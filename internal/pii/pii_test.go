@@ -55,6 +55,40 @@ func TestUnkeyedRedactMasksIdentifiersAndKeepsTheirLastTwoCharacters(t *testing.
 		{"several identifiers in one line", "sip:" + testMSISDN + "@" + testDomain + " -> tel:+15550100002 imsi " + testIMSI2, "sip:***01@" + testDomain + " -> tel:+***02 imsi ***02"},
 		{"non-ASCII text passes through", "メッセージ 受信 sip:alice.smith@例え.jp", "メッセージ 受信 sip:***th@例え.jp"},
 		{"empty input", "", ""},
+		{"a scheme at the end of the input", "to tel:", "to tel:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := r.Redact(tt.in); got != tt.want {
+				t.Fatalf("Redact(%q)\n got %q\nwant %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// UK numbers are from Ofcom's range reserved for drama (07700 900000-900999);
+// the Korean-shaped one is all zero groups, not a plausible subscriber.
+func TestRedactMasksNumbersWrittenWithSeparators(t *testing.T) {
+	r := NewRedactor(nil)
+	tests := []struct {
+		name, in, want string
+	}{
+		{"E.164 with hyphens", "msisdn=+1-555-010-0001", "msisdn=+***01"},
+		{"E.164 with spaces", "+1 555 010 0001 rejected", "+***01 rejected"},
+		{"E.164 with dots", "call +1.555.010.0002 failed", "call +***02 failed"},
+		{"E.164 with parentheses in a display name", `"+1 (555) 010-0003" <sip:alice.smith@` + testDomain + `>`, `"+***03" <sip:***th@` + testDomain + `>`},
+		{"national mobile number with a space", "from 07700 900001", "from ***01"},
+		{"national number in parentheses", "(07700) 900-002", "(***02"},
+		{"Korean-style national groups", "msisdn=010-0000-0001", "msisdn=***01"},
+		{"IMEI with separators", "imei=00-101000-000003-1", "imei=***31"},
+		{"tel URI written with spaces", "tel:+1 555 010 0004", "tel:+***04"},
+		{"a long run anywhere masks the whole group", "2026-10-19 15550100001", "***01"},
+		{"dates do not start with 0 or +", "on 2026-10-19 at 10.0.255.255", "on 2026-10-19 at 10.0.255.255"},
+		{"zero groups inside a token are not a number", "v0.1234.5678 and 10.0.255.255", "v0.1234.5678 and 10.0.255.255"},
+		{"too few digits", "+1 555 010 and 0 1 2 3", "+1 555 010 and 0 1 2 3"},
+		{"three separators end the number", "+1 555   0100001", "+1 555   0100001"},
+		{"status lines are untouched", "SIP/2.0 200 OK", "SIP/2.0 200 OK"},
+		{"a group after a URI value is part of it", "urn:gsma:imei:000A00 000000", "urn:gsma:imei:***00"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -112,6 +146,8 @@ func TestKeyedHintsCorrelateOneIdentifierAcrossItsForms(t *testing.T) {
 		"msisdn=15550100001",
 		"tel:" + testMSISDN,
 		"tel:+1-555-010-0001",
+		"+1 (555) 010-0001",
+		"+1 555 010 0001",
 		"sip:" + testMSISDN + "@" + testDomain,
 		"sips:" + testMSISDN + ";user=phone@" + testDomain,
 	}
@@ -196,6 +232,7 @@ func TestIdentityAlwaysMasksTheWholeValue(t *testing.T) {
 		{"alice", "***"},
 		{"", "***"},
 		{testMSISDN, "***01"},
+		{"+1 555 010 0001", "***01"},
 	}
 	for _, tt := range tests {
 		a := r.Identity("impi", tt.in)
@@ -291,7 +328,7 @@ func hintOf(t *testing.T, redacted string) string {
 // milliseconds, so a regression shows up as a test timeout, not a flaky timing.
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
-	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x"} {
+	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)

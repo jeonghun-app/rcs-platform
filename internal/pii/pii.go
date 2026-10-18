@@ -10,8 +10,9 @@
 // Masking is deliberately over-inclusive: any run of eight or more ASCII digits
 // is treated as an identifier, because national-format MSISDNs, IMSIs (TS 23.003
 // §2.2) and IMEIs (TS 23.003 §6.2) are all digit runs and a false positive costs
-// only a less useful log line. Digit groups separated by spaces outside a tel URI
-// are not recognised.
+// only a less useful log line. Numbers written in groups ("+1 555 010-0001",
+// "010-0000-0001") are recognised when they start with "+" or with a word-initial
+// 0; other grouped numbers are not (see numberAt).
 //
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
@@ -122,6 +123,9 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //
 //   - runs of eight or more digits, which covers IMSIs (14–15 digits), IMEIs and
 //     IMEISVs (15–16 digits) and E.164 numbers; a leading "+" is kept;
+//   - numbers written in groups, with eight or more digits in total, that start
+//     with "+" (international) or with a 0 that begins a word (national trunk
+//     prefix: 010-0000-0001, (07700) 900001); see [numberAt];
 //   - the subscriber of a tel URI (RFC 3966 §3), visual separators included;
 //   - the userinfo of a sip or sips URI (RFC 3261 §19.1.1), password included;
 //   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups.
@@ -136,17 +140,18 @@ func (r *Redactor) Redact(s string) string {
 	// remembering this keeps a line full of "sip:" prefixes linear.
 	noUserBefore := 0
 	for i := 0; i < len(s); {
-		if isDigit(s[i]) {
-			j := i + 1
-			for j < len(s) && isDigit(s[j]) {
-				j++
-			}
-			if j-i >= minRun {
-				b.WriteString(r.mask(s[i:j]))
+		if startsNumber(s, i) {
+			from, end := numberAt(s, i)
+			if from < 0 {
+				b.WriteString(s[i:end])
 			} else {
-				b.WriteString(s[i:j])
+				b.WriteString(s[i:from])
+				if s[from] == '+' {
+					b.WriteByte('+')
+				}
+				b.WriteString(r.mask(s[from:end]))
 			}
-			i = j
+			i = end
 			continue
 		}
 		n := schemeLen(s[i:])
@@ -177,11 +182,17 @@ func (r *Redactor) Redact(s string) string {
 			}
 		default:
 			// tel and urn:gsma:imei: the identifier is the run of number characters
-			// that follows the scheme, up to parameters or the end of the URI.
+			// that follows the scheme, up to parameters or the end of the URI, or
+			// the number as a person wrote it with spaces, whichever is longer.
 			end := start
 			for end < len(s) && isNumberChar(s[end]) {
 				end++
 			}
+			if startsNumber(s, start) {
+				_, written := numberAt(s, start)
+				end = max(end, written)
+			}
+			end = continueWritten(s, end)
 			if end > start {
 				num := s[start:end]
 				if num[0] == '+' {
@@ -193,6 +204,95 @@ func (r *Redactor) Redact(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// startsNumber reports whether a written number can start at s[i]: a digit, or
+// "+" followed by a digit.
+func startsNumber(s string, i int) bool {
+	return i < len(s) && (isDigit(s[i]) || s[i] == '+' && i+1 < len(s) && isDigit(s[i+1]))
+}
+
+// numberAt scans the written number starting at s[i] (see startsNumber): digit
+// groups joined by at most two separators from " -.()", as in "+1 (555)
+// 010-0001". It returns the end of the number and where its identifying part
+// starts, or from = -1 if it is not an identifier. It is one when it has a run
+// of minRun digits, when it starts with "+" and has minRun digits, or from the
+// first group that starts with 0 at the start of a word and is followed by
+// minRun digits in total (a national number such as 010-0000-0001).
+//
+// The 0 rule keeps dates (2026-10-19), IPv4 addresses and versions, which do
+// not start a word with 0, readable. National numbers without a trunk prefix
+// written in groups, such as North American (555) 010-0001, are not
+// recognised. The number ends where three separators or a separator followed by
+// something other than a digit appear, so each byte is scanned once.
+func numberAt(s string, i int) (from, end int) {
+	p := i
+	if s[p] == '+' {
+		p++
+	}
+	digits, run, longest := 0, 0, 0
+	national, digitsBeforeNational := -1, 0
+	for p < len(s) {
+		if isDigit(s[p]) {
+			if run == 0 && national < 0 && s[p] == '0' && startsWord(s, p) {
+				national, digitsBeforeNational = p, digits
+			}
+			digits++
+			run++
+			longest = max(longest, run)
+			p++
+			end = p
+			continue
+		}
+		q := p
+		for q < len(s) && q-p < 3 && isNumberSeparator(s[q]) {
+			q++
+		}
+		if q == p || q-p > 2 || q == len(s) || !isDigit(s[q]) {
+			break
+		}
+		run = 0
+		p = q
+	}
+	switch {
+	case longest >= minRun, s[i] == '+' && digits >= minRun:
+		return i, end
+	case national >= 0 && digits-digitsBeforeNational >= minRun:
+		return national, end
+	}
+	return -1, end
+}
+
+// continueWritten extends a number ending at end over further groups joined by
+// one or two separators, so that a mask is never followed by a group whose
+// digits would read as the rest of the number together with the mask's hint.
+func continueWritten(s string, end int) int {
+	for end < len(s) {
+		q := end
+		for q < len(s) && q-end < 3 && isNumberSeparator(s[q]) {
+			q++
+		}
+		if q == end || q-end > 2 || q == len(s) || !isDigit(s[q]) {
+			return end
+		}
+		_, end = numberAt(s, q)
+	}
+	return end
+}
+
+// startsWord reports whether the digit at s[p] begins a word: it is not
+// preceded by a letter, digit, '.' or '-', which would make it part of an
+// address, version or date.
+func startsWord(s string, p int) bool {
+	if p == 0 {
+		return true
+	}
+	c := s[p-1]
+	return !isAlnum(c) && c != '.' && c != '-'
+}
+
+func isNumberSeparator(c byte) bool {
+	return c == ' ' || isVisualSeparator(c)
 }
 
 // mask returns the masked form of one identifier. The hint is computed from the
@@ -226,15 +326,16 @@ func letters(sum []byte, n int) string {
 	return string(out)
 }
 
-// canonical reduces a telephone number to its digits, dropping the "+" and the
-// visual separators of RFC 3966 §5.1.1; anything else is returned unchanged.
+// canonical reduces a telephone number to its digits, dropping the "+", the
+// visual separators of RFC 3966 §5.1.1 and spaces; anything else is returned
+// unchanged.
 func canonical(v string) string {
 	digits := false
 	for i := 0; i < len(v); i++ {
 		switch c := v[i]; {
 		case isDigit(c):
 			digits = true
-		case c == '+' || isVisualSeparator(c):
+		case c == '+' || isNumberSeparator(c):
 		default:
 			return v
 		}
