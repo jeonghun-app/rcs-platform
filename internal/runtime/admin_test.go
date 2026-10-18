@@ -11,12 +11,42 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	// Registers handlers on http.DefaultServeMux, which the admin server must
 	// not serve.
 	_ "net/http/pprof"
 )
+
+// fakeNow is a clock a test moves by hand.
+type fakeNow struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (f *fakeNow) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.t
+}
+
+func (f *fakeNow) Advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.t = f.t.Add(d)
+}
+
+// testAdmin returns an Admin past "starting", on a clock that only moves when
+// the test moves it.
+func testAdmin(log *slog.Logger) (*Admin, *fakeNow, *fakeTimers) {
+	clock, timers := &fakeNow{t: epoch}, newFakeTimers()
+	a := newAdmin(log, clock.Now, timers.After)
+	a.markReady()
+	return a, clock, timers
+}
 
 func get(t *testing.T, h http.Handler, method, path string) (int, map[string]any) {
 	t.Helper()
@@ -32,7 +62,11 @@ func get(t *testing.T, h http.Handler, method, path string) (int, map[string]any
 }
 
 func TestHealthzIsAlwaysOK(t *testing.T) {
-	a := newAdmin(discardLogger(), newFakeTimers().After)
+	a := newAdmin(discardLogger(), time.Now, newFakeTimers().After)
+	if code, body := get(t, a, "GET", "/healthz"); code != 200 || body["status"] != "ok" {
+		t.Fatalf("healthz while starting = %d %v", code, body)
+	}
+	a.markReady()
 	a.AddReadinessCheck("store", func(context.Context) error { return errors.New("down") })
 	a.stop()
 	if code, body := get(t, a, "GET", "/healthz"); code != 200 || body["status"] != "ok" {
@@ -43,13 +77,32 @@ func TestHealthzIsAlwaysOK(t *testing.T) {
 	}
 }
 
+func TestReadyzIsStartingUntilTheServiceIsReady(t *testing.T) {
+	a := newAdmin(discardLogger(), time.Now, newFakeTimers().After)
+	var calls atomic.Int32
+	a.AddReadinessCheck("store", func(context.Context) error { calls.Add(1); return nil })
+	if code, body := get(t, a, "GET", "/readyz"); code != 503 || body["status"] != "starting" {
+		t.Fatalf("readyz before ready = %d %v", code, body)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("checks ran while starting")
+	}
+	if !a.markReady() || a.markReady() {
+		t.Fatal("markReady should report only the first call")
+	}
+	if code, body := get(t, a, "GET", "/readyz"); code != 200 || body["status"] != "ready" {
+		t.Fatalf("readyz after ready = %d %v", code, body)
+	}
+}
+
 func TestReadyzIsOKWhenEveryCheckPasses(t *testing.T) {
-	a := newAdmin(discardLogger(), newFakeTimers().After)
+	a, clock, _ := testAdmin(discardLogger())
 	if code, body := get(t, a, "GET", "/readyz"); code != 200 || body["status"] != "ready" {
 		t.Fatalf("readyz with no checks = %d %v", code, body)
 	}
 	a.AddReadinessCheck("store", func(context.Context) error { return nil })
 	a.AddReadinessCheck("hss", func(context.Context) error { return nil })
+	clock.Advance(readinessCacheTTL)
 	if code, body := get(t, a, "GET", "/readyz"); code != 200 || body["status"] != "ready" {
 		t.Fatalf("readyz = %d %v", code, body)
 	}
@@ -57,7 +110,7 @@ func TestReadyzIsOKWhenEveryCheckPasses(t *testing.T) {
 
 func TestReadyzNamesFailingChecksWithoutTheirErrors(t *testing.T) {
 	var logs bytes.Buffer
-	a := newAdmin(NewLogger(&logs, "scscf", "dev", slog.LevelInfo), newFakeTimers().After)
+	a, _, _ := testAdmin(NewLogger(&logs, "scscf", "dev", slog.LevelInfo))
 	a.AddReadinessCheck("store", func(context.Context) error {
 		return errors.New("dial tcp 10.0.9.9:8000: table registrations-prod unreachable for sip:+15550100001@ims.example")
 	})
@@ -94,8 +147,7 @@ func TestReadyzNamesFailingChecksWithoutTheirErrors(t *testing.T) {
 }
 
 func TestACheckThatHangsIsReportedWhenTheReadinessDeadlinePasses(t *testing.T) {
-	timers := newFakeTimers()
-	a := newAdmin(discardLogger(), timers.After)
+	a, _, timers := testAdmin(discardLogger())
 	entered := make(chan struct{})
 	a.AddReadinessCheck("broken", func(context.Context) error { return errors.New("refused") })
 	a.AddReadinessCheck("slow", func(ctx context.Context) error {
@@ -113,8 +165,161 @@ func TestACheckThatHangsIsReportedWhenTheReadinessDeadlinePasses(t *testing.T) {
 	}
 }
 
+func TestAPanickingCheckFailsWithoutStoppingTheProcess(t *testing.T) {
+	var logs lockedBuffer
+	a, _, _ := testAdmin(NewLogger(&logs, "pcscf", "dev", slog.LevelInfo))
+	var client *http.Client
+	a.AddReadinessCheck("store", func(context.Context) error {
+		_ = client.Timeout // nil pointer, as an uninitialised dependency would be
+		return nil
+	})
+	a.AddReadinessCheck("panics-with-pii", func(context.Context) error { panic("bad contact sip:+15550100001@ims.example") })
+	a.AddReadinessCheck("hss", func(context.Context) error { return nil })
+	code, body := get(t, a, "GET", "/readyz")
+	if code != 503 || !slices.Equal(toStrings(body["failing"]), []string{"store", "panics-with-pii"}) {
+		t.Fatalf("readyz = %d %v", code, body)
+	}
+	if strings.Contains(logs.String(), "15550100001") {
+		t.Fatalf("panic value logged unredacted: %s", logs.String())
+	}
+	rec := record(t, logs.String(), "readiness check failing")
+	if rec["check"] != "store" || !strings.Contains(rec["error"].(string), "nil pointer") {
+		t.Fatalf("record = %v", rec)
+	}
+}
+
+func TestConcurrentReadyzRequestsShareOneEvaluation(t *testing.T) {
+	a, _, _ := testAdmin(discardLogger())
+	var calls atomic.Int32
+	release := make(chan struct{})
+	a.AddReadinessCheck("store", func(context.Context) error {
+		calls.Add(1)
+		<-release
+		return nil
+	})
+	const n = 20
+	codes := make(chan int, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			code, _ := get(t, a, "GET", "/readyz")
+			codes <- code
+		})
+	}
+	close(release)
+	wg.Wait()
+	close(codes)
+	for code := range codes {
+		if code != 200 {
+			t.Fatalf("a request got %d", code)
+		}
+	}
+	// The clock does not move, so every request either joined the one
+	// evaluation or was answered from its cached result.
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("check ran %d times for %d requests", got, n)
+	}
+}
+
+func TestReadinessResultsAreCachedForOneSecond(t *testing.T) {
+	a, clock, _ := testAdmin(discardLogger())
+	var calls atomic.Int32
+	var down atomic.Bool
+	a.AddReadinessCheck("store", func(context.Context) error {
+		calls.Add(1)
+		if down.Load() {
+			return errors.New("down")
+		}
+		return nil
+	})
+	get(t, a, "GET", "/readyz")
+	down.Store(true)
+	clock.Advance(readinessCacheTTL - time.Millisecond)
+	if code, _ := get(t, a, "GET", "/readyz"); code != 200 || calls.Load() != 1 {
+		t.Fatalf("within the TTL: code %d, %d calls", code, calls.Load())
+	}
+	clock.Advance(time.Millisecond)
+	if code, _ := get(t, a, "GET", "/readyz"); code != 503 || calls.Load() != 2 {
+		t.Fatalf("after the TTL: code %d, %d calls", code, calls.Load())
+	}
+}
+
+func TestAddingACheckInvalidatesTheCachedResult(t *testing.T) {
+	a, _, _ := testAdmin(discardLogger())
+	get(t, a, "GET", "/readyz")
+	a.AddReadinessCheck("store", func(context.Context) error { return errors.New("down") })
+	if code, _ := get(t, a, "GET", "/readyz"); code != 503 {
+		t.Fatalf("new failing check hidden by the cache: %d", code)
+	}
+}
+
+func TestReadinessIsLoggedOnlyWhenACheckChangesState(t *testing.T) {
+	var logs lockedBuffer
+	a, clock, _ := testAdmin(NewLogger(&logs, "hss", "dev", slog.LevelInfo))
+	var down atomic.Bool
+	a.AddReadinessCheck("store", func(context.Context) error {
+		if down.Load() {
+			return errors.New("down")
+		}
+		return nil
+	})
+	poll := func() {
+		get(t, a, "GET", "/readyz")
+		clock.Advance(readinessCacheTTL)
+	}
+	poll() // passing from the start: nothing to say
+	down.Store(true)
+	poll()
+	poll()
+	poll()
+	down.Store(false)
+	poll()
+	poll()
+	out := logs.String()
+	if n := strings.Count(out, "readiness check failing"); n != 1 {
+		t.Fatalf("%d failing records, want 1:\n%s", n, out)
+	}
+	if n := strings.Count(out, "readiness check passing again"); n != 1 {
+		t.Fatalf("%d recovery records, want 1:\n%s", n, out)
+	}
+}
+
+func TestAReadyzCallerThatGoesAwayDoesNotCancelTheEvaluation(t *testing.T) {
+	a, _, _ := testAdmin(discardLogger())
+	entered, release := make(chan struct{}), make(chan struct{})
+	var sawCancel atomic.Bool
+	a.AddReadinessCheck("store", func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			sawCancel.Store(true)
+		}
+		return ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		a.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil).WithContext(ctx))
+		close(done)
+	}()
+	<-entered
+	cancel()
+	<-done
+	if rec.Code != 503 {
+		t.Fatalf("abandoned request = %d", rec.Code)
+	}
+	close(release)
+	// The next caller gets the shared evaluation's answer: it was not
+	// cancelled with the first caller.
+	if code, _ := get(t, a, "GET", "/readyz"); code != 200 || sawCancel.Load() {
+		t.Fatalf("evaluation was cancelled with its first caller: code %d", code)
+	}
+}
+
 func TestReadyzFailsOnceStopping(t *testing.T) {
-	a := newAdmin(discardLogger(), newFakeTimers().After)
+	a, _, _ := testAdmin(discardLogger())
 	a.AddReadinessCheck("store", func(context.Context) error { return nil })
 	a.stop()
 	if code, body := get(t, a, "GET", "/readyz"); code != 503 || body["status"] != "stopping" {
@@ -123,7 +328,7 @@ func TestReadyzFailsOnceStopping(t *testing.T) {
 }
 
 func TestAdminServesNothingUnmounted(t *testing.T) {
-	a := newAdmin(discardLogger(), newFakeTimers().After)
+	a, _, _ := testAdmin(discardLogger())
 	for _, path := range []string{"/", "/debug/pprof/", "/debug/pprof/heap", "/metrics", "/healthz/x", "/readyz/"} {
 		if code, _ := get(t, a, "GET", path); code != 404 {
 			t.Errorf("GET %s = %d, want 404", path, code)
@@ -135,7 +340,7 @@ func TestAdminServesNothingUnmounted(t *testing.T) {
 }
 
 func TestMountedHandlersAreServed(t *testing.T) {
-	a := newAdmin(discardLogger(), newFakeTimers().After)
+	a, _, _ := testAdmin(discardLogger())
 	a.Handle("GET /v1/bindings", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "bindings")
 	}))
@@ -147,7 +352,7 @@ func TestMountedHandlersAreServed(t *testing.T) {
 }
 
 func TestBadReadinessChecksPanic(t *testing.T) {
-	a := newAdmin(discardLogger(), newFakeTimers().After)
+	a, _, _ := testAdmin(discardLogger())
 	a.AddReadinessCheck("store", func(context.Context) error { return nil })
 	for name, add := range map[string]func(){
 		"duplicate": func() { a.AddReadinessCheck("store", func(context.Context) error { return nil }) },

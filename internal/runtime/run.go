@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -39,18 +40,20 @@ type Service[C any] struct {
 	// Name is the binary name ("pcscf"). It is the service field of every log
 	// line and the Service dimension of every metric.
 	Name string
-	// EnvPrefix prefixes the service's own variables ("PCSCF_"). The shared
-	// RCS_ prefix is reserved for the runtime.
+	// EnvPrefix prefixes the service's own variables ("PCSCF_"). It must not
+	// start with RCS_, which is reserved for the shared settings: rcs-as uses
+	// RCSAS_, since RCS_AS_ would mix its settings into the shared namespace.
 	EnvPrefix string
 	// Configure reads the service's settings and declares the ones unsafe in
 	// production. It must not start anything: when it returns, every problem it
 	// and the runtime recorded is reported at once and the process exits if
 	// there is any.
 	Configure func(s *Settings) C
-	// Run starts the service and blocks until ctx is cancelled, which happens on
-	// SIGTERM or SIGINT, or until the service fails. When Run returns the
-	// process shuts down: a non-nil error, other than ctx's own, makes the exit
-	// status non-zero.
+	// Run starts the service, calls rt.Ready once it can take work, and blocks
+	// until ctx is cancelled, which happens on SIGTERM or SIGINT, or until the
+	// service fails. /readyz answers 503 "starting" until Ready is called. When
+	// Run returns the process shuts down: a non-nil error, other than ctx's
+	// own, makes the exit status non-zero.
 	Run func(ctx context.Context, rt *Runtime, cfg C) error
 }
 
@@ -60,8 +63,8 @@ func (svc Service[C]) validate() {
 	switch {
 	case svc.Name == "":
 		panic("runtime: Service.Name is empty")
-	case !envPrefixPattern.MatchString(svc.EnvPrefix) || svc.EnvPrefix == "RCS_":
-		panic("runtime: Service.EnvPrefix must look like PCSCF_ and must not be RCS_")
+	case !envPrefixPattern.MatchString(svc.EnvPrefix) || strings.HasPrefix(svc.EnvPrefix, "RCS_"):
+		panic("runtime: Service.EnvPrefix must look like PCSCF_ and must not start with RCS_")
 	case svc.Configure == nil || svc.Run == nil:
 		panic("runtime: Service.Configure and Service.Run are required")
 	}
@@ -91,7 +94,8 @@ func (s *Settings) ForbidInProduction(unsafe bool, reason string) {
 	}
 }
 
-// Runtime is what a running service gets from the runtime.
+// Runtime is what a running service gets from the runtime. Run builds it; tests
+// of service packages get one from internal/runtime/runtimetest.
 type Runtime struct {
 	Environment Environment
 	Logger      *slog.Logger
@@ -100,6 +104,61 @@ type Runtime struct {
 
 	mu    sync.Mutex
 	hooks []shutdownHook
+}
+
+// RuntimeOptions configures [NewRuntime].
+type RuntimeOptions struct {
+	// Service names the service in logs and metrics.
+	Service string
+	// Environment is reported by Runtime.Environment.
+	Environment Environment
+	// Out receives log and metric lines; nil discards them.
+	Out io.Writer
+	// Level is the log level; nil means info.
+	Level slog.Leveler
+	// MetricsNamespace defaults to DefaultMetricsNamespace.
+	MetricsNamespace string
+	// Now and After are the clock; nil means time.Now and time.After.
+	Now   func() time.Time
+	After func(time.Duration) <-chan time.Time
+}
+
+// NewRuntime returns a Runtime that is not attached to a process: Run uses it,
+// and runtimetest uses it so that service packages can test their Run function
+// without signals or a listener.
+func NewRuntime(o RuntimeOptions) *Runtime {
+	if o.Out == nil {
+		o.Out = io.Discard
+	}
+	if o.Level == nil {
+		o.Level = slog.LevelInfo
+	}
+	if o.MetricsNamespace == "" {
+		o.MetricsNamespace = DefaultMetricsNamespace
+	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	if o.After == nil {
+		o.After = time.After
+	}
+	out := &syncWriter{w: o.Out}
+	log := NewLogger(out, o.Service, buildinfo.Version, o.Level)
+	return &Runtime{
+		Environment: o.Environment,
+		Logger:      log,
+		Metrics:     NewMetrics(out, o.MetricsNamespace, o.Service, o.Now, log),
+		Admin:       newAdmin(log, o.Now, o.After),
+	}
+}
+
+// Ready tells the runtime the service can take work: /readyz stops answering
+// "starting" and from then on reflects the readiness checks. Register the
+// checks before calling it. Calling it again has no effect.
+func (r *Runtime) Ready() {
+	if r.Admin.markReady() {
+		r.Logger.Info("ready")
+	}
 }
 
 type shutdownHook struct {
@@ -118,31 +177,40 @@ func (r *Runtime) OnShutdown(name string, fn func(ctx context.Context) error) {
 	r.hooks = append(r.hooks, shutdownHook{name: name, fn: fn})
 }
 
-func (r *Runtime) runHooks(ctx context.Context) bool {
+// Shutdown makes /readyz answer "stopping" and runs the shutdown hooks as
+// described at [Runtime.OnShutdown], returning every failure. A hook that
+// panics fails without stopping the others. Run calls Shutdown after
+// Service.Run returns; a service never calls it itself, and tests call it
+// through runtimetest.
+func (r *Runtime) Shutdown(ctx context.Context) error {
+	r.Admin.stop()
 	r.mu.Lock()
 	hooks := slices.Clone(r.hooks)
 	r.mu.Unlock()
 
-	ok := true
+	var errs []error
 	for _, h := range slices.Backward(hooks) {
 		if ctx.Err() != nil {
 			r.Logger.Error("shutdown hook skipped: deadline passed", slog.String("hook", h.name))
-			ok = false
+			errs = append(errs, fmt.Errorf("shutdown hook %s: skipped", h.name))
 			continue
 		}
 		done := make(chan error, 1)
-		go func() { done <- h.fn(ctx) }()
+		go func() {
+			defer recoverInto(done)
+			done <- h.fn(ctx)
+		}()
 		err, finished := await(ctx, done)
 		switch {
 		case !finished:
 			r.Logger.Error("shutdown hook did not finish before the deadline", slog.String("hook", h.name))
-			ok = false
+			errs = append(errs, fmt.Errorf("shutdown hook %s: %w", h.name, err))
 		case err != nil:
 			r.Logger.Error("shutdown hook failed", slog.String("hook", h.name), slog.String("error", pii.Redact(err.Error())))
-			ok = false
+			errs = append(errs, fmt.Errorf("shutdown hook %s failed", h.name))
 		}
 	}
-	return ok
+	return errors.Join(errs...)
 }
 
 // Process is what Run takes from the operating system. [Main] fills it from
@@ -270,6 +338,16 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	}
 
 	pii.SetDefault(sh.redactor)
+	rt := NewRuntime(RuntimeOptions{
+		Service:          svc.Name,
+		Environment:      sh.environment,
+		Out:              out,
+		Level:            sh.logLevel,
+		MetricsNamespace: sh.metricsNamespace,
+		Now:              p.Now,
+		After:            p.After,
+	})
+	log = rt.Logger
 	// Libraries that log through slog's or log's default logger end up in the
 	// same JSON stream instead of as plain text on stderr.
 	slog.SetDefault(log)
@@ -279,9 +357,8 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		log.Error("admin listener failed", slog.String("error", pii.Redact(err.Error())))
 		return ExitFailure
 	}
-	admin := newAdmin(log, p.After)
 	srv := &http.Server{
-		Handler:           admin,
+		Handler:           rt.Admin,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -291,13 +368,6 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	}
 	adminDone := make(chan error, 1)
 	go func() { adminDone <- srv.Serve(ln) }()
-
-	rt := &Runtime{
-		Environment: sh.environment,
-		Logger:      log,
-		Metrics:     NewMetrics(out, sh.metricsNamespace, svc.Name, p.Now, log),
-		Admin:       admin,
-	}
 
 	sigCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
 	defer stopSignals()
@@ -314,6 +384,13 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		log.Info("stopping: shutdown requested")
 	case err := <-runDone:
 		runReturned = true
+		if runCtx.Err() != nil {
+			// Stop was requested and Run returned at once; select may pick
+			// either ready case, so this is the case above.
+			log.Info("stopping: shutdown requested")
+			failed = stopFailed(log, err)
+			break
+		}
 		if err != nil {
 			log.Error("stopping: service failed", slog.String("error", pii.Redact(err.Error())))
 			failed = true
@@ -327,23 +404,21 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	// From here a second signal gets the default action and ends the process,
 	// for an operator who does not want to wait for the drain.
 	stopSignals()
-	admin.stop()
+	rt.Admin.stop()
 	cancelRun()
 
 	deadline, cancelDeadline := withTimer(context.Background(), p.After, sh.shutdownTimeout)
 	defer cancelDeadline()
 	if !runReturned {
 		err, finished := await(deadline, runDone)
-		switch {
-		case !finished:
+		if !finished {
 			log.Error("service did not stop before the shutdown deadline", slog.Duration("timeout", sh.shutdownTimeout))
 			failed = true
-		case err != nil && !errors.Is(err, context.Canceled):
-			log.Error("service failed while stopping", slog.String("error", pii.Redact(err.Error())))
+		} else if stopFailed(log, err) {
 			failed = true
 		}
 	}
-	if !rt.runHooks(deadline) {
+	if rt.Shutdown(deadline) != nil {
 		failed = true
 	}
 	if err := srv.Shutdown(deadline); err != nil {
@@ -356,6 +431,16 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	}
 	log.Info("stopped")
 	return ExitOK
+}
+
+// stopFailed logs and reports an error Service.Run returned after it was asked
+// to stop; its own context's cancellation is a clean stop.
+func stopFailed(log *slog.Logger, err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	log.Error("service failed while stopping", slog.String("error", pii.Redact(err.Error())))
+	return true
 }
 
 // probe performs -healthcheck. Proxies and redirects are ignored: the target is
@@ -373,11 +458,7 @@ func probe(ctx context.Context, p Process) error {
 	if err != nil {
 		return err
 	}
-	client := &http.Client{
-		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-	resp, err := client.Do(req)
+	resp, err := probeClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -387,6 +468,14 @@ func probe(ctx context.Context, p Process) error {
 		return fmt.Errorf("%s answered %s", addr.probeURL, resp.Status)
 	}
 	return nil
+}
+
+// probeClient is the -healthcheck client: no proxy and no redirects.
+func probeClient() *http.Client {
+	return &http.Client{
+		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // await returns the value sent on done, or reports finished=false if ctx ends

@@ -154,9 +154,12 @@ func TestHealthcheckSucceedsOnlyOn200(t *testing.T) {
 	for status, want := range map[int]int{200: ExitOK, 503: ExitFailure, 302: ExitFailure, 404: ExitFailure} {
 		var gotPath string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/ok" {
+				return // 200: following the redirect would turn failure into success
+			}
 			gotPath = r.URL.Path
 			if status == 302 {
-				w.Header().Set("Location", "/healthz")
+				w.Header().Set("Location", "/ok")
 			}
 			w.WriteHeader(status)
 		}))
@@ -210,16 +213,17 @@ func TestHealthcheckFailsWhenNothingListens(t *testing.T) {
 	}
 }
 
+// ProxyFromEnvironment never proxies loopback, so an end-to-end test against
+// 127.0.0.1 could not tell; the probe can also target a non-loopback admin
+// address, where a proxy would matter.
 func TestHealthcheckIgnoresProxySettings(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
-	defer srv.Close()
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
-	t.Setenv("http_proxy", "http://127.0.0.1:1")
-	code := Run(context.Background(), testService(waitForStop), Process{
-		Args: []string{"-healthcheck"}, LookupEnv: adminEnvFor(t, srv).lookup,
-	})
-	if code != ExitOK {
-		t.Fatalf("exit %d", code)
+	c := probeClient()
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatalf("probe transport = %#v, want one without a proxy", c.Transport)
+	}
+	if err := c.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("probe follows redirects: %v", err)
 	}
 }
 
@@ -370,6 +374,7 @@ func TestShutdownMarksNotReadyRunsHooksInReverseAndExitsZero(t *testing.T) {
 		rt.OnShutdown("store", func(context.Context) error { note("store"); return nil })
 		rt.OnShutdown("listener", func(context.Context) error { note("listener"); return nil })
 		rt.Admin.AddReadinessCheck("store", func(context.Context) error { return nil })
+		rt.Ready()
 		close(ready)
 		<-ctx.Done()
 		note("run returned")
@@ -392,6 +397,32 @@ func TestShutdownMarksNotReadyRunsHooksInReverseAndExitsZero(t *testing.T) {
 	}
 	if !slices.Contains(h.timers.Made(), testShutdownTimeout) {
 		t.Fatalf("no shutdown deadline of RCS_SHUTDOWN_TIMEOUT: %v", h.timers.Made())
+	}
+}
+
+func TestReadyzIsStartingUntilRunCallsReady(t *testing.T) {
+	initDone, ready := make(chan struct{}), make(chan struct{})
+	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		<-initDone
+		rt.Ready()
+		close(ready)
+		<-ctx.Done()
+		return nil
+	}))
+	u := h.adminURL("/readyz")
+	before := httpGet(t, u)
+	close(initDone)
+	<-ready
+	after := httpGet(t, u)
+	h.cancel()
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if before != 503 || after != 200 {
+		t.Fatalf("readyz before Ready %d, after %d", before, after)
+	}
+	if !hasRecord(t, h.out.String(), "ready") {
+		t.Fatalf("no ready record:\n%s", h.out.String())
 	}
 }
 
@@ -514,6 +545,32 @@ func TestAFailingHookMakesTheExitNonZeroButLaterHooksRun(t *testing.T) {
 	}
 }
 
+func TestAPanickingHookFailsAndTheOthersStillRun(t *testing.T) {
+	ready := make(chan struct{})
+	storeClosed := make(chan struct{}, 1)
+	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		rt.OnShutdown("store", func(context.Context) error { storeClosed <- struct{}{}; return nil })
+		rt.OnShutdown("flows", func(context.Context) error { panic("closing flow for sip:+15550100001@ims.example") })
+		close(ready)
+		<-ctx.Done()
+		return nil
+	}))
+	<-ready
+	h.cancel()
+	if code := h.wait(); code != ExitFailure {
+		t.Fatalf("exit %d", code)
+	}
+	select {
+	case <-storeClosed:
+	default:
+		t.Fatal("the hook after the panicking one did not run")
+	}
+	rec := record(t, h.out.String(), "shutdown hook failed")
+	if rec["hook"] != "flows" || !strings.Contains(rec["error"].(string), "panic: closing flow") || strings.Contains(h.out.String(), "15550100001") {
+		t.Fatalf("record = %v", rec)
+	}
+}
+
 func TestAHookStillRunningAtTheDeadlineIsAbandonedAndTheRestSkipped(t *testing.T) {
 	ready := make(chan struct{})
 	entered := make(chan struct{})
@@ -612,6 +669,7 @@ func TestInvalidServiceDefinitionsPanic(t *testing.T) {
 		"lowercase prefix": {Name: "x", EnvPrefix: "x_", Configure: good.Configure, Run: good.Run},
 		"no underscore":    {Name: "x", EnvPrefix: "X", Configure: good.Configure, Run: good.Run},
 		"shared prefix":    {Name: "x", EnvPrefix: "RCS_", Configure: good.Configure, Run: good.Run},
+		"inside shared":    {Name: "rcs-as", EnvPrefix: "RCS_AS_", Configure: good.Configure, Run: good.Run},
 		"no configure":     {Name: "x", EnvPrefix: "X_", Run: good.Run},
 		"no run":           {Name: "x", EnvPrefix: "X_", Configure: good.Configure},
 	} {

@@ -19,6 +19,11 @@
 //		})
 //	}
 //
+// Run registers readiness checks and shutdown hooks on its *Runtime, calls
+// rt.Ready once it can take work (/readyz answers 503 "starting" until then),
+// and returns when its context is cancelled. Service packages test their Run
+// function with internal/runtime/runtimetest instead of a process.
+//
 // The shared settings, all optional except RCS_ENV:
 //
 //	RCS_ENV               dev, test, staging or prod; staging and prod refuse
