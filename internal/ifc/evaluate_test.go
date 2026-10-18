@@ -2,9 +2,12 @@ package ifc
 
 import (
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // sipRequest is the test implementation of Request. calls counts how often
@@ -373,13 +376,199 @@ func TestCompileRefusesAmbiguousOrInvalidCriteria(t *testing.T) {
 	}
 }
 
-func TestEmptyPatternsMatchAnything(t *testing.T) {
-	s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+func TestEmptyValuePatternsMatchAnyValueButAnEmptyNameMatchesNoHeader(t *testing.T) {
+	uri := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
 		{Groups: []int{0}, Condition: RequestURI("")},
-		{Groups: []int{1}, Condition: SIPHeader{Header: ""}},
+		{Groups: []int{1}, Condition: SessionDescription{Line: "", Content: ""}},
 	}}))
-	if !matches(t, s, req("INVITE", "", HeaderField{"Via", ""}), Context{}) {
-		t.Error("empty patterns did not match")
+	r := &sipRequest{method: "INVITE", uri: "", sdp: []string{"v=0"}}
+	if !matches(t, uri, r, Context{}) {
+		t.Error("empty Request-URI and SDP patterns did not match")
+	}
+	// A header name pattern matches the whole name, and no header has an
+	// empty one.
+	name := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+		{Groups: []int{0}, Condition: SIPHeader{Header: ""}},
+	}}))
+	if matches(t, name, req("INVITE", "", HeaderField{"Via", ""}), Context{}) {
+		t.Error("empty header name pattern matched Via")
+	}
+}
+
+func TestHeaderNamePatternsMatchTheWholeName(t *testing.T) {
+	s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+		{Groups: []int{0}, Condition: SIPHeader{Header: "Contact", Content: "oma\\.cpm"}},
+	}}))
+	chat := `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`
+	tests := map[string]struct {
+		name string
+		want bool
+	}{
+		"Contact":        {"Contact", true},
+		"contact":        {"contact", true},
+		"Accept-Contact": {"Accept-Contact", false},
+		"Reject-Contact": {"Reject-Contact", false},
+		"Contacts":       {"Contacts", false},
+	}
+	for label, tc := range tests {
+		if got := matches(t, s, req("INVITE", impu, HeaderField{tc.name, chat}), Context{}); got != tc.want {
+			t.Errorf("%s: %t, want %t", label, got, tc.want)
+		}
+	}
+	// Alternation stays inside the anchors.
+	alt := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+		{Groups: []int{0}, Condition: SIPHeader{Header: "To|From"}},
+	}}))
+	if !matches(t, alt, req("INVITE", impu, from("<"+tel+">")), Context{}) ||
+		matches(t, alt, req("INVITE", impu, HeaderField{"Reply-To", "<" + tel + ">"}), Context{}) {
+		t.Error("an alternation in a name pattern escaped the anchors")
+	}
+}
+
+func TestSDPLinesEndingInCarriageReturnMatchAnchoredPatterns(t *testing.T) {
+	s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+		{Groups: []int{0}, Condition: SessionDescription{Line: "^m$", Content: `^message 9 TCP/MSRP \*$`}},
+	}}))
+	if !matches(t, s, &sipRequest{method: "INVITE", uri: impu, sdp: []string{"m=message 9 TCP/MSRP *\r"}}, Context{}) {
+		t.Error("the line's CR was matched as content")
+	}
+}
+
+func TestCompileRefusesPatternsWithAHugeProgram(t *testing.T) {
+	for name, pat := range map[string]string{
+		"repetition chained":  strings.Repeat("[ab]{1000}", 100), // 1000 bytes, about 100 000 instructions
+		"nested repetition":   "((a{100}){100}){100}",
+		"just over the limit": strings.Repeat("abcdefghij", MaxPatternInstructions/10+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc := criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+				Condition: SIPHeader{Header: "Subject", Content: pat}}}})
+			_, err := Compile([]FilterCriteria{fc})
+			if err == nil {
+				t.Fatal("Compile accepted the pattern")
+			}
+			if strings.Contains(err.Error(), "abc") || strings.Contains(err.Error(), "[ab]") {
+				t.Errorf("error quotes the pattern: %v", err)
+			}
+		})
+	}
+	// A pattern a person writes is far below the limit.
+	if _, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Accept-Contact", Content: `3gpp-service\.ims\.icsi\.oma\.cpm\.(session|msg|largemsg|filetransfer)`}}}})}); err != nil {
+		t.Errorf("ordinary pattern refused: %v", err)
+	}
+}
+
+// bulkyPattern compiles to a little under MaxPatternInstructions.
+var bulkyPattern = "(" + strings.Repeat("[a-z]", 9) + "){150}"
+
+func TestCompileRefusesASetLargerThanItsInstructionBudget(t *testing.T) {
+	var cs []FilterCriteria
+	for i := range 40 {
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+			Condition: SIPHeader{Header: "Subject", Content: bulkyPattern}}}}))
+	}
+	if _, err := Compile(cs[:1]); err != nil {
+		t.Fatalf("one bulky pattern refused: %v", err)
+	}
+	if _, err := Compile(cs); err == nil {
+		t.Error("forty bulky patterns accepted")
+	}
+}
+
+// TestAMaximumSizeDocumentOfCostlyPatternsIsRefusedCheaply fills the
+// document limit with patterns each just under the per-pattern limit. The
+// set budget must stop Compile long before the memory and time the patterns
+// would take.
+func TestAMaximumSizeDocumentOfCostlyPatternsIsRefusedCheaply(t *testing.T) {
+	var b strings.Builder
+	for i := 0; ; i++ {
+		fc := `<InitialFilterCriteria><Priority>` + strconv.Itoa(i) + `</Priority><TriggerPoint><ConditionTypeCNF>1</ConditionTypeCNF>` +
+			`<SPT><Group>0</Group><SIPHeader><Header>Subject</Header><Content>` + bulkyPattern + `</Content></SIPHeader></SPT></TriggerPoint>` +
+			`<ApplicationServer><ServerName>sip:a</ServerName></ApplicationServer></InitialFilterCriteria>`
+		if len(doc(b.String()+fc)) > MaxDocumentSize {
+			break
+		}
+		b.WriteString(fc)
+	}
+	s := mustParse(t, doc(b.String()))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	start := time.Now()
+	_, err := Compile(s.ServiceProfiles[0].InitialFilterCriteria)
+	elapsed := time.Since(start)
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Fatalf("Compile accepted %d bulky criteria", len(s.ServiceProfiles[0].InitialFilterCriteria))
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 {
+		t.Errorf("Compile allocated %d MiB before refusing", alloc>>20)
+	}
+	// Generous: the bound is about the work done, not this host's speed.
+	if elapsed > 5*time.Second {
+		t.Errorf("Compile took %s before refusing", elapsed)
+	}
+}
+
+func TestValuesOverTheirLimitAreNotExaminedAndAreCounted(t *testing.T) {
+	s := compile(t,
+		criteria(1, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: SIPHeader{Header: "Subject", Content: "x"}}}}),
+		criteria(2, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: RequestURI("x")}}}),
+		criteria(3, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: SessionDescription{Line: "a", Content: "x"}}}}),
+	)
+	priorities := func(r Request) []int {
+		var out []int
+		for _, fc := range s.Match(r, Context{}) {
+			out = append(out, fc.Priority)
+		}
+		return out
+	}
+	within := &sipRequest{method: "MESSAGE", uri: "sip:" + strings.Repeat("x", MaxRequestURILength-4),
+		headers: []HeaderField{{"Subject", strings.Repeat("x", MaxHeaderLength)}},
+		sdp:     []string{"a=" + strings.Repeat("x", MaxSDPLineLength-2)}}
+	if got := priorities(within); !reflect.DeepEqual(got, []int{1, 2, 3}) || s.OversizedValues() != 0 {
+		t.Fatalf("values at their limits: matched %v, oversized %d", got, s.OversizedValues())
+	}
+	over := &sipRequest{method: "MESSAGE", uri: "sip:" + strings.Repeat("x", MaxRequestURILength-3),
+		headers: []HeaderField{{"Subject", strings.Repeat("x", MaxHeaderLength+1)}, {strings.Repeat("S", MaxHeaderLength+1), "x"}},
+		sdp:     []string{"a=" + strings.Repeat("x", MaxSDPLineLength-1)}}
+	if got := priorities(over); len(got) != 0 {
+		t.Errorf("oversized values matched %v", got)
+	}
+	if n := s.OversizedValues(); n != 4 {
+		t.Errorf("OversizedValues = %d, want 4", n)
+	}
+	// A negated condition on an unexamined value holds.
+	neg := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+		{ConditionNegated: true, Groups: []int{0}, Condition: SIPHeader{Header: "Subject", Content: "x"}}}}))
+	if !matches(t, neg, over, Context{}) {
+		t.Error("negated condition on an oversized value did not hold")
+	}
+}
+
+func TestEverySPTIsEvaluatedOnceWhateverItsGroups(t *testing.T) {
+	// 2000 SPTs, each alone in its own group and also in a shared one: a
+	// DNF trigger that never matches visits every group.
+	var spts []SPT
+	for i := range 2000 {
+		spts = append(spts, SPT{Groups: []int{i, 5000}, Condition: Method("NOTIFY")})
+	}
+	s := compile(t, criteria(0, &TriggerPoint{SPTs: spts}))
+	r := req("MESSAGE", impu)
+	if matches(t, s, r, Context{}) {
+		t.Fatal("matched")
+	}
+	if n := r.calls["method"]; n > len(spts) {
+		t.Errorf("Method read %d times for %d SPTs", n, len(spts))
+	}
+	tr := s.criteria[0].trigger
+	entries := 0
+	for _, m := range tr.members {
+		entries += len(m)
+	}
+	if len(tr.members) != 2001 || entries != 4000 {
+		t.Errorf("index has %d groups and %d entries, want 2001 and 4000", len(tr.members), entries)
 	}
 }
 

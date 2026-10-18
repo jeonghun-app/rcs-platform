@@ -36,10 +36,30 @@
 // trigger. Criteria without a trigger point always match.
 //
 // Matching follows TS 29.228 Annex F. Request-URI, header and SDP patterns are
-// POSIX extended regular expressions, run with Go's linear-time engine, so a
-// hostile pattern cannot stall the S-CSCF. A pattern matches anywhere in its
-// field, as a POSIX regexec would; anchor it with ^ and $ to match the whole
-// field. Header name and Request-URI patterns ignore case, because header
-// names and host names are case-insensitive in SIP (RFC 3261 §7.3.1,
-// §19.1.4); header values and SDP content are matched as written.
+// POSIX extended regular expressions, run with Go's engine, whose time is
+// linear in the value matched and in the size of the compiled pattern. Both
+// are bounded, so neither a profile nor a request can make an evaluation
+// expensive: a pattern may compile to at most [MaxPatternInstructions] and a
+// set to at most [MaxSetInstructions] (Compile refuses more), and a value
+// longer than [MaxHeaderLength], [MaxRequestURILength] or [MaxSDPLineLength]
+// is not examined, which [Set.OversizedValues] counts.
+//
+// A header name pattern must match the whole header name, compared without
+// regard to case (header names are case-insensitive, RFC 3261 §7.3.1): the
+// pattern "Contact" selects Contact and not Accept-Contact. Every other
+// pattern matches anywhere in its field, as a POSIX regexec would; anchor it
+// with ^ and $ to match the whole field. Request-URI patterns ignore case,
+// because host names do (RFC 3261 §19.1.4); header values and SDP content are
+// matched as written. Operators writing iFC, and docs/hss.md, follow these
+// rules.
+//
+// # Presenting a SIP request
+//
+// The adapter from the SIP message type to [Request] belongs to the S-CSCF
+// (#14). It gives header names in their full form through sip.CanonicalName,
+// since a received message may use compact forms, and splits a header into
+// its comma-separated values only when the header has the list syntax of
+// RFC 3261 §7.3.1 (as sip.Header.Elements does for those headers): Subject,
+// Date and WWW-Authenticate values contain commas that do not separate
+// values.
 package ifc

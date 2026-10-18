@@ -4,10 +4,12 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"regexp/syntax"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // Request is the view of a SIP request that service point triggers examine.
@@ -28,6 +30,28 @@ type Request interface {
 	// any, such as "m=message 9 TCP/MSRP *", without line endings.
 	SDPLines() []string
 }
+
+// Limits on what evaluation examines. A pattern's cost is its program size
+// times the length of the value it runs over, so both are bounded: a profile
+// cannot make Compile hold an unbounded program, and a request cannot make one
+// evaluation scan an unbounded value. A value longer than its limit (counted
+// before white space is normalised) is not examined: the condition is false
+// for it, so a negated condition holds, and [Set.OversizedValues] counts it.
+const (
+	// MaxPatternInstructions bounds the compiled program of one pattern. A
+	// pattern a person writes compiles to tens of instructions; counted
+	// repetition ("{n}") is what multiplies the size.
+	MaxPatternInstructions = 2000
+	// MaxSetInstructions bounds the programs of one [Set] together, which is
+	// what an S-CSCF holds for each registration.
+	MaxSetInstructions = 50000
+	// MaxHeaderLength bounds a header name or value that is matched.
+	MaxHeaderLength = 8 << 10
+	// MaxRequestURILength bounds the Request-URI that is matched.
+	MaxRequestURILength = 2 << 10
+	// MaxSDPLineLength bounds an SDP line that is matched.
+	MaxSDPLineLength = 1 << 10
+)
 
 // HeaderField is one header value of a [Request].
 type HeaderField struct {
@@ -58,7 +82,8 @@ func (c Context) registered() bool {
 // criteria that Match and Next return share their trigger points with the
 // ones passed to Compile; treat them as read-only.
 type Set struct {
-	criteria []compiledCriteria
+	criteria  []compiledCriteria
+	oversized atomic.Uint64
 }
 
 type compiledCriteria struct {
@@ -67,14 +92,15 @@ type compiledCriteria struct {
 }
 
 type compiledTrigger struct {
-	cnf    bool
-	spts   []compiledSPT
-	groups []int // distinct group numbers, ascending
+	cnf  bool
+	spts []compiledSPT
+	// members lists, for each distinct group number, the indexes of the
+	// SPTs in it, so that evaluation is linear in the group memberships.
+	members [][]int
 }
 
 type compiledSPT struct {
 	negated bool
-	groups  []int
 	kind    conditionKind
 	// method or session case, for those kinds
 	method  string
@@ -110,10 +136,11 @@ func Compile(criteria []FilterCriteria) (*Set, error) {
 		return nil, r.err
 	}
 	s := &Set{criteria: make([]compiledCriteria, 0, len(criteria))}
+	budget := MaxSetInstructions
 	for _, fc := range criteria {
 		c := compiledCriteria{fc: fc}
 		if fc.TriggerPoint != nil {
-			t, err := compileTrigger(fc.TriggerPoint)
+			t, err := compileTrigger(fc.TriggerPoint, &budget)
 			if err != nil {
 				return nil, fmt.Errorf("ifc: filter criteria with priority %d: %w", fc.Priority, err)
 			}
@@ -130,48 +157,63 @@ func Compile(criteria []FilterCriteria) (*Set, error) {
 	return s, nil
 }
 
-func compileTrigger(tp *TriggerPoint) (*compiledTrigger, error) {
+func compileTrigger(tp *TriggerPoint, budget *int) (*compiledTrigger, error) {
 	t := &compiledTrigger{cnf: tp.ConditionTypeCNF}
+	byGroup := map[int][]int{}
 	for i := range tp.SPTs {
-		spt, err := compileSPT(&tp.SPTs[i])
+		spt, err := compileSPT(&tp.SPTs[i], budget)
 		if err != nil {
 			return nil, fmt.Errorf("SPT %d: %w", i+1, err)
 		}
 		t.spts = append(t.spts, spt)
-		t.groups = append(t.groups, spt.groups...)
+		for _, g := range tp.SPTs[i].Groups {
+			if m := byGroup[g]; len(m) == 0 || m[len(m)-1] != i {
+				byGroup[g] = append(m, i)
+			}
+		}
 	}
-	slices.Sort(t.groups)
-	t.groups = slices.Compact(t.groups)
+	for _, g := range slices.Sorted(maps.Keys(byGroup)) {
+		t.members = append(t.members, byGroup[g])
+	}
 	return t, nil
 }
 
-func compileSPT(spt *SPT) (compiledSPT, error) {
-	c := compiledSPT{negated: spt.ConditionNegated, groups: slices.Clone(spt.Groups)}
+func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
+	c := compiledSPT{negated: spt.ConditionNegated}
 	var err error
 	switch v := spt.Condition.(type) {
 	case RequestURI:
 		c.kind = kindRequestURI
 		// Host names are case-insensitive (RFC 3261 §19.1.4).
-		c.name, err = compilePattern("RequestURI", string(v), true)
+		c.name, err = compilePattern("RequestURI", string(v), patternFoldCase, budget)
 	case Method:
 		c.kind, c.method, c.regs = kindMethod, string(v), slices.Clone(spt.RegistrationTypes)
 	case SIPHeader:
 		c.kind = kindHeader
-		// Header names are case-insensitive (RFC 3261 §7.3.1); values are
-		// matched as written.
-		if c.name, err = compilePattern("Header", v.Header, true); err == nil && v.Content != "" {
-			c.value, err = compilePattern("Content", v.Content, false)
+		// Header names are case-insensitive (RFC 3261 §7.3.1), and a name
+		// pattern must match the whole name: "Contact" must not select
+		// Accept-Contact or Reject-Contact. Values are matched as written,
+		// anywhere in the value, as Annex F's regexec semantics give.
+		if c.name, err = compilePattern("Header", v.Header, patternFoldCase|patternWhole, budget); err == nil && v.Content != "" {
+			c.value, err = compilePattern("Content", v.Content, 0, budget)
 		}
 	case SessionCase:
 		c.kind, c.session = kindSessionCase, v
 	case SessionDescription:
 		c.kind = kindSessionDescription
-		if c.name, err = compilePattern("Line", v.Line, false); err == nil && v.Content != "" {
-			c.value, err = compilePattern("Content", v.Content, false)
+		if c.name, err = compilePattern("Line", v.Line, 0, budget); err == nil && v.Content != "" {
+			c.value, err = compilePattern("Content", v.Content, 0, budget)
 		}
 	}
 	return c, err
 }
+
+type patternMode uint8
+
+const (
+	patternFoldCase patternMode = 1 << iota // ignore case
+	patternWhole                            // match the whole field
+)
 
 // compilePattern compiles a POSIX extended regular expression (TS 29.228
 // Annex F). The pattern is first parsed with Go's POSIX syntax, which refuses
@@ -180,7 +222,12 @@ func compileSPT(spt *SPT) (compiledSPT, error) {
 // engine, whose matching time is linear in the input. Only whether a pattern
 // matches is used, so leftmost-longest and leftmost-first semantics give the
 // same answers.
-func compilePattern(name, pattern string, foldCase bool) (*regexp.Regexp, error) {
+//
+// The program size is estimated from the parse tree before anything is
+// expanded, so a pattern such as "[ab]{1000}" repeated is refused without
+// building its program, and then counted exactly against
+// MaxPatternInstructions and the set's remaining budget.
+func compilePattern(name, pattern string, mode patternMode, budget *int) (*regexp.Regexp, error) {
 	if _, err := syntax.Parse(pattern, syntax.POSIX); err != nil {
 		var se *syntax.Error
 		if errors.As(err, &se) {
@@ -188,15 +235,67 @@ func compilePattern(name, pattern string, foldCase bool) (*regexp.Regexp, error)
 		}
 		return nil, fmt.Errorf("%s is not a POSIX extended regular expression", name)
 	}
-	prefix := "(?:"
-	if foldCase {
-		prefix = "(?i:"
+	expr := "(?:" + pattern + ")"
+	if mode&patternFoldCase != 0 {
+		expr = "(?i:" + pattern + ")"
 	}
-	re, err := regexp.Compile(prefix + pattern + ")")
+	if mode&patternWhole != 0 {
+		expr = "^" + expr + "$"
+	}
+	tree, err := syntax.Parse(expr, syntax.Perl)
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be compiled", name)
+	}
+	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
+	if estimateSize(tree) > 4*MaxPatternInstructions {
+		return nil, tooComplex
+	}
+	prog, err := syntax.Compile(tree.Simplify())
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be compiled", name)
+	}
+	n := len(prog.Inst)
+	if n > MaxPatternInstructions {
+		return nil, tooComplex
+	}
+	if n > *budget {
+		return nil, fmt.Errorf("the criteria compile to more than %d instructions together", MaxSetInstructions)
+	}
+	*budget -= n
+	re, err := regexp.Compile(expr)
 	if err != nil {
 		return nil, fmt.Errorf("%s cannot be compiled", name)
 	}
 	return re, nil
+}
+
+// estimateSize is an upper bound on the instructions syntax.Compile emits for
+// re, computed without expanding counted repetitions. It saturates, so it
+// cannot overflow however the repetitions nest.
+func estimateSize(re *syntax.Regexp) int {
+	const ceiling = 1 << 24
+	sum := func(subs []*syntax.Regexp) int {
+		n := 1
+		for _, sub := range subs {
+			n = min(n+estimateSize(sub)+1, ceiling)
+		}
+		return n
+	}
+	switch re.Op {
+	case syntax.OpLiteral:
+		return len(re.Rune) + 1
+	case syntax.OpConcat, syntax.OpAlternate:
+		return sum(re.Sub)
+	case syntax.OpCapture, syntax.OpStar, syntax.OpPlus, syntax.OpQuest:
+		return min(estimateSize(re.Sub[0])+2, ceiling)
+	case syntax.OpRepeat:
+		copies := re.Max
+		if copies < 0 {
+			copies = re.Min + 1
+		}
+		return min((copies+1)*(estimateSize(re.Sub[0])+2), ceiling)
+	}
+	return 2
 }
 
 // Len returns the number of criteria in the set.
@@ -207,6 +306,7 @@ func (s *Set) Len() int { return len(s.criteria) }
 // (TS 24.229 §5.4.1.7).
 func (s *Set) Match(req Request, ctx Context) []FilterCriteria {
 	in := newInput(req, ctx)
+	defer s.count(in)
 	var out []FilterCriteria
 	for i := range s.criteria {
 		if s.criteria[i].matches(in) {
@@ -216,6 +316,18 @@ func (s *Set) Match(req Request, ctx Context) []FilterCriteria {
 	return out
 }
 
+// OversizedValues returns how many header values, Request-URIs and SDP lines
+// evaluations of this set have left unexamined because they exceeded their
+// limit. A rising count means requests that iFC may have misjudged, worth a
+// metric.
+func (s *Set) OversizedValues() uint64 { return s.oversized.Load() }
+
+func (s *Set) count(in *input) {
+	if in.oversized > 0 {
+		s.oversized.Add(uint64(in.oversized))
+	}
+}
+
 // Next returns the first criterion, in priority order, whose priority is
 // greater than after and that applies to the request; pass -1 to start. The
 // S-CSCF calls it again with the priority it last used when the request
@@ -223,6 +335,7 @@ func (s *Set) Match(req Request, ctx Context) []FilterCriteria {
 // (TS 24.229 §5.4.3.2).
 func (s *Set) Next(req Request, ctx Context, after int) (FilterCriteria, bool) {
 	in := newInput(req, ctx)
+	defer s.count(in)
 	for i := range s.criteria {
 		c := &s.criteria[i]
 		if c.fc.Priority > after && c.matches(in) {
@@ -259,13 +372,13 @@ func (t *compiledTrigger) matches(in *input) bool {
 		}
 		return results[i] == 1
 	}
-	for _, g := range t.groups {
+	for _, members := range t.members {
 		if t.cnf {
 			// Each group is an OR; every group must hold.
-			if !t.anyInGroup(g, holds) {
+			if !slices.ContainsFunc(members, holds) {
 				return false
 			}
-		} else if t.allInGroup(g, holds) {
+		} else if !slices.ContainsFunc(members, func(i int) bool { return !holds(i) }) {
 			// Each group is an AND; one group is enough.
 			return true
 		}
@@ -273,28 +386,11 @@ func (t *compiledTrigger) matches(in *input) bool {
 	return t.cnf
 }
 
-func (t *compiledTrigger) anyInGroup(g int, holds func(int) bool) bool {
-	for i := range t.spts {
-		if slices.Contains(t.spts[i].groups, g) && holds(i) {
-			return true
-		}
-	}
-	return false
-}
-
-func (t *compiledTrigger) allInGroup(g int, holds func(int) bool) bool {
-	for i := range t.spts {
-		if slices.Contains(t.spts[i].groups, g) && !holds(i) {
-			return false
-		}
-	}
-	return true
-}
-
 func (c *compiledSPT) matches(in *input) bool {
 	switch c.kind {
 	case kindRequestURI:
-		return c.name.MatchString(in.uriPart())
+		part, ok := in.uriPart()
+		return ok && c.name.MatchString(part)
 	case kindMethod:
 		if in.req.Method() != c.method {
 			return false
@@ -328,8 +424,11 @@ func (c *compiledSPT) matches(in *input) bool {
 type input struct {
 	req Request
 	ctx Context
+	// oversized counts the values left unexamined for their length.
+	oversized int
 
 	uri        string
+	uriOK      bool
 	uriDone    bool
 	fields     []HeaderField
 	fieldsDone bool
@@ -339,11 +438,16 @@ type input struct {
 
 func newInput(req Request, ctx Context) *input { return &input{req: req, ctx: ctx} }
 
-func (in *input) uriPart() string {
+func (in *input) uriPart() (string, bool) {
 	if !in.uriDone {
-		in.uri, in.uriDone = requestURIPart(in.req.RequestURI()), true
+		in.uriDone = true
+		if uri := in.req.RequestURI(); len(uri) <= MaxRequestURILength {
+			in.uri, in.uriOK = requestURIPart(uri), true
+		} else {
+			in.oversized++
+		}
 	}
-	return in.uri
+	return in.uri, in.uriOK
 }
 
 func (in *input) headers() []HeaderField {
@@ -352,6 +456,10 @@ func (in *input) headers() []HeaderField {
 		// removed and inner runs of it reduced to one space, which is what
 		// collapse does.
 		for _, h := range in.req.HeaderFields() {
+			if len(h.Name) > MaxHeaderLength || len(h.Value) > MaxHeaderLength {
+				in.oversized++
+				continue
+			}
 			in.fields = append(in.fields, HeaderField{Name: collapse(h.Name), Value: collapse(h.Value)})
 		}
 		in.fieldsDone = true
@@ -365,6 +473,10 @@ func (in *input) sdp() []HeaderField {
 	if !in.linesDone {
 		for _, l := range in.req.SDPLines() {
 			l = strings.TrimSuffix(l, "\r")
+			if len(l) > MaxSDPLineLength {
+				in.oversized++
+				continue
+			}
 			if typ, value, ok := strings.Cut(l, "="); ok {
 				in.lines = append(in.lines, HeaderField{Name: typ, Value: value})
 			}
