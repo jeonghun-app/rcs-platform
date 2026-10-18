@@ -60,6 +60,7 @@ a maintainer; behaviour built on it is listed as unverified in
 | 3862 | Common Presence and Instant Messaging (CPIM) message format |
 | 5438 | Instant Message Disposition Notification (IMDN) |
 | 5626 | SIP outbound (flow tokens) |
+| 6223 | Indication of support for keep-alive (Via `keep`) |
 | 6733, 4006 | Diameter base protocol |
 | 3539 | AAA transport profile: Diameter watchdog (DWR/DWA, Tw, REOPEN) |
 | 4330 | Simple Network Time Protocol: era rule for Diameter `Time` after 2036 |
