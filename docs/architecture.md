@@ -186,7 +186,10 @@ uses DynamoDB Local and a local S3.
   distroless image can run an ECS container health check.
 - **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
   linear in its input (a test parses a maximum-size adversarial input), and never
-  repairs input it forwards: received bytes are passed on unchanged. Receivers
+  repairs content it does not own: message bodies such as CPIM and MSRP payloads
+  are forwarded byte for byte, and only the headers and SDP lines a service is
+  responsible for (Via, Record-Route, the `m=message` lines `pcscf` anchors) are
+  rewritten. Receivers
   may *interpret* common deviations leniently where interoperability needs it
   (e.g. bare LF, extra whitespace) and count them; senders are strict. Anything
   ambiguous, or a security risk (control characters, invalid UTF-8, mixed line

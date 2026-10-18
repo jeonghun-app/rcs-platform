@@ -34,8 +34,10 @@ gateway controlled by the P-CSCF (TS 23.334).
     network to dial it. The relay **never dials clients** (a client-supplied
     target is an SSRF and port-scanning vector, and the outbound leg could not
     use the NLB's TLS). The answer arrives in a 2xx, which a proxy must forward
-    (RFC 3261 §16.7), so `pcscf` forwards it to `rcs-as` (with the relay as
-    `active` toward `rcs-as`, as usual) and then ends the session: it sends BYE
+    (RFC 3261 §16.7). `pcscf` first releases the relay binding, so the relay never
+    connects to `rcs-as` for this session, then forwards the 2xx and, once the
+    ACK from `rcs-as` has passed through, ends the session as a P-CSCF may
+    (TS 24.229 §5.2.10, clause to confirm against the targeted edition): BYE
     toward the client and toward `rcs-as`, both with
     `Reason: SIP;cause=488;text="MSRP direction not supported"`.
     `rcs-as` treats a BYE carrying that Reason before any MSRP traffic as a
@@ -77,7 +79,9 @@ RCS and keeps the client unaware of the relay.
   sessions from the network. `rcs-as` delivers to it with **pager-mode
   standalone messaging** (SIP MESSAGE, no MSRP) when the message fits the pager
   limit; larger content stays stored and is delivered inside the next session the
-  client itself originates. `rcs-as` does not retry a terminating session to that
-  contact, since it would fail the same way. Recorded as a limitation; the count
-  is a metric.
+  client itself originates to that conversation, until the store-and-forward
+  expiry (`RCSAS_STORE_TTL`, default 7 days), after which the sender gets a
+  negative delivery notification. `rcs-as` does not retry terminating sessions to
+  that contact while it stays registered on the same flow; a registration on a
+  new flow clears the marker. Recorded as a limitation; the count is a metric.
 - The relay needs no internet egress.
