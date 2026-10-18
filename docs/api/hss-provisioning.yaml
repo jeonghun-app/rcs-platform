@@ -1,0 +1,564 @@
+# HSS provisioning API (internal/hss, docs/hss.md).
+#
+# Callers and the operations each may use are in hss-provisioning.md, next to
+# this file. ft-server's lookup (getFTCredential) is the contract of
+# internal/ftserver HSSCredentials.
+openapi: 3.1.0
+info:
+  title: HSS provisioning API
+  version: 1.0.0
+  description: |
+    Provisioning API of the platform's HSS: subscriptions (identities,
+    credentials, service profile), service profiles with their initial filter
+    criteria, and the credential operations acs and ft-server use.
+
+    Every request needs a bearer token of a caller allowed the operation
+    (hss-provisioning.md). Responses carry `Cache-Control: no-store`. Errors are
+    `{"error": "..."}` and never quote the request. A store failure is 503 with
+    `Retry-After`, so callers retry. Keys (K, OPc, OP) are write-only; a
+    generated password is returned once, by the request that issues it.
+
+    Changes to a subscription an S-CSCF serves are pushed to it over Cx (RTR or
+    PPR) after they are stored; docs/hss.md lists which change causes which.
+servers:
+  - url: http://hss.{namespace}:8081
+    description: Inside the VPC only (ADR 0007), through Cloud Map
+    variables:
+      namespace:
+        default: rcs.local
+security:
+  - bearer: []
+paths:
+  /v1/subscriptions:
+    post:
+      operationId: createSubscription
+      summary: Create a subscription
+      description: Caller admin. Credentials are added afterwards with putAKA or the credential operations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubscriptionRequest" }
+      responses:
+        "201":
+          description: Created.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Location: { description: The subscription's URL., schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: The IMPI exists, or an IMPU belongs to another subscription. }
+        "413": { description: The body is larger than 64 KiB. }
+        "415": { description: The body is not application/json. }
+        "422": { description: The service profile does not exist. }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/subscriptions/{impi}:
+    parameters:
+      - $ref: "#/components/parameters/IMPI"
+    get:
+      operationId: getSubscription
+      summary: Read a subscription
+      description: Caller admin, or acs for a subscription with acs_managed. Never returns a secret.
+      responses:
+        "200":
+          description: The subscription.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    put:
+      operationId: putSubscription
+      summary: Replace a subscription's provisioned fields
+      description: |
+        Caller admin. Replaces IMSI, identities, service profile, charging
+        information and acs_managed; credentials and the Cx state stay. An
+        identity that stays keeps its registration state; one added to a served
+        implicit set takes the set's state.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubscriptionRequest" }
+      responses:
+        "200":
+          description: Replaced.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: An IMPU belongs to another subscription. }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "422": { description: The service profile does not exist. }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    delete:
+      operationId: deleteSubscription
+      summary: Delete a subscription
+      description: Caller admin. A served subscription is deregistered with RTR PERMANENT_TERMINATION.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/subscriptions/{impi}/aka:
+    parameters:
+      - $ref: "#/components/parameters/IMPI"
+    put:
+      operationId: putAKA
+      summary: Set the IMS AKA keys
+      description: Caller admin. Write-only; the keys are sealed and never returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AKAKeys" }
+      responses:
+        "204": { description: Stored. }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/subscriptions/{impi}/digest-credential:
+    parameters:
+      - $ref: "#/components/parameters/IMPI"
+    post:
+      operationId: issueIMSCredential
+      summary: Issue the SIP Digest password of the IMS realm
+      description: |
+        Caller admin, or acs for a subscription with acs_managed. Generates a
+        random password (192 bits), stores its MD5 and SHA-256 HA1 for the IMS
+        realm, replacing any earlier one, and returns it once. The Digest user
+        name is the IMPI. No request body.
+      responses:
+        "201":
+          description: Issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssuedCredential" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/subscriptions/{impi}/ft-credential:
+    parameters:
+      - $ref: "#/components/parameters/IMPI"
+    post:
+      operationId: issueFTCredential
+      summary: Issue the HTTP Digest password of the FT realm
+      description: |
+        Caller admin, or acs for a subscription with acs_managed. As
+        issueIMSCredential for the FT realm; acs provisions the result as the FT
+        content server user and password (RCC.14).
+      responses:
+        "201":
+          description: Issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssuedCredential" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "501": { description: This HSS has no FT realm (HSS_FT_REALM). }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      operationId: getFTCredential
+      summary: HA1 of a subscriber's File Transfer credential
+      description: |
+        Caller ft-server only. Returns H(impi:realm:password) of the FT credential
+        for the algorithm asked for, and the IMPU that owns the subscriber's
+        uploads: the first identity that is not barred. The answer is a secret:
+        callers must not log or cache it beyond the request that needs it.
+      parameters:
+        - name: algorithm
+          in: query
+          required: true
+          description: Digest algorithm the HA1 is computed for (RFC 7616 §3.3).
+          schema:
+            type: string
+            enum: [MD5, SHA-256]
+      responses:
+        "200":
+          description: The credential.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FTCredential" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: No such subscription, no FT credential, or every identity barred. ft-server treats all as an unknown user.
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/service-profiles:
+    post:
+      operationId: createProfile
+      summary: Create a service profile
+      description: |
+        Caller admin. The criteria are compiled as the S-CSCF compiles them and
+        evaluated against reference requests within its default work budget;
+        a profile that fails either, or whose User-Data would be too large, is
+        refused with 400 naming the field or the limit, and one that needs more
+        than half of the budget is stored with a warning (docs/hss.md, "Writing
+        iFC").
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServiceProfile" }
+      responses:
+        "201":
+          description: Created.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Location: { description: The profile's URL., schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceProfile" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: The ID exists. }
+        "413": { description: The body is larger than 256 KiB. }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/service-profiles/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ProfileID"
+    get:
+      operationId: getProfile
+      summary: Read a service profile
+      description: Caller admin.
+      responses:
+        "200":
+          description: The profile.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceProfile" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    put:
+      operationId: putProfile
+      summary: Replace a service profile
+      description: |
+        Caller admin. Validated as in createProfile. Every served subscription
+        using the profile gets a PPR with its new User-Data, sent in the
+        background after the response.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServiceProfile" }
+      responses:
+        "200":
+          description: Replaced.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceProfile" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    delete:
+      operationId: deleteProfile
+      summary: Delete a service profile
+      description: Caller admin.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: A subscription uses the profile. }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: A token of the caller (hss-provisioning.md); 256 bits or more.
+  parameters:
+    IMPI:
+      name: impi
+      in: path
+      required: true
+      description: Private user identity user@realm, percent-encoded as one path segment.
+      schema: { type: string, maxLength: 255 }
+      example: 001010000000001@ims.mnc001.mcc001.3gppnetwork.org
+    ProfileID:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/ProfileID" }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: The ETag read; the change is refused with 412 when the stored version differs.
+      schema: { type: string, example: '"3"' }
+  headers:
+    ETag:
+      description: The version, quoted, for If-Match.
+      schema: { type: string, example: '"1"' }
+  responses:
+    Invalid:
+      description: The request is not valid; the message says which field.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthenticated:
+      description: No bearer token, or one that is not accepted.
+      headers:
+        WWW-Authenticate: { schema: { type: string, example: 'Bearer realm="hss"' } }
+    Forbidden:
+      description: The token's caller may not use the operation, or acs asked for a subscription without acs_managed.
+    NotFound:
+      description: No such subscription or profile.
+    PreconditionFailed:
+      description: If-Match does not match the stored version.
+    RateLimited:
+      description: The acs token is over its rate limit.
+      headers:
+        Retry-After: { schema: { type: integer } }
+    Unavailable:
+      description: No token is configured for the operation, or the store is unavailable; retry.
+      headers:
+        Retry-After: { schema: { type: integer } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    ProfileID:
+      type: string
+      pattern: "^[a-z0-9._-]{1,64}$"
+    PublicIdentity:
+      type: object
+      required: [impu]
+      additionalProperties: false
+      properties:
+        impu:
+          type: string
+          maxLength: 255
+          description: SIP URI with a user part, or a global tel URI; stored in canonical form (docs/hss.md).
+          example: sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org
+        barred:
+          type: boolean
+          default: false
+          description: Barred from everything but registration (TS 29.228 B.2.1).
+        identity_type:
+          type: string
+          enum: [PUBLIC_USER_IDENTITY]
+          default: PUBLIC_USER_IDENTITY
+        implicit_set:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Identities with the same number register together (TS 29.228 §6.5).
+        registration_state:
+          type: string
+          enum: [NOT_REGISTERED, REGISTERED, UNREGISTERED]
+          readOnly: true
+    ChargingInformation:
+      type: object
+      additionalProperties: false
+      description: DiameterURIs of the charging functions (TS 29.229 §6.3.19); a primary one is required.
+      properties:
+        primary_event_charging_function_name: { type: string, example: aaa://ecf.ims.mnc001.mcc001.3gppnetwork.org }
+        secondary_event_charging_function_name: { type: string }
+        primary_charging_collection_function_name: { type: string }
+        secondary_charging_collection_function_name: { type: string }
+    SubscriptionRequest:
+      type: object
+      required: [impi, public_identities]
+      additionalProperties: false
+      properties:
+        impi: { type: string, maxLength: 255, description: Required on create; on replace it must match the path when given. }
+        imsi: { type: string, pattern: "^[0-9]{6,15}$" }
+        public_identities:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items: { $ref: "#/components/schemas/PublicIdentity" }
+        service_profile:
+          allOf: [{ $ref: "#/components/schemas/ProfileID" }]
+          description: Defaults to HSS_DEFAULT_PROFILE.
+        charging_information: { $ref: "#/components/schemas/ChargingInformation" }
+        acs_managed:
+          type: boolean
+          default: false
+          description: Lets acs read the subscription and issue its credentials.
+    Subscription:
+      type: object
+      properties:
+        impi: { type: string }
+        imsi: { type: string }
+        public_identities:
+          type: array
+          items: { $ref: "#/components/schemas/PublicIdentity" }
+        service_profile: { $ref: "#/components/schemas/ProfileID" }
+        charging_information: { $ref: "#/components/schemas/ChargingInformation" }
+        acs_managed: { type: boolean }
+        credentials:
+          type: object
+          description: Which credentials exist; their values are never returned.
+          properties:
+            aka: { type: boolean }
+            ims_digest: { type: boolean }
+            ft_digest: { type: boolean }
+        server_name: { type: string, description: The assigned S-CSCF, if any. }
+        authentication_pending: { type: boolean }
+        version: { type: integer }
+    AKAKeys:
+      type: object
+      required: [k]
+      additionalProperties: false
+      description: Exactly one of opc and op.
+      properties:
+        k: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
+        opc: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
+        op: { type: string, pattern: "^[0-9a-fA-F]{32}$", description: Turned into OPc (TS 35.206 §4) and not stored. }
+        amf: { type: string, pattern: "^[0-9a-fA-F]{4}$", default: "8000" }
+        sqn:
+          type: string
+          pattern: "^[0-9a-fA-F]{12}$"
+          description: SQN_HE to continue from; the stored one is kept, or 0 for new keys, when absent.
+    IssuedCredential:
+      type: object
+      required: [impi, username, realm, password]
+      properties:
+        impi: { type: string }
+        username: { type: string, description: The Digest user name, the IMPI. }
+        realm: { type: string }
+        password: { type: string, description: Shown once; only its HA1 is stored. }
+    FTCredential:
+      type: object
+      required: [impi, impu, realm, algorithm, ha1]
+      properties:
+        impi: { type: string, description: The IMPI as stored. }
+        impu: { type: string, description: The public identity that owns the subscriber's uploads. }
+        realm: { type: string, description: The FT realm. }
+        algorithm: { type: string, enum: [MD5, SHA-256] }
+        ha1:
+          type: string
+          pattern: "^[0-9a-f]+$"
+          description: Lower-case hex H(impi:realm:password), 32 digits for MD5, 64 for SHA-256.
+    ServiceProfile:
+      type: object
+      required: [id, initial_filter_criteria]
+      additionalProperties: false
+      properties:
+        id: { $ref: "#/components/schemas/ProfileID" }
+        initial_filter_criteria:
+          type: array
+          maxItems: 64
+          items: { $ref: "#/components/schemas/Criterion" }
+        mandatory_capabilities: { type: array, maxItems: 32, items: { type: integer, minimum: 0 } }
+        optional_capabilities: { type: array, maxItems: 32, items: { type: integer, minimum: 0 } }
+        version: { type: integer, readOnly: true }
+        warnings:
+          type: array
+          readOnly: true
+          items: { type: string }
+          description: |
+            In the answer to createProfile and putProfile: the profile is stored,
+            but evaluating a reference request needs more than half of the
+            S-CSCF's default work budget (docs/hss.md, "Writing iFC").
+    Criterion:
+      type: object
+      description: One tInitialFilterCriteria (TS 29.228 B.2.2); the names follow the XML schema.
+      required: [priority, application_server]
+      additionalProperties: false
+      properties:
+        priority: { type: integer, minimum: 0, description: Unique within the profile; lower first. }
+        trigger_point:
+          type: object
+          required: [condition_type_cnf, spt]
+          additionalProperties: false
+          properties:
+            condition_type_cnf: { type: boolean }
+            spt:
+              type: array
+              minItems: 1
+              maxItems: 64
+              items: { $ref: "#/components/schemas/SPT" }
+        application_server:
+          type: object
+          required: [server_name, default_handling]
+          additionalProperties: false
+          properties:
+            server_name: { type: string, example: sip:rcs-as.rcs.local }
+            default_handling: { type: string, enum: [SESSION_CONTINUED, SESSION_TERMINATED] }
+            service_info: { type: string }
+            include_register_request: { type: boolean }
+            include_register_response: { type: boolean }
+        profile_part_indicator:
+          type: string
+          enum: [REGISTERED, UNREGISTERED]
+          description: Absent means both parts of the profile.
+    SPT:
+      type: object
+      description: One tSePoTri; exactly one of the conditions. Patterns are POSIX extended regular expressions (docs/hss.md, "Writing iFC").
+      required: [group]
+      additionalProperties: false
+      properties:
+        condition_negated: { type: boolean }
+        group: { type: array, minItems: 1, items: { type: integer, minimum: 0 } }
+        request_uri: { type: string }
+        method: { type: string, example: MESSAGE }
+        sip_header:
+          type: object
+          required: [header]
+          additionalProperties: false
+          properties:
+            header: { type: string, description: Must match the whole header name. }
+            content: { type: string }
+        session_case:
+          type: string
+          enum: [ORIGINATING_REGISTERED, TERMINATING_REGISTERED, TERMINATING_UNREGISTERED, ORIGINATING_UNREGISTERED, ORIGINATING_CDIV]
+        session_description:
+          type: object
+          required: [line]
+          additionalProperties: false
+          properties:
+            line: { type: string }
+            content: { type: string }
+        registration_type:
+          type: array
+          maxItems: 2
+          items: { type: string, enum: [INITIAL_REGISTRATION, RE-REGISTRATION, DE-REGISTRATION] }
