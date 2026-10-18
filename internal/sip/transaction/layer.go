@@ -45,12 +45,18 @@ var (
 )
 
 // Sender sends messages; *transport.Transport implements it.
+//
+// The layer passes transport.NoWait for what it sends on behalf of a message it
+// is receiving, on the goroutine that read it: the 100 Trying, the ACK for a
+// failure response and the answer to a retransmission. Waiting there for room in
+// a connection's send queue could deadlock with a peer that is waiting for us to
+// read. What the TU originates waits, so a burst is paced by the peer.
 type Sender interface {
 	// SendRequest sends a request and reports the transport it used, which
 	// decides whether the client transaction retransmits.
-	SendRequest(req *sip.Request, dst transport.Destination) (transport.Network, error)
+	SendRequest(req *sip.Request, dst transport.Destination, opts ...transport.SendOption) (transport.Network, error)
 	// SendResponse sends a response to the request that came from src.
-	SendResponse(res *sip.Response, src transport.Source) error
+	SendResponse(res *sip.Response, src transport.Source, opts ...transport.SendOption) error
 }
 
 // TU is the transaction user. Its methods are called without any lock held, from
@@ -58,9 +64,9 @@ type Sender interface {
 //
 // While a method runs, nothing else is read from the connection the message came
 // on, or from the UDP socket every UDP client shares. Layer.Request and
-// ServerTransaction.Respond send synchronously and can block for up to the
-// transport's DialTimeout plus WriteTimeout, so a proxy that forwards to another
-// flow does so off this goroutine.
+// ServerTransaction.Respond wait for room in a full send queue, for up to the
+// transport's WriteTimeout, and for a new connection, up to DialTimeout; so a TU
+// answers a busy connection, or forwards to another flow, off this goroutine.
 type TU interface {
 	// Request receives a request that created a server transaction. The TU
 	// answers with tx.Respond.

@@ -91,9 +91,10 @@ type fakeSender struct {
 }
 
 type sent struct {
-	at  time.Duration
-	msg sip.Message
-	dst transport.Destination
+	at     time.Duration
+	msg    sip.Message
+	dst    transport.Destination
+	noWait bool
 }
 
 // label names a message the way the tables write it: the method of a request,
@@ -108,23 +109,23 @@ func label(m sip.Message) string {
 	return "?"
 }
 
-func (s *fakeSender) SendRequest(req *sip.Request, dst transport.Destination) (transport.Network, error) {
+func (s *fakeSender) SendRequest(req *sip.Request, dst transport.Destination, opts ...transport.SendOption) (transport.Network, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		return "", s.fail
 	}
-	s.sent = append(s.sent, sent{s.clock.elapsed(), req, dst})
+	s.sent = append(s.sent, sent{s.clock.elapsed(), req, dst, slices.Contains(opts, transport.NoWait)})
 	return s.network, nil
 }
 
-func (s *fakeSender) SendResponse(res *sip.Response, src transport.Source) error {
+func (s *fakeSender) SendResponse(res *sip.Response, src transport.Source, opts ...transport.SendOption) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		return s.fail
 	}
-	s.sent = append(s.sent, sent{s.clock.elapsed(), res, transport.Destination{}})
+	s.sent = append(s.sent, sent{s.clock.elapsed(), res, transport.Destination{}, slices.Contains(opts, transport.NoWait)})
 	return nil
 }
 
@@ -143,6 +144,21 @@ func (s *fakeSender) take() []string {
 		out = append(out, label(x.msg))
 	}
 	s.sent = nil
+	return out
+}
+
+// modes returns each message sent as "label wait" or "label nowait".
+func (s *fakeSender) modes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, x := range s.sent {
+		m := " wait"
+		if x.noWait {
+			m = " nowait"
+		}
+		out = append(out, label(x.msg)+m)
+	}
 	return out
 }
 
