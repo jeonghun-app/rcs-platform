@@ -92,6 +92,14 @@ build: volumes ## Compile every service binary into bin/
 	  for d in cmd/*/; do [ -d "$$d" ] || continue; n=$$(basename "$$d"); \
 	    go build -trimpath -ldflags "$(LDFLAGS)" -o "bin/$$n" "./$$d"; echo "bin/$$n"; done'
 
+# Docker tags cannot contain "+", which VERSION may (semver build metadata).
+.PHONY: image
+image: ## Build the service image: every cmd/* binary on distroless, non-root
+	@$(CHECK_VERSION)
+	$(DOCKER) build -f deploy/Dockerfile \
+	  --build-arg VERSION="$$VERSION" --build-arg REVISION="$$REVISION" \
+	  -t "$(IMAGE):$$(printf %s "$$VERSION" | tr + _)" .
+
 .PHONY: vuln
 vuln: volumes ## Verify modules and scan reachable vulnerabilities
 	$(RUNGO) $(GOIMAGE) go mod verify
