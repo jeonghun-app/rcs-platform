@@ -118,22 +118,32 @@ func (c *fakeClock) Advance(d time.Duration) {
 // test advances the clock only after the code under test has armed it.
 func (c *fakeClock) waitForTimer(t testing.TB, d time.Duration) {
 	t.Helper()
+	c.waitForTimers(t, d, 1)
+}
+
+// waitForTimers blocks until n live timers are due exactly d from now.
+func (c *fakeClock) waitForTimers(t testing.TB, d time.Duration, n int) {
+	t.Helper()
 	deadline := time.After(realWait)
 	for {
 		c.mu.Lock()
 		target := c.now.Add(d)
+		found := 0
 		for _, x := range c.timers {
 			if !x.done && x.when.Equal(target) {
-				c.mu.Unlock()
-				return
+				found++
 			}
+		}
+		if found >= n {
+			c.mu.Unlock()
+			return
 		}
 		ch := c.changed
 		c.mu.Unlock()
 		select {
 		case <-ch:
 		case <-deadline:
-			t.Fatalf("no timer due in %s was armed", d)
+			t.Fatalf("%d of %d timers due in %s were armed", found, n, d)
 		}
 	}
 }

@@ -28,6 +28,7 @@ var (
 	errWatchdogExpired = errors.New("diameter: watchdog expired with no answer from the peer")
 	errDuplicatePeer   = errors.New("diameter: peer identity already has an open connection")
 	errPeerDisconnect  = errors.New("diameter: peer sent DPR and did not close the connection")
+	errNotDraining     = errors.New("diameter: peer does not read the answers to its requests")
 )
 
 type result struct {
@@ -43,9 +44,18 @@ type pendingRequest struct {
 
 // conn is one transport connection to a peer, from the capabilities exchange
 // until it closes. Three goroutines serve an open connection: the read loop
-// (which also dispatches requests), the writer, and the watchdog. The read
-// loop never writes to the socket, so two nodes that both answer while
-// neither reads cannot block each other's read loops.
+// (which also dispatches requests), the writer, and the watchdog.
+//
+// The read loop and the watchdog never wait for the writer. If they did, two
+// nodes sending each other requests could each fill its write queue while
+// its read loop waited for room, and neither would read again: a deadlock
+// between two healthy peers. Their messages (base protocol answers,
+// node-built error answers, DWRs) therefore go to a separate control queue
+// that is bounded by bytes, served first, and never blocks; when it is full
+// the peer is not reading what it asked for, and the connection is closed
+// (a DWR is dropped instead, which the watchdog counts as unanswered).
+// Handlers and Send wait for room in the main queue, Send no longer than its
+// timeout.
 type conn struct {
 	node *Node
 	nc   net.Conn
@@ -56,13 +66,14 @@ type conn struct {
 	caps capabilities
 	apps []uint32
 
-	writes   chan []byte
-	inflight chan struct{}
-	wdFire   chan struct{}
-	done     chan struct{}
-	ctx      context.Context // handlers' context; ends at close
-	cancel   context.CancelFunc
-	once     sync.Once
+	writes       chan []byte
+	controlReady chan struct{} // wakes the writer when control gains an entry
+	inflight     chan struct{}
+	wdFire       chan struct{}
+	done         chan struct{}
+	ctx          context.Context // handlers' context; ends at close
+	cancel       context.CancelFunc
+	once         sync.Once
 
 	mu          sync.Mutex
 	closed      bool
@@ -77,19 +88,24 @@ type conn struct {
 	closing     bool // DPR sent or received: no new requests either way
 	remoteCause int32
 	gotDPR      bool
+
+	controlMu    sync.Mutex
+	control      [][]byte
+	controlBytes int
 }
 
 func newConn(n *Node, nc net.Conn) *conn {
 	c := &conn{
-		node:     n,
-		nc:       nc,
-		br:       bufio.NewReader(nc),
-		writes:   make(chan []byte, n.cfg.MaxInFlight),
-		inflight: make(chan struct{}, n.cfg.MaxInFlight),
-		wdFire:   make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		pending:  make(map[uint32]*pendingRequest),
-		hopByHop: uint32(n.cfg.Random()),
+		node:         n,
+		nc:           nc,
+		br:           bufio.NewReader(nc),
+		writes:       make(chan []byte, n.cfg.MaxInFlight),
+		controlReady: make(chan struct{}, 1),
+		inflight:     make(chan struct{}, n.cfg.MaxInFlight),
+		wdFire:       make(chan struct{}, 1),
+		done:         make(chan struct{}),
+		pending:      make(map[uint32]*pendingRequest),
+		hopByHop:     uint32(n.cfg.Random()),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	return c
@@ -391,24 +407,54 @@ func (c *conn) remoteDisconnectCause() (int32, bool) {
 	return c.remoteCause, c.gotDPR
 }
 
-// enqueue hands encoded bytes to the writer.
-func (c *conn) enqueue(ctx context.Context, b []byte) error {
-	select {
-	case c.writes <- b:
-		return nil
-	case <-c.done:
-		return ErrConnectionClosed
-	case <-ctx.Done():
-		return ctx.Err()
+// controlQueueBytes bounds the control queue. Four maximum-size messages
+// leave room for thousands of ordinary answers while capping what a peer that
+// sends requests but never reads the answers can make the node hold.
+func (c *conn) controlQueueBytes() int { return 4 * c.node.cfg.Limits.MaxMessageSize }
+
+// enqueueControl queues b for the writer ahead of the main queue without ever
+// blocking. It reports false when the control queue is full.
+func (c *conn) enqueueControl(b []byte) bool {
+	c.controlMu.Lock()
+	if c.controlBytes+len(b) > c.controlQueueBytes() {
+		c.controlMu.Unlock()
+		return false
 	}
+	c.control = append(c.control, b)
+	c.controlBytes += len(b)
+	c.controlMu.Unlock()
+	select {
+	case c.controlReady <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (c *conn) popControl() ([]byte, bool) {
+	c.controlMu.Lock()
+	defer c.controlMu.Unlock()
+	if len(c.control) == 0 {
+		return nil, false
+	}
+	b := c.control[0]
+	c.control[0] = nil
+	c.control = c.control[1:]
+	c.controlBytes -= len(b)
+	return b, true
 }
 
 func (c *conn) writeLoop() {
 	for {
+		if b, ok := c.popControl(); ok {
+			if !c.write(b) {
+				return
+			}
+			continue
+		}
 		select {
+		case <-c.controlReady:
 		case b := <-c.writes:
-			if _, err := c.nc.Write(b); err != nil {
-				c.close(err)
+			if !c.write(b) {
 				return
 			}
 		case <-c.done:
@@ -417,20 +463,60 @@ func (c *conn) writeLoop() {
 	}
 }
 
-// reply sends an answer. An answer that cannot be encoded (a handler built
-// one larger than the protocol allows) is replaced by
-// DIAMETER_UNABLE_TO_COMPLY so the peer is not left waiting.
-func (c *conn) reply(req, ans *Message) {
-	b, err := ans.Encode()
-	if err != nil {
-		c.node.log.Error("diameter answer cannot be encoded", "command", req.Code,
-			"application", req.ApplicationID, "error", err)
-		b, err = c.node.errorAnswer(req, &Error{ResultCode: ResultUnableToComply}).Encode()
-		if err != nil {
-			return
-		}
+// write sends b, failing the connection when the peer does not take it within
+// WriteTimeout. The deadline is on the wall clock because it bounds a socket
+// operation, not a protocol timer; the watchdog already detects a silent
+// peer, and the deadline additionally frees a writer stuck on one that has
+// stopped reading.
+func (c *conn) write(b []byte) bool {
+	_ = c.nc.SetWriteDeadline(time.Now().Add(c.node.cfg.WriteTimeout))
+	if _, err := c.nc.Write(b); err != nil {
+		c.close(fmt.Errorf("diameter: write failed: %w", err))
+		return false
 	}
-	_ = c.enqueue(context.Background(), b)
+	return true
+}
+
+// encodeAnswer encodes an answer. An answer that cannot be encoded (a handler
+// built one larger than the protocol allows) is replaced by
+// DIAMETER_UNABLE_TO_COMPLY so the peer is not left waiting.
+func (c *conn) encodeAnswer(req, ans *Message) ([]byte, bool) {
+	b, err := ans.Encode()
+	if err == nil {
+		return b, true
+	}
+	c.node.log.Error("diameter answer cannot be encoded", "command", req.Code,
+		"application", req.ApplicationID, "error", err)
+	b, err = c.node.errorAnswer(req, &Error{ResultCode: ResultUnableToComply}).Encode()
+	return b, err == nil
+}
+
+// answerNow sends an answer from the read loop through the control queue. A
+// peer that keeps sending requests without reading the answers fills it, and
+// is disconnected rather than allowed to stop the read loop.
+func (c *conn) answerNow(req, ans *Message) {
+	b, ok := c.encodeAnswer(req, ans)
+	if !ok {
+		return
+	}
+	if !c.enqueueControl(b) {
+		c.node.log.Warn("diameter peer not reading answers: closing", "peer_host", c.caps.host,
+			"queued_bytes", c.controlQueueBytes())
+		c.close(errNotDraining)
+	}
+}
+
+// answerQueued sends a handler's answer through the main queue, waiting for
+// room; handlers run on their own goroutines, so waiting stops no one else.
+func (c *conn) answerQueued(req, ans *Message) {
+	b, ok := c.encodeAnswer(req, ans)
+	if !ok {
+		return
+	}
+	select {
+	case c.writes <- b:
+	case <-c.done:
+	}
 }
 
 // roundTrip sends a request and waits for the matching answer. Base protocol
@@ -458,9 +544,17 @@ func (c *conn) roundTrip(ctx context.Context, req *Message, internal bool) (*Mes
 	p.timer = n.cfg.Clock.AfterFunc(n.cfg.RequestTimeout, func() { c.complete(hbh, 0, result{err: ErrTimeout}) })
 	c.mu.Unlock()
 
+	// Waiting for room in the queue ends with the request: its timer or the
+	// connection closing completes it, and so does the caller's context.
 	b, err := req.Encode()
 	if err == nil {
-		err = c.enqueue(ctx, b)
+		select {
+		case c.writes <- b:
+		case r := <-p.ch:
+			return r.m, r.err
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
 	}
 	if err != nil {
 		c.complete(hbh, 0, result{err: err})
@@ -508,7 +602,7 @@ func (c *conn) readLoop() {
 		case derr != nil && m.IsRequest():
 			n.log.Warn("diameter request rejected", "peer_host", c.caps.host, "command", m.Code,
 				"application", m.ApplicationID, "result_code", derr.ResultCode)
-			c.reply(m, n.errorAnswer(m, derr))
+			c.answerNow(m, n.errorAnswer(m, derr))
 		case derr != nil:
 			c.complete(m.HopByHop, m.Code, result{err: derr})
 		case m.IsRequest():
@@ -567,15 +661,15 @@ func (c *conn) handleRequest(m *Message, process bool) {
 	if m.ApplicationID == AppCommon {
 		switch m.Code {
 		case CodeDeviceWatchdog:
-			c.reply(m, n.NewAnswer(m, ResultSuccess, NewAVP(AVPOriginStateID, FlagMandatory, 0, Unsigned32(n.cfg.OriginStateID))))
+			c.answerNow(m, n.NewAnswer(m, ResultSuccess, NewAVP(AVPOriginStateID, FlagMandatory, 0, Unsigned32(n.cfg.OriginStateID))))
 		case CodeDisconnectPeer:
 			c.disconnected(m)
 		case CodeCapabilitiesExchange:
 			// Capabilities are exchanged once per connection; changing them
 			// later is a separate extension (RFC 6737).
-			c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToComply, Message: "capabilities already exchanged"}))
+			c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToComply, Message: "capabilities already exchanged"}))
 		default:
-			c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultCommandUnsupported}))
+			c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultCommandUnsupported}))
 		}
 		return
 	}
@@ -586,22 +680,22 @@ func (c *conn) handleRequest(m *Message, process bool) {
 		// RFC 3539 discards application messages while reopening; answering
 		// instead lets the sender fail over at once rather than at its
 		// timeout. A closing connection takes no new work either (§5.4).
-		c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToDeliver}))
+		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToDeliver}))
 		return
 	}
 	if !slices.Contains(c.apps, m.ApplicationID) {
-		c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultApplicationUnsupported}))
+		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultApplicationUnsupported}))
 		return
 	}
 	h, rc := n.handler(m.ApplicationID, m.Code)
 	if h == nil {
-		c.reply(m, n.errorAnswer(m, &Error{ResultCode: rc}))
+		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: rc}))
 		return
 	}
 	select {
 	case c.inflight <- struct{}{}:
 	default:
-		c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultTooBusy}))
+		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultTooBusy}))
 		return
 	}
 	n.wg.Add(1)
@@ -621,7 +715,7 @@ func (c *conn) serve(h Handler, req *Message) {
 		if v := recover(); v != nil {
 			n.log.Error("diameter handler panicked", "command", req.Code, "application", req.ApplicationID,
 				"panic", fmt.Sprint(v))
-			c.reply(req, n.errorAnswer(req, &Error{ResultCode: ResultUnableToComply}))
+			c.answerQueued(req, n.errorAnswer(req, &Error{ResultCode: ResultUnableToComply}))
 		}
 	}()
 	ans, err := h.ServeDiameter(c.ctx, c.peer, req)
@@ -641,7 +735,7 @@ func (c *conn) serve(h Handler, req *Message) {
 	ans.Flags = ans.Flags&^(FlagRequest|FlagProxiable|FlagRetransmit) | req.Flags&FlagProxiable
 	ans.Code, ans.ApplicationID = req.Code, req.ApplicationID
 	ans.HopByHop, ans.EndToEnd = req.HopByHop, req.EndToEnd
-	c.reply(req, ans)
+	c.answerQueued(req, ans)
 }
 
 // disconnected answers a DPR (RFC 6733 §5.4). The sender closes the
@@ -659,7 +753,7 @@ func (c *conn) disconnected(dpr *Message) {
 	c.remoteCause = cause
 	c.mu.Unlock()
 	n.log.Info("diameter peer disconnecting", "peer_host", c.caps.host, "disconnect_cause", cause)
-	c.reply(dpr, n.NewAnswer(dpr, ResultSuccess))
+	c.answerNow(dpr, n.NewAnswer(dpr, ResultSuccess))
 	n.cfg.Clock.AfterFunc(disconnectWaitForPeerToDrop, func() { c.close(errPeerDisconnect) })
 }
 
@@ -755,7 +849,9 @@ func (c *conn) watchdogExpired() {
 }
 
 // sendDWR sends a watchdog request. Its answer is not awaited: the watchdog
-// timer, not a request timeout, decides what a missing DWA means.
+// timer, not a request timeout, decides what a missing DWA means. A DWR that
+// does not fit the control queue is dropped, which that timer then treats as
+// unanswered.
 func (c *conn) sendDWR() {
 	n := c.node
 	dwr := &Message{
@@ -771,5 +867,7 @@ func (c *conn) sendDWR() {
 	if err != nil {
 		return
 	}
-	_ = c.enqueue(context.Background(), b)
+	if !c.enqueueControl(b) {
+		n.log.Warn("diameter watchdog request dropped: write queue full", "peer_host", c.caps.host)
+	}
 }

@@ -77,8 +77,12 @@ type Config struct {
 	CapabilitiesTimeout time.Duration // dial plus CER/CEA exchange
 	ReconnectMin        time.Duration // first reconnect delay of an initiated peer
 	ReconnectMax        time.Duration // ceiling of the exponential backoff
-	// MaxInFlight bounds concurrent inbound requests per connection; more
-	// are answered with DIAMETER_TOO_BUSY.
+	// WriteTimeout bounds one socket write; a peer that takes nothing for
+	// that long is treated as failed. It defaults to WatchdogInterval.
+	WriteTimeout time.Duration
+	// MaxInFlight bounds concurrent inbound requests per connection (more
+	// are answered with DIAMETER_TOO_BUSY) and the length of the write queue
+	// that handlers and Send wait on.
 	MaxInFlight int
 
 	// Clock, Random and Dial are injected for tests. Random must be safe for
@@ -129,6 +133,7 @@ func (c *Config) setDefaults() error {
 	if c.WatchdogInterval < MinWatchdogInterval {
 		return fmt.Errorf("diameter: WatchdogInterval below the RFC 3539 minimum of %s", MinWatchdogInterval)
 	}
+	setDuration(&c.WriteTimeout, c.WatchdogInterval)
 	setDuration(&c.RequestTimeout, DefaultRequestTimeout)
 	setDuration(&c.CapabilitiesTimeout, DefaultCapabilitiesTimeout)
 	setDuration(&c.ReconnectMin, DefaultReconnectMin)
