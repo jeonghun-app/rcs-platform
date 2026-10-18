@@ -96,10 +96,11 @@ func RejectMedia(offer *Media) Media {
 // have in common (RFC 4975 §8.6), takes the connection role that complements
 // the offered one (RFC 4145 §4, RFC 6135 §4.2.1), mirrors the direction
 // (RFC 3264 §6.1) and, for a file transfer, echoes a=file-selector,
-// a=file-transfer-id and a=file-range (RFC 5547 §8.3). A line offered with port 0 is never
-// accepted (ErrMediaDisabled), nor is one with no type in common
-// (ErrNoCommonType); either way the caller keeps the rejected line from
-// NewAnswer. offer is not modified.
+// a=file-transfer-id and a=file-range (RFC 5547 §8.3). A line offered with
+// port 0 is never accepted (ErrMediaDisabled), nor is one with no type in
+// common (ErrNoCommonType); either way the caller keeps the rejected line
+// from NewAnswer. The answer is never holdconn, and may be passive: only an
+// offer is barred from passive (RFC 6135 §4.2.2). offer is not modified.
 func NegotiateMSRP(offer *Session, i int, local MSRPEndpoint) (Media, error) {
 	m, err := offer.media(i)
 	if err != nil {
