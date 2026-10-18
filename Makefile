@@ -8,6 +8,10 @@ IMAGE    ?= rcs-platform
 GOIMAGE  ?= rcs-platform-go:$(shell cat deploy/toolchain.Dockerfile 2>/dev/null | sha256sum | cut -c1-12)
 DOCKER   ?= docker
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+# Stand-ins for S3 and DynamoDB in `make test-integration`, pinned like the
+# toolchain so a run tests the same server code every time.
+S3MOCK_IMAGE   ?= adobe/s3mock:5.2.3@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+DDBLOCAL_IMAGE ?= amazon/dynamodb-local:3.3.2@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86
 
 # VERSION and REVISION reach recipes only as environment variables and are always
 # quoted there, so a tag such as v1.0.0-`cmd` cannot run anything.
@@ -72,6 +76,27 @@ test: volumes ## Unit tests with coverage summary
 .PHONY: race
 race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
+
+# The storage backends (internal/ftserver/awsstore) against an S3-compatible
+# container and DynamoDB Local on a private network. Names carry the shell's
+# PID so parallel runs on one host do not meet; the trap removes everything
+# however the run ends. Not part of `check`: it pulls two images and starts
+# two JVMs.
+.PHONY: test-integration
+test-integration: volumes ## Storage backends against S3 and DynamoDB containers
+	@set -eu; id=rcs-platform-it-$$$$; \
+	trap '$(DOCKER) rm -f "$$id-s3" "$$id-ddb" >/dev/null 2>&1 || true; $(DOCKER) network rm "$$id" >/dev/null 2>&1 || true' EXIT; \
+	$(DOCKER) network create "$$id" >/dev/null; \
+	$(DOCKER) run -d --rm --name "$$id-s3" --network "$$id" $(S3MOCK_IMAGE) >/dev/null; \
+	$(DOCKER) run -d --rm --name "$$id-ddb" --network "$$id" $(DDBLOCAL_IMAGE) >/dev/null; \
+	$(RUNGO) --network "$$id" \
+	  -e FT_IT_S3_ENDPOINT="http://$$id-s3:9090" -e FT_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
+	  -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=local -e AWS_SECRET_ACCESS_KEY=local \
+	  $(GOIMAGE) sh -c 'for url in "$$FT_IT_S3_ENDPOINT" "$$FT_IT_DYNAMODB_ENDPOINT"; do \
+	      n=0; until wget -S -O /dev/null "$$url/" 2>&1 | grep -q "HTTP/"; do \
+	        n=$$((n + 1)); [ "$$n" -lt 120 ] || { echo "$$url did not start" >&2; exit 1; }; sleep 1; done; \
+	    done; \
+	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/...'
 
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz

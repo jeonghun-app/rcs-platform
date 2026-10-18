@@ -1,0 +1,103 @@
+# HSS provisioning API: contract stub.
+#
+# Only the operation ft-server depends on is defined here: it is the contract
+# between ft-server (#34, internal/ftserver HSSCredentials) and the HSS (#12),
+# which owns this document and adds the rest of the API to it.
+openapi: 3.1.0
+info:
+  title: HSS provisioning API
+  version: 0.1.0
+  description: |
+    Provisioning API of the platform's HSS. This stub holds the File Transfer
+    credential lookup used by ft-server to verify HTTP Digest (RFC 7616)
+    uploads (GSMA RCC.07, FT via HTTP). The HSS keeps the HA1 of each
+    subscriber's FT credential for the FT realm; the password itself is never
+    stored or returned.
+servers:
+  - url: http://hss.{namespace}:8080
+    description: Inside the VPC, through Cloud Map
+    variables:
+      namespace:
+        default: rcs.local
+security:
+  - bearer: []
+paths:
+  /v1/subscriptions/{impi}/ft-credential:
+    get:
+      operationId: getFTCredential
+      summary: HA1 of a subscriber's File Transfer credential
+      description: |
+        Returns H(username:realm:password) for the subscriber's FT credential,
+        computed with the requested algorithm, and the public identity that
+        owns the subscriber's uploads. The Digest user name is the IMPI.
+
+        The answer is a secret: callers must not log or cache it beyond the
+        request that needs it. The HSS should accept a token scoped to this
+        operation, so that ft-server does not hold the operator's admin token.
+      parameters:
+        - name: impi
+          in: path
+          required: true
+          description: Private user identity, percent-encoded as one path segment.
+          schema:
+            type: string
+          example: 001010000000001@ims.mnc001.mcc001.3gppnetwork.org
+        - name: algorithm
+          in: query
+          required: true
+          description: Digest algorithm the HA1 is computed for (RFC 7616 §3.3).
+          schema:
+            type: string
+            enum: [MD5, SHA-256]
+      responses:
+        "200":
+          description: The credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FTCredential"
+              example:
+                impi: 001010000000001@ims.mnc001.mcc001.3gppnetwork.org
+                impu: sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org
+                realm: ft.ims.mnc001.mcc001.3gppnetwork.org
+                algorithm: SHA-256
+                ha1: 5a7c0e7ba1e8c3b5a2f2c9d1f0e4b6a8c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7
+        "401":
+          description: Missing or wrong bearer token.
+        "404":
+          description: |
+            No such subscription, or it has no FT credential. ft-server treats
+            both as an unknown user.
+        "503":
+          description: No token is configured on the HSS, or it is not ready.
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    FTCredential:
+      type: object
+      required: [impu, realm, algorithm, ha1]
+      properties:
+        impi:
+          type: string
+          description: The IMPI asked for.
+        impu:
+          type: string
+          description: |
+            Public user identity that owns the subscriber's uploads, normally
+            the default IMPU of the implicit registration set.
+        realm:
+          type: string
+          description: |
+            Digest realm the HA1 was computed for. ft-server refuses a
+            credential for any realm other than its FT_REALM.
+        algorithm:
+          type: string
+          enum: [MD5, SHA-256]
+          description: Echoes the requested algorithm.
+        ha1:
+          type: string
+          description: Lower-case hex H(impi:realm:password), 32 digits for MD5, 64 for SHA-256.
+          pattern: "^[0-9a-f]+$"
