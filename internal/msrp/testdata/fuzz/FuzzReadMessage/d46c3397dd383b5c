@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("MSRP 0 A\r\n\r\n0")
