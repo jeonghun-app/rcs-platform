@@ -467,35 +467,49 @@ func TestARelayStreamsAHugeChunkInBoundedMemory(t *testing.T) {
 	}
 	const total = 64 << 20
 	block := bodyOf(64 << 10)
-	runtime.GC()
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	base, peak := ms.HeapAlloc, ms.HeapAlloc
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for sent := 0; sent < total; sent += len(block) {
+	// What the relay retains is measured at pauses in the middle of the
+	// chunk, once everything sent so far has come out the other side: with
+	// pieces still churning through, a collection counts what is allocated
+	// while it runs, and on a busy machine that is tens of MiB of garbage.
+	liveHeap := func() uint64 {
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	base := liveHeap()
+	peak := base
+	deadline := time.Now().Add(60 * time.Second)
+	const pause = 16 << 20
+	for sent := 0; sent < total; {
+		for end := sent + pause; sent < end; sent += len(block) {
 			if _, err := nc.Write(block); err != nil {
-				return
+				t.Fatal(err)
 			}
 		}
-		_, _ = nc.Write([]byte("\r\n-------b1gx$\r\n"))
-	}()
-	deadline := time.Now().Add(60 * time.Second)
-	for octets.Load() < total && time.Now().Before(deadline) {
-		runtime.ReadMemStats(&ms)
-		peak = max(peak, ms.HeapAlloc)
-		time.Sleep(10 * time.Millisecond)
+		// The relay keeps back at most one piece and its look-ahead.
+		for octets.Load() < int64(sent)-2*DefaultChunkSize {
+			if time.Now().After(deadline) {
+				t.Fatalf("only %d of %d octets arrived", octets.Load(), sent)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		peak = max(peak, liveHeap())
 	}
-	<-done
+	if _, err := nc.Write([]byte("\r\n-------b1gx$\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	for octets.Load() < total && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if v := badRange.Load(); v != nil {
 		t.Fatal(v)
 	}
 	if octets.Load() != total {
 		t.Fatalf("only %d octets arrived", octets.Load())
 	}
-	if peak > base+32<<20 {
-		t.Fatalf("heap grew by %.1f MiB while streaming %d MiB", float64(peak-base)/(1<<20), total>>20)
+	if peak > base+8<<20 {
+		t.Fatalf("heap grew by %.1f MiB in the middle of a %d MiB chunk", float64(peak-base)/(1<<20), total>>20)
 	}
 }
 
@@ -672,7 +686,8 @@ func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) {
 	rig := newRelayRigTCP(t, Config{}, Config{})
 	asLate, clLate, rpLate := rig.addUser(t, 1, &countingHandler{})
-	asOver, _, rpOver := rig.addUser(t, 2, &countingHandler{})
+	overH := &countingHandler{}
+	asOver, _, rpOver := rig.addUser(t, 2, overH)
 	asFast, clFast, rpFast := rig.addUser(t, 3, &countingHandler{})
 	fastH := &countingHandler{got: make(chan *Message, 16)}
 	_, fastConn := rig.dialClient(t, clFast, rpFast, fastH)
@@ -714,10 +729,13 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	if err := <-stored; err != nil {
 		t.Fatalf("stored message: %v", err)
 	}
+	// Send may have written every chunk before the refusal came back; the
+	// refusal reaches the session's reports either way.
 	var se *StatusError
-	if err := <-over; !errors.As(err, &se) || se.Code != StatusMessageTooLarge {
+	if err := <-over; err != nil && !(errors.As(err, &se) && se.Code == StatusMessageTooLarge) {
 		t.Fatalf("unbound session over its bound: %v", err)
 	}
+	waitCount(t, "refusals for the session over its bound", &overH.failures, 1, 5*time.Second)
 	// The client comes and gets what was held.
 	lateH := &countingHandler{got: make(chan *Message, 4)}
 	rig.dialClient(t, clLate, rpLate, lateH)

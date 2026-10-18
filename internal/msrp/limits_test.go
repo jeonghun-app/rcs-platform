@@ -375,10 +375,9 @@ func (discard) HandleMessage(*Session, *Message) error { return nil }
 func (discard) HandleReport(*Session, Report)          {}
 
 func TestAFloodAskingForReportsCannotQueueThemWithoutBound(t *testing.T) {
-	// REPORTs are written by the session's handler goroutine, which waits
-	// for the peer, so a peer that asks for them and reads nothing gets its
-	// messages refused once the handler queue is full, the answer queue
-	// stays within its bound, and the write deadline ends the connection.
+	// REPORTs join the bounded answer queue, so a peer that asks for them
+	// and reads nothing never makes the queue pass its bound: the
+	// connection is closed at the bound or by the write deadline.
 	const deadline = 200 * time.Millisecond
 	const bound = 64 << 10
 	reg := &Registry{}

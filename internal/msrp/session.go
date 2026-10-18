@@ -199,10 +199,12 @@ func (s *Session) closeWith(err error) {
 	if c != nil {
 		c.removeSession(s)
 	}
-	close(s.done)
+	// Hooks (a Registry forgetting s) run before Done closes, so whoever
+	// sees Done sees them done.
 	for _, h := range hooks {
 		h()
 	}
+	close(s.done)
 	s.dropHeld(StatusNoSession, false)
 	if peer != nil {
 		peer.closeWith(fmt.Errorf("msrp: bridged session ended: %w", err))
@@ -658,15 +660,17 @@ func (s *Session) receiveSend(c *Conn, m *Message) error {
 	return err
 }
 
-// deliver runs on the handler's goroutine, which may wait for the peer, so
-// its REPORT is written rather than queued.
+// deliver runs on the handler's goroutine. Its REPORT is queued rather
+// than waited for: waiting would hold the handler behind whatever content
+// this side is sending, and the session's messages would be refused for
+// it. The answer queue bounds REPORTs a peer asks for and never reads.
 func (s *Session) deliver(c *Conn, whole *Message) {
 	code := StatusOK
 	if err := s.handler.HandleMessage(s, whole); err != nil {
 		code = codeOf(err, StatusForbidden)
 	}
 	if ShouldReport(whole, code) {
-		_ = c.sendRequest(context.Background(), NewReport(whole, s.local, *whole.ByteRange, code), sendWait, nil)
+		_ = c.sendRequest(context.Background(), NewReport(whole, s.local, *whole.ByteRange, code), sendQueue, nil)
 	}
 }
 

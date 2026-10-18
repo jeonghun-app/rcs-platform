@@ -39,8 +39,9 @@ const (
 	// 2 KiB pieces) is in flight at once.
 	DefaultMaxInFlight = 8192
 	// DefaultMaxHandlerQueue bounds the events waiting for one session's
-	// Handler.
-	DefaultMaxHandlerQueue = 32
+	// Handler. It absorbs bursts; what bounds memory is the session's
+	// Budget, which waiting messages are charged to.
+	DefaultMaxHandlerQueue = 256
 	// DefaultSendWindow is how many chunks of one session Send may have
 	// awaiting their 200 at once.
 	DefaultSendWindow = 64
