@@ -44,7 +44,7 @@ func FuzzParseSubscription(f *testing.F) {
 		}
 		for _, p := range s.ServiceProfiles {
 			if set, err := Compile(p.InitialFilterCriteria); err == nil {
-				set.Match(&sipRequest{method: "INVITE", uri: impu, headers: []HeaderField{{"From", impu}}, sdp: []string{"m=message 9 TCP/MSRP *"}}, Context{})
+				_, _ = set.Match(&sipRequest{method: "INVITE", uri: impu, headers: []HeaderField{{"From", impu}}, sdp: []string{"m=message 9 TCP/MSRP *"}}, Context{})
 			}
 		}
 	})
@@ -83,7 +83,11 @@ func FuzzEvaluateTrigger(f *testing.F) {
 				if err != nil {
 					return
 				}
-				_, results[[2]bool{cnf, negated}] = s.Next(r, Context{Case: Originating}, -1)
+				_, matched, err := s.Next(r, Context{Case: Originating}, -1)
+				if err != nil {
+					return // the fuzzer's values may exceed the limits
+				}
+				results[[2]bool{cnf, negated}] = matched
 			}
 		}
 		if results[[2]bool{true, false}] != results[[2]bool{false, false}] ||

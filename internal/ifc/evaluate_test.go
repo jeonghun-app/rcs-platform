@@ -1,8 +1,10 @@
 package ifc
 
 import (
+	"errors"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,8 +59,41 @@ func criteria(priority int, tp *TriggerPoint) FilterCriteria {
 
 func matches(t *testing.T, s *Set, r Request, ctx Context) bool {
 	t.Helper()
-	_, ok := s.Next(r, ctx, -1)
+	_, ok, err := s.Next(r, ctx, -1)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
 	return ok
+}
+
+func matchAll(t *testing.T, s *Set, r Request, ctx Context) []int {
+	t.Helper()
+	got, err := s.Match(r, ctx)
+	if err != nil {
+		t.Fatalf("Match: %v", err)
+	}
+	var out []int
+	for _, fc := range got {
+		out = append(out, fc.Priority)
+	}
+	return out
+}
+
+// limitReached evaluates r with Next and Match and returns the limit both
+// report, failing the test unless both fail with a *LimitError.
+func limitReached(t *testing.T, s *Set, r Request) string {
+	t.Helper()
+	_, ok, err := s.Next(r, Context{}, -1)
+	var le *LimitError
+	if !errors.As(err, &le) || !errors.Is(err, ErrEvaluationLimit) || ok {
+		t.Fatalf("Next = %t, %v; want a *LimitError", ok, err)
+	}
+	got, err := s.Match(r, Context{})
+	var le2 *LimitError
+	if !errors.As(err, &le2) || got != nil || le2.Limit != le.Limit {
+		t.Fatalf("Match = %v, %v; want the *LimitError Next gave (%v)", got, err, le)
+	}
+	return le.Limit
 }
 
 // The trigger "MESSAGE or INVITE, or OPTIONS not from a spam source" in both
@@ -186,10 +221,7 @@ func TestProfilePartSelectsCriteriaByRegistrationState(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var got []int
-			for _, fc := range s.Match(req("INVITE", impu), tc.ctx) {
-				got = append(got, fc.Priority)
-			}
+			got := matchAll(t, s, req("INVITE", impu), tc.ctx)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("priorities = %v, want %v", got, tc.want)
 			}
@@ -316,7 +348,10 @@ func TestCriteriaAreEvaluatedInPriorityOrder(t *testing.T) {
 	var chain []int
 	after := -1
 	for {
-		fc, ok := s.Next(req("MESSAGE", impu), Context{}, after)
+		fc, ok, err := s.Next(req("MESSAGE", impu), Context{}, after)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !ok {
 			break
 		}
@@ -326,10 +361,7 @@ func TestCriteriaAreEvaluatedInPriorityOrder(t *testing.T) {
 	if !reflect.DeepEqual(chain, []int{0, 10, 30}) {
 		t.Errorf("chain = %v, want [0 10 30]", chain)
 	}
-	var all []int
-	for _, fc := range s.Match(req("MESSAGE", impu), Context{}) {
-		all = append(all, fc.Priority)
-	}
+	all := matchAll(t, s, req("MESSAGE", impu), Context{})
 	if !reflect.DeepEqual(all, chain) {
 		t.Errorf("Match = %v, want %v", all, chain)
 	}
@@ -344,7 +376,7 @@ func TestEachPartOfTheRequestIsReadAtMostOncePerEvaluation(t *testing.T) {
 	}}
 	s := compile(t, criteria(1, h), criteria(2, h))
 	r := req("MESSAGE", impu)
-	s.Match(r, Context{})
+	matchAll(t, s, r, Context{})
 	if r.calls["headers"] != 1 || r.calls["uri"] != 1 || r.calls["sdp"] != 0 {
 		t.Errorf("reads = %v, want headers and uri once, sdp never", r.calls)
 	}
@@ -511,39 +543,161 @@ func TestAMaximumSizeDocumentOfCostlyPatternsIsRefusedCheaply(t *testing.T) {
 	}
 }
 
-func TestValuesOverTheirLimitAreNotExaminedAndAreCounted(t *testing.T) {
+func TestValuesOverTheirLimitFailTheEvaluationAndAreCounted(t *testing.T) {
 	s := compile(t,
 		criteria(1, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: SIPHeader{Header: "Subject", Content: "x"}}}}),
 		criteria(2, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: RequestURI("x")}}}),
 		criteria(3, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: SessionDescription{Line: "a", Content: "x"}}}}),
 	)
-	priorities := func(r Request) []int {
-		var out []int
-		for _, fc := range s.Match(r, Context{}) {
-			out = append(out, fc.Priority)
-		}
-		return out
+	within := func() *sipRequest {
+		return &sipRequest{method: "MESSAGE", uri: "sip:" + strings.Repeat("x", MaxRequestURILength-4),
+			headers: []HeaderField{{"Subject", strings.Repeat("x", MaxHeaderLength)}},
+			sdp:     []string{"a=" + strings.Repeat("x", MaxSDPLineLength-2)}}
 	}
-	within := &sipRequest{method: "MESSAGE", uri: "sip:" + strings.Repeat("x", MaxRequestURILength-4),
-		headers: []HeaderField{{"Subject", strings.Repeat("x", MaxHeaderLength)}},
-		sdp:     []string{"a=" + strings.Repeat("x", MaxSDPLineLength-2)}}
-	if got := priorities(within); !reflect.DeepEqual(got, []int{1, 2, 3}) || s.OversizedValues() != 0 {
+	if got := matchAll(t, s, within(), Context{}); !reflect.DeepEqual(got, []int{1, 2, 3}) || s.OversizedValues() != 0 {
 		t.Fatalf("values at their limits: matched %v, oversized %d", got, s.OversizedValues())
 	}
-	over := &sipRequest{method: "MESSAGE", uri: "sip:" + strings.Repeat("x", MaxRequestURILength-3),
-		headers: []HeaderField{{"Subject", strings.Repeat("x", MaxHeaderLength+1)}, {strings.Repeat("S", MaxHeaderLength+1), "x"}},
-		sdp:     []string{"a=" + strings.Repeat("x", MaxSDPLineLength-1)}}
-	if got := priorities(over); len(got) != 0 {
-		t.Errorf("oversized values matched %v", got)
+	tests := map[string]struct {
+		edit  func(*sipRequest)
+		fc    int // the criterion that reads the part
+		limit string
+	}{
+		"header value": {func(r *sipRequest) { r.headers[0].Value += "x" }, 0, "MaxHeaderLength"},
+		"header name": {func(r *sipRequest) {
+			r.headers = append(r.headers, HeaderField{strings.Repeat("S", MaxHeaderLength+1), "x"})
+		}, 0, "MaxHeaderLength"},
+		"Request-URI": {func(r *sipRequest) { r.uri += "x" }, 1, "MaxRequestURILength"},
+		"SDP line":    {func(r *sipRequest) { r.sdp[0] += "x" }, 2, "MaxSDPLineLength"},
 	}
-	if n := s.OversizedValues(); n != 4 {
-		t.Errorf("OversizedValues = %d, want 4", n)
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			r := within()
+			tc.edit(r)
+			one := compile(t, s.criteria[tc.fc].fc)
+			if got := limitReached(t, one, r); got != tc.limit {
+				t.Errorf("limit = %s, want %s", got, tc.limit)
+			}
+			if one.OversizedValues() == 0 {
+				t.Error("OversizedValues did not count the value")
+			}
+		})
 	}
-	// A negated condition on an unexamined value holds.
+	// A negated condition on an unexamined value is an error too, not a
+	// condition that holds.
 	neg := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
 		{ConditionNegated: true, Groups: []int{0}, Condition: SIPHeader{Header: "Subject", Content: "x"}}}}))
-	if !matches(t, neg, over, Context{}) {
-		t.Error("negated condition on an oversized value did not hold")
+	r := within()
+	r.headers[0].Value += "x"
+	limitReached(t, neg, r)
+}
+
+// TestAPaddedRequestCannotBypassAnApplicationServer pads an INVITE so that
+// its Accept-Contact lies beyond MaxHeaderBytes. Treating the unexamined
+// header as absent would skip the chat AS; the evaluation must fail instead.
+func TestAPaddedRequestCannotBypassAnApplicationServer(t *testing.T) {
+	s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+		{Groups: []int{0}, Condition: Method("INVITE")},
+		{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `3gpp-service\.ims\.icsi\.oma\.cpm\.session`}},
+	}}))
+	chat := HeaderField{"Accept-Contact", `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`}
+	if !matches(t, s, req("INVITE", impu, chat), Context{}) {
+		t.Fatal("unpadded INVITE did not match")
+	}
+	padding := slices.Repeat([]HeaderField{{"X-Padding", strings.Repeat("p", MaxHeaderLength-16)}}, 5)
+	if got := limitReached(t, s, req("INVITE", impu, append(padding, chat)...)); got != "MaxHeaderBytes" {
+		t.Errorf("limit = %s, want MaxHeaderBytes", got)
+	}
+}
+
+func TestEvaluationExaminesABoundedAmountOfSDP(t *testing.T) {
+	line := "a=" + strings.Repeat("a", MaxSDPLineLength-2)
+	lines := slices.Repeat([]string{line}, 1024) // 1 MiB of SDP, every line within MaxSDPLineLength
+	set := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SessionDescription{Line: "a", Content: "[ab]{100}c"}}}}))
+	if got := limitReached(t, set, &sipRequest{method: "INVITE", uri: impu, sdp: lines}); got != "MaxSDPBytes" {
+		t.Errorf("limit = %s, want MaxSDPBytes", got)
+	}
+	if set.OversizedValues() == 0 {
+		t.Error("1 MiB of SDP in 1 KiB lines was examined in full")
+	}
+}
+
+func TestEvaluationExaminesABoundedAmountOfHeaders(t *testing.T) {
+	value := strings.Repeat("a", MaxHeaderLength-len("Subject"))
+	headers := slices.Repeat([]HeaderField{{"Subject", value}}, 16) // 128 KiB, each field within MaxHeaderLength
+	set := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: "late"}}}}))
+	if got := limitReached(t, set, req("MESSAGE", impu, headers...)); got != "MaxHeaderBytes" {
+		t.Errorf("limit = %s, want MaxHeaderBytes", got)
+	}
+	// limitReached evaluates twice.
+	if n, want := set.OversizedValues(), uint64(2*(16-MaxHeaderBytes/MaxHeaderLength)); n != want {
+		t.Errorf("OversizedValues = %d, want %d", n, want)
+	}
+}
+
+// TestAnEvaluationFailsWhenItsWorkBudgetIsSpent uses a pattern of about a
+// thousand instructions over Subject values of a thousand bytes: each match
+// costs more than the whole default budget.
+func TestAnEvaluationFailsWhenItsWorkBudgetIsSpent(t *testing.T) {
+	fc := criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: "[ab]{999}c"}}}})
+	r := req("MESSAGE", impu,
+		HeaderField{"Subject", strings.Repeat("a", 1000)},
+		HeaderField{"Subject", strings.Repeat("a", 999) + "c"})
+
+	set := compile(t, fc)
+	if got := limitReached(t, set, r); got != "MaxWork" {
+		t.Errorf("limit = %s, want MaxWork", got)
+	}
+	// limitReached evaluated twice; the budget is per evaluation.
+	if n := set.ExhaustedEvaluations(); n != 2 {
+		t.Errorf("ExhaustedEvaluations = %d, want 2", n)
+	}
+
+	roomy, err := CompileWithLimits([]FilterCriteria{fc}, Limits{MaxWork: 3_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matches(t, roomy, r, Context{}) || roomy.ExhaustedEvaluations() != 0 {
+		t.Errorf("with a larger budget: exhausted %d", roomy.ExhaustedEvaluations())
+	}
+}
+
+// TestAnOrdinaryProfileSpendsLittleOfTheBudget evaluates the kind of RCS
+// profile an HSS provisions against a realistic chat INVITE: the error path
+// is for abuse, so ordinary traffic must stay far from it.
+func TestAnOrdinaryProfileSpendsLittleOfTheBudget(t *testing.T) {
+	var cs []FilterCriteria
+	for i, icsi := range []string{"session", "msg", "largemsg", "filetransfer", "deferred", "chatbot", "sm", "groupchat"} {
+		for j, method := range []string{"INVITE", "MESSAGE", "OPTIONS"} {
+			cs = append(cs, criteria(i*10+j, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+				{Groups: []int{0}, Condition: Method(method)},
+				{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `urn%3Aurn-7%3A3gpp-service\.ims\.icsi\.oma\.cpm\.` + icsi}},
+				{Groups: []int{1}, Condition: SIPHeader{Header: "Contact", Content: `\+g\.3gpp\.icsi-ref="[^"]*oma\.cpm\.` + icsi}},
+				{Groups: []int{2}, Condition: SessionDescription{Line: "m", Content: "^message [0-9]+ TCP(/TLS)?/MSRP"}},
+				{ConditionNegated: true, Groups: []int{3}, Condition: SIPHeader{Header: "P-Served-User"}},
+			}}))
+		}
+	}
+	s := compile(t, cs...)
+	var headers []HeaderField
+	for _, name := range []string{"Via", "Via", "Max-Forwards", "Route", "Record-Route", "From", "To", "Call-ID", "CSeq",
+		"Contact", "Accept-Contact", "P-Asserted-Identity", "P-Preferred-Service", "Supported", "Allow", "User-Agent",
+		"Content-Type", "Content-Length", "Session-Expires", "P-Access-Network-Info"} {
+		headers = append(headers, HeaderField{name, strings.Repeat("v", 120)})
+	}
+	r := &sipRequest{method: "INVITE", uri: impu, headers: headers, sdp: []string{
+		"v=0", "o=- 1 1 IN IP4 192.0.2.1", "s=-", "c=IN IP4 192.0.2.1", "t=0 0", "m=message 9 TCP/MSRP *",
+		"a=accept-types:message/cpim application/im-iscomposing+xml", "a=path:msrp://192.0.2.1:9/abc;tcp", "a=setup:active",
+	}}
+	in := newInput(r, Context{}, s.maxWork)
+	for i := range s.criteria {
+		s.criteria[i].matches(in)
+	}
+	if in.limit != "" || DefaultMaxWork-in.work > DefaultMaxWork/4 {
+		t.Errorf("an ordinary evaluation of %d criteria spent %d of %d units (limit %q)",
+			len(cs), DefaultMaxWork-in.work, DefaultMaxWork, in.limit)
 	}
 }
 
@@ -580,7 +734,7 @@ func TestOneSetServesConcurrentRequests(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			method := []string{"MESSAGE", "OPTIONS"}[i%2]
-			if got := s.Match(req(method, impu, from("<"+tel+">")), Context{}); len(got) != 2 {
+			if got, err := s.Match(req(method, impu, from("<"+tel+">")), Context{}); len(got) != 2 || err != nil {
 				t.Errorf("%s matched %d criteria", method, len(got))
 			}
 		}()

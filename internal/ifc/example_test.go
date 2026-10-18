@@ -58,7 +58,12 @@ func Example() {
 			{Name: "Accept-Contact", Value: `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg"`},
 		},
 	}
-	if fc, ok := set.Next(chat, ifc.Context{Case: ifc.Originating}, -1); ok {
+	fc, ok, err := set.Next(chat, ifc.Context{Case: ifc.Originating}, -1)
+	if err != nil {
+		fmt.Println(err) // the S-CSCF refuses a request too large to evaluate
+		return
+	}
+	if ok {
 		fmt.Println(fc.Priority, fc.ApplicationServer.ServerName)
 	}
 	// Output: 10 sip:rcs-as.ims.mnc001.mcc001.3gppnetwork.org;lr

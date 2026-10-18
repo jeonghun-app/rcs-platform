@@ -31,12 +31,25 @@ type Request interface {
 	SDPLines() []string
 }
 
-// Limits on what evaluation examines. A pattern's cost is its program size
-// times the length of the value it runs over, so both are bounded: a profile
-// cannot make Compile hold an unbounded program, and a request cannot make one
-// evaluation scan an unbounded value. A value longer than its limit (counted
-// before white space is normalised) is not examined: the condition is false
-// for it, so a negated condition holds, and [Set.OversizedValues] counts it.
+// Limits on what evaluation examines. Matching a pattern costs about its
+// program size times the length of the value it runs over, so a profile
+// cannot make Compile hold an unbounded program, and a request cannot make an
+// evaluation examine unbounded input or do unbounded work:
+//
+//   - A value longer than its limit, or beyond the bytes of its kind that one
+//     evaluation examines, cannot be examined (lengths are counted before
+//     white space is normalised); [Set.OversizedValues] counts it.
+//   - Each match is charged against the evaluation's work budget
+//     ([Limits.MaxWork]): the length of the value for a header name that is
+//     a plain token and for a pattern that is a plain literal, which are
+//     compared or searched directly, and instructions × bytes otherwise.
+//     [Set.ExhaustedEvaluations] counts evaluations the budget could not
+//     pay for.
+//
+// Either way the evaluation fails with a [*LimitError] rather than treating
+// the condition as false: a false condition could let a padded request
+// bypass an application server, or reach one it should not. The S-CSCF
+// refuses such a request.
 const (
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
@@ -51,7 +64,44 @@ const (
 	MaxRequestURILength = 2 << 10
 	// MaxSDPLineLength bounds an SDP line that is matched.
 	MaxSDPLineLength = 1 << 10
+	// MaxHeaderBytes bounds the header names and values one evaluation
+	// examines together, twice the 16 KiB of headers a SIP parser accepts
+	// by default.
+	MaxHeaderBytes = 32 << 10
+	// MaxSDPBytes bounds the SDP lines one evaluation examines together;
+	// an offer for MSRP chat or file transfer is well under 2 KiB.
+	MaxSDPBytes = 16 << 10
+	// DefaultMaxWork is the work budget of one evaluation, in units of one
+	// instruction over one byte. Spending all of it with the costliest
+	// patterns the limits allow took 15 to 28 ns a unit on a heavily
+	// loaded shared host (load average 55), so at most about 5 to 8 ms of
+	// one core there, and less on an idle one. 24 ordinary RCS criteria
+	// over a chat INVITE spend about 40 000 units; an S-CSCF with larger
+	// profiles raises the budget with [CompileWithLimits].
+	DefaultMaxWork = 300_000
 )
+
+// ErrEvaluationLimit is wrapped by every [*LimitError].
+var ErrEvaluationLimit = errors.New("ifc: request exceeds an evaluation limit")
+
+// LimitError reports that an evaluation could not examine everything its
+// criteria needed. Limit names the first limit reached, such as
+// "MaxSDPBytes" or "MaxWork".
+type LimitError struct {
+	Limit string
+}
+
+func (e *LimitError) Error() string { return "ifc: request exceeds the evaluation limit " + e.Limit }
+
+// Unwrap returns ErrEvaluationLimit.
+func (e *LimitError) Unwrap() error { return ErrEvaluationLimit }
+
+// Limits configures [CompileWithLimits]. Zero fields take the defaults.
+type Limits struct {
+	// MaxWork is the work budget of one evaluation; zero means
+	// DefaultMaxWork.
+	MaxWork int
+}
 
 // HeaderField is one header value of a [Request].
 type HeaderField struct {
@@ -83,7 +133,9 @@ func (c Context) registered() bool {
 // ones passed to Compile; treat them as read-only.
 type Set struct {
 	criteria  []compiledCriteria
+	maxWork   int
 	oversized atomic.Uint64
+	exhausted atomic.Uint64
 }
 
 type compiledCriteria struct {
@@ -107,8 +159,8 @@ type compiledSPT struct {
 	regs    []RegistrationType
 	session SessionCase
 	// patterns: Request-URI; header name and value; SDP type and value. A
-	// nil value pattern matches any value.
-	name, value *regexp.Regexp
+	// value pattern without a program matches any value.
+	name, value pattern
 }
 
 type conditionKind uint8
@@ -128,6 +180,11 @@ const (
 // Errors name the criterion by priority and never quote a pattern, which may
 // hold a subscriber identity.
 func Compile(criteria []FilterCriteria) (*Set, error) {
+	return CompileWithLimits(criteria, Limits{})
+}
+
+// CompileWithLimits is Compile with a work budget other than the default.
+func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	r := &reader{}
 	for i := range criteria {
 		r.validateCriteria(fmt.Sprintf("InitialFilterCriteria[%d]", i+1), &criteria[i])
@@ -135,7 +192,10 @@ func Compile(criteria []FilterCriteria) (*Set, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	s := &Set{criteria: make([]compiledCriteria, 0, len(criteria))}
+	s := &Set{criteria: make([]compiledCriteria, 0, len(criteria)), maxWork: lim.MaxWork}
+	if s.maxWork <= 0 {
+		s.maxWork = DefaultMaxWork
+	}
 	budget := MaxSetInstructions
 	for _, fc := range criteria {
 		c := compiledCriteria{fc: fc}
@@ -208,6 +268,19 @@ func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
 	return c, err
 }
 
+// pattern is a compiled pattern and the size of its program, which is what
+// a match is charged per byte.
+type pattern struct {
+	re    *regexp.Regexp
+	insts int
+	// token is set for a header name pattern that is a plain token, which
+	// is compared with EqualFold; linear for a pattern whose whole match is
+	// a literal, which Go finds with a substring search. Both cost one unit
+	// a byte.
+	token  string
+	linear bool
+}
+
 type patternMode uint8
 
 const (
@@ -227,46 +300,70 @@ const (
 // expanded, so a pattern such as "[ab]{1000}" repeated is refused without
 // building its program, and then counted exactly against
 // MaxPatternInstructions and the set's remaining budget.
-func compilePattern(name, pattern string, mode patternMode, budget *int) (*regexp.Regexp, error) {
-	if _, err := syntax.Parse(pattern, syntax.POSIX); err != nil {
+func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
+	if _, err := syntax.Parse(source, syntax.POSIX); err != nil {
 		var se *syntax.Error
 		if errors.As(err, &se) {
-			return nil, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
+			return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
 		}
-		return nil, fmt.Errorf("%s is not a POSIX extended regular expression", name)
+		return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression", name)
 	}
-	expr := "(?:" + pattern + ")"
+	expr := "(?:" + source + ")"
 	if mode&patternFoldCase != 0 {
-		expr = "(?i:" + pattern + ")"
+		expr = "(?i:" + source + ")"
 	}
 	if mode&patternWhole != 0 {
 		expr = "^" + expr + "$"
 	}
 	tree, err := syntax.Parse(expr, syntax.Perl)
 	if err != nil {
-		return nil, fmt.Errorf("%s cannot be compiled", name)
+		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
 	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
 	if estimateSize(tree) > 4*MaxPatternInstructions {
-		return nil, tooComplex
+		return pattern{}, tooComplex
 	}
 	prog, err := syntax.Compile(tree.Simplify())
 	if err != nil {
-		return nil, fmt.Errorf("%s cannot be compiled", name)
+		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
 	n := len(prog.Inst)
 	if n > MaxPatternInstructions {
-		return nil, tooComplex
+		return pattern{}, tooComplex
 	}
 	if n > *budget {
-		return nil, fmt.Errorf("the criteria compile to more than %d instructions together", MaxSetInstructions)
+		return pattern{}, fmt.Errorf("the criteria compile to more than %d instructions together", MaxSetInstructions)
 	}
 	*budget -= n
 	re, err := regexp.Compile(expr)
 	if err != nil {
-		return nil, fmt.Errorf("%s cannot be compiled", name)
+		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
-	return re, nil
+	p := pattern{re: re, insts: n}
+	if mode&patternWhole != 0 && mode&patternFoldCase != 0 && isPlainToken(source) {
+		p.token = source
+	}
+	_, p.linear = re.LiteralPrefix()
+	return p, nil
+}
+
+// isPlainToken reports whether s is a header name made only of token
+// characters that are not ERE operators (RFC 3261 §25.1), so that the
+// pattern means exactly that name.
+func isPlainToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("-!%_`'~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // estimateSize is an upper bound on the instructions syntax.Compile emits for
@@ -304,27 +401,40 @@ func (s *Set) Len() int { return len(s.criteria) }
 // Match returns, in priority order, every criterion that applies to the
 // request: the S-CSCF sends a third-party REGISTER to each of their servers
 // (TS 24.229 §5.4.1.7).
-func (s *Set) Match(req Request, ctx Context) []FilterCriteria {
-	in := newInput(req, ctx)
+//
+// It fails with a [*LimitError] when the request is too large to evaluate.
+func (s *Set) Match(req Request, ctx Context) ([]FilterCriteria, error) {
+	in := newInput(req, ctx, s.maxWork)
 	defer s.count(in)
 	var out []FilterCriteria
 	for i := range s.criteria {
 		if s.criteria[i].matches(in) {
 			out = append(out, s.criteria[i].fc)
 		}
+		if in.limit != "" {
+			return nil, &LimitError{Limit: in.limit}
+		}
 	}
-	return out
+	return out, nil
 }
 
 // OversizedValues returns how many header values, Request-URIs and SDP lines
 // evaluations of this set have left unexamined because they exceeded their
-// limit. A rising count means requests that iFC may have misjudged, worth a
-// metric.
+// own limit or their kind's per-evaluation limit. A rising count means
+// requests that iFC may have misjudged, worth a metric.
 func (s *Set) OversizedValues() uint64 { return s.oversized.Load() }
+
+// ExhaustedEvaluations returns how many evaluations of this set ran out of
+// work budget, so that some of their conditions were not examined. Like
+// OversizedValues it is worth a metric.
+func (s *Set) ExhaustedEvaluations() uint64 { return s.exhausted.Load() }
 
 func (s *Set) count(in *input) {
 	if in.oversized > 0 {
 		s.oversized.Add(uint64(in.oversized))
+	}
+	if in.exhausted {
+		s.exhausted.Add(1)
 	}
 }
 
@@ -333,16 +443,27 @@ func (s *Set) count(in *input) {
 // S-CSCF calls it again with the priority it last used when the request
 // returns from that application server, which may have changed the request
 // (TS 24.229 §5.4.3.2).
-func (s *Set) Next(req Request, ctx Context, after int) (FilterCriteria, bool) {
-	in := newInput(req, ctx)
+//
+// It fails with a [*LimitError] when the request is too large to evaluate;
+// a criterion reached before the limit is returned, since the request
+// satisfies it whatever the rest of the request holds.
+func (s *Set) Next(req Request, ctx Context, after int) (FilterCriteria, bool, error) {
+	in := newInput(req, ctx, s.maxWork)
 	defer s.count(in)
 	for i := range s.criteria {
 		c := &s.criteria[i]
-		if c.fc.Priority > after && c.matches(in) {
-			return c.fc, true
+		if c.fc.Priority <= after {
+			continue
+		}
+		matched := c.matches(in)
+		if in.limit != "" {
+			return FilterCriteria{}, false, &LimitError{Limit: in.limit}
+		}
+		if matched {
+			return c.fc, true, nil
 		}
 	}
-	return FilterCriteria{}, false
+	return FilterCriteria{}, false, nil
 }
 
 func (c *compiledCriteria) matches(in *input) bool {
@@ -390,7 +511,7 @@ func (c *compiledSPT) matches(in *input) bool {
 	switch c.kind {
 	case kindRequestURI:
 		part, ok := in.uriPart()
-		return ok && c.name.MatchString(part)
+		return ok && in.match(c.name, part)
 	case kindMethod:
 		if in.req.Method() != c.method {
 			return false
@@ -401,7 +522,7 @@ func (c *compiledSPT) matches(in *input) bool {
 		return true
 	case kindHeader:
 		for _, h := range in.headers() {
-			if c.name.MatchString(h.Name) && (c.value == nil || c.value.MatchString(h.Value)) {
+			if in.match(c.name, h.Name) && (c.value.re == nil || in.match(c.value, h.Value)) {
 				return true
 			}
 		}
@@ -410,7 +531,7 @@ func (c *compiledSPT) matches(in *input) bool {
 		return in.ctx.Case == c.session
 	case kindSessionDescription:
 		for _, l := range in.sdp() {
-			if c.name.MatchString(l.Name) && (c.value == nil || c.value.MatchString(l.Value)) {
+			if in.match(c.name, l.Name) && (c.value.re == nil || in.match(c.value, l.Value)) {
 				return true
 			}
 		}
@@ -426,6 +547,11 @@ type input struct {
 	ctx Context
 	// oversized counts the values left unexamined for their length.
 	oversized int
+	// work is what is left of the work budget; exhausted says a match
+	// could not be paid for. limit names the first limit reached.
+	work      int
+	exhausted bool
+	limit     string
 
 	uri        string
 	uriOK      bool
@@ -436,7 +562,35 @@ type input struct {
 	linesDone  bool
 }
 
-func newInput(req Request, ctx Context) *input { return &input{req: req, ctx: ctx} }
+func newInput(req Request, ctx Context, work int) *input {
+	return &input{req: req, ctx: ctx, work: work}
+}
+
+// match runs p over v if the budget can pay for it. An empty value still
+// costs the program once.
+func (in *input) match(p pattern, v string) bool {
+	cost := max(len(v), 1)
+	if p.token == "" && !p.linear {
+		cost *= p.insts
+	}
+	if cost > in.work {
+		in.work, in.exhausted = 0, true
+		in.reached("MaxWork")
+		return false
+	}
+	in.work -= cost
+	if p.token != "" {
+		return strings.EqualFold(v, p.token)
+	}
+	return p.re.MatchString(v)
+}
+
+// reached records a limit; the first one is reported.
+func (in *input) reached(limit string) {
+	if in.limit == "" {
+		in.limit = limit
+	}
+}
 
 func (in *input) uriPart() (string, bool) {
 	if !in.uriDone {
@@ -445,6 +599,7 @@ func (in *input) uriPart() (string, bool) {
 			in.uri, in.uriOK = requestURIPart(uri), true
 		} else {
 			in.oversized++
+			in.reached("MaxRequestURILength")
 		}
 	}
 	return in.uri, in.uriOK
@@ -452,14 +607,18 @@ func (in *input) uriPart() (string, bool) {
 
 func (in *input) headers() []HeaderField {
 	if !in.fieldsDone {
-		// Annex F matches names and values with white space at either end
-		// removed and inner runs of it reduced to one space, which is what
-		// collapse does.
+		total := 0
 		for _, h := range in.req.HeaderFields() {
-			if len(h.Name) > MaxHeaderLength || len(h.Value) > MaxHeaderLength {
+			n := len(h.Name) + len(h.Value)
+			if limit := headerLimit(h, total+n); limit != "" {
+				in.reached(limit)
 				in.oversized++
 				continue
 			}
+			total += n
+			// Annex F matches names and values with white space at either
+			// end removed and inner runs of it reduced to one space, which
+			// is what collapse does.
 			in.fields = append(in.fields, HeaderField{Name: collapse(h.Name), Value: collapse(h.Value)})
 		}
 		in.fieldsDone = true
@@ -467,16 +626,29 @@ func (in *input) headers() []HeaderField {
 	return in.fields
 }
 
+func headerLimit(h HeaderField, total int) string {
+	switch {
+	case len(h.Name) > MaxHeaderLength || len(h.Value) > MaxHeaderLength:
+		return "MaxHeaderLength"
+	case total > MaxHeaderBytes:
+		return "MaxHeaderBytes"
+	}
+	return ""
+}
+
 // sdp splits each SDP line into its type and value; lines without "=" are
 // not SDP fields and are skipped.
 func (in *input) sdp() []HeaderField {
 	if !in.linesDone {
+		total := 0
 		for _, l := range in.req.SDPLines() {
 			l = strings.TrimSuffix(l, "\r")
-			if len(l) > MaxSDPLineLength {
+			if limit := sdpLimit(l, total+len(l)); limit != "" {
+				in.reached(limit)
 				in.oversized++
 				continue
 			}
+			total += len(l)
 			if typ, value, ok := strings.Cut(l, "="); ok {
 				in.lines = append(in.lines, HeaderField{Name: typ, Value: value})
 			}
@@ -484,6 +656,16 @@ func (in *input) sdp() []HeaderField {
 		in.linesDone = true
 	}
 	return in.lines
+}
+
+func sdpLimit(line string, total int) string {
+	switch {
+	case len(line) > MaxSDPLineLength:
+		return "MaxSDPLineLength"
+	case total > MaxSDPBytes:
+		return "MaxSDPBytes"
+	}
+	return ""
 }
 
 // requestURIPart is the part of a Request-URI that a RequestURI pattern is

@@ -36,13 +36,26 @@
 // trigger. Criteria without a trigger point always match.
 //
 // Matching follows TS 29.228 Annex F. Request-URI, header and SDP patterns are
-// POSIX extended regular expressions, run with Go's engine, whose time is
-// linear in the value matched and in the size of the compiled pattern. Both
-// are bounded, so neither a profile nor a request can make an evaluation
-// expensive: a pattern may compile to at most [MaxPatternInstructions] and a
-// set to at most [MaxSetInstructions] (Compile refuses more), and a value
-// longer than [MaxHeaderLength], [MaxRequestURILength] or [MaxSDPLineLength]
-// is not examined, which [Set.OversizedValues] counts.
+// POSIX extended regular expressions, run with Go's engine, whose time grows
+// with the size of the compiled pattern times the length of the value. What
+// is bounded, exactly:
+//
+//   - Compile: a pattern compiles to at most [MaxPatternInstructions] and a
+//     set to at most [MaxSetInstructions]; Compile refuses more, and refuses
+//     an oversized pattern before building its program.
+//   - Input: one evaluation examines a Request-URI of at most
+//     [MaxRequestURILength], header names and values of at most
+//     [MaxHeaderLength] and [MaxHeaderBytes] together, and SDP lines of at
+//     most [MaxSDPLineLength] and [MaxSDPBytes] together.
+//   - Work: every match is charged against a budget per evaluation
+//     ([DefaultMaxWork], or [Limits.MaxWork]), which bounds the matching
+//     time whatever the profile and the request.
+//
+// A request that would need more fails the evaluation with a [*LimitError]
+// instead of leaving a condition unexamined, because a condition taken as
+// false could let a padded request bypass an application server; the S-CSCF
+// refuses the request. [Set.OversizedValues] and [Set.ExhaustedEvaluations]
+// count these cases for metrics.
 //
 // A header name pattern must match the whole header name, compared without
 // regard to case (header names are case-insensitive, RFC 3261 §7.3.1): the
