@@ -415,7 +415,11 @@ func TestStrayResponseIsDropped(t *testing.T) {
 	server, rec := newTransport(t, Config{})
 	addr := listen(t, server, ListenerConfig{Network: TCP, AdvertisedHost: "pcscf.example.com", AdvertisedPort: 5060})
 	c := dialRaw(t, addr)
-	for _, via := range []string{"SIP/2.0/TCP elsewhere.example.com:5060;branch=z9hG4bK1", "SIP/2.0/TCP pcscf.example.com;branch=z9hG4bK2"} {
+	for _, via := range []string{
+		"SIP/2.0/TCP elsewhere.example.com:5060;branch=z9hG4bK1",
+		"SIP/2.0/TCP pcscf.example.com:5070;branch=z9hG4bK3", // our host, another port
+		"SIP/2.0/TCP pcscf.example.com;branch=z9hG4bK2",
+	} {
 		res := respond(t, newRequest(t, "OPTIONS", via), 200)
 		b, _ := res.Bytes()
 		c.Write(b)
@@ -423,7 +427,7 @@ func TestStrayResponseIsDropped(t *testing.T) {
 	if v := topVia(t, rec.next(t).Message); v.Branch() != "z9hG4bK2" {
 		t.Fatalf("delivered %s, want only the response to our sent-by", v)
 	}
-	eventually(t, "the stray to be counted", func() bool { return server.Stats().StrayResponses == 1 })
+	eventually(t, "the strays to be counted", func() bool { return server.Stats().StrayResponses == 2 })
 }
 
 func TestDoubleCRLFPingIsAnsweredWithASingleCRLF(t *testing.T) {
@@ -582,19 +586,128 @@ func TestProxyLocalHealthCheckIsClosedWithoutAFlow(t *testing.T) {
 	rec.none(t)
 }
 
+// pipeTransport returns a transport whose dials return one end of a net.Pipe,
+// which is unbuffered, so a write blocks until the test reads the other end. A
+// TCP listener supplies the sent-by, since a pipe has no address.
+func pipeTransport(t *testing.T, cfg Config) (*Transport, net.Conn) {
+	t.Helper()
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	cfg.Dialer = pipeDialer{server}
+	tr, _ := newTransport(t, cfg)
+	listen(t, tr, ListenerConfig{Network: TCP})
+	return tr, peer
+}
+
+var pipeDst = Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.1:5060")}
+
 func TestWriteThatTimesOutClosesTheConnection(t *testing.T) {
-	// net.Pipe is unbuffered, so a write blocks until the peer reads, which this
-	// peer never does.
+	tr, _ := pipeTransport(t, Config{WriteTimeout: 10 * time.Millisecond})
+	req := newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK1")
+	// The send only queues; the writer then misses its deadline.
+	if _, err := tr.SendRequest(req, pipeDst); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the write to time out", func() bool {
+		s := tr.Stats()
+		return s.WriteErrors == 1 && s.OpenOutbound == 0
+	})
+}
+
+// within runs send and fails the test if it blocks.
+func within(t *testing.T, send func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- send() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(waitFor):
+		t.Fatal("a send blocked")
+		return nil
+	}
+}
+
+// queueTest sends ~850-byte MESSAGEs over a pipe transport.
+type queueTest struct {
+	t  *testing.T
+	tr *Transport
+	n  int
+}
+
+func (q *queueTest) send(opts ...SendOption) error {
+	q.n++
+	req := newRequest(q.t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKq"+string(rune('a'+q.n)))
+	req.Body = make([]byte, 600)
+	return within(q.t, func() error { _, err := q.tr.SendRequest(req, pipeDst, opts...); return err })
+}
+
+// writerBusy waits until the writer has taken everything queued and is blocked
+// writing it.
+func (q *queueTest) writerBusy() {
+	eventually(q.t, "the writer to take the queue", func() bool {
+		f := q.tr.flows.peer(reuseKey{network: TCP, remote: pipeDst.Addr})
+		f.q.mu.Lock()
+		defer f.q.mu.Unlock()
+		return len(f.q.bufs) == 0
+	})
+}
+
+func TestNoWaitSendNeverBlocksAndOverflowingTheReserveCloses(t *testing.T) {
+	// The limit fits one message; NoWait may use as much again, and the one
+	// being written still counts, so the second fits and the third does not.
+	tr, _ := pipeTransport(t, Config{WriteTimeout: time.Hour, SendQueueBytes: 1000})
+	q := &queueTest{t: t, tr: tr}
+	if err := q.send(); err != nil {
+		t.Fatal(err)
+	}
+	q.writerBusy()
+	if err := q.send(NoWait); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.send(NoWait); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("third send = %v, want ErrQueueFull", err)
+	}
+	if s := tr.Stats(); s.QueueOverflows != 1 || s.OpenOutbound != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestSendWaitsForRoomWhileThePeerReads(t *testing.T) {
+	tr, peer := pipeTransport(t, Config{WriteTimeout: time.Hour, SendQueueBytes: 1000})
+	q := &queueTest{t: t, tr: tr}
+	if err := q.send(); err != nil {
+		t.Fatal(err)
+	}
+	q.writerBusy()
+	// The second send waits; reading the pipe lets the writer finish the first
+	// message, which makes room.
+	go io.Copy(io.Discard, peer)
+	if err := q.send(); err != nil {
+		t.Fatalf("a send waiting for a reading peer failed: %v", err)
+	}
+}
+
+func TestSendThatFindsNoRoomWithinTheWriteTimeoutFails(t *testing.T) {
+	tr, _ := pipeTransport(t, Config{WriteTimeout: 50 * time.Millisecond, SendQueueBytes: 1000})
+	q := &queueTest{t: t, tr: tr}
+	if err := q.send(); err != nil {
+		t.Fatal(err)
+	}
+	q.writerBusy()
+	if err := q.send(); err == nil {
+		t.Fatal("a send to a peer that never reads succeeded")
+	}
+	eventually(t, "the connection to close", func() bool { return tr.Stats().OpenOutbound == 0 })
+}
+
+func TestDialedConnectionWithoutAnAddressOrListenerIsNotGivenABrokenVia(t *testing.T) {
 	server, peer := net.Pipe()
 	defer peer.Close()
-	tr, _ := newTransport(t, Config{WriteTimeout: 10 * time.Millisecond, Dialer: pipeDialer{server}})
-	dst := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.1:5060")}
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{server}})
 	req := newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK1")
-	if _, err := tr.SendRequest(req, dst); err == nil {
-		t.Fatal("a write nobody read succeeded")
-	}
-	if s := tr.Stats(); s.WriteErrors != 1 || s.OpenOutbound != 0 {
-		t.Fatalf("stats = %+v", s)
+	if _, err := tr.SendRequest(req, pipeDst); !errors.Is(err, ErrNoListener) {
+		t.Fatalf("SendRequest = %v, want ErrNoListener", err)
 	}
 }
 

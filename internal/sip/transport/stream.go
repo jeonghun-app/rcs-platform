@@ -114,10 +114,11 @@ func (t *Transport) serveStream(f *flow, accepted bool) {
 	r := sip.NewReader(br, t.cfg.Limits)
 	r.OnKeepAlive = func() {
 		// RFC 5626 §5.4: answer a double-CRLF ping with a single CRLF pong at once.
-		// The write is bounded by WriteTimeout; a peer that pings but does not
-		// read loses its connection, as it would for any other write.
+		// It is queued without waiting, like everything sent from this
+		// goroutine; a peer that pings but does not read loses its connection
+		// once its queue is full.
 		t.stats.keepAlives.Add(1)
-		t.write(f, crlf)
+		t.write(f, crlf, false)
 		d.keepAlive(br)
 	}
 	for {
@@ -151,28 +152,34 @@ func (t *Transport) countReadError(err error, strict bool) {
 	}
 }
 
-// write sends b on a stream or UDP flow. A stream connection is closed on any
-// write error, since the peer may have received part of a message and cannot
-// find the start of the next.
-func (t *Transport) write(f *flow, b []byte) error {
+// write sends b on a UDP flow, or queues it for a stream flow's writer (see
+// sendQueue), waiting for room when wait is set. A stream whose queue stays full
+// is closed: its peer is not reading. An error writing a queued message later
+// closes the connection too, and is seen by the sender only as the flow going
+// away.
+func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	if f.conn == nil {
 		return t.sendDatagram(f.lis, f.remote, b)
 	}
-	f.wmu.Lock()
-	defer f.wmu.Unlock()
-	if f.closed.Load() {
+	ok, closed := f.q.push(b, wait, t.cfg.WriteTimeout)
+	switch {
+	case ok:
+		return nil
+	case closed:
 		return ErrNoFlow
 	}
-	err := f.conn.SetWriteDeadline(time.Now().Add(t.cfg.WriteTimeout))
-	if err == nil {
-		_, err = f.conn.Write(b)
-	}
-	if err != nil {
-		t.stats.writeErrors.Add(1)
-		t.closeFlow(f)
-		return fmt.Errorf("transport: writing to %s connection: %w", f.network, err)
-	}
-	return nil
+	t.stats.queueOverflows.Add(1)
+	t.closeFlow(f)
+	return ErrQueueFull
+}
+
+// startWriter gives a stream flow its send queue and writer goroutine. It is
+// called before the flow can be found, with the transport's WaitGroup already
+// held by the caller's goroutine.
+func (t *Transport) startWriter(f *flow) {
+	f.q = newSendQueue(t.cfg.SendQueueBytes)
+	t.wg.Add(1)
+	go t.writeLoop(f)
 }
 
 // streamTo returns an open connection to a peer, reusing one when there is one
@@ -256,10 +263,12 @@ func (t *Transport) dial(k reuseKey) (*flow, error) {
 	closed := t.closed
 	if !closed {
 		t.wg.Add(1)
+		t.startWriter(f)
 	}
 	t.mu.Unlock()
 	if closed || !t.flows.addStream(f) {
 		if !closed {
+			f.q.close()
 			t.wg.Done()
 		}
 		c.Close()

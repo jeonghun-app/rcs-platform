@@ -38,12 +38,15 @@ type Destination struct {
 // all if the TCP connection cannot be opened. The transaction layer uses the
 // returned Network to decide whether to retransmit.
 //
-// SendRequest can block: for up to DialTimeout while a connection is opened, and
-// for up to WriteTimeout while a stream write waits for the peer. A handler that
-// forwards from one flow to another should therefore send off the reading
+// SendRequest never writes on the caller's goroutine: a stream message is queued
+// for the connection's writer. It can still block, for up to DialTimeout while a
+// connection is opened and for up to WriteTimeout while the queue is full, unless
+// opts include NoWait, which the goroutine reading a connection uses. A handler
+// that forwards from one flow to another should therefore send off the reading
 // goroutine. The caller must not use req concurrently, since the Via may be
 // rewritten.
-func (t *Transport) SendRequest(req *sip.Request, dst Destination) (Network, error) {
+func (t *Transport) SendRequest(req *sip.Request, dst Destination, opts ...SendOption) (Network, error) {
+	wait := !noWait(opts)
 	if t.isClosed() {
 		return "", ErrClosed
 	}
@@ -52,7 +55,7 @@ func (t *Transport) SendRequest(req *sip.Request, dst Destination) (Network, err
 		if f == nil {
 			return "", ErrNoFlow
 		}
-		return f.network, t.sendOn(f, req)
+		return f.network, t.sendOn(f, req, wait)
 	}
 	switch dst.Network {
 	case UDP:
@@ -75,30 +78,33 @@ func (t *Transport) SendRequest(req *sip.Request, dst Destination) (Network, err
 			// §18.1.1: fall back to UDP when the TCP attempt is refused.
 			return UDP, t.sendDatagram(l, dst.Addr, b)
 		}
-		return TCP, t.sendStream(f, req, dst.Listener)
+		return TCP, t.sendStream(f, req, dst.Listener, wait)
 	case TCP, TLS:
 		f, err := t.streamTo(dst.Network, dst.Addr, dst.ServerName)
 		if err != nil {
 			return "", err
 		}
-		return dst.Network, t.sendStream(f, req, dst.Listener)
+		return dst.Network, t.sendStream(f, req, dst.Listener, wait)
 	}
 	return "", fmt.Errorf("transport: unsupported network %q", dst.Network)
 }
 
 // sendOn sends a request over a flow it arrived on or this transport opened.
-func (t *Transport) sendOn(f *flow, req *sip.Request) error {
+func (t *Transport) sendOn(f *flow, req *sip.Request, wait bool) error {
 	if f.conn == nil {
 		if err := setSentBy(req, UDP, f.lis.sentByHost, f.lis.sentByPort); err != nil {
 			return err
 		}
-		return t.writeMessage(f, req)
+		return t.writeMessage(f, req, wait)
 	}
-	return t.sendStream(f, req, "")
+	return t.sendStream(f, req, "", wait)
 }
 
-func (t *Transport) sendStream(f *flow, req *sip.Request, listener string) error {
-	host, port := t.sentByOf(f)
+func (t *Transport) sendStream(f *flow, req *sip.Request, listener string, wait bool) error {
+	host, port, err := t.sentByOf(f)
+	if err != nil {
+		return err
+	}
 	if f.lis == nil && listener != "" {
 		if l := t.listenerNamed(listener); l != nil && l.network == f.network {
 			host, port = l.sentBy()
@@ -107,7 +113,7 @@ func (t *Transport) sendStream(f *flow, req *sip.Request, listener string) error
 	if err := setSentBy(req, f.network, host, port); err != nil {
 		return err
 	}
-	return t.writeMessage(f, req)
+	return t.writeMessage(f, req, wait)
 }
 
 func (t *Transport) listenerNamed(name string) *listener {
@@ -121,12 +127,12 @@ func (t *Transport) listenerNamed(name string) *listener {
 	return nil
 }
 
-func (t *Transport) writeMessage(f *flow, m sip.Message) error {
+func (t *Transport) writeMessage(f *flow, m sip.Message, wait bool) error {
 	b, err := m.Bytes()
 	if err != nil {
 		return err
 	}
-	return t.write(f, b)
+	return t.write(f, b, wait)
 }
 
 func (t *Transport) sendDatagram(l *listener, to netip.AddrPort, b []byte) error {
@@ -151,9 +157,11 @@ func (t *Transport) sendDatagram(l *listener, to netip.AddrPort, b []byte) error
 // the socket the request arrived on, which is what a client behind a NAT expects
 // (RFC 3581 §4).
 //
-// Over a live connection SendResponse blocks for at most WriteTimeout; opening a
-// new one adds up to DialTimeout. A UDP send does not block.
-func (t *Transport) SendResponse(res *sip.Response, src Source) error {
+// Over a live connection SendResponse waits for at most WriteTimeout for room in
+// the send queue, and not at all with NoWait; opening a new connection adds up to
+// DialTimeout. A UDP send does not block.
+func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOption) error {
+	wait := !noWait(opts)
 	if t.isClosed() {
 		return ErrClosed
 	}
@@ -166,7 +174,7 @@ func (t *Transport) SendResponse(res *sip.Response, src Source) error {
 	}
 	if src.Network.Reliable() {
 		if f := t.flows.lookup(src.Flow); f != nil {
-			return t.writeMessage(f, res)
+			return t.writeMessage(f, res, wait)
 		}
 		if l := t.listenerNamed(src.Listener); l != nil && l.clientFacing {
 			return ErrNoFlow
@@ -182,7 +190,7 @@ func (t *Transport) SendResponse(res *sip.Response, src Source) error {
 		if err != nil {
 			return err
 		}
-		return t.writeMessage(f, res)
+		return t.writeMessage(f, res, wait)
 	}
 	_, addr, err := responseTarget(vias[0], true)
 	if err != nil {
