@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -323,7 +324,9 @@ func TestDeadlineReaderKeepsTheReadTimeoutUntilTheFirstMessageIsComplete(t *test
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
-	d := &deadlineReader{conn: a, idle: time.Hour, read: time.Hour, beforeFirst: true}
+	var idle atomic.Int64
+	idle.Store(int64(time.Hour))
+	d := newDeadlineReader(a, &idle, time.Hour, true)
 	br := bufio.NewReader(d)
 	if !d.strict() {
 		t.Fatal("a new accepted connection is not under the read timeout")

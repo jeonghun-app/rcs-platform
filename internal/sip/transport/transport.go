@@ -29,13 +29,14 @@ const (
 	// it.
 	DefaultMaxUDPFlowsPerIP = 256
 	// DefaultIdleTimeout is just below the 1800 s idle timeout of the NLB's TCP
-	// listeners (ADR 0003). Cutting a silent flow here first sends the client a
-	// FIN, so it reconnects, and a terminating request finds no flow and gets
-	// 430 at once; cutting it after the NLB has silently dropped the connection
-	// would let that request be written into a dead connection and time out. The
-	// NLB's TLS listeners have a fixed 350 s idle timeout, so the listener behind
-	// one sets ListenerConfig.IdleTimeout below that and the P-CSCF asks clients
-	// for keep-alives more often with Flow-Timer (RFC 5626 §4.4.1).
+	// listeners. Cutting a silent flow here first sends the client a FIN, so it
+	// reconnects, and a terminating request finds no flow and gets 430 at once;
+	// cutting it after the NLB has silently dropped the connection would let that
+	// request be written into a dead connection and time out. The values a
+	// service actually uses per listener and per flow, which depend on the NLB
+	// listener and on whether the flow negotiated a keep-alive, are set out in
+	// ADR 0003 and applied with ListenerConfig.IdleTimeout and
+	// Transport.SetFlowIdleTimeout.
 	DefaultIdleTimeout = 1740 * time.Second
 	// DefaultUDPFlowTimeout is the shortest UDP mapping lifetime a NAT may use
 	// (RFC 4787 §4.3 REQ-5). Mobile NATs often keep mappings no longer, and
@@ -52,6 +53,12 @@ const (
 	// thousand typical requests while its peer catches up. A peer that never
 	// reads costs at most twice this before its connection is closed.
 	DefaultSendQueueBytes = 4 << 20
+	// DefaultClientSendQueueBytes is the send queue of a client-facing
+	// connection. A client has a few responses and terminating requests in
+	// flight at a time, tens of KiB, so anything more means it is not reading.
+	DefaultClientSendQueueBytes = 64 << 10
+	// DefaultMaxQueuedBytes bounds the output all send queues hold together.
+	DefaultMaxQueuedBytes = 256 << 20
 )
 
 // Errors returned by the send methods. Errors from the network are returned
@@ -156,8 +163,15 @@ type Config struct {
 	// SendQueueBytes bounds what may wait to be written to one stream
 	// connection: a send waits for room, for at most WriteTimeout, while it is
 	// exceeded, and a NoWait send may use as much again. A connection whose
-	// queue stays full is closed.
+	// queue stays full is closed. It applies to dialed connections and to
+	// listeners that are not client-facing; ListenerConfig.SendQueueBytes
+	// overrides it per listener.
 	SendQueueBytes int
+	// MaxQueuedBytes bounds the output every send queue holds together. When a
+	// message would take the total past it, the connection holding the most is
+	// closed to make room. Size it, with the limits above, against the task's
+	// memory (see the package documentation).
+	MaxQueuedBytes int
 	// DialTimeout bounds opening an outbound connection, TLS handshake
 	// included.
 	DialTimeout time.Duration
@@ -203,6 +217,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.WriteTimeout, DefaultWriteTimeout)
 	setDefault(&c.DialTimeout, DefaultDialTimeout)
 	setDefault(&c.SendQueueBytes, DefaultSendQueueBytes)
+	setDefault(&c.MaxQueuedBytes, DefaultMaxQueuedBytes)
 	if c.Dialer == nil {
 		c.Dialer = &net.Dialer{KeepAliveConfig: coreKeepAlive}
 	}
@@ -269,7 +284,12 @@ type ListenerConfig struct {
 	KeepAlive *net.KeepAliveConfig
 	// IdleTimeout overrides Config.IdleTimeout for connections accepted on
 	// this listener, such as one behind the NLB's TLS listener (350 s).
+	// SetFlowIdleTimeout changes it for one flow.
 	IdleTimeout time.Duration
+	// SendQueueBytes overrides Config.SendQueueBytes for connections accepted
+	// on this listener. Zero takes DefaultClientSendQueueBytes on a
+	// client-facing listener and Config.SendQueueBytes otherwise.
+	SendQueueBytes int
 }
 
 // Transport sends and receives SIP messages and owns the flow table. Its methods
@@ -279,6 +299,7 @@ type Transport struct {
 	handler Handler
 	flows   *flowTable
 	stats   counters
+	budget  queueBudget
 
 	mu        sync.Mutex
 	listeners []*listener
@@ -318,6 +339,7 @@ func New(cfg Config, h Handler) (*Transport, error) {
 		dialing: make(map[reuseKey]*dialCall),
 		pending: make(map[net.Conn]struct{}),
 	}
+	t.budget.max = int64(cfg.MaxQueuedBytes)
 	t.flows = newFlowTable(key, cfg.Now, tableConfig{
 		udpTimeout:  cfg.UDPFlowTimeout,
 		maxUDP:      cfg.MaxUDPFlows,
@@ -361,6 +383,23 @@ func (t *Transport) CloseFlow(id FlowID) bool {
 		return false
 	}
 	t.closeFlow(f)
+	return true
+}
+
+// SetFlowIdleTimeout changes the idle timeout of one TCP or TLS flow, counted
+// from the flow's last message or keep-alive, so a shorter value can close it at
+// once. A P-CSCF uses it once registration shows whether the client keeps the
+// flow alive (ADR 0003). It reports false for an unknown flow, a UDP flow (whose
+// lifetime is UDPFlowTimeout) and a duration that is not positive.
+func (t *Transport) SetFlowIdleTimeout(id FlowID, d time.Duration) bool {
+	f := t.flows.lookup(id)
+	if f == nil || f.conn == nil || d <= 0 {
+		return false
+	}
+	f.idle.Store(int64(d))
+	if dr := f.dr.Load(); dr != nil {
+		dr.retime()
+	}
 	return true
 }
 
@@ -427,6 +466,7 @@ type Stats struct {
 	OpenOutbound    int // connections this transport opened
 	OpenUDPFlows    int
 	PendingAccepted int // accepted, PROXY header or TLS handshake in progress
+	QueuedBytes     int // output waiting in every send queue, against MaxQueuedBytes
 
 	// Counters since New.
 	Accepted           uint64 // TCP and TLS connections accepted
@@ -444,6 +484,7 @@ type Stats struct {
 	ReadTimeouts       uint64 // stream connections closed mid-message or before their first message
 	WriteErrors        uint64
 	QueueOverflows     uint64 // stream connections closed because their send queue was full
+	BudgetSheds        uint64 // stream connections closed to keep all queues within MaxQueuedBytes
 	KeepAlives         uint64 // CRLF pings answered
 	MalformedDatagrams uint64
 	InvalidMessages    uint64 // framed but refused by Validate; dropped
@@ -454,7 +495,7 @@ type Stats struct {
 type counters struct {
 	accepted, rejected, refused, dialed, dialErrors, dialLimited,
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
-	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, keepAlives,
+	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, budgetSheds, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses atomic.Uint64
 }
 
@@ -470,6 +511,7 @@ func (t *Transport) Stats() Stats {
 		OpenOutbound:       ts.outbound,
 		OpenUDPFlows:       ts.udp,
 		PendingAccepted:    pending,
+		QueuedBytes:        int(t.budget.used.Load()),
 		Accepted:           c.accepted.Load(),
 		Rejected:           c.rejected.Load(),
 		Refused:            c.refused.Load(),
@@ -485,6 +527,7 @@ func (t *Transport) Stats() Stats {
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
 		QueueOverflows:     c.queueOverflows.Load(),
+		BudgetSheds:        c.budgetSheds.Load(),
 		KeepAlives:         c.keepAlives.Load(),
 		MalformedDatagrams: c.malformedDatagrams.Load(),
 		InvalidMessages:    c.invalidMessages.Load(),

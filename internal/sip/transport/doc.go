@@ -55,15 +55,25 @@
 // only while the queue is over SendQueueBytes, and a NoWait sender, such as the
 // goroutine that reads the same connection, never waits. Two peers that both
 // send faster than they read therefore cannot deadlock each other, and a peer
-// that stops reading loses its connection without slowing anyone else.
+// that stops reading loses its connection without slowing anyone else. When all
+// queues together reach MaxQueuedBytes, the connection holding the most is
+// closed.
 //
-// Memory: a stream connection holds a 4 KiB read buffer, up to twice
-// SendQueueBytes of queued output if its peer stops reading, and while reading a
-// message up to Limits.MaxHeaderBytes plus the body bytes that have arrived, at
-// most Limits.MaxBodyBytes (16 KiB and 1 MiB by default). The worst case is
-// therefore about MaxConnections times 1.02 MiB, over 10 GiB with the defaults,
-// although reaching it needs every client to send a maximal body at once; size
-// the task, MaxConnections and MaxBodyBytes together. Each UDP socket has one
+// Memory, per stream connection: a 4 KiB read buffer; while a message is being
+// read, up to Limits.MaxHeaderBytes plus the body bytes that have arrived (at
+// most Limits.MaxBodyBytes); and up to twice its send queue limit of output if
+// its peer stops reading. With the defaults (16 KiB, 1 MiB, 64 KiB for a
+// client-facing listener, 4 MiB for core listeners and dialed connections) a
+// client connection can hold about 4 KiB + 16 KiB + 1 MiB + 128 KiB = 1.15 MiB
+// and a core connection about 9 MiB. The worst case for a task is therefore
+//
+//	MaxConnections × (4 KiB + MaxHeaderBytes + MaxBodyBytes)   input
+//	+ min(MaxQueuedBytes, Σ 2 × send queue limit)              output
+//
+// which with the defaults is 10000 × 1.02 MiB ≈ 10 GiB of input plus at most
+// 256 MiB of output, since MaxQueuedBytes caps all queues together. Reaching the
+// input term needs every client to send a maximal body at once; size the task,
+// MaxConnections and Limits.MaxBodyBytes together. Each UDP socket has one
 // 64 KiB buffer.
 //
 // Nothing here logs message content or flow IDs: both identify subscribers or
