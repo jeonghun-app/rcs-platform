@@ -27,8 +27,9 @@ a maintainer; behaviour built on it is listed as unverified in
 | TS 24.229 | IMS SIP and SDP stage 3 | `pcscf`, `icscf`, `scscf`, `rcs-as` |
 | TS 29.228 / 29.229 | Cx/Dx signalling flows and Diameter protocol | `icscf`, `scscf`, `hss` |
 | TS 29.328 / 29.329 | Sh interface, user data XML schema | `hss`, `rcs-as` |
+| TS 33.102 | 3G security architecture: AKA, AUTN/AUTS, resynchronisation (§6.3), sequence number management (Annex C) | `hss`, `scscf` (`internal/milenage`) |
 | TS 33.203 | IMS access security | `pcscf`, `scscf` |
-| TS 35.205 / 35.206 / 35.208 | Milenage algorithm set and test data | `hss` (`internal/milenage`) |
+| TS 35.205 / 35.206 / 35.207 / 35.208 | Milenage algorithm set, implementers' test data (35.207) and conformance test data (35.208) | `hss` (`internal/milenage`) |
 | TS 23.003 | Numbering, addressing and identification | `internal/sip`, `hss` |
 | TS 23.334 | IMS-ALG and IMS-AGW | `pcscf`, `msrp-relay` |
 

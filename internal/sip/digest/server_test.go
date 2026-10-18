@@ -28,6 +28,9 @@ type harness struct {
 	server *Server
 	clock  *fakeClock
 	counts *MemoryNonceCounts
+	// vectorExpires is when scscf's stored AKA vector expires in tests that
+	// are not about expiry: well after any clock advance they make.
+	vectorExpires time.Time
 }
 
 func newHarness(t testing.TB) *harness {
@@ -44,7 +47,7 @@ func newHarness(t testing.TB) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{server: s, clock: clock, counts: counts}
+	return &harness{server: s, clock: clock, counts: counts, vectorExpires: clock.t.Add(24 * time.Hour)}
 }
 
 func (h *harness) challenge(t *testing.T, alg Algorithm) Challenge {
@@ -72,9 +75,9 @@ func answer(t *testing.T, ch Challenge, password string, nc uint32) Credentials 
 // would.
 func overWire(t *testing.T, c Credentials) Credentials {
 	t.Helper()
-	parsed, err := ParseCredentials(c.String())
+	parsed, err := ParseCredentials(c.Header())
 	if err != nil {
-		t.Fatalf("ParseCredentials(%q): %v", c.String(), err)
+		t.Fatalf("ParseCredentials(%q): %v", c.Header(), err)
 	}
 	return parsed
 }
@@ -83,7 +86,7 @@ func TestCorrectPasswordIsAcceptedForMD5AndSHA256(t *testing.T) {
 	for _, alg := range []Algorithm{MD5, SHA256} {
 		t.Run(string(alg), func(t *testing.T) {
 			h := newHarness(t)
-			ch, err := ParseChallenge(h.challenge(t, alg).String())
+			ch, err := ParseChallenge(h.challenge(t, alg).Header())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -224,8 +227,8 @@ func TestStaleChallengeSaysStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(ch.String(), ", stale=true") {
-		t.Fatalf("challenge %q has no stale=true", ch.String())
+	if !strings.HasSuffix(ch.Header(), ", stale=true") {
+		t.Fatalf("challenge %q has no stale=true", ch.Header())
 	}
 }
 
@@ -257,7 +260,8 @@ func TestNonceNotIssuedByThisServerIsInvalid(t *testing.T) {
 	ch := h.challenge(t, MD5)
 
 	other := newHarness(t)
-	other.server.key = bytes.Repeat([]byte{0x55}, 32)
+	otherKey := bytes.Repeat([]byte{0x55}, 32)
+	other.server.key = seal(&otherKey)
 	foreign := other.challenge(t, MD5)
 
 	otherRealm, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: testKey, NonceCounts: h.counts, Now: h.clock.now})
@@ -353,7 +357,7 @@ func TestCredentialsThatBreakTheProtocolAreRejectedBeforeAnyCryptography(t *test
 		{"no nc", func(c *Credentials) { c.NC = 0 }, ErrMalformed},
 		{"no cnonce", func(c *Credentials) { c.CNonce = "" }, ErrMalformed},
 		{"auts with MD5", func(c *Credentials) { c.AUTS = make([]byte, 14) }, ErrMalformed},
-		{"AKA algorithm on a Digest nonce", func(c *Credentials) { c.Algorithm = AKAv1MD5 }, ErrInvalidNonce},
+		{"AKA credentials sent to Verify", func(c *Credentials) { c.Algorithm = AKAv1MD5 }, ErrUseVerifyAKA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -387,7 +391,7 @@ func TestZeroSecretIsRefused(t *testing.T) {
 
 type failingCounts struct{}
 
-func (failingCounts) Advance(context.Context, string, uint32, time.Time) (bool, error) {
+func (failingCounts) Advance(context.Context, string, string, uint32, time.Time) (bool, error) {
 	return false, errors.New("table unavailable")
 }
 
@@ -402,13 +406,14 @@ func TestNonceCountStoreFailureFailsVerification(t *testing.T) {
 }
 
 type recordingCounts struct {
-	nonce   string
-	nc      uint32
-	expires time.Time
+	username string
+	nonce    string
+	nc       uint32
+	expires  time.Time
 }
 
-func (r *recordingCounts) Advance(_ context.Context, nonce string, nc uint32, expires time.Time) (bool, error) {
-	r.nonce, r.nc, r.expires = nonce, nc, expires
+func (r *recordingCounts) Advance(_ context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
+	r.username, r.nonce, r.nc, r.expires = username, nonce, nc, expires
 	return true, nil
 }
 
@@ -422,7 +427,7 @@ func TestNonceCountIsRecordedUntilTheNonceExpires(t *testing.T) {
 	if err := h.server.Verify(context.Background(), "REGISTER", answer(t, ch, testPass, 9), Password([]byte(testPass))); err != nil {
 		t.Fatal(err)
 	}
-	if rec.nonce != ch.Nonce || rec.nc != 9 || !rec.expires.Equal(issued.Add(DefaultNonceLifetime)) {
+	if rec.username != testUser || rec.nonce != ch.Nonce || rec.nc != 9 || !rec.expires.Equal(issued.Add(DefaultNonceLifetime)) {
 		t.Fatalf("recorded %+v", rec)
 	}
 }
@@ -577,5 +582,99 @@ func TestNewCNonceIsRandomAndReportsReaderFailure(t *testing.T) {
 	}
 	if _, err := NewCNonce(brokenReader{}); err == nil {
 		t.Fatal("cnonce made without randomness")
+	}
+}
+
+func TestOneUserCannotUseUpAnotherUsersNonceCount(t *testing.T) {
+	// The security review's scenario: a second user answers a nonce issued to
+	// the first with nc=ffffffff. Counts are per (username, nonce).
+	h := newHarness(t)
+	ch := h.challenge(t, SHA256)
+	ctx := context.Background()
+	other, err := Respond(ch, ClientParams{
+		Username: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", Password: []byte("other"),
+		Method: "REGISTER", URI: testURI, CNonce: "x", NC: 0xffffffff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.server.Verify(ctx, "REGISTER", other, Password([]byte("other"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.server.Verify(ctx, "REGISTER", answer(t, ch, testPass, 1), Password([]byte(testPass))); err != nil {
+		t.Fatalf("victim's nc 1 after another user's nc ffffffff: %v", err)
+	}
+}
+
+func TestOpaqueIsBoundToAlgorithmAndRealm(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// A SHA-256 challenge answered under MD5 (a downgrade) is refused.
+	ch := h.challenge(t, SHA256)
+	ch.Algorithm = MD5
+	if err := h.server.Verify(ctx, "REGISTER", answer(t, ch, testPass, 1), Password([]byte(testPass))); !errors.Is(err, ErrInvalidNonce) {
+		t.Fatalf("algorithm switched: err = %v, want ErrInvalidNonce", err)
+	}
+
+	// A default AKA nonce, which has no tag, issued for another realm that
+	// shares the key, is refused although the nonce itself decodes.
+	other, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: testKey, NonceCounts: h.counts, Now: h.clock.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	aka, _ := other.AKAChallenge(make([]byte, 16), make([]byte, 16), false)
+	aka.Realm = testRealm
+	c, err := Respond(aka, ClientParams{Username: testUser, Password: []byte("res"), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, []byte("res"), h.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
+		t.Fatalf("AKA nonce from another realm: err = %v, want ErrInvalidNonce", err)
+	}
+}
+
+func TestFirstIMSRegisterIsAnInvalidNonceWhateverElseItLacks(t *testing.T) {
+	// TS 24.229 §5.1.1.2.2/§5.1.1.2.3: identity only, no qop, nc or cnonce.
+	h := newHarness(t)
+	c, err := ParseCredentials(`Digest username="` + testUser + `", realm="` + testRealm +
+		`", uri="` + testURI + `", nonce="", response=""`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := h.server.Check(c); !errors.Is(err, ErrInvalidNonce) {
+		t.Errorf("Check: err = %v, want ErrInvalidNonce", err)
+	}
+	if err := h.server.Verify(ctx, "REGISTER", c, Password([]byte(testPass))); !errors.Is(err, ErrInvalidNonce) {
+		t.Errorf("Verify: err = %v, want ErrInvalidNonce", err)
+	}
+	c.Algorithm = AKAv1MD5
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, []byte("res"), h.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
+		t.Errorf("VerifyAKA: err = %v, want ErrInvalidNonce", err)
+	}
+	if err := h.server.Verify(ctx, "REGISTER", c, Password([]byte(testPass))); !errors.Is(err, ErrInvalidNonce) {
+		t.Errorf("Verify with algorithm=AKAv1-MD5: err = %v, want ErrInvalidNonce", err)
+	}
+	c.Realm = "another.example"
+	if err := h.server.Check(c); !errors.Is(err, ErrInvalidNonce) {
+		t.Errorf("empty nonce for another realm: err = %v, want ErrInvalidNonce first", err)
+	}
+}
+
+func TestCheckRejectsForgedNoncesBeforeAnySecretIsRead(t *testing.T) {
+	h := newHarness(t)
+	ch := h.challenge(t, SHA256)
+	good := answer(t, ch, testPass, 1)
+	if err := h.server.Check(good); err != nil {
+		t.Fatalf("Check on genuine credentials: %v", err)
+	}
+	forged := good
+	forged.Opaque = "AAAAAAAAAAAAAAAA"
+	if err := h.server.Check(forged); !errors.Is(err, ErrInvalidNonce) {
+		t.Fatalf("Check on a forged opaque: err = %v, want ErrInvalidNonce", err)
+	}
+	if h.counts.Len() != 0 {
+		t.Fatal("Check consumed a nonce count")
 	}
 }

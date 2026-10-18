@@ -33,7 +33,14 @@ func set1Seen(t *testing.T) milenage.SQN {
 	return s
 }
 
-func set1(t *testing.T) (milenage.Milenage, milenage.Vector) {
+// vector is a milenage.Vector unpacked into arrays the tests can slice.
+type vector struct {
+	RAND, AUTN [16]byte
+	XRES       [8]byte
+	CK, IK     [16]byte
+}
+
+func set1(t *testing.T) (milenage.Milenage, vector) {
 	t.Helper()
 	b := func(s string) []byte {
 		v, err := hex.DecodeString(s)
@@ -44,7 +51,7 @@ func set1(t *testing.T) (milenage.Milenage, milenage.Vector) {
 	}
 	m := milenage.New([16]byte(b(set1K)), [16]byte(b(set1OPc)))
 	v := m.Vector([16]byte(b(set1RAND)), milenage.SQNFromBytes([6]byte(b(set1SQN))), [2]byte(b(set1AMF)))
-	return m, v
+	return m, vector{RAND: v.RAND(), AUTN: v.AUTN(), XRES: v.XRES(), CK: v.CK(), IK: v.IK()}
 }
 
 // card plays the ISIM and the client: it checks AUTN, and either answers
@@ -84,7 +91,7 @@ func TestAKARoundTripWithTestSet1Authenticates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire, err := ParseChallenge(ch.String())
+	wire, err := ParseChallenge(ch.Header())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +100,7 @@ func TestAKARoundTripWithTestSet1Authenticates(t *testing.T) {
 	}
 
 	c := card(t, m, wire, set1Seen(t))
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 }
@@ -115,40 +122,128 @@ func TestDefaultAKANonceIsExactlyBase64OfRANDAndAUTN(t *testing.T) {
 	}
 }
 
-func TestDefaultAKANonceLeavesExpiryToTheVectorStore(t *testing.T) {
-	// The nonce has no issue time; scscf's auth-challenges entry expires
-	// instead (ADR 0005), so Verify itself never reports it stale.
+func TestDefaultAKANonceLivesAsLongAsTheStoredVector(t *testing.T) {
+	// The nonce has no issue time; the vector's expiry in auth-challenges
+	// (ADR 0005) is the only limit, even past the nonce lifetime.
 	h := newHarness(t)
 	m, v := set1(t)
+	expires := h.clock.now().Add(3 * DefaultNonceLifetime)
 	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	c := card(t, m, ch, set1Seen(t))
 	h.clock.advance(2 * DefaultNonceLifetime)
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
-		t.Fatalf("Verify: %v", err)
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], expires); err != nil {
+		t.Fatalf("VerifyAKA before the vector expires: %v", err)
 	}
 }
 
-func TestDefaultAKANonceCountIsStillReplayProtected(t *testing.T) {
+func TestAKAAfterTheVectorExpiresIsStale(t *testing.T) {
+	h := newHarness(t)
+	m, v := set1(t)
+	expires := h.clock.now().Add(30 * time.Second)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c := card(t, m, ch, set1Seen(t))
+	h.clock.advance(31 * time.Second)
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], expires); !errors.Is(err, ErrStaleNonce) {
+		t.Fatalf("err = %v, want ErrStaleNonce", err)
+	}
+}
+
+func TestAKASynchronisationFailureOnAnExpiredVectorIsStale(t *testing.T) {
+	// A stale challenge must not keep driving resynchronisation at hss.
+	h := newHarness(t)
+	m, v := set1(t)
+	expires := h.clock.now().Add(30 * time.Second)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	ahead, _ := milenage.NewSQN(set1Seen(t).SEQ()+10, 0)
+	c := card(t, m, ch, ahead)
+	h.clock.advance(time.Minute)
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], expires); !errors.Is(err, ErrStaleNonce) {
+		t.Fatalf("err = %v, want ErrStaleNonce", err)
+	}
+}
+
+func TestAKAReplayAfterTheNonceLifetimeIsStillRejected(t *testing.T) {
+	// The security review's scenario: a vector kept longer than the nonce
+	// lifetime, and a captured Authorization resent once a lifetime-bound
+	// count would have gone. The count lives as long as the vector.
+	h := newHarness(t)
+	m, v := set1(t)
+	expires := h.clock.now().Add(time.Hour)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c := card(t, m, ch, set1Seen(t))
+	ctx := context.Background()
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, v.XRES[:], expires); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, v.XRES[:], expires); !errors.Is(err, ErrReplayed) {
+		t.Fatalf("immediate replay: err = %v, want ErrReplayed", err)
+	}
+	h.clock.advance(DefaultNonceLifetime + 2*time.Minute)
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, v.XRES[:], expires); !errors.Is(err, ErrReplayed) {
+		t.Fatalf("replay after the nonce lifetime: err = %v, want ErrReplayed", err)
+	}
+	h.clock.advance(time.Hour)
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, v.XRES[:], expires); !errors.Is(err, ErrStaleNonce) {
+		t.Fatalf("replay after the vector expired: err = %v, want ErrStaleNonce", err)
+	}
+}
+
+func TestAKANonceCountIsKeptUntilTheVectorExpires(t *testing.T) {
 	h := newHarness(t)
 	rec := &recordingCounts{}
+	h.server.counts = rec
+	m, v := set1(t)
+	expires := h.clock.now().Add(time.Hour)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c := card(t, m, ch, set1Seen(t))
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], expires); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.expires.Equal(expires) || rec.username != testUser || rec.nonce != ch.Nonce {
+		t.Fatalf("recorded %+v, want the vector's expiry for (user, nonce)", rec)
+	}
+}
+
+func TestAKANonceWithServerDataEndsAtTheEarlierOfNonceAndVector(t *testing.T) {
+	h := newHarness(t)
+	h.server.akaServerData = true
+	rec := &recordingCounts{}
+	h.server.counts = rec
+	m, v := set1(t)
+	issued := h.clock.now()
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c := card(t, m, ch, set1Seen(t))
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], issued.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.expires.Equal(issued.Add(DefaultNonceLifetime)) {
+		t.Fatalf("count kept until %v, want the nonce lifetime", rec.expires)
+	}
+}
+
+func TestVerifyAKARefusesWhatItCannotCheck(t *testing.T) {
+	h := newHarness(t)
 	m, v := set1(t)
 	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	c := card(t, m, ch, set1Seen(t))
-
-	h.server.counts = rec
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
-		t.Fatal(err)
+	ctx := context.Background()
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, v.XRES[:], time.Time{}); err == nil {
+		t.Error("accepted without the vector's expiry")
 	}
-	if !rec.expires.Equal(h.clock.now().Add(DefaultNonceLifetime)) {
-		t.Fatalf("count kept until %v, want one lifetime from now", rec.expires)
+	if err := h.server.VerifyAKA(ctx, "REGISTER", c, nil, h.vectorExpires); !errors.Is(err, ErrNoSecret) {
+		t.Errorf("no XRES: err = %v, want ErrNoSecret", err)
 	}
-
-	h.server.counts = h.counts
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
-		t.Fatal(err)
+	digest := answer(t, h.challenge(t, MD5), testPass, 1)
+	if err := h.server.VerifyAKA(ctx, "REGISTER", digest, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrUnsupportedAlgorithm) {
+		t.Errorf("MD5 credentials: err = %v, want ErrUnsupportedAlgorithm", err)
 	}
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrReplayed) {
-		t.Fatalf("replayed AKA credentials: err = %v, want ErrReplayed", err)
+	digestNonce := h.challenge(t, MD5)
+	digestNonce.Algorithm = AKAv1MD5
+	if err := h.server.VerifyAKA(ctx, "REGISTER", answer(t, digestNonce, "res", 1), []byte("res"), h.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
+		t.Errorf("AKA answer to a Digest nonce: err = %v, want ErrInvalidNonce", err)
+	}
+	if err := h.server.Verify(ctx, "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrUseVerifyAKA) {
+		t.Errorf("Verify with AKA credentials: err = %v, want ErrUseVerifyAKA", err)
 	}
 }
 
@@ -176,14 +271,14 @@ func TestAKANonceWithServerDataRoundTripsAndExpires(t *testing.T) {
 		t.Fatalf("nonce %x does not start with RAND ‖ AUTN followed by server data", raw)
 	}
 	c := card(t, m, ch, set1Seen(t))
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 
 	ch, _ = h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	c = card(t, m, ch, set1Seen(t))
 	h.clock.advance(DefaultNonceLifetime + time.Second)
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrStaleNonce) {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrStaleNonce) {
 		t.Fatalf("expired nonce with server data: err = %v, want ErrStaleNonce", err)
 	}
 }
@@ -200,7 +295,7 @@ func TestAKANonceOfTheFormNotConfiguredIsInvalid(t *testing.T) {
 			issuer, verifier := pair[0], pair[1]
 			ch, _ := issuer.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 			c := card(t, m, ch, set1Seen(t))
-			if err := verifier.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrInvalidNonce) {
+			if err := verifier.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], verifier.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
 				t.Fatalf("err = %v, want ErrInvalidNonce", err)
 			}
 		})
@@ -211,9 +306,9 @@ func TestDefaultAKANonceOfTheWrongLengthIsInvalid(t *testing.T) {
 	h := newHarness(t)
 	for _, n := range []int{31, 33, akaTaggedLen} {
 		nonce := base64.StdEncoding.EncodeToString(make([]byte, n))
-		ch := Challenge{Realm: testRealm, Nonce: nonce, Opaque: h.server.opaqueFor(nonce), Algorithm: AKAv1MD5, QOP: []string{"auth"}}
+		ch := Challenge{Realm: testRealm, Nonce: nonce, Opaque: h.server.opaqueFor(AKAv1MD5, nonce), Algorithm: AKAv1MD5, QOP: []string{"auth"}}
 		c := answer(t, ch, "res", 1)
-		if err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte("res"))); !errors.Is(err, ErrInvalidNonce) {
+		if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, []byte("res"), h.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
 			t.Errorf("%d-byte nonce: err = %v, want ErrInvalidNonce", n, err)
 		}
 	}
@@ -226,7 +321,7 @@ func TestAKAWithTheWrongRESIsRejected(t *testing.T) {
 	c := card(t, m, ch, set1Seen(t))
 	wrong := v.XRES
 	wrong[0] ^= 0x01
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(wrong[:])); !errors.Is(err, ErrWrongResponse) {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, wrong[:], h.vectorExpires); !errors.Is(err, ErrWrongResponse) {
 		t.Fatalf("err = %v, want ErrWrongResponse", err)
 	}
 }
@@ -239,11 +334,11 @@ func TestAKASynchronisationFailureExposesAUTSForResynchronisation(t *testing.T) 
 	// The card has already seen a later SEQ than the one in AUTN.
 	cardHighest, _ := milenage.NewSQN(set1Seen(t).SEQ()+10, 0)
 	c := card(t, m, ch, cardHighest)
-	if c.AUTS == nil {
+	if len(c.AUTS) == 0 {
 		t.Fatal("card did not report a synchronisation failure")
 	}
 
-	err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:]))
+	err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires)
 	var sync *SyncFailure
 	if !errors.As(err, &sync) {
 		t.Fatalf("err = %v, want *SyncFailure", err)
@@ -259,8 +354,23 @@ func TestAKASynchronisationFailureExposesAUTSForResynchronisation(t *testing.T) 
 	if sqnMS != cardHighest {
 		t.Fatalf("SQN_MS = %x, want %x", uint64(sqnMS), uint64(cardHighest))
 	}
-	if h.counts.Len() != 0 {
-		t.Fatal("a synchronisation failure consumed a nonce count")
+	// Resending the same auts credentials must not trigger another
+	// resynchronisation round trip.
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrReplayed) {
+		t.Fatalf("resent auts: err = %v, want ErrReplayed", err)
+	}
+}
+
+func TestExpiredTaggedAKANonceWithAUTSIsStaleNotASyncFailure(t *testing.T) {
+	h := newHarness(t)
+	h.server.akaServerData = true
+	m, v := set1(t)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	ahead, _ := milenage.NewSQN(set1Seen(t).SEQ()+10, 0)
+	c := card(t, m, ch, ahead)
+	h.clock.advance(DefaultNonceLifetime + time.Second)
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrStaleNonce) {
+		t.Fatalf("err = %v, want ErrStaleNonce", err)
 	}
 }
 
@@ -273,7 +383,7 @@ func TestAKASynchronisationFailureMustUseTheEmptyPassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.AUTS = make([]byte, 14) // auts added, but the response was computed with RES
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrWrongResponse) {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrWrongResponse) {
 		t.Fatalf("err = %v, want ErrWrongResponse", err)
 	}
 }
@@ -284,7 +394,7 @@ func TestAKAAUTSOfTheWrongLengthIsMalformed(t *testing.T) {
 	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	c := card(t, m, ch, set1Seen(t))
 	c.AUTS = make([]byte, 11) // the length of the illustrative auts in RFC 3310 §4
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrMalformed) {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
 }
@@ -302,7 +412,7 @@ func TestDigestAlgorithmOnAnAKANonceIsInvalid(t *testing.T) {
 
 // forgeRAND swaps another RAND into a genuine AKA nonce and answers it with the
 // RES for that RAND, as an attacker replaying a captured AUTN would.
-func forgeRAND(t *testing.T, h *harness, m milenage.Milenage, v milenage.Vector, fixOpaque bool) (Credentials, []byte) {
+func forgeRAND(t *testing.T, h *harness, m milenage.Milenage, v vector, fixOpaque bool) (Credentials, []byte) {
 	t.Helper()
 	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	otherRAND := v.RAND
@@ -313,7 +423,7 @@ func forgeRAND(t *testing.T, h *harness, m milenage.Milenage, v milenage.Vector,
 	ch.Nonce = string(raw)
 	if fixOpaque {
 		// Only a holder of the nonce key could do this.
-		ch.Opaque = h.server.opaqueFor(ch.Nonce)
+		ch.Opaque = h.server.opaqueFor(AKAv1MD5, ch.Nonce)
 	}
 	res := m.F2(otherRAND)
 	c, err := Respond(ch, ClientParams{Username: testUser, Password: res[:], Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
@@ -327,7 +437,7 @@ func TestTamperedAKANonceIsInvalid(t *testing.T) {
 	h := newHarness(t)
 	m, v := set1(t)
 	c, res := forgeRAND(t, h, m, v, false)
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(res)); !errors.Is(err, ErrInvalidNonce) {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, res, h.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
 		t.Fatalf("err = %v, want ErrInvalidNonce", err)
 	}
 }
@@ -337,7 +447,7 @@ func TestTamperedAKANonceWithServerDataIsInvalidEvenWithAMatchingOpaque(t *testi
 	h.server.akaServerData = true
 	m, v := set1(t)
 	c, res := forgeRAND(t, h, m, v, true)
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(res)); !errors.Is(err, ErrInvalidNonce) {
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, res, h.vectorExpires); !errors.Is(err, ErrInvalidNonce) {
 		t.Fatalf("err = %v, want ErrInvalidNonce", err)
 	}
 }

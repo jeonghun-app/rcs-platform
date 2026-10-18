@@ -10,7 +10,10 @@ import (
 )
 
 // ClientParams is what a client supplies to answer a challenge. It formats as
-// a redacted placeholder because it holds the password.
+// a redacted placeholder because it holds the password. Its fields are
+// exported for ease of use, so build it where it is used rather than keeping
+// it in an unexported field of a long-lived struct, where fmt would print the
+// password bytes.
 type ClientParams struct {
 	Username string
 	// Password is the user's password, or for AKAv1-MD5 the RES the card
@@ -24,8 +27,8 @@ type ClientParams struct {
 	// NC is the nonce-count: 1 for the first request with a nonce, then one
 	// more for each further request with the same nonce.
 	NC uint32
-	// AUTS, when set, reports an AKA synchronisation failure instead of
-	// answering: the response is computed with the empty password and the
+	// AUTS, when not empty, reports an AKA synchronisation failure instead
+	// of answering: the response is computed with the empty password and the
 	// token is sent in auts (RFC 3310 §3.4).
 	AUTS []byte
 }
@@ -47,9 +50,9 @@ func Respond(ch Challenge, p ClientParams) (Credentials, error) {
 		return Credentials{}, errors.New("digest: nonce count starts at 1")
 	case p.CNonce == "":
 		return Credentials{}, errors.New("digest: cnonce is required with qop=auth")
-	case p.AUTS != nil && alg != AKAv1MD5:
+	case len(p.AUTS) > 0 && alg != AKAv1MD5:
 		return Credentials{}, errors.New("digest: auts is only defined for Digest AKA")
-	case p.AUTS != nil && len(p.AUTS) != 14:
+	case len(p.AUTS) > 0 && len(p.AUTS) != 14:
 		return Credentials{}, errors.New("digest: AUTS is 14 bytes")
 	}
 	for _, v := range []string{p.Username, p.URI, p.CNonce, p.Method, ch.Realm, ch.Nonce, ch.Opaque} {
@@ -58,7 +61,7 @@ func Respond(ch Challenge, p ClientParams) (Credentials, error) {
 		}
 	}
 	password := p.Password
-	if p.AUTS != nil {
+	if len(p.AUTS) > 0 {
 		password = nil
 	}
 	h := ha1(alg, p.Username, ch.Realm, password)

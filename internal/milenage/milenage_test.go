@@ -3,6 +3,7 @@ package milenage
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,14 +21,20 @@ type conformanceSet struct {
 	f5, f5Star             string
 }
 
-// conformanceSets holds all twenty test sets of TS 35.208 §4.3 (§4.3.1 to
-// §4.3.20). The first six carry the same data as the implementers' test sets of TS 35.207.
+// conformanceSets holds the twenty test sets of TS 35.208 §4.3 (§4.3.1 to
+// §4.3.20). The first six carry the same data as the implementers' test sets
+// of TS 35.207.
+//
+// Set 2 is the exception: TS 35.208 V17.0.0 §4.3.2 repeats the values of set
+// 1, so the values here are TS 35.207 V17.0.0 set 2 (§4.4, §5.4, §6.4). Do
+// not "correct" it to §4.3.2: that would only test set 1 twice.
 var conformanceSets = []conformanceSet{
 	{set: 1, k: "465b5ce8b199b49faa5f0a2ee238a6bc", rand: "23553cbe9637a89d218ae64dae47bf35", sqn: "ff9bb4d0b607", amf: "b9b9",
 		op: "cdc202d5123e20f62b6d676ac72cb318", opc: "cd63cb71954a9f4e48a5994e37a02baf",
 		f1: "4a9ffac354dfafb3", f1Star: "01cfaf9ec4e871e9", f2: "a54211d5e3ba50bf",
 		f3: "b40ba9a3c58b2a05bbf0d987b21bf8cb", f4: "f769bcd751044604127672711c6d3441",
 		f5: "aa689c648370", f5Star: "451e8beca43b"},
+	// Set 2 from TS 35.207 V17.0.0, see above.
 	{set: 2, k: "0396eb317b6d1c36f19c1c84cd6ffd16", rand: "c00d603103dcee52c4478119494202e8", sqn: "fd8eef40df7d", amf: "af17",
 		op: "ff53bade17df5d4e793073ce9d7579fa", opc: "53c15671c60a4b731c55b4a441c0bde2",
 		f1: "5df5b31807e258b0", f1Star: "a8c016e51ef4a343", f2: "d3a628ed988620f0",
@@ -193,10 +200,10 @@ func TestVectorCombinesTheFunctionsAsTS33102Specifies(t *testing.T) {
 			sqn := SQNFromBytes(sqnOf(t, ts.sqn))
 			v := m.Vector(rand, sqn, amfOf(t, ts.amf))
 
-			check(t, "RAND", v.RAND[:], ts.rand)
-			check(t, "XRES", v.XRES[:], ts.f2)
-			check(t, "CK", v.CK[:], ts.f3)
-			check(t, "IK", v.IK[:], ts.f4)
+			check(t, "RAND", v.p().rand[:], ts.rand)
+			check(t, "XRES", v.p().xres[:], ts.f2)
+			check(t, "CK", v.p().ck[:], ts.f3)
+			check(t, "IK", v.p().ik[:], ts.f4)
 
 			// AUTN = SQN ⊕ AK ‖ AMF ‖ MAC-A, built here from the test set
 			// independently of Vector.
@@ -204,7 +211,7 @@ func TestVectorCombinesTheFunctionsAsTS33102Specifies(t *testing.T) {
 			for i, b := range unhex(t, ts.f5) {
 				concealed[i] ^= b
 			}
-			check(t, "AUTN", v.AUTN[:], hex.EncodeToString(concealed)+ts.amf+ts.f1)
+			check(t, "AUTN", v.p().autn[:], hex.EncodeToString(concealed)+ts.amf+ts.f1)
 		})
 	}
 }
@@ -214,7 +221,7 @@ func TestVectorAUTNForTestSet1IsTheKnownValue(t *testing.T) {
 	ts := conformanceSets[0]
 	m := New(key(t, ts.k), key(t, ts.opc))
 	v := m.Vector(rnd(t, ts.rand), SQNFromBytes(sqnOf(t, ts.sqn)), amfOf(t, ts.amf))
-	check(t, "AUTN", v.AUTN[:], "55f328b43577b9b94a9ffac354dfafb3")
+	check(t, "AUTN", v.p().autn[:], "55f328b43577b9b94a9ffac354dfafb3")
 }
 
 func TestCardRecoversSQNFromAUTNItsNetworkBuilt(t *testing.T) {
@@ -223,7 +230,7 @@ func TestCardRecoversSQNFromAUTNItsNetworkBuilt(t *testing.T) {
 		rand := rnd(t, ts.rand)
 		sqn := SQNFromBytes(sqnOf(t, ts.sqn))
 		v := m.Vector(rand, sqn, amfOf(t, ts.amf))
-		got, err := m.CheckAUTN(rand, v.AUTN)
+		got, err := m.CheckAUTN(rand, v.p().autn)
 		if err != nil {
 			t.Fatalf("set%d: CheckAUTN: %v", ts.set, err)
 		}
@@ -240,7 +247,7 @@ func TestCardRejectsAUTNThatWasTamperedWithOrMadeWithAnotherKey(t *testing.T) {
 	v := m.Vector(rand, SQNFromBytes(sqnOf(t, ts.sqn)), amfOf(t, ts.amf))
 
 	for i := range AUTNSize {
-		autn := v.AUTN
+		autn := v.p().autn
 		autn[i] ^= 0x01
 		if _, err := m.CheckAUTN(rand, autn); !errors.Is(err, ErrMACFailure) {
 			t.Errorf("AUTN with byte %d flipped: err = %v, want ErrMACFailure", i, err)
@@ -248,12 +255,12 @@ func TestCardRejectsAUTNThatWasTamperedWithOrMadeWithAnotherKey(t *testing.T) {
 	}
 	otherRAND := rand
 	otherRAND[0] ^= 0x80
-	if _, err := m.CheckAUTN(otherRAND, v.AUTN); !errors.Is(err, ErrMACFailure) {
+	if _, err := m.CheckAUTN(otherRAND, v.p().autn); !errors.Is(err, ErrMACFailure) {
 		t.Errorf("AUTN with another RAND: err = %v, want ErrMACFailure", err)
 	}
 	other := conformanceSets[2]
 	stranger := New(key(t, other.k), key(t, other.opc))
-	if _, err := stranger.CheckAUTN(rand, v.AUTN); !errors.Is(err, ErrMACFailure) {
+	if _, err := stranger.CheckAUTN(rand, v.p().autn); !errors.Is(err, ErrMACFailure) {
 		t.Errorf("AUTN checked with another subscriber's keys: err = %v, want ErrMACFailure", err)
 	}
 }
@@ -315,11 +322,15 @@ func TestNetworkRejectsAUTSThatWasTamperedWithOrIsForAnotherRAND(t *testing.T) {
 }
 
 // secretsOf returns every secret the test set holds, in the forms a leak
-// could take: lower and upper hex, and the raw bytes.
+// could take: lower and upper hex, the raw bytes, and fmt's decimal rendering
+// of a byte slice or array ("165 66 17 ..."), which is what %v and %d print
+// for a []byte or [N]byte field.
 func secretsOf(t *testing.T, ts conformanceSet) []string {
 	var out []string
 	for _, h := range []string{ts.k, ts.op, ts.opc, ts.f2, ts.f3, ts.f4} {
-		out = append(out, h, strings.ToUpper(h), string(unhex(t, h)))
+		b := unhex(t, h)
+		dec := fmt.Sprint(b)
+		out = append(out, h, strings.ToUpper(h), string(b), dec[1:len(dec)-1])
 	}
 	return out
 }
@@ -346,6 +357,16 @@ func TestNoSecretAppearsInFormattedOrLoggedValues(t *testing.T) {
 			M Milenage
 			V Vector
 		}{m, v},
+		// fmt cannot call methods on unexported fields; the pointer inside
+		// each type is what keeps the bytes out.
+		"unexported fields": struct {
+			m Milenage
+			v Vector
+		}{m, v},
+		"unexported pointers": struct {
+			m *Milenage
+			v *Vector
+		}{&m, &v},
 	}
 	for name, val := range values {
 		for _, out := range formatted(val) {
@@ -360,6 +381,29 @@ func TestNoSecretAppearsInFormattedOrLoggedValues(t *testing.T) {
 		if !strings.Contains(s, "redacted") {
 			t.Errorf("String/GoString = %q, want the redacted placeholder", s)
 		}
+	}
+}
+
+func TestVectorPartsAreReadThroughItsMethods(t *testing.T) {
+	ts := conformanceSets[0]
+	m := New(key(t, ts.k), key(t, ts.opc))
+	v := m.Vector(rnd(t, ts.rand), SQNFromBytes(sqnOf(t, ts.sqn)), amfOf(t, ts.amf))
+	rand, xres, ck, ik, autn := v.RAND(), v.XRES(), v.CK(), v.IK(), v.AUTN()
+	check(t, "RAND()", rand[:], ts.rand)
+	check(t, "XRES()", xres[:], ts.f2)
+	check(t, "CK()", ck[:], ts.f3)
+	check(t, "IK()", ik[:], ts.f4)
+	check(t, "AUTN()", autn[:], "55f328b43577b9b94a9ffac354dfafb3")
+
+	var zero Vector
+	if zero.XRES() != [RESSize]byte{} || zero.AUTN() != [AUTNSize]byte{} {
+		t.Fatal("zero Vector is not all zeros")
+	}
+	if b, err := json.Marshal(v); err != nil || !strings.Contains(string(b), "redacted") {
+		t.Fatalf("JSON = %s, %v", b, err)
+	}
+	if b, err := json.Marshal(m); err != nil || !strings.Contains(string(b), "redacted") {
+		t.Fatalf("JSON = %s, %v", b, err)
 	}
 }
 

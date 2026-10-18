@@ -35,9 +35,12 @@ type param struct {
 // parseHeader splits `Digest name=value, name="value", ...` into parameters.
 // Values may be tokens or quoted-strings wherever they appear: RFC 7235
 // §5.1.2 expects auth-params to allow both so that one generic parser serves
-// every scheme, and clients do send qop="auth" in Authorization. Line folding (CRLF followed by whitespace, RFC 3261 §7.3.1)
-// counts as whitespace. Anything else outside the grammar is an error, never
-// repaired.
+// every scheme, and clients do send qop="auth" in Authorization. Empty list
+// elements (",," or a trailing comma) are skipped, as RFC 7230 §7 requires of
+// recipients of the HTTP list rule the auth-params use (RFC 7235 §2.1); SIP
+// has no empty elements, so accepting them there costs nothing. Line folding
+// (CRLF followed by whitespace, RFC 3261 §7.3.1) counts as whitespace.
+// Anything else outside the grammar is an error, never repaired.
 func parseHeader(s string) ([]param, error) {
 	if len(s) > MaxHeaderLength {
 		return nil, malformed("longer than %d bytes", MaxHeaderLength)
@@ -52,6 +55,10 @@ func parseHeader(s string) ([]param, error) {
 	}
 	var params []param
 	for {
+		l.skipEmptyElements()
+		if l.eof() {
+			break
+		}
 		name := l.token()
 		if name == "" {
 			return nil, malformed("expected a parameter name at offset %d", l.i)
@@ -76,13 +83,16 @@ func parseHeader(s string) ([]param, error) {
 		}
 		l.skipLWS()
 		if l.eof() {
-			return params, nil
+			break
 		}
 		if !l.consume(',') {
 			return nil, malformed("expected ',' at offset %d", l.i)
 		}
-		l.skipLWS()
 	}
+	if len(params) == 0 {
+		return nil, malformed("no parameters after the scheme")
+	}
+	return params, nil
 }
 
 // pick returns the values of the parameters named in known. A known parameter
@@ -144,6 +154,13 @@ func (l *lexer) skipLWS() int {
 // fold reports whether a folded line break (CRLF then SP or HTAB) starts here.
 func (l *lexer) fold() bool {
 	return strings.HasPrefix(l.s[l.i:], "\r\n") && l.i+2 < len(l.s) && isWSP(l.s[l.i+2])
+}
+
+// skipEmptyElements skips whitespace and any commas that only delimit empty
+// list elements.
+func (l *lexer) skipEmptyElements() {
+	for l.skipLWS(); l.consume(','); l.skipLWS() {
+	}
 }
 
 func (l *lexer) token() string {

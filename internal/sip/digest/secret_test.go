@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // leakForms returns the ways a secret could show up in text: as is, as lower
@@ -74,6 +75,13 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 		"ClientParams":    params,
 		"*Server":         h.server,
 	}
+	// fmt cannot call Format on unexported fields; the pointer inside Secret
+	// is what keeps the bytes out there.
+	formatted["unexported fields"] = struct {
+		pw  Secret
+		ha1 Secret
+		srv *Server
+	}{Password([]byte(testPass)), ha1Secret, h.server}
 	for name, value := range formatted {
 		for _, out := range everyFormatting(value) {
 			s.check(t, name, out)
@@ -115,8 +123,13 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 
 	aka, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	sync, _ := Respond(aka, ClientParams{Username: testUser, Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1, AUTS: make([]byte, 14)})
-	verify(sync, Password(v.XRES[:]))
+	verifyAKA := func(c Credentials, expires time.Time) {
+		errs = append(errs, h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], expires))
+	}
+	verifyAKA(sync, h.vectorExpires)
 	res, _ := Respond(aka, ClientParams{Username: testUser, Password: []byte("x"), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	verifyAKA(res, h.vectorExpires)
+	verifyAKA(res, h.clock.now().Add(-time.Second))
 	verify(res, Password(v.XRES[:]))
 
 	_, err = HA1(MD5, "zz"+md5HA1[2:])
@@ -131,7 +144,7 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 	errs = append(errs, err)
 
 	r := httptest.NewRequest("GET", "/f", nil)
-	r.Header.Set("Authorization", answer(t, h.challenge(t, MD5), testPass, 1).String())
+	r.Header.Set("Authorization", answer(t, h.challenge(t, MD5), testPass, 1).Header())
 	_, err = h.server.VerifyHTTP(r, lookupFor(testPass))
 	errs = append(errs, err)
 
@@ -148,7 +161,41 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 	}
 
 	// Header values carry the response digest but never what it was made from.
-	for _, out := range []string{good.String(), ch.String(), sync.String(), aka.String()} {
+	for _, out := range []string{good.Header(), ch.Header(), sync.Header(), aka.Header()} {
 		s.check(t, "header value", out)
+	}
+}
+
+func TestCredentialsAndChallengesLogASummaryWithoutIdentityOrNonce(t *testing.T) {
+	h := newHarness(t)
+	_, v := set1(t)
+	aka, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	creds, err := Respond(aka, ClientParams{Username: testUser, Password: v.XRES[:], Method: "REGISTER", URI: testURI, CNonce: "cnonce-x", NC: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds.AUTS = make([]byte, 14)
+	forbidden := []string{testUser, "001010000000001", aka.Nonce, aka.Opaque, creds.Response, "cnonce-x"}
+	for name, value := range map[string]any{"Credentials": creds, "Challenge": aka} {
+		for _, out := range everyFormatting(value) {
+			for _, f := range forbidden {
+				if strings.Contains(out, f) {
+					t.Errorf("%s formatted as %q contains %q", name, out, f)
+				}
+			}
+			if !strings.Contains(out, testRealm) {
+				t.Errorf("%s summary %q lost the realm", name, out)
+			}
+		}
+	}
+	// The header form is the one place they do appear.
+	if !strings.Contains(creds.Header(), testUser) || !strings.Contains(aka.Header(), aka.Nonce) {
+		t.Fatal("Header lost the wire values")
+	}
+	if creds.GoString() != creds.String() || aka.GoString() != aka.String() {
+		t.Fatal("GoString differs from the summary")
+	}
+	if got := creds.String(); got != `digest.Credentials{realm="`+testRealm+`" algorithm=AKAv1-MD5 qop="auth" nc=00000001 auts=true}` {
+		t.Fatalf("summary = %s", got)
 	}
 }

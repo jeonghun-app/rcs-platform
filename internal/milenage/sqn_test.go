@@ -155,7 +155,7 @@ func TestResynchronisedCounterRoundTripsThroughAUTS(t *testing.T) {
 
 	sent, _ := network.Next()
 	v := m.Vector(rand, sent, amfOf(t, ts.amf))
-	got, err := m.CheckAUTN(rand, v.AUTN)
+	got, err := m.CheckAUTN(rand, v.p().autn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestResynchronisedCounterRoundTripsThroughAUTS(t *testing.T) {
 		t.Fatal(err)
 	}
 	v = m.Vector(rand, next, amfOf(t, ts.amf))
-	got, err = m.CheckAUTN(rand, v.AUTN)
+	got, err = m.CheckAUTN(rand, v.p().autn)
 	if err != nil || !Fresh(got, card) {
 		t.Fatalf("vector after resynchronisation rejected: fresh=%v err=%v", Fresh(got, card), err)
 	}

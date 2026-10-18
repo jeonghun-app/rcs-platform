@@ -53,13 +53,10 @@ const (
 )
 
 func (s *Server) nonceTag(kind byte, issued []byte, body []byte) []byte {
-	m := hmac.New(sha256.New, s.key)
+	m := hmac.New(sha256.New, *s.key())
 	m.Write([]byte(labelNonce))
 	m.Write([]byte{kind})
-	var realmLen [2]byte
-	binary.BigEndian.PutUint16(realmLen[:], uint16(len(s.realm)))
-	m.Write(realmLen[:])
-	m.Write([]byte(s.realm))
+	writeField(m, s.realm)
 	m.Write(issued)
 	m.Write(body)
 	return m.Sum(nil)[:tagSize]
@@ -143,15 +140,27 @@ func (s *Server) checkTag(kind byte, issued, body, tag []byte) (time.Time, error
 	return at, nil
 }
 
-// opaqueFor derives the opaque value from the nonce, so it needs no storage
-// and a client cannot pair a nonce with another nonce's opaque. For the
-// default AKA nonce, which has no tag, it is also what shows that this server
-// issued the nonce before scscf looks the vector up.
-func (s *Server) opaqueFor(nonce string) string {
-	m := hmac.New(sha256.New, s.key)
+// opaqueFor derives the opaque value from the realm, the algorithm and the
+// nonce, so it needs no storage, a client cannot pair a nonce with another
+// nonce's opaque, and a nonce cannot be answered under another algorithm or
+// carried to another realm that shares the key. For the default AKA nonce,
+// which has no tag, it is also what shows that this server issued the nonce.
+func (s *Server) opaqueFor(alg Algorithm, nonce string) string {
+	m := hmac.New(sha256.New, *s.key())
 	m.Write([]byte(labelOpaque))
+	writeField(m, s.realm)
+	writeField(m, string(alg))
 	m.Write([]byte(nonce))
 	return base64.RawURLEncoding.EncodeToString(m.Sum(nil)[:12])
+}
+
+// writeField writes a length-prefixed field, so that adjacent fields cannot
+// be shifted into each other.
+func writeField(w io.Writer, v string) {
+	var n [2]byte
+	binary.BigEndian.PutUint16(n[:], uint16(len(v)))
+	_, _ = w.Write(n[:])
+	_, _ = io.WriteString(w, v)
 }
 
 // ParseAKANonce extracts RAND and AUTN from the nonce of an AKAv1-MD5

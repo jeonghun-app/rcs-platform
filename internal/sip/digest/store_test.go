@@ -26,7 +26,7 @@ func TestMemoryStoreAcceptsOnlyIncreasingCounts(t *testing.T) {
 		{"a", 6, true},
 	}
 	for i, s := range steps {
-		got, err := m.Advance(ctx, s.nonce, s.nc, exp)
+		got, err := m.Advance(ctx, "u", s.nonce, s.nc, exp)
 		if err != nil || got != s.want {
 			t.Fatalf("step %d Advance(%s, %d) = %v, %v; want %v", i, s.nonce, s.nc, got, err, s.want)
 		}
@@ -37,25 +37,40 @@ func TestMemoryStoreForgetsExpiredNonces(t *testing.T) {
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
 	m := NewMemoryNonceCounts(clock.now)
 	ctx := context.Background()
-	_, _ = m.Advance(ctx, "old", 3, clock.t.Add(10*time.Second))
-	_, _ = m.Advance(ctx, "live", 1, clock.t.Add(time.Hour))
+	_, _ = m.Advance(ctx, "u", "old", 3, clock.t.Add(10*time.Second))
+	_, _ = m.Advance(ctx, "u", "live", 1, clock.t.Add(time.Hour))
 
 	clock.advance(sweepInterval)
-	_, _ = m.Advance(ctx, "trigger", 1, clock.t.Add(time.Hour))
+	_, _ = m.Advance(ctx, "u", "trigger", 1, clock.t.Add(time.Hour))
 	if m.Len() != 2 {
 		t.Fatalf("Len = %d after the sweep, want the two live nonces", m.Len())
 	}
 	// An expired entry no longer blocks, even before a sweep removes it.
-	_, _ = m.Advance(ctx, "short", 9, clock.t.Add(time.Second))
+	_, _ = m.Advance(ctx, "u", "short", 9, clock.t.Add(time.Second))
 	clock.advance(2 * time.Second)
-	if ok, _ := m.Advance(ctx, "short", 1, clock.t.Add(time.Second)); !ok {
+	if ok, _ := m.Advance(ctx, "u", "short", 1, clock.t.Add(time.Second)); !ok {
 		t.Fatal("expired entry still rejected a count")
+	}
+}
+
+func TestMemoryStoreKeepsSeparateCountsPerUser(t *testing.T) {
+	m := NewMemoryNonceCounts(nil)
+	exp := time.Now().Add(time.Hour)
+	ctx := context.Background()
+	if ok, _ := m.Advance(ctx, "bob", "n", 0xffffffff, exp); !ok {
+		t.Fatal("first count for bob refused")
+	}
+	if ok, _ := m.Advance(ctx, "alice", "n", 1, exp); !ok {
+		t.Fatal("bob's count blocked alice")
+	}
+	if ok, _ := m.Advance(ctx, "alice", "n", 1, exp); ok {
+		t.Fatal("alice's replay accepted")
 	}
 }
 
 func TestMemoryStoreDefaultsToTheSystemClock(t *testing.T) {
 	m := NewMemoryNonceCounts(nil)
-	if ok, err := m.Advance(context.Background(), "n", 1, time.Now().Add(time.Minute)); !ok || err != nil {
+	if ok, err := m.Advance(context.Background(), "u", "n", 1, time.Now().Add(time.Minute)); !ok || err != nil {
 		t.Fatalf("Advance = %v, %v", ok, err)
 	}
 }
@@ -67,7 +82,7 @@ func TestMemoryStoreAcceptsEachCountOnceUnderConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 32 {
 		wg.Go(func() {
-			if ok, _ := m.Advance(context.Background(), "n", 1, exp); ok {
+			if ok, _ := m.Advance(context.Background(), "u", "n", 1, exp); ok {
 				accepted.Add(1)
 			}
 		})

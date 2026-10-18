@@ -1,6 +1,7 @@
 package digest
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -13,17 +14,19 @@ import (
 )
 
 // Verification outcomes. Callers answer ErrStaleNonce with a new challenge
-// carrying stale=true, a *SyncFailure with a challenge built from a
-// resynchronised vector, and every other error with a fresh challenge (or a
-// rejection, by local policy).
+// carrying stale=true and a *SyncFailure as its documentation says. Every
+// other error, including a failed secret lookup, should get one and the same
+// answer (a fresh challenge, or a rejection by local policy), so that a client
+// cannot tell an unknown user from a wrong password.
 var (
 	// ErrRealmMismatch means the credentials name another realm.
 	ErrRealmMismatch = errors.New("digest: credentials are for another realm")
 	// ErrUnsupportedQOP means the credentials do not use qop=auth.
 	ErrUnsupportedQOP = errors.New("digest: qop is not auth")
 	// ErrInvalidNonce means the nonce or opaque was not issued by this server
-	// for this realm and algorithm, including the empty nonce of an IMS
-	// client's first REGISTER.
+	// for this realm and algorithm. The empty nonce of an IMS client's first
+	// REGISTER gives it too, before any other check, so the caller simply
+	// challenges.
 	ErrInvalidNonce = errors.New("digest: nonce was not issued by this server")
 	// ErrWrongResponse means the response does not match the secret.
 	ErrWrongResponse = errors.New("digest: response does not match")
@@ -34,11 +37,18 @@ var (
 	ErrReplayed = errors.New("digest: nonce count already used")
 )
 
-// SyncFailure is returned by Verify when an AKA client reported that the
-// challenge's sequence number was not acceptable (RFC 3310 §3.4). The client
-// is not authenticated. The caller sends RAND ‖ AUTS to hss for
-// resynchronisation (TS 33.203 §6.1.3, TS 29.228 §6.3) and challenges again
-// with the new vector.
+// SyncFailure is returned by VerifyAKA when an AKA client reported that the
+// challenge's sequence number was not acceptable (RFC 3310 §3.4). The caller
+// sends RAND ‖ AUTS to hss for resynchronisation (TS 33.203 §6.1.3, TS 29.228
+// §6.3) and challenges again with the new vector.
+//
+// A SyncFailure is unauthenticated. RFC 3310 §3.4 has the client compute the
+// response with the empty password, so anyone holding a challenge's nonce and
+// opaque can produce one with any 14 bytes of AUTS (each nonce-count only
+// once). Only milenage.VerifyAUTS at hss (MAC-S under K) authenticates
+// AUTS. Until that check passes the caller must change no state (keep the
+// pending vector, keep any registration), and it must rate-limit
+// resynchronisation per IMPI, because each attempt costs a Cx round trip.
 type SyncFailure struct {
 	RAND [16]byte
 	AUTS [14]byte
@@ -47,15 +57,18 @@ type SyncFailure struct {
 // Error implements error. It names no value: AUTS and RAND must not be logged.
 func (e *SyncFailure) Error() string { return "digest: AKA client reported a synchronisation failure" }
 
-// NonceCountStore records the highest nonce-count used with each nonce, the
-// only state Digest needs.
+// NonceCountStore records the highest nonce-count each user has used with
+// each nonce, the only state Digest needs. Counts are kept per (username,
+// nonce) because MD5 and SHA-256 nonces are not bound to a user: keyed by
+// nonce alone, one user could exhaust the count of a nonce issued to another.
 type NonceCountStore interface {
-	// Advance records nc for nonce and reports true if nc is greater than the
-	// nonce-count recorded so far (or none is); otherwise it changes nothing
-	// and reports false. The comparison and the write must be one atomic step
-	// across every instance sharing the store, for example a DynamoDB
-	// conditional update. The entry may be discarded after expires.
-	Advance(ctx context.Context, nonce string, nc uint32, expires time.Time) (bool, error)
+	// Advance records nc for (username, nonce) and reports true if nc is
+	// greater than the nonce-count recorded so far (or none is); otherwise it
+	// changes nothing and reports false. The comparison and the write must be
+	// one atomic step across every instance sharing the store, for example a
+	// DynamoDB conditional update. The entry must be kept until expires and
+	// may be discarded after it: no credentials for the nonce verify later.
+	Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error)
 }
 
 // DefaultNonceLifetime is used when ServerConfig.NonceLifetime is zero. A SIP
@@ -89,11 +102,11 @@ type ServerConfig struct {
 	// safe for concurrent use.
 	Random io.Reader
 	// AKAServerData appends an issue time and an HMAC tag to AKA nonces as
-	// RFC 3310 §3.2 server data, so that Verify can reject a forged or expired
-	// AKA nonce without the vector store. Off by default: many deployed UE
-	// stacks accept only the bare base64(RAND ‖ AUTN). Every instance serving
-	// the realm must use the same setting, because each accepts only the form
-	// it issues.
+	// RFC 3310 §3.2 server data, so that a forged nonce fails its tag before
+	// the vector lookup and VerifyAKA applies the nonce lifetime as well as
+	// the vector's. Off by default: many deployed UE stacks accept only the
+	// bare base64(RAND ‖ AUTN). Every instance serving the realm must use the
+	// same setting, because each accepts only the form it issues.
 	AKAServerData bool
 }
 
@@ -102,7 +115,7 @@ type ServerConfig struct {
 // it holds the nonce key.
 type Server struct {
 	realm    string
-	key      []byte
+	key      sealed[[]byte] // sealed so that a *Server nested anywhere cannot print it
 	lifetime time.Duration
 	counts   NonceCountStore
 	now      func() time.Time
@@ -123,9 +136,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	case cfg.NonceCounts == nil:
 		return nil, errors.New("digest: a nonce count store is required for replay protection")
 	}
+	key := bytes.Clone(cfg.NonceKey)
 	s := &Server{
 		realm:    cfg.Realm,
-		key:      append([]byte{}, cfg.NonceKey...),
+		key:      seal(&key),
 		lifetime: cfg.NonceLifetime,
 		counts:   cfg.NonceCounts,
 		now:      cfg.Now,
@@ -162,9 +176,10 @@ func (s *Server) Challenge(alg Algorithm, stale bool) (Challenge, error) {
 }
 
 // AKAChallenge returns an AKAv1-MD5 challenge for one vector's RAND and AUTN
-// (RFC 3310 §3.2, TS 24.229 §5.4.1.2.1). The nonce is base64(RAND ‖ AUTN)
+// (RFC 3310 §3.2, TS 24.229 §5.4.1.2.1A). The nonce is base64(RAND ‖ AUTN)
 // unless ServerConfig.AKAServerData is set. The caller stores the vector under
-// the returned nonce.
+// the IMPI and the returned nonce, with an expiry, and later passes both to
+// VerifyAKA.
 func (s *Server) AKAChallenge(rand, autn []byte, stale bool) (Challenge, error) {
 	if len(rand) != randSize || len(autn) != autnSize {
 		return Challenge{}, errors.New("digest: RAND and AUTN must be 16 bytes each")
@@ -176,40 +191,118 @@ func (s *Server) challenge(alg Algorithm, nonce string, stale bool) Challenge {
 	return Challenge{
 		Realm:     s.realm,
 		Nonce:     nonce,
-		Opaque:    s.opaqueFor(nonce),
+		Opaque:    s.opaqueFor(alg, nonce),
 		Algorithm: alg,
 		QOP:       []string{QOPAuth},
 		Stale:     stale,
 	}
 }
 
-// Verify checks credentials sent with a request whose method is method (the
-// SIP method, or the HTTP method for ft-server). nil means the client is
-// authenticated and the nonce-count has been consumed.
-//
-// For AKAv1-MD5, secret is Password(XRES) of the vector the caller stored
-// under c.Nonce. With the default nonce form Verify cannot tell whether that
-// vector is still current, so the caller must treat a nonce with no stored,
-// unexpired vector as invalid (or stale, by its policy) and not call Verify;
-// ErrStaleNonce then only arises with ServerConfig.AKAServerData. Credentials
-// carrying auts are checked against the empty password and reported as a
-// *SyncFailure (RFC 3310 §3.4).
+// ErrUseVerifyAKA is returned by Verify for AKAv1-MD5 credentials, which need
+// the vector's expiry and so go through VerifyAKA.
+var ErrUseVerifyAKA = fmt.Errorf("%w: verify AKAv1-MD5 with VerifyAKA", ErrUnsupportedAlgorithm)
+
+// Verify checks MD5 or SHA-256 credentials sent with a request whose method is
+// method (the SIP method, or the HTTP method for ft-server). nil means the
+// client is authenticated and the nonce-count has been consumed. For
+// AKAv1-MD5 credentials it returns ErrUseVerifyAKA. Call Check before looking
+// up the secret.
 //
 // Verify does not compare c.URI with the request: in SIP the two may
 // legitimately differ after forwarding, and whether to accept that is local
 // policy (RFC 8760 §2.6). VerifyHTTP does compare them.
 func (s *Server) Verify(ctx context.Context, method string, c Credentials, secret Secret) error {
+	// An empty nonce falls through to precheck, so that a first REGISTER
+	// gives ErrInvalidNonce whatever its algorithm.
+	if c.Algorithm == AKAv1MD5 && c.Nonce != "" {
+		return ErrUseVerifyAKA
+	}
 	issued, err := s.precheck(c)
 	if err != nil {
 		return err
 	}
-	return s.verify(ctx, method, c, secret, issued)
+	return s.verifyDigest(ctx, method, c, secret, issued)
 }
 
-// precheck does every check that needs no secret, so that a forged or foreign
-// nonce costs no subscriber lookup.
+// VerifyAKA checks AKAv1-MD5 credentials against the vector the caller stored
+// under c.Nonce when it issued the challenge (ADR 0005): xres is its XRES and
+// expires the end of its life in auth-challenges. nil means the client is
+// authenticated and the nonce-count has been consumed.
+//
+// Credentials are refused once expires has passed, and the nonce-count is
+// kept until then, so they cannot be replayed for as long as the vector could
+// be found. The caller must still delete the vector, with a conditional
+// delete, on the first nil result (ADR 0005): that, not the nonce-count, is
+// what makes a captured Authorization worthless across instances and
+// restarts of the count store. With ServerConfig.AKAServerData the nonce's
+// own lifetime applies as well, whichever ends first.
+//
+// Credentials carrying auts are checked against the empty password and
+// reported as a *SyncFailure (RFC 3310 §3.4), which is unauthenticated: see
+// SyncFailure. The order is: response, then expiry, then nonce-count, then
+// auts. So an expired vector, or with AKAServerData an expired nonce, gives
+// ErrStaleNonce rather than a SyncFailure, and a resent auts gives
+// ErrReplayed; neither can drive resynchronisation.
+func (s *Server) VerifyAKA(ctx context.Context, method string, c Credentials, xres []byte, expires time.Time) error {
+	switch {
+	case c.Algorithm != AKAv1MD5:
+		return fmt.Errorf("%w: VerifyAKA needs AKAv1-MD5 credentials", ErrUnsupportedAlgorithm)
+	case len(xres) == 0:
+		return ErrNoSecret
+	case expires.IsZero():
+		return errors.New("digest: VerifyAKA needs the vector's expiry")
+	}
+	issued, err := s.precheck(c)
+	if err != nil {
+		return err
+	}
+	password := xres
+	if len(c.AUTS) > 0 {
+		password = nil
+	}
+	if err := s.checkResponse(method, c, ha1(AKAv1MD5, c.Username, c.Realm, password)); err != nil {
+		return err
+	}
+	deadline := expires
+	if !issued.IsZero() {
+		if own := issued.Add(s.lifetime); own.Before(deadline) {
+			deadline = own
+		}
+	}
+	if s.now().After(deadline) {
+		return ErrStaleNonce
+	}
+	// The count is consumed before a SyncFailure too, so that resending the
+	// same auts credentials gets ErrReplayed instead of another Cx round trip.
+	if err := s.consume(ctx, c, deadline); err != nil {
+		return err
+	}
+	if len(c.AUTS) > 0 {
+		// precheck has confirmed the nonce is an AKA nonce, so it holds RAND.
+		rand, _, _ := ParseAKANonce(c.Nonce)
+		return &SyncFailure{RAND: rand, AUTS: [14]byte(c.AUTS)}
+	}
+	return nil
+}
+
+// Check runs the checks Verify and VerifyAKA start with, the ones that need no
+// secret: realm, algorithm, qop, nc and cnonce, the nonce's form and tag, and
+// the opaque value. scscf calls it before reading HA1 or the stored vector, so
+// a forged or foreign nonce costs no table read; Verify and VerifyAKA repeat
+// it, which is cheap. Credentials with an empty nonce, such as an IMS
+// client's first REGISTER (TS 24.229 §5.1.1.2.2, §5.1.1.2.3), give
+// ErrInvalidNonce whatever else they lack.
+func (s *Server) Check(c Credentials) error {
+	_, err := s.precheck(c)
+	return err
+}
+
+// precheck implements Check and returns the nonce's issue time, or the zero
+// time for the default AKA form.
 func (s *Server) precheck(c Credentials) (time.Time, error) {
 	switch {
+	case c.Nonce == "":
+		return time.Time{}, ErrInvalidNonce
 	case c.Realm != s.realm:
 		return time.Time{}, ErrRealmMismatch
 	case !c.Algorithm.supported():
@@ -218,50 +311,52 @@ func (s *Server) precheck(c Credentials) (time.Time, error) {
 		return time.Time{}, ErrUnsupportedQOP
 	case c.NC == 0 || c.CNonce == "":
 		return time.Time{}, malformed("qop=auth credentials need nc and cnonce")
-	case c.AUTS != nil && c.Algorithm != AKAv1MD5:
+	case len(c.AUTS) > 0 && c.Algorithm != AKAv1MD5:
 		return time.Time{}, malformed("auts outside Digest AKA")
-	case c.AUTS != nil && len(c.AUTS) != 14:
+	case len(c.AUTS) > 0 && len(c.AUTS) != 14:
 		return time.Time{}, malformed("auts is not 14 bytes")
 	}
 	issued, err := s.checkNonce(c.Algorithm, c.Nonce)
 	if err != nil {
 		return time.Time{}, err
 	}
-	if subtle.ConstantTimeCompare([]byte(c.Opaque), []byte(s.opaqueFor(c.Nonce))) != 1 {
+	if subtle.ConstantTimeCompare([]byte(c.Opaque), []byte(s.opaqueFor(c.Algorithm, c.Nonce))) != 1 {
 		return time.Time{}, ErrInvalidNonce
 	}
 	return issued, nil
 }
 
-func (s *Server) verify(ctx context.Context, method string, c Credentials, secret Secret, issued time.Time) error {
-	var h string
-	if c.AUTS != nil {
-		h = ha1(c.Algorithm, c.Username, c.Realm, nil)
-	} else {
-		var err error
-		if h, err = secret.ha1For(c.Algorithm, c.Username, c.Realm); err != nil {
-			return err
-		}
+// verifyDigest finishes Verify and VerifyHTTP once precheck has passed.
+func (s *Server) verifyDigest(ctx context.Context, method string, c Credentials, secret Secret, issued time.Time) error {
+	h, err := secret.ha1For(c.Algorithm, c.Username, c.Realm)
+	if err != nil {
+		return err
 	}
+	if err := s.checkResponse(method, c, h); err != nil {
+		return err
+	}
+	deadline := issued.Add(s.lifetime)
+	if s.now().After(deadline) {
+		return ErrStaleNonce
+	}
+	return s.consume(ctx, c, deadline)
+}
+
+// checkResponse compares the client's request-digest with the one computed
+// from h in constant time.
+func (s *Server) checkResponse(method string, c Credentials, h string) error {
 	want, _ := hex.DecodeString(response(c.Algorithm, h, c.Nonce, formatNC(c.NC), c.CNonce, c.QOP, method, c.URI))
 	got, err := hex.DecodeString(c.Response)
 	if err != nil || subtle.ConstantTimeCompare(got, want) != 1 {
 		return ErrWrongResponse
 	}
+	return nil
+}
 
-	if c.AUTS != nil {
-		// checkNonce has confirmed the nonce is an AKA nonce, so it holds RAND.
-		rand, _, _ := ParseAKANonce(c.Nonce)
-		return &SyncFailure{RAND: rand, AUTS: [14]byte(c.AUTS)}
-	}
-	expires := s.now().Add(s.lifetime) // default AKA nonce: no issue time, keep the count a lifetime
-	if !issued.IsZero() {
-		if s.now().Sub(issued) > s.lifetime {
-			return ErrStaleNonce
-		}
-		expires = issued.Add(s.lifetime)
-	}
-	fresh, err := s.counts.Advance(ctx, c.Nonce, c.NC, expires)
+// consume records the nonce-count, keeping it until deadline, after which the
+// credentials would be refused anyway.
+func (s *Server) consume(ctx context.Context, c Credentials, deadline time.Time) error {
+	fresh, err := s.counts.Advance(ctx, c.Username, c.Nonce, c.NC, deadline)
 	if err != nil {
 		return fmt.Errorf("digest: recording the nonce count: %w", err)
 	}

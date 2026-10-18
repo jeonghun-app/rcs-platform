@@ -1,7 +1,11 @@
 package digest
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 )
 
@@ -74,10 +78,11 @@ func (c Challenge) offersAuth() bool {
 	return false
 }
 
-// String formats the challenge as a header field value. realm, nonce, opaque
+// Header formats the challenge as a header field value. realm, nonce, opaque
 // and qop are quoted and algorithm and stale are not, as RFC 7616 §3.3
-// requires of senders.
-func (c Challenge) String() string {
+// requires of senders. The value holds the nonce, so it must not be logged;
+// String and LogValue give a summary that may be.
+func (c Challenge) Header() string {
 	var h headerBuilder
 	h.quoted("realm", c.Realm)
 	h.quoted("nonce", c.Nonce)
@@ -104,4 +109,36 @@ func algorithmValue(a Algorithm) string {
 		return string(a)
 	}
 	return quote(string(a))
+}
+
+// String returns a summary for logs and errors: the realm, the algorithm and
+// whether the challenge is stale. The nonce (for AKA, RAND ‖ AUTN) and the
+// opaque value are left out, because neither may reach a log.
+func (c Challenge) String() string {
+	return fmt.Sprintf("digest.Challenge{realm=%q algorithm=%s stale=%t}", c.Realm, c.Algorithm, c.Stale)
+}
+
+// GoString returns the same summary as String.
+func (c Challenge) GoString() string { return c.String() }
+
+// Format makes every fmt verb produce the summary.
+func (c Challenge) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, c.String()) }
+
+// LogValue gives log/slog the summary fields.
+func (c Challenge) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("realm", c.Realm),
+		slog.String("algorithm", string(c.Algorithm)),
+		slog.Bool("stale", c.Stale),
+	)
+}
+
+// MarshalJSON emits the summary fields, because a value nested in another one
+// reaches a JSON log handler through encoding/json, which ignores LogValue.
+func (c Challenge) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Realm     string    `json:"realm"`
+		Algorithm Algorithm `json:"algorithm"`
+		Stale     bool      `json:"stale"`
+	}{c.Realm, c.Algorithm, c.Stale})
 }

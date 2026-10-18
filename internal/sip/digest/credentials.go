@@ -2,7 +2,10 @@ package digest
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 )
 
 // Credentials is the value of an Authorization or Proxy-Authorization header
@@ -10,8 +13,9 @@ import (
 //
 // Nonce and Response may be empty: an IMS client's first REGISTER carries
 // credentials with only the identity filled in, so that scscf knows whom to
-// challenge (TS 24.229 §5.1.1.2.1, RFC 8760 §2.7). Such credentials parse,
-// and Verify rejects them.
+// challenge (TS 24.229 §5.1.1.2.2 for IMS AKA, §5.1.1.2.3 for SIP Digest;
+// RFC 8760 §2.7). Such credentials parse, and Check, Verify and VerifyAKA
+// reject them with ErrInvalidNonce.
 type Credentials struct {
 	Username  string
 	Realm     string
@@ -23,7 +27,7 @@ type Credentials struct {
 	NC        uint32 // nonce-count; zero when absent
 	QOP       string // as sent, normally "auth"
 	Opaque    string
-	AUTS      []byte // decoded auts (RFC 3310 §3.4); nil when absent
+	AUTS      []byte // decoded auts (RFC 3310 §3.4); empty when absent
 }
 
 // ParseCredentials parses one set of Digest credentials.
@@ -94,11 +98,13 @@ func parseNC(s string) (uint32, error) {
 
 func formatNC(nc uint32) string { return fmt.Sprintf("%08x", nc) }
 
-// String formats the credentials as a header field value. The five required
+// Header formats the credentials as a header field value. The five required
 // parameters are always written, empty or not; algorithm, qop and nc are
 // unquoted and the rest quoted, as RFC 7616 §3.4 and RFC 8760 §2.6 require of
-// senders.
-func (c Credentials) String() string {
+// senders. The value holds the username (for IMS the IMSI-based IMPI) and the
+// nonce, so it must not be logged; String and LogValue give a summary that
+// may be.
+func (c Credentials) Header() string {
 	var h headerBuilder
 	h.quoted("username", c.Username)
 	h.quoted("realm", c.Realm)
@@ -124,8 +130,46 @@ func (c Credentials) String() string {
 	if c.NC != 0 {
 		h.add("nc", formatNC(c.NC))
 	}
-	if c.AUTS != nil {
+	if len(c.AUTS) > 0 {
 		h.quoted("auts", base64.StdEncoding.EncodeToString(c.AUTS))
 	}
 	return h.String()
+}
+
+// String returns a summary for logs and errors: realm, algorithm, qop,
+// nonce-count and whether auts is present. The username is left out because
+// for IMS it is the IMSI-based IMPI, which reaches a log only through
+// internal/pii, and so are the nonce, cnonce, opaque, response and AUTS.
+func (c Credentials) String() string {
+	return fmt.Sprintf("digest.Credentials{realm=%q algorithm=%s qop=%q nc=%s auts=%t}",
+		c.Realm, c.Algorithm, c.QOP, formatNC(c.NC), len(c.AUTS) > 0)
+}
+
+// GoString returns the same summary as String.
+func (c Credentials) GoString() string { return c.String() }
+
+// Format makes every fmt verb produce the summary.
+func (c Credentials) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, c.String()) }
+
+// LogValue gives log/slog the summary fields.
+func (c Credentials) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("realm", c.Realm),
+		slog.String("algorithm", string(c.Algorithm)),
+		slog.String("qop", c.QOP),
+		slog.String("nc", formatNC(c.NC)),
+		slog.Bool("auts", len(c.AUTS) > 0),
+	)
+}
+
+// MarshalJSON emits the summary fields, because a value nested in another one
+// reaches a JSON log handler through encoding/json, which ignores LogValue.
+func (c Credentials) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Realm     string    `json:"realm"`
+		Algorithm Algorithm `json:"algorithm"`
+		QOP       string    `json:"qop"`
+		NC        string    `json:"nc"`
+		AUTS      bool      `json:"auts"`
+	}{c.Realm, c.Algorithm, c.QOP, formatNC(c.NC), len(c.AUTS) > 0})
 }

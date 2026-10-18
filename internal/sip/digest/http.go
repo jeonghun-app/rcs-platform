@@ -13,7 +13,8 @@ import (
 var ErrNoCredentials = errors.New("digest: no Digest credentials")
 
 // ErrURIMismatch means the uri parameter does not name the request target,
-// which RFC 7616 §3.4.6 requires of HTTP. The server should answer 400.
+// which RFC 7616 §3.4.6 requires of HTTP. The RFC suggests answering 400; that
+// reveals nothing about the user, because the check runs before any lookup.
 var ErrURIMismatch = errors.New("digest: uri is not the request target")
 
 // SecretLookup returns the secret of username for credentials under alg. An
@@ -22,9 +23,16 @@ var ErrURIMismatch = errors.New("digest: uri is not the request target")
 type SecretLookup func(ctx context.Context, username string, alg Algorithm) (Secret, error)
 
 // VerifyHTTP authenticates an HTTP request with the same rules as Verify, plus
-// the request-target check HTTP requires. lookup runs only after the nonce has
-// been verified, so forged credentials cost no subscriber lookup. On success
-// it returns the credentials, whose Username is the authenticated user.
+// the request-target check HTTP requires. On success it returns the
+// credentials, whose Username is the authenticated user.
+//
+// lookup runs only after the nonce and opaque have verified, so a forged
+// nonce costs no lookup. A genuine nonce is free to obtain, though, so lookup
+// can still run for any username a client sends, and its error comes back
+// wrapped. Callers must answer every error except ErrStaleNonce (and, if they
+// wish, ErrURIMismatch) with the same 401 from ChallengeHTTP, with no
+// difference in body or timing they can avoid, so that a client cannot tell
+// which usernames exist.
 //
 // A client that reuses a nonce must send its requests in nonce-count order;
 // counts must strictly increase, so a request overtaken by a later one fails
@@ -66,7 +74,7 @@ func (s *Server) VerifyHTTP(r *http.Request, lookup SecretLookup) (Credentials, 
 	if err != nil {
 		return Credentials{}, fmt.Errorf("digest: looking up the secret: %w", err)
 	}
-	if err := s.verify(r.Context(), r.Method, c, secret, issued); err != nil {
+	if err := s.verifyDigest(r.Context(), r.Method, c, secret, issued); err != nil {
 		return Credentials{}, err
 	}
 	return c, nil
@@ -82,7 +90,7 @@ func (s *Server) ChallengeHTTP(w http.ResponseWriter, stale bool) error {
 		if err != nil {
 			return err
 		}
-		values = append(values, c.String())
+		values = append(values, c.Header())
 	}
 	for _, v := range values {
 		w.Header().Add("WWW-Authenticate", v)

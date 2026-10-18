@@ -18,7 +18,7 @@ func FuzzParseChallenge(f *testing.F) {
 	h := newHarness(f)
 	for _, alg := range []Algorithm{MD5, SHA256} {
 		ch, _ := h.server.Challenge(alg, true)
-		f.Add(ch.String())
+		f.Add(ch.Header())
 	}
 	f.Add(rfc2617Challenge)
 	f.Add(rfc7616Challenge("SHA-256"))
@@ -30,9 +30,9 @@ func FuzzParseChallenge(f *testing.F) {
 			checkParseError(t, err)
 			return
 		}
-		again, err := ParseChallenge(c.String())
+		again, err := ParseChallenge(c.Header())
 		if err != nil {
-			t.Fatalf("String output %q does not parse: %v", c.String(), err)
+			t.Fatalf("Header output %q does not parse: %v", c.Header(), err)
 		}
 		if !reflect.DeepEqual(again, c) {
 			t.Fatalf("round trip changed the challenge:\n%+v\n%+v", c, again)
@@ -44,7 +44,7 @@ func FuzzParseCredentials(f *testing.F) {
 	h := newHarness(f)
 	ch, _ := h.server.Challenge(SHA256, false)
 	c, _ := Respond(ch, ClientParams{Username: testUser, Password: []byte(testPass), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
-	f.Add(c.String())
+	f.Add(c.Header())
 	f.Add(rfc2617Authorization)
 	f.Add(rfc7616Authorization("MD5", "8ca523f5e9506fed4657c9700eebdbec"))
 	f.Add(`Digest username="u", realm="r", nonce="", uri="sip:r", response="", auts="AAAAAAAAAAAAAAAAAAA="`)
@@ -55,16 +55,19 @@ func FuzzParseCredentials(f *testing.F) {
 			checkParseError(t, err)
 			return
 		}
-		again, err := ParseCredentials(c.String())
+		again, err := ParseCredentials(c.Header())
 		if err != nil {
-			t.Fatalf("String output %q does not parse: %v", c.String(), err)
+			t.Fatalf("Header output %q does not parse: %v", c.Header(), err)
 		}
 		if !reflect.DeepEqual(again, c) {
 			t.Fatalf("round trip changed the credentials:\n%+v\n%+v", c, again)
 		}
-		// Whatever arrives, verification must return rather than panic. The
-		// result is not checked: the first seed is genuine and verifies once.
+		// Whatever arrives, the checks must return rather than panic. The
+		// results are not checked: the first seed is genuine and verifies once.
+		_ = h.server.Check(c)
 		_ = h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass)))
+		_ = h.server.VerifyAKA(context.Background(), "REGISTER", c, []byte("res"), h.vectorExpires)
+		_ = c.String()
 	})
 }
 

@@ -22,14 +22,41 @@ var resyncAMF = [AMFSize]byte{}
 // scscf in a Cx Multimedia-Auth-Answer.
 //
 // XRES, CK and IK are secrets, and RAND and AUTN must not be logged either, so
-// the type formats as a fixed placeholder.
+// the parts are sealed, read through methods, and the type formats as a fixed
+// placeholder. The zero Vector holds all zeros.
 type Vector struct {
-	RAND [RANDSize]byte
-	XRES [RESSize]byte
-	CK   [CKSize]byte
-	IK   [IKSize]byte
-	AUTN [AUTNSize]byte
+	p sealed[vectorParts]
 }
+
+type vectorParts struct {
+	rand [RANDSize]byte
+	xres [RESSize]byte
+	ck   [CKSize]byte
+	ik   [IKSize]byte
+	autn [AUTNSize]byte
+}
+
+func (v Vector) parts() vectorParts {
+	if v.p == nil {
+		return vectorParts{}
+	}
+	return *v.p()
+}
+
+// RAND returns the challenge.
+func (v Vector) RAND() [RANDSize]byte { return v.parts().rand }
+
+// XRES returns the expected response. Secret.
+func (v Vector) XRES() [RESSize]byte { return v.parts().xres }
+
+// CK returns the cipher key. Secret.
+func (v Vector) CK() [CKSize]byte { return v.parts().ck }
+
+// IK returns the integrity key. Secret.
+func (v Vector) IK() [IKSize]byte { return v.parts().ik }
+
+// AUTN returns the network authentication token.
+func (v Vector) AUTN() [AUTNSize]byte { return v.parts().autn }
 
 // Vector builds the authentication vector for rand, sqn and amf. rand must
 // come from a cryptographically secure source (crypto/rand); it is a parameter
@@ -40,19 +67,19 @@ func (m Milenage) Vector(rand [RANDSize]byte, sqn SQN, amf [AMFSize]byte) Vector
 	out1 := m.out1(temp, sqnBytes, amf)
 	out2 := m.out(temp, r2, c2)
 
-	v := Vector{
-		RAND: rand,
-		XRES: [RESSize]byte(out2[8:16]),
-		CK:   m.out(temp, r3, c3),
-		IK:   m.out(temp, r4, c4),
+	p := &vectorParts{
+		rand: rand,
+		xres: [RESSize]byte(out2[8:16]),
+		ck:   m.out(temp, r3, c3),
+		ik:   m.out(temp, r4, c4),
 	}
 	// AUTN = SQN ⊕ AK ‖ AMF ‖ MAC-A (TS 33.102 §6.3.2).
 	for i := range SQNSize {
-		v.AUTN[i] = sqnBytes[i] ^ out2[i]
+		p.autn[i] = sqnBytes[i] ^ out2[i]
 	}
-	copy(v.AUTN[SQNSize:SQNSize+AMFSize], amf[:])
-	copy(v.AUTN[SQNSize+AMFSize:], out1[:MACSize])
-	return v
+	copy(p.autn[SQNSize:SQNSize+AMFSize], amf[:])
+	copy(p.autn[SQNSize+AMFSize:], out1[:MACSize])
+	return Vector{p: seal(p)}
 }
 
 // CheckAUTN does the card's half of TS 33.102 §6.3.3: it recovers SQN from
@@ -124,5 +151,5 @@ func (v Vector) LogValue() slog.Value { return slog.StringValue(redactedVector) 
 
 // MarshalJSON emits the placeholder, because a vector nested in another value
 // reaches a JSON log handler through encoding/json, which ignores LogValue.
-// Code that stores a vector copies its fields into its own record type.
+// Code that stores a vector copies its parts into its own record type.
 func (v Vector) MarshalJSON() ([]byte, error) { return json.Marshal(redactedVector) }

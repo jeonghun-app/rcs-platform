@@ -23,7 +23,7 @@ func httpAnswer(t *testing.T, ch Challenge, method, uri string, nc uint32) strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	return c.String()
+	return c.Header()
 }
 
 func TestHTTPChallengeOffersSHA256BeforeMD5(t *testing.T) {
@@ -142,7 +142,7 @@ func TestHTTPUnknownUserFailsWithTheLookupError(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest(http.MethodGet, "/f", nil)
-	r.Header.Set("Authorization", c.String())
+	r.Header.Set("Authorization", c.Header())
 	if _, err := h.server.VerifyHTTP(r, lookupFor(testPass)); err == nil || errors.Is(err, ErrWrongResponse) {
 		t.Fatalf("err = %v, want the lookup error", err)
 	}

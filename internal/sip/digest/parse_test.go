@@ -24,6 +24,22 @@ func TestChallengeParametersAreReadWhateverTheirCaseAndQuoting(t *testing.T) {
 	}
 }
 
+func TestEmptyListElementsAreSkipped(t *testing.T) {
+	// RFC 7230 §7: recipients ignore empty elements of a # list.
+	want := Challenge{Realm: "r", Nonce: "n", Algorithm: MD5}
+	for _, value := range []string{
+		`Digest realm="r",, nonce="n"`,
+		`Digest realm="r", nonce="n",`,
+		`Digest realm="r", nonce="n" , , `,
+		`Digest ,realm="r" , ,nonce="n"`,
+	} {
+		c, err := ParseChallenge(value)
+		if err != nil || !reflect.DeepEqual(c, want) {
+			t.Errorf("ParseChallenge(%q) = %+v, %v", value, c, err)
+		}
+	}
+}
+
 func TestChallengeWithoutAlgorithmMeansMD5(t *testing.T) {
 	c, err := ParseChallenge(`Digest realm="r", nonce="n"`)
 	if err != nil {
@@ -56,8 +72,7 @@ func TestMalformedHeadersAreRejected(t *testing.T) {
 		"missing equals":            `Digest realm "r"`,
 		"missing value":             `Digest realm=, nonce="n"`,
 		"missing comma":             `Digest realm="r" nonce="n"`,
-		"trailing comma":            `Digest realm="r", nonce="n",`,
-		"empty list element":        `Digest realm="r",, nonce="n"`,
+		"only empty elements":       `Digest , ,`,
 		"unterminated quote":        `Digest realm="r, nonce="n`,
 		"escape at the end":         `Digest realm="r\`,
 		"escaped line feed":         "Digest realm=\"r\\\n\", nonce=\"n\"",
@@ -136,8 +151,8 @@ func TestFirstIMSRegisterCredentialsWithEmptyNonceParse(t *testing.T) {
 	if c.Nonce != "" || c.Response != "" || c.Username == "" {
 		t.Fatalf("parsed %+v", c)
 	}
-	if again, err := ParseCredentials(c.String()); err != nil || !reflect.DeepEqual(again, c) {
-		t.Fatalf("String did not round-trip: %q, %v", c.String(), err)
+	if again, err := ParseCredentials(c.Header()); err != nil || !reflect.DeepEqual(again, c) {
+		t.Fatalf("Header did not round-trip: %q, %v", c.Header(), err)
 	}
 }
 
@@ -188,48 +203,62 @@ func TestParseErrorsDoNotQuoteTheInput(t *testing.T) {
 	}
 }
 
-func TestChallengeStringQuotesAsRFC7616Requires(t *testing.T) {
+func TestChallengeHeaderQuotesAsRFC7616Requires(t *testing.T) {
 	c := Challenge{Realm: `r"\`, Nonce: "n", Opaque: "o", Algorithm: SHA256, QOP: []string{"auth"}, Stale: true}
 	want := `Digest realm="r\"\\", nonce="n", opaque="o", algorithm=SHA-256, qop="auth", stale=true`
-	if got := c.String(); got != want {
-		t.Fatalf("String = %s\nwant     %s", got, want)
+	if got := c.Header(); got != want {
+		t.Fatalf("Header = %s\nwant     %s", got, want)
 	}
 }
 
-func TestCredentialsStringQuotesAsRFC7616Requires(t *testing.T) {
+func TestCredentialsHeaderQuotesAsRFC7616Requires(t *testing.T) {
 	c := Credentials{
 		Username: "u", Realm: "r", Nonce: "n", URI: "sip:r", Response: "ab",
 		Algorithm: AKAv1MD5, CNonce: "c", NC: 0x1a, QOP: "auth", Opaque: "o", AUTS: []byte{1, 2, 3},
 	}
 	want := `Digest username="u", realm="r", nonce="n", uri="sip:r", response="ab", algorithm=AKAv1-MD5, ` +
 		`cnonce="c", opaque="o", qop=auth, nc=0000001a, auts="AQID"`
-	if got := c.String(); got != want {
-		t.Fatalf("String = %s\nwant     %s", got, want)
+	if got := c.Header(); got != want {
+		t.Fatalf("Header = %s\nwant     %s", got, want)
 	}
 }
 
-func TestStringNeverWritesALineBreak(t *testing.T) {
+func TestHeaderNeverWritesALineBreak(t *testing.T) {
 	// A hand-built value with CR LF must not be able to add a header line.
 	c := Credentials{Username: "u\r\nVia: x", Realm: "r", Nonce: "n", URI: "u", Response: "", QOP: "a\r\nb", Algorithm: "X\r\nY"}
 	ch := Challenge{Realm: "r\r\nX: y", Nonce: "n", Algorithm: "A\nB", QOP: []string{"auth\r\n"}}
-	for _, s := range []string{c.String(), ch.String()} {
+	for _, s := range []string{c.Header(), ch.Header()} {
 		if strings.ContainsAny(s, "\r\n") {
-			t.Fatalf("String wrote a line break: %q", s)
+			t.Fatalf("Header wrote a line break: %q", s)
 		}
 	}
 }
 
-func TestStringOutputParsesBackToTheSameValue(t *testing.T) {
+func TestHeaderOutputParsesBackToTheSameValue(t *testing.T) {
 	ch := Challenge{Realm: "r", Nonce: "n", Opaque: "o", Algorithm: AKAv1MD5, QOP: []string{"auth", "auth-int"}, Stale: true}
-	if got, err := ParseChallenge(ch.String()); err != nil || !reflect.DeepEqual(got, ch) {
+	if got, err := ParseChallenge(ch.Header()); err != nil || !reflect.DeepEqual(got, ch) {
 		t.Fatalf("challenge round trip = %+v, %v", got, err)
 	}
 	cr := Credentials{
 		Username: "u", Realm: "r", Nonce: "n", URI: "sip:r", Response: "ab", Algorithm: SHA256,
 		CNonce: "c", NC: 7, QOP: "a b", Opaque: "o", AUTS: make([]byte, 14),
 	}
-	if got, err := ParseCredentials(cr.String()); err != nil || !reflect.DeepEqual(got, cr) {
+	if got, err := ParseCredentials(cr.Header()); err != nil || !reflect.DeepEqual(got, cr) {
 		t.Fatalf("credentials round trip = %+v, %v", got, err)
+	}
+}
+
+func TestEmptyAUTSIsTreatedAsAbsent(t *testing.T) {
+	c := Credentials{Username: "u", Realm: "r", Nonce: "n", URI: "sip:r", Response: "", AUTS: []byte{}}
+	if strings.Contains(c.Header(), "auts") {
+		t.Fatalf("Header wrote an empty auts: %s", c.Header())
+	}
+	again, err := ParseCredentials(c.Header())
+	if err != nil || len(again.AUTS) != 0 {
+		t.Fatalf("round trip = %+v, %v", again, err)
+	}
+	if strings.Contains(c.String(), "auts=true") {
+		t.Fatalf("summary reports auts: %s", c)
 	}
 }
 

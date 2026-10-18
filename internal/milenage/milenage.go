@@ -9,12 +9,15 @@
 // so callers never assemble those byte layouts themselves.
 //
 // K, OPc, RES, CK and IK are secrets. Every type that holds one formats as a
-// fixed redacted string under fmt and log/slog, and no error carries one.
+// fixed redacted string under fmt, log/slog and encoding/json, and keeps the
+// bytes sealed (see sealed) so that they stay hidden even when the value sits
+// in an unexported field of another struct. No error carries a secret.
 package milenage
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -44,9 +47,14 @@ const (
 )
 
 // Milenage computes the MILENAGE functions for one subscriber, that is for one
-// (K, OPc) pair. It is an immutable value and safe for concurrent use. The zero
-// value is not usable; build one with New or NewWithOP.
+// (K, OPc) pair. It is an immutable value, cheap to copy and safe for
+// concurrent use. The zero value is not usable; build one with New or
+// NewWithOP.
 type Milenage struct {
+	s sealed[subscriber]
+}
+
+type subscriber struct {
 	block cipher.Block // AES-128 keyed with K: the kernel function E_K of TS 35.206 §4
 	opc   [KeySize]byte
 }
@@ -55,7 +63,7 @@ type Milenage struct {
 // HSS stores OPc rather than OP (TS 35.206 allows either), so this is the
 // constructor production code uses.
 func New(k, opc [KeySize]byte) Milenage {
-	return Milenage{block: kernel(k), opc: opc}
+	return Milenage{s: seal(&subscriber{block: kernel(k), opc: opc})}
 }
 
 // NewWithOP returns the functions for subscriber key k and operator variant
@@ -128,9 +136,9 @@ func (m Milenage) F5Star(rand [RANDSize]byte) [AKSize]byte {
 // (TS 35.206 §4).
 func (m Milenage) temp(rand [RANDSize]byte) [16]byte {
 	x := rand
-	xorInto(&x, &m.opc)
+	xorInto(&x, &m.s().opc)
 	var t [16]byte
-	m.block.Encrypt(t[:], x[:])
+	m.s().block.Encrypt(t[:], x[:])
 	return t
 }
 
@@ -142,7 +150,7 @@ func (m Milenage) out1(temp [16]byte, sqn [SQNSize]byte, amf [AMFSize]byte) [16]
 	copy(in1[6:8], amf[:])
 	copy(in1[8:14], sqn[:])
 	copy(in1[14:16], amf[:])
-	xorInto(&in1, &m.opc)
+	xorInto(&in1, &m.s().opc)
 	x := rotate(in1, r1)
 	xorInto(&x, &temp)
 	x[15] ^= c1
@@ -153,7 +161,7 @@ func (m Milenage) out1(temp [16]byte, sqn [SQNSize]byte, amf [AMFSize]byte) [16]
 // (TS 35.206 §4).
 func (m Milenage) out(temp [16]byte, r int, c byte) [16]byte {
 	x := temp
-	xorInto(&x, &m.opc)
+	xorInto(&x, &m.s().opc)
 	x = rotate(x, r)
 	x[15] ^= c
 	return m.finish(x)
@@ -162,8 +170,8 @@ func (m Milenage) out(temp [16]byte, r int, c byte) [16]byte {
 // finish applies the final E_K and ⊕ OPc common to every OUTi.
 func (m Milenage) finish(x [16]byte) [16]byte {
 	var y [16]byte
-	m.block.Encrypt(y[:], x[:])
-	xorInto(&y, &m.opc)
+	m.s().block.Encrypt(y[:], x[:])
+	xorInto(&y, &m.s().opc)
 	return y
 }
 
@@ -198,3 +206,6 @@ func (m Milenage) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, redacte
 
 // LogValue keeps log/slog handlers from serialising the fields.
 func (m Milenage) LogValue() slog.Value { return slog.StringValue(redactedMilenage) }
+
+// MarshalJSON emits the placeholder.
+func (m Milenage) MarshalJSON() ([]byte, error) { return json.Marshal(redactedMilenage) }

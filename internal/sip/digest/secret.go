@@ -16,20 +16,25 @@ var ErrNoSecret = errors.New("digest: no secret to verify against")
 // algorithm than the client used, so it cannot verify the response.
 var ErrSecretAlgorithm = errors.New("digest: HA1 is for another algorithm")
 
-// Secret is what the server knows about a user: either the password (for AKA,
-// XRES) or a stored HA1. Build one with Password or HA1. It formats as a
-// redacted placeholder.
+// Secret is what the server knows about a Digest user: either the password or
+// a stored HA1. Build one with Password or HA1. It formats as a redacted
+// placeholder. AKA does not use it: VerifyAKA takes the vector's XRES.
+//
+// The value is sealed (see sealed), so a Secret held in an unexported field of
+// another struct, where fmt cannot call Format, still prints only an address.
 type Secret struct {
+	s sealed[secretValue]
+}
+
+type secretValue struct {
 	password []byte
 	ha1      string    // lower-case hex
 	ha1Alg   Algorithm // empty for a password
-	set      bool
 }
 
-// Password returns a Secret holding a password, or the XRES of an AKA vector
-// (RFC 3310 §3.3: RES takes the place of the password). The bytes are copied.
+// Password returns a Secret holding a password. The bytes are copied.
 func Password(p []byte) Secret {
-	return Secret{password: append([]byte{}, p...), set: true}
+	return Secret{s: seal(&secretValue{password: append([]byte{}, p...)})}
 }
 
 // HA1 returns a Secret holding a stored H(username:realm:password) for alg, so
@@ -45,7 +50,7 @@ func HA1(alg Algorithm, hexDigest string) (Secret, error) {
 	if _, err := hex.DecodeString(hexDigest); err != nil {
 		return Secret{}, errors.New("digest: HA1 is not hex")
 	}
-	return Secret{ha1: strings.ToLower(hexDigest), ha1Alg: alg, set: true}, nil
+	return Secret{s: seal(&secretValue{ha1: strings.ToLower(hexDigest), ha1Alg: alg})}, nil
 }
 
 // ComputeHA1 returns H(username:realm:password) in hex, the value an operator
@@ -59,15 +64,17 @@ func ComputeHA1(alg Algorithm, username, realm string, password []byte) (string,
 
 // ha1For returns the HA1 to verify a response under alg.
 func (s Secret) ha1For(alg Algorithm, username, realm string) (string, error) {
-	switch {
-	case !s.set:
+	if s.s == nil {
 		return "", ErrNoSecret
-	case s.ha1Alg == "":
-		return ha1(alg, username, realm, s.password), nil
-	case s.ha1Alg != alg:
+	}
+	v := s.s()
+	switch {
+	case v.ha1Alg == "":
+		return ha1(alg, username, realm, v.password), nil
+	case v.ha1Alg != alg:
 		return "", ErrSecretAlgorithm
 	}
-	return s.ha1, nil
+	return v.ha1, nil
 }
 
 const redactedSecret = "digest.Secret{redacted}"

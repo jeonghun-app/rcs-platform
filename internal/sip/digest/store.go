@@ -18,9 +18,11 @@ type MemoryNonceCounts struct {
 	now func() time.Time
 
 	mu        sync.Mutex
-	entries   map[string]nonceCount
+	entries   map[countKey]nonceCount
 	lastSweep time.Time
 }
+
+type countKey struct{ username, nonce string }
 
 type nonceCount struct {
 	nc      uint32
@@ -33,11 +35,11 @@ func NewMemoryNonceCounts(now func() time.Time) *MemoryNonceCounts {
 	if now == nil {
 		now = time.Now
 	}
-	return &MemoryNonceCounts{now: now, entries: make(map[string]nonceCount), lastSweep: now()}
+	return &MemoryNonceCounts{now: now, entries: make(map[countKey]nonceCount), lastSweep: now()}
 }
 
 // Advance implements NonceCountStore.
-func (m *MemoryNonceCounts) Advance(_ context.Context, nonce string, nc uint32, expires time.Time) (bool, error) {
+func (m *MemoryNonceCounts) Advance(_ context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
@@ -49,14 +51,16 @@ func (m *MemoryNonceCounts) Advance(_ context.Context, nonce string, nc uint32, 
 		}
 		m.lastSweep = now
 	}
-	if e, ok := m.entries[nonce]; ok && nc <= e.nc && !now.After(e.expires) {
+	key := countKey{username, nonce}
+	if e, ok := m.entries[key]; ok && nc <= e.nc && !now.After(e.expires) {
 		return false, nil
 	}
-	m.entries[nonce] = nonceCount{nc: nc, expires: expires}
+	m.entries[key] = nonceCount{nc: nc, expires: expires}
 	return true, nil
 }
 
-// Len returns the number of nonces held, for tests and metrics.
+// Len returns the number of (username, nonce) entries held, for tests and
+// metrics.
 func (m *MemoryNonceCounts) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
