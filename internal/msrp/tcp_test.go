@@ -115,20 +115,18 @@ func sendMany(ctx context.Context, s *Session, workers, per, size int, sr bool) 
 	return errs
 }
 
-func waitCount(t *testing.T, what string, c *atomic.Int64, want int64, limit time.Duration, conns ...*Conn) {
+// waitCount waits for c to reach want while it keeps growing and the
+// connections stay up (see waitProgress).
+func waitCount(t *testing.T, what string, c *atomic.Int64, want int64, conns ...*Conn) {
 	t.Helper()
-	deadline := time.Now().Add(limit)
-	for c.Load() < want {
+	waitProgress(t, what, func() bool { return c.Load() >= want }, counter(c), func() error {
 		for _, cc := range conns {
 			if err := cc.Err(); err != nil {
-				t.Fatalf("%s: connection ended after %d/%d: %v", what, c.Load(), want, err)
+				return fmt.Errorf("connection ended after %d/%d: %w", c.Load(), want, err)
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: only %d/%d after %v", what, c.Load(), want, limit)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return nil
+	})
 }
 
 // stayUp fails if any connection ends within d.
@@ -147,14 +145,15 @@ func stayUp(t *testing.T, d time.Duration, conns ...*Conn) {
 
 func TestLargeChunksBothWaysOverTCPAllArriveWithTheirReports(t *testing.T) {
 	for _, tc := range []struct{ workers, per, size int }{{1, 300, 32 << 10}, {4, 75, 32 << 10}, {8, 6, 512 << 10}} {
+		tc.per = scaled(tc.per)
 		t.Run(fmt.Sprintf("w%d_n%d_%dKiB", tc.workers, tc.per, tc.size>>10), func(t *testing.T) {
 			ah, bh := &countingHandler{}, &countingHandler{}
 			alice, bob, ac, pc := tcpEndpoints(t, Config{}, ah, bh)
 			ea := sendMany(context.Background(), alice, tc.workers, tc.per, tc.size, true)
 			eb := sendMany(context.Background(), bob, tc.workers, tc.per, tc.size, true)
 			want := int64(tc.workers * tc.per)
-			waitCount(t, "bob received", &bh.msgs, want, 60*time.Second, ac, pc)
-			waitCount(t, "alice received", &ah.msgs, want, 60*time.Second, ac, pc)
+			waitCount(t, "bob received", &bh.msgs, want, ac, pc)
+			waitCount(t, "alice received", &ah.msgs, want, ac, pc)
 			for range 2 * tc.workers {
 				var err error
 				select {
@@ -165,8 +164,8 @@ func TestLargeChunksBothWaysOverTCPAllArriveWithTheirReports(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			waitCount(t, "alice success reports", &ah.reports, want, 30*time.Second, ac, pc)
-			waitCount(t, "bob success reports", &bh.reports, want, 30*time.Second, ac, pc)
+			waitCount(t, "alice success reports", &ah.reports, want, ac, pc)
+			waitCount(t, "bob success reports", &bh.reports, want, ac, pc)
 			if ah.failures.Load()+bh.failures.Load() != 0 {
 				t.Fatalf("failures: %d, %d", ah.failures.Load(), bh.failures.Load())
 			}
@@ -183,21 +182,27 @@ func TestASlowHandlerDoesNotDisconnectAHealthyPeer(t *testing.T) {
 	alice, bob, ac, pc := tcpEndpoints(t, Config{}, ah, bh)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ea := sendMany(ctx, alice, 4, 1000, 200, false)
-	eb := sendMany(ctx, bob, 4, 60, 256<<10, false)
-	for range 8 {
-		var err error
-		select {
-		case err = <-ea:
-		case err = <-eb:
-		case <-time.After(60 * time.Second):
-			t.Fatal("senders did not finish")
-		}
-		var se *StatusError
-		if err != nil && !(errors.As(err, &se) && se.Code == StatusMessageTooLarge) {
-			t.Fatalf("a sender ended with %v", err)
-		}
-	}
+	ea := sendMany(ctx, alice, 4, scaled(1000), 200, false)
+	eb := sendMany(ctx, bob, 4, scaled(60), 256<<10, false)
+	finished := 0
+	waitProgress(t, "senders", func() bool { return finished == 8 },
+		func() int64 { return ah.msgs.Load() + bh.msgs.Load() + int64(finished) },
+		func() error {
+			for {
+				var err error
+				select {
+				case err = <-ea:
+				case err = <-eb:
+				default:
+					return nil
+				}
+				finished++
+				var se *StatusError
+				if err != nil && !(errors.As(err, &se) && se.Code == StatusMessageTooLarge) {
+					return fmt.Errorf("a sender ended with %w", err)
+				}
+			}
+		})
 	if ac.Err() != nil || pc.Err() != nil {
 		t.Fatalf("connections ended: %v, %v", ac.Err(), pc.Err())
 	}
@@ -401,7 +406,8 @@ func (rig *relayRigTCP) coreConn(t *testing.T) *Conn {
 
 func TestTrafficThroughARelayOverTCPArrivesBothWays(t *testing.T) {
 	rig := newRelayRigTCP(t, Config{}, Config{})
-	const users, per, size = 4, 12, 256 << 10
+	const users, size = 4, 256 << 10
+	per := scaled(12)
 	var clientHs, asHs []*countingHandler
 	var clients, ases []*Session
 	var conns []*Conn
@@ -418,11 +424,11 @@ func TestTrafficThroughARelayOverTCPArrivesBothWays(t *testing.T) {
 		sendMany(context.Background(), ases[n], 2, per, size, true)
 	}
 	for n := range users {
-		waitCount(t, fmt.Sprintf("as%d received", n), &asHs[n].msgs, 2*per, 60*time.Second, conns...)
-		waitCount(t, fmt.Sprintf("client%d received", n), &clientHs[n].msgs, 2*per, 60*time.Second, conns...)
-		waitCount(t, fmt.Sprintf("client%d reports", n), &clientHs[n].reports, 2*per, 30*time.Second, conns...)
-		waitCount(t, fmt.Sprintf("as%d reports", n), &asHs[n].reports, 2*per, 30*time.Second, conns...)
-		if asHs[n].octets.Load() != 2*per*size || clientHs[n].octets.Load() != 2*per*size {
+		waitCount(t, fmt.Sprintf("as%d received", n), &asHs[n].msgs, int64(2*per), conns...)
+		waitCount(t, fmt.Sprintf("client%d received", n), &clientHs[n].msgs, int64(2*per), conns...)
+		waitCount(t, fmt.Sprintf("client%d reports", n), &clientHs[n].reports, int64(2*per), conns...)
+		waitCount(t, fmt.Sprintf("as%d reports", n), &asHs[n].reports, int64(2*per), conns...)
+		if asHs[n].octets.Load() != int64(2*per*size) || clientHs[n].octets.Load() != int64(2*per*size) {
 			t.Fatalf("user %d octets as=%d client=%d", n, asHs[n].octets.Load(), clientHs[n].octets.Load())
 		}
 	}
@@ -471,7 +477,12 @@ func TestARelayStreamsAHugeChunkInBoundedMemory(t *testing.T) {
 	if _, err := nc.Write([]byte(head)); err != nil {
 		t.Fatal(err)
 	}
-	const total = 64 << 20
+	// Under the race detector, less data with closer pauses: a relay that
+	// held the chunk would still pass the bound below by the second pause.
+	total, pause := 64<<20, 16<<20
+	if raceEnabled {
+		total, pause = 24<<20, 8<<20
+	}
 	block := bodyOf(64 << 10)
 	// What the relay retains is measured at pauses in the middle of the
 	// chunk, once everything sent so far has come out the other side: with
@@ -485,8 +496,6 @@ func TestARelayStreamsAHugeChunkInBoundedMemory(t *testing.T) {
 	}
 	base := liveHeap()
 	peak := base
-	deadline := time.Now().Add(60 * time.Second)
-	const pause = 16 << 20
 	for sent := 0; sent < total; {
 		for end := sent + pause; sent < end; sent += len(block) {
 			if _, err := nc.Write(block); err != nil {
@@ -494,24 +503,18 @@ func TestARelayStreamsAHugeChunkInBoundedMemory(t *testing.T) {
 			}
 		}
 		// The relay keeps back at most one piece and its look-ahead.
-		for octets.Load() < int64(sent)-2*DefaultChunkSize {
-			if time.Now().After(deadline) {
-				t.Fatalf("only %d of %d octets arrived", octets.Load(), sent)
-			}
-			time.Sleep(time.Millisecond)
-		}
+		want := int64(sent) - 2*DefaultChunkSize
+		waitProgress(t, "octets through the relay", func() bool { return octets.Load() >= want }, counter(&octets), nil)
 		peak = max(peak, liveHeap())
 	}
 	if _, err := nc.Write([]byte("\r\n-------b1gx$\r\n")); err != nil {
 		t.Fatal(err)
 	}
-	for octets.Load() < total && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitProgress(t, "octets through the relay", func() bool { return octets.Load() >= int64(total) }, counter(&octets), nil)
 	if v := badRange.Load(); v != nil {
 		t.Fatal(v)
 	}
-	if octets.Load() != total {
+	if octets.Load() != int64(total) {
 		t.Fatalf("only %d octets arrived", octets.Load())
 	}
 	if peak > base+8<<20 {
@@ -583,10 +586,10 @@ func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *test
 		}
 		select {
 		case <-fastH.got:
-			if d := time.Since(start); d > time.Second {
+			if d := time.Since(start); d > prompt {
 				t.Errorf("message %d to the fast client took %v", i, d)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(hangGuard):
 			t.Fatalf("message %d to the fast client never arrived", i)
 		}
 	}
@@ -600,7 +603,7 @@ func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *test
 		if err := silentEdge.Err(); !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, ErrPeerNotReading) {
 			t.Errorf("silent client cut off with %v", err)
 		}
-	case <-time.After(10 * deadline):
+	case <-time.After(hangGuard):
 		t.Error("silent client still connected")
 	}
 	if slowEdge.Err() != nil || slowRead.Load() == 0 {
@@ -693,7 +696,7 @@ func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Send = %v", err)
 	}
-	if d := time.Since(start); d > time.Second {
+	if d := time.Since(start); d > prompt {
 		t.Fatalf("Send ignored its context for %v", d)
 	}
 }
@@ -734,10 +737,10 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		}
 		select {
 		case <-fastH.got:
-			if d := time.Since(start); d > time.Second {
+			if d := time.Since(start); d > prompt {
 				t.Errorf("message %d to the connected client took %v", i, d)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(hangGuard):
 			t.Fatalf("message %d to the connected client never arrived", i)
 		}
 	}
@@ -750,7 +753,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	if err := <-over; err != nil && !(errors.As(err, &se) && se.Code == StatusMessageTooLarge) {
 		t.Fatalf("unbound session over its bound: %v", err)
 	}
-	waitCount(t, "refusals for the session over its bound", &overH.failures, 1, 5*time.Second)
+	waitCount(t, "refusals for the session over its bound", &overH.failures, 1)
 	// What was held of the refused message is dropped, so its client, when
 	// it comes, gets no truncated message.
 	rig.relay.mu.Lock()
@@ -772,7 +775,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		if string(m.Body) != "after" {
 			t.Fatalf("the client got %d octets of %q first", len(m.Body), m.MessageID)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("the later message never arrived")
 	}
 	// The client comes and gets what was held.
@@ -783,7 +786,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		if string(m.Body) != "kept for you" {
 			t.Fatalf("got %q", m.Body)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("the held message was not delivered")
 	}
 	if rig.coreConn(t).Err() != nil || fastConn.Err() != nil {

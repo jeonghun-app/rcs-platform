@@ -561,7 +561,7 @@ func TestARelayStopsReadingAClientWhileRcsAsIsNotReading(t *testing.T) {
 		if !afterCore {
 			t.Fatal("the relay buffered the client's chunk while rcs-as was not reading")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("client write never finished")
 	}
 }
@@ -575,7 +575,7 @@ func TestARelayDisconnectsAClientThatFallsBehindWithoutStallingRcsAs(t *testing.
 	var told atomic.Int64 // answers for what the relay could not deliver
 	go func() {
 		for {
-			_ = as.nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_ = as.nc.SetReadDeadline(time.Now().Add(hangGuard))
 			m, err := as.r.ReadMessage(DefaultMaxMessageSize)
 			if err != nil {
 				return
@@ -594,7 +594,7 @@ func TestARelayDisconnectsAClientThatFallsBehindWithoutStallingRcsAs(t *testing.
 		default:
 			msg := wire("MSRP fl"+fmt.Sprintf("%06d", i)+" SEND", "To-Path: "+relayInternalURI, "From-Path: "+asURI,
 				"Message-ID: m"+fmt.Sprintf("%06d", i), "Content-Type: text/plain", "", piece, "-------fl"+fmt.Sprintf("%06d", i)+"$")
-			_ = as.nc.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_ = as.nc.SetWriteDeadline(time.Now().Add(hangGuard))
 			if _, err := as.nc.Write([]byte(msg)); err != nil {
 				t.Fatalf("rcs-as could not write after %d messages: %v", sent, err)
 			}
@@ -613,7 +613,7 @@ func TestARelayDisconnectsAClientThatFallsBehindWithoutStallingRcsAs(t *testing.
 	}
 	// What was queued for the client is answered back to rcs-as as not
 	// delivered rather than forgotten.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(hangGuard)
 	for told.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -721,7 +721,7 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 		go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: body}) }()
 	}
 	want := int64(stalled * DefaultSendWindow)
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(hangGuard)
 	for chunks.Load() < want && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -739,7 +739,7 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("a session with an empty window waited for the stalled ones")
 	}
 }
