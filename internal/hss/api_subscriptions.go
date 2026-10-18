@@ -316,7 +316,11 @@ func (a *API) deleteSubscription(w http.ResponseWriter, r *http.Request, _ Scope
 // delete deletes a subscription, retrying when a Cx write changes it in
 // between, and returns it as it was deleted.
 func (h *HSS) delete(ctx context.Context, impi string, want int64) (*store.Subscription, error) {
-	defer h.lock(impi)()
+	unlock, err := h.lock(ctx, impi)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	for attempt := 0; attempt < maxUpdateAttempts; attempt++ {
 		s, err := h.store.Subscription(ctx, impi)
 		if err != nil {

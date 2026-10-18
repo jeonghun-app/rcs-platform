@@ -66,6 +66,7 @@ type Config struct {
 
 	MaxAuthItems int
 	CxTimeout    time.Duration
+	APITimeout   time.Duration
 	PushTimeout  time.Duration
 }
 
@@ -111,6 +112,7 @@ func Configure(s *runtime.Settings) Config {
 		CreateDefaultProfile: e.Bool("CREATE_DEFAULT_PROFILE", true),
 		MaxAuthItems:         e.Int("MAX_AUTH_ITEMS", DefaultMaxAuthItems),
 		CxTimeout:            e.Duration("CX_TIMEOUT", DefaultCxTimeout),
+		APITimeout:           e.Duration("API_TIMEOUT", DefaultAPIStoreTimeout),
 		PushTimeout:          e.Duration("PUSH_TIMEOUT", DefaultPushTimeout),
 	}
 	c.PeerRealm = e.String("DIAMETER_PEER_REALM", c.OriginRealm)
@@ -152,7 +154,7 @@ func Configure(s *runtime.Settings) Config {
 	for _, d := range []struct {
 		name string
 		v    time.Duration
-	}{{"CX_TIMEOUT", c.CxTimeout}, {"PUSH_TIMEOUT", c.PushTimeout}} {
+	}{{"CX_TIMEOUT", c.CxTimeout}, {"API_TIMEOUT", c.APITimeout}, {"PUSH_TIMEOUT", c.PushTimeout}} {
 		if d.v <= 0 {
 			e.Invalid(d.name, "must be greater than zero")
 		}

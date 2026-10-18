@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/ifcjson"
+	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
 )
@@ -88,9 +89,18 @@ type APIOptions struct {
 	// FanoutWorkers bounds the PPRs sent at once after a shared profile
 	// changes; 8 when zero.
 	FanoutWorkers int
+	// StoreTimeout bounds the store work of one request, lock waits
+	// included; DefaultAPIStoreTimeout when zero.
+	StoreTimeout time.Duration
 	// Now is the clock of the rate limits; time.Now when nil.
 	Now func() time.Time
 }
+
+// DefaultAPIStoreTimeout bounds the store work of one API request. Without
+// it a request whose store calls are slow would hold its subscriber's lock,
+// and so delay Cx for every subscriber of the stripe, for as long as the
+// SDK retries.
+const DefaultAPIStoreTimeout = 5 * time.Second
 
 // Defaults of the acs rate limit: provisioning a subscriber takes a few
 // requests, and acs provisions at the pace clients configure themselves.
@@ -117,6 +127,7 @@ type API struct {
 	notifier       Notifier
 	defaultProfile string
 	pushTimeout    time.Duration
+	storeTimeout   time.Duration
 	workers        int
 
 	mu      sync.Mutex
@@ -137,6 +148,10 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 	}
 	if a.workers <= 0 {
 		a.workers = 8
+	}
+	a.storeTimeout = o.StoreTimeout
+	if a.storeTimeout <= 0 {
+		a.storeTimeout = DefaultAPIStoreTimeout
 	}
 	now := o.Now
 	if now == nil {
@@ -224,6 +239,9 @@ func (a *API) route(pattern, name string, allowed Scope, h handler) {
 	a.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
+		ctx, cancel := context.WithTimeout(r.Context(), a.storeTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
 		tok, err := a.authenticate(r, allowed)
 		var caller Scope
 		if tok != nil {
@@ -342,8 +360,9 @@ func managedByACS(caller Scope, s *store.Subscription) error {
 var errNotFound = &apiError{http.StatusNotFound, "not found"}
 
 // writeError answers err. Errors the API has no specific answer for are
-// store and keyring failures: 503, so that callers retry (they are transient
-// far more often than not), with the cause logged, redacted.
+// store failures: 503, so that callers retry (an outage, throttling or a
+// timeout is transient), with the cause logged, redacted. Unusable stored
+// data is 500 instead (classify).
 func (a *API) writeError(w http.ResponseWriter, err error) {
 	var ae *apiError
 	if !errors.As(err, &ae) {
@@ -372,6 +391,15 @@ func (a *API) classify(err error) *apiError {
 		return &apiError{http.StatusConflict, "the service profile is in use"}
 	case errors.Is(err, errPrecondition):
 		return &apiError{http.StatusPreconditionFailed, "the version does not match If-Match"}
+	case errors.Is(err, errBusy), errors.Is(err, errContention):
+		return &apiError{http.StatusServiceUnavailable, "the subscription is busy; retry"}
+	case errors.Is(err, store.ErrInvalid), errors.Is(err, keyring.ErrCorrupt), errors.Is(err, keyring.ErrUnknownKey):
+		// A record that does not decode or a secret that does not open will
+		// not get better by retrying: 500, without Retry-After, counted
+		// apart from store outages.
+		a.h.metrics.Count("api.data_error", 1)
+		a.h.log.Error("provisioning request found unusable data", slog.String("error", pii.Redact(err.Error())))
+		return &apiError{http.StatusInternalServerError, "the stored subscription cannot be used; see the HSS log"}
 	}
 	a.h.metrics.Count("api.store_failure", 1)
 	a.h.log.Error("provisioning request failed", slog.String("error", pii.Redact(err.Error())))

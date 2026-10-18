@@ -71,6 +71,25 @@ func (c *CxServer) resultOf(cmd string, err error) cx.Result {
 	return cx.ResultCode(diameter.ResultUnableToComply)
 }
 
+// timed records the time a command takes, so a slow store shows in
+// cx.<command> before requests start to time out.
+func (c *CxServer) timed(cmd string) func() {
+	start := time.Now()
+	return func() { c.h.metrics.Timing("cx."+cmd, time.Since(start)) }
+}
+
+// busy is the answer to a request that waited too long for its
+// subscription's lock in this task (errBusy): DIAMETER_TOO_BUSY, a protocol
+// error (RFC 6733 §7.1.3), which the node sends in the generic answer
+// format and which lets the client try another HSS task. A failing store
+// is DIAMETER_UNABLE_TO_COMPLY instead (resultOf): every task shares it.
+func busy(err error) error {
+	if errors.Is(err, errBusy) {
+		return &diameter.Error{ResultCode: diameter.ResultTooBusy, Message: "subscription busy"}
+	}
+	return nil
+}
+
 func (c *CxServer) count(cmd string, r cx.Result) {
 	name := "cx." + cmd + "." + strconv.FormatUint(uint64(r.Code), 10)
 	if r.Vendor != 0 {
@@ -137,6 +156,7 @@ func (c *CxServer) context(ctx context.Context) (context.Context, context.Cancel
 }
 
 func (c *CxServer) uar(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+	defer c.timed("uar")()
 	r, err := cx.ParseUAR(req)
 	if err != nil {
 		return nil, err
@@ -183,6 +203,7 @@ func (c *CxServer) decideUAR(ctx context.Context, r *cx.UAR) (uarAnswer, error) 
 }
 
 func (c *CxServer) lir(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+	defer c.timed("lir")()
 	r, err := cx.ParseLIR(req)
 	if err != nil {
 		return nil, err
@@ -226,6 +247,7 @@ func (c *CxServer) decideLIR(ctx context.Context, r *cx.LIR) (lirAnswer, error) 
 }
 
 func (c *CxServer) sar(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+	defer c.timed("sar")()
 	r, err := cx.ParseSAR(req)
 	if err != nil {
 		return nil, err
@@ -247,6 +269,9 @@ func (c *CxServer) sar(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 	defer cancel()
 	a := cx.SAA{}
 	if err := c.applySAR(ctx, r, &a); err != nil {
+		if b := busy(err); b != nil {
+			return nil, b
+		}
 		a = cx.SAA{UserName: a.UserName}
 		a.Result = c.resultOf("sar", err)
 	}
@@ -330,6 +355,7 @@ func (c *CxServer) applySAR(ctx context.Context, r *cx.SAR, a *cx.SAA) error {
 }
 
 func (c *CxServer) mar(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+	defer c.timed("mar")()
 	r, err := cx.ParseMAR(req)
 	if err != nil {
 		return nil, err
@@ -345,6 +371,9 @@ func (c *CxServer) mar(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 	defer cancel()
 	a := cx.MAA{}
 	items, err := c.authenticate(ctx, r)
+	if b := busy(err); b != nil {
+		return nil, b
+	}
 	if err != nil {
 		a.Result = c.resultOf("mar", err)
 	} else {

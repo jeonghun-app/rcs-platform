@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	mathrand "math/rand/v2"
-	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
@@ -76,8 +75,21 @@ type HSS struct {
 	rand        io.Reader
 	log         *slog.Logger
 	metrics     Metrics
-	locks       [64]sync.Mutex
+	// locks are semaphores of one, so a writer waits for a subscription
+	// only as long as its context allows.
+	locks [lockStripes]chan struct{}
 }
+
+// lockStripes is the number of subscriber locks of a task. A slow write
+// holds up the subscribers sharing its stripe, so there are enough that a
+// stalled one delays few others.
+const lockStripes = 256
+
+// errBusy means a subscription's lock in this task was not free before the
+// request's deadline: another request for it, or for a subscriber sharing
+// its stripe, is slow. It is local to this task, so Cx answers it with
+// DIAMETER_TOO_BUSY and the client may try another HSS task.
+var errBusy = errors.New("hss: subscription is busy in this task")
 
 // New returns an HSS.
 func New(o Options) (*HSS, error) {
@@ -98,17 +110,31 @@ func New(o Options) (*HSS, error) {
 	if h.metrics == nil {
 		h.metrics = noMetrics{}
 	}
+	for i := range h.locks {
+		h.locks[i] = make(chan struct{}, 1)
+	}
 	return h, nil
 }
 
 // lock serialises writers of one subscription within the task, so that
 // version conflicts, and the retries they cost, arise only between tasks.
-func (h *HSS) lock(impi string) func() {
+// It gives up with errBusy when ctx ends first.
+func (h *HSS) lock(ctx context.Context, impi string) (unlock func(), err error) {
 	f := fnv.New32a()
 	_, _ = io.WriteString(f, impi)
-	mu := &h.locks[f.Sum32()%uint32(len(h.locks))]
-	mu.Lock()
-	return mu.Unlock
+	sem := h.locks[f.Sum32()%lockStripes]
+	select {
+	case sem <- struct{}{}: // free: taken whatever the context's state
+		return func() { <-sem }, nil
+	default:
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		h.metrics.Count("lock.busy", 1)
+		return nil, errBusy
+	}
 }
 
 // update reads the subscription, applies fn to a copy and writes it back
@@ -124,7 +150,11 @@ func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscrip
 // as the first attempt's starting point, which saves a read on the Cx path.
 // If read is stale the conditional write fails and the next attempt reads.
 func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
-	defer h.lock(impi)()
+	unlock, err := h.lock(ctx, impi)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	for attempt := 0; attempt < maxUpdateAttempts; attempt++ {
 		if attempt > 0 {
 			h.metrics.Count("store.conflict", 1)

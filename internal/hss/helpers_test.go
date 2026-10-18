@@ -260,12 +260,18 @@ type hssNode struct {
 
 func serveHSS(t *testing.T, h *HSS, host string) *hssNode {
 	t.Helper()
+	return serveHSSWith(t, h, host, 0)
+}
+
+// serveHSSWith is serveHSS with a Cx timeout.
+func serveHSSWith(t *testing.T, h *HSS, host string, timeout time.Duration) *hssNode {
+	t.Helper()
 	ln := newPipeListener()
 	n, err := diameter.NewNode(nodeConfig(t, host, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.ServeCx(n, 0)
+	h.ServeCx(n, timeout)
 	go func() { _ = n.Serve(ln) }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), realWait)
