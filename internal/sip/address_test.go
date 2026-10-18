@@ -2,6 +2,7 @@ package sip
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -179,8 +180,10 @@ func TestMalformedContactParametersFailOnlyTheirAccessor(t *testing.T) {
 		param string
 		get   func(c Contact) (bool, error)
 	}{
-		{"expires=4294967296", func(c Contact) (bool, error) { _, ok, err := c.Expires(); return ok, err }},
 		{"expires=-1", func(c Contact) (bool, error) { _, ok, err := c.Expires(); return ok, err }},
+		{`expires="3600"`, func(c Contact) (bool, error) { _, ok, err := c.Expires(); return ok, err }},
+		{`q="0.5"`, func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{`reg-id="1"`, func(c Contact) (bool, error) { _, ok, err := c.RegID(); return ok, err }},
 		{"q=1.5", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
 		{"q=1.001", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
 		{"q=0.1234", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
@@ -227,6 +230,33 @@ func TestMalformedContactParametersFailOnlyTheirAccessor(t *testing.T) {
 	}
 	if _, ok := parseQValue("1.0000"); ok {
 		t.Error("four decimals accepted")
+	}
+}
+
+// RFC 3261 §10.2 lets a registrar treat an expires above 2^32-1 as 2^32-1, so an
+// overlarge value is told apart from a malformed one.
+func TestOverlargeContactExpiresIsOutOfRangeNotMalformed(t *testing.T) {
+	for _, v := range []string{"4294967296", "99999999999999999999"} {
+		cs, err := ParseContacts("<sip:a@example.com>;expires=" + v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, present, err := cs[0].Expires()
+		if !present || n != math.MaxUint32 || !errors.Is(err, ErrOutOfRange) || errors.Is(err, ErrMalformed) {
+			t.Errorf("expires=%s: Expires() = %d, %v, %v", v, n, present, err)
+		}
+	}
+	cs, _ := ParseContacts("<sip:a@example.com>;expires=4294967295")
+	if n, _, err := cs[0].Expires(); n != math.MaxUint32 || err != nil {
+		t.Errorf("expires=2^32-1: %d, %v", n, err)
+	}
+}
+
+func TestTagsMustBeUnquotedTokens(t *testing.T) {
+	for _, in := range []string{`<sip:b@example.com>;tag="x y"`, `<sip:b@example.com>;tag="abc"`, `<sip:b@example.com>;tag=a:b`} {
+		if _, err := ParseAddress(in); !errors.Is(err, ErrMalformed) {
+			t.Errorf("ParseAddress(%q) = %v, want ErrMalformed", in, err)
+		}
 	}
 }
 
@@ -281,6 +311,13 @@ func TestRouteSetsRequireNameAddrs(t *testing.T) {
 	var none Header
 	if as, err := none.Route(); as != nil || err != nil {
 		t.Errorf("absent Route = %v, %v", as, err)
+	}
+	// An empty P-Associated-URI is allowed (RFC 7315 §5.1); an empty Route is not.
+	if as, err := headerWith(t, "P-Associated-URI", "").PAssociatedURI(); as != nil || err != nil {
+		t.Errorf("empty P-Associated-URI = %v, %v", as, err)
+	}
+	if _, err := headerWith(t, "Route", "").Route(); !errors.Is(err, ErrMalformed) {
+		t.Errorf("empty Route: %v", err)
 	}
 }
 

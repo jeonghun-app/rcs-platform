@@ -66,8 +66,15 @@ func (h *Header) Path() ([]Address, error) { return h.nameAddrs("Path") }
 // ServiceRoute returns the Service-Route elements (RFC 3608).
 func (h *Header) ServiceRoute() ([]Address, error) { return h.nameAddrs("Service-Route") }
 
-// PAssociatedURI returns the P-Associated-URI elements (RFC 7315 §4.1).
-func (h *Header) PAssociatedURI() ([]Address, error) { return h.nameAddrs("P-Associated-URI") }
+// PAssociatedURI returns the P-Associated-URI elements (RFC 7315 §4.1). The field
+// may be empty, meaning the user has no other identities (RFC 7315 §5.1); an empty
+// field yields no elements.
+func (h *Header) PAssociatedURI() ([]Address, error) {
+	if h.Has("P-Associated-URI") && strings.Join(h.Values("P-Associated-URI"), "") == "" {
+		return nil, nil
+	}
+	return h.nameAddrs("P-Associated-URI")
+}
 
 // PAssertedIdentity returns the P-Asserted-Identity elements (RFC 3325 §9.1),
 // at most one SIP or SIPS URI and one tel URI in practice.
@@ -97,17 +104,16 @@ func (h *Header) PChargingVector() (ChargingVector, error) {
 	return singleOf(h, "P-Charging-Vector", parseChargingVector)
 }
 
-// Expires returns Expires in seconds (RFC 3261 §20.19). An overlarge value is
-// reported as malformed, not clamped: whether to clamp it or use a default is the
-// registrar's decision (RFC 3261 §10.2.1, RFC 4475 §3.1.2.4).
+// Expires returns Expires in seconds (RFC 3261 §20.19). A number above 2^32-1
+// yields 2^32-1 with an error wrapping ErrOutOfRange, anything else that is not a
+// number an error wrapping ErrMalformed: whether to clamp or use a default is the
+// registrar's decision (RFC 3261 §10.2, RFC 4475 §3.1.2.4).
 func (h *Header) Expires() (uint32, error) {
-	return singleOf(h, "Expires", func(s string) (uint32, error) {
-		n, ok := parseDelta(s)
-		if !ok {
-			return 0, syntaxError("invalid delta-seconds")
-		}
-		return n, nil
-	})
+	v, err := h.single("Expires")
+	if err != nil {
+		return 0, err
+	}
+	return deltaSeconds("Expires", Param{Value: v})
 }
 
 // Allow returns the methods in Allow. An empty Allow, meaning no method, is

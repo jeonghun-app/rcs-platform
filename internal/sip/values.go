@@ -306,8 +306,12 @@ func parseReason(s string) (Reason, error) {
 	if err != nil {
 		return Reason{}, err
 	}
-	if v, ok := ps.Get("cause"); ok && !isDigits(v) {
-		return Reason{}, syntaxError("invalid cause parameter")
+	// Causes are small numbers (SIP status codes, Q.850 causes); bounding them
+	// keeps Cause from reporting a present parameter as absent on overflow.
+	if v, ok := ps.Get("cause"); ok {
+		if n, valid := parseDelta(v); !valid || n >= 1<<31 {
+			return Reason{}, syntaxError("invalid cause parameter")
+		}
 	}
 	return Reason{Protocol: proto, Params: ps}, nil
 }

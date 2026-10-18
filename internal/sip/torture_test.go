@@ -460,13 +460,14 @@ func TestTortureRFC4475Section3_1_2InvalidMessagesAreRefused(t *testing.T) {
 			}
 		}
 	}
-	accessorFails := func(get func(h *Header) error) check {
+	accessorFailsWith := func(want error, get func(h *Header) error) check {
 		return func(t *testing.T, m Message) {
-			if err := get(m.Headers()); !errors.Is(err, ErrMalformed) {
-				t.Errorf("accessor error = %v, want ErrMalformed", err)
+			if err := get(m.Headers()); !errors.Is(err, want) {
+				t.Errorf("accessor error = %v, want %v", err, want)
 			}
 		}
 	}
+	accessorFails := func(get func(h *Header) error) check { return accessorFailsWith(ErrMalformed, get) }
 	tests := []struct {
 		section string
 		msg     string
@@ -493,17 +494,19 @@ func TestTortureRFC4475Section3_1_2InvalidMessagesAreRefused(t *testing.T) {
 			msg: breakBase(t, "Max-Forwards: 7", "Max-Forwards: 300"), checks: []check{failsValidate("Max-Forwards")}},
 		{section: "3.1.2.4 overlarge CSeq",
 			msg: breakBase(t, "CSeq: 8 INVITE", "CSeq: 36893488147419103232 INVITE"), checks: []check{failsValidate("CSeq")}},
+		// Overlarge expiry values are out of range rather than malformed, so a
+		// registrar can clamp them (RFC 3261 §10.2).
 		{section: "3.1.2.4 overlarge Expires",
 			msg: breakBase(t, "Expires: 60", "Expires: 10000000000000000000"),
-			checks: []check{accessorFails(func(h *Header) error {
+			checks: []check{accessorFailsWith(ErrOutOfRange, func(h *Header) error {
 				_, err := h.Expires()
 				return err
 			})}},
-		// The bad expires fails its own accessor only, so a registrar can treat it
-		// as 3600 (RFC 3261 §10.2.1).
+		// The bad expires fails its own accessor only, so the rest of the Contact
+		// stays readable.
 		{section: "3.1.2.4 overlarge Contact expires",
 			msg: breakBase(t, `Contact: "Joe" <sip:joe@example.org>`, `Contact: "Joe" <sip:joe@example.org>;expires=99999999999999999999`),
-			checks: []check{accessorFails(func(h *Header) error {
+			checks: []check{accessorFailsWith(ErrOutOfRange, func(h *Header) error {
 				cs, err := h.Contact()
 				if err != nil {
 					return err

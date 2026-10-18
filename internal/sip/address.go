@@ -1,6 +1,9 @@
 package sip
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 // Address is the value of From, To, Contact, Route and the other header fields
 // built from a name-addr or addr-spec followed by header parameters (RFC 3261
@@ -96,6 +99,12 @@ func parseAddress(s string, nameAddrOnly bool) (Address, error) {
 	if err != nil {
 		return Address{}, err
 	}
+	// A tag is a token (RFC 3261 §25.1 tag-param). Accepting a quoted one would
+	// let "x y" into a dialog identifier and make tag="a" and tag=a the same
+	// dialog for us but not for a stricter element.
+	if i := ps.index("tag"); i >= 0 && (ps[i].Quoted || !isAll(ps[i].Value, classToken)) {
+		return Address{}, syntaxError("invalid tag parameter")
+	}
 	a.Params = ps
 	return a, nil
 }
@@ -130,22 +139,40 @@ type Contact struct {
 }
 
 // The contact parameters below are checked when read rather than when the Contact
-// field is parsed. A registrar treats a malformed expires as 3600 (RFC 3261
-// §10.2.1; RFC 4475 §3.1.2.4), which it could not do if one bad parameter failed
-// the whole Contact list.
+// field is parsed. A registrar treats a malformed expires as 3600 and may treat
+// an overlarge one as 2^32-1 (RFC 3261 §10.2; RFC 4475 §3.1.2.4), which it could
+// not do if one bad parameter failed the whole Contact list. All of them are
+// numbers, so a quoted value is malformed.
 
 // Expires returns the expires parameter in seconds. present is false when there
-// is none; err wraps ErrMalformed when it is not delta-seconds within 2^32-1.
+// is none. err wraps ErrOutOfRange, with seconds set to 2^32-1, when the value is
+// a number above 2^32-1, and ErrMalformed when it is not a number.
 func (c Contact) Expires() (seconds uint32, present bool, err error) {
-	v, ok := c.Params.Get("expires")
+	p, ok := c.param("expires")
 	if !ok {
 		return 0, false, nil
 	}
-	n, valid := parseDelta(v)
-	if !valid {
-		return 0, true, headerError("Contact", "invalid expires parameter")
+	n, err := deltaSeconds("Contact", p)
+	return n, true, err
+}
+
+func (c Contact) param(name string) (Param, bool) {
+	if i := c.Params.index(name); i >= 0 {
+		return c.Params[i], true
 	}
-	return n, true, nil
+	return Param{}, false
+}
+
+// deltaSeconds reads an expires value for the accessors of the named header.
+func deltaSeconds(header string, p Param) (uint32, error) {
+	n, overlarge, ok := parseDeltaSeconds(p.Value)
+	switch {
+	case !ok || p.Quoted:
+		return 0, headerError(header, "invalid expires value")
+	case overlarge:
+		return n, &ParseError{Header: header, Reason: "expires value above 2^32-1", Err: ErrOutOfRange}
+	}
+	return n, nil
 }
 
 // Q returns the q parameter in thousandths (q=0.5 is 500). Thousandths are exact,
@@ -153,12 +180,12 @@ func (c Contact) Expires() (seconds uint32, present bool, err error) {
 // present is false when there is none; err wraps ErrMalformed when it is not a
 // qvalue.
 func (c Contact) Q() (thousandths int, present bool, err error) {
-	v, ok := c.Params.Get("q")
+	p, ok := c.param("q")
 	if !ok {
 		return 0, false, nil
 	}
-	q, valid := parseQValue(v)
-	if !valid {
+	q, valid := parseQValue(p.Value)
+	if !valid || p.Quoted {
 		return 0, true, headerError("Contact", "invalid q parameter")
 	}
 	return q, true, nil
@@ -171,12 +198,12 @@ func (c Contact) Instance() (string, bool) { return c.Params.Get("+sip.instance"
 // RegID returns the reg-id parameter (RFC 5626 §4.2). present is false when there
 // is none; err wraps ErrMalformed when it is outside 1 to 2^31-1 (RFC 5626 §10).
 func (c Contact) RegID() (id uint32, present bool, err error) {
-	v, ok := c.Params.Get("reg-id")
+	p, ok := c.param("reg-id")
 	if !ok {
 		return 0, false, nil
 	}
-	n, valid := parseDelta(v)
-	if !valid || n == 0 || n >= 1<<31 {
+	n, valid := parseDelta(p.Value)
+	if !valid || p.Quoted || n == 0 || n >= 1<<31 {
 		return 0, true, headerError("Contact", "invalid reg-id parameter")
 	}
 	return n, true, nil
@@ -246,15 +273,22 @@ func parseQValue(s string) (int, bool) {
 // parseDelta parses delta-seconds (RFC 3261 §25.1), which is at most 2^32-1
 // (RFC 3261 §20.19).
 func parseDelta(s string) (uint32, bool) {
+	n, overlarge, ok := parseDeltaSeconds(s)
+	return n, ok && !overlarge
+}
+
+// parseDeltaSeconds parses delta-seconds and tells an overlarge value, returned
+// as 2^32-1, apart from one that is not a number at all.
+func parseDeltaSeconds(s string) (n uint32, overlarge, ok bool) {
 	if !isDigits(s) {
-		return 0, false
+		return 0, false, false
 	}
-	var n uint64
+	var v uint64
 	for i := 0; i < len(s); i++ {
-		n = n*10 + uint64(s[i]-'0')
-		if n > 1<<32-1 {
-			return 0, false
+		v = v*10 + uint64(s[i]-'0')
+		if v > math.MaxUint32 {
+			return math.MaxUint32, true, true
 		}
 	}
-	return uint32(n), true
+	return uint32(v), false, true
 }

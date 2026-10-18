@@ -124,11 +124,11 @@ func checkViaParams(ps Params) error {
 			ok = isAll(p.Value, classToken) && !p.Quoted
 		case "ttl":
 			n, valid := parseDelta(p.Value)
-			ok = valid && n <= 255 && len(p.Value) <= 3
+			ok = valid && !p.Quoted && n <= 255 && len(p.Value) <= 3
 		case "maddr":
-			ok = validHost(p.Value)
+			ok = !p.Quoted && validHost(p.Value)
 		case "received":
-			ok = isIPv4(p.Value) || isIPv6(p.Value)
+			ok = !p.Quoted && (isIPv4(p.Value) || isIPv6(p.Value))
 		case "rport":
 			// A request carries rport as a flag; the response gets the port filled in
 			// (RFC 3581 §4).

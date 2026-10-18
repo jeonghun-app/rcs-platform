@@ -63,9 +63,15 @@ func TestScalarHeadersEnforceTheirRanges(t *testing.T) {
 	if err != nil || ex != 1<<32-1 {
 		t.Errorf("Expires = %d, %v", ex, err)
 	}
-	for _, in := range []string{"", "4294967296", "10000000000000000000000", "1.5", "Thu, 01 Dec 1994 16:00:00 GMT"} {
+	for _, in := range []string{"", "1.5", "Thu, 01 Dec 1994 16:00:00 GMT"} {
 		_, err := headerWith(t, "Expires", in).Expires()
 		wantMalformed(t, "Expires", in, err)
+	}
+	for _, in := range []string{"4294967296", "10000000000000000000000"} {
+		n, err := headerWith(t, "Expires", in).Expires()
+		if n != 1<<32-1 || !errors.Is(err, ErrOutOfRange) {
+			t.Errorf("Expires %q = %d, %v, want 2^32-1 and ErrOutOfRange", in, n, err)
+		}
 	}
 	var none Header
 	if _, err := none.Expires(); !errors.Is(err, ErrMissingHeader) {
@@ -271,7 +277,7 @@ func TestReasonCarriesProtocolCauseAndText(t *testing.T) {
 	if _, ok := (Reason{Protocol: "SIP"}).Cause(); ok {
 		t.Error("Cause() without cause")
 	}
-	for _, in := range []string{"", "SIP;cause=abc", `SIP;text="x`, "SIP;cause=1;cause=2"} {
+	for _, in := range []string{"", "SIP;cause=abc", `SIP;text="x`, "SIP;cause=1;cause=2", "SIP;cause=99999999999999999999", "SIP;cause=2147483648"} {
 		_, err := headerWith(t, "Reason", in).Reason()
 		wantMalformed(t, "Reason", in, err)
 	}

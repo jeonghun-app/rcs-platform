@@ -26,6 +26,11 @@ var (
 	// ErrKeepAlive means a datagram held only CRLF keep-alives (or nothing), which
 	// is not an error worth logging.
 	ErrKeepAlive = errors.New("sip: keep-alive, not a message")
+	// ErrOutOfRange means a value is well-formed but larger than its field allows.
+	// It is kept apart from ErrMalformed for expires, which a registrar may treat
+	// as 2^32-1 when it is larger (RFC 3261 §10.2), while a malformed one is
+	// treated as 3600.
+	ErrOutOfRange = errors.New("sip: value out of range")
 	// ErrMissingHeader means a header field a typed accessor was asked for is
 	// absent.
 	ErrMissingHeader = errors.New("sip: header field not present")
