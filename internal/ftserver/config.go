@@ -25,15 +25,23 @@ const (
 	DefaultMaxDownloads         = 256
 	DefaultMaxLookups           = 16
 	DefaultMinUploadRate        = 1024 // bytes per second
-	DefaultMinDownloadRate      = 1024 // bytes per second
-	DefaultMaxDownloadsPerFile  = 4
-	DefaultDrainTimeout         = 10 * time.Second
-	DefaultIdleTimeout          = 30 * time.Second
-	DefaultUploadTimeout        = 30 * time.Minute
-	DefaultStorageTimeout       = time.Minute
-	DefaultSweepInterval        = time.Hour
-	DefaultHSSTimeout           = 2 * time.Second
-	DefaultTable                = "files"
+	// A group chat delivers one link to every member at once: 64 downloads
+	// of a file per task keep them from 503-and-retry (#50). The download
+	// rate floor is 4 KiB/s, which a congested mobile link still makes, and
+	// rises to 16 KiB/s only while more than 75% of the task's download
+	// slots are taken, so that slow readers make room when others wait.
+	DefaultMinDownloadRate         = 4 << 10  // bytes per second
+	DefaultMinDownloadRatePressure = 16 << 10 // bytes per second
+	DefaultDownloadPressurePercent = 75
+	DefaultMaxDownloadsPerFile     = 64
+	DefaultMaxDownloadsPerUploader = 128
+	DefaultDrainTimeout            = 10 * time.Second
+	DefaultIdleTimeout             = 30 * time.Second
+	DefaultUploadTimeout           = 30 * time.Minute
+	DefaultStorageTimeout          = time.Minute
+	DefaultSweepInterval           = time.Hour
+	DefaultHSSTimeout              = 2 * time.Second
+	DefaultTable                   = "files"
 )
 
 // The FT_STORE and FT_CREDENTIALS values.
@@ -64,24 +72,27 @@ type Config struct {
 	Store string
 	AWS   AWSConfig
 
-	MaxSize              int64
-	MaxThumbnailSize     int64
-	PartSize             int64
-	Validity             time.Duration
-	DownloadAuth         bool
-	UploadsPerMinute     int
-	MaxConcurrentUploads int
-	MaxUploadsPerUser    int
-	MaxDownloads         int
-	MaxLookups           int
-	MinUploadRate        int64
-	MinDownloadRate      int64
-	MaxDownloadsPerFile  int
-	IdleTimeout          time.Duration
-	UploadTimeout        time.Duration
-	StorageTimeout       time.Duration
-	SweepInterval        time.Duration
-	DrainTimeout         time.Duration
+	MaxSize                 int64
+	MaxThumbnailSize        int64
+	PartSize                int64
+	Validity                time.Duration
+	DownloadAuth            bool
+	UploadsPerMinute        int
+	MaxConcurrentUploads    int
+	MaxUploadsPerUser       int
+	MaxDownloads            int
+	MaxLookups              int
+	MinUploadRate           int64
+	MinDownloadRate         int64
+	MinDownloadRatePressure int64
+	DownloadPressurePercent int
+	MaxDownloadsPerFile     int
+	MaxDownloadsPerUploader int
+	IdleTimeout             time.Duration
+	UploadTimeout           time.Duration
+	StorageTimeout          time.Duration
+	SweepInterval           time.Duration
+	DrainTimeout            time.Duration
 }
 
 // AWSConfig is the S3 and DynamoDB part of Config, used with FT_STORE=aws.
@@ -104,31 +115,34 @@ type AWSConfig struct {
 func Configure(s *runtime.Settings) Config {
 	e := s.Env
 	c := Config{
-		ListenAddr:           e.String("LISTEN_ADDR", DefaultListenAddr),
-		Realm:                e.RequiredString("REALM"),
-		NonceKey:             secret{e.String("NONCE_KEY", "")},
-		Credentials:          e.String("CREDENTIALS", CredentialsHSS),
-		HSSToken:             secret{e.String("HSS_TOKEN", "")},
-		HSSTimeout:           e.Duration("HSS_TIMEOUT", DefaultHSSTimeout),
-		Store:                e.String("STORE", StoreAWS),
-		MaxSize:              int64(e.Int("MAX_SIZE", DefaultMaxSize)),
-		MaxThumbnailSize:     int64(e.Int("MAX_THUMBNAIL_SIZE", DefaultMaxThumbnailSize)),
-		PartSize:             int64(e.Int("PART_SIZE", DefaultPartSize)),
-		Validity:             e.Duration("VALIDITY", DefaultValidity),
-		DownloadAuth:         e.Bool("DOWNLOAD_AUTH", false),
-		UploadsPerMinute:     e.Int("UPLOADS_PER_MINUTE", DefaultUploadsPerMinute),
-		MaxConcurrentUploads: e.Int("MAX_CONCURRENT_UPLOADS", DefaultMaxConcurrentUploads),
-		MaxUploadsPerUser:    e.Int("MAX_UPLOADS_PER_USER", DefaultMaxUploadsPerUser),
-		MaxDownloads:         e.Int("MAX_CONCURRENT_DOWNLOADS", DefaultMaxDownloads),
-		MaxLookups:           e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
-		MinUploadRate:        int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
-		MinDownloadRate:      int64(e.Int("MIN_DOWNLOAD_RATE", DefaultMinDownloadRate)),
-		MaxDownloadsPerFile:  e.Int("MAX_DOWNLOADS_PER_FILE", DefaultMaxDownloadsPerFile),
-		IdleTimeout:          e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
-		UploadTimeout:        e.Duration("UPLOAD_TIMEOUT", DefaultUploadTimeout),
-		StorageTimeout:       e.Duration("STORAGE_TIMEOUT", DefaultStorageTimeout),
-		SweepInterval:        e.Duration("SWEEP_INTERVAL", DefaultSweepInterval),
-		DrainTimeout:         e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
+		ListenAddr:              e.String("LISTEN_ADDR", DefaultListenAddr),
+		Realm:                   e.RequiredString("REALM"),
+		NonceKey:                secret{e.String("NONCE_KEY", "")},
+		Credentials:             e.String("CREDENTIALS", CredentialsHSS),
+		HSSToken:                secret{e.String("HSS_TOKEN", "")},
+		HSSTimeout:              e.Duration("HSS_TIMEOUT", DefaultHSSTimeout),
+		Store:                   e.String("STORE", StoreAWS),
+		MaxSize:                 int64(e.Int("MAX_SIZE", DefaultMaxSize)),
+		MaxThumbnailSize:        int64(e.Int("MAX_THUMBNAIL_SIZE", DefaultMaxThumbnailSize)),
+		PartSize:                int64(e.Int("PART_SIZE", DefaultPartSize)),
+		Validity:                e.Duration("VALIDITY", DefaultValidity),
+		DownloadAuth:            e.Bool("DOWNLOAD_AUTH", false),
+		UploadsPerMinute:        e.Int("UPLOADS_PER_MINUTE", DefaultUploadsPerMinute),
+		MaxConcurrentUploads:    e.Int("MAX_CONCURRENT_UPLOADS", DefaultMaxConcurrentUploads),
+		MaxUploadsPerUser:       e.Int("MAX_UPLOADS_PER_USER", DefaultMaxUploadsPerUser),
+		MaxDownloads:            e.Int("MAX_CONCURRENT_DOWNLOADS", DefaultMaxDownloads),
+		MaxLookups:              e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
+		MinUploadRate:           int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
+		MinDownloadRate:         int64(e.Int("MIN_DOWNLOAD_RATE", DefaultMinDownloadRate)),
+		MinDownloadRatePressure: int64(e.Int("MIN_DOWNLOAD_RATE_UNDER_PRESSURE", DefaultMinDownloadRatePressure)),
+		DownloadPressurePercent: e.Int("DOWNLOAD_PRESSURE_PERCENT", DefaultDownloadPressurePercent),
+		MaxDownloadsPerFile:     e.Int("MAX_DOWNLOADS_PER_FILE", DefaultMaxDownloadsPerFile),
+		MaxDownloadsPerUploader: e.Int("MAX_DOWNLOADS_PER_UPLOADER", DefaultMaxDownloadsPerUploader),
+		IdleTimeout:             e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
+		UploadTimeout:           e.Duration("UPLOAD_TIMEOUT", DefaultUploadTimeout),
+		StorageTimeout:          e.Duration("STORAGE_TIMEOUT", DefaultStorageTimeout),
+		SweepInterval:           e.Duration("SWEEP_INTERVAL", DefaultSweepInterval),
+		DrainTimeout:            e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
 		AWS: AWSConfig{
 			Bucket:           e.String("S3_BUCKET", ""),
 			Prefix:           e.String("S3_PREFIX", ""),
@@ -253,7 +267,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"MAX_CONCURRENT_UPLOADS", c.MaxConcurrentUploads}, {"MAX_UPLOADS_PER_USER", c.MaxUploadsPerUser},
 		{"MAX_CONCURRENT_DOWNLOADS", c.MaxDownloads}, {"MAX_CONCURRENT_LOOKUPS", c.MaxLookups},
-		{"MAX_DOWNLOADS_PER_FILE", c.MaxDownloadsPerFile},
+		{"MAX_DOWNLOADS_PER_FILE", c.MaxDownloadsPerFile}, {"MAX_DOWNLOADS_PER_UPLOADER", c.MaxDownloadsPerUploader},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")
@@ -265,6 +279,23 @@ func Configure(s *runtime.Settings) Config {
 	if c.MinDownloadRate < 0 {
 		e.Invalid("MIN_DOWNLOAD_RATE", "must not be negative")
 	}
+	if c.MinDownloadRatePressure < 0 {
+		e.Invalid("MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "must not be negative")
+	}
+	if c.DownloadPressurePercent < 1 || c.DownloadPressurePercent > 100 {
+		e.Invalid("DOWNLOAD_PRESSURE_PERCENT", "must be from 1 to 100")
+	}
+	// The pressure floor is the stricter one; below the normal floor it
+	// would loosen the check exactly when slots run short. With the normal
+	// floor at 0 both are off, so the pressure floor does not matter.
+	s.ForbidInProduction(c.MinDownloadRate > 0 && c.MinDownloadRatePressure < c.MinDownloadRate,
+		"FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE is below FT_MIN_DOWNLOAD_RATE: the floor would loosen when download slots run short")
+	// Each download limit only protects if it is tighter than the one
+	// around it.
+	// The per-uploader limit is strictly below the task's: equal to it, one
+	// subscriber's links could still take every slot.
+	s.ForbidInProduction(c.MaxDownloadsPerFile > c.MaxDownloadsPerUploader || c.MaxDownloadsPerUploader >= c.MaxDownloads,
+		"FT_MAX_DOWNLOADS_PER_FILE ≤ FT_MAX_DOWNLOADS_PER_UPLOADER < FT_MAX_CONCURRENT_DOWNLOADS does not hold: a looser inner limit protects nothing")
 	return c
 }
 

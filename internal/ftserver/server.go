@@ -79,12 +79,22 @@ type Options struct {
 	// task, so requests from the internet cannot load the HSS without limit.
 	MaxConcurrentLookups int
 	// MaxDownloadsPerFile bounds downloads of one file in progress on this
-	// task: a recipient resuming a download needs one or two connections.
-	MaxDownloadsPerFile int
+	// task, sized for a group chat whose members all fetch one link at once,
+	// and MaxDownloadsPerUploader those of all the files of one uploader, so
+	// that one subscriber's links cannot take every slot of the task.
+	MaxDownloadsPerFile, MaxDownloadsPerUploader int
 	// MinUploadRate is the slowest an upload body may arrive and
 	// MinDownloadRate the slowest a download may be read, in bytes per
 	// second over each minute; 0 disables the check.
 	MinUploadRate, MinDownloadRate int64
+	// MinDownloadRateUnderPressure replaces MinDownloadRate while more
+	// than DownloadPressurePercent of the task's download slots are taken.
+	// A slow mobile link must be able to finish a large file while slots
+	// are plentiful; when they run short, slow readers make room for others.
+	// A MinDownloadRate of 0 turns the floor off in both regimes, and a
+	// DownloadPressurePercent of 0 means DefaultDownloadPressurePercent.
+	MinDownloadRateUnderPressure int64
+	DownloadPressurePercent      int
 	// IdleTimeout ends a transfer that moves no byte for that long; zero
 	// disables connection deadlines (tests with a ResponseRecorder).
 	// UploadTimeout bounds one upload request end to end.
@@ -117,6 +127,7 @@ type Server struct {
 	lookups      chan struct{}
 	perUser      *userSlots
 	perFile      *userSlots
+	perUploader  *userSlots
 	// retryWait is the pause before retry attempt n of a completing update.
 	retryWait func(attempt int) time.Duration
 	writers   activity
@@ -144,8 +155,9 @@ func New(o Options) (*Server, error) {
 	case o.Validity <= 0 || o.UploadTimeout <= 0 || o.StorageTimeout <= 0 || o.IdleTimeout < 0:
 		return nil, errors.New("ftserver: validity and timeouts must be positive")
 	case o.MaxConcurrentUploads <= 0 || o.MaxUploadsPerUser <= 0 || o.MaxConcurrentDownloads <= 0 ||
-		o.MaxDownloadsPerFile <= 0 || o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 ||
-		o.MinUploadRate < 0 || o.MinDownloadRate < 0:
+		o.MaxDownloadsPerFile <= 0 || o.MaxDownloadsPerUploader <= 0 || o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 ||
+		o.MinUploadRate < 0 || o.MinDownloadRate < 0 || o.MinDownloadRateUnderPressure < 0 ||
+		o.DownloadPressurePercent < 0 || o.DownloadPressurePercent > 100:
 		return nil, errors.New("ftserver: concurrency limits must be positive")
 	}
 	up, down := o.UploadURI.Path, o.DownloadURI.Path
@@ -175,6 +187,7 @@ func New(o Options) (*Server, error) {
 		lookups:      make(chan struct{}, o.MaxConcurrentLookups),
 		perUser:      &userSlots{max: o.MaxUploadsPerUser, n: map[string]int{}},
 		perFile:      &userSlots{max: o.MaxDownloadsPerFile, n: map[string]int{}},
+		perUploader:  &userSlots{max: o.MaxDownloadsPerUploader, n: map[string]int{}},
 		leaseTTL:     2 * (o.IdleTimeout + o.StorageTimeout),
 		retryWait:    func(n int) time.Duration { return time.Duration(50<<n) * time.Millisecond },
 	}
@@ -183,6 +196,10 @@ func New(o Options) (*Server, error) {
 	}
 	if s.random == nil {
 		s.random = rand.Reader
+	}
+	if s.o.DownloadPressurePercent == 0 {
+		// The zero value must not mean "always under pressure".
+		s.o.DownloadPressurePercent = DefaultDownloadPressurePercent
 	}
 	s.limiter = newLimiter(o.UploadsPerMinute, s.now)
 	// One byte more than a part: a full part is stored only once the next
@@ -398,7 +415,7 @@ func (s *Server) acquireUpload(owner string) (release func(), reason string) {
 }
 
 // userSlots counts transfers in progress per key: uploads per owner,
-// downloads per file id.
+// downloads per file id and per uploader.
 type userSlots struct {
 	max int
 	mu  sync.Mutex
@@ -419,6 +436,25 @@ func (u *userSlots) acquire(owner string) (release func(), ok bool) {
 			delete(u.n, owner)
 		}
 	}, true
+}
+
+// completeBudget bounds the completion of an upload: storing the last part,
+// closing the object, every try of the completing update and the read-back.
+// Two thirds of a lease, so that a writer that renews its lease at the start
+// of completion is done while it still holds it.
+func (s *Server) completeBudget() time.Duration { return s.leaseTTL * 2 / 3 }
+
+// minDownloadRate is the download rate floor now: the stricter one while
+// the task's download slots are under pressure.
+func (s *Server) minDownloadRate() int64 {
+	if s.o.MinDownloadRate == 0 {
+		// Turned off, in both regimes.
+		return 0
+	}
+	if used, total := len(s.downloads), cap(s.downloads); used*100 > s.o.DownloadPressurePercent*total {
+		return s.o.MinDownloadRateUnderPressure
+	}
+	return s.o.MinDownloadRate
 }
 
 // storageContext bounds one storage call. It does not end with the request:
@@ -448,7 +484,7 @@ func (s *Server) bodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
 		now:  s.wallNow,
 		end:  now.Add(s.o.UploadTimeout),
 		idle: s.o.IdleTimeout,
-		rate: newRateCheck(s.o.MinUploadRate, s.wallNow),
+		rate: newRateCheck(func() int64 { return s.o.MinUploadRate }, s.wallNow),
 	}
 	if s.o.IdleTimeout > 0 {
 		d.rc = http.NewResponseController(w)
@@ -467,13 +503,13 @@ var (
 // It is what stops a client from holding a slot for hours by moving a byte
 // just often enough to beat the idle deadline.
 type rateCheck struct {
-	min    int64 // bytes per second; 0 disables the check
+	min    func() int64 // bytes per second, asked at the end of each window; 0 disables the check
 	now    func() time.Time
 	window time.Time // start of the current window
 	bytes  int64     // moved in the current window
 }
 
-func newRateCheck(min int64, now func() time.Time) rateCheck {
+func newRateCheck(min func() int64, now func() time.Time) rateCheck {
 	return rateCheck{min: min, now: now, window: now()}
 }
 
@@ -482,7 +518,7 @@ func newRateCheck(min int64, now func() time.Time) rateCheck {
 func (r *rateCheck) check() error {
 	now := r.now()
 	if elapsed := now.Sub(r.window); elapsed >= rateWindow {
-		if r.min > 0 && float64(r.bytes) < float64(r.min)*elapsed.Seconds() {
+		if min := r.min(); min > 0 && float64(r.bytes) < float64(min)*elapsed.Seconds() {
 			return errTooSlow
 		}
 		r.window, r.bytes = now, 0
