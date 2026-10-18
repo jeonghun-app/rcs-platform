@@ -3,9 +3,11 @@ package cx
 import "github.com/jeonghun-app/rcs-platform/internal/diameter"
 
 // RTR is a Registration-Termination-Request (TS 29.229 §6.1.9): the HSS
-// deregisters a user administratively (TS 29.228 §6.1.3). The HSS sends it to
-// the S-CSCF it learnt from an earlier request, so Destination-Host is
-// required (TS 29.229 §5.5).
+// deregisters a user administratively (TS 29.228 §6.1.3). Destination-Host is
+// required on HSS-initiated requests (TS 29.229 §5.5). Under ADR 0005 the HSS
+// sends the request on any connected scscf peer of the realm, not to the
+// Origin-Host recorded at SAR time, which may belong to a task that has gone,
+// so Destination-Host names the peer chosen ([diameter.Peer.Host]).
 type RTR struct {
 	Request
 	UserName             string
