@@ -31,6 +31,15 @@ func respondRefused(code int) serverStep {
 	}
 }
 
+// respondFailing passes a response the transport fails to send.
+func respondFailing(code int) serverStep {
+	return func(h *harness, req *sip.Request) {
+		if err := h.tu.lastTx().Respond(response(h.t, req, code)); !errors.Is(err, errNetwork) {
+			h.t.Fatalf("Respond(%d) = %v, want the transport error", code, err)
+		}
+	}
+}
+
 // retransmit delivers the request again.
 func retransmit(h *harness, req *sip.Request) { h.receive(req) }
 
@@ -192,6 +201,18 @@ func TestServerNonInviteTransitions(t *testing.T) {
 		{name: "reliable: Timer J is zero", network: transport.TCP,
 			steps:    []serverStep{respondWith(200)},
 			wantSent: []string{"200"}, wantState: Terminated},
+		{name: "Trying: a response the transport cannot send terminates", network: transport.UDP,
+			steps:     []serverStep{failServerSends, respondFailing(200)},
+			wantState: Terminated},
+		{name: "Proceeding: a provisional the transport cannot send terminates", network: transport.UDP,
+			steps:    []serverStep{respondWith(100), failServerSends, respondFailing(180)},
+			wantSent: []string{"100"}, wantState: Terminated},
+		{name: "Proceeding: a failed answer to a retransmission fails the transaction", network: transport.UDP,
+			steps:    []serverStep{respondWith(100), failServerSends, retransmit},
+			wantSent: []string{"100"}, wantTU: []string{"failed: " + errNetwork.Error()}, wantState: Terminated},
+		{name: "Completed: a failed answer to a retransmission fails the transaction", network: transport.UDP,
+			steps:    []serverStep{respondWith(200), failServerSends, retransmit},
+			wantSent: []string{"200"}, wantTU: []string{"failed: " + errNetwork.Error()}, wantState: Terminated},
 	})
 }
 
@@ -418,4 +439,19 @@ func TestTUMayRespondFromInsideRequest(t *testing.T) {
 	}
 	h.receive(request(t, "MESSAGE", "z9hG4bKin"))
 	check(t, "sent", h.sender.take(), []string{"200"})
+}
+
+func TestSendsOnTheReadingGoroutineNeverWaitForTheQueue(t *testing.T) {
+	// The 100 Trying, the ACK for a failure and the answer to a retransmission
+	// are sent while a message is being received; the TU's own sends wait.
+	h := newHarness(t, transport.TCP, Config{})
+	inv := request(t, "INVITE", "z9hG4bKmode")
+	h.receive(inv)
+	if err := h.tu.lastTx().Respond(response(t, inv, 486)); err != nil {
+		t.Fatal(err)
+	}
+	h.receive(inv)
+	client := h.startClient(request(t, "INVITE", "z9hG4bKmode2"))
+	h.receive(response(t, client.Request(), 603))
+	check(t, "send modes", h.sender.modes(), []string{"100 nowait", "486 wait", "486 nowait", "INVITE wait", "ACK nowait"})
 }
