@@ -6,6 +6,7 @@ import (
 	"errors"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -209,7 +210,8 @@ func (a *API) createSubscription(w http.ResponseWriter, r *http.Request, _ Scope
 	if err != nil {
 		return err
 	}
-	w.Header().Set("Location", "/v1/subscriptions/"+saved.IMPI)
+	// An IMPI may hold '?' and '#' (RFC 7542), which a URL must escape.
+	w.Header().Set("Location", "/v1/subscriptions/"+url.PathEscape(saved.IMPI))
 	w.Header().Set("ETag", etag(saved.Version))
 	writeJSON(w, http.StatusCreated, a.response(saved))
 	return nil

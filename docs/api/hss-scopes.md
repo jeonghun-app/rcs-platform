@@ -36,7 +36,8 @@ can issue a new password but never read a stored credential.
 |---|---|
 | 503 | no token is configured that may use the operation (also: the store is unavailable; both with `Retry-After`) |
 | 401 | no bearer token, or one that is not accepted (`WWW-Authenticate: Bearer`) |
-| 403 | the token's caller is not allowed the operation, or `acs` asks about a subscription without `acs_managed` |
+| 403 | the token's caller is not allowed the operation |
+| 404 | no such subscription; for `acs`, also a subscription without `acs_managed`, with the same body, so an `acs` token cannot tell which IMPIs exist outside its scope; for `ft-server`, also a user name that is not an IMPI, or no FT credential |
 | 429 | an `acs` token is over `HSS_ACS_RATE` requests per second (burst `HSS_ACS_BURST`), with `Retry-After` |
 
 ## Tokens

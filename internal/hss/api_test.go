@@ -235,16 +235,18 @@ func TestACSWorksOnlyOnSubscriptionsHandedToIt(t *testing.T) {
 	a := newAPIEnv(t)
 	a.create(impi1, true, impu1)
 	a.create(impi2, false, impu2)
-	for _, path := range []string{subPath(impi2), subPath(impi2, "/digest-credential"), subPath(impi2, "/ft-credential")} {
-		method := "POST"
-		if path == subPath(impi2) {
-			method = "GET"
+	for _, c := range []struct{ method, rest string }{
+		{"GET", ""}, {"POST", "/digest-credential"}, {"POST", "/ft-credential"},
+	} {
+		// An unmanaged subscription looks to acs exactly like a missing one,
+		// so an acs token cannot tell which IMPIs exist outside its scope.
+		unmanagedCode, unmanaged, _ := a.do(c.method, subPath(impi2, c.rest), acsToken, "")
+		missingCode, missing, _ := a.do(c.method, subPath(impi3, c.rest), acsToken, "")
+		if unmanagedCode != http.StatusNotFound || missingCode != unmanagedCode || stringify(unmanaged) != stringify(missing) {
+			t.Errorf("acs %s %s: unmanaged %d %v, missing %d %v", c.method, c.rest, unmanagedCode, unmanaged, missingCode, missing)
 		}
-		if code, _, _ := a.do(method, path, acsToken, ""); code != http.StatusForbidden {
-			t.Errorf("acs %s %s = %d, want 403", method, path, code)
-		}
-		if code, _, _ := a.do(method, path, adminToken, ""); code == http.StatusForbidden {
-			t.Errorf("admin %s %s = 403", method, path)
+		if code, _, _ := a.do(c.method, subPath(impi2, c.rest), adminToken, ""); code >= 400 {
+			t.Errorf("admin %s %s = %d", c.method, c.rest, code)
 		}
 	}
 	if code, body, _ := a.do("GET", subPath(impi1), acsToken, ""); code != http.StatusOK || body["acs_managed"] != true {
@@ -252,6 +254,29 @@ func TestACSWorksOnlyOnSubscriptionsHandedToIt(t *testing.T) {
 	}
 	if s := a.sub(impi2); s.DigestFor(domain) == nil {
 		t.Error("the admin could not issue for an unmanaged subscription")
+	}
+}
+
+func TestFTLookupOfAMalformedUserNameIsNotFound(t *testing.T) {
+	a := newAPIEnv(t)
+	for _, user := range []string{"alice", "alice@", "@" + domain, "al ice@" + domain, "al%41ice@" + domain} {
+		code, body, _ := a.do("GET", subPath(user, "/ft-credential?algorithm=SHA-256"), ftToken, "")
+		if code != http.StatusNotFound {
+			t.Errorf("user %q = %d %v, want 404 (an unknown user, not a backend failure)", user, code, body)
+		}
+	}
+}
+
+func TestLocationAddressesTheCreatedSubscription(t *testing.T) {
+	a := newAPIEnv(t)
+	for i, impi := range []string{"a?b@" + domain, "a#b@" + domain} {
+		code, _, h := a.do("POST", "/v1/subscriptions", adminToken, subscriptionBody(impi, false, []string{impu1, impu2}[i]))
+		if code != http.StatusCreated {
+			t.Fatalf("create = %d", code)
+		}
+		if got, _, _ := a.do("GET", h.Get("Location"), adminToken, ""); got != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200", h.Get("Location"), got)
+		}
 	}
 }
 

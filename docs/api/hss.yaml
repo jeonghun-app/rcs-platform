@@ -223,7 +223,10 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404":
-          description: No such subscription, no FT credential, or every identity barred. ft-server treats all as an unknown user.
+          description: |
+            No such subscription, a user name that is not an IMPI, no FT
+            credential, or every identity barred. ft-server treats all as an
+            unknown user.
         "503": { $ref: "#/components/responses/Unavailable" }
   /v1/service-profiles:
     post:
@@ -357,9 +360,11 @@ components:
       headers:
         WWW-Authenticate: { schema: { type: string, example: 'Bearer realm="hss"' } }
     Forbidden:
-      description: The token's caller may not use the operation, or acs asked for a subscription without acs_managed.
+      description: The token's caller may not use the operation.
     NotFound:
-      description: No such subscription or profile.
+      description: |
+        No such subscription or profile. acs gets the same answer for a
+        subscription without acs_managed.
     PreconditionFailed:
       description: If-Match does not match the stored version.
     RateLimited:

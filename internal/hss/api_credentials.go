@@ -2,11 +2,13 @@ package hss
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -92,9 +94,13 @@ type ftCredential struct {
 // first identity that is not barred. A subscription with none of those is
 // unknown to ft-server: 404 either way.
 func (a *API) getFTCredential(w http.ResponseWriter, r *http.Request, _ Scope) error {
-	impi, err := a.impi(r)
-	if err != nil {
-		return err
+	notFound := fail(http.StatusNotFound, "no FT credential")
+	// The path segment is a Digest user name an unauthenticated client
+	// chose; one that is not an IMPI is an unknown user, which the contract
+	// answers with 404. A 400 would reach ft-server as a backend failure.
+	impi := r.PathValue("impi")
+	if identity.ValidIMPI(impi) != nil {
+		return notFound
 	}
 	var alg digest.Algorithm
 	switch q := r.URL.Query()["algorithm"]; {
@@ -105,11 +111,13 @@ func (a *API) getFTCredential(w http.ResponseWriter, r *http.Request, _ Scope) e
 	default:
 		return fail(http.StatusBadRequest, "algorithm: one of MD5 and SHA-256 is required")
 	}
-	notFound := fail(http.StatusNotFound, "no FT credential")
 	if a.h.ftRealm == "" {
 		return notFound
 	}
 	s, err := a.h.store.Subscription(r.Context(), impi)
+	if errors.Is(err, store.ErrNotFound) {
+		return notFound
+	}
 	if err != nil {
 		return err
 	}

@@ -326,12 +326,20 @@ func (b *bucket) allow() bool {
 
 // managedByACS refuses acs access to a subscription the operator has not
 // handed to it (ADR 0007 §3). The admin token is not limited.
+//
+// acs gets the same answer for such a subscription as for one that does not
+// exist: a different one would let an acs token enumerate which IMSI-based
+// IMPIs the operator provisions outside acs.
 func managedByACS(caller Scope, s *store.Subscription) error {
 	if caller == ScopeACS && !s.ACSManaged {
-		return fail(http.StatusForbidden, "the subscription is not managed by acs")
+		return errNotFound
 	}
 	return nil
 }
+
+// errNotFound is the answer for a subscription or profile that does not
+// exist, and what classify gives store.ErrNotFound.
+var errNotFound = &apiError{http.StatusNotFound, "not found"}
 
 // writeError answers err. Errors the API has no specific answer for are
 // store and keyring failures: 503, so that callers retry (they are transient
@@ -353,7 +361,7 @@ func (a *API) writeError(w http.ResponseWriter, err error) {
 func (a *API) classify(err error) *apiError {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		return &apiError{http.StatusNotFound, "not found"}
+		return errNotFound
 	case errors.Is(err, store.ErrExists):
 		return &apiError{http.StatusConflict, "already exists"}
 	case errors.Is(err, store.ErrIdentityInUse):
