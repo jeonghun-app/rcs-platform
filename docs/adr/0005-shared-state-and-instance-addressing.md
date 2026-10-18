@@ -75,7 +75,11 @@ horizontal scaling without sticky load balancing.
 - HSS-initiated Cx requests (RTR, PPR) are sent by Destination-Realm to any
   connected `scscf` peer, not to the Origin-Host recorded at SAR time: that task
   may be gone, and every instance can act on any registration because the state
-  is in DynamoDB.
+  is in DynamoDB. Since `hss` only answers connections, it can send them
+  only over connections `scscf` opened to that `hss` task, so every `scscf` task
+  keeps a Cx connection to every `hss` task (every address of `hss.<namespace>`,
+  resolved again periodically); otherwise a change provisioned on a task no
+  `scscf` is connected to cannot be pushed.
 - The signed iFC-position parameter covers the Call-ID and an expiry (default
   32 s, Timer B/F) as well as served user, session case and next priority, so it
   cannot be replayed on another request or later.

@@ -38,7 +38,8 @@ can issue a new password but never read a stored credential.
 | 401 | no bearer token, or one that is not accepted (`WWW-Authenticate: Bearer`) |
 | 403 | the token's caller is not allowed the operation |
 | 404 | no such subscription; for `acs`, also a subscription without `acs_managed`, with the same body, so an `acs` token cannot tell which IMPIs exist outside its scope; for `ft-server`, also a user name that is not an IMPI, or no FT credential |
-| 429 | an `acs` token is over `HSS_ACS_RATE` requests per second (burst `HSS_ACS_BURST`), with `Retry-After` |
+| 429 | an `acs` token is over `HSS_ACS_RATE` requests per second (burst `HSS_ACS_BURST`), with `Retry-After`. The bucket is per token slot and per task, so one caller gets at most rate × tasks × 2 |
+| 500 | the stored subscription cannot be used (corrupt record, a secret that does not open); retrying does not help |
 
 ## Tokens
 
