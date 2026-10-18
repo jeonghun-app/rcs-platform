@@ -31,7 +31,10 @@ func (m *Memory) Create(_ context.Context, b Binding) error {
 	b.ExpiresAt = b.ExpiresAt.Truncate(Precision)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.bindings[b.ID]; ok {
+	if old, ok := m.bindings[b.ID]; ok {
+		if old.CoreLocal == b.CoreLocal && old.ClaimedBy == "" {
+			return nil
+		}
 		return fmt.Errorf("store: create: %w", ErrExists)
 	}
 	m.bindings[b.ID] = b
@@ -95,6 +98,8 @@ func (m *Memory) Claim(_ context.Context, id, by string, now time.Time) (Binding
 	switch {
 	case !ok:
 		return Binding{}, fmt.Errorf("store: claim: %w", ErrNotFound)
+	case b.ClaimedBy == by:
+		return b, nil
 	case b.ClaimedBy != "":
 		return Binding{}, fmt.Errorf("store: claim: %w", ErrClaimed)
 	case !b.Complete():

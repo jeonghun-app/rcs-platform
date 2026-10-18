@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,8 +37,10 @@ type controlOptions struct {
 	// Public is the client-facing authority; CoreHost the core-side address.
 	Public   msrp.URI
 	CoreHost netip.Addr
-	// CoreNetworks and Namespace say which core_path hosts are allowed.
+	// CoreNetworks, Namespace and CorePorts say which core_path hosts and
+	// ports are allowed.
 	CoreNetworks []netip.Prefix
+	CorePorts    []uint16
 	Namespace    string
 	MaxExpiresIn time.Duration
 	Tokens       []string
@@ -271,6 +274,21 @@ func (c *control) decode(w http.ResponseWriter, r *http.Request) (bindingRequest
 		c.invalid(w, "the body holds more than one JSON value")
 		return req, false
 	}
+	// encoding/json matches field names regardless of case; the API's
+	// names are exact (docs/api/msrp-relay.yaml).
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.invalid(w, "the body is not a binding request: malformed JSON")
+		return req, false
+	}
+	for name := range fields {
+		switch name {
+		case "core_path", "client_endpoint_path", "expires_in":
+		default:
+			c.invalid(w, "the body is not a binding request: unknown field "+strconv.Quote(name))
+			return req, false
+		}
+	}
 	return req, true
 }
 
@@ -332,6 +350,10 @@ func onePath(path []string) (msrp.URI, string) {
 	if err != nil {
 		return msrp.URI{}, "not an MSRP URI"
 	}
+	// The relay speaks MSRP over TCP only (TLS on TCP included, §6).
+	if !strings.EqualFold(u.Transport, "tcp") {
+		return msrp.URI{}, "the transport must be tcp"
+	}
 	if u.SessionID == "" || u.Port == 0 {
 		return msrp.URI{}, "the URI needs a port and a session id (RFC 4975 §8.2)"
 	}
@@ -340,8 +362,9 @@ func onePath(path []string) (msrp.URI, string) {
 
 // corePath checks rcs-as's path. The relay will connect to its host, so a
 // pcscf that is compromised, or that copies a path it should not, must not
-// be able to make the relay connect anywhere but a private address in the
-// VPC (ADR 0007 §5); the dialer checks again after name resolution.
+// be able to make the relay connect anywhere but rcs-as's port on a private
+// address in the VPC (ADR 0007 §5); the dialer checks again after name
+// resolution.
 func (c *control) corePath(path []string) (string, string) {
 	u, problem := onePath(path)
 	if problem != "" {
@@ -349,6 +372,9 @@ func (c *control) corePath(path []string) (string, string) {
 	}
 	if u.Secure {
 		return "", "msrps toward rcs-as is not supported (ADR 0007)"
+	}
+	if !slices.Contains(c.o.CorePorts, uint16(u.Port)) {
+		return "", "the port is not in RELAY_CORE_PORTS"
 	}
 	if a, err := netip.ParseAddr(u.Host); err == nil {
 		if !inNetworks(a, c.o.CoreNetworks) {

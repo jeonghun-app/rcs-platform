@@ -14,9 +14,11 @@
 // in this package refer to that document. Only version 2, the binary form
 // the NLB sends, is accepted.
 //
-// internal/sip/transport has a parser of its own in review (#35); this
-// package exists so msrp-relay does not depend on the SIP stack, and the two
-// can be merged once both are on main.
+// This is the platform's one PROXY parser: msrp-relay uses it, and the SIP
+// transport (#35) is to use it rather than a copy of its own. Its rules are
+// strict on purpose and must stay so: no fallback to the socket address for
+// UNSPEC, UDP or UNIX headers, no unusable source address, a bounded
+// payload.
 package proxyproto
 
 import (

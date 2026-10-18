@@ -53,6 +53,20 @@ func TestTimingIsInMilliseconds(t *testing.T) {
 	}
 }
 
+func TestBytesCarryTheBytesUnit(t *testing.T) {
+	var buf bytes.Buffer
+	m := NewMetrics(&buf, "RCS", "msrp-relay", func() time.Time { return epoch }, discardLogger())
+	m.Bytes("BytesToClients", 4096)
+	rec := records(t, buf.String())[0]
+	if rec["BytesToClients"] != 4096.0 {
+		t.Fatalf("value = %v", rec["BytesToClients"])
+	}
+	unit := rec["_aws"].(map[string]any)["CloudWatchMetrics"].([]any)[0].(map[string]any)["Metrics"].([]any)[0].(map[string]any)["Unit"]
+	if unit != "Bytes" {
+		t.Fatalf("unit = %v", unit)
+	}
+}
+
 func TestInvalidMetricNamesAreDroppedAndReportedOnce(t *testing.T) {
 	var out, logs bytes.Buffer
 	log := NewLogger(&logs, "pcscf", "dev", slog.LevelInfo)

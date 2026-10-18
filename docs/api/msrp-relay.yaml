@@ -29,6 +29,7 @@ info:
     API. With no token configured (dev and test only; staging and prod refuse
     to start) every call gets 503.
 
+    Request field names are case-sensitive, and unknown fields are refused.
     Every answer is JSON and carries `Cache-Control: no-store`. Errors are
     `{"error": "<reason>"}`; the reason never repeats the request.
 
@@ -201,9 +202,9 @@ components:
     Path:
       type: array
       description: |
-        An `a=path` as a list of MSRP URIs (RFC 4975 §8.2), each with a port
-        and a session id. Exactly one URI: RFC 4976 relays on either side are
-        not supported.
+        An `a=path` as a list of MSRP URIs (RFC 4975 §8.2), each with a port,
+        a session id and transport `tcp`. Exactly one URI: RFC 4976 relays on
+        either side are not supported.
       minItems: 1
       maxItems: 1
       items:
@@ -214,10 +215,11 @@ components:
         - $ref: "#/components/schemas/Path"
       description: |
         rcs-as's `a=path`. The relay connects to its host, so it must be
-        `msrp:` (no TLS inside the VPC, ADR 0007) and the host an address in
+        `msrp:` (no TLS inside the VPC, ADR 0007), the host an address in
         `RELAY_CORE_NETWORKS` (RFC 1918 and ULA by default) or a name in
-        `RCS_SERVICE_NAMESPACE`; the relay checks the resolved address again
-        when it connects.
+        `RCS_SERVICE_NAMESPACE`, and the port one of `RELAY_CORE_PORTS`
+        (2855 by default); the relay checks the resolved address and the port
+        again when it connects.
     ClientEndpointPath:
       allOf:
         - $ref: "#/components/schemas/Path"

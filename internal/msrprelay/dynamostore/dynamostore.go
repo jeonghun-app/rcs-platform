@@ -144,13 +144,20 @@ func (s *Store) Create(ctx context.Context, b store.Binding) error {
 		item[attrClientPath] = str(b.ClientEndpointPath)
 	}
 	_, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName:                aws.String(s.table),
-		Item:                     item,
-		ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
-		ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+		TableName:                           aws.String(s.table),
+		Item:                                item,
+		ConditionExpression:                 aws.String("attribute_not_exists(#pk)"),
+		ExpressionAttributeNames:            map[string]string{"#pk": attrPK},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 	})
 	var failed *types.ConditionalCheckFailedException
 	if errors.As(err, &failed) {
+		// The SDK retries a write whose answer was lost; finding our own
+		// item (its core_local carries a random session id) means the first
+		// attempt landed.
+		if old, err := decode(failed.Item); err == nil && old.CoreLocal == b.CoreLocal && old.ClaimedBy == "" {
+			return nil
+		}
 		return fmt.Errorf("dynamostore: create: %w", store.ErrExists)
 	}
 	if err != nil {
@@ -265,6 +272,9 @@ func (s *Store) Claim(ctx context.Context, id, by string, now time.Time) (store.
 		switch {
 		case err != nil:
 			return store.Binding{}, err
+		case b.ClaimedBy == by:
+			// An SDK retry of a claim that had landed: ours already.
+			return b, nil
 		case b.ClaimedBy != "":
 			return store.Binding{}, fmt.Errorf("dynamostore: claim: %w", store.ErrClaimed)
 		}

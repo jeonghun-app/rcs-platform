@@ -27,7 +27,13 @@ const (
 	mBytesToClients    = "BytesToClients"
 	mHealthChecks      = "ProxyHealthChecks"
 	mIdleClosed        = "ClientsClosedIdle"
-	mStoreErrors       = "StoreErrors"
+	// mUnboundClosed counts client connections closed for naming no
+	// session within FirstBindTimeout.
+	mUnboundClosed = "ClientsClosedUnbound"
+	mStoreErrors   = "StoreErrors"
+	// mBudgetUntracked counts lookups let through because the lookup
+	// budget's table was full (see lookupBudget.take).
+	mBudgetUntracked = "LookupBudgetUntracked"
 	// mRefusedPrefix starts a refusal by the relay itself: "Refused." and a
 	// reason* constant.
 	mRefusedPrefix = "Refused."
@@ -45,6 +51,11 @@ const (
 	reasonProxyHeader     = "ProxyHeader"
 	reasonBindOverload    = "BindOverload"
 	reasonUnknownSession  = "UnknownSession"
+	// reasonEndedSession: the connection names a session whose bridge on
+	// this same connection has ended; not a second connection.
+	reasonEndedSession = "EndedSession"
+	// reasonSourceBudget: the source has used up its lookup budget.
+	reasonSourceBudget    = "SourceLookupBudget"
 	reasonIncomplete      = "IncompleteBinding"
 	reasonClaimed         = "AlreadyClaimed"
 	reasonCoreUnreachable = "CoreUnreachable"
@@ -52,7 +63,9 @@ const (
 	reasonUnauthorized    = "ControlUnauthorized"
 	reasonForbidden       = "ControlForbidden"
 	reasonInvalid         = "ControlInvalid"
-	reasonDraining        = "Draining"
+	// reasonDraining: refused because the task is stopping, so that the
+	// noise of a rolling update stays out of the capacity and store counts.
+	reasonDraining = "Draining"
 )
 
 // counters accumulates counts between flushes, so a busy relay writes a
@@ -85,11 +98,12 @@ func (m *counters) flush(out *runtime.Metrics) {
 	counts := m.counts
 	m.counts = map[string]int64{}
 	m.mu.Unlock()
+	// Bytes go out with the Bytes unit, so CloudWatch can scale them.
 	if n := m.bytesIn.Swap(0); n > 0 {
-		counts[mBytesFromClients] += n
+		out.Bytes(mBytesFromClients, n)
 	}
 	if n := m.bytesOut.Swap(0); n > 0 {
-		counts[mBytesToClients] += n
+		out.Bytes(mBytesToClients, n)
 	}
 	names := make([]string, 0, len(counts))
 	for name := range counts {

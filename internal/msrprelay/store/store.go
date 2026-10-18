@@ -81,7 +81,9 @@ type Update struct {
 // caller passes so that tests control time.
 type Store interface {
 	// Create stores b, which must not be claimed. ErrExists if the id is
-	// taken, even by an expired binding the TTL has not removed yet.
+	// taken, even by an expired binding the TTL has not removed yet, unless
+	// by b itself (same CoreLocal, whose session id is random): a request
+	// retried after its write landed succeeds.
 	Create(ctx context.Context, b Binding) error
 	// Get reads the binding with a strongly consistent read: a client may
 	// connect milliseconds after another task wrote it (ADR 0004).
@@ -92,7 +94,9 @@ type Store interface {
 	Update(ctx context.Context, id string, u Update, now time.Time) (Binding, error)
 	// Claim records by as the claimant and returns the binding. It fails
 	// with ErrNotFound, ErrClaimed or ErrIncomplete, checked in that order,
-	// and only one Claim of a binding ever succeeds.
+	// and only one claimant ever succeeds. A Claim by the claimant already
+	// recorded succeeds again, so a request retried after its write landed
+	// (an SDK retry after a lost answer) is not taken for a rival.
 	Claim(ctx context.Context, id, by string, now time.Time) (Binding, error)
 	// Delete removes the binding. ErrNotFound if there was none, or only an
 	// expired one (which is removed all the same).

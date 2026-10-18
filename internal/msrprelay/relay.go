@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -20,10 +21,10 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/proxyproto"
 )
 
-// proxyHeaderTimeout bounds the wait for a PROXY header. The NLB writes it
-// with the connection, so only a client that skipped the NLB, or one that
-// opened a connection and went quiet, takes this long.
-const proxyHeaderTimeout = 5 * time.Second
+// defaultProxyHeaderTimeout bounds the wait for a PROXY header. The NLB
+// writes it with the connection, so only a client that skipped the NLB, or
+// one that opened a connection and went quiet, takes this long.
+const defaultProxyHeaderTimeout = 5 * time.Second
 
 // expiryRetry is how soon a bridge's binding is looked at again when the
 // store could not be read: a DynamoDB hiccup must not cut a running chat.
@@ -41,9 +42,21 @@ type relayOptions struct {
 	MaxConnections          int
 	MaxConnectionsPerSource int
 	MaxConcurrentBinds      int
-	PathWait                time.Duration
-	CoreConnectTimeout      time.Duration
-	IdleTimeout             time.Duration
+	// FailedLookupsPerSource is the per-source lookup budget (see
+	// lookupBudget), per minute.
+	FailedLookupsPerSource int
+	PathWait               time.Duration
+	CoreConnectTimeout     time.Duration
+	IdleTimeout            time.Duration
+	// ProxyHeaderTimeout is the real-time wait for a PROXY header; zero
+	// means defaultProxyHeaderTimeout.
+	ProxyHeaderTimeout time.Duration
+	// FirstBindTimeout is how long a client connection may go without
+	// naming a session the first time; zero means
+	// msrp.DefaultUnboundTimeout. Once it has carried a bridge, a connection
+	// left with none stays for IdleTimeout instead, so the client can reuse
+	// it (RFC 4975 §5.4) for its next session.
+	FirstBindTimeout time.Duration
 
 	// Edge configures client connections and Core the connections toward
 	// rcs-as; Clock, Rand and OnEvent are filled in by newRelay.
@@ -68,6 +81,7 @@ type Relay struct {
 	instance string
 	pool     *msrp.Pool
 	binds    chan struct{}
+	budget   *lookupBudget
 	// ctx ends store calls and core connection attempts when the relay
 	// closes.
 	ctx    context.Context
@@ -105,6 +119,18 @@ func newRelay(o relayOptions) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
+	if o.ProxyHeaderTimeout <= 0 {
+		o.ProxyHeaderTimeout = defaultProxyHeaderTimeout
+	}
+	if o.FirstBindTimeout <= 0 {
+		o.FirstBindTimeout = msrp.DefaultUnboundTimeout
+	}
+	// internal/msrp's unbound timer runs whenever a connection carries no
+	// session: from the start, and again when its last session ends. The
+	// first case is FirstBindTimeout's (see handle); for the second, which
+	// is a client whose bridge ended from the core side, the connection is
+	// kept like any other quiet one.
+	o.Edge.UnboundTimeout = o.IdleTimeout
 	o.Edge.Clock, o.Edge.Rand, o.Edge.OnEvent = o.Clock, o.Rand, o.Metrics.onEvent(mClientPrefix)
 	o.Core.Clock, o.Core.Rand, o.Core.OnEvent = o.Clock, o.Rand, o.Metrics.onEvent(mCorePrefix)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,6 +138,7 @@ func newRelay(o relayOptions) (*Relay, error) {
 		o:        o,
 		instance: instance,
 		binds:    make(chan struct{}, o.MaxConcurrentBinds),
+		budget:   newLookupBudget(o.Clock, o.FailedLookupsPerSource),
 		ctx:      ctx,
 		cancel:   cancel,
 		sources:  map[netip.Prefix]int{},
@@ -134,16 +161,16 @@ func (r *Relay) dialCore(ctx context.Context, to msrp.URI) (net.Conn, error) {
 	return r.o.Dial(ctx, "tcp", addr)
 }
 
-// coreDialer returns a dialer that connects only to addresses in networks,
-// checked on the resolved address, so a name in the namespace cannot be made
-// to point the relay elsewhere. Kernel keep-alive stays on: this side is not
+// coreDialer returns a dialer that connects only to addresses in networks
+// and to ports in ports, checked on the resolved address, so a name in the
+// namespace cannot be made to point the relay elsewhere. Kernel keep-alive stays on: this side is not
 // client-facing (ADR 0003).
-func coreDialer(networks []netip.Prefix, timeout time.Duration) func(ctx context.Context, network, address string) (net.Conn, error) {
+func coreDialer(networks []netip.Prefix, ports []uint16, timeout time.Duration) func(ctx context.Context, network, address string) (net.Conn, error) {
 	d := &net.Dialer{
 		Timeout: timeout,
 		Control: func(_, address string, _ syscall.RawConn) error {
 			ap, err := netip.ParseAddrPort(address)
-			if err != nil || !inNetworks(ap.Addr(), networks) {
+			if err != nil || !inNetworks(ap.Addr(), networks) || !slices.Contains(ports, ap.Port()) {
 				return errCoreNotAllowed
 			}
 			return nil
@@ -152,7 +179,7 @@ func coreDialer(networks []netip.Prefix, timeout time.Duration) func(ctx context
 	return d.DialContext
 }
 
-var errCoreNotAllowed = errors.New("msrprelay: core address outside RELAY_CORE_NETWORKS")
+var errCoreNotAllowed = errors.New("msrprelay: core address outside RELAY_CORE_NETWORKS or RELAY_CORE_PORTS")
 
 // Serve accepts client connections on ln until ln fails or the relay
 // drains. Kernel TCP keep-alive must be off on ln (ADR 0003); listen does
@@ -184,8 +211,8 @@ func (r *Relay) Serve(ln net.Listener) error {
 			continue
 		}
 		delay = 0
-		if !r.admit(nc) {
-			r.o.Metrics.refuse(reasonConnectionLimit)
+		if reason := r.admit(nc); reason != "" {
+			r.o.Metrics.refuse(reason)
 			_ = nc.Close()
 			continue
 		}
@@ -200,15 +227,21 @@ func (r *Relay) isDraining() bool {
 	return r.draining
 }
 
-func (r *Relay) admit(nc net.Conn) bool {
+// admit counts nc in, or returns the reason it is refused. A connection
+// accepted just as the drain began is not a capacity problem, so it is
+// counted apart.
+func (r *Relay) admit(nc net.Conn) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.draining || r.admitted >= r.o.MaxConnections {
-		return false
+	switch {
+	case r.draining:
+		return reasonDraining
+	case r.admitted >= r.o.MaxConnections:
+		return reasonConnectionLimit
 	}
 	r.admitted++
 	r.conns[nc] = struct{}{}
-	return true
+	return ""
 }
 
 func (r *Relay) leave(nc net.Conn) {
@@ -242,10 +275,20 @@ func (r *Relay) handle(nc net.Conn) {
 	// The id names the connection in claimed_by, so a claim says which
 	// task and connection hold the binding.
 	id := r.instance + "/" + strconv.FormatUint(r.nextConnID(), 10)
-	c, err := msrp.NewPassiveConn(mc, &binder{r: r, connID: id}, r.o.Edge)
+	b := &binder{r: r, connID: id, source: key}
+	c, err := msrp.NewPassiveConn(mc, b, r.o.Edge)
 	if err != nil {
 		return
 	}
+	// The active side sends its first SEND at once (RFC 4975 §5.4); a
+	// connection that has named no session by now is not going to.
+	first := r.o.Clock.AfterFunc(r.o.FirstBindTimeout, func() {
+		if !b.everBound.Load() {
+			r.o.Metrics.add(mUnboundClosed, 1)
+			_ = c.Close()
+		}
+	})
+	defer first.Stop()
 	r.o.Metrics.conns.Add(1)
 	<-c.Done()
 	r.o.Metrics.conns.Add(-1)
@@ -266,7 +309,7 @@ func (r *Relay) source(nc net.Conn) (netip.Addr, bool) {
 		}
 		return ap.Addr().Unmap(), true
 	}
-	_ = nc.SetReadDeadline(time.Now().Add(proxyHeaderTimeout))
+	_ = nc.SetReadDeadline(time.Now().Add(r.o.ProxyHeaderTimeout))
 	h, err := proxyproto.Read(nc)
 	_ = nc.SetReadDeadline(time.Time{})
 	switch {
@@ -323,43 +366,85 @@ func (r *Relay) nextConnID() uint64 {
 type binder struct {
 	r      *Relay
 	connID string
+	source netip.Prefix
+	// bridges counts the live bridges on this connection; see refuseHard.
+	// everBound is set by the first bridge.
+	bridges   atomic.Int64
+	everBound atomic.Bool
 }
 
-// errOverload ends a connection whose bind found no lookup slot.
-var errOverload = errors.New("msrprelay: too many binds in flight")
+// errOverload and errBudget end a connection whose bind found no lookup
+// slot, or whose source has used up its lookup budget.
+var (
+	errOverload = errors.New("msrprelay: too many binds in flight")
+	errBudget   = errors.New("msrprelay: source has used up its lookup budget")
+)
+
+// bindSlotWait is how long a bind waits for a lookup slot. It absorbs a
+// burst of clients arriving together; a store slow enough to keep every
+// slot busy for longer is an outage, and waiting longer would only hold
+// more client goroutines.
+const bindSlotWait = 250 * time.Millisecond
 
 // Bind implements msrp.Binder. It runs on the client connection's reading
-// goroutine, so a slow lookup holds up that client alone; the number of
-// lookups in flight is bounded all the same, since each is a store call.
+// goroutine, so a slow lookup holds up that client alone. What every client
+// shares is bounded: store calls in flight (the bind slots, held for the
+// lookup and the claim only) and, per source, lookups that find nothing.
 func (b *binder) Bind(c *msrp.Conn, to msrp.URI) (*msrp.Session, error) {
 	r := b.r
 	local := r.o.Public
 	local.SessionID = to.SessionID
-	if to.SessionID == "" || !local.Equal(to) {
+	// A session id this relay did not issue cannot name a binding, so it
+	// is refused before it can cost a store read or a bind slot.
+	if !issuedSessionID(to.SessionID) || !local.Equal(to) {
 		r.o.Metrics.refuse(reasonUnknownSession)
 		return nil, msrp.ErrNoSession
 	}
-	select {
-	case r.binds <- struct{}{}:
-	default:
-		// MSRP has no "try later" (RFC 4975 §10): every code refuses the
-		// session for good. Closing the connection instead looks like any
-		// transport failure, which the client recovers from with a new
-		// INVITE, as it would if the task had gone.
-		r.o.Metrics.refuse(reasonBindOverload)
-		_ = c.Close()
-		return nil, errOverload
+	switch ok, tracked := r.budget.take(b.source); {
+	case !ok:
+		r.o.Metrics.refuse(reasonSourceBudget)
+		return nil, b.refuseHard(c, errBudget)
+	case !tracked:
+		r.o.Metrics.add(mBudgetUntracked, 1)
 	}
-	defer func() { <-r.binds }()
+	charged := true
+	defer func() {
+		if !charged {
+			r.budget.refund(b.source)
+		}
+	}()
+	if !r.acquire() {
+		charged = false
+		if r.ctx.Err() != nil {
+			r.o.Metrics.refuse(reasonDraining)
+		} else {
+			r.o.Metrics.refuse(reasonBindOverload)
+		}
+		return nil, b.refuseHard(c, errOverload)
+	}
 
 	id := BindingID(to.SessionID)
 	bnd, err := r.awaitComplete(id)
+	if err == nil && bnd.ClaimedBy == b.connID {
+		// This connection held the binding and its bridge has ended, most
+		// likely from the core side; the client, which cannot know, names
+		// the session again. Not a second connection: the session is over.
+		r.release()
+		charged = false
+		r.o.Metrics.refuse(reasonEndedSession)
+		return nil, msrp.ErrNoSession
+	}
 	if err == nil {
 		bnd, err = r.claim(id, b.connID)
 	}
+	// The slot covers the store calls only: connecting to rcs-as happens
+	// outside it, so one unreachable rcs-as cannot use up every slot.
+	r.release()
 	if err != nil {
-		return nil, r.refuseBind(c, id, err)
+		charged = errors.Is(err, store.ErrNotFound)
+		return nil, b.refuseBind(c, id, err)
 	}
+	charged = false
 	r.o.Metrics.add(mBindingsClaimed, 1)
 
 	edge, core, err := sessions(local, bnd)
@@ -376,12 +461,70 @@ func (b *binder) Bind(c *msrp.Conn, to msrp.URI) (*msrp.Session, error) {
 	cancel()
 	if err != nil {
 		_ = edge.Close()
+		if r.ctx.Err() != nil {
+			r.o.Metrics.refuse(reasonDraining)
+			return nil, msrp.ErrNoSession
+		}
 		r.o.Metrics.refuse(reasonCoreUnreachable)
 		r.o.Log.Warn("could not open the session toward rcs-as", slog.String("binding", id), slog.String("error", pii.Redact(err.Error())))
 		return nil, msrp.ErrNoSession
 	}
-	r.startBridge(id, b.connID, edge, bnd.ExpiresAt)
+	r.startBridge(b, id, edge, bnd.ExpiresAt)
 	return edge, nil
+}
+
+// issuedSessionID reports whether s has the form msrp.NewSessionID gives:
+// 32 characters of lower-case base32.
+func issuedSessionID(s string) bool {
+	if len(s) != issuedSessionIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !('a' <= c && c <= 'z' || '2' <= c && c <= '7') {
+			return false
+		}
+	}
+	return true
+}
+
+// issuedSessionIDLen is the length of a 160-bit msrp.NewSessionID.
+const issuedSessionIDLen = 32
+
+// acquire takes a bind slot, waiting up to bindSlotWait for one.
+func (r *Relay) acquire() bool {
+	select {
+	case r.binds <- struct{}{}:
+		return true
+	default:
+	}
+	expired := make(chan struct{})
+	t := r.o.Clock.AfterFunc(bindSlotWait, func() { close(expired) })
+	defer t.Stop()
+	select {
+	case r.binds <- struct{}{}:
+		return true
+	case <-expired:
+	case <-r.ctx.Done():
+	}
+	return false
+}
+
+func (r *Relay) release() { <-r.binds }
+
+// refuseHard refuses a bind for a reason that says nothing about the
+// session itself: overload, an exhausted budget, a store failure. MSRP has
+// no "try later" (RFC 4975 §10), and every code ends the session for good,
+// so on a connection that carries no bridge the connection is closed
+// instead: that looks like any transport failure, which the client
+// recovers from with a new INVITE, as it would if the task had gone. A
+// connection that already carries bridges is kept for their sake (§5.4
+// connection reuse), and only the new session is refused, with 481.
+func (b *binder) refuseHard(c *msrp.Conn, err error) error {
+	if b.bridges.Load() > 0 {
+		return msrp.ErrNoSession
+	}
+	_ = c.Close()
+	return err
 }
 
 // awaitComplete reads the binding until both paths are known or PathWait
@@ -432,7 +575,8 @@ func (r *Relay) claim(id, by string) (store.Binding, error) {
 }
 
 // refuseBind answers a bind the store refused or could not serve.
-func (r *Relay) refuseBind(c *msrp.Conn, id string, err error) error {
+func (b *binder) refuseBind(c *msrp.Conn, id string, err error) error {
+	r := b.r
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		r.o.Metrics.refuse(reasonUnknownSession)
@@ -447,15 +591,15 @@ func (r *Relay) refuseBind(c *msrp.Conn, id string, err error) error {
 		r.o.Metrics.refuse(reasonClaimed)
 		r.o.Log.Warn("refused a second connection for a claimed binding", slog.String("binding", id))
 		return &msrp.StatusError{Code: msrp.StatusForbidden, Comment: msrp.StatusText(msrp.StatusForbidden)}
+	case r.ctx.Err() != nil:
+		// The relay is closing; a lookup it cut short is not a store fault.
+		r.o.Metrics.refuse(reasonDraining)
+		return b.refuseHard(c, err)
 	}
-	// The binding may well exist; refusing it with 481 would end the
-	// session for good. A closed connection is what an unreachable relay
-	// looks like, and the client recovers from it the same way.
 	r.o.Metrics.refuse(reasonStore)
 	r.o.Metrics.add(mStoreErrors, 1)
 	r.o.Log.Warn("binding lookup failed", slog.String("binding", id), slog.String("error", pii.Redact(err.Error())))
-	_ = c.Close()
-	return err
+	return b.refuseHard(c, err)
 }
 
 // sessions builds the two sides of a bridge: edge toward the client, named
@@ -485,9 +629,11 @@ func sessions(local msrp.URI, b store.Binding) (edge, core *msrp.Session, err er
 // startBridge tracks a bridge until its client side ends, and checks the
 // binding again whenever its expiry comes: pcscf extends it on every session
 // refresh, and one it let lapse or released ends the bridge.
-func (r *Relay) startBridge(id, claimant string, edge *msrp.Session, expires time.Time) {
-	br := &bridge{binding: id, claimant: claimant, edge: edge}
+func (r *Relay) startBridge(b *binder, id string, edge *msrp.Session, expires time.Time) {
+	br := &bridge{binding: id, claimant: b.connID, edge: edge}
 	r.o.Metrics.bridges.Add(1)
+	b.bridges.Add(1)
+	b.everBound.Store(true)
 	br.arm(r, expires.Sub(r.o.Clock.Now()))
 	go func() {
 		<-edge.Done()
@@ -497,6 +643,7 @@ func (r *Relay) startBridge(id, claimant string, edge *msrp.Session, expires tim
 			br.timer.Stop()
 		}
 		br.mu.Unlock()
+		b.bridges.Add(-1)
 		r.o.Metrics.bridges.Add(-1)
 	}()
 }
@@ -531,7 +678,10 @@ func (r *Relay) checkExpiry(br *bridge) {
 // Drain stops accepting, gives the client connections until timeout (on the
 // relay's clock) or the end of ctx to finish, and then closes the rest:
 // their clients reconnect through a new INVITE, which pcscf anchors on
-// another task (ADR 0003).
+// another task (ADR 0003). Connections still open halfway through are
+// closed one by one over the second half, so their clients do not all
+// come back at the same moment, which would turn a rolling update into a
+// burst of control calls and claims (ADR 0003 asks the same of pcscf).
 func (r *Relay) Drain(ctx context.Context, timeout time.Duration) {
 	r.mu.Lock()
 	r.draining = true
@@ -547,16 +697,50 @@ func (r *Relay) Drain(ctx context.Context, timeout time.Duration) {
 		_ = ln.Close()
 	}
 	if drained != nil {
-		expired := make(chan struct{})
-		t := r.o.Clock.AfterFunc(timeout, func() { close(expired) })
-		select {
-		case <-drained:
-		case <-expired:
-		case <-ctx.Done():
-		}
-		t.Stop()
+		r.spreadCloses(ctx, drained, timeout)
 	}
 	r.Close()
+}
+
+// spreadCloses waits for the first half of the drain, then closes the
+// connections left one at a time at even steps over the second half. It
+// returns when they are all gone, the time is up, or ctx ends.
+func (r *Relay) spreadCloses(ctx context.Context, drained <-chan struct{}, timeout time.Duration) {
+	half := timeout / 2
+	if !r.wait(ctx, drained, half) {
+		return
+	}
+	r.mu.Lock()
+	conns := make([]net.Conn, 0, len(r.conns))
+	for nc := range r.conns {
+		conns = append(conns, nc)
+	}
+	r.mu.Unlock()
+	if len(conns) == 0 {
+		return
+	}
+	step := (timeout - half) / time.Duration(len(conns))
+	for i, nc := range conns {
+		_ = nc.Close()
+		if i < len(conns)-1 && !r.wait(ctx, drained, step) {
+			return
+		}
+	}
+}
+
+// wait sleeps d on the relay's clock, reporting false if drained closed or
+// ctx ended first.
+func (r *Relay) wait(ctx context.Context, drained <-chan struct{}, d time.Duration) bool {
+	expired := make(chan struct{})
+	t := r.o.Clock.AfterFunc(d, func() { close(expired) })
+	defer t.Stop()
+	select {
+	case <-expired:
+		return true
+	case <-drained:
+	case <-ctx.Done():
+	}
+	return false
 }
 
 // Close closes every connection at once and waits for their goroutines.
@@ -584,8 +768,14 @@ func (r *Relay) Close() {
 }
 
 // meteredConn counts what crosses a client connection and closes it after
-// IdleTimeout without a byte from the client (ADR 0003). The deadline is
-// real time: the operating system enforces it.
+// IdleTimeout without a byte in either direction (ADR 0003). Traffic toward
+// the client counts too: rcs-as may send with Failure-Report no or partial,
+// which the client does not answer (RFC 4975 §7.1.2), and the relay
+// forwards that header as it is, so a client that only receives would
+// otherwise be cut while chatting. A dead client is still caught, by the
+// write timeout and the unanswered keep-alive. The NLB's idle timer works
+// the same way. The deadline is real time: the operating system enforces
+// it.
 type meteredConn struct {
 	net.Conn
 	idle    time.Duration
@@ -613,5 +803,9 @@ func (c *meteredConn) Read(p []byte) (int, error) {
 func (c *meteredConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	c.out.Add(int64(n))
+	if n > 0 && c.idle > 0 {
+		// A deadline set while a Read waits applies to that Read.
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	}
 	return n, err
 }

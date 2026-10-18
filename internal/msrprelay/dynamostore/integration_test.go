@@ -44,12 +44,12 @@ func TestIntegrationDynamoDBMeetsTheContract(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("creating the table: %v", err)
 	}
-	if _, err := ddb.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
-		TableName:               aws.String(table),
-		TimeToLiveSpecification: &types.TimeToLiveSpecification{AttributeName: aws.String(TTLAttribute), Enabled: aws.Bool(true)},
-	}); err != nil {
-		t.Fatalf("enabling TTL: %v", err)
-	}
+	// TTL stays off here. The contract runs at storetest.Start, in the past,
+	// so every item's ttl is already due, and DynamoDB Local really deletes
+	// such items, at a moment of its choosing. That made the contract flaky.
+	// TTL deletion is no part of the contract (expiry is checked on every
+	// access), and the TTL setting itself belongs to the infrastructure's
+	// checks.
 	s, err := New(ctx, table, endpoint)
 	if err != nil {
 		t.Fatal(err)

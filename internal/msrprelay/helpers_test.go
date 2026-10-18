@@ -266,16 +266,20 @@ type rig struct {
 
 type rigOption func(*relayOptions)
 
+// corePorts are ports the rig allows toward the core besides the fake
+// rcs-as's own (RELAY_CORE_PORTS).
+type extraCorePorts []uint16
+
 func withProxyProtocol(o *relayOptions) { o.ProxyProtocol = true }
 
-func newRig(t *testing.T, tasks int, opts ...rigOption) *rig {
+func newRig(t *testing.T, tasks int, opts ...any) *rig {
 	t.Helper()
 	return newRigWithStore(t, tasks, store.NewMemory(), opts...)
 }
 
 // newRigWithStore is newRig over st, which every task and the control API
 // share.
-func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...rigOption) *rig {
+func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig {
 	t.Helper()
 	r := &rig{t: t, clock: newFakeClock(), store: st, metrics: newCounters(), logs: &bytes.Buffer{}, logMu: &sync.Mutex{}}
 	r.as = newFakeAS(t, r.clock)
@@ -283,20 +287,35 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...rigOption)
 	public := msrp.URI{Secure: true, Host: publicHost, Port: DefaultPublicPort, Transport: "tcp"}
 	rnd := &sequence{}
 	loopback := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+	ports := []uint16{r.as.addr.Port()}
+	for _, opt := range opts {
+		switch opt := opt.(type) {
+		case extraCorePorts:
+			ports = append(ports, opt...)
+		case rigOption, func(*relayOptions):
+		default:
+			t.Fatalf("unknown rig option %T", opt)
+		}
+	}
 	r.control = newControl(controlOptions{
 		Store: r.store, StoreTimeout: time.Second, Public: public, CoreHost: coreHostAddr,
-		CoreNetworks: loopback, MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken},
+		CoreNetworks: loopback, CorePorts: ports, MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken},
 		Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
 	})
 	for range tasks {
 		o := relayOptions{
 			Store: r.store, StoreTimeout: time.Second, Public: public,
-			MaxConnections: 100, MaxConnectionsPerSource: 100, MaxConcurrentBinds: 8,
+			MaxConnections: 100, MaxConnectionsPerSource: 100, MaxConcurrentBinds: 8, FailedLookupsPerSource: 100,
 			PathWait: DefaultPathWait, CoreConnectTimeout: 5 * time.Second, IdleTimeout: time.Minute,
-			Dial: coreDialer(loopback, 5*time.Second), Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
+			Dial: coreDialer(loopback, ports, 5*time.Second), Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
 		}
 		for _, opt := range opts {
-			opt(&o)
+			switch f := opt.(type) {
+			case rigOption:
+				f(&o)
+			case func(*relayOptions):
+				f(&o)
+			}
 		}
 		relay, err := newRelay(o)
 		if err != nil {
@@ -425,7 +444,14 @@ func (r *rig) dial(i int, prefix []byte) *client {
 // does with the path in the SDP answer.
 func (c *client) open(t *testing.T, relayPath string, h msrp.Handler) (*msrp.Session, error) {
 	t.Helper()
-	s, err := msrp.NewSession(msrp.SessionConfig{Local: mustURI(t, clientURI), Remote: []msrp.URI{mustURI(t, relayPath)}, Handler: h})
+	return c.openAs(t, clientURI, relayPath, h)
+}
+
+// openAs is open with the client's own URI local, for a second session on
+// one connection.
+func (c *client) openAs(t *testing.T, local, relayPath string, h msrp.Handler) (*msrp.Session, error) {
+	t.Helper()
+	s, err := msrp.NewSession(msrp.SessionConfig{Local: mustURI(t, local), Remote: []msrp.URI{mustURI(t, relayPath)}, Handler: h})
 	if err != nil {
 		t.Fatal(err)
 	}

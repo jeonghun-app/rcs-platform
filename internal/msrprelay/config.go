@@ -16,9 +16,20 @@ import (
 const (
 	DefaultListenAddr  = ":2855"
 	DefaultControlAddr = ":8082"
-	// DefaultPublicPort is the NLB's MSRP TLS listener (ADR 0003).
-	DefaultPublicPort = 2856
-	DefaultTable      = "msrp-bindings"
+	// DefaultPublicPort is the NLB's MSRP TLS listener (ADR 0003), and
+	// DefaultPlainPublicPort its TCP listener, the default with
+	// RELAY_PUBLIC_TLS=false so that a plain msrp: URI never names the TLS
+	// port.
+	DefaultPublicPort      = 2856
+	DefaultPlainPublicPort = 2855
+	// DefaultCorePort is the MSRP port (RFC 4975 §15.4), the one rcs-as
+	// listens on.
+	DefaultCorePort = 2855
+	// DefaultFailedLookupsPerSource is generous: clients behind one
+	// carrier-grade NAT address share it, though a client naming only
+	// sessions pcscf handed out almost never fails a lookup.
+	DefaultFailedLookupsPerSource = 120
+	DefaultTable                  = "msrp-bindings"
 	// DefaultStoreTimeout bounds one DynamoDB call, retries included. A
 	// client's first SEND waits for it, so it is short.
 	DefaultStoreTimeout = 2 * time.Second
@@ -32,9 +43,9 @@ const (
 	// DefaultMaxConnectionsPerSource is generous because mobile operators put
 	// many subscribers behind one carrier-grade NAT address.
 	DefaultMaxConnectionsPerSource = 256
-	// DefaultMaxConcurrentBinds bounds lookups in flight, so a burst of
-	// connections cannot turn into a burst of DynamoDB calls and goroutines
-	// waiting on them.
+	// DefaultMaxConcurrentBinds bounds binds in their store calls (lookup and
+	// claim), so a burst of connections cannot turn into a burst of DynamoDB
+	// calls and goroutines waiting on them.
 	DefaultMaxConcurrentBinds = 64
 	// DefaultPathWait covers the race in ADR 0004's second row: the client
 	// connects as soon as it has sent its answer, while pcscf is still
@@ -90,6 +101,9 @@ type Config struct {
 	// CoreNetworks are where the relay may connect: core_path hosts must be
 	// in them, and so must every address a host name resolves to.
 	CoreNetworks []netip.Prefix
+	// CorePorts are the only ports the relay connects to (RELAY_CORE_PORTS),
+	// checked like CoreNetworks.
+	CorePorts []uint16
 	// Namespace is RCS_SERVICE_NAMESPACE; names in it may appear in
 	// core_path.
 	Namespace string
@@ -109,6 +123,7 @@ type Config struct {
 	MaxConnections          int
 	MaxConnectionsPerSource int
 	MaxConcurrentBinds      int
+	FailedLookupsPerSource  int
 	MaxUnknownSessions      int
 	PathWait                time.Duration
 	CoreConnectTimeout      time.Duration
@@ -146,6 +161,7 @@ func Configure(s *runtime.Settings) Config {
 		MaxConnections:          e.Int("MAX_CONNECTIONS", DefaultMaxConnections),
 		MaxConnectionsPerSource: e.Int("MAX_CONNECTIONS_PER_SOURCE", DefaultMaxConnectionsPerSource),
 		MaxConcurrentBinds:      e.Int("MAX_CONCURRENT_BINDS", DefaultMaxConcurrentBinds),
+		FailedLookupsPerSource:  e.Int("FAILED_LOOKUPS_PER_SOURCE", DefaultFailedLookupsPerSource),
 		MaxUnknownSessions:      e.Int("MAX_UNKNOWN_SESSIONS", msrp.DefaultMaxFailedBinds),
 		PathWait:                e.Duration("PATH_WAIT", DefaultPathWait),
 		CoreConnectTimeout:      e.Duration("CORE_CONNECT_TIMEOUT", DefaultCoreConnectTimeout),
@@ -160,6 +176,7 @@ func Configure(s *runtime.Settings) Config {
 		}
 	}
 	c.Public = publicURI(s)
+	c.CorePorts = corePorts(e)
 	c.CoreHost = coreHost(e)
 	s.ForbidInProduction(!c.ProxyProtocol,
 		"RCS_PROXY_PROTOCOL is false: every client would appear as the load balancer, so per-source limits could not work (ADR 0003)")
@@ -199,13 +216,19 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("KEEPALIVE_INTERVAL", "must be shorter than RELAY_IDLE_TIMEOUT")
 	}
 	// Run must return inside the runtime's stop deadline, or the stop counts
-	// as failed; the runtime itself reports a malformed value.
+	// as failed and the last metrics are lost. After the drain it waits up
+	// to controlShutdownTimeout for control calls, then closes and flushes,
+	// which stopMargin covers. The runtime itself reports a malformed value.
+	stop, problem := runtime.DefaultShutdownTimeout, " ("+runtime.DefaultShutdownTimeout.String()+" by default)"
 	if v := s.Shared.String("SHUTDOWN_TIMEOUT", ""); v != "" {
-		if stop, err := time.ParseDuration(v); err == nil && c.DrainTimeout >= stop {
-			e.Invalid("DRAIN_TIMEOUT", "must be shorter than RCS_SHUTDOWN_TIMEOUT")
+		stop, problem = 0, ""
+		if d, err := time.ParseDuration(v); err == nil {
+			stop = d
 		}
-	} else if c.DrainTimeout >= runtime.DefaultShutdownTimeout {
-		e.Invalid("DRAIN_TIMEOUT", "must be shorter than RCS_SHUTDOWN_TIMEOUT ("+runtime.DefaultShutdownTimeout.String()+" by default)")
+	}
+	if after := controlShutdownTimeout + stopMargin; stop > 0 && c.DrainTimeout+after > stop {
+		e.Invalid("DRAIN_TIMEOUT", "plus "+after.String()+" must not exceed RCS_SHUTDOWN_TIMEOUT"+problem+
+			": the control API and the last metrics need that long after the drain")
 	}
 	for _, n := range []struct {
 		name string
@@ -213,6 +236,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"MAX_CONNECTIONS", c.MaxConnections}, {"MAX_CONNECTIONS_PER_SOURCE", c.MaxConnectionsPerSource},
 		{"MAX_CONCURRENT_BINDS", c.MaxConcurrentBinds}, {"MAX_UNKNOWN_SESSIONS", c.MaxUnknownSessions},
+		{"FAILED_LOOKUPS_PER_SOURCE", c.FailedLookupsPerSource},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")
@@ -226,8 +250,12 @@ func Configure(s *runtime.Settings) Config {
 func publicURI(s *runtime.Settings) msrp.URI {
 	e := s.Env
 	host := e.RequiredString("PUBLIC_HOST")
-	port := e.Int("PUBLIC_PORT", DefaultPublicPort)
 	secure := e.Bool("PUBLIC_TLS", true)
+	port := DefaultPublicPort
+	if !secure {
+		port = DefaultPlainPublicPort
+	}
+	port = e.Int("PUBLIC_PORT", port)
 	// Clients on the internet use TLS to the NLB; msrp:// would carry chat
 	// in the clear (ADR 0003).
 	s.ForbidInProduction(!secure, "RELAY_PUBLIC_TLS is false: clients would send chat content over the internet in the clear")
@@ -247,6 +275,27 @@ func publicURI(s *runtime.Settings) msrp.URI {
 	}
 	u.SessionID = ""
 	return u
+}
+
+// stopMargin is the time Run needs after the control API has stopped.
+const stopMargin = time.Second
+
+// corePorts reads RELAY_CORE_PORTS. Security groups are the primary control
+// on where the relay connects (ADR 0007 §2); this keeps a compromised pcscf
+// from using the relay to probe other ports inside RELAY_CORE_NETWORKS even
+// where a security group is too broad.
+func corePorts(e *runtime.Env) []uint16 {
+	items := e.List("CORE_PORTS", []string{strconv.Itoa(DefaultCorePort)})
+	ports := make([]uint16, 0, len(items))
+	for i, item := range items {
+		n, err := strconv.ParseUint(item, 10, 16)
+		if err != nil || n == 0 || strconv.FormatUint(n, 10) != item {
+			e.Invalid("CORE_PORTS", "item "+strconv.Itoa(i+1)+" is not a port from 1 to 65535")
+			return nil
+		}
+		ports = append(ports, uint16(n))
+	}
+	return ports
 }
 
 // coreHost reads RELAY_CORE_HOST, or finds this task's one private IPv4

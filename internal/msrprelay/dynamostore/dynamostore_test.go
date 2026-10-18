@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,6 +125,26 @@ func TestCreateWritesEveryAttributeAndRefusesATakenID(t *testing.T) {
 	}
 	if err := s.Create(context.Background(), store.Binding{ID: "b2", ClaimedBy: "x"}); err == nil {
 		t.Fatal("Create accepted a claimed binding")
+	}
+}
+
+func TestRetriedCreateThatHadLandedSucceeds(t *testing.T) {
+	expires := now.Add(time.Minute)
+	ours := store.Binding{ID: "b1", CoreLocal: "msrp://10.0.2.9:9/c;tcp", ExpiresAt: expires}
+	api := &scripted{put: func(in *dynamodb.PutItemInput) (*dynamodb.PutItemOutput, error) {
+		if in.ReturnValuesOnConditionCheckFailure != types.ReturnValuesOnConditionCheckFailureAllOld {
+			t.Fatal("a refused create would not say whose item is there")
+		}
+		return nil, ccf(item(expires, nil))
+	}}
+	s := NewWithClient(api, "t")
+	if err := s.Create(context.Background(), ours); err != nil {
+		t.Fatalf("Create finding its own item = %v", err)
+	}
+	other := ours
+	other.CoreLocal = "msrp://10.0.2.9:9/other;tcp"
+	if err := s.Create(context.Background(), other); !errors.Is(err, store.ErrExists) {
+		t.Fatalf("Create finding another item = %v, want ErrExists", err)
 	}
 }
 
@@ -289,6 +313,9 @@ func TestClaimRefusalsAreClassifiedFromTheOldItem(t *testing.T) {
 		{"missing", nil, store.ErrNotFound},
 		{"expired and claimed", item(now, claimed), store.ErrNotFound},
 		{"claimed", item(now.Add(time.Minute), claimed), store.ErrClaimed},
+		{"claimed by us: a retry", item(now.Add(time.Minute), map[string]types.AttributeValue{
+			attrCorePath: str("msrp://10.0.1.5:2855/a;tcp"), attrClientPath: str("msrp://c.invalid:1/x;tcp"), attrClaimedBy: str("task/1"),
+		}), nil},
 		{"incomplete", item(now.Add(time.Minute), nil), store.ErrIncomplete},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -417,5 +444,52 @@ func TestNewLoadsConfigurationWithoutARequest(t *testing.T) {
 	s, err := New(context.Background(), "msrp-bindings", "http://127.0.0.1:1")
 	if err != nil || s.table != "msrp-bindings" {
 		t.Fatalf("New = %v, %v", s, err)
+	}
+}
+
+func TestClaimRetriedBySDKAfterItLandedSucceeds(t *testing.T) {
+	// DynamoDB applies the claim but the answer is lost (a 500 here), so the
+	// SDK sends the request again, which now fails its own condition. The
+	// item that comes back names this claimant: the claim is ours.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		if r.Header.Get("X-Amz-Target") != "DynamoDB_20120810.UpdateItem" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"unexpected"}`)
+			return
+		}
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"lost"}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(w, `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed",`+
+			`"Item":{"pk":{"S":"b1"},"core_local":{"S":"msrp://10.0.2.9:9/c;tcp"},"core_path":{"S":"msrp://10.0.1.5:2855/a;tcp"},`+
+			`"client_endpoint_path":{"S":"msrp://c.invalid:1/x;tcp"},"claimed_by":{"S":"task/1"},"expires_at":{"N":"%d"}}}`,
+			now.Add(time.Minute).UnixMilli())
+	}))
+	defer srv.Close()
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "local")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	s, err := New(context.Background(), "msrp-bindings", srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Claim(context.Background(), "b1", "task/1", now)
+	if err != nil || b.ClaimedBy != "task/1" {
+		t.Fatalf("Claim = %+v, %v; want the claim that landed", b, err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("%d UpdateItem calls, want the original and one retry", calls.Load())
+	}
+	// Another claimant retrying the same way is still refused.
+	calls.Store(0)
+	if _, err := s.Claim(context.Background(), "b1", "task/2", now); !errors.Is(err, store.ErrClaimed) {
+		t.Fatalf("Claim by another = %v, want ErrClaimed", err)
 	}
 }

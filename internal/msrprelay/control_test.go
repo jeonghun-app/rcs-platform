@@ -29,7 +29,7 @@ func newTestControl(t *testing.T, st store.Store) (*control, *fakeClock, *counte
 		Store: st, StoreTimeout: time.Second,
 		Public:       msrp.URI{Secure: true, Host: publicHost, Port: DefaultPublicPort, Transport: "tcp"},
 		CoreHost:     coreHostAddr,
-		CoreNetworks: privateRanges, Namespace: "rcs.internal",
+		CoreNetworks: privateRanges, CorePorts: []uint16{DefaultCorePort}, Namespace: "rcs.internal",
 		MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken, nextToken},
 		Clock: clock, Rand: &sequence{}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: m,
 	}), clock, m
@@ -221,10 +221,16 @@ func TestInvalidCreateRequestsAreRefused(t *testing.T) {
 		{"core path to loopback", `{"expires_in":60,"core_path":["msrp://127.0.0.1:2855/a;tcp"]}`, 400},
 		{"core path to a public name", `{"expires_in":60,"core_path":["msrp://as.example.com:2855/a;tcp"]}`, 400},
 		{"core path to a lookalike namespace", `{"expires_in":60,"core_path":["msrp://as.evilrcs.internal:2855/a;tcp"]}`, 400},
+		{"field in another case", `{"Expires_In":60}`, 400},
+		{"field in upper case", `{"expires_in":60,"CORE_PATH":["msrp://10.0.1.5:2855/a;tcp"]}`, 400},
+		{"core path over UDP", `{"expires_in":60,"core_path":["msrp://10.0.1.5:2855/a;udp"]}`, 400},
+		{"client path over UDP", `{"expires_in":60,"client_endpoint_path":["msrp://client.invalid:7777/x;udp"]}`, 400},
+		{"core path to another port", `{"expires_in":60,"core_path":["msrp://10.0.1.5:8080/a;tcp"]}`, 400},
 		{"client path of two URIs", `{"expires_in":60,"client_endpoint_path":["` + clientURI + `","` + clientURI + `"]}`, 400},
 		{"client path without a port", `{"expires_in":60,"client_endpoint_path":["msrp://client.invalid/x;tcp"]}`, 400},
 		{"core path to a namespace name", `{"expires_in":60,"core_path":["msrp://rcs-as.rcs.internal:2855/a;tcp"]}`, 201},
 		{"core path to a ULA", `{"expires_in":60,"core_path":["msrp://[fd00::5]:2855/a;tcp"]}`, 201},
+		{"transport in upper case", `{"expires_in":60,"core_path":["msrp://10.0.1.5:2855/a;TCP"]}`, 201},
 		{"both paths", `{"expires_in":7200,"core_path":["` + asPath + `"],"client_endpoint_path":["` + clientURI + `"]}`, 201},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -239,7 +245,7 @@ func TestInvalidCreateRequestsAreRefused(t *testing.T) {
 			}
 		})
 	}
-	if m.count(mRefusedPrefix+reasonInvalid) != 21 {
+	if m.count(mRefusedPrefix+reasonInvalid) != 26 {
 		t.Fatalf("Refused.ControlInvalid = %d", m.count(mRefusedPrefix+reasonInvalid))
 	}
 }

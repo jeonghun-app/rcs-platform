@@ -90,6 +90,20 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 	if len(c.CoreNetworks) != len(privateRanges) || len(c.Tokens) != 1 {
 		t.Fatalf("networks %v, %d tokens", c.CoreNetworks, len(c.Tokens))
 	}
+	if len(c.CorePorts) != 1 || c.CorePorts[0] != 2855 || c.FailedLookupsPerSource != DefaultFailedLookupsPerSource {
+		t.Fatalf("core ports %v, failed lookups %d", c.CorePorts, c.FailedLookupsPerSource)
+	}
+}
+
+func TestPlainPublicURIDefaultsToTheNLBsTCPPort(t *testing.T) {
+	// A plain msrp: URI must not name the NLB's TLS listener (ADR 0003).
+	c, err := configure(with(devEnv, "RELAY_PUBLIC_TLS", "false"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Public.String() != "msrp://relay.example.net:2855;tcp" {
+		t.Fatalf("public %s", c.Public.String())
+	}
 }
 
 func TestEverySettingIsRead(t *testing.T) {
@@ -103,16 +117,18 @@ func TestEverySettingIsRead(t *testing.T) {
 		"RELAY_MAX_UNKNOWN_SESSIONS", "4", "RELAY_PATH_WAIT", "1s", "RELAY_CORE_CONNECT_TIMEOUT", "2s",
 		"RELAY_KEEPALIVE_INTERVAL", "100s", "RELAY_IDLE_TIMEOUT", "200s", "RELAY_DRAIN_TIMEOUT", "100s",
 		"RCS_SHUTDOWN_TIMEOUT", "115s", "RELAY_METRICS_INTERVAL", "10s",
+		"RELAY_CORE_PORTS", "2855, 12855", "RELAY_FAILED_LOOKUPS_PER_SOURCE", "30",
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := fmt.Sprint("127.0.0.1:12855 127.0.0.1:18082 msrp://relay.example.net:2855;tcp [10.1.0.0/16] rcs.internal true ",
-		"dynamodb bindings http://ddb:8000 1s 2 1h0m0s 5 2 3 4 1s 2s 1m40s 3m20s 1m40s 10s")
+		"dynamodb bindings http://ddb:8000 1s 2 1h0m0s 5 2 3 4 1s 2s 1m40s 3m20s 1m40s 10s [2855 12855] 30")
 	got := fmt.Sprint(c.ListenAddr, " ", c.ControlAddr, " ", c.Public.String(), " ", c.CoreNetworks, " ", c.Namespace, " ", c.ProxyProtocol, " ",
 		c.Store, " ", c.Table, " ", c.DynamoDBEndpoint, " ", c.StoreTimeout, " ", len(c.Tokens), " ", c.MaxExpiresIn, " ",
 		c.MaxConnections, " ", c.MaxConnectionsPerSource, " ", c.MaxConcurrentBinds, " ", c.MaxUnknownSessions, " ",
-		c.PathWait, " ", c.CoreConnectTimeout, " ", c.KeepAlive, " ", c.IdleTimeout, " ", c.DrainTimeout, " ", c.MetricsInterval)
+		c.PathWait, " ", c.CoreConnectTimeout, " ", c.KeepAlive, " ", c.IdleTimeout, " ", c.DrainTimeout, " ", c.MetricsInterval, " ",
+		c.CorePorts, " ", c.FailedLookupsPerSource)
 	if got != want {
 		t.Fatalf("config\n got %s\nwant %s", got, want)
 	}
@@ -137,8 +153,11 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		{[]string{"RELAY_STORE_TIMEOUT", "0s"}, "RELAY_STORE_TIMEOUT: must be greater than zero"},
 		{[]string{"RELAY_MAX_EXPIRES_IN", "1500ms"}, "RELAY_MAX_EXPIRES_IN: must be whole seconds"},
 		{[]string{"RELAY_KEEPALIVE_INTERVAL", "300s"}, "RELAY_KEEPALIVE_INTERVAL: must be shorter than RELAY_IDLE_TIMEOUT"},
-		{[]string{"RELAY_DRAIN_TIMEOUT", "20s"}, "RELAY_DRAIN_TIMEOUT: must be shorter than RCS_SHUTDOWN_TIMEOUT (20s by default)"},
-		{[]string{"RELAY_DRAIN_TIMEOUT", "30s", "RCS_SHUTDOWN_TIMEOUT", "30s"}, "RELAY_DRAIN_TIMEOUT: must be shorter than RCS_SHUTDOWN_TIMEOUT"},
+		{[]string{"RELAY_DRAIN_TIMEOUT", "18s"}, "RELAY_DRAIN_TIMEOUT: plus 3s must not exceed RCS_SHUTDOWN_TIMEOUT (20s by default)"},
+		{[]string{"RELAY_DRAIN_TIMEOUT", "98s", "RCS_SHUTDOWN_TIMEOUT", "100s"}, "RELAY_DRAIN_TIMEOUT: plus 3s must not exceed RCS_SHUTDOWN_TIMEOUT:"},
+		{[]string{"RELAY_CORE_PORTS", "2855, 0"}, "RELAY_CORE_PORTS: item 2 is not a port"},
+		{[]string{"RELAY_CORE_PORTS", "02855"}, "RELAY_CORE_PORTS: item 1 is not a port"},
+		{[]string{"RELAY_FAILED_LOOKUPS_PER_SOURCE", "0"}, "RELAY_FAILED_LOOKUPS_PER_SOURCE: must be positive"},
 		{[]string{"RELAY_MAX_CONNECTIONS", "0"}, "RELAY_MAX_CONNECTIONS: must be positive"},
 		{[]string{"RELAY_MAX_CONCURRENT_BINDS", "-1"}, "RELAY_MAX_CONCURRENT_BINDS: must be positive"},
 	} {

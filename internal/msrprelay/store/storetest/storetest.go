@@ -31,12 +31,14 @@ const (
 func Run(t *testing.T, open func(t *testing.T) store.Store) {
 	t.Run("CreatedBindingReadsBack", func(t *testing.T) { createdBindingReadsBack(t, open(t)) })
 	t.Run("CreateRefusesATakenID", func(t *testing.T) { createRefusesATakenID(t, open(t)) })
+	t.Run("RetriedCreateSucceeds", func(t *testing.T) { retriedCreateSucceeds(t, open(t)) })
 	t.Run("ExpiredBindingIsNotFound", func(t *testing.T) { expiredBindingIsNotFound(t, open(t)) })
 	t.Run("PathsAreSetOnce", func(t *testing.T) { pathsAreSetOnce(t, open(t)) })
 	t.Run("ExpiryMovesBothWays", func(t *testing.T) { expiryMovesBothWays(t, open(t)) })
 	t.Run("UpdateOfAMissingOrExpiredBindingFails", func(t *testing.T) { updateOfMissingFails(t, open(t)) })
 	t.Run("ClaimNeedsALiveCompleteUnclaimedBinding", func(t *testing.T) { claimRules(t, open(t)) })
 	t.Run("OnlyOneConcurrentClaimWins", func(t *testing.T) { oneClaimWins(t, open(t)) })
+	t.Run("RetriedClaimBySameClaimantSucceeds", func(t *testing.T) { retriedClaimSucceeds(t, open(t)) })
 	t.Run("ClaimedBindingStillExtends", func(t *testing.T) { claimedStillExtends(t, open(t)) })
 	t.Run("DeleteRemovesExpiredBindingsToo", func(t *testing.T) { deleteRules(t, open(t)) })
 	t.Run("Ready", func(t *testing.T) {
@@ -108,9 +110,12 @@ func createdBindingReadsBack(t *testing.T, s store.Store) {
 
 func createRefusesATakenID(t *testing.T, s store.Store) {
 	b := create(t, s, store.Binding{})
-	want(t, s.Create(context.Background(), b), store.ErrExists, "second Create")
+	other := b
+	other.CoreLocal = "msrp://10.0.2.9:9/an0ther;tcp"
+	want(t, s.Create(context.Background(), other), store.ErrExists, "Create of another binding with the id")
 	// An expired binding still holds its id until it is deleted.
 	old := create(t, s, store.Binding{ExpiresAt: Start.Add(time.Second)})
+	old.CoreLocal = "msrp://10.0.2.9:9/an0ther;tcp"
 	want(t, s.Create(context.Background(), old), store.ErrExists, "Create over an expired binding")
 	if err := s.Create(context.Background(), store.Binding{ID: newID(t), CoreLocal: coreLocal, ExpiresAt: Start.Add(time.Minute), ClaimedBy: "x"}); err == nil {
 		t.Fatal("Create accepted a claimed binding")
@@ -202,11 +207,40 @@ func claimRules(t *testing.T, s store.Store) {
 	same(t, get(t, s, b.ID, Start), b)
 	_, err = s.Claim(ctx, b.ID, "task-b/7", Start)
 	want(t, err, store.ErrClaimed, "second Claim")
-	_, err = s.Claim(ctx, b.ID, "task-a/1", Start)
-	want(t, err, store.ErrClaimed, "Claim again by the same claimant")
 	// Expiry is checked first: a claimed binding that expired is gone.
 	_, err = s.Claim(ctx, b.ID, "task-b/7", b.ExpiresAt)
 	want(t, err, store.ErrNotFound, "Claim of an expired claimed binding")
+}
+
+// retriedCreateSucceeds: the SDK retries a write whose answer was lost, and
+// the retry must not turn the binding the first attempt stored into an
+// error.
+func retriedCreateSucceeds(t *testing.T, s store.Store) {
+	b := create(t, s, store.Binding{CorePath: corePath})
+	if err := s.Create(context.Background(), b); err != nil {
+		t.Fatalf("retried Create = %v", err)
+	}
+	same(t, get(t, s, b.ID, Start), b)
+}
+
+// retriedClaimSucceeds: a claim retried after it landed finds itself the
+// claimant, which is success; anyone else still gets ErrClaimed.
+func retriedClaimSucceeds(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	b := create(t, s, store.Binding{CorePath: corePath, ClientEndpointPath: clientPath})
+	if _, err := s.Claim(ctx, b.ID, "task-a/1", Start); err != nil {
+		t.Fatalf("Claim = %v", err)
+	}
+	got, err := s.Claim(ctx, b.ID, "task-a/1", Start)
+	if err != nil {
+		t.Fatalf("retried Claim = %v", err)
+	}
+	b.ClaimedBy = "task-a/1"
+	same(t, got, b)
+	// Claimants are compared exactly: another connection of the same task
+	// is a rival.
+	_, err = s.Claim(ctx, b.ID, "task-a/2", Start)
+	want(t, err, store.ErrClaimed, "Claim by another connection of the task")
 }
 
 func oneClaimWins(t *testing.T, s store.Store) {

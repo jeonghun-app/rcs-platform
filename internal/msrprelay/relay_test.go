@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -300,13 +301,13 @@ func TestStoreHiccupAtTheExpiryCheckDoesNotCutTheBridge(t *testing.T) {
 }
 
 func TestCoreThatCannotBeReachedIsRefusedWith481(t *testing.T) {
-	r := newRig(t, 1)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	closed := ln.Addr().String()
 	_ = ln.Close()
+	r := newRig(t, 1, extraCorePorts{netip.MustParseAddrPort(closed).Port()})
 	b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{"msrp://" + closed + "/g0ne;tcp"}})
 	if _, err := r.dial(0, nil).open(t, b.clientPath, newRecorder()); statusOf(err) != msrp.StatusNoSession {
 		t.Fatalf("Open = %v, want 481", err)
@@ -330,7 +331,7 @@ func TestCoreDialerRefusesAddressesOutsideItsNetworks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	dial := coreDialer([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, time.Second)
+	dial := coreDialer([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, []uint16{2855}, time.Second)
 	if _, err := dial(context.Background(), "tcp", ln.Addr().String()); !errors.Is(err, errCoreNotAllowed) {
 		t.Fatalf("dial = %v, want errCoreNotAllowed", err)
 	}
@@ -473,6 +474,8 @@ func wrapStore(f *flakyStore) rigOption {
 // flakyStore wraps a Store: Get can be made to fail or to block.
 type flakyStore struct {
 	store.Store
+	// gets counts every Get, the store reads the relay makes.
+	gets    atomic.Int64
 	mu      sync.Mutex
 	fails   int
 	block   chan struct{}
@@ -486,6 +489,7 @@ func (f *flakyStore) failGets(n int) {
 }
 
 func (f *flakyStore) Get(ctx context.Context, id string, now time.Time) (store.Binding, error) {
+	f.gets.Add(1)
 	f.mu.Lock()
 	fail, block := f.fails > 0, f.block
 	if fail {
@@ -518,7 +522,15 @@ func TestBindsBeyondTheLimitCloseTheConnection(t *testing.T) {
 	}()
 	<-slow.blocked
 	second := r.dial(0, nil)
-	if _, err := second.open(t, b.clientPath, newRecorder()); !closedNotRefused(err) {
+	opened := make(chan error, 1)
+	go func() {
+		_, err := second.open(t, b.clientPath, newRecorder())
+		opened <- err
+	}()
+	// The bind waits a moment for a slot, then gives up.
+	r.clock.waitTimer(t, bindSlotWait)
+	r.clock.Advance(bindSlotWait)
+	if err := <-opened; !closedNotRefused(err) {
 		t.Fatalf("Open while every bind slot is taken = %v, want the connection closed", err)
 	}
 	waitDone(t, second.conn.Done(), "the overloaded connection")
@@ -528,6 +540,38 @@ func TestBindsBeyondTheLimitCloseTheConnection(t *testing.T) {
 	close(slow.block)
 	if err := <-first; err != nil {
 		t.Fatalf("the waiting bind failed: %v", err)
+	}
+}
+
+func TestBindWaitsBrieflyForASlot(t *testing.T) {
+	slow := &flakyStore{block: make(chan struct{}), blocked: make(chan struct{}, 2)}
+	r := newRig(t, 1, wrapStore(slow), func(o *relayOptions) { o.MaxConcurrentBinds = 1 })
+	var paths []string
+	for _, sid := range []string{"aswait1", "aswait2"} {
+		b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{r.as.uri(sid)}})
+		r.as.session(t, sid, b.coreLocal, newRecorder())
+		paths = append(paths, b.clientPath)
+	}
+	results := make(chan error, 2)
+	go func() {
+		_, err := r.dial(0, nil).open(t, paths[0], newRecorder())
+		results <- err
+	}()
+	<-slow.blocked
+	go func() {
+		_, err := r.dial(0, nil).open(t, paths[1], newRecorder())
+		results <- err
+	}()
+	r.clock.waitTimer(t, bindSlotWait)
+	// The slot frees before the wait is over: the second bind proceeds.
+	close(slow.block)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("Open = %v", err)
+		}
+	}
+	if got := r.metrics.count(mRefusedPrefix + reasonBindOverload); got != 0 {
+		t.Fatalf("Refused.BindOverload = %d", got)
 	}
 }
 
@@ -578,7 +622,7 @@ func TestDrainKeepsBridgesUntilTheTimeoutThenClosesThem(t *testing.T) {
 		r.relays[0].Drain(context.Background(), 10*time.Second)
 		close(drained)
 	}()
-	r.clock.waitTimer(t, 10*time.Second)
+	r.clock.waitTimer(t, 5*time.Second)
 	if c, err := net.Dial("tcp", r.addrs[0]); err == nil {
 		_ = c.Close()
 		t.Fatal("a draining relay accepted a connection")
@@ -587,7 +631,8 @@ func TestDrainKeepsBridgesUntilTheTimeoutThenClosesThem(t *testing.T) {
 	if m := asH.message(t); string(m.Body) != "draining" {
 		t.Fatalf("rcs-as got %q", m.Body)
 	}
-	r.clock.Advance(10 * time.Second)
+	// Halfway through, what is left starts to be closed.
+	r.clock.Advance(5 * time.Second)
 	waitDone(t, drained, "Drain")
 	if r.metrics.bridges.Load() != 0 {
 		eventually(t, "the bridge to end", func() bool { return r.metrics.bridges.Load() == 0 })
@@ -607,7 +652,7 @@ func TestDrainEndsAsSoonAsTheLastClientLeaves(t *testing.T) {
 		r.relays[0].Drain(context.Background(), time.Hour)
 		close(drained)
 	}()
-	r.clock.waitTimer(t, time.Hour)
+	r.clock.waitTimer(t, 30*time.Minute)
 	_ = c.conn.Close()
 	waitDone(t, drained, "Drain")
 }

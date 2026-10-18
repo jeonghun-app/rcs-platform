@@ -30,6 +30,7 @@ func testConfig(t *testing.T) Config {
 type running struct {
 	h               *runtimetest.Harness
 	clock           *fakeClock
+	as              *fakeAS
 	public, control string
 	cancel          context.CancelFunc
 	done            chan error
@@ -38,6 +39,8 @@ type running struct {
 func startRun(t *testing.T, cfg Config) *running {
 	t.Helper()
 	r := &running{h: runtimetest.New(t, "msrp-relay"), clock: newFakeClock(), done: make(chan error, 1)}
+	r.as = newFakeAS(t, r.clock)
+	cfg.CorePorts = append(cfg.CorePorts, r.as.addr.Port())
 	addrs := make(chan [2]string, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
@@ -83,7 +86,7 @@ func (r *running) post(t *testing.T, body string) map[string]any {
 func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 	r := startRun(t, testConfig(t))
 	eventually(t, "/readyz to answer 200", func() bool { code, _ := r.h.Get("/readyz"); return code == http.StatusOK })
-	as := newFakeAS(t, r.clock)
+	as := r.as
 	b := r.post(t, `{"client_endpoint_path":["`+clientURI+`"],"core_path":["`+as.uri("asrun")+`"],"expires_in":600}`)
 	asH := newRecorder()
 	as.session(t, "asrun", b["core_path_local"].(string), asH)
@@ -120,7 +123,7 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 	// Stopping: the listener closes, the bridge stays until the drain
 	// timeout, then it is closed and Run returns.
 	r.cancel()
-	r.clock.waitTimer(t, 10*time.Second)
+	r.clock.waitTimer(t, 5*time.Second)
 	if c, err := net.Dial("tcp", r.public); err == nil {
 		_ = c.Close()
 		t.Fatal("a stopping relay accepted a connection")
@@ -129,7 +132,7 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 	if m := asH.message(t); string(m.Body) != "while draining" {
 		t.Fatalf("rcs-as got %q", m.Body)
 	}
-	r.clock.Advance(10 * time.Second)
+	r.clock.Advance(5 * time.Second)
 	select {
 	case err := <-r.done:
 		if err != nil {

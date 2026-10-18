@@ -57,7 +57,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		d.listen = listenClients
 	}
 	if d.dial == nil {
-		d.dial = coreDialer(cfg.CoreNetworks, cfg.CoreConnectTimeout)
+		d.dial = coreDialer(cfg.CoreNetworks, cfg.CorePorts, cfg.CoreConnectTimeout)
 	}
 	st := d.store
 	if st == nil {
@@ -81,6 +81,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		MaxConnections:          cfg.MaxConnections,
 		MaxConnectionsPerSource: cfg.MaxConnectionsPerSource,
 		MaxConcurrentBinds:      cfg.MaxConcurrentBinds,
+		FailedLookupsPerSource:  cfg.FailedLookupsPerSource,
 		PathWait:                cfg.PathWait,
 		CoreConnectTimeout:      cfg.CoreConnectTimeout,
 		IdleTimeout:             cfg.IdleTimeout,
@@ -101,6 +102,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Public:       cfg.Public,
 		CoreHost:     cfg.CoreHost,
 		CoreNetworks: cfg.CoreNetworks,
+		CorePorts:    cfg.CorePorts,
 		Namespace:    cfg.Namespace,
 		MaxExpiresIn: cfg.MaxExpiresIn,
 		Tokens:       tokens,
