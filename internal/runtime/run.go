@@ -318,6 +318,11 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		Shared:      sharedEnv,
 		Environment: sh.environment,
 	}
+	// Unkeyed hints show the last two characters of every identifier, which
+	// together with a time and an address narrows a subscriber down, and they
+	// correlate poorly; production logs leave the platform, so they are keyed.
+	settings.ForbidInProduction(!sh.piiKeySet,
+		"RCS_PII_HMAC_KEY is unset: log hints would show the last two characters of each identifier")
 	cfg := svc.Configure(settings)
 
 	log := NewLogger(out, svc.Name, buildinfo.Version, sh.logLevel)

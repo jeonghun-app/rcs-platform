@@ -33,7 +33,9 @@
 //	RCS_SHUTDOWN_TIMEOUT  drain deadline after SIGTERM (default 20s)
 //	RCS_METRICS_NAMESPACE CloudWatch namespace for EMF metrics (default RCS)
 //	RCS_PII_HMAC_KEY      at least 32 bytes; keys the correlation hints of
-//	                      internal/pii (unkeyed hints otherwise)
+//	                      internal/pii; required in staging and prod (unkeyed
+//	                      hints, allowed in dev and test, show the last two
+//	                      characters of each identifier)
 //
 // The package name shadows the standard library's runtime; import it under
 // another name where both are needed.

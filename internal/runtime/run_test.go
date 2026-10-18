@@ -102,9 +102,15 @@ func httpGet(t *testing.T, u string) int {
 	return resp.StatusCode
 }
 
+// testPIIKey is an HMAC key of the minimum length, for environments that need
+// one.
+var testPIIKey = strings.Repeat("k", 32)
+
 func devEnv() envMap {
-	return envMap{"RCS_ENV": "dev", "RCS_SHUTDOWN_TIMEOUT": "7s"}
+	return envMap{"RCS_ENV": "dev", "RCS_SHUTDOWN_TIMEOUT": "7s", "RCS_PII_HMAC_KEY": testPIIKey}
 }
+
+const missingKeyReason = "RCS_PII_HMAC_KEY is unset: log hints would show the last two characters of each identifier"
 
 const testShutdownTimeout = 7 * time.Second
 
@@ -251,7 +257,7 @@ func TestConfigurationProblemsAreReportedTogetherBeforeAnythingStarts(t *testing
 		return testConfig{}
 	}
 	code := Run(context.Background(), svc, Process{
-		LookupEnv: envMap{"RCS_ENV": "prod", "RCS_LOG_LEVEL": "chatty", "TESTSVC_PORT": "fivethousand"}.lookup,
+		LookupEnv: envMap{"RCS_ENV": "prod", "RCS_PII_HMAC_KEY": testPIIKey, "RCS_LOG_LEVEL": "chatty", "TESTSVC_PORT": "fivethousand"}.lookup,
 		Stdout:    &out,
 		Listen: func(string, string) (net.Listener, error) {
 			listened = true
@@ -290,7 +296,7 @@ func TestProductionRefusesEveryUnsafeSetting(t *testing.T) {
 			s.ForbidInProduction(true, "TESTSVC_TLS=false sends SIP in clear")
 			return testConfig{}
 		}
-		code := Run(context.Background(), svc, Process{LookupEnv: envMap{"RCS_ENV": env}.lookup, Stdout: &out})
+		code := Run(context.Background(), svc, Process{LookupEnv: envMap{"RCS_ENV": env, "RCS_PII_HMAC_KEY": testPIIKey}.lookup, Stdout: &out})
 		if code != ExitFailure {
 			t.Fatalf("%s: exit %d", env, code)
 		}
@@ -302,6 +308,55 @@ func TestProductionRefusesEveryUnsafeSetting(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Fatalf("%s: problems = %q", env, got)
 		}
+	}
+}
+
+func TestStagingAndProdRequireThePIIHMACKey(t *testing.T) {
+	for _, env := range []string{"staging", "prod"} {
+		restoreDefaults(t)
+		var out lockedBuffer
+		code := Run(context.Background(), testService(waitForStop), Process{LookupEnv: envMap{"RCS_ENV": env}.lookup, Stdout: &out})
+		if code != ExitFailure {
+			t.Fatalf("%s without a key: exit %d", env, code)
+		}
+		got := toStrings(record(t, out.String(), "configuration rejected")["problems"])
+		if want := []string{"refused in " + env + ": " + missingKeyReason}; !slices.Equal(got, want) {
+			t.Fatalf("%s: problems = %q", env, got)
+		}
+	}
+
+	h := startService(t, envMap{"RCS_ENV": "prod", "RCS_SHUTDOWN_TIMEOUT": "7s", "RCS_PII_HMAC_KEY": testPIIKey}, testService(waitForStop))
+	if code := httpGet(t, h.adminURL("/healthz")); code != 200 {
+		t.Fatalf("prod with a key: healthz %d", code)
+	}
+	h.cancel()
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("prod with a key: exit %d:\n%s", code, h.out.String())
+	}
+}
+
+func TestAShortPIIKeyIsReportedOnceNotAlsoAsMissing(t *testing.T) {
+	restoreDefaults(t)
+	var out lockedBuffer
+	code := Run(context.Background(), testService(waitForStop), Process{LookupEnv: envMap{"RCS_ENV": "prod", "RCS_PII_HMAC_KEY": "short"}.lookup, Stdout: &out})
+	got := toStrings(record(t, out.String(), "configuration rejected")["problems"])
+	if code != ExitFailure || !slices.Equal(got, []string{"RCS_PII_HMAC_KEY: shorter than 32 bytes"}) {
+		t.Fatalf("exit %d, problems %q", code, got)
+	}
+}
+
+func TestDevelopmentWithoutThePIIHMACKeyStartsAndWarns(t *testing.T) {
+	h := startService(t, envMap{"RCS_ENV": "dev", "RCS_SHUTDOWN_TIMEOUT": "7s"}, testService(waitForStop))
+	if code := httpGet(t, h.adminURL("/healthz")); code != 200 {
+		t.Fatalf("healthz %d", code)
+	}
+	h.cancel()
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	got := toStrings(record(t, h.out.String(), "production-unsafe settings in use")["reasons"])
+	if !slices.Equal(got, []string{missingKeyReason}) {
+		t.Fatalf("reasons = %q", got)
 	}
 }
 

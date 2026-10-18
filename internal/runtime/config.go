@@ -50,6 +50,9 @@ type shared struct {
 	// redactor carries RCS_PII_HMAC_KEY; the key itself is never stored where
 	// fmt could print it (see pii.Redactor).
 	redactor *pii.Redactor
+	// piiKeySet records that RCS_PII_HMAC_KEY was given, valid or not, so that
+	// a short key is reported once, as too short, and not also as missing.
+	piiKeySet bool
 }
 
 // loadShared reads the RCS_ settings. RCS_ENV has no default: a task definition
@@ -97,6 +100,7 @@ func loadShared(e *Env) shared {
 	}
 
 	if key := e.String("PII_HMAC_KEY", ""); key != "" {
+		s.piiKeySet = true
 		if len(key) < minPIIKeyLen {
 			e.Invalid("PII_HMAC_KEY", "shorter than "+strconv.Itoa(minPIIKeyLen)+" bytes")
 		} else {
