@@ -194,3 +194,28 @@ func TestOfferMayBeRewrittenToActpass(t *testing.T) {
 		t.Errorf("MediaSetup = %q, %v", r, err)
 	}
 }
+
+func TestRejectedLinesDoNotKeepTheCoreAddressInTheSessionConnection(t *testing.T) {
+	offer := mustParse(t, crlf("v=0", "o=- 1 1 IN IP4 192.0.2.10", "s=-", "c=IN IP4 192.0.2.10", "t=0 0",
+		"m=audio 49170 RTP/AVP 0",
+		"m=message 9 TCP/MSRP *", "a=accept-types:message/cpim",
+		"a=path:msrp://192.0.2.10:9/s1;tcp", "a=setup:active"))
+	ans := NewAnswer(offer, asOrigin, asConnection)
+	m, err := NegotiateMSRP(offer, 1, asEndpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ans.Media[1] = m
+	toClient := MSRPRewrite{Connection: Connection{"IN", "IP4", "198.51.100.7"}, Port: 2855,
+		Path: []string{"msrps://198.51.100.7:2855/rl;tcp"}, Setup: SetupPassive, Answer: true}
+	if err := ans.RewriteMSRP(1, toClient); err != nil {
+		t.Fatal(err)
+	}
+	out := mustMarshal(t, ans)
+	if strings.Contains(out, "c=IN IP4 "+asConnection.Address) {
+		t.Errorf("core address still in a c= line after anchoring:\n%s", out)
+	}
+	if *ans.Connection != toClient.Connection || len(ans.Media[1].Connections) != 0 {
+		t.Errorf("session c=%v, media c=%v", ans.Connection, ans.Media[1].Connections)
+	}
+}

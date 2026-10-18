@@ -81,10 +81,12 @@ func (s *Session) RewriteMSRP(i int, rw MSRPRewrite) error {
 // without changing the connection of any other line.
 //
 // A line with its own c= lines gets c in their place. A line that inherits
-// the session-level c= gets c written there when no other line inherits it,
-// so the replaced address does not linger in the description where the far
-// end can still read it; when other lines inherit it too, the line gets a
-// media-level c= of its own instead (RFC 8866 §5.7).
+// the session-level c= gets c written there when no other active line
+// inherits it, so the replaced address (rcs-as's VPC address, say) does not
+// linger where the far end can still read it; when another active line
+// inherits it too, the line gets a media-level c= of its own instead
+// (RFC 8866 §5.7). A line with port 0 does not count: the address of a
+// rejected stream means nothing (RFC 3264 §6).
 func (s *Session) SetMediaConnection(i int, c Connection) error {
 	if _, err := s.media(i); err != nil {
 		return err
@@ -109,4 +111,6 @@ func (s *Session) othersInheritConnection(i int) bool {
 	return slices.ContainsFunc(s.Media[:i], noOwnConnection) || slices.ContainsFunc(s.Media[i+1:], noOwnConnection)
 }
 
-func noOwnConnection(m Media) bool { return len(m.Connections) == 0 }
+// noOwnConnection reports whether m is an active line that relies on the
+// session-level c=.
+func noOwnConnection(m Media) bool { return m.Port != 0 && len(m.Connections) == 0 }
