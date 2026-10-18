@@ -510,7 +510,7 @@ func (c *conn) answerNow(req, ans *Message) {
 	}
 	if !c.enqueueControl(b) {
 		c.node.log.Warn("diameter peer not reading answers: closing", "peer_host", c.caps.host,
-			"queued_bytes", c.controlQueueBytes())
+			"limit_bytes", c.controlQueueBytes())
 		c.close(errNotDraining)
 	}
 }
