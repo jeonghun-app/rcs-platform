@@ -233,12 +233,11 @@ func parseSubscriptionState(s string) (SubscriptionState, error) {
 	if err != nil {
 		return SubscriptionState{}, err
 	}
-	for _, name := range []string{"expires", "retry-after"} {
-		if v, ok := ps.Get(name); ok {
-			if _, ok := parseDelta(v); !ok {
-				return SubscriptionState{}, syntaxError("invalid " + name + " parameter")
-			}
-		}
+	if !deltaParamValid(ps, "expires") {
+		return SubscriptionState{}, syntaxError("invalid expires parameter")
+	}
+	if !deltaParamValid(ps, "retry-after") {
+		return SubscriptionState{}, syntaxError("invalid retry-after parameter")
 	}
 	return SubscriptionState{State: state, Params: ps}, nil
 }
@@ -341,6 +340,17 @@ func (r Reason) Text() string {
 
 // String writes the element.
 func (r Reason) String() string { return tokenParamsString(r.Protocol, r.Params) }
+
+// deltaParamValid reports whether the named parameter is absent or an unquoted
+// delta-seconds.
+func deltaParamValid(ps Params, name string) bool {
+	i := ps.index(name)
+	if i < 0 {
+		return true
+	}
+	_, ok := parseDelta(ps[i].Value)
+	return ok && !ps[i].Quoted
+}
 
 func deltaParam(ps Params, name string) (uint32, bool) {
 	v, ok := ps.Get(name)

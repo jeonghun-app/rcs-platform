@@ -117,28 +117,32 @@ func parseViaElement(s string) (Via, error) {
 // checkViaParams validates the parameters RFC 3261 §20.42 and RFC 3581 give a
 // meaning to, so the accessors on Via cannot meet a malformed value.
 func checkViaParams(ps Params) error {
+	// None of these values may be quoted: their grammar is a token, a number or
+	// an address.
 	for _, p := range ps {
-		var ok bool
-		switch strings.ToLower(p.Name) {
+		switch lowerASCII(p.Name) {
 		case "branch":
-			ok = isAll(p.Value, classToken) && !p.Quoted
+			if p.Quoted || !isAll(p.Value, classToken) {
+				return syntaxError("invalid branch parameter in Via")
+			}
 		case "ttl":
-			n, valid := parseDelta(p.Value)
-			ok = valid && !p.Quoted && n <= 255 && len(p.Value) <= 3
+			if n, valid := parseDelta(p.Value); p.Quoted || !valid || n > 255 || len(p.Value) > 3 {
+				return syntaxError("invalid ttl parameter in Via")
+			}
 		case "maddr":
-			ok = !p.Quoted && validHost(p.Value)
+			if p.Quoted || !validHost(p.Value) {
+				return syntaxError("invalid maddr parameter in Via")
+			}
 		case "received":
-			ok = !p.Quoted && (isIPv4(p.Value) || isIPv6(p.Value))
+			if p.Quoted || !isIPv4(p.Value) && !isIPv6(p.Value) {
+				return syntaxError("invalid received parameter in Via")
+			}
 		case "rport":
 			// A request carries rport as a flag; the response gets the port filled in
 			// (RFC 3581 §4).
-			_, valid := parsePort(p.Value)
-			ok = !p.Quoted && (p.Value == "" || valid)
-		default:
-			ok = true
-		}
-		if !ok {
-			return syntaxError("invalid " + strings.ToLower(p.Name) + " parameter in Via")
+			if _, valid := parsePort(p.Value); p.Quoted || p.Value != "" && !valid {
+				return syntaxError("invalid rport parameter in Via")
+			}
 		}
 	}
 	return nil
