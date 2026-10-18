@@ -35,14 +35,22 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
   - Clients using outbound (RFC 5626) get `Flow-Timer: 120` in the REGISTER 200
     (with `Require: outbound`, RFC 5626 §4.4, §5.4, §10), so they send a CRLF
     ping at least every two minutes.
-  - Clients not using outbound get the same interval through the Via `keep`
-    parameter (RFC 6223), which RCS clients use for SIP keep-alive: `pcscf`
-    answers `keep=120`.
+  - Clients that ask for keep-alive with the Via `keep` parameter (RFC 6223
+    §4.4) get `keep=120` (the same value as Flow-Timer, §5).
+  - A client that uses neither cannot be made to send keep-alives (§10). Its TLS
+    connection may be reset by the NLB after 350 s of silence; terminating
+    requests in that window get 430 from `pcscf` and are stored by `rcs-as`
+    (ADR 0005). To bound the window, `pcscf` caps the registration expiry of
+    such contacts at 600 s.
   - `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session idle for
     240 s.
-  - Server-side idle timeouts are longer than the keep-alive interval the server
-    asked for (RFC 5626 §5.4): 180 s on TLS listeners, 1900 s on TCP listeners, so
-    a client that keeps to the interval is never cut by the service. The NLB does
+  - Server-side idle timeouts are longer than the keep-alive interval of the
+    protocol on that listener, so an endpoint that keeps to it is never cut by
+    the service: `pcscf` 180 s on TLS and 1900 s on TCP (SIP keep-alive 120 s,
+    RFC 5626 §5.4); `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s).
+    Idle connections longer than 350 s are not expected to survive even on TCP
+    listeners: the target ENI's connection tracking on Fargate is not
+    configurable and may not match the NLB's longer timeout. The NLB does
     not close a connection when its own timer expires; it stops tracking it and a
     later packet gets a reset, which the client treats as a flow failure.
   - Kernel TCP keep-alive is **disabled** on client-facing listeners
