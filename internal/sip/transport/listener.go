@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -16,11 +17,13 @@ import (
 const maxDatagram = 65535
 
 type listener struct {
-	t       *Transport
-	name    string
-	network Network
-	proxy   bool
-	local   netip.AddrPort
+	t            *Transport
+	name         string
+	network      Network
+	proxy        bool
+	clientFacing bool
+	idle         time.Duration
+	local        netip.AddrPort
 	// sentByHost and sentByPort are what this listener writes into, and accepts
 	// in, the sent-by of a Via.
 	sentByHost string
@@ -28,13 +31,21 @@ type listener struct {
 
 	ln net.Listener // TCP and TLS
 	pc *net.UDPConn // UDP
+
+	stopOnce sync.Once
+	stopErr  error
 }
 
-func (l *listener) close() error {
-	if l.ln != nil {
-		return l.ln.Close()
-	}
-	return l.pc.Close()
+// stop closes the socket; later calls do nothing.
+func (l *listener) stop() error {
+	l.stopOnce.Do(func() {
+		if l.ln != nil {
+			l.stopErr = l.ln.Close()
+		} else {
+			l.stopErr = l.pc.Close()
+		}
+	})
+	return l.stopErr
 }
 
 // Listen opens a listening socket and starts serving it. It returns the bound
@@ -56,8 +67,27 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 		return netip.AddrPort{}, errors.New("transport: advertised port out of range")
 	}
 
-	l := &listener{t: t, network: cfg.Network, proxy: cfg.ProxyProtocol}
-	var lc net.ListenConfig
+	l := &listener{
+		t:            t,
+		network:      cfg.Network,
+		proxy:        cfg.ProxyProtocol,
+		clientFacing: cfg.ClientFacing || cfg.ProxyProtocol,
+		idle:         cfg.IdleTimeout,
+	}
+	if l.idle <= 0 {
+		l.idle = t.cfg.IdleTimeout
+	}
+	lc := net.ListenConfig{KeepAliveConfig: coreKeepAlive}
+	switch {
+	case cfg.KeepAlive != nil:
+		lc.KeepAliveConfig = *cfg.KeepAlive
+	case l.clientFacing:
+		lc.KeepAliveConfig = net.KeepAliveConfig{}
+	}
+	if !lc.KeepAliveConfig.Enable {
+		// Without this Go turns keep-alive on with its defaults.
+		lc.KeepAlive = -1
+	}
 	if cfg.Network == UDP {
 		pc, err := lc.ListenPacket(context.Background(), "udp", cfg.Addr)
 		if err != nil {
@@ -76,7 +106,7 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 	l.local = netip.AddrPortFrom(l.local.Addr().Unmap(), l.local.Port())
 	if cfg.AdvertisedHost == "" && l.local.Addr().IsUnspecified() {
 		// 0.0.0.0 or :: in a Via would send every response nowhere.
-		l.close()
+		l.stop()
 		return netip.AddrPort{}, errors.New("transport: a listener on an unspecified address needs AdvertisedHost")
 	}
 	l.name = cfg.Name
@@ -105,7 +135,7 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 	}()
 	if err != nil {
 		t.mu.Unlock()
-		l.close()
+		l.stop()
 		return netip.AddrPort{}, err
 	}
 	t.listeners = append(t.listeners, l)
@@ -158,10 +188,21 @@ func (l *listener) serveUDP() {
 			t.stats.malformedDatagrams.Add(1)
 			continue
 		}
-		f, _ := t.flows.udp(l, from)
+		f := t.flows.udpFlow(l, from)
 		if f == nil {
-			t.stats.udpFlowsRejected.Add(1)
-			continue
+			nf := t.flows.newFlow(UDP, l, from)
+			if !t.admit(nf) {
+				continue
+			}
+			var ok bool
+			if f, ok = t.flows.addUDP(nf); !ok || f != nf {
+				// Admitted but never entered: report it so the count Admit keeps
+				// stays balanced.
+				t.flowClosed(nf)
+			}
+			if !ok {
+				continue
+			}
 		}
 		t.deliver(f, msg)
 	}
@@ -185,7 +226,7 @@ func (l *listener) acceptLoop() {
 			continue
 		}
 		backoff = 0
-		if !t.reserveAccepted() {
+		if !t.reserveAccepted(c) {
 			t.stats.rejected.Add(1)
 			c.Close()
 			continue
@@ -200,68 +241,88 @@ func nextBackoff(d time.Duration) time.Duration {
 	return min(max(2*d, 5*time.Millisecond), time.Second)
 }
 
-func (t *Transport) reserveAccepted() bool {
+func (t *Transport) reserveAccepted(c net.Conn) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed || t.accepted >= t.cfg.MaxConnections {
 		return false
 	}
 	t.accepted++
+	t.pending[c] = struct{}{}
 	return true
 }
 
-func (t *Transport) releaseAccepted() {
+func (t *Transport) releaseAccepted(c net.Conn) {
 	t.mu.Lock()
 	t.accepted--
+	delete(t.pending, c)
 	t.mu.Unlock()
+}
+
+// unpend moves an accepted connection out of the pending set once it is a flow,
+// which Close reaches through the flow table. It reports false if Close has
+// already run, in which case the connection has been closed.
+func (t *Transport) unpend(c net.Conn) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.pending, c)
+	return !t.closed
 }
 
 // serveAccepted reads the PROXY header and runs the TLS handshake if the listener
 // needs them, then serves the connection as a flow.
-func (l *listener) serveAccepted(c net.Conn) {
+func (l *listener) serveAccepted(raw net.Conn) {
 	t := l.t
 	defer t.wg.Done()
-	defer t.releaseAccepted()
+	defer t.releaseAccepted(raw)
 
-	remote := addrPortOf(c.RemoteAddr())
+	remote := addrPortOf(raw.RemoteAddr())
 	if l.proxy {
-		c.SetReadDeadline(time.Now().Add(t.cfg.ReadTimeout))
-		h, err := ReadProxyHeader(c)
+		raw.SetReadDeadline(time.Now().Add(t.cfg.ReadTimeout))
+		h, err := ReadProxyHeader(raw)
 		if err != nil {
 			t.stats.proxyHeaderErrors.Add(1)
-			c.Close()
+			raw.Close()
 			return
 		}
 		if h.Command == ProxyLocal {
 			// An NLB health check: the connection is good, but there is no client
 			// to make a flow for (ADR 0003).
 			t.stats.healthChecks.Add(1)
-			c.Close()
+			raw.Close()
 			return
 		}
 		remote = h.Source
 	}
+	f := t.flows.newFlow(l.network, l, remote)
+	if !t.admit(f) {
+		raw.Close()
+		return
+	}
+	// From here on the flow is admitted, so it is reported closed exactly once:
+	// by the table if it gets there, here otherwise.
+	c := raw
 	if l.network == TLS {
-		tc := tls.Server(c, t.cfg.TLS)
+		tc := tls.Server(raw, t.cfg.TLS)
 		ctx, cancel := context.WithTimeout(context.Background(), t.cfg.ReadTimeout)
 		err := tc.HandshakeContext(ctx)
 		cancel()
 		if err != nil {
 			t.stats.tlsHandshakeErrors.Add(1)
-			c.Close()
+			raw.Close()
+			t.flowClosed(f)
 			return
 		}
 		c = tc
 	}
 	c.SetReadDeadline(time.Time{})
-
-	f := t.flows.newFlow(l.network, l, remote)
 	f.conn = c
-	if !t.flows.addStream(f) {
+	if !t.unpend(raw) || !t.flows.addStream(f) {
 		c.Close()
+		t.flowClosed(f)
 		return
 	}
-	t.serveStream(f)
+	t.serveStream(f, true)
 }
 
 func addrPortOf(a net.Addr) netip.AddrPort {

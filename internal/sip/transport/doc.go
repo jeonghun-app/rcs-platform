@@ -29,13 +29,34 @@
 // misconfigured target group fails loudly; a LOCAL header, which NLB health checks
 // send, is accepted and the connection closed without creating a flow.
 //
+// # Client-facing and core listeners
+//
+// A listener clients reach (ListenerConfig.ClientFacing, implied by
+// ProxyProtocol) never opens a connection to deliver a response whose connection
+// has closed, and sends no TCP keep-alive probes, leaving the keep-alive interval
+// to the client (RFC 5626 §4.4). Core-facing listeners and dialed connections
+// probe every 15 s. Admit and OnFlowClosed let a service see every inbound flow
+// come and go, to enforce per-client limits and to forget bindings of a closed
+// flow; CloseFlow and StopListening let it shut down gradually (ADR 0003).
+//
 // # Resource limits
 //
 // A stream connection may be idle between messages for IdleTimeout, but once the
 // first byte of a message has arrived the whole message must arrive within
-// ReadTimeout, so a peer cannot hold a connection by trickling a header. The same
-// ReadTimeout bounds the PROXY header and the TLS handshake. Writes have their own
-// deadline, and the number of accepted connections and of UDP flows is bounded.
+// ReadTimeout, so a peer cannot hold a connection by trickling a header. An
+// accepted connection must also complete its first message within ReadTimeout.
+// The same ReadTimeout bounds the PROXY header and the TLS handshake. Writes have
+// their own deadline. Accepted connections, dialed connections and UDP flows (in
+// total and per source IP) are bounded; a full UDP table displaces its least
+// recently seen flow rather than refusing a new client.
+//
+// Memory: a stream connection holds a 4 KiB read buffer, and while reading a
+// message up to Limits.MaxHeaderBytes plus the body bytes that have arrived, at
+// most Limits.MaxBodyBytes (16 KiB and 1 MiB by default). The worst case is
+// therefore about MaxConnections times 1.02 MiB, over 10 GiB with the defaults,
+// although reaching it needs every client to send a maximal body at once; size
+// the task, MaxConnections and MaxBodyBytes together. Each UDP socket has one
+// 64 KiB buffer.
 //
 // Nothing here logs message content or flow IDs: both identify subscribers or
 // let an attacker address their flows.
