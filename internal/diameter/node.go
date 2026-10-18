@@ -26,6 +26,11 @@ const (
 	DefaultRequestTimeout      = 10 * time.Second
 	DefaultCapabilitiesTimeout = 10 * time.Second
 	DefaultMaxInFlight         = 256
+	// DefaultMaxPendingConnections bounds inbound connections that have not
+	// completed CER/CEA. Legitimate peers finish within milliseconds, so the
+	// limit only bites when something is opening connections and sending
+	// nothing.
+	DefaultMaxPendingConnections = 64
 )
 
 const (
@@ -69,6 +74,13 @@ type Config struct {
 	// Accept lists the peers [Node.Serve] accepts. With no rules, every
 	// inbound peer is answered with DIAMETER_UNKNOWN_PEER.
 	Accept []PeerRule
+	// MaxPendingConnections bounds inbound connections that have not yet
+	// completed the capabilities exchange; further ones are closed as soon
+	// as they are accepted. Each such connection is also closed after
+	// CapabilitiesTimeout. Together they cap what unauthenticated clients
+	// can hold: this many goroutines and read buffers of at most
+	// MaxMessageSize.
+	MaxPendingConnections int
 
 	// WatchdogInterval is Twinit; each wait is jittered by up to ±2 s as
 	// RFC 3539 §3.4.1 requires.
@@ -144,6 +156,9 @@ func (c *Config) setDefaults() error {
 	if c.MaxInFlight <= 0 {
 		c.MaxInFlight = DefaultMaxInFlight
 	}
+	if c.MaxPendingConnections <= 0 {
+		c.MaxPendingConnections = DefaultMaxPendingConnections
+	}
 	if c.Clock == nil {
 		c.Clock = systemClock{}
 	}
@@ -212,6 +227,10 @@ type Node struct {
 	listeners map[net.Listener]struct{}
 	conns     map[*conn]struct{} // every connection, including those still exchanging capabilities
 	peers     map[string]*Peer   // open peers by lower-case Origin-Host
+	// exchanging counts accepted connections still in the capabilities
+	// exchange; limitLogged keeps a flood from logging every refusal.
+	exchanging  int
+	limitLogged bool
 }
 
 // NewNode validates cfg and returns a node. It does nothing on the network
@@ -451,12 +470,35 @@ func (n *Node) Serve(l net.Listener) error {
 			_ = nc.Close()
 			return ErrNodeClosed
 		}
+		if n.exchanging >= n.cfg.MaxPendingConnections {
+			first := !n.limitLogged
+			n.limitLogged = true
+			n.mu.Unlock()
+			_ = nc.Close()
+			if first {
+				n.log.Warn("diameter connections refused: too many have not completed CER",
+					"limit", n.cfg.MaxPendingConnections, "remote", nc.RemoteAddr().String())
+			}
+			continue
+		}
+		n.exchanging++
 		n.wg.Add(1)
 		n.mu.Unlock()
 		go func() {
 			defer n.wg.Done()
 			n.accept(nc)
 		}()
+	}
+}
+
+// exchangeDone releases a connection's place among those still exchanging
+// capabilities.
+func (n *Node) exchangeDone() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.exchanging--
+	if n.exchanging < n.cfg.MaxPendingConnections {
+		n.limitLogged = false
 	}
 }
 

@@ -359,3 +359,23 @@ func TestNodesTalkOverLoopbackTCPWithTheDefaultDialerAndClock(t *testing.T) {
 		t.Fatalf("Serve = %v", err)
 	}
 }
+
+func TestConnectionsBeyondThePendingExchangeLimitAreClosedAtOnce(t *testing.T) {
+	hss, ln, _ := startResponder(t, func(c *Config) { c.MaxPendingConnections = 1 })
+	silent := newScript(t, ln.connect(t, "10.0.1.5:40000"), scscfHost)
+
+	refused := newScript(t, ln.connect(t, "10.0.1.6:40000"), "scscf-2.rcs.test")
+	refused.expectClosed()
+
+	// Once the first connection finishes its exchange there is room again.
+	silent.write(testCER(scscfHost, testRealm, cxVSA()))
+	if rc, _ := silent.read().ResultCode(); rc != ResultSuccess {
+		t.Fatalf("CEA result %d", rc)
+	}
+	waitFor(t, "the exchange to be counted as finished", func() bool {
+		hss.mu.Lock()
+		defer hss.mu.Unlock()
+		return hss.exchanging == 0
+	})
+	openScript(t, ln, "scscf-3.rcs.test")
+}

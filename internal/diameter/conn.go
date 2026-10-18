@@ -137,10 +137,13 @@ func addrOf(a net.Addr) netip.Addr {
 func (n *Node) accept(nc net.Conn) {
 	c := newConn(n, nc)
 	if !n.register(c) {
+		n.exchangeDone()
 		_ = nc.Close()
 		return
 	}
-	if err := c.answerCapabilities(); err != nil {
+	err := c.answerCapabilities()
+	n.exchangeDone()
+	if err != nil {
 		c.close(err)
 		return
 	}
