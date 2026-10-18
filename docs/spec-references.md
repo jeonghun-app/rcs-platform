@@ -71,9 +71,13 @@ a maintainer; behaviour built on it is listed as unverified in
 | 7578, 2046 | `multipart/form-data` and the multipart boundary (`ft-server` uploads) |
 | 6266 | `Content-Disposition` in HTTP (`ft-server` downloads) |
 | 3986 | URI syntax: unreserved characters of the FT transaction id |
+| 6750 | Bearer token usage: `Authorization: Bearer` and the b64token syntax (internal HTTP APIs, `msrp-relay` control API) |
+| 6459 | IPv6 in 3GPP EPS: one /64 per bearer (`msrp-relay` per-source limits) |
+| 5482 | TCP user timeout (§1): how long sent data may stay unacknowledged (`msrp-relay` client sockets) |
 
 ## Other
 
 | Document | Subject | Used by |
 |---|---|---|
 | IEEE Std 1003.1-2004 Part 1 §9 | POSIX extended regular expressions, the syntax of iFC patterns (TS 29.228 Annex F) | `internal/ifc` |
+| HAProxy `proxy-protocol.txt` | PROXY protocol version 2, the header the AWS NLB sends (ADR 0003) | `internal/proxyproto` |
