@@ -203,8 +203,9 @@ type Node struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	hmu      sync.RWMutex
-	handlers map[handlerKey]Handler
+	hmu       sync.RWMutex
+	handlers  map[handlerKey]Handler
+	errorAVPs map[uint32]func(req *Message) []*AVP
 
 	mu        sync.Mutex
 	closed    bool
@@ -224,6 +225,7 @@ func NewNode(cfg Config) (*Node, error) {
 		log:       cfg.Logger.With("diameter_origin_host", cfg.OriginHost),
 		sessions:  NewSessionIDGenerator(cfg.OriginHost, cfg.Clock.Now()),
 		handlers:  make(map[handlerKey]Handler),
+		errorAVPs: make(map[uint32]func(req *Message) []*AVP),
 		listeners: make(map[net.Listener]struct{}),
 		conns:     make(map[*conn]struct{}),
 		peers:     make(map[string]*Peer),
@@ -255,6 +257,36 @@ func (n *Node) Handle(appID, code uint32, h Handler) {
 // HandleFunc registers f as with [Node.Handle].
 func (n *Node) HandleFunc(appID, code uint32, f func(ctx context.Context, peer *Peer, req *Message) (*Message, error)) {
 	n.Handle(appID, code, HandlerFunc(f))
+}
+
+// SetErrorAVPs registers f to supply the AVPs an application's answers must
+// carry, for the failure answers the node builds itself: decode faults,
+// [*Error] values and other errors returned by handlers, and handler panics.
+// Cx, for example, requires Vendor-Specific-Application-Id and
+// Auth-Session-State in every answer (TS 29.229 §6.1).
+//
+// f is not used for protocol errors (3xxx): those use the generic
+// answer-message format of RFC 6733 §7.2, while 4xxx and 5xxx answers use the
+// command's own format (§7.1.4, §7.1.5). f gets the request as far as it was
+// decoded and must not panic or block; it runs on the connection's read loop
+// for decode faults. Like [Node.Handle], it panics for the base protocol.
+func (n *Node) SetErrorAVPs(appID uint32, f func(req *Message) []*AVP) {
+	if appID == AppCommon {
+		panic("diameter: base protocol answers are built by the node")
+	}
+	n.hmu.Lock()
+	defer n.hmu.Unlock()
+	n.errorAVPs[appID] = f
+}
+
+func (n *Node) applicationErrorAVPs(req *Message) []*AVP {
+	n.hmu.RLock()
+	f := n.errorAVPs[req.ApplicationID]
+	n.hmu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f(req)
 }
 
 // handler returns the handler for a request and the result code to answer
@@ -343,10 +375,14 @@ func (n *Node) answerHeader(req *Message) *Message {
 	return a
 }
 
-// errorAnswer answers req with e (RFC 6733 §7.2): Error-Message and
-// Failed-AVP follow the result.
+// errorAnswer answers req with e (RFC 6733 §7.2): the application's required
+// AVPs (see [Node.SetErrorAVPs]), Error-Message and Failed-AVP follow the
+// result.
 func (n *Node) errorAnswer(req *Message, e *Error) *Message {
 	var extra []*AVP
+	if req.ApplicationID != AppCommon && !IsProtocolError(e.ResultCode) {
+		extra = append(extra, n.applicationErrorAVPs(req)...)
+	}
 	if e.Message != "" {
 		extra = append(extra, NewAVP(AVPErrorMessage, 0, 0, []byte(e.Message)))
 	}
