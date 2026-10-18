@@ -1,0 +1,98 @@
+package digest
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+)
+
+// ErrNoCredentials means an HTTP request carries no Authorization header
+// field with the Digest scheme.
+var ErrNoCredentials = errors.New("digest: no Digest credentials")
+
+// ErrURIMismatch means the uri parameter does not name the request target,
+// which RFC 7616 §3.4.6 requires of HTTP. The server should answer 400.
+var ErrURIMismatch = errors.New("digest: uri is not the request target")
+
+// SecretLookup returns the secret of username for credentials under alg. An
+// error, such as an unknown user, makes verification fail with that error
+// wrapped.
+type SecretLookup func(ctx context.Context, username string, alg Algorithm) (Secret, error)
+
+// VerifyHTTP authenticates an HTTP request with the same rules as Verify, plus
+// the request-target check HTTP requires. lookup runs only after the nonce has
+// been verified, so forged credentials cost no subscriber lookup. On success
+// it returns the credentials, whose Username is the authenticated user.
+//
+// A client that reuses a nonce must send its requests in nonce-count order;
+// counts must strictly increase, so a request overtaken by a later one fails
+// with ErrReplayed and the client is re-challenged. Digest AKA is refused:
+// over HTTP it belongs to GBA, which this package does not implement.
+func (s *Server) VerifyHTTP(r *http.Request, lookup SecretLookup) (Credentials, error) {
+	var values []string
+	for _, v := range r.Header.Values("Authorization") {
+		if isDigestScheme(v) {
+			values = append(values, v)
+		}
+	}
+	switch len(values) {
+	case 0:
+		return Credentials{}, ErrNoCredentials
+	case 1:
+	default:
+		return Credentials{}, malformed("more than one Digest Authorization field")
+	}
+	c, err := ParseCredentials(values[0])
+	if err != nil {
+		return Credentials{}, err
+	}
+	if c.Algorithm == AKAv1MD5 {
+		return Credentials{}, ErrUnsupportedAlgorithm
+	}
+	target := r.RequestURI
+	if target == "" {
+		target = r.URL.RequestURI()
+	}
+	if c.URI != target {
+		return Credentials{}, ErrURIMismatch
+	}
+	issued, err := s.precheck(c)
+	if err != nil {
+		return Credentials{}, err
+	}
+	secret, err := lookup(r.Context(), c.Username, c.Algorithm)
+	if err != nil {
+		return Credentials{}, fmt.Errorf("digest: looking up the secret: %w", err)
+	}
+	if err := s.verify(r.Context(), r.Method, c, secret, issued); err != nil {
+		return Credentials{}, err
+	}
+	return c, nil
+}
+
+// ChallengeHTTP answers 401 with a SHA-256 and an MD5 challenge, in that order
+// of preference (RFC 7616 §3.7). Set stale when VerifyHTTP returned
+// ErrStaleNonce. Nothing is written if a nonce cannot be generated.
+func (s *Server) ChallengeHTTP(w http.ResponseWriter, stale bool) error {
+	var values []string
+	for _, alg := range []Algorithm{SHA256, MD5} {
+		c, err := s.Challenge(alg, stale)
+		if err != nil {
+			return err
+		}
+		values = append(values, c.String())
+	}
+	for _, v := range values {
+		w.Header().Add("WWW-Authenticate", v)
+	}
+	w.WriteHeader(http.StatusUnauthorized)
+	return nil
+}
+
+func isDigestScheme(v string) bool {
+	v = strings.TrimLeft(v, " \t")
+	const scheme = "Digest"
+	return len(v) > len(scheme) && strings.EqualFold(v[:len(scheme)], scheme) && isWSP(v[len(scheme)])
+}
