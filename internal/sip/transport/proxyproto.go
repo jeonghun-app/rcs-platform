@@ -138,15 +138,24 @@ func ParseProxyHeader(b []byte) (ProxyHeader, error) {
 	default:
 		return ProxyHeader{}, proxyError("unsupported address family")
 	}
-	// A client address that no client can have would become a flow identity and a
-	// received parameter; refuse it instead.
-	if a := h.Source.Addr(); h.Source.Port() == 0 || a.IsUnspecified() || a.IsMulticast() {
+	if !usableClient(h.Source) {
 		return ProxyHeader{}, proxyError("invalid source address")
 	}
 	if err := checkTLVs(payload[addrLen:]); err != nil {
 		return ProxyHeader{}, err
 	}
 	return h, nil
+}
+
+// usableClient reports whether a PROXY source can be a client on the internet.
+// The address becomes a flow identity and a received parameter, so one no client
+// can have, such as a loopback, link-local (169.254.169.254 is the instance
+// metadata service), multicast or broadcast address, or port 0, is refused rather
+// than trusted.
+func usableClient(ap netip.AddrPort) bool {
+	a := ap.Addr()
+	return ap.Port() != 0 && !a.IsUnspecified() && !a.IsLoopback() && !a.IsMulticast() &&
+		!a.IsLinkLocalUnicast() && a != netip.AddrFrom4([4]byte{255, 255, 255, 255})
 }
 
 // checkTLVs checks that the type-length-value records after the address block

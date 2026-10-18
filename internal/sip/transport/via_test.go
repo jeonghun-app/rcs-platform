@@ -194,3 +194,15 @@ func TestNetworkNamesFollowTheViaTransport(t *testing.T) {
 		t.Error("default ports are wrong")
 	}
 }
+
+func TestStampingKeepsTheBytesOfTheOtherVias(t *testing.T) {
+	req := parseRequest(t, rawRequest("OPTIONS", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bK1",
+		"v:  SIP/2.0/UDP   b.example.com ;branch=z9hG4bK2"))
+	if err := stampReceived(req, netip.MustParseAddrPort("192.0.2.10:1")); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := req.Bytes()
+	if !strings.Contains(string(b), "\r\nv:  SIP/2.0/UDP   b.example.com ;branch=z9hG4bK2\r\n") {
+		t.Fatalf("the second Via was rewritten:\n%s", b)
+	}
+}

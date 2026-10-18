@@ -76,38 +76,11 @@ func setSentBy(req *sip.Request, network Network, host string, port int) error {
 	return replaceTopVia(&req.Header, top)
 }
 
-// replaceTopVia writes v as the first Via element and keeps every other element in
-// order.
-//
-// sip.Header can replace all fields of a name but not one field line, so every Via
-// line is written again: Set leaves the last line at the position of the first,
-// and each Prepend puts the line above it back on top. Lines other than the first
-// keep their values; only their whitespace and the spelling of the field name
-// become canonical, which RFC 3261 §7.3.1 makes equivalent.
+// replaceTopVia writes v as the first Via element. Every other Via, and every
+// other field, keeps its original bytes, so a forwarded message differs from the
+// received one only in the element this transport changed.
 func replaceTopVia(h *sip.Header, v sip.Via) error {
-	lines := h.Values("Via")
-	if len(lines) == 0 {
-		return errors.New("transport: message has no Via")
-	}
-	first, err := sip.ParseVia(lines[0])
-	if err != nil {
-		return err
-	}
-	parts := make([]string, len(first))
-	parts[0] = v.String()
-	for i := 1; i < len(first); i++ {
-		parts[i] = first[i].String()
-	}
-	lines[0] = strings.Join(parts, ", ")
-	if err := h.Set("Via", lines[len(lines)-1]); err != nil {
-		return err
-	}
-	for i := len(lines) - 2; i >= 0; i-- {
-		if err := h.Prepend("Via", lines[i]); err != nil {
-			return err
-		}
-	}
-	return nil
+	return h.ReplaceFirstElement("Via", v.String())
 }
 
 // ownsTopVia applies RFC 3261 §18.1.2: a response whose top Via sent-by is not one
@@ -137,8 +110,9 @@ func (t *Transport) ownsTopVia(res *sip.Response, f *flow) bool {
 		}
 	}
 	t.mu.Unlock()
-	if f.conn != nil && f.lis == nil {
-		return matches(t.sentByOf(f))
+	if f != nil && f.conn != nil && f.lis == nil {
+		host, p, err := t.sentByOf(f)
+		return err == nil && matches(host, p)
 	}
 	return false
 }

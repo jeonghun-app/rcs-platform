@@ -128,6 +128,11 @@ func TestInvalidProxyHeadersAreRejected(t *testing.T) {
 		{"source port 0", proxyHeaderFor(netip.MustParseAddrPort("192.0.2.10:0"), dst, nil)},
 		{"unspecified source", proxyHeaderFor(netip.MustParseAddrPort("0.0.0.0:40000"), dst, nil)},
 		{"multicast source", proxyHeaderFor(netip.MustParseAddrPort("[ff02::1]:40000"), netip.MustParseAddrPort("[2001:db8::1]:5060"), nil)},
+		{"loopback source", proxyHeaderFor(netip.MustParseAddrPort("127.0.0.1:40000"), dst, nil)},
+		{"IPv6 loopback source", proxyHeaderFor(netip.MustParseAddrPort("[::1]:40000"), netip.MustParseAddrPort("[2001:db8::1]:5060"), nil)},
+		{"link-local source", proxyHeaderFor(netip.MustParseAddrPort("[fe80::1]:40000"), netip.MustParseAddrPort("[2001:db8::1]:5060"), nil)},
+		{"instance metadata source", proxyHeaderFor(netip.MustParseAddrPort("169.254.169.254:80"), dst, nil)},
+		{"broadcast source", proxyHeaderFor(netip.MustParseAddrPort("255.255.255.255:40000"), dst, nil)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -204,7 +209,7 @@ func FuzzParseProxyHeader(f *testing.F) {
 			}
 			return
 		}
-		if !h.Source.IsValid() || h.Source.Port() == 0 || h.Source.Addr().Is4In6() {
+		if !h.Source.IsValid() || !usableClient(h.Source) || h.Source.Addr().Is4In6() {
 			t.Fatalf("accepted an unusable source %v", h.Source)
 		}
 		// Encoding what was parsed, without TLVs, must parse to the same header.

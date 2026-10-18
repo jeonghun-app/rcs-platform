@@ -48,6 +48,10 @@ const (
 	DefaultReadTimeout  = 32 * time.Second
 	DefaultWriteTimeout = 10 * time.Second
 	DefaultDialTimeout  = 5 * time.Second
+	// DefaultSendQueueBytes lets a core connection absorb a burst of a
+	// thousand typical requests while its peer catches up. A peer that never
+	// reads costs at most twice this before its connection is closed.
+	DefaultSendQueueBytes = 4 << 20
 )
 
 // Errors returned by the send methods. Errors from the network are returned
@@ -72,6 +76,9 @@ var (
 	// ErrTooManyConnections means MaxDialedConnections outbound connections
 	// are open or being opened.
 	ErrTooManyConnections = errors.New("transport: too many outbound connections")
+	// ErrQueueFull means a stream connection's send queue was full, so its peer
+	// was not reading; the connection has been closed.
+	ErrQueueFull = errors.New("transport: send queue full; connection closed")
 )
 
 // Handler receives every message the transport accepts. It runs on the goroutine
@@ -146,6 +153,11 @@ type Config struct {
 	// WriteTimeout bounds writing one message. A stream connection whose write
 	// fails or times out is closed, since part of a message may have been sent.
 	WriteTimeout time.Duration
+	// SendQueueBytes bounds what may wait to be written to one stream
+	// connection: a send waits for room, for at most WriteTimeout, while it is
+	// exceeded, and a NoWait send may use as much again. A connection whose
+	// queue stays full is closed.
+	SendQueueBytes int
 	// DialTimeout bounds opening an outbound connection, TLS handshake
 	// included.
 	DialTimeout time.Duration
@@ -190,6 +202,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.ReadTimeout, DefaultReadTimeout)
 	setDefault(&c.WriteTimeout, DefaultWriteTimeout)
 	setDefault(&c.DialTimeout, DefaultDialTimeout)
+	setDefault(&c.SendQueueBytes, DefaultSendQueueBytes)
 	if c.Dialer == nil {
 		c.Dialer = &net.Dialer{KeepAliveConfig: coreKeepAlive}
 	}
@@ -402,6 +415,7 @@ func (t *Transport) isClosed() bool {
 func (t *Transport) closeFlow(f *flow) {
 	if f.closed.CompareAndSwap(false, true) && f.conn != nil {
 		f.conn.Close()
+		f.q.close()
 	}
 	t.flows.remove(f)
 }
@@ -429,6 +443,7 @@ type Stats struct {
 	IdleTimeouts       uint64
 	ReadTimeouts       uint64 // stream connections closed mid-message or before their first message
 	WriteErrors        uint64
+	QueueOverflows     uint64 // stream connections closed because their send queue was full
 	KeepAlives         uint64 // CRLF pings answered
 	MalformedDatagrams uint64
 	InvalidMessages    uint64 // framed but refused by Validate; dropped
@@ -439,7 +454,7 @@ type Stats struct {
 type counters struct {
 	accepted, rejected, refused, dialed, dialErrors, dialLimited,
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
-	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, keepAlives,
+	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses atomic.Uint64
 }
 
@@ -469,6 +484,7 @@ func (t *Transport) Stats() Stats {
 		IdleTimeouts:       c.idleTimeouts.Load(),
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
+		QueueOverflows:     c.queueOverflows.Load(),
 		KeepAlives:         c.keepAlives.Load(),
 		MalformedDatagrams: c.malformedDatagrams.Load(),
 		InvalidMessages:    c.invalidMessages.Load(),
@@ -477,23 +493,32 @@ func (t *Transport) Stats() Stats {
 	}
 }
 
-// deliver checks a framed message and hands it to the handler.
+// deliver checks a framed stream message and hands it to the handler.
 func (t *Transport) deliver(f *flow, msg sip.Message) {
+	if t.accept(msg, f.remote, f) {
+		t.handler(Inbound{Message: msg, Source: f.source()})
+	}
+}
+
+// accept checks a framed message from remote: it must validate, a request gets
+// received and rport, and a response must carry our sent-by (RFC 3261 §18.1.2).
+// f is the stream flow it arrived on, nil for UDP. Refusals are counted.
+func (t *Transport) accept(msg sip.Message, remote netip.AddrPort, f *flow) bool {
 	if err := msg.Validate(); err != nil {
 		t.stats.invalidMessages.Add(1)
-		return
+		return false
 	}
 	switch m := msg.(type) {
 	case *sip.Request:
-		if err := stampReceived(m, f.remote); err != nil {
+		if err := stampReceived(m, remote); err != nil {
 			t.stats.invalidMessages.Add(1)
-			return
+			return false
 		}
 	case *sip.Response:
 		if !t.ownsTopVia(m, f) {
 			t.stats.strayResponses.Add(1)
-			return
+			return false
 		}
 	}
-	t.handler(Inbound{Message: msg, Source: f.source()})
+	return true
 }
