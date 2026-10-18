@@ -76,7 +76,7 @@ traffic within an AZ is not assumed to be.
    assigned ULAs are in `fd00::/8`); link-local (including the task metadata
    address), loopback and public hosts are refused in `staging`/`prod`.
    Internal clients never follow redirects. IPv6 GUAs are refused (fails safe on
-   dual-stack VPCs). (Amended in #63: ULAs were always accepted by the code and
+   dual-stack VPCs). (Amended in #64: ULAs were always accepted by the code and
    are now named here.)
    Operators reach the HSS API only from inside the VPC (a task or an internal
    ALB with TLS); it is never on the public ALB.

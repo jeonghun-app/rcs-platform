@@ -88,7 +88,7 @@ Two services can run today, `ft-server` and `msrp-relay`; the IMS core
   a keep-alive is 1740 s, just under the NLB's 1800 s, instead of 1900 s. The
   client then sees a clean close rather than a later reset. ADR 0007 §5 now
   also names IPv6 unique local addresses as private hosts for plain `http`,
-  which the code already accepted. (#63)
+  which the code already accepted. (#64)
 - `ft-server` defaults for group chats: `FT_MAX_DOWNLOADS_PER_FILE` is 64
   (was 4) and `FT_MIN_DOWNLOAD_RATE` is 4 KiB/s (was 1 KiB/s). The download
   limits must nest (per file ≤ per uploader < per task); staging and prod

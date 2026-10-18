@@ -53,7 +53,7 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
     flows that did not. 1740 s is just under the TCP listener's 1800 s, as 340 s
     is just under the TLS listener's 350 s, so on either listener the client sees
     a clean close from `pcscf` rather than a later reset from the NLB;
-    `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s). (Amended in #63:
+    `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s). (Amended in #64:
     the TCP value was 1900 s, above the NLB's own timeout.)
     Idle connections longer than 350 s are not expected to survive even on TCP
     listeners: the target ENI's connection tracking on Fargate is not
