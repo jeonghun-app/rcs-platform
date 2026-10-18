@@ -2,6 +2,7 @@ package hss
 
 import (
 	"encoding/base64"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"net"
 	"net/netip"
 	"strconv"
@@ -121,13 +122,13 @@ func Configure(s *runtime.Settings) Config {
 			e.Invalid(addr.name, "not host:port")
 		}
 	}
-	if !isDomain(c.Namespace) {
+	if !identity.IsDomainName(c.Namespace) {
 		e.Invalid("NAMESPACE", "not a domain name")
 	}
-	if c.OriginHost != "" && !isDomain(c.OriginHost) {
+	if c.OriginHost != "" && !identity.IsDomainName(c.OriginHost) {
 		e.Invalid("DIAMETER_HOST", "not a domain name")
 	}
-	if domain != "" && !isDomain(c.OriginRealm) {
+	if domain != "" && !identity.IsDomainName(c.OriginRealm) {
 		e.Invalid("DIAMETER_REALM", "not a domain name")
 	}
 	if c.FTRealm != "" && c.FTRealm == c.IMSRealm {
@@ -195,7 +196,7 @@ func isSIPHostURI(v string) bool {
 		}
 		host = h
 	}
-	return isDomain(host)
+	return identity.IsDomainName(host)
 }
 
 func cutScheme(v string) (string, bool) {

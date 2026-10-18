@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"io"
 	"log/slog"
 	"strconv"
@@ -81,7 +82,7 @@ func (c *CxServer) count(cmd string, r cx.Result) {
 // pair finds the subscription of impi and checks that impu, in canonical
 // form, is one of its identities (TS 29.228 §6.1.1.1, §6.3.1 steps 1 to 3).
 func (c *CxServer) pair(ctx context.Context, impi, impu string) (*store.Subscription, string, error) {
-	canonical, ok := CanonicalIMPU(impu)
+	canonical, ok := identity.CanonicalIMPU(impu)
 	if !ok {
 		return nil, "", experimental(cx.ErrorUserUnknown)
 	}
@@ -109,7 +110,7 @@ func (c *CxServer) pair(ctx context.Context, impi, impu string) (*store.Subscrip
 
 // byIMPU finds the subscription of a public identity.
 func (c *CxServer) byIMPU(ctx context.Context, impu string) (*store.Subscription, string, error) {
-	canonical, ok := CanonicalIMPU(impu)
+	canonical, ok := identity.CanonicalIMPU(impu)
 	if !ok {
 		return nil, "", experimental(cx.ErrorUserUnknown)
 	}
@@ -258,7 +259,7 @@ func (c *CxServer) applySAR(ctx context.Context, r *cx.SAR, a *cx.SAA) error {
 	var err error
 	impus := make([]string, 0, len(r.PublicIdentities))
 	for _, id := range r.PublicIdentities {
-		canonical, ok := CanonicalIMPU(id)
+		canonical, ok := identity.CanonicalIMPU(id)
 		if !ok {
 			return experimental(cx.ErrorUserUnknown)
 		}

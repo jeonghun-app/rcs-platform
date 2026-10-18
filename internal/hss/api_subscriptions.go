@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,7 +98,7 @@ const maxImplicitSet = 1 << 16
 // s, leaving the Cx state and the credentials alone.
 func (a *API) apply(req *subscriptionRequest, s *store.Subscription) error {
 	if req.IMSI != "" {
-		if err := ValidIMSI(req.IMSI); err != nil {
+		if err := identity.ValidIMSI(req.IMSI); err != nil {
 			return fail(http.StatusBadRequest, "imsi: "+err.Error())
 		}
 	}
@@ -108,10 +109,10 @@ func (a *API) apply(req *subscriptionRequest, s *store.Subscription) error {
 	seen := map[string]bool{}
 	for i, p := range req.PublicIdentities {
 		where := "public_identities[" + strconv.Itoa(i) + "]"
-		impu, ok := CanonicalIMPU(p.IMPU)
+		impu, ok := identity.CanonicalIMPU(p.IMPU)
 		switch {
 		case !ok:
-			return fail(http.StatusBadRequest, where+".impu: "+errIMPU.Error())
+			return fail(http.StatusBadRequest, where+".impu: "+identity.ErrIMPU.Error())
 		case seen[impu]:
 			return fail(http.StatusBadRequest, where+".impu: listed twice")
 		case p.IdentityType != "" && p.IdentityType != identityTypePublicUser:
@@ -173,7 +174,7 @@ func isDiameterURI(s string) bool {
 	if i := strings.IndexAny(rest, ":;"); i >= 0 {
 		host = rest[:i]
 	}
-	if !isDomain(host) {
+	if !identity.IsDomainName(host) {
 		return false
 	}
 	for i := 0; i < len(rest); i++ {
@@ -186,7 +187,7 @@ func isDiameterURI(s string) bool {
 
 func (a *API) impi(r *http.Request) (string, error) {
 	impi := r.PathValue("impi")
-	if err := ValidIMPI(impi); err != nil {
+	if err := identity.ValidIMPI(impi); err != nil {
 		return "", fail(http.StatusBadRequest, "impi: "+err.Error())
 	}
 	return impi, nil
@@ -197,7 +198,7 @@ func (a *API) createSubscription(w http.ResponseWriter, r *http.Request, _ Scope
 	if err := decodeBody(w, r, maxSubscriptionBody, &req); err != nil {
 		return err
 	}
-	if err := ValidIMPI(req.IMPI); err != nil {
+	if err := identity.ValidIMPI(req.IMPI); err != nil {
 		return fail(http.StatusBadRequest, "impi: "+err.Error())
 	}
 	s := &store.Subscription{IMPI: req.IMPI}

@@ -1,8 +1,18 @@
-package hss
+package identity
 
 import (
 	"strings"
 	"testing"
+)
+
+// Test identities: MCC 001 / MNC 01 and the fictional +1 555 0100 range
+// (.github/allowed-test-identifiers.txt).
+const (
+	domain = "ims.mnc001.mcc001.3gppnetwork.org"
+	imsi1  = "001010000000001"
+	impi1  = imsi1 + "@" + domain
+	impu1  = "sip:+15550100001@" + domain
+	tel1   = "tel:+15550100001"
 )
 
 func TestPrivateIdentitiesAreNAIs(t *testing.T) {
@@ -35,17 +45,6 @@ func TestIMSIsAreSixToFifteenDigits(t *testing.T) {
 	} {
 		if got := ValidIMSI(imsi) == nil; got != want {
 			t.Errorf("ValidIMSI(%q) = %t, want %t", imsi, got, want)
-		}
-	}
-}
-
-func TestProfileIDsAreLowerCaseLabels(t *testing.T) {
-	for id, want := range map[string]bool{
-		"rcs-default": true, "a.b_c-1": true, "": false, "Upper": false, "a b": false, "a/b": false,
-		strings.Repeat("a", 64): true, strings.Repeat("a", 65): false,
-	} {
-		if got := ValidProfileID(id) == nil; got != want {
-			t.Errorf("ValidProfileID(%q) = %t, want %t", id, got, want)
 		}
 	}
 }
@@ -101,4 +100,15 @@ func FuzzCanonicalIMPU(f *testing.F) {
 			t.Fatalf("CanonicalIMPU(%q) = %q, which canonicalises to %q, %t", s, c, again, ok)
 		}
 	})
+}
+
+func TestDomainNamesAreLDHLabels(t *testing.T) {
+	for name, want := range map[string]bool{
+		domain: true, "a": true, "a-b.c": true, "": false, "-a.b": false, "a-.b": false, "a..b": false,
+		"a_b.c": false, strings.Repeat("a", 64) + ".b": false, strings.Repeat("a.", 127) + "a": false,
+	} {
+		if got := IsDomainName(name); got != want {
+			t.Errorf("IsDomainName(%q) = %t, want %t", name, got, want)
+		}
+	}
 }

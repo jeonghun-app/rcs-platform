@@ -127,7 +127,7 @@ func (Sealed) MarshalJSON() ([]byte, error) { return []byte(`"` + sealedPlacehol
 // PublicIdentity is one IMPU of a subscription.
 type PublicIdentity struct {
 	// IMPU is a SIP URI or a global tel URI in the canonical form the HSS
-	// matches on (see hss.CanonicalIMPU).
+	// matches on (see identity.CanonicalIMPU).
 	IMPU string
 	// Barred bars the identity from every IMS communication except
 	// registration (TS 29.228 B.2.1, TS 23.228 §4.3.3.4).

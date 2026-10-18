@@ -1,22 +1,30 @@
-package hss
+// Package identity holds the rules for IMS user identities that more than
+// one service must apply the same way: what a private identity (IMPI) and an
+// IMSI look like, and the one canonical form of a public identity (IMPU).
+//
+// The HSS stores IMPUs in canonical form and sends them so in User-Data;
+// icscf and scscf put the identities of a SIP request into the same form
+// before they compare them with the HSS's, or look them up, so that
+// sip:+1555...@IMS.example registers the user provisioned as
+// sip:+1555...@ims.example (RFC 3261 §19.1.4).
+package identity
 
 import (
 	"errors"
 	"strings"
 
-	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
-// Identity formats. The HSS matches identities as strings, so it stores
-// them in one canonical form and puts every identity it receives over Cx
-// into the same form before looking it up.
+// MaxLength bounds every identity: no IMPI, IMPU or IMSI legitimately comes
+// near it, and it keeps them inside one DynamoDB key and one log field.
+const MaxLength = 255
 
+// Errors of the validators. They describe the rule, never the value.
 var (
-	errIMPI      = errors.New("not a private user identity of the form user@realm")
-	errIMPU      = errors.New("not a SIP URI or global tel URI without parameters")
-	errIMSI      = errors.New("not an IMSI of 6 to 15 digits")
-	errProfileID = errors.New("not a profile ID of 1 to 64 characters a-z, 0-9, '.', '_' or '-'")
+	ErrIMPI = errors.New("not a private user identity of the form user@realm")
+	ErrIMPU = errors.New("not a SIP URI or global tel URI without parameters")
+	ErrIMSI = errors.New("not an IMSI of 6 to 15 digits")
 )
 
 // ValidIMPI checks a private user identity: an NAI user@realm (TS 23.003
@@ -25,12 +33,12 @@ var (
 // segment of the provisioning API.
 func ValidIMPI(impi string) error {
 	user, realm, ok := strings.Cut(impi, "@")
-	if !ok || user == "" || len(impi) > store.MaxIdentityLength || strings.Contains(realm, "@") || !isDomain(realm) {
-		return errIMPI
+	if !ok || user == "" || len(impi) > MaxLength || strings.Contains(realm, "@") || !IsDomainName(realm) {
+		return ErrIMPI
 	}
 	for i := 0; i < len(user); i++ {
 		if c := user[i]; c <= ' ' || c >= 0x7f || c == '/' || c == '%' || c == '\\' {
-			return errIMPI
+			return ErrIMPI
 		}
 	}
 	return nil
@@ -40,28 +48,14 @@ func ValidIMPI(impi string) error {
 // §2.2).
 func ValidIMSI(imsi string) error {
 	if len(imsi) < 6 || len(imsi) > 15 || strings.Trim(imsi, "0123456789") != "" {
-		return errIMSI
+		return ErrIMSI
 	}
 	return nil
 }
 
-// ValidProfileID checks a service profile identifier.
-func ValidProfileID(id string) error {
-	if id == "" || len(id) > store.MaxProfileIDLength {
-		return errProfileID
-	}
-	for i := 0; i < len(id); i++ {
-		c := id[i]
-		if !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '.' || c == '_' || c == '-') {
-			return errProfileID
-		}
-	}
-	return nil
-}
-
-// isDomain reports whether s is a domain name of LDH labels (RFC 1035
+// IsDomainName reports whether s is a domain name of LDH labels (RFC 1035
 // §2.3.1, RFC 1123 §2.1).
-func isDomain(s string) bool {
+func IsDomainName(s string) bool {
 	if s == "" || len(s) > 253 {
 		return false
 	}
@@ -80,7 +74,7 @@ func isDomain(s string) bool {
 }
 
 // CanonicalIMPU returns the form in which the HSS stores and matches a
-// public identity, or false when s is not one: a SIP or SIPS URI becomes
+// public identity, and in which every service compares one, or false when s is not one: a SIP or SIPS URI becomes
 // scheme:user@host with the escapes in the user part decoded and the host
 // in lower case (RFC 3261 §19.1.4: hosts compare without regard to case,
 // users with it, and escaped characters equal their unescaped form); a tel
@@ -88,7 +82,7 @@ func isDomain(s string) bool {
 // parameters, which an IMPU in a Cx request may carry (user=phone), are
 // dropped. A SIP URI needs a user part and no password, port or headers.
 func CanonicalIMPU(s string) (string, bool) {
-	if len(s) > store.MaxIdentityLength {
+	if len(s) > MaxLength {
 		return "", false
 	}
 	u, err := sip.ParseURI(s)
