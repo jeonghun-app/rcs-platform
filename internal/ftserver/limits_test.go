@@ -496,3 +496,38 @@ func TestCompletingUpdateStopsRetryingOnAConflict(t *testing.T) {
 		t.Fatalf("complete = %v, retried %v", err, e.metric("upload.commit_retried"))
 	}
 }
+
+func TestZeroDownloadRateFloorTurnsOffBothRegimes(t *testing.T) {
+	e := newEnv(t, func(o *Options) {
+		o.MinDownloadRate = 0
+		o.MinDownloadRateUnderPressure = 100
+		o.MaxConcurrentDownloads = 4
+	})
+	file, _ := uploaded(t, e, pattern(4*testPart))
+	wall := time.Unix(1_800_000_000, 0)
+	e.srv.wallNow = func() time.Time { return wall }
+	e.srv.o.Blobs = slowBlobs{Blobs: e.blobs, now: &wall, step: 10 * time.Second}
+	// Four of four slots taken: under pressure, yet the floor stays off.
+	r1, _ := acquireSlot(e.srv.downloads)
+	r2, _ := acquireSlot(e.srv.downloads)
+	r3, _ := acquireSlot(e.srv.downloads)
+	defer r1()
+	defer r2()
+	defer r3()
+	if rec := get(e, file); rec.Code != http.StatusOK || rec.Body.Len() != 4*testPart || e.metric("download.failed.too_slow") != 0 {
+		t.Fatalf("a 10 B/s download with the floor off: %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestZeroPressurePercentMeansTheDefault(t *testing.T) {
+	// newEnv leaves DownloadPressurePercent at 0.
+	e := newEnv(t, func(o *Options) { o.MinDownloadRate = 10; o.MinDownloadRateUnderPressure = 100 })
+	if e.srv.o.DownloadPressurePercent != DefaultDownloadPressurePercent {
+		t.Fatalf("pressure percent = %d", e.srv.o.DownloadPressurePercent)
+	}
+	release, _ := acquireSlot(e.srv.downloads) // 1 of 8: no pressure
+	defer release()
+	if got := e.srv.minDownloadRate(); got != 10 {
+		t.Fatalf("one download in eight counted as pressure: floor %d", got)
+	}
+}

@@ -91,6 +91,8 @@ type Options struct {
 	// than DownloadPressurePercent of the task's download slots are taken.
 	// A slow mobile link must be able to finish a large file while slots
 	// are plentiful; when they run short, slow readers make room for others.
+	// A MinDownloadRate of 0 turns the floor off in both regimes, and a
+	// DownloadPressurePercent of 0 means DefaultDownloadPressurePercent.
 	MinDownloadRateUnderPressure int64
 	DownloadPressurePercent      int
 	// IdleTimeout ends a transfer that moves no byte for that long; zero
@@ -194,6 +196,10 @@ func New(o Options) (*Server, error) {
 	}
 	if s.random == nil {
 		s.random = rand.Reader
+	}
+	if s.o.DownloadPressurePercent == 0 {
+		// The zero value must not mean "always under pressure".
+		s.o.DownloadPressurePercent = DefaultDownloadPressurePercent
 	}
 	s.limiter = newLimiter(o.UploadsPerMinute, s.now)
 	// One byte more than a part: a full part is stored only once the next
@@ -432,9 +438,19 @@ func (u *userSlots) acquire(owner string) (release func(), ok bool) {
 	}, true
 }
 
+// completeBudget bounds the completion of an upload: storing the last part,
+// closing the object, every try of the completing update and the read-back.
+// Two thirds of a lease, so that a writer that renews its lease at the start
+// of completion is done while it still holds it.
+func (s *Server) completeBudget() time.Duration { return s.leaseTTL * 2 / 3 }
+
 // minDownloadRate is the download rate floor now: the stricter one while
 // the task's download slots are under pressure.
 func (s *Server) minDownloadRate() int64 {
+	if s.o.MinDownloadRate == 0 {
+		// Turned off, in both regimes.
+		return 0
+	}
 	if used, total := len(s.downloads), cap(s.downloads); used*100 > s.o.DownloadPressurePercent*total {
 		return s.o.MinDownloadRateUnderPressure
 	}

@@ -121,7 +121,8 @@ byte 0, and the resume URL:
     time.
 - The update that completes an upload depends on the version the writer holds,
   so two tasks cannot both complete the same `tid`. A transient failure of that
-  update is retried, and each attempt gets its own `FT_STORAGE_TIMEOUT`.
+  update is retried, and each attempt gets its own `FT_STORAGE_TIMEOUT`, all
+  within the completion budget (see Operations notes).
   - An update can be applied with its answer lost, either because our deadline
     ended the call after DynamoDB wrote, or because the SDK's retry met the write
     as a conflict.
@@ -293,10 +294,10 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_MIN_UPLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower upload is cut off with `408`. `0` turns the check off |
 | `FT_MAX_CONCURRENT_DOWNLOADS` | `256` | Downloads in progress per task |
 | `FT_MAX_DOWNLOADS_PER_FILE` | `64` | Downloads of one file in progress per task, enough for a group chat fetching one link at once |
-| `FT_MAX_DOWNLOADS_PER_UPLOADER` | `128` | Downloads in progress per task across all the files of one uploader. The download limits must nest: `FT_MAX_DOWNLOADS_PER_FILE` ≤ `FT_MAX_DOWNLOADS_PER_UPLOADER` ≤ `FT_MAX_CONCURRENT_DOWNLOADS`. Otherwise staging and prod refuse to start, and dev warns |
-| `FT_MIN_DOWNLOAD_RATE` | `4096` (4 KiB/s) | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off |
-| `FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE` | `16384` (16 KiB/s) | The floor while the task's download slots are under pressure |
-| `FT_DOWNLOAD_PRESSURE_PERCENT` | `75` | Share of `FT_MAX_CONCURRENT_DOWNLOADS` in use above which the pressure floor applies |
+| `FT_MAX_DOWNLOADS_PER_UPLOADER` | `128` | Downloads in progress per task across all the files of one uploader. The download limits must nest: `FT_MAX_DOWNLOADS_PER_FILE` ≤ `FT_MAX_DOWNLOADS_PER_UPLOADER` < `FT_MAX_CONCURRENT_DOWNLOADS`. The second comparison is strict, because a per-uploader limit equal to the task's lets one subscriber's links take every slot. Otherwise staging and prod refuse to start, and dev warns |
+| `FT_MIN_DOWNLOAD_RATE` | `4096` (4 KiB/s) | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off in both regimes, under pressure too |
+| `FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE` | `16384` (16 KiB/s) | The floor while the task's download slots are under pressure. It must not be below `FT_MIN_DOWNLOAD_RATE`: staging and prod refuse to start, and dev warns |
+| `FT_DOWNLOAD_PRESSURE_PERCENT` | `75` | Share of `FT_MAX_CONCURRENT_DOWNLOADS` in use, from 1 to 100, above which the pressure floor applies |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
 | `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
@@ -465,6 +466,13 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 - **Rate limit.** The upload rate limit is per task, so a user spread over N
   tasks can start N times as many uploads. It stops a runaway client; the WAF
   rule stops a determined one.
+- **Completion time.** Completing an upload covers storing the last part,
+  closing the object, every try of the completing update and the read-back. It
+  all runs within a budget of two thirds of a lease: 2 minutes with the default
+  3-minute lease. If less than that is left of the lease, the lease is renewed
+  first, so a writer is done, committed or failed, while it still holds the
+  lease. Each call still has its own `FT_STORAGE_TIMEOUT`, and a quarter of the
+  budget (at most one `FT_STORAGE_TIMEOUT`) is kept for the read-back.
 - **Dead task.** A task that crashes while writing leaves the upload's lease
   until it lapses, which takes up to 3 minutes with the defaults. During that
   time the client gets `503` with `Retry-After` on resume.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	goruntime "runtime"
 	"testing"
 	"time"
 
@@ -40,6 +41,19 @@ func startRun(t *testing.T, h *runtimetest.Harness, cfg Config) (string, context
 	return "", cancel, done
 }
 
+// waitReady returns once the runtime has logged "ready", yielding to the
+// goroutine running Run; it fails the test after ten seconds.
+func waitReady(t *testing.T, h *runtimetest.Harness) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(h.Logs("ready")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Run never reported ready")
+		}
+		goruntime.Gosched()
+	}
+}
+
 func TestRunServesUntilCancelledAndDrainsOnShutdown(t *testing.T) {
 	h := runtimetest.New(t, "ft-server")
 	cfg, err := configure(devEnv)
@@ -55,6 +69,9 @@ func TestRunServesUntilCancelledAndDrainsOnShutdown(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized || len(resp.Header.Values("WWW-Authenticate")) != 2 {
 		t.Fatalf("pre-check = %d", resp.StatusCode)
 	}
+	// Run reports ready just after it starts serving, which is after the
+	// listener exists: wait for the "ready" line rather than racing it.
+	waitReady(t, h)
 	if code, _ := h.Get("/readyz"); code != http.StatusOK {
 		t.Fatalf("/readyz = %d", code)
 	}

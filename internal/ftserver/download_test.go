@@ -347,6 +347,7 @@ func TestDownloadDefaultsLetAGroupChatFetchOneLinkAtOnce(t *testing.T) {
 		"zero per uploader":    with(devEnv, "FT_MAX_DOWNLOADS_PER_UPLOADER", "0"),
 		"negative pressure":    with(devEnv, "FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "-1"),
 		"percent out of range": with(devEnv, "FT_DOWNLOAD_PRESSURE_PERCENT", "101"),
+		"zero percent":         with(devEnv, "FT_DOWNLOAD_PRESSURE_PERCENT", "0"),
 	} {
 		if _, err := configure(env); err == nil {
 			t.Errorf("%s was accepted", name)
@@ -357,15 +358,23 @@ func TestDownloadDefaultsLetAGroupChatFetchOneLinkAtOnce(t *testing.T) {
 func TestDownloadLimitsMustNestOrProductionRefusesToStart(t *testing.T) {
 	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32))
 	for name, env := range map[string]map[string]string{
-		"per file above per uploader": with(prod, "FT_MAX_DOWNLOADS_PER_FILE", "200"),
-		"per uploader above the task": with(prod, "FT_MAX_CONCURRENT_DOWNLOADS", "100"),
+		"per file above per uploader":    with(prod, "FT_MAX_DOWNLOADS_PER_FILE", "200"),
+		"per uploader above the task":    with(prod, "FT_MAX_CONCURRENT_DOWNLOADS", "100"),
+		"per uploader equal to the task": with(prod, "FT_MAX_CONCURRENT_DOWNLOADS", "128"),
 	} {
-		if _, out := runService(t, env); !strings.Contains(out, "FT_MAX_DOWNLOADS_PER_UPLOADER ≤ FT_MAX_CONCURRENT_DOWNLOADS does not hold") {
+		if _, out := runService(t, env); !strings.Contains(out, "FT_MAX_DOWNLOADS_PER_UPLOADER < FT_MAX_CONCURRENT_DOWNLOADS does not hold") {
 			t.Errorf("%s: not refused:\n%s", name, out)
 		}
 	}
 	if _, out := runService(t, prod); strings.Contains(out, "does not hold") {
 		t.Fatalf("the defaults were refused:\n%s", out)
+	}
+	low := "FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE is below FT_MIN_DOWNLOAD_RATE"
+	if _, out := runService(t, with(prod, "FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "1024")); !strings.Contains(out, low) {
+		t.Errorf("a pressure floor below the normal one was not refused:\n%s", out)
+	}
+	if _, out := runService(t, with(prod, "FT_MIN_DOWNLOAD_RATE", "0", "FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "1024")); strings.Contains(out, low) {
+		t.Errorf("with both floors off the pressure floor still counted:\n%s", out)
 	}
 	// dev starts with a warning instead.
 	_, out := runService(t, with(devEnv, "FT_MAX_CONCURRENT_DOWNLOADS", "100"))

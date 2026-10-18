@@ -3,6 +3,7 @@ package ftserver
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -103,9 +104,17 @@ func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
 			// The first attempt really expires; a later attempt meets the
 			// applied write as a conflict, or, if every attempt expires,
 			// the final read-back finds it.
-			rec := e.user(alice).upload(multipartBody(tidPart("expired"), filePart("a", "text/plain", data)))
+			u := e.user(alice)
+			u.challenge()
+			start := time.Now()
+			rec := u.upload(multipartBody(tidPart("expired"), filePart("a", "text/plain", data)))
 			if rec.Code != http.StatusOK || e.metric("upload.commit_recovered") != 1 {
 				t.Fatalf("status = %d, recovered %v, retried %v", rec.Code, e.metric("upload.commit_recovered"), e.metric("upload.commit_retried"))
+			}
+			// However many attempts time out, completion ends within its
+			// budget, while the writer still holds the lease.
+			if took := time.Since(start); took > e.srv.completeBudget()+time.Second {
+				t.Fatalf("completion took %v, budget %v", took, e.srv.completeBudget())
 			}
 		})
 	}
@@ -139,5 +148,35 @@ func TestCommitUnderTheSameKeyWithAnotherHashIsNotMistakenForOurs(t *testing.T) 
 	rec := e.user(alice).upload(multipartBody(tidPart("same-key"), filePart("a", "text/plain", "mine")))
 	if rec.Code != http.StatusConflict || e.metric("upload.commit_recovered") != 0 {
 		t.Fatalf("status = %d, recovered %v", rec.Code, e.metric("upload.commit_recovered"))
+	}
+}
+
+func TestCompletionRenewsALeaseWithLessThanItsBudgetLeft(t *testing.T) {
+	e := newEnv(t)
+	u := e.user(alice)
+	data := pattern(2*testPart + 1)
+	breakUpload(t, e, u, "late", data, testPart+1)
+	rec, _ := e.meta.GetByTID(t.Context(), alice, "late")
+	rec, err := e.srv.acquireLease(t.Context(), rec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := e.srv.newWriter(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	if err := w.copy(t.Context(), strings.NewReader(data[testPart:])); err != nil {
+		t.Fatal(err)
+	}
+	// Most of the lease is gone by the time the content has arrived.
+	e.clock.Advance(e.srv.leaseTTL - e.srv.completeBudget()/2)
+	renewals := e.metric("upload.lease_renewed")
+	done, err := w.complete(t.Context())
+	if err != nil || done.State != store.Complete {
+		t.Fatalf("complete = %+v, %v", done, err)
+	}
+	if e.metric("upload.lease_renewed") != renewals+1 {
+		t.Fatal("the lease was not renewed before completing")
 	}
 }

@@ -282,14 +282,20 @@ func Configure(s *runtime.Settings) Config {
 	if c.MinDownloadRatePressure < 0 {
 		e.Invalid("MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "must not be negative")
 	}
-	if c.DownloadPressurePercent < 0 || c.DownloadPressurePercent > 100 {
-		e.Invalid("DOWNLOAD_PRESSURE_PERCENT", "must be from 0 to 100")
+	if c.DownloadPressurePercent < 1 || c.DownloadPressurePercent > 100 {
+		e.Invalid("DOWNLOAD_PRESSURE_PERCENT", "must be from 1 to 100")
 	}
+	// The pressure floor is the stricter one; below the normal floor it
+	// would loosen the check exactly when slots run short. With the normal
+	// floor at 0 both are off, so the pressure floor does not matter.
+	s.ForbidInProduction(c.MinDownloadRate > 0 && c.MinDownloadRatePressure < c.MinDownloadRate,
+		"FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE is below FT_MIN_DOWNLOAD_RATE: the floor would loosen when download slots run short")
 	// Each download limit only protects if it is tighter than the one
-	// around it: a per-uploader limit above the task's would let one
-	// subscriber's links take every slot again.
-	s.ForbidInProduction(c.MaxDownloadsPerFile > c.MaxDownloadsPerUploader || c.MaxDownloadsPerUploader > c.MaxDownloads,
-		"FT_MAX_DOWNLOADS_PER_FILE ≤ FT_MAX_DOWNLOADS_PER_UPLOADER ≤ FT_MAX_CONCURRENT_DOWNLOADS does not hold: a looser inner limit protects nothing")
+	// around it.
+	// The per-uploader limit is strictly below the task's: equal to it, one
+	// subscriber's links could still take every slot.
+	s.ForbidInProduction(c.MaxDownloadsPerFile > c.MaxDownloadsPerUploader || c.MaxDownloadsPerUploader >= c.MaxDownloads,
+		"FT_MAX_DOWNLOADS_PER_FILE ≤ FT_MAX_DOWNLOADS_PER_UPLOADER < FT_MAX_CONCURRENT_DOWNLOADS does not hold: a looser inner limit protects nothing")
 	return c
 }
 
