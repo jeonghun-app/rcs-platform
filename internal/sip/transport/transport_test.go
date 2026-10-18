@@ -225,7 +225,7 @@ func TestTCPRequestCarriesReceivedAndRPortAndItsResponseUsesTheConnection(t *tes
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d", res.StatusCode)
 	}
-	if s := server.Stats(); s.Accepted != 1 || s.OpenConnections != 1 {
+	if s := server.Stats(); s.Accepted != 1 || s.OpenInbound != 1 || s.OpenOutbound != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 }
@@ -362,24 +362,37 @@ func TestResponseIsRoutedToSentByWhenTheConnectionHasClosed(t *testing.T) {
 
 func TestFramingErrorClosesTheConnectionAndIsCounted(t *testing.T) {
 	for name, junk := range map[string]string{
-		"garbage start line":     "HELLO\r\n\r\n",
-		"no Content-Length":      strings.Replace(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1"), "Content-Length: 0\r\n", "", 1),
-		"bare LF line ends":      "OPTIONS sip:a@example.com SIP/2.0\n\n",
-		"cut short by the close": "OPTIONS sip:a@example.com SIP/2.0\r\nVia: SIP",
+		"garbage start line": "HELLO\r\n\r\n",
+		"no Content-Length":  strings.Replace(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1"), "Content-Length: 0\r\n", "", 1),
+		"bare LF line ends":  "OPTIONS sip:a@example.com SIP/2.0\n\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			server, rec := newTransport(t, Config{})
 			addr := listen(t, server, ListenerConfig{Network: TCP})
 			c := dialRaw(t, addr)
 			c.Write([]byte(junk))
-			if name == "cut short by the close" {
-				c.(*net.TCPConn).CloseWrite()
-			}
 			waitClosed(t, c)
 			eventually(t, "a framing error", func() bool { return server.Stats().FramingErrors == 1 })
+			if s := server.Stats(); s.TruncatedMessages != 0 {
+				t.Fatalf("stats = %+v", s)
+			}
 			rec.none(t)
 		})
 	}
+}
+
+func TestMessageCutShortByThePeerIsCountedApartFromFramingErrors(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: TCP})
+	c := dialRaw(t, addr)
+	c.Write([]byte("OPTIONS sip:a@example.com SIP/2.0\r\nVia: SIP"))
+	c.(*net.TCPConn).CloseWrite()
+	waitClosed(t, c)
+	eventually(t, "a truncated message", func() bool { return server.Stats().TruncatedMessages == 1 })
+	if s := server.Stats(); s.FramingErrors != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	rec.none(t)
 }
 
 func TestInvalidMessageIsDroppedButTheConnectionStays(t *testing.T) {
@@ -431,10 +444,37 @@ func TestDoubleCRLFPingIsAnsweredWithASingleCRLF(t *testing.T) {
 }
 
 func TestIdleConnectionIsClosedAfterTheIdleTimeout(t *testing.T) {
-	server, _ := newTransport(t, Config{IdleTimeout: time.Nanosecond})
+	server, rec := newTransport(t, Config{IdleTimeout: time.Nanosecond})
 	addr := listen(t, server, ListenerConfig{Network: TCP})
-	waitClosed(t, dialRaw(t, addr))
+	c := dialRaw(t, addr)
+	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+	rec.next(t)
+	waitClosed(t, c)
 	eventually(t, "an idle timeout", func() bool { return server.Stats().IdleTimeouts == 1 })
+}
+
+func TestListenerIdleTimeoutOverridesTheTransportDefault(t *testing.T) {
+	server, rec := newTransport(t, Config{IdleTimeout: time.Hour})
+	addr := listen(t, server, ListenerConfig{Network: TCP, IdleTimeout: time.Nanosecond})
+	c := dialRaw(t, addr)
+	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+	rec.next(t)
+	waitClosed(t, c)
+	eventually(t, "an idle timeout", func() bool { return server.Stats().IdleTimeouts == 1 })
+}
+
+func TestAcceptedConnectionThatSendsNoMessageIsClosedAfterTheReadTimeout(t *testing.T) {
+	// The idle timeout is an hour, and keep-alives do not count as a first
+	// message, so only the read timeout can free this slot.
+	server, _ := newTransport(t, Config{IdleTimeout: time.Hour, ReadTimeout: 50 * time.Millisecond})
+	addr := listen(t, server, ListenerConfig{Network: TCP})
+	c := dialRaw(t, addr)
+	c.Write([]byte("\r\n\r\n"))
+	waitClosed(t, c)
+	eventually(t, "a read timeout", func() bool { return server.Stats().ReadTimeouts == 1 })
+	if s := server.Stats(); s.IdleTimeouts != 0 || s.KeepAlives != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
 }
 
 func TestTrickledHeaderIsCutOffByTheReadTimeout(t *testing.T) {
@@ -493,7 +533,7 @@ func TestConnectionsBeyondTheLimitAreRefused(t *testing.T) {
 	}
 	// Closing the first connection frees its slot.
 	first.Close()
-	eventually(t, "the slot to free", func() bool { return server.Stats().OpenConnections == 0 })
+	eventually(t, "the slot to free", func() bool { return server.Stats().OpenInbound == 0 })
 	c := dialRaw(t, addr)
 	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK2")))
 	rec.next(t)
@@ -536,7 +576,7 @@ func TestProxyLocalHealthCheckIsClosedWithoutAFlow(t *testing.T) {
 	c.Write(proxyHeader(0x20, 0x00, nil, nil))
 	waitClosed(t, c)
 	eventually(t, "the health check to be counted", func() bool { return server.Stats().HealthChecks == 1 })
-	if s := server.Stats(); s.OpenConnections != 0 || s.ProxyHeaderErrors != 0 {
+	if s := server.Stats(); s.OpenInbound != 0 || s.PendingAccepted != 0 || s.ProxyHeaderErrors != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 	rec.none(t)
@@ -553,7 +593,7 @@ func TestWriteThatTimesOutClosesTheConnection(t *testing.T) {
 	if _, err := tr.SendRequest(req, dst); err == nil {
 		t.Fatal("a write nobody read succeeded")
 	}
-	if s := tr.Stats(); s.WriteErrors != 1 || s.OpenConnections != 0 {
+	if s := tr.Stats(); s.WriteErrors != 1 || s.OpenOutbound != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 }

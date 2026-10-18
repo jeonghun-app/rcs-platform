@@ -20,11 +20,28 @@ import (
 
 // Defaults for the zero fields of Config.
 const (
-	DefaultMaxConnections = 10000
-	DefaultMaxUDPFlows    = 65536
-	// DefaultIdleTimeout matches the NLB idle timeout of the SIP listeners (ADR
-	// 0003), so a quiet flow the load balancer keeps is not cut here first.
-	DefaultIdleTimeout = 1800 * time.Second
+	DefaultMaxConnections       = 10000
+	DefaultMaxDialedConnections = 1024
+	DefaultMaxUDPFlows          = 65536
+	// DefaultMaxUDPFlowsPerIP keeps one host with many source ports from
+	// displacing everyone else's UDP flows. Clients behind a carrier-grade NAT
+	// share an address, so an operator whose clients use UDP through one raises
+	// it.
+	DefaultMaxUDPFlowsPerIP = 256
+	// DefaultIdleTimeout is just below the 1800 s idle timeout of the NLB's TCP
+	// listeners (ADR 0003). Cutting a silent flow here first sends the client a
+	// FIN, so it reconnects, and a terminating request finds no flow and gets
+	// 430 at once; cutting it after the NLB has silently dropped the connection
+	// would let that request be written into a dead connection and time out. The
+	// NLB's TLS listeners have a fixed 350 s idle timeout, so the listener behind
+	// one sets ListenerConfig.IdleTimeout below that and the P-CSCF asks clients
+	// for keep-alives more often with Flow-Timer (RFC 5626 §4.4.1).
+	DefaultIdleTimeout = 1740 * time.Second
+	// DefaultUDPFlowTimeout is the shortest UDP mapping lifetime a NAT may use
+	// (RFC 4787 §4.3 REQ-5). Mobile NATs often keep mappings no longer, and
+	// reporting a flow alive past its mapping would send terminating requests
+	// into nothing until Timer F instead of answering 430.
+	DefaultUDPFlowTimeout = 120 * time.Second
 	// DefaultReadTimeout is 64*T1 with the default T1: a request that takes
 	// longer than that to arrive belongs to a transaction its sender has already
 	// given up on (RFC 3261 §17.1.1.2, §17.1.2.2).
@@ -39,22 +56,29 @@ var (
 	// ErrNoFlow means the FlowID names no live flow: it is unknown, forged,
 	// from an earlier process, or its connection has closed. A proxy answers
 	// a request it cannot forward for this reason with 430 Flow Failed (RFC 5626
-	// §5.3.1).
+	// §5.3.1). A response to a request from a client-facing listener whose
+	// connection has closed also fails with it.
 	ErrNoFlow = errors.New("transport: no such flow")
 	// ErrClosed means the transport has been closed.
 	ErrClosed = errors.New("transport: closed")
 	// ErrNoListener means a UDP message has no socket to leave from, or a TLS
 	// listener has no certificate configured.
 	ErrNoListener = errors.New("transport: no suitable listener")
-	// ErrUnroutable means a response's top Via does not say where to send it:
-	// an unsupported transport, or a sent-by host name with no received
-	// parameter, which would need RFC 3263 resolution this package does not do.
+	// ErrUnroutable means the transport cannot tell where, or how safely, to
+	// send: an unsupported transport or a sent-by host name without received in
+	// a response's top Via (RFC 3263 resolution is not done here), or a TLS
+	// connection with no server name to verify.
 	ErrUnroutable = errors.New("transport: cannot route the message")
+	// ErrTooManyConnections means MaxDialedConnections outbound connections
+	// are open or being opened.
+	ErrTooManyConnections = errors.New("transport: too many outbound connections")
 )
 
 // Handler receives every message the transport accepts. It runs on the goroutine
 // that read the message, one call at a time per connection and per UDP socket, so
-// messages from one flow arrive in order; it must hand off anything slow.
+// messages from one flow arrive in order. It must hand off anything slow: while it
+// runs, nothing else is read from that connection, or from that UDP socket, which
+// every UDP client shares.
 type Handler func(Inbound)
 
 // Inbound is a message received from the network.
@@ -96,19 +120,28 @@ type Config struct {
 	TLSClient *tls.Config
 
 	// MaxConnections bounds the TCP and TLS connections accepted from peers,
-	// counted from accept, so it also bounds handshakes in progress. Outbound
-	// connections are not counted: a flood of clients must not stop a proxy from
-	// reaching the core.
+	// counted from accept, so it also bounds handshakes in progress.
 	MaxConnections int
-	// MaxUDPFlows bounds the UDP sources tracked as flows. A datagram from a new
-	// source when the table is full is dropped and counted.
-	MaxUDPFlows int
+	// MaxDialedConnections bounds the connections this transport opens,
+	// separately, so a flood of clients cannot stop a proxy from reaching the
+	// core and nothing a client writes can make it open connections without
+	// limit.
+	MaxDialedConnections int
+	// MaxUDPFlows bounds the UDP sources tracked as flows, and MaxUDPFlowsPerIP
+	// those of one source address. At either limit the least recently seen flow
+	// in its scope makes room for the new one.
+	MaxUDPFlows      int
+	MaxUDPFlowsPerIP int
 	// IdleTimeout is how long a stream connection may go without receiving a
-	// byte between messages (keep-alives count), and how long a UDP flow lives
-	// without a datagram.
+	// byte between messages; keep-alives count. ListenerConfig.IdleTimeout
+	// overrides it for one listener.
 	IdleTimeout time.Duration
+	// UDPFlowTimeout is how long a UDP flow lives without a datagram.
+	UDPFlowTimeout time.Duration
 	// ReadTimeout bounds receiving one message from its first byte, the PROXY
-	// header and the TLS handshake.
+	// header and the TLS handshake, and, on an accepted connection, everything
+	// until the first message is complete, so a connection that never sends a
+	// message frees its MaxConnections slot quickly.
 	ReadTimeout time.Duration
 	// WriteTimeout bounds writing one message. A stream connection whose write
 	// fails or times out is closed, since part of a message may have been sent.
@@ -120,7 +153,22 @@ type Config struct {
 	// Limits bound every message read, on every transport.
 	Limits sip.Limits
 
-	// Dialer opens outbound connections; nil uses a net.Dialer.
+	// Admit, if set, is asked about every new inbound flow once its client
+	// address is known: after the PROXY header and before the TLS handshake of
+	// a stream connection, or on the first datagram from a UDP source. Returning
+	// false refuses the flow (the connection is closed, the datagram dropped)
+	// and counts it. A service enforces per-client limits with it. It runs on
+	// the accepting or reading goroutine and must not block.
+	Admit func(id FlowID, info FlowInfo) bool
+	// OnFlowClosed, if set, is told once about every flow that ends: each
+	// admitted inbound flow (even if its TLS handshake then fails) and each
+	// outbound connection. UDP flows end when they expire, which is noticed on
+	// the next lookup or datagram, when they are displaced, or on Close. It must
+	// not block, and must not call back into the transport synchronously.
+	OnFlowClosed func(id FlowID, info FlowInfo)
+
+	// Dialer opens outbound connections; nil uses a net.Dialer with the core
+	// keep-alive described at ListenerConfig.KeepAlive.
 	Dialer Dialer
 	// Rand is the source of the flow key; nil uses crypto/rand.
 	Rand io.Reader
@@ -133,26 +181,17 @@ type Config struct {
 }
 
 func (c Config) withDefaults() Config {
-	if c.MaxConnections <= 0 {
-		c.MaxConnections = DefaultMaxConnections
-	}
-	if c.MaxUDPFlows <= 0 {
-		c.MaxUDPFlows = DefaultMaxUDPFlows
-	}
-	if c.IdleTimeout <= 0 {
-		c.IdleTimeout = DefaultIdleTimeout
-	}
-	if c.ReadTimeout <= 0 {
-		c.ReadTimeout = DefaultReadTimeout
-	}
-	if c.WriteTimeout <= 0 {
-		c.WriteTimeout = DefaultWriteTimeout
-	}
-	if c.DialTimeout <= 0 {
-		c.DialTimeout = DefaultDialTimeout
-	}
+	setDefault(&c.MaxConnections, DefaultMaxConnections)
+	setDefault(&c.MaxDialedConnections, DefaultMaxDialedConnections)
+	setDefault(&c.MaxUDPFlows, DefaultMaxUDPFlows)
+	setDefault(&c.MaxUDPFlowsPerIP, DefaultMaxUDPFlowsPerIP)
+	setDefault(&c.IdleTimeout, DefaultIdleTimeout)
+	setDefault(&c.UDPFlowTimeout, DefaultUDPFlowTimeout)
+	setDefault(&c.ReadTimeout, DefaultReadTimeout)
+	setDefault(&c.WriteTimeout, DefaultWriteTimeout)
+	setDefault(&c.DialTimeout, DefaultDialTimeout)
 	if c.Dialer == nil {
-		c.Dialer = &net.Dialer{}
+		c.Dialer = &net.Dialer{KeepAliveConfig: coreKeepAlive}
 	}
 	if c.Rand == nil {
 		c.Rand = rand.Reader
@@ -166,6 +205,18 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+func setDefault[T int | time.Duration](v *T, d T) {
+	if *v <= 0 {
+		*v = d
+	}
+}
+
+// coreKeepAlive is the TCP keep-alive of core-facing connections: probes after
+// 15 s of silence, every 15 s, nine times, which are Go's defaults. A core peer
+// whose task has gone away is noticed within about three minutes, and the probes
+// keep the VPC's connection tracking warm on quiet core links.
+var coreKeepAlive = net.KeepAliveConfig{Enable: true, Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9}
+
 // ListenerConfig describes one listening socket.
 type ListenerConfig struct {
 	// Name identifies the listener in Source and is part of the flow identity.
@@ -178,13 +229,34 @@ type ListenerConfig struct {
 	// AdvertisedHost and AdvertisedPort are the sent-by this transport writes
 	// in the Via of requests it sends through this listener's transport (RFC
 	// 3261 §18.1.1) and accepts in responses (§18.1.2), such as the task address
-	// behind a load balancer. Empty and zero take the bound address and port.
+	// behind a load balancer. Empty and zero take the bound address and port; a
+	// listener bound to an unspecified address needs AdvertisedHost.
 	AdvertisedHost string
 	AdvertisedPort int
 	// ProxyProtocol requires a PROXY protocol v2 header at the start of every
 	// connection (TCP and TLS only), for listeners behind the NLB (ADR 0003,
-	// RCS_PROXY_PROTOCOL). Core-facing listeners leave it off.
+	// RCS_PROXY_PROTOCOL). It implies ClientFacing.
 	ProxyProtocol bool
+	// ClientFacing marks a listener clients connect to, directly or through the
+	// load balancer, as opposed to one other core nodes use. On such a
+	// listener:
+	//   - a response whose connection has closed fails with ErrNoFlow instead of
+	//     opening a new connection to the address in its Via (RFC 3261
+	//     §18.2.2). A client behind a NAT cannot be reached that way, and the
+	//     address is the client's to choose, so dialing it would let any client
+	//     make this server open connections wherever it likes. A client using
+	//     RFC 5626 outbound treats the lost flow as a failure anyway.
+	//   - TCP keep-alive probes are off by default (see KeepAlive).
+	ClientFacing bool
+	// KeepAlive sets the TCP keep-alive of accepted connections; nil takes the
+	// default. A client-facing listener sends no probes: the client chooses its
+	// own keep-alive interval (RFC 5626 §4.4), and a probe from the server would
+	// wake the radio of every idle phone. Other listeners use the core
+	// keep-alive, 15 s probes, as dialed connections do.
+	KeepAlive *net.KeepAliveConfig
+	// IdleTimeout overrides Config.IdleTimeout for connections accepted on
+	// this listener, such as one behind the NLB's TLS listener (350 s).
+	IdleTimeout time.Duration
 }
 
 // Transport sends and receives SIP messages and owns the flow table. Its methods
@@ -202,6 +274,9 @@ type Transport struct {
 	// accepted counts accepted connections, from accept to close, against
 	// MaxConnections.
 	accepted int
+	// pending holds accepted connections that are not flows yet (PROXY header
+	// or TLS handshake in progress), so Close can close them at once.
+	pending map[net.Conn]struct{}
 
 	wg sync.WaitGroup
 }
@@ -224,12 +299,34 @@ func New(cfg Config, h Handler) (*Transport, error) {
 	if _, err := io.ReadFull(cfg.Rand, key[:]); err != nil {
 		return nil, fmt.Errorf("transport: drawing the flow key: %w", err)
 	}
-	return &Transport{
+	t := &Transport{
 		cfg:     cfg,
 		handler: h,
-		flows:   newFlowTable(key, cfg.Now, cfg.IdleTimeout, cfg.MaxUDPFlows),
 		dialing: make(map[reuseKey]*dialCall),
-	}, nil
+		pending: make(map[net.Conn]struct{}),
+	}
+	t.flows = newFlowTable(key, cfg.Now, tableConfig{
+		udpTimeout:  cfg.UDPFlowTimeout,
+		maxUDP:      cfg.MaxUDPFlows,
+		maxUDPPerIP: cfg.MaxUDPFlowsPerIP,
+		onClosed:    t.flowClosed,
+	})
+	return t, nil
+}
+
+func (t *Transport) flowClosed(f *flow) {
+	if t.cfg.OnFlowClosed != nil {
+		t.cfg.OnFlowClosed(f.id, f.info())
+	}
+}
+
+// admit asks Config.Admit about a new inbound flow.
+func (t *Transport) admit(f *flow) bool {
+	if t.cfg.Admit == nil || t.cfg.Admit(f.id, f.info()) {
+		return true
+	}
+	t.stats.refused.Add(1)
+	return false
 }
 
 // Flow resolves a FlowID. It reports false for every ID that does not name a live
@@ -242,9 +339,35 @@ func (t *Transport) Flow(id FlowID) (FlowInfo, bool) {
 	return f.info(), true
 }
 
-// Close stops every listener and closes every connection, then waits for the
-// goroutines of the transport to finish. Messages being delivered to the handler
-// complete first.
+// CloseFlow closes one flow: its connection, or for UDP its table entry. It
+// reports whether the flow was live. A stopping P-CSCF uses it to close its
+// flows gradually rather than all at once (ADR 0003).
+func (t *Transport) CloseFlow(id FlowID) bool {
+	f := t.flows.lookup(id)
+	if f == nil {
+		return false
+	}
+	t.closeFlow(f)
+	return true
+}
+
+// StopListening closes the TCP and TLS listeners, so no new connection is
+// accepted, and leaves every flow open. UDP sockets stay open, since UDP flows
+// and every UDP send use them. It is the first step of a gradual shutdown.
+func (t *Transport) StopListening() {
+	t.mu.Lock()
+	lis := t.listeners
+	t.mu.Unlock()
+	for _, l := range lis {
+		if l.ln != nil {
+			l.stop()
+		}
+	}
+}
+
+// Close stops every listener and closes every connection, including those still
+// in their PROXY header or TLS handshake, then waits for the goroutines of the
+// transport to finish. Messages being delivered to the handler complete first.
 func (t *Transport) Close() error {
 	t.mu.Lock()
 	if t.closed {
@@ -253,11 +376,14 @@ func (t *Transport) Close() error {
 	}
 	t.closed = true
 	lis := t.listeners
+	for c := range t.pending {
+		c.Close()
+	}
 	t.mu.Unlock()
 
 	var errs []error
 	for _, l := range lis {
-		errs = append(errs, l.close())
+		errs = append(errs, l.stop())
 	}
 	for _, f := range t.flows.close() {
 		t.closeFlow(f)
@@ -272,7 +398,7 @@ func (t *Transport) isClosed() bool {
 	return t.closed
 }
 
-// closeFlow closes a stream flow's connection and forgets the flow.
+// closeFlow closes a flow's connection, if it has one, and forgets the flow.
 func (t *Transport) closeFlow(f *flow) {
 	if f.closed.CompareAndSwap(false, true) && f.conn != nil {
 		f.conn.Close()
@@ -280,49 +406,66 @@ func (t *Transport) closeFlow(f *flow) {
 	t.flows.remove(f)
 }
 
-// Stats is a snapshot of the transport's counters, for metrics. Every field
-// except OpenConnections counts events since New.
+// Stats is a snapshot of the transport's gauges and counters, for metrics.
 type Stats struct {
-	OpenConnections int // TCP and TLS, inbound and outbound
+	// Gauges.
+	OpenInbound     int // accepted TCP and TLS flows
+	OpenOutbound    int // connections this transport opened
+	OpenUDPFlows    int
+	PendingAccepted int // accepted, PROXY header or TLS handshake in progress
 
+	// Counters since New.
 	Accepted           uint64 // TCP and TLS connections accepted
 	Rejected           uint64 // connections refused at MaxConnections
+	Refused            uint64 // flows Config.Admit refused
 	Dialed             uint64 // outbound connections opened
 	DialErrors         uint64
+	DialLimited        uint64 // dials refused at MaxDialedConnections
 	ProxyHeaderErrors  uint64 // connections closed for a missing or invalid PROXY header
 	HealthChecks       uint64 // PROXY LOCAL connections, closed without a flow
 	TLSHandshakeErrors uint64
-	FramingErrors      uint64 // stream connections closed because a message could not be framed
+	FramingErrors      uint64 // stream connections closed because a message did not parse
+	TruncatedMessages  uint64 // stream connections the peer closed in the middle of a message
 	IdleTimeouts       uint64
-	ReadTimeouts       uint64 // stream connections closed mid-message
+	ReadTimeouts       uint64 // stream connections closed mid-message or before their first message
 	WriteErrors        uint64
 	KeepAlives         uint64 // CRLF pings answered
 	MalformedDatagrams uint64
 	InvalidMessages    uint64 // framed but refused by Validate; dropped
 	StrayResponses     uint64 // responses whose top Via is not ours (RFC 3261 §18.1.2); dropped
-	UDPFlowsRejected   uint64 // datagrams dropped at MaxUDPFlows
+	UDPFlowsEvicted    uint64 // UDP flows displaced at MaxUDPFlows or MaxUDPFlowsPerIP
 }
 
 type counters struct {
-	accepted, rejected, dialed, dialErrors, proxyHeaderErrors, healthChecks,
-	tlsHandshakeErrors, framingErrors, idleTimeouts, readTimeouts, writeErrors,
-	keepAlives, malformedDatagrams, invalidMessages, strayResponses,
-	udpFlowsRejected atomic.Uint64
+	accepted, rejected, refused, dialed, dialErrors, dialLimited,
+	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
+	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, keepAlives,
+	malformedDatagrams, invalidMessages, strayResponses atomic.Uint64
 }
 
-// Stats returns the current counters.
+// Stats returns the current gauges and counters.
 func (t *Transport) Stats() Stats {
 	c := &t.stats
+	ts := t.flows.stats()
+	t.mu.Lock()
+	pending := len(t.pending)
+	t.mu.Unlock()
 	return Stats{
-		OpenConnections:    t.flows.openStreams(),
+		OpenInbound:        ts.inbound,
+		OpenOutbound:       ts.outbound,
+		OpenUDPFlows:       ts.udp,
+		PendingAccepted:    pending,
 		Accepted:           c.accepted.Load(),
 		Rejected:           c.rejected.Load(),
+		Refused:            c.refused.Load(),
 		Dialed:             c.dialed.Load(),
 		DialErrors:         c.dialErrors.Load(),
+		DialLimited:        c.dialLimited.Load(),
 		ProxyHeaderErrors:  c.proxyHeaderErrors.Load(),
 		HealthChecks:       c.healthChecks.Load(),
 		TLSHandshakeErrors: c.tlsHandshakeErrors.Load(),
 		FramingErrors:      c.framingErrors.Load(),
+		TruncatedMessages:  c.truncatedMessages.Load(),
 		IdleTimeouts:       c.idleTimeouts.Load(),
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
@@ -330,7 +473,7 @@ func (t *Transport) Stats() Stats {
 		MalformedDatagrams: c.malformedDatagrams.Load(),
 		InvalidMessages:    c.invalidMessages.Load(),
 		StrayResponses:     c.strayResponses.Load(),
-		UDPFlowsRejected:   c.udpFlowsRejected.Load(),
+		UDPFlowsEvicted:    ts.evicted,
 	}
 }
 

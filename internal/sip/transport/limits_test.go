@@ -1,0 +1,350 @@
+package transport
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"net"
+	"net/netip"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
+)
+
+func TestResponseForAClosedClientFacingFlowIsNotDialledBack(t *testing.T) {
+	// An attacker sends a request with its own address in Via and closes the
+	// connection; the response must not make the server connect out to it.
+	for name, lc := range map[string]ListenerConfig{
+		"PROXY protocol listener": {Network: TCP, ProxyProtocol: true},
+		"client-facing listener":  {Network: TCP, ClientFacing: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, rec := newTransport(t, Config{})
+			addr := listen(t, server, lc)
+			attacker := listen(t, mustTransport(t), ListenerConfig{Network: TCP})
+			c := dialRaw(t, addr)
+			if lc.ProxyProtocol {
+				c.Write(proxyHeaderFor(netip.MustParseAddrPort("127.0.0.1:40000"), addr, nil))
+			}
+			c.Write([]byte(rawRequest("MESSAGE", "Via: SIP/2.0/TCP "+attacker.String()+";branch=z9hG4bK1")))
+			in := rec.next(t)
+			c.Close()
+			eventually(t, "the flow to close", func() bool { _, ok := server.Flow(in.Source.Flow); return !ok })
+
+			err := server.SendResponse(respond(t, in.Message.(*sip.Request), 200), in.Source)
+			if !errors.Is(err, ErrNoFlow) {
+				t.Fatalf("SendResponse = %v, want ErrNoFlow", err)
+			}
+			if s := server.Stats(); s.Dialed != 0 || s.OpenOutbound != 0 {
+				t.Fatalf("the server connected out: %+v", s)
+			}
+		})
+	}
+}
+
+func mustTransport(t *testing.T) *Transport {
+	tr, _ := newTransport(t, Config{})
+	return tr
+}
+
+func TestDialedConnectionsAreCapped(t *testing.T) {
+	a, b := mustTransport(t), mustTransport(t)
+	addrA := listen(t, a, ListenerConfig{Network: TCP})
+	addrB := listen(t, b, ListenerConfig{Network: TCP})
+	client, _ := newTransport(t, Config{MaxDialedConnections: 1})
+
+	req := newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK1")
+	if _, err := client.SendRequest(req, Destination{Network: TCP, Addr: addrA}); err != nil {
+		t.Fatal(err)
+	}
+	req2 := newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK2")
+	if _, err := client.SendRequest(req2, Destination{Network: TCP, Addr: addrB}); !errors.Is(err, ErrTooManyConnections) {
+		t.Fatalf("second dial = %v, want ErrTooManyConnections", err)
+	}
+	// Reusing the open connection is not a new dial.
+	req3 := newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK3")
+	if _, err := client.SendRequest(req3, Destination{Network: TCP, Addr: addrA}); err != nil {
+		t.Fatalf("reuse refused: %v", err)
+	}
+	if s := client.Stats(); s.Dialed != 1 || s.DialLimited != 1 || s.OpenOutbound != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+type countingDialer struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (d *countingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.mu.Lock()
+	d.n++
+	d.mu.Unlock()
+	return nil, errors.New("not dialing in this test")
+}
+
+func TestTLSWithoutAServerNameIsUnroutableAndNotDialled(t *testing.T) {
+	dialer := &countingDialer{}
+	tr, _ := newTransport(t, Config{Dialer: dialer})
+	req := newRequest(t, "OPTIONS", "SIP/2.0/TLS placeholder.invalid;branch=z9hG4bK1")
+	if _, err := tr.SendRequest(req, Destination{Network: TLS, Addr: netip.MustParseAddrPort("192.0.2.1:5061")}); !errors.Is(err, ErrUnroutable) {
+		t.Fatalf("SendRequest = %v, want ErrUnroutable", err)
+	}
+	// The response fallback of RFC 3261 §18.2.2 has no server name either.
+	res := respond(t, newRequest(t, "OPTIONS", "SIP/2.0/TLS 192.0.2.1:5061;branch=z9hG4bK2"), 200)
+	if err := tr.SendResponse(res, Source{Network: TLS, Flow: "gone"}); !errors.Is(err, ErrUnroutable) {
+		t.Fatalf("SendResponse = %v, want ErrUnroutable", err)
+	}
+	if dialer.n != 0 {
+		t.Fatalf("dialled %d times", dialer.n)
+	}
+}
+
+// flowEvents records the Admit and OnFlowClosed calls of a transport.
+type flowEvents struct {
+	mu       sync.Mutex
+	admitted []FlowID
+	closed   []FlowID
+	refuse   bool
+}
+
+func (e *flowEvents) config(cfg Config) Config {
+	cfg.Admit = func(id FlowID, info FlowInfo) bool {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.refuse {
+			return false
+		}
+		e.admitted = append(e.admitted, id)
+		return true
+	}
+	cfg.OnFlowClosed = func(id FlowID, info FlowInfo) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.closed = append(e.closed, id)
+	}
+	return cfg
+}
+
+func (e *flowEvents) counts() (admitted, closed int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.admitted), len(e.closed)
+}
+
+func TestAdmitSeesEveryNewInboundFlowAndCanRefuseIt(t *testing.T) {
+	ev := &flowEvents{}
+	server, rec := newTransport(t, ev.config(Config{}))
+	tcpAddr := listen(t, server, ListenerConfig{Network: TCP})
+	udpAddr := listen(t, server, ListenerConfig{Network: UDP})
+
+	c := dialRaw(t, tcpAddr)
+	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+	in := rec.next(t)
+	u, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(udpAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	u.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bK2")))
+	rec.next(t)
+	if a, _ := ev.counts(); a != 2 || ev.admitted[0] != in.Source.Flow {
+		t.Fatalf("admitted %v", ev.admitted)
+	}
+
+	ev.mu.Lock()
+	ev.refuse = true
+	ev.mu.Unlock()
+	refused := dialRaw(t, tcpAddr)
+	waitClosed(t, refused)
+	u2, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(udpAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u2.Close()
+	u2.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bK3")))
+	eventually(t, "two refusals", func() bool { return server.Stats().Refused == 2 })
+	rec.none(t)
+}
+
+func TestEveryAdmittedFlowIsReportedClosedOnce(t *testing.T) {
+	serverTLS, _ := testTLS(t)
+	ev := &flowEvents{}
+	server, rec := newTransport(t, ev.config(Config{TLS: serverTLS}))
+	tcpAddr := listen(t, server, ListenerConfig{Network: TCP})
+	tlsAddr := listen(t, server, ListenerConfig{Network: TLS})
+	udpAddr := listen(t, server, ListenerConfig{Network: UDP})
+
+	// A TCP flow the client closes.
+	c := dialRaw(t, tcpAddr)
+	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+	rec.next(t)
+	c.Close()
+	// A TLS connection admitted and then failing its handshake.
+	bad := dialRaw(t, tlsAddr)
+	bad.Write([]byte("not a ClientHello\r\n\r\n"))
+	waitClosed(t, bad)
+	// A UDP flow, still open at Close.
+	u, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(udpAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	u.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bK2")))
+	rec.next(t)
+
+	eventually(t, "two closures", func() bool { _, closed := ev.counts(); return closed == 2 })
+	server.Close()
+	admitted, closed := ev.counts()
+	if admitted != 3 || closed != 3 {
+		t.Fatalf("admitted %d, closed %d", admitted, closed)
+	}
+	seen := map[FlowID]int{}
+	for _, id := range ev.closed {
+		seen[id]++
+	}
+	for _, id := range ev.admitted {
+		if seen[id] != 1 {
+			t.Fatalf("flow reported closed %d times", seen[id])
+		}
+	}
+}
+
+func TestCloseFlowClosesOneConnection(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: TCP})
+	a, b := dialRaw(t, addr), dialRaw(t, addr)
+	a.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+	first := rec.next(t).Source.Flow
+	b.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP b.example.com;branch=z9hG4bK2")))
+	second := rec.next(t).Source.Flow
+
+	if !server.CloseFlow(first) {
+		t.Fatal("CloseFlow reported a live flow as gone")
+	}
+	waitClosed(t, a)
+	if _, ok := server.Flow(second); !ok {
+		t.Fatal("closing one flow closed another")
+	}
+	if server.CloseFlow(first) || server.CloseFlow("unknown") {
+		t.Fatal("CloseFlow reported a gone flow as live")
+	}
+}
+
+func TestCloseFlowForgetsAUDPFlow(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: UDP})
+	u, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	u.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bK1")))
+	id := rec.next(t).Source.Flow
+	if !server.CloseFlow(id) {
+		t.Fatal("CloseFlow failed")
+	}
+	if _, ok := server.Flow(id); ok || server.Stats().OpenUDPFlows != 0 {
+		t.Fatal("UDP flow still live")
+	}
+}
+
+func TestStopListeningKeepsFlowsButRefusesNewConnections(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: TCP})
+	c := dialRaw(t, addr)
+	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+	flow := rec.next(t).Source.Flow
+
+	server.StopListening()
+	if _, err := net.DialTimeout("tcp", addr.String(), time.Second); err == nil {
+		t.Fatal("a new connection was accepted after StopListening")
+	}
+	req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKout")
+	if _, err := server.SendRequest(req, Destination{Flow: flow}); err != nil {
+		t.Fatalf("existing flow unusable: %v", err)
+	}
+	readMessage(t, bufio.NewReader(c))
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close after StopListening: %v", err)
+	}
+}
+
+func TestCloseDoesNotWaitForConnectionsInTheirHandshake(t *testing.T) {
+	server, err := New(Config{ReadTimeout: time.Hour}, func(Inbound) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.Listen(ListenerConfig{Network: TCP, Addr: "127.0.0.1:0", ProxyProtocol: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := dialRaw(t, addr)
+	c.Write([]byte("\r\n\r\n")) // part of a PROXY header, and then nothing
+	eventually(t, "the connection to be pending", func() bool { return server.Stats().PendingAccepted == 1 })
+
+	done := make(chan struct{})
+	go func() {
+		server.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(waitFor):
+		t.Fatal("Close waited for a connection still reading its PROXY header")
+	}
+	waitClosed(t, c)
+}
+
+func TestFullUDPFlowTableStillDeliversNewSources(t *testing.T) {
+	server, rec := newTransport(t, Config{MaxUDPFlows: 1})
+	addr := listen(t, server, ListenerConfig{Network: UDP})
+	var flows []FlowID
+	for i := range 2 {
+		u, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(addr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer u.Close()
+		u.Write([]byte(rawRequest("REGISTER", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bK"+string(rune('a'+i)))))
+		flows = append(flows, rec.next(t).Source.Flow)
+	}
+	if _, ok := server.Flow(flows[0]); ok {
+		t.Fatal("the older flow was kept")
+	}
+	if s := server.Stats(); s.UDPFlowsEvicted != 1 || s.OpenUDPFlows != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestDeadlineReaderKeepsTheReadTimeoutUntilTheFirstMessageIsComplete(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	d := &deadlineReader{conn: a, idle: time.Hour, read: time.Hour, beforeFirst: true}
+	br := bufio.NewReader(d)
+	if !d.strict() {
+		t.Fatal("a new accepted connection is not under the read timeout")
+	}
+	go b.Write([]byte("\r\n\r\n"))
+	br.Peek(4)
+	br.Discard(4)
+	d.keepAlive(br)
+	if !d.strict() {
+		t.Fatal("a keep-alive before the first message switched to the idle timeout")
+	}
+	d.messageDone(br)
+	if d.strict() {
+		t.Fatal("the read timeout still applies after the first message")
+	}
+}
+
+func TestProxyProtocolListenerIsClientFacing(t *testing.T) {
+	tr := mustTransport(t)
+	listen(t, tr, ListenerConfig{Name: "edge", Network: TCP, ProxyProtocol: true})
+	if l := tr.listenerNamed("edge"); l == nil || !l.clientFacing {
+		t.Fatal("a PROXY protocol listener is not client-facing")
+	}
+}
