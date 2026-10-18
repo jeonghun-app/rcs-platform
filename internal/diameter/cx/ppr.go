@@ -46,8 +46,8 @@ func (r *PPR) Message(n *diameter.Node) (*diameter.Message, error) {
 }
 
 // LogValue logs what the request carries without the user's identity, the
-// profile or the SIP Digest credentials.
-func (r *PPR) LogValue() slog.Value {
+// profile or the SIP Digest credentials. Like MAR's it has a value receiver.
+func (r PPR) LogValue() slog.Value {
 	attrs := []slog.Attr{
 		slog.String("command", "PPR"),
 		slog.Bool("user_data", r.UserData != nil),

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 )
@@ -266,8 +267,9 @@ func (d DigestAuthenticate) MarshalJSON() ([]byte, error) {
 }
 
 // LogValue logs the request without the identities and the item's
-// credentials.
-func (r *MAR) LogValue() slog.Value {
+// credentials. It has a value receiver so that an MAR logged by value or by
+// pointer gives the same line.
+func (r MAR) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("command", "MAR"),
 		slog.Any("auth_data_item", r.AuthDataItem),
@@ -276,16 +278,17 @@ func (r *MAR) LogValue() slog.Value {
 }
 
 // LogValue logs the answer's result and items without the identities and
-// the credentials.
-func (a *MAA) LogValue() slog.Value {
-	items := make([]any, len(a.AuthDataItems))
+// the credentials. Each item is its own attribute, so that every handler
+// resolves its LogValue.
+func (a MAA) LogValue() slog.Value {
+	items := make([]slog.Attr, len(a.AuthDataItems))
 	for i, item := range a.AuthDataItems {
-		items[i] = item.LogValue()
+		items[i] = slog.Any(strconv.Itoa(i+1), item)
 	}
 	return slog.GroupValue(
 		slog.String("command", "MAA"),
 		slog.String("result", a.Result.String()),
 		slog.Uint64("number_auth_items", uint64(a.NumberAuthItems)),
-		slog.Any("auth_data_items", items),
+		slog.Attr{Key: "auth_data_items", Value: slog.GroupValue(items...)},
 	)
 }

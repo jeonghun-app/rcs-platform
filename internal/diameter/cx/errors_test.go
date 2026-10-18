@@ -305,10 +305,13 @@ func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
 		slog.New(slog.NewJSONHandler(&b, nil)).Info("x", "msg", v)
 		return b.String()
 	}
+	maa := MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), UserName: impi, PublicIdentity: impu, NumberAuthItems: 1, AuthDataItems: []AuthDataItem{item}}
+	mar := MAR{Request: request("s"), UserName: impi, PublicIdentity: impu, AuthDataItem: item, NumberAuthItems: 1}
+	ppr := PPR{Request: request("s"), UserName: impi, AuthDataItem: &item}
 	messages := map[string]any{
-		"MAA": &MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), UserName: impi, PublicIdentity: impu, AuthDataItems: []AuthDataItem{item}},
-		"MAR": &MAR{Request: request("s"), UserName: impi, PublicIdentity: impu, AuthDataItem: item, NumberAuthItems: 1},
-		"PPR": &PPR{Request: request("s"), UserName: impi, AuthDataItem: &item},
+		"*MAA": &maa, "MAA": maa,
+		"*MAR": &mar, "MAR": mar,
+		"*PPR": &ppr, "PPR": ppr,
 	}
 	others := map[string]any{
 		"items":        []AuthDataItem{item},
@@ -324,6 +327,10 @@ func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
 			}
 		}
 		others[name] = v
+	}
+	// The log line still says what the answer carried.
+	if out := jsonLog(maa); !strings.Contains(out, `"auth_data_items":{"1":{"item_number":1,"scheme":"Digest-AKAv1-MD5"`) {
+		t.Errorf("MAA log line lost its items: %s", out)
 	}
 	for name, v := range others {
 		raw, err := json.Marshal(v)
