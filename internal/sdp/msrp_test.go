@@ -179,6 +179,7 @@ func TestSettersRejectValuesThatWouldBreakTheLine(t *testing.T) {
 		{"accept-wrapped type that is not a type", m.SetAcceptWrappedTypes([]string{"plain"})},
 		{"negative max size", m.SetMaxSize(-1)},
 		{"unknown setup role", m.SetSetup("both")},
+		{"holdconn", m.SetSetup(SetupHoldConn)},
 		{"unknown direction", m.SetDirection("sideways")},
 	}
 	for _, tt := range tests {
@@ -232,5 +233,33 @@ func TestMediaDirectionFallsBackToTheSessionLevelThenSendrecv(t *testing.T) {
 	}
 	if _, err := mustParse(t, head).MediaDirection(0); err == nil {
 		t.Error("MediaDirection(0) with no media: no error")
+	}
+}
+
+func TestMediaSetupIgnoresHoldconnAtEitherLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		session string
+		media   string
+		want    Setup
+	}{
+		{"media holdconn falls back to the session role", "a=setup:actpass\r\n", "a=setup:holdconn\r\n", SetupActPass},
+		{"media holdconn with no session role", "", "a=setup:holdconn\r\n", ""},
+		{"session holdconn alone", "a=setup:HOLDCONN\r\n", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := mustParse(t, head+tt.session+"m=message 9 TCP/MSRP *\r\n"+tt.media)
+			got, err := s.MediaSetup(0)
+			if tt.want == "" && !errors.Is(err, ErrNoAttribute) {
+				t.Errorf("MediaSetup = %q, %v; want ErrNoAttribute", got, err)
+			}
+			if tt.want != "" && (err != nil || got != tt.want) {
+				t.Errorf("MediaSetup = %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+	if r, err := mustParse(t, head+"m=message 9 TCP/MSRP *\r\na=setup:holdconn\r\n").Media[0].Setup(); err != nil || r != SetupHoldConn {
+		t.Errorf("Media.Setup = %q, %v; want the holdconn as written", r, err)
 	}
 }

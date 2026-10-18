@@ -16,8 +16,15 @@ type MSRPRewrite struct {
 	// Path replaces a=path. The m= transport is set to match the scheme of
 	// its first URI, since the relay may use TLS on one side and TCP on the
 	// other.
-	Path  []string
+	Path []string
+	// Setup is the role written to a=setup: active, passive or actpass;
+	// holdconn is refused (RFC 6135 §4.2.1).
 	Setup Setup
+	// Answer says the description being rewritten is an SDP answer. An offer
+	// must not carry a=setup:passive (RFC 6135 §4.2.2), so passive is refused
+	// unless Answer is set. The zero value is the strict one: forgetting to
+	// set it on an answer fails loudly instead of producing a bad offer.
+	Answer bool
 }
 
 // RewriteMSRP applies rw to media line i. Only the c= that applies to the line,
@@ -51,9 +58,12 @@ func (s *Session) RewriteMSRP(i int, rw MSRPRewrite) error {
 	if err := validatePath(rw.Path); err != nil {
 		return err
 	}
-	setup, err := parseSetup(string(rw.Setup))
+	setup, err := parseWritableSetup(rw.Setup)
 	if err != nil {
 		return err
+	}
+	if setup == SetupPassive && !rw.Answer {
+		return errors.New("sdp: rewrite: an offer must not use a=setup:passive (RFC 6135 §4.2.2)")
 	}
 
 	s.setMediaConnection(i, rw.Connection)

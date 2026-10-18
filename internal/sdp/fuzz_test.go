@@ -82,8 +82,10 @@ func FuzzMediaAttributes(f *testing.F) {
 			if v, err := m.MaxSize(); err == nil {
 				roundTrip(t, "max-size", v, m.SetMaxSize, m.MaxSize)
 			}
-			if v, err := m.Setup(); err == nil {
+			if v, err := m.Setup(); err == nil && v != SetupHoldConn {
 				roundTrip(t, "setup", v, m.SetSetup, m.Setup)
+			} else if err == nil && m.SetSetup(v) == nil {
+				t.Fatal("SetSetup accepted holdconn")
 			}
 			if v, err := m.Direction(); err == nil {
 				roundTrip(t, "direction", v, m.SetDirection, m.Direction)
@@ -121,6 +123,9 @@ func FuzzOfferAnswerAndRewrite(f *testing.F) {
 				local := asEndpoint()
 				local.Path = []string{path}
 				if m, err := NegotiateMSRP(offer, i, local); err == nil {
+					if r, _ := m.Setup(); r == SetupHoldConn {
+						t.Fatal("answer carries a=setup:holdconn")
+					}
 					ans.Media[i] = m
 				}
 			}

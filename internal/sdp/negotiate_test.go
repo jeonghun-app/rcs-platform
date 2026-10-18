@@ -80,7 +80,8 @@ func TestAnswerSetupComplementsTheOfferedRole(t *testing.T) {
 		{"actpass offer, no preference", "actpass", false, "", SetupPassive},
 		{"actpass offer, prefer active", "actpass", false, SetupActive, SetupActive},
 		{"actpass offer, prefer passive", "actpass", false, SetupPassive, SetupPassive},
-		{"holdconn offer", "holdconn", false, SetupActive, SetupHoldConn},
+		{"holdconn is ignored, so the offerer connects", "holdconn", false, SetupActive, SetupPassive},
+		{"session-level holdconn is ignored too", "holdconn", true, SetupActive, SetupPassive},
 		{"no a=setup means the offerer connects", "", false, SetupActive, SetupPassive},
 		{"session-level a=setup applies", "passive", true, "", SetupActive},
 	}

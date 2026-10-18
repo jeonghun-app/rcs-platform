@@ -86,7 +86,7 @@ func RejectMedia(offer *Media) Media {
 //
 // The answer accepts the accept-types and accept-wrapped-types the two ends
 // have in common (RFC 4975 §8.6), takes the connection role that complements
-// the offered one (RFC 4145 §4, RFC 6135 §4.2), mirrors the direction
+// the offered one (RFC 4145 §4, RFC 6135 §4.2.1), mirrors the direction
 // (RFC 3264 §6.1) and, for a file transfer, echoes a=file-selector and
 // a=file-transfer-id (RFC 5547 §8). A line offered with port 0 is never
 // accepted (ErrMediaDisabled), nor is one with no type in common
@@ -155,9 +155,10 @@ func NegotiateMSRP(offer *Session, i int, local MSRPEndpoint) (Media, error) {
 	return ans, nil
 }
 
-// answerSetup picks the answerer's role. Without a=setup the offerer follows
-// the original RFC 4975 model and connects itself, so it is treated as active
-// (RFC 6135 §4). holdconn is answered in kind (RFC 4145 §4).
+// answerSetup picks the answerer's role. Without a usable a=setup (absent, or
+// holdconn, which MediaSetup ignores) the offerer follows the original
+// RFC 4975 model and connects itself (RFC 4975 §8.5, RFC 6135 §4.2.1), so the
+// answer is passive. The result is never holdconn.
 func answerSetup(offer *Session, i int, preferred Setup) (Setup, error) {
 	offered, err := offer.MediaSetup(i)
 	switch {
@@ -171,8 +172,6 @@ func answerSetup(offer *Session, i int, preferred Setup) (Setup, error) {
 		return SetupPassive, nil
 	case SetupPassive:
 		return SetupActive, nil
-	case SetupHoldConn:
-		return SetupHoldConn, nil
 	}
 	if preferred == "" {
 		return SetupPassive, nil

@@ -173,10 +173,13 @@ type Setup string
 
 // Setup roles.
 const (
-	SetupActive   Setup = "active"   // opens the connection
-	SetupPassive  Setup = "passive"  // accepts the connection
-	SetupActPass  Setup = "actpass"  // either; the answerer decides
-	SetupHoldConn Setup = "holdconn" // no connection for now
+	SetupActive  Setup = "active"  // opens the connection
+	SetupPassive Setup = "passive" // accepts the connection
+	SetupActPass Setup = "actpass" // either; the answerer decides
+	// SetupHoldConn is recognised when read but never written: RFC 6135
+	// §4.2.1 forbids it in MSRP and has a receiver treat it as if a=setup
+	// were absent, which MediaSetup does.
+	SetupHoldConn Setup = "holdconn"
 )
 
 func parseSetup(v string) (Setup, error) {
@@ -188,7 +191,8 @@ func parseSetup(v string) (Setup, error) {
 	return "", fmt.Errorf("sdp: a=setup: unknown role %.32q", v)
 }
 
-// Setup returns the media-level a=setup role, in lower case.
+// Setup returns the media-level a=setup role as written, in lower case,
+// holdconn included. Use Session.MediaSetup for the role that applies.
 func (m *Media) Setup() (Setup, error) {
 	return setupOf(m.Attributes)
 }
@@ -201,9 +205,10 @@ func setupOf(as Attributes) (Setup, error) {
 	return parseSetup(v)
 }
 
-// SetSetup replaces a=setup, or appends it when absent.
+// SetSetup replaces a=setup, or appends it when absent. holdconn is refused
+// (RFC 6135 §4.2.1).
 func (m *Media) SetSetup(r Setup) error {
-	canonical, err := parseSetup(string(r))
+	canonical, err := parseWritableSetup(r)
 	if err != nil {
 		return err
 	}
@@ -211,17 +216,32 @@ func (m *Media) SetSetup(r Setup) error {
 	return nil
 }
 
+// parseWritableSetup is parseSetup without holdconn, for values this package
+// is asked to put on the wire.
+func parseWritableSetup(r Setup) (Setup, error) {
+	canonical, err := parseSetup(string(r))
+	if err == nil && canonical == SetupHoldConn {
+		err = errors.New("sdp: a=setup: holdconn must not be sent in MSRP (RFC 6135 §4.2.1)")
+	}
+	return canonical, err
+}
+
 // MediaSetup returns the a=setup role that applies to media line i: its own,
-// or the session-level one, which RFC 4145 §4 also allows. ErrNoAttribute
-// means neither is present.
+// or the session-level one, which RFC 4145 §4 also allows. A holdconn value
+// is ignored at either level, as RFC 6135 §4.2.1 requires of an MSRP
+// receiver, so the result is never holdconn. ErrNoAttribute means no role
+// applies; RFC 4975 §8.5 then makes the offerer the active party.
 func (s *Session) MediaSetup(i int) (Setup, error) {
 	m, err := s.media(i)
 	if err != nil {
 		return "", err
 	}
 	r, err := m.Setup()
-	if errors.Is(err, ErrNoAttribute) {
-		return setupOf(s.Attributes)
+	if errors.Is(err, ErrNoAttribute) || r == SetupHoldConn {
+		r, err = setupOf(s.Attributes)
+	}
+	if err == nil && r == SetupHoldConn {
+		return "", fmt.Errorf("%w: a=setup (holdconn is ignored)", ErrNoAttribute)
 	}
 	return r, err
 }

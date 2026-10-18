@@ -46,6 +46,7 @@ func TestAnswerTowardTheClientGetsThePassiveTLSRelay(t *testing.T) {
 		Port:       2855,
 		Path:       []string{"msrps://203.0.113.7:2855/c4x9q;tcp"},
 		Setup:      SetupPassive,
+		Answer:     true,
 	})
 	if err != nil {
 		t.Fatalf("RewriteMSRP: %v", err)
@@ -139,6 +140,9 @@ func TestRejectedRewriteLeavesTheSessionUntouched(t *testing.T) {
 		{"no path", chatOffer, 0, func(rw *MSRPRewrite) { rw.Path = nil }, nil, "at least one URI"},
 		{"path that is not MSRP", chatOffer, 0, func(rw *MSRPRewrite) { rw.Path = []string{"sip:relay.example.com"} }, nil, "not an msrp"},
 		{"no setup", chatOffer, 0, func(rw *MSRPRewrite) { rw.Setup = "" }, nil, "unknown role"},
+		{"holdconn", chatOffer, 0, func(rw *MSRPRewrite) { rw.Setup = SetupHoldConn }, nil, "holdconn must not be sent"},
+		{"holdconn in an answer", chatAnswer, 0, func(rw *MSRPRewrite) { rw.Setup = SetupHoldConn; rw.Answer = true }, nil, "holdconn must not be sent"},
+		{"passive in an offer", chatOffer, 0, func(rw *MSRPRewrite) { rw.Setup = SetupPassive }, nil, "an offer must not use a=setup:passive"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -176,5 +180,17 @@ func TestSetMediaConnectionRejectsBadInput(t *testing.T) {
 	}
 	if s.Connection.Address != "192.0.2.10" {
 		t.Errorf("session c= changed to %v", s.Connection)
+	}
+}
+
+func TestOfferMayBeRewrittenToActpass(t *testing.T) {
+	s := mustParse(t, chatOffer)
+	rw := relayToCore
+	rw.Setup = SetupActPass
+	if err := s.RewriteMSRP(0, rw); err != nil {
+		t.Fatalf("RewriteMSRP: %v", err)
+	}
+	if r, err := s.MediaSetup(0); err != nil || r != SetupActPass {
+		t.Errorf("MediaSetup = %q, %v", r, err)
 	}
 }
