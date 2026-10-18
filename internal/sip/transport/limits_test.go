@@ -26,7 +26,7 @@ func TestResponseForAClosedClientFacingFlowIsNotDialledBack(t *testing.T) {
 			attacker := listen(t, mustTransport(t), ListenerConfig{Network: TCP})
 			c := dialRaw(t, addr)
 			if lc.ProxyProtocol {
-				c.Write(proxyHeaderFor(netip.MustParseAddrPort("127.0.0.1:40000"), addr, nil))
+				c.Write(proxyHeaderFor(netip.MustParseAddrPort("192.0.2.77:40000"), addr, nil))
 			}
 			c.Write([]byte(rawRequest("MESSAGE", "Via: SIP/2.0/TCP "+attacker.String()+";branch=z9hG4bK1")))
 			in := rec.next(t)
@@ -346,5 +346,101 @@ func TestProxyProtocolListenerIsClientFacing(t *testing.T) {
 	listen(t, tr, ListenerConfig{Name: "edge", Network: TCP, ProxyProtocol: true})
 	if l := tr.listenerNamed("edge"); l == nil || !l.clientFacing {
 		t.Fatal("a PROXY protocol listener is not client-facing")
+	}
+}
+
+func TestAddressFromAPROXYHeaderIsNeverReusedForRequestsToThatAddress(t *testing.T) {
+	// A connection that claims to come from a core node must not receive the
+	// requests meant for that node.
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: TCP, ProxyProtocol: true})
+	core := netip.MustParseAddrPort("192.0.2.50:5060")
+	c := dialRaw(t, addr)
+	c.Write(proxyHeaderFor(core, addr, nil))
+	c.Write([]byte(rawRequest("REGISTER", "Via: SIP/2.0/TCP 192.0.2.50:5060;branch=z9hG4bK1")))
+	rec.next(t)
+	if f := server.flows.peer(reuseKey{network: TCP, remote: core}); f != nil {
+		t.Fatal("a PROXY-addressed connection is offered for reuse")
+	}
+}
+
+func TestTLSConnectionIsReusedOnlyForTheNameItWasVerifiedFor(t *testing.T) {
+	serverTLS, clientTLS := testTLS(t)
+	server, rec := newTransport(t, Config{TLS: serverTLS})
+	addr := listen(t, server, ListenerConfig{Network: TLS})
+	client, _ := newTransport(t, Config{TLSClient: clientTLS})
+	req := newRequest(t, "OPTIONS", "SIP/2.0/TLS placeholder.invalid;branch=z9hG4bK1")
+	if _, err := client.SendRequest(req, Destination{Network: TLS, Addr: addr, ServerName: "sip.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	rec.next(t)
+	// The certificate does not cover another name, so a fresh connection fails
+	// verification; reusing the first one would have skipped it.
+	other := newRequest(t, "OPTIONS", "SIP/2.0/TLS placeholder.invalid;branch=z9hG4bK2")
+	if _, err := client.SendRequest(other, Destination{Network: TLS, Addr: addr, ServerName: "other.example.com"}); err == nil {
+		t.Fatal("a connection verified for one name carried a request for another")
+	}
+	if s := client.Stats(); s.Dialed != 1 || s.DialErrors != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestUDPSocketIsChosenByAddressFamily(t *testing.T) {
+	tr := mustTransport(t)
+	listen(t, tr, ListenerConfig{Network: UDP, Addr: "127.0.0.1:0"})
+	req := newRequest(t, "OPTIONS", "SIP/2.0/UDP placeholder.invalid;branch=z9hG4bK1")
+	if _, err := tr.SendRequest(req, Destination{Network: UDP, Addr: netip.MustParseAddrPort("[2001:db8::1]:5060")}); !errors.Is(err, ErrNoListener) {
+		t.Fatalf("IPv6 destination from an IPv4 socket: %v, want ErrNoListener", err)
+	}
+	if _, err := tr.SendRequest(req, Destination{Network: UDP, Addr: netip.MustParseAddrPort("127.0.0.1:9")}); err != nil {
+		t.Fatalf("IPv4 destination: %v", err)
+	}
+}
+
+// QA regression (PR #35 review): datagrams that frame but fail Validate must
+// not create UDP flows, so they cannot crowd out a real client.
+func TestJunkDatagramsDoNotLockOutANewClient(t *testing.T) {
+	server, rec := newTransport(t, Config{MaxUDPFlows: 20, MaxUDPFlowsPerIP: 20})
+	addr := listen(t, server, ListenerConfig{Network: UDP})
+	for range 20 {
+		c, err := net.Dial("udp", addr.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		c.Write([]byte("OPTIONS sip:x@example.com SIP/2.0\r\n\r\n")) // no Via
+	}
+	eventually(t, "junk counted", func() bool { return server.Stats().InvalidMessages == 20 })
+	if s := server.Stats(); s.OpenUDPFlows != 0 {
+		t.Fatalf("invalid datagrams created %d flows", s.OpenUDPFlows)
+	}
+	legit, err := net.Dial("udp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legit.Close()
+	legit.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/UDP 127.0.0.1;rport;branch=z9hG4bKlegit")))
+	rec.next(t)
+}
+
+// QA regression (PR #35 review): admitting a new UDP source to a full table
+// must not scan the table under its lock, which every lookup also takes.
+func TestNewUDPSourceIsCheapWhenTheTableIsFull(t *testing.T) {
+	clock := &fakeNow{t: time.Unix(1000, 0)}
+	var k [32]byte
+	tab := newFlowTable(k, clock.now, tableConfig{udpTimeout: time.Hour, maxUDP: DefaultMaxUDPFlows, maxUDPPerIP: DefaultMaxUDPFlowsPerIP})
+	lis := &listener{name: "udp"}
+	for i := range DefaultMaxUDPFlows {
+		tab.addUDP(tab.newFlow(UDP, lis, netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), 5060)))
+	}
+	start := time.Now()
+	for i := range 100 {
+		tab.addUDP(tab.newFlow(UDP, lis, netip.AddrPortFrom(netip.AddrFrom4([4]byte{11, 0, 0, byte(i)}), 5060)))
+	}
+	if per := time.Since(start) / 100; per > 100*time.Microsecond {
+		t.Fatalf("each new source held the flow-table lock for %v", per)
+	}
+	if s := tab.stats(); s.udp != DefaultMaxUDPFlows || s.evicted != 100 {
+		t.Fatalf("stats = %+v", s)
 	}
 }

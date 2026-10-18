@@ -188,6 +188,11 @@ func (l *listener) serveUDP() {
 			t.stats.malformedDatagrams.Add(1)
 			continue
 		}
+		// Only a message that will be delivered may create a flow, so junk from
+		// many source ports cannot fill the table.
+		if !t.accept(msg, from, nil) {
+			continue
+		}
 		f := t.flows.udpFlow(l, from)
 		if f == nil {
 			nf := t.flows.newFlow(UDP, l, from)
@@ -204,7 +209,7 @@ func (l *listener) serveUDP() {
 				continue
 			}
 		}
-		t.deliver(f, msg)
+		t.handler(Inbound{Message: msg, Source: f.source()})
 	}
 }
 
@@ -317,7 +322,9 @@ func (l *listener) serveAccepted(raw net.Conn) {
 	}
 	c.SetReadDeadline(time.Time{})
 	f.conn = c
+	t.startWriter(f)
 	if !t.unpend(raw) || !t.flows.addStream(f) {
+		f.q.close()
 		c.Close()
 		t.flowClosed(f)
 		return
@@ -378,15 +385,22 @@ func (t *Transport) udpListenerFor(name string, dst netip.AddrPort) *listener {
 }
 
 // sentByOf returns the sent-by this transport writes for a message leaving on f.
-func (t *Transport) sentByOf(f *flow) (string, int) {
+func (t *Transport) sentByOf(f *flow) (string, int, error) {
 	if f.lis != nil {
-		return f.lis.sentBy()
+		h, p := f.lis.sentBy()
+		return h, p, nil
 	}
 	if l := t.listenerFor(f.network); l != nil {
-		return l.sentBy()
+		h, p := l.sentBy()
+		return h, p, nil
 	}
 	// No listener for this transport: responses can only come back on the
-	// connection, so its local address is as good a sent-by as any.
+	// connection, so its local address is as good a sent-by as any. A Dialer
+	// that returns something other than a TCP connection may have no address,
+	// and a Via without one is useless.
 	local := addrPortOf(f.conn.LocalAddr())
-	return hostString(local.Addr()), int(local.Port())
+	if !local.IsValid() || local.Port() == 0 {
+		return "", 0, fmt.Errorf("%w: no %s listener and no local address for the Via", ErrNoListener, f.network)
+	}
+	return hostString(local.Addr()), int(local.Port()), nil
 }

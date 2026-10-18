@@ -54,8 +54,8 @@ type flow struct {
 	serverName string
 
 	conn net.Conn // nil for UDP
-	// wmu serializes writes so two messages never interleave on a stream.
-	wmu    sync.Mutex
+	// q feeds the writer goroutine of a stream flow.
+	q      *sendQueue
 	closed atomic.Bool
 
 	// UDP only, guarded by flowTable.mu: when the flow last received a
@@ -94,13 +94,18 @@ func (f *flow) reuseKey() reuseKey {
 	return k
 }
 
-// reusable reports whether requests "to this address" may use the flow. An
-// accepted TLS connection is not: its peer was never verified as a server, so a
-// request meant for a server at that address must open its own connection
-// (RFC 5923 §9.2 refuses reuse of a connection whose client presented no
-// certificate for the same reason).
+// reusable reports whether requests "to this address" may use the flow. Two
+// kinds of accepted connection are not. A TLS one: its peer was never verified as
+// a server, so a request meant for a server at that address must open its own
+// connection (RFC 5923 §9.2 refuses reuse of a connection whose client presented
+// no certificate for the same reason). And one whose address came from a PROXY
+// header: whoever reaches the port can write any address there, including a core
+// node's, and would then receive the requests meant for it.
 func (f *flow) reusable() bool {
-	return !(f.network == TLS && f.lis != nil)
+	if f.lis == nil {
+		return true
+	}
+	return f.network != TLS && !f.lis.proxy
 }
 
 // flowTable maps FlowIDs to flows and peers to reusable flows. Its methods are

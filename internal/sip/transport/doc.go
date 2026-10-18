@@ -50,7 +50,15 @@
 // total and per source IP) are bounded; a full UDP table displaces its least
 // recently seen flow rather than refusing a new client.
 //
-// Memory: a stream connection holds a 4 KiB read buffer, and while reading a
+// Writes never happen on the caller's goroutine. Each stream connection has a
+// send queue and a writer goroutine; a sender waits, for at most WriteTimeout,
+// only while the queue is over SendQueueBytes, and a NoWait sender, such as the
+// goroutine that reads the same connection, never waits. Two peers that both
+// send faster than they read therefore cannot deadlock each other, and a peer
+// that stops reading loses its connection without slowing anyone else.
+//
+// Memory: a stream connection holds a 4 KiB read buffer, up to twice
+// SendQueueBytes of queued output if its peer stops reading, and while reading a
 // message up to Limits.MaxHeaderBytes plus the body bytes that have arrived, at
 // most Limits.MaxBodyBytes (16 KiB and 1 MiB by default). The worst case is
 // therefore about MaxConnections times 1.02 MiB, over 10 GiB with the defaults,
