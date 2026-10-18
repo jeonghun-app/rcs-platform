@@ -405,12 +405,46 @@ func TestOneLinkCannotHoldEveryDownloadSlot(t *testing.T) {
 	// Another file is not affected.
 	done := make(chan int, 1)
 	go func() { done <- get(e, other).Code }()
-	<-held.opened
-	close(held.release)
-	if code := <-done; code != http.StatusOK {
+	select {
+	case <-held.opened:
+		close(held.release)
+		if code := <-done; code != http.StatusOK {
+			t.Fatalf("download of another file = %d", code)
+		}
+	case code := <-done:
+		close(held.release)
+		wg.Wait()
 		t.Fatalf("download of another file = %d", code)
 	}
 	wg.Wait()
+}
+
+func TestDownloadRateFloorTightensOnlyWhileSlotsRunShort(t *testing.T) {
+	e := newEnv(t, func(o *Options) {
+		o.MinDownloadRate = 10
+		o.MinDownloadRateUnderPressure = 100
+		o.MaxConcurrentDownloads = 4
+		o.DownloadPressurePercent = 50
+	})
+	file, _ := uploaded(t, e, pattern(4*testPart))
+	wall := time.Unix(1_800_000_000, 0)
+	e.srv.wallNow = func() time.Time { return wall }
+	// 100 bytes every five seconds: 20 bytes/s, between the two floors.
+	e.srv.o.Blobs = slowBlobs{Blobs: e.blobs, now: &wall, step: 5 * time.Second}
+	// With one slot of four taken there is no pressure: the slow link
+	// finishes.
+	if rec := get(e, file); rec.Code != http.StatusOK || rec.Body.Len() != 4*testPart || e.metric("download.failed.too_slow") != 0 {
+		t.Fatalf("slow download without pressure: %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	// With two other slots taken (three of four, over 50%), the same
+	// reader is cut off.
+	r1, _ := acquireSlot(e.srv.downloads)
+	r2, _ := acquireSlot(e.srv.downloads)
+	defer r1()
+	defer r2()
+	if rec := get(e, file); rec.Body.Len() >= 4*testPart || e.metric("download.failed.too_slow") != 1 {
+		t.Fatalf("slow download under pressure delivered %d bytes, too_slow %v", rec.Body.Len(), e.metric("download.failed.too_slow"))
+	}
 }
 
 // flakyFinalUpdate fails the first update that completes a record, like a

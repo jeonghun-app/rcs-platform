@@ -208,8 +208,8 @@ func (w *writer) flush(ctx context.Context, n int) error {
 // a key of its own for every completion, a multipart one is joined by S3 only
 // from parts whose ETags match the list given, and the conditional record
 // update commits exactly one of them.
-func (w *writer) complete(ctx context.Context) (store.Record, error) {
-	ctx, cancel := w.s.storageContext(ctx)
+func (w *writer) complete(parent context.Context) (store.Record, error) {
+	ctx, cancel := w.s.storageContext(parent)
 	defer cancel()
 	tail := *w.buf
 	size := w.rec.Received + int64(len(tail))
@@ -248,7 +248,7 @@ func (w *writer) complete(ctx context.Context) (store.Record, error) {
 	r.Lease, r.LeaseUntil = "", time.Time{}
 	r.Completed = now
 	r.Expires = now.Add(w.s.o.Validity)
-	rec, err := w.commit(ctx, r)
+	rec, err := w.commit(parent, r)
 	if err != nil {
 		return store.Record{}, metadataErr(err)
 	}
@@ -266,45 +266,59 @@ const commitAttempts = 4
 // update is conditional on the version this writer holds, so a retry can
 // only ever write it once: a conflict ends the retries at once.
 //
-// A conflict may be this writer's own earlier write: an update that was
-// applied but whose answer was lost, here or in the SDK's own retries. The
-// record is read back, and if it is complete with this attempt's object key
-// and hash, the upload did complete and is reported as such (#50). Object
-// keys are unique per attempt and the hash covers the content, so another
-// writer's commit cannot pass for this one.
+// Each attempt gets a storage context of its own (FT_STORAGE_TIMEOUT is per
+// call), so that one attempt timing out leaves time for the next. An update
+// can be applied and its answer lost: our own deadline ends the call after
+// DynamoDB wrote, or the SDK's retry of a lost answer meets the write as
+// ConditionalCheckFailed. So a conflict, and every failure that leaves the
+// outcome unknown, is checked against the stored record before it is
+// answered: if the record is complete with this completion's object key and
+// hash, the upload did complete and is reported as such (#50).
 func (w *writer) commit(ctx context.Context, r store.Record) (store.Record, error) {
 	var err error
 	for attempt := range commitAttempts {
 		if attempt > 0 {
-			select {
-			case <-time.After(w.s.retryWait(attempt)):
-			case <-ctx.Done():
-				return store.Record{}, err
-			}
+			// The request may have ended; the commit is worth finishing
+			// anyway, so the wait does not follow it.
+			<-time.After(w.s.retryWait(attempt))
 		}
+		actx, cancel := w.s.storageContext(ctx)
 		var rec store.Record
-		rec, err = w.s.o.Metadata.Update(ctx, r)
-		if errors.Is(err, store.ErrConflict) {
+		rec, err = w.s.o.Metadata.Update(actx, r)
+		cancel()
+		switch {
+		case err == nil, errors.Is(err, store.ErrNotFound):
+			return rec, err
+		case errors.Is(err, store.ErrConflict):
 			if mine, ok := w.committed(ctx, r); ok {
-				w.s.metrics.Count("upload.commit_recovered", 1)
 				return mine, nil
 			}
-		}
-		if err == nil || errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
 			return rec, err
 		}
 		w.s.metrics.Count("upload.commit_retried", 1)
 	}
+	// Every attempt failed without saying whether it wrote: look once more.
+	if mine, ok := w.committed(ctx, r); ok {
+		return mine, nil
+	}
 	return store.Record{}, err
 }
 
-// committed reads the record back after a conflicting completion and
-// reports whether it holds this completion, r.
+// committed reads the record back, with a context of its own, and reports
+// whether it holds this completion, r.
+//
+// The object key and the hash together identify r. A single-object file is
+// written under a new key for every completion, so no other completion can
+// share it. Writers resuming one multipart upload do share its key, but S3
+// completes a multipart upload only once, and the hash covers the content.
 func (w *writer) committed(ctx context.Context, r store.Record) (store.Record, bool) {
-	stored, err := w.s.o.Metadata.Get(ctx, r.ID)
+	gctx, cancel := w.s.storageContext(ctx)
+	defer cancel()
+	stored, err := w.s.o.Metadata.Get(gctx, r.ID)
 	if err != nil || stored.State != store.Complete || stored.Object != r.Object || !bytes.Equal(stored.SHA256, r.SHA256) {
 		return store.Record{}, false
 	}
+	w.s.metrics.Count("upload.commit_recovered", 1)
 	return stored, true
 }
 

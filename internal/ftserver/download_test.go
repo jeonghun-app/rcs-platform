@@ -336,15 +336,41 @@ func TestDownloadDefaultsLetAGroupChatFetchOneLinkAtOnce(t *testing.T) {
 	}
 	// Every member of a group chat fetches the same link within seconds of
 	// the message; 64 per task keeps them out of 503-and-retry. The rate
-	// floor rises with it, so 64 slow readers cannot sit on the file.
-	if c.MaxDownloadsPerFile != 64 || c.MinDownloadRate != 16<<10 || c.MaxDownloadsPerUploader != DefaultMaxDownloadsPerUploader {
-		t.Fatalf("per file %d, min rate %d, per uploader %d", c.MaxDownloadsPerFile, c.MinDownloadRate, c.MaxDownloadsPerUploader)
+	// floor stays low enough for a congested mobile link and tightens only
+	// when slots run short.
+	if c.MaxDownloadsPerFile != 64 || c.MaxDownloadsPerUploader != 128 || c.MinDownloadRate != 4<<10 ||
+		c.MinDownloadRatePressure != 16<<10 || c.DownloadPressurePercent != 75 {
+		t.Fatalf("per file %d, per uploader %d, rates %d/%d at %d%%", c.MaxDownloadsPerFile, c.MaxDownloadsPerUploader,
+			c.MinDownloadRate, c.MinDownloadRatePressure, c.DownloadPressurePercent)
 	}
-	if DefaultMaxDownloadsPerUploader < DefaultMaxDownloadsPerFile || DefaultMaxDownloadsPerUploader > DefaultMaxDownloads {
-		t.Fatalf("the per-uploader default %d must lie between the per-file and per-task ones", DefaultMaxDownloadsPerUploader)
+	for name, env := range map[string]map[string]string{
+		"zero per uploader":    with(devEnv, "FT_MAX_DOWNLOADS_PER_UPLOADER", "0"),
+		"negative pressure":    with(devEnv, "FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "-1"),
+		"percent out of range": with(devEnv, "FT_DOWNLOAD_PRESSURE_PERCENT", "101"),
+	} {
+		if _, err := configure(env); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
 	}
-	if _, err := configure(with(devEnv, "FT_MAX_DOWNLOADS_PER_UPLOADER", "0")); err == nil {
-		t.Fatal("FT_MAX_DOWNLOADS_PER_UPLOADER=0 was accepted")
+}
+
+func TestDownloadLimitsMustNestOrProductionRefusesToStart(t *testing.T) {
+	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32))
+	for name, env := range map[string]map[string]string{
+		"per file above per uploader": with(prod, "FT_MAX_DOWNLOADS_PER_FILE", "200"),
+		"per uploader above the task": with(prod, "FT_MAX_CONCURRENT_DOWNLOADS", "100"),
+	} {
+		if _, out := runService(t, env); !strings.Contains(out, "FT_MAX_DOWNLOADS_PER_UPLOADER ≤ FT_MAX_CONCURRENT_DOWNLOADS does not hold") {
+			t.Errorf("%s: not refused:\n%s", name, out)
+		}
+	}
+	if _, out := runService(t, prod); strings.Contains(out, "does not hold") {
+		t.Fatalf("the defaults were refused:\n%s", out)
+	}
+	// dev starts with a warning instead.
+	_, out := runService(t, with(devEnv, "FT_MAX_CONCURRENT_DOWNLOADS", "100"))
+	if !strings.Contains(out, "production-unsafe settings in use") || strings.Contains(out, "configuration rejected") {
+		t.Fatalf("dev did not just warn:\n%s", out)
 	}
 }
 
@@ -379,9 +405,17 @@ func TestOneUploaderCannotHoldEveryDownloadSlot(t *testing.T) {
 	}
 	done := make(chan int, 1)
 	go func() { done <- get(e, bobs).Code }()
-	<-held.opened
-	close(held.release)
-	if code := <-done; code != http.StatusOK {
+	// Wait for bob's download to reach storage, or for its answer: a
+	// regression that turns it away must fail the test, not hang it.
+	select {
+	case <-held.opened:
+		close(held.release)
+		if code := <-done; code != http.StatusOK {
+			t.Fatalf("another uploader's file = %d", code)
+		}
+	case code := <-done:
+		close(held.release)
+		wg.Wait()
 		t.Fatalf("another uploader's file = %d", code)
 	}
 	wg.Wait()

@@ -26,9 +26,13 @@ const (
 	DefaultMaxLookups           = 16
 	DefaultMinUploadRate        = 1024 // bytes per second
 	// A group chat delivers one link to every member at once: 64 downloads
-	// of a file per task keep them from 503-and-retry, and a 16 KiB/s floor
-	// keeps 64 slow readers from sitting on the file (#50).
-	DefaultMinDownloadRate         = 16 << 10 // bytes per second
+	// of a file per task keep them from 503-and-retry (#50). The download
+	// rate floor is 4 KiB/s, which a congested mobile link still makes, and
+	// rises to 16 KiB/s only while more than 75% of the task's download
+	// slots are taken, so that slow readers make room when others wait.
+	DefaultMinDownloadRate         = 4 << 10  // bytes per second
+	DefaultMinDownloadRatePressure = 16 << 10 // bytes per second
+	DefaultDownloadPressurePercent = 75
 	DefaultMaxDownloadsPerFile     = 64
 	DefaultMaxDownloadsPerUploader = 128
 	DefaultDrainTimeout            = 10 * time.Second
@@ -80,6 +84,8 @@ type Config struct {
 	MaxLookups              int
 	MinUploadRate           int64
 	MinDownloadRate         int64
+	MinDownloadRatePressure int64
+	DownloadPressurePercent int
 	MaxDownloadsPerFile     int
 	MaxDownloadsPerUploader int
 	IdleTimeout             time.Duration
@@ -128,6 +134,8 @@ func Configure(s *runtime.Settings) Config {
 		MaxLookups:              e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
 		MinUploadRate:           int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
 		MinDownloadRate:         int64(e.Int("MIN_DOWNLOAD_RATE", DefaultMinDownloadRate)),
+		MinDownloadRatePressure: int64(e.Int("MIN_DOWNLOAD_RATE_UNDER_PRESSURE", DefaultMinDownloadRatePressure)),
+		DownloadPressurePercent: e.Int("DOWNLOAD_PRESSURE_PERCENT", DefaultDownloadPressurePercent),
 		MaxDownloadsPerFile:     e.Int("MAX_DOWNLOADS_PER_FILE", DefaultMaxDownloadsPerFile),
 		MaxDownloadsPerUploader: e.Int("MAX_DOWNLOADS_PER_UPLOADER", DefaultMaxDownloadsPerUploader),
 		IdleTimeout:             e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
@@ -271,6 +279,17 @@ func Configure(s *runtime.Settings) Config {
 	if c.MinDownloadRate < 0 {
 		e.Invalid("MIN_DOWNLOAD_RATE", "must not be negative")
 	}
+	if c.MinDownloadRatePressure < 0 {
+		e.Invalid("MIN_DOWNLOAD_RATE_UNDER_PRESSURE", "must not be negative")
+	}
+	if c.DownloadPressurePercent < 0 || c.DownloadPressurePercent > 100 {
+		e.Invalid("DOWNLOAD_PRESSURE_PERCENT", "must be from 0 to 100")
+	}
+	// Each download limit only protects if it is tighter than the one
+	// around it: a per-uploader limit above the task's would let one
+	// subscriber's links take every slot again.
+	s.ForbidInProduction(c.MaxDownloadsPerFile > c.MaxDownloadsPerUploader || c.MaxDownloadsPerUploader > c.MaxDownloads,
+		"FT_MAX_DOWNLOADS_PER_FILE ≤ FT_MAX_DOWNLOADS_PER_UPLOADER ≤ FT_MAX_CONCURRENT_DOWNLOADS does not hold: a looser inner limit protects nothing")
 	return c
 }
 

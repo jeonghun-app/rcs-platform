@@ -147,7 +147,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close()
 	w.WriteHeader(status)
-	n, err := io.Copy(&deadlineWriter{s: s, w: w, rate: newRateCheck(s.o.MinDownloadRate, s.wallNow)}, body)
+	n, err := io.Copy(&deadlineWriter{s: s, w: w, rate: newRateCheck(s.minDownloadRate, s.wallNow)}, body)
 	s.metrics.Count("download.bytes", n)
 	if err != nil || n != rng.length {
 		// The status line is out; all that is left is to cut the response
@@ -198,8 +198,8 @@ func (s *Server) downloadFailed(w http.ResponseWriter, op string, err error) {
 
 // deadlineWriter gives each write of a download IdleTimeout, so a reader
 // that stops reading releases the connection, and cuts off a reader slower
-// than MinDownloadRate, so one that reads just enough to beat the deadline
-// cannot hold a download slot for hours.
+// than the download rate floor, so one that reads just enough to beat the
+// deadline cannot hold a slot for hours while others wait for it.
 type deadlineWriter struct {
 	s    *Server
 	w    http.ResponseWriter

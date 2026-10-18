@@ -121,10 +121,16 @@ byte 0, and the resume URL:
     time.
 - The update that completes an upload depends on the version the writer holds,
   so two tasks cannot both complete the same `tid`. A transient failure of that
-  update is retried. If a retry conflicts with the writer's own earlier
-  update, one that was applied but whose answer was lost, the record is read
-  back. When it names this attempt's object key and hash, the upload is reported
-  as complete (`upload.commit_recovered`) rather than failed. Content is safe even if a
+  update is retried, and each attempt gets its own `FT_STORAGE_TIMEOUT`.
+  - An update can be applied with its answer lost, either because our deadline
+    ended the call after DynamoDB wrote, or because the SDK's retry met the write
+    as a conflict.
+  - So before a conflict, or any failure that leaves the outcome unknown, is
+    answered, the record is read back once with a fresh context.
+  - If it is complete with this completion's object key and hash, the upload is
+    reported as complete (`upload.commit_recovered`) rather than failed.
+
+  Content is safe even if a
   lease is broken, for example by a writer stalled past it or by clocks far
   apart:
   - each upload attempt writes its multipart upload under its own key;
@@ -148,10 +154,17 @@ byte 0, and the resume URL:
   - The per-uploader limit keeps one subscriber's links from taking every slot
     of the task. With `FT_DOWNLOAD_AUTH` off, anyone holding a link can open
     connections.
-- A download read more slowly than `FT_MIN_DOWNLOAD_RATE`, measured over each
-  minute, is cut off. Otherwise a reader that reads just enough to beat the
-  write deadline could hold a slot for hours. The client sees a broken download,
+- A download read more slowly than the rate floor, measured over each minute,
+  is cut off. Otherwise a reader that reads just enough to beat the write
+  deadline could hold a slot for hours. The client sees a broken download,
   which it can resume with a range.
+  - The floor is `FT_MIN_DOWNLOAD_RATE`, 4 KiB/s (32 kbit/s), which a congested
+    or cell-edge mobile link still makes.
+  - It rises to `FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE`, 16 KiB/s, only while more
+    than `FT_DOWNLOAD_PRESSURE_PERCENT` (75%) of the task's download slots are
+    taken. When slots run short, slow readers make room for others. Under
+    pressure, a link slower than about 128 kbit/s cannot finish a file of more
+    than a few MiB without resuming.
 - Headers:
   - the declared `Content-Type`;
   - `Content-Disposition: attachment` with the file name (RFC 6266);
@@ -280,8 +293,10 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_MIN_UPLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower upload is cut off with `408`. `0` turns the check off |
 | `FT_MAX_CONCURRENT_DOWNLOADS` | `256` | Downloads in progress per task |
 | `FT_MAX_DOWNLOADS_PER_FILE` | `64` | Downloads of one file in progress per task, enough for a group chat fetching one link at once |
-| `FT_MAX_DOWNLOADS_PER_UPLOADER` | `128` | Downloads in progress per task across all the files of one uploader |
-| `FT_MIN_DOWNLOAD_RATE` | `16384` (16 KiB/s) | Bytes per second, measured over each minute. A slower download is cut off, so that the many readers a group chat allows cannot sit on a file. `0` turns the check off |
+| `FT_MAX_DOWNLOADS_PER_UPLOADER` | `128` | Downloads in progress per task across all the files of one uploader. The download limits must nest: `FT_MAX_DOWNLOADS_PER_FILE` ≤ `FT_MAX_DOWNLOADS_PER_UPLOADER` ≤ `FT_MAX_CONCURRENT_DOWNLOADS`. Otherwise staging and prod refuse to start, and dev warns |
+| `FT_MIN_DOWNLOAD_RATE` | `4096` (4 KiB/s) | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off |
+| `FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE` | `16384` (16 KiB/s) | The floor while the task's download slots are under pressure |
+| `FT_DOWNLOAD_PRESSURE_PERCENT` | `75` | Share of `FT_MAX_CONCURRENT_DOWNLOADS` in use above which the pressure floor applies |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
 | `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
@@ -428,7 +443,9 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 | `download.failed.missing_object` > 0 | A valid file's object is gone. The lifecycle rule is shorter than the validity |
 | `upload.failed.busy` sustained | The tasks' upload slots are full. Uploads are I/O bound, so scale on this, not on CPU |
 | `download.failed.busy` sustained | The tasks' download slots are full. Scale out, or raise `FT_MAX_CONCURRENT_DOWNLOADS` if memory allows |
-| `download.failed.file_busy`, `download.failed.uploader_busy` sustained | One link or one uploader's links hit their limit. Group chats larger than the per-file limit per task, or one subscriber's links being hammered. Check the WAF rule before raising the limits |
+| `download.failed.file_busy` sustained | One link hit its limit: a group chat larger than the per-file limit per task, or one link being hammered. Check the WAF rule before raising the limit |
+| `download.failed.uploader_busy` sustained | One uploader's links hit their limit. This is usually an album: one sender posts several photos to a large group chat. With one task, 63 recipients × 3 photos is 189 downloads (thumbnails count too), over the 128 limit, so the rest get `503` and retry after 10 s. Two or more tasks share the load. If it persists with several tasks and no album traffic, look for abuse of one subscriber's links |
+| `download.failed.too_slow` / (`download.served` + `download.partial`) above a few percent | Recipients are cut off by the rate floor. If it happens without pressure, the 4 KiB/s floor is too high for the network. Under pressure it is expected: add capacity |
 | `sweep.failed` > 0, or no `sweep.duration` for two intervals | The sweeper is failing or stuck. Until the expiry index exists (follow-up), a table too large to scan within `FT_STORAGE_TIMEOUT` makes every sweep fail. Raise the timeout or build the index before alarming on this |
 
 ## Operations notes

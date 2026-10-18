@@ -72,3 +72,72 @@ func TestConflictWithAnotherWritersCommitIsStillAFailure(t *testing.T) {
 		t.Fatalf("status = %d, recovered %v", rec.Code, e.metric("upload.commit_recovered"))
 	}
 }
+
+// appliedThenTimedOut applies completing updates, then holds the call until
+// its context ends and reports the context's error, as when DynamoDB writes
+// and FT_STORAGE_TIMEOUT expires before the answer arrives. With every set,
+// it does so on every completing update; otherwise only on the first.
+type appliedThenTimedOut struct {
+	store.Metadata
+	every bool
+	calls atomic.Int32
+}
+
+func (a *appliedThenTimedOut) Update(ctx context.Context, r store.Record) (store.Record, error) {
+	if r.State != store.Complete || !a.every && a.calls.Load() > 0 {
+		return a.Metadata.Update(ctx, r)
+	}
+	a.calls.Add(1)
+	_, _ = a.Metadata.Update(ctx, r) // applied, or a conflict on a retry
+	<-ctx.Done()
+	return store.Record{}, ctx.Err()
+}
+
+func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
+	for name, every := range map[string]bool{"retry conflicts": false, "every attempt times out": true} {
+		t.Run(name, func(t *testing.T) {
+			meta := &appliedThenTimedOut{Metadata: store.NewMemory(), every: every}
+			e := newEnv(t, func(o *Options) { o.Metadata = meta; o.StorageTimeout = 300 * time.Millisecond })
+			e.srv.retryWait = func(int) time.Duration { return 0 }
+			data := pattern(20)
+			// The first attempt really expires; a later attempt meets the
+			// applied write as a conflict, or, if every attempt expires,
+			// the final read-back finds it.
+			rec := e.user(alice).upload(multipartBody(tidPart("expired"), filePart("a", "text/plain", data)))
+			if rec.Code != http.StatusOK || e.metric("upload.commit_recovered") != 1 {
+				t.Fatalf("status = %d, recovered %v, retried %v", rec.Code, e.metric("upload.commit_recovered"), e.metric("upload.commit_retried"))
+			}
+		})
+	}
+}
+
+// sameKeyOtherContent commits, the first time a completing update arrives,
+// a record with the same object key but another hash, as a writer resuming
+// the same multipart upload with other content would, then reports a
+// timeout.
+type sameKeyOtherContent struct {
+	store.Metadata
+	done atomic.Bool
+}
+
+func (o *sameKeyOtherContent) Update(ctx context.Context, r store.Record) (store.Record, error) {
+	if r.State == store.Complete && o.done.CompareAndSwap(false, true) {
+		theirs := r.Clone()
+		theirs.SHA256 = sha("other content")
+		if _, err := o.Metadata.Update(ctx, theirs); err != nil {
+			return store.Record{}, err
+		}
+		return store.Record{}, context.DeadlineExceeded
+	}
+	return o.Metadata.Update(ctx, r)
+}
+
+func TestCommitUnderTheSameKeyWithAnotherHashIsNotMistakenForOurs(t *testing.T) {
+	meta := &sameKeyOtherContent{Metadata: store.NewMemory()}
+	e := newEnv(t, func(o *Options) { o.Metadata = meta })
+	e.srv.retryWait = func(int) time.Duration { return 0 }
+	rec := e.user(alice).upload(multipartBody(tidPart("same-key"), filePart("a", "text/plain", "mine")))
+	if rec.Code != http.StatusConflict || e.metric("upload.commit_recovered") != 0 {
+		t.Fatalf("status = %d, recovered %v", rec.Code, e.metric("upload.commit_recovered"))
+	}
+}
