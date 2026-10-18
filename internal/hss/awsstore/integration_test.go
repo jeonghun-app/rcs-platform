@@ -58,11 +58,11 @@ func TestIntegrationTwoTasksOpenOneKeyring(t *testing.T) {
 	d := IntegrationTables(t)
 	ctx := context.Background()
 	w := xorWrapper{}
-	a, err := keyring.Open(ctx, w, d, rand.Reader)
+	a, err := keyring.Open(ctx, w, d, keyring.OpenOptions{Rand: rand.Reader, Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := keyring.Open(ctx, w, d, rand.Reader)
+	b, err := keyring.Open(ctx, w, d, keyring.OpenOptions{Rand: rand.Reader, Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeKMS wraps keys by XOR with a fixed pad, which is enough to tell a
@@ -62,7 +64,8 @@ func (f *fakeKMS) Unwrap(_ context.Context, wrapped []byte) ([]byte, error) {
 type memStore struct {
 	mu   sync.Mutex
 	keys []WrappedKey
-	// beforeAdd runs before AddDataKey stores, to simulate another task.
+	// beforeAdd runs before AddFirstDataKey stores, to simulate another
+	// task.
 	beforeAdd func()
 	failLoad  error
 }
@@ -76,20 +79,20 @@ func (s *memStore) DataKeys(context.Context) ([]WrappedKey, error) {
 	return append([]WrappedKey(nil), s.keys...), nil
 }
 
-func (s *memStore) AddDataKey(_ context.Context, k WrappedKey) error {
+func (s *memStore) AddFirstDataKey(_ context.Context, k WrappedKey) error {
 	if s.beforeAdd != nil {
 		s.beforeAdd()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, have := range s.keys {
-		if have.ID == k.ID {
-			return fmt.Errorf("add: %w", ErrExists)
-		}
+	if len(s.keys) > 0 {
+		return fmt.Errorf("add: %w", ErrExists)
 	}
 	s.keys = append(s.keys, k)
 	return nil
 }
+
+func create() OpenOptions { return OpenOptions{Rand: rand.Reader, Create: true} }
 
 func localKeyring(t *testing.T) *Keyring {
 	t.Helper()
@@ -160,18 +163,18 @@ func TestLocalKeyMustBe256Bits(t *testing.T) {
 
 func TestOpenCreatesTheFirstDataKeyOnceAndReusesIt(t *testing.T) {
 	kms, st := &fakeKMS{}, &memStore{}
-	first, err := Open(context.Background(), kms, st, rand.Reader)
+	first, err := Open(context.Background(), kms, st, create())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kms.generated != 1 || len(st.keys) != 1 || st.keys[0].ID != "1" {
+	if kms.generated != 1 || len(st.keys) != 1 {
 		t.Fatalf("generated %d, stored %+v", kms.generated, st.keys)
 	}
 	sealed, err := first.Seal([]byte("secret"), []byte("aad"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Open(context.Background(), kms, st, rand.Reader)
+	second, err := Open(context.Background(), kms, st, create())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,17 +192,17 @@ func TestOpenUsesTheKeyAnotherTaskStoredFirst(t *testing.T) {
 	st.beforeAdd = func() {
 		st.beforeAdd = nil
 		var err error
-		other, err = Open(context.Background(), kms, st, rand.Reader)
+		other, err = Open(context.Background(), kms, st, create())
 		if err != nil {
 			t.Error(err)
 		}
 	}
-	mine, err := Open(context.Background(), kms, st, rand.Reader)
+	mine, err := Open(context.Background(), kms, st, create())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st.keys) != 1 {
-		t.Fatalf("stored keys = %d, want 1", len(st.keys))
+	if len(st.keys) != 1 || kms.generated != 2 {
+		t.Fatalf("stored keys = %d, generated %d; want 1 stored of 2", len(st.keys), kms.generated)
 	}
 	sealed, err := other.Seal([]byte("secret"), nil)
 	if err != nil {
@@ -215,7 +218,7 @@ func TestTheHighestKeySealsAndEveryKeyOpens(t *testing.T) {
 	old, wrappedOld, _ := kms.GenerateDataKey(context.Background())
 	_, wrappedNew, _ := kms.GenerateDataKey(context.Background())
 	st := &memStore{keys: []WrappedKey{{ID: "10", Ciphertext: wrappedNew}, {ID: "9", Ciphertext: wrappedOld}}}
-	k, err := Open(context.Background(), kms, st, rand.Reader)
+	k, err := Open(context.Background(), kms, st, create())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +247,7 @@ func TestOpenFailsClosed(t *testing.T) {
 		"invalid identifier": {&fakeKMS{}, &memStore{keys: []WrappedKey{{ID: "01", Ciphertext: []byte("wrapped:")}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if k, err := Open(context.Background(), tc.kms, tc.st, rand.Reader); err == nil {
+			if k, err := Open(context.Background(), tc.kms, tc.st, create()); err == nil {
 				t.Errorf("Open = %v, want an error", k)
 			}
 		})
@@ -270,5 +273,33 @@ func TestKeyringNeverPrintsItsKeys(t *testing.T) {
 		if strings.Contains(s, "0707") || strings.Contains(s, "aead") {
 			t.Errorf("keyring printed its contents: %s", s)
 		}
+	}
+}
+
+// A store without a key either is new or has lost its key. Creating one
+// for a store that holds secrets would seal new values under a key nothing
+// old opens with, so the caller must allow it.
+func TestOpenCreatesAKeyOnlyWhenAllowed(t *testing.T) {
+	kms, st := &fakeKMS{}, &memStore{}
+	if _, err := Open(context.Background(), kms, st, OpenOptions{Rand: rand.Reader}); !errors.Is(err, ErrNoDataKey) {
+		t.Fatalf("Open without Create = %v, want ErrNoDataKey", err)
+	}
+	if kms.generated != 0 || len(st.keys) != 0 {
+		t.Fatal("a key was created without permission")
+	}
+	var created string
+	at := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	k, err := Open(context.Background(), kms, st, OpenOptions{
+		Rand: rand.Reader, Create: true, Now: func() time.Time { return at },
+		Created: func(id string) { created = id },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ID is the creation time, so a replacement key never reuses the
+	// ID of the key it replaces.
+	want := strconv.FormatInt(at.UnixMilli(), 10)
+	if created != want || k.CurrentKeyID() != want {
+		t.Errorf("created %q, current %q; want %q", created, k.CurrentKeyID(), want)
 	}
 }

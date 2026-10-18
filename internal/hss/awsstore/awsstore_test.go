@@ -78,7 +78,8 @@ func TestStoreFailuresAreReportedWithoutRequestDetails(t *testing.T) {
 	_, checks["update profile"] = d.UpdateProfile(ctx, storetest.Profile("p"))
 	checks["delete profile"] = d.DeleteProfile(ctx, storetest.Profile("p"))
 	_, checks["data keys"] = d.DataKeys(ctx)
-	checks["add data key"] = d.AddDataKey(ctx, keyring.WrappedKey{ID: "1"})
+	checks["add data key"] = d.AddFirstDataKey(ctx, keyring.WrappedKey{ID: "1"})
+	_, checks["has subscriptions"] = d.HasSubscriptions(ctx)
 	checks["ready"] = d.Ready(ctx)
 	for op, err := range checks {
 		if err == nil {
@@ -188,7 +189,7 @@ func TestKMSWrapsDataKeysWithItsEncryptionContext(t *testing.T) {
 	d, _ := fakeStore(t)
 	f := &fakeKMS{}
 	ctx := context.Background()
-	k, err := keyring.Open(ctx, NewKMS(f, "alias/hss"), d, rand.Reader)
+	k, err := keyring.Open(ctx, NewKMS(f, "alias/hss"), d, keyring.OpenOptions{Rand: rand.Reader, Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +201,7 @@ func TestKMSWrapsDataKeysWithItsEncryptionContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Another task opens the same keyring from the table.
-	again, err := keyring.Open(ctx, NewKMS(f, "alias/hss"), d, rand.Reader)
+	again, err := keyring.Open(ctx, NewKMS(f, "alias/hss"), d, keyring.OpenOptions{Rand: rand.Reader, Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +209,7 @@ func TestKMSWrapsDataKeysWithItsEncryptionContext(t *testing.T) {
 		t.Errorf("second task: %q, %v", got, err)
 	}
 	// A wrapped key is refused under another master key.
-	if _, err := keyring.Open(ctx, NewKMS(f, "alias/other"), d, rand.Reader); err == nil {
+	if _, err := keyring.Open(ctx, NewKMS(f, "alias/other"), d, keyring.OpenOptions{Rand: rand.Reader, Create: true}); err == nil {
 		t.Error("a data key unwrapped under another KMS key")
 	}
 }

@@ -270,15 +270,20 @@ func (m *Memory) DataKeys(context.Context) ([]keyring.WrappedKey, error) {
 	return out, nil
 }
 
-// AddDataKey implements keyring.Store.
-func (m *Memory) AddDataKey(_ context.Context, k keyring.WrappedKey) error {
+// AddFirstDataKey implements keyring.Store.
+func (m *Memory) AddFirstDataKey(_ context.Context, k keyring.WrappedKey) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, have := range m.keys {
-		if have.ID == k.ID {
-			return fmt.Errorf("store: add data key: %w", keyring.ErrExists)
-		}
+	if len(m.keys) > 0 {
+		return fmt.Errorf("store: add data key: %w", keyring.ErrExists)
 	}
 	m.keys = append(m.keys, keyring.WrappedKey{ID: k.ID, Ciphertext: slices.Clone(k.Ciphertext)})
 	return nil
+}
+
+// HasSubscriptions implements Store.
+func (m *Memory) HasSubscriptions(context.Context) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.subs) > 0, nil
 }

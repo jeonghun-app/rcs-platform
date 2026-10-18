@@ -211,7 +211,25 @@ func openStore(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (st
 		keys, err := keyring.NewLocal(k, d.rand)
 		return dyn, keys, err
 	}
-	keys, err := keyring.Open(ctx, wrapper, dyn, d.rand)
+	// A first data key is created for an empty table, or when the operator
+	// says so: a table with subscriptions but no key has lost its key, and
+	// a new one would make restoring the old one a second loss.
+	hasSubs, err := dyn.HasSubscriptions(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := keyring.Open(ctx, wrapper, dyn, keyring.OpenOptions{
+		Rand: d.rand, Create: cfg.KeyringBootstrap || !hasSubs,
+		Created: func(id string) {
+			rt.Metrics.Count("keyring.created", 1)
+			rt.Logger.Warn("created the first data key of the subscriber secrets", slog.String("key_id", id),
+				slog.Bool("bootstrap_flag", cfg.KeyringBootstrap))
+		},
+	})
+	if errors.Is(err, keyring.ErrNoDataKey) {
+		return nil, nil, errors.New("hss: the subscribers table holds subscriptions but no data key; " +
+			"restore the keyring item (docs/hss.md, Secrets), or set HSS_KEYRING_BOOTSTRAP=true to start over with a new key")
+	}
 	if err != nil {
 		return nil, nil, err
 	}

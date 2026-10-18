@@ -249,3 +249,44 @@ func mustConfigure(t *testing.T, env map[string]string) Config {
 	}
 	return c
 }
+
+// A table with subscriptions but no data key has lost its key: the HSS
+// refuses to start rather than create a new one, unless told to.
+func TestRunRefusesToReplaceALostDataKey(t *testing.T) {
+	cfg, err := configure(with(devEnv, "HSS_STORE", "dynamodb", "HSS_KMS_KEY_ID", "alias/hss"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &memoryAWS{Memory: store.NewMemory()}
+	ctx := context.Background()
+	if err := ensureProfile(ctx, backend, DefaultRCSProfile(DefaultProfileID, asURI)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.CreateSubscription(ctx, &store.Subscription{IMPI: impi1, Profile: DefaultProfileID,
+		PublicIdentities: []store.PublicIdentity{{IMPU: impu1}}}); err != nil {
+		t.Fatal(err)
+	}
+	d := defaultDeps()
+	d.aws = func(context.Context, awsstore.Config) (readyStore, keyring.Wrapper, error) {
+		return backend, xorWrapper{}, nil
+	}
+	err = run(ctx, runtimetest.New(t, "hss").Runtime, cfg, d)
+	if err == nil || !strings.Contains(err.Error(), "HSS_KEYRING_BOOTSTRAP") {
+		t.Fatalf("Run = %v, want a refusal naming HSS_KEYRING_BOOTSTRAP", err)
+	}
+	if keys, _ := backend.DataKeys(ctx); len(keys) != 0 {
+		t.Fatal("a data key was created")
+	}
+	cfg, err = configure(with(devEnv, "HSS_STORE", "dynamodb", "HSS_KMS_KEY_ID", "alias/hss", "HSS_KEYRING_BOOTSTRAP", "true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _, cancel, done := startRun(t, cfg, d)
+	defer func() { cancel(); <-done }()
+	if keys, _ := backend.DataKeys(ctx); len(keys) != 1 {
+		t.Fatalf("keys after bootstrap = %d", len(keys))
+	}
+	if n, _ := h.Metric("keyring.created"); n != 1 {
+		t.Errorf("keyring.created = %v", n)
+	}
+}

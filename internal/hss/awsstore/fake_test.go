@@ -73,8 +73,6 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return cur == nil
 	case "attribute_exists(#pk)":
 		return cur != nil
-	case "attribute_not_exists(#k)":
-		return attr("#k") == nil
 	case "#v = :v":
 		return cur != nil && nv(attr("#v")) == nv(values[":v"])
 	case "#impi = :impi":
@@ -127,27 +125,23 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 	return &dynamodb.PutItemOutput{}, nil
 }
 
-func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+func (f *fakeDynamo) Scan(_ context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.enter("UpdateItem"); err != nil {
+	if err := f.enter("Scan"); err != nil {
 		return nil, err
 	}
-	if got := aws.ToString(in.UpdateExpression); got != "SET #k = :k" {
-		f.t.Fatalf("update expression %q", got)
+	if aws.ToString(in.IndexName) != ProfileIndex || aws.ToInt32(in.Limit) != 1 {
+		f.t.Fatalf("scan of %q with limit %d", aws.ToString(in.IndexName), aws.ToInt32(in.Limit))
 	}
-	tbl := f.table(in.TableName)
-	pk := sv(in.Key[attrPK])
-	if !f.holds(in.ConditionExpression, in.ExpressionAttributeNames, in.ExpressionAttributeValues, tbl[pk]) {
-		return nil, &types.ConditionalCheckFailedException{}
+	out := &dynamodb.ScanOutput{}
+	for pk, item := range f.table(in.TableName) {
+		if _, ok := item[attrProfile]; ok {
+			out.Items = append(out.Items, map[string]types.AttributeValue{attrPK: str(pk)})
+			break
+		}
 	}
-	item := maps.Clone(tbl[pk])
-	if item == nil {
-		item = maps.Clone(in.Key)
-	}
-	item[in.ExpressionAttributeNames["#k"]] = in.ExpressionAttributeValues[":k"]
-	tbl[pk] = item
-	return &dynamodb.UpdateItemOutput{}, nil
+	return out, nil
 }
 
 func (f *fakeDynamo) DeleteItem(_ context.Context, in *dynamodb.DeleteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {

@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"time"
 )
 
 // DataKeySize is the size of a data key: AES-256.
@@ -39,8 +40,8 @@ const format = 1
 const nonceSize = 12
 
 var (
-	// ErrExists is returned by Store.AddDataKey when another task added a
-	// key with the same identifier first.
+	// ErrExists is returned by Store.AddFirstDataKey when another task
+	// stored a key first.
 	ErrExists = errors.New("keyring: data key exists")
 	// ErrUnknownKey means a value was sealed with a data key this keyring
 	// does not hold.
@@ -52,7 +53,9 @@ var (
 
 // WrappedKey is a data key encrypted under the master key, as stored.
 type WrappedKey struct {
-	// ID is a decimal number; the highest one seals new values.
+	// ID is a decimal number, the creation time in Unix milliseconds, so
+	// that a key created to replace a lost one never takes the lost one's
+	// ID; the highest seals new values.
 	ID         string
 	Ciphertext []byte
 }
@@ -71,9 +74,30 @@ type Wrapper interface {
 type Store interface {
 	// DataKeys returns every stored wrapped key.
 	DataKeys(ctx context.Context) ([]WrappedKey, error)
-	// AddDataKey stores a key, or fails with an error wrapping ErrExists
-	// when a key with its ID is already stored.
-	AddDataKey(ctx context.Context, k WrappedKey) error
+	// AddFirstDataKey stores the first key, or fails with an error wrapping
+	// ErrExists when any key is already stored, so that tasks starting
+	// together agree on one first key.
+	AddFirstDataKey(ctx context.Context, k WrappedKey) error
+}
+
+// ErrNoDataKey means the store holds no data key and Open was not allowed
+// to create one.
+var ErrNoDataKey = errors.New("keyring: no data key is stored")
+
+// OpenOptions configures Open.
+type OpenOptions struct {
+	// Rand supplies nonces (crypto/rand.Reader).
+	Rand io.Reader
+	// Now stamps the ID of a new key; time.Now when nil.
+	Now func() time.Time
+	// Create allows creating the first key when the store holds none. A
+	// store that already holds secrets but no key has lost its key: a new
+	// one would seal new values under a key nothing old opens with, and
+	// turn a restore of the lost key into a second loss. The caller allows
+	// it only for an empty store or by an operator's explicit choice.
+	Create bool
+	// Created is told the ID of a key Open created.
+	Created func(id string)
 }
 
 // Keyring seals and opens values. It is safe for concurrent use and formats
@@ -96,24 +120,27 @@ func NewLocal(key []byte, rand io.Reader) (*Keyring, error) {
 }
 
 // Open loads the wrapped data keys from s and unwraps each with w. When s
-// holds none, it generates the first one and stores it; when another task
-// stores one at the same time, it uses that task's key instead, so every
-// task seals with the same key.
-func Open(ctx context.Context, w Wrapper, s Store, rand io.Reader) (*Keyring, error) {
+// holds none and o.Create allows it, it generates the first one and stores
+// it; when another task stores one at the same time, it uses that task's
+// key instead, so every task seals with the same key.
+func Open(ctx context.Context, w Wrapper, s Store, o OpenOptions) (*Keyring, error) {
 	wrapped, err := s.DataKeys(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("keyring: loading data keys: %w", err)
 	}
 	if len(wrapped) == 0 {
-		if wrapped, err = createFirst(ctx, w, s); err != nil {
+		if !o.Create {
+			return nil, ErrNoDataKey
+		}
+		if wrapped, err = createFirst(ctx, w, s, o); err != nil {
 			return nil, err
 		}
 	}
-	k := &Keyring{aeads: map[string]cipher.AEAD{}, rand: rand}
-	highest := -1
+	k := &Keyring{aeads: map[string]cipher.AEAD{}, rand: o.Rand}
+	highest := int64(-1)
 	for _, wk := range wrapped {
-		n, err := strconv.Atoi(wk.ID)
-		if err != nil || n < 0 || strconv.Itoa(n) != wk.ID {
+		n, err := strconv.ParseInt(wk.ID, 10, 64)
+		if err != nil || n < 0 || strconv.FormatInt(n, 10) != wk.ID || len(wk.ID) > 255 {
 			return nil, errors.New("keyring: a stored data key has an invalid identifier")
 		}
 		plain, err := w.Unwrap(ctx, wk.Ciphertext)
@@ -132,14 +159,24 @@ func Open(ctx context.Context, w Wrapper, s Store, rand io.Reader) (*Keyring, er
 	return k, nil
 }
 
-func createFirst(ctx context.Context, w Wrapper, s Store) ([]WrappedKey, error) {
+func createFirst(ctx context.Context, w Wrapper, s Store, o OpenOptions) ([]WrappedKey, error) {
+	now := o.Now
+	if now == nil {
+		now = time.Now
+	}
 	plain, ct, err := w.GenerateDataKey(ctx)
 	clear(plain) // reloaded through Unwrap like every other key
 	if err != nil {
 		return nil, fmt.Errorf("keyring: generating a data key: %w", err)
 	}
-	err = s.AddDataKey(ctx, WrappedKey{ID: "1", Ciphertext: ct})
-	if err != nil && !errors.Is(err, ErrExists) {
+	id := strconv.FormatInt(now().UnixMilli(), 10)
+	err = s.AddFirstDataKey(ctx, WrappedKey{ID: id, Ciphertext: ct})
+	switch {
+	case err == nil:
+		if o.Created != nil {
+			o.Created(id)
+		}
+	case !errors.Is(err, ErrExists):
 		return nil, fmt.Errorf("keyring: storing the data key: %w", err)
 	}
 	wrapped, err := s.DataKeys(ctx)

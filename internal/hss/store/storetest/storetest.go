@@ -81,7 +81,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store, o Options) {
 		{"ConcurrentWritersNeverLoseAnUpdate", testConcurrentUpdates},
 		{"SubscriptionsAreListedByProfileInPages", testListByProfile},
 		{"ProfilesHaveVersionsAndCannotBeDeletedInUse", testProfiles},
-		{"DataKeysAreAddedOnce", testDataKeys},
+		{"OnlyOneFirstDataKeyIsStored", testDataKeys},
+		{"StoredSubscriptionsAreSeen", testHasSubscriptions},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newStore(t), o) })
@@ -432,23 +433,32 @@ func testProfiles(t *testing.T, s store.Store, o Options) {
 	wantErr(t, s.DeleteProfile(ctx(t), v2), store.ErrNotFound)
 }
 
-func testDataKeys(t *testing.T, s store.Store, _ Options) {
+func testDataKeys(t *testing.T, s store.Store, o Options) {
 	if keys := must(s.DataKeys(ctx(t)))(t); len(keys) != 0 {
 		t.Fatalf("new store has keys: %v", keys)
 	}
-	if err := s.AddDataKey(ctx(t), keyring.WrappedKey{ID: "1", Ciphertext: []byte("one")}); err != nil {
+	if err := s.AddFirstDataKey(ctx(t), keyring.WrappedKey{ID: "1760000000000", Ciphertext: []byte("one")}); err != nil {
 		t.Fatal(err)
 	}
-	wantErr(t, s.AddDataKey(ctx(t), keyring.WrappedKey{ID: "1", Ciphertext: []byte("other")}), keyring.ErrExists)
-	if err := s.AddDataKey(ctx(t), keyring.WrappedKey{ID: "2", Ciphertext: []byte("two")}); err != nil {
-		t.Fatal(err)
-	}
+	// Another task's first key loses: there is one first key.
+	wantErr(t, s.AddFirstDataKey(ctx(t), keyring.WrappedKey{ID: "1760000000001", Ciphertext: []byte("other")}), keyring.ErrExists)
 	keys := must(s.DataKeys(ctx(t)))(t)
-	got := map[string]string{}
-	for _, k := range keys {
-		got[k.ID] = string(k.Ciphertext)
+	if len(keys) != 1 || keys[0].ID != "1760000000000" || string(keys[0].Ciphertext) != "one" {
+		t.Errorf("keys = %+v", keys)
 	}
-	if !reflect.DeepEqual(got, map[string]string{"1": "one", "2": "two"}) {
-		t.Errorf("keys = %v", got)
+}
+
+func testHasSubscriptions(t *testing.T, s store.Store, o Options) {
+	if must(s.HasSubscriptions(ctx(t)))(t) {
+		t.Fatal("an empty store has subscriptions")
+	}
+	withProfile(t, s, "p")
+	must(s.CreateSubscription(ctx(t), Subscription(IMPI1, "p", IMPU1)))(t)
+	deadline := time.Now().Add(o.ListingWait)
+	for !must(s.HasSubscriptions(ctx(t)))(t) {
+		if time.Now().After(deadline) {
+			t.Fatal("a subscription is not seen")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

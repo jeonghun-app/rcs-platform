@@ -38,6 +38,9 @@ type Config struct {
 	KMSKeyID         string
 	// DataKey is the local data key (dev and test), nil with KMS.
 	DataKey secret
+	// KeyringBootstrap allows creating a first data key although
+	// subscriptions are stored (see openStore).
+	KeyringBootstrap bool
 
 	IMSRealm string
 	FTRealm  string
@@ -95,6 +98,7 @@ func Configure(s *runtime.Settings) Config {
 		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
 		KMSKeyID:         e.String("KMS_KEY_ID", ""),
 		DataKey:          secret{e.String("DATA_KEY", "")},
+		KeyringBootstrap: e.Bool("KEYRING_BOOTSTRAP", false),
 		IMSRealm:         e.String("IMS_REALM", domain),
 		FTRealm:          e.String("FT_REALM", ""),
 		DiameterAddr:     e.String("DIAMETER_ADDR", DefaultDiameterAddr),

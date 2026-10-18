@@ -23,10 +23,10 @@ import (
 type DynamoAPI interface {
 	GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	PutItem(context.Context, *dynamodb.PutItemInput, ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
-	UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
 	DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
 	TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
 	Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	Scan(context.Context, *dynamodb.ScanInput, ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
 	DescribeTable(context.Context, *dynamodb.DescribeTableInput, ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }
 
@@ -579,16 +579,18 @@ func (d *Dynamo) DataKeys(ctx context.Context) ([]keyring.WrappedKey, error) {
 	return keys, nil
 }
 
-// AddDataKey implements keyring.Store: one attribute per key, added only if
-// absent, so two tasks starting together cannot both store a first key.
-func (d *Dynamo) AddDataKey(ctx context.Context, k keyring.WrappedKey) error {
-	_, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(d.subscribers),
-		Key:                       key(keyringPK),
-		UpdateExpression:          aws.String("SET #k = :k"),
-		ConditionExpression:       aws.String("attribute_not_exists(#k)"),
-		ExpressionAttributeNames:  map[string]string{"#k": keyPrefix + k.ID},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":k": &types.AttributeValueMemberB{Value: k.Ciphertext}},
+// AddFirstDataKey implements keyring.Store: the keyring item is created
+// with the key only if it does not exist, so two tasks starting together
+// cannot both store a first key.
+func (d *Dynamo) AddFirstDataKey(ctx context.Context, k keyring.WrappedKey) error {
+	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(d.subscribers),
+		Item: map[string]types.AttributeValue{
+			attrPK:           str(keyringPK),
+			keyPrefix + k.ID: &types.AttributeValueMemberB{Value: k.Ciphertext},
+		},
+		ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+		ExpressionAttributeNames: map[string]string{"#pk": attrPK},
 	})
 	var ccf *types.ConditionalCheckFailedException
 	if errors.As(err, &ccf) {
@@ -598,4 +600,18 @@ func (d *Dynamo) AddDataKey(ctx context.Context, k keyring.WrappedKey) error {
 		return sanitize("add data key", err)
 	}
 	return nil
+}
+
+// HasSubscriptions implements store.Store with one item of the profile
+// index, which holds only subscriptions.
+func (d *Dynamo) HasSubscriptions(ctx context.Context) (bool, error) {
+	out, err := d.api.Scan(ctx, &dynamodb.ScanInput{
+		TableName: aws.String(d.subscribers),
+		IndexName: aws.String(ProfileIndex),
+		Limit:     aws.Int32(1),
+	})
+	if err != nil {
+		return false, sanitize("scan profile index", err)
+	}
+	return len(out.Items) > 0, nil
 }

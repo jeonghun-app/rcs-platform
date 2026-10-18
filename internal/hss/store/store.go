@@ -275,7 +275,11 @@ type Store interface {
 	// ErrProfileInUse while a subscription refers to it.
 	DeleteProfile(ctx context.Context, p *ServiceProfile) error
 
-	// Store keeps the wrapped data keys: DataKeys and AddDataKey, whose
-	// duplicate is keyring.ErrExists.
+	// HasSubscriptions reports whether any subscription is stored, which
+	// decides whether a first data key may be created (keyring.Open). It is
+	// eventually consistent in DynamoDB.
+	HasSubscriptions(ctx context.Context) (bool, error)
+
+	// Store keeps the wrapped data keys: DataKeys and AddFirstDataKey.
 	keyring.Store
 }
