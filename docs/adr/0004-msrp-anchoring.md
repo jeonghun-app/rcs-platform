@@ -15,20 +15,28 @@ gateway controlled by the P-CSCF (TS 23.334).
   binding through `POST /v1/bindings` and rewrites `m=message` SDP in both
   directions.
 - Connection direction: **the client connects to the relay, and the relay connects
-  to `rcs-as`**, whenever the client allows it. RFC 6135 §4.2.2 forbids
-  `a=setup:passive` in an offer, so the direction is reached through answers and
-  `actpass` offers, never by offering `passive`:
+  to `rcs-as`**. RFC 6135 §4.2.2 forbids `a=setup:passive` in an offer, so the
+  direction is reached through answers, never by offering `passive`:
 
   | Session | Offer the far side sees | Answer the offerer sees |
   |---|---|---|
-  | Client originates (client offers `actpass` or `active`) | to `rcs-as`: relay core address, `actpass`; `rcs-as` answers `passive` | to client: relay public address, `passive` |
+  | Client originates (client offers `actpass` or `active`) | to `rcs-as`: relay core address, `active`; `rcs-as` answers `passive` | to client: relay public address, `passive` |
   | `rcs-as` originates (`rcs-as` offers `actpass`, its instance address) | to client: relay public address, `actpass` | to `rcs-as`: `active` (relay connects) |
 
-  When the client answers a terminating `actpass` offer with `active`, which a
-  client behind NAT does (§4.2.2), it connects to the relay. When it answers
-  `passive`, the relay dials the client's `a=path` address as a fallback, which
-  works only if the client is reachable; the failure is counted and the session
-  falls back to store-and-forward in `rcs-as`.
+  - On the core leg the relay offers `active` (port 9), which forces a `passive`
+    answer, because it does not accept connections from the core. The relay is a
+    media gateway, not a UA; the §4.2.2 `actpass` rule addresses endpoints that
+    can be reached, which the relay's core side deliberately cannot.
+  - A missing `a=setup` takes the RFC 4145 §4 defaults (`active` in an offer,
+    `passive` in an answer), so a client without connection negotiation
+    (RFC 6135 §5) is served.
+  - A client answering the terminating `actpass` offer with `passive` asks the
+    network to dial it. The relay **never dials clients** (a client-supplied
+    target is an SSRF and port-scanning vector, and the outbound leg could not
+    use the NLB's TLS). `pcscf` releases the binding and returns 488 toward
+    `rcs-as`, which keeps the message for store-and-forward and retries on the
+    next registration. Clients behind NAT answer `active` (§4.2.2), so this
+    affects only clients that are themselves reachable.
 - `rcs-as` offers `actpass` with its instance address and answers `passive`;
   every MSRP endpoint in the platform always sends an explicit `a=setup`
   (§4.2.1) and never sends `holdconn`.
@@ -49,9 +57,9 @@ gateway controlled by the P-CSCF (TS 23.334).
 
 ## Rationale
 
-Making the client the connecting side whenever it allows it removes the need for
-connection affinity behind the NLB and works through NAT; the outbound fallback
-exists only so a compliant client that answers `passive` is not refused. Using the gateway model matches how operators deploy
+Making the client always the connecting side removes the need for connection
+affinity behind the NLB, works through NAT, and means the relay never opens a
+connection to an address a client chose. Using the gateway model matches how operators deploy
 RCS and keeps the client unaware of the relay.
 
 ## Consequences
@@ -60,7 +68,7 @@ RCS and keeps the client unaware of the relay.
   and release bindings on BYE, CANCEL, failure responses and session timer expiry.
 - A client that offers `a=setup:passive` violates RFC 6135 §4.2.2; `pcscf`
   answers such an offer with 488 Not Acceptable Here.
-- A binding whose client leg is outbound (client answered `passive`) is served by
-  the relay task that dials, so it is claimed at dial time like an inbound one.
-- The relay needs egress to the internet for the fallback dial; security groups
-  allow it only toward the ports clients put in `a=path`.
+- A client that answers a terminating offer with `passive` cannot receive chat
+  sessions; its messages are stored and delivered when it next originates or
+  through standalone messaging. Recorded as a limitation; the count is a metric.
+- The relay needs no internet egress.

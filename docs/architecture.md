@@ -134,13 +134,12 @@ MSRP between a client on the internet and `rcs-as` inside the VPC goes through
 
 - `pcscf` rewrites each SDP offer and answer that carries `m=message` so that the
   client sees the relay's public `a=path` and the core sees the relay's core
-  address. Offers use `actpass` and answers choose the direction (RFC 6135 §4.2.2
-  forbids `passive` in an offer); the result is that **clients connect to the
-  relay and the relay connects to `rcs-as`**. Only a client that answers
-  `passive` is dialled by the relay. ADR 0004 has the full table.
-- So the relay normally never accepts connections from the core and never opens
-  connections to clients, which works behind any NAT and lets any relay instance
-  behind the NLB serve any session.
+  address. No offer carries `passive` (RFC 6135 §4.2.2); answers choose the
+  direction so that **clients connect to the relay and the relay connects to
+  `rcs-as`**. ADR 0004 has the full table.
+- So the relay never accepts connections from the core and never opens
+  connections to clients, which works behind any NAT, needs no internet egress
+  and lets any relay instance behind the NLB serve any session.
 - `pcscf` allocates a binding through the relay control API. Bindings live in
   DynamoDB with a TTL, keyed by the session id in the relay's MSRP URI, so the task
   that receives the client connection does not need to be the task that allocated
