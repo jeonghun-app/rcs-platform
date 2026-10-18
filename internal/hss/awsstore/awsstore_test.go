@@ -251,3 +251,71 @@ func TestNewClientsMakesNoRequest(t *testing.T) {
 	}
 	sdkLogger{}.Logf("WARN", "retrying %s", storetest.IMPU1)
 }
+
+func TestRacingTransactionsAreVersionConflicts(t *testing.T) {
+	d, f := fakeStore(t)
+	ctx := context.Background()
+	if _, err := d.CreateProfile(ctx, storetest.Profile("p")); err != nil {
+		t.Fatal(err)
+	}
+	v1, err := d.CreateSubscription(ctx, storetest.Subscription(storetest.IMPI1, "p", storetest.IMPU1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := *v1
+	next.AuthPending = true
+	f.raceNext = true
+	if _, err := d.UpdateSubscription(ctx, v1, &next); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("PutItem racing a transaction = %v, want ErrConflict", err)
+	}
+	f.raceNext = true
+	if _, err := d.UpdateSubscription(ctx, v1, storetest.Subscription(storetest.IMPI1, "p", storetest.IMPU1, storetest.TEL1)); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("cancelled transaction = %v, want ErrConflict", err)
+	}
+	f.raceNext = true
+	if _, err := d.CreateSubscription(ctx, storetest.Subscription(storetest.IMPI2, "p", storetest.IMPU2)); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("create racing = %v, want ErrConflict", err)
+	}
+	f.raceNext = true
+	if err := d.DeleteSubscription(ctx, v1); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("delete racing = %v, want ErrConflict", err)
+	}
+}
+
+func TestAWriteWhoseResponseWasLostStands(t *testing.T) {
+	d, f := fakeStore(t)
+	ctx := context.Background()
+	if _, err := d.CreateProfile(ctx, storetest.Profile("p")); err != nil {
+		t.Fatal(err)
+	}
+	v1, err := d.CreateSubscription(ctx, storetest.Subscription(storetest.IMPI1, "p", storetest.IMPU1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := *v1
+	next.ServerName = "sip:scscf.rcs.local"
+	f.loseNextResponse = true
+	got, err := d.UpdateSubscription(ctx, v1, &next)
+	if err != nil || got.Version != 2 {
+		t.Fatalf("update whose response was lost = %+v, %v; it was applied", got, err)
+	}
+	// Another writer's identical document from the same version is still
+	// a conflict: only this write's own token proves it applied.
+	if _, err := d.UpdateSubscription(ctx, v1, &next); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("second writer = %v, want ErrConflict", err)
+	}
+	p, err := d.Profile(ctx, "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.loseNextResponse = true
+	if got, err := d.UpdateProfile(ctx, p); err != nil || got.Version != 2 {
+		t.Fatalf("profile update whose response was lost = %+v, %v", got, err)
+	}
+	if _, err := d.CreateSubscription(ctx, storetest.Subscription(storetest.IMPI2, "p", storetest.IMPU2)); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.tokens) != 2 || f.tokens[0] == f.tokens[1] {
+		t.Errorf("transactions share a request token: %v", f.tokens)
+	}
+}

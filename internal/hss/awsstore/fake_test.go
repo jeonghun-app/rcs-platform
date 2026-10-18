@@ -24,6 +24,12 @@ type fakeDynamo struct {
 	fail   error
 	status types.TableStatus
 	calls  map[string]int
+	// raceNext makes the next PutItem or TransactWriteItems lose to a
+	// concurrent transaction; loseNextResponse applies the next PutItem but
+	// answers as a resent request would, with the condition failed.
+	raceNext         bool
+	loseNextResponse bool
+	tokens           []string
 }
 
 func newFakeDynamo(t *testing.T, tables ...string) *fakeDynamo {
@@ -32,13 +38,6 @@ func newFakeDynamo(t *testing.T, tables ...string) *fakeDynamo {
 		f.tables[name] = map[string]map[string]types.AttributeValue{}
 	}
 	return f
-}
-
-func sv(v types.AttributeValue) string {
-	if s, ok := v.(*types.AttributeValueMemberS); ok {
-		return s.Value
-	}
-	return ""
 }
 
 func nv(v types.AttributeValue) int64 {
@@ -111,12 +110,20 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 	if err := f.enter("PutItem"); err != nil {
 		return nil, err
 	}
+	if f.raceNext {
+		f.raceNext = false
+		return nil, &types.TransactionConflictException{}
+	}
 	tbl := f.table(in.TableName)
 	pk := sv(in.Item[attrPK])
 	if !f.holds(in.ConditionExpression, in.ExpressionAttributeNames, in.ExpressionAttributeValues, tbl[pk]) {
 		return nil, &types.ConditionalCheckFailedException{}
 	}
 	tbl[pk] = maps.Clone(in.Item)
+	if f.loseNextResponse {
+		f.loseNextResponse = false
+		return nil, &types.ConditionalCheckFailedException{}
+	}
 	return &dynamodb.PutItemOutput{}, nil
 }
 
@@ -166,6 +173,19 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 	}
 	if len(in.TransactItems) > 100 {
 		f.t.Fatalf("transaction of %d items; DynamoDB allows 100", len(in.TransactItems))
+	}
+	if aws.ToString(in.ClientRequestToken) == "" {
+		f.t.Error("a transaction without ClientRequestToken is not idempotent")
+	}
+	f.tokens = append(f.tokens, aws.ToString(in.ClientRequestToken))
+	if f.raceNext {
+		f.raceNext = false
+		reasons := make([]types.CancellationReason, len(in.TransactItems))
+		for i := range reasons {
+			reasons[i].Code = aws.String("None")
+		}
+		reasons[len(reasons)-1].Code = aws.String("TransactionConflict")
+		return nil, &types.TransactionCanceledException{CancellationReasons: reasons}
 	}
 	reasons := make([]types.CancellationReason, len(in.TransactItems))
 	failed := false

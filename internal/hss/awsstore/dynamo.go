@@ -2,8 +2,11 @@ package awsstore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -29,11 +32,14 @@ type DynamoAPI interface {
 
 // Attribute and index names; docs/hss.md has the table definitions.
 const (
-	attrPK       = "pk"
-	attrVersion  = "version"
-	attrProfile  = "profile"
-	attrDoc      = "doc"
-	attrIMPI     = "impi"
+	attrPK      = "pk"
+	attrVersion = "version"
+	attrProfile = "profile"
+	attrDoc     = "doc"
+	attrIMPI    = "impi"
+	// attrWriter is a random token of the write that stored an item; see
+	// conflictOrGone.
+	attrWriter   = "writer"
 	keyPrefix    = "key_"
 	ProfileIndex = "profile-index"
 
@@ -58,13 +64,14 @@ type Dynamo struct {
 	api         DynamoAPI
 	subscribers string
 	profiles    string
+	rand        io.Reader
 }
 
 var _ store.Store = (*Dynamo)(nil)
 
 // NewDynamo returns the store over api.
 func NewDynamo(api DynamoAPI, c Config) *Dynamo {
-	return &Dynamo{api: api, subscribers: c.SubscribersTable, profiles: c.ProfilesTable}
+	return &Dynamo{api: api, subscribers: c.SubscribersTable, profiles: c.ProfilesTable, rand: rand.Reader}
 }
 
 // Ready checks that both tables are active, for /readyz. It needs
@@ -92,6 +99,7 @@ func (d *Dynamo) subscriptionItem(s *store.Subscription, version int64) (map[str
 		attrVersion: num(version),
 		attrProfile: str(s.Profile),
 		attrDoc:     &types.AttributeValueMemberB{Value: doc},
+		attrWriter:  str(d.token()),
 	}, nil
 }
 
@@ -140,6 +148,41 @@ func cancelled(err error) int {
 	return -1
 }
 
+// raced reports whether a write lost to a concurrent transaction on one of
+// its items: a PutItem that met a transaction, or a transaction cancelled
+// for another one. The SDK does not retry either; to the HSS it is a version
+// conflict, which update retries from a fresh read.
+func raced(err error) bool {
+	var conflict *types.TransactionConflictException
+	if errors.As(err, &conflict) {
+		return true
+	}
+	var tc *types.TransactionCanceledException
+	if errors.As(err, &tc) {
+		for _, r := range tc.CancellationReasons {
+			if aws.ToString(r.Code) == "TransactionConflict" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// requestToken makes a transaction idempotent (DynamoDB keeps the token for
+// ten minutes): when the SDK resends one whose response was lost, DynamoDB
+// answers the first outcome instead of failing its own conditions.
+func (d *Dynamo) requestToken() *string { return aws.String(d.token()) }
+
+// token is 128 random bits in hex. Without randomness it is a fixed string,
+// which leaves writes conditional but makes lost responses conflicts.
+func (d *Dynamo) token() string {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(d.rand, b); err != nil {
+		return "unset"
+	}
+	return hex.EncodeToString(b)
+}
+
 // CreateSubscription implements store.Store: the subscription, its IMPU
 // items and a check that the profile exists, in one transaction.
 func (d *Dynamo) CreateSubscription(ctx context.Context, s *store.Subscription) (*store.Subscription, error) {
@@ -157,8 +200,10 @@ func (d *Dynamo) CreateSubscription(ctx context.Context, s *store.Subscription) 
 		items = append(items, d.identityPut(p.IMPU, s.IMPI))
 	}
 	items = append(items, d.profileCheck(s.Profile))
-	_, err = d.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	_, err = d.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items, ClientRequestToken: d.requestToken()})
 	switch i := cancelled(err); {
+	case raced(err):
+		return nil, fmt.Errorf("awsstore: create subscription: %w", store.ErrConflict)
 	case i == 0:
 		return nil, fmt.Errorf("awsstore: create subscription: %w", store.ErrExists)
 	case i == len(items)-1:
@@ -250,10 +295,14 @@ func (d *Dynamo) UpdateSubscription(ctx context.Context, old, s *store.Subscript
 			ConditionExpression: cond, ExpressionAttributeNames: names, ExpressionAttributeValues: values,
 		})
 		var ccf *types.ConditionalCheckFailedException
-		if errors.As(err, &ccf) {
-			return nil, d.conflictOrGone(ctx, s.IMPI, "update subscription")
-		}
-		if err != nil {
+		switch {
+		case errors.As(err, &ccf):
+			if err := d.conflictOrGone(ctx, d.subscribers, subscriptionKey(s.IMPI), item, "update subscription"); err != nil {
+				return nil, err
+			}
+		case raced(err):
+			return nil, fmt.Errorf("awsstore: update subscription: %w", store.ErrConflict)
+		case err != nil:
 			return nil, sanitize("update subscription", err)
 		}
 		return d.decodeSubscription(item)
@@ -272,10 +321,14 @@ func (d *Dynamo) UpdateSubscription(ctx context.Context, old, s *store.Subscript
 	if checked {
 		items = append(items, d.profileCheck(s.Profile))
 	}
-	_, err = d.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	_, err = d.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items, ClientRequestToken: d.requestToken()})
 	switch i := cancelled(err); {
+	case raced(err):
+		return nil, fmt.Errorf("awsstore: update subscription: %w", store.ErrConflict)
 	case i == 0:
-		return nil, d.conflictOrGone(ctx, s.IMPI, "update subscription")
+		if err := d.conflictOrGone(ctx, d.subscribers, subscriptionKey(s.IMPI), item, "update subscription"); err != nil {
+			return nil, err
+		}
 	case checked && i == len(items)-1:
 		return nil, fmt.Errorf("awsstore: update subscription: %w", store.ErrProfileMissing)
 	case i > 0 && i <= len(added):
@@ -290,17 +343,35 @@ func (d *Dynamo) UpdateSubscription(ctx context.Context, old, s *store.Subscript
 	return d.decodeSubscription(item)
 }
 
-// conflictOrGone tells a version conflict from a deleted subscription after
-// a failed version condition, which DynamoDB reports the same way.
-func (d *Dynamo) conflictOrGone(ctx context.Context, impi, op string) error {
-	_, err := d.get(ctx, d.subscribers, subscriptionKey(impi), op)
-	if errors.Is(err, store.ErrNotFound) {
-		return err
-	}
+// conflictOrGone explains a failed version condition, which DynamoDB
+// reports the same way whatever the cause: the item is gone (ErrNotFound),
+// another writer was first (ErrConflict), or the stored item carries this
+// write's own writer token, which means an earlier attempt of the write
+// succeeded and only its response was lost (nil: the write stands). The
+// token, not the content, decides: two writers that read the same version
+// and computed the same document must not both succeed, or both would
+// believe they had reserved the same sequence numbers.
+func (d *Dynamo) conflictOrGone(ctx context.Context, table, pk string, wrote map[string]types.AttributeValue, op string) error {
+	cur, err := d.get(ctx, table, pk, op)
 	if err != nil {
 		return err
 	}
+	if wrote != nil && sv(cur[attrWriter]) != "" && sv(cur[attrWriter]) == sv(wrote[attrWriter]) &&
+		sv(cur[attrVersion]) == sv(wrote[attrVersion]) {
+		return nil
+	}
 	return fmt.Errorf("awsstore: %s: %w", op, store.ErrConflict)
+}
+
+// sv is the string or number of an attribute, or "".
+func sv(v types.AttributeValue) string {
+	switch a := v.(type) {
+	case *types.AttributeValueMemberS:
+		return a.Value
+	case *types.AttributeValueMemberN:
+		return a.Value
+	}
+	return ""
 }
 
 // DeleteSubscription implements store.Store.
@@ -315,10 +386,12 @@ func (d *Dynamo) DeleteSubscription(ctx context.Context, s *store.Subscription) 
 	for _, p := range s.PublicIdentities {
 		items = append(items, d.identityDelete(p.IMPU, s.IMPI))
 	}
-	_, err := d.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	_, err := d.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items, ClientRequestToken: d.requestToken()})
 	switch i := cancelled(err); {
+	case raced(err):
+		return fmt.Errorf("awsstore: delete subscription: %w", store.ErrConflict)
 	case i == 0:
-		return d.conflictOrGone(ctx, s.IMPI, "delete subscription")
+		return d.conflictOrGone(ctx, d.subscribers, subscriptionKey(s.IMPI), nil, "delete subscription")
 	case i > 0:
 		return fmt.Errorf("%w: an IMPU item of the subscription points elsewhere", store.ErrInvalid)
 	case err != nil:
@@ -370,7 +443,7 @@ func pkValue(pk *types.AttributeValueMemberS, ok bool) string {
 	return pk.Value
 }
 
-func profileItem(p *store.ServiceProfile, version int64) (map[string]types.AttributeValue, error) {
+func (d *Dynamo) profileItem(p *store.ServiceProfile, version int64) (map[string]types.AttributeValue, error) {
 	doc, err := store.EncodeProfile(p)
 	if err != nil {
 		return nil, err
@@ -379,6 +452,7 @@ func profileItem(p *store.ServiceProfile, version int64) (map[string]types.Attri
 		attrPK:      str(p.ID),
 		attrVersion: num(version),
 		attrDoc:     &types.AttributeValueMemberB{Value: doc},
+		attrWriter:  str(d.token()),
 	}, nil
 }
 
@@ -397,7 +471,7 @@ func decodeProfile(item map[string]types.AttributeValue) (*store.ServiceProfile,
 
 // CreateProfile implements store.Store.
 func (d *Dynamo) CreateProfile(ctx context.Context, p *store.ServiceProfile) (*store.ServiceProfile, error) {
-	item, err := profileItem(p, 1)
+	item, err := d.profileItem(p, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -427,7 +501,7 @@ func (d *Dynamo) Profile(ctx context.Context, id string) (*store.ServiceProfile,
 
 // UpdateProfile implements store.Store.
 func (d *Dynamo) UpdateProfile(ctx context.Context, p *store.ServiceProfile) (*store.ServiceProfile, error) {
-	item, err := profileItem(p, p.Version+1)
+	item, err := d.profileItem(p, p.Version+1)
 	if err != nil {
 		return nil, err
 	}
@@ -438,20 +512,15 @@ func (d *Dynamo) UpdateProfile(ctx context.Context, p *store.ServiceProfile) (*s
 		ExpressionAttributeValues: map[string]types.AttributeValue{":v": num(p.Version)},
 	})
 	var ccf *types.ConditionalCheckFailedException
-	if errors.As(err, &ccf) {
-		return nil, d.profileConflictOrGone(ctx, p.ID, "update profile")
-	}
-	if err != nil {
+	switch {
+	case errors.As(err, &ccf):
+		if err := d.conflictOrGone(ctx, d.profiles, p.ID, item, "update profile"); err != nil {
+			return nil, err
+		}
+	case err != nil:
 		return nil, sanitize("update profile", err)
 	}
 	return decodeProfile(item)
-}
-
-func (d *Dynamo) profileConflictOrGone(ctx context.Context, id, op string) error {
-	if _, err := d.get(ctx, d.profiles, id, op); err != nil {
-		return err
-	}
-	return fmt.Errorf("awsstore: %s: %w", op, store.ErrConflict)
 }
 
 // DeleteProfile implements store.Store. The in-use check reads the profile
@@ -478,7 +547,7 @@ func (d *Dynamo) DeleteProfile(ctx context.Context, p *store.ServiceProfile) err
 	})
 	var ccf *types.ConditionalCheckFailedException
 	if errors.As(err, &ccf) {
-		return d.profileConflictOrGone(ctx, p.ID, "delete profile")
+		return d.conflictOrGone(ctx, d.profiles, p.ID, nil, "delete profile")
 	}
 	if err != nil {
 		return sanitize("delete profile", err)
