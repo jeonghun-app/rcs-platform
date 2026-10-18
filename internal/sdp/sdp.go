@@ -8,7 +8,7 @@ package sdp
 // An empty string or a nil slice means the line is absent.
 type Session struct {
 	Origin      Origin      // o=
-	Name        string      // s=, never empty (RFC 8866 §5.3); "-" when there is no name
+	Name        string      // s=, never empty (RFC 8866 §5.3); "-" when there is no name, and what an empty s= parses to
 	Information string      // i=
 	URI         string      // u=
 	Emails      []string    // e=

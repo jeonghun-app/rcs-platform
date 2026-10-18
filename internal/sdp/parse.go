@@ -184,7 +184,13 @@ func (st *state) addSession(typ byte, v string) error {
 	case 'o':
 		s.Origin, err = parseOrigin(v)
 	case 's':
-		s.Name, err = v, textErr(v)
+		// RFC 8866 §5.3 forbids an empty name, but a stack that trims
+		// trailing space turns the recommended "s= " into "s=". The intent
+		// is unambiguous, so it is read as "-"; Marshal never writes it.
+		s.Name = v
+		if v == "" {
+			s.Name = "-"
+		}
 	case 'i':
 		s.Information, err = v, textErr(v)
 	case 'u':

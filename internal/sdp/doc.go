@@ -12,10 +12,11 @@
 // Parsing is strict. Line order, the at-most-once rules and the syntax of each
 // field follow RFC 8866 §5 and §9; anything else is rejected with a
 // *SyntaxError naming the line, never repaired, because a proxy that guesses
-// at a malformed description forwards something the peer did not send. Two
-// deviations are tolerated because deployed stacks produce them and they are
-// unambiguous: lines ending in LF alone, and a last line with no line ending.
-// Output always uses CRLF. Input larger than Parser.MaxSize is refused without
+// at a malformed description forwards something the peer did not send. A few
+// deviations are tolerated because deployed stacks or middleboxes produce them
+// and they are unambiguous: lines ending in LF alone, a last line with no
+// line ending, and an empty s= line, which is read as "s=-". Output always
+// uses CRLF and never repeats a deviation. Input larger than Parser.MaxSize is refused without
 // being parsed.
 //
 // Values are validated again when a description is serialized, so a field

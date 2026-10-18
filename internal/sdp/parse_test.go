@@ -202,7 +202,6 @@ func TestMalformedDescriptionsAreRejectedWithTheLine(t *testing.T) {
 		{"o= address type not a token", "v=0\r\no=- 1 1 IN IP:4 x\r\n", 2, "address type must be a token"},
 		{"o= username with control byte", "v=0\r\no=\x01 1 1 IN IP4 x\r\n", 2, "username must be"},
 		{"o= address with DEL", "v=0\r\no=- 1 1 IN IP4 a\x7f\r\n", 2, "address must be"},
-		{"empty s=", "v=0\r\no=- 1 1 IN IP4 x\r\ns=\r\n", 3, "s=: value must not be empty"},
 		{"empty session i=", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\ni=\r\n", 4, "i=: value must not be empty"},
 		{"u= with a space", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\nu=https://example.com/a b\r\n", 4, "u=: value must be non-empty"},
 		{"empty e=", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\ne=\r\n", 4, "e=: value must not be empty"},
@@ -284,5 +283,19 @@ func TestDescriptionExactlyAtTheLimitIsAccepted(t *testing.T) {
 func TestNegativeLimitMeansTheDefault(t *testing.T) {
 	if _, err := (Parser{MaxSize: -1}).Parse([]byte(head)); err != nil {
 		t.Errorf("Parse: %v", err)
+	}
+}
+
+func TestEmptySessionNameIsReadAsDashAndWrittenStrictly(t *testing.T) {
+	sdp := strings.Replace(head, "s=-", "s=", 1)
+	s := mustParse(t, sdp)
+	if s.Name != "-" {
+		t.Errorf("Name = %q, want %q", s.Name, "-")
+	}
+	if got := mustMarshal(t, s); got != head {
+		t.Errorf("got %q, want %q", got, head)
+	}
+	if s := mustParse(t, strings.Replace(head, "s=-", "s= ", 1)); s.Name != " " {
+		t.Errorf("a single-space name became %q", s.Name)
 	}
 }
