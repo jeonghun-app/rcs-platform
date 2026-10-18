@@ -17,9 +17,10 @@ const (
 	// request sent with Failure-Report yes.
 	DefaultTransactionTimeout = 30 * time.Second
 	// DefaultKeepAliveInterval is how long a session may stay quiet before
-	// a bodiless SEND goes out (ADR 0003), well inside the 1800 s NLB idle
-	// timeout and inside the NAT timers RCS clients see.
-	DefaultKeepAliveInterval = 300 * time.Second
+	// a bodiless SEND goes out (ADR 0003). The NLB's TLS listeners close a
+	// connection idle for 350 s, a limit that cannot be raised, so this
+	// stays well inside it; Config.KeepAliveInterval changes it.
+	DefaultKeepAliveInterval = 240 * time.Second
 	// DefaultUnboundTimeout is how long a connection may carry no session.
 	// The active side sends its first SEND immediately (§5.4), so a
 	// connection that names no session by then is not going to.
@@ -27,6 +28,21 @@ const (
 	// DefaultWriteTimeout bounds one write, so a peer that stops reading
 	// cannot hold the connection, and every session on it, forever.
 	DefaultWriteTimeout = 30 * time.Second
+	// DefaultReassemblyTimeout is how long an incomplete message is kept
+	// without a new chunk. A sender has no reason to pause between chunks
+	// for longer than a transaction may take, so this is generous.
+	DefaultReassemblyTimeout = 60 * time.Second
+	// DefaultMaxInFlight bounds the requests one connection waits for
+	// answers to. It is sized for a relay's client connection, where
+	// everything in the kernel's send and receive buffers (a few MiB, in
+	// 2 KiB pieces) is in flight at once.
+	DefaultMaxInFlight = 8192
+	// DefaultMaxHandlerQueue bounds the events waiting for one session's
+	// Handler.
+	DefaultMaxHandlerQueue = 32
+	// DefaultSendWindow is how many chunks of one session Send may have
+	// awaiting their 200 at once.
+	DefaultSendWindow = 64
 )
 
 // Config tunes a Conn. The zero value uses the defaults.
@@ -43,7 +59,10 @@ type Config struct {
 	// bodiless SEND. Negative disables keep-alives.
 	KeepAliveInterval time.Duration
 	UnboundTimeout    time.Duration
-	WriteTimeout      time.Duration
+	// WriteTimeout is how long one message may take to write. A peer that
+	// takes no octets for that long is not reading, and the connection is
+	// closed; a slow peer that keeps reading is not.
+	WriteTimeout time.Duration
 
 	MaxHeaderBytes int
 	// MaxMessageSize bounds a received message and therefore a received
@@ -52,9 +71,58 @@ type Config struct {
 	MaxMessageSize int64
 	// MaxPendingMessages bounds incomplete messages per session.
 	MaxPendingMessages int
-	// ChunkSize is the largest chunk sent, at most 2048 because this
-	// package never interrupts a chunk (§7.1.1). Zero means
-	// DefaultChunkSize.
+	// MaxSessionBuffer bounds the octets of incomplete messages one
+	// session holds. Zero means eight times MaxMessageSize, room for a few
+	// messages arriving interleaved.
+	MaxSessionBuffer int64
+	// MaxConnBuffer bounds the octets held for all sessions on one
+	// connection together: incomplete messages, the chunk being read, and
+	// complete messages waiting for their Handler. Zero means 64 times
+	// MaxMessageSize.
+	MaxConnBuffer int64
+	// ReassemblyTimeout is how long an incomplete message waits for its
+	// next chunk before it is dropped.
+	ReassemblyTimeout time.Duration
+	// MaxQueuedBytes bounds what waits in a connection's write queue
+	// without anyone waiting for it: answers, REPORTs, and what a relay
+	// forwards toward a client. It is a memory bound, not the test of a
+	// peer that has stopped reading (WriteTimeout is), so it is large: a
+	// peer that falls this far behind while still reading is closed with
+	// ErrPeerNotReading too. Zero means 16 MiB or four times
+	// MaxMessageSize, whichever is more.
+	MaxQueuedBytes int64
+	// MaxRelayBacklog bounds what a relay has queued toward the client of
+	// one bridged session (see Bridge). With a sender that windows its
+	// chunks, as Send does, the backlog stays within one window; the bound
+	// is for one that does not (Failure-Report no or partial), and a client
+	// that falls this far behind is disconnected rather than making the
+	// shared connection toward rcs-as wait. Zero means twice
+	// MaxMessageSize.
+	MaxRelayBacklog int64
+	// SendWindow is how many chunks of one session Send may have awaiting
+	// their answer at once (Failure-Report yes). It is per session, so a
+	// peer that answers one session slowly, as a relay does for a slow
+	// client, slows that session and not the connection. Zero means
+	// DefaultSendWindow.
+	SendWindow int
+	// MaxHandlerQueue bounds the events (messages, reports, extension
+	// requests) waiting for one session's Handler. Beyond it messages are
+	// refused with 413 and reports are dropped. Zero means
+	// DefaultMaxHandlerQueue.
+	MaxHandlerQueue int
+	// OnEvent, if set, hears about every refusal, drop and connection end
+	// (see Event), for metrics. It runs on the connection's goroutines and
+	// must not block.
+	OnEvent func(Event)
+	// MaxInFlight bounds the requests awaiting an answer on one
+	// connection. A sender that reaches it waits, which slows whoever feeds
+	// it (a relay stops reading its other side); every wait ends within
+	// TransactionTimeout, because unanswered requests expire then.
+	MaxInFlight int
+	// ChunkSize is the largest chunk sent. It is at most 2048: §7.1.1
+	// allows larger chunks only from a sender ready to interrupt them, and
+	// this package writes every chunk whole. Cutting at 2048 is the other
+	// strategy §7.1.1 allows. Zero means DefaultChunkSize.
 	ChunkSize int
 }
 
@@ -86,6 +154,30 @@ func (cfg Config) withDefaults() (Config, error) {
 	if cfg.MaxPendingMessages <= 0 {
 		cfg.MaxPendingMessages = DefaultMaxPending
 	}
+	if cfg.MaxSessionBuffer <= 0 {
+		cfg.MaxSessionBuffer = 8 * cfg.MaxMessageSize
+	}
+	if cfg.MaxConnBuffer <= 0 {
+		cfg.MaxConnBuffer = 64 * cfg.MaxMessageSize
+	}
+	if cfg.ReassemblyTimeout <= 0 {
+		cfg.ReassemblyTimeout = DefaultReassemblyTimeout
+	}
+	if cfg.MaxQueuedBytes <= 0 {
+		cfg.MaxQueuedBytes = max(4*cfg.MaxMessageSize, 16<<20)
+	}
+	if cfg.MaxRelayBacklog <= 0 {
+		cfg.MaxRelayBacklog = 2 * cfg.MaxMessageSize
+	}
+	if cfg.MaxHandlerQueue <= 0 {
+		cfg.MaxHandlerQueue = DefaultMaxHandlerQueue
+	}
+	if cfg.SendWindow <= 0 {
+		cfg.SendWindow = DefaultSendWindow
+	}
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = DefaultMaxInFlight
+	}
 	if cfg.ChunkSize == 0 {
 		cfg.ChunkSize = DefaultChunkSize
 	}
@@ -94,11 +186,6 @@ func (cfg Config) withDefaults() (Config, error) {
 	}
 	return cfg, nil
 }
-
-// maxPosted bounds the answers (responses and REPORTs) waiting to be
-// written on one connection. A peer that leaves this much unread is not
-// reading at all, and the connection is closed rather than buffering more.
-const maxPosted = 1 << 20
 
 // Errors of the connection layer.
 var (
@@ -150,6 +237,10 @@ type Conn struct {
 	posted int
 	wake   chan struct{}
 
+	// slots holds one token per request awaiting an answer.
+	slots  chan struct{}
+	budget *Budget
+
 	mu         sync.Mutex
 	sessions   map[string]*Session
 	pending    map[string]*transaction
@@ -164,6 +255,12 @@ type Conn struct {
 type outFrame struct {
 	b    []byte
 	done chan error
+	// owner, when set, is the bridged session whose relay backlog the
+	// frame counts toward until written.
+	owner *Session
+	// written, when set, hears how the write went; a frame dropped because
+	// the connection failed hears ErrConnClosed.
+	written func(error)
 }
 
 type transaction struct {
@@ -200,6 +297,8 @@ func newConn(nc net.Conn, passive bool, b Binder, cfg Config) (*Conn, error) {
 		sessions: map[string]*Session{},
 		pending:  map[string]*transaction{},
 		wake:     make(chan struct{}, 1),
+		slots:    make(chan struct{}, cfg.MaxInFlight),
+		budget:   &Budget{Limit: cfg.MaxConnBuffer},
 		done:     make(chan struct{}),
 	}
 	c.mu.Lock()
@@ -241,7 +340,7 @@ func (c *Conn) Open(ctx context.Context, s *Session) error {
 		comment string
 	}
 	res := make(chan result, 1)
-	err := s.sendEmpty(c, func(code int, comment string) { res <- result{code, comment} })
+	err := s.sendEmpty(ctx, c, func(code int, comment string) { res <- result{code, comment} })
 	if err != nil {
 		s.closeWith(err)
 		return err
@@ -286,9 +385,17 @@ func (c *Conn) fail(err error) {
 	c.mu.Unlock()
 
 	_ = c.nc.Close()
+	c.qmu.Lock()
+	dropped := c.queue
+	c.queue = nil
+	c.qmu.Unlock()
+	var lost []*transaction
 	for _, t := range pending {
 		if t.timer != nil {
 			t.timer.Stop()
+		}
+		if t.mode == ReportYes {
+			lost = append(lost, t)
 		}
 	}
 	cause := err
@@ -299,6 +406,21 @@ func (c *Conn) fail(err error) {
 		s.closeWith(cause)
 	}
 	close(c.done)
+	c.emit(Event{Kind: EventClosed, Err: err})
+	// Requests that can no longer be answered end as a local timeout would
+	// (§10.4), so that a relay can still tell the original sender. The
+	// callbacks may write to other connections, so they run apart from
+	// whichever goroutine noticed the failure.
+	go func() {
+		for _, f := range dropped {
+			if f.written != nil {
+				f.written(ErrConnClosed)
+			}
+		}
+		for _, t := range lost {
+			t.onResult(StatusRequestTimeout, StatusText(StatusRequestTimeout))
+		}
+	}()
 }
 
 func (c *Conn) addSession(s *Session) error {
@@ -351,6 +473,9 @@ func (c *Conn) readLoop() {
 				c.fail(err)
 				return
 			}
+			if !me.Message.IsRequest() {
+				c.emit(Event{Kind: EventDropped, Err: me})
+			}
 			err = c.respond(me.Message, me.Code)
 		} else if m.IsRequest() {
 			err = c.handleRequest(m)
@@ -372,6 +497,7 @@ func (c *Conn) handleResponse(m *Message) {
 		if t.timer != nil {
 			t.timer.Stop()
 		}
+		c.releaseSlot()
 	}
 	c.mu.Unlock()
 	// A 200 to a "partial" request should not exist (§7.1.4); there is
@@ -427,6 +553,9 @@ func (c *Conn) sessionFor(to URI) (*Session, int) {
 
 // respond answers req with code if Failure-Report allows it.
 func (c *Conn) respond(req *Message, code int) error {
+	if code != StatusOK && req.IsRequest() {
+		c.emit(Event{Kind: EventRefused, Method: req.Method, Code: code})
+	}
 	if !ShouldRespond(req, code) {
 		return nil
 	}
@@ -435,18 +564,41 @@ func (c *Conn) respond(req *Message, code int) error {
 		// Nothing to address an answer to; the request is dropped.
 		return nil
 	}
-	return c.postMessage(resp)
+	return c.sendMessage(context.Background(), resp, sendQueue)
 }
 
-// sendRequest assigns a transaction id to m and writes it. A REPORT is
-// queued like an answer, since it is never answered (§7.1.2) and is often
-// produced while reading. Any other request returns once written and,
-// unless Failure-Report is no, waits for its response in the background:
-// onResult gets every response for "yes" and a 408 when TransactionTimeout
-// passes after the write (§7.1.1, §10.4); for "partial" it gets only
-// failure responses and no timer runs, though the transaction is still
-// forgotten after TransactionTimeout.
-func (c *Conn) sendRequest(m *Message, onResult func(code int, comment string)) error {
+// sendMode says whether a request may make its caller wait.
+type sendMode struct {
+	// queue, when set, means never wait: the request joins the bounded
+	// queue of answers, and a connection that cannot take it is closed as
+	// not reading (ErrPeerNotReading). It is for requests produced on a
+	// reading goroutine that must not stall, such as a REPORT about what
+	// was just read, or a relay forwarding from a shared connection.
+	// Otherwise the caller waits for an in-flight slot and for the write,
+	// so it goes no faster than the peer reads.
+	queue bool
+	// owner, for a queued request, is the bridged session whose backlog
+	// it counts toward (MaxRelayBacklog).
+	owner *Session
+	// written, for a queued request, is called once it has been written
+	// or dropped.
+	written func(error)
+}
+
+var (
+	sendWait  = sendMode{}
+	sendQueue = sendMode{queue: true}
+)
+
+// sendRequest assigns a transaction id to m and sends it in the given
+// mode. Unless m is a REPORT (never answered, §7.1.2) or says
+// Failure-Report no, the response is awaited in the background: onResult
+// gets every response for "yes" and a 408 when TransactionTimeout passes
+// after the write (§7.1.1, §10.4); for "partial" it gets only failure
+// responses and no timer runs, though the request is still forgotten
+// after TransactionTimeout. Every awaited request holds one of MaxInFlight
+// slots until then.
+func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onResult func(code int, comment string)) error {
 	tid, err := c.newTransactionID(m.Body)
 	if err != nil {
 		return err
@@ -456,13 +608,30 @@ func (c *Conn) sendRequest(m *Message, onResult func(code int, comment string)) 
 	if err != nil {
 		return err
 	}
-	if m.Method == MethodReport {
-		return c.post(b)
+	fr := m.FailureMode()
+	track := m.Method != MethodReport && fr != ReportNo && onResult != nil
+	t := &transaction{mode: fr, onResult: onResult}
+	if o := mode.owner; o != nil && o.backlog.Load()+int64(len(b)) > c.cfg.MaxRelayBacklog {
+		c.fail(ErrPeerNotReading)
+		return ErrPeerNotReading
 	}
-	mode := m.FailureMode()
-	track := mode != ReportNo && onResult != nil
-	t := &transaction{mode: mode, onResult: onResult}
 	if track {
+		if mode.queue {
+			select {
+			case c.slots <- struct{}{}:
+			default:
+				c.fail(ErrPeerNotReading)
+				return ErrPeerNotReading
+			}
+		} else {
+			select {
+			case c.slots <- struct{}{}:
+			case <-c.done:
+				return ErrConnClosed
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
@@ -471,10 +640,26 @@ func (c *Conn) sendRequest(m *Message, onResult func(code int, comment string)) 
 		c.pending[tid] = t
 		c.mu.Unlock()
 	}
-	if err := c.write(b); err != nil {
+	if mode.queue {
+		err = c.enqueue(outFrame{b: b, owner: mode.owner, written: mode.written})
+	} else {
+		err = c.write(ctx, b)
+	}
+	if err != nil {
+		if track {
+			c.mu.Lock()
+			if c.pending[tid] == t {
+				delete(c.pending, tid)
+				c.releaseSlot()
+			}
+			c.mu.Unlock()
+		}
 		return err
 	}
 	if track {
+		// For a queued request the timer starts when it is queued, so time
+		// in the queue counts against it: stricter than the §7.1.1 start at
+		// the write, never looser.
 		c.mu.Lock()
 		if c.pending[tid] == t {
 			t.timer = c.cfg.Clock.AfterFunc(c.cfg.TransactionTimeout, func() { c.expire(tid, t) })
@@ -491,9 +676,20 @@ func (c *Conn) expire(tid string, t *transaction) {
 		return
 	}
 	delete(c.pending, tid)
+	c.releaseSlot()
 	c.mu.Unlock()
 	if t.mode == ReportYes {
 		t.onResult(StatusRequestTimeout, StatusText(StatusRequestTimeout))
+	}
+}
+
+// releaseSlot returns the token of a request that is no longer awaited.
+// Callers hold c.mu and have just removed the request from c.pending,
+// which is what keeps tokens and pending requests one to one.
+func (c *Conn) releaseSlot() {
+	select {
+	case <-c.slots:
+	default:
 	}
 }
 
@@ -515,28 +711,25 @@ func (c *Conn) newTransactionID(body []byte) (string, error) {
 	return "", errors.New("msrp: no usable transaction id; the random source repeats itself")
 }
 
-// postMessage queues an answer without waiting for it to be written.
-func (c *Conn) postMessage(m *Message) error {
+// sendMessage sends a message that already has its transaction id, such
+// as a response, in the given mode.
+func (c *Conn) sendMessage(ctx context.Context, m *Message, mode sendMode) error {
 	b, err := m.Marshal()
 	if err != nil {
 		return err
 	}
-	return c.post(b)
-}
-
-func (c *Conn) post(b []byte) error {
-	if c.isClosed() {
-		return ErrConnClosed
+	if mode.queue {
+		return c.enqueue(outFrame{b: b, owner: mode.owner})
 	}
-	return c.enqueue(outFrame{b: b})
+	return c.write(ctx, b)
 }
 
 // write queues b and waits until it has been written, so a sender of
-// content goes no faster than the peer reads.
-func (c *Conn) write(b []byte) error {
-	if c.isClosed() {
-		return ErrConnClosed
-	}
+// content goes no faster than the peer reads. If ctx ends first, write
+// returns at once: a message still in the queue is taken out, and one
+// already being written is left to the writer, which finishes it or fails
+// the connection within WriteTimeout.
+func (c *Conn) write(ctx context.Context, b []byte) error {
 	f := outFrame{b: b, done: make(chan error, 1)}
 	if err := c.enqueue(f); err != nil {
 		return err
@@ -551,18 +744,53 @@ func (c *Conn) write(b []byte) error {
 		default:
 			return ErrConnClosed
 		}
+	case <-ctx.Done():
+		select {
+		case err := <-f.done:
+			return err
+		default:
+		}
+		if c.unqueue(f) {
+			return ctx.Err()
+		}
+		return startedError{ctx.Err()}
 	}
 }
 
+// startedError is the context error of a write that had already begun and
+// may still complete.
+type startedError struct{ err error }
+
+func (e startedError) Error() string { return e.err.Error() }
+func (e startedError) Unwrap() error { return e.err }
+
+func (c *Conn) unqueue(f outFrame) bool {
+	c.qmu.Lock()
+	defer c.qmu.Unlock()
+	for i, q := range c.queue {
+		if q.done == f.done {
+			c.queue = append(c.queue[:i], c.queue[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Conn) enqueue(f outFrame) error {
+	if c.isClosed() {
+		return ErrConnClosed
+	}
 	c.qmu.Lock()
 	if f.done == nil {
-		if c.posted+len(f.b) > maxPosted {
+		if int64(c.posted+len(f.b)) > c.cfg.MaxQueuedBytes {
 			c.qmu.Unlock()
 			c.fail(ErrPeerNotReading)
 			return ErrPeerNotReading
 		}
 		c.posted += len(f.b)
+	}
+	if f.owner != nil {
+		f.owner.backlog.Add(int64(len(f.b)))
 	}
 	c.queue = append(c.queue, f)
 	c.qmu.Unlock()
@@ -598,14 +826,22 @@ func (c *Conn) writeLoop() {
 
 			_ = c.nc.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout))
 			_, err := c.nc.Write(f.b)
+			if f.owner != nil {
+				f.owner.backlog.Add(-int64(len(f.b)))
+			}
+			if f.written != nil {
+				f.written(err)
+			}
 			if err != nil {
+				// Fail first, so that whoever waited for this write sees
+				// the connection and its sessions already closed.
+				c.fail(err)
 				err = fmt.Errorf("%w: %w", ErrConnClosed, err)
 			}
 			if f.done != nil {
 				f.done <- err
 			}
 			if err != nil {
-				c.fail(err)
 				return
 			}
 		}

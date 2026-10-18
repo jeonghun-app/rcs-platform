@@ -117,7 +117,11 @@ func (r *Reader) ReadHeader() (*Message, error) {
 	if hasBody {
 		r.body = &bodyReader{r: r, m: m, endLine: []byte(endLinePrefix + m.TransactionID)}
 	}
-	if err := parseHeaders(m, lines, hasBody); err != nil {
+	err = parseHeaders(m, lines, hasBody)
+	if !validIdent(m.TransactionID) {
+		err = errors.New("transaction id is not 4 to 32 characters (§9 ident)")
+	}
+	if err != nil {
 		return m, &MessageError{Message: m, Code: StatusBadRequest, Err: err}
 	}
 	return m, nil
@@ -133,24 +137,60 @@ func (r *Reader) Body() io.Reader {
 }
 
 // ReadBody reads the rest of the current body into its Message, refusing
-// more than max octets with ErrBodyTooLarge.
-func (r *Reader) ReadBody(max int64) error {
+// more than limit octets with ErrBodyTooLarge.
+func (r *Reader) ReadBody(limit int64) error {
+	_, err := r.readBodyCharged(limit, nil)
+	return err
+}
+
+// readBodyCharged is ReadBody with the memory it allocates charged to b as
+// it grows, so the octets of chunks being read count against the same
+// allowance as those held for reassembly. The buffer grows with what has
+// arrived, never with what a header promises, and never past limit+1. It
+// returns what was charged, for the caller to release once it is done with
+// the body; running out of allowance is ErrBodyTooLarge as well.
+func (r *Reader) readBodyCharged(limit int64, b *Budget) (int64, error) {
 	if r.body == nil {
-		return nil
+		return 0, nil
 	}
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(io.LimitReader(r.body, max+1)); err != nil {
+	var buf []byte
+	var charged int64
+	for {
+		if len(buf) == cap(buf) {
+			if int64(len(buf)) > limit {
+				break
+			}
+			newCap := int(min(int64(max(512, 2*cap(buf))), limit+1))
+			if !b.take(int64(newCap - cap(buf))) {
+				return charged, r.tooLarge()
+			}
+			charged += int64(newCap - cap(buf))
+			nb := make([]byte, len(buf), newCap)
+			copy(nb, buf)
+			buf = nb
+		}
+		n, err := r.body.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return charged, err
+		}
+	}
+	if int64(len(buf)) > limit {
+		return charged, r.tooLarge()
+	}
+	r.cur.Body = buf
+	r.body = nil
+	return charged, nil
+}
+
+func (r *Reader) tooLarge() error {
+	if err := r.skipBody(); err != nil {
 		return err
 	}
-	if int64(buf.Len()) > max {
-		if err := r.skipBody(); err != nil {
-			return err
-		}
-		return ErrBodyTooLarge
-	}
-	r.cur.Body = buf.Bytes()
-	r.body = nil
-	return nil
+	return ErrBodyTooLarge
 }
 
 // ReadMessage reads one whole message. SEND bodies may be up to maxBody
@@ -228,7 +268,7 @@ func parseStartLine(line string) (*Message, error) {
 		return nil, framing("start line does not begin with MSRP")
 	}
 	tid, rest, ok := strings.Cut(rest, " ")
-	if !ok || !validIdent(tid) {
+	if !ok || !validFramingID(tid) {
 		return nil, framing("bad transaction id in start line")
 	}
 	m := &Message{TransactionID: tid}
@@ -293,17 +333,17 @@ func parseHeaders(m *Message, lines []string, hasBody bool) error {
 		}
 		var err error
 		switch {
+		// The paths are kept even when out of place, so that the refusal
+		// can still be addressed.
 		case strings.EqualFold(name, hdrToPath):
-			if i != 0 {
+			m.ToPath, err = parsePath(value)
+			if err == nil && i != 0 {
 				err = errors.New("To-Path must be the first header (§9)")
-			} else {
-				m.ToPath, err = parsePath(value)
 			}
 		case strings.EqualFold(name, hdrFromPath):
-			if i != 1 {
+			m.FromPath, err = parsePath(value)
+			if err == nil && i != 1 {
 				err = errors.New("From-Path must be the second header (§9)")
-			} else {
-				m.FromPath, err = parsePath(value)
 			}
 		case strings.EqualFold(name, hdrMessageID):
 			if !validIdent(value) {

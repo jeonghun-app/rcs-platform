@@ -6,13 +6,31 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Handler receives what arrives on an endpoint session. Its methods run on
-// connection goroutines, possibly at the same time, and should return
-// quickly: while HandleMessage runs, nothing else on that connection is
-// read.
+// event is one call to a session's Handler. ready, when set, holds the call
+// back until the transaction it belongs to has been answered, so that a
+// REPORT never overtakes the 200 for the chunk that completed the message.
+// octets are charged to the connection's Budget while the event waits.
+type event struct {
+	run    func()
+	ready  chan struct{}
+	octets int64
+}
+
+// Handler receives what arrives on an endpoint session.
+//
+// The methods for one session run one at a time, in arrival order, on a
+// goroutine of the session's own, never on a connection's reading
+// goroutine. So a handler may take its time and may call Send on any
+// session, including one that is still waiting to be bound, without
+// holding up other sessions. What it holds up is its own session: while it
+// runs, up to Config.MaxHandlerQueue further events wait, and beyond that
+// messages for the session are refused with 413 and reports are dropped
+// (EventDropped with ErrHandlerBusy). A session's handler that is slow for
+// long therefore makes its peer see refusals, not a stalled connection.
 type Handler interface {
 	// HandleMessage gets each complete message. Returning nil confirms it
 	// with a success REPORT when the sender asked for one (§7.1.3). An
@@ -80,8 +98,9 @@ type Session struct {
 	handler Handler
 	accept  []string
 
-	// reasm is used only by the goroutine reading the bound connection.
-	reasm Reassembler
+	// reasm is set when the session is bound and draws on the
+	// connection's Budget.
+	reasm *Reassembler
 
 	mu         sync.Mutex
 	conn       *Conn
@@ -91,9 +110,20 @@ type Session struct {
 	done       chan struct{}
 	lastActive time.Time
 	keepAlive  Timer
+	expiry     Timer
 	peer       *Session
-	rejected   []string
-	onClose    []func()
+	edge       bool // the client side of a bridge
+	// events feeds the handler's goroutine; nil for a bridged session.
+	events chan event
+	// window holds a token per chunk Send has awaiting its answer.
+	window chan struct{}
+	// backlog counts octets queued toward the client of a bridged edge
+	// session and not yet written (Config.MaxRelayBacklog).
+	backlog  atomic.Int64
+	rejected []string
+	// pieces are the relay's buffers for streaming SEND bodies.
+	pieces  [2][]byte
+	onClose []func()
 }
 
 // NewSession creates an unbound session.
@@ -149,11 +179,16 @@ func (s *Session) closeWith(err error) {
 	}
 	s.closed = true
 	s.err = err
-	c, ka, peer, hooks := s.conn, s.keepAlive, s.peer, s.onClose
+	c, ka, ex, reasm, peer, hooks := s.conn, s.keepAlive, s.expiry, s.reasm, s.peer, s.onClose
 	s.mu.Unlock()
 
-	if ka != nil {
-		ka.Stop()
+	for _, t := range []Timer{ka, ex} {
+		if t != nil {
+			t.Stop()
+		}
+	}
+	if reasm != nil {
+		reasm.Close()
 	}
 	if c != nil {
 		c.removeSession(s)
@@ -194,7 +229,17 @@ func (s *Session) attach(c *Conn) error {
 	}
 	s.conn = c
 	s.lastActive = c.cfg.Clock.Now()
-	s.reasm = Reassembler{MaxSize: c.cfg.MaxMessageSize, MaxPending: c.cfg.MaxPendingMessages}
+	s.reasm = &Reassembler{
+		MaxSize:     c.cfg.MaxMessageSize,
+		MaxPending:  c.cfg.MaxPendingMessages,
+		MaxBuffered: c.cfg.MaxSessionBuffer,
+		Budget:      c.budget,
+	}
+	s.window = make(chan struct{}, c.cfg.SendWindow)
+	if s.handler != nil {
+		s.events = make(chan event, c.cfg.MaxHandlerQueue)
+		go s.work(c)
+	}
 	close(s.bound)
 	s.mu.Unlock()
 
@@ -233,7 +278,9 @@ func (s *Session) waitBound(ctx context.Context) (*Conn, error) {
 // session (§5.4).
 //
 // Send returns once every chunk is written; it does not wait for
-// responses. Delivery status arrives through Handler.HandleReport. If the
+// responses, except that at most Config.SendWindow chunks of the session
+// may await theirs at once. Delivery status arrives through
+// Handler.HandleReport. If the
 // peer refuses a chunk while later ones are still to go, Send stops,
 // since §10.5 forbids sending more of a refused message, and returns the
 // refusal as a *StatusError. If ctx ends part-way, Send ends the message
@@ -273,13 +320,34 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 		}
 		if err := ctx.Err(); err != nil {
 			if i > 0 {
-				abort := ByteRange{Start: ch.Range.Start, End: ch.Range.Start - 1, Total: ch.Range.Total}
-				_ = c.sendRequest(s.chunk(id, out, sr, abort, nil, FlagAbort), nil)
+				s.abandon(c, id, out, sr, ch.Range)
 			}
 			return id, err
 		}
 		r := ch.Range
-		err := c.sendRequest(s.chunk(id, out, sr, r, ch.Data, ch.Flag), func(code int, comment string) {
+		// Only chunks that will be answered take a place in the window:
+		// with Failure-Report partial or no, no 200 would free it.
+		windowed := out.FailureReport == ReportUnset || out.FailureReport == ReportYes
+		if windowed {
+			select {
+			case s.window <- struct{}{}:
+			case <-s.done:
+				return id, s.Err()
+			case <-ctx.Done():
+				if i > 0 {
+					s.abandon(c, id, out, sr, r)
+				}
+				return id, ctx.Err()
+			}
+		}
+		var once sync.Once
+		free := func() {
+			if windowed {
+				once.Do(func() { <-s.window })
+			}
+		}
+		err := c.sendRequest(ctx, s.chunk(id, out, sr, r, ch.Data, ch.Flag), sendWait, func(code int, comment string) {
+			free()
 			if code == StatusOK {
 				return
 			}
@@ -291,11 +359,29 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 			s.report(Report{MessageID: id, Range: r, Code: code, Comment: comment})
 		})
 		if err != nil {
+			free()
+			var started startedError
+			switch {
+			case ctx.Err() == nil:
+			case errors.As(err, &started) && ch.Flag != FlagEnd:
+				// The chunk may still go out whole; end the message after it.
+				s.abandon(c, id, out, sr, ByteRange{Start: r.End + 1, Total: r.Total})
+			case !errors.As(err, &started) && i > 0:
+				s.abandon(c, id, out, sr, r)
+			}
 			return id, err
 		}
 		s.touch(c)
 	}
 	return id, nil
+}
+
+// abandon ends a message that Send gives up on with an empty chunk flagged
+// "#" at the first position not known to have been sent (§7.1). It is
+// queued, since the caller's context has already ended.
+func (s *Session) abandon(c *Conn, id string, out Outgoing, sr ReportMode, next ByteRange) {
+	abort := ByteRange{Start: next.Start, End: next.Start - 1, Total: next.Total}
+	_ = c.sendRequest(context.Background(), s.chunk(id, out, sr, abort, nil, FlagAbort), sendQueue, nil)
 }
 
 func (s *Session) chunk(id string, out Outgoing, sr ReportMode, r ByteRange, data []byte, flag byte) *Message {
@@ -319,19 +405,19 @@ func (s *Session) chunk(id string, out Outgoing, sr ReportMode, r ByteRange, dat
 
 // sendEmpty sends a bodiless SEND, the form §5.4 uses to bind a connection
 // and §7.1 suggests for keeping NAT bindings alive.
-func (s *Session) sendEmpty(c *Conn, onResult func(code int, comment string)) error {
+func (s *Session) sendEmpty(ctx context.Context, c *Conn, onResult func(code int, comment string)) error {
 	id, err := NewMessageID(c.cfg.Rand)
 	if err != nil {
 		return err
 	}
 	s.touch(c)
-	return c.sendRequest(&Message{
+	return c.sendRequest(ctx, &Message{
 		Method:    MethodSend,
 		ToPath:    s.remote,
 		FromPath:  []URI{s.local},
 		MessageID: id,
 		ByteRange: &ByteRange{Start: 1, End: 0, Total: 0},
-	}, onResult)
+	}, sendWait, onResult)
 }
 
 func (s *Session) armKeepAlive(c *Conn, after time.Duration) {
@@ -362,7 +448,7 @@ func (s *Session) keepAliveDue(c *Conn) {
 		s.armKeepAlive(c, interval-idle)
 		return
 	}
-	err := s.sendEmpty(c, func(code int, comment string) {
+	err := s.sendEmpty(context.Background(), c, func(code int, comment string) {
 		switch code {
 		case StatusOK:
 		case StatusRequestTimeout:
@@ -377,9 +463,86 @@ func (s *Session) keepAliveDue(c *Conn) {
 	s.armKeepAlive(c, interval)
 }
 
+// armExpiry makes sure a timer will drop incomplete messages that stop
+// getting chunks (Config.ReassemblyTimeout).
+func (s *Session) armExpiry(c *Conn) {
+	oldest, ok := s.reasm.Oldest()
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.expiry != nil {
+		return
+	}
+	wait := oldest.Add(c.cfg.ReassemblyTimeout).Sub(c.cfg.Clock.Now())
+	s.expiry = c.cfg.Clock.AfterFunc(wait, func() {
+		for range s.reasm.Expire(c.cfg.Clock.Now().Add(-c.cfg.ReassemblyTimeout)) {
+			c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrReassemblyTimeout})
+		}
+		s.mu.Lock()
+		s.expiry = nil
+		s.mu.Unlock()
+		s.armExpiry(c)
+	})
+}
+
+// post hands e to the handler's goroutine, or reports that there is no
+// room. Posting and closing share s.mu, so nothing is posted once the
+// goroutine has begun to drain on close.
+func (s *Session) post(e event) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.events == nil {
+		return false
+	}
+	select {
+	case s.events <- e:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Session) work(c *Conn) {
+	for {
+		select {
+		case e := <-s.events:
+			if e.ready != nil {
+				select {
+				case <-e.ready:
+				case <-s.done:
+					// Closed meanwhile: nothing more reaches the handler.
+					c.budget.release(e.octets)
+					continue
+				}
+			}
+			e.run()
+			c.budget.release(e.octets)
+		case <-s.done:
+			for {
+				select {
+				case e := <-s.events:
+					c.budget.release(e.octets)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
 func (s *Session) report(r Report) {
-	if s.handler != nil {
-		s.handler.HandleReport(s, r)
+	if s.handler == nil {
+		return
+	}
+	if !s.post(event{run: func() { s.handler.HandleReport(s, r) }}) {
+		s.mu.Lock()
+		c, closed := s.conn, s.closed
+		s.mu.Unlock()
+		if c != nil && !closed {
+			c.emit(Event{Kind: EventDropped, Method: MethodReport, Err: ErrHandlerBusy})
+		}
 	}
 }
 
@@ -393,11 +556,13 @@ func (s *Session) serve(c *Conn, m *Message) error {
 		return s.relaySend(c, peer, m)
 	}
 
-	limit := c.cfg.MaxMessageSize
+	limit, budget := c.cfg.MaxMessageSize, c.budget
 	if m.Method != MethodSend {
-		limit = maxNonSendBody
+		limit, budget = maxNonSendBody, nil
 	}
-	if err := c.r.ReadBody(limit); err != nil {
+	charged, err := c.r.readBodyCharged(limit, budget)
+	defer budget.release(charged)
+	if err != nil {
 		if !errors.Is(err, ErrBodyTooLarge) {
 			return err
 		}
@@ -420,10 +585,26 @@ func (s *Session) serve(c *Conn, m *Message) error {
 		s.receiveReport(m)
 		return nil
 	}
-	if rh, ok := s.handler.(RequestHandler); ok {
-		return c.respond(m, rh.HandleRequest(s, m))
+	rh, ok := s.handler.(RequestHandler)
+	if !ok {
+		return c.respond(m, StatusNotImplemented)
 	}
-	return c.respond(m, StatusNotImplemented)
+	if !s.post(event{run: func() {
+		code := rh.HandleRequest(s, m)
+		if code != StatusOK {
+			c.emit(Event{Kind: EventRefused, Method: m.Method, Code: code})
+		}
+		if !ShouldRespond(m, code) {
+			return
+		}
+		if resp, err := NewResponse(m, code, StatusText(code)); err == nil {
+			_ = c.sendMessage(context.Background(), resp, sendWait)
+		}
+	}}) {
+		c.emit(Event{Kind: EventDropped, Method: m.Method, Err: ErrHandlerBusy})
+		return c.respond(m, StatusMessageTooLarge)
+	}
+	return nil
 }
 
 func (s *Session) receiveSend(c *Conn, m *Message) error {
@@ -439,24 +620,41 @@ func (s *Session) receiveSend(c *Conn, m *Message) error {
 		s.reasm.Drop(m.MessageID)
 		return c.respond(m, StatusUnsupportedMediaType)
 	}
-	whole, err := s.reasm.Add(m)
+	whole, err := s.reasm.Add(m, c.cfg.Clock.Now())
 	if err != nil {
 		return c.respond(m, codeOf(err, StatusBadRequest))
 	}
-	if err := c.respond(m, StatusOK); err != nil {
-		return err
-	}
+	s.armExpiry(c)
 	if whole == nil {
-		return nil
+		return c.respond(m, StatusOK)
 	}
+	// The complete message waits for the handler charged to the
+	// connection's Budget, like octets held for reassembly.
+	octets := int64(len(whole.Body))
+	if !c.budget.take(octets) {
+		return c.respond(m, StatusMessageTooLarge)
+	}
+	ready := make(chan struct{})
+	if !s.post(event{octets: octets, ready: ready, run: func() { s.deliver(c, whole) }}) {
+		c.budget.release(octets)
+		c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrHandlerBusy})
+		return c.respond(m, StatusMessageTooLarge)
+	}
+	err = c.respond(m, StatusOK)
+	close(ready)
+	return err
+}
+
+// deliver runs on the handler's goroutine, which may wait for the peer, so
+// its REPORT is written rather than queued.
+func (s *Session) deliver(c *Conn, whole *Message) {
 	code := StatusOK
 	if err := s.handler.HandleMessage(s, whole); err != nil {
 		code = codeOf(err, StatusForbidden)
 	}
-	if !ShouldReport(whole, code) {
-		return nil
+	if ShouldReport(whole, code) {
+		_ = c.sendRequest(context.Background(), NewReport(whole, s.local, *whole.ByteRange, code), sendWait, nil)
 	}
-	return c.sendRequest(NewReport(whole, s.local, *whole.ByteRange, code), nil)
 }
 
 func (s *Session) receiveReport(m *Message) {
@@ -472,7 +670,9 @@ func (s *Session) accepts(mediaType string) bool {
 		return true
 	}
 	for _, a := range s.accept {
-		a = strings.ToLower(a)
+		// §8.6: an entry with parameters also matches the bare type.
+		a, _, _ = strings.Cut(a, ";")
+		a = strings.ToLower(strings.TrimSpace(a))
 		switch {
 		case a == "*", a == mediaType:
 			return true

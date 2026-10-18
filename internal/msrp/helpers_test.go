@@ -2,6 +2,7 @@ package msrp
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"sort"
 	"strings"
@@ -127,11 +128,15 @@ func newWirePeer(t *testing.T, nc net.Conn) *wirePeer {
 		r := NewReader(nc, 0)
 		for {
 			m, err := r.ReadMessage(DefaultMaxMessageSize)
-			if err != nil {
+			var me *MessageError
+			if err != nil && !errors.As(err, &me) {
 				p.errs <- err
 				close(p.msgs)
 				return
 			}
+			// A refused message is still handed over: tests look at
+			// answers we send to malformed requests, such as one echoing
+			// an oddly sized transaction id.
 			p.msgs <- m
 		}
 	}()

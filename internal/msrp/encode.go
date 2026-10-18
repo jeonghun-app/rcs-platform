@@ -113,7 +113,9 @@ func invalid(format string, args ...any) error {
 }
 
 func (m *Message) check() error {
-	if !validIdent(m.TransactionID) {
+	// A response echoes the request's id (§7.2), even one that was only
+	// good enough to frame the request it refuses.
+	if !validIdent(m.TransactionID) && (m.IsRequest() || !validFramingID(m.TransactionID)) {
 		return invalid("transaction id %q", m.TransactionID)
 	}
 	if m.IsRequest() {

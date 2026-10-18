@@ -841,11 +841,11 @@ func TestWritingToAClosedConnectionFails(t *testing.T) {
 	if !errors.Is(c.Err(), ErrConnClosed) {
 		t.Fatalf("Err = %v", c.Err())
 	}
-	if err := c.write([]byte("x")); !errors.Is(err, ErrConnClosed) {
+	if err := c.write(context.Background(), []byte("x")); !errors.Is(err, ErrConnClosed) {
 		t.Fatalf("write = %v", err)
 	}
-	if err := c.sendRequest(&Message{Method: MethodSend, ToPath: []URI{mustURI(t, asURI)}, FromPath: []URI{mustURI(t, clientURI)}, MessageID: "msg1"},
-		func(int, string) {}); !errors.Is(err, ErrConnClosed) {
+	if err := c.sendRequest(context.Background(), &Message{Method: MethodSend, ToPath: []URI{mustURI(t, asURI)}, FromPath: []URI{mustURI(t, clientURI)}, MessageID: "msg1"},
+		sendWait, func(int, string) {}); !errors.Is(err, ErrConnClosed) {
 		t.Fatalf("sendRequest = %v", err)
 	}
 	s := newTestSession(t, clientURI, asURI, nil)
@@ -861,7 +861,7 @@ func TestAWriteThatFailsClosesTheConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = theirs.Close()
-	if err := c.write([]byte("x")); !errors.Is(err, ErrConnClosed) {
+	if err := c.write(context.Background(), []byte("x")); !errors.Is(err, ErrConnClosed) {
 		t.Fatalf("write = %v", err)
 	}
 	waitDone(t, c.Done(), "connection")
@@ -1090,7 +1090,8 @@ func TestAPeerThatNeverReadsItsAnswersIsDisconnected(t *testing.T) {
 		t.Fatal(err)
 	}
 	ours, theirs := net.Pipe()
-	c, err := NewPassiveConn(ours, reg, Config{Clock: newFakeClock()})
+	// The bound is a memory limit; a small one shows it holding quickly.
+	c, err := NewPassiveConn(ours, reg, Config{Clock: newFakeClock(), MaxQueuedBytes: 64 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1106,5 +1107,27 @@ func TestAPeerThatNeverReadsItsAnswersIsDisconnected(t *testing.T) {
 	waitDone(t, c.Done(), "connection")
 	if !errors.Is(c.Err(), ErrPeerNotReading) {
 		t.Fatalf("Err = %v", c.Err())
+	}
+}
+
+func TestKeepAlivesDefaultToWellInsideTheLoadBalancerIdleTimeout(t *testing.T) {
+	// NLB TLS listeners close a connection idle for 350 s (ADR 0003).
+	cfg, err := Config{}.withDefaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.KeepAliveInterval != 240*time.Second || cfg.KeepAliveInterval >= 350*time.Second {
+		t.Fatalf("default keep-alive %v", cfg.KeepAliveInterval)
+	}
+}
+
+func TestTheKeepAliveIntervalIsConfigurable(t *testing.T) {
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Minute})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	clock.Advance(time.Minute)
+	if ka := p.next(t); ka.Method != MethodSend || ka.HasBody() {
+		t.Fatalf("got %+v, want a keep-alive", ka)
 	}
 }

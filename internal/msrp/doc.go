@@ -22,6 +22,19 @@
 //     forward between a client and rcs-as one bounded piece at a time
 //     (ADR 0004, RFC 4976 §6.4 for the forwarding rules a relay follows).
 //
+// A connection is read by one goroutine that never waits for a peer to
+// read: answers it produces are queued for the connection's writer, each
+// session's Handler runs on a goroutine of its own, and a relay never makes
+// its shared connection toward rcs-as wait for one client. What waits is
+// whoever produces content: Send, and a relay forwarding toward rcs-as.
+// Everything a peer can make this side hold is bounded (Config): header
+// and message size, octets held for reassembly per session and per
+// connection, incomplete messages, gaps per message, events per handler,
+// unanswered requests, queued answers and the relay backlog per client.
+// A peer that stops reading is cut off after WriteTimeout. Config.OnEvent
+// reports refusals, drops and disconnections, without identifiers, for
+// metrics.
+//
 // The package never logs: session ids are the only secret that ties a
 // connection to a session (ADR 0004), and message bodies must not reach a
 // log, so reporting is left to callers through returned errors.

@@ -4,7 +4,11 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"time"
 )
+
+// t0 is when test chunks arrive unless a test says otherwise.
+var t0 = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 func TestSplitCutsBodiesIntoChunksOfAtMostTheSize(t *testing.T) {
 	tests := []struct {
@@ -67,7 +71,7 @@ func TestReassemblerPassesAWholeMessageStraightThrough(t *testing.T) {
 		chunkMsg("msg2", ByteRange{1, Unknown, Unknown}, "hello", FlagEnd),
 		{Method: MethodSend, MessageID: "msg3", ContentType: "text/plain", Body: []byte("hello")}, // no Byte-Range
 	} {
-		got, err := r.Add(m)
+		got, err := r.Add(m, t0)
 		if err != nil || got == nil || string(got.Body) != "hello" || *got.ByteRange != (ByteRange{1, 5, 5}) {
 			t.Fatalf("%s: got %+v, %v", m.MessageID, got, err)
 		}
@@ -88,7 +92,7 @@ func TestReassemblerJoinsChunksInAnyOrder(t *testing.T) {
 		var r Reassembler
 		var got *Message
 		for i, idx := range order {
-			m, err := r.Add(parts[idx])
+			m, err := r.Add(parts[idx], t0)
 			if err != nil {
 				t.Fatalf("order %v: %v", order, err)
 			}
@@ -164,12 +168,12 @@ func TestReassemblerRefusesMessagesOverTheSizeLimitWith413(t *testing.T) {
 		"position":         chunkMsg("msg2", ByteRange{10, Unknown, Unknown}, "ab", FlagMore),
 		"huge range-start": chunkMsg("msg3", ByteRange{math.MaxInt64, Unknown, Unknown}, "ab", FlagMore),
 	} {
-		if _, err := r.Add(m); statusCode(err) != StatusMessageTooLarge {
+		if _, err := r.Add(m, t0); statusCode(err) != StatusMessageTooLarge {
 			t.Errorf("%s: err = %v, want 413", name, err)
 		}
 	}
 	mustAdd(t, &r, chunkMsg("msg4", ByteRange{1, 5, Unknown}, "abcde", FlagMore))
-	if _, err := r.Add(chunkMsg("msg4", ByteRange{6, Unknown, Unknown}, "fghijk", FlagMore)); statusCode(err) != StatusMessageTooLarge {
+	if _, err := r.Add(chunkMsg("msg4", ByteRange{6, Unknown, Unknown}, "fghijk", FlagMore), t0); statusCode(err) != StatusMessageTooLarge {
 		t.Fatalf("err = %v, want 413", err)
 	}
 	if r.Pending() != 0 {
@@ -181,7 +185,7 @@ func TestReassemblerBoundsIncompleteMessages(t *testing.T) {
 	r := Reassembler{MaxPending: 2}
 	mustAdd(t, &r, chunkMsg("msg1", ByteRange{1, 1, 2}, "a", FlagMore))
 	mustAdd(t, &r, chunkMsg("msg2", ByteRange{1, 1, 2}, "a", FlagMore))
-	if _, err := r.Add(chunkMsg("msg3", ByteRange{1, 1, 2}, "a", FlagMore)); statusCode(err) != StatusMessageTooLarge {
+	if _, err := r.Add(chunkMsg("msg3", ByteRange{1, 1, 2}, "a", FlagMore), t0); statusCode(err) != StatusMessageTooLarge {
 		t.Fatalf("err = %v, want 413", err)
 	}
 	// A whole message needs no slot.
@@ -221,7 +225,7 @@ func TestReassemblerRefusesChunksThatContradictEachOtherWith400(t *testing.T) {
 		var r Reassembler
 		var err error
 		for _, m := range msgs {
-			if _, err = r.Add(m); err != nil {
+			if _, err = r.Add(m, t0); err != nil {
 				break
 			}
 		}
@@ -245,20 +249,9 @@ func TestReassemblerKeepsMessagesApartByMessageID(t *testing.T) {
 	}
 }
 
-func TestAddSpanMergesOverlappingAndTouchingRanges(t *testing.T) {
-	var have []span
-	for _, s := range []span{{10, 12}, {1, 2}, {5, 6}, {3, 4}, {7, 9}, {20, 30}, {15, 16}, {14, 25}} {
-		have = addSpan(have, s)
-	}
-	want := []span{{1, 12}, {14, 30}}
-	if len(have) != len(want) || have[0] != want[0] || have[1] != want[1] {
-		t.Fatalf("spans %v, want %v", have, want)
-	}
-}
-
 func mustAdd(t *testing.T, r *Reassembler, m *Message) *Message {
 	t.Helper()
-	got, err := r.Add(m)
+	got, err := r.Add(m, t0)
 	if err != nil {
 		t.Fatalf("Add(%s %v): %v", m.MessageID, m.ByteRange, err)
 	}

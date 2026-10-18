@@ -50,8 +50,10 @@ func transcript(t *testing.T, src io.Reader) string {
 		var me *MessageError
 		switch {
 		case errors.As(err, &me):
-			if me.Message == nil || !validIdent(me.Message.TransactionID) {
-				t.Fatalf("MessageError without a transaction id: %v", err)
+			// The id may break the length rule but always frames the
+			// message, so the refusal can echo it.
+			if me.Message == nil || !validFramingID(me.Message.TransactionID) {
+				t.Fatalf("MessageError without a usable transaction id: %v", err)
 			}
 			fmt.Fprintf(&out, "refused %s %d\n", me.Message.TransactionID, me.Code)
 			continue
@@ -108,8 +110,8 @@ func FuzzParseURI(f *testing.F) {
 }
 
 // FuzzReassembler feeds arbitrary chunk sequences and checks that the
-// limits hold, that a delivered message is exactly as long as its range
-// says, and that nothing panics.
+// limits hold (incomplete messages, octets held), that a delivered message
+// is exactly as long as its range says, and that nothing panics.
 func FuzzReassembler(f *testing.F) {
 	f.Add([]byte{1, 4, 0x80 | 8, 5, 4, 0x90 | 8, 9, 4, 2})
 	f.Add([]byte{9, 2, 2, 1, 8, 0, 200, 3, 1, 1, 0, 3})
@@ -132,7 +134,7 @@ func FuzzReassembler(f *testing.F) {
 				Body:         bytes.Repeat([]byte{data[i]}, int(data[i+1]%24)),
 				Continuation: flags[int(data[i+2]>>4)%3],
 			}
-			whole, err := asm.Add(m)
+			whole, err := asm.Add(m, t0)
 			if err != nil {
 				var se *StatusError
 				if !errors.As(err, &se) || (se.Code != StatusBadRequest && se.Code != StatusMessageTooLarge) {
@@ -147,6 +149,10 @@ func FuzzReassembler(f *testing.F) {
 			}
 			if asm.Pending() > asm.MaxPending {
 				t.Fatalf("%d incomplete messages held", asm.Pending())
+			}
+			// Twice MaxSize is the default MaxBuffered.
+			if held := asm.Buffered(); held > 2*asm.MaxSize {
+				t.Fatalf("%d octets held", held)
 			}
 		}
 	})

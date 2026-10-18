@@ -5,7 +5,8 @@ import (
 	"strconv"
 )
 
-// Status codes of RFC 4975 §10 and RFC 7701 §10.3 that this package uses.
+// Status codes of RFC 4975 §10 and of RFC 7701 §10.3, which a
+// RequestHandler serving NICKNAME may return.
 const (
 	StatusOK                   = 200
 	StatusBadRequest           = 400
@@ -17,6 +18,8 @@ const (
 	StatusNoSession            = 481
 	StatusNotImplemented       = 501
 	StatusSessionInUse         = 506
+	StatusNicknameInvalid      = 424
+	StatusNicknameInUse        = 425
 )
 
 // StatusText returns the comment this package writes for code. MSRP
@@ -43,6 +46,10 @@ func StatusText(code int) string {
 		return "Not Implemented"
 	case StatusSessionInUse:
 		return "Session Already Bound"
+	case StatusNicknameInvalid:
+		return "Nickname Not Valid"
+	case StatusNicknameInUse:
+		return "Nickname Reserved Or In Use"
 	}
 	return ""
 }

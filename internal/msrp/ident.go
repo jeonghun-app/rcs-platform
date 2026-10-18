@@ -49,6 +49,28 @@ func NewSessionID(rand io.Reader) (string, error) {
 	return newID(rand, sessionIDBytes)
 }
 
+// maxFramingID bounds how long a transaction id may be and still be used
+// to find the end of its message; see validFramingID.
+const maxFramingID = 64
+
+// validFramingID accepts a transaction id that breaks only the length rule
+// of ident: the end-line can still be found with it, so the request can be
+// answered with 400 instead of losing the whole connection, and the answer
+// can echo the id as §7.2 requires. A reference client draws ids as
+// variable-length hex numbers, which are occasionally shorter than four
+// characters.
+func validFramingID(s string) bool {
+	if s == "" || len(s) > maxFramingID || !isAlnum(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if c := s[i]; !isAlnum(c) && c != '.' && c != '-' && c != '+' && c != '%' && c != '=' {
+			return false
+		}
+	}
+	return true
+}
+
 // validIdent follows the §9 ident rule used by transaction ids and
 // Message-ID values: 4 to 32 characters starting with a letter or digit.
 func validIdent(s string) bool {
