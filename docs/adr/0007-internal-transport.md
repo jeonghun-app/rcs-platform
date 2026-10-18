@@ -38,7 +38,7 @@ traffic within an AZ is not assumed to be.
    | `hss` Diameter | `icscf`, `scscf` (and `rcs-as` once it uses Sh) |
    | `hss` HTTP API | `ft-server`, `acs`, the operator path |
    | `icscf`, `scscf` SIP | `pcscf`, `rcs-as`, each other |
-   | `pcscf` core SIP (separate listener) | `scscf`, `icscf` |
+   | `pcscf` core SIP (separate listener) | `scscf` |
    | `rcs-as` SIP | `scscf`, `icscf` (direct routing to the conference factory and other PSIs, TS 24.229 §5.3.2.1) |
    | `rcs-as` MSRP | `msrp-relay` |
    | `msrp-relay` control HTTP | `pcscf` |
