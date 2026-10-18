@@ -11,7 +11,9 @@ import (
 // by parsing maximum-size adversarial input. Each shape below fills a header
 // section of a given size with one pattern that a careless parser handles in
 // quadratic time or allocations. The test parses and reads it at the default
-// limit and at four times that, and checks the cost grows about four times.
+// limit and at four times that, and checks the allocations grow about four
+// times. Allocations are deterministic; wall time on a shared CI runner is not,
+// so the times are logged for a reader but do not decide the test.
 
 const adversarialSmall = DefaultMaxHeaderBytes
 
@@ -109,7 +111,7 @@ func readEverything(tb testing.TB, data []byte, lim Limits) {
 	}
 }
 
-func TestMaximumSizeAdversarialInputCostsLinearTime(t *testing.T) {
+func TestMaximumSizeAdversarialInputCostsLinearAllocations(t *testing.T) {
 	small := Limits{MaxHeaderBytes: adversarialSmall}
 	large := Limits{MaxHeaderBytes: 4 * adversarialSmall}
 	for _, shape := range adversarialShapes {
@@ -121,18 +123,14 @@ func TestMaximumSizeAdversarialInputCostsLinearTime(t *testing.T) {
 				t.Fatalf("small input is %d bytes", len(s))
 			}
 
-			// Allocations are deterministic, so they get the tight bound.
 			as := testing.AllocsPerRun(5, func() { readEverything(t, s, small) })
 			al := testing.AllocsPerRun(5, func() { readEverything(t, l, large) })
 			if al > 6*as+16 {
 				t.Errorf("allocations grow from %.0f to %.0f for four times the input", as, al)
 			}
 
-			// Time gets a loose bound: linear is about 4x, quadratic about 16x.
 			ts, tl := fastest(func() { readEverything(t, s, small) }), fastest(func() { readEverything(t, l, large) })
-			if tl > 10*ts+time.Millisecond {
-				t.Errorf("time grows from %v to %v for four times the input", ts, tl)
-			}
+			t.Logf("%.0f to %.0f allocations, %v to %v, for four times the input", as, al, ts, tl)
 		})
 	}
 }

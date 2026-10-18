@@ -392,8 +392,17 @@ func TestControlCharactersAndInvalidUTF8AreRejected(t *testing.T) {
 			t.Errorf("Add %q: error = %v, want ErrMalformed", value, err)
 		}
 	}
+	// NUL in a quoted-pair is received but never sent.
+	nul := "\"NUL:\\\x00\" <sip:a@example.com>"
+	if _, err := ParseMessage([]byte(lines("OPTIONS sip:example.com SIP/2.0", "X-Foo: "+nul, "Content-Length: 0"))); err != nil {
+		t.Errorf("parse %q: %v", nul, err)
+	}
+	var withNUL Header
+	if err := withNUL.Add("X-Foo", nul); !errors.Is(err, ErrMalformed) {
+		t.Errorf("Add %q: error = %v, want ErrMalformed", nul, err)
+	}
 	for _, value := range []string{
-		"\"BEL:\\\x07 NUL:\\\x00 DEL:\\\x7f\" <sip:a@example.com>",
+		"\"BEL:\\\x07 DEL:\\\x7f\" <sip:a@example.com>",
 		"tab\there",
 		"\ufeff大停電",
 		"unquoted \\ backslash",

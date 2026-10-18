@@ -237,7 +237,7 @@ func (h *Header) Elements(name string) ([]string, error) {
 // invalid UTF-8, which docs/architecture.md §8 has senders never emit. Every
 // value a service writes passes through them, so this is the one place the
 // check is made; the String methods of the value types rely on it (see
-// invalidValue).
+// invalidValue). NUL is refused even as a quoted-pair, which the parser accepts.
 func (h *Header) Add(name, value string) error {
 	f, err := newField(name, value)
 	if err != nil {
@@ -364,6 +364,13 @@ func newField(name, value string) (field, error) {
 	}
 	if !validFieldValue(value) {
 		return field{}, headerError(CanonicalName(name), "value contains a control character or invalid UTF-8")
+	}
+	// A received quoted-pair may carry NUL (RFC 4475 §3.1.1.2), but nothing this
+	// stack sends needs one, and NUL is what the String methods write for a part
+	// with no valid form (invalidValue). Refusing it anywhere means that marker
+	// can never be let through by sitting inside a quoted string.
+	if strings.IndexByte(value, 0) >= 0 {
+		return field{}, headerError(CanonicalName(name), "value contains NUL")
 	}
 	name = CanonicalName(name)
 	return field{name: name, key: headerKey(name), value: trimWS(value)}, nil

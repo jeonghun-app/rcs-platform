@@ -8,6 +8,11 @@ import "log/slog"
 // redacted forms instead of the exported fields, the same line of defence as
 // messages having no String method.
 //
+// slog applies LogValue only to the value it is handed. A slice of these values,
+// or a struct of the service's own that holds one, reaches the JSON handler
+// through encoding/json, which ignores LogValue and writes every field: log the
+// elements or the fields one by one instead.
+//
 // TODO(#2): pass user parts and numbers through internal/pii once it lands, so
 // operators can correlate the masked form; until then they are left out.
 
@@ -61,9 +66,16 @@ func authLogValue(scheme string, ps Params) slog.Value {
 	return slog.GroupValue(attrs...)
 }
 
+// LogValue logs the number of fields; names and values are left out, since
+// either can carry input chosen by the peer.
+func (h Header) LogValue() slog.Value {
+	return slog.GroupValue(slog.Int("fields", len(h.fields)))
+}
+
 // LogValue logs the method, the redacted Request-URI and sizes; header values
-// and the body are left out.
-func (r *Request) LogValue() slog.Value {
+// and the body are left out. The receiver is a value so that a Request and a
+// *Request both log this way.
+func (r Request) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("method", r.Method),
 		slog.String("uri", r.URI.redacted()),
@@ -73,7 +85,8 @@ func (r *Request) LogValue() slog.Value {
 }
 
 // LogValue logs the status and sizes; header values and the body are left out.
-func (r *Response) LogValue() slog.Value {
+// Like Request.LogValue it has a value receiver.
+func (r Response) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Int("status", r.StatusCode),
 		slog.String("reason", r.Reason),

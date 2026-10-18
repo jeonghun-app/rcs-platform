@@ -146,6 +146,11 @@ var errTooManyParams = syntaxError("too many parameters")
 // error: two tags or two branches leave a receiver to guess which one counts.
 func parseParams(s string, i int) (Params, int, error) {
 	var ps Params
+	if n := strings.Count(s[i:], ";"); n > 0 {
+		// Each parameter starts with ";", so this is an upper bound; it saves the
+		// regrowths of a long list.
+		ps = make(Params, 0, min(n, maxParams))
+	}
 	var seen nameSet
 	for {
 		k := skipWS(s, i)
@@ -195,38 +200,25 @@ func parseTokenParams(s string) (string, Params, error) {
 	return s[i:j], ps, nil
 }
 
-// nameSet finds repeated parameter names. Comparing every pair would let one
-// 16 KiB field of near-identical names cost each accessor call millions of byte
-// comparisons, so past a handful of names it switches to a map and the cost stays
-// linear in the input.
+// nameSet finds repeated parameter names. Names are compared after one
+// normalization each, with ==, which checks lengths before bytes, and there are
+// at most maxParams of them, so the check costs a bounded number of short
+// comparisons per element and allocates nothing beyond the normalization: a
+// map per element would allocate on every header read.
 type nameSet struct {
-	small [8]string
-	n     int
-	m     map[string]struct{}
+	keys [maxParams]string
+	n    int
 }
 
 // add records key, already normalized by the caller, and reports whether it was
-// there before.
+// there before. Callers check maxParams first, so the array never overflows.
 func (s *nameSet) add(key string) bool {
-	if s.m == nil {
-		for _, k := range s.small[:s.n] {
-			if k == key {
-				return true
-			}
-		}
-		if s.n < len(s.small) {
-			s.small[s.n] = key
-			s.n++
-			return false
-		}
-		s.m = make(map[string]struct{}, 2*len(s.small))
-		for _, k := range s.small {
-			s.m[k] = struct{}{}
+	for _, k := range s.keys[:s.n] {
+		if k == key {
+			return true
 		}
 	}
-	if _, dup := s.m[key]; dup {
-		return true
-	}
-	s.m[key] = struct{}{}
+	s.keys[s.n] = key
+	s.n++
 	return false
 }

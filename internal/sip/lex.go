@@ -52,7 +52,9 @@ const upperHex = "0123456789ABCDEF"
 // Header.Add, Set and Prepend refuse and Request.Bytes refuses on the start line.
 // A value built wrongly in code therefore fails where it is added, and cannot
 // reach the wire as something else: a host of "p.example.com>,<sip:x" would
-// otherwise add a hop to a Route.
+// otherwise add a hop to a Route. Because every invalid value writes the same
+// byte, String output is not a safe map key or identity unless the value is
+// known to be valid, for example because it was parsed.
 const invalidValue = "\x00"
 
 func in(c byte, cls uint16) bool { return charClasses[c]&cls != 0 }

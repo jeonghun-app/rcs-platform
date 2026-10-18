@@ -337,7 +337,9 @@ func (u URI) IsSIP() bool { return u.Scheme == "sip" || u.Scheme == "sips" }
 // String returns the URI as text. Characters that a component cannot carry are
 // escaped. A URI with a part that has no escaped form (an invalid scheme, host,
 // port or tel number, an empty parameter name, too many parameters) is written as
-// invalidValue, which Header.Add refuses; a zero URI is one of those.
+// invalidValue, which Header.Add refuses; a zero URI is one of those. Such output
+// contains NUL, so do not use String as a key for a URI that was not parsed;
+// compare with Equal, or for telephone numbers key on E164.
 func (u URI) String() string {
 	return string(u.appendTo(nil))
 }

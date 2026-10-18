@@ -31,7 +31,7 @@ func TestLoggedValuesLeaveOutIdentitiesAndCredentials(t *testing.T) {
 
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, nil))
-	log.Info("x", "req", req, "res", res, "uri", req.URI, "from", from, "to", to,
+	log.Info("x", "req", req, "reqv", *req, "res", res, "resv", *res, "header", req.Header, "headerp", &req.Header, "uri", req.URI, "from", from, "to", to,
 		"contact", cs[0], "star", Contact{Star: true}, "creds", creds[0], "challenge", chs[0], "zero", URI{},
 		"urn", URI{Scheme: "urn", Opaque: "uuid:s3cret"})
 	out := buf.String()
@@ -43,7 +43,8 @@ func TestLoggedValuesLeaveOutIdentitiesAndCredentials(t *testing.T) {
 	for _, want := range []string{
 		`"method":"REGISTER"`, `"uri":"sip:***@ims.example.net"`, `"status":200`, `"to":{"uri":"tel:***","tag":""}`,
 		`"contact":{"uri":"sip:***@192.0.2.1","tag":""}`, `"star":"*"`, `"realm":"ims.example.net"`, `"algorithm":"AKAv1-MD5"`,
-		`"zero":""`, `"urn":"urn:***"`, `"body_bytes":11`,
+		`"zero":""`, `"urn":"urn:***"`, `"body_bytes":11`, `"reqv":{"method":"REGISTER"`, `"resv":{"status":200`,
+		`"header":{"fields":9}`, `"headerp":{"fields":9}`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log lacks %s:\n%s", want, out)
