@@ -1,0 +1,81 @@
+# Every job runs the same Make targets a contributor runs locally.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded pull request runs are cancelled; a main run is never cancelled
+  # once started (a queued one can still be replaced by a newer merge).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: fmt, vet, test, race, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make fmt-check
+      - run: make vet
+      - run: make test
+      - run: make race
+      - run: make build
+
+  fuzz:
+    name: fuzz every parser briefly
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make fuzz FUZZTIME=5s
+      # A crashing input is written under testdata/fuzz/ and is the only way to
+      # reproduce the failure, so keep it.
+      - name: keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashers
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
+
+  vuln:
+    name: modules and vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make vuln
+
+  hygiene:
+    name: workflows, docs links, privacy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make lint-actions
+      - run: make docs
+      - run: make privacy
+      - name: no credentials or env files are tracked
+        run: |
+          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$'; then
+            echo "an env file is tracked" >&2; exit 1
+          fi
+          if git grep -nIE 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' -- ':!*_test.go'; then
+            echo "a credential is tracked" >&2; exit 1
+          fi

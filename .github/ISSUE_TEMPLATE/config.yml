@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/jeonghun-app/rcs-platform/security/advisories/new
+    about: >-
+      Report anything exploitable privately. Do not open a public issue for it.
+      See SECURITY.md for scope and what to include.

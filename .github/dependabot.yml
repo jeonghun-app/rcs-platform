@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      aws-sdk:
+        patterns: ["github.com/aws/*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: monthly
+    # The Go toolchain version is a project decision (go.mod, Makefile, Dockerfile
+    # and CI move together), not a base-image bump.
+    ignore:
+      - dependency-name: golang
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

@@ -1,0 +1,40 @@
+name: Bug report
+description: Something a service does that it should not, or fails to do.
+labels: ["type/bug", "status/triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Exploitable? Stop here** and use
+        [private vulnerability reporting](https://github.com/jeonghun-app/rcs-platform/security/advisories/new).
+
+        **Do not paste a real IMSI, IMEI, MSISDN, key, nonce, token or message
+        content**, including inside SIP traces, MSRP chunks or logs. Reproduce with
+        the reserved test network (MCC `001`, MNC `01`) and replace anything else
+        with `<redacted>`.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: service
+    attributes:
+      label: Service
+      options: [pcscf, icscf, scscf, hss, rcs-as, msrp-relay, ft-server, acs integration, AWS deployment, other]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, a redacted SIP/MSRP trace, or an rcs-sim scenario.
+    validations:
+      required: true

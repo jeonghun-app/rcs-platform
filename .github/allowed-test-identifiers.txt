@@ -1,0 +1,26 @@
+# Every IMSI- or IMEI-shaped (15-16 digit) and E.164-shaped (+ and 10-15 digits)
+# identifier that may appear in this repository.
+#
+# CI fails on any other one, because a 15-digit literal is most likely a real
+# IMSI and a real IMSI is subscriber-identifying data.
+#
+# Rules for adding an entry:
+#   * IMSIs use MCC 001 / MNC 01, the reserved test network.
+#   * IMEIs come from documented example ranges and are not tied to a device.
+#   * Add a comment saying which test or document uses the entry.
+#
+# Format: one identifier per line. Comments and blank lines are ignored.
+
+# --- IMSIs, reserved test network (MCC 001, MNC 01) --------------------------
+001010000000001
+001010000000002
+001010000000003
+
+# --- Phone numbers (E.164) ---------------------------------------------------
+# Use only these. +1 555 0100-0199 is reserved for fictional use in North America,
+# so none of them can reach a real subscriber.
++15550100001
++15550100002
++15550100003
++15550100004
++15550100005
