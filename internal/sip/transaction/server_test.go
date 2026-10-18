@@ -2,6 +2,7 @@ package transaction
 
 import (
 	"errors"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -268,6 +269,48 @@ func TestServerTransactionsAreMatchedOnBranchSentByAndMethod(t *testing.T) {
 	}
 	if target.Source().Network != transport.UDP {
 		t.Fatalf("Source = %+v", target.Source())
+	}
+}
+
+func TestRetransmissionIsAnsweredOnlyWhenItArrivesTheWayTheRequestDid(t *testing.T) {
+	tcp := func(flow transport.FlowID) transport.Inbound {
+		return transport.Inbound{Source: transport.Source{Flow: flow, Network: transport.TCP}}
+	}
+	udp := func(flow transport.FlowID, port uint16) transport.Inbound {
+		return transport.Inbound{Source: transport.Source{Flow: flow, Network: transport.UDP, Listener: "udp",
+			Addr: netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), port)}}
+	}
+	tests := []struct {
+		name       string
+		first, re  transport.Inbound
+		wantAnswer bool
+	}{
+		{"same TCP flow", tcp("a"), tcp("a"), true},
+		{"another TCP flow", tcp("a"), tcp("b"), false},
+		{"UDP after TCP", tcp("a"), udp("u", 5060), false},
+		{"same UDP source", udp("u", 5060), udp("u", 5060), true},
+		// An expired UDP flow comes back with a new FlowID; the socket and the
+		// address are what make it the same.
+		{"same UDP source, new flow", udp("u", 5060), udp("v", 5060), true},
+		{"another UDP port", udp("u", 5060), udp("w", 5070), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, transport.UDP, Config{})
+			// A completed INVITE lingers over every transport, until Timer H.
+			req := request(t, "INVITE", "z9hG4bKre")
+			first, re := tt.first, tt.re
+			first.Message, re.Message = req, req
+			h.layer.Receive(first)
+			if err := h.tu.lastTx().Respond(response(t, req, 486)); err != nil {
+				t.Fatal(err)
+			}
+			h.sender.take()
+			h.layer.Receive(re)
+			if got := len(h.sender.take()) == 1; got != tt.wantAnswer {
+				t.Fatalf("answered = %v, want %v", got, tt.wantAnswer)
+			}
+		})
 	}
 }
 
