@@ -88,6 +88,13 @@ type ServerConfig struct {
 	// Random supplies nonce randomness; crypto/rand.Reader when nil. It must be
 	// safe for concurrent use.
 	Random io.Reader
+	// AKAServerData appends an issue time and an HMAC tag to AKA nonces as
+	// RFC 3310 §3.2 server data, so that Verify can reject a forged or expired
+	// AKA nonce without the vector store. Off by default: many deployed UE
+	// stacks accept only the bare base64(RAND ‖ AUTN). Every instance serving
+	// the realm must use the same setting, because each accepts only the form
+	// it issues.
+	AKAServerData bool
 }
 
 // Server issues Digest challenges for one realm and verifies the answers. It
@@ -100,6 +107,8 @@ type Server struct {
 	counts   NonceCountStore
 	now      func() time.Time
 	random   io.Reader
+
+	akaServerData bool
 }
 
 // NewServer validates cfg and returns a Server.
@@ -121,6 +130,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		counts:   cfg.NonceCounts,
 		now:      cfg.Now,
 		random:   cfg.Random,
+
+		akaServerData: cfg.AKAServerData,
 	}
 	if s.lifetime == 0 {
 		s.lifetime = DefaultNonceLifetime
@@ -151,7 +162,9 @@ func (s *Server) Challenge(alg Algorithm, stale bool) (Challenge, error) {
 }
 
 // AKAChallenge returns an AKAv1-MD5 challenge for one vector's RAND and AUTN
-// (RFC 3310 §3.2, TS 24.229 §5.4.1.2.1).
+// (RFC 3310 §3.2, TS 24.229 §5.4.1.2.1). The nonce is base64(RAND ‖ AUTN)
+// unless ServerConfig.AKAServerData is set. The caller stores the vector under
+// the returned nonce.
 func (s *Server) AKAChallenge(rand, autn []byte, stale bool) (Challenge, error) {
 	if len(rand) != randSize || len(autn) != autnSize {
 		return Challenge{}, errors.New("digest: RAND and AUTN must be 16 bytes each")
@@ -174,9 +187,13 @@ func (s *Server) challenge(alg Algorithm, nonce string, stale bool) Challenge {
 // SIP method, or the HTTP method for ft-server). nil means the client is
 // authenticated and the nonce-count has been consumed.
 //
-// For AKAv1-MD5, secret is Password(XRES) of the vector issued with the nonce.
-// Credentials carrying auts are checked against the empty password and
-// reported as a *SyncFailure (RFC 3310 §3.4).
+// For AKAv1-MD5, secret is Password(XRES) of the vector the caller stored
+// under c.Nonce. With the default nonce form Verify cannot tell whether that
+// vector is still current, so the caller must treat a nonce with no stored,
+// unexpired vector as invalid (or stale, by its policy) and not call Verify;
+// ErrStaleNonce then only arises with ServerConfig.AKAServerData. Credentials
+// carrying auts are checked against the empty password and reported as a
+// *SyncFailure (RFC 3310 §3.4).
 //
 // Verify does not compare c.URI with the request: in SIP the two may
 // legitimately differ after forwarding, and whether to accept that is local
@@ -237,10 +254,14 @@ func (s *Server) verify(ctx context.Context, method string, c Credentials, secre
 		rand, _, _ := ParseAKANonce(c.Nonce)
 		return &SyncFailure{RAND: rand, AUTS: [14]byte(c.AUTS)}
 	}
-	if s.now().Sub(issued) > s.lifetime {
-		return ErrStaleNonce
+	expires := s.now().Add(s.lifetime) // default AKA nonce: no issue time, keep the count a lifetime
+	if !issued.IsZero() {
+		if s.now().Sub(issued) > s.lifetime {
+			return ErrStaleNonce
+		}
+		expires = issued.Add(s.lifetime)
 	}
-	fresh, err := s.counts.Advance(ctx, c.Nonce, c.NC, issued.Add(s.lifetime))
+	fresh, err := s.counts.Advance(ctx, c.Nonce, c.NC, expires)
 	if err != nil {
 		return fmt.Errorf("digest: recording the nonce count: %w", err)
 	}

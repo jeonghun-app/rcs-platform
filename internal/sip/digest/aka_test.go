@@ -1,10 +1,13 @@
 package digest
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 )
@@ -95,19 +98,124 @@ func TestAKARoundTripWithTestSet1Authenticates(t *testing.T) {
 	}
 }
 
-func TestAKANonceCarriesRANDAndAUTNFirst(t *testing.T) {
+func TestDefaultAKANonceIsExactlyBase64OfRANDAndAUTN(t *testing.T) {
 	h := newHarness(t)
 	_, v := set1(t)
 	ch, err := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	want := base64.StdEncoding.EncodeToString(append(v.RAND[:], v.AUTN[:]...))
+	if ch.Nonce != want {
+		t.Fatalf("nonce = %s, want base64(RAND ‖ AUTN) = %s", ch.Nonce, want)
+	}
 	rand, autn, err := ParseAKANonce(ch.Nonce)
+	if err != nil || rand != v.RAND || autn != v.AUTN {
+		t.Fatalf("ParseAKANonce = %x %x %v", rand, autn, err)
+	}
+}
+
+func TestDefaultAKANonceLeavesExpiryToTheVectorStore(t *testing.T) {
+	// The nonce has no issue time; scscf's auth-challenges entry expires
+	// instead (ADR 0005), so Verify itself never reports it stale.
+	h := newHarness(t)
+	m, v := set1(t)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c := card(t, m, ch, set1Seen(t))
+	h.clock.advance(2 * DefaultNonceLifetime)
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestDefaultAKANonceCountIsStillReplayProtected(t *testing.T) {
+	h := newHarness(t)
+	rec := &recordingCounts{}
+	m, v := set1(t)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c := card(t, m, ch, set1Seen(t))
+
+	h.server.counts = rec
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.expires.Equal(h.clock.now().Add(DefaultNonceLifetime)) {
+		t.Fatalf("count kept until %v, want one lifetime from now", rec.expires)
+	}
+
+	h.server.counts = h.counts
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrReplayed) {
+		t.Fatalf("replayed AKA credentials: err = %v, want ErrReplayed", err)
+	}
+}
+
+func TestAKAServerDataIsOptIn(t *testing.T) {
+	s, err := NewServer(ServerConfig{Realm: testRealm, NonceKey: testKey, NonceCounts: NewMemoryNonceCounts(nil)})
+	if err != nil || s.akaServerData {
+		t.Fatalf("server data on by default (err %v)", err)
+	}
+	s, err = NewServer(ServerConfig{Realm: testRealm, NonceKey: testKey, NonceCounts: NewMemoryNonceCounts(nil), AKAServerData: true})
+	if err != nil || !s.akaServerData {
+		t.Fatalf("AKAServerData not applied (err %v)", err)
+	}
+}
+
+func TestAKANonceWithServerDataRoundTripsAndExpires(t *testing.T) {
+	h := newHarness(t)
+	h.server.akaServerData = true
+	m, v := set1(t)
+	ch, err := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rand != v.RAND || autn != v.AUTN {
-		t.Fatalf("nonce holds RAND %x AUTN %x", rand, autn)
+	raw, err := base64.StdEncoding.DecodeString(ch.Nonce)
+	if err != nil || len(raw) != akaTaggedLen || !bytes.Equal(raw[:32], append(v.RAND[:], v.AUTN[:]...)) {
+		t.Fatalf("nonce %x does not start with RAND ‖ AUTN followed by server data", raw)
+	}
+	c := card(t, m, ch, set1Seen(t))
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	ch, _ = h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	c = card(t, m, ch, set1Seen(t))
+	h.clock.advance(DefaultNonceLifetime + time.Second)
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrStaleNonce) {
+		t.Fatalf("expired nonce with server data: err = %v, want ErrStaleNonce", err)
+	}
+}
+
+func TestAKANonceOfTheFormNotConfiguredIsInvalid(t *testing.T) {
+	plain, tagged := newHarness(t), newHarness(t)
+	tagged.server.akaServerData = true
+	m, v := set1(t)
+	for name, pair := range map[string][2]*harness{
+		"server data sent to a plain server":  {tagged, plain},
+		"plain nonce sent to a tagged server": {plain, tagged},
+	} {
+		t.Run(name, func(t *testing.T) {
+			issuer, verifier := pair[0], pair[1]
+			ch, _ := issuer.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+			c := card(t, m, ch, set1Seen(t))
+			if err := verifier.server.Verify(context.Background(), "REGISTER", c, Password(v.XRES[:])); !errors.Is(err, ErrInvalidNonce) {
+				t.Fatalf("err = %v, want ErrInvalidNonce", err)
+			}
+		})
+	}
+}
+
+func TestDefaultAKANonceOfTheWrongLengthIsInvalid(t *testing.T) {
+	h := newHarness(t)
+	for _, n := range []int{31, 33, akaTaggedLen} {
+		nonce := base64.StdEncoding.EncodeToString(make([]byte, n))
+		ch := Challenge{Realm: testRealm, Nonce: nonce, Opaque: h.server.opaqueFor(nonce), Algorithm: AKAv1MD5, QOP: []string{"auth"}}
+		c := answer(t, ch, "res", 1)
+		if err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte("res"))); !errors.Is(err, ErrInvalidNonce) {
+			t.Errorf("%d-byte nonce: err = %v, want ErrInvalidNonce", n, err)
+		}
 	}
 }
 
@@ -192,10 +300,10 @@ func TestDigestAlgorithmOnAnAKANonceIsInvalid(t *testing.T) {
 	}
 }
 
-func TestTamperedAKANonceIsInvalid(t *testing.T) {
-	h := newHarness(t)
-	m, v := set1(t)
-	// A RAND swapped into an otherwise genuine nonce must not verify.
+// forgeRAND swaps another RAND into a genuine AKA nonce and answers it with the
+// RES for that RAND, as an attacker replaying a captured AUTN would.
+func forgeRAND(t *testing.T, h *harness, m milenage.Milenage, v milenage.Vector, fixOpaque bool) (Credentials, []byte) {
+	t.Helper()
 	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
 	otherRAND := v.RAND
 	otherRAND[0] ^= 0xff
@@ -203,13 +311,33 @@ func TestTamperedAKANonceIsInvalid(t *testing.T) {
 	raw := []byte(ch.Nonce)
 	copy(raw[:20], forged.Nonce[:20])
 	ch.Nonce = string(raw)
-	ch.Opaque = h.server.opaqueFor(ch.Nonce)
+	if fixOpaque {
+		// Only a holder of the nonce key could do this.
+		ch.Opaque = h.server.opaqueFor(ch.Nonce)
+	}
 	res := m.F2(otherRAND)
 	c, err := Respond(ch, ClientParams{Username: testUser, Password: res[:], Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(res[:])); !errors.Is(err, ErrInvalidNonce) {
+	return c, res[:]
+}
+
+func TestTamperedAKANonceIsInvalid(t *testing.T) {
+	h := newHarness(t)
+	m, v := set1(t)
+	c, res := forgeRAND(t, h, m, v, false)
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(res)); !errors.Is(err, ErrInvalidNonce) {
+		t.Fatalf("err = %v, want ErrInvalidNonce", err)
+	}
+}
+
+func TestTamperedAKANonceWithServerDataIsInvalidEvenWithAMatchingOpaque(t *testing.T) {
+	h := newHarness(t)
+	h.server.akaServerData = true
+	m, v := set1(t)
+	c, res := forgeRAND(t, h, m, v, true)
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password(res)); !errors.Is(err, ErrInvalidNonce) {
 		t.Fatalf("err = %v, want ErrInvalidNonce", err)
 	}
 }
