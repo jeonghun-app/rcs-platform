@@ -196,7 +196,7 @@ func TestMalformedContactParametersFailOnlyTheirAccessor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		// The other contact and the rest of this one stay readable, so a registrar
-		// can apply its default (RFC 3261 §10.2.1).
+		// can apply its default (RFC 3261 §10.2).
 		cs, err := ParseContacts("<sip:a@example.com>;" + tt.param + ", <sip:b@example.com>")
 		if err != nil || len(cs) != 2 || cs[0].URI.User != "a" {
 			t.Fatalf("%s: ParseContacts = %#v, %v", tt.param, cs, err)

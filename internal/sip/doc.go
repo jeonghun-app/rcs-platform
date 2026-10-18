@@ -19,8 +19,17 @@
 // until it is replaced, so a forwarded message differs from the received one only
 // where a service changed it. Content-Length is always recomputed from the body.
 //
-// Malformed input is rejected, never repaired, and every size limit has its own
-// error (docs/architecture.md §8). Errors never contain message bytes: header values
-// carry subscriber identities and an error is likely to be logged. For the same
-// reason messages have no String method.
+// Following docs/architecture.md §8, input that is ambiguous or a security risk is
+// rejected, never repaired: control characters and invalid UTF-8 in a header
+// value, any line end but CRLF, and anything over a limit, each limit with its
+// own error. §8 allows a receiver to accept a bare LF where interoperability
+// needs it; this package does not, because RFC 3261 §7 requires CRLF and §28.1
+// records that LF line ends were dropped on purpose, and no client is known to
+// need them. What is sent is held to the same rules: Header.Add refuses a value
+// that breaks them.
+//
+// Errors never contain message bytes: header values carry subscriber identities
+// and an error is likely to be logged. For the same reason messages have no
+// String method, and the value types implement slog.LogValuer with identities
+// and credentials left out.
 package sip

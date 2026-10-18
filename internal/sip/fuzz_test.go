@@ -19,6 +19,10 @@ var fuzzMessageSeeds = []string{
 	lines("SIP/2.0 401 Unauthorized", "WWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=\"auth\", algorithm=AKAv1-MD5", "Content-Length: 0"),
 	"\r\n\r\n" + lines("OPTIONS sip:a@example.com SIP/2.0", "Content-Length: 1") + "x",
 	lines("OPTIONS sip:a@example.com SIP/2.0", "X: \"q\\\"\"", "Y: <a,b>, c"),
+	// Control characters: refused raw, allowed as quoted-pairs.
+	lines("OPTIONS sip:a@example.com SIP/2.0", "X: a\x00b\x1b[31m", "l: 0"),
+	lines("OPTIONS sip:a@example.com SIP/2.0", "To: \"\\\x00\\\x7f\" <sip:b@example.com>", "l: 0"),
+	lines("SIP/2.0 200 \xff", "l: 0"),
 }
 
 // equalMessages compares two parsed messages field by field, ignoring
