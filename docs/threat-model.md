@@ -35,8 +35,28 @@ separate from its core listener; core SIP ports admit only platform services
 MSRP session ids act as capabilities (ADR 0004). A task that reaches the `rcs-as`
 MSRP port and learns a session id could read or inject chat content.
 **Control:** only `msrp-relay` reaches that port; session ids carry ≥128 random
-bits and never appear in logs or errors.
-**Status:** planned (`internal/msrp` in #28, relay and security groups later).
+bits and never appear in logs or errors. On the client side of the relay
+([msrp-relay](msrp-relay.md)):
+- a session id not in the issued form (32 lower-case base32 characters, 160
+  bits) gets 481 without a store lookup;
+- bindings are keyed by the SHA-256 of the client-side session id, which is
+  never stored or logged, so a copy of the table does not let anyone connect as
+  the client;
+- one client connection claims a binding with a conditional write, on whichever
+  task it reaches; a second connection gets 403 and is logged (ADR 0004);
+- lookups that find nothing are rate-limited per source address (IPv6 /64) and
+  survive reconnects (`RELAY_FAILED_LOOKUPS_PER_SOURCE`), and unknown sessions
+  per connection are capped (`RELAY_MAX_UNKNOWN_SESSIONS`);
+- the relay connects only to hosts in `RELAY_CORE_NETWORKS` (private ranges)
+  or the Cloud Map namespace, on ports in `RELAY_CORE_PORTS`, and checks the
+  resolved address again before dialling.
+
+The table still holds `rcs-as`'s core-side session id in `core_path`, so read
+access to it must stay with the relay task role.
+**Status:** implemented in `internal/msrp` (session ids, no ids in logs) and
+`msrp-relay` (the controls above). Security groups that keep everything but
+`msrp-relay` off the `rcs-as` MSRP port, and the IAM policy test for the
+table, are planned (#56, Phase 7 infrastructure).
 
 ## T4 — Compromise of an internet-facing service
 
@@ -52,8 +72,16 @@ compromised, its reach is what its security group and tokens allow:
 
 **Control:** ADR 0007 §2–§4; parsers are fuzzed, bounded and linear
 (architecture §8).
-**Status:** parser rules implemented for merged libraries; reach limits planned
-(Phase 7 infrastructure, #12 token scopes). `acs` can re-issue credentials of
+**Status:** parser rules implemented for merged libraries. Per service:
+
+| Service | Implemented in the service | Planned |
+|---|---|---|
+| `pcscf` | nothing yet: the service is not built | the service (#16), security groups (#56) |
+| `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
+| `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
+| `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |
+
+`acs` can re-issue credentials of
 every `acs_managed` subscription; the audit log and rate limit bound and reveal
 that, they do not prevent it.
 

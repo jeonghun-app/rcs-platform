@@ -11,6 +11,20 @@ I-CSCF, S-CSCF, HSS), RCS 메시징 애플리케이션 서버, MSRP 릴레이, H
 > **상태: 개발 중.** [로드맵](#로드맵) 순서대로 서비스를 만들고 있으며, 아직 운영 환경에 쓸 수
 > 있는 단계가 아닙니다.
 
+## 현황
+
+`main`에 구현되어 머지된 것(자세한 내용은 [CHANGELOG.md](CHANGELOG.md)):
+
+- **라이브러리**: 서비스 런타임, 식별자 마스킹, SIP 메시지, SIP/HTTP Digest와 AKA,
+  Milenage, SDP, Diameter 기본 프로토콜, Cx와 Sh, iFC, MSRP, CPIM, IMDN,
+  conference-info, PROXY protocol v2.
+- **서비스**: `ft-server`([문서](docs/ft-server.md))와 `msrp-relay`
+  ([문서](docs/msrp-relay.md)). 둘 다 단독으로 실행되며, 아직 호출하는 서비스는 없습니다.
+- **결정 기록**: ADR 0001–0007과 [위협 모델](docs/threat-model.md).
+
+아직 만들지 않은 것: SIP 전송 계층과 트랜잭션, `hss`, `pcscf`, `icscf`, `scscf`,
+`rcs-as`, 클라이언트 시뮬레이터, 로컬 스택, AWS 인프라. 아직 릴리스는 없습니다.
+
 ## 서비스
 
 | 서비스 | 역할 |
