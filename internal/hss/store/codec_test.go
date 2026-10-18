@@ -116,3 +116,17 @@ func TestRegistrationStatesHaveTheirSpecNames(t *testing.T) {
 		t.Error("Served is wrong")
 	}
 }
+
+// A stored profile's criteria were compiled when they were written; reading
+// it compiles nothing, which this shows with criteria that would not compile.
+func TestReadingAProfileDoesNotRecompileItsCriteria(t *testing.T) {
+	doc := `{"schema":1,"id":"p","criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,` +
+		`"spt":[{"group":[0],"request_uri":"\\d+"}]},"application_server":{"server_name":"sip:as","default_handling":"SESSION_CONTINUED"}}]}`
+	p, err := store.DecodeProfile([]byte(doc), 1)
+	if err != nil {
+		t.Fatalf("DecodeProfile = %v", err)
+	}
+	if _, err := store.EncodeProfile(p); !errors.Is(err, store.ErrInvalid) {
+		t.Errorf("EncodeProfile = %v; writing must still compile", err)
+	}
+}

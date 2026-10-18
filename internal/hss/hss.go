@@ -117,6 +117,13 @@ func (h *HSS) lock(impi string) func() {
 // from the subscription it is given only. When fn returns errUnchanged
 // nothing is written and the subscription as read is returned.
 func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscription) error) (*store.Subscription, error) {
+	return h.updateFrom(ctx, impi, nil, fn)
+}
+
+// updateFrom is update with read, the subscription the caller has just read,
+// as the first attempt's starting point, which saves a read on the Cx path.
+// If read is stale the conditional write fails and the next attempt reads.
+func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
 	defer h.lock(impi)()
 	for attempt := 0; attempt < maxUpdateAttempts; attempt++ {
 		if attempt > 0 {
@@ -129,9 +136,13 @@ func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscrip
 				return nil, ctx.Err()
 			}
 		}
-		cur, err := h.store.Subscription(ctx, impi)
-		if err != nil {
-			return nil, err
+		cur := read
+		read = nil
+		if cur == nil {
+			var err error
+			if cur, err = h.store.Subscription(ctx, impi); err != nil {
+				return nil, err
+			}
 		}
 		next := clone(cur)
 		if err := fn(next); err != nil {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store/storetest"
+	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 )
 
 // FuzzDecodeSubscription reads arbitrary stored documents: nothing may
@@ -52,6 +53,11 @@ func FuzzDecodeProfile(f *testing.F) {
 		}
 		again, err := store.EncodeProfile(got)
 		if err != nil {
+			// Decoding checks structure only; writing also compiles, which
+			// a document that was never written by EncodeProfile may fail.
+			if _, cerr := ifc.Compile(got.Criteria); cerr != nil {
+				return
+			}
 			t.Fatalf("decoded profile does not encode: %v", err)
 		}
 		if _, err := store.DecodeProfile(again, 1); err != nil {

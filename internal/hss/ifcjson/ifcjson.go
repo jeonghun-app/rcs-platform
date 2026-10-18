@@ -185,6 +185,23 @@ func fromSPT(spt ifc.SPT) SPT {
 // ifc.Compile, so that what it returns is what an S-CSCF can evaluate.
 // Errors wrap ErrInvalid.
 func ToIFC(criteria []Criterion) ([]ifc.FilterCriteria, error) {
+	out, err := Convert(criteria)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ifc.Compile(out); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalid, err)
+	}
+	return out, nil
+}
+
+// Convert converts criteria from their JSON form, checking only their
+// structure (names, one condition per trigger, the counts), not their
+// patterns. It is for criteria ToIFC accepted when they were written, such
+// as a stored profile: compiling them again on every read would cost the
+// HSS milliseconds per SAR for nothing, since it never evaluates them.
+// Errors wrap ErrInvalid.
+func Convert(criteria []Criterion) ([]ifc.FilterCriteria, error) {
 	if len(criteria) > MaxCriteria {
 		return nil, fmt.Errorf("%w: more than %d criteria", ErrInvalid, MaxCriteria)
 	}
@@ -195,9 +212,6 @@ func ToIFC(criteria []Criterion) ([]ifc.FilterCriteria, error) {
 			return nil, fmt.Errorf("%w: criterion %d: %s", ErrInvalid, i, err)
 		}
 		out = append(out, fc)
-	}
-	if _, err := ifc.Compile(out); err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrInvalid, err)
 	}
 	return out, nil
 }

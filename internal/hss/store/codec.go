@@ -130,14 +130,15 @@ func EncodeProfile(p *ServiceProfile) ([]byte, error) {
 	})
 }
 
-// DecodeProfile reads a stored profile. Its criteria are checked with
-// ifc.Compile, as when they were written.
+// DecodeProfile reads a stored profile. Its criteria were compiled when they
+// were written (EncodeProfile), so only their structure is checked here: a
+// SAR reads the profile, and the HSS only serialises the criteria.
 func DecodeProfile(data []byte, version int64) (*ServiceProfile, error) {
 	var r profileRecord
 	if err := unmarshalRecord(data, &r, &r.Schema); err != nil {
 		return nil, err
 	}
-	criteria, err := ifcjson.ToIFC(r.Criteria)
+	criteria, err := ifcjson.Convert(r.Criteria)
 	if err != nil {
 		return nil, fmt.Errorf("%w: criteria: %s", ErrInvalid, err)
 	}
@@ -145,7 +146,7 @@ func DecodeProfile(data []byte, version int64) (*ServiceProfile, error) {
 		ID: r.ID, Criteria: criteria, MandatoryCapabilities: r.Mandatory,
 		OptionalCapabilities: r.Optional, Version: version,
 	}
-	if err := ValidateProfile(p); err != nil {
+	if err := checkProfile(p); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -230,9 +231,19 @@ func ValidateSubscription(s *Subscription) error {
 	return nil
 }
 
-// ValidateProfile checks the structural rules every stored profile keeps.
-// Its criteria must compile (ifc.Compile).
+// ValidateProfile checks the structural rules every stored profile keeps,
+// and that its criteria compile (ifc.Compile).
 func ValidateProfile(p *ServiceProfile) error {
+	if err := checkProfile(p); err != nil {
+		return err
+	}
+	if _, err := ifc.Compile(p.Criteria); err != nil {
+		return fmt.Errorf("%w: criteria: %s", ErrInvalid, err)
+	}
+	return nil
+}
+
+func checkProfile(p *ServiceProfile) error {
 	switch {
 	case p.ID == "" || len(p.ID) > MaxProfileIDLength:
 		return fmt.Errorf("%w: profile ID is empty or too long", ErrInvalid)
@@ -240,9 +251,6 @@ func ValidateProfile(p *ServiceProfile) error {
 		return fmt.Errorf("%w: more than %d capabilities", ErrInvalid, MaxCapabilities)
 	case len(p.Criteria) > ifcjson.MaxCriteria:
 		return fmt.Errorf("%w: more than %d criteria", ErrInvalid, ifcjson.MaxCriteria)
-	}
-	if _, err := ifc.Compile(p.Criteria); err != nil {
-		return fmt.Errorf("%w: criteria: %s", ErrInvalid, err)
 	}
 	return nil
 }

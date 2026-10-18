@@ -262,16 +262,27 @@ func (a *API) fanout(id string) {
 		}
 		a.mu.Unlock()
 		a.h.metrics.Count("push.fanout.subscriptions", int64(n))
-		if err != nil && ctx.Err() == nil {
-			a.h.log.Warn("profile push stopped early", slog.String("profile", id), slog.String("error", pii.Redact(err.Error())))
+		switch {
+		case err != nil && ctx.Err() == nil:
+			a.h.log.Warn("profile push stopped early", slog.String("profile", pii.Redact(id)),
+				slog.Int("notified", n), slog.String("error", pii.Redact(err.Error())))
+		case a.closing.Err() != nil:
+			// Some subscribers have the old profile until they register
+			// again; the operator may want to apply the change once more.
+			a.h.log.Info("profile push cut short by shutdown", slog.String("profile", pii.Redact(id)), slog.Int("notified", n))
 		}
 	}()
 }
 
 // pushProfile walks the subscriptions of a profile page by page and sends
-// their PPRs with a bounded number of workers. It returns how many
-// subscriptions it notified.
+// their PPRs with a bounded number of workers. It reads the profile once: a
+// later change of it cancels this fan-out and starts another. It returns how
+// many subscriptions it notified.
 func (a *API) pushProfile(ctx context.Context, id string) (int, error) {
+	p, err := a.h.store.Profile(ctx, id)
+	if err != nil {
+		return 0, err
+	}
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -281,7 +292,7 @@ func (a *API) pushProfile(ctx context.Context, id string) (int, error) {
 		go func() {
 			defer wg.Done()
 			for impi := range jobs {
-				if a.pushOne(ctx, impi, id) {
+				if a.pushOne(ctx, impi, p) {
 					mu.Lock()
 					count++
 					mu.Unlock()
@@ -289,7 +300,7 @@ func (a *API) pushProfile(ctx context.Context, id string) (int, error) {
 			}
 		}()
 	}
-	err := func() error {
+	err = func() error {
 		defer close(jobs)
 		cursor := ""
 		for {
@@ -314,20 +325,16 @@ func (a *API) pushProfile(ctx context.Context, id string) (int, error) {
 	return count, err
 }
 
-// pushOne sends the PPRs of one subscription, reading it and the profile
-// afresh: the listing is eventually consistent, and the subscription may
-// have moved to another profile since.
-func (a *API) pushOne(ctx context.Context, impi, id string) bool {
+// pushOne sends the PPRs of one subscription, reading it afresh: the listing
+// is eventually consistent, and the subscription may have moved to another
+// profile since.
+func (a *API) pushOne(ctx context.Context, impi string, p *store.ServiceProfile) bool {
 	s, err := a.h.store.Subscription(ctx, impi)
-	if err != nil || s.Profile != id {
+	if err != nil || s.Profile != p.ID {
 		return false
 	}
 	pushes := profilePushes(s)
 	if len(pushes) == 0 {
-		return false
-	}
-	p, err := a.h.store.Profile(ctx, id)
-	if err != nil {
 		return false
 	}
 	pctx, cancel := context.WithTimeout(ctx, a.pushTimeout)

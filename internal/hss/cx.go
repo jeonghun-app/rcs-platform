@@ -293,7 +293,7 @@ func (c *CxServer) applySAR(ctx context.Context, r *cx.SAR, a *cx.SAA) error {
 	keep := hasUnregisteredServices(p)
 	var out sarOutcome
 	var data []byte
-	saved, err := c.h.update(ctx, s.IMPI, func(cur *store.Subscription) error {
+	saved, err := c.h.updateFrom(ctx, s.IMPI, s, func(cur *store.Subscription) error {
 		for _, impu := range impus {
 			if cur.Identity(impu) == nil {
 				return experimental(cx.ErrorUserUnknown) // removed meanwhile
@@ -383,7 +383,7 @@ func (c *CxServer) authenticate(ctx context.Context, r *cx.MAR) ([]cx.AuthDataIt
 	var first milenage.SQN
 	var m milenage.Milenage
 	var amf [milenage.AMFSize]byte
-	saved, err := c.h.update(ctx, s.IMPI, func(cur *store.Subscription) error {
+	saved, err := c.h.updateFrom(ctx, s.IMPI, s, func(cur *store.Subscription) error {
 		if cur.Identity(impu) == nil {
 			return experimental(cx.ErrorUserUnknown) // removed meanwhile
 		}
