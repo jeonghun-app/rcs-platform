@@ -90,7 +90,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 	if len(c.CoreNetworks) != len(privateRanges) || len(c.Tokens) != 1 {
 		t.Fatalf("networks %v, %d tokens", c.CoreNetworks, len(c.Tokens))
 	}
-	if len(c.CorePorts) != 1 || c.CorePorts[0] != 2855 || c.FailedLookupsPerSource != DefaultFailedLookupsPerSource {
+	if len(c.CorePorts) != 1 || c.CorePorts[0] != 2855 || c.FailedLookupsPerSource != DefaultFailedLookupsPerSource || c.UserTimeout != time.Minute {
 		t.Fatalf("core ports %v, failed lookups %d", c.CorePorts, c.FailedLookupsPerSource)
 	}
 }
@@ -151,6 +151,7 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		{[]string{"RELAY_PCSCF_TOKEN_NEXT", testToken}, "RELAY_PCSCF_TOKEN_NEXT: equal to RELAY_PCSCF_TOKEN"},
 		{[]string{"RELAY_PCSCF_TOKEN", testToken + " x"}, "RELAY_PCSCF_TOKEN: not a bearer token"},
 		{[]string{"RELAY_STORE_TIMEOUT", "0s"}, "RELAY_STORE_TIMEOUT: must be greater than zero"},
+		{[]string{"RELAY_TCP_USER_TIMEOUT", "0s"}, "RELAY_TCP_USER_TIMEOUT: must be greater than zero"},
 		{[]string{"RELAY_MAX_EXPIRES_IN", "1500ms"}, "RELAY_MAX_EXPIRES_IN: must be whole seconds"},
 		{[]string{"RELAY_KEEPALIVE_INTERVAL", "300s"}, "RELAY_KEEPALIVE_INTERVAL: must be shorter than RELAY_IDLE_TIMEOUT"},
 		{[]string{"RELAY_DRAIN_TIMEOUT", "18s"}, "RELAY_DRAIN_TIMEOUT: plus 3s must not exceed RCS_SHUTDOWN_TIMEOUT (20s by default)"},

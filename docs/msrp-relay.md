@@ -163,9 +163,23 @@ succeeds. The task role needs
   (`RELAY_IDLE_TIMEOUT`) is closed. Both directions count, as they do for
   the NLB's own timer: `rcs-as` may send with `Failure-Report: no` or
   `partial`, which the client does not answer (RFC 4975 §7.1.2), so a client
-  that only receives sends nothing at all. A dead client is still caught by
-  the write timeout and the unanswered keep-alive. Both timeouts stay inside
-  the NLB TLS listener's fixed 350 s (ADR 0003).
+  that only receives sends nothing at all. Both timeouts stay inside the NLB
+  TLS listener's fixed 350 s (ADR 0003).
+- **A client that vanishes.** A client gone without a FIN or RST is caught
+  by the unanswered keep-alive when its session is quiet, and by the write
+  timeout once the send buffer fills. Neither applies to a session that
+  rcs-as keeps feeding small chunks nobody answers. For that case client
+  sockets carry `TCP_USER_TIMEOUT` (`RELAY_TCP_USER_TIMEOUT`, 60 s; the user
+  timeout of RFC 5482 §1): data unacknowledged that long ends the
+  connection, instead of the kernel's retransmissions running out after
+  about 15 minutes. It sends no packets of its own, so it does not conflict
+  with kernel keep-alive being off. The limit applies to the relay's TCP
+  peer. Behind an NLB TCP listener that is the client. Behind the TLS
+  listener it is the NLB, which acknowledges data itself, so there the
+  vanished client is noticed when the NLB gives up on its client side and
+  closes toward the relay. Messages sent with `Failure-Report: no` or
+  `partial` in that window are lost without a report, which those modes
+  accept (RFC 4975 §7.1.2).
 - **Connections without a session.** A new connection must name a session
   within 30 s (the active side sends its first SEND at once, RFC 4975 §5.4),
   or it is closed (`ClientsClosedUnbound`). A connection whose last bridge
@@ -208,6 +222,7 @@ start with that value.
 | `RELAY_CORE_CONNECT_TIMEOUT` | `5s` | connecting to `rcs-as` and its 200 to the binding SEND |
 | `RELAY_KEEPALIVE_INTERVAL` | `240s` | MSRP keep-alive; must be shorter than the idle timeout |
 | `RELAY_IDLE_TIMEOUT` | `300s` | close a client connection silent this long |
+| `RELAY_TCP_USER_TIMEOUT` | `60s` | `TCP_USER_TIMEOUT` on client sockets: give up on data unacknowledged this long |
 | `RELAY_DRAIN_TIMEOUT` | `15s` | how long bridges are kept after SIGTERM; plus 3 s (control API shutdown and the last flush) it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 | `RELAY_METRICS_INTERVAL` | `1m` | how often counters are written |
 
@@ -303,9 +318,17 @@ Choices worth knowing:
   connection, but a client resets that by reconnecting, and the connection
   caps limit concurrency, not rate. So each source (IPv4 address or IPv6
   /64) also has a token bucket of `RELAY_FAILED_LOOKUPS_PER_SOURCE` a minute
-  that survives reconnects. Only lookups that find nothing spend from it, so
-  clients naming sessions `pcscf` handed out are not affected, even many of
-  them behind one carrier-grade NAT address. Session ids not in the issued
+  that survives reconnects. Only lookups that find nothing keep their token,
+  so clients naming sessions `pcscf` handed out do not use the budget up,
+  even many of them behind one carrier-grade NAT address. A lookup still
+  needs a token to start, though: once one client behind a shared address
+  has emptied the bucket, every new bind from that address is refused
+  (`Refused.SourceLookupBudget`) until it refills, at one token every half
+  second by default. This is the same trade-off as the per-source
+  connection cap, and the harm stays with that one address. Refusals
+  concentrated on one address point to a shared CGNAT address with one
+  misbehaving client, and `RELAY_FAILED_LOOKUPS_PER_SOURCE` can be raised
+  (runbook, #54). Session ids not in the issued
   form never reach the store. The worst case per task is then the number of
   sources times the per-source rate. The table remembers at most 65,536
   sources short of tokens; beyond that, lookups are let through uncounted

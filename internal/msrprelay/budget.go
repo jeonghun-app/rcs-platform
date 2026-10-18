@@ -9,9 +9,14 @@ import (
 )
 
 // maxBudgetSources bounds how many sources the lookup budget remembers. A
-// source is remembered only while its bucket is short of full, which takes
-// a minute to refill, so the table holds the sources that failed lookups in
-// the last minute. At about 100 bytes each this is a few MiB at most.
+// source is remembered only while its bucket is short of full: a whole
+// minute after it was emptied, but one token's worth (half a second at the
+// default 120 a minute) after a single failed lookup. So to keep the table
+// full, each of 65,536 sources has to fail a lookup about every half
+// second, which is a distributed attack in its own right, and one a
+// per-source budget does not hold back anyway; that is why a full table
+// lets lookups through uncounted rather than refusing them. At about 100
+// bytes a source the table is a few MiB at most.
 const maxBudgetSources = 1 << 16
 
 // lookupBudget is a token bucket per source (sourceKey) for lookups that

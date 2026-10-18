@@ -57,6 +57,9 @@ type relayOptions struct {
 	// left with none stays for IdleTimeout instead, so the client can reuse
 	// it (RFC 4975 §5.4) for its next session.
 	FirstBindTimeout time.Duration
+	// UserTimeout is TCP_USER_TIMEOUT on client sockets (setUserTimeout);
+	// zero leaves the kernel default.
+	UserTimeout time.Duration
 
 	// Edge configures client connections and Core the connections toward
 	// rcs-as; Clock, Rand and OnEvent are filled in by newRelay.
@@ -260,6 +263,9 @@ func (r *Relay) handle(nc net.Conn) {
 	defer r.handled.Done()
 	defer r.leave(nc)
 	defer nc.Close()
+	if err := setUserTimeout(nc, r.o.UserTimeout); err != nil {
+		r.o.Log.Debug("TCP_USER_TIMEOUT not set", slog.String("error", pii.Redact(err.Error())))
+	}
 	src, ok := r.source(nc)
 	if !ok {
 		return

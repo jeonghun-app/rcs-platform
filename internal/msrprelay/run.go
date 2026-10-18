@@ -85,6 +85,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		PathWait:                cfg.PathWait,
 		CoreConnectTimeout:      cfg.CoreConnectTimeout,
 		IdleTimeout:             cfg.IdleTimeout,
+		UserTimeout:             cfg.UserTimeout,
 		Edge:                    msrp.Config{KeepAliveInterval: cfg.KeepAlive, MaxFailedBinds: cfg.MaxUnknownSessions},
 		Core:                    msrp.Config{KeepAliveInterval: cfg.KeepAlive},
 		Dial:                    d.dial,

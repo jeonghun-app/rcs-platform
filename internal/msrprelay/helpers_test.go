@@ -298,13 +298,15 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 		}
 	}
 	r.control = newControl(controlOptions{
-		Store: r.store, StoreTimeout: time.Second, Public: public, CoreHost: coreHostAddr,
+		Store: r.store, StoreTimeout: 5 * time.Second, Public: public, CoreHost: coreHostAddr,
 		CoreNetworks: loopback, CorePorts: ports, MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken},
 		Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
 	})
 	for range tasks {
 		o := relayOptions{
-			Store: r.store, StoreTimeout: time.Second, Public: public,
+			// The store timeout is generous: a loaded host must not turn
+			// a slow DynamoDB Local answer into a refusal.
+			Store: r.store, StoreTimeout: 5 * time.Second, Public: public,
 			MaxConnections: 100, MaxConnectionsPerSource: 100, MaxConcurrentBinds: 8, FailedLookupsPerSource: 100,
 			PathWait: DefaultPathWait, CoreConnectTimeout: 5 * time.Second, IdleTimeout: time.Minute,
 			Dial: coreDialer(loopback, ports, 5*time.Second), Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,

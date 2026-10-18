@@ -59,7 +59,11 @@ const (
 	DefaultIdleTimeout = 300 * time.Second
 	// DefaultDrainTimeout is shorter than runtime.DefaultShutdownTimeout, which
 	// bounds the whole stop.
-	DefaultDrainTimeout    = 15 * time.Second
+	DefaultDrainTimeout = 15 * time.Second
+	// DefaultUserTimeout gives up on a client that has left data
+	// unacknowledged for a minute: one gone without a FIN, with traffic
+	// toward it that nobody answers (see setUserTimeout).
+	DefaultUserTimeout     = time.Minute
 	DefaultMetricsInterval = time.Minute
 )
 
@@ -131,6 +135,7 @@ type Config struct {
 	IdleTimeout             time.Duration
 	DrainTimeout            time.Duration
 	MetricsInterval         time.Duration
+	UserTimeout             time.Duration
 }
 
 // secret holds a token so that printing a Config cannot reveal it.
@@ -169,6 +174,7 @@ func Configure(s *runtime.Settings) Config {
 		IdleTimeout:             e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
 		DrainTimeout:            e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
 		MetricsInterval:         e.Duration("METRICS_INTERVAL", DefaultMetricsInterval),
+		UserTimeout:             e.Duration("TCP_USER_TIMEOUT", DefaultUserTimeout),
 	}
 	for _, a := range []struct{ name, v string }{{"LISTEN_ADDR", c.ListenAddr}, {"CONTROL_ADDR", c.ControlAddr}} {
 		if _, _, err := net.SplitHostPort(a.v); err != nil {
@@ -202,6 +208,7 @@ func Configure(s *runtime.Settings) Config {
 		{"STORE_TIMEOUT", c.StoreTimeout}, {"MAX_EXPIRES_IN", c.MaxExpiresIn}, {"PATH_WAIT", c.PathWait},
 		{"CORE_CONNECT_TIMEOUT", c.CoreConnectTimeout}, {"KEEPALIVE_INTERVAL", c.KeepAlive},
 		{"IDLE_TIMEOUT", c.IdleTimeout}, {"DRAIN_TIMEOUT", c.DrainTimeout}, {"METRICS_INTERVAL", c.MetricsInterval},
+		{"TCP_USER_TIMEOUT", c.UserTimeout},
 	} {
 		if d.v == 0 {
 			e.Invalid(d.name, "must be greater than zero")

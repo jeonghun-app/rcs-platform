@@ -73,6 +73,7 @@ a maintainer; behaviour built on it is listed as unverified in
 | 3986 | URI syntax: unreserved characters of the FT transaction id |
 | 6750 | Bearer token usage: `Authorization: Bearer` and the b64token syntax (internal HTTP APIs, `msrp-relay` control API) |
 | 6459 | IPv6 in 3GPP EPS: one /64 per bearer (`msrp-relay` per-source limits) |
+| 5482 | TCP user timeout (§1): how long sent data may stay unacknowledged (`msrp-relay` client sockets) |
 
 ## Other
 

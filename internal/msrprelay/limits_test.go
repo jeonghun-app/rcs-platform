@@ -329,14 +329,24 @@ func TestConnectionWhoseLastBridgeEndedStaysForTheIdleTimeout(t *testing.T) {
 }
 
 func TestConnectionThatNeverNamesASessionIsClosed(t *testing.T) {
+	// A raw socket, not an msrp.Conn: a test client's own unbound timer
+	// runs on the same fake clock and could close the connection first,
+	// which is not what is under test.
 	r := newRig(t, 1)
-	c := r.dial(0, nil)
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
 	eventually(t, "the connection to be admitted", func() bool { return r.metrics.conns.Load() == 1 })
 	r.clock.Advance(msrp.DefaultUnboundTimeout)
-	waitDone(t, c.conn.Done(), "the silent connection")
-	if r.metrics.count(mUnboundClosed) != 1 {
-		t.Fatalf("ClientsClosedUnbound = %d", r.metrics.count(mUnboundClosed))
+	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := nc.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read %v, want the relay to close the connection", err)
 	}
+	eventually(t, "the relay-side close to be counted", func() bool {
+		return r.metrics.count(mUnboundClosed) == 1 && r.metrics.conns.Load() == 0
+	})
 }
 
 func TestBindSlotsAreReturnedOnEveryRefusalPath(t *testing.T) {
