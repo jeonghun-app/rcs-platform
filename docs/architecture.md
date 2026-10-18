@@ -132,13 +132,14 @@ MSRP between a client on the internet and `rcs-as` inside the VPC goes through
 `msrp-relay`, which `pcscf` controls the way a P-CSCF controls an IMS access gateway
 (ADR 0004):
 
-- `pcscf` rewrites each SDP offer and answer that carries `m=message`: the client
-  side sees the relay's public `a=path` and `a=setup:passive`; the core side sees
-  the relay as `a=setup:active`.
+- `pcscf` rewrites each SDP offer and answer that carries `m=message` so that the
+  client sees the relay's public `a=path` and the core sees the relay's core
+  address. No offer carries `passive` (RFC 6135 §4.2.2); answers choose the
+  direction so that **clients connect to the relay and the relay connects to
+  `rcs-as`**. ADR 0004 has the full table.
 - So the relay never accepts connections from the core and never opens
-  connections to clients: **clients always connect to the relay, the relay always
-  connects to `rcs-as`**. This works behind any NAT and lets any relay instance
-  behind the NLB serve any session.
+  connections to clients, which works behind any NAT, needs no internet egress
+  and lets any relay instance behind the NLB serve any session.
 - `pcscf` allocates a binding through the relay control API. Bindings live in
   DynamoDB with a TTL, keyed by the session id in the relay's MSRP URI, so the task
   that receives the client connection does not need to be the task that allocated
@@ -183,8 +184,16 @@ uses DynamoDB Local and a local S3.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
   distroless image can run an ECS container health check.
-- **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, and
-  rejects rather than repairs malformed input. XML parsers never resolve entities.
+- **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
+  linear in its input (a test parses a maximum-size adversarial input), and never
+  repairs content it does not own: message bodies such as CPIM and MSRP payloads
+  are forwarded byte for byte, and only the headers and SDP lines a service is
+  responsible for (Via, Record-Route, the `m=message` lines `pcscf` anchors) are
+  rewritten. Receivers
+  may *interpret* common deviations leniently where interoperability needs it
+  (e.g. bare LF, extra whitespace) and count them; senders are strict. Anything
+  ambiguous, or a security risk (control characters, invalid UTF-8, mixed line
+  endings, limits), is rejected. XML parsers never resolve entities.
 - **Time and randomness** are injected so timers and nonces are testable.
 
 ## 9. Specifications
