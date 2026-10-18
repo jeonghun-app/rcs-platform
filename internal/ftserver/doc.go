@@ -23,15 +23,20 @@
 //
 // Uploads and info requests need HTTP Digest (SHA-256 preferred, MD5) against
 // a CredentialSource; downloads only with Options.DownloadAuth, because a
-// recipient's client commonly fetches the bare link. docs/ft-server.md has the
+// recipient's client commonly fetches the bare link. Every limit that turns a
+// request away (task and per-user slots, lookups, a held lease, a failing
+// credential backend) answers 503 with Retry-After, which RCS clients retry. docs/ft-server.md has the
 // settings, the table layout and what is unverified against RCC.07.
 //
 // # Consistency
 //
 // Any task may serve any request (ADR 0005). A request that writes content
 // first takes the record's lease with a conditional update, so one upload has
-// one writer at a time, and the update that marks it complete is conditional
-// on the version that writer holds, so it completes once.
+// one writer at a time; the lease is short and renewed while content flows,
+// so a dead task's lapses in minutes. The update that marks an upload
+// complete is conditional on the version its writer holds, so it completes
+// once, and every attempt writes content under an object key of its own, so
+// a writer that lost its lease cannot overwrite what another committed.
 //
 // # Privacy
 //

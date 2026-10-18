@@ -78,14 +78,26 @@ type HSSCredentials struct {
 }
 
 // NewHSSCredentials returns a source calling the HSS at base with the bearer
-// token, expecting credentials for realm. timeout bounds each call.
-func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration) *HSSCredentials {
+// token, expecting credentials for realm. timeout bounds each call and
+// maxConns the connections to the HSS, which the server's lookup limit
+// (Options.MaxConcurrentLookups) should match.
+func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration, maxConns int) *HSSCredentials {
+	// A transport of its own: the default one has no connection limit and
+	// is shared with whatever else uses it.
+	transport := &http.Transport{
+		Proxy:               nil,
+		MaxConnsPerHost:     maxConns,
+		MaxIdleConnsPerHost: maxConns,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: timeout,
+	}
 	return &HSSCredentials{
 		base:  base,
 		token: secret{token},
 		realm: realm,
 		client: &http.Client{
-			Timeout: timeout,
+			Transport: transport,
+			Timeout:   timeout,
 			// The token must not follow a redirect to another host.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
@@ -94,6 +106,7 @@ func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration
 
 // hssCredential is the response body of the ft-credential operation.
 type hssCredential struct {
+	IMPI      string `json:"impi"`
 	IMPU      string `json:"impu"`
 	Realm     string `json:"realm"`
 	Algorithm string `json:"algorithm"`
@@ -128,7 +141,7 @@ func (h *HSSCredentials) Lookup(ctx context.Context, username string, alg digest
 	case len(body) > maxHSSResponse:
 		return Credential{}, errors.New("ftserver: hss response too large")
 	}
-	return parseHSSCredential(body, h.realm, alg)
+	return parseHSSCredential(body, username, h.realm, alg)
 }
 
 // credentialURL is the ft-credential URL for impi. The IMPI is escaped as
@@ -143,15 +156,23 @@ func (h *HSSCredentials) credentialURL(impi string, alg digest.Algorithm) string
 	return u.String()
 }
 
-// parseHSSCredential checks an ft-credential response against the realm and
-// algorithm asked for. A mismatch is an error, not a fallback: an HA1 for
-// another realm or algorithm cannot verify anything.
-func parseHSSCredential(body []byte, realm string, alg digest.Algorithm) (Credential, error) {
+// parseHSSCredential checks an ft-credential response against the IMPI,
+// realm and algorithm asked for. A realm or algorithm mismatch is an error,
+// not a fallback: an HA1 for another realm or algorithm cannot verify
+// anything.
+//
+// The IMPI must come back byte for byte. An HSS that matched the name
+// loosely (say, the domain case-insensitively) would let a captured
+// Authorization be replayed under a respelt user name, which keys a fresh
+// nonce-count; such an answer is treated as an unknown user.
+func parseHSSCredential(body []byte, impi, realm string, alg digest.Algorithm) (Credential, error) {
 	var c hssCredential
 	if err := json.Unmarshal(body, &c); err != nil {
 		return Credential{}, errors.New("ftserver: hss response is not an ft-credential")
 	}
 	switch {
+	case c.IMPI != impi:
+		return Credential{}, fmt.Errorf("%w: the hss answered for another impi", ErrUnknownUser)
 	case c.Realm != realm:
 		return Credential{}, errors.New("ftserver: hss credential is for another realm")
 	case !strings.EqualFold(c.Algorithm, string(alg)):

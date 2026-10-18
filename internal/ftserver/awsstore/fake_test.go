@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"maps"
 	"slices"
@@ -140,6 +143,9 @@ func (f *fakeDynamo) Scan(_ context.Context, in *dynamodb.ScanInput, _ ...func(*
 	if f.fail != nil {
 		return nil, f.fail
 	}
+	if in.ConsistentRead != nil {
+		f.t.Error("the sweeper's Scan asks for strong consistency, at twice the cost")
+	}
 	if got := aws.ToString(in.FilterExpression); got != "begins_with(#pk, :f) AND #e < :now AND #s <> :expired" {
 		f.t.Fatalf("Scan filter %q", got)
 	}
@@ -184,6 +190,12 @@ func newFakeS3() *fakeS3 {
 	return &fakeS3{objects: map[string][]byte{}, uploads: map[string]map[int32][]byte{}}
 }
 
+func crcOf(b []byte) string {
+	var sum [4]byte
+	binary.BigEndian.PutUint32(sum[:], crc32.ChecksumIEEE(b))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
 func etagOf(b []byte) string {
 	sum := md5.Sum(b)
 	return `"` + hex.EncodeToString(sum[:]) + `"`
@@ -206,6 +218,9 @@ func (f *fakeS3) CreateMultipartUpload(_ context.Context, in *s3.CreateMultipart
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return nil, f.fail
+	}
+	if in.ChecksumAlgorithm != stypes.ChecksumAlgorithmCrc32 {
+		return nil, &fakeAPIError{code: "InvalidRequest"}
 	}
 	f.next++
 	id := aws.ToString(in.Key) + "#" + strconv.Itoa(f.next)
@@ -232,9 +247,12 @@ func (f *fakeS3) UploadPart(_ context.Context, in *s3.UploadPartInput, _ ...func
 	if err != nil {
 		return nil, err
 	}
+	if in.ChecksumAlgorithm != stypes.ChecksumAlgorithmCrc32 {
+		return nil, &fakeAPIError{code: "InvalidRequest"}
+	}
 	body, _ := io.ReadAll(in.Body)
 	u[aws.ToInt32(in.PartNumber)] = body
-	return &s3.UploadPartOutput{ETag: aws.String(etagOf(body))}, nil
+	return &s3.UploadPartOutput{ETag: aws.String(etagOf(body)), ChecksumCRC32: aws.String(crcOf(body))}, nil
 }
 
 func (f *fakeS3) CompleteMultipartUpload(_ context.Context, in *s3.CompleteMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
@@ -250,7 +268,8 @@ func (f *fakeS3) CompleteMultipartUpload(_ context.Context, in *s3.CompleteMulti
 	var obj []byte
 	for _, p := range in.MultipartUpload.Parts {
 		data, ok := u[aws.ToInt32(p.PartNumber)]
-		if !ok || etagOf(data) != aws.ToString(p.ETag) {
+		// An upload created with CRC32 needs every part's checksum back.
+		if !ok || etagOf(data) != aws.ToString(p.ETag) || aws.ToString(p.ChecksumCRC32) != crcOf(data) {
 			return nil, &fakeAPIError{code: "InvalidPart"}
 		}
 		obj = append(obj, data...)

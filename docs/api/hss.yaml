@@ -14,6 +14,8 @@ info:
     subscriber's FT credential for the FT realm; the password itself is never
     stored or returned.
 servers:
+  # ADR 0007: plain http only to a private host (a Cloud Map name or an
+  # RFC 1918 / ULA address), always with the caller's service bearer token.
   - url: http://hss.{namespace}:8080
     description: Inside the VPC, through Cloud Map
     variables:
@@ -32,8 +34,18 @@ paths:
         owns the subscriber's uploads. The Digest user name is the IMPI.
 
         The answer is a secret: callers must not log or cache it beyond the
-        request that needs it. The HSS should accept a token scoped to this
-        operation, so that ft-server does not hold the operator's admin token.
+        request that needs it. The caller authenticates with its own service
+        token (ADR 0007: one bearer token per calling service, from Secrets
+        Manager), not the operator's admin token.
+
+        The IMPI is matched byte for byte, and the answer names it again:
+        ft-server treats an answer for any other spelling as an unknown user,
+        because a loosely matched name would let a captured Authorization be
+        replayed under a respelt user name with a fresh nonce-count.
+
+        The FT user name and password are what acs provisions to the client as
+        ftHTTPCSUser and ftHTTPCSPwd (ACS integration, Phase 7); this
+        operation returns the HA1 of that password for the FT realm.
       parameters:
         - name: impi
           in: path
@@ -78,11 +90,11 @@ components:
   schemas:
     FTCredential:
       type: object
-      required: [impu, realm, algorithm, ha1]
+      required: [impi, impu, realm, algorithm, ha1]
       properties:
         impi:
           type: string
-          description: The IMPI asked for.
+          description: The IMPI asked for, exactly as it appears in the path (after percent-decoding).
         impu:
           type: string
           description: |

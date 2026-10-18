@@ -255,10 +255,11 @@ func TestResumeIntoAVanishedMultipartUploadStartsOver(t *testing.T) {
 	e := newEnv(t)
 	u := e.user(alice)
 	data := pattern(3 * testPart)
-	breakUpload(t, e, u, "gone", data, 2*testPart)
+	// Cut one byte after the second part, so that both parts are durable.
+	breakUpload(t, e, u, "gone", data, 2*testPart+1)
 	r, _ := e.meta.GetByTID(t.Context(), alice, "gone")
 	// What the bucket's lifecycle rule or a crash after completion leaves.
-	if err := e.blobs.AbortMultipart(t.Context(), r.ID, r.MultipartID); err != nil {
+	if err := e.blobs.AbortMultipart(t.Context(), r.Object, r.MultipartID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := u.put("/ft/gone", rangeHeader(2*testPart, len(data)), data[2*testPart:]); rec.Code != http.StatusConflict {

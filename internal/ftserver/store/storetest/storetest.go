@@ -132,9 +132,10 @@ func Metadata(t *testing.T, newStore func(t *testing.T) store.Metadata) {
 		r.Size = 12
 		r.SHA256 = bytes.Repeat([]byte{0xab}, 32)
 		r.HashState = []byte{1, 2, 3}
+		r.Object = id + ".attempt"
 		r.MultipartID = "upload-1"
-		r.Parts = []store.Part{{Number: 1, ETag: `"e1"`, Size: 5}, {Number: 2, ETag: `"e2"`, Size: 7}}
-		r.Thumbnail = &store.Thumbnail{Size: 3, ContentType: "image/png"}
+		r.Parts = []store.Part{{Number: 1, ETag: `"e1"`, Size: 5, Checksum: "AAAAAA=="}, {Number: 2, ETag: `"e2"`, Size: 7}}
+		r.Thumbnail = &store.Thumbnail{Key: id + ".attempt.t", Size: 3, ContentType: "image/png"}
 		r.Completed = T0.Add(time.Minute)
 		r.Expires = T0.Add(time.Hour)
 		r.Lease = "lease-1"
@@ -313,15 +314,18 @@ func Blobs(t *testing.T, b store.Blobs, minPart int) {
 		}
 		p1 := bytes.Repeat([]byte{'a'}, minPart)
 		p2 := []byte("tail")
-		e1, err := b.UploadPart(ctx, k, id, 1, p1)
+		part1, err := b.UploadPart(ctx, k, id, 1, p1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		e2, err := b.UploadPart(ctx, k, id, 2, p2)
+		part2, err := b.UploadPart(ctx, k, id, 2, p2)
 		if err != nil {
 			t.Fatal(err)
 		}
-		parts := []store.Part{{Number: 1, ETag: e1, Size: int64(len(p1))}, {Number: 2, ETag: e2, Size: int64(len(p2))}}
+		if part1.Number != 1 || part1.Size != int64(len(p1)) || part1.ETag == "" || part2.Number != 2 {
+			t.Fatalf("parts = %+v, %+v", part1, part2)
+		}
+		parts := []store.Part{part1, part2}
 		if err := b.CompleteMultipart(ctx, k, id, parts); err != nil {
 			t.Fatal(err)
 		}
@@ -340,14 +344,14 @@ func Blobs(t *testing.T, b store.Blobs, minPart int) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		e1, err := b.UploadPart(ctx, k, id, 1, []byte("first writer"))
+		first, err := b.UploadPart(ctx, k, id, 1, []byte("first writer"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := b.UploadPart(ctx, k, id, 1, []byte("second writer")); err != nil {
 			t.Fatal(err)
 		}
-		if err := b.CompleteMultipart(ctx, k, id, []store.Part{{Number: 1, ETag: e1, Size: 12}}); !errors.Is(err, store.ErrInvalidParts) {
+		if err := b.CompleteMultipart(ctx, k, id, []store.Part{first}); !errors.Is(err, store.ErrInvalidParts) {
 			t.Fatalf("completion with the replaced part's ETag = %v, want ErrInvalidParts", err)
 		}
 		_ = b.AbortMultipart(ctx, k, id)
@@ -385,7 +389,7 @@ func Equal(a, b store.Record) bool {
 		a.FileName == b.FileName && a.ContentType == b.ContentType &&
 		a.DeclaredSize == b.DeclaredSize && a.Received == b.Received && a.Size == b.Size &&
 		bytes.Equal(a.SHA256, b.SHA256) && bytes.Equal(a.HashState, b.HashState) &&
-		a.MultipartID == b.MultipartID && sameParts && sameThumb &&
+		a.Object == b.Object && a.MultipartID == b.MultipartID && sameParts && sameThumb &&
 		sameTime(a.Created, b.Created) && sameTime(a.Completed, b.Completed) &&
 		sameTime(a.Expires, b.Expires) && a.Lease == b.Lease &&
 		sameTime(a.LeaseUntil, b.LeaseUntil) && a.Version == b.Version

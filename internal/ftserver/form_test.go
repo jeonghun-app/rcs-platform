@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 var testLimits = formLimits{maxFile: 4096, maxThumbnail: 64}
@@ -85,14 +86,31 @@ func TestMissingFileContentTypeIsOctetStream(t *testing.T) {
 
 func TestFileNameIsKeptAsSentIncludingRFC2231(t *testing.T) {
 	for header, want := range map[string]string{
-		`filename="dir/name.txt"`:                 "dir/name.txt",
+		`filename="name.txt"`:                     "name.txt",
 		`filename*=UTF-8''%EC%82%AC%EC%A7%84.jpg`: "사진.jpg",
 		`filename="My%20Photo.jpg"`:               "My%20Photo.jpg",
+		`filename="東京 ü (1).txt"`:                 "東京 ü (1).txt",
 	} {
 		p := part{header: "Content-Disposition: form-data; name=\"File\"; " + header + "\r\n", body: "x"}
 		f, _, err := readForm(formType, multipartBody(tidPart("t"), p), testLimits)
 		if err != nil || f.file.name != want {
-			t.Errorf("%s: name %q, %v; want %q", header, f.file.name, err, want)
+			t.Errorf("%s: %v; want %q", header, err, want)
+		}
+	}
+}
+
+func TestFileNamesThatAreNotOnePlainNameAreRefused(t *testing.T) {
+	for _, name := range []string{
+		"../../etc/passwd", "..\\..\\x.bat", "/abs/path", "dir/name.txt", ".", "..",
+		"invoice\u202efdp.exe", "a\u200bb", "a\u2066b", "a\u061cb", "a\u200eb", "\ufeffname", "tab\tname",
+	} {
+		if validFileName(name) {
+			t.Errorf("validFileName(%q) = true", name)
+		}
+	}
+	for _, name := range []string{"a.b.c", "...", "東京.txt", "résumé (final).pdf", "a\u00a0b"} {
+		if !validFileName(name) {
+			t.Errorf("validFileName(%q) = false", name)
 		}
 	}
 }
@@ -219,5 +237,78 @@ func TestValidBoundaryFollowsRFC2046(t *testing.T) {
 		if got := validBoundary(b); got != want {
 			t.Errorf("validBoundary(%q) = %v", b, got)
 		}
+	}
+}
+
+// lookalikeReader yields a File part of n bytes made entirely of boundary
+// lookalikes, the input that makes a multipart scanner work hardest, without
+// holding it in memory.
+type lookalikeReader struct {
+	head, tail string
+	n          int64
+	sent       int64
+}
+
+const lookalike = "\r\n--boundary1x"
+
+func (l *lookalikeReader) Read(p []byte) (int, error) {
+	switch {
+	case l.head != "":
+		k := copy(p, l.head)
+		l.head = l.head[k:]
+		return k, nil
+	case l.sent < l.n:
+		k := 0
+		for k < len(p) && l.sent < l.n {
+			c := copy(p[k:], lookalike[l.sent%int64(len(lookalike)):])
+			c = min(c, int(l.n-l.sent))
+			k += c
+			l.sent += int64(c)
+		}
+		return k, nil
+	case l.tail != "":
+		k := copy(p, l.tail)
+		l.tail = l.tail[k:]
+		return k, nil
+	}
+	return 0, io.EOF
+}
+
+func parseLookalikes(t *testing.T, n int64) time.Duration {
+	t.Helper()
+	body := &lookalikeReader{
+		head: "--boundary1\r\n" + tidPart("t").header + "\r\nt\r\n--boundary1\r\n" + filePart("a", "text/plain", "").header + "\r\n",
+		n:    n,
+		tail: "\r\n--boundary1--\r\n",
+	}
+	start := time.Now()
+	f, err := readUploadHead(formType, body, formLimits{maxFile: DefaultMaxSize, maxThumbnail: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.Copy(io.Discard, f.file.body)
+	if err != nil || got != n {
+		t.Fatalf("read %d of %d bytes: %v", got, n, err)
+	}
+	if err := f.finish(); err != nil {
+		t.Fatal(err)
+	}
+	return time.Since(start)
+}
+
+func TestMaximumSizeAdversarialFormParsesInLinearTime(t *testing.T) {
+	// docs/architecture.md §8: a parser is shown linear on a maximum-size
+	// adversarial input. Times are compared, not bounded, so a loaded host
+	// slows both alike; the best of three runs smooths out the rest.
+	best := func(n int64) time.Duration {
+		d := parseLookalikes(t, n)
+		for range 2 {
+			d = min(d, parseLookalikes(t, n))
+		}
+		return d
+	}
+	small, large := best(DefaultMaxSize/8), best(DefaultMaxSize)
+	if large > 16*small+time.Second {
+		t.Fatalf("8× the input took %v against %v: not linear", large, small)
 	}
 }

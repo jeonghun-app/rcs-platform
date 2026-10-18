@@ -110,6 +110,13 @@ type ServerConfig struct {
 	// bare base64(RAND ‖ AUTN). Every instance serving the realm must use the
 	// same setting, because each accepts only the form it issues.
 	AKAServerData bool
+	// HTTPPathOnlyURI lets VerifyHTTP accept a uri that is the request
+	// target's path without its query, which RFC 7616 §3.4.6 allows the
+	// value to be (an absolute-path) and which some RCS clients send for
+	// FT via HTTP info requests. Method and path stay bound by the response
+	// and nonce-counts still cannot be reused; only the query is unsigned.
+	// Any other mismatch is still ErrURIMismatch. Off by default.
+	HTTPPathOnlyURI bool
 }
 
 // Server issues Digest challenges for one realm and verifies the answers. It
@@ -123,7 +130,8 @@ type Server struct {
 	now      func() time.Time
 	random   io.Reader
 
-	akaServerData bool
+	akaServerData   bool
+	httpPathOnlyURI bool
 }
 
 // NewServer validates cfg and returns a Server.
@@ -147,7 +155,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		now:      cfg.Now,
 		random:   cfg.Random,
 
-		akaServerData: cfg.AKAServerData,
+		akaServerData:   cfg.AKAServerData,
+		httpPathOnlyURI: cfg.HTTPPathOnlyURI,
 	}
 	if s.lifetime == 0 {
 		s.lifetime = DefaultNonceLifetime

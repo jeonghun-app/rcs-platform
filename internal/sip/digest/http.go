@@ -59,11 +59,7 @@ func (s *Server) VerifyHTTP(r *http.Request, lookup SecretLookup) (Credentials, 
 	if c.Algorithm == AKAv1MD5 {
 		return Credentials{}, ErrUnsupportedAlgorithm
 	}
-	target := r.RequestURI
-	if target == "" {
-		target = r.URL.RequestURI()
-	}
-	if c.URI != target {
+	if target := requestTarget(r); c.URI != target && !(s.httpPathOnlyURI && isPathOf(c.URI, target)) {
 		return Credentials{}, ErrURIMismatch
 	}
 	issued, err := s.precheck(c)
@@ -80,9 +76,37 @@ func (s *Server) VerifyHTTP(r *http.Request, lookup SecretLookup) (Credentials, 
 	return c, nil
 }
 
+// PathOnlyURI reports whether c's uri names only the path of r's request
+// target, the form ServerConfig.HTTPPathOnlyURI lets VerifyHTTP accept, so a
+// caller can count how often it does.
+func PathOnlyURI(r *http.Request, c Credentials) bool {
+	target := requestTarget(r)
+	return c.URI != target && isPathOf(c.URI, target)
+}
+
+func requestTarget(r *http.Request) string {
+	if r.RequestURI != "" {
+		return r.RequestURI
+	}
+	return r.URL.RequestURI()
+}
+
+// isPathOf reports whether uri is target up to, not including, its '?':
+// the absolute-path RFC 7616 §3.4.6 allows the uri to be. A uri with a query
+// of its own, or with any other path, is not.
+func isPathOf(uri, target string) bool {
+	path, _, hasQuery := strings.Cut(target, "?")
+	return hasQuery && uri == path
+}
+
 // ChallengeHTTP answers 401 with a SHA-256 and an MD5 challenge, in that order
 // of preference (RFC 7616 §3.7). Set stale when VerifyHTTP returned
 // ErrStaleNonce. Nothing is written if a nonce cannot be generated.
+//
+// The order is also what keeps MD5-only clients working: the GSMA rcsjta
+// client reads only the last WWW-Authenticate field (HttpURLConnection's
+// getHeaderField) and answers it as MD5 without an algorithm parameter, so
+// MD5 must stay the last field.
 func (s *Server) ChallengeHTTP(w http.ResponseWriter, stale bool) error {
 	var values []string
 	for _, alg := range []Algorithm{SHA256, MD5} {

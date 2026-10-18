@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,18 +128,71 @@ func (failingSource) Lookup(context.Context, string, digest.Algorithm) (Credenti
 	return Credential{}, errors.New("hss unreachable")
 }
 
-func TestCredentialBackendFailureIsAUniform401ButIsLogged(t *testing.T) {
+func TestCredentialBackendFailureIsServiceUnavailableAndLogged(t *testing.T) {
 	e := newEnv(t, func(o *Options) { o.Credentials = failingSource{} })
 	u := e.user(alice)
 	rec := e.do(u.sign(httptest.NewRequest(http.MethodPost, "/ft", nil)))
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d", rec.Code)
+	// Not 401: the failure says nothing about the user, and RCS clients
+	// retry a 503 but give up after a second 401.
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || rec.Header().Get("WWW-Authenticate") != "" {
+		t.Fatalf("status = %d, headers %v", rec.Code, rec.Header())
 	}
 	if e.metric("auth.backend_error") != 1 || len(e.h.Logs("credential lookup failed")) != 1 {
 		t.Fatal("backend failure not reported")
 	}
 	if strings.Contains(e.h.Output(), "001010000000001") {
 		t.Fatal("the user name reached the log")
+	}
+}
+
+// blockingSource holds every lookup until released, counting how many are
+// in progress at once.
+type blockingSource struct {
+	release chan struct{}
+	mu      sync.Mutex
+	now     int
+	peak    int
+}
+
+func (b *blockingSource) Lookup(context.Context, string, digest.Algorithm) (Credential, error) {
+	b.mu.Lock()
+	b.now++
+	b.peak = max(b.peak, b.now)
+	b.mu.Unlock()
+	<-b.release
+	b.mu.Lock()
+	b.now--
+	b.mu.Unlock()
+	return Credential{}, ErrUnknownUser
+}
+
+func TestCredentialLookupsPerTaskAreBounded(t *testing.T) {
+	src := &blockingSource{release: make(chan struct{})}
+	e := newEnv(t, func(o *Options) { o.Credentials = src; o.MaxConcurrentLookups = 2 })
+	// Requests from anyone with a nonce and a made-up user name.
+	const requests = 10
+	var wg sync.WaitGroup
+	codes := make(chan int, requests)
+	for i := range requests {
+		u := e.user("nobody-" + strconv.Itoa(i))
+		r := u.sign(httptest.NewRequest(http.MethodPost, "/ft", nil))
+		wg.Go(func() { codes <- e.do(r).Code })
+	}
+	// Every request beyond the limit is answered at once.
+	for range requests - 2 {
+		if code := <-codes; code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503 beyond the lookup limit", code)
+		}
+	}
+	close(src.release)
+	wg.Wait()
+	for range 2 {
+		if code := <-codes; code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401 for the looked-up unknown users", code)
+		}
+	}
+	if src.peak > 2 || e.metric("auth.lookup_busy") != requests-2 {
+		t.Fatalf("peak lookups %d, lookup_busy %v", src.peak, e.metric("auth.lookup_busy"))
 	}
 }
 

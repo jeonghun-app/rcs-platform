@@ -296,6 +296,10 @@ func TestValidFileWhoseObjectIsGoneIsNotFound(t *testing.T) {
 	if rec.Code != http.StatusNotFound || rec.Header().Get("ETag") != "" || rec.Header().Get("Content-Disposition") != "" {
 		t.Fatalf("status = %d, headers %v", rec.Code, rec.Header())
 	}
+	// Told apart from an unknown id, because it should never happen.
+	if e.metric("download.failed.missing_object") != 1 || e.metric("download.not_found") != 0 || len(e.h.Logs("download object missing")) != 1 {
+		t.Fatal("a missing object was not reported on its own")
+	}
 }
 
 // brokenMetadata fails every read like an unreachable table.

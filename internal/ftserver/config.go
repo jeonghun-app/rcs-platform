@@ -2,6 +2,7 @@ package ftserver
 
 import (
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -14,12 +15,17 @@ import (
 // Defaults of the FT_ settings. docs/ft-server.md has the full table.
 const (
 	DefaultListenAddr           = ":8081"
-	DefaultMaxSize              = 100 << 20 // what acs publishes as MaxSizeFileTr
+	DefaultMaxSize              = 100 << 20 // at least what acs publishes as MaxSizeFileTr (KiB) × 1024
 	DefaultMaxThumbnailSize     = 512 << 10
 	DefaultPartSize             = 8 << 20
 	DefaultValidity             = 7 * 24 * time.Hour
 	DefaultUploadsPerMinute     = 20
 	DefaultMaxConcurrentUploads = 32
+	DefaultMaxUploadsPerUser    = 4
+	DefaultMaxDownloads         = 256
+	DefaultMaxLookups           = 16
+	DefaultMinUploadRate        = 1024 // bytes per second
+	DefaultDrainTimeout         = 10 * time.Second
 	DefaultIdleTimeout          = 30 * time.Second
 	DefaultUploadTimeout        = 30 * time.Minute
 	DefaultStorageTimeout       = time.Minute
@@ -63,10 +69,15 @@ type Config struct {
 	DownloadAuth         bool
 	UploadsPerMinute     int
 	MaxConcurrentUploads int
+	MaxUploadsPerUser    int
+	MaxDownloads         int
+	MaxLookups           int
+	MinUploadRate        int64
 	IdleTimeout          time.Duration
 	UploadTimeout        time.Duration
 	StorageTimeout       time.Duration
 	SweepInterval        time.Duration
+	DrainTimeout         time.Duration
 }
 
 // AWSConfig is the S3 and DynamoDB part of Config, used with FT_STORE=aws.
@@ -103,10 +114,15 @@ func Configure(s *runtime.Settings) Config {
 		DownloadAuth:         e.Bool("DOWNLOAD_AUTH", false),
 		UploadsPerMinute:     e.Int("UPLOADS_PER_MINUTE", DefaultUploadsPerMinute),
 		MaxConcurrentUploads: e.Int("MAX_CONCURRENT_UPLOADS", DefaultMaxConcurrentUploads),
+		MaxUploadsPerUser:    e.Int("MAX_UPLOADS_PER_USER", DefaultMaxUploadsPerUser),
+		MaxDownloads:         e.Int("MAX_CONCURRENT_DOWNLOADS", DefaultMaxDownloads),
+		MaxLookups:           e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
+		MinUploadRate:        int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
 		IdleTimeout:          e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
 		UploadTimeout:        e.Duration("UPLOAD_TIMEOUT", DefaultUploadTimeout),
 		StorageTimeout:       e.Duration("STORAGE_TIMEOUT", DefaultStorageTimeout),
 		SweepInterval:        e.Duration("SWEEP_INTERVAL", DefaultSweepInterval),
+		DrainTimeout:         e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
 		AWS: AWSConfig{
 			Bucket:           e.String("S3_BUCKET", ""),
 			Prefix:           e.String("S3_PREFIX", ""),
@@ -123,11 +139,24 @@ func Configure(s *runtime.Settings) Config {
 	c.UploadURI = publicURI(s, "UPLOAD_URI", true)
 	c.DownloadURI = publicURI(s, "DOWNLOAD_URI", true)
 	c.BrandedURI = publicURI(s, "BRANDED_URI", false)
+	// Links are built from these URIs as given and requests are routed on
+	// their exact paths, so a trailing '/' (which acs would provision as
+	// is) would make the server's own links miss it.
+	for _, u := range []struct {
+		name string
+		v    *url.URL
+	}{{"UPLOAD_URI", c.UploadURI}, {"DOWNLOAD_URI", c.DownloadURI}, {"BRANDED_URI", c.BrandedURI}} {
+		if u.v != nil && strings.HasSuffix(u.v.Path, "/") && u.v.Path != "/" {
+			e.Invalid(u.name, "path must not end in '/'")
+		}
+	}
 	if c.UploadURI != nil && c.DownloadURI != nil {
-		up, down := cleanPath(c.UploadURI), cleanPath(c.DownloadURI)
+		up, down := c.UploadURI.Path, c.DownloadURI.Path
 		switch {
-		case up == "/":
+		case up == "" || up == "/":
 			e.Invalid("UPLOAD_URI", "needs a path, below which resume URLs live")
+		case down == "" || down == "/":
+			e.Invalid("DOWNLOAD_URI", "needs a path")
 		case up == down || strings.HasPrefix(down, up+"/"):
 			e.Invalid("DOWNLOAD_URI", "path must not be the upload path or below it")
 		}
@@ -148,8 +177,12 @@ func Configure(s *runtime.Settings) Config {
 		if c.HSSToken.v == "" {
 			e.Invalid("HSS_TOKEN", "required with FT_CREDENTIALS=hss")
 		}
-		s.ForbidInProduction(c.HSSURL != nil && c.HSSURL.Scheme != "https",
-			"FT_HSS_URL is not https: the bearer token and HA1 would cross the network in the clear")
+		// ADR 0007: plain http to an internal API only for a private host
+		// (an RFC 1918 or ULA address, or a name in the Cloud Map
+		// namespace), always with the service's own bearer token.
+		namespace := s.Shared.String("SERVICE_NAMESPACE", "")
+		s.ForbidInProduction(c.HSSURL != nil && c.HSSURL.Scheme != "https" && !privateHost(c.HSSURL.Hostname(), namespace),
+			"FT_HSS_URL is http to a host that is not private (RFC 1918/ULA address or a name in RCS_SERVICE_NAMESPACE): the bearer token and HA1 would cross a network outside the VPC in the clear")
 	default:
 		e.Invalid("CREDENTIALS", "not one of static, hss")
 	}
@@ -182,8 +215,8 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("MAX_SIZE", "must be positive")
 	case c.PartSize <= 0:
 		e.Invalid("PART_SIZE", "must be positive")
-	case (c.MaxSize+c.PartSize-1)/c.PartSize > maxParts:
-		e.Invalid("PART_SIZE", "too small for FT_MAX_SIZE: S3 allows 10000 parts")
+	case (c.MaxSize+c.PartSize-1)/c.PartSize >= maxParts:
+		e.Invalid("PART_SIZE", "too small for FT_MAX_SIZE: an upload may have at most "+strconv.Itoa(maxParts-1)+" parts")
 	}
 	if c.MaxThumbnailSize <= 0 {
 		e.Invalid("MAX_THUMBNAIL_SIZE", "must be positive")
@@ -194,6 +227,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"VALIDITY", c.Validity}, {"IDLE_TIMEOUT", c.IdleTimeout}, {"UPLOAD_TIMEOUT", c.UploadTimeout},
 		{"STORAGE_TIMEOUT", c.StorageTimeout}, {"SWEEP_INTERVAL", c.SweepInterval}, {"HSS_TIMEOUT", c.HSSTimeout},
+		{"DRAIN_TIMEOUT", c.DrainTimeout},
 	} {
 		if d.v == 0 {
 			e.Invalid(d.name, "must be greater than zero")
@@ -202,8 +236,19 @@ func Configure(s *runtime.Settings) Config {
 	if c.UploadsPerMinute < 0 {
 		e.Invalid("UPLOADS_PER_MINUTE", "must not be negative")
 	}
-	if c.MaxConcurrentUploads <= 0 {
-		e.Invalid("MAX_CONCURRENT_UPLOADS", "must be positive")
+	for _, n := range []struct {
+		name string
+		v    int
+	}{
+		{"MAX_CONCURRENT_UPLOADS", c.MaxConcurrentUploads}, {"MAX_UPLOADS_PER_USER", c.MaxUploadsPerUser},
+		{"MAX_CONCURRENT_DOWNLOADS", c.MaxDownloads}, {"MAX_CONCURRENT_LOOKUPS", c.MaxLookups},
+	} {
+		if n.v <= 0 {
+			e.Invalid(n.name, "must be positive")
+		}
+	}
+	if c.MinUploadRate < 0 {
+		e.Invalid("MIN_UPLOAD_RATE", "must not be negative")
 	}
 	return c
 }
@@ -236,6 +281,18 @@ func absoluteURL(e *runtime.Env, name string, required bool) *url.URL {
 		return nil
 	}
 	return u
+}
+
+// privateHost reports whether host is a private address (RFC 1918, or an
+// IPv6 unique local address) or a name inside the Cloud Map namespace
+// (ADR 0007).
+func privateHost(host, namespace string) bool {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.IsPrivate()
+	}
+	namespace = strings.TrimSuffix(strings.ToLower(namespace), ".")
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	return namespace != "" && strings.HasSuffix(host, "."+namespace)
 }
 
 // staticUsers reads FT_STATIC_USERS: comma-separated user=password pairs.

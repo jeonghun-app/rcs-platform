@@ -74,11 +74,11 @@ func FuzzParseContentRange(f *testing.F) {
 // FuzzParseHSSCredential checks that whatever an HSS answers, an accepted
 // credential has an owner and was for the realm and algorithm asked.
 func FuzzParseHSSCredential(f *testing.F) {
-	f.Add([]byte(`{"impu":"sip:a@b","realm":"` + realm + `","algorithm":"MD5","ha1":"00112233445566778899aabbccddeeff"}`))
+	f.Add([]byte(`{"impi":"` + alice + `","impu":"sip:a@b","realm":"` + realm + `","algorithm":"MD5","ha1":"00112233445566778899aabbccddeeff"}`))
 	f.Add([]byte(`{"impu":1}`))
 	f.Add([]byte(`[]`))
 	f.Fuzz(func(t *testing.T, body []byte) {
-		c, err := parseHSSCredential(body, realm, digest.MD5)
+		c, err := parseHSSCredential(body, alice, realm, digest.MD5)
 		if err == nil && c.Owner == "" {
 			t.Fatal("credential without an owner accepted")
 		}

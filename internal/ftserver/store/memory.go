@@ -182,21 +182,21 @@ func (b *MemoryBlobs) CreateMultipart(_ context.Context, key, _ string) (string,
 }
 
 // UploadPart implements Blobs.
-func (b *MemoryBlobs) UploadPart(_ context.Context, key, uploadID string, number int32, body []byte) (string, error) {
+func (b *MemoryBlobs) UploadPart(_ context.Context, key, uploadID string, number int32, body []byte) (Part, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.fail != nil {
-		return "", b.fail
+		return Part{}, b.fail
 	}
 	u, ok := b.uploads[uploadID]
 	if !ok || u.key != key {
-		return "", ErrNotFound
+		return Part{}, ErrNotFound
 	}
 	if number < 1 || number > 10000 {
-		return "", fmt.Errorf("store: part number %d out of range", number)
+		return Part{}, fmt.Errorf("store: part number %d out of range", number)
 	}
 	u.parts[number] = bytes.Clone(body)
-	return etag(body), nil
+	return Part{Number: number, ETag: etag(body), Size: int64(len(body))}, nil
 }
 
 // CompleteMultipart implements Blobs.

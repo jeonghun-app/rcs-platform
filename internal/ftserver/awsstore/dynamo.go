@@ -45,8 +45,10 @@ const (
 	attrSize       = "size"
 	attrSHA256     = "sha256"
 	attrHashState  = "hash_state"
+	attrObject     = "object_key"
 	attrMultipart  = "multipart_id"
 	attrParts      = "parts"
+	attrThumbKey   = "thumbnail_key"
 	attrThumbSize  = "thumbnail_size"
 	attrThumbType  = "thumbnail_type"
 	attrCreated    = "created"
@@ -205,7 +207,7 @@ func (m *Metadata) Update(ctx context.Context, r store.Record) (store.Record, er
 // ListExpired implements store.Metadata with a filtered Scan. The scan reads
 // the whole table on every sweep, which is fine at the sweep interval
 // (FT_SWEEP_INTERVAL, an hour by default) for the table sizes of a first
-// release; docs/ft-server.md records the limit.
+// release; docs/ft-server.md records the cost and the limit.
 func (m *Metadata) ListExpired(ctx context.Context, now time.Time, limit int) ([]store.Record, error) {
 	var out []store.Record
 	var start map[string]types.AttributeValue
@@ -220,7 +222,9 @@ func (m *Metadata) ListExpired(ctx context.Context, now time.Time, limit int) ([
 				":f": str("f#"), ":now": num(now.UnixMilli()), ":expired": str(string(store.Expired)),
 			},
 			ExclusiveStartKey: start,
-			ConsistentRead:    aws.Bool(true),
+			// Eventually consistent: half the read cost of a scan that
+			// reads the whole table, and safe because every update the
+			// sweeper makes is conditional on the version it read.
 		})
 		if err != nil {
 			return nil, sanitize("scan", err)
@@ -304,21 +308,29 @@ func encodeRecord(r store.Record) map[string]types.AttributeValue {
 	if len(r.HashState) > 0 {
 		item[attrHashState] = &types.AttributeValueMemberB{Value: r.HashState}
 	}
+	if r.Object != "" {
+		item[attrObject] = str(r.Object)
+	}
 	if r.MultipartID != "" {
 		item[attrMultipart] = str(r.MultipartID)
 	}
 	if len(r.Parts) > 0 {
 		parts := make([]types.AttributeValue, len(r.Parts))
 		for i, p := range r.Parts {
-			parts[i] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
-				"n": num(int64(p.Number)), "etag": str(p.ETag), "size": num(p.Size),
-			}}
+			m := map[string]types.AttributeValue{"n": num(int64(p.Number)), "etag": str(p.ETag), "size": num(p.Size)}
+			if p.Checksum != "" {
+				m["crc32"] = str(p.Checksum)
+			}
+			parts[i] = &types.AttributeValueMemberM{Value: m}
 		}
 		item[attrParts] = &types.AttributeValueMemberL{Value: parts}
 	}
 	if t := r.Thumbnail; t != nil {
 		item[attrThumbSize] = num(t.Size)
 		item[attrThumbType] = str(t.ContentType)
+		if t.Key != "" {
+			item[attrThumbKey] = str(t.Key)
+		}
 	}
 	if !r.Completed.IsZero() {
 		item[attrCompleted] = num(r.Completed.UnixMilli())
@@ -349,6 +361,7 @@ func decodeRecord(item map[string]types.AttributeValue) (store.Record, error) {
 		Size:         d.num(attrSize, true),
 		SHA256:       d.bin(attrSHA256),
 		HashState:    d.bin(attrHashState),
+		Object:       d.str(attrObject, false),
 		MultipartID:  d.str(attrMultipart, false),
 		Created:      d.time(attrCreated, true),
 		Completed:    d.time(attrCompleted, false),
@@ -358,7 +371,7 @@ func decodeRecord(item map[string]types.AttributeValue) (store.Record, error) {
 		Version:      d.num(attrVersion, true),
 	}
 	if _, ok := item[attrThumbType]; ok {
-		r.Thumbnail = &store.Thumbnail{Size: d.num(attrThumbSize, true), ContentType: d.str(attrThumbType, true)}
+		r.Thumbnail = &store.Thumbnail{Key: d.str(attrThumbKey, false), Size: d.num(attrThumbSize, true), ContentType: d.str(attrThumbType, true)}
 	}
 	if v, ok := item[attrParts]; ok {
 		list, ok := v.(*types.AttributeValueMemberL)
@@ -373,9 +386,10 @@ func decodeRecord(item map[string]types.AttributeValue) (store.Record, error) {
 				}
 				pd := decoder{item: m.Value}
 				r.Parts = append(r.Parts, store.Part{
-					Number: int32(pd.num("n", true)),
-					ETag:   pd.str("etag", true),
-					Size:   pd.num("size", true),
+					Number:   int32(pd.num("n", true)),
+					ETag:     pd.str("etag", true),
+					Size:     pd.num("size", true),
+					Checksum: pd.str("crc32", false),
 				})
 				if pd.err != nil {
 					d.fail(attrParts)

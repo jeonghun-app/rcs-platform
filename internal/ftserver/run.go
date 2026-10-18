@@ -27,8 +27,9 @@ var listen = net.Listen
 // Run serves cfg until ctx ends. The public listener is plain HTTP: TLS ends
 // at the ALB (ADR 0003), and the URIs clients see are https in staging and
 // prod (Configure refuses anything else). Uploads still running at shutdown
-// get until the runtime's shutdown deadline; one cut off there leaves its
-// durable parts, and the client resumes on another task.
+// get FT_DRAIN_TIMEOUT and are then cut off (see drain); each keeps its
+// durable parts and releases its lease, and the client resumes on another
+// task.
 func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 	stores, err := openStores(ctx, cfg, rt)
 	if err != nil {
@@ -44,30 +45,39 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 			return err
 		}
 	}
-	ds, err := digest.NewServer(digest.ServerConfig{Realm: cfg.Realm, NonceKey: nonceKey, NonceCounts: stores.nonces})
+	ds, err := digest.NewServer(digest.ServerConfig{
+		Realm: cfg.Realm, NonceKey: nonceKey, NonceCounts: stores.nonces,
+		// The rcsjta reference client signs only the path of get_upload_info
+		// and get_download_info (docs/ft-server.md, Authentication).
+		HTTPPathOnlyURI: true,
+	})
 	if err != nil {
 		return err
 	}
 	srv, err := New(Options{
-		UploadURI:            cfg.UploadURI,
-		DownloadURI:          cfg.DownloadURI,
-		BrandedURI:           cfg.BrandedURI,
-		Digest:               ds,
-		Credentials:          credentialSource(cfg),
-		Metadata:             stores.metadata,
-		Blobs:                stores.blobs,
-		Logger:               rt.Logger,
-		Metrics:              rt.Metrics,
-		MaxSize:              cfg.MaxSize,
-		MaxThumbnailSize:     cfg.MaxThumbnailSize,
-		PartSize:             cfg.PartSize,
-		Validity:             cfg.Validity,
-		DownloadAuth:         cfg.DownloadAuth,
-		UploadsPerMinute:     cfg.UploadsPerMinute,
-		MaxConcurrentUploads: cfg.MaxConcurrentUploads,
-		IdleTimeout:          cfg.IdleTimeout,
-		UploadTimeout:        cfg.UploadTimeout,
-		StorageTimeout:       cfg.StorageTimeout,
+		UploadURI:              cfg.UploadURI,
+		DownloadURI:            cfg.DownloadURI,
+		BrandedURI:             cfg.BrandedURI,
+		Digest:                 ds,
+		Credentials:            credentialSource(cfg),
+		Metadata:               stores.metadata,
+		Blobs:                  stores.blobs,
+		Logger:                 rt.Logger,
+		Metrics:                rt.Metrics,
+		MaxSize:                cfg.MaxSize,
+		MaxThumbnailSize:       cfg.MaxThumbnailSize,
+		PartSize:               cfg.PartSize,
+		Validity:               cfg.Validity,
+		DownloadAuth:           cfg.DownloadAuth,
+		UploadsPerMinute:       cfg.UploadsPerMinute,
+		MaxConcurrentUploads:   cfg.MaxConcurrentUploads,
+		MaxUploadsPerUser:      cfg.MaxUploadsPerUser,
+		MaxConcurrentDownloads: cfg.MaxDownloads,
+		MaxConcurrentLookups:   cfg.MaxLookups,
+		MinUploadRate:          cfg.MinUploadRate,
+		IdleTimeout:            cfg.IdleTimeout,
+		UploadTimeout:          cfg.UploadTimeout,
+		StorageTimeout:         cfg.StorageTimeout,
 	})
 	if err != nil {
 		return err
@@ -90,7 +100,9 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 	}
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()
-	rt.OnShutdown("public listener", hs.Shutdown)
+	rt.OnShutdown("public listener", func(ctx context.Context) error {
+		return drain(ctx, hs, srv, cfg.DrainTimeout)
+	})
 
 	ticker := time.NewTicker(cfg.SweepInterval)
 	defer ticker.Stop()
@@ -113,6 +125,25 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 		}
 		return err
 	}
+}
+
+// drain stops the public listener at shutdown. Requests get timeout to
+// finish; uploads still running then are cut off by closing their
+// connections, so that their handlers fail the body read, release their
+// leases and return, and drain waits for that within ctx. Without this a
+// task stopped mid-upload would exit holding the lease, and the client could
+// not resume on another task until it lapsed.
+func drain(ctx context.Context, hs *http.Server, srv *Server, timeout time.Duration) error {
+	stopped := make(chan error, 1)
+	go func() { stopped <- hs.Shutdown(ctx) }()
+	select {
+	case err := <-stopped:
+		return err
+	case <-time.After(timeout):
+	case <-ctx.Done():
+	}
+	_ = hs.Close()
+	return srv.WaitWriters(ctx)
 }
 
 // sweep runs Server.Sweep on every tick until ctx ends.
@@ -164,5 +195,5 @@ func credentialSource(cfg Config) CredentialSource {
 		}
 		return NewStaticCredentials(users)
 	}
-	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.v, cfg.Realm, cfg.HSSTimeout)
+	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.v, cfg.Realm, cfg.HSSTimeout, cfg.MaxLookups)
 }

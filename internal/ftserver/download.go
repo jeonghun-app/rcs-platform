@@ -31,6 +31,16 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Each download holds a goroutine, a copy buffer and an open storage
+	// stream for as long as its reader keeps up with the write deadline,
+	// which for a slow reader can be hours.
+	release, ok := acquireSlot(s.downloads)
+	if !ok {
+		s.metrics.Count("download.failed.busy", 1)
+		serviceUnavailable(w, retryAfter)
+		return
+	}
+	defer release()
 	q := r.URL.Query()
 	id, thumbnail, ok := parseDownloadID(q.Get("id"))
 	if !ok || len(q["id"]) != 1 {
@@ -51,14 +61,14 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
-	key, size, contentType, name := rec.ID, rec.Size, rec.ContentType, rec.FileName
+	key, size, contentType, name := rec.Object, rec.Size, rec.ContentType, rec.FileName
 	etag := `"` + hex.EncodeToString(rec.SHA256) + `"`
 	if thumbnail {
 		if rec.Thumbnail == nil {
 			s.notFound(w, r)
 			return
 		}
-		key, size, contentType, name = rec.ID+thumbnailSuffix, rec.Thumbnail.Size, rec.Thumbnail.ContentType, ""
+		key, size, contentType, name = rec.Thumbnail.Key, rec.Thumbnail.Size, rec.Thumbnail.ContentType, ""
 		// The thumbnail is not hashed; its validator is the file's plus a
 		// marker, which changes whenever the file does.
 		etag = `"t` + etag[1:]
@@ -106,8 +116,13 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			h.Del(name)
 		}
 		if errors.Is(err, store.ErrNotFound) {
-			// A lifecycle rule shorter than the validity removed it.
-			s.notFound(w, r)
+			// A valid file whose object is gone: a lifecycle rule shorter
+			// than the validity. The client gets what any missing file
+			// gets; operators get a metric of its own and a log line,
+			// because this one should never happen.
+			s.metrics.Count("download.failed.missing_object", 1)
+			s.log.Warn("download object missing", slog.Bool("thumbnail", thumbnail))
+			http.NotFound(w, r)
 			return
 		}
 		s.downloadFailed(w, "open", err)

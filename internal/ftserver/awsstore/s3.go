@@ -3,7 +3,10 @@ package awsstore
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"strconv"
 
@@ -64,7 +67,11 @@ func (b *Blobs) Put(ctx context.Context, key string, body []byte, contentType st
 	return nil
 }
 
-// CreateMultipart implements store.Blobs.
+// CreateMultipart implements store.Blobs. The checksum algorithm is named
+// here, and every part and the completion carry the part's CRC32: an upload
+// created with an algorithm is completed only with every part's checksum
+// listed, which S3 checks, rather than leaving the combination to defaults
+// that differ between SDK versions and S3-compatible servers.
 func (b *Blobs) CreateMultipart(ctx context.Context, key, contentType string) (string, error) {
 	out, err := b.api.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:               aws.String(b.bucket),
@@ -72,6 +79,7 @@ func (b *Blobs) CreateMultipart(ctx context.Context, key, contentType string) (s
 		ContentType:          aws.String(contentType),
 		ServerSideEncryption: types.ServerSideEncryption(b.sse),
 		SSEKMSKeyId:          b.kms(),
+		ChecksumAlgorithm:    types.ChecksumAlgorithmCrc32,
 	})
 	if err != nil {
 		return "", sanitize("create multipart upload", err)
@@ -83,22 +91,32 @@ func (b *Blobs) CreateMultipart(ctx context.Context, key, contentType string) (s
 }
 
 // UploadPart implements store.Blobs.
-func (b *Blobs) UploadPart(ctx context.Context, key, uploadID string, number int32, body []byte) (string, error) {
+//
+// The part's CRC32 is computed here and sent, rather than left to the SDK
+// and read back from the response: S3 then verifies the part against it,
+// and the value to hand back at completion does not depend on a server
+// echoing it (S3-compatible servers differ there).
+func (b *Blobs) UploadPart(ctx context.Context, key, uploadID string, number int32, body []byte) (store.Part, error) {
+	var sum [4]byte
+	binary.BigEndian.PutUint32(sum[:], crc32.ChecksumIEEE(body))
+	checksum := base64.StdEncoding.EncodeToString(sum[:])
 	out, err := b.api.UploadPart(ctx, &s3.UploadPartInput{
-		Bucket:        aws.String(b.bucket),
-		Key:           b.key(key),
-		UploadId:      aws.String(uploadID),
-		PartNumber:    aws.Int32(number),
-		Body:          bytes.NewReader(body),
-		ContentLength: aws.Int64(int64(len(body))),
+		Bucket:            aws.String(b.bucket),
+		Key:               b.key(key),
+		UploadId:          aws.String(uploadID),
+		PartNumber:        aws.Int32(number),
+		Body:              bytes.NewReader(body),
+		ContentLength:     aws.Int64(int64(len(body))),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+		ChecksumCRC32:     aws.String(checksum),
 	})
 	if err != nil {
-		return "", s3Err("upload part", err)
+		return store.Part{}, s3Err("upload part", err)
 	}
 	if out.ETag == nil {
-		return "", fmt.Errorf("awsstore: upload part: no ETag")
+		return store.Part{}, fmt.Errorf("awsstore: upload part: no ETag")
 	}
-	return *out.ETag, nil
+	return store.Part{Number: number, ETag: *out.ETag, Size: int64(len(body)), Checksum: checksum}, nil
 }
 
 // CompleteMultipart implements store.Blobs.
@@ -106,6 +124,9 @@ func (b *Blobs) CompleteMultipart(ctx context.Context, key, uploadID string, par
 	completed := make([]types.CompletedPart, len(parts))
 	for i, p := range parts {
 		completed[i] = types.CompletedPart{PartNumber: aws.Int32(p.Number), ETag: aws.String(p.ETag)}
+		if p.Checksum != "" {
+			completed[i].ChecksumCRC32 = aws.String(p.Checksum)
+		}
 	}
 	_, err := b.api.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(b.bucket),

@@ -1,6 +1,7 @@
 package ftserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -30,13 +31,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The pre-check is recognised by its empty body, whatever Content-Type
+	// a client copies onto it, and before any upload limit is applied.
+	body, empty := peekEmpty(r, s.bodyReader(w, r))
+	if empty {
+		s.metrics.Count("upload.precheck", 1)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	ct := r.Header.Get("Content-Type")
 	if mt, _, _ := mime.ParseMediaType(ct); mt != "multipart/form-data" {
-		if isEmpty(r, s.bodyReader(w, r)) {
-			s.metrics.Count("upload.precheck", 1)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 		s.uploadFailed(w, "not_multipart", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -45,9 +49,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		serviceUnavailable(w, wait)
 		return
 	}
-	release, ok := s.acquireSlot()
-	if !ok {
-		s.metrics.Count("upload.failed.busy", 1)
+	release, reason := s.acquireUpload(id.owner)
+	if release == nil {
+		s.metrics.Count("upload.failed."+reason, 1)
 		serviceUnavailable(w, retryAfter)
 		return
 	}
@@ -57,7 +61,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	form, err := readUploadHead(ct, s.bodyReader(w, r), formLimits{maxFile: s.o.MaxSize, maxThumbnail: s.o.MaxThumbnailSize})
+	form, err := readUploadHead(ct, body, formLimits{maxFile: s.o.MaxSize, maxThumbnail: s.o.MaxThumbnailSize})
 	if err != nil {
 		s.formFailed(w, err)
 		return
@@ -88,16 +92,29 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	s.finishUpload(w, r, wr)
 }
 
-// isEmpty reports whether the request has no body. A pre-check POST may still
-// be sent chunked, with no Content-Length, so the body is tried.
-func isEmpty(r *http.Request, body io.Reader) bool {
+// peekEmpty reports whether the request has no body, and returns the body
+// to read otherwise. A pre-check POST may be sent chunked, with no
+// Content-Length, so the first byte is tried and handed back.
+func peekEmpty(r *http.Request, body io.Reader) (io.Reader, bool) {
 	if r.ContentLength == 0 {
-		return true
+		return body, true
 	}
 	var b [1]byte
 	n, err := io.ReadFull(body, b[:])
-	return n == 0 && err == io.EOF
+	if n == 0 && err == io.EOF {
+		return body, true
+	}
+	if n == 0 {
+		return errorReader{err}, false
+	}
+	return io.MultiReader(bytes.NewReader(b[:n]), body), false
 }
+
+// errorReader fails every read with err: a body that broke on its first
+// byte.
+type errorReader struct{ err error }
+
+func (e errorReader) Read([]byte) (int, error) { return 0, e.err }
 
 // beginUpload finds or creates owner's record for the form's tid and takes
 // its lease. A tid that is still uploading starts again from the first byte:
@@ -116,18 +133,22 @@ func (s *Server) beginUpload(ctx context.Context, id identity, form *uploadForm)
 	case rec.State != store.Uploading:
 		return store.Record{}, errTIDUsed
 	}
-	previous := rec.MultipartID
+	previousKey, previous := rec.Object, rec.MultipartID
+	thumbKey, err := s.thumbnailKey(rec.ID, form)
+	if err != nil {
+		return store.Record{}, err
+	}
 	now := s.now()
 	rec, err = s.acquireLease(ctx, rec, func(r *store.Record) {
 		clearContent(r)
-		describe(r, form)
+		describe(r, form, thumbKey)
 		r.Expires = now.Add(s.o.Validity)
 	})
 	if err != nil {
 		return store.Record{}, err
 	}
 	if previous != "" {
-		_ = s.o.Blobs.AbortMultipart(sctx, rec.ID, previous)
+		_ = s.o.Blobs.AbortMultipart(sctx, previousKey, previous)
 	}
 	s.metrics.Count("upload.restarted", 1)
 	return s.storeThumbnail(ctx, rec, form)
@@ -145,6 +166,10 @@ func (s *Server) createUpload(ctx context.Context, id identity, form *uploadForm
 	if err != nil {
 		return store.Record{}, err
 	}
+	thumbKey, err := s.thumbnailKey(fileID, form)
+	if err != nil {
+		return store.Record{}, err
+	}
 	now := s.now()
 	r := store.Record{
 		ID:         fileID,
@@ -156,27 +181,42 @@ func (s *Server) createUpload(ctx context.Context, id identity, form *uploadForm
 		Lease:      lease,
 		LeaseUntil: now.Add(s.leaseTTL),
 	}
-	describe(&r, form)
+	describe(&r, form, thumbKey)
 	rec, err := s.o.Metadata.Create(ctx, r)
 	switch {
 	case errors.Is(err, store.ErrExists):
 		// The same tid raced in through another request or task.
-		return store.Record{}, errBusy
+		return store.Record{}, &busyError{wait: retryAfter}
 	case err != nil:
 		return store.Record{}, storageErr("create record", err)
 	}
 	return s.storeThumbnail(ctx, rec, form)
 }
 
-// describe copies what the form declares about the file into r.
-func describe(r *store.Record, form *uploadForm) {
+// describe copies what the form declares about the file into r; the
+// thumbnail, if any, goes to thumbKey.
+func describe(r *store.Record, form *uploadForm, thumbKey string) {
 	r.FileName = form.file.name
 	r.ContentType = form.file.contentType
 	r.DeclaredSize = form.file.declaredSize
 	r.Thumbnail = nil
 	if t := form.thumbnail; t != nil {
-		r.Thumbnail = &store.Thumbnail{Size: int64(len(t.data)), ContentType: t.contentType}
+		r.Thumbnail = &store.Thumbnail{Key: thumbKey, Size: int64(len(t.data)), ContentType: t.contentType}
 	}
+}
+
+// thumbnailKey returns a fresh key for the form's thumbnail, or "" without
+// one. Each attempt has its own, like the file content, so a restart never
+// overwrites a thumbnail another attempt committed.
+func (s *Server) thumbnailKey(id string, form *uploadForm) (string, error) {
+	if form.thumbnail == nil {
+		return "", nil
+	}
+	key, err := s.newObjectKey(id)
+	if err != nil {
+		return "", err
+	}
+	return key + thumbnailSuffix, nil
 }
 
 // storeThumbnail stores the form's thumbnail, if any, before the file
@@ -188,7 +228,7 @@ func (s *Server) storeThumbnail(ctx context.Context, rec store.Record, form *upl
 	}
 	sctx, cancel := s.storageContext(ctx)
 	defer cancel()
-	if err := s.o.Blobs.Put(sctx, rec.ID+thumbnailSuffix, form.thumbnail.data, form.thumbnail.contentType); err != nil {
+	if err := s.o.Blobs.Put(sctx, rec.Thumbnail.Key, form.thumbnail.data, form.thumbnail.contentType); err != nil {
 		s.releaseLease(ctx, rec)
 		return store.Record{}, storageErr("put thumbnail", err)
 	}
@@ -243,9 +283,9 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request, tid string
 		s.uploadFailed(w, "bad_content_range", http.StatusBadRequest)
 		return
 	}
-	release, ok := s.acquireSlot()
-	if !ok {
-		s.metrics.Count("upload.failed.busy", 1)
+	release, reason := s.acquireUpload(id.owner)
+	if release == nil {
+		s.metrics.Count("upload.failed."+reason, 1)
 		serviceUnavailable(w, retryAfter)
 		return
 	}
@@ -394,13 +434,18 @@ func (s *Server) formFailed(w http.ResponseWriter, err error) {
 func (s *Server) failUpload(w http.ResponseWriter, err error) {
 	var se *storageError
 	var ne net.Error
+	var busy *busyError
 	switch {
+	case errors.As(err, &busy):
+		// A request still holds the lease, often one whose connection has
+		// gone half-open after the client changed networks; RCS clients
+		// retry a 503 after Retry-After but give up on a 409.
+		s.metrics.Count("upload.failed.leased", 1)
+		serviceUnavailable(w, busy.wait)
 	case errors.Is(err, errFileTooLarge):
 		s.uploadFailed(w, "too_large", http.StatusRequestEntityTooLarge)
 	case errors.Is(err, errLengthMismatch):
 		s.uploadFailed(w, "length_mismatch", http.StatusBadRequest)
-	case errors.Is(err, errBusy):
-		s.uploadFailed(w, "busy", http.StatusConflict)
 	case errors.Is(err, errTIDUsed):
 		s.uploadFailed(w, "tid_used", http.StatusConflict)
 	case errors.Is(err, errLostLease), errors.Is(err, errUploadGone):
@@ -408,6 +453,10 @@ func (s *Server) failUpload(w http.ResponseWriter, err error) {
 	case errors.As(err, &se):
 		s.log.Warn("storage failed", slog.String("op", se.op), slog.String("error", pii.Redact(se.err.Error())))
 		s.uploadFailed(w, "storage", http.StatusInternalServerError)
+	case errors.Is(err, errTooManyParts):
+		s.uploadFailed(w, "too_large", http.StatusRequestEntityTooLarge)
+	case errors.Is(err, errTooSlow):
+		s.uploadFailed(w, "too_slow", http.StatusRequestTimeout)
 	case errors.Is(err, errUploadTimeout), errors.Is(err, os.ErrDeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
 		s.uploadFailed(w, "timeout", http.StatusRequestTimeout)
 	case errors.Is(err, context.Canceled):
@@ -440,25 +489,39 @@ const sweepBatch = 100
 // once rather than when the bucket's lifecycle rule gets to it. Deleting
 // complete content is the lifecycle rule's job (docs/ft-server.md).
 func (s *Server) Sweep(ctx context.Context) (int, error) {
+	start := s.wallNow()
+	defer func() { s.metrics.Timing("sweep.duration", s.wallNow().Sub(start)) }()
 	now := s.now()
-	list, err := s.o.Metadata.ListExpired(ctx, now, sweepBatch)
+	// Each call has its own deadline: a request that never answers must not
+	// stop the sweeper silently.
+	lctx, cancel := context.WithTimeout(ctx, s.o.StorageTimeout)
+	list, err := s.o.Metadata.ListExpired(lctx, now, sweepBatch)
+	cancel()
 	if err != nil {
 		return 0, err
 	}
 	marked := 0
 	for _, rec := range list {
+		if ctx.Err() != nil {
+			break
+		}
 		if rec.State == store.Uploading && rec.Lease != "" && now.Before(rec.LeaseUntil) {
 			continue // a request is still writing; the next sweep gets it
 		}
-		multipart := rec.MultipartID
+		key, multipart := rec.Object, rec.MultipartID
 		rec.State = store.Expired
-		clearContent(&rec)
-		rec.Lease, rec.LeaseUntil = "", time.Time{}
-		if _, err := s.o.Metadata.Update(ctx, rec); err != nil {
-			continue // changed meanwhile; the next sweep sees the new version
-		}
 		if multipart != "" {
-			_ = s.o.Blobs.AbortMultipart(ctx, rec.ID, multipart)
+			clearContent(&rec)
+		}
+		rec.Lease, rec.LeaseUntil = "", time.Time{}
+		uctx, cancel := context.WithTimeout(ctx, s.o.StorageTimeout)
+		_, err := s.o.Metadata.Update(uctx, rec)
+		if err == nil && multipart != "" {
+			_ = s.o.Blobs.AbortMultipart(uctx, key, multipart)
+		}
+		cancel()
+		if err != nil {
+			continue // changed meanwhile; the next sweep sees the new version
 		}
 		marked++
 	}

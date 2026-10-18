@@ -75,13 +75,13 @@ func TestMemoryBlobsEnforceThePartRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e1, _ := b.UploadPart(ctx, "k", id, 1, []byte("ab"))
-	e2, _ := b.UploadPart(ctx, "k", id, 2, []byte("cd"))
-	small := []store.Part{{Number: 1, ETag: e1}, {Number: 2, ETag: e2}}
+	p1, _ := b.UploadPart(ctx, "k", id, 1, []byte("ab"))
+	p2, _ := b.UploadPart(ctx, "k", id, 2, []byte("cd"))
+	small := []store.Part{p1, p2}
 	if err := b.CompleteMultipart(ctx, "k", id, small); !errors.Is(err, store.ErrInvalidParts) {
 		t.Fatalf("a non-last part below the minimum: %v", err)
 	}
-	unordered := []store.Part{{Number: 2, ETag: e2}, {Number: 1, ETag: e1}}
+	unordered := []store.Part{p2, p1}
 	if err := b.CompleteMultipart(ctx, "k", id, unordered); !errors.Is(err, store.ErrInvalidParts) {
 		t.Fatalf("parts out of order: %v", err)
 	}

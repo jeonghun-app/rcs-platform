@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -110,7 +111,8 @@ func TestUploadReturnsFileInfoForFileAndThumbnail(t *testing.T) {
 		t.Fatalf("branded-url without FT_BRANDED_URI: %q", f.BrandedURL)
 	}
 	id, _, _ := parseDownloadID(strings.TrimPrefix(f.Data.URL, "https://ft.example.test/dl?id="))
-	stored, ok := e.blobs.Object(id)
+	r0, _ := e.meta.Get(t.Context(), id)
+	stored, ok := e.blobs.Object(r0.Object)
 	if !ok || string(stored) != data {
 		t.Fatalf("stored object is %d bytes, want %d", len(stored), len(data))
 	}
@@ -295,7 +297,7 @@ func TestRateLimitForgetsIdleUsers(t *testing.T) {
 
 func TestUploadsBeyondTheTaskLimitAreTurnedAway(t *testing.T) {
 	e := newEnv(t, func(o *Options) { o.MaxConcurrentUploads = 1 })
-	release, ok := e.srv.acquireSlot()
+	release, ok := acquireSlot(e.srv.slots)
 	if !ok {
 		t.Fatal("no slot")
 	}
@@ -360,8 +362,13 @@ func TestUploadOfALeasedTIDIsBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := u.upload(multipartBody(tidPart("leased"), filePart("a", "text/plain", "x")))
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", rec.Code)
+	// 503, not 409: RCS clients retry after Retry-After, which is never
+	// longer than a lease lasts without renewal.
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != strconv.Itoa(int(e.srv.leaseTTL/time.Second)) {
+		t.Fatalf("status = %d, Retry-After %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if e.metric("upload.failed.leased") != 1 {
+		t.Fatal("busy lease not counted")
 	}
 	// A lease whose holder died lapses.
 	e.clock.Advance(2 * time.Hour)
@@ -369,51 +376,70 @@ func TestUploadOfALeasedTIDIsBusy(t *testing.T) {
 	u.uploadFile("leased", "x")
 }
 
-func TestConcurrentCompletionOfOneTIDSucceedsOnce(t *testing.T) {
+func TestConcurrentCompletionOfOneTIDSucceedsOnceAndKeepsTheWinnersContent(t *testing.T) {
 	e := newEnv(t)
 	ctx := t.Context()
-	rec, err := e.meta.Create(ctx, store.Record{
-		ID: "concurrent-file-id-00000", Owner: alice, TID: "race", State: store.Uploading,
-		DeclaredSize: -1, Created: e.clock.Now(), Expires: e.clock.Now().Add(time.Hour),
-		Lease: "held", LeaseUntil: e.clock.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Two tasks that both believe they hold the record at this version: the
-	// conditional update lets exactly one complete it.
-	const writers = 2
-	var wg sync.WaitGroup
-	errs := make([]error, writers)
-	for i := range writers {
-		wg.Go(func() {
-			w, err := e.srv.newWriter(rec)
-			if err != nil {
-				errs[i] = err
-				return
-			}
-			defer w.close()
-			if err := w.copy(ctx, strings.NewReader("content "+strconv.Itoa(i))); err != nil {
-				errs[i] = err
-				return
-			}
-			_, errs[i] = w.complete(ctx)
-		})
-	}
-	wg.Wait()
-	ok, lost := 0, 0
-	for _, err := range errs {
-		switch {
-		case err == nil:
-			ok++
-		case errors.Is(err, errLostLease):
-			lost++
-		default:
-			t.Fatalf("complete = %v", err)
+	// Two tasks that both believe they hold the record at this version, as
+	// after a broken lease: the conditional update lets exactly one complete
+	// it, and the loser's content, written under a key of its own, cannot
+	// replace the winner's. Run often enough to meet every interleaving of
+	// the two writers' storage calls; even and odd runs cover a
+	// single-object file and a multipart one.
+	for run := range 300 {
+		size := 20
+		if run%2 == 1 {
+			size = 2*testPart + 20
 		}
-	}
-	if ok != 1 || lost != 1 {
-		t.Fatalf("%d completions succeeded and %d lost, want 1 and 1", ok, lost)
+		rec, err := e.meta.Create(ctx, store.Record{
+			ID: fmt.Sprintf("concurrent-%05d-00000000000", run)[:idLength], Owner: alice, TID: "race-" + strconv.Itoa(run),
+			State: store.Uploading, DeclaredSize: -1, Created: e.clock.Now(), Expires: e.clock.Now().Add(time.Hour),
+			Lease: "held", LeaseUntil: e.clock.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents := []string{strings.Repeat("A", size), strings.Repeat("B", size)}
+		var wg sync.WaitGroup
+		results := make([]store.Record, 2)
+		errs := make([]error, 2)
+		for i := range 2 {
+			wg.Go(func() {
+				w, err := e.srv.newWriter(rec)
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				defer w.close()
+				if err := w.copy(ctx, strings.NewReader(contents[i])); err != nil {
+					errs[i] = err
+					return
+				}
+				results[i], errs[i] = w.complete(ctx)
+			})
+		}
+		wg.Wait()
+		winner := -1
+		for i, err := range errs {
+			switch {
+			case err == nil && winner < 0:
+				winner = i
+			case err == nil:
+				t.Fatalf("run %d: both completions succeeded", run)
+			case !errors.Is(err, errLostLease) && !errors.Is(err, errUploadGone):
+				t.Fatalf("run %d: complete = %v", run, err)
+			}
+		}
+		if winner < 0 {
+			t.Fatalf("run %d: no completion succeeded: %v", run, errs)
+		}
+		stored, err := e.meta.Get(ctx, rec.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		object, ok := e.blobs.Object(stored.Object)
+		if !ok || string(object) != contents[winner] || !bytes.Equal(stored.SHA256, sha(contents[winner])) {
+			t.Fatalf("run %d: the stored object is not the winner's content (%d bytes)", run, len(object))
+		}
 	}
 }
 
@@ -432,8 +458,11 @@ func TestConcurrentResumesOfOneTIDHaveOneWriter(t *testing.T) {
 		wg.Go(func() { codes[i] = e.do(r).Code })
 	}
 	wg.Wait()
-	if !(codes[0] == http.StatusOK && codes[1] == http.StatusConflict || codes[0] == http.StatusConflict && codes[1] == http.StatusOK) {
-		t.Fatalf("racing resumes answered %v, want one 200 and one 409", codes)
+	// The loser finds the lease held (503) or the upload already complete
+	// (409).
+	loser := codes[0] + codes[1] - http.StatusOK
+	if codes[0] != http.StatusOK && codes[1] != http.StatusOK || loser != http.StatusServiceUnavailable && loser != http.StatusConflict {
+		t.Fatalf("racing resumes answered %v, want one 200 and one 503 or 409", codes)
 	}
 	doc := parseFileDocument(t, u.get("/ft?tid=race&get_download_info").Body.Bytes())
 	if got := u.get(downloadTarget(t, fileOf(t, doc).Data.URL)).Body.String(); got != data {

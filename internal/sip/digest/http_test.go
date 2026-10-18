@@ -165,3 +165,66 @@ func TestHTTPReusedNonceWithIncreasingCountIsAccepted(t *testing.T) {
 		t.Fatalf("replayed nc: err = %v, want ErrReplayed", err)
 	}
 }
+
+func TestPathOnlyURIIsRefusedByDefault(t *testing.T) {
+	h := newHarness(t)
+	ch := h.challenge(t, MD5)
+	r := httptest.NewRequest(http.MethodGet, "/ft?tid=t1&get_upload_info", nil)
+	r.Header.Set("Authorization", httpAnswer(t, ch, http.MethodGet, "/ft", 1))
+	if _, err := h.server.VerifyHTTP(r, lookupFor(testPass)); !errors.Is(err, ErrURIMismatch) {
+		t.Fatalf("err = %v, want ErrURIMismatch", err)
+	}
+}
+
+func TestPathOnlyURIIsAcceptedWhenEnabledAndOnlyForTheSamePath(t *testing.T) {
+	h := newHarness(t)
+	h.server.httpPathOnlyURI = true
+	ch := h.challenge(t, MD5)
+	nc := uint32(0)
+	verify := func(method, target, uri string) error {
+		nc++
+		r := httptest.NewRequest(method, target, nil)
+		r.Header.Set("Authorization", httpAnswer(t, ch, method, uri, nc))
+		c, err := h.server.VerifyHTTP(r, lookupFor(testPass))
+		if err == nil && PathOnlyURI(r, c) != (uri != target) {
+			t.Errorf("PathOnlyURI(%s, %s) = %v", target, uri, PathOnlyURI(r, c))
+		}
+		return err
+	}
+	for _, c := range []struct {
+		target, uri string
+		want        error
+	}{
+		{"/ft?tid=t1&get_upload_info", "/ft", nil},
+		{"/ft?tid=t1&get_download_info", "/ft?tid=t1&get_download_info", nil},
+		{"/ft?tid=t1&get_upload_info", "/dl", ErrURIMismatch},
+		{"/ft?tid=t1&get_upload_info", "/ft?tid=other&get_upload_info", ErrURIMismatch},
+		{"/ft?tid=t1&get_upload_info", "/ft?", ErrURIMismatch},
+		{"/ft", "/ft/", ErrURIMismatch},
+		{"/ft/t1", "/ft", ErrURIMismatch},
+	} {
+		if err := verify(http.MethodGet, c.target, c.uri); !errors.Is(err, c.want) && !(c.want == nil && err == nil) {
+			t.Errorf("target %s, uri %s: %v, want %v", c.target, c.uri, err, c.want)
+		}
+	}
+	// The method is still bound: the response for GET does not verify a PUT.
+	nc++
+	r := httptest.NewRequest(http.MethodPut, "/ft?tid=t1", nil)
+	r.Header.Set("Authorization", httpAnswer(t, ch, http.MethodGet, "/ft", nc))
+	if _, err := h.server.VerifyHTTP(r, lookupFor(testPass)); !errors.Is(err, ErrWrongResponse) {
+		t.Fatalf("method mismatch: %v", err)
+	}
+}
+
+func TestHTTPChallengeEndsWithMD5ForClientsThatReadTheLastField(t *testing.T) {
+	h := newHarness(t)
+	w := httptest.NewRecorder()
+	if err := h.server.ChallengeHTTP(w, false); err != nil {
+		t.Fatal(err)
+	}
+	values := w.Header().Values("WWW-Authenticate")
+	last, err := ParseChallenge(values[len(values)-1])
+	if err != nil || last.Algorithm != MD5 {
+		t.Fatalf("last challenge = %+v, %v; rcsjta answers the last field as MD5", last, err)
+	}
+}

@@ -23,29 +23,33 @@ import (
 // than the last.
 const minPartSize = 5 << 20
 
-// maxParts is the most parts an S3 multipart upload may have.
-const maxParts = 10000
+// maxParts bounds the parts of one upload. S3 allows 10000, but every part is
+// listed in the record, and a DynamoDB item (400 KB) holds about 7000 part
+// entries; 5000 leaves room for the rest of the record.
+const maxParts = 5000
 
-// leaseMargin is added to a writer's lease beyond the longest a request can
-// last, so that a lease never expires under a live writer even with some clock
-// difference between tasks.
-const leaseMargin = time.Minute
-
-// retryAfter is the Retry-After of a 503: when a task is at its upload limit
-// or a user at their rate limit.
+// retryAfter is the Retry-After of a 503 for a full task, a user at their
+// limits, a credential backend that is down, and a tid that another request
+// is creating.
 const retryAfter = 10 * time.Second
+
+// rateWindow is the interval over which FT_MIN_UPLOAD_RATE is measured.
+const rateWindow = time.Minute
 
 // Options configures a Server. Every field without a stated default is
 // required.
 type Options struct {
 	// UploadURI is the public ftHTTPCSURI and DownloadURI the public
-	// ftHTTPDLURI (what acs provisions). The server answers on their paths;
-	// the documents it returns link to them.
+	// ftHTTPDLURI (what acs provisions). The server answers on their paths,
+	// which must not end in '/'; the documents it returns link to them.
 	UploadURI, DownloadURI *url.URL
 	// BrandedURI, when set, adds a branded-url to each file's file-info: the
 	// same id on an operator's web page, for recipients without RCS.
 	BrandedURI *url.URL
 
+	// Digest verifies credentials. It should accept a path-only uri
+	// (digest.ServerConfig.HTTPPathOnlyURI) for the info requests of RCS
+	// clients that sign only the path.
 	Digest      *digest.Server
 	Credentials CredentialSource
 	Metadata    store.Metadata
@@ -66,8 +70,17 @@ type Options struct {
 	DownloadAuth bool
 	// UploadsPerMinute limits new uploads per user and task; 0 disables it.
 	UploadsPerMinute int
-	// MaxConcurrentUploads bounds uploads in progress on this task.
-	MaxConcurrentUploads int
+	// MaxConcurrentUploads bounds uploads and resumes in progress on this
+	// task, and MaxUploadsPerUser those of one user on it.
+	MaxConcurrentUploads, MaxUploadsPerUser int
+	// MaxConcurrentDownloads bounds downloads in progress on this task.
+	MaxConcurrentDownloads int
+	// MaxConcurrentLookups bounds credential lookups in progress on this
+	// task, so requests from the internet cannot load the HSS without limit.
+	MaxConcurrentLookups int
+	// MinUploadRate is the slowest an upload body may arrive, in bytes per
+	// second averaged over a minute; 0 disables the check.
+	MinUploadRate int64
 	// IdleTimeout ends a transfer that moves no byte for that long; zero
 	// disables connection deadlines (tests with a ResponseRecorder).
 	// UploadTimeout bounds one upload request end to end.
@@ -76,9 +89,10 @@ type Options struct {
 	StorageTimeout time.Duration
 
 	// Now is the clock for validity and leases; time.Now when nil.
-	// Connection deadlines always use the wall clock.
+	// Connection deadlines and the transfer rate use the wall clock.
 	Now func() time.Time
-	// Random supplies file ids and lease tokens; crypto/rand when nil.
+	// Random supplies file ids, object keys and lease tokens; crypto/rand
+	// when nil.
 	Random io.Reader
 }
 
@@ -89,13 +103,22 @@ type Server struct {
 	uploadPath   string
 	downloadPath string
 	now          func() time.Time
+	wallNow      func() time.Time
 	random       io.Reader
 	log          *slog.Logger
 	metrics      *runtime.Metrics
 	limiter      *limiter
 	slots        chan struct{}
+	downloads    chan struct{}
+	lookups      chan struct{}
+	perUser      *userSlots
+	writers      activity
 	buffers      sync.Pool
-	leaseTTL     time.Duration
+	// leaseTTL is how long a lease lasts without renewal: twice the longest
+	// a live writer can go without renewing (a read waiting IdleTimeout and
+	// a storage call taking StorageTimeout), so that it never lapses under
+	// one, and short enough that a dead task's lease lapses in minutes.
+	leaseTTL time.Duration
 }
 
 // New validates o and returns a Server.
@@ -109,18 +132,24 @@ func New(o Options) (*Server, error) {
 		return nil, errors.New("ftserver: logger and metrics are required")
 	case o.MaxSize <= 0 || o.MaxThumbnailSize <= 0 || o.PartSize <= 0:
 		return nil, errors.New("ftserver: sizes must be positive")
-	case (o.MaxSize+o.PartSize-1)/o.PartSize > maxParts:
-		return nil, errors.New("ftserver: the maximum size needs more than 10000 parts")
+	case (o.MaxSize+o.PartSize-1)/o.PartSize >= maxParts:
+		return nil, errors.New("ftserver: the maximum size needs too many parts")
 	case o.Validity <= 0 || o.UploadTimeout <= 0 || o.StorageTimeout <= 0 || o.IdleTimeout < 0:
 		return nil, errors.New("ftserver: validity and timeouts must be positive")
-	case o.MaxConcurrentUploads <= 0 || o.UploadsPerMinute < 0:
-		return nil, errors.New("ftserver: upload limits must be positive")
+	case o.MaxConcurrentUploads <= 0 || o.MaxUploadsPerUser <= 0 || o.MaxConcurrentDownloads <= 0 ||
+		o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 || o.MinUploadRate < 0:
+		return nil, errors.New("ftserver: concurrency limits must be positive")
 	}
-	up, down := cleanPath(o.UploadURI), cleanPath(o.DownloadURI)
+	up, down := o.UploadURI.Path, o.DownloadURI.Path
 	switch {
-	case up == "/":
+	case up == "" || up == "/" || down == "":
 		// Resume URLs live below the upload path, so it cannot be the root.
-		return nil, errors.New("ftserver: the upload URI needs a path")
+		return nil, errors.New("ftserver: the upload and download URIs need a path")
+	case strings.HasSuffix(up, "/") || strings.HasSuffix(down, "/"):
+		// Links are built from the URI as given and requests are routed on
+		// the exact path, so a trailing '/' would make the server's own
+		// links miss it.
+		return nil, errors.New("ftserver: the upload and download paths must not end in '/'")
 	case up == down || strings.HasPrefix(down, up+"/"):
 		return nil, errors.New("ftserver: the download path must not be the upload path or below it")
 	}
@@ -129,13 +158,15 @@ func New(o Options) (*Server, error) {
 		uploadPath:   up,
 		downloadPath: down,
 		now:          o.Now,
+		wallNow:      time.Now,
 		random:       o.Random,
 		log:          o.Logger,
 		metrics:      o.Metrics,
 		slots:        make(chan struct{}, o.MaxConcurrentUploads),
-		// A request lasts at most UploadTimeout, and its last storage call
-		// at most StorageTimeout beyond; see acquireLease.
-		leaseTTL: o.UploadTimeout + o.StorageTimeout + leaseMargin,
+		downloads:    make(chan struct{}, o.MaxConcurrentDownloads),
+		lookups:      make(chan struct{}, o.MaxConcurrentLookups),
+		perUser:      &userSlots{max: o.MaxUploadsPerUser, n: map[string]int{}},
+		leaseTTL:     2 * (o.IdleTimeout + o.StorageTimeout),
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -144,25 +175,21 @@ func New(o Options) (*Server, error) {
 		s.random = rand.Reader
 	}
 	s.limiter = newLimiter(o.UploadsPerMinute, s.now)
-	partSize := o.PartSize
-	s.buffers.New = func() any { b := make([]byte, 0, partSize); return &b }
+	// One byte more than a part: a full part is stored only once the next
+	// byte has arrived (see writer).
+	size := o.PartSize + 1
+	s.buffers.New = func() any { b := make([]byte, 0, size); return &b }
 	return s, nil
-}
-
-func cleanPath(u *url.URL) string {
-	p := strings.TrimSuffix(u.Path, "/")
-	if p == "" {
-		return "/"
-	}
-	return p
 }
 
 // ServeHTTP routes the upload path (POST upload, GET upload and download
 // info), resume URLs below it (PUT) and the download path (GET, HEAD).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Every answer is about one user's transfer; none may be cached on the
-	// way. Downloads replace this (see handleDownload).
+	// way, and none is to be sniffed into something else. Downloads replace
+	// the cache rule (see handleDownload).
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	s.extendWrite(w)
 	switch p := r.URL.Path; {
 	case p == s.downloadPath:
@@ -174,6 +201,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == s.uploadPath:
 		switch r.Method {
 		case http.MethodPost:
+			defer s.writers.start()()
 			s.handleUpload(w, r)
 		case http.MethodGet:
 			s.handleInfo(w, r)
@@ -190,9 +218,57 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, "PUT")
 			return
 		}
+		defer s.writers.start()()
 		s.handleResume(w, r, tid)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// WaitWriters returns once no upload or resume handler is running, or when
+// ctx ends. At shutdown, after the listener has closed their connections, it
+// lets those handlers release their leases before the process exits.
+func (s *Server) WaitWriters(ctx context.Context) error {
+	return s.writers.wait(ctx)
+}
+
+// activity counts running handlers. A sync.WaitGroup is not used because
+// new requests may still arrive while shutdown waits.
+type activity struct {
+	mu   sync.Mutex
+	n    int
+	idle chan struct{} // closed while n == 0; nil means closed
+}
+
+func (a *activity) start() (done func()) {
+	a.mu.Lock()
+	if a.n == 0 {
+		a.idle = make(chan struct{})
+	}
+	a.n++
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.n--; a.n == 0 {
+			close(a.idle)
+		}
+	}
+}
+
+func (a *activity) wait(ctx context.Context) error {
+	a.mu.Lock()
+	idle := a.idle
+	n := a.n
+	a.mu.Unlock()
+	if n == 0 {
+		return nil
+	}
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -206,38 +282,62 @@ type identity struct {
 	owner string
 }
 
+// errLookupBusy fails a credential lookup when the task already has
+// MaxConcurrentLookups in progress.
+var errLookupBusy = errors.New("ftserver: too many credential lookups in progress")
+
 // authenticate verifies the request's Digest credentials (RFC 7616 via
-// internal/sip/digest). On failure it has answered 401 with a fresh
-// challenge, stale=true only for a correct response with an expired nonce,
-// and the same answer for every other failure: no credentials, an unknown
-// user, a wrong password, a replay, a failed lookup. A client therefore
-// cannot learn which user names exist.
+// internal/sip/digest). On failure it has answered.
+//
+// Every credential failure (no credentials, an unknown user, a wrong
+// password, a replay, a wrong uri) gets the same 401 with a fresh challenge,
+// stale=true only for a correct response with an expired nonce, so a client
+// cannot learn which user names exist. A failure of the credential backend
+// itself, or a task at its lookup limit, gets 503 with Retry-After instead:
+// it says nothing about the user, and RCS clients retry a 503 but give up
+// after a second 401.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity, bool) {
 	var cred Credential
 	var lookupErr error
-	_, err := s.o.Digest.VerifyHTTP(r, func(ctx context.Context, username string, alg digest.Algorithm) (digest.Secret, error) {
-		c, err := s.o.Credentials.Lookup(ctx, username, alg)
+	c, err := s.o.Digest.VerifyHTTP(r, func(ctx context.Context, username string, alg digest.Algorithm) (digest.Secret, error) {
+		select {
+		case s.lookups <- struct{}{}:
+			defer func() { <-s.lookups }()
+		default:
+			lookupErr = errLookupBusy
+			return digest.Secret{}, lookupErr
+		}
+		found, err := s.o.Credentials.Lookup(ctx, username, alg)
 		if err != nil {
 			lookupErr = err
 			return digest.Secret{}, err
 		}
-		cred = c
-		return c.Secret, nil
+		cred = found
+		return found.Secret, nil
 	})
 	if err == nil {
+		if digest.PathOnlyURI(r, c) {
+			// A deviation accepted for interoperability, counted
+			// (docs/architecture.md §8) so it can be withdrawn on evidence.
+			s.metrics.Count("auth.uri_path_only", 1)
+		}
 		return identity{owner: cred.Owner}, true
 	}
 	stale := errors.Is(err, digest.ErrStaleNonce)
 	switch {
+	case errors.Is(lookupErr, errLookupBusy):
+		s.metrics.Count("auth.lookup_busy", 1)
+		serviceUnavailable(w, time.Second)
+		return identity{}, false
+	case lookupErr != nil && !errors.Is(lookupErr, ErrUnknownUser):
+		s.metrics.Count("auth.backend_error", 1)
+		s.log.Warn("credential lookup failed", slog.String("error", pii.Redact(lookupErr.Error())))
+		serviceUnavailable(w, retryAfter)
+		return identity{}, false
 	case errors.Is(err, digest.ErrNoCredentials):
 		s.metrics.Count("auth.challenged", 1)
 	case stale:
 		s.metrics.Count("auth.stale", 1)
-	case lookupErr != nil && !errors.Is(lookupErr, ErrUnknownUser):
-		// The client still gets the uniform 401; the operator gets the
-		// cause, which names no user.
-		s.metrics.Count("auth.backend_error", 1)
-		s.log.Warn("credential lookup failed", slog.String("error", pii.Redact(lookupErr.Error())))
 	default:
 		s.metrics.Count("auth.failed", 1)
 	}
@@ -251,19 +351,58 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 // serviceUnavailable answers 503 with Retry-After, which RCS clients honour
 // before retrying an upload.
 func serviceUnavailable(w http.ResponseWriter, after time.Duration) {
-	w.Header().Set("Retry-After", strconv.Itoa(int((after+time.Second-1)/time.Second)))
+	w.Header().Set("Retry-After", strconv.Itoa(max(1, int((after+time.Second-1)/time.Second))))
 	http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 }
 
-// acquireSlot reserves one of the task's concurrent upload slots, each of
-// which holds a part buffer.
-func (s *Server) acquireSlot() (release func(), ok bool) {
+// acquireSlot reserves one of the task's slots in slots (uploads, each of
+// which holds a part buffer, or downloads).
+func acquireSlot(slots chan struct{}) (release func(), ok bool) {
 	select {
-	case s.slots <- struct{}{}:
-		return func() { <-s.slots }, true
+	case slots <- struct{}{}:
+		return func() { <-slots }, true
 	default:
 		return nil, false
 	}
+}
+
+// acquireUpload reserves an upload slot on the task and one of owner's,
+// so that one user cannot hold every slot of a task. reason names the limit
+// that refused it.
+func (s *Server) acquireUpload(owner string) (release func(), reason string) {
+	task, ok := acquireSlot(s.slots)
+	if !ok {
+		return nil, "busy"
+	}
+	user, ok := s.perUser.acquire(owner)
+	if !ok {
+		task()
+		return nil, "user_busy"
+	}
+	return func() { user(); task() }, ""
+}
+
+// userSlots counts uploads in progress per owner.
+type userSlots struct {
+	max int
+	mu  sync.Mutex
+	n   map[string]int
+}
+
+func (u *userSlots) acquire(owner string) (release func(), ok bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.n[owner] >= u.max {
+		return nil, false
+	}
+	u.n[owner]++
+	return func() {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if u.n[owner]--; u.n[owner] == 0 {
+			delete(u.n, owner)
+		}
+	}, true
 }
 
 // storageContext bounds one storage call. It does not end with the request:
@@ -279,47 +418,72 @@ func (s *Server) storageContext(ctx context.Context) (context.Context, context.C
 // connection instead.
 func (s *Server) extendWrite(w http.ResponseWriter) {
 	if s.o.IdleTimeout > 0 {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.o.IdleTimeout))
+		_ = http.NewResponseController(w).SetWriteDeadline(s.wallNow().Add(s.o.IdleTimeout))
 	}
 }
 
-// bodyReader returns r's body with deadlines: each read must make progress
-// within IdleTimeout, and the whole body must arrive within UploadTimeout.
+// bodyReader returns r's body with its limits: the whole body must arrive
+// within UploadTimeout and, measured over each minute, at MinUploadRate or
+// faster; with IdleTimeout, each read must also make progress within it.
 func (s *Server) bodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
-	if s.o.IdleTimeout == 0 {
-		return r.Body
+	now := s.wallNow()
+	d := &deadlineReader{
+		r:       r.Body,
+		now:     s.wallNow,
+		end:     now.Add(s.o.UploadTimeout),
+		idle:    s.o.IdleTimeout,
+		minRate: s.o.MinUploadRate,
+		window:  now,
 	}
-	return &deadlineReader{
-		r:   r.Body,
-		rc:  http.NewResponseController(w),
-		end: time.Now().Add(s.o.UploadTimeout),
-		idl: s.o.IdleTimeout,
+	if s.o.IdleTimeout > 0 {
+		d.rc = http.NewResponseController(w)
 	}
+	return d
 }
 
-// errUploadTimeout ends a request body that took longer than UploadTimeout.
-var errUploadTimeout = errors.New("ftserver: upload took longer than the upload timeout")
+// Errors of a body that arrives too slowly; both are answered 408.
+var (
+	errUploadTimeout = errors.New("ftserver: upload took longer than the upload timeout")
+	errTooSlow       = errors.New("ftserver: upload slower than the minimum rate")
+)
 
+// deadlineReader enforces bodyReader's limits. The minimum rate is what
+// stops a client from holding an upload slot for the whole UploadTimeout by
+// sending a byte just often enough to beat the idle deadline.
 type deadlineReader struct {
-	r   io.Reader
-	rc  *http.ResponseController
-	end time.Time
-	idl time.Duration
+	r       io.Reader
+	rc      *http.ResponseController
+	now     func() time.Time
+	end     time.Time
+	idle    time.Duration
+	minRate int64
+	window  time.Time // start of the current rate window
+	bytes   int64     // read in the current window
 }
 
 func (d *deadlineReader) Read(p []byte) (int, error) {
-	now := time.Now()
+	now := d.now()
 	if !now.Before(d.end) {
 		return 0, errUploadTimeout
 	}
-	deadline := now.Add(d.idl)
-	if deadline.After(d.end) {
-		deadline = d.end
+	if elapsed := now.Sub(d.window); elapsed >= rateWindow {
+		if d.minRate > 0 && float64(d.bytes) < float64(d.minRate)*elapsed.Seconds() {
+			return 0, errTooSlow
+		}
+		d.window, d.bytes = now, 0
 	}
-	// Not every ResponseWriter supports deadlines (http.ErrNotSupported);
-	// the read then simply has none.
-	_ = d.rc.SetReadDeadline(deadline)
-	return d.r.Read(p)
+	if d.rc != nil {
+		// Not every ResponseWriter supports deadlines (http.ErrNotSupported);
+		// the read then simply has none.
+		deadline := now.Add(d.idle)
+		if deadline.After(d.end) {
+			deadline = d.end
+		}
+		_ = d.rc.SetReadDeadline(deadline)
+	}
+	n, err := d.r.Read(p)
+	d.bytes += int64(n)
+	return n, err
 }
 
 // limiter is a token bucket per owner: perMinute new uploads, refilled

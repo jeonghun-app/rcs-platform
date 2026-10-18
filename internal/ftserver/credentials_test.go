@@ -63,7 +63,7 @@ func TestHSSCredentialsVerifyAnUpload(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, credentialJSON(t, digest.Algorithm(r.URL.Query().Get("algorithm")), alice))
 	})
-	src := NewHSSCredentials(mustURL(h.URL+"/hss/"), "provisioning-token", realm, time.Second)
+	src := NewHSSCredentials(mustURL(h.URL+"/hss/"), "provisioning-token", realm, time.Second, 4)
 	e := newEnv(t, func(o *Options) { o.Credentials = src })
 	doc := e.user(alice).uploadFile("via-hss", "content")
 	if len(doc.Infos) != 1 {
@@ -87,7 +87,7 @@ func TestHSSCredentialsVerifyAnUpload(t *testing.T) {
 
 func TestHSSRequestEscapesTheIMPIAsOnePathSegment(t *testing.T) {
 	h := newHSS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
-	src := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second)
+	src := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second, 4)
 	for _, name := range []string{"a/../../admin", "a?b#c", "a%2Fb", "."} {
 		_, err := src.Lookup(t.Context(), name, digest.MD5)
 		if !errors.Is(err, ErrUnknownUser) {
@@ -111,10 +111,12 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 		"server error":    {500, "", false},
 		"unauthorised":    {401, "", false},
 		"not json":        {200, "<html>", false},
-		"another realm":   {200, `{"impu":"` + impu + `","realm":"other","algorithm":"SHA-256","ha1":"00"}`, false},
-		"other algorithm": {200, `{"impu":"` + impu + `","realm":"` + realm + `","algorithm":"MD5","ha1":"00"}`, false},
-		"no impu":         {200, `{"realm":"` + realm + `","algorithm":"SHA-256","ha1":"00"}`, false},
-		"bad ha1":         {200, `{"impu":"` + impu + `","realm":"` + realm + `","algorithm":"SHA-256","ha1":"xyz"}`, false},
+		"another realm":   {200, `{"impi":"` + alice + `","impu":"` + impu + `","realm":"other","algorithm":"SHA-256","ha1":"00"}`, false},
+		"other algorithm": {200, `{"impi":"` + alice + `","impu":"` + impu + `","realm":"` + realm + `","algorithm":"MD5","ha1":"00"}`, false},
+		"no impu":         {200, `{"impi":"` + alice + `","realm":"` + realm + `","algorithm":"SHA-256","ha1":"00"}`, false},
+		"bad ha1":         {200, `{"impi":"` + alice + `","impu":"` + impu + `","realm":"` + realm + `","algorithm":"SHA-256","ha1":"xyz"}`, false},
+		"no impi":         {200, `{"impu":"` + impu + `","realm":"` + realm + `","algorithm":"SHA-256","ha1":"00"}`, true},
+		"respelt impi":    {200, `{"impi":"` + strings.ToUpper(alice) + `","impu":"` + impu + `","realm":"` + realm + `","algorithm":"SHA-256","ha1":"00"}`, true},
 		"too large":       {200, `{"impu":"` + strings.Repeat("x", maxHSSResponse) + `"}`, false},
 		"redirect":        {302, "", false},
 	} {
@@ -125,7 +127,7 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 			w.WriteHeader(c.status)
 			fmt.Fprint(w, c.body)
 		})
-		_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second).Lookup(t.Context(), alice, digest.SHA256)
+		_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second, 4).Lookup(t.Context(), alice, digest.SHA256)
 		if err == nil || errors.Is(err, ErrUnknownUser) != c.unknown {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -138,7 +140,7 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 func TestUnreachableHSSIsAnErrorWithoutTheURL(t *testing.T) {
 	h := newHSS(t, nil)
 	h.Close()
-	_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second).Lookup(context.Background(), alice, digest.SHA256)
+	_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second, 4).Lookup(context.Background(), alice, digest.SHA256)
 	if err == nil || strings.Contains(err.Error(), "subscriptions") {
 		t.Fatalf("err = %v", err)
 	}

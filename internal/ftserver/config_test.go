@@ -85,6 +85,15 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"ftp uri":             {with(devEnv, "FT_BRANDED_URI", "ftp://ft/x"), "FT_BRANDED_URI"},
 		"root upload":         {with(devEnv, "FT_UPLOAD_URI", "https://ft/"), "FT_UPLOAD_URI: needs a path"},
 		"same paths":          {with(devEnv, "FT_DOWNLOAD_URI", "https://dl/ft"), "FT_DOWNLOAD_URI: path"},
+		"upload slash":        {with(devEnv, "FT_UPLOAD_URI", "https://ft.example/ft/"), "FT_UPLOAD_URI: path must not end in '/'"},
+		"download slash":      {with(devEnv, "FT_DOWNLOAD_URI", "https://ft.example/dl/"), "FT_DOWNLOAD_URI: path must not end in '/'"},
+		"branded slash":       {with(devEnv, "FT_BRANDED_URI", "https://ft.example/view/"), "FT_BRANDED_URI: path must not end in '/'"},
+		"no download path":    {with(devEnv, "FT_DOWNLOAD_URI", "https://ft.example"), "FT_DOWNLOAD_URI: needs a path"},
+		"zero per user":       {with(devEnv, "FT_MAX_UPLOADS_PER_USER", "0"), "FT_MAX_UPLOADS_PER_USER"},
+		"zero downloads":      {with(devEnv, "FT_MAX_CONCURRENT_DOWNLOADS", "0"), "FT_MAX_CONCURRENT_DOWNLOADS"},
+		"zero lookups":        {with(devEnv, "FT_MAX_CONCURRENT_LOOKUPS", "0"), "FT_MAX_CONCURRENT_LOOKUPS"},
+		"negative min rate":   {with(devEnv, "FT_MIN_UPLOAD_RATE", "-1"), "FT_MIN_UPLOAD_RATE"},
+		"zero drain":          {with(devEnv, "FT_DRAIN_TIMEOUT", "0s"), "FT_DRAIN_TIMEOUT"},
 		"listen":              {with(devEnv, "FT_LISTEN_ADDR", "8081"), "FT_LISTEN_ADDR"},
 		"short nonce key":     {with(devEnv, "FT_NONCE_KEY", "short"), "FT_NONCE_KEY"},
 		"credentials":         {with(devEnv, "FT_CREDENTIALS", "ldap"), "FT_CREDENTIALS"},
@@ -142,7 +151,27 @@ func TestProductionRefusesEveryUnsafeSetting(t *testing.T) {
 
 func TestProductionRefusesPlainHTTPToTheHSS(t *testing.T) {
 	_, out := runService(t, with(devEnv, "RCS_ENV", "prod", "FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss:8080", "FT_HSS_TOKEN", "t"))
-	if !strings.Contains(out, "FT_HSS_URL is not https") {
+	if !strings.Contains(out, "FT_HSS_URL is http to a host that is not private") {
 		t.Fatalf("output:\n%s", out)
+	}
+}
+
+func TestPlainHTTPToTheHSSIsAllowedOnlyForPrivateHosts(t *testing.T) {
+	for host, want := range map[string]bool{
+		"10.0.3.7": true, "172.16.0.1": true, "192.168.1.1": true, "fd00::1": true,
+		"hss.rcs.local": true, "HSS.RCS.LOCAL.": true,
+		"8.8.8.8": false, "172.32.0.1": false, "hss.example.com": false, "rcs.local": false, "evilrcs.local": false,
+	} {
+		if got := privateHost(host, "rcs.local"); got != want {
+			t.Errorf("privateHost(%q) = %v", host, got)
+		}
+	}
+	if privateHost("hss.rcs.local", "") {
+		t.Error("a name is private without a namespace")
+	}
+	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCS_SERVICE_NAMESPACE", "rcs.local",
+		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss.rcs.local:8080", "FT_HSS_TOKEN", "t", "FT_STATIC_USERS", "")
+	if _, out := runService(t, prod); strings.Contains(out, "FT_HSS_URL") {
+		t.Fatalf("http to the Cloud Map name was refused:\n%s", out)
 	}
 }

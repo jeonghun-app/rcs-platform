@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -79,8 +80,12 @@ type formPart struct {
 type formFile struct {
 	name        string
 	contentType string
-	// declaredSize is the part's Content-Length, which some clients send
-	// (RFC 7578 §4.8 lets a receiver ignore it), or -1.
+	// declaredSize is the part's Content-Length, or -1. RFC 7578 §4.8 has
+	// receivers ignore other Content- fields; this one is used on purpose,
+	// because RCS clients send it (the rcsjta reference client does) and it
+	// lets a too large file be refused before its bytes arrive, a resume be
+	// held to the size first declared, and a short body be told from a
+	// complete one.
 	declaredSize int64
 	body         io.Reader
 }
@@ -267,15 +272,25 @@ func declaredType(h textproto.MIMEHeader) (string, error) {
 }
 
 // validFileName accepts a non-empty UTF-8 name of at most maxFileName bytes
-// without control characters. The name is echoed in the file-info document
-// and in the download's Content-Disposition, so anything that could break out
-// of either is refused rather than repaired.
+// that is one plain name. The name is echoed in the file-info document and in
+// the download's Content-Disposition and shown by the recipient's client, so
+// anything that could break out of either, or make the name read as
+// something else, is refused rather than repaired:
+//
+//   - control characters (C0, DEL, C1);
+//   - '/' and '\', and the names "." and "..", which a client saving the
+//     file under its name would take as a path (RFC 6266 §4.3 asks
+//     recipients to strip paths, but only the server can protect them all);
+//   - format characters (Unicode category Cf): the bidirectional controls
+//     (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069) that make
+//     "invoice<U+202E>fdp.exe" display as "invoiceexe.pdf", and invisible
+//     ones such as U+200B and U+FEFF.
 func validFileName(name string) bool {
-	if name == "" || len(name) > maxFileName || !utf8.ValidString(name) {
+	if name == "" || len(name) > maxFileName || !utf8.ValidString(name) || name == "." || name == ".." {
 		return false
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f || 0x80 <= r && r < 0xa0 {
+		if r < 0x20 || r == 0x7f || 0x80 <= r && r < 0xa0 || r == '/' || r == '\\' || unicode.Is(unicode.Cf, r) {
 			return false
 		}
 	}

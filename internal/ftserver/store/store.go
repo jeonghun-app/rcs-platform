@@ -55,10 +55,15 @@ type Part struct {
 	Number int32
 	ETag   string
 	Size   int64
+	// Checksum is the part's CRC32 as the backend reported it (base64), or
+	// empty; it is handed back when the upload is completed.
+	Checksum string
 }
 
 // Thumbnail describes the optional thumbnail stored with a file.
 type Thumbnail struct {
+	// Key is the object holding the thumbnail.
+	Key         string
 	Size        int64
 	ContentType string
 }
@@ -93,6 +98,12 @@ type Record struct {
 	// HashState is the marshalled SHA-256 state over the first Received
 	// bytes, so a resume on another task continues the same hash.
 	HashState []byte
+	// Object is the key of the object holding the content: the target of
+	// the open multipart upload while uploading, the complete object after.
+	// Every upload attempt and every single-object completion gets a key of
+	// its own, so a writer that lost its lease cannot overwrite content
+	// another writer's conditional update has committed.
+	Object string
 	// MultipartID is the open multipart upload holding Parts, or empty while
 	// no part has been stored.
 	MultipartID string
@@ -147,17 +158,17 @@ type Metadata interface {
 	ListExpired(ctx context.Context, now time.Time, limit int) ([]Record, error)
 }
 
-// Blobs stores content. Keys are file ids (plus a suffix for thumbnails).
-// Implementations are safe for concurrent use.
+// Blobs stores content under keys ft-server chooses (Record.Object,
+// Thumbnail.Key). Implementations are safe for concurrent use.
 type Blobs interface {
 	// Put stores body as the whole object key.
 	Put(ctx context.Context, key string, body []byte, contentType string) error
 	// CreateMultipart opens a multipart upload for key and returns its id.
 	CreateMultipart(ctx context.Context, key, contentType string) (string, error)
 	// UploadPart stores part number of an open multipart upload and returns
-	// its ETag. Storing a number again replaces the part. A closed or unknown
-	// upload gives ErrNotFound.
-	UploadPart(ctx context.Context, key, uploadID string, number int32, body []byte) (string, error)
+	// it with its ETag and checksum. Storing a number again replaces the
+	// part. A closed or unknown upload gives ErrNotFound.
+	UploadPart(ctx context.Context, key, uploadID string, number int32, body []byte) (Part, error)
 	// CompleteMultipart joins parts, in order, into object key. It fails
 	// with ErrInvalidParts if a part's ETag does not match the part stored
 	// under its number, or the parts break the size and order rules.
