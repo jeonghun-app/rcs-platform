@@ -29,10 +29,17 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
   client address); the transport accepts those and closes them after the health
   check without creating a flow. `RCS_PROXY_PROTOCOL=false` is refused in
   `staging`/`prod`.
-- NLB TCP idle timeout is raised to 1800 s on the SIP and MSRP listeners (the
-  default 350 s would cut quiet sessions). Clients keep SIP flows alive with CRLF
-  pings (RFC 5626); `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session
-  idle for 300 s.
+- Idle timeouts. The NLB idle timeout is configurable only on TCP listeners
+  (raised to 1800 s there); on TLS listeners it is fixed at 350 s. Every keep-alive
+  is therefore sized for 350 s:
+  - `pcscf` returns `Flow-Timer: 120` (RFC 5626 §4.4.1, §10) in the REGISTER 200,
+    so clients send a CRLF ping at least every two minutes on SIP flows.
+  - `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session idle for
+    240 s.
+  - Server-side idle timeouts are a little longer than the NLB's, so the NLB, not
+    the service, is what ends a dead connection.
+  - Kernel TCP keep-alive is off on client-facing listeners (it wakes the radio and
+    is not what keeps the NLB entry alive) and on for core-facing connections.
 - `infra/ecr.yaml` for repositories, `infra/platform.yaml` for everything else;
   `scripts/deploy.sh` builds, pushes and deploys.
 
