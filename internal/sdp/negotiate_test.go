@@ -193,6 +193,7 @@ func TestFileTransferAnswerEchoesTheSelectorAndAdvertisesMaxSize(t *testing.T) {
 		"recvonly", "",
 		"file-selector", offer.Media[0].Attributes.Values("file-selector")[0],
 		"file-transfer-id", "vBnG916bdberum2fFEABR4f",
+		"file-range", "1-48213",
 	)
 	if !reflect.DeepEqual(m.Attributes, want) {
 		t.Errorf("answer attributes:\n got %+v\nwant %+v", m.Attributes, want)
@@ -223,6 +224,7 @@ func TestOffersThatCannotBeAcceptedAreDeclinedWithAReason(t *testing.T) {
 		{"conflicting offered direction", head + msrpLine + types + path + "a=sendonly\r\na=recvonly\r\n", nil, 0, nil, "more than one direction"},
 		{"malformed file selector", head + msrpLine + types + path + "a=file-selector:colour:blue\r\n", nil, 0, nil, "unknown selector"},
 		{"malformed file transfer id", head + msrpLine + types + path + "a=file-transfer-id:a/b\r\n", nil, 0, nil, "is not a token"},
+		{"malformed file range", head + msrpLine + types + path + "a=file-range:0-10\r\n", nil, 0, nil, "is not <start>-<stop>"},
 		{"local port 0", head + msrpLine + types + path, func(e *MSRPEndpoint) { e.Port = 0 }, 0, nil, "port must be from 1 to 65535"},
 		{"local path missing", head + msrpLine + types + path, func(e *MSRPEndpoint) { e.Path = nil }, 0, nil, "at least one URI"},
 		{"local accept types missing", head + msrpLine + types + path, func(e *MSRPEndpoint) { e.AcceptTypes = nil }, 0, nil, "at least one accept type"},
@@ -278,5 +280,36 @@ func TestOfferWithTypeParametersIsAccepted(t *testing.T) {
 	if !reflect.DeepEqual(types, []string{"message/cpim;charset=UTF-8", "application/im-iscomposing+xml"}) ||
 		!reflect.DeepEqual(wrapped, []string{"text/plain;charset=UTF-8", "message/imdn+xml"}) {
 		t.Errorf("answer accept-types %q, accept-wrapped-types %q", types, wrapped)
+	}
+}
+
+func TestResumedFileTransferAnswerKeepsTheOfferedRange(t *testing.T) {
+	offer := mustParse(t, strings.Replace(fileOffer, "a=file-range:1-48213", "a=file-range:1001-*", 1))
+	m, err := NegotiateMSRP(offer, 0, asEndpoint())
+	if err != nil {
+		t.Fatalf("NegotiateMSRP: %v", err)
+	}
+	if r, err := m.FileRange(); err != nil || r != (FileRange{Start: 1001, Stop: -1}) {
+		t.Errorf("answer file-range = %+v, %v", r, err)
+	}
+}
+
+func TestDeclinedFileTransferStillNamesTheTransfer(t *testing.T) {
+	offer := mustParse(t, fileOffer)
+	local := asEndpoint()
+	local.AcceptTypes = []string{"text/plain"}
+	if _, err := NegotiateMSRP(offer, 0, local); !errors.Is(err, ErrNoCommonType) {
+		t.Fatalf("NegotiateMSRP = %v, want ErrNoCommonType", err)
+	}
+	got := NewAnswer(offer, asOrigin, asConnection).Media[0]
+	want := Media{
+		Type: "message", Proto: "TCP/MSRP", Formats: []string{"*"},
+		Attributes: attrs(
+			"file-selector", offer.Media[0].Attributes.Values("file-selector")[0],
+			"file-transfer-id", "vBnG916bdberum2fFEABR4f",
+		),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rejected line = %+v\nwant %+v", got, want)
 	}
 }

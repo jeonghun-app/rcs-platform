@@ -77,9 +77,17 @@ func NewAnswer(offer *Session, origin Origin, conn Connection) *Session {
 
 // RejectMedia returns the answer line that declines an offered media line:
 // the same media type and transport with port 0, and the offered formats,
-// since at least one must be listed (RFC 3264 §6).
+// since at least one must be listed (RFC 3264 §6). A declined file transfer
+// keeps a=file-selector and a=file-transfer-id so the offerer can tell which
+// transfer was refused (RFC 5547 §8.3).
 func RejectMedia(offer *Media) Media {
-	return Media{Type: offer.Type, Proto: offer.Proto, Formats: slices.Clone(offer.Formats)}
+	m := Media{Type: offer.Type, Proto: offer.Proto, Formats: slices.Clone(offer.Formats)}
+	for _, name := range []string{"file-selector", "file-transfer-id"} {
+		if v, ok := offer.Attributes.Get(name); ok {
+			m.Attributes.Add(name, v)
+		}
+	}
+	return m
 }
 
 // NegotiateMSRP answers media line i of offer for the local endpoint.
@@ -87,8 +95,8 @@ func RejectMedia(offer *Media) Media {
 // The answer accepts the accept-types and accept-wrapped-types the two ends
 // have in common (RFC 4975 §8.6), takes the connection role that complements
 // the offered one (RFC 4145 §4, RFC 6135 §4.2.1), mirrors the direction
-// (RFC 3264 §6.1) and, for a file transfer, echoes a=file-selector and
-// a=file-transfer-id (RFC 5547 §8). A line offered with port 0 is never
+// (RFC 3264 §6.1) and, for a file transfer, echoes a=file-selector,
+// a=file-transfer-id and a=file-range (RFC 5547 §8.3). A line offered with port 0 is never
 // accepted (ErrMediaDisabled), nor is one with no type in common
 // (ErrNoCommonType); either way the caller keeps the rejected line from
 // NewAnswer. offer is not modified.
@@ -189,9 +197,10 @@ func answerDirection(offered Direction) Direction {
 	return offered
 }
 
-// echoFileTransfer copies the attributes that identify the file being
-// accepted, after checking they parse, so a malformed selector is refused
-// rather than reflected.
+// echoFileTransfer copies the attributes that identify the file and the part
+// of it being accepted, after checking they parse, so a malformed value is
+// refused rather than reflected. Leaving out a=file-range would mean the
+// whole file (RFC 5547 §8.7), so a resumed transfer must have it echoed.
 func echoFileTransfer(offer, ans *Media) error {
 	if _, err := offer.FileSelector(); err == nil {
 		v, _ := offer.Attributes.Get("file-selector")
@@ -201,6 +210,12 @@ func echoFileTransfer(offer, ans *Media) error {
 	}
 	if id, err := offer.FileTransferID(); err == nil {
 		ans.Attributes.Add("file-transfer-id", id)
+	} else if !errors.Is(err, ErrNoAttribute) {
+		return err
+	}
+	if _, err := offer.FileRange(); err == nil {
+		v, _ := offer.Attributes.Get("file-range")
+		ans.Attributes.Add("file-range", v)
 	} else if !errors.Is(err, ErrNoAttribute) {
 		return err
 	}
