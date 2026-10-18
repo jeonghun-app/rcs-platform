@@ -617,9 +617,11 @@ func (c *conn) readLoop() {
 }
 
 // received applies the RFC 3539 §3.4.1 events for a received message and
-// reports whether an application message may be processed: in REOPEN, they
-// are thrown away. Receipt resets the timer (SetWatchdog) in OKAY and SUSPECT
-// only; in REOPEN the timer keeps the DWR cadence.
+// reports whether it may be processed: in REOPEN, application messages are
+// thrown away, while base protocol messages (a DPA to this node's DPR, for
+// one) are still handled, since the throwaway rule is about application
+// traffic. Receipt resets the timer (SetWatchdog) in OKAY and SUSPECT only;
+// in REOPEN the timer keeps the DWR cadence.
 func (c *conn) received(m *Message) bool {
 	isDWA := !m.IsRequest() && m.ApplicationID == AppCommon && m.Code == CodeDeviceWatchdog
 	c.mu.Lock()
@@ -637,7 +639,7 @@ func (c *conn) received(m *Message) bool {
 		c.node.log.Info("diameter peer recovered", "peer_host", c.caps.host)
 	case watchdogReopen:
 		if !isDWA {
-			return false
+			return m.ApplicationID == AppCommon
 		}
 		c.dwrPending = false
 		c.numDWA++

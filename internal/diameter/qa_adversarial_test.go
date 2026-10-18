@@ -68,3 +68,31 @@ func TestQAWatchdogClosesAPeerThatStoppedReadingUnderLoad(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func TestQAShutdownDuringReopenClosesOnTheDPA(t *testing.T) {
+	n, peer, dialer, clock := startInitiator(t, nil)
+	first := dialer.next(t)
+	acceptCER(t, first)
+	waitFor(t, "the first connection to open", peer.Available)
+	_ = first.nc.Close()
+	clock.waitForTimer(t, n.backoff(0))
+	clock.Advance(n.backoff(0))
+	s := dialer.next(t)
+	acceptCER(t, s)
+	s.expectDWR() // REOPEN, left unanswered
+	errc := make(chan error, 1)
+	go func() { errc <- n.Shutdown(context.Background()) }()
+	dpr := s.read()
+	if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+		t.Fatalf("expected DPR, got %+v", dpr)
+	}
+	s.write(s.answer(dpr, ResultSuccess))
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(realWait):
+		t.Fatal("Shutdown did not return after the DPA")
+	}
+}
