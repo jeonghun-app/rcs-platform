@@ -67,6 +67,20 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 	}
 }
 
+func TestNamespaceDefaultsToTheSharedServiceNamespace(t *testing.T) {
+	c, err := configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "prod.internal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Namespace != "prod.internal" || c.SCSCFPattern != "scscf-*.prod.internal" || c.RCSASURI != "sip:rcs-as.prod.internal" {
+		t.Errorf("config = %+v", c)
+	}
+	c, err = configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "prod.internal", "HSS_NAMESPACE", "hss.internal"))
+	if err != nil || c.Namespace != "hss.internal" {
+		t.Errorf("HSS_NAMESPACE does not win: %v %+v", err, c)
+	}
+}
+
 func TestConfigNeverPrintsItsSecrets(t *testing.T) {
 	c, err := configure(with(devEnv, "HSS_DATA_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))))
 	if err != nil {

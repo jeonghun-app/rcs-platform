@@ -30,7 +30,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_FT_REALM` | | Digest realm of `ft-server`; must differ from the IMS realm; unset means no FT credentials |
 | `HSS_DIAMETER_ADDR` | `:3868` | Cx listener |
 | `HSS_DIAMETER_HOST` | `hss-<random>.<namespace>` | Origin-Host; leave unset in ECS (see [Diameter identity](#diameter-identity)) |
-| `HSS_NAMESPACE` | `rcs.local` | Cloud Map namespace, for the generated Origin-Host and defaults below |
+| `HSS_NAMESPACE` | `RCS_SERVICE_NAMESPACE`, else `rcs.local` | Cloud Map namespace, for the generated Origin-Host and defaults below |
 | `HSS_DIAMETER_REALM` | `RCS_IMS_DOMAIN` | Origin-Realm |
 | `HSS_DIAMETER_PEER_REALM` | the Origin-Realm | realm a peer must claim in its CER |
 | `HSS_DIAMETER_PEER_NETWORKS` | | CIDRs peers may connect from; required in prod (ADR 0007 §6) |

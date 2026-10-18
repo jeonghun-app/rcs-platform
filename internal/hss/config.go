@@ -87,17 +87,19 @@ func Configure(s *runtime.Settings) Config {
 	e := s.Env
 	domain := s.Shared.RequiredString("IMS_DOMAIN")
 	c := Config{
-		Store:                e.String("STORE", StoreDynamoDB),
-		SubscribersTable:     e.String("SUBSCRIBERS_TABLE", DefaultSubscribersTable),
-		ProfilesTable:        e.String("PROFILES_TABLE", DefaultProfilesTable),
-		DynamoDBEndpoint:     e.String("DYNAMODB_ENDPOINT", ""),
-		KMSKeyID:             e.String("KMS_KEY_ID", ""),
-		DataKey:              secret{e.String("DATA_KEY", "")},
-		IMSRealm:             e.String("IMS_REALM", domain),
-		FTRealm:              e.String("FT_REALM", ""),
-		DiameterAddr:         e.String("DIAMETER_ADDR", DefaultDiameterAddr),
-		OriginHost:           e.String("DIAMETER_HOST", ""),
-		Namespace:            e.String("NAMESPACE", DefaultNamespace),
+		Store:            e.String("STORE", StoreDynamoDB),
+		SubscribersTable: e.String("SUBSCRIBERS_TABLE", DefaultSubscribersTable),
+		ProfilesTable:    e.String("PROFILES_TABLE", DefaultProfilesTable),
+		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
+		KMSKeyID:         e.String("KMS_KEY_ID", ""),
+		DataKey:          secret{e.String("DATA_KEY", "")},
+		IMSRealm:         e.String("IMS_REALM", domain),
+		FTRealm:          e.String("FT_REALM", ""),
+		DiameterAddr:     e.String("DIAMETER_ADDR", DefaultDiameterAddr),
+		OriginHost:       e.String("DIAMETER_HOST", ""),
+		// The shared Cloud Map namespace ft-server also reads, unless the
+		// HSS is told otherwise.
+		Namespace:            e.String("NAMESPACE", s.Shared.String("SERVICE_NAMESPACE", DefaultNamespace)),
 		OriginRealm:          e.String("DIAMETER_REALM", domain),
 		PeerNetworks:         e.CIDRs("DIAMETER_PEER_NETWORKS", nil),
 		SCSCFNames:           e.List("SCSCF_NAMES", nil),
