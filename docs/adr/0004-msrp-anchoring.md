@@ -24,19 +24,24 @@ gateway controlled by the P-CSCF (TS 23.334).
   | `rcs-as` originates (`rcs-as` offers `actpass`, its instance address) | to client: relay public address, `actpass` | to `rcs-as`: `active` (relay connects) |
 
   - On the core leg the relay offers `active` (port 9), which forces a `passive`
-    answer, because it does not accept connections from the core. The relay is a
-    media gateway, not a UA; the §4.2.2 `actpass` rule addresses endpoints that
-    can be reached, which the relay's core side deliberately cannot.
+    answer: it does not listen on its core address, and RFC 6135 §4.2.2 requires
+    `active` from an endpoint that cannot provide a transport address it accepts
+    connections on. The relay still sends an explicit `a=setup` (§4.2.1).
   - A missing `a=setup` takes the RFC 4145 §4 defaults (`active` in an offer,
     `passive` in an answer), so a client without connection negotiation
     (RFC 6135 §5) is served.
   - A client answering the terminating `actpass` offer with `passive` asks the
     network to dial it. The relay **never dials clients** (a client-supplied
     target is an SSRF and port-scanning vector, and the outbound leg could not
-    use the NLB's TLS). `pcscf` releases the binding and returns 488 toward
-    `rcs-as`, which keeps the message for store-and-forward and retries on the
-    next registration. Clients behind NAT answer `active` (§4.2.2), so this
-    affects only clients that are themselves reachable.
+    use the NLB's TLS). The answer arrives in a 2xx, which a proxy must forward
+    (RFC 3261 §16.7), so `pcscf` forwards it to `rcs-as` (with the relay as
+    `active` toward `rcs-as`, as usual) and then ends the session: it sends BYE
+    toward the client and toward `rcs-as`, both with
+    `Reason: SIP;cause=488;text="MSRP direction not supported"`.
+    `rcs-as` treats a BYE carrying that Reason before any MSRP traffic as a
+    delivery failure on this contact (see Consequences for what it does next).
+    Clients behind NAT answer `active` (§4.2.2), so this affects only clients
+    that are themselves reachable.
 - `rcs-as` offers `actpass` with its instance address and answers `passive`;
   every MSRP endpoint in the platform always sends an explicit `a=setup`
   (§4.2.1) and never sends `holdconn`.
@@ -69,6 +74,10 @@ RCS and keeps the client unaware of the relay.
 - A client that offers `a=setup:passive` violates RFC 6135 §4.2.2; `pcscf`
   answers such an offer with 488 Not Acceptable Here.
 - A client that answers a terminating offer with `passive` cannot receive chat
-  sessions; its messages are stored and delivered when it next originates or
-  through standalone messaging. Recorded as a limitation; the count is a metric.
+  sessions from the network. `rcs-as` delivers to it with **pager-mode
+  standalone messaging** (SIP MESSAGE, no MSRP) when the message fits the pager
+  limit; larger content stays stored and is delivered inside the next session the
+  client itself originates. `rcs-as` does not retry a terminating session to that
+  contact, since it would fail the same way. Recorded as a limitation; the count
+  is a metric.
 - The relay needs no internet egress.
