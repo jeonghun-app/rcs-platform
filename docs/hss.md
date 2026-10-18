@@ -225,7 +225,7 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   consistent index) is answered `DIAMETER_UNABLE_TO_COMPLY` and counted as
   `profile.missing` until it is given a profile.
 - Store failures answer the API with 503 and `Retry-After`, so callers retry.
-- `make test-integration-hss` runs the DynamoDB store and two HSS tasks issuing
+- `make test-integration` runs the DynamoDB store and two HSS tasks issuing
   AKA vectors at once against DynamoDB Local.
 
 Not in this release: the Sh interface, SLF, geo-redundancy, IMS restoration.

@@ -18,7 +18,7 @@ import (
 )
 
 // The SQN property of TestConcurrentMARsOnTwoTasksNeverShareASequenceNumber
-// against DynamoDB Local (make test-integration-hss): two HSS tasks, each
+// against DynamoDB Local (make test-integration): two HSS tasks, each
 // with its own DynamoDB client, issue vectors for one subscriber at once,
 // and only DynamoDB's conditional writes keep them apart.
 func TestIntegrationConcurrentMARsOnTwoTasksShareNoSQN(t *testing.T) {

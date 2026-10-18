@@ -21,7 +21,7 @@ import (
 )
 
 // The integration tests run the store contract against DynamoDB Local
-// (make test-integration-hss), where the condition expressions,
+// (make test-integration), where the condition expressions,
 // transactions and error codes the unit tests fake meet a real
 // implementation. HSS_IT_DYNAMODB_ENDPOINT names the container.
 

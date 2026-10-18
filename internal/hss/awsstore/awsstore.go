@@ -3,7 +3,7 @@
 // that imports the AWS SDK: the HSS talks to the interfaces of
 // internal/hss/store and internal/hss/keyring, so the service logic is tested
 // against the memory backend, and this package against a strict fake in unit
-// tests and DynamoDB Local in make test-integration-hss.
+// tests and DynamoDB Local in make test-integration.
 //
 // # Tables
 //

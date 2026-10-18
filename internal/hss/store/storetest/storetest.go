@@ -1,7 +1,7 @@
 // Package storetest checks a store.Store implementation against the
 // behaviour the HSS relies on. The memory backend runs it in every unit test
 // run and the DynamoDB backend against DynamoDB Local (make
-// test-integration-hss), so the two cannot drift apart.
+// test-integration), so the two cannot drift apart.
 package storetest
 
 import (
