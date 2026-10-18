@@ -554,8 +554,13 @@ func TestARelayStopsReadingAClientWhileRcsAsIsNotReading(t *testing.T) {
 	}()
 	// rcs-as reads nothing more, so the relay can take only a few pieces
 	// of the megabyte before it stops reading the client; the client's
-	// write cannot finish until the connection to rcs-as has given up.
-	waitDone(t, core.Done(), "rcs-as side")
+	// write cannot finish until the connection to rcs-as has given up,
+	// after the configured deadline rather than the 30 s default.
+	select {
+	case <-core.Done():
+	case <-time.After(deadline + stallBound):
+		t.Fatalf("the rcs-as side outlived its %v write deadline", deadline)
+	}
 	select {
 	case afterCore := <-wrote:
 		if !afterCore {
@@ -594,7 +599,9 @@ func TestARelayDisconnectsAClientThatFallsBehindWithoutStallingRcsAs(t *testing.
 		default:
 			msg := wire("MSRP fl"+fmt.Sprintf("%06d", i)+" SEND", "To-Path: "+relayInternalURI, "From-Path: "+asURI,
 				"Message-ID: m"+fmt.Sprintf("%06d", i), "Content-Type: text/plain", "", piece, "-------fl"+fmt.Sprintf("%06d", i)+"$")
-			_ = as.nc.SetWriteDeadline(time.Now().Add(hangGuard))
+			// The only check that rcs-as is never held up: its writes must
+			// keep going, well inside the relay's 30 s write deadline.
+			_ = as.nc.SetWriteDeadline(time.Now().Add(stallBound))
 			if _, err := as.nc.Write([]byte(msg)); err != nil {
 				t.Fatalf("rcs-as could not write after %d messages: %v", sent, err)
 			}

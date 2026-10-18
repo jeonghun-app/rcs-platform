@@ -21,6 +21,12 @@ var hangGuard = map[bool]time.Duration{false: 30 * time.Second, true: 2 * time.M
 // them apart.
 var prompt = map[bool]time.Duration{false: time.Second, true: 5 * time.Second}[raceEnabled]
 
+// stallBound bounds waits that a protocol default (the 30 s write,
+// transaction and unbound timeouts) would otherwise end: hangGuard there
+// would let the default rescue a stall the test exists to catch. It is
+// well below those defaults, also under the race detector.
+var stallBound = max(5*time.Second, 2*prompt)
+
 // scaled is n under normal runs and a quarter of it, at least 1, under the
 // race detector: the same behaviour on less data.
 func scaled(n int) int {

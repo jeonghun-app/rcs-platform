@@ -478,7 +478,7 @@ func TestARelayStreamsAHugeChunkInBoundedMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Under the race detector, less data with closer pauses: a relay that
-	// held the chunk would still pass the bound below by the second pause.
+	// held the chunk would still exceed the bound below by the second pause.
 	total, pause := 64<<20, 16<<20
 	if raceEnabled {
 		total, pause = 24<<20, 8<<20
@@ -603,8 +603,8 @@ func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *test
 		if err := silentEdge.Err(); !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, ErrPeerNotReading) {
 			t.Errorf("silent client cut off with %v", err)
 		}
-	case <-time.After(hangGuard):
-		t.Error("silent client still connected")
+	case <-time.After(deadline + stallBound):
+		t.Errorf("silent client still connected well after its %v write deadline", deadline)
 	}
 	if slowEdge.Err() != nil || slowRead.Load() == 0 {
 		t.Errorf("slow client: %v after reading %d octets", slowEdge.Err(), slowRead.Load())
@@ -676,7 +676,9 @@ func TestARelayKeepsItsRcsAsConnectionUnderPacedChatAndFilePush(t *testing.T) {
 
 func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	ours, theirs := net.Pipe()
-	c, err := NewActiveConn(ours, Config{WriteTimeout: 3 * time.Second})
+	// A write deadline well above prompt, so that a Send waiting for it
+	// instead of honouring its context fails, also under the race detector.
+	c, err := NewActiveConn(ours, Config{WriteTimeout: DefaultWriteTimeout})
 	if err != nil {
 		t.Fatal(err)
 	}
