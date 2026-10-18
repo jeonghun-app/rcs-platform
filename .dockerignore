@@ -4,5 +4,7 @@ tmp
 bin
 docs
 *.md
-.env
-.env.*
+.env*
+*.pem
+*.key
+*.p12
