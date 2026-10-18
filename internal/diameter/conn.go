@@ -382,6 +382,10 @@ func (c *conn) close(reason error) {
 		peer, host := c.peer, c.caps.host
 		c.mu.Unlock()
 
+		// The tables go first: whoever waits on done (the reconnect loop)
+		// must not find this connection still registered under the peer's
+		// identity and refuse its successor as a duplicate.
+		c.node.forget(c, peer, host)
 		close(c.done)
 		c.cancel()
 		_ = c.nc.Close()
@@ -391,7 +395,6 @@ func (c *conn) close(reason error) {
 			}
 			p.ch <- result{err: ErrConnectionClosed}
 		}
-		c.node.forget(c, peer, host)
 		if running {
 			c.node.log.Info("diameter peer closed", "peer_host", host, "remote", c.remote(), "reason", reason)
 		} else {
@@ -833,6 +836,10 @@ func (c *conn) disconnect(ctx context.Context, cause int32) {
 	c.mu.Unlock()
 	if ready {
 		c.drain(ctx.Done())
+	}
+	// Once ctx has ended the caller wants the connections closed now, so no
+	// DPR is started.
+	if ready && ctx.Err() == nil {
 		dpr := &Message{Flags: FlagRequest, Code: CodeDisconnectPeer, ApplicationID: AppCommon}
 		dpr.Add(c.node.originAVPs()...)
 		dpr.Add(NewAVP(AVPDisconnectCause, FlagMandatory, 0, Enumerated(cause)))

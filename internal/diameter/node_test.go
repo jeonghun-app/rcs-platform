@@ -145,6 +145,9 @@ func TestReconnectionBacksOffExponentiallyToTheCeiling(t *testing.T) {
 	cfg := testConfig(clock, scscfHost)
 	cfg.Dial = dialer.Dial
 	cfg.Random = func() uint64 { return 0 } // lower edge of the jitter
+	// The dial timer must not share a duration with any backoff step, or
+	// waitForTimer could find it instead of the sleep.
+	cfg.CapabilitiesTimeout = 11 * time.Second
 	n := newTestNode(t, cfg)
 	if _, err := n.Connect(PeerConfig{Address: "hss:3868"}); err != nil {
 		t.Fatal(err)
