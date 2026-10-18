@@ -145,6 +145,11 @@ func TestAnswerAcceptsTheTypesBothEndsAccept(t *testing.T) {
 		{"subtype matches local type/*", []string{"text/plain", "image/png"}, []string{"text/*"}, []string{"text/plain"}},
 		{"duplicates collapse", []string{"*", "a/a"}, []string{"a/a"}, []string{"a/a"}},
 		{"nothing in common", []string{"a/a"}, []string{"b/b", "a/*x"}, nil},
+		{"offered parameters are ignored for matching and kept", []string{"text/plain;charset=UTF-8"}, []string{"text/plain"}, []string{"text/plain;charset=UTF-8"}},
+		{"local parameters are ignored for matching", []string{"text/plain"}, []string{"text/plain;charset=UTF-8"}, []string{"text/plain"}},
+		{"wildcard with parameters narrows to the local entry", []string{"text/*;q=1"}, []string{"text/plain;charset=UTF-8"}, []string{"text/plain;charset=UTF-8"}},
+		{"offered * keeps local parameters", []string{"*"}, []string{"text/plain;charset=UTF-8"}, []string{"text/plain;charset=UTF-8"}},
+		{"same entry twice collapses", []string{"text/plain", "TEXT/PLAIN"}, []string{"*"}, []string{"text/plain"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -256,5 +261,22 @@ func TestNegotiateDoesNotModifyTheOffer(t *testing.T) {
 	m.Formats[0] = "changed"
 	if after := mustMarshal(t, offer); after != before {
 		t.Errorf("offer changed:\n%q\n%q", before, after)
+	}
+}
+
+func TestOfferWithTypeParametersIsAccepted(t *testing.T) {
+	offer := mustParse(t, head+"m=message 9 TCP/MSRP *\r\n"+
+		"a=accept-types:message/cpim;charset=UTF-8 application/im-iscomposing+xml\r\n"+
+		"a=accept-wrapped-types:text/plain;charset=UTF-8 message/imdn+xml\r\n"+
+		"a=path:msrp://192.0.2.1:9/x;tcp\r\n")
+	m, err := NegotiateMSRP(offer, 0, asEndpoint())
+	if err != nil {
+		t.Fatalf("NegotiateMSRP: %v", err)
+	}
+	types, _ := m.AcceptTypes()
+	wrapped, _ := m.AcceptWrappedTypes()
+	if !reflect.DeepEqual(types, []string{"message/cpim;charset=UTF-8", "application/im-iscomposing+xml"}) ||
+		!reflect.DeepEqual(wrapped, []string{"text/plain;charset=UTF-8", "message/imdn+xml"}) {
+		t.Errorf("answer accept-types %q, accept-wrapped-types %q", types, wrapped)
 	}
 }

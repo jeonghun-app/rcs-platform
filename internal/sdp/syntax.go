@@ -101,3 +101,19 @@ func isTypedTime(s string) bool {
 	}
 	return isDigits(s)
 }
+
+// splitUnquoted splits s at every sep that is not inside double quotes.
+func splitUnquoted(s string, sep byte) []string {
+	var out []string
+	start, quoted := 0, false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			quoted = !quoted
+		case c == sep && !quoted:
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	return append(out, s[start:])
+}

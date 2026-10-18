@@ -80,8 +80,8 @@ func TestMalformedFileTransferAttributesAreRejected(t *testing.T) {
 		attr, value, wantErr string
 	}{
 		{"file-selector", `name:"unterminated`, "unterminated quoted string"},
-		{"file-selector", `name:"a"  size:1`, "empty parameter"},
-		{"file-selector", `size:1 `, "empty parameter"},
+		{"file-selector", `name:"a"  size:1`, "empty entry"},
+		{"file-selector", `size:1 `, "empty entry"},
 		{"file-selector", `name:x`, "name must be a non-empty quoted string"},
 		{"file-selector", `name:""`, "name must be a non-empty quoted string"},
 		{"file-selector", `name:"a"b"`, "unterminated quoted string"},

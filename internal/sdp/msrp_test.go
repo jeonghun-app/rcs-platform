@@ -85,9 +85,15 @@ func TestMSRPGettersRejectMalformedValues(t *testing.T) {
 		{"path with two spaces", "path", attrs("path", "msrp://a.example.com/1;tcp  msrp://b.example.com/2;tcp"), `"" is not an msrp`},
 		{"path twice", "path", attrs("path", "msrp://a.example.com/1;tcp", "path", "msrp://b.example.com/2;tcp"), "more than one line"},
 		{"path with no value", "path", attrs("path", ""), "value missing"},
-		{"accept-types with parameters", "accept-types", attrs("accept-types", "text/plain;charset=utf-8"), "is not a media type"},
 		{"accept-types without subtype", "accept-types", attrs("accept-types", "text"), "is not a media type"},
-		{"accept-wrapped-types with an empty entry", "accept-wrapped-types", attrs("accept-wrapped-types", "text/plain "), "is not a media type"},
+		{"accept-types parameter without a value", "accept-types", attrs("accept-types", "text/plain;charset"), "is not a media type"},
+		{"accept-types parameter with an empty name", "accept-types", attrs("accept-types", "text/plain;=utf-8"), "is not a media type"},
+		{"accept-types with a trailing semicolon", "accept-types", attrs("accept-types", "text/plain;a=1;"), "is not a media type"},
+		{"accept-types parameter with an escaped quote", "accept-types", attrs("accept-types", `text/plain;a="x\"y"`), "unterminated quoted string"},
+		{"accept-types parameter with a backslash", "accept-types", attrs("accept-types", `text/plain;a="x\y"`), "is not a media type"},
+		{"accept-types with an unterminated quote", "accept-types", attrs("accept-types", `text/plain;a="x`), "unterminated quoted string"},
+		{"accept-types * with a parameter", "accept-types", attrs("accept-types", "*;q=1"), "is not a media type"},
+		{"accept-wrapped-types with an empty entry", "accept-wrapped-types", attrs("accept-wrapped-types", "text/plain "), "empty entry"},
 		{"max-size with a sign", "max-size", attrs("max-size", "+10"), "is not a size in bytes"},
 		{"max-size beyond int64", "max-size", attrs("max-size", "9223372036854775808"), "is not a size in bytes"},
 		{"unknown setup role", "setup", attrs("setup", "both"), "unknown role"},
@@ -261,5 +267,21 @@ func TestMediaSetupIgnoresHoldconnAtEitherLevel(t *testing.T) {
 	}
 	if r, err := mustParse(t, head+"m=message 9 TCP/MSRP *\r\na=setup:holdconn\r\n").Media[0].Setup(); err != nil || r != SetupHoldConn {
 		t.Errorf("Media.Setup = %q, %v; want the holdconn as written", r, err)
+	}
+}
+
+func TestAcceptTypesMayCarryParameters(t *testing.T) {
+	v := `message/cpim text/plain;charset=UTF-8 text/x-note;title="a; b c";v=1 image/*;q=1`
+	m := Media{Attributes: attrs("accept-types", v)}
+	want := []string{"message/cpim", "text/plain;charset=UTF-8", `text/x-note;title="a; b c";v=1`, "image/*;q=1"}
+	got, err := m.AcceptTypes()
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("AcceptTypes = %q, %v; want %q", got, err, want)
+	}
+	if err := m.SetAcceptTypes(got); err != nil {
+		t.Fatalf("SetAcceptTypes: %v", err)
+	}
+	if v2, _ := m.Attributes.Get("accept-types"); v2 != v {
+		t.Errorf("written back as %q, want %q", v2, v)
 	}
 }

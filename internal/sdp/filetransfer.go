@@ -255,33 +255,22 @@ func (m *Media) FileRange() (FileRange, error) {
 	return r, nil
 }
 
-// splitParams splits a space-separated parameter list, keeping spaces inside
-// double quotes (file names and dates contain them). A backslash is not an
-// escape: RFC 5547 §6 percent-encodes a quote inside a file name, and a
-// backslash there is an ordinary character.
+// splitParams splits a space-separated list, keeping spaces inside double
+// quotes (file names, dates and media type parameters contain them). A
+// backslash is not an escape: RFC 5547 §6 percent-encodes a quote inside a
+// file name, and a backslash there is an ordinary character.
 func splitParams(v string) ([]string, error) {
 	if v == "" {
 		return nil, nil
 	}
-	var out []string
-	start, quoted := 0, false
-	for i := 0; i < len(v); i++ {
-		switch c := v[i]; {
-		case c == '"':
-			quoted = !quoted
-		case c == ' ' && !quoted:
-			if i == start {
-				return nil, errors.New("empty parameter")
-			}
-			out = append(out, v[start:i])
-			start = i + 1
-		}
-	}
-	if quoted {
+	if strings.Count(v, `"`)%2 != 0 {
 		return nil, errors.New("unterminated quoted string")
 	}
-	if start == len(v) {
-		return nil, errors.New("empty parameter")
+	parts := splitUnquoted(v, ' ')
+	for _, p := range parts {
+		if p == "" {
+			return nil, errors.New("empty entry (a doubled, leading or trailing space)")
+		}
 	}
-	return append(out, v[start:]), nil
+	return parts, nil
 }

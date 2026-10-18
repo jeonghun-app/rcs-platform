@@ -208,15 +208,27 @@ func echoFileTransfer(offer, ans *Media) error {
 }
 
 // intersectTypes returns the media types both lists accept, in the order of
-// offered. A wildcard on one side matches the other side's entry, and the
-// narrower of the two is kept: offering * and accepting text/plain yields
-// text/plain. Media types compare case-insensitively.
+// offered. Entries are matched on type/subtype alone, so an entry with
+// parameters matches the same type without them (RFC 4975 §8.6), and media
+// types compare case-insensitively. A wildcard on one side matches the other
+// side's entry and the narrower entry is kept as written, parameters
+// included: offering * and accepting text/plain yields text/plain. When both
+// name the same type the offered entry is kept.
+//
+// The offer is peer input of up to DefaultMaxSize, so duplicates are found
+// with a map rather than by scanning the result.
 func intersectTypes(offered, local []string) []string {
 	var out []string
+	seen := make(map[string]struct{})
 	for _, o := range offered {
 		for _, l := range local {
 			t, ok := narrower(o, l)
-			if ok && !slices.ContainsFunc(out, func(s string) bool { return strings.EqualFold(s, t) }) {
+			if !ok {
+				continue
+			}
+			key := strings.ToLower(t)
+			if _, dup := seen[key]; !dup {
+				seen[key] = struct{}{}
 				out = append(out, t)
 			}
 		}
@@ -225,16 +237,17 @@ func intersectTypes(offered, local []string) []string {
 }
 
 func narrower(a, b string) (string, bool) {
+	aBase, bBase := mediaRangeBase(a), mediaRangeBase(b)
 	switch {
-	case strings.EqualFold(a, b):
+	case strings.EqualFold(aBase, bBase):
 		return a, true
-	case a == "*":
+	case aBase == "*":
 		return b, true
-	case b == "*":
+	case bBase == "*":
 		return a, true
 	}
-	aType, aSub, _ := strings.Cut(a, "/")
-	bType, bSub, _ := strings.Cut(b, "/")
+	aType, aSub, _ := strings.Cut(aBase, "/")
+	bType, bSub, _ := strings.Cut(bBase, "/")
 	switch {
 	case !strings.EqualFold(aType, bType):
 		return "", false

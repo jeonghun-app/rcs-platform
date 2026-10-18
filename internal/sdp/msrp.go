@@ -118,7 +118,11 @@ func mediaTypeList(as Attributes, name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	types := strings.Split(v, " ")
+	// Split outside quotes: a quoted parameter value may contain a space.
+	types, err := splitParams(v)
+	if err != nil {
+		return nil, fmt.Errorf("sdp: a=%s: %w", name, err)
+	}
 	if err := validateMediaTypes(name, types); err != nil {
 		return nil, err
 	}
@@ -134,14 +138,43 @@ func validateMediaTypes(name string, types []string) error {
 	return nil
 }
 
-// isMediaRange reports whether s is "*", type/* or type/subtype, the entries
-// RFC 4975 §9 allows in accept-types. Parameters are not allowed there.
+// isMediaRange reports whether s is an accept-types entry (RFC 4975 §8.6):
+// "*", or type/subtype or type/* followed by any number of ;name=value
+// parameters, a value being a token or a quoted string.
 func isMediaRange(s string) bool {
-	if s == "*" {
-		return true
+	base, params, hasParams := strings.Cut(s, ";")
+	if base == "*" {
+		return !hasParams
 	}
-	typ, sub, ok := strings.Cut(s, "/")
-	return ok && isToken(typ) && isToken(sub)
+	typ, sub, ok := strings.Cut(base, "/")
+	if !ok || !isToken(typ) || !isToken(sub) {
+		return false
+	}
+	return !hasParams || isTypeParams(params)
+}
+
+// isTypeParams checks the text after the first ";" of an entry. A quoted
+// value may hold ";" and spaces but no quote or backslash: escapes are not
+// supported, and an entry that would need one is rejected, not guessed at.
+func isTypeParams(s string) bool {
+	for _, p := range splitUnquoted(s, ';') {
+		name, value, ok := strings.Cut(p, "=")
+		if !ok || !isToken(name) || !(isToken(value) || isQuoted(value)) {
+			return false
+		}
+	}
+	return true
+}
+
+func isQuoted(v string) bool {
+	return len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' && !strings.ContainsAny(v[1:len(v)-1], `"\`)
+}
+
+// mediaRangeBase returns an entry without its parameters, which is what
+// entries are matched on (RFC 4975 §8.6).
+func mediaRangeBase(s string) string {
+	base, _, _ := strings.Cut(s, ";")
+	return base
 }
 
 // MaxSize returns a=max-size, the largest message the endpoint is willing to
