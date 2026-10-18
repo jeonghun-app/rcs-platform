@@ -23,6 +23,7 @@ type listener struct {
 	proxy        bool
 	clientFacing bool
 	idle         time.Duration
+	sendQueue    int
 	local        netip.AddrPort
 	// sentByHost and sentByPort are what this listener writes into, and accepts
 	// in, the sent-by of a Via.
@@ -76,6 +77,13 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 	}
 	if l.idle <= 0 {
 		l.idle = t.cfg.IdleTimeout
+	}
+	switch l.sendQueue = cfg.SendQueueBytes; {
+	case l.sendQueue > 0:
+	case l.clientFacing:
+		l.sendQueue = DefaultClientSendQueueBytes
+	default:
+		l.sendQueue = t.cfg.SendQueueBytes
 	}
 	lc := net.ListenConfig{KeepAliveConfig: coreKeepAlive}
 	switch {
@@ -322,6 +330,7 @@ func (l *listener) serveAccepted(raw net.Conn) {
 	}
 	c.SetReadDeadline(time.Time{})
 	f.conn = c
+	f.idle.Store(int64(l.idle))
 	t.startWriter(f)
 	if !t.unpend(raw) || !t.flows.addStream(f) {
 		f.q.close()

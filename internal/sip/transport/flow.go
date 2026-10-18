@@ -57,6 +57,10 @@ type flow struct {
 	// q feeds the writer goroutine of a stream flow.
 	q      *sendQueue
 	closed atomic.Bool
+	// idle is a stream flow's idle timeout in nanoseconds, and dr the reader
+	// that applies it, once the flow is being served.
+	idle atomic.Int64
+	dr   atomic.Pointer[deadlineReader]
 
 	// UDP only, guarded by flowTable.mu: when the flow last received a
 	// datagram, and its places in the table's recency lists.
@@ -373,6 +377,19 @@ func (t *flowTable) close() []*flow {
 		}
 	}
 	return streams
+}
+
+// streams returns the stream flows in the table.
+func (t *flowTable) streams() []*flow {
+	t.mu.Lock()
+	defer t.unlock()
+	out := make([]*flow, 0, t.inbound+t.outbound)
+	for _, f := range t.byID {
+		if f.conn != nil && f.q != nil {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 type tableStats struct {

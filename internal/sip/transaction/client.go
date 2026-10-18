@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -11,9 +12,58 @@ import (
 
 // ResponseHandler receives what a client transaction passes to the TU: each
 // response the TU must see, in order, or one error after which nothing follows.
-// The error is ErrTimeout when Timer B or F fires, or a transport error from a
-// retransmission.
+// The error is ErrTimeout when Timer B or F fires, ErrTerminated after
+// Terminate, or a transport error from a retransmission.
+//
+// Calls for one transaction never overlap and arrive in the order the
+// transaction produced them, though not always on the goroutine that produced
+// them: a call made while another is running is delivered by that one when it
+// returns.
 type ResponseHandler func(res *sip.Response, err error)
+
+// delivery serializes a client transaction's handler calls and drops anything
+// that follows the terminal error. The state machine produces notifications
+// under the transaction's lock but delivers them after releasing it, so without
+// this a response produced just before Terminate could reach the TU after
+// ErrTerminated. Queueing rather than holding a lock across the call also lets
+// the handler call Terminate itself.
+type delivery struct {
+	h ResponseHandler
+
+	mu      sync.Mutex
+	queue   []event
+	running bool
+	ended   bool
+}
+
+type event struct {
+	res *sip.Response
+	err error
+}
+
+func (d *delivery) deliver(res *sip.Response, err error) {
+	d.mu.Lock()
+	if d.ended {
+		d.mu.Unlock()
+		return
+	}
+	d.ended = err != nil
+	d.queue = append(d.queue, event{res, err})
+	if d.running {
+		d.mu.Unlock()
+		return
+	}
+	d.running = true
+	for len(d.queue) > 0 {
+		e := d.queue[0]
+		d.queue = d.queue[1:]
+		d.mu.Unlock()
+		d.h(e.res, e.err)
+		d.mu.Lock()
+	}
+	d.running = false
+	d.mu.Unlock()
+}
 
 // ClientTransaction is a client INVITE (RFC 3261 §17.1.1, RFC 6026 §7.2) or
 // client non-INVITE (§17.1.2) transaction.
@@ -25,7 +75,7 @@ type ClientTransaction struct {
 	// network is the transport the first send actually used, which the ACK
 	// for a non-2xx response must use too (§17.1.1.3).
 	network transport.Network
-	handler ResponseHandler
+	out     delivery
 	// ack is the ACK for a non-2xx final response, built once and resent for
 	// each retransmission of that response (§17.1.1.3).
 	ack *sip.Request
@@ -57,7 +107,7 @@ func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseH
 		return nil, errors.New("transaction: the top Via branch lacks the RFC 3261 magic cookie")
 	}
 	key, _ := clientKey(&req.Header)
-	tx := &ClientTransaction{invite: req.Method == "INVITE", req: req, dst: dst, handler: h}
+	tx := &ClientTransaction{invite: req.Method == "INVITE", req: req, dst: dst, out: delivery{h: h}}
 	tx.machine = machine{l: l, key: key, onTimer: tx.onTimer}
 
 	l.mu.Lock()
@@ -105,7 +155,9 @@ func (tx *ClientTransaction) State() State {
 func (tx *ClientTransaction) Request() *sip.Request { return tx.req }
 
 // Terminate ends the transaction now, and its handler receives ErrTerminated
-// unless the transaction had already ended. RFC 3261 leaves a client INVITE
+// unless the transaction had already ended; nothing reaches the handler after
+// that. Called from inside the handler, it returns before ErrTerminated is
+// delivered, which happens as soon as the handler returns. RFC 3261 leaves a client INVITE
 // transaction in Proceeding until a final response arrives, so the TU ends it
 // itself: 64*T1 after its CANCEL went unanswered (§9.1), or when a proxy's Timer
 // C fires (§16.8).
@@ -115,7 +167,7 @@ func (tx *ClientTransaction) Terminate() {
 	tx.terminate()
 	tx.mu.Unlock()
 	if live {
-		tx.handler(nil, ErrTerminated)
+		tx.out.deliver(nil, ErrTerminated)
 	}
 }
 
@@ -131,7 +183,7 @@ func (tx *ClientTransaction) ackDestination() transport.Destination {
 }
 
 func (tx *ClientTransaction) notify(res *sip.Response, err error) func() {
-	return func() { tx.handler(res, err) }
+	return func() { tx.out.deliver(res, err) }
 }
 
 func (tx *ClientTransaction) onTimer(id timerID) func() {

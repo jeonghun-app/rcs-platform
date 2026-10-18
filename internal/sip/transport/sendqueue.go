@@ -2,6 +2,7 @@ package transport
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +35,8 @@ func noWait(opts []SendOption) bool {
 // caller never waits. A queue that stays full closes its connection: its peer is
 // not reading, and cannot slow anyone else down for longer than that.
 type sendQueue struct {
+	budget *queueBudget
+
 	mu sync.Mutex
 	// bufs are the messages not yet taken by the writer; queued counts them
 	// and the batch the writer is writing, against limit.
@@ -48,21 +51,55 @@ type sendQueue struct {
 	done chan struct{}
 }
 
-func newSendQueue(limit int) *sendQueue {
-	return &sendQueue{limit: limit, wake: make(chan struct{}, 1), room: make(chan struct{}, 1), done: make(chan struct{})}
+func newSendQueue(limit int, budget *queueBudget) *sendQueue {
+	return &sendQueue{budget: budget, limit: limit, wake: make(chan struct{}, 1), room: make(chan struct{}, 1), done: make(chan struct{})}
 }
 
-// tryPush queues b if it fits within max. A message is always accepted into an
-// empty queue, so a limit below the largest message cannot make a connection
-// unusable.
-func (q *sendQueue) tryPush(b []byte, max int) (ok, closed bool) {
+// queueBudget is the output every send queue of a transport may hold together
+// (Config.MaxQueuedBytes). Per-connection limits keep one peer from using much;
+// the budget keeps all of them together inside the task's memory.
+type queueBudget struct {
+	used atomic.Int64
+	max  int64
+}
+
+func (b *queueBudget) reserve(n int) bool {
+	for {
+		u := b.used.Load()
+		if u+int64(n) > b.max {
+			return false
+		}
+		if b.used.CompareAndSwap(u, u+int64(n)) {
+			return true
+		}
+	}
+}
+
+func (b *queueBudget) release(n int) { b.used.Add(-int64(n)) }
+
+type pushResult int
+
+const (
+	pushed     pushResult = iota
+	queueFull             // over this connection's limit
+	overBudget            // over the transport's budget
+	queueGone             // the connection has closed
+)
+
+// tryPush queues b if it fits within max and the transport's budget. A message
+// is always accepted into an empty queue, budget permitting, so a limit below
+// the largest message cannot make a connection unusable.
+func (q *sendQueue) tryPush(b []byte, max int) pushResult {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
-		return false, true
+		return queueGone
 	}
 	if q.queued > 0 && q.queued+len(b) > max {
-		return false, false
+		return queueFull
+	}
+	if !q.budget.reserve(len(b)) {
+		return overBudget
 	}
 	q.bufs = append(q.bufs, b)
 	q.queued += len(b)
@@ -71,20 +108,20 @@ func (q *sendQueue) tryPush(b []byte, max int) (ok, closed bool) {
 		// Let the next waiting sender look too.
 		notify(q.room)
 	}
-	return true, false
+	return pushed
 }
 
 // push queues b. A NoWait push may fill the queue to twice its limit; another
-// push waits up to timeout for the queue to drop below its limit. ok is false
-// when it could not; closed reports that the queue was closed meanwhile.
-func (q *sendQueue) push(b []byte, wait bool, timeout time.Duration) (ok, closed bool) {
+// push waits up to timeout for the queue to drop below its limit. Neither waits
+// for the transport's budget.
+func (q *sendQueue) push(b []byte, wait bool, timeout time.Duration) pushResult {
 	if !wait {
 		return q.tryPush(b, 2*q.limit)
 	}
 	var deadline <-chan time.Time
 	for {
-		if ok, closed := q.tryPush(b, q.limit); ok || closed {
-			return ok, closed
+		if r := q.tryPush(b, q.limit); r != queueFull {
+			return r
 		}
 		if deadline == nil {
 			t := time.NewTimer(timeout)
@@ -94,9 +131,9 @@ func (q *sendQueue) push(b []byte, wait bool, timeout time.Duration) (ok, closed
 		select {
 		case <-q.room:
 		case <-q.done:
-			return false, true
+			return queueGone
 		case <-deadline:
-			return false, false
+			return queueFull
 		}
 	}
 }
@@ -119,12 +156,23 @@ func (q *sendQueue) take() (bufs [][]byte, closed bool) {
 // written releases n bytes the writer has sent.
 func (q *sendQueue) written(n int) {
 	q.mu.Lock()
-	q.queued -= n
+	if !q.closed {
+		q.queued -= n
+		q.budget.release(n)
+	}
 	q.mu.Unlock()
 	notify(q.room)
 }
 
-// close drops what is queued, stops the writer and releases waiting senders.
+// size returns the bytes the queue holds, the batch being written included.
+func (q *sendQueue) size() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.queued
+}
+
+// close drops what is queued, returns its bytes to the budget, stops the writer
+// and releases waiting senders.
 func (q *sendQueue) close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -133,6 +181,8 @@ func (q *sendQueue) close() {
 	}
 	q.closed = true
 	q.bufs = nil
+	q.budget.release(q.queued)
+	q.queued = 0
 	close(q.done)
 	notify(q.wake)
 }
