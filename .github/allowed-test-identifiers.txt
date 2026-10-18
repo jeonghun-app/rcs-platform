@@ -1,0 +1,16 @@
+# Every 15- and 16-digit identifier that may appear in this repository.
+#
+# CI fails on any other one, because a 15-digit literal is most likely a real
+# IMSI and a real IMSI is subscriber-identifying data.
+#
+# Rules for adding an entry:
+#   * IMSIs use MCC 001 / MNC 01, the reserved test network.
+#   * IMEIs come from documented example ranges and are not tied to a device.
+#   * Add a comment saying which test or document uses the entry.
+#
+# Format: one identifier per line. Comments and blank lines are ignored.
+
+# --- IMSIs, reserved test network (MCC 001, MNC 01) --------------------------
+001010000000001
+001010000000002
+001010000000003

@@ -1,0 +1,22 @@
+name: Specification correction
+description: Behaviour that does not match a GSMA, 3GPP, OMA or IETF specification.
+labels: ["type/bug", "status/triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cite the document, edition and clause. **Do not paste GSMA specification
+        text**: the documents are licensed.
+  - type: input
+    id: reference
+    attributes:
+      label: Document, edition and clause
+      placeholder: RCC.07 v11.0 §3.2.5.1, RFC 4975 §7.1.1
+    validations:
+      required: true
+  - type: textarea
+    id: mismatch
+    attributes:
+      label: What the platform does, and what the clause requires
+    validations:
+      required: true
