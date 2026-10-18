@@ -40,9 +40,11 @@ type Request interface {
 //     evaluation examines, cannot be examined (lengths are counted before
 //     white space is normalised); [Set.OversizedValues] counts it.
 //   - Each match is charged against the evaluation's work budget
-//     ([Limits.MaxWork]): the length of the value for a header name that is
-//     a plain token and for a pattern that is a plain literal, which are
-//     compared or searched directly, and instructions × bytes otherwise.
+//     ([Limits.MaxWork]): one unit a byte of the value for a header name
+//     that is a plain token, which is compared directly; four units a byte
+//     for a pattern that is a plain literal (after a leading and trailing
+//     ".*" are dropped), which is found with a substring search; and
+//     instructions × bytes otherwise.
 //     [Set.ExhaustedEvaluations] counts evaluations the budget could not
 //     pay for.
 //
@@ -72,13 +74,15 @@ const (
 	// an offer for MSRP chat or file transfer is well under 2 KiB.
 	MaxSDPBytes = 16 << 10
 	// DefaultMaxWork is the work budget of one evaluation, in units of one
-	// instruction over one byte. Spending all of it with the costliest
-	// patterns the limits allow took 15 to 28 ns a unit on a heavily
-	// loaded shared host (load average 55), so at most about 5 to 8 ms of
-	// one core there, and less on an idle one. 24 ordinary RCS criteria
-	// over a chat INVITE spend about 40 000 units; an S-CSCF with larger
-	// profiles raises the budget with [CompileWithLimits].
-	DefaultMaxWork = 300_000
+	// instruction over one byte. The costliest patterns measured, short
+	// counted repetitions such as "[ab]{100}c" over 3 KB values, ran at 12
+	// to 27 ns a unit on a heavily loaded shared host (load average 56 to
+	// 125), so spending the whole budget took up to about 25 ms of one core
+	// there, and less on an idle one. 24 ordinary RCS criteria over a chat
+	// INVITE or a REGISTER with a 2 KB Contact spend well under half of it;
+	// an S-CSCF with larger profiles raises the budget with
+	// [CompileWithLimits].
+	DefaultMaxWork = 1_000_000
 )
 
 // ErrEvaluationLimit is wrapped by every [*LimitError].
@@ -254,14 +258,14 @@ func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
 		// pattern must match the whole name: "Contact" must not select
 		// Accept-Contact or Reject-Contact. Values are matched as written,
 		// anywhere in the value, as Annex F's regexec semantics give.
-		if c.name, err = compilePattern("Header", v.Header, patternFoldCase|patternWhole, budget); err == nil && v.Content != "" {
+		if c.name, err = compilePattern("Header", v.Header, patternFoldCase|patternWhole, budget); err == nil && matchesSomething(v.Content) {
 			c.value, err = compilePattern("Content", v.Content, 0, budget)
 		}
 	case SessionCase:
 		c.kind, c.session = kindSessionCase, v
 	case SessionDescription:
 		c.kind = kindSessionDescription
-		if c.name, err = compilePattern("Line", v.Line, 0, budget); err == nil && v.Content != "" {
+		if c.name, err = compilePattern("Line", v.Line, 0, budget); err == nil && matchesSomething(v.Content) {
 			c.value, err = compilePattern("Content", v.Content, 0, budget)
 		}
 	}
@@ -274,12 +278,15 @@ type pattern struct {
 	re    *regexp.Regexp
 	insts int
 	// token is set for a header name pattern that is a plain token, which
-	// is compared with EqualFold; linear for a pattern whose whole match is
-	// a literal, which Go finds with a substring search. Both cost one unit
-	// a byte.
+	// is compared with EqualFold at one unit a byte. linear is set for a
+	// pattern whose whole match is a literal, which Go finds with a
+	// substring search; that is charged literalCost a byte, about what such
+	// a search costs against one instruction over one byte.
 	token  string
 	linear bool
 }
+
+const literalCost = 4
 
 type patternMode uint8
 
@@ -307,6 +314,9 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 			return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
 		}
 		return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression", name)
+	}
+	if mode&patternWhole == 0 {
+		source = withoutOuterDotStar(source)
 	}
 	expr := "(?:" + source + ")"
 	if mode&patternFoldCase != 0 {
@@ -364,6 +374,48 @@ func isPlainToken(s string) bool {
 		}
 	}
 	return true
+}
+
+// matchesSomething reports whether a Content pattern restricts the value at
+// all; an empty one, or ".*", is the same as no Content.
+func matchesSomething(content string) bool {
+	return content != "" && withoutOuterDotStar(content) != ""
+}
+
+// withoutOuterDotStar drops a leading and a trailing ".*" from a pattern
+// that is searched for anywhere in its field. Operators often write ".*X.*"
+// for "contains X"; in an unanchored search the two are the same as long as
+// the field has no newline, which "." does not match, and none has one:
+// header values are collapsed, SDP lines are split at line ends, and a SIP
+// parser refuses a line break in a Request-URI. Without the ".*", a literal X
+// is found with a substring search instead of the full engine. Only the
+// compiled form changes; the criteria keep the pattern as provisioned.
+func withoutOuterDotStar(source string) string {
+	tree, err := syntax.Parse(source, syntax.POSIX)
+	if err != nil {
+		return source
+	}
+	dotStar := func(re *syntax.Regexp) bool {
+		return re.Op == syntax.OpStar && (re.Sub[0].Op == syntax.OpAnyCharNotNL || re.Sub[0].Op == syntax.OpAnyChar)
+	}
+	if dotStar(tree) {
+		return ""
+	}
+	if tree.Op != syntax.OpConcat {
+		return source
+	}
+	subs := tree.Sub
+	for len(subs) > 0 && dotStar(subs[0]) {
+		subs = subs[1:]
+	}
+	for len(subs) > 0 && dotStar(subs[len(subs)-1]) {
+		subs = subs[:len(subs)-1]
+	}
+	if len(subs) == len(tree.Sub) {
+		return source
+	}
+	stripped := &syntax.Regexp{Op: syntax.OpConcat, Sub: subs}
+	return stripped.String()
 }
 
 // estimateSize is an upper bound on the instructions syntax.Compile emits for
@@ -570,7 +622,11 @@ func newInput(req Request, ctx Context, work int) *input {
 // costs the program once.
 func (in *input) match(p pattern, v string) bool {
 	cost := max(len(v), 1)
-	if p.token == "" && !p.linear {
+	switch {
+	case p.token != "":
+	case p.linear:
+		cost *= literalCost
+	default:
 		cost *= p.insts
 	}
 	if cost > in.work {

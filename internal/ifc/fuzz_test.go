@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -96,6 +97,20 @@ func FuzzEvaluateTrigger(f *testing.F) {
 		}
 		if results[[2]bool{true, false}] == results[[2]bool{true, true}] {
 			t.Fatalf("negation did not invert the answer: %v", results)
+		}
+		// Dropping an outer ".*" must not change a content match on a
+		// value without a newline, which is all evaluation ever sees.
+		if !strings.Contains(value, "\n") {
+			plain, err1 := Compile([]FilterCriteria{contentCriteria(p2)})
+			padded, err2 := Compile([]FilterCriteria{contentCriteria(".*" + p2 + ".*")})
+			if err1 == nil && err2 == nil {
+				hr := req("MESSAGE", impu, HeaderField{"Subject", value})
+				_, a, errA := plain.Next(hr, Context{}, -1)
+				_, b, errB := padded.Next(hr, Context{}, -1)
+				if errA == nil && errB == nil && a != b {
+					t.Fatalf("%q and .*%q.* disagree on %q: %t, %t", p2, p2, value, a, b)
+				}
+			}
 		}
 	})
 }

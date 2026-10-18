@@ -701,6 +701,110 @@ func TestAnOrdinaryProfileSpendsLittleOfTheBudget(t *testing.T) {
 	}
 }
 
+// rcsICSIs are the services the realistic profiles below select.
+var rcsICSIs = []string{"oma.cpm.msg", "oma.cpm.largemsg", "oma.cpm.deferred", "oma.cpm.filetransfer", "oma.cpm.session", "oma.cpm.systemmsg",
+	"mmtel", "gsma.callcomposer", "gsma.callunanswered", "gsma.sharedmap", "gsma.sharedsketch", "gsma.chatbot"}
+
+func TestAnINVITEMatchingNoCriterionOfADotStarProfileIsEvaluated(t *testing.T) {
+	var cs []FilterCriteria
+	for i := 0; i < 24; i++ {
+		// Operators often pad unanchored patterns with .* at both ends.
+		icsi := strings.ReplaceAll(rcsICSIs[i%len(rcsICSIs)], ".", `\.`)
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+			{Groups: []int{0}, Condition: Method("INVITE")}, {Groups: []int{0}, Condition: Method("MESSAGE")},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact",
+				Content: `.*\+g\.3gpp\.icsi-ref="urn%3Aurn-7%3A3gpp-service\.ims\.icsi\.` + icsi + `".*`}},
+		}}))
+	}
+	s := compile(t, cs...)
+	headers := []HeaderField{{"Accept-Contact", `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.unknown.service";` +
+		`+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.geopush";require;explicit`}}
+	for _, name := range []string{"Via", "Via", "Max-Forwards", "Route", "Record-Route", "From", "To", "Call-ID", "CSeq", "Contact",
+		"P-Asserted-Identity", "P-Charging-Vector", "P-Access-Network-Info", "Allow", "Supported", "User-Agent", "Content-Type", "Content-Length"} {
+		headers = append(headers, HeaderField{name, strings.Repeat("v", 60)})
+	}
+	if _, ok, err := s.Next(&sipRequest{method: "INVITE", uri: impu, headers: headers}, Context{Case: Originating}, -1); err != nil || ok {
+		t.Errorf("an ordinary INVITE that no criterion selects: ok=%v, err=%v", ok, err)
+	}
+}
+
+// TestOuterDotStarChangesNeitherTheResultNorTheCost compiles each pattern
+// with and without a leading and trailing ".*" and evaluates both against
+// the same values.
+func TestOuterDotStarChangesNeitherTheResultNorTheCost(t *testing.T) {
+	values := []string{"", "chat", "a chat b", "x oma.cpm.session y", "oma.cpm", "OMA.CPM.SESSION", "ab\tcd"}
+	for _, core := range []string{`oma\.cpm\.session`, `chat`, `(a|b)c`, `^a`, `b$`, `[0-9]+`, ``} {
+		for _, padded := range []string{".*" + core, core + ".*", ".*" + core + ".*", ".*.*" + core + ".*.*"} {
+			plain, dots := compile(t, contentCriteria(core)), compile(t, contentCriteria(padded))
+			for _, v := range values {
+				r := req("MESSAGE", impu, HeaderField{"Subject", v})
+				inPlain, inDots := newInput(r, Context{}, DefaultMaxWork), newInput(r, Context{}, DefaultMaxWork)
+				gotPlain, gotDots := plain.criteria[0].matches(inPlain), dots.criteria[0].matches(inDots)
+				if gotPlain != gotDots || inPlain.work != inDots.work {
+					t.Errorf("%q vs %q on %q: matched %t/%t, cost %d/%d", core, padded, v, gotPlain, gotDots,
+						DefaultMaxWork-inPlain.work, DefaultMaxWork-inDots.work)
+				}
+			}
+		}
+	}
+	// A ".*" inside the pattern, or a lone one, is kept or means "anything".
+	if got := withoutOuterDotStar("a.*b"); got != "a.*b" {
+		t.Errorf("inner .* changed: %q", got)
+	}
+	if got := withoutOuterDotStar(".*"); got != "" {
+		t.Errorf(".* alone = %q, want empty", got)
+	}
+	// The criteria keep the pattern as provisioned.
+	fc := contentCriteria(".*chat.*")
+	s := compile(t, fc)
+	if c := s.criteria[0].fc.TriggerPoint.SPTs[0].Condition; c != (SIPHeader{Header: "Subject", Content: ".*chat.*"}) {
+		t.Errorf("returned criteria hold %v", c)
+	}
+}
+
+func contentCriteria(content string) FilterCriteria {
+	return criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: content}}}})
+}
+
+// TestARealisticProfileOverARegisterUsesAtMostHalfTheBudget evaluates 24
+// RCS criteria, for REGISTER (third-party registration) as well as for
+// INVITE and MESSAGE, against a REGISTER whose Contact carries 2 KB of
+// feature tags, as RCS clients send.
+func TestARealisticProfileOverARegisterUsesAtMostHalfTheBudget(t *testing.T) {
+	var cs []FilterCriteria
+	for i := 0; i < 24; i++ {
+		icsi := strings.ReplaceAll(rcsICSIs[i%len(rcsICSIs)], ".", `\.`)
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+			{Groups: []int{0}, Condition: Method("REGISTER")},
+			{Groups: []int{0}, Condition: Method("INVITE")},
+			{Groups: []int{0}, Condition: Method("MESSAGE")},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Contact", Content: `.*\+g\.3gpp\.icsi-ref="urn%3Aurn-7%3A3gpp-service\.ims\.icsi\.` + icsi + `".*`}},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `.*` + icsi + `.*`}},
+			{ConditionNegated: true, Groups: []int{2}, Condition: SIPHeader{Header: "P-Served-User"}},
+		}}))
+	}
+	s := compile(t, cs...)
+	var tags strings.Builder
+	tags.WriteString(`<sip:+15550100001@192.0.2.1:5060;transport=tcp>;+sip.instance="<urn:gsma:imei:00000000-000000-0>";expires=600000`)
+	for tags.Len() < 2000 {
+		tags.WriteString(`;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.unknown"`)
+	}
+	headers := []HeaderField{{"Contact", tags.String()}}
+	for _, name := range []string{"Via", "Max-Forwards", "Route", "From", "To", "Call-ID", "CSeq", "Expires",
+		"Authorization", "Supported", "Path", "Require", "P-Access-Network-Info", "P-Visited-Network-ID", "User-Agent"} {
+		headers = append(headers, HeaderField{name, strings.Repeat("v", 120)})
+	}
+	in := newInput(&sipRequest{method: "REGISTER", uri: "sip:" + domain, headers: headers}, Context{}, s.maxWork)
+	for i := range s.criteria {
+		s.criteria[i].matches(in)
+	}
+	spent := DefaultMaxWork - in.work
+	if in.limit != "" || spent > DefaultMaxWork/2 {
+		t.Errorf("the REGISTER spent %d of %d units (limit %q)", spent, DefaultMaxWork, in.limit)
+	}
+}
+
 func TestEverySPTIsEvaluatedOnceWhateverItsGroups(t *testing.T) {
 	// 2000 SPTs, each alone in its own group and also in a shared one: a
 	// DNF trigger that never matches visits every group.
