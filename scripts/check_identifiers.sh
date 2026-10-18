@@ -24,18 +24,20 @@ fi
 
 allowed="$(grep -oE '^\+?[0-9]{10,16}' "$ALLOWLIST" | sort -u)"
 
-# git grep exits 1 when nothing matches; anything above 1 is a real failure.
-scan() {
-  local rc=0 out
-  out="$(git grep -hIoE "$1" -- ':!.github/allowed-test-identifiers.txt' ':!go.sum')" || rc=$?
+# git grep exits 1 when nothing matches; anything above 1 is a real failure. The
+# scans run at top level (not in a command substitution) so `exit` really exits.
+hits="$(mktemp)"
+trap 'rm -f "$hits"' EXIT
+for pattern in '\b[0-9]{15,16}\b' '\+[0-9]{10,15}\b'; do
+  rc=0
+  git grep -hIoE "$pattern" -- ':!.github/allowed-test-identifiers.txt' ':!go.sum' >>"$hits" || rc=$?
   if (( rc > 1 )); then
     echo "error: git grep failed ($rc)" >&2
     exit 2
   fi
-  printf '%s\n' "$out"
-}
+done
 
-found="$( { scan '\b[0-9]{15,16}\b'; scan '\+[0-9]{10,15}\b'; } | grep -E '^\+?[0-9]+$' | sort -u || true)"
+found="$(grep -E '^\+?[0-9]+$' "$hits" | sort -u || true)"
 
 if [[ -z "$found" ]]; then
   echo "no subscriber-shaped identifiers found"

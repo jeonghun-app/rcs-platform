@@ -64,5 +64,15 @@ horizontal scaling without sticky load balancing.
 - A `pcscf` or `rcs-as` task that stops drops its connections and sessions;
   clients recover by re-registering and re-establishing sessions, which RCS
   clients already do.
-- ECS deployments use a minimum healthy percent of 100 and connection draining so
-  rolling updates do not cut every connection at once.
+- Rolling updates replace connection-holding tasks one at a time (ADR 0003) so
+  an update never cuts every connection at once.
+- HSS-initiated Cx requests (RTR, PPR) are sent by Destination-Realm to any
+  connected `scscf` peer, not to the Origin-Host recorded at SAR time: that task
+  may be gone, and every instance can act on any registration because the state
+  is in DynamoDB.
+- The signed iFC-position parameter covers the Call-ID and an expiry (default
+  32 s, Timer B/F) as well as served user, session case and next priority, so it
+  cannot be replayed on another request or later.
+- In-dialog requests from the core reach the client the same way terminating
+  initial requests do: the core-facing `Record-Route` entry `pcscf` inserts
+  carries the same signed flow token as `Path`.

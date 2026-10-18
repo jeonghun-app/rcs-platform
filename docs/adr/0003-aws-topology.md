@@ -25,7 +25,10 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
   identity. The SIP and MSRP transports require the PPv2 header when
   `RCS_PROXY_PROTOCOL=true` and refuse a connection without one, so a
   misconfigured target group fails loudly instead of seeing every client as the
-  load balancer.
+  load balancer. NLB health checks are sent with a PPv2 `LOCAL` command (no
+  client address); the transport accepts those and closes them after the health
+  check without creating a flow. `RCS_PROXY_PROTOCOL=false` is refused in
+  `staging`/`prod`.
 - NLB TCP idle timeout is raised to 1800 s on the SIP and MSRP listeners (the
   default 350 s would cut quiet sessions). Clients keep SIP flows alive with CRLF
   pings (RFC 5626); `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session
@@ -51,7 +54,9 @@ true; it can be split into nested stacks later without changing service code.
 - Load balancer connection draining does not help long-lived SIP and MSRP
   connections: when a `pcscf` or `msrp-relay` task stops, its clients reconnect and
   re-register. Rolling updates therefore replace one task at a time
-  (`maximumPercent` 200, `minimumHealthyPercent` 100, deregistration delay 30 s),
+  (`minimumHealthyPercent` 100 and `maximumPercent` 100 + 100/N rounded up, e.g.
+  150 for two tasks, so ECS adds and then retires one task per step;
+  deregistration delay 30 s),
   a stopping `pcscf` closes its flows gradually over the task's stop timeout
   (120 s) rather than all at once, and `hss` and `scscf` are sized for the
   resulting re-registration burst (full authentication for every client of one

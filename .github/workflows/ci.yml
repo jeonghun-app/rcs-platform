@@ -12,7 +12,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # Superseded pull request runs are cancelled; every main commit is tested.
+  # Superseded pull request runs are cancelled; a main run is never cancelled
+  # once started (a queued one can still be replaced by a newer merge).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

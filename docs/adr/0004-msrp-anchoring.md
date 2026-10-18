@@ -26,7 +26,9 @@ gateway controlled by the P-CSCF (TS 23.334).
   - The binding stores its own expiry and the relay checks it on read; DynamoDB
     TTL deletion can lag by days and only keeps the table small.
   - A binding accepts one client connection; a second connection presenting the
-    same session id is refused with a 403 and logged.
+    same session id is refused with a 403 and logged. The relay task that
+    accepts the connection claims the binding with a conditional update
+    (`attribute_not_exists(claimed_by)`), so the rule holds across tasks.
 - RFC 4976 relay mode (AUTH) is an optional later feature for clients that ask for
   it.
 
