@@ -469,3 +469,41 @@ func TestXMLErrorsDoNotQuoteTheInput(t *testing.T) {
 		t.Errorf("ParseNotificationMessage() error = %v", err)
 	}
 }
+
+func TestDateTimeLengthIsBoundedSoReceiptsStayReadable(t *testing.T) {
+	long := strings.Repeat("9", MaxDateTimeLength+1)
+	m := mustCPIM(t, "NS: imdn <urn:ietf:params:imdn>\nimdn.Message-ID: abc\nDateTime: "+long+"\nimdn.Disposition-Notification: display\n\nContent-Type: text/plain\n\n")
+	if _, err := ParseRequest(m); !errors.Is(err, ErrMalformed) {
+		t.Errorf("ParseRequest() error = %v, want ErrMalformed", err)
+	}
+	n := displayed()
+	n.DateTime = long
+	if _, err := n.Marshal(); !errors.Is(err, ErrMalformed) {
+		t.Errorf("Marshal() error = %v, want ErrMalformed", err)
+	}
+	if _, err := ParseNotification([]byte(doc(`<message-id>abc</message-id><datetime>` + long + `</datetime>` + delivered("")))); !errors.Is(err, ErrMalformed) {
+		t.Errorf("ParseNotification() error = %v, want ErrMalformed", err)
+	}
+	n.DateTime = strings.Repeat("9", MaxDateTimeLength)
+	if _, err := n.Marshal(); err != nil {
+		t.Errorf("a datetime of exactly %d bytes: %v", MaxDateTimeLength, err)
+	}
+}
+
+func TestMarshalNeverWritesWhatParseWouldRefuse(t *testing.T) {
+	n := displayed()
+	n.Subject = strings.Repeat("s", MaxDocumentSize)
+	if _, err := n.Marshal(); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("Marshal() error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestTimeIgnoresWhiteSpaceAroundThePrettyPrintedValue(t *testing.T) {
+	n, err := ParseNotification([]byte(doc("<message-id>abc</message-id><datetime>\n  2026-10-18T09:30:00Z\n</datetime>" + delivered(""))))
+	if err != nil || n.DateTime != "\n  2026-10-18T09:30:00Z\n" {
+		t.Fatalf("ParseNotification() = %q, %v; the raw value is kept", n.DateTime, err)
+	}
+	if got, err := n.Time(); err != nil || !got.Equal(time.Date(2026, 10, 18, 9, 30, 0, 0, time.UTC)) {
+		t.Errorf("Time() = %v, %v", got, err)
+	}
+}

@@ -85,6 +85,24 @@ func parseHeaderLine(line string) (Header, error) {
 	return Header{Name: name, Params: params, Value: value}, nil
 }
 
+// layoutDeviations reports how line, which parsed to h, departs from the
+// canonical Name ":" Params SP Value layout.
+func layoutDeviations(line string, h Header) Deviation {
+	after := line[len(h.Name)+1+len(h.Params):]
+	if h.Value == "" {
+		return DeviationEmptyValue
+	}
+	var d Deviation
+	lead := len(after) - len(strings.TrimLeft(after, " \t"))
+	if after[:lead] != " " {
+		d |= DeviationSpacing
+	}
+	if len(strings.TrimRight(after, " \t")) != len(after) {
+		d |= DeviationTrailingWS
+	}
+	return d
+}
+
 // checkHeader reports whether Marshal can write h as one canonical line,
 // exactly one space after the colon and no white space at either end (RFC
 // 3862 §2.2), that parses back to exactly h. A canonical line cannot carry an

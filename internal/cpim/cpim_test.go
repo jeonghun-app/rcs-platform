@@ -801,3 +801,38 @@ func TestParsedMessageDoesNotAliasTheInput(t *testing.T) {
 		t.Errorf("message changed with its input: %q", m.Body)
 	}
 }
+
+func TestDeviationsRecordWhatParseTolerated(t *testing.T) {
+	const content = "\n\nContent-Type: text/plain\n\n"
+	tests := map[string]struct {
+		data []byte
+		want Deviation
+	}{
+		"canonical":              {crlf("From: <" + alice + ">\nSubject:;lang=fr Bonjour" + content), 0},
+		"loose content headers":  {crlf("From: <" + alice + ">\n\ncontent-type:text/plain  \n\n"), 0},
+		"bare LF":                {[]byte("From: <" + alice + ">" + content), DeviationBareLF},
+		"no space":               {crlf("From:<" + alice + ">" + content), DeviationSpacing},
+		"two spaces":             {crlf("From:  <" + alice + ">" + content), DeviationSpacing},
+		"tab before the value":   {crlf("Subject:;lang=fr\tBonjour" + content), DeviationSpacing},
+		"trailing white space":   {crlf("From: <" + alice + "> \t" + content), DeviationTrailingWS},
+		"empty value":            {crlf("Subject:  " + content), DeviationEmptyValue},
+		"several in one message": {[]byte("From:<" + alice + "> \nSubject:" + content), DeviationBareLF | DeviationSpacing | DeviationTrailingWS | DeviationEmptyValue},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := mustParse(t, tt.data).Deviations(); got != tt.want {
+				t.Errorf("Deviations() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	all := DeviationBareLF | DeviationSpacing | DeviationTrailingWS | DeviationEmptyValue
+	if got := all.String(); got != "bare-lf,spacing,trailing-ws,empty-value" {
+		t.Errorf("String() = %q", got)
+	}
+	if !all.Has(DeviationSpacing|DeviationBareLF) || DeviationSpacing.Has(all) || Deviation(0).String() != "" {
+		t.Error("Has or String misreports a set")
+	}
+	if (&Message{}).Deviations() != 0 {
+		t.Error("a message built in code reports deviations")
+	}
+}

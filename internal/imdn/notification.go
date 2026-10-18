@@ -97,17 +97,18 @@ func (r Request) Notification(k Kind, s Status, recipient string) (Notification,
 }
 
 // Time interprets DateTime. ParseNotification keeps a datetime it cannot
-// parse rather than lose the receipt; this is where that surfaces.
+// parse rather than lose the receipt; this is where that surfaces. White space
+// around the value, which a pretty-printed document puts there, is ignored.
 func (n Notification) Time() (time.Time, error) {
-	return cpim.ParseDateTime(n.DateTime)
+	return cpim.ParseDateTime(strings.Trim(n.DateTime, " \t\r\n"))
 }
 
 func (n Notification) validate() error {
 	switch {
 	case !cpim.IsToken(n.MessageID) || !isXMLText(n.MessageID):
 		return fmt.Errorf("%w: message-id is not a token", ErrMalformed)
-	case n.DateTime == "" || !isXMLText(n.DateTime):
-		return fmt.Errorf("%w: datetime missing or not XML text", ErrMalformed)
+	case n.DateTime == "" || len(n.DateTime) > MaxDateTimeLength || !isXMLText(n.DateTime):
+		return fmt.Errorf("%w: datetime missing, too long or not XML text", ErrMalformed)
 	case !isURIText(n.RecipientURI) || !isURIText(n.OriginalRecipientURI):
 		return fmt.Errorf("%w: recipient URI contains white space or invalid characters", ErrMalformed)
 	case !isXMLText(n.Subject):
@@ -182,6 +183,10 @@ func (n Notification) Marshal() ([]byte, error) {
 	w.end("imdn")
 	if err := w.close(); err != nil {
 		return nil, err
+	}
+	// Never write what ParseNotification would refuse to read.
+	if b.Len() > MaxDocumentSize {
+		return nil, ErrTooLarge
 	}
 	return b.Bytes(), nil
 }

@@ -38,6 +38,11 @@ import (
 // Namespace is the CPIM header namespace of the IMDN headers (RFC 5438 §6.1).
 const Namespace = "urn:ietf:params:imdn"
 
+// MaxDateTimeLength bounds the DateTime a notification echoes. An RFC 3339
+// date-time is at most a few dozen bytes; without a bound a sender could fill
+// its message with one and have every recipient echo it back.
+const MaxDateTimeLength = 64
+
 // Prefix is the namespace prefix this package declares when it adds IMDN
 // headers. Receivers must accept any prefix (RFC 5438 §6.1); this one is the
 // conventional choice.
@@ -217,6 +222,9 @@ func ParseRequest(m *cpim.Message) (Request, error) {
 	}
 
 	if h, ok := m.Get(cpim.CoreNamespace, cpim.HeaderDateTime); ok {
+		if len(h.Value) > MaxDateTimeLength {
+			return Request{}, fmt.Errorf("%w: DateTime longer than %d bytes", ErrMalformed, MaxDateTimeLength)
+		}
 		r.DateTime = h.Value
 	}
 	if r.Dispositions != 0 && (r.MessageID == "" || r.DateTime == "") {

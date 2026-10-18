@@ -119,6 +119,61 @@ type Message struct {
 	// Body is the encapsulated content, ending where the transport's framing
 	// ends (RFC 3862 §2).
 	Body []byte
+
+	deviations Deviation
+}
+
+// Deviation is a set of the RFC 3862 §2.2 layout rules a parsed message broke
+// and Parse tolerated. A service can count them to learn what real clients
+// send before deciding how lenient to stay.
+type Deviation uint8
+
+// The tolerated deviations. Content headers are MIME, where the spacing that
+// these flags record is legal, so only message headers set Spacing,
+// TrailingWS and EmptyValue.
+const (
+	// DeviationBareLF: the headers end lines with LF instead of CRLF.
+	DeviationBareLF Deviation = 1 << iota
+	// DeviationSpacing: a header has no space, or more than one, or a tab,
+	// between the colon (or parameters) and the value.
+	DeviationSpacing
+	// DeviationTrailingWS: a header line ends in space or tab.
+	DeviationTrailingWS
+	// DeviationEmptyValue: a header has an empty value.
+	DeviationEmptyValue
+)
+
+var deviationNames = []struct {
+	d    Deviation
+	name string
+}{
+	{DeviationBareLF, "bare-lf"},
+	{DeviationSpacing, "spacing"},
+	{DeviationTrailingWS, "trailing-ws"},
+	{DeviationEmptyValue, "empty-value"},
+}
+
+// Has reports whether d includes every deviation in x.
+func (d Deviation) Has(x Deviation) bool {
+	return d&x == x
+}
+
+// String lists the deviations as fixed names joined by commas, for example
+// "bare-lf,spacing"; empty when there are none.
+func (d Deviation) String() string {
+	var names []string
+	for _, dn := range deviationNames {
+		if d&dn.d != 0 {
+			names = append(names, dn.name)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+// Deviations reports the layout deviations Parse tolerated in m; zero for a
+// conforming message and for one built in code.
+func (m *Message) Deviations() Deviation {
+	return m.deviations
 }
 
 // Limits bounds the input Parse accepts. The zero value applies the defaults.
@@ -172,6 +227,9 @@ func (l Limits) Parse(data []byte) (*Message, error) {
 	}
 	lf := usesBareLF(data)
 	m := &Message{}
+	if lf {
+		m.deviations |= DeviationBareLF
+	}
 	rest := data
 	lineNo := 0
 	for {
@@ -191,6 +249,7 @@ func (l Limits) Parse(data []byte) (*Message, error) {
 		if err != nil {
 			return nil, atLine(err, lineNo)
 		}
+		m.deviations |= layoutDeviations(string(line), h)
 		m.Headers = append(m.Headers, h)
 	}
 
@@ -495,6 +554,8 @@ func ParseDateTime(v string) (time.Time, error) {
 		}
 		return r
 	}, v)
+	// Second 60 is accepted at any minute, not only where RFC 3339 §5.7 puts
+	// leap seconds: receiving is lenient and the value only orders messages.
 	leap := len(v) > 19 && v[10] == 'T' && v[16] == ':' && v[17:19] == "60"
 	if leap {
 		v = v[:17] + "59" + v[19:]

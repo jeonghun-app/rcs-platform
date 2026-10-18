@@ -8,9 +8,10 @@ import (
 )
 
 // FuzzParse checks that Parse never panics, that every rejection carries a
-// Reason, and that whatever Marshal accepts is a fixed point: it parses back
-// to the same message and marshals to the same bytes. Byte-identity with
-// canonical input is TestParseThenMarshalReproducesMessageHeadersExactly.
+// Reason, that Marshal refuses a parsed message only for its values, and that
+// whatever Marshal accepts is a fixed point: it parses back to the same
+// message, with no deviations, and marshals to the same bytes. Byte-identity
+// with canonical input is TestParseThenMarshalReproducesMessageHeadersExactly.
 func FuzzParse(f *testing.F) {
 	f.Add(chatMessage)
 	f.Add(crlf("From: \"A \\\"B\\\"\" <" + alice + ">\nSubject:;lang=fr;x=\"a b\" Bonjour\nNS: <urn:example:wily>\nrunner-trap: set\n\ncontent-type: multipart/mixed;\n boundary=b\n\n--b--"))
@@ -26,8 +27,11 @@ func FuzzParse(f *testing.F) {
 		}
 		out, err := m.Marshal()
 		if err != nil {
-			if ReasonOf(err) == "" {
-				t.Fatalf("Marshal failure without a reason: %v", err)
+			// Parse already vouched for everything but the values, so a
+			// parsed message can fail to marshal only because of a value
+			// sending refuses: an empty one or an invalid core header.
+			if ReasonOf(err) != ReasonValue {
+				t.Fatalf("Marshal of a parsed message failed for another reason: %v", err)
 			}
 			return
 		}
@@ -35,7 +39,12 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			t.Fatalf("Parse of a marshalled message failed: %v\n%q", err, out)
 		}
-		if !reflect.DeepEqual(again, m) {
+		if again.Deviations() != 0 {
+			t.Fatalf("Marshal output deviates from the canonical layout: %v\n%q", again.Deviations(), out)
+		}
+		tolerated := *m
+		tolerated.deviations = 0
+		if !reflect.DeepEqual(again, &tolerated) {
 			t.Fatalf("round trip changed the message:\n%#v\n%#v", m, again)
 		}
 		if twice, err := again.Marshal(); err != nil || !bytes.Equal(twice, out) {
