@@ -98,7 +98,8 @@ func (h *Header) PChargingVector() (ChargingVector, error) {
 }
 
 // Expires returns Expires in seconds (RFC 3261 §20.19). An overlarge value is
-// malformed rather than clamped (RFC 4475 §3.1.2.4).
+// reported as malformed, not clamped: whether to clamp it or use a default is the
+// registrar's decision (RFC 3261 §10.2.1, RFC 4475 §3.1.2.4).
 func (h *Header) Expires() (uint32, error) {
 	return singleOf(h, "Expires", func(s string) (uint32, error) {
 		n, ok := parseDelta(s)

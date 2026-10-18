@@ -129,40 +129,57 @@ type Contact struct {
 	Address
 }
 
-// Expires returns the expires parameter in seconds and whether it is present.
-func (c Contact) Expires() (uint32, bool) {
+// The contact parameters below are checked when read rather than when the Contact
+// field is parsed. A registrar treats a malformed expires as 3600 (RFC 3261
+// §10.2.1; RFC 4475 §3.1.2.4), which it could not do if one bad parameter failed
+// the whole Contact list.
+
+// Expires returns the expires parameter in seconds. present is false when there
+// is none; err wraps ErrMalformed when it is not delta-seconds within 2^32-1.
+func (c Contact) Expires() (seconds uint32, present bool, err error) {
 	v, ok := c.Params.Get("expires")
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
-	n, _ := parseDelta(v) // validated by parseContact
-	return n, true
+	n, valid := parseDelta(v)
+	if !valid {
+		return 0, true, headerError("Contact", "invalid expires parameter")
+	}
+	return n, true, nil
 }
 
-// Q returns the q parameter in thousandths (q=0.5 is 500) and whether it is
-// present. Thousandths are exact, which a float is not, and qvalue has at most
-// three decimals (RFC 3261 §20.10).
-func (c Contact) Q() (int, bool) {
+// Q returns the q parameter in thousandths (q=0.5 is 500). Thousandths are exact,
+// which a float is not, and a qvalue has at most three decimals (RFC 3261 §25.1).
+// present is false when there is none; err wraps ErrMalformed when it is not a
+// qvalue.
+func (c Contact) Q() (thousandths int, present bool, err error) {
 	v, ok := c.Params.Get("q")
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
-	q, _ := parseQValue(v)
-	return q, true
+	q, valid := parseQValue(v)
+	if !valid {
+		return 0, true, headerError("Contact", "invalid q parameter")
+	}
+	return q, true, nil
 }
 
 // Instance returns the +sip.instance parameter (RFC 5626 §4.1) without its
 // quotes, for example "<urn:uuid:...>", and whether it is present.
 func (c Contact) Instance() (string, bool) { return c.Params.Get("+sip.instance") }
 
-// RegID returns the reg-id parameter (RFC 5626 §4.2) and whether it is present.
-func (c Contact) RegID() (uint32, bool) {
+// RegID returns the reg-id parameter (RFC 5626 §4.2). present is false when there
+// is none; err wraps ErrMalformed when it is outside 1 to 2^31-1 (RFC 5626 §10).
+func (c Contact) RegID() (id uint32, present bool, err error) {
 	v, ok := c.Params.Get("reg-id")
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
-	n, _ := parseDelta(v)
-	return n, true
+	n, valid := parseDelta(v)
+	if !valid || n == 0 || n >= 1<<31 {
+		return 0, true, headerError("Contact", "invalid reg-id parameter")
+	}
+	return n, true, nil
 }
 
 // String writes the contact; see Address.String.
@@ -196,35 +213,9 @@ func parseContactElements(els []string) ([]Contact, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := checkContactParams(a.Params); err != nil {
-			return nil, err
-		}
 		out = append(out, Contact{Address: a})
 	}
 	return out, nil
-}
-
-// checkContactParams validates the parameters Contact gives a meaning to, so the
-// accessors on Contact cannot meet a malformed value. An overlarge expires is
-// refused rather than clamped (RFC 4475 §3.1.2.4).
-func checkContactParams(ps Params) error {
-	if v, ok := ps.Get("expires"); ok {
-		if _, ok := parseDelta(v); !ok {
-			return syntaxError("invalid expires parameter")
-		}
-	}
-	if v, ok := ps.Get("q"); ok {
-		if _, ok := parseQValue(v); !ok {
-			return syntaxError("invalid q parameter")
-		}
-	}
-	if v, ok := ps.Get("reg-id"); ok {
-		// reg-id is 1 to 2^31-1 (the RFC 5626 grammar).
-		if n, ok := parseDelta(v); !ok || n == 0 || n >= 1<<31 {
-			return syntaxError("invalid reg-id parameter")
-		}
-	}
-	return nil
 }
 
 // parseQValue parses a qvalue (RFC 3261 §25.1) into thousandths.

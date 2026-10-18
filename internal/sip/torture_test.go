@@ -99,7 +99,7 @@ body`)
 	if err != nil || len(cs) != 1 || cs[0].DisplayName != `Quote "" inside` {
 		t.Fatalf("Contact = %#v, %v", cs, err)
 	}
-	if q, _ := cs[0].Q(); q != 250 {
+	if q, _, _ := cs[0].Q(); q != 250 {
 		t.Errorf("q = %d", q)
 	}
 	if v, _ := cs[0].Params.Get("p1"); v != "v1" || !cs[0].Params.Has("p2") {
@@ -499,10 +499,16 @@ func TestTortureRFC4475Section3_1_2InvalidMessagesAreRefused(t *testing.T) {
 				_, err := h.Expires()
 				return err
 			})}},
+		// The bad expires fails its own accessor only, so a registrar can treat it
+		// as 3600 (RFC 3261 §10.2.1).
 		{section: "3.1.2.4 overlarge Contact expires",
 			msg: breakBase(t, `Contact: "Joe" <sip:joe@example.org>`, `Contact: "Joe" <sip:joe@example.org>;expires=99999999999999999999`),
 			checks: []check{accessorFails(func(h *Header) error {
-				_, err := h.Contact()
+				cs, err := h.Contact()
+				if err != nil {
+					return err
+				}
+				_, _, err = cs[0].Expires()
 				return err
 			})}},
 		{section: "3.1.2.5 response with an overlarge CSeq",

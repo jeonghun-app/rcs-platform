@@ -115,17 +115,17 @@ func TestContactReadsIMSParameters(t *testing.T) {
 		t.Fatalf("got %d contacts", len(cs))
 	}
 	c := cs[0]
-	if e, ok := c.Expires(); !ok || e != 600 {
-		t.Errorf("Expires() = %d, %v", e, ok)
+	if e, ok, err := c.Expires(); !ok || e != 600 || err != nil {
+		t.Errorf("Expires() = %d, %v, %v", e, ok, err)
 	}
-	if q, ok := c.Q(); !ok || q != 500 {
-		t.Errorf("Q() = %d, %v", q, ok)
+	if q, ok, err := c.Q(); !ok || q != 500 || err != nil {
+		t.Errorf("Q() = %d, %v, %v", q, ok, err)
 	}
 	if inst, ok := c.Instance(); !ok || inst != "<urn:uuid:00000000-0000-1000-8000-000000000001>" {
 		t.Errorf("Instance() = %q, %v", inst, ok)
 	}
-	if id, ok := c.RegID(); !ok || id != 1 {
-		t.Errorf("RegID() = %d, %v", id, ok)
+	if id, ok, err := c.RegID(); !ok || id != 1 || err != nil {
+		t.Errorf("RegID() = %d, %v, %v", id, ok, err)
 	}
 	if v, ok := c.Params.Get("+g.3gpp.icsi-ref"); !ok || v != "urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session" {
 		t.Errorf("icsi-ref = %q, %v", v, ok)
@@ -133,14 +133,14 @@ func TestContactReadsIMSParameters(t *testing.T) {
 	if !c.Params.Has("+g.oma.sip-im") {
 		t.Error("feature flag missing")
 	}
-	if q, ok := cs[1].Q(); !ok || q != 1000 {
-		t.Errorf("second Q() = %d, %v", q, ok)
+	if q, ok, err := cs[1].Q(); !ok || q != 1000 || err != nil {
+		t.Errorf("second Q() = %d, %v, %v", q, ok, err)
 	}
-	if _, ok := cs[1].Expires(); ok {
-		t.Error("second contact has expires")
+	if _, ok, err := cs[1].Expires(); ok || err != nil {
+		t.Errorf("second contact has expires: %v", err)
 	}
-	if _, ok := cs[1].RegID(); ok {
-		t.Error("second contact has reg-id")
+	if _, ok, err := cs[1].RegID(); ok || err != nil {
+		t.Errorf("second contact has reg-id: %v", err)
 	}
 	if _, ok := cs[1].Instance(); ok {
 		t.Error("second contact has an instance")
@@ -170,21 +170,39 @@ func TestContactStarStandsAlone(t *testing.T) {
 	}
 }
 
-func TestContactParametersAreValidated(t *testing.T) {
+func TestMalformedContactParametersFailOnlyTheirAccessor(t *testing.T) {
+	tests := []struct {
+		param string
+		get   func(c Contact) (bool, error)
+	}{
+		{"expires=4294967296", func(c Contact) (bool, error) { _, ok, err := c.Expires(); return ok, err }},
+		{"expires=-1", func(c Contact) (bool, error) { _, ok, err := c.Expires(); return ok, err }},
+		{"q=1.5", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{"q=1.001", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{"q=0.1234", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{"q=2", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{"q=.5", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{"q=0.x", func(c Contact) (bool, error) { _, ok, err := c.Q(); return ok, err }},
+		{"reg-id=0", func(c Contact) (bool, error) { _, ok, err := c.RegID(); return ok, err }},
+		{"reg-id=2147483648", func(c Contact) (bool, error) { _, ok, err := c.RegID(); return ok, err }},
+		{"reg-id=x", func(c Contact) (bool, error) { _, ok, err := c.RegID(); return ok, err }},
+	}
+	for _, tt := range tests {
+		// The other contact and the rest of this one stay readable, so a registrar
+		// can apply its default (RFC 3261 §10.2.1).
+		cs, err := ParseContacts("<sip:a@example.com>;" + tt.param + ", <sip:b@example.com>")
+		if err != nil || len(cs) != 2 || cs[0].URI.User != "a" {
+			t.Fatalf("%s: ParseContacts = %#v, %v", tt.param, cs, err)
+		}
+		present, err := tt.get(cs[0])
+		var pe *ParseError
+		if !present || !errors.As(err, &pe) || pe.Header != "Contact" || !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: accessor = %v, %v, want a malformed Contact", tt.param, present, err)
+		}
+	}
 	for _, v := range []string{
-		"<sip:a@example.com>;expires=4294967296",
-		"<sip:a@example.com>;expires=-1",
-		"<sip:a@example.com>;q=1.5",
-		"<sip:a@example.com>;q=1.001",
-		"<sip:a@example.com>;q=0.1234",
-		"<sip:a@example.com>;q=2",
-		"<sip:a@example.com>;q=.5",
-		"<sip:a@example.com>;q=0,5",
-		"<sip:a@example.com>;q=0.x",
-		"<sip:a@example.com>;reg-id=0",
-		"<sip:a@example.com>;reg-id=2147483648",
-		"<sip:a@example.com>;reg-id=x",
 		"<sip:a@example.com>;;",
+		"<sip:a@example.com>;q=0,5",
 		"Bell, Alexander <sip:a@example.com>",
 	} {
 		var h Header
