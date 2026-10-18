@@ -10,11 +10,40 @@ import (
 // FuzzRedact checks the guarantee services rely on: whatever the input, keyed or
 // not, the output has no run of minRun or more digits and no number written in
 // groups that Redact promises to mask, and valid UTF-8 stays valid. The grouped
-// rules are restated as regular expressions here, independently of numberAt.
+// rules are restated here independently of numberAt: a national number is any
+// group of two or more digits starting with 0, not preceded by a letter or
+// digit, followed by eight digits in total. The one documented exception is
+// checked separately in nationalNumberIn, so a mistake in it cannot hide behind
+// the same mistake in the pattern.
 var (
 	groupedInternational = regexp.MustCompile(`\+[0-9](?:[ ().-]{0,2}[0-9]){7,}`)
-	groupedNational      = regexp.MustCompile(`(?:^|[^0-9A-Za-z.-])0(?:[ ().-]{0,2}[0-9]){7,}`)
+	groupedNational      = regexp.MustCompile(`^0[0-9](?:[ ().-]{0,2}[0-9]){6,}`)
 )
+
+// nationalNumberIn returns a national number left in s, if any. A match counts
+// unless what comes before it makes it part of a word: a letter or digit, or a
+// '.' or '-' that itself follows a digit (an address, version or date).
+func nationalNumberIn(s string) string {
+	for p := range len(s) {
+		if s[p] == '0' && !partOfWord(s, p) {
+			if m := groupedNational.FindString(s[p:]); m != "" {
+				return m
+			}
+		}
+	}
+	return ""
+}
+
+func partOfWord(s string, p int) bool {
+	if p == 0 {
+		return false
+	}
+	c := s[p-1]
+	if '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' {
+		return true
+	}
+	return (c == '.' || c == '-') && p >= 2 && '0' <= s[p-2] && s[p-2] <= '9'
+}
 
 func FuzzRedact(f *testing.F) {
 	for _, s := range []string{
@@ -37,6 +66,8 @@ func FuzzRedact(f *testing.F) {
 		"2026-10-19 10.0.255.255",
 		"+1 555   0100001",
 		"0.0.0.0 0 1 2 3 4 5 6 7",
+		"Tel.010-0000-0001 H.P.010 0000 0001",
+		"bytes=0-1048575 [0.25 0.5 0.75]",
 	} {
 		f.Add(s, false)
 		f.Add(s, true)
@@ -59,7 +90,7 @@ func FuzzRedact(f *testing.F) {
 			if m := groupedInternational.FindString(a); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
-			if m := groupedNational.FindString(a); m != "" {
+			if m := nationalNumberIn(a); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
 		}

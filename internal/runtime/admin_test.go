@@ -253,6 +253,28 @@ func TestAddingACheckInvalidatesTheCachedResult(t *testing.T) {
 	}
 }
 
+func TestACheckAddedDuringAnEvaluationIsNotHiddenByItsResult(t *testing.T) {
+	a, _, _ := testAdmin(discardLogger())
+	release, entered := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	a.AddReadinessCheck("slow", func(context.Context) error {
+		once.Do(func() { close(entered) })
+		<-release
+		return nil
+	})
+	first := make(chan int)
+	go func() { c, _ := get(t, a, "GET", "/readyz"); first <- c }()
+	<-entered
+	a.AddReadinessCheck("store", func(context.Context) error { return errors.New("down") })
+	close(release)
+	if code := <-first; code != 200 {
+		t.Fatalf("the waiting request got %d; it asked before the new check existed", code)
+	}
+	if code, body := get(t, a, "GET", "/readyz"); code != 503 || !slices.Equal(toStrings(body["failing"]), []string{"store"}) {
+		t.Fatalf("new failing check hidden by the in-flight evaluation: %d %v", code, body)
+	}
+}
+
 func TestReadinessIsLoggedOnlyWhenACheckChangesState(t *testing.T) {
 	var logs lockedBuffer
 	a, clock, _ := testAdmin(NewLogger(&logs, "hss", "dev", slog.LevelInfo))

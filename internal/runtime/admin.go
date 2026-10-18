@@ -47,6 +47,10 @@ type Admin struct {
 	failing map[string]bool
 	cached  *evaluation
 	running *evaluation
+	// generation counts changes to checks. An evaluation that started before
+	// the latest change answers the requests already waiting for it but is not
+	// cached or joined, since it did not run every check.
+	generation uint64
 
 	ready    atomic.Bool
 	stopping atomic.Bool
@@ -89,7 +93,8 @@ func (a *Admin) AddReadinessCheck(name string, check func(context.Context) error
 	}
 	a.checks = append(a.checks, readinessCheck{name: name, check: check})
 	// A cached "ready" must not hide a check that has never run.
-	a.cached = nil
+	a.generation++
+	a.cached, a.running = nil, nil
 }
 
 // Handle mounts h on the admin server, with http.ServeMux pattern rules. The
@@ -154,7 +159,7 @@ func (a *Admin) evaluate(ctx context.Context) (failing []string, ok bool) {
 		a.running = e
 		// The evaluation is shared, so it must not end with the request that
 		// happened to start it.
-		go a.runChecks(e, slices.Clone(a.checks))
+		go a.runChecks(e, slices.Clone(a.checks), a.generation)
 	}
 	a.mu.Unlock()
 
@@ -169,7 +174,7 @@ func (a *Admin) evaluate(ctx context.Context) (failing []string, ok bool) {
 // runChecks runs every check concurrently, so one slow dependency cannot use up
 // the time the others need, and records the names of those that failed,
 // panicked or did not answer within readinessTimeout, in registration order.
-func (a *Admin) runChecks(e *evaluation, checks []readinessCheck) {
+func (a *Admin) runChecks(e *evaluation, checks []readinessCheck, generation uint64) {
 	ctx, cancel := withTimer(context.Background(), a.after, readinessTimeout)
 	defer cancel()
 
@@ -205,7 +210,12 @@ func (a *Admin) runChecks(e *evaluation, checks []readinessCheck) {
 		a.failing[c.name] = failed
 	}
 	e.finished = a.now()
-	a.cached, a.running = e, nil
+	if a.generation == generation {
+		a.cached = e
+	}
+	if a.running == e {
+		a.running = nil
+	}
 	a.mu.Unlock()
 
 	// Logged before the answer is released, so a caller that has its answer

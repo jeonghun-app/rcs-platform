@@ -12,7 +12,7 @@
 // §2.2) and IMEIs (TS 23.003 §6.2) are all digit runs and a false positive costs
 // only a less useful log line. Numbers written in groups ("+1 555 010-0001",
 // "010-0000-0001") are recognised when they start with "+" or with a word-initial
-// 0; other grouped numbers are not (see numberAt).
+// trunk prefix such as 010; other grouped numbers are not (see numberAt).
 //
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
@@ -124,8 +124,9 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //   - runs of eight or more digits, which covers IMSIs (14–15 digits), IMEIs and
 //     IMEISVs (15–16 digits) and E.164 numbers; a leading "+" is kept;
 //   - numbers written in groups, with eight or more digits in total, that start
-//     with "+" (international) or with a 0 that begins a word (national trunk
-//     prefix: 010-0000-0001, (07700) 900001); see [numberAt];
+//     with "+" (international) or with a group of two or more digits starting
+//     with 0 that begins a word (national trunk prefix: 010-0000-0001,
+//     (07700) 900001, Tel.010-0000-0001); see [numberAt];
 //   - the subscriber of a tel URI (RFC 3966 §3), visual separators included;
 //   - the userinfo of a sip or sips URI (RFC 3261 §19.1.1), password included;
 //   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups.
@@ -217,13 +218,16 @@ func startsNumber(s string, i int) bool {
 // 010-0001". It returns the end of the number and where its identifying part
 // starts, or from = -1 if it is not an identifier. It is one when it has a run
 // of minRun digits, when it starts with "+" and has minRun digits, or from the
-// first group that starts with 0 at the start of a word and is followed by
-// minRun digits in total (a national number such as 010-0000-0001).
+// first group of two or more digits that starts with 0 at the start of a word
+// and is followed by minRun digits in total (a national number such as
+// 010-0000-0001).
 //
-// The 0 rule keeps dates (2026-10-19), IPv4 addresses and versions, which do
-// not start a word with 0, readable. National numbers without a trunk prefix
-// written in groups, such as North American (555) 010-0001, are not
-// recognised. The number ends where three separators or a separator followed by
+// The 0 rule keeps dates (2026-10-19), IPv4 addresses, versions, ranges
+// (0-1048575) and lists ([0 1 2 3]) readable. It still masks a few non-numbers
+// that look like national numbers, such as the date 09.10.2026 or the ports
+// "05060 05061". National numbers without a trunk prefix written in groups,
+// such as North American (555) 010-0001, are not recognised, nor are numbers
+// grouped with tabs, en dashes or " - ". The number ends where three separators or a separator followed by
 // something other than a digit appear, so each byte is scanned once.
 func numberAt(s string, i int) (from, end int) {
 	p := i
@@ -243,6 +247,12 @@ func numberAt(s string, i int) (from, end int) {
 			p++
 			end = p
 			continue
+		}
+		// A trunk prefix has at least two digits (010, 02, 07700); a lone 0
+		// group is a list or range ("bytes=0-1048575", "[0 1 2 3]"), so a
+		// later group may still start the number.
+		if national == p-1 {
+			national = -1
 		}
 		q := p
 		for q < len(s) && q-p < 3 && isNumberSeparator(s[q]) {
@@ -280,15 +290,22 @@ func continueWritten(s string, end int) int {
 	return end
 }
 
-// startsWord reports whether the digit at s[p] begins a word: it is not
-// preceded by a letter, digit, '.' or '-', which would make it part of an
-// address, version or date.
+// startsWord reports whether the digit at s[p] begins a word. It does not when
+// a letter or digit comes right before it ("v0", "10"), or a '.' or '-' that
+// follows a digit, as inside an address, version or date ("10.0.1.2",
+// "1-0"). A '.' or '-' after a letter does not join the number to the word:
+// "Tel.010-0000-0001" and "phone-010-0000-0001" are labels before a number.
 func startsWord(s string, p int) bool {
 	if p == 0 {
 		return true
 	}
-	c := s[p-1]
-	return !isAlnum(c) && c != '.' && c != '-'
+	switch c := s[p-1]; {
+	case isAlnum(c):
+		return false
+	case c == '.' || c == '-':
+		return p < 2 || !isDigit(s[p-2])
+	}
+	return true
 }
 
 func isNumberSeparator(c byte) bool {
