@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"container/list"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -13,9 +14,9 @@ import (
 )
 
 // FlowID names a flow: one TCP or TLS connection, or one UDP source address on one
-// listener, in the sense of RFC 5626. It is opaque, unguessable and made only of URL-safe
-// base64 characters, which are valid in the user part and parameters of a SIP URI,
-// so a service can use it as the flow token of RFC 5626 §5.2 as it is.
+// listener, in the sense of RFC 5626. It is opaque, unguessable and made only of
+// URL-safe base64 characters, which are valid in the user part and parameters of a
+// SIP URI, so a service can use it as the flow token of RFC 5626 §5.2 as it is.
 //
 // A FlowID is a capability to send to a subscriber's connection: it must not be
 // logged.
@@ -30,7 +31,7 @@ const flowTokenBytes = 16
 // computed with the same key.
 const flowKeyLabel = "rcs-platform sip flow v1"
 
-// FlowInfo describes a live flow.
+// FlowInfo describes a flow.
 type FlowInfo struct {
 	Network Network
 	// Addr is the peer: the client address from the PROXY header when the
@@ -54,10 +55,14 @@ type flow struct {
 
 	conn net.Conn // nil for UDP
 	// wmu serializes writes so two messages never interleave on a stream.
-	wmu sync.Mutex
-	// lastSeen is when a UDP flow last received a datagram, in Unix nanoseconds.
-	lastSeen atomic.Int64
-	closed   atomic.Bool
+	wmu    sync.Mutex
+	closed atomic.Bool
+
+	// UDP only, guarded by flowTable.mu: when the flow last received a
+	// datagram, and its places in the table's recency lists.
+	lastSeen time.Time
+	inAll    *list.Element
+	inIP     *list.Element
 }
 
 func (f *flow) info() FlowInfo {
@@ -81,31 +86,87 @@ type reuseKey struct {
 	listener   string // UDP only: a UDP flow belongs to one socket
 }
 
-// flowTable maps FlowIDs to flows and peers to reusable flows. Its methods are
-// safe for concurrent use.
-type flowTable struct {
-	key [sha256.Size]byte
-	now func() time.Time
-	// udpIdle is how long a UDP flow lives without a datagram.
-	udpIdle    time.Duration
-	maxUDP     int
-	counter    atomic.Uint64
-	mu         sync.Mutex
-	byID       map[FlowID]*flow
-	byPeer     map[reuseKey]*flow
-	udpFlows   int
-	closed     bool
-	streamOpen int
+func (f *flow) reuseKey() reuseKey {
+	k := reuseKey{network: f.network, remote: f.remote, serverName: f.serverName}
+	if f.network == UDP {
+		k.listener = f.lis.name
+	}
+	return k
 }
 
-func newFlowTable(key [sha256.Size]byte, now func() time.Time, udpIdle time.Duration, maxUDP int) *flowTable {
-	return &flowTable{
-		key:     key,
-		now:     now,
-		udpIdle: udpIdle,
-		maxUDP:  maxUDP,
-		byID:    make(map[FlowID]*flow),
-		byPeer:  make(map[reuseKey]*flow),
+// reusable reports whether requests "to this address" may use the flow. An
+// accepted TLS connection is not: its peer was never verified as a server, so a
+// request meant for a server at that address must open its own connection
+// (RFC 5923 §9.2 refuses reuse of a connection whose client presented no
+// certificate for the same reason).
+func (f *flow) reusable() bool {
+	return !(f.network == TLS && f.lis != nil)
+}
+
+// flowTable maps FlowIDs to flows and peers to reusable flows. Its methods are
+// safe for concurrent use. No method holds the lock for longer than a few map
+// and list operations: there is no scan of the table.
+//
+// UDP flows are kept in two recency lists, one for the table and one per source
+// IP, most recent first. A datagram moves its flow to the front, an expired flow
+// is dropped from the back, and when a limit is reached the oldest flow of that
+// IP, or of the table, makes room. So a full table never refuses a new client,
+// and one host with many source ports only ever displaces its own flows.
+type flowTable struct {
+	key         [sha256.Size]byte
+	now         func() time.Time
+	udpTimeout  time.Duration
+	maxUDP      int
+	maxUDPPerIP int
+	// onClosed is told about every flow that leaves the table, after the lock
+	// is released.
+	onClosed func(*flow)
+	counter  atomic.Uint64
+
+	mu       sync.Mutex
+	byID     map[FlowID]*flow
+	byPeer   map[reuseKey]*flow
+	udpAll   list.List
+	udpByIP  map[netip.Addr]*list.List
+	inbound  int
+	outbound int
+	evicted  uint64
+	closed   bool
+	// gone collects the flows removed under the lock, for onClosed.
+	gone []*flow
+}
+
+type tableConfig struct {
+	udpTimeout          time.Duration
+	maxUDP, maxUDPPerIP int
+	onClosed            func(*flow)
+}
+
+func newFlowTable(key [sha256.Size]byte, now func() time.Time, c tableConfig) *flowTable {
+	t := &flowTable{
+		key:         key,
+		now:         now,
+		udpTimeout:  c.udpTimeout,
+		maxUDP:      c.maxUDP,
+		maxUDPPerIP: c.maxUDPPerIP,
+		onClosed:    c.onClosed,
+		byID:        make(map[FlowID]*flow),
+		byPeer:      make(map[reuseKey]*flow),
+		udpByIP:     make(map[netip.Addr]*list.List),
+	}
+	if t.onClosed == nil {
+		t.onClosed = func(*flow) {}
+	}
+	return t
+}
+
+// unlock releases the lock and reports the flows removed while it was held.
+func (t *flowTable) unlock() {
+	gone := t.gone
+	t.gone = nil
+	t.mu.Unlock()
+	for _, f := range gone {
+		t.onClosed(f)
 	}
 }
 
@@ -146,27 +207,10 @@ func (t *flowTable) newFlow(network Network, lis *listener, remote netip.AddrPor
 	}
 }
 
-func (f *flow) reuseKey() reuseKey {
-	k := reuseKey{network: f.network, remote: f.remote, serverName: f.serverName}
-	if f.network == UDP {
-		k.listener = f.lis.name
-	}
-	return k
-}
-
-// reusable reports whether requests "to this address" may use the flow. An
-// accepted TLS connection is not: its peer was never verified as a server, so a
-// request meant for a server at that address must open its own connection
-// (RFC 5923 §9.2 refuses reuse of a connection whose client presented no
-// certificate for the same reason).
-func (f *flow) reusable() bool {
-	return !(f.network == TLS && f.lis != nil)
-}
-
 // addStream enters a connected stream flow. It fails when the table is closed.
 func (t *flowTable) addStream(f *flow) bool {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.unlock()
 	if t.closed {
 		return false
 	}
@@ -176,52 +220,84 @@ func (t *flowTable) addStream(f *flow) bool {
 			t.byPeer[f.reuseKey()] = f
 		}
 	}
-	t.streamOpen++
+	if f.lis != nil {
+		t.inbound++
+	} else {
+		t.outbound++
+	}
 	return true
 }
 
-// udp returns the flow of a UDP source on a listener, creating it if needed, and
-// marks it as just seen. It returns nil when the table is full or closed.
-func (t *flowTable) udp(lis *listener, remote netip.AddrPort) (f *flow, created bool) {
+// udpFlow returns the live flow of a UDP source on a listener and marks it as just
+// seen, or nil if there is none.
+func (t *flowTable) udpFlow(lis *listener, remote netip.AddrPort) *flow {
 	now := t.now()
-	k := reuseKey{network: UDP, remote: remote, listener: lis.name}
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.unlock()
+	f := t.byPeer[reuseKey{network: UDP, remote: remote, listener: lis.name}]
+	if f == nil {
+		return nil
+	}
+	if t.expired(f, now) {
+		t.removeLocked(f)
+		return nil
+	}
+	f.lastSeen = now
+	t.udpAll.MoveToFront(f.inAll)
+	t.udpByIP[remote.Addr()].MoveToFront(f.inIP)
+	return f
+}
+
+// addUDP enters a new UDP flow, displacing the oldest flow of its source IP or of
+// the table when either is at its limit. It returns false when the table is
+// closed. A flow for the same source that appeared meanwhile is returned instead.
+func (t *flowTable) addUDP(f *flow) (*flow, bool) {
+	now := t.now()
+	t.mu.Lock()
+	defer t.unlock()
 	if t.closed {
 		return nil, false
 	}
-	if f = t.byPeer[k]; f != nil && !t.expired(f, now) {
-		f.lastSeen.Store(now.UnixNano())
-		return f, false
+	if g := t.byPeer[f.reuseKey()]; g != nil && !t.expired(g, now) {
+		return g, true
 	}
-	if f != nil {
-		t.removeLocked(f)
+	for b := t.udpAll.Back(); b != nil && t.expired(b.Value.(*flow), now); b = t.udpAll.Back() {
+		t.removeLocked(b.Value.(*flow))
 	}
-	if t.udpFlows >= t.maxUDP {
-		// Expired flows are only swept when the table is full, which keeps the
-		// common path free of a timer per flow.
-		t.sweepLocked(now)
-		if t.udpFlows >= t.maxUDP {
-			return nil, false
-		}
+	if g := t.byPeer[f.reuseKey()]; g != nil {
+		t.removeLocked(g)
 	}
-	f = t.newFlow(UDP, lis, remote)
-	f.lastSeen.Store(now.UnixNano())
+	ip := f.remote.Addr()
+	switch perIP := t.udpByIP[ip]; {
+	case perIP != nil && perIP.Len() >= t.maxUDPPerIP:
+		t.removeLocked(perIP.Back().Value.(*flow))
+		t.evicted++
+	case t.udpAll.Len() >= t.maxUDP:
+		t.removeLocked(t.udpAll.Back().Value.(*flow))
+		t.evicted++
+	}
+	f.lastSeen = now
 	t.byID[f.id] = f
-	t.byPeer[k] = f
-	t.udpFlows++
+	t.byPeer[f.reuseKey()] = f
+	f.inAll = t.udpAll.PushFront(f)
+	perIP := t.udpByIP[ip]
+	if perIP == nil {
+		perIP = list.New()
+		t.udpByIP[ip] = perIP
+	}
+	f.inIP = perIP.PushFront(f)
 	return f, true
 }
 
 func (t *flowTable) expired(f *flow, now time.Time) bool {
-	return f.network == UDP && now.Sub(time.Unix(0, f.lastSeen.Load())) > t.udpIdle
+	return f.network == UDP && now.Sub(f.lastSeen) > t.udpTimeout
 }
 
-// lookup resolves a FlowID. Unknown, forged and stale IDs, closed connections and
-// expired UDP flows all give nil.
+// lookup resolves a FlowID. Unknown, forged and stale IDs, closing connections
+// and expired UDP flows all give nil.
 func (t *flowTable) lookup(id FlowID) *flow {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.unlock()
 	f := t.byID[id]
 	if f == nil {
 		return nil
@@ -233,10 +309,10 @@ func (t *flowTable) lookup(id FlowID) *flow {
 	return f
 }
 
-// peer returns an open flow requests to (network, remote, serverName) may reuse.
+// peer returns an open flow requests to k may reuse.
 func (t *flowTable) peer(k reuseKey) *flow {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.unlock()
 	f := t.byPeer[k]
 	if f == nil || f.closed.Load() {
 		return nil
@@ -247,7 +323,7 @@ func (t *flowTable) peer(k reuseKey) *flow {
 // remove takes a flow out of the table; it is safe to call more than once.
 func (t *flowTable) remove(f *flow) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.unlock()
 	t.removeLocked(f)
 }
 
@@ -259,37 +335,48 @@ func (t *flowTable) removeLocked(f *flow) {
 	if k := f.reuseKey(); t.byPeer[k] == f {
 		delete(t.byPeer, k)
 	}
-	if f.network == UDP {
-		t.udpFlows--
-	} else {
-		t.streamOpen--
+	switch {
+	case f.network == UDP:
+		t.udpAll.Remove(f.inAll)
+		ip := f.remote.Addr()
+		if perIP := t.udpByIP[ip]; perIP != nil {
+			perIP.Remove(f.inIP)
+			if perIP.Len() == 0 {
+				delete(t.udpByIP, ip)
+			}
+		}
+	case f.lis != nil:
+		t.inbound--
+	default:
+		t.outbound--
 	}
+	t.gone = append(t.gone, f)
 }
 
-func (t *flowTable) sweepLocked(now time.Time) {
+// close marks the table closed, removes its UDP flows and returns the stream
+// flows still open, which the caller closes.
+func (t *flowTable) close() []*flow {
+	t.mu.Lock()
+	defer t.unlock()
+	t.closed = true
+	var streams []*flow
 	for _, f := range t.byID {
-		if t.expired(f, now) {
+		if f.conn != nil {
+			streams = append(streams, f)
+		} else {
 			t.removeLocked(f)
 		}
 	}
+	return streams
 }
 
-// close marks the table closed and returns the stream flows still open.
-func (t *flowTable) close() []*flow {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.closed = true
-	var out []*flow
-	for _, f := range t.byID {
-		if f.conn != nil {
-			out = append(out, f)
-		}
-	}
-	return out
+type tableStats struct {
+	inbound, outbound, udp int
+	evicted                uint64
 }
 
-func (t *flowTable) openStreams() int {
+func (t *flowTable) stats() tableStats {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.streamOpen
+	defer t.unlock()
+	return tableStats{inbound: t.inbound, outbound: t.outbound, udp: t.udpAll.Len(), evicted: t.evicted}
 }

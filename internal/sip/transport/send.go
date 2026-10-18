@@ -38,7 +38,11 @@ type Destination struct {
 // all if the TCP connection cannot be opened. The transaction layer uses the
 // returned Network to decide whether to retransmit.
 //
-// The caller must not use req concurrently, since the Via may be rewritten.
+// SendRequest can block: for up to DialTimeout while a connection is opened, and
+// for up to WriteTimeout while a stream write waits for the peer. A handler that
+// forwards from one flow to another should therefore send off the reading
+// goroutine. The caller must not use req concurrently, since the Via may be
+// rewritten.
 func (t *Transport) SendRequest(req *sip.Request, dst Destination) (Network, error) {
 	if t.isClosed() {
 		return "", ErrClosed
@@ -141,9 +145,14 @@ func (t *Transport) sendDatagram(l *listener, to netip.AddrPort, b []byte) error
 //
 // Over TCP or TLS the response goes back on the request's connection. If that has
 // closed, a new connection is opened to the received address (or the sent-by
-// address) and the sent-by port. Over UDP it goes to the received address and the
-// rport port, or the sent-by port, from the socket the request arrived on, which
-// is what a client behind a NAT expects (RFC 3581 §4).
+// address) and the sent-by port, except for a request from a client-facing
+// listener, which fails with ErrNoFlow (see ListenerConfig.ClientFacing). Over UDP
+// it goes to the received address and the rport port, or the sent-by port, from
+// the socket the request arrived on, which is what a client behind a NAT expects
+// (RFC 3581 §4).
+//
+// Over a live connection SendResponse blocks for at most WriteTimeout; opening a
+// new one adds up to DialTimeout. A UDP send does not block.
 func (t *Transport) SendResponse(res *sip.Response, src Source) error {
 	if t.isClosed() {
 		return ErrClosed
@@ -158,6 +167,9 @@ func (t *Transport) SendResponse(res *sip.Response, src Source) error {
 	if src.Network.Reliable() {
 		if f := t.flows.lookup(src.Flow); f != nil {
 			return t.writeMessage(f, res)
+		}
+		if l := t.listenerNamed(src.Listener); l != nil && l.clientFacing {
+			return ErrNoFlow
 		}
 		n, addr, err := responseTarget(vias[0], false)
 		if err != nil {
