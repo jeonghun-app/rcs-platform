@@ -19,9 +19,12 @@ type ResponseHandler func(res *sip.Response, err error)
 // client non-INVITE (§17.1.2) transaction.
 type ClientTransaction struct {
 	machine
-	invite  bool
-	req     *sip.Request
-	dst     transport.Destination
+	invite bool
+	req    *sip.Request
+	dst    transport.Destination
+	// network is the transport the first send actually used, which the ACK
+	// for a non-2xx response must use too (§17.1.1.3).
+	network transport.Network
 	handler ResponseHandler
 	// ack is the ACK for a non-2xx final response, built once and resent for
 	// each retransmission of that response (§17.1.1.3).
@@ -37,7 +40,9 @@ type ClientTransaction struct {
 // 2xx straight through the transport (§13.2.2.4). If the first send fails,
 // Request returns the error and h is never called.
 //
-// The layer owns req from here on; the TU must not change it.
+// Request sends synchronously, so it can block for up to the transport's
+// DialTimeout plus WriteTimeout (see TU). The layer owns req from here on; the TU
+// must not change it.
 func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseHandler) (*ClientTransaction, error) {
 	if req.Method == "ACK" {
 		return nil, errors.New("transaction: an ACK is not sent in a client transaction")
@@ -74,6 +79,7 @@ func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseH
 		tx.terminate()
 		return nil, err
 	}
+	tx.network = network
 	tx.reliable = network.Reliable()
 	if tx.invite {
 		tx.state = Calling
@@ -97,6 +103,32 @@ func (tx *ClientTransaction) State() State {
 
 // Request returns the request the transaction sent.
 func (tx *ClientTransaction) Request() *sip.Request { return tx.req }
+
+// Terminate ends the transaction now, and its handler receives ErrTerminated
+// unless the transaction had already ended. RFC 3261 leaves a client INVITE
+// transaction in Proceeding until a final response arrives, so the TU ends it
+// itself: 64*T1 after its CANCEL went unanswered (§9.1), or when a proxy's Timer
+// C fires (§16.8).
+func (tx *ClientTransaction) Terminate() {
+	tx.mu.Lock()
+	live := tx.state != Terminated
+	tx.terminate()
+	tx.mu.Unlock()
+	if live {
+		tx.handler(nil, ErrTerminated)
+	}
+}
+
+// ackDestination is where the ACK for a non-2xx response goes: the same flow, or
+// the same address over the transport the INVITE actually used (§17.1.1.3), which
+// may be TCP for a large INVITE meant for UDP (§18.1.1).
+func (tx *ClientTransaction) ackDestination() transport.Destination {
+	dst := tx.dst
+	if dst.Flow == "" {
+		dst.Network = tx.network
+	}
+	return dst
+}
 
 func (tx *ClientTransaction) notify(res *sip.Response, err error) func() {
 	return func() { tx.handler(res, err) }
@@ -176,7 +208,7 @@ func (tx *ClientTransaction) receiveInvite(res *sip.Response) func() {
 			ack, err := buildACK(tx.req, res)
 			if err == nil {
 				tx.ack = ack
-				_, err = l.sender.SendRequest(ack, tx.dst)
+				_, err = l.sender.SendRequest(ack, tx.ackDestination())
 			}
 			if err != nil {
 				// The TU still learns the final response; the server will
@@ -195,7 +227,7 @@ func (tx *ClientTransaction) receiveInvite(res *sip.Response) func() {
 		switch {
 		case code >= 300 && tx.ack != nil:
 			// A retransmitted final response means the ACK was lost (§17.1.1.2).
-			if _, err := l.sender.SendRequest(tx.ack, tx.dst); err != nil {
+			if _, err := l.sender.SendRequest(tx.ack, tx.ackDestination()); err != nil {
 				tx.terminate()
 			}
 		case code >= 200 && code < 300:

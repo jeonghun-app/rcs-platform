@@ -93,6 +93,7 @@ type fakeSender struct {
 type sent struct {
 	at  time.Duration
 	msg sip.Message
+	dst transport.Destination
 }
 
 // label names a message the way the tables write it: the method of a request,
@@ -113,7 +114,7 @@ func (s *fakeSender) SendRequest(req *sip.Request, dst transport.Destination) (t
 	if s.fail != nil {
 		return "", s.fail
 	}
-	s.sent = append(s.sent, sent{s.clock.elapsed(), req})
+	s.sent = append(s.sent, sent{s.clock.elapsed(), req, dst})
 	return s.network, nil
 }
 
@@ -123,7 +124,7 @@ func (s *fakeSender) SendResponse(res *sip.Response, src transport.Source) error
 	if s.fail != nil {
 		return s.fail
 	}
-	s.sent = append(s.sent, sent{s.clock.elapsed(), res})
+	s.sent = append(s.sent, sent{s.clock.elapsed(), res, transport.Destination{}})
 	return nil
 }
 
@@ -163,6 +164,12 @@ func (s *fakeSender) last() sip.Message {
 		return nil
 	}
 	return s.sent[len(s.sent)-1].msg
+}
+
+func (s *fakeSender) lastDestination() transport.Destination {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sent[len(s.sent)-1].dst
 }
 
 // tuRecorder is a TU that records every call as a label.

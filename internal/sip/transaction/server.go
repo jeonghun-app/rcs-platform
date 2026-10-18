@@ -19,6 +19,24 @@ type ServerTransaction struct {
 	last *sip.Response
 }
 
+// sameFlow reports whether a retransmission arrived the way the request did, so
+// that answering it is a write on a live connection or a datagram from the same
+// socket, neither of which can stall the reading goroutine. A retransmission
+// that arrives another way, which a client does not do (RFC 3261 §18.1.1), is
+// absorbed without an answer: answering would mean writing to the original flow,
+// which may have to be redialled, from the goroutine that serves the other one.
+// A UDP flow is compared by socket and address, because an expired flow comes
+// back with a new FlowID.
+func sameFlow(a, b transport.Source) bool {
+	if a.Network != b.Network {
+		return false
+	}
+	if a.Network == transport.UDP {
+		return a.Listener == b.Listener && a.Addr == b.Addr
+	}
+	return a.Flow == b.Flow
+}
+
 func newServerTransaction(l *Layer, key string, req *sip.Request, src transport.Source) *ServerTransaction {
 	tx := &ServerTransaction{invite: req.Method == "INVITE", req: req, src: src}
 	tx.machine = machine{l: l, key: key, server: true, onTimer: tx.onTimer, reliable: src.Network.Reliable()}
@@ -109,6 +127,9 @@ func (tx *ServerTransaction) failed(err error) func() {
 // a final response after the first non-2xx one is discarded (§17.2.1, §17.2.2).
 //
 // If the transport fails, the transaction terminates and the error is returned.
+// Respond sends synchronously and can block for up to the transport's
+// WriteTimeout, plus DialTimeout if the request's connection must be reopened
+// (see TU).
 func (tx *ServerTransaction) Respond(res *sip.Response) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
@@ -211,7 +232,7 @@ func (tx *ServerTransaction) onTimer(id timerID) func() {
 // receive runs the state machine for a request matched to this transaction: a
 // retransmission, or the ACK of an INVITE. It reports false for an ACK the TU
 // must see, which the layer passes on as a stray.
-func (tx *ServerTransaction) receive(req *sip.Request) bool {
+func (tx *ServerTransaction) receive(req *sip.Request, from transport.Source) bool {
 	tx.mu.Lock()
 	var notify func()
 	ok := true
@@ -225,7 +246,7 @@ func (tx *ServerTransaction) receive(req *sip.Request) bool {
 			// An ACK for the 2xx is the TU's business (RFC 6026 §7.1).
 			ok = false
 		}
-	} else if tx.last != nil {
+	} else if tx.last != nil && sameFlow(from, tx.src) {
 		switch tx.state {
 		case Proceeding, Completed:
 			// A retransmitted request is answered with the last response sent

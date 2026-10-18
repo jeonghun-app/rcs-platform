@@ -39,6 +39,9 @@ var (
 	ErrDuplicate = errors.New("transaction: duplicate branch")
 	// ErrClosed means the layer has been closed.
 	ErrClosed = errors.New("transaction: layer closed")
+	// ErrTerminated is passed to a client transaction's handler when the TU
+	// ends the transaction with Terminate.
+	ErrTerminated = errors.New("transaction: terminated by the TU")
 )
 
 // Sender sends messages; *transport.Transport implements it.
@@ -52,6 +55,12 @@ type Sender interface {
 
 // TU is the transaction user. Its methods are called without any lock held, from
 // the goroutine that delivered the message or from a timer; they must not block.
+//
+// While a method runs, nothing else is read from the connection the message came
+// on, or from the UDP socket every UDP client shares. Layer.Request and
+// ServerTransaction.Respond send synchronously and can block for up to the
+// transport's DialTimeout plus WriteTimeout, so a proxy that forwards to another
+// flow does so off this goroutine.
 type TU interface {
 	// Request receives a request that created a server transaction. The TU
 	// answers with tx.Respond.
@@ -224,7 +233,7 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 	if tx != nil && wantTag != "" && tx.responseToTag() != wantTag {
 		tx = nil
 	}
-	if tx == nil || !tx.receive(req) {
+	if tx == nil || !tx.receive(req, in.Source) {
 		l.tu.Stray(in)
 	}
 }

@@ -2,6 +2,7 @@ package transaction
 
 import (
 	"errors"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,8 @@ func recv(code int) clientStep {
 func wait(d time.Duration) clientStep {
 	return func(h *harness, _ *ClientTransaction) { h.clock.advance(d) }
 }
+
+func terminate(_ *harness, tx *ClientTransaction) { tx.Terminate() }
 
 func failSends() clientStep {
 	return func(h *harness, _ *ClientTransaction) { h.sender.failWith(errNetwork) }
@@ -122,6 +125,12 @@ func TestClientInviteTransitions(t *testing.T) {
 		{name: "Calling: a failed ACK still passes the response up", network: transport.UDP,
 			steps:    []clientStep{failSends(), recv(486)},
 			wantSent: []string{"INVITE"}, wantTU: []string{"486"}, wantState: Terminated},
+		{name: "Proceeding: Terminate ends the transaction and removes it", network: transport.UDP,
+			steps:    []clientStep{recv(180), terminate, wait(time.Hour)},
+			wantSent: []string{"INVITE"}, wantTU: []string{"180", "error: " + ErrTerminated.Error()}, wantState: Terminated},
+		{name: "Terminated: Terminate again reports nothing", network: transport.TCP,
+			steps:    []clientStep{recv(486), terminate},
+			wantSent: []string{"INVITE", "ACK"}, wantTU: []string{"486"}, wantState: Terminated},
 		{name: "Completed: a failed ACK retransmission terminates quietly", network: transport.UDP,
 			steps:    []clientStep{recv(486), failSends(), recv(486)},
 			wantSent: []string{"INVITE", "ACK"}, wantTU: []string{"486"}, wantState: Terminated},
@@ -337,6 +346,30 @@ func TestFailedFirstSendReturnsTheErrorAndLeavesNoTransaction(t *testing.T) {
 	h.clock.advance(time.Minute)
 	if got := h.takeResponses(); len(got) != 0 {
 		t.Fatalf("handler called: %q", got)
+	}
+}
+
+func TestAckForAFailureGoesOverTheTransportTheInviteUsed(t *testing.T) {
+	// A large INVITE for UDP went over TCP (RFC 3261 §18.1.1); its ACK must
+	// follow it there (§17.1.1.3), however small the ACK is.
+	h := newHarness(t, transport.TCP, Config{})
+	addr := netip.MustParseAddrPort("192.0.2.1:5060")
+	if _, err := h.layer.Request(request(t, "INVITE", "z9hG4bKbig"), transport.Destination{Network: transport.UDP, Addr: addr}, h.handler); err != nil {
+		t.Fatal(err)
+	}
+	h.receive(response(t, request(t, "INVITE", "z9hG4bKbig"), 486))
+	if dst := h.sender.lastDestination(); dst.Network != transport.TCP || dst.Addr != addr {
+		t.Fatalf("ACK sent to %+v, want TCP to %v", dst, addr)
+	}
+
+	// Over a flow the flow is all there is.
+	h2 := newHarness(t, transport.TCP, Config{})
+	if _, err := h2.layer.Request(request(t, "INVITE", "z9hG4bKflow"), transport.Destination{Flow: "f1"}, h2.handler); err != nil {
+		t.Fatal(err)
+	}
+	h2.receive(response(t, request(t, "INVITE", "z9hG4bKflow"), 486))
+	if dst := h2.sender.lastDestination(); dst.Flow != "f1" || dst.Network != "" {
+		t.Fatalf("ACK sent to %+v, want flow f1", dst)
 	}
 }
 
