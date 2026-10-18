@@ -352,7 +352,7 @@ func TestEventsCarryOnlyFixedValuesWhateverThePeerSends(t *testing.T) {
 		defer mu.Unlock()
 		return len(events) > 0 && events[len(events)-1].Kind == EventClosed
 	}
-	for deadline := time.Now().Add(5 * time.Second); !closed(); {
+	for deadline := time.Now().Add(hangGuard); !closed(); {
 		if time.Now().After(deadline) {
 			t.Fatal("no EventClosed")
 		}
@@ -476,7 +476,7 @@ func TestEveryRefusalOfASentMessageReachesHandleReport(t *testing.T) {
 			t.Fatalf("%d reports waiting with a window of %d", waiting, cfg.SendWindow)
 		}
 	}
-	for deadline := time.Now().Add(10 * time.Second); h.reports.Load() < n; {
+	for deadline := time.Now().Add(hangGuard); h.reports.Load() < n; {
 		if time.Now().After(deadline) {
 			break
 		}
