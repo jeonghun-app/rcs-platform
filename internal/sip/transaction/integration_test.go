@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
+	"net"
 	"net/netip"
 	"strconv"
 	"testing"
@@ -220,4 +222,80 @@ func testTLS(t *testing.T) (server, client *tls.Config) {
 	server = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS12}
 	client = &tls.Config{RootCAs: pool, ServerName: "sip.example.com", MinVersion: tls.VersionTLS12}
 	return server, client
+}
+
+// blockingDialer never connects; it waits until the dial times out.
+type blockingDialer struct{}
+
+func (blockingDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// requestTU records requests without answering them.
+type requestTU struct{ got chan *sip.Request }
+
+func (r requestTU) Request(tx *ServerTransaction)        { r.got <- tx.Request() }
+func (requestTU) Stray(transport.Inbound)                {}
+func (requestTU) ServerFailed(*ServerTransaction, error) {}
+
+func TestRetransmissionFromAnotherFlowDoesNotStallTheUDPReadLoop(t *testing.T) {
+	// The INVITE arrives over TCP and its connection closes. A copy arriving
+	// over UDP matches the transaction; answering it would mean redialling the
+	// TCP peer from the UDP read loop, which every UDP client shares.
+	tu := requestTU{got: make(chan *sip.Request, 4)}
+	var layer *Layer
+	tr, err := transport.New(transport.Config{Dialer: blockingDialer{}, DialTimeout: 3 * time.Second},
+		func(in transport.Inbound) { layer.Receive(in) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer = New(tr, tu, Config{})
+	t.Cleanup(func() { layer.Close(); tr.Close() })
+	tcpAddr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpAddr, err := tr.Listen(transport.ListenerConfig{Network: transport.UDP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	invite := func(network string) []byte {
+		req := newOutgoing(t, transport.Network(network), "INVITE", "z9hG4bKstall", "", 1)
+		req.Header.Set("Via", "SIP/2.0/"+network+" client.example.com:5060;branch=z9hG4bKstall")
+		b, _ := req.Bytes()
+		return b
+	}
+	c, err := net.Dial("tcp", tcpAddr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Write(invite("TCP"))
+	awaitRequest(t, tu.got)
+	c.Close()
+
+	u, err := net.Dial("udp", udpAddr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	u.Write(invite("TCP")) // same branch and sent-by: the same transaction
+
+	other, err := net.Dial("udp", udpAddr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	start := time.Now()
+	msg := newOutgoing(t, transport.UDP, "MESSAGE", "z9hG4bKother", "", 1)
+	msg.Header.Set("Via", "SIP/2.0/UDP other.example.com:5060;branch=z9hG4bKother")
+	b, _ := msg.Bytes()
+	other.Write(b)
+	if got := awaitRequest(t, tu.got); got.Method != "MESSAGE" {
+		t.Fatalf("got %s", got.Method)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("the UDP read loop stalled for %v", d)
+	}
 }
