@@ -92,6 +92,7 @@ func parseAuth(s string) (string, Params, error) {
 	scheme := s[i:j]
 	i = skipWS(s, j)
 	var ps Params
+	var seen nameSet
 	for {
 		k := scanClass(s, i, classToken)
 		if k == i {
@@ -116,11 +117,11 @@ func parseAuth(s string) (string, Params, error) {
 			}
 			p.Value, k = s[k:e], e
 		}
-		if ps.Has(p.Name) {
-			return "", nil, syntaxError("repeated auth-param")
-		}
 		if len(ps) == maxParams {
 			return "", nil, errTooManyParams
+		}
+		if seen.add(lowerASCII(p.Name)) {
+			return "", nil, syntaxError("repeated auth-param")
 		}
 		ps = append(ps, p)
 		i = skipWS(s, k)

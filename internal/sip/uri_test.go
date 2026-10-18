@@ -3,6 +3,7 @@ package sip
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -209,6 +210,10 @@ func TestURIEqualHandlesSchemesEscapesAndAddresses(t *testing.T) {
 		{"tel:+15550100001;ext=1", "tel:+15550100001;EXT=1", true},
 		{"tel:+15550100001;ext=1", "tel:+15550100001;isub=1", false},
 		{"tel:7042;phone-context=Example.com", "tel:7042;phone-context=example.com", true},
+		// A global-number phone-context compares without visual separators (RFC 3966 §4).
+		{"tel:7042;phone-context=+1-212-555", "tel:7042;phone-context=+1212555", true},
+		{"tel:7042;phone-context=+1-212-555", "tel:7042;phone-context=+1212556", false},
+		{"tel:7042;phone-context=ex-ample.com", "tel:7042;phone-context=example.com", false},
 		{"urn:uuid:abc", "urn:uuid:abc", true},
 		{"urn:uuid:abc", "urn:uuid:abd", false},
 		{"tel:+15550100001", "sip:+15550100001@example.com;user=phone", false},
@@ -264,6 +269,18 @@ func TestTelAndUserPhoneURIsShareAnE164Key(t *testing.T) {
 		if key != tt.key || ok != (tt.key != "") {
 			t.Errorf("%q E164() = %q, %v, want %q", tt.in, key, ok, tt.key)
 		}
+	}
+}
+
+func TestHostnamesAreAtMost255Octets(t *testing.T) {
+	label := strings.Repeat("a", 63)
+	host := strings.Repeat(label+".", 4)[:255]
+	host = host[:254] + "m"
+	if _, err := ParseURI("sip:" + host); err != nil {
+		t.Errorf("255-octet host: %v", err)
+	}
+	if _, err := ParseURI("sip:" + host + "m"); !errors.Is(err, ErrMalformed) {
+		t.Errorf("256-octet host: %v", err)
 	}
 }
 

@@ -342,6 +342,10 @@ func TestParameterCountIsBounded(t *testing.T) {
 		if (err == nil) != ok {
 			t.Errorf("%d tel URI parameters: %v", n, err)
 		}
+		_, err = ParseURI("sip:a@example.com?" + params(n, "&"))
+		if (err == nil) != ok {
+			t.Errorf("%d URI headers: %v", n, err)
+		}
 		_, err = headerWith(t, "Authorization", "Digest "+params(n, ", ")).Authorization()
 		if (err == nil) != ok {
 			t.Errorf("%d auth-params: %v", n, err)

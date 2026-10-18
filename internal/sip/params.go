@@ -131,10 +131,8 @@ func parseParam(s string, i int) (Param, int, error) {
 	return p, e, nil
 }
 
-// maxParams bounds the parameters of one header element or URI. Repeated names
-// are looked for by comparing every pair, so without a bound a 16 KiB field of
-// ";a;b;c..." would cost each accessor call tens of millions of comparisons. Real
-// IMS contacts carry about twenty.
+// maxParams bounds the parameters of one header element and the parameters and
+// headers of one URI. Real IMS contacts carry about twenty.
 const maxParams = 64
 
 var errTooManyParams = syntaxError("too many parameters")
@@ -144,6 +142,7 @@ var errTooManyParams = syntaxError("too many parameters")
 // error: two tags or two branches leave a receiver to guess which one counts.
 func parseParams(s string, i int) (Params, int, error) {
 	var ps Params
+	var seen nameSet
 	for {
 		k := skipWS(s, i)
 		if k >= len(s) || s[k] != ';' {
@@ -153,11 +152,11 @@ func parseParams(s string, i int) (Params, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		if ps.Has(p.Name) {
-			return nil, 0, syntaxError("repeated parameter")
-		}
 		if len(ps) == maxParams {
 			return nil, 0, errTooManyParams
+		}
+		if seen.add(lowerASCII(p.Name)) {
+			return nil, 0, syntaxError("repeated parameter")
 		}
 		ps = append(ps, p)
 		i = next
@@ -190,4 +189,40 @@ func parseTokenParams(s string) (string, Params, error) {
 		return "", nil, err
 	}
 	return s[i:j], ps, nil
+}
+
+// nameSet finds repeated parameter names. Comparing every pair would let one
+// 16 KiB field of near-identical names cost each accessor call millions of byte
+// comparisons, so past a handful of names it switches to a map and the cost stays
+// linear in the input.
+type nameSet struct {
+	small [8]string
+	n     int
+	m     map[string]struct{}
+}
+
+// add records key, already normalized by the caller, and reports whether it was
+// there before.
+func (s *nameSet) add(key string) bool {
+	if s.m == nil {
+		for _, k := range s.small[:s.n] {
+			if k == key {
+				return true
+			}
+		}
+		if s.n < len(s.small) {
+			s.small[s.n] = key
+			s.n++
+			return false
+		}
+		s.m = make(map[string]struct{}, 2*len(s.small))
+		for _, k := range s.small {
+			s.m[k] = struct{}{}
+		}
+	}
+	if _, dup := s.m[key]; dup {
+		return true
+	}
+	s.m[key] = struct{}{}
+	return false
 }

@@ -110,6 +110,14 @@ func parseSIPURI(scheme, rest string) (URI, error) {
 		u.Port, rest = port, rest[end:]
 	}
 
+	var seen nameSet
+	if strings.HasPrefix(rest, ";") {
+		paramsEnd := strings.IndexByte(rest, '?')
+		if paramsEnd < 0 {
+			paramsEnd = len(rest)
+		}
+		u.Params = make(Params, 0, min(strings.Count(rest[:paramsEnd], ";"), maxParams))
+	}
 	for strings.HasPrefix(rest, ";") {
 		rest = rest[1:]
 		end = strings.IndexAny(rest, ";?")
@@ -122,20 +130,29 @@ func parseSIPURI(scheme, rest string) (URI, error) {
 			hasValue && (value == "" || !validEscaped(value, classParam)) {
 			return URI{}, syntaxError("invalid URI parameter")
 		}
-		if _, dup := u.Param(name); dup {
-			return URI{}, syntaxError("repeated URI parameter")
-		}
 		if len(u.Params) == maxParams {
 			return URI{}, errTooManyParams
+		}
+		// The key is computed once per parameter: normalizing it again for every
+		// pair let a crafted Contact cost a registrar milliseconds per read.
+		if seen.add(uriParamKey(name)) {
+			return URI{}, syntaxError("repeated URI parameter")
 		}
 		u.Params = append(u.Params, Param{Name: name, Value: value})
 	}
 
 	if strings.HasPrefix(rest, "?") {
-		for _, h := range strings.Split(rest[1:], "&") {
+		hs := rest[1:]
+		u.Headers = make(Params, 0, min(strings.Count(hs, "&")+1, maxParams))
+		for more := true; more; {
+			var h string
+			h, hs, more = strings.Cut(hs, "&")
 			name, value, ok := strings.Cut(h, "=")
 			if !ok || name == "" || !validEscaped(name, classURIHeader) || !validEscaped(value, classURIHeader) {
 				return URI{}, syntaxError("invalid URI header")
+			}
+			if len(u.Headers) == maxParams {
+				return URI{}, errTooManyParams
 			}
 			u.Headers = append(u.Headers, Param{Name: name, Value: value})
 		}
@@ -166,6 +183,7 @@ func parseTelURI(rest string) (URI, error) {
 		rest = ""
 	}
 	u := URI{Scheme: "tel", User: number}
+	var seen nameSet
 	global := strings.HasPrefix(number, "+")
 	if global && !isGlobalNumberDigits(number) || !global && !isLocalNumberDigits(number) {
 		return URI{}, syntaxError("invalid telephone number in tel URI")
@@ -181,11 +199,11 @@ func parseTelURI(rest string) (URI, error) {
 		if !isAll(name, classTelPName) || hasValue && (value == "" || !validEscaped(value, classParam)) {
 			return URI{}, syntaxError("invalid tel URI parameter")
 		}
-		if u.Params.Has(name) {
-			return URI{}, syntaxError("repeated tel URI parameter")
-		}
 		if len(u.Params) == maxParams {
 			return URI{}, errTooManyParams
+		}
+		if seen.add(lowerASCII(name)) {
+			return URI{}, syntaxError("repeated tel URI parameter")
 		}
 		u.Params = append(u.Params, Param{Name: name, Value: value})
 	}
@@ -273,7 +291,8 @@ func isIPv4(s string) bool {
 // trailing dot.
 func isHostname(s string) bool {
 	s = strings.TrimSuffix(s, ".")
-	if s == "" {
+	// A domain name is at most 255 octets (RFC 1035 §2.3.4).
+	if s == "" || len(s) > 255 {
 		return false
 	}
 	start := 0
@@ -301,14 +320,16 @@ func isHostname(s string) bool {
 func (u URI) Param(name string) (string, bool) {
 	key := uriParamKey(name)
 	for _, p := range u.Params {
-		if uriParamKey(p.Name) == key {
+		// Only a name with an escape needs normalizing, which allocates.
+		if strings.IndexByte(p.Name, '%') < 0 && strings.EqualFold(p.Name, key) ||
+			strings.IndexByte(p.Name, '%') >= 0 && uriParamKey(p.Name) == key {
 			return p.Value, true
 		}
 	}
 	return "", false
 }
 
-func uriParamKey(name string) string { return strings.ToLower(normalizeEscapes(name)) }
+func uriParamKey(name string) string { return lowerASCII(normalizeEscapes(name)) }
 
 // IsSIP reports whether u is a SIP or SIPS URI.
 func (u URI) IsSIP() bool { return u.Scheme == "sip" || u.Scheme == "sips" }
@@ -407,20 +428,21 @@ func sipEqual(u, v URI) bool {
 		!hostEqual(u.Host, v.Host) || u.Port != v.Port {
 		return false
 	}
-	for _, p := range u.Params {
-		q, ok := v.Param(p.Name)
+	up, vp := normalizedParams(u.Params), normalizedParams(v.Params)
+	for _, p := range up {
+		q, ok := findNormalized(vp, p.key)
 		if !ok {
-			if uriParamsThatMustMatch[uriParamKey(p.Name)] {
+			if uriParamsThatMustMatch[p.key] {
 				return false
 			}
 			continue
 		}
-		if !strings.EqualFold(normalizeEscapes(p.Value), normalizeEscapes(q)) {
+		if p.value != q {
 			return false
 		}
 	}
-	for _, q := range v.Params {
-		if _, ok := u.Param(q.Name); !ok && uriParamsThatMustMatch[uriParamKey(q.Name)] {
+	for _, q := range vp {
+		if _, ok := findNormalized(up, q.key); !ok && uriParamsThatMustMatch[q.key] {
 			return false
 		}
 	}
@@ -428,12 +450,42 @@ func sipEqual(u, v URI) bool {
 	return slices.Equal(uriHeaderKeys(u.Headers), uriHeaderKeys(v.Headers))
 }
 
-func uriHeaderKeys(hs Params) []string {
-	keys := make([]string, len(hs))
-	for i, h := range hs {
-		keys[i] = strings.ToLower(normalizeEscapes(h.Name) + "=" + normalizeEscapes(h.Value))
+// normalizedParam is a URI parameter reduced to what RFC 3261 §19.1.4 compares:
+// escapes normalized and, since parameters compare case-insensitively, lower case.
+type normalizedParam struct{ key, value string }
+
+// normalizedParams normalizes each parameter once, so comparing two URIs costs
+// about as much as parsing them instead of a normalization per pair.
+func normalizedParams(ps Params) []normalizedParam {
+	out := make([]normalizedParam, len(ps))
+	for i, p := range ps {
+		out[i] = normalizedParam{key: uriParamKey(p.Name), value: lowerASCII(normalizeEscapes(p.Value))}
 	}
-	slices.Sort(keys)
+	return out
+}
+
+func findNormalized(ps []normalizedParam, key string) (string, bool) {
+	for _, p := range ps {
+		if p.key == key {
+			return p.value, true
+		}
+	}
+	return "", false
+}
+
+// uriHeaderKeys returns the header components normalized and sorted, so two sets
+// compare equal whatever their order.
+func uriHeaderKeys(hs Params) []normalizedParam {
+	keys := make([]normalizedParam, len(hs))
+	for i, h := range hs {
+		keys[i] = normalizedParam{key: lowerASCII(normalizeEscapes(h.Name)), value: lowerASCII(normalizeEscapes(h.Value))}
+	}
+	slices.SortFunc(keys, func(a, b normalizedParam) int {
+		if c := strings.Compare(a.key, b.key); c != 0 {
+			return c
+		}
+		return strings.Compare(a.value, b.value)
+	})
 	return keys
 }
 
@@ -451,19 +503,32 @@ func hostEqual(a, b string) bool {
 }
 
 // telEqual applies RFC 3966 §4: the numbers match once visual separators are
-// removed, and both URIs carry the same parameters in any order.
+// removed, and both URIs carry the same parameters in any order. A phone-context
+// that is a global number compares without its visual separators too.
 func telEqual(u, v URI) bool {
 	if !strings.EqualFold(stripVisualSeparators(u.User), stripVisualSeparators(v.User)) ||
 		len(u.Params) != len(v.Params) {
 		return false
 	}
-	for _, p := range u.Params {
-		q, ok := v.Params.Get(p.Name)
-		if !ok || !strings.EqualFold(normalizeEscapes(p.Value), normalizeEscapes(q)) {
+	up, vp := normalizedTelParams(u.Params), normalizedTelParams(v.Params)
+	for _, p := range up {
+		if q, ok := findNormalized(vp, p.key); !ok || q != p.value {
 			return false
 		}
 	}
 	return true
+}
+
+func normalizedTelParams(ps Params) []normalizedParam {
+	out := make([]normalizedParam, len(ps))
+	for i, p := range ps {
+		value := lowerASCII(normalizeEscapes(p.Value))
+		if out[i].key = lowerASCII(p.Name); out[i].key == "phone-context" && strings.HasPrefix(value, "+") {
+			value = stripVisualSeparators(value)
+		}
+		out[i].value = value
+	}
+	return out
 }
 
 func stripVisualSeparators(s string) string {
