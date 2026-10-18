@@ -87,7 +87,7 @@ type ftCredential struct {
 }
 
 // getFTCredential answers ft-server's lookup (the contract of
-// docs/api/hss-provisioning.yaml): the HA1 of the FT credential for the
+// docs/api/hss.yaml): the HA1 of the FT credential for the
 // algorithm asked for, and the IMPU that owns the subscriber's files, the
 // first identity that is not barred. A subscription with none of those is
 // unknown to ft-server: 404 either way.

@@ -12,7 +12,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 )
 
-// The JSON forms of docs/api/hss-provisioning.yaml. Request and response
+// The JSON forms of docs/api/hss.yaml. Request and response
 // types are separate from the store's, so the wire format is stable and a
 // response can only carry what is listed here: no secret has a field.
 

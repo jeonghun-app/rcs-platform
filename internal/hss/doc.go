@@ -15,7 +15,7 @@
 //   - Pusher sends the HSS-initiated RTR and PPR (TS 29.228 §6.1.3, §6.2.2)
 //     by Destination-Realm to any connected S-CSCF peer (ADR 0005).
 //   - API is the provisioning API under /v1/, documented in
-//     docs/api/hss-provisioning.yaml, with bearer tokens scoped per caller.
+//     docs/api/hss.yaml, with bearer tokens scoped per caller.
 //   - Configure and Run wire them for cmd/hss; docs/hss.md is the
 //     operator's guide.
 //

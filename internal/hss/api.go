@@ -21,7 +21,7 @@ import (
 )
 
 // Scope is what a caller of the provisioning API may do (ADR 0007 §3; the
-// table is in docs/api/hss-provisioning.md).
+// table is in docs/api/hss-scopes.md).
 type Scope uint8
 
 // Scopes.
@@ -108,7 +108,7 @@ type acceptedToken struct {
 	limit *bucket
 }
 
-// API is the HSS provisioning API under /v1/ (docs/api/hss-provisioning.yaml).
+// API is the HSS provisioning API under /v1/ (docs/api/hss.yaml).
 type API struct {
 	h              *HSS
 	mux            *http.ServeMux

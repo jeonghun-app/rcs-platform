@@ -7,8 +7,8 @@ that operators, `acs` and `ft-server` call. Code: `internal/hss`, wired by
 `cmd/hss`.
 
 - Cx: TS 29.228 (procedures) and TS 29.229 (Diameter), see [Cx behaviour](#cx-behaviour).
-- Provisioning API: [api/hss-provisioning.yaml](api/hss-provisioning.yaml), with the
-  caller scopes in [api/hss-provisioning.md](api/hss-provisioning.md).
+- Provisioning API: [api/hss.yaml](api/hss.yaml), with the
+  caller scopes in [api/hss-scopes.md](api/hss-scopes.md).
 - State: DynamoDB `subscribers` and `service-profiles` ([Tables](#tables)).
 
 ## Configuration

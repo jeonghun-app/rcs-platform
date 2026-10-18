@@ -1,6 +1,6 @@
 # HSS provisioning API: callers and scopes
 
-The operations are specified in [hss-provisioning.yaml](hss-provisioning.yaml);
+The operations are specified in [hss.yaml](hss.yaml);
 [../hss.md](../hss.md) describes the HSS. This page is the scope table ADR 0007 §3
 asks for next to the API.
 

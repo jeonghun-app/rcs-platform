@@ -195,7 +195,7 @@ func TestAPIAnswers401ForAMissingOrWrongToken(t *testing.T) {
 	}
 }
 
-// The scope table of docs/api/hss-provisioning.md, checked operation by
+// The scope table of docs/api/hss-scopes.md, checked operation by
 // operation: every caller outside an operation's scope gets 403.
 func TestEveryOperationRefusesCallersOutsideItsScope(t *testing.T) {
 	a := newAPIEnv(t)
