@@ -86,6 +86,8 @@ func TestWantsMatchesEachStatusToTheRequestItAnswers(t *testing.T) {
 		{NegativeDelivery, DeliveryNotification, Delivered, false},
 		{NegativeDelivery, DeliveryNotification, Failed, true},
 		{NegativeDelivery, DeliveryNotification, Forbidden, true},
+		{PositiveDelivery, DeliveryNotification, Forbidden, true},
+		{Display | Processing, DeliveryNotification, Forbidden, false},
 		{NegativeDelivery, DeliveryNotification, Error, true},
 		{PositiveDelivery, DeliveryNotification, Failed, false},
 		{Display, DisplayNotification, Displayed, true},
@@ -127,7 +129,7 @@ Hello`)
 	}
 	want := Request{
 		MessageID:    "Kd3Pq8sXw2",
-		DateTime:     r.DateTime,
+		DateTime:     "2026-10-18T09:30:00+09:00",
 		Dispositions: PositiveDelivery | Display,
 		OriginalTo:   cpim.Address{Name: "Group", URI: focus},
 		RecordRoute:  []cpim.Address{{URI: relay}, {URI: focus}},
@@ -135,8 +137,8 @@ Hello`)
 	if !reflect.DeepEqual(r, want) {
 		t.Errorf("ParseRequest() = %+v\nwant %+v", r, want)
 	}
-	if !r.DateTime.Equal(time.Date(2026, 10, 18, 0, 30, 0, 0, time.UTC)) {
-		t.Errorf("DateTime = %v", r.DateTime)
+	if got, err := r.Time(); err != nil || !got.Equal(time.Date(2026, 10, 18, 0, 30, 0, 0, time.UTC)) {
+		t.Errorf("Time() = %v, %v", got, err)
 	}
 }
 
@@ -202,7 +204,6 @@ func TestParseRequestRejectsMalformedHeaders(t *testing.T) {
 		"two Message-IDs":        {ns, id, id},
 		"Message-ID not a token": {ns, {Name: "imdn.Message-ID", Value: "a b"}},
 		"bad dispositions":       {ns, id, dt, {Name: "imdn.Disposition-Notification", Value: "display,,"}},
-		"bad DateTime":           {ns, id, {Name: "DateTime", Value: "yesterday"}},
 		"two Original-To":        {ns, id, {Name: "imdn.Original-To", Value: "<" + focus + ">"}, {Name: "imdn.Original-To", Value: "<" + focus + ">"}},
 		"bad Original-To":        {ns, id, {Name: "imdn.Original-To", Value: focus}},
 		"bad IMDN-Record-Route":  {ns, id, {Name: "imdn.IMDN-Record-Route", Value: relay}},
@@ -345,5 +346,40 @@ func TestIsNotificationReadsContentDisposition(t *testing.T) {
 	}
 	if IsNotification(&cpim.Message{}) {
 		t.Error("a message without Content-Disposition is not a notification")
+	}
+}
+
+func TestAddRecordRoutePutsTheLatestIntermediaryOnTop(t *testing.T) {
+	m := chatToBob(t)
+	for _, a := range []string{relay, focus} {
+		if err := AddRecordRoute(m, cpim.Address{URI: a}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := AddRequest(m, "abc", Display); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := cpim.Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := ParseRequest(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []cpim.Address{{URI: focus}, {URI: relay}}; !reflect.DeepEqual(r.RecordRoute, want) {
+		t.Errorf("RecordRoute = %+v, want the last intermediary first", r.RecordRoute)
+	}
+	if err := AddRecordRoute(m, cpim.Address{URI: "relay"}); err == nil {
+		t.Error("AddRecordRoute accepted an address that is not a URI")
+	}
+	stuck := &cpim.Message{}
+	_ = stuck.Declare("", "urn:example:other")
+	if err := AddRecordRoute(stuck, cpim.Address{URI: relay}); err == nil {
+		t.Error("AddRecordRoute succeeded where no NS header can be written")
 	}
 }

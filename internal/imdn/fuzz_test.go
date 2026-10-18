@@ -27,7 +27,7 @@ func FuzzParseNotification(f *testing.F) {
 			t.Fatalf("Marshal of a parsed notification failed: %v\n%+v", err, n)
 		}
 		back, err := ParseNotification(out)
-		if err != nil || !sameNotification(back, n) {
+		if err != nil || back != n {
 			t.Fatalf("round trip changed the notification:\n%+v\n%+v, %v", n, back, err)
 		}
 	})

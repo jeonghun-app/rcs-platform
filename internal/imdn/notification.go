@@ -61,8 +61,10 @@ type Notification struct {
 	// MessageID is the Message-ID of the message being reported on, not of
 	// the notification (RFC 5438 §11.1.1).
 	MessageID string
-	// DateTime is the DateTime of the message being reported on (§11.1.2).
-	DateTime time.Time
+	// DateTime is the DateTime header of the message being reported on,
+	// verbatim (§11.1.2); the schema makes it a plain string. Time interprets
+	// it.
+	DateTime string
 	// RecipientURI is the final recipient; optional (§11.1.3).
 	RecipientURI string
 	// OriginalRecipientURI is the recipient named by Original-To; present
@@ -94,20 +96,26 @@ func (r Request) Notification(k Kind, s Status, recipient string) (Notification,
 	return n, n.validate()
 }
 
+// Time interprets DateTime. ParseNotification keeps a datetime it cannot
+// parse rather than lose the receipt; this is where that surfaces.
+func (n Notification) Time() (time.Time, error) {
+	return cpim.ParseDateTime(n.DateTime)
+}
+
 func (n Notification) validate() error {
 	switch {
 	case !cpim.IsToken(n.MessageID) || !isXMLText(n.MessageID):
 		return fmt.Errorf("%w: message-id is not a token", ErrMalformed)
-	case n.DateTime.IsZero() || n.DateTime.Year() > 9999 || n.DateTime.Year() < 0:
-		return fmt.Errorf("%w: datetime missing or out of range", ErrMalformed)
+	case n.DateTime == "" || !isXMLText(n.DateTime):
+		return fmt.Errorf("%w: datetime missing or not XML text", ErrMalformed)
 	case !isURIText(n.RecipientURI) || !isURIText(n.OriginalRecipientURI):
 		return fmt.Errorf("%w: recipient URI contains white space or invalid characters", ErrMalformed)
 	case !isXMLText(n.Subject):
 		return fmt.Errorf("%w: subject contains characters XML cannot carry", ErrMalformed)
-	case n.SubjectLang != "" && (n.Subject == "" || !isLanguageTag(n.SubjectLang)):
-		return fmt.Errorf("%w: subject language without subject or not a language tag", ErrMalformed)
+	case n.SubjectLang != "" && !isLanguageTag(n.SubjectLang):
+		return fmt.Errorf("%w: subject language is not a language tag", ErrMalformed)
 	case !n.Kind.allows(n.Status):
-		return fmt.Errorf("%w: status %q is not defined for %q", ErrMalformed, n.Status, n.Kind)
+		return fmt.Errorf("%w: status is not defined for the notification kind", ErrMalformed)
 	}
 	return nil
 }
@@ -148,14 +156,15 @@ func (n Notification) Marshal() ([]byte, error) {
 	// it on every element if the names carried it.
 	w.start("imdn", xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: XMLNamespace})
 	w.text("message-id", n.MessageID)
-	w.text("datetime", n.DateTime.Format(time.RFC3339Nano))
+	w.text("datetime", n.DateTime)
 	if n.RecipientURI != "" {
 		w.text("recipient-uri", n.RecipientURI)
 	}
 	if n.OriginalRecipientURI != "" {
 		w.text("original-recipient-uri", n.OriginalRecipientURI)
 	}
-	if n.Subject != "" {
+	// A subject with only a language is valid (§11.1.9) and kept.
+	if n.Subject != "" || n.SubjectLang != "" {
 		var attrs []xml.Attr
 		if n.SubjectLang != "" {
 			attrs = append(attrs, xml.Attr{Name: xml.Name{Space: xmlLangNamespace, Local: "lang"}, Value: n.SubjectLang})
@@ -214,8 +223,9 @@ func ParseNotification(data []byte) (Notification, error) {
 		return Notification{}, err
 	}
 	var w wireIMDN
+	data = withoutBOM(data)
 	if err := xml.NewDecoder(bytes.NewReader(data)).Decode(&w); err != nil {
-		return Notification{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		return Notification{}, decodeError(err)
 	}
 
 	var n Notification
@@ -226,12 +236,8 @@ func ParseNotification(data []byte) (Notification, error) {
 		return Notification{}, err
 	}
 	n.MessageID = strings.TrimSpace(n.MessageID)
-	dt, err := one("datetime", w.DateTime, true)
-	if err != nil {
+	if n.DateTime, err = one("datetime", w.DateTime, true); err != nil {
 		return Notification{}, err
-	}
-	if n.DateTime, err = time.Parse(time.RFC3339, dt); err != nil {
-		return Notification{}, fmt.Errorf("%w: datetime is not an RFC 3339 date-time", ErrMalformed)
 	}
 	if n.RecipientURI, err = one("recipient-uri", w.RecipientURI, false); err != nil {
 		return Notification{}, err
@@ -344,8 +350,10 @@ func (n Notification) Message(e Envelope) (*cpim.Message, error) {
 	if e.MessageID == n.MessageID {
 		return nil, fmt.Errorf("%w: notification reuses the Message-ID it reports on", ErrMalformed)
 	}
-	if e.DateTime.IsZero() {
-		return nil, fmt.Errorf("%w: notification has no DateTime", ErrMalformed)
+	// Checked here rather than left to cpim.Message.Marshal so the error
+	// points at the envelope that caused it.
+	if e.DateTime.IsZero() || e.DateTime.Year() < 0 || e.DateTime.Year() > 9999 {
+		return nil, fmt.Errorf("%w: notification DateTime missing or outside years 0-9999", ErrMalformed)
 	}
 	for _, a := range append([]cpim.Address{e.From, e.To}, e.Route...) {
 		if _, err := cpim.ParseAddress(a.String()); err != nil {
@@ -392,7 +400,7 @@ func ParseNotificationMessage(m *cpim.Message) (Notification, error) {
 	case mt == "multipart/mixed":
 		return Notification{}, ErrUnsupported
 	case mt != ContentType:
-		return Notification{}, fmt.Errorf("%w: notification content is %s", ErrMalformed, mt)
+		return Notification{}, fmt.Errorf("%w: notification content is not %s", ErrMalformed, ContentType)
 	}
 	return ParseNotification(m.Body)
 }

@@ -10,25 +10,15 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 )
 
-var sentAt = time.Date(2026, 10, 18, 9, 30, 0, 0, time.FixedZone("", 9*3600))
-
-// sameNotification compares notifications with DateTime compared as an
-// instant plus offset, since time.Location pointers differ between parses.
-func sameNotification(a, b Notification) bool {
-	_, ao := a.DateTime.Zone()
-	_, bo := b.DateTime.Zone()
-	if !a.DateTime.Equal(b.DateTime) || ao != bo {
-		return false
-	}
-	a.DateTime, b.DateTime = time.Time{}, time.Time{}
-	return a == b
-}
+// sentAt is the DateTime of the reported message as its sender wrote it,
+// with a fraction an RFC3339Nano round trip would rewrite.
+const sentAt = "2026-10-18T09:30:00.250+09:00"
 
 func TestParseNotificationReadsEveryElement(t *testing.T) {
 	doc := `<?xml version="1.0" encoding="UTF-8"?>
 <imdn xmlns="urn:ietf:params:xml:ns:imdn">
   <message-id>Kd3Pq8sXw2</message-id>
-  <datetime>2026-10-18T09:30:00+09:00</datetime>
+  <datetime>2026-10-18T09:30:00.250+09:00</datetime>
   <recipient-uri>` + bob + `</recipient-uri>
   <original-recipient-uri>` + focus + `</original-recipient-uri>
   <subject xml:lang="ko">점심 &amp; 회의</subject>
@@ -52,7 +42,7 @@ func TestParseNotificationReadsEveryElement(t *testing.T) {
 		Kind:                 DeliveryNotification,
 		Status:               Delivered,
 	}
-	if !sameNotification(n, want) {
+	if n != want {
 		t.Errorf("ParseNotification() = %+v\nwant %+v", n, want)
 	}
 }
@@ -75,7 +65,7 @@ func TestMarshalWritesSchemaOrderWithOneNamespaceDeclaration(t *testing.T) {
 	want := `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
 		`<imdn xmlns="urn:ietf:params:xml:ns:imdn">` +
 		`<message-id>Kd3Pq8sXw2</message-id>` +
-		`<datetime>2026-10-18T09:30:00+09:00</datetime>` +
+		`<datetime>2026-10-18T09:30:00.250+09:00</datetime>` +
 		`<recipient-uri>` + bob + `</recipient-uri>` +
 		`<original-recipient-uri>` + focus + `</original-recipient-uri>` +
 		`<subject xml:lang="en-GB">a &lt; b</subject>` +
@@ -89,13 +79,13 @@ func TestMarshalWritesSchemaOrderWithOneNamespaceDeclaration(t *testing.T) {
 func TestEveryKindAndStatusRoundTrips(t *testing.T) {
 	for kind, list := range statuses {
 		for _, status := range list {
-			n := Notification{MessageID: "id-1", DateTime: sentAt.Add(250 * time.Millisecond), Kind: kind, Status: status}
+			n := Notification{MessageID: "id-1", DateTime: sentAt, Kind: kind, Status: status}
 			out, err := n.Marshal()
 			if err != nil {
 				t.Fatalf("%s/%s: Marshal: %v", kind, status, err)
 			}
 			back, err := ParseNotification(out)
-			if err != nil || !sameNotification(back, n) {
+			if err != nil || back != n {
 				t.Errorf("%s/%s: ParseNotification() = %+v, %v", kind, status, back, err)
 			}
 		}
@@ -152,7 +142,7 @@ func TestMalformedNotificationsAreRejected(t *testing.T) {
 		"message-id with a space":     doc(`<message-id>a b</message-id><datetime>2026-10-18T00:30:00Z</datetime>` + delivered("")),
 		"missing datetime":            doc(`<message-id>abc</message-id>` + delivered("")),
 		"two datetimes":               doc(validBody + `<datetime>2026-10-18T00:30:00Z</datetime>` + delivered("")),
-		"datetime not RFC 3339":       doc(`<message-id>abc</message-id><datetime>18 Oct 2026</datetime>` + delivered("")),
+		"empty datetime":              doc(`<message-id>abc</message-id><datetime/>` + delivered("")),
 		"two recipient-uris":          doc(validBody + `<recipient-uri>` + bob + `</recipient-uri><recipient-uri>` + bob + `</recipient-uri>` + delivered("")),
 		"two original-recipient-uris": doc(validBody + `<original-recipient-uri>` + bob + `</original-recipient-uri><original-recipient-uri>` + bob + `</original-recipient-uri>` + delivered("")),
 		"recipient-uri with a space":  doc(validBody + `<recipient-uri>sip:a b</recipient-uri>` + delivered("")),
@@ -211,12 +201,11 @@ func TestMarshalRejectsInvalidNotifications(t *testing.T) {
 		"empty message-id":           func(n *Notification) { n.MessageID = "" },
 		"message-id with a space":    func(n *Notification) { n.MessageID = "a b" },
 		"message-id XML cannot hold": func(n *Notification) { n.MessageID = "a￾b" },
-		"no datetime":                func(n *Notification) { n.DateTime = time.Time{} },
-		"datetime after year 9999":   func(n *Notification) { n.DateTime = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) },
+		"no datetime":                func(n *Notification) { n.DateTime = "" },
+		"datetime XML cannot hold":   func(n *Notification) { n.DateTime = "2026\x00" },
 		"recipient with a space":     func(n *Notification) { n.RecipientURI = "sip:a b" },
 		"original with a newline":    func(n *Notification) { n.OriginalRecipientURI = "sip:a\nb" },
 		"subject with a control":     func(n *Notification) { n.Subject = "a\x01" },
-		"language without subject":   func(n *Notification) { n.SubjectLang = "en" },
 		"invalid language":           func(n *Notification) { n.Subject, n.SubjectLang = "s", "en_GB" },
 		"empty language subtag":      func(n *Notification) { n.Subject, n.SubjectLang = "s", "en--GB" },
 		"overlong language subtag":   func(n *Notification) { n.Subject, n.SubjectLang = "s", "languages" },
@@ -305,7 +294,7 @@ Content-Disposition: notification
 		t.Error("the wrapped message is not recognised as a notification")
 	}
 	n, err := ParseNotificationMessage(parsed)
-	if err != nil || !sameNotification(n, displayed()) {
+	if err != nil || n != displayed() {
 		t.Errorf("ParseNotificationMessage() = %+v, %v", n, err)
 	}
 	if r, err := ParseRequest(parsed); err != nil || r.Dispositions != 0 {
@@ -319,6 +308,7 @@ func TestNotificationMessageRefusesAnInvalidEnvelope(t *testing.T) {
 		"Message-ID not a token": func(_ *Notification, e *Envelope) { e.MessageID = "a b" },
 		"Message-ID reused":      func(n *Notification, e *Envelope) { e.MessageID = n.MessageID },
 		"no DateTime":            func(_ *Notification, e *Envelope) { e.DateTime = time.Time{} },
+		"DateTime after 9999":    func(_ *Notification, e *Envelope) { e.DateTime = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) },
 		"no From":                func(_ *Notification, e *Envelope) { e.From = cpim.Address{} },
 		"invalid To":             func(_ *Notification, e *Envelope) { e.To = cpim.Address{URI: "alice"} },
 		"invalid route":          func(_ *Notification, e *Envelope) { e.Route[1].URI = "sip:a b" },
@@ -362,5 +352,120 @@ func TestParseNotificationMessageChecksTheContent(t *testing.T) {
 				t.Errorf("ParseNotificationMessage() error = %v, want %v", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestDatetimeIsKeptVerbatimAndInterpretedOnDemand(t *testing.T) {
+	for _, v := range []string{"2026-10-18t00:30:00.000z", "18 Oct 2026", " 2026-10-18T00:30:00Z "} {
+		n, err := ParseNotification([]byte(doc(`<message-id>abc</message-id><datetime>` + v + `</datetime>` + delivered(""))))
+		if err != nil || n.DateTime != v {
+			t.Fatalf("ParseNotification(%q) = %+v, %v; the receipt must survive with its datetime intact", v, n, err)
+		}
+		out, err := n.Marshal()
+		if err != nil || !strings.Contains(string(out), "<datetime>"+v+"</datetime>") {
+			t.Errorf("Marshal() = %s, %v; datetime must be echoed verbatim", out, err)
+		}
+	}
+	n := Notification{DateTime: "2026-10-18t00:30:00z"}
+	if got, err := n.Time(); err != nil || !got.Equal(time.Date(2026, 10, 18, 0, 30, 0, 0, time.UTC)) {
+		t.Errorf("Time() = %v, %v", got, err)
+	}
+	if _, err := (Notification{DateTime: "18 Oct 2026"}).Time(); err == nil {
+		t.Error("Time() parsed a non-RFC 3339 datetime")
+	}
+}
+
+func TestAnUnparseableDateTimeIsEchoedNotRejected(t *testing.T) {
+	m := mustCPIM(t, `NS: imdn <urn:ietf:params:imdn>
+imdn.Message-ID: abc
+DateTime: 2026-10-18t09:30:00.000+09:00
+imdn.Disposition-Notification: display
+
+Content-Type: text/plain
+
+`)
+	r, err := ParseRequest(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := r.Notification(DisplayNotification, Displayed, bob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := n.Marshal()
+	if err != nil || !strings.Contains(string(body), "<datetime>2026-10-18t09:30:00.000+09:00</datetime>") {
+		t.Errorf("Marshal() = %s, %v", body, err)
+	}
+
+	odd := mustCPIM(t, "NS: imdn <urn:ietf:params:imdn>\nimdn.Message-ID: abc\nDateTime: yesterday\nimdn.Disposition-Notification: display\n\nContent-Type: text/plain\n\n")
+	r, err = ParseRequest(odd)
+	if err != nil || r.DateTime != "yesterday" {
+		t.Fatalf("ParseRequest() = %+v, %v", r, err)
+	}
+	if _, err := r.Time(); err == nil {
+		t.Error("Time() parsed yesterday")
+	}
+	if _, err := r.Notification(DisplayNotification, Displayed, bob); err != nil {
+		t.Errorf("the sender still gets its receipt: %v", err)
+	}
+}
+
+func TestAByteOrderMarkIsAccepted(t *testing.T) {
+	body, _ := displayed().Marshal()
+	n, err := ParseNotification(append([]byte("\xef\xbb\xbf"), body...))
+	if err != nil || n != displayed() {
+		t.Errorf("ParseNotification(BOM + document) = %+v, %v", n, err)
+	}
+	if _, err := ParseNotification([]byte("\xef\xbb\xbf\xef\xbb\xbf" + string(body))); !errors.Is(err, ErrMalformed) {
+		t.Errorf("two byte order marks: %v", err)
+	}
+}
+
+func TestASubjectWithOnlyALanguageRoundTrips(t *testing.T) {
+	n, err := ParseNotification([]byte(doc(validBody + `<subject xml:lang="en"></subject>` + delivered(""))))
+	if err != nil || n.Subject != "" || n.SubjectLang != "en" {
+		t.Fatalf("ParseNotification() = %+v, %v", n, err)
+	}
+	out, err := n.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back, err := ParseNotification(out); err != nil || back != n {
+		t.Errorf("round trip = %+v, %v", back, err)
+	}
+}
+
+func TestXMLErrorsDoNotQuoteTheInput(t *testing.T) {
+	const marker = "15550100001"
+	tests := map[string]string{
+		"entity reference":      doc(`<message-id>&sip:+` + marker + `;</message-id>`),
+		"invalid element name":  doc(`<1` + marker + `/>`),
+		"wrong root":            `<x` + marker + ` xmlns="urn:ietf:params:xml:ns:imdn"/>`,
+		"mismatched end tag":    doc(`<a` + marker + `></b>`),
+		"unknown encoding":      `<?xml version="1.0" encoding="x` + marker + `"?>` + doc(""),
+		"unsupported version":   `<?xml version="+` + marker + `"?>` + doc(""),
+		"repeated attribute":    `<a` + marker + ` x="1" x="2"/>`,
+		"unknown status":        doc(validBody + `<delivery-notification><status><s` + marker + `/></status></delivery-notification>`),
+		"message-id not token":  doc(`<message-id>+` + marker + ` x</message-id><datetime>d</datetime>` + delivered("")),
+		"recipient with space":  doc(validBody + `<recipient-uri>sip:+` + marker + ` x</recipient-uri>` + delivered("")),
+		"invalid character ref": doc(`<subject>&#x` + marker + `;</subject>`),
+	}
+	for name, d := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseNotification([]byte(d))
+			if err == nil {
+				t.Fatal("ParseNotification accepted the document")
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Errorf("error %q quotes the input", err)
+			}
+		})
+	}
+	m := &cpim.Message{ContentHeaders: []cpim.Field{
+		{Name: "Content-Type", Value: "application/x" + marker},
+		{Name: "Content-Disposition", Value: "notification"},
+	}}
+	if _, err := ParseNotificationMessage(m); err == nil || strings.Contains(err.Error(), marker) {
+		t.Errorf("ParseNotificationMessage() error = %v", err)
 	}
 }

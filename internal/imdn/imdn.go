@@ -9,6 +9,11 @@
 // and Request.Notification apply those rules so a service cannot send a
 // notification nobody asked for.
 //
+// A notification echoes the DateTime of the message it reports on as the
+// sender wrote it (RFC 5438 §11.1.2), so Request and Notification keep it as a
+// string; their Time methods interpret it. A time this package cannot parse
+// therefore never costs anyone a receipt.
+//
 // Notification documents are decoded with encoding/xml behind a size limit, a
 // nesting limit and a refusal of any document type declaration, so entity
 // tricks never reach the decoder.
@@ -136,18 +141,26 @@ func (d Disposition) String() string {
 }
 
 // Wants reports whether a sender that requested d wants a notification of
-// kind k with status s. A successful delivery answers positive-delivery and
-// every other delivery status answers negative-delivery (RFC 5438 §7.1.1.3,
-// §8.2); display and processing statuses answer their own request whatever
-// the outcome (§7.2.1.2, §8.1).
+// kind k with status s:
+//
+//   - delivered answers positive-delivery, and failed and error answer
+//     negative-delivery, since both report a delivery that did not happen
+//     (RFC 5438 §7.1.1.3, §8.2);
+//   - forbidden refuses the requested notification itself (§5.1), so it
+//     answers a request for either delivery notification;
+//   - display and processing statuses answer their own request whatever the
+//     outcome (§5.2, §5.3).
 func (d Disposition) Wants(k Kind, s Status) bool {
 	if !k.allows(s) {
 		return false
 	}
 	switch k {
 	case DeliveryNotification:
-		if s == Delivered {
+		switch s {
+		case Delivered:
 			return d&PositiveDelivery != 0
+		case Forbidden:
+			return d&(PositiveDelivery|NegativeDelivery) != 0
 		}
 		return d&NegativeDelivery != 0
 	case DisplayNotification:
@@ -162,8 +175,10 @@ func (d Disposition) Wants(k Kind, s Status) bool {
 type Request struct {
 	// MessageID identifies the message; every notification quotes it.
 	MessageID string
-	// DateTime is when the sender sent the message; notifications return it.
-	DateTime time.Time
+	// DateTime is the message's DateTime header exactly as sent. A
+	// notification echoes this string (RFC 5438 §11.1.2) so the sender can
+	// match it however it formatted the time; Time interprets it.
+	DateTime string
 	// Dispositions are the notifications requested; zero means none.
 	Dispositions Disposition
 	// OriginalTo is the recipient before an intermediary rewrote To (RFC 5438
@@ -201,14 +216,10 @@ func ParseRequest(m *cpim.Message) (Request, error) {
 		r.MessageID = ids[0].Value
 	}
 
-	if _, ok := m.Get(cpim.CoreNamespace, cpim.HeaderDateTime); ok {
-		t, err := m.DateTime()
-		if err != nil {
-			return Request{}, err
-		}
-		r.DateTime = t
+	if h, ok := m.Get(cpim.CoreNamespace, cpim.HeaderDateTime); ok {
+		r.DateTime = h.Value
 	}
-	if r.Dispositions != 0 && (r.MessageID == "" || r.DateTime.IsZero()) {
+	if r.Dispositions != 0 && (r.MessageID == "" || r.DateTime == "") {
 		return Request{}, ErrIncompleteRequest
 	}
 
@@ -231,6 +242,26 @@ func ParseRequest(m *cpim.Message) (Request, error) {
 		r.RecordRoute = append(r.RecordRoute, a)
 	}
 	return r, nil
+}
+
+// Time interprets DateTime, which ParseRequest keeps uninterpreted so that a
+// time this package cannot parse still gets its notifications.
+func (r Request) Time() (time.Time, error) {
+	return cpim.ParseDateTime(r.DateTime)
+}
+
+// AddRecordRoute puts an intermediary's address on top of the IMDN-Record-Route
+// list of m, as RFC 5438 §8 has an intermediary do when it wants to see the
+// notifications. The recipient copies the list in order into IMDN-Route, so
+// the notification reaches the last intermediary to add itself first.
+func AddRecordRoute(m *cpim.Message, a cpim.Address) error {
+	if _, err := cpim.ParseAddress(a.String()); err != nil {
+		return err
+	}
+	if err := m.Declare(Prefix, Namespace); err != nil {
+		return err
+	}
+	return m.AddFirst(Namespace, HeaderRecordRoute, a.String())
 }
 
 // AddRequest asks the recipients of m for the notifications in d, adding the

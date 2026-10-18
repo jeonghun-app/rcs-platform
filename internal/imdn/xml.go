@@ -38,7 +38,7 @@ func checkDocument(data []byte) error {
 	if len(data) > MaxDocumentSize {
 		return ErrTooLarge
 	}
-	d := xml.NewDecoder(bytes.NewReader(data))
+	d := xml.NewDecoder(bytes.NewReader(withoutBOM(data)))
 	depth, roots := 0, 0
 	for {
 		tok, err := d.Token()
@@ -46,7 +46,7 @@ func checkDocument(data []byte) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrMalformed, err)
+			return decodeError(err)
 		}
 		switch t := tok.(type) {
 		case xml.Directive:
@@ -63,7 +63,7 @@ func checkDocument(data []byte) error {
 				return fmt.Errorf("%w: elements nested deeper than %d", ErrMalformed, maxDepth)
 			}
 			if hasRepeatedAttr(t.Attr) {
-				return fmt.Errorf("%w: repeated attribute on <%s>", ErrMalformed, t.Name.Local)
+				return fmt.Errorf("%w: repeated attribute", ErrMalformed)
 			}
 		case xml.EndElement:
 			depth--
@@ -77,6 +77,23 @@ func checkDocument(data []byte) error {
 		return fmt.Errorf("%w: no root element", ErrMalformed)
 	}
 	return nil
+}
+
+// withoutBOM drops a leading UTF-8 byte order mark, which XML 1.0 §4.3.3
+// allows before a UTF-8 document and encoding/xml would read as text.
+func withoutBOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+}
+
+// decodeError reduces an encoding/xml error to its line number. The
+// decoder's messages quote the input, such as an entity name or a value,
+// and could put a subscriber address into a log.
+func decodeError(err error) error {
+	var se *xml.SyntaxError
+	if errors.As(err, &se) {
+		return fmt.Errorf("%w: XML syntax error on line %d", ErrMalformed, se.Line)
+	}
+	return fmt.Errorf("%w: document does not have the expected structure", ErrMalformed)
 }
 
 func hasRepeatedAttr(attrs []xml.Attr) bool {
