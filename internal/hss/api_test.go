@@ -29,12 +29,14 @@ var (
 	ftToken        = "ft-0123456789abcdefghijklmnopqrstuvwxyzABCDE"
 )
 
-// recordingNotifier records the RTRs and PPRs the API causes.
+// recordingNotifier records the RTRs and PPRs the API causes; pprErr, when
+// set, is what every PPR fails with.
 type recordingNotifier struct {
-	mu   sync.Mutex
-	rtrs []*cx.RTR
-	pprs []*cx.PPR
-	sent chan struct{}
+	mu     sync.Mutex
+	rtrs   []*cx.RTR
+	pprs   []*cx.PPR
+	sent   chan struct{}
+	pprErr error
 }
 
 func newRecorder() *recordingNotifier { return &recordingNotifier{sent: make(chan struct{}, 100)} }
@@ -50,9 +52,10 @@ func (n *recordingNotifier) Deregister(_ context.Context, r *cx.RTR) error {
 func (n *recordingNotifier) PushProfile(_ context.Context, r *cx.PPR) error {
 	n.mu.Lock()
 	n.pprs = append(n.pprs, r)
+	err := n.pprErr
 	n.mu.Unlock()
 	n.sent <- struct{}{}
-	return nil
+	return err
 }
 
 func (n *recordingNotifier) got() ([]*cx.RTR, []*cx.PPR) {
@@ -797,5 +800,51 @@ func TestAKAOverTheAPIAuthenticatesOverCx(t *testing.T) {
 	m := milenage.New(testK, testOPc)
 	if xres := m.F2([16]byte(maa.AuthDataItems[0].Authenticate[:16])); string(xres[:]) != string(maa.AuthDataItems[0].Authorization) {
 		t.Error("the vector does not come from the provisioned keys")
+	}
+}
+
+// TS 29.228 §6.2.2.1: a PPA that says the S-CSCF lost the user brings the
+// HSS's state in line; one that refuses the data deregisters the user with
+// SERVER_CHANGE so they register again.
+func TestPPAFailuresAreActedOn(t *testing.T) {
+	for name, c := range map[string]struct {
+		result cx.Result
+		rtr    bool
+		metric string
+	}{
+		"user unknown":            {exp(cx.ErrorUserUnknown), false, "push.ppr.user_unknown"},
+		"unsupported user data":   {exp(cx.ErrorNotSupportedUserData), true, "push.ppr.data_refused"},
+		"too much data":           {exp(cx.ErrorTooMuchData), true, "push.ppr.data_refused"},
+		"unable to comply (kept)": {resUnable, false, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAPIEnv(t)
+			a.notifier.pprErr = &RejectedError{Command: "PPR", Result: c.result}
+			a.create(impi1, true, impu1)
+			a.modify(impi1, func(s *store.Subscription) {
+				s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+			})
+			a.do("PUT", subPath(impi1), adminToken, subscriptionBody(impi1, true, impu1, tel1))
+			rtrs, pprs := a.notifier.got()
+			if len(pprs) != 1 {
+				t.Fatalf("%d PPRs", len(pprs))
+			}
+			if got := len(rtrs) == 1 && rtrs[0].DeregistrationReason.Code == cx.ServerChange; got != c.rtr {
+				t.Errorf("RTRs = %+v, want SERVER_CHANGE %t", rtrs, c.rtr)
+			}
+			s := a.sub(impi1)
+			if c.metric == "" {
+				if s.Identity(impu1).State != store.Registered {
+					t.Error("a PPA failure without a rule changed the state")
+				}
+				return
+			}
+			if s.Identity(impu1).State != store.NotRegistered || s.Identity(tel1).State != store.NotRegistered || s.ServerName != "" {
+				t.Errorf("after the PPA: %+v", s)
+			}
+			if a.metrics.get(c.metric) != 1 {
+				t.Errorf("%s not counted", c.metric)
+			}
+		})
 	}
 }

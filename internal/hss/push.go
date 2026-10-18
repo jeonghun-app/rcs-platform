@@ -190,7 +190,22 @@ func (p *Pusher) PushProfile(ctx context.Context, r *cx.PPR) error {
 	})
 }
 
+// RejectedError is an RTA or PPA with a result other than success.
+type RejectedError struct {
+	Command string // "RTR" or "PPR"
+	Result  cx.Result
+}
+
+func (e *RejectedError) Error() string { return "hss: " + e.Command + " answered " + e.Result.String() }
+
 func (p *Pusher) outcome(name string, ans *diameter.Message, err error, parse func(*diameter.Message) (cx.Result, error)) error {
+	if errors.Is(err, ErrNoSCSCF) {
+		// Counted apart from failures: it means no S-CSCF holds a
+		// connection to this task, which is a deployment fault (docs/hss.md,
+		// HSS-initiated requests), not an S-CSCF refusing.
+		p.metrics.Count("push."+name+".no_peer", 1)
+		return err
+	}
 	if err != nil {
 		p.metrics.Count("push."+name+".failed", 1)
 		return err
@@ -202,7 +217,7 @@ func (p *Pusher) outcome(name string, ans *diameter.Message, err error, parse fu
 	}
 	if !result.IsSuccess() {
 		p.metrics.Count("push."+name+".rejected", 1)
-		return fmt.Errorf("hss: %s answered %s", strings.ToUpper(name), result)
+		return &RejectedError{Command: strings.ToUpper(name), Result: result}
 	}
 	p.metrics.Count("push."+name+".sent", 1)
 	return nil

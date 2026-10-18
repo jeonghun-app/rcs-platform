@@ -152,6 +152,56 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 			h.log.Warn("could not notify the S-CSCF of a provisioning change",
 				pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
 		}
+		var rejected *RejectedError
+		if !ps.deregister && errors.As(err, &rejected) {
+			h.pprRejected(ctx, n, s, rejected.Result)
+		}
+	}
+}
+
+// pprRejected acts on a PPA failure as TS 29.228 §6.2.2.1 asks of an HSS
+// without restoration support:
+//
+//   - DIAMETER_ERROR_USER_UNKNOWN: the S-CSCF has lost the user, so the
+//     HSS's registration state is wrong; every identity becomes not
+//     registered (there is no other registered IMPI to retry with).
+//   - DIAMETER_ERROR_NOT_SUPPORTED_USER_DATA or TOO_MUCH_DATA: the S-CSCF
+//     keeps the old data and the HSS deregisters the user with
+//     SERVER_CHANGE, setting the state to not registered, so that the user
+//     registers again and gets an S-CSCF that takes the new data.
+func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result) {
+	if r.Vendor != cx.Vendor3GPP {
+		return
+	}
+	switch r.Code {
+	case cx.ErrorUserUnknown, cx.ErrorNotSupportedUserData, cx.ErrorTooMuchData:
+	default:
+		return
+	}
+	_, err := h.update(ctx, s.IMPI, func(cur *store.Subscription) error {
+		if !served(cur) && !cur.AuthPending && cur.ServerName == "" {
+			return errUnchanged
+		}
+		for i := range cur.PublicIdentities {
+			cur.PublicIdentities[i].State = store.NotRegistered
+		}
+		cur.AuthPending, cur.ServerName = false, ""
+		return nil
+	})
+	if err != nil {
+		h.log.Warn("could not mark a user the S-CSCF refused as not registered", pii.Identity("impi", s.IMPI),
+			slog.String("error", pii.Redact(err.Error())))
+		return
+	}
+	if r.Code == cx.ErrorUserUnknown {
+		h.metrics.Count("push.ppr.user_unknown", 1)
+		return
+	}
+	h.metrics.Count("push.ppr.data_refused", 1)
+	err = n.Deregister(ctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
+	if err != nil {
+		h.log.Warn("could not deregister a user whose S-CSCF refused new data", pii.Identity("impi", s.IMPI),
+			slog.String("error", pii.Redact(err.Error())))
 	}
 }
 

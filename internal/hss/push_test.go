@@ -103,13 +103,17 @@ func TestPushFailsWithoutAnSCSCFAndOnARejection(t *testing.T) {
 	n := serveHSS(t, e.h, "hss-a.rcs.local")
 	connectCSCF(t, n, "icscf-1.rcs.local")
 	p := pusherOn(n)
+	m := &countingMetrics{}
+	p.metrics = m
 	err := p.Deregister(context.Background(), &cx.RTR{UserName: impi1})
-	if !errors.Is(err, ErrNoSCSCF) {
-		t.Fatalf("without an S-CSCF: %v", err)
+	if !errors.Is(err, ErrNoSCSCF) || m.get("push.rtr.no_peer") != 1 || m.get("push.rtr.failed") != 0 {
+		t.Fatalf("without an S-CSCF: %v, metrics %v", err, m.counts)
 	}
 	scscf := connectCSCF(t, n, "scscf-1.rcs.local")
 	scscf.setAnswer(exp(cx.ErrorUserUnknown))
-	if err := p.PushProfile(context.Background(), &cx.PPR{UserName: impi1, UserData: []byte("<x/>")}); err == nil || !strings.Contains(err.Error(), "5001") {
+	err = p.PushProfile(context.Background(), &cx.PPR{UserName: impi1, UserData: []byte("<x/>")})
+	var rejected *RejectedError
+	if !errors.As(err, &rejected) || rejected.Result != exp(cx.ErrorUserUnknown) || !strings.Contains(err.Error(), "5001") {
 		t.Fatalf("rejected PPR: %v", err)
 	}
 	scscf.setBusy(true)
