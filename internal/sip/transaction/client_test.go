@@ -179,6 +179,9 @@ func TestClientNonInviteTransitions(t *testing.T) {
 		{name: "a failed retransmission is a transport error", network: transport.UDP,
 			steps:    []clientStep{failSends(), wait(DefaultT1)},
 			wantSent: []string{"MESSAGE"}, wantTU: []string{"error: " + errNetwork.Error()}, wantState: Terminated},
+		{name: "Proceeding: a failed retransmission is a transport error", network: transport.UDP,
+			steps:    []clientStep{recv(100), failSends(), wait(DefaultT1)},
+			wantSent: []string{"MESSAGE"}, wantTU: []string{"100", "error: " + errNetwork.Error()}, wantState: Terminated},
 	})
 }
 

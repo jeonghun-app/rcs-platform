@@ -208,7 +208,7 @@ func (tx *ClientTransaction) receiveInvite(res *sip.Response) func() {
 			ack, err := buildACK(tx.req, res)
 			if err == nil {
 				tx.ack = ack
-				_, err = l.sender.SendRequest(ack, tx.ackDestination())
+				_, err = l.sender.SendRequest(ack, tx.ackDestination(), transport.NoWait)
 			}
 			if err != nil {
 				// The TU still learns the final response; the server will
@@ -227,7 +227,7 @@ func (tx *ClientTransaction) receiveInvite(res *sip.Response) func() {
 		switch {
 		case code >= 300 && tx.ack != nil:
 			// A retransmitted final response means the ACK was lost (§17.1.1.2).
-			if _, err := l.sender.SendRequest(tx.ack, tx.ackDestination()); err != nil {
+			if _, err := l.sender.SendRequest(tx.ack, tx.ackDestination(), transport.NoWait); err != nil {
 				tx.terminate()
 			}
 		case code >= 200 && code < 300:

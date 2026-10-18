@@ -74,7 +74,7 @@ func (tx *ServerTransaction) sendTrying() error {
 	if err != nil {
 		return err
 	}
-	return tx.send(res)
+	return tx.send(res, transport.NoWait)
 }
 
 // Request returns the request that created the transaction.
@@ -105,8 +105,8 @@ func (tx *ServerTransaction) responseToTag() string {
 
 // send passes a response to the transport and remembers it for retransmission.
 // mu must be held.
-func (tx *ServerTransaction) send(res *sip.Response) error {
-	if err := tx.l.sender.SendResponse(res, tx.src); err != nil {
+func (tx *ServerTransaction) send(res *sip.Response, opts ...transport.SendOption) error {
+	if err := tx.l.sender.SendResponse(res, tx.src, opts...); err != nil {
 		return err
 	}
 	tx.last = res
@@ -252,7 +252,7 @@ func (tx *ServerTransaction) receive(req *sip.Request, from transport.Source) bo
 			// A retransmitted request is answered with the last response sent
 			// (§17.2.1, §17.2.2). In Accepted the TU retransmits the 2xx, so the
 			// request is absorbed (RFC 6026 §7.1).
-			if err := tx.l.sender.SendResponse(tx.last, tx.src); err != nil {
+			if err := tx.l.sender.SendResponse(tx.last, tx.src, transport.NoWait); err != nil {
 				notify = tx.failed(err)
 			}
 		}
