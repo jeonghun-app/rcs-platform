@@ -96,10 +96,13 @@ a library package under `internal/`.
 ### 5.1 Registration
 
 1. Client → `pcscf` REGISTER. `pcscf` adds `Path` with its own instance address and
-   a flow token naming the client connection (RFC 5626 §5.3), and forwards to `icscf`.
+   a signed flow token naming the client connection (RFC 5626 §5.2, ADR 0005), and
+   forwards to `icscf`.
 2. `icscf` → `hss` UAR, receives the S-CSCF name or capabilities, forwards to that
    `scscf`.
-3. `scscf` → `hss` MAR, challenges with 401 (AKA: RAND/AUTN; Digest: nonce).
+3. `scscf` → `hss` MAR, stores the vector in `auth-challenges` and challenges with
+   401 (AKA: RAND/AUTN; Digest: nonce). The second REGISTER may reach another
+   `scscf` instance, which finds the vector there.
 4. Client re-REGISTERs with credentials; `scscf` verifies, sends SAR, stores the
    binding (contacts, Path, instance id, expiry) in the registrations table and
    returns 200 with `Service-Route` and `P-Associated-URI`.
@@ -150,7 +153,9 @@ store-and-forward, IMDN and group fan-out.
 |---|---|---|---|
 | Subscribers, credentials, service profiles, S-CSCF assignment | `hss` | DynamoDB `subscribers` | Secrets (Ki, OPc, digest HA1) encrypted at rest; never logged |
 | Registration bindings | `scscf` | DynamoDB `registrations` | Any `scscf` instance can serve any user; `Service-Route` names the service, not the instance |
-| Client connections (flows) | `pcscf` | instance memory | `Path` and `Record-Route` name the instance, so terminating and in-dialog requests reach the connection |
+| Authentication challenges, reg-event subscriptions | `scscf` | DynamoDB `auth-challenges`, `reg-subscriptions` | Second REGISTER and NOTIFY numbering work across instances (ADR 0005) |
+| Position in the iFC chain | `scscf` | signed parameter in the `Route` back to `scscf` | Original dialog identifier, HMAC with a key shared by `scscf` instances |
+| Client connections (flows) | `pcscf` | instance memory | `Path` and core-facing `Record-Route` name the instance; flow tokens are HMACs under a per-start key, unknown ones get 430 (ADR 0005) |
 | SIP transactions | every SIP service | instance memory | Responses follow `Via` back to the instance that sent the request |
 | Stored messages, group chat state | `rcs-as` | DynamoDB `messages`, `groupchats` | |
 | MSRP bindings | `msrp-relay` | DynamoDB `msrp-bindings` with TTL | |

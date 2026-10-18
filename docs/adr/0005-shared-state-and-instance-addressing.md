@@ -14,9 +14,43 @@ follows `Via`, a terminating request follows `Path`, an in-dialog request follow
   bindings and file metadata are in DynamoDB. A service instance keeps only
   transactions, connections and caches in memory.
 - `scscf` advertises its **service** name in `Service-Route` and `Record-Route`
-  and to the HSS as the S-CSCF name, so any instance can serve any user.
-- `pcscf` advertises its **instance** address (task private IP) in `Path` and
-  `Record-Route`, because the client's connection lives on that instance.
+  and to the HSS as the S-CSCF name, so any instance can serve any user. Each
+  instance still has its **own Diameter identity** (`Origin-Host` =
+  `scscf-<task id>.<namespace>`), because the HSS keeps one connection per peer
+  identity (RFC 6733 §5.6.4); only the S-CSCF *name* (`Server-Name`) is shared.
+  State `scscf` must carry across requests is therefore shared or carried in the
+  message, never kept in instance memory:
+  - **Authentication challenges**: the vector (or digest nonce state) issued with
+    a 401 is stored in DynamoDB `auth-challenges`, keyed by IMPI and the challenge
+    nonce, with a short expiry checked on read; the second REGISTER can land on
+    any instance. Reads are strongly consistent; a vector is deleted on first use
+    (conditional delete) so a RES cannot be replayed.
+  - **Position in the iFC chain**: when `scscf` forwards to an application server
+    it adds a `Route` back to itself whose URI parameter carries the original
+    dialog identifier (TS 24.229 §5.4.3.2/§5.4.3.3): the served user, session
+    case and next iFC priority, HMAC-signed with a key shared by all `scscf`
+    instances (Secrets Manager). Any instance can resume filter evaluation; a bad
+    signature is rejected with 403.
+  - **reg event subscriptions** (RFC 3680): stored in DynamoDB
+    `reg-subscriptions`; the NOTIFY CSeq and the reginfo `version` are allocated
+    with conditional atomic counters so two instances cannot reuse a number.
+- `pcscf` advertises its **instance** address (task private IP) in `Path` and in
+  the core-facing `Record-Route`, because the client's connection lives on that
+  instance. The flow token in `Path` (RFC 5626 §5.2) is an HMAC over the
+  connection identity (source address and port as reported by Proxy Protocol,
+  listener, and a per-connection counter) keyed by a **random key generated at
+  every start**. ECS can hand a dead task's IP to a new task; with a fresh key the
+  new task cannot mistake an old token for one of its own connections.
+  - An unknown or invalid token, or a token for a closed connection, is answered
+    with **430 Flow Failed** (RFC 5626 §5.3).
+  - On 430 `scscf` removes only that binding (contact + flow) from the
+    registration and tries the user's remaining contacts.
+  - When every contact fails, `rcs-as` stores the message for later delivery
+    instead of failing it.
+  - The client-facing `Record-Route` (the one the client copies into its route
+    set) names the public `pcscf` address, so the client never sees or uses a
+    private IP; the core-facing entry names the instance (double Record-Route,
+    RFC 5658).
 - `rcs-as` advertises its instance address in `Record-Route`/`Contact` and in
   MSRP paths, because the MSRP session lives on that instance.
 

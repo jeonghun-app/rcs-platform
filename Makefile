@@ -4,7 +4,8 @@
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 IMAGE    ?= rcs-platform
-GOIMAGE  ?= golang:1.26.8-alpine3.23
+# The Go version is pinned in deploy/toolchain.Dockerfile (pinned Go image + gcc) (deploy/toolchain.Dockerfile); rebuilt when the file changes.
+GOIMAGE  ?= rcs-platform-go:$(shell cat deploy/toolchain.Dockerfile 2>/dev/null | sha256sum | cut -c1-12)
 DOCKER   ?= docker
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 
@@ -36,10 +37,15 @@ help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
+.PHONY: toolchain
+toolchain:
+	@$(DOCKER) image inspect $(GOIMAGE) >/dev/null 2>&1 || \
+	  $(DOCKER) build -q -f deploy/toolchain.Dockerfile -t $(GOIMAGE) deploy >/dev/null
+
 # The cache volumes are created root-owned; hand them to the calling user once so
 # the toolchain container can run unprivileged.
 .PHONY: volumes
-volumes:
+volumes: toolchain
 	@$(DOCKER) run --rm -v $(GOCACHE_VOL):/gocache -v $(GOMOD_VOL):/gomodcache \
 	  $(GOIMAGE) chown -R $(shell id -u):$(shell id -g) /gocache /gomodcache
 
@@ -65,10 +71,7 @@ test: volumes ## Unit tests with coverage summary
 
 .PHONY: race
 race: volumes ## Unit tests under the race detector
-	$(DOCKER) run --rm -v $(CURDIR):/src -w /src -v $(GOCACHE_VOL):/gocache -v $(GOMOD_VOL):/gomodcache \
-	  -e GOCACHE=/gocache -e GOMODCACHE=/gomodcache -e GOFLAGS=-buildvcs=false -e CGO_ENABLED=1 \
-	  $(GOIMAGE) sh -c 'apk add --no-cache gcc musl-dev >/dev/null && go test -race ./... -count=1 && \
-	  chown -R $(shell id -u):$(shell id -g) /gocache /gomodcache'
+	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
 # Every Fuzz* function in the module runs for FUZZTIME. Go allows one fuzz target
 # per invocation, hence the loop.

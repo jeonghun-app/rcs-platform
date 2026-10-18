@@ -19,6 +19,14 @@ gateway controlled by the P-CSCF (TS 23.334).
   connect to the relay; the relay always connects to `rcs-as`.
 - Bindings are stored in DynamoDB with a TTL and keyed by the session id in the
   relay URI, so any relay task can accept any client connection.
+  - The session id carries at least 128 random bits (base32), so it cannot be
+    guessed; it is the only thing that ties a client connection to a binding.
+  - Lookups use **strongly consistent reads**: a client may connect milliseconds
+    after another task wrote the binding.
+  - The binding stores its own expiry and the relay checks it on read; DynamoDB
+    TTL deletion can lag by days and only keeps the table small.
+  - A binding accepts one client connection; a second connection presenting the
+    same session id is refused with a 403 and logged.
 - RFC 4976 relay mode (AUTH) is an optional later feature for clients that ask for
   it.
 
@@ -32,7 +40,9 @@ RCS and keeps the client unaware of the relay.
 
 - `pcscf` must rewrite SDP correctly in offers and answers, initial and re-INVITE,
   and release bindings on BYE, CANCEL, failure responses and session timer expiry.
-- A client that insists on `a=setup:passive` in its answer cannot be served; the
-  relay answers with a 488 through `pcscf`. Recorded as a limitation.
+- A client that offers `a=setup:passive` when it originates a session asks the
+  network to connect to it, which the relay never does. `pcscf` answers such an
+  offer with 488 Not Acceptable Here. RCS clients normally offer `active` or
+  `actpass`; recorded as a limitation.
 - `rcs-as` offers `a=setup:passive` on terminating sessions so the relay can
   connect to it.

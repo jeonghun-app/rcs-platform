@@ -1,29 +1,44 @@
 #!/usr/bin/env bash
 #
-# Refuse any 15- or 16-digit identifier that is not on the allow-list.
+# Refuse any subscriber-identifier-shaped number that is not on the allow-list.
 #
-# A 15-digit literal in this repository is most likely an IMSI, and an IMSI is
-# subscriber-identifying data that must never be committed. The allow-list is
-# .github/allowed-test-identifiers.txt, which documents why each entry is safe.
+# A 15- or 16-digit literal is most likely an IMSI or IMEI, and a "+" followed by
+# 10-15 digits is most likely an E.164 phone number. Both identify a subscriber and
+# must never be committed. The allow-list is .github/allowed-test-identifiers.txt,
+# which documents why each entry is safe. Every tracked file is scanned.
 #
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "error: not a git work tree; the check scans tracked files and cannot run" >&2
+  exit 2
+fi
+
 ALLOWLIST=".github/allowed-test-identifiers.txt"
 if [[ ! -f "$ALLOWLIST" ]]; then
   echo "error: $ALLOWLIST is missing" >&2
-  exit 1
+  exit 2
 fi
 
-allowed="$(grep -oE '^[0-9]{14,16}' "$ALLOWLIST" | sort -u)"
+allowed="$(grep -oE '^\+?[0-9]{10,16}' "$ALLOWLIST" | sort -u)"
 
-found="$(git grep -hIoE '\b[0-9]{15,16}\b' -- \
-  'cmd' 'internal' 'tools' 'scripts' 'docs' 'infra' 'deploy' '*.go' '*.md' '*.yml' '*.yaml' '*.json' \
-  ':!.github/allowed-test-identifiers.txt' 2>/dev/null | sort -u || true)"
+# git grep exits 1 when nothing matches; anything above 1 is a real failure.
+scan() {
+  local rc=0 out
+  out="$(git grep -hIoE "$1" -- ':!.github/allowed-test-identifiers.txt' ':!go.sum')" || rc=$?
+  if (( rc > 1 )); then
+    echo "error: git grep failed ($rc)" >&2
+    exit 2
+  fi
+  printf '%s\n' "$out"
+}
+
+found="$( { scan '\b[0-9]{15,16}\b'; scan '\+[0-9]{10,15}\b'; } | grep -E '^\+?[0-9]+$' | sort -u || true)"
 
 if [[ -z "$found" ]]; then
-  echo "no long numeric identifiers found"
+  echo "no subscriber-shaped identifiers found"
   exit 0
 fi
 
@@ -35,12 +50,12 @@ if [[ -n "$unexpected" ]]; then
   cat >&2 <<'HINT'
 
 If these are test data, add them to .github/allowed-test-identifiers.txt with a
-comment explaining why they are safe. Prefer MCC 001 (the reserved test network).
-If any of them is a real subscriber identifier, remove it — and rewrite history
-before pushing.
+comment explaining why they are safe: IMSIs from MCC 001, phone numbers from the
+fictional ranges listed there. If any of them is a real subscriber identifier,
+remove it and rewrite history before pushing.
 HINT
   exit 1
 fi
 
 count="$(echo "$found" | grep -c . || true)"
-echo "all $count long identifiers are on the allow-list"
+echo "all $count identifiers are on the allow-list"
