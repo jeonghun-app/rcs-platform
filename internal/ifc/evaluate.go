@@ -295,20 +295,30 @@ const (
 	patternWhole                            // match the whole field
 )
 
+// posixFlags make Go's parser read a pattern as an ERE is read by POSIX
+// regcomp without REG_NEWLINE, which is what TS 29.228 Annex F refers to:
+// "." and a negated bracket expression match a newline too, and "^" and "$"
+// match only at the ends of the value. Go's plain POSIX flags would read
+// them line by line.
+const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
+
 // compilePattern compiles a POSIX extended regular expression (TS 29.228
-// Annex F). The pattern is first parsed with Go's POSIX syntax, which refuses
-// the Perl extensions (\d, (?i), non-greedy repetition and so on) a pattern
-// written for another HSS would not contain; it is then compiled with Go's
-// engine, whose matching time is linear in the input. Only whether a pattern
-// matches is used, so leftmost-longest and leftmost-first semantics give the
-// same answers.
+// Annex F). The pattern is parsed as an ERE, which refuses Perl extensions
+// such as \d and (?i), and the parsed tree, not the source text, is what gets
+// compiled: Go's matcher reads Perl syntax, in which some valid EREs mean
+// something else. "0+?" is (0+)? in an ERE, which matches the empty value,
+// but the lazy 0+? in Perl, which needs a 0 (#61). The tree is written out in
+// Go's own syntax with every flag explicit, and the text is parsed back and
+// compared with the tree, so a pattern whose meaning could not be kept
+// exactly is refused rather than compiled into something else.
 //
 // The program size is estimated from the parse tree before anything is
 // expanded, so a pattern such as "[ab]{1000}" repeated is refused without
 // building its program, and then counted exactly against
 // MaxPatternInstructions and the set's remaining budget.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
-	if _, err := syntax.Parse(source, syntax.POSIX); err != nil {
+	tree, err := syntax.Parse(source, posixFlags)
+	if err != nil {
 		var se *syntax.Error
 		if errors.As(err, &se) {
 			return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
@@ -316,24 +326,30 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 		return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression", name)
 	}
 	if mode&patternWhole == 0 {
-		source = withoutOuterDotStar(source)
+		tree = withoutOuterDotStar(tree)
 	}
-	expr := "(?:" + source + ")"
+	body := tree.String()
+	if back, err := syntax.Parse(body, syntax.Perl); err != nil || !back.Equal(tree) {
+		return pattern{}, fmt.Errorf("%s cannot be compiled without changing its meaning", name)
+	}
+	// Case folding is applied around the proven text, so that it cannot
+	// change the structure the comparison above checked.
+	expr := "(?:" + body + ")"
 	if mode&patternFoldCase != 0 {
-		expr = "(?i:" + source + ")"
+		expr = "(?i:" + body + ")"
 	}
 	if mode&patternWhole != 0 {
 		expr = "^" + expr + "$"
 	}
-	tree, err := syntax.Parse(expr, syntax.Perl)
+	perl, err := syntax.Parse(expr, syntax.Perl)
 	if err != nil {
 		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
 	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
-	if estimateSize(tree) > 4*MaxPatternInstructions {
+	if estimateSize(perl) > 4*MaxPatternInstructions {
 		return pattern{}, tooComplex
 	}
-	prog, err := syntax.Compile(tree.Simplify())
+	prog, err := syntax.Compile(perl.Simplify())
 	if err != nil {
 		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
@@ -379,30 +395,37 @@ func isPlainToken(s string) bool {
 // matchesSomething reports whether a Content pattern restricts the value at
 // all; an empty one, or ".*", is the same as no Content.
 func matchesSomething(content string) bool {
-	return content != "" && withoutOuterDotStar(content) != ""
+	tree, err := syntax.Parse(content, posixFlags)
+	if err != nil {
+		return true // compilePattern reports the error
+	}
+	return withoutOuterDotStar(tree).Op != syntax.OpEmptyMatch
 }
 
-// withoutOuterDotStar drops a leading and a trailing ".*" from a pattern
-// that is searched for anywhere in its field. Operators often write ".*X.*"
-// for "contains X"; in an unanchored search the two are the same as long as
-// the field has no newline, which "." does not match, and none has one:
-// header values are collapsed, SDP lines are split at line ends, and a SIP
-// parser refuses a line break in a Request-URI. Without the ".*", a literal X
-// is found with a substring search instead of the full engine. Only the
-// compiled form changes; the criteria keep the pattern as provisioned.
-func withoutOuterDotStar(source string) string {
-	tree, err := syntax.Parse(source, syntax.POSIX)
-	if err != nil {
-		return source
-	}
+// withoutOuterDotStar drops a leading and a trailing ".*" from the tree of a
+// pattern that is searched for anywhere in its field. Operators often write
+// ".*X.*" for "contains X"; without the ".*", a literal X is found with a
+// substring search instead of the full engine. Only the compiled form
+// changes; the criteria keep the pattern as provisioned.
+//
+// The two match the same values. "." matches every character (posixFlags),
+// so if P matches at some position of a value, ".*P" matches from its start
+// with ".*" taking what precedes P, and every match of ".*P" contains one of
+// P after the ".*"; any anchor in P is checked at the same position either
+// way. The same holds at the end. Only the operands of the top-level
+// concatenation are dropped, and only when they are exactly a star over a
+// dot: ".*a|b" is an alternation and keeps its ".*", and ".*?", which an ERE
+// reads as (.*)?, is left alone.
+func withoutOuterDotStar(tree *syntax.Regexp) *syntax.Regexp {
 	dotStar := func(re *syntax.Regexp) bool {
-		return re.Op == syntax.OpStar && (re.Sub[0].Op == syntax.OpAnyCharNotNL || re.Sub[0].Op == syntax.OpAnyChar)
+		return re.Op == syntax.OpStar && (re.Sub[0].Op == syntax.OpAnyChar || re.Sub[0].Op == syntax.OpAnyCharNotNL)
 	}
+	empty := &syntax.Regexp{Op: syntax.OpEmptyMatch, Flags: tree.Flags}
 	if dotStar(tree) {
-		return ""
+		return empty
 	}
 	if tree.Op != syntax.OpConcat {
-		return source
+		return tree
 	}
 	subs := tree.Sub
 	for len(subs) > 0 && dotStar(subs[0]) {
@@ -411,11 +434,15 @@ func withoutOuterDotStar(source string) string {
 	for len(subs) > 0 && dotStar(subs[len(subs)-1]) {
 		subs = subs[:len(subs)-1]
 	}
-	if len(subs) == len(tree.Sub) {
-		return source
+	switch len(subs) {
+	case len(tree.Sub):
+		return tree
+	case 0:
+		return empty
+	case 1:
+		return subs[0]
 	}
-	stripped := &syntax.Regexp{Op: syntax.OpConcat, Sub: subs}
-	return stripped.String()
+	return &syntax.Regexp{Op: syntax.OpConcat, Flags: tree.Flags, Sub: subs}
 }
 
 // estimateSize is an upper bound on the instructions syntax.Compile emits for

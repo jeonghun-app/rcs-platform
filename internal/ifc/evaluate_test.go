@@ -3,6 +3,7 @@ package ifc
 import (
 	"errors"
 	"reflect"
+	"regexp/syntax"
 	"runtime"
 	"slices"
 	"strconv"
@@ -747,12 +748,25 @@ func TestOuterDotStarChangesNeitherTheResultNorTheCost(t *testing.T) {
 			}
 		}
 	}
-	// A ".*" inside the pattern, or a lone one, is kept or means "anything".
-	if got := withoutOuterDotStar("a.*b"); got != "a.*b" {
-		t.Errorf("inner .* changed: %q", got)
+	// A ".*" inside the pattern, or in an alternation, is kept; a lone one
+	// means "anything", and ".*?" is the ERE (.*)? and is kept too.
+	strip := func(p string) string {
+		tree, err := syntax.Parse(p, posixFlags)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return withoutOuterDotStar(tree).String()
 	}
-	if got := withoutOuterDotStar(".*"); got != "" {
-		t.Errorf(".* alone = %q, want empty", got)
+	for p, want := range map[string]string{
+		"a.*b":    "(?s:a.*b)",
+		".*a|b.*": "(?s:.*a|b.*)",
+		".*":      "(?:)",
+		".*?a":    "(?s:(?:.*)?a)",
+		".*0+?.*": "(?:0+)?",
+	} {
+		if got := strip(p); got != want {
+			t.Errorf("stripping %q = %q, want %q", p, got, want)
+		}
 	}
 	// The criteria keep the pattern as provisioned.
 	fc := contentCriteria(".*chat.*")
