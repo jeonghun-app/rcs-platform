@@ -1,0 +1,775 @@
+package diameter
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+// watchdogState is the RFC 3539 §3.4.1 state of an open connection. INITIAL
+// and DOWN have no connection, so they are represented by the peer having
+// none.
+type watchdogState uint8
+
+const (
+	watchdogOkay watchdogState = iota
+	watchdogSuspect
+	watchdogReopen
+)
+
+var (
+	errWatchdogExpired = errors.New("diameter: watchdog expired with no answer from the peer")
+	errDuplicatePeer   = errors.New("diameter: peer identity already has an open connection")
+	errPeerDisconnect  = errors.New("diameter: peer sent DPR and did not close the connection")
+)
+
+type result struct {
+	m   *Message
+	err error
+}
+
+type pendingRequest struct {
+	code  uint32
+	ch    chan result // buffered: the single completion never blocks
+	timer Timer
+}
+
+// conn is one transport connection to a peer, from the capabilities exchange
+// until it closes. Three goroutines serve an open connection: the read loop
+// (which also dispatches requests), the writer, and the watchdog. The read
+// loop never writes to the socket, so two nodes that both answer while
+// neither reads cannot block each other's read loops.
+type conn struct {
+	node *Node
+	nc   net.Conn
+	br   *bufio.Reader
+
+	// Set during the capabilities exchange, read-only afterwards.
+	peer *Peer
+	caps capabilities
+	apps []uint32
+
+	writes   chan []byte
+	inflight chan struct{}
+	wdFire   chan struct{}
+	done     chan struct{}
+	ctx      context.Context // handlers' context; ends at close
+	cancel   context.CancelFunc
+	once     sync.Once
+
+	mu          sync.Mutex
+	closed      bool
+	running     bool
+	pending     map[uint32]*pendingRequest
+	hopByHop    uint32
+	state       watchdogState
+	dwrPending  bool
+	numDWA      int
+	wdDeadline  time.Time
+	wdTimer     Timer
+	closing     bool // DPR sent or received: no new requests either way
+	remoteCause int32
+	gotDPR      bool
+}
+
+func newConn(n *Node, nc net.Conn) *conn {
+	c := &conn{
+		node:     n,
+		nc:       nc,
+		br:       bufio.NewReader(nc),
+		writes:   make(chan []byte, n.cfg.MaxInFlight),
+		inflight: make(chan struct{}, n.cfg.MaxInFlight),
+		wdFire:   make(chan struct{}, 1),
+		done:     make(chan struct{}),
+		pending:  make(map[uint32]*pendingRequest),
+		hopByHop: uint32(n.cfg.Random()),
+	}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	return c
+}
+
+func (c *conn) remote() string { return c.nc.RemoteAddr().String() }
+
+func (c *conn) nextHopByHop() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h := c.hopByHop
+	c.hopByHop++
+	return h
+}
+
+func addrOf(a net.Addr) netip.Addr {
+	if t, ok := a.(*net.TCPAddr); ok {
+		return t.AddrPort().Addr().Unmap()
+	}
+	if ap, err := netip.ParseAddrPort(a.String()); err == nil {
+		return ap.Addr().Unmap()
+	}
+	return netip.Addr{}
+}
+
+// accept runs the responder side of a new inbound connection to its end.
+func (n *Node) accept(nc net.Conn) {
+	c := newConn(n, nc)
+	if !n.register(c) {
+		_ = nc.Close()
+		return
+	}
+	if err := c.answerCapabilities(); err != nil {
+		c.close(err)
+		return
+	}
+	c.run()
+}
+
+// answerCapabilities reads the CER and answers it (RFC 6733 §5.3). Anything
+// other than a CER first is a reason to close; a CER that fails a check is
+// answered with the reason, and the connection is closed by the caller.
+func (c *conn) answerCapabilities() error {
+	n := c.node
+	// The timer also bounds writing the CEA, so a peer that connects and
+	// never reads cannot hold the goroutine.
+	t := n.cfg.Clock.AfterFunc(n.cfg.CapabilitiesTimeout, func() { _ = c.nc.Close() })
+	defer t.Stop()
+
+	m, err := ReadMessage(c.br, n.cfg.Dictionary, n.cfg.Limits)
+	var derr *Error
+	if errors.As(err, &derr) && isCER(m) {
+		return c.rejectCER(m, derr)
+	}
+	if err != nil {
+		return err
+	}
+	if !isCER(m) {
+		return fmt.Errorf("diameter: expected CER, got command %d", m.Code)
+	}
+	caps, derr := parseCapabilities(m, n.cfg.Dictionary)
+	if derr != nil {
+		return c.rejectCER(m, derr)
+	}
+	if !n.accepts(caps, addrOf(c.nc.RemoteAddr())) {
+		n.log.Warn("diameter peer rejected: no accept rule matches",
+			"peer_host", caps.host, "peer_realm", caps.realm, "remote", c.remote())
+		return c.rejectCER(m, &Error{ResultCode: ResultUnknownPeer})
+	}
+	if !securityAcceptable(caps.inbandSecurity) {
+		return c.rejectCER(m, &Error{ResultCode: ResultNoCommonSecurity})
+	}
+	apps := commonApplications(n.cfg.Applications, caps.authApps)
+	if len(apps) == 0 {
+		return c.rejectCER(m, &Error{ResultCode: ResultNoCommonApplication})
+	}
+	c.setPeer(&Peer{}, caps, apps)
+	if !n.open(c, c.peer) {
+		// No election (§5.6.4): this node never initiates to a peer that
+		// may initiate to it, so a second connection from one identity is a
+		// stale or misconfigured one. The existing connection's watchdog
+		// removes it if it is dead, and the peer retries.
+		c.setPeer(nil, caps, apps)
+		return c.rejectCER(m, &Error{ResultCode: ResultUnableToComply, Message: "peer already connected"})
+	}
+	cea := n.NewAnswer(m, ResultSuccess, n.capabilityAVPs(addrOf(c.nc.LocalAddr()))...)
+	return c.writeNow(cea)
+}
+
+func isCER(m *Message) bool {
+	return m != nil && m.IsRequest() && m.Code == CodeCapabilitiesExchange && m.ApplicationID == AppCommon
+}
+
+// rejectCER answers a CER with a failure and returns the reason the
+// connection closes.
+func (c *conn) rejectCER(m *Message, e *Error) error {
+	n := c.node
+	var extra []*AVP
+	if e.Message != "" {
+		extra = append(extra, NewAVP(AVPErrorMessage, 0, 0, []byte(e.Message)))
+	}
+	if e.FailedAVP != nil {
+		extra = append(extra, NewGrouped(AVPFailedAVP, FlagMandatory, 0, e.FailedAVP))
+	}
+	cea := n.NewAnswer(m, e.ResultCode, append(n.capabilityAVPs(addrOf(c.nc.LocalAddr())), extra...)...)
+	if err := c.writeNow(cea); err != nil {
+		return err
+	}
+	return fmt.Errorf("diameter: capabilities exchange refused: %w", e)
+}
+
+// writeNow writes before the writer goroutine runs.
+func (c *conn) writeNow(m *Message) error {
+	b, err := m.Encode()
+	if err != nil {
+		return err
+	}
+	_, err = c.nc.Write(b)
+	return err
+}
+
+func (n *Node) accepts(caps capabilities, src netip.Addr) bool {
+	return slices.ContainsFunc(n.cfg.Accept, func(r PeerRule) bool {
+		return r.matches(caps.host, caps.realm, src)
+	})
+}
+
+// initiate dials a configured peer and runs the initiator side of the
+// capabilities exchange. On success the connection is open and served in the
+// background.
+func (n *Node) initiate(p *Peer, reopen bool) (*conn, error) {
+	dctx, cancel := context.WithCancel(n.ctx)
+	t := n.cfg.Clock.AfterFunc(n.cfg.CapabilitiesTimeout, cancel)
+	nc, err := n.cfg.Dial(dctx, "tcp", p.cfg.Address)
+	t.Stop()
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	c := newConn(n, nc)
+	if !n.register(c) {
+		_ = nc.Close()
+		return nil, ErrNodeClosed
+	}
+	if err := c.requestCapabilities(p); err != nil {
+		c.close(err)
+		return nil, err
+	}
+	if reopen {
+		// After a failure the connection must earn its way back with three
+		// watchdog exchanges before it carries traffic (RFC 3539 §3.4.1).
+		c.mu.Lock()
+		c.state, c.dwrPending = watchdogReopen, true
+		c.mu.Unlock()
+	}
+	if !n.open(c, p) {
+		c.close(errDuplicatePeer)
+		return nil, errDuplicatePeer
+	}
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		c.run()
+	}()
+	return c, nil
+}
+
+// requestCapabilities sends the CER and checks the CEA (RFC 6733 §5.3).
+func (c *conn) requestCapabilities(p *Peer) error {
+	n := c.node
+	t := n.cfg.Clock.AfterFunc(n.cfg.CapabilitiesTimeout, func() { _ = c.nc.Close() })
+	defer t.Stop()
+
+	cer := &Message{
+		Flags:         FlagRequest,
+		Code:          CodeCapabilitiesExchange,
+		ApplicationID: AppCommon,
+		HopByHop:      c.nextHopByHop(),
+		EndToEnd:      n.nextEndToEnd(),
+	}
+	cer.Add(n.originAVPs()...)
+	cer.Add(n.capabilityAVPs(addrOf(c.nc.LocalAddr()))...)
+	if err := c.writeNow(cer); err != nil {
+		return err
+	}
+	m, err := ReadMessage(c.br, n.cfg.Dictionary, n.cfg.Limits)
+	if err != nil {
+		return err
+	}
+	if m.IsRequest() || m.Code != CodeCapabilitiesExchange || m.HopByHop != cer.HopByHop {
+		return fmt.Errorf("diameter: expected CEA, got command %d", m.Code)
+	}
+	if rc, ok := m.ResultCode(); !ok || rc != ResultSuccess {
+		return fmt.Errorf("diameter: capabilities exchange refused by peer: %w", &Error{ResultCode: rc})
+	}
+	caps, derr := parseCapabilities(m, n.cfg.Dictionary)
+	if derr != nil {
+		return derr
+	}
+	if p.cfg.Host != "" && !strings.EqualFold(p.cfg.Host, caps.host) {
+		return fmt.Errorf("diameter: peer at %s is %s, configured as %s", p.cfg.Address, caps.host, p.cfg.Host)
+	}
+	if p.cfg.Realm != "" && !strings.EqualFold(p.cfg.Realm, caps.realm) {
+		return fmt.Errorf("diameter: peer at %s is in realm %s, configured as %s", p.cfg.Address, caps.realm, p.cfg.Realm)
+	}
+	if !securityAcceptable(caps.inbandSecurity) {
+		return errors.New("diameter: peer requires in-band security")
+	}
+	apps := commonApplications(n.cfg.Applications, caps.authApps)
+	if len(apps) == 0 {
+		return errors.New("diameter: peer has no application in common")
+	}
+	c.setPeer(p, caps, apps)
+	return nil
+}
+
+// setPeer records the outcome of the capabilities exchange. It takes the lock
+// because Shutdown may close the connection concurrently; once the connection
+// is open the fields no longer change and are read without it.
+func (c *conn) setPeer(p *Peer, caps capabilities, apps []uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.peer, c.caps, c.apps = p, caps, apps
+}
+
+// run serves an open connection until it closes.
+func (c *conn) run() {
+	n := c.node
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.running = true
+	reopen := c.state == watchdogReopen
+	c.armWatchdogLocked(n.cfg.Clock.Now())
+	c.mu.Unlock()
+	n.log.Info("diameter peer open", "peer_host", c.caps.host, "peer_realm", c.caps.realm,
+		"remote", c.remote(), "applications", c.apps, "reopen", reopen)
+
+	n.wg.Add(2)
+	go func() {
+		defer n.wg.Done()
+		c.writeLoop()
+	}()
+	go func() {
+		defer n.wg.Done()
+		c.watchdogLoop()
+	}()
+	if reopen {
+		c.sendDWR()
+	}
+	c.readLoop()
+}
+
+// close ends the connection once: it fails every pending request, cancels
+// handlers and removes the connection from the node.
+func (c *conn) close(reason error) {
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		pending := c.pending
+		c.pending = nil
+		if c.wdTimer != nil {
+			c.wdTimer.Stop()
+		}
+		running := c.running
+		peer, host := c.peer, c.caps.host
+		c.mu.Unlock()
+
+		close(c.done)
+		c.cancel()
+		_ = c.nc.Close()
+		for _, p := range pending {
+			if p.timer != nil {
+				p.timer.Stop()
+			}
+			p.ch <- result{err: ErrConnectionClosed}
+		}
+		c.node.forget(c, peer, host)
+		if running {
+			c.node.log.Info("diameter peer closed", "peer_host", host, "remote", c.remote(), "reason", reason)
+		} else {
+			c.node.log.Info("diameter connection closed before capabilities exchange completed",
+				"remote", c.remote(), "reason", reason)
+		}
+	})
+}
+
+func (c *conn) available() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && !c.closing && c.state == watchdogOkay
+}
+
+func (c *conn) remoteDisconnectCause() (int32, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.remoteCause, c.gotDPR
+}
+
+// enqueue hands encoded bytes to the writer.
+func (c *conn) enqueue(ctx context.Context, b []byte) error {
+	select {
+	case c.writes <- b:
+		return nil
+	case <-c.done:
+		return ErrConnectionClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *conn) writeLoop() {
+	for {
+		select {
+		case b := <-c.writes:
+			if _, err := c.nc.Write(b); err != nil {
+				c.close(err)
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// reply sends an answer. An answer that cannot be encoded (a handler built
+// one larger than the protocol allows) is replaced by
+// DIAMETER_UNABLE_TO_COMPLY so the peer is not left waiting.
+func (c *conn) reply(req, ans *Message) {
+	b, err := ans.Encode()
+	if err != nil {
+		c.node.log.Error("diameter answer cannot be encoded", "command", req.Code,
+			"application", req.ApplicationID, "error", err)
+		b, err = c.node.errorAnswer(req, &Error{ResultCode: ResultUnableToComply}).Encode()
+		if err != nil {
+			return
+		}
+	}
+	_ = c.enqueue(context.Background(), b)
+}
+
+// roundTrip sends a request and waits for the matching answer. Base protocol
+// requests (internal) are sent even when the peer is not available.
+func (c *conn) roundTrip(ctx context.Context, req *Message, internal bool) (*Message, error) {
+	n := c.node
+	p := &pendingRequest{code: req.Code, ch: make(chan result, 1)}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, ErrConnectionClosed
+	}
+	if !internal && (c.closing || c.state != watchdogOkay) {
+		c.mu.Unlock()
+		return nil, ErrPeerUnavailable
+	}
+	req.Flags = (req.Flags | FlagRequest) &^ FlagError
+	req.HopByHop = c.hopByHop
+	c.hopByHop++
+	if req.EndToEnd == 0 {
+		req.EndToEnd = n.nextEndToEnd()
+	}
+	hbh := req.HopByHop
+	c.pending[hbh] = p
+	p.timer = n.cfg.Clock.AfterFunc(n.cfg.RequestTimeout, func() { c.complete(hbh, 0, result{err: ErrTimeout}) })
+	c.mu.Unlock()
+
+	b, err := req.Encode()
+	if err == nil {
+		err = c.enqueue(ctx, b)
+	}
+	if err != nil {
+		c.complete(hbh, 0, result{err: err})
+	}
+	select {
+	case r := <-p.ch:
+		return r.m, r.err
+	case <-ctx.Done():
+		c.complete(hbh, 0, result{err: ctx.Err()})
+		r := <-p.ch
+		return r.m, r.err
+	}
+}
+
+// complete delivers the outcome of a pending request once. A non-zero code
+// must match the request's command code: an answer to a different command
+// under the same identifier is not this request's answer.
+func (c *conn) complete(hbh, code uint32, r result) bool {
+	c.mu.Lock()
+	p, ok := c.pending[hbh]
+	if !ok || (code != 0 && p.code != code) {
+		c.mu.Unlock()
+		return false
+	}
+	delete(c.pending, hbh)
+	c.mu.Unlock()
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	p.ch <- r
+	return true
+}
+
+func (c *conn) readLoop() {
+	n := c.node
+	for {
+		m, err := ReadMessage(c.br, n.cfg.Dictionary, n.cfg.Limits)
+		var derr *Error
+		if err != nil && !errors.As(err, &derr) {
+			c.close(err)
+			return
+		}
+		process := c.received(m)
+		switch {
+		case derr != nil && m.IsRequest():
+			n.log.Warn("diameter request rejected", "peer_host", c.caps.host, "command", m.Code,
+				"application", m.ApplicationID, "result_code", derr.ResultCode)
+			c.reply(m, n.errorAnswer(m, derr))
+		case derr != nil:
+			c.complete(m.HopByHop, m.Code, result{err: derr})
+		case m.IsRequest():
+			c.handleRequest(m, process)
+		case process:
+			c.handleAnswer(m)
+		}
+	}
+}
+
+// received applies the RFC 3539 §3.4.1 events for a received message and
+// reports whether an application message may be processed: in REOPEN, they
+// are thrown away. Receipt resets the timer (SetWatchdog) in OKAY and SUSPECT
+// only; in REOPEN the timer keeps the DWR cadence.
+func (c *conn) received(m *Message) bool {
+	isDWA := !m.IsRequest() && m.ApplicationID == AppCommon && m.Code == CodeDeviceWatchdog
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case watchdogOkay:
+		c.wdDeadline = c.node.cfg.Clock.Now().Add(c.node.watchdogInterval())
+		if isDWA {
+			c.dwrPending = false
+		}
+	case watchdogSuspect:
+		c.wdDeadline = c.node.cfg.Clock.Now().Add(c.node.watchdogInterval())
+		c.dwrPending = c.dwrPending && !isDWA
+		c.state = watchdogOkay
+		c.node.log.Info("diameter peer recovered", "peer_host", c.caps.host)
+	case watchdogReopen:
+		if !isDWA {
+			return false
+		}
+		c.dwrPending = false
+		c.numDWA++
+		if c.numDWA >= reopenWatchdogsBeforeOpen {
+			c.state = watchdogOkay
+			c.node.log.Info("diameter peer reopened", "peer_host", c.caps.host)
+		}
+	}
+	return true
+}
+
+func (c *conn) handleAnswer(m *Message) {
+	if m.ApplicationID == AppCommon && m.Code == CodeDeviceWatchdog {
+		return // accounted for by received
+	}
+	if !c.complete(m.HopByHop, m.Code, result{m: m}) {
+		c.node.log.Debug("diameter answer matches no pending request", "peer_host", c.caps.host,
+			"command", m.Code, "application", m.ApplicationID)
+	}
+}
+
+func (c *conn) handleRequest(m *Message, process bool) {
+	n := c.node
+	if m.ApplicationID == AppCommon {
+		switch m.Code {
+		case CodeDeviceWatchdog:
+			c.reply(m, n.NewAnswer(m, ResultSuccess, NewAVP(AVPOriginStateID, FlagMandatory, 0, Unsigned32(n.cfg.OriginStateID))))
+		case CodeDisconnectPeer:
+			c.disconnected(m)
+		case CodeCapabilitiesExchange:
+			// Capabilities are exchanged once per connection; changing them
+			// later is a separate extension (RFC 6737).
+			c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToComply, Message: "capabilities already exchanged"}))
+		default:
+			c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultCommandUnsupported}))
+		}
+		return
+	}
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	if !process || closing {
+		// RFC 3539 discards application messages while reopening; answering
+		// instead lets the sender fail over at once rather than at its
+		// timeout. A closing connection takes no new work either (§5.4).
+		c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToDeliver}))
+		return
+	}
+	if !slices.Contains(c.apps, m.ApplicationID) {
+		c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultApplicationUnsupported}))
+		return
+	}
+	h, rc := n.handler(m.ApplicationID, m.Code)
+	if h == nil {
+		c.reply(m, n.errorAnswer(m, &Error{ResultCode: rc}))
+		return
+	}
+	select {
+	case c.inflight <- struct{}{}:
+	default:
+		c.reply(m, n.errorAnswer(m, &Error{ResultCode: ResultTooBusy}))
+		return
+	}
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer func() { <-c.inflight }()
+		c.serve(h, m)
+	}()
+}
+
+// serve runs a handler and sends its answer. A panicking handler is answered
+// with DIAMETER_UNABLE_TO_COMPLY instead of taking the whole node down with
+// every other peer's requests.
+func (c *conn) serve(h Handler, req *Message) {
+	n := c.node
+	defer func() {
+		if v := recover(); v != nil {
+			n.log.Error("diameter handler panicked", "command", req.Code, "application", req.ApplicationID,
+				"panic", fmt.Sprint(v))
+			c.reply(req, n.errorAnswer(req, &Error{ResultCode: ResultUnableToComply}))
+		}
+	}()
+	ans, err := h.ServeDiameter(c.ctx, c.peer, req)
+	var derr *Error
+	switch {
+	case errors.As(err, &derr):
+		ans = n.errorAnswer(req, derr)
+	case err != nil:
+		n.log.Error("diameter handler failed", "command", req.Code, "application", req.ApplicationID, "error", err)
+		ans = n.errorAnswer(req, &Error{ResultCode: ResultUnableToComply})
+	case ans == nil:
+		n.log.Error("diameter handler returned no answer", "command", req.Code, "application", req.ApplicationID)
+		ans = n.errorAnswer(req, &Error{ResultCode: ResultUnableToComply})
+	}
+	// The answer travels back on the request's identifiers whatever the
+	// handler set; the P bit mirrors the request (§6.2).
+	ans.Flags = ans.Flags&^(FlagRequest|FlagProxiable|FlagRetransmit) | req.Flags&FlagProxiable
+	ans.Code, ans.ApplicationID = req.Code, req.ApplicationID
+	ans.HopByHop, ans.EndToEnd = req.HopByHop, req.EndToEnd
+	c.reply(req, ans)
+}
+
+// disconnected answers a DPR (RFC 6733 §5.4). The sender closes the
+// connection on receiving the DPA; if it does not, this node closes it
+// after a grace period.
+func (c *conn) disconnected(dpr *Message) {
+	n := c.node
+	cause := DisconnectRebooting
+	if a := dpr.Find(AVPDisconnectCause, 0); a != nil {
+		cause, _ = a.Enumerated()
+	}
+	c.mu.Lock()
+	c.closing = true
+	c.gotDPR = true
+	c.remoteCause = cause
+	c.mu.Unlock()
+	n.log.Info("diameter peer disconnecting", "peer_host", c.caps.host, "disconnect_cause", cause)
+	c.reply(dpr, n.NewAnswer(dpr, ResultSuccess))
+	n.cfg.Clock.AfterFunc(disconnectWaitForPeerToDrop, func() { c.close(errPeerDisconnect) })
+}
+
+// disconnect sends DPR with the cause and closes the connection once the DPA
+// arrives, the request times out, or ctx ends (RFC 6733 §5.4).
+func (c *conn) disconnect(ctx context.Context, cause int32) {
+	c.mu.Lock()
+	ready := c.running && !c.closing && !c.closed
+	c.closing = true
+	c.mu.Unlock()
+	if ready {
+		dpr := &Message{Flags: FlagRequest, Code: CodeDisconnectPeer, ApplicationID: AppCommon}
+		dpr.Add(c.node.originAVPs()...)
+		dpr.Add(NewAVP(AVPDisconnectCause, FlagMandatory, 0, Enumerated(cause)))
+		_, _ = c.roundTrip(ctx, dpr, true)
+	}
+	c.close(ErrNodeClosed)
+}
+
+// armWatchdogLocked is SetWatchdog() of RFC 3539: Tw from now, jittered.
+func (c *conn) armWatchdogLocked(now time.Time) {
+	tw := c.node.watchdogInterval()
+	c.wdDeadline = now.Add(tw)
+	c.wdTimer = c.node.cfg.Clock.AfterFunc(tw, c.fireWatchdog)
+}
+
+// fireWatchdog runs on the clock's goroutine and must not block; the
+// watchdog loop does the work.
+func (c *conn) fireWatchdog() {
+	select {
+	case c.wdFire <- struct{}{}:
+	default:
+	}
+}
+
+func (c *conn) watchdogLoop() {
+	for {
+		select {
+		case <-c.wdFire:
+			c.watchdogExpired()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// watchdogExpired applies the timer-expiry events of RFC 3539 §3.4.1. Every
+// received message moves the deadline forward without touching the timer, so
+// an early expiry just re-arms for the remainder.
+func (c *conn) watchdogExpired() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	now := c.node.cfg.Clock.Now()
+	if now.Before(c.wdDeadline) {
+		c.wdTimer = c.node.cfg.Clock.AfterFunc(c.wdDeadline.Sub(now), c.fireWatchdog)
+		c.mu.Unlock()
+		return
+	}
+	send, drop := false, false
+	switch c.state {
+	case watchdogOkay:
+		if c.dwrPending {
+			// Failover: no new requests until the peer answers again.
+			c.state = watchdogSuspect
+			c.node.log.Warn("diameter peer suspect: watchdog unanswered", "peer_host", c.caps.host)
+		} else {
+			send, c.dwrPending = true, true
+		}
+	case watchdogSuspect:
+		drop = true
+	case watchdogReopen:
+		switch {
+		case !c.dwrPending:
+			send, c.dwrPending = true, true
+		case c.numDWA >= 0:
+			c.numDWA = -1
+		default:
+			drop = true
+		}
+	}
+	c.armWatchdogLocked(now)
+	c.mu.Unlock()
+	if drop {
+		c.close(errWatchdogExpired)
+		return
+	}
+	if send {
+		c.sendDWR()
+	}
+}
+
+// sendDWR sends a watchdog request. Its answer is not awaited: the watchdog
+// timer, not a request timeout, decides what a missing DWA means.
+func (c *conn) sendDWR() {
+	n := c.node
+	dwr := &Message{
+		Flags:         FlagRequest,
+		Code:          CodeDeviceWatchdog,
+		ApplicationID: AppCommon,
+		HopByHop:      c.nextHopByHop(),
+		EndToEnd:      n.nextEndToEnd(),
+	}
+	dwr.Add(n.originAVPs()...)
+	dwr.Add(NewAVP(AVPOriginStateID, FlagMandatory, 0, Unsigned32(n.cfg.OriginStateID)))
+	b, err := dwr.Encode()
+	if err != nil {
+		return
+	}
+	_ = c.enqueue(context.Background(), b)
+}
