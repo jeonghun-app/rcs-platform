@@ -31,6 +31,7 @@ a maintainer; behaviour built on it is listed as unverified in
 | TS 35.205 / 35.206 / 35.208 | Milenage algorithm set and test data | `hss` (`internal/milenage`) |
 | TS 23.003 | Numbering, addressing and identification | `internal/sip`, `hss` |
 | TS 23.334 | IMS-ALG and IMS-AGW | `pcscf`, `msrp-relay` |
+| TS 23.218 | IMS session handling: use of iFC and ServiceInfo by the S-CSCF | `scscf` (`internal/ifc`) |
 
 ## OMA
 
@@ -54,5 +55,13 @@ a maintainer; behaviour built on it is listed as unverified in
 | 5438 | Instant Message Disposition Notification (IMDN) |
 | 5626 | SIP outbound (flow tokens) |
 | 6733, 4006 | Diameter base protocol |
+| 4740 | Diameter SIP application: the Digest-* AVPs that Cx reuses (TS 29.229 §6.3.37 to §6.3.41) |
+| 3966 | tel URI: the telephone-subscriber that iFC Request-URI patterns match (TS 29.228 Annex F) |
 | 3539 | AAA transport profile: Diameter watchdog (DWR/DWA, Tw, REOPEN) |
 | 4330 | Simple Network Time Protocol: era rule for Diameter `Time` after 2036 |
+
+## Other
+
+| Document | Subject | Used by |
+|---|---|---|
+| IEEE Std 1003.1-2004 Part 1 §9 | POSIX extended regular expressions, the syntax of iFC patterns (TS 29.228 Annex F) | `internal/ifc` |
