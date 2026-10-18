@@ -87,6 +87,20 @@ jobs:
           persist-credentials: false
       - run: make test-integration
 
+  # The HSS store and its cross-task SQN allocation against a digest-pinned
+  # DynamoDB Local (make test-integration-hss). A job of its own, outside
+  # `make check`, because it starts a JVM container; its name is stable so it
+  # can be made a required check.
+  integration-hss:
+    name: HSS store integration (DynamoDB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make test-integration-hss
+
   vuln:
     name: modules and vulnerabilities
     runs-on: ubuntu-latest

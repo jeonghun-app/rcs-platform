@@ -99,6 +99,23 @@ test-integration: volumes ## Storage backends against S3 and DynamoDB containers
 	    done; \
 	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/...'
 
+# The HSS store (internal/hss/awsstore) and two HSS tasks issuing AKA vectors
+# at once, against DynamoDB Local on a private network. Names carry the
+# shell's PID so parallel runs on one host do not meet; the trap removes
+# everything however the run ends. Not part of `check`: it pulls an image and
+# starts a JVM.
+.PHONY: test-integration-hss
+test-integration-hss: volumes ## HSS store against a DynamoDB Local container
+	@set -eu; id=rcs-platform-hss-it-$$$$; \
+	trap '$(DOCKER) rm -f "$$id-ddb" >/dev/null 2>&1 || true; $(DOCKER) network rm "$$id" >/dev/null 2>&1 || true' EXIT; \
+	$(DOCKER) network create "$$id" >/dev/null; \
+	$(DOCKER) run -d --rm --name "$$id-ddb" --network "$$id" $(DDBLOCAL_IMAGE) >/dev/null; \
+	$(RUNGO) --network "$$id" -e HSS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
+	  -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=local -e AWS_SECRET_ACCESS_KEY=local \
+	  $(GOIMAGE) sh -c 'n=0; until wget -S -O /dev/null "$$HSS_IT_DYNAMODB_ENDPOINT/" 2>&1 | grep -q "HTTP/"; do \
+	      n=$$((n + 1)); [ "$$n" -lt 120 ] || { echo "DynamoDB Local did not start" >&2; exit 1; }; sleep 1; done; \
+	    go test -tags integration -count=1 -v -run Integration ./internal/hss/...'
+
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz
 fuzz: volumes ## Run every fuzz target for FUZZTIME each
