@@ -2,6 +2,8 @@ package cx
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -280,5 +282,60 @@ func TestAuthenticationVectorsAreNotPrintedOrLogged(t *testing.T) {
 	}
 	if !strings.Contains(outputs["slog"], SchemeDigestAKAv1MD5) {
 		t.Errorf("slog output lost the scheme: %s", outputs["slog"])
+	}
+}
+
+// TestCredentialsInsideMessagesDoNotReachJSONLogs logs messages and items the
+// way a service would, through the JSON handler internal/runtime uses, and
+// as plain JSON. Neither the raw credentials nor their base64 form may appear;
+// the messages' own log form leaves out the identities too.
+func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
+	ha1 := "0123456789abcdef0123456789abcdef"
+	key := seq(16, 0x61)
+	item := AuthDataItem{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5,
+		Authenticate: seq(32, 0x41), Authorization: seq(8, 0x30),
+		ConfidentialityKey: key, IntegrityKey: key,
+		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: ha1, AlternateHA1: ha1 + ha1}}
+	credentials := []string{ha1, "abcdefgh",
+		base64.StdEncoding.EncodeToString(key)[:12],
+		base64.StdEncoding.EncodeToString(seq(32, 0x41))[:12],
+		base64.StdEncoding.EncodeToString(seq(8, 0x30))[:8]}
+	jsonLog := func(v any) string {
+		var b bytes.Buffer
+		slog.New(slog.NewJSONHandler(&b, nil)).Info("x", "msg", v)
+		return b.String()
+	}
+	messages := map[string]any{
+		"MAA": &MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), UserName: impi, PublicIdentity: impu, AuthDataItems: []AuthDataItem{item}},
+		"MAR": &MAR{Request: request("s"), UserName: impi, PublicIdentity: impu, AuthDataItem: item, NumberAuthItems: 1},
+		"PPR": &PPR{Request: request("s"), UserName: impi, AuthDataItem: &item},
+	}
+	others := map[string]any{
+		"items":        []AuthDataItem{item},
+		"item pointer": &item,
+		"digest":       item.Digest,
+		"in a struct":  struct{ Answer MAA }{MAA{AuthDataItems: []AuthDataItem{item}}},
+	}
+	for name, v := range messages {
+		out := jsonLog(v)
+		for _, id := range []string{impi, impu} {
+			if strings.Contains(out, id) {
+				t.Errorf("%s log line has an identity: %s", name, out)
+			}
+		}
+		others[name] = v
+	}
+	for name, v := range others {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("%s: json.Marshal: %v", name, err)
+		}
+		for _, out := range []string{jsonLog(v), string(raw)} {
+			for _, c := range credentials {
+				if strings.Contains(out, c) {
+					t.Errorf("%s leaks %q: %s", name, c, out)
+				}
+			}
+		}
 	}
 }

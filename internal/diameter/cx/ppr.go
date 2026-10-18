@@ -1,10 +1,15 @@
 package cx
 
-import "github.com/jeonghun-app/rcs-platform/internal/diameter"
+import (
+	"log/slog"
+
+	"github.com/jeonghun-app/rcs-platform/internal/diameter"
+)
 
 // PPR is a Push-Profile-Request (TS 29.229 §6.1.11): the HSS sends a changed
 // user profile, charging information or SIP Digest data to the S-CSCF serving
-// the user (TS 29.228 §6.2.2). Like an RTR it needs Destination-Host.
+// the user (TS 29.228 §6.2.2). Like an [RTR] it is sent on any connected
+// scscf peer (ADR 0005), whose Origin-Host becomes Destination-Host.
 type PPR struct {
 	Request
 	UserName            string
@@ -38,6 +43,20 @@ func (r *PPR) Message(n *diameter.Node) (*diameter.Message, error) {
 		body = append(body, item)
 	}
 	return r.NewMessage(n, Application, CodePushProfile, body...)
+}
+
+// LogValue logs what the request carries without the user's identity, the
+// profile or the SIP Digest credentials.
+func (r *PPR) LogValue() slog.Value {
+	attrs := []slog.Attr{
+		slog.String("command", "PPR"),
+		slog.Bool("user_data", r.UserData != nil),
+		slog.Bool("charging_information", r.ChargingInformation != nil),
+	}
+	if r.AuthDataItem != nil {
+		attrs = append(attrs, slog.Any("auth_data_item", *r.AuthDataItem))
+	}
+	return slog.GroupValue(attrs...)
 }
 
 // ParsePPR reads a received PPR.

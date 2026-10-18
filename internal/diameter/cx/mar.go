@@ -1,6 +1,7 @@
 package cx
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -203,6 +204,17 @@ func readAuthDataItem(g *Fields) AuthDataItem {
 	return item
 }
 
+// The credentials of an item must stay out of every log line, however the
+// item reaches the logger (docs/architecture.md §8). fmt uses String and
+// GoString; slog uses LogValue only for the value it is handed, and the JSON
+// handler the services use writes anything else, such as an MAA holding a
+// slice of items, through encoding/json, so the items and digests also
+// marshal to JSON without their credentials. The messages that carry items
+// have a LogValue of their own, which leaves out the subscriber identities
+// as well.
+
+const redacted = "redacted"
+
 // String describes the item without its credentials.
 func (a AuthDataItem) String() string {
 	return fmt.Sprintf("SIP-Auth-Data-Item{number %d, scheme %q, digest %t, credentials redacted}",
@@ -221,6 +233,17 @@ func (a AuthDataItem) LogValue() slog.Value {
 	)
 }
 
+// MarshalJSON writes the item without its credentials. The result is for
+// logs only; nothing reads it back.
+func (a AuthDataItem) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ItemNumber  uint32
+		Scheme      string
+		Digest      bool
+		Credentials string
+	}{a.ItemNumber, a.Scheme, a.Digest != nil, redacted})
+}
+
 // String describes the digest parameters without HA1.
 func (d DigestAuthenticate) String() string {
 	return fmt.Sprintf("SIP-Digest-Authenticate{algorithm %q, qop %q, HA1 redacted}", d.Algorithm, d.QoP)
@@ -233,4 +256,36 @@ func (d DigestAuthenticate) GoString() string { return d.String() }
 // too: it is often the user's home domain and adds nothing to a log line.
 func (d DigestAuthenticate) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("algorithm", d.Algorithm), slog.String("qop", d.QoP))
+}
+
+// MarshalJSON writes the digest parameters without HA1, for logs only.
+func (d DigestAuthenticate) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Algorithm, QoP, AlternateAlgorithm, HA1 string
+	}{d.Algorithm, d.QoP, d.AlternateAlgorithm, redacted})
+}
+
+// LogValue logs the request without the identities and the item's
+// credentials.
+func (r *MAR) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("command", "MAR"),
+		slog.Any("auth_data_item", r.AuthDataItem),
+		slog.Uint64("number_auth_items", uint64(r.NumberAuthItems)),
+	)
+}
+
+// LogValue logs the answer's result and items without the identities and
+// the credentials.
+func (a *MAA) LogValue() slog.Value {
+	items := make([]any, len(a.AuthDataItems))
+	for i, item := range a.AuthDataItems {
+		items[i] = item.LogValue()
+	}
+	return slog.GroupValue(
+		slog.String("command", "MAA"),
+		slog.String("result", a.Result.String()),
+		slog.Uint64("number_auth_items", uint64(a.NumberAuthItems)),
+		slog.Any("auth_data_items", items),
+	)
 }
