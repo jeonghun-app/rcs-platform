@@ -98,7 +98,7 @@ type Config struct {
 	// largest size (a chunk being read and the complete message after it).
 	// Memory therefore grows with the number of sessions, which signalling
 	// creates, not with anything a peer sends. Zero means twice
-	// MaxMessageSize.
+	// MaxMessageSize plus 64 KiB.
 	SessionReserve int64
 	// ReassemblyTimeout is how long an incomplete message waits for its
 	// next chunk before it is dropped.
@@ -135,10 +135,12 @@ type Config struct {
 	// DefaultMaxHandlerQueue.
 	MaxHandlerQueue int
 	// MaxFailedBinds is how many requests for unknown sessions a passive
-	// connection may make before any session has been bound on it; one
-	// more and it is closed (ErrTooManyUnknownSessions). Each costs a
-	// Binder lookup, and a peer that knows no session has nothing to do
-	// here. Zero means DefaultMaxFailedBinds.
+	// connection may make in a minute, plus one for each session bound on
+	// it; one more and it is closed (ErrTooManyUnknownSessions). Each costs
+	// a Binder lookup. Before any bind the allowance is MaxFailedBinds
+	// alone, since a peer that knows no session has nothing to do here;
+	// later it grows with the sessions, which a peer may well address just
+	// after they ended. Zero means DefaultMaxFailedBinds.
 	MaxFailedBinds int
 	// OnEvent, if set, hears about every refusal, drop and connection end
 	// (see Event), for metrics. It runs on the connection's goroutines and
@@ -197,7 +199,9 @@ func (cfg Config) withDefaults() (Config, error) {
 		cfg.MaxReassemblyLifetime = DefaultMaxReassemblyLifetime
 	}
 	if cfg.SessionReserve <= 0 {
-		cfg.SessionReserve = 2 * cfg.MaxMessageSize
+		// The chunk's read buffer may run one octet past MaxMessageSize;
+		// the slack keeps a whole message of that size within the reserve.
+		cfg.SessionReserve = 2*cfg.MaxMessageSize + 64<<10
 	}
 	if cfg.MaxQueuedBytes <= 0 {
 		cfg.MaxQueuedBytes = max(4*cfg.MaxMessageSize, 16<<20)
@@ -284,6 +288,7 @@ type Conn struct {
 	// refused lookups before that.
 	everBound   atomic.Bool
 	failedBinds int
+	failWindow  time.Time
 
 	mu         sync.Mutex
 	sessions   map[string]*Session
@@ -450,8 +455,9 @@ func (c *Conn) fail(err error) {
 	for _, s := range sessions {
 		s.closeWith(cause)
 	}
-	close(c.done)
+	// The event comes first, so that whoever sees Done has heard it.
 	c.emit(Event{Kind: EventClosed, Err: err})
+	close(c.done)
 	// Requests that can no longer be answered end as a local timeout would
 	// (§10.4), so that a relay can still tell the original sender. The
 	// callbacks may write to other connections, so they run apart from
@@ -598,13 +604,16 @@ func (c *Conn) sessionFor(to URI) (*Session, int) {
 }
 
 // refuseBind answers a request no session on this connection takes, and
-// closes a passive connection that keeps naming unknown sessions before it
-// has bound any.
+// closes a passive connection that names unknown sessions more often than
+// MaxFailedBinds allows.
 func (c *Conn) refuseBind(req *Message, code int) error {
-	if c.passive && !c.everBound.Load() {
+	if c.passive {
 		c.mu.Lock()
+		if now := c.cfg.Clock.Now(); now.Sub(c.failWindow) >= time.Minute {
+			c.failWindow, c.failedBinds = now, 0
+		}
 		c.failedBinds++
-		tooMany := c.failedBinds > c.cfg.MaxFailedBinds
+		tooMany := c.failedBinds > c.cfg.MaxFailedBinds+len(c.sessions)
 		c.mu.Unlock()
 		if tooMany {
 			c.emit(Event{Kind: EventRefused, Method: req.Method, Code: code})

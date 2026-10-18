@@ -15,6 +15,10 @@ var bridgeMu sync.Mutex
 // session alone.
 const maxHeldBytes = 256 << 10
 
+// maxHeldEntries bounds the same by count, so that many tiny forwards
+// cannot each cost a closure for little data.
+const maxHeldEntries = 256
+
 // errHeldFull refuses a forward toward an unbound client side whose
 // holding queue is full.
 var errHeldFull = errors.New("msrp: too much held for an unbound session")
@@ -23,9 +27,10 @@ var errHeldFull = errors.New("msrp: too much held for an unbound session")
 // it on the connection once there is one, drop answers for it if there
 // never is.
 type held struct {
-	send   func(out *Conn) error
-	drop   func(code int)
-	octets int64
+	messageID string
+	send      func(out *Conn) error
+	drop      func(code int)
+	octets    int64
 }
 
 // maxRejected bounds how many refused Message-IDs a bridged session
@@ -152,7 +157,7 @@ func (s *Session) forwardConn(c *Conn) (*Conn, int) {
 // it while s is not bound; in, the connection the request came on, gives
 // the clock and the timeout. Held forwards keep their order: until the
 // flush on binding is through, new ones queue behind them.
-func (s *Session) dispatch(in *Conn, octets int64, send func(out *Conn) error, drop func(code int)) error {
+func (s *Session) dispatch(in *Conn, messageID string, octets int64, send func(out *Conn) error, drop func(code int)) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -162,12 +167,12 @@ func (s *Session) dispatch(in *Conn, octets int64, send func(out *Conn) error, d
 		s.mu.Unlock()
 		return send(out)
 	}
-	if s.heldOctets+octets > maxHeldBytes {
+	if s.heldOctets+octets > maxHeldBytes || len(s.held) >= maxHeldEntries {
 		s.mu.Unlock()
 		return errHeldFull
 	}
 	first := len(s.held) == 0 && s.conn == nil
-	s.held = append(s.held, held{send: send, drop: drop, octets: octets})
+	s.held = append(s.held, held{messageID: messageID, send: send, drop: drop, octets: octets})
 	s.heldOctets += octets
 	s.mu.Unlock()
 	if first {
@@ -196,6 +201,28 @@ func (s *Session) flushHeld(out *Conn) {
 				break
 			}
 		}
+	}
+}
+
+// dropHeldMessage drops what is held of one message, answering for it
+// with code, so that a client binding later does not get a message that
+// was cut off part-way.
+func (s *Session) dropHeldMessage(id string, code int) {
+	s.mu.Lock()
+	var drop []held
+	kept := s.held[:0]
+	for _, h := range s.held {
+		if h.messageID == id {
+			drop = append(drop, h)
+			s.heldOctets -= h.octets
+		} else {
+			kept = append(kept, h)
+		}
+	}
+	s.held = kept
+	s.mu.Unlock()
+	for _, h := range drop {
+		h.drop(code)
 	}
 }
 
@@ -317,6 +344,7 @@ func (s *Session) relaySend(c *Conn, peer *Session, m *Message) error {
 		if err := peer.forwardPiece(out, c, s, m, pos, cur[:n], flag, answer); err != nil {
 			if errors.Is(err, errHeldFull) {
 				s.reject(id)
+				peer.dropHeldMessage(id, StatusMessageTooLarge)
 				return c.respond(m, StatusMessageTooLarge)
 			}
 			return c.respond(m, StatusNoSession)
@@ -390,7 +418,7 @@ func (p *Session) forwardPiece(out, in *Conn, from *Session, m *Message, pos int
 	// The piece buffer is reused once this returns, so a held piece keeps
 	// a copy.
 	kept := append([]byte(nil), data...)
-	return p.dispatch(in, int64(len(kept)), func(out *Conn) error { return send(out, kept) }, func(code int) {
+	return p.dispatch(in, m.MessageID, int64(len(kept)), func(out *Conn) error { return send(out, kept) }, func(code int) {
 		if written != nil {
 			_ = in.respond(m, code)
 		}
@@ -426,7 +454,7 @@ func (s *Session) relayBuffered(c *Conn, peer *Session, m *Message) error {
 	var err error
 	if peer.edge {
 		// The body was read into a buffer of its own, so m can be held.
-		err = peer.dispatch(c, int64(len(m.Body)), send, func(code int) { _ = c.respond(m, code) })
+		err = peer.dispatch(c, m.MessageID, int64(len(m.Body)), send, func(code int) { _ = c.respond(m, code) })
 	} else {
 		out, code := peer.forwardConn(c)
 		if code != 0 {

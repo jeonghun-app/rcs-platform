@@ -235,6 +235,7 @@ func TestAnIncompleteMessageExpiresAFixedTimeAfterItsFirstChunk(t *testing.T) {
 		p.send(t, sendLines(tid, "Message-ID: tr1ckle", fmt.Sprintf("Byte-Range: %d-%d/1000", start, start+9),
 			"Content-Type: text/plain", "", "0123456789", "-------"+tid+"+")...)
 		expectResponse(t, p, tid, StatusOK)
+		sentinel(t, p) // the chunk's read buffer has been given back
 		if i == 0 {
 			clock.waitTimer(t, lifetime)
 		}
@@ -260,6 +261,9 @@ func TestASessionDropsAnIncompleteMessageAfterTheReassemblyTimeout(t *testing.T)
 	clock.watchTimers()
 	p.send(t, sendLines("h4lf1", "Message-ID: half", "Byte-Range: 1-3/6", "Content-Type: text/plain", "", "abc", "-------h4lf1+")...)
 	expectResponse(t, p, "h4lf1", StatusOK)
+	// The chunk's read buffer is given back only after its answer is
+	// queued; the answer to a later request shows that has happened.
+	sentinel(t, p)
 	clock.waitTimer(t, timeout)
 	if s.reasm.Pending() != 1 || s.budget.Used() == 0 {
 		t.Fatalf("%d pending, %d octets charged", s.reasm.Pending(), s.budget.Used())
@@ -271,6 +275,7 @@ func TestASessionDropsAnIncompleteMessageAfterTheReassemblyTimeout(t *testing.T)
 	// The rest of the message now starts a new, incomplete one.
 	p.send(t, sendLines("h4lf2", "Message-ID: half", "Byte-Range: 4-6/6", "Content-Type: text/plain", "", "def", "-------h4lf2$")...)
 	expectResponse(t, p, "h4lf2", StatusOK)
+	sentinel(t, p)
 	if s.reasm.Pending() != 1 {
 		t.Fatal("the expired start of the message was kept")
 	}
@@ -312,8 +317,11 @@ func fillRegistry(t *testing.T, sessions int) *Registry {
 }
 
 func TestSessionsFillingTheSharedBufferLeaveAnotherSessionItsReserve(t *testing.T) {
+	// A reserve just big enough for one message of the largest size (its
+	// read buffer may run one octet over, then the message waits for the
+	// handler), so that filling the pool matters.
 	cfg := Config{Clock: newFakeClock(), MaxMessageSize: 4096, MaxPendingMessages: 64,
-		MaxSessionBuffer: 64 << 10, MaxConnBuffer: 32 << 10}
+		MaxSessionBuffer: 64 << 10, MaxConnBuffer: 32 << 10, SessionReserve: 2*4096 + 1}
 	_, p := passiveWithPeer(t, fillRegistry(t, 4), cfg)
 	part := strings.Repeat("q", 2000)
 	for n := range 3 {
@@ -328,15 +336,15 @@ func TestSessionsFillingTheSharedBufferLeaveAnotherSessionItsReserve(t *testing.
 }
 
 func TestWhatSessionsHoldBeyondTheirReserveIsBoundedTogether(t *testing.T) {
+	const reserve = 8192
 	cfg := Config{Clock: newFakeClock(), MaxMessageSize: 4096, MaxPendingMessages: 64,
-		MaxSessionBuffer: 64 << 10, MaxConnBuffer: 32 << 10}
+		MaxSessionBuffer: 64 << 10, MaxConnBuffer: 32 << 10, SessionReserve: reserve}
 	c, p := passiveWithPeer(t, fillRegistry(t, 3), cfg)
 	part := strings.Repeat("q", 2000)
 	total := 0
 	for n := range 3 {
 		total += fillSession(t, p, n, part)
 	}
-	reserve := 2 * 4096 // the default SessionReserve for this MaxMessageSize
 	if limit := 3*reserve + 32<<10; total > limit {
 		t.Fatalf("sessions held %d octets, bound %d", total, limit)
 	}

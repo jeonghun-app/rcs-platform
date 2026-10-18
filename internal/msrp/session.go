@@ -20,17 +20,32 @@ type event struct {
 	octets int64
 }
 
+// queuedReport waits for HandleReport. own marks the outcome of a chunk
+// this session sent; after, if set, runs once the handler has taken it
+// (it frees the chunk's window place).
+type queuedReport struct {
+	r     Report
+	own   bool
+	after func()
+}
+
 // Handler receives what arrives on an endpoint session.
 //
-// The methods for one session run one at a time, in arrival order, on a
-// goroutine of the session's own, never on a connection's reading
-// goroutine. So a handler may take its time and may call Send on any
-// session, including one that is still waiting to be bound, without
-// holding up other sessions. What it holds up is its own session: while it
-// runs, up to Config.MaxHandlerQueue further events wait, and beyond that
-// messages for the session are refused with 413 and reports are dropped
-// (EventDropped with ErrHandlerBusy). A session's handler that is slow for
-// long therefore makes its peer see refusals, not a stalled connection.
+// Nothing runs on a connection's reading goroutine. For each session,
+// HandleMessage and HandleRequest calls run one at a time, in arrival
+// order, on one goroutine of the session's own, and HandleReport calls run
+// one at a time, in order, on another; the two kinds may overlap. So a
+// handler may take its time and may call Send on any session, including
+// its own and one still waiting to be bound, without holding up other
+// sessions.
+//
+// What a slow handler holds up is its own session. Beyond
+// Config.MaxHandlerQueue waiting messages, the session's messages are
+// refused with 413, and REPORTs the peer sends are dropped (EventDropped
+// with ErrHandlerBusy). Reports about the session's own sends are never
+// dropped: while Config.SendWindow of them wait, Send waits too. For that
+// reason HandleReport must not wait for a Send on its own session to
+// finish; a retry belongs on another goroutine.
 type Handler interface {
 	// HandleMessage gets each complete message. Returning nil confirms it
 	// with a success REPORT when the sender asked for one (§7.1.3). An
@@ -116,6 +131,18 @@ type Session struct {
 	edge       bool // the client side of a bridge
 	// events feeds the handler's goroutine; nil for a bridged session.
 	events chan event
+	// reports wait for HandleReport, on a goroutine of their own. Those
+	// about this session's own sends are never dropped: SendWindow bounds
+	// them (Send waits while as many are undelivered), as do the
+	// connection's in-flight slots. Those the peer sends are dropped
+	// beyond MaxHandlerQueue. reportWake tells the goroutine about new
+	// ones; reportRoom tells Send that one was delivered. rmu keeps
+	// HandleReport calls one at a time even after the session closed.
+	reports    []queuedReport
+	ownCount   int
+	reportWake chan struct{}
+	reportRoom chan struct{}
+	rmu        sync.Mutex
 	// window holds a token per chunk Send has awaiting its answer.
 	window chan struct{}
 	// backlog counts octets queued toward the client of a bridged edge
@@ -146,12 +173,14 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 		}
 	}
 	return &Session{
-		local:   cfg.Local,
-		remote:  append([]URI(nil), cfg.Remote...),
-		handler: cfg.Handler,
-		accept:  append([]string(nil), cfg.AcceptTypes...),
-		bound:   make(chan struct{}),
-		done:    make(chan struct{}),
+		local:      cfg.Local,
+		remote:     append([]URI(nil), cfg.Remote...),
+		handler:    cfg.Handler,
+		accept:     append([]string(nil), cfg.AcceptTypes...),
+		bound:      make(chan struct{}),
+		done:       make(chan struct{}),
+		reportWake: make(chan struct{}, 1),
+		reportRoom: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -251,6 +280,7 @@ func (s *Session) attach(c *Conn) error {
 	if s.handler != nil {
 		s.events = make(chan event, c.cfg.MaxHandlerQueue)
 		go s.work(c)
+		go s.workReports(c)
 	}
 	close(s.bound)
 	s.mu.Unlock()
@@ -340,6 +370,20 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 			return id, err
 		}
 		r := ch.Range
+		// A handler slow to take reports about this session's sends slows
+		// this session's sending, rather than reports being lost.
+		for s.undeliveredReports() >= c.cfg.SendWindow {
+			select {
+			case <-s.reportRoom:
+			case <-s.done:
+				return id, s.Err()
+			case <-ctx.Done():
+				if i > 0 {
+					s.abandon(c, id, out, sr, r)
+				}
+				return id, ctx.Err()
+			}
+		}
 		// Only chunks that will be answered take a place in the window:
 		// with Failure-Report partial or no, no 200 would free it.
 		windowed := out.FailureReport == ReportUnset || out.FailureReport == ReportYes
@@ -362,8 +406,8 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 			}
 		}
 		err := c.sendRequest(ctx, s.chunk(id, out, sr, r, ch.Data, ch.Flag), sendMode{windowed: windowed}, func(code int, comment string) {
-			free()
 			if code == StatusOK {
+				free()
 				return
 			}
 			mu.Lock()
@@ -371,7 +415,8 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 				refused = &StatusError{Code: code, Comment: comment}
 			}
 			mu.Unlock()
-			s.report(Report{MessageID: id, Range: r, Code: code, Comment: comment})
+			// The window place is kept until the handler has the report.
+			s.reportOwn(Report{MessageID: id, Range: r, Code: code, Comment: comment}, free)
 		})
 		if err != nil {
 			free()
@@ -547,17 +592,109 @@ func (s *Session) work(c *Conn) {
 	}
 }
 
+// workReports delivers reports in order, apart from messages so that a
+// HandleMessage that sends on its own session cannot hold up the reports
+// that sending waits for. On close it delivers what is left about this
+// session's own sends.
+func (s *Session) workReports(c *Conn) {
+	for {
+		select {
+		case <-s.reportWake:
+			s.deliverReports(false)
+		case <-s.done:
+			s.deliverReports(true)
+			return
+		}
+	}
+}
+
+func (s *Session) undeliveredReports() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ownCount
+}
+
+// reportOwn hands the handler the outcome of a chunk this session sent.
+// After the session has closed, its report goroutine may be gone, so the
+// report is delivered on a goroutine of its own.
+func (s *Session) reportOwn(r Report, after func()) {
+	if s.handler == nil {
+		if after != nil {
+			after()
+		}
+		return
+	}
+	q := queuedReport{r: r, own: true, after: after}
+	s.mu.Lock()
+	if !s.closed && s.events != nil {
+		s.reports = append(s.reports, q)
+		s.ownCount++
+		s.mu.Unlock()
+		s.wakeReports()
+		return
+	}
+	s.mu.Unlock()
+	go s.hand(q)
+}
+
+func (s *Session) wakeReports() {
+	select {
+	case s.reportWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) deliverReports(onlyOwn bool) {
+	for {
+		s.mu.Lock()
+		if len(s.reports) == 0 {
+			s.mu.Unlock()
+			return
+		}
+		next := s.reports[0]
+		s.reports = s.reports[1:]
+		if next.own {
+			s.ownCount--
+		}
+		s.mu.Unlock()
+		if !onlyOwn || next.own {
+			s.hand(next)
+		}
+	}
+}
+
+func (s *Session) hand(q queuedReport) {
+	s.rmu.Lock()
+	s.handler.HandleReport(s, q.r)
+	s.rmu.Unlock()
+	if q.after != nil {
+		q.after()
+	}
+	select {
+	case s.reportRoom <- struct{}{}:
+	default:
+	}
+}
+
+// report hands the handler a REPORT the peer sent. Those come at the
+// peer's pace, so beyond MaxHandlerQueue waiting reports they are dropped
+// and counted (EventDropped with ErrHandlerBusy).
 func (s *Session) report(r Report) {
 	if s.handler == nil {
 		return
 	}
-	if !s.post(event{run: func() { s.handler.HandleReport(s, r) }}) {
-		s.mu.Lock()
-		c, closed := s.conn, s.closed
-		s.mu.Unlock()
-		if c != nil && !closed {
-			c.emit(Event{Kind: EventDropped, Method: MethodReport, Err: ErrHandlerBusy})
-		}
+	s.mu.Lock()
+	c, closed := s.conn, s.closed
+	room := c != nil && !closed && len(s.reports)-s.ownCount < c.cfg.MaxHandlerQueue
+	if room {
+		s.reports = append(s.reports, queuedReport{r: r})
+	}
+	s.mu.Unlock()
+	switch {
+	case room:
+		s.wakeReports()
+	case c != nil && !closed:
+		c.emit(Event{Kind: EventDropped, Method: MethodReport, Err: ErrHandlerBusy})
 	}
 }
 

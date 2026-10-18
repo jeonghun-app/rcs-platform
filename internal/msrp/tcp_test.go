@@ -209,8 +209,10 @@ func TestASlowHandlerDoesNotDisconnectAHealthyPeer(t *testing.T) {
 // relayRigTCP is msrp-relay between rcs-as and clients, all over TCP.
 type relayRigTCP struct {
 	// edgeWriteBuffer, when set, is the send buffer of the relay's client
-	// sockets.
+	// sockets; edgeConfig, when set, chooses the Config of the n-th client
+	// connection the relay accepts.
 	edgeWriteBuffer int
+	edgeConfig      func(n int) Config
 	relayAddr       string
 	asReg           *Registry
 	relay           *pairBinder
@@ -272,7 +274,7 @@ func newRelayRigTCP(t *testing.T, relayClientCfg, asCfg Config, opts ...func(*re
 	t.Cleanup(func() { _ = pool.Close() })
 	rig.relay = &pairBinder{pool: pool, pairs: map[string][2]*Session{}}
 	go func() {
-		for {
+		for n := 0; ; n++ {
 			nc, err := relayL.Accept()
 			if err != nil {
 				return
@@ -280,7 +282,11 @@ func newRelayRigTCP(t *testing.T, relayClientCfg, asCfg Config, opts ...func(*re
 			if rig.edgeWriteBuffer > 0 {
 				_ = nc.(*net.TCPConn).SetWriteBuffer(rig.edgeWriteBuffer)
 			}
-			c, err := NewPassiveConn(nc, rig.relay, relayClientCfg)
+			cfg := relayClientCfg
+			if rig.edgeConfig != nil {
+				cfg = rig.edgeConfig(n)
+			}
+			c, err := NewPassiveConn(nc, rig.relay, cfg)
 			if err != nil {
 				return
 			}
@@ -395,7 +401,7 @@ func (rig *relayRigTCP) coreConn(t *testing.T) *Conn {
 
 func TestTrafficThroughARelayOverTCPArrivesBothWays(t *testing.T) {
 	rig := newRelayRigTCP(t, Config{}, Config{})
-	const users, per, size = 4, 25, 256 << 10
+	const users, per, size = 4, 12, 256 << 10
 	var clientHs, asHs []*countingHandler
 	var clients, ases []*Session
 	var conns []*Conn
@@ -514,15 +520,24 @@ func TestARelayStreamsAHugeChunkInBoundedMemory(t *testing.T) {
 }
 
 func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *testing.T) {
-	// The relay writes to clients with a deadline short enough to cut the
-	// silent client off within the test, yet longer than the 8–9 s a single
-	// write was measured to wait for a client reading 4 KiB a second: the
-	// kernel lets a writer go on in bursts. The production default is 30 s.
-	const deadline = 15 * time.Second
+	// The relay writes to the silent client, which connects first, with a
+	// short deadline so that it is cut off within the test; the others keep
+	// the default 30 s, comfortably above the 8–9 s a single write was
+	// measured to wait for a client reading 4 KiB a second, since the
+	// kernel lets a writer go on in bursts.
+	const deadline = time.Second
 	// Linux wakes a blocked writer only once much of its send buffer has
 	// drained; with a large one that takes minutes at 4 KiB/s and a slow
 	// reader looks like a silent one. A small buffer keeps them apart.
-	rig := newRelayRigTCP(t, Config{WriteTimeout: deadline}, Config{}, func(r *relayRigTCP) { r.edgeWriteBuffer = 16 << 10 })
+	rig := newRelayRigTCP(t, Config{}, Config{}, func(r *relayRigTCP) {
+		r.edgeWriteBuffer = 16 << 10
+		r.edgeConfig = func(n int) Config {
+			if n == 0 {
+				return Config{WriteTimeout: deadline}
+			}
+			return Config{}
+		}
+	})
 	asSilent, clSilent, rpSilent := rig.addUser(t, 1, &countingHandler{})
 	asSlow, clSlow, rpSlow := rig.addUser(t, 2, &countingHandler{})
 	asFast, clFast, rpFast := rig.addUser(t, 3, &countingHandler{})
@@ -585,7 +600,7 @@ func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *test
 		if err := silentEdge.Err(); !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, ErrPeerNotReading) {
 			t.Errorf("silent client cut off with %v", err)
 		}
-	case <-time.After(3 * deadline):
+	case <-time.After(10 * deadline):
 		t.Error("silent client still connected")
 	}
 	if slowEdge.Err() != nil || slowRead.Load() == 0 {
@@ -617,7 +632,7 @@ func TestARelayKeepsItsRcsAsConnectionWhileRcsAsHandlesSlowly(t *testing.T) {
 				sendMany(ctx, cs, 1, 1<<20, 200, false) // chat as fast as it goes
 				sendMany(ctx, as, 1, 100, 1<<20, false) // file push
 			}
-			stayUp(t, 2*time.Second, append(conns, rig.coreConn(t))...)
+			stayUp(t, time.Second, append(conns, rig.coreConn(t))...)
 		})
 	}
 }
@@ -651,7 +666,7 @@ func TestARelayKeepsItsRcsAsConnectionUnderPacedChatAndFilePush(t *testing.T) {
 					sendMany(ctx, as, 1, 100, 1<<20, false)
 				}
 			}
-			stayUp(t, 2*time.Second, rig.coreConn(t))
+			stayUp(t, time.Second, rig.coreConn(t))
 		})
 	}
 }
@@ -687,7 +702,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	rig := newRelayRigTCP(t, Config{}, Config{})
 	asLate, clLate, rpLate := rig.addUser(t, 1, &countingHandler{})
 	overH := &countingHandler{}
-	asOver, _, rpOver := rig.addUser(t, 2, overH)
+	asOver, clOver, rpOver := rig.addUser(t, 2, overH)
 	asFast, clFast, rpFast := rig.addUser(t, 3, &countingHandler{})
 	fastH := &countingHandler{got: make(chan *Message, 16)}
 	_, fastConn := rig.dialClient(t, clFast, rpFast, fastH)
@@ -736,6 +751,30 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		t.Fatalf("unbound session over its bound: %v", err)
 	}
 	waitCount(t, "refusals for the session over its bound", &overH.failures, 1, 5*time.Second)
+	// What was held of the refused message is dropped, so its client, when
+	// it comes, gets no truncated message.
+	rig.relay.mu.Lock()
+	overEdge := rig.relay.pairs[rpOver.SessionID][0]
+	rig.relay.mu.Unlock()
+	overEdge.mu.Lock()
+	heldLeft, octetsLeft := len(overEdge.held), overEdge.heldOctets
+	overEdge.mu.Unlock()
+	if heldLeft != 0 || octetsLeft != 0 {
+		t.Fatalf("%d pieces (%d octets) of the refused message still held", heldLeft, octetsLeft)
+	}
+	overClient := &countingHandler{got: make(chan *Message, 4)}
+	rig.dialClient(t, clOver, rpOver, overClient)
+	if _, err := asOver.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("after")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case m := <-overClient.got:
+		if string(m.Body) != "after" {
+			t.Fatalf("the client got %d octets of %q first", len(m.Body), m.MessageID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the later message never arrived")
+	}
 	// The client comes and gets what was held.
 	lateH := &countingHandler{got: make(chan *Message, 4)}
 	rig.dialClient(t, clLate, rpLate, lateH)

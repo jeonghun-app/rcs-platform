@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -356,7 +356,7 @@ func TestEventsCarryOnlyFixedValuesWhateverThePeerSends(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("no EventClosed")
 		}
-		runtime.Gosched()
+		time.Sleep(time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -418,4 +418,103 @@ func TestAnUnboundConnectionQueuesLittleForAPeerThatDoesNotRead(t *testing.T) {
 	if c.posted > unboundQueueBytes {
 		t.Fatalf("%d octets were queued", c.posted)
 	}
+}
+
+// slowReporter takes a while over each report, as marking a message failed
+// in a database does.
+type slowReporter struct {
+	reports atomic.Int64
+	delay   time.Duration
+}
+
+func (h *slowReporter) HandleMessage(*Session, *Message) error { return nil }
+func (h *slowReporter) HandleReport(*Session, Report) {
+	time.Sleep(h.delay)
+	h.reports.Add(1)
+}
+
+func TestEveryRefusalOfASentMessageReachesHandleReport(t *testing.T) {
+	// Adapted from the tester's reproduction on PR #28: the peer refuses
+	// every message, the sender's HandleReport is slow, and no refusal may
+	// be lost; Send slows down instead.
+	var dropped atomic.Int64
+	cfg := Config{SendWindow: 8, MaxHandlerQueue: 4, OnEvent: func(e Event) {
+		if e.Kind == EventDropped && e.Method == MethodReport {
+			dropped.Add(1)
+		}
+	}}
+	reg := &Registry{}
+	bob, err := NewSession(SessionConfig{Local: mustURI(t, asURI), Remote: []URI{mustURI(t, clientURI)},
+		Handler: &slowReporter{}, AcceptTypes: []string{"text/plain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Add(bob); err != nil {
+		t.Fatal(err)
+	}
+	a, b := net.Pipe()
+	pc, err := NewPassiveConn(b, reg, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac, err := NewActiveConn(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ac.Close(); _ = pc.Close() })
+	h := &slowReporter{delay: 2 * time.Millisecond}
+	alice := newTestSession(t, clientURI, asURI, h)
+	if err := ac.Open(context.Background(), alice); err != nil {
+		t.Fatal(err)
+	}
+	const n = 200
+	for i := range n {
+		if _, err := alice.Send(context.Background(), Outgoing{ContentType: "image/png", Body: []byte("x")}); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+		if waiting := alice.undeliveredReports(); waiting > cfg.SendWindow {
+			t.Fatalf("%d reports waiting with a window of %d", waiting, cfg.SendWindow)
+		}
+	}
+	for deadline := time.Now().Add(10 * time.Second); h.reports.Load() < n; {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if h.reports.Load() != n || dropped.Load() != 0 {
+		t.Fatalf("HandleReport saw %d of %d refusals, %d dropped", h.reports.Load(), n, dropped.Load())
+	}
+}
+
+func TestUnknownSessionsKeepCountingAfterTheFirstBind(t *testing.T) {
+	// One bound session raises the allowance by one; a peer that goes on
+	// guessing is closed all the same.
+	clock := newFakeClock()
+	_, p := boundPassive(t, newRecorder(), Config{Clock: clock, MaxFailedBinds: 2})
+	guess := func(i int) {
+		tid := fmt.Sprintf("gu3ss%d", i)
+		p.send(t, "MSRP "+tid+" SEND", fmt.Sprintf("To-Path: msrp://as.example.org:9000/guess%d;tcp", i),
+			"From-Path: "+clientURI, "Message-ID: "+tid, "-------"+tid+"$")
+	}
+	for i := range 3 {
+		guess(i)
+		expectResponse(t, p, fmt.Sprintf("gu3ss%d", i), StatusNoSession)
+	}
+	// A minute later the count starts again.
+	clock.Advance(time.Minute)
+	for i := 3; i < 6; i++ {
+		guess(i)
+		expectResponse(t, p, fmt.Sprintf("gu3ss%d", i), StatusNoSession)
+	}
+	guess(6)
+	p.closed(t)
+}
+
+func TestAMaximumSizeMessageFitsInASessionsReserveWhenThePoolIsFull(t *testing.T) {
+	// A shared pool of one octet is as good as full.
+	_, p := boundPassive(t, newRecorder(), Config{MaxMessageSize: 4096, MaxConnBuffer: 1})
+	whole := strings.Repeat("w", 4096)
+	p.send(t, sendLines("fu11", "Message-ID: whole1", "Byte-Range: 1-4096/4096", "Content-Type: text/plain", "", whole, "-------fu11$")...)
+	expectResponse(t, p, "fu11", StatusOK)
 }
