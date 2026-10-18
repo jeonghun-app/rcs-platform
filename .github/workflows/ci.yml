@@ -87,6 +87,20 @@ jobs:
           persist-credentials: false
       - run: make test-integration
 
+  # rcs-sim against the built ft-server and msrp-relay binaries (make e2e):
+  # file transfer with resume, chat through the relay in both connection
+  # orders, IMDN. Outside `make check` because it builds and runs three
+  # binaries; its name is stable so it can be made a required check.
+  e2e:
+    name: end to end (rcs-sim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make e2e
+
   vuln:
     name: modules and vulnerabilities
     runs-on: ubuntu-latest
