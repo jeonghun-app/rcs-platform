@@ -308,9 +308,14 @@ func Encode(criteria []ifc.FilterCriteria) ([]byte, error) {
 }
 
 // DecodeStrict unmarshals exactly one JSON value into v, refusing unknown
-// fields and anything after the value. Its errors describe the position and
-// the JSON type involved, never the value.
+// fields, a key repeated in an object (encoding/json keeps the last, so
+// {"acs_managed":false,"acs_managed":true} would read as true while a
+// reviewer of the body sees false) and anything after the value. Its errors
+// describe the position and the JSON type involved, never the value.
 func DecodeStrict(data []byte, v any) error {
+	if err := noDuplicateKeys(data); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
@@ -320,6 +325,63 @@ func DecodeStrict(data []byte, v any) error {
 		return errors.New("data after the JSON value")
 	}
 	return nil
+}
+
+// noDuplicateKeys walks the tokens of data and fails on an object key that
+// occurs twice in one object. Malformed JSON is left to the decoder, which
+// describes it.
+func noDuplicateKeys(data []byte) error {
+	type frame struct {
+		object, wantKey bool
+		keys            map[string]bool
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var stack []*frame
+	value := func() {
+		if n := len(stack); n > 0 && stack[n-1].object {
+			stack[n-1].wantKey = true
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		top := (*frame)(nil)
+		if n := len(stack); n > 0 {
+			top = stack[n-1]
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				if top != nil && top.object {
+					top.wantKey = false
+				}
+				stack = append(stack, &frame{object: true, wantKey: true, keys: map[string]bool{}})
+			case '[':
+				if top != nil && top.object {
+					top.wantKey = false
+				}
+				stack = append(stack, &frame{})
+			default:
+				stack = stack[:len(stack)-1]
+				value()
+			}
+		default:
+			if top != nil && top.object && top.wantKey {
+				key, _ := t.(string)
+				if top.keys[key] {
+					return errors.New("a key occurs twice in a JSON object")
+				}
+				top.keys[key] = true
+				top.wantKey = false
+				continue
+			}
+			value()
+		}
+	}
 }
 
 // describe reduces a decoding error to what is safe to show: encoding/json

@@ -138,3 +138,33 @@ func TestEmptyCriteriaAreAnEmptyArray(t *testing.T) {
 		t.Errorf("Decode([]) = %v, %v", got, err)
 	}
 }
+
+func TestDecodeStrictRefusesRepeatedKeys(t *testing.T) {
+	type doc struct {
+		A bool           `json:"a"`
+		B map[string]int `json:"b"`
+		C []struct {
+			D int `json:"d"`
+		} `json:"c"`
+	}
+	for name, c := range map[string]struct {
+		in string
+		ok bool
+	}{
+		"distinct":              {`{"a":true,"b":{"x":1,"y":2},"c":[{"d":1},{"d":2}]}`, true},
+		"same key in siblings":  {`{"c":[{"d":1},{"d":2}],"b":{"d":3}}`, true},
+		"repeated at top":       {`{"a":false,"a":true}`, false},
+		"repeated in nested":    {`{"b":{"x":1,"x":2}}`, false},
+		"repeated in array obj": {`{"c":[{"d":1,"d":2}]}`, false},
+		"repeated after nested": {`{"b":{"x":1},"a":true,"b":{}}`, false},
+	} {
+		var v doc
+		err := DecodeStrict([]byte(c.in), &v)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+		if err != nil && strings.Contains(err.Error(), `"`) {
+			t.Errorf("%s: the error quotes the input: %v", name, err)
+		}
+	}
+}
