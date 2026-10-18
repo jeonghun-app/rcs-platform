@@ -68,7 +68,6 @@ type conn struct {
 
 	writes       chan []byte
 	controlReady chan struct{} // wakes the writer when control gains an entry
-	inflight     chan struct{}
 	wdFire       chan struct{}
 	done         chan struct{}
 	ctx          context.Context // handlers' context; ends at close
@@ -85,9 +84,13 @@ type conn struct {
 	numDWA      int
 	wdDeadline  time.Time
 	wdTimer     Timer
-	closing     bool // DPR sent or received: no new requests either way
+	closing     bool // disconnecting: no new requests either way
 	remoteCause int32
 	gotDPR      bool
+	// active counts running handlers; drained is closed when it reaches
+	// zero while a disconnect waits for it.
+	active  int
+	drained chan struct{}
 
 	controlMu    sync.Mutex
 	control      [][]byte
@@ -101,7 +104,6 @@ func newConn(n *Node, nc net.Conn) *conn {
 		br:           bufio.NewReader(nc),
 		writes:       make(chan []byte, n.cfg.MaxInFlight),
 		controlReady: make(chan struct{}, 1),
-		inflight:     make(chan struct{}, n.cfg.MaxInFlight),
 		wdFire:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
 		pending:      make(map[uint32]*pendingRequest),
@@ -673,13 +675,10 @@ func (c *conn) handleRequest(m *Message, process bool) {
 		}
 		return
 	}
-	c.mu.Lock()
-	closing := c.closing
-	c.mu.Unlock()
-	if !process || closing {
+	if !process {
 		// RFC 3539 discards application messages while reopening; answering
 		// instead lets the sender fail over at once rather than at its
-		// timeout. A closing connection takes no new work either (§5.4).
+		// timeout.
 		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultUnableToDeliver}))
 		return
 	}
@@ -692,18 +691,67 @@ func (c *conn) handleRequest(m *Message, process bool) {
 		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: rc}))
 		return
 	}
-	select {
-	case c.inflight <- struct{}{}:
-	default:
-		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: ResultTooBusy}))
+	if rc := c.startHandler(); rc != 0 {
+		c.answerNow(m, n.errorAnswer(m, &Error{ResultCode: rc}))
 		return
 	}
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		defer func() { <-c.inflight }()
+		defer c.finishHandler()
 		c.serve(h, m)
 	}()
+}
+
+// startHandler admits a request to a handler, or returns the result code to
+// refuse it with. Checking closing and counting under one lock means a
+// disconnect that has seen zero handlers cannot be overtaken by a new one.
+func (c *conn) startHandler() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.closing:
+		// A connection being disconnected takes no new work (§5.4).
+		return ResultUnableToDeliver
+	case c.active >= c.node.cfg.MaxInFlight:
+		return ResultTooBusy
+	}
+	c.active++
+	return 0
+}
+
+// finishHandler runs after the handler's answer is queued, so a drained
+// connection has every answer ahead of what is sent next.
+func (c *conn) finishHandler() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.active--
+	if c.active == 0 && c.drained != nil {
+		close(c.drained)
+		c.drained = nil
+	}
+}
+
+// drain stops new requests and waits until every running handler has queued
+// its answer, stop is closed, or the connection closes. Whatever is queued
+// next (DPR or DPA) then follows those answers on the wire.
+func (c *conn) drain(stop <-chan struct{}) {
+	c.mu.Lock()
+	c.closing = true
+	if c.active == 0 {
+		c.mu.Unlock()
+		return
+	}
+	if c.drained == nil {
+		c.drained = make(chan struct{})
+	}
+	drained := c.drained
+	c.mu.Unlock()
+	select {
+	case <-drained:
+	case <-stop:
+	case <-c.done:
+	}
 }
 
 // serve runs a handler and sends its answer. A panicking handler is answered
@@ -738,8 +786,10 @@ func (c *conn) serve(h Handler, req *Message) {
 	c.answerQueued(req, ans)
 }
 
-// disconnected answers a DPR (RFC 6733 §5.4). The sender closes the
-// connection on receiving the DPA; if it does not, this node closes it
+// disconnected answers a DPR (RFC 6733 §5.4). Requests already being handled
+// are answered first, at most for RequestTimeout (the sender would not wait
+// longer), so the DPA is the last message the sender gets. The sender closes
+// the connection on receiving the DPA; if it does not, this node closes it
 // after a grace period.
 func (c *conn) disconnected(dpr *Message) {
 	n := c.node
@@ -753,18 +803,30 @@ func (c *conn) disconnected(dpr *Message) {
 	c.remoteCause = cause
 	c.mu.Unlock()
 	n.log.Info("diameter peer disconnecting", "peer_host", c.caps.host, "disconnect_cause", cause)
-	c.answerNow(dpr, n.NewAnswer(dpr, ResultSuccess))
-	n.cfg.Clock.AfterFunc(disconnectWaitForPeerToDrop, func() { c.close(errPeerDisconnect) })
+	// The read loop keeps reading (DWRs, late answers) while this waits.
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		stop := make(chan struct{})
+		t := n.cfg.Clock.AfterFunc(n.cfg.RequestTimeout, func() { close(stop) })
+		c.drain(stop)
+		t.Stop()
+		c.answerQueued(dpr, n.NewAnswer(dpr, ResultSuccess))
+		n.cfg.Clock.AfterFunc(disconnectWaitForPeerToDrop, func() { c.close(errPeerDisconnect) })
+	}()
 }
 
-// disconnect sends DPR with the cause and closes the connection once the DPA
-// arrives, the request times out, or ctx ends (RFC 6733 §5.4).
+// disconnect stops taking requests, lets the handlers already running queue
+// their answers (until ctx ends), then sends DPR with the cause and closes the
+// connection once the DPA arrives, the request times out, or ctx ends
+// (RFC 6733 §5.4). Answers are queued before the DPR, so the peer receives
+// them before it sees the connection go.
 func (c *conn) disconnect(ctx context.Context, cause int32) {
 	c.mu.Lock()
 	ready := c.running && !c.closing && !c.closed
-	c.closing = true
 	c.mu.Unlock()
 	if ready {
+		c.drain(ctx.Done())
 		dpr := &Message{Flags: FlagRequest, Code: CodeDisconnectPeer, ApplicationID: AppCommon}
 		dpr.Add(c.node.originAVPs()...)
 		dpr.Add(NewAVP(AVPDisconnectCause, FlagMandatory, 0, Enumerated(cause)))

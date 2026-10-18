@@ -572,9 +572,10 @@ func (n *Node) forget(c *conn, p *Peer, host string) {
 	}
 }
 
-// Shutdown stops accepting and reconnecting, sends DPR (REBOOTING) on every
-// open connection, waits for the answers (each at most RequestTimeout) and
-// for running handlers, then returns. When ctx ends first, every connection
+// Shutdown stops accepting and reconnecting, and on every open connection
+// refuses new requests (DIAMETER_UNABLE_TO_DELIVER), lets running handlers
+// send their answers, sends DPR (REBOOTING) and waits for the DPA (at most
+// RequestTimeout) before closing. When ctx ends first, every connection
 // is closed at once and Shutdown returns ctx's error without waiting for
 // handlers that ignore their context.
 func (n *Node) Shutdown(ctx context.Context) error {
