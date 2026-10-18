@@ -2,29 +2,40 @@
 // which RCS clients exchange chat messages, standalone messages and disposition
 // notifications.
 //
-// Message headers are kept exactly as received. RFC 3862 §2.2 forbids changing
-// their octets or their order in transit and §6 forbids a gateway from changing
-// the content at all, so a Message stores raw header values and Marshal of a
-// parsed Message reproduces every message header octet. Accessors such as From,
-// To and DateTime interpret the raw values on demand.
+// RFC 3862 §2.2 forbids changing message header octets or their order in
+// transit, and §6 forbids a gateway from changing the content at all. A relay
+// that forwards a message unchanged must therefore forward the bytes it
+// received, not Marshal of the parsed Message: Marshal writes the canonical
+// form, which differs from the input wherever Parse was lenient and wherever
+// a content header was folded.
 //
-// Header names are case-sensitive (RFC 3862 §3). A prefixed name such as
-// "imdn.Message-ID" belongs to the namespace an earlier NS header bound to the
-// prefix (§3.4), so Get and Add take a namespace URI rather than a prefix: the
-// prefix is the sender's choice and carries no meaning of its own.
+// Parse is lenient about how a header is laid out but strict about what it
+// says. It accepts bare LF line ends when the headers use them throughout, any
+// white space around a header value (or none), and empty values, because a
+// rejected message is a lost message. It still rejects mixed line ends,
+// control characters, invalid UTF-8, header names outside the grammar, broken
+// namespace declarations, a missing Content-Type and anything beyond Limits.
+// Header values are interpreted on demand: From, To, Cc and DateTime check
+// their own header, so one bad cc does not lose the whole message. Marshal is
+// strict and writes only what RFC 3862 §3.6 allows.
+//
+// Header names are case-sensitive (RFC 3862 §2.2): "from" is an unknown header,
+// kept as such, not From. A prefixed name such as "imdn.Message-ID" belongs to
+// the namespace an earlier NS header bound to the prefix (§3.4), so Get and Add
+// take a namespace URI rather than a prefix: the prefix is the sender's choice
+// and carries no meaning of its own.
 //
 // The encapsulated object keeps its MIME headers and body (§2.4). MIME header
 // names are case-insensitive, folded MIME headers are unfolded, and the body is
 // opaque bytes.
 //
-// Parse rejects rather than repairs: anything outside the §3.6 grammar is an
-// error, and Limits bound what Parse accepts. Error messages never contain
-// header values, because those carry subscriber addresses.
+// Every rejection is an *Error whose Reason can be counted. Error messages
+// identify input by line number only and never quote it: values carry
+// subscriber addresses, and a header name can be shaped like one.
 package cpim
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -59,17 +70,9 @@ const (
 	DefaultMaxSize = 1 << 20
 	// DefaultMaxHeaders is far above the dozen headers a real message carries.
 	DefaultMaxHeaders = 64
-)
-
-var (
-	// ErrMalformed reports input outside the RFC 3862 grammar.
-	ErrMalformed = errors.New("cpim: malformed message")
-	// ErrTooLarge reports input beyond the configured Limits.
-	ErrTooLarge = errors.New("cpim: message exceeds limits")
-	// ErrMissingHeader reports that a header an accessor needs is absent.
-	ErrMissingHeader = errors.New("cpim: header not present")
-	// ErrUndeclaredNamespace reports that no prefix is bound to a namespace.
-	ErrUndeclaredNamespace = errors.New("cpim: namespace not declared")
+	// DefaultMaxContentHeaderSize is far above the few hundred bytes of
+	// content headers a real message carries.
+	DefaultMaxContentHeaderSize = 8 << 10
 )
 
 // Header is one message header.
@@ -120,11 +123,18 @@ type Message struct {
 
 // Limits bounds the input Parse accepts. The zero value applies the defaults.
 type Limits struct {
-	// MaxSize is the largest body accepted, in bytes.
+	// MaxSize is the largest message/cpim body accepted, headers included,
+	// in bytes.
 	MaxSize int
-	// MaxHeaders is the largest number of headers accepted in each of the
-	// message header and content header sections.
+	// MaxHeaders is the largest number of lines accepted in each of the
+	// message header and content header sections. Continuation lines of
+	// folded content headers count.
 	MaxHeaders int
+	// MaxContentHeaderSize is the largest content header section accepted,
+	// in bytes including line ends. The section is MIME, where a header may be
+	// folded over any number of lines, so it gets a bound of its own rather
+	// than a share of MaxSize.
+	MaxContentHeaderSize int
 }
 
 func (l Limits) maxSize() int {
@@ -141,25 +151,33 @@ func (l Limits) maxHeaders() int {
 	return DefaultMaxHeaders
 }
 
+func (l Limits) maxContentHeaderSize() int {
+	if l.MaxContentHeaderSize > 0 {
+		return l.MaxContentHeaderSize
+	}
+	return DefaultMaxContentHeaderSize
+}
+
 // Parse parses data with the default Limits.
 func Parse(data []byte) (*Message, error) {
 	return Limits{}.Parse(data)
 }
 
-// Parse parses a message/cpim body: the message headers, a blank line, the
-// content headers, a blank line and the content (RFC 3862 §2). The returned
+// Parse parses a message/cpim body: the message headers, an empty line, the
+// content headers, an empty line and the content (RFC 3862 §2). The returned
 // Message does not alias data.
 func (l Limits) Parse(data []byte) (*Message, error) {
 	if len(data) > l.maxSize() {
-		return nil, ErrTooLarge
+		return nil, reject(ReasonTooLarge, "message larger than MaxSize")
 	}
+	lf := usesBareLF(data)
 	m := &Message{}
 	rest := data
 	lineNo := 0
 	for {
-		line, r, ok := nextLine(rest)
+		line, r, ok := nextLine(rest, lf)
 		if !ok {
-			return nil, fmt.Errorf("%w: message headers are not terminated by a blank line", ErrMalformed)
+			return nil, reject(ReasonFraming, "message headers do not end with an empty line")
 		}
 		rest = r
 		lineNo++
@@ -167,69 +185,83 @@ func (l Limits) Parse(data []byte) (*Message, error) {
 			break
 		}
 		if len(m.Headers) == l.maxHeaders() {
-			return nil, fmt.Errorf("%w: more than %d message headers", ErrTooLarge, l.maxHeaders())
+			return nil, reject(ReasonTooLarge, "more message headers than MaxHeaders")
 		}
 		h, err := parseHeaderLine(string(line))
 		if err != nil {
-			return nil, fmt.Errorf("line %d: %w", lineNo, err)
+			return nil, atLine(err, lineNo)
 		}
 		m.Headers = append(m.Headers, h)
 	}
 
 	// A folded MIME header continues on lines starting with white space; it is
-	// joined to its first line before being parsed (RFC 5322 §2.2.3).
-	var raw []string
+	// joined to its first line before being parsed (RFC 5322 §2.2.3). Each
+	// header is appended to in place, so joining costs time linear in its
+	// length however many lines it is folded over.
+	var raw [][]byte
+	var rawLine []int
+	sectionStart, lines := len(data)-len(rest), 0
 	for {
-		line, r, ok := nextLine(rest)
+		line, r, ok := nextLine(rest, lf)
 		if !ok {
-			return nil, fmt.Errorf("%w: content headers are not terminated by a blank line", ErrMalformed)
+			return nil, reject(ReasonFraming, "content headers do not end with an empty line")
 		}
 		rest = r
 		lineNo++
+		if len(data)-len(rest)-sectionStart > l.maxContentHeaderSize() {
+			return nil, reject(ReasonTooLarge, "content headers longer than MaxContentHeaderSize")
+		}
 		if len(line) == 0 {
 			break
 		}
+		if lines == l.maxHeaders() {
+			return nil, reject(ReasonTooLarge, "more content header lines than MaxHeaders")
+		}
+		lines++
 		if line[0] == ' ' || line[0] == '\t' {
 			if len(raw) == 0 {
-				return nil, fmt.Errorf("%w: line %d: continuation line without a header", ErrMalformed, lineNo)
+				return nil, atLine(reject(ReasonFraming, "continuation line without a header"), lineNo)
 			}
-			raw[len(raw)-1] += string(line)
+			raw[len(raw)-1] = append(raw[len(raw)-1], line...)
 			continue
 		}
-		if len(raw) == l.maxHeaders() {
-			return nil, fmt.Errorf("%w: more than %d content headers", ErrTooLarge, l.maxHeaders())
-		}
-		raw = append(raw, string(line))
+		raw = append(raw, bytes.Clone(line))
+		rawLine = append(rawLine, lineNo)
 	}
-	for i, s := range raw {
-		f, err := parseFieldLine(s)
+	for i, b := range raw {
+		f, err := parseFieldLine(string(b))
 		if err != nil {
-			return nil, fmt.Errorf("content header %d: %w", i+1, err)
+			return nil, atLine(err, rawLine[i])
 		}
 		m.ContentHeaders = append(m.ContentHeaders, f)
 	}
 	m.Body = bytes.Clone(rest)
 
-	if err := m.checkSemantics(); err != nil {
+	if err := m.checkStructure(); err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
-// Marshal serializes m. It fails rather than emit a body that Parse would
-// reject, so a header value can never smuggle a line break into the output.
+// Marshal serializes m in canonical form: CRLF line ends, one space after
+// each colon. It fails rather than emit anything Parse would reject or read
+// differently, so a header value can never smuggle a line break into the
+// output, and it checks the values of the core headers it knows.
 func (m *Message) Marshal() ([]byte, error) {
 	for i, h := range m.Headers {
 		if err := checkHeader(h); err != nil {
-			return nil, fmt.Errorf("header %d: %w", i+1, err)
+			return nil, atLine(err, i+1)
 		}
 	}
 	for i, f := range m.ContentHeaders {
 		if err := checkField(f); err != nil {
-			return nil, fmt.Errorf("content header %d: %w", i+1, err)
+			return nil, atLine(err, len(m.Headers)+2+i)
 		}
 	}
-	if err := m.checkSemantics(); err != nil {
+	if err := m.checkStructure(); err != nil {
+		return nil, err
+	}
+	if err := m.checkCoreValues(); err != nil {
 		return nil, err
 	}
 	var b bytes.Buffer
@@ -253,41 +285,46 @@ func (m *Message) Marshal() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// checkSemantics validates what the line syntax alone cannot: namespace
-// declarations precede their use, core header values have their §4 syntax,
-// and the content has a Content-Type (§2.4).
-func (m *Message) checkSemantics() error {
+// checkStructure validates what every later header depends on: namespace
+// declarations are valid and precede their use (§3.4), and the content has a
+// Content-Type (§2.4).
+func (m *Message) checkStructure() error {
 	var firstErr error
-	m.walk(func(i int, h Header, ns, local string, err error) {
-		if firstErr != nil {
-			return
-		}
-		if err != nil {
-			firstErr = fmt.Errorf("header %d: %w", i+1, err)
-			return
-		}
-		if ns != CoreNamespace {
-			return
-		}
-		switch local {
-		case HeaderFrom, HeaderTo, HeaderCc:
-			_, err = ParseAddress(h.Value)
-		case HeaderDateTime:
-			_, err = parseDateTime(h.Value)
-		case HeaderRequire:
-			err = checkRequire(h.Value)
-		}
-		if err != nil {
-			firstErr = fmt.Errorf("header %d (%s): %w", i+1, local, err)
+	m.walk(func(i int, _ Header, _, _ string, err error) {
+		if firstErr == nil && err != nil {
+			firstErr = atLine(err, i+1)
 		}
 	})
 	if firstErr != nil {
 		return firstErr
 	}
 	if _, ok := m.ContentHeader("Content-Type"); !ok {
-		return fmt.Errorf("%w: content has no Content-Type", ErrMalformed)
+		return reject(ReasonContentType, "content has no Content-Type")
 	}
 	return nil
+}
+
+// checkCoreValues checks the §4 syntax of the core headers Marshal writes.
+// Parse leaves this to the accessors.
+func (m *Message) checkCoreValues() error {
+	var firstErr error
+	m.walk(func(i int, h Header, ns, local string, err error) {
+		if firstErr != nil || err != nil || ns != CoreNamespace {
+			return
+		}
+		switch local {
+		case HeaderFrom, HeaderTo, HeaderCc:
+			_, err = ParseAddress(h.Value)
+		case HeaderDateTime:
+			_, err = ParseDateTime(h.Value)
+		case HeaderRequire:
+			err = checkRequire(h.Value)
+		}
+		if err != nil {
+			firstErr = atLine(err, i+1)
+		}
+	})
+	return firstErr
 }
 
 // walk calls fn for every header with the namespace and local name it
@@ -341,6 +378,25 @@ func (m *Message) Add(ns, name, value string) error {
 	return nil
 }
 
+// AddFirst inserts a header named name in namespace ns in front of every
+// existing header of that name, or appends it like Add when there is none. A
+// list such as IMDN-Record-Route, where each intermediary goes on top (RFC
+// 5438 §8), needs this. The new header copies the existing first one's name,
+// prefix included, so at that position it resolves to the same namespace.
+func (m *Message) AddFirst(ns, name, value string) error {
+	at := -1
+	m.walk(func(i int, _ Header, hns, local string, err error) {
+		if at < 0 && err == nil && hns == ns && local == name {
+			at = i
+		}
+	})
+	if at < 0 {
+		return m.Add(ns, name, value)
+	}
+	m.Headers = slices.Insert(m.Headers, at, Header{Name: m.Headers[at].Name, Value: value})
+	return nil
+}
+
 // Declare makes ns usable by Add, appending "NS: prefix <ns>" unless some
 // prefix is already bound to ns. An empty prefix makes ns the default namespace
 // for every later unprefixed header, so core headers must be added before it.
@@ -356,10 +412,10 @@ func (m *Message) Declare(prefix, ns string) error {
 		return fmt.Errorf("%w: %s, needed to write an NS header", ErrUndeclaredNamespace, CoreNamespace)
 	}
 	if prefix != "" && !isName(prefix) {
-		return fmt.Errorf("%w: invalid namespace prefix", ErrMalformed)
+		return reject(ReasonNamespace, "invalid namespace prefix")
 	}
 	if !isAbsoluteURI(ns) || strings.ContainsRune(ns, '#') {
-		return fmt.Errorf("%w: namespace is not an absolute URI", ErrMalformed)
+		return reject(ReasonNamespace, "namespace is not an absolute URI")
 	}
 	value := "<" + ns + ">"
 	if prefix != "" {
@@ -408,13 +464,14 @@ func (m *Message) addresses(name string) ([]Address, error) {
 	return out, nil
 }
 
-// DateTime returns the time the sender sent the message (RFC 3862 §4.4).
+// DateTime returns the time the sender sent the message (RFC 3862 §4.4). The
+// raw value, which an IMDN echoes, is Get(CoreNamespace, HeaderDateTime).
 func (m *Message) DateTime() (time.Time, error) {
 	h, ok := m.Get(CoreNamespace, HeaderDateTime)
 	if !ok {
 		return time.Time{}, fmt.Errorf("%w: %s", ErrMissingHeader, HeaderDateTime)
 	}
-	return parseDateTime(h.Value)
+	return ParseDateTime(h.Value)
 }
 
 // FormatDateTime formats t for a DateTime header. Whole seconds are enough for
@@ -424,10 +481,30 @@ func FormatDateTime(t time.Time) string {
 	return t.Format(time.RFC3339)
 }
 
-func parseDateTime(v string) (time.Time, error) {
+// ParseDateTime parses an RFC 3339 date-time, including the forms Go's
+// time.RFC3339 layout refuses: lower-case "t" and "z" (RFC 3339 §5.6) and a
+// leap second, second 60 (§5.7). time.Time cannot hold a leap second, so it
+// becomes the first instant after it.
+func ParseDateTime(v string) (time.Time, error) {
+	v = strings.Map(func(r rune) rune {
+		switch r {
+		case 't':
+			return 'T'
+		case 'z':
+			return 'Z'
+		}
+		return r
+	}, v)
+	leap := len(v) > 19 && v[10] == 'T' && v[16] == ':' && v[17:19] == "60"
+	if leap {
+		v = v[:17] + "59" + v[19:]
+	}
 	t, err := time.Parse(time.RFC3339, v)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("%w: DateTime is not an RFC 3339 date-time", ErrMalformed)
+		return time.Time{}, reject(ReasonValue, "DateTime is not an RFC 3339 date-time")
+	}
+	if leap {
+		t = t.Add(time.Second)
 	}
 	return t, nil
 }

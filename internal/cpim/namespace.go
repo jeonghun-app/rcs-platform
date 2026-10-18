@@ -1,7 +1,6 @@
 package cpim
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 )
@@ -25,7 +24,7 @@ func (s *scope) resolve(name string) (ns, local string, err error) {
 	ns, ok = s.prefixes[prefix]
 	if !ok {
 		// §3.4: a prefix must be declared before it is used.
-		return "", local, fmt.Errorf("%w: namespace prefix used before its NS header", ErrMalformed)
+		return "", local, reject(ReasonNamespace, "namespace prefix used before its NS header")
 	}
 	return ns, local, nil
 }
@@ -36,16 +35,16 @@ func (s *scope) resolve(name string) (ns, local string, err error) {
 func (s *scope) declare(value string) error {
 	prefix, uri, ok := strings.Cut(value, "<")
 	if !ok || !strings.HasSuffix(uri, ">") {
-		return fmt.Errorf("%w: NS value is not [prefix] <URI>", ErrMalformed)
+		return reject(ReasonNamespace, "NS value is not [prefix] <URI>")
 	}
 	uri = uri[:len(uri)-1]
 	prefix = strings.TrimSuffix(prefix, " ")
 	if prefix != "" && !isName(prefix) {
-		return fmt.Errorf("%w: invalid namespace prefix", ErrMalformed)
+		return reject(ReasonNamespace, "invalid namespace prefix")
 	}
 	// §3.4: a namespace is an absolute URI without a fragment.
 	if !isAbsoluteURI(uri) || strings.ContainsRune(uri, '#') {
-		return fmt.Errorf("%w: namespace is not an absolute URI", ErrMalformed)
+		return reject(ReasonNamespace, "namespace is not an absolute URI")
 	}
 	if prefix == "" {
 		s.def = uri

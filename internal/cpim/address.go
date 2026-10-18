@@ -12,7 +12,10 @@ import (
 // [ Formal-name ] "<" URI ">" (RFC 3862 §4.1-§4.3).
 type Address struct {
 	// Name is the formal name with quoting and escapes removed; empty when
-	// the header carries only a URI.
+	// the header carries only a URI. Because escapes are decoded, Name may
+	// contain control characters including CR and LF: escape or reject them
+	// before copying Name into another protocol's header, such as a SIP
+	// display name. String re-escapes it for CPIM.
 	Name string
 	// URI is the address, for example a sip: or tel: URI.
 	URI string
@@ -21,7 +24,7 @@ type Address struct {
 // ParseAddress parses a From, To or cc header value.
 func ParseAddress(v string) (Address, error) {
 	if !utf8.ValidString(v) || hasControl(v, false) {
-		return Address{}, fmt.Errorf("%w: address contains an invalid character", ErrMalformed)
+		return Address{}, reject(ReasonValue, "address contains an invalid character")
 	}
 	var a Address
 	rest := v
@@ -29,7 +32,7 @@ func ParseAddress(v string) (Address, error) {
 	case strings.HasPrefix(v, `"`):
 		end := quotedEnd(v, 0)
 		if end < 0 {
-			return Address{}, fmt.Errorf("%w: unterminated formal name", ErrMalformed)
+			return Address{}, reject(ReasonValue, "unterminated formal name")
 		}
 		a.Name = Unescape(v[1 : end-1])
 		// The grammar puts "<" straight after the closing quote, but writers
@@ -38,18 +41,18 @@ func ParseAddress(v string) (Address, error) {
 	case !strings.HasPrefix(v, "<"):
 		i := strings.IndexByte(v, '<')
 		if i < 0 || !isFormalTokens(v[:i]) {
-			return Address{}, fmt.Errorf("%w: formal name is not 1*( Token SP ) or a quoted string", ErrMalformed)
+			return Address{}, reject(ReasonValue, "formal name is not 1*( Token SP ) or a quoted string")
 		}
 		a.Name = v[:i-1]
 		rest = v[i:]
 	}
 	uri, ok := strings.CutPrefix(rest, "<")
 	if !ok {
-		return Address{}, fmt.Errorf("%w: address has no <URI>", ErrMalformed)
+		return Address{}, reject(ReasonValue, "address has no <URI>")
 	}
 	uri, ok = strings.CutSuffix(uri, ">")
 	if !ok || !isAbsoluteURI(uri) {
-		return Address{}, fmt.Errorf("%w: address URI is not an absolute URI in angle brackets", ErrMalformed)
+		return Address{}, reject(ReasonValue, "address URI is not an absolute URI in angle brackets")
 	}
 	a.URI = uri
 	return a, nil

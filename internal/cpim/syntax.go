@@ -2,7 +2,6 @@ package cpim
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 	"unicode/utf8"
 )
@@ -10,16 +9,32 @@ import (
 func checkRequire(v string) error {
 	for name := range strings.SplitSeq(v, ",") {
 		if !isHeaderName(strings.Trim(name, " ")) {
-			return fmt.Errorf("%w: Require lists an invalid header name", ErrMalformed)
+			return reject(ReasonValue, "Require lists an invalid header name")
 		}
 	}
 	return nil
 }
 
-// nextLine splits data at the first CRLF, the only line terminator RFC 3862
-// §2.2 allows. A bare CR or LF stays inside the line, where the control
-// character checks reject it.
-func nextLine(data []byte) (line, rest []byte, ok bool) {
+// usesBareLF reports whether data ends its first line with a bare LF. RFC 3862
+// §2.2 requires CRLF, but a writer that uses LF throughout is unambiguous,
+// so Parse reads such headers rather than reject them. A message whose
+// headers mix the two is still rejected.
+func usesBareLF(data []byte) bool {
+	i := bytes.IndexByte(data, '\n')
+	return i >= 0 && (i == 0 || data[i-1] != '\r')
+}
+
+// nextLine splits data at the first line end: CRLF, or LF when lf is set. A
+// stray CR or LF stays inside the line, where checkChars reports it as mixed
+// line endings.
+func nextLine(data []byte, lf bool) (line, rest []byte, ok bool) {
+	if lf {
+		i := bytes.IndexByte(data, '\n')
+		if i < 0 {
+			return nil, nil, false
+		}
+		return data[:i], data[i+1:], true
+	}
 	i := bytes.Index(data, []byte("\r\n"))
 	if i < 0 {
 		return nil, nil, false
@@ -27,43 +42,63 @@ func nextLine(data []byte) (line, rest []byte, ok bool) {
 	return data[:i], data[i+2:], true
 }
 
-// parseHeaderLine parses Header-name ":" *( ";" Parameter ) SP Header-value
-// (RFC 3862 §3.6).
-func parseHeaderLine(line string) (Header, error) {
-	if !utf8.ValidString(line) {
-		return Header{}, fmt.Errorf("%w: header is not UTF-8", ErrMalformed)
+// checkChars rejects invalid UTF-8 and control characters (RFC 3862 §2.2),
+// optionally allowing horizontal tab.
+func checkChars(s string, allowTab bool) error {
+	if !utf8.ValidString(s) {
+		return reject(ReasonEncoding, "header is not UTF-8")
 	}
-	// §2.2: control characters are written as escape sequences.
-	if hasControl(line, false) {
-		return Header{}, fmt.Errorf("%w: control character in header", ErrMalformed)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\r' || c == '\n':
+			return reject(ReasonLineEnding, "CRLF and LF line ends are mixed")
+		case c == '\t' && allowTab:
+		case c < 0x20 || c == 0x7f:
+			return reject(ReasonControl, "control character in header")
+		}
+	}
+	return nil
+}
+
+// parseHeaderLine parses Header-name ":" *( ";" Parameter ) SP Header-value
+// (RFC 3862 §3.6), reading the value leniently: any amount of space or tab
+// around it, including none, is not part of the value, and the value may be
+// empty. Nothing else about the grammar is relaxed. checkHeader holds what
+// Marshal writes to the exact grammar.
+func parseHeaderLine(line string) (Header, error) {
+	if err := checkChars(line, true); err != nil {
+		return Header{}, err
 	}
 	name, rest, ok := strings.Cut(line, ":")
 	if !ok || !isHeaderName(name) {
-		return Header{}, fmt.Errorf("%w: invalid header name", ErrMalformed)
+		return Header{}, reject(ReasonHeaderName, "invalid header name")
 	}
 	_, n, err := parseParams(rest)
 	if err != nil {
 		return Header{}, err
 	}
-	params, rest := rest[:n], rest[n:]
-	// §2.2: exactly one space after the colon and no white space at the end
-	// of the line, which also rules out an empty value.
-	value, ok := strings.CutPrefix(rest, " ")
-	if !ok || value == "" || value[0] == ' ' || value[len(value)-1] == ' ' {
-		return Header{}, fmt.Errorf("%w: header %s needs one space before a value without surrounding white space", ErrMalformed, name)
+	params, value := rest[:n], strings.Trim(rest[n:], " \t")
+	if strings.ContainsRune(params, '\t') || strings.ContainsRune(value, '\t') {
+		return Header{}, reject(ReasonControl, "control character in header")
 	}
 	return Header{Name: name, Params: params, Value: value}, nil
 }
 
-// checkHeader reports whether Marshal can write h as one line that parses back
-// to exactly h.
+// checkHeader reports whether Marshal can write h as one canonical line,
+// exactly one space after the colon and no white space at either end (RFC
+// 3862 §2.2), that parses back to exactly h. A canonical line cannot carry an
+// empty value: it would end in a space.
 func checkHeader(h Header) error {
+	if h.Value == "" {
+		return reject(ReasonValue, "an empty value cannot be written")
+	}
 	parsed, err := parseHeaderLine(h.Name + ":" + h.Params + " " + h.Value)
 	if err != nil {
 		return err
 	}
 	if parsed != h {
-		return fmt.Errorf("%w: header fields do not survive serialization", ErrMalformed)
+		return reject(ReasonValue, "header fields do not survive serialization")
 	}
 	return nil
 }
@@ -85,14 +120,14 @@ func parseParams(s string) ([]param, int, error) {
 			eq++
 		}
 		if eq == start || eq >= len(s) || s[eq] != '=' {
-			return nil, 0, fmt.Errorf("%w: invalid header parameter", ErrMalformed)
+			return nil, 0, reject(ReasonParameter, "invalid header parameter")
 		}
 		var value string
 		end := eq + 1
 		if end < len(s) && s[end] == '"' {
 			q := quotedEnd(s, end)
 			if q < 0 {
-				return nil, 0, fmt.Errorf("%w: unterminated quoted header parameter", ErrMalformed)
+				return nil, 0, reject(ReasonParameter, "unterminated quoted header parameter")
 			}
 			value = Unescape(s[end+1 : q-1])
 			end = q
@@ -105,7 +140,7 @@ func parseParams(s string) ([]param, int, error) {
 				end += size
 			}
 			if end == eq+1 {
-				return nil, 0, fmt.Errorf("%w: empty header parameter value", ErrMalformed)
+				return nil, 0, reject(ReasonParameter, "empty header parameter value")
 			}
 			value = s[eq+1 : end]
 		}
@@ -136,11 +171,11 @@ func quotedEnd(s string, start int) int {
 func parseFieldLine(line string) (Field, error) {
 	name, value, ok := strings.Cut(line, ":")
 	if !ok || !isFieldName(name) {
-		return Field{}, fmt.Errorf("%w: invalid content header name", ErrMalformed)
+		return Field{}, reject(ReasonHeaderName, "invalid content header name")
 	}
 	value = strings.Trim(value, " \t")
-	if !utf8.ValidString(value) || hasControl(value, true) {
-		return Field{}, fmt.Errorf("%w: invalid character in content header %s", ErrMalformed, name)
+	if err := checkChars(value, true); err != nil {
+		return Field{}, err
 	}
 	return Field{Name: name, Value: value}, nil
 }
@@ -152,7 +187,7 @@ func checkField(f Field) error {
 		return err
 	}
 	if parsed != f {
-		return fmt.Errorf("%w: content header %s has surrounding white space", ErrMalformed, f.Name)
+		return reject(ReasonValue, "content header has surrounding white space")
 	}
 	return nil
 }

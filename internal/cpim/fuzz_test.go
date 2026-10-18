@@ -7,21 +7,29 @@ import (
 	"unicode/utf8"
 )
 
-// FuzzParse checks that Parse never panics and that whatever it accepts
-// survives Marshal: the same message comes back and the message headers are
-// byte-identical, as RFC 3862 §2.2 requires of anything that relays them.
+// FuzzParse checks that Parse never panics, that every rejection carries a
+// Reason, and that whatever Marshal accepts is a fixed point: it parses back
+// to the same message and marshals to the same bytes. Byte-identity with
+// canonical input is TestParseThenMarshalReproducesMessageHeadersExactly.
 func FuzzParse(f *testing.F) {
 	f.Add(chatMessage)
 	f.Add(crlf("From: \"A \\\"B\\\"\" <" + alice + ">\nSubject:;lang=fr;x=\"a b\" Bonjour\nNS: <urn:example:wily>\nrunner-trap: set\n\ncontent-type: multipart/mixed;\n boundary=b\n\n--b--"))
 	f.Add(crlf("NS: x <urn:ietf:params:imdn>\nx.Message-ID: 1\nRequire: x.Message-ID\n\nContent-Type: text/plain\n\n"))
+	f.Add([]byte("From:<" + alice + ">  \nSubject:\nDateTime: 2016-12-31t23:59:60z\n\nContent-Type: text/plain\n\nHi"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		m, err := Parse(data)
 		if err != nil {
+			if ReasonOf(err) == "" {
+				t.Fatalf("rejection without a reason: %v", err)
+			}
 			return
 		}
 		out, err := m.Marshal()
 		if err != nil {
-			t.Fatalf("Marshal of a parsed message failed: %v", err)
+			if ReasonOf(err) == "" {
+				t.Fatalf("Marshal failure without a reason: %v", err)
+			}
+			return
 		}
 		again, err := Parse(out)
 		if err != nil {
@@ -30,13 +38,8 @@ func FuzzParse(f *testing.F) {
 		if !reflect.DeepEqual(again, m) {
 			t.Fatalf("round trip changed the message:\n%#v\n%#v", m, again)
 		}
-		if len(m.Headers) == 0 {
-			return
-		}
-		// With at least one header, the first empty line ends the headers.
-		headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
-		if !bytes.Equal(out[:headerEnd], data[:headerEnd]) {
-			t.Fatalf("message headers changed:\n%q\n%q", data[:headerEnd], out[:headerEnd])
+		if twice, err := again.Marshal(); err != nil || !bytes.Equal(twice, out) {
+			t.Fatalf("Marshal is not stable:\n%q\n%q, %v", out, twice, err)
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -122,62 +123,257 @@ Content-ID: <1234@example.com>
 	}
 }
 
-func TestMalformedMessagesAreRejected(t *testing.T) {
+func TestMalformedMessagesAreRejectedWithACountableReason(t *testing.T) {
 	const ok = "From: <" + alice + ">\nTo: <" + bob + ">\n"
 	const content = "\nContent-Type: text/plain\n\nHi"
-	tests := map[string][]byte{
-		"bare LF line endings":            []byte("From: <" + alice + ">\n\nContent-Type: text/plain\n\nHi"),
-		"no blank line after headers":     crlf(ok),
-		"no blank line after content":     crlf(ok + "\nContent-Type: text/plain"),
-		"content headers missing":         crlf(ok + "\nHi"),
-		"no Content-Type":                 crlf(ok + "\nContent-ID: <x@example.com>\n\nHi"),
-		"header without colon":            crlf("From <" + alice + ">\n" + content),
-		"space in header name":            crlf("Fr om: <" + alice + ">\n" + content),
-		"separator in header name":        crlf("Fr@m: x\n" + content),
-		"two dots in header name":         crlf("NS: a <urn:x:y>\na.b.c: x\n" + content),
-		"empty prefix":                    crlf(".Message-ID: x\n" + content),
-		"no space after colon":            crlf("From:<" + alice + ">\n" + content),
-		"two spaces after colon":          crlf("From:  <" + alice + ">\n" + content),
-		"trailing space":                  crlf("Subject: hi \n" + content),
-		"empty value":                     crlf("Subject: \n" + content),
-		"leading white space":             crlf(" From: <" + alice + ">\n" + content),
-		"tab in header value":             crlf("Subject: a\tb\n" + content),
-		"bare CR in header":               crlf("Subject: a\rb\n" + content),
-		"invalid UTF-8":                   crlf("Subject: \xff\n" + content),
-		"prefix used before declaration":  crlf("imdn.Message-ID: x\nNS: imdn <urn:ietf:params:imdn>\n" + content),
-		"NS without angle brackets":       crlf("NS: imdn urn:ietf:params:imdn\n" + content),
-		"NS with relative URI":            crlf("NS: imdn <imdn>\n" + content),
-		"NS with fragment":                crlf("NS: imdn <urn:x:y#z>\n" + content),
-		"NS with invalid prefix":          crlf("NS: im/dn <urn:x:y>\n" + content),
-		"From without angle brackets":     crlf("From: " + alice + "\n" + content),
-		"From with unquoted separator":    crlf("From: Smith, Alice <" + alice + ">\n" + content),
-		"To with space in URI":            crlf("To: <sip:a b@example.com>\n" + content),
-		"DateTime not RFC 3339":           crlf("DateTime: 18 Oct 2026 09:30:00 +0900\n" + content),
-		"Require with invalid name":       crlf("Require: a b\n" + content),
-		"parameter without value":         crlf("Subject:;lang hi\n" + content),
-		"parameter with empty value":      crlf("Subject:;lang= hi\n" + content),
-		"unterminated quoted parameter":   crlf(`Subject:;x="a hi` + "\n" + content),
-		"continuation before any content": crlf(ok + "\n Content-Type: text/plain\n\nHi"),
-		"invalid content header name":     crlf(ok + "\nContent Type: text/plain\n\nHi"),
-		"control in content header":       crlf(ok + "\nContent-Type: text/plain\x00\n\nHi"),
+	tests := map[string]struct {
+		data   []byte
+		reason Reason
+	}{
+		"no line end at all":              {[]byte("From: <" + alice + ">"), ReasonFraming},
+		"no empty line after headers":     {crlf(ok), ReasonFraming},
+		"no empty line after content":     {crlf(ok + "\nContent-Type: text/plain"), ReasonFraming},
+		"content headers missing":         {crlf(ok + "\nHi"), ReasonFraming},
+		"continuation before any content": {crlf(ok + "\n Content-Type: text/plain\n\nHi"), ReasonFraming},
+		"CRLF then LF":                    {[]byte("From: <" + alice + ">\r\nTo: <" + bob + ">\n\r\nContent-Type: text/plain\r\n\r\n"), ReasonLineEnding},
+		"LF then CRLF":                    {[]byte("From: <" + alice + ">\nTo: <" + bob + ">\r\n\nContent-Type: text/plain\n\n"), ReasonLineEnding},
+		"LF then CRLF in content":         {[]byte("From: <" + alice + ">\n\nContent-Type: text/plain\r\n\n"), ReasonLineEnding},
+		"bare CR in header":               {crlf("Subject: a\rb\n" + content), ReasonLineEnding},
+		"invalid UTF-8":                   {crlf("Subject: \xff\n" + content), ReasonEncoding},
+		"tab inside a header value":       {crlf("Subject: a\tb\n" + content), ReasonControl},
+		"tab inside parameters":           {crlf("Subject:;x=\"a\tb\" hi\n" + content), ReasonControl},
+		"NUL in header":                   {crlf("Subject: a\x00\n" + content), ReasonControl},
+		"control in content header":       {crlf(ok + "\nContent-Type: text/plain\x00\n\nHi"), ReasonControl},
+		"header without colon":            {crlf("From <" + alice + ">\n" + content), ReasonHeaderName},
+		"space in header name":            {crlf("Fr om: <" + alice + ">\n" + content), ReasonHeaderName},
+		"separator in header name":        {crlf("Fr@m: x\n" + content), ReasonHeaderName},
+		"two dots in header name":         {crlf("NS: a <urn:x:y>\na.b.c: x\n" + content), ReasonHeaderName},
+		"empty prefix":                    {crlf(".Message-ID: x\n" + content), ReasonHeaderName},
+		"leading white space":             {crlf(" From: <" + alice + ">\n" + content), ReasonHeaderName},
+		"invalid content header name":     {crlf(ok + "\nContent Type: text/plain\n\nHi"), ReasonHeaderName},
+		"parameter without value":         {crlf("Subject:;lang hi\n" + content), ReasonParameter},
+		"parameter with empty value":      {crlf("Subject:;lang= hi\n" + content), ReasonParameter},
+		"unterminated quoted parameter":   {crlf(`Subject:;x="a hi` + "\n" + content), ReasonParameter},
+		"prefix used before declaration":  {crlf("imdn.Message-ID: x\nNS: imdn <urn:ietf:params:imdn>\n" + content), ReasonNamespace},
+		"NS without angle brackets":       {crlf("NS: imdn urn:ietf:params:imdn\n" + content), ReasonNamespace},
+		"NS with relative URI":            {crlf("NS: imdn <imdn>\n" + content), ReasonNamespace},
+		"NS with fragment":                {crlf("NS: imdn <urn:x:y#z>\n" + content), ReasonNamespace},
+		"NS with invalid prefix":          {crlf("NS: im/dn <urn:x:y>\n" + content), ReasonNamespace},
+		"empty NS":                        {crlf("NS:\n" + content), ReasonNamespace},
+		"no Content-Type":                 {crlf(ok + "\nContent-ID: <x@example.com>\n\nHi"), ReasonContentType},
 	}
-	for name, data := range tests {
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := Parse(data)
-			if !errors.Is(err, ErrMalformed) {
-				t.Fatalf("Parse() error = %v, want ErrMalformed", err)
+			_, err := Parse(tt.data)
+			if !errors.Is(err, ErrMalformed) || ReasonOf(err) != tt.reason {
+				t.Fatalf("Parse() error = %v (reason %q), want ErrMalformed with reason %q", err, ReasonOf(err), tt.reason)
 			}
 		})
 	}
 }
 
-func TestErrorsDoNotRevealHeaderValues(t *testing.T) {
-	_, err := Parse(crlf("From: " + alice + "\n\nContent-Type: text/plain\n\n"))
-	if err == nil {
-		t.Fatal("Parse accepted a From without angle brackets")
+func TestErrorsNameTheLine(t *testing.T) {
+	_, err := Parse(crlf("From: <" + alice + ">\nFr@m: x\n\nContent-Type: text/plain\n\n"))
+	var e *Error
+	if !errors.As(err, &e) || e.Line != 2 || !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("Parse() error = %#v", err)
 	}
-	if strings.Contains(err.Error(), "15550100001") {
-		t.Errorf("error %q reveals the subscriber address", err)
+	_, err = Parse(crlf("From: <" + alice + ">\n\nContent-Type: text/plain\nContent Type: x\n\n"))
+	if !errors.As(err, &e) || e.Line != 4 {
+		t.Errorf("content header error = %#v", err)
+	}
+	if ReasonOf(errors.New("other")) != "" {
+		t.Error("ReasonOf invented a reason for a foreign error")
+	}
+}
+
+func TestLayoutDeviationsAreReadWithoutRewritingTheValue(t *testing.T) {
+	tests := map[string]struct {
+		data []byte
+		want []Header
+	}{
+		"bare LF throughout": {
+			[]byte("From: <" + alice + ">\nTo: <" + bob + ">\n\nContent-Type: text/plain\n\nHi\r\n"),
+			[]Header{{Name: "From", Value: "<" + alice + ">"}, {Name: "To", Value: "<" + bob + ">"}},
+		},
+		"no space after the colon": {
+			crlf("From:<" + alice + ">\nSubject:;lang=fr Bonjour\n\nContent-Type: text/plain\n\nHi"),
+			[]Header{{Name: "From", Value: "<" + alice + ">"}, {Name: "Subject", Params: ";lang=fr", Value: "Bonjour"}},
+		},
+		"several spaces and trailing white space": {
+			crlf("From:   <" + alice + ">  \nSubject: hi\t\n\nContent-Type: text/plain\n\nHi"),
+			[]Header{{Name: "From", Value: "<" + alice + ">"}, {Name: "Subject", Value: "hi"}},
+		},
+		"empty values": {
+			crlf("Subject:\nNS: imdn <urn:ietf:params:imdn>\nimdn.Disposition-Notification: \n\nContent-Type: text/plain\n\nHi"),
+			[]Header{{Name: "Subject"}, {Name: "NS", Value: "imdn <urn:ietf:params:imdn>"}, {Name: "imdn.Disposition-Notification"}},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			m := mustParse(t, tt.data)
+			if !reflect.DeepEqual(m.Headers, tt.want) {
+				t.Errorf("Headers = %#v", m.Headers)
+			}
+			if m.ContentType() != "text/plain" {
+				t.Errorf("ContentType() = %q", m.ContentType())
+			}
+		})
+	}
+	m := mustParse(t, []byte("From: <"+alice+">\n\nContent-Type: text/plain\n\nline\r\nend\n"))
+	if string(m.Body) != "line\r\nend\n" {
+		t.Errorf("Body = %q; the body is never touched", m.Body)
+	}
+	out, err := m.Marshal()
+	if err != nil || !bytes.HasPrefix(out, crlf("From: <"+alice+">\n\nContent-Type: text/plain\n\n")) {
+		t.Errorf("Marshal() = %q, %v; Marshal always writes CRLF", out, err)
+	}
+}
+
+func TestMarshalRefusesEmptyValuesParseAccepted(t *testing.T) {
+	m := mustParse(t, crlf("Subject:\n\nContent-Type: text/plain\n\n"))
+	if _, err := m.Marshal(); ReasonOf(err) != ReasonValue {
+		t.Errorf("Marshal() error = %v, want a value error", err)
+	}
+}
+
+func TestInvalidCoreValuesAreLeftToTheAccessors(t *testing.T) {
+	m := mustParse(t, crlf(`From: `+alice+`
+To: <`+bob+`>
+cc: Smith, Carol <`+carol+`>
+DateTime: 18 Oct 2026
+Require: a b
+
+Content-Type: text/plain
+
+Hi`))
+	if _, err := m.From(); ReasonOf(err) != ReasonValue {
+		t.Errorf("From() error = %v", err)
+	}
+	if to, err := m.To(); err != nil || to[0].URI != bob {
+		t.Errorf("To() = %v, %v; a valid header is unaffected by invalid neighbours", to, err)
+	}
+	if _, err := m.Cc(); ReasonOf(err) != ReasonValue {
+		t.Errorf("Cc() error = %v", err)
+	}
+	if _, err := m.DateTime(); ReasonOf(err) != ReasonValue {
+		t.Errorf("DateTime() error = %v", err)
+	}
+	if _, err := m.Marshal(); ReasonOf(err) != ReasonValue {
+		t.Errorf("Marshal() error = %v; sending stays strict", err)
+	}
+}
+
+func TestErrorsDoNotQuoteTheInput(t *testing.T) {
+	const content = "\nContent-Type: text/plain\n\n"
+	tests := map[string][]byte{
+		"invalid From":                  crlf("From: " + alice + "\n" + content),
+		"invalid To":                    crlf("To: <sip:+15550100001 x>\n" + content),
+		"identifier-shaped header name": crlf("+15550100001: a\x01\n" + content),
+		"identifier-shaped empty value": crlf("+15550100001:\n" + content),
+		"identifier-shaped prefix":      crlf("+15550100001.x: v\n" + content),
+		"invalid header name":           crlf("+15550100001 x: v\n" + content),
+		"invalid NS":                    crlf("NS: +15550100001 urn:x\n" + content),
+		"invalid DateTime":              crlf("DateTime: +15550100001\n" + content),
+		"invalid Require":               crlf("Require: +15550100001 x\n" + content),
+		"control in content header":     crlf("From: <" + alice + ">\n\n+15550100001: a\x01\n\n"),
+		"invalid content header name":   crlf("From: <" + alice + ">\n\n+15550100001 x: a\n\n"),
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Parse rejects some of these; the rest are accepted and fail in
+			// the accessors or in Marshal, whose errors must be as clean.
+			var errs []error
+			m, err := Parse(data)
+			if err != nil {
+				errs = append(errs, err)
+			} else {
+				_, e1 := m.From()
+				_, e2 := m.To()
+				_, e3 := m.DateTime()
+				_, e4 := m.Marshal()
+				errs = append(errs, e1, e2, e3, e4)
+			}
+			failed := false
+			for _, err := range errs {
+				if err == nil {
+					continue
+				}
+				failed = true
+				if strings.Contains(err.Error(), "15550100001") {
+					t.Errorf("error %q quotes the input", err)
+				}
+			}
+			if !failed {
+				t.Fatal("no step rejected the input")
+			}
+		})
+	}
+	bad := &Message{
+		Headers:        []Header{{Name: "From", Value: "<" + alice + ">"}},
+		ContentHeaders: []Field{{Name: "+15550100001", Value: " padded"}},
+	}
+	if _, err := bad.Marshal(); err == nil || strings.Contains(err.Error(), "15550100001") {
+		t.Errorf("Marshal() error = %v", err)
+	}
+}
+
+// foldedHeaders returns a message whose single content header is folded over
+// continuation lines until the content header section is size bytes long.
+func foldedHeaders(size int) []byte {
+	head := crlf("From: <" + alice + ">\n\nContent-Type: text/plain;\n")
+	fold := []byte(" x=y;\r\n")
+	section := make([]byte, 0, size+len(head))
+	section = append(section, head...)
+	for len(section)+len(fold)+2 <= size+len(head)-len("From: <"+alice+">\r\n\r\n") {
+		section = append(section, fold...)
+	}
+	return append(section, "\r\nbody"...)
+}
+
+func TestContentHeaderLimitsCountEveryLineAndByte(t *testing.T) {
+	if _, err := Parse(foldedHeaders(DefaultMaxContentHeaderSize + 64)); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("a content header section over the default size: %v, want ErrTooLarge", err)
+	}
+	if _, err := (Limits{MaxContentHeaderSize: 1 << 20}).Parse(foldedHeaders(1024)); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("more continuation lines than MaxHeaders: %v, want ErrTooLarge", err)
+	}
+	m, err := (Limits{MaxHeaders: 1 << 20}).Parse(foldedHeaders(DefaultMaxContentHeaderSize - 64))
+	if err != nil {
+		t.Fatalf("a section within the limits: %v", err)
+	}
+	if !strings.HasPrefix(m.ContentType(), "text/plain; x=y;") {
+		t.Errorf("ContentType() = %.40q", m.ContentType())
+	}
+}
+
+// TestFoldedContentHeadersCostLinearTime guards against joining continuation
+// lines by repeated concatenation, which made a 1 MiB message cost gigabytes
+// of allocation. With every limit raised to admit the worst case, parsing must
+// allocate a small multiple of the input; the time bound is two orders of
+// magnitude above what a linear parse takes, so it cannot flake.
+func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
+	data := foldedHeaders(DefaultMaxSize - 64)
+	l := Limits{MaxSize: DefaultMaxSize, MaxHeaders: DefaultMaxSize, MaxContentHeaderSize: DefaultMaxSize}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	start := time.Now()
+	m, err := l.Parse(data)
+	elapsed := time.Since(start)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(m.ContentType()); n < DefaultMaxSize/2 {
+		t.Fatalf("ContentType is only %d bytes; the input did not exercise folding", n)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8*uint64(len(data)) {
+		t.Errorf("parsing %d bytes allocated %d bytes", len(data), allocated)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("parsing %d bytes took %v", len(data), elapsed)
 	}
 }
 
@@ -334,7 +530,7 @@ func TestLimitsBoundWhatParseAccepts(t *testing.T) {
 		{"body beyond the default size", Limits{}, append(crlf("From: <"+alice+">\n\nContent-Type: text/plain\n\n"), make([]byte, DefaultMaxSize)...)},
 		{"body beyond a configured size", Limits{MaxSize: 64}, append(crlf("From: <"+alice+">\n\nContent-Type: text/plain\n\n"), make([]byte, 64)...)},
 		{"too many message headers", Limits{}, crlf(headers(DefaultMaxHeaders+1) + "\nContent-Type: text/plain\n\n")},
-		{"too many content headers", Limits{MaxHeaders: 2}, crlf("From: <" + alice + ">\n\nContent-Type: text/plain\n" + headers(2) + "\n")},
+		{"too many content header lines", Limits{MaxHeaders: 2}, crlf("From: <" + alice + ">\n\nContent-Type: text/plain\n" + headers(2) + "\n")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -530,13 +726,68 @@ func TestEveryRecipientIsReturnedInOrder(t *testing.T) {
 	}
 }
 
-func TestDateTimeAcceptsFractionsAndOffsets(t *testing.T) {
-	for _, v := range []string{"2026-10-18T00:30:00Z", "2026-10-18T09:30:00.250+09:00", "2026-10-17T19:30:00-05:00"} {
+func TestDateTimeAcceptsEveryRFC3339Form(t *testing.T) {
+	want := time.Date(2026, 10, 18, 0, 30, 0, 0, time.UTC)
+	for _, v := range []string{
+		"2026-10-18T00:30:00Z",
+		"2026-10-18T09:30:00.250+09:00",
+		"2026-10-17T19:30:00-05:00",
+		"2026-10-18t00:30:00z",
+		"2026-10-18t09:30:00+09:00",
+	} {
 		m := mustParse(t, crlf("DateTime: "+v+"\n\nContent-Type: text/plain\n\n"))
 		got, err := m.DateTime()
-		if err != nil || !got.Truncate(time.Second).Equal(time.Date(2026, 10, 18, 0, 30, 0, 0, time.UTC)) {
+		if err != nil || !got.Truncate(time.Second).Equal(want) {
 			t.Errorf("DateTime(%s) = %v, %v", v, got, err)
 		}
+		if h, _ := m.Get(CoreNamespace, HeaderDateTime); h.Value != v {
+			t.Errorf("raw DateTime = %q, want %q kept verbatim", h.Value, v)
+		}
+	}
+	leap, err := ParseDateTime("2016-12-31T23:59:60Z")
+	if err != nil || !leap.Equal(time.Date(2017, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("leap second = %v, %v", leap, err)
+	}
+	if leap, err := ParseDateTime("2016-12-31t23:59:60.5z"); err != nil || !leap.Equal(time.Date(2017, 1, 1, 0, 0, 0, 5e8, time.UTC)) {
+		t.Errorf("fractional leap second = %v, %v", leap, err)
+	}
+	for _, v := range []string{"", "2026-10-18", "2026-10-18T00:61:00Z", "2026-10-18T00:30:00", "2026-10-18 00:30:00Z"} {
+		if _, err := ParseDateTime(v); ReasonOf(err) != ReasonValue {
+			t.Errorf("ParseDateTime(%q) error = %v", v, err)
+		}
+	}
+}
+
+func TestAddFirstPutsTheNewHeaderOnTop(t *testing.T) {
+	const route = "IMDN-Record-Route"
+	m := &Message{Headers: []Header{
+		{Name: HeaderNS, Value: "x <" + imdnNS + ">"},
+		{Name: "x.Message-ID", Value: "abc"},
+		{Name: "x." + route, Value: "<sip:first@example.com>"},
+		{Name: HeaderNS, Value: "imdn <" + imdnNS + ">"},
+		{Name: "imdn." + route, Value: "<sip:second@example.com>"},
+	}}
+	if err := m.AddFirst(imdnNS, route, "<sip:new@example.com>"); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, h := range m.All(imdnNS, route) {
+		got = append(got, h.Value)
+	}
+	if want := "<sip:new@example.com>,<sip:first@example.com>,<sip:second@example.com>"; strings.Join(got, ",") != want {
+		t.Errorf("routes = %v", got)
+	}
+	if m.Headers[2].Name != "x."+route {
+		t.Errorf("inserted header = %+v; it takes the prefix in force where it goes", m.Headers[2])
+	}
+
+	empty := &Message{}
+	if err := empty.AddFirst(imdnNS, route, "<sip:a@example.com>"); !errors.Is(err, ErrUndeclaredNamespace) {
+		t.Errorf("AddFirst without a declaration: %v", err)
+	}
+	_ = empty.Declare("imdn", imdnNS)
+	if err := empty.AddFirst(imdnNS, route, "<sip:a@example.com>"); err != nil || empty.Headers[1].Name != "imdn."+route {
+		t.Errorf("AddFirst with no existing header appends: %+v, %v", empty.Headers, err)
 	}
 }
 
