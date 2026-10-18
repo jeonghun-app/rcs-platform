@@ -123,6 +123,11 @@ func (p *Pusher) send(ctx context.Context, name string, build func(dest cx.Reque
 		if i == p.attempts {
 			break
 		}
+		// Peer.Send may still deliver a request whose context has ended;
+		// one the caller has given up on must not reach an S-CSCF.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		msg, err := build(cx.Request{SessionID: sessionID, DestinationHost: peer.Host(), DestinationRealm: peer.Realm()})
 		if err != nil {
 			return nil, err
