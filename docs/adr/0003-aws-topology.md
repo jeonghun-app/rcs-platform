@@ -11,7 +11,7 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
 
 - ECS Fargate for every service, in private subnets across two AZs, with NAT for
   egress.
-- A public **NLB** for SIP (TCP 5060, TLS 5061, optional UDP 5060) to `pcscf` and
+- A public **NLB** for SIP (TCP 5060, TLS 5061; UDP 5060 in dev/test only) to `pcscf` and
   for MSRP (TCP 2855, TLS 2856) to `msrp-relay`. TLS terminates on the NLB with an
   ACM certificate when one is given.
 - A public **ALB** for `acs` and `ft-server` (path or host routing), HTTPS when a
@@ -29,10 +29,42 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
   client address); the transport accepts those and closes them after the health
   check without creating a flow. `RCS_PROXY_PROTOCOL=false` is refused in
   `staging`/`prod`.
-- NLB TCP idle timeout is raised to 1800 s on the SIP and MSRP listeners (the
-  default 350 s would cut quiet sessions). Clients keep SIP flows alive with CRLF
-  pings (RFC 5626); `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session
-  idle for 300 s.
+- Idle timeouts. The NLB idle timeout is configurable only on TCP listeners
+  (raised to 1800 s there); TLS listeners keep a fixed 350 s and UDP flows a fixed
+  120 s. Every keep-alive is therefore sized for 350 s on TCP and TLS:
+  - Clients using outbound (RFC 5626) get `Flow-Timer: 120` in the REGISTER 200
+    (with `Require: outbound`, RFC 5626 §4.4, §5.4, §10), so they send a CRLF
+    ping at least every two minutes.
+  - Clients that ask for keep-alive with the Via `keep` parameter (RFC 6223
+    §4.4) get `keep=120` (the same value as Flow-Timer, §5).
+  - A client that uses neither cannot be made to send keep-alives (§10). On TLS
+    `pcscf` closes its connection after 340 s of silence; terminating requests from then until the client registers again get
+    430 from `pcscf` and are stored by `rcs-as` (ADR 0005). `pcscf` bounds that
+    window by lowering the `Expires` of such a client's REGISTER (and of the
+    contact in the 200) to at most 600 s, so the gap is at most about 260 s per
+    registration. The cost is a re-registration, with a full authentication, every
+    10 minutes per such client; the runbook includes it in HSS sizing.
+  - `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session idle for
+    240 s.
+  - Server-side idle timeouts are longer than the keep-alive interval of the
+    protocol on that listener, so an endpoint that keeps to it is never cut by
+    the service: `pcscf` 180 s on TLS and 1900 s on TCP for flows that
+    negotiated a keep-alive (SIP keep-alive 120 s, RFC 5626 §5.4), and 340 s for
+    flows that did not, just under the NLB's 350 s so the client sees a clean
+    close rather than a later reset; `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s).
+    Idle connections longer than 350 s are not expected to survive even on TCP
+    listeners: the target ENI's connection tracking on Fargate is not
+    configurable and may not match the NLB's longer timeout. The NLB does
+    not close a connection when its own timer expires; it stops tracking it and a
+    later packet gets a reset, which the client treats as a flow failure.
+  - Kernel TCP keep-alive is **disabled** on client-facing listeners
+    (`net.ListenConfig{KeepAlive: -1}`; Go enables it at 15 s by default). A TCP
+    keep-alive restarts the NLB idle timer, and on TLS listeners it makes the NLB
+    start its own keep-alives to both sides every 20 s, which keeps the client's
+    radio awake. Core-facing connections keep it enabled.
+- SIP over UDP is for dev and test only and refused in `staging`/`prod`: the NLB's
+  fixed 120 s UDP flow timeout would route a client's packets to another `pcscf`
+  task after a quiet period, and UDP keep-alive needs STUN rather than CRLF.
 - `infra/ecr.yaml` for repositories, `infra/platform.yaml` for everything else;
   `scripts/deploy.sh` builds, pushes and deploys.
 

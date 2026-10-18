@@ -44,7 +44,13 @@ a maintainer; behaviour built on it is listed as unverified in
 | RFC | Subject |
 |---|---|
 | 3261, 3263 | SIP, locating SIP servers |
-| 3325, 3327, 3608, 3455 | Asserted identity, Path, Service-Route, P-headers for 3GPP |
+| 3966 | tel URI |
+| 4475, 5118 | SIP torture test messages (IPv4, IPv6) |
+| 3581 | Symmetric response routing (`rport`) |
+| 3325, 3327, 3608, 7315 | Asserted identity, Path, Service-Route, P-headers for 3GPP (7315 obsoletes 3455) |
+| 3840, 3841 | Callee capabilities (feature tags), caller preferences (`Accept-Contact`) |
+| 3326 | `Reason` header |
+| 3515, 3892 | REFER, `Referred-By` |
 | 3428 | SIP MESSAGE |
 | 3310, 7616, 8760 | Digest AKA, HTTP Digest (MD5, SHA-256) |
 | 4028 | Session timers |
@@ -54,6 +60,7 @@ a maintainer; behaviour built on it is listed as unverified in
 | 3862 | Common Presence and Instant Messaging (CPIM) message format |
 | 5438 | Instant Message Disposition Notification (IMDN) |
 | 5626 | SIP outbound (flow tokens) |
+| 6223 | Indication of support for keep-alive (Via `keep`) |
 | 6733, 4006 | Diameter base protocol |
 | 3539 | AAA transport profile: Diameter watchdog (DWR/DWA, Tw, REOPEN) |
 | 4330 | Simple Network Time Protocol: era rule for Diameter `Time` after 2036 |
