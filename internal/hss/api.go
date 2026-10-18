@@ -49,10 +49,18 @@ func (s Scope) String() string {
 	return "none"
 }
 
-// Tokens are the bearer tokens the API accepts, up to two per caller so a
-// token can rotate without downtime (ADR 0007 §4): current and next.
+// Tokens are the bearer tokens the API accepts, two per caller so a token
+// can rotate without downtime (ADR 0007 §4).
 type Tokens struct {
-	Admin, ACS, FT []string
+	Admin, ACS, FT TokenPair
+}
+
+// TokenPair is one caller's current and next token (HSS_<CALLER>_TOKEN and
+// HSS_<CALLER>_TOKEN_NEXT); either may be empty. The audit log names the
+// slot a request used by the variable it came from, so it shows when the old
+// token is no longer used whichever order the rotation empties them in.
+type TokenPair struct {
+	Current, Next string
 }
 
 // MinTokenLength is the shortest token accepted in staging and prod: 256
@@ -165,15 +173,12 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 		burst = DefaultACSBurst
 	}
 	a.closing, a.close = context.WithCancel(context.Background())
-	add := func(scope Scope, list []string) {
-		for i, t := range list {
-			if t == "" {
+	add := func(scope Scope, pair TokenPair) {
+		for _, t := range []struct{ value, slot string }{{pair.Current, "current"}, {pair.Next, "next"}} {
+			if t.value == "" {
 				continue
 			}
-			at := &acceptedToken{digest: sha256.Sum256([]byte(t)), scope: scope, slot: "current"}
-			if i > 0 {
-				at.slot = "next"
-			}
+			at := &acceptedToken{digest: sha256.Sum256([]byte(t.value)), scope: scope, slot: t.slot}
 			if scope == ScopeACS {
 				at.limit = newBucket(rate, burst, now)
 			}

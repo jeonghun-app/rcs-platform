@@ -77,7 +77,7 @@ func newAPIEnv(t *testing.T, mutate ...func(*APIOptions)) *apiEnv {
 	t.Helper()
 	a := &apiEnv{env: newEnv(t), notifier: newRecorder(), now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	o := APIOptions{
-		Tokens:         Tokens{Admin: []string{adminToken, adminTokenNext}, ACS: []string{acsToken}, FT: []string{ftToken}},
+		Tokens:         Tokens{Admin: TokenPair{adminToken, adminTokenNext}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}},
 		Notifier:       a.notifier,
 		DefaultProfile: DefaultProfileID,
 		Now:            func() time.Time { a.mu.Lock(); defer a.mu.Unlock(); return a.now },
@@ -157,7 +157,7 @@ func (a *apiEnv) create(impi string, managed bool, impus ...string) {
 }
 
 func TestAPIAnswers503WhenNoTokenIsConfigured(t *testing.T) {
-	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens = Tokens{FT: []string{ftToken}} })
+	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens = Tokens{FT: TokenPair{Current: ftToken}} })
 	for _, path := range []string{"/v1/subscriptions/" + impi1, "/v1/service-profiles/" + DefaultProfileID} {
 		code, body, h := a.do("GET", path, adminToken, "")
 		if code != http.StatusServiceUnavailable || body["error"] == nil || h.Get("Retry-After") == "" {
@@ -593,7 +593,7 @@ func TestFTCredentialFollowsFtServersContract(t *testing.T) {
 func TestFTCredentialsNeedAnFTRealm(t *testing.T) {
 	e := newEnv(t)
 	h := e.newHSS(func(o *Options) { o.FTRealm = "" })
-	a := &apiEnv{env: e, api: h.NewAPI(APIOptions{Tokens: Tokens{Admin: []string{adminToken}, FT: []string{ftToken}}, DefaultProfile: DefaultProfileID})}
+	a := &apiEnv{env: e, api: h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: adminToken}, FT: TokenPair{Current: ftToken}}, DefaultProfile: DefaultProfileID})}
 	a.create(impi1, true, impu1)
 	if code, _, _ := a.do("POST", subPath(impi1, "/ft-credential"), adminToken, ""); code != http.StatusNotImplemented {
 		t.Errorf("issue = %d", code)
@@ -606,7 +606,7 @@ func TestFTCredentialsNeedAnFTRealm(t *testing.T) {
 func TestStoreFailuresAre503SoCallersRetry(t *testing.T) {
 	fs := &failingStore{Store: store.NewMemory()}
 	e := newEnvWith(t, fs)
-	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{Tokens: Tokens{Admin: []string{adminToken}, ACS: []string{acsToken}, FT: []string{ftToken}}, DefaultProfile: DefaultProfileID})}
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}}, DefaultProfile: DefaultProfileID})}
 	a.create(impi1, true, impu1)
 	fs.fail.Store(true)
 	for _, c := range []struct{ method, path, token, body string }{
@@ -846,5 +846,38 @@ func TestPPAFailuresAreActedOn(t *testing.T) {
 				t.Errorf("%s not counted", c.metric)
 			}
 		})
+	}
+}
+
+func TestReKeyingWithoutASequenceNumberKeepsTheCounter(t *testing.T) {
+	a := newAPIEnv(t)
+	a.create(impi1, true, impu1)
+	if code, _, _ := a.do("PUT", subPath(impi1, "/aka"), adminToken,
+		`{"k":"465b5ce8b199b49faa5f0a2ee238a6bc","opc":"cd63cb71954a9f4e48a5994e37a02baf","sqn":"000000000040"}`); code != http.StatusNoContent {
+		t.Fatal(code)
+	}
+	if code, _, _ := a.do("PUT", subPath(impi1, "/aka"), adminToken, akaBody); code != http.StatusNoContent {
+		t.Fatal(code)
+	}
+	if got := a.sub(impi1).AKA.SQN; got != 0x40 {
+		t.Fatalf("SQN after re-keying = %#x, want 0x40 kept", got)
+	}
+}
+
+// The audit slot comes from the variable a token was set in, so a rotation
+// that empties HSS_*_TOKEN first still shows the next token as "next".
+func TestAuditSlotFollowsTheTokenVariable(t *testing.T) {
+	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens.ACS = TokenPair{Next: acsToken} })
+	a.create(impi1, true, impu1)
+	a.do("GET", subPath(impi1), acsToken, "")
+	var last map[string]any
+	for _, line := range strings.Split(a.logs.String(), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == "audit: provisioning request" {
+			last = rec
+		}
+	}
+	if last["caller"] != "acs" || last["token"] != "next" {
+		t.Errorf("audit = %v", last)
 	}
 }

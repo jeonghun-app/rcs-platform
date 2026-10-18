@@ -290,3 +290,34 @@ func TestRunRefusesToReplaceALostDataKey(t *testing.T) {
 		t.Errorf("keyring.created = %v", n)
 	}
 }
+
+// Each start draws its own Origin-Host (ADR 0005): a fixed one would hold
+// an S-CSCF reconnecting to a restarted or other task in REOPEN.
+func TestTwoStartsDrawDifferentOriginHosts(t *testing.T) {
+	cfg, err := configure(devEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hosts []string
+	for range 2 {
+		_, addrs, cancel, done := startRun(t, cfg, defaultDeps())
+		client, err := diameter.NewNode(nodeConfig(t, "scscf-1.rcs.local", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		peer, err := client.Connect(diameter.PeerConfig{Address: addrs[0]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for deadline := time.Now().Add(realWait); !peer.Available() && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+		hosts = append(hosts, peer.Host())
+		_ = client.Shutdown(context.Background())
+		cancel()
+		<-done
+	}
+	if hosts[0] == "" || hosts[0] == hosts[1] {
+		t.Fatalf("two HSS starts used Origin-Host %q and %q", hosts[0], hosts[1])
+	}
+}

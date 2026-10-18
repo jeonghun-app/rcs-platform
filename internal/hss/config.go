@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
@@ -185,6 +186,10 @@ func Configure(s *runtime.Settings) Config {
 		"HSS_KMS_KEY_ID is unset: subscriber secrets would be encrypted with a key held in the task's environment")
 	s.ForbidInProduction(len(c.PeerNetworks) == 0,
 		"HSS_DIAMETER_PEER_NETWORKS is unset: Diameter peers would be accepted from any source address (ADR 0007 §6)")
+	for _, n := range c.PeerNetworks {
+		s.ForbidInProduction(n.Bits() == 0,
+			"HSS_DIAMETER_PEER_NETWORKS holds a /0 prefix: it restricts no source address (ADR 0007 §6)")
+	}
 
 	c.Tokens = secretTokens{readTokens(s)}
 	return c
@@ -215,25 +220,36 @@ func cutScheme(v string) (string, bool) {
 }
 
 // readTokens reads the current and next token of each caller and applies
-// ADR 0007 §4: at least 256 bits, and no token shared between callers.
+// ADR 0007 §4. Everywhere, a token must be printable ASCII without white
+// space: a trailing newline from `echo` into Secrets Manager would make
+// every request fail, since a header cannot carry it. In staging and prod a
+// token must hold 256 bits (64 hex digits, or 43 characters of base64 or
+// another larger alphabet), no token may serve two callers, the admin needs
+// a current token, and no caller may have a next token without a current
+// one.
 func readTokens(s *runtime.Settings) Tokens {
 	e := s.Env
-	read := func(name string) []string {
-		var out []string
-		for _, v := range []string{e.String(name+"_TOKEN", ""), e.String(name+"_TOKEN_NEXT", "")} {
-			if v != "" {
-				out = append(out, v)
+	read := func(name string) TokenPair {
+		p := TokenPair{e.String(name+"_TOKEN", ""), e.String(name+"_TOKEN_NEXT", "")}
+		for _, v := range []struct{ name, value string }{{name + "_TOKEN", p.Current}, {name + "_TOKEN_NEXT", p.Next}} {
+			if !printableToken(v.value) {
+				e.Invalid(v.name, "has white space or characters outside printable ASCII")
 			}
 		}
-		return out
+		s.ForbidInProduction(p.Current == "" && p.Next != "",
+			"HSS_"+name+"_TOKEN_NEXT is set without HSS_"+name+"_TOKEN: the rotation is in an unexpected state")
+		return p
 	}
 	t := Tokens{Admin: read("ADMIN"), ACS: read("ACS"), FT: read("FT")}
 	owner := map[string]string{}
-	short, shared := false, false
-	for name, list := range map[string][]string{"ADMIN": t.Admin, "ACS": t.ACS, "FT": t.FT} {
-		for _, v := range list {
-			if len(v) < MinTokenLength {
-				short = true
+	weak, shared := false, false
+	for name, p := range map[string]TokenPair{"ADMIN": t.Admin, "ACS": t.ACS, "FT": t.FT} {
+		for _, v := range []string{p.Current, p.Next} {
+			if v == "" {
+				continue
+			}
+			if !strongToken(v) {
+				weak = true
 			}
 			if o, ok := owner[v]; ok && o != name {
 				shared = true
@@ -241,8 +257,27 @@ func readTokens(s *runtime.Settings) Tokens {
 			owner[v] = name
 		}
 	}
-	s.ForbidInProduction(len(t.Admin) == 0, "HSS_ADMIN_TOKEN is unset: the provisioning API would answer 503 to operators")
-	s.ForbidInProduction(short, "an HSS API token is shorter than 256 bits (43 base64url characters)")
+	s.ForbidInProduction(t.Admin.Current == "", "HSS_ADMIN_TOKEN is unset: the provisioning API would answer 503 to operators")
+	s.ForbidInProduction(weak, "an HSS API token holds less than 256 bits (64 hex digits or 43 base64url characters)")
 	s.ForbidInProduction(shared, "an HSS API token is shared between callers")
 	return t
+}
+
+func printableToken(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if v[i] <= ' ' || v[i] > '~' {
+			return false
+		}
+	}
+	return true
+}
+
+// strongToken reports whether a token can hold 256 bits: a token of hex
+// digits only needs 64 of them, any other needs MinTokenLength characters
+// (base64url carries 6 bits a character).
+func strongToken(v string) bool {
+	if strings.Trim(v, "0123456789abcdefABCDEF") == "" {
+		return len(v) >= 64
+	}
+	return len(v) >= MinTokenLength
 }

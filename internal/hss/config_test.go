@@ -62,8 +62,8 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		c.SubscribersTable != "subscribers" || c.ProfilesTable != "service-profiles" || c.OriginHost != "" {
 		t.Fatalf("config = %+v", c)
 	}
-	if len(c.Tokens.t.Admin) != 1 || len(c.Tokens.t.ACS) != 1 || len(c.Tokens.t.FT) != 1 {
-		t.Fatalf("tokens = %d %d %d", len(c.Tokens.t.Admin), len(c.Tokens.t.ACS), len(c.Tokens.t.FT))
+	if c.Tokens.t.Admin.Current != adminToken || c.Tokens.t.ACS.Current != acsToken || c.Tokens.t.FT.Current != ftToken || c.Tokens.t.Admin.Next != "" {
+		t.Fatal("tokens not read")
 	}
 }
 
@@ -172,5 +172,47 @@ func TestProductionRefusesUnsafeSettings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTokenStrengthBoundaryInProduction(t *testing.T) {
+	for name, c := range map[string]struct {
+		token   string
+		refused bool
+	}{
+		"42 base64url characters": {strings.Repeat("g", 42), true},
+		"43 base64url characters": {strings.Repeat("g", 43), false},
+		"63 hex digits":           {strings.Repeat("f", 63), true},
+		"64 hex digits":           {strings.Repeat("f", 64), false},
+	} {
+		_, out := startUp(with(prodEnv, "HSS_FT_TOKEN", c.token))
+		if got := strings.Contains(out, "256 bits"); got != c.refused {
+			t.Errorf("%s: refused = %v, want %v", name, got, c.refused)
+		}
+	}
+}
+
+func TestTokensWithWhiteSpaceAreRefusedEverywhere(t *testing.T) {
+	for _, v := range []string{ftToken + "\n", "a " + ftToken, ftToken + "\t", ftToken + "\u00e9"} {
+		_, err := configure(with(devEnv, "HSS_FT_TOKEN_NEXT", v))
+		if err == nil || !strings.Contains(err.Error(), "HSS_FT_TOKEN_NEXT") {
+			t.Errorf("token %q: %v", v, err)
+		}
+	}
+}
+
+func TestProductionRefusesOpenNetworksAndHalfRotations(t *testing.T) {
+	for name, c := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"IPv4 /0":              {with(prodEnv, "HSS_DIAMETER_PEER_NETWORKS", "0.0.0.0/0"), "/0 prefix"},
+		"IPv6 /0":              {with(prodEnv, "HSS_DIAMETER_PEER_NETWORKS", "10.0.0.0/16,::/0"), "/0 prefix"},
+		"next without current": {with(prodEnv, "HSS_ACS_TOKEN", "", "HSS_ACS_TOKEN_NEXT", acsToken), "HSS_ACS_TOKEN_NEXT is set without"},
+	} {
+		code, out := startUp(c.env)
+		if code != runtime.ExitFailure || !strings.Contains(out, "configuration rejected") || !strings.Contains(out, c.want) {
+			t.Errorf("%s: exit %d\n%s", name, code, out)
+		}
 	}
 }
