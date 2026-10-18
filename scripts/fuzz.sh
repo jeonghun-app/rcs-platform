@@ -4,9 +4,12 @@
 #
 # Go 1.26's fuzz coordinator occasionally reports its own -fuzztime expiry as
 # "context deadline exceeded" and fails the run although no input failed (#29).
-# A real failure always prints "Failing input written to" and leaves a file in
-# testdata/fuzz, so a run that fails with only the deadline message and no new
-# corpus entry is reported and treated as a pass. Anything else fails.
+# That case is recognised only by the coordinator's own line (four spaces, then
+# exactly that text) together with: no "Failing input written to", no failing
+# seed corpus entry (those write nothing new), and no new file in testdata/fuzz
+# (a crasher found during minimisation is written without the message). It is
+# reported as a GitHub Actions warning and treated as a pass; anything else
+# fails. A hung target is not detected by Go either way (#30).
 set -eu
 
 : "${FUZZTIME:=10s}"
@@ -25,10 +28,11 @@ for pkg in $(go list ./...); do
     fi
     cat "$log"
     after=$(ls "$dir" 2>/dev/null | wc -l)
-    if grep -q 'context deadline exceeded' "$log" &&
+    if grep -qx '    context deadline exceeded' "$log" &&
        ! grep -q 'Failing input written to' "$log" &&
+       ! grep -q 'failure while testing seed corpus entry' "$log" &&
        [ "$before" -eq "$after" ]; then
-      echo "warning: $f: coordinator deadline race (#29), no failing input; treated as pass"
+      echo "::warning title=fuzz deadline race::$pkg $f failed only with the coordinator deadline (#29); treated as pass"
       continue
     fi
     status=1
