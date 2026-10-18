@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -30,38 +32,81 @@ var crlf = []byte("\r\n")
 // complete, the read timeout runs from the start and keep-alives do not restart
 // it, so a connection that never sends a message gives back its MaxConnections
 // slot after ReadTimeout rather than IdleTimeout.
+//
+// The idle timeout is the flow's, which Transport.SetFlowIdleTimeout may change
+// while an idle period runs; mu guards the state it reads against the reading
+// goroutine.
 type deadlineReader struct {
-	conn       net.Conn
-	idle, read time.Duration
-	inMessage  bool
+	conn net.Conn
+	read time.Duration
+	idle *atomic.Int64 // the flow's idle timeout, in nanoseconds
+
+	mu        sync.Mutex
+	inMessage bool
 	// beforeFirst is true until the first message of an accepted connection is
 	// complete.
 	beforeFirst bool
 	armed       bool
+	// idleSince is when the current idle period began, once it is armed.
+	idleSince time.Time
+}
+
+func newDeadlineReader(conn net.Conn, idle *atomic.Int64, read time.Duration, beforeFirst bool) *deadlineReader {
+	return &deadlineReader{conn: conn, idle: idle, read: read, beforeFirst: beforeFirst}
 }
 
 // strict reports whether the read timeout, not the idle timeout, applies now.
-func (d *deadlineReader) strict() bool { return d.inMessage || d.beforeFirst }
+func (d *deadlineReader) strict() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.strictLocked()
+}
+
+func (d *deadlineReader) strictLocked() bool { return d.inMessage || d.beforeFirst }
 
 func (d *deadlineReader) Read(p []byte) (int, error) {
-	if !d.armed {
-		timeout := d.idle
-		if d.strict() {
-			timeout = d.read
-		}
-		if err := d.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-			return 0, err
-		}
-		d.armed = true
+	if err := d.arm(); err != nil {
+		return 0, err
 	}
 	n, err := d.conn.Read(p)
-	if !d.inMessage && hasNonCRLF(p[:n]) {
-		d.startMessage()
+	if hasNonCRLF(p[:n]) {
+		d.mu.Lock()
+		if !d.inMessage {
+			d.startMessageLocked()
+		}
+		d.mu.Unlock()
 	}
 	return n, err
 }
 
-func (d *deadlineReader) startMessage() {
+// arm sets the deadline at the start of a regime.
+func (d *deadlineReader) arm() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.armed {
+		return nil
+	}
+	now := time.Now()
+	timeout := d.read
+	if !d.strictLocked() {
+		timeout = time.Duration(d.idle.Load())
+		d.idleSince = now
+	}
+	d.armed = true
+	return d.conn.SetReadDeadline(now.Add(timeout))
+}
+
+// retime applies a changed idle timeout to the idle period now running, counted
+// from its start, so a shorter one can end it at once.
+func (d *deadlineReader) retime() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.armed && !d.strictLocked() {
+		d.conn.SetReadDeadline(d.idleSince.Add(time.Duration(d.idle.Load())))
+	}
+}
+
+func (d *deadlineReader) startMessageLocked() {
 	// Before the first message the deadline already runs from the start.
 	if !d.beforeFirst {
 		d.armed = false
@@ -72,22 +117,26 @@ func (d *deadlineReader) startMessage() {
 // keepAlive restarts the idle period after a ping, except before the first
 // message.
 func (d *deadlineReader) keepAlive(br *bufio.Reader) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if !d.beforeFirst {
-		d.betweenMessages(br)
+		d.betweenMessagesLocked(br)
 	}
 }
 
 // messageDone ends the first-message regime and restarts the idle period, unless
 // the bytes already buffered have begun the next message.
 func (d *deadlineReader) messageDone(br *bufio.Reader) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.beforeFirst = false
-	d.betweenMessages(br)
+	d.betweenMessagesLocked(br)
 }
 
-func (d *deadlineReader) betweenMessages(br *bufio.Reader) {
+func (d *deadlineReader) betweenMessagesLocked(br *bufio.Reader) {
 	d.inMessage, d.armed = false, false
 	if b, _ := br.Peek(br.Buffered()); hasNonCRLF(b) {
-		d.startMessage()
+		d.startMessageLocked()
 	}
 }
 
@@ -105,11 +154,8 @@ func hasNonCRLF(b []byte) bool {
 // closed rather than resynchronised (RFC 3261 §18.3).
 func (t *Transport) serveStream(f *flow, accepted bool) {
 	defer t.closeFlow(f)
-	idle := t.cfg.IdleTimeout
-	if f.lis != nil {
-		idle = f.lis.idle
-	}
-	d := &deadlineReader{conn: f.conn, idle: idle, read: t.cfg.ReadTimeout, beforeFirst: accepted}
+	d := newDeadlineReader(f.conn, &f.idle, t.cfg.ReadTimeout, accepted)
+	f.dr.Store(d)
 	br := bufio.NewReaderSize(d, streamBufferSize)
 	r := sip.NewReader(br, t.cfg.Limits)
 	r.OnKeepAlive = func() {
@@ -161,11 +207,19 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	if f.conn == nil {
 		return t.sendDatagram(f.lis, f.remote, b)
 	}
-	ok, closed := f.q.push(b, wait, t.cfg.WriteTimeout)
-	switch {
-	case ok:
+	r := f.q.push(b, wait, t.cfg.WriteTimeout)
+	if r == overBudget {
+		// Every queue together is at Config.MaxQueuedBytes. The peer holding the
+		// most is the one not reading; closing it frees the most memory, and is
+		// fair to a connection that only wants room for one more message.
+		t.stats.budgetSheds.Add(1)
+		t.shedLargestQueue()
+		r = f.q.push(b, false, 0)
+	}
+	switch r {
+	case pushed:
 		return nil
-	case closed:
+	case queueGone:
 		return ErrNoFlow
 	}
 	t.stats.queueOverflows.Add(1)
@@ -173,11 +227,30 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	return ErrQueueFull
 }
 
+// shedLargestQueue closes the stream flow with the most queued output. It looks
+// at every stream flow, which is fine for the rare moment the budget runs out.
+func (t *Transport) shedLargestQueue() {
+	var victim *flow
+	most := 0
+	for _, f := range t.flows.streams() {
+		if n := f.q.size(); n > most {
+			victim, most = f, n
+		}
+	}
+	if victim != nil {
+		t.closeFlow(victim)
+	}
+}
+
 // startWriter gives a stream flow its send queue and writer goroutine. It is
 // called before the flow can be found, with the transport's WaitGroup already
 // held by the caller's goroutine.
 func (t *Transport) startWriter(f *flow) {
-	f.q = newSendQueue(t.cfg.SendQueueBytes)
+	limit := t.cfg.SendQueueBytes
+	if f.lis != nil {
+		limit = f.lis.sendQueue
+	}
+	f.q = newSendQueue(limit, &t.budget)
 	t.wg.Add(1)
 	go t.writeLoop(f)
 }
@@ -258,6 +331,7 @@ func (t *Transport) dial(k reuseKey) (*flow, error) {
 	}
 	f := t.flows.newFlow(k.network, nil, k.remote)
 	f.serverName = k.serverName
+	f.idle.Store(int64(t.cfg.IdleTimeout))
 	f.conn = c
 	t.mu.Lock()
 	closed := t.closed

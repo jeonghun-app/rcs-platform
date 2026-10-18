@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -500,7 +501,9 @@ func TestDeadlineReaderStartsTheReadTimeoutAtTheFirstMessageByte(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
-	d := &deadlineReader{conn: a, idle: time.Hour, read: time.Hour}
+	var idle atomic.Int64
+	idle.Store(int64(time.Hour))
+	d := newDeadlineReader(a, &idle, time.Hour, false)
 	br := bufio.NewReader(d)
 	go b.Write([]byte("\r\n\r\n"))
 	br.Peek(4)
@@ -513,12 +516,12 @@ func TestDeadlineReaderStartsTheReadTimeoutAtTheFirstMessageByte(t *testing.T) {
 		t.Fatal("message bytes did not start a message")
 	}
 	br.Discard(4) // the ping
-	d.betweenMessages(br)
+	d.messageDone(br)
 	if !d.inMessage {
 		t.Fatal("a message already buffered was treated as idle time")
 	}
 	br.Discard(br.Buffered())
-	d.betweenMessages(br)
+	d.messageDone(br)
 	if d.inMessage {
 		t.Fatal("an empty buffer was not idle")
 	}
