@@ -288,6 +288,53 @@ func (h *Header) Set(name, value string) error {
 	return nil
 }
 
+// RemoveFirstElement removes the first element of a list field, wherever the
+// list is split across lines: the Route a proxy has consumed (RFC 3261 §16.4) or
+// the top Via of a response it forwards (§16.7 step 3). Other fields keep their
+// original bytes, and so does the text of the other elements; only the field
+// that held the element is rewritten, or removed if it held nothing else.
+func (h *Header) RemoveFirstElement(name string) error {
+	return h.editFirstElement(name, func(els []string) []string { return els[1:] })
+}
+
+// ReplaceFirstElement replaces the first element of a list field with value, a
+// single element, such as the top Via with received and rport added (RFC 3261
+// §18.2.1). Like RemoveFirstElement it rewrites only the field holding it.
+func (h *Header) ReplaceFirstElement(name, value string) error {
+	els, err := splitList(trimWS(value))
+	if err != nil || len(els) != 1 {
+		return headerError(CanonicalName(name), "replacement is not a single list element")
+	}
+	return h.editFirstElement(name, func(old []string) []string {
+		old[0] = els[0]
+		return old
+	})
+}
+
+func (h *Header) editFirstElement(name string, edit func([]string) []string) error {
+	key := headerKey(name)
+	for i := range h.fields {
+		if h.fields[i].key != key {
+			continue
+		}
+		els, err := splitList(h.fields[i].value)
+		if err != nil {
+			return inHeader(CanonicalName(name), err)
+		}
+		if els = edit(els); len(els) == 0 {
+			h.fields = slices.Delete(h.fields, i, i+1)
+			return nil
+		}
+		f, err := newField(name, strings.Join(els, ", "))
+		if err != nil {
+			return err
+		}
+		h.fields[i] = f
+		return nil
+	}
+	return &ParseError{Header: CanonicalName(name), Err: ErrMissingHeader}
+}
+
 // Del removes every field with the given name.
 func (h *Header) Del(name string) { h.removeAfter(0, headerKey(name)) }
 

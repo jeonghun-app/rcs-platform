@@ -236,3 +236,73 @@ func mustAdd(t *testing.T, h *Header, name, value string) {
 		t.Fatalf("Add(%q, %q): %v", name, value, err)
 	}
 }
+
+func TestFirstElementEditsLeaveTheOtherElementsAlone(t *testing.T) {
+	msg := lines(
+		"SIP/2.0 200 OK",
+		"Via: SIP/2.0/UDP p1.example.com;branch=z9hG4bK1 ,  SIP/2.0/UDP  p2.example.com;branch=z9hG4bK2",
+		"v:  SIP/2.0/UDP client.example.com ;branch=z9hG4bK3",
+		"Content-Length: 0",
+	)
+	m := mustParse(t, msg)
+	h := m.Headers()
+	if err := h.RemoveFirstElement("via"); err != nil {
+		t.Fatal(err)
+	}
+	want := lines(
+		"SIP/2.0 200 OK",
+		"Via: SIP/2.0/UDP  p2.example.com;branch=z9hG4bK2",
+		"v:  SIP/2.0/UDP client.example.com ;branch=z9hG4bK3",
+		"Content-Length: 0",
+	)
+	if got := string(mustBytes(t, m)); got != want {
+		t.Errorf("after RemoveFirstElement:\n got %q\nwant %q", got, want)
+	}
+	// Removing the only element of a field removes the field.
+	if err := h.RemoveFirstElement("Via"); err != nil {
+		t.Fatal(err)
+	}
+	if vs := h.Values("Via"); len(vs) != 1 || !strings.Contains(vs[0], "client.example.com") {
+		t.Errorf("Via = %q", vs)
+	}
+	if err := h.ReplaceFirstElement("Via", "SIP/2.0/UDP client.example.com;branch=z9hG4bK3;received=192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	vias, err := h.Via()
+	if err != nil || len(vias) != 1 || vias[0].Received() != "192.0.2.1" {
+		t.Errorf("Via() = %#v, %v", vias, err)
+	}
+
+	var r Header
+	mustAdd(t, &r, "Route", "<sip:a.example.com;lr>, <sip:b.example.com;lr>")
+	mustAdd(t, &r, "Route", "<sip:c.example.com;lr>")
+	if err := r.ReplaceFirstElement("Route", "<sip:z.example.com;lr>"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Values("Route"); !reflect.DeepEqual(got, []string{"<sip:z.example.com;lr>, <sip:b.example.com;lr>", "<sip:c.example.com;lr>"}) {
+		t.Errorf("Route = %q", got)
+	}
+}
+
+func TestFirstElementEditsRefuseWhatTheyCannotDo(t *testing.T) {
+	var h Header
+	if err := h.RemoveFirstElement("Route"); !errors.Is(err, ErrMissingHeader) {
+		t.Errorf("absent field: %v", err)
+	}
+	if err := h.ReplaceFirstElement("Route", "<sip:a.example.com;lr>"); !errors.Is(err, ErrMissingHeader) {
+		t.Errorf("absent field: %v", err)
+	}
+	mustAdd(t, &h, "Route", "<sip:a.example.com;lr>")
+	for _, v := range []string{"<sip:x;lr>, <sip:y;lr>", "", "a\x00b"} {
+		if err := h.ReplaceFirstElement("Route", v); !errors.Is(err, ErrMalformed) {
+			t.Errorf("ReplaceFirstElement(%q) = %v", v, err)
+		}
+	}
+	mustAdd(t, &h, "Via", "a,,b")
+	if err := h.RemoveFirstElement("Via"); !errors.Is(err, ErrMalformed) {
+		t.Errorf("malformed list: %v", err)
+	}
+	if got := h.Get("Route"); got != "<sip:a.example.com;lr>" {
+		t.Errorf("a refused edit changed the field: %q", got)
+	}
+}
