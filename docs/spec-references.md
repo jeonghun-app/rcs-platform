@@ -67,6 +67,10 @@ a maintainer; behaviour built on it is listed as unverified in
 | 3966 | tel URI: the telephone-subscriber that iFC Request-URI patterns match (TS 29.228 Annex F) |
 | 3539 | AAA transport profile: Diameter watchdog (DWR/DWA, Tw, REOPEN) |
 | 4330 | Simple Network Time Protocol: era rule for Diameter `Time` after 2036 |
+| 9110 | HTTP semantics: byte ranges, `Range`, `If-Range`, `Content-Range`, partial PUT (`ft-server`) |
+| 7578, 2046 | `multipart/form-data` and the multipart boundary (`ft-server` uploads) |
+| 6266 | `Content-Disposition` in HTTP (`ft-server` downloads) |
+| 3986 | URI syntax: unreserved characters of the FT transaction id |
 
 ## Other
 
