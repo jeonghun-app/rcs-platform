@@ -38,14 +38,19 @@ traffic within an AZ is not assumed to be.
    | `hss` Diameter | `icscf`, `scscf` (and `rcs-as` once it uses Sh) |
    | `hss` HTTP API | `ft-server`, `acs`, the operator path |
    | `icscf`, `scscf` SIP | `pcscf`, `rcs-as`, each other |
-   | `rcs-as` SIP | `scscf` |
+   | `pcscf` core SIP (separate listener) | `scscf`, `icscf` |
+   | `rcs-as` SIP | `scscf`, `icscf` (direct routing to the conference factory and other PSIs, TS 24.229 §5.3.2.1) |
    | `rcs-as` MSRP | `msrp-relay` |
    | `msrp-relay` control HTTP | `pcscf` |
-   | `pcscf` SIP, `msrp-relay` MSRP (public) | NLB |
+   | `pcscf` client SIP, `msrp-relay` MSRP (public) | NLB |
    | `acs`, `ft-server` HTTP (public) | ALB |
    | every admin port (health) | its load balancer only, where one is attached |
 
-   `acs` and `ft-server` reach no SIP or Diameter port. The infrastructure
+   `acs` and `ft-server` reach no SIP or Diameter port. `pcscf` runs **two SIP
+   listeners**: the client listener behind the NLB (PROXY protocol, untrusted)
+   and a core listener on another port that only the core's security groups
+   reach; the core-facing `Path` and `Record-Route` name the core listener. The
+   security group, not application logic, is the trust-domain boundary. The infrastructure
    templates are checked against this matrix by a policy test (Phase 7).
 3. **Every internal HTTP API requires a bearer token per caller, scoped to that
    caller's endpoints.** The scope table lives in `docs/api/` next to each API;
@@ -54,7 +59,7 @@ traffic within an AZ is not assumed to be.
    | Caller | Allowed |
    |---|---|
    | operator (admin token) | all provisioning, including writing keys; keys are never returned |
-   | `acs` | issue and read the IMS and FT credentials of a subscriber it provisions |
+   | `acs` | issue and read the IMS and FT credentials of subscriptions marked `acs_managed`; every issue is audit-logged and rate-limited per token |
    | `ft-server` | read the FT credential (HA1 for the FT realm and the owning IMPU) |
 
 4. Tokens are random, at least 256 bits, distinct per caller and from the admin
@@ -78,10 +83,15 @@ traffic within an AZ is not assumed to be.
    what keep non-CSCF tasks off the Cx port. Restricting which command codes a
    peer may use (for example UAR/LIR only for `icscf`) is a follow-up.
 7. SIP trust domain (RFC 3325): only `pcscf` accepts requests from clients, and it
-   removes any `P-Asserted-Identity` they carry. The core SIP ports trust
+   removes the headers only the network may set (TS 24.229 §5.2):
+   `P-Asserted-Identity`, `P-Served-User`, `P-Asserted-Service`,
+   `P-Charging-Vector`, `P-Charging-Function-Addresses`, `P-Visited-Network-ID`,
+   `P-Associated-URI`, `P-Called-Party-ID`. The core SIP ports trust
    `P-Asserted-Identity` because security groups admit only platform services
    there.
-8. Task definitions use `readonlyRootFilesystem: true`, `enableExecuteCommand:
+8. The FT digest realm must differ from the IMS digest realm (startup refuses
+   equal realms), so an FT credential can never authenticate a SIP registration.
+9. Task definitions use `readonlyRootFilesystem: true`, `enableExecuteCommand:
    false`, no `privileged`, and drop all Linux capabilities; the image has no
    shell (distroless, non-root). VPC Flow Logs and GuardDuty Runtime Monitoring
    for Fargate are enabled in `prod`.
@@ -102,7 +112,8 @@ expect between networks, not inside one deployment.
   |---|---|---|
   | Ki/OPc, digest credentials, admin token | operator → `hss` API | the two endpoints |
   | IMS and FT credentials, service tokens | `acs`/`ft-server` ↔ `hss` | the two endpoints |
-  | AKA vectors (RAND, AUTN, XRES, CK, IK), HA1 | `hss` → CSCFs (MAA) | `hss`, `icscf`/`scscf` |
+  | AKA vectors (RAND, AUTN, XRES, CK, IK), HA1 | `hss` → `scscf` (MAA) | `hss`, `scscf` |
+  | relay control token, MSRP binding ids | `pcscf` → `msrp-relay` | the two endpoints |
   | IMS credentials and OTP in configuration responses | ALB → `acs` | `acs` |
   | SIP signalling incl. IMPI/IMPU, MSISDN, MESSAGE bodies | NLB → `pcscf` → core | every SIP service on the path |
   | MSRP message content | NLB → `msrp-relay` → `rcs-as` | relay and `rcs-as` |
