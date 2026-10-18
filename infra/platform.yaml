@@ -1,0 +1,945 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  RCS platform on AWS (ADR 0003): VPC across two AZs, ECS Fargate cluster, Cloud
+  Map namespace, one security group per service in the ADR 0007 matrix, a public
+  NLB for SIP and MSRP and a public ALB with AWS WAF for acs and ft-server. Data
+  stores, task definitions, services and alarms are added to this stack by the
+  service blocks (#56 part 2). Deployed by scripts/deploy.sh, never by hand.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Stage }
+        Parameters: [Environment]
+      - Label: { default: Network }
+        Parameters: [VpcCidr, NatGateways, ServiceNamespace, PublicIngressCidr]
+      - Label: { default: Load balancers }
+        Parameters:
+          - AlbCertificateArn
+          - NlbCertificateArn
+          - FtHostName
+          - FtDeregistrationDelay
+          - PcscfEnabled
+          - WafRateLimit
+      - Label: { default: Observability }
+        Parameters: [ContainerInsights, LogRetentionDays]
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: >
+      RCS_ENV of every service. staging and prod require both certificates
+      (see Rules) and get VPC Flow Logs and deletion protection.
+
+  VpcCidr:
+    Type: String
+    Default: 10.30.0.0/16
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/16$'
+    Description: >
+      A /16 of RFC 1918 space, split into two public and two private /20
+      subnets. Services accept internal addresses only in RFC 1918 and ULA
+      ranges (ADR 0007 §5), so this must be private.
+
+  NatGateways:
+    Type: String
+    Default: per-az
+    AllowedValues: [per-az, single]
+    Description: >
+      per-az keeps task egress (image pulls, AWS APIs) up when one AZ fails;
+      single saves one NAT gateway's hourly charge for dev and test stacks.
+
+  ServiceNamespace:
+    Type: String
+    Default: rcs.local
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    Description: >
+      Cloud Map private DNS namespace (RCS_SERVICE_NAMESPACE); services find
+      each other as <service>.<namespace>.
+
+  PublicIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$'
+    Description: >
+      Who may reach the NLB and ALB. Handsets come from anywhere, so the
+      default is the internet; narrow it while a stack is not yet meant for
+      real clients.
+
+  AlbCertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      ACM certificate for the ALB's HTTPS listener (acs and ft-server). Empty
+      is allowed in dev only: the ALB then serves plain HTTP.
+
+  NlbCertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      ACM certificate for the NLB's SIP TLS (5061) and MSRP TLS (2856)
+      listeners. Empty is allowed in dev only: the TLS listeners are omitted.
+
+  FtHostName:
+    Type: String
+    Default: ''
+    Description: >
+      Host name of the FT HTTP content server (the host of ftHTTPCSURI). When
+      set, ft-server's routes also match on it, so acs and ft-server can share
+      the ALB under different names; empty routes on paths alone.
+
+  FtDeregistrationDelay:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 3600
+    Description: >
+      Seconds a stopping ft-server task keeps receiving in-flight requests
+      from the ALB: long enough for most uploads to finish in place
+      (docs/ft-server.md, Operations notes).
+
+  PcscfEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Creates the SIP listeners and target group once pcscf exists (#16).
+      The pcscf security group and its rules exist either way.
+
+  WafRateLimit:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 2000000000
+    Description: >
+      Requests per client address per 5 minutes the ALB's WAF rule allows
+      before it blocks that address. A deployment prerequisite of ft-server
+      (docs/ft-server.md, Operations notes): its own limits are per task.
+
+  ContainerInsights:
+    Type: String
+    Default: enabled
+    AllowedValues: [enabled, disabled]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention of the VPC Flow Logs and, later, the service log groups.
+
+Rules:
+  ProductionNeedsTls:
+    RuleCondition: !Not [!Equals [!Ref Environment, dev]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AlbCertificateArn, '']]
+        AssertDescription: >
+          staging and prod need AlbCertificateArn: acs configuration and file
+          transfer carry credentials and identities.
+      - Assert: !Not [!Equals [!Ref NlbCertificateArn, '']]
+        AssertDescription: >
+          staging and prod need NlbCertificateArn: clients use SIP and MSRP over
+          TLS, and msrp-relay refuses to offer plain MSRP.
+
+Conditions:
+  IsDev: !Equals [!Ref Environment, dev]
+  IsProduction: !Not [!Condition IsDev]
+  NatPerAz: !Equals [!Ref NatGateways, per-az]
+  HasAlbCertificate: !Not [!Equals [!Ref AlbCertificateArn, '']]
+  NoAlbCertificate: !Equals [!Ref AlbCertificateArn, '']
+  HasNlbCertificate: !Not [!Equals [!Ref NlbCertificateArn, '']]
+  HasFtHostName: !Not [!Equals [!Ref FtHostName, '']]
+  WithPcscf: !Equals [!Ref PcscfEnabled, 'true']
+  WithPcscfTls: !And [!Condition WithPcscf, !Condition HasNlbCertificate]
+
+Resources:
+  # ---------------------------------------------------------------- network
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Ref AWS::StackName }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Ref AWS::StackName }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnets hold only the load balancers and NAT gateways; tasks never
+  # get a public address.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-a' }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-b' }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-a' }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-b' }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public' }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatAddressA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatAddressA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-a' }
+
+  NatAddressB:
+    Type: AWS::EC2::EIP
+    Condition: NatPerAz
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: NatPerAz
+    Properties:
+      AllocationId: !GetAtt NatAddressB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-b' }
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-a' }
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-b' }
+
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  # With a single NAT gateway both AZs leave through AZ a.
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [NatPerAz, !Ref NatGatewayB, !Ref NatGatewayA]
+
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # Gateway endpoints cost nothing and keep DynamoDB and S3 traffic (every
+  # service's state, ft-server's file content) off the NAT gateways.
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+
+  # ADR 0007 §9: VPC Flow Logs in production, so that an investigation can
+  # see which task talked to what.
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsProduction
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/rcs/${AWS::StackName}/vpc-flow-logs'
+      RetentionInDays: !Ref LogRetentionDays
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      Description: Lets VPC Flow Logs write to the stack's flow log group.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: IsProduction
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+
+  # -------------------------------------------------------- compute, naming
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      # On-demand by default: SIP and MSRP tasks hold client connections, and a
+      # Spot interruption drops them. A service may opt into FARGATE_SPOT.
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1 }
+      ClusterSettings:
+        - { Name: containerInsights, Value: !Ref ContainerInsights }
+
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref ServiceNamespace
+      Vpc: !Ref Vpc
+      Description: Service discovery inside the platform VPC (ADR 0003, ADR 0005).
+
+  # ------------------------------------------------------- security groups
+  #
+  # One group per service, exactly the matrix of ADR 0007 §2, which
+  # scripts/check_infra.py checks: private groups admit only other groups,
+  # never an address range, and only on the ports listed there. Every rule
+  # between two groups is its own resource (no circular references), and every
+  # group declares an egress rule inline, which removes the default allow-all
+  # egress. Groups of services that do not exist yet are created now, so their
+  # service blocks only attach them.
+  #
+  # Ports (the service blocks bind these):
+  #   pcscf      5060 client SIP (NLB), 5070 core SIP
+  #   icscf      5060 SIP          scscf    5060 SIP
+  #   rcs-as     5060 SIP, 2855 MSRP
+  #   hss        3868 Diameter Cx, 8081 provisioning API
+  #   msrp-relay 2855 MSRP (NLB), 8082 control API
+  #   ft-server  8081 HTTP (ALB), 8080 admin (ALB health check)
+  #   acs        8080 HTTP (ALB)
+  # Admin ports of services without a load balancer get no ingress: the ECS
+  # container health check runs inside the task (-healthcheck).
+
+  PcscfSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: pcscf - client SIP from the NLB, core SIP from scscf
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-pcscf' }]
+
+  IcscfSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: icscf - SIP from pcscf, rcs-as and scscf
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-icscf' }]
+
+  ScscfSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: scscf - SIP from pcscf, rcs-as and icscf
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-scscf' }]
+
+  RcsAsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: rcs-as - SIP from scscf and icscf, MSRP from msrp-relay
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rcs-as' }]
+
+  HssSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: hss - Cx from icscf and scscf, API from ft-server, acs and operators
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, KMS)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-hss' }]
+
+  MsrpRelaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: msrp-relay - MSRP from the NLB, control API from pcscf
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, DynamoDB)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-msrp-relay' }]
+
+  FtServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ft-server - HTTP and health checks from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, S3, DynamoDB)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-ft-server' }]
+
+  AcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: acs - HTTP from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs and SMS providers' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-acs' }]
+
+  # The operator path to the HSS API (ADR 0007 §5): attach this group to a
+  # one-off task or an internal load balancer; it is never on the public ALB.
+  OperatorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: operator - may call the hss provisioning API
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-operator' }]
+
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NLB - SIP and MSRP from clients
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TCP' }
+        - { IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TLS' }
+        - { IpProtocol: tcp, FromPort: 2855, ToPort: 2855, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TCP' }
+        - { IpProtocol: tcp, FromPort: 2856, ToPort: 2856, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TLS' }
+      # Only the target rules below leave the NLB; this unroutable entry
+      # replaces the default allow-all.
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: 'no default egress' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb' }]
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP and HTTPS from clients
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref PublicIngressCidr, Description: 'HTTPS' }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref PublicIngressCidr, Description: 'HTTP (redirect, or dev)' }
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: 'no default egress' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-alb' }]
+
+  # Each matrix entry is an ingress rule on the destination and the matching
+  # egress rule on the source.
+
+  NlbToPcscfSip:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref PcscfSecurityGroup, SourceSecurityGroupId: !Ref NlbSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'client SIP and health checks' }
+  NlbToPcscfSipOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref NlbSecurityGroup, DestinationSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'client SIP and health checks' }
+
+  NlbToRelayMsrp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref MsrpRelaySecurityGroup, SourceSecurityGroupId: !Ref NlbSecurityGroup, IpProtocol: tcp, FromPort: 2855, ToPort: 2855, Description: 'client MSRP and health checks' }
+  NlbToRelayMsrpOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref NlbSecurityGroup, DestinationSecurityGroupId: !Ref MsrpRelaySecurityGroup, IpProtocol: tcp, FromPort: 2855, ToPort: 2855, Description: 'client MSRP and health checks' }
+
+  AlbToAcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref AcsSecurityGroup, SourceSecurityGroupId: !Ref AlbSecurityGroup, IpProtocol: tcp, FromPort: 8080, ToPort: 8080, Description: 'acs HTTP and health checks' }
+  AlbToAcsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref AlbSecurityGroup, DestinationSecurityGroupId: !Ref AcsSecurityGroup, IpProtocol: tcp, FromPort: 8080, ToPort: 8080, Description: 'acs HTTP and health checks' }
+
+  AlbToFtServer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref FtServerSecurityGroup, SourceSecurityGroupId: !Ref AlbSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'file transfer' }
+  AlbToFtServerOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref AlbSecurityGroup, DestinationSecurityGroupId: !Ref FtServerSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'file transfer' }
+
+  AlbToFtServerAdmin:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref FtServerSecurityGroup, SourceSecurityGroupId: !Ref AlbSecurityGroup, IpProtocol: tcp, FromPort: 8080, ToPort: 8080, Description: 'health checks on /readyz' }
+  AlbToFtServerAdminOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref AlbSecurityGroup, DestinationSecurityGroupId: !Ref FtServerSecurityGroup, IpProtocol: tcp, FromPort: 8080, ToPort: 8080, Description: 'health checks on /readyz' }
+
+  IcscfToHssCx:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref HssSecurityGroup, SourceSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 3868, ToPort: 3868, Description: 'Diameter Cx' }
+  IcscfToHssCxOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref IcscfSecurityGroup, DestinationSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 3868, ToPort: 3868, Description: 'Diameter Cx' }
+
+  ScscfToHssCx:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref HssSecurityGroup, SourceSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 3868, ToPort: 3868, Description: 'Diameter Cx' }
+  ScscfToHssCxOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, DestinationSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 3868, ToPort: 3868, Description: 'Diameter Cx' }
+
+  FtServerToHssApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref HssSecurityGroup, SourceSecurityGroupId: !Ref FtServerSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'FT credential lookups' }
+  FtServerToHssApiOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref FtServerSecurityGroup, DestinationSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'FT credential lookups' }
+
+  AcsToHssApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref HssSecurityGroup, SourceSecurityGroupId: !Ref AcsSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'credential issue' }
+  AcsToHssApiOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref AcsSecurityGroup, DestinationSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'credential issue' }
+
+  OperatorToHssApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref HssSecurityGroup, SourceSecurityGroupId: !Ref OperatorSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'provisioning' }
+  OperatorToHssApiOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref OperatorSecurityGroup, DestinationSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'provisioning' }
+
+  PcscfToIcscf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref IcscfSecurityGroup, SourceSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  PcscfToIcscfOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref PcscfSecurityGroup, DestinationSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  RcsAsToIcscf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref IcscfSecurityGroup, SourceSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  RcsAsToIcscfOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, DestinationSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  ScscfToIcscf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref IcscfSecurityGroup, SourceSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  ScscfToIcscfOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, DestinationSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  PcscfToScscf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, SourceSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  PcscfToScscfOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref PcscfSecurityGroup, DestinationSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  RcsAsToScscf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, SourceSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  RcsAsToScscfOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, DestinationSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  IcscfToScscf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, SourceSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  IcscfToScscfOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref IcscfSecurityGroup, DestinationSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  # ADR 0007 §2, §7: the core listener is a different port from the client
+  # listener, and only scscf reaches it.
+  ScscfToPcscfCore:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref PcscfSecurityGroup, SourceSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 5070, ToPort: 5070, Description: 'core SIP' }
+  ScscfToPcscfCoreOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, DestinationSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 5070, ToPort: 5070, Description: 'core SIP' }
+
+  ScscfToRcsAs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, SourceSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+  ScscfToRcsAsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref ScscfSecurityGroup, DestinationSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP' }
+
+  # TS 24.229 §5.3.2.1: icscf routes directly to the conference factory and
+  # other PSIs that rcs-as hosts.
+  IcscfToRcsAs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, SourceSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP to PSIs' }
+  IcscfToRcsAsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref IcscfSecurityGroup, DestinationSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP to PSIs' }
+
+  # threat model T3: only the relay reaches rcs-as's MSRP port.
+  RelayToRcsAsMsrp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, SourceSecurityGroupId: !Ref MsrpRelaySecurityGroup, IpProtocol: tcp, FromPort: 2855, ToPort: 2855, Description: 'MSRP' }
+  RelayToRcsAsMsrpOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref MsrpRelaySecurityGroup, DestinationSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 2855, ToPort: 2855, Description: 'MSRP' }
+
+  PcscfToRelayControl:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref MsrpRelaySecurityGroup, SourceSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 8082, ToPort: 8082, Description: 'relay control API' }
+  PcscfToRelayControlOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref PcscfSecurityGroup, DestinationSecurityGroupId: !Ref MsrpRelaySecurityGroup, IpProtocol: tcp, FromPort: 8082, ToPort: 8082, Description: 'relay control API' }
+
+  # -------------------------------------------------------------------- NLB
+  #
+  # Every target group has Proxy Protocol v2 on (ADR 0003): Fargate targets
+  # are IP targets, for which the NLB does not keep the client address on TLS
+  # listeners. Health checks are TCP connections to the traffic port: with
+  # PPv2 on, AWS sends the PPv2 header on health check connections too (with
+  # the LOCAL command), which the SIP and MSRP transports accept, whereas the
+  # admin HTTP server would not parse it.
+
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref NlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
+        - { Key: deletion_protection.enabled, Value: !If [IsProduction, 'true', 'false'] }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb' }]
+
+  PcscfSipTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: WithPcscf
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: TCP
+      Port: 5060
+      HealthCheckProtocol: TCP
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: proxy_protocol_v2.enabled, Value: 'true' }
+        # Off, so targets see the NLB's group as the source and the matrix
+        # holds; the client address arrives in the PPv2 header instead.
+        - { Key: preserve_client_ip.enabled, Value: 'false' }
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  RelayMsrpTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: TCP
+      Port: 2855
+      HealthCheckProtocol: TCP
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: proxy_protocol_v2.enabled, Value: 'true' }
+        # Off, so targets see the NLB's group as the source and the matrix
+        # holds; the client address arrives in the PPv2 header instead.
+        - { Key: preserve_client_ip.enabled, Value: 'false' }
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  # The idle timeout is configurable on TCP listeners only; TLS listeners keep
+  # a fixed 350 s, which the keep-alives are sized for (ADR 0003).
+  SipTcpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: WithPcscf
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 5060
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref PcscfSipTargetGroup }]
+      ListenerAttributes:
+        - { Key: tcp.idle_timeout.seconds, Value: '1800' }
+
+  SipTlsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: WithPcscfTls
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TLS
+      Port: 5061
+      Certificates: [{ CertificateArn: !Ref NlbCertificateArn }]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref PcscfSipTargetGroup }]
+
+  MsrpTcpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 2855
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref RelayMsrpTargetGroup }]
+      ListenerAttributes:
+        - { Key: tcp.idle_timeout.seconds, Value: '1800' }
+
+  MsrpTlsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasNlbCertificate
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TLS
+      Port: 2856
+      Certificates: [{ CertificateArn: !Ref NlbCertificateArn }]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref RelayMsrpTargetGroup }]
+
+  # -------------------------------------------------------------------- ALB
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        # Longer than ft-server's 30 s FT_IDLE_TIMEOUT, so the service, not
+        # the ALB, decides when a stalled transfer ends.
+        - { Key: idle_timeout.timeout_seconds, Value: '60' }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+        - { Key: deletion_protection.enabled, Value: !If [IsProduction, 'true', 'false'] }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-alb' }]
+
+  AcsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  FtServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8081
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8080'
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: !Ref FtDeregistrationDelay }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasAlbCertificate
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTPS
+      Port: 443
+      Certificates: [{ CertificateArn: !Ref AlbCertificateArn }]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+
+  HttpRedirectListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasAlbCertificate
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+
+  # dev only (see Rules): no certificate, so the ALB serves plain HTTP.
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NoAlbCertificate
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+
+  # ft-server answers on its upload (/ft) and download (/dl) paths
+  # (FT_UPLOAD_URI, FT_DOWNLOAD_URI); everything else goes to acs.
+  FtServerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasAlbCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: [/ft, /ft/*, /dl] }
+        - !If
+          - HasFtHostName
+          - Field: host-header
+            HostHeaderConfig: { Values: [!Ref FtHostName] }
+          - !Ref AWS::NoValue
+      Actions: [{ Type: forward, TargetGroupArn: !Ref FtServerTargetGroup }]
+
+  # A rate-based rule per client address: ft-server's and acs's own limits are
+  # per task, so only this limits one client across tasks.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-alb'
+      Rules:
+        - Name: rate-per-address
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafRateLimit
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-per-address
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref Alb
+      WebACLArn: !GetAtt WebAcl.Arn
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+  PrivateSubnets:
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export: { Name: !Sub '${AWS::StackName}-PrivateSubnets' }
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub '${AWS::StackName}-ClusterName' }
+  NamespaceId:
+    Value: !Ref Namespace
+    Export: { Name: !Sub '${AWS::StackName}-NamespaceId' }
+  NlbDnsName:
+    Description: >
+      Where clients reach SIP and MSRP: point the operator's names at it, or
+      use it as RELAY_PUBLIC_HOST and the pcscf address acs provisions.
+    Value: !GetAtt Nlb.DNSName
+  AlbDnsName:
+    Description: Where clients reach acs and ft-server.
+    Value: !GetAtt Alb.DNSName
+  OperatorSecurityGroupId:
+    Description: Attach to a task or internal load balancer that may call the hss provisioning API.
+    Value: !Ref OperatorSecurityGroup
