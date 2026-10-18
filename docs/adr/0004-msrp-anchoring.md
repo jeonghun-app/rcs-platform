@@ -14,9 +14,39 @@ gateway controlled by the P-CSCF (TS 23.334).
 - `msrp-relay` is an MSRP back-to-back relay at the edge. `pcscf` asks it for a
   binding through `POST /v1/bindings` and rewrites `m=message` SDP in both
   directions.
-- Toward the client the relay is always **passive** (`a=setup:passive`, its public
-  address in `a=path`); toward `rcs-as` it is always **active**. Clients always
-  connect to the relay; the relay always connects to `rcs-as`.
+- Connection direction: **the client connects to the relay, and the relay connects
+  to `rcs-as`**. RFC 6135 §4.2.2 forbids `a=setup:passive` in an offer, so the
+  direction is reached through answers, never by offering `passive`:
+
+  | Session | Offer the far side sees | Answer the offerer sees |
+  |---|---|---|
+  | Client originates (client offers `actpass` or `active`) | to `rcs-as`: relay core address, `active`; `rcs-as` answers `passive` | to client: relay public address, `passive` |
+  | `rcs-as` originates (`rcs-as` offers `actpass`, its instance address) | to client: relay public address, `actpass` | to `rcs-as`: `active` (relay connects) |
+
+  - On the core leg the relay offers `active` (port 9), which forces a `passive`
+    answer: it does not listen on its core address, and RFC 6135 §4.2.2 requires
+    `active` from an endpoint that cannot provide a transport address it accepts
+    connections on. The relay still sends an explicit `a=setup` (§4.2.1).
+  - A missing `a=setup` takes the RFC 4145 §4 defaults (`active` in an offer,
+    `passive` in an answer), so a client without connection negotiation
+    (RFC 6135 §5) is served.
+  - A client answering the terminating `actpass` offer with `passive` asks the
+    network to dial it. The relay **never dials clients** (a client-supplied
+    target is an SSRF and port-scanning vector, and the outbound leg could not
+    use the NLB's TLS). The answer arrives in a 2xx, which a proxy must forward
+    (RFC 3261 §16.7). `pcscf` first releases the relay binding, so the relay never
+    connects to `rcs-as` for this session, then forwards the 2xx and, once the
+    ACK from `rcs-as` has passed through, ends the session as a P-CSCF may
+    (TS 24.229 §5.2.10, clause to confirm against the targeted edition): BYE
+    toward the client and toward `rcs-as`, both with
+    `Reason: SIP;cause=488;text="MSRP direction not supported"`.
+    `rcs-as` treats a BYE carrying that Reason before any MSRP traffic as a
+    delivery failure on this contact (see Consequences for what it does next).
+    Clients behind NAT answer `active` (§4.2.2), so this affects only clients
+    that are themselves reachable.
+- `rcs-as` offers `actpass` with its instance address and answers `passive`;
+  every MSRP endpoint in the platform always sends an explicit `a=setup`
+  (§4.2.1) and never sends `holdconn`.
 - Bindings are stored in DynamoDB with a TTL and keyed by the session id in the
   relay URI, so any relay task can accept any client connection.
   - The session id carries at least 128 random bits (base32), so it cannot be
@@ -34,17 +64,24 @@ gateway controlled by the P-CSCF (TS 23.334).
 
 ## Rationale
 
-Fixing the connection direction removes the need for connection affinity behind
-the NLB and works through NAT. Using the gateway model matches how operators deploy
+Making the client always the connecting side removes the need for connection
+affinity behind the NLB, works through NAT, and means the relay never opens a
+connection to an address a client chose. Using the gateway model matches how operators deploy
 RCS and keeps the client unaware of the relay.
 
 ## Consequences
 
 - `pcscf` must rewrite SDP correctly in offers and answers, initial and re-INVITE,
   and release bindings on BYE, CANCEL, failure responses and session timer expiry.
-- A client that offers `a=setup:passive` when it originates a session asks the
-  network to connect to it, which the relay never does. `pcscf` answers such an
-  offer with 488 Not Acceptable Here. RCS clients normally offer `active` or
-  `actpass`; recorded as a limitation.
-- `rcs-as` offers `a=setup:passive` on terminating sessions so the relay can
-  connect to it.
+- A client that offers `a=setup:passive` violates RFC 6135 §4.2.2; `pcscf`
+  answers such an offer with 488 Not Acceptable Here.
+- A client that answers a terminating offer with `passive` cannot receive chat
+  sessions from the network. `rcs-as` delivers to it with **pager-mode
+  standalone messaging** (SIP MESSAGE, no MSRP) when the message fits the pager
+  limit; larger content stays stored and is delivered inside the next session the
+  client itself originates to that conversation, until the store-and-forward
+  expiry (`RCSAS_STORE_TTL`, default 7 days), after which the sender gets a
+  negative delivery notification. `rcs-as` does not retry terminating sessions to
+  that contact while it stays registered on the same flow; a registration on a
+  new flow clears the marker. Recorded as a limitation; the count is a metric.
+- The relay needs no internet egress.

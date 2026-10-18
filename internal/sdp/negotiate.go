@@ -1,0 +1,276 @@
+package sdp
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+// Reasons NegotiateMSRP declines an offered media line. Each one is answered
+// by rejecting the line (RejectMedia), or the whole offer with 488 when no line
+// is left.
+var (
+	ErrNotMSRP           = errors.New("sdp: not an MSRP media line")
+	ErrMediaDisabled     = errors.New("sdp: offered media line has port 0")
+	ErrNoCommonType      = errors.New("sdp: no accept-types in common")
+	ErrTransportMismatch = errors.New("sdp: local path scheme does not match the offered transport")
+)
+
+// MSRPEndpoint describes the local end of an MSRP media line being answered.
+type MSRPEndpoint struct {
+	Port int
+	// Path is the local a=path. Its first URI's scheme must match the offered
+	// transport: msrps: for TCP/TLS/MSRP, msrp: for TCP/MSRP.
+	Path               []string
+	AcceptTypes        []string // what the local end can receive; may contain wildcards
+	AcceptWrappedTypes []string // likewise inside a wrapper; empty for none
+	MaxSize            int64    // advertised as a=max-size when positive
+	// PreferredSetup is the role taken when the offer is actpass: active or
+	// passive. Empty means passive, because rcs-as, the answerer this package
+	// is written for, is always connected to by msrp-relay (ADR 0004).
+	PreferredSetup Setup
+}
+
+func (e *MSRPEndpoint) validate() error {
+	if e.Port < 1 || e.Port > 65535 {
+		return errors.New("sdp: local endpoint: port must be from 1 to 65535")
+	}
+	if err := validatePath(e.Path); err != nil {
+		return err
+	}
+	if len(e.AcceptTypes) == 0 {
+		return errors.New("sdp: local endpoint: at least one accept type is required")
+	}
+	if err := validateMediaTypes("accept-types", e.AcceptTypes); err != nil {
+		return err
+	}
+	if err := validateMediaTypes("accept-wrapped-types", e.AcceptWrappedTypes); err != nil {
+		return err
+	}
+	if e.MaxSize < 0 {
+		return errors.New("sdp: local endpoint: max size must not be negative")
+	}
+	switch e.PreferredSetup {
+	case "", SetupActive, SetupPassive:
+		return nil
+	}
+	return fmt.Errorf("sdp: local endpoint: preferred setup must be active or passive, not %.32q", e.PreferredSetup)
+}
+
+// NewAnswer starts the answer to offer. RFC 3264 §6 requires one answer media
+// line per offered line, in the same order, so every line starts out rejected
+// and the caller replaces those it accepts with the result of NegotiateMSRP.
+// The t= lines are copied from the offer, as RFC 3264 §6 also requires.
+func NewAnswer(offer *Session, origin Origin, conn Connection) *Session {
+	ans := &Session{Origin: origin, Name: "-", Connection: &conn}
+	for _, t := range offer.Times {
+		ans.Times = append(ans.Times, Time{Start: t.Start, Stop: t.Stop, Repeats: slices.Clone(t.Repeats), Zones: t.Zones})
+	}
+	ans.Media = make([]Media, len(offer.Media))
+	for i := range offer.Media {
+		ans.Media[i] = RejectMedia(&offer.Media[i])
+	}
+	return ans
+}
+
+// RejectMedia returns the answer line that declines an offered media line:
+// the same media type and transport with port 0, and the offered formats,
+// since at least one must be listed (RFC 3264 §6). A declined file transfer
+// keeps a=file-selector and a=file-transfer-id so the offerer can tell which
+// transfer was refused (RFC 5547 §8.3).
+func RejectMedia(offer *Media) Media {
+	m := Media{Type: offer.Type, Proto: offer.Proto, Formats: slices.Clone(offer.Formats)}
+	for _, name := range []string{"file-selector", "file-transfer-id"} {
+		if v, ok := offer.Attributes.Get(name); ok {
+			m.Attributes.Add(name, v)
+		}
+	}
+	return m
+}
+
+// NegotiateMSRP answers media line i of offer for the local endpoint.
+//
+// The answer accepts the accept-types and accept-wrapped-types the two ends
+// have in common (RFC 4975 §8.6), takes the connection role that complements
+// the offered one (RFC 4145 §4, RFC 6135 §4.2.1), mirrors the direction
+// (RFC 3264 §6.1) and, for a file transfer, echoes a=file-selector,
+// a=file-transfer-id and a=file-range (RFC 5547 §8.3). A line offered with
+// port 0 is never accepted (ErrMediaDisabled), nor is one with no type in
+// common (ErrNoCommonType); either way the caller keeps the rejected line
+// from NewAnswer. The answer is never holdconn, and may be passive: only an
+// offer is barred from passive (RFC 6135 §4.2.2). offer is not modified.
+func NegotiateMSRP(offer *Session, i int, local MSRPEndpoint) (Media, error) {
+	m, err := offer.media(i)
+	if err != nil {
+		return Media{}, err
+	}
+	if !m.IsMSRP() {
+		return Media{}, ErrNotMSRP
+	}
+	if m.Port == 0 {
+		return Media{}, ErrMediaDisabled
+	}
+	if err := local.validate(); err != nil {
+		return Media{}, err
+	}
+	if secure, _ := msrpScheme(local.Path[0]); secure != strings.EqualFold(m.Proto, ProtoMSRPS) {
+		return Media{}, ErrTransportMismatch
+	}
+	if _, err := m.Path(); err != nil {
+		return Media{}, fmt.Errorf("sdp: offer: %w", err)
+	}
+
+	offered, err := m.AcceptTypes()
+	if err != nil {
+		return Media{}, fmt.Errorf("sdp: offer: %w", err)
+	}
+	types := intersectTypes(offered, local.AcceptTypes)
+	if len(types) == 0 {
+		return Media{}, ErrNoCommonType
+	}
+	var wrapped []string
+	switch offeredWrapped, err := m.AcceptWrappedTypes(); {
+	case err == nil:
+		wrapped = intersectTypes(offeredWrapped, local.AcceptWrappedTypes)
+	case !errors.Is(err, ErrNoAttribute):
+		return Media{}, fmt.Errorf("sdp: offer: %w", err)
+	}
+
+	setup, err := answerSetup(offer, i, local.PreferredSetup)
+	if err != nil {
+		return Media{}, fmt.Errorf("sdp: offer: %w", err)
+	}
+	dir, err := offer.MediaDirection(i)
+	if err != nil {
+		return Media{}, fmt.Errorf("sdp: offer: %w", err)
+	}
+
+	ans := Media{Type: m.Type, Port: local.Port, Proto: m.Proto, Formats: slices.Clone(m.Formats)}
+	ans.Attributes.Add("accept-types", strings.Join(types, " "))
+	if len(wrapped) > 0 {
+		ans.Attributes.Add("accept-wrapped-types", strings.Join(wrapped, " "))
+	}
+	if local.MaxSize > 0 {
+		ans.Attributes.Add("max-size", strconv.FormatInt(local.MaxSize, 10))
+	}
+	ans.Attributes.Add("path", strings.Join(local.Path, " "))
+	ans.Attributes.Add("setup", string(setup))
+	ans.Attributes.Add(string(answerDirection(dir)), "")
+	if err := echoFileTransfer(m, &ans); err != nil {
+		return Media{}, fmt.Errorf("sdp: offer: %w", err)
+	}
+	return ans, nil
+}
+
+// answerSetup picks the answerer's role. Without a usable a=setup (absent, or
+// holdconn, which MediaSetup ignores) the offerer follows the original
+// RFC 4975 model and connects itself (RFC 4975 §8.5, RFC 6135 §4.2.1), so the
+// answer is passive. The result is never holdconn.
+func answerSetup(offer *Session, i int, preferred Setup) (Setup, error) {
+	offered, err := offer.MediaSetup(i)
+	switch {
+	case errors.Is(err, ErrNoAttribute):
+		offered = SetupActive
+	case err != nil:
+		return "", err
+	}
+	switch offered {
+	case SetupActive:
+		return SetupPassive, nil
+	case SetupPassive:
+		return SetupActive, nil
+	}
+	if preferred == "" {
+		return SetupPassive, nil
+	}
+	return preferred, nil
+}
+
+func answerDirection(offered Direction) Direction {
+	switch offered {
+	case SendOnly:
+		return RecvOnly
+	case RecvOnly:
+		return SendOnly
+	}
+	return offered
+}
+
+// echoFileTransfer copies the attributes that identify the file and the part
+// of it being accepted, after checking they parse, so a malformed value is
+// refused rather than reflected. Leaving out a=file-range would mean the
+// whole file (RFC 5547 §8.7), so a resumed transfer must have it echoed.
+func echoFileTransfer(offer, ans *Media) error {
+	if _, err := offer.FileSelector(); err == nil {
+		v, _ := offer.Attributes.Get("file-selector")
+		ans.Attributes.Add("file-selector", v)
+	} else if !errors.Is(err, ErrNoAttribute) {
+		return err
+	}
+	if id, err := offer.FileTransferID(); err == nil {
+		ans.Attributes.Add("file-transfer-id", id)
+	} else if !errors.Is(err, ErrNoAttribute) {
+		return err
+	}
+	if _, err := offer.FileRange(); err == nil {
+		v, _ := offer.Attributes.Get("file-range")
+		ans.Attributes.Add("file-range", v)
+	} else if !errors.Is(err, ErrNoAttribute) {
+		return err
+	}
+	return nil
+}
+
+// intersectTypes returns the media types both lists accept, in the order of
+// offered. Entries are matched on type/subtype alone, so an entry with
+// parameters matches the same type without them (RFC 4975 §8.6), and media
+// types compare case-insensitively. A wildcard on one side matches the other
+// side's entry and the narrower entry is kept as written, parameters
+// included: offering * and accepting text/plain yields text/plain. When both
+// name the same type the offered entry is kept.
+//
+// The offer is peer input of up to DefaultMaxSize, so duplicates are found
+// with a map rather than by scanning the result.
+func intersectTypes(offered, local []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, o := range offered {
+		for _, l := range local {
+			t, ok := narrower(o, l)
+			if !ok {
+				continue
+			}
+			key := strings.ToLower(t)
+			if _, dup := seen[key]; !dup {
+				seen[key] = struct{}{}
+				out = append(out, t)
+			}
+		}
+	}
+	return out
+}
+
+func narrower(a, b string) (string, bool) {
+	aBase, bBase := mediaRangeBase(a), mediaRangeBase(b)
+	switch {
+	case strings.EqualFold(aBase, bBase):
+		return a, true
+	case aBase == "*":
+		return b, true
+	case bBase == "*":
+		return a, true
+	}
+	aType, aSub, _ := strings.Cut(aBase, "/")
+	bType, bSub, _ := strings.Cut(bBase, "/")
+	switch {
+	case !strings.EqualFold(aType, bType):
+		return "", false
+	case aSub == "*":
+		return b, true
+	case bSub == "*":
+		return a, true
+	}
+	return "", false
+}
