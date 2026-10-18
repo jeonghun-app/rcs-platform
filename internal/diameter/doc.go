@@ -16,6 +16,10 @@
 //   - A [Node] runs the peer state machine over TCP: capabilities exchange
 //     (CER/CEA, §5.3), the RFC 3539 watchdog (DWR/DWA, §5.5), disconnection
 //     (DPR/DPA, §5.4) and reconnection with backoff for peers it initiates.
+//     A reconnection starts in the watchdog's REOPEN state (three DWAs
+//     before traffic) only when the previous connection failed and the new
+//     one reaches the same Origin-Host; after a DPR, or to another node, it
+//     is usable at once.
 //   - The request/answer API: [Peer.Send] waits for the answer matched by
 //     hop-by-hop identifier, and handlers registered with [Node.Handle] answer
 //     requests per application and command code.

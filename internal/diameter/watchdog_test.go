@@ -179,3 +179,52 @@ func TestReopeningConnectionToleratesOneMissedWatchdogAnswer(t *testing.T) {
 	clock.Advance(testWatchdog) // second miss: close
 	s.expectClosed()
 }
+
+// A peer that leaves with DPR, as an hss task does in a rolling update
+// (ADR 0003), did not fail: the next connection carries traffic at once.
+func TestReconnectAfterACleanDisconnectIsAvailableAtOnce(t *testing.T) {
+	n, peer, dialer, clock := startInitiator(t, nil)
+	first := dialer.next(t)
+	acceptCER(t, first)
+	waitFor(t, "the first connection to open", peer.Available)
+	first.roundTrip(&Message{Code: CodeDisconnectPeer, AVPs: append(first.origin(),
+		NewAVP(AVPDisconnectCause, FlagMandatory, 0, Enumerated(DisconnectRebooting)))})
+	_ = first.nc.Close()
+	clock.waitForTimer(t, n.backoff(0))
+	clock.Advance(n.backoff(0))
+
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "the new connection to open", peer.Available)
+	s.sync() // a REOPEN DWR would arrive here instead of the DWA
+}
+
+// REOPEN guards against flapping back to the same failed peer (RFC 3539
+// §3.4.1); a different node behind the same address has not failed.
+func TestReconnectToAnotherIdentityIsAvailableAtOnce(t *testing.T) {
+	clock := newFakeClock()
+	dialer := newPipeDialer()
+	cfg := testConfig(clock, scscfHost)
+	cfg.Dial = dialer.Dial
+	n := newTestNode(t, cfg)
+	peer, err := n.Connect(PeerConfig{Address: "hss.rcs.test:3868"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := dialer.next(t)
+	first.host = "hss-a.rcs.test"
+	acceptCER(t, first)
+	waitFor(t, "the first connection to open", peer.Available)
+	_ = first.nc.Close() // a transport failure
+	clock.waitForTimer(t, n.backoff(0))
+	clock.Advance(n.backoff(0))
+
+	s := dialer.next(t)
+	s.host = "hss-b.rcs.test"
+	acceptCER(t, s)
+	waitFor(t, "the new connection to open", peer.Available)
+	s.sync()
+	if peer.Host() != "hss-b.rcs.test" {
+		t.Fatalf("peer host %q", peer.Host())
+	}
+}

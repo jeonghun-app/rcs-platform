@@ -238,7 +238,7 @@ func (n *Node) accepts(caps capabilities, src netip.Addr) bool {
 // initiate dials a configured peer and runs the initiator side of the
 // capabilities exchange. On success the connection is open and served in the
 // background.
-func (n *Node) initiate(p *Peer, reopen bool) (*conn, error) {
+func (n *Node) initiate(p *Peer, failedHost string) (*conn, error) {
 	dctx, cancel := context.WithCancel(n.ctx)
 	t := n.cfg.Clock.AfterFunc(n.cfg.CapabilitiesTimeout, cancel)
 	nc, err := n.cfg.Dial(dctx, "tcp", p.cfg.Address)
@@ -256,9 +256,10 @@ func (n *Node) initiate(p *Peer, reopen bool) (*conn, error) {
 		c.close(err)
 		return nil, err
 	}
-	if reopen {
-		// After a failure the connection must earn its way back with three
-		// watchdog exchanges before it carries traffic (RFC 3539 §3.4.1).
+	if failedHost != "" && strings.EqualFold(failedHost, c.caps.host) {
+		// Back to the node that just failed: the connection must earn its
+		// way back with three watchdog exchanges before it carries traffic
+		// (RFC 3539 §3.4.1).
 		c.mu.Lock()
 		c.state, c.dwrPending = watchdogReopen, true
 		c.mu.Unlock()

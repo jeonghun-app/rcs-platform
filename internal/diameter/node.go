@@ -443,8 +443,9 @@ type PeerConfig struct {
 // Connect starts maintaining a connection to the peer: dial, capabilities
 // exchange, and reconnection with exponential backoff whenever the
 // connection fails. The returned peer is unavailable until the first
-// exchange succeeds, and after a reconnection until the RFC 3539 §3.4.1
-// REOPEN state has seen three watchdog answers.
+// exchange succeeds. After a connection fails (watchdog expiry or transport
+// error, not a DPR), a reconnection to the same Origin-Host is unavailable
+// until the RFC 3539 §3.4.1 REOPEN state has seen three watchdog answers.
 func (n *Node) Connect(pc PeerConfig) (*Peer, error) {
 	if pc.Address == "" {
 		return nil, errors.New("diameter: peer address is required")
@@ -464,11 +465,20 @@ func (n *Node) Connect(pc PeerConfig) (*Peer, error) {
 }
 
 // maintain is the initiator loop of one peer.
+//
+// failedHost is the Origin-Host of the last connection if it ended in a
+// failure (watchdog expiry or a transport error) rather than a DPR exchange.
+// Only a reconnection to that same node starts in REOPEN: RFC 3539 §3.4.1
+// uses REOPEN to stop traffic flapping back to a node that has just failed.
+// A node that left cleanly (an hss task replaced in a rolling update, ADR
+// 0003) or a different node behind the same address has not failed, and
+// with a single connection per peer there is no alternate to carry the
+// traffic meanwhile, so those reconnections are usable at once.
 func (n *Node) maintain(p *Peer) {
 	attempt := 0
-	reopen := false
+	failedHost := ""
 	for {
-		c, err := n.initiate(p, reopen)
+		c, err := n.initiate(p, failedHost)
 		var delay time.Duration
 		if err != nil {
 			n.log.Warn("diameter peer connection failed", "address", p.cfg.Address, "error", err)
@@ -476,18 +486,22 @@ func (n *Node) maintain(p *Peer) {
 			attempt++
 		} else {
 			attempt = 0
-			reopen = true
 			select {
 			case <-c.done:
 			case <-n.ctx.Done():
 				return
 			}
 			delay = n.backoff(0)
-			if cause, ok := c.remoteDisconnectCause(); ok && cause != DisconnectRebooting {
-				// A peer that is busy or does not want this connection is
-				// left alone for the longest interval before the next try
-				// (RFC 6733 §5.4.3).
-				delay = n.cfg.ReconnectMax
+			cause, clean := c.remoteDisconnectCause()
+			failedHost = c.caps.host
+			if clean {
+				failedHost = ""
+				if cause != DisconnectRebooting {
+					// A peer that is busy or does not want this connection
+					// is left alone for the longest interval before the
+					// next try (RFC 6733 §5.4.3).
+					delay = n.cfg.ReconnectMax
+				}
 			}
 		}
 		if !n.sleep(delay) {
