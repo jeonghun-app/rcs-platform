@@ -41,7 +41,8 @@ func (ps Params) Get(name string) (string, bool) {
 func (ps Params) Has(name string) bool { return ps.index(name) >= 0 }
 
 // Set gives the named parameter a value, replacing it in place if present and
-// appending it otherwise. The value is quoted when it is not a valid token or
+// appending it otherwise. The name must be a token; a parameter with any other
+// name is written as invalidValue, so Header.Add refuses the value carrying it. The value is quoted when it is not a valid token or
 // host, when it replaces a quoted value, and when the name is a feature tag:
 // the RFC 3840 feature-param grammar always quotes their values.
 func (ps *Params) Set(name, value string) {
@@ -90,6 +91,9 @@ func (ps Params) appendHeaderParams(b []byte) []byte {
 }
 
 func (p Param) appendTo(b []byte, bare uint16) []byte {
+	if !isAll(p.Name, classToken) {
+		return append(b, invalidValue...)
+	}
 	b = append(b, p.Name...)
 	if !p.hasValue() {
 		return b

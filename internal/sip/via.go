@@ -196,8 +196,12 @@ func (v Via) TTL() (int, bool) {
 	return n, true
 }
 
-// String writes the Via element in canonical form.
+// String writes the Via element in canonical form, or invalidValue if Transport
+// is not a token, Host not a valid host or Port not a port.
 func (v Via) String() string {
+	if !isAll(v.Transport, classToken) || !validHost(v.Host) || v.Port < 0 || v.Port > 65535 {
+		return invalidValue
+	}
 	b := make([]byte, 0, 64)
 	b = append(b, "SIP/2.0/"...)
 	b = append(b, v.Transport...)

@@ -60,12 +60,18 @@ func authQuoted(quoted map[string]bool, name, value string) bool {
 }
 
 func authString(scheme string, ps Params) string {
+	if !isAll(scheme, classToken) {
+		return invalidValue
+	}
 	b := append(make([]byte, 0, 128), scheme...)
 	for i, p := range ps {
 		if i == 0 {
 			b = append(b, ' ')
 		} else {
 			b = append(b, ", "...)
+		}
+		if !isAll(p.Name, classToken) {
+			return invalidValue
 		}
 		b = append(b, p.Name...)
 		b = append(b, '=')

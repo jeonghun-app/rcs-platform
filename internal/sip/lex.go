@@ -46,6 +46,15 @@ var charClasses = func() (t [256]uint16) {
 
 const upperHex = "0123456789ABCDEF"
 
+// invalidValue is what the String methods of the value types write for a part
+// that has no valid form, such as a host with a space, a tel number with a
+// letter or a parameter name that is not a token. It is a NUL byte, which
+// Header.Add, Set and Prepend refuse and Request.Bytes refuses on the start line.
+// A value built wrongly in code therefore fails where it is added, and cannot
+// reach the wire as something else: a host of "p.example.com>,<sip:x" would
+// otherwise add a hop to a Route.
+const invalidValue = "\x00"
+
 func in(c byte, cls uint16) bool { return charClasses[c]&cls != 0 }
 
 // isAll reports whether s is non-empty and made only of characters in cls.

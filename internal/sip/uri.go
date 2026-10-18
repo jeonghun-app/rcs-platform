@@ -335,15 +335,52 @@ func uriParamKey(name string) string { return lowerASCII(normalizeEscapes(name))
 func (u URI) IsSIP() bool { return u.Scheme == "sip" || u.Scheme == "sips" }
 
 // String returns the URI as text. Characters that a component cannot carry are
-// escaped, so a URI built in code always produces a URI that parses; Host is
-// written as is and must be valid. A zero URI is "".
+// escaped. A URI with a part that has no escaped form (an invalid scheme, host,
+// port or tel number, an empty parameter name, too many parameters) is written as
+// invalidValue, which Header.Add refuses; a zero URI is one of those.
 func (u URI) String() string {
 	return string(u.appendTo(nil))
 }
 
+// writable reports whether every part of u has a valid written form. Repeated
+// parameter names are left to the caller.
+func (u URI) writable() bool {
+	if u.Scheme == "" || !validScheme(u.Scheme) || u.Scheme != lowerASCII(u.Scheme) ||
+		len(u.Params) > maxParams || len(u.Headers) > maxParams {
+		return false
+	}
+	for _, p := range u.Params {
+		if p.Name == "" {
+			return false
+		}
+	}
+	switch u.Scheme {
+	case "sip", "sips":
+		for _, h := range u.Headers {
+			if h.Name == "" {
+				return false
+			}
+		}
+		return (u.User != "" || u.Password == "") && validHost(u.Host) && u.Port >= 0 && u.Port <= 65535
+	case "tel":
+		global := strings.HasPrefix(u.User, "+")
+		if global && !isGlobalNumberDigits(u.User) || !global && !isLocalNumberDigits(u.User) {
+			return false
+		}
+		for _, p := range u.Params {
+			if !isAll(p.Name, classTelPName) {
+				return false
+			}
+		}
+		return global || u.Params.Has("phone-context")
+	default:
+		return u.Opaque != ""
+	}
+}
+
 func (u URI) appendTo(b []byte) []byte {
-	if u.Scheme == "" {
-		return b
+	if !u.writable() {
+		return append(b, invalidValue...)
 	}
 	b = append(b, u.Scheme...)
 	b = append(b, ':')
@@ -374,7 +411,7 @@ func (u URI) appendTo(b []byte) []byte {
 			b = appendEscaped(b, h.Value, classURIHeader)
 		}
 	case "tel":
-		b = appendEscaped(b, u.User, classTelNumber)
+		b = append(b, u.User...)
 		b = appendURIParams(b, u.Params)
 	default:
 		b = appendEscaped(b, u.Opaque, classURIC)

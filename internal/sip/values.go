@@ -28,8 +28,11 @@ func parseCSeq(s string) (CSeq, error) {
 	return CSeq{Seq: n, Method: method}, nil
 }
 
-// String writes the CSeq value.
+// String writes the CSeq value, or invalidValue if it has none.
 func (c CSeq) String() string {
+	if c.Seq >= 1<<31 || !isAll(c.Method, classToken) {
+		return invalidValue
+	}
 	return strconv.FormatUint(uint64(c.Seq), 10) + " " + c.Method
 }
 
@@ -70,8 +73,12 @@ func (m MediaType) Is(typ, subtype string) bool {
 	return strings.EqualFold(m.Type, typ) && strings.EqualFold(m.Subtype, subtype)
 }
 
-// String writes the media type with its parameters.
+// String writes the media type with its parameters, or invalidValue if the type
+// or subtype is not a token.
 func (m MediaType) String() string {
+	if !isAll(m.Type, classToken) || !isAll(m.Subtype, classToken) {
+		return invalidValue
+	}
 	b := make([]byte, 0, len(m.Type)+len(m.Subtype)+16)
 	b = append(b, m.Type...)
 	b = append(b, '/')
@@ -345,6 +352,9 @@ func deltaParam(ps Params, name string) (uint32, bool) {
 }
 
 func tokenParamsString(token string, ps Params) string {
+	if !isAll(token, classToken) {
+		return invalidValue
+	}
 	return string(ps.appendHeaderParams(append(make([]byte, 0, len(token)+16), token...)))
 }
 

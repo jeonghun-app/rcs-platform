@@ -142,8 +142,59 @@ func TestURIStringEscapesWhatAComponentCannotCarry(t *testing.T) {
 	if _, err := ParseURI(want); err != nil {
 		t.Fatalf("escaped URI does not parse: %v", err)
 	}
-	if got := (URI{}).String(); got != "" {
+	if got := (URI{}).String(); got != invalidValue {
 		t.Errorf("zero URI String() = %q", got)
+	}
+}
+
+// Parts that have no escaped form make String write invalidValue, which
+// Header.Add refuses, so a value built wrongly in code fails where it is added.
+func TestValuesBuiltWithInvalidPartsAreRefusedWhenAdded(t *testing.T) {
+	host := func(h string) URI { return URI{Scheme: "sip", Host: h} }
+	tests := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{"host that adds a route", "Record-Route", Address{URI: host("p.example.com>,<sip:x.example.net;lr")}.String()},
+		{"host with a space", "To", Address{URI: host("exa mple.com")}.String()},
+		{"empty host", "To", Address{URI: host("")}.String()},
+		{"negative port", "To", Address{URI: URI{Scheme: "sip", Host: "example.com", Port: -1}}.String()},
+		{"port above 65535", "To", Address{URI: URI{Scheme: "sip", Host: "example.com", Port: 70000}}.String()},
+		{"upper-case scheme", "To", Address{URI: URI{Scheme: "SIP", Host: "example.com"}}.String()},
+		{"invalid scheme", "To", Address{URI: URI{Scheme: "s p", Host: "example.com"}}.String()},
+		{"zero URI", "To", Address{}.String()},
+		{"password without user", "To", Address{URI: URI{Scheme: "sip", Password: "x", Host: "example.com"}}.String()},
+		{"empty URI parameter name", "To", Address{URI: URI{Scheme: "sip", Host: "example.com", Params: Params{{}}}}.String()},
+		{"tel number with spaces", "P-Asserted-Identity", Address{URI: URI{Scheme: "tel", User: "+1 555 0100"}}.String()},
+		{"local tel without context", "P-Asserted-Identity", Address{URI: URI{Scheme: "tel", User: "7042"}}.String()},
+		{"tel parameter name", "P-Asserted-Identity", Address{URI: URI{Scheme: "tel", User: "+15550100001", Params: Params{{Name: "a_b"}}}}.String()},
+		{"empty opaque", "To", Address{URI: URI{Scheme: "urn"}}.String()},
+		{"header parameter name", "To", Address{URI: host("example.com"), Params: Params{{Name: "x;tag=evil"}}}.String()},
+		{"header parameter flag with a space", "To", func() string {
+			a := Address{URI: host("example.com")}
+			a.Params.SetFlag("a b")
+			return a.String()
+		}()},
+		{"Via transport", "Via", Via{Transport: "UDP x", Host: "example.com"}.String()},
+		{"Via host", "Via", Via{Transport: "UDP", Host: "a,SIP/2.0/UDP b"}.String()},
+		{"Via port", "Via", Via{Transport: "UDP", Host: "example.com", Port: 65536}.String()},
+		{"media type", "Content-Type", MediaType{Type: "text", Subtype: "plain;x=1"}.String()},
+		{"CSeq method", "CSeq", CSeq{Seq: 1, Method: "IN VITE"}.String()},
+		{"CSeq number", "CSeq", CSeq{Seq: 1 << 31, Method: "INVITE"}.String()},
+		{"event type", "Event", Event{Type: "reg,presence"}.String()},
+		{"auth scheme", "Authorization", Credentials{Scheme: "Digest x"}.String()},
+		{"auth-param name", "Authorization", Credentials{Scheme: "Digest", Params: Params{{Name: "a,b", Value: "1"}}}.String()},
+	}
+	for _, tt := range tests {
+		var h Header
+		if err := h.Add(tt.header, tt.value); !errors.Is(err, ErrMalformed) {
+			t.Errorf("%s: Add(%q) = %v, want ErrMalformed", tt.name, tt.value, err)
+		}
+	}
+	req := &Request{Method: "OPTIONS", URI: host("bad host")}
+	if _, err := req.Bytes(); err == nil {
+		t.Error("Request-URI with an invalid host serialized")
 	}
 }
 
