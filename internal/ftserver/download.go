@@ -61,8 +61,16 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
-	// One link must not take every download slot of the task: with
-	// FT_DOWNLOAD_AUTH off, anyone holding it can open connections.
+	// Neither one link nor all the links of one uploader may take every
+	// download slot of the task: with FT_DOWNLOAD_AUTH off, anyone holding
+	// a link can open connections.
+	releaseUploader, ok := s.perUploader.acquire(rec.Owner)
+	if !ok {
+		s.metrics.Count("download.failed.uploader_busy", 1)
+		serviceUnavailable(w, retryAfter)
+		return
+	}
+	defer releaseUploader()
 	releaseFile, ok := s.perFile.acquire(rec.ID)
 	if !ok {
 		s.metrics.Count("download.failed.file_busy", 1)

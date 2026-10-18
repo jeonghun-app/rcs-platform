@@ -120,7 +120,11 @@ byte 0, and the resume URL:
     Operations notes). A task that crashes leaves it to lapse within the lease
     time.
 - The update that completes an upload depends on the version the writer holds,
-  so two tasks cannot both complete the same `tid`. Content is safe even if a
+  so two tasks cannot both complete the same `tid`. A transient failure of that
+  update is retried. If a retry conflicts with the writer's own earlier
+  update, one that was applied but whose answer was lost, the record is read
+  back. When it names this attempt's object key and hash, the upload is reported
+  as complete (`upload.commit_recovered`) rather than failed. Content is safe even if a
   lease is broken, for example by a writer stalled past it or by clocks far
   apart:
   - each upload attempt writes its multipart upload under its own key;
@@ -135,11 +139,15 @@ byte 0, and the resume URL:
 
 - Every answer except a live, complete file is `404`: an unknown or malformed
   id, an upload in progress, a file past its validity, or an expired record.
-- A task serves at most `FT_MAX_CONCURRENT_DOWNLOADS` at once, and at most
-  `FT_MAX_DOWNLOADS_PER_FILE` of one file. Beyond either limit it answers `503`
-  with `Retry-After`. The per-file limit matters because with
-  `FT_DOWNLOAD_AUTH` off, anyone holding a link can open connections; a
-  recipient resuming a download needs one or two.
+- A task serves at most `FT_MAX_CONCURRENT_DOWNLOADS` downloads at once. Within
+  that, it serves at most `FT_MAX_DOWNLOADS_PER_UPLOADER` across all the files of
+  one uploader, and at most `FT_MAX_DOWNLOADS_PER_FILE` of one file. Beyond any
+  of these limits it answers `503` with `Retry-After`.
+  - The per-file limit is sized for a group chat, where every member fetches the
+    same link within seconds of the message (64 with the defaults).
+  - The per-uploader limit keeps one subscriber's links from taking every slot
+    of the task. With `FT_DOWNLOAD_AUTH` off, anyone holding a link can open
+    connections.
 - A download read more slowly than `FT_MIN_DOWNLOAD_RATE`, measured over each
   minute, is cut off. Otherwise a reader that reads just enough to beat the
   write deadline could hold a slot for hours. The client sees a broken download,
@@ -271,8 +279,9 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_MAX_UPLOADS_PER_USER` | `4` | Uploads and resumes in progress per user and task |
 | `FT_MIN_UPLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower upload is cut off with `408`. `0` turns the check off |
 | `FT_MAX_CONCURRENT_DOWNLOADS` | `256` | Downloads in progress per task |
-| `FT_MAX_DOWNLOADS_PER_FILE` | `4` | Downloads of one file in progress per task |
-| `FT_MIN_DOWNLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off |
+| `FT_MAX_DOWNLOADS_PER_FILE` | `64` | Downloads of one file in progress per task, enough for a group chat fetching one link at once |
+| `FT_MAX_DOWNLOADS_PER_UPLOADER` | `128` | Downloads in progress per task across all the files of one uploader |
+| `FT_MIN_DOWNLOAD_RATE` | `16384` (16 KiB/s) | Bytes per second, measured over each minute. A slower download is cut off, so that the many readers a group chat allows cannot sit on a file. `0` turns the check off |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
 | `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
@@ -383,10 +392,10 @@ identifier ever appears in a metric name:
 | Metric | Counts |
 |---|---|
 | `upload.precheck`, `upload.started`, `upload.restarted`, `upload.resumed`, `upload.completed` | Upload steps |
-| `upload.bytes`, `upload.parts`, `upload.lease_renewed`, `upload.commit_retried` | Bytes completed, parts stored, lease renewals, retries of the update that completes an upload |
+| `upload.bytes`, `upload.parts`, `upload.lease_renewed`, `upload.commit_retried`, `upload.commit_recovered` | Bytes completed, parts stored, lease renewals, retries of the update that completes an upload, and completions recognised after that update's answer was lost |
 | `upload.failed.<reason>` | Failures, by reason (see below) |
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
-| `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.missing_object` | Failed downloads |
+| `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.uploader_busy`, `download.failed.missing_object` | Failed downloads |
 | `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
@@ -417,7 +426,9 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 | `auth.bad_credential_record` > 0 | A subscriber's FT credential record in the HSS is unusable. That user cannot upload |
 | `upload.failed.storage`, `download.failed.storage` > 0 | S3 or DynamoDB fails |
 | `download.failed.missing_object` > 0 | A valid file's object is gone. The lifecycle rule is shorter than the validity |
-| `upload.failed.busy`, `download.failed.busy` sustained | The tasks are full. Uploads are I/O bound, so scale on this, not on CPU |
+| `upload.failed.busy` sustained | The tasks' upload slots are full. Uploads are I/O bound, so scale on this, not on CPU |
+| `download.failed.busy` sustained | The tasks' download slots are full. Scale out, or raise `FT_MAX_CONCURRENT_DOWNLOADS` if memory allows |
+| `download.failed.file_busy`, `download.failed.uploader_busy` sustained | One link or one uploader's links hit their limit. Group chats larger than the per-file limit per task, or one subscriber's links being hammered. Check the WAF rule before raising the limits |
 | `sweep.failed` > 0, or no `sweep.duration` for two intervals | The sweeper is failing or stuck. Until the expiry index exists (follow-up), a table too large to scan within `FT_STORAGE_TIMEOUT` makes every sweep fail. Raise the timeout or build the index before alarming on this |
 
 ## Operations notes

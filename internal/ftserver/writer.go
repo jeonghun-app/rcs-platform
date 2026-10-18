@@ -1,6 +1,7 @@
 package ftserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding"
@@ -264,6 +265,13 @@ const commitAttempts = 4
 // throttled table, a timed-out call) is therefore retried, with backoff. The
 // update is conditional on the version this writer holds, so a retry can
 // only ever write it once: a conflict ends the retries at once.
+//
+// A conflict may be this writer's own earlier write: an update that was
+// applied but whose answer was lost, here or in the SDK's own retries. The
+// record is read back, and if it is complete with this attempt's object key
+// and hash, the upload did complete and is reported as such (#50). Object
+// keys are unique per attempt and the hash covers the content, so another
+// writer's commit cannot pass for this one.
 func (w *writer) commit(ctx context.Context, r store.Record) (store.Record, error) {
 	var err error
 	for attempt := range commitAttempts {
@@ -276,12 +284,28 @@ func (w *writer) commit(ctx context.Context, r store.Record) (store.Record, erro
 		}
 		var rec store.Record
 		rec, err = w.s.o.Metadata.Update(ctx, r)
+		if errors.Is(err, store.ErrConflict) {
+			if mine, ok := w.committed(ctx, r); ok {
+				w.s.metrics.Count("upload.commit_recovered", 1)
+				return mine, nil
+			}
+		}
 		if err == nil || errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
 			return rec, err
 		}
 		w.s.metrics.Count("upload.commit_retried", 1)
 	}
 	return store.Record{}, err
+}
+
+// committed reads the record back after a conflicting completion and
+// reports whether it holds this completion, r.
+func (w *writer) committed(ctx context.Context, r store.Record) (store.Record, bool) {
+	stored, err := w.s.o.Metadata.Get(ctx, r.ID)
+	if err != nil || stored.State != store.Complete || stored.Object != r.Object || !bytes.Equal(stored.SHA256, r.SHA256) {
+		return store.Record{}, false
+	}
+	return stored, true
 }
 
 // release gives up the lease after a request that did not complete, keeping

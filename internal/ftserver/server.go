@@ -79,8 +79,10 @@ type Options struct {
 	// task, so requests from the internet cannot load the HSS without limit.
 	MaxConcurrentLookups int
 	// MaxDownloadsPerFile bounds downloads of one file in progress on this
-	// task: a recipient resuming a download needs one or two connections.
-	MaxDownloadsPerFile int
+	// task, sized for a group chat whose members all fetch one link at once,
+	// and MaxDownloadsPerUploader those of all the files of one uploader, so
+	// that one subscriber's links cannot take every slot of the task.
+	MaxDownloadsPerFile, MaxDownloadsPerUploader int
 	// MinUploadRate is the slowest an upload body may arrive and
 	// MinDownloadRate the slowest a download may be read, in bytes per
 	// second over each minute; 0 disables the check.
@@ -117,6 +119,7 @@ type Server struct {
 	lookups      chan struct{}
 	perUser      *userSlots
 	perFile      *userSlots
+	perUploader  *userSlots
 	// retryWait is the pause before retry attempt n of a completing update.
 	retryWait func(attempt int) time.Duration
 	writers   activity
@@ -144,7 +147,7 @@ func New(o Options) (*Server, error) {
 	case o.Validity <= 0 || o.UploadTimeout <= 0 || o.StorageTimeout <= 0 || o.IdleTimeout < 0:
 		return nil, errors.New("ftserver: validity and timeouts must be positive")
 	case o.MaxConcurrentUploads <= 0 || o.MaxUploadsPerUser <= 0 || o.MaxConcurrentDownloads <= 0 ||
-		o.MaxDownloadsPerFile <= 0 || o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 ||
+		o.MaxDownloadsPerFile <= 0 || o.MaxDownloadsPerUploader <= 0 || o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 ||
 		o.MinUploadRate < 0 || o.MinDownloadRate < 0:
 		return nil, errors.New("ftserver: concurrency limits must be positive")
 	}
@@ -175,6 +178,7 @@ func New(o Options) (*Server, error) {
 		lookups:      make(chan struct{}, o.MaxConcurrentLookups),
 		perUser:      &userSlots{max: o.MaxUploadsPerUser, n: map[string]int{}},
 		perFile:      &userSlots{max: o.MaxDownloadsPerFile, n: map[string]int{}},
+		perUploader:  &userSlots{max: o.MaxDownloadsPerUploader, n: map[string]int{}},
 		leaseTTL:     2 * (o.IdleTimeout + o.StorageTimeout),
 		retryWait:    func(n int) time.Duration { return time.Duration(50<<n) * time.Millisecond },
 	}
@@ -398,7 +402,7 @@ func (s *Server) acquireUpload(owner string) (release func(), reason string) {
 }
 
 // userSlots counts transfers in progress per key: uploads per owner,
-// downloads per file id.
+// downloads per file id and per uploader.
 type userSlots struct {
 	max int
 	mu  sync.Mutex

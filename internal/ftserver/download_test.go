@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -326,4 +327,62 @@ func TestUnreachableTableIsAnInternalError(t *testing.T) {
 			t.Errorf("%s: status = %d, want 500", name, rec.Code)
 		}
 	}
+}
+
+func TestDownloadDefaultsLetAGroupChatFetchOneLinkAtOnce(t *testing.T) {
+	c, err := configure(devEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every member of a group chat fetches the same link within seconds of
+	// the message; 64 per task keeps them out of 503-and-retry. The rate
+	// floor rises with it, so 64 slow readers cannot sit on the file.
+	if c.MaxDownloadsPerFile != 64 || c.MinDownloadRate != 16<<10 || c.MaxDownloadsPerUploader != DefaultMaxDownloadsPerUploader {
+		t.Fatalf("per file %d, min rate %d, per uploader %d", c.MaxDownloadsPerFile, c.MinDownloadRate, c.MaxDownloadsPerUploader)
+	}
+	if DefaultMaxDownloadsPerUploader < DefaultMaxDownloadsPerFile || DefaultMaxDownloadsPerUploader > DefaultMaxDownloads {
+		t.Fatalf("the per-uploader default %d must lie between the per-file and per-task ones", DefaultMaxDownloadsPerUploader)
+	}
+	if _, err := configure(with(devEnv, "FT_MAX_DOWNLOADS_PER_UPLOADER", "0")); err == nil {
+		t.Fatal("FT_MAX_DOWNLOADS_PER_UPLOADER=0 was accepted")
+	}
+}
+
+func TestOneUploaderCannotHoldEveryDownloadSlot(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.MaxDownloadsPerUploader = 2 })
+	a := e.user(alice)
+	var files []string
+	for _, tid := range []string{"a1", "a2", "a3"} {
+		files = append(files, downloadTarget(t, fileOf(t, a.uploadFile(tid, "alice's "+tid)).Data.URL))
+	}
+	bobs := downloadTarget(t, fileOf(t, e.user(bob).uploadFile("b1", "bob's")).Data.URL)
+	held := heldBlobs{Blobs: e.blobs, opened: make(chan struct{}, 4), release: make(chan struct{})}
+	e.srv.o.Blobs = held
+	var wg sync.WaitGroup
+	// Two different files of one uploader, each well under its per-file cap.
+	for _, f := range files[:2] {
+		wg.Go(func() { get(e, f) })
+		<-held.opened
+	}
+	third := make(chan *httptest.ResponseRecorder, 1)
+	go func() { third <- get(e, files[2]) }()
+	select {
+	case rec := <-third:
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || e.metric("download.failed.uploader_busy") != 1 {
+			t.Fatalf("a third file of the same uploader = %d", rec.Code)
+		}
+	case <-held.opened:
+		close(held.release)
+		wg.Wait()
+		<-third
+		t.Fatal("a third file of the same uploader was served past the per-uploader cap")
+	}
+	done := make(chan int, 1)
+	go func() { done <- get(e, bobs).Code }()
+	<-held.opened
+	close(held.release)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("another uploader's file = %d", code)
+	}
+	wg.Wait()
 }

@@ -25,15 +25,19 @@ const (
 	DefaultMaxDownloads         = 256
 	DefaultMaxLookups           = 16
 	DefaultMinUploadRate        = 1024 // bytes per second
-	DefaultMinDownloadRate      = 1024 // bytes per second
-	DefaultMaxDownloadsPerFile  = 4
-	DefaultDrainTimeout         = 10 * time.Second
-	DefaultIdleTimeout          = 30 * time.Second
-	DefaultUploadTimeout        = 30 * time.Minute
-	DefaultStorageTimeout       = time.Minute
-	DefaultSweepInterval        = time.Hour
-	DefaultHSSTimeout           = 2 * time.Second
-	DefaultTable                = "files"
+	// A group chat delivers one link to every member at once: 64 downloads
+	// of a file per task keep them from 503-and-retry, and a 16 KiB/s floor
+	// keeps 64 slow readers from sitting on the file (#50).
+	DefaultMinDownloadRate         = 16 << 10 // bytes per second
+	DefaultMaxDownloadsPerFile     = 64
+	DefaultMaxDownloadsPerUploader = 128
+	DefaultDrainTimeout            = 10 * time.Second
+	DefaultIdleTimeout             = 30 * time.Second
+	DefaultUploadTimeout           = 30 * time.Minute
+	DefaultStorageTimeout          = time.Minute
+	DefaultSweepInterval           = time.Hour
+	DefaultHSSTimeout              = 2 * time.Second
+	DefaultTable                   = "files"
 )
 
 // The FT_STORE and FT_CREDENTIALS values.
@@ -64,24 +68,25 @@ type Config struct {
 	Store string
 	AWS   AWSConfig
 
-	MaxSize              int64
-	MaxThumbnailSize     int64
-	PartSize             int64
-	Validity             time.Duration
-	DownloadAuth         bool
-	UploadsPerMinute     int
-	MaxConcurrentUploads int
-	MaxUploadsPerUser    int
-	MaxDownloads         int
-	MaxLookups           int
-	MinUploadRate        int64
-	MinDownloadRate      int64
-	MaxDownloadsPerFile  int
-	IdleTimeout          time.Duration
-	UploadTimeout        time.Duration
-	StorageTimeout       time.Duration
-	SweepInterval        time.Duration
-	DrainTimeout         time.Duration
+	MaxSize                 int64
+	MaxThumbnailSize        int64
+	PartSize                int64
+	Validity                time.Duration
+	DownloadAuth            bool
+	UploadsPerMinute        int
+	MaxConcurrentUploads    int
+	MaxUploadsPerUser       int
+	MaxDownloads            int
+	MaxLookups              int
+	MinUploadRate           int64
+	MinDownloadRate         int64
+	MaxDownloadsPerFile     int
+	MaxDownloadsPerUploader int
+	IdleTimeout             time.Duration
+	UploadTimeout           time.Duration
+	StorageTimeout          time.Duration
+	SweepInterval           time.Duration
+	DrainTimeout            time.Duration
 }
 
 // AWSConfig is the S3 and DynamoDB part of Config, used with FT_STORE=aws.
@@ -104,31 +109,32 @@ type AWSConfig struct {
 func Configure(s *runtime.Settings) Config {
 	e := s.Env
 	c := Config{
-		ListenAddr:           e.String("LISTEN_ADDR", DefaultListenAddr),
-		Realm:                e.RequiredString("REALM"),
-		NonceKey:             secret{e.String("NONCE_KEY", "")},
-		Credentials:          e.String("CREDENTIALS", CredentialsHSS),
-		HSSToken:             secret{e.String("HSS_TOKEN", "")},
-		HSSTimeout:           e.Duration("HSS_TIMEOUT", DefaultHSSTimeout),
-		Store:                e.String("STORE", StoreAWS),
-		MaxSize:              int64(e.Int("MAX_SIZE", DefaultMaxSize)),
-		MaxThumbnailSize:     int64(e.Int("MAX_THUMBNAIL_SIZE", DefaultMaxThumbnailSize)),
-		PartSize:             int64(e.Int("PART_SIZE", DefaultPartSize)),
-		Validity:             e.Duration("VALIDITY", DefaultValidity),
-		DownloadAuth:         e.Bool("DOWNLOAD_AUTH", false),
-		UploadsPerMinute:     e.Int("UPLOADS_PER_MINUTE", DefaultUploadsPerMinute),
-		MaxConcurrentUploads: e.Int("MAX_CONCURRENT_UPLOADS", DefaultMaxConcurrentUploads),
-		MaxUploadsPerUser:    e.Int("MAX_UPLOADS_PER_USER", DefaultMaxUploadsPerUser),
-		MaxDownloads:         e.Int("MAX_CONCURRENT_DOWNLOADS", DefaultMaxDownloads),
-		MaxLookups:           e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
-		MinUploadRate:        int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
-		MinDownloadRate:      int64(e.Int("MIN_DOWNLOAD_RATE", DefaultMinDownloadRate)),
-		MaxDownloadsPerFile:  e.Int("MAX_DOWNLOADS_PER_FILE", DefaultMaxDownloadsPerFile),
-		IdleTimeout:          e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
-		UploadTimeout:        e.Duration("UPLOAD_TIMEOUT", DefaultUploadTimeout),
-		StorageTimeout:       e.Duration("STORAGE_TIMEOUT", DefaultStorageTimeout),
-		SweepInterval:        e.Duration("SWEEP_INTERVAL", DefaultSweepInterval),
-		DrainTimeout:         e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
+		ListenAddr:              e.String("LISTEN_ADDR", DefaultListenAddr),
+		Realm:                   e.RequiredString("REALM"),
+		NonceKey:                secret{e.String("NONCE_KEY", "")},
+		Credentials:             e.String("CREDENTIALS", CredentialsHSS),
+		HSSToken:                secret{e.String("HSS_TOKEN", "")},
+		HSSTimeout:              e.Duration("HSS_TIMEOUT", DefaultHSSTimeout),
+		Store:                   e.String("STORE", StoreAWS),
+		MaxSize:                 int64(e.Int("MAX_SIZE", DefaultMaxSize)),
+		MaxThumbnailSize:        int64(e.Int("MAX_THUMBNAIL_SIZE", DefaultMaxThumbnailSize)),
+		PartSize:                int64(e.Int("PART_SIZE", DefaultPartSize)),
+		Validity:                e.Duration("VALIDITY", DefaultValidity),
+		DownloadAuth:            e.Bool("DOWNLOAD_AUTH", false),
+		UploadsPerMinute:        e.Int("UPLOADS_PER_MINUTE", DefaultUploadsPerMinute),
+		MaxConcurrentUploads:    e.Int("MAX_CONCURRENT_UPLOADS", DefaultMaxConcurrentUploads),
+		MaxUploadsPerUser:       e.Int("MAX_UPLOADS_PER_USER", DefaultMaxUploadsPerUser),
+		MaxDownloads:            e.Int("MAX_CONCURRENT_DOWNLOADS", DefaultMaxDownloads),
+		MaxLookups:              e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
+		MinUploadRate:           int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
+		MinDownloadRate:         int64(e.Int("MIN_DOWNLOAD_RATE", DefaultMinDownloadRate)),
+		MaxDownloadsPerFile:     e.Int("MAX_DOWNLOADS_PER_FILE", DefaultMaxDownloadsPerFile),
+		MaxDownloadsPerUploader: e.Int("MAX_DOWNLOADS_PER_UPLOADER", DefaultMaxDownloadsPerUploader),
+		IdleTimeout:             e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
+		UploadTimeout:           e.Duration("UPLOAD_TIMEOUT", DefaultUploadTimeout),
+		StorageTimeout:          e.Duration("STORAGE_TIMEOUT", DefaultStorageTimeout),
+		SweepInterval:           e.Duration("SWEEP_INTERVAL", DefaultSweepInterval),
+		DrainTimeout:            e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
 		AWS: AWSConfig{
 			Bucket:           e.String("S3_BUCKET", ""),
 			Prefix:           e.String("S3_PREFIX", ""),
@@ -253,7 +259,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"MAX_CONCURRENT_UPLOADS", c.MaxConcurrentUploads}, {"MAX_UPLOADS_PER_USER", c.MaxUploadsPerUser},
 		{"MAX_CONCURRENT_DOWNLOADS", c.MaxDownloads}, {"MAX_CONCURRENT_LOOKUPS", c.MaxLookups},
-		{"MAX_DOWNLOADS_PER_FILE", c.MaxDownloadsPerFile},
+		{"MAX_DOWNLOADS_PER_FILE", c.MaxDownloadsPerFile}, {"MAX_DOWNLOADS_PER_UPLOADER", c.MaxDownloadsPerUploader},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")
