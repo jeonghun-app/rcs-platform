@@ -103,9 +103,14 @@ func (m Message) MarshalJSON() ([]byte, error) {
 
 // Format implements fmt.Formatter with the same content as LogValue, so
 // printing a Message with any verb never shows its body or session-ids.
-func (m Message) Format(f fmt.State, _ rune) {
+func (m Message) Format(f fmt.State, _ rune) { formatGroup(f, m.LogValue()) }
+
+// The connection-layer types hold URIs in unexported fields, which fmt
+// prints without calling URI.Format, so they summarise themselves too.
+
+func formatGroup(f fmt.State, v slog.Value) {
 	var b strings.Builder
-	for i, a := range m.LogValue().Group() {
+	for i, a := range v.Group() {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
@@ -115,3 +120,55 @@ func (m Message) Format(f fmt.State, _ rune) {
 	}
 	_, _ = f.Write([]byte(b.String()))
 }
+
+// LogValue implements slog.LogValuer with redacted URIs and the state.
+func (s *Session) LogValue() slog.Value {
+	s.mu.Lock()
+	bound, closed := s.conn != nil, s.closed
+	s.mu.Unlock()
+	return slog.GroupValue(
+		slog.String("local", s.local.Redacted()),
+		slog.String("remote", redactedPath(s.remote)),
+		slog.Bool("bound", bound),
+		slog.Bool("closed", closed),
+	)
+}
+
+// Format implements fmt.Formatter with the content of LogValue.
+func (s *Session) Format(f fmt.State, _ rune) { formatGroup(f, s.LogValue()) }
+
+// LogValue implements slog.LogValuer: the role, the number of sessions and
+// whether the connection has ended.
+func (c *Conn) LogValue() slog.Value {
+	c.mu.Lock()
+	n, closed := len(c.sessions), c.closed
+	c.mu.Unlock()
+	role := "active"
+	if c.passive {
+		role = "passive"
+	}
+	return slog.GroupValue(slog.String("role", role), slog.Int("sessions", n), slog.Bool("closed", closed))
+}
+
+// Format implements fmt.Formatter with the content of LogValue.
+func (c *Conn) Format(f fmt.State, _ rune) { formatGroup(f, c.LogValue()) }
+
+// LogValue implements slog.LogValuer with the number of sessions held.
+func (r *Registry) LogValue() slog.Value {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slog.GroupValue(slog.Int("sessions", len(r.sessions)))
+}
+
+// Format implements fmt.Formatter with the content of LogValue.
+func (r *Registry) Format(f fmt.State, _ rune) { formatGroup(f, r.LogValue()) }
+
+// LogValue implements slog.LogValuer with the number of connections held.
+func (p *Pool) LogValue() slog.Value {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slog.GroupValue(slog.Int("connections", len(p.conns)))
+}
+
+// Format implements fmt.Formatter with the content of LogValue.
+func (p *Pool) Format(f fmt.State, _ rune) { formatGroup(f, p.LogValue()) }

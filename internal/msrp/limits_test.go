@@ -207,17 +207,45 @@ func TestIncompleteMessagesExpireWhenTheirChunksStop(t *testing.T) {
 	if _, err := r.Add(chunkMsg("new", ByteRange{1, 1, 2}, "a", FlagMore), later); err != nil {
 		t.Fatal(err)
 	}
-	if oldest, ok := r.Oldest(); !ok || !oldest.Equal(t0) {
-		t.Fatalf("Oldest = %v, %v", oldest, ok)
+	if due, ok := r.NextExpiry(time.Minute, time.Hour); !ok || !due.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("NextExpiry = %v, %v", due, ok)
 	}
-	if n := r.Expire(t0); n != 1 || r.Pending() != 1 {
+	never := t0.Add(-time.Hour)
+	if n := r.Expire(t0, never); n != 1 || r.Pending() != 1 {
 		t.Fatalf("expired %d, %d left", n, r.Pending())
 	}
-	if n := r.Expire(later); n != 1 || r.Buffered() != 0 {
+	if n := r.Expire(later, never); n != 1 || r.Buffered() != 0 {
 		t.Fatalf("expired %d, %d octets left", n, r.Buffered())
 	}
-	if _, ok := r.Oldest(); ok {
-		t.Fatal("Oldest with nothing held")
+	if _, ok := r.NextExpiry(time.Minute, time.Hour); ok {
+		t.Fatal("NextExpiry with nothing held")
+	}
+}
+
+func TestAnIncompleteMessageExpiresAFixedTimeAfterItsFirstChunk(t *testing.T) {
+	// Chunks keep coming every 10 s, so the idle rule never fires; the
+	// lifetime, counted from the first chunk, does.
+	clock := newFakeClock()
+	const lifetime = 30 * time.Second
+	s, p := boundPassive(t, newRecorder(), Config{Clock: clock, MaxReassemblyLifetime: lifetime, ReassemblyTimeout: time.Hour})
+	for i := range 3 {
+		clock.watchTimers()
+		start := i*10 + 1
+		tid := fmt.Sprintf("tr1ckle%d", i)
+		p.send(t, sendLines(tid, "Message-ID: tr1ckle", fmt.Sprintf("Byte-Range: %d-%d/1000", start, start+9),
+			"Content-Type: text/plain", "", "0123456789", "-------"+tid+"+")...)
+		expectResponse(t, p, tid, StatusOK)
+		if i == 0 {
+			clock.waitTimer(t, lifetime)
+		}
+		if s.reasm.Pending() != 1 {
+			t.Fatalf("chunk %d: message not held", i)
+		}
+		clock.Advance(10 * time.Second)
+	}
+	// 30 s after the first chunk, with the last one 10 s old.
+	if s.reasm.Pending() != 0 || s.budget.Used() != 0 {
+		t.Fatalf("after the lifetime: %d pending, %d octets", s.reasm.Pending(), s.budget.Used())
 	}
 }
 
@@ -233,12 +261,12 @@ func TestASessionDropsAnIncompleteMessageAfterTheReassemblyTimeout(t *testing.T)
 	p.send(t, sendLines("h4lf1", "Message-ID: half", "Byte-Range: 1-3/6", "Content-Type: text/plain", "", "abc", "-------h4lf1+")...)
 	expectResponse(t, p, "h4lf1", StatusOK)
 	clock.waitTimer(t, timeout)
-	if s.reasm.Pending() != 1 || c.budget.Used() == 0 {
-		t.Fatalf("%d pending, %d octets charged", s.reasm.Pending(), c.budget.Used())
+	if s.reasm.Pending() != 1 || s.budget.Used() == 0 {
+		t.Fatalf("%d pending, %d octets charged", s.reasm.Pending(), s.budget.Used())
 	}
 	clock.Advance(timeout)
-	if s.reasm.Pending() != 0 || c.budget.Used() != 0 {
-		t.Fatalf("after the timeout: %d pending, %d octets charged", s.reasm.Pending(), c.budget.Used())
+	if s.reasm.Pending() != 0 || s.budget.Used() != 0 || c.budget.Used() != 0 {
+		t.Fatalf("after the timeout: %d pending, %d and %d octets charged", s.reasm.Pending(), s.budget.Used(), c.budget.Used())
 	}
 	// The rest of the message now starts a new, incomplete one.
 	p.send(t, sendLines("h4lf2", "Message-ID: half", "Byte-Range: 4-6/6", "Content-Type: text/plain", "", "def", "-------h4lf2$")...)
@@ -246,31 +274,75 @@ func TestASessionDropsAnIncompleteMessageAfterTheReassemblyTimeout(t *testing.T)
 	if s.reasm.Pending() != 1 {
 		t.Fatal("the expired start of the message was kept")
 	}
-	// Closing the session gives its octets back to the connection.
+	// Closing the session gives its octets back.
 	_ = s.Close()
-	if c.budget.Used() != 0 {
-		t.Fatalf("%d octets still charged after Close", c.budget.Used())
+	if s.budget.Used() != 0 || c.budget.Used() != 0 {
+		t.Fatalf("%d and %d octets still charged after Close", s.budget.Used(), c.budget.Used())
 	}
 }
 
-func TestSessionsOnAConnectionShareItsBuffer(t *testing.T) {
+// fillSession has session n of a passive connection hold incomplete
+// messages until it is refused, and returns how many octets it got in.
+func fillSession(t *testing.T, p *wirePeer, n int, part string) int {
+	t.Helper()
+	held := 0
+	for i := 0; ; i++ {
+		tid := fmt.Sprintf("f%02d%04d", n, i)
+		p.send(t, "MSRP "+tid+" SEND", fmt.Sprintf("To-Path: msrp://as.example.org:9000/fill%02d;tcp", n),
+			fmt.Sprintf("From-Path: msrp://client.example.com:2855/fill%02d;tcp", n), fmt.Sprintf("Message-ID: m%02d%04d", n, i),
+			fmt.Sprintf("Byte-Range: 1-%d/%d", len(part), 2*len(part)), "Content-Type: text/plain", "", part, "-------"+tid+"+")
+		if r := p.next(t); r.StatusCode != StatusOK {
+			return held
+		}
+		held += len(part)
+	}
+}
+
+func fillRegistry(t *testing.T, sessions int) *Registry {
+	t.Helper()
 	reg := &Registry{}
-	one := newTestSession(t, asURI, clientURI, newRecorder())
-	two := newTestSession(t, "msrp://as.example.org:9000/as9two;tcp", "msrp://client.example.com:2855/cl1two;tcp", newRecorder())
-	for _, s := range []*Session{one, two} {
+	for n := range sessions {
+		s := newTestSession(t, fmt.Sprintf("msrp://as.example.org:9000/fill%02d;tcp", n),
+			fmt.Sprintf("msrp://client.example.com:2855/fill%02d;tcp", n), newRecorder())
 		if err := reg.Add(s); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A chunk being read is charged too, so the first 4000 octets briefly
-	// need about twice that; the second session's then do not fit.
-	_, p := passiveWithPeer(t, reg, Config{Clock: newFakeClock(), MaxMessageSize: 8192, MaxSessionBuffer: 8192, MaxConnBuffer: 10000})
-	part := strings.Repeat("q", 4000)
-	p.send(t, sendLines("sh4re1", "Message-ID: msg1", "Byte-Range: 1-4000/8000", "Content-Type: text/plain", "", part, "-------sh4re1+")...)
-	expectResponse(t, p, "sh4re1", StatusOK)
-	p.send(t, "MSRP sh4re2 SEND", "To-Path: msrp://as.example.org:9000/as9two;tcp", "From-Path: msrp://client.example.com:2855/cl1two;tcp",
-		"Message-ID: msg2", "Byte-Range: 1-4000/8000", "Content-Type: text/plain", "", part, "-------sh4re2+")
-	expectResponse(t, p, "sh4re2", StatusMessageTooLarge)
+	return reg
+}
+
+func TestSessionsFillingTheSharedBufferLeaveAnotherSessionItsReserve(t *testing.T) {
+	cfg := Config{Clock: newFakeClock(), MaxMessageSize: 4096, MaxPendingMessages: 64,
+		MaxSessionBuffer: 64 << 10, MaxConnBuffer: 32 << 10}
+	_, p := passiveWithPeer(t, fillRegistry(t, 4), cfg)
+	part := strings.Repeat("q", 2000)
+	for n := range 3 {
+		fillSession(t, p, n, part)
+	}
+	// The shared part is full, yet a whole message of the largest size on
+	// the fourth session still fits within its own reserve.
+	whole := strings.Repeat("w", 4096)
+	p.send(t, "MSRP sh4re0k SEND", "To-Path: msrp://as.example.org:9000/fill03;tcp", "From-Path: msrp://client.example.com:2855/fill03;tcp",
+		"Message-ID: whole1", "Byte-Range: 1-4096/4096", "Content-Type: text/plain", "", whole, "-------sh4re0k$")
+	expectResponse(t, p, "sh4re0k", StatusOK)
+}
+
+func TestWhatSessionsHoldBeyondTheirReserveIsBoundedTogether(t *testing.T) {
+	cfg := Config{Clock: newFakeClock(), MaxMessageSize: 4096, MaxPendingMessages: 64,
+		MaxSessionBuffer: 64 << 10, MaxConnBuffer: 32 << 10}
+	c, p := passiveWithPeer(t, fillRegistry(t, 3), cfg)
+	part := strings.Repeat("q", 2000)
+	total := 0
+	for n := range 3 {
+		total += fillSession(t, p, n, part)
+	}
+	reserve := 2 * 4096 // the default SessionReserve for this MaxMessageSize
+	if limit := 3*reserve + 32<<10; total > limit {
+		t.Fatalf("sessions held %d octets, bound %d", total, limit)
+	}
+	if used := c.budget.Used(); used > 32<<10 {
+		t.Fatalf("shared part %d octets", used)
+	}
 }
 
 func TestAStalledPeerIsDisconnectedWithinTheWriteDeadline(t *testing.T) {
@@ -350,28 +422,56 @@ func TestAFloodAskingForReportsCannotQueueThemWithoutBound(t *testing.T) {
 	}
 }
 
+// unwindowed sends a request that holds a connection slot, as a relay's
+// forwarding does.
+func unwindowed(t *testing.T, c *Conn, mode sendMode, id string) error {
+	return c.sendRequest(context.Background(), &Message{Method: MethodSend, ToPath: []URI{mustURI(t, asURI)},
+		FromPath: []URI{mustURI(t, clientURI)}, MessageID: id}, mode, func(int, string) {})
+}
+
 func TestRequestsAwaitingAnswersAreBounded(t *testing.T) {
-	clock := newFakeClock()
-	c, p := activeWithPeer(t, Config{Clock: clock, MaxInFlight: 2})
+	c, p := activeWithPeer(t, Config{Clock: newFakeClock(), MaxInFlight: 2})
 	s := newTestSession(t, clientURI, asURI, newRecorder())
 	openWithPeer(t, c, p, s)
-	for range 2 {
-		if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("x")}); err != nil {
+	for _, id := range []string{"msg1", "msg2"} {
+		if err := unwindowed(t, c, sendWait, id); err != nil {
 			t.Fatal(err)
 		}
 		p.next(t)
 	}
 	// A request that must not wait is refused, and its connection with it.
-	if err := c.sendRequest(context.Background(), &Message{Method: MethodSend, ToPath: []URI{mustURI(t, asURI)}, FromPath: []URI{mustURI(t, clientURI)},
-		MessageID: "msg9"}, sendQueue, func(int, string) {}); !errors.Is(err, ErrPeerNotReading) {
+	if err := unwindowed(t, c, sendQueue, "msg3"); !errors.Is(err, ErrPeerNotReading) {
 		t.Fatalf("queued request = %v", err)
 	}
 	waitDone(t, c.Done(), "connection")
 }
 
-func TestASenderWaitsForAFreeSlot(t *testing.T) {
+func TestARequestWaitsForAFreeSlot(t *testing.T) {
 	clock := newFakeClock()
 	c, p := activeWithPeer(t, Config{Clock: clock, MaxInFlight: 2})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	for _, id := range []string{"msg1", "msg2"} {
+		if err := unwindowed(t, c, sendWait, id); err != nil {
+			t.Fatal(err)
+		}
+		p.next(t)
+	}
+	sent := make(chan error, 1)
+	go func() { sent <- unwindowed(t, c, sendWait, "msg3") }()
+	// The unanswered two expire, which frees their slots.
+	clock.Advance(DefaultTransactionTimeout)
+	if m := p.next(t); m.MessageID != "msg3" {
+		t.Fatalf("got %+v", m)
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestASenderWaitsForRoomInItsSessionsWindow(t *testing.T) {
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, SendWindow: 2})
 	s := newTestSession(t, clientURI, asURI, newRecorder())
 	openWithPeer(t, c, p, s)
 	for range 2 {
@@ -385,19 +485,12 @@ func TestASenderWaitsForAFreeSlot(t *testing.T) {
 		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("third")})
 		sent <- err
 	}()
-	// The unanswered two expire, which frees their slots.
 	clock.Advance(DefaultTransactionTimeout)
 	if m := p.next(t); string(m.Body) != "third" {
 		t.Fatalf("got %+v", m)
 	}
 	if err := <-sent; err != nil {
 		t.Fatal(err)
-	}
-	c.mu.Lock()
-	n := len(c.pending)
-	c.mu.Unlock()
-	if n > 2 {
-		t.Fatalf("%d requests awaited", n)
 	}
 }
 
@@ -567,5 +660,79 @@ func TestMessagesPrintWithoutBodiesOrSessionIDs(t *testing.T) {
 	}
 	if !strings.Contains(fmt.Sprint(m), "body_octets=15") || !strings.Contains(logged.String(), `"status":200`) {
 		t.Fatalf("summary missing: %s / %s", fmt.Sprint(m), logged.String())
+	}
+}
+
+// bindOnlyPeer answers the SENDs that bind sessions and swallows the rest
+// unanswered, like a relay whose clients have all stopped reading.
+func bindOnlyPeer(t *testing.T, nc net.Conn) *atomic.Int64 {
+	t.Helper()
+	var chunks atomic.Int64
+	go func() {
+		r := NewReader(nc, 0)
+		for {
+			m, err := r.ReadMessage(DefaultMaxMessageSize)
+			if err != nil {
+				return
+			}
+			if m.Method == MethodSend && !m.HasBody() {
+				resp, _ := NewResponse(m, StatusOK, "OK")
+				b, _ := resp.Marshal()
+				if _, err := nc.Write(b); err != nil {
+					return
+				}
+				continue
+			}
+			chunks.Add(1)
+		}
+	}()
+	t.Cleanup(func() { _ = nc.Close() })
+	return &chunks
+}
+
+func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
+	// One more stalled session than the connection has slots for at the
+	// default window, so the windows alone would use up every slot.
+	stalled := DefaultMaxInFlight/DefaultSendWindow + 1
+	ours, theirs := net.Pipe()
+	c, err := NewActiveConn(ours, Config{Clock: newFakeClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	chunks := bindOnlyPeer(t, theirs)
+	open := func(i int) *Session {
+		s := newTestSession(t, fmt.Sprintf("msrp://relay.internal:2855/st%05d;tcp", i), fmt.Sprintf("msrp://as.example.org:9000/st%05d;tcp", i), newRecorder())
+		if err := c.Open(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	body := bodyOf((DefaultSendWindow + 1) * DefaultChunkSize)
+	for i := range stalled {
+		s := open(i)
+		go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: body}) }()
+	}
+	want := int64(stalled * DefaultSendWindow)
+	deadline := time.Now().Add(10 * time.Second)
+	for chunks.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if chunks.Load() < want {
+		t.Fatalf("only %d of %d chunks went out", chunks.Load(), want)
+	}
+	other := open(stalled)
+	done := make(chan error, 1)
+	go func() {
+		_, err := other.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("not stuck")})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session with an empty window waited for the stalled ones")
 	}
 }

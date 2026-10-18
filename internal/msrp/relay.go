@@ -9,6 +9,25 @@ import (
 
 var bridgeMu sync.Mutex
 
+// maxHeldBytes bounds what a relay holds for a client side that is not
+// bound yet. It is above one SendWindow of chunks, so a sender that
+// windows never reaches it; one that does not is refused (413) for that
+// session alone.
+const maxHeldBytes = 256 << 10
+
+// errHeldFull refuses a forward toward an unbound client side whose
+// holding queue is full.
+var errHeldFull = errors.New("msrp: too much held for an unbound session")
+
+// held is a forward waiting for its client side to be bound: send runs
+// it on the connection once there is one, drop answers for it if there
+// never is.
+type held struct {
+	send   func(out *Conn) error
+	drop   func(code int)
+	octets int64
+}
+
 // maxRejected bounds how many refused Message-IDs a bridged session
 // remembers. Forgetting one only costs a second refusal from the next hop
 // if the sender keeps going after a 413.
@@ -58,6 +77,15 @@ const maxRejected = 64
 //     passes Config.MaxRelayBacklog anyway (a sender that does not window,
 //     for example with Failure-Report no) is cut off then
 //     (ErrPeerNotReading).
+//
+// The relay service opens core from edge's Bind, that is, it connects to
+// rcs-as when the client connects (ADR 0004), so normally neither side
+// has to wait for the other. Should rcs-as send on core before the client
+// has bound edge, what it sends is held, up to a small bound per session,
+// and forwarded once edge is bound; beyond the bound it is refused with
+// 413 and after TransactionTimeout without a client it is answered 408.
+// Either way only that session is affected: the shared connection is never
+// made to wait for a client to arrive.
 func Bridge(edge, core *Session) error {
 	if edge == core {
 		return errors.New("msrp: cannot bridge a session to itself")
@@ -90,9 +118,11 @@ func (s *Session) towards() sendMode {
 	return sendWait
 }
 
-// forwardConn waits for the outgoing session to be bound. Within a
-// bridge the other side is normally bound a moment later, but a request
-// must not wait on it for longer than a transaction may take.
+// forwardConn waits for the core session s to be bound. It is used only
+// toward core, on the reading goroutine of the client's own connection, so
+// only that client waits; and since the relay opens core from the client's
+// Bind (ADR 0004), core is normally bound already. The wait is capped at a
+// transaction's time all the same.
 func (s *Session) forwardConn(c *Conn) (*Conn, int) {
 	select {
 	case <-s.bound:
@@ -116,6 +146,73 @@ func (s *Session) forwardConn(c *Conn) (*Conn, int) {
 		return nil, StatusNoSession
 	}
 	return s.conn, 0
+}
+
+// dispatch runs send for the edge session s on its connection, or holds
+// it while s is not bound; in, the connection the request came on, gives
+// the clock and the timeout. Held forwards keep their order: until the
+// flush on binding is through, new ones queue behind them.
+func (s *Session) dispatch(in *Conn, octets int64, send func(out *Conn) error, drop func(code int)) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrSessionClosed
+	}
+	if out := s.conn; out != nil && !s.flushing {
+		s.mu.Unlock()
+		return send(out)
+	}
+	if s.heldOctets+octets > maxHeldBytes {
+		s.mu.Unlock()
+		return errHeldFull
+	}
+	first := len(s.held) == 0 && s.conn == nil
+	s.held = append(s.held, held{send: send, drop: drop, octets: octets})
+	s.heldOctets += octets
+	s.mu.Unlock()
+	if first {
+		in.cfg.Clock.AfterFunc(in.cfg.TransactionTimeout, func() { s.dropHeld(StatusRequestTimeout, true) })
+	}
+	return nil
+}
+
+// flushHeld sends what was held for s once it is bound to out.
+func (s *Session) flushHeld(out *Conn) {
+	for {
+		s.mu.Lock()
+		batch := s.held
+		s.held, s.heldOctets = nil, 0
+		if len(batch) == 0 {
+			s.flushing = false
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		for i, h := range batch {
+			if err := h.send(out); err != nil {
+				for _, rest := range batch[i:] {
+					rest.drop(StatusNoSession)
+				}
+				break
+			}
+		}
+	}
+}
+
+// dropHeld answers for everything held with code; onlyUnbound keeps a
+// timer that fires after binding from dropping anything.
+func (s *Session) dropHeld(code int, onlyUnbound bool) {
+	s.mu.Lock()
+	if onlyUnbound && s.conn != nil {
+		s.mu.Unlock()
+		return
+	}
+	batch := s.held
+	s.held, s.heldOctets = nil, 0
+	s.mu.Unlock()
+	for _, h := range batch {
+		h.drop(code)
+	}
 }
 
 func (s *Session) isRejected(id string) bool {
@@ -146,9 +243,16 @@ func (s *Session) reject(id string) {
 // relaySend streams the body of the SEND m, which arrived on c for s, to
 // the peer session in pieces.
 func (s *Session) relaySend(c *Conn, peer *Session, m *Message) error {
-	out, code := peer.forwardConn(c)
-	if code != 0 {
-		return c.respond(m, code)
+	// Toward the client nothing waits (see Bridge); toward rcs-as the
+	// client's own connection may wait for core to be bound.
+	var out *Conn
+	size := c.cfg.ChunkSize
+	if !peer.edge {
+		var code int
+		if out, code = peer.forwardConn(c); code != 0 {
+			return c.respond(m, code)
+		}
+		size = out.cfg.ChunkSize
 	}
 	id := m.MessageID
 	br := m.Range()
@@ -159,7 +263,6 @@ func (s *Session) relaySend(c *Conn, peer *Session, m *Message) error {
 	}
 
 	body := c.r.Body()
-	size := out.cfg.ChunkSize
 	// The two piece buffers are kept with the session; only the goroutine
 	// reading c uses them.
 	if len(s.pieces[0]) != size {
@@ -212,6 +315,10 @@ func (s *Session) relaySend(c *Conn, peer *Session, m *Message) error {
 			}
 		}
 		if err := peer.forwardPiece(out, c, s, m, pos, cur[:n], flag, answer); err != nil {
+			if errors.Is(err, errHeldFull) {
+				s.reject(id)
+				return c.respond(m, StatusMessageTooLarge)
+			}
 			return c.respond(m, StatusNoSession)
 		}
 		pos += int64(n)
@@ -240,38 +347,52 @@ func readPiece(body io.Reader, buf []byte) (int, bool, error) {
 }
 
 // forwardPiece sends bytes of the SEND m, starting at message position
-// pos, on out for p. Failures on that hop go back on in to the sender of
-// m, which arrived for from.
+// pos, for p: on out toward core, or through dispatch toward the edge, in
+// which case out is nil. Failures on that hop go back on in to the sender
+// of m, which arrived for from.
 func (p *Session) forwardPiece(out, in *Conn, from *Session, m *Message, pos int64, data []byte, flag byte, written func(error)) error {
 	if data == nil {
 		data = []byte{}
 	}
 	r := ByteRange{Start: pos, End: pos + int64(len(data)) - 1, Total: m.Range().Total}
-	fwd := &Message{
-		Method:        MethodSend,
-		ToPath:        p.remote,
-		FromPath:      []URI{p.local},
-		MessageID:     m.MessageID,
-		ByteRange:     &r,
-		SuccessReport: m.SuccessReport,
-		FailureReport: m.FailureReport,
-		ContentType:   m.ContentType,
-		Header:        m.Header,
-		Body:          data,
-		Continuation:  flag,
+	send := func(out *Conn, data []byte) error {
+		fwd := &Message{
+			Method:        MethodSend,
+			ToPath:        p.remote,
+			FromPath:      []URI{p.local},
+			MessageID:     m.MessageID,
+			ByteRange:     &r,
+			SuccessReport: m.SuccessReport,
+			FailureReport: m.FailureReport,
+			ContentType:   m.ContentType,
+			Header:        m.Header,
+			Body:          data,
+			Continuation:  flag,
+		}
+		p.touch(out)
+		mode := p.towards()
+		mode.written = written
+		return out.sendRequest(context.Background(), fwd, mode, func(code int, _ string) {
+			if code == StatusOK {
+				return
+			}
+			if code == StatusMessageTooLarge {
+				from.reject(m.MessageID)
+			}
+			if ShouldReport(m, code) {
+				_ = in.sendRequest(context.Background(), NewReport(m, from.local, r, code), from.towards(), nil)
+			}
+		})
 	}
-	p.touch(out)
-	mode := p.towards()
-	mode.written = written
-	return out.sendRequest(context.Background(), fwd, mode, func(code int, _ string) {
-		if code == StatusOK {
-			return
-		}
-		if code == StatusMessageTooLarge {
-			from.reject(m.MessageID)
-		}
-		if ShouldReport(m, code) {
-			_ = in.sendRequest(context.Background(), NewReport(m, from.local, r, code), from.towards(), nil)
+	if out != nil {
+		return send(out, data)
+	}
+	// The piece buffer is reused once this returns, so a held piece keeps
+	// a copy.
+	kept := append([]byte(nil), data...)
+	return p.dispatch(in, int64(len(kept)), func(out *Conn) error { return send(out, kept) }, func(code int) {
+		if written != nil {
+			_ = in.respond(m, code)
 		}
 	})
 }
@@ -282,30 +403,42 @@ func (s *Session) relayBuffered(c *Conn, peer *Session, m *Message) error {
 	if m.Method == MethodSend {
 		return c.respond(m, StatusOK)
 	}
-	out, code := peer.forwardConn(c)
-	if code != 0 {
-		return c.respond(m, code)
+	send := func(out *Conn) error {
+		fwd := *m
+		fwd.ToPath = peer.remote
+		fwd.FromPath = []URI{peer.local}
+		peer.touch(out)
+		if m.Method == MethodReport {
+			// Nothing can be answered if this fails; the failing
+			// connection takes the bridge down with it.
+			_ = out.sendRequest(context.Background(), &fwd, peer.towards(), nil)
+			return nil
+		}
+		return out.sendRequest(context.Background(), &fwd, peer.towards(), func(code int, comment string) {
+			if !ShouldRespond(m, code) {
+				return
+			}
+			if resp, err := NewResponse(m, code, comment); err == nil {
+				_ = c.sendMessage(context.Background(), resp, s.towards())
+			}
+		})
 	}
-	fwd := *m
-	fwd.ToPath = peer.remote
-	fwd.FromPath = []URI{peer.local}
-	peer.touch(out)
-	if m.Method == MethodReport {
-		// Nothing can be answered if this fails; the failing connection
-		// takes the bridge down with it.
-		_ = out.sendRequest(context.Background(), &fwd, peer.towards(), nil)
+	var err error
+	if peer.edge {
+		// The body was read into a buffer of its own, so m can be held.
+		err = peer.dispatch(c, int64(len(m.Body)), send, func(code int) { _ = c.respond(m, code) })
+	} else {
+		out, code := peer.forwardConn(c)
+		if code != 0 {
+			return c.respond(m, code)
+		}
+		err = send(out)
+	}
+	switch {
+	case err == nil:
 		return nil
+	case errors.Is(err, errHeldFull):
+		return c.respond(m, StatusMessageTooLarge)
 	}
-	err := out.sendRequest(context.Background(), &fwd, peer.towards(), func(code int, comment string) {
-		if !ShouldRespond(m, code) {
-			return
-		}
-		if resp, err := NewResponse(m, code, comment); err == nil {
-			_ = c.sendMessage(context.Background(), resp, s.towards())
-		}
-	})
-	if err != nil {
-		return c.respond(m, StatusNoSession)
-	}
-	return nil
+	return c.respond(m, StatusNoSession)
 }

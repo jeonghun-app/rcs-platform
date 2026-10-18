@@ -1,9 +1,13 @@
 package msrp
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -292,5 +296,126 @@ func TestContextEndsAnOpenThatCannotBeWritten(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Open ignored its context for %v", elapsed)
+	}
+}
+
+func TestConnectionLayerValuesPrintWithoutSessionIDs(t *testing.T) {
+	reg := &Registry{}
+	s := newTestSession(t, asURI, clientURI, newRecorder())
+	if err := reg.Add(s); err != nil {
+		t.Fatal(err)
+	}
+	c, p := passiveWithPeer(t, reg, Config{Clock: newFakeClock()})
+	sentinel(t, p)
+	pool := &Pool{}
+	var out bytes.Buffer
+	for _, v := range []any{s, c, reg, pool} {
+		fmt.Fprintf(&out, "%v %+v %#v %s\n", v, v, v, v)
+		slog.New(slog.NewTextHandler(&out, nil)).Info("x", "v", v)
+		slog.New(slog.NewJSONHandler(&out, nil)).Info("x", "v", v, "in", []any{v})
+	}
+	for _, secret := range []string{"as9ses", "cl1ses"} {
+		if strings.Contains(out.String(), secret) {
+			t.Fatalf("%q printed:\n%s", secret, out.String())
+		}
+	}
+	for _, want := range []string{"bound=true", "role=passive", "sessions=1", "connections=0"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("%q missing:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestEventsCarryOnlyFixedValuesWhateverThePeerSends(t *testing.T) {
+	var mu sync.Mutex
+	var events []Event
+	reg := &Registry{}
+	if err := reg.Add(newTestSession(t, asURI, clientURI, newRecorder())); err != nil {
+		t.Fatal(err)
+	}
+	_, p := passiveWithPeer(t, reg, Config{Clock: newFakeClock(), OnEvent: func(e Event) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}})
+	sentinel(t, p)
+	for _, method := range []string{"FROBNICATE", "XYZZY", "QQQQQQQQQQQQQQQQQQQQQQQQ"} {
+		tid := strings.ToLower(method)[:4] + "1"
+		p.send(t, "MSRP "+tid+" "+method, "To-Path: "+asURI, "From-Path: "+clientURI, "-------"+tid+"$")
+		expectResponse(t, p, tid, StatusNotImplemented)
+	}
+	p.send(t, "MSRP str4y 200 OK", "From-Path: 10.0.0.1 \"quoted\"", "-------str4y$")
+	sentinel(t, p)
+	_ = p.nc.Close()
+	closed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(events) > 0 && events[len(events)-1].Kind == EventClosed
+	}
+	for deadline := time.Now().Add(5 * time.Second); !closed(); {
+		if time.Now().After(deadline) {
+			t.Fatal("no EventClosed")
+		}
+		runtime.Gosched()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if last := events[len(events)-1]; last.Err != ErrPeerGone {
+		t.Errorf("closed with %v, want ErrPeerGone for a peer that hung up", last.Err)
+	}
+	allowed := map[string]bool{"": true, MethodSend: true, MethodReport: true, MethodNickname: true, "other": true}
+	sentinels := append([]error{nil, ErrPeerGone}, eventErrs...)
+	for _, e := range events {
+		if !allowed[e.Method] {
+			t.Errorf("method %q in %+v", e.Method, e)
+		}
+		known := false
+		for _, s := range sentinels {
+			if e.Err == s {
+				known = true
+			}
+		}
+		if !known {
+			t.Errorf("error %v is not a sentinel", e.Err)
+		}
+	}
+}
+
+func TestAnUnboundConnectionIsClosedAfterAFewUnknownSessions(t *testing.T) {
+	c, p := passiveWithPeer(t, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 2})
+	for _, tid := range []string{"unkn1", "unkn2"} {
+		p.send(t, "MSRP "+tid+" SEND", "To-Path: msrp://as.example.org:9000/guess"+tid+";tcp", "From-Path: "+clientURI, "Message-ID: "+tid, "-------"+tid+"$")
+		expectResponse(t, p, tid, StatusNoSession)
+	}
+	p.send(t, "MSRP unkn3 SEND", "To-Path: msrp://as.example.org:9000/guess3;tcp", "From-Path: "+clientURI, "Message-ID: unkn3", "-------unkn3$")
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), ErrTooManyUnknownSessions) {
+		t.Fatalf("Err = %v", c.Err())
+	}
+}
+
+func TestAnUnboundConnectionQueuesLittleForAPeerThatDoesNotRead(t *testing.T) {
+	ours, theirs := net.Pipe()
+	c, err := NewPassiveConn(ours, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(); _ = theirs.Close() })
+	req := []byte(wire("MSRP m4l SEND", "To-Path: "+asURI, "From-Path: "+clientURI, "Byte-Range: bad", "-------m4l$"))
+	go func() {
+		for {
+			if _, err := theirs.Write(req); err != nil {
+				return
+			}
+		}
+	}()
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), ErrPeerNotReading) {
+		t.Fatalf("Err = %v", c.Err())
+	}
+	c.qmu.Lock()
+	defer c.qmu.Unlock()
+	if c.posted > unboundQueueBytes {
+		t.Fatalf("%d octets were queued", c.posted)
 	}
 }

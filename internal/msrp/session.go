@@ -98,9 +98,10 @@ type Session struct {
 	handler Handler
 	accept  []string
 
-	// reasm is set when the session is bound and draws on the
-	// connection's Budget.
-	reasm *Reassembler
+	// reasm and budget are set when the session is bound; budget has the
+	// connection's as its Parent.
+	reasm  *Reassembler
+	budget *Budget
 
 	mu         sync.Mutex
 	conn       *Conn
@@ -122,8 +123,13 @@ type Session struct {
 	backlog  atomic.Int64
 	rejected []string
 	// pieces are the relay's buffers for streaming SEND bodies.
-	pieces  [2][]byte
-	onClose []func()
+	pieces [2][]byte
+	// held are forwards waiting for this edge session to be bound; while
+	// flushing they are being sent and new ones queue behind them.
+	held       []held
+	heldOctets int64
+	flushing   bool
+	onClose    []func()
 }
 
 // NewSession creates an unbound session.
@@ -197,6 +203,7 @@ func (s *Session) closeWith(err error) {
 	for _, h := range hooks {
 		h()
 	}
+	s.dropHeld(StatusNoSession, false)
 	if peer != nil {
 		peer.closeWith(fmt.Errorf("msrp: bridged session ended: %w", err))
 	}
@@ -229,13 +236,16 @@ func (s *Session) attach(c *Conn) error {
 	}
 	s.conn = c
 	s.lastActive = c.cfg.Clock.Now()
+	s.budget = &Budget{Reserve: c.cfg.SessionReserve, Parent: c.budget}
 	s.reasm = &Reassembler{
 		MaxSize:     c.cfg.MaxMessageSize,
 		MaxPending:  c.cfg.MaxPendingMessages,
 		MaxBuffered: c.cfg.MaxSessionBuffer,
-		Budget:      c.budget,
+		Budget:      s.budget,
 	}
 	s.window = make(chan struct{}, c.cfg.SendWindow)
+	flush := len(s.held) > 0
+	s.flushing = flush
 	if s.handler != nil {
 		s.events = make(chan event, c.cfg.MaxHandlerQueue)
 		go s.work(c)
@@ -248,6 +258,9 @@ func (s *Session) attach(c *Conn) error {
 		return err
 	}
 	s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	if flush {
+		s.flushHeld(c)
+	}
 	return nil
 }
 
@@ -346,7 +359,7 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 				once.Do(func() { <-s.window })
 			}
 		}
-		err := c.sendRequest(ctx, s.chunk(id, out, sr, r, ch.Data, ch.Flag), sendWait, func(code int, comment string) {
+		err := c.sendRequest(ctx, s.chunk(id, out, sr, r, ch.Data, ch.Flag), sendMode{windowed: windowed}, func(code int, comment string) {
 			free()
 			if code == StatusOK {
 				return
@@ -466,7 +479,7 @@ func (s *Session) keepAliveDue(c *Conn) {
 // armExpiry makes sure a timer will drop incomplete messages that stop
 // getting chunks (Config.ReassemblyTimeout).
 func (s *Session) armExpiry(c *Conn) {
-	oldest, ok := s.reasm.Oldest()
+	due, ok := s.reasm.NextExpiry(c.cfg.ReassemblyTimeout, c.cfg.MaxReassemblyLifetime)
 	if !ok {
 		return
 	}
@@ -475,9 +488,9 @@ func (s *Session) armExpiry(c *Conn) {
 	if s.closed || s.expiry != nil {
 		return
 	}
-	wait := oldest.Add(c.cfg.ReassemblyTimeout).Sub(c.cfg.Clock.Now())
-	s.expiry = c.cfg.Clock.AfterFunc(wait, func() {
-		for range s.reasm.Expire(c.cfg.Clock.Now().Add(-c.cfg.ReassemblyTimeout)) {
+	s.expiry = c.cfg.Clock.AfterFunc(due.Sub(c.cfg.Clock.Now()), func() {
+		now := c.cfg.Clock.Now()
+		for range s.reasm.Expire(now.Add(-c.cfg.ReassemblyTimeout), now.Add(-c.cfg.MaxReassemblyLifetime)) {
 			c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrReassemblyTimeout})
 		}
 		s.mu.Lock()
@@ -513,17 +526,17 @@ func (s *Session) work(c *Conn) {
 				case <-e.ready:
 				case <-s.done:
 					// Closed meanwhile: nothing more reaches the handler.
-					c.budget.release(e.octets)
+					s.budget.release(e.octets)
 					continue
 				}
 			}
 			e.run()
-			c.budget.release(e.octets)
+			s.budget.release(e.octets)
 		case <-s.done:
 			for {
 				select {
 				case e := <-s.events:
-					c.budget.release(e.octets)
+					s.budget.release(e.octets)
 				default:
 					return
 				}
@@ -556,7 +569,7 @@ func (s *Session) serve(c *Conn, m *Message) error {
 		return s.relaySend(c, peer, m)
 	}
 
-	limit, budget := c.cfg.MaxMessageSize, c.budget
+	limit, budget := c.cfg.MaxMessageSize, s.budget
 	if m.Method != MethodSend {
 		limit, budget = maxNonSendBody, nil
 	}
@@ -628,15 +641,15 @@ func (s *Session) receiveSend(c *Conn, m *Message) error {
 	if whole == nil {
 		return c.respond(m, StatusOK)
 	}
-	// The complete message waits for the handler charged to the
-	// connection's Budget, like octets held for reassembly.
+	// The complete message waits for the handler charged to the session's
+	// Budget, like octets held for reassembly.
 	octets := int64(len(whole.Body))
-	if !c.budget.take(octets) {
+	if !s.budget.take(octets) {
 		return c.respond(m, StatusMessageTooLarge)
 	}
 	ready := make(chan struct{})
 	if !s.post(event{octets: octets, ready: ready, run: func() { s.deliver(c, whole) }}) {
-		c.budget.release(octets)
+		s.budget.release(octets)
 		c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrHandlerBusy})
 		return c.respond(m, StatusMessageTooLarge)
 	}

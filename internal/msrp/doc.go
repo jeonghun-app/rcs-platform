@@ -28,12 +28,14 @@
 // its shared connection toward rcs-as wait for one client. What waits is
 // whoever produces content: Send, and a relay forwarding toward rcs-as.
 // Everything a peer can make this side hold is bounded (Config): header
-// and message size, octets held for reassembly per session and per
-// connection, incomplete messages, gaps per message, events per handler,
-// unanswered requests, queued answers and the relay backlog per client.
-// A peer that stops reading is cut off after WriteTimeout. Config.OnEvent
-// reports refusals, drops and disconnections, without identifiers, for
-// metrics.
+// and message size, octets held per session (a guaranteed reserve plus a
+// share of a per-connection pool) and per connection, incomplete messages
+// and how long each may take, gaps per message, events per handler,
+// unanswered requests, queued answers, failed binds before the first
+// session, and what a relay queues or holds per client. A peer that stops
+// reading is cut off after WriteTimeout. Config.OnEvent reports refusals,
+// drops and disconnections, with values from fixed sets, for metrics. The
+// package's exported types print without session-ids or bodies.
 //
 // The package never logs: session ids are the only secret that ties a
 // connection to a session (ADR 0004), and message bodies must not reach a

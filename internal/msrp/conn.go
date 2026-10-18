@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,7 +44,17 @@ const (
 	// DefaultSendWindow is how many chunks of one session Send may have
 	// awaiting their 200 at once.
 	DefaultSendWindow = 64
+	// DefaultMaxFailedBinds: see Config.MaxFailedBinds.
+	DefaultMaxFailedBinds = 3
+	// DefaultMaxReassemblyLifetime gives a 1 MiB message room to arrive at
+	// about 4 KiB/s.
+	DefaultMaxReassemblyLifetime = 5 * time.Minute
 )
+
+// unboundQueueBytes bounds the answers queued on a passive connection
+// before its first session is bound, when all it can have sent is
+// requests for sessions it does not know or malformed ones.
+const unboundQueueBytes = 64 << 10
 
 // Config tunes a Conn. The zero value uses the defaults.
 type Config struct {
@@ -75,14 +86,26 @@ type Config struct {
 	// session holds. Zero means eight times MaxMessageSize, room for a few
 	// messages arriving interleaved.
 	MaxSessionBuffer int64
-	// MaxConnBuffer bounds the octets held for all sessions on one
-	// connection together: incomplete messages, the chunk being read, and
-	// complete messages waiting for their Handler. Zero means 64 times
-	// MaxMessageSize.
+	// MaxConnBuffer bounds the octets the sessions on one connection hold
+	// beyond their SessionReserve, together: incomplete messages, the chunk
+	// being read, and complete messages waiting for their Handler. Zero
+	// means 64 times MaxMessageSize.
 	MaxConnBuffer int64
+	// SessionReserve is the part of what a session holds that is its own
+	// rather than drawn from MaxConnBuffer, so that other sessions filling
+	// the shared part never leave it without room for one message of the
+	// largest size (a chunk being read and the complete message after it).
+	// Memory therefore grows with the number of sessions, which signalling
+	// creates, not with anything a peer sends. Zero means twice
+	// MaxMessageSize.
+	SessionReserve int64
 	// ReassemblyTimeout is how long an incomplete message waits for its
 	// next chunk before it is dropped.
 	ReassemblyTimeout time.Duration
+	// MaxReassemblyLifetime is how long after its first chunk an incomplete
+	// message is dropped, however its chunks keep coming. Zero means
+	// DefaultMaxReassemblyLifetime.
+	MaxReassemblyLifetime time.Duration
 	// MaxQueuedBytes bounds what waits in a connection's write queue
 	// without anyone waiting for it: answers, REPORTs, and what a relay
 	// forwards toward a client. It is a memory bound, not the test of a
@@ -110,6 +133,12 @@ type Config struct {
 	// refused with 413 and reports are dropped. Zero means
 	// DefaultMaxHandlerQueue.
 	MaxHandlerQueue int
+	// MaxFailedBinds is how many requests for unknown sessions a passive
+	// connection may make before any session has been bound on it; one
+	// more and it is closed (ErrTooManyUnknownSessions). Each costs a
+	// Binder lookup, and a peer that knows no session has nothing to do
+	// here. Zero means DefaultMaxFailedBinds.
+	MaxFailedBinds int
 	// OnEvent, if set, hears about every refusal, drop and connection end
 	// (see Event), for metrics. It runs on the connection's goroutines and
 	// must not block.
@@ -163,6 +192,12 @@ func (cfg Config) withDefaults() (Config, error) {
 	if cfg.ReassemblyTimeout <= 0 {
 		cfg.ReassemblyTimeout = DefaultReassemblyTimeout
 	}
+	if cfg.MaxReassemblyLifetime <= 0 {
+		cfg.MaxReassemblyLifetime = DefaultMaxReassemblyLifetime
+	}
+	if cfg.SessionReserve <= 0 {
+		cfg.SessionReserve = 2 * cfg.MaxMessageSize
+	}
 	if cfg.MaxQueuedBytes <= 0 {
 		cfg.MaxQueuedBytes = max(4*cfg.MaxMessageSize, 16<<20)
 	}
@@ -174,6 +209,9 @@ func (cfg Config) withDefaults() (Config, error) {
 	}
 	if cfg.SendWindow <= 0 {
 		cfg.SendWindow = DefaultSendWindow
+	}
+	if cfg.MaxFailedBinds <= 0 {
+		cfg.MaxFailedBinds = DefaultMaxFailedBinds
 	}
 	if cfg.MaxInFlight <= 0 {
 		cfg.MaxInFlight = DefaultMaxInFlight
@@ -241,6 +279,11 @@ type Conn struct {
 	slots  chan struct{}
 	budget *Budget
 
+	// everBound is set once a session has been bound; failedBinds counts
+	// refused lookups before that.
+	everBound   atomic.Bool
+	failedBinds int
+
 	mu         sync.Mutex
 	sessions   map[string]*Session
 	pending    map[string]*transaction
@@ -267,6 +310,7 @@ type transaction struct {
 	mode     ReportMode
 	onResult func(code int, comment string)
 	timer    Timer
+	slot     bool // holds one of c.slots
 }
 
 // NewActiveConn starts serving nc, a connection this side opened.
@@ -434,6 +478,7 @@ func (c *Conn) addSession(s *Session) error {
 	}
 	c.sessions[s.local.SessionID] = s
 	c.unboundGen++
+	c.everBound.Store(true)
 	return nil
 }
 
@@ -474,7 +519,7 @@ func (c *Conn) readLoop() {
 				return
 			}
 			if !me.Message.IsRequest() {
-				c.emit(Event{Kind: EventDropped, Err: me})
+				c.emit(Event{Kind: EventDropped, Err: ErrMalformedResponse})
 			}
 			err = c.respond(me.Message, me.Code)
 		} else if m.IsRequest() {
@@ -497,7 +542,7 @@ func (c *Conn) handleResponse(m *Message) {
 		if t.timer != nil {
 			t.timer.Stop()
 		}
-		c.releaseSlot()
+		c.releaseSlotOf(t)
 	}
 	c.mu.Unlock()
 	// A 200 to a "partial" request should not exist (§7.1.4); there is
@@ -512,11 +557,11 @@ func (c *Conn) handleRequest(m *Message) error {
 	// §7.3: on arrival the To-Path holds exactly one URI, which must name a
 	// session on this connection.
 	if len(m.ToPath) != 1 {
-		return c.respond(m, StatusNoSession)
+		return c.refuseBind(m, StatusNoSession)
 	}
 	s, code := c.sessionFor(m.ToPath[0])
 	if code != 0 {
-		return c.respond(m, code)
+		return c.refuseBind(m, code)
 	}
 	return s.serve(c, m)
 }
@@ -551,6 +596,23 @@ func (c *Conn) sessionFor(to URI) (*Session, int) {
 	}
 }
 
+// refuseBind answers a request no session on this connection takes, and
+// closes a passive connection that keeps naming unknown sessions before it
+// has bound any.
+func (c *Conn) refuseBind(req *Message, code int) error {
+	if c.passive && !c.everBound.Load() {
+		c.mu.Lock()
+		c.failedBinds++
+		tooMany := c.failedBinds > c.cfg.MaxFailedBinds
+		c.mu.Unlock()
+		if tooMany {
+			c.emit(Event{Kind: EventRefused, Method: req.Method, Code: code})
+			return ErrTooManyUnknownSessions
+		}
+	}
+	return c.respond(req, code)
+}
+
 // respond answers req with code if Failure-Report allows it.
 func (c *Conn) respond(req *Message, code int) error {
 	if code != StatusOK && req.IsRequest() {
@@ -583,6 +645,11 @@ type sendMode struct {
 	// written, for a queued request, is called once it has been written
 	// or dropped.
 	written func(error)
+	// windowed means the request already holds a place in its session's
+	// SendWindow, which bounds it. It then takes no connection slot:
+	// otherwise sessions that a slow peer holds at a full window would use
+	// up the connection's slots and stall every other session.
+	windowed bool
 }
 
 var (
@@ -615,7 +682,8 @@ func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onRes
 		c.fail(ErrPeerNotReading)
 		return ErrPeerNotReading
 	}
-	if track {
+	if track && !mode.windowed {
+		t.slot = true
 		if mode.queue {
 			select {
 			case c.slots <- struct{}{}:
@@ -632,8 +700,11 @@ func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onRes
 				return ctx.Err()
 			}
 		}
+	}
+	if track {
 		c.mu.Lock()
 		if c.closed {
+			c.releaseSlotOf(t)
 			c.mu.Unlock()
 			return ErrConnClosed
 		}
@@ -650,7 +721,7 @@ func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onRes
 			c.mu.Lock()
 			if c.pending[tid] == t {
 				delete(c.pending, tid)
-				c.releaseSlot()
+				c.releaseSlotOf(t)
 			}
 			c.mu.Unlock()
 		}
@@ -676,17 +747,22 @@ func (c *Conn) expire(tid string, t *transaction) {
 		return
 	}
 	delete(c.pending, tid)
-	c.releaseSlot()
+	c.releaseSlotOf(t)
 	c.mu.Unlock()
 	if t.mode == ReportYes {
 		t.onResult(StatusRequestTimeout, StatusText(StatusRequestTimeout))
 	}
 }
 
-// releaseSlot returns the token of a request that is no longer awaited.
-// Callers hold c.mu and have just removed the request from c.pending,
-// which is what keeps tokens and pending requests one to one.
-func (c *Conn) releaseSlot() {
+// releaseSlotOf returns the token of a request that is no longer awaited,
+// if it took one. Callers hold c.mu and have just removed the request from
+// c.pending (or never added it), which keeps tokens and requests one to
+// one.
+func (c *Conn) releaseSlotOf(t *transaction) {
+	if !t.slot {
+		return
+	}
+	t.slot = false
 	select {
 	case <-c.slots:
 	default:
@@ -780,9 +856,13 @@ func (c *Conn) enqueue(f outFrame) error {
 	if c.isClosed() {
 		return ErrConnClosed
 	}
+	limit := c.cfg.MaxQueuedBytes
+	if c.passive && !c.everBound.Load() {
+		limit = min(limit, unboundQueueBytes)
+	}
 	c.qmu.Lock()
 	if f.done == nil {
-		if int64(c.posted+len(f.b)) > c.cfg.MaxQueuedBytes {
+		if int64(c.posted+len(f.b)) > limit {
 			c.qmu.Unlock()
 			c.fail(ErrPeerNotReading)
 			return ErrPeerNotReading

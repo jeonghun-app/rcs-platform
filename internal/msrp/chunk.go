@@ -69,15 +69,24 @@ func Split(body []byte, size int) ([]Chunk, error) {
 	return chunks, nil
 }
 
-// Budget is an allowance of buffered octets that several Reassemblers draw
-// on together; a Conn gives one to all of its sessions, so the sessions on
-// a connection cannot together hold more than Limit. It is safe for
+// Budget is an allowance of buffered octets that several holders draw on
+// together. A Conn gives every session a Budget of its own whose Parent is
+// the connection's, with a Reserve: what a session holds up to its Reserve
+// is guaranteed to it, and only what it holds beyond is drawn from the
+// shared Parent. So sessions crowding the shared part cannot leave another
+// session without room for a message of its own. A Budget is safe for
 // concurrent use.
 type Budget struct {
+	// Limit bounds what is drawn from this Budget; zero or less means no
+	// bound of its own.
 	Limit int64
+	// Reserve is the part not drawn from Parent.
+	Reserve int64
+	Parent  *Budget
 
-	mu   sync.Mutex
-	used int64
+	mu      sync.Mutex
+	used    int64
+	spilled int64 // drawn from Parent
 }
 
 // Used returns the octets currently drawn.
@@ -93,8 +102,16 @@ func (b *Budget) take(n int64) bool {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.used+n > b.Limit {
+	if b.Limit > 0 && b.used+n > b.Limit {
 		return false
+	}
+	if b.Parent != nil {
+		if spill := max(0, b.used+n-b.Reserve) - b.spilled; spill > 0 {
+			if !b.Parent.take(spill) {
+				return false
+			}
+			b.spilled += spill
+		}
 	}
 	b.used += n
 	return true
@@ -105,8 +122,14 @@ func (b *Budget) release(n int64) {
 		return
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.used -= n
-	b.mu.Unlock()
+	if b.Parent != nil {
+		if keep := max(0, b.used-b.Reserve); b.spilled > keep {
+			b.Parent.release(b.spilled - keep)
+			b.spilled = keep
+		}
+	}
 }
 
 // Reassembler puts SEND chunks back together by Message-ID and Byte-Range
@@ -148,11 +171,12 @@ type Reassembler struct {
 }
 
 type partial struct {
-	runs    []run // sorted and disjoint
-	have    int64 // octets received
-	cost    int64 // octets of capacity charged
-	end     int64 // message length once the "$" chunk arrived, else Unknown
-	total   int64 // declared Byte-Range total, else Unknown
+	started time.Time // when the first chunk came
+	runs    []run     // sorted and disjoint
+	have    int64     // octets received
+	cost    int64     // octets of capacity charged
+	end     int64     // message length once the "$" chunk arrived, else Unknown
+	total   int64     // declared Byte-Range total, else Unknown
 	touched time.Time
 }
 
@@ -222,7 +246,7 @@ func (r *Reassembler) Add(m *Message, now time.Time) (*Message, error) {
 		if r.pending == nil {
 			r.pending = map[string]*partial{}
 		}
-		p = &partial{end: Unknown, total: Unknown}
+		p = &partial{end: Unknown, total: Unknown, started: now}
 		r.pending[id] = p
 	}
 	p.touched = now
@@ -391,15 +415,17 @@ func (r *Reassembler) dropLocked(id string) {
 	r.Budget.release(p.cost)
 }
 
-// Expire drops every incomplete message whose last chunk came at or before
-// cutoff and returns how many it dropped, so a sender that stops half-way
-// does not keep memory until the session ends.
-func (r *Reassembler) Expire(cutoff time.Time) int {
+// Expire drops every incomplete message whose last chunk came at or
+// before idleCutoff, or whose first chunk came at or before startCutoff,
+// and returns how many it dropped. The first rule frees what a sender
+// abandoned; the second bounds how long any message may take, so a sender
+// trickling chunks cannot hold memory for ever.
+func (r *Reassembler) Expire(idleCutoff, startCutoff time.Time) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	dropped := 0
 	for id, p := range r.pending {
-		if !p.touched.After(cutoff) {
+		if !p.touched.After(idleCutoff) || !p.started.After(startCutoff) {
 			r.dropLocked(id)
 			dropped++
 		}
@@ -407,14 +433,18 @@ func (r *Reassembler) Expire(cutoff time.Time) int {
 	return dropped
 }
 
-// Oldest returns when the least recently touched incomplete message last
-// got a chunk; ok is false when nothing is held.
-func (r *Reassembler) Oldest() (t time.Time, ok bool) {
+// NextExpiry returns when Expire, with these limits, would next drop
+// something; ok is false when nothing is held.
+func (r *Reassembler) NextExpiry(idle, lifetime time.Duration) (t time.Time, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, p := range r.pending {
-		if !ok || p.touched.Before(t) {
-			t, ok = p.touched, true
+		due := p.touched.Add(idle)
+		if end := p.started.Add(lifetime); end.Before(due) {
+			due = end
+		}
+		if !ok || due.Before(t) {
+			t, ok = due, true
 		}
 	}
 	return t, ok

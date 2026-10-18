@@ -222,15 +222,21 @@ type pairBinder struct {
 	pool  *Pool
 	mu    sync.Mutex
 	pairs map[string][2]*Session
+	// opened are pairs whose core side was opened before the client came.
+	opened map[string]bool
 }
 
 func (r *pairBinder) Bind(_ *Conn, to URI) (*Session, error) {
 	r.mu.Lock()
 	p, ok := r.pairs[to.SessionID]
+	opened := r.opened[to.SessionID]
 	delete(r.pairs, to.SessionID)
 	r.mu.Unlock()
 	if !ok {
 		return nil, ErrNoSession
+	}
+	if opened {
+		return p[0], nil
 	}
 	if err := r.pool.Open(context.Background(), p[1]); err != nil {
 		_ = p[0].Close()
@@ -358,6 +364,22 @@ func (rig *relayRigTCP) relayEdgeSession(t *testing.T, c *Conn) *Session {
 	}
 	t.Fatal("no session on the client connection")
 	return nil
+}
+
+// openCoreFirst opens the rcs-as side of a user's bridge before its client
+// connects, against the order ADR 0004 gives.
+func (rig *relayRigTCP) openCoreFirst(t *testing.T, relayPub URI) {
+	t.Helper()
+	rig.relay.mu.Lock()
+	p := rig.relay.pairs[relayPub.SessionID]
+	if rig.relay.opened == nil {
+		rig.relay.opened = map[string]bool{}
+	}
+	rig.relay.opened[relayPub.SessionID] = true
+	rig.relay.mu.Unlock()
+	if err := rig.relay.pool.Open(context.Background(), p[1]); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (rig *relayRigTCP) coreConn(t *testing.T) *Conn {
@@ -644,5 +666,70 @@ func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	}
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("Send ignored its context for %v", d)
+	}
+}
+
+func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) {
+	rig := newRelayRigTCP(t, Config{}, Config{})
+	asLate, clLate, rpLate := rig.addUser(t, 1, &countingHandler{})
+	asOver, _, rpOver := rig.addUser(t, 2, &countingHandler{})
+	asFast, clFast, rpFast := rig.addUser(t, 3, &countingHandler{})
+	fastH := &countingHandler{got: make(chan *Message, 16)}
+	_, fastConn := rig.dialClient(t, clFast, rpFast, fastH)
+	rig.openCoreFirst(t, rpLate)
+	rig.openCoreFirst(t, rpOver)
+	for _, s := range []*Session{asLate, asOver, asFast} {
+		if _, err := s.waitBound(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A stored message for a client that has not connected yet is held.
+	stored := make(chan error, 1)
+	go func() {
+		_, err := asLate.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("kept for you")})
+		stored <- err
+	}()
+	// More than the relay holds for an unbound session, from a sender that
+	// does not wait for answers, is refused for that session alone.
+	over := make(chan error, 1)
+	go func() {
+		_, err := asOver.Send(context.Background(), Outgoing{ContentType: "application/octet-stream", Body: bodyOf(1 << 20), FailureReport: ReportPartial})
+		over <- err
+	}()
+	for i := range 5 {
+		start := time.Now()
+		if _, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-fastH.got:
+			if d := time.Since(start); d > time.Second {
+				t.Errorf("message %d to the connected client took %v", i, d)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("message %d to the connected client never arrived", i)
+		}
+	}
+	if err := <-stored; err != nil {
+		t.Fatalf("stored message: %v", err)
+	}
+	var se *StatusError
+	if err := <-over; !errors.As(err, &se) || se.Code != StatusMessageTooLarge {
+		t.Fatalf("unbound session over its bound: %v", err)
+	}
+	// The client comes and gets what was held.
+	lateH := &countingHandler{got: make(chan *Message, 4)}
+	rig.dialClient(t, clLate, rpLate, lateH)
+	select {
+	case m := <-lateH.got:
+		if string(m.Body) != "kept for you" {
+			t.Fatalf("got %q", m.Body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held message was not delivered")
+	}
+	if rig.coreConn(t).Err() != nil || fastConn.Err() != nil {
+		t.Fatalf("shared connection %v, connected client %v", rig.coreConn(t).Err(), fastConn.Err())
 	}
 }
