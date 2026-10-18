@@ -2,6 +2,7 @@ package conference
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"testing"
@@ -91,13 +92,44 @@ func TestAFullEndpointInAPartialUserReplacesTheOldOne(t *testing.T) {
 	}
 }
 
-func TestUsersWithoutAStateInAPartialDocumentReplaceTheRoster(t *testing.T) {
+func TestUsersWithoutAStateInAPartialDocumentAreReadAsPartial(t *testing.T) {
+	// The RFC 4575 §7.2 example writes a delta this way; reading it with the
+	// schema default would replace the roster with the one user it names.
 	got := mustMerge(t, fullInfo(), partial(`<users><user entity="`+dave+`"/></users>`))
-	if want := []User{{Entity: dave, State: Full}}; !reflect.DeepEqual(got.Users.List, want) {
-		t.Errorf("users = %+v; <users> defaults to full", got.Users.List)
+	if n := len(got.Users.List); n != 4 || got.Users.List[3].Entity != dave {
+		t.Errorf("users = %+v; the roster must keep its members and gain dave", got.Users.List)
 	}
 	if got.Description == nil || got.Description.Subject != "Hiking & dinner" {
 		t.Errorf("an absent description is kept: %+v", got.Description)
+	}
+}
+
+func TestFullUsersInAPartialDocumentReplaceTheRoster(t *testing.T) {
+	got := mustMerge(t, fullInfo(), partial(`<users state="full"><user entity="`+dave+`"/></users>`))
+	if want := []User{{Entity: dave, State: Full}}; !reflect.DeepEqual(got.Users.List, want) {
+		t.Errorf("users = %+v", got.Users.List)
+	}
+}
+
+func TestForeignNamespacedAttributesAreNotStateOrEntity(t *testing.T) {
+	const head = `<conference-info xmlns="urn:ietf:params:xml:ns:conference-info" xmlns:x="urn:example:ext" entity="sip:conf@example.com" x:entity="sip:other@example.com" state="%s" x:state="deleted" version="%d" x:version="9">`
+	base, err := Parse([]byte(fmt.Sprintf(head, "full", 1) + `<conference-description/><users x:state="deleted"><user entity="sip:a@example.com"/><user entity="sip:b@example.com" x:entity="sip:evil@example.com"><endpoint entity="b1" x:entity="e" x:state="deleted"/></user></users></conference-info>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.Entity != "sip:conf@example.com" || base.Version != 1 || base.State != Full {
+		t.Errorf("root attributes = %+v", base)
+	}
+	if base.Users.List[1].Entity != "sip:b@example.com" || base.Users.List[1].Endpoints[0] != (Endpoint{Entity: "b1", State: Full}) {
+		t.Errorf("x:entity or x:state overrode an attribute: %+v", base.Users.List[1])
+	}
+	doc, err := Parse([]byte(fmt.Sprintf(head, "partial", 2) + `<users state="partial"><user entity="sip:a@example.com" state="partial" x:state="deleted"><display-text>A</display-text></user></users></conference-info>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Merge(base, doc)
+	if err != nil || len(got.Users.List) != 2 || got.Users.List[0].DisplayText != "A" {
+		t.Errorf("x:state=\"deleted\" removed a user: %+v, %v", got, err)
 	}
 }
 

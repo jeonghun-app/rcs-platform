@@ -10,13 +10,10 @@ import (
 // The wire types decode with namespace-qualified names, so an extension
 // element sharing a local name is never mistaken for a conference-info one.
 // Single-valued elements are slices so a duplicate is detected rather than
-// silently overwritten, and required attributes are pointers so a missing one
-// is told from an empty one.
+// silently overwritten. Attributes are collected whole and read with plainAttr.
 type wireInfo struct {
 	XMLName     xml.Name          `xml:"urn:ietf:params:xml:ns:conference-info conference-info"`
-	Entity      *string           `xml:"entity,attr"`
-	State       string            `xml:"state,attr"`
-	Version     *string           `xml:"version,attr"`
+	Attrs       []xml.Attr        `xml:",any,attr"`
 	Description []wireDescription `xml:"urn:ietf:params:xml:ns:conference-info conference-description"`
 	Users       []wireUsers       `xml:"urn:ietf:params:xml:ns:conference-info users"`
 }
@@ -27,13 +24,12 @@ type wireDescription struct {
 }
 
 type wireUsers struct {
-	State string     `xml:"state,attr"`
+	Attrs []xml.Attr `xml:",any,attr"`
 	User  []wireUser `xml:"urn:ietf:params:xml:ns:conference-info user"`
 }
 
 type wireUser struct {
-	Entity      *string        `xml:"entity,attr"`
-	State       string         `xml:"state,attr"`
+	Attrs       []xml.Attr     `xml:",any,attr"`
 	DisplayText []string       `xml:"urn:ietf:params:xml:ns:conference-info display-text"`
 	Roles       []wireRoles    `xml:"urn:ietf:params:xml:ns:conference-info roles"`
 	Endpoint    []wireEndpoint `xml:"urn:ietf:params:xml:ns:conference-info endpoint"`
@@ -44,12 +40,25 @@ type wireRoles struct {
 }
 
 type wireEndpoint struct {
-	Entity              *string  `xml:"entity,attr"`
-	State               string   `xml:"state,attr"`
-	DisplayText         []string `xml:"urn:ietf:params:xml:ns:conference-info display-text"`
-	Status              []string `xml:"urn:ietf:params:xml:ns:conference-info status"`
-	JoiningMethod       []string `xml:"urn:ietf:params:xml:ns:conference-info joining-method"`
-	DisconnectionMethod []string `xml:"urn:ietf:params:xml:ns:conference-info disconnection-method"`
+	Attrs               []xml.Attr `xml:",any,attr"`
+	DisplayText         []string   `xml:"urn:ietf:params:xml:ns:conference-info display-text"`
+	Status              []string   `xml:"urn:ietf:params:xml:ns:conference-info status"`
+	JoiningMethod       []string   `xml:"urn:ietf:params:xml:ns:conference-info joining-method"`
+	DisconnectionMethod []string   `xml:"urn:ietf:params:xml:ns:conference-info disconnection-method"`
+}
+
+// plainAttr returns the attribute called name in no namespace. RFC 4575
+// attributes are unqualified (§6), and one of the same local name in another
+// namespace is an extension the schema allows (anyAttribute ##other). A plain
+// `xml:"entity,attr"` field would match either and keep the last, letting an
+// extension attribute change a merge key or a state.
+func plainAttr(attrs []xml.Attr, name string) (string, bool) {
+	for _, a := range attrs {
+		if a.Name.Space == "" && a.Name.Local == name {
+			return a.Value, true
+		}
+	}
+	return "", false
 }
 
 // parseState reads a state attribute. The enumeration is an xs:string, whose
@@ -63,23 +72,26 @@ func parseState(s string) (State, error) {
 }
 
 func (w *wireInfo) info() (*Info, error) {
-	if w.Entity == nil {
+	entity, ok := plainAttr(w.Attrs, "entity")
+	if !ok {
 		return nil, fmt.Errorf("%w: conference-info without entity", ErrMalformed)
 	}
 	// §4.3: version is mandatory on the root even though the schema marks
 	// it optional.
-	if w.Version == nil {
+	v, ok := plainAttr(w.Attrs, "version")
+	if !ok {
 		return nil, fmt.Errorf("%w: conference-info without version", ErrMalformed)
 	}
-	version, err := strconv.ParseUint(strings.TrimSpace(*w.Version), 10, 32)
+	version, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
 	if err != nil {
 		return nil, fmt.Errorf("%w: version is not a 32-bit unsigned integer", ErrMalformed)
 	}
-	state, err := parseState(w.State)
+	st, _ := plainAttr(w.Attrs, "state")
+	state, err := parseState(st)
 	if err != nil {
 		return nil, err
 	}
-	c := &Info{Entity: strings.TrimSpace(*w.Entity), State: state, Version: uint32(version)}
+	c := &Info{Entity: strings.TrimSpace(entity), State: state, Version: uint32(version)}
 	if state == Deleted {
 		return c, nil
 	}
@@ -102,7 +114,7 @@ func (w *wireInfo) info() (*Info, error) {
 	switch len(w.Users) {
 	case 0:
 	case 1:
-		if c.Users, err = w.Users[0].users(); err != nil {
+		if c.Users, err = w.Users[0].users(state); err != nil {
 			return nil, err
 		}
 	default:
@@ -111,8 +123,14 @@ func (w *wireInfo) info() (*Info, error) {
 	return c, nil
 }
 
-func (w *wireUsers) users() (*Users, error) {
-	state, err := parseState(w.State)
+// users reads <users>. Without a state attribute inside a partial document
+// it is partial, not the schema's full: see the Users type.
+func (w *wireUsers) users(parent State) (*Users, error) {
+	st, ok := plainAttr(w.Attrs, "state")
+	if !ok && parent == Partial {
+		st = string(Partial)
+	}
+	state, err := parseState(st)
 	if err != nil {
 		return nil, err
 	}
@@ -131,14 +149,16 @@ func (w *wireUsers) users() (*Users, error) {
 }
 
 func (w *wireUser) user() (User, error) {
-	if w.Entity == nil {
+	entity, ok := plainAttr(w.Attrs, "entity")
+	if !ok {
 		return User{}, fmt.Errorf("%w: user without entity", ErrMalformed)
 	}
-	state, err := parseState(w.State)
+	st, _ := plainAttr(w.Attrs, "state")
+	state, err := parseState(st)
 	if err != nil {
 		return User{}, err
 	}
-	u := User{Entity: strings.TrimSpace(*w.Entity), State: state}
+	u := User{Entity: strings.TrimSpace(entity), State: state}
 	if state == Deleted {
 		return u, nil
 	}
@@ -167,14 +187,16 @@ func (w *wireUser) user() (User, error) {
 }
 
 func (w *wireEndpoint) endpoint() (Endpoint, error) {
-	if w.Entity == nil {
+	entity, ok := plainAttr(w.Attrs, "entity")
+	if !ok {
 		return Endpoint{}, fmt.Errorf("%w: endpoint without entity", ErrMalformed)
 	}
-	state, err := parseState(w.State)
+	st, _ := plainAttr(w.Attrs, "state")
+	state, err := parseState(st)
 	if err != nil {
 		return Endpoint{}, err
 	}
-	e := Endpoint{Entity: *w.Entity, State: state}
+	e := Endpoint{Entity: entity, State: state}
 	if state == Deleted {
 		return e, nil
 	}

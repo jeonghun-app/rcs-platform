@@ -322,6 +322,13 @@ func TestMarshalRejectsWhatParseWouldReject(t *testing.T) {
 		"deleted endpoint with content": func(c *Info) {
 			c.State, c.Users.State, c.Users.List[0].State, c.Users.List[0].Endpoints[0].State = Partial, Partial, Partial, Deleted
 		},
+		"partial without a users state": func(c *Info) { c.State, c.Users.State = Partial, "" },
+		"partial without a user state": func(c *Info) {
+			c.State, c.Users.State, c.Users.List[0].State = Partial, Partial, ""
+		},
+		"partial without an endpoint state": func(c *Info) {
+			c.State, c.Users.State, c.Users.List[0].State, c.Users.List[0].Endpoints[0].State = Partial, Partial, Partial, ""
+		},
 	}
 	for name, breakIt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -334,5 +341,39 @@ func TestMarshalRejectsWhatParseWouldReject(t *testing.T) {
 	}
 	if _, err := fullInfo().Marshal(); err != nil {
 		t.Errorf("the unbroken document marshals: %v", err)
+	}
+}
+
+func TestAByteOrderMarkIsAccepted(t *testing.T) {
+	c, err := Parse([]byte("\xef\xbb\xbf" + fullDoc))
+	if err != nil || !reflect.DeepEqual(c, fullInfo()) {
+		t.Errorf("Parse(BOM + document) = %+v, %v", c, err)
+	}
+}
+
+func TestXMLErrorsDoNotQuoteTheInput(t *testing.T) {
+	const marker = "15550100001"
+	tests := map[string]string{
+		"entity reference":     partial(`<conference-description><subject>&sip:+` + marker + `;</subject></conference-description>`),
+		"invalid element name": partial(`<1` + marker + `/>`),
+		"wrong root":           `<x` + marker + ` xmlns="urn:ietf:params:xml:ns:conference-info"/>`,
+		"mismatched end tag":   partial(`<a` + marker + `></b>`),
+		"unknown encoding":     `<?xml version="1.0" encoding="x` + marker + `"?>` + partial(""),
+		"repeated attribute":   `<a` + marker + ` x="1" x="2"/>`,
+		"bad version":          root(`state="partial" version="+`+marker+`"`, ""),
+		"bad state":            root(`state="s`+marker+`" version="2"`, ""),
+		"bad endpoint status":  partial(`<users state="partial"><user entity="` + alice + `" state="partial"><endpoint entity="e" state="partial"><status>s` + marker + `</status></endpoint></user></users>`),
+		"entity with a space":  `<conference-info xmlns="urn:ietf:params:xml:ns:conference-info" entity="sip:+` + marker + ` x" version="1" state="partial"/>`,
+	}
+	for name, doc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(doc))
+			if err == nil {
+				t.Fatal("Parse accepted the document")
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Errorf("error %q quotes the input", err)
+			}
+		})
 	}
 }

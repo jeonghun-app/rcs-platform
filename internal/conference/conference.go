@@ -10,7 +10,10 @@
 //
 // A focus sends a full document first and partial ones afterwards. Merge
 // applies a document to the local state with the RFC 4575 §4.6 procedure, so a
-// client simulator can keep the same roster a real client would.
+// client simulator can keep the same roster a real client would. One reading
+// departs from the schema default: a <users> without a state attribute in a
+// partial document is partial, as in the RFC 4575 §7.2 example (see Users).
+// Marshal therefore insists on explicit states below a partial document.
 //
 // Documents are decoded with encoding/xml behind a size limit, a nesting limit
 // and a refusal of any document type declaration.
@@ -125,8 +128,12 @@ type Description struct {
 }
 
 // Users is the <users> element (RFC 4575 §5.6), which has a state of its
-// own: in a partial document, <users> without state="partial" replaces the
-// whole roster.
+// own. In a partial document, a <users> with state="full" replaces the whole
+// roster. Parse reads a partial document's <users> without a state attribute
+// as partial, although the schema default is full: the RFC 4575 §7.2 example
+// writes deltas that way, and reading it as full would wipe the roster.
+// Documents built for sending must set State explicitly; Marshal refuses an
+// empty one below a partial document.
 type Users struct {
 	State State
 	List  []User
@@ -164,8 +171,8 @@ func Parse(data []byte) (*Info, error) {
 		return nil, err
 	}
 	var w wireInfo
-	if err := xml.NewDecoder(bytes.NewReader(data)).Decode(&w); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+	if err := xml.NewDecoder(bytes.NewReader(withoutBOM(data))).Decode(&w); err != nil {
+		return nil, decodeError(err)
 	}
 	info, err := w.info()
 	if err != nil {
@@ -351,13 +358,20 @@ func (e *Endpoint) validate(parent State) error {
 	return nil
 }
 
-// childState applies RFC 4575 §4.4: a child of a full element is full.
+// childState applies RFC 4575 §4.4: a child of a full element is full. Below
+// a partial element the state must be written out, because the schema default
+// is full and a forgotten state would make a delta replace what it meant to
+// update: a partial document with a stateless <users> wipes every receiver's
+// roster. Parse always makes states explicit, so this binds only documents a
+// caller builds.
 func childState(parent, child State) error {
-	if !child.valid() {
+	switch {
+	case !child.valid():
 		return fmt.Errorf("%w: invalid state", ErrMalformed)
-	}
-	if parent == Full && child.orFull() != Full {
-		return fmt.Errorf("%w: %s element inside a full one", ErrMalformed, child)
+	case parent == Full && child.orFull() != Full:
+		return fmt.Errorf("%w: partial or deleted element inside a full one", ErrMalformed)
+	case parent == Partial && child == "":
+		return fmt.Errorf("%w: element inside a partial one without an explicit state", ErrMalformed)
 	}
 	return nil
 }
