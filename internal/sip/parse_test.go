@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -413,5 +414,41 @@ func TestControlCharactersAndInvalidUTF8AreRejected(t *testing.T) {
 		if _, err := (&Response{StatusCode: 200, Reason: reason}).Bytes(); err == nil {
 			t.Errorf("Bytes() with reason %q succeeded", reason)
 		}
+	}
+}
+
+const optionsZeroLength = "OPTIONS sip:a@example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n"
+
+// Found by QA on PR #27: "no limit" as math.MaxInt overflowed the arithmetic.
+func TestDatagramWithLargestHeaderLimitDoesNotPanic(t *testing.T) {
+	if _, err := ParseDatagram([]byte(optionsZeroLength), Limits{MaxHeaderBytes: math.MaxInt}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestReaderWithLargestHeaderLimitReadsAMessage(t *testing.T) {
+	r := NewReader(bufio.NewReader(strings.NewReader(optionsZeroLength)), Limits{MaxHeaderBytes: math.MaxInt})
+	if _, err := r.ReadMessage(); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestOverflowingContentLengthIsRefused(t *testing.T) {
+	// 2^64+5: a parser that wraps reads Content-Length 5 and takes the rest as
+	// the next message.
+	msg := "OPTIONS sip:a@example.com SIP/2.0\r\nContent-Length: 18446744073709551621\r\n\r\nhelloINVITE sip:b@example.com SIP/2.0\r\n"
+	r := NewReader(bufio.NewReader(strings.NewReader(msg)), Limits{MaxBodyBytes: math.MaxInt})
+	if _, err := r.ReadMessage(); !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("err = %v, want ErrBodyTooLarge", err)
+	}
+	if _, err := ParseDatagram([]byte(msg), Limits{MaxBodyBytes: math.MaxInt}); !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("datagram err = %v, want ErrBodyTooLarge", err)
+	}
+}
+
+func TestLimitsAboveOneGiBAreClamped(t *testing.T) {
+	got := Limits{MaxHeaderBytes: math.MaxInt, MaxHeaders: math.MaxInt, MaxBodyBytes: math.MaxInt}.withDefaults()
+	if got != (Limits{MaxHeaderBytes: maxLimit, MaxHeaders: maxLimit, MaxBodyBytes: maxLimit}) {
+		t.Errorf("withDefaults() = %+v", got)
 	}
 }

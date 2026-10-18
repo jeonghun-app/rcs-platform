@@ -18,7 +18,8 @@ const (
 )
 
 // Limits bound the resources one message may take. A zero or negative field
-// takes its default.
+// takes its default, and a field above 1 GiB is treated as 1 GiB, so a limit set
+// to math.MaxInt to mean "none" cannot overflow the arithmetic on it.
 type Limits struct {
 	// MaxHeaderBytes bounds the start line and header fields, CRLFs included.
 	MaxHeaderBytes int
@@ -27,6 +28,8 @@ type Limits struct {
 	// MaxBodyBytes bounds the body.
 	MaxBodyBytes int
 }
+
+const maxLimit = 1 << 30
 
 func (l Limits) withDefaults() Limits {
 	if l.MaxHeaderBytes <= 0 {
@@ -38,6 +41,9 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxBodyBytes <= 0 {
 		l.MaxBodyBytes = DefaultMaxBodyBytes
 	}
+	l.MaxHeaderBytes = min(l.MaxHeaderBytes, maxLimit)
+	l.MaxHeaders = min(l.MaxHeaders, maxLimit)
+	l.MaxBodyBytes = min(l.MaxBodyBytes, maxLimit)
 	return l
 }
 
@@ -269,10 +275,13 @@ func parseContentLength(v string, max int) (int, error) {
 	}
 	n := 0
 	for i := 0; i < len(v); i++ {
-		n = n*10 + int(v[i]-'0')
-		if n > max {
+		// n*10+d > max, checked before multiplying so n cannot wrap around. d > max
+		// needs its own test because (max-d)/10 truncates towards zero.
+		d := int(v[i] - '0')
+		if d > max || n > (max-d)/10 {
 			return 0, &ParseError{Header: "Content-Length", Err: ErrBodyTooLarge}
 		}
+		n = n*10 + d
 	}
 	return n, nil
 }
