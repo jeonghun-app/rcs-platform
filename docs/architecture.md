@@ -184,8 +184,13 @@ uses DynamoDB Local and a local S3.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
   distroless image can run an ECS container health check.
-- **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, and
-  rejects rather than repairs malformed input. XML parsers never resolve entities.
+- **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
+  linear in its input (a test parses a maximum-size adversarial input), and never
+  repairs input it forwards: received bytes are passed on unchanged. Receivers
+  may *interpret* common deviations leniently where interoperability needs it
+  (e.g. bare LF, extra whitespace) and count them; senders are strict. Anything
+  ambiguous, or a security risk (control characters, invalid UTF-8, mixed line
+  endings, limits), is rejected. XML parsers never resolve entities.
 - **Time and randomness** are injected so timers and nonces are testable.
 
 ## 9. Specifications
