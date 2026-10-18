@@ -65,14 +65,9 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	st, keys, err := openStore(ctx, rt, cfg, d)
+	st, keys, err := start(ctx, rt, cfg, d)
 	if err != nil {
 		return err
-	}
-	if cfg.CreateDefaultProfile {
-		if err := ensureProfile(ctx, st, DefaultRCSProfile(cfg.DefaultProfile, cfg.RCSASURI)); err != nil {
-			return fmt.Errorf("hss: creating the default service profile: %w", err)
-		}
 	}
 	h, err := New(Options{
 		Store: st, Keys: keys, IMSRealm: cfg.IMSRealm, FTRealm: cfg.FTRealm, ServerNames: cfg.SCSCFNames,
@@ -172,6 +167,27 @@ func keyDescription(cfg Config) string {
 		return "kms"
 	}
 	return "local"
+}
+
+// start opens the store and the keyring and creates the default profile,
+// within HSS_START_TIMEOUT. Without the bound, a task whose route to
+// DynamoDB or KMS drops packets would wait out the SDK's dial timeouts and
+// retries for minutes before failing, holding a place in a rolling update;
+// with it, the task exits soon and plainly, which ECS's deployment circuit
+// breaker sees. /readyz answers "starting" until then.
+func start(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (store.Store, *keyring.Keyring, error) {
+	ctx, cancel := context.WithTimeout(ctx, cfg.StartTimeout)
+	defer cancel()
+	st, keys, err := openStore(ctx, rt, cfg, d)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hss: start-up: %w", err)
+	}
+	if cfg.CreateDefaultProfile {
+		if err := ensureProfile(ctx, st, DefaultRCSProfile(cfg.DefaultProfile, cfg.RCSASURI)); err != nil {
+			return nil, nil, fmt.Errorf("hss: creating the default service profile: %w", err)
+		}
+	}
+	return st, keys, nil
 }
 
 // openStore opens the store and the keyring the configuration names.

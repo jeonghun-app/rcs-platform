@@ -321,3 +321,35 @@ func TestTwoStartsDrawDifferentOriginHosts(t *testing.T) {
 		t.Fatalf("two HSS starts used Origin-Host %q and %q", hosts[0], hosts[1])
 	}
 }
+
+// blockingAWS answers nothing until the caller's context ends, like a
+// route that drops packets.
+type blockingAWS struct{ *memoryAWS }
+
+func (b blockingAWS) HasSubscriptions(ctx context.Context) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestStartUpGivesUpAtItsDeadline(t *testing.T) {
+	cfg, err := configure(with(devEnv, "HSS_STORE", "dynamodb", "HSS_KMS_KEY_ID", "alias/hss", "HSS_START_TIMEOUT", "100ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := defaultDeps()
+	d.aws = func(context.Context, awsstore.Config) (readyStore, keyring.Wrapper, error) {
+		return blockingAWS{&memoryAWS{Memory: store.NewMemory()}}, xorWrapper{}, nil
+	}
+	h := runtimetest.New(t, "hss")
+	begin := time.Now()
+	err = run(context.Background(), h.Runtime, cfg, d)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run = %v, want the start-up deadline", err)
+	}
+	if took := time.Since(begin); took > 5*time.Second {
+		t.Errorf("gave up after %v", took)
+	}
+	if code, _ := h.Get("/readyz"); code == http.StatusOK {
+		t.Error("ready although start-up failed")
+	}
+}

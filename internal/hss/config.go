@@ -27,6 +27,8 @@ const (
 	DefaultSubscribersTable = "subscribers"
 	DefaultProfilesTable    = "service-profiles"
 	DefaultProfileID        = "rcs-default"
+	// DefaultStartTimeout bounds opening the store and the keyring.
+	DefaultStartTimeout = 60 * time.Second
 )
 
 // Config is the HSS configuration, read by Configure from HSS_ variables.
@@ -71,6 +73,7 @@ type Config struct {
 	MaxAuthItems int
 	CxTimeout    time.Duration
 	APITimeout   time.Duration
+	StartTimeout time.Duration
 	PushTimeout  time.Duration
 }
 
@@ -118,6 +121,7 @@ func Configure(s *runtime.Settings) Config {
 		MaxAuthItems:         e.Int("MAX_AUTH_ITEMS", DefaultMaxAuthItems),
 		CxTimeout:            e.Duration("CX_TIMEOUT", DefaultCxTimeout),
 		APITimeout:           e.Duration("API_TIMEOUT", DefaultAPIStoreTimeout),
+		StartTimeout:         e.Duration("START_TIMEOUT", DefaultStartTimeout),
 		PushTimeout:          e.Duration("PUSH_TIMEOUT", DefaultPushTimeout),
 	}
 	c.PeerRealm = e.String("DIAMETER_PEER_REALM", c.OriginRealm)
@@ -159,7 +163,7 @@ func Configure(s *runtime.Settings) Config {
 	for _, d := range []struct {
 		name string
 		v    time.Duration
-	}{{"CX_TIMEOUT", c.CxTimeout}, {"API_TIMEOUT", c.APITimeout}, {"PUSH_TIMEOUT", c.PushTimeout}} {
+	}{{"CX_TIMEOUT", c.CxTimeout}, {"API_TIMEOUT", c.APITimeout}, {"START_TIMEOUT", c.StartTimeout}, {"PUSH_TIMEOUT", c.PushTimeout}} {
 		if d.v <= 0 {
 			e.Invalid(d.name, "must be greater than zero")
 		}
