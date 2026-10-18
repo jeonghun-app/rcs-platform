@@ -50,6 +50,29 @@ jobs:
           path: '**/testdata/fuzz/**'
           if-no-files-found: ignore
 
+  # Builds deploy/Dockerfile so a base image digest update (Dependabot) cannot
+  # merge green and fail only at deploy time, and checks the properties the
+  # deployment relies on: a non-root numeric user and a stamped binary that runs.
+  image:
+    name: image builds and runs as non-root
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make image VERSION=ci
+      - name: image runs as uid 65532 and reports its version
+        run: |
+          user="$(docker image inspect rcs-platform:ci --format '{{.Config.User}}')"
+          if [ "$user" != "65532:65532" ]; then
+            echo "image user is '$user', want 65532:65532" >&2; exit 1
+          fi
+          out="$(docker run --rm rcs-platform:ci)"
+          if [ "$out" != "rcs-version ci" ]; then
+            echo "rcs-version printed '$out', want 'rcs-version ci'" >&2; exit 1
+          fi
+
   vuln:
     name: modules and vulnerabilities
     runs-on: ubuntu-latest
