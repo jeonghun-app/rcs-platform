@@ -21,6 +21,11 @@ scripts. The Auto Configuration Server has its own policy in
 Out of scope: the GSMA, 3GPP, OMA and IETF specifications themselves, and
 third-party dependencies (report those upstream; a note here is welcome).
 
+## Threat model
+
+The threats the design addresses, and their status, are in
+[docs/threat-model.md](docs/threat-model.md).
+
 ## This platform handles subscriber data and credentials
 
 The HSS stores IMSIs, MSISDNs, SIM keys (Ki, OPc) and digest credentials; the
