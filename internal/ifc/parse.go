@@ -244,6 +244,10 @@ func (r *reader) spt(where string, w *wireSPT) SPT {
 		}
 	}
 	if ext := atMostOne(r, where, "Extension", w.Extension); ext != nil {
+		// Table E.2 allows two; with three, one kind would be repeated.
+		if len(ext.RegistrationType) > 2 {
+			r.fail(where, "RegistrationType occurs more than twice")
+		}
 		for _, v := range ext.RegistrationType {
 			spt.RegistrationTypes = append(spt.RegistrationTypes,
 				RegistrationType(r.integer(where, "RegistrationType", v, int(InitialRegistration), int(DeRegistration))))

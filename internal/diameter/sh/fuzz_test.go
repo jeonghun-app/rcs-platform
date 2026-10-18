@@ -2,6 +2,7 @@ package sh
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -21,11 +22,11 @@ func FuzzParseData(f *testing.F) {
 			return
 		}
 		out, err := d.Marshal()
+		if errors.Is(err, ErrTooLarge) {
+			return // longer escapes can push a document past the limit
+		}
 		if err != nil {
 			t.Fatalf("parsed data does not marshal: %v\n%+v", err, d)
-		}
-		if len(out) > MaxDataSize {
-			return // longer escapes can push a document past the limit
 		}
 		back, err := ParseData(out)
 		if err != nil {

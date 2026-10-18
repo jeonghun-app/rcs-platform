@@ -101,6 +101,9 @@ func (r *reader) validateSPT(where string, spt *SPT) {
 			r.fail(where, "Group is negative")
 		}
 	}
+	if len(spt.RegistrationTypes) > 2 {
+		r.fail(where, "RegistrationType occurs more than twice")
+	}
 	for _, t := range spt.RegistrationTypes {
 		if t < InitialRegistration || t > DeRegistration {
 			r.fail(where, "RegistrationType is out of range")

@@ -148,8 +148,9 @@ func (d *Data) validate() error {
 }
 
 // Marshal writes the data as an Sh-Data document. It refuses what ParseData
-// would refuse; ServiceData must be well-formed XML content without a
-// document type declaration, since it is written as it is.
+// would refuse, a document over MaxDataSize with ErrTooLarge; ServiceData
+// must be well-formed XML content without a document type declaration, since
+// it is written as it is.
 func (d *Data) Marshal() ([]byte, error) {
 	if err := d.validate(); err != nil {
 		return nil, err
@@ -166,7 +167,8 @@ func (d *Data) Marshal() ([]byte, error) {
 		if rd.ServiceData != nil {
 			// The content goes out unescaped, so it must stand on its own
 			// as XML; otherwise it could close ServiceData and add
-			// elements of its own to the document.
+			// elements of its own to the document. Size and depth are
+			// checked on the whole document below.
 			wrapped := append(append([]byte("<ServiceData>"), rd.ServiceData.InnerXML...), "</ServiceData>"...)
 			if err := checkDocument(wrapped); err != nil {
 				return nil, fmt.Errorf("RepositoryData[%d]: ServiceData: %w", i+1, err)
@@ -182,5 +184,12 @@ func (d *Data) Marshal() ([]byte, error) {
 	var out bytes.Buffer
 	out.WriteString(xml.Header)
 	out.Write(body)
+	// The whole document must pass the parser's checks too: the size
+	// limit, and the depth limit at the depth ServiceData really sits at.
+	// Otherwise the HSS, or this AS reading its data back, would refuse
+	// what was written.
+	if err := checkDocument(out.Bytes()); err != nil {
+		return nil, err
+	}
 	return out.Bytes(), nil
 }

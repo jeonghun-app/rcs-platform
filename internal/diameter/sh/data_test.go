@@ -132,3 +132,39 @@ func TestMarshalRefusesServiceDataThatIsNotSelfContainedXML(t *testing.T) {
 		}
 	}
 }
+
+func TestMarshalRefusesShDataTheParserRefuses(t *testing.T) {
+	big := []byte("<x>" + strings.Repeat("y", 40<<10) + "</x>")
+	deep := []byte(strings.Repeat("<e>", maxDepth-1) + strings.Repeat("</e>", maxDepth-1))
+	for name, tc := range map[string]struct {
+		d    *Data
+		want error
+	}{
+		"two entries over MaxDataSize": {&Data{RepositoryData: []RepositoryData{
+			{ServiceIndication: "a", ServiceData: &ServiceData{InnerXML: big}},
+			{ServiceIndication: "b", ServiceData: &ServiceData{InnerXML: big}},
+		}}, ErrTooLarge},
+		// ServiceData sits three levels down, so content that is fine
+		// on its own is too deep in the document.
+		"ServiceData nested to the limit": {&Data{RepositoryData: []RepositoryData{
+			{ServiceIndication: "a", ServiceData: &ServiceData{InnerXML: deep}},
+		}}, ErrMalformed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := tc.d.Marshal()
+			if !errors.Is(err, tc.want) {
+				_, perr := ParseData(out)
+				t.Fatalf("Marshal = %d bytes, %v (ParseData: %v); want %v", len(out), err, perr, tc.want)
+			}
+		})
+	}
+	// One entry of the same size fits, and reads back.
+	one := &Data{RepositoryData: []RepositoryData{{ServiceIndication: "a", ServiceData: &ServiceData{InnerXML: big}}}}
+	out, err := one.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseData(out); err != nil {
+		t.Errorf("ParseData refuses what Marshal wrote: %v", err)
+	}
+}

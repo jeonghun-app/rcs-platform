@@ -2,6 +2,7 @@ package ifc
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -22,14 +23,14 @@ func FuzzParseSubscription(f *testing.F) {
 			return
 		}
 		out, err := s.Marshal()
+		if errors.Is(err, ErrTooLarge) {
+			// Marshal may write longer forms than the input used, such as
+			// &#xD; for a carriage return, and refuses what the parser
+			// would refuse.
+			return
+		}
 		if err != nil {
 			t.Fatalf("parsed subscription does not marshal: %v\n%+v", err, s)
-		}
-		if len(out) > MaxDocumentSize {
-			// Marshal may write longer forms than the input used, such as
-			// &#xD; for a carriage return; only documents within the
-			// limit can be read back.
-			return
 		}
 		back, err := ParseSubscription(out)
 		if err != nil {

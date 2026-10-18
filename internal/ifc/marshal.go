@@ -7,8 +7,10 @@ import (
 
 // Marshal writes the subscription as an IMSSubscription document. It refuses
 // a subscription that ParseSubscription would refuse, so a document the HSS
-// sends is one it would accept itself, and a value with characters XML
-// cannot carry, which encoding/xml would otherwise replace silently.
+// sends is one it would accept itself: one larger than MaxDocumentSize gives
+// ErrTooLarge, which the HSS can answer with DIAMETER_ERROR_TOO_MUCH_DATA. It
+// also refuses a value with characters XML cannot carry, which encoding/xml
+// would otherwise replace silently.
 //
 // Optional elements with their default value (BarringIndication false, an
 // absent ProfilePartIndicator) are left out; DefaultHandling is always
@@ -27,7 +29,14 @@ func (s *Subscription) Marshal() ([]byte, error) {
 	}
 	out := make([]byte, 0, len(xml.Header)+len(body))
 	out = append(out, xml.Header...)
-	return append(out, body...), nil
+	out = append(out, body...)
+	// The parser's document checks, size above all, apply to what is
+	// written too: a profile the S-CSCF would refuse with ErrTooLarge is
+	// better refused when it is provisioned.
+	if err := checkDocument(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func list(s string) []string {

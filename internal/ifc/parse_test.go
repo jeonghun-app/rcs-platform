@@ -392,6 +392,7 @@ func TestMalformedDocumentsAreRejected(t *testing.T) {
 		"SIPHeader without Header":      trigger(`<SPT><Group>0</Group><SIPHeader><Content>x</Content></SIPHeader></SPT>`),
 		"SIPHeader with two Contents":   trigger(`<SPT><Group>0</Group><SIPHeader><Header>a</Header><Content>x</Content><Content>y</Content></SIPHeader></SPT>`),
 		"SessionDescription no Line":    trigger(`<SPT><Group>0</Group><SessionDescription><Content>x</Content></SessionDescription></SPT>`),
+		"three RegistrationTypes":       trigger(`<SPT><Group>0</Group><Method>REGISTER</Method><Extension><RegistrationType>0</RegistrationType><RegistrationType>1</RegistrationType><RegistrationType>2</RegistrationType></Extension></SPT>`),
 		"RegistrationType 3":            trigger(`<SPT><Group>0</Group><Method>REGISTER</Method><Extension><RegistrationType>3</RegistrationType></Extension></SPT>`),
 		"ConditionNegated maybe":        trigger(`<SPT><ConditionNegated>maybe</ConditionNegated><Group>0</Group><Method>A</Method></SPT>`),
 	}
@@ -446,6 +447,7 @@ func TestMarshalRefusesWhatTheParserWouldRefuse(t *testing.T) {
 		"SPT without condition":    func(s *Subscription) { spt(s).Condition = nil },
 		"SessionCase 9":            func(s *Subscription) { spt(s).Condition = SessionCase(9) },
 		"RegistrationType 4":       func(s *Subscription) { spt(s).RegistrationTypes = []RegistrationType{4} },
+		"three RegistrationTypes":  func(s *Subscription) { spt(s).RegistrationTypes = []RegistrationType{0, 1, 2} },
 		"header with a NUL":        func(s *Subscription) { spt(s).Condition = SIPHeader{Header: "a\x00"} },
 		"SDP content with a NUL":   func(s *Subscription) { spt(s).Condition = SessionDescription{Line: "m", Content: "\x00"} },
 		"RequestURI with a NUL":    func(s *Subscription) { spt(s).Condition = RequestURI("\x00") },
@@ -459,5 +461,20 @@ func TestMarshalRefusesWhatTheParserWouldRefuse(t *testing.T) {
 				t.Errorf("err = %v, want ErrMalformed", err)
 			}
 		})
+	}
+}
+
+func TestMarshalRefusesASubscriptionLargerThanTheParserAccepts(t *testing.T) {
+	s := &Subscription{PrivateID: impi, ServiceProfiles: []ServiceProfile{{PublicIdentities: []PublicIdentity{{Identity: impu}}}}}
+	for i := range 2000 {
+		s.ServiceProfiles[0].InitialFilterCriteria = append(s.ServiceProfiles[0].InitialFilterCriteria, FilterCriteria{
+			Priority:          i,
+			TriggerPoint:      &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: Method("MESSAGE")}}},
+			ApplicationServer: ApplicationServer{ServerName: rcsAS},
+		})
+	}
+	out, err := s.Marshal()
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("Marshal = %d bytes, %v; want ErrTooLarge", len(out), err)
 	}
 }
