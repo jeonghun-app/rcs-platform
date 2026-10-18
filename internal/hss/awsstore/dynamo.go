@@ -171,14 +171,22 @@ func raced(err error) bool {
 // requestToken makes a transaction idempotent (DynamoDB keeps the token for
 // ten minutes): when the SDK resends one whose response was lost, DynamoDB
 // answers the first outcome instead of failing its own conditions.
-func (d *Dynamo) requestToken() *string { return aws.String(d.token()) }
+func (d *Dynamo) requestToken() *string {
+	if t := d.token(); t != "" {
+		return aws.String(t)
+	}
+	return nil // not idempotent, but still conditional
+}
 
-// token is 128 random bits in hex. Without randomness it is a fixed string,
-// which leaves writes conditional but makes lost responses conflicts.
+// token is 128 random bits in hex, or "" when no randomness is available.
+// An empty writer token never matches in conflictOrGone, so a write whose
+// answer was lost then counts as a conflict and is retried from a fresh
+// read; a fixed fallback value would instead let two writers each take the
+// other's write for its own and both succeed.
 func (d *Dynamo) token() string {
 	b := make([]byte, 16)
 	if _, err := io.ReadFull(d.rand, b); err != nil {
-		return "unset"
+		return ""
 	}
 	return hex.EncodeToString(b)
 }

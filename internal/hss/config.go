@@ -2,7 +2,6 @@ package hss
 
 import (
 	"encoding/base64"
-	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"net"
 	"net/netip"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 

@@ -157,6 +157,11 @@ func TestDecodeStrictRefusesRepeatedKeys(t *testing.T) {
 		"repeated in nested":    {`{"b":{"x":1,"x":2}}`, false},
 		"repeated in array obj": {`{"c":[{"d":1,"d":2}]}`, false},
 		"repeated after nested": {`{"b":{"x":1},"a":true,"b":{}}`, false},
+		"case variant of a key": {`{"a":false,"A":true}`, false},
+		"case variant alone":    {`{"A":true}`, false},
+		"folded variant":        {`{"c":[{"d":1}],"\u017f":1}`, false},
+		"case variant in array": {`{"c":[{"D":1}]}`, false},
+		"map keys are data":     {`{"b":{"X":1,"x":2}}`, true},
 	} {
 		var v doc
 		err := DecodeStrict([]byte(c.in), &v)

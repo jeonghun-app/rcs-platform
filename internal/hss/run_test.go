@@ -282,12 +282,25 @@ func TestRunRefusesToReplaceALostDataKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, _, cancel, done := startRun(t, cfg, d)
-	defer func() { cancel(); <-done }()
 	if keys, _ := backend.DataKeys(ctx); len(keys) != 1 {
+		cancel()
+		<-done
 		t.Fatalf("keys after bootstrap = %d", len(keys))
 	}
 	if n, _ := h.Metric("keyring.created"); n != 1 {
 		t.Errorf("keyring.created = %v", n)
+	}
+	const leftSet = "HSS_KEYRING_BOOTSTRAP is set although a data key exists; remove it"
+	if len(h.Logs(leftSet)) != 0 {
+		t.Error("warned about the flag on the start that used it")
+	}
+	cancel()
+	<-done
+	// A later start with the flag still set warns.
+	h2, _, cancel2, done2 := startRun(t, cfg, d)
+	defer func() { cancel2(); <-done2 }()
+	if len(h2.Logs(leftSet)) != 1 {
+		t.Error("no warning while HSS_KEYRING_BOOTSTRAP stays set")
 	}
 }
 

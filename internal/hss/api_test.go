@@ -881,3 +881,13 @@ func TestAuditSlotFollowsTheTokenVariable(t *testing.T) {
 		t.Errorf("audit = %v", last)
 	}
 }
+
+func TestDecodeStrictRefusesKeysThatDifferOnlyInCase(t *testing.T) {
+	a := newAPIEnv(t)
+	for _, variant := range []string{"ACS_MANAGED", "ac\u017f_managed", "acſ_managed"} {
+		body := `{"impi":"` + impi1 + `","public_identities":[{"impu":"` + impu1 + `"}],"acs_managed":false,"` + variant + `":true}`
+		if code, resp, _ := a.do("POST", "/v1/subscriptions", adminToken, body); code != http.StatusBadRequest {
+			t.Fatalf("variant %q = %d, acs_managed %v; want 400", variant, code, resp["acs_managed"])
+		}
+	}
+}

@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 )
@@ -324,7 +326,91 @@ func DecodeStrict(data []byte, v any) error {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("data after the JSON value")
 	}
+	return exactKeys(data, reflect.TypeOf(v))
+}
+
+// exactKeys fails on an object key that is not spelled exactly as the field
+// it fills: encoding/json matches field names without regard to case,
+// Unicode folding included (ſ for s, K for k), so {"acs_managed":false,
+// "ACS_MANAGED":true} has no repeated key and yet sets acs_managed to true.
+// Only the API's own spelling is accepted. data has already decoded into t.
+func exactKeys(data []byte, t reflect.Type) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(data, &obj) != nil {
+			return nil // null, which decoded as the zero value
+		}
+		fields := map[string]reflect.Type{}
+		structFields(t, fields)
+		for name, raw := range obj {
+			ft, ok := fields[name]
+			if !ok {
+				return errors.New("a field name is not spelled as the API defines it")
+			}
+			if err := exactKeys(raw, ft); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		if t.Elem().Kind() == reflect.Uint8 {
+			return nil // bytes: a base64 string or an array of numbers
+		}
+		var items []json.RawMessage
+		if json.Unmarshal(data, &items) != nil {
+			return nil
+		}
+		for _, raw := range items {
+			if err := exactKeys(raw, t.Elem()); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		// Keys of a map are data, not field names.
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(data, &obj) != nil {
+			return nil
+		}
+		for _, raw := range obj {
+			if err := exactKeys(raw, t.Elem()); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+// structFields collects the JSON names of t's fields, those of embedded
+// structs included, as encoding/json does.
+func structFields(t reflect.Type, out map[string]reflect.Type) {
+	for i := range t.NumField() {
+		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if f.Anonymous && name == "" {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				structFields(ft, out)
+				continue
+			}
+		}
+		if !f.IsExported() {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		out[name] = f.Type
+	}
 }
 
 // noDuplicateKeys walks the tokens of data and fails on an object key that

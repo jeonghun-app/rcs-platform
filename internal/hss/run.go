@@ -234,9 +234,11 @@ func openStore(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (st
 	if err != nil {
 		return nil, nil, err
 	}
+	created := false
 	keys, err := keyring.Open(ctx, wrapper, dyn, keyring.OpenOptions{
 		Rand: d.rand, Create: cfg.KeyringBootstrap || !hasSubs,
 		Created: func(id string) {
+			created = true
 			rt.Metrics.Count("keyring.created", 1)
 			rt.Logger.Warn("created the first data key of the subscriber secrets", slog.String("key_id", id),
 				slog.Bool("bootstrap_flag", cfg.KeyringBootstrap))
@@ -248,6 +250,11 @@ func openStore(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (st
 	}
 	if err != nil {
 		return nil, nil, err
+	}
+	if cfg.KeyringBootstrap && !created {
+		// Left set, the flag would let a later loss of the keyring item
+		// pass unnoticed: say so at every start until it is removed.
+		rt.Logger.Warn("HSS_KEYRING_BOOTSTRAP is set although a data key exists; remove it")
 	}
 	return dyn, keys, nil
 }
