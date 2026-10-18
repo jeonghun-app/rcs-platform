@@ -63,7 +63,8 @@ One subscription per private identity (IMPI). It holds:
   TS 29.228 §6.5) and its registration state, `NOT_REGISTERED`, `REGISTERED` or
   `UNREGISTERED`;
 - AKA credentials: K, OPc (OP is accepted and turned into OPc, never stored),
-  AMF and SQN;
+  AMF (default `0000`: the separation bit of TS 33.102 Annex H is for EPS
+  and 5GS, not IMS AKA) and SQN;
 - Digest credentials: the HA1 of a password per realm, for MD5 and SHA-256;
 - the ID of its service profile, shared by reference;
 - charging information;

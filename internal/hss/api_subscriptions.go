@@ -348,9 +348,12 @@ type akaRequest struct {
 	SQN string `json:"sqn,omitempty"`
 }
 
-// defaultAMF has the AMF separation bit clear and the other bits zero, the
-// usual value for IMS (TS 33.102 Annex H leaves the rest to the operator).
-var defaultAMF = [2]byte{0x80, 0x00}
+// defaultAMF is all zero. Bit 0, the most significant, is the AMF
+// separation bit, which only EPS and 5GS authentication use (TS 33.102
+// Annex H, TS 33.401, TS 33.501), not IMS AKA; bits 1 to 7 are reserved and
+// zero; bits 8 to 15 are the operator's, and none is used here. An operator
+// whose cards expect another AMF provisions it.
+var defaultAMF = [2]byte{0x00, 0x00}
 
 func hexField(name, v string, n int) ([]byte, error) {
 	b, err := hex.DecodeString(v)

@@ -471,7 +471,14 @@ components:
         k: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
         opc: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
         op: { type: string, pattern: "^[0-9a-fA-F]{32}$", description: Turned into OPc (TS 35.206 §4) and not stored. }
-        amf: { type: string, pattern: "^[0-9a-fA-F]{4}$", default: "8000" }
+        amf:
+          type: string
+          pattern: "^[0-9a-fA-F]{4}$"
+          default: "0000"
+          description: |
+            AMF, 4 hex digits. The default leaves the separation bit (bit 0,
+            used only by EPS and 5GS, TS 33.102 Annex H) and every other bit
+            clear.
         sqn:
           type: string
           pattern: "^[0-9a-fA-F]{12}$"
