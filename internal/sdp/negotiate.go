@@ -66,7 +66,7 @@ func (e *MSRPEndpoint) validate() error {
 func NewAnswer(offer *Session, origin Origin, conn Connection) *Session {
 	ans := &Session{Origin: origin, Name: "-", Connection: &conn}
 	for _, t := range offer.Times {
-		ans.Times = append(ans.Times, Time{Start: t.Start, Stop: t.Stop, Repeats: slices.Clone(t.Repeats)})
+		ans.Times = append(ans.Times, Time{Start: t.Start, Stop: t.Stop, Repeats: slices.Clone(t.Repeats), Zones: t.Zones})
 	}
 	ans.Media = make([]Media, len(offer.Media))
 	for i := range offer.Media {

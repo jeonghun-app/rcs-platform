@@ -50,9 +50,13 @@ func (s *Session) Validate() error {
 				return fmt.Errorf("sdp: r=: %w", err)
 			}
 		}
-	}
-	if s.TimeZones != "" {
-		if err := validateZones(s.TimeZones); err != nil {
+		if t.Zones == "" {
+			continue
+		}
+		if len(t.Repeats) == 0 {
+			return errors.New(`sdp: z=: a time description needs an "r=" line before its "z=" line`)
+		}
+		if err := validateZones(t.Zones); err != nil {
 			return fmt.Errorf("sdp: z=: %w", err)
 		}
 	}
@@ -153,8 +157,8 @@ func (s *Session) Marshal() ([]byte, error) {
 		for _, r := range t.Repeats {
 			line('r', r)
 		}
+		optional('z', t.Zones)
 	}
-	optional('z', s.TimeZones)
 	optional('k', s.Key)
 	for _, a := range s.Attributes {
 		line('a', a.String())

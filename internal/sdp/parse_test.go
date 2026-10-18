@@ -60,10 +60,9 @@ func TestEveryLineTypeIsParsedIntoItsField(t *testing.T) {
 		Connection:  &Connection{"IN", "IP6", "2001:db8::10"},
 		Bandwidths:  []Bandwidth{{"CT", 384}},
 		Times: []Time{
-			{Start: 3913000000, Stop: 3913003600, Repeats: []string{"7d 1h 0 25h"}},
+			{Start: 3913000000, Stop: 3913003600, Repeats: []string{"7d 1h 0 25h"}, Zones: "3913000000 -1h 3920000000 0"},
 			{Start: 0, Stop: 0},
 		},
-		TimeZones:  "3913000000 -1h 3920000000 0",
 		Key:        "prompt",
 		Attributes: Attributes{{Name: "recvonly"}, {Name: "tool", Value: "example-client 1.0"}},
 		Media: []Media{
@@ -181,9 +180,12 @@ func TestMalformedDescriptionsAreRejectedWithTheLine(t *testing.T) {
 		{"second session c=", head + "c=IN IP4 192.0.2.2\r\n", 6, `"c=" line must come before the "t=" line`},
 		{"two session c= lines", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\nc=IN IP4 x\r\nc=IN IP4 y\r\n", 5, `more than one "c=" line`},
 		{"second s=", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\ns=-\r\n", 4, `more than one "s=" line`},
-		{"second z=", head + "z=0 0\r\nz=0 0\r\n", 7, `more than one "z=" line`},
+		{"z= without r=", head + "z=0 0\r\n", 6, `"z=" line must follow the "r=" lines`},
+		{"second z= in a time description", head + "r=1d 1h 0\r\nz=0 0\r\nz=0 0\r\n", 8, `"z=" line must follow the "r=" lines`},
+		{"z= after all time descriptions", head + "r=1d 1h 0\r\nt=0 0\r\nz=0 0\r\n", 8, `"z=" line must follow the "r=" lines`},
+		{"z= after k=", head + "r=1d 1h 0\r\nk=prompt\r\nz=0 0\r\n", 8, `"z=" line must follow the "r=" lines`},
 		{"r= without t=", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\nr=1d 1h 0\r\n", 4, `"r=" line must follow a "t=" or "r=" line`},
-		{"r= after z=", head + "z=0 0\r\nr=1d 1h 0\r\n", 7, `"r=" line must follow`},
+		{"r= after z=", head + "r=1d 1h 0\r\nz=0 0\r\nr=1d 1h 0\r\n", 8, `"r=" line must follow`},
 		{"t= after a=", head + "a=x\r\nt=0 0\r\n", 7, `"t=" line must come before the "a=" line`},
 		{"missing t= before media", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\nc=IN IP4 x\r\n" + msrp, 5, `missing "t=" line`},
 		{"missing t= at the end", "v=0\r\no=- 1 1 IN IP4 x\r\ns=-\r\n", 4, `missing "t=" line`},
@@ -218,8 +220,8 @@ func TestMalformedDescriptionsAreRejectedWithTheLine(t *testing.T) {
 		{"r= with two fields", head + "r=1d 1h\r\n", 6, "r=: want <repeat-interval>"},
 		{"r= with zero interval", head + "r=0 1h 0\r\n", 6, "r=: repeat interval must be positive"},
 		{"r= with an unknown unit", head + "r=1w 1h 0\r\n", 6, "r=: times must be digits"},
-		{"z= with an odd field count", head + "z=0\r\n", 6, "z=: want pairs"},
-		{"z= offset not a time", head + "z=0 -x\r\n", 6, "z=: want pairs"},
+		{"z= with an odd field count", head + "r=1d 1h 0\r\nz=0\r\n", 7, "z=: want pairs"},
+		{"z= offset not a time", head + "r=1d 1h 0\r\nz=0 -x\r\n", 7, "z=: want pairs"},
 		{"empty session k=", head + "k=\r\n", 6, "k=: value must not be empty"},
 		{"a= with empty value", head + "a=path:\r\n", 6, "a=: attribute value after ':' must not be empty"},
 		{"a= with empty name", head + "a=:x\r\n", 6, "a=: attribute name must be a token"},
@@ -297,5 +299,19 @@ func TestEmptySessionNameIsReadAsDashAndWrittenStrictly(t *testing.T) {
 	}
 	if s := mustParse(t, strings.Replace(head, "s=-", "s= ", 1)); s.Name != " " {
 		t.Errorf("a single-space name became %q", s.Name)
+	}
+}
+
+func TestEachTimeDescriptionMayCarryItsOwnZoneLine(t *testing.T) {
+	sdp := crlf("v=0", "o=- 1 1 IN IP4 192.0.2.1", "s=-", "c=IN IP4 192.0.2.1",
+		"t=3913000000 3913003600", "r=7d 1h 0", "z=3913000000 -1h",
+		"t=3920000000 3920003600", "r=7d 1h 0", "z=3920000000 0",
+		"a=recvonly")
+	s := mustParse(t, sdp)
+	if len(s.Times) != 2 || s.Times[0].Zones != "3913000000 -1h" || s.Times[1].Zones != "3920000000 0" {
+		t.Errorf("Times = %+v", s.Times)
+	}
+	if got := mustMarshal(t, s); got != sdp {
+		t.Errorf("got %q, want %q", got, sdp)
 	}
 }

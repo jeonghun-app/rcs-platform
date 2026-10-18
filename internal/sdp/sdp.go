@@ -15,8 +15,7 @@ type Session struct {
 	Phones      []string    // p=
 	Connection  *Connection // c=; may be nil when every media description has its own
 	Bandwidths  []Bandwidth // b=
-	Times       []Time      // t= with its r= lines; at least one
-	TimeZones   string      // z=, kept as written
+	Times       []Time      // t= with its r= and z= lines; at least one
 	Key         string      // k=, obsolete (RFC 8866 §5.12) but preserved
 	Attributes  Attributes  // session-level a=, in wire order
 	Media       []Media     // m= sections, in wire order
@@ -48,13 +47,20 @@ type Bandwidth struct {
 	Value uint64
 }
 
-// Time is a t= line and the r= lines that follow it. Start and Stop are NTP
-// seconds, 0 meaning unbounded (RFC 8866 §5.9). Repeat lines are kept as
-// written once their syntax has been checked.
+// Time is a time description: a t= line, the r= lines that follow it and an
+// optional z= line after them. Start and Stop are NTP seconds, 0 meaning
+// unbounded (RFC 8866 §5.9). Repeat and zone lines are kept as written once
+// their syntax has been checked.
+//
+// RFC 8866 §9 puts z= inside the time description and only after an r=
+// line (repeat-description = 1*repeat-field [zone-field]). RFC 4566 had one
+// z= per session after all the t= lines; such a description, or a z= with no
+// r= before it, is rejected.
 type Time struct {
 	Start   uint64
 	Stop    uint64
 	Repeats []string
+	Zones   string // z=; requires at least one repeat
 }
 
 // Media is one media description: an m= line and the lines up to the next m=.

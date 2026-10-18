@@ -82,16 +82,17 @@ func nextLine(data []byte) (line, rest []byte) {
 	return line, rest
 }
 
-// The line types RFC 8866 §5 defines, in the order they appear in a session
-// section and in a media section. A line may follow only lines of the same
-// or an earlier position; the r= line shares the position of t= because the
-// two interleave.
+// The line types RFC 8866 §5 defines, in the order the §9 grammar puts them
+// in a session section and in a media section. A line may follow only lines
+// of the same or an earlier position. r= and z= are part of a time
+// description, so they share the position of t= and are checked against the
+// line just before them instead: r= follows t= or r=, and z= follows r=.
 const (
 	knownTypes   = "vosiuepcbtrzkam"
-	sessionOrder = "vosiuepcbtzka"
+	sessionOrder = "vosiuepcbtka"
 	mediaOrder   = "micbka"
 	// Line types that may appear more than once in their section.
-	sessionRepeatable = "epbtra"
+	sessionRepeatable = "epbtrza"
 	mediaRepeatable   = "cba"
 )
 
@@ -151,9 +152,15 @@ func (st *state) add(line []byte) error {
 // order checks that typ may follow the lines already seen in the section.
 func (st *state) order(typ byte, order, repeatable string) error {
 	pos := strings.IndexByte(order, typ)
-	if typ == 'r' {
+	switch typ {
+	case 'r':
 		if st.prev != 't' && st.prev != 'r' {
 			return st.errf(`"r=" line must follow a "t=" or "r=" line`)
+		}
+		pos = strings.IndexByte(order, 't')
+	case 'z':
+		if st.prev != 'r' {
+			return st.errf(`"z=" line must follow the "r=" lines of its time description (RFC 8866 §9)`)
 		}
 		pos = strings.IndexByte(order, 't')
 	}
@@ -164,7 +171,7 @@ func (st *state) order(typ byte, order, repeatable string) error {
 		return st.errf("more than one %q line", string(typ)+"=")
 	}
 	st.seen[typ-'a'] = true
-	if typ != 'r' {
+	if typ != 'r' && typ != 'z' {
 		st.last = typ
 	}
 	return nil
@@ -215,7 +222,8 @@ func (st *state) addSession(typ byte, v string) error {
 		t := &s.Times[len(s.Times)-1]
 		t.Repeats, err = append(t.Repeats, v), validateRepeat(v)
 	case 'z':
-		s.TimeZones, err = v, validateZones(v)
+		t := &s.Times[len(s.Times)-1]
+		t.Zones, err = v, validateZones(v)
 	case 'k':
 		s.Key, err = v, textErr(v)
 	case 'a':
