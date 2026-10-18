@@ -335,3 +335,130 @@ func TestSweepReportsItsDuration(t *testing.T) {
 		t.Fatal("no sweep.duration")
 	}
 }
+
+// slowBlobs serve objects in small reads, moving the wall clock on by step
+// before each, like a reader on the other end taking its time.
+type slowBlobs struct {
+	store.Blobs
+	now  *time.Time
+	step time.Duration
+}
+
+func (s slowBlobs) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	rc, err := s.Blobs.Open(ctx, key, off, n)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(&clockedReader{r: rc, step: s.step, now: s.now, chunk: 100}), nil
+}
+
+func TestDownloadSlowerThanTheMinimumRateIsCutOff(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.MinDownloadRate = 100 })
+	file, _ := uploaded(t, e, pattern(4*testPart))
+	wall := time.Unix(1_800_000_000, 0)
+	e.srv.wallNow = func() time.Time { return wall }
+	// 100 bytes every second is fast enough ...
+	e.srv.o.Blobs = slowBlobs{Blobs: e.blobs, now: &wall, step: time.Second}
+	if rec := get(e, file); rec.Code != http.StatusOK || rec.Body.Len() != 4*testPart || e.metric("download.served") != 1 {
+		t.Fatalf("download at a good rate = %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	// ... 100 bytes every ten seconds is not: the first minute falls short
+	// and the response is cut.
+	e.srv.o.Blobs = slowBlobs{Blobs: e.blobs, now: &wall, step: 10 * time.Second}
+	rec := get(e, file)
+	if rec.Body.Len() >= 4*testPart || e.metric("download.failed.too_slow") != 1 {
+		t.Fatalf("slow download delivered %d bytes, too_slow %v", rec.Body.Len(), e.metric("download.failed.too_slow"))
+	}
+}
+
+// heldBlobs block every read of an opened object until released.
+type heldBlobs struct {
+	store.Blobs
+	opened  chan struct{}
+	release chan struct{}
+}
+
+func (h heldBlobs) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	rc, err := h.Blobs.Open(ctx, key, off, n)
+	if err != nil {
+		return nil, err
+	}
+	h.opened <- struct{}{}
+	<-h.release
+	return rc, nil
+}
+
+func TestOneLinkCannotHoldEveryDownloadSlot(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.MaxDownloadsPerFile = 2 })
+	file, _ := uploaded(t, e, "first file")
+	other := downloadTarget(t, fileOf(t, e.user(bob).uploadFile("other", "second file")).Data.URL)
+	held := heldBlobs{Blobs: e.blobs, opened: make(chan struct{}, 4), release: make(chan struct{})}
+	e.srv.o.Blobs = held
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() { get(e, file) })
+		<-held.opened
+	}
+	if rec := get(e, file); rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" || e.metric("download.failed.file_busy") != 1 {
+		t.Fatalf("third download of one link = %d", rec.Code)
+	}
+	// Another file is not affected.
+	done := make(chan int, 1)
+	go func() { done <- get(e, other).Code }()
+	<-held.opened
+	close(held.release)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("download of another file = %d", code)
+	}
+	wg.Wait()
+}
+
+// flakyFinalUpdate fails the first update that completes a record, like a
+// throttled table after the SDK's own retries.
+type flakyFinalUpdate struct {
+	store.Metadata
+	failed atomic.Bool
+}
+
+func (f *flakyFinalUpdate) Update(ctx context.Context, r store.Record) (store.Record, error) {
+	if r.State == store.Complete && f.failed.CompareAndSwap(false, true) {
+		return store.Record{}, errors.New("ProvisionedThroughputExceededException")
+	}
+	return f.Metadata.Update(ctx, r)
+}
+
+func TestTransientFailureOfTheCompletingUpdateIsRetried(t *testing.T) {
+	meta := &flakyFinalUpdate{Metadata: store.NewMemory()}
+	e := newEnv(t, func(o *Options) { o.Metadata = meta })
+	e.srv.retryWait = func(int) time.Duration { return 0 }
+	u := e.user(alice)
+	data := pattern(3*testPart + 5)
+	doc := u.uploadFile("commit", data)
+	if got := get(e, downloadTarget(t, fileOf(t, doc).Data.URL)).Body.String(); got != data {
+		t.Fatal("the retried completion stored other content")
+	}
+	if !meta.failed.Load() || e.metric("upload.commit_retried") != 1 {
+		t.Fatalf("commit_retried = %v", e.metric("upload.commit_retried"))
+	}
+}
+
+func TestCompletingUpdateStopsRetryingOnAConflict(t *testing.T) {
+	e := newEnv(t)
+	e.srv.retryWait = func(int) time.Duration { return 0 }
+	rec, err := e.meta.Create(t.Context(), store.Record{
+		ID: strings.Repeat("C", idLength), Owner: alice, TID: "conflict", State: store.Uploading, DeclaredSize: -1,
+		Expires: e.clock.Now().Add(time.Hour), Lease: "x", LeaseUntil: e.clock.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.meta.Update(t.Context(), rec); err != nil { // someone else moved the version on
+		t.Fatal(err)
+	}
+	w, _ := e.srv.newWriter(rec)
+	defer w.close()
+	_ = w.copy(t.Context(), strings.NewReader("x"))
+	if _, err := w.complete(t.Context()); !errors.Is(err, errLostLease) || e.metric("upload.commit_retried") != 0 {
+		t.Fatalf("complete = %v, retried %v", err, e.metric("upload.commit_retried"))
+	}
+}

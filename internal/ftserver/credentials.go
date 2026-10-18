@@ -17,6 +17,14 @@ import (
 // ErrUnknownUser means a credential source has no FT credential for the user.
 var ErrUnknownUser = errors.New("ftserver: no FT credential for the user")
 
+// ErrBadCredentialRecord means the source answered but the user's credential
+// cannot be used: a record for another realm or algorithm, without an IMPU or
+// with a malformed HA1. It is a fault of that one subscriber's record, not of
+// the source, so the client gets the same 401 as for an unknown user (a 503
+// would tell such users apart) while the operator gets a metric and a log
+// line.
+var ErrBadCredentialRecord = errors.New("ftserver: the user's FT credential record is unusable")
+
 // Credential is what a CredentialSource knows about one Digest user.
 type Credential struct {
 	// Secret verifies the user's Digest response.
@@ -31,8 +39,9 @@ type Credential struct {
 // ft-server never learns more than a Secret: a source returns a password or
 // an HA1 computed for alg. Implementations are safe for concurrent use.
 type CredentialSource interface {
-	// Lookup returns username's credential for alg, or an error wrapping
-	// ErrUnknownUser. Every error is answered with the same 401.
+	// Lookup returns username's credential for alg. An error wrapping
+	// ErrUnknownUser or ErrBadCredentialRecord is answered with the uniform
+	// 401; any other error is a failure of the source and gets 503.
 	Lookup(ctx context.Context, username string, alg digest.Algorithm) (Credential, error)
 }
 
@@ -139,7 +148,7 @@ func (h *HSSCredentials) Lookup(ctx context.Context, username string, alg digest
 	case err != nil:
 		return Credential{}, fmt.Errorf("ftserver: hss: reading the response: %w", err)
 	case len(body) > maxHSSResponse:
-		return Credential{}, errors.New("ftserver: hss response too large")
+		return Credential{}, fmt.Errorf("%w: hss response too large", ErrBadCredentialRecord)
 	}
 	return parseHSSCredential(body, username, h.realm, alg)
 }
@@ -168,21 +177,21 @@ func (h *HSSCredentials) credentialURL(impi string, alg digest.Algorithm) string
 func parseHSSCredential(body []byte, impi, realm string, alg digest.Algorithm) (Credential, error) {
 	var c hssCredential
 	if err := json.Unmarshal(body, &c); err != nil {
-		return Credential{}, errors.New("ftserver: hss response is not an ft-credential")
+		return Credential{}, fmt.Errorf("%w: hss response is not an ft-credential", ErrBadCredentialRecord)
 	}
 	switch {
 	case c.IMPI != impi:
 		return Credential{}, fmt.Errorf("%w: the hss answered for another impi", ErrUnknownUser)
 	case c.Realm != realm:
-		return Credential{}, errors.New("ftserver: hss credential is for another realm")
+		return Credential{}, fmt.Errorf("%w: credential for another realm", ErrBadCredentialRecord)
 	case !strings.EqualFold(c.Algorithm, string(alg)):
-		return Credential{}, errors.New("ftserver: hss credential is for another algorithm")
+		return Credential{}, fmt.Errorf("%w: credential for another algorithm", ErrBadCredentialRecord)
 	case c.IMPU == "":
-		return Credential{}, errors.New("ftserver: hss credential names no public identity")
+		return Credential{}, fmt.Errorf("%w: credential names no public identity", ErrBadCredentialRecord)
 	}
 	s, err := digest.HA1(alg, c.HA1)
 	if err != nil {
-		return Credential{}, fmt.Errorf("ftserver: hss credential: %w", err)
+		return Credential{}, fmt.Errorf("%w: %w", ErrBadCredentialRecord, err)
 	}
 	return Credential{Secret: s, Owner: c.IMPU}, nil
 }

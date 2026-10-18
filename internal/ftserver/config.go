@@ -25,6 +25,8 @@ const (
 	DefaultMaxDownloads         = 256
 	DefaultMaxLookups           = 16
 	DefaultMinUploadRate        = 1024 // bytes per second
+	DefaultMinDownloadRate      = 1024 // bytes per second
+	DefaultMaxDownloadsPerFile  = 4
 	DefaultDrainTimeout         = 10 * time.Second
 	DefaultIdleTimeout          = 30 * time.Second
 	DefaultUploadTimeout        = 30 * time.Minute
@@ -73,6 +75,8 @@ type Config struct {
 	MaxDownloads         int
 	MaxLookups           int
 	MinUploadRate        int64
+	MinDownloadRate      int64
+	MaxDownloadsPerFile  int
 	IdleTimeout          time.Duration
 	UploadTimeout        time.Duration
 	StorageTimeout       time.Duration
@@ -118,6 +122,8 @@ func Configure(s *runtime.Settings) Config {
 		MaxDownloads:         e.Int("MAX_CONCURRENT_DOWNLOADS", DefaultMaxDownloads),
 		MaxLookups:           e.Int("MAX_CONCURRENT_LOOKUPS", DefaultMaxLookups),
 		MinUploadRate:        int64(e.Int("MIN_UPLOAD_RATE", DefaultMinUploadRate)),
+		MinDownloadRate:      int64(e.Int("MIN_DOWNLOAD_RATE", DefaultMinDownloadRate)),
+		MaxDownloadsPerFile:  e.Int("MAX_DOWNLOADS_PER_FILE", DefaultMaxDownloadsPerFile),
 		IdleTimeout:          e.Duration("IDLE_TIMEOUT", DefaultIdleTimeout),
 		UploadTimeout:        e.Duration("UPLOAD_TIMEOUT", DefaultUploadTimeout),
 		StorageTimeout:       e.Duration("STORAGE_TIMEOUT", DefaultStorageTimeout),
@@ -177,6 +183,11 @@ func Configure(s *runtime.Settings) Config {
 		if c.HSSToken.v == "" {
 			e.Invalid("HSS_TOKEN", "required with FT_CREDENTIALS=hss")
 		}
+		// ADR 0007 §4: service tokens carry at least 256 bits. The length of
+		// 32 random bytes in base64 (43 characters) is the shortest encoded
+		// form; a shorter token cannot hold that much.
+		s.ForbidInProduction(c.HSSToken.v != "" && len(c.HSSToken.v) < minTokenLength,
+			"FT_HSS_TOKEN is shorter than "+strconv.Itoa(minTokenLength)+" characters (ADR 0007: at least 256 random bits, e.g. 32 bytes in base64)")
 		// ADR 0007: plain http to an internal API only for a private host
 		// (an RFC 1918 or ULA address, or a name in the Cloud Map
 		// namespace), always with the service's own bearer token.
@@ -242,6 +253,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"MAX_CONCURRENT_UPLOADS", c.MaxConcurrentUploads}, {"MAX_UPLOADS_PER_USER", c.MaxUploadsPerUser},
 		{"MAX_CONCURRENT_DOWNLOADS", c.MaxDownloads}, {"MAX_CONCURRENT_LOOKUPS", c.MaxLookups},
+		{"MAX_DOWNLOADS_PER_FILE", c.MaxDownloadsPerFile},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")
@@ -249,6 +261,9 @@ func Configure(s *runtime.Settings) Config {
 	}
 	if c.MinUploadRate < 0 {
 		e.Invalid("MIN_UPLOAD_RATE", "must not be negative")
+	}
+	if c.MinDownloadRate < 0 {
+		e.Invalid("MIN_DOWNLOAD_RATE", "must not be negative")
 	}
 	return c
 }
@@ -282,6 +297,9 @@ func absoluteURL(e *runtime.Env, name string, required bool) *url.URL {
 	}
 	return u
 }
+
+// minTokenLength is the shortest FT_HSS_TOKEN accepted in staging and prod.
+const minTokenLength = 43
 
 // privateHost reports whether host is a private address (RFC 1918, or an
 // IPv6 unique local address) or a name inside the Cloud Map namespace

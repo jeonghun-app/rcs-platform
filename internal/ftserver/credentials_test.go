@@ -131,6 +131,11 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 		if err == nil || errors.Is(err, ErrUnknownUser) != c.unknown {
 			t.Errorf("%s: %v", name, err)
 		}
+		// A 200 that cannot be used is the subscriber's record at fault (a
+		// 401 for the client); any other status is the HSS (a 503).
+		if record := c.status == 200 && !c.unknown; errors.Is(err, ErrBadCredentialRecord) != record {
+			t.Errorf("%s: %v, want an unusable-record error: %v", name, err, record)
+		}
 		if err != nil && strings.Contains(err.Error(), "001010000000001") {
 			t.Errorf("%s: the error names the IMPI: %v", name, err)
 		}

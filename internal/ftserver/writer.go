@@ -64,7 +64,10 @@ func (s *Server) newWriter(rec store.Record) (*writer, error) {
 	}
 	buf := s.buffers.Get().(*[]byte)
 	*buf = (*buf)[:0]
-	return &writer{s: s, rec: rec, hash: h, buf: buf, total: rec.DeclaredSize, renewed: s.now()}, nil
+	// The lease was taken (or last renewed) leaseTTL before it ends, which
+	// may be well before now if a thumbnail was stored in between.
+	renewed := rec.LeaseUntil.Add(-s.leaseTTL)
+	return &writer{s: s, rec: rec, hash: h, buf: buf, total: rec.DeclaredSize, renewed: renewed}, nil
 }
 
 // close returns the part buffer. Call it once, last.
@@ -244,12 +247,41 @@ func (w *writer) complete(ctx context.Context) (store.Record, error) {
 	r.Lease, r.LeaseUntil = "", time.Time{}
 	r.Completed = now
 	r.Expires = now.Add(w.s.o.Validity)
-	rec, err := w.s.o.Metadata.Update(ctx, r)
+	rec, err := w.commit(ctx, r)
 	if err != nil {
 		return store.Record{}, metadataErr(err)
 	}
 	w.rec = rec
 	return rec, nil
+}
+
+// commitAttempts bounds the tries of the update that completes an upload.
+const commitAttempts = 4
+
+// commit writes the record that completes an upload. By then the content
+// is committed in storage and the multipart upload closed, so if this update
+// failed for good the upload could only start over; a transient failure (a
+// throttled table, a timed-out call) is therefore retried, with backoff. The
+// update is conditional on the version this writer holds, so a retry can
+// only ever write it once: a conflict ends the retries at once.
+func (w *writer) commit(ctx context.Context, r store.Record) (store.Record, error) {
+	var err error
+	for attempt := range commitAttempts {
+		if attempt > 0 {
+			select {
+			case <-time.After(w.s.retryWait(attempt)):
+			case <-ctx.Done():
+				return store.Record{}, err
+			}
+		}
+		var rec store.Record
+		rec, err = w.s.o.Metadata.Update(ctx, r)
+		if err == nil || errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+			return rec, err
+		}
+		w.s.metrics.Count("upload.commit_retried", 1)
+	}
+	return store.Record{}, err
 }
 
 // release gives up the lease after a request that did not complete, keeping

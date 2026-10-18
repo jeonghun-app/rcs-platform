@@ -78,9 +78,13 @@ type Options struct {
 	// MaxConcurrentLookups bounds credential lookups in progress on this
 	// task, so requests from the internet cannot load the HSS without limit.
 	MaxConcurrentLookups int
-	// MinUploadRate is the slowest an upload body may arrive, in bytes per
-	// second averaged over a minute; 0 disables the check.
-	MinUploadRate int64
+	// MaxDownloadsPerFile bounds downloads of one file in progress on this
+	// task: a recipient resuming a download needs one or two connections.
+	MaxDownloadsPerFile int
+	// MinUploadRate is the slowest an upload body may arrive and
+	// MinDownloadRate the slowest a download may be read, in bytes per
+	// second over each minute; 0 disables the check.
+	MinUploadRate, MinDownloadRate int64
 	// IdleTimeout ends a transfer that moves no byte for that long; zero
 	// disables connection deadlines (tests with a ResponseRecorder).
 	// UploadTimeout bounds one upload request end to end.
@@ -112,8 +116,11 @@ type Server struct {
 	downloads    chan struct{}
 	lookups      chan struct{}
 	perUser      *userSlots
-	writers      activity
-	buffers      sync.Pool
+	perFile      *userSlots
+	// retryWait is the pause before retry attempt n of a completing update.
+	retryWait func(attempt int) time.Duration
+	writers   activity
+	buffers   sync.Pool
 	// leaseTTL is how long a lease lasts without renewal: twice the longest
 	// a live writer can go without renewing (a read waiting IdleTimeout and
 	// a storage call taking StorageTimeout), so that it never lapses under
@@ -137,7 +144,8 @@ func New(o Options) (*Server, error) {
 	case o.Validity <= 0 || o.UploadTimeout <= 0 || o.StorageTimeout <= 0 || o.IdleTimeout < 0:
 		return nil, errors.New("ftserver: validity and timeouts must be positive")
 	case o.MaxConcurrentUploads <= 0 || o.MaxUploadsPerUser <= 0 || o.MaxConcurrentDownloads <= 0 ||
-		o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 || o.MinUploadRate < 0:
+		o.MaxDownloadsPerFile <= 0 || o.MaxConcurrentLookups <= 0 || o.UploadsPerMinute < 0 ||
+		o.MinUploadRate < 0 || o.MinDownloadRate < 0:
 		return nil, errors.New("ftserver: concurrency limits must be positive")
 	}
 	up, down := o.UploadURI.Path, o.DownloadURI.Path
@@ -166,7 +174,9 @@ func New(o Options) (*Server, error) {
 		downloads:    make(chan struct{}, o.MaxConcurrentDownloads),
 		lookups:      make(chan struct{}, o.MaxConcurrentLookups),
 		perUser:      &userSlots{max: o.MaxUploadsPerUser, n: map[string]int{}},
+		perFile:      &userSlots{max: o.MaxDownloadsPerFile, n: map[string]int{}},
 		leaseTTL:     2 * (o.IdleTimeout + o.StorageTimeout),
+		retryWait:    func(n int) time.Duration { return time.Duration(50<<n) * time.Millisecond },
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -289,8 +299,9 @@ var errLookupBusy = errors.New("ftserver: too many credential lookups in progres
 // authenticate verifies the request's Digest credentials (RFC 7616 via
 // internal/sip/digest). On failure it has answered.
 //
-// Every credential failure (no credentials, an unknown user, a wrong
-// password, a replay, a wrong uri) gets the same 401 with a fresh challenge,
+// Every credential failure (no credentials, an unknown user, an unusable
+// credential record, a wrong password, a replay, a wrong uri) gets the same
+// 401 with a fresh challenge,
 // stale=true only for a correct response with an expired nonce, so a client
 // cannot learn which user names exist. A failure of the credential backend
 // itself, or a task at its lookup limit, gets 503 with Retry-After instead:
@@ -329,6 +340,10 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 		s.metrics.Count("auth.lookup_busy", 1)
 		serviceUnavailable(w, time.Second)
 		return identity{}, false
+	case errors.Is(lookupErr, ErrBadCredentialRecord):
+		// Answered like an unknown user, below; only the operator learns.
+		s.metrics.Count("auth.bad_credential_record", 1)
+		s.log.Warn("credential record unusable", slog.String("error", pii.Redact(lookupErr.Error())))
 	case lookupErr != nil && !errors.Is(lookupErr, ErrUnknownUser):
 		s.metrics.Count("auth.backend_error", 1)
 		s.log.Warn("credential lookup failed", slog.String("error", pii.Redact(lookupErr.Error())))
@@ -382,7 +397,8 @@ func (s *Server) acquireUpload(owner string) (release func(), reason string) {
 	return func() { user(); task() }, ""
 }
 
-// userSlots counts uploads in progress per owner.
+// userSlots counts transfers in progress per key: uploads per owner,
+// downloads per file id.
 type userSlots struct {
 	max int
 	mu  sync.Mutex
@@ -428,12 +444,11 @@ func (s *Server) extendWrite(w http.ResponseWriter) {
 func (s *Server) bodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
 	now := s.wallNow()
 	d := &deadlineReader{
-		r:       r.Body,
-		now:     s.wallNow,
-		end:     now.Add(s.o.UploadTimeout),
-		idle:    s.o.IdleTimeout,
-		minRate: s.o.MinUploadRate,
-		window:  now,
+		r:    r.Body,
+		now:  s.wallNow,
+		end:  now.Add(s.o.UploadTimeout),
+		idle: s.o.IdleTimeout,
+		rate: newRateCheck(s.o.MinUploadRate, s.wallNow),
 	}
 	if s.o.IdleTimeout > 0 {
 		d.rc = http.NewResponseController(w)
@@ -441,24 +456,50 @@ func (s *Server) bodyReader(w http.ResponseWriter, r *http.Request) io.Reader {
 	return d
 }
 
-// Errors of a body that arrives too slowly; both are answered 408.
+// Errors of a transfer that moves too slowly; an upload gets 408 for
+// either.
 var (
 	errUploadTimeout = errors.New("ftserver: upload took longer than the upload timeout")
-	errTooSlow       = errors.New("ftserver: upload slower than the minimum rate")
+	errTooSlow       = errors.New("ftserver: transfer slower than the minimum rate")
 )
 
-// deadlineReader enforces bodyReader's limits. The minimum rate is what
-// stops a client from holding an upload slot for the whole UploadTimeout by
-// sending a byte just often enough to beat the idle deadline.
+// rateCheck enforces a minimum transfer rate, measured over each rateWindow.
+// It is what stops a client from holding a slot for hours by moving a byte
+// just often enough to beat the idle deadline.
+type rateCheck struct {
+	min    int64 // bytes per second; 0 disables the check
+	now    func() time.Time
+	window time.Time // start of the current window
+	bytes  int64     // moved in the current window
+}
+
+func newRateCheck(min int64, now func() time.Time) rateCheck {
+	return rateCheck{min: min, now: now, window: now()}
+}
+
+// check fails once a window has passed with fewer bytes than the rate asks
+// for, and otherwise starts the next window when one is over.
+func (r *rateCheck) check() error {
+	now := r.now()
+	if elapsed := now.Sub(r.window); elapsed >= rateWindow {
+		if r.min > 0 && float64(r.bytes) < float64(r.min)*elapsed.Seconds() {
+			return errTooSlow
+		}
+		r.window, r.bytes = now, 0
+	}
+	return nil
+}
+
+func (r *rateCheck) add(n int) { r.bytes += int64(n) }
+
+// deadlineReader enforces bodyReader's limits.
 type deadlineReader struct {
-	r       io.Reader
-	rc      *http.ResponseController
-	now     func() time.Time
-	end     time.Time
-	idle    time.Duration
-	minRate int64
-	window  time.Time // start of the current rate window
-	bytes   int64     // read in the current window
+	r    io.Reader
+	rc   *http.ResponseController
+	now  func() time.Time
+	end  time.Time
+	idle time.Duration
+	rate rateCheck
 }
 
 func (d *deadlineReader) Read(p []byte) (int, error) {
@@ -466,11 +507,8 @@ func (d *deadlineReader) Read(p []byte) (int, error) {
 	if !now.Before(d.end) {
 		return 0, errUploadTimeout
 	}
-	if elapsed := now.Sub(d.window); elapsed >= rateWindow {
-		if d.minRate > 0 && float64(d.bytes) < float64(d.minRate)*elapsed.Seconds() {
-			return 0, errTooSlow
-		}
-		d.window, d.bytes = now, 0
+	if err := d.rate.check(); err != nil {
+		return 0, err
 	}
 	if d.rc != nil {
 		// Not every ResponseWriter supports deadlines (http.ErrNotSupported);
@@ -482,7 +520,7 @@ func (d *deadlineReader) Read(p []byte) (int, error) {
 		_ = d.rc.SetReadDeadline(deadline)
 	}
 	n, err := d.r.Read(p)
-	d.bytes += int64(n)
+	d.rate.add(n)
 	return n, err
 }
 

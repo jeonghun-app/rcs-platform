@@ -94,6 +94,8 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"zero lookups":        {with(devEnv, "FT_MAX_CONCURRENT_LOOKUPS", "0"), "FT_MAX_CONCURRENT_LOOKUPS"},
 		"negative min rate":   {with(devEnv, "FT_MIN_UPLOAD_RATE", "-1"), "FT_MIN_UPLOAD_RATE"},
 		"zero drain":          {with(devEnv, "FT_DRAIN_TIMEOUT", "0s"), "FT_DRAIN_TIMEOUT"},
+		"zero per file":       {with(devEnv, "FT_MAX_DOWNLOADS_PER_FILE", "0"), "FT_MAX_DOWNLOADS_PER_FILE"},
+		"negative dl rate":    {with(devEnv, "FT_MIN_DOWNLOAD_RATE", "-1"), "FT_MIN_DOWNLOAD_RATE"},
 		"listen":              {with(devEnv, "FT_LISTEN_ADDR", "8081"), "FT_LISTEN_ADDR"},
 		"short nonce key":     {with(devEnv, "FT_NONCE_KEY", "short"), "FT_NONCE_KEY"},
 		"credentials":         {with(devEnv, "FT_CREDENTIALS", "ldap"), "FT_CREDENTIALS"},
@@ -156,6 +158,17 @@ func TestProductionRefusesPlainHTTPToTheHSS(t *testing.T) {
 	}
 }
 
+func TestProductionRefusesAShortHSSToken(t *testing.T) {
+	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32),
+		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "https://hss.example.test", "FT_STATIC_USERS", "")
+	if _, out := runService(t, with(prod, "FT_HSS_TOKEN", strings.Repeat("t", 42))); !strings.Contains(out, "FT_HSS_TOKEN is shorter than 43") {
+		t.Fatalf("a 42-character token was accepted:\n%s", out)
+	}
+	if _, out := runService(t, with(prod, "FT_HSS_TOKEN", strings.Repeat("t", 43))); strings.Contains(out, "FT_HSS_TOKEN") {
+		t.Fatalf("a 43-character token was refused:\n%s", out)
+	}
+}
+
 func TestPlainHTTPToTheHSSIsAllowedOnlyForPrivateHosts(t *testing.T) {
 	for host, want := range map[string]bool{
 		"10.0.3.7": true, "172.16.0.1": true, "192.168.1.1": true, "fd00::1": true,
@@ -170,7 +183,7 @@ func TestPlainHTTPToTheHSSIsAllowedOnlyForPrivateHosts(t *testing.T) {
 		t.Error("a name is private without a namespace")
 	}
 	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCS_SERVICE_NAMESPACE", "rcs.local",
-		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss.rcs.local:8080", "FT_HSS_TOKEN", "t", "FT_STATIC_USERS", "")
+		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss.rcs.local:8080", "FT_HSS_TOKEN", strings.Repeat("t", 43), "FT_STATIC_USERS", "")
 	if _, out := runService(t, prod); strings.Contains(out, "FT_HSS_URL") {
 		t.Fatalf("http to the Cloud Map name was refused:\n%s", out)
 	}

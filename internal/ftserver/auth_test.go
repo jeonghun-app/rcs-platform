@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net"
@@ -273,5 +274,30 @@ func TestStalledUploadIsCutOffAtTheIdleTimeout(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestTimeout {
 		t.Fatalf("status = %d, want 408", resp.StatusCode)
+	}
+}
+
+// badRecordSource answers like an HSS whose record for the user is
+// unusable.
+type badRecordSource struct{}
+
+func (badRecordSource) Lookup(context.Context, string, digest.Algorithm) (Credential, error) {
+	return Credential{}, fmt.Errorf("%w: credential for another realm", ErrBadCredentialRecord)
+}
+
+func TestUnusableCredentialRecordLooksLikeAnUnknownUser(t *testing.T) {
+	post := func() *http.Request { return httptest.NewRequest(http.MethodPost, "/ft", nil) }
+	bad := newEnv(t, func(o *Options) { o.Credentials = badRecordSource{} })
+	unknown := newEnv(t)
+	got := failure(bad.do(bad.user(alice).sign(post())))
+	want := failure(unknown.do(unknown.user("001010000000003@ims.mnc001.mcc001.3gppnetwork.org").sign(post())))
+	if got != want {
+		t.Fatalf("an unusable record answered\n%s\nan unknown user\n%s", got, want)
+	}
+	if bad.metric("auth.bad_credential_record") != 1 || bad.metric("auth.backend_error") != 0 || len(bad.h.Logs("credential record unusable")) != 1 {
+		t.Fatal("the unusable record was not reported on its own")
+	}
+	if strings.Contains(bad.h.Output(), "001010000000001") {
+		t.Fatal("the user name reached the log")
 	}
 }

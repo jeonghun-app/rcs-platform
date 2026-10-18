@@ -75,6 +75,8 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 		MaxConcurrentDownloads: cfg.MaxDownloads,
 		MaxConcurrentLookups:   cfg.MaxLookups,
 		MinUploadRate:          cfg.MinUploadRate,
+		MinDownloadRate:        cfg.MinDownloadRate,
+		MaxDownloadsPerFile:    cfg.MaxDownloadsPerFile,
 		IdleTimeout:            cfg.IdleTimeout,
 		UploadTimeout:          cfg.UploadTimeout,
 		StorageTimeout:         cfg.StorageTimeout,

@@ -135,8 +135,15 @@ byte 0, and the resume URL:
 
 - Every answer except a live, complete file is `404`: an unknown or malformed
   id, an upload in progress, a file past its validity, or an expired record.
-- A task serves at most `FT_MAX_CONCURRENT_DOWNLOADS` at once. Beyond that it
-  answers `503` with `Retry-After`.
+- A task serves at most `FT_MAX_CONCURRENT_DOWNLOADS` at once, and at most
+  `FT_MAX_DOWNLOADS_PER_FILE` of one file. Beyond either limit it answers `503`
+  with `Retry-After`. The per-file limit matters because with
+  `FT_DOWNLOAD_AUTH` off, anyone holding a link can open connections; a
+  recipient resuming a download needs one or two.
+- A download read more slowly than `FT_MIN_DOWNLOAD_RATE`, measured over each
+  minute, is cut off. Otherwise a reader that reads just enough to beat the
+  write deadline could hold a slot for hours. The client sees a broken download,
+  which it can resume with a range.
 - Headers:
   - the declared `Content-Type`;
   - `Content-Disposition: attachment` with the file name (RFC 6266);
@@ -167,10 +174,16 @@ and answers it as MD5.
   same 401 with fresh challenges, so a client cannot learn which user names
   exist. The one exception is a correct response with an expired nonce, which
   gets `stale=true`.
-- **Backend failures get 503.** If the credential backend fails, the answer is
-  `503` with `Retry-After`. The failure is counted (`auth.backend_error`) and
-  logged without the user name. It says nothing about the user, and clients
-  retry a 503 but give up after a second 401.
+- **Unusable records get the same 401.** Sometimes the HSS answers `200` but the
+  record cannot be used: it is for another realm or algorithm, it has no IMPU,
+  its HA1 is malformed, or the body is not a credential. That is the fault of
+  one subscriber's record, so the client gets the uniform 401 and cannot tell
+  such users apart. The operator gets `auth.bad_credential_record` and a log
+  line without the user name.
+- **Backend failures get 503.** A transport error, a timeout, or an HSS status
+  other than `200` and `404` gets `503` with `Retry-After`. It is counted in
+  `auth.backend_error` and logged without the user name. It says nothing about
+  the user, and clients retry a 503 but give up after a second 401.
 - **Lookups are bounded.** Each task runs at most `FT_MAX_CONCURRENT_LOOKUPS` at
   once and answers `503` beyond that (`auth.lookup_busy`). Anyone who has
   fetched a nonce can trigger a lookup with a made-up user name. The HSS client
@@ -237,7 +250,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_REALM` | required | Digest realm of the FT credentials |
 | `FT_NONCE_KEY` | random per start | At least 32 bytes, shared by every task. Required in staging and prod |
 | `FT_CREDENTIALS` | `hss` | `hss` or `static` (refused in staging and prod) |
-| `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base and service bearer token. `https`, or `http` to a private host (see above) |
+| `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
 | `FT_HSS_TIMEOUT` | `2s` | Per lookup |
 | `FT_MAX_CONCURRENT_LOOKUPS` | `16` | Credential lookups in progress per task, and HSS connections |
 | `FT_STATIC_USERS` | required with `static` | `user=password,...` |
@@ -258,6 +271,8 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_MAX_UPLOADS_PER_USER` | `4` | Uploads and resumes in progress per user and task |
 | `FT_MIN_UPLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower upload is cut off with `408`. `0` turns the check off |
 | `FT_MAX_CONCURRENT_DOWNLOADS` | `256` | Downloads in progress per task |
+| `FT_MAX_DOWNLOADS_PER_FILE` | `4` | Downloads of one file in progress per task |
+| `FT_MIN_DOWNLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
 | `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
@@ -368,11 +383,11 @@ identifier ever appears in a metric name:
 | Metric | Counts |
 |---|---|
 | `upload.precheck`, `upload.started`, `upload.restarted`, `upload.resumed`, `upload.completed` | Upload steps |
-| `upload.bytes`, `upload.parts`, `upload.lease_renewed` | Bytes completed, parts stored, lease renewals |
+| `upload.bytes`, `upload.parts`, `upload.lease_renewed`, `upload.commit_retried` | Bytes completed, parts stored, lease renewals, retries of the update that completes an upload |
 | `upload.failed.<reason>` | Failures, by reason (see below) |
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
-| `download.failed.storage`, `download.failed.interrupted`, `download.failed.busy`, `download.failed.missing_object` | Failed downloads |
-| `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
+| `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.missing_object` | Failed downloads |
+| `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
 The reasons in `upload.failed.<reason>`:
@@ -399,10 +414,11 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 |---|---|
 | `auth.backend_error` > 0 | The HSS lookup fails. Uploads get `503` |
 | `auth.lookup_busy` sustained | Lookups pile up (slow HSS, or an unauthenticated flood). Check the WAF rule |
+| `auth.bad_credential_record` > 0 | A subscriber's FT credential record in the HSS is unusable. That user cannot upload |
 | `upload.failed.storage`, `download.failed.storage` > 0 | S3 or DynamoDB fails |
 | `download.failed.missing_object` > 0 | A valid file's object is gone. The lifecycle rule is shorter than the validity |
 | `upload.failed.busy`, `download.failed.busy` sustained | The tasks are full. Uploads are I/O bound, so scale on this, not on CPU |
-| `sweep.failed` > 0, or no `sweep.duration` for two intervals | The sweeper is failing or stuck |
+| `sweep.failed` > 0, or no `sweep.duration` for two intervals | The sweeper is failing or stuck. Until the expiry index exists (follow-up), a table too large to scan within `FT_STORAGE_TIMEOUT` makes every sweep fail. Raise the timeout or build the index before alarming on this |
 
 ## Operations notes
 

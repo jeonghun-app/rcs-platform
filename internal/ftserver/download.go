@@ -61,6 +61,15 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
+	// One link must not take every download slot of the task: with
+	// FT_DOWNLOAD_AUTH off, anyone holding it can open connections.
+	releaseFile, ok := s.perFile.acquire(rec.ID)
+	if !ok {
+		s.metrics.Count("download.failed.file_busy", 1)
+		serviceUnavailable(w, retryAfter)
+		return
+	}
+	defer releaseFile()
 	key, size, contentType, name := rec.Object, rec.Size, rec.ContentType, rec.FileName
 	etag := `"` + hex.EncodeToString(rec.SHA256) + `"`
 	if thumbnail {
@@ -130,12 +139,16 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer body.Close()
 	w.WriteHeader(status)
-	n, err := io.Copy(&deadlineWriter{s: s, w: w}, body)
+	n, err := io.Copy(&deadlineWriter{s: s, w: w, rate: newRateCheck(s.o.MinDownloadRate, s.wallNow)}, body)
 	s.metrics.Count("download.bytes", n)
 	if err != nil || n != rng.length {
 		// The status line is out; all that is left is to cut the response
 		// short, which the client sees as a broken download it can resume.
-		s.metrics.Count("download.failed.interrupted", 1)
+		if errors.Is(err, errTooSlow) {
+			s.metrics.Count("download.failed.too_slow", 1)
+		} else {
+			s.metrics.Count("download.failed.interrupted", 1)
+		}
 		return
 	}
 	if status == http.StatusPartialContent {
@@ -176,13 +189,21 @@ func (s *Server) downloadFailed(w http.ResponseWriter, op string, err error) {
 }
 
 // deadlineWriter gives each write of a download IdleTimeout, so a reader
-// that stops reading releases the connection.
+// that stops reading releases the connection, and cuts off a reader slower
+// than MinDownloadRate, so one that reads just enough to beat the deadline
+// cannot hold a download slot for hours.
 type deadlineWriter struct {
-	s *Server
-	w http.ResponseWriter
+	s    *Server
+	w    http.ResponseWriter
+	rate rateCheck
 }
 
 func (d *deadlineWriter) Write(p []byte) (int, error) {
+	if err := d.rate.check(); err != nil {
+		return 0, err
+	}
 	d.s.extendWrite(d.w)
-	return d.w.Write(p)
+	n, err := d.w.Write(p)
+	d.rate.add(n)
+	return n, err
 }

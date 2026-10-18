@@ -107,6 +107,7 @@ func newEnv(t *testing.T, change ...func(*Options)) *env {
 		MaxUploadsPerUser:      8,
 		MaxConcurrentDownloads: 8,
 		MaxConcurrentLookups:   8,
+		MaxDownloadsPerFile:    8,
 		UploadTimeout:          time.Minute,
 		StorageTimeout:         time.Minute,
 		Now:                    c.Now,
