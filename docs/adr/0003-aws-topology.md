@@ -38,11 +38,10 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
   - Clients that ask for keep-alive with the Via `keep` parameter (RFC 6223
     §4.4) get `keep=120` (the same value as Flow-Timer, §5).
   - A client that uses neither cannot be made to send keep-alives (§10). On TLS
-    its connection is lost after about 350 s of silence (the NLB stops tracking
-    it); terminating requests from then until the client registers again get
+    `pcscf` closes its connection after 340 s of silence; terminating requests from then until the client registers again get
     430 from `pcscf` and are stored by `rcs-as` (ADR 0005). `pcscf` bounds that
     window by lowering the `Expires` of such a client's REGISTER (and of the
-    contact in the 200) to at most 600 s, so the gap is at most about 250 s per
+    contact in the 200) to at most 600 s, so the gap is at most about 260 s per
     registration. The cost is a re-registration, with a full authentication, every
     10 minutes per such client; the runbook includes it in HSS sizing.
   - `rcs-as` and `msrp-relay` send an empty MSRP SEND on a session idle for
@@ -51,7 +50,8 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
     protocol on that listener, so an endpoint that keeps to it is never cut by
     the service: `pcscf` 180 s on TLS and 1900 s on TCP for flows that
     negotiated a keep-alive (SIP keep-alive 120 s, RFC 5626 §5.4), and 340 s for
-    flows that did not, so `pcscf` never closes one before the NLB would; `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s).
+    flows that did not, just under the NLB's 350 s so the client sees a clean
+    close rather than a later reset; `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s).
     Idle connections longer than 350 s are not expected to survive even on TCP
     listeners: the target ENI's connection tracking on Fargate is not
     configurable and may not match the NLB's longer timeout. The NLB does
