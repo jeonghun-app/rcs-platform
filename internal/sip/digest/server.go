@@ -44,11 +44,13 @@ var (
 //
 // A SyncFailure is unauthenticated. RFC 3310 §3.4 has the client compute the
 // response with the empty password, so anyone holding a challenge's nonce and
-// opaque can produce one with any 14 bytes of AUTS (each nonce-count only
-// once). Only milenage.VerifyAUTS at hss (MAC-S under K) authenticates
-// AUTS. Until that check passes the caller must change no state (keep the
-// pending vector, keep any registration), and it must rate-limit
-// resynchronisation per IMPI, because each attempt costs a Cx round trip.
+// opaque can produce one with any 14 bytes of AUTS. Each nonce-count works
+// only once, and auts counts are kept apart from RES counts so that a forged
+// auts cannot block the genuine answer. Only milenage.VerifyAUTS at hss
+// (MAC-S under K) authenticates AUTS. Until that check passes the caller must
+// change no state (keep the pending vector, keep any registration), and it
+// must rate-limit resynchronisation per IMPI, because each attempt costs a Cx
+// round trip.
 type SyncFailure struct {
 	RAND [16]byte
 	AUTS [14]byte
@@ -274,6 +276,7 @@ func (s *Server) VerifyAKA(ctx context.Context, method string, c Credentials, xr
 	}
 	// The count is consumed before a SyncFailure too, so that resending the
 	// same auts credentials gets ErrReplayed instead of another Cx round trip.
+	// consume keeps auts counts apart from RES counts (see autsCountPrefix).
 	if err := s.consume(ctx, c, deadline); err != nil {
 		return err
 	}
@@ -353,10 +356,23 @@ func (s *Server) checkResponse(method string, c Credentials, h string) error {
 	return nil
 }
 
+// autsCountPrefix puts the nonce-counts of auts credentials in their own key
+// space. auts credentials need no secret (RFC 3310 §3.4: empty password), so
+// anyone who saw the 401 can send them in the victim's name with
+// nc=ffffffff; counted together with the RES answers, that would make the
+// victim's genuine nc=00000001 a replay. Kept apart, a resent auts is still
+// refused and a forged one cannot touch the RES path. NUL cannot occur in a
+// parsed nonce, so the prefixed key cannot collide with a real one.
+const autsCountPrefix = "auts\x00"
+
 // consume records the nonce-count, keeping it until deadline, after which the
 // credentials would be refused anyway.
 func (s *Server) consume(ctx context.Context, c Credentials, deadline time.Time) error {
-	fresh, err := s.counts.Advance(ctx, c.Username, c.Nonce, c.NC, deadline)
+	nonce := c.Nonce
+	if len(c.AUTS) > 0 {
+		nonce = autsCountPrefix + nonce
+	}
+	fresh, err := s.counts.Advance(ctx, c.Username, nonce, c.NC, deadline)
 	if err != nil {
 		return fmt.Errorf("digest: recording the nonce count: %w", err)
 	}

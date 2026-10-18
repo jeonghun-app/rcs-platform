@@ -11,6 +11,13 @@ import (
 // Credentials is the value of an Authorization or Proxy-Authorization header
 // field with the Digest scheme (RFC 7616 §3.4, RFC 3310 §3.4).
 //
+// Its fields are exported, so its summary methods only cover a Credentials
+// that fmt or slog is handed directly (or through an exported field). In an
+// unexported field of another struct, fmt prints the fields themselves,
+// including the username (for IMS the IMSI-based IMPI) and the nonce. Do not
+// log structs that hold Credentials in unexported fields; log the
+// Credentials itself.
+//
 // Nonce and Response may be empty: an IMS client's first REGISTER carries
 // credentials with only the identity filled in, so that scscf knows whom to
 // challenge (TS 24.229 §5.1.1.2.2 for IMS AKA, §5.1.1.2.3 for SIP Digest;

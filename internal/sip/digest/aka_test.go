@@ -361,6 +361,36 @@ func TestAKASynchronisationFailureExposesAUTSForResynchronisation(t *testing.T) 
 	}
 }
 
+func TestForgedAUTSCannotBurnTheVictimsNonceCount(t *testing.T) {
+	// QA's scenario on 1ac2cd9: someone who saw the 401 sends auts
+	// credentials in the victim's name with nc=ffffffff. They need no secret
+	// (empty password), so they must not make the victim's genuine nc=1 a
+	// replay. Resending them is still refused.
+	h := newHarness(t)
+	m, v := set1(t)
+	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	forged, err := Respond(ch, ClientParams{
+		Username: testUser, Method: "REGISTER", URI: testURI,
+		CNonce: "evil", NC: 0xffffffff, AUTS: bytes.Repeat([]byte{0x42}, 14),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged = overWire(t, forged)
+	ctx := context.Background()
+	var sf *SyncFailure
+	if err := h.server.VerifyAKA(ctx, "REGISTER", forged, v.XRES[:], h.vectorExpires); !errors.As(err, &sf) {
+		t.Fatalf("forged auts: err = %v, want *SyncFailure", err)
+	}
+	if err := h.server.VerifyAKA(ctx, "REGISTER", forged, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrReplayed) {
+		t.Fatalf("resent forged auts: err = %v, want ErrReplayed", err)
+	}
+	genuine := card(t, m, ch, set1Seen(t))
+	if err := h.server.VerifyAKA(ctx, "REGISTER", genuine, v.XRES[:], h.vectorExpires); err != nil {
+		t.Fatalf("victim's genuine answer after a forged auts: %v", err)
+	}
+}
+
 func TestExpiredTaggedAKANonceWithAUTSIsStaleNotASyncFailure(t *testing.T) {
 	h := newHarness(t)
 	h.server.akaServerData = true
