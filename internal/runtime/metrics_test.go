@@ -60,6 +60,7 @@ func TestInvalidMetricNamesAreDroppedAndReportedOnce(t *testing.T) {
 	for _, name := range []string{
 		"", "Service", "_aws", "1st", "sip register", "sip:alice@example.com",
 		"from.+15550100001", "a/b", "ü", strings.Repeat("n", 256),
+		"auth.fail.001010000000001", "msisdn15550100001", "x.12345678",
 	} {
 		m.Count(name, 1)
 		m.Timing(name, time.Millisecond)
@@ -70,12 +71,15 @@ func TestInvalidMetricNamesAreDroppedAndReportedOnce(t *testing.T) {
 	if n := strings.Count(logs.String(), "metric dropped"); n != 1 {
 		t.Fatalf("%d reports, want 1: %s", n, logs.String())
 	}
-	if strings.Contains(logs.String(), "15550100001") {
+	if strings.Contains(logs.String(), "15550100001") || strings.Contains(logs.String(), "001010000000001") {
 		t.Fatalf("report leaks the identifier in the name: %s", logs.String())
 	}
-	m.Count(strings.Repeat("n", 255), 1)
-	if out.Len() == 0 {
-		t.Fatal("a 255-character name was dropped")
+	for _, name := range []string{strings.Repeat("n", 255), "sip.5xx", "http.status.1234567", "rtt.p99"} {
+		out.Reset()
+		m.Count(name, 1)
+		if out.Len() == 0 {
+			t.Errorf("valid name %q was dropped", name)
+		}
 	}
 }
 

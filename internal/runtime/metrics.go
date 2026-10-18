@@ -97,8 +97,11 @@ func (m *Metrics) emit(name, unit string, value any) {
 
 // validMetricName accepts a letter followed by up to 254 letters, digits, '.',
 // '_' or '-' (EMF allows 1-255 characters), and refuses "Service", which would
-// overwrite the dimension value in the same JSON object. The narrow character
-// set also keeps identifiers such as "+1555…" or "sip:…" out of metric names.
+// overwrite the dimension value in the same JSON object. It also refuses any
+// name internal/pii would mask, such as one with a run of eight or more digits
+// ("auth.fail.001010000000001"): a metric name stays in CloudWatch for 15
+// months and is visible to anyone allowed to list metrics, so an identifier must
+// not reach one by being appended to a name.
 func validMetricName(name string) bool {
 	if len(name) == 0 || len(name) > 255 || name == "Service" {
 		return false
@@ -111,5 +114,5 @@ func validMetricName(name string) bool {
 			return false
 		}
 	}
-	return true
+	return pii.Redact(name) == name
 }
