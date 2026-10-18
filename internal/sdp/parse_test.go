@@ -165,8 +165,10 @@ func TestMalformedDescriptionsAreRejectedWithTheLine(t *testing.T) {
 		{"empty input", "", 0, "empty description"},
 		{"first line is not v=", "o=- 1 1 IN IP4 x\r\n", 1, `must start with a "v=" line`},
 		{"version other than 0", "v=1\r\n", 1, "unsupported protocol version"},
-		{"empty line", "v=0\r\n\r\n", 2, "empty line"},
-		{"trailing empty line", head + "\r\n", 6, "empty line"},
+		{"empty line", "v=0\r\n\r\no=- 1 1 IN IP4 x\r\n", 2, "empty line"},
+		{"trailing empty line on a truncated description", "v=0\r\n\r\n", 2, `missing "o=" line`},
+		{"two trailing empty lines", head + "\r\n\r\n", 6, "empty line"},
+		{"only a line ending", "\r\n", 1, "empty line"},
 		{"NUL byte", "v=0\r\ns=a\x00b\r\n", 2, "NUL byte"},
 		{"bare CR inside a line", "v=0\r\ns=a\rb\r\n", 2, "CR not followed by LF"},
 		{"bare CR at the end", "v=0\r", 1, "CR not followed by LF"},
@@ -313,5 +315,13 @@ func TestEachTimeDescriptionMayCarryItsOwnZoneLine(t *testing.T) {
 	}
 	if got := mustMarshal(t, s); got != sdp {
 		t.Errorf("got %q, want %q", got, sdp)
+	}
+}
+
+func TestOneTrailingEmptyLineIsIgnored(t *testing.T) {
+	for _, sdp := range []string{chatOffer + "\r\n", strings.ReplaceAll(chatOffer, "\r\n", "\n") + "\n"} {
+		if got := mustMarshal(t, mustParse(t, sdp)); got != chatOffer {
+			t.Errorf("got %q, want %q", got, chatOffer)
+		}
 	}
 }

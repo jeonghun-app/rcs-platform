@@ -15,7 +15,8 @@
 // at a malformed description forwards something the peer did not send. A few
 // deviations are tolerated because deployed stacks or middleboxes produce them
 // and they are unambiguous: lines ending in LF alone, a last line with no
-// line ending, and an empty s= line, which is read as "s=-". Output always
+// line ending, one empty line at the very end, and an empty s= line, which
+// is read as "s=-". Output always
 // uses CRLF and never repeats a deviation. Input larger than Parser.MaxSize is refused without
 // being parsed.
 //

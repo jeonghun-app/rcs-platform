@@ -55,9 +55,15 @@ func (p Parser) Parse(data []byte) (*Session, error) {
 	}
 	st := state{s: &Session{}}
 	for len(data) > 0 {
-		st.line++
 		var line []byte
 		line, data = nextLine(data)
+		// Some stacks end the body with one extra line ending. A single
+		// empty line at the very end is ignored; anywhere else, or twice,
+		// it is an error.
+		if len(line) == 0 && len(data) == 0 && st.line > 0 {
+			break
+		}
+		st.line++
 		if err := st.add(line); err != nil {
 			return nil, err
 		}
