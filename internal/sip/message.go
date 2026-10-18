@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Message is a *Request or a *Response.
@@ -102,7 +103,8 @@ func (r *Request) Bytes() ([]byte, error) {
 }
 
 // Bytes serializes the response; see Request.Bytes. It fails if the status code is
-// outside 100–699 or the reason phrase contains a control character.
+// outside 100–699 or the reason phrase contains a control character or invalid
+// UTF-8.
 func (r *Response) Bytes() ([]byte, error) {
 	if r.StatusCode < 100 || r.StatusCode > 699 {
 		return nil, errors.New("sip: status code outside 100-699")
@@ -143,16 +145,16 @@ func printableNoSpace(b []byte) bool {
 	return true
 }
 
-// validReasonPhrase allows any byte but control characters other than HTAB. The
-// grammar is narrower (RFC 3261 §25.1 Reason-Phrase), but reason phrases are for
-// people and real ones use characters it leaves out.
+// validReasonPhrase allows any valid UTF-8 without control characters other
+// than HTAB. The grammar is narrower (RFC 3261 §25.1 Reason-Phrase), but reason
+// phrases are for people and real ones use characters it leaves out.
 func validReasonPhrase(s string) bool {
 	for i := 0; i < len(s); i++ {
-		if c := s[i]; c < 0x20 && c != '\t' || c == 0x7f {
+		if isCTL(s[i]) {
 			return false
 		}
 	}
-	return true
+	return utf8.ValidString(s)
 }
 
 func (h *Header) size() int {

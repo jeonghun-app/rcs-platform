@@ -367,3 +367,51 @@ func TestStreamAndDatagramParsesAgree(t *testing.T) {
 		t.Errorf("stream and datagram parses differ:\n%s\n%s", db, sb)
 	}
 }
+
+// docs/architecture.md §8: control characters and invalid UTF-8 are refused,
+// except a quoted-pair inside a quoted string (RFC 4475 §3.1.1.2).
+func TestControlCharactersAndInvalidUTF8AreRejected(t *testing.T) {
+	for _, value := range []string{
+		"a\x00b",
+		"a\x1b[2Jb",
+		"a\x7fb",
+		"\xff\xfe",
+		"<http://x>\x01",
+		"\"quoted \x00 raw\"",
+		"\"quoted \\\xff\"",
+		"\"ends in a backslash \\",
+		"caf\xc3",
+	} {
+		msg := lines("OPTIONS sip:example.com SIP/2.0", "X-Foo: "+value, "Content-Length: 0")
+		if _, err := ParseMessage([]byte(msg)); !errors.Is(err, ErrMalformed) {
+			t.Errorf("parse %q: error = %v, want ErrMalformed", value, err)
+		}
+		var h Header
+		if err := h.Add("X-Foo", value); !errors.Is(err, ErrMalformed) {
+			t.Errorf("Add %q: error = %v, want ErrMalformed", value, err)
+		}
+	}
+	for _, value := range []string{
+		"\"BEL:\\\x07 NUL:\\\x00 DEL:\\\x7f\" <sip:a@example.com>",
+		"tab\there",
+		"\ufeff大停電",
+		"unquoted \\ backslash",
+	} {
+		msg := lines("OPTIONS sip:example.com SIP/2.0", "X-Foo: "+value, "Content-Length: 0")
+		if _, err := ParseMessage([]byte(msg)); err != nil {
+			t.Errorf("parse %q: %v", value, err)
+		}
+		var h Header
+		if err := h.Add("X-Foo", value); err != nil {
+			t.Errorf("Add %q: %v", value, err)
+		}
+	}
+	for _, reason := range []string{"O\x00K", "O\xffK"} {
+		if _, err := ParseMessage([]byte(lines("SIP/2.0 200 "+reason, "Content-Length: 0"))); !errors.Is(err, ErrMalformed) {
+			t.Errorf("reason %q: error = %v", reason, err)
+		}
+		if _, err := (&Response{StatusCode: 200, Reason: reason}).Bytes(); err == nil {
+			t.Errorf("Bytes() with reason %q succeeded", reason)
+		}
+	}
+}

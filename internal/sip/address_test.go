@@ -64,6 +64,10 @@ func TestMalformedAddressesAreRejected(t *testing.T) {
 		"<sip:a@example.com>;tag=1;tag=2",
 		"<sip:a@example.com>;tag=",
 		`<sip:a@example.com>;x="unterminated`,
+		// qdtext has no control characters; only a quoted-pair may carry one.
+		"\"a\x00b\" <sip:a@example.com>",
+		"\"a\x7fb\" <sip:a@example.com>",
+		"\"a\x1bb\" <sip:a@example.com>",
 		"<sip:a@example.com>;x=a b",
 		"sip:a b@example.com",
 		"not a uri",

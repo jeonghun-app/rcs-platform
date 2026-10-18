@@ -232,10 +232,12 @@ func (h *Header) Elements(name string) ([]string, error) {
 
 // Add appends a field. A known name is written in its canonical spelling.
 //
-// Add, Set and Prepend refuse a name that is not a token and a value containing
-// CR or LF: either would let the value start a header line of its own. Every
+// Add, Set and Prepend refuse a name that is not a token, and a value with a
+// control character (CR and LF would start a header line of their own) or
+// invalid UTF-8, which docs/architecture.md §8 has senders never emit. Every
 // value a service writes passes through them, so this is the one place the
-// check is made.
+// check is made; the String methods of the value types rely on it (see
+// invalidValue).
 func (h *Header) Add(name, value string) error {
 	f, err := newField(name, value)
 	if err != nil {
@@ -313,8 +315,8 @@ func newField(name, value string) (field, error) {
 	if !isAll(name, classToken) {
 		return field{}, syntaxError("header name is not a token")
 	}
-	if strings.ContainsAny(value, "\r\n") {
-		return field{}, headerError(CanonicalName(name), "value contains CR or LF")
+	if !validFieldValue(value) {
+		return field{}, headerError(CanonicalName(name), "value contains a control character or invalid UTF-8")
 	}
 	name = CanonicalName(name)
 	return field{name: name, key: headerKey(name), value: trimWS(value)}, nil

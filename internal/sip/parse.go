@@ -298,7 +298,11 @@ func parseField(raw string) (field, error) {
 	if !isAll(name, classToken) || isWS(raw[0]) {
 		return field{}, syntaxError("invalid header field name")
 	}
-	return field{name: name, key: headerKey(name), value: unfold(raw[colon+1:]), raw: raw}, nil
+	value := unfold(raw[colon+1:])
+	if !validFieldValue(value) {
+		return field{}, syntaxError("control character or invalid UTF-8 in header field")
+	}
+	return field{name: name, key: headerKey(name), value: value, raw: raw}, nil
 }
 
 // unfold replaces each line fold and the whitespace around it with one SP, which

@@ -1,6 +1,9 @@
 package sip
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // Character classes of the RFC 3261 §25.1 grammar (and RFC 3966 for tel numbers).
 // They are a table because the parser consults one for nearly every byte.
@@ -177,6 +180,51 @@ func unescape(s string) string {
 	return string(b)
 }
 
+// isCTL reports a control character other than HTAB.
+func isCTL(c byte) bool { return c < 0x20 && c != '\t' || c == 0x7f }
+
+// validFieldValue checks a header field value, unfolded, against what
+// docs/architecture.md §8 lets through: valid UTF-8 and no control character
+// other than HTAB (RFC 3261 §25.1 TEXT-UTF8char), except as the second byte of a
+// quoted-pair inside a quoted string, which RFC 4475 §3.1.1.2 shows is valid. CR
+// and LF are refused even there: quoted-pair excludes them.
+func validFieldValue(v string) bool {
+	inQuote := false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case inQuote && c == '\\':
+			if i+1 == len(v) || v[i+1] == '\r' || v[i+1] == '\n' {
+				return false
+			}
+			i++
+		case c == '"':
+			inQuote = !inQuote
+		case isCTL(c):
+			return false
+		}
+	}
+	return utf8.ValidString(v)
+}
+
+// lowerASCII lower-cases ASCII letters only. Unlike strings.ToLower it leaves
+// other bytes alone, so two different invalid UTF-8 sequences never compare
+// equal, and it does not allocate when there is nothing to change.
+func lowerASCII(s string) string {
+	for i := 0; i < len(s); i++ {
+		if 'A' <= s[i] && s[i] <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if 'A' <= b[j] && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
 func isWS(c byte) bool { return c == ' ' || c == '\t' }
 
 // skipWS skips SP and HTAB. Header values reach the value parsers unfolded, so
@@ -231,7 +279,7 @@ func parseQuoted(s string, i int) (string, int, bool) {
 			}
 			b = append(b, s[i+1])
 			i += 2
-		case c < 0x20 && c != '\t' || c == 0x7f:
+		case isCTL(c):
 			// qdtext excludes control characters other than HTAB.
 			return "", 0, false
 		default:
@@ -252,7 +300,7 @@ func appendQuoted(b []byte, s string) []byte {
 	b = append(b, '"')
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '"' || c == '\\' || c < 0x20 && c != '\t' || c == 0x7f {
+		if c == '"' || c == '\\' || isCTL(c) {
 			b = append(b, '\\')
 		}
 		b = append(b, c)
