@@ -73,16 +73,10 @@ test: volumes ## Unit tests with coverage summary
 race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
-# Every Fuzz* function in the module runs for FUZZTIME. Go allows one fuzz target
-# per invocation, hence the loop.
+# Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz
 fuzz: volumes ## Run every fuzz target for FUZZTIME each
-	$(RUNGO) -e FUZZTIME=$(FUZZTIME) $(GOIMAGE) sh -c 'set -e; \
-	  for pkg in $$(go list ./...); do \
-	    for f in $$(go test -list "^Fuzz" "$$pkg" | grep "^Fuzz" || true); do \
-	      echo "== $$pkg $$f"; go test "$$pkg" -run "^$$" -fuzz "^$$f$$" -fuzztime "$$FUZZTIME"; \
-	    done; \
-	  done'
+	$(RUNGO) -e FUZZTIME=$(FUZZTIME) $(GOIMAGE) scripts/fuzz.sh
 
 .PHONY: build
 build: volumes ## Compile every service binary into bin/
@@ -91,6 +85,14 @@ build: volumes ## Compile every service binary into bin/
 	  go build ./...; \
 	  for d in cmd/*/; do [ -d "$$d" ] || continue; n=$$(basename "$$d"); \
 	    go build -trimpath -ldflags "$(LDFLAGS)" -o "bin/$$n" "./$$d"; echo "bin/$$n"; done'
+
+# Docker tags cannot contain "+", which VERSION may (semver build metadata).
+.PHONY: image
+image: ## Build the service image: every cmd/* binary on distroless, non-root
+	@$(CHECK_VERSION)
+	$(DOCKER) build -f deploy/Dockerfile \
+	  --build-arg VERSION="$$VERSION" --build-arg REVISION="$$REVISION" \
+	  -t "$(IMAGE):$$(printf %s "$$VERSION" | tr + _)" .
 
 .PHONY: vuln
 vuln: volumes ## Verify modules and scan reachable vulnerabilities

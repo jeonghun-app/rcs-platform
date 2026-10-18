@@ -27,8 +27,9 @@ a maintainer; behaviour built on it is listed as unverified in
 | TS 24.229 | IMS SIP and SDP stage 3 | `pcscf`, `icscf`, `scscf`, `rcs-as` |
 | TS 29.228 / 29.229 | Cx/Dx signalling flows and Diameter protocol | `icscf`, `scscf`, `hss` |
 | TS 29.328 / 29.329 | Sh interface, user data XML schema | `hss`, `rcs-as` |
+| TS 33.102 | 3G security architecture: AKA, AUTN/AUTS, resynchronisation (§6.3), sequence number management (Annex C) | `hss`, `scscf` (`internal/milenage`) |
 | TS 33.203 | IMS access security | `pcscf`, `scscf` |
-| TS 35.205 / 35.206 / 35.208 | Milenage algorithm set and test data | `hss` (`internal/milenage`) |
+| TS 35.205 / 35.206 / 35.207 / 35.208 | Milenage algorithm set, implementers' test data (35.207) and conformance test data (35.208) | `hss` (`internal/milenage`) |
 | TS 23.003 | Numbering, addressing and identification | `internal/sip`, `hss` |
 | TS 23.334 | IMS-ALG and IMS-AGW | `pcscf`, `msrp-relay` |
 | TS 23.218 | IMS session handling: use of iFC and ServiceInfo by the S-CSCF | `scscf` (`internal/ifc`) |
@@ -44,7 +45,13 @@ a maintainer; behaviour built on it is listed as unverified in
 | RFC | Subject |
 |---|---|
 | 3261, 3263 | SIP, locating SIP servers |
-| 3325, 3327, 3608, 3455 | Asserted identity, Path, Service-Route, P-headers for 3GPP |
+| 3966 | tel URI |
+| 4475, 5118 | SIP torture test messages (IPv4, IPv6) |
+| 3581 | Symmetric response routing (`rport`) |
+| 3325, 3327, 3608, 7315 | Asserted identity, Path, Service-Route, P-headers for 3GPP (7315 obsoletes 3455) |
+| 3840, 3841 | Callee capabilities (feature tags), caller preferences (`Accept-Contact`) |
+| 3326 | `Reason` header |
+| 3515, 3892 | REFER, `Referred-By` |
 | 3428 | SIP MESSAGE |
 | 3310, 7616, 8760 | Digest AKA, HTTP Digest (MD5, SHA-256) |
 | 4028 | Session timers |
@@ -54,6 +61,7 @@ a maintainer; behaviour built on it is listed as unverified in
 | 3862 | Common Presence and Instant Messaging (CPIM) message format |
 | 5438 | Instant Message Disposition Notification (IMDN) |
 | 5626 | SIP outbound (flow tokens) |
+| 6223 | Indication of support for keep-alive (Via `keep`) |
 | 6733, 4006 | Diameter base protocol |
 | 4740 | Diameter SIP application: the Digest-* AVPs that Cx reuses (TS 29.229 §6.3.37 to §6.3.41) |
 | 3966 | tel URI: the telephone-subscriber that iFC Request-URI patterns match (TS 29.228 Annex F) |
