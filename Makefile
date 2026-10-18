@@ -73,16 +73,10 @@ test: volumes ## Unit tests with coverage summary
 race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
-# Every Fuzz* function in the module runs for FUZZTIME. Go allows one fuzz target
-# per invocation, hence the loop.
+# Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz
 fuzz: volumes ## Run every fuzz target for FUZZTIME each
-	$(RUNGO) -e FUZZTIME=$(FUZZTIME) $(GOIMAGE) sh -c 'set -e; \
-	  for pkg in $$(go list ./...); do \
-	    for f in $$(go test -list "^Fuzz" "$$pkg" | grep "^Fuzz" || true); do \
-	      echo "== $$pkg $$f"; go test "$$pkg" -run "^$$" -fuzz "^$$f$$" -fuzztime "$$FUZZTIME"; \
-	    done; \
-	  done'
+	$(RUNGO) -e FUZZTIME=$(FUZZTIME) $(GOIMAGE) scripts/fuzz.sh
 
 .PHONY: build
 build: volumes ## Compile every service binary into bin/
