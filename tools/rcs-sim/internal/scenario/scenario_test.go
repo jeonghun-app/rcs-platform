@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -331,22 +332,31 @@ func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
 
 func TestTheResumeQuietTimeIsCountedOnTheClock(t *testing.T) {
 	// The same 300 ms as above, without depending on how fast a loaded host
-	// asks (#197). The clock moves 50 ms each time it is read, twice per
-	// request, and the server always holds the same bytes, so the step
-	// sends exactly 300 ms / 100 ms + 1 = 4 requests; with no quiet time
-	// it would send 2.
-	const quiet = 300 * time.Millisecond
+	// asks (#197). The clock moves only when the stand-in answers a signed
+	// get_upload_info, so the count does not depend on how often the code
+	// reads it: the requests are asked at 0, 299 ms and 300 ms, and a
+	// quiet time of exactly 300 ms, counted from a request, resumes at the
+	// third. 0, 250 or 299 ms would stop at the second, 301 ms or a quiet
+	// time counted from an answer would need a fourth (QA on #203).
 	cfg := stack(t)
-	var reads atomic.Int64
-	start := time.Unix(0, 0)
-	cfg.FT.Now = func() time.Time { return start.Add(time.Duration(reads.Add(1)) * 50 * time.Millisecond) }
-	var signed atomic.Int32
+	var mu sync.Mutex
+	clock := time.Unix(0, 0)
+	k := 0
+	at := []time.Duration{299 * time.Millisecond, 300 * time.Millisecond}
+	cfg.FT.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
 	a := &answering{match: func(r *http.Request) bool {
-		if strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != "" {
-			signed.Add(1)
-			return true
+		if !strings.Contains(r.URL.RawQuery, "get_upload_info") || r.Header.Get("Authorization") == "" {
+			return false
 		}
-		return false
+		mu.Lock()
+		defer mu.Unlock()
+		if k < len(at) {
+			clock = time.Unix(0, 0).Add(at[k])
+		} else {
+			clock = clock.Add(time.Millisecond)
+		}
+		k++
+		return true
 	}, status: http.StatusOK, body: `<?xml version="1.0"?><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp">` +
 		`<file-range start="0" end="65535"/><data url="/ft/x"/></file-resume-info>`}
 	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
@@ -354,8 +364,10 @@ func TestTheResumeQuietTimeIsCountedOnTheClock(t *testing.T) {
 	if info := byStep(results)["get_upload_info"]; !info.OK || info.Detail["held"] != 65536 {
 		t.Fatalf("get_upload_info %+v", info)
 	}
-	if want := int32(quiet/(2*50*time.Millisecond)) + 1; signed.Load() != want {
-		t.Fatalf("%d signed get_upload_info, want %d for a %v quiet time", signed.Load(), want, quiet)
+	mu.Lock()
+	defer mu.Unlock()
+	if k != 3 {
+		t.Fatalf("%d signed get_upload_info, want 3 for a quiet time of exactly 300 ms", k)
 	}
 }
 

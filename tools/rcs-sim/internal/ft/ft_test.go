@@ -597,3 +597,34 @@ func TestUploadInfoMeasuresItsQuietTimeAndDeadlineOnItsClock(t *testing.T) {
 		t.Fatalf("%d answers, want 2: the quiet time was not taken from the clock", n)
 	}
 }
+
+func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
+	// The deadline as well comes from the clock: the bytes held keep
+	// changing, the clock moves an hour per read and the settle time is
+	// 3 h, so the second answer finds the deadline passed (QA on #203).
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		held := 10 + n
+		mu.Unlock()
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(held))
+	})
+	var reads atomic.Int64
+	c.Now = func() time.Time { return time.Unix(0, 0).Add(time.Duration(reads.Add(1)) * time.Hour) }
+	if _, _, err := c.SettledUploadInfo(ctx(t), "x", 3*time.Hour, time.Millisecond, 30*time.Minute); !errors.Is(err, ft.ErrNotSettled) {
+		t.Fatalf("SettledUploadInfo = %v, want ErrNotSettled", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d answers before the deadline, want 2", n)
+	}
+}
