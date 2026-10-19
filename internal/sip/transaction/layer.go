@@ -2,9 +2,11 @@ package transaction
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -21,6 +23,20 @@ const (
 // tryingDelay is how long a server INVITE transaction waits for the TU's own
 // provisional response before sending 100 Trying itself (RFC 3261 §17.2.1).
 const tryingDelay = 200 * time.Millisecond
+
+// Defaults and bounds for the server transaction cap.
+const (
+	// DefaultMaxServerTransactions bounds the requests a layer holds. A server
+	// transaction keeps its request until it ends, 32 s after its final
+	// response over UDP (Timer J), so at a few KiB per request 20000 of them
+	// is tens of MiB, comfortably inside a 1–2 GiB task.
+	DefaultMaxServerTransactions = 20000
+	// MaxMaxServerTransactions is the largest cap Validate accepts.
+	MaxMaxServerTransactions = 1000000
+	// DefaultRetryAfter is what the 503 for a request beyond the cap asks the
+	// client to wait (RFC 3261 §21.5.4, §20.33).
+	DefaultRetryAfter = 5 * time.Second
+)
 
 // minTimerD is the lower bound RFC 3261 §17.1.1.2 sets for Timer D over an
 // unreliable transport.
@@ -117,6 +133,35 @@ type Config struct {
 	// the 100 useless. Otherwise 100 Trying is sent at once, which suits a UAS
 	// core that does not know how long it will take.
 	DelayTrying bool
+
+	// MaxServerTransactions bounds the live server transactions. A request
+	// that would start one more is answered with 503 Service Unavailable and a
+	// Retry-After, statelessly, and never reaches the TU: every transaction
+	// holds its request until it ends, so without a bound a flood of requests
+	// is a flood of memory. CANCEL is exempt, since refusing one would leave
+	// the INVITE it cancels running; ACK never starts a transaction. Zero takes
+	// DefaultMaxServerTransactions; Validate accepts 1 to
+	// MaxMaxServerTransactions.
+	MaxServerTransactions int
+	// RetryAfter is the Retry-After of that 503, in whole seconds rounded up;
+	// zero takes DefaultRetryAfter.
+	RetryAfter time.Duration
+	// IDs makes the To tag of that 503; the zero value draws from crypto/rand.
+	IDs sip.IDGenerator
+}
+
+// Validate reports a configuration New would refuse. A service calls it at
+// start, so a bad setting stops the service with a message instead of a panic.
+func (c Config) Validate() error {
+	switch {
+	case c.MaxServerTransactions < 0 || c.MaxServerTransactions > MaxMaxServerTransactions:
+		return fmt.Errorf("transaction: MaxServerTransactions %d is outside 1..%d", c.MaxServerTransactions, MaxMaxServerTransactions)
+	case c.RetryAfter < 0:
+		return errors.New("transaction: negative RetryAfter")
+	case c.T1 < 0 || c.T2 < 0 || c.T4 < 0:
+		return errors.New("transaction: negative timer base")
+	}
+	return nil
 }
 
 // Layer matches messages to transactions and runs their state machines. Its
@@ -127,6 +172,10 @@ type Layer struct {
 	clock       Clock
 	t1, t2, t4  time.Duration
 	delayTrying bool
+	maxServers  int
+	retryAfter  string
+	ids         sip.IDGenerator
+	rejected    atomic.Uint64
 
 	mu      sync.Mutex
 	clients map[string]*ClientTransaction
@@ -135,8 +184,22 @@ type Layer struct {
 }
 
 // New returns a Layer that sends through s and passes requests and failures to tu.
+// It panics if cfg does not pass Validate, which a caller with configuration
+// from outside should call first.
 func New(s Sender, tu TU, cfg Config) *Layer {
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
+	if cfg.MaxServerTransactions == 0 {
+		cfg.MaxServerTransactions = DefaultMaxServerTransactions
+	}
+	if cfg.RetryAfter == 0 {
+		cfg.RetryAfter = DefaultRetryAfter
+	}
 	l := &Layer{
+		maxServers:  cfg.MaxServerTransactions,
+		retryAfter:  strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
+		ids:         cfg.IDs,
 		sender:      s,
 		tu:          tu,
 		clock:       cfg.Clock,
@@ -227,6 +290,11 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 			l.mu.Unlock()
 			return
 		}
+		if len(l.servers) >= l.maxServers && req.Method != "CANCEL" {
+			l.mu.Unlock()
+			l.refuse(req, in.Source)
+			return
+		}
 		tx = newServerTransaction(l, key, req, in.Source)
 		l.servers[key] = tx
 		l.mu.Unlock()
@@ -242,6 +310,41 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 	if tx == nil || !tx.receive(req, in.Source) {
 		l.tu.Stray(in)
 	}
+}
+
+// refuse answers a request beyond MaxServerTransactions with 503 and
+// Retry-After, without a transaction (RFC 3261 §21.5.4). A retransmission of it
+// is refused again the same way, which costs no memory. It runs on the reading
+// goroutine, so it sends without waiting.
+func (l *Layer) refuse(req *sip.Request, src transport.Source) {
+	l.rejected.Add(1)
+	tag, err := l.ids.Tag()
+	if err != nil {
+		return
+	}
+	res, err := sip.NewResponse(req, 503, "", tag)
+	if err != nil {
+		return
+	}
+	if err := res.Header.Add("Retry-After", l.retryAfter); err != nil {
+		return
+	}
+	l.sender.SendResponse(res, src, transport.NoWait)
+}
+
+// Stats is a snapshot of the layer's gauges and counters, for metrics.
+type Stats struct {
+	ClientTransactions int // live
+	ServerTransactions int // live, against MaxServerTransactions
+	// ServerTransactionsRejected counts requests answered with 503 because
+	// MaxServerTransactions server transactions were live.
+	ServerTransactionsRejected uint64
+}
+
+// Stats returns the current gauges and counters.
+func (l *Layer) Stats() Stats {
+	c, s := l.Len()
+	return Stats{ClientTransactions: c, ServerTransactions: s, ServerTransactionsRejected: l.rejected.Load()}
 }
 
 // matchServer finds the server transaction a request belongs to (RFC 3261
