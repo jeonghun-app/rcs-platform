@@ -3,6 +3,7 @@ package hss
 import (
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -84,6 +85,48 @@ func TestProfileBeyondTheWorkBudgetIsRefusedWithTheLimitName(t *testing.T) {
 	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, `{"id":"costly","initial_filter_criteria":[`+strings.Join(items, ",")+`]}`)
 	if code != http.StatusBadRequest || !strings.Contains(body["error"].(string), "MaxWork") {
 		t.Fatalf("costly profile = %d %v", code, body)
+	}
+}
+
+func TestProfileWithAPatternGoReadsDifferentlyFromPOSIXIsRefusedNamingTheConstruct(t *testing.T) {
+	a := newAPIEnv(t)
+	// The contents are JSON strings, so each backslash is written twice.
+	for content, construct := range map[string]string{
+		`[\\.]com`: "a backslash inside a bracket expression",
+		`\\x41`:    `the escape \x`,
+	} {
+		profile := `{"id":"corner","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+			`{"group":[0],"sip_header":{"header":"Subject","content":"` + content + `"}}]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}]}`
+		code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
+		if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, construct) {
+			t.Errorf("%s: %d %v, want 400 naming %s", content, code, body, construct)
+		}
+	}
+}
+
+func TestProfileWithAPatternOverMaxPatternBytesIsRefusedNamingTheLimit(t *testing.T) {
+	a := newAPIEnv(t)
+	profile := `{"id":"long","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+		`{"group":[0],"sip_header":{"header":"Subject","content":"` + strings.Repeat("a", ifc.MaxPatternBytes+1) + `"}}]},` +
+		`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}]}`
+	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
+	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxPatternBytes") {
+		t.Fatalf("%d %v, want 400 naming MaxPatternBytes", code, body)
+	}
+}
+
+func TestProfileCostlierToCompileThanMaxSetCompileCostIsRefusedNamingTheLimit(t *testing.T) {
+	a := newAPIEnv(t)
+	items := make([]string, 12)
+	for i := range items {
+		items[i] = `{"priority":` + strconv.Itoa(i+1) + `,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+			`{"group":[0],"request_uri":"` + strings.Repeat("[^a]", ifc.MaxPatternBytes/4) + `"}]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}`
+	}
+	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, `{"id":"slow","initial_filter_criteria":[`+strings.Join(items, ",")+`]}`)
+	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxSetCompileCost") {
+		t.Fatalf("%d %v, want 400 naming MaxSetCompileCost", code, body)
 	}
 }
 

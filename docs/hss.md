@@ -222,6 +222,42 @@ selects `Contact`, not `Accept-Contact`); every other pattern matches anywhere i
 its field, so anchor it with `^`/`$` to match a whole value. Request-URI patterns
 ignore case.
 
+A few constructs mean one thing to POSIX and another to the Go engine the S-CSCF
+runs, so the API refuses them with 400, naming the construct:
+
+- a backslash inside brackets (`[\.]com`; write `[.]com` or `\.com`);
+- a backslash before anything but an ERE special character, one of
+  `. [ ] ( ) * + ? { } | ^ $ \`: letters and digits (`\d`, `\w`, `\b`, `\x41`,
+  `\n`, `\1`), which some engines read as classes or escapes, `\<`, `\>`, `` \` ``
+  and `\'`, which glibc and musl read as word or value boundaries, and other
+  punctuation (`\-`, `\@`, `\/`, `\:`). Write `[[:digit:]]`, `[[:space:]]` and
+  so on, or the character itself;
+- collating symbols and equivalence classes (`[[.a.]]`, `[[=a=]]`), and
+  `[[:^alpha:]]`, which is not a class name (write `[^[:alpha:]]`);
+- an interval without a lower bound (`a{,3}`; write `a{0,3}`, or `a\{,3\}` for
+  the text).
+
+A backslash before a special character, such as `\.` or `\+`, is a literal and
+is fine. Named classes such as `[[:alpha:]]` hold ASCII characters only, as in
+the POSIX locale: `[[:alpha:]]` does not match `ä`, and `[^[:upper:]]` does.
+
+A pattern is at most 4 KiB (`MaxPatternBytes`); a longer one is refused with
+400 naming the limit. The limit bounds the time to parse a pattern, which for
+some inputs grows with the square of their length. A profile's patterns
+together may cost at most `MaxSetCompileCost` (1 000 000 units) to compile,
+counted in bytes and instructions processed rather than timed. A profile of
+64 ordinary RCS criteria uses about 92% of it and the default RCS profile
+about 2%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
+development host at load 140 to 230, a profile at the limit took 39 to 48 ms
+of CPU (33 to 70 ms wall) to compile when made of 4 KiB patterns, and about
+2 to 2.3 times as long when made of hundreds of short ones; other hosts and
+loads differ, and the HSS compiles a profile several times on each write
+(once, after #120). A profile over it is refused with 400 naming the limit.
+
+The API checks patterns when a profile is written. A profile stored before
+this rule keeps working as it is, and needs these constructs removed when it
+is next changed.
+
 The S-CSCF evaluates a profile for every initial request within a work budget
 (`internal/ifc`, `DefaultMaxWork`) and fails the evaluation of a request the
 budget cannot pay for. Write each condition as a plain header name and a literal

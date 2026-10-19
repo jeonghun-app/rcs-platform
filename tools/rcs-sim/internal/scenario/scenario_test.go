@@ -241,6 +241,19 @@ func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
 	}
 }
 
+func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
+	// get_upload_info resumes only once the bytes held have stayed the same
+	// for 300 ms (docs/rcs-sim.md), so the step cannot be shorter than that.
+	// The value is written out here, not taken from the package, so that a
+	// change to it fails until the documents agree.
+	const quiet = 300 * time.Millisecond
+	ok, results := runAll(t, stack(t), "ft-resume")
+	info := byStep(results)["get_upload_info"]
+	if !ok || time.Duration(info.Millis)*time.Millisecond < quiet {
+		t.Fatalf("ok %v, get_upload_info took %d ms, want at least %v", ok, info.Millis, quiet)
+	}
+}
+
 func TestAnUploadInfoThatWouldOverflowFailsTheStep(t *testing.T) {
 	cfg := stack(t)
 	a := &answering{match: func(r *http.Request) bool {
