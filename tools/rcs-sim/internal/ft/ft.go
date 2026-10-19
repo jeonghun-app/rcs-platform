@@ -20,11 +20,15 @@
 //   - resumes a broken upload with get_upload_info and a PUT with
 //     Content-Range from the first byte the server does not hold.
 //
-// Like rcsjta it retries nothing: a second 401, a PUT answered other than
-// 200, or a 503 is a failure the caller sees. (rcsjta restarts the upload
-// from the beginning when get_upload_info answers anything but 200; this
-// client reports that as ErrNothingHeld and leaves the restart to the
-// caller.)
+// It retries what rcsjta retries and nothing else (HttpUploadManager). The
+// empty POST is sent again on any answer but 401, after the Retry-After of
+// a 503; the multipart POST is sent again on a 503 with a Retry-After above
+// zero. Both count against one budget of three per transfer (RETRY_MAX),
+// which the caller sees in Transfer.BusyRetries. A second 401, any other
+// failure of the upload POST, and a PUT answered other than 200 are
+// failures. (rcsjta restarts the upload from the beginning when
+// get_upload_info answers anything but 200; this client reports that as
+// ErrNothingHeld and leaves the restart to the caller.)
 //
 // Nothing here logs. Errors name the operation and the HTTP status or a
 // fixed network reason (safeerr), never the user name, the password, a URL
@@ -49,6 +53,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
@@ -102,23 +107,90 @@ func IsStatus(err error, code int) bool {
 	return errors.As(err, &se) && se.Status == code
 }
 
+// maxRetries is rcsjta's RETRY_MAX: how often one transfer's upload POSTs
+// are sent again.
+const maxRetries = 3
+
+// maxRetryAfter caps the seconds a Retry-After asks for. rcsjta has no cap;
+// a step's timeout usually ends the wait sooner.
+const maxRetryAfter = 60
+
+// retryUnit is what one Retry-After second waits; tests shorten it.
+var retryUnit = time.Second
+
+// Transfer is the state rcsjta keeps for one file transfer across its
+// requests (an HttpUploadManager).
+type Transfer struct {
+	// BusyRetries counts the upload POSTs sent again, at most three.
+	BusyRetries int
+}
+
+// retry spends one retry of t, if one is left.
+func (t *Transfer) retry() bool {
+	if t.BusyRetries >= maxRetries {
+		return false
+	}
+	t.BusyRetries++
+	return true
+}
+
+// retryAfter reads Retry-After as rcsjta does (getRetryTimeout): whole
+// seconds, and no wait for anything else. It is capped before multiplying,
+// so a large value cannot overflow.
+func retryAfter(v string) time.Duration {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return time.Duration(min(n, maxRetryAfter)) * retryUnit
+}
+
+// sleep waits d, or until ctx ends.
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Precheck sends the empty POST rcsjta starts every upload with and keeps
-// the challenge of its 401. A server that answers anything else is not
-// asking for authentication, which is an error here.
-func (c *Client) Precheck(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UploadURL.String(), nil)
-	if err != nil {
-		return err
+// the challenge of its 401. As rcsjta does, it sends the POST again on any
+// other answer, after the Retry-After of a 503, while t has retries left. A
+// 204 (rcsjta's "authentication not required") is an error here: ft-server
+// always asks. A nil t gives the call a transfer of its own.
+func (c *Client) Precheck(ctx context.Context, t *Transfer) error {
+	if t == nil {
+		t = &Transfer{}
 	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("ft: pre-check: %w", safeerr.Reason(err))
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UploadURL.String(), nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return fmt.Errorf("ft: pre-check: %w", safeerr.Reason(err))
+		}
+		drain(resp)
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized:
+			return c.readChallenge(resp.Header)
+		case resp.StatusCode == http.StatusNoContent || !t.retry():
+			return &StatusError{Op: "pre-check", Status: resp.StatusCode}
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			if err := sleep(ctx, retryAfter(resp.Header.Get("Retry-After"))); err != nil {
+				return fmt.Errorf("ft: pre-check: %w", err)
+			}
+		}
 	}
-	drain(resp)
-	if resp.StatusCode != http.StatusUnauthorized {
-		return &StatusError{Op: "pre-check", Status: resp.StatusCode}
-	}
-	return c.readChallenge(resp.Header)
 }
 
 // readChallenge keeps the last WWW-Authenticate field, the only one rcsjta
@@ -279,23 +351,40 @@ func (u Upload) form() (body []byte, contentType string, err error) {
 	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
-// Send uploads u whole and returns the file-info document.
-func (c *Client) Send(ctx context.Context, u Upload) (FileDocument, error) {
+// Send uploads u whole as part of transfer t and returns the file-info
+// document. As rcsjta does, a 503 with a Retry-After above zero is waited
+// out and the POST sent again while t has retries left; any other answer
+// but 200 is a failure. A nil t gives the call a transfer of its own.
+func (c *Client) Send(ctx context.Context, t *Transfer, u Upload) (FileDocument, error) {
+	if t == nil {
+		t = &Transfer{}
+	}
 	body, ct, err := u.form()
 	if err != nil {
 		return FileDocument{}, err
 	}
-	resp, err := c.do(ctx, "upload", c.UploadURL.Path, func() (*http.Request, error) {
-		r, err := http.NewRequest(http.MethodPost, c.UploadURL.String(), bytes.NewReader(body))
-		if err == nil {
-			r.Header.Set("Content-Type", ct)
+	for {
+		resp, err := c.do(ctx, "upload", c.UploadURL.Path, func() (*http.Request, error) {
+			r, err := http.NewRequest(http.MethodPost, c.UploadURL.String(), bytes.NewReader(body))
+			if err == nil {
+				r.Header.Set("Content-Type", ct)
+			}
+			return r, err
+		})
+		if err != nil {
+			return FileDocument{}, err
 		}
-		return r, err
-	})
-	if err != nil {
-		return FileDocument{}, err
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			if wait := retryAfter(resp.Header.Get("Retry-After")); wait > 0 && t.retry() {
+				drain(resp)
+				if err := sleep(ctx, wait); err != nil {
+					return FileDocument{}, fmt.Errorf("ft: upload: %w", err)
+				}
+				continue
+			}
+		}
+		return readFileDocument(resp, "upload")
 	}
-	return readFileDocument(resp, "upload")
 }
 
 // errCut is the read error that breaks an interrupted upload.
@@ -362,6 +451,47 @@ func (c *Client) UploadInfo(ctx context.Context, tid string) (ResumeDocument, er
 
 // ErrNothingHeld is get_upload_info's 404: start the upload again.
 var ErrNothingHeld = errors.New("ft: the server holds nothing of the upload")
+
+// Settled says how SettledUploadInfo got its answer: how often it asked
+// again, and how many answers were 404.
+type Settled struct {
+	Retries, NotHeld int64
+}
+
+// SettledUploadInfo is the simulator's own wait, not rcsjta's. A device
+// asks get_upload_info once it is back on a network, seconds after the
+// break; a test asks at once, before the server may have noticed the break
+// and stored what it keeps. So this asks every poll until two answers in a
+// row name the same bytes held. A 404 is asked again until within has
+// passed, and then returned as ErrNothingHeld.
+func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll time.Duration) (ResumeDocument, Settled, error) {
+	var st Settled
+	deadline := time.Now().Add(within)
+	last := int64(-1)
+	for {
+		info, err := c.UploadInfo(ctx, tid)
+		held := int64(-1)
+		switch {
+		case errors.Is(err, ErrNothingHeld):
+			st.NotHeld++
+		case err != nil:
+			return info, st, err
+		default:
+			held, _ = info.Held()
+			if held == last {
+				return info, st, nil
+			}
+		}
+		last = held
+		if time.Now().After(deadline) {
+			return info, st, err
+		}
+		if err := sleep(ctx, poll); err != nil {
+			return info, st, err
+		}
+		st.Retries++
+	}
+}
 
 // Resume sends the rest of data from the first byte d says is missing, with
 // a PUT to the resume URL, signed for its path.

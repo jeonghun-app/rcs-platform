@@ -18,9 +18,8 @@ import (
 const thumbnailSize = 2 << 10
 
 // uploadSettle is how long a broken upload may take to show, unchanging, in
-// get_upload_info, and settlePoll how often the simulator asks meanwhile. A
-// device asks once it is back on a network, seconds later; the simulator
-// asks at once, so it must wait for the server to notice the break.
+// get_upload_info, and settlePoll how often the simulator asks meanwhile
+// (ft.Client.SettledUploadInfo).
 const (
 	uploadSettle = 3 * time.Second
 	settlePoll   = 100 * time.Millisecond
@@ -46,12 +45,13 @@ func fileTransfer(r *run) error {
 	var (
 		up  ft.Upload
 		doc ft.FileDocument
+		tr  ft.Transfer
 	)
 	if err := r.step("pre-check", func(ctx context.Context) (map[string]int64, error) {
 		if c == nil {
 			return nil, errNoFTClient
 		}
-		return nil, c.Precheck(ctx)
+		return busy(&tr, func() error { return c.Precheck(ctx, &tr) })
 	}); err != nil {
 		return err
 	}
@@ -69,11 +69,15 @@ func fileTransfer(r *run) error {
 			return nil, err
 		}
 		up = ft.Upload{TID: tid, Name: "photo 1.jpg", ContentType: "image/jpeg", Data: data, Thumbnail: thumb, ThumbnailType: "image/jpeg"}
-		doc, err = c.Send(ctx, up)
+		detail, err := busy(&tr, func() (err error) {
+			doc, err = c.Send(ctx, &tr, up)
+			return err
+		})
 		if err != nil {
-			return nil, err
+			return detail, err
 		}
-		return map[string]int64{"bytes": int64(len(data))}, checkDocument(doc, up)
+		detail["bytes"] = int64(len(data))
+		return detail, checkDocument(doc, up)
 	}); err != nil {
 		return err
 	}
@@ -163,12 +167,13 @@ func fileTransferResumed(r *run) error {
 		up   ft.Upload
 		info ft.ResumeDocument
 		doc  ft.FileDocument
+		tr   ft.Transfer
 	)
 	if err := r.step("pre-check", func(ctx context.Context) (map[string]int64, error) {
 		if c == nil {
 			return nil, errNoFTClient
 		}
-		return nil, c.Precheck(ctx)
+		return busy(&tr, func() error { return c.Precheck(ctx, &tr) })
 	}); err != nil {
 		return err
 	}
@@ -191,11 +196,11 @@ func fileTransferResumed(r *run) error {
 	held := int64(0)
 	if err := r.step("get_upload_info", func(ctx context.Context) (map[string]int64, error) {
 		var (
-			retries, notHeld int64
-			err              error
+			st  ft.Settled
+			err error
 		)
-		info, retries, notHeld, err = settledUploadInfo(ctx, c, up.TID)
-		detail := map[string]int64{"retries": retries, "not_held": notHeld}
+		info, st, err = c.SettledUploadInfo(ctx, up.TID, uploadSettle, settlePoll)
+		detail := map[string]int64{"retries": st.Retries, "not_held": st.NotHeld}
 		switch {
 		case errors.Is(err, ft.ErrNothingHeld):
 			// rcsjta uploads the file again from the start; so does the
@@ -216,15 +221,19 @@ func fileTransferResumed(r *run) error {
 	}
 	if held == 0 {
 		if err := r.step("upload-again", func(ctx context.Context) (map[string]int64, error) {
-			// rcsjta's uploadFile, from its empty POST on.
-			if err := c.Precheck(ctx); err != nil {
-				return nil, err
+			// rcsjta's uploadFile, from its empty POST on, with what is
+			// left of the transfer's retries.
+			detail, err := busy(&tr, func() (err error) {
+				if err = c.Precheck(ctx, &tr); err == nil {
+					doc, err = c.Send(ctx, &tr, up)
+				}
+				return err
+			})
+			if err != nil {
+				return detail, err
 			}
-			var err error
-			if doc, err = c.Send(ctx, up); err != nil {
-				return nil, err
-			}
-			return map[string]int64{"bytes": int64(len(up.Data))}, checkDocument(doc, up)
+			detail["bytes"] = int64(len(up.Data))
+			return detail, checkDocument(doc, up)
 		}); err != nil {
 			return err
 		}
@@ -265,40 +274,12 @@ func fileTransferResumed(r *run) error {
 	})
 }
 
-// settledUploadInfo asks get_upload_info until the server has noticed the
-// break and stored what it will keep: until two answers in a row name the
-// same bytes held. A 404 is asked again until uploadSettle has passed, and
-// then returned as ft.ErrNothingHeld. retries counts the answers asked again
-// for, notHeld the 404s among them; the scenario reports both, so a server
-// that is slow to keep a broken upload shows in the results.
-func settledUploadInfo(ctx context.Context, c *ft.Client, tid string) (info ft.ResumeDocument, retries, notHeld int64, err error) {
-	deadline := time.Now().Add(uploadSettle)
-	last := int64(-1)
-	for {
-		info, err = c.UploadInfo(ctx, tid)
-		held := int64(-1)
-		switch {
-		case errors.Is(err, ft.ErrNothingHeld):
-			notHeld++
-		case err != nil:
-			return info, retries, notHeld, err
-		default:
-			held, _ = info.Held()
-			if held == last {
-				return info, retries, notHeld, nil
-			}
-		}
-		last = held
-		if time.Now().After(deadline) {
-			return info, retries, notHeld, err
-		}
-		select {
-		case <-time.After(settlePoll):
-		case <-ctx.Done():
-			return info, retries, notHeld, ctx.Err()
-		}
-		retries++
-	}
+// busy runs f and reports how many upload POSTs it sent again after a busy
+// answer, as rcsjta does (ft.Transfer).
+func busy(tr *ft.Transfer, f func() error) (map[string]int64, error) {
+	before := tr.BusyRetries
+	err := f()
+	return map[string]int64{"busy_retries": int64(tr.BusyRetries - before)}, err
 }
 
 // checkDocument checks a file-info document against what was uploaded.

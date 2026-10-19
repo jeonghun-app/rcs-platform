@@ -34,6 +34,8 @@ func stack(t *testing.T) scenario.Config {
 	f := simtest.StartFT(t, part)
 	corePort := simtest.FreePort(t)
 	r := simtest.StartRelay(t, corePort)
+	// IdleWait is six keep-alive intervals, so a slow scheduler still sees
+	// one go out.
 	return scenario.Config{
 		FT:         &ft.Client{HTTP: f.Server.Client(), UploadURL: f.UploadURL, User: simtest.FTUser, Password: ft.NewSecret(simtest.FTPassword)},
 		FileSize:   100 << 10,
@@ -41,7 +43,7 @@ func stack(t *testing.T) scenario.Config {
 		Control:    &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)},
 		CoreListen: "127.0.0.1:" + strconv.Itoa(corePort),
 		MSRP:       msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
-		IdleWait:   400 * time.Millisecond,
+		IdleWait:   600 * time.Millisecond,
 		Self:       self, Peer: peer,
 		StepTimeout: 20 * time.Second,
 	}
@@ -153,7 +155,9 @@ type answering struct {
 	status int
 	// body, when set, is sent as an ft document.
 	body string
-	n    atomic.Int32
+	// header is added to the answer.
+	header http.Header
+	n      atomic.Int32
 }
 
 func (a *answering) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -164,7 +168,10 @@ func (a *answering) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.Body != nil {
 		_ = r.Body.Close()
 	}
-	resp := &http.Response{StatusCode: a.status, Header: http.Header{}, Body: http.NoBody, Request: r}
+	resp := &http.Response{StatusCode: a.status, Header: a.header.Clone(), Body: http.NoBody, Request: r}
+	if resp.Header == nil {
+		resp.Header = http.Header{}
+	}
 	if a.body != "" {
 		resp.Header.Set("Content-Type", ft.ContentType)
 		resp.Body = io.NopCloser(strings.NewReader(a.body))
@@ -196,6 +203,22 @@ func TestAResumeAnsweredOtherThan200FailsWithoutARetry(t *testing.T) {
 		if n := a.n.Load(); n != 1 {
 			t.Fatalf("%d: %d PUTs sent, want 1", status, n)
 		}
+	}
+}
+
+func TestABusyUploadIsSentAgainAndCounted(t *testing.T) {
+	cfg := stack(t)
+	// The first signed upload POST is answered 503 with Retry-After: 1, as
+	// ft-server answers a user over its upload rate.
+	var posts atomic.Int32
+	a := &answering{match: func(r *http.Request) bool {
+		return r.Method == http.MethodPost && r.Header.Get("Authorization") != "" && posts.Add(1) == 1
+	}, status: http.StatusServiceUnavailable, header: http.Header{"Retry-After": {"1"}}}
+	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+	ok, results := runAll(t, cfg, "ft")
+	upload := byStep(results)["upload"]
+	if !ok || !upload.OK || upload.Detail["busy_retries"] != 1 || posts.Load() != 2 {
+		t.Fatalf("ok %v, upload %+v, %d POSTs", ok, upload, posts.Load())
 	}
 }
 

@@ -29,3 +29,16 @@ func FuzzDocuments(f *testing.F) {
 		}
 	})
 }
+
+// FuzzRetryAfter: whatever a server sends as Retry-After, the wait is never
+// negative and never over the cap.
+func FuzzRetryAfter(f *testing.F) {
+	for _, s := range []string{"0", "5", "120", "-1", "+3", "Fri, 31 Dec 1999 23:59:59 GMT", "", "99999999999999999999", "9223372036854775807"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, v string) {
+		if d := retryAfter(v); d < 0 || d > maxRetryAfter*retryUnit {
+			t.Fatalf("retryAfter(%q) = %v", v, d)
+		}
+	})
+}

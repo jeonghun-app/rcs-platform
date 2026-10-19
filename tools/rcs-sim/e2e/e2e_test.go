@@ -81,7 +81,8 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		"-resume-size", strconv.Itoa(resumeSize),
 		"-relay-control", "http://127.0.0.1:"+control,
 		"-core-listen", "127.0.0.1:"+core,
-		"-msrp-keepalive", "500ms", "-idle-wait", "1500ms",
+		// Quiet for five keep-alive intervals.
+		"-msrp-keepalive", "300ms", "-idle-wait", "1500ms",
 		"all")
 	cmd.Env = append(os.Environ(),
 		"RCS_SIM_FT_USER="+ftUser, "RCS_SIM_FT_PASSWORD="+ftPassword, "RCS_SIM_RELAY_TOKEN="+relayToken)
@@ -126,6 +127,13 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 	if info := seen["ft-resume/get_upload_info"]; info.Detail["retries"] > maxInfoRetries {
 		t.Errorf("get_upload_info asked again %d times (%d of them 404), more than %d: ft-server is slow to keep a broken upload",
 			info.Detail["retries"], info.Detail["not_held"], maxInfoRetries)
+	}
+	// Nothing on an idle stack is busy: a retry rcsjta would make here
+	// would hide an overloaded or misconfigured ft-server.
+	for name, r := range seen {
+		if n := r.Detail["busy_retries"]; n != 0 {
+			t.Errorf("%s: %d upload POSTs sent again after 503", name, n)
+		}
 	}
 	// The same rule as the unit tests' (scenario_test.go): no secret, test
 	// number, URL or address, on either stream.

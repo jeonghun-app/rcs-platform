@@ -10,8 +10,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"net/textproto"
 	"net/url"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -26,6 +28,9 @@ var (
 	ErrCertificate = errors.New("server certificate not accepted")
 	ErrClosed      = errors.New("connection closed")
 	ErrNetwork     = errors.New("network error")
+	// ErrNotHTTP is an answer that is not HTTP, from something else
+	// listening on the port, say. Go's error would quote its bytes.
+	ErrNotHTTP = errors.New("the answer is not HTTP")
 )
 
 // Reason returns err as a fixed reason when it is a network failure, and err
@@ -46,6 +51,7 @@ func Reason(err error) error {
 		hn   x509.HostnameError
 		ua   x509.UnknownAuthorityError
 		rec  tls.RecordHeaderError
+		hdr  textproto.ProtocolError
 	)
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
@@ -77,6 +83,10 @@ func Reason(err error) error {
 			return ErrTimeout
 		}
 		return ErrNetwork
+	case errors.As(err, &hdr), ue != nil && strings.Contains(err.Error(), "malformed HTTP"):
+		// net/http's own parse errors have no exported type; inside a
+		// *url.Error, "malformed HTTP" names only them.
+		return ErrNotHTTP
 	}
 	return err
 }

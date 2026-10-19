@@ -49,16 +49,28 @@ The FT client follows the GSMA rcsjta reference client
   start (`upload-again`).
 - It downloads the rest of a file with `Range: bytes=<received>-<total>`
   (HttpDownloadManager), one past the last byte.
-- Like rcsjta, it retries nothing else: a 401 to a signed request, a 503, or a
-  PUT answered other than 200 fails the step.
+- It sends the upload POSTs again where rcsjta does (HttpUploadManager), and
+  at most three times per transfer between them (`RETRY_MAX`):
+  - the empty POST on any answer but 401, after the `Retry-After` of a 503
+    (a 204, "no authentication", is an error here: ft-server always asks);
+  - the multipart POST on a 503 whose `Retry-After` is above zero only.
+
+  The steps report these as `busy_retries`.
+- It retries nothing else: a 401 to a signed request, a 503 to anything but
+  the upload POSTs, a 503 without a usable `Retry-After`, or a PUT answered
+  other than 200 fails the step.
 
 One wait is the simulator's own. A device resumes once it is back on a
 network, seconds after the break; the simulator asks at once, before
 `ft-server` may have noticed the break. So `get_upload_info` asks again, every
 100 ms for up to 3 s, until it answers 404 no more and two answers in a row
 name the same bytes held. The step reports how often it asked again
-(`retries`) and how many of those were 404 (`not_held`), and `make e2e` bounds
-both, so a server that is slow to keep a broken upload shows.
+(`retries`) and how many of those answers were 404 (`not_held`).
+
+`make e2e` asserts that `retries` is at most 10, that `ft-resume` resumed
+rather than uploading again, and that `busy_retries` is 0 on every step. So a
+server that is slow to keep a broken upload, or busy on an idle stack, fails
+the run.
 
 The chat client connects actively, as a device behind NAT does: over TLS for
 an `msrps:` path, plain for `msrp:`. It binds the session with a bodiless SEND

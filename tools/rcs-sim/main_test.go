@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -78,7 +80,9 @@ func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 	args := []string{
 		"-ft-upload-url", f.UploadURL.String(), "-resume-size", strconv.Itoa(5*64<<10 + 1),
 		"-relay-control", r.Control.String(), "-core-listen", "127.0.0.1:" + strconv.Itoa(corePort),
-		"-msrp-keepalive", "100ms", "-idle-wait", "300ms",
+		// Quiet for six keep-alive intervals, so a slow scheduler still
+		// sees one go out.
+		"-msrp-keepalive", "100ms", "-idle-wait", "600ms",
 		"all",
 	}
 	code, out, errOut := call(lookup, args...)
@@ -111,17 +115,38 @@ func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 }
 
 // Failed results name a fixed reason, never the address or host name that
-// failed, nor the resolver asked (QA's regression test on #68).
+// failed, nor the resolver asked, nor what a server that is not HTTP sent
+// (QA's regression test on #68).
 func TestFailureResultsCarryNoAddress(t *testing.T) {
 	port := strconv.Itoa(simtest.FreePort(t))
+	// Something else listening where ft-server was expected.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Read the request first: Go treats bytes that arrive before
+			// it asks as a stray answer on an idle connection.
+			_, _ = http.ReadRequest(bufio.NewReader(c))
+			_, _ = c.Write([]byte("SSH-2.0-OpenSSH secret-host.example\r\n"))
+			_ = c.Close()
+		}
+	}()
+	banner := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 	lookup := env("RCS_SIM_FT_USER", "u", "RCS_SIM_FT_PASSWORD", "p", "RCS_SIM_RELAY_TOKEN", simtest.RelayToken)
-	for _, host := range []string{"127.0.0.1:" + port, "ft.operator-host.invalid"} {
+	for _, host := range []string{"127.0.0.1:" + port, "ft.operator-host.invalid", "127.0.0.1:" + banner} {
 		code, out, errOut := call(lookup, "-ft-upload-url", "http://"+host+"/ft",
 			"-relay-control", "http://"+host, "-step-timeout", "2s", "ft", "chat-client-originated")
 		if code != exitFailed || strings.Count(out, `"ok":false`) != 2 {
 			t.Fatalf("%s: exit %d, output %q", host, code, out)
 		}
-		for _, leak := range []string{port, "127.0.0.1", "operator-host", ":53"} {
+		for _, leak := range []string{port, banner, "127.0.0.1", "operator-host", ":53", "secret-host"} {
 			if strings.Contains(out+errOut, leak) {
 				t.Errorf("%s: output names %q:\n%s", host, leak, out)
 			}

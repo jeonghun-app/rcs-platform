@@ -1,6 +1,7 @@
 package safeerr_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -111,5 +112,43 @@ func TestAnUntrustedServerIsACertificateFailure(t *testing.T) {
 	_, err := (&http.Client{Transport: &http.Transport{}}).Get(srv.URL)
 	if got := safeerr.Reason(err); got != safeerr.ErrCertificate {
 		t.Fatalf("Reason(%v) = %v", err, got)
+	}
+}
+
+// answering listens on loopback and answers every request with reply,
+// once it has read the request: a reply sent earlier would reach a client
+// that has not asked yet, which Go reports differently.
+func answering(t *testing.T, reply string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = http.ReadRequest(bufio.NewReader(c))
+			_, _ = c.Write([]byte(reply))
+			_ = c.Close()
+		}
+	}()
+	return "http://" + ln.Addr().String() + "/ft"
+}
+
+func TestAnAnswerThatIsNotHTTPIsNotQuoted(t *testing.T) {
+	for _, reply := range []string{
+		"SSH-2.0-OpenSSH secret-host.example 10.9.8.7\r\n",
+		"HTTP/1.1 2x0 secret-host.example\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nsecret-host.example 10.9.8.7\r\n\r\n",
+	} {
+		_, err := http.Get(answering(t, reply))
+		got := safeerr.Reason(err)
+		if got != safeerr.ErrNotHTTP {
+			t.Errorf("%q: Reason(%v) = %v", reply, err, got)
+		}
 	}
 }

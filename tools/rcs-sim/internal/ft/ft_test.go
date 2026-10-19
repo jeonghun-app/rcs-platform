@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -44,12 +45,12 @@ func ctx(t *testing.T) context.Context {
 func TestUploadThenDownloadAsRcsjtaDoes(t *testing.T) {
 	s := simtest.StartFT(t, part)
 	c := newClient(t, s, simtest.FTPassword)
-	if err := c.Precheck(ctx(t)); err != nil {
+	if err := c.Precheck(ctx(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	up := ft.Upload{TID: "tid-1", Name: "a photo.jpg", ContentType: "image/jpeg", Data: content(t, 3*part+5),
 		Thumbnail: content(t, 100), ThumbnailType: "image/png"}
-	doc, err := c.Send(ctx(t), up)
+	doc, err := c.Send(ctx(t), nil, up)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,41 +85,25 @@ func TestUploadThenDownloadAsRcsjtaDoes(t *testing.T) {
 func TestBrokenUploadIsResumedFromWhatTheServerHolds(t *testing.T) {
 	s := simtest.StartFT(t, part)
 	c := newClient(t, s, simtest.FTPassword)
-	if err := c.Precheck(ctx(t)); err != nil {
+	if err := c.Precheck(ctx(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	up := ft.Upload{TID: "tid-resume", Name: "v.mp4", ContentType: "video/mp4", Data: content(t, 5*part+11)}
 	if err := c.SendInterrupted(ctx(t), up, 4*part); err != nil {
 		t.Fatal(err)
 	}
-	var info ft.ResumeDocument
-	// The server notices the break on its own time; until then it may hold
-	// less, which is what get_upload_info reports.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var err error
-		info, err = c.UploadInfo(ctx(t), up.TID)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, ft.ErrNothingHeld) || time.Now().After(deadline) {
-			t.Fatalf("get_upload_info = %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The scenario's rule: two answers in a row with the same bytes held,
+	// so the server has noticed the break and released the upload. The PUT
+	// is then sent once, as rcsjta sends it.
+	info, _, err := c.SettledUploadInfo(ctx(t), up.TID, 10*time.Second, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("get_upload_info = %v", err)
 	}
 	held, err := info.Held()
 	if err != nil || held <= 0 || held%part != 0 || held >= int64(len(up.Data)) {
 		t.Fatalf("held %d, %v", held, err)
 	}
-	// While the server is still storing the broken upload, a PUT from
-	// what it reported a moment ago gets 409; the client asks again.
 	doc, err := c.Resume(ctx(t), info, up.ContentType, up.Data)
-	for attempt := 0; ft.IsStatus(err, http.StatusConflict) && attempt < 10; attempt++ {
-		time.Sleep(50 * time.Millisecond)
-		if info, err = c.UploadInfo(ctx(t), up.TID); err == nil {
-			doc, err = c.Resume(ctx(t), info, up.ContentType, up.Data)
-		}
-	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +117,7 @@ func TestBrokenUploadIsResumedFromWhatTheServerHolds(t *testing.T) {
 func TestUploadInfoOfAnUnknownTransferHoldsNothing(t *testing.T) {
 	s := simtest.StartFT(t, part)
 	c := newClient(t, s, simtest.FTPassword)
-	if err := c.Precheck(ctx(t)); err != nil {
+	if err := c.Precheck(ctx(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.UploadInfo(ctx(t), "never"); !errors.Is(err, ft.ErrNothingHeld) {
@@ -146,10 +131,10 @@ func TestUploadInfoOfAnUnknownTransferHoldsNothing(t *testing.T) {
 func TestWrongPasswordIsA401WithoutTheCredentials(t *testing.T) {
 	s := simtest.StartFT(t, part)
 	c := newClient(t, s, "not-the-password")
-	if err := c.Precheck(ctx(t)); err != nil {
+	if err := c.Precheck(ctx(t), nil); err != nil {
 		t.Fatal(err)
 	}
-	_, err := c.Send(ctx(t), ft.Upload{TID: "x", Name: "x", ContentType: "text/plain", Data: []byte("x")})
+	_, err := c.Send(ctx(t), nil, ft.Upload{TID: "x", Name: "x", ContentType: "text/plain", Data: []byte("x")})
 	if !ft.IsStatus(err, http.StatusUnauthorized) {
 		t.Fatalf("Send = %v, want 401", err)
 	}
@@ -165,7 +150,7 @@ func TestRequestsBeforeAChallengeAreRefused(t *testing.T) {
 	if _, err := c.UploadInfo(ctx(t), "x"); err == nil {
 		t.Fatal("a request went out without a challenge")
 	}
-	if err := c.Precheck(ctx(t)); err == nil || strings.Contains(err.Error(), "127.0.0.1") {
+	if err := c.Precheck(ctx(t), nil); err == nil || strings.Contains(err.Error(), "127.0.0.1") {
 		t.Fatalf("Precheck = %v; want a transport error without the address", err)
 	}
 }
@@ -196,7 +181,7 @@ func TestInfoRequestsGoOutUnauthenticatedFirstAndUseTheFreshNonce(t *testing.T) 
 		}
 		w.WriteHeader(http.StatusNotFound)
 	})
-	if err := c.Precheck(ctx(t)); err != nil {
+	if err := c.Precheck(ctx(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.UploadInfo(ctx(t), "x"); !errors.Is(err, ft.ErrNothingHeld) {
@@ -223,6 +208,119 @@ func TestABusyServerIsAFailureNotARetry(t *testing.T) {
 	})
 	if _, err := c.UploadInfo(ctx(t), "x"); !ft.IsStatus(err, http.StatusServiceUnavailable) || signed != 1 {
 		t.Fatalf("UploadInfo = %v after %d signed requests", err, signed)
+	}
+}
+
+// fileDocument is a minimal file-info document a fake server answers with.
+const fileDocument = `<?xml version="1.0"?><file xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-info type="file">` +
+	`<file-size>1</file-size><file-name>x</file-name><content-type>text/plain</content-type>` +
+	`<data url="https://ft.example.test/dl?id=x" until="2026-01-01T00:00:00Z"/></file-info></file>`
+
+// script answers the requests a fake server gets with statuses in turn (the
+// last one repeats), a 401 with the challenge, any other status with
+// retryAfter as Retry-After when set, and 200 with fileDocument.
+func script(t *testing.T, retryAfter string, statuses ...int) (*ft.Client, *int) {
+	t.Helper()
+	calls := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		st := statuses[min(calls, len(statuses)-1)]
+		calls++
+		switch st {
+		case http.StatusUnauthorized:
+			w.Header().Set("WWW-Authenticate", challenge)
+		case http.StatusOK:
+			w.Header().Set("Content-Type", ft.ContentType)
+			w.WriteHeader(st)
+			_, _ = io.WriteString(w, fileDocument)
+			return
+		default:
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+		}
+		w.WriteHeader(st)
+	})
+	return c, &calls
+}
+
+func TestTheEmptyPostIsSentAgainAsRcsjtaDoes(t *testing.T) {
+	// HttpUploadManager.uploadFile: a 503 is waited out, and any answer but
+	// 401 or 204 is sent again, up to RETRY_MAX (3).
+	ft.ShortRetryAfter(t)
+	c, calls := script(t, "1", http.StatusServiceUnavailable, http.StatusInternalServerError, http.StatusUnauthorized)
+	var tr ft.Transfer
+	if err := c.Precheck(ctx(t), &tr); err != nil || tr.BusyRetries != 2 || *calls != 3 {
+		t.Fatalf("Precheck = %v, %d retries, %d calls", err, tr.BusyRetries, *calls)
+	}
+	c, calls = script(t, "1", http.StatusServiceUnavailable)
+	tr = ft.Transfer{}
+	if err := c.Precheck(ctx(t), &tr); !ft.IsStatus(err, http.StatusServiceUnavailable) || tr.BusyRetries != 3 || *calls != 4 {
+		t.Fatalf("Precheck = %v, %d retries, %d calls; want 503 after 3 retries", err, tr.BusyRetries, *calls)
+	}
+	c, calls = script(t, "", http.StatusNoContent)
+	if err := c.Precheck(ctx(t), nil); !ft.IsStatus(err, http.StatusNoContent) || *calls != 1 {
+		t.Fatalf("Precheck = %v after %d calls; a server that asks for no authentication is an error", err, *calls)
+	}
+}
+
+func TestTheUploadPostWaitsOutA503WithRetryAfterOnly(t *testing.T) {
+	// HttpUploadManager.sendMultipartPost: a 503 is sent again only when its
+	// Retry-After is above zero; anything else but 200 aborts.
+	ft.ShortRetryAfter(t)
+	up := ft.Upload{TID: "x", Name: "x", ContentType: "text/plain", Data: []byte("x")}
+	c, calls := script(t, "1", http.StatusUnauthorized, http.StatusServiceUnavailable, http.StatusOK)
+	var tr ft.Transfer
+	if err := c.Precheck(ctx(t), &tr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Send(ctx(t), &tr, up); err != nil || tr.BusyRetries != 1 || *calls != 3 {
+		t.Fatalf("Send = %v, %d retries, %d calls", err, tr.BusyRetries, *calls)
+	}
+	for _, retryAfter := range []string{"", "0", "-1", "soon"} {
+		c, calls := script(t, retryAfter, http.StatusUnauthorized, http.StatusServiceUnavailable, http.StatusOK)
+		tr := ft.Transfer{}
+		if err := c.Precheck(ctx(t), &tr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Send(ctx(t), &tr, up); !ft.IsStatus(err, http.StatusServiceUnavailable) || tr.BusyRetries != 0 || *calls != 2 {
+			t.Fatalf("Retry-After %q: Send = %v, %d retries, %d calls", retryAfter, err, tr.BusyRetries, *calls)
+		}
+	}
+	c, calls = script(t, "1", http.StatusUnauthorized, http.StatusInternalServerError, http.StatusOK)
+	if _, err := c.Send(ctx(t), nil, up); err == nil {
+		t.Fatal("Send before a challenge succeeded")
+	}
+	if err := c.Precheck(ctx(t), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Send(ctx(t), nil, up); !ft.IsStatus(err, http.StatusInternalServerError) || *calls != 2 {
+		t.Fatalf("Send = %v after %d calls; a 500 is not retried", err, *calls)
+	}
+}
+
+func TestOneTransferHasThreeRetriesInAll(t *testing.T) {
+	ft.ShortRetryAfter(t)
+	// Three spent on the empty POST leave none for the upload's 503.
+	c, calls := script(t, "1", http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusServiceUnavailable,
+		http.StatusUnauthorized, http.StatusServiceUnavailable, http.StatusOK)
+	var tr ft.Transfer
+	if err := c.Precheck(ctx(t), &tr); err != nil || tr.BusyRetries != 3 {
+		t.Fatalf("Precheck = %v, %d retries", err, tr.BusyRetries)
+	}
+	_, err := c.Send(ctx(t), &tr, ft.Upload{TID: "x", Name: "x", ContentType: "text/plain", Data: []byte("x")})
+	if !ft.IsStatus(err, http.StatusServiceUnavailable) || *calls != 5 {
+		t.Fatalf("Send = %v after %d calls", err, *calls)
+	}
+}
+
+func TestRetryAfterIsWholeSecondsCapped(t *testing.T) {
+	for v, want := range map[string]time.Duration{
+		"5": 5 * time.Second, "+2": 2 * time.Second, "0": 0, "-1": 0, "": 0, " 5": 0,
+		"Fri, 31 Dec 1999 23:59:59 GMT": 0, "3600": time.Minute, "99999999999999999999": 0, "9223372036854775807": time.Minute,
+	} {
+		if got := ft.RetryAfter(v); got != want {
+			t.Errorf("retryAfter(%q) = %v, want %v", v, got, want)
+		}
 	}
 }
 
@@ -256,7 +354,7 @@ func TestPrecheckNeedsAChallenge(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := fakeServer(t, h).Precheck(ctx(t)); err == nil {
+			if err := fakeServer(t, h).Precheck(ctx(t), nil); err == nil {
 				t.Fatal("Precheck accepted it")
 			}
 		})
@@ -284,7 +382,7 @@ func TestMalformedDocumentsAreErrors(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(body))
 			})
-			if err := c.Precheck(ctx(t)); err != nil {
+			if err := c.Precheck(ctx(t), nil); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := c.UploadInfo(ctx(t), "x"); err == nil {
@@ -314,7 +412,7 @@ func TestFileDocumentsMustBeTheRightTypeAndNameTheFile(t *testing.T) {
 				}
 				h(w, r)
 			})
-			if err := c.Precheck(ctx(t)); err != nil {
+			if err := c.Precheck(ctx(t), nil); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := c.DownloadInfo(ctx(t), "x"); err == nil {
