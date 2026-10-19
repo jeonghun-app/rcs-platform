@@ -67,11 +67,15 @@
 // reads an ERE, also where Perl syntax, which Go's matcher reads, would
 // differ: "0+?" is (0+)?, not a lazy repetition; and, as regexec reads a
 // value without REG_NEWLINE, "." and "[^x]" match a newline and "^" and "$"
-// only the ends of the value. Go's parser still departs from IEEE 1003.1 in
-// two ways: a backslash inside brackets escapes ("[\.]" is a dot, not a
-// backslash or a dot) and escapes such as "\x41" are accepted. Wrapping a
-// pattern in ".*" on both sides never changes what it selects. Operators
-// writing iFC, and docs/hss.md, follow these rules.
+// only the ends of the value. Where Go's parser departs from IEEE 1003.1,
+// Compile refuses the pattern and names the construct rather than compile
+// Go's reading (#67): a backslash inside a bracket expression ("[\.]" is a
+// backslash or a dot in POSIX, a dot in Go), a backslash before a letter or
+// digit ("\x41", "\d", "\n", "\1"), and collating symbols and equivalence
+// classes ("[[.a.]]", "[[=a=]]"). A backslash before punctuation ("\.",
+// "\+") is a literal, as everywhere. Wrapping a pattern in ".*" on both
+// sides never changes what it selects. Operators writing iFC, and
+// docs/hss.md, follow these rules.
 //
 // # Presenting a SIP request
 //

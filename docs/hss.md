@@ -222,6 +222,16 @@ selects `Contact`, not `Accept-Contact`); every other pattern matches anywhere i
 its field, so anchor it with `^`/`$` to match a whole value. Request-URI patterns
 ignore case.
 
+A few constructs mean one thing to POSIX and another to the Go engine the S-CSCF
+runs, so the API refuses them with 400, naming the construct:
+
+- a backslash inside brackets (`[\.]com`; write `[.]com` or `\.com`);
+- a backslash before a letter or digit (`\d`, `\w`, `\s`, `\b`, `\p`, `\x41`,
+  `\n`, `\1`; write `[[:digit:]]`, `[[:space:]]` and so on, or the character itself);
+- collating symbols and equivalence classes (`[[.a.]]`, `[[=a=]]`).
+
+A backslash before punctuation, such as `\.` or `\+`, is a literal and is fine.
+
 The S-CSCF evaluates a profile for every initial request within a work budget
 (`internal/ifc`, `DefaultMaxWork`) and fails the evaluation of a request the
 budget cannot pay for. Write each condition as a plain header name and a literal
