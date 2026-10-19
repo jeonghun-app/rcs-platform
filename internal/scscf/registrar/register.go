@@ -518,6 +518,11 @@ func (g *Registrar) ok(req *sip.Request, r *register, bindings []state.Contact, 
 	if set != nil && len(bindings) > 0 {
 		u := g.cfg.ServiceRoute
 		u.Params = append(sip.Params(nil), u.Params...)
+		if _, ok := u.Param("transport"); !ok {
+			// pcscf resolves a route without it as UDP, and reaches the
+			// core over TCP only (#208).
+			u.Params.Set("transport", "tcp")
+		}
 		u.Params.SetFlag("lr")
 		u.Params.SetFlag("orig")
 		fields = append(fields, [2]string{"Service-Route", "<" + u.String() + ">"})

@@ -9,6 +9,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -39,7 +40,7 @@ func TestAnAKARegistrationIsChallengedThenAccepted(t *testing.T) {
 		!strings.Contains(contacts[0], `+sip.instance="<urn:uuid:00000000-0000-0000-0000-000000000001>"`) {
 		t.Errorf("Contact %q", contacts)
 	}
-	if got := res.Header.Get("Service-Route"); got != "<sip:scscf."+realm+";lr;orig>" {
+	if got := res.Header.Get("Service-Route"); got != "<sip:scscf."+realm+";transport=tcp;lr;orig>" {
 		t.Errorf("Service-Route %q", got)
 	}
 	if got := res.Header.Values("P-Associated-URI"); len(got) != 2 || got[0] != "<"+impu1+">" || got[1] != "<"+tel1+">" {
@@ -409,5 +410,18 @@ func TestAUEThatCouldNotAuthenticateTheNetworkIsForbiddenAndTheHSSIsTold(t *test
 	wantStatus(t, g.Register(bg, u.request(600, forged), upstream), 401)
 	if _, n := e.hss.counts(); n != sars {
 		t.Error("a forged failure report reached SAR")
+	}
+}
+
+func TestTheServiceRouteKeepsAConfiguredTransport(t *testing.T) {
+	e := newEnv(t)
+	u, err := sip.ParseURI("sip:scscf." + realm + ";transport=tls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := e.instance(1, func(c *Config) { c.ServiceRoute = u })
+	res := e.akaUser(impi1, impu1).registerWith(g, 600)
+	if got := res.Header.Get("Service-Route"); got != "<sip:scscf."+realm+";transport=tls;lr;orig>" {
+		t.Errorf("Service-Route %q", got)
 	}
 }

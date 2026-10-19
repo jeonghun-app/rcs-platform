@@ -52,7 +52,8 @@ type Config struct {
 	Realm string
 	// ServiceRoute is the S-CSCF's service URI, such as sip:scscf.rcs.local;
 	// the registrar returns it with lr and orig (TS 24.229 §5.4.1.2.2) so
-	// that originating requests come back to any instance.
+	// that originating requests come back to any instance, and with
+	// transport=tcp unless it names a transport.
 	ServiceRoute sip.URI
 	// NonceKey authenticates Digest nonces; every instance uses the same one
 	// (digest.ServerConfig.NonceKey).
