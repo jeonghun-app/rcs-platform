@@ -11,10 +11,11 @@
 // unknown and answered 430 Flow Failed (RFC 5626 §5.3).
 //
 // This version serves the edge only: it opens the listeners, recognises
-// itself in Route by its public FQDN or its addresses, removes the headers
-// only the network may set from client requests (TS 24.229 §5.2, ADR 0007
-// §7), limits the flows of one client address, and drains flows gradually
-// on shutdown. Registration, originating and terminating routing follow in
-// later changes (#16); until then a client's request is refused with 403 and
-// one from the core with 430.
+// itself in Route by its public FQDN, the NLB's addresses or its own, removes
+// the headers only the network may set from every message a client sends
+// (TS 24.229 §5.2.1, ADR 0007 §7), limits the client flows of one client and
+// in all, and drains client flows gradually on shutdown while the core
+// listener stays open. Registration, originating and terminating routing
+// follow in later changes (#16); until then a client's request is refused
+// with 403 and one from the core with 430.
 package pcscf

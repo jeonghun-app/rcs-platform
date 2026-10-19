@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -506,12 +507,15 @@ func (t *Transport) SetFlowIdleTimeout(id FlowID, d time.Duration) bool {
 // StopListening closes the TCP and TLS listeners, so no new connection is
 // accepted, and leaves every flow open. UDP sockets stay open, since UDP flows
 // and every UDP send use them. It is the first step of a gradual shutdown.
-func (t *Transport) StopListening() {
+// With names it closes only the listeners of those names: a service that
+// drains its clients keeps the listener its core peers use (pcscf, ADR
+// 0003). Names no listener has are ignored.
+func (t *Transport) StopListening(names ...string) {
 	t.mu.Lock()
 	lis := t.listeners
 	t.mu.Unlock()
 	for _, l := range lis {
-		if l.ln != nil {
+		if l.ln != nil && (len(names) == 0 || slices.Contains(names, l.name)) {
 			l.stop()
 		}
 	}

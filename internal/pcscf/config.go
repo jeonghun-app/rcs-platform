@@ -25,6 +25,12 @@ const (
 // Defaults of the settings in docs/pcscf.md.
 const (
 	DefaultCoreAddr = "0.0.0.0:5070"
+	// DefaultMaxClientFlows and DefaultCoreConnections split the transport's
+	// DefaultMaxConnections: client flows may take no more than their share,
+	// so the core listener always has room for scscf (review of #188).
+	DefaultMaxConnections  = 10_000
+	DefaultMaxClientFlows  = 9_000
+	DefaultCoreConnections = 256
 	// DefaultMaxFlowsPerIP is generous because mobile clients share public
 	// addresses behind carrier-grade NAT (#16 plan, question 1).
 	DefaultMaxFlowsPerIP = 1024
@@ -39,10 +45,12 @@ const (
 
 // Config is pcscf's configuration (docs/pcscf.md).
 type Config struct {
-	// PublicHost is the name clients dial, the NLB's or an operator FQDN, and
-	// PublicPort its port: pcscf recognises itself in Route by them.
-	PublicHost string
-	PublicPort int
+	// PublicHost is the name clients dial, the NLB's or an operator FQDN,
+	// PublicAddrs the NLB's public addresses it resolves to, and PublicPort
+	// their port: pcscf recognises itself in Route by them.
+	PublicHost  string
+	PublicAddrs []netip.Addr
+	PublicPort  int
 	// ClientTransport is one of ClientTLS, ClientNLBTLS and ClientTCP, and
 	// ClientAddr the address its listener binds.
 	ClientTransport string
@@ -62,6 +70,10 @@ type Config struct {
 	ProxyProtocol bool
 	// MaxFlowsPerIP bounds the client flows of one client address.
 	MaxFlowsPerIP int
+	// MaxConnections bounds the connections the transport accepts, and
+	// MaxClientFlows the client flows among them; CoreConnections of the
+	// rest are kept for the core listener.
+	MaxConnections, MaxClientFlows, CoreConnections int
 	// ClientIdleTimeout closes a quiet client connection.
 	ClientIdleTimeout time.Duration
 	// DrainTimeout is how long a stop spreads the closing of client flows
@@ -78,7 +90,7 @@ var interfaceAddrs = net.InterfaceAddrs
 func Configure(s *runtime.Settings) Config {
 	e := s.Env
 	c := Config{
-		PublicHost:        strings.ToLower(e.RequiredString("PUBLIC_HOST")),
+		PublicHost:        strings.TrimSuffix(strings.ToLower(e.RequiredString("PUBLIC_HOST")), "."),
 		ClientTransport:   e.String("CLIENT_TRANSPORT", ClientTLS),
 		TLSCertFile:       e.String("TLS_CERT_FILE", ""),
 		TLSKeyFile:        e.String("TLS_KEY_FILE", ""),
@@ -86,11 +98,24 @@ func Configure(s *runtime.Settings) Config {
 		CoreAddr:          e.String("CORE_ADDR", DefaultCoreAddr),
 		ProxyProtocol:     s.Shared.Bool("PROXY_PROTOCOL", false),
 		MaxFlowsPerIP:     e.Int("MAX_FLOWS_PER_IP", DefaultMaxFlowsPerIP),
+		MaxConnections:    e.Int("MAX_CONNECTIONS", DefaultMaxConnections),
+		MaxClientFlows:    e.Int("MAX_CLIENT_FLOWS", DefaultMaxClientFlows),
+		CoreConnections:   e.Int("CORE_CONNECTIONS", DefaultCoreConnections),
 		ClientIdleTimeout: e.Duration("CLIENT_IDLE_TIMEOUT", DefaultClientIdleTimeout),
 	}
 	if c.PublicHost != "" && !validHostName(c.PublicHost) {
 		e.Invalid("PUBLIC_HOST", "not a host name")
 	}
+	for i, v := range e.List("PUBLIC_ADDRS", nil) {
+		a, err := netip.ParseAddr(v)
+		if err != nil || a.Zone() != "" {
+			e.Invalid("PUBLIC_ADDRS", "item "+strconv.Itoa(i+1)+" is not an IP address")
+			continue
+		}
+		c.PublicAddrs = append(c.PublicAddrs, a.Unmap())
+	}
+	s.ForbidInProduction(len(c.PublicAddrs) == 0,
+		"PCSCF_PUBLIC_ADDRS is unset: clients put the NLB's address in their first Route (TS 24.229 §5.1.2A.1.1), which pcscf would not take as its own")
 	defaultPort := 5061
 	switch c.ClientTransport {
 	case ClientTLS:
@@ -122,8 +147,19 @@ func Configure(s *runtime.Settings) Config {
 		"PCSCF_CLIENT_UDP_ADDR is set: the NLB's fixed 120 s UDP flow timeout would send a client's packets to another task (ADR 0003)")
 	s.ForbidInProduction(!c.ProxyProtocol,
 		"RCS_PROXY_PROTOCOL is false: every client would appear as the load balancer, so flows and per-client limits could not work (ADR 0003)")
-	if c.MaxFlowsPerIP <= 0 {
-		e.Invalid("MAX_FLOWS_PER_IP", "must be positive")
+	for _, n := range []struct {
+		name string
+		v    int
+	}{
+		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
+		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
+	} {
+		if n.v <= 0 {
+			e.Invalid(n.name, "must be positive")
+		}
+	}
+	if c.MaxClientFlows+c.CoreConnections > c.MaxConnections {
+		e.Invalid("MAX_CLIENT_FLOWS", "plus PCSCF_CORE_CONNECTIONS must not exceed PCSCF_MAX_CONNECTIONS")
 	}
 	if c.ClientIdleTimeout <= 0 {
 		e.Invalid("CLIENT_IDLE_TIMEOUT", "must be greater than zero")
@@ -156,7 +192,6 @@ func Configure(s *runtime.Settings) Config {
 // validHostName reports whether h is a DNS name pcscf can be dialled by:
 // dot-separated labels of letters, digits and inner hyphens.
 func validHostName(h string) bool {
-	h = strings.TrimSuffix(h, ".")
 	if h == "" || len(h) > 253 {
 		return false
 	}
