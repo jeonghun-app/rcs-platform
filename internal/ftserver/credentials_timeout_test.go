@@ -15,40 +15,71 @@ import (
 // backstop bounds each test below whatever the code under test does.
 const backstop = 10 * time.Second
 
-// silentHSS accepts every request and never answers it, until the test ends.
-func silentHSS(t *testing.T) *hss {
+// stallingHSS accepts every request and stalls it until the test ends:
+// before any answer, or, with headers set, after sending 200 headers and
+// before the body.
+func stallingHSS(t *testing.T, headers bool) *hss {
 	release := make(chan struct{})
-	h := newHSS(t, func(http.ResponseWriter, *http.Request) { <-release })
+	h := newHSS(t, func(w http.ResponseWriter, _ *http.Request) {
+		if headers {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+		}
+		<-release
+	})
 	// Registered after newHSS's own cleanup, so it runs first: the server
 	// cannot close while a handler still waits.
 	t.Cleanup(func() { close(release) })
 	return h
 }
 
+// wiredSource is the credential source ft-server builds from its
+// configuration (credentialSource), with FT_HSS_TIMEOUT set to timeout. It
+// checks that the setting reaches the client: a test that called
+// NewHSSCredentials itself would pass with the setting dropped or replaced
+// by the default (QA on #138).
+func wiredSource(t *testing.T, h *hss, timeout time.Duration) *HSSCredentials {
+	t.Helper()
+	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL(h.URL), HSSToken: secret{"t"}, Realm: realm, HSSTimeout: timeout, MaxLookups: 4}
+	src, ok := credentialSource(cfg, false).(*HSSCredentials)
+	if !ok {
+		t.Fatalf("credentialSource gave %T, want *HSSCredentials", credentialSource(cfg, false))
+	}
+	if src.client.Timeout != cfg.HSSTimeout {
+		t.Fatalf("HSS client timeout = %v, want FT_HSS_TIMEOUT %v", src.client.Timeout, cfg.HSSTimeout)
+	}
+	return src
+}
+
 // The HSS client's timeout (FT_HSS_TIMEOUT) is what keeps an HSS that stops
 // answering from holding every upload that needs a credential (#134). The
-// other credential tests allow far more than they need, so this one alone
-// proves the timeout applies.
-func TestAnHSSThatDoesNotAnswerTimesOutAsABackendFailure(t *testing.T) {
+// other credential tests allow far more than they need, so these prove the
+// timeout applies, whether the HSS stalls before its answer or in its body.
+func TestAnHSSThatStopsAnsweringTimesOutAsABackendFailure(t *testing.T) {
 	const timeout = 50 * time.Millisecond
-	h := silentHSS(t)
-	src := NewHSSCredentials(mustURL(h.URL), "t", realm, timeout, 4, nil)
-	// backstop ends the lookup if the client's timeout does not, so a
-	// regression fails here instead of hanging until go test's timeout.
-	ctx, cancel := context.WithTimeout(t.Context(), backstop)
-	defer cancel()
-	start := time.Now()
-	_, err := src.Lookup(ctx, alice, digest.SHA256)
-	took := time.Since(start)
-	// Far above the timeout, so a loaded host cannot fail it.
-	if took >= backstop/2 {
-		t.Fatalf("Lookup took %v with a %v timeout", took, timeout)
-	}
-	if err == nil || !strings.Contains(err.Error(), "Timeout") {
-		t.Fatalf("Lookup = %v, want a timeout", err)
-	}
-	if isUnknown, isRecord := errors.Is(err, ErrUnknownUser), errors.Is(err, ErrBadCredentialRecord); isUnknown || isRecord {
-		t.Fatalf("a timeout counted as the user's fault (unknown %v, unusable record %v)", isUnknown, isRecord)
+	for name, headers := range map[string]bool{"no answer": false, "body stalls": true} {
+		t.Run(name, func(t *testing.T) {
+			src := wiredSource(t, stallingHSS(t, headers), timeout)
+			// backstop ends the lookup if the client's timeout does not, so
+			// a regression fails here instead of hanging until go test's
+			// timeout.
+			ctx, cancel := context.WithTimeout(t.Context(), backstop)
+			defer cancel()
+			start := time.Now()
+			_, err := src.Lookup(ctx, alice, digest.SHA256)
+			took := time.Since(start)
+			// Far above the timeout, so a loaded host cannot fail it.
+			if took >= backstop/2 {
+				t.Fatalf("Lookup took %v with a %v timeout", took, timeout)
+			}
+			if err == nil || !strings.Contains(err.Error(), "Timeout") {
+				t.Fatalf("Lookup = %v, want the client's timeout", err)
+			}
+			if isUnknown, isRecord := errors.Is(err, ErrUnknownUser), errors.Is(err, ErrBadCredentialRecord); isUnknown || isRecord {
+				t.Fatalf("a timeout counted as the user's fault (unknown %v, unusable record %v)", isUnknown, isRecord)
+			}
+		})
 	}
 }
 
@@ -56,8 +87,7 @@ func TestAnHSSThatDoesNotAnswerTimesOutAsABackendFailure(t *testing.T) {
 // out is answered 503 with Retry-After, so the client tries again later,
 // and not 401, which would tell it its password is wrong.
 func TestAnUploadWhoseLookupTimesOutIsAnsweredServiceUnavailable(t *testing.T) {
-	h := silentHSS(t)
-	src := NewHSSCredentials(mustURL(h.URL), "t", realm, 50*time.Millisecond, 4, nil)
+	src := wiredSource(t, stallingHSS(t, false), 50*time.Millisecond)
 	e := newEnv(t, func(o *Options) { o.Credentials = src })
 	u := e.user(alice)
 	u.challenge()
