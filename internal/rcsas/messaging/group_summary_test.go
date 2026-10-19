@@ -761,6 +761,143 @@ func TestNewMarksStartTheFailedRemovalsOver(t *testing.T) {
 	}
 }
 
+// hookedRemoval fails every RemoveSummary with err, and runs hook in the
+// try numbered at, before it fails.
+type hookedRemoval struct {
+	store.Store
+	err   error
+	at    int32
+	hook  func()
+	tries atomic.Int32
+}
+
+func (s *hookedRemoval) RemoveSummary(context.Context, store.Message, string, int64) error {
+	if s.tries.Add(1) == s.at && s.hook != nil {
+		s.hook()
+	}
+	return s.err
+}
+
+// mergedDuringRemovals is QA's case: alice offline, bob's display queued
+// whole and carol's summarized; just before the summary's third removal
+// fails, dave's delivery takes the share again and his display is merged
+// into the summary. alice's session is open.
+func mergedDuringRemovals(t *testing.T, st *hookedRemoval) (*rig, *fakeClock, *author) {
+	t.Helper()
+	const dave = "tel:+15550100005"
+	clock := newFakeClock()
+	cfg := smallQueue
+	cfg.RetryInterval, cfg.MaxRetryInterval = time.Minute, time.Minute
+	r := newRigWith(t, cfg, st, clock)
+	r.e.SetGroupHandler(members{all: []string{alice, bob, carol, dave}})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", imdn.PositiveDelivery|imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{bob, carol} {
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(p, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.at = MaxSummaryFailures
+	st.hook = func() {
+		for _, k := range []struct {
+			kind   imdn.Kind
+			status imdn.Status
+		}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
+			if err := r.e.SubmitGroup(context.Background(), groupFrom(dave, receipt(t, "m1", k.kind, k.status))); err != nil {
+				t.Errorf("dave: %v", err)
+			}
+		}
+		if got := r.m.get("group.notification.summarized"); got != 2 {
+			t.Errorf("dave's display went in whole: %d summarized", got)
+		}
+	}
+	waitFor(t, "the receipts' passes", r.idle)
+	a := newAuthor(alice)
+	l := r.listen(t)
+	_, c := r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	a.listen(t, c)
+	return r, clock, a
+}
+
+// retried waits for removal try to have failed and lets the retry come.
+func retried(t *testing.T, r *rig, clock *fakeClock, st *hookedRemoval, try int32) {
+	t.Helper()
+	waitFor(t, fmt.Sprint("removal ", try), func() bool { return st.tries.Load() == try && r.idle() })
+	waitFor(t, "the retry", func() bool { return clock.armed(time.Minute) })
+	clock.Advance(time.Minute)
+}
+
+// A summary whose removal the store is too busy for is never given up:
+// the conflicting writes are the marks, which keep coming while it is
+// tried. Each try sends what changed, dave's display among them.
+func TestASummaryIsNotGivenUpForABusyStore(t *testing.T) {
+	st := &hookedRemoval{Store: store.NewMemory(), err: fmt.Errorf("fake: remove summary: %w", store.ErrBusy)}
+	r, clock, a := mergedDuringRemovals(t, st)
+	for try := int32(1); try <= 2*MaxSummaryFailures; try++ {
+		retried(t, r, clock, st, try)
+	}
+	waitFor(t, "read by all", func() bool { return a.readByAll("m1", []string{bob, carol, "tel:+15550100005"}) })
+	if _, sums := queuedReceipts(t, r, alice); sums != 1 || r.m.get("group.summary.abandoned") != 0 {
+		t.Fatalf("%d summaries queued, metrics %v", sums, r.m)
+	}
+}
+
+// QA's failing test: notifications merged into a summary while its
+// removals failed are sent before it is given up. The third failure finds
+// dave's display marked since the pass read the record, so the count
+// starts over and the summary goes again, with his only.
+func TestNotificationsMergedBeforeASummaryIsGivenUpAreSent(t *testing.T) {
+	st := &hookedRemoval{Store: store.NewMemory(), err: errStore}
+	r, clock, a := mergedDuringRemovals(t, st)
+	retried(t, r, clock, st, 1)
+	retried(t, r, clock, st, 2)
+	// The third fails with new marks: the queue is read again at once.
+	retried(t, r, clock, st, MaxSummaryFailures+1)
+	retried(t, r, clock, st, MaxSummaryFailures+2)
+	waitFor(t, "the summary given up", func() bool { return r.m.get("group.summary.abandoned") == 1 && r.idle() })
+	if got := st.tries.Load(); got != 2*MaxSummaryFailures {
+		t.Fatalf("given up after %d removals", got)
+	}
+	if !a.readByAll("m1", []string{bob, carol, "tel:+15550100005"}) {
+		t.Fatal("dave's display was given up with the summary")
+	}
+	// bob's and carol's from the first pass, dave's from the fourth.
+	if got := r.m.get("group.summary.sent"); got != 3 {
+		t.Fatalf("summary sent %d notifications", got)
+	}
+}
+
+// A client that refuses the summary's last notification for good (403)
+// will never take it: the summary is given up at once, without a
+// notification about a notification.
+func TestASummaryRefusedForGoodIsGivenUp(t *testing.T) {
+	r, _ := offlineSummary(t, smallQueue, store.NewMemory())
+	var taken atomic.Int32
+	l := r.listen(t)
+	_, _ = r.connectAnswering(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group}, func(*msrp.Message) error {
+		if taken.Add(1) < 3 {
+			return nil // bob's receipt queued whole, then the summary's first
+		}
+		return &msrp.StatusError{Code: msrp.StatusForbidden}
+	})
+	waitFor(t, "the refusal", func() bool { return r.m.get("delivery.refused") == 1 && r.idle() })
+	if n := r.store.(*store.Memory).Len(alice); n != 0 || r.m.get("group.summary.expanded") != 0 {
+		t.Fatalf("%d queued, metrics %v", n, r.m)
+	}
+	// bob and carol hold their copies of m1, and nothing else: no
+	// notification about the refused one (the queues are idle, so
+	// Pending sees every item).
+	for _, u := range []string{bob, carol} {
+		ms, err := r.store.Pending(t.Context(), u, "", r.clock.Now(), 10)
+		if err != nil || len(ms) != 1 || ms[0].Notification {
+			t.Fatalf("%s's queue %+v, %v", u, ms, err)
+		}
+	}
+}
+
 // busyMarks reports every mark busy (store.ErrBusy).
 type busyMarks struct{ store.Store }
 

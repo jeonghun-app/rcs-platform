@@ -483,14 +483,18 @@ func (e *Engine) summarize(ctx context.Context, sent store.Sent, o GroupOrigin, 
 // notification (display before delivery before processing), as a
 // notification of its own From the participant To the author. All but the
 // last go without reports (Failure-Report: no, no Success-Report); the
-// last asks for a success report (Leg.send), and since one session
-// delivers in order, its 200 says the client has them all. Only then is
-// the summary removed, and only if no notification was marked since the
+// last asks for a success report (Leg.send). One session delivers in order
+// over one connection, so its 200 says every one of them reached the
+// client: a transport guarantee, not that the client took each, since one
+// it refuses under Failure-Report: no is not reported. Only then is the
+// summary removed, and only if no notification was marked since the
 // record was read (store.Store.RemoveSummary); otherwise it is released
 // and the queue read again, so that it goes out once more with the new
 // ones, to the participants whose notification changed. A removal that
-// fails otherwise is tried again at the next delivery, MaxSummaryFailures
-// times in a row at most, after which the summary is given up.
+// fails otherwise is tried again at the next delivery: a busy store
+// (store.ErrBusy) for as long as it takes, any other failure
+// MaxSummaryFailures times in a row at most, after which the summary is
+// given up unless notifications were merged into it meanwhile.
 func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outcome {
 	now := e.clock.Now()
 	sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
@@ -569,15 +573,45 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 		return whole
 	}
 	e.storeFailed("remove summary", m.Recipient, err)
+	if errors.Is(err, store.ErrBusy) {
+		// Other writes to the record, the marks themselves among them,
+		// held it: that passes, and is no reason to give up.
+		e.release(m)
+		return stop
+	}
 	if e.summaryFailed(m) >= MaxSummaryFailures {
-		// Sent whole that many times: giving it up is better than sending
-		// it again at every lease for as long as the store refuses.
+		// Notifications merged into the summary since the record was read
+		// were not sent: they are not given up with it.
+		if e.marksGrew(ctx, m, sent.MarkCount) {
+			e.summaryProgressed(m)
+			e.release(m)
+			return whole
+		}
+		// Nothing left to send: giving it up is better than trying the
+		// removal at every retry for as long as the store refuses.
 		e.forgetSummary(m)
 		e.giveUp(m, "group.summary.abandoned")
 		return done
 	}
 	e.release(m)
 	return stop
+}
+
+// marksGrew reports whether the sent record of summary m now counts more
+// marks than read did. A record it cannot read counts as grown, so that
+// the summary is kept rather than given up on a guess.
+func (e *Engine) marksGrew(ctx context.Context, m store.Message, read int64) bool {
+	sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
+	defer cancel()
+	sent, err := e.store.Sent(sctx, m.Sender, m.MessageID, e.clock.Now())
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return false
+	case err != nil:
+		e.storeFailed("sent", m.Recipient, err)
+		return true
+	}
+	return sent.MarkCount > read
 }
 
 // MaxSummaryFailures is how many times in a row a summary's removal may
