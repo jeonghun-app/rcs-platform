@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -712,7 +713,10 @@ func TestClientAddressesInURIsAreLoggedAsTheirNetwork(t *testing.T) {
 		ToPath:   []URI{mustURI(t, "msrp://relay.example.com:2855/r3l4ysess;tcp")},
 		FromPath: []URI{mustURI(t, "msrp://198.51.100.23:49152/s3cr3tsess10n;tcp")}}
 	var logged bytes.Buffer
-	slog.New(slog.NewJSONHandler(&logged, nil)).Info("x", "msg", m)
+	untimedJSONLogger(&logged).Info("x", "msg", m)
+	if strings.Contains(logged.String(), `"time"`) {
+		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", logged.String())
+	}
 	for _, out := range []string{logged.String(), fmt.Sprint(m)} {
 		if strings.Contains(out, "198.51.100.23") || strings.Contains(out, "49152") {
 			t.Errorf("the client's address is logged: %s", out)
@@ -820,4 +824,16 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	case <-time.After(hangGuard):
 		t.Fatal("a session with an empty window waited for the stalled ones")
 	}
+}
+
+// untimedJSONLogger writes JSON lines without the time attribute, so that a
+// test searching a line for leaked digits cannot find them in the
+// timestamp's nanoseconds (#99).
+func untimedJSONLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
 }

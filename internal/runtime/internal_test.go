@@ -1,11 +1,17 @@
 package runtime
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPrivateHostsAreRFC1918ULAAndNamesInTheNamespace(t *testing.T) {
@@ -134,3 +140,152 @@ func TestStagingAndProdNeedANamespaceOfTwoOrMoreLabels(t *testing.T) {
 // longNamespace is a valid namespace of 253 characters, the most a DNS name
 // may have.
 var longNamespace = strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+
+// fakeNet stands in for DNS and the network: lookups answer from a table,
+// and dials record the address and fail, as nothing listens there.
+type fakeNet struct {
+	names  map[string][]netip.Addr
+	dialed []string
+}
+
+var errNoListener = errors.New("connection refused")
+
+func (f *fakeNet) dialer() InternalDialer {
+	return InternalDialer{
+		Lookup: func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			addrs, ok := f.names[host]
+			if !ok {
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+			}
+			return addrs, nil
+		},
+		Dial: func(_ context.Context, _, address string) (net.Conn, error) {
+			f.dialed = append(f.dialed, address)
+			return nil, errNoListener
+		},
+	}
+}
+
+func addrs(ss ...string) []netip.Addr {
+	var out []netip.Addr
+	for _, s := range ss {
+		out = append(out, netip.MustParseAddr(s))
+	}
+	return out
+}
+
+func TestTheInternalDialerConnectsOnlyToPrivateAddresses(t *testing.T) {
+	f := &fakeNet{names: map[string][]netip.Addr{
+		"metadata.rcs.local": addrs("169.254.170.2"),
+		"loop.rcs.local":     addrs("127.0.0.1", "::1"),
+		"public.rcs.local":   addrs("203.0.113.9", "2001:db8::9"),
+		"zoned.rcs.local":    addrs("fe80::1%eth0", "fd00::1%eth0"),
+		"mixed.rcs.local":    addrs("203.0.113.9", "10.0.1.5", "fd00::5"),
+		"hss.rcs.local":      addrs("::ffff:10.0.2.7"),
+	}}
+	d := f.dialer()
+	for _, address := range []string{
+		"metadata.rcs.local:80", "loop.rcs.local:8081", "public.rcs.local:443", "zoned.rcs.local:80",
+		"127.0.0.1:8081", "169.254.169.254:80", "[::1]:443", "8.8.8.8:53",
+	} {
+		_, err := d.DialContext(context.Background(), "tcp", address)
+		if !errors.Is(err, ErrAddressNotPrivate) {
+			t.Errorf("%s: %v, want ErrAddressNotPrivate", address, err)
+		}
+	}
+	if len(f.dialed) != 0 {
+		t.Fatalf("dialed %q, which are not private", f.dialed)
+	}
+	// Private addresses are tried in order, the others skipped, and a
+	// real failure is reported as itself.
+	if _, err := d.DialContext(context.Background(), "tcp", "mixed.rcs.local:8081"); !errors.Is(err, errNoListener) {
+		t.Errorf("mixed: %v", err)
+	}
+	if _, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081"); !errors.Is(err, errNoListener) {
+		t.Errorf("mapped: %v", err)
+	}
+	if _, err := d.DialContext(context.Background(), "tcp", "10.0.3.3:8081"); !errors.Is(err, errNoListener) {
+		t.Errorf("literal: %v", err)
+	}
+	if want := []string{"10.0.1.5:8081", "[fd00::5]:8081", "10.0.2.7:8081", "10.0.3.3:8081"}; !slices.Equal(f.dialed, want) {
+		t.Errorf("dialed %q, want %q", f.dialed, want)
+	}
+	var dnsErr *net.DNSError
+	if _, err := d.DialContext(context.Background(), "tcp", "missing.rcs.local:80"); !errors.As(err, &dnsErr) {
+		t.Errorf("unknown name: %v", err)
+	}
+	if _, err := d.DialContext(context.Background(), "tcp", "no-port"); err == nil {
+		t.Error("an address without a port was dialed")
+	}
+}
+
+// An address that does not answer must leave the next one time to answer:
+// the time left is shared out as net.Dialer shares it (#87 review).
+func TestEachAddressGetsItsShareOfTheDialTime(t *testing.T) {
+	var shares []time.Duration
+	var networks []string
+	d := InternalDialer{
+		Timeout: 6 * time.Second,
+		Lookup: func(_ context.Context, network, _ string) ([]netip.Addr, error) {
+			networks = append(networks, network)
+			return addrs("10.0.0.1", "203.0.113.1", "10.0.0.2"), nil
+		},
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				return nil, errors.New("no deadline")
+			}
+			shares = append(shares, time.Until(deadline))
+			return nil, errNoListener
+		},
+	}
+	start := time.Now()
+	if _, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081"); !errors.Is(err, errNoListener) {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// Two private addresses: the first gets half of 6 s, the second what
+	// is left. The public one is not dialed.
+	if len(shares) != 2 || shares[0] > 3*time.Second || shares[0] < 3*time.Second-elapsed ||
+		shares[1] > 6*time.Second || shares[1] < 6*time.Second-elapsed {
+		t.Fatalf("shares %v in %v, want about 3s then 6s", shares, elapsed)
+	}
+	// Both address families are looked up, so a name with only an AAAA
+	// (ULA) record is reachable.
+	if !slices.Equal(networks, []string{"ip"}) {
+		t.Fatalf("looked up %q, want ip", networks)
+	}
+	// The share never drops below two seconds while that much is left.
+	shares = nil
+	d.Timeout = 3 * time.Second
+	d.Lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		return addrs("10.0.0.1", "10.0.0.2", "10.0.0.3"), nil
+	}
+	_, _ = d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081")
+	if len(shares) != 3 || shares[0] > 2*time.Second || shares[0] < 2*time.Second-time.Second {
+		t.Fatalf("shares %v, want the first about 2s", shares)
+	}
+}
+
+// Timeout bounds name resolution as net.Dialer.Timeout does: http.Transport
+// dials with a context the request's cancellation does not reach, so an
+// unresponsive resolver must not hold the connection slot beyond it (#114;
+// the test is QA's from the review of #105).
+func TestTheDialTimeoutAlsoBoundsTheLookup(t *testing.T) {
+	d := InternalDialer{
+		Timeout: 200 * time.Millisecond,
+		Lookup: func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+				return nil, errors.New("the lookup was not bounded by Timeout")
+			}
+		},
+	}
+	start := time.Now()
+	_, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("%v after %v, want a deadline error after about 200ms", err, time.Since(start))
+	}
+}

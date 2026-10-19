@@ -36,7 +36,7 @@ RUNGO = $(DOCKER) run --rm \
 	-v $(GOCACHE_VOL):/gocache \
 	-v $(GOMOD_VOL):/gomodcache \
 	-e GOCACHE=/gocache -e GOMODCACHE=/gomodcache -e HOME=/tmp \
-	-e GOFLAGS=-buildvcs=false
+	-e GOFLAGS=-buildvcs=false -e CI
 
 # Seconds each fuzz target runs in `make fuzz`; CI uses the default.
 FUZZTIME ?= 10s
