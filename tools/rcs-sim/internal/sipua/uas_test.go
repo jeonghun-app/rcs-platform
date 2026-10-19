@@ -35,9 +35,15 @@ type caller struct {
 
 func (s *standIn) call(t *testing.T, flow transport.FlowID) *caller {
 	t.Helper()
+	callID, _ := s.ids.CallID("")
+	return s.callWith(t, flow, callID)
+}
+
+// callWith is call with a given Call-ID and extra header fields.
+func (s *standIn) callWith(t *testing.T, flow transport.FlowID, callID string, extra ...[2]string) *caller {
+	t.Helper()
 	c := &caller{s: s, flow: flow, tag: "caller", responses: make(chan *sip.Response, 32)}
 	branch, _ := s.ids.Branch()
-	callID, _ := s.ids.CallID("")
 	req := &sip.Request{Method: "INVITE", URI: mustURI(t, testIMPU)}
 	for _, f := range [][2]string{
 		{"Via", "SIP/2.0/TCP standin.invalid;branch=" + branch},
@@ -50,6 +56,11 @@ func (s *standIn) call(t *testing.T, flow transport.FlowID) *caller {
 		{"Record-Route", callerRecordRoute},
 		{"Content-Type", "application/sdp"},
 	} {
+		if err := req.Header.Add(f[0], f[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range extra {
 		if err := req.Header.Add(f[0], f[1]); err != nil {
 			t.Fatal(err)
 		}
@@ -211,6 +222,9 @@ func TestAnIncomingChatIsRungAcceptedAndConfirmed(t *testing.T) {
 	}
 	ringing := cl.next(t)
 	rto, _ := ringing.Header.To()
+	if rc, _ := ringing.Header.Contact(); len(rc) != 1 {
+		t.Fatalf("180 Contact = %v: a response that sets up the dialog carries one (RFC 3261 §12.1.1)", rc)
+	}
 	if ringing.StatusCode != 180 || rto.Tag() == "" || ringing.Header.Get("Record-Route") != callerRecordRoute {
 		t.Fatalf("180: %d, To tag %q, Record-Route %q", ringing.StatusCode, rto.Tag(), ringing.Header.Get("Record-Route"))
 	}
@@ -361,17 +375,125 @@ func TestNoACKEndsTheCalledPartysDialogWithBye(t *testing.T) {
 	}
 	cl.next(t)
 	clock.armedFor(t, transaction.DefaultT1)
-	// Past 64*T1, short of the keep-alive, whose pong the fake clock
-	// would also run past.
-	for elapsed := time.Duration(0); elapsed <= 64*transaction.DefaultT1; elapsed += transaction.DefaultT2 {
-		clock.advance(transaction.DefaultT2)
+	// Up to just short of 64*T1 in small steps: still up. Then the last
+	// step: ended, exactly at 64*T1.
+	const step = 100 * time.Millisecond
+	for elapsed := time.Duration(0); elapsed < 64*transaction.DefaultT1-step; elapsed += step {
+		clock.advance(step)
 	}
 	select {
 	case <-d.Done():
+		t.Fatal("the dialog ended before 64*T1")
+	default:
+	}
+	clock.advance(step)
+	select {
+	case <-d.Done():
 	case <-time.After(waitFor):
-		t.Fatal("the dialog did not end")
+		t.Fatal("the dialog did not end at 64*T1")
 	}
 	s.nextMethod(t, "BYE")
+}
+
+func TestARequiredExtensionIsRefusedWith420(t *testing.T) {
+	// RFC 3261 §8.2.2.3; sipua supports none, 100rel and precondition
+	// among them.
+	s, _, flow, calls := calleeUA(t, nil)
+	callID, _ := s.ids.CallID("")
+	cl := s.callWith(t, flow, callID, [2]string{"Require", "100rel, precondition"})
+	res := cl.next(t)
+	if res.StatusCode != 420 || res.Header.Get("Unsupported") != "100rel, precondition" {
+		t.Fatalf("answered %d, Unsupported %q", res.StatusCode, res.Header.Get("Unsupported"))
+	}
+	select {
+	case <-calls:
+		t.Fatal("OnInvite got an INVITE it cannot answer")
+	default:
+	}
+}
+
+func TestTheSameInviteByAnotherWayIs482(t *testing.T) {
+	// A merged request (RFC 3261 §8.2.2.2): same Call-ID, From tag and
+	// CSeq, another branch.
+	s, _, flow, calls := calleeUA(t, nil)
+	callID, _ := s.ids.CallID("")
+	s.callWith(t, flow, callID)
+	nextCall(t, calls)
+	second := s.callWith(t, flow, callID)
+	if res := second.next(t); res.StatusCode != 482 {
+		t.Fatalf("the second copy answered %d, want 482", res.StatusCode)
+	}
+}
+
+func TestTheCalledPartysByeWaitsForTheACK(t *testing.T) {
+	// RFC 3261 §15: the called party's BYE waits until the ACK of its 200
+	// has come (or 64*T1 have passed).
+	s, _, flow, calls := calleeUA(t, nil)
+	cl := s.call(t, flow)
+	d, err := nextCall(t, calls).Accept([]byte(testAnswer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl.next(t)
+	byed := make(chan error, 1)
+	go func() { _, err := d.Bye(context.Background()); byed <- err }()
+	// A BYE sent before the ACK would be back by now; this wait only
+	// catches that, a correct UA sends nothing until the ACK.
+	select {
+	case err := <-byed:
+		t.Fatalf("Bye returned before the ACK: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	cl.ack(t)
+	if err := <-byed; err != nil {
+		t.Fatal(err)
+	}
+	s.nextMethod(t, "BYE")
+}
+
+func TestACancelWithoutOnInviteGoesToOnRequest(t *testing.T) {
+	// With no OnInvite, INVITEs and their CANCELs are OnRequest's alike.
+	s := newStandIn(t, transport.TCP)
+	got := make(chan string, 4)
+	cfg := s.config()
+	cfg.OnRequest = func(tx *transaction.ServerTransaction) {
+		got <- tx.Request().Method
+		code := 180
+		if tx.Request().Method == "CANCEL" {
+			code = 200
+		}
+		if res, err := sip.NewResponse(tx.Request(), code, "", "u"); err == nil {
+			tx.Respond(res)
+		}
+	}
+	ua := dial(t, cfg)
+	register(t, ua)
+	cl := s.call(t, s.next(t).src.Flow)
+	if m := <-got; m != "INVITE" {
+		t.Fatalf("OnRequest got %s", m)
+	}
+	cl.next(t)
+	cl.cancel(t)
+	select {
+	case m := <-got:
+		if m != "CANCEL" {
+			t.Fatalf("OnRequest got %s, want the CANCEL", m)
+		}
+	case <-time.After(waitFor):
+		t.Fatal("the CANCEL did not reach OnRequest")
+	}
+}
+
+func TestRingAfterTheFinalResponseIsRefused(t *testing.T) {
+	s, _, flow, calls := calleeUA(t, nil)
+	s.call(t, flow)
+	in := nextCall(t, calls)
+	if err := in.Reject(486); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.Ring(); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("Ring after Reject = %v, want ErrCallEnded", err)
+	}
 }
 
 func TestARejectedCallAnswersTheStatus(t *testing.T) {

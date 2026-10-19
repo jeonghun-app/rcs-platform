@@ -174,10 +174,15 @@ As the called party, it hands each INVITE from the network to the scenario
 
 - `Ring` answers 180, and `Reject` answers 486, 480, 603 and the like. `Accept`
   answers 200 with the SDP answer and a Contact with the chat ICSI and `ob`.
-  Every response carries the INVITE's `Record-Route` and the same To tag
-  (RFC 3261 §12.1.1).
+  Every response that sets up the dialog, the 180 as well as the 200,
+  carries a Contact, the INVITE's `Record-Route` and the same To tag (RFC
+  3261 §12.1.1).
+- An INVITE that requires an extension gets 420 with `Unsupported`, since the
+  client supports none (§8.2.2.3). A second copy of an INVITE, the same
+  Call-ID, From tag and CSeq on another branch, gets 482 (§8.2.2.2).
 - The 200 is sent again at T1, doubling up to T2, until its ACK confirms the
-  dialog (§13.3.1.4). Without an ACK in 64*T1, the dialog is ended with BYE.
+  dialog (§13.3.1.4). Without an ACK at 64*T1, the dialog is ended with BYE.
+  A BYE the scenario sends waits for that ACK, or for the 64*T1 (§15).
 - The dialog's route set is the INVITE's `Record-Route` in order, and its
   remote target the INVITE's Contact.
 - A CANCEL before the answer gets 200, and the INVITE 487 (§9.2). After the

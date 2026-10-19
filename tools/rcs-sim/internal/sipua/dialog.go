@@ -322,6 +322,10 @@ type Dialog struct {
 	// retransmitTimer sends that 2xx again meanwhile (uas.go).
 	confirmed       chan struct{}
 	retransmitTimer transaction.Timer
+	// ackGiveUp is closed when 64*T1 have passed without that ACK, by
+	// giveUpTimer.
+	ackGiveUp   chan struct{}
+	giveUpTimer transaction.Timer
 }
 
 // closed is a channel that is always closed.
@@ -484,7 +488,20 @@ func (d *Dialog) Done() <-chan struct{} { return d.done }
 
 // Bye ends the dialog and sends BYE, returning its final response. The
 // session is over as BYE goes out, whatever the answer (RFC 3261 §15.1.1).
+//
+// On the called side the BYE waits for the ACK of the 200, or for 64*T1
+// to have passed without it (§15): a BYE that overtook the ACK could reach
+// a caller that has not yet confirmed the dialog.
 func (d *Dialog) Bye(ctx context.Context) (*sip.Response, error) {
+	if d.confirmed != nil {
+		select {
+		case <-d.confirmed:
+		case <-d.ackGiveUp:
+		case <-d.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	d.mu.Lock()
 	if d.ended {
 		d.mu.Unlock()
@@ -506,8 +523,10 @@ func (d *Dialog) endLocked() {
 	}
 	d.ended = true
 	close(d.done)
-	if d.retransmitTimer != nil {
-		d.retransmitTimer.Stop()
+	for _, t := range []transaction.Timer{d.retransmitTimer, d.giveUpTimer} {
+		if t != nil {
+			t.Stop()
+		}
 	}
 	d.ua.mu.Lock()
 	delete(d.ua.dialogs, d.key)

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -114,7 +113,9 @@ func (c *IncomingCall) response(code int, answer []byte) (*sip.Response, error) 
 			return nil, err
 		}
 	}
-	if code >= 200 {
+	// A response that sets up the dialog, the 180 as well as the 200,
+	// carries the Contact (§12.1.1, TS 24.229 §5.1.4.1).
+	{
 		contact := sip.Contact{Address: sip.Address{URI: c.ua.contact.URI}}
 		contact.URI.Params = slices.Clone(c.ua.contact.URI.Params)
 		contact.URI.Params.SetFlag("ob")
@@ -122,7 +123,7 @@ func (c *IncomingCall) response(code int, answer []byte) (*sip.Response, error) 
 		if err := res.Header.Add("Contact", contact.String()); err != nil {
 			return nil, err
 		}
-		if len(answer) > 0 {
+		if code >= 200 && len(answer) > 0 {
 			if err := res.Header.Add("Content-Type", "application/sdp"); err != nil {
 				return nil, err
 			}
@@ -138,11 +139,34 @@ func (ua *UA) incoming(tx *transaction.ServerTransaction) {
 	if err != nil {
 		return
 	}
-	c := &IncomingCall{ua: ua, tx: tx, req: tx.Request(), tag: tag, cancelled: make(chan struct{})}
+	req := tx.Request()
+	key := mergeKey(req)
+	c := &IncomingCall{ua: ua, tx: tx, req: req, tag: tag, cancelled: make(chan struct{})}
 	ua.mu.Lock()
-	ua.calls[tx] = c
+	merged := false
+	for _, other := range ua.calls {
+		merged = merged || mergeKey(other.req) == key
+	}
+	if !merged {
+		ua.calls[tx] = c
+	}
 	ua.mu.Unlock()
+	if merged {
+		// The same INVITE by another way: a loop or a fork that met
+		// itself (RFC 3261 §8.2.2.2).
+		if res, err := sip.NewResponse(req, 482, "", tag); err == nil {
+			_ = tx.Respond(res)
+		}
+		return
+	}
 	ua.cfg.OnInvite(c)
+}
+
+// mergeKey is what two copies of one request share whatever way they came:
+// Call-ID, From tag and CSeq (RFC 3261 §8.2.2.2).
+func mergeKey(req *sip.Request) string {
+	from, _ := req.Header.From()
+	return req.Header.Get("Call-ID") + "\x00" + from.Tag() + "\x00" + req.Header.Get("CSeq")
 }
 
 func (ua *UA) forgetCall(tx *transaction.ServerTransaction) {
@@ -219,6 +243,7 @@ func (ua *UA) newUASDialog(invite *sip.Request, res *sip.Response) (*Dialog, err
 		remoteCSeq:   cseq.Seq,
 		done:         make(chan struct{}),
 		confirmed:    make(chan struct{}),
+		ackGiveUp:    make(chan struct{}),
 	}
 	for _, a := range rr {
 		d.routes = append(d.routes, a.String())
@@ -230,11 +255,11 @@ func (ua *UA) newUASDialog(invite *sip.Request, res *sip.Response) (*Dialog, err
 }
 
 // retransmit sends the 2xx again until its ACK comes, at T1 doubling up to
-// T2, and ends the dialog with BYE if none has come after 64*T1 (RFC 3261
-// §13.3.1.4). It runs on Config.Clock.
+// T2, and at 64*T1 without an ACK gives up: the wait of Bye ends and the
+// dialog is ended with BYE (RFC 3261 §13.3.1.4). It runs on Config.Clock.
 func (d *Dialog) retransmit(tx *transaction.ServerTransaction, res *sip.Response) {
 	clock := d.ua.cfg.Clock
-	interval, waited := transaction.DefaultT1, time.Duration(0)
+	interval := transaction.DefaultT1
 	var again func()
 	again = func() {
 		select {
@@ -242,12 +267,9 @@ func (d *Dialog) retransmit(tx *transaction.ServerTransaction, res *sip.Response
 			return
 		case <-d.done:
 			return
-		default:
-		}
-		waited += interval
-		if waited >= 64*transaction.DefaultT1 {
-			go func() { _, _ = d.Bye(context.Background()) }()
+		case <-d.ackGiveUp:
 			return
+		default:
 		}
 		_ = tx.Respond(res)
 		interval = min(2*interval, transaction.DefaultT2)
@@ -257,6 +279,15 @@ func (d *Dialog) retransmit(tx *transaction.ServerTransaction, res *sip.Response
 	}
 	d.mu.Lock()
 	d.retransmitTimer = clock.AfterFunc(interval, again)
+	d.giveUpTimer = clock.AfterFunc(64*transaction.DefaultT1, func() {
+		select {
+		case <-d.confirmed:
+			return
+		default:
+		}
+		close(d.ackGiveUp)
+		_, _ = d.Bye(context.Background())
+	})
 	d.mu.Unlock()
 }
 
@@ -271,8 +302,10 @@ func (d *Dialog) confirm() {
 	case <-d.confirmed:
 	default:
 		close(d.confirmed)
-		if d.retransmitTimer != nil {
-			d.retransmitTimer.Stop()
+		for _, t := range []transaction.Timer{d.retransmitTimer, d.giveUpTimer} {
+			if t != nil {
+				t.Stop()
+			}
 		}
 	}
 }
