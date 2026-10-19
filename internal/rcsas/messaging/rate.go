@@ -40,8 +40,12 @@ func newLimiter(r Rate, maxKeys int) *limiter {
 }
 
 // allow takes a token from key's bucket at now.
-func (l *limiter) allow(key string, now time.Time) bool {
-	if l.interval == 0 {
+func (l *limiter) allow(key string, now time.Time) bool { return l.allowN(key, now, 1) }
+
+// allowN takes n tokens from key's bucket at now, all or none. More than
+// a burst's worth is never allowed.
+func (l *limiter) allowN(key string, now time.Time, n int) bool {
+	if l.interval == 0 || n <= 0 {
 		return true
 	}
 	l.mu.Lock()
@@ -53,10 +57,10 @@ func (l *limiter) allow(key string, now time.Time) bool {
 	if full.Before(now) {
 		full = now
 	}
-	if full.Sub(now) > l.tolerance {
+	if full.Sub(now)+time.Duration(n-1)*l.interval > l.tolerance {
 		return false
 	}
-	l.full[key] = full.Add(l.interval)
+	l.full[key] = full.Add(time.Duration(n) * l.interval)
 	return true
 }
 
@@ -86,3 +90,14 @@ func (l *limiter) evict(now time.Time) {
 		delete(l.full, first)
 	}
 }
+
+// Limiter is the engine's token bucket per key, for the limits other
+// rcs-as packages apply (the group package: per sender and group, per
+// group's fan-out). It is safe for concurrent use.
+type Limiter struct{ l *limiter }
+
+// NewLimiter returns a Limiter of rate r, keeping at most maxKeys buckets.
+func NewLimiter(r Rate, maxKeys int) *Limiter { return &Limiter{newLimiter(r, maxKeys)} }
+
+// Allow takes n tokens from key's bucket at now, all or none.
+func (l *Limiter) Allow(key string, now time.Time, n int) bool { return l.l.allowN(key, now, n) }

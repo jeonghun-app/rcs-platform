@@ -498,7 +498,7 @@ func (m *Message) From() (Address, error) {
 }
 
 // To returns the recipient addresses; RFC 3862 §4.2 allows several.
-func (m *Message) To() ([]Address, error) {
+func (m *Message) To() (Addresses, error) {
 	to, err := m.addresses(HeaderTo)
 	if err == nil && len(to) == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrMissingHeader, HeaderTo)
@@ -507,12 +507,12 @@ func (m *Message) To() ([]Address, error) {
 }
 
 // Cc returns the courtesy copy addresses, which are optional.
-func (m *Message) Cc() ([]Address, error) {
+func (m *Message) Cc() (Addresses, error) {
 	return m.addresses(HeaderCc)
 }
 
-func (m *Message) addresses(name string) ([]Address, error) {
-	var out []Address
+func (m *Message) addresses(name string) (Addresses, error) {
+	var out Addresses
 	for _, h := range m.All(CoreNamespace, name) {
 		a, err := ParseAddress(h.Value)
 		if err != nil {

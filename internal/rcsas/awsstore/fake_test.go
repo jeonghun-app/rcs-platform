@@ -78,11 +78,17 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 	}
 	k := rowKey(in.Item)
 	old, exists := f.rows[k]
-	if aws.ToString(in.ConditionExpression) != "attribute_not_exists(#pk) OR #expires <= :now" {
-		f.t.Errorf("PutItem condition %q", aws.ToString(in.ConditionExpression))
-	}
-	if exists && nOf(old[attrExpires]) > nOf(in.ExpressionAttributeValues[":now"]) {
-		return nil, errCondition
+	switch cond := aws.ToString(in.ConditionExpression); cond {
+	case "attribute_not_exists(#pk) OR #expires <= :now":
+		if exists && nOf(old[attrExpires]) > nOf(in.ExpressionAttributeValues[":now"]) {
+			return nil, errCondition
+		}
+	case "#rev = :rev":
+		if !exists || nOf(old[attrRev]) != nOf(in.ExpressionAttributeValues[":rev"]) {
+			return nil, errCondition
+		}
+	default:
+		f.t.Errorf("PutItem condition %q", cond)
 	}
 	f.rows[k] = maps.Clone(in.Item)
 	return &dynamodb.PutItemOutput{}, nil
@@ -155,6 +161,14 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 		}
 		row[attrRecounted] = vals[":now"]
 		return &dynamodb.UpdateItemOutput{}, nil
+	case cond == "attribute_exists(#pk) AND #expires > :active AND #active < :active AND #expires < :expires" &&
+		upd == "SET #active = :active, #expires = :expires, #ttl = :ttl":
+		if !exists || nOf(row[attrExpires]) <= nOf(vals[":active"]) || nOf(row[attrActive]) >= nOf(vals[":active"]) ||
+			nOf(row[attrExpires]) >= nOf(vals[":expires"]) {
+			return nil, errCondition
+		}
+		row[attrActive], row[attrExpires], row[attrTTL] = vals[":active"], vals[":expires"], vals[":ttl"]
+		return &dynamodb.UpdateItemOutput{}, nil
 	case cond == "#count = :wasCount AND #bytes = :wasBytes" && upd == "SET #count = :count, #bytes = :bytes":
 		if !exists || nOf(row[attrCount]) != nOf(vals[":wasCount"]) || nOf(row[attrBytes]) != nOf(vals[":wasBytes"]) {
 			return nil, errCondition
@@ -180,16 +194,18 @@ func cancelled(failed ...bool) error {
 }
 
 // TransactWriteItems knows the two transactions the store sends: enqueue
-// (put the message, add to its queue's and its sender's sizes) and remove
-// (delete the message, take it off both).
+// (put the message, add to its queue's size, its share's and, for a group
+// notification, the group notifications' total) and remove (delete the
+// message, take it off each).
 func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return nil, f.fail
 	}
-	// A notification has no share item: two items, else three.
-	if n := len(in.TransactItems); n != 2 && n != 3 {
+	// A 1-to-1 notification has no share item: two items; a group
+	// notification has the total besides: four; else three.
+	if n := len(in.TransactItems); n < 2 || n > 4 {
 		f.t.Fatalf("transaction %+v", in.TransactItems)
 	}
 	var sizes []*dtypes.Update
@@ -347,8 +363,8 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		items, last := f.page(rows, indexOrder, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool { return free(r, vals[":now"]) }, indexKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
-	if aws.ToString(in.ProjectionExpression) == "#sender, #size, #notification" {
-		// recount: the whole partition, keys and the two attributes.
+	if aws.ToString(in.ProjectionExpression) == "#sender, #author, #mode, #size, #notification" {
+		// recount: the whole partition, keys and the projected attributes.
 		f.recounts++
 		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
 			f.t.Errorf("recount query %+v", in)
@@ -357,7 +373,11 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		for _, r := range f.rows {
 			if sOf(r[attrPK]) == sOf(vals[":pk"]) {
 				p := tableKey(r)
-				p[attrSender], p[attrSize], p[attrNotification] = r[attrSender], r[attrSize], r[attrNotification]
+				for _, a := range []string{attrSender, attrAuthor, attrMode, attrSize, attrNotification} {
+					if v, ok := r[a]; ok {
+						p[a] = v
+					}
+				}
 				rows = append(rows, p)
 			}
 		}

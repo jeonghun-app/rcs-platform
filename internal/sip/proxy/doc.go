@@ -1,0 +1,91 @@
+// Package proxy is the proxy core of RFC 3261 §16, which pcscf, icscf, scscf
+// and rcs-as share: all four route requests by loose routing, insert
+// Record-Route, fork, cancel and choose among responses in the same way, and
+// differ only in where a request goes. This package does what they share; the
+// service supplies a Router, the location service of §16.5, and hooks.
+//
+// The proxy is transaction stateful. It is the transaction user (TU) of a
+// transaction.Layer it owns, and for every request the layer passes up it:
+//
+//   - validates it (§16.3): the Request-URI scheme (416), Max-Forwards (483),
+//     loops (482) and Proxy-Require (420);
+//   - preprocesses its Route (§16.4): it undoes a strict router's rewrite and
+//     removes the Route values naming itself (Config.Self), two in a row when
+//     it recorded two (RFC 5658 §5), and hands them to the Router;
+//   - asks the Router for a Decision: an answer, targets, or to hand the
+//     request to the service (Serve), which answers it as a UAS and has its
+//     2xx retransmitted until the ACK, which is delivered to it (RFC 6026
+//     §8.1);
+//   - forwards to each target (§16.6) with a new Via whose branch ID carries a
+//     keyed loop-detection hash (RFC 5393 §4.2), the Record-Route values of
+//     the decision, the routes of the target, and Decision.Prepare's changes;
+//   - forks: targets of equal q in parallel, lower q only once every higher
+//     one has failed;
+//   - forwards provisional responses and every 2xx at once and keeps the
+//     other finals, then sends the best of them (§16.7): a 6xx over all, then
+//     the lowest class, preferring 401, 407, 415, 420 and 484 within 4xx, with
+//     the challenges of every 401 and 407 gathered into the one sent, a 503
+//     from downstream turned into 500, and a 430 into 480 unless OnFinal
+//     keeps it (RFC 5626 §11.5);
+//   - sends no 408 to a non-INVITE request that got no response, which would
+//     arrive after the client gave up (RFC 4320 §4.2);
+//   - cancels the INVITE branches still pending after a 2xx, a 6xx or a
+//     CANCEL from upstream, each only once it has a provisional response
+//     (§9.1), and terminates a branch whose CANCEL is not answered within
+//     64*T1;
+//   - runs Timer C on every INVITE branch (§16.8): a branch that has had a
+//     provisional response is cancelled, one that has not counts as a 408;
+//     Target.Timeout bounds a branch more tightly where a service needs it.
+//
+// An ACK for a 2xx belongs to no transaction and is forwarded statelessly
+// (§16.11). Every other request, in-dialog ones included, has a server
+// transaction the proxy must answer, so it goes through a response context;
+// Forward is the Decision that sends an in-dialog request where its Route says
+// (§16.12). A response that matches no client transaction is dropped (RFC 6026
+// §7.3), so responses follow Via through the transaction that sent the request.
+//
+// # Robustness
+//
+// Nothing that can block runs on the goroutine reading the network: the
+// transaction layer calls the TU from it, and while the TU runs nothing more is
+// read from that connection or UDP socket. Routing, Prepare and every send
+// downstream run on a goroutine per request or branch, and the responses of a
+// request go upstream in order on a goroutine of their own, so a peer that is
+// slow to take what it is sent delays only the messages addressed to it; while
+// it is, at most 16 provisional responses or 2xx retransmissions of a request
+// wait for it, and later ones are dropped and counted (the first 2xx of a
+// branch and the final response never are; the UAS resends a 2xx until its
+// ACK). The exceptions are
+// the 503 sent at MaxContexts and the answers to a CANCEL: they go back to the
+// peer the request just came from and wait only if that peer has stopped
+// reading, for at most the transport's WriteTimeout.
+//
+// Memory is bounded by MaxContexts response contexts of at most MaxBranches
+// branches. A context holds its request once, with its body shared by every
+// copy, plus a copy of the header and a CANCEL per branch, and the final
+// responses kept for the choice: about
+//
+//	body + (2 + 2 × branches) × header + branches × response
+//
+// per context. MaxContextBytes bounds the request part over all contexts
+// together, and keeps it charged for 64*T1 after a 2xx, or while a branch's
+// CANCEL waits for an answer, since the transactions hold the request that
+// long; the responses are bounded by MaxBranches and the transport's
+// message limits. A context lives until every branch has ended. Timer C ends
+// a silent INVITE branch; one that receives a provisional response at least
+// every TimerC keeps its context, as ringing does, and holds a MaxContexts
+// slot as long.
+//
+// A branch the transport cannot send because the next hop's connection has no
+// room, or no connection can be opened (transport.ErrQueueFull,
+// ErrTooManyConnections), counts as a 503 with Retry-After that is passed on
+// as such, so the client backs off. Other transport failures count as a 503
+// from the next hop (§16.9), which becomes a 500 if chosen, and a vanished
+// flow as 430 (RFC 5626 §5.3.1). In every case the next fork group, or a
+// replacement target from OnBranchFailure, may still succeed.
+//
+// Max-Breadth (RFC 5393 §5) is not implemented; MaxBranches bounds forking
+// meanwhile (#75).
+//
+// Logs carry no message content, URIs or flow IDs.
+package proxy

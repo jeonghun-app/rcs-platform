@@ -8,7 +8,10 @@ package simtest
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +92,9 @@ func StartFT(t testing.TB, partSize int64) *FT {
 type Relay struct {
 	Control *url.URL
 	Harness *runtimetest.Harness
+	// TLSRoots trusts the certificate of the TLS terminator in front of a
+	// relay from StartRelayBehindTLS; nil otherwise.
+	TLSRoots *x509.CertPool
 }
 
 // StartRelay starts msrp-relay with its memory store, a plain public
@@ -102,9 +108,64 @@ type Relay struct {
 // StartRelay tries again with fresh ports, up to three times.
 func StartRelay(t testing.TB, corePorts ...int) *Relay {
 	t.Helper()
+	return startRelayRetrying(t, corePorts, nil)
+}
+
+// StartRelayBehindTLS is StartRelay with a TLS terminator in front of the
+// relay's public listener, as the NLB is in AWS (ADR 0003): client_path is
+// msrps: on the terminator's port, and the relay listens plain behind it.
+// Clients trust Relay.TLSRoots.
+func StartRelayBehindTLS(t testing.TB, corePorts ...int) *Relay {
+	t.Helper()
+	ts := httptest.NewTLSServer(http.NotFoundHandler()) // only for its certificate
+	t.Cleanup(ts.Close)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", ts.TLS.Clone())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	front := &tlsFront{ln: ln}
+	r := startRelayRetrying(t, corePorts, front)
+	r.TLSRoots = ts.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	go front.serve()
+	return r
+}
+
+// tlsFront is a TLS terminator: it takes TLS on ln and copies each
+// connection, in the clear, to the relay's public listener.
+type tlsFront struct {
+	ln     net.Listener
+	public int
+}
+
+func (f *tlsFront) port() int { return f.ln.Addr().(*net.TCPAddr).Port }
+
+func (f *tlsFront) serve() {
+	for {
+		c, err := f.ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			b, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(f.public))
+			if err != nil {
+				return
+			}
+			defer b.Close()
+			go func() { _, _ = io.Copy(b, c); _ = b.(*net.TCPConn).CloseWrite() }()
+			_, _ = io.Copy(c, b)
+		}()
+	}
+}
+
+// startRelayRetrying starts the relay, trying again with fresh ports, up to
+// three times, when it stopped because one was taken.
+func startRelayRetrying(t testing.TB, corePorts []int, front *tlsFront) *Relay {
+	t.Helper()
 	for attempt := 1; ; attempt++ {
 		ports := freePorts(t, 2)
-		r, err := startRelay(t, ports[0], ports[1], corePorts)
+		r, err := startRelay(t, ports[0], ports[1], corePorts, front)
 		switch {
 		case err == nil:
 			return r
@@ -115,10 +176,17 @@ func StartRelay(t testing.TB, corePorts ...int) *Relay {
 }
 
 // startRelay starts the relay on the given ports and waits until it is
-// ready. If the relay stops first, it returns the error the relay stopped
-// with; the relay's cleanup does not wait for it a second time.
-func startRelay(t testing.TB, public, control int, corePorts []int) (*Relay, error) {
+// ready. With front, client_path names the terminator's msrps: port, and
+// the terminator forwards to public. If the relay stops first, it returns
+// the error the relay stopped with; the relay's cleanup does not wait for
+// it a second time.
+func startRelay(t testing.TB, public, control int, corePorts []int, front *tlsFront) (*Relay, error) {
 	t.Helper()
+	advertised, secure := public, "false"
+	if front != nil {
+		front.public = public
+		advertised, secure = front.port(), "true"
+	}
 	ports := make([]string, len(corePorts))
 	for i, p := range corePorts {
 		ports[i] = strconv.Itoa(p)
@@ -128,8 +196,8 @@ func startRelay(t testing.TB, public, control int, corePorts []int) (*Relay, err
 		"RELAY_LISTEN_ADDR":        "127.0.0.1:" + strconv.Itoa(public),
 		"RELAY_CONTROL_ADDR":       "127.0.0.1:" + strconv.Itoa(control),
 		"RELAY_PUBLIC_HOST":        "127.0.0.1",
-		"RELAY_PUBLIC_PORT":        strconv.Itoa(public),
-		"RELAY_PUBLIC_TLS":         "false",
+		"RELAY_PUBLIC_PORT":        strconv.Itoa(advertised),
+		"RELAY_PUBLIC_TLS":         secure,
 		"RELAY_CORE_HOST":          "127.0.0.1",
 		"RELAY_CORE_NETWORKS":      "127.0.0.0/8",
 		"RELAY_CORE_PORTS":         strings.Join(ports, ","),

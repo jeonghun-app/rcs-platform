@@ -2,8 +2,9 @@
 
 `rcs-as` is the RCS messaging application server
 ([architecture](architecture.md) §2). This document describes its messaging
-core: how 1-to-1 chat and standalone messages are accepted, stored, delivered
-and answered with disposition notifications (IMDN, RFC 5438). The SIP side
+core: how 1-to-1 chat, group chat and standalone messages are accepted,
+stored, delivered and answered with disposition notifications (IMDN, RFC
+5438), and how group chats are run ([Group chat](#group-chat)). The SIP side
 (INVITE and MESSAGE handling, SDP, the third-party REGISTER from `scscf`) is a
 later issue. The core is driven through interfaces so that it can be built and
 tested first.
@@ -13,7 +14,11 @@ The code:
 - `internal/rcsas/messaging`: the engine. It has no SIP and no AWS code.
 - `internal/rcsas/store`: the `Store` interface, the memory backend and the
   contract test (`storetest`) that every backend passes.
-- `internal/rcsas/awsstore`: the DynamoDB backend.
+- `internal/rcsas/group`: the group chat focus: rules, rosters, and who a
+  group message goes to. No SIP code either.
+- `internal/rcsas/groupstore`: the groups' `Store` interface, memory backend
+  and contract test.
+- `internal/rcsas/awsstore`: the DynamoDB backends of both.
 - `internal/rcsas`: the `RCSAS_` settings.
 
 ## How the SIP layer drives the engine
@@ -91,7 +96,16 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    separate token buckets, per task.
 4. **CPIM From.** It must be one of the sender's asserted identities, or the
    anonymous URI `sip:anonymous@anonymous.invalid` that RCS clients put in
-   1-to-1 chat.
+   1-to-1 chat. Identities are compared as written and in canonical form
+   (`identity.CanonicalIMPU`), so `;user=phone` or a host's case does not make
+   a client's own provisioned URI someone else's. It must also be the only header that a receiver could read as
+   a From, and at most one header may read as a To: a second `From`, a `from`
+   or `FROM`, a prefixed `x.From` (whatever namespace the prefix is bound
+   to), a `From` after an NS header that changes the default namespace, and
+   a content header named `From` or `To` are all refused as `malformed`. The
+   message is forwarded unchanged, so a receiver that compares header names
+   loosely or reads namespaces differently from `internal/cpim` would
+   otherwise read a sender the engine never checked.
 5. **Sent-message record.** A message that asks for notifications gets one:
    sender, Message-ID, recipients, the dispositions asked for. It is kept for
    `RCSAS_SENT_TTL`. A resend with the same Message-ID to the same recipient
@@ -104,10 +118,11 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    - Each sender may hold `1/RCSAS_QUEUE_SENDER_SHARE` of either (an eighth
      by default). One sender therefore cannot fill a queue and lock the others
      out.
-   - Notifications count toward the queue but not toward a share. What one
-     notifier can put in a queue is already bounded: it needs a message the
-     queue's owner sent it, and is accepted once per kind. A recipient catching
-     up answers each message with up to two.
+   - A 1-to-1 notification counts toward the queue but not toward a share.
+     What one notifier can put in a queue is already bounded: it needs a
+     message the queue's owner sent it, and is accepted once per kind. A
+     recipient catching up answers each message with up to two. Group traffic
+     has shares of its own (see [Fan-out](#fan-out)).
    - Beyond these bounds the message is refused as `queue_full` or
      `queue_share_full`, and the sender gets the negative delivery
      notification it asked for. A refusal from a full share affects that
@@ -257,6 +272,235 @@ expired after `RCSAS_STORE_TTL` and gives up on them.
 - **Partial reads.** A read that fails part-way still hands over what it
   found.
 
+## Group chat
+
+`rcs-as` is the controlling function of RCC.07 Group Chat: a conference focus
+that the conference factory URI reaches. Each group has a conference URI of its
+own, `sip:chat-<128 random bits>@RCSAS_CONFERENCE_HOST`, and every participant
+has a session with it: a leg of mode `group` whose peer is that URI.
+
+Group mode is single-task for now: run it on one rcs-as task until
+[#121](https://github.com/jeonghun-app/rcs-platform/issues/121) anchors each
+group on one task (see [Assumptions and
+limitations](#assumptions-and-limitations)).
+
+### How the SIP layer drives it
+
+| SIP event | Call |
+|---|---|
+| An INVITE to the conference factory, with a resource list | `group.Service.Create` (the creator is joined; the invitees are invited, and the SIP layer invites them). A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` entries is refused (`ErrTooMany`) before any entry is read; the SIP layer should bound the resource-list body it parses to about that many entries too |
+| A participant's session with the group is set up (its INVITE, or its answer to the focus's) | `Join`, then `OpenLeg` / `Offer` and `Leg.Answer` with `Mode: store.Group` and the conference URI as `Peer`. If `Join` refuses, the session is refused and no leg opened |
+| A BYE on that session | `Leave`, and `Leg.Close` |
+| A 603 Decline to the focus's INVITE | `Leave`, not `InviteFailed`. The reference client declines the first INVITE of a group it left while offline (RCC.07 6.3.3.1; rcsjta `isGroupChatNextInviteRejected`), and accepts later ones as a new addition. Other failures stay `InviteFailed` |
+| A REFER adding someone | `Add`. A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 is refused unread, as for `Create` |
+| A REFER with `method=BYE` removing someone | `Remove`, then a BYE on the removed participant's session and `Leg.Close` |
+| `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated`), so that it learns no later roster change |
+| A SUBSCRIBE to the conference event package | `Roster`: the full document for the first NOTIFY |
+| `Notifier.RosterChanged` | a NOTIFY with the document to each subscription |
+| `Deliverer.Invite` with `Mode: store.Group` | an INVITE that brings the participant back into the group. The engine asks `Member` first, so it is only ever for a current participant |
+
+### Rules
+
+These are this implementation's reading of RCC.07 Group Chat and OMA CPM
+group sessions. They have not been checked against the licensed texts.
+
+| Operation | Who may | Conditions |
+|---|---|---|
+| Create | anyone | 1 to `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 others; the creator becomes chairman, joined; rate per creator, and the invitees count toward its add rate |
+| Join | a current (invited or joined) participant | someone who left or was removed must be added again; a joined participant joining again only updates its name, at its group rate |
+| Leave | a current participant | the chairman's role passes to the participant joined longest (counted from its last join, not its first), else the one invited longest ago; the last one out ends the group |
+| Add | a joined participant | within the size limit, at its add rate; current participants are left alone, former ones invited again. Someone the chairman removed is added back only by the chairman |
+| Remove | the chairman | not itself (that is Leave); the target must be current |
+| Write | a joined participant | at `RCSAS_GROUP_SENDER_RATE` per group, within a quarter of the group's fan-out budget and within the budget |
+| Read the roster | a current participant | |
+
+Every value is checked before anything is stored, and the roster documents are
+built before each write, so that no request can store a group whose roster
+cannot be written. A bad creator, subject or Conversation-ID refuses the
+request (`invalid`); a bad invitee or name never does:
+
+- **Identities** must be SIP or tel URIs that name a user, at most 255 bytes
+  (`identity.MaxLength`), without `&` or `'`, which XML would escape in the
+  roster. An invitee in `Create` or `Add` whose identity is not one is left
+  out (`group.invitee_skipped`) and the others are invited; the SIP layer
+  finds who was in the group returned. A list with nobody left is
+  `invalid`.
+  They are stored and compared in canonical form (`identity.CanonicalIMPU`,
+  the form the HSS provisions): a SIP URI keeps its user part, loses its
+  parameters and has its host in lower case; a tel URI is a global number
+  without visual separators. One person added as `tel:+1-555-…` and joining
+  as `tel:+1555…` is one participant. The SIP layer passes asserted
+  identities in the same form, as the CSCFs assert them. The engine puts a
+  group leg's `User`, and a group message's sender, in that form too, so a
+  leg opened under another spelling still gets its participant's copies.
+- **Names** are at most 100 bytes and **the subject** at most 256 bytes of
+  UTF-8 that XML can carry, without control characters.
+- **A name is one participant's, and never keeps anyone out.** A name that is
+  too long, is not valid text, or that another participant, current or
+  former, goes by, is dropped (`group.name_dropped`): `Create` and `Add` store
+  that participant without a name, and `Join` keeps the name it had, if any,
+  as a rename that is no change and uses none of the renaming rate. Without
+  a name, its roster entry and the `From` of what it writes carry its
+  identity alone. Names are first come, first served, and unverified. Names are not cut
+  short, which could make two equal. They are compared without case, extra
+  white space, and every character that shows as nothing (Unicode format
+  characters and the other default-ignorable code points: bidirectional
+  controls, zero-width characters, the soft hyphen, variation selectors,
+  tags, Hangul fillers). The author's roster name is in the `From` of every
+  group message, so one participant cannot pass for another by name. Names
+  are not normalized (NFC), and look-alike letters of different scripts are
+  not folded.
+- **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
+  in 1-to-1 chat.
+
+### Fan-out
+
+A message a joined participant writes goes through the same pipeline as 1-to-1
+chat (size, CPIM parse, `From` check, per-sender rate). Then:
+
+- **Rate and budget.** The group applies the sender's rate in this group and
+  the group's fan-out budget, which counts one delivery per recipient. Each
+  sender may use at most a quarter of the budget (`group.FanoutSenderShare`),
+  in rate and in burst. Without that, one participant of a full group writing
+  as fast as its own rate allows would use the whole budget, and the others'
+  messages would be refused. The burst is sized so that a quarter of it still
+  carries 10 messages in a row to a full group
+  (`group.FanoutSenderMessages`): people send a few short messages in quick
+  succession, and the reference client ends its session with the group when
+  one is refused.
+- **CPIM rewrite.** rcs-as builds the header block anew: `From`, the sender's
+  asserted identity under its display name in the roster (not the one its
+  client wrote), then `To`, the group, then every other header in its order.
+  Any header a receiver could take for a `From` or `To` is left out, in any
+  case, prefix or namespace, and both come before any NS header, so they are
+  in the core namespace. It then queues one copy for every other current
+  participant, invited ones included:
+  - each copy has `Sender` = the group and `Author` = the writer;
+  - each recipient's queue is bounded as in 1-to-1 chat, and a copy counts
+    against its author's share of it, the same share the author's 1-to-1
+    messages to that recipient use: one person holds one share of a queue,
+    however many groups it writes in;
+  - a full queue costs that recipient the copy, with the negative delivery
+    notification if the author asked for one, and nobody else anything.
+- **Delivery.** Each copy goes on the recipient's own session with the group,
+  by its own worker:
+  - a slow participant holds up its own queue only;
+  - an absent one has its copy kept while the engine asks the SIP layer to
+    bring it back (`Invite`, mode `group`), each time after asking the group
+    (`GroupHandler.Member`) whether it is still a participant;
+  - a copy for someone who is no longer a participant is given up
+    (`delivery.not_participant`), with the negative delivery notification if
+    the author asked for one. `Leave`, `Remove` and a refused `Join` tell the
+    engine at once (`ParticipantLeft`), and it gives up that participant's
+    copies from the group even while its session is still open. Another
+    task finds out when it would invite the participant;
+  - pager mode is never used, since a client cannot place a group message
+    that arrives outside the group.
+- **Is-composing.** Indications go to the joined participants' open sessions
+  on this task, unstored, with `From` rewritten, at 60 a minute with a burst
+  of 5 per participant and group. With no other session of the group open on
+  the task, one is dropped without reading the group. rcsjta sends them wrapped in
+  CPIM in a group; a bare one is wrapped.
+
+### Notifications in a group
+
+Each participant's delivery and display notifications are forwarded to the
+author one by one, in the author's session with the group. They are not
+aggregated: RFC 5438 §8.3 aggregation is optional and `internal/imdn` does not
+decode it.
+
+A group message that asks for notifications gets two sent-message records:
+
+- the group's, keyed by the group and the Message-ID. It matches a
+  notification sent in the group whatever form of the author's identity the
+  notifier's client writes in its To, and holds the marks of the
+  notifications accepted;
+- the author's own, keyed by the author and naming the group. A notification
+  sent outside the group finds it. rcsjta sends display notifications as a
+  SIP MESSAGE to the author, with anonymous From and To, once the group
+  session is gone (`ChatServiceImpl.sendGroupChatDisplayedDeliveryReport`).
+  It also means that an author's Message-ID names one message: the same ID
+  in a group and in a 1-to-1 message is refused as `message_id_reused`.
+
+A notification, in the group or outside it, is accepted only when all of these
+hold:
+
+- the group's record of the message exists. It is read before the group, so
+  a notification about nothing costs no read of the group's item;
+- the notifier is one of the participants the message went to;
+- its `recipient-uri`, if it has one, is the notifier's identity (or the
+  anonymous URI): no participant reports for another;
+- the author asked for that kind;
+- it is the first of its kind from that notifier, whichever way it came.
+
+It goes to the author in the group. Its header block is rebuilt as for a
+message: `From` the notifier's asserted identity and `To` the author, as the
+group's record names it, whatever the notifier wrote there. A client takes a
+notification in a group only when it is `To` itself (rcsjta).
+
+Every message an author writes is answered by every other participant, up to
+twice. So the notifications about one group's messages in a queue, from any
+notifier, share one sender's share of it (`#group-notifications <group>`, an
+eighth by default), so that one busy group does not crowd out another's. All
+group notifications in a queue together, from every group, hold at most a
+quarter of it (`#group-notifications`, 250 by default): an author in many
+large groups is not locked out of 1-to-1 messages by receipts. A notification
+beyond its group's share, the total or the queue is taken (200)
+and dropped, counted as `group.notification.dropped`, rather than refused: the
+reference client ends its session with the group when one is refused.
+
+Notifications rcs-as generates (expiry, full queue) go to the author the same
+way, from the recipient.
+
+### Roster events
+
+The roster is a conference-info document (RFC 4575, `internal/conference`)
+with one user per participant, current or former, and one endpoint each:
+
+| Participant | Endpoint status | Disconnection method |
+|---|---|---|
+| invited | `dialing-out` | |
+| joined | `connected` | |
+| left | `disconnected` | `departed` |
+| removed | `disconnected` | `booted` |
+
+A group keeps at most as many former participants as
+`RCSAS_GROUP_MAX_PARTICIPANTS`, and fewer where that many could take the roster
+beyond 256 KiB (`conference.MaxDocumentSize`, what `internal/conference` reads
+back). Beyond that, whoever left longest ago leaves the roster, as a
+`state="deleted"` user in the partial document of the change that pushed it
+out; those who left go before those who were removed. A removed participant
+that leaves the roster is still kept, identity only, in the group's
+`removed` list (up to 200, oldest forgotten first), which is not part of the
+roster: only the chairman adds them back, however many have left since.
+
+The roster's size is bounded by the limits, not checked as it grows, so that no
+Leave or Remove can be refused for it. When the service starts, it builds the
+largest full document its limits allow: every identity at 255 bytes, every name
+at 100 bytes of `&` (each escaped to `&amp;`), the longest subject, role and
+endpoint. That is about 1.2 KB a participant. It keeps as many former
+participants as fit with a full group (100 for a group of 100, 9 for a group of
+200) and refuses a size limit whose current participants alone would not fit.
+A partial document never holds more than the full one.
+
+Former participants are in the roster that every current participant reads,
+including those who join after they left. So someone who joins a group learns
+the identities and names of people who were in it before, up to that limit, as
+clients show who left. This is RFC 4575's model of a conference roster. It is
+communication metadata (threat model T11).
+
+The roles are `chairman` and `participant`. Creating a group produces a full
+document at version 1. Every change after that writes the group conditionally
+on the revision it was computed from (`groupstore.Store.Update`) and raises the
+version by exactly one. Two tasks changing one group therefore never lose a
+change and never reuse a version.
+
+Each change is sent as a partial document: `<users state="partial">` with each
+changed user whole (`state="full"`), which RFC 4575 §4.6 merges by entity.
+Versions count per group across tasks, so a subscription that misses one sees
+the gap and refreshes for a full document. A task that stops between writing a
+change and notifying it leaves exactly such a gap.
+
 ## Settings
 
 Shared `RCS_` settings are described in `internal/runtime`. The `RCSAS_`
@@ -288,6 +532,16 @@ settings:
 | `RCSAS_RETRY_INTERVAL`, `RCSAS_MAX_RETRY_INTERVAL` | `1m`, `1h` | First and longest wait before a held queue is read again |
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
+| `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as` |
+| `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
+| `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200. Former participants are kept up to the same number, fewer above 104, so that the roster stays within 256 KiB (see [Roster events](#roster-events)) |
+| `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
+| `RCSAS_GROUP_SENDER_RATE`, `RCSAS_GROUP_SENDER_BURST` | `60`, `30` | Messages per minute one participant writes in one group, per task; also renames |
+| `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |
+| `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
+| `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
+
+A rate of `0` turns that limit off.
 
 Durations use Go syntax (`168h`, not `7d`).
 
@@ -301,7 +555,7 @@ There is one table with partition key `pk` and sort key `sk` (both strings).
 | Queued message | `q#<len>#<recipient>` | queue ID: enqueue time in hex, then random |
 | Queue size | `c#<len>#<recipient>` | `n` |
 | A sender's share of a queue | `c#<len>#<recipient>` | `s#<len>#<sender>` |
-| Sent-message record | `s#<len>#<sender>` | IMDN Message-ID |
+| Sent-message record | `s#<len>#<sender>` | IMDN Message-ID; for a group message, one under the group and one under the author, which names the group (`group`) |
 
 There is one global secondary index, `expiry`:
 
@@ -316,8 +570,12 @@ The table's properties:
   order, which is enqueue order.
 - **Bounds.** The queue's size item and the sender's share item count messages
   and bytes. Both are written in the same transaction as each enqueue and
-  removal, and the enqueue is conditional on both bounds. A notification has
-  no share item. An enqueue moves a size item's TTL to its message's, which
+  removal, and the enqueue is conditional on both bounds. A 1-to-1
+  notification has no share item. A group message counts in its author's
+  share item, a group notification in its group's, named
+  `#group-notifications <group>`, and in the total of all group notifications,
+  `#group-notifications`; no identity can be either. An enqueue moves a size
+  item's TTL to its message's, which
   only lengthens it, since messages are enqueued in time order with one
   lifetime. A removal leaves the TTL alone. Each queue item
   carries its own `size`. The SDK's idempotency token makes its own retry of a
@@ -325,7 +583,8 @@ The table's properties:
 - **Drift.** The sizes are kept by rcs-as, so a queue item deleted another way
   (by DynamoDB's TTL, or by hand) would count until it was corrected. An
   enqueue that a bound refuses therefore counts the queue once (a consistent
-  query of the partition, projecting sender and size). It lowers each size
+  query of the partition, projecting what decides an item's share and its
+  size). It lowers each size
   item that says more than it found, conditional on the item being unchanged
   since it was read, and tries the enqueue again. A count reads the whole
   partition, so each queue is counted at most once per 10 minutes: a
@@ -372,6 +631,43 @@ needed.
 also runs two engines that share one table and must deliver each message
 once.
 
+## DynamoDB `groupchats` table
+
+The `groupchats` table has the same key schema as `messages` (`pk`, `sk`,
+TTL attribute `ttl`) and no index. Each group is one item:
+
+| `pk` | `sk` |
+|---|---|
+| `g#<len>#<conference URI>` | `group` |
+
+- **Contents.** The item holds the subject, creator, Conversation-ID, roster
+  version, times, the participants as a list, and the identities of removed
+  participants the roster no longer lists (`removed`, at most 200). A group of 100 is about 15
+  KB, and the item limit is 400 KB. A group holds at most 400 participants,
+  current and former, which is about 340 KB with every field at its longest
+  (`groupstore.MaxEntries`; `RCSAS_GROUP_MAX_PARTICIPANTS` is therefore at most
+  200).
+- **Writes.** Every change rewrites the item on the condition that its `rev`
+  is the one the change was computed from. A token (`wtoken`) tells a repeat
+  of the write from another writer's; `Create` uses one too.
+- **Touch.** At most once an hour per task, and not within an hour of a
+  change, a group in use has its `active`, `expires` and `ttl` moved forward,
+  without changing `rev`. The update is conditional on the stored `active`
+  being older, so a touch that arrives after a later write (which may have
+  ended the group) changes nothing. Creating a group and every change set
+  `expires` to `RCSAS_GROUP_IDLE_TTL` from then.
+- **Expiry.** `ttl` is the group's expiry plus a day; every read checks the
+  expiry itself.
+- **IAM.** The task role needs `GetItem`, `PutItem`, `UpdateItem` and
+  `DescribeTable` on the table.
+
+Each group message costs one strongly consistent read of the group item and,
+per recipient, the enqueue transaction of the `messages` table. The fan-out
+budget bounds that per group. A notification costs a read of its sent-message
+record first, and of the group item only when the record exists; an
+is-composing indication reads the group item only when another participant
+has a session with the group on the same task, within its rate.
+
 ## Metrics and logs
 
 Counts are written as CloudWatch EMF. The only dimension is `Service`, and no
@@ -387,7 +683,7 @@ identifier ever appears in a metric name.
 | `imdn.duplicate` | Notifications dropped as repeats |
 | `imdn.route_untrusted`, `imdn.route_dropped` | IMDN routes not followed: in a forwarded notification, and in a generated one's record route |
 | `delivery.msrp`, `delivery.pager`, `delivery.msrp_failed`, `delivery.pager_failed` | Delivery attempts |
-| `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `message.expired` | Messages given up on |
+| `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
 | `invite.sent`, `invite.failed`, `invite.no_sessions`, `invite.untracked` | Terminating session requests |
@@ -395,6 +691,10 @@ identifier ever appears in a metric name.
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
+| `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
+| `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
+| `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
+| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through
 `internal/pii`. MSRP session ids never appear: they are capabilities ([threat
@@ -413,6 +713,9 @@ Signals to alarm on (Phase 7):
 | `message.expired` rising | Recipients unreachable for `RCSAS_STORE_TTL` |
 | `msrp.accept_failed` > 0 | The MSRP listener ran out of file descriptors or the like |
 | `invite.untracked` > 0 | More pending invitations than a task tracks (100 000); messages wait for the retry timer instead of an invitation |
+| `group.fanout_budget_exceeded` sustained | A group writing beyond its budget: a flood, or the budget is too small for real groups |
+| `group.fanout_share_exceeded` sustained | One participant writing to a large group as fast as it may: a flood |
+| `group.rejected.rate_limited` sustained | Users creating groups or adding people faster than allowed: mass-add spam |
 
 ## Assumptions and limitations
 
@@ -445,9 +748,60 @@ Signals to alarm on (Phase 7):
 - **The queue size is kept by rcs-as.** A queue item that DynamoDB's TTL
   deletes, because no sweep reached it, still counts until the next refusal
   recounts the queue.
+- **Group delivery is per task like 1-to-1 chat.** A participant's session
+  with a group lives on the task its SIP dialog names, and group mode needs
+  them all on one (below). Is-composing reaches only participants on the same
+  task. The delivery workers are shared, so more slow participants than
+  `Workers` (32) at once slow everyone, by up to `RCSAS_DELIVERY_TIMEOUT`
+  each.
+- **Receipts for an offline author can be dropped.** While the author has no
+  session, its queue keeps at most a share (125 by default) of one group's
+  notifications, and 250 of all groups' together. One message to a full group
+  of 100 that asks for both kinds is answered with 198: 125 are kept and 73
+  dropped (`group.notification.dropped`); one message in each of nine such
+  groups keeps 250 of 1782. The reference client marks a group message
+  displayed only when every recipient has said so
+  (`GroupChatImpl.isDisplayedByAllRecipients`), so such a message is never
+  shown as read by all. An author with a session, or that the engine can
+  invite, takes them as they come and loses none.
+  This is accepted for now: an author that goes offline right after writing to
+  a large group may never see "read by all". Aggregating the receipts is
+  [#166](https://github.com/jeonghun-app/rcs-platform/issues/166).
+- **Group fan-out is sequential.** A group message is queued for its
+  recipients one enqueue transaction after another, on the sender's session,
+  before the sender's answer. A message to 99 others at 10 ms an enqueue takes
+  about a second. Past 20 s (`Config.FanoutTimeout`, within the 30 s an MSRP
+  client waits) the remaining recipients are left out
+  (`group.fanout.timed_out` counts them), and the sender gets `StatusTryAgain`.
+  The reference client does not resend by itself: it marks the message failed
+  and ends its session with the group, and the user may send it again.
+  Recipients that already have it drop the repeat by Message-ID. Each message
+  starts at a random recipient, so the ones left out are not the same every
+  time. Other sessions are not held up.
+- **Leaving is known per task.** The task that ran `Leave` or `Remove` gives up
+  that participant's queued copies at once. Another task gives them up only
+  when it would invite the participant back, so a session the SIP layer has
+  not ended yet may still carry them there. A client that takes no sessions
+  has its copies given up when it registers on a new flow, or when they
+  expire.
+- **Group rates are per task**, like the 1-to-1 ones.
+- **Group mode runs on one task until
+  [#121](https://github.com/jeonghun-app/rcs-platform/issues/121).** Every
+  participant's session with a group, its deliveries and its roster
+  notifications must be on the same task. With two or more tasks, a
+  participant's session would land on whichever task its SIP dialog names: a
+  message written on one task would invite participants whose session is on
+  another instead of delivering to it, and a roster change would reach only
+  the subscriptions of the task that made it. #121 anchors each group's focus
+  on one task (an owner lease, ADR 0005 amendment); until then, deploy
+  rcs-as with group chat on a single task.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;
   - the IMDN behaviour of chat sessions;
-  - is-composing outside CPIM;
-  - one message per large-mode session.
+  - is-composing outside CPIM in 1-to-1 chat, and inside CPIM in a group;
+  - one message per large-mode session;
+  - the group rules above, and the author taken from a group message's CPIM
+    `From`;
+  - one `From` and at most one `To` per message: RFC 3862 §4.2 allows
+    several `To` headers, but RCS clients write one.

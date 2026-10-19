@@ -154,7 +154,7 @@ func (h *Header) ProxyAuthorization() (CredentialsList, error) {
 }
 
 // AcceptContact returns the Accept-Contact elements (RFC 3841).
-func (h *Header) AcceptContact() ([]AcceptContact, error) {
+func (h *Header) AcceptContact() (AcceptContacts, error) {
 	return listOf(h, "Accept-Contact", parseAcceptContact)
 }
 
@@ -194,7 +194,7 @@ func (h *Header) MinSE() (MinSE, error) {
 }
 
 // Reason returns the Reason elements (RFC 3326 §2).
-func (h *Header) Reason() ([]Reason, error) { return listOf(h, "Reason", parseReason) }
+func (h *Header) Reason() (Reasons, error) { return listOf(h, "Reason", parseReason) }
 
 func (h *Header) nameAddrs(name string) (Addresses, error) {
 	return listOf(h, name, func(s string) (Address, error) { return parseAddress(s, true) })

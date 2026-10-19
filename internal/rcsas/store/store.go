@@ -47,16 +47,22 @@ var (
 
 // Limit bounds one recipient's queue, and the share of it one sender may
 // hold, so that a sender cannot fill a queue and lock every other sender
-// out. A zero field is no bound. Notifications count toward the queue but
-// neither toward nor against a sender's share: what one notifier may put
-// in a queue is already bounded by the messages the queue's owner sent it,
-// each answered once per kind, and a recipient catching up on many
-// messages answers each with up to two.
+// out. A zero field is no bound. Whose share an item counts against is
+// Message.ShareKey: a 1-to-1 notification counts toward the queue only,
+// since what one notifier may put in a queue is already bounded by the
+// messages the queue's owner sent it, each answered once per kind.
+//
+// GroupCount and GroupBytes bound all group notifications in a queue
+// together (Message.InGroupTotal), whichever group they come from: each
+// group's have a share of their own, and without a total, an author in
+// enough groups would have its queue filled by receipts alone.
 type Limit struct {
 	Count       int
 	Bytes       int64
 	SenderCount int
 	SenderBytes int64
+	GroupCount  int
+	GroupBytes  int64
 }
 
 // Mode is how a message was sent, which decides how it may be delivered.
@@ -68,6 +74,10 @@ const (
 	// Standalone messages are pager-mode (SIP MESSAGE, RFC 3428) or
 	// large-mode (an MSRP session of its own) standalone messages.
 	Standalone
+	// Group messages travel in a participant's session with a group chat
+	// (RCC.07 Group Chat): Sender is the group's conference URI, the peer
+	// of that session, and Author the participant who wrote the message.
+	Group
 )
 
 func (m Mode) String() string {
@@ -76,6 +86,8 @@ func (m Mode) String() string {
 		return "chat"
 	case Standalone:
 		return "standalone"
+	case Group:
+		return "group"
 	}
 	return "unknown"
 }
@@ -89,8 +101,13 @@ type Message struct {
 	// it sort in enqueue order (see the messaging package), so Pending
 	// returns a queue oldest first.
 	ID string
-	// Sender is the asserted identity of the sender.
+	// Sender is the asserted identity of the sender: for a Group message,
+	// the group's conference URI.
 	Sender string
+	// Author is, for a Group message, the asserted identity of the
+	// participant who wrote it, or for a group notification the
+	// participant it reports for; empty otherwise.
+	Author string
 	// Conversation, Contribution and InReplyTo are the RCC.07 conversation
 	// identifiers the message belongs to; InReplyTo may be empty.
 	Conversation string
@@ -117,6 +134,43 @@ type Message struct {
 	LeaseUntil time.Time
 }
 
+// GroupNotifications names the total of all group notifications in a
+// queue (Limit.GroupCount), and followed by a space and a group's
+// conference URI, the share of a queue that notifications about that
+// group's messages count against, whichever participant sends them.
+// Neither is an identity, which is a URI.
+const GroupNotifications = "#group-notifications"
+
+// InGroupTotal reports whether m counts toward the total of a queue's
+// group notifications, GroupNotifications: it is a group notification.
+func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification }
+
+// ShareKey returns whose share of the recipient's queue m counts against,
+// and false when it counts against none:
+//
+//   - a message counts against its writer's share: the sender, or for a
+//     group message its author, so that one person holds one share of a
+//     queue whichever way they write;
+//   - a group notification counts against its group's notification share
+//     (GroupNotifications): each message an author writes is answered by
+//     every other participant, so the bound that makes a 1-to-1
+//     notification need no share (one recipient answers it, once per
+//     kind) does not hold, and without one the receipts for a few messages
+//     to a large group would fill the author's queue. A share per group
+//     keeps one busy group from crowding out the receipts of the others;
+//   - a 1-to-1 notification counts against none.
+func (m Message) ShareKey() (string, bool) {
+	switch {
+	case m.Mode == Group && m.Notification:
+		return GroupNotifications + " " + m.Sender, true
+	case m.Mode == Group && m.Author != "":
+		return m.Author, true
+	case !m.Notification:
+		return m.Sender, true
+	}
+	return "", false
+}
+
 // Size is what m counts for against its queue's Limit.
 func (m Message) Size() int64 { return int64(len(m.CPIM)) }
 
@@ -135,8 +189,20 @@ func (m Message) Free(now time.Time) bool {
 // Sent records a message a sender sent, for as long as notifications about
 // it may come back.
 type Sent struct {
+	// Sender is the sender's identity, or for a group message the group's
+	// conference URI: a notification in a group answers a message by its
+	// Message-ID within the group, whatever form of the author's identity
+	// the notifier's client writes.
 	Sender    string
 	MessageID string
+	// Author is, for a group message, the participant who wrote it, whom
+	// its notifications go to; empty otherwise.
+	Author string
+	// Group is set on the author's own record of a group message (Sender
+	// the author), which a notification sent outside the group's session
+	// finds: the group's conference URI, whose record holds the marks of
+	// the notifications already accepted. Empty otherwise.
+	Group string
 	// Recipients are the identities a notification about the message may
 	// come from.
 	Recipients []string
@@ -162,8 +228,8 @@ func (s Sent) Clone() Sent {
 type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
-	// beyond l, ErrSenderShareFull if what m.Sender has in it would (m not
-	// being a notification).
+	// beyond l, ErrSenderShareFull if what counts against m's share
+	// (Message.ShareKey), or the total of group notifications for one, would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID
