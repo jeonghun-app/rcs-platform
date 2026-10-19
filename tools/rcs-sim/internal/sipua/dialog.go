@@ -115,7 +115,7 @@ func (ua *UA) Invite(ctx context.Context, req *sip.Request, progress func(*sip.R
 		d := inv.d
 		inv.mu.Unlock()
 		if d != nil && d != handed {
-			go func() { _, _ = d.Bye(context.Background()) }()
+			ua.byes.Go(func() { _, _ = d.Bye(context.Background()) })
 		}
 	}()
 	tx, err := ua.layer.Request(req, ua.destination(), inv.handle)
@@ -269,8 +269,14 @@ func (inv *invite) ok(res *sip.Response) {
 		return
 	}
 	inv.forks[tag] = f
+	// Counted before the ACK goes, so that whoever sees the ACK can wait
+	// for the BYE.
+	inv.ua.byes.Add(1)
 	f.sendACK()
-	go func() { _, _ = f.Bye(context.Background()) }()
+	go func() {
+		defer inv.ua.byes.Done()
+		_, _ = f.Bye(context.Background())
+	}()
 }
 
 func (inv *invite) dialog() *Dialog {
