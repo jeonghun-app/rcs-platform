@@ -51,16 +51,7 @@ func TestASendCancelledWhileQueuedEndsWithItsContextsError(t *testing.T) {
 		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: []byte("cancelled")})
 		second <- err
 	}()
-	deadline := time.Now().Add(hangGuard)
-	for queued := 0; queued == 0; {
-		c.qmu.Lock()
-		queued = len(c.queue)
-		c.qmu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatal("the second message was never queued")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitQueued(t, c, 1, "the second message")
 	cancel()
 	err = <-second
 	if !errors.Is(err, context.Canceled) || errors.As(err, &startedError{}) {
@@ -86,5 +77,99 @@ func TestASendCancelledWhileQueuedEndsWithItsContextsError(t *testing.T) {
 	p.respond(t, m, StatusOK)
 	if err := <-third; err != nil {
 		t.Fatalf("third Send = %v", err)
+	}
+}
+
+// waitQueued waits until n frames wait in c's write queue.
+func waitQueued(t *testing.T, c *Conn, n int, what string) {
+	t.Helper()
+	deadline := time.Now().Add(hangGuard)
+	for {
+		c.qmu.Lock()
+		queued := len(c.queue)
+		c.qmu.Unlock()
+		if queued == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d frames queued, want %d", what, queued, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A message whose later chunk is cancelled while still queued is ended with
+// an abort chunk, "#", at that chunk's start (RFC 4975 §7.1), so the
+// receiver does not hold the first chunk until its own timeout (#162, from
+// QA on #152).
+func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
+	ours, theirs := net.Pipe()
+	c, err := NewActiveConn(ours, Config{WriteTimeout: DefaultWriteTimeout, ChunkSize: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	p := newSyncPeer(t, theirs)
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	opened := make(chan error, 1)
+	go func() { opened <- c.Open(context.Background(), s) }()
+	p.respond(t, p.next(t), StatusOK)
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+	_ = theirs.SetReadDeadline(time.Now().Add(hangGuard))
+	octet := make([]byte, 1)
+
+	// B is two chunks of 8. Its first chunk is held mid-write: the peer has
+	// read one octet, and net.Pipe holds the writer until it reads on.
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	b := make(chan error, 1)
+	go func() {
+		_, err := s.Send(ctxB, Outgoing{ContentType: "text/plain", Body: []byte("bbbbbbbbBBBBBBBB")})
+		b <- err
+	}()
+	if _, err := io.ReadFull(theirs, octet); err != nil {
+		t.Fatal(err)
+	}
+	// A, one chunk, queues behind B's first chunk.
+	a := make(chan error, 1)
+	go func() {
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("aaaa")})
+		a <- err
+	}()
+	waitQueued(t, c, 1, "A")
+	// B's first chunk finishes, the writer takes A, and B's second chunk
+	// queues behind A. Then B is cancelled.
+	p.r = NewReader(io.MultiReader(bytes.NewReader(octet), theirs), 0)
+	b1 := p.next(t)
+	if string(b1.Body) != "bbbbbbbb" {
+		t.Fatalf("first chunk %q", b1.Body)
+	}
+	if _, err := io.ReadFull(theirs, octet); err != nil { // A is being written
+		t.Fatal(err)
+	}
+	waitQueued(t, c, 1, "B's second chunk")
+	cancelB()
+	if err := <-b; !errors.Is(err, context.Canceled) || errors.As(err, &startedError{}) {
+		t.Fatalf("B = %v, want context.Canceled from the queue", err)
+	}
+	p.r = NewReader(io.MultiReader(bytes.NewReader(octet), theirs), 0)
+	am := p.next(t)
+	if string(am.Body) != "aaaa" {
+		t.Fatalf("after B's first chunk the peer read %q, want A", am.Body)
+	}
+	p.respond(t, am, StatusOK)
+	p.respond(t, b1, StatusOK)
+	if err := <-a; err != nil {
+		t.Fatal(err)
+	}
+	// A third message, so a missing abort shows at once as the wrong next
+	// message.
+	go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("cccc")}) }()
+	m := p.next(t)
+	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range() != (ByteRange{Start: 9, End: 8, Total: 16}) || len(m.Body) != 0 {
+		t.Fatalf("after A the peer read %q flag %q range %+v (id %s, B's %s); want B's abort chunk 9-8/16",
+			m.Body, m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
 	}
 }
