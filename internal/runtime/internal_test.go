@@ -266,3 +266,26 @@ func TestEachAddressGetsItsShareOfTheDialTime(t *testing.T) {
 		t.Fatalf("shares %v, want the first about 2s", shares)
 	}
 }
+
+// Timeout bounds name resolution as net.Dialer.Timeout does: http.Transport
+// dials with a context the request's cancellation does not reach, so an
+// unresponsive resolver must not hold the connection slot beyond it (#114;
+// the test is QA's from the review of #105).
+func TestTheDialTimeoutAlsoBoundsTheLookup(t *testing.T) {
+	d := InternalDialer{
+		Timeout: 200 * time.Millisecond,
+		Lookup: func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(2 * time.Second):
+				return nil, errors.New("the lookup was not bounded by Timeout")
+			}
+		},
+	}
+	start := time.Now()
+	_, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("%v after %v, want a deadline error after about 200ms", err, time.Since(start))
+	}
+}

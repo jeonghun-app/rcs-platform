@@ -54,21 +54,29 @@ var ErrAddressNotPrivate = errors.New("runtime: the internal API host has no pri
 // net.Dialer. Use DialContext as an http.Transport's DialContext in staging
 // and prod; dev runs internal APIs on loopback.
 type InternalDialer struct {
-	// Timeout bounds each connection attempt; 0 means none beyond ctx.
+	// Timeout bounds the whole of DialContext, the name lookup and every
+	// connection attempt together, as net.Dialer.Timeout does; the
+	// attempts share what the lookup leaves (see DialContext). 0 means no
+	// bound beyond ctx's. It matters because http.Transport dials with a
+	// context that the request's cancellation does not reach, so without
+	// it an unresponsive resolver holds a connection slot for as long as
+	// the resolver's own timeout.
 	Timeout time.Duration
 	// Lookup resolves a host name, for tests; nil means
 	// net.DefaultResolver.LookupNetIP.
 	Lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 	// Dial connects to an address already checked, for tests; nil means a
-	// net.Dialer with Timeout.
+	// net.Dialer with no timeout of its own: each attempt's ctx carries
+	// its share of the time.
 	Dial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // DialContext resolves address's host and connects to its private
 // addresses in order, skipping the others. It fails with
 // ErrAddressNotPrivate when there is none; the error names no address. The
-// time left (ctx's deadline or Timeout, whichever is sooner) is shared out
-// as net.Dialer shares it: each attempt gets the time left divided by the
+// lookup and the attempts run within ctx's deadline or Timeout, whichever
+// is sooner, and the time the lookup leaves is shared out as net.Dialer
+// shares it: each attempt gets the time left divided by the
 // addresses left, at least two seconds, so that an address that does not
 // answer, such as a stopped task's still in the namespace's records, does
 // not use up the time the next one needs.
@@ -76,6 +84,11 @@ func (d InternalDialer) DialContext(ctx context.Context, network, address string
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
+	}
+	if d.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.Timeout)
+		defer cancel()
 	}
 	var addrs []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
@@ -97,11 +110,6 @@ func (d InternalDialer) DialContext(ctx context.Context, network, address string
 	}
 	if len(private) == 0 {
 		return nil, ErrAddressNotPrivate
-	}
-	if d.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d.Timeout)
-		defer cancel()
 	}
 	dial := d.Dial
 	if dial == nil {

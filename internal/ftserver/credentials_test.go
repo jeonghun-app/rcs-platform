@@ -233,3 +233,37 @@ func TestTheHSSClientInProductionConnectsOnlyToPrivateAddresses(t *testing.T) {
 		}
 	}
 }
+
+// A DialContext of its own turns HTTP/2 off in net/http unless the
+// transport asks for it, so the production HSS client sets
+// ForceAttemptHTTP2: an https HSS keeps h2 in staging and prod (#114).
+func TestTheProductionHSSClientSpeaksHTTP2ToAnHTTPSHSS(t *testing.T) {
+	var proto string
+	hss := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proto = r.Proto
+		fmt.Fprint(w, credentialJSON(t, digest.SHA256, alice))
+	}))
+	hss.EnableHTTP2 = true
+	hss.StartTLS()
+	defer hss.Close()
+	_, port, _ := net.SplitHostPort(hss.Listener.Addr().String())
+	d := runtime.InternalDialer{
+		Timeout: time.Second,
+		Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("10.0.1.5")}, nil
+		},
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hss.Listener.Addr().String())
+		},
+	}
+	// httptest's certificate names example.com.
+	src := NewHSSCredentials(mustURL("https://example.com:"+port), "provisioning-token", realm, time.Second, 4, d.DialContext)
+	tr := src.client.Transport.(*http.Transport)
+	tr.TLSClientConfig = hss.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	if _, err := src.Lookup(t.Context(), alice, digest.SHA256); err != nil {
+		t.Fatal(err)
+	}
+	if proto != "HTTP/2.0" {
+		t.Fatalf("the HSS was asked over %s, want HTTP/2.0", proto)
+	}
+}
