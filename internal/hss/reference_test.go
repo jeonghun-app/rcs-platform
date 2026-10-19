@@ -10,8 +10,11 @@ import (
 )
 
 func TestDefaultProfileEvaluatesWithinHalfTheWorkBudget(t *testing.T) {
-	p := DefaultRCSProfile(DefaultProfileID, asURI)
-	if err := checkWork(p.Criteria, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2}); err != nil {
+	set, err := ifc.Compile(DefaultRCSProfile(DefaultProfileID, asURI).Criteria)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkWork(set, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2}); err != nil {
 		t.Fatalf("the default profile needs more than half the S-CSCF's budget: %v", err)
 	}
 }
@@ -141,5 +144,38 @@ func TestCostlyProfileIsAcceptedWithAWarning(t *testing.T) {
 		stringify(profileResponse(DefaultRCSProfile(DefaultProfileID, asURI), nil).profileJSON))
 	if resp["warnings"] != nil {
 		t.Errorf("default profile warnings = %v", resp["warnings"])
+	}
+}
+
+// A write compiles the profile's criteria once (#120): the work check, the
+// store's validation and the cost warning use the compiled set instead of
+// compiling again, where they used to compile it four times. The warning
+// still comes, so the set it needs was there.
+func TestAProfileWriteCompilesItsCriteriaOnce(t *testing.T) {
+	a := newAPIEnv(t)
+	compiles := 0
+	compileProfile = func(criteria []ifc.FilterCriteria) (*ifc.Set, error) {
+		compiles++
+		return ifc.Compile(criteria)
+	}
+	t.Cleanup(func() { compileProfile = ifc.Compile })
+	spt := `{"group":[0],"sip_header":{"header":"Contact","content":"x[ab]{160}y"}}`
+	crit := func(p string) string {
+		return `{"priority":` + p + `,"trigger_point":{"condition_type_cnf":false,"spt":[` + spt + `]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}`
+	}
+	body := `{"id":"once","initial_filter_criteria":[` + crit("1") + `,` + crit("2") + `]}`
+	for _, w := range []struct{ method, path string }{{"POST", "/v1/service-profiles"}, {"PUT", "/v1/service-profiles/once"}} {
+		compiles = 0
+		code, resp, _ := a.do(w.method, w.path, adminToken, body)
+		if code != http.StatusCreated && code != http.StatusOK {
+			t.Fatalf("%s = %d %v", w.method, code, resp)
+		}
+		if warnings, _ := resp["warnings"].([]any); len(warnings) != 1 {
+			t.Fatalf("%s: warnings %v, want the cost warning", w.method, resp["warnings"])
+		}
+		if compiles != 1 {
+			t.Errorf("%s compiled the criteria %d times, want once", w.method, compiles)
+		}
 	}
 }

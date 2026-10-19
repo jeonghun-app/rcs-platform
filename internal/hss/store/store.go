@@ -229,6 +229,12 @@ type ServiceProfile struct {
 	MandatoryCapabilities []uint32
 	OptionalCapabilities  []uint32
 	Version               int64
+	// Compiled is ifc.Compile(Criteria), when the writer has already
+	// compiled these very criteria: ValidateProfile then uses it instead of
+	// compiling them again, which costs milliseconds for a large profile
+	// (#120). It is not stored, and a profile read back has none. A writer
+	// that changes Criteria after compiling them must clear it.
+	Compiled *ifc.Set
 }
 
 // Page is one page of a listing.

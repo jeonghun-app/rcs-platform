@@ -48,7 +48,7 @@ func profileResponse(p *store.ServiceProfile, warnings []string) profileResponse
 // warning, returned and logged, because a client sending somewhat larger
 // requests than the reference ones would push it over.
 func (a *API) costWarnings(p *store.ServiceProfile) []string {
-	err := checkWork(p.Criteria, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2})
+	err := checkWork(p.Compiled, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2})
 	if err == nil {
 		return nil
 	}
@@ -58,8 +58,16 @@ func (a *API) costWarnings(p *store.ServiceProfile) []string {
 	return []string{w}
 }
 
+// compileProfile compiles a profile's criteria; a variable so that a test
+// can count compiles.
+var compileProfile = ifc.Compile
+
 // profileFromJSON validates a profile as the S-CSCF will use it, and refuses
-// with 400 one it could not: the criteria must compile (ifcjson.ToIFC), the
+// with 400 one it could not. It compiles the criteria once, and the profile
+// it returns carries the compiled set (store.ServiceProfile.Compiled), which
+// the work check, the store's validation and the cost warning all use, so a
+// write compiles its criteria once whatever it does after (#120). The
+// criteria must compile (as ifcjson.ToIFC checks), the
 // reference requests of reference.go must evaluate within the default work
 // budget in every session case (the error names the limit reached), and the
 // User-Data of a subscription at the model's limits with this profile must
@@ -75,16 +83,21 @@ func profileFromJSON(in *profileJSON) (*store.ServiceProfile, error) {
 	if len(in.MandatoryCapabilities) > store.MaxCapabilities || len(in.OptionalCapabilities) > store.MaxCapabilities {
 		return nil, fail(http.StatusBadRequest, "capabilities: at most 32 of each")
 	}
-	criteria, err := ifcjson.ToIFC(in.InitialFilterCriteria)
+	criteria, err := ifcjson.Convert(in.InitialFilterCriteria)
 	if err != nil {
 		return nil, fail(http.StatusBadRequest, "initial_filter_criteria: "+strings.TrimPrefix(err.Error(), ifcjson.ErrInvalid.Error()+": "))
 	}
-	if err := checkWork(criteria, ifc.Limits{}); err != nil {
+	compiled, err := compileProfile(criteria)
+	if err != nil {
+		return nil, fail(http.StatusBadRequest, "initial_filter_criteria: "+err.Error())
+	}
+	if err := checkWork(compiled, ifc.Limits{}); err != nil {
 		return nil, fail(http.StatusBadRequest, "initial_filter_criteria: "+err.Error())
 	}
 	p := &store.ServiceProfile{
 		ID: in.ID, Criteria: criteria,
 		MandatoryCapabilities: in.MandatoryCapabilities, OptionalCapabilities: in.OptionalCapabilities,
+		Compiled: compiled,
 	}
 	if _, err := userData(largestSubscription(), 0, p); err != nil {
 		if errors.Is(err, ifc.ErrTooLarge) {
@@ -122,7 +135,7 @@ func (a *API) createProfile(w http.ResponseWriter, r *http.Request, _ Scope) err
 	}
 	w.Header().Set("Location", "/v1/service-profiles/"+saved.ID)
 	w.Header().Set("ETag", etag(saved.Version))
-	writeJSON(w, http.StatusCreated, profileResponse(saved, a.costWarnings(saved)))
+	writeJSON(w, http.StatusCreated, profileResponse(saved, a.costWarnings(p)))
 	return nil
 }
 
@@ -180,7 +193,7 @@ func (a *API) putProfile(w http.ResponseWriter, r *http.Request, _ Scope) error 
 	}
 	a.fanout(id)
 	w.Header().Set("ETag", etag(saved.Version))
-	writeJSON(w, http.StatusOK, profileResponse(saved, a.costWarnings(saved)))
+	writeJSON(w, http.StatusOK, profileResponse(saved, a.costWarnings(p)))
 	return nil
 }
 

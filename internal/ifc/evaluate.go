@@ -200,6 +200,17 @@ func Compile(criteria []FilterCriteria) (*Set, error) {
 	return CompileWithLimits(criteria, Limits{})
 }
 
+// WithLimits returns a Set that evaluates s's compiled criteria within lim,
+// so a set compiled once can be evaluated under several budgets. Its
+// counters start at zero.
+func (s *Set) WithLimits(lim Limits) *Set {
+	w := &Set{criteria: s.criteria, maxWork: lim.MaxWork}
+	if w.maxWork <= 0 {
+		w.maxWork = DefaultMaxWork
+	}
+	return w
+}
+
 // CompileWithLimits is Compile with a work budget other than the default.
 func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	r := &reader{}

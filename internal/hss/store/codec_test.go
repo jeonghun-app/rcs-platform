@@ -130,3 +130,45 @@ func TestReadingAProfileDoesNotRecompileItsCriteria(t *testing.T) {
 		t.Errorf("EncodeProfile = %v; writing must still compile", err)
 	}
 }
+
+// A writer that has compiled a profile's criteria hands the set over, and
+// the store does not compile them again (#120); without one it does, so a
+// stored profile always compiles whoever writes it.
+func TestValidateProfileCompilesOnlyWhatWasNotCompiled(t *testing.T) {
+	uncompilable := func() *store.ServiceProfile {
+		return &store.ServiceProfile{ID: "p", Criteria: []ifc.FilterCriteria{{
+			Priority: 1,
+			TriggerPoint: &ifc.TriggerPoint{SPTs: []ifc.SPT{
+				{Groups: []int{0}, Condition: ifc.RequestURI("(unclosed")},
+			}},
+			ApplicationServer: ifc.ApplicationServer{ServerName: "sip:as.example.net", DefaultHandling: ifc.SessionContinued},
+		}}}
+	}
+	if err := store.ValidateProfile(uncompilable()); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("an uncompiled profile that does not compile: %v, want store.ErrInvalid", err)
+	}
+	// The criteria above would fail to compile, so a nil error shows that
+	// the store used the set it was given rather than compiling.
+	given := uncompilable()
+	given.Compiled = &ifc.Set{}
+	if err := store.ValidateProfile(given); err != nil {
+		t.Fatalf("a profile with its compiled set: %v", err)
+	}
+	// The structural rules still apply.
+	given.ID = ""
+	if err := store.ValidateProfile(given); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("a compiled profile without an ID: %v, want store.ErrInvalid", err)
+	}
+	// The set is not stored: a profile read back has none.
+	ok, err := ifc.Compile(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := store.EncodeProfile(&store.ServiceProfile{ID: "q", Compiled: ok})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back, err := store.DecodeProfile(doc, 1); err != nil || back.Compiled != nil {
+		t.Fatalf("decoded %+v, %v, want no compiled set", back, err)
+	}
+}

@@ -232,10 +232,14 @@ func ValidateSubscription(s *Subscription) error {
 }
 
 // ValidateProfile checks the structural rules every stored profile keeps,
-// and that its criteria compile (ifc.Compile).
+// and that its criteria compile (ifc.Compile), unless p.Compiled shows
+// they already have.
 func ValidateProfile(p *ServiceProfile) error {
 	if err := checkProfile(p); err != nil {
 		return err
+	}
+	if p.Compiled != nil {
+		return nil
 	}
 	if _, err := ifc.Compile(p.Criteria); err != nil {
 		return fmt.Errorf("%w: criteria: %s", ErrInvalid, err)

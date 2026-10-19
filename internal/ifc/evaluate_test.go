@@ -917,3 +917,24 @@ func TestOneSetServesConcurrentRequests(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A set compiled once can be evaluated under another work budget, without
+// compiling it again and without changing the original (#120).
+func TestWithLimitsEvaluatesTheSameSetUnderAnotherBudget(t *testing.T) {
+	s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: "x[ab]{20}y"}}}}))
+	r := req("MESSAGE", impu, HeaderField{"Subject", strings.Repeat("z", 1000)})
+	if _, err := s.Match(r, Context{}); err != nil {
+		t.Fatalf("default budget: %v", err)
+	}
+	var le *LimitError
+	if _, err := s.WithLimits(Limits{MaxWork: 10}).Match(r, Context{}); !errors.As(err, &le) {
+		t.Fatalf("budget of 10: %v, want a LimitError", err)
+	}
+	if _, err := s.Match(r, Context{}); err != nil {
+		t.Fatalf("the original set changed: %v", err)
+	}
+	if s.WithLimits(Limits{}).Len() != s.Len() {
+		t.Fatal("criteria lost")
+	}
+}
