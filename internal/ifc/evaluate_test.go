@@ -2,6 +2,7 @@ package ifc
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"regexp/syntax"
 	"runtime"
@@ -916,4 +917,56 @@ func TestOneSetServesConcurrentRequests(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// negatedClasses is a case-folded Request-URI pattern of 1024 negated
+// classes, the costliest shape per byte found in the review of #104.
+func negatedClasses(priority int) FilterCriteria {
+	return criteria(priority, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: RequestURI(strings.Repeat("[^a]", MaxPatternBytes/4))}}})
+}
+
+// Forty-seven patterns near MaxPatternBytes fit the instruction budget and
+// took about half a second to compile (#111). The cost budget refuses the
+// set at the first pattern that crosses it, so no more than one pattern's
+// work is done past MaxSetCompileCost, on any host.
+func TestASetCostlierThanMaxSetCompileCostIsRefusedAtThePatternThatCrossesIt(t *testing.T) {
+	one := compile(t, negatedClasses(0)).CompileCost()
+	if one <= 0 || one > MaxSetCompileCost/4 {
+		t.Fatalf("one pattern costs %d units", one)
+	}
+	var cs []FilterCriteria
+	for i := range 47 {
+		cs = append(cs, negatedClasses(i))
+	}
+	_, err := Compile(cs)
+	// Every pattern costs the same, so the one at index MaxSetCompileCost/one
+	// is the first that does not fit.
+	crossing := MaxSetCompileCost / one
+	want := fmt.Sprintf("filter criteria with priority %d: SPT 1: the criteria cost more than MaxSetCompileCost (%d units)", crossing, MaxSetCompileCost)
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Compile = %v, want %q", err, want)
+	}
+	// As many as fit are accepted, and their cost is the sum of theirs.
+	s, err := Compile(cs[:crossing])
+	if err != nil || s.CompileCost() != crossing*one {
+		t.Fatalf("%d patterns: cost %d, %v, want %d", crossing, s.CompileCost(), err, crossing*one)
+	}
+}
+
+// A pattern whose source alone exceeds what is left of the budget is not
+// parsed: an invalid one gets the cost error, not a syntax error.
+func TestAPatternTheCostBudgetCannotPayForIsRefusedBeforeItIsParsed(t *testing.T) {
+	b := setBudget{insts: MaxSetInstructions, cost: 100}
+	_, err := b.compile("Content", "("+strings.Repeat("a", 100), 0)
+	if err == nil || !strings.Contains(err.Error(), "MaxSetCompileCost") || b.cost != 100 {
+		t.Fatalf("err %v, %d units left, want the cost error and nothing charged", err, b.cost)
+	}
+	if _, err := b.compile("Content", "(a", 0); err == nil || !strings.Contains(err.Error(), "not a POSIX") {
+		t.Fatalf("a short invalid pattern: %v, want the syntax error", err)
+	}
+	p, err := b.compile("Content", "abc", 0)
+	if err != nil || p.cost < patternCost("abc", "abc", p.insts) || b.cost != 100-p.cost {
+		t.Fatalf("abc: %v, cost %d, %d left", err, p.cost, b.cost)
+	}
 }

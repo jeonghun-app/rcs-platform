@@ -59,11 +59,23 @@ const (
 	// as a bracket expression full of "[:" that no ":]" closes, which is a
 	// single character class the instruction limits do not catch (#96).
 	// Within the limit the costliest patterns known take a few milliseconds
-	// to compile (about 10 ms for 1024 negated classes, case-folded); a
-	// profile's total is bounded only by MaxSetInstructions and the size of
-	// the request that carries it. A pattern a person writes is tens of
-	// bytes.
+	// to compile (about 10 ms for 1024 negated classes, case-folded), and
+	// [MaxSetCompileCost] bounds a set's total. A pattern a person writes
+	// is tens of bytes.
 	MaxPatternBytes = 4 << 10
+	// MaxSetCompileCost bounds the work of compiling one [Set], in cost
+	// units: one per byte of a pattern's source and of the text it is
+	// written out as, which the proof and the compiler parse again, and
+	// compileCostPerInstruction per instruction of its program (see
+	// patternCost). Patterns near MaxPatternBytes fit the instruction
+	// budget in dozens, and 47 of them took about half a second (#111);
+	// a unit is about a tenth of a microsecond, so the bound is tens of
+	// milliseconds whatever the profile. The default RCS profile costs
+	// about 6 500 units. Compile refuses a set that costs more, before
+	// parsing the pattern that would cross the bound when its source
+	// alone does; at most one pattern's cost, which MaxPatternBytes
+	// bounds, is spent past it.
+	MaxSetCompileCost = 500_000
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
 	// repetition ("{n}") is what multiplies the size.
@@ -147,10 +159,13 @@ func (c Context) registered() bool {
 // criteria that Match and Next return share their trigger points with the
 // ones passed to Compile; treat them as read-only.
 type Set struct {
-	criteria  []compiledCriteria
-	maxWork   int
-	oversized atomic.Uint64
-	exhausted atomic.Uint64
+	criteria []compiledCriteria
+	maxWork  int
+	// compileCost is what compiling the set took, in MaxSetCompileCost's
+	// units.
+	compileCost int
+	oversized   atomic.Uint64
+	exhausted   atomic.Uint64
 }
 
 type compiledCriteria struct {
@@ -213,11 +228,11 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	if s.maxWork <= 0 {
 		s.maxWork = DefaultMaxWork
 	}
-	budget := MaxSetInstructions
+	b := setBudget{insts: MaxSetInstructions, cost: MaxSetCompileCost}
 	for _, fc := range criteria {
 		c := compiledCriteria{fc: fc}
 		if fc.TriggerPoint != nil {
-			t, err := compileTrigger(fc.TriggerPoint, &budget)
+			t, err := compileTrigger(fc.TriggerPoint, &b)
 			if err != nil {
 				return nil, fmt.Errorf("ifc: filter criteria with priority %d: %w", fc.Priority, err)
 			}
@@ -225,6 +240,7 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 		}
 		s.criteria = append(s.criteria, c)
 	}
+	s.compileCost = MaxSetCompileCost - b.cost
 	slices.SortFunc(s.criteria, func(a, b compiledCriteria) int { return cmp.Compare(a.fc.Priority, b.fc.Priority) })
 	for i := 1; i < len(s.criteria); i++ {
 		if s.criteria[i].fc.Priority == s.criteria[i-1].fc.Priority {
@@ -234,11 +250,33 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	return s, nil
 }
 
-func compileTrigger(tp *TriggerPoint, budget *int) (*compiledTrigger, error) {
+// setBudget is what is left of a set's instruction and compile cost budgets.
+type setBudget struct{ insts, cost int }
+
+// compile compiles one pattern of the set, charging both budgets. A pattern
+// whose source alone exceeds what is left of the cost budget is refused
+// before it is parsed.
+func (b *setBudget) compile(name, source string, mode patternMode) (pattern, error) {
+	errCost := fmt.Errorf("the criteria cost more than MaxSetCompileCost (%d units) to compile", MaxSetCompileCost)
+	if len(source) > b.cost {
+		return pattern{}, errCost
+	}
+	p, err := compilePattern(name, source, mode, &b.insts)
+	if err != nil {
+		return p, err
+	}
+	if p.cost > b.cost {
+		return pattern{}, errCost
+	}
+	b.cost -= p.cost
+	return p, nil
+}
+
+func compileTrigger(tp *TriggerPoint, b *setBudget) (*compiledTrigger, error) {
 	t := &compiledTrigger{cnf: tp.ConditionTypeCNF}
 	byGroup := map[int][]int{}
 	for i := range tp.SPTs {
-		spt, err := compileSPT(&tp.SPTs[i], budget)
+		spt, err := compileSPT(&tp.SPTs[i], b)
 		if err != nil {
 			return nil, fmt.Errorf("SPT %d: %w", i+1, err)
 		}
@@ -255,14 +293,14 @@ func compileTrigger(tp *TriggerPoint, budget *int) (*compiledTrigger, error) {
 	return t, nil
 }
 
-func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
+func compileSPT(spt *SPT, b *setBudget) (compiledSPT, error) {
 	c := compiledSPT{negated: spt.ConditionNegated}
 	var err error
 	switch v := spt.Condition.(type) {
 	case RequestURI:
 		c.kind = kindRequestURI
 		// Host names are case-insensitive (RFC 3261 §19.1.4).
-		c.name, err = compilePattern("RequestURI", string(v), patternFoldCase, budget)
+		c.name, err = b.compile("RequestURI", string(v), patternFoldCase)
 	case Method:
 		c.kind, c.method, c.regs = kindMethod, string(v), slices.Clone(spt.RegistrationTypes)
 	case SIPHeader:
@@ -271,15 +309,15 @@ func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
 		// pattern must match the whole name: "Contact" must not select
 		// Accept-Contact or Reject-Contact. Values are matched as written,
 		// anywhere in the value, as Annex F's regexec semantics give.
-		if c.name, err = compilePattern("Header", v.Header, patternFoldCase|patternWhole, budget); err == nil && matchesSomething(v.Content) {
-			c.value, err = compilePattern("Content", v.Content, 0, budget)
+		if c.name, err = b.compile("Header", v.Header, patternFoldCase|patternWhole); err == nil && matchesSomething(v.Content) {
+			c.value, err = b.compile("Content", v.Content, 0)
 		}
 	case SessionCase:
 		c.kind, c.session = kindSessionCase, v
 	case SessionDescription:
 		c.kind = kindSessionDescription
-		if c.name, err = compilePattern("Line", v.Line, 0, budget); err == nil && matchesSomething(v.Content) {
-			c.value, err = compilePattern("Content", v.Content, 0, budget)
+		if c.name, err = b.compile("Line", v.Line, 0); err == nil && matchesSomething(v.Content) {
+			c.value, err = b.compile("Content", v.Content, 0)
 		}
 	}
 	return c, err
@@ -297,9 +335,27 @@ type pattern struct {
 	// a search costs against one instruction over one byte.
 	token  string
 	linear bool
+	// cost is the work compiling the pattern took, in the units of
+	// MaxSetCompileCost.
+	cost int
 }
 
 const literalCost = 4
+
+// compileCostPerInstruction weighs one program instruction against one
+// byte of text in a pattern's compile cost: building a program, which
+// happens four times per pattern (the proof compiles the parsed and the
+// written-out trees, then syntax and regexp each compile the text), costs
+// several times as much per instruction as parsing costs per byte. It was
+// set so that the shapes measured for #111 (long literals, ".", negated and
+// folded classes) cost within a factor of three of each other per second.
+const compileCostPerInstruction = 8
+
+// patternCost is the compile cost of a pattern with the given source,
+// written-out text and number of instructions.
+func patternCost(source, expr string, insts int) int {
+	return len(source) + len(expr) + compileCostPerInstruction*insts
+}
 
 type patternMode uint8
 
@@ -388,7 +444,7 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if err != nil {
 		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
-	p := pattern{re: re, insts: n}
+	p := pattern{re: re, insts: n, cost: patternCost(source, expr, n)}
 	if mode&patternWhole != 0 && mode&patternFoldCase != 0 && isPlainToken(source) {
 		p.token = source
 	}
@@ -725,6 +781,10 @@ func estimateSize(re *syntax.Regexp) int {
 	}
 	return 2
 }
+
+// CompileCost returns what compiling the set took, in the units of
+// MaxSetCompileCost: the same for the same criteria on every host.
+func (s *Set) CompileCost() int { return s.compileCost }
 
 // Len returns the number of criteria in the set.
 func (s *Set) Len() int { return len(s.criteria) }
