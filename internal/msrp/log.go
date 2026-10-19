@@ -20,15 +20,18 @@ import (
 const redacted = "[redacted]"
 
 // Redacted returns u as String does, but with the session-id and any
-// userinfo replaced by a placeholder, and an IP address host logged as its
-// network only.
+// userinfo replaced by a placeholder, an IP address host logged as its
+// network only, and no parameters after the transport.
 //
 // A client's a=path names the UE's own address, which is personal data
 // whatever its range (#36, #80): only its /24 or /48 is logged, without the
 // port, by the rule sip's hosts follow (pii.TruncateIP). A host name is
 // kept, with its port, and any long digit run in it masked like other text.
+// The parameters are the client's own text, which could name the address
+// again, and sip's log values leave theirs out too.
 func (u URI) Redacted() string {
 	v := u
+	v.Params = nil
 	if v.SessionID != "" {
 		v.SessionID = redacted
 	}

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/netip"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -95,6 +94,8 @@ func FuzzParseURI(f *testing.F) {
 	for _, s := range []string{
 		aliceURI, "msrps://u@[2001:db8::1]:2856/a+b=c/d;tcp;x=y;z", "msrp://192.0.2.1:1;TCP",
 		"MSRP://R%65lay.example.net:2855/s;tcp", "msrp://relay.example.net;tcp", "msrp://[::ffff:192.0.2.1]:9/s;tcp",
+		// From the security review of #98: an address in a parameter.
+		"msrp://198.51.100.23:1/s;tcp;x=198.51.100.23", "msrp://192.000.002.001:2855/s;tcp",
 	} {
 		f.Add(s)
 	}
@@ -111,11 +112,31 @@ func FuzzParseURI(f *testing.F) {
 		if !u.Equal(v) || !v.Equal(u) || v.String() != formatted || !u.valid() {
 			t.Fatalf("%q and %q differ", s, formatted)
 		}
-		if ip, err := netip.ParseAddr(u.Host); err == nil {
-			// The network is shown, and the address nowhere else.
-			r, network := u.Redacted(), pii.TruncateIP(u.Host)
-			if !strings.Contains(r, network) || strings.Contains(strings.Replace(r, network, "", 1), ip.Unmap().String()) {
-				t.Fatalf("%q redacts to %q, want only its network %s", s, r, network)
+		r := u.Redacted()
+		// Only the transport follows the session: no parameter, which is
+		// the client's text, reaches a log.
+		if !strings.HasSuffix(r, ";"+u.Transport) || strings.Count(r, ";") != 1 {
+			t.Fatalf("%q redacts to %q, which keeps parameters", s, r)
+		}
+		if ipHost(u.Host) {
+			// What the package takes for an IP address, leading zeros
+			// included, shows as its network and nothing else: not the
+			// address in any spelling, and not the port.
+			prefix := "msrp://"
+			if u.Secure {
+				prefix = "msrps://"
+			}
+			if u.User != "" {
+				prefix += redacted + "@"
+			}
+			suffix := ";" + u.Transport
+			if u.SessionID != "" {
+				suffix = "/" + redacted + suffix
+			}
+			network := pii.TruncateIP(u.Host)
+			host := strings.TrimSuffix(strings.TrimPrefix(r, prefix), suffix)
+			if host != network && host != "["+network+"]" {
+				t.Fatalf("%q redacts to %q, whose host is %q, want only the network %s", s, r, host, network)
 			}
 		}
 	})

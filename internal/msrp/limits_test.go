@@ -696,7 +696,11 @@ func TestClientAddressesInURIsAreLoggedAsTheirNetwork(t *testing.T) {
 		{"msrps://10.20.30.40:2856/s3cr3tsess10n;tcp", "msrps://10.20.30.0/24/[redacted];tcp"},
 		{"msrp://[2001:db8:5:6::17]:2855/s3cr3tsess10n;tcp", "msrp://[2001:db8:5::/48]/[redacted];tcp"},
 		{"msrp://[::ffff:198.51.100.23]:2855/s3cr3tsess10n;tcp", "msrp://198.51.100.0/24/[redacted];tcp"},
+		{"msrp://192.000.002.001:2855/s3cr3tsess10n;tcp", "msrp://192.0.2.0/24/[redacted];tcp"},
 		{"msrp://relay.example.com:2855/s3cr3tsess10n;tcp", "msrp://relay.example.com:2855/[redacted];tcp"},
+		// Parameters are the client's text and could name the address
+		// again (security review of #98): only the transport is kept.
+		{"msrp://198.51.100.23:1/s;tcp;x=198.51.100.23;y", "msrp://198.51.100.0/24/[redacted];tcp"},
 	} {
 		u := mustURI(t, tt.uri)
 		if got := u.Redacted(); got != tt.want {
