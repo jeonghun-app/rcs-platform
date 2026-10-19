@@ -9,6 +9,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -167,6 +168,13 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 			return reject(ReasonMalformed, errors.New("identity empty or too long"))
 		}
 	}
+	// The author is named as the group names it, so that its share, its
+	// sent records and the notifications for it meet its own legs.
+	sender, ok := identity.CanonicalIMPU(o.Sender)
+	if !ok {
+		return reject(ReasonNotParticipant, nil)
+	}
+	o.Sender = sender
 	m, err := ParseMessage(o.CPIM, e.cfg.MaxMessageSize)
 	if err != nil {
 		return err

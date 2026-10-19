@@ -324,7 +324,9 @@ cannot be written (`invalid`):
   parameters and has its host in lower case; a tel URI is a global number
   without visual separators. One person added as `tel:+1-555-…` and joining
   as `tel:+1555…` is one participant. The SIP layer passes asserted
-  identities in the same form, as the CSCFs assert them, and names legs so.
+  identities in the same form, as the CSCFs assert them. The engine puts a
+  group leg's `User`, and a group message's sender, in that form too, so a
+  leg opened under another spelling still gets its participant's copies.
 - **Names** are at most 100 bytes and **the subject** at most 256 bytes of
   UTF-8 that XML can carry, without control characters.
 - **The Conversation-ID** is at most 256 bytes.

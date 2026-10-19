@@ -178,3 +178,41 @@ var errGroups = errors.New("groups store unavailable")
 func (failingGroups) Get(context.Context, string, time.Time) (groupstore.Group, error) {
 	return groupstore.Group{}, errGroups
 }
+
+// QA's reproduction (PR #118, round 2): bob joins, and opens his session,
+// under a spelling of his number with separators. The group names him in
+// canonical form, and so does his leg, so his copy goes on his session
+// rather than to an invitation.
+func TestALegInAnotherSpellingGetsItsParticipantsMessages(t *testing.T) {
+	r := newRig(t, Config{})
+	g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const spelled = "tel:+1-555-010-0002"
+	if _, err := r.s.Join(t.Context(), g.URI, spelled, ""); err != nil {
+		t.Fatal(err)
+	}
+	b := r.connect(g, spelled, nil)
+	if err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: message(t, alice, "m1", "hi", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := asSeen(t, b.next(t)); string(got.Body) != "hi" {
+		t.Fatalf("bob got %q", got.Body)
+	}
+	if n := r.invitesOf(g, bob); n != 0 {
+		t.Fatalf("bob was invited %d times with his session open", n)
+	}
+	// What he writes there is his, in canonical form.
+	a := r.connect(g, alice, nil)
+	if code := b.send(t, message(t, messaging.AnonymousURI, "m2", "hello", 0)); code != msrp.StatusOK {
+		t.Fatalf("answered %d", code)
+	}
+	if from, _ := fromTo(t, asSeen(t, a.next(t))); from.URI != bob {
+		t.Fatalf("alice got it from %v", from)
+	}
+	if _, err := r.e.OpenLeg(messaging.LegParams{Remote: []msrp.URI{{Host: "127.0.0.1", Port: 1, SessionID: "x", Transport: "tcp"}},
+		User: "not a URI", Peer: g.URI, Mode: store.Group, Direction: messaging.Originating}); err == nil {
+		t.Fatal("a group leg for no URI opened")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -58,7 +59,8 @@ type LegParams struct {
 	// for Offer, which learns it in Leg.Answer.
 	Remote []msrp.URI
 	// User is the asserted identity of the client on this leg, and
-	// Identities the others it may name in the CPIM From.
+	// Identities the others it may name in the CPIM From. A group leg puts
+	// User in canonical form (identity.CanonicalIMPU), as the group does.
 	User       string
 	Identities []string
 	// Peer is the other party of the conversation.
@@ -169,6 +171,16 @@ func (e *Engine) Offer(p LegParams) (*Leg, error) {
 func (e *Engine) newLeg(p LegParams) (*Leg, error) {
 	if err := p.check(); err != nil {
 		return nil, err
+	}
+	if p.Mode == store.Group {
+		// The group stores and names its participants in canonical form
+		// (the group package), and their copies are queued under it; a
+		// leg keyed otherwise would never be found for them.
+		user, ok := identity.CanonicalIMPU(p.User)
+		if !ok {
+			return nil, errors.New("messaging: a group leg's user must be a SIP or tel URI")
+		}
+		p.User = user
 	}
 	id, err := msrp.NewSessionID(e.rand)
 	if err != nil {
