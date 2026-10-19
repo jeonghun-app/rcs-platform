@@ -527,22 +527,26 @@ func TestCompileRefusesAPatternLongerThanMaxPatternBytes(t *testing.T) {
 	}
 }
 
-// The parse of the costliest pattern the limit lets through is quick: about
-// a millisecond, against seconds for the 240 KiB the API body would allow
-// without it. The bound below leaves a factor of hundreds for a loaded host.
-func TestTheCostliestPatternWithinTheLimitCompilesQuickly(t *testing.T) {
-	at := unclosedClasses(MaxPatternBytes)
-	if len(at) != MaxPatternBytes {
-		t.Fatalf("pattern of %d bytes", len(at))
-	}
-	start := time.Now()
-	_, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
-		Condition: SIPHeader{Header: "Subject", Content: at}}}})})
-	if err != nil {
-		t.Fatalf("a pattern at the limit refused: %v", err)
-	}
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Fatalf("compiling %d bytes took %v", len(at), d)
+// Patterns at the limit that are costly to compile still take milliseconds:
+// about 1 ms for unclosed classes, whose parse is quadratic, and 3.5-10 ms
+// for 1024 negated classes in a case-folded Request-URI, the slowest found
+// in review, against seconds for the 240 KiB the API body would allow
+// without the limit. Only the quadratic case is timed, against a bound
+// hundreds of times its cost, so that a loaded host cannot fail the test;
+// the negated classes are only shown to be accepted.
+func TestCostlyPatternsWithinTheLimitCompile(t *testing.T) {
+	for name, c := range map[string]Condition{
+		"unclosed classes":        SIPHeader{Header: "Subject", Content: unclosedClasses(MaxPatternBytes)},
+		"negated classes, folded": RequestURI(strings.Repeat("[^a]", MaxPatternBytes/4)),
+	} {
+		start := time.Now()
+		_, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: c}}})})
+		if err != nil {
+			t.Fatalf("%s: a pattern at the limit refused: %v", name, err)
+		}
+		if d := time.Since(start); name == "unclosed classes" && d > 500*time.Millisecond {
+			t.Fatalf("%s: compiling took %v", name, d)
+		}
 	}
 }
 

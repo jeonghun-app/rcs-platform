@@ -57,8 +57,12 @@ const (
 	// MaxPatternBytes bounds the text of one pattern, so that the cost of
 	// parsing it is bounded: Go's parser is quadratic on some inputs, such
 	// as a bracket expression full of "[:" that no ":]" closes, which is a
-	// single character class the instruction limits do not catch (#96). A
-	// pattern a person writes is tens of bytes.
+	// single character class the instruction limits do not catch (#96).
+	// Within the limit the costliest patterns known take a few milliseconds
+	// to compile (about 10 ms for 1024 negated classes, case-folded); a
+	// profile's total is bounded only by MaxSetInstructions and the size of
+	// the request that carries it. A pattern a person writes is tens of
+	// bytes.
 	MaxPatternBytes = 4 << 10
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
