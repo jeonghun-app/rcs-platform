@@ -148,7 +148,7 @@ func (c Credentials) MarshalJSON() ([]byte, error) { return json.Marshal(redacte
 // which the S-CSCF learns which private identity registers (TS 24.229
 // §5.1.1.2.2 for IMS AKA, §5.1.1.2.3 for SIP digest).
 func (ua *UA) initialAuthorization(uri string) string {
-	return digest.Credentials{Username: ua.cfg.Credentials.p.impi, Realm: ua.cfg.Domain, URI: uri}.Header()
+	return digest.Credentials{Username: ua.cfg.Credentials.p.impi, Realm: ua.cfg.Realm, URI: uri}.Header()
 }
 
 // authAnswer is the answer to one challenge: the header field, and next,
@@ -180,7 +180,7 @@ func (ua *UA) authorize(res *sip.Response, uri string) (authAnswer, error) {
 		// No challenge at all: the status is the whole answer.
 		return a, &StatusError{Method: "REGISTER", Code: res.StatusCode}
 	}
-	ch, ok := firstUsable(values, c.card != nil, ua.cfg.Domain)
+	ch, ok := firstUsable(values, c.card != nil, ua.cfg.Realm)
 	if !ok {
 		return a, &StatusError{Method: "REGISTER", Code: res.StatusCode, Err: ErrNoUsableChallenge}
 	}
@@ -217,8 +217,8 @@ func (ua *UA) authorize(res *sip.Response, uri string) (authAnswer, error) {
 }
 
 // firstUsable returns the topmost challenge the credentials can answer
-// (TS 24.229 §5.1.1.5.4, RFC 8760 §2.4). Only a challenge for realm, the
-// home domain, is: an answer for another realm would hand whoever sent it
+// (TS 24.229 §5.1.1.5.4, RFC 8760 §2.4). Only a challenge for realm,
+// Config.Realm, is: an answer for another realm would hand whoever sent it
 // a response computed from the home password, to guess it from offline.
 // Digest needs qop=auth; AKA may offer no qop (§5.4.1.2.1A).
 func firstUsable(values []string, aka bool, realm string) (digest.Challenge, bool) {
