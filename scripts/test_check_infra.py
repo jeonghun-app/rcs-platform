@@ -42,13 +42,16 @@ def role(*actions: str) -> dict:
         "Type": "AWS::IAM::Role",
         "Properties": {
             "Policies": [
-                {"PolicyName": "p", "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": list(actions), "Resource": "*"}]}}
+                {"PolicyName": "p", "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": list(actions),
+                                                                      "Resource": "arn:aws:dynamodb:ap-northeast-2:123456789012:table/other"}]}}
             ]
         },
     }
 
 
-class PlatformTemplate(unittest.TestCase):
+class TemplateCase(unittest.TestCase):
+    """Loads infra/platform.yaml once and changes copies of it."""
+
     @classmethod
     def setUpClass(cls):
         cls.template = check_infra.load(str(TEMPLATE))
@@ -65,6 +68,10 @@ class PlatformTemplate(unittest.TestCase):
     def assertProblem(self, template: dict, fragment: str):
         found = check_infra.problems(template)
         self.assertTrue(any(fragment in p for p in found), f"no problem with {fragment!r} in {found}")
+
+
+class PlatformTemplate(TemplateCase):
+    """Policies on the network, security groups and load balancers."""
 
     def test_the_platform_template_meets_every_policy(self):
         self.assertEqual(check_infra.problems(self.template), [])
@@ -169,6 +176,45 @@ class PlatformTemplate(unittest.TestCase):
         td["Properties"]["ExecutionRoleArn"] = {"Fn::GetAtt": ["SvcTaskRole", "Arn"]}
         t = self.changed(SvcTask=td, SvcTaskRole=role("dynamodb:GetItem"))
         self.assertProblem(t, "the task role is also the execution role")
+
+
+class PlatformServices(TemplateCase):
+    """Policies on the service blocks: task definitions, roles, tables."""
+
+    def test_every_service_task_definition_is_present_and_locked_down(self):
+        tds = check_infra.resources(self.template, "AWS::ECS::TaskDefinition")
+        self.assertEqual(set(tds), {"HssTaskDefinition", "FtServerTaskDefinition", "RelayTaskDefinition", "AcsTaskDefinition"})
+        self.assertEqual(check_infra.check_tasks(self.template), [])
+
+    def test_only_the_relay_reads_the_bindings(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {"Fn::GetAtt": ["MsrpBindingsTable", "Arn"]}})
+        self.assertProblem(t, "HssTaskRole: may read MsrpBindingsTable; only MsrpRelayTaskRole may")
+
+    def test_a_wildcard_read_reaches_the_bindings_too(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AcsTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": ["dynamodb:Scan"], "Resource": "*"})
+        self.assertProblem(t, "AcsTaskRole: may read MsrpBindingsTable")
+
+    def test_nobody_exports_the_bindings(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["MsrpRelayTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:ExportTableToPointInTime",
+             "Resource": {"Fn::Sub": "${MsrpBindingsTable.Arn}"}})
+        self.assertProblem(t, "MsrpRelayTaskRole: may export MsrpBindingsTable")
+
+    def test_every_table_keeps_pitr(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["SubscribersTable"]["Properties"]["PointInTimeRecoverySpecification"]
+        self.assertProblem(t, "SubscribersTable: point-in-time recovery is off")
+
+    def test_a_service_task_role_reading_its_secrets_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "FtNonceKey"}})
+        self.assertProblem(t, "FtServerTaskRole: a task role may read secrets")
 
 
 if __name__ == "__main__":

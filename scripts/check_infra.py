@@ -15,7 +15,10 @@ platform the ADRs describe:
   (ADR 0007 §9);
 * every DynamoDB table has point-in-time recovery (ADR 0003);
 * no task role can read a secret: secrets reach tasks through the execution
-  role only (ADR 0007 §4).
+  role only (ADR 0007 §4);
+* tables holding capabilities are read only by their own service's task
+  role, and nothing may export them: msrp-bindings holds rcs-as session ids
+  (threat model T3, #54).
 
 Runs in the infra tools image (deploy/infra-tools.Dockerfile), which provides
 cfn-lint's CloudFormation YAML decoder. Usage: check_infra.py TEMPLATE...
@@ -286,7 +289,88 @@ def check_secret_access(template: dict) -> list[str]:
     return problems
 
 
-CHECKS = (check_security_groups, check_target_groups, check_waf, check_tasks, check_tables, check_secret_access)
+# Tables whose items are capabilities, and the only roles that may read them.
+TABLE_READERS: dict[str, set[str]] = {"MsrpBindingsTable": {"MsrpRelayTaskRole"}}
+
+READ_ACTIONS = {
+    "dynamodb:getitem",
+    "dynamodb:batchgetitem",
+    "dynamodb:query",
+    "dynamodb:scan",
+    "dynamodb:partiqlselect",
+    "dynamodb:exporttabletopointintime",
+    "dynamodb:getrecords",
+}
+
+
+def _names(value) -> set[str]:
+    """Logical ids a Resource value refers to, and "*" for a wildcard."""
+    found: set[str] = set()
+    if isinstance(value, str):
+        if value == "*":
+            found.add("*")
+    elif isinstance(value, list):
+        for item in value:
+            found |= _names(item)
+    elif isinstance(value, dict):
+        name = logical_id(value)
+        if name:
+            found.add(name)
+        if "Fn::Sub" in value:
+            text = value["Fn::Sub"][0] if isinstance(value["Fn::Sub"], list) else value["Fn::Sub"]
+            for table in TABLE_READERS:
+                if "${" + table in str(text):
+                    found.add(table)
+        for key, item in value.items():
+            if key not in ("Ref", "Fn::GetAtt", "Fn::Sub"):
+                found |= _names(item)
+    return found
+
+
+def _statements(template: dict):
+    """(role or policy name, attached roles, statement) for every IAM statement."""
+    for name, role in resources(template, "AWS::IAM::Role").items():
+        for policy in role.get("Properties", {}).get("Policies", []):
+            if isinstance(policy, dict):
+                for st in policy.get("PolicyDocument", {}).get("Statement", []):
+                    yield name, {name}, st
+    for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
+        for name, policy in resources(template, kind).items():
+            props = policy.get("Properties", {})
+            attached = {logical_id(r) for r in props.get("Roles", [])} - {None}
+            for st in props.get("PolicyDocument", {}).get("Statement", []):
+                yield name, attached, st
+
+
+def check_table_readers(template: dict) -> list[str]:
+    problems = []
+    for name, attached, st in _statements(template):
+        if st.get("Effect") != "Allow":
+            continue
+        actions = {a.lower() for a in _actions(st) if isinstance(a, str)}
+        reads = {a for a in actions if a in READ_ACTIONS or a in ("*", "dynamodb:*")}
+        if not reads:
+            continue
+        targets = _names(st.get("Resource"))
+        for table, readers in TABLE_READERS.items():
+            if table not in targets and "*" not in targets:
+                continue
+            if "dynamodb:exporttabletopointintime" in reads or "*" in reads or "dynamodb:*" in reads:
+                problems.append(f"{name}: may export {table}, whose items are capabilities")
+            if not attached <= readers:
+                problems.append(f"{name}: may read {table}; only {', '.join(sorted(readers))} may")
+    return problems
+
+
+CHECKS = (
+    check_security_groups,
+    check_target_groups,
+    check_waf,
+    check_tasks,
+    check_tables,
+    check_secret_access,
+    check_table_readers,
+)
 
 
 def problems(template: dict) -> list[str]:
