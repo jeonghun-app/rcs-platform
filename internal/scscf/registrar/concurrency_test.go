@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -263,5 +265,63 @@ func TestASaveAppliedButReportedAsAConflictIsASuccess(t *testing.T) {
 			wantStatus(t, res, 200)
 			wantSameBindings(t, e, 1, impu1, tel1)
 		})
+	}
+}
+
+func TestAREGISTERWhoseSetWasDeregisteredMeanwhileRegistersAfresh(t *testing.T) {
+	for _, set := range [][]string{{impu1}, {impu1, tel1}} {
+		t.Run(fmt.Sprint(len(set), " identities"), func(t *testing.T) {
+			e := newEnv(t)
+			a := e.akaUser(impi1, set...)
+			a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+			wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+			b := device(a, 2)
+			wantStatus(t, b.registerWith(e.instance(1), 600), 200)
+			hs := newHookStore(e.store)
+			// B re-registers; just before its save, A deregisters the whole
+			// set with Contact * on another instance.
+			hs.onSave[impu1] = func() {
+				saved := a.contact
+				a.contact = ""
+				auth := a.answer(e.instance(3).Register(bg, a.request(-1, "", "Contact: *", "Expires: 0"), upstream), 0)
+				wantStatus(t, e.instance(3).Register(bg, a.request(-1, auth, "Contact: *", "Expires: 0"), upstream), 200)
+				a.contact = saved
+			}
+			g := e.instance(2, func(c *Config) { c.Store = hs })
+			auth := b.answer(g.Register(bg, b.request(600, ""), upstream), 0)
+			wantStatus(t, g.Register(bg, b.request(600, auth), upstream), 200)
+			wantSameBindings(t, e, 1, set...)
+			if s := e.hss.lastSAR(t); s.AssignmentType != cx.Registration {
+				t.Errorf("last SAR %v, want B's REGISTRATION after A's deregistration", s.AssignmentType)
+			}
+		})
+	}
+}
+
+func TestARemovalAppliedButReportedAsAConflictIsA200(t *testing.T) {
+	e := newEnv(t)
+	a := e.akaUser(impi1, impu1)
+	a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+	b := device(a, 2)
+	wantStatus(t, b.registerWith(e.instance(1), 600), 200)
+	hs := newHookStore(e.store)
+	once := false
+	hs.saveErr = func(r *state.Registration) error {
+		if once {
+			return nil
+		}
+		once = true
+		if _, err := e.store.SaveRegistration(bg, r); err != nil {
+			t.Fatal(err)
+		}
+		return state.ErrConflict
+	}
+	g := e.instance(2, func(c *Config) { c.Store = hs })
+	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
+	res := g.Register(bg, a.request(0, auth), upstream)
+	wantStatus(t, res, 200)
+	if got := bindingsOf(t, e, impu1)[impu1]; len(got) != 1 || !strings.Contains(got[0], "ue2@") {
+		t.Errorf("stored %v, want only B", got)
 	}
 }

@@ -64,6 +64,10 @@ func prepare(r *register, lim expiryLimits) ([]contactOp, *failure) {
 		if f != nil {
 			return nil, f
 		}
+		if !roundTrips(b, r) {
+			// Stored, it would break every 200 of the set until it expired.
+			return nil, refuse(400, "Contact cannot be written back")
+		}
 		op := contactOp{b: b, uri: c.URI, seconds: min(exp, lim.max)}
 		for _, o := range ops {
 			if o.uri.Equal(op.uri) || op.b.InstanceID != "" && sameInstance(o.b, op.b) {
@@ -188,6 +192,11 @@ func binding(c sip.Contact, r *register, outbound bool, flow string) (state.Cont
 		}
 	}
 	for _, p := range c.Params {
+		if hasControl(p.Value) {
+			// A quoted-pair lets one in (RFC 3261 §25.1), but no header
+			// field may carry it written back.
+			return b, refuse(400, "Control character in a Contact parameter")
+		}
 		name := strings.ToLower(p.Name)
 		if name == "+sip.instance" || !strings.HasPrefix(name, "+") && !slices.Contains(featureTags, name) {
 			continue
@@ -257,4 +266,29 @@ func quoted(v string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// hasControl reports whether v has a control character, which no quoted
+// string written back can carry.
+func hasControl(v string) bool {
+	return strings.ContainsFunc(v, func(c rune) bool { return c < 0x20 || c == 0x7f })
+}
+
+// roundTrips reports whether b, written as the 200 lists it, can be added to
+// a header and parses back to the same binding.
+func roundTrips(b state.Contact, r *register) bool {
+	v := contactField(b, time.Time{})
+	var h sip.Header
+	if h.Add("Contact", v) != nil {
+		return false
+	}
+	back, err := sip.ParseContacts(v)
+	if err != nil || len(back) != 1 || back[0].URI.String() != b.URI {
+		return false
+	}
+	if inst, _ := back[0].Instance(); inst != b.InstanceID {
+		return false
+	}
+	again, f := binding(back[0], r, b.RegID != 0, b.FlowToken)
+	return f == nil && slices.Equal(again.FeatureTags, b.FeatureTags)
 }

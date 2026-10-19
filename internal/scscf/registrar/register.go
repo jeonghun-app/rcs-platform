@@ -55,6 +55,7 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 	if f != nil {
 		return nil, f
 	}
+	conflicted := false
 	for range saveAttempts {
 		now := g.cfg.Now()
 		var old []state.Contact
@@ -62,6 +63,12 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 			old = cur.Contacts
 		}
 		next, f := applyDelta(old, r, ops, now)
+		if f != nil && f.code == 481 && conflicted {
+			// What this request removes is gone: its own save was applied
+			// but reported lost, or another removed it first. Either way
+			// the bindings are as the client asked.
+			return g.ok(req, r, old, nil), nil
+		}
 		if f != nil {
 			return nil, f
 		}
@@ -85,12 +92,15 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 		switch {
 		case errors.As(err, &fl):
 			return nil, fl
-		case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrExists):
-			// Another instance changed the registration since it was read.
+		case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrExists), errors.Is(err, state.ErrNotFound):
+			// Another instance changed the registration since it was read,
+			// or deregistered the whole set: read it again, which may make
+			// this an initial registration.
 			if cur, f = g.read(ctx, r.impu); f != nil {
 				return nil, f
 			}
 			registered = isRegistered(cur)
+			conflicted = true
 			continue
 		case err != nil:
 			return nil, g.internal("saving the registration", err)
