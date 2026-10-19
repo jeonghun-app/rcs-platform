@@ -386,15 +386,26 @@ func (c *countingConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// sendStartLines counts the lines of p that are a SEND's start line,
-// "MSRP <transaction-id> SEND". A write holds whole messages; quiet, the
-// client writes no message bodies that could hold such a line.
+// sendStartLines counts the SEND requests in p: lines that are exactly
+// "MSRP <transaction-id> SEND" (RFC 4975 §7.1, single spaces, CRLF) and
+// whose end-line, "-------<transaction-id>" and a flag, follows in p. A line
+// that only looks like a start line, in a body say, has no such end-line. A
+// start line split across two writes is missed, which only makes the step
+// wait for the next keep-alive.
 func sendStartLines(p []byte) int {
 	n := 0
-	for _, line := range bytes.Split(p, []byte("\r\n")) {
-		f := bytes.Fields(line)
-		if len(f) == 3 && string(f[0]) == "MSRP" && string(f[2]) == "SEND" {
-			n++
+	lines := bytes.Split(p, []byte("\r\n"))
+	for i, line := range lines {
+		f := bytes.Split(line, []byte(" "))
+		if len(f) != 3 || string(f[0]) != "MSRP" || string(f[2]) != "SEND" || len(f[1]) == 0 {
+			continue
+		}
+		end := append([]byte("-------"), f[1]...)
+		for _, later := range lines[i+1:] {
+			if len(later) == len(end)+1 && bytes.HasPrefix(later, end) && bytes.IndexByte([]byte("$+#"), later[len(end)]) >= 0 {
+				n++
+				break
+			}
 		}
 	}
 	return n

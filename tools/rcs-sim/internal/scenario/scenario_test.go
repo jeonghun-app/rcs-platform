@@ -2,10 +2,14 @@ package scenario_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -14,6 +18,9 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/msrprelay"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
@@ -319,6 +326,105 @@ func TestAClientThatSendsNoKeepAliveFailsAtTheStepTimeout(t *testing.T) {
 		t.Fatalf("the keep-alive step did not run: %+v", results)
 	}
 	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+}
+
+// tlsStack is stack(t) with the client's side of the relay behind a TLS
+// terminator, as behind the NLB (ADR 0003): client_path is msrps: and the
+// client speaks TLS, while the relay listens plain (QA's probe on #102).
+func tlsStack(t *testing.T) scenario.Config {
+	t.Helper()
+	ts := httptest.NewTLSServer(http.NotFoundHandler()) // only for its certificate
+	t.Cleanup(ts.Close)
+	roots := ts.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	tlsLn, err := tls.Listen("tcp", "127.0.0.1:0", ts.TLS.Clone())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tlsLn.Close() })
+	tlsPort := tlsLn.Addr().(*net.TCPAddr).Port
+
+	f := simtest.StartFT(t, part)
+	corePort, plain, control := simtest.FreePort(t), simtest.FreePort(t), simtest.FreePort(t)
+	env := map[string]string{
+		"RCS_ENV": "test", "RELAY_LISTEN_ADDR": "127.0.0.1:" + strconv.Itoa(plain),
+		"RELAY_CONTROL_ADDR": "127.0.0.1:" + strconv.Itoa(control),
+		"RELAY_PUBLIC_HOST":  "127.0.0.1", "RELAY_PUBLIC_PORT": strconv.Itoa(tlsPort), "RELAY_PUBLIC_TLS": "true",
+		"RELAY_CORE_HOST": "127.0.0.1", "RELAY_CORE_NETWORKS": "127.0.0.0/8", "RELAY_CORE_PORTS": strconv.Itoa(corePort),
+		"RELAY_STORE": "memory", "RELAY_PCSCF_TOKEN": simtest.RelayToken,
+		"RELAY_KEEPALIVE_INTERVAL": "10s", "RELAY_IDLE_TIMEOUT": "60s",
+	}
+	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+	shared := runtime.NewEnv("RCS_", lookup)
+	rcfg := msrprelay.Configure(&runtime.Settings{Env: shared.WithPrefix("RELAY_"), Shared: shared, Environment: runtime.Test})
+	if err := shared.Err(); err != nil {
+		t.Fatal(err)
+	}
+	h := runtimetest.New(t, "msrp-relay")
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { _ = msrprelay.Run(ctx, h.Runtime, rcfg); close(stopped) }()
+	t.Cleanup(func() { cancel(); <-stopped })
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if code, _ := h.Get("/readyz"); code == http.StatusOK {
+			break
+		}
+		select {
+		case <-stopped:
+			t.Fatal("the relay stopped before it was ready")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the relay did not become ready")
+		}
+	}
+	// The terminator: TLS in, plain to the relay's public listener.
+	go func() {
+		for {
+			c, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				b, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(plain))
+				if err != nil {
+					return
+				}
+				defer b.Close()
+				go func() { _, _ = io.Copy(b, c); _ = b.(*net.TCPConn).CloseWrite() }()
+				_, _ = io.Copy(c, b)
+			}()
+		}
+	}()
+	u, _ := url.Parse("http://127.0.0.1:" + strconv.Itoa(control))
+	cfg := stack(t)
+	cfg.FT = &ft.Client{HTTP: f.Server.Client(), UploadURL: f.UploadURL, User: simtest.FTUser, Password: ft.NewSecret(simtest.FTPassword)}
+	cfg.Control = &anchor.Control{HTTP: http.DefaultClient, URL: u, Token: anchor.NewToken(simtest.RelayToken)}
+	cfg.CoreListen = "127.0.0.1:" + strconv.Itoa(corePort)
+	cfg.TLS = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	return cfg
+}
+
+// The keep-alive step watches the MSRP inside TLS: over msrps:, the
+// deployed path (ADR 0003), a client's keep-alives count (QA on #102: the
+// wrapper once saw only ciphertext, and the step always failed there).
+func TestTheKeepAliveStepWorksOverTLS(t *testing.T) {
+	cfg := tlsStack(t)
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	if !ok {
+		t.Fatalf("chat-client-originated over msrps: %+v", results)
+	}
+}
+
+func TestAClientWithoutKeepAlivesFailsOverTLSToo(t *testing.T) {
+	cfg := tlsStack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	cfg.StepTimeout = 2 * time.Second
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran || ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
 		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
 	}
 }
