@@ -192,8 +192,8 @@ type CreateRequest struct {
 	// entries are left out.
 	Invitees []Invitee
 	Subject  string
-	// Conversation is the Conversation-ID of the request; empty means one
-	// is generated.
+	// Conversation is the Conversation-ID of the request, a token as in
+	// 1-to-1 chat (messaging.ValidID); empty means one is generated.
 	Conversation string
 }
 
@@ -265,7 +265,7 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group, error) {
 	creator, ok := canonical(r.Creator)
 	if !ok || !validText(r.CreatorName, MaxDisplayNameLength) || !validText(r.Subject, MaxSubjectLength) ||
-		len(r.Conversation) > messaging.MaxIDLength {
+		r.Conversation != "" && !messaging.ValidID(r.Conversation) {
 		return groupstore.Group{}, ErrInvalid
 	}
 	r.Creator = creator

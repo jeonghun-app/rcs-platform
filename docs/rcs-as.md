@@ -335,7 +335,8 @@ cannot be written (`invalid`):
   zero-width characters. The author's roster name is in the `From` of every
   group message, so one participant cannot pass for another by name.
   Look-alike letters of different scripts are not folded.
-- **The Conversation-ID** is at most 256 bytes.
+- **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
+  in 1-to-1 chat.
 
 ### Fan-out
 

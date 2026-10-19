@@ -61,6 +61,9 @@ func TestCreationIsBounded(t *testing.T) {
 			Invitees: []Invitee{{Identity: bob, DisplayName: strings.Repeat("n", MaxDisplayNameLength+1)}}}, ErrInvalid},
 		"an overlong Conversation-ID": {CreateRequest{Creator: alice, Conversation: strings.Repeat("c", messaging.MaxIDLength+1),
 			Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
+		"a Conversation-ID with a space": {CreateRequest{Creator: alice, Conversation: "a b", Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
+		"a Conversation-ID with a CRLF":  {CreateRequest{Creator: alice, Conversation: "a\r\nX: y", Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
+		"a Conversation-ID with a quote": {CreateRequest{Creator: alice, Conversation: `a"b`, Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
 	} {
 		if _, err := r.s.Create(t.Context(), c.req); !errors.Is(err, c.want) {
 			t.Errorf("%s: %v, want %v", name, err, c.want)
