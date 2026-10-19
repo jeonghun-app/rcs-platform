@@ -5,16 +5,19 @@
 //
 // The SIP work is the platform's own: framing and the keep-alive are
 // internal/sip/transport's, retransmission and matching
-// internal/sip/transaction's. What is here is what a UA adds on top: the
-// registration with its +sip.instance and reg-id (RFC 5626 §4.2), the route
-// set every later request is sent with (RFC 3608, TS 24.229 §5.1.2A.1.1),
-// and the timing of the keep-alive pongs (RFC 5626 §4.4.1).
+// internal/sip/transaction's, and the Digest and AKA computations are
+// internal/sip/digest's and internal/milenage's. What is here is what a UA
+// adds on top: the registration with its +sip.instance and reg-id (RFC 5626
+// §4.2) and its challenges (RFC 3310, RFC 7616, TS 24.229 §5.1.1.2), the
+// route set every later request is sent with (RFC 3608, TS 24.229
+// §5.1.2A.1.1), and the timing of the keep-alive pongs (RFC 5626 §4.4.1).
 //
 // A failed flow is not recovered: the UA reports it and stops, and a
 // scenario that wants to go on dials a new one.
 //
 // Nothing here logs, and errors carry methods, status codes and fixed
-// reasons, never an identity, an address or a Call-ID.
+// reasons, never an identity, an address, a Call-ID, a nonce or a
+// credential.
 package sipua
 
 import (
@@ -35,6 +38,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
@@ -68,15 +72,23 @@ var (
 	ErrNoBinding = errors.New("sipua: the registrar lists no binding for this flow")
 )
 
-// StatusError is a final response that is not a success.
+// StatusError is a final response that is not a success. Err, when set,
+// says more: ErrNetworkNotAuthenticated, which the UA had reported in the
+// request, or ErrNoUsableChallenge, for a 401 or 407 it could not answer.
 type StatusError struct {
 	Method string
 	Code   int
+	Err    error
 }
 
 func (e *StatusError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%v; %s answered %d", e.Err, e.Method, e.Code)
+	}
 	return fmt.Sprintf("sipua: %s answered %d", e.Method, e.Code)
 }
+
+func (e *StatusError) Unwrap() error { return e.Err }
 
 // Config configures a UA.
 type Config struct {
@@ -95,6 +107,11 @@ type Config struct {
 	// Domain is the home network domain, the Request-URI of REGISTER (TS
 	// 24.229 §5.1.1.2.1).
 	Domain string
+	// Realm is the S-CSCF's Digest realm: the only one whose challenges
+	// are answered, and the realm of the unchallenged Authorization. Empty
+	// is Domain, which it is unless the HSS's realm (HSS_IMS_REALM) was
+	// set apart.
+	Realm string
 	// IMPU is the public user identity registered, and the From of every
 	// request. It is a SIP URI: the From and To of REGISTER must be one (TS
 	// 24.229 §5.1.1.2.1), and a tel URI comes only in the implicit set.
@@ -106,6 +123,9 @@ type Config struct {
 	RegID uint32
 	// Expires is the registration expiry asked for; zero is DefaultExpires.
 	Expires time.Duration
+	// Credentials answer the registrar's challenge. The zero value answers
+	// none, and the 401 is the result.
+	Credentials Credentials
 
 	// KeepAlive is the interval between pings, used as it is. Zero draws
 	// each interval anew between 80% and 100% of the registrar's
@@ -150,6 +170,11 @@ type Registration struct {
 	// Outbound reports "outbound" in Require: the registrar used the reg-id
 	// (RFC 5626 §6).
 	Outbound bool
+	// Challenges counts the 401 and 407 answers before this one, and
+	// Resynchronised reports that the card answered one with AUTS (RFC 3310
+	// §3.4).
+	Challenges     int
+	Resynchronised bool
 }
 
 // UA is a registered or registering client on one flow. Its methods are safe
@@ -215,6 +240,9 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 	}
 	if cfg.Expires <= 0 {
 		cfg.Expires = DefaultExpires
+	}
+	if cfg.Realm == "" {
+		cfg.Realm = cfg.Domain
 	}
 	if cfg.PongTimeout <= 0 {
 		cfg.PongTimeout = DefaultPongTimeout
@@ -422,13 +450,90 @@ func (ua *UA) Unregister(ctx context.Context) (*Registration, error) {
 	return reg, nil
 }
 
+// maxChallenges bounds the 401s and 407s one registration answers: the
+// first, one after a resynchronisation (RFC 3310 §3.4), and one with a
+// stale nonce (RFC 7616 §3.3).
+const maxChallenges = 3
+
+// register sends REGISTER and answers its challenges. Answered credentials
+// that are refused again end it: a second 401 to the same challenge's
+// answer is a wrong password or RES, not something to try again.
 func (ua *UA) register(ctx context.Context, expires time.Duration) (*Registration, error) {
+	domain := sip.URI{Scheme: "sip", Host: ua.cfg.Domain}
+	uri := domain.String()
+	creds := ua.cfg.Credentials
+	// auth holds the credentials sent, by field. A 407 and a 401 are
+	// answered side by side: what one hop's challenge asked for goes in
+	// every later REGISTER of the Call-ID (RFC 3261 §22.3), and the
+	// Authorization with the IMPI stays even while a proxy challenges
+	// (TS 24.229 §5.1.1.2.2).
+	auth := map[string]func() (string, error){}
+	if creds.set() {
+		auth["Authorization"] = fixed(ua.initialAuthorization(uri))
+	}
+	answered := map[int]bool{}
+	challenges, resynced, lastResync, reportedFailure := 0, false, false, false
+	for {
+		res, err := ua.sendRegister(ctx, domain, expires, auth)
+		if err != nil {
+			return nil, err
+		}
+		if reportedFailure && res.StatusCode >= 200 {
+			return nil, &StatusError{Method: "REGISTER", Code: res.StatusCode, Err: ErrNetworkNotAuthenticated}
+		}
+		if res.StatusCode == 401 || res.StatusCode == 407 {
+			// Each kind of challenge is answered once. Another only after
+			// AUTS, when the network challenges again with a fresh vector,
+			// or when it says the nonce had gone stale; otherwise a
+			// challenge to these credentials is final.
+			answer := !answered[res.StatusCode] || lastResync || staleChallenge(res)
+			if !creds.set() || !answer || challenges == maxChallenges {
+				return nil, &StatusError{Method: "REGISTER", Code: res.StatusCode}
+			}
+			challenges++
+			answered[res.StatusCode] = true
+			a, err := ua.authorize(res, uri)
+			if err != nil {
+				return nil, err
+			}
+			auth[a.field] = a.next
+			lastResync, reportedFailure = a.resync, a.failure
+			resynced = resynced || a.resync
+			continue
+		}
+		if res.StatusCode >= 300 {
+			return nil, &StatusError{Method: "REGISTER", Code: res.StatusCode}
+		}
+		reg, err := ua.registration(res)
+		if err != nil {
+			return nil, err
+		}
+		reg.Challenges, reg.Resynchronised = challenges, resynced
+		return reg, nil
+	}
+}
+
+// staleChallenge reports a 401 or 407 whose challenge says only the nonce
+// had expired (RFC 7616 §3.3): the credentials were right.
+func staleChallenge(res *sip.Response) bool {
+	for _, name := range []string{"WWW-Authenticate", "Proxy-Authenticate"} {
+		for _, v := range res.Header.Values(name) {
+			if ch, err := digest.ParseChallenge(v); err == nil && ch.Stale {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sendRegister sends one REGISTER, in the registration's Call-ID with the
+// next CSeq, and returns its final response.
+func (ua *UA) sendRegister(ctx context.Context, domain sip.URI, expires time.Duration, auth map[string]func() (string, error)) (*sip.Response, error) {
 	ua.mu.Lock()
 	ua.regCSeq++
 	cseq := ua.regCSeq
 	ua.mu.Unlock()
 
-	domain := sip.URI{Scheme: "sip", Host: ua.cfg.Domain}
 	req, err := ua.request("REGISTER", domain, ua.regCallID, ua.regTag, cseq, ua.cfg.IMPU)
 	if err != nil {
 		return nil, err
@@ -439,17 +544,18 @@ func (ua *UA) register(ctx context.Context, expires time.Duration) (*Registratio
 	add(req, &err, "Supported", "path, outbound")
 	add(req, &err, "Contact", ua.contact.String())
 	add(req, &err, "Expires", strconv.FormatInt(int64(expires/time.Second), 10))
+	for _, field := range []string{"Authorization", "Proxy-Authorization"} {
+		if next, ok := auth[field]; ok && err == nil {
+			var v string
+			if v, err = next(); err == nil {
+				add(req, &err, field, v)
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	res, err := ua.Send(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode >= 300 {
-		return nil, &StatusError{Method: "REGISTER", Code: res.StatusCode}
-	}
-	return ua.registration(res)
+	return ua.Send(ctx, req)
 }
 
 // registration reads a 2xx to REGISTER. A field that does not parse fails

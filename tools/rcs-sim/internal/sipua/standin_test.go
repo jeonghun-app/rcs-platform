@@ -58,6 +58,12 @@ type standIn struct {
 	grant uint32
 	// rewrite, when set, changes each contact the 2xx to REGISTER lists.
 	rewrite func(*sip.Contact)
+	// auth, when set, authenticates every REGISTER as the S-CSCF does, and
+	// proxyAuth, before it, as a proxy on the way would.
+	auth, proxyAuth *authRegistrar
+	// hook, when set, answers REGISTERs in their place: a response, or nil
+	// for the stand-in's own 200.
+	hook func(req *sip.Request, tag string) *sip.Response
 	// noOutbound leaves Require: outbound out of the 2xx to REGISTER, as a
 	// registrar that did not use the reg-id does (RFC 5626 §6).
 	noOutbound bool
@@ -169,6 +175,18 @@ func (s *standIn) response(req *sip.Request) *sip.Response {
 	if req.Method == "REGISTER" && s.refuse != 0 {
 		code = s.refuse
 	}
+	if req.Method == "REGISTER" && code == 200 && s.hook != nil {
+		if res := s.hook(req, tag); res != nil {
+			return res
+		}
+	}
+	for _, a := range []*authRegistrar{s.proxyAuth, s.auth} {
+		if req.Method == "REGISTER" && code == 200 && a != nil {
+			if res := a.check(s.t, req, tag); res != nil {
+				return res
+			}
+		}
+	}
 	res, err := sip.NewResponse(req, code, "", tag)
 	if err != nil {
 		// Errorf, not Fatalf: a delayed answer runs off the test's goroutine.
@@ -210,6 +228,13 @@ func (s *standIn) response(req *sip.Request) *sip.Response {
 		res.Header.Add("Flow-Timer", strconv.Itoa(s.flowTimer))
 	}
 	return res
+}
+
+// registerCount is how many REGISTERs the stand-in has received.
+func (s *standIn) registerCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registers
 }
 
 func (s *standIn) Stray(transport.Inbound) {}
