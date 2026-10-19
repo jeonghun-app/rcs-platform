@@ -25,7 +25,13 @@ const (
 	thisHost  = "scscf-0a1b2c.rcs.local"
 )
 
-// realWait guards against hangs; no protocol timer depends on it.
+// realWait guards against hangs. It is also the default RequestTimeout of
+// the harness (newEnv), so that a slow but healthy answer never runs out
+// of it (#177): the attempt's bound, the node's request timer and its DPR
+// drain all wait that long. The caller's context (ctx) has the same
+// bound and starts first, so with the defaults it always runs out first:
+// no attempt times out on its own, and neither an exclusion nor a retry
+// after a timeout happens. A test about those sets its own timeout.
 const realWait = 10 * time.Second
 
 // pipeListener hands one end of a net.Pipe to Node.Serve per dial.
