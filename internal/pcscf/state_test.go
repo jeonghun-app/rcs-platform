@@ -77,9 +77,10 @@ func TestTheRegistryCountsExpiresAndForgetsFlows(t *testing.T) {
 	if err := save("A", "sip:1@h", 2*time.Minute); err != nil || r.size() != 3 {
 		t.Fatalf("a refresh = %v, size %d", err, r.size())
 	}
-	if r.room("C", "sip:1@h") || !r.room("A", "sip:2@h") {
-		t.Fatal("room is wrong")
+	if r.reserve("C", "sip:1@h", clock.t.Add(time.Minute)) || !r.reserve("A", "sip:2@h", clock.t.Add(time.Minute)) {
+		t.Fatal("a full registry reserved a new slot, or refused a registered one")
 	}
+	r.release("A", "sip:2@h")
 	clock.t = clock.t.Add(5 * time.Minute)
 	r.sweep()
 	if r.size() != 2 {
@@ -149,5 +150,57 @@ func TestTheLimitCountsAClientByItsAddressOrItsSlash64(t *testing.T) {
 	}
 	if !fl.admit("core", transport.FlowInfo{Listener: coreListener, Addr: netip.MustParseAddrPort("198.51.100.7:3")}) {
 		t.Error("a core flow was counted against a client")
+	}
+}
+
+// A REGISTER reserves its identity's slot before it is forwarded, so a full
+// registry refuses the next one then rather than after its 200; the slot is
+// freed when the REGISTER ends unregistered, or when its reservation lapses
+// (QA of #198).
+func TestRegistrySlotsAreReservedUntilReleasedOrLapsed(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	r := newRegistry(2, clock.now)
+	until := clock.t.Add(time.Minute)
+	if !r.reserve("F1", "sip:1@h", until) || !r.reserve("F1", "sip:1@h", until) || !r.reserve("F2", "sip:1@h", until) {
+		t.Fatal("refused with room")
+	}
+	if r.reserve("F3", "sip:1@h", until) || r.size() != 2 {
+		t.Fatalf("a third slot was taken: size %d", r.size())
+	}
+	// The second REGISTER of F1 still holds the slot after the first ends.
+	r.release("F1", "sip:1@h")
+	if r.reserve("F3", "sip:1@h", until) {
+		t.Fatal("a slot still reserved was given away")
+	}
+	r.release("F1", "sip:1@h")
+	r.release("F1", "sip:1@h")
+	if r.size() != 1 || !r.reserve("F3", "sip:1@h", until) {
+		t.Fatalf("a released slot was not freed: size %d", r.size())
+	}
+	// A reservation that becomes a registration keeps its slot.
+	if err := r.save(&registration{flow: "F2", aor: "sip:1@h", expires: clock.t.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	r.release("F2", "sip:1@h")
+	if r.size() != 2 {
+		t.Fatalf("size %d after saving and releasing", r.size())
+	}
+	// One no response released lapses at the sweep.
+	clock.t = until
+	r.sweep()
+	if r.size() != 1 || len(r.pending) != 0 {
+		t.Fatalf("size %d, %d reservations after they lapsed", r.size(), len(r.pending))
+	}
+	// A flow that closes keeps a REGISTER's slot until it ends.
+	if !r.reserve("F2", "sip:2@h", clock.t.Add(time.Minute)) {
+		t.Fatal("refused")
+	}
+	r.removeFlow("F2")
+	if r.size() != 1 {
+		t.Fatalf("size %d after the flow closed", r.size())
+	}
+	r.release("F2", "sip:2@h")
+	if r.size() != 0 {
+		t.Fatalf("size %d at the end", r.size())
 	}
 }

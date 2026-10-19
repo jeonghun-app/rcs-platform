@@ -88,18 +88,6 @@ func (p *peer) final() *sip.Response {
 	}
 }
 
-// receive waits for the next request at n.
-func (n *fakeCoreNode) receive(t *testing.T) *sip.Request {
-	t.Helper()
-	select {
-	case req := <-n.got:
-		return req
-	case <-time.After(waitFor):
-		t.Fatal("no request reached the core")
-		return nil
-	}
-}
-
 // forged are header fields a client may not set, and so must never reach the
 // core from it as the client wrote them (TS 24.229 §5.2, ADR 0007 §7).
 var forged = []string{

@@ -31,8 +31,9 @@ func fromClient(src transport.Source) bool {
 // 24.229 §5.2.1, §5.2.6.3.3, RFC 3325, ADR 0007 §7). pcscf removes them from
 // every request and response a client sends, so a client cannot assert an
 // identity, a served user, a service, charging or media authorisation data,
-// network feature capabilities, a private network or a profile key, or
-// claim a visited network; the core trusts them because only pcscf admits
+// network feature capabilities, a private network or a profile key, claim
+// a visited network, or write the Path a registrar keeps (RFC 3327 §5.1:
+// proxies insert it); the core trusts them because only pcscf admits
 // clients.
 var networkOnlyHeaders = []string{
 	"P-Asserted-Identity",
@@ -47,6 +48,7 @@ var networkOnlyHeaders = []string{
 	"Feature-Caps",
 	"P-Private-Network-Indication",
 	"P-Profile-Key",
+	"Path",
 }
 
 // stripNetworkHeaders removes networkOnlyHeaders from h, and every
@@ -170,6 +172,9 @@ type pcscf struct {
 	registers, initials *limiter
 	// resolve finds a core hop, as the proxy does.
 	resolve proxy.Resolver
+	// icscfs finds icscf's addresses, every one so that a REGISTER can try
+	// the next.
+	icscfs allResolver
 	// rand draws charging identifiers.
 	rand io.Reader
 	// flows sets a flow's idle timeout; nil in tests that need none.

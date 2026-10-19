@@ -2,8 +2,6 @@ package pcscf
 
 import (
 	"context"
-	"encoding/hex"
-	"io"
 	"net/netip"
 	"slices"
 
@@ -57,13 +55,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 					return err
 				}
 			}
-			if err := req.Header.Set("P-Charging-Vector", "icid-value="+icid); err != nil {
-				return err
-			}
-			if p.cfg.VisitedNetworkID != "" {
-				return req.Header.Set("P-Visited-Network-ID", p.cfg.VisitedNetworkID)
-			}
-			return nil
+			return req.Header.Set("P-Charging-Vector", "icid-value="+icid)
 		},
 	}
 }
@@ -180,13 +172,4 @@ func (p *pcscf) publicHost(host string) bool {
 		return true
 	}
 	return slices.ContainsFunc(p.cfg.PublicAddrs, func(a netip.Addr) bool { return hostOf(a) == host })
-}
-
-// icid is a new IMS charging identifier (RFC 7315 §4.6): 128 random bits.
-func (p *pcscf) icid() (string, error) {
-	b := make([]byte, 16)
-	if _, err := io.ReadFull(p.rand, b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }

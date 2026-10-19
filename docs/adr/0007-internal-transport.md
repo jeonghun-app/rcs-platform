@@ -96,11 +96,13 @@ traffic within an AZ is not assumed to be.
    `P-Asserted-Identity`, `P-Served-User`, `P-Asserted-Service`,
    `P-Charging-Vector`, `P-Charging-Function-Addresses`, `P-Visited-Network-ID`,
    `P-Associated-URI`, `P-Called-Party-ID`, `P-Media-Authorization`,
-   `Feature-Caps`, `P-Private-Network-Indication` and `P-Profile-Key`, and any
+   `Feature-Caps`, `P-Private-Network-Indication`, `P-Profile-Key` and `Path`
+   (proxies insert it, RFC 3327 §5.1, and a registrar keeps it), and any
    `P-Access-Network-Info` value with the `network-provided` parameter (a client
    may describe its access, not vouch for it). The core SIP ports trust
    `P-Asserted-Identity` because security groups admit only platform services
-   there. (Amended in #188: the list was the first eight, for requests only.)
+   there. (Amended in #188: the list was the first eight, for requests only.
+   Amended in #198: `Path`.)
 8. The FT digest realm must differ from the IMS digest realm (startup refuses
    equal realms), so an FT credential can never authenticate a SIP registration.
 9. Task definitions use `readonlyRootFilesystem: true`, `enableExecuteCommand:

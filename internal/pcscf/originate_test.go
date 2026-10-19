@@ -4,14 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"regexp"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
-	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -44,9 +42,9 @@ func inDialogText(method string, extra ...string) string {
 	return strings.Replace(initialText(method, extra...), "To: <"+bobIMPU+">", "To: <"+bobIMPU+">;tag=b1", 1)
 }
 
-// registerOver registers alice over flow from 192.0.2.10, with the 200's
+// registerAlice registers alice over flow from 192.0.2.10, with the 200's
 // extra fields.
-func registerOver(t *testing.T, p *pcscf, flow transport.FlowID, extra ...string) {
+func registerAlice(t *testing.T, p *pcscf, flow transport.FlowID, extra ...string) {
 	t.Helper()
 	d := p.Route(context.Background(), clientRequest(t, registerText(outboundContact, "Supported: outbound"), flow))
 	d.OnResponse(context.Background(), parseResponse(t, okText(outboundContact+";expires=3600", extra...)))
@@ -55,21 +53,6 @@ func registerOver(t *testing.T, p *pcscf, flow transport.FlowID, extra ...string
 	}
 }
 
-// prepared is the request d forwards to its only target.
-func prepared(t *testing.T, d proxy.Decision, r *proxy.Request) *sip.Request {
-	t.Helper()
-	if len(d.Targets) != 1 || d.Prepare == nil {
-		t.Fatalf("decision %+v", d)
-	}
-	req := r.Message.Clone()
-	if err := d.Prepare(context.Background(), d.Targets[0], req); err != nil {
-		t.Fatal(err)
-	}
-	return req
-}
-
-var icidValue = regexp.MustCompile(`^icid-value=[0-9a-f]{32}$`)
-
 // A request outside a dialog goes along the registration's Service-Route in
 // place of the client's Route, with the default public identity asserted and
 // the registration's tel URI beside it, a new charging identifier, and two
@@ -77,7 +60,7 @@ var icidValue = regexp.MustCompile(`^icid-value=[0-9a-f]{32}$`)
 // name (TS 24.229 §5.2.6.3.3, RFC 3325 §9.1, RFC 5658).
 func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing.T) {
 	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
-	registerOver(t, p, "FLOW-A", "Service-Route: "+scscfRoute+", <sip:term@10.0.4.5;lr>",
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute+", <sip:term@10.0.4.5;lr>",
 		"P-Associated-URI: <"+aliceIMPU+">, <"+aliceTel+">")
 	r := clientRequest(t, initialText("INVITE", "Route: <sip:10.0.9.9;lr>"), "FLOW-A")
 	d := p.Route(context.Background(), r)
@@ -102,8 +85,9 @@ func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing
 	if !icidValue.MatchString(first) {
 		t.Errorf("P-Charging-Vector %q", first)
 	}
+	// P-Visited-Network-ID is for REGISTER (§5.2.2.1), not these.
 	if req.Header.Has("P-Visited-Network-ID") {
-		t.Error("P-Visited-Network-ID without PCSCF_VISITED_NETWORK_ID")
+		t.Errorf("P-Visited-Network-ID %q", req.Header.Get("P-Visited-Network-ID"))
 	}
 	if strings.Contains(r.Message.Header.Get("Route"), "orig") || r.Message.Header.Has("P-Asserted-Identity") {
 		t.Error("Prepare changed the shared request")
@@ -112,31 +96,6 @@ func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing
 	r = clientRequest(t, initialText("MESSAGE"), "FLOW-A")
 	if again := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); again == first || !icidValue.MatchString(again) {
 		t.Errorf("second P-Charging-Vector %q after %q", again, first)
-	}
-}
-
-// The visited network is named on REGISTERs and requests outside a dialog
-// when it is configured (TS 24.229 §5.2.2.1, §5.2.6.3.3).
-func TestTheVisitedNetworkIsNamedWhenConfigured(t *testing.T) {
-	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
-	p.cfg.VisitedNetworkID = `"Visited network number 1"`
-	r := clientRequest(t, registerText(outboundContact, "Supported: outbound"), "FLOW-A")
-	if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Visited-Network-ID"); got != p.cfg.VisitedNetworkID {
-		t.Errorf("REGISTER P-Visited-Network-ID %q", got)
-	}
-	registerOver(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
-	r = clientRequest(t, initialText("MESSAGE"), "FLOW-A")
-	if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Visited-Network-ID"); got != p.cfg.VisitedNetworkID {
-		t.Errorf("MESSAGE P-Visited-Network-ID %q", got)
-	}
-}
-
-func TestAVisitedNetworkIDIsRead(t *testing.T) {
-	for _, v := range []string{"ims.mnc001.mcc001.3gppnetwork.org", `"Visited network number 1";x=1`} {
-		c, err := configure(with(devEnv, "PCSCF_VISITED_NETWORK_ID", v))
-		if err != nil || c.VisitedNetworkID != v {
-			t.Errorf("%q: %q, %v", v, c.VisitedNetworkID, err)
-		}
 	}
 }
 
@@ -198,7 +157,7 @@ func TestTheAssertedIdentityIsAPreferredOneTheFlowRegistered(t *testing.T) {
 func TestThePreferredIdentitysRegistrationGivesTheRoute(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	p, _ := newTestPcscf(clock)
-	registerOver(t, p, "FLOW-A", "Service-Route: "+scscfRoute, "P-Associated-URI: <"+aliceIMPU+">")
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute, "P-Associated-URI: <"+aliceIMPU+">")
 	other := &registration{flow: "FLOW-A", uri: mustURI(t, bobIMPU), aor: aorKey(mustURI(t, bobIMPU)), expires: clock.t.Add(time.Hour),
 		serviceRoute: []sip.Address{{URI: mustURI(t, "sip:orig@10.0.4.7;lr")}}, associated: []sip.Address{{URI: mustURI(t, bobIMPU)}}}
 	if err := p.registry.save(other); err != nil {
@@ -217,7 +176,7 @@ func TestThePreferredIdentitysRegistrationGivesTheRoute(t *testing.T) {
 		if req := prepared(t, p.Route(context.Background(), r), r); req.Header.Get("Route") != scscfRoute {
 			t.Errorf("default route %q after %d refreshes", req.Header.Get("Route"), i)
 		}
-		registerOver(t, p, "FLOW-A", "Service-Route: "+scscfRoute, "P-Associated-URI: <"+aliceIMPU+">")
+		registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute, "P-Associated-URI: <"+aliceIMPU+">")
 	}
 }
 
@@ -229,7 +188,7 @@ func TestAnInitialRequestNeedsARegistrationOverItsFlow(t *testing.T) {
 	if d := p.Route(context.Background(), clientRequest(t, initialText("MESSAGE"), "FLOW-A")); d.Status != 403 {
 		t.Errorf("unregistered: %+v", d)
 	}
-	registerOver(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
 	if d := p.Route(context.Background(), clientRequest(t, initialText("MESSAGE"), "FLOW-B")); d.Status != 403 {
 		t.Errorf("another flow: %+v", d)
 	}
@@ -239,7 +198,7 @@ func TestAnInitialRequestNeedsARegistrationOverItsFlow(t *testing.T) {
 	}
 
 	p, _ = newTestPcscf(clock)
-	registerOver(t, p, "FLOW-A")
+	registerAlice(t, p, "FLOW-A")
 	if d := p.Route(context.Background(), clientRequest(t, initialText("MESSAGE"), "FLOW-A")); d.Status != 500 || d.Targets != nil {
 		t.Errorf("no Service-Route: %+v", d)
 	}
@@ -251,7 +210,7 @@ func TestInitialRequestsPastTheRateAreRefused(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	p, _ := newTestPcscf(clock)
 	p.initials = newLimiter(1, 2, clock.now)
-	registerOver(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
 	for i := range 3 {
 		d := p.Route(context.Background(), clientRequest(t, initialText("MESSAGE"), "FLOW-A"))
 		if refused := d.Response != nil; refused != (i == 2) {

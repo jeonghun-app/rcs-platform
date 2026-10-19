@@ -2,10 +2,14 @@ package pcscf
 
 import (
 	"context"
+	"encoding/hex"
+	"io"
 	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -30,12 +34,25 @@ const (
 	defaultExpires = 3600
 	// retryAfter is the Retry-After of a refused REGISTER, in seconds.
 	retryAfter = "1"
+	// maxICSCFAttempts and icscfAttemptTimeout bound the icscf addresses a
+	// REGISTER tries and how long each may take, so that a 504 after the
+	// last still reaches the client before its own Timer F, 32 s (RFC 3261
+	// §17.1.2.2).
+	maxICSCFAttempts    = 3
+	icscfAttemptTimeout = 8 * time.Second
+	// reservationHold is how long a REGISTER holds its registry slot if its
+	// final response never comes through OnResponse: the attempts' time and
+	// a margin.
+	reservationHold = maxICSCFAttempts*icscfAttemptTimeout + 30*time.Second
 )
 
 // register routes a REGISTER from a client to icscf (TS 24.229 §5.2.2.1):
 // Path names this task's core listener and the flow (RFC 3327, RFC 5626
-// §5.2), and the 200 is remembered, with the keep-alive the client gets.
-func (p *pcscf) register(_ context.Context, r *proxy.Request) proxy.Decision {
+// §5.2), and the 200 is remembered, with the keep-alive the client gets. An
+// icscf address that does not answer, fails or answers 3xx, 480 or 503 is
+// replaced by the next, and the client gets 504 once none is left (§5.2.2.1
+// 7)).
+func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	src := r.Source
 	if !p.registers.allow(clientKey(src.Addr)) {
 		return p.refuse(r, 503, "Too Many Registrations")
@@ -49,20 +66,90 @@ func (p *pcscf) register(_ context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 400, Reason: "Bad Contact"}
 	}
 	aor := aorKey(to.URI)
-	if !p.registry.room(src.Flow, aor) {
+	if !p.registry.reserve(src.Flow, aor, p.now().Add(reservationHold)) {
 		return p.refuse(r, 503, "Registry Full")
 	}
-	reg := &registration{flow: src.Flow, uri: to.URI, aor: aor, outbound: usesOutbound(r.Message, contacts)}
-	reg.keepAlive = reg.outbound || viaKeep(r.Message)
+	var once sync.Once
+	release := func() { once.Do(func() { p.registry.release(src.Flow, aor) }) }
+	icid, err := p.icid()
+	if err != nil {
+		release()
+		return proxy.Decision{Status: 500}
+	}
+	dsts, err := p.icscfs.ResolveAll(ctx, p.cfg.ICSCF)
+	if err != nil {
+		release()
+		return proxy.Decision{Status: 504, Reason: "No I-CSCF"}
+	}
+	tries := &icscfTries{left: dsts[1:min(len(dsts), maxICSCFAttempts)]}
+	reg := &registration{flow: src.Flow, uri: to.URI, aor: aor, outbound: usesOutbound(r.Message, contacts), viaKeep: viaKeep(r.Message)}
 	return proxy.Decision{
-		Targets: []proxy.Target{{URI: r.Message.URI, Routes: []sip.Address{{URI: p.cfg.ICSCF}}}},
+		Targets: []proxy.Target{icscfTarget(r.Message.URI, dsts[0])},
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
-			return p.prepareRegister(req, reg)
+			return p.prepareRegister(req, reg, icid)
+		},
+		OnBranchFailure: func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
+			if !retryICSCF(f.Response.StatusCode) {
+				return nil
+			}
+			next, ok := tries.next()
+			if !ok {
+				return nil
+			}
+			return []proxy.Target{icscfTarget(r.Message.URI, next)}
+		},
+		OnFinal: func(_ context.Context, res *sip.Response) {
+			switch {
+			case tries.exhausted.Load():
+				res.StatusCode, res.Reason = 504, sip.DefaultReason(504)
+			case res.StatusCode == statusFlowFailed:
+				// What the proxy does without OnFinal: a client must not
+				// see 430 (RFC 5626 §11.5).
+				res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
+			}
 		},
 		OnResponse: func(_ context.Context, res *sip.Response) {
+			if res.StatusCode < 200 {
+				return
+			}
+			defer release()
 			p.registered(res, reg, contacts)
 		},
 	}
+}
+
+// icscfTarget sends a REGISTER to icscf at dst, cut short after
+// icscfAttemptTimeout so that another address can be tried in time.
+func icscfTarget(uri sip.URI, dst transport.Destination) proxy.Target {
+	return proxy.Target{URI: uri, Destination: &dst, Timeout: icscfAttemptTimeout}
+}
+
+// retryICSCF reports whether a REGISTER that icscf answered with code, or
+// that failed as code, goes to another icscf (TS 24.229 §5.2.2.1 7)): no
+// answer (408), a transport failure or overload (503), a redirection or
+// 480.
+func retryICSCF(code int) bool {
+	return code == 408 || code == 503 || code == 480 || code >= 300 && code < 400
+}
+
+// icscfTries are the icscf addresses a REGISTER has left to try.
+type icscfTries struct {
+	mu   sync.Mutex
+	left []transport.Destination
+	// exhausted is set when a retryable failure found no address left.
+	exhausted atomic.Bool
+}
+
+func (t *icscfTries) next() (transport.Destination, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.left) == 0 {
+		t.exhausted.Store(true)
+		return transport.Destination{}, false
+	}
+	d := t.left[0]
+	t.left = t.left[1:]
+	return d, true
 }
 
 // refuse answers a request with code and Retry-After, telling the client to
@@ -115,12 +202,20 @@ func viaKeep(req *sip.Request) bool {
 	return err == nil && len(vias) > 0 && vias[0].Params.Has("keep")
 }
 
-// prepareRegister readies the branch's REGISTER: Path naming this task's
-// core listener and the flow, with ob when the client uses outbound (RFC
-// 5626 §5.1), Supported: path, and, for a client that does not keep its
-// flow alive, expiries of at most maxExpiresWithoutKeepAlive. The headers
-// only the network may set are gone already, removed on arrival.
-func (p *pcscf) prepareRegister(req *sip.Request, reg *registration) error {
+// prepareRegister readies the branch's REGISTER (TS 24.229 §5.2.2.1): icscf
+// as its only Route, since pcscf chooses the I-CSCF and a Route the client
+// wrote below pcscf's own must not steer it; Path naming this task's core
+// listener and the flow, with ob when the client uses outbound (RFC 5626
+// §5.1), and Require: path; the visited network and a new charging
+// identifier; and, for a client that does not keep its flow alive,
+// expiries of at most maxExpiresWithoutKeepAlive. The headers only the
+// network may set, a client's Path among them, are gone already, removed
+// on arrival.
+func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string) error {
+	req.Header.Del("Route")
+	if err := req.Header.Add("Route", sip.Address{URI: p.cfg.ICSCF}.String()); err != nil {
+		return err
+	}
 	path := sip.URI{Scheme: "sip", User: string(reg.flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
 	path.Params.Set("transport", "tcp")
 	path.Params.SetFlag("lr")
@@ -130,20 +225,30 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration) error {
 	if err := req.Header.Prepend("Path", sip.Address{URI: path}.String()); err != nil {
 		return err
 	}
-	if !hasOption(req.Header.Supported, "path") {
-		if err := req.Header.Add("Supported", "path"); err != nil {
+	if !hasOption(req.Header.Require, "path") {
+		if err := req.Header.Add("Require", "path"); err != nil {
 			return err
 		}
 	}
-	if p.cfg.VisitedNetworkID != "" {
-		if err := req.Header.Set("P-Visited-Network-ID", p.cfg.VisitedNetworkID); err != nil {
-			return err
-		}
+	if err := req.Header.Set("P-Visited-Network-ID", p.cfg.VisitedNetworkID); err != nil {
+		return err
 	}
-	if !reg.keepAlive {
+	if err := req.Header.Set("P-Charging-Vector", "icid-value="+icid); err != nil {
+		return err
+	}
+	if !reg.outbound && !reg.viaKeep {
 		return capExpires(&req.Header, maxExpiresWithoutKeepAlive)
 	}
 	return nil
+}
+
+// icid is a new IMS charging identifier (RFC 7315 §4.6): 128 random bits.
+func (p *pcscf) icid() (string, error) {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(p.rand, b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // capExpires lowers the Expires field and each contact's expires to at most
@@ -186,14 +291,19 @@ func capExpires(h *sip.Header, limit uint32) error {
 
 // registered records the outcome of a REGISTER from its final 2xx: the
 // client's contacts the 200 lists, with Service-Route and P-Associated-URI,
-// or that it has none left. It also tells the client how to keep its flow
-// alive (RFC 5626 §4.4, RFC 6223 §5), caps a client without keep-alive to
-// maxExpiresWithoutKeepAlive, and sets the flow's idle timeout to match.
+// or that it has none left. A REGISTER without Contact only fetches the
+// bindings (RFC 3261 §10.2.3) and changes nothing. It also tells the client
+// how to keep its flow alive (RFC 5626 §4.4, RFC 6223 §5): Flow-Timer only
+// when the registrar's Require: outbound says outbound applies (§5.4); it
+// caps a client without keep-alive to maxExpiresWithoutKeepAlive, and sets
+// the flow's idle timeout to match.
 func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contacts) {
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
+	if res.StatusCode < 200 || res.StatusCode >= 300 || len(sent) == 0 {
 		return
 	}
-	if !reg.keepAlive {
+	outbound := reg.outbound && hasOption(res.Header.Require, "outbound")
+	keepAlive := outbound || reg.viaKeep
+	if !keepAlive {
 		if err := capExpires(&res.Header, maxExpiresWithoutKeepAlive); err != nil {
 			p.log.Warn("REGISTER 200 has malformed expiries", slog.String("error", err.Error()))
 		}
@@ -236,6 +346,7 @@ func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contac
 	}
 	saved := *reg
 	saved.contacts = mine
+	saved.outbound, saved.keepAlive = outbound, keepAlive
 	saved.expires = p.now().Add(time.Duration(least) * time.Second)
 	saved.serviceRoute, _ = res.Header.ServiceRoute()
 	saved.associated, _ = res.Header.PAssociatedURI()
@@ -243,24 +354,25 @@ func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contac
 		p.log.Warn("registration not kept", slog.String("error", err.Error()))
 	}
 
-	if reg.outbound {
+	if outbound {
 		_ = res.Header.Set("Flow-Timer", strconv.Itoa(keepAliveInterval))
-		if !hasOption(res.Header.Require, "outbound") {
-			_ = res.Header.Add("Require", "outbound")
-		}
 	}
 	if viaKeepFlag(res) {
 		setViaKeep(res)
 	}
 	idle := p.cfg.ClientIdleTimeout
-	if reg.keepAlive {
+	if keepAlive {
 		idle = keepAliveIdleTLS
 		if p.cfg.ClientTransport == ClientTCP {
 			idle = keepAliveIdleTCP
 		}
 	}
-	if p.flows != nil {
-		p.flows.SetFlowIdleTimeout(reg.flow, idle)
+	if p.flows != nil && !p.flows.SetFlowIdleTimeout(reg.flow, idle) {
+		// The flow closed before its 200, and OnFlowClosed found nothing
+		// to remove. Saving before this check means that whichever runs
+		// second, this or OnFlowClosed, removes the registration (QA of
+		// #198).
+		p.registry.remove(reg.flow, reg.aor)
 	}
 }
 
