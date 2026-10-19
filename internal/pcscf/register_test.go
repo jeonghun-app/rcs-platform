@@ -118,7 +118,7 @@ func newTestPcscf(clock *testClock) (*pcscf, idleSet) {
 		cfg: cfg, corePort: 5070,
 		registry:     newRegistry(cfg.MaxRegistrations, clock.now),
 		registers:    newLimiter(cfg.RegisterRate, cfg.RegisterBurst, clock.now),
-		allRegisters: newLimiter(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, clock.now),
+		allRegisters: newTaskLimit(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, clock.now),
 		initials:     newLimiter(cfg.InitialRate, cfg.InitialBurst, clock.now),
 		icscfFirst:   icscfFirstTimeout, icscfTotal: icscfTotalTimeout,
 		resolve: coreResolver{dns: &proxy.DNSResolver{Namespace: cfg.Namespace, Allow: allowCore(cfg), Lookup: scscfAt("10.0.4.4")}},
@@ -681,33 +681,57 @@ func TestTheICSCFAttemptsShareThirtySeconds(t *testing.T) {
 	}
 }
 
-// A flow may have REGISTERs under way for at most eight identities: a
-// client writing new To values while the core is slow holds no more slots,
-// and a client on another flow still registers (QA of #198).
-func TestAFlowHoldsAFewSlotsForUnansweredRegisters(t *testing.T) {
+// registerAs is a REGISTER from 192.0.2.10 for identity n, over flow.
+func registerAs(t *testing.T, n int, flow transport.FlowID) *proxy.Request {
+	text := strings.ReplaceAll(registerText("<sip:x@192.0.2.10:40000>"), aliceIMPU, fmt.Sprintf("sip:user%d@ims.mnc001.mcc001.3gppnetwork.org", n))
+	return clientRequest(t, text, flow)
+}
+
+// A client, an IPv4 address or IPv6 /64, may have REGISTERs under way for at
+// most eight identities over all its flows: one writing new To values while
+// the core is slow holds no more slots, and another client still registers
+// (QA of #198).
+func TestAClientHoldsAFewSlotsForUnansweredRegisters(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	p, _ := newTestPcscf(clock)
 	p.registry = newRegistry(100, clock.now)
-	refused := 0
-	for i := range 100 {
-		text := strings.ReplaceAll(registerText("<sip:x@192.0.2.10:40000>"), aliceIMPU, fmt.Sprintf("sip:user%d@ims.mnc001.mcc001.3gppnetwork.org", i))
-		if d := p.Route(context.Background(), clientRequest(t, text, "BUSY")); d.Response != nil {
-			if d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
-				t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
+	refused, n := 0, 0
+	// 13 connections from one address, 8 identities each.
+	for f := range 13 {
+		for range 8 {
+			if d := p.Route(context.Background(), registerAs(t, n, transport.FlowID(fmt.Sprint("BUSY-", f)))); d.Response != nil {
+				if d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
+					t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
+				}
+				refused++
 			}
-			refused++
+			n++
 		}
 	}
-	if n := p.registry.size(); n > maxPendingPerFlow || refused != 100-maxPendingPerFlow {
-		t.Fatalf("%d slots held, %d refused", n, refused)
+	if size := p.registry.size(); size > maxPendingPerClient || refused != n-maxPendingPerClient {
+		t.Fatalf("%d slots held, %d of %d refused", size, refused, n)
 	}
-	// A refresh of an identity already under way is not a new one.
-	if d := p.Route(context.Background(), clientRequest(t, strings.ReplaceAll(registerText("<sip:x@192.0.2.10:40000>"), aliceIMPU, "sip:user0@ims.mnc001.mcc001.3gppnetwork.org"), "BUSY")); d.Response != nil {
+	// One already under way is not a new identity.
+	if d := p.Route(context.Background(), registerAs(t, 0, "BUSY-0")); d.Response != nil {
 		t.Fatal("a retransmitted identity was refused")
 	}
-	d := p.Route(context.Background(), clientRequest(t, registerText(outboundContact, "Supported: outbound"), "OTHER"))
+	// The same /64 is the same client.
+	r := registerAs(t, n, "BUSY-V6")
+	r.Source.Addr = netip.MustParseAddrPort("[2001:db8:1:2::1]:1")
+	for i := range maxPendingPerClient {
+		r := registerAs(t, n+1+i, "BUSY-V6")
+		r.Source.Addr = netip.MustParseAddrPort("[2001:db8:1:2::1]:1")
+		_ = p.Route(context.Background(), r)
+	}
+	r.Source.Addr = netip.MustParseAddrPort("[2001:db8:1:2::99]:1")
+	if d := p.Route(context.Background(), r); d.Response == nil {
+		t.Fatal("another address of the same /64 got slots of its own")
+	}
+	other := clientRequest(t, registerText(outboundContact, "Supported: outbound"), "OTHER")
+	other.Source.Addr = netip.MustParseAddrPort("192.0.2.11:40000")
+	d := p.Route(context.Background(), other)
 	if d.Response != nil {
-		t.Fatalf("a client on another flow was refused: %+v", d.Response)
+		t.Fatalf("another client was refused: %+v", d.Response)
 	}
 	d.OnResponse(context.Background(), parseResponse(t, okText(outboundContact+";expires=3600", "Require: outbound")))
 	if _, ok := p.registry.lookup("OTHER", aorKey(mustURI(t, aliceIMPU))); !ok {
@@ -716,26 +740,47 @@ func TestAFlowHoldsAFewSlotsForUnansweredRegisters(t *testing.T) {
 }
 
 // The REGISTERs of all clients together are bounded, and a refusal is
-// counted (security review of #198).
+// counted (security review of #198). A REGISTER refused as malformed costs
+// nothing, and a share is kept for refreshes of registrations the task
+// holds, so new ones cannot use it all up.
 func TestTheTaskBoundsTheRegistersOfAllClients(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	p, _ := newTestPcscf(clock)
 	var out strings.Builder
 	p.metrics = runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, p.log)
-	p.allRegisters = newLimiter(1, 2, clock.now)
-	for i := range 3 {
+	p.allRegisters = newTaskLimit(4, 4, clock.now) // 3 for anyone, 1 kept for refreshes
+	client := func(i int) *proxy.Request {
 		r := clientRequest(t, registerText(outboundContact), transport.FlowID(fmt.Sprint("F", i)))
 		r.Source.Addr = netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(20 + i)}), 40000)
-		d := p.Route(context.Background(), r)
-		if refused := d.Response != nil; refused != (i == 2) {
-			t.Fatalf("REGISTER %d refused %v", i, refused)
+		return r
+	}
+	malformed := client(9)
+	malformed.Message.Header.Set("To", "<<")
+	if d := p.Route(context.Background(), malformed); d.Status != 400 {
+		t.Fatalf("malformed: %+v", d)
+	}
+	for i := range 3 {
+		d := p.Route(context.Background(), client(i))
+		if d.Response != nil {
+			t.Fatalf("REGISTER %d refused", i)
 		}
-		if d.Response != nil && (d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1") {
-			t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
+		if i == 0 {
+			d.OnResponse(context.Background(), parseResponse(t, okText(outboundContact+";expires=3600")))
 		}
 	}
+	d := p.Route(context.Background(), client(3))
+	if d.Response == nil || d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
+		t.Fatalf("a new registration past the shared rate: %+v", d)
+	}
+	// The registration of F0 refreshes from the share kept for it.
+	if d := p.Route(context.Background(), client(0)); d.Response != nil {
+		t.Fatalf("a refresh was refused: %d", d.Response.StatusCode)
+	}
+	if d := p.Route(context.Background(), client(0)); d.Response == nil {
+		t.Fatal("a refresh past the whole rate was routed")
+	}
 	p.metrics.Flush()
-	if !strings.Contains(out.String(), `"`+metricRegisterTaskLimit+`":1`) {
+	if !strings.Contains(out.String(), `"`+metricRegisterTaskLimit+`":2`) {
 		t.Errorf("metrics %s", out.String())
 	}
 }

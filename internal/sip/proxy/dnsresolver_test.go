@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -386,5 +387,84 @@ func TestDNSResolverSharesOneLookupOfANewName(t *testing.T) {
 	r.refreshes.Wait()
 	if n := dns.count(); n != 2 {
 		t.Fatalf("%d lookups, want one for the name not found", n)
+	}
+}
+
+// A lookup that answers no address is a failure, not an answer kept for
+// the TTL. A name with no answer at all is looked up again every 5 s, so a
+// service that comes up is found soon after (review of #198); one with a
+// stale answer in use backs off, doubling from 5 s to a minute (QA of #198).
+func TestDNSResolverBacksOffFailedLookups(t *testing.T) {
+	dns := &fakeDNS{answers: map[string][]netip.Addr{"empty.rcs.internal": nil}}
+	now := time.Unix(1_800_000_000, 0)
+	start := now
+	r := &DNSResolver{Lookup: dns.lookup, Namespace: "rcs.internal", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now: func() time.Time { return now }}
+	resolve := func(u sip.URI) error {
+		_, err := r.Resolve(context.Background(), u)
+		r.refreshes.Wait()
+		return err
+	}
+	// waits are the times between lookups of u over n lookups, resolving
+	// every second.
+	waits := func(u sip.URI, n int) []time.Duration {
+		var out []time.Duration
+		for range n {
+			from, before := now, dns.lookups
+			for dns.lookups == before {
+				now = now.Add(time.Second)
+				_ = resolve(u)
+			}
+			out = append(out, now.Sub(from))
+		}
+		return out
+	}
+	empty := mustURI("sip:empty.rcs.internal;transport=tcp")
+	if err := resolve(empty); !errors.Is(err, ErrUnresolvable) || !strings.Contains(err.Error(), "(not found)") {
+		t.Fatalf("an empty answer: %v", err)
+	}
+	if got, want := waits(empty, 4), []time.Duration{5 * time.Second, 5 * time.Second, 5 * time.Second, 5 * time.Second}; !slices.Equal(got, want) {
+		t.Fatalf("a name with no answer: waits %v, want %v", got, want)
+	}
+
+	// A service that comes up at 100 s is found by 105 s.
+	now = start
+	dns.answers["icscf.rcs.internal"] = nil
+	icscf := mustURI("sip:icscf.rcs.internal;transport=tcp")
+	for err := resolve(icscf); err != nil; err = resolve(icscf) {
+		if now.Sub(start) >= 100*time.Second {
+			dns.answers["icscf.rcs.internal"] = []netip.Addr{netip.MustParseAddr("10.0.3.7")}
+		}
+		if now.Sub(start) > 105*time.Second {
+			t.Fatal("not found by 105 s")
+		}
+		now = now.Add(time.Second)
+	}
+
+	// With the answer stale and the resolver failing, the waits double.
+	now = now.Add(DefaultDNSTTL)
+	dns.err = errors.New("timeout")
+	if got, want := waits(icscf, 6), []time.Duration{time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute}; !slices.Equal(got, want) {
+		t.Fatalf("a stale answer: waits %v, want %v", got, want)
+	}
+}
+
+// A lookup runs for at most refreshTimeout whatever the resolver does, so a
+// name whose resolver hangs is looked up again after that and its backoff.
+func TestDNSResolverEndsALookupAfterTenSeconds(t *testing.T) {
+	deadline := make(chan time.Duration, 1)
+	r := &DNSResolver{Namespace: "rcs.internal", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Lookup: func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				deadline <- 0
+				return nil, errors.New("no deadline")
+			}
+			deadline <- time.Until(dl)
+			return nil, &net.DNSError{Err: "i/o timeout", IsTimeout: true}
+		}}
+	_, _ = r.Resolve(context.Background(), mustURI("sip:hung.rcs.internal;transport=tcp"))
+	if d := <-deadline; d <= 0 || d > refreshTimeout || refreshTimeout != 10*time.Second {
+		t.Fatalf("a lookup may run %v, want at most 10 s", d)
 	}
 }

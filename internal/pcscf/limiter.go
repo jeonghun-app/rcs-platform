@@ -65,3 +65,32 @@ func (l *limiter) dropFull(t time.Time) bool {
 	}
 	return len(l.buckets) < maxLimitedAddrs
 }
+
+// taskLimit bounds the REGISTERs of all clients of a task together, at rate
+// a second with burst. New registrations may take refreshShare less of it;
+// what is left is kept for refreshes of registrations the task holds.
+type taskLimit struct {
+	shared, reserved *limiter
+}
+
+// refreshShare is the part of a task's REGISTER rate kept for refreshes, in
+// hundredths.
+const refreshShare = 25
+
+func newTaskLimit(rate, burst int, now func() time.Time) taskLimit {
+	sharedRate, sharedBurst := max(1, rate*(100-refreshShare)/100), max(1, burst*(100-refreshShare)/100)
+	return taskLimit{
+		shared:   newLimiter(sharedRate, sharedBurst, now),
+		reserved: newLimiter(max(1, rate-sharedRate), max(1, burst-sharedBurst), now),
+	}
+}
+
+// allow takes a token for a REGISTER, a refresh or not, and reports whether
+// there was one: a new registration from the shared part only, a refresh
+// from either.
+func (l taskLimit) allow(refresh bool) bool {
+	if l.shared.allow(netip.Addr{}) {
+		return true
+	}
+	return refresh && l.reserved.allow(netip.Addr{})
+}

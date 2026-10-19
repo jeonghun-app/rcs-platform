@@ -31,8 +31,9 @@ const DefaultDNSStale = 5 * time.Minute
 // a handful.
 const maxDNSNames = 256
 
-// minLookupBackoff and maxLookupBackoff bound the wait before a name whose
-// lookup failed is looked up again; refreshTimeout bounds a refresh in the
+// minLookupBackoff is the wait before a name whose lookup failed is looked
+// up again, which doubles up to maxLookupBackoff while an older answer is
+// still in use; refreshTimeout bounds a refresh in the
 // background.
 const (
 	minLookupBackoff = 5 * time.Second
@@ -272,7 +273,14 @@ func (r *DNSResolver) do(ctx context.Context, host string, done chan struct{}) {
 		return
 	}
 	a.failures++
-	backoff := min(minLookupBackoff<<(min(a.failures, 8)-1), maxLookupBackoff)
+	// A name with an answer still in use backs off, doubling, since its
+	// callers lose nothing by waiting; one with none is tried again soon, so
+	// a new stack or a recovering service is not left out for a minute.
+	stale := a.addrs != nil && t.Before(a.expires.Add(r.stale()))
+	backoff := minLookupBackoff
+	if stale {
+		backoff = min(minLookupBackoff<<(min(a.failures, 8)-1), maxLookupBackoff)
+	}
 	a.retryAt = t.Add(backoff)
 	a.err = fmt.Errorf("%w: lookup of %s failed (%s): %w", ErrUnresolvable, host, lookupFailure(err), err)
 	if a.failing.IsZero() {
@@ -282,7 +290,6 @@ func (r *DNSResolver) do(ctx context.Context, host string, done chan struct{}) {
 	if report {
 		a.reported = t
 	}
-	stale := a.addrs != nil && t.Before(a.expires.Add(r.stale()))
 	r.keepLocked(host, t, a)
 	r.mu.Unlock()
 	if !report {
