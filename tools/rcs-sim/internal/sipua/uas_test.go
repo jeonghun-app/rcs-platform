@@ -386,7 +386,19 @@ func TestNoACKEndsTheCalledPartysDialogWithBye(t *testing.T) {
 		t.Fatal("the dialog ended before 64*T1")
 	default:
 	}
-	clock.advance(step)
+	// The BYE goes unanswered for now: the clock must not wait for it.
+	hold := make(chan struct{})
+	defer close(hold)
+	s.mu.Lock()
+	s.holdBye = hold
+	s.mu.Unlock()
+	advanced := make(chan struct{})
+	go func() { clock.advance(step); close(advanced) }()
+	select {
+	case <-advanced:
+	case <-time.After(waitFor):
+		t.Fatal("the clock waited for the BYE's answer")
+	}
 	select {
 	case <-d.Done():
 	case <-time.After(waitFor):
@@ -404,6 +416,10 @@ func TestARequiredExtensionIsRefusedWith420(t *testing.T) {
 	res := cl.next(t)
 	if res.StatusCode != 420 || res.Header.Get("Unsupported") != "100rel, precondition" {
 		t.Fatalf("answered %d, Unsupported %q", res.StatusCode, res.Header.Get("Unsupported"))
+	}
+	// A random To tag, as every tag must be (§19.3).
+	if to, _ := res.Header.To(); len(to.Tag()) < 8 || to.Tag() == "rcs-sim" {
+		t.Fatalf("To tag %q", to.Tag())
 	}
 	select {
 	case <-calls:

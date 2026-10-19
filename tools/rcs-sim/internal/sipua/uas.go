@@ -286,7 +286,10 @@ func (d *Dialog) retransmit(tx *transaction.ServerTransaction, res *sip.Response
 		default:
 		}
 		close(d.ackGiveUp)
-		_, _ = d.Bye(context.Background())
+		// Off the timer's goroutine: the BYE may wait up to Timer F
+		// for its answer, and a clock that runs callbacks in turn would
+		// wait with it.
+		go func() { _, _ = d.Bye(context.Background()) }()
 	})
 	d.mu.Unlock()
 }

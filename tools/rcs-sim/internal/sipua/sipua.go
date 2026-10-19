@@ -916,7 +916,11 @@ func (t tu) Request(tx *transaction.ServerTransaction) {
 	if unsupported := unsupportedExtensions(req); len(unsupported) > 0 {
 		// RFC 3261 §8.2.2.3: this UA supports no extension a request may
 		// require, 100rel and precondition among them.
-		if res, err := sip.NewResponse(req, 420, "", "rcs-sim"); err == nil {
+		tag, err := t.ua.ids.Tag()
+		if err != nil {
+			return
+		}
+		if res, err := sip.NewResponse(req, 420, "", tag); err == nil {
 			if res.Header.Add("Unsupported", strings.Join(unsupported, ", ")) == nil {
 				_ = tx.Respond(res)
 			}
