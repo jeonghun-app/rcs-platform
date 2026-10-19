@@ -75,9 +75,9 @@ const (
 	// 48 ms of CPU, 33 to 70 ms of wall time; sets of other 4 KiB shapes
 	// took about 1.1 times as long as the baseline's in the same run or
 	// less, and sets of hundreds of short patterns about 2 to 2.3 times.
-	// Other hosts and loads differ, and the HSS compiles a profile several
-	// times on each write (once, after #120). Compile refuses a set that costs more, before parsing the
-	// pattern that would cross the bound when its source alone does; at
+	// Other hosts and loads differ; the HSS compiles a profile once on each
+	// write (#120). Compile refuses a set that costs more, before parsing
+	// the pattern that would cross the bound when its source alone does; at
 	// most one pattern's work, which MaxPatternBytes bounds, is spent past
 	// it.
 	MaxSetCompileCost = 1_000_000
@@ -128,7 +128,8 @@ func (e *LimitError) Error() string { return "ifc: request exceeds the evaluatio
 // Unwrap returns ErrEvaluationLimit.
 func (e *LimitError) Unwrap() error { return ErrEvaluationLimit }
 
-// Limits configures [CompileWithLimits]. Zero fields take the defaults.
+// Limits configures [CompileWithLimits] and [Set.WithLimits]. Zero fields
+// take the defaults.
 type Limits struct {
 	// MaxWork is the work budget of one evaluation; zero means
 	// DefaultMaxWork.
@@ -164,13 +165,20 @@ func (c Context) registered() bool {
 // criteria that Match and Next return share their trigger points with the
 // ones passed to Compile; treat them as read-only.
 type Set struct {
+	// compiled is what Compile built, never changed after: a Set derived
+	// with WithLimits shares it, so whatever is added to it carries over.
+	*compiled
+	maxWork   int
+	oversized atomic.Uint64
+	exhausted atomic.Uint64
+}
+
+// compiled is the immutable part of a Set.
+type compiled struct {
 	criteria []compiledCriteria
-	maxWork  int
 	// compileCost is what compiling the set took, in MaxSetCompileCost's
 	// units.
 	compileCost int
-	oversized   atomic.Uint64
-	exhausted   atomic.Uint64
 }
 
 type compiledCriteria struct {
@@ -220,6 +228,17 @@ func Compile(criteria []FilterCriteria) (*Set, error) {
 	return CompileWithLimits(criteria, Limits{})
 }
 
+// WithLimits returns a Set that evaluates s's compiled criteria within lim,
+// so a set compiled once can be evaluated under several budgets. Its
+// counters start at zero.
+func (s *Set) WithLimits(lim Limits) *Set {
+	w := &Set{compiled: s.compiled, maxWork: lim.MaxWork}
+	if w.maxWork <= 0 {
+		w.maxWork = DefaultMaxWork
+	}
+	return w
+}
+
 // CompileWithLimits is Compile with a work budget other than the default.
 func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	r := &reader{}
@@ -229,7 +248,7 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	s := &Set{criteria: make([]compiledCriteria, 0, len(criteria)), maxWork: lim.MaxWork}
+	s := &Set{compiled: &compiled{criteria: make([]compiledCriteria, 0, len(criteria))}, maxWork: lim.MaxWork}
 	if s.maxWork <= 0 {
 		s.maxWork = DefaultMaxWork
 	}
