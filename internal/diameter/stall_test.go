@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	goruntime "runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -81,14 +83,14 @@ const loadStall = 30 * time.Second
 // deadlocks both.
 //
 // The test waits on progress, the bytes either node reads, not on a time
-// (#113). Each node admits MaxInFlight of the other's requests to its
-// handler and answers the rest DIAMETER_TOO_BUSY at once, and an admitted
-// request's answer queues behind the node's own backlog of requests, about
-// 64 MB here: the admitted requests are answered only once both backlogs
-// have been written. On a loaded CI runner that took over the minute the
-// test once gave as RequestTimeout, and the 256 admitted requests of one
-// side timed out together (answered 3744, error 256). RequestTimeout is now
-// beyond the test's own timeout, so only a stall fails the test.
+// (#113). Each node admits at least MaxInFlight of the other's requests to
+// its handlers and answers the others DIAMETER_TOO_BUSY at once, and an
+// admitted request's answer queues behind the node's own backlog of
+// requests, about 64 MB here: the admitted requests are answered only once
+// both backlogs have been written, which on a loaded host can take minutes
+// (#117). RequestTimeout is beyond the test's own timeout, and the
+// watchdog, whose messages would count as progress, is held off for as
+// long, so only a stall of the nodes fails the test.
 func TestBidirectionalLoadOverLoopbackTCPCompletes(t *testing.T) {
 	const perSide, size = 2000, 32 << 10
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -99,13 +101,13 @@ func TestBidirectionalLoadOverLoopbackTCPCompletes(t *testing.T) {
 	quiet := slog.New(slog.DiscardHandler)
 	apps := []Application{{ID: appCx, VendorID: vendor3GPP}}
 	hss, err := NewNode(Config{OriginHost: hssHost, OriginRealm: testRealm, Logger: quiet, Applications: apps,
-		RequestTimeout: time.Hour,
-		Accept:         []PeerRule{{HostPattern: "scscf-*.rcs.test", Networks: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}}})
+		RequestTimeout: time.Hour, WatchdogInterval: time.Hour,
+		Accept: []PeerRule{{HostPattern: "scscf-*.rcs.test", Networks: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	scscf, err := NewNode(Config{OriginHost: scscfHost, OriginRealm: testRealm, Logger: quiet, Applications: apps,
-		RequestTimeout: time.Hour,
+		RequestTimeout: time.Hour, WatchdogInterval: time.Hour,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			c, err := (&net.Dialer{}).DialContext(ctx, network, address)
 			if err != nil {
@@ -138,24 +140,43 @@ func TestBidirectionalLoadOverLoopbackTCPCompletes(t *testing.T) {
 	payload := NewAVP(9999, 0, 0, make([]byte, size))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	// Outcomes by side and kind, so that a failure says which requests
+	// ended how: "hss->scscf 2001", "scscf->hss diameter: request timed
+	// out", and so on.
 	outcomes := map[string]int{}
-	send := func(from *Node, to *Peer) {
+	answered := 0
+	send := func(side string, from *Node, to *Peer) {
 		defer wg.Done()
 		ans, err := to.Send(context.Background(), from.NewRequest(cmdTest, appCx, from.NewSessionID(""), payload))
-		key := "error"
-		if err == nil {
-			if rc, _ := ans.ResultCode(); rc == ResultSuccess || rc == ResultTooBusy {
-				key = "answered"
-			}
+		key := side + " "
+		ok := false
+		if err != nil {
+			key += err.Error()
+		} else {
+			rc, _ := ans.ResultCode()
+			key += strconv.FormatUint(uint64(rc), 10)
+			ok = rc == ResultSuccess || rc == ResultTooBusy
 		}
 		mu.Lock()
 		outcomes[key]++
+		if ok {
+			answered++
+		}
 		mu.Unlock()
 	}
 	for range perSide {
 		wg.Add(2)
-		go send(scscf, toHSS)
-		go send(hss, toSCSCF)
+		go send("scscf->hss", scscf, toHSS)
+		go send("hss->scscf", hss, toSCSCF)
+	}
+	// failf fails the test with the outcomes so far and every goroutine's
+	// stack, so that a failure on a CI runner explains itself.
+	failf := func(format string, args ...any) {
+		buf := make([]byte, 4<<20)
+		buf = buf[:goruntime.Stack(buf, true)]
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf(format+"\noutcomes so far (%d answered of %d): %v\ngoroutines:\n%s", append(args, answered, 2*perSide, outcomes, buf)...)
 	}
 	finished := make(chan struct{})
 	go func() {
@@ -173,13 +194,11 @@ func TestBidirectionalLoadOverLoopbackTCPCompletes(t *testing.T) {
 			if now := read.Load(); now != last {
 				last, lastMoved = now, time.Now()
 			} else if time.Since(lastMoved) > loadStall {
-				mu.Lock()
-				defer mu.Unlock()
-				t.Fatalf("no byte moved for %v after %d bytes: outcomes so far %v of %d", loadStall, now, outcomes, 2*perSide)
+				failf("no byte moved for %v after %d bytes", loadStall, now)
 			}
 		}
 	}
-	if outcomes["answered"] != 2*perSide {
-		t.Fatalf("outcomes %v, want all %d answered", outcomes, 2*perSide)
+	if answered != 2*perSide {
+		failf("not every request was answered with success or DIAMETER_TOO_BUSY")
 	}
 }
