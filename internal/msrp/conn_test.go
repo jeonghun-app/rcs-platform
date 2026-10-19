@@ -1131,3 +1131,57 @@ func TestTheKeepAliveIntervalIsConfigurable(t *testing.T) {
 		t.Fatalf("got %+v, want a keep-alive", ka)
 	}
 }
+
+func TestNoKeepAliveGoesOutWhileTheBindingSendIsUnanswered(t *testing.T) {
+	// The binding SEND is itself the session's traffic; keep-alives sent
+	// while it waits for its answer would each name a session the relay
+	// may not know yet, and a slow relay closes a connection that names
+	// unknown sessions too often (MaxFailedBinds, #204).
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	done := make(chan error, 1)
+	go func() { done <- c.Open(context.Background(), s) }()
+	bind := p.next(t)
+	clock.Advance(5 * time.Second)
+	p.respond(t, bind, StatusNoSession)
+	if err := <-done; statusCode(err) != StatusNoSession {
+		t.Fatalf("Open = %v, want 481", err)
+	}
+	_ = c.Close()
+	for {
+		select {
+		case m, ok := <-p.msgs:
+			if !ok {
+				return
+			}
+			t.Fatalf("sent %s %s while the binding SEND was unanswered", m.TransactionID, m.Method)
+		case <-time.After(hangGuard):
+			t.Fatal("connection stayed open")
+		}
+	}
+}
+
+func TestKeepAlivesStartWhenTheBindingSendIsAnswered(t *testing.T) {
+	// The quiet interval counts from the answer, not from the SEND.
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	done := make(chan error, 1)
+	go func() { done <- c.Open(context.Background(), s) }()
+	bind := p.next(t)
+	clock.Advance(900 * time.Millisecond)
+	p.respond(t, bind, StatusOK)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(900 * time.Millisecond)
+	// Its answer comes first only if no keep-alive went out before it.
+	p.sendMessage(t, &Message{TransactionID: "syncsync", Method: MethodSend, ToPath: []URI{mustURI(t, clientURI)},
+		FromPath: []URI{mustURI(t, asURI)}, MessageID: "syncsync"})
+	expectResponse(t, p, "syncsync", StatusOK)
+	clock.Advance(time.Second)
+	if ka := p.next(t); ka.HasBody() || *ka.ByteRange != (ByteRange{1, 0, 0}) {
+		t.Fatalf("keep-alive %+v", ka)
+	}
+}
