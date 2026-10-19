@@ -1,10 +1,8 @@
 package dynamostore
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -15,32 +13,46 @@ import (
 // KeySize is the length of a challenge key (AES-256).
 const KeySize = 32
 
-// keyIDSize is the length of the key identifier a sealed document starts with.
-const keyIDSize = 4
+// maxKeyID bounds a key's identifier, which every sealed challenge carries.
+const maxKeyID = 64
 
-// sealer seals challenge documents with AES-256-GCM. A sealed document is the
-// sealing key's identifier, the nonce and the ciphertext. The identifier is a
-// hash of the key rather than its position in Config.ChallengeKeys, which
-// changes when a key rotates in.
+// ChallengeKey is one key that challenges are sealed or opened with, named by
+// an identifier the instances agree on (the Secrets Manager version, say).
+type ChallengeKey struct {
+	ID  string
+	Key []byte
+}
+
+// sealer seals challenge documents with AES-256-GCM under the seal key and
+// opens them with any key it knows. A sealed document is the length of the
+// key's identifier, the identifier, the nonce and the ciphertext, so the key a
+// document needs is found by name, whatever order the keys are configured in.
 type sealer struct {
-	keys []sealKey
+	sealWith *sealKey
+	keys     map[string]*sealKey
 }
 
 type sealKey struct {
-	id   []byte
+	id   string
 	aead cipher.AEAD
 }
 
-func newSealer(keys [][]byte) (*sealer, error) {
+func newSealer(keys []ChallengeKey, sealID string) (*sealer, error) {
 	if len(keys) == 0 {
 		return nil, errors.New("dynamostore: at least one challenge key is needed")
 	}
-	s := &sealer{}
+	s := &sealer{keys: map[string]*sealKey{}}
 	for _, k := range keys {
-		if len(k) != KeySize {
+		if k.ID == "" || len(k.ID) > maxKeyID {
+			return nil, fmt.Errorf("dynamostore: a challenge key needs an ID of 1 to %d bytes", maxKeyID)
+		}
+		if _, dup := s.keys[k.ID]; dup {
+			return nil, errors.New("dynamostore: two challenge keys share an ID")
+		}
+		if len(k.Key) != KeySize {
 			return nil, fmt.Errorf("dynamostore: a challenge key must be %d bytes", KeySize)
 		}
-		block, err := aes.NewCipher(k)
+		block, err := aes.NewCipher(k.Key)
 		if err != nil {
 			return nil, err
 		}
@@ -48,43 +60,50 @@ func newSealer(keys [][]byte) (*sealer, error) {
 		if err != nil {
 			return nil, err
 		}
-		sum := sha256.Sum256(append([]byte("scscf challenge key id\x00"), k...))
-		s.keys = append(s.keys, sealKey{id: sum[:keyIDSize], aead: aead})
+		s.keys[k.ID] = &sealKey{id: k.ID, aead: aead}
+	}
+	if sealID == "" && len(keys) == 1 {
+		sealID = keys[0].ID
+	}
+	s.sealWith = s.keys[sealID]
+	if s.sealWith == nil {
+		return nil, errors.New("dynamostore: the seal key is not among the challenge keys")
 	}
 	return s, nil
 }
 
-// seal encrypts plain with the first key. aad binds it to its item, so a
-// sealed document copied into another item does not open.
+// seal encrypts plain with the seal key. aad binds it to its item, so a sealed
+// document copied into another item does not open.
 func (s *sealer) seal(rand io.Reader, plain, aad []byte) ([]byte, error) {
-	k := s.keys[0]
+	k := s.sealWith
+	head := 1 + len(k.id)
 	ns := k.aead.NonceSize()
-	out := make([]byte, keyIDSize+ns, keyIDSize+ns+len(plain)+k.aead.Overhead())
-	copy(out, k.id)
-	if _, err := io.ReadFull(rand, out[keyIDSize:]); err != nil {
+	out := make([]byte, head+ns, head+ns+len(plain)+k.aead.Overhead())
+	out[0] = byte(len(k.id))
+	copy(out[1:], k.id)
+	if _, err := io.ReadFull(rand, out[head:]); err != nil {
 		return nil, fmt.Errorf("dynamostore: drawing a nonce: %w", err)
 	}
-	return k.aead.Seal(out, out[keyIDSize:], plain, aad), nil
+	return k.aead.Seal(out, out[head:], plain, aad), nil
 }
 
 // open decrypts a sealed document with the key it names.
 func (s *sealer) open(sealed, aad []byte) ([]byte, error) {
-	if len(sealed) < keyIDSize {
+	if len(sealed) < 1 || len(sealed) < 1+int(sealed[0]) {
 		return nil, fmt.Errorf("%w: sealed challenge too short", state.ErrInvalid)
 	}
-	for _, k := range s.keys {
-		if !bytes.Equal(k.id, sealed[:keyIDSize]) {
-			continue
-		}
-		ns := k.aead.NonceSize()
-		if len(sealed) < keyIDSize+ns+k.aead.Overhead() {
-			return nil, fmt.Errorf("%w: sealed challenge too short", state.ErrInvalid)
-		}
-		plain, err := k.aead.Open(nil, sealed[keyIDSize:keyIDSize+ns], sealed[keyIDSize+ns:], aad)
-		if err != nil {
-			return nil, fmt.Errorf("%w: challenge does not open", state.ErrInvalid)
-		}
-		return plain, nil
+	head := 1 + int(sealed[0])
+	k := s.keys[string(sealed[1:head])]
+	if k == nil {
+		return nil, fmt.Errorf("%w: challenge sealed with an unknown key", state.ErrInvalid)
 	}
-	return nil, fmt.Errorf("%w: challenge sealed with an unknown key", state.ErrInvalid)
+	ns := k.aead.NonceSize()
+	if len(sealed) < head+ns+k.aead.Overhead() {
+		return nil, fmt.Errorf("%w: sealed challenge too short", state.ErrInvalid)
+	}
+	plain, err := k.aead.Open(nil, sealed[head:head+ns], sealed[head+ns:], aad)
+	if err != nil {
+		return nil, fmt.Errorf("%w: challenge does not open", state.ErrInvalid)
+	}
+	return plain, nil
 }

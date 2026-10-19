@@ -18,7 +18,8 @@ import (
 // refused with ErrInvalid.
 func FuzzDecodeDocuments(f *testing.F) {
 	r := statetest.Registration(statetest.IMPI1, statetest.IMPU1, time.Hour, time.Minute)
-	r.UserData = []byte("<IMSSubscription/>")
+	r.Contacts[0].Q = 700
+	r.Deregistering = statetest.T0
 	reg, _ := encodeRegistration(r)
 	ch, _ := encodeChallenge(statetest.Challenge(statetest.IMPI1, "n", time.Minute))
 	sub, _ := encodeSubscription(statetest.Subscription("s1", statetest.IMPU1, time.Hour))
@@ -63,6 +64,7 @@ func FuzzDecodeDocuments(f *testing.F) {
 // normal makes times comparable: JSON keeps the instant, not the location.
 func normal(r *state.Registration) *state.Registration {
 	c := r.Clone()
+	c.Deregistering = c.Deregistering.UTC()
 	for i := range c.Contacts {
 		c.Contacts[i].Expires = c.Contacts[i].Expires.UTC()
 	}
@@ -72,7 +74,7 @@ func normal(r *state.Registration) *state.Registration {
 // FuzzOpenSealed checks that a sealed challenge opens only unchanged: any other
 // bytes are refused with ErrInvalid, never a panic.
 func FuzzOpenSealed(f *testing.F) {
-	s, err := newSealer([][]byte{testKey})
+	s, err := newSealer([]ChallengeKey{testKey}, "")
 	if err != nil {
 		f.Fatal(err)
 	}

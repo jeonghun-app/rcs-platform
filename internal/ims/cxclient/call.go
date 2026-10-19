@@ -73,14 +73,17 @@ func call[A any](ctx context.Context, c *Client, cmd string, common *cx.Request,
 	if common.SessionID == "" {
 		common.SessionID = c.sessions.Next("")
 	}
-	first := c.pick(nil)
+	first := c.pick()
 	if first == nil {
 		c.metrics.Count("cxclient."+cmd+".error.no_peer", 1)
 		return zero, ErrNoPeer
 	}
 	msg, ans, err := c.attempt(ctx, first, build, nil)
+	if timedOut(ctx, err) {
+		c.exclude(first)
+	}
 	if retryable(ctx, ans, err) {
-		if second := c.pick(first); second != nil {
+		if second := c.pickAfter(first); second != nil {
 			c.metrics.Count("cxclient."+cmd+".retry", 1)
 			if msg != nil {
 				_, ans, err = c.attempt(ctx, second, build, msg)
@@ -139,6 +142,13 @@ func retryable(ctx context.Context, ans *diameter.Message, err error) bool {
 	}
 	rc, ok := ans.ResultCode()
 	return ok && (rc == diameter.ResultTooBusy || rc == diameter.ResultUnableToDeliver)
+}
+
+// timedOut reports an attempt that ran out of RequestTimeout while the caller
+// still waits: the task may have stopped answering without closing its
+// connection.
+func timedOut(ctx context.Context, err error) bool {
+	return ctx.Err() == nil && (errors.Is(err, diameter.ErrTimeout) || errors.Is(err, context.DeadlineExceeded))
 }
 
 // errorKind names an error in a metric.

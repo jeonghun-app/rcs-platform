@@ -1,7 +1,11 @@
 package state_test
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -31,13 +35,41 @@ func TestPruneRemovesOnlyExpiredContacts(t *testing.T) {
 	}
 }
 
-func TestCredentialsAreNotPrinted(t *testing.T) {
+func TestCredentialsAreNotPrintedOrLogged(t *testing.T) {
 	c := statetest.Challenge(statetest.IMPI1, "n", time.Minute)
 	c.AKA.XRES = []byte("SECRET-XRES")
-	d := state.DigestChallenge{Realm: "r", Algorithm: "MD5", HA1: "SECRET-HA1"}
-	for _, s := range []string{fmt.Sprint(c.AKA), fmt.Sprintf("%v %+v %#v", *c.AKA, *c.AKA, *c.AKA), fmt.Sprintf("%v %+v %#v", d, d, d)} {
-		if strings.Contains(s, "SECRET") {
-			t.Errorf("printed a credential: %s", s)
+	d := &state.DigestChallenge{Realm: "r", Algorithm: "MD5", HA1: "SECRET-HA1"}
+	digest := statetest.Challenge(statetest.IMPI1, "m", time.Minute)
+	digest.AKA, digest.Digest = nil, d
+	var out bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&out, nil))
+	log.Info("x", "challenge", c, "ptr", &c, "aka", c.AKA, "akaValue", *c.AKA, "digest", d, "digestValue", *d, "dc", digest)
+	b, _ := json.Marshal(map[string]any{"c": c, "d": digest})
+	printed := []string{out.String(), string(b), fmt.Sprint(c.AKA), fmt.Sprintf("%v %+v %#v", *c.AKA, *c.AKA, *c.AKA),
+		fmt.Sprintf("%v %+v %#v", *d, *d, *d), fmt.Sprintf("%v %+v %#v", *c, *c, *c)}
+	for _, s := range printed {
+		for _, secret := range []string{"SECRET", "U0VDUkVU", statetest.IMPI1} {
+			if strings.Contains(s, secret) {
+				t.Errorf("printed or logged a credential or identity: %s", s)
+			}
 		}
+	}
+}
+
+func TestMemoryForgetsExpiredChallengesNobodyTook(t *testing.T) {
+	m := state.NewMemory()
+	for i := range 1023 {
+		if err := m.AddChallenge(context.Background(), statetest.Challenge(statetest.IMPI1, fmt.Sprint("old", i), time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The next one is issued after all of those expired.
+	late := statetest.Challenge(statetest.IMPI1, "late", 10*time.Minute)
+	late.Issued = statetest.T0.Add(5 * time.Minute)
+	if err := m.AddChallenge(context.Background(), late); err != nil {
+		t.Fatal(err)
+	}
+	if n := m.HeldChallenges(); n != 1 {
+		t.Errorf("%d challenges held after the purge, want 1", n)
 	}
 }

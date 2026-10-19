@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net"
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,24 +31,37 @@ const (
 	// the 32 s a SIP transaction waits (Timer B and F), and the HSS bounds its
 	// own work per request at 3 s.
 	DefaultRequestTimeout = 5 * time.Second
-	// DefaultMaxPeers bounds the HSS tasks connected at once, so a DNS
+	// DefaultMaxPeers bounds the HSS tasks connected at once, so a discovery
 	// answer, however large, cannot make the client open connections without
 	// limit.
 	DefaultMaxPeers = 32
+	// DefaultTimeoutExclusion is how long a task whose attempt timed out gets
+	// no first attempts. A task that stops answering without closing its
+	// connection stays OKAY for up to two watchdog intervals (RFC 3539
+	// §3.4.1), a minute by default; without this, every request it got first
+	// in that time would wait out RequestTimeout before its retry.
+	DefaultTimeoutExclusion = 30 * time.Second
+	// absencesBeforeRemoval is how many discovery answers in a row must leave
+	// a task out, its connection down as well, before the client drops it. A
+	// DNS answer names only some of the tasks when there are many (see
+	// DNSDiscovery), and a task that answers is never dropped.
+	absencesBeforeRemoval = 3
 )
-
-// Resolver resolves the HSS service name; *net.Resolver has it.
-type Resolver interface {
-	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
-}
 
 // Metrics is what the client records; *runtime.Metrics has it. No name carries
 // an identity.
 //
-//	cxclient.peers                 available HSS peers, sampled at every resolve
-//	                               (a gauge: read Average or Minimum, not Sum)
-//	cxclient.peer.added, .removed  HSS tasks that appeared in or left DNS
-//	cxclient.resolve.error         failed resolutions; the peers are kept
+//	cxclient.peers                 available HSS peers, sampled at every
+//	                               discovery (a gauge: read Average or Minimum,
+//	                               not Sum)
+//	cxclient.peers.known           HSS tasks the client keeps a connection
+//	                               to, sampled likewise: below the HSS task
+//	                               count means RTR and PPR can be lost
+//	cxclient.peer.added, .removed  HSS tasks connected and dropped
+//	cxclient.resolve.error         failed discoveries; the peers are kept
+//	cxclient.peer.excluded         tasks excluded after an attempt timed out
+//	cxclient.RTR.refused, .PPR.refused  requests from a peer whose Origin-Host
+//	                               does not match HSSHostPattern
 //	cxclient.<CMD>.<result>        answers by command and result code, or
 //	                               error.<kind> when there was none
 //	cxclient.<CMD>.latency         time from the first attempt to the outcome
@@ -73,17 +86,28 @@ type Config struct {
 	// icscf.
 	ServerName string
 
-	// HSS is the name every HSS task is registered under in Cloud Map,
-	// hss.<namespace>, and Port the Diameter port of the tasks.
-	HSS  string
-	Port int
-	// Resolver resolves HSS; nil is net.DefaultResolver.
-	Resolver        Resolver
+	// Discovery finds the HSS tasks: CloudMapDiscovery on AWS, which lists
+	// every task. Nil resolves HSS, the name the tasks are registered under,
+	// hss.<namespace>, with Resolver (net.DefaultResolver when nil), which
+	// suits the compose stack. Port is the Diameter port of the tasks.
+	Discovery Discovery
+	HSS       string
+	Resolver  Resolver
+	Port      int
+	// ResolveInterval is how often the tasks are discovered again.
 	ResolveInterval time.Duration
 	// MaxPeers bounds the HSS tasks connected at once.
 	MaxPeers int
-	// RequestTimeout bounds each attempt of a request.
-	RequestTimeout time.Duration
+	// HSSHostPattern, if set, is the Origin-Host every HSS task must have,
+	// such as hss-*.rcs.local ('*' matches within one label). A peer that
+	// claims another gets no requests, and its RTR and PPR are refused: the
+	// HSS can deregister any user and change any profile, so the connection
+	// that carries them should be to an HSS (threat model T1).
+	HSSHostPattern string
+	// RequestTimeout bounds each attempt of a request, and TimeoutExclusion
+	// how long a task whose attempt timed out gets no first attempts.
+	RequestTimeout   time.Duration
+	TimeoutExclusion time.Duration
 
 	// Node configures the Diameter node of each connection: watchdog,
 	// timeouts, HostIPAddresses, and the Clock, Random and Dial that tests
@@ -128,14 +152,17 @@ type Client struct {
 	metrics  Metrics
 	clock    diameter.Clock
 
+	discovery Discovery
+
 	mu     sync.Mutex
 	peers  map[netip.Addr]*hssPeer
 	closed bool
 
-	next     atomic.Uint64
-	stop     chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	next atomic.Uint64
+	// ctx ends with Close, and with it a discovery in progress.
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // hssPeer is one HSS task. Each has a node of its own because a node keeps
@@ -146,6 +173,10 @@ type hssPeer struct {
 	addr netip.Addr
 	node *diameter.Node
 	peer *diameter.Peer
+
+	// Guarded by Client.mu.
+	absences      int
+	excludedUntil time.Time
 }
 
 type systemClock struct{}
@@ -163,17 +194,20 @@ func (discardMetrics) Timing(string, time.Duration) {}
 // every ResolveInterval; requests fail with ErrNoPeer until a task is
 // connected.
 func New(cfg Config) (*Client, error) {
-	if cfg.HSS == "" || !identity.IsDomainName(cfg.HSS) {
-		return nil, errors.New("cxclient: HSS must be a domain name")
+	if cfg.Discovery == nil {
+		if cfg.HSS == "" || !identity.IsDomainName(cfg.HSS) {
+			return nil, errors.New("cxclient: HSS must be a domain name")
+		}
+		cfg.Discovery = DNSDiscovery{Resolver: cfg.Resolver, Name: cfg.HSS}
+	}
+	if cfg.HSSHostPattern != "" && !identity.IsDomainName(strings.ReplaceAll(cfg.HSSHostPattern, "*", "x")) {
+		return nil, errors.New("cxclient: HSSHostPattern must be a domain name with '*' in its labels")
 	}
 	if cfg.DestinationRealm == "" {
 		return nil, errors.New("cxclient: DestinationRealm is required")
 	}
 	if cfg.Port == 0 {
 		cfg.Port = DefaultPort
-	}
-	if cfg.Resolver == nil {
-		cfg.Resolver = net.DefaultResolver
 	}
 	if cfg.ResolveInterval <= 0 {
 		cfg.ResolveInterval = DefaultResolveInterval
@@ -183,6 +217,9 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = DefaultRequestTimeout
+	}
+	if cfg.TimeoutExclusion <= 0 {
+		cfg.TimeoutExclusion = DefaultTimeoutExclusion
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
@@ -223,15 +260,16 @@ func New(cfg Config) (*Client, error) {
 	_ = probe.Shutdown(context.Background())
 	cfg.Node = n
 	c := &Client{
-		cfg:      cfg,
-		sessions: diameter.NewSessionIDGenerator(cfg.OriginHost, clock.Now()),
-		dict:     dict,
-		log:      cfg.Logger,
-		metrics:  cfg.Metrics,
-		clock:    clock,
-		peers:    map[netip.Addr]*hssPeer{},
-		stop:     make(chan struct{}),
+		cfg:       cfg,
+		sessions:  diameter.NewSessionIDGenerator(cfg.OriginHost, clock.Now()),
+		dict:      dict,
+		log:       cfg.Logger,
+		metrics:   cfg.Metrics,
+		clock:     clock,
+		discovery: cfg.Discovery,
+		peers:     map[netip.Addr]*hssPeer{},
 	}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.wg.Add(1)
 	go c.resolveLoop()
 	return c, nil
@@ -240,7 +278,7 @@ func New(cfg Config) (*Client, error) {
 func (c *Client) resolveLoop() {
 	defer c.wg.Done()
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ResolveInterval)
+		ctx, cancel := context.WithTimeout(c.ctx, c.cfg.ResolveInterval)
 		// A failure is logged and counted by Refresh; the peers stay.
 		_ = c.Refresh(ctx)
 		cancel()
@@ -248,23 +286,24 @@ func (c *Client) resolveLoop() {
 		t := c.clock.AfterFunc(c.cfg.ResolveInterval, func() { close(wake) })
 		select {
 		case <-wake:
-		case <-c.stop:
+		case <-c.ctx.Done():
 			t.Stop()
 			return
 		}
 	}
 }
 
-// Refresh resolves the HSS name now and makes the peers follow the answer:
-// a connection to every new address, and none to an address that has gone.
-// A failed resolution leaves the peers as they are, since an HSS task does not
-// stop because DNS does, and so does an empty answer.
+// Refresh discovers the HSS tasks now and makes the peers follow: a
+// connection to every new address, up to MaxPeers. A task stays as long as its
+// connection does; one left out of absencesBeforeRemoval answers in a row
+// whose connection is down too is dropped. A failed or empty answer leaves the
+// peers as they are, since an HSS task does not stop because discovery does.
 func (c *Client) Refresh(ctx context.Context) error {
-	addrs, err := c.cfg.Resolver.LookupNetIP(ctx, "ip", c.cfg.HSS)
+	addrs, err := c.discovery.HSSAddresses(ctx)
 	if err != nil {
 		c.metrics.Count("cxclient.resolve.error", 1)
-		c.log.Warn("cxclient: resolving the HSS failed; keeping the peers", slog.String("name", c.cfg.HSS))
-		return fmt.Errorf("cxclient: resolving %s: %w", c.cfg.HSS, err)
+		c.log.Warn("cxclient: discovering the HSS failed; keeping the peers")
+		return fmt.Errorf("cxclient: discovering the HSS: %w", err)
 	}
 	want := map[netip.Addr]bool{}
 	for _, a := range addrs {
@@ -272,13 +311,9 @@ func (c *Client) Refresh(ctx context.Context) error {
 	}
 	if len(want) == 0 {
 		c.metrics.Count("cxclient.resolve.error", 1)
-		return fmt.Errorf("cxclient: %s has no address", c.cfg.HSS)
+		return errors.New("cxclient: discovery found no HSS address")
 	}
 	sorted := slices.SortedFunc(maps.Keys(want), func(a, b netip.Addr) int { return a.Compare(b) })
-	if len(sorted) > c.cfg.MaxPeers {
-		c.log.Warn("cxclient: more HSS addresses than MaxPeers; ignoring the rest", slog.Int("addresses", len(sorted)))
-		sorted = sorted[:c.cfg.MaxPeers]
-	}
 
 	c.mu.Lock()
 	if c.closed {
@@ -286,19 +321,25 @@ func (c *Client) Refresh(ctx context.Context) error {
 		return ErrClosed
 	}
 	var gone []*hssPeer
-	keep := map[netip.Addr]bool{}
-	for _, a := range sorted {
-		keep[a] = true
-	}
 	for a, p := range c.peers {
-		if !keep[a] {
+		if want[a] {
+			p.absences = 0
+			continue
+		}
+		p.absences++
+		if p.absences >= absencesBeforeRemoval && !p.peer.Available() {
 			gone = append(gone, p)
 			delete(c.peers, a)
 		}
 	}
 	var errs error
+	ignored := 0
 	for _, a := range sorted {
 		if _, ok := c.peers[a]; ok {
+			continue
+		}
+		if len(c.peers) >= c.cfg.MaxPeers {
+			ignored++
 			continue
 		}
 		p, err := c.connect(a)
@@ -310,16 +351,21 @@ func (c *Client) Refresh(ctx context.Context) error {
 		c.metrics.Count("cxclient.peer.added", 1)
 		c.log.Info("cxclient: HSS task added", slog.String("address", a.String()))
 	}
+	known := len(c.peers)
 	// Counted while closed is false under mu, so Close waits for them.
 	c.wg.Add(len(gone))
 	c.mu.Unlock()
 
+	if ignored > 0 {
+		c.log.Warn("cxclient: more HSS tasks than MaxPeers; ignoring the rest", slog.Int("ignored", ignored))
+	}
 	for _, p := range gone {
 		c.metrics.Count("cxclient.peer.removed", 1)
 		c.log.Info("cxclient: HSS task removed", slog.String("address", p.addr.String()))
 		c.shutdown(p)
 	}
-	c.metrics.Count("cxclient.peers", int64(len(c.available())))
+	c.metrics.Count("cxclient.peers", int64(len(c.usable(nil))))
+	c.metrics.Count("cxclient.peers.known", int64(known))
 	return errs
 }
 
@@ -330,11 +376,11 @@ func (c *Client) connect(a netip.Addr) (*hssPeer, error) {
 		return nil, err
 	}
 	n.SetErrorAVPs(cx.ApplicationID, cx.ErrorAVPs)
-	n.HandleFunc(cx.ApplicationID, cx.CodeRegistrationTermination, func(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
-		return c.serveRTR(ctx, n, req)
+	n.HandleFunc(cx.ApplicationID, cx.CodeRegistrationTermination, func(ctx context.Context, from *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+		return c.serveRTR(ctx, n, from, req)
 	})
-	n.HandleFunc(cx.ApplicationID, cx.CodePushProfile, func(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
-		return c.servePPR(ctx, n, req)
+	n.HandleFunc(cx.ApplicationID, cx.CodePushProfile, func(ctx context.Context, from *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+		return c.servePPR(ctx, n, from, req)
 	})
 	peer, err := n.Connect(diameter.PeerConfig{
 		Address: netip.AddrPortFrom(a, uint16(c.cfg.Port)).String(),
@@ -358,28 +404,101 @@ func (c *Client) shutdown(p *hssPeer) {
 	}()
 }
 
-// available returns the peers that can take a request, in address order.
-func (c *Client) available() []*hssPeer {
+// usable returns the peers that can take a first attempt now, in address
+// order: available (RFC 3539 OKAY), with the expected Origin-Host, and not
+// excluded after a timeout. With every available peer excluded, they are
+// usable all the same: a slow answer beats none.
+func (c *Client) usable(not *hssPeer) []*hssPeer {
+	now := c.clock.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var out []*hssPeer
+	var ok, excluded []*hssPeer
 	for _, p := range c.peers {
-		if p.peer.Available() {
-			out = append(out, p)
+		if p == not || !p.peer.Available() || !c.hostOK(p.peer.Host()) {
+			continue
 		}
+		if now.Before(p.excludedUntil) {
+			excluded = append(excluded, p)
+			continue
+		}
+		ok = append(ok, p)
 	}
-	slices.SortFunc(out, func(a, b *hssPeer) int { return a.addr.Compare(b.addr) })
-	return out
+	if len(ok) == 0 {
+		ok = excluded
+	}
+	slices.SortFunc(ok, func(a, b *hssPeer) int { return a.addr.Compare(b.addr) })
+	return ok
 }
 
-// pick chooses the next available peer other than not, in turn, so the load
+// pick chooses the peer for a first attempt, the next in turn so the load
 // spreads over the tasks.
-func (c *Client) pick(not *hssPeer) *hssPeer {
-	ps := slices.DeleteFunc(c.available(), func(p *hssPeer) bool { return p == not })
+func (c *Client) pick() *hssPeer {
+	ps := c.usable(nil)
 	if len(ps) == 0 {
 		return nil
 	}
 	return ps[c.next.Add(1)%uint64(len(ps))]
+}
+
+// pickAfter chooses the peer for the retry of an attempt on failed: the next
+// in address order after it. It leaves the turn alone, so a task that fails
+// does not also shift the next first attempt back to itself.
+func (c *Client) pickAfter(failed *hssPeer) *hssPeer {
+	ps := c.usable(failed)
+	if len(ps) == 0 {
+		return nil
+	}
+	for _, p := range ps {
+		if p.addr.Compare(failed.addr) > 0 {
+			return p
+		}
+	}
+	return ps[0]
+}
+
+// exclude keeps p from first attempts for TimeoutExclusion.
+func (c *Client) exclude(p *hssPeer) {
+	c.mu.Lock()
+	p.excludedUntil = c.clock.Now().Add(c.cfg.TimeoutExclusion)
+	c.mu.Unlock()
+	c.metrics.Count("cxclient.peer.excluded", 1)
+}
+
+// hostOK reports whether host matches HSSHostPattern, if one is set.
+func (c *Client) hostOK(host string) bool {
+	return c.cfg.HSSHostPattern == "" || matchHost(c.cfg.HSSHostPattern, host)
+}
+
+// matchHost matches a host against a pattern label by label, without regard
+// to case; '*' in a label matches any run of characters within that label.
+func matchHost(pattern, host string) bool {
+	pl, hl := strings.Split(strings.ToLower(pattern), "."), strings.Split(strings.ToLower(host), ".")
+	if len(pl) != len(hl) {
+		return false
+	}
+	for i, p := range pl {
+		prefix, suffix, wild := strings.Cut(p, "*")
+		if !wild {
+			if p != hl[i] {
+				return false
+			}
+			continue
+		}
+		if strings.Contains(suffix, "*") || len(hl[i]) < len(prefix)+len(suffix) ||
+			!strings.HasPrefix(hl[i], prefix) || !strings.HasSuffix(hl[i], suffix) {
+			return false
+		}
+	}
+	return true
+}
+
+// Ready reports whether a request can be sent now: some HSS task is connected
+// and available. It is the client's part of /readyz.
+func (c *Client) Ready() error {
+	if len(c.usable(nil)) == 0 {
+		return ErrNoPeer
+	}
+	return nil
 }
 
 // PeerStatus describes one HSS task.
@@ -401,21 +520,30 @@ func (c *Client) Peers() []PeerStatus {
 	return out
 }
 
-// Close stops resolving and disconnects from every HSS task (DPR), waiting at
-// most until ctx ends.
+// Close stops discovering, ending a discovery in progress, and disconnects
+// from every HSS task (DPR) at once, waiting at most until ctx ends.
 func (c *Client) Close(ctx context.Context) error {
-	c.stopOnce.Do(func() { close(c.stop) })
+	c.cancel()
 	c.mu.Lock()
 	c.closed = true
 	peers := c.peers
 	c.peers = map[netip.Addr]*hssPeer{}
 	c.mu.Unlock()
+	var mu sync.Mutex
 	var errs error
+	var all sync.WaitGroup
 	for _, p := range peers {
-		if err := p.node.Shutdown(ctx); err != nil && !errors.Is(err, diameter.ErrNodeClosed) {
-			errs = errors.Join(errs, err)
-		}
+		all.Add(1)
+		go func() {
+			defer all.Done()
+			if err := p.node.Shutdown(ctx); err != nil && !errors.Is(err, diameter.ErrNodeClosed) {
+				mu.Lock()
+				errs = errors.Join(errs, err)
+				mu.Unlock()
+			}
+		}()
 	}
+	all.Wait()
 	done := make(chan struct{})
 	go func() {
 		c.wg.Wait()
@@ -431,13 +559,17 @@ func (c *Client) Close(ctx context.Context) error {
 
 // serveRTR answers a Registration-Termination-Request (TS 29.228 §6.1.3) with
 // the result of OnRTR.
-func (c *Client) serveRTR(ctx context.Context, n *diameter.Node, req *diameter.Message) (*diameter.Message, error) {
+func (c *Client) serveRTR(ctx context.Context, n *diameter.Node, from *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
 	r, err := cx.ParseRTR(req)
 	if err != nil {
 		return nil, err
 	}
 	res := cx.ResultCode(diameter.ResultUnableToComply)
-	if c.cfg.OnRTR != nil {
+	switch {
+	case !c.hostOK(from.Host()):
+		c.metrics.Count("cxclient.RTR.refused", 1)
+		c.log.Warn("cxclient: RTR from a peer that is not an HSS", slog.String("peer", from.Host()))
+	case c.cfg.OnRTR != nil:
 		res = c.cfg.OnRTR(ctx, r)
 	}
 	c.metrics.Count("cxclient.RTR."+resultName(res), 1)
@@ -446,13 +578,17 @@ func (c *Client) serveRTR(ctx context.Context, n *diameter.Node, req *diameter.M
 
 // servePPR answers a Push-Profile-Request (TS 29.228 §6.2.2) with the result
 // of OnPPR.
-func (c *Client) servePPR(ctx context.Context, n *diameter.Node, req *diameter.Message) (*diameter.Message, error) {
+func (c *Client) servePPR(ctx context.Context, n *diameter.Node, from *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
 	r, err := cx.ParsePPR(req)
 	if err != nil {
 		return nil, err
 	}
 	res := cx.ResultCode(diameter.ResultUnableToComply)
-	if c.cfg.OnPPR != nil {
+	switch {
+	case !c.hostOK(from.Host()):
+		c.metrics.Count("cxclient.PPR.refused", 1)
+		c.log.Warn("cxclient: PPR from a peer that is not an HSS", slog.String("peer", from.Host()))
+	case c.cfg.OnPPR != nil:
 		res = c.cfg.OnPPR(ctx, r)
 	}
 	c.metrics.Count("cxclient.PPR."+resultName(res), 1)

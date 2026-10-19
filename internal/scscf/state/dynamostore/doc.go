@@ -9,12 +9,17 @@
 //
 // registrations, partition key pk (string = canonical IMPU):
 //
-//	version  number   optimistic concurrency
+//	version  number   optimistic concurrency; a new item starts at a random
+//	                  value, so a deleted and recreated one never repeats one
 //	doc      binary   the registration as JSON
 //	writer   string   random token of the write that stored it
 //	impi     string   key of impi-index (keys only): RegistrationsOf
 //	shard    string   0 to 15, from the key
-//	expires  number   earliest contact expiry, Unix seconds; 0 without contacts
+//	expires  number   SweepAt in Unix seconds: the earliest contact expiry, or
+//	                  without contacts the end of the deregistration lease
+//
+// The same table holds the profiles, partition key profile#<IMPI>, with the
+// User-Data in doc and no other attribute, so no index lists them.
 //
 // with global secondary indexes impi-index (partition impi) and expiry-index
 // (partition shard, sort expires), both keys only. The shard spreads the
@@ -22,7 +27,8 @@
 // touch it, never meet one partition's throughput limit.
 //
 // auth-challenges, partition key pk (string = IMPI), sort key sk (string =
-// nonce): doc (binary, the challenge sealed with AES-256-GCM), writer, and
+// nonce): doc (binary, the challenge sealed with AES-256-GCM: the key's ID,
+// the nonce, the ciphertext), writer, and
 // expires (number), which is also the table's TTL attribute: DynamoDB removes
 // challenges nobody answered, and a read checks the expiry itself because TTL
 // deletion can lag by days.
@@ -34,7 +40,12 @@
 //
 // Reads are strongly consistent; the indexes are eventually consistent, so
 // every item an index names is read again from the table before it is
-// returned.
+// returned. A key no item can have (empty, or over state.MaxKey or
+// state.MaxNonce) is answered ErrNotFound without a request, and an item over
+// state.MaxItemBytes is refused with ErrInvalid before one: DynamoDB would
+// refuse both with a ValidationException of its own.
+//
+// docs/scscf-state.md has the capacity, cost and key rotation for operators.
 //
 // # Idempotent writes
 //

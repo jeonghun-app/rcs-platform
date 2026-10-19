@@ -66,6 +66,16 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"NotifyCountersNeverRepeatAcrossInstances", testNotifyCounters},
 		{"NextNotifyInvalidatesEarlierReads", testNotifyVersion},
 		{"ConcurrentSweepsEndEverySubscriptionOnce", testSubscriptionSweep},
+		{"ASweepFromAStaleListingKeepsAFreshRegistration", testSweepFromAStaleListing},
+		{"ASaveFromBeforeADeleteDoesNotOverwriteANewRegistration", testStaleSaveAfterRecreate},
+		{"ASubscriptionDeletedAndCreatedAgainRefusesAnOldSave", testStaleSubscriptionSave},
+		{"KeysNoItemCanHaveAreNotFound", testImpossibleKeys},
+		{"ItemsOverTheSizeLimitAreRefusedByEveryBackend", testItemSize},
+		{"BoundaryValuesAreTheSameEverywhere", testBoundaries},
+		{"AFailedDeregistrationIsRetriedAfterTheLease", testSweepRetry},
+		{"AClaimedSubscriptionKeepsItsGraceFromTheClaim", testTerminatedGrace},
+		{"NotifyCountersStopAtTheirLimit", testCounterLimit},
+		{"ProfilesAreKeptApartFromRegistrations", testProfiles},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,12 +147,12 @@ func Registration(impi, impu string, expiries ...time.Duration) *state.Registrat
 
 func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour, 2*time.Hour)
-	r.UserData = []byte("<IMSSubscription/>")
+	r.Contacts[1].Q = 500
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
-	if saved.Version != 1 {
-		t.Errorf("version after create = %d, want 1", saved.Version)
+	if saved.Version == 0 {
+		t.Error("a saved registration has version 0")
 	}
-	r.Version = 1
+	r.Version = saved.Version
 	for _, s := range []state.Store{a, b} {
 		got := must(s.Registration(ctx(t), IMPU1))(t)
 		if !reflect.DeepEqual(got, r) {
@@ -161,8 +171,8 @@ func testRegistrationVersion(t *testing.T, a, b state.Store, _ Options) {
 	next := v1.Clone()
 	next.Contacts[0].CSeq++
 	v2 := must(b.SaveRegistration(ctx(t), next))(t)
-	if v2.Version != 2 {
-		t.Errorf("version after update = %d, want 2", v2.Version)
+	if v2.Version == v1.Version {
+		t.Error("an update kept the version")
 	}
 	_, err := a.SaveRegistration(ctx(t), v1)
 	wantErr(t, err, state.ErrConflict)
@@ -273,11 +283,12 @@ func testRegistrationSweep(t *testing.T, a, b state.Store, o Options) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, err := state.SweepRegistrations(ctx(t), s, T0, 10, func(before, after *state.Registration) {
+				_, err := state.SweepRegistrations(ctx(t), s, T0, 10, func(before, after *state.Registration) error {
 					mu.Lock()
 					defer mu.Unlock()
 					handled[before.IMPU]++
 					left[before.IMPU] = len(after.Contacts)
+					return nil
 				})
 				if err != nil {
 					t.Error(err)
@@ -337,7 +348,7 @@ func testNoAliasing(t *testing.T, a, _ state.Store, _ Options) {
 // Challenge returns an AKA challenge of impi expiring after ttl.
 func Challenge(impi, nonce string, ttl time.Duration) *state.Challenge {
 	return &state.Challenge{
-		IMPI: impi, Nonce: nonce, IMPU: IMPU1, Expires: T0.Add(ttl),
+		IMPI: impi, Nonce: nonce, IMPU: IMPU1, Issued: T0.Add(ttl - time.Minute), Expires: T0.Add(ttl),
 		AKA: &state.AKAVector{
 			RAND: []byte("0123456789abcdef"), AUTN: []byte("fedcba9876543210"),
 			XRES: []byte("xres0123"), CK: []byte("ck-0123456789abc"), IK: []byte("ik-0123456789abc"),
@@ -351,7 +362,7 @@ func testChallengeRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 		t.Fatal(err)
 	}
 	digest := &state.Challenge{
-		IMPI: IMPI1, Nonce: "nonce-digest", IMPU: IMPU1, Expires: T0.Add(time.Minute),
+		IMPI: IMPI1, Nonce: "nonce-digest", IMPU: IMPU1, Issued: T0, Expires: T0.Add(time.Minute),
 		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", Opaque: "op", HA1: "0123456789abcdef0123456789abcdef"},
 	}
 	if err := a.AddChallenge(ctx(t), digest); err != nil {
@@ -359,12 +370,12 @@ func testChallengeRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	}
 	wantErr(t, b.AddChallenge(ctx(t), Challenge(IMPI1, "nonce-aka", time.Minute)), state.ErrExists)
 	for _, want := range []*state.Challenge{aka, digest} {
-		got := must(b.Challenge(ctx(t), want.IMPI, want.Nonce, T0))(t)
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("the second instance read %+v, want %+v", got, want)
+		got := must(b.TakeChallenge(ctx(t), want.IMPI, want.Nonce, T0))(t)
+		if !sameChallenge(got, want) {
+			t.Errorf("the second instance took %#v, want %#v", got, want)
 		}
 	}
-	_, err := b.Challenge(ctx(t), IMPI2, "nonce-aka", T0)
+	_, err := b.TakeChallenge(ctx(t), IMPI2, "nonce-aka", T0)
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -389,8 +400,8 @@ func testChallengeTakenOnce(t *testing.T, a, b state.Store, _ Options) {
 					t.Error(err)
 					return
 				}
-				if !reflect.DeepEqual(got, c) {
-					t.Errorf("took %+v, want %+v", got, c)
+				if !sameChallenge(got, c) {
+					t.Errorf("took %#v, want %#v", got, c)
 				}
 				mu.Lock()
 				taken++
@@ -402,7 +413,7 @@ func testChallengeTakenOnce(t *testing.T, a, b state.Store, _ Options) {
 	if taken != 1 {
 		t.Fatalf("the challenge was taken %d times, want once", taken)
 	}
-	_, err := a.Challenge(ctx(t), IMPI1, "nonce", T0)
+	_, err := a.TakeChallenge(ctx(t), IMPI1, "nonce", T0)
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -410,10 +421,7 @@ func testChallengeExpiry(t *testing.T, a, b state.Store, _ Options) {
 	if err := a.AddChallenge(ctx(t), Challenge(IMPI1, "nonce", time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	later := T0.Add(time.Minute)
-	_, err := b.Challenge(ctx(t), IMPI1, "nonce", later)
-	wantErr(t, err, state.ErrNotFound)
-	_, err = b.TakeChallenge(ctx(t), IMPI1, "nonce", later)
+	_, err := b.TakeChallenge(ctx(t), IMPI1, "nonce", T0.Add(time.Minute))
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -432,7 +440,7 @@ func Subscription(id, impu string, ttl time.Duration) *state.Subscription {
 func testSubscriptionRoundTrip(t *testing.T, a, b state.Store, o Options) {
 	s := Subscription("s1", IMPU1, time.Hour)
 	saved := must(a.SaveSubscription(ctx(t), s))(t)
-	s.Version = 1
+	s.Version = saved.Version
 	if !reflect.DeepEqual(saved, s) {
 		t.Errorf("saved %+v, want %+v", saved, s)
 	}

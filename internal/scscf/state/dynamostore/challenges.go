@@ -73,19 +73,15 @@ func (d *Dynamo) decodeChallengeItem(item map[string]types.AttributeValue, impi,
 	return c, nil
 }
 
-// Challenge implements state.Challenges.
-func (d *Dynamo) Challenge(ctx context.Context, impi, nonce string, now time.Time) (*state.Challenge, error) {
-	item, err := d.get(ctx, d.challenges, challengeKey(impi, nonce), "get challenge")
-	if err != nil {
-		return nil, err
-	}
-	return d.decodeChallengeItem(item, impi, nonce, now)
-}
-
 // TakeChallenge implements state.Challenges with one conditional delete that
 // returns the deleted item: DynamoDB applies it to the item once, so of two
 // instances taking the same challenge only one gets it back.
 func (d *Dynamo) TakeChallenge(ctx context.Context, impi, nonce string, now time.Time) (*state.Challenge, error) {
+	if !state.KeyOK(impi, state.MaxKey) || !state.KeyOK(nonce, state.MaxNonce) {
+		// A key DynamoDB would refuse names no challenge, such as the empty
+		// nonce of a first REGISTER (TS 24.229 §5.1.1.2.1).
+		return nil, fmt.Errorf("dynamostore: take challenge: %w", state.ErrNotFound)
+	}
 	out, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName:                aws.String(d.challenges),
 		Key:                      challengeKey(impi, nonce),

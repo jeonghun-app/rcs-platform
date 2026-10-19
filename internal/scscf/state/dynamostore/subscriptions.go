@@ -29,12 +29,10 @@ func (d *Dynamo) subscriptionItem(s *state.Subscription, version int64) (map[str
 		attrIMPU:    str(s.IMPU),
 		attrCSeq:    num(int64(s.CSeq)),
 		attrRver:    num(int64(s.ReginfoVersion)),
+		attrShard:   str(shardOf(s.ID)),
+		attrExpires: num(s.Expires.Unix()),
 	}
-	if !s.Expires.IsZero() {
-		item[attrShard] = str(shardOf(s.ID))
-		item[attrExpires] = num(s.Expires.Unix())
-	}
-	return item, nil
+	return item, checkSize(item, "subscription")
 }
 
 func decodeSubscriptionItem(item map[string]types.AttributeValue) (*state.Subscription, error) {
@@ -70,6 +68,9 @@ func counter(item map[string]types.AttributeValue, name string) (uint32, error) 
 
 // Subscription implements state.Subscriptions.
 func (d *Dynamo) Subscription(ctx context.Context, id string) (*state.Subscription, error) {
+	if !state.KeyOK(id, state.MaxKey) {
+		return nil, fmt.Errorf("dynamostore: get subscription: %w", state.ErrNotFound)
+	}
 	item, err := d.get(ctx, d.subscriptions, key(id), "get subscription")
 	if err != nil {
 		return nil, err
@@ -79,6 +80,9 @@ func (d *Dynamo) Subscription(ctx context.Context, id string) (*state.Subscripti
 
 // SubscriptionsOf implements state.Subscriptions.
 func (d *Dynamo) SubscriptionsOf(ctx context.Context, impu string) ([]*state.Subscription, error) {
+	if !state.KeyOK(impu, state.MaxKey) {
+		return nil, nil
+	}
 	items, err := d.byIndex(ctx, d.subscriptions, IMPUIndex, attrIMPU, impu, "query subscriptions of an IMPU")
 	if err != nil {
 		return nil, err
@@ -93,7 +97,11 @@ func (d *Dynamo) SaveSubscription(ctx context.Context, s *state.Subscription) (*
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
-	item, err := d.subscriptionItem(s, s.Version+1)
+	version, err := d.nextVersion(s.Version)
+	if err != nil {
+		return nil, err
+	}
+	item, err := d.subscriptionItem(s, version)
 	if err != nil {
 		return nil, err
 	}
@@ -101,30 +109,36 @@ func (d *Dynamo) SaveSubscription(ctx context.Context, s *state.Subscription) (*
 		return nil, err
 	}
 	saved := s.Clone()
-	saved.Version = s.Version + 1
+	saved.Version = version
 	return saved, nil
 }
 
 // DeleteSubscription implements state.Subscriptions.
 func (d *Dynamo) DeleteSubscription(ctx context.Context, s *state.Subscription) error {
+	if !state.KeyOK(s.ID, state.MaxKey) {
+		return fmt.Errorf("dynamostore: delete subscription: %w", state.ErrNotFound)
+	}
 	return d.deleteVersioned(ctx, d.subscriptions, s.ID, s.Version, "delete subscription")
 }
 
 // NextNotify implements state.Subscriptions with one UpdateItem that adds 1
-// to both counters and the version. The token makes it idempotent: a resent
-// update finds its own token and fails its condition, and the values the first
-// attempt produced are read back.
+// to both counters and the version, below state.MaxCounter. The token makes it
+// idempotent: a resent update finds its own token and fails its condition, and
+// the values the first attempt produced are read back.
 func (d *Dynamo) NextNotify(ctx context.Context, id string) (uint32, uint32, error) {
+	if !state.KeyOK(id, state.MaxKey) {
+		return 0, 0, fmt.Errorf("dynamostore: next notify: %w", state.ErrNotFound)
+	}
 	tok := d.token()
 	out, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           aws.String(d.subscriptions),
 		Key:                 key(id),
 		UpdateExpression:    aws.String("SET #tok = :tok, #v = #v + :one ADD #cseq :one, #rver :one"),
-		ConditionExpression: aws.String("attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok)"),
+		ConditionExpression: aws.String("attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk": attrPK, "#tok": attrNToken, "#v": attrVersion, "#cseq": attrCSeq, "#rver": attrRver,
 		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":tok": str(tok), ":one": num(1)},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":tok": str(tok), ":one": num(1), ":max": num(state.MaxCounter)},
 		ReturnValues:              types.ReturnValueAllNew,
 	})
 	var item map[string]types.AttributeValue
@@ -134,7 +148,14 @@ func (d *Dynamo) NextNotify(ctx context.Context, id string) (uint32, uint32, err
 		if err != nil {
 			return 0, 0, err
 		}
-		if tok == "" || sv(cur[attrNToken]) != tok {
+		c, _ := nv(cur, attrCSeq)
+		r, _ := nv(cur, attrRver)
+		switch {
+		case tok != "" && sv(cur[attrNToken]) == tok:
+			// An earlier attempt of this call succeeded.
+		case c >= state.MaxCounter || r >= state.MaxCounter:
+			return 0, 0, fmt.Errorf("dynamostore: next notify: %w", state.ErrExhausted)
+		default:
 			// Unreachable unless the item went and came back between the two
 			// requests; the caller asks again.
 			return 0, 0, fmt.Errorf("dynamostore: next notify: %w", state.ErrConflict)

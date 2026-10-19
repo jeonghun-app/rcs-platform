@@ -10,18 +10,22 @@ import (
 
 // The documents stored in the doc attributes. They are separate from the state
 // types so that renaming a Go field never changes the stored format. Unknown
-// fields are ignored on decoding: during a rolling update an older instance
-// reads what a newer one wrote.
+// fields are ignored on decoding, so during a rolling update an older instance
+// reads what a newer one wrote; but when it saves the item again it writes only
+// the fields it knows, and a newer field is lost. A field added later must
+// therefore be one whose loss for a while is harmless, or wait until no older
+// instance runs before it is relied on.
 
 type registrationDoc struct {
-	IMPU     string       `json:"impu"`
-	IMPI     string       `json:"impi"`
-	Contacts []contactDoc `json:"contacts,omitempty"`
-	UserData []byte       `json:"user_data,omitempty"`
+	IMPU          string       `json:"impu"`
+	IMPI          string       `json:"impi"`
+	Contacts      []contactDoc `json:"contacts,omitempty"`
+	Deregistering *time.Time   `json:"deregistering,omitempty"`
 }
 
 type contactDoc struct {
 	URI         string    `json:"uri"`
+	Q           int       `json:"q"`
 	InstanceID  string    `json:"instance_id,omitempty"`
 	RegID       uint32    `json:"reg_id,omitempty"`
 	Path        []string  `json:"path,omitempty"`
@@ -34,10 +38,14 @@ type contactDoc struct {
 }
 
 func encodeRegistration(r *state.Registration) ([]byte, error) {
-	doc := registrationDoc{IMPU: r.IMPU, IMPI: r.IMPI, UserData: r.UserData}
+	doc := registrationDoc{IMPU: r.IMPU, IMPI: r.IMPI}
+	if !r.Deregistering.IsZero() {
+		t := r.Deregistering.UTC()
+		doc.Deregistering = &t
+	}
 	for _, c := range r.Contacts {
 		doc.Contacts = append(doc.Contacts, contactDoc{
-			URI: c.URI, InstanceID: c.InstanceID, RegID: c.RegID, Path: c.Path, Expires: c.Expires.UTC(),
+			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: c.Path, Expires: c.Expires.UTC(),
 			FeatureTags: c.FeatureTags, CallID: c.CallID, CSeq: c.CSeq, FlowToken: c.FlowToken, KeepAlive: c.KeepAlive,
 		})
 	}
@@ -49,10 +57,13 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: registration document does not decode", state.ErrInvalid)
 	}
-	r := &state.Registration{IMPU: doc.IMPU, IMPI: doc.IMPI, UserData: nilIfEmpty(doc.UserData), Version: version}
+	r := &state.Registration{IMPU: doc.IMPU, IMPI: doc.IMPI, Version: version}
+	if doc.Deregistering != nil {
+		r.Deregistering = *doc.Deregistering
+	}
 	for _, c := range doc.Contacts {
 		r.Contacts = append(r.Contacts, state.Contact{
-			URI: c.URI, InstanceID: c.InstanceID, RegID: c.RegID, Path: nilIfEmpty(c.Path), Expires: c.Expires,
+			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: nilIfEmpty(c.Path), Expires: c.Expires,
 			FeatureTags: nilIfEmpty(c.FeatureTags), CallID: c.CallID, CSeq: c.CSeq, FlowToken: c.FlowToken, KeepAlive: c.KeepAlive,
 		})
 	}
@@ -64,6 +75,7 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 
 type challengeDoc struct {
 	IMPU    string     `json:"impu,omitempty"`
+	Issued  time.Time  `json:"issued"`
 	Expires time.Time  `json:"expires"`
 	AKA     *akaDoc    `json:"aka,omitempty"`
 	Digest  *digestDoc `json:"digest,omitempty"`
@@ -86,7 +98,7 @@ type digestDoc struct {
 }
 
 func encodeChallenge(c *state.Challenge) ([]byte, error) {
-	doc := challengeDoc{IMPU: c.IMPU, Expires: c.Expires.UTC()}
+	doc := challengeDoc{IMPU: c.IMPU, Issued: c.Issued.UTC(), Expires: c.Expires.UTC()}
 	if v := c.AKA; v != nil {
 		doc.AKA = &akaDoc{RAND: v.RAND, AUTN: v.AUTN, XRES: v.XRES, CK: v.CK, IK: v.IK}
 	}
@@ -101,7 +113,7 @@ func decodeChallenge(b []byte, impi, nonce string) (*state.Challenge, error) {
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: challenge document does not decode", state.ErrInvalid)
 	}
-	c := &state.Challenge{IMPI: impi, Nonce: nonce, IMPU: doc.IMPU, Expires: doc.Expires}
+	c := &state.Challenge{IMPI: impi, Nonce: nonce, IMPU: doc.IMPU, Issued: doc.Issued, Expires: doc.Expires}
 	if v := doc.AKA; v != nil {
 		c.AKA = &state.AKAVector{RAND: v.RAND, AUTN: v.AUTN, XRES: v.XRES, CK: v.CK, IK: v.IK}
 	}

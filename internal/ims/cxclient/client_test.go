@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,23 +29,76 @@ func TestTheClientConnectsToEveryHSSTaskInDNS(t *testing.T) {
 	}
 }
 
-func TestATaskThatLeavesDNSIsDisconnectedAndANewOneConnected(t *testing.T) {
+// TestATaskIsDroppedOnlyOnceGoneFromDNSAndDown: a task a DNS answer leaves out
+// keeps its connection while it answers; once it has stopped, having been left
+// out of three answers in a row, it is dropped, its node shut down.
+func TestATaskIsDroppedOnlyOnceGoneFromDNSAndDown(t *testing.T) {
 	e := newEnv(t, nil)
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
 	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
 	startHSS(t, e.net, "192.0.2.3", "hss-c.rcs.local")
 	e.refresh("192.0.2.1", "192.0.2.2")
-	e.refresh("192.0.2.2", "192.0.2.3")
-	// The dropped task sees its peer go: the node was shut down, not left to
-	// reconnect.
-	eventually(t, "hss-a to lose the peer", func() bool { return len(a.node.Peers()) == 0 })
+	for range 5 {
+		e.dns.set(nil, "192.0.2.2", "192.0.2.3")
+		if err := e.client.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.waitAvailable("192.0.2.1", "192.0.2.2", "192.0.2.3")
+	if n := e.metrics.count("cxclient.peer.removed"); n != 0 {
+		t.Fatalf("a live task left out of DNS was dropped (%d)", n)
+	}
+	a.kill()
+	eventually(t, "task A to be unavailable", func() bool {
+		for _, p := range e.client.Peers() {
+			if p.Address == netip.MustParseAddr("192.0.2.1") && p.Available {
+				return false
+			}
+		}
+		return true
+	})
+	// Left out of five answers already, it goes at the next one.
+	if err := e.client.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.waitAvailable("192.0.2.2", "192.0.2.3")
 	dials := e.net.dialsTo("192.0.2.1")
 	time.Sleep(100 * time.Millisecond)
 	if e.net.dialsTo("192.0.2.1") != dials {
-		t.Error("the client keeps redialling an address that left DNS")
+		t.Error("the client keeps redialling a task it dropped")
 	}
 	if n := e.metrics.count("cxclient.peer.removed"); n != 1 {
 		t.Errorf("peer.removed = %d", n)
+	}
+}
+
+// TestTenTasksBehindEightRecordAnswersStayConnected is Cloud Map MULTIVALUE
+// DNS with more tasks than records: each answer names a different eight.
+func TestTenTasksBehindEightRecordAnswersStayConnected(t *testing.T) {
+	e := newEnv(t, nil)
+	var all []string
+	for i := 1; i <= 10; i++ {
+		a := "192.0.2." + itoa(i)
+		all = append(all, a)
+		startHSS(t, e.net, a, "hss-"+itoa(i)+".rcs.local")
+	}
+	sortAddrs(all)
+	for round := range 12 {
+		answer := make([]string, 0, 8)
+		for j := range 8 {
+			answer = append(answer, all[(round*3+j)%10])
+		}
+		e.dns.set(nil, answer...)
+		if err := e.client.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.waitAvailable(all...)
+	if n := e.metrics.count("cxclient.peer.removed"); n != 0 {
+		t.Errorf("peer.removed = %d with every task alive", n)
+	}
+	if n := e.metrics.count("cxclient.peer.added"); n != 10 {
+		t.Errorf("peer.added = %d, want each task once", n)
 	}
 }
 
@@ -65,6 +120,12 @@ func TestAFailedOrEmptyResolutionKeepsThePeers(t *testing.T) {
 		t.Errorf("resolve.error = %d", n)
 	}
 }
+
+func sortAddrs(as []string) {
+	slices.SortFunc(as, func(a, b string) int { return netip.MustParseAddr(a).Compare(netip.MustParseAddr(b)) })
+}
+
+func itoa(i int) string { return strconv.Itoa(i) }
 
 func TestPeersAreBoundedByMaxPeers(t *testing.T) {
 	e := newEnv(t, func(c *Config) { c.MaxPeers = 2 })
@@ -452,5 +513,184 @@ func TestCloseDisconnectsAndRefusesRefresh(t *testing.T) {
 	}
 	if _, err := e.client.UAR(ctx(t), uar()); !errors.Is(err, ErrNoPeer) {
 		t.Errorf("UAR after Close = %v", err)
+	}
+}
+
+func TestADownTaskStillInDNSIsKept(t *testing.T) {
+	e := newEnv(t, nil)
+	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
+	e.refresh("192.0.2.1", "192.0.2.2")
+	a.kill()
+	for range 4 {
+		if err := e.client.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(e.client.Peers()) != 2 {
+		t.Error("a task still in DNS was dropped while it restarts")
+	}
+}
+
+// TestABusyTaskGetsOnlyItsShareOfFirstAttempts: the retry does not move the
+// turn, so a task that keeps failing gets half of the first attempts, not all.
+func TestABusyTaskGetsOnlyItsShareOfFirstAttempts(t *testing.T) {
+	e := newEnv(t, nil)
+	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
+	e.refresh("192.0.2.1", "192.0.2.2")
+	a.setAnswer(busy)
+	for range 20 {
+		if _, err := e.client.UAR(ctx(t), uar()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := 0
+	for _, r := range a.requests() {
+		if r.flags&diameter.FlagRetransmit == 0 {
+			first++
+		}
+	}
+	if first > 11 {
+		t.Fatalf("the busy task got %d of 20 first attempts, want about half", first)
+	}
+}
+
+func TestATaskThatTimedOutGetsNoFirstAttemptsForAWhile(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.RequestTimeout = 200 * time.Millisecond })
+	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
+	e.refresh("192.0.2.1", "192.0.2.2")
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	a.setAnswer(func(uint32, *diameter.Message) (*diameter.Message, error) {
+		<-hang
+		return nil, errors.New("gone")
+	})
+	start := time.Now()
+	for range 10 {
+		if _, err := e.client.UAR(ctx(t), uar()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(a.requests()); n > 1 {
+		t.Errorf("the hung task got %d attempts, want only the one that timed out", n)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("10 requests took %s with one hung task", elapsed)
+	}
+	if e.metrics.count("cxclient.peer.excluded") != 1 {
+		t.Error("the exclusion was not counted")
+	}
+}
+
+func TestReadyNeedsAnAvailableTask(t *testing.T) {
+	e := newEnv(t, nil)
+	if err := e.client.Ready(); !errors.Is(err, ErrNoPeer) {
+		t.Errorf("Ready without tasks = %v", err)
+	}
+	startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	e.refresh("192.0.2.1")
+	if err := e.client.Ready(); err != nil {
+		t.Errorf("Ready = %v", err)
+	}
+}
+
+func TestAPeerWhoseOriginHostIsNotAnHSSIsNotUsedOrBelieved(t *testing.T) {
+	var rtrs int
+	e := newEnv(t, func(c *Config) {
+		c.HSSHostPattern = "hss-*.rcs.local"
+		c.OnRTR = func(context.Context, *cx.RTR) cx.Result { rtrs++; return cx.ResultCode(diameter.ResultSuccess) }
+	})
+	impostor := startHSS(t, e.net, "192.0.2.1", "evil.rcs.local")
+	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
+	e.refresh("192.0.2.1", "192.0.2.2")
+	for range 4 {
+		if _, err := e.client.UAR(ctx(t), uar()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(impostor.requests()); n != 0 {
+		t.Errorf("the impostor got %d requests", n)
+	}
+	ans := pushTo(t, impostor, (&cx.RTR{
+		Request:  cx.Request{DestinationHost: thisHost, DestinationRealm: realm},
+		UserName: impi1,
+	}).Message)
+	rta, err := cx.ParseRTA(ans)
+	if err != nil || rta.Result != cx.ResultCode(diameter.ResultUnableToComply) || rtrs != 0 {
+		t.Fatalf("RTA %+v, %v; callback called %d times", rta, err, rtrs)
+	}
+	if e.metrics.count("cxclient.RTR.refused") != 1 {
+		t.Error("the refusal was not counted")
+	}
+}
+
+func TestMatchHost(t *testing.T) {
+	for _, tt := range []struct {
+		pattern, host string
+		want          bool
+	}{
+		{"hss-*.rcs.local", "hss-1a2b.rcs.local", true},
+		{"hss-*.rcs.local", "HSS-1A.RCS.local", true},
+		{"hss-*.rcs.local", "hss-.rcs.local", true},
+		{"hss-*.rcs.local", "hss-a.evil.rcs.local", false},
+		{"hss-*.rcs.local", "evil.rcs.local", false},
+		{"hss.rcs.local", "hss.rcs.local", true},
+		{"*-hss.rcs.local", "a-hss.rcs.local", true},
+	} {
+		if got := matchHost(tt.pattern, tt.host); got != tt.want {
+			t.Errorf("matchHost(%q, %q) = %v", tt.pattern, tt.host, got)
+		}
+	}
+}
+
+// stuckDiscovery never answers until its ctx ends.
+type stuckDiscovery struct{ entered chan struct{} }
+
+func (s stuckDiscovery) HSSAddresses(ctx context.Context) ([]netip.Addr, error) {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestCloseEndsADiscoveryInProgress(t *testing.T) {
+	d := stuckDiscovery{entered: make(chan struct{}, 1)}
+	c, err := New(Config{OriginHost: thisHost, OriginRealm: realm, DestinationRealm: realm, Discovery: d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-d.entered
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := c.Close(ctx); err != nil {
+		t.Errorf("Close = %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Error("Close waited for the stuck discovery")
+	}
+}
+
+func TestLatencyAndPeerGaugesAreRecorded(t *testing.T) {
+	e := newEnv(t, nil)
+	startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	e.refresh("192.0.2.1")
+	if _, err := e.client.SAR(ctx(t), &cx.SAR{UserName: impi1, PublicIdentities: []string{impu1}, AssignmentType: cx.Registration}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.client.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.metrics.mu.Lock()
+	defer e.metrics.mu.Unlock()
+	if e.metrics.timed["cxclient.SAR.latency"] != 1 {
+		t.Error("SAR latency not recorded")
+	}
+	if e.metrics.counts["cxclient.peers"] < 1 || e.metrics.counts["cxclient.peers.known"] < 2 {
+		t.Errorf("gauges %d available, %d known", e.metrics.counts["cxclient.peers"], e.metrics.counts["cxclient.peers.known"])
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net/url"
 	"strings"
@@ -17,14 +18,24 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state/statetest"
 )
 
-var testKey = bytes.Repeat([]byte{0x42}, KeySize)
+var (
+	testKey  = ChallengeKey{ID: "k1", Key: bytes.Repeat([]byte{0x42}, KeySize)}
+	otherKey = ChallengeKey{ID: "k2", Key: bytes.Repeat([]byte{0x43}, KeySize)}
+)
 
-func newTestStore(t *testing.T, f *fakeDynamo, keys ...[]byte) *Dynamo {
+// newTestStore returns a store over f that seals with the first key given, or
+// testKey.
+func newTestStore(t *testing.T, f *fakeDynamo, keys ...ChallengeKey) *Dynamo {
 	t.Helper()
 	if len(keys) == 0 {
-		keys = [][]byte{testKey}
+		keys = []ChallengeKey{testKey}
 	}
-	d, err := New(f, Config{ChallengeKeys: keys})
+	return newSealing(t, f, keys[0].ID, keys...)
+}
+
+func newSealing(t *testing.T, f *fakeDynamo, seal string, keys ...ChallengeKey) *Dynamo {
+	t.Helper()
+	d, err := New(f, Config{ChallengeKeys: keys, SealKeyID: seal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,32 +145,54 @@ func TestChallengesAreSealedAndBoundToTheirKey(t *testing.T) {
 	moved := challengeKey(statetest.IMPI1, "n2")
 	moved[attrDoc], moved[attrExpires] = item[attrDoc], item[attrExpires]
 	tbl[itemKey(moved)] = moved
-	if _, err := d.Challenge(bg(), statetest.IMPI1, "n2", statetest.T0); !errors.Is(err, state.ErrInvalid) {
+	if _, err := d.TakeChallenge(bg(), statetest.IMPI1, "n2", statetest.T0); !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("a moved challenge: error = %v, want ErrInvalid", err)
 	}
-	other := newTestStore(t, f, bytes.Repeat([]byte{0x43}, KeySize))
-	if _, err := other.Challenge(bg(), statetest.IMPI1, "n1", statetest.T0); !errors.Is(err, state.ErrInvalid) {
+	// A key with the same ID but other bytes does not open it either.
+	other := newTestStore(t, f, ChallengeKey{ID: testKey.ID, Key: otherKey.Key})
+	if _, err := other.TakeChallenge(bg(), statetest.IMPI1, "n1", statetest.T0); !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("another key: error = %v, want ErrInvalid", err)
 	}
 }
 
-func TestAChallengeKeyRotatesWithoutLosingChallenges(t *testing.T) {
+// TestEachStepOfAKeyRotationOpensWhatTheOthersSeal runs the documented
+// rotation with instances one step apart, in both directions: whichever
+// instance seals a challenge, whichever takes it opens it.
+func TestEachStepOfAKeyRotationOpensWhatTheOthersSeal(t *testing.T) {
 	f := newFake(t)
-	oldKey, newKey := testKey, bytes.Repeat([]byte{0x43}, KeySize)
-	before := newTestStore(t, f, oldKey)
-	if err := before.AddChallenge(bg(), statetest.Challenge(statetest.IMPI1, "n", time.Minute)); err != nil {
-		t.Fatal(err)
+	steps := []*Dynamo{
+		newSealing(t, f, "k1", testKey),           // before
+		newSealing(t, f, "k1", testKey, otherKey), // 1: the new key added
+		newSealing(t, f, "k2", testKey, otherKey), // 2: sealing with it
+		newSealing(t, f, "k2", otherKey),          // 3: the old key dropped
 	}
-	after := newTestStore(t, f, newKey, oldKey)
-	if _, err := after.TakeChallenge(bg(), statetest.IMPI1, "n", statetest.T0); err != nil {
-		t.Fatalf("a challenge sealed with the old key: %v", err)
+	n := 0
+	for i := 0; i+1 < len(steps); i++ {
+		for _, pair := range [][2]*Dynamo{{steps[i], steps[i+1]}, {steps[i+1], steps[i]}} {
+			n++
+			nonce := fmt.Sprint("n", n)
+			if err := pair[0].AddChallenge(bg(), statetest.Challenge(statetest.IMPI1, nonce, time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pair[1].TakeChallenge(bg(), statetest.IMPI1, nonce, statetest.T0); err != nil {
+				t.Errorf("steps %d and %d: %v", i, i+1, err)
+			}
+		}
 	}
 }
 
 func TestNewRefusesBadChallengeKeys(t *testing.T) {
-	for _, keys := range [][][]byte{nil, {make([]byte, 16)}} {
-		if _, err := New(newFake(t), Config{ChallengeKeys: keys}); err == nil {
-			t.Errorf("New accepted %d keys of %d bytes", len(keys), len(keys[0:min(1, len(keys))]))
+	short := ChallengeKey{ID: "k", Key: make([]byte, 16)}
+	for name, c := range map[string]Config{
+		"no key":              {},
+		"a short key":         {ChallengeKeys: []ChallengeKey{short}},
+		"no ID":               {ChallengeKeys: []ChallengeKey{{Key: testKey.Key}}},
+		"two with one ID":     {ChallengeKeys: []ChallengeKey{testKey, {ID: "k1", Key: otherKey.Key}}, SealKeyID: "k1"},
+		"no seal key":         {ChallengeKeys: []ChallengeKey{testKey, otherKey}},
+		"an unknown seal key": {ChallengeKeys: []ChallengeKey{testKey}, SealKeyID: "k9"},
+	} {
+		if _, err := New(newFake(t), c); err == nil {
+			t.Errorf("New accepted %s", name)
 		}
 	}
 }
@@ -180,7 +213,7 @@ func TestACorruptItemIsReportedWithoutHidingTheOthers(t *testing.T) {
 	if !errors.Is(err, state.ErrInvalid) || len(regs) != 1 {
 		t.Fatalf("listed %d with error %v; want the good one and ErrInvalid", len(regs), err)
 	}
-	n, err := state.SweepRegistrations(bg(), d, statetest.T0, 10, func(_, _ *state.Registration) {})
+	n, err := state.SweepRegistrations(bg(), d, statetest.T0, 10, func(_, _ *state.Registration) error { return nil })
 	if n != 1 || !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("sweep handled %d with error %v; want 1 and ErrInvalid", n, err)
 	}

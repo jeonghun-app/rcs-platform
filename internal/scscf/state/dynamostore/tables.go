@@ -17,7 +17,7 @@ import (
 func CreateTables(ctx context.Context, api *dynamodb.Client, c Config) error {
 	d, err := New(api, Config{
 		RegistrationsTable: c.RegistrationsTable, ChallengesTable: c.ChallengesTable,
-		SubscriptionsTable: c.SubscriptionsTable, ChallengeKeys: [][]byte{make([]byte, KeySize)},
+		SubscriptionsTable: c.SubscriptionsTable, ChallengeKeys: []ChallengeKey{{ID: "tables", Key: make([]byte, KeySize)}},
 	})
 	if err != nil {
 		return err

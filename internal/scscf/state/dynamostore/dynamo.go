@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	mathrand "math/rand/v2"
 	"net/url"
 	"strconv"
 	"time"
@@ -66,11 +67,23 @@ type Config struct {
 	RegistrationsTable string
 	ChallengesTable    string
 	SubscriptionsTable string
-	// ChallengeKeys seal challenges with AES-256-GCM: the first seals, and
-	// every key opens, so a key rotates by adding the new one first and
-	// dropping the old one once its challenges have expired (seconds). Each
-	// is 32 bytes, shared by every scscf instance (Secrets Manager).
-	ChallengeKeys [][]byte
+	// ChallengeKeys are the keys challenges are sealed and opened with
+	// (AES-256-GCM, 32 bytes each), shared by every scscf instance through
+	// Secrets Manager, and SealKeyID names the one that seals; with a single
+	// key it may be empty. Every key opens what it sealed, so a key rotates
+	// in three steps, each rolled out to every instance before the next:
+	//
+	//  1. add the new key to ChallengeKeys, still sealing with the old one;
+	//  2. set SealKeyID to the new key;
+	//  3. after MaxChallengeLifetime, remove the old key.
+	//
+	// An instance a step behind then still opens every challenge, and a
+	// rollback of one step does too. Rotate at least quarterly: with random
+	// 96-bit nonces one GCM key is good for 2^32 seals (NIST SP 800-38D §8.3),
+	// far beyond a quarter's registrations, and rotating bounds it whatever
+	// the traffic.
+	ChallengeKeys []ChallengeKey
+	SealKeyID     string
 	// Rand is the source of write tokens and nonces; nil is crypto/rand.
 	Rand io.Reader
 }
@@ -89,7 +102,7 @@ var _ state.Store = (*Dynamo)(nil)
 
 // New returns the store over api.
 func New(api DynamoAPI, c Config) (*Dynamo, error) {
-	s, err := newSealer(c.ChallengeKeys)
+	s, err := newSealer(c.ChallengeKeys, c.SealKeyID)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +237,42 @@ func (d *Dynamo) get(ctx context.Context, table string, k map[string]types.Attri
 	return out.Item, nil
 }
 
+// nextVersion is the version a save of an item read at given stores: a random
+// first one for a new item (state.FirstVersion), the next one otherwise.
+func (d *Dynamo) nextVersion(given int64) (int64, error) {
+	if given == 0 {
+		return state.FirstVersion(d.rand)
+	}
+	return given + 1, nil
+}
+
+// itemSize is the size DynamoDB counts for an item: every attribute's name and
+// value.
+func itemSize(item map[string]types.AttributeValue) int {
+	n := 0
+	for name, v := range item {
+		n += len(name)
+		switch a := v.(type) {
+		case *types.AttributeValueMemberS:
+			n += len(a.Value)
+		case *types.AttributeValueMemberN:
+			n += len(a.Value)
+		case *types.AttributeValueMemberB:
+			n += len(a.Value)
+		}
+	}
+	return n
+}
+
+// checkSize refuses an item larger than state.MaxItemBytes, which DynamoDB
+// would refuse at 400 KB with an error of its own.
+func checkSize(item map[string]types.AttributeValue, what string) error {
+	if itemSize(item) > state.MaxItemBytes {
+		return fmt.Errorf("%w: %s is larger than %d bytes stored", state.ErrInvalid, what, state.MaxItemBytes)
+	}
+	return nil
+}
+
 // putVersioned writes item, created when version is 0 and otherwise
 // conditional on that version (state.Registrations.SaveRegistration).
 func (d *Dynamo) putVersioned(ctx context.Context, table, pk string, version int64, item map[string]types.AttributeValue, op string) error {
@@ -295,7 +344,11 @@ func (d *Dynamo) deleteVersioned(ctx context.Context, table, pk string, version 
 // keep accepts: the index is eventually consistent.
 func (d *Dynamo) expiring(ctx context.Context, table string, now time.Time, limit int, keep func(map[string]types.AttributeValue) bool, op string) ([]map[string]types.AttributeValue, error) {
 	var out []map[string]types.AttributeValue
-	for shard := 0; shard < shards && len(out) < limit; shard++ {
+	// Starting at a random shard spreads instances sweeping at once over
+	// different items, and no shard waits behind a backlog in another.
+	first := mathrand.IntN(shards)
+	for i := 0; i < shards && len(out) < limit; i++ {
+		shard := (first + i) % shards
 		var start map[string]types.AttributeValue
 		for len(out) < limit {
 			q, err := d.api.Query(ctx, &dynamodb.QueryInput{

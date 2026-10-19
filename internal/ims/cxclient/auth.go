@@ -21,7 +21,8 @@ var DefaultSchemes = []string{cx.SchemeDigestAKAv1MD5, cx.SchemeSIPDigest}
 // for a REGISTER whose Authorization names algorithm (empty when it has none
 // or names none). An algorithm the client named wins: AKAv1-MD5 and AKAv2-MD5
 // (RFC 3310, RFC 4169; the HSS has one vector for both) ask for AKA only, and
-// the plain Digest algorithms (RFC 2617, RFC 7616) for SIP Digest only.
+// the Digest algorithms the HSS keeps an HA1 for, MD5 and SHA-256 (RFC 2617,
+// RFC 7616), for SIP Digest only.
 // Otherwise preference applies, DefaultSchemes when nil. ok is false for an
 // algorithm the HSS has no credentials for, which the S-CSCF refuses.
 func Schemes(algorithm string, preference []string) (schemes []string, ok bool) {
@@ -33,7 +34,7 @@ func Schemes(algorithm string, preference []string) (schemes []string, ok bool) 
 		return slices.Clone(preference), true
 	case "akav1-md5", "akav2-md5":
 		return []string{cx.SchemeDigestAKAv1MD5}, true
-	case "md5", "md5-sess", "sha-256", "sha-256-sess", "sha-512-256", "sha-512-256-sess":
+	case "md5", "md5-sess", "sha-256", "sha-256-sess":
 		return []string{cx.SchemeSIPDigest}, true
 	}
 	return nil, false

@@ -46,7 +46,7 @@ func TestIntegrationDynamoStoreMeetsTheContract(t *testing.T) {
 		suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 		c := Config{
 			RegistrationsTable: "registrations-" + suffix, ChallengesTable: "auth-challenges-" + suffix,
-			SubscriptionsTable: "reg-subscriptions-" + suffix, ChallengeKeys: [][]byte{testKey},
+			SubscriptionsTable: "reg-subscriptions-" + suffix, ChallengeKeys: []ChallengeKey{testKey},
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
@@ -64,7 +64,7 @@ func TestIntegrationDynamoStoreMeetsTheContract(t *testing.T) {
 			f := first.(*Dynamo)
 			d, err := New(integrationAPI(t), Config{
 				RegistrationsTable: f.registrations, ChallengesTable: f.challenges,
-				SubscriptionsTable: f.subscriptions, ChallengeKeys: [][]byte{testKey},
+				SubscriptionsTable: f.subscriptions, ChallengeKeys: []ChallengeKey{testKey},
 			})
 			if err != nil {
 				t.Fatal(err)

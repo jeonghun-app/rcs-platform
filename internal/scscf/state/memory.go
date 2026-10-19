@@ -3,19 +3,28 @@ package state
 import (
 	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
+// purgeEvery is how many challenges are added between two purges of the
+// expired ones, which no read ever asked for again.
+const purgeEvery = 1024
+
 // Memory is a Store in process memory, for tests and for a single instance in
 // development. Several S-CSCF handles sharing one Memory behave as instances
 // sharing DynamoDB. It hands out copies, so callers cannot change what it holds.
 type Memory struct {
+	rand io.Reader
+
 	mu            sync.Mutex
 	registrations map[string]*Registration
+	profiles      map[string][]byte
 	challenges    map[challengeKey]*Challenge
+	added         int
 	subscriptions map[string]*Subscription
 }
 
@@ -26,7 +35,9 @@ var _ Store = (*Memory)(nil)
 // NewMemory returns an empty store.
 func NewMemory() *Memory {
 	return &Memory{
+		rand:          randReader,
 		registrations: map[string]*Registration{},
+		profiles:      map[string][]byte{},
 		challenges:    map[challengeKey]*Challenge{},
 		subscriptions: map[string]*Subscription{},
 	}
@@ -65,33 +76,34 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.registrations[r.IMPU]
-	if err := checkVersion("registration", ok, cur.versionOrZero(), r.Version); err != nil {
+	var stored int64
+	if ok {
+		stored = cur.Version
+	}
+	version, err := m.nextVersion("registration", ok, stored, r.Version)
+	if err != nil {
 		return nil, err
 	}
 	saved := r.Clone()
-	saved.Version = r.Version + 1
+	saved.Version = version
 	m.registrations[r.IMPU] = saved
 	return saved.Clone(), nil
 }
 
-func (r *Registration) versionOrZero() int64 {
-	if r == nil {
-		return 0
-	}
-	return r.Version
-}
-
-// checkVersion applies the optimistic concurrency rule of the Save methods.
-func checkVersion(what string, exists bool, stored, given int64) error {
+// nextVersion applies the optimistic concurrency rule of the Save methods and
+// returns the version to store. m.mu must be held.
+func (m *Memory) nextVersion(what string, exists bool, stored, given int64) (int64, error) {
 	switch {
 	case given == 0 && exists:
-		return fmt.Errorf("state: save %s: %w", what, ErrExists)
+		return 0, fmt.Errorf("state: save %s: %w", what, ErrExists)
 	case given != 0 && !exists:
-		return fmt.Errorf("state: save %s: %w", what, ErrNotFound)
+		return 0, fmt.Errorf("state: save %s: %w", what, ErrNotFound)
 	case given != 0 && stored != given:
-		return fmt.Errorf("state: save %s: %w", what, ErrConflict)
+		return 0, fmt.Errorf("state: save %s: %w", what, ErrConflict)
+	case given == 0:
+		return FirstVersion(m.rand)
 	}
-	return nil
+	return given + 1, nil
 }
 
 // DeleteRegistration implements Registrations.
@@ -99,7 +111,11 @@ func (m *Memory) DeleteRegistration(_ context.Context, r *Registration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.registrations[r.IMPU]
-	if err := checkDelete("registration", ok, cur.versionOrZero(), r.Version); err != nil {
+	var stored int64
+	if ok {
+		stored = cur.Version
+	}
+	if err := checkDelete("registration", ok, stored, r.Version); err != nil {
 		return err
 	}
 	delete(m.registrations, r.IMPU)
@@ -116,21 +132,53 @@ func checkDelete(what string, exists bool, stored, given int64) error {
 	return nil
 }
 
-// ExpiringRegistrations implements Registrations, earliest expiry first.
+// ExpiringRegistrations implements Registrations, earliest first.
 func (m *Memory) ExpiringRegistrations(_ context.Context, now time.Time, limit int) ([]*Registration, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []*Registration
 	for _, r := range m.registrations {
-		if len(r.Contacts) == 0 || !r.NextExpiry().After(now) {
+		if !r.SweepAt().After(now) {
 			out = append(out, r.Clone())
 		}
 	}
-	slices.SortFunc(out, func(a, b *Registration) int { return a.NextExpiry().Compare(b.NextExpiry()) })
+	slices.SortFunc(out, func(a, b *Registration) int { return a.SweepAt().Compare(b.SweepAt()) })
 	return out[:min(len(out), max(limit, 0))], nil
 }
 
-// AddChallenge implements Challenges.
+// Profile implements Profiles.
+func (m *Memory) Profile(_ context.Context, impi string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[impi]
+	if !ok {
+		return nil, fmt.Errorf("state: profile: %w", ErrNotFound)
+	}
+	return slices.Clone(p), nil
+}
+
+// SaveProfile implements Profiles.
+func (m *Memory) SaveProfile(_ context.Context, impi string, userData []byte) error {
+	if err := ValidProfile(impi, userData); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.profiles[impi] = slices.Clone(userData)
+	return nil
+}
+
+// DeleteProfile implements Profiles.
+func (m *Memory) DeleteProfile(_ context.Context, impi string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.profiles, impi)
+	return nil
+}
+
+// AddChallenge implements Challenges. Every purgeEvery challenges it forgets
+// those that have expired by the new one's issue time, which nothing else
+// would remove.
 func (m *Memory) AddChallenge(_ context.Context, c *Challenge) error {
 	if err := c.Validate(); err != nil {
 		return err
@@ -142,45 +190,41 @@ func (m *Memory) AddChallenge(_ context.Context, c *Challenge) error {
 		return fmt.Errorf("state: add challenge: %w", ErrExists)
 	}
 	m.challenges[k] = c.Clone()
-	return nil
-}
-
-// Challenge implements Challenges.
-func (m *Memory) Challenge(_ context.Context, impi, nonce string, now time.Time) (*Challenge, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	c, ok := m.live(impi, nonce, now)
-	if !ok {
-		return nil, fmt.Errorf("state: challenge: %w", ErrNotFound)
+	if m.added++; m.added%purgeEvery == 0 {
+		m.purge(c.Issued)
 	}
-	return c.Clone(), nil
+	return nil
 }
 
 // TakeChallenge implements Challenges.
 func (m *Memory) TakeChallenge(_ context.Context, impi, nonce string, now time.Time) (*Challenge, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c, ok := m.live(impi, nonce, now)
-	if !ok {
+	k := challengeKey{impi, nonce}
+	c, ok := m.challenges[k]
+	if !ok || !c.Expires.After(now) {
+		delete(m.challenges, k)
 		return nil, fmt.Errorf("state: take challenge: %w", ErrNotFound)
 	}
-	delete(m.challenges, challengeKey{impi, nonce})
+	delete(m.challenges, k)
 	return c, nil
 }
 
-// live returns an unexpired challenge, and forgets an expired one, which is
-// all the clean-up the memory store needs. m.mu must be held.
-func (m *Memory) live(impi, nonce string, now time.Time) (*Challenge, bool) {
-	k := challengeKey{impi, nonce}
-	c, ok := m.challenges[k]
-	if !ok {
-		return nil, false
+// purge forgets the challenges that have expired at now. m.mu must be held.
+func (m *Memory) purge(now time.Time) {
+	for k, c := range m.challenges {
+		if !c.Expires.After(now) {
+			delete(m.challenges, k)
+		}
 	}
-	if !c.Expires.After(now) {
-		delete(m.challenges, k)
-		return nil, false
-	}
-	return c, true
+}
+
+// HeldChallenges returns the number of challenges held, expired ones included,
+// for tests of the purge.
+func (m *Memory) HeldChallenges() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.challenges)
 }
 
 // Subscription implements Subscriptions.
@@ -220,11 +264,12 @@ func (m *Memory) SaveSubscription(_ context.Context, s *Subscription) (*Subscrip
 	if ok {
 		stored = cur.Version
 	}
-	if err := checkVersion("subscription", ok, stored, s.Version); err != nil {
+	version, err := m.nextVersion("subscription", ok, stored, s.Version)
+	if err != nil {
 		return nil, err
 	}
 	saved := s.Clone()
-	saved.Version = s.Version + 1
+	saved.Version = version
 	m.subscriptions[s.ID] = saved
 	return saved.Clone(), nil
 }
@@ -252,6 +297,9 @@ func (m *Memory) NextNotify(_ context.Context, id string) (uint32, uint32, error
 	s, ok := m.subscriptions[id]
 	if !ok {
 		return 0, 0, fmt.Errorf("state: next notify: %w", ErrNotFound)
+	}
+	if s.CSeq >= MaxCounter || s.ReginfoVersion >= MaxCounter {
+		return 0, 0, fmt.Errorf("state: next notify: %w", ErrExhausted)
 	}
 	s.CSeq++
 	s.ReginfoVersion++

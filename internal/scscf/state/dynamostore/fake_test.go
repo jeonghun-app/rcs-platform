@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 )
 
 // fakeDynamo implements the DynamoDB semantics this package relies on, for
@@ -75,15 +76,39 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return cur != nil && sv(cur[names["#v"]]) == sv(values[":v"])
 	case "attribute_exists(#pk) AND #exp > :now":
 		return cur != nil && number(cur[names["#exp"]]) > number(values[":now"])
-	case "attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok)":
+	case "attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max":
 		if cur == nil {
 			return false
 		}
 		tok, ok := cur[names["#tok"]]
-		return !ok || sv(tok) != sv(values[":tok"])
+		max := number(values[":max"])
+		return (!ok || sv(tok) != sv(values[":tok"])) && number(cur[names["#cseq"]]) < max && number(cur[names["#rver"]]) < max
 	}
 	f.t.Fatalf("fakeDynamo: unknown condition %q", aws.ToString(expr))
 	return false
+}
+
+// checkKey refuses keys as DynamoDB does: an empty key attribute, or one over
+// 2048 bytes for a partition key and 1024 for a sort key.
+func checkKey(k map[string]types.AttributeValue) error {
+	pk, sk := sv(k[attrPK]), k[attrSK]
+	if pk == "" || len(pk) > 2048 || sk != nil && (sv(sk) == "" || len(sv(sk)) > 1024) {
+		return &smithy.GenericAPIError{Code: "ValidationException", Message: "invalid key"}
+	}
+	return nil
+}
+
+// checkIndexKeys refuses an item whose index key attributes are empty strings.
+func checkIndexKeys(item map[string]types.AttributeValue) error {
+	for _, a := range []string{attrIMPI, attrIMPU, attrShard} {
+		if v, ok := item[a]; ok && sv(v) == "" {
+			return &smithy.GenericAPIError{Code: "ValidationException", Message: "empty index key"}
+		}
+	}
+	if itemSize(item) > 400<<10 {
+		return &smithy.GenericAPIError{Code: "ValidationException", Message: "item size exceeded"}
+	}
+	return nil
 }
 
 func conditionFailed() error {
@@ -114,10 +139,19 @@ func (f *fakeDynamo) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...
 	if !aws.ToBool(in.ConsistentRead) {
 		f.t.Fatal("fakeDynamo: every read must be strongly consistent")
 	}
+	if err := checkKey(in.Key); err != nil {
+		return nil, err
+	}
 	return &dynamodb.GetItemOutput{Item: maps.Clone(f.table(in.TableName)[itemKey(in.Key)])}, nil
 }
 
 func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
+	if err := checkKey(keyOf(in.Item)); err != nil {
+		return nil, err
+	}
+	if err := checkIndexKeys(in.Item); err != nil {
+		return nil, err
+	}
 	err := f.write(func() error {
 		tbl := f.table(in.TableName)
 		k := itemKey(keyOf(in.Item))
@@ -134,6 +168,9 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 }
 
 func (f *fakeDynamo) DeleteItem(_ context.Context, in *dynamodb.DeleteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	if err := checkKey(in.Key); err != nil {
+		return nil, err
+	}
 	var old map[string]types.AttributeValue
 	err := f.write(func() error {
 		tbl := f.table(in.TableName)
@@ -158,6 +195,9 @@ func (f *fakeDynamo) DeleteItem(_ context.Context, in *dynamodb.DeleteItemInput,
 func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	if aws.ToString(in.UpdateExpression) != "SET #tok = :tok, #v = #v + :one ADD #cseq :one, #rver :one" {
 		f.t.Fatalf("fakeDynamo: unknown update %q", aws.ToString(in.UpdateExpression))
+	}
+	if err := checkKey(in.Key); err != nil {
+		return nil, err
 	}
 	var updated map[string]types.AttributeValue
 	err := f.write(func() error {
