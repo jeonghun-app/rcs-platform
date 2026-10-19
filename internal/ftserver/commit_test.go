@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,47 +75,120 @@ func TestConflictWithAnotherWritersCommitIsStillAFailure(t *testing.T) {
 	}
 }
 
-// appliedThenTimedOut applies completing updates, then holds the call until
-// its context ends and reports the context's error, as when DynamoDB writes
-// and FT_STORAGE_TIMEOUT expires before the answer arrives. With every set,
-// it does so on every completing update; otherwise only on the first.
+// appliedThenTimedOut applies completing updates, then reports them as timed
+// out, as when DynamoDB writes and FT_STORAGE_TIMEOUT expires before the
+// answer arrives. With every set, it does so on every completing update;
+// otherwise only on the first. With expire set, it holds the call until its
+// context ends and reports the context's error; otherwise it reports
+// context.DeadlineExceeded at once.
 type appliedThenTimedOut struct {
 	store.Metadata
-	every bool
-	calls atomic.Int32
+	every, expire bool
+	calls         atomic.Int32
+
+	mu sync.Mutex
+	// updates and reads are the completing updates and the reads after
+	// the first, with when each was called and its context's deadline.
+	updates, reads []timedCall
+}
+
+type timedCall struct{ at, deadline time.Time }
+
+func (a *appliedThenTimedOut) record(calls *[]timedCall, ctx context.Context) {
+	deadline, _ := ctx.Deadline()
+	a.mu.Lock()
+	*calls = append(*calls, timedCall{time.Now(), deadline})
+	a.mu.Unlock()
+}
+
+func (a *appliedThenTimedOut) Get(ctx context.Context, id string) (store.Record, error) {
+	if a.calls.Load() > 0 {
+		a.record(&a.reads, ctx)
+	}
+	return a.Metadata.Get(ctx, id)
 }
 
 func (a *appliedThenTimedOut) Update(ctx context.Context, r store.Record) (store.Record, error) {
+	if r.State == store.Complete {
+		a.record(&a.updates, ctx)
+	}
 	if r.State != store.Complete || !a.every && a.calls.Load() > 0 {
 		return a.Metadata.Update(ctx, r)
 	}
 	a.calls.Add(1)
 	_, _ = a.Metadata.Update(ctx, r) // applied, or a conflict on a retry
+	if !a.expire {
+		return store.Record{}, context.DeadlineExceeded
+	}
 	<-ctx.Done()
 	return store.Record{}, ctx.Err()
 }
 
 func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
-	for name, every := range map[string]bool{"retry conflicts": false, "every attempt times out": true} {
-		t.Run(name, func(t *testing.T) {
-			meta := &appliedThenTimedOut{Metadata: store.NewMemory(), every: every}
-			e := newEnv(t, func(o *Options) { o.Metadata = meta; o.StorageTimeout = 300 * time.Millisecond })
-			e.srv.retryWait = func(int) time.Duration { return 0 }
+	for _, tt := range []struct {
+		name          string
+		every, expire bool
+	}{
+		{"retry conflicts", false, false},
+		{"every attempt times out", true, false},
+		{"the attempts really expire", true, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &appliedThenTimedOut{Metadata: store.NewMemory(), every: tt.every, expire: tt.expire}
+			e := newEnv(t, func(o *Options) {
+				o.Metadata = meta
+				if tt.expire {
+					// The lease is 900 ms and the completion budget 600 ms,
+					// of which 450 ms are for the commit attempts: the first
+					// expires after 300 ms, and whether a second starts
+					// before the budget ends depends on how the host runs
+					// the test, so only the budget is checked.
+					o.StorageTimeout = 300 * time.Millisecond
+					o.IdleTimeout = 150 * time.Millisecond
+				} else {
+					// The attempts report their timeout at once, so none
+					// waits on the clock. With no idle timeout, the budget
+					// less the reserve is one StorageTimeout: an attempt
+					// whose deadline ignored the budget would end past it,
+					// as each starts at least one retryWait after the first
+					// (review of #131).
+					o.StorageTimeout = 10 * time.Second
+					o.IdleTimeout = 0
+				}
+			})
+			e.srv.retryWait = func(int) time.Duration { return 10 * time.Millisecond }
 			data := pattern(20)
-			// The first attempt really expires; a later attempt meets the
-			// applied write as a conflict, or, if every attempt expires,
-			// the final read-back finds it.
+			// A retry meets the applied write as a conflict, or, if every
+			// attempt times out, the final read back finds it.
 			u := e.user(alice)
 			u.challenge()
-			start := time.Now()
 			rec := u.upload(multipartBody(tidPart("expired"), filePart("a", "text/plain", data)))
 			if rec.Code != http.StatusOK || e.metric("upload.commit_recovered") != 1 {
 				t.Fatalf("status = %d, recovered %v, retried %v", rec.Code, e.metric("upload.commit_recovered"), e.metric("upload.commit_retried"))
 			}
 			// However many attempts time out, completion ends within its
-			// budget, while the writer still holds the lease.
-			if took := time.Since(start); took > e.srv.completeBudget()+time.Second {
-				t.Fatalf("completion took %v, budget %v", took, e.srv.completeBudget())
+			// budget, while the writer still holds the lease. That is
+			// shown by the deadlines completion gives its calls, not by
+			// the time a loaded host takes to run them (#130): every
+			// attempt ends within the budget less the reserve, counted
+			// from the first, which began after the budget did, and each
+			// read back within the reserve.
+			budget := e.srv.completeBudget()
+			reserve := min(e.srv.o.StorageTimeout, budget/4)
+			meta.mu.Lock()
+			defer meta.mu.Unlock()
+			if len(meta.updates) == 0 || !tt.expire && (len(meta.updates) < 2 || len(meta.reads) != 1) {
+				t.Fatalf("%d completing updates and %d reads back, want at least 2 and 1", len(meta.updates), len(meta.reads))
+			}
+			for i, c := range meta.updates {
+				if c.deadline.IsZero() || c.deadline.After(meta.updates[0].at.Add(budget-reserve)) {
+					t.Errorf("attempt %d has deadline %v, past %v of budget after the first", i, c.deadline.Sub(meta.updates[0].at), budget-reserve)
+				}
+			}
+			for i, c := range meta.reads {
+				if c.deadline.IsZero() || c.deadline.After(c.at.Add(reserve)) {
+					t.Errorf("read back %d has deadline %v after it began, past the %v reserve", i, c.deadline.Sub(c.at), reserve)
+				}
 			}
 		})
 	}

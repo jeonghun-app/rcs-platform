@@ -5,8 +5,6 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +12,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
 )
 
 // The stack's test identities: an IMPI of the MCC 001 test network (on the
@@ -31,7 +31,10 @@ const (
 func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 	bin := build(t, "./cmd/ft-server", "./cmd/msrp-relay", "./tools/rcs-sim")
 
-	ftPort, ftAdmin := freePort(t), freePort(t)
+	// Every port at once, so no two are the same (QA on #127).
+	ports := simtest.FreePorts(t, 6)
+	port := func(i int) string { return strconv.Itoa(ports[i]) }
+	ftPort, ftAdmin := port(0), port(1)
 	start(t, bin, "ft-server", ftAdmin, map[string]string{
 		"FT_LISTEN_ADDR":    "127.0.0.1:" + ftPort,
 		"FT_UPLOAD_URI":     "http://127.0.0.1:" + ftPort + "/ft",
@@ -44,7 +47,7 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		"FT_SWEEP_INTERVAL": "1h",
 	})
 
-	public, control, relayAdmin, core := freePort(t), freePort(t), freePort(t), freePort(t)
+	public, control, relayAdmin, core := port(2), port(3), port(4), port(5)
 	start(t, bin, "msrp-relay", relayAdmin, map[string]string{
 		"RELAY_LISTEN_ADDR":   "127.0.0.1:" + public,
 		"RELAY_CONTROL_ADDR":  "127.0.0.1:" + control,
@@ -105,8 +108,16 @@ func start(t *testing.T, bin, name, admin string, env map[string]string) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	// Closed when the process has exited, with exitErr set, so the wait
+	// for readiness and the cleanup can both see it. A channel holding the
+	// one result let the readiness wait take it, and the cleanup then
+	// waited for ever (#139, the same as #107).
+	exited := make(chan struct{})
+	var exitErr error
+	go func() {
+		exitErr = cmd.Wait()
+		close(exited)
+	}()
 	t.Cleanup(func() {
 		_ = cmd.Process.Signal(os.Interrupt)
 		select {
@@ -129,8 +140,8 @@ func start(t *testing.T, bin, name, admin string, env map[string]string) {
 			}
 		}
 		select {
-		case err := <-exited:
-			t.Fatalf("%s exited: %v\n%s", name, err, logs.String())
+		case <-exited:
+			t.Fatalf("%s exited: %v\n%s", name, exitErr, logs.String())
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -138,16 +149,4 @@ func start(t *testing.T, bin, name, admin string, env map[string]string) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-}
-
-// freePort returns a loopback port nothing listens on now; the services
-// must be told their ports before they start.
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
 }
