@@ -58,6 +58,19 @@ type standIn struct {
 	grant uint32
 	// rewrite, when set, changes each contact the 2xx to REGISTER lists.
 	rewrite func(*sip.Contact)
+	// noOutbound leaves Require: outbound out of the 2xx to REGISTER, as a
+	// registrar that did not use the reg-id does (RFC 5626 §6).
+	noOutbound bool
+	// delay, when set, is how long the n-th REGISTER (from 1) waits for
+	// its answer, which then comes from another goroutine.
+	delay func(n int) time.Duration
+
+	mu sync.Mutex
+	// registers counts REGISTERs; open is how many have no answer yet, and
+	// overlaps how many arrived while another had none.
+	registers, open, overlaps int
+	// lastExpires is the Expires of the last REGISTER received.
+	lastExpires uint32
 
 	got chan received
 }
@@ -112,10 +125,42 @@ func (s *standIn) config() Config {
 func (s *standIn) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
 	s.got <- received{req.Clone(), tx.Source()}
-	res := s.response(req)
-	if err := tx.Respond(res); err != nil {
-		s.t.Errorf("stand-in: answering %s: %v", req.Method, err)
+	var wait time.Duration
+	if req.Method == "REGISTER" {
+		s.mu.Lock()
+		s.registers++
+		if s.open > 0 {
+			s.overlaps++
+		}
+		s.open++
+		s.lastExpires, _ = req.Header.Expires()
+		if s.delay != nil {
+			wait = s.delay(s.registers)
+		}
+		s.mu.Unlock()
 	}
+	answer := func() {
+		res := s.response(req)
+		if res == nil {
+			return
+		}
+		if req.Method == "REGISTER" {
+			s.mu.Lock()
+			s.open--
+			s.mu.Unlock()
+		}
+		if err := tx.Respond(res); err != nil {
+			s.t.Errorf("stand-in: answering %s: %v", req.Method, err)
+		}
+	}
+	if wait == 0 {
+		answer()
+		return
+	}
+	go func() {
+		time.Sleep(wait)
+		answer()
+	}()
 }
 
 func (s *standIn) response(req *sip.Request) *sip.Response {
@@ -126,7 +171,9 @@ func (s *standIn) response(req *sip.Request) *sip.Response {
 	}
 	res, err := sip.NewResponse(req, code, "", tag)
 	if err != nil {
-		s.t.Fatalf("stand-in: %v", err)
+		// Errorf, not Fatalf: a delayed answer runs off the test's goroutine.
+		s.t.Errorf("stand-in: %v", err)
+		return nil
 	}
 	if req.Method != "REGISTER" || code != 200 {
 		return res
@@ -152,7 +199,9 @@ func (s *standIn) response(req *sip.Request) *sip.Response {
 			res.Header.Add("Contact", c.String())
 		}
 	}
-	res.Header.Add("Require", "outbound")
+	if !s.noOutbound {
+		res.Header.Add("Require", "outbound")
+	}
 	res.Header.Add("Path", "<sip:flowtoken@pcscf.example.com;lr;ob>")
 	res.Header.Add("Service-Route", testRoute1)
 	res.Header.Add("Service-Route", testRoute2)
@@ -271,6 +320,7 @@ func (r *rawRegistrar) register(t *testing.T, ua *UA) {
 	contacts, _ := req.Header.Contact()
 	contacts[0].Params.Set("expires", "3600")
 	res.Header.Add("Contact", contacts[0].String())
+	res.Header.Add("Require", "outbound")
 	b, _ := res.Bytes()
 	c.Write(b)
 	select {

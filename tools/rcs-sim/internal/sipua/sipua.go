@@ -96,7 +96,8 @@ type Config struct {
 	// 24.229 §5.1.1.2.1).
 	Domain string
 	// IMPU is the public user identity registered, and the From of every
-	// request.
+	// request. It is a SIP URI: the From and To of REGISTER must be one (TS
+	// 24.229 §5.1.1.2.1), and a tel URI comes only in the implicit set.
 	IMPU sip.URI
 	// InstanceID is the +sip.instance URN, such as "urn:uuid:...", without
 	// angle brackets (RFC 5626 §4.1).
@@ -106,9 +107,11 @@ type Config struct {
 	// Expires is the registration expiry asked for; zero is DefaultExpires.
 	Expires time.Duration
 
-	// KeepAlive is the interval between pings, used as it is. Zero takes a
-	// random interval between 80% and 100% of the registrar's Flow-Timer,
-	// or of DefaultFlowTimer without one (RFC 5626 §4.4.1).
+	// KeepAlive is the interval between pings, used as it is. Zero draws
+	// each interval anew between 80% and 100% of the registrar's
+	// Flow-Timer, or of DefaultFlowTimer without one (RFC 5626 §4.4.1).
+	// Either way the UA pings only while the registrar's 2xx carries
+	// Require: outbound (§4.2.1).
 	KeepAlive time.Duration
 	// PongTimeout is how long a ping waits for its pong; zero is
 	// DefaultPongTimeout.
@@ -150,7 +153,9 @@ type Registration struct {
 }
 
 // UA is a registered or registering client on one flow. Its methods are safe
-// for concurrent use.
+// for concurrent use. Register and Unregister run one at a time, so a
+// REGISTER is never sent before the previous one has its final response
+// (RFC 3261 §10.2).
 type UA struct {
 	cfg     Config
 	tr      *transport.Transport
@@ -165,6 +170,10 @@ type UA struct {
 
 	pings, pongs atomic.Int64
 
+	// regMu is held for the whole of Register and Unregister, the wait for
+	// the response included; mu only for the state.
+	regMu sync.Mutex
+
 	mu sync.Mutex
 	// flow is the connection's FlowID, known from the first message that
 	// arrives over it.
@@ -175,12 +184,19 @@ type UA struct {
 	regCSeq           uint32
 	serviceRoute      []sip.Address
 	registered        bool
-	interval          time.Duration
-	keepAlive         transaction.Timer
-	pongDue           transaction.Timer
-	err               error
-	done              chan struct{}
-	closeOnce         sync.Once
+	// keepAliveBase is what each interval is drawn from when
+	// Config.KeepAlive is zero: the Flow-Timer, or DefaultFlowTimer.
+	keepAliveBase time.Duration
+	keepAlive     transaction.Timer
+	pongDue       transaction.Timer
+	// keepAliveGen and pongGen name the one live timer of each kind. A
+	// timer that fires as it is being replaced or stopped finds the
+	// generation moved on and does nothing, so a refresh never leaves a
+	// second chain of pings running.
+	keepAliveGen, pongGen uint64
+	err                   error
+	done                  chan struct{}
+	closeOnce             sync.Once
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -260,8 +276,8 @@ func (c Config) validate() error {
 		return errors.New("sipua: no P-CSCF address")
 	case !isHost(c.Domain):
 		return errors.New("sipua: the home domain is not a host")
-	case !c.IMPU.IsSIP() && c.IMPU.Scheme != "tel":
-		return errors.New("sipua: the IMPU is not a SIP or tel URI")
+	case !c.IMPU.IsSIP():
+		return errors.New("sipua: the IMPU is not a SIP URI")
 	case !strings.HasPrefix(c.InstanceID, "urn:"):
 		return errors.New("sipua: the instance ID is not a URN")
 	case c.RegID >= 1<<31:
@@ -288,6 +304,11 @@ func (ua *UA) buildAddresses() error {
 	ua.contact.Params.Set("+sip.instance", "<"+ua.cfg.InstanceID+">")
 	ua.contact.Params.Set("reg-id", strconv.FormatUint(uint64(ua.cfg.RegID), 10))
 
+	// TS 24.229 §5.1.2A.1.1 puts the P-CSCF's IP address in this Route, and
+	// its NOTE 15 has a UE resolve an FQDN from discovery first. Clients
+	// reach pcscf through the NLB's host name, whose addresses are the
+	// NLB's and change, so the Route keeps the name the client was given;
+	// pcscf recognises its own Route by name or by address.
 	host := ua.cfg.ServerName
 	if host == "" {
 		host = hostOf(ua.cfg.Proxy.Addr())
@@ -354,6 +375,8 @@ func (ua *UA) fail(err error) {
 // refreshes the registration, in the same Call-ID (RFC 3261 §10.2.4), and
 // takes the Service-Route of the new response.
 func (ua *UA) Register(ctx context.Context) (*Registration, error) {
+	ua.regMu.Lock()
+	defer ua.regMu.Unlock()
 	reg, err := ua.register(ctx, ua.cfg.Expires)
 	if err != nil {
 		return nil, err
@@ -362,21 +385,22 @@ func (ua *UA) Register(ctx context.Context) (*Registration, error) {
 		return nil, ErrNoBinding
 	}
 	ua.mu.Lock()
+	defer ua.mu.Unlock()
 	ua.serviceRoute = reg.ServiceRoute
 	ua.registered = true
-	ua.interval = ua.cfg.KeepAlive
-	if ua.interval <= 0 {
-		ua.interval = ua.jitter(orDefault(reg.FlowTimer, DefaultFlowTimer))
-	}
-	if ua.err == nil {
+	ua.keepAliveBase = orDefault(reg.FlowTimer, DefaultFlowTimer)
+	switch {
+	case ua.err != nil:
+	case reg.Outbound:
 		// A refresh starts the interval again but leaves a pong that is
 		// due alone: the flow must still answer it.
-		if ua.keepAlive != nil {
-			ua.keepAlive.Stop()
-		}
-		ua.keepAlive = ua.cfg.Clock.AfterFunc(ua.interval, ua.ping)
+		ua.armKeepAliveLocked()
+	default:
+		// Keep-alives start only once outbound registration has succeeded,
+		// which Require: outbound shows (RFC 5626 §4.2.1); a first hop
+		// that did not use outbound need not answer them (§4.4).
+		ua.stopKeepAliveLocked()
 	}
-	ua.mu.Unlock()
 	return reg, nil
 }
 
@@ -384,6 +408,8 @@ func (ua *UA) Register(ctx context.Context) (*Registration, error) {
 // keep-alive. The connection stays open, for what the network still sends
 // over it, a NOTIFY of the registration's end say.
 func (ua *UA) Unregister(ctx context.Context) (*Registration, error) {
+	ua.regMu.Lock()
+	defer ua.regMu.Unlock()
 	reg, err := ua.register(ctx, 0)
 	if err != nil {
 		return nil, err
@@ -611,6 +637,13 @@ func (ua *UA) sendError(err error) error {
 	if e := ua.Err(); e != nil {
 		return e
 	}
+	// The one connection can be gone without a flow ever having opened: a
+	// failed TLS handshake closes it before the transport has a flow to
+	// report closed. The UA is finished then too, and the reason, which
+	// says why, is what the caller gets.
+	if ua.dialer.taken() && ua.tr.Stats().OpenOutbound == 0 {
+		ua.fail(ErrFlowFailed)
+	}
 	return safeerr.Reason(err)
 }
 
@@ -625,12 +658,31 @@ func (ua *UA) receive(in transport.Inbound) {
 	ua.layer.Receive(in)
 }
 
+// armKeepAliveLocked replaces the keep-alive timer with one for the next
+// interval, drawn anew each time (RFC 5626 §4.4.1: "the random number will
+// be different for each keep-alive ping").
+func (ua *UA) armKeepAliveLocked() {
+	d := ua.cfg.KeepAlive
+	if d <= 0 {
+		d = ua.jitter(ua.keepAliveBase)
+	}
+	// Stopping the timer this one replaces is not enough when it has
+	// already fired: its ping may be waiting for the lock. The generation
+	// turns that ping away.
+	if ua.keepAlive != nil {
+		ua.keepAlive.Stop()
+	}
+	ua.keepAliveGen++
+	gen := ua.keepAliveGen
+	ua.keepAlive = ua.cfg.Clock.AfterFunc(d, func() { ua.ping(gen) })
+}
+
 // ping sends a keep-alive and arms the timers for its pong and the next one.
 // The pong timer is armed before the ping is written, so a pong that comes
 // back at once finds it to stop.
-func (ua *UA) ping() {
+func (ua *UA) ping(gen uint64) {
 	ua.mu.Lock()
-	if ua.err != nil || !ua.registered {
+	if ua.err != nil || !ua.registered || gen != ua.keepAliveGen {
 		ua.mu.Unlock()
 		return
 	}
@@ -638,9 +690,11 @@ func (ua *UA) ping() {
 	// A pong still outstanding keeps its deadline: a later ping must not
 	// extend the life of a flow that has stopped answering.
 	if ua.pongDue == nil {
-		ua.pongDue = ua.cfg.Clock.AfterFunc(ua.cfg.PongTimeout, ua.pongMissed)
+		ua.pongGen++
+		pg := ua.pongGen
+		ua.pongDue = ua.cfg.Clock.AfterFunc(ua.cfg.PongTimeout, func() { ua.pongMissed(pg) })
 	}
-	ua.keepAlive = ua.cfg.Clock.AfterFunc(ua.interval, ua.ping)
+	ua.armKeepAliveLocked()
 	ua.mu.Unlock()
 
 	ua.pings.Add(1)
@@ -657,12 +711,18 @@ func (ua *UA) pong(transport.FlowID) {
 	if ua.pongDue != nil {
 		ua.pongDue.Stop()
 		ua.pongDue = nil
+		ua.pongGen++
 	}
 }
 
 // pongMissed fails the flow and closes it (RFC 5626 §4.4.1).
-func (ua *UA) pongMissed() {
+func (ua *UA) pongMissed(gen uint64) {
 	ua.mu.Lock()
+	if gen != ua.pongGen {
+		// The pong came as the timer fired.
+		ua.mu.Unlock()
+		return
+	}
 	flow := ua.flow
 	ua.pongDue = nil
 	ua.mu.Unlock()
@@ -677,6 +737,8 @@ func (ua *UA) stopKeepAliveLocked() {
 			*t = nil
 		}
 	}
+	ua.keepAliveGen++
+	ua.pongGen++
 }
 
 // jitter returns a random duration between 80% and 100% of d (RFC 5626
@@ -738,6 +800,13 @@ func (d *oneConn) DialContext(context.Context, string, string) (net.Conn, error)
 		return nil, ErrFlowFailed
 	}
 	return c, nil
+}
+
+// taken reports whether the transport has taken the connection.
+func (d *oneConn) taken() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.c == nil
 }
 
 // close closes the connection if the transport never took it.

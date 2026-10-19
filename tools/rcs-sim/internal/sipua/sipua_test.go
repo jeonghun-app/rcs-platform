@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -250,6 +251,88 @@ func TestKeepAliveIntervalComesFromTheFlowTimer(t *testing.T) {
 	}
 }
 
+func TestKeepAliveIntervalIsDrawnForEachPing(t *testing.T) {
+	// RFC 5626 §4.4.1: "the random number will be different for each
+	// keep-alive ping", so clients that drew the same first interval do
+	// not ping together from then on.
+	s := newStandIn(t, transport.TCP)
+	s.flowTimer = 100
+	clock := newFakeClock()
+	cfg := s.config()
+	cfg.Clock = clock
+	ua := dial(t, cfg)
+	register(t, ua)
+	var intervals []time.Duration
+	for i := int64(1); i <= 4; i++ {
+		d := clock.waitArmed(t, "keep-alive", func(d time.Duration) bool { return d >= 80*time.Second && d <= 100*time.Second })
+		intervals = append(intervals, d)
+		clock.advance(d)
+		// The pong before the next advance, which passes its timer.
+		waitUntil(t, "the pong", func() bool { _, pongs := ua.KeepAlives(); return pongs == i })
+	}
+	if slices.Equal(intervals, []time.Duration{intervals[0], intervals[0], intervals[0], intervals[0]}) {
+		t.Fatalf("intervals = %v, all the same", intervals)
+	}
+}
+
+func TestNoKeepAliveWithoutRequireOutbound(t *testing.T) {
+	// RFC 5626 §4.2.1: keep-alives start once Require: outbound shows the
+	// outbound registration succeeded; a first hop that did not use it
+	// need not answer them.
+	s := newStandIn(t, transport.TCP)
+	s.noOutbound = true
+	clock := newFakeClock()
+	cfg := s.config()
+	cfg.Clock, cfg.KeepAlive = clock, 30*time.Second
+	ua := dial(t, cfg)
+	if reg := register(t, ua); reg.Outbound {
+		t.Fatal("registration reports outbound without Require: outbound")
+	}
+	clock.advance(time.Hour)
+	if pings, _ := ua.KeepAlives(); pings != 0 {
+		t.Fatalf("%d pings without outbound", pings)
+	}
+	if err := ua.Err(); err != nil {
+		t.Fatalf("Err = %v", err)
+	}
+}
+
+func TestRefreshAndUnregisterNeverOverlap(t *testing.T) {
+	// RFC 3261 §10.2: no REGISTER before the previous one has its final
+	// response. Code review's case: a refresh and an Unregister at once,
+	// with the first REGISTER to arrive answered last. Overlapping, the
+	// UA would take the answers in the wrong order and stay registered
+	// while the registrar removed the binding.
+	s := newStandIn(t, transport.TCP)
+	s.delay = func(n int) time.Duration {
+		if n == 2 {
+			return 200 * time.Millisecond
+		}
+		return 0
+	}
+	ua := dial(t, s.config())
+	register(t, ua)
+	errs := make(chan error, 2)
+	go func() { _, err := ua.Register(context.Background()); errs <- err }()
+	go func() { _, err := ua.Unregister(context.Background()); errs <- err }()
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.mu.Lock()
+	overlaps, last := s.overlaps, s.lastExpires
+	s.mu.Unlock()
+	if overlaps != 0 {
+		t.Fatalf("%d REGISTERs sent before the previous one was answered", overlaps)
+	}
+	// The UA ends as the registrar does, after whichever came last.
+	_, err := ua.NewRequest("MESSAGE", mustURI(t, testIMPU))
+	if registered := err == nil; registered != (last != 0) {
+		t.Fatalf("UA registered %v, but the last REGISTER had Expires %d", registered, last)
+	}
+}
+
 func TestClosedConnectionFailsTheUAAndIsNotReplaced(t *testing.T) {
 	s := newStandIn(t, transport.TCP)
 	ua := dial(t, s.config())
@@ -341,6 +424,7 @@ func TestDialRefusesAnIncompleteConfig(t *testing.T) {
 		"no domain":       func(c *Config) { c.Domain = "" },
 		"domain not host": func(c *Config) { c.Domain = "ims.example.com;x=1" },
 		"IMPU not SIP":    func(c *Config) { c.IMPU = mustURI(t, "mailto:a@example.com") },
+		"IMPU tel":        func(c *Config) { c.IMPU = mustURI(t, testTel) },
 		"instance":        func(c *Config) { c.InstanceID = "00000000-0000-4000-8000-000000000001" },
 		"reg-id":          func(c *Config) { c.RegID = 1 << 31 },
 		"server name":     func(c *Config) { c.ServerName = "pcscf.example.com;lr" },

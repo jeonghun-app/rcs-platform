@@ -102,9 +102,14 @@ behaves as a device behind NAT does:
 - It registers with SIP outbound (RFC 5626 §4.2): `+sip.instance` and `reg-id`
   in Contact, `Supported: path, outbound`, and a Route to pcscf alone. The
   Contact has the connection's address and no user part.
-- It sends a CRLF ping every 80% to 100% of the registrar's `Flow-Timer`, or of
-  120 s without one, and counts the flow as failed when a pong takes more than
-  10 s (RFC 5626 §4.4.1). It then closes the connection.
+- Once the registrar's 2xx carries `Require: outbound` (RFC 5626 §4.2.1), it
+  sends CRLF pings. Each interval is drawn anew between 80% and 100% of the
+  registrar's `Flow-Timer`, or of 120 s without one. A pong that takes more
+  than 10 s fails the flow (RFC 5626 §4.4.1), and the client closes the
+  connection.
+- REGISTERs go one at a time: a refresh and a de-registration never overlap
+  on the one Call-ID (RFC 3261 §10.2). The registered identity is a SIP URI
+  (TS 24.229 §5.1.1.2.1).
 - Requests from the network arrive over that same connection.
 - After registration, every request carries the route set of TS 24.229
   §5.1.2A.1.1: pcscf, then the `Service-Route` of the last 2xx to REGISTER.
