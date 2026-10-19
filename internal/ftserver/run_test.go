@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	goruntime "runtime"
 	"strings"
 	"sync/atomic"
@@ -168,19 +169,25 @@ func TestSweepRunsOnEveryTickAndReportsFailures(t *testing.T) {
 }
 
 // privateIPv4 returns an RFC 1918 address of this host, such as a
-// container's eth0, or skips the test when there is none.
+// container's eth0. Without one the test is skipped, except in CI (the CI
+// variable, which make passes into the toolchain container), where a skip
+// would go unseen without -v and leave the production dial untested (#119).
 func privateIPv4(t *testing.T) netip.Addr {
 	t.Helper()
+	skip := t.Skipf
+	if os.Getenv("CI") != "" {
+		skip = t.Fatalf
+	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		t.Skipf("no interface addresses: %v", err)
+		skip("no interface addresses: %v", err)
 	}
 	for _, a := range addrs {
 		if p, err := netip.ParsePrefix(a.String()); err == nil && p.Addr().Is4() && runtime.IsPrivateAddr(p.Addr()) {
 			return p.Addr()
 		}
 	}
-	t.Skip("this host has no RFC 1918 address to put the HSS on")
+	skip("this host has no RFC 1918 address to put the HSS on")
 	return netip.Addr{}
 }
 
@@ -266,12 +273,36 @@ func TestRunInStagingReachesTheHSSOnlyAtAPrivateAddress(t *testing.T) {
 					!strings.Contains(fmt.Sprint(failures[0]["error"]), runtime.ErrAddressNotPrivate.Error()) {
 					t.Fatalf("status %d, lookup failures %v, want 503 and ErrAddressNotPrivate", status, failures)
 				}
-			} else if status == http.StatusServiceUnavailable || status == http.StatusUnauthorized || len(failures) != 0 {
+			} else if status != http.StatusNoContent || len(failures) != 0 {
 				t.Fatalf("status %d, lookup failures %v, want alice authenticated", status, failures)
 			}
 			if strings.Contains(h.Output(), "provisioning-token") {
 				t.Fatalf("the token was logged:\n%s", h.Output())
 			}
 		})
+	}
+}
+
+// The production wiring gives the dialer FT_HSS_TIMEOUT: http.Client's
+// Timeout answers the caller in time, but the transport dials with a
+// context the request's end does not cancel, so without it a dial to an
+// address that never answers (10.255.255.1 is not routed here or in CI)
+// would hold a connection slot long after (#119; QA's test from the review
+// of #116).
+func TestTheProductionHSSDialEndsWithinTheHSSTimeout(t *testing.T) {
+	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL("http://10.255.255.1:8081"), HSSTimeout: 300 * time.Millisecond, MaxLookups: 1, Realm: realm}
+	src := credentialSource(cfg, true).(*HSSCredentials)
+	start := time.Now()
+	_, _ = src.Lookup(t.Context(), alice, digest.SHA256)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		if !strings.Contains(string(buf[:goruntime.Stack(buf, true)]), "InternalDialer.DialContext") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the dial still runs %v after a %v FT_HSS_TIMEOUT", time.Since(start), cfg.HSSTimeout)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
