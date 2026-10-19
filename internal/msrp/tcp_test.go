@@ -746,18 +746,31 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		_, err := asOver.Send(context.Background(), Outgoing{ContentType: "application/octet-stream", Body: bodyOf(1 << 20), FailureReport: ReportPartial})
 		over <- err
 	}()
+	// The connected client gets its messages while the unconnected one's
+	// is still held: proved by order, not by a time bound, which a loaded
+	// host broke (#157). A relay that held other sessions up behind the
+	// unconnected one would deliver nothing here before that client came,
+	// and the wait would end at hangGuard.
+	held := func() int {
+		rig.relay.mu.Lock()
+		edge := rig.relay.pairs[rpLate.SessionID][0]
+		rig.relay.mu.Unlock()
+		edge.mu.Lock()
+		defer edge.mu.Unlock()
+		return len(edge.held)
+	}
+	waitProgress(t, "the message for the unconnected client to be held", func() bool { return held() > 0 }, func() int64 { return 0 }, nil)
 	for i := range 5 {
-		start := time.Now()
 		if _, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))}); err != nil {
 			t.Fatal(err)
 		}
 		select {
 		case <-fastH.got:
-			if d := time.Since(start); d > prompt {
-				t.Errorf("message %d to the connected client took %v", i, d)
-			}
 		case <-time.After(hangGuard):
 			t.Fatalf("message %d to the connected client never arrived", i)
+		}
+		if held() == 0 {
+			t.Fatalf("message %d arrived only after the unconnected client's message was released", i)
 		}
 	}
 	if err := <-stored; err != nil {
