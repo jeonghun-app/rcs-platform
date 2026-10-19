@@ -2,6 +2,7 @@ package scenario_test
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -333,6 +334,40 @@ func TestAClientThatSendsNoKeepAliveFailsAtTheStepTimeout(t *testing.T) {
 	// stack's 20 s step timeout.
 	if ka.Millis >= 10000 {
 		t.Fatalf("the keep-alive step took %d ms: KeepAliveTimeout did not bound it", ka.Millis)
+	}
+}
+
+// slowRand stalls the first large read, the chunked message's content, as
+// a loaded host would stall the chunked-message step (QA on #181).
+type slowRand struct {
+	stall time.Duration
+	done  atomic.Bool
+}
+
+func (s *slowRand) Read(p []byte) (int, error) {
+	if len(p) >= 100<<10 && s.done.CompareAndSwap(false, true) {
+		time.Sleep(s.stall)
+	}
+	return cryptorand.Read(p)
+}
+
+func TestASlowStepBeforeTheKeepAliveStepIsNotHeldToItsBound(t *testing.T) {
+	// KeepAliveTimeout bounds the keep-alive step alone: a chunked message
+	// that takes 3 s, longer than it, still passes (#178).
+	cfg := stack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	cfg.KeepAliveTimeout = 2 * time.Second
+	cfg.Rand = &slowRand{stall: 3 * time.Second}
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran {
+		t.Fatalf("the keep-alive step did not run: %+v", results)
+	}
+	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") || ka.Millis >= 10000 {
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+	if c := byStep(results)["chunked-message"]; !c.OK || c.Millis < 3000 {
+		t.Fatalf("chunked-message %+v: the stall did not happen", c)
 	}
 }
 

@@ -58,9 +58,10 @@ type Config struct {
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
 	// KeepAliveTimeout bounds the keep-alive step alone, the IdleWait
-	// included; zero is StepTimeout. A short one makes a client that sends
-	// no keep-alive fail soon without holding every other step, a 100 KiB
-	// chunked message say, to the same bound (#178).
+	// included, so it must be longer than IdleWait; zero is StepTimeout. A
+	// short one makes a client that sends no keep-alive fail soon without
+	// holding every other step, a 100 KiB chunked message say, to the same
+	// bound (#178).
 	KeepAliveTimeout time.Duration
 	// Rand supplies ids and content; crypto/rand when nil.
 	Rand io.Reader
