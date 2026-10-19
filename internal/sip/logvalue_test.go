@@ -237,7 +237,10 @@ func TestStructFieldsAndPlainSlicesMarshalRedacted(t *testing.T) {
 	}
 	for name, out := range map[string]string{"json.Marshal": string(direct), "slog": buf.String()} {
 		for _, secret := range []string{"15550100001", "001010000000001", "Alice Secret", "198.51.100.7", "192.0.2.44", "10.20.30.40",
-			":5060", "transport=", "received", "n0nce-value", "r3sponse-value", "0paque", "s3cret-body", "bob@"} {
+			":5060", "transport=", "received", "n0nce-value", "r3sponse-value", "0paque", "s3cret-body", "bob@",
+			// The body as encoding/json writes a []byte, should Response
+			// lose its MarshalJSON (QA of #101).
+			"czNjcmV0LWJvZHk"} {
 			if strings.Contains(out, secret) {
 				t.Errorf("%s output contains %q:\n%s", name, secret, out)
 			}
@@ -254,6 +257,7 @@ func TestStructFieldsAndPlainSlicesMarshalRedacted(t *testing.T) {
 		{cs[0], `{"uri":"sip:***@10.20.30.0/24","tag":""}`},
 		{Contact{Star: true}, `"*"`},
 		{req, `{"method":"INVITE","uri":"sip:***@ims.example.net","headers":9,"body_bytes":11}`},
+		{Response{StatusCode: 200, Reason: "OK", Body: []byte("s3cret-body")}, `{"status":200,"reason":"OK","headers":0,"body_bytes":11}`},
 	} {
 		if got, err := json.Marshal(c.v); err != nil || string(got) != c.want {
 			t.Errorf("json.Marshal(%T) = %s, %v, want %s", c.v, got, err, c.want)
@@ -271,4 +275,72 @@ func untimedJSONLogger(w io.Writer) *slog.Logger {
 		}
 		return a
 	}}))
+}
+
+// untimedTextLogger is untimedJSONLogger for slog's text handler.
+func untimedTextLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
+}
+
+// Accept-Contact values are the peer's text and +sip.instance can carry an
+// IMEI; Reason text and a reason phrase are the peer's free text (#109). The
+// log, in either handler and as JSON, keeps only what says what happened.
+func TestAcceptContactReasonAndReasonPhrasesLogNoPeerText(t *testing.T) {
+	m := mustParse(t, lines(
+		"SIP/2.0 486 Busy 15550100001",
+		"Via: SIP/2.0/TCP 198.51.100.7:5060;branch=z9hG4bK1",
+		"From: <sip:alice@ims.example.net>;tag=1",
+		"To: <sip:bob@ims.example.net>;tag=2",
+		"Call-ID: a@b",
+		"CSeq: 1 INVITE",
+		`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";+sip.instance="<urn:gsma:imei:00101000-000003-1>";require`,
+		`Reason: SIP;cause=486;text="Alice Secret 15550100001"`,
+		"Content-Length: 0",
+	))
+	resp := m.(*Response)
+	acs, err1 := resp.Header.AcceptContact()
+	rs, err2 := resp.Header.Reason()
+	if err := errors.Join(err1, err2); err != nil {
+		t.Fatal(err)
+	}
+	type event struct {
+		Accept  []AcceptContact
+		Reasons []Reason
+		Resp    Response
+	}
+	direct, err := json.Marshal(event{[]AcceptContact(acs), []Reason(rs), *resp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var js, text bytes.Buffer
+	untimedJSONLogger(&js).Info("x", "accept", acs, "reasons", rs, "resp", resp)
+	untimedTextLogger(&text).Info("x", "accept", acs, "reasons", rs, "resp", resp)
+	for name, out := range map[string]string{"json.Marshal": string(direct), "JSON handler": js.String(), "text handler": text.String()} {
+		if strings.Contains(out, "time=") || strings.Contains(out, `"time"`) {
+			t.Fatalf("%s: the line has a timestamp whose digits could match a secret:\n%s", name, out)
+		}
+		for _, secret := range []string{"00101000-000003-1", "imei", "Alice Secret", "15550100001", "oma.cpm.session"} {
+			if strings.Contains(out, secret) {
+				t.Errorf("%s output contains %q:\n%s", name, secret, out)
+			}
+		}
+	}
+	for _, want := range []string{
+		`"accept":{"0":{"params":"+g.3gpp.icsi-ref;+sip.instance;require"}}`,
+		`"reasons":{"0":{"protocol":"SIP","cause":486}}`,
+		`"resp":{"status":486,"reason":"Busy ***01"`,
+	} {
+		if !strings.Contains(js.String(), want) {
+			t.Errorf("JSON log lacks %s:\n%s", want, js.String())
+		}
+	}
+	if !strings.Contains(text.String(), "accept.0.params=+g.3gpp.icsi-ref;+sip.instance;require") ||
+		!strings.Contains(text.String(), "reasons.0.cause=486") {
+		t.Errorf("text log = %s", text.String())
+	}
 }

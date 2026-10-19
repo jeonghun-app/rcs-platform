@@ -21,7 +21,8 @@ import (
 // values, or a struct of the service's own that holds one, reaches the JSON
 // handler through encoding/json, which ignores LogValue. So the parsers and
 // accessors return lists as the slice types below (Vias, Contacts, Addresses,
-// Challenges, CredentialsList), which log each element through its LogValue,
+// Challenges, CredentialsList, AcceptContacts, Reasons), which log each
+// element through its LogValue,
 // and every type with a LogValue also has a MarshalJSON writing the same
 // redacted form, which covers plain slices and struct fields. Text handlers
 // format such values with fmt instead; the platform logs JSON only
@@ -113,6 +114,28 @@ func (v Via) LogValue() slog.Value {
 	)
 }
 
+// LogValue logs the names of the feature parameters and flags only: their
+// values are the peer's text, and +sip.instance carries the device's
+// instance identifier, often its IMEI (RFC 5626 §4.1, RFC 7254) (#109).
+// The names, the peer's text too, go through internal/pii.
+func (a AcceptContact) LogValue() slog.Value {
+	names := make([]string, len(a.Params))
+	for i, p := range a.Params {
+		names[i] = p.Name
+	}
+	return slog.GroupValue(slog.String("params", pii.Redact(strings.Join(names, ";"))))
+}
+
+// LogValue logs the protocol and the cause; the text is the peer's free
+// text and is left out (#109).
+func (r Reason) LogValue() slog.Value {
+	attrs := []slog.Attr{slog.String("protocol", pii.Redact(r.Protocol))}
+	if c, ok := r.Cause(); ok {
+		attrs = append(attrs, slog.Int("cause", c))
+	}
+	return slog.GroupValue(attrs...)
+}
+
 // Vias is a Via header's elements, top first, as ParseVia and Header.Via
 // return them. It exists so that logging them all goes through Via.LogValue:
 // a plain []Via would be logged field by field, received included.
@@ -129,6 +152,20 @@ type Addresses []Address
 // Challenges is one challenge per WWW-Authenticate or Proxy-Authenticate
 // field; logged, each goes through Challenge.LogValue, nonce left out.
 type Challenges []Challenge
+
+// AcceptContacts is an Accept-Contact header's elements; logged, each goes
+// through AcceptContact.LogValue.
+type AcceptContacts []AcceptContact
+
+// Reasons is a Reason header's elements; logged, each goes through
+// Reason.LogValue.
+type Reasons []Reason
+
+// LogValue logs each element by its position.
+func (as AcceptContacts) LogValue() slog.Value { return listValue(as) }
+
+// LogValue logs each element by its position.
+func (rs Reasons) LogValue() slog.Value { return listValue(rs) }
 
 // CredentialsList is one set of credentials per Authorization or
 // Proxy-Authorization field; logged, each goes through Credentials.LogValue,
@@ -182,7 +219,9 @@ func (r Request) LogValue() slog.Value {
 func (r Response) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Int("status", r.StatusCode),
-		slog.String("reason", r.Reason),
+		// The reason phrase is the peer's text: identifiers in it are
+		// masked like any other text (internal/pii).
+		slog.String("reason", pii.Redact(r.Reason)),
 		slog.Int("headers", r.Header.Len()),
 		slog.Int("body_bytes", len(r.Body)),
 	)
@@ -211,6 +250,12 @@ func (c Credentials) MarshalJSON() ([]byte, error) { return jsonOf(c.LogValue())
 
 // MarshalJSON writes the log value.
 func (v Via) MarshalJSON() ([]byte, error) { return jsonOf(v.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (a AcceptContact) MarshalJSON() ([]byte, error) { return jsonOf(a.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (r Reason) MarshalJSON() ([]byte, error) { return jsonOf(r.LogValue()) }
 
 // MarshalJSON writes the log value.
 func (h Header) MarshalJSON() ([]byte, error) { return jsonOf(h.LogValue()) }
