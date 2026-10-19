@@ -30,16 +30,24 @@ func TestNetworkFailuresLoseTheirAddresses(t *testing.T) {
 	}
 	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 	_ = ln.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The lookup goes to a resolver that cannot be reached, which fails at
+	// once with a *net.DNSError, as an unknown name does. The host's own
+	// resolver (none in the toolchain container) answered in its own time,
+	// and on a loaded host after the test's deadline (#130).
+	noResolver := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("no resolver here")
+	}}
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: (&net.Dialer{Resolver: noResolver}).DialContext,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	client := &http.Client{}
 	for _, tt := range []struct {
 		url  string
 		want []error
 	}{
 		{"http://127.0.0.1:" + port + "/ft", []error{safeerr.ErrRefused}},
-		// Without a resolver to ask, the lookup times out instead.
-		{"http://ft.rcs-sim-test.invalid/ft", []error{safeerr.ErrNoSuchHost, safeerr.ErrTimeout}},
+		{"http://ft.rcs-sim-test.invalid/ft", []error{safeerr.ErrNoSuchHost}},
 	} {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tt.url, nil)
 		_, err := client.Do(req)

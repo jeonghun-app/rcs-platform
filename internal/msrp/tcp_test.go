@@ -676,9 +676,11 @@ func TestARelayKeepsItsRcsAsConnectionUnderPacedChatAndFilePush(t *testing.T) {
 
 func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	ours, theirs := net.Pipe()
-	// A write deadline well above prompt, so that a Send waiting for it
-	// instead of honouring its context fails, also under the race detector.
-	c, err := NewActiveConn(ours, Config{WriteTimeout: DefaultWriteTimeout})
+	// A write deadline of an hour: a Send that waited for it instead of
+	// honouring its context would block far past the minute this test
+	// waits, and would end with the write's timeout rather than the
+	// context's error. So the test needs no tight bound of its own (#130).
+	c, err := NewActiveConn(ours, Config{WriteTimeout: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -693,13 +695,18 @@ func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	start := time.Now()
-	_, err = s.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(10000)})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Send = %v", err)
-	}
-	if d := time.Since(start); d > prompt {
-		t.Fatalf("Send ignored its context for %v", d)
+	sent := make(chan error, 1)
+	go func() {
+		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(10000)})
+		sent <- err
+	}()
+	select {
+	case err := <-sent:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Send = %v, want its context's deadline", err)
+		}
+	case <-time.After(time.Minute):
+		t.Fatal("Send ignored its context, waiting for the write deadline")
 	}
 }
 
