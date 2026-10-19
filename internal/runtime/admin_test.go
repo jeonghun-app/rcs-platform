@@ -401,3 +401,21 @@ func toStrings(v any) []string {
 	}
 	return out
 }
+
+func TestHealthzWaitsForReadyWhenTheServiceAsksForIt(t *testing.T) {
+	a := newAdmin(discardLogger(), time.Now, newFakeTimers().After)
+	a.liveAfterReady = true
+	if code, body := get(t, a, "GET", "/healthz"); code != 503 || body["status"] != "starting" {
+		t.Fatalf("healthz while starting = %d %v, want 503 starting", code, body)
+	}
+	a.markReady()
+	if code, body := get(t, a, "GET", "/healthz"); code != 200 || body["status"] != "ok" {
+		t.Fatalf("healthz once ready = %d %v", code, body)
+	}
+	// A failing dependency or a drain does not make a ready process dead.
+	a.AddReadinessCheck("store", func(context.Context) error { return errors.New("down") })
+	a.stop()
+	if code, _ := get(t, a, "GET", "/healthz"); code != 200 {
+		t.Fatalf("healthz while draining = %d", code)
+	}
+}

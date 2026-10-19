@@ -31,6 +31,9 @@ const readinessCacheTTL = time.Second
 // http.DefaultServeMux so that a package registering debug handlers there
 // (net/http/pprof, expvar) cannot expose them by accident.
 //
+// /healthz answers 200 while the process runs, from the moment the admin
+// server listens to the end of shutdown, or, with Service.LiveAfterReady, 503
+// "starting" until the service calls [Runtime.Ready] and 200 from then on.
 // /readyz answers 503 with status "starting" until the service calls
 // [Runtime.Ready], 503 "stopping" once shutdown has begun, and otherwise 200
 // only if every readiness check passes.
@@ -54,6 +57,9 @@ type Admin struct {
 
 	ready    atomic.Bool
 	stopping atomic.Bool
+	// liveAfterReady is Service.LiveAfterReady; it is set before the admin
+	// server starts and never changes.
+	liveAfterReady bool
 }
 
 type readinessCheck struct {
@@ -121,6 +127,12 @@ func (a *Admin) stop() {
 }
 
 func (a *Admin) healthz(w http.ResponseWriter, _ *http.Request) {
+	if a.liveAfterReady && !a.ready.Load() {
+		writeStatus(w, http.StatusServiceUnavailable, map[string]any{"status": "starting"})
+		return
+	}
+	// Shutdown leaves /healthz passing: a draining task is alive, and a
+	// failing container health check would make ECS kill it mid-drain.
 	writeStatus(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 

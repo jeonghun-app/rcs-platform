@@ -8,3 +8,5 @@ docs
 *.pem
 *.key
 *.p12
+deploy/compose.env
+deploy/compose.env.tmp.*
