@@ -96,7 +96,9 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    separate token buckets, per task.
 4. **CPIM From.** It must be one of the sender's asserted identities, or the
    anonymous URI `sip:anonymous@anonymous.invalid` that RCS clients put in
-   1-to-1 chat. It must also be the only header that a receiver could read as
+   1-to-1 chat. Identities are compared as written and in canonical form
+   (`identity.CanonicalIMPU`), so `;user=phone` or a host's case does not make
+   a client's own provisioned URI someone else's. It must also be the only header that a receiver could read as
    a From, and at most one header may read as a To: a second `From`, a `from`
    or `FROM`, a prefixed `x.From` (whatever namespace the prefix is bound
    to), a `From` after an NS header that changes the default namespace, and

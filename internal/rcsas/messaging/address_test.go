@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -215,5 +216,40 @@ func checkAccepted(t *testing.T, m *Message) {
 	}
 	if a, err := cpim.ParseAddress(froms[0].Value); err != nil || a != m.From {
 		t.Fatalf("From %+v, %v, read %+v", a, err, m.From)
+	}
+}
+
+// The code review's reproduction (PR #118, round 3): a client writes its
+// provisioned public URI in the From as it was given, ;user=phone or an
+// upper-case host included. The group path names the sender in canonical
+// form and must still take it; so must the 1-to-1 path, and a
+// recipient-uri. Someone else's address is still refused.
+func TestASendersOwnAddressInAnotherFormIsItsOwn(t *testing.T) {
+	const asserted = "sip:+15550100002@ims.example.net;user=phone"
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}})
+	r.e.SetGroupHandler(members{all: []string{alice, "sip:+15550100002@ims.example.net"}})
+	for i, from := range []string{asserted, "sip:+15550100002@IMS.example.net", "sip:+15550100002@ims.example.net"} {
+		body := cpimMessage(t, cpim.Address{URI: from}, fmt.Sprint("m", i), "hi", 0)
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(asserted, body)); err != nil {
+			t.Errorf("in the group, From %s: %v", from, err)
+		}
+		if err := r.e.Submit(t.Context(), Origin{Sender: asserted, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: body}); err != nil {
+			t.Errorf("1-to-1, From %s: %v", from, err)
+		}
+	}
+	other := cpimMessage(t, cpim.Address{URI: "sip:+15550100003@ims.example.net;user=phone"}, "x", "hi", 0)
+	if got := rejected(r.e.SubmitGroup(t.Context(), groupFrom(asserted, other))); got != ReasonFromMismatch {
+		t.Fatalf("someone else's From in the group: %q", got)
+	}
+	if got := rejected(r.e.Submit(t.Context(), Origin{Sender: asserted, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: other})); got != ReasonFromMismatch {
+		t.Fatalf("someone else's From 1-to-1: %q", got)
+	}
+	for uri, want := range map[string]bool{
+		asserted: true, "sip:+15550100002@IMS.example.net": true, AnonymousURI: true,
+		"sip:+15550100003@ims.example.net": false, "not a URI": false,
+	} {
+		if got := namesSender(uri, "sip:+15550100002@ims.example.net", nil); got != want {
+			t.Errorf("namesSender(%q) = %v", uri, got)
+		}
 	}
 }

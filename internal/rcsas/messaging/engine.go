@@ -426,7 +426,7 @@ func (e *Engine) submit(ctx context.Context, o Origin) error {
 	if !limit.allow(o.Sender, now) {
 		return reject(ReasonRateLimited, nil)
 	}
-	if m.From.URI != AnonymousURI && m.From.URI != o.Sender && !slices.Contains(o.Identities, m.From.URI) {
+	if !namesSender(m.From.URI, o.Sender, o.Identities) {
 		return reject(ReasonFromMismatch, nil)
 	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
