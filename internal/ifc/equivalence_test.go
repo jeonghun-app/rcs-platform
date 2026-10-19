@@ -290,6 +290,32 @@ func TestAFoldedAlternationThatMergesIntoOneRuneIsCompiled(t *testing.T) {
 	}
 }
 
+// The meaning check takes a class of one rune for that rune's literal, and
+// nothing wider: a class of two runes, or a folded literal against a class
+// missing one of its case variants, still differs.
+func TestTheMeaningCheckTakesAOneRuneClassForItsLiteralOnly(t *testing.T) {
+	class := func(r ...rune) *syntax.Regexp { return &syntax.Regexp{Op: syntax.OpCharClass, Rune: r} }
+	lit := func(f syntax.Flags, r ...rune) *syntax.Regexp {
+		return &syntax.Regexp{Op: syntax.OpLiteral, Flags: f, Rune: r}
+	}
+	for _, tc := range []struct {
+		name string
+		a, b *syntax.Regexp
+		want bool
+	}{
+		{"[0] and 0", class('0', '0'), lit(0, '0'), true},
+		{"[0] and folded 0", class('0', '0'), lit(syntax.FoldCase, '0'), true},
+		{"[0-1] and 0", class('0', '1'), lit(0, '0'), false},
+		{"[01] and 0", class('0', '0', '1', '1'), lit(0, '0'), false},
+		{"[a] and folded a", class('a', 'a'), lit(syntax.FoldCase, 'a'), false},
+		{"[Aa] and folded a", class('A', 'A', 'a', 'a'), lit(syntax.FoldCase, 'a'), true},
+	} {
+		if got := sameMeaning(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: sameMeaning = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
 // Bracket case pairs are the ERE idiom for "ignore case"; main accepts them.
 func TestCasePairBracketsAreNotRefused(t *testing.T) {
 	tp := func(c Condition) *TriggerPoint {
