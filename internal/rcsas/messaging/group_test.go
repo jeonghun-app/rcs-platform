@@ -248,10 +248,10 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if c, err := cpim.Parse(a.next(t).Body); err != nil || !isComposing(c) {
 		t.Fatalf("alice got %v, %v", c, err)
 	}
+	// A delivered copy is removed once its success report is in, after
+	// the client has it.
 	mem := r.store.(*store.Memory)
-	if mem.Len(alice) != 0 || mem.Len(bob) != 0 {
-		t.Fatal("something was left queued")
-	}
+	waitFor(t, "every queue empty", func() bool { return mem.Len(alice) == 0 && mem.Len(bob) == 0 })
 	// Other media types are refused, and so is everything once the
 	// handler says no.
 	if code := a.outcome(t, "text/plain", []byte("x")); code != 415 {
