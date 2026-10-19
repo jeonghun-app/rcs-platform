@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // Test identifiers come from .github/allowed-test-identifiers.txt: IMSIs from the
@@ -340,6 +341,74 @@ func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
+		}
+	}
+}
+
+// CPIM From and To carry im: and pres: URIs (RFC 3862 §3.4, RFC 3860,
+// RFC 3859), whose user part names the subscriber as a sip URI's does.
+func TestRedactMasksTheUserOfImAndPresURIs(t *testing.T) {
+	r := NewRedactor(nil)
+	for _, tt := range []struct{ in, want string }{
+		{"From: Alice <im:alice.smith@" + testDomain + ">", "From: Alice <im:***th@" + testDomain + ">"},
+		{"To: <pres:bob.jones@" + testDomain + ">", "To: <pres:***es@" + testDomain + ">"},
+		{"IM:carol.jones@" + testDomain, "IM:***es@" + testDomain},
+		{"Pres:" + testMSISDN + "@" + testDomain, "Pres:***01@" + testDomain},
+		{"im:conference-factory", "im:conference-factory"},
+	} {
+		if got := r.Redact(tt.in); got != tt.want {
+			t.Errorf("Redact(%q)\n got %q\nwant %q", tt.in, got, tt.want)
+		}
+	}
+	if got := r.URI("from", "im:alice.smith@"+testDomain).Value.String(); got != "im:***th@"+testDomain {
+		t.Errorf("URI(im:…) = %q, want the host kept", got)
+	}
+}
+
+// Digits from other scripts identify a subscriber as well as ASCII ones: a
+// phone number typed on a phone in a CJK input mode arrives in full-width
+// digits, and Arabic-script locales use Arabic-Indic digits.
+func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
+	r := NewRedactor(nil)
+	for _, tt := range []struct{ name, in, want string }{
+		{"full-width MSISDN", "msisdn=１５５５０１００００１", "msisdn=***01"},
+		{"full-width with an ASCII plus", "caller +１５５５０１００００２", "caller +***02"},
+		{"ASCII and full-width mixed", "id 1555０１０0003 seen", "id ***03 seen"},
+		{"Arabic-Indic IMSI", "imsi ٠٠١٠١٠٠٠٠٠٠٠٠٠١", "imsi ***01"},
+		{"Extended Arabic-Indic digits", "شماره ۱۵۵۵۰۱۰۰۰۰۴", "شماره ***04"},
+		{"short full-width numbers are kept", "２０２６年１０月", "２０２６年１０月"},
+		{"full-width inside a sip URI user", "sip:１５５５０１００００１@" + testDomain, "sip:***01@" + testDomain},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := r.Redact(tt.in); got != tt.want {
+				t.Fatalf("Redact(%q)\n got %q\nwant %q", tt.in, got, tt.want)
+			}
+		})
+	}
+	// The keyed hint is the same whichever digits the number was written in,
+	// so one subscriber's log lines still correlate.
+	k := NewRedactor(testKey)
+	if a, b := k.Redact(testMSISDN), k.Redact("+１５５５０１００００１"); a != b {
+		t.Errorf("hints differ: %q and %q", a, b)
+	}
+}
+
+func TestDigitValuesFollowTheUnicodeDecimalDigits(t *testing.T) {
+	for r, want := range map[rune]byte{'7': '7', '٣': '3', '۹': '9', '９': '9', '０': '0', '𝟗': '9', '𝟘': '0', '߃': '3'} {
+		if got := asciiDigit(r); got != want {
+			t.Errorf("asciiDigit(%q) = %q, want %q", r, got, want)
+		}
+	}
+	// asciiDigit relies on every block of decimal digits starting at a zero
+	// and running in tens.
+	for _, rg := range unicode.Nd.R16 {
+		if rg.Stride != 1 || (rg.Hi-rg.Lo+1)%10 != 0 {
+			t.Errorf("Nd range %#x-%#x is not whole blocks of ten", rg.Lo, rg.Hi)
+		}
+	}
+	for _, rg := range unicode.Nd.R32 {
+		if rg.Stride != 1 || (rg.Hi-rg.Lo+1)%10 != 0 {
+			t.Errorf("Nd range %#x-%#x is not whole blocks of ten", rg.Lo, rg.Hi)
 		}
 	}
 }
