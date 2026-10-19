@@ -1,6 +1,7 @@
 package group
 
 import (
+	"strings"
 	"unicode/utf8"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -14,9 +15,12 @@ import (
 // make every later Roster call, and every change, fail for good.
 
 // Bounds on what a client names: they are stored once per participant,
-// and the group's item must stay well inside DynamoDB's 400 KB.
+// the group's item must stay well inside DynamoDB's 400 KB, and the roster
+// document inside conference.MaxDocumentSize (rosterBound). A name of 100
+// bytes, each escaping to five in XML, lets a default group of 100 keep 100
+// former participants as well.
 const (
-	MaxDisplayNameLength = 256
+	MaxDisplayNameLength = 100
 	MaxSubjectLength     = 256
 )
 
@@ -32,7 +36,14 @@ func canonical(id string) (string, bool) {
 	if len(id) > messaging.MaxIdentityLength {
 		return "", false
 	}
-	return identity.CanonicalIMPU(id)
+	c, ok := identity.CanonicalIMPU(id)
+	// An identity is written into the roster twice, as XML attributes; one
+	// that XML would escape could take five times its length there, which
+	// rosterBound does not allow for. No real IMPU has these.
+	if !ok || strings.ContainsAny(c, "&'") {
+		return "", false
+	}
+	return c, true
 }
 
 // validText reports whether s may be a display name or a subject: at most

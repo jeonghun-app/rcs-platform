@@ -1,9 +1,14 @@
 package group
 
 import (
+	"fmt"
+	"math"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 )
 
@@ -76,4 +81,56 @@ func partialDocument(g groupstore.Group, changed, deleted []string) ([]byte, err
 		c.Users.List = append(c.Users.List, conference.User{Entity: id, State: conference.Deleted})
 	}
 	return c.Marshal()
+}
+
+// The roster's size is bounded by the limits rather than checked as it
+// grows: a document that internal/conference could not read back
+// (conference.MaxDocumentSize) would make Roster fail for everyone, and a
+// check on each change would block the Leave or Remove that adds one more
+// former participant to a full roster. rosterBound is the size of the
+// largest full document a group can have, for n entries in all, under the
+// limits on what a client names: the longest conference URI, subject and
+// version, and n users each with the longest identity (stored unescaped,
+// canonical refuses what XML escapes), the longest name in the character
+// that escapes longest (& to &amp;), the longer role and the longest
+// endpoint, a former participant's. A partial document never holds more
+// than the full one it changes.
+func rosterBound(host string, n int) (int, error) {
+	g := groupstore.Group{
+		URI:     "sip:chat-" + strings.Repeat("0", 32) + "@" + host,
+		Subject: strings.Repeat("&", MaxSubjectLength),
+		Version: math.MaxUint32,
+	}
+	for i := range n {
+		suffix := "@" + strconv.Itoa(i) + ".example.net"
+		g.Participants = append(g.Participants, groupstore.Participant{
+			Identity:    "sip:" + strings.Repeat("u", identity.MaxLength-len("sip:")-len(suffix)) + suffix,
+			DisplayName: strings.Repeat("&", MaxDisplayNameLength),
+			Role:        groupstore.Member,
+			State:       groupstore.Left,
+		})
+	}
+	doc, err := fullDocument(g)
+	return len(doc), err
+}
+
+// formerLimit is how many former participants a group of at most
+// maxParticipants keeps: as many as maxParticipants, or fewer if that
+// many would take the largest roster beyond conference.MaxDocumentSize.
+// It fails when not even maxParticipants current ones fit.
+func formerLimit(host string, maxParticipants int) (int, error) {
+	one, err := rosterBound(host, 1)
+	if err != nil {
+		return 0, err
+	}
+	two, err := rosterBound(host, 2)
+	if err != nil {
+		return 0, err
+	}
+	perUser := two - one
+	fit := (conference.MaxDocumentSize - (one - perUser)) / perUser
+	if fit < maxParticipants {
+		return 0, fmt.Errorf("group: a roster of %d participants could exceed %d bytes; at most %d fit", maxParticipants, conference.MaxDocumentSize, fit)
+	}
+	return min(maxParticipants, fit-maxParticipants), nil
 }

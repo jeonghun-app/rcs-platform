@@ -20,6 +20,8 @@ var (
 		"an empty one":     "",
 		"a password":       "sip:bob:secret@example.net",
 		"a CRLF in a user": "sip:bob\r\nX: y@example.net",
+		"an ampersand":     "sip:b&b@example.net",
+		"an apostrophe":    "sip:o'b@example.net",
 	}
 	badNames = map[string]string{
 		"a NUL":         "a\x00b",

@@ -222,12 +222,18 @@ metadata.
     against its author's share, the one its 1-to-1 messages use, and all
     group notifications together hold one share, beyond which they are
     dropped;
-  - names, subject and Conversation-ID, 256 bytes each; identities must be
-    SIP or tel URIs, compared in canonical form, and names XML-safe text, so
-    that one bad value cannot make the stored roster unwritable;
-  - former participants, at most as many as the size limit; adding and
-    removing stranger after stranger cannot grow a group's stored item past
-    DynamoDB's limit and break the group.
+  - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
+    be SIP or tel URIs, compared in canonical form, and names XML-safe text,
+    so that one bad value cannot make the stored roster unwritable;
+  - the roster's size: the limits are such that the largest roster they
+    allow stays within what `internal/conference` reads back (256 KiB),
+    checked when the service starts, so no combination of allowed values
+    makes it unreadable either, and no Leave or Remove is ever refused for
+    size;
+  - former participants, at most as many as the size limit and as the
+    roster bound leaves room for; adding and removing stranger after
+    stranger cannot grow a group's stored item past DynamoDB's limit and
+    break the group.
 - **Metrics.** None names a group or a participant.
 - **Roster privacy.** The roster keeps former participants (up to the size
   limit), so a participant who joins later sees who was in the group before.

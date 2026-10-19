@@ -316,15 +316,17 @@ Every value is checked before anything is stored, and the roster documents are
 built before each write, so that no request can store a group whose roster
 cannot be written (`invalid`):
 
-- **Identities** must be SIP or tel URIs that name a user, at most 256 bytes.
+- **Identities** must be SIP or tel URIs that name a user, at most 255 bytes
+  (`identity.MaxLength`), without `&` or `'`, which XML would escape in the
+  roster.
   They are stored and compared in canonical form (`identity.CanonicalIMPU`,
   the form the HSS provisions): a SIP URI keeps its user part, loses its
   parameters and has its host in lower case; a tel URI is a global number
   without visual separators. One person added as `tel:+1-555-…` and joining
   as `tel:+1555…` is one participant. The SIP layer passes asserted
   identities in the same form, as the CSCFs assert them, and names legs so.
-- **Names and the subject** are at most 256 bytes of UTF-8 that XML can
-  carry, without control characters.
+- **Names** are at most 100 bytes and **the subject** at most 256 bytes of
+  UTF-8 that XML can carry, without control characters.
 - **The Conversation-ID** is at most 256 bytes.
 
 ### Fan-out
@@ -437,9 +439,20 @@ with one user per participant, current or former, and one endpoint each:
 | removed | `disconnected` | `booted` |
 
 A group keeps at most as many former participants as
-`RCSAS_GROUP_MAX_PARTICIPANTS`. Beyond that, whoever left longest ago leaves the
-roster, as a `state="deleted"` user in the partial document of the change that
-pushed it out.
+`RCSAS_GROUP_MAX_PARTICIPANTS`, and fewer where that many could take the roster
+beyond 256 KiB (`conference.MaxDocumentSize`, what `internal/conference` reads
+back). Beyond that, whoever left longest ago leaves the roster, as a
+`state="deleted"` user in the partial document of the change that pushed it
+out.
+
+The roster's size is bounded by the limits, not checked as it grows, so that no
+Leave or Remove can be refused for it. When the service starts, it builds the
+largest full document its limits allow: every identity at 255 bytes, every name
+at 100 bytes of `&` (each escaped to `&amp;`), the longest subject, role and
+endpoint. That is about 1.2 KB a participant. It keeps as many former
+participants as fit with a full group (100 for a group of 100, 9 for a group of
+200) and refuses a size limit whose current participants alone would not fit.
+A partial document never holds more than the full one.
 
 Former participants are in the roster that every current participant reads,
 including those who join after they left. So someone who joins a group learns
@@ -492,7 +505,7 @@ settings:
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
 | `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as` |
 | `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
-| `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200 |
+| `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200. Former participants are kept up to the same number, fewer above 104, so that the roster stays within 256 KiB (see [Roster events](#roster-events)) |
 | `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
 | `RCSAS_GROUP_SENDER_RATE`, `RCSAS_GROUP_SENDER_BURST` | `60`, `30` | Messages per minute one participant writes in one group, per task; also renames |
 | `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |

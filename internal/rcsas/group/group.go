@@ -207,6 +207,10 @@ type Service struct {
 	// fanoutShare is each sender's part of its group's fan-out budget.
 	fanoutShare *messaging.Limiter
 
+	// maxFormer is how many former participants a group keeps
+	// (formerLimit).
+	maxFormer int
+
 	mu      sync.Mutex
 	touched map[string]time.Time
 }
@@ -222,6 +226,10 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 	cfg = cfg.withDefaults()
 	if cfg.MaxParticipants > LimitParticipants {
 		return nil, fmt.Errorf("group: MaxParticipants above %d", LimitParticipants)
+	}
+	former, err := formerLimit(cfg.ConferenceHost, cfg.MaxParticipants)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.FanoutRate.PerMinute > 0 && cfg.FanoutRate.Burst/FanoutSenderShare < FanoutSenderMessages*(cfg.MaxParticipants-1) {
 		return nil, fmt.Errorf("group: a sender's part of the fan-out burst (1/%d) must cover %d messages to a full group",
@@ -243,6 +251,7 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		adds:        messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
+		maxFormer:   former,
 	}
 	engine.SetGroupHandler(s)
 	return s, nil
@@ -609,12 +618,13 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 	return groupstore.Group{}, ErrBusy
 }
 
-// forget drops the oldest former participants of g beyond MaxParticipants
-// of them and returns who it dropped. Without it, adding and removing one
-// stranger after another would grow the stored group without bound.
+// forget drops the oldest former participants of g beyond maxFormer of
+// them and returns who it dropped. Without it, adding and removing one
+// stranger after another would grow the stored group, and its roster,
+// without bound.
 func (s *Service) forget(g *groupstore.Group) []string {
 	var deleted []string
-	for len(g.Participants)-activeCount(g) > s.cfg.MaxParticipants {
+	for len(g.Participants)-activeCount(g) > s.maxFormer {
 		oldest := -1
 		for i, p := range g.Participants {
 			if !p.State.Active() && (oldest < 0 || p.Since.Before(g.Participants[oldest].Since)) {
