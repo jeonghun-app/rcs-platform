@@ -700,6 +700,53 @@ func TestACancelledInviteWithoutAFinalResponseEndsAfter64T1(t *testing.T) {
 	t.Fatal("Invite still waits 64*T1 after its CANCEL")
 }
 
+func TestA2xxAfterACancelledInviteGaveUpIsACKedAndEnded(t *testing.T) {
+	// Code review on #194: Invite has given up 64*T1 after its CANCEL, so
+	// a 200 that comes later has nobody to take its dialog. It is ACKed
+	// and ended, and leaves no dialog behind.
+	r := newRawUAS(t)
+	cfg := r.config(t)
+	clock := newFakeClock()
+	cfg.Clock = clock
+	ua := dial(t, cfg)
+	r.register(t, ua)
+	req, _ := ua.NewInvite(mustURI(t, testPeer), []byte(testOffer))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, _, err := ua.Invite(ctx, req, nil); done <- err }()
+	inv := r.expect(t, "INVITE")
+	r.respond(t, inv, 180)
+	cancel()
+	r.respond(t, r.expect(t, "CANCEL"), 200)
+	gaveUp := false
+	for i := 0; i < 5 && !gaveUp; i++ {
+		clock.advance(64 * transaction.DefaultT1)
+		select {
+		case <-done:
+			gaveUp = true
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if !gaveUp {
+		t.Fatal("Invite still waits 64*T1 after its CANCEL")
+	}
+	ok := mustResponse(t, inv, 200, "late")
+	ok.Header.Add("Contact", "<sip:late@192.0.2.5:5060;transport=tcp>")
+	r.write(t, ok)
+	for _, method := range []string{"ACK", "BYE"} {
+		m := r.expect(t, method)
+		if to, _ := m.Header.To(); to.Tag() != "late" {
+			t.Fatalf("%s To tag %q", method, to.Tag())
+		}
+	}
+	ua.mu.Lock()
+	n := len(ua.dialogs)
+	ua.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d dialogs left", n)
+	}
+}
+
 func TestA2xxAfterAFailureResponseIsACKedAndEnded(t *testing.T) {
 	// Over TCP the INVITE transaction ends at a 603 (Timer D is zero); a
 	// 200 from another branch is then a stray, still ACKed and ended
