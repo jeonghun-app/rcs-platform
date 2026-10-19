@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -179,6 +180,13 @@ type pcscf struct {
 	ids   sip.IDGenerator
 	now   func() time.Time
 	log   *slog.Logger
+	// allRegisters limits the REGISTERs of all clients together.
+	allRegisters *limiter
+	// icscfFirst and icscfTotal bound a REGISTER's first attempt at icscf
+	// and all of them.
+	icscfFirst, icscfTotal time.Duration
+	// metrics counts what is worth an alarm; nil in tests that need none.
+	metrics *runtime.Metrics
 }
 
 // Route implements proxy.Router. A client's REGISTER goes to icscf. Until

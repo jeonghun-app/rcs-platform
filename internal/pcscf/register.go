@@ -3,8 +3,10 @@ package pcscf
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,17 +36,28 @@ const (
 	defaultExpires = 3600
 	// retryAfter is the Retry-After of a refused REGISTER, in seconds.
 	retryAfter = "1"
-	// maxICSCFAttempts and icscfAttemptTimeout bound the icscf addresses a
-	// REGISTER tries and how long each may take, so that a 504 after the
-	// last still reaches the client before its own Timer F, 32 s (RFC 3261
-	// §17.1.2.2).
-	maxICSCFAttempts    = 3
-	icscfAttemptTimeout = 8 * time.Second
+	// maxICSCFAttempts bounds the icscf addresses a REGISTER tries. The
+	// first may take icscfFirstTimeout, longer than the core's own retry of
+	// an HSS (cxclient: two attempts of 5 s), so that a slow but healthy core
+	// is not taken for a dead one; the others share what is left of
+	// icscfTotalTimeout, so that a 504 after the last still reaches the
+	// client before its own Timer F, 32 s (RFC 3261 §17.1.2.2). That is
+	// usually two attempts. A 200 that arrives after its attempt was cut
+	// short is dropped, and the client's next REGISTER recovers.
+	maxICSCFAttempts  = 3
+	icscfFirstTimeout = 12 * time.Second
+	icscfTotalTimeout = 30 * time.Second
+	// minICSCFAttempt is the least time worth giving another attempt.
+	minICSCFAttempt = time.Second
 	// reservationHold is how long a REGISTER holds its registry slot if its
 	// final response never comes through OnResponse: the attempts' time and
 	// a margin.
-	reservationHold = maxICSCFAttempts*icscfAttemptTimeout + 30*time.Second
+	reservationHold = icscfTotalTimeout + 30*time.Second
 )
+
+// metricRegisterTaskLimit counts the REGISTERs refused by the task-wide
+// rate.
+const metricRegisterTaskLimit = "register.refused_task_rate"
 
 // register routes a REGISTER from a client to icscf (TS 24.229 §5.2.2.1):
 // Path names this task's core listener and the flow (RFC 3327, RFC 5626
@@ -57,6 +70,14 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !p.registers.allow(clientKey(src.Addr)) {
 		return p.refuse(r, 503, "Too Many Registrations")
 	}
+	// Every REGISTER, authenticated or not, costs the core a UAR and an
+	// authentication vector, so the task as a whole is bounded as well.
+	if !p.allRegisters.allow(netip.Addr{}) {
+		if p.metrics != nil {
+			p.metrics.Count(metricRegisterTaskLimit, 1)
+		}
+		return p.refuse(r, 503, "Too Many Registrations")
+	}
 	to, err := r.Message.Header.To()
 	if err != nil {
 		return proxy.Decision{Status: 400, Reason: "Bad To"}
@@ -65,8 +86,15 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if err != nil {
 		return proxy.Decision{Status: 400, Reason: "Bad Contact"}
 	}
+	creds, err := r.Message.Header.Authorization()
+	if err != nil {
+		return proxy.Decision{Status: 400, Reason: "Bad Authorization"}
+	}
 	aor := aorKey(to.URI)
-	if !p.registry.reserve(src.Flow, aor, p.now().Add(reservationHold)) {
+	switch err := p.registry.reserve(src.Flow, aor, p.now().Add(reservationHold)); {
+	case errors.Is(err, errTooManyPending):
+		return p.refuse(r, 503, "Too Many Registrations")
+	case err != nil:
 		return p.refuse(r, 503, "Registry Full")
 	}
 	var once sync.Once
@@ -81,22 +109,22 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 		release()
 		return proxy.Decision{Status: 504, Reason: "No I-CSCF"}
 	}
-	tries := &icscfTries{left: dsts[1:min(len(dsts), maxICSCFAttempts)]}
+	tries := &icscfTries{left: dsts[1:min(len(dsts), maxICSCFAttempts)], deadline: p.now().Add(p.icscfTotal)}
 	reg := &registration{flow: src.Flow, aor: aor, outbound: usesOutbound(r.Message, contacts), viaKeep: viaKeep(r.Message)}
 	return proxy.Decision{
-		Targets: []proxy.Target{icscfTarget(r.Message.URI, dsts[0])},
+		Targets: []proxy.Target{icscfTarget(r.Message.URI, dsts[0], p.icscfFirst)},
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
-			return p.prepareRegister(req, reg, icid)
+			return p.prepareRegister(req, reg, icid, creds)
 		},
 		OnBranchFailure: func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
 			if !retryICSCF(f.Response.StatusCode) {
 				return nil
 			}
-			next, ok := tries.next()
+			next, left, ok := tries.next(p.now())
 			if !ok {
 				return nil
 			}
-			return []proxy.Target{icscfTarget(r.Message.URI, next)}
+			return []proxy.Target{icscfTarget(r.Message.URI, next, left)}
 		},
 		OnFinal: func(_ context.Context, res *sip.Response) {
 			switch {
@@ -118,10 +146,10 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	}
 }
 
-// icscfTarget sends a REGISTER to icscf at dst, cut short after
-// icscfAttemptTimeout so that another address can be tried in time.
-func icscfTarget(uri sip.URI, dst transport.Destination) proxy.Target {
-	return proxy.Target{URI: uri, Destination: &dst, Timeout: icscfAttemptTimeout}
+// icscfTarget sends a REGISTER to icscf at dst, cut short after timeout so
+// that another address can be tried in time.
+func icscfTarget(uri sip.URI, dst transport.Destination, timeout time.Duration) proxy.Target {
+	return proxy.Target{URI: uri, Destination: &dst, Timeout: timeout}
 }
 
 // retryICSCF reports whether a REGISTER that icscf answered with code, or
@@ -132,24 +160,29 @@ func retryICSCF(code int) bool {
 	return code == 408 || code == 503 || code == 480 || code >= 300 && code < 400
 }
 
-// icscfTries are the icscf addresses a REGISTER has left to try.
+// icscfTries are the icscf addresses a REGISTER has left to try, and when
+// its attempts must end.
 type icscfTries struct {
-	mu   sync.Mutex
-	left []transport.Destination
-	// exhausted is set when a retryable failure found no address left.
+	mu       sync.Mutex
+	left     []transport.Destination
+	deadline time.Time
+	// exhausted is set when a retryable failure found no address, or no
+	// time, left.
 	exhausted atomic.Bool
 }
 
-func (t *icscfTries) next() (transport.Destination, bool) {
+// next is the address to try at now and how long it may take.
+func (t *icscfTries) next(now time.Time) (transport.Destination, time.Duration, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.left) == 0 {
+	left := t.deadline.Sub(now)
+	if len(t.left) == 0 || left < minICSCFAttempt {
 		t.exhausted.Store(true)
-		return transport.Destination{}, false
+		return transport.Destination{}, 0, false
 	}
 	d := t.left[0]
 	t.left = t.left[1:]
-	return d, true
+	return d, left, true
 }
 
 // refuse answers a request with code and Retry-After, telling the client to
@@ -207,11 +240,11 @@ func viaKeep(req *sip.Request) bool {
 // wrote below pcscf's own must not steer it; Path naming this task's core
 // listener and the flow, with ob when the client uses outbound (RFC 5626
 // §5.1), and Require: path; the visited network and a new charging
-// identifier; and, for a client that does not keep its flow alive,
-// expiries of at most maxExpiresWithoutKeepAlive. The headers only the
-// network may set, a client's Path among them, are gone already, removed
-// on arrival.
-func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string) error {
+// identifier; the client's credentials without integrity-protected; and,
+// for a client that does not keep its flow alive, expiries of at most
+// maxExpiresWithoutKeepAlive. The headers only the network may set, a
+// client's Path among them, are gone already, removed on arrival.
+func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string, creds sip.CredentialsList) error {
 	req.Header.Del("Route")
 	if err := req.Header.Add("Route", sip.Address{URI: p.cfg.ICSCF}.String()); err != nil {
 		return err
@@ -236,6 +269,18 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string
 	if err := req.Header.Set("P-Charging-Vector", p.chargingVector(icid)); err != nil {
 		return err
 	}
+	// pcscf owns integrity-protected (TS 24.229 §5.2.2.1): it sets none, so
+	// scscf always challenges.
+	if len(creds) > 0 {
+		req.Header.Del("Authorization")
+		for _, c := range creds {
+			c.Params = slices.Clone(c.Params)
+			c.Params.Del("integrity-protected")
+			if err := req.Header.Add("Authorization", c.String()); err != nil {
+				return err
+			}
+		}
+	}
 	if !reg.outbound && !reg.viaKeep {
 		return capExpires(&req.Header, maxExpiresWithoutKeepAlive)
 	}
@@ -244,7 +289,7 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string
 
 // chargingVector is the P-Charging-Vector of a request pcscf sends for a
 // client: the request's charging identifier, and this network as the type 1
-// orig-ioi (TS 24.229 §5.2.2.1 4), §5.2.6.3.3 7); no term-ioi).
+// orig-ioi (TS 24.229 §5.2.2.1 3), §5.2.6.3.3 7); no term-ioi).
 func (p *pcscf) chargingVector(icid string) string {
 	return "icid-value=" + icid + ";orig-ioi=" + p.cfg.HomeDomain
 }

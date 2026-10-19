@@ -33,6 +33,11 @@ const (
 	// (#16 question 1).
 	DefaultRegisterRate  = 50
 	DefaultRegisterBurst = 200
+	// DefaultMaxRegisterRate and DefaultMaxRegisterBurst bound the
+	// REGISTERs of all clients of a task together, since each costs the
+	// core a UAR and an authentication vector (security review of #198).
+	DefaultMaxRegisterRate  = 2000
+	DefaultMaxRegisterBurst = 4000
 	// DefaultMaxClientFlows and DefaultCoreConnections split the transport's
 	// DefaultMaxConnections: client flows may take no more than their share,
 	// so the core listener always has room for scscf (review of #188).
@@ -93,7 +98,7 @@ type Config struct {
 	Namespace string
 	// HomeDomain is RCS_IMS_DOMAIN, the operator's IMS domain: the type 1
 	// orig-ioi of P-Charging-Vector, naming the network that sends a
-	// request (TS 24.229 §5.2.2.1 4), §5.2.6.3.3 7)), and the visited
+	// request (TS 24.229 §5.2.2.1 3), §5.2.6.3.3 7)), and the visited
 	// network by default.
 	HomeDomain string
 	// VisitedNetworkID is the P-Visited-Network-ID of REGISTERs (TS 24.229
@@ -108,6 +113,9 @@ type Config struct {
 	// RegisterBurst the REGISTERs of one client address.
 	MaxRegistrations            int
 	RegisterRate, RegisterBurst int
+	// MaxRegisterRate and MaxRegisterBurst bound the REGISTERs of all
+	// clients together.
+	MaxRegisterRate, MaxRegisterBurst int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -138,6 +146,8 @@ func Configure(s *runtime.Settings) Config {
 		MaxRegistrations:  e.Int("MAX_REGISTRATIONS", DefaultMaxRegistrations),
 		RegisterRate:      e.Int("REGISTER_RATE", DefaultRegisterRate),
 		RegisterBurst:     e.Int("REGISTER_BURST", DefaultRegisterBurst),
+		MaxRegisterRate:   e.Int("MAX_REGISTER_RATE", DefaultMaxRegisterRate),
+		MaxRegisterBurst:  e.Int("MAX_REGISTER_BURST", DefaultMaxRegisterBurst),
 		Namespace:         s.ServiceNamespace(),
 		HomeDomain:        strings.TrimSuffix(strings.ToLower(s.Shared.RequiredString("IMS_DOMAIN")), "."),
 	}
@@ -199,6 +209,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"MAX_REGISTRATIONS", c.MaxRegistrations},
 		{"REGISTER_RATE", c.RegisterRate}, {"REGISTER_BURST", c.RegisterBurst},
+		{"MAX_REGISTER_RATE", c.MaxRegisterRate}, {"MAX_REGISTER_BURST", c.MaxRegisterBurst},
 		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
 	} {

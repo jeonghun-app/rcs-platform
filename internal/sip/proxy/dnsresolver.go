@@ -22,14 +22,23 @@ import (
 const DefaultDNSTTL = 10 * time.Second
 
 // DefaultDNSStale is how long past its TTL a DNSResolver still uses an answer
-// by default when a new lookup fails: a short outage or throttling of the
-// VPC resolver then fails no request, while instances keep their addresses
-// that long in any case.
+// by default while it is refreshed: a short outage or throttling of the VPC
+// resolver then fails no request and delays none, while instances keep
+// their addresses that long in any case.
 const DefaultDNSStale = 5 * time.Minute
 
 // maxDNSNames bounds the names a DNSResolver keeps answers for: the core has
 // a handful.
 const maxDNSNames = 256
+
+// minLookupBackoff and maxLookupBackoff bound the wait before a name whose
+// lookup failed is looked up again; refreshTimeout bounds a refresh in the
+// background.
+const (
+	minLookupBackoff = 5 * time.Second
+	maxLookupBackoff = time.Minute
+	refreshTimeout   = 10 * time.Second
+)
 
 // failureLogEvery is how often a DNSResolver logs a name whose lookups keep
 // failing: once when they start, then at most this often.
@@ -43,6 +52,9 @@ const failureLogEvery = time.Minute
 // keeps them for TTL; a host that is already an address is checked the
 // same way. The transport and port follow the URI as for NumericResolver;
 // TLS verifies the host name.
+//
+// A name has one lookup at a time, which no caller waits on while there is
+// an answer to use, and a failure backs the next lookup off (lookup).
 //
 // ResolveAll gives every address in a random order, so that requests spread
 // over the instances and a caller can try the next address when one fails,
@@ -78,6 +90,8 @@ type DNSResolver struct {
 
 	mu    sync.Mutex
 	names map[string]dnsAnswer
+	// refreshes counts the lookups under way, which tests wait for.
+	refreshes sync.WaitGroup
 }
 
 // dnsAnswer is what a DNSResolver keeps of a name: its last answer, until
@@ -87,6 +101,13 @@ type dnsAnswer struct {
 	addrs             []netip.Addr
 	expires           time.Time
 	failing, reported time.Time
+	// inflight, if set, is closed when the lookup under way ends.
+	inflight chan struct{}
+	// failures counts the failed lookups in a row, retryAt is when the next
+	// may start, and err is the last one's error.
+	failures int
+	retryAt  time.Time
+	err      error
 }
 
 // Resolve implements Resolver: the first of ResolveAll.
@@ -145,61 +166,114 @@ func (r *DNSResolver) ResolveAll(ctx context.Context, u sip.URI) ([]transport.De
 	return out, nil
 }
 
-// lookup returns the addresses of host, from a kept answer if it is fresh,
-// or if it is stale and a new lookup fails.
+// lookup returns the addresses of host. A fresh answer is used as it is. A
+// stale one is used at once while a single lookup refreshes it in the
+// background, so no caller waits on a resolver that times out; after a
+// failure the next refresh waits a backoff that doubles from
+// minLookupBackoff to maxLookupBackoff. With no usable answer the callers
+// share one lookup, and within the backoff they get its error without one.
 func (r *DNSResolver) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
-	now := time.Now
-	if r.Now != nil {
-		now = r.Now
-	}
-	t := now()
+	t := r.now()
 	r.mu.Lock()
-	kept, ok := r.names[host]
-	r.mu.Unlock()
-	if ok && kept.addrs != nil && t.Before(kept.expires) {
-		return kept.addrs, nil
+	a := r.names[host]
+	switch {
+	case a.addrs != nil && t.Before(a.expires):
+		r.mu.Unlock()
+		return a.addrs, nil
+	case a.addrs != nil && t.Before(a.expires.Add(r.stale())):
+		if a.inflight == nil && !t.Before(a.retryAt) {
+			r.startLocked(host, t, a)
+		}
+		r.mu.Unlock()
+		return a.addrs, nil
+	case a.inflight == nil && t.Before(a.retryAt):
+		err := a.err
+		r.mu.Unlock()
+		return nil, err
 	}
+	done := a.inflight
+	if done == nil {
+		done = r.startLocked(host, t, a)
+	}
+	r.mu.Unlock()
+	select {
+	case <-done:
+		return r.result(host)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: lookup of %s: %w", ErrUnresolvable, host, ctx.Err())
+	}
+}
+
+// startLocked starts the one lookup of host, which no caller's ctx ends: a
+// request that is cancelled must not make the name fail for the others. mu
+// must be held.
+func (r *DNSResolver) startLocked(host string, t time.Time, a dnsAnswer) chan struct{} {
+	done := make(chan struct{})
+	a.inflight = done
+	r.keepLocked(host, t, a)
+	r.refreshes.Add(1)
+	go func() {
+		defer r.refreshes.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+		defer cancel()
+		r.do(ctx, host, done)
+	}()
+	return done
+}
+
+// result is what the last lookup of host left: its usable answer, or its
+// error.
+func (r *DNSResolver) result(host string) ([]netip.Addr, error) {
+	t := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a := r.names[host]
+	if a.addrs != nil && t.Before(a.expires.Add(r.stale())) {
+		return a.addrs, nil
+	}
+	if a.err != nil {
+		return nil, a.err
+	}
+	return nil, fmt.Errorf("%w: no answer for %s", ErrUnresolvable, host)
+}
+
+// do looks host up and records the outcome, then closes done. A failure is
+// logged at its first occurrence in a run, and then at most every
+// failureLogEvery, with its class, which tells a missing record, a
+// configuration error, from a resolver that does not answer.
+func (r *DNSResolver) do(ctx context.Context, host string, done chan struct{}) {
+	defer close(done)
 	lookup := net.DefaultResolver.LookupNetIP
 	if r.Lookup != nil {
 		lookup = r.Lookup
 	}
 	addrs, err := lookup(ctx, "ip", host)
-	if err != nil {
-		stale := r.Stale
-		if stale <= 0 {
-			stale = DefaultDNSStale
-		}
-		usable := kept.addrs != nil && t.Before(kept.expires.Add(stale))
-		r.failed(host, t, err, usable)
-		if usable {
-			return kept.addrs, nil
-		}
-		return nil, fmt.Errorf("%w: lookup of %s failed (%s): %w", ErrUnresolvable, host, lookupFailure(err), err)
+	if err == nil && len(addrs) == 0 {
+		err = &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
 	}
-	if len(addrs) == 0 {
-		// Not kept: a nil answer is how a failure with nothing to fall back
-		// on is recorded.
-		return nil, nil
-	}
-	for i, a := range addrs {
-		addrs[i] = a.Unmap()
-	}
-	ttl := r.TTL
-	if ttl <= 0 {
-		ttl = DefaultDNSTTL
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.keepLocked(host, t, dnsAnswer{addrs: addrs, expires: t.Add(ttl)})
-	return addrs, nil
-}
-
-// failed records and logs a failed lookup of host: the first of a run, and
-// then at most every failureLogEvery. Its class tells a missing record, a
-// configuration error, from a resolver that does not answer.
-func (r *DNSResolver) failed(host string, t time.Time, err error, stale bool) {
+	t := r.now()
 	r.mu.Lock()
 	a := r.names[host]
+	a.inflight = nil
+	if err == nil {
+		// A copy: the slice is Lookup's, which may keep it.
+		kept := make([]netip.Addr, len(addrs))
+		for i, v := range addrs {
+			kept[i] = v.Unmap()
+		}
+		addrs = kept
+		ttl := r.TTL
+		if ttl <= 0 {
+			ttl = DefaultDNSTTL
+		}
+		r.keepLocked(host, t, dnsAnswer{addrs: addrs, expires: t.Add(ttl)})
+		r.mu.Unlock()
+		return
+	}
+	a.failures++
+	backoff := min(minLookupBackoff<<(min(a.failures, 8)-1), maxLookupBackoff)
+	a.retryAt = t.Add(backoff)
+	a.err = fmt.Errorf("%w: lookup of %s failed (%s): %w", ErrUnresolvable, host, lookupFailure(err), err)
 	if a.failing.IsZero() {
 		a.failing = t
 	}
@@ -207,6 +281,7 @@ func (r *DNSResolver) failed(host string, t time.Time, err error, stale bool) {
 	if report {
 		a.reported = t
 	}
+	stale := a.addrs != nil && t.Before(a.expires.Add(r.stale()))
 	r.keepLocked(host, t, a)
 	r.mu.Unlock()
 	if !report {
@@ -217,7 +292,22 @@ func (r *DNSResolver) failed(host string, t time.Time, err error, stale bool) {
 		log = slog.Default()
 	}
 	log.Warn("DNS lookup failed", slog.String("host", host), slog.String("failure", lookupFailure(err)),
-		slog.Bool("using_stale_answer", stale), slog.Duration("failing_for", t.Sub(a.failing)), slog.String("error", err.Error()))
+		slog.Bool("using_stale_answer", stale), slog.Duration("failing_for", t.Sub(a.failing)),
+		slog.Duration("next_lookup_in", backoff), slog.String("error", err.Error()))
+}
+
+func (r *DNSResolver) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func (r *DNSResolver) stale() time.Duration {
+	if r.Stale > 0 {
+		return r.Stale
+	}
+	return DefaultDNSStale
 }
 
 // keepLocked stores a's answer for host, making room if the names are at
@@ -232,15 +322,17 @@ func (r *DNSResolver) keepLocked(host string, t time.Time, a dnsAnswer) {
 			stale = DefaultDNSStale
 		}
 		for name, old := range r.names {
-			if !t.Before(old.expires.Add(stale)) {
+			if old.inflight == nil && !t.Before(old.expires.Add(stale)) && !t.Before(old.retryAt) {
 				delete(r.names, name)
 			}
 		}
-		for name := range r.names {
+		for name, old := range r.names {
 			if len(r.names) < maxDNSNames {
 				break
 			}
-			delete(r.names, name)
+			if old.inflight == nil {
+				delete(r.names, name)
+			}
 		}
 	}
 	r.names[host] = a
