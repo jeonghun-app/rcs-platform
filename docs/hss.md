@@ -47,7 +47,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_MAX_AUTH_ITEMS` | `4` | AKA vectors per MAR at most (1 to 16) |
 | `HSS_CX_TIMEOUT` | `3s` | store work per Cx request, waiting for the subscriber's lock included |
 | `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included |
-| `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits |
+| `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits. At most `240s` (see Operations) |
 | `HSS_KEYRING_BOOTSTRAP` | `false` | allow creating a first data key although subscriptions are stored (see [Secrets](#secrets)) |
 | `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and the pushes one provisioning request causes |
 
@@ -258,9 +258,13 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   checks both tables. No load balancer sends to `hss`, so nothing acts on
   `/readyz`: a deployment relies on the container health check (`-healthcheck`,
   which probes `/healthz`) and ECS's deployment circuit breaker, which sees a
-  task that exits at `HSS_START_TIMEOUT`. The task definition's health check
-  `startPeriod` must be longer than `HSS_START_TIMEOUT`, or ECS replaces a task
-  that is still starting.
+  task that exits at `HSS_START_TIMEOUT`. ECS ignores failed checks during the
+  health check's `startPeriod` and then marks a task unhealthy after `retries`
+  failures `interval` apart, so `startPeriod + interval × retries` must exceed
+  `HSS_START_TIMEOUT`, or ECS replaces a task that is still starting. The
+  default 60 s start-up fits `startPeriod` 60, `interval` 15, `retries` 3
+  (105 s). `startPeriod` is at most 300 s, so `HSS_START_TIMEOUT` is refused
+  above 240 s.
 - The API logs one `audit: provisioning request` line per request: operation,
   caller, token slot (`current` or `next`), status and the masked IMPI.
 - Metrics: `cx.<command>` (latency), `cx.<command>.<result>` (`e` before an

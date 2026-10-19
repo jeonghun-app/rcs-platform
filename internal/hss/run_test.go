@@ -232,6 +232,32 @@ func TestRunFailsWhenItCannotStart(t *testing.T) {
 	}
 }
 
+// /healthz and /readyz promise "starting" until the store, the keyring and
+// both listeners are up (docs/hss.md, Operations), so Ready must come after
+// the listeners, and never when one fails to open.
+func TestHSSIsStartingUntilBothListenersAreOpen(t *testing.T) {
+	h := runtimetest.New(t, "hss")
+	d := defaultDeps()
+	var seen []string
+	d.listen = func(string, string) (net.Listener, error) {
+		_, body := h.Get("/readyz")
+		seen = append(seen, body)
+		if len(seen) == 2 {
+			return nil, errors.New("address in use")
+		}
+		return net.Listen("tcp", "127.0.0.1:0")
+	}
+	if err := run(context.Background(), h.Runtime, mustConfigure(t, devEnv), d); err == nil {
+		t.Fatal("Run started without its API listener")
+	}
+	_, after := h.Get("/readyz")
+	for _, body := range append(seen, after) {
+		if !strings.Contains(body, "starting") {
+			t.Fatalf("readiness while opening the listeners and after: %q, want starting throughout", append(seen, after))
+		}
+	}
+}
+
 type failingWrapper struct{}
 
 func (failingWrapper) GenerateDataKey(context.Context) ([]byte, []byte, error) {

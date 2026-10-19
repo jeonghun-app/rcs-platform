@@ -114,6 +114,7 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		"no auth items":             {with(devEnv, "HSS_MAX_AUTH_ITEMS", "0"), "HSS_MAX_AUTH_ITEMS"},
 		"no rate":                   {with(devEnv, "HSS_ACS_RATE", "0"), "HSS_ACS_RATE"},
 		"no Cx timeout":             {with(devEnv, "HSS_CX_TIMEOUT", "0s"), "HSS_CX_TIMEOUT"},
+		"start-up beyond 240 s":     {with(devEnv, "HSS_START_TIMEOUT", "241s"), "HSS_START_TIMEOUT"},
 		"bad networks":              {with(devEnv, "HSS_DIAMETER_PEER_NETWORKS", "10.0.0.1/8"), "HSS_DIAMETER_PEER_NETWORKS"},
 		"no IMS domain":             {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
 	} {
@@ -128,6 +129,9 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 	c, err := configure(with(devEnv, "HSS_RCS_AS_URI", "sip:rcs-as.rcs.local:5070", "HSS_CREATE_DEFAULT_PROFILE", "false", "HSS_DEFAULT_PROFILE", "mine"))
 	if err != nil || c.CreateDefaultProfile || c.DefaultProfile != "mine" || c.RCSASURI != "sip:rcs-as.rcs.local:5070" {
 		t.Errorf("explicit settings: %v %+v", err, c)
+	}
+	if c, err := configure(with(devEnv, "HSS_START_TIMEOUT", "240s")); err != nil || c.StartTimeout != 240*time.Second {
+		t.Errorf("a 240 s start-up: %v %v", err, c.StartTimeout)
 	}
 }
 

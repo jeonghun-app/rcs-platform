@@ -61,8 +61,8 @@ type Service[C any] struct {
 	// the process runs; a service whose start-up waits on remote services
 	// (KMS, DynamoDB) and exits at a start-up deadline would be marked
 	// healthy before it can serve. Pair it with a task-definition health
-	// check startPeriod longer than that deadline, or ECS replaces the task
-	// while it starts.
+	// check whose startPeriod plus interval × retries exceeds that deadline,
+	// or ECS replaces the task while it starts.
 	LiveAfterReady bool
 }
 
