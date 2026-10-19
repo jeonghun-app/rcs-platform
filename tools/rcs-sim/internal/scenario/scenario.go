@@ -57,6 +57,12 @@ type Config struct {
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
+	// KeepAliveTimeout bounds the keep-alive step alone, the IdleWait
+	// included, so it must be longer than IdleWait; zero is StepTimeout. A
+	// short one makes a client that sends no keep-alive fail soon without
+	// holding every other step, a 100 KiB chunked message say, to the same
+	// bound (#178).
+	KeepAliveTimeout time.Duration
 	// Rand supplies ids and content; crypto/rand when nil.
 	Rand io.Reader
 }
@@ -143,7 +149,12 @@ var errStepFailed = errors.New("step failed")
 // step runs f as the step called name and reports it. A failure ends the
 // scenario: the error returned is errStepFailed.
 func (r *run) step(name string, f func(ctx context.Context) (map[string]int64, error)) error {
-	ctx, cancel := context.WithTimeout(r.ctx, r.cfg.StepTimeout)
+	return r.stepWithin(name, r.cfg.StepTimeout, f)
+}
+
+// stepWithin is step with its own timeout.
+func (r *run) stepWithin(name string, timeout time.Duration, f func(ctx context.Context) (map[string]int64, error)) error {
+	ctx, cancel := context.WithTimeout(r.ctx, timeout)
 	defer cancel()
 	start := time.Now()
 	detail, err := f(ctx)
