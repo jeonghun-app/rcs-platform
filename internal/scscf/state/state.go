@@ -99,24 +99,29 @@ func FirstVersion(r io.Reader) (int64, error) {
 // randReader is the default source of FirstVersion.
 var randReader io.Reader = rand.Reader
 
-// Registration is the registration state of one public identity: the bindings
-// of RFC 3261 §10.3 with the RFC 5626 additions. The user profile is a Profile
-// of its own, written only when it changes.
+// Registration is the registration state of one implicit registration set
+// (TS 23.228 §5.2.1a): the bindings of RFC 3261 §10.3, with the RFC 5626
+// additions, that every identity of the set shares. The set is one record, so
+// that a REGISTER, a deregistration or a sweep is one conditional save of it,
+// whichever identity of the set it came for; each identity points at it
+// (Identity). The user profile is a Profile of its own under the same key,
+// written only when it changes.
 type Registration struct {
-	// IMPU is the public identity in canonical form (identity.CanonicalIMPU).
-	IMPU string
-	// IMPI is the private identity that registered it.
-	IMPI string
-	// DefaultIMPU is the default public identity of the implicit
-	// registration set IMPU belongs to, in canonical form: with IMPI it
-	// names the set's profile (ProfileKey), which a terminating request to
-	// IMPU reads.
-	DefaultIMPU string
-	Contacts    []Contact
+	// Key is the private identity and the set's default public identity.
+	Key SetKey
+	// Incarnation is drawn when the record is created and kept by every save
+	// of it: the identities that point at the set name it, so that one
+	// pointing at an earlier record of the same key is told apart.
+	Incarnation int64
+	// Identities are the set's public identities, in canonical form, in the
+	// order of its User-Data; Key.IMPU is one of them.
+	Identities []SetIdentity
+	Contacts   []Contact
 	// Deregistering is set on a registration left without contacts by the
-	// sweep that claimed it: until then that instance handles the
-	// deregistration (SAR, NOTIFY), after it any sweep retries it. A
-	// registration without contacts is deleted once that has succeeded.
+	// instance that is deregistering it, a sweep or a user's REGISTER: until
+	// then that instance handles the deregistration (SAR, NOTIFY), after it
+	// any sweep retries it. A registration without contacts is deleted once
+	// that has succeeded.
 	Deregistering time.Time
 	// Unregistered is set on the record of an unregistered user, which the
 	// S-CSCF stores after SAR UNREGISTERED_USER (TS 29.228 §6.1.2) so that
@@ -131,6 +136,46 @@ type Registration struct {
 	// starts at a random value (FirstVersion).
 	Version int64
 }
+
+// SetIdentity is one public identity of an implicit registration set.
+type SetIdentity struct {
+	IMPU string
+	// Barred bars the identity from every communication but registration
+	// (TS 29.228 Annex B.2.1).
+	Barred bool
+}
+
+// Identity is what one public identity names: the implicit registration set
+// it belongs to. It is written when the S-CSCF is assigned the set (SAR) or
+// the set changes (PPR), and deleted with the set, never by a re-registration.
+type Identity struct {
+	// IMPU is the public identity in canonical form.
+	IMPU string
+	// Set and Incarnation name the set's record.
+	Set         SetKey
+	Incarnation int64
+	Barred      bool
+	// Version is as for Registration.
+	Version int64
+}
+
+// Validate checks i against the limits of this package.
+func (i *Identity) Validate() error {
+	if !canonicalIMPU(i.IMPU) {
+		return fmt.Errorf("%w: identity IMPU is not a canonical public identity", ErrInvalid)
+	}
+	if err := validSetKey(i.Set); err != nil {
+		return err
+	}
+	if i.Incarnation == 0 {
+		return fmt.Errorf("%w: an identity names its set's incarnation", ErrInvalid)
+	}
+	return nil
+}
+
+// MaxIdentities bounds the public identities of one implicit registration
+// set.
+const MaxIdentities = 32
 
 // Contact is one binding.
 type Contact struct {
@@ -206,6 +251,7 @@ func (r *Registration) Prune(now time.Time) []Contact {
 // Clone returns a deep copy.
 func (r *Registration) Clone() *Registration {
 	c := *r
+	c.Identities = slices.Clone(r.Identities)
 	c.Contacts = make([]Contact, len(r.Contacts))
 	for i, ct := range r.Contacts {
 		ct.Path = slices.Clone(ct.Path)
@@ -220,14 +266,24 @@ func (r *Registration) Clone() *Registration {
 
 // Validate checks r against the limits of this package.
 func (r *Registration) Validate() error {
-	if !canonicalIMPU(r.IMPU) {
-		return fmt.Errorf("%w: registration IMPU is not a canonical public identity", ErrInvalid)
+	if err := validSetKey(r.Key); err != nil {
+		return err
 	}
-	if err := identity.ValidIMPI(r.IMPI); err != nil {
-		return fmt.Errorf("%w: registration IMPI: %w", ErrInvalid, err)
+	if r.Incarnation == 0 {
+		return fmt.Errorf("%w: a registration needs an incarnation", ErrInvalid)
 	}
-	if !canonicalIMPU(r.DefaultIMPU) {
-		return fmt.Errorf("%w: registration DefaultIMPU is not a canonical public identity", ErrInvalid)
+	if len(r.Identities) == 0 || len(r.Identities) > MaxIdentities {
+		return fmt.Errorf("%w: a set has 1 to %d identities", ErrInvalid, MaxIdentities)
+	}
+	found := false
+	for _, id := range r.Identities {
+		if !canonicalIMPU(id.IMPU) {
+			return fmt.Errorf("%w: a set identity is not a canonical public identity", ErrInvalid)
+		}
+		found = found || id.IMPU == r.Key.IMPU
+	}
+	if !found {
+		return fmt.Errorf("%w: the set's default identity is not among its identities", ErrInvalid)
 	}
 	if len(r.Contacts) > MaxContacts {
 		return fmt.Errorf("%w: more than %d contacts", ErrInvalid, MaxContacts)
@@ -260,11 +316,6 @@ func canonicalIMPU(impu string) bool {
 	return ok && canon == impu && KeyOK(impu, MaxKey)
 }
 
-// ProfileKey returns the key of the profile that applies to r's IMPU.
-func (r *Registration) ProfileKey() ProfileKey {
-	return ProfileKey{IMPI: r.IMPI, IMPU: r.DefaultIMPU}
-}
-
 // sizeOK refuses an item whose JSON form exceeds MaxItemBytes. The backends'
 // own encodings are no larger, so a registration this accepts fits everywhere.
 func sizeOK(what string, v any) error {
@@ -278,13 +329,15 @@ func sizeOK(what string, v any) error {
 	return nil
 }
 
-// Registrations stores the registration state, one item per public identity.
+// Registrations stores the registration state: one record per implicit
+// registration set, and per public identity the set it belongs to.
 type Registrations interface {
-	// Registration returns the registration of a canonical IMPU.
-	Registration(ctx context.Context, impu string) (*Registration, error)
+	// Registration returns the registration of a set.
+	Registration(ctx context.Context, k SetKey) (*Registration, error)
 	// RegistrationsOf returns every registration of a private identity, which
 	// a Registration-Termination-Request without public identities ends (TS
-	// 29.228 §6.1.3).
+	// 29.228 §6.1.3). It is read through an index, which may miss one saved
+	// moments ago.
 	RegistrationsOf(ctx context.Context, impi string) ([]*Registration, error)
 	// SaveRegistration stores r and returns it with its new version. A
 	// Version of 0 creates it and fails with ErrExists if it exists; any
@@ -295,6 +348,12 @@ type Registrations interface {
 	// DeleteRegistration deletes r if its version is still the stored one
 	// (ErrConflict otherwise, ErrNotFound if gone).
 	DeleteRegistration(ctx context.Context, r *Registration) error
+	// Identity returns what a canonical IMPU names.
+	Identity(ctx context.Context, impu string) (*Identity, error)
+	// SaveIdentity and DeleteIdentity are as SaveRegistration and
+	// DeleteRegistration, for an identity.
+	SaveIdentity(ctx context.Context, i *Identity) (*Identity, error)
+	DeleteIdentity(ctx context.Context, i *Identity) error
 	// ExpiringRegistrations returns up to limit registrations whose SweepAt
 	// has come at now, for SweepRegistrations.
 	ExpiringRegistrations(ctx context.Context, now time.Time, limit int) ([]*Registration, error)
@@ -305,7 +364,7 @@ type Registrations interface {
 // initial filter criteria. The HSS sends User-Data per implicit registration
 // set, an SAA only the set of the identity it was asked about and a PPR one
 // set at a time (TS 29.228 §6.1.2, §6.2.2), so a profile is stored per set
-// (ProfileKey): one private identity with two sets has two, and saving one
+// (SetKey): one private identity with two sets has two, and saving one
 // leaves the other. Profiles are kept apart from the registrations so a
 // re-registration, which changes only contacts, does not rewrite them, and so
 // that an unregistered user's profile stays as long as the HSS has the user
@@ -314,7 +373,7 @@ type Registrations interface {
 type Profiles interface {
 	// Profile returns the profile stored for k, ErrNotFound if there is none
 	// or its KeepUntil has come at now.
-	Profile(ctx context.Context, k ProfileKey, now time.Time) (*Profile, error)
+	Profile(ctx context.Context, k SetKey, now time.Time) (*Profile, error)
 	// SaveProfile stores p. A profile received earlier than the one stored
 	// for its key is not stored (ErrConflict): an SAA that took longer to
 	// arrive must not undo the PPR that followed it. Saving the same one
@@ -327,23 +386,35 @@ type Profiles interface {
 	// during that one too, KeepProfile returns nil and the saved KeepUntil
 	// stands: that profile was just written, and the next registration
 	// extends it (KeepDue). It never returns ErrConflict.
-	KeepProfile(ctx context.Context, k ProfileKey, until, now time.Time) error
+	KeepProfile(ctx context.Context, k SetKey, until, now time.Time) error
 	// DeleteProfile deletes the profile of k; deleting none is no error.
-	DeleteProfile(ctx context.Context, k ProfileKey) error
+	DeleteProfile(ctx context.Context, k SetKey) error
 	// DeleteProfileIf deletes the profile of k only if it is still the one
 	// received at received (Profile.Received): one another instance saved
 	// since, for a registration of its own, stays and gives ErrConflict.
 	// Deleting none is no error.
-	DeleteProfileIf(ctx context.Context, k ProfileKey, received time.Time) error
+	DeleteProfileIf(ctx context.Context, k SetKey, received time.Time) error
 }
 
-// ProfileKey names the profile of one implicit registration set.
-type ProfileKey struct {
+// SetKey names one implicit registration set: its registration and its
+// profile.
+type SetKey struct {
 	// IMPI is the private identity the set belongs to.
 	IMPI string
-	// IMPU is the set's default public identity in canonical form, the one
-	// its registrations name in DefaultIMPU.
+	// IMPU is the set's default public identity in canonical form: the first
+	// of its identities that is not barred (TS 24.229 §5.4.1.2.2F). Every
+	// identity of the set names it (Identity.Set).
 	IMPU string
+}
+
+func validSetKey(k SetKey) error {
+	if err := identity.ValidIMPI(k.IMPI); err != nil {
+		return fmt.Errorf("%w: set IMPI: %w", ErrInvalid, err)
+	}
+	if !canonicalIMPU(k.IMPU) {
+		return fmt.Errorf("%w: set IMPU is not a canonical public identity", ErrInvalid)
+	}
+	return nil
 }
 
 // ProfileGrace is how long a profile outlives the last contact expiry of its
@@ -361,7 +432,7 @@ const (
 
 // Profile is the User-Data of one implicit registration set.
 type Profile struct {
-	Key      ProfileKey
+	Key      SetKey
 	UserData []byte
 	// Received is when the SAA or PPR that carried UserData arrived, which
 	// orders the profiles of one set across instances.
@@ -392,11 +463,8 @@ func (p *Profile) Clone() *Profile {
 // ValidProfile checks a profile against the limits of this package; the
 // backends apply it in SaveProfile.
 func ValidProfile(p *Profile) error {
-	if err := identity.ValidIMPI(p.Key.IMPI); err != nil {
-		return fmt.Errorf("%w: profile IMPI: %w", ErrInvalid, err)
-	}
-	if !canonicalIMPU(p.Key.IMPU) {
-		return fmt.Errorf("%w: profile IMPU is not a canonical public identity", ErrInvalid)
+	if err := validSetKey(p.Key); err != nil {
+		return err
 	}
 	if !validTime(p.Received) || !validTime(p.KeepUntil) {
 		return fmt.Errorf("%w: a profile needs the time it was received and a KeepUntil", ErrInvalid)
