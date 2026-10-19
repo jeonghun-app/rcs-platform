@@ -51,12 +51,11 @@ const (
 // Metrics is what the client records; *runtime.Metrics has it. No name carries
 // an identity.
 //
-//	cxclient.peers                 available HSS peers, sampled at every
-//	                               discovery (a gauge: read Average or Minimum,
-//	                               not Sum)
-//	cxclient.peers.known           HSS tasks the client keeps a connection
-//	                               to, sampled likewise: below the HSS task
-//	                               count means RTR and PPR can be lost
+//	cxclient.peers                 gauge: available HSS peers, at every
+//	                               discovery
+//	cxclient.peers.known           gauge: HSS tasks the client keeps a
+//	                               connection to; below the HSS task count
+//	                               means RTR and PPR can be lost
 //	cxclient.peer.added, .removed  HSS tasks connected and dropped
 //	cxclient.resolve.error         failed discoveries; the peers are kept
 //	cxclient.peer.excluded         tasks excluded after an attempt timed out
@@ -69,6 +68,7 @@ const (
 //	cxclient.RTR.<result>, cxclient.PPR.<result>  answers sent to the HSS
 type Metrics interface {
 	Count(name string, n int64)
+	Gauge(name string, v int64)
 	Timing(name string, d time.Duration)
 }
 
@@ -188,6 +188,7 @@ func (systemClock) AfterFunc(d time.Duration, f func()) diameter.Timer { return 
 type discardMetrics struct{}
 
 func (discardMetrics) Count(string, int64)          {}
+func (discardMetrics) Gauge(string, int64)          {}
 func (discardMetrics) Timing(string, time.Duration) {}
 
 // New returns a client and starts resolving the HSS name, at once and then
@@ -364,8 +365,8 @@ func (c *Client) Refresh(ctx context.Context) error {
 		c.log.Info("cxclient: HSS task removed", slog.String("address", p.addr.String()))
 		c.shutdown(p)
 	}
-	c.metrics.Count("cxclient.peers", int64(len(c.usable(nil))))
-	c.metrics.Count("cxclient.peers.known", int64(known))
+	c.metrics.Gauge("cxclient.peers", int64(len(c.usable(nil))))
+	c.metrics.Gauge("cxclient.peers.known", int64(known))
 	return errs
 }
 

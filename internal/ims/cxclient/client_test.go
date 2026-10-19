@@ -13,6 +13,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 
 func TestTheClientConnectsToEveryHSSTaskInDNS(t *testing.T) {
@@ -690,7 +691,13 @@ func TestLatencyAndPeerGaugesAreRecorded(t *testing.T) {
 	if e.metrics.timed["cxclient.SAR.latency"] != 1 {
 		t.Error("SAR latency not recorded")
 	}
-	if e.metrics.counts["cxclient.peers"] < 1 || e.metrics.counts["cxclient.peers.known"] < 2 {
-		t.Errorf("gauges %d available, %d known", e.metrics.counts["cxclient.peers"], e.metrics.counts["cxclient.peers.known"])
+	if e.metrics.gauges["cxclient.peers"] != 1 || e.metrics.gauges["cxclient.peers.known"] != 1 {
+		t.Errorf("gauges %d available, %d known; want 1 and 1", e.metrics.gauges["cxclient.peers"], e.metrics.gauges["cxclient.peers.known"])
+	}
+	if _, summed := e.metrics.counts["cxclient.peers"]; summed {
+		t.Error("cxclient.peers is recorded as a count")
 	}
 }
+
+// The services pass their *runtime.Metrics.
+var _ Metrics = (*runtime.Metrics)(nil)

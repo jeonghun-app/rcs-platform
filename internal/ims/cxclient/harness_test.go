@@ -264,7 +264,18 @@ func busy(uint32, *diameter.Message) (*diameter.Message, error) {
 type recordingMetrics struct {
 	mu     sync.Mutex
 	counts map[string]int64
+	gauges map[string]int64
 	timed  map[string]int
+}
+
+// Gauge keeps the last value, as runtime.Metrics does.
+func (m *recordingMetrics) Gauge(name string, v int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gauges == nil {
+		m.gauges = map[string]int64{}
+	}
+	m.gauges[name] = v
 }
 
 func (m *recordingMetrics) Count(name string, n int64) {
