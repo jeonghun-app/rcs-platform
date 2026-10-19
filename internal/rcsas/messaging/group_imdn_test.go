@@ -236,6 +236,11 @@ func TestReceiptsFromManyGroupsDoNotFillTheAuthorsQueue(t *testing.T) {
 			}
 		}
 	}
+	// One invitation at most per item queued for alice: the engine tries
+	// her when work arrives, and does not loop.
+	if n, items := r.d.invited.Load(), int64(9*(len(everyone)-1)*2); n > items {
+		t.Errorf("%d invitations for %d receipts", n, items)
+	}
 	l := queueLimit(r.e.cfg)
 	if got := r.store.(*store.Memory).Len(alice); got != l.GroupCount || got != 250 {
 		t.Fatalf("%d receipts queued for alice, the total is %d", got, l.GroupCount)

@@ -29,16 +29,20 @@ func (s *readCounter) Pending(ctx context.Context, r, after string, now time.Tim
 	return ms, err
 }
 
-func drainInvites(t *testing.T, d *fakeDeliverer) {
-	go func() {
-		for {
-			select {
-			case <-d.invites:
-			case <-t.Context().Done():
-				return
-			}
+// drainInvites is for a test that does not look at invitations: from now
+// on they are only counted (fakeDeliverer.invited), and those already sent
+// are dropped.
+func drainInvites(_ *testing.T, d *fakeDeliverer) {
+	d.mu.Lock()
+	d.unread = true
+	d.mu.Unlock()
+	for {
+		select {
+		case <-d.invites:
+		default:
+			return
 		}
-	}()
+	}
 }
 
 // Messages that wait for a session are not read again for each new one:

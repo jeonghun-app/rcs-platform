@@ -170,6 +170,12 @@ func (c *counter) get(name string) int64 {
 // full channel counts the attempt in overflow rather than block: an
 // engine that loops on attempts then fails its test (newRigWith) instead
 // of hanging it, workers and Close included.
+//
+// A test that does not look at invitations (drainInvites) has them only
+// counted, in invited: draining them through the channel raced the
+// engine, and a loaded host let the channel fill with attempts the engine
+// makes by design, which counted as a loop (#192). Past maxUnreadInvites
+// they count as overflow all the same.
 type fakeDeliverer struct {
 	mu       sync.Mutex
 	pagerCtx func(context.Context, Delivery) error
@@ -178,7 +184,14 @@ type fakeDeliverer struct {
 	pagers   chan Delivery
 	invites  chan Invitation
 	overflow atomic.Int64
+	// unread is set by drainInvites; invited counts every invitation.
+	unread  bool
+	invited atomic.Int64
 }
+
+// maxUnreadInvites bounds the invitations a test that does not read them
+// may cause before the engine counts as looping.
+const maxUnreadInvites = 100_000
 
 func newFakeDeliverer() *fakeDeliverer {
 	return &fakeDeliverer{pagers: make(chan Delivery, 256), invites: make(chan Invitation, 256)}
@@ -204,12 +217,19 @@ func (f *fakeDeliverer) Pager(ctx context.Context, d Delivery) error {
 }
 
 func (f *fakeDeliverer) Invite(_ context.Context, inv Invitation) error {
+	n := f.invited.Add(1)
 	f.mu.Lock()
-	h := f.invite
+	h, unread := f.invite, f.unread
 	f.mu.Unlock()
 	var err error
 	if h != nil {
 		err = h(inv)
+	}
+	if unread {
+		if n > maxUnreadInvites {
+			f.overflow.Add(1)
+		}
+		return err
 	}
 	select {
 	case f.invites <- inv:
