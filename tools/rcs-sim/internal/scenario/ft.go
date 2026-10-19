@@ -18,16 +18,13 @@ import (
 const thumbnailSize = 2 << 10
 
 // uploadSettle is how long a broken upload may take to show in
-// get_upload_info unless Config.UploadSettle says otherwise, settlePoll how often the simulator asks meanwhile, and
-// settleQuiet how long the bytes held must stay the same before it resumes
-// (ft.Client.SettledUploadInfo). uploadSettle is a variable so that a test
-// counting the requests can leave their number to the server's answers,
-// not to how fast a loaded host sends them (#159).
-var uploadSettle = 3 * time.Second
-
+// get_upload_info when Config.UploadSettle is zero, settlePoll how often
+// the simulator asks meanwhile, and settleQuiet how long the bytes held
+// must stay the same before it resumes (ft.Client.SettledUploadInfo).
 const (
-	settlePoll  = 100 * time.Millisecond
-	settleQuiet = 300 * time.Millisecond
+	uploadSettle = 3 * time.Second
+	settlePoll   = 100 * time.Millisecond
+	settleQuiet  = 300 * time.Millisecond
 )
 
 // newTID returns a transfer id: 128 random bits, hex.

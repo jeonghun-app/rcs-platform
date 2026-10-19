@@ -290,12 +290,13 @@ func TestABusyUploadIsSentAgainAndCounted(t *testing.T) {
 
 func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
 	// The answers below decide how often get_upload_info is asked, so the
-	// step's own timeout is the only bound. Under load one request took the
-	// whole of the default settle time, which ended the step after a single
-	// 404 (#159); the first one here, the unsigned GET that draws the
-	// challenge, is made that slow on purpose.
+	// step's own timeout is the only bound: stack() sets the settle time
+	// to an hour (#176). Under load one request took the whole of the
+	// default settle time, which ended the step after a single 404 (#159);
+	// the first one here, the unsigned GET that draws the challenge, is
+	// made that slow on purpose, so this test fails without stack()'s
+	// setting.
 	slow := scenario.UploadSettle() + 100*time.Millisecond
-	defer scenario.SetUploadSettle(time.Hour)()
 	cfg := stack(t)
 	// The first three signed get_upload_info answer 404, as when the server
 	// has not yet noticed the break.
@@ -314,42 +315,6 @@ func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
 	}
 	if !byStep(results)["resume"].OK {
 		t.Fatalf("results %+v", results)
-	}
-}
-
-// slowFirst holds the first signed get_upload_info for delay before
-// sending it on.
-type slowFirst struct {
-	next  http.RoundTripper
-	delay time.Duration
-	n     atomic.Int32
-}
-
-func (s *slowFirst) RoundTrip(r *http.Request) (*http.Response, error) {
-	if strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != "" && s.n.Add(1) == 1 {
-		select {
-		case <-time.After(s.delay):
-		case <-r.Context().Done():
-			return nil, r.Context().Err()
-		}
-	}
-	return s.next.RoundTrip(r)
-}
-
-func TestAResumeOutlastsASlowUploadInfoAnswer(t *testing.T) {
-	// One answer slower than the default 3 s settle time, as a loaded host
-	// gave (#176), ended get_upload_info with "the server is still storing
-	// the broken upload" although the bytes held never changed. In the
-	// stack only the step timeout bounds it.
-	cfg := stack(t)
-	slow := &slowFirst{delay: 3*time.Second + 100*time.Millisecond}
-	slow.next = cfg.FT.HTTP.Transport
-	client := *cfg.FT.HTTP
-	client.Transport = slow
-	cfg.FT.HTTP = &client
-	ok, results := runAll(t, cfg, "ft-resume")
-	if !ok || !byStep(results)["resume"].OK || slow.n.Load() == 0 {
-		t.Fatalf("ok %v, %d signed get_upload_info\nall results: %+v", ok, slow.n.Load(), results)
 	}
 }
 
