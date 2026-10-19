@@ -21,7 +21,9 @@ platform the ADRs describe:
   role only (ADR 0007 §4);
 * tables holding capabilities are read only by their own service's task
   role, and nothing may export them: msrp-bindings holds rcs-as session ids
-  (threat model T3, #54).
+  (threat model T3, #54); a wildcard ARN, or one naming the table, counts;
+* every task role is granted each action its service's code calls
+  (infra/task-role-actions.yaml).
 
 Runs in the infra tools image (deploy/infra-tools.Dockerfile), which provides
 cfn-lint's CloudFormation YAML decoder. Usage: check_infra.py TEMPLATE...
@@ -30,6 +32,9 @@ Exit status 1 lists every problem.
 
 from __future__ import annotations
 
+import fnmatch
+import pathlib
+import re
 import sys
 from dataclasses import dataclass
 
@@ -310,11 +315,36 @@ def _reads_secrets(document: dict) -> bool:
     return False
 
 
+def _policies(role: dict) -> list[dict]:
+    """A role's inline policies, both branches of an Fn::If included."""
+    found = []
+    for policy in role.get("Properties", {}).get("Policies", []):
+        if isinstance(policy, dict) and "Fn::If" in policy:
+            found += [b for b in policy["Fn::If"][1:] if isinstance(b, dict) and "PolicyDocument" in b]
+        elif isinstance(policy, dict):
+            found.append(policy)
+    return found
+
+
+def task_roles(template: dict) -> set[str]:
+    """Roles a task's code runs as: every role ECS tasks may assume that is no
+    task definition's execution role, so a role created before its service
+    (and its task definition) is covered too."""
+    tds = resources(template, "AWS::ECS::TaskDefinition").values()
+    execution = {logical_id(td.get("Properties", {}).get("ExecutionRoleArn")) for td in tds}
+    named = {logical_id(td.get("Properties", {}).get("TaskRoleArn")) for td in tds}
+    assumed = set()
+    for name, role in resources(template, "AWS::IAM::Role").items():
+        trust = role.get("Properties", {}).get("AssumeRolePolicyDocument", {})
+        for st in trust.get("Statement", []):
+            services = st.get("Principal", {}).get("Service", [])
+            if "ecs-tasks.amazonaws.com" in ([services] if isinstance(services, str) else services):
+                assumed.add(name)
+    return ((assumed - execution) | named) - {None}
+
+
 def check_secret_access(template: dict) -> list[str]:
-    task_roles = {
-        logical_id(td.get("Properties", {}).get("TaskRoleArn"))
-        for td in resources(template, "AWS::ECS::TaskDefinition").values()
-    } - {None}
+    roles_of_tasks = task_roles(template)
     problems = []
     for name, td in resources(template, "AWS::ECS::TaskDefinition").items():
         props = td.get("Properties", {})
@@ -322,18 +352,18 @@ def check_secret_access(template: dict) -> list[str]:
         if task is not None and task == logical_id(props.get("ExecutionRoleArn")):
             problems.append(f"{name}: the task role is also the execution role, so the task can read its secrets")
     roles = resources(template, "AWS::IAM::Role")
-    for name in sorted(task_roles):
-        role = roles.get(name, {}).get("Properties", {})
-        for policy in role.get("Policies", []):
+    for name in sorted(roles_of_tasks):
+        role = roles.get(name, {})
+        for policy in _policies(role):
             if _reads_secrets(policy.get("PolicyDocument", {})):
                 problems.append(f"{name}: a task role may read secrets (only execution roles may)")
-        if role.get("ManagedPolicyArns"):
+        if role.get("Properties", {}).get("ManagedPolicyArns"):
             problems.append(f"{name}: a task role has managed policies, which this check cannot see into")
     for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
         for name, policy in resources(template, kind).items():
             props = policy.get("Properties", {})
             attached = {logical_id(r) for r in props.get("Roles", [])}
-            if attached & task_roles and _reads_secrets(props.get("PolicyDocument", {})):
+            if attached & roles_of_tasks and _reads_secrets(props.get("PolicyDocument", {})):
                 problems.append(f"{name}: lets a task role read secrets (only execution roles may)")
     return problems
 
@@ -352,37 +382,57 @@ READ_ACTIONS = {
 }
 
 
-def _names(value) -> set[str]:
+def _table_suffixes(template: dict) -> dict[str, str]:
+    """Protected table -> the name it gets after the stack prefix."""
+    suffixes = {}
+    for table in TABLE_READERS:
+        name = resources(template, "AWS::DynamoDB::Table").get(table, {}).get("Properties", {}).get("TableName")
+        text = name.get("Fn::Sub", "") if isinstance(name, dict) else str(name or "")
+        if text:
+            suffixes[table] = text.split("}")[-1].lstrip("-") or text
+    return suffixes
+
+
+def _arn_names(text: str, suffixes: dict[str, str]) -> set[str]:
+    """What an ARN string reaches: the logical ids it names (a wildcard after
+    one stays under it, such as an index of that table), a protected table
+    named literally, or everything ("*") for a wildcard naming nothing."""
+    refs = set(re.findall(r"\$\{([A-Za-z0-9]+)[.}]", text))
+    found = set(refs)
+    found |= {table for table, suffix in suffixes.items() if suffix and suffix in text}
+    if not found and ("*" in text or "?" in text):
+        found.add("*")
+    return found
+
+
+def _names(value, suffixes: dict[str, str] | None = None) -> set[str]:
     """Logical ids a Resource value refers to, and "*" for a wildcard."""
+    suffixes = suffixes or {}
     found: set[str] = set()
     if isinstance(value, str):
-        if value == "*":
-            found.add("*")
+        found |= _arn_names(value, suffixes)
     elif isinstance(value, list):
         for item in value:
-            found |= _names(item)
+            found |= _names(item, suffixes)
     elif isinstance(value, dict):
         name = logical_id(value)
         if name:
             found.add(name)
         if "Fn::Sub" in value:
             text = value["Fn::Sub"][0] if isinstance(value["Fn::Sub"], list) else value["Fn::Sub"]
-            for table in TABLE_READERS:
-                if "${" + table in str(text):
-                    found.add(table)
+            found |= _arn_names(str(text), suffixes)
         for key, item in value.items():
             if key not in ("Ref", "Fn::GetAtt", "Fn::Sub"):
-                found |= _names(item)
+                found |= _names(item, suffixes)
     return found
 
 
 def _statements(template: dict):
     """(role or policy name, attached roles, statement) for every IAM statement."""
     for name, role in resources(template, "AWS::IAM::Role").items():
-        for policy in role.get("Properties", {}).get("Policies", []):
-            if isinstance(policy, dict):
-                for st in policy.get("PolicyDocument", {}).get("Statement", []):
-                    yield name, {name}, st
+        for policy in _policies(role):
+            for st in policy.get("PolicyDocument", {}).get("Statement", []):
+                yield name, {name}, st
     for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
         for name, policy in resources(template, kind).items():
             props = policy.get("Properties", {})
@@ -393,6 +443,7 @@ def _statements(template: dict):
 
 def check_table_readers(template: dict) -> list[str]:
     problems = []
+    suffixes = _table_suffixes(template)
     for name, attached, st in _statements(template):
         if st.get("Effect") != "Allow":
             continue
@@ -400,7 +451,7 @@ def check_table_readers(template: dict) -> list[str]:
         reads = {a for a in actions if a in READ_ACTIONS or a in ("*", "dynamodb:*")}
         if not reads:
             continue
-        targets = _names(st.get("Resource"))
+        targets = _names(st.get("Resource"), suffixes)
         for table, readers in TABLE_READERS.items():
             if table not in targets and "*" not in targets:
                 continue
@@ -408,6 +459,56 @@ def check_table_readers(template: dict) -> list[str]:
                 problems.append(f"{name}: may export {table}, whose items are capabilities")
             if not attached <= readers:
                 problems.append(f"{name}: may read {table}; only {', '.join(sorted(readers))} may")
+    return problems
+
+
+REQUIRED_ACTIONS = pathlib.Path(__file__).resolve().parent.parent / "infra" / "task-role-actions.yaml"
+
+
+def _resource_keys(value) -> list[str]:
+    """A statement's resources written like the keys of task-role-actions.yaml:
+    GetAtt X.Arn is "X", Sub '${X.Arn}/index/a' is "X/index/a"."""
+    items = value if isinstance(value, list) else [value]
+    keys = []
+    for item in items:
+        if isinstance(item, str):
+            keys.append(item)
+        elif isinstance(item, dict) and "Fn::Sub" in item:
+            text = item["Fn::Sub"][0] if isinstance(item["Fn::Sub"], list) else item["Fn::Sub"]
+            keys.append(re.sub(r"\$\{([A-Za-z0-9]+)\.Arn\}", r"\1", str(text)))
+        elif isinstance(item, dict):
+            name = logical_id(item)
+            if name:
+                keys.append(name)
+    return keys
+
+
+def check_required_actions(template: dict, required: dict | None = None) -> list[str]:
+    """Every action a service's code calls is granted on its resource.
+
+    A wildcard grants what it matches, by shell pattern on both the action
+    and the resource key.
+    """
+    if required is None:
+        import yaml  # cfn-lint's dependency, in the infra tools image
+
+        required = yaml.safe_load(REQUIRED_ACTIONS.read_text())
+    roles = resources(template, "AWS::IAM::Role")
+    problems = []
+    for role, needs in sorted(required.items()):
+        if role not in roles:
+            problems.append(f"{role}: in task-role-actions.yaml but not in the template")
+            continue
+        grants = []
+        for policy in _policies(roles[role]):
+            for st in policy.get("PolicyDocument", {}).get("Statement", []):
+                if st.get("Effect") == "Allow":
+                    grants.append(([a.lower() for a in _actions(st) if isinstance(a, str)], _resource_keys(st.get("Resource"))))
+        for resource, actions in needs.items():
+            for action in actions:
+                if not any(any(fnmatch.fnmatchcase(action.lower(), a) for a in acts) and
+                           any(fnmatch.fnmatchcase(resource, r) for r in keys) for acts, keys in grants):
+                    problems.append(f"{role}: lacks {action} on {resource}, which its code calls")
     return problems
 
 
@@ -420,6 +521,7 @@ CHECKS = (
     check_tables,
     check_secret_access,
     check_table_readers,
+    check_required_actions,
 )
 
 
