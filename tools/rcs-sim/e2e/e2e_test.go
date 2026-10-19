@@ -32,7 +32,7 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 	bin := build(t, "./cmd/ft-server", "./cmd/msrp-relay", "./tools/rcs-sim")
 
 	// Every port at once, so no two are the same (QA on #127).
-	ports := simtest.FreePorts(t, 6)
+	ports := simtest.FreePorts(t, 5)
 	port := func(i int) string { return strconv.Itoa(ports[i]) }
 	ftPort, ftAdmin := port(0), port(1)
 	start(t, bin, "ft-server", ftAdmin, map[string]string{
@@ -47,7 +47,10 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		"FT_SWEEP_INTERVAL": "1h",
 	})
 
-	public, control, relayAdmin, core := port(2), port(3), port(4), port(5)
+	public, control, relayAdmin := port(2), port(3), port(4)
+	// rcs-sim's rcs-as stand-in listens here, below the ephemeral range,
+	// where no outgoing connection or FreePorts pick can take it (#133).
+	core := strconv.Itoa(simtest.StandInPort(t))
 	start(t, bin, "msrp-relay", relayAdmin, map[string]string{
 		"RELAY_LISTEN_ADDR":   "127.0.0.1:" + public,
 		"RELAY_CONTROL_ADDR":  "127.0.0.1:" + control,

@@ -185,10 +185,12 @@ func TestCloseCancelsAnAttemptThatOutlastsItsBound(t *testing.T) {
 	<-entered
 	closed := make(chan struct{})
 	go func() { r.e.Close(); close(closed) }()
-	waitFor(t, "Close to begin", r.e.isClosed)
-	// The bound is a delivery and two store calls; the attempt itself
-	// would have had an hour.
-	r.clock.Advance(time.Hour + 2*time.Second)
+	// Close's bound is a delivery and two store calls. Only it fires: the
+	// attempt's own deadline (an hour) would end the attempt too, and
+	// advancing the clock to the bound passes it first (QA on #147, #149).
+	bound := time.Hour + 2*time.Second
+	waitFor(t, "Close's bound", func() bool { return r.clock.armed(bound) })
+	r.clock.fire(bound)
 	waitDone(t, closed)
 	// The cancelled attempt handed the message back for another task.
 	if r.queued(t, bob) != 1 {
@@ -408,7 +410,8 @@ func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {
 // flakyListener fails Accept once with a passing error.
 type flakyListener struct {
 	net.Listener
-	failed atomic.Bool
+	failed  atomic.Bool
+	accepts atomic.Int32
 }
 
 type tempErr struct{}
@@ -418,6 +421,7 @@ func (tempErr) Timeout() bool   { return false }
 func (tempErr) Temporary() bool { return true }
 
 func (l *flakyListener) Accept() (net.Conn, error) {
+	l.accepts.Add(1)
 	if l.failed.CompareAndSwap(false, true) {
 		return nil, tempErr{}
 	}
@@ -434,7 +438,18 @@ func TestServeWaitsOutAFailedAccept(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	served := make(chan error, 1)
 	go func() { served <- r.e.Serve(ctx, fl) }()
-	waitFor(t, "the failed accept", func() bool { return r.m.get("msrp.accept_failed") == 1 })
+	// Serve counts the failure before it sets its retry timer (the first
+	// pause, 5 ms), so the count alone does not say the timer is there yet.
+	waitFor(t, "the retry timer", func() bool { return r.clock.armed(5 * time.Millisecond) })
+	if n := r.m.get("msrp.accept_failed"); n != 1 {
+		t.Fatalf("msrp.accept_failed = %d, want 1", n)
+	}
+	// Serve waits for the timer before it accepts again: a Serve that set
+	// the timer and went straight on would have called Accept again by now.
+	time.Sleep(50 * time.Millisecond)
+	if n := fl.accepts.Load(); n != 1 {
+		t.Fatalf("Accept called %d times before the pause was over, want 1", n)
+	}
 	r.clock.Advance(time.Second)
 	leg, c := r.connect(t, fl, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Chat})
 	_ = leg
@@ -541,7 +556,9 @@ func TestAnOutcomeAfterTheCloseBoundIsStillRecorded(t *testing.T) {
 	<-entered
 	closed := make(chan struct{})
 	go func() { r.e.Close(); close(closed) }()
-	waitFor(t, "Close to begin", r.e.isClosed)
+	// Close sets its bound after it marks the engine closed: advancing
+	// before then would pass a bound not yet set (#149).
+	waitFor(t, "Close's bound", func() bool { return clock.armed(DefaultDeliveryTimeout + 2*DefaultStoreTimeout) })
 	clock.Advance(DefaultDeliveryTimeout + 2*DefaultStoreTimeout) // the bound cancels
 	close(answered)                                               // the 200 OK comes after
 	<-closed
