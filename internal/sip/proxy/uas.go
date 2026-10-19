@@ -78,6 +78,12 @@ func (u *UAS) Source() transport.Source { return u.tx.Source() }
 // one; a second final fails with transaction.ErrState. The proxy retransmits a
 // 2xx to an INVITE until its ACK arrives or 64*T1 have passed; ACK reports
 // which.
+//
+// A transport error ends the server transaction, and the response is lost.
+// transport.ErrNoFlow means the client's flow is gone, or was closed because
+// the client stopped reading; transport.ErrQueueFull means the response was
+// not queued but the flow stays open, as when the transport-wide budget is
+// full, so the client is still reachable for the next request.
 func (u *UAS) Respond(res *sip.Response) error {
 	u.mu.Lock()
 	if u.answered {
