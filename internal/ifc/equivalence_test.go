@@ -305,12 +305,12 @@ func TestAnchorsAndNegatedClassesReadAValueWithANewlineAsOneString(t *testing.T)
 	}
 }
 
-// TestCompilingIsCheapForPatternsOfNegatedClasses compiles a set at the
-// instruction budget built from negated classes, which Regexp.String took
-// milliseconds each to write, and an oversized pattern of them, which must
-// be refused before it is written out. The bound is generous: it separates
-// linear work from the minutes the quadratic writer took, not this host's
-// speed.
+// TestCompilingIsCheapForPatternsOfNegatedClasses compiles, one set each,
+// forty patterns of negated classes, which Regexp.String took milliseconds
+// each to write, and an oversized pattern of them, which must be refused
+// before it is written out. The bound is generous: it separates linear work
+// from the minutes the quadratic writer took, not this host's speed.
+// Together in one set the forty cost more than MaxSetCompileCost (#111).
 func TestCompilingIsCheapForPatternsOfNegatedClasses(t *testing.T) {
 	big := strings.Repeat("[^0]", 1000)
 	var cs []FilterCriteria
@@ -319,8 +319,13 @@ func TestCompilingIsCheapForPatternsOfNegatedClasses(t *testing.T) {
 			Condition: SIPHeader{Header: "Subject", Content: big}}}}))
 	}
 	start := time.Now()
-	if _, err := Compile(cs); err != nil {
-		t.Fatalf("set within the budget refused: %v", err)
+	for _, c := range cs {
+		if _, err := Compile([]FilterCriteria{c}); err != nil {
+			t.Fatalf("one pattern of negated classes refused: %v", err)
+		}
+	}
+	if _, err := Compile(cs); err == nil || !strings.Contains(err.Error(), "MaxSetCompileCost") {
+		t.Fatalf("forty together: %v, want a refusal naming MaxSetCompileCost", err)
 	}
 	oversized := criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
 		Condition: SIPHeader{Header: "Subject", Content: strings.Repeat("[^0]", 4000)}}}})
