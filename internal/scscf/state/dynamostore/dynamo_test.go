@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"maps"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -244,5 +246,65 @@ func TestListingsReadEveryPage(t *testing.T) {
 	all, err := d.RegistrationsOf(bg(), statetest.IMPI1)
 	if err != nil || len(all) != len(impus) {
 		t.Fatalf("listed %d of %d by IMPI: %v", len(all), len(impus), err)
+	}
+}
+
+func TestMalformedItemsAreInvalid(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	if _, err := d.SaveSubscription(bg(), statetest.Subscription("s1", statetest.IMPU1, -time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	good := f.tables[DefaultSubscriptionsTable][itemKey(key("s1"))]
+	breakers := map[string]func(map[string]types.AttributeValue){
+		"no doc":           func(i map[string]types.AttributeValue) { delete(i, attrDoc) },
+		"no version":       func(i map[string]types.AttributeValue) { delete(i, attrVersion) },
+		"a bad version":    func(i map[string]types.AttributeValue) { i[attrVersion] = &types.AttributeValueMemberN{Value: "x"} },
+		"no CSeq":          func(i map[string]types.AttributeValue) { delete(i, attrCSeq) },
+		"a negative rver":  func(i map[string]types.AttributeValue) { i[attrRver] = num(-1) },
+		"a doc not binary": func(i map[string]types.AttributeValue) { i[attrDoc] = str("{}") },
+	}
+	for name, breakIt := range breakers {
+		t.Run(name, func(t *testing.T) {
+			item := maps.Clone(good)
+			breakIt(item)
+			f.tables[DefaultSubscriptionsTable][itemKey(key("s1"))] = item
+			if _, err := d.Subscription(bg(), "s1"); !errors.Is(err, state.ErrInvalid) {
+				t.Errorf("Subscription: %v", err)
+			}
+			if _, err := d.SubscriptionsOf(bg(), statetest.IMPU1); !errors.Is(err, state.ErrInvalid) {
+				t.Errorf("SubscriptionsOf: %v", err)
+			}
+			if _, err := d.ExpiringSubscriptions(bg(), statetest.T0, 10); !errors.Is(err, state.ErrInvalid) {
+				t.Errorf("ExpiringSubscriptions: %v", err)
+			}
+		})
+	}
+	f.tables[DefaultRegistrationsTable][itemKey(key(statetest.IMPU1))] = map[string]types.AttributeValue{
+		attrPK: str(statetest.IMPU1), attrDoc: bin([]byte("{}")),
+	}
+	if _, err := d.Registration(bg(), statetest.IMPU1); !errors.Is(err, state.ErrInvalid) {
+		t.Errorf("a registration without a version: %v", err)
+	}
+}
+
+func TestTransportErrorsAreReducedToTheirCause(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	f.fail = &url.Error{Op: "Post", URL: "https://dynamodb.example/" + statetest.IMPU1, Err: errors.New("connection refused")}
+	_, err := d.Registration(bg(), statetest.IMPU1)
+	if err == nil || strings.Contains(err.Error(), "15550100001") || !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("error %v", err)
+	}
+	f.fail = errors.New("something " + statetest.IMPU1)
+	if _, err := d.Registration(bg(), statetest.IMPU1); err == nil || strings.Contains(err.Error(), "15550100001") {
+		t.Errorf("error %v", err)
+	}
+}
+
+func TestTheDefaultTableNamesAreTheArchitecturesOwn(t *testing.T) {
+	d := newTestStore(t, newFake(t))
+	if d.registrations != "registrations" || d.challenges != "auth-challenges" || d.subscriptions != "reg-subscriptions" {
+		t.Errorf("tables %q %q %q", d.registrations, d.challenges, d.subscriptions)
 	}
 }
