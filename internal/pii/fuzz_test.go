@@ -4,12 +4,14 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 )
 
-// FuzzRedact checks the guarantee services rely on: whatever the input, keyed or
-// not, the output has no run of minRun or more digits and no number written in
-// groups that Redact promises to mask, and valid UTF-8 stays valid. The grouped
+// FuzzRedact checks the guarantee services rely on: whatever the input, keyed
+// or not, the output has no run of minRun or more decimal digits of any
+// script and no number written in groups, in any script's digits, that
+// Redact promises to mask, and valid UTF-8 stays valid. The grouped
 // rules are restated here independently of numberAt: a national number is any
 // group of two or more digits starting with 0, not preceded by a letter or
 // digit, followed by eight digits in total. The one documented exception is
@@ -68,6 +70,17 @@ func FuzzRedact(f *testing.F) {
 		"0.0.0.0 0 1 2 3 4 5 6 7",
 		"Tel.010-0000-0001 H.P.010 0000 0001",
 		"bytes=0-1048575 [0.25 0.5 0.75]",
+		"From: <im:alice.smith@" + testDomain + ">",
+		"pres:" + testMSISDN + "@" + testDomain,
+		"msisdn=１５５５０１００００１ ２０２６年",
+		"imsi ٠٠١٠١٠٠٠٠٠٠٠٠٠١ 1555０１００\xff００1",
+		"tel:+15550100001-２３４５６７",
+		"0000000 0０１0000",
+		"urn:gsma:imei:00101000-１７６１４８-１",
+		"０１０-００００-０００１ +１ ５５５ ０１００ ００１",
+		"call ０１０－００００－０００１ ＋１\u3000５５５\u3000０１０\u3000０００１ （０７７００）９００．００１",
+		`From: <im:"bob smith"@` + testDomain + `> pres:"a \"" im:"x`,
+		`im:"` + testMSISDN + `"@` + testDomain,
 	} {
 		f.Add(s, false)
 		f.Add(s, true)
@@ -87,23 +100,27 @@ func FuzzRedact(f *testing.F) {
 			if run := longestDigitRun(a); run >= minRun {
 				t.Fatalf("redacting %q gave %q, which keeps a %d-digit run", s, a, run)
 			}
-			if m := groupedInternational.FindString(a); m != "" {
+			// The grouped rules read ASCII digits; a number in another
+			// script's digits must be masked as well.
+			if m := groupedInternational.FindString(asciiNumberChars(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
-			if m := nationalNumberIn(a); m != "" {
+			if m := nationalNumberIn(asciiNumberChars(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
 		}
-		if !strings.ContainsAny(s, "0123456789:") && out != s {
+		if !strings.ContainsRune(s, ':') && !strings.ContainsFunc(s, unicode.IsDigit) && out != s {
 			t.Fatalf("Redact(%q) = %q changed text with no digits or schemes", s, out)
 		}
 	})
 }
 
+// longestDigitRun counts decimal digits of every script, as Redact promises
+// to mask runs of any of them.
 func longestDigitRun(s string) int {
 	longest, run := 0, 0
-	for i := 0; i < len(s); i++ {
-		if isDigit(s[i]) {
+	for _, r := range s {
+		if unicode.IsDigit(r) {
 			run++
 			longest = max(longest, run)
 		} else {

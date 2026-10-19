@@ -34,6 +34,12 @@ follows `Via`, a terminating request follows `Path`, an in-dialog request follow
   - **reg event subscriptions** (RFC 3680): stored in DynamoDB
     `reg-subscriptions`; the NOTIFY CSeq and the reginfo `version` are allocated
     with conditional atomic counters so two instances cannot reuse a number.
+- `hss` tasks have their own Diameter identity as well (`Origin-Host` =
+  `hss-<random>.<namespace>`, drawn at every start). The CSCFs reach `hss`
+  through its service name and send to it by Destination-Realm, so nothing needs
+  a shared name; a shared one would make an S-CSCF that reconnects to another
+  task after its HSS task died wait about a minute in the watchdog's REOPEN state
+  (RFC 3539 §3.4.1), which only applies when the same Origin-Host comes back.
 - `pcscf` advertises its **instance** address (task private IP) in `Path` and in
   the core-facing `Record-Route`, because the client's connection lives on that
   instance. The flow token in `Path` (RFC 5626 §5.2) is an HMAC over the
@@ -69,7 +75,11 @@ horizontal scaling without sticky load balancing.
 - HSS-initiated Cx requests (RTR, PPR) are sent by Destination-Realm to any
   connected `scscf` peer, not to the Origin-Host recorded at SAR time: that task
   may be gone, and every instance can act on any registration because the state
-  is in DynamoDB.
+  is in DynamoDB. Since `hss` only answers connections, it can send them
+  only over connections `scscf` opened to that `hss` task, so every `scscf` task
+  keeps a Cx connection to every `hss` task (every address of `hss.<namespace>`,
+  resolved again periodically); otherwise a change provisioned on a task no
+  `scscf` is connected to cannot be pushed.
 - The signed iFC-position parameter covers the Call-ID and an expiry (default
   32 s, Timer B/F) as well as served user, session case and next priority, so it
   cannot be replayed on another request or later.

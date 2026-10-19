@@ -11,6 +11,20 @@ I-CSCF, S-CSCF, HSS), RCS 메시징 애플리케이션 서버, MSRP 릴레이, H
 > **상태: 개발 중.** [로드맵](#로드맵) 순서대로 서비스를 만들고 있으며, 아직 운영 환경에 쓸 수
 > 있는 단계가 아닙니다.
 
+## 현황
+
+`main`에 구현되어 머지된 것(자세한 내용은 [CHANGELOG.md](CHANGELOG.md)):
+
+- **라이브러리**: 서비스 런타임, 식별자 마스킹, SIP 메시지, SIP/HTTP Digest와 AKA,
+  Milenage, SDP, Diameter 기본 프로토콜, Cx와 Sh, iFC, MSRP, CPIM, IMDN,
+  conference-info, PROXY protocol v2.
+- **서비스**: `ft-server`([문서](docs/ft-server.md))와 `msrp-relay`
+  ([문서](docs/msrp-relay.md)). 둘 다 단독으로 실행되며, 아직 호출하는 서비스는 없습니다.
+- **결정 기록**: ADR 0001–0007과 [위협 모델](docs/threat-model.md).
+
+아직 만들지 않은 것: SIP 전송 계층과 트랜잭션, `hss`, `pcscf`, `icscf`, `scscf`,
+`rcs-as`, 클라이언트 시뮬레이터, 로컬 스택, AWS 인프라. 아직 릴리스는 없습니다.
+
 ## 서비스
 
 | 서비스 | 역할 |
@@ -36,6 +50,16 @@ Docker만 있으면 됩니다. Go는 고정된 컨테이너에서 실행됩니�
 make check     # 포맷, vet, 테스트, race detector, 빌드, 문서 링크, 개인정보 검사
 make fuzz      # 모든 파서의 퍼즈 테스트
 make vuln      # go mod verify + govulncheck
+```
+
+docker compose로 플랫폼 전체를 로컬에서 실행할 수 있습니다. 서비스, DynamoDB
+Local, S3Mock, 고정된 `acs` 릴리스가 함께 뜹니다.
+[docs/local-stack.md](docs/local-stack.md)를 참고하세요.
+
+```bash
+make up            # 로컬 스택을 띄우고 모두 정상이 될 때까지 기다림
+make e2e-compose   # 클라이언트 시뮬레이터를 스택에 실행
+make down          # 스택을 멈추고 데이터를 지움
 ```
 
 ## 로드맵

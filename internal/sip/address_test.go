@@ -283,7 +283,7 @@ func TestRouteSetsRequireNameAddrs(t *testing.T) {
 	mustAdd(t, &h, "Path", "<sip:term@pcscf.example.com;lr;ob>")
 	mustAdd(t, &h, "Service-Route", "<sip:orig@scscf.example.com;lr>")
 	mustAdd(t, &h, "P-Associated-URI", "<sip:+15550100001@ims.example.net>, <tel:+15550100001>")
-	for name, get := range map[string]func() ([]Address, error){
+	for name, get := range map[string]func() (Addresses, error){
 		"Route": h.Route, "Record-Route": h.RecordRoute, "Path": h.Path,
 		"Service-Route": h.ServiceRoute, "P-Associated-URI": h.PAssociatedURI,
 	} {

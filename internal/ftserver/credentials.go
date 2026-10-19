@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -89,12 +91,19 @@ type HSSCredentials struct {
 // NewHSSCredentials returns a source calling the HSS at base with the bearer
 // token, expecting credentials for realm. timeout bounds each call and
 // maxConns the connections to the HSS, which the server's lookup limit
-// (Options.MaxConcurrentLookups) should match.
-func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration, maxConns int) *HSSCredentials {
+// (Options.MaxConcurrentLookups) should match. dial opens its connections;
+// in staging and prod it is a runtime.InternalDialer's, so that the token
+// reaches only a private address whatever the HSS's name resolves to, and
+// nil means the default dialer.
+func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration, maxConns int, dial func(ctx context.Context, network, address string) (net.Conn, error)) *HSSCredentials {
 	// A transport of its own: the default one has no connection limit and
 	// is shared with whatever else uses it.
 	transport := &http.Transport{
-		Proxy:               nil,
+		Proxy:       nil,
+		DialContext: dial,
+		// A DialContext of its own turns HTTP/2 off unless asked for; an
+		// https HSS keeps it in every environment.
+		ForceAttemptHTTP2:   true,
 		MaxConnsPerHost:     maxConns,
 		MaxIdleConnsPerHost: maxConns,
 		IdleConnTimeout:     90 * time.Second,
@@ -108,7 +117,7 @@ func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration
 			Transport: transport,
 			Timeout:   timeout,
 			// The token must not follow a redirect to another host.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			CheckRedirect: runtime.RefuseRedirects,
 		},
 	}
 }

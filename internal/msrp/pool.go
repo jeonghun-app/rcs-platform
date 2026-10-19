@@ -70,7 +70,11 @@ type Pool struct {
 // Open binds s to a connection toward its first remote hop, dialling one
 // if none is open, and performs Conn.Open.
 func (p *Pool) Open(ctx context.Context, s *Session) error {
-	c, err := p.conn(ctx, s.remote[0])
+	remote := s.Remote()
+	if len(remote) == 0 {
+		return errors.New("msrp: an active session needs the remote path")
+	}
+	c, err := p.conn(ctx, remote[0])
 	if err != nil {
 		return err
 	}

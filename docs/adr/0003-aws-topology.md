@@ -48,10 +48,13 @@ TCP (and SIP also UDP) connections; ACS and file transfer are HTTPS.
     240 s.
   - Server-side idle timeouts are longer than the keep-alive interval of the
     protocol on that listener, so an endpoint that keeps to it is never cut by
-    the service: `pcscf` 180 s on TLS and 1900 s on TCP for flows that
+    the service: `pcscf` 180 s on TLS and 1740 s on TCP for flows that
     negotiated a keep-alive (SIP keep-alive 120 s, RFC 5626 §5.4), and 340 s for
-    flows that did not, just under the NLB's 350 s so the client sees a clean
-    close rather than a later reset; `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s).
+    flows that did not. 1740 s is just under the TCP listener's 1800 s, as 340 s
+    is just under the TLS listener's 350 s, so on either listener the client sees
+    a clean close from `pcscf` rather than a later reset from the NLB;
+    `msrp-relay` and `rcs-as` 300 s (MSRP keep-alive 240 s). (Amended in #64:
+    the TCP value was 1900 s, above the NLB's own timeout.)
     Idle connections longer than 350 s are not expected to survive even on TCP
     listeners: the target ENI's connection tracking on Fargate is not
     configurable and may not match the NLB's longer timeout. The NLB does

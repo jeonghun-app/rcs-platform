@@ -65,15 +65,21 @@ a maintainer; behaviour built on it is listed as unverified in
 | 6733, 4006 | Diameter base protocol |
 | 4740 | Diameter SIP application: the Digest-* AVPs that Cx reuses (TS 29.229 §6.3.37 to §6.3.41) |
 | 3966 | tel URI: the telephone-subscriber that iFC Request-URI patterns match (TS 29.228 Annex F) |
+| 7542 | Network Access Identifier: the user@realm form of a private user identity (IMPI), which `hss` checks on provisioning |
+| 6050 | `P-Asserted-Service` and `P-Preferred-Service`: the ICSI the default `hss` service profile sends to `rcs-as` |
 | 3539 | AAA transport profile: Diameter watchdog (DWR/DWA, Tw, REOPEN) |
 | 4330 | Simple Network Time Protocol: era rule for Diameter `Time` after 2036 |
 | 9110 | HTTP semantics: byte ranges, `Range`, `If-Range`, `Content-Range`, partial PUT (`ft-server`) |
 | 7578, 2046 | `multipart/form-data` and the multipart boundary (`ft-server` uploads) |
 | 6266 | `Content-Disposition` in HTTP (`ft-server` downloads) |
 | 3986 | URI syntax: unreserved characters of the FT transaction id |
+| 6750 | Bearer token usage: `Authorization: Bearer` and the b64token syntax (internal HTTP APIs, `msrp-relay` control API) |
+| 6459 | IPv6 in 3GPP EPS: one /64 per bearer (`msrp-relay` per-source limits) |
+| 5482 | TCP user timeout (§1): how long sent data may stay unacknowledged (`msrp-relay` client sockets) |
 
 ## Other
 
 | Document | Subject | Used by |
 |---|---|---|
 | IEEE Std 1003.1-2004 Part 1 §9 | POSIX extended regular expressions, the syntax of iFC patterns (TS 29.228 Annex F) | `internal/ifc` |
+| HAProxy `proxy-protocol.txt` | PROXY protocol version 2, the header the AWS NLB sends (ADR 0003) | `internal/proxyproto` |

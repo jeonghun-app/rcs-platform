@@ -1,0 +1,328 @@
+# msrp-relay control API.
+#
+# pcscf allocates, completes, extends and releases MSRP bindings through this
+# API while it rewrites the m=message SDP of a session (ADR 0004). The relay
+# serves it on RELAY_CONTROL_ADDR, which only pcscf's security group reaches
+# (ADR 0007 §2). docs/msrp-relay.md describes the flows around it.
+openapi: 3.1.0
+info:
+  title: msrp-relay control API
+  version: 1.0.0
+  description: |
+    A binding ties the URI a client connects to (`client_path`, on the
+    relay's public address) to the session the relay opens toward rcs-as
+    (`core_path_local` → `core_path`). Both endpoint paths may be given when
+    the binding is created or later with PATCH, as pcscf learns them from the
+    offer and the answer; each can be set once. The relay accepts the client's
+    connection only when both are known, and only once (ADR 0004).
+
+    Scope (ADR 0007 §3): one caller, pcscf, with two tokens accepted at a time
+    (current and next, `RELAY_PCSCF_TOKEN` and `RELAY_PCSCF_TOKEN_NEXT`), so a
+    token rotates without downtime.
+
+    | Caller | Token | Allowed |
+    |---|---|---|
+    | `pcscf` | `RELAY_PCSCF_TOKEN`, `RELAY_PCSCF_TOKEN_NEXT` | `bindings.create` (POST), `bindings.update` (PATCH), `bindings.delete` (DELETE) |
+
+    A token outside its scope gets 403. A missing or unknown token gets 401
+    for every path, so an unauthenticated caller learns nothing about the
+    API. With no token configured (dev and test only; staging and prod refuse
+    to start) every call gets 503.
+
+    Request field names are case-sensitive, and unknown fields are refused.
+    Every answer is JSON and carries `Cache-Control: no-store`. Errors are
+    `{"error": "<reason>"}`; the reason never repeats the request.
+
+    `client_path` carries the session id that lets a client connection into
+    the session (RFC 4975 §14.1). It is returned once, by POST, and never
+    stored by the relay: pcscf writes it into the SDP toward the client and
+    must not log it. The binding `id` is derived from it one way (SHA-256),
+    so ids may be logged.
+servers:
+  # ADR 0007 §5: plain http only to a private host, always with the caller's
+  # bearer token. The relay is reached by task address or Cloud Map name.
+  - url: http://msrp-relay.{namespace}:8082
+    description: Inside the VPC, through Cloud Map
+    variables:
+      namespace:
+        default: rcs.local
+security:
+  - bearer: []
+paths:
+  /v1/bindings:
+    post:
+      operationId: createBinding
+      summary: Allocate a binding
+      description: |
+        Called when pcscf anchors an `m=message` line: on the client's offer
+        (with `client_endpoint_path`) or on rcs-as's offer (with
+        `core_path`). The answer gives the paths pcscf writes into the SDP:
+        `client_path` toward the client (with `a=setup:passive` in an answer,
+        `actpass` in an offer) and `core_path_local` toward rcs-as (with
+        `a=setup:active` and port 9; RFC 6135 §4.2.2, RFC 4975 §8.1).
+      x-scope: bindings.create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBinding"
+            examples:
+              clientOriginated:
+                summary: The client offers (ADR 0004, first row)
+                value:
+                  client_endpoint_path: ["msrp://client.invalid:7777/iau39soe2843z;tcp"]
+                  expires_in: 1800
+              coreOriginated:
+                summary: rcs-as offers (ADR 0004, second row)
+                value:
+                  core_path: ["msrp://10.0.1.5:2855/9di4eae923wzd;tcp"]
+                  expires_in: 1800
+      responses:
+        "201":
+          description: The binding.
+          headers:
+            Location:
+              description: "`/v1/bindings/{id}`"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedBinding"
+              example:
+                id: iy5x5b2bhc2xeckdw7ercei27dwrmk4rxpybngwhlrnzm7x5halq
+                client_path: msrps://msrp.example.net:2856/aebagbafaydqqcikbmga2dqpcaireeyu;tcp
+                core_path_local: msrp://10.0.2.9:9/culbogazdinryhi6d4qccirdeqssmjzi;tcp
+                expires_at: "2026-01-02T03:34:05.000Z"
+        "400":
+          $ref: "#/components/responses/Invalid"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          description: The body is over 4 KiB.
+        "415":
+          description: The body is not `application/json`.
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v1/bindings/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The id POST returned. Anything that cannot be an id gets 404.
+        schema:
+          type: string
+          pattern: "^[a-z2-7]{52}$"
+    patch:
+      operationId: updateBinding
+      summary: Complete or extend a binding
+      description: |
+        Records the path pcscf learnt from the answer, and extends (or
+        shortens) the expiry on every session refresh and re-INVITE. A path
+        already set may be given again with the same value; another value
+        gets 409, since a new path is a new session (RFC 4975 §8.4) and needs
+        a new binding. An expired binding cannot be revived (404).
+
+        A bridge already running checks its binding again when the expiry it
+        last saw comes, and ends if the binding has expired or been released.
+        A shortened expiry or a release therefore takes effect on a running
+        bridge at that time, not at once.
+      x-scope: bindings.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateBinding"
+            examples:
+              answer:
+                summary: rcs-as answered the client's offer
+                value:
+                  core_path: ["msrp://10.0.1.5:2855/9di4eae923wzd;tcp"]
+              refresh:
+                summary: Session refresh
+                value:
+                  expires_in: 1800
+      responses:
+        "200":
+          description: The binding after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdatedBinding"
+        "400":
+          $ref: "#/components/responses/Invalid"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A path is already set to another value; nothing was changed.
+        "413":
+          description: The body is over 4 KiB.
+        "415":
+          description: The body is not `application/json`.
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    delete:
+      operationId: deleteBinding
+      summary: Release a binding
+      description: |
+        Called on BYE, CANCEL, a failure response, session timer expiry, and
+        before forwarding an answer the relay cannot serve (ADR 0004: a
+        client answering `passive`). A binding released before any client
+        connected can no longer be used. See PATCH for a running bridge.
+      x-scope: bindings.delete
+      responses:
+        "204":
+          description: Released.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <token>`, one header. Tokens are at least 256
+        random bits (43 or more base64 characters), compared as SHA-256
+        digests in constant time (ADR 0007 §4).
+  schemas:
+    Path:
+      type: array
+      description: |
+        An `a=path` as a list of MSRP URIs (RFC 4975 §8.2), each with a port,
+        a session id and transport `tcp`. Exactly one URI: RFC 4976 relays on
+        either side are not supported.
+      minItems: 1
+      maxItems: 1
+      items:
+        type: string
+        format: uri
+    CorePath:
+      allOf:
+        - $ref: "#/components/schemas/Path"
+      description: |
+        rcs-as's `a=path`. The relay connects to its host, so it must be
+        `msrp:` (no TLS inside the VPC, ADR 0007), the host an address in
+        `RELAY_CORE_NETWORKS` (RFC 1918 and ULA by default) or a name in
+        `RCS_SERVICE_NAMESPACE`, and the port one of `RELAY_CORE_PORTS`
+        (2855 by default); the relay checks the resolved address and the port
+        again when it connects.
+    ClientEndpointPath:
+      allOf:
+        - $ref: "#/components/schemas/Path"
+      description: |
+        The client's own `a=path`, the To-Path of everything the relay sends
+        to the client. The relay never connects to it (ADR 0004), so any host
+        is accepted.
+    ExpiresIn:
+      type: integer
+      minimum: 1
+      maximum: 7200
+      description: Seconds from now; the maximum is `RELAY_MAX_EXPIRES_IN` (7200 by default).
+    CreateBinding:
+      type: object
+      additionalProperties: false
+      required: [expires_in]
+      properties:
+        core_path:
+          $ref: "#/components/schemas/CorePath"
+        client_endpoint_path:
+          $ref: "#/components/schemas/ClientEndpointPath"
+        expires_in:
+          $ref: "#/components/schemas/ExpiresIn"
+    UpdateBinding:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        core_path:
+          $ref: "#/components/schemas/CorePath"
+        client_endpoint_path:
+          $ref: "#/components/schemas/ClientEndpointPath"
+        expires_in:
+          $ref: "#/components/schemas/ExpiresIn"
+    CreatedBinding:
+      type: object
+      required: [id, client_path, core_path_local, expires_at]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z2-7]{52}$"
+          description: SHA-256 of the client-side session id, base32. Not a secret.
+        client_path:
+          type: string
+          description: |
+            `msrps://<RELAY_PUBLIC_HOST>:<RELAY_PUBLIC_PORT>/<session-id>;tcp`
+            (`msrp:` with `RELAY_PUBLIC_TLS=false`, dev and test only). The
+            session id has 160 random bits (ADR 0004). A secret: do not log.
+        core_path_local:
+          type: string
+          description: |
+            `msrp://<task private IP>:9/<session-id>;tcp`, with a session id of
+            its own. The address names the task that allocated the binding;
+            whichever task the client reaches opens the core leg, so rcs-as
+            must not compare it with the source of the connection.
+        expires_at:
+          type: string
+          format: date-time
+    UpdatedBinding:
+      type: object
+      required: [id, expires_at]
+      properties:
+        id:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+  responses:
+    Invalid:
+      description: The body is not a valid request; the reason says which rule failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or unknown bearer token. Carries `WWW-Authenticate`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The token is valid but its scope does not cover the operation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such binding, or it has expired.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unavailable:
+      description: |
+        No token is configured, or the binding store could not be reached in
+        `RELAY_STORE_TIMEOUT`. pcscf may retry, or fail the session setup.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
