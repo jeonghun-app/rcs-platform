@@ -249,8 +249,30 @@ func TestNewChecksItsDependenciesAndBudget(t *testing.T) {
 		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
 		t.Error("a fan-out burst smaller than a full group")
 	}
+	if _, err := New(Config{ConferenceHost: host, MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: 6000, Burst: 395}},
+		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
+		t.Error("a sender's quarter of the fan-out burst smaller than a full group")
+	}
+	if _, err := New(Config{ConferenceHost: host, MaxParticipants: 100, AddRate: messaging.Rate{PerMinute: 30, Burst: 98}},
+		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
+		t.Error("an add burst smaller than a full group's invitees")
+	}
 	if _, err := New(Config{ConferenceHost: host, MaxParticipants: LimitParticipants + 1}, groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
 		t.Error("a size limit whose roster would not fit in one item")
+	}
+	// Exactly enough is enough, and an unlimited budget needs no burst.
+	for _, c := range []Config{
+		{MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: 6000, Burst: 396}, AddRate: messaging.Rate{PerMinute: 30, Burst: 99}},
+		{MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: -1}, AddRate: messaging.Rate{PerMinute: -1}},
+		{MaxParticipants: LimitParticipants},
+	} {
+		c.ConferenceHost = host
+		if _, err := New(c, groupstore.NewMemory(), r.e, r.n, r.m); err != nil {
+			t.Errorf("%+v: %v", c, err)
+		}
+	}
+	if got := DefaultAddBurst(LimitParticipants); got != LimitParticipants-1 {
+		t.Errorf("DefaultAddBurst(%d) = %d", LimitParticipants, got)
 	}
 }
 

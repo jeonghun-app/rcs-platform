@@ -2,6 +2,7 @@ package group
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -167,37 +168,41 @@ func TestOnlyJoinedParticipantsWriteInAGroup(t *testing.T) {
 }
 
 func TestAGroupBoundsEachSenderAndItsFanOut(t *testing.T) {
-	r := newRig(t, Config{MaxParticipants: 4, SenderRate: messaging.Rate{PerMinute: 60, Burst: 2},
-		FanoutRate: messaging.Rate{PerMinute: 60, Burst: 5}})
-	g := r.create(bob, carol)
-	send := func(from, id string) error {
+	send := func(r *rig, g groupstore.Group, from, id string) error {
 		return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: from, CPIM: message(t, from, id, "x", 0)})
 	}
-	// Each message costs two deliveries: the budget of 5 takes two.
-	if err := send(alice, "a1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := send(bob, "b1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := send(carol, "c1"); err == nil {
-		t.Fatal("the group's fan-out budget did not hold")
-	}
-	r.clock.Advance(time.Minute)
-	// alice's own rate: two, then refused, while bob still writes.
-	for _, id := range []string{"a2", "a3"} {
-		if err := send(alice, id); err != nil {
+	// Each participant's own rate in the group.
+	r := newRig(t, Config{SenderRate: messaging.Rate{PerMinute: 60, Burst: 2}, FanoutRate: rateOff})
+	g := r.create(bob, carol)
+	for _, id := range []string{"a1", "a2"} {
+		if err := send(r, g, alice, id); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := send(alice, "a4"); err == nil {
+	if err := send(r, g, alice, "a3"); err == nil {
 		t.Fatal("alice's rate in the group did not hold")
 	}
-	r.clock.Advance(time.Minute) // the group's budget refills
-	if err := send(bob, "b2"); err != nil {
+	if err := send(r, g, bob, "b1"); err != nil {
 		t.Fatalf("bob: %v", err)
 	}
-	if r.m.get("group.fanout_budget_exceeded") != 1 || r.m.get("message.rejected.rate_limited") != 2 {
+	// The group's budget: each message to the four others costs four
+	// deliveries, and each sender may use a quarter of the 16, so four
+	// senders use it up and the fifth waits for it to refill.
+	r = newRig(t, Config{MaxParticipants: 5, FanoutRate: messaging.Rate{PerMinute: 60, Burst: 16}})
+	g = r.create(bob, carol, dave, erin)
+	for _, from := range []string{alice, bob, carol, dave} {
+		if err := send(r, g, from, "m-"+from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := send(r, g, erin, "e1"); err == nil {
+		t.Fatal("the group's fan-out budget did not hold")
+	}
+	r.clock.Advance(16 * time.Second)
+	if err := send(r, g, erin, "e2"); err != nil {
+		t.Fatalf("erin once the budget refilled: %v", err)
+	}
+	if r.m.get("group.fanout_budget_exceeded") != 1 || r.m.get("group.fanout_share_exceeded") != 0 || r.m.get("message.rejected.rate_limited") != 1 {
 		t.Fatalf("metrics %v", r.m)
 	}
 	// The engine's size limit applies to group messages too.
@@ -205,6 +210,59 @@ func TestAGroupBoundsEachSenderAndItsFanOut(t *testing.T) {
 	if rej, ok := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: bob, CPIM: big}).(*messaging.Rejection); !ok ||
 		rej.Reason != messaging.ReasonTooLarge {
 		t.Fatalf("a large message: %v", rej)
+	}
+}
+
+// QA's reproduction (PR #118): in a full group of 100, one participant
+// writing a message a second, within its own rate, used the whole fan-out
+// budget and the others were refused 80% of the time. Its share of the
+// budget now holds it to a quarter.
+func TestOneMemberCannotSilenceAFullGroup(t *testing.T) {
+	r := newRig(t, Config{})
+	var in []Invitee
+	for i := range 99 {
+		in = append(in, Invitee{Identity: fmt.Sprintf("sip:u%d@example.net", i)})
+	}
+	g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mallory, other := "sip:u0@example.net", "sip:u1@example.net"
+	for _, who := range []string{mallory, other} {
+		if _, err := r.s.Join(t.Context(), g.URI, who, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ok, no int
+	for sec := range 300 {
+		_, _ = r.s.Recipients(t.Context(), g.URI, mallory, messaging.GroupText)
+		if sec%5 == 0 {
+			if _, err := r.s.Recipients(t.Context(), g.URI, other, messaging.GroupText); err == nil {
+				ok++
+			} else {
+				no++
+			}
+		}
+		r.clock.Advance(time.Second)
+	}
+	if no != 0 {
+		t.Fatalf("the other member: ok %d, refused %d", ok, no)
+	}
+	if r.m.get("group.fanout_share_exceeded") == 0 {
+		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// QA's reproduction (PR #118): with the largest size limit, a group of
+// that size can be created at once.
+func TestTheLargestGroupCanBeCreatedAtOnce(t *testing.T) {
+	r := newRig(t, Config{MaxParticipants: LimitParticipants})
+	var in []Invitee
+	for i := range LimitParticipants - 1 {
+		in = append(in, Invitee{Identity: fmt.Sprintf("sip:u%d@example.net", i)})
+	}
+	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: in}); err != nil {
+		t.Fatal(err)
 	}
 }
 

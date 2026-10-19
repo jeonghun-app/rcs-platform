@@ -164,13 +164,15 @@ func Configure(s *runtime.Settings) Config {
 	}
 	s.ForbidInProduction(c.DynamoDB.Endpoint != "", "RCSAS_DYNAMODB_ENDPOINT replaces the AWS endpoint")
 	c.GroupsTable = e.String("GROUPCHATS_TABLE", DefaultGroupsTable)
+	maxParticipants := e.Int("GROUP_MAX_PARTICIPANTS", group.DefaultMaxParticipants)
+	addRate := messaging.Rate{PerMinute: group.DefaultAddRate.PerMinute, Burst: group.DefaultAddBurst(maxParticipants)}
 	c.Group = group.Config{
 		ConferenceHost:  e.RequiredString("CONFERENCE_HOST"),
-		MaxParticipants: e.Int("GROUP_MAX_PARTICIPANTS", group.DefaultMaxParticipants),
+		MaxParticipants: maxParticipants,
 		IdleTTL:         e.Duration("GROUP_IDLE_TTL", group.DefaultIdleTTL),
 		SenderRate:      readRate(e, "GROUP_SENDER", group.DefaultSenderRate),
 		FanoutRate:      readRate(e, "GROUP_FANOUT", group.DefaultFanoutRate),
-		AddRate:         readRate(e, "GROUP_ADD", group.DefaultAddRate),
+		AddRate:         readRate(e, "GROUP_ADD", addRate),
 		CreateRate:      readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
 	}
 	positive(e, "GROUP_MAX_PARTICIPANTS", c.Group.MaxParticipants)
@@ -180,9 +182,14 @@ func Configure(s *runtime.Settings) Config {
 	if c.Group.IdleTTL <= 0 {
 		e.Invalid("GROUP_IDLE_TTL", "must be positive")
 	}
-	if r := c.Group.FanoutRate; r.PerMinute > 0 && r.Burst < c.Group.MaxParticipants-1 {
-		// Otherwise a message to a full group could never be sent.
-		e.Invalid("GROUP_FANOUT_BURST", "smaller than a full group's fan-out (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
+	if r := c.Group.FanoutRate; r.PerMinute > 0 && r.Burst/group.FanoutSenderShare < c.Group.MaxParticipants-1 {
+		// One sender may use a quarter of the budget; otherwise a message
+		// to a full group could never be sent.
+		e.Invalid("GROUP_FANOUT_BURST", "a quarter of it is smaller than a full group's fan-out (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
+	}
+	if r := c.Group.AddRate; r.PerMinute > 0 && r.Burst < c.Group.MaxParticipants-1 {
+		// Otherwise a full group could never be created.
+		e.Invalid("GROUP_ADD_BURST", "smaller than a full group's invitees (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
 	}
 	return c
 }

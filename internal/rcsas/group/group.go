@@ -36,15 +36,27 @@ const (
 
 // Default rates. A participant writes in a group as fast as in a 1-to-1
 // chat. The fan-out budget is deliveries per group: a full group of 100 may
-// carry about one message a second, and its burst covers one message to
-// every participant. Adding is bounded per adder, creating per creator: a
-// group of strangers is the spam this guards against (threat model T11).
+// carry about one message a second, and a quarter of its burst covers one
+// message to every participant of the largest group. Adding is bounded per
+// adder, creating per creator: a group of strangers is the spam this guards
+// against (threat model T11). The add burst is at least a full group's
+// invitees, so that the largest group can be created at once.
 var (
 	DefaultSenderRate = messaging.Rate{PerMinute: 60, Burst: 30}
 	DefaultFanoutRate = messaging.Rate{PerMinute: 6000, Burst: 1000}
 	DefaultAddRate    = messaging.Rate{PerMinute: 30, Burst: 100}
 	DefaultCreateRate = messaging.Rate{PerMinute: 5, Burst: 10}
 )
+
+// FanoutSenderShare is how many senders' worth a group's fan-out budget
+// holds: one sender may use at most 1/FanoutSenderShare of it, in rate and
+// in burst, so that a participant writing as fast as its own rate allows
+// leaves the rest of the budget to the others (threat model T11).
+const FanoutSenderShare = 4
+
+// DefaultAddBurst is the add burst for a group size limit: the default,
+// or a full group's invitees if that is more.
+func DefaultAddBurst(maxParticipants int) int { return max(DefaultAddRate.Burst, maxParticipants-1) }
 
 // Errors the operations return; the SIP layer answers them (for example
 // 404, 403, 486).
@@ -77,8 +89,10 @@ type Config struct {
 	IdleTTL         time.Duration
 	// SenderRate bounds the messages one participant writes in one group;
 	// FanoutRate the deliveries one group makes, a message counting once
-	// per recipient; AddRate the participants one user adds, in groups it
-	// creates too; CreateRate the groups one user creates.
+	// per recipient, of which one sender may use 1/FanoutSenderShare;
+	// AddRate the participants one user adds, in groups it creates too;
+	// CreateRate the groups one user creates. A zero AddRate is
+	// DefaultAddRate with DefaultAddBurst(MaxParticipants).
 	SenderRate    messaging.Rate
 	FanoutRate    messaging.Rate
 	AddRate       messaging.Rate
@@ -104,10 +118,11 @@ func (c Config) withDefaults() Config {
 	if c.MaxTracked <= 0 {
 		c.MaxTracked = DefaultMaxTracked
 	}
+	addRate := messaging.Rate{PerMinute: DefaultAddRate.PerMinute, Burst: DefaultAddBurst(c.MaxParticipants)}
 	for _, r := range []struct {
 		v   *messaging.Rate
 		def messaging.Rate
-	}{{&c.SenderRate, DefaultSenderRate}, {&c.FanoutRate, DefaultFanoutRate}, {&c.AddRate, DefaultAddRate}, {&c.CreateRate, DefaultCreateRate}} {
+	}{{&c.SenderRate, DefaultSenderRate}, {&c.FanoutRate, DefaultFanoutRate}, {&c.AddRate, addRate}, {&c.CreateRate, DefaultCreateRate}} {
 		if *r.v == (messaging.Rate{}) {
 			*r.v = r.def
 		}
@@ -172,6 +187,8 @@ type Service struct {
 	rand     io.Reader
 
 	senders, fanout, adds, creates *messaging.Limiter
+	// fanoutShare is each sender's part of its group's fan-out budget.
+	fanoutShare *messaging.Limiter
 
 	mu      sync.Mutex
 	touched map[string]time.Time
@@ -189,17 +206,26 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 	if cfg.MaxParticipants > LimitParticipants {
 		return nil, fmt.Errorf("group: MaxParticipants above %d", LimitParticipants)
 	}
-	if cfg.FanoutRate.PerMinute > 0 && cfg.FanoutRate.Burst < cfg.MaxParticipants-1 {
+	if cfg.FanoutRate.PerMinute > 0 && cfg.FanoutRate.Burst/FanoutSenderShare < cfg.MaxParticipants-1 {
 		// Otherwise a message to a full group could never be sent.
-		return nil, errors.New("group: the fan-out burst must cover a full group")
+		return nil, fmt.Errorf("group: a sender's part of the fan-out burst (1/%d) must cover a full group", FanoutSenderShare)
+	}
+	if cfg.AddRate.PerMinute > 0 && cfg.AddRate.Burst < cfg.MaxParticipants-1 {
+		// Otherwise a full group could never be created.
+		return nil, errors.New("group: the add burst must cover a full group's invitees")
+	}
+	share := messaging.Rate{PerMinute: -1}
+	if r := cfg.FanoutRate; r.PerMinute > 0 {
+		share = messaging.Rate{PerMinute: max(r.PerMinute/FanoutSenderShare, 1), Burst: r.Burst / FanoutSenderShare}
 	}
 	s := &Service{
 		cfg: cfg, store: st, engine: engine, notifier: n, metrics: metrics, rand: &lockedReader{r: cfg.Rand},
-		senders: messaging.NewLimiter(cfg.SenderRate, cfg.MaxTracked),
-		fanout:  messaging.NewLimiter(cfg.FanoutRate, cfg.MaxTracked),
-		adds:    messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
-		creates: messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
-		touched: map[string]time.Time{},
+		senders:     messaging.NewLimiter(cfg.SenderRate, cfg.MaxTracked),
+		fanout:      messaging.NewLimiter(cfg.FanoutRate, cfg.MaxTracked),
+		fanoutShare: messaging.NewLimiter(share, cfg.MaxTracked),
+		adds:        messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
+		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
+		touched:     map[string]time.Time{},
 	}
 	engine.SetGroupHandler(s)
 	return s, nil
@@ -632,6 +658,10 @@ func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messa
 		return messaging.Audience{}, nil
 	case messaging.GroupText:
 		if !s.senders.Allow(uri+"\x00"+sender, now, 1) {
+			return messaging.Audience{}, messaging.Reject(messaging.ReasonRateLimited)
+		}
+		if !s.fanoutShare.Allow(uri+"\x00"+sender, now, len(aud.Recipients)) {
+			s.metrics.Count("group.fanout_share_exceeded", 1)
 			return messaging.Audience{}, messaging.Reject(messaging.ReasonRateLimited)
 		}
 		if !s.fanout.Allow(uri, now, len(aud.Recipients)) {

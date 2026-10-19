@@ -304,7 +304,7 @@ group sessions. They have not been checked against the licensed texts.
 | Leave | a current participant | the chairman's role passes to the joined participant longest in the group, else the longest-invited one; the last one out ends the group |
 | Add | a joined participant | within the size limit, at its add rate; current participants are left alone, former ones invited again |
 | Remove | the chairman | not itself (that is Leave); the target must be current |
-| Write | a joined participant | at `RCSAS_GROUP_SENDER_RATE` per group, within the group's fan-out budget |
+| Write | a joined participant | at `RCSAS_GROUP_SENDER_RATE` per group, within a quarter of the group's fan-out budget and within the budget |
 | Read the roster | a current participant | |
 
 Every value is checked before anything is stored, and the roster documents are
@@ -328,7 +328,11 @@ A message a joined participant writes goes through the same pipeline as 1-to-1
 chat (size, CPIM parse, `From` check, per-sender rate). Then:
 
 - **Rate and budget.** The group applies the sender's rate in this group and
-  the group's fan-out budget, which counts one delivery per recipient.
+  the group's fan-out budget, which counts one delivery per recipient. Each
+  sender may use at most a quarter of the budget (`group.FanoutSenderShare`),
+  in rate and in burst. Without that, one participant of a full group writing
+  as fast as its own rate allows would use the whole budget, and the others'
+  messages would be refused.
 - **CPIM rewrite.** rcs-as builds the header block anew: `From`, the sender's
   asserted identity under its display name in the roster (not the one its
   client wrote), then `To`, the group, then every other header in its order.
@@ -476,8 +480,8 @@ settings:
 | `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200 |
 | `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
 | `RCSAS_GROUP_SENDER_RATE`, `RCSAS_GROUP_SENDER_BURST` | `60`, `30` | Messages per minute one participant writes in one group, per task; also renames |
-| `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. The burst must cover a full group |
-| `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` | Participants one user adds per minute, in groups it creates too |
+| `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, so a quarter of the burst must cover a full group |
+| `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
 
 A rate of `0` turns that limit off.
@@ -625,7 +629,7 @@ identifier ever appears in a metric name.
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
-| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout_budget_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share |
+| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget |
 
 Logs never carry message content. Identities appear only through
 `internal/pii`. MSRP session ids never appear: they are capabilities ([threat
@@ -645,6 +649,7 @@ Signals to alarm on (Phase 7):
 | `msrp.accept_failed` > 0 | The MSRP listener ran out of file descriptors or the like |
 | `invite.untracked` > 0 | More pending invitations than a task tracks (100 000); messages wait for the retry timer instead of an invitation |
 | `group.fanout_budget_exceeded` sustained | A group writing beyond its budget: a flood, or the budget is too small for real groups |
+| `group.fanout_share_exceeded` sustained | One participant writing to a large group as fast as it may: a flood |
 | `group.rejected.rate_limited` sustained | Users creating groups or adding people faster than allowed: mass-add spam |
 
 ## Assumptions and limitations

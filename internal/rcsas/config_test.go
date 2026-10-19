@@ -149,8 +149,12 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 	g := c.Group
 	if c.GroupsTable != "groupchats" || g.ConferenceHost != "conf.ims.example.net" || g.MaxParticipants != 100 ||
 		g.IdleTTL != 30*24*time.Hour || g.SenderRate.PerMinute != 60 || g.FanoutRate.Burst != 1000 || g.AddRate.PerMinute != 30 ||
-		g.CreateRate.Burst != 10 {
+		g.AddRate.Burst != 100 || g.CreateRate.Burst != 10 {
 		t.Fatalf("defaults %+v", c.Group)
+	}
+	// The largest groups take a larger add burst by default.
+	if c, err := configure(with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "200")); err != nil || c.Group.AddRate.Burst != 199 {
+		t.Fatalf("add burst for 200: %+v, %v", c.Group.AddRate, err)
 	}
 	c, err = configure(with(devEnv, "RCSAS_GROUPCHATS_TABLE", "rcs-groups", "RCSAS_GROUP_MAX_PARTICIPANTS", "20",
 		"RCSAS_GROUP_IDLE_TTL", "240h", "RCSAS_GROUP_SENDER_RATE", "10", "RCSAS_GROUP_SENDER_BURST", "3",
@@ -172,7 +176,8 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 		"no participants":       {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "0"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
 		"too many participants": {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "201", "RCSAS_GROUP_FANOUT_BURST", "1000"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
 		"no idle time":          {with(devEnv, "RCSAS_GROUP_IDLE_TTL", "0s"), "RCSAS_GROUP_IDLE_TTL"},
-		"a small fan-out":       {with(devEnv, "RCSAS_GROUP_FANOUT_BURST", "50"), "RCSAS_GROUP_FANOUT_BURST"},
+		"a small fan-out":       {with(devEnv, "RCSAS_GROUP_FANOUT_BURST", "395"), "RCSAS_GROUP_FANOUT_BURST"},
+		"a small add burst":     {with(devEnv, "RCSAS_GROUP_ADD_BURST", "98"), "RCSAS_GROUP_ADD_BURST"},
 		"a negative rate":       {with(devEnv, "RCSAS_GROUP_ADD_RATE", "-1"), "RCSAS_GROUP_ADD_RATE"},
 		"a negative burst":      {with(devEnv, "RCSAS_GROUP_CREATE_BURST", "-1"), "RCSAS_GROUP_CREATE_BURST"},
 	} {

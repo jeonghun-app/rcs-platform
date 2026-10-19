@@ -210,7 +210,9 @@ metadata.
   - group size (`RCSAS_GROUP_MAX_PARTICIPANTS`);
   - per user, groups created and participants added per minute;
   - per participant and group, messages and renames per minute;
-  - per group, a fan-out budget of deliveries per minute;
+  - per group, a fan-out budget of deliveries per minute, of which one
+    sender may use at most a quarter, so that no participant can silence a
+    group by writing at its own full rate;
   - each recipient's queue as in 1-to-1 chat, where a group message counts
     against its author's share, the one its 1-to-1 messages use, and all
     group notifications together hold one share, beyond which they are
