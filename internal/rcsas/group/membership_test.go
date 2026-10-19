@@ -91,7 +91,10 @@ func TestTheGroupIsAskedBeforeAParticipantIsInvitedBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "bob invited", func() bool { return a.invitesOf(g, bob) == 1 })
+	// Task b removes bob. Its engine is stopped, so that what happens to
+	// bob's copy is task a's doing.
 	b := newRigWith(t, Config{}, messaging.Config{}, queues, groups, clock, 2)
+	b.e.Close()
 	if err := b.s.Remove(t.Context(), g.URI, alice, bob); err != nil {
 		t.Fatal(err)
 	}

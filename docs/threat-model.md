@@ -215,7 +215,9 @@ metadata.
     against its author's share, the one its 1-to-1 messages use, and all
     group notifications together hold one share, beyond which they are
     dropped;
-  - names, subject and Conversation-ID, 256 bytes each;
+  - names, subject and Conversation-ID, 256 bytes each; identities must be
+    SIP or tel URIs, compared in canonical form, and names XML-safe text, so
+    that one bad value cannot make the stored roster unwritable;
   - former participants, at most as many as the size limit; adding and
     removing stranger after stranger cannot grow a group's stored item past
     DynamoDB's limit and break the group.

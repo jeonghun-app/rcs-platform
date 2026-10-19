@@ -307,8 +307,20 @@ group sessions. They have not been checked against the licensed texts.
 | Write | a joined participant | at `RCSAS_GROUP_SENDER_RATE` per group, within the group's fan-out budget |
 | Read the roster | a current participant | |
 
-Identities are at most 256 bytes; names, the subject and the Conversation-ID
-are at most 256 bytes each.
+Every value is checked before anything is stored, and the roster documents are
+built before each write, so that no request can store a group whose roster
+cannot be written (`invalid`):
+
+- **Identities** must be SIP or tel URIs that name a user, at most 256 bytes.
+  They are stored and compared in canonical form (`identity.CanonicalIMPU`,
+  the form the HSS provisions): a SIP URI keeps its user part, loses its
+  parameters and has its host in lower case; a tel URI is a global number
+  without visual separators. One person added as `tel:+1-555-…` and joining
+  as `tel:+1555…` is one participant. The SIP layer passes asserted
+  identities in the same form, as the CSCFs assert them, and names legs so.
+- **Names and the subject** are at most 256 bytes of UTF-8 that XML can
+  carry, without control characters.
+- **The Conversation-ID** is at most 256 bytes.
 
 ### Fan-out
 

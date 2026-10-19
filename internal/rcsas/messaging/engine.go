@@ -186,8 +186,8 @@ type Engine struct {
 	departed map[legKey]time.Time
 	// groupLegs counts the open group legs of each group on this task.
 	groupLegs map[string]int
-	lastID   int64
-	sweepAt  string
+	lastID    int64
+	sweepAt   string
 }
 
 // legKey names the chat legs a queued message may be delivered on: those

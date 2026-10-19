@@ -205,33 +205,20 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 	return s, nil
 }
 
-// Bounds on what a client names: they are stored once per participant,
-// and the group's item must stay well inside DynamoDB's 400 KB.
-const (
-	MaxDisplayNameLength = 256
-	MaxSubjectLength     = 256
-)
-
-func validIdentity(id string) bool { return id != "" && len(id) <= messaging.MaxIdentityLength }
-
 // Create makes a group of the creator, its chairman and already joined
 // (its INVITE is what creates it), and the invitees, invited.
 func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group, error) {
-	if !validIdentity(r.Creator) || len(r.CreatorName) > MaxDisplayNameLength || len(r.Subject) > MaxSubjectLength ||
+	creator, ok := canonical(r.Creator)
+	if !ok || !validText(r.CreatorName, MaxDisplayNameLength) || !validText(r.Subject, MaxSubjectLength) ||
 		len(r.Conversation) > messaging.MaxIDLength {
 		return groupstore.Group{}, ErrInvalid
 	}
-	var invitees []Invitee
-	seen := map[string]bool{r.Creator: true}
-	for _, in := range r.Invitees {
-		if !validIdentity(in.Identity) || len(in.DisplayName) > MaxDisplayNameLength {
-			return groupstore.Group{}, ErrInvalid
-		}
-		if !seen[in.Identity] {
-			seen[in.Identity] = true
-			invitees = append(invitees, in)
-		}
+	r.Creator = creator
+	invitees, err := canonicalInvitees(r.Invitees)
+	if err != nil {
+		return groupstore.Group{}, err
 	}
+	invitees = slices.DeleteFunc(invitees, func(in Invitee) bool { return in.Identity == creator })
 	switch {
 	case len(invitees) == 0:
 		return groupstore.Group{}, ErrInvalid
@@ -269,17 +256,33 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 			Identity: in.Identity, DisplayName: in.DisplayName, Role: groupstore.Member, State: groupstore.Invited, AddedBy: r.Creator, Since: now,
 		})
 	}
+	doc, err := fullDocument(g)
+	if err != nil {
+		return groupstore.Group{}, ErrInvalid
+	}
 	if err := s.store.Create(ctx, g, token, now); err != nil {
 		return groupstore.Group{}, err
 	}
 	g.Rev = 1
-	doc, err := fullDocument(g)
-	if err != nil {
-		return groupstore.Group{}, err
-	}
 	s.metrics.Count("group.created", 1)
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})
 	return g, nil
+}
+
+// canonicalInvitees checks the invitees and puts their identities in
+// canonical form, leaving out the repeats that canonical form reveals.
+func canonicalInvitees(in []Invitee) ([]Invitee, error) {
+	var out []Invitee
+	for _, x := range in {
+		id, ok := canonical(x.Identity)
+		if !ok || !validText(x.DisplayName, MaxDisplayNameLength) {
+			return nil, ErrInvalid
+		}
+		if !slices.ContainsFunc(out, func(y Invitee) bool { return y.Identity == id }) {
+			out = append(out, Invitee{Identity: id, DisplayName: x.DisplayName})
+		}
+	}
+	return out, nil
 }
 
 // Join records that who joined the group: an invited participant
@@ -290,7 +293,8 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 // group (messaging.Engine.ParticipantLeft): a copy queued before it left
 // or was removed is then given up, not kept to invite it again.
 func (s *Service) Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
-	if len(displayName) > MaxDisplayNameLength {
+	who, ok := canonical(who)
+	if !ok || !validText(displayName, MaxDisplayNameLength) {
 		return groupstore.Group{}, ErrInvalid
 	}
 	g, err := s.join(ctx, uri, who, displayName)
@@ -331,6 +335,10 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 // still queued for who from the group is given up
 // (messaging.Engine.ParticipantLeft).
 func (s *Service) Leave(ctx context.Context, uri, who string) error {
+	who, ok := canonical(who)
+	if !ok {
+		return ErrInvalid
+	}
 	_, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		i := index(g, who)
 		if i < 0 || !g.Participants[i].State.Active() {
@@ -374,10 +382,13 @@ func successor(g *groupstore.Group) int {
 // again, and messages are kept for them once more
 // (messaging.Engine.ParticipantAdded).
 func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error {
-	for _, in := range who {
-		if !validIdentity(in.Identity) || len(in.DisplayName) > MaxDisplayNameLength {
-			return ErrInvalid
-		}
+	by, ok := canonical(by)
+	if !ok {
+		return ErrInvalid
+	}
+	who, err := canonicalInvitees(who)
+	if err != nil {
+		return err
 	}
 	now := s.cfg.Clock.Now()
 	if !s.adds.Allow(by, now, len(who)) {
@@ -385,7 +396,7 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		return ErrRateLimited
 	}
 	var added []string
-	_, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
+	_, err = s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		added = nil
 		if i := index(g, by); i < 0 || g.Participants[i].State != groupstore.Joined {
 			return nil, ErrNotParticipant
@@ -393,7 +404,7 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		var changed []string
 		for _, in := range who {
 			i := index(g, in.Identity)
-			if i >= 0 && g.Participants[i].State.Active() || slices.Contains(changed, in.Identity) {
+			if i >= 0 && g.Participants[i].State.Active() {
 				continue
 			}
 			changed = append(changed, in.Identity)
@@ -421,6 +432,11 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 
 // Remove removes who from the group on behalf of by, its chairman.
 func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
+	by, ok := canonical(by)
+	who, ok2 := canonical(who)
+	if !ok || !ok2 {
+		return ErrInvalid
+	}
 	_, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		i := index(g, by)
 		switch {
@@ -449,6 +465,10 @@ func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
 // first NOTIFY of a subscription by who, a current participant (RFC 4575
 // §4.6). Others get ErrNotParticipant: the roster says who talks to whom.
 func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, error) {
+	who, ok := canonical(who)
+	if !ok {
+		return nil, 0, ErrInvalid
+	}
 	g, err := s.get(ctx, uri)
 	if err != nil {
 		return nil, 0, err
@@ -499,6 +519,16 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 		if g.Expires.After(now) {
 			g.Expires = now.Add(s.cfg.IdleTTL)
 		}
+		// Both documents are built before the write: one the group could
+		// not be written as must not be stored.
+		doc, err := partialDocument(g, changed, deleted)
+		if err == nil {
+			_, err = fullDocument(g)
+		}
+		if err != nil {
+			s.metrics.Count("group.rejected.invalid", 1)
+			return groupstore.Group{}, ErrInvalid
+		}
 		token, err := s.randomHex(8)
 		if err != nil {
 			return groupstore.Group{}, err
@@ -515,10 +545,6 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 			return groupstore.Group{}, err
 		}
 		g.Rev++
-		doc, err := partialDocument(g, changed, deleted)
-		if err != nil {
-			return groupstore.Group{}, err
-		}
 		s.metrics.Count("group.roster_changed", 1)
 		s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Document: doc})
 		return g, nil
@@ -578,6 +604,10 @@ func activeCount(g *groupstore.Group) int {
 // is-composing indication only to the joined ones, which have a session to
 // show it on. The sender's name is the one the roster holds.
 func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messaging.GroupKind) (messaging.Audience, error) {
+	sender, ok := canonical(sender)
+	if !ok {
+		return messaging.Audience{}, messaging.Reject(messaging.ReasonNotParticipant)
+	}
 	g, err := s.get(ctx, uri)
 	if errors.Is(err, ErrNoGroup) {
 		return messaging.Audience{}, messaging.Reject(messaging.ReasonNoGroup)
@@ -616,6 +646,10 @@ func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messa
 // Member implements messaging.GroupHandler: whether user is a current
 // participant, invited or joined.
 func (s *Service) Member(ctx context.Context, uri, user string) (bool, error) {
+	user, ok := canonical(user)
+	if !ok {
+		return false, nil
+	}
 	g, err := s.get(ctx, uri)
 	switch {
 	case errors.Is(err, ErrNoGroup):
