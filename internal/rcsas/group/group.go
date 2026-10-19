@@ -392,12 +392,20 @@ func (s *Service) Leave(ctx context.Context, uri, who string) error {
 	return err
 }
 
-// successor returns the participant who takes over as chairman: the
-// longest-standing joined one, else the longest-standing invited one, or -1.
+// successor returns the participant who takes over as chairman: the one
+// joined longest, else the one invited longest ago, or -1. Since is when
+// each entered its state, so someone who left and came back counts from
+// its return, not from its place in the list, which Add keeps.
 func successor(g *groupstore.Group) int {
 	for _, want := range []groupstore.State{groupstore.Joined, groupstore.Invited} {
-		if i := slices.IndexFunc(g.Participants, func(p groupstore.Participant) bool { return p.State == want }); i >= 0 {
-			return i
+		best := -1
+		for i, p := range g.Participants {
+			if p.State == want && (best < 0 || p.Since.Before(g.Participants[best].Since)) {
+				best = i
+			}
+		}
+		if best >= 0 {
+			return best
 		}
 	}
 	return -1
@@ -406,7 +414,8 @@ func successor(g *groupstore.Group) int {
 // Add adds participants, invited, on behalf of by, a joined participant.
 // Current participants are left as they are; former ones are invited
 // again, and messages are kept for them once more
-// (messaging.Engine.ParticipantAdded).
+// (messaging.Engine.ParticipantAdded). Only the chairman adds back someone
+// who was removed.
 func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error {
 	by, ok := canonical(by)
 	if !ok {
@@ -424,14 +433,20 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 	var added []string
 	_, err = s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		added = nil
-		if i := index(g, by); i < 0 || g.Participants[i].State != groupstore.Joined {
+		adder := index(g, by)
+		if adder < 0 || g.Participants[adder].State != groupstore.Joined {
 			return nil, ErrNotParticipant
 		}
 		var changed []string
 		for _, in := range who {
 			i := index(g, in.Identity)
-			if i >= 0 && g.Participants[i].State.Active() {
+			switch {
+			case i >= 0 && g.Participants[i].State.Active():
 				continue
+			case i >= 0 && g.Participants[i].State == groupstore.Removed && g.Participants[adder].Role != groupstore.Chairman:
+				// Otherwise any participant could undo the chairman's
+				// removal at once (threat model T11).
+				return nil, ErrNotChairman
 			}
 			changed = append(changed, in.Identity)
 			p := groupstore.Participant{Identity: in.Identity, DisplayName: in.DisplayName, Role: groupstore.Member,

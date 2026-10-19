@@ -190,7 +190,9 @@ metadata.
 
 - **Authorisation.** Every operation is checked against the stored roster:
   - only joined participants add, and only the chairman removes;
-  - someone who left or was removed returns only when added again;
+  - someone who left or was removed returns only when added again, and
+    someone removed only when the chairman adds them back, so that no
+    participant can undo the chairman's removal;
   - only current participants read the roster;
   - only joined participants write.
 
@@ -224,6 +226,10 @@ metadata.
     removing stranger after stranger cannot grow a group's stored item past
     DynamoDB's limit and break the group.
 - **Metrics.** None names a group or a participant.
+- **Roster privacy.** The roster keeps former participants (up to the size
+  limit), so a participant who joins later sees who was in the group before.
+  This is accepted: it is how RFC 4575 rosters and RCS clients show who left.
+  Only current participants read the roster.
 
 **Status:** implemented in `internal/rcsas/group` (#108). The SIP layer must:
 

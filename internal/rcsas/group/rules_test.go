@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
@@ -98,7 +99,8 @@ func TestOnlyTheRightParticipantsMayChangeAGroup(t *testing.T) {
 		"a former participant adds":                 {add(dave, stranger), ErrNotParticipant},
 		"a stranger adds":                           {add(stranger, "sip:x@example.net"), ErrNotParticipant},
 		"adding someone who left invites them":      {add(bob, dave), nil},
-		"adding someone removed invites them":       {add(bob, erin), nil},
+		"a participant adds someone removed":        {add(bob, erin), ErrNotChairman},
+		"the chairman adds someone removed":         {add(alice, erin), nil},
 		"adding a current participant does nothing": {add(bob, carol), nil},
 		"the chairman removes":                      {remove(alice, bob), nil},
 		"the chairman removes an invitee":           {remove(alice, carol), nil},
@@ -199,6 +201,67 @@ func TestTheChairmanRoleOutlivesTheChairman(t *testing.T) {
 	}
 	if err := r.s.Leave(t.Context(), "sip:chat-none@"+host, bob); !errors.Is(err, ErrNoGroup) {
 		t.Fatalf("Leave of no group = %v", err)
+	}
+}
+
+// QA's reproduction (PR #118): the role goes to whoever has been joined
+// longest, not to whoever comes first in the list. bob left and was added
+// back into his old place; carol was there all along.
+func TestTheChairmanPassesToTheLongestJoined(t *testing.T) {
+	r := newRig(t, Config{})
+	g := r.create(bob, carol)
+	r.clock.Advance(time.Minute)
+	if err := r.s.Leave(t.Context(), g.URI, bob); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(time.Minute)
+	if err := r.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: bob}}); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(time.Minute)
+	if _, err := r.s.Join(t.Context(), g.URI, bob, ""); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(time.Minute)
+	if err := r.s.Leave(t.Context(), g.URI, alice); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.s.Get(t.Context(), g.URI)
+	if p, _ := got.Participant(carol); p.Role != groupstore.Chairman {
+		t.Fatalf("carol = %+v; bob = %+v", p, got.Participants[1])
+	}
+}
+
+// A joined participant takes the role before an invitee who was added
+// earlier, and among invitees the one invited first.
+func TestAJoinedParticipantTakesTheChairBeforeAnEarlierInvitee(t *testing.T) {
+	r := newRig(t, Config{})
+	g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(time.Minute)
+	if err := r.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: carol}, {Identity: dave}}); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(time.Minute)
+	if _, err := r.s.Join(t.Context(), g.URI, dave, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.s.Leave(t.Context(), g.URI, alice); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.s.Get(t.Context(), g.URI)
+	if p, _ := got.Participant(dave); p.Role != groupstore.Chairman {
+		t.Fatalf("dave = %+v", p)
+	}
+	// dave leaves too: bob, invited first, takes it over carol.
+	if err := r.s.Leave(t.Context(), g.URI, dave); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = r.s.Get(t.Context(), g.URI)
+	if p, _ := got.Participant(bob); p.Role != groupstore.Chairman {
+		t.Fatalf("bob = %+v", p)
 	}
 }
 

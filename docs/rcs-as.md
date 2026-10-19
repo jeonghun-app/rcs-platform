@@ -301,8 +301,8 @@ group sessions. They have not been checked against the licensed texts.
 |---|---|---|
 | Create | anyone | 1 to `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 others; the creator becomes chairman, joined; rate per creator, and the invitees count toward its add rate |
 | Join | a current (invited or joined) participant | someone who left or was removed must be added again; a joined participant joining again only updates its name, at its group rate |
-| Leave | a current participant | the chairman's role passes to the joined participant longest in the group, else the longest-invited one; the last one out ends the group |
-| Add | a joined participant | within the size limit, at its add rate; current participants are left alone, former ones invited again |
+| Leave | a current participant | the chairman's role passes to the participant joined longest (counted from its last join, not its first), else the one invited longest ago; the last one out ends the group |
+| Add | a joined participant | within the size limit, at its add rate; current participants are left alone, former ones invited again. Someone the chairman removed is added back only by the chairman |
 | Remove | the chairman | not itself (that is Leave); the target must be current |
 | Write | a joined participant | at `RCSAS_GROUP_SENDER_RATE` per group, within a quarter of the group's fan-out budget and within the budget |
 | Read the roster | a current participant | |
@@ -431,6 +431,12 @@ A group keeps at most as many former participants as
 `RCSAS_GROUP_MAX_PARTICIPANTS`. Beyond that, whoever left longest ago leaves the
 roster, as a `state="deleted"` user in the partial document of the change that
 pushed it out.
+
+Former participants are in the roster that every current participant reads,
+including those who join after they left. So someone who joins a group learns
+the identities and names of people who were in it before, up to that limit, as
+clients show who left. This is RFC 4575's model of a conference roster. It is
+communication metadata (threat model T11).
 
 The roles are `chairman` and `participant`. Creating a group produces a full
 document at version 1. Every change after that writes the group conditionally

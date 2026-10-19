@@ -27,12 +27,13 @@
 //     within the size limit. Only the chairman may remove others; anyone may
 //     leave.
 //   - A participant who left or was removed comes back only by being added
-//     again; being in the roster once is not a standing invitation.
+//     again; being in the roster once is not a standing invitation. Only
+//     the chairman adds back someone who was removed.
 //   - A group remembers at most as many former participants as its size
 //     limit; the one who left longest ago is forgotten first, so that
 //     churn cannot grow the stored group without bound.
-//   - When the chairman leaves, the role passes to the participant who has
-//     been in the group longest.
+//   - When the chairman leaves, the role passes to the participant joined
+//     longest, else to the one invited longest ago.
 //   - Only a joined participant may write in the group, and what it writes
 //     goes to every other current participant, invited ones included, so
 //     that they find it when they join.

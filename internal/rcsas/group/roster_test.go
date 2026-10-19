@@ -25,7 +25,8 @@ func TestPartialRosterUpdatesAddUpToTheFullRoster(t *testing.T) {
 		func() error { _, err := r.s.Join(ctx, g.URI, dave, "Dave D."); return err },
 		func() error { return r.s.Remove(ctx, g.URI, alice, carol) },
 		func() error { return r.s.Leave(ctx, g.URI, alice) },
-		func() error { return r.s.Add(ctx, g.URI, dave, []Invitee{{Identity: carol}}) },
+		// bob, chairman now, adds back the carol alice removed.
+		func() error { return r.s.Add(ctx, g.URI, bob, []Invitee{{Identity: carol}}) },
 	}
 	for i, step := range steps {
 		if err := step(); err != nil {
