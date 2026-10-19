@@ -237,6 +237,9 @@ type UA struct {
 	// the incoming INVITEs not yet answered, by their transaction.
 	dialogs map[string]*Dialog
 	calls   map[*transaction.ServerTransaction]*IncomingCall
+	// invites are the INVITEs sent in the last 64*T1, by Call-ID and From
+	// tag, for 2xx that arrive after their transaction.
+	invites map[string]*invite
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -281,6 +284,7 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		done:    make(chan struct{}),
 		dialogs: map[string]*Dialog{},
 		calls:   map[*transaction.ServerTransaction]*IncomingCall{},
+		invites: map[string]*invite{},
 		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
