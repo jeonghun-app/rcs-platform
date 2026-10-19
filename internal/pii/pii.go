@@ -142,17 +142,17 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //
 // Digits of any script count: every decimal digit (Unicode Nd) outside ASCII,
 // such as a full-width digit from a CJK input mode or an Arabic-Indic digit,
-// is written as the ASCII digit of the same value first, so a number in any
-// script is masked like the same number in ASCII, with the same hint. Other
-// digit-like characters (superscripts, circled digits) are not digits here,
-// and separators must be ASCII: a number grouped with full-width separators
-// ("０１０－００００－０００１") is not recognised as one (#85).
+// is written as the ASCII digit of the same value first, and full-width
+// separators ("＋", "－", "．", "（", "）", U+3000) as ASCII ones, so a number
+// in any script is masked like the same number in ASCII, with the same hint
+// ("０１０－００００－０００１" like "010-0000-0001"). Other digit-like
+// characters (superscripts, circled digits) are not digits here.
 //
 // Schemes match case-insensitively (RFC 3261 §19.1.4, RFC 3966 §3). The output
 // never contains a run of eight or more decimal digits. Redact runs in time
 // linear in len(s), because it is given attacker-controlled header values.
 func (r *Redactor) Redact(s string) string {
-	s = asciiDigits(s)
+	s = asciiNumberChars(s)
 	var b strings.Builder
 	b.Grow(len(s))
 	// A sip or sips URI that starts before noUserBefore has no '@' before its end:
@@ -450,26 +450,30 @@ func hasUserinfo(scheme string) bool {
 	return false
 }
 
-// asciiDigits rewrites every decimal digit outside ASCII as the ASCII digit
-// of the same value, so that the scan in Redact, which reads ASCII digits,
-// treats a number in any script as it treats the number in ASCII: runs,
-// numbers in groups and URI users alike. Rewriting only long runs would let a
-// short run sit next to a mask and form a long one with the hint ("…-２３４５６７"
-// after a tel number), and would miss full-width numbers written in ASCII
-// groups. A short number such as "２０２６年" reads the same in ASCII. Only
-// digit runes are replaced, so the text around them, valid UTF-8 or not, is
-// kept.
-func asciiDigits(s string) string {
-	if isASCII(s) {
+// asciiNumberChars rewrites every decimal digit outside ASCII as the ASCII
+// digit of the same value, and the full-width forms of the characters that
+// write a number ("＋", "－", "．", "（", "）" and the ideographic space
+// U+3000) as their ASCII ones, so that the scan in Redact, which reads
+// ASCII, treats a number in any script or input mode as it treats the
+// number in ASCII: runs, numbers in groups and URI users alike, with the same
+// hint. Rewriting only long digit runs would let a short run sit next to a
+// mask and form a long one with the hint ("…-２３４５６７" after a tel
+// number), and would miss numbers written in groups. Text such as
+// "２０２６年" or "（注）" reads the same with ASCII characters, and text
+// without a digit is not rewritten at all. Only these runes are replaced, so
+// the text around them, valid UTF-8 or not, is kept.
+func asciiNumberChars(s string) string {
+	// Text without a digit holds no number, and is left alone.
+	if isASCII(s) || !strings.ContainsFunc(s, unicode.IsDigit) {
 		return s
 	}
 	var b strings.Builder
 	last := 0 // s[:last] has been written
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if r >= utf8.RuneSelf && unicode.IsDigit(r) {
+		if c, ok := asciiNumberChar(r); ok {
 			b.WriteString(s[last:i])
-			b.WriteByte(asciiDigit(r))
+			b.WriteByte(c)
 			last = i + size
 		}
 		i += size
@@ -479,6 +483,23 @@ func asciiDigits(s string) string {
 	}
 	b.WriteString(s[last:])
 	return b.String()
+}
+
+// asciiNumberChar returns the ASCII character asciiNumberChars writes for r,
+// if r is one it rewrites.
+func asciiNumberChar(r rune) (byte, bool) {
+	switch {
+	case r < utf8.RuneSelf:
+		return 0, false
+	case unicode.IsDigit(r):
+		return asciiDigit(r), true
+	case r == '\u3000':
+		return ' ', true
+	case r == '＋', r == '－', r == '．', r == '（', r == '）':
+		// The full-width forms block mirrors ASCII 0x21-0x7E at U+FF01.
+		return byte(r - '！' + '!'), true
+	}
+	return 0, false
 }
 
 // asciiDigit returns the ASCII digit with the value of the decimal digit r.
