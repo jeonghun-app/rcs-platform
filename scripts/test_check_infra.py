@@ -134,6 +134,33 @@ class PlatformTemplate(TemplateCase):
         attrs[:] = [a for a in attrs if a["Key"] != "preserve_client_ip.enabled"]
         self.assertProblem(t, "RelayMsrpTargetGroup: NLB target group must not preserve client addresses")
 
+    def test_an_nlb_target_group_resetting_connections_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for a in t["Resources"]["RelayMsrpTargetGroup"]["Properties"]["TargetGroupAttributes"]:
+            if a["Key"] == "deregistration_delay.connection_termination.enabled":
+                a["Value"] = "true"
+        self.assertProblem(t, "RelayMsrpTargetGroup: NLB target group must keep connections at deregistration")
+
+    def test_a_plain_listener_outside_dev_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["MsrpTcpListener"]["Condition"]
+        self.assertProblem(t, "MsrpTcpListener: a plain TCP listener outside dev (ADR 0003)")
+
+    def test_a_plain_sip_listener_with_pcscf_alone_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["SipTcpListener"]["Condition"] = "WithPcscf"
+        self.assertProblem(t, "SipTcpListener: a plain TCP listener outside dev")
+
+    def test_a_plain_port_open_outside_dev_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["NlbSecurityGroup"]["Properties"]["SecurityGroupIngress"].append(
+            {"IpProtocol": "tcp", "FromPort": 2855, "ToPort": 2855, "CidrIp": "0.0.0.0/0"})
+        self.assertProblem(t, "NlbSecurityGroup: plain port 2855 open outside dev (ADR 0003)")
+
+    def test_the_tls_listeners_are_not_dev_only(self):
+        listeners = check_infra.resources(self.template, "AWS::ElasticLoadBalancingV2::Listener")
+        self.assertFalse(check_infra.dev_only(self.template, listeners["MsrpTlsListener"].get("Condition")))
+
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)
         self.assertProblem(t, "Alb: internet-facing ALB without an AWS WAF web ACL")
@@ -241,6 +268,60 @@ class PlatformServices(TemplateCase):
         t = copy.deepcopy(self.template)
         self.set_start_timeout(t, "1.5m")
         self.assertProblem(t, "HSS_START_TIMEOUT is not a duration")
+    def test_an_arn_wildcard_reaches_the_bindings(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:GetItem",
+             "Resource": {"Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"}})
+        self.assertProblem(t, "HssTaskRole: may read MsrpBindingsTable")
+
+    def test_an_arn_naming_the_bindings_table_reaches_it(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AcsTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Query",
+             "Resource": {"Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-msrp-bindings"}})
+        self.assertProblem(t, "AcsTaskRole: may read MsrpBindingsTable")
+
+    def test_a_wildcard_under_a_named_table_stays_there(self):
+        targets = check_infra._names({"Fn::Sub": "${SubscribersTable.Arn}/index/*"})
+        self.assertEqual(targets, {"SubscribersTable"})
+
+    def test_a_role_without_an_action_its_code_calls_is_refused(self):
+        # The #70 blocker: hss Scans profile-index at every start with a KMS key.
+        t = copy.deepcopy(self.template)
+        statements = t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+        for st in statements:
+            if "dynamodb:Scan" in st["Action"]:
+                st["Action"] = [a for a in st["Action"] if a != "dynamodb:Scan"]
+        self.assertProblem(t, "HssTaskRole: lacks dynamodb:Scan on SubscribersTable/index/profile-index")
+
+    def test_a_grant_on_the_wrong_resource_does_not_count(self):
+        required = {"FtServerTaskRole": {"FilesBucket": ["s3:GetObject"]}}
+        self.assertEqual(check_infra.check_required_actions(self.template, required),
+                         ["FtServerTaskRole: lacks s3:GetObject on FilesBucket, which its code calls"])
+
+    def test_a_wildcard_grant_counts(self):
+        required = {"HssTaskRole": {"SubscribersTable/index/profile-index": ["dynamodb:Query"]}}
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]:
+            if st["Resource"] == {"Fn::Sub": "${SubscribersTable.Arn}/index/profile-index"}:
+                st["Resource"], st["Action"] = {"Fn::Sub": "${SubscribersTable.Arn}/index/*"}, ["dynamodb:*"]
+        self.assertEqual(check_infra.check_required_actions(t, required), [])
+
+    def test_a_task_role_without_a_task_definition_is_still_checked(self):
+        t = copy.deepcopy(self.template)
+        role = copy.deepcopy(t["Resources"]["MsrpRelayTaskRole"])
+        role["Properties"]["Policies"][0]["PolicyDocument"]["Statement"] = [
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]
+        t["Resources"]["FutureTaskRole"] = role
+        self.assertProblem(t, "FutureTaskRole: a task role may read secrets")
+
+    def test_a_secret_grant_inside_a_condition_is_seen(self):
+        t = copy.deepcopy(self.template)
+        policies = t["Resources"]["AcsTaskRole"]["Properties"]["Policies"]
+        policies.append({"Fn::If": ["UseAcsAwsSms", {"PolicyName": "x", "PolicyDocument": {"Statement": [
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]}}, {"Ref": "AWS::NoValue"}]})
+        self.assertProblem(t, "AcsTaskRole: a task role may read secrets")
 
     def test_a_service_task_role_reading_its_secrets_is_refused(self):
         t = copy.deepcopy(self.template)

@@ -48,32 +48,65 @@ otherwise.
 
 ## 3. Repository layout
 
+What is on `main` today:
+
 ```
-cmd/<service>/              main package per service; flags, wiring, nothing else
+cmd/<service>/              main package per service; wiring only (ft-server,
+                            msrp-relay, rcs-version)
 internal/
+  buildinfo/                release version stamped into every binary
   runtime/                  shared service runtime: env config, slog JSON logger,
-                            /healthz + /readyz, graceful shutdown, -healthcheck flag
+                            EMF metrics, /healthz + /readyz, graceful shutdown,
+                            -version and -healthcheck modes
+  runtime/runtimetest/      a *runtime.Runtime for service tests, manual clock
   pii/                      redaction of IMSI, MSISDN, IMEI, SIP/tel URIs in logs
+  proxyproto/               PROXY protocol v2 parser shared by every service
+                            behind the NLB (ADR 0003)
   sip/                      RFC 3261 message model, parser, serializer, URIs, headers
-  sip/transport/            UDP, TCP and TLS listeners and connection table (flows)
-  sip/transaction/          client and server transaction state machines and timers
   sip/digest/               SIP/HTTP Digest (RFC 7616, RFC 8760) and AKA (RFC 3310)
-  sdp/                      RFC 4566/8866 parser and serializer, MSRP media attributes
-  diameter/                 RFC 6733 codec, peer state machine (CER/CEA, DWR/DWA, DPR)
-  diameter/cx, diameter/sh  application dictionaries and typed messages
   milenage/                 TS 35.206 f1–f5*, AUTN/RES/CK/IK/AK, resync (AUTS)
-  msrp/                     RFC 4975 codec, chunking, session, connection reuse
+  sdp/                      RFC 8866 parser and serializer, MSRP media attributes,
+                            offer/answer and relay rewrite
+  diameter/                 RFC 6733 codec, dictionary, peers (CER/CEA, DWR/DWA, DPR)
+  diameter/cx, diameter/sh  Cx and Sh application dictionaries and typed messages
+  ifc/                      IMS user profile (Cx User-Data) and iFC evaluation
+  msrp/                     RFC 4975 codec, chunking, reports, connections, Bridge
   cpim/, imdn/              message/cpim wrapper and IMDN notifications
   conference/               RFC 4575 conference-info documents
-  ifc/                      initial filter criteria model and evaluation
-  store/                    storage interfaces; memory and DynamoDB backends
-  <service>/                service logic (pcscf/, scscf/, rcsas/, …), testable without network
-deploy/                     Dockerfile, docker-compose.yml for the full local stack
-infra/                      CloudFormation: ecr.yaml, platform.yaml
-scripts/                    deploy.sh, teardown.sh, privacy and docs checks
+  ftserver/                 ft-server service logic
+  ftserver/store/           ft-server storage interfaces, memory backends,
+                            storetest contract
+  ftserver/awsstore/        ft-server S3 and DynamoDB backends
+  msrprelay/                msrp-relay service logic: control API and data path
+  msrprelay/store/          binding store interface, memory backend, storetest
+                            contract
+  msrprelay/dynamostore/    msrp-relay DynamoDB backend (`msrp-bindings`)
+deploy/                     Dockerfile (service image), toolchain.Dockerfile,
+                            docker-compose.yml (the local stack, docs/local-stack.md)
+                            and stack-init.Dockerfile (its bootstrap)
+infra/                      CloudFormation (empty until Phase 7)
+scripts/                    fuzz, privacy and docs-link checks, compose-env.sh
 tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
-docs/                       this file, ADRs, protocol notes, runbook, conformance
+tools/stack-init/           creates the local stack's tables and seeds its test subscriber
+docs/                       this file, ADRs, threat model, service docs
+                            (ft-server.md, msrp-relay.md), api/ (OpenAPI)
 ```
+
+Planned, not on `main` yet:
+
+```
+internal/sip/transport/     UDP, TCP and TLS listeners and connection table (flows)
+internal/sip/transaction/   client and server transaction state machines and timers
+internal/<service>/         pcscf/, icscf/, scscf/, hss/, rcsas/: service logic,
+                            each with its own store/ and AWS backend as above
+infra/                      ecr.yaml, platform.yaml
+scripts/                    deploy.sh, teardown.sh
+docs/                       runbook, conformance, aws-deployment.md
+```
+
+A service keeps its storage interface in `internal/<service>/store` and is the
+only importer of its AWS backend package, so its logic is tested against memory
+backends and the backend against local containers (`make test-integration`).
 
 One container image holds every service binary; the ECS task definition picks the
 command. Services never import another service's package: shared behaviour lives in
@@ -141,9 +174,13 @@ MSRP between a client on the internet and `rcs-as` inside the VPC goes through
   connections to clients, which works behind any NAT, needs no internet egress
   and lets any relay instance behind the NLB serve any session.
 - `pcscf` allocates a binding through the relay control API. Bindings live in
-  DynamoDB with a TTL, keyed by the session id in the relay's MSRP URI, so the task
-  that receives the client connection does not need to be the task that allocated
-  it.
+  DynamoDB with a TTL, keyed by the SHA-256 of the session id in the relay's
+  client-side MSRP URI, so the task that receives the client connection does not
+  need to be the task that allocated it, and a copy of the table does not let
+  anyone connect as the client.
+- The relay reads the client's address from the PROXY protocol v2 header the NLB
+  sends (`internal/proxyproto`, the one PROXY parser for every service behind the
+  NLB) and applies its per-source limits to it.
 
 `rcs-as` terminates MSRP for every session: it needs the content for
 store-and-forward, IMDN and group fan-out.
@@ -159,7 +196,7 @@ store-and-forward, IMDN and group fan-out.
 | Client connections (flows) | `pcscf` | instance memory | `Path` and core-facing `Record-Route` name the instance; flow tokens are HMACs under a per-start key, unknown ones get 430 (ADR 0005) |
 | SIP transactions | every SIP service | instance memory | Responses follow `Via` back to the instance that sent the request |
 | Stored messages, group chat state | `rcs-as` | DynamoDB `messages`, `groupchats` | |
-| MSRP bindings | `msrp-relay` | DynamoDB `msrp-bindings` with TTL | |
+| MSRP bindings | `msrp-relay` | DynamoDB `msrp-bindings`, expiry checked on read, TTL for cleanup | Keyed by the SHA-256 of the client-side session id, which is never stored; strongly consistent reads; one conditional claim per binding across tasks; a client that connects before `pcscf` has recorded its path waits up to `RELAY_PATH_WAIT` ([msrp-relay](msrp-relay.md)) |
 | Files | `ft-server` | S3 (content) + DynamoDB `files` (metadata, expiry) | Lifecycle rule deletes expired content |
 
 Every service runs at least two tasks across two AZs in production. Losing a
@@ -168,7 +205,7 @@ through the NLB to a surviving task. Every other service is stateless apart from
 its tables.
 
 Every table has a memory backend for unit tests and local runs; the compose stack
-uses DynamoDB Local and a local S3.
+([local-stack.md](local-stack.md)) uses DynamoDB Local and S3Mock.
 
 ## 8. Cross-cutting rules
 
@@ -177,13 +214,39 @@ uses DynamoDB Local and a local S3.
   (memory store, no TLS on the public listener, no admin token) refuses to start
   when `RCS_ENV` is `staging` or `prod`.
 - **Logging**: JSON lines through `log/slog`. SIP URIs, `tel:` URIs, IMSI, IMEI and
-  MSISDN pass through `internal/pii` before they are logged. Message bodies,
+  MSISDN pass through `internal/pii` before they are logged. Client IP
+  addresses, private ones included, are logged only as their network, through
+  `pii.ClientIP` or the sip and msrp log values (IPv4 /24, IPv6 /48). Message bodies,
   credentials, nonces, RAND/AUTN, keys and tokens are never logged.
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
-  needed. No identifier is ever a metric dimension.
+  needed. They are aggregated in memory and written once a minute, when
+  shutdown starts and when it ends, one line per metric, so log volume does
+  not grow with traffic; a crash loses at most the last minute. Counts are
+  sums and gauges the last value. A timing is written as at most 100 values
+  (every value, or quantiles within the exact minimum and maximum) with
+  companions `<name>.count` and `<name>.sum` holding its exact number and
+  total. No identifier is ever a metric dimension. Alarms on these metrics:
+  - use a period of 60 s or more and M of N datapoints with N of 2 or more:
+    a minute's values arrive up to a minute late, stamped when written, and a
+    task's flushes are not aligned to the minute;
+  - set `treatMissingData` explicitly: a task writes no line for a count
+    nothing incremented, so for counts missing means zero;
+  - alarm on latency with a timing's Maximum, which is exact, with the
+    exact average `<name>.sum / <name>.count` by metric math, or with the
+    Count of timeouts and errors. Never use a timing's SampleCount, Sum or
+    Average, which describe at most 100 values per task and minute, and
+    treat its percentiles with care: with `Service` as the only dimension
+    CloudWatch pools every task's values, so they weigh each task's minute
+    alike, not each request, and a slow task serving most requests can hide
+    behind fast idle ones;
+  - alarm on `EMFValidationErrors` and `EMFParsingErrors` (namespace
+    `AWS/Logs`) for each service's log group: a line CloudWatch cannot
+    extract loses a whole minute of that metric.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
-  distroless image can run an ECS container health check.
+  distroless image can run an ECS container health check. A service whose
+  start-up waits on remote services and ends at a start-up deadline (hss) sets
+  `Service.LiveAfterReady`, so that `/healthz` fails until it is ready.
 - **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
   linear in its input (a test parses a maximum-size adversarial input), and never
   repairs content it does not own: message bodies such as CPIM and MSRP payloads

@@ -616,7 +616,7 @@ func TestSendStopsAfterThePeerRefusesAChunk(t *testing.T) {
 	rest := make(chan *Message, 8)
 	go func() {
 		for {
-			_ = p.nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_ = p.nc.SetReadDeadline(time.Now().Add(hangGuard))
 			m, err := p.r.ReadMessage(DefaultMaxMessageSize)
 			if err != nil {
 				close(rest)

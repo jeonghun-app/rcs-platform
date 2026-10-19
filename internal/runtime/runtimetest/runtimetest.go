@@ -122,20 +122,44 @@ func (h *Harness) Logs(msg string) []map[string]any {
 	return out
 }
 
-// Metric returns the sum of every value written for the metric name, and
-// whether any was written.
+// Metric flushes the runtime's metrics and returns the sum of every value
+// written for the metric name, and whether any was written. For a timing the
+// sum is of the values written, which are the recorded durations themselves
+// only while there are 100 or fewer per flush; name.sum is exact. A gauge is
+// written once per flush, so read one with MetricValues.
 func (h *Harness) Metric(name string) (float64, bool) {
 	h.t.Helper()
-	sum, found := 0.0, false
+	values := h.MetricValues(name)
+	sum := 0.0
+	for _, v := range values {
+		sum += v
+	}
+	return sum, len(values) > 0
+}
+
+// MetricValues flushes the runtime's metrics and returns every value written
+// for the metric name, in the order written: one per line for a count or a
+// gauge, and each of a timing line's values.
+func (h *Harness) MetricValues(name string) []float64 {
+	h.t.Helper()
+	h.Runtime.Metrics.Flush()
+	var out []float64
 	for _, rec := range h.Records() {
 		if _, isMetric := rec["_aws"]; !isMetric {
 			continue
 		}
-		if v, ok := rec[name].(float64); ok {
-			sum, found = sum+v, true
+		switch v := rec[name].(type) {
+		case float64:
+			out = append(out, v)
+		case []any:
+			for _, x := range v {
+				if f, ok := x.(float64); ok {
+					out = append(out, f)
+				}
+			}
 		}
 	}
-	return sum, found
+	return out
 }
 
 type buffer struct {

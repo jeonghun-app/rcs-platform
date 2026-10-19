@@ -21,7 +21,9 @@ Metadata:
           - FtHostName
           - FtDeregistrationDelay
           - PcscfEnabled
+          - ScscfEnabled
           - WafRateLimit
+          - WafRateAction
       - Label: { default: Release }
         Parameters: [EcrStackName, ImageTag, AcsImageTag]
       - Label: { default: Identity }
@@ -134,6 +136,14 @@ Parameters:
       from the ALB: long enough for most uploads to finish in place
       (docs/ft-server.md, Operations notes).
 
+  ScscfEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Creates what needs scscf to exist (#89): for now the alarm on failed
+      HSS pushes, which until then fail for want of a peer every time.
+
   PcscfEnabled:
     Type: String
     Default: 'false'
@@ -144,13 +154,24 @@ Parameters:
 
   WafRateLimit:
     Type: Number
-    Default: 1000
+    Default: 10000
     MinValue: 100
     MaxValue: 2000000000
     Description: >
-      Requests per client address per 5 minutes the ALB's WAF rule allows
-      before it blocks that address. A deployment prerequisite of ft-server
+      Requests per client address per 5 minutes above which the ALB's WAF
+      rule acts on that address. A deployment prerequisite of ft-server
       (docs/ft-server.md, Operations notes): its own limits are per task.
+      Handsets reach the stack through carrier-grade NAT, thousands behind
+      one address, so size it to the busiest such address, not to a device.
+
+  WafRateAction:
+    Type: String
+    Default: count
+    AllowedValues: [count, block]
+    Description: >
+      What the rate rule does above WafRateLimit. count only counts (and
+      alarms), to measure real per-address peaks first; block refuses
+      (docs/runbook.md#wafratelimited says when to switch).
 
   ContainerInsights:
     Type: String
@@ -218,7 +239,10 @@ Parameters:
     Type: Number
     Default: 2
     MinValue: 0
-    MaxValue: 10
+    # A rolling update runs one task more, and a Cloud Map DNS answer lists
+    # at most 8 addresses: a ninth hss task would get no Cx connection from
+    # a CSCF that finds the HSS by DNS (ADR 0005).
+    MaxValue: 7
   FtServerDesiredCount:
     Type: Number
     Default: 2
@@ -449,11 +473,14 @@ Conditions:
   IsProduction: !Not [!Condition IsDev]
   NatPerAz: !Equals [!Ref NatGateways, per-az]
   HasAlbCertificate: !Not [!Equals [!Ref AlbCertificateArn, '']]
-  NoAlbCertificate: !Equals [!Ref AlbCertificateArn, '']
   HasNlbCertificate: !Not [!Equals [!Ref NlbCertificateArn, '']]
   HasFtHostName: !Not [!Equals [!Ref FtHostName, '']]
   WithPcscf: !Equals [!Ref PcscfEnabled, 'true']
+  WithScscf: !Equals [!Ref ScscfEnabled, 'true']
   WithPcscfTls: !And [!Condition WithPcscf, !Condition HasNlbCertificate]
+  # ADR 0003: plain SIP and MSRP are refused outside dev.
+  WithPcscfPlain: !And [!Condition WithPcscf, !Condition IsDev]
+  WafBlocks: !Equals [!Ref WafRateAction, block]
 
   CreateAlarmTopic: !Equals [!Ref AlarmTopicArn, '']
   HasMonthlyBudget: !Not [!Equals [!Ref MonthlyBudgetUsd, '0']]
@@ -817,9 +844,16 @@ Resources:
       GroupDescription: NLB - SIP and MSRP from clients
       VpcId: !Ref Vpc
       SecurityGroupIngress:
-        - { IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TCP' }
+        # The plain ports exist in dev only (ADR 0003), like their listeners.
+        - !If
+          - IsDev
+          - { IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TCP (dev)' }
+          - !Ref AWS::NoValue
         - { IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TLS' }
-        - { IpProtocol: tcp, FromPort: 2855, ToPort: 2855, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TCP' }
+        - !If
+          - IsDev
+          - { IpProtocol: tcp, FromPort: 2855, ToPort: 2855, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TCP (dev)' }
+          - !Ref AWS::NoValue
         - { IpProtocol: tcp, FromPort: 2856, ToPort: 2856, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TLS' }
       # Only the target rules below leave the NLB; this unroutable entry
       # replaces the default allow-all.
@@ -1034,6 +1068,10 @@ Resources:
         # holds; the client address arrives in the PPv2 header instead.
         - { Key: preserve_client_ip.enabled, Value: 'false' }
         - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+        # Stated, not left to the default: on, the NLB would reset every
+        # client connection 30 s after deregistration, all at once, before
+        # the service's own staggered drain (ADR 0003).
+        - { Key: deregistration_delay.connection_termination.enabled, Value: 'false' }
 
   RelayMsrpTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -1053,12 +1091,15 @@ Resources:
         # holds; the client address arrives in the PPv2 header instead.
         - { Key: preserve_client_ip.enabled, Value: 'false' }
         - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+        - { Key: deregistration_delay.connection_termination.enabled, Value: 'false' }
 
   # The idle timeout is configurable on TCP listeners only; TLS listeners keep
-  # a fixed 350 s, which the keep-alives are sized for (ADR 0003).
+  # a fixed 350 s, which the keep-alives are sized for (ADR 0003). The plain
+  # listeners exist in dev only: ADR 0003 refuses unencrypted SIP and MSRP in
+  # staging and prod, and the target port cannot tell the two apart.
   SipTcpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: WithPcscf
+    Condition: WithPcscfPlain
     Properties:
       LoadBalancerArn: !Ref Nlb
       Protocol: TCP
@@ -1080,6 +1121,7 @@ Resources:
 
   MsrpTcpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: IsDev
     Properties:
       LoadBalancerArn: !Ref Nlb
       Protocol: TCP
@@ -1160,26 +1202,23 @@ Resources:
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
       DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
 
-  HttpRedirectListener:
+  # One listener on port 80 whatever the certificate: with one it redirects
+  # to HTTPS, without one (dev only, see Rules) it serves plain HTTP. Two
+  # conditional listeners on the same port would collide when a certificate
+  # is added to a running stack, since CloudFormation creates the new one
+  # before it deletes the old.
+  HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: HasAlbCertificate
     Properties:
       LoadBalancerArn: !Ref Alb
       Protocol: HTTP
       Port: 80
       DefaultActions:
-        - Type: redirect
-          RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
-
-  # dev only (see Rules): no certificate, so the ALB serves plain HTTP.
-  HttpListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: NoAlbCertificate
-    Properties:
-      LoadBalancerArn: !Ref Alb
-      Protocol: HTTP
-      Port: 80
-      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+        - !If
+          - HasAlbCertificate
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+          - { Type: forward, TargetGroupArn: !Ref AcsTargetGroup }
 
   # ft-server answers on its upload (/ft) and download (/dl) paths
   # (FT_UPLOAD_URI, FT_DOWNLOAD_URI); everything else goes to acs.
@@ -1213,7 +1252,7 @@ Resources:
       Rules:
         - Name: rate-per-address
           Priority: 0
-          Action: { Block: {} }
+          Action: !If [WafBlocks, { Block: {} }, { Count: {} }]
           Statement:
             RateBasedStatement:
               Limit: !Ref WafRateLimit
@@ -1763,15 +1802,18 @@ Resources:
                 Action:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
-                  - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
-                  - dynamodb:Query
                   - dynamodb:ConditionCheckItem
                   - dynamodb:DescribeTable
                 Resource:
                   - !GetAtt SubscribersTable.Arn
-                  - !Sub '${SubscribersTable.Arn}/index/profile-index'
                   - !GetAtt ServiceProfilesTable.Arn
+              # Scan with Limit 1 at every start tells an empty table from a
+              # lost keyring (docs/hss.md, Secrets); a task without it exits.
+              # Scoped to the keys-only index, never the table.
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:Scan]
+                Resource: !Sub '${SubscribersTable.Arn}/index/profile-index'
 
   FtServerExecutionRole:
     Type: AWS::IAM::Role
@@ -2224,8 +2266,10 @@ Resources:
             - { Name: RELAY_DRAIN_TIMEOUT, Value: 100s }
             - { Name: GOMEMLIMIT, Value: !FindInMap [TaskSize, !Ref RelayTaskSize, GoMemLimit] }
             - { Name: RELAY_PUBLIC_HOST, Value: !If [HasRelayPublicHost, !Ref RelayPublicHost, !GetAtt Nlb.DNSName] }
-            - { Name: RELAY_PUBLIC_PORT, Value: '2856' }
-            - { Name: RELAY_PUBLIC_TLS, Value: 'true' }
+            # msrps on the NLB's TLS listener; plain msrp on 2855 only in a dev
+            # stack without a certificate, which the relay refuses outside dev.
+            - { Name: RELAY_PUBLIC_PORT, Value: !If [HasNlbCertificate, '2856', '2855'] }
+            - { Name: RELAY_PUBLIC_TLS, Value: !If [HasNlbCertificate, 'true', 'false'] }
             - { Name: RELAY_CORE_PORTS, Value: '2855' }
             - { Name: RELAY_DYNAMODB_TABLE, Value: !Ref MsrpBindingsTable }
             - { Name: RELAY_MAX_CONNECTIONS, Value: !Ref RelayMaxConnections }
@@ -2272,8 +2316,13 @@ Resources:
             - { Name: ACS_SMS_PROVIDER, Value: !Ref AcsSmsProvider }
             - { Name: ACS_SMS_ORIGINATION_IDENTITY, Value: !Ref AcsSmsOriginationIdentity }
             - { Name: ACS_DEFAULT_RCS_PROFILE, Value: !Ref AcsDefaultRcsProfile }
-            # The ALB is the only proxy in front of acs.
-            - { Name: ACS_TRUSTED_PROXY_CIDRS, Value: !Ref VpcCidr }
+            # Empty, acs's default: header enrichment off. acs trusts an
+            # identity header (X-3GPP-Intended-Identity) from clients whose
+            # address, as the ALB saw it, is in these ranges: operator
+            # gateways on the data path, not the ALB. No range of this VPC
+            # (the ALB's subnets included) is ever such a client, so any
+            # value here would only add a way to forge an identity later.
+            - { Name: ACS_TRUSTED_PROXY_CIDRS, Value: '' }
             - { Name: ACS_DEV_ENDPOINTS_ENABLED, Value: 'false' }
             - { Name: ACS_METRICS_NAMESPACE, Value: !Sub 'RCS/${AWS::StackName}/acs' }
             - Name: ACS_DM_ACCOUNT_URI
@@ -2341,12 +2390,18 @@ Resources:
       LoadBalancers: [{ ContainerName: ft-server, ContainerPort: 8081, TargetGroupArn: !Ref FtServerTargetGroup }]
       ServiceRegistries: [{ RegistryArn: !GetAtt FtServerDiscovery.Arn }]
 
-  # The relay offers only msrps: client paths (RELAY_PUBLIC_TLS=true; false
-  # is refused), so it runs only where the NLB terminates TLS.
+  # ECS needs the target group on a listener before the service starts. The
+  # listener the relay hands out is the TLS one when there is a certificate,
+  # and in a dev stack without one the plain one (the Rules require a
+  # certificate outside dev); this handle depends on whichever applies.
+  RelayListenerReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      Listener: !If [HasNlbCertificate, !Ref MsrpTlsListener, !Ref MsrpTcpListener]
+
   RelayService:
     Type: AWS::ECS::Service
-    Condition: HasNlbCertificate
-    DependsOn: MsrpTlsListener
+    DependsOn: RelayListenerReady
     Properties:
       ServiceName: msrp-relay
       Cluster: !Ref Cluster
@@ -2895,6 +2950,7 @@ Resources:
           ReturnData: true
   HssPushFailed:
     Type: AWS::CloudWatch::Alarm
+    Condition: WithScscf
     Properties:
       AlarmName: !Sub '${AWS::StackName}-HssPushFailed'
       AlarmDescription: 'RTR or PPR pushes find no S-CSCF peer or fail. See docs/runbook.md#hsspushfailed.'
@@ -3223,17 +3279,19 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${AWS::StackName}-AcsTarget5xx'
-      AlarmDescription: 'Acs answers 5xx through the ALB. See docs/runbook.md#acstarget5xx.'
+      AlarmDescription: 'Over 5% of acs requests through the ALB answer 5xx. See docs/runbook.md#acstarget5xx.'
       AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # A ratio, guarded by at least 20 requests in 5 minutes: a count would
+      # miss a full outage at night and fire on 1% at peak.
       ComparisonOperator: GreaterThanThreshold
-      Threshold: 10
+      Threshold: 0.05
       EvaluationPeriods: 3
-      DatapointsToAlarm: 3
+      DatapointsToAlarm: 2
       TreatMissingData: notBreaching
       Metrics:
-        - Id: m
-          ReturnData: true
+        - Id: errors
+          ReturnData: false
           MetricStat:
             Metric:
               Namespace: AWS/ApplicationELB
@@ -3241,8 +3299,220 @@ Resources:
               Dimensions:
                 - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
                 - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
-            Period: 60
+            Period: 300
             Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
+            Period: 300
+            Stat: Sum
+        - Id: share
+          Expression: 'IF(FILL(requests, 0) > 20, FILL(errors, 0) / FILL(requests, 0), 0)'
+          Label: AcsTarget5xx
+          ReturnData: true
+  AcsNoHealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AcsNoHealthyTargets'
+      AlarmDescription: 'acs has no healthy target: the service is down for clients. See docs/runbook.md#acsnohealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # Missing data is a breach: with every task gone the target group may
+      # report nothing at all.
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      Metrics:
+        - Id: healthy
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Minimum
+  FtServerNoHealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtServerNoHealthyTargets'
+      AlarmDescription: 'ft-server has no healthy target: the service is down for clients. See docs/runbook.md#ftservernohealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # Missing data is a breach: with every task gone the target group may
+      # report nothing at all.
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      Metrics:
+        - Id: healthy
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Minimum
+  RelayNoHealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayNoHealthyTargets'
+      AlarmDescription: 'msrp-relay has no healthy target: the service is down for clients. See docs/runbook.md#relaynohealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # Missing data is a breach: with every task gone the target group may
+      # report nothing at all.
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      Metrics:
+        - Id: healthy
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Nlb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt RelayMsrpTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Minimum
+  # The ALB answering by itself: 502/503/504 when no target can take the
+  # request, which no target metric shows.
+  AlbElb5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AlbElb5xx'
+      AlarmDescription: 'Over 5% of ALB requests are answered 5xx by the ALB itself. See docs/runbook.md#albelb5xx.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0.05
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_ELB_5XX_Count
+              Dimensions: [{ Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }]
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions: [{ Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }]
+            Period: 300
+            Stat: Sum
+        - Id: share
+          Expression: 'IF(FILL(requests, 0) > 20, FILL(errors, 0) / FILL(requests, 0), 0)'
+          Label: AlbElb5xx
+          ReturnData: true
+  # Addresses over WafRateLimit: counted (WafRateAction count) or blocked.
+  # Counted ones measure real per-address peaks before blocking; see the
+  # runbook on when to switch.
+  WafRateLimited:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-WafRateLimited'
+      AlarmDescription: 'Client addresses exceed the WAF rate limit (counted or blocked). See docs/runbook.md#wafratelimited.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: counted
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/WAFV2
+              MetricName: CountedRequests
+              Dimensions:
+                - { Name: WebACL, Value: !Sub '${AWS::StackName}-alb' }
+                - { Name: Region, Value: !Ref AWS::Region }
+                - { Name: Rule, Value: rate-per-address }
+            Period: 300
+            Stat: Sum
+        - Id: blocked
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/WAFV2
+              MetricName: BlockedRequests
+              Dimensions:
+                - { Name: WebACL, Value: !Sub '${AWS::StackName}-alb' }
+                - { Name: Region, Value: !Ref AWS::Region }
+                - { Name: Rule, Value: rate-per-address }
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(counted, 0) + FILL(blocked, 0)'
+          Label: WafRateLimited
+          ReturnData: true
+  # docs/hss.md: MAR and SAR latency against HSS_CX_TIMEOUT (3 s). Above 2 s
+  # the CSCFs come close to timing out while cx.*.error, which counts store
+  # failures only, stays at zero. Maximum is exact for a timing (§8).
+  HssCxLatency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssCxLatency'
+      AlarmDescription: 'MAR or SAR took over 2 s, near the 3 s HSS_CX_TIMEOUT. See docs/runbook.md#hsscxlatency.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 2000
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      TreatMissingData: missing
+      Metrics:
+        - Id: mar
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.mar
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 60
+            Stat: Maximum
+        - Id: sar
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.sar
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 60
+            Stat: Maximum
+        - Id: slowest
+          Expression: 'MAX([mar, sar])'
+          Label: HssCxLatency
+          ReturnData: true
   AcsUnhealthyTargets:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -3294,17 +3564,19 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${AWS::StackName}-FtServerTarget5xx'
-      AlarmDescription: 'FtServer answers 5xx through the ALB. See docs/runbook.md#ftservertarget5xx.'
+      AlarmDescription: 'Over 5% of ft-server requests through the ALB answer 5xx. See docs/runbook.md#ftservertarget5xx.'
       AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # A ratio, guarded by at least 20 requests in 5 minutes: a count would
+      # miss a full outage at night and fire on 1% at peak.
       ComparisonOperator: GreaterThanThreshold
-      Threshold: 10
+      Threshold: 0.05
       EvaluationPeriods: 3
-      DatapointsToAlarm: 3
+      DatapointsToAlarm: 2
       TreatMissingData: notBreaching
       Metrics:
-        - Id: m
-          ReturnData: true
+        - Id: errors
+          ReturnData: false
           MetricStat:
             Metric:
               Namespace: AWS/ApplicationELB
@@ -3312,8 +3584,23 @@ Resources:
               Dimensions:
                 - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
                 - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
-            Period: 60
+            Period: 300
             Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
+            Period: 300
+            Stat: Sum
+        - Id: share
+          Expression: 'IF(FILL(requests, 0) > 20, FILL(errors, 0) / FILL(requests, 0), 0)'
+          Label: FtServerTarget5xx
+          ReturnData: true
   FtServerUnhealthyTargets:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -3340,7 +3627,6 @@ Resources:
             Stat: Maximum
   RelayUnhealthyTargets:
     Type: AWS::CloudWatch::Alarm
-    Condition: HasNlbCertificate
     Properties:
       AlarmName: !Sub '${AWS::StackName}-RelayUnhealthyTargets'
       AlarmDescription: 'msrp-relay has unhealthy targets behind the NLB. See docs/runbook.md#relayunhealthytargets.'
@@ -3394,8 +3680,30 @@ Resources:
               Dimensions: [{ Name: TableName, Value: !Ref SubscribersTable }]
             Period: 60
             Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref SubscribersTable }
+                - { Name: GlobalSecondaryIndexName, Value: profile-index }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref SubscribersTable }
+                - { Name: GlobalSecondaryIndexName, Value: profile-index }
+            Period: 60
+            Stat: Sum
         - Id: total
-          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0)'
           Label: SubscribersThrottled
           ReturnData: true
   ServiceProfilesThrottled:
@@ -3534,8 +3842,30 @@ Resources:
               Dimensions: [{ Name: TableName, Value: !Ref AcsTable }]
             Period: 60
             Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref AcsTable }
+                - { Name: GlobalSecondaryIndexName, Value: gsi1 }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref AcsTable }
+                - { Name: GlobalSecondaryIndexName, Value: gsi1 }
+            Period: 60
+            Stat: Sum
         - Id: total
-          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0)'
           Label: AcsThrottled
           ReturnData: true
   RegistrationsThrottled:
@@ -3724,7 +4054,6 @@ Resources:
   # Maximum. Its name may change with the gauge support of #82.
   RelayConnectionsNearLimit:
     Type: AWS::CloudWatch::Alarm
-    Condition: HasNlbCertificate
     Properties:
       AlarmName: !Sub '${AWS::StackName}-RelayConnectionsNearLimit'
       AlarmDescription: 'A relay task holds over 80% of RELAY_MAX_CONNECTIONS. See docs/runbook.md#relayconnectionsnearlimit.'
@@ -3779,6 +4108,21 @@ Resources:
   # Security changes, from CloudTrail management events (a trail must record
   # them in this account and region): any security group or secret change is
   # reported, including those a deployment makes.
+  # A service that cannot start tasks (image, secrets, start-up refused) or a
+  # deployment the circuit breaker failed: hss has no load balancer, so no
+  # target metric would show it down.
+  ServiceImpaired:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ECS services of the stack that cannot start tasks or failed a deployment, reported to the alarm topic.
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Service Action, ECS Deployment State Change]
+        detail:
+          clusterArn: [!GetAtt Cluster.Arn]
+          eventName: [SERVICE_TASK_START_IMPAIRED, SERVICE_DEPLOYMENT_FAILED]
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
   # Cost alarms (handbook: 80% and 100% of a daily and a monthly budget).
   # Each has a section in docs/runbook.md. The budgets see the whole account:
   # filtering on a tag needs a cost allocation tag activated by hand, and a

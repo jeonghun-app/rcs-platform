@@ -55,6 +55,15 @@ type Service[C any] struct {
 	// Run returns the process shuts down: a non-nil error, other than ctx's
 	// own, makes the exit status non-zero.
 	Run func(ctx context.Context, rt *Runtime, cfg C) error
+	// LiveAfterReady makes /healthz answer 503 "starting", like /readyz,
+	// until Run calls rt.Ready. By default /healthz passes as soon as the
+	// admin server listens, which tells a container health check only that
+	// the process runs; a service whose start-up waits on remote services
+	// (KMS, DynamoDB) and exits at a start-up deadline would be marked
+	// healthy before it can serve. Pair it with a task-definition health
+	// check whose startPeriod plus interval × retries exceeds that deadline,
+	// or ECS replaces the task while it starts.
+	LiveAfterReady bool
 }
 
 var envPrefixPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_$`)
@@ -82,6 +91,14 @@ type Settings struct {
 	Environment Environment
 
 	unsafe []string
+}
+
+// ServiceNamespace returns RCS_SERVICE_NAMESPACE, the Cloud Map namespace the
+// services find each other in, in lower case without a trailing dot, or ""
+// when it is unset or invalid (the runtime reports an invalid one). Names
+// inside it are private hosts ([IsPrivateHost]).
+func (s *Settings) ServiceNamespace() string {
+	return serviceNamespace(s.Shared)
 }
 
 // ForbidInProduction refuses to start in staging and prod when unsafe is true,
@@ -121,6 +138,8 @@ type RuntimeOptions struct {
 	// Now and After are the clock; nil means time.Now and time.After.
 	Now   func() time.Time
 	After func(time.Duration) <-chan time.Time
+	// LiveAfterReady is Service.LiveAfterReady.
+	LiveAfterReady bool
 }
 
 // NewRuntime returns a Runtime that is not attached to a process: Run uses it,
@@ -144,11 +163,13 @@ func NewRuntime(o RuntimeOptions) *Runtime {
 	}
 	out := &syncWriter{w: o.Out}
 	log := NewLogger(out, o.Service, buildinfo.Version, o.Level)
+	admin := newAdmin(log, o.Now, o.After)
+	admin.liveAfterReady = o.LiveAfterReady
 	return &Runtime{
 		Environment: o.Environment,
 		Logger:      log,
 		Metrics:     NewMetrics(out, o.MetricsNamespace, o.Service, o.Now, log),
-		Admin:       newAdmin(log, o.Now, o.After),
+		Admin:       admin,
 	}
 }
 
@@ -351,6 +372,7 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		MetricsNamespace: sh.metricsNamespace,
 		Now:              p.Now,
 		After:            p.After,
+		LiveAfterReady:   svc.LiveAfterReady,
 	})
 	log = rt.Logger
 	// Libraries that log through slog's or log's default logger end up in the
@@ -380,6 +402,20 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	defer cancelRun()
 
 	log.Info("started", slog.String("environment", string(sh.environment)), slog.String("admin_addr", ln.Addr().String()))
+	// Metrics are flushed every interval until the process stops, when
+	// shutdown starts, and once more after the shutdown hooks so that what
+	// the drain records is not lost.
+	flushDone := make(chan struct{})
+	flushCtx, stopFlushing := context.WithCancel(context.Background())
+	go func() {
+		defer close(flushDone)
+		flushEvery(flushCtx, rt.Metrics, DefaultMetricsInterval, p.After)
+	}()
+	defer func() {
+		stopFlushing()
+		<-flushDone
+		rt.Metrics.Flush()
+	}()
 	runDone := make(chan error, 1)
 	go func() { runDone <- svc.Run(runCtx, rt, cfg) }()
 
@@ -406,6 +442,10 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		log.Error("stopping: admin server failed", slog.String("error", pii.Redact(err.Error())))
 		failed = true
 	}
+	// What was recorded before the stop goes out now: a second signal, or a
+	// stop timeout shorter than the drain, ends the process before the
+	// last flush.
+	rt.Metrics.Flush()
 	// From here a second signal gets the default action and ends the process,
 	// for an operator who does not want to wait for the drain.
 	stopSignals()
@@ -436,6 +476,18 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	}
 	log.Info("stopped")
 	return ExitOK
+}
+
+// flushEvery flushes m every interval on the injected clock until ctx ends.
+func flushEvery(ctx context.Context, m *Metrics, interval time.Duration, after func(time.Duration) <-chan time.Time) {
+	for {
+		select {
+		case <-after(interval):
+			m.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // stopFailed logs and reports an error Service.Run returned after it was asked
@@ -479,7 +531,7 @@ func probe(ctx context.Context, p Process) error {
 func probeClient() *http.Client {
 	return &http.Client{
 		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: RefuseRedirects,
 	}
 }
 

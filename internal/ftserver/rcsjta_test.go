@@ -67,6 +67,21 @@ func (c *rcsjta) do(method, target, contentType, body string, header ...string) 
 	return c.e.do(r)
 }
 
+// getInfo is rcsjta's sendGetInfo (HttpUploadManager), used for
+// get_upload_info and get_download_info: a GET without credentials first,
+// whose 401 brings a fresh nonce, then the same GET signed for the path only.
+// rcsjta's agent starts a new nonce at nc 1
+// (HttpDigestMd5Authentication.updateNonceParameters), as readChallenge does.
+func (c *rcsjta) getInfo(target string) *httptest.ResponseRecorder {
+	c.t.Helper()
+	first := c.e.do(httptest.NewRequest(http.MethodGet, target, nil))
+	if first.Code != http.StatusUnauthorized {
+		c.t.Fatalf("unauthenticated %s = %d, want 401", target, first.Code)
+	}
+	c.readChallenge(first.Header())
+	return c.do(http.MethodGet, target, "", "")
+}
+
 // rcsjtaForm builds the multipart body rcsjta writes: tid, then File, each
 // part with its own Content-Length, the file name URL-encoded.
 func rcsjtaForm(tid, name, data string) string {
@@ -96,8 +111,9 @@ func TestRCSJTAUploadBreaksResumesAndFetchesTheDownloadInfo(t *testing.T) {
 		t.Fatalf("broken upload = %d", rec.Code)
 	}
 
-	// resumeUpload: get_upload_info, signed for "/ft" only.
-	info := c.do(http.MethodGet, "/ft?tid=rcsjta-1&get_upload_info", "", "")
+	// resumeUpload: get_upload_info, unauthenticated first, then signed for
+	// "/ft" only under the fresh nonce.
+	info := c.getInfo("/ft?tid=rcsjta-1&get_upload_info")
 	if info.Code != http.StatusOK {
 		t.Fatalf("get_upload_info with a path-only uri = %d", info.Code)
 	}
@@ -111,8 +127,9 @@ func TestRCSJTAUploadBreaksResumesAndFetchesTheDownloadInfo(t *testing.T) {
 	if put.Code != http.StatusOK {
 		t.Fatalf("resume PUT = %d %s", put.Code, put.Body)
 	}
-	// sendGetDownloadInfo after the PUT, again signed for "/ft" only.
-	dl := c.do(http.MethodGet, "/ft?tid=rcsjta-1&get_download_info", "", "")
+	// sendGetDownloadInfo after the PUT, the same way: unauthenticated first,
+	// then signed for "/ft" only.
+	dl := c.getInfo("/ft?tid=rcsjta-1&get_download_info")
 	if dl.Code != http.StatusOK {
 		t.Fatalf("get_download_info with a path-only uri = %d", dl.Code)
 	}
@@ -125,6 +142,39 @@ func TestRCSJTAUploadBreaksResumesAndFetchesTheDownloadInfo(t *testing.T) {
 	}
 	if e.metric("auth.uri_path_only") != 2 {
 		t.Fatalf("auth.uri_path_only = %v, want 2", e.metric("auth.uri_path_only"))
+	}
+}
+
+func TestRCSJTABrokenUploadVerifiedAfterItsResumeStartsStillCounts(t *testing.T) {
+	// The ordering behind #66: the client gives up on a broken POST as soon
+	// as its body fails, so its next request can be verified before the
+	// server has read the POST. rcsjta's next request, get_upload_info, goes
+	// out without credentials and its 401 starts a fresh nonce, so the late
+	// POST's nonce-count competes with nothing and the POST keeps its whole
+	// parts. (A client that reused the POST's nonce would see the late POST
+	// refused as a replay; see #66.)
+	e := newEnv(t)
+	c := &rcsjta{t: t, e: e, user: alice, password: password}
+	c.readChallenge(e.do(httptest.NewRequest(http.MethodPost, "/ft", nil)).Header())
+	data := pattern(3*testPart + 7)
+	body := rcsjtaForm("rcsjta-late", "clip.mp4", data)
+	cut := strings.Index(body, data) + 2*testPart + 100
+	late := httptest.NewRequest(http.MethodPost, "/ft", strings.NewReader(body[:cut]))
+	late.Header.Set("Content-Type", "multipart/form-data; boundary=boundary1")
+	late.Header.Set("Authorization", c.authorization(http.MethodPost, "/ft"))
+
+	if early := c.getInfo("/ft?tid=rcsjta-late&get_upload_info"); early.Code != http.StatusNotFound {
+		t.Fatalf("get_upload_info before the POST is read = %d, want 404", early.Code)
+	}
+	if rec := e.do(late); rec.Code != http.StatusBadRequest {
+		t.Fatalf("late broken upload = %d, want 400 (accepted, then broken)", rec.Code)
+	}
+	info := c.getInfo("/ft?tid=rcsjta-late&get_upload_info")
+	if info.Code != http.StatusOK {
+		t.Fatalf("get_upload_info = %d", info.Code)
+	}
+	if end, _ := strconv.Atoi(parseResumeDocument(t, info.Body.Bytes()).Range.End); end+1 != 2*testPart {
+		t.Fatalf("held %d bytes, want the two whole parts", end+1)
 	}
 }
 

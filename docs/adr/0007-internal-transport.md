@@ -71,10 +71,18 @@ traffic within an AZ is not assumed to be.
    from Secrets Manager through the task **execution** role, which can read only
    that service's secret ARNs; task roles have no `secretsmanager:GetSecretValue`.
 5. A service accepts plain `http://` for an internal API only when the host is
-   inside the configured Cloud Map namespace (label-exact suffix match) or an
-   RFC 1918 address; link-local (including the task metadata address), loopback
-   and public hosts are refused in `staging`/`prod`. Internal clients never
-   follow redirects. IPv6 GUAs are refused (fails safe on dual-stack VPCs).
+   inside the configured Cloud Map namespace (label-exact suffix match), an
+   RFC 1918 address or an IPv6 unique local address (ULA, `fc00::/7`, RFC 4193;
+   assigned ULAs are in `fd00::/8`); link-local (including the task metadata
+   address), loopback and public hosts are refused in `staging`/`prod`.
+   Internal clients never follow redirects. IPv6 GUAs are refused (fails safe on
+   dual-stack VPCs). (Amended in #64: ULAs were always accepted by the code and
+   are now named here.) In `staging`/`prod` internal HTTP clients, `https://`
+   ones included, also check the address a name resolves to when they connect
+   (`runtime.InternalDialer`) and connect only to RFC 1918 or ULA addresses, so
+   a record in the namespace cannot send a token elsewhere. The `-healthcheck`
+   probe of a task's own admin port on loopback is not an internal API client
+   and carries no token; it is exempt. (Amended in #87.)
    Operators reach the HSS API only from inside the VPC (a task or an internal
    ALB with TLS); it is never on the public ALB.
 6. Diameter: in `staging`/`prod` every accept rule must restrict `Networks`, and

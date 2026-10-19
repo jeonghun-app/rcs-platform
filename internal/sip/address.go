@@ -218,7 +218,7 @@ func (c Contact) String() string {
 }
 
 // ParseContacts parses a Contact header field value.
-func ParseContacts(s string) ([]Contact, error) {
+func ParseContacts(s string) (Contacts, error) {
 	els, err := splitList(s)
 	if err != nil {
 		return nil, err

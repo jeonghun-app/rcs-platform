@@ -9,21 +9,21 @@ import (
 func TestParseViaReadsEveryElement(t *testing.T) {
 	tests := []struct {
 		in   string
-		want []Via
+		want Vias
 	}{
-		{"SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK776asdhds", []Via{{Transport: "UDP", Host: "192.0.2.1", Port: 5060,
+		{"SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK776asdhds", Vias{{Transport: "UDP", Host: "192.0.2.1", Port: 5060,
 			Params: Params{{Name: "branch", Value: "z9hG4bK776asdhds"}}}}},
 		// RFC 4475 §3.1.1.1 puts whitespace around every separator.
 		{"SIP  /  2.0  / TCP   spindle.example.com   ;  branch  =   z9hG4bK9ikj8  ,  sip / 2.0 / UDP [2001:db8::9] : 5070 ; rport ; received = 2001:db8::1",
-			[]Via{
+			Vias{
 				{Transport: "TCP", Host: "spindle.example.com", Params: Params{{Name: "branch", Value: "z9hG4bK9ikj8"}}},
 				{Transport: "UDP", Host: "[2001:db8::9]", Port: 5070, Params: Params{{Name: "rport"}, {Name: "received", Value: "2001:db8::1"}}},
 			}},
 		{"SIP/2.0/UNKNOWN t1.example.com;branch=z9hG4bKasdf;ttl=255;maddr=224.0.1.75;rport=5061;received=192.0.2.9;x-extra=\"q\"",
-			[]Via{{Transport: "UNKNOWN", Host: "t1.example.com", Params: Params{
+			Vias{{Transport: "UNKNOWN", Host: "t1.example.com", Params: Params{
 				{Name: "branch", Value: "z9hG4bKasdf"}, {Name: "ttl", Value: "255"}, {Name: "maddr", Value: "224.0.1.75"},
 				{Name: "rport", Value: "5061"}, {Name: "received", Value: "192.0.2.9"}, {Name: "x-extra", Value: "q", Quoted: true}}}}},
-		{"SIP/2.0/TLS client.example.com;received=[2001:db8::1]", []Via{{Transport: "TLS", Host: "client.example.com",
+		{"SIP/2.0/TLS client.example.com;received=[2001:db8::1]", Vias{{Transport: "TLS", Host: "client.example.com",
 			Params: Params{{Name: "received", Value: "[2001:db8::1]"}}}}},
 	}
 	for _, tt := range tests {
@@ -118,7 +118,7 @@ func TestViaStringRoundTrips(t *testing.T) {
 		t.Errorf("String() = %q", s)
 	}
 	got, err := ParseVia(s)
-	if err != nil || !reflect.DeepEqual(got, []Via{v}) {
+	if err != nil || !reflect.DeepEqual(got, Vias{v}) {
 		t.Errorf("round trip = %#v, %v", got, err)
 	}
 }
