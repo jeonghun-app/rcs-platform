@@ -203,7 +203,13 @@ func TestIntegrationADriftedQueueSizeIsCorrectedOnce(t *testing.T) {
 }
 
 // integrationGroups creates a groupchats table as docs/rcs-as.md
-// describes it and returns the store over it.
+// describes it and returns the store over it, except that TTL is not
+// turned on. The contract runs on a fixed clock (storetest's t0, in 2026),
+// so every item's ttl is in the past by the wall clock, and DynamoDB
+// Local's TTL would delete items in the middle of a test: the flake
+// msrp-relay's tests saw on #52. TTL is only the backstop that keeps the
+// table small; every read checks the expiry itself, which the contract
+// covers.
 func integrationGroups(t *testing.T) *Groups {
 	t.Helper()
 	endpoint := os.Getenv("RCSAS_IT_DYNAMODB_ENDPOINT")

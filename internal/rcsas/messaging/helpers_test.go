@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,7 +131,10 @@ func (c *counter) get(name string) int64 {
 }
 
 // fakeDeliverer stands in for the SIP layer. pager and invite decide the
-// outcome of each attempt; every attempt is also sent on a channel.
+// outcome of each attempt; every attempt is also sent on a channel. A
+// full channel counts the attempt in overflow rather than block: an
+// engine that loops on attempts then fails its test (newRigWith) instead
+// of hanging it, workers and Close included.
 type fakeDeliverer struct {
 	mu       sync.Mutex
 	pagerCtx func(context.Context, Delivery) error
@@ -138,6 +142,7 @@ type fakeDeliverer struct {
 	invite   func(Invitation) error
 	pagers   chan Delivery
 	invites  chan Invitation
+	overflow atomic.Int64
 }
 
 func newFakeDeliverer() *fakeDeliverer {
@@ -155,7 +160,11 @@ func (f *fakeDeliverer) Pager(ctx context.Context, d Delivery) error {
 	case h != nil:
 		err = h(d)
 	}
-	f.pagers <- d
+	select {
+	case f.pagers <- d:
+	default:
+		f.overflow.Add(1)
+	}
 	return err
 }
 
@@ -167,7 +176,11 @@ func (f *fakeDeliverer) Invite(_ context.Context, inv Invitation) error {
 	if h != nil {
 		err = h(inv)
 	}
-	f.invites <- inv
+	select {
+	case f.invites <- inv:
+	default:
+		f.overflow.Add(1)
+	}
 	return err
 }
 
@@ -244,7 +257,12 @@ func newRigWith(t *testing.T, cfg Config, st store.Store, clock *fakeClock) *rig
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(r.e.Close)
+	t.Cleanup(func() {
+		r.e.Close()
+		if n := r.d.overflow.Load(); n > 0 {
+			t.Errorf("%d delivery attempts beyond the fake's channels: the engine looped", n)
+		}
+	})
 	return r
 }
 

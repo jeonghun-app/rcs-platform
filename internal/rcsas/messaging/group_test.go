@@ -523,3 +523,67 @@ func TestASlowFanOutAnswersTheSenderInTime(t *testing.T) {
 		t.Fatalf("%d enqueues; metrics %v", n, r.m)
 	}
 }
+
+// As in a 1-to-1 chat: a new group copy tried on its own does not go ahead
+// of an older one from the group waiting for the same session, when that
+// session opens just before it is tried (QA mutant M12).
+func TestANewGroupMessageDoesNotOvertakeOnesWaitingForTheSession(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	l := r.listen(t)
+	drainInvites(t, r.d)
+	// alice's g1 waits for bob's session with the group.
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "g1", "g1", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	// carol's pager-mode messages hold the worker, one at a time.
+	entered, proceed := make(chan struct{}, 4), make(chan struct{}, 4)
+	r.d.onPager(func(Delivery) error { entered <- struct{}{}; <-proceed; return nil })
+	if err := r.e.Submit(t.Context(), standalone(carol, bob, chat(t, "c1", "c1", 0))); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	// While it is held, carol's c2 and alice's g2 arrive: the next pass
+	// tries them on their own, c2 first.
+	if err := r.e.Submit(t.Context(), standalone(carol, bob, chat(t, "c2", "c2", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "g2", "g2", 0))); err != nil {
+		t.Fatal(err)
+	}
+	proceed <- struct{}{}
+	<-entered // c2
+	// bob's session with the group opens now, before g2 is tried.
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	proceed <- struct{}{}
+	for _, want := range []string{"g1", "g2"} {
+		if got := b.next(t); !strings.HasSuffix(string(got.Body), want) {
+			t.Fatalf("got %q, want %s", got.Body, want)
+		}
+	}
+}
+
+// The size limit holds for what is queued, after the rewrite: a long
+// identity and roster name in place of the anonymous From can take a
+// message that fit beyond it (QA mutant M14).
+func TestTheRewrittenGroupMessageMustFitTheSizeLimit(t *testing.T) {
+	const limit = 1024
+	long := "sip:" + strings.Repeat("a", 200) + "@example.net"
+	r := newRig(t, Config{MaxMessageSize: limit, SenderRate: Rate{PerMinute: -1}})
+	r.e.SetGroupHandler(members{all: []string{long, bob}, names: map[string]string{long: strings.Repeat("N", 200)}})
+	base := len(chat(t, "m1", "", 0))
+	body := chat(t, "m1", strings.Repeat("x", limit-base), 0)
+	if len(body) != limit {
+		t.Fatalf("body of %d bytes", len(body))
+	}
+	if got := rejected(r.e.SubmitGroup(t.Context(), groupFrom(long, body))); got != ReasonTooLarge {
+		t.Fatalf("a rewrite beyond the limit: %q", got)
+	}
+	if r.store.(*store.Memory).Len(bob) != 0 {
+		t.Fatal("it was queued")
+	}
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(long, chat(t, "m2", strings.Repeat("x", limit-base-500), 0))); err != nil {
+		t.Fatalf("one that fits after the rewrite: %v", err)
+	}
+}

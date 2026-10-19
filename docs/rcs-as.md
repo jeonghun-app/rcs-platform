@@ -277,6 +277,11 @@ that the conference factory URI reaches. Each group has a conference URI of its
 own, `sip:chat-<128 random bits>@RCSAS_CONFERENCE_HOST`, and every participant
 has a session with it: a leg of mode `group` whose peer is that URI.
 
+Group mode is single-task for now: run it on one rcs-as task until
+[#121](https://github.com/jeonghun-app/rcs-platform/issues/121) anchors each
+group on one task (see [Assumptions and
+limitations](#assumptions-and-limitations)).
+
 ### How the SIP layer drives it
 
 | SIP event | Call |
@@ -694,10 +699,11 @@ Signals to alarm on (Phase 7):
   deletes, because no sweep reached it, still counts until the next refusal
   recounts the queue.
 - **Group delivery is per task like 1-to-1 chat.** A participant's session
-  with a group lives on the task its SIP dialog names. Is-composing reaches
-  only participants on the same task. The delivery workers are shared, so
-  more slow participants than `Workers` (32) at once slow everyone, by up to
-  `RCSAS_DELIVERY_TIMEOUT` each.
+  with a group lives on the task its SIP dialog names, and group mode needs
+  them all on one (below). Is-composing reaches only participants on the same
+  task. The delivery workers are shared, so more slow participants than
+  `Workers` (32) at once slow everyone, by up to `RCSAS_DELIVERY_TIMEOUT`
+  each.
 - **Group fan-out is sequential.** A group message is queued for its
   recipients one enqueue transaction after another, on the sender's session,
   before the sender's answer. A message to 99 others at 10 ms an enqueue takes
@@ -713,6 +719,16 @@ Signals to alarm on (Phase 7):
   has its copies given up when it registers on a new flow, or when they
   expire.
 - **Group rates are per task**, like the 1-to-1 ones.
+- **Group mode runs on one task until
+  [#121](https://github.com/jeonghun-app/rcs-platform/issues/121).** Every
+  participant's session with a group, its deliveries and its roster
+  notifications must be on the same task. With two or more tasks, a
+  participant's session would land on whichever task its SIP dialog names: a
+  message written on one task would invite participants whose session is on
+  another instead of delivering to it, and a roster change would reach only
+  the subscriptions of the task that made it. #121 anchors each group's focus
+  on one task (an owner lease, ADR 0005 amendment); until then, deploy
+  rcs-as with group chat on a single task.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;
