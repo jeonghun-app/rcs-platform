@@ -31,29 +31,27 @@ var (
 // stack starts ft-server and msrp-relay in the test process and returns a
 // Config for them.
 //
-// Two things a device and a deployed stack give ft-resume are made explicit
-// here, so that a loaded host cannot fail the scenarios that only pass
-// through it (#176):
-//   - UploadSettle is an hour, so only the step timeout bounds
-//     get_upload_info. Its own 3 s deadline is the ft package's to test;
-//     a test that needs the settle time to end, to see that nothing is
-//     held, sets its own.
-//   - Each get_upload_info waits until ft-server is done with every
-//     request before it. A device asks seconds after the break, once it is
-//     back on a network, by when the server has stored the broken upload;
-//     here it asks at once, and a server still storing it could answer the
-//     same bytes for the whole quiet time and then refuse the resume 503.
+// UploadSettle is an hour, so that only the step timeout bounds
+// get_upload_info and a loaded host's slow answer cannot end it (#176). The
+// 3 s default is the ft package's to test; a test that needs the settle time
+// to end, to see that nothing is held, sets its own. The other half of #176,
+// a server still storing the broken upload, simtest.StartFT takes care of.
 func stack(t *testing.T) scenario.Config {
+	t.Helper()
+	cfg, _ := stackFT(t)
+	return cfg
+}
+
+// stackFT is stack with its ft-server.
+func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 	t.Helper()
 	f := simtest.StartFT(t, part)
 	corePort := simtest.StandInPort(t)
 	r := simtest.StartRelay(t, corePort)
-	client := f.Server.Client()
-	client.Transport = storedFirst{next: client.Transport, ft: f}
 	// IdleWait is six keep-alive intervals, so a slow scheduler still sees
 	// one go out.
 	return scenario.Config{
-		FT:           &ft.Client{HTTP: client, UploadURL: f.UploadURL, User: simtest.FTUser, Password: ft.NewSecret(simtest.FTPassword)},
+		FT:           &ft.Client{HTTP: f.Server.Client(), UploadURL: f.UploadURL, User: simtest.FTUser, Password: ft.NewSecret(simtest.FTPassword)},
 		UploadSettle: time.Hour,
 		FileSize:     100 << 10,
 		ResumeSize:   5*part + 123,
@@ -63,7 +61,7 @@ func stack(t *testing.T) scenario.Config {
 		IdleWait:     600 * time.Millisecond,
 		Self:         self, Peer: peer,
 		StepTimeout: 20 * time.Second,
-	}
+	}, f
 }
 
 func runAll(t *testing.T, cfg scenario.Config, names ...string) (bool, []scenario.Result) {
@@ -150,25 +148,18 @@ func byStep(results []scenario.Result) map[string]scenario.Result {
 	return m
 }
 
-// storedFirst holds each get_upload_info until ft-server has no request in
-// flight (see stack). The request's own context, the step's, bounds the
-// wait.
-type storedFirst struct {
-	next http.RoundTripper
-	ft   *simtest.FT
-}
-
-func (s storedFirst) RoundTrip(r *http.Request) (*http.Response, error) {
-	if strings.Contains(r.URL.RawQuery, "get_upload_info") {
-		for s.ft.InFlight() > 0 {
-			select {
-			case <-r.Context().Done():
-				return nil, r.Context().Err()
-			case <-time.After(5 * time.Millisecond):
-			}
-		}
+func TestAResumeWaitsForTheServerToStoreTheBrokenUpload(t *testing.T) {
+	// ft-server notices the break a second late, as a loaded host made it
+	// (#176): the parts are stored and the upload is still leased. Asked
+	// then, it would show the same bytes for the whole quiet time and
+	// refuse the resume 503; simtest answers get_upload_info only once it
+	// is done.
+	cfg, f := stackFT(t)
+	f.SetBrokenUploadDelay(time.Second)
+	ok, results := runAll(t, cfg, "ft-resume")
+	if !ok || !byStep(results)["resume"].OK {
+		t.Fatalf("results %+v", results)
 	}
-	return s.next.RoundTrip(r)
 }
 
 func TestAResumeFileNoLargerThanAPartIsUploadedAgainAsRCSJTADoes(t *testing.T) {
