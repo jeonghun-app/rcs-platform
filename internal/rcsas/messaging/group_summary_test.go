@@ -870,6 +870,24 @@ func TestNotificationsMergedBeforeASummaryIsGivenUpAreSent(t *testing.T) {
 	}
 }
 
+// A summary whose record cannot be read when its removal has failed a
+// third time is kept: notifications merged into it may be unsent.
+func TestASummaryIsNotGivenUpOnARecordItCannotRead(t *testing.T) {
+	records := &goneRecord{Store: store.NewMemory()}
+	st := &hookedRemoval{Store: records, err: errStore, at: MaxSummaryFailures, hook: func() { records.fail(errStore) }}
+	cfg := smallQueue
+	cfg.RetryInterval, cfg.MaxRetryInterval = time.Minute, time.Minute
+	r, clock := offlineSummary(t, cfg, st)
+	l := r.listen(t)
+	_, _ = r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	retried(t, r, clock, st, 1)
+	retried(t, r, clock, st, 2)
+	waitFor(t, "the third removal", func() bool { return st.tries.Load() == MaxSummaryFailures && r.idle() })
+	if n := records.Store.(*store.Memory).Len(alice); n != 1 || r.m.get("group.summary.abandoned") != 0 {
+		t.Fatalf("%d queued, metrics %v", n, r.m)
+	}
+}
+
 // A client that refuses the summary's last notification for good (403)
 // will never take it: the summary is given up at once, without a
 // notification about a notification.
