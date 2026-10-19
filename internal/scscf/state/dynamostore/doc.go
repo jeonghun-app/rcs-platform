@@ -18,9 +18,11 @@
 //	expires  number   SweepAt in Unix seconds: the earliest contact expiry, or
 //	                  without contacts the end of the deregistration lease
 //
-// The same table holds the profiles, partition key profile#<IMPI>, with the
-// User-Data in doc and received (number, Unix ns) ordering them, and no
-// index attribute, so no index lists them.
+// The doc names the IMPU's implicit registration set by its default IMPU.
+// The same table holds the profiles, one per set, partition key
+// profile#<IMPI>#<default IMPU>, with the User-Data in doc and received
+// (number, Unix ns) ordering them, and no index attribute, so no index lists
+// them.
 //
 // with global secondary indexes impi-index (partition impi) and expiry-index
 // (partition shard, sort expires), both keys only. The shard spreads the

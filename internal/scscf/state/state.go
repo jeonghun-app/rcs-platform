@@ -106,8 +106,13 @@ type Registration struct {
 	// IMPU is the public identity in canonical form (identity.CanonicalIMPU).
 	IMPU string
 	// IMPI is the private identity that registered it.
-	IMPI     string
-	Contacts []Contact
+	IMPI string
+	// DefaultIMPU is the default public identity of the implicit
+	// registration set IMPU belongs to, in canonical form: with IMPI it
+	// names the set's profile (ProfileKey), which a terminating request to
+	// IMPU reads.
+	DefaultIMPU string
+	Contacts    []Contact
 	// Deregistering is set on a registration left without contacts by the
 	// sweep that claimed it: until then that instance handles the
 	// deregistration (SAR, NOTIFY), after it any sweep retries it. A
@@ -202,11 +207,14 @@ func (r *Registration) Clone() *Registration {
 
 // Validate checks r against the limits of this package.
 func (r *Registration) Validate() error {
-	if canon, ok := identity.CanonicalIMPU(r.IMPU); !ok || canon != r.IMPU || !KeyOK(r.IMPU, MaxKey) {
+	if !canonicalIMPU(r.IMPU) {
 		return fmt.Errorf("%w: registration IMPU is not a canonical public identity", ErrInvalid)
 	}
 	if err := identity.ValidIMPI(r.IMPI); err != nil {
 		return fmt.Errorf("%w: registration IMPI: %w", ErrInvalid, err)
+	}
+	if !canonicalIMPU(r.DefaultIMPU) {
+		return fmt.Errorf("%w: registration DefaultIMPU is not a canonical public identity", ErrInvalid)
 	}
 	if len(r.Contacts) > MaxContacts {
 		return fmt.Errorf("%w: more than %d contacts", ErrInvalid, MaxContacts)
@@ -229,6 +237,16 @@ func (r *Registration) Validate() error {
 		}
 	}
 	return sizeOK("registration", r)
+}
+
+func canonicalIMPU(impu string) bool {
+	canon, ok := identity.CanonicalIMPU(impu)
+	return ok && canon == impu && KeyOK(impu, MaxKey)
+}
+
+// ProfileKey returns the key of the profile that applies to r's IMPU.
+func (r *Registration) ProfileKey() ProfileKey {
+	return ProfileKey{IMPI: r.IMPI, IMPU: r.DefaultIMPU}
 }
 
 // sizeOK refuses an item whose JSON form exceeds MaxItemBytes. The backends'
@@ -266,31 +284,48 @@ type Registrations interface {
 	ExpiringRegistrations(ctx context.Context, now time.Time, limit int) ([]*Registration, error)
 }
 
-// Profiles stores the user profile of each private identity: the
-// IMSSubscription document of the last SAA or PPR (TS 29.228 Annex E), which
-// every instance needs to run the initial filter criteria. It is kept apart
-// from the registrations so a re-registration, which changes only contacts,
-// does not rewrite it, and so that an unregistered user's profile (SAR
-// UNREGISTERED_USER, TS 29.228 §6.1.2) stays as long as the HSS has the user
-// assigned: the S-CSCF deletes it with the assignment, no sweep does.
+// Profiles stores the user profiles: the IMSSubscription document of the
+// last SAA or PPR (TS 29.228 Annex E), which every instance needs to run the
+// initial filter criteria. The HSS sends User-Data per implicit registration
+// set, an SAA only the set of the identity it was asked about and a PPR one
+// set at a time (TS 29.228 §6.1.2, §6.2.2), so a profile is stored per set
+// (ProfileKey): one private identity with two sets has two, and saving one
+// leaves the other. Profiles are kept apart from the registrations so a
+// re-registration, which changes only contacts, does not rewrite them, and so
+// that an unregistered user's profile (SAR UNREGISTERED_USER) stays as long as
+// the HSS has the user assigned: the S-CSCF deletes it with the assignment,
+// no sweep does.
 type Profiles interface {
-	// Profile returns the User-Data stored for impi.
-	Profile(ctx context.Context, impi string) ([]byte, error)
-	// SaveProfile stores userData for impi, received at received: the time the
+	// Profile returns the User-Data stored for k.
+	Profile(ctx context.Context, k ProfileKey) ([]byte, error)
+	// SaveProfile stores userData for k, received at received: the time the
 	// SAA or PPR that carried it arrived, which orders the profiles of one
-	// user across instances. A profile received earlier than the stored one
-	// is not stored (ErrConflict): an SAA that took longer to arrive must not
-	// undo the PPR that followed it. Saving the same one again succeeds.
-	SaveProfile(ctx context.Context, impi string, userData []byte, received time.Time) error
-	// DeleteProfile deletes the profile of impi; deleting none is no error.
-	DeleteProfile(ctx context.Context, impi string) error
+	// set across instances. A profile received earlier than the one stored
+	// for k is not stored (ErrConflict): an SAA that took longer to arrive
+	// must not undo the PPR that followed it. Saving the same one again
+	// succeeds. Other sets of the same IMPI are not touched.
+	SaveProfile(ctx context.Context, k ProfileKey, userData []byte, received time.Time) error
+	// DeleteProfile deletes the profile of k; deleting none is no error.
+	DeleteProfile(ctx context.Context, k ProfileKey) error
+}
+
+// ProfileKey names the profile of one implicit registration set.
+type ProfileKey struct {
+	// IMPI is the private identity the set belongs to.
+	IMPI string
+	// IMPU is the set's default public identity in canonical form, the one
+	// its registrations name in DefaultIMPU.
+	IMPU string
 }
 
 // ValidProfile checks a profile against the limits of this package; the
 // backends apply it in SaveProfile.
-func ValidProfile(impi string, userData []byte, received time.Time) error {
-	if err := identity.ValidIMPI(impi); err != nil {
+func ValidProfile(k ProfileKey, userData []byte, received time.Time) error {
+	if err := identity.ValidIMPI(k.IMPI); err != nil {
 		return fmt.Errorf("%w: profile IMPI: %w", ErrInvalid, err)
+	}
+	if !canonicalIMPU(k.IMPU) {
+		return fmt.Errorf("%w: profile IMPU is not a canonical public identity", ErrInvalid)
 	}
 	if !validTime(received) {
 		return fmt.Errorf("%w: a profile needs the time it was received", ErrInvalid)

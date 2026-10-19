@@ -19,6 +19,7 @@ import (
 type registrationDoc struct {
 	IMPU          string       `json:"impu"`
 	IMPI          string       `json:"impi"`
+	DefaultIMPU   string       `json:"default_impu"`
 	Contacts      []contactDoc `json:"contacts,omitempty"`
 	Deregistering *time.Time   `json:"deregistering,omitempty"`
 }
@@ -38,7 +39,7 @@ type contactDoc struct {
 }
 
 func encodeRegistration(r *state.Registration) ([]byte, error) {
-	doc := registrationDoc{IMPU: r.IMPU, IMPI: r.IMPI}
+	doc := registrationDoc{IMPU: r.IMPU, IMPI: r.IMPI, DefaultIMPU: r.DefaultIMPU}
 	if !r.Deregistering.IsZero() {
 		t := r.Deregistering.UTC()
 		doc.Deregistering = &t
@@ -57,7 +58,7 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: registration document does not decode", state.ErrInvalid)
 	}
-	r := &state.Registration{IMPU: doc.IMPU, IMPI: doc.IMPI, Version: version}
+	r := &state.Registration{IMPU: doc.IMPU, IMPI: doc.IMPI, DefaultIMPU: doc.DefaultIMPU, Version: version}
 	if doc.Deregistering != nil {
 		r.Deregistering = *doc.Deregistering
 	}

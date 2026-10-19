@@ -19,6 +19,19 @@ import (
 // No IMPU starts with it: a canonical one starts with sip:, sips: or tel:.
 const profilePrefix = "profile#"
 
+// profileKey is profile#<IMPI>#<default IMPU>. No two profiles share one: the
+// IMPI has a single '@' and after it a domain name, which has no '#', so the
+// first '#' after the first '@' ends the IMPI.
+func profileKey(k state.ProfileKey) map[string]types.AttributeValue {
+	return key(profilePrefix + k.IMPI + "#" + k.IMPU)
+}
+
+// possibleProfile reports whether k could name a stored profile; one that
+// could not is not looked up, it is simply not found.
+func possibleProfile(k state.ProfileKey) bool {
+	return state.KeyOK(k.IMPI, state.MaxKey) && state.KeyOK(k.IMPU, state.MaxKey)
+}
+
 func (d *Dynamo) registrationItem(r *state.Registration, version int64) (map[string]types.AttributeValue, error) {
 	doc, err := encodeRegistration(r)
 	if err != nil {
@@ -133,11 +146,11 @@ func (d *Dynamo) ExpiringRegistrations(ctx context.Context, now time.Time, limit
 }
 
 // Profile implements state.Profiles.
-func (d *Dynamo) Profile(ctx context.Context, impi string) ([]byte, error) {
-	if !state.KeyOK(impi, state.MaxKey) {
+func (d *Dynamo) Profile(ctx context.Context, k state.ProfileKey) ([]byte, error) {
+	if !possibleProfile(k) {
 		return nil, fmt.Errorf("dynamostore: get profile: %w", state.ErrNotFound)
 	}
-	item, err := d.get(ctx, d.registrations, key(profilePrefix+impi), "get profile")
+	item, err := d.get(ctx, d.registrations, profileKey(k), "get profile")
 	if err != nil {
 		return nil, err
 	}
@@ -145,12 +158,13 @@ func (d *Dynamo) Profile(ctx context.Context, impi string) ([]byte, error) {
 }
 
 // SaveProfile implements state.Profiles with a PutItem conditional on no
-// later profile being stored. A resend carries the same time and passes.
-func (d *Dynamo) SaveProfile(ctx context.Context, impi string, userData []byte, received time.Time) error {
-	if err := state.ValidProfile(impi, userData, received); err != nil {
+// later profile of the set being stored. A resend carries the same time and
+// passes.
+func (d *Dynamo) SaveProfile(ctx context.Context, k state.ProfileKey, userData []byte, received time.Time) error {
+	if err := state.ValidProfile(k, userData, received); err != nil {
 		return err
 	}
-	item := key(profilePrefix + impi)
+	item := profileKey(k)
 	item[attrDoc] = bin(userData)
 	item[attrReceived] = num(received.UnixNano())
 	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
@@ -170,11 +184,11 @@ func (d *Dynamo) SaveProfile(ctx context.Context, impi string, userData []byte, 
 }
 
 // DeleteProfile implements state.Profiles.
-func (d *Dynamo) DeleteProfile(ctx context.Context, impi string) error {
-	if !state.KeyOK(impi, state.MaxKey) {
+func (d *Dynamo) DeleteProfile(ctx context.Context, k state.ProfileKey) error {
+	if !possibleProfile(k) {
 		return nil
 	}
-	if _, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(d.registrations), Key: key(profilePrefix + impi)}); err != nil {
+	if _, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(d.registrations), Key: profileKey(k)}); err != nil {
 		return sanitize("delete profile", err)
 	}
 	return nil

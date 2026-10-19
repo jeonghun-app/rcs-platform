@@ -30,6 +30,12 @@ const (
 	IMPU3  = "sip:+15550100003@" + Domain
 )
 
+// Two implicit registration sets of IMPI1, by their default IMPUs.
+var (
+	Set1 = state.ProfileKey{IMPI: IMPI1, IMPU: IMPU1}
+	Set2 = state.ProfileKey{IMPI: IMPI1, IMPU: IMPU2}
+)
+
 // T0 is the time the checks run at. It lies in the future so that DynamoDB's
 // TTL never removes a test item early.
 var T0 = time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -76,6 +82,9 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AClaimedSubscriptionKeepsItsGraceFromTheClaim", testTerminatedGrace},
 		{"NotifyCountersStopAtTheirLimit", testCounterLimit},
 		{"ProfilesAreKeptApartFromRegistrations", testProfiles},
+		{"EachImplicitRegistrationSetHasItsOwnProfile", testProfilesPerSet},
+		{"APPRForOneSetLeavesTheOtherSetsProfile", testPPRForOneSet},
+		{"ARegistrationNamesTheProfileOfItsSet", testRegistrationProfileKey},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,9 +132,9 @@ func eventually(t *testing.T, o Options, what string, check func() bool) {
 }
 
 // Registration returns a valid registration of impu with one contact per
-// expiry, each relative to T0.
+// expiry, each relative to T0. impu is the default IMPU of its set.
 func Registration(impi, impu string, expiries ...time.Duration) *state.Registration {
-	r := &state.Registration{IMPU: impu, IMPI: impi}
+	r := &state.Registration{IMPU: impu, IMPI: impi, DefaultIMPU: impu}
 	for i, e := range expiries {
 		r.Contacts = append(r.Contacts, state.Contact{
 			URI:        fmt.Sprintf("sip:ue%d@192.0.2.%d:5060;transport=tcp", i, 10+i),
@@ -320,7 +329,9 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 		tooMany.Contacts = append(tooMany.Contacts, Registration(IMPI1, IMPU1, time.Hour).Contacts[0])
 	}
 	badIMPI := Registration("not an impi", IMPU1, time.Hour)
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI} {
+	noSet := Registration(IMPI1, IMPU1, time.Hour)
+	noSet.DefaultIMPU = ""
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noSet} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}

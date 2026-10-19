@@ -24,7 +24,7 @@ func FuzzDecodeDocuments(f *testing.F) {
 	ch, _ := encodeChallenge(statetest.Challenge(statetest.IMPI1, "n", time.Minute))
 	sub, _ := encodeSubscription(statetest.Subscription("s1", statetest.IMPU1, time.Hour))
 	for _, seed := range [][]byte{reg, ch, sub, []byte("{}"), []byte(`{"contacts":[{}]}`), []byte("null"),
-		[]byte(`{"impu":"sip:a@example.com","impi":"a@example.com","user_data":"","contacts":[{"uri":"sip:x","expires":"2031-01-01T00:00:00+09:00","path":[],"feature_tags":[]}]}`)} {
+		[]byte(`{"impu":"sip:a@example.com","impi":"a@example.com","default_impu":"sip:a@example.com","contacts":[{"uri":"sip:x","expires":"2031-01-01T00:00:00+09:00","path":[],"feature_tags":[]}]}`)} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, b []byte) {

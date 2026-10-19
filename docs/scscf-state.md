@@ -10,7 +10,7 @@ them.
 
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
-| `registrations` | `pk` (S): canonical IMPU, or `profile#<IMPI>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only | the bindings of each IMPU, and the User-Data of each IMPI |
+| `registrations` | `pk` (S): canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only | the bindings of each IMPU, and the User-Data of each implicit registration set |
 | `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions and their NOTIFY counters |
 
@@ -31,11 +31,28 @@ additionally sealed (below).
   contacts, leased or not, is handled as an initial registration: SAR
   REGISTRATION, and a save conditional on the version read, which makes the
   sweep's later delete fail harmlessly (#14).
-- **Profiles are ordered by arrival.** `SaveProfile` takes the time the SAA or
-  PPR arrived and keeps the later one, so an SAA answered slowly cannot undo
-  the PPR that followed it; a refused save (`ErrConflict`) is not an error to
-  report. The profile is deleted when the HSS no longer assigns the user to
-  this S-CSCF, never by a sweep.
+- **One profile per implicit registration set.** The HSS sends User-Data per
+  set: an SAA for the set of the IMPU in the request, a PPR for one set at a
+  time. A profile is therefore keyed by the IMPI and the set's default IMPU
+  (`state.ProfileKey`), a PPR saves only its own set, and each registration
+  records its set's default IMPU (`DefaultIMPU`), which a terminating request
+  uses to find the profile.
+- **Profiles are ordered by arrival, per set.** `SaveProfile` takes the time
+  the SAA or PPR arrived and keeps the later one, so an SAA answered slowly
+  cannot undo the PPR that followed it; a refused save (`ErrConflict`) is not
+  an error to report. A profile is deleted when the HSS no longer assigns its
+  set to this S-CSCF, never by a sweep.
+- **A permanent SAR failure ends the deregistration.** The sweep's handler
+  returns an error only for failures that may pass (the HSS unreachable, a
+  busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
+  (5001) it returns nil, or the SAR would be retried every minute.
+
+## HSS discovery
+
+`scscf` and `icscf` find the HSS tasks with Cloud Map (`cxclient`,
+`CloudMapDiscovery`), so both task roles need
+`servicediscovery:DiscoverInstances` on the HSS namespace. Without it no HSS
+peer is found and every Cx request fails.
 
 ## Challenge keys
 
@@ -57,7 +74,7 @@ client one more 401, not a failed registration.
 A re-registration is one strongly consistent read and one put of the IMPU's
 registration item (a few KB), plus two writes to `expiry-index`; the profile is
 written only on SAR and PPR. Every terminating request reads the IMPU's
-registration and the IMPI's profile, two strongly consistent reads: about 1
+registration and its set's profile, two strongly consistent reads: about 1
 read request unit for the registration and 1 per 4 KB of profile (2 for a
 typical 5 KB IMSSubscription, 32 for the 128 KiB maximum), so 3 RRU per
 terminating request, $0.4 per million at the same prices. With 1 M users of

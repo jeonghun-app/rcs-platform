@@ -22,7 +22,7 @@ type Memory struct {
 
 	mu            sync.Mutex
 	registrations map[string]*Registration
-	profiles      map[string]storedProfile
+	profiles      map[ProfileKey]storedProfile
 	challenges    map[challengeKey]*Challenge
 	added         int
 	subscriptions map[string]*Subscription
@@ -42,7 +42,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		rand:          randReader,
 		registrations: map[string]*Registration{},
-		profiles:      map[string]storedProfile{},
+		profiles:      map[ProfileKey]storedProfile{},
 		challenges:    map[challengeKey]*Challenge{},
 		subscriptions: map[string]*Subscription{},
 	}
@@ -152,10 +152,10 @@ func (m *Memory) ExpiringRegistrations(_ context.Context, now time.Time, limit i
 }
 
 // Profile implements Profiles.
-func (m *Memory) Profile(_ context.Context, impi string) ([]byte, error) {
+func (m *Memory) Profile(_ context.Context, k ProfileKey) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	p, ok := m.profiles[impi]
+	p, ok := m.profiles[k]
 	if !ok {
 		return nil, fmt.Errorf("state: profile: %w", ErrNotFound)
 	}
@@ -163,24 +163,24 @@ func (m *Memory) Profile(_ context.Context, impi string) ([]byte, error) {
 }
 
 // SaveProfile implements Profiles.
-func (m *Memory) SaveProfile(_ context.Context, impi string, userData []byte, received time.Time) error {
-	if err := ValidProfile(impi, userData, received); err != nil {
+func (m *Memory) SaveProfile(_ context.Context, k ProfileKey, userData []byte, received time.Time) error {
+	if err := ValidProfile(k, userData, received); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur, ok := m.profiles[impi]; ok && cur.received.After(received) {
+	if cur, ok := m.profiles[k]; ok && cur.received.After(received) {
 		return fmt.Errorf("state: save profile: %w", ErrConflict)
 	}
-	m.profiles[impi] = storedProfile{userData: slices.Clone(userData), received: received}
+	m.profiles[k] = storedProfile{userData: slices.Clone(userData), received: received}
 	return nil
 }
 
 // DeleteProfile implements Profiles.
-func (m *Memory) DeleteProfile(_ context.Context, impi string) error {
+func (m *Memory) DeleteProfile(_ context.Context, k ProfileKey) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.profiles, impi)
+	delete(m.profiles, k)
 	return nil
 }
 

@@ -96,8 +96,13 @@ func testImpossibleKeys(t *testing.T, a, _ state.Store, _ Options) {
 		wantErr(t, err, state.ErrNotFound)
 		_, _, err = a.NextNotify(ctx(t), impu)
 		wantErr(t, err, state.ErrNotFound)
-		_, err = a.Profile(ctx(t), impu)
-		wantErr(t, err, state.ErrNotFound)
+		for _, k := range []state.ProfileKey{{IMPI: IMPI1, IMPU: impu}, {IMPI: impu, IMPU: IMPU1}} {
+			_, err = a.Profile(ctx(t), k)
+			wantErr(t, err, state.ErrNotFound)
+			if err := a.DeleteProfile(ctx(t), k); err != nil {
+				t.Errorf("deleting an impossible profile: %v", err)
+			}
+		}
 		if regs := must(a.RegistrationsOf(ctx(t), impu))(t); len(regs) != 0 {
 			t.Error("an impossible IMPI lists registrations")
 		}
@@ -137,8 +142,8 @@ func testBoundaries(t *testing.T, a, _ state.Store, _ Options) {
 	wantErr(t, err, state.ErrInvalid)
 	must(a.SaveRegistration(ctx(t), at(time.Unix(0, 0).UTC())))(t)
 
-	wantErr(t, a.SaveProfile(ctx(t), IMPI1, make([]byte, state.MaxUserData+1), T0), state.ErrInvalid)
-	if err := a.SaveProfile(ctx(t), IMPI1, make([]byte, state.MaxUserData), T0); err != nil {
+	wantErr(t, a.SaveProfile(ctx(t), Set1, make([]byte, state.MaxUserData+1), T0), state.ErrInvalid)
+	if err := a.SaveProfile(ctx(t), Set1, make([]byte, state.MaxUserData), T0); err != nil {
 		t.Errorf("a profile of MaxUserData bytes: %v", err)
 	}
 
@@ -268,19 +273,19 @@ func testCounterLimit(t *testing.T, a, b state.Store, _ Options) {
 }
 
 func testProfiles(t *testing.T, a, b state.Store, _ Options) {
-	if err := a.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>1</IMSSubscription>"), T0); err != nil {
+	if err := a.SaveProfile(ctx(t), Set1, []byte("<IMSSubscription>1</IMSSubscription>"), T0); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second)); err != nil {
+	if err := b.SaveProfile(ctx(t), Set1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	// An SAA received before the PPR that followed it, saved late, loses.
-	wantErr(t, a.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>1</IMSSubscription>"), T0), state.ErrConflict)
+	wantErr(t, a.SaveProfile(ctx(t), Set1, []byte("<IMSSubscription>1</IMSSubscription>"), T0), state.ErrConflict)
 	// Saving the same one again, as an SDK resend does, is fine.
-	if err := b.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second)); err != nil {
+	if err := b.SaveProfile(ctx(t), Set1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second)); err != nil {
 		t.Errorf("saving the stored profile again: %v", err)
 	}
-	if got := must(a.Profile(ctx(t), IMPI1))(t); string(got) != "<IMSSubscription>2</IMSSubscription>" {
+	if got := must(a.Profile(ctx(t), Set1))(t); string(got) != "<IMSSubscription>2</IMSSubscription>" {
 		t.Errorf("profile %q, want the one received last", got)
 	}
 	// A profile is not a registration: no listing or sweep sees it.
@@ -290,14 +295,81 @@ func testProfiles(t *testing.T, a, b state.Store, _ Options) {
 	if regs := must(a.ExpiringRegistrations(ctx(t), T0.Add(24*time.Hour), 10))(t); len(regs) != 0 {
 		t.Error("a profile is listed as expiring")
 	}
-	if err := b.DeleteProfile(ctx(t), IMPI1); err != nil {
+	if err := b.DeleteProfile(ctx(t), Set1); err != nil {
 		t.Fatal(err)
 	}
-	_, err := a.Profile(ctx(t), IMPI1)
+	_, err := a.Profile(ctx(t), Set1)
 	wantErr(t, err, state.ErrNotFound)
-	if err := b.DeleteProfile(ctx(t), IMPI1); err != nil {
+	if err := b.DeleteProfile(ctx(t), Set1); err != nil {
 		t.Errorf("deleting no profile: %v", err)
 	}
-	wantErr(t, a.SaveProfile(ctx(t), IMPI1, nil, T0), state.ErrInvalid)
-	wantErr(t, a.SaveProfile(ctx(t), IMPI1, []byte("x"), time.Time{}), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), Set1, nil, T0), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), Set1, []byte("x"), time.Time{}), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), state.ProfileKey{IMPI: IMPI1}, []byte("x"), T0), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), state.ProfileKey{IMPI: IMPI1, IMPU: "sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}, []byte("x"), T0), state.ErrInvalid)
+}
+
+// testProfilesPerSet: the HSS sends User-Data per implicit registration set,
+// so two sets of one IMPI are two profiles, each ordered on its own.
+func testProfilesPerSet(t *testing.T, a, b state.Store, _ Options) {
+	one, two := "<IMSSubscription>set 1</IMSSubscription>", "<IMSSubscription>set 2</IMSSubscription>"
+	if err := a.SaveProfile(ctx(t), Set1, []byte(one), T0.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Received before set 1's, yet not refused: the order is per set.
+	if err := b.SaveProfile(ctx(t), Set2, []byte(two), T0); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[state.ProfileKey]string{Set1: one, Set2: two} {
+		for _, s := range []state.Store{a, b} {
+			if got := must(s.Profile(ctx(t), k))(t); string(got) != want {
+				t.Errorf("profile of %s = %q, want %q", k.IMPU, got, want)
+			}
+		}
+	}
+	if err := b.DeleteProfile(ctx(t), Set2); err != nil {
+		t.Fatal(err)
+	}
+	_, err := a.Profile(ctx(t), Set2)
+	wantErr(t, err, state.ErrNotFound)
+	if got := must(a.Profile(ctx(t), Set1))(t); string(got) != one {
+		t.Errorf("deleting set 2 changed set 1 to %q", got)
+	}
+}
+
+// testPPRForOneSet: a PPR carries one set's User-Data and replaces that set's
+// profile only.
+func testPPRForOneSet(t *testing.T, a, b state.Store, _ Options) {
+	saa1, saa2, ppr := "<IMSSubscription>saa 1</IMSSubscription>", "<IMSSubscription>saa 2</IMSSubscription>", "<IMSSubscription>ppr 2</IMSSubscription>"
+	if err := a.SaveProfile(ctx(t), Set1, []byte(saa1), T0); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SaveProfile(ctx(t), Set2, []byte(saa2), T0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SaveProfile(ctx(t), Set2, []byte(ppr), T0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := must(a.Profile(ctx(t), Set2))(t); string(got) != ppr {
+		t.Errorf("set 2 = %q, want the PPR's", got)
+	}
+	if got := must(a.Profile(ctx(t), Set1))(t); string(got) != saa1 {
+		t.Errorf("a PPR for set 2 changed set 1 to %q", got)
+	}
+	// Set 1's next SAA, received before the PPR, still counts: it is later
+	// than set 1's stored profile.
+	if err := a.SaveProfile(ctx(t), Set1, []byte("<IMSSubscription>saa 1 again</IMSSubscription>"), T0.Add(time.Second)); err != nil {
+		t.Errorf("a later SAA for set 1: %v", err)
+	}
+}
+
+// testRegistrationProfileKey: every IMPU of a set, explicitly registered or
+// not, finds the set's profile through its registration.
+func testRegistrationProfileKey(t *testing.T, a, b state.Store, _ Options) {
+	r := Registration(IMPI1, IMPU2, time.Hour)
+	r.DefaultIMPU = IMPU1
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if got := must(b.Registration(ctx(t), IMPU2))(t).ProfileKey(); got != Set1 {
+		t.Errorf("ProfileKey of a non-default IMPU = %+v, want %+v", got, Set1)
+	}
 }

@@ -31,8 +31,11 @@ const TerminatedGrace = time.Minute
 // first, the registration stays, and a sweep after the lease claims it and
 // calls handle again, with before as empty as after: the deregistration is
 // retried until it succeeds, so the HSS is not left thinking the user is still
-// registered here. The errors of handle are returned together with the number
-// handled.
+// registered here. handle therefore returns an error only for a failure that
+// may pass, and nil for a permanent one, such as an SAA with
+// DIAMETER_ERROR_USER_UNKNOWN (5001, TS 29.229 §6.2.2): the HSS will not
+// answer differently, and an error would retry the SAR every lease. The
+// errors of handle are returned together with the number handled.
 func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, limit int, handle func(before, after *Registration) error) (int, error) {
 	// A listing error that comes with registrations (an item that does not
 	// decode) does not stop the others from being swept.
