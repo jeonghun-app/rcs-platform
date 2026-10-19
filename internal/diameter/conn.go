@@ -466,9 +466,9 @@ type queued struct {
 // maxAnswersInARow bounds how many handlers' answers the writer sends before
 // it serves the main queue again, so that a peer keeping requests
 // outstanding faster than it reads the answers cannot hold up the node's
-// own requests (an HSS's RTR or PPR) indefinitely (review of #148). A
-// connection with a smaller MaxInFlight uses that, so a request never
-// waits behind more answers than it did when both shared one queue.
+// own requests (an HSS's RTR or PPR) indefinitely (review of #148): at
+// most that many answers go ahead of each queued message. A connection
+// with a smaller MaxInFlight uses that bound instead.
 const maxAnswersInARow = 16
 
 // testHookTookLast, when set by a test, runs once the writer has taken a
