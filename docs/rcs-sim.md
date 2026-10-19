@@ -110,10 +110,10 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-relay-control` | none | msrp-relay control API base URL; the chat scenarios fail without it |
 | `-core-listen` | `127.0.0.1:0` | where the rcs-as stand-in listens; the port must be in the relay's `RELAY_CORE_PORTS` |
 | `-core-advertise` | the listener's address | host the relay is told to connect to |
-| `-msrp-keepalive` | 240s | MSRP keep-alive interval of both ends (ADR 0003) |
-| `-idle-wait` | 0 (skip) | stay quiet this long in the chat scenarios, to see keep-alives go out; set it above `-msrp-keepalive`. If no keep-alive has gone out by then, the step waits for one until `-step-timeout`, since a loaded host can run the timer late |
+| `-msrp-keepalive` | 200s | MSRP keep-alive interval of both ends (ADR 0003). It must be shorter than the relay's (`RELAY_KEEPALIVE_INTERVAL`, 240 s by default): the relay's own keep-alive resets the client's timer, so with a longer interval the client never sends one and the keep-alive step fails |
+| `-idle-wait` | 0 (skip) | stay quiet this long in the chat scenarios, to see keep-alives go out; set it above `-msrp-keepalive`. If no keep-alive has gone out by then, the step waits for one until `-step-timeout`, since a loaded host can run the timer late. Only a SEND the client starts counts; the step's `bytes_while_quiet` (reported on failure too) is everything it wrote meanwhile |
 | `-self`, `-peer` | `+15550100001`, `+15550100002` in the MCC 001 test domain | the CPIM addresses of the two ends |
-| `-step-timeout` | 30s | bound on each step |
+| `-step-timeout` | 30s | bound on each step; must be longer than `-idle-wait`, which the keep-alive step spends within it |
 | `-list`, `-version` | | print the scenarios or the version |
 
 Secrets are read from the environment only, never from flags, because flags

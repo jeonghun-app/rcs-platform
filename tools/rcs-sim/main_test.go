@@ -46,6 +46,7 @@ func TestUsageErrorsExitWithTwo(t *testing.T) {
 		{"self not a URI", nil, []string{"-self", "nobody", "all"}, "-self"},
 		{"peer not a URI", nil, []string{"-peer", "nobody", "all"}, "-peer"},
 		{"no file size", nil, []string{"-file-size", "0", "all"}, "-file-size"},
+		{"step timeout within the idle wait", nil, []string{"-idle-wait", "30s", "-step-timeout", "30s", "all"}, "-step-timeout must be longer than -idle-wait"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			code, _, errOut := call(env(tt.env...), tt.args...)

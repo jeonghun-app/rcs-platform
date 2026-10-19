@@ -216,12 +216,18 @@ func (r *run) converse(cs *chatSession) error {
 	if r.cfg.IdleWait > 0 {
 		if err := r.step("keep-alive", func(ctx context.Context) (map[string]int64, error) {
 			before, sends := cs.traffic.written.Load(), cs.traffic.sends.Load()
+			// What the client wrote while quiet goes into the result whether
+			// the step passes or fails: a failure with bytes written means
+			// it answered someone else's keep-alive but sent none itself.
+			quiet := func() map[string]int64 {
+				return map[string]int64{"bytes_while_quiet": cs.traffic.written.Load() - before}
+			}
 			select {
 			case <-time.After(r.cfg.IdleWait):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return quiet(), ctx.Err()
 			case <-client.Done():
-				return nil, errors.New("the session ended while quiet")
+				return quiet(), errors.New("the session ended while quiet")
 			}
 			// Quiet for IdleWait, the client must have sent a keep-alive.
 			// On a loaded host its timer can run late, past IdleWait (#97),
@@ -234,15 +240,14 @@ func (r *run) converse(cs *chatSession) error {
 				select {
 				case <-time.After(10 * time.Millisecond):
 				case <-ctx.Done():
-					return nil, errors.New("no keep-alive went out while the session was quiet")
+					return quiet(), errors.New("no keep-alive went out while the session was quiet")
 				case <-client.Done():
-					return nil, errors.New("the session ended while quiet")
+					return quiet(), errors.New("the session ended while quiet")
 				}
 			}
-			sent := cs.traffic.written.Load() - before
+			detail := quiet()
 			// The session survives the quiet spell end to end.
-			err := r.exchange(ctx, cs.client, client, cs.coreEnd, cs.coreSession, []byte("still here"), false)
-			return map[string]int64{"bytes_while_quiet": sent}, err
+			return detail, r.exchange(ctx, cs.client, client, cs.coreEnd, cs.coreSession, []byte("still here"), false)
 		}); err != nil {
 			return err
 		}
@@ -364,7 +369,7 @@ func (r *run) release(cs *chatSession) {
 }
 
 // traffic is what the client writes: bytes, and SEND requests by their
-// start lines (RFC 4975 §7.1). Responses are not requests, so the client's
+// start lines (RFC 4975 §9). Responses are not requests, so the client's
 // answer to someone else's keep-alive is not counted as one of its own.
 type traffic struct {
 	written atomic.Int64
@@ -387,7 +392,7 @@ func (c *countingConn) Write(p []byte) (int, error) {
 }
 
 // sendStartLines counts the SEND requests in p: lines that are exactly
-// "MSRP <transaction-id> SEND" (RFC 4975 §7.1, single spaces, CRLF) and
+// "MSRP <transaction-id> SEND" (RFC 4975 §9, single spaces, CRLF) and
 // whose end-line, "-------<transaction-id>" and a flag, follows in p. A line
 // that only looks like a start line, in a body say, has no such end-line. A
 // start line split across two writes is missed, which only makes the step
