@@ -166,3 +166,146 @@ func TestTheDPAFollowsTheAnswersAndTheQueuedRequests(t *testing.T) {
 	}
 	checkBehindTheMainQueue(t, "DPA", before+after)
 }
+
+// A peer that keeps requests outstanding faster than it reads the answers
+// cannot hold up the node's own requests: one goes out after at most
+// maxAnswersInARow answers, however many are queued (review of #148). The
+// script reads nothing until the answers and the request are all queued,
+// so the order is the writer's alone.
+func TestTheNodesOwnRequestFollowsAtMostABoundedRunOfAnswers(t *testing.T) {
+	for _, outstanding := range []int{2, maxAnswersInARow + 1, 64} {
+		hss, ln, _ := startResponder(t, func(c *Config) { c.MaxInFlight = 64 })
+		hss.HandleFunc(appCx, cmdTest, func(ctx context.Context, p *Peer, req *Message) (*Message, error) {
+			return hss.NewAnswer(req, ResultSuccess), nil
+		})
+		s := openScript(t, ln, scscfHost)
+		for range outstanding {
+			s.request(&Message{Code: cmdTest, ApplicationID: appCx, AVPs: s.origin()})
+		}
+		peer := hss.Peer(scscfHost)
+		c := peer.current()
+		// The writer holds one answer, waiting for the script to read it.
+		waitFor(t, "the answers to be queued", func() bool {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return c.active == 0 && len(c.answers) == outstanding-1
+		})
+		go func() { _, _ = peer.Send(context.Background(), hss.NewRequest(cmdTest, appCx, hss.NewSessionID(""))) }()
+		waitFor(t, "the node's request to be queued", func() bool { return len(c.writes) == 1 })
+		answers, _ := countUntil(s, func(m *Message) bool { return m.IsRequest() })
+		if answers > maxAnswersInARow {
+			t.Errorf("%d outstanding: the node's request came after %d answers, want at most %d", outstanding, answers, maxAnswersInARow)
+		}
+	}
+}
+
+// countUntil reads messages until one matches and returns how many came
+// before it.
+func countUntil(s *script, match func(*Message) bool) (before int, m *Message) {
+	s.t.Helper()
+	for {
+		if m := s.read(); match(m) {
+			return before, m
+		}
+		before++
+	}
+}
+
+// A DPR the writer takes from the main queue while an answer is ready, as
+// a select that found both ready may, follows that answer on the wire: the
+// hook queues the answer just after the writer took the DPR (review of
+// #148).
+func TestAnAnswerReadyWhenTheWriterTakesTheDPRGoesFirst(t *testing.T) {
+	hss, ln, _ := startResponder(t, nil)
+	s := openScript(t, ln, scscfHost)
+	late := &Message{Flags: FlagRequest, Code: cmdTest, ApplicationID: appCx, HopByHop: 0x5150, EndToEnd: 0x5150, AVPs: s.origin()}
+	b, err := hss.NewAnswer(late, ResultSuccess).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The DPR exchange needs a running connection; the DWR proves it.
+	s.sync()
+	testHookTookLast = func(c *conn) { c.answers <- b }
+	t.Cleanup(func() { testHookTookLast = nil })
+	errc := make(chan error, 1)
+	go func() { errc <- hss.Shutdown(context.Background()) }()
+	if ans := s.read(); ans.IsRequest() || ans.HopByHop != late.HopByHop {
+		t.Fatalf("expected the ready answer first, got %+v", ans)
+	}
+	dpr := s.read()
+	if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+		t.Fatalf("expected the DPR, got %+v", dpr)
+	}
+	s.write(s.answer(dpr, ResultSuccess))
+	s.expectClosed()
+	if err := <-errc; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// The same for the DPA a node sends when the peer disconnects.
+func TestAnAnswerReadyWhenTheWriterTakesTheDPAGoesFirst(t *testing.T) {
+	scscf, peer, dialer, _ := startInitiator(t, nil)
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "peer to open", peer.Available)
+	s.sync()
+	late := &Message{Flags: FlagRequest, Code: cmdTest, ApplicationID: appCx, HopByHop: 0x5151, EndToEnd: 0x5151, AVPs: s.origin()}
+	b, err := scscf.NewAnswer(late, ResultSuccess).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookTookLast = func(c *conn) { c.answers <- b }
+	t.Cleanup(func() { testHookTookLast = nil })
+	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	if ans := s.read(); ans.IsRequest() || ans.HopByHop != late.HopByHop {
+		t.Fatalf("expected the ready answer first, got %+v", ans)
+	}
+	if dpa := s.read(); dpa.IsRequest() || dpa.Code != CodeDisconnectPeer || dpa.HopByHop != dpr.HopByHop {
+		t.Fatalf("expected the DPA, got %+v", dpa)
+	}
+}
+
+// The node's own request, once queued, must not wait behind an endless
+// stream of answers (QA of #148): here the peer keeps one request in progress at a time,
+// and the node never gets to write its own second request.
+func TestQA148OwnRequestIsNotStarvedByAStreamOfAnswers(t *testing.T) {
+	const rounds = 3 * testInFlight
+	hss, ln, _ := startResponder(t, func(c *Config) { c.MaxInFlight = testInFlight })
+	hss.HandleFunc(appCx, cmdTest, func(ctx context.Context, p *Peer, req *Message) (*Message, error) {
+		return hss.NewAnswer(req, ResultSuccess), nil
+	})
+	s := openScript(t, ln, scscfHost)
+	p := hss.Peer(scscfHost)
+	c := p.current()
+	// Two own requests: the writer blocks on the first (the script is not
+	// reading), the second waits in the main queue.
+	for range 2 {
+		go func() { _, _ = p.Send(context.Background(), hss.NewRequest(cmdTest, appCx, hss.NewSessionID(""))) }()
+	}
+	waitFor(t, "both requests pending", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return len(c.pending) == 2
+	})
+	ownSeen, answers := 0, 0
+	for range rounds {
+		// While the writer is still on the previous message, one more
+		// request from the peer is answered and its answer queued.
+		s.request(&Message{Code: cmdTest, ApplicationID: appCx, AVPs: s.origin()})
+		if !waitForAnswersQueued(c) {
+			t.Fatal("answer not queued")
+		}
+		m := s.read()
+		if m.IsRequest() {
+			ownSeen++
+			if ownSeen == 2 {
+				t.Logf("second own request written after %d answers", answers)
+				return
+			}
+		} else {
+			answers++
+		}
+	}
+	t.Fatalf("the node's second request was still not written after %d answers (MaxInFlight %d)", answers, testInFlight)
+}

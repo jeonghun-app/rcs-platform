@@ -56,8 +56,8 @@ type pendingRequest struct {
 // (a DWR is dropped instead, which the watchdog counts as unanswered).
 // Handlers wait for room in the answer queue, which is written next, so an
 // admitted request's answer does not wait behind the node's own requests
-// (#117); Send waits for room in the main queue, no longer than its
-// timeout.
+// (#117), up to maxAnswersInARow at a time; Send waits for room in the main
+// queue, no longer than its timeout.
 type conn struct {
 	node *Node
 	nc   net.Conn
@@ -68,7 +68,7 @@ type conn struct {
 	caps capabilities
 	apps []uint32
 
-	writes       chan []byte   // requests, and the DPA, behind them
+	writes       chan queued   // requests, and the DPA, behind them
 	answers      chan []byte   // handlers' answers, written before writes
 	controlReady chan struct{} // wakes the writer when control gains an entry
 	wdFire       chan struct{}
@@ -105,7 +105,7 @@ func newConn(n *Node, nc net.Conn) *conn {
 		node:         n,
 		nc:           nc,
 		br:           bufio.NewReader(nc),
-		writes:       make(chan []byte, n.cfg.MaxInFlight),
+		writes:       make(chan queued, n.cfg.MaxInFlight),
 		answers:      make(chan []byte, n.cfg.MaxInFlight),
 		controlReady: make(chan struct{}, 1),
 		wdFire:       make(chan struct{}, 1),
@@ -456,18 +456,58 @@ func (c *conn) popControl() ([]byte, bool) {
 	return b, true
 }
 
+// queued is a message in the main queue. last marks the DPR and the DPA,
+// which end what the peer is sent.
+type queued struct {
+	b    []byte
+	last bool
+}
+
+// maxAnswersInARow bounds how many handlers' answers the writer sends before
+// it serves the main queue again, so that a peer keeping requests
+// outstanding faster than it reads the answers cannot hold up the node's
+// own requests (an HSS's RTR or PPR) indefinitely (review of #148). A
+// connection with a smaller MaxInFlight uses that, so a request never
+// waits behind more answers than it did when both shared one queue.
+const maxAnswersInARow = 16
+
+// testHookTookLast, when set by a test, runs once the writer has taken a
+// DPR or DPA from the main queue, before it writes the answers queued
+// ahead of it.
+var testHookTookLast func(*conn)
+
 // writeLoop writes the control queue first, then handlers' answers, then
-// the main queue. A message taken from the main queue waits for the answers
-// that arrived meanwhile: a select that found both queues ready picks one at
-// random, and an answer queued before a DPR or DPA must reach the peer
-// before it (drain).
+// the main queue, but serves the main queue after at most
+// maxAnswersInARow (or MaxInFlight) answers in a row.
 func (c *conn) writeLoop() {
+	limit := min(maxAnswersInARow, cap(c.answers))
+	inARow := 0 // answers written since the main queue was last served
 	for {
-		if b, ok := c.popFirst(); ok {
+		if b, ok := c.popControl(); ok {
 			if !c.write(b) {
 				return
 			}
 			continue
+		}
+		if inARow >= limit {
+			inARow = 0
+			select {
+			case q := <-c.writes:
+				if !c.writeQueued(q) {
+					return
+				}
+				continue
+			default:
+			}
+		}
+		select {
+		case b := <-c.answers:
+			if !c.write(b) {
+				return
+			}
+			inARow++
+			continue
+		default:
 		}
 		select {
 		case <-c.controlReady:
@@ -475,17 +515,10 @@ func (c *conn) writeLoop() {
 			if !c.write(b) {
 				return
 			}
-		case b := <-c.writes:
-			for {
-				first, ok := c.popFirst()
-				if !ok {
-					break
-				}
-				if !c.write(first) {
-					return
-				}
-			}
-			if !c.write(b) {
+			inARow++
+		case q := <-c.writes:
+			inARow = 0
+			if !c.writeQueued(q) {
 				return
 			}
 		case <-c.done:
@@ -494,18 +527,23 @@ func (c *conn) writeLoop() {
 	}
 }
 
-// popFirst returns the next control message, or else the next handler's
-// answer, without waiting.
-func (c *conn) popFirst() ([]byte, bool) {
-	if b, ok := c.popControl(); ok {
-		return b, true
+// writeQueued writes a message from the main queue. A DPR or DPA goes after
+// the answers already queued: a select that found both queues ready picks
+// one at random, and an answer queued before a DPR or DPA must reach the
+// peer before it (drain). Those are all in the queue by now, so only that
+// many are written first, however many more arrive.
+func (c *conn) writeQueued(q queued) bool {
+	if q.last {
+		if testHookTookLast != nil {
+			testHookTookLast(c)
+		}
+		for range len(c.answers) {
+			if !c.write(<-c.answers) {
+				return false
+			}
+		}
 	}
-	select {
-	case b := <-c.answers:
-		return b, true
-	default:
-		return nil, false
-	}
+	return c.write(q.b)
 }
 
 // write sends b, failing the connection when the peer does not take it within
@@ -556,23 +594,26 @@ func (c *conn) answerNow(req, ans *Message) {
 // else. At most MaxInFlight handlers run, so the queue holds every running
 // handler's answer unless the writer is behind on answers already.
 func (c *conn) answerQueued(req, ans *Message) {
-	c.queueAnswer(c.answers, req, ans)
+	b, ok := c.encodeAnswer(req, ans)
+	if !ok {
+		return
+	}
+	select {
+	case c.answers <- b:
+	case <-c.done:
+	}
 }
 
 // answerLast sends an answer through the main queue, behind the requests
 // already queued and every handler answer queued before it: the DPA, which
 // ends what the peer is sent (RFC 6733 §5.4).
 func (c *conn) answerLast(req, ans *Message) {
-	c.queueAnswer(c.writes, req, ans)
-}
-
-func (c *conn) queueAnswer(q chan<- []byte, req, ans *Message) {
 	b, ok := c.encodeAnswer(req, ans)
 	if !ok {
 		return
 	}
 	select {
-	case q <- b:
+	case c.writes <- queued{b: b, last: true}:
 	case <-c.done:
 	}
 }
@@ -607,7 +648,7 @@ func (c *conn) roundTrip(ctx context.Context, req *Message, internal bool) (*Mes
 	b, err := req.Encode()
 	if err == nil {
 		select {
-		case c.writes <- b:
+		case c.writes <- queued{b: b, last: req.Code == CodeDisconnectPeer}:
 		case r := <-p.ch:
 			return r.m, r.err
 		case <-ctx.Done():
