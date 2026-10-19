@@ -99,7 +99,7 @@ func waitQueued(t *testing.T, c *Conn, n int, what string) {
 }
 
 // A message whose later chunk is cancelled while still queued is ended with
-// an abort chunk, "#", at that chunk's start (RFC 4975 §7.1.2), so the
+// an abort chunk, "#", at that chunk's start (RFC 4975 §7.1), so the
 // receiver does not hold the first chunk until its own timeout (#162, from
 // QA on #152).
 func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
@@ -168,8 +168,8 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	// message.
 	go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("cccc")}) }()
 	m := p.next(t)
-	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range().Start != 9 || len(m.Body) != 0 {
-		t.Fatalf("after A the peer read %q flag %q range %+v (id %s, B's %s); want B's abort chunk at 9",
+	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range() != (ByteRange{Start: 9, End: 8, Total: 16}) || len(m.Body) != 0 {
+		t.Fatalf("after A the peer read %q flag %q range %+v (id %s, B's %s); want B's abort chunk 9-8/16",
 			m.Body, m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
 	}
 }
