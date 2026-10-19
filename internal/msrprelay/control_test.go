@@ -421,21 +421,9 @@ func TestBindingIDsAreDigestsInTheSessionIDAlphabet(t *testing.T) {
 	}
 }
 
-func TestNamespaceMatchesWholeLabels(t *testing.T) {
-	for _, tt := range []struct {
-		host, ns string
-		want     bool
-	}{
-		{"rcs-as.rcs.internal", "rcs.internal", true},
-		{"RCS-AS.RCS.INTERNAL.", "rcs.internal.", true},
-		{"rcs.internal", "rcs.internal", false},
-		{"as.evilrcs.internal", "rcs.internal", false},
-		{"as.rcs.internal", "", false},
-	} {
-		if got := inNamespace(tt.host, tt.ns); got != tt.want {
-			t.Fatalf("inNamespace(%q, %q) = %v", tt.host, tt.ns, got)
-		}
-	}
+// Names in the namespace are checked by runtime.InServiceNamespace; the
+// control API table above shows the relay accepts and refuses them.
+func TestAnIPv4MappedPrivateAddressIsInTheCoreNetworks(t *testing.T) {
 	if !inNetworks(netip.MustParseAddr("::ffff:10.0.0.1"), privateRanges) {
 		t.Fatal("an IPv4-mapped private address is not private")
 	}

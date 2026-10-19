@@ -47,7 +47,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_MAX_AUTH_ITEMS` | `4` | AKA vectors per MAR at most (1 to 16) |
 | `HSS_CX_TIMEOUT` | `3s` | store work per Cx request, waiting for the subscriber's lock included |
 | `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included |
-| `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits |
+| `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits. At most `240s` (see Operations) |
 | `HSS_KEYRING_BOOTSTRAP` | `false` | allow creating a first data key although subscriptions are stored (see [Secrets](#secrets)) |
 | `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and the pushes one provisioning request causes |
 
@@ -222,6 +222,42 @@ selects `Contact`, not `Accept-Contact`); every other pattern matches anywhere i
 its field, so anchor it with `^`/`$` to match a whole value. Request-URI patterns
 ignore case.
 
+A few constructs mean one thing to POSIX and another to the Go engine the S-CSCF
+runs, so the API refuses them with 400, naming the construct:
+
+- a backslash inside brackets (`[\.]com`; write `[.]com` or `\.com`);
+- a backslash before anything but an ERE special character, one of
+  `. [ ] ( ) * + ? { } | ^ $ \`: letters and digits (`\d`, `\w`, `\b`, `\x41`,
+  `\n`, `\1`), which some engines read as classes or escapes, `\<`, `\>`, `` \` ``
+  and `\'`, which glibc and musl read as word or value boundaries, and other
+  punctuation (`\-`, `\@`, `\/`, `\:`). Write `[[:digit:]]`, `[[:space:]]` and
+  so on, or the character itself;
+- collating symbols and equivalence classes (`[[.a.]]`, `[[=a=]]`), and
+  `[[:^alpha:]]`, which is not a class name (write `[^[:alpha:]]`);
+- an interval without a lower bound (`a{,3}`; write `a{0,3}`, or `a\{,3\}` for
+  the text).
+
+A backslash before a special character, such as `\.` or `\+`, is a literal and
+is fine. Named classes such as `[[:alpha:]]` hold ASCII characters only, as in
+the POSIX locale: `[[:alpha:]]` does not match `ä`, and `[^[:upper:]]` does.
+
+A pattern is at most 4 KiB (`MaxPatternBytes`); a longer one is refused with
+400 naming the limit. The limit bounds the time to parse a pattern, which for
+some inputs grows with the square of their length. A profile's patterns
+together may cost at most `MaxSetCompileCost` (1 000 000 units) to compile,
+counted in bytes and instructions processed rather than timed. A profile of
+64 ordinary RCS criteria uses about 92% of it and the default RCS profile
+about 2%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
+development host at load 140 to 230, a profile at the limit took 39 to 48 ms
+of CPU (33 to 70 ms wall) to compile when made of 4 KiB patterns, and about
+2 to 2.3 times as long when made of hundreds of short ones; other hosts and
+loads differ, and the HSS compiles a profile once on each write. A profile
+over it is refused with 400 naming the limit.
+
+The API checks patterns when a profile is written. A profile stored before
+this rule keeps working as it is, and needs these constructs removed when it
+is next changed.
+
 The S-CSCF evaluates a profile for every initial request within a work budget
 (`internal/ifc`, `DefaultMaxWork`) and fails the evaluation of a request the
 budget cannot pay for. Write each condition as a plain header name and a literal
@@ -252,12 +288,19 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
 
 ## Operations
 
-- `/healthz` and `/readyz` are on `RCS_ADMIN_ADDR`; `/readyz` answers "starting"
-  until the store, the keyring and the listeners are up, then checks both tables.
-  No load balancer sends to `hss`, so nothing acts on `/readyz`: a deployment
-  relies on the container health check (`/healthz`, which only says the process
-  runs) and ECS's deployment circuit breaker, which sees a task that exits at
-  `HSS_START_TIMEOUT`.
+- `/healthz` and `/readyz` are on `RCS_ADMIN_ADDR`. Both answer 503 "starting"
+  until the store, the keyring and the listeners are up (`/healthz` waits too,
+  #58); then `/healthz` passes for as long as the process runs and `/readyz`
+  checks both tables. No load balancer sends to `hss`, so nothing acts on
+  `/readyz`: a deployment relies on the container health check (`-healthcheck`,
+  which probes `/healthz`) and ECS's deployment circuit breaker, which sees a
+  task that exits at `HSS_START_TIMEOUT`. ECS ignores failed checks during the
+  health check's `startPeriod` and then marks a task unhealthy after `retries`
+  failures `interval` apart, so `startPeriod + interval × retries` must exceed
+  `HSS_START_TIMEOUT`, or ECS replaces a task that is still starting. The
+  default 60 s start-up fits `startPeriod` 60, `interval` 15, `retries` 3
+  (105 s). `startPeriod` is at most 300 s, so `HSS_START_TIMEOUT` is refused
+  above 240 s.
 - The API logs one `audit: provisioning request` line per request: operation,
   caller, token slot (`current` or `next`), status and the masked IMPI.
 - Metrics: `cx.<command>` (latency), `cx.<command>.<result>` (`e` before an
@@ -270,8 +313,9 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   `api.data_error`.
 - Alarm candidates (Phase 7): `cx.*.error`, `lock.busy`, `api.store_failure`,
   `api.data_error`, `push.*.no_peer`, `push.*.failed`, `aka.sqn_exhausted`,
-  `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency against
-  `HSS_CX_TIMEOUT`.
+  `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency
+  (Maximum, or the average `cx.sar.sum / cx.sar.count`) against
+  `HSS_CX_TIMEOUT` (docs/architecture.md §8 has the rules for EMF alarms).
 - A shared profile's fan-out that a shutdown cuts short logs `profile push cut
   short by shutdown` with how many subscriptions it reached; apply the profile
   again to reach the rest before they register again.
@@ -302,9 +346,10 @@ units, a re-registration about 4 read and 1–2 write units. At ap-northeast-2
 on-demand prices (read $0.1355 and write $0.68 per million units, 2026-10), a
 million registrations cost about $3 in DynamoDB and a million re-registrations
 about $1.5; a million subscribers re-registering every hour, about $1.1k a month,
-and up to six times that for clients on 600 s registrations (ADR 0003). Each Cx request writes two EMF lines (count and
-latency, about 300 bytes each), about 2.4 KB per registration: some 2.4 GB, $1.8
-of log ingestion at $0.76/GB, per million registrations. KMS sees only one
+and up to six times that for clients on 600 s registrations (ADR 0003). Metrics
+cost almost nothing in log ingestion: the runtime aggregates them and writes one
+EMF line per metric a minute, at most a few kilobytes each, however many Cx
+requests a task serves. KMS sees only one
 `Decrypt` per task start.
 
 On a task, the profile work of a SAR, reading the stored profile and writing

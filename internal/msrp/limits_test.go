@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -54,28 +55,58 @@ func TestReassemblyMemoryFollowsReceivedOctetsNotDeclaredRanges(t *testing.T) {
 	}
 }
 
+// fastest runs f three times and returns its shortest time: other work on
+// the host can only lengthen a run, so the shortest is the closest to f's
+// own cost.
+func fastest(f func()) time.Duration {
+	best := time.Duration(1<<63 - 1)
+	for range 3 {
+		start := time.Now()
+		f()
+		best = min(best, time.Since(start))
+	}
+	return best
+}
+
 func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	// 64k one-octet chunks spread over one megabyte message, the input
 	// that is quadratic for a reassembler that keeps every gap.
 	const size = 1 << 20
 	const chunks = 1 << 16
-	msgs := make([]*Message, chunks)
-	for i := range msgs {
+	spread := make([]*Message, chunks)
+	for i := range spread {
 		pos := int64(i)*(size/chunks) + 1
-		msgs[i] = chunkMsg("spread", ByteRange{pos, pos, Unknown}, "s", FlagMore)
+		spread[i] = chunkMsg("spread", ByteRange{pos, pos, Unknown}, "s", FlagMore)
 	}
-	r := Reassembler{MaxSize: size}
+	// The same number of one-octet chunks in order, which costs the same
+	// for every chunk: the yardstick for the spread.
+	inOrder := make([]*Message, chunks)
+	for i := range inOrder {
+		pos := int64(i) + 1
+		inOrder[i] = chunkMsg("inorder", ByteRange{pos, pos, Unknown}, "s", FlagMore)
+	}
 	refused, maxHeld := 0, int64(0)
-	start := time.Now()
-	n := allocated(func() {
-		for _, m := range msgs {
-			if _, err := r.Add(m, t0); err != nil {
-				refused++
+	var n uint64
+	spreadTime := fastest(func() {
+		r := Reassembler{MaxSize: size}
+		refused, maxHeld = 0, 0
+		n = allocated(func() {
+			for _, m := range spread {
+				if _, err := r.Add(m, t0); err != nil {
+					refused++
+				}
+				maxHeld = max(maxHeld, r.Buffered())
 			}
-			maxHeld = max(maxHeld, r.Buffered())
+		})
+	})
+	baseTime := fastest(func() {
+		r := Reassembler{MaxSize: size}
+		for _, m := range inOrder {
+			if _, err := r.Add(m, t0); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
-	elapsed := time.Since(start)
 	// The 65th gap is refused and the message dropped, so it starts over;
 	// at most one fragment limit's worth is ever held.
 	if refused < chunks/(DefaultMaxFragments+1)-1 || maxHeld > DefaultMaxFragments {
@@ -84,10 +115,15 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	if n > 32<<20 {
 		t.Fatalf("%d bytes allocated for %d one-octet chunks", n, chunks)
 	}
-	// Generous enough for a loaded CI runner; the quadratic version takes
-	// tens of seconds here.
-	if elapsed > 2*time.Second {
-		t.Fatalf("%d chunks took %v", chunks, elapsed)
+	// Time relative to a yardstick measured in the same run, so that a
+	// loaded host or the race detector, which slow both alike, do not
+	// matter. Per chunk the spread costs a few times an in-order chunk
+	// (it holds up to a fragment limit of gaps); a reassembler whose cost
+	// grows with the gaps or the declared size is hundreds of times
+	// slower.
+	t.Logf("spread %v, in order %v (%.1fx)", spreadTime, baseTime, float64(spreadTime)/float64(baseTime))
+	if spreadTime > 25*baseTime {
+		t.Fatalf("%d spread chunks took %v, %d in order %v", chunks, spreadTime, chunks, baseTime)
 	}
 }
 
@@ -652,6 +688,45 @@ func TestURIsPrintWithoutTheirSessionID(t *testing.T) {
 	}
 }
 
+func TestClientAddressesInURIsAreLoggedAsTheirNetwork(t *testing.T) {
+	// A client's a=path names the UE's address (#80); like sip's hosts,
+	// every IP address is logged as its /24 or /48 without the port, and a
+	// name is kept.
+	for _, tt := range []struct{ uri, want string }{
+		{"msrp://198.51.100.23:49152/s3cr3tsess10n;tcp", "msrp://198.51.100.0/24/[redacted];tcp"},
+		{"msrps://10.20.30.40:2856/s3cr3tsess10n;tcp", "msrps://10.20.30.0/24/[redacted];tcp"},
+		{"msrp://[2001:db8:5:6::17]:2855/s3cr3tsess10n;tcp", "msrp://[2001:db8:5::/48]/[redacted];tcp"},
+		{"msrp://[::ffff:198.51.100.23]:2855/s3cr3tsess10n;tcp", "msrp://198.51.100.0/24/[redacted];tcp"},
+		{"msrp://192.000.002.001:2855/s3cr3tsess10n;tcp", "msrp://192.0.2.0/24/[redacted];tcp"},
+		{"msrp://relay.example.com:2855/s3cr3tsess10n;tcp", "msrp://relay.example.com:2855/[redacted];tcp"},
+		// Parameters are the client's text and could name the address
+		// again (security review of #98): only the transport is kept.
+		{"msrp://198.51.100.23:1/s;tcp;x=198.51.100.23;y", "msrp://198.51.100.0/24/[redacted];tcp"},
+	} {
+		u := mustURI(t, tt.uri)
+		if got := u.Redacted(); got != tt.want {
+			t.Errorf("Redacted(%s) = %q, want %q", tt.uri, got, tt.want)
+		}
+	}
+	// The same in a message's paths, as every log line shows them.
+	m := &Message{TransactionID: "t1", Method: MethodSend,
+		ToPath:   []URI{mustURI(t, "msrp://relay.example.com:2855/r3l4ysess;tcp")},
+		FromPath: []URI{mustURI(t, "msrp://198.51.100.23:49152/s3cr3tsess10n;tcp")}}
+	var logged bytes.Buffer
+	untimedJSONLogger(&logged).Info("x", "msg", m)
+	if strings.Contains(logged.String(), `"time"`) {
+		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", logged.String())
+	}
+	for _, out := range []string{logged.String(), fmt.Sprint(m)} {
+		if strings.Contains(out, "198.51.100.23") || strings.Contains(out, "49152") {
+			t.Errorf("the client's address is logged: %s", out)
+		}
+		if !strings.Contains(out, "198.51.100.0/24") {
+			t.Errorf("the client's network is lost: %s", out)
+		}
+	}
+}
+
 func TestMessagesPrintWithoutBodiesOrSessionIDs(t *testing.T) {
 	m := &Message{TransactionID: "l0gged", Method: MethodSend, ToPath: []URI{mustURI(t, asURI)}, FromPath: []URI{mustURI(t, clientURI)},
 		MessageID: "msg1", ByteRange: &ByteRange{1, 15, 15}, ContentType: "text/plain",
@@ -749,4 +824,16 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	case <-time.After(hangGuard):
 		t.Fatal("a session with an empty window waited for the stalled ones")
 	}
+}
+
+// untimedJSONLogger writes JSON lines without the time attribute, so that a
+// test searching a line for leaked digits cannot find them in the
+// timestamp's nanoseconds (#99).
+func untimedJSONLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
 }

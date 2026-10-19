@@ -81,9 +81,13 @@ internal/
   msrprelay/store/          binding store interface, memory backend, storetest
                             contract
   msrprelay/dynamostore/    msrp-relay DynamoDB backend (`msrp-bindings`)
-deploy/                     Dockerfile (service image), toolchain.Dockerfile
+deploy/                     Dockerfile (service image), toolchain.Dockerfile,
+                            docker-compose.yml (the local stack, docs/local-stack.md)
+                            and stack-init.Dockerfile (its bootstrap)
 infra/                      CloudFormation (empty until Phase 7)
-scripts/                    fuzz, privacy and docs-link checks
+scripts/                    fuzz, privacy and docs-link checks, compose-env.sh
+tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
+tools/stack-init/           creates the local stack's tables and seeds its test subscriber
 docs/                       this file, ADRs, threat model, service docs
                             (ft-server.md, msrp-relay.md), api/ (OpenAPI)
 ```
@@ -95,10 +99,8 @@ internal/sip/transport/     UDP, TCP and TLS listeners and connection table (flo
 internal/sip/transaction/   client and server transaction state machines and timers
 internal/<service>/         pcscf/, icscf/, scscf/, hss/, rcsas/: service logic,
                             each with its own store/ and AWS backend as above
-deploy/docker-compose.yml   the full local stack
 infra/                      ecr.yaml, platform.yaml
 scripts/                    deploy.sh, teardown.sh
-tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
 docs/                       runbook, conformance, aws-deployment.md
 ```
 
@@ -203,7 +205,7 @@ through the NLB to a surviving task. Every other service is stateless apart from
 its tables.
 
 Every table has a memory backend for unit tests and local runs; the compose stack
-uses DynamoDB Local and a local S3.
+([local-stack.md](local-stack.md)) uses DynamoDB Local and S3Mock.
 
 ## 8. Cross-cutting rules
 
@@ -212,13 +214,39 @@ uses DynamoDB Local and a local S3.
   (memory store, no TLS on the public listener, no admin token) refuses to start
   when `RCS_ENV` is `staging` or `prod`.
 - **Logging**: JSON lines through `log/slog`. SIP URIs, `tel:` URIs, IMSI, IMEI and
-  MSISDN pass through `internal/pii` before they are logged. Message bodies,
+  MSISDN pass through `internal/pii` before they are logged. Client IP
+  addresses, private ones included, are logged only as their network, through
+  `pii.ClientIP` or the sip and msrp log values (IPv4 /24, IPv6 /48). Message bodies,
   credentials, nonces, RAND/AUTN, keys and tokens are never logged.
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
-  needed. No identifier is ever a metric dimension.
+  needed. They are aggregated in memory and written once a minute, when
+  shutdown starts and when it ends, one line per metric, so log volume does
+  not grow with traffic; a crash loses at most the last minute. Counts are
+  sums and gauges the last value. A timing is written as at most 100 values
+  (every value, or quantiles within the exact minimum and maximum) with
+  companions `<name>.count` and `<name>.sum` holding its exact number and
+  total. No identifier is ever a metric dimension. Alarms on these metrics:
+  - use a period of 60 s or more and M of N datapoints with N of 2 or more:
+    a minute's values arrive up to a minute late, stamped when written, and a
+    task's flushes are not aligned to the minute;
+  - set `treatMissingData` explicitly: a task writes no line for a count
+    nothing incremented, so for counts missing means zero;
+  - alarm on latency with a timing's Maximum, which is exact, with the
+    exact average `<name>.sum / <name>.count` by metric math, or with the
+    Count of timeouts and errors. Never use a timing's SampleCount, Sum or
+    Average, which describe at most 100 values per task and minute, and
+    treat its percentiles with care: with `Service` as the only dimension
+    CloudWatch pools every task's values, so they weigh each task's minute
+    alike, not each request, and a slow task serving most requests can hide
+    behind fast idle ones;
+  - alarm on `EMFValidationErrors` and `EMFParsingErrors` (namespace
+    `AWS/Logs`) for each service's log group: a line CloudWatch cannot
+    extract loses a whole minute of that metric.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
-  distroless image can run an ECS container health check.
+  distroless image can run an ECS container health check. A service whose
+  start-up waits on remote services and ends at a start-up deadline (hss) sets
+  `Service.LiveAfterReady`, so that `/healthz` fails until it is ready.
 - **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
   linear in its input (a test parses a maximum-size adversarial input), and never
   repairs content it does not own: message bodies such as CPIM and MSRP payloads

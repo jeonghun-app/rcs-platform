@@ -207,7 +207,10 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	if f.conn == nil {
 		return t.sendDatagram(f.lis, f.remote, b)
 	}
-	r := f.q.push(b, wait, t.cfg.WriteTimeout)
+	// One deadline covers the whole send, the retry after shedding included,
+	// so a waiting sender blocks for at most WriteTimeout.
+	deadline := time.Now().Add(t.cfg.WriteTimeout)
+	r := f.q.push(b, wait, deadline)
 	if r == overBudget {
 		// Every queue together is at Config.MaxQueuedBytes. Make room by closing
 		// a connection whose peer has stopped reading, if there is one, and try
@@ -215,11 +218,11 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 		// never closed for the budget: it may be perfectly healthy.
 		if t.shedStalledQueue(f) {
 			t.stats.budgetSheds.Add(1)
-			r = f.q.push(b, wait, t.cfg.WriteTimeout)
+			r = f.q.push(b, wait, deadline)
 		}
 		if r == overBudget {
 			t.stats.budgetRefusals.Add(1)
-			return ErrQueueFull
+			return errBudgetFull
 		}
 	}
 	switch r {
@@ -229,7 +232,7 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 		return ErrNoFlow
 	case waitTimedOut:
 		t.stats.queueWaitTimeouts.Add(1)
-		return ErrQueueFull
+		return errNoRoom
 	}
 	// A NoWait message did not fit even in the reserve: the reading goroutine
 	// cannot wait, and the peer is not taking what we send.
@@ -237,6 +240,17 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	t.closeFlow(f)
 	return errQueueOverflow
 }
+
+// The two reasons a send fails with the connection left open. Both are
+// ErrQueueFull to callers; SendResponse tells them apart, because only the
+// first says anything about the peer the response is for.
+var (
+	// errNoRoom: this connection's own queue had no room within WriteTimeout.
+	errNoRoom = fmt.Errorf("%w: no room in the connection's queue within WriteTimeout", ErrQueueFull)
+	// errBudgetFull: every queue together was at MaxQueuedBytes and no stalled
+	// connection could be closed to make room.
+	errBudgetFull = fmt.Errorf("%w: transport-wide budget full", ErrQueueFull)
+)
 
 // errQueueOverflow reports that the transport closed a connection whose send
 // queue overflowed, so callers that test for ErrNoFlow (and answer 430) see it.
@@ -266,17 +280,28 @@ func (a shedRank) before(b shedRank) bool {
 	return a.stalled > b.stalled
 }
 
+// shedScanInterval bounds how often shedStalledQueue looks at every flow. A
+// scan of a few thousand flows takes some hundreds of microseconds under the
+// flow table's lock, and a full budget refuses sends in bursts; one scan per
+// interval keeps that to a fraction of a percent of one core, and a stalled
+// peer that one scan missed is still stalled at the next.
+const shedScanInterval = 100 * time.Millisecond
+
 // shedStalledQueue closes the best candidate for shedding other than except and
-// reports whether there was one. A connection with nothing queued, or whose
-// writer made progress within shedGrace, is never a candidate. It looks at
-// every stream flow, which is fine for the rare moment the budget runs out.
+// reports whether it closed one. A connection with nothing queued, already
+// closing, or whose writer made progress within shedGrace, is never a
+// candidate. It scans every stream flow, at most once per shedScanInterval.
 func (t *Transport) shedStalledQueue(except *flow) bool {
 	now := time.Now()
+	last := t.lastShedScan.Load()
+	if now.UnixNano()-last < int64(shedScanInterval) || !t.lastShedScan.CompareAndSwap(last, now.UnixNano()) {
+		return false
+	}
 	grace := t.shedGrace()
 	var victim *flow
 	var best shedRank
 	for _, f := range t.flows.streams() {
-		if f == except {
+		if f == except || f.closed.Load() {
 			continue
 		}
 		queued, idle := f.q.stall(now)
@@ -288,11 +313,9 @@ func (t *Transport) shedStalledQueue(except *flow) bool {
 			victim, best = f, r
 		}
 	}
-	if victim == nil {
-		return false
-	}
-	t.closeFlow(victim)
-	return true
+	// The victim may have started closing since it was looked at; then the
+	// shed freed nothing and the send is refused.
+	return victim != nil && t.closeFlow(victim)
 }
 
 // startWriter gives a stream flow its send queue and writer goroutine. It is

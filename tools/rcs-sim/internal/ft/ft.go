@@ -452,6 +452,11 @@ func (c *Client) UploadInfo(ctx context.Context, tid string) (ResumeDocument, er
 // ErrNothingHeld is get_upload_info's 404: start the upload again.
 var ErrNothingHeld = errors.New("ft: the server holds nothing of the upload")
 
+// ErrNotSettled is SettledUploadInfo's answer when the bytes held were still
+// changing as its time ran out: the server is still storing the broken
+// upload, and a resume now would likely get 409 or 503.
+var ErrNotSettled = errors.New("ft: the server is still storing the broken upload")
+
 // Settled says how SettledUploadInfo got its answer: how often it asked
 // again, and how many answers were 404.
 type Settled struct {
@@ -460,15 +465,27 @@ type Settled struct {
 
 // SettledUploadInfo is the simulator's own wait, not rcsjta's. A device
 // asks get_upload_info once it is back on a network, seconds after the
-// break; a test asks at once, before the server may have noticed the break
-// and stored what it keeps. So this asks every poll until two answers in a
-// row name the same bytes held. A 404 is asked again until within has
-// passed, and then returned as ErrNothingHeld.
-func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll time.Duration) (ResumeDocument, Settled, error) {
+// break; a test asks at once, before the server may have noticed the break,
+// stored what it keeps and released the upload. So this asks every poll
+// until the same bytes held have been reported for at least quiet: two
+// answers in a row can agree while the server still holds the upload, and
+// a resume then gets 503. The quiet time runs from the request that first
+// got the value to the request that gets it again, so it is time the server
+// held the value, however slowly the answers came. A 404 is asked again until
+// within has passed, and then returned as ErrNothingHeld. Bytes held that are
+// still changing when within has passed are returned with ErrNotSettled.
+//
+// Nothing the server sends says the upload is released: its lease lasts
+// minutes when the process holding it dies, and ft-server's upload-info
+// document is RCC.07's, which has no such field. The quiet time is what a
+// device's reconnection gives the server anyway.
+func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll, quiet time.Duration) (ResumeDocument, Settled, error) {
 	var st Settled
 	deadline := time.Now().Add(within)
 	last := int64(-1)
+	var since time.Time
 	for {
+		asked := time.Now()
 		info, err := c.UploadInfo(ctx, tid)
 		held := int64(-1)
 		switch {
@@ -478,12 +495,17 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 			return info, st, err
 		default:
 			held, _ = info.Held()
-			if held == last {
+			if held == last && asked.Sub(since) >= quiet {
 				return info, st, nil
 			}
 		}
-		last = held
+		if held != last {
+			last, since = held, asked
+		}
 		if time.Now().After(deadline) {
+			if err == nil {
+				err = ErrNotSettled
+			}
 			return info, st, err
 		}
 		if err := sleep(ctx, poll); err != nil {
@@ -575,7 +597,7 @@ func (c *Client) Download(ctx context.Context, link, rangeHeader string, max int
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return Downloaded{}, fmt.Errorf("ft: download: %w", safeerr.Reason(err))
+		return Downloaded{}, fmt.Errorf("ft: download: %w", safeerr.Body(err))
 	}
 	if int64(len(body)) > max {
 		return Downloaded{}, errors.New("ft: download larger than expected")
@@ -665,7 +687,7 @@ func readFileDocument(resp *http.Response, op string) (FileDocument, error) {
 func decode(r io.Reader, v any) error {
 	data, err := io.ReadAll(io.LimitReader(r, maxDocument+1))
 	if err != nil {
-		return safeerr.Reason(err)
+		return safeerr.Body(err)
 	}
 	if len(data) > maxDocument {
 		return errors.New("document too large")

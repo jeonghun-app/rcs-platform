@@ -162,21 +162,21 @@ func FuzzHeaderValues(f *testing.F) {
 		{"From", func(h *Header) (any, error) { return h.From() }, func(v any) []string { return []string{v.(Address).String()} }},
 		{"Contact", func(h *Header) (any, error) { return h.Contact() }, func(v any) []string {
 			var out []string
-			for _, c := range v.([]Contact) {
+			for _, c := range v.(Contacts) {
 				out = append(out, c.String())
 			}
 			return join(out)
 		}},
 		{"Route", func(h *Header) (any, error) { return h.Route() }, func(v any) []string {
 			var out []string
-			for _, a := range v.([]Address) {
+			for _, a := range v.(Addresses) {
 				out = append(out, a.String())
 			}
 			return join(out)
 		}},
 		{"Via", func(h *Header) (any, error) { return h.Via() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]Via) {
+			for _, x := range v.(Vias) {
 				out = append(out, x.String())
 			}
 			return join(out)
@@ -193,7 +193,7 @@ func FuzzHeaderValues(f *testing.F) {
 		}},
 		{"Accept-Contact", func(h *Header) (any, error) { return h.AcceptContact() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]AcceptContact) {
+			for _, x := range v.(AcceptContacts) {
 				out = append(out, x.String())
 			}
 			return join(out)
@@ -204,21 +204,21 @@ func FuzzHeaderValues(f *testing.F) {
 		{"Min-SE", func(h *Header) (any, error) { return h.MinSE() }, func(v any) []string { return []string{v.(MinSE).String()} }},
 		{"Reason", func(h *Header) (any, error) { return h.Reason() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]Reason) {
+			for _, x := range v.(Reasons) {
 				out = append(out, x.String())
 			}
 			return join(out)
 		}},
 		{"WWW-Authenticate", func(h *Header) (any, error) { return h.WWWAuthenticate() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]Challenge) {
+			for _, x := range v.(Challenges) {
 				out = append(out, x.String())
 			}
 			return out
 		}},
 		{"Authorization", func(h *Header) (any, error) { return h.Authorization() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]Credentials) {
+			for _, x := range v.(CredentialsList) {
 				out = append(out, x.String())
 			}
 			return out

@@ -1,17 +1,23 @@
 package hss
 
 import (
+	"encoding/json"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/hss/ifcjson"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 )
 
 func TestDefaultProfileEvaluatesWithinHalfTheWorkBudget(t *testing.T) {
-	p := DefaultRCSProfile(DefaultProfileID, asURI)
-	if err := checkWork(p.Criteria, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2}); err != nil {
+	set, err := ifc.Compile(DefaultRCSProfile(DefaultProfileID, asURI).Criteria)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkWork(set, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2}); err != nil {
 		t.Fatalf("the default profile needs more than half the S-CSCF's budget: %v", err)
 	}
 }
@@ -87,6 +93,48 @@ func TestProfileBeyondTheWorkBudgetIsRefusedWithTheLimitName(t *testing.T) {
 	}
 }
 
+func TestProfileWithAPatternGoReadsDifferentlyFromPOSIXIsRefusedNamingTheConstruct(t *testing.T) {
+	a := newAPIEnv(t)
+	// The contents are JSON strings, so each backslash is written twice.
+	for content, construct := range map[string]string{
+		`[\\.]com`: "a backslash inside a bracket expression",
+		`\\x41`:    `the escape \x`,
+	} {
+		profile := `{"id":"corner","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+			`{"group":[0],"sip_header":{"header":"Subject","content":"` + content + `"}}]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}]}`
+		code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
+		if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, construct) {
+			t.Errorf("%s: %d %v, want 400 naming %s", content, code, body, construct)
+		}
+	}
+}
+
+func TestProfileWithAPatternOverMaxPatternBytesIsRefusedNamingTheLimit(t *testing.T) {
+	a := newAPIEnv(t)
+	profile := `{"id":"long","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+		`{"group":[0],"sip_header":{"header":"Subject","content":"` + strings.Repeat("a", ifc.MaxPatternBytes+1) + `"}}]},` +
+		`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}]}`
+	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
+	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxPatternBytes") {
+		t.Fatalf("%d %v, want 400 naming MaxPatternBytes", code, body)
+	}
+}
+
+func TestProfileCostlierToCompileThanMaxSetCompileCostIsRefusedNamingTheLimit(t *testing.T) {
+	a := newAPIEnv(t)
+	items := make([]string, 12)
+	for i := range items {
+		items[i] = `{"priority":` + strconv.Itoa(i+1) + `,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+			`{"group":[0],"request_uri":"` + strings.Repeat("[^a]", ifc.MaxPatternBytes/4) + `"}]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}`
+	}
+	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, `{"id":"slow","initial_filter_criteria":[`+strings.Join(items, ",")+`]}`)
+	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxSetCompileCost") {
+		t.Fatalf("%d %v, want 400 naming MaxSetCompileCost", code, body)
+	}
+}
+
 func TestCostlyProfileIsAcceptedWithAWarning(t *testing.T) {
 	a := newAPIEnv(t)
 	// Two counted repetitions over the 2 KB Contact cost about 340 000
@@ -113,5 +161,77 @@ func TestCostlyProfileIsAcceptedWithAWarning(t *testing.T) {
 		stringify(profileResponse(DefaultRCSProfile(DefaultProfileID, asURI), nil).profileJSON))
 	if resp["warnings"] != nil {
 		t.Errorf("default profile warnings = %v", resp["warnings"])
+	}
+}
+
+// A write compiles the profile's criteria once (#120): the work check, the
+// store's validation and the cost warning use the compiled set instead of
+// compiling again, where they used to compile it four times. The warning
+// still comes, so the set it needs was there.
+func TestAProfileWriteCompilesItsCriteriaOnce(t *testing.T) {
+	a := newAPIEnv(t)
+	compiles := 0
+	compileProfile = func(criteria []ifc.FilterCriteria) (*ifc.Set, error) {
+		compiles++
+		return ifc.Compile(criteria)
+	}
+	t.Cleanup(func() { compileProfile = ifc.Compile })
+	spt := `{"group":[0],"sip_header":{"header":"Contact","content":"x[ab]{160}y"}}`
+	crit := func(p string) string {
+		return `{"priority":` + p + `,"trigger_point":{"condition_type_cnf":false,"spt":[` + spt + `]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}`
+	}
+	body := `{"id":"once","initial_filter_criteria":[` + crit("1") + `,` + crit("2") + `]}`
+	for _, w := range []struct{ method, path string }{{"POST", "/v1/service-profiles"}, {"PUT", "/v1/service-profiles/once"}} {
+		compiles = 0
+		code, resp, _ := a.do(w.method, w.path, adminToken, body)
+		if code != http.StatusCreated && code != http.StatusOK {
+			t.Fatalf("%s = %d %v", w.method, code, resp)
+		}
+		if warnings, _ := resp["warnings"].([]any); len(warnings) != 1 {
+			t.Fatalf("%s: warnings %v, want the cost warning", w.method, resp["warnings"])
+		}
+		if compiles != 1 {
+			t.Errorf("%s compiled the criteria %d times, want once", w.method, compiles)
+		}
+	}
+}
+
+// compileProfile is the only compile of a write (#120): its criteria do not
+// compile, so any other compile (ToIFC, the store, the cost warning) would
+// refuse them, while the injected compile hands over a set compiled from
+// costly but valid criteria, whose cost warning must come back (QA's test
+// from the review of #125).
+func TestTheInjectedCompileIsTheOnlyCompileOfAWrite(t *testing.T) {
+	a := newAPIEnv(t)
+	var valid []ifc.FilterCriteria
+	for _, p := range []int{1, 2} {
+		valid = append(valid, ifc.FilterCriteria{Priority: p,
+			TriggerPoint:      &ifc.TriggerPoint{SPTs: []ifc.SPT{{Groups: []int{0}, Condition: ifc.SIPHeader{Header: "Contact", Content: "x[ab]{160}y"}}}},
+			ApplicationServer: ifc.ApplicationServer{ServerName: asURI, DefaultHandling: ifc.SessionContinued}})
+	}
+	compiles := 0
+	compileProfile = func([]ifc.FilterCriteria) (*ifc.Set, error) { compiles++; return ifc.Compile(valid) }
+	t.Cleanup(func() { compileProfile = ifc.Compile })
+	bad := ifcjson.FromIFC(valid)
+	u := "(unclosed"
+	bad[0].TriggerPoint.SPTs[0] = ifcjson.SPT{Groups: []int{0}, RequestURI: &u}
+	enc, err := json.Marshal(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"id":"once","initial_filter_criteria":` + string(enc) + `}`
+	for _, w := range []struct{ method, path string }{{"POST", "/v1/service-profiles"}, {"PUT", "/v1/service-profiles/once"}} {
+		compiles = 0
+		code, resp, _ := a.do(w.method, w.path, adminToken, body)
+		if code != http.StatusCreated && code != http.StatusOK {
+			t.Fatalf("%s = %d %v: something besides compileProfile compiled the criteria", w.method, code, resp)
+		}
+		if ws, _ := resp["warnings"].([]any); len(ws) != 1 || !strings.Contains(ws[0].(string), "MaxWork") {
+			t.Fatalf("%s: warnings %v, want the cost warning of the injected set", w.method, resp["warnings"])
+		}
+		if compiles != 1 {
+			t.Errorf("%s: %d compiles, want 1", w.method, compiles)
+		}
 	}
 }

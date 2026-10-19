@@ -3,20 +3,17 @@
 package e2e
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
 )
 
 // The stack's test identities: an IMPI of the MCC 001 test network (on the
@@ -29,25 +26,15 @@ const (
 	// rule), so the resume file is a little over one part.
 	partSize   = 5 << 20
 	resumeSize = partSize + 1<<20
-	// maxInfoRetries bounds how often ft-resume asks get_upload_info again
-	// while ft-server notices the break (100 ms apart): a server that is
-	// slow to keep a broken upload fails here instead of passing on retries.
-	maxInfoRetries = 10
 )
 
-// result is one line of rcs-sim's output.
-type result struct {
-	Scenario string           `json:"scenario"`
-	Step     string           `json:"step"`
-	OK       bool             `json:"ok"`
-	Error    string           `json:"error"`
-	Detail   map[string]int64 `json:"detail"`
-}
-
 func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
-	bin := build(t)
+	bin := build(t, "./cmd/ft-server", "./cmd/msrp-relay", "./tools/rcs-sim")
 
-	ftPort, ftAdmin := freePort(t), freePort(t)
+	// Every port at once, so no two are the same (QA on #127).
+	ports := simtest.FreePorts(t, 5)
+	port := func(i int) string { return strconv.Itoa(ports[i]) }
+	ftPort, ftAdmin := port(0), port(1)
 	start(t, bin, "ft-server", ftAdmin, map[string]string{
 		"FT_LISTEN_ADDR":    "127.0.0.1:" + ftPort,
 		"FT_UPLOAD_URI":     "http://127.0.0.1:" + ftPort + "/ft",
@@ -60,7 +47,10 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		"FT_SWEEP_INTERVAL": "1h",
 	})
 
-	public, control, relayAdmin, core := freePort(t), freePort(t), freePort(t), freePort(t)
+	public, control, relayAdmin := port(2), port(3), port(4)
+	// rcs-sim's rcs-as stand-in listens here, below the ephemeral range,
+	// where no outgoing connection or FreePorts pick can take it (#133).
+	core := strconv.Itoa(simtest.StandInPort(t))
 	start(t, bin, "msrp-relay", relayAdmin, map[string]string{
 		"RELAY_LISTEN_ADDR":   "127.0.0.1:" + public,
 		"RELAY_CONTROL_ADDR":  "127.0.0.1:" + control,
@@ -90,71 +80,20 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	t.Logf("rcs-sim output:\n%s%s", stdout.String(), stderr.String())
+	// A failed run is still checked: its error strings are where an
+	// address would leak.
 	if err != nil {
-		t.Fatalf("rcs-sim: %v", err)
+		t.Errorf("rcs-sim: %v", err)
 	}
 
-	out := stdout.String() + stderr.String()
-	seen := map[string]result{}
-	sc := bufio.NewScanner(&stdout)
-	for sc.Scan() {
-		var r result
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			t.Fatalf("not a result line: %q", sc.Text())
-		}
-		if !r.OK {
-			t.Errorf("%s/%s: %s", r.Scenario, r.Step, r.Error)
-		}
-		seen[r.Scenario+"/"+r.Step] = r
-	}
-	for _, want := range []string{
+	checkResults(t, stdout.String(), stderr.String(), []string{
 		"ft/upload", "ft/download", "ft/download-range", "ft/download-resume", "ft/download-thumbnail",
 		"ft-resume/interrupted-upload", "ft-resume/get_upload_info", "ft-resume/resume", "ft-resume/download",
 		"chat-client-originated/client-to-core", "chat-client-originated/core-to-client", "chat-client-originated/keep-alive",
 		"chat-client-originated/release",
 		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/client-to-core",
 		"chat-core-originated/release",
-	} {
-		if _, ok := seen[want]; !ok {
-			t.Errorf("step %s did not run", want)
-		}
-	}
-	// The parts of the broken upload were kept: rcsjta would have uploaded
-	// the whole file again.
-	if _, ok := seen["ft-resume/upload-again"]; ok {
-		t.Error("ft-resume uploaded again: ft-server kept nothing of the broken upload")
-	}
-	if info := seen["ft-resume/get_upload_info"]; info.Detail["retries"] > maxInfoRetries {
-		t.Errorf("get_upload_info asked again %d times (%d of them 404), more than %d: ft-server is slow to keep a broken upload",
-			info.Detail["retries"], info.Detail["not_held"], maxInfoRetries)
-	}
-	// Nothing on an idle stack is busy: a retry rcsjta would make here
-	// would hide an overloaded or misconfigured ft-server.
-	for name, r := range seen {
-		if n := r.Detail["busy_retries"]; n != 0 {
-			t.Errorf("%s: %d upload POSTs sent again after 503", name, n)
-		}
-	}
-	// The same rule as the unit tests' (scenario_test.go): no secret, test
-	// number, URL or address, on either stream.
-	for _, leak := range []string{ftPassword, relayToken, ftUser, "15550100001", "15550100002", "http://", "msrp://", "127.0.0.1"} {
-		if strings.Contains(out, leak) {
-			t.Errorf("rcs-sim printed %q", leak)
-		}
-	}
-}
-
-// build compiles the three binaries into a temporary directory.
-func build(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	cmd := exec.Command("go", "build", "-o", dir, "./cmd/ft-server", "./cmd/msrp-relay", "./tools/rcs-sim")
-	cmd.Dir = filepath.Join("..", "..", "..")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	return dir
+	}, ftPassword, relayToken, ftUser, "127.0.0.1")
 }
 
 // start runs one service binary with env and the shared settings of a test
@@ -172,8 +111,16 @@ func start(t *testing.T, bin, name, admin string, env map[string]string) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	// Closed when the process has exited, with exitErr set, so the wait
+	// for readiness and the cleanup can both see it. A channel holding the
+	// one result let the readiness wait take it, and the cleanup then
+	// waited for ever (#139, the same as #107).
+	exited := make(chan struct{})
+	var exitErr error
+	go func() {
+		exitErr = cmd.Wait()
+		close(exited)
+	}()
 	t.Cleanup(func() {
 		_ = cmd.Process.Signal(os.Interrupt)
 		select {
@@ -196,8 +143,8 @@ func start(t *testing.T, bin, name, admin string, env map[string]string) {
 			}
 		}
 		select {
-		case err := <-exited:
-			t.Fatalf("%s exited: %v\n%s", name, err, logs.String())
+		case <-exited:
+			t.Fatalf("%s exited: %v\n%s", name, exitErr, logs.String())
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -205,16 +152,4 @@ func start(t *testing.T, bin, name, admin string, env map[string]string) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-}
-
-// freePort returns a loopback port nothing listens on now; the services
-// must be told their ports before they start.
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
 }

@@ -233,16 +233,19 @@ that clients are not all cut at once on a rolling update.
 ## Metrics
 
 EMF lines through `internal/runtime`, with `Service` as the only dimension.
-Counters accumulate and are written every `RELAY_METRICS_INTERVAL`, so a busy
-relay writes a few dozen lines a minute, not one per event. Names come from
-fixed sets and never carry an identifier.
+Counters accumulate in the relay and are handed to the runtime every
+`RELAY_METRICS_INTERVAL`; the runtime writes one line per metric a minute
+(docs/architecture.md §8), so a busy relay writes a few dozen lines a minute,
+not one per event. Counts handed over within a minute are summed; the gauges
+are the last value, so a `RELAY_METRICS_INTERVAL` shorter than a minute does
+not multiply them. Names come from fixed sets and never carry an identifier.
 
 | Metric | Kind | Meaning |
 |---|---|---|
 | `BindingsCreated`, `BindingsReleased` | count | control API POST and DELETE |
 | `BindingsClaimed` | count | bindings a client connection claimed |
 | `BindingsExpired` | count | bridges ended because their binding expired or was released |
-| `ActiveBridges`, `ClientConnections` | gauge, written every interval | use Average or Maximum |
+| `ActiveBridges`, `ClientConnections` | gauge, the last value of each minute | use Average or Maximum |
 | `BytesFromClients`, `BytesToClients` | Bytes | octets on client connections, MSRP framing included |
 | `ProxyHealthChecks` | count | PROXY `LOCAL` connections |
 | `ClientsClosedIdle` | count | client connections closed by `RELAY_IDLE_TIMEOUT` |
@@ -375,8 +378,12 @@ answers 503 from the start of the stop.
   into that session (T3). Only the client-side id is hashed. Read access to
   the table must therefore be the relay task role's alone, and table exports
   stay off. Phase 7 IAM and policy tests check both.
-- Logs carry binding ids, never URIs, session ids, message bodies or client
-  addresses (#36 tracks address truncation platform-wide).
+- Logs carry binding ids, never session ids, message bodies or client
+  addresses. An MSRP URI that reaches a log (`internal/msrp`'s log values,
+  for example a client's `a=path` in a message's `From-Path`) shows an IP
+  address host as its network only, IPv4 /24 or IPv6 /48 without the port,
+  as SIP's hosts do (#36, #80). A client's source address is not logged. A
+  log of it must go through `pii.ClientIP`.
 
 ## Testing
 

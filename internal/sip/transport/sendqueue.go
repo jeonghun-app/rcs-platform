@@ -129,27 +129,27 @@ func (q *sendQueue) tryPush(b []byte, max int) pushResult {
 }
 
 // push queues b. A NoWait push may fill the queue to twice its limit; another
-// push waits up to timeout for the queue to drop below its limit. Neither waits
-// for the transport's budget.
-func (q *sendQueue) push(b []byte, wait bool, timeout time.Duration) pushResult {
+// push waits until deadline for the queue to drop below its limit. Neither
+// waits for the transport's budget.
+func (q *sendQueue) push(b []byte, wait bool, deadline time.Time) pushResult {
 	if !wait {
 		return q.tryPush(b, 2*q.limit)
 	}
-	var deadline <-chan time.Time
+	var expired <-chan time.Time
 	for {
 		if r := q.tryPush(b, q.limit); r != queueFull {
 			return r
 		}
-		if deadline == nil {
-			t := time.NewTimer(timeout)
+		if expired == nil {
+			t := time.NewTimer(time.Until(deadline))
 			defer t.Stop()
-			deadline = t.C
+			expired = t.C
 		}
 		select {
 		case <-q.room:
 		case <-q.done:
 			return queueGone
-		case <-deadline:
+		case <-expired:
 			return waitTimedOut
 		}
 	}

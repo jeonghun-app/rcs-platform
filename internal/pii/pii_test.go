@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // Test identifiers come from .github/allowed-test-identifiers.txt: IMSIs from the
@@ -295,12 +298,15 @@ func TestPackageFunctionsUseTheDefaultRedactor(t *testing.T) {
 
 func TestAttributesNeverCarryTheRawValueIntoALogLine(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	log := untimedJSONLogger(&buf)
 	log.Info("registered",
 		URI("impu", "sip:"+testMSISDN+"@"+testDomain),
 		Identity("impi", testIMSI+"@"+testDomain),
 	)
 	line := buf.String()
+	if strings.Contains(line, `"time"`) {
+		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", line)
+	}
 	for _, raw := range []string{testMSISDN, testIMSI, "15550100001"} {
 		if strings.Contains(line, raw) {
 			t.Fatalf("log line contains %q: %s", raw, line)
@@ -336,10 +342,314 @@ func hintOf(t *testing.T, redacted string) string {
 // milliseconds, so a regression shows up as a test timeout, not a flaky timing.
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
-	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1"} {
+	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－", "1\u00a0", "1ー", "（１２", "(1", "tel:－", "１—\u202f", "1 \u2013", "＋"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
 		}
 	}
+}
+
+// CPIM From and To carry im: and pres: URIs (RFC 3862 §3.4, RFC 3860,
+// RFC 3859), whose user part names the subscriber as a sip URI's does.
+func TestRedactMasksTheUserOfImAndPresURIs(t *testing.T) {
+	r := NewRedactor(nil)
+	for _, tt := range []struct{ in, want string }{
+		{"From: Alice <im:alice.smith@" + testDomain + ">", "From: Alice <im:***th@" + testDomain + ">"},
+		{"To: <pres:bob.jones@" + testDomain + ">", "To: <pres:***es@" + testDomain + ">"},
+		{"IM:carol.jones@" + testDomain, "IM:***es@" + testDomain},
+		{"Pres:" + testMSISDN + "@" + testDomain, "Pres:***01@" + testDomain},
+		{"im:conference-factory", "im:conference-factory"},
+		// RFC 3860 §3: the user is an RFC 5322 local part, which may be a
+		// quoted string with spaces and escaped quotes.
+		{`From: <im:"bob smith"@` + testDomain + ">", "From: <im:***th@" + testDomain + ">"},
+		{`pres:"a \"b\" c"@` + testDomain, "pres:***@" + testDomain},
+		{`im:"` + testMSISDN + `"@` + testDomain, "im:***01@" + testDomain},
+		// A quoted string not followed by '@' is not a user.
+		{`im:"bob smith" said`, `im:"bob smith" said`},
+		{`sip:"bob smith"@` + testDomain, `sip:"bob smith"@` + testDomain},
+	} {
+		if got := r.Redact(tt.in); got != tt.want {
+			t.Errorf("Redact(%q)\n got %q\nwant %q", tt.in, got, tt.want)
+		}
+	}
+	if got := r.URI("from", "im:alice.smith@"+testDomain).Value.String(); got != "im:***th@"+testDomain {
+		t.Errorf("URI(im:…) = %q, want the host kept", got)
+	}
+}
+
+// Digits from other scripts identify a subscriber as well as ASCII ones: a
+// phone number typed on a phone in a CJK input mode arrives in full-width
+// digits, and Arabic-script locales use Arabic-Indic digits.
+func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
+	r := NewRedactor(nil)
+	for _, tt := range []struct{ name, in, want string }{
+		{"full-width MSISDN", "msisdn=１５５５０１００００１", "msisdn=***01"},
+		{"full-width with an ASCII plus", "caller +１５５５０１００００２", "caller +***02"},
+		{"ASCII and full-width mixed", "id 1555０１０0003 seen", "id ***03 seen"},
+		{"Arabic-Indic IMSI", "imsi ٠٠١٠١٠٠٠٠٠٠٠٠٠١", "imsi ***01"},
+		{"Extended Arabic-Indic digits", "شماره ۱۵۵۵۰۱۰۰۰۰۴", "شماره ***04"},
+		{"short full-width numbers read the same in ASCII", "２０２６年１０月", "2026年10月"},
+		{"eight full-width digits are a run", "２０２６１０１９", "***19"},
+		{"seven full-width digits are not", "２０２６１０１", "2026101"},
+		{"full-width trunk number with ASCII hyphens", "０１０-１２３４-５６７８", "***78"},
+		{"ASCII trunk prefix and full-width groups", "010-１２３４-５６７８", "***78"},
+		{"a short run after a tel number", "tel:+15550100001-２３４５６７", "tel:+***67"},
+		{"a short run after a digit run", "0000000 0０１0000", "***00"},
+		{"full-width IMEI groups", "urn:gsma:imei:00101000-１７６１４８-１", "urn:gsma:imei:***81"},
+		{"full-width national number in ASCII groups", "call ０１０-００００-０００１", "call ***01"},
+		{"full-width international number in ASCII groups", "call +１ ５５５ ０１００ ００１", "call +***01"},
+		{"full-width inside a sip URI user", "sip:１５５５０１００００１@" + testDomain, "sip:***01@" + testDomain},
+		// Full-width separators group a number as ASCII ones do (#85).
+		{"full-width hyphens", "call ０１０－００００－０００１", "call ***01"},
+		{"full-width plus and ideographic spaces", "call ＋１\u3000５５５\u3000０１０\u3000０００１", "call +***01"},
+		{"full-width parentheses and full stops", "（０７７００）\u3000９００．００１", "(***01"},
+		{"full-width separators around ASCII digits", "010－0000－0001", "***01"},
+		{"full-width parentheses and a space between groups", "＋１\u3000（５５５）\u3000０１０－０００１", "+***01"},
+		// Every Unicode space and dash groups a number too (#110): a number
+		// copied from a formatter or a web page may carry no-break or thin
+		// spaces, and the "-" key of a Japanese IME in kana mode types "ー".
+		{"no-break spaces", "call +1\u00a0555\u00a0010\u00a00001", "call +***01"},
+		{"narrow no-break spaces", "010\u202f0000\u202f0001", "***01"},
+		{"thin spaces", "+1\u2009555\u2009010\u20090001", "+***01"},
+		{"hyphens", "010\u20100000\u20100001", "***01"},
+		{"non-breaking hyphens", "010\u20110000\u20110001", "***01"},
+		{"figure dashes", "010\u20120000\u20120001", "***01"},
+		{"en dashes", "010\u20130000\u20130001", "***01"},
+		{"em dashes", "010\u20140000\u20140001", "***01"},
+		{"horizontal bars", "010\u20150000\u20150001", "***01"},
+		{"minus signs", "010\u22120000\u22120001", "***01"},
+		{"katakana long vowel marks", "０１０ー１２３４ー５６７８", "***78"},
+		{"half-width long vowel marks", "010ｰ0000ｰ0001", "***01"},
+		{"an en dash and a space", "+1\u2013 555\u2013 010\u2013 0001", "+***01"},
+		// Inside a tel URI every number character counts, as in ASCII.
+		{"full-width parentheses in a tel URI", "tel:（０３）１２３４", "tel:***34"},
+		{"full-width hyphens in a tel URI", "tel:１２－－－３４５６", "tel:***56"},
+		{"a dash after a tel URI's scheme", "tel:\u2010123456", "tel:***56"},
+		{"a space after a tel URI's scheme", "tel:\u3000１２３４５６", "tel:***56"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := r.Redact(tt.in); got != tt.want {
+				t.Fatalf("Redact(%q)\n got %q\nwant %q", tt.in, got, tt.want)
+			}
+		})
+	}
+	// The keyed hint is the same whichever digits the number was written in,
+	// so one subscriber's log lines still correlate.
+	k := NewRedactor(testKey)
+	if a, b := k.Redact(testMSISDN), k.Redact("+１５５５０１００００１"); a != b {
+		t.Errorf("hints differ: %q and %q", a, b)
+	}
+	// A number written with full-width separators is masked as its ASCII
+	// form is, hint included.
+	for ascii, wide := range map[string]string{
+		"+1 555 010 0001":   "＋１\u3000５５５\u3000０１０\u3000０００１",
+		"010-0000-0001":     "０１０－００００－０００１",
+		"(07700) 900.001":   "（０７７００）\u3000９００．００１",
+		"tel:+1-555-0100-1": "tel:＋１－５５５－０１００－１",
+		"+1 555 010 0002":   "+1\u00a0555\u202f010\u20090002",
+		"010-0000-0002":     "０１０ー００００\u2212０００２",
+		"+1 (555) 010-0001": "＋１\u3000（５５５）\u00a0０１０\u2013０００１",
+		"tel:(03)1234-5678": "tel:（０３）１２３４—５６７８",
+	} {
+		if a, b := k.Redact(ascii), k.Redact(wide); a != b || !strings.Contains(a, mark) {
+			t.Errorf("%q gives %q but %q gives %q", ascii, a, wide, b)
+		}
+	}
+}
+
+// Only the characters of a number are rewritten: brackets, spaces and dashes
+// in the text around it keep the form they were written in (#110).
+func TestRedactKeepsTheTextAroundANumber(t *testing.T) {
+	r := NewRedactor(nil)
+	for _, in := range []string{
+		"名前\u3000（注）\u300010",
+		"failed \u2014 retry 3 times",
+		"pages 10 \u2013 20",
+		"1\u3000\u2212\u30002",
+		"ゲーム10本",
+		"データー 10",
+		"＋ 1",
+		"（注1）",
+		"（1",
+		"1）",
+		"10\u00a0€",
+		"欄（）1",
+	} {
+		if got := r.Redact(in); got != in {
+			t.Errorf("Redact(%q) = %q, want it unchanged", in, got)
+		}
+	}
+	for in, want := range map[string]string{
+		"（１）":        "(1)",
+		"(１）":        "(1)",
+		"（注１）２":      "（注1)2",
+		"10\u201320": "10-20",
+		"コード１ー２ー３":   "コード1-2-3",
+		"２０２６年":      "2026年",
+		// A URI's number ends where it does in ASCII.
+		"tel:１２３４５６\u3000（注）": "tel:***56\u3000（注）",
+	} {
+		if got := r.Redact(in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Redact masks a number written in any digits and any Unicode spaces and
+// dashes as it masks the number written in ASCII, hint included: the
+// differential check from the QA of #106, with the separators of #110. Each
+// text is built from numbers, URIs and words in ASCII, then every digit and
+// separator in it is replaced at random by a form from another script. As
+// only the characters of a number are rewritten, the output is compared
+// after the remaining forms are read back as ASCII.
+func TestRedactReadsANumberInAnyFormAsInASCII(t *testing.T) {
+	n := 20_000
+	if testing.Short() {
+		n = 2_000
+	}
+	rng := rand.New(rand.NewPCG(110, 106))
+	unkeyed, keyed := NewRedactor(nil), NewRedactor(testKey)
+	for range n {
+		ascii := asciiNumberText(rng)
+		wide := anyFormOf(rng, ascii)
+		for _, r := range []*Redactor{unkeyed, keyed} {
+			if want, got := r.Redact(ascii), r.Redact(wide); asciiForm(got) != want {
+				t.Fatalf("Redact(%q) = %q\nRedact(%q) = %q", ascii, want, wide, got)
+			}
+		}
+	}
+}
+
+// asciiNumberText returns a text of numbers, number URIs and words, joined
+// as they may be in a log line.
+func asciiNumberText(rng *rand.Rand) string {
+	pick := func(xs ...string) string { return xs[rng.IntN(len(xs))] }
+	digits := func() string {
+		var b strings.Builder
+		for range 1 + rng.IntN(5) {
+			b.WriteByte(byte('0' + rng.IntN(10)))
+		}
+		return b.String()
+	}
+	number := func(seps ...string) string {
+		var b strings.Builder
+		b.WriteString(pick("", "", "+", "(", "0"))
+		b.WriteString(digits())
+		for range rng.IntN(6) {
+			b.WriteString(pick(seps...))
+			b.WriteString(digits())
+		}
+		return b.String()
+	}
+	grouping := []string{" ", "-", ".", "(", ")", "  ", " (", ") ", ")-", "--", " - ", "-.", ".("}
+	// A sip user cannot hold a space (RFC 3261 §25.1).
+	userGrouping := []string{"-", ".", "(", ")", ")-", "--", "-.", "---"}
+	var b strings.Builder
+	for range 1 + rng.IntN(5) {
+		switch rng.IntN(6) {
+		case 0, 1:
+			b.WriteString(number(grouping...))
+		case 2:
+			b.WriteString(pick("tel:", "TEL:", "urn:gsma:imei:"))
+			b.WriteString(number(grouping...))
+			b.WriteString(pick("", ";phone-context=example.net", "-", ")"))
+		case 3:
+			b.WriteString(pick("sip:", "sips:", "im:", "pres:"))
+			b.WriteString(number(userGrouping...))
+			b.WriteString("@" + testDomain)
+		default:
+			b.WriteString(pick("call", "msisdn=", "id", "x", "abc", "Tel.", "v", "a-b", "(x)", "#", "*", "-", "+", "."))
+		}
+		b.WriteString(pick("", " ", " ", "-", " (", ") ", ", ", " - ", "(", ")", "."))
+	}
+	return b.String()
+}
+
+// The forms anyFormOf writes for each ASCII character of a number.
+var (
+	digitZeros = []rune{'0', '０', '٠', '۰', '०', '০', '𝟎', '𝟘'}
+	otherForms = map[byte][]rune{
+		' ': {' ', '\u3000', '\u00a0', '\u202f', '\u2009', '\u2002', '\u205f'},
+		'-': {'-', '－', '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212', 'ー', 'ｰ', '\ufe63'},
+		'.': {'.', '．'},
+		'(': {'(', '（'},
+		')': {')', '）'},
+		'+': {'+', '＋'},
+	}
+)
+
+// anyFormOf replaces every digit and number character in s, outside URI
+// schemes and the domain, by a form chosen at random.
+func anyFormOf(rng *rand.Rand, s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if n := schemeLen(s[i:]); n > 0 {
+			b.WriteString(s[i : i+n])
+			i += n - 1
+			continue
+		}
+		if strings.HasPrefix(s[i:], "@"+testDomain) {
+			b.WriteString("@" + testDomain)
+			i += len(testDomain)
+			continue
+		}
+		c := s[i]
+		switch {
+		case isDigit(c):
+			b.WriteRune(digitZeros[rng.IntN(len(digitZeros))] + rune(c-'0'))
+		case otherForms[c] != nil:
+			forms := otherForms[c]
+			b.WriteRune(forms[rng.IntN(len(forms))])
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// asciiForm writes every character that Redact can read as a number
+// character in its ASCII form, wherever it is.
+func asciiForm(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if c, ok := asciiNumberChar(r); ok {
+			b.WriteByte(c)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func TestDigitValuesFollowTheUnicodeDecimalDigits(t *testing.T) {
+	for r, want := range map[rune]byte{'7': '7', '٣': '3', '۹': '9', '９': '9', '０': '0', '𝟗': '9', '𝟘': '0', '߃': '3'} {
+		if got := asciiDigit(r); got != want {
+			t.Errorf("asciiDigit(%q) = %q, want %q", r, got, want)
+		}
+	}
+	// asciiDigit relies on every block of decimal digits starting at a zero
+	// and running in tens.
+	for _, rg := range unicode.Nd.R16 {
+		if rg.Stride != 1 || (rg.Hi-rg.Lo+1)%10 != 0 {
+			t.Errorf("Nd range %#x-%#x is not whole blocks of ten", rg.Lo, rg.Hi)
+		}
+	}
+	for _, rg := range unicode.Nd.R32 {
+		if rg.Stride != 1 || (rg.Hi-rg.Lo+1)%10 != 0 {
+			t.Errorf("Nd range %#x-%#x is not whole blocks of ten", rg.Lo, rg.Hi)
+		}
+	}
+}
+
+// untimedJSONLogger writes JSON lines without the time attribute, so that a
+// test searching a line for leaked digits cannot find them in the
+// timestamp's nanoseconds (#99).
+func untimedJSONLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
 }

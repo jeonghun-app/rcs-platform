@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -29,16 +30,25 @@ func TestNetworkFailuresLoseTheirAddresses(t *testing.T) {
 	}
 	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 	_ = ln.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The lookup goes to a resolver that cannot be reached, which fails at
+	// once with a *net.DNSError that is not a timeout. The host's own
+	// resolver answered in its own time, which on a loaded host came after
+	// the test's deadline (#130). The NXDOMAIN shape (IsNotFound) is
+	// TestEachFailureHasItsReason's.
+	noResolver := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("no resolver here")
+	}}
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: (&net.Dialer{Resolver: noResolver}).DialContext,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	client := &http.Client{}
 	for _, tt := range []struct {
 		url  string
 		want []error
 	}{
 		{"http://127.0.0.1:" + port + "/ft", []error{safeerr.ErrRefused}},
-		// Without a resolver to ask, the lookup times out instead.
-		{"http://ft.rcs-sim-test.invalid/ft", []error{safeerr.ErrNoSuchHost, safeerr.ErrTimeout}},
+		{"http://ft.rcs-sim-test.invalid/ft", []error{safeerr.ErrNoSuchHost}},
 	} {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tt.url, nil)
 		_, err := client.Do(req)
@@ -150,5 +160,56 @@ func TestAnAnswerThatIsNotHTTPIsNotQuoted(t *testing.T) {
 		if got != safeerr.ErrNotHTTP {
 			t.Errorf("%q: Reason(%v) = %v", reply, err, got)
 		}
+	}
+}
+
+func TestEveryOtherHTTPFailureIsAFixedReason(t *testing.T) {
+	for _, tt := range []struct {
+		reply string
+		want  error
+	}{
+		{"HTTP/1.1 200 OK\r\nContent-Length: secret-host.example\r\n\r\n", safeerr.ErrHTTP},
+		{"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2 secret-host.example\r\n\r\n", safeerr.ErrHTTP},
+		{"HTTP/1.1 200 OK\r\nTransfer-Encoding: secret-host.example\r\n\r\n", safeerr.ErrHTTP},
+		// The server closes without answering.
+		{"", safeerr.ErrClosed},
+	} {
+		_, err := http.Get(answering(t, tt.reply))
+		if got := safeerr.Reason(err); got != tt.want {
+			t.Errorf("%q: Reason(%v) = %v, want %v", tt.reply, err, got, tt.want)
+		}
+	}
+	// A link with another scheme, taken from a server's document.
+	_, err := http.Get("ftp://secret-host.example/x")
+	if got := safeerr.Reason(err); got != safeerr.ErrHTTP {
+		t.Errorf("Reason(%v) = %v", err, got)
+	}
+}
+
+func TestABodyThatCannotBeReadIsAFixedReason(t *testing.T) {
+	for _, tt := range []struct {
+		reply string
+		want  error
+	}{
+		{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nsecret-host\r\n", safeerr.ErrBadBody},
+		{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nasecret-host\r\n0\r\n\r\n", safeerr.ErrBadBody},
+		{"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", safeerr.ErrClosed},
+	} {
+		resp, err := http.Get(answering(t, tt.reply))
+		if err != nil {
+			t.Fatalf("%q: %v", tt.reply, err)
+		}
+		_, err = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if got := safeerr.Body(err); got != tt.want || strings.Contains(got.Error(), "secret") {
+			t.Errorf("%q: Body(%v) = %v, want %v", tt.reply, err, got, tt.want)
+		}
+	}
+	if safeerr.Body(nil) != nil || !errors.Is(safeerr.Body(fmt.Errorf("x: %w", context.Canceled)), context.Canceled) {
+		t.Fatal("Body changed nil or a cancellation")
+	}
+	op := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+	if got := safeerr.Body(op); got != safeerr.ErrReset {
+		t.Fatalf("Body(%v) = %v", op, got)
 	}
 }

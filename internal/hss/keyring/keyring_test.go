@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -267,7 +268,15 @@ func TestSealFailsWhenRandomnessFails(t *testing.T) {
 func TestKeyringNeverPrintsItsKeys(t *testing.T) {
 	k := localKeyring(t)
 	var buf bytes.Buffer
-	slog.New(slog.NewJSONHandler(&buf, nil)).Info("x", slog.Any("keyring", k))
+	untimedJSONLogger(&buf).Info("x", slog.Any("keyring", k))
+	if strings.Contains(buf.String(), `"time"`) {
+		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", buf.String())
+	}
+	// The keyring is in the line, as its placeholder, so the search below
+	// looks at what it logs and not at a line without it.
+	if !strings.Contains(buf.String(), placeholder) {
+		t.Fatalf("the line does not log the keyring as %s:\n%s", placeholder, buf.String())
+	}
 	j, _ := json.Marshal(struct{ K *Keyring }{k})
 	for _, s := range []string{fmt.Sprint(k), fmt.Sprintf("%#v", k), fmt.Sprintf("%x", k), k.String(), buf.String(), string(j)} {
 		if strings.Contains(s, "0707") || strings.Contains(s, "aead") {
@@ -302,4 +311,16 @@ func TestOpenCreatesAKeyOnlyWhenAllowed(t *testing.T) {
 	if created != want || k.CurrentKeyID() != want {
 		t.Errorf("created %q, current %q; want %q", created, k.CurrentKeyID(), want)
 	}
+}
+
+// untimedJSONLogger writes JSON lines without the time attribute, so that a
+// test searching a line for leaked digits cannot find them in the
+// timestamp's nanoseconds (#99).
+func untimedJSONLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
 }

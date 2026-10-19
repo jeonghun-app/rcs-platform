@@ -269,7 +269,8 @@ type Client struct {
 // for msrps, and binds the session with the bodiless SEND RFC 4975 §5.4
 // asks of the active side. tlsConfig may be nil for the system defaults.
 // wrap, when set, wraps the connection, so a scenario can watch what crosses
-// it (that keep-alives go out, say).
+// it (that keep-alives go out, say). It wraps the MSRP stream, inside TLS
+// for an msrps: path, so what it sees is MSRP and not ciphertext.
 func Dial(ctx context.Context, relayPath, local msrp.URI, h msrp.Handler, cfg msrp.Config, tlsConfig *tls.Config, wrap func(net.Conn) net.Conn) (*Client, error) {
 	addr, err := relayPath.Addr()
 	if err != nil {
@@ -279,9 +280,6 @@ func Dial(ctx context.Context, relayPath, local msrp.URI, h msrp.Handler, cfg ms
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("chat: connecting to the relay: %w", safeerr.Reason(err))
-	}
-	if wrap != nil {
-		nc = wrap(nc)
 	}
 	if relayPath.Secure {
 		tc := &tls.Config{MinVersion: tls.VersionTLS12}
@@ -297,6 +295,9 @@ func Dial(ctx context.Context, relayPath, local msrp.URI, h msrp.Handler, cfg ms
 			return nil, fmt.Errorf("chat: TLS to the relay: %w", safeerr.Reason(err))
 		}
 		nc = conn
+	}
+	if wrap != nil {
+		nc = wrap(nc)
 	}
 	c, err := msrp.NewActiveConn(nc, cfg)
 	if err != nil {

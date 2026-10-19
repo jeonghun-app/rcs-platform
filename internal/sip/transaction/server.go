@@ -132,10 +132,11 @@ func (tx *ServerTransaction) failed(err error) func() {
 // connection must be reopened (see TU).
 //
 // transport.ErrQueueFull means nothing was sent and the connection is still
-// open. On a client-facing flow the transport then closes the flow itself and
-// returns transport.ErrNoFlow, so the client learns of the failure at once; on
-// a core flow the peer's transaction times out. Either way this transaction
-// has ended.
+// open; the peer's transaction times out. If a client-facing flow's own queue
+// had no room within WriteTimeout, the client is not reading: the transport
+// then closes the flow itself and returns transport.ErrNoFlow, so the client
+// learns of the failure at once. A refusal by the transport-wide budget leaves
+// the flow open. Either way this transaction has ended.
 func (tx *ServerTransaction) Respond(res *sip.Response) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()

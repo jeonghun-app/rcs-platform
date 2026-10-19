@@ -745,3 +745,114 @@ type failingListener struct{}
 func (failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed") }
 func (failingListener) Close() error              { return nil }
 func (failingListener) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1} }
+
+func TestMetricsAreFlushedEveryIntervalAndOnceMoreAtShutdown(t *testing.T) {
+	counted := make(chan struct{})
+	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		// Counted by a shutdown hook, which runs after the flush when
+		// shutdown starts: only the last flush can write it.
+		rt.OnShutdown("drain", func(context.Context) error {
+			rt.Metrics.Count("while.stopping", 1)
+			return nil
+		})
+		rt.Metrics.Count("before.interval", 2)
+		close(counted)
+		<-ctx.Done()
+		return nil
+	}))
+	<-counted
+	h.timers.WaitFor(DefaultMetricsInterval)
+	if strings.Contains(h.out.String(), "before.interval") {
+		t.Fatalf("a count was written before the interval ended:\n%s", h.out.String())
+	}
+	h.timers.Fire(DefaultMetricsInterval)
+	// The loop makes its next timer once the flush is written.
+	h.timers.WaitForN(DefaultMetricsInterval, 2)
+	if n := strings.Count(h.out.String(), `"before.interval":2`); n != 1 {
+		t.Fatalf("%d lines for the first interval:\n%s", n, h.out.String())
+	}
+	h.cancel()
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	out := h.out.String()
+	if strings.Count(out, `"before.interval":`) != 1 || !strings.Contains(out, `"while.stopping":1`) {
+		t.Fatalf("the shutdown flush is missing or repeats the first interval:\n%s", out)
+	}
+	if strings.Index(out, "while.stopping") < strings.Index(out, `"msg":"stopped"`) {
+		t.Fatalf("the shutdown flush ran before the service stopped:\n%s", out)
+	}
+}
+
+func TestMetricsAreFlushedWhenShutdownStarts(t *testing.T) {
+	counted, entered, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		rt.OnShutdown("slow drain", func(context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		})
+		rt.Metrics.Count("before.stop", 1)
+		close(counted)
+		<-ctx.Done()
+		return nil
+	}))
+	<-counted
+	h.cancel()
+	// While the drain runs, which a second signal or a short ECS stop
+	// timeout could cut off, the count is already written.
+	<-entered
+	if !strings.Contains(h.out.String(), `"before.stop":1`) {
+		t.Errorf("not flushed when shutdown started:\n%s", h.out.String())
+	}
+	close(release)
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if n := strings.Count(h.out.String(), `"before.stop":`); n != 1 {
+		t.Fatalf("written %d times:\n%s", n, h.out.String())
+	}
+}
+
+// TestALiveAfterReadyServiceFailsItsHealthCheckUntilItIsReady runs a service
+// whose start-up is held open, the way hss waits on KMS and DynamoDB, and
+// probes it as the container health check does.
+func TestALiveAfterReadyServiceFailsItsHealthCheckUntilItIsReady(t *testing.T) {
+	release, ready := make(chan struct{}), make(chan struct{})
+	svc := testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil
+		}
+		rt.Ready()
+		close(ready)
+		<-ctx.Done()
+		return nil
+	})
+	svc.LiveAfterReady = true
+	h := startService(t, devEnv(), svc)
+	healthz := h.adminURL("/healthz")
+	if code := httpGet(t, healthz); code != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz while starting = %d, want 503", code)
+	}
+	probe := func() int {
+		u, _ := url.Parse(healthz)
+		return Run(context.Background(), svc, Process{
+			Args: []string{"-healthcheck"}, LookupEnv: envMap{"RCS_ADMIN_ADDR": u.Host}.lookup, Stderr: io.Discard,
+		})
+	}
+	if code := probe(); code != ExitFailure {
+		t.Fatalf("-healthcheck while starting = %d, want failure", code)
+	}
+	close(release)
+	<-ready
+	if code := httpGet(t, healthz); code != http.StatusOK {
+		t.Fatalf("/healthz once ready = %d", code)
+	}
+	if code := probe(); code != ExitOK {
+		t.Fatalf("-healthcheck once ready = %d", code)
+	}
+	h.cancel()
+	h.wait()
+}

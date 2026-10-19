@@ -110,14 +110,11 @@ var referenceContexts = []ifc.Context{
 	{Case: ifc.TerminatingUnregistered, Unregistered: true},
 }
 
-// checkWork compiles criteria with lim and evaluates them against every
+// checkWork evaluates a compiled profile within lim against every
 // reference request in every session case. It returns an error naming the
 // request and the limit (a *ifc.LimitError's Limit) that a request reached.
-func checkWork(criteria []ifc.FilterCriteria, lim ifc.Limits) error {
-	set, err := ifc.CompileWithLimits(criteria, lim)
-	if err != nil {
-		return err
-	}
+func checkWork(compiled *ifc.Set, lim ifc.Limits) error {
+	set := compiled.WithLimits(lim)
 	for _, req := range referenceRequests() {
 		for _, ctx := range referenceContexts {
 			if _, err := set.Match(req, ctx); err != nil {

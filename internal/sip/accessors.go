@@ -9,7 +9,7 @@ import "strings"
 // allows one, or does not parse, yields an error wrapping ErrMalformed.
 
 // Via returns every Via element, top first.
-func (h *Header) Via() ([]Via, error) {
+func (h *Header) Via() (Vias, error) {
 	return listOf(h, "Via", parseViaElement)
 }
 
@@ -45,7 +45,7 @@ func (h *Header) MaxForwards() (int, error) {
 
 // Contact returns the Contact elements. A "*" contact is returned alone with Star
 // set; "*" mixed with addresses is malformed.
-func (h *Header) Contact() ([]Contact, error) {
+func (h *Header) Contact() (Contacts, error) {
 	els, err := h.Elements("Contact")
 	if err != nil || els == nil {
 		return nil, err
@@ -55,21 +55,21 @@ func (h *Header) Contact() ([]Contact, error) {
 }
 
 // Route returns the Route elements, which must be name-addrs (RFC 3261 §20.34).
-func (h *Header) Route() ([]Address, error) { return h.nameAddrs("Route") }
+func (h *Header) Route() (Addresses, error) { return h.nameAddrs("Route") }
 
 // RecordRoute returns the Record-Route elements (RFC 3261 §20.30).
-func (h *Header) RecordRoute() ([]Address, error) { return h.nameAddrs("Record-Route") }
+func (h *Header) RecordRoute() (Addresses, error) { return h.nameAddrs("Record-Route") }
 
 // Path returns the Path elements (RFC 3327 §4).
-func (h *Header) Path() ([]Address, error) { return h.nameAddrs("Path") }
+func (h *Header) Path() (Addresses, error) { return h.nameAddrs("Path") }
 
 // ServiceRoute returns the Service-Route elements (RFC 3608).
-func (h *Header) ServiceRoute() ([]Address, error) { return h.nameAddrs("Service-Route") }
+func (h *Header) ServiceRoute() (Addresses, error) { return h.nameAddrs("Service-Route") }
 
 // PAssociatedURI returns the P-Associated-URI elements (RFC 7315 §4.1). The field
 // may be empty, meaning the user has no other identities (RFC 7315 §5.1); an empty
 // field yields no elements.
-func (h *Header) PAssociatedURI() ([]Address, error) {
+func (h *Header) PAssociatedURI() (Addresses, error) {
 	if h.Has("P-Associated-URI") && strings.Join(h.Values("P-Associated-URI"), "") == "" {
 		return nil, nil
 	}
@@ -78,12 +78,12 @@ func (h *Header) PAssociatedURI() ([]Address, error) {
 
 // PAssertedIdentity returns the P-Asserted-Identity elements (RFC 3325 §9.1),
 // at most one SIP or SIPS URI and one tel URI in practice.
-func (h *Header) PAssertedIdentity() ([]Address, error) {
+func (h *Header) PAssertedIdentity() (Addresses, error) {
 	return listOf(h, "P-Asserted-Identity", ParseAddress)
 }
 
 // PPreferredIdentity returns the P-Preferred-Identity elements (RFC 3325 §9.2).
-func (h *Header) PPreferredIdentity() ([]Address, error) {
+func (h *Header) PPreferredIdentity() (Addresses, error) {
 	return listOf(h, "P-Preferred-Identity", ParseAddress)
 }
 
@@ -134,27 +134,27 @@ func (h *Header) ContentType() (MediaType, error) {
 }
 
 // WWWAuthenticate returns one challenge per WWW-Authenticate field.
-func (h *Header) WWWAuthenticate() ([]Challenge, error) {
+func (h *Header) WWWAuthenticate() (Challenges, error) {
 	return perLine(h, "WWW-Authenticate", parseChallenge)
 }
 
 // ProxyAuthenticate returns one challenge per Proxy-Authenticate field.
-func (h *Header) ProxyAuthenticate() ([]Challenge, error) {
+func (h *Header) ProxyAuthenticate() (Challenges, error) {
 	return perLine(h, "Proxy-Authenticate", parseChallenge)
 }
 
 // Authorization returns one set of credentials per Authorization field.
-func (h *Header) Authorization() ([]Credentials, error) {
+func (h *Header) Authorization() (CredentialsList, error) {
 	return perLine(h, "Authorization", parseCredentials)
 }
 
 // ProxyAuthorization returns one set of credentials per Proxy-Authorization field.
-func (h *Header) ProxyAuthorization() ([]Credentials, error) {
+func (h *Header) ProxyAuthorization() (CredentialsList, error) {
 	return perLine(h, "Proxy-Authorization", parseCredentials)
 }
 
 // AcceptContact returns the Accept-Contact elements (RFC 3841).
-func (h *Header) AcceptContact() ([]AcceptContact, error) {
+func (h *Header) AcceptContact() (AcceptContacts, error) {
 	return listOf(h, "Accept-Contact", parseAcceptContact)
 }
 
@@ -194,9 +194,9 @@ func (h *Header) MinSE() (MinSE, error) {
 }
 
 // Reason returns the Reason elements (RFC 3326 §2).
-func (h *Header) Reason() ([]Reason, error) { return listOf(h, "Reason", parseReason) }
+func (h *Header) Reason() (Reasons, error) { return listOf(h, "Reason", parseReason) }
 
-func (h *Header) nameAddrs(name string) ([]Address, error) {
+func (h *Header) nameAddrs(name string) (Addresses, error) {
 	return listOf(h, name, func(s string) (Address, error) { return parseAddress(s, true) })
 }
 

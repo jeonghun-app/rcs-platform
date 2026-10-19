@@ -18,6 +18,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/store"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 
 // maxControlBody bounds a control request body. The largest valid one is two
@@ -380,7 +381,7 @@ func (c *control) corePath(path []string) (string, string) {
 		if !inNetworks(a, c.o.CoreNetworks) {
 			return "", "the host is outside RELAY_CORE_NETWORKS"
 		}
-	} else if !inNamespace(u.Host, c.o.Namespace) {
+	} else if !runtime.InServiceNamespace(u.Host, c.o.Namespace) {
 		return "", "the host is neither an address in RELAY_CORE_NETWORKS nor a name in RCS_SERVICE_NAMESPACE"
 	}
 	return u.String(), ""
@@ -405,14 +406,6 @@ func inNetworks(a netip.Addr, networks []netip.Prefix) bool {
 		}
 	}
 	return false
-}
-
-// inNamespace matches whole labels, so "evil-ns.internal" is not inside
-// "ns.internal" (ADR 0007 §5).
-func inNamespace(host, namespace string) bool {
-	namespace = strings.TrimSuffix(strings.ToLower(namespace), ".")
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	return namespace != "" && strings.HasSuffix(host, "."+namespace)
 }
 
 func (c *control) invalid(w http.ResponseWriter, problem string) {

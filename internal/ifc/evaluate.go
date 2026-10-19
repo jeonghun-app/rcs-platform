@@ -54,6 +54,33 @@ type Request interface {
 // bypass an application server, or reach one it should not. The S-CSCF
 // refuses such a request.
 const (
+	// MaxPatternBytes bounds the text of one pattern, so that the cost of
+	// parsing it is bounded: Go's parser is quadratic on some inputs, such
+	// as a bracket expression full of "[:" that no ":]" closes, which is a
+	// single character class the instruction limits do not catch (#96).
+	// Within the limit the costliest patterns known take a few milliseconds
+	// to compile (about 10 ms for 1024 negated classes, case-folded), and
+	// [MaxSetCompileCost] bounds a set's total. A pattern a person writes
+	// is tens of bytes.
+	MaxPatternBytes = 4 << 10
+	// MaxSetCompileCost bounds the work of compiling one [Set], in cost
+	// units counted rather than timed, so the same profile is accepted or
+	// refused on every host (see patternCost for what a pattern costs).
+	// Patterns near MaxPatternBytes fit the instruction budget in dozens,
+	// and 47 of them took about half a second (#111); now the tenth is
+	// refused. A profile of MaxCriteria ordinary RCS criteria costs about
+	// 921 000 units, and the default RCS profile about 21 000. Measured on
+	// a 32-core development host at load 140 to 230, a set at the bound of
+	// the baseline shape (case-folded negated classes, 4 KiB) took 39 to
+	// 48 ms of CPU, 33 to 70 ms of wall time; sets of other 4 KiB shapes
+	// took about 1.1 times as long as the baseline's in the same run or
+	// less, and sets of hundreds of short patterns about 2 to 2.3 times.
+	// Other hosts and loads differ; the HSS compiles a profile once on each
+	// write (#120). Compile refuses a set that costs more, before parsing
+	// the pattern that would cross the bound when its source alone does; at
+	// most one pattern's work, which MaxPatternBytes bounds, is spent past
+	// it.
+	MaxSetCompileCost = 1_000_000
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
 	// repetition ("{n}") is what multiplies the size.
@@ -101,7 +128,8 @@ func (e *LimitError) Error() string { return "ifc: request exceeds the evaluatio
 // Unwrap returns ErrEvaluationLimit.
 func (e *LimitError) Unwrap() error { return ErrEvaluationLimit }
 
-// Limits configures [CompileWithLimits]. Zero fields take the defaults.
+// Limits configures [CompileWithLimits] and [Set.WithLimits]. Zero fields
+// take the defaults.
 type Limits struct {
 	// MaxWork is the work budget of one evaluation; zero means
 	// DefaultMaxWork.
@@ -135,12 +163,23 @@ func (c Context) registered() bool {
 // reads only the set's compiled form, which nothing changes after Compile, so
 // one set can serve every request of a registration concurrently. The
 // criteria that Match and Next return share their trigger points with the
-// ones passed to Compile; treat them as read-only.
+// ones passed to Compile; treat them as read-only. A Set that Compile did not
+// build, such as a zero Set, is empty.
 type Set struct {
-	criteria  []compiledCriteria
+	// compiled is what Compile built, never changed after: a Set derived
+	// with WithLimits shares it, so whatever is added to it carries over.
+	*compiled
 	maxWork   int
 	oversized atomic.Uint64
 	exhausted atomic.Uint64
+}
+
+// compiled is the immutable part of a Set.
+type compiled struct {
+	criteria []compiledCriteria
+	// compileCost is what compiling the set took, in MaxSetCompileCost's
+	// units.
+	compileCost int
 }
 
 type compiledCriteria struct {
@@ -181,11 +220,24 @@ const (
 // Compile checks criteria (as Subscription.Marshal would), compiles their
 // patterns and orders them by priority. It fails when two criteria share a
 // priority, which TS 29.228 B.2.2 forbids and which would leave their order
-// to chance, or when a pattern is not a POSIX extended regular expression.
+// to chance, when a pattern is not a POSIX extended regular expression, or
+// when it uses a construct Go reads differently (see the package doc).
 // Errors name the criterion by priority and never quote a pattern, which may
-// hold a subscriber identity.
+// hold a subscriber identity; a refused construct is named by its own
+// characters only.
 func Compile(criteria []FilterCriteria) (*Set, error) {
 	return CompileWithLimits(criteria, Limits{})
+}
+
+// WithLimits returns a Set that evaluates s's compiled criteria within lim,
+// so a set compiled once can be evaluated under several budgets. Its
+// counters start at zero.
+func (s *Set) WithLimits(lim Limits) *Set {
+	w := &Set{compiled: s.compiled, maxWork: lim.MaxWork}
+	if w.maxWork <= 0 {
+		w.maxWork = DefaultMaxWork
+	}
+	return w
 }
 
 // CompileWithLimits is Compile with a work budget other than the default.
@@ -197,15 +249,15 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	s := &Set{criteria: make([]compiledCriteria, 0, len(criteria)), maxWork: lim.MaxWork}
+	s := &Set{compiled: &compiled{criteria: make([]compiledCriteria, 0, len(criteria))}, maxWork: lim.MaxWork}
 	if s.maxWork <= 0 {
 		s.maxWork = DefaultMaxWork
 	}
-	budget := MaxSetInstructions
+	b := setBudget{insts: MaxSetInstructions, cost: MaxSetCompileCost}
 	for _, fc := range criteria {
 		c := compiledCriteria{fc: fc}
 		if fc.TriggerPoint != nil {
-			t, err := compileTrigger(fc.TriggerPoint, &budget)
+			t, err := compileTrigger(fc.TriggerPoint, &b)
 			if err != nil {
 				return nil, fmt.Errorf("ifc: filter criteria with priority %d: %w", fc.Priority, err)
 			}
@@ -213,6 +265,7 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 		}
 		s.criteria = append(s.criteria, c)
 	}
+	s.compileCost = MaxSetCompileCost - b.cost
 	slices.SortFunc(s.criteria, func(a, b compiledCriteria) int { return cmp.Compare(a.fc.Priority, b.fc.Priority) })
 	for i := 1; i < len(s.criteria); i++ {
 		if s.criteria[i].fc.Priority == s.criteria[i-1].fc.Priority {
@@ -222,11 +275,59 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	return s, nil
 }
 
-func compileTrigger(tp *TriggerPoint, budget *int) (*compiledTrigger, error) {
+// setBudget is what is left of a set's instruction and compile cost budgets.
+type setBudget struct{ insts, cost int }
+
+// compile compiles one pattern of the set, charging both budgets. A pattern
+// whose source alone exceeds what is left of the cost budget is refused
+// before it is parsed.
+func (b *setBudget) compile(name, source string, mode patternMode) (pattern, error) {
+	return b.charged(name, source, mode, false)
+}
+
+// compileContent compiles a Content pattern of the set as compile does,
+// unless it matches every value (empty, or ".*"), which is the same as no
+// Content: then it returns the zero pattern, no condition, and only its
+// parse, the source cost, is charged. The pattern is parsed once either
+// way, so every parse is pre-checked and paid for (#115).
+func (b *setBudget) compileContent(name, source string) (pattern, error) {
+	return b.charged(name, source, 0, true)
+}
+
+func (b *setBudget) charged(name, source string, mode patternMode, content bool) (pattern, error) {
+	// A pattern over MaxPatternBytes is refused by parsePattern, naming
+	// that limit, before anything is parsed.
+	if len(source) <= MaxPatternBytes && sourceCost(len(source)) > b.cost {
+		return pattern{}, b.exceeded()
+	}
+	tree, err := parsePattern(name, source, mode)
+	if err != nil {
+		return pattern{}, err
+	}
+	if content && tree.Op == syntax.OpEmptyMatch {
+		b.cost -= sourceCost(len(source))
+		return pattern{}, nil
+	}
+	p, err := buildPattern(name, source, tree, mode, &b.insts)
+	if err != nil {
+		return pattern{}, err
+	}
+	if p.cost > b.cost {
+		return pattern{}, b.exceeded()
+	}
+	b.cost -= p.cost
+	return p, nil
+}
+
+func (b *setBudget) exceeded() error {
+	return fmt.Errorf("the criteria cost more than MaxSetCompileCost (%d units) to compile", MaxSetCompileCost)
+}
+
+func compileTrigger(tp *TriggerPoint, b *setBudget) (*compiledTrigger, error) {
 	t := &compiledTrigger{cnf: tp.ConditionTypeCNF}
 	byGroup := map[int][]int{}
 	for i := range tp.SPTs {
-		spt, err := compileSPT(&tp.SPTs[i], budget)
+		spt, err := compileSPT(&tp.SPTs[i], b)
 		if err != nil {
 			return nil, fmt.Errorf("SPT %d: %w", i+1, err)
 		}
@@ -243,14 +344,14 @@ func compileTrigger(tp *TriggerPoint, budget *int) (*compiledTrigger, error) {
 	return t, nil
 }
 
-func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
+func compileSPT(spt *SPT, b *setBudget) (compiledSPT, error) {
 	c := compiledSPT{negated: spt.ConditionNegated}
 	var err error
 	switch v := spt.Condition.(type) {
 	case RequestURI:
 		c.kind = kindRequestURI
 		// Host names are case-insensitive (RFC 3261 §19.1.4).
-		c.name, err = compilePattern("RequestURI", string(v), patternFoldCase, budget)
+		c.name, err = b.compile("RequestURI", string(v), patternFoldCase)
 	case Method:
 		c.kind, c.method, c.regs = kindMethod, string(v), slices.Clone(spt.RegistrationTypes)
 	case SIPHeader:
@@ -259,15 +360,15 @@ func compileSPT(spt *SPT, budget *int) (compiledSPT, error) {
 		// pattern must match the whole name: "Contact" must not select
 		// Accept-Contact or Reject-Contact. Values are matched as written,
 		// anywhere in the value, as Annex F's regexec semantics give.
-		if c.name, err = compilePattern("Header", v.Header, patternFoldCase|patternWhole, budget); err == nil && matchesSomething(v.Content) {
-			c.value, err = compilePattern("Content", v.Content, 0, budget)
+		if c.name, err = b.compile("Header", v.Header, patternFoldCase|patternWhole); err == nil {
+			c.value, err = b.compileContent("Content", v.Content)
 		}
 	case SessionCase:
 		c.kind, c.session = kindSessionCase, v
 	case SessionDescription:
 		c.kind = kindSessionDescription
-		if c.name, err = compilePattern("Line", v.Line, 0, budget); err == nil && matchesSomething(v.Content) {
-			c.value, err = compilePattern("Content", v.Content, 0, budget)
+		if c.name, err = b.compile("Line", v.Line, 0); err == nil {
+			c.value, err = b.compileContent("Content", v.Content)
 		}
 	}
 	return c, err
@@ -285,9 +386,47 @@ type pattern struct {
 	// a search costs against one instruction over one byte.
 	token  string
 	linear bool
+	// cost is the work compiling the pattern took, in the units of
+	// MaxSetCompileCost.
+	cost int
 }
 
 const literalCost = 4
+
+// The weights of a pattern's compile cost. A pattern costs
+// sourceCost(len(source)), one unit per byte of the text writeTree writes
+// it out as (the proof and the compiler parse it again), and
+// compileCostPerInstruction per program instruction: a program is built
+// four times per pattern (the proof compiles the parsed and the
+// written-out trees, then syntax and regexp each compile the text).
+//
+// They were set against the baseline shape, 1024 case-folded negated
+// classes in a Request-URI, by timing patterns of about 4 KiB alone in the
+// same run (#111, #115). Parse-dominated shapes, whose programs are small
+// ("0.|00|" repeated, a bracket full of unclosed "[:", a Content of "|"
+// that matches everything, short literal alternatives), took up to a third
+// of the baseline's time on one host while costing a tenth of its units,
+// and their parse grows faster than their length: hence the quadratic
+// source term, which is nothing for the tens of bytes a person writes and
+// a third of the baseline's cost at 4 KiB. With it no shape measured is
+// charged less per microsecond than the baseline, and the cheapest ones
+// (long literals) are charged up to several times more.
+const (
+	compileCostPerInstruction = 32
+	sourceCostPerByte         = 2
+	sourceCostQuadratic       = 512 // sourceCost adds n²/sourceCostQuadratic
+)
+
+// patternCost is the compile cost of a pattern whose source, written-out
+// text and program have the given sizes.
+func patternCost(source, expr, insts int) int {
+	return sourceCost(source) + expr + compileCostPerInstruction*insts
+}
+
+// sourceCost is the cost of checking and parsing a pattern's source of n
+// bytes, whatever the parse finds; it is all a Content that matches every
+// value costs.
+func sourceCost(n int) int { return sourceCostPerByte*n + n*n/sourceCostQuadratic }
 
 type patternMode uint8
 
@@ -304,11 +443,13 @@ const (
 const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 
 // compilePattern compiles a POSIX extended regular expression (TS 29.228
-// Annex F). The pattern is parsed as an ERE, which refuses Perl extensions
-// such as \d and (?i), and the parsed tree, not the source text, is what gets
-// compiled: Go's matcher reads Perl syntax, in which some valid EREs mean
-// something else. "0+?" is (0+)? in an ERE, which matches the empty value,
-// but the lazy 0+? in Perl, which needs a 0 (#61).
+// Annex F). A pattern using a construct Go's parser reads differently from
+// IEEE 1003.1 is refused first, naming it ([ereDeparture]). The pattern is
+// then parsed as an ERE, which refuses Perl extensions such as (?i), and the
+// parsed tree, not the source text, is what gets compiled: Go's matcher
+// reads Perl syntax, in which some valid EREs mean something else. "0+?"
+// is (0+)? in an ERE, which matches the empty value, but the lazy 0+? in
+// Perl, which needs a 0 (#61).
 //
 // A case-insensitive pattern is parsed with FoldCase, so that the parser
 // folds every literal and bracket expression before it merges them; folding
@@ -321,6 +462,22 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // ([sameMeaning]), so a pattern whose meaning could not be kept exactly is
 // refused rather than compiled into something else.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
+	tree, err := parsePattern(name, source, mode)
+	if err != nil {
+		return pattern{}, err
+	}
+	return buildPattern(name, source, tree, mode, budget)
+}
+
+// parsePattern checks source's length and constructs and parses it as an
+// ERE, without the outer ".*" of a pattern that matches anywhere.
+func parsePattern(name, source string, mode patternMode) (*syntax.Regexp, error) {
+	if len(source) > MaxPatternBytes {
+		return nil, fmt.Errorf("%s is longer than MaxPatternBytes (%d bytes)", name, MaxPatternBytes)
+	}
+	if construct := ereDeparture(source); construct != "" {
+		return nil, fmt.Errorf("%s uses %s, which this engine reads differently from a POSIX ERE", name, construct)
+	}
 	flags := posixFlags
 	if mode&patternFoldCase != 0 {
 		flags |= syntax.FoldCase
@@ -329,13 +486,18 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if err != nil {
 		var se *syntax.Error
 		if errors.As(err, &se) {
-			return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
+			return nil, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
 		}
-		return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression", name)
+		return nil, fmt.Errorf("%s is not a POSIX extended regular expression", name)
 	}
 	if mode&patternWhole == 0 {
 		tree = withoutOuterDotStar(tree)
 	}
+	return tree, nil
+}
+
+// buildPattern compiles the parsed tree of source (see compilePattern).
+func buildPattern(name, source string, tree *syntax.Regexp, mode patternMode, budget *int) (pattern, error) {
 	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
 	if estimateSize(tree) > 4*MaxPatternInstructions {
 		return pattern{}, tooComplex
@@ -368,7 +530,7 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if err != nil {
 		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
-	p := pattern{re: re, insts: n}
+	p := pattern{re: re, insts: n, cost: patternCost(len(source), len(expr), n)}
 	if mode&patternWhole != 0 && mode&patternFoldCase != 0 && isPlainToken(source) {
 		p.token = source
 	}
@@ -620,16 +782,6 @@ func isPlainToken(s string) bool {
 	return true
 }
 
-// matchesSomething reports whether a Content pattern restricts the value at
-// all; an empty one, or ".*", is the same as no Content.
-func matchesSomething(content string) bool {
-	tree, err := syntax.Parse(content, posixFlags)
-	if err != nil {
-		return true // compilePattern reports the error
-	}
-	return withoutOuterDotStar(tree).Op != syntax.OpEmptyMatch
-}
-
 // withoutOuterDotStar drops a leading and a trailing ".*" from the tree of a
 // pattern that is searched for anywhere in its field. Operators often write
 // ".*X.*" for "contains X"; without the ".*", a literal X is found with a
@@ -703,8 +855,26 @@ func estimateSize(re *syntax.Regexp) int {
 	return 2
 }
 
+// CompileCost returns what compiling the set took, in the units of
+// MaxSetCompileCost: the same for the same criteria on every host.
+func (s *Set) CompileCost() int {
+	if s.compiled == nil {
+		return 0
+	}
+	return s.compileCost
+}
+
 // Len returns the number of criteria in the set.
-func (s *Set) Len() int { return len(s.criteria) }
+func (s *Set) Len() int { return len(s.list()) }
+
+// list returns the compiled criteria in priority order: none for a Set that
+// Compile did not build.
+func (s *Set) list() []compiledCriteria {
+	if s.compiled == nil {
+		return nil
+	}
+	return s.criteria
+}
 
 // Match returns, in priority order, every criterion that applies to the
 // request: the S-CSCF sends a third-party REGISTER to each of their servers
@@ -715,9 +885,10 @@ func (s *Set) Match(req Request, ctx Context) ([]FilterCriteria, error) {
 	in := newInput(req, ctx, s.maxWork)
 	defer s.count(in)
 	var out []FilterCriteria
-	for i := range s.criteria {
-		if s.criteria[i].matches(in) {
-			out = append(out, s.criteria[i].fc)
+	criteria := s.list()
+	for i := range criteria {
+		if criteria[i].matches(in) {
+			out = append(out, criteria[i].fc)
 		}
 		if in.limit != "" {
 			return nil, &LimitError{Limit: in.limit}
@@ -758,8 +929,9 @@ func (s *Set) count(in *input) {
 func (s *Set) Next(req Request, ctx Context, after int) (FilterCriteria, bool, error) {
 	in := newInput(req, ctx, s.maxWork)
 	defer s.count(in)
-	for i := range s.criteria {
-		c := &s.criteria[i]
+	criteria := s.list()
+	for i := range criteria {
+		c := &criteria[i]
 		if c.fc.Priority <= after {
 			continue
 		}

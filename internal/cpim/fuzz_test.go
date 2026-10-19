@@ -2,8 +2,10 @@ package cpim
 
 import (
 	"bytes"
+	"encoding/json"
 	"reflect"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -54,11 +56,14 @@ func FuzzParse(f *testing.F) {
 }
 
 // FuzzParseAddress checks that an accepted address formats back to a value
-// that parses to the same address.
+// that parses to the same address, and that its log form keeps no run of
+// eight digits, as internal/pii promises of every log line.
 func FuzzParseAddress(f *testing.F) {
 	f.Add("<" + alice + ">")
 	f.Add("Alice B <" + alice + ">")
 	f.Add(`"Smith, \"Al\" é" <` + alice + ">")
+	f.Add("<im:15550100001@[2001:db8:5:6::7]?subject=15550100002>")
+	f.Add("<x15550100001:15550100002@10.20.30.40>")
 	f.Fuzz(func(t *testing.T, v string) {
 		a, err := ParseAddress(v)
 		if err != nil {
@@ -67,6 +72,20 @@ func FuzzParseAddress(f *testing.F) {
 		back, err := ParseAddress(a.String())
 		if err != nil || back != a {
 			t.Fatalf("ParseAddress(%q) = %+v, then %q parsed to %+v, %v", v, a, a.String(), back, err)
+		}
+		// Read back, as JSON escapes digits of its own ("\u0026").
+		var logged map[string]string
+		if j, err := json.Marshal(a); err != nil || json.Unmarshal(j, &logged) != nil {
+			t.Fatalf("ParseAddress(%q) logs %s, %v", v, j, err)
+		}
+		run := 0
+		for _, c := range logged["uri"] {
+			if run = run + 1; !unicode.IsDigit(c) {
+				run = 0
+			}
+			if run >= 8 {
+				t.Fatalf("ParseAddress(%q) logs %s", v, logged)
+			}
 		}
 	})
 }
