@@ -47,7 +47,11 @@ var (
 
 // Limit bounds one recipient's queue, and the share of it one sender may
 // hold, so that a sender cannot fill a queue and lock every other sender
-// out. A zero field is no bound.
+// out. A zero field is no bound. Notifications count toward the queue but
+// neither toward nor against a sender's share: what one notifier may put
+// in a queue is already bounded by the messages the queue's owner sent it,
+// each answered once per kind, and a recipient catching up on many
+// messages answers each with up to two.
 type Limit struct {
 	Count       int
 	Bytes       int64
@@ -158,7 +162,8 @@ func (s Sent) Clone() Sent {
 type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
-	// beyond l, ErrSenderShareFull if what m.Sender has in it would.
+	// beyond l, ErrSenderShareFull if what m.Sender has in it would (m not
+	// being a notification).
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID

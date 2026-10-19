@@ -388,3 +388,43 @@ func TestASessionOpeningMidwayKeepsTheQueueInOrder(t *testing.T) {
 		}
 	}
 }
+
+// The same for new messages tried on their own: one from a sender with a
+// message waiting for the session that has just opened does not go first.
+func TestANewMessageDoesNotOvertakeOnesWaitingForTheSameSession(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour})
+	l := r.listen(t)
+	drainInvites(t, r.d)
+	// alice's m1 waits for a session to bob.
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "m1", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	// carol's pager-mode messages hold the worker, one at a time.
+	entered, proceed := make(chan struct{}, 4), make(chan struct{}, 4)
+	r.d.onPager(func(Delivery) error { entered <- struct{}{}; <-proceed; return nil })
+	if err := r.e.Submit(t.Context(), standalone(carol, bob, chat(t, "c1", "c1", 0))); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	// While it is held, carol's c2 and alice's m2 arrive: the next pass
+	// tries them on their own, c2 first.
+	for _, o := range []Origin{
+		standalone(carol, bob, chat(t, "c2", "c2", 0)),
+		{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m2", "m2", 0)},
+	} {
+		if err := r.e.Submit(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	proceed <- struct{}{}
+	<-entered // c2
+	// bob's session with alice opens now, before m2 is tried.
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	proceed <- struct{}{}
+	for _, want := range []string{"m1", "m2"} {
+		if got := b.next(t); !bytes.HasSuffix(got.Body, []byte(want)) {
+			t.Fatalf("got %q, want %s", got.Body, want)
+		}
+	}
+}

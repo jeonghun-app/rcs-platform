@@ -104,6 +104,10 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    - Each sender may hold `1/RCSAS_QUEUE_SENDER_SHARE` of either (an eighth
      by default). One sender therefore cannot fill a queue and lock the others
      out.
+   - Notifications count toward the queue but not toward a share. What one
+     notifier can put in a queue is already bounded: it needs a message the
+     queue's owner sent it, and is accepted once per kind. A recipient catching
+     up answers each message with up to two.
    - Beyond these bounds the message is refused as `queue_full` or
      `queue_share_full`, and the sender gets the negative delivery
      notification it asked for. A refusal from a full share affects that
@@ -312,7 +316,10 @@ The table's properties:
   order, which is enqueue order.
 - **Bounds.** The queue's size item and the sender's share item count messages
   and bytes. Both are written in the same transaction as each enqueue and
-  removal, and the enqueue is conditional on both bounds. Each queue item
+  removal, and the enqueue is conditional on both bounds. A notification has
+  no share item. An enqueue moves a size item's TTL to its message's, which
+  only lengthens it, since messages are enqueued in time order with one
+  lifetime. A removal leaves the TTL alone. Each queue item
   carries its own `size`. The SDK's idempotency token makes its own retry of a
   transaction safe.
 - **Drift.** The sizes are kept by rcs-as, so a queue item deleted another way

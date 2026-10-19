@@ -325,3 +325,33 @@ func TestAFullQueueIsRecountedAtMostOncePerInterval(t *testing.T) {
 		t.Fatalf("%d recounts once the interval passed", f.recounts)
 	}
 }
+
+// Removing an old message must not bring the size item's TTL forward: it
+// still counts messages that live longer, and losing it would restart the
+// counts from zero under a queue that is still there.
+func TestARemovalLeavesTheQueueSizeTTLAlone(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	old := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	young := old
+	young.ID, young.Expires = "2", t0.Add(7*24*time.Hour)
+	for _, m := range []store.Message{old, young} {
+		if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held, err := s.Claim(ctx, "r", "1", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, held, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	want := nOf(ttlOf(young.Expires.Add(retention)))
+	for _, k := range []string{"c#1#r\x00n", "c#1#r\x00s#1#s"} {
+		if got := nOf(f.rows[k][attrTTL]); got != want {
+			t.Errorf("%q ttl %d, want %d", k, got, want)
+		}
+	}
+}

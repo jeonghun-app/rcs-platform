@@ -188,16 +188,27 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 	if f.fail != nil {
 		return nil, f.fail
 	}
-	if len(in.TransactItems) != 3 || in.TransactItems[1].Update == nil || in.TransactItems[2].Update == nil {
+	// A notification has no share item: two items, else three.
+	if n := len(in.TransactItems); n != 2 && n != 3 {
 		f.t.Fatalf("transaction %+v", in.TransactItems)
 	}
-	sizes := []*dtypes.Update{in.TransactItems[1].Update, in.TransactItems[2].Update}
-	failed := []bool{false, false, false}
-	for i, u := range sizes {
-		if aws.ToString(u.UpdateExpression) != "ADD #count :count, #bytes :bytes SET #ttl = :ttl" {
+	var sizes []*dtypes.Update
+	failed := []bool{false}
+	enqueue := in.TransactItems[0].Put != nil
+	for _, item := range in.TransactItems[1:] {
+		u := item.Update
+		if u == nil {
+			f.t.Fatalf("transaction %+v", in.TransactItems)
+		}
+		want := "ADD #count :count, #bytes :bytes"
+		if enqueue {
+			want += " SET #ttl = :ttl"
+		}
+		if aws.ToString(u.UpdateExpression) != want {
 			f.t.Errorf("size update %q", aws.ToString(u.UpdateExpression))
 		}
-		failed[i+1] = !f.sizeFits(u)
+		sizes = append(sizes, u)
+		failed = append(failed, !f.sizeFits(u))
 	}
 	switch first := in.TransactItems[0]; {
 	case first.Put != nil:
@@ -205,7 +216,7 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 			f.t.Errorf("enqueue %q", aws.ToString(first.Put.ConditionExpression))
 		}
 		_, failed[0] = f.rows[rowKey(first.Put.Item)]
-		if failed[0] || failed[1] || failed[2] {
+		if slices.Contains(failed, true) {
 			return nil, cancelled(failed...)
 		}
 		f.rows[rowKey(first.Put.Item)] = maps.Clone(first.Put.Item)
@@ -215,7 +226,8 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 		}
 		row, ok := f.rows[rowKey(first.Delete.Key)]
 		if !ok || sOf(row[attrOwner]) != sOf(first.Delete.ExpressionAttributeValues[":owner"]) {
-			return nil, cancelled(true, false, false)
+			failed[0] = true
+			return nil, cancelled(failed...)
 		}
 		delete(f.rows, rowKey(first.Delete.Key))
 	default:
@@ -223,7 +235,9 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 	}
 	for _, u := range sizes {
 		f.add(u.Key, u.ExpressionAttributeValues[":count"], u.ExpressionAttributeValues[":bytes"])
-		f.rows[rowKey(u.Key)][attrTTL] = u.ExpressionAttributeValues[":ttl"]
+		if ttl, ok := u.ExpressionAttributeValues[":ttl"]; ok {
+			f.rows[rowKey(u.Key)][attrTTL] = ttl
+		}
 	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
@@ -333,7 +347,7 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		items, last := f.page(rows, indexOrder, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool { return free(r, vals[":now"]) }, indexKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
-	if aws.ToString(in.ProjectionExpression) == "#sender, #size" {
+	if aws.ToString(in.ProjectionExpression) == "#sender, #size, #notification" {
 		// recount: the whole partition, keys and the two attributes.
 		f.recounts++
 		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
@@ -343,7 +357,7 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		for _, r := range f.rows {
 			if sOf(r[attrPK]) == sOf(vals[":pk"]) {
 				p := tableKey(r)
-				p[attrSender], p[attrSize] = r[attrSender], r[attrSize]
+				p[attrSender], p[attrSize], p[attrNotification] = r[attrSender], r[attrSize], r[attrNotification]
 				rows = append(rows, p)
 			}
 		}

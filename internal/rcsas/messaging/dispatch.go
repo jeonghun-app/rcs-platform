@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
@@ -56,6 +57,10 @@ type recipient struct {
 	hold   hold
 	retry  msrp.Timer
 	wait   time.Duration
+	// waiting holds the senders with chat messages or notifications the
+	// last passes left waiting for a session: a new message from one of
+	// them must not go ahead of those, from anyone else it may.
+	waiting map[string]bool
 }
 
 // state needs e.mu.
@@ -147,18 +152,29 @@ func (e *Engine) work() {
 		r := e.recipients[user]
 		r.run = running
 		for r.full || len(r.single) > 0 {
-			full, single := r.full, r.single
+			full, single, waiting := r.full, r.single, maps.Clone(r.waiting)
 			r.full, r.single = false, nil
 			e.mu.Unlock()
 			var res passResult
 			if full {
 				res = e.drain(e.ctx, user)
 			} else {
-				res = e.trySingles(e.ctx, single)
+				res = e.trySingles(e.ctx, single, waiting)
 			}
 			e.mu.Lock()
 			if res.again {
 				r.full = true
+			}
+			if full && !res.stopped && !res.again {
+				// A pass that read the whole queue knows who waits.
+				r.waiting = res.waited
+			} else {
+				for s := range res.waited {
+					if r.waiting == nil {
+						r.waiting = map[string]bool{}
+					}
+					r.waiting[s] = true
+				}
 			}
 			e.settle(user, r, res, full)
 			if e.closed {
@@ -174,8 +190,12 @@ func (e *Engine) work() {
 }
 
 // passResult is what one pass over a queue found; again asks for the
-// whole queue to be read.
-type passResult struct{ stopped, skipped, again bool }
+// whole queue to be read; waited are the senders whose chat messages or
+// notifications it left waiting for a session.
+type passResult struct {
+	stopped, skipped, again bool
+	waited                  map[string]bool
+}
 
 // settle needs e.mu. It records what a pass found and arms the retry timer
 // of a queue left held.
@@ -222,12 +242,12 @@ const (
 // drain delivers recipient's queue, oldest first, until a message finds the
 // recipient unreachable or the engine closes.
 func (e *Engine) drain(ctx context.Context, recipient string) passResult {
-	var res passResult
+	res := passResult{waited: map[string]bool{}}
 	after := ""
-	// waited holds the senders whose chat messages this pass left waiting
-	// for a session. If that session opens part-way through the pass, a
-	// later message from the same sender must not go before them.
-	waited := map[string]bool{}
+	// If the session the waited senders' messages wait for opens part-way
+	// through the pass, a later message from the same sender must not go
+	// before them.
+	waited := res.waited
 	for ctx.Err() == nil && !e.isClosed() {
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 		batch, err := e.store.Pending(sctx, recipient, after, e.clock.Now(), e.cfg.Batch)
@@ -263,12 +283,13 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 }
 
 // trySingles tries new messages of a held queue on their own. A message
-// that finds a chat leg open has older ones waiting for that same leg: the
-// whole queue is read instead, so that they go first.
-func (e *Engine) trySingles(ctx context.Context, ms []store.Message) passResult {
-	var res passResult
+// from a sender with messages waiting (waiting) that finds a chat leg open
+// has older ones waiting for that same leg: the whole queue is read
+// instead, so that they go first. Anyone else's goes at once.
+func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map[string]bool) passResult {
+	res := passResult{waited: map[string]bool{}}
 	for _, m := range ms {
-		switch e.deliver(ctx, m, true) {
+		switch e.deliver(ctx, m, waiting[m.Sender] || res.waited[m.Sender]) {
 		case whole:
 			res.again = true
 			return res
@@ -277,6 +298,9 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message) passResult 
 			return res
 		case skip:
 			res.skipped = true
+			if m.Mode == store.Chat || m.Notification {
+				res.waited[m.Sender] = true
+			}
 		}
 	}
 	return res

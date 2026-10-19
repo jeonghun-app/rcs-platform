@@ -366,6 +366,40 @@ func senderShares(t *testing.T, s store.Store) {
 	if err := s.Enqueue(ctx, from(carol, "0006"), store.Limit{SenderBytes: 2*size - 1}); !errors.Is(err, store.ErrSenderShareFull) {
 		t.Fatalf("beyond carol's bytes = %v", err)
 	}
+	// Notifications from a sender at its share still go in, and do not
+	// use up the share.
+	for _, id := range []string{"n1", "n2", "n3"} {
+		n := from(alice, id)
+		n.Notification = true
+		if err := s.Enqueue(ctx, n, l); err != nil {
+			t.Fatalf("notification %s = %v", id, err)
+		}
+	}
+	if err := s.Enqueue(ctx, from(alice, "0007"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("alice at her share = %v", err)
+	}
+	// With a message of hers gone she has room again, notifications or not.
+	m, err := s.Claim(ctx, bob, "0002", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, m, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, from(alice, "0007"), l); err != nil {
+		t.Fatalf("alice below her share, with notifications queued = %v", err)
+	}
+	// Removing a notification frees nothing of the share.
+	n, err := s.Claim(ctx, bob, "n1", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, n, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, from(alice, "0008"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("alice after a notification went = %v", err)
+	}
 }
 
 func longKeys(t *testing.T, s store.Store) {

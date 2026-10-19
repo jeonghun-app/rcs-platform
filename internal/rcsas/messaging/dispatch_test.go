@@ -493,7 +493,7 @@ func TestOneSenderCannotLockOthersOutOfAQueue(t *testing.T) {
 // batch; the rest wait for the next read of the queue.
 func TestTheMessagesKeptForAHeldQueueAreBounded(t *testing.T) {
 	r := newRig(t, Config{Batch: 3, SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour})
-	release := make(chan struct{})
+	release, blocked := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	r.d.onInvite(func(Invitation) error { return nil })
 	drainInvites(t, r.d)
@@ -503,11 +503,17 @@ func TestTheMessagesKeptForAHeldQueueAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "idle", r.idle)
-	r.d.onInvite(func(Invitation) error { once.Do(func() { <-release }); return nil })
+	r.d.onInvite(func(Invitation) error { once.Do(func() { close(blocked); <-release }); return nil })
 	r.e.mu.Lock()
 	delete(r.e.invites, inviteKey{bob, alice, store.Chat, ""})
 	r.e.mu.Unlock()
-	for i := range 10 {
+	// One message starts a pass whose invitation is held up...
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	<-blocked
+	// ...and the rest arrive while it is.
+	for i := 1; i < 10; i++ {
 		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("m", i+1), "hi", 0)}); err != nil {
 			t.Fatal(err)
 		}
@@ -546,5 +552,70 @@ func TestAnOutcomeAfterTheCloseBoundIsStillRecorded(t *testing.T) {
 	case d := <-r2.d.pagers:
 		t.Fatalf("delivered again by task-2: %q", d.CPIM)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A recipient catching up on many messages answers each with up to two
+// notifications; those are bounded by the messages, not by the share.
+func TestReceiptsForManyMessagesAreNotHeldToTheSenderShare(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}})
+	r.d.onPager(func(d Delivery) error {
+		if d.Recipient == alice {
+			return ErrOffline // alice is away while bob reads
+		}
+		return nil
+	})
+	const n = 70
+	for i := range n {
+		if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, fmt.Sprint("m", i), "hi", imdn.PositiveDelivery|imdn.Display))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range n {
+		id := fmt.Sprint("m", i)
+		for _, k := range []struct {
+			kind   imdn.Kind
+			status imdn.Status
+		}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
+			if err := r.e.Submit(t.Context(), standalone(bob, alice, receipt(t, id, k.kind, k.status))); err != nil {
+				t.Fatalf("receipt %s %s: %v", id, k.kind, err)
+			}
+		}
+	}
+	waitFor(t, "idle", r.idle)
+	if got := r.store.(*store.Memory).Len(alice); got != 2*n {
+		t.Fatalf("%d receipts queued for alice, want %d", got, 2*n)
+	}
+	if r.m.get("message.rejected.queue_share_full") != 0 {
+		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// Messages from one sender that wait for a session do not slow another
+// sender's live chat: only a sender with waiting messages takes the slow
+// path that reads the queue again.
+func TestALiveChatDoesNotReReadAQueueHeldByAnotherSender(t *testing.T) {
+	st := &readCounter{Store: store.NewMemory()}
+	r := newRigWith(t, Config{SenderRate: Rate{PerMinute: -1}}, st, newFakeClock())
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	drainInvites(t, r.d)
+	l := r.listen(t)
+	for i := range 100 {
+		if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("c", i), "from carol", 0)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "idle", r.idle)
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	waitFor(t, "idle", r.idle)
+	before := st.items.Load()
+	for i := range 100 {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("a", i), "live", 0)}); err != nil {
+			t.Fatal(err)
+		}
+		b.next(t)
+	}
+	if got := st.items.Load() - before; got > 100 {
+		t.Fatalf("100 live messages read %d queue items", got)
 	}
 }

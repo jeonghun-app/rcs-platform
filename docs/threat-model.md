@@ -157,7 +157,8 @@ metadata.
 - **Floods.** These are bounded:
   - per-recipient queues, by count and bytes, across tasks;
   - each sender's share of a queue (an eighth by default), so that no sender
-    can lock the others out;
+    can lock the others out; notifications are bounded by the sent records and
+    by being accepted once instead;
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
