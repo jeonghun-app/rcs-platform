@@ -161,6 +161,11 @@ func TestAResumeWaitsForTheServerToStoreTheBrokenUpload(t *testing.T) {
 	if !ok || !byStep(results)["resume"].OK {
 		t.Fatalf("results %+v", results)
 	}
+	// The wait happened: get_upload_info was answered only after the
+	// server had noticed the break (QA on #185).
+	if info := byStep(results)["get_upload_info"]; info.Millis < 900 {
+		t.Fatalf("get_upload_info took %d ms, under the 1 s the server took to notice the break", info.Millis)
+	}
 }
 
 func TestAResumeFileNoLargerThanAPartIsUploadedAgainAsRCSJTADoes(t *testing.T) {
