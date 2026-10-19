@@ -65,7 +65,7 @@ network, seconds after the break; the simulator asks at once, before
 `ft-server` may have noticed the break. So `get_upload_info` asks again, every
 100 ms. It stops once the answers have named the same bytes held for 300 ms,
 counted from the request that first got that value. A 404 is asked again for
-up to 3 s. If the bytes held are still changing when the 3 s have passed, the
+up to 3 s (`-upload-settle`). If the bytes held are still changing when the 3 s have passed, the
 step fails ("the server is still storing the broken upload") instead of
 resuming from a value that has not settled. Two equal answers in a row were not enough:
 `ft-server` may still hold the broken upload, and about one resume in 800 got
@@ -169,6 +169,37 @@ It sets up 1-to-1 chats as the caller (RFC 3261 §12–15):
   dialog it does not know, or no longer knows, gets 481; with it, such a
   request goes to `OnRequest`.
 
+It answers the registrar's challenge:
+
+- Every unchallenged REGISTER, a de-registration too, carries an
+  `Authorization` with the IMPI, the home domain as realm and an empty nonce
+  and response, from which the S-CSCF learns the private identity (TS 24.229
+  §5.1.1.2.2, §5.1.1.2.3).
+- It answers only challenges for the S-CSCF's realm (`Config.Realm`), which is
+  the home domain unless the HSS's realm (`HSS_IMS_REALM`) was set apart. An answer for
+  another realm would give that hop a response computed from the home
+  password to guess it from offline. Of those, it takes the topmost it can
+  meet (§5.1.1.5.4): with a password, MD5 or SHA-256 with `qop=auth` (RFC
+  7616, RFC 8760); with AKA keys, AKAv1-MD5 with `qop=auth` or without qop
+  (§5.4.1.2.1A).
+- With AKA keys it answers as a card does (RFC 3310, TS 33.102 §6.3.3). A
+  fresh SQN is answered with RES. An SQN the card will not accept is answered
+  with AUTS, after which the network resynchronises and challenges again. An
+  AUTN that does not verify, or a nonce without RAND and AUTN, is reported in
+  one more REGISTER with an empty response and no `auts` (§5.1.1.5.3). The
+  answer to that is the result.
+- A 407 and a 401 are answered side by side: each REGISTER after them carries
+  both credentials (RFC 3261 §22.3), with the next nonce-count and a new
+  cnonce.
+- Credentials refused once are not tried again: a second challenge of the
+  same kind is the result, unless it follows AUTS or says the nonce was
+  stale. One registration answers at most three challenges.
+
+The credentials come from the environment only: K and OPc as 32 hex digits in
+`RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`, the Digest password in
+`RCS_SIM_SIP_PASSWORD`. Only made-up keys or the TS 35.208 test sets belong
+there. They print as a placeholder in every form.
+
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an
 in-process stand-in for pcscf, the registrar and the far end. The registrar
@@ -194,6 +225,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-ft-upload-url` | none | ft-server's upload URI (`ftHTTPCSURI`); the FT scenarios fail without it |
 | `-ft-user` | `RCS_SIM_FT_USER` | FT user name (`ftHTTPCSUser`) |
 | `-file-size` | 256 KiB | size of the `ft` file |
+| `-upload-settle` | 3s | how long `get_upload_info` is asked again for a broken upload to show; when it ends with the bytes still changing, the step fails. Tests that run the in-process stack set an hour, so that only `-step-timeout` bounds the step |
 | `-resume-size` | 12 MiB | size of the `ft-resume` file; must exceed the server's `FT_PART_SIZE`, since only whole parts survive a break; otherwise nothing is held and the scenario uploads again instead of resuming |
 | `-relay-control` | none | msrp-relay control API base URL; the chat scenarios fail without it |
 | `-core-listen` | `127.0.0.1:0` | where the rcs-as stand-in listens; the port must be in the relay's `RELAY_CORE_PORTS` |
