@@ -69,18 +69,52 @@ func TestSlowButReadingPeerKeepsItsConnectionUnderABurst(t *testing.T) {
 
 func TestLargeMessageToASteadyReaderIsNotCutByTheWriteTimeout(t *testing.T) {
 	// The whole message takes about 1.6 s to drain, longer than WriteTimeout,
-	// but the peer takes 32 KiB every 100 ms, so the writer makes progress ten
-	// times per WriteTimeout, which leaves room for a loaded host.
-	tr, peer := pipeTransport(t, Config{WriteTimeout: time.Second})
-	got := make(chan int, 1)
+	// but the peer takes 32 KiB every 100 ms, so the writer makes progress
+	// ten times per WriteTimeout.
+	//
+	// On a loaded host the peer's 100 ms can stretch past WriteTimeout, and
+	// then cutting the connection is right (#155). So a cut fails the test
+	// only if it came sooner than WriteTimeout after the peer's last read;
+	// a cut after a longer pause is the host's doing, and the run is tried
+	// again.
+	const writeTimeout = time.Second
+	for attempt := 1; attempt <= 5; attempt++ {
+		read, pause := steadyReaderRun(t, writeTimeout)
+		switch {
+		case read >= 512<<10:
+			return
+		case pause < writeTimeout:
+			t.Fatalf("peer read %d bytes; the connection was cut %v after the peer's last read, within WriteTimeout %v", read, pause, writeTimeout)
+		}
+		t.Logf("attempt %d: the peer paused %v, past WriteTimeout; trying again", attempt, pause)
+	}
+	t.Skip("the host kept the peer from reading for longer than WriteTimeout in every attempt")
+}
+
+// steadyReaderRun sends a 512 KiB message to a peer that reads 32 KiB every
+// 100 ms, and returns how much it read and, if it was cut off, how long
+// after its last read the cut came.
+func steadyReaderRun(t *testing.T, writeTimeout time.Duration) (read int, pause time.Duration) {
+	t.Helper()
+	tr, peer := pipeTransport(t, Config{WriteTimeout: writeTimeout})
+	type result struct {
+		n     int
+		pause time.Duration
+	}
+	got := make(chan result, 1)
 	go func() {
 		buf := make([]byte, writeChunk)
-		total := 0
+		total, last := 0, time.Now()
 		for {
 			n, err := peer.Read(buf)
 			total += n
-			if err != nil || total >= 512<<10 {
-				got <- total
+			if err != nil {
+				got <- result{total, time.Since(last)}
+				return
+			}
+			last = time.Now()
+			if total >= 512<<10 {
+				got <- result{total, 0}
 				return
 			}
 			time.Sleep(100 * time.Millisecond)
@@ -92,14 +126,15 @@ func TestLargeMessageToASteadyReaderIsNotCutByTheWriteTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case n := <-got:
-		if n < 512<<10 {
-			t.Fatalf("peer read %d bytes", n)
+	case r := <-got:
+		if r.n >= 512<<10 {
+			if s := tr.Stats(); s.WriteErrors != 0 || s.OpenOutbound != 1 {
+				t.Fatalf("stats = %+v", s)
+			}
 		}
+		return r.n, r.pause
 	case <-time.After(waitFor):
 		t.Fatal("the message never arrived")
 	}
-	if s := tr.Stats(); s.WriteErrors != 0 || s.OpenOutbound != 1 {
-		t.Fatalf("stats = %+v", s)
-	}
+	return 0, 0
 }
