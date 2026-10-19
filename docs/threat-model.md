@@ -20,6 +20,21 @@ not authenticated without TLS.
 requirement and security groups planned (#12, Phase 7 infrastructure); per-peer
 command restrictions open.
 
+The other direction: whoever answers on the Cx port at an address the CSCFs
+discover for `hss` (by adding an instance to the Cloud Map service, T7, or
+running a task the security groups admit) receives every UAR, MAR and SAR, with
+IMPIs and AUTS, and can send RTR (deregister any user) and PPR (push User-Data
+whose iFC route a user's sessions to an application server it controls).
+**Control:** the CSCFs connect only to addresses Cloud Map lists for `hss` and
+only reach them through the security group from `icscf`/`scscf` to the `hss`
+port; the CEA must name the HSS realm; `cxclient` sends no request to, and
+refuses RTR and PPR from, a peer whose Origin-Host does not match
+`HSSHostPattern` (`hss-*.<namespace>`, ADR 0005). Origin-Host is still not
+authenticated without TLS, so the pattern guards against a misdirected peer,
+and Cloud Map and IAM integrity (T7) against a planted one.
+**Status:** Origin-Host pattern implemented (`internal/ims/cxclient`, #76);
+security groups planned (Phase 7 infrastructure).
+
 ## T2 — SIP trust domain (RFC 3325)
 
 Anything that reaches a core SIP port can send as any subscriber by setting
