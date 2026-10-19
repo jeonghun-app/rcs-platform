@@ -337,7 +337,7 @@ func hintOf(t *testing.T, redacted string) string {
 // milliseconds, so a regression shows up as a test timeout, not a flaky timing.
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
-	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３"} {
+	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
@@ -395,6 +395,11 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 		{"full-width national number in ASCII groups", "call ０１０-００００-０００１", "call ***01"},
 		{"full-width international number in ASCII groups", "call +１ ５５５ ０１００ ００１", "call +***01"},
 		{"full-width inside a sip URI user", "sip:１５５５０１００００１@" + testDomain, "sip:***01@" + testDomain},
+		// Full-width separators group a number as ASCII ones do (#85).
+		{"full-width hyphens", "call ０１０－００００－０００１", "call ***01"},
+		{"full-width plus and ideographic spaces", "call ＋１\u3000５５５\u3000０１０\u3000０００１", "call +***01"},
+		{"full-width parentheses and full stops", "（０７７００）\u3000９００．００１", "(***01"},
+		{"full-width separators around ASCII digits", "010－0000－0001", "***01"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := r.Redact(tt.in); got != tt.want {
@@ -407,6 +412,18 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 	k := NewRedactor(testKey)
 	if a, b := k.Redact(testMSISDN), k.Redact("+１５５５０１００００１"); a != b {
 		t.Errorf("hints differ: %q and %q", a, b)
+	}
+	// A number written with full-width separators is masked as its ASCII
+	// form is, hint included.
+	for ascii, wide := range map[string]string{
+		"+1 555 010 0001":   "＋１\u3000５５５\u3000０１０\u3000０００１",
+		"010-0000-0001":     "０１０－００００－０００１",
+		"(07700) 900.001":   "（０７７００）\u3000９００．００１",
+		"tel:+1-555-0100-1": "tel:＋１－５５５－０１００－１",
+	} {
+		if a, b := k.Redact(ascii), k.Redact(wide); a != b || !strings.Contains(a, mark) {
+			t.Errorf("%q gives %q but %q gives %q", ascii, a, wide, b)
+		}
 	}
 }
 
