@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"impu\":\"sip:0@a\",\"impi\":\"0@0\",\"ContACts\":[{\"uri\":\"\x94\x94\",\"eXpires\":\"0000-01-01T0:00:00+01:00\"}]}")
