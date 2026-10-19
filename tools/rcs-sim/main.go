@@ -76,6 +76,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		ftUser        = fs.String("ft-user", envOr(lookup, "RCS_SIM_FT_USER", ""), "FT user name (ftHTTPCSUser); also RCS_SIM_FT_USER")
 		fileSize      = fs.Int("file-size", 256<<10, "size of the file the ft scenario sends")
 		resumeSize    = fs.Int("resume-size", 12<<20, "size of the file ft-resume sends; must exceed FT_PART_SIZE")
+		uploadSettle  = fs.Duration("upload-settle", 3*time.Second, "how long ft-resume asks get_upload_info again for a broken upload to show")
 		control       = fs.String("relay-control", "", "msrp-relay control API base URL")
 		coreListen    = fs.String("core-listen", "127.0.0.1:0", "where the rcs-as stand-in listens")
 		coreAdvertise = fs.String("core-advertise", "", "host the relay connects to for the stand-in (default: the listener's)")
@@ -124,6 +125,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	cfg := scenario.Config{
 		FileSize:      *fileSize,
 		ResumeSize:    *resumeSize,
+		UploadSettle:  *uploadSettle,
 		CoreListen:    *coreListen,
 		CoreAdvertise: *coreAdvertise,
 		MSRP:          msrp.Config{KeepAliveInterval: *keepAlive},
@@ -139,6 +141,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	}
 	if *fileSize < 1 || *resumeSize < 1 {
 		return usage("-file-size and -resume-size must be positive")
+	}
+	if *uploadSettle <= 0 {
+		return usage("-upload-settle must be positive")
 	}
 	if *idleWait > 0 && *stepTimeout <= *idleWait {
 		return usage("-step-timeout must be longer than -idle-wait: the keep-alive step waits -idle-wait within it")
