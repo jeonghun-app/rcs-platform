@@ -73,7 +73,10 @@ func TestAnHSSThatStopsAnsweringTimesOutAsABackendFailure(t *testing.T) {
 			if took >= backstop/2 {
 				t.Fatalf("Lookup took %v with a %v timeout", took, timeout)
 			}
-			if err == nil || !strings.Contains(err.Error(), "Timeout") {
+			// The duration check above rules out the backstop, so the
+			// deadline is the client's. errors.Is, not the message, so a
+			// timeout moved into a context still passes.
+			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("Lookup = %v, want the client's timeout", err)
 			}
 			if isUnknown, isRecord := errors.Is(err, ErrUnknownUser), errors.Is(err, ErrBadCredentialRecord); isUnknown || isRecord {
@@ -91,10 +94,13 @@ func TestAnUploadWhoseLookupTimesOutIsAnsweredServiceUnavailable(t *testing.T) {
 	e := newEnv(t, func(o *Options) { o.Credentials = src })
 	u := e.user(alice)
 	u.challenge()
+	// Signed here: sign can call t.Fatal, which must not run off the
+	// test's goroutine. Only the request runs in the goroutine.
+	r := httptest.NewRequest(http.MethodPost, "/ft", strings.NewReader(multipartBody(tidPart("slow-hss"), filePart("a.bin", "application/octet-stream", "x"))))
+	r.Header.Set("Content-Type", formType)
+	r = u.sign(r)
 	answered := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		answered <- u.upload(multipartBody(tidPart("slow-hss"), filePart("a.bin", "application/octet-stream", "x")))
-	}()
+	go func() { answered <- e.do(r) }()
 	var rec *httptest.ResponseRecorder
 	select {
 	case rec = <-answered:
@@ -103,5 +109,10 @@ func TestAnUploadWhoseLookupTimesOutIsAnsweredServiceUnavailable(t *testing.T) {
 	}
 	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("upload = %d, Retry-After %q; want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	// A backend failure, not the lookup limit (errLookupBusy), which is
+	// answered 503 too.
+	if got := e.metric("auth.backend_error"); got != 1 {
+		t.Fatalf("auth.backend_error = %v, want 1", got)
 	}
 }
