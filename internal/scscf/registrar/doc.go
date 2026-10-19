@@ -18,8 +18,11 @@
 // the client's connection with TLS, not the IPsec security association they
 // are for, so there is no Security-Client negotiation either.
 //
-// Third-party registration, the reg event package and the deregistration
-// sweeps come in later parts of #14, on top of this package.
+// The HSS's own requests are answered here too: an RTR deregisters the sets
+// it names, a PPR replaces one set's profile and follows changes to the set
+// (HandleRTR, HandlePPR). Sweeps (Sweep, RunSweeps) deregister what expired,
+// registrations and unregistered users' records alike. Third-party
+// registration and the reg event package come in later parts of #14.
 //
 // Logs carry no identity, nonce or credential.
 package registrar

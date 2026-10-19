@@ -96,8 +96,11 @@ type fakeHSS struct {
 	unavailable bool
 	// sarResult, if set, is the result of every SAR.
 	sarResult *cx.Result
-	mars      []*cx.MAR
-	sars      []*cx.SAR
+	// sarHook, if set, answers a SAR in place of the HSS, unless it returns
+	// nil and no error.
+	sarHook func(*cx.SAR) (*cx.SAA, error)
+	mars    []*cx.MAR
+	sars    []*cx.SAR
 }
 
 func newFakeHSS() *fakeHSS { return &fakeHSS{subs: map[string]*subscriber{}} }
@@ -176,21 +179,18 @@ func (f *fakeHSS) SAR(_ context.Context, r *cx.SAR) (*cx.SAA, error) {
 	if f.sarResult != nil {
 		return &cx.SAA{Answer: cx.Answer{Result: *f.sarResult}}, nil
 	}
+	if f.sarHook != nil {
+		if saa, err := f.sarHook(&cp); saa != nil || err != nil {
+			return saa, err
+		}
+	}
 	s := f.subs[r.UserName]
 	if s == nil {
 		return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
 	}
 	saa := &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}}
 	if r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable && (r.AssignmentType == cx.Registration || r.AssignmentType == cx.ReRegistration) {
-		sp := ifc.ServiceProfile{}
-		for _, id := range s.set {
-			sp.PublicIdentities = append(sp.PublicIdentities, ifc.PublicIdentity{Identity: id, BarringIndication: s.barred[id]})
-		}
-		doc, err := (&ifc.Subscription{PrivateID: s.impi, ServiceProfiles: []ifc.ServiceProfile{sp}}).Marshal()
-		if err != nil {
-			return nil, err
-		}
-		saa.UserData = doc
+		saa.UserData = userDataOf(s.impi, s.barred, s.set...)
 	}
 	return saa, nil
 }
@@ -425,4 +425,28 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.w.Write(p)
+}
+
+// userDataOf is the IMSSubscription of one implicit registration set.
+func userDataOf(impi string, barred map[string]bool, set ...string) []byte {
+	sp := ifc.ServiceProfile{}
+	for _, id := range set {
+		sp.PublicIdentities = append(sp.PublicIdentities, ifc.PublicIdentity{Identity: id, BarringIndication: barred[id]})
+	}
+	doc, err := (&ifc.Subscription{PrivateID: impi, ServiceProfiles: []ifc.ServiceProfile{sp}}).Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return doc
+}
+
+// sarsOf returns the assignment types of the SARs sent so far.
+func (f *fakeHSS) sarsOf() []cx.ServerAssignmentType {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []cx.ServerAssignmentType
+	for _, s := range f.sars {
+		out = append(out, s.AssignmentType)
+	}
+	return out
 }
