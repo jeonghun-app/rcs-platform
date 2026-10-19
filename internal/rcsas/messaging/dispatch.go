@@ -27,7 +27,9 @@ import (
 //     pager mode the way, or the retry timer.
 //   - The recipient could not be reached (holdBlocked): a new message
 //     waits too. Any registration, a leg, or the retry timer reads the
-//     queue.
+//     queue. A message that comes in while such a pass runs is noted:
+//     should the pass get through, the queue is read again for it, since
+//     the pass may have read past where it sorts (#214).
 //
 // The retry timer starts at RetryInterval and doubles up to
 // MaxRetryInterval while a queue stays held, so a recipient that never
@@ -61,6 +63,9 @@ type recipient struct {
 	// last passes left waiting for a session: a new message from one of
 	// them must not go ahead of those, from anyone else it may.
 	waiting map[string]bool
+	// arrived notes a message queued while a pass ran with the queue
+	// blocked (see hold).
+	arrived bool
 }
 
 // state needs e.mu.
@@ -125,6 +130,9 @@ func (e *Engine) kickNew(m store.Message) {
 			r.waiting[m.Sender] = true
 		}
 	case holdBlocked:
+		if r.run == running {
+			r.arrived = true
+		}
 		return
 	}
 	e.schedule(m.Recipient, r)
@@ -186,6 +194,14 @@ func (e *Engine) work() {
 				}
 			}
 			e.settle(user, r, res, full)
+			if r.arrived {
+				// Blocked still, it waits like the rest; otherwise the
+				// queue is read again for it.
+				r.arrived = false
+				if r.hold != holdBlocked {
+					r.full = true
+				}
+			}
 			if e.closed {
 				break
 			}
