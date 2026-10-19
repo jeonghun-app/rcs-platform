@@ -23,6 +23,7 @@ def ingress(group: str, port: int, **peer) -> dict:
 def task_definition(**container) -> dict:
     c = {
         "Name": "svc",
+        "Image": "registry.example/svc@sha256:" + "ab" * 32,
         "ReadonlyRootFilesystem": True,
         "LinuxParameters": {"Capabilities": {"Drop": ["ALL"]}},
     }
@@ -233,6 +234,10 @@ class PlatformTemplate(TemplateCase):
         self.assertProblem(t, "Files: point-in-time recovery is off")
         t = self.changed(Files={"Type": "AWS::DynamoDB::Table", "Properties": {
             "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": True}}})
+        self.assertProblem(t, "Files: SSE with a KMS key is not on")
+        t = self.changed(Files={"Type": "AWS::DynamoDB::Table", "Properties": {
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": True},
+            "SSESpecification": {"SSEEnabled": True}}})
         self.assertEqual(check_infra.problems(t), [])
 
     def test_task_roles_cannot_read_secrets(self):
@@ -344,6 +349,134 @@ class PlatformServices(TemplateCase):
         t["Resources"]["FtServerTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
             {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "FtNonceKey"}})
         self.assertProblem(t, "FtServerTaskRole: a task role may read secrets")
+
+
+
+class SecurityChecklist(TemplateCase):
+    """Bad copies of the template that the security review asked to fail."""
+
+    def statements(self, t: dict, role: str, policy: int = 0) -> list:
+        return t["Resources"][role]["Properties"]["Policies"][policy]["PolicyDocument"]["Statement"]
+
+    def test_a_glob_read_on_every_table_reaches_the_bindings(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "HssTaskRole").append({"Effect": "Allow", "Action": "dynamodb:Get*", "Resource": {
+            "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"}})
+        self.assertProblem(t, "HssTaskRole: may read MsrpBindingsTable")
+
+    def test_not_action_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "AcsTaskRole").append({"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"})
+        self.assertProblem(t, "AcsTaskRole: an Allow with NotAction grants everything it does not name")
+        self.assertProblem(t, "AcsTaskRole: a task role may read secrets")
+
+    def test_an_execution_role_reading_every_secret_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for st in self.statements(t, "FtServerExecutionRole"):
+            if st.get("Action") == "secretsmanager:GetSecretValue":
+                st["Resource"] = "*"
+        self.assertProblem(t, "FtServerExecutionRole: may read *, which its task definition does not inject")
+
+    def test_an_execution_role_reading_another_services_secret_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for st in self.statements(t, "RelayExecutionRole"):
+            if st.get("Action") == "secretsmanager:GetSecretValue":
+                st["Resource"] = st["Resource"] + [{"Ref": "HssAdminToken"}]
+        self.assertProblem(t, "RelayExecutionRole: may read HssAdminToken")
+
+    def test_parameter_store_secrets_count_as_secrets(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "HssTaskRole").append({"Effect": "Allow", "Action": "ssm:GetParameter*", "Resource": {
+            "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/x"}})
+        self.assertProblem(t, "HssTaskRole: a task role may read secrets")
+
+    def test_a_separate_role_policy_is_seen(self):
+        t = self.changed(Extra={"Type": "AWS::IAM::RolePolicy", "Properties": {
+            "RoleName": {"Ref": "AcsTaskRole"}, "PolicyName": "x", "PolicyDocument": {"Statement": [
+                {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "AcsAdminToken"}}]}}})
+        self.assertProblem(t, "Extra: lets a task role read secrets")
+
+    def test_a_secret_resource_policy_for_a_task_role_is_refused(self):
+        t = self.changed(Open={"Type": "AWS::SecretsManager::ResourcePolicy", "Properties": {
+            "SecretId": {"Ref": "FtNonceKey"}, "ResourcePolicy": {"Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": {"Fn::GetAtt": ["FtServerTaskRole", "Arn"]}},
+                "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]}}})
+        self.assertProblem(t, "Open: a secret resource policy lets a task role or anyone read it")
+
+    def test_any_action_on_every_resource_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "MsrpRelayTaskRole").append({"Effect": "Allow", "Action": "logs:PutLogEvents", "Resource": "*"})
+        self.assertProblem(t, "MsrpRelayTaskRole: logs:PutLogEvents on Resource '*'")
+
+    def test_sns_publish_without_the_topic_deny_is_refused(self):
+        t = copy.deepcopy(self.template)
+        policies = t["Resources"]["AcsTaskRole"]["Properties"]["Policies"]
+        for p in policies:
+            if isinstance(p, dict) and "Fn::If" in p and p["Fn::If"][0] == "UseAcsSns":
+                p["Fn::If"][1]["PolicyDocument"]["Statement"] = p["Fn::If"][1]["PolicyDocument"]["Statement"][:1]
+        self.assertProblem(t, "AcsTaskRole: sns:Publish on '*' without a Deny on topics reaches every topic")
+
+    def test_a_scan_outside_the_allowlist_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "AcsTaskRole").append({"Effect": "Allow", "Action": "dynamodb:Scan",
+                                                   "Resource": {"Fn::GetAtt": ["AcsTable", "Arn"]}})
+        self.assertProblem(t, "AcsTaskRole: may Scan AcsTable")
+
+    def test_the_root_using_a_key_is_refused(self):
+        t = copy.deepcopy(self.template)
+        statements = t["Resources"]["HssKey"]["Properties"]["KeyPolicy"]["Statement"]
+        statements[0]["Action"] = statements[0]["Action"] + ["kms:Create*"]
+        self.assertProblem(t, "HssKey: root may use the key; only HssTaskRole may")
+
+    def test_another_role_using_the_hss_key_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssKey"]["Properties"]["KeyPolicy"]["Statement"].append({
+            "Effect": "Allow", "Principal": {"AWS": {"Fn::GetAtt": ["AcsTaskRole", "Arn"]}},
+            "Action": "kms:Decrypt", "Resource": "*"})
+        self.assertProblem(t, "HssKey: AcsTaskRole may use the key")
+
+    def test_an_unencrypted_topic_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["AlarmTopic"]["Properties"]["KmsMasterKeyId"]
+        self.assertProblem(t, "AlarmTopic: not encrypted (KmsMasterKeyId)")
+
+    def test_a_topic_policy_without_cloudwatch_silences_the_alarms(self):
+        t = copy.deepcopy(self.template)
+        st = t["Resources"]["AlarmTopicPolicy"]["Properties"]["PolicyDocument"]["Statement"][0]
+        st["Principal"]["Service"] = ["events.amazonaws.com"]
+        self.assertProblem(t, "AlarmTopic: cloudwatch.amazonaws.com publishes to it but its topic policy does not allow it")
+
+    def test_an_image_by_tag_is_refused(self):
+        t = copy.deepcopy(self.template)
+        c = t["Resources"]["AcsTaskDefinition"]["Properties"]["ContainerDefinitions"][0]
+        c["Image"]["Fn::Sub"][0] = "${Repository}:${AcsImageTag}"
+        self.assertProblem(t, "AcsTaskDefinition/acs: image by tag")
+
+    def test_a_secret_resolved_into_the_environment_is_refused(self):
+        t = copy.deepcopy(self.template)
+        c = t["Resources"]["FtServerTaskDefinition"]["Properties"]["ContainerDefinitions"][0]
+        c["Environment"].append({"Name": "LEAK", "Value": "{{resolve:secretsmanager:x}}"})
+        self.assertProblem(t, "FtServerTaskDefinition/ft-server: LEAK resolves a secret into plain text")
+
+    def test_buckets_must_be_locked(self):
+        t = copy.deepcopy(self.template)
+        props = t["Resources"]["FilesBucket"]["Properties"]
+        props["PublicAccessBlockConfiguration"]["RestrictPublicBuckets"] = "false"
+        del props["BucketEncryption"]
+        self.assertProblem(t, "FilesBucket: RestrictPublicBuckets is not on")
+        self.assertProblem(t, "FilesBucket: no default encryption")
+        t = self.changed(FilesBucketPolicy=None)
+        self.assertProblem(t, "FilesBucket: its policy does not refuse requests without TLS")
+
+    def test_a_service_in_another_group_or_subnet_is_refused(self):
+        t = copy.deepcopy(self.template)
+        net = t["Resources"]["AcsService"]["Properties"]["NetworkConfiguration"]["AwsvpcConfiguration"]
+        net["SecurityGroups"].append({"Ref": "HssSecurityGroup"})
+        net["AssignPublicIp"] = "ENABLED"
+        net["Subnets"] = [{"Ref": "PublicSubnetA"}]
+        self.assertProblem(t, "AcsService: runs in ['AcsSecurityGroup', 'HssSecurityGroup']")
+        self.assertProblem(t, "AcsService: tasks get a public address")
+        self.assertProblem(t, "AcsService: tasks outside the private subnets")
 
 
 if __name__ == "__main__":
