@@ -407,8 +407,8 @@ func (ua *UA) register(ctx context.Context, expires time.Duration) (*Registratio
 	if err != nil {
 		return nil, err
 	}
-	// The first REGISTER goes to the P-CSCF alone; the Service-Route is
-	// only for what follows registration (RFC 3608 §6).
+	// Every REGISTER, refreshes included, goes to the P-CSCF alone: the
+	// Service-Route is for the other requests (RFC 3608).
 	add(req, &err, "Route", ua.proxy.String())
 	add(req, &err, "Supported", "path, outbound")
 	add(req, &err, "Contact", ua.contact.String())
