@@ -619,3 +619,81 @@ func TestALiveChatDoesNotReReadAQueueHeldByAnotherSender(t *testing.T) {
 		t.Fatalf("100 live messages read %d queue items", got)
 	}
 }
+
+// A held queue gets more new messages than it can try on their own while
+// one attempt runs: those beyond are neither lost nor sent out of order.
+func TestMessagesBeyondTheHeldQueueSingleListAreNotLost(t *testing.T) {
+	const n = 120
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}})
+	l := r.listen(t)
+	drainInvites(t, r.d)
+	var b *client
+	for i := range n {
+		if i == n/3 {
+			_, b = r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+		}
+		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("m", i), fmt.Sprintf("#%04d", i), 0)}
+		if err := r.e.Submit(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range n {
+		if got := b.next(t); !bytes.HasSuffix(got.Body, []byte(fmt.Sprintf("#%04d", i))) {
+			t.Fatalf("delivery %d: %q", i, got.Body)
+		}
+	}
+}
+
+func TestADroppedSingleDoesNotLetALaterMessageOvertake(t *testing.T) {
+	r := newRig(t, Config{Batch: 2, SenderRate: Rate{PerMinute: -1}})
+	l := r.listen(t)
+	var mu sync.Mutex
+	gates := map[string]chan struct{}{}
+	entered := make(chan string, 16)
+	gate := func(peer string) chan struct{} {
+		mu.Lock()
+		defer mu.Unlock()
+		g := make(chan struct{})
+		gates[peer] = g
+		return g
+	}
+	r.d.onInvite(func(inv Invitation) error {
+		mu.Lock()
+		g := gates[inv.Peer]
+		mu.Unlock()
+		if g != nil {
+			entered <- inv.Peer
+			<-g
+		}
+		return ErrOffline
+	})
+	drainInvites(t, r.d)
+	submit := func(from, id string) {
+		t.Helper()
+		if err := r.e.Submit(t.Context(), Origin{Sender: from, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, id, id, 0)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x1, x2, x3 := "sip:x1@example.net", "sip:x2@example.net", "sip:x3@example.net"
+	submit(carol, "c0") // the queue is held; waiting = {carol}
+	waitFor(t, "idle", r.idle)
+	g1 := gate(x1)
+	submit(x1, "x1") // the worker blocks in Invite(x1)
+	<-entered
+	g2 := gate(x2)
+	submit(x2, "x2")
+	submit(carol, "c3") // the single list is full (Batch 2)
+	submit(alice, "a1") // dropped: not tried, not in waiting
+	close(g1)           // the worker takes [x2, c3] and blocks in Invite(x2)
+	<-entered
+	g3 := gate(x3)
+	submit(x3, "x3")
+	submit(alice, "a2") // single list [x3, a2]
+	close(g2)           // the worker takes [x3, a2] and blocks in Invite(x3)
+	<-entered
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	close(g3)
+	if first := b.next(t); !bytes.HasSuffix(first.Body, []byte("a1")) {
+		t.Fatalf("bob's first message from alice is %q, want a1", first.Body[len(first.Body)-2:])
+	}
+}

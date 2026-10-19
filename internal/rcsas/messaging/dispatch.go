@@ -114,6 +114,15 @@ func (e *Engine) kickNew(m store.Message) {
 	case holdWaiting:
 		if len(r.single) < e.cfg.Batch {
 			r.single = append(r.single, m)
+		} else {
+			// No room to try it on its own: the queue is read in order
+			// instead, and until then its sender counts as waiting, so
+			// that no later message of its goes first.
+			r.full = true
+			if r.waiting == nil {
+				r.waiting = map[string]bool{}
+			}
+			r.waiting[m.Sender] = true
 		}
 	case holdBlocked:
 		return
