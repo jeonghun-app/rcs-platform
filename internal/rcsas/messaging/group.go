@@ -415,9 +415,11 @@ func (e *Engine) submitGroupNotification(ctx context.Context, h GroupHandler, o 
 
 // groupComposing passes an is-composing indication to the open sessions
 // of the other participants on this task, without storing it, under
-// IsComposingRate per sender and group.
+// IsComposingRate per sender and group. With no other session of the
+// group open here there is nobody to pass it to, and the group's item is
+// not read.
 func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrigin, m *Message, now time.Time) error {
-	if len(o.CPIM) > MaxIsComposingSize || !e.composing.allow(o.Group+"\x00"+o.Sender, now) {
+	if len(o.CPIM) > MaxIsComposingSize || !e.composing.allow(o.Group+"\x00"+o.Sender, now) || !e.othersHere(o.Group, o.Sender) {
 		e.metrics.Count("iscomposing.dropped", 1)
 		return nil
 	}
@@ -448,6 +450,22 @@ func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrig
 		}()
 	}
 	return nil
+}
+
+// othersHere reports whether a participant of group other than sender
+// has a session with it open on this task.
+func (e *Engine) othersHere(group, sender string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	own := 0
+	for _, l := range e.legs[legKey{sender, group}] {
+		select {
+		case <-l.Done():
+		default:
+			own++
+		}
+	}
+	return e.groupLegs[group] > own
 }
 
 // groupReceived is HandleMessage for a group session. A bare is-composing

@@ -232,14 +232,23 @@ func (l *Leg) activate() {
 		// A group session is a chat session whose peer is the group's
 		// conference URI.
 		key := legKey{l.p.User, l.p.Peer}
+		group := l.p.Mode == store.Group
 		e.mu.Lock()
 		e.legs[key] = append(e.legs[key], l)
+		if group {
+			e.groupLegs[l.p.Peer]++
+		}
 		delete(e.invites, inviteKey{l.p.User, l.p.Peer, l.p.Mode, ""})
 		e.mu.Unlock()
 		go func() {
 			<-l.session.Done()
 			e.mu.Lock()
 			defer e.mu.Unlock()
+			if group {
+				if e.groupLegs[l.p.Peer]--; e.groupLegs[l.p.Peer] == 0 {
+					delete(e.groupLegs, l.p.Peer)
+				}
+			}
 			legs := e.legs[key]
 			for i, x := range legs {
 				if x == l {

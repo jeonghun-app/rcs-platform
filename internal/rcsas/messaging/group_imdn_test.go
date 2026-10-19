@@ -153,3 +153,37 @@ func TestAMessageIDIsNotSharedBetweenAGroupAnd1To1(t *testing.T) {
 		t.Fatalf("a group ID to bob, who got it in the group: %q", got)
 	}
 }
+
+// Is-composing in a group reads the group only when another participant
+// has a session open here, and at most IsComposingRate's burst at once.
+func TestGroupIsComposingIsBoundedAndReadsTheGroupOnlyForSomeone(t *testing.T) {
+	r := newRig(t, Config{})
+	reads := new(atomic.Int64)
+	r.e.SetGroupHandler(counted{members{all: []string{alice, bob}}, reads})
+	ind := "From: <" + alice + ">\r\nTo: <" + AnonymousURI + ">\r\n\r\nContent-Type: " + IsComposingType + "\r\n\r\n" +
+		`<isComposing xmlns="urn:ietf:params:xml:ns:im-iscomposing"><state>active</state></isComposing>`
+	send := func() {
+		t.Helper()
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, []byte(ind))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l := r.listen(t)
+	r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	send()
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("%d group reads with nobody else here", n)
+	}
+	r.clock.Advance(time.Minute)
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	for range 3 * IsComposingRate.Burst {
+		send()
+	}
+	if n := reads.Load(); n != int64(IsComposingRate.Burst) {
+		t.Fatalf("%d group reads for %d indications, burst %d", n, 3*IsComposingRate.Burst, IsComposingRate.Burst)
+	}
+	b.next(t)
+	if r.m.get("iscomposing.dropped") < int64(2*IsComposingRate.Burst) {
+		t.Fatalf("metrics %v", r.m)
+	}
+}

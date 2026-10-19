@@ -346,7 +346,9 @@ chat (size, CPIM parse, `From` check, per-sender rate). Then:
   - pager mode is never used, since a client cannot place a group message
     that arrives outside the group.
 - **Is-composing.** Indications go to the joined participants' open sessions
-  on this task, unstored, with `From` rewritten. rcsjta sends them wrapped in
+  on this task, unstored, with `From` rewritten, at 60 a minute with a burst
+  of 5 per participant and group. With no other session of the group open on
+  the task, one is dropped without reading the group. rcsjta sends them wrapped in
   CPIM in a group; a bare one is wrapped.
 
 ### Notifications in a group
@@ -581,7 +583,10 @@ TTL attribute `ttl`) and no index. Each group is one item:
 
 Each group message costs one strongly consistent read of the group item and,
 per recipient, the enqueue transaction of the `messages` table. The fan-out
-budget bounds that per group.
+budget bounds that per group. A notification costs a read of its sent-message
+record first, and of the group item only when the record exists; an
+is-composing indication reads the group item only when another participant
+has a session with the group on the same task, within its rate.
 
 ## Metrics and logs
 

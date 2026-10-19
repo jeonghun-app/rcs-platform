@@ -184,6 +184,8 @@ type Engine struct {
 	// departed marks the participants that left a group on this task
 	// (ParticipantLeft), until when their copies could still be queued.
 	departed map[legKey]time.Time
+	// groupLegs counts the open group legs of each group on this task.
+	groupLegs map[string]int
 	lastID   int64
 	sweepAt  string
 }
@@ -221,6 +223,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		invites:    map[inviteKey]time.Time{},
 		pagerOnly:  map[string]struct{}{},
 		departed:   map[legKey]time.Time{},
+		groupLegs:  map[string]int{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {
