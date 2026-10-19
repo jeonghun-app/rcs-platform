@@ -2,7 +2,6 @@ package pii
 
 import (
 	"bytes"
-	"log/slog"
 	"net/netip"
 	"strings"
 	"testing"
@@ -45,7 +44,7 @@ func TestClientIPsAreTruncatedToTheirNetwork(t *testing.T) {
 
 func TestClientIPAttributeNeverCarriesTheFullAddress(t *testing.T) {
 	var buf bytes.Buffer
-	slog.New(slog.NewJSONHandler(&buf, nil)).Info("connection", ClientIP("source", "192.0.2.77:40001"), ClientIP("v6", "[2001:db8:5:6:7::8]:5061"))
+	untimedJSONLogger(&buf).Info("connection", ClientIP("source", "192.0.2.77:40001"), ClientIP("v6", "[2001:db8:5:6:7::8]:5061"))
 	out := buf.String()
 	for _, leak := range []string{"192.0.2.77", "40001", ":6:7::8", "5061"} {
 		if strings.Contains(out, leak) {

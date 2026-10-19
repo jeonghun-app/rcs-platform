@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -296,7 +297,7 @@ func TestPackageFunctionsUseTheDefaultRedactor(t *testing.T) {
 
 func TestAttributesNeverCarryTheRawValueIntoALogLine(t *testing.T) {
 	var buf bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	log := untimedJSONLogger(&buf)
 	log.Info("registered",
 		URI("impu", "sip:"+testMSISDN+"@"+testDomain),
 		Identity("impi", testIMSI+"@"+testDomain),
@@ -428,4 +429,16 @@ func TestDigitValuesFollowTheUnicodeDecimalDigits(t *testing.T) {
 			t.Errorf("Nd range %#x-%#x is not whole blocks of ten", rg.Lo, rg.Hi)
 		}
 	}
+}
+
+// untimedJSONLogger writes JSON lines without the time attribute, so that a
+// test searching a line for leaked digits cannot find them in the
+// timestamp's nanoseconds (#99).
+func untimedJSONLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
 }

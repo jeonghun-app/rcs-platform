@@ -2,6 +2,7 @@ package sip
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -36,11 +37,14 @@ func TestLoggedValuesLeaveOutIdentitiesAndCredentials(t *testing.T) {
 	res := &Response{StatusCode: 200, Reason: "OK", Body: []byte("n0nce-value")}
 
 	var buf bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	log := untimedJSONLogger(&buf)
 	log.Info("x", "req", req, "reqv", *req, "res", res, "resv", *res, "header", req.Header, "headerp", &req.Header, "uri", req.URI, "from", from, "to", to,
 		"contact", cs[0], "apn", cs[1], "vias", vias, "star", Contact{Star: true}, "creds", creds[0], "challenge", chs[0], "zero", URI{},
 		"urn", URI{Scheme: "urn", Opaque: "uuid:s3cret"})
 	out := buf.String()
+	if strings.Contains(out, `"time"`) {
+		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", out)
+	}
 	for _, s := range secrets {
 		if strings.Contains(out, s) {
 			t.Errorf("log contains %q:\n%s", s, out)
@@ -96,7 +100,7 @@ func TestIPHostsAreLoggedAsTheirNetworkOnly(t *testing.T) {
 func TestViaLogsItsHostLikeAURIAndLeavesOutTheReceivedAddress(t *testing.T) {
 	vias := mustParseVias(t, "SIP/2.0/TCP 198.51.100.23:40001;branch=z9hG4bK77;received=198.51.100.23;rport=40001")
 	var buf bytes.Buffer
-	slog.New(slog.NewJSONHandler(&buf, nil)).Info("x", "via", vias[0], "all", vias)
+	untimedJSONLogger(&buf).Info("x", "via", vias[0], "all", vias)
 	out := buf.String()
 	if strings.Contains(out, "198.51.100.23") || strings.Contains(out, "40001") {
 		t.Errorf("Via log has the client address: %s", out)
@@ -114,4 +118,16 @@ func mustParseVias(t *testing.T, s string) Vias {
 		t.Fatal(err)
 	}
 	return vias
+}
+
+// untimedJSONLogger writes JSON lines without the time attribute, so that a
+// test searching a line for leaked digits cannot find them in the
+// timestamp's nanoseconds (#99).
+func untimedJSONLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}}))
 }
