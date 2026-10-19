@@ -193,6 +193,9 @@ def check_security_groups(template: dict) -> list[str]:
         elif r.cidr is not None:
             if (r.protocol, r.from_port, r.to_port, r.cidr) not in ALLOWED_CIDR_EGRESS:
                 problems.append(f"{where}: to {r.cidr}; only HTTPS for the AWS APIs may leave to an address range")
+            elif r.group in PUBLIC_PORTS and r.protocol != "icmp":
+                # A load balancer sends only to its targets.
+                problems.append(f"{where}: an internet-facing group sends to an address range")
         elif r.protocol != "tcp" or r.from_port != r.to_port:
             problems.append(f"{where}: rules are single TCP ports")
         else:
@@ -250,6 +253,25 @@ def check_plain_listeners(template: dict) -> list[str]:
     return problems
 
 
+# Listener ports per load balancer: what clients may use (ADR 0003).
+LISTENER_PORTS = {"Nlb": {5060, 5061, 2855, 2856}, "Alb": {80, 443}}
+
+
+def check_load_balancers(template: dict) -> list[str]:
+    """Only Nlb and Alb face the internet, on their listed ports only."""
+    problems = []
+    lbs = resources(template, "AWS::ElasticLoadBalancingV2::LoadBalancer")
+    for name, lb in lbs.items():
+        if lb.get("Properties", {}).get("Scheme", "internet-facing") != "internal" and name not in LISTENER_PORTS:
+            problems.append(f"{name}: internet-facing; only {', '.join(sorted(LISTENER_PORTS))} may be")
+    for name, listener in resources(template, "AWS::ElasticLoadBalancingV2::Listener").items():
+        props = listener.get("Properties", {})
+        lb = logical_id(props.get("LoadBalancerArn"))
+        if lb in LISTENER_PORTS and props.get("Port") not in LISTENER_PORTS[lb]:
+            problems.append(f"{name}: port {props.get('Port')} on {lb} is not a client port")
+    return problems
+
+
 def check_waf(template: dict) -> list[str]:
     protected = {
         logical_id(a.get("Properties", {}).get("ResourceArn"))
@@ -260,7 +282,16 @@ def check_waf(template: dict) -> list[str]:
         props = lb.get("Properties", {})
         if props.get("Type", "application") == "application" and props.get("Scheme") != "internal" and name not in protected:
             problems.append(f"{name}: internet-facing ALB without an AWS WAF web ACL")
+    for name, acl in resources(template, "AWS::WAFv2::WebACL").items():
+        rules = acl.get("Properties", {}).get("Rules", [])
+        if not any("RateBasedStatement" in r.get("Statement", {}) for r in rules if isinstance(r, dict)):
+            problems.append(f"{name}: no rate-based rule; per-task limits do not hold one client back across tasks")
     return problems
+
+
+def is_true(value) -> bool:
+    """CloudFormation accepts booleans as strings; 'true' is as true as True."""
+    return value is True or str(value).strip().lower() == "true"
 
 
 def check_tasks(template: dict) -> list[str]:
@@ -268,9 +299,9 @@ def check_tasks(template: dict) -> list[str]:
     for name, td in resources(template, "AWS::ECS::TaskDefinition").items():
         for c in td.get("Properties", {}).get("ContainerDefinitions", []):
             where = f"{name}/{c.get('Name', '?')}"
-            if c.get("ReadonlyRootFilesystem") is not True:
+            if not is_true(c.get("ReadonlyRootFilesystem")):
                 problems.append(f"{where}: root file system is not read-only")
-            if c.get("Privileged") is True:
+            if is_true(c.get("Privileged")):
                 problems.append(f"{where}: privileged")
             drop = c.get("LinuxParameters", {}).get("Capabilities", {}).get("Drop", [])
             if "ALL" not in drop:
@@ -278,7 +309,7 @@ def check_tasks(template: dict) -> list[str]:
             if c.get("LinuxParameters", {}).get("Capabilities", {}).get("Add"):
                 problems.append(f"{where}: adds Linux capabilities")
     for name, svc in resources(template, "AWS::ECS::Service").items():
-        if svc.get("Properties", {}).get("EnableExecuteCommand") not in (None, False, "false"):
+        if is_true(svc.get("Properties", {}).get("EnableExecuteCommand")):
             problems.append(f"{name}: ECS Exec is enabled")
     return problems
 
@@ -335,7 +366,7 @@ def check_secret_access(template: dict) -> list[str]:
     return problems
 
 
-CHECKS = (check_security_groups, check_target_groups, check_plain_listeners, check_waf, check_tasks, check_tables, check_secret_access)
+CHECKS = (check_security_groups, check_target_groups, check_plain_listeners, check_load_balancers, check_waf, check_tasks, check_tables, check_secret_access)
 
 
 def problems(template: dict) -> list[str]:

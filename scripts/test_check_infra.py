@@ -153,6 +153,53 @@ class PlatformTemplate(unittest.TestCase):
         listeners = check_infra.resources(self.template, "AWS::ElasticLoadBalancingV2::Listener")
         self.assertFalse(check_infra.dev_only(self.template, listeners["MsrpTlsListener"].get("Condition")))
 
+    def test_a_load_balancer_group_sending_to_the_internet_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AlbSecurityGroup"]["Properties"]["SecurityGroupEgress"].append(
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0"})
+        self.assertProblem(t, "AlbSecurityGroup egress tcp 443-443: an internet-facing group sends to an address range")
+
+    def test_a_group_admitted_into_a_load_balancer_group_is_refused(self):
+        t = self.changed(Back=ingress("NlbSecurityGroup", 5061, SourceSecurityGroupId={"Ref": "HssSecurityGroup"}))
+        self.assertProblem(t, "NlbSecurityGroup ingress tcp 5061-5061: an internet-facing group admits only clients")
+
+    def test_egress_outside_the_matrix_is_refused(self):
+        t = self.changed(Stray={"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {
+            "GroupId": {"Ref": "AcsSecurityGroup"}, "DestinationSecurityGroupId": {"Ref": "RcsAsSecurityGroup"},
+            "IpProtocol": "tcp", "FromPort": 5060, "ToPort": 5060}})
+        self.assertProblem(t, "AcsSecurityGroup egress to RcsAsSecurityGroup port 5060 has no matching matrix entry")
+
+    def test_a_listener_on_another_port_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["MsrpTlsListener"]["Properties"]["Port"] = 8443
+        self.assertProblem(t, "MsrpTlsListener: port 8443 on Nlb is not a client port")
+
+    def test_another_internet_facing_load_balancer_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["Extra"] = copy.deepcopy(t["Resources"]["Alb"])
+        self.assertProblem(t, "Extra: internet-facing; only Alb, Nlb may be")
+
+    def test_a_web_acl_without_a_rate_rule_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["WebAcl"]["Properties"]["Rules"] = []
+        self.assertProblem(t, "WebAcl: no rate-based rule")
+
+    def test_booleans_written_as_strings_count(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["Task"] = task_definition(Privileged="true", ReadonlyRootFilesystem="false")
+        self.assertProblem(t, "Task/svc: privileged")
+        self.assertProblem(t, "Task/svc: root file system is not read-only")
+
+    def test_acs_admin_is_not_routed(self):
+        rules = check_infra.resources(self.template, "AWS::ElasticLoadBalancingV2::ListenerRule")
+        paths = [v for r in rules.values() for c in r["Properties"]["Conditions"] if isinstance(c, dict)
+                 for v in c.get("PathPatternConfig", {}).get("Values", [])]
+        self.assertFalse([p for p in paths if p.startswith("/admin") or p in ("/*", "*")], paths)
+        for name in ("HttpsListener", "HttpListener"):
+            actions = str(self.template["Resources"][name]["Properties"]["DefaultActions"])
+            self.assertIn("fixed-response", actions)
+            self.assertNotIn("AcsTargetGroup", actions)
+
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)
         self.assertProblem(t, "Alb: internet-facing ALB without an AWS WAF web ACL")

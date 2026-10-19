@@ -877,7 +877,7 @@ Resources:
       Port: 443
       Certificates: [{ CertificateArn: !Ref AlbCertificateArn }]
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
-      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+      DefaultActions: [{ Type: fixed-response, FixedResponseConfig: { StatusCode: '404', ContentType: text/plain } }]
 
   # One listener on port 80 whatever the certificate: with one it redirects
   # to HTTPS, without one (dev only, see Rules) it serves plain HTTP. Two
@@ -895,10 +895,13 @@ Resources:
           - HasAlbCertificate
           - Type: redirect
             RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
-          - { Type: forward, TargetGroupArn: !Ref AcsTargetGroup }
+          - { Type: fixed-response, FixedResponseConfig: { StatusCode: '404', ContentType: text/plain } }
 
-  # ft-server answers on its upload (/ft) and download (/dl) paths
-  # (FT_UPLOAD_URI, FT_DOWNLOAD_URI); everything else goes to acs.
+  # Only the client-facing paths reach a service; everything else, acs's
+  # /admin API and console included, gets the listeners' fixed 404 (ADR 0007
+  # §5: operator APIs are never on the public ALB). acs's admin is reached
+  # from inside the VPC. ft-server answers on its upload (/ft) and download
+  # (/dl) paths (FT_UPLOAD_URI, FT_DOWNLOAD_URI).
   FtServerRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
     Properties:
@@ -913,6 +916,29 @@ Resources:
             HostHeaderConfig: { Values: [!Ref FtHostName] }
           - !Ref AWS::NoValue
       Actions: [{ Type: forward, TargetGroupArn: !Ref FtServerTargetGroup }]
+
+  # acs's configuration paths (ACS_CONFIG_PATHS, RCC.14), OMA-DM, and the
+  # MSISDN entry flow, as acs's pinned release serves them. A rule takes at
+  # most five values, hence two.
+  AcsConfigRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasAlbCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: [/, /config, /rcs/config] }
+      Actions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+
+  AcsDeviceRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasAlbCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 21
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: [/dm, /dm/mo, /msisdn, /msisdn/verify] }
+      Actions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
 
   # A rate-based rule per client address: ft-server's and acs's own limits are
   # per task, so only this limits one client across tasks.
