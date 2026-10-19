@@ -75,14 +75,16 @@ func TestConflictWithAnotherWritersCommitIsStillAFailure(t *testing.T) {
 	}
 }
 
-// appliedThenTimedOut applies completing updates, then holds the call until
-// its context ends and reports the context's error, as when DynamoDB writes
-// and FT_STORAGE_TIMEOUT expires before the answer arrives. With every set,
-// it does so on every completing update; otherwise only on the first.
+// appliedThenTimedOut applies completing updates, then reports them as timed
+// out, as when DynamoDB writes and FT_STORAGE_TIMEOUT expires before the
+// answer arrives. With every set, it does so on every completing update;
+// otherwise only on the first. With expire set, it holds the call until its
+// context ends and reports the context's error; otherwise it reports
+// context.DeadlineExceeded at once.
 type appliedThenTimedOut struct {
 	store.Metadata
-	every bool
-	calls atomic.Int32
+	every, expire bool
+	calls         atomic.Int32
 
 	mu sync.Mutex
 	// updates and reads are the completing updates and the reads after
@@ -115,31 +117,49 @@ func (a *appliedThenTimedOut) Update(ctx context.Context, r store.Record) (store
 	}
 	a.calls.Add(1)
 	_, _ = a.Metadata.Update(ctx, r) // applied, or a conflict on a retry
+	if !a.expire {
+		return store.Record{}, context.DeadlineExceeded
+	}
 	<-ctx.Done()
 	return store.Record{}, ctx.Err()
 }
 
 func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
-	for name, every := range map[string]bool{"retry conflicts": false, "every attempt times out": true} {
-		t.Run(name, func(t *testing.T) {
-			meta := &appliedThenTimedOut{Metadata: store.NewMemory(), every: every}
-			// IdleTimeout 150 ms makes the lease 900 ms and the completion
-			// budget 600 ms, of which 450 ms are for the commit attempts:
-			// more than one 300 ms StorageTimeout, so a second attempt runs
-			// and the retry path is taken (review of #131). The one real
-			// time window left is that the first attempt must start within
-			// those 450 ms of the budget's start; it took at most 35 µs
-			// when measured under load, a margin of about 10^4.
+	for _, tt := range []struct {
+		name          string
+		every, expire bool
+	}{
+		{"retry conflicts", false, false},
+		{"every attempt times out", true, false},
+		{"the attempts really expire", true, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &appliedThenTimedOut{Metadata: store.NewMemory(), every: tt.every, expire: tt.expire}
 			e := newEnv(t, func(o *Options) {
 				o.Metadata = meta
-				o.StorageTimeout = 300 * time.Millisecond
-				o.IdleTimeout = 150 * time.Millisecond
+				if tt.expire {
+					// The lease is 900 ms and the completion budget 600 ms,
+					// of which 450 ms are for the commit attempts: the first
+					// expires after 300 ms, and whether a second starts
+					// before the budget ends depends on how the host runs
+					// the test, so only the budget is checked.
+					o.StorageTimeout = 300 * time.Millisecond
+					o.IdleTimeout = 150 * time.Millisecond
+				} else {
+					// The attempts report their timeout at once, so none
+					// waits on the clock. With no idle timeout, the budget
+					// less the reserve is one StorageTimeout: an attempt
+					// whose deadline ignored the budget would end past it,
+					// as each starts at least one retryWait after the first
+					// (review of #131).
+					o.StorageTimeout = 10 * time.Second
+					o.IdleTimeout = 0
+				}
 			})
-			e.srv.retryWait = func(int) time.Duration { return 0 }
+			e.srv.retryWait = func(int) time.Duration { return 10 * time.Millisecond }
 			data := pattern(20)
-			// The first attempt really expires; the second meets the
-			// applied write as a conflict, or, if every attempt expires,
-			// the final read-back finds it.
+			// A retry meets the applied write as a conflict, or, if every
+			// attempt times out, the final read back finds it.
 			u := e.user(alice)
 			u.challenge()
 			rec := u.upload(multipartBody(tidPart("expired"), filePart("a", "text/plain", data)))
@@ -157,7 +177,7 @@ func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
 			reserve := min(e.srv.o.StorageTimeout, budget/4)
 			meta.mu.Lock()
 			defer meta.mu.Unlock()
-			if len(meta.updates) < 2 || len(meta.reads) != 1 {
+			if len(meta.updates) == 0 || !tt.expire && (len(meta.updates) < 2 || len(meta.reads) != 1) {
 				t.Fatalf("%d completing updates and %d reads back, want at least 2 and 1", len(meta.updates), len(meta.reads))
 			}
 			for i, c := range meta.updates {
