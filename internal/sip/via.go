@@ -26,7 +26,7 @@ type Via struct {
 }
 
 // ParseVia parses a Via header field value, which may hold several elements.
-func ParseVia(s string) ([]Via, error) {
+func ParseVia(s string) (Vias, error) {
 	els, err := splitList(s)
 	if err != nil {
 		return nil, err

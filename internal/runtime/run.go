@@ -55,6 +55,15 @@ type Service[C any] struct {
 	// Run returns the process shuts down: a non-nil error, other than ctx's
 	// own, makes the exit status non-zero.
 	Run func(ctx context.Context, rt *Runtime, cfg C) error
+	// LiveAfterReady makes /healthz answer 503 "starting", like /readyz,
+	// until Run calls rt.Ready. By default /healthz passes as soon as the
+	// admin server listens, which tells a container health check only that
+	// the process runs; a service whose start-up waits on remote services
+	// (KMS, DynamoDB) and exits at a start-up deadline would be marked
+	// healthy before it can serve. Pair it with a task-definition health
+	// check whose startPeriod plus interval × retries exceeds that deadline,
+	// or ECS replaces the task while it starts.
+	LiveAfterReady bool
 }
 
 var envPrefixPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_$`)
@@ -82,6 +91,14 @@ type Settings struct {
 	Environment Environment
 
 	unsafe []string
+}
+
+// ServiceNamespace returns RCS_SERVICE_NAMESPACE, the Cloud Map namespace the
+// services find each other in, in lower case without a trailing dot, or ""
+// when it is unset or invalid (the runtime reports an invalid one). Names
+// inside it are private hosts ([IsPrivateHost]).
+func (s *Settings) ServiceNamespace() string {
+	return serviceNamespace(s.Shared)
 }
 
 // ForbidInProduction refuses to start in staging and prod when unsafe is true,
@@ -121,6 +138,8 @@ type RuntimeOptions struct {
 	// Now and After are the clock; nil means time.Now and time.After.
 	Now   func() time.Time
 	After func(time.Duration) <-chan time.Time
+	// LiveAfterReady is Service.LiveAfterReady.
+	LiveAfterReady bool
 }
 
 // NewRuntime returns a Runtime that is not attached to a process: Run uses it,
@@ -144,11 +163,13 @@ func NewRuntime(o RuntimeOptions) *Runtime {
 	}
 	out := &syncWriter{w: o.Out}
 	log := NewLogger(out, o.Service, buildinfo.Version, o.Level)
+	admin := newAdmin(log, o.Now, o.After)
+	admin.liveAfterReady = o.LiveAfterReady
 	return &Runtime{
 		Environment: o.Environment,
 		Logger:      log,
 		Metrics:     NewMetrics(out, o.MetricsNamespace, o.Service, o.Now, log),
-		Admin:       newAdmin(log, o.Now, o.After),
+		Admin:       admin,
 	}
 }
 
@@ -351,6 +372,7 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		MetricsNamespace: sh.metricsNamespace,
 		Now:              p.Now,
 		After:            p.After,
+		LiveAfterReady:   svc.LiveAfterReady,
 	})
 	log = rt.Logger
 	// Libraries that log through slog's or log's default logger end up in the
@@ -509,7 +531,7 @@ func probe(ctx context.Context, p Process) error {
 func probeClient() *http.Client {
 	return &http.Client{
 		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: RefuseRedirects,
 	}
 }
 
