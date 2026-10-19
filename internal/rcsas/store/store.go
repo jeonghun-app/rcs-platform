@@ -47,6 +47,10 @@ var (
 	// ErrMarksChanged means RemoveSummary found more marks on the sent
 	// record than the summary was expanded from.
 	ErrMarksChanged = errors.New("store: notifications were marked since")
+	// ErrBusy means a write kept meeting a concurrent one on the same item
+	// (a DynamoDB transaction conflict) and gave up; the caller may try
+	// again shortly.
+	ErrBusy = errors.New("store: item busy with a concurrent write")
 )
 
 // Limit bounds one recipient's queue, and the share of it one sender may

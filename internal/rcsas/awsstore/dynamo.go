@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
@@ -133,6 +134,52 @@ func canceled(err error) (failed []bool, ok bool) {
 		failed = append(failed, aws.ToString(r.Code) == "ConditionalCheckFailed")
 	}
 	return failed, true
+}
+
+// conflicted reports whether a write lost to a concurrent transaction on
+// one of its items: an UpdateItem that met a transaction, or a transaction
+// cancelled for another one. The SDK retries neither.
+func conflicted(err error) bool {
+	var conflict *types.TransactionConflictException
+	if errors.As(err, &conflict) {
+		return true
+	}
+	var tce *types.TransactionCanceledException
+	if errors.As(err, &tce) {
+		for _, r := range tce.CancellationReasons {
+			if aws.ToString(r.Code) == "TransactionConflict" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// conflictAttempts bounds the tries of a write to a group's sent record,
+// which a summary's removal (a transaction) and notifiers' marks (single
+// updates) may hit at once.
+const conflictAttempts = 3
+
+// retryConflicts runs write until it does not lose to a concurrent
+// transaction, conflictAttempts times at most with a short jittered pause
+// between, and then reports store.ErrBusy.
+func retryConflicts(ctx context.Context, op string, write func() error) error {
+	for i := range conflictAttempts {
+		err := write()
+		if !conflicted(err) {
+			return err
+		}
+		if i == conflictAttempts-1 {
+			break
+		}
+		pause := time.Duration(10<<i)*time.Millisecond + rand.N(time.Duration(10<<i)*time.Millisecond)
+		select {
+		case <-time.After(pause):
+		case <-ctx.Done():
+			return sanitize(op, ctx.Err())
+		}
+	}
+	return fmt.Errorf("awsstore: %s: %w", op, store.ErrBusy)
 }
 
 // sizeUpdate adds count and bytes to a size item, conditional on the
@@ -599,6 +646,10 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 // condition check that the sent record's mark count is unchanged, or the
 // record gone.
 func (s *Store) RemoveSummary(ctx context.Context, m store.Message, owner string, marks int64) error {
+	return retryConflicts(ctx, "remove summary", func() error { return s.removeSummary(ctx, m, owner, marks) })
+}
+
+func (s *Store) removeSummary(ctx context.Context, m store.Message, owner string, marks int64) error {
 	k := key(identityKey(queuePrefix, m.Recipient), m.ID)
 	items := []types.TransactWriteItem{
 		{Delete: &types.Delete{
@@ -619,6 +670,9 @@ func (s *Store) RemoveSummary(ctx context.Context, m store.Message, owner string
 		}},
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	if conflicted(err) {
+		return err
+	}
 	if failed, ok := canceled(err); ok {
 		switch {
 		case len(failed) > 0 && failed[0]:
@@ -863,6 +917,10 @@ func (s *Store) Sent(ctx context.Context, sender, messageID string, now time.Tim
 // count makes a repeat unsafe to apply again, so a refusal reads the entry
 // back: the same token is the attempt's own, landed already.
 func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, status, token string, now time.Time) error {
+	return retryConflicts(ctx, "mark notified", func() error { return s.markNotified(ctx, sender, messageID, mark, status, token, now) })
+}
+
+func (s *Store) markNotified(ctx context.Context, sender, messageID, mark, status, token string, now time.Time) error {
 	k := key(identityKey(sentPrefix, sender), messageID)
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           aws.String(s.table),
@@ -895,6 +953,9 @@ func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, statu
 			}
 		}
 		return fmt.Errorf("awsstore: mark notified: %w", store.ErrExists)
+	}
+	if conflicted(err) {
+		return err
 	}
 	if err != nil {
 		return sanitize("mark notified", err)

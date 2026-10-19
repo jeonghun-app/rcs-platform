@@ -670,7 +670,7 @@ func (e *Engine) groupReceived(l *Leg, m *msrp.Message) error {
 	case errors.As(err, &r):
 		return &msrp.StatusError{Code: r.MSRPStatus()}
 	case err != nil:
-		return &msrp.StatusError{Code: StatusTryAgain, Comment: "Try again later"}
+		return notStored(err)
 	}
 	return nil
 }

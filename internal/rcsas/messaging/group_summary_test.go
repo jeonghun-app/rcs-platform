@@ -460,3 +460,33 @@ func TestSummariesLeaveTheQueueTo1To1Messages(t *testing.T) {
 		t.Fatalf("dave's 1-to-1 message: %v", err)
 	}
 }
+
+// busyMarks reports every mark busy (store.ErrBusy).
+type busyMarks struct{ store.Store }
+
+func (busyMarks) MarkNotified(context.Context, string, string, string, string, string, time.Time) error {
+	return fmt.Errorf("fake: mark notified: %w", store.ErrBusy)
+}
+
+// A notification the store is too busy to mark is answered 503, which a
+// client may send again at once, not the 500 of a failed store.
+func TestABusyStoreIsAnsweredServiceUnavailable(t *testing.T) {
+	r := newRigWith(t, Config{}, busyMarks{store.NewMemory()}, newFakeClock())
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	drainInvites(t, r.d)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m2", "hi", imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	l := r.listen(t)
+	_, g := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	if code := g.outcome(t, cpim.ContentType, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)); code != StatusBusy {
+		t.Fatalf("group receipt answered %d", code)
+	}
+	_, c := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	if code := c.outcome(t, cpim.ContentType, receipt(t, "m2", imdn.DisplayNotification, imdn.Displayed)); code != StatusBusy {
+		t.Fatalf("1-to-1 receipt answered %d", code)
+	}
+}
