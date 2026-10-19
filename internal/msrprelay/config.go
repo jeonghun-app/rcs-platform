@@ -156,7 +156,7 @@ func Configure(s *runtime.Settings) Config {
 		ListenAddr:              e.String("LISTEN_ADDR", DefaultListenAddr),
 		ControlAddr:             e.String("CONTROL_ADDR", DefaultControlAddr),
 		CoreNetworks:            e.CIDRs("CORE_NETWORKS", slices.Clone(privateRanges)),
-		Namespace:               s.Shared.String("SERVICE_NAMESPACE", ""),
+		Namespace:               s.ServiceNamespace(),
 		ProxyProtocol:           s.Shared.Bool("PROXY_PROTOCOL", false),
 		Store:                   e.String("STORE", StoreDynamoDB),
 		Table:                   e.String("DYNAMODB_TABLE", DefaultTable),

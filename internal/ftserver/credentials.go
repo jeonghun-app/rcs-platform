@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -108,7 +109,7 @@ func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration
 			Transport: transport,
 			Timeout:   timeout,
 			// The token must not follow a redirect to another host.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			CheckRedirect: runtime.RefuseRedirects,
 		},
 	}
 }
