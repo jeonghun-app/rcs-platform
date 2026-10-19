@@ -251,8 +251,8 @@ about 2%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
 development host at load 140 to 230, a profile at the limit took 39 to 48 ms
 of CPU (33 to 70 ms wall) to compile when made of 4 KiB patterns, and about
 2 to 2.3 times as long when made of hundreds of short ones; other hosts and
-loads differ, and the HSS compiles a profile several times on each write
-(once, after #120). A profile over it is refused with 400 naming the limit.
+loads differ, and the HSS compiles a profile once on each write. A profile
+over it is refused with 400 naming the limit.
 
 The API checks patterns when a profile is written. A profile stored before
 this rule keeps working as it is, and needs these constructs removed when it
