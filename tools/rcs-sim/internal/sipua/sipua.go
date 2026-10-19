@@ -239,6 +239,9 @@ type UA struct {
 	calls   map[*transaction.ServerTransaction]*IncomingCall
 	// subs are the reg event subscriptions, by subscriptionKey.
 	subs map[string]*Subscription
+	// invites are the INVITEs sent in the last 64*T1, by Call-ID and From
+	// tag, for 2xx that arrive after their transaction.
+	invites map[string]*invite
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -284,6 +287,7 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		dialogs: map[string]*Dialog{},
 		calls:   map[*transaction.ServerTransaction]*IncomingCall{},
 		subs:    map[string]*Subscription{},
+		invites: map[string]*invite{},
 		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
@@ -916,7 +920,17 @@ func (t tu) Request(tx *transaction.ServerTransaction) {
 		d.receive(tx)
 		return
 	}
-	if req.Method == "CANCEL" {
+	if unsupported := unsupportedExtensions(req); len(unsupported) > 0 {
+		// RFC 3261 §8.2.2.3: this UA supports no extension a request may
+		// require, 100rel and precondition among them.
+		if res, err := sip.NewResponse(req, 420, "", "rcs-sim"); err == nil {
+			if res.Header.Add("Unsupported", strings.Join(unsupported, ", ")) == nil {
+				_ = tx.Respond(res)
+			}
+		}
+		return
+	}
+	if req.Method == "CANCEL" && t.ua.cfg.OnInvite != nil {
 		t.ua.cancel(tx)
 		return
 	}
@@ -958,9 +972,22 @@ func (t tu) Stray(in transport.Inbound) {
 	}
 }
 
-// ServerFailed has nothing to undo: the UA keeps no state for a request it
-// answered.
-func (tu) ServerFailed(*transaction.ServerTransaction, error) {}
+// ServerFailed forgets an incoming INVITE whose transaction failed: it can
+// no longer be answered.
+func (t tu) ServerFailed(tx *transaction.ServerTransaction, _ error) { t.ua.forgetCall(tx) }
+
+// unsupportedExtensions returns the option tags req requires, none of
+// which this UA supports. ACK and CANCEL cannot be refused (§8.2.2.3).
+func unsupportedExtensions(req *sip.Request) []string {
+	if req.Method == "ACK" || req.Method == "CANCEL" {
+		return nil
+	}
+	tags, err := req.Header.Require()
+	if err != nil {
+		return nil
+	}
+	return tags
+}
 
 // oneConn is the transport's Dialer. It hands over the connection Dial
 // opened, once, and refuses every later dial, so a closed flow is never

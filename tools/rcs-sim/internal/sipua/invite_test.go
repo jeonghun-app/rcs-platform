@@ -73,13 +73,18 @@ func (c *callee) log(what string) {
 
 // accept sends a 200 with the SDP answer, as the far end with tag.
 func (c *callee) accept(t *testing.T, tx *transaction.ServerTransaction, tag string) {
+	c.acceptVia(t, tx, tag, calleeContact, recordRoute)
+}
+
+// acceptVia is accept as a branch with its own Contact and Record-Route.
+func (c *callee) acceptVia(t *testing.T, tx *transaction.ServerTransaction, tag, contact, rr string) {
 	res, err := sip.NewResponse(tx.Request(), 200, "", tag)
 	if err != nil {
 		t.Errorf("callee: %v", err)
 		return
 	}
-	res.Header.Add("Contact", calleeContact)
-	res.Header.Add("Record-Route", recordRoute)
+	res.Header.Add("Contact", contact)
+	res.Header.Add("Record-Route", rr)
 	res.Header.Add("Content-Type", "application/sdp")
 	res.Body = []byte(testAnswer)
 	c.mu.Lock()
@@ -207,6 +212,7 @@ func TestAnInviteCarriesTheChatServiceAndPreferredIdentity(t *testing.T) {
 		"P-Preferred-Service":  "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.session",
 		"P-Preferred-Identity": "<" + testIMPU + ">",
 		"Content-Type":         "application/sdp",
+		"Supported":            "outbound",
 	} {
 		if got := inv.Header.Get(name); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
@@ -317,18 +323,79 @@ func TestA2xxAfterTheTransactionEndedIsACKedAgain(t *testing.T) {
 func TestA2xxFromAnotherBranchIsACKedAndEnded(t *testing.T) {
 	// RFC 3261 §13.2.2.4: a 2xx from another branch of a fork, with
 	// another To tag, is ACKed and the call it set up ended with BYE.
+	// The other branch has its own Contact and route: its BYE uses them,
+	// not the first dialog's. It sends its 2xx twice: one ACK each, one
+	// BYE only.
+	const otherContact = "<sip:other@192.0.2.4:5060;transport=tcp>"
+	const otherRR = "<sip:as.example.com;lr>, <sip:pcscf.example.com;lr>"
 	s, c, ua := inviteStandIn(t, true)
-	call(t, ua)
+	d, _, _ := call(t, ua)
 	s.nextACK(t)
+	// The call is ended first, so the first dialog's CSeq has moved on;
+	// the fork's ACK must still carry the INVITE's (code review on #194).
+	if _, err := d.Bye(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.nextMethod(t, "BYE")
 	tx := <-c.ringing
-	c.accept(t, tx, "other-branch")
+	c.acceptVia(t, tx, "other-branch", otherContact, otherRR)
 	ack := s.nextACK(t)
-	if to, _ := ack.Header.To(); to.Tag() != "other-branch" {
-		t.Fatalf("second ACK To tag = %q", to.Tag())
+	c.mu.Lock()
+	inv := c.invite
+	c.mu.Unlock()
+	invCSeq, _ := inv.Header.CSeq()
+	ackCSeq, _ := ack.Header.CSeq()
+	if to, _ := ack.Header.To(); to.Tag() != "other-branch" || ackCSeq.Seq != invCSeq.Seq {
+		t.Fatalf("second ACK To tag %q CSeq %v, INVITE's %v", to.Tag(), ackCSeq, invCSeq)
 	}
 	bye := s.nextMethod(t, "BYE").req
-	if to, _ := bye.Header.To(); to.Tag() != "other-branch" {
-		t.Fatalf("BYE To tag = %q, want the other branch's", to.Tag())
+	if to, _ := bye.Header.To(); to.Tag() != "other-branch" || bye.URI.String() != mustURI(t, "sip:other@192.0.2.4:5060;transport=tcp").String() || routeHosts(t, bye) != "pcscf.example.com as.example.com" {
+		t.Fatalf("BYE To tag %q, URI %s, Route %s; want the other branch's", to.Tag(), bye.URI, routeHosts(t, bye))
+	}
+	c.acceptVia(t, tx, "other-branch", otherContact, otherRR)
+	s.nextACK(t)
+	// A MESSAGE after it: a second BYE sent meanwhile would arrive first.
+	req, _ := ua.NewRequest("MESSAGE", mustURI(t, testPeer))
+	if _, err := ua.Send(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for r := s.next(t); r.req.Method != "MESSAGE"; r = s.next(t) {
+		if r.req.Method == "BYE" {
+			t.Fatal("a second BYE for one forked branch")
+		}
+	}
+}
+
+func TestA2xxReformattedIsARetransmissionNotAFork(t *testing.T) {
+	// The same 2xx with its To written differently (LWS before ;tag) is
+	// the same branch: ACKed again, not ended (QA on #194).
+	s, c, ua := inviteStandIn(t, true)
+	d, _, _ := call(t, ua)
+	s.nextACK(t)
+	tx := <-c.ringing
+	c.mu.Lock()
+	again := c.ok.Clone()
+	c.mu.Unlock()
+	to := again.Header.Get("To")
+	again.Header.Set("To", strings.Replace(to, ";tag=", " ;tag=", 1))
+	if err := tx.Respond(again); err != nil {
+		t.Fatal(err)
+	}
+	s.nextACK(t)
+	// A MESSAGE after it: a BYE sent meanwhile would arrive first.
+	req, _ := ua.NewRequest("MESSAGE", mustURI(t, testPeer))
+	if _, err := ua.Send(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for r := s.next(t); r.req.Method != "MESSAGE"; r = s.next(t) {
+		if r.req.Method == "BYE" {
+			t.Fatal("a reformatted retransmission was taken for a fork and ended with BYE")
+		}
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("the dialog ended")
+	default:
 	}
 }
 
@@ -459,6 +526,9 @@ func TestCancellingAnInviteSendsCANCELAfterTheProvisional(t *testing.T) {
 	cv, _ := c.Header.Via()
 	cs, _ := c.Header.CSeq()
 	is, _ := inv.Header.CSeq()
+	if strings.Join(c.Header.Values("Route"), ",") != strings.Join(inv.Header.Values("Route"), ",") || len(inv.Header.Values("Route")) == 0 {
+		t.Fatalf("CANCEL Route %q, INVITE's %q: they must be the same (RFC 3261 §9.1)", c.Header.Values("Route"), inv.Header.Values("Route"))
+	}
 	if cv[0].Branch() != iv[0].Branch() || cs.Seq != is.Seq || cs.Method != "CANCEL" || c.URI.String() != inv.URI.String() || c.Header.Get("To") != inv.Header.Get("To") {
 		t.Fatalf("CANCEL does not match its INVITE (RFC 3261 §9.1): Via %s CSeq %v URI %s", cv[0], cs, c.URI)
 	}
@@ -592,4 +662,78 @@ func label(m sip.Message) string {
 		return strconv.Itoa(m.StatusCode)
 	}
 	return "nothing"
+}
+
+func TestACancelledInviteWithoutAFinalResponseEndsAfter64T1(t *testing.T) {
+	// QA on #194: a CANCEL answered 200 and an INVITE never answered.
+	// RFC 3261 §9.1: 64*T1 later the INVITE is given up, and Invite
+	// returns a timeout that wraps the context's error.
+	r := newRawUAS(t)
+	cfg := r.config(t)
+	clock := newFakeClock()
+	cfg.Clock = clock
+	ua := dial(t, cfg)
+	r.register(t, ua)
+	req, _ := ua.NewInvite(mustURI(t, testPeer), []byte(testOffer))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, _, err := ua.Invite(ctx, req, nil); done <- err }()
+	inv := r.expect(t, "INVITE")
+	r.respond(t, inv, 180)
+	cancel()
+	c := r.expect(t, "CANCEL")
+	r.respond(t, c, 200) // and never a 487
+	// The timer is armed as the CANCEL goes, maybe just after it reached
+	// the far end: the clock is moved on until Invite returns, a few
+	// times at most. Without the timer it never does.
+	for range 5 {
+		clock.advance(64 * transaction.DefaultT1)
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "64*T1") {
+				t.Fatalf("Invite = %v, want the timeout wrapping context.Canceled", err)
+			}
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatal("Invite still waits 64*T1 after its CANCEL")
+}
+
+func TestA2xxAfterAFailureResponseIsACKedAndEnded(t *testing.T) {
+	// Over TCP the INVITE transaction ends at a 603 (Timer D is zero); a
+	// 200 from another branch is then a stray, still ACKed and ended
+	// (QA on #194).
+	r := newRawUAS(t)
+	ua := dial(t, r.config(t))
+	r.register(t, ua)
+	req, _ := ua.NewInvite(mustURI(t, testPeer), []byte(testOffer))
+	done := make(chan *sip.Response, 1)
+	go func() { _, res, _ := ua.Invite(context.Background(), req, nil); done <- res }()
+	inv := r.expect(t, "INVITE")
+	r.respond(t, inv, 603)
+	r.expect(t, "ACK") // the transaction's, for the 603
+	if res := <-done; res == nil || res.StatusCode != 603 {
+		t.Fatalf("Invite = %v", res)
+	}
+	ok := mustResponse(t, inv, 200, "late-branch")
+	ok.Header.Add("Contact", "<sip:late@192.0.2.5:5060;transport=tcp>")
+	r.write(t, ok)
+	ack := r.expect(t, "ACK")
+	if to, _ := ack.Header.To(); to.Tag() != "late-branch" {
+		t.Fatalf("ACK To tag %q", to.Tag())
+	}
+	bye := r.expect(t, "BYE")
+	if to, _ := bye.Header.To(); to.Tag() != "late-branch" {
+		t.Fatalf("BYE To tag %q", to.Tag())
+	}
+}
+
+func TestAnInviteNeedsAnOffer(t *testing.T) {
+	s := newStandIn(t, transport.TCP)
+	ua := dial(t, s.config())
+	register(t, ua)
+	if _, err := ua.NewInvite(mustURI(t, testPeer), nil); err == nil {
+		t.Fatal("NewInvite took an INVITE without an offer")
+	}
 }

@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/buildinfo"
@@ -165,6 +166,19 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		cfg.Control = &anchor.Control{HTTP: httpClient, URL: u, Token: anchor.NewToken(token)}
 	}
 
+	if sf.proxy == "" {
+		// The other -sip-* flags mean nothing without it; better said
+		// than ignored.
+		var stray string
+		fs.Visit(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Name, "sip-") && stray == "" {
+				stray = f.Name
+			}
+		})
+		if stray != "" {
+			return usage("-" + stray + " needs -sip-proxy")
+		}
+	}
 	if sf.proxy != "" {
 		if cfg.SIP, err = sipConfig(ctx, sf, *self, lookup); err != nil {
 			return usage(err.Error())

@@ -65,6 +65,17 @@ func sipConfig(ctx context.Context, f sipFlags, self string, lookup func(string)
 	if cfg.Domain == "" {
 		cfg.Domain = cfg.IMPU.Host
 	}
+	if u, err := sip.ParseURI("sip:" + cfg.Domain); err != nil || u.Host != cfg.Domain {
+		return nil, errors.New("-sip-domain is not a host")
+	}
+	if cfg.Network == transport.TLS && cfg.ServerName == "" {
+		return nil, errors.New("TLS to an address needs -sip-server-name")
+	}
+	if cfg.ServerName != "" {
+		if u, err := sip.ParseURI("sip:" + cfg.ServerName); err != nil || u.Host != cfg.ServerName {
+			return nil, errors.New("-sip-server-name is not a host")
+		}
+	}
 	cfg.Realm = f.realm
 	cfg.InstanceID = f.instance
 	if cfg.InstanceID == "" {
@@ -80,7 +91,7 @@ func sipConfig(ctx context.Context, f sipFlags, self string, lookup func(string)
 		return nil, errors.New("SIP needs -sip-impi or " + envIMPI)
 	}
 	getenv := func(k string) string { v, _ := lookup(k); return v }
-	switch f.auth {
+	switch strings.ToLower(f.auth) {
 	case "aka":
 		cfg.Credentials, err = sipua.AKACredentialsFromEnv(impi, getenv)
 	case "digest":
