@@ -68,6 +68,10 @@ const (
 	// Standalone messages are pager-mode (SIP MESSAGE, RFC 3428) or
 	// large-mode (an MSRP session of its own) standalone messages.
 	Standalone
+	// Group messages travel in a participant's session with a group chat
+	// (RCC.07 Group Chat): Sender is the group's conference URI, the peer
+	// of that session, and Author the participant who wrote the message.
+	Group
 )
 
 func (m Mode) String() string {
@@ -76,6 +80,8 @@ func (m Mode) String() string {
 		return "chat"
 	case Standalone:
 		return "standalone"
+	case Group:
+		return "group"
 	}
 	return "unknown"
 }
@@ -89,8 +95,13 @@ type Message struct {
 	// it sort in enqueue order (see the messaging package), so Pending
 	// returns a queue oldest first.
 	ID string
-	// Sender is the asserted identity of the sender.
+	// Sender is the asserted identity of the sender: for a Group message,
+	// the group's conference URI.
 	Sender string
+	// Author is, for a Group message, the asserted identity of the
+	// participant who wrote it, or for a group notification the
+	// participant it reports for; empty otherwise.
+	Author string
 	// Conversation, Contribution and InReplyTo are the RCC.07 conversation
 	// identifiers the message belongs to; InReplyTo may be empty.
 	Conversation string
@@ -135,8 +146,15 @@ func (m Message) Free(now time.Time) bool {
 // Sent records a message a sender sent, for as long as notifications about
 // it may come back.
 type Sent struct {
+	// Sender is the sender's identity, or for a group message the group's
+	// conference URI: a notification in a group answers a message by its
+	// Message-ID within the group, whatever form of the author's identity
+	// the notifier's client writes.
 	Sender    string
 	MessageID string
+	// Author is, for a group message, the participant who wrote it, whom
+	// its notifications go to; empty otherwise.
+	Author string
 	// Recipients are the identities a notification about the message may
 	// come from.
 	Recipients []string

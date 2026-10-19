@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"strings"
 	"testing"
 )
@@ -63,6 +64,36 @@ func FuzzEscapeDisplayName(f *testing.F) {
 			if r < 0x20 || r == 0x7f || r == '"' || (0x80 <= r && r < 0xa0) || r == 0x2028 || r == 0x2029 || r == 0x061c || (0x200b <= r && r <= 0x200f) || (0x202a <= r && r <= 0x202e) || (0x2066 <= r && r <= 0x2069) {
 				t.Fatalf("EscapeDisplayName(%q) = %q", name, got)
 			}
+		}
+	})
+}
+
+func FuzzGroupView(f *testing.F) {
+	f.Add(chat(f, "m1", "hi", 3))
+	f.Add([]byte("From: \"A\" <sip:a@x>\r\nTo: <sip:b@x>\r\nTo: <sip:c@x>\r\n\r\nContent-Type: text/plain\r\n\r\nhi"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		c, err := cpim.Limits{MaxSize: 4096}.Parse(data)
+		if err != nil {
+			return
+		}
+		from, err := c.From()
+		if err != nil {
+			return
+		}
+		out, err := groupView(c, cpim.Address{Name: from.Name, URI: alice}, groupURI)
+		if err != nil {
+			return
+		}
+		// What participants get always parses, from the author to the
+		// group.
+		got, err := cpim.Parse(out)
+		if err != nil {
+			t.Fatalf("groupView output does not parse: %v\n%q", err, out)
+		}
+		f2, err := got.From()
+		to, err2 := got.To()
+		if err != nil || err2 != nil || f2.URI != alice || len(to) != 1 || to[0].URI != groupURI {
+			t.Fatalf("From %v (%v), To %v (%v)", f2, err, to, err2)
 		}
 	})
 }

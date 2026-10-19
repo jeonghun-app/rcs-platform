@@ -163,6 +163,9 @@ type Engine struct {
 	limit     store.Limit
 
 	senders, notifiers *limiter
+	// composing bounds the is-composing indications one participant
+	// sends in one group.
+	composing *limiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -176,6 +179,7 @@ type Engine struct {
 	legs       map[legKey][]*Leg
 	invites    map[inviteKey]time.Time
 	pagerOnly  map[string]struct{}
+	groups     GroupHandler
 	lastID     int64
 	sweepAt    string
 }
@@ -207,6 +211,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		limit:      queueLimit(cfg),
 		senders:    newLimiter(cfg.SenderRate, cfg.MaxTracked),
 		notifiers:  newLimiter(cfg.NotificationRate, cfg.MaxTracked),
+		composing:  newLimiter(IsComposingRate, cfg.MaxTracked),
 		recipients: map[string]*recipient{},
 		legs:       map[legKey][]*Leg{},
 		invites:    map[inviteKey]time.Time{},

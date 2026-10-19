@@ -39,6 +39,7 @@ const (
 	attrTTL          = "ttl"
 	attrBucket       = "xb"
 	attrSender       = "sender"
+	attrAuthor       = "author"
 	attrConversation = "conversation"
 	attrContribution = "contribution"
 	attrInReplyTo    = "in_reply_to"
@@ -225,7 +226,7 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
-		attrInReplyTo: m.InReplyTo, attrMessageID: m.MessageID,
+		attrInReplyTo: m.InReplyTo, attrMessageID: m.MessageID, attrAuthor: m.Author,
 	} {
 		if v != "" {
 			item[name] = str(v)
@@ -643,17 +644,21 @@ func (s *Store) RecordSent(ctx context.Context, r store.Sent, now time.Time) err
 	for i, v := range r.Recipients {
 		recipients[i] = str(v)
 	}
+	item := map[string]types.AttributeValue{
+		attrPK:           str(identityKey(sentPrefix, r.Sender)),
+		attrSK:           str(r.MessageID),
+		attrRecipients:   &types.AttributeValueMemberL{Value: recipients},
+		attrDispositions: num(int64(r.Dispositions)),
+		attrExpires:      stamp(r.Expires),
+		attrTTL:          ttlOf(r.Expires),
+		attrSeen:         &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}},
+	}
+	if r.Author != "" {
+		item[attrAuthor] = str(r.Author)
+	}
 	_, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			attrPK:           str(identityKey(sentPrefix, r.Sender)),
-			attrSK:           str(r.MessageID),
-			attrRecipients:   &types.AttributeValueMemberL{Value: recipients},
-			attrDispositions: num(int64(r.Dispositions)),
-			attrExpires:      stamp(r.Expires),
-			attrTTL:          ttlOf(r.Expires),
-			attrSeen:         &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}},
-		},
+		TableName:                 aws.String(s.table),
+		Item:                      item,
 		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #expires <= :now"),
 		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#expires": attrExpires},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":now": stamp(now)},
@@ -684,6 +689,7 @@ func (s *Store) Sent(ctx context.Context, sender, messageID string, now time.Tim
 	err = errors.Join(
 		getNum(out.Item, attrDispositions, &dispositions),
 		getTime(out.Item, attrExpires, &expires),
+		getString(out.Item, attrAuthor, &r.Author, false),
 	)
 	if l, ok := out.Item[attrRecipients].(*types.AttributeValueMemberL); ok {
 		for _, v := range l.Value {
@@ -772,6 +778,7 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 		getString(item, attrPK, &pk, true),
 		getString(item, attrSK, &m.ID, true),
 		getString(item, attrSender, &m.Sender, true),
+		getString(item, attrAuthor, &m.Author, false),
 		getString(item, attrConversation, &m.Conversation, false),
 		getString(item, attrContribution, &m.Contribution, false),
 		getString(item, attrInReplyTo, &m.InReplyTo, false),

@@ -34,7 +34,7 @@ const StatusTryAgain = 500
 // is-composing indications in a chat session. The SIP layer offers and
 // answers with it.
 func AcceptTypes(mode store.Mode) []string {
-	if mode == store.Chat {
+	if mode == store.Chat || mode == store.Group {
 		return []string{cpim.ContentType, IsComposingType}
 	}
 	return []string{cpim.ContentType}
@@ -110,7 +110,7 @@ func (p LegParams) check() error {
 	switch {
 	case p.User == "" || p.Peer == "":
 		return errors.New("messaging: a leg needs a user and a peer")
-	case p.Mode != store.Chat && p.Mode != store.Standalone:
+	case p.Mode != store.Chat && p.Mode != store.Standalone && p.Mode != store.Group:
 		return errors.New("messaging: a leg needs a mode")
 	case p.Direction != Originating && p.Direction != Terminating:
 		return errors.New("messaging: a leg needs a direction")
@@ -228,11 +228,13 @@ func (l *Leg) activate() {
 	l.answered = true
 	l.mu.Unlock()
 	switch {
-	case l.p.Mode == store.Chat:
+	case l.p.Mode == store.Chat || l.p.Mode == store.Group:
+		// A group session is a chat session whose peer is the group's
+		// conference URI.
 		key := legKey{l.p.User, l.p.Peer}
 		e.mu.Lock()
 		e.legs[key] = append(e.legs[key], l)
-		delete(e.invites, inviteKey{l.p.User, l.p.Peer, store.Chat, ""})
+		delete(e.invites, inviteKey{l.p.User, l.p.Peer, l.p.Mode, ""})
 		e.mu.Unlock()
 		go func() {
 			<-l.session.Done()
@@ -312,6 +314,9 @@ func (l *Leg) Close() error {
 // its peer. It returns once the message is stored, so a success report
 // tells the client rcs-as has it.
 func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
+	if l.p.Mode == store.Group {
+		return l.e.groupReceived(l, m)
+	}
 	switch m.MediaType() {
 	case cpim.ContentType:
 	case IsComposingType:

@@ -44,6 +44,7 @@ func message(recipient, id string, enqueued time.Time) store.Message {
 func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("PendingListsFreeMessagesOldestFirst", func(t *testing.T) { pendingOrder(t, newStore(t)) })
 	t.Run("EnqueueRefusesADuplicateID", func(t *testing.T) { duplicate(t, newStore(t)) })
+	t.Run("GroupMessagesKeepTheirAuthor", func(t *testing.T) { groupMessage(t, newStore(t)) })
 	t.Run("OnlyOneOfConcurrentClaimsWins", func(t *testing.T) { concurrentClaims(t, newStore(t)) })
 	t.Run("ALapsedLeaseCanBeClaimedAgain", func(t *testing.T) { lapsedLease(t, newStore(t)) })
 	t.Run("OnlyTheOwnerReleasesOrRemoves", func(t *testing.T) { ownership(t, newStore(t)) })
@@ -484,8 +485,17 @@ func sent(t *testing.T, s store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(got.Recipients) != fmt.Sprint(r.Recipients) || got.Dispositions != r.Dispositions || !got.Expires.Equal(r.Expires) {
+	if fmt.Sprint(got.Recipients) != fmt.Sprint(r.Recipients) || got.Dispositions != r.Dispositions || !got.Expires.Equal(r.Expires) || got.Author != "" {
 		t.Fatalf("Sent = %+v", got)
+	}
+	// A group's record names the author.
+	g := store.Sent{Sender: "sip:chat-1@conf.example.net", MessageID: "m-1", Author: alice, Recipients: []string{bob, carol},
+		Dispositions: imdn.Display, Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, g, t0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Sent(ctx, g.Sender, "m-1", t0); err != nil || got.Author != alice || len(got.Recipients) != 2 {
+		t.Fatalf("group Sent = %+v, %v", got, err)
 	}
 	// The record is the sender's: another sender with the same Message-ID
 	// has none.
@@ -512,4 +522,20 @@ func idsOf(ms []store.Message) []string {
 		ids[i] = m.ID
 	}
 	return ids
+}
+
+func groupMessage(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	m := message(bob, "0001", t0)
+	m.Sender, m.Author, m.Mode = "sip:chat-1@conf.example.net", alice, store.Group
+	if err := s.Enqueue(ctx, m, none); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim(ctx, bob, "0001", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Sender != m.Sender || got.Author != alice || got.Mode != store.Group || store.Group.String() != "group" {
+		t.Fatalf("Claim = %+v", got)
+	}
 }

@@ -272,7 +272,7 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 				return res
 			case skip:
 				res.skipped = true
-				if m.Mode == store.Chat || m.Notification {
+				if sessionBound(m) {
 					waited[m.Sender] = true
 				}
 			case whole:
@@ -307,7 +307,7 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map
 			return res
 		case skip:
 			res.skipped = true
-			if m.Mode == store.Chat || m.Notification {
+			if sessionBound(m) {
 				res.waited[m.Sender] = true
 			}
 		}
@@ -323,6 +323,9 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map
 // behind says older messages from m's sender wait for a chat leg: if one
 // is open now, m is not sent ahead of them (whole).
 func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outcome {
+	if m.Mode == store.Group {
+		return e.deliverGroup(ctx, m, behind)
+	}
 	fits := len(m.CPIM) <= e.cfg.PagerLimit
 	if m.Mode == store.Chat || m.Notification {
 		if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
@@ -351,6 +354,34 @@ func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outc
 		return skip
 	}
 	e.invite(ctx, m)
+	return skip
+}
+
+// sessionBound reports whether m waits for a session with its sender: a
+// chat or group message, or a notification.
+func sessionBound(m store.Message) bool {
+	return m.Mode == store.Chat || m.Mode == store.Group || m.Notification
+}
+
+// deliverGroup makes one attempt at a group message or notification: on
+// the recipient's open session with the group, or by asking the SIP layer
+// to bring the recipient back into the group. Pager mode is never used: a
+// group message out of the group's session would reach a client that
+// cannot place it in the group (RCC.07 Group Chat). Messages for a client
+// that takes no sessions wait until it opens one itself.
+func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool) outcome {
+	if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
+		if behind {
+			return whole
+		}
+		return e.viaLeg(ctx, l, m)
+	}
+	e.mu.Lock()
+	_, pagerOnly := e.pagerOnly[m.Recipient]
+	e.mu.Unlock()
+	if !pagerOnly {
+		e.invite(ctx, m)
+	}
 	return skip
 }
 
