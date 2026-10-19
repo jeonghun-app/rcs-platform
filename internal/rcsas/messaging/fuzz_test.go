@@ -53,7 +53,7 @@ func FuzzEscapeDisplayName(f *testing.F) {
 	f.Fuzz(func(t *testing.T, name string) {
 		got := EscapeDisplayName(name)
 		for _, r := range got {
-			if r < 0x20 || r == 0x7f || r == '"' || (0x80 <= r && r < 0xa0) || r == 0x2028 || r == 0x2029 {
+			if r < 0x20 || r == 0x7f || r == '"' || (0x80 <= r && r < 0xa0) || r == 0x2028 || r == 0x2029 || r == 0x061c || (0x200b <= r && r <= 0x200f) || (0x202a <= r && r <= 0x202e) || (0x2066 <= r && r <= 0x2069) {
 				t.Fatalf("EscapeDisplayName(%q) = %q", name, got)
 			}
 		}

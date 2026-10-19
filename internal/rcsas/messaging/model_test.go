@@ -24,6 +24,33 @@ func TestConversationHeadersAreTrimmedTokens(t *testing.T) {
 	}
 }
 
+func TestARequestWithoutConversationHeadersHasNoConversation(t *testing.T) {
+	// As rcsjta sends pager-mode notifications.
+	if c, err := ParseConversationHeaders("", " ", ""); err != nil || c != (Conversation{}) {
+		t.Fatalf("got %+v, %v", c, err)
+	}
+}
+
+func TestQueueIDsKeepTheirOrderWithinATask(t *testing.T) {
+	r := newRig(t, Config{})
+	now := r.clock.Now()
+	prev := ""
+	for i := range 100 {
+		at := now
+		if i == 50 {
+			at = now.Add(-time.Hour) // the clock stepped back
+		}
+		id, err := r.e.newID(at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id <= prev {
+			t.Fatalf("ID %d %q not after %q", i, id, prev)
+		}
+		prev = id
+	}
+}
+
 func TestConversationHeadersOutsideTheGrammarAreRefused(t *testing.T) {
 	long := strings.Repeat("a", MaxIDLength+1)
 	for _, h := range [][3]string{
@@ -48,13 +75,15 @@ func TestConversationHeadersOutsideTheGrammarAreRefused(t *testing.T) {
 
 func TestDisplayNamesAreEscapedBeforeLeavingCPIM(t *testing.T) {
 	for in, want := range map[string]string{
-		"Alice":                    "Alice",
-		"Zo\u00eb \uc815\ud6c8":    "Zo\u00eb \uc815\ud6c8",
-		"a\r\nb":                   `a\u000d\u000ab`,
-		"tab\tnul\x00del\x7f":      `tab\u0009nul\u0000del\u007f`,
-		`say "hi" \o/`:             `say \u0022hi\u0022 \u005co/`,
-		"c1\u0085ls\u2028ps\u2029": `c1\u0085ls\u2028ps\u2029`,
-		"bad\xffutf8":              "bad\ufffdutf8",
+		"Alice":                           "Alice",
+		"Zo\u00eb \uc815\ud6c8":           "Zo\u00eb \uc815\ud6c8",
+		"a\r\nb":                          `a\u000d\u000ab`,
+		"tab\tnul\x00del\x7f":             `tab\u0009nul\u0000del\u007f`,
+		`say "hi" \o/`:                    `say \u0022hi\u0022 \u005co/`,
+		"c1\u0085ls\u2028ps\u2029":        `c1\u0085ls\u2028ps\u2029`,
+		"\u202eevil\u202c":                `\u202eevil\u202c`,
+		"\u2066x\u2069\u200f\u200b\u061c": `\u2066x\u2069\u200f\u200b\u061c`,
+		"bad\xffutf8":                     "bad\ufffdutf8",
 	} {
 		if got := EscapeDisplayName(in); got != want {
 			t.Errorf("EscapeDisplayName(%q) = %q, want %q", in, got, want)
@@ -95,7 +124,7 @@ func TestARequestWithoutItsMessageIDIsDeliveredWithoutNotifications(t *testing.T
 		t.Fatal(err)
 	}
 	if r.m.get("imdn.incomplete_request") != 1 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 

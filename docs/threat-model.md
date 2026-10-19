@@ -124,3 +124,46 @@ metric dimension (architecture §8).
 **Control:** every listener and parser has size, count, time and per-source limits;
 reviews check maximum-size inputs (architecture §8).
 **Status:** implemented for merged libraries; each service adds its own.
+
+## T10 — Forged receipts, routes and floods through `rcs-as`
+
+`rcs-as` stores messages for absent recipients and carries delivery and display
+notifications (IMDN) back to senders. A subscriber could:
+
+- send notifications about messages it never received (a false "read" or
+  "failed");
+- write `IMDN-Record-Route` or `IMDN-Route` headers that make `rcs-as` send a
+  request from inside the network to a host of its choosing;
+- fill another subscriber's queue, or resend one notification without end.
+
+The store also keeps a record of who wrote to whom, which is communication
+metadata.
+
+**Control** ([rcs-as](rcs-as.md)):
+
+- **Notifications.**
+  - A notification is accepted only from a recipient of the message it names,
+    or from a configured intermediary reporting processing or failure.
+  - It must name a message its addressee sent, and a disposition that message
+    asked for.
+  - It is accepted once per notifier and kind.
+  - Who sent it is the identity the network asserted (T2), never the CPIM
+    `From`.
+- **Routes.** IMDN routes are followed only to hosts of
+  `RCSAS_TRUSTED_ROUTE_DOMAINS`. Other entries are dropped from generated
+  notifications and ignored in forwarded ones.
+- **Floods.** These are bounded:
+  - per-recipient queues, by count and bytes, across tasks;
+  - per-sender rates for messages and notifications;
+  - the size of notifications;
+  - store keys built from client input, which are limited in length.
+- **Display names.** Names copied from CPIM are escaped, bidirectional
+  controls included. They are for display only, never an asserted identity.
+- **Metadata.** Sent-message records hold sender, recipients, Message-ID and
+  the dispositions asked for, and no content. They are kept for
+  `RCSAS_SENT_TTL`, which defaults to `RCSAS_STORE_TTL` plus one day (8 days),
+  and DynamoDB's TTL deletes them at their own expiry. Queued message bodies
+  are removed when delivered or swept, with a one-day TTL backstop.
+
+**Status:** implemented in `internal/rcsas` (#59). The SIP-layer contracts
+(`Delivery.Route`, `Delivery.SenderName`) apply when the SIP layer is built.

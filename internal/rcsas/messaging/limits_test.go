@@ -30,7 +30,7 @@ func TestMessagesBeyondTheSizeLimitsAreRefused(t *testing.T) {
 		t.Fatalf("a message over the size limit: %q", got)
 	}
 	if r.m.get("message.rejected.too_large") != 2 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -90,13 +90,15 @@ func TestPagerAndLargeModeShareThePipeline(t *testing.T) {
 		t.Fatalf("pager delivery %q", d.CPIM)
 	}
 	a.send(t, large)
-	if inv := r.d.nextInvite(t); inv.Mode != store.Standalone || inv.Recipient != bob {
+	inv := r.d.nextInvite(t)
+	if inv.Mode != store.Standalone || inv.Recipient != bob || inv.QueueID == "" {
 		t.Fatalf("invitation %+v", inv)
 	}
-	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Standalone})
+	b, leg := r.largeMode(t, l, inv)
 	if got := b.next(t); !bytes.Equal(got.Body, large) {
 		t.Fatalf("large-mode delivery of %d bytes", len(got.Body))
 	}
+	waitDone(t, leg.Finished())
 	// Both were recorded as sent, so both can be answered.
 	for _, id := range []string{"m1", "m2"} {
 		if err := r.e.Submit(t.Context(), standalone(bob, alice, receipt(t, id, imdn.DeliveryNotification, imdn.Delivered))); err != nil {
@@ -104,7 +106,7 @@ func TestPagerAndLargeModeShareThePipeline(t *testing.T) {
 		}
 	}
 	if r.m.get("message.rejected.from_mismatch") != 2 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -118,7 +120,7 @@ func TestAcceptedCPIMDeviationsAndRejectionReasonsAreCounted(t *testing.T) {
 		t.Fatalf("no content headers: %q", got)
 	}
 	if r.m.get("cpim.deviation.bare-lf") != 1 || r.m.get("message.rejected.malformed") != 1 || r.m.get("cpim.rejected.framing") != 1 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -149,7 +151,7 @@ func TestAFailingStoreIsReportedAsAFailureNotARejection(t *testing.T) {
 		t.Fatalf("Submit = %v", err)
 	}
 	if r.m.get("store.failed") != 1 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -217,25 +219,25 @@ func (f *flakyStore) Claim(ctx context.Context, r, id, owner string, now, until 
 	return f.Store.Claim(ctx, r, id, owner, now, until)
 }
 
-func (f *flakyStore) Remove(ctx context.Context, r, id, owner string) error {
+func (f *flakyStore) Remove(ctx context.Context, m store.Message, owner string) error {
 	if f.failing("remove") {
 		return errStore
 	}
-	return f.Store.Remove(ctx, r, id, owner)
+	return f.Store.Remove(ctx, m, owner)
 }
 
-func (f *flakyStore) Enqueue(ctx context.Context, m store.Message) error {
+func (f *flakyStore) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
 	if f.failing("enqueue") && m.Notification {
 		return errStore
 	}
-	return f.Store.Enqueue(ctx, m)
+	return f.Store.Enqueue(ctx, m, l)
 }
 
-func (f *flakyStore) Expired(ctx context.Context, now time.Time, n int) ([]store.Message, error) {
+func (f *flakyStore) Expired(ctx context.Context, now time.Time, cursor string, n int) ([]store.Message, string, error) {
 	if f.failing("expired") {
-		return nil, errStore
+		return nil, cursor, errStore
 	}
-	return f.Store.Expired(ctx, now, n)
+	return f.Store.Expired(ctx, now, cursor, n)
 }
 
 func TestStoreFailuresDuringDeliveryKeepTheMessageAndLogNoContent(t *testing.T) {
@@ -251,7 +253,7 @@ func TestStoreFailuresDuringDeliveryKeepTheMessageAndLogNoContent(t *testing.T) 
 	}
 	waitFor(t, "the failed read", func() bool { return r.m.get("store.failed") == 1 })
 	st.set("claim")
-	r.e.UserRegistered(bob)
+	r.e.UserRegistered(bob, false)
 	waitFor(t, "the failed claim", func() bool { return r.m.get("store.failed") == 2 })
 
 	// At expiry the negative notification cannot be stored: the message
@@ -303,11 +305,13 @@ func firstID(t *testing.T, st store.Store, r *rig) string {
 }
 
 func TestTheSystemClockIsTheDefault(t *testing.T) {
-	e, err := New(Config{MSRPHost: "127.0.0.1", MSRPPort: 2855, Logger: slog.New(slog.DiscardHandler)}, store.NewMemory(), newFakeDeliverer(), newCounter())
+	d := newFakeDeliverer()
+	e, err := New(Config{MSRPHost: "127.0.0.1", MSRPPort: 2855, Logger: slog.New(slog.DiscardHandler)}, store.NewMemory(), d, newCounter())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer e.Close()
+	d.onPager(func(Delivery) error { return ErrOffline })
 	if err := e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "hi", 0))); err != nil {
 		t.Fatal(err)
 	}

@@ -30,13 +30,23 @@ var (
 	// ErrNotFound means no message or record exists under the key, or it
 	// has expired.
 	ErrNotFound = errors.New("store: not found")
-	// ErrExists means Enqueue or RecordSent found an item under the key.
+	// ErrExists means Enqueue, RecordSent or MarkNotified found the key
+	// taken.
 	ErrExists = errors.New("store: already exists")
 	// ErrConflict means a claim is held by someone else: Claim found it
 	// taken, or Release or Remove was called by a caller that does not hold
 	// it.
 	ErrConflict = errors.New("store: claimed by another owner")
+	// ErrQueueFull means Enqueue would take the recipient's queue past its
+	// Limit.
+	ErrQueueFull = errors.New("store: recipient's queue is full")
 )
+
+// Limit bounds one recipient's queue. A zero field is no bound.
+type Limit struct {
+	Count int
+	Bytes int64
+}
 
 // Mode is how a message was sent, which decides how it may be delivered.
 type Mode uint8
@@ -96,6 +106,9 @@ type Message struct {
 	LeaseUntil time.Time
 }
 
+// Size is what m counts for against its queue's Limit.
+func (m Message) Size() int64 { return int64(len(m.CPIM)) }
+
 // Clone returns a copy of m that shares no memory with it.
 func (m Message) Clone() Message {
 	m.CPIM = slices.Clone(m.CPIM)
@@ -130,31 +143,52 @@ func (s Sent) Clone() Sent {
 // Store is where rcs-as keeps queued messages and sent records. Every
 // method is safe for concurrent use, also across processes sharing a
 // backend.
+//
+// Every write may be repeated with the same arguments, as an SDK does when
+// an answer is lost, and the repeat of one that took effect succeeds:
+// Claim by the same owner with the same lease, Release of a message no one
+// holds, Remove of a message already gone, MarkNotified with the same token.
 type Store interface {
-	// Enqueue adds m, unclaimed, to its recipient's queue; ErrExists if the
-	// queue already holds m.ID.
-	Enqueue(ctx context.Context, m Message) error
+	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
+	// queue already holds m.ID, ErrQueueFull if the queue would then be
+	// beyond l.
+	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID
 	// after ("" for the start), so that a caller can page past messages it
 	// leaves queued.
 	Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]Message, error)
-	// Claim gives the message to owner until until, if it is free at now.
-	// Exactly one of several concurrent callers succeeds; the others get
-	// ErrConflict. ErrNotFound if there is no such message.
+	// Claim gives the message to owner until until, if it is free at now,
+	// and returns it whole. Exactly one of several concurrent callers
+	// succeeds; the others get ErrConflict. ErrNotFound if there is no
+	// such message.
 	Claim(ctx context.Context, recipient, id, owner string, now, until time.Time) (Message, error)
 	// Release frees a message owner holds, for another delivery attempt.
 	Release(ctx context.Context, recipient, id, owner string) error
-	// Remove deletes a message owner holds: delivered, or given up on.
-	Remove(ctx context.Context, recipient, id, owner string) error
+	// Remove deletes m, which owner holds: delivered, or given up on. m is
+	// the message as Claim returned it; its size is taken off the queue's.
+	Remove(ctx context.Context, m Message, owner string) error
 	// Expired returns up to limit messages, of any recipient, whose expiry
-	// is at or before now and that are free at now.
-	Expired(ctx context.Context, now time.Time, limit int) ([]Message, error)
-	// RecordSent stores s; ErrExists if the sender already has a record for
+	// is at or before now and that are free at now, starting at cursor
+	// ("" for the start), and the cursor to go on from: "" once the end is
+	// reached. Only Recipient, ID and Expires are filled in: Claim returns
+	// the rest. When it fails part-way it returns what it found, with the
+	// cursor to resume from, and the error.
+	Expired(ctx context.Context, now time.Time, cursor string, limit int) ([]Message, string, error)
+	// RecordSent stores s: ErrExists if the sender already has a record for
 	// the Message-ID that has not expired at now. An expired one is
 	// replaced, since a backend may keep it for a while (DynamoDB TTL).
 	RecordSent(ctx context.Context, s Sent, now time.Time) error
 	// Sent returns the record of sender's message, ErrNotFound if there is
 	// none or it has expired at now.
 	Sent(ctx context.Context, sender, messageID string, now time.Time) (Sent, error)
+	// MarkNotified records on sender's record of messageID that the
+	// notification named key has been accepted, so that it is accepted
+	// once. token identifies the attempt: ErrExists if key is marked with
+	// another token, ErrNotFound if there is no live record.
+	MarkNotified(ctx context.Context, sender, messageID, key, token string, now time.Time) error
+	// UnmarkNotified undoes MarkNotified with the same token, when what the
+	// mark stood for could not be done. Without such a mark it does
+	// nothing.
+	UnmarkNotified(ctx context.Context, sender, messageID, key, token string) error
 }

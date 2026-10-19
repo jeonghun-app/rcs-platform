@@ -2,8 +2,10 @@ package awsstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 	"time"
@@ -16,16 +18,26 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
-// retention is how long an item outlives its own expiry before DynamoDB's
-// TTL deletes it: long enough for an operator to look into a lost message,
-// short enough that the table does not grow without bound.
-const retention = 7 * 24 * time.Hour
+// retention is how long a queue item or size item outlives its own expiry
+// before DynamoDB's TTL deletes it. The sweep removes expired messages
+// itself; the TTL is only the backstop for one it never reached, and a
+// message body is kept no longer than that. Sent records carry no content
+// and expire exactly (threat model T10).
+const retention = 24 * time.Hour
+
+// ExpiryBuckets is how many partitions of the expiry index queue items are
+// spread over.
+const ExpiryBuckets = 16
+
+// IndexExpiry is the expiry index's name.
+const IndexExpiry = "expiry"
 
 // Attribute names.
 const (
 	attrPK           = "pk"
 	attrSK           = "sk"
 	attrTTL          = "ttl"
+	attrBucket       = "xb"
 	attrSender       = "sender"
 	attrConversation = "conversation"
 	attrContribution = "contribution"
@@ -40,6 +52,9 @@ const (
 	attrLease        = "lease_until"
 	attrRecipients   = "recipients"
 	attrDispositions = "dispositions"
+	attrSeen         = "seen"
+	attrCount        = "count"
+	attrBytes        = "bytes"
 )
 
 // MaxCPIMSize is the largest message body the table takes. A DynamoDB item
@@ -52,8 +67,12 @@ var ErrTooLarge = errors.New("awsstore: message larger than an item holds")
 
 const (
 	queuePrefix = "q#"
+	sizePrefix  = "c#"
 	sentPrefix  = "s#"
+	sizeSK      = "n"
 )
+
+const conditionFailed = "ConditionalCheckFailedException"
 
 // Store is a store.Store in the DynamoDB messages table.
 type Store struct {
@@ -65,6 +84,13 @@ var _ store.Store = (*Store)(nil)
 
 func identityKey(prefix, identity string) string {
 	return prefix + strconv.Itoa(len(identity)) + "#" + identity
+}
+
+// bucket spreads queues over the expiry index's partitions.
+func bucket(recipient string) string {
+	h := fnv.New32a()
+	h.Write([]byte(recipient))
+	return fmt.Sprintf("x#%02d", h.Sum32()%ExpiryBuckets)
 }
 
 func key(pk, sk string) map[string]types.AttributeValue {
@@ -80,24 +106,43 @@ func num(v int64) types.AttributeValue {
 // stamp encodes a time with nanoseconds, so a round trip keeps it exact.
 func stamp(t time.Time) types.AttributeValue { return num(t.UnixNano()) }
 
-// ttlOf is the DynamoDB TTL, in epoch seconds, of an item valid until t.
-func ttlOf(t time.Time) types.AttributeValue { return num(t.Add(retention).Unix()) }
+// ttlOf is the DynamoDB TTL, in epoch seconds, of an item kept until t.
+func ttlOf(t time.Time) types.AttributeValue { return num(t.Unix()) }
 
-// Enqueue implements store.Store.
-func (s *Store) Enqueue(ctx context.Context, m store.Message) error {
+// canceled reports which items of a cancelled transaction failed their
+// condition.
+func canceled(err error) (failed []bool, ok bool) {
+	var tce *types.TransactionCanceledException
+	if !errors.As(err, &tce) {
+		return nil, false
+	}
+	for _, r := range tce.CancellationReasons {
+		failed = append(failed, aws.ToString(r.Code) == "ConditionalCheckFailed")
+	}
+	return failed, true
+}
+
+// Enqueue implements store.Store: the message and its queue's size in one
+// transaction, the size conditional on l. The SDK gives the transaction an
+// idempotency token, so its own retry of one that took effect succeeds.
+func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
 	if len(m.CPIM) > MaxCPIMSize {
 		return ErrTooLarge
+	}
+	if l.Bytes > 0 && m.Size() > l.Bytes {
+		return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
 	}
 	item := map[string]types.AttributeValue{
 		attrPK:           str(identityKey(queuePrefix, m.Recipient)),
 		attrSK:           str(m.ID),
+		attrBucket:       str(bucket(m.Recipient)),
 		attrSender:       str(m.Sender),
 		attrMode:         num(int64(m.Mode)),
 		attrNotification: &types.AttributeValueMemberBOOL{Value: m.Notification},
 		attrCPIM:         &types.AttributeValueMemberB{Value: m.CPIM},
 		attrEnqueued:     stamp(m.Enqueued),
 		attrExpires:      stamp(m.Expires),
-		attrTTL:          ttlOf(m.Expires),
+		attrTTL:          ttlOf(m.Expires.Add(retention)),
 	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
@@ -107,14 +152,45 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message) error {
 			item[name] = str(v)
 		}
 	}
-	_, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName:                aws.String(s.table),
-		Item:                     item,
-		ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
-		ExpressionAttributeNames: map[string]string{"#pk": attrPK},
-	})
-	if errorCode(err) == "ConditionalCheckFailedException" {
-		return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
+	size := &types.Update{
+		TableName:        aws.String(s.table),
+		Key:              key(identityKey(sizePrefix, m.Recipient), sizeSK),
+		UpdateExpression: aws.String("ADD #count :one, #bytes :size SET #ttl = :ttl"),
+		ExpressionAttributeNames: map[string]string{
+			"#count": attrCount, "#bytes": attrBytes, "#ttl": attrTTL,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":one": num(1), ":size": num(m.Size()), ":ttl": ttlOf(m.Expires.Add(retention)),
+		},
+	}
+	var bounds []string
+	if l.Count > 0 {
+		bounds = append(bounds, "#count < :maxCount")
+		size.ExpressionAttributeValues[":maxCount"] = num(int64(l.Count))
+	}
+	if l.Bytes > 0 {
+		bounds = append(bounds, "#bytes <= :room")
+		size.ExpressionAttributeValues[":room"] = num(l.Bytes - m.Size())
+	}
+	if len(bounds) > 0 {
+		size.ConditionExpression = aws.String("attribute_not_exists(#count) OR (" + strings.Join(bounds, " AND ") + ")")
+	}
+	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{
+			TableName:                aws.String(s.table),
+			Item:                     item,
+			ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+		}},
+		{Update: size},
+	}})
+	if failed, ok := canceled(err); ok {
+		switch {
+		case len(failed) > 0 && failed[0]:
+			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
+		case len(failed) > 1 && failed[1]:
+			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
+		}
 	}
 	if err != nil {
 		return sanitize("enqueue", err)
@@ -190,8 +266,20 @@ func (s *Store) Claim(ctx context.Context, recipient, id, owner string, now, unt
 		},
 		ReturnValues: types.ReturnValueAllNew,
 	})
-	if errorCode(err) == "ConditionalCheckFailedException" {
-		return store.Message{}, s.whyRefused(ctx, "claim", k)
+	if errorCode(err) == conditionFailed {
+		item, err := s.current(ctx, "claim", k)
+		if err != nil {
+			return store.Message{}, err
+		}
+		m, err := decodeMessage(item)
+		if err != nil {
+			return store.Message{}, err
+		}
+		if m.Owner == owner && m.LeaseUntil.Equal(until) {
+			// The SDK repeated a claim whose answer was lost.
+			return m, nil
+		}
+		return store.Message{}, fmt.Errorf("awsstore: claim: %w", store.ErrConflict)
 	}
 	if err != nil {
 		return store.Message{}, sanitize("claim", err)
@@ -210,8 +298,18 @@ func (s *Store) Release(ctx context.Context, recipient, id, owner string) error 
 		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
 	})
-	if errorCode(err) == "ConditionalCheckFailedException" {
-		return s.whyRefused(ctx, "release", k)
+	if errorCode(err) == conditionFailed {
+		item, err := s.current(ctx, "release", k)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, held := item[attrOwner]; !held {
+			return nil
+		}
+		return fmt.Errorf("awsstore: release: %w", store.ErrConflict)
 	}
 	if err != nil {
 		return sanitize("release", err)
@@ -219,18 +317,35 @@ func (s *Store) Release(ctx context.Context, recipient, id, owner string) error 
 	return nil
 }
 
-// Remove implements store.Store.
-func (s *Store) Remove(ctx context.Context, recipient, id, owner string) error {
-	k := key(identityKey(queuePrefix, recipient), id)
-	_, err := s.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName:                 aws.String(s.table),
-		Key:                       k,
-		ConditionExpression:       aws.String("#owner = :owner"),
-		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
-	})
-	if errorCode(err) == "ConditionalCheckFailedException" {
-		return s.whyRefused(ctx, "remove", k)
+// Remove implements store.Store: the message and its share of the queue's
+// size in one transaction.
+func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error {
+	k := key(identityKey(queuePrefix, m.Recipient), m.ID)
+	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Delete: &types.Delete{
+			TableName:                 aws.String(s.table),
+			Key:                       k,
+			ConditionExpression:       aws.String("#owner = :owner"),
+			ExpressionAttributeNames:  map[string]string{"#owner": attrOwner},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
+		}},
+		{Update: &types.Update{
+			TableName:                 aws.String(s.table),
+			Key:                       key(identityKey(sizePrefix, m.Recipient), sizeSK),
+			UpdateExpression:          aws.String("ADD #count :minus, #bytes :size"),
+			ExpressionAttributeNames:  map[string]string{"#count": attrCount, "#bytes": attrBytes},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":minus": num(-1), ":size": num(-m.Size())},
+		}},
+	}})
+	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
+		_, err := s.current(ctx, "remove", k)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("awsstore: remove: %w", store.ErrConflict)
 	}
 	if err != nil {
 		return sanitize("remove", err)
@@ -238,63 +353,128 @@ func (s *Store) Remove(ctx context.Context, recipient, id, owner string) error {
 	return nil
 }
 
-// whyRefused tells a missing item from one held by someone else, after a
-// conditional write failed.
-func (s *Store) whyRefused(ctx context.Context, op string, k map[string]types.AttributeValue) error {
-	out, err := s.api.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(s.table), Key: k, ConsistentRead: aws.Bool(true),
-		ProjectionExpression: aws.String("#pk"), ExpressionAttributeNames: map[string]string{"#pk": attrPK},
-	})
+// current reads an item after a conditional write failed, to tell a
+// missing item from one in another state.
+func (s *Store) current(ctx context.Context, op string, k map[string]types.AttributeValue) (map[string]types.AttributeValue, error) {
+	out, err := s.api.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(s.table), Key: k, ConsistentRead: aws.Bool(true)})
 	if err != nil {
-		return sanitize(op, err)
+		return nil, sanitize(op, err)
 	}
 	if len(out.Item) == 0 {
-		return fmt.Errorf("awsstore: %s: %w", op, store.ErrNotFound)
+		return nil, fmt.Errorf("awsstore: %s: %w", op, store.ErrNotFound)
 	}
-	return fmt.Errorf("awsstore: %s: %w", op, store.ErrConflict)
+	return out.Item, nil
 }
 
-// Expired implements store.Store with a paged, filtered Scan of the queue
-// items. It reads the whole table each sweep, which is fine while the
-// table holds what offline users have not received; an expiry index is the
-// step up (docs/rcs-as.md).
-func (s *Store) Expired(ctx context.Context, now time.Time, limit int) ([]store.Message, error) {
-	if limit <= 0 {
-		return nil, nil
+// expiryCursor is where Expired stopped: a bucket and the index key of the
+// last message returned from it.
+type expiryCursor struct {
+	Bucket int               `json:"b"`
+	Key    map[string]string `json:"k,omitempty"`
+}
+
+func (c expiryCursor) startKey() map[string]types.AttributeValue {
+	if c.Key == nil {
+		return nil
 	}
-	in := &dynamodb.ScanInput{
-		TableName:        aws.String(s.table),
-		ConsistentRead:   aws.Bool(true),
-		FilterExpression: aws.String("begins_with(#pk, :q) AND #expires <= :now AND " + freeAt),
-		ExpressionAttributeNames: map[string]string{
-			"#pk": attrPK, "#expires": attrExpires, "#owner": attrOwner, "#lease": attrLease,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":q": str(queuePrefix), ":now": stamp(now)},
+	return map[string]types.AttributeValue{
+		attrPK: str(c.Key[attrPK]), attrSK: str(c.Key[attrSK]),
+		attrBucket: str(c.Key[attrBucket]), attrExpires: &types.AttributeValueMemberN{Value: c.Key[attrExpires]},
+	}
+}
+
+func (c expiryCursor) encode() string {
+	b, _ := json.Marshal(c)
+	return string(b)
+}
+
+// Expired implements store.Store over the expiry index, bucket by bucket.
+func (s *Store) Expired(ctx context.Context, now time.Time, cursor string, limit int) ([]store.Message, string, error) {
+	if limit <= 0 {
+		return nil, cursor, nil
+	}
+	var at expiryCursor
+	if cursor != "" {
+		if err := json.Unmarshal([]byte(cursor), &at); err != nil || at.Bucket < 0 || at.Bucket >= ExpiryBuckets {
+			at = expiryCursor{} // from a different layout: start over
+		}
 	}
 	var out []store.Message
-	for {
-		page, err := s.api.Scan(ctx, in)
-		if err != nil {
-			return nil, sanitize("scan for expired", err)
+	for ; at.Bucket < ExpiryBuckets; at = (expiryCursor{Bucket: at.Bucket + 1}) {
+		in := &dynamodb.QueryInput{
+			TableName:              aws.String(s.table),
+			IndexName:              aws.String(IndexExpiry),
+			KeyConditionExpression: aws.String("#xb = :b AND #expires <= :now"),
+			FilterExpression:       aws.String(freeAt),
+			ExpressionAttributeNames: map[string]string{
+				"#xb": attrBucket, "#expires": attrExpires, "#owner": attrOwner, "#lease": attrLease,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":b": str(fmt.Sprintf("x#%02d", at.Bucket)), ":now": stamp(now),
+			},
+			ExclusiveStartKey: at.startKey(),
 		}
-		for _, item := range page.Items {
-			m, err := decodeMessage(item)
+		for {
+			page, err := s.api.Query(ctx, in)
 			if err != nil {
-				return nil, err
+				return out, at.encode(), sanitize("query expired", err)
 			}
-			out = append(out, m)
-			if len(out) == limit {
-				return out, nil
+			for _, item := range page.Items {
+				m, k, err := decodeExpired(item)
+				if err != nil {
+					return out, at.encode(), err
+				}
+				out = append(out, m)
+				at.Key = k
+				if len(out) == limit {
+					return out, at.encode(), nil
+				}
 			}
+			if len(page.LastEvaluatedKey) == 0 {
+				break
+			}
+			in.ExclusiveStartKey = page.LastEvaluatedKey
+			at.Key = plainKey(page.LastEvaluatedKey)
 		}
-		if len(page.LastEvaluatedKey) == 0 {
-			return out, nil
-		}
-		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}
+	return out, "", nil
 }
 
-// RecordSent implements store.Store.
+func plainKey(k map[string]types.AttributeValue) map[string]string {
+	out := map[string]string{}
+	for name, v := range k {
+		switch v := v.(type) {
+		case *types.AttributeValueMemberS:
+			out[name] = v.Value
+		case *types.AttributeValueMemberN:
+			out[name] = v.Value
+		}
+	}
+	return out
+}
+
+func decodeExpired(item map[string]types.AttributeValue) (store.Message, map[string]string, error) {
+	var m store.Message
+	var pk, xb string
+	err := errors.Join(
+		getString(item, attrPK, &pk, true),
+		getString(item, attrSK, &m.ID, true),
+		getString(item, attrBucket, &xb, true),
+		getTime(item, attrExpires, &m.Expires),
+	)
+	recipient, ok := queueRecipient(pk)
+	if !ok {
+		err = errors.Join(err, errors.New("not a queue key"))
+	}
+	if err != nil {
+		return store.Message{}, nil, fmt.Errorf("awsstore: decoding an expired message: %w", err)
+	}
+	m.Recipient = recipient
+	return m, plainKey(map[string]types.AttributeValue{attrPK: item[attrPK], attrSK: item[attrSK], attrBucket: item[attrBucket], attrExpires: item[attrExpires]}), nil
+}
+
+// RecordSent implements store.Store. The record carries an empty map of
+// the notifications accepted so far (MarkNotified).
 func (s *Store) RecordSent(ctx context.Context, r store.Sent, now time.Time) error {
 	recipients := make([]types.AttributeValue, len(r.Recipients))
 	for i, v := range r.Recipients {
@@ -309,12 +489,13 @@ func (s *Store) RecordSent(ctx context.Context, r store.Sent, now time.Time) err
 			attrDispositions: num(int64(r.Dispositions)),
 			attrExpires:      stamp(r.Expires),
 			attrTTL:          ttlOf(r.Expires),
+			attrSeen:         &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}},
 		},
 		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #expires <= :now"),
 		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#expires": attrExpires},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":now": stamp(now)},
 	})
-	if errorCode(err) == "ConditionalCheckFailedException" {
+	if errorCode(err) == conditionFailed {
 		return fmt.Errorf("awsstore: record sent: %w", store.ErrExists)
 	}
 	if err != nil {
@@ -363,6 +544,63 @@ func (s *Store) Sent(ctx context.Context, sender, messageID string, now time.Tim
 	return r, nil
 }
 
+// MarkNotified implements store.Store with an entry of the record's seen
+// map, set only when absent or set by the same attempt.
+func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, token string, now time.Time) error {
+	k := key(identityKey(sentPrefix, sender), messageID)
+	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(s.table),
+		Key:                       k,
+		UpdateExpression:          aws.String("SET #seen.#k = :token"),
+		ConditionExpression:       aws.String("#expires > :now AND (attribute_not_exists(#seen.#k) OR #seen.#k = :token)"),
+		ExpressionAttributeNames:  map[string]string{"#seen": attrSeen, "#k": mark, "#expires": attrExpires},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":token": str(token), ":now": stamp(now)},
+	})
+	if errorCode(err) == conditionFailed {
+		item, err := s.current(ctx, "mark notified", k)
+		if err != nil {
+			return err
+		}
+		var expires time.Time
+		if err := getTime(item, attrExpires, &expires); err != nil || !expires.After(now) {
+			return fmt.Errorf("awsstore: mark notified: %w", store.ErrNotFound)
+		}
+		return fmt.Errorf("awsstore: mark notified: %w", store.ErrExists)
+	}
+	if err != nil {
+		return sanitize("mark notified", err)
+	}
+	return nil
+}
+
+// UnmarkNotified implements store.Store.
+func (s *Store) UnmarkNotified(ctx context.Context, sender, messageID, mark, token string) error {
+	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(s.table),
+		Key:                       key(identityKey(sentPrefix, sender), messageID),
+		UpdateExpression:          aws.String("REMOVE #seen.#k"),
+		ConditionExpression:       aws.String("#seen.#k = :token"),
+		ExpressionAttributeNames:  map[string]string{"#seen": attrSeen, "#k": mark},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":token": str(token)},
+	})
+	if err != nil && errorCode(err) != conditionFailed {
+		return sanitize("unmark notified", err)
+	}
+	return nil
+}
+
+func queueRecipient(pk string) (string, bool) {
+	rest, ok := strings.CutPrefix(pk, queuePrefix)
+	if !ok {
+		return "", false
+	}
+	n, recipient, ok := strings.Cut(rest, "#")
+	if !ok || n != strconv.Itoa(len(recipient)) {
+		return "", false
+	}
+	return recipient, true
+}
+
 func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) {
 	var m store.Message
 	var pk string
@@ -391,10 +629,7 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 	if b, ok := item[attrNotification].(*types.AttributeValueMemberBOOL); ok {
 		m.Notification = b.Value
 	}
-	recipient, ok := strings.CutPrefix(pk, queuePrefix)
-	if ok {
-		_, recipient, ok = strings.Cut(recipient, "#")
-	}
+	recipient, ok := queueRecipient(pk)
 	if !ok {
 		err = errors.Join(err, errors.New("not a queue key"))
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -11,25 +12,121 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
-// kick asks for recipient's queue to be delivered. A queue is delivered by
-// one worker at a time within a task; a kick while it runs makes it run
-// once more, so nothing enqueued meanwhile waits for the next event.
-// Across tasks, store.Claim keeps two workers from delivering one message.
-func (e *Engine) kick(recipient string) {
+// A recipient's queue is delivered by one worker at a time within a task;
+// store.Claim keeps workers of different tasks from delivering one message
+// twice. What a worker did last decides what makes it read the queue again:
+//
+//   - Everything went (holdNone): any new message, registration or leg
+//     reads it again, which costs one store read when there is nothing
+//     waiting.
+//   - Messages wait for a session of their own (holdWaiting): reading the
+//     queue again would find them waiting still, so a new message is tried
+//     on its own. The whole queue is read on what can let them go: a leg
+//     opening, a registration on a new flow, a failed invitation that makes
+//     pager mode the way, or the retry timer.
+//   - The recipient could not be reached (holdBlocked): a new message
+//     waits too. Any registration, a leg, or the retry timer reads the
+//     queue.
+//
+// The retry timer starts at RetryInterval and doubles up to
+// MaxRetryInterval while a queue stays held, so a recipient that never
+// comes back costs a read an hour, not one per message sent to it.
+type hold uint8
+
+const (
+	holdNone hold = iota
+	holdWaiting
+	holdBlocked
+)
+
+type runState uint8
+
+const (
+	runIdle runState = iota
+	runQueued
+	running
+)
+
+type recipient struct {
+	run runState
+	// full asks for the whole queue to be read; single holds new messages
+	// to try on their own.
+	full   bool
+	single []store.Message
+	hold   hold
+	retry  msrp.Timer
+	wait   time.Duration
+}
+
+// state needs e.mu.
+func (e *Engine) state(user string) *recipient {
+	r := e.recipients[user]
+	if r == nil {
+		r = &recipient{}
+		e.recipients[user] = r
+	}
+	return r
+}
+
+// schedule needs e.mu.
+func (e *Engine) schedule(user string, r *recipient) {
+	if r.run == runIdle {
+		r.run = runQueued
+		e.queue = append(e.queue, user)
+		e.wake.Signal()
+	}
+}
+
+// kickEvent reads user's queue after something that may let its messages
+// go; it also restarts the retry timer's backoff.
+func (e *Engine) kickEvent(user string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return
 	}
-	switch e.state[recipient] {
-	case queued, runAgain:
-	case running:
-		e.state[recipient] = runAgain
-	default:
-		e.state[recipient] = queued
-		e.queue = append(e.queue, recipient)
-		e.wake.Signal()
+	r := e.state(user)
+	if r.retry != nil {
+		r.retry.Stop()
+		r.retry = nil
 	}
+	r.wait = 0
+	r.full = true
+	e.schedule(user, r)
+}
+
+// kickNew has a newly queued message delivered (see hold).
+func (e *Engine) kickNew(m store.Message) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	r := e.state(m.Recipient)
+	switch r.hold {
+	case holdNone:
+		r.full = true
+	case holdWaiting:
+		if len(r.single) < e.cfg.Batch {
+			r.single = append(r.single, m)
+		}
+	case holdBlocked:
+		return
+	}
+	e.schedule(m.Recipient, r)
+}
+
+// kickRetry is the retry timer.
+func (e *Engine) kickRetry(user string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r := e.recipients[user]
+	if e.closed || r == nil {
+		return
+	}
+	r.retry = nil
+	r.full = true
+	e.schedule(user, r)
 }
 
 // work is one delivery worker. Workers are a fixed pool, so a burst of
@@ -45,24 +142,60 @@ func (e *Engine) work() {
 			e.mu.Unlock()
 			return
 		}
-		r := e.queue[0]
+		user := e.queue[0]
 		e.queue = e.queue[1:]
-		e.state[r] = running
-		e.mu.Unlock()
-		for {
-			e.drain(e.ctx, r)
-			e.mu.Lock()
-			again := e.state[r] == runAgain
-			if again {
-				e.state[r] = running
-			} else {
-				delete(e.state, r)
-			}
+		r := e.recipients[user]
+		r.run = running
+		for r.full || len(r.single) > 0 {
+			full, single := r.full, r.single
+			r.full, r.single = false, nil
 			e.mu.Unlock()
-			if !again {
+			var res passResult
+			if full {
+				res = e.drain(e.ctx, user)
+			} else {
+				res = e.trySingles(e.ctx, single)
+			}
+			e.mu.Lock()
+			e.settle(user, r, res, full)
+			if e.closed {
 				break
 			}
 		}
+		r.run = runIdle
+		if r.hold == holdNone && r.retry == nil {
+			delete(e.recipients, user)
+		}
+		e.mu.Unlock()
+	}
+}
+
+// passResult is what one pass over a queue found.
+type passResult struct{ stopped, skipped bool }
+
+// settle needs e.mu. It records what a pass found and arms the retry timer
+// of a queue left held.
+func (e *Engine) settle(user string, r *recipient, res passResult, full bool) {
+	switch {
+	case res.stopped:
+		r.hold = holdBlocked
+	case res.skipped:
+		r.hold = holdWaiting
+	case full:
+		// The whole queue went: nothing is held.
+		r.hold = holdNone
+	}
+	if r.hold == holdNone {
+		if r.retry != nil {
+			r.retry.Stop()
+			r.retry = nil
+		}
+		r.wait = 0
+		return
+	}
+	if r.retry == nil && !e.closed {
+		r.wait = min(max(2*r.wait, e.cfg.RetryInterval), e.cfg.MaxRetryInterval)
+		r.retry = e.clock.AfterFunc(r.wait, func() { e.kickRetry(user) })
 	}
 }
 
@@ -80,42 +213,78 @@ const (
 )
 
 // drain delivers recipient's queue, oldest first, until a message finds the
-// recipient unreachable.
-func (e *Engine) drain(ctx context.Context, recipient string) {
+// recipient unreachable or the engine closes.
+func (e *Engine) drain(ctx context.Context, recipient string) passResult {
+	var res passResult
 	after := ""
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !e.isClosed() {
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 		batch, err := e.store.Pending(sctx, recipient, after, e.clock.Now(), e.cfg.Batch)
 		cancel()
 		if err != nil {
 			e.storeFailed("pending", recipient, err)
-			return
+			return passResult{stopped: true}
 		}
 		for _, m := range batch {
-			if e.deliver(ctx, m) == stop {
-				return
+			switch e.deliver(ctx, m) {
+			case stop:
+				res.stopped = true
+				return res
+			case skip:
+				res.skipped = true
 			}
 			after = m.ID
+			if e.isClosed() {
+				return res
+			}
 		}
 		if len(batch) < e.cfg.Batch {
-			return
+			return res
 		}
 	}
+	return res
 }
 
-// deliver makes one attempt at m: on an open leg if there is one, else in
-// pager mode if m may go that way, else by asking for a session.
+// trySingles tries new messages of a held queue on their own.
+func (e *Engine) trySingles(ctx context.Context, ms []store.Message) passResult {
+	var res passResult
+	for _, m := range ms {
+		switch e.deliver(ctx, m) {
+		case stop:
+			res.stopped = true
+			return res
+		case skip:
+			res.skipped = true
+		}
+	}
+	return res
+}
+
+// deliver makes one attempt at m. A chat message or a notification goes
+// on an open chat leg if there is one; a notification, a standalone
+// message within the pager limit, and a chat message within it to a client
+// that takes no sessions go in pager mode; anything else waits for a
+// terminating session, a chat session or a large-mode session of its own.
 func (e *Engine) deliver(ctx context.Context, m store.Message) outcome {
 	fits := len(m.CPIM) <= e.cfg.PagerLimit
-	if l := e.legFor(m); l != nil {
-		return e.viaLeg(ctx, l, m)
+	if m.Mode == store.Chat || m.Notification {
+		if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
+			return e.viaLeg(ctx, l, m)
+		}
 	}
 	e.mu.Lock()
 	_, pagerOnly := e.pagerOnly[m.Recipient]
 	e.mu.Unlock()
 	switch {
-	case m.Notification, fits && (m.Mode == store.Standalone || pagerOnly):
+	case m.Notification && fits, fits && (m.Mode == store.Standalone || pagerOnly):
 		return e.viaPager(ctx, m)
+	case m.Notification:
+		// Submit refuses these; a notification queued by an earlier
+		// version could still be one.
+		if c, ok := e.claim(ctx, m); ok {
+			e.giveUp(c, "delivery.notification_too_large")
+		}
+		return done
 	case pagerOnly:
 		// ADR 0004: larger content waits for a session the client opens
 		// itself, or expires.
@@ -125,52 +294,51 @@ func (e *Engine) deliver(ctx context.Context, m store.Message) outcome {
 	return skip
 }
 
-// legFor returns the newest open leg m can go on. A notification may go on
-// a chat leg or a standalone one, since it carries no content of its own.
-func (e *Engine) legFor(m store.Message) *Leg {
-	modes := []store.Mode{m.Mode}
-	if m.Notification {
-		modes = []store.Mode{store.Chat, store.Standalone}
-	}
+// chatLeg returns the newest open chat leg of user with peer.
+func (e *Engine) chatLeg(user, peer string) *Leg {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for _, mode := range modes {
-		legs := e.legs[legKey{m.Recipient, m.Sender, mode}]
-		for i := len(legs) - 1; i >= 0; i-- {
-			select {
-			case <-legs[i].Done():
-			default:
-				return legs[i]
-			}
+	legs := e.legs[legKey{user, peer}]
+	for i := len(legs) - 1; i >= 0; i-- {
+		select {
+		case <-legs[i].Done():
+		default:
+			return legs[i]
 		}
 	}
 	return nil
 }
 
-// claim takes m for this task; false when another task holds it, or it is
-// gone.
-func (e *Engine) claim(ctx context.Context, m store.Message) bool {
+// claim takes m for this task and returns it whole; false when another
+// task holds it, or it is gone.
+func (e *Engine) claim(ctx context.Context, m store.Message) (store.Message, bool) {
 	now := e.clock.Now()
-	// The lease outlasts a whole attempt, so that it never runs out while
-	// the attempt is still going and another task delivers m a second time.
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 	defer cancel()
-	_, err := e.store.Claim(ctx, m.Recipient, m.ID, e.cfg.InstanceID, now, now.Add(3*e.cfg.DeliveryTimeout))
+	// The lease outlasts a whole attempt, so that it never runs out while
+	// the attempt is still going and another task delivers m a second time.
+	c, err := e.store.Claim(ctx, m.Recipient, m.ID, e.cfg.InstanceID, now, now.Add(3*e.cfg.DeliveryTimeout))
 	switch {
 	case err == nil:
-		return true
+		return c, true
 	case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrNotFound):
 		e.metrics.Count("delivery.claimed_elsewhere", 1)
 	default:
 		e.storeFailed("claim", m.Recipient, err)
 	}
-	return false
+	return store.Message{}, false
 }
 
 func (e *Engine) viaLeg(ctx context.Context, l *Leg, m store.Message) outcome {
-	if !e.claim(ctx, m) {
+	c, ok := e.claim(ctx, m)
+	if !ok {
 		return done
 	}
+	return e.sendClaimed(ctx, l, c)
+}
+
+// sendClaimed delivers a claimed message on l and records the outcome.
+func (e *Engine) sendClaimed(ctx context.Context, l *Leg, m store.Message) outcome {
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	code, err := l.send(ctx, m.CPIM)
 	cancel()
@@ -200,7 +368,8 @@ func permanent(code int) bool {
 }
 
 func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
-	if !e.claim(ctx, m) {
+	m, ok := e.claim(ctx, m)
+	if !ok {
 		return done
 	}
 	d := Delivery{
@@ -233,9 +402,17 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 }
 
 // invite asks for a session to deliver m on, unless one was asked for
-// within InviteTimeout.
+// within InviteTimeout: a chat session for a chat message, a large-mode
+// session for this message alone for a standalone one.
 func (e *Engine) invite(ctx context.Context, m store.Message) {
-	key := legKey{m.Recipient, m.Sender, m.Mode}
+	inv := Invitation{
+		Recipient: m.Recipient, Peer: m.Sender, Mode: m.Mode,
+		Conversation: Conversation{ID: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo},
+	}
+	if m.Mode == store.Standalone {
+		inv.QueueID = m.ID
+	}
+	key := inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 	now := e.clock.Now()
 	e.mu.Lock()
 	if until, ok := e.invites[key]; ok && now.Before(until) {
@@ -256,10 +433,6 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 	}
 	e.invites[key] = now.Add(e.cfg.InviteTimeout)
 	e.mu.Unlock()
-	inv := Invitation{
-		Recipient: m.Recipient, Peer: m.Sender, Mode: m.Mode,
-		Conversation: Conversation{ID: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo},
-	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	err := e.deliverer.Invite(ctx, inv)
 	cancel()
@@ -271,9 +444,9 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 }
 
 func (e *Engine) remove(m store.Message) {
-	ctx, cancel := e.withTimeout(e.ctx, e.cfg.StoreTimeout)
+	ctx, cancel := e.recordCtx()
 	defer cancel()
-	if err := e.store.Remove(ctx, m.Recipient, m.ID, e.cfg.InstanceID); err != nil {
+	if err := e.store.Remove(ctx, m, e.cfg.InstanceID); err != nil {
 		// The lease ran out and another task took the message: it may be
 		// delivered twice, which clients absorb by Message-ID.
 		e.storeFailed("remove", m.Recipient, err)
@@ -281,7 +454,7 @@ func (e *Engine) remove(m store.Message) {
 }
 
 func (e *Engine) release(m store.Message) {
-	ctx, cancel := e.withTimeout(e.ctx, e.cfg.StoreTimeout)
+	ctx, cancel := e.recordCtx()
 	defer cancel()
 	if err := e.store.Release(ctx, m.Recipient, m.ID, e.cfg.InstanceID); err != nil {
 		e.storeFailed("release", m.Recipient, err)
@@ -295,11 +468,11 @@ func (e *Engine) release(m store.Message) {
 // it; its ID derives from m's, so the repeat is the same queue item.
 func (e *Engine) giveUp(m store.Message, metric string) bool {
 	if !m.Notification {
-		n, err := e.notification(m, imdn.DeliveryNotification, imdn.Failed, m.ID+"-f", e.clock.Now())
+		n, err := e.notification(m, failedDelivery, m.ID+"-f", e.clock.Now())
 		switch {
 		case err == nil:
-			ctx, cancel := e.withTimeout(e.ctx, e.cfg.StoreTimeout)
-			err := e.enqueueNotification(ctx, n, imdn.Failed)
+			ctx, cancel := e.recordCtx()
+			err := e.enqueueNotification(ctx, n, failedDelivery.status)
 			cancel()
 			if err != nil {
 				e.storeFailed("enqueue notification", m.Sender, err)
@@ -318,39 +491,55 @@ func (e *Engine) giveUp(m store.Message, metric string) bool {
 }
 
 // Sweep gives up on up to Batch expired messages and reports how many it
-// handled; Run calls it.
+// handled; Run calls it. Each call goes on where the last one stopped, so
+// messages that cannot be handled (another task holds them) do not keep
+// the sweep from the ones after them; what a failing read found is still
+// handled.
 func (e *Engine) Sweep(ctx context.Context) (int, error) {
 	now := e.clock.Now()
+	e.mu.Lock()
+	cursor := e.sweepAt
+	e.mu.Unlock()
 	sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
-	expired, err := e.store.Expired(sctx, now, e.cfg.Batch)
+	expired, next, err := e.store.Expired(sctx, now, cursor, e.cfg.Batch)
 	cancel()
-	if err != nil {
-		return 0, err
-	}
+	e.mu.Lock()
+	e.sweepAt = next
+	e.mu.Unlock()
 	n := 0
 	for _, m := range expired {
-		if e.claim(ctx, m) && e.giveUp(m, "message.expired") {
+		if c, ok := e.claim(ctx, m); ok && e.giveUp(c, "message.expired") {
 			n++
 		}
 	}
-	return n, nil
+	return n, err
 }
 
-// Run sweeps expired messages every SweepInterval until ctx ends; a full
-// batch is followed by another at once.
+// Run sweeps expired messages every SweepInterval until ctx ends; a sweep
+// that found a full batch, or stopped part-way through the store, is
+// followed by another at once.
 func (e *Engine) Run(ctx context.Context) error {
 	tick := make(chan struct{}, 1)
 	for {
-		for {
+		for ctx.Err() == nil {
 			n, err := e.Sweep(ctx)
 			if err != nil {
 				e.storeFailed("expired", "", err)
+				break
 			}
-			if err != nil || n < e.cfg.Batch {
+			e.mu.Lock()
+			more := e.sweepAt != ""
+			e.mu.Unlock()
+			if n < e.cfg.Batch && !more {
 				break
 			}
 		}
-		t := e.clock.AfterFunc(e.cfg.SweepInterval, func() { tick <- struct{}{} })
+		t := e.clock.AfterFunc(e.cfg.SweepInterval, func() {
+			select {
+			case tick <- struct{}{}:
+			default:
+			}
+		})
 		select {
 		case <-ctx.Done():
 			t.Stop()

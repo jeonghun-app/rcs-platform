@@ -48,6 +48,7 @@ type Config struct {
 // than one task in staging and prod.
 func Configure(s *runtime.Settings) Config {
 	e := s.Env
+	storeTTL := e.Duration("STORE_TTL", messaging.DefaultStoreTTL)
 	c := Config{
 		MSRPListenAddr: e.String("MSRP_LISTEN_ADDR", DefaultMSRPListenAddr),
 		Store:          e.String("STORE", StoreDynamoDB),
@@ -56,13 +57,16 @@ func Configure(s *runtime.Settings) Config {
 			Endpoint: e.String("DYNAMODB_ENDPOINT", ""),
 		},
 		Messaging: messaging.Config{
-			MSRPHost:       e.RequiredString("MSRP_HOST"),
-			Self:           e.List("SELF_URIS", nil),
-			Intermediaries: e.List("IMDN_INTERMEDIARIES", nil),
-			MaxMessageSize: e.Int("MAX_MESSAGE_SIZE", messaging.DefaultMaxMessageSize),
-			PagerLimit:     e.Int("PAGER_LIMIT", messaging.DefaultPagerLimit),
-			StoreTTL:       e.Duration("STORE_TTL", messaging.DefaultStoreTTL),
-			SentTTL:        e.Duration("SENT_TTL", messaging.DefaultSentTTL),
+			MSRPHost:            e.RequiredString("MSRP_HOST"),
+			Self:                e.List("SELF_URIS", nil),
+			Intermediaries:      e.List("IMDN_INTERMEDIARIES", nil),
+			MaxMessageSize:      e.Int("MAX_MESSAGE_SIZE", messaging.DefaultMaxMessageSize),
+			PagerLimit:          e.Int("PAGER_LIMIT", messaging.DefaultPagerLimit),
+			StoreTTL:            storeTTL,
+			SentTTL:             e.Duration("SENT_TTL", storeTTL+messaging.DefaultSentMargin),
+			TrustedRouteDomains: e.List("TRUSTED_ROUTE_DOMAINS", nil),
+			MaxQueueMessages:    e.Int("MAX_QUEUE_MESSAGES", messaging.DefaultMaxQueueMessages),
+			MaxQueueBytes:       int64(e.Int("MAX_QUEUE_BYTES", messaging.DefaultMaxQueueBytes)),
 			SenderRate: messaging.Rate{
 				PerMinute: e.Int("SENDER_RATE", messaging.DefaultSenderRate.PerMinute),
 				Burst:     e.Int("SENDER_BURST", messaging.DefaultSenderRate.Burst),
@@ -71,10 +75,13 @@ func Configure(s *runtime.Settings) Config {
 				PerMinute: e.Int("NOTIFICATION_RATE", messaging.DefaultNotificationRate.PerMinute),
 				Burst:     e.Int("NOTIFICATION_BURST", messaging.DefaultNotificationRate.Burst),
 			},
-			DeliveryTimeout: e.Duration("DELIVERY_TIMEOUT", messaging.DefaultDeliveryTimeout),
-			InviteTimeout:   e.Duration("INVITE_TIMEOUT", messaging.DefaultInviteTimeout),
-			StoreTimeout:    e.Duration("STORE_TIMEOUT", messaging.DefaultStoreTimeout),
-			SweepInterval:   e.Duration("SWEEP_INTERVAL", messaging.DefaultSweepInterval),
+			DeliveryTimeout:  e.Duration("DELIVERY_TIMEOUT", messaging.DefaultDeliveryTimeout),
+			InviteTimeout:    e.Duration("INVITE_TIMEOUT", messaging.DefaultInviteTimeout),
+			AnswerTimeout:    e.Duration("ANSWER_TIMEOUT", messaging.DefaultAnswerTimeout),
+			RetryInterval:    e.Duration("RETRY_INTERVAL", messaging.DefaultRetryInterval),
+			MaxRetryInterval: e.Duration("MAX_RETRY_INTERVAL", messaging.DefaultMaxRetryInterval),
+			StoreTimeout:     e.Duration("STORE_TIMEOUT", messaging.DefaultStoreTimeout),
+			SweepInterval:    e.Duration("SWEEP_INTERVAL", messaging.DefaultSweepInterval),
 			MSRP: msrp.Config{
 				// ADR 0003: below the NLB's fixed 350 s TLS idle timeout.
 				KeepAliveInterval: e.Duration("MSRP_KEEPALIVE", msrp.DefaultKeepAliveInterval),
@@ -106,10 +113,13 @@ func Configure(s *runtime.Settings) Config {
 	}
 	positive(e, "MAX_MESSAGE_SIZE", c.Messaging.MaxMessageSize)
 	positive(e, "PAGER_LIMIT", c.Messaging.PagerLimit)
+	positive(e, "MAX_QUEUE_MESSAGES", c.Messaging.MaxQueueMessages)
+	positive(e, "MAX_QUEUE_BYTES", int(c.Messaging.MaxQueueBytes))
 	for name, d := range map[string]bool{
 		"STORE_TTL": c.Messaging.StoreTTL > 0, "SENT_TTL": c.Messaging.SentTTL > 0,
 		"DELIVERY_TIMEOUT": c.Messaging.DeliveryTimeout > 0, "INVITE_TIMEOUT": c.Messaging.InviteTimeout > 0,
 		"STORE_TIMEOUT": c.Messaging.StoreTimeout > 0, "SWEEP_INTERVAL": c.Messaging.SweepInterval > 0,
+		"ANSWER_TIMEOUT": c.Messaging.AnswerTimeout > 0, "RETRY_INTERVAL": c.Messaging.RetryInterval > 0,
 	} {
 		if !d {
 			e.Invalid(name, "must be positive")
@@ -119,6 +129,12 @@ func Configure(s *runtime.Settings) Config {
 		// A notification about a message delivered late must still find
 		// the message's record.
 		e.Invalid("SENT_TTL", "shorter than RCSAS_STORE_TTL")
+	}
+	if c.Messaging.MaxRetryInterval < c.Messaging.RetryInterval {
+		e.Invalid("MAX_RETRY_INTERVAL", "shorter than RCSAS_RETRY_INTERVAL")
+	}
+	if c.Messaging.MaxQueueBytes < int64(c.Messaging.MaxMessageSize) {
+		e.Invalid("MAX_QUEUE_BYTES", "smaller than RCSAS_MAX_MESSAGE_SIZE")
 	}
 	if c.Messaging.PagerLimit > c.Messaging.MaxMessageSize {
 		e.Invalid("PAGER_LIMIT", "larger than RCSAS_MAX_MESSAGE_SIZE")

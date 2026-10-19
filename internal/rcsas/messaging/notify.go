@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -11,12 +12,20 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
+// disposition is what a notification reports.
+type disposition struct {
+	kind   imdn.Kind
+	status imdn.Status
+}
+
+var failedDelivery = disposition{imdn.DeliveryNotification, imdn.Failed}
+
 // submitNotification accepts a disposition notification only if it answers
 // a message its recipient (o.Recipient) sent to its sender (o.Sender), or
 // comes from an allowed intermediary, and reports something that message
-// asked for. Without that check anyone could tell a sender that its message
-// was read or failed (docs/threat-model.md; RFC 5438 §6.3 makes the
-// Message-ID unguessable for the same reason).
+// asked for, once per notifier and kind. Without that check anyone could
+// tell a sender that its message was read or failed (threat model T10;
+// RFC 5438 §6.3 makes the Message-ID unguessable for the same reason).
 //
 // Who sent the notification is o.Sender, the identity the network asserted;
 // the CPIM From has already been checked against it, or is the anonymous
@@ -43,7 +52,33 @@ func (e *Engine) submitNotification(ctx context.Context, o Origin, m *Message, n
 	if err != nil {
 		return reject(ReasonIMDNMalformed, err)
 	}
-	return e.enqueue(ctx, o, m, now, body)
+	id, err := e.newID(now)
+	if err != nil {
+		return err
+	}
+	mark := string(n.Kind) + " " + o.Sender
+	err = e.store.MarkNotified(ctx, o.Recipient, n.MessageID, mark, id, now)
+	switch {
+	case errors.Is(err, store.ErrExists):
+		e.metrics.Count("imdn.duplicate", 1)
+		return nil
+	case errors.Is(err, store.ErrNotFound):
+		return reject(ReasonIMDNUnknown, nil)
+	case err != nil:
+		return err
+	}
+	err = e.enqueue(ctx, queued(o, id, body, true, "", now, e.cfg.StoreTTL))
+	if err != nil {
+		// Let the client's retry through: what the mark stood for did
+		// not happen.
+		rctx, cancel := e.recordCtx()
+		_ = e.store.UnmarkNotified(rctx, o.Recipient, n.MessageID, mark, id)
+		cancel()
+		if errors.Is(err, store.ErrQueueFull) {
+			return reject(ReasonQueueFull, nil)
+		}
+	}
+	return err
 }
 
 // intermediaryMay reports whether an intermediary may send a notification
@@ -72,7 +107,9 @@ func (e *Engine) dropOwnRoute(m *Message) ([]byte, error) {
 }
 
 // nextRoute is the URI a stored notification is sent through: its top
-// IMDN-Route, unless that names rcs-as or there is none.
+// IMDN-Route, if that names a trusted host and not rcs-as itself. A client
+// writes these headers, so anything else would let it pick where rcs-as
+// sends a request from inside the network.
 func (e *Engine) nextRoute(body []byte) string {
 	c, err := e.parseCPIM(body)
 	if err != nil {
@@ -86,7 +123,57 @@ func (e *Engine) nextRoute(body []byte) string {
 	if err != nil || slices.Contains(e.cfg.Self, a.URI) {
 		return ""
 	}
+	if !e.trusted(a.URI) {
+		e.metrics.Count("imdn.route_untrusted", 1)
+		return ""
+	}
 	return a.URI
+}
+
+// trusted reports whether uri is a SIP URI whose host is one of
+// TrustedRouteDomains or below one.
+func (e *Engine) trusted(uri string) bool {
+	host := sipHost(uri)
+	if host == "" {
+		return false
+	}
+	for _, d := range e.cfg.TrustedRouteDomains {
+		d = strings.ToLower(d)
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// sipHost returns the lower-cased host of a sip or sips URI (RFC 3261
+// §19.1.1), or "" for any other URI. It reads only as much of the grammar
+// as it needs to find the host.
+func sipHost(uri string) string {
+	u := strings.ToLower(uri)
+	rest, ok := strings.CutPrefix(u, "sip:")
+	if !ok {
+		if rest, ok = strings.CutPrefix(u, "sips:"); !ok {
+			return ""
+		}
+	}
+	if i := strings.IndexAny(rest, ";?>"); i >= 0 {
+		rest = rest[:i]
+	}
+	if i := strings.LastIndexByte(rest, '@'); i >= 0 {
+		rest = rest[i+1:]
+	}
+	if strings.HasPrefix(rest, "[") {
+		end := strings.IndexByte(rest, ']')
+		if end < 0 {
+			return ""
+		}
+		return rest[:end+1]
+	}
+	if i := strings.IndexByte(rest, ':'); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
 }
 
 // Report generates the notification the recipient of d reported in a way
@@ -106,7 +193,7 @@ func (e *Engine) Report(ctx context.Context, d Delivery, k imdn.Kind, s imdn.Sta
 		Recipient: d.Recipient, Sender: d.Sender, Mode: d.Mode, CPIM: d.CPIM,
 		Conversation: d.Conversation.ID, Contribution: d.Conversation.Contribution, InReplyTo: d.Conversation.InReplyTo,
 	}
-	n, err := e.notification(q, k, s, id, now)
+	n, err := e.notification(q, disposition{k, s}, id, now)
 	if err != nil {
 		return err
 	}
@@ -115,25 +202,38 @@ func (e *Engine) Report(ctx context.Context, d Delivery, k imdn.Kind, s imdn.Sta
 	return e.enqueueNotification(ctx, n, s)
 }
 
-// notification builds the notification of kind k and status s about m,
-// sent on behalf of m.Recipient, as a queue item for m.Sender with the given
-// ID. It returns imdn.ErrNotRequested when the sender did not ask for it. A
-// notification generated by the network is from the recipient: that is the
-// conversation a client files it under (an assumption docs/rcs-as.md
+// notification builds the notification d about m, sent on behalf of
+// m.Recipient, as a queue item for m.Sender with the given ID. It returns
+// imdn.ErrNotRequested when the sender did not ask for it, which includes
+// a message that asked without the Message-ID and DateTime to answer with.
+//
+// A notification generated by the network is from the recipient: that is
+// the conversation a client files it under (an assumption docs/rcs-as.md
 // records). IMDN-Route is copied from IMDN-Record-Route, as RFC 5438
-// §7.2.1 has a recipient do.
-func (e *Engine) notification(m store.Message, k imdn.Kind, s imdn.Status, id string, now time.Time) (store.Message, error) {
+// §7.2.1 has a recipient do, keeping only trusted entries.
+func (e *Engine) notification(m store.Message, d disposition, id string, now time.Time) (store.Message, error) {
 	c, err := e.parseCPIM(m.CPIM)
 	if err != nil {
 		return store.Message{}, err
 	}
 	req, err := imdn.ParseRequest(c)
+	if errors.Is(err, imdn.ErrIncompleteRequest) {
+		return store.Message{}, imdn.ErrNotRequested
+	}
 	if err != nil {
 		return store.Message{}, err
 	}
-	n, err := req.Notification(k, s, m.Recipient)
+	n, err := req.Notification(d.kind, d.status, m.Recipient)
 	if err != nil {
 		return store.Message{}, err
+	}
+	var route []cpim.Address
+	for _, a := range req.RecordRoute {
+		if e.trusted(a.URI) {
+			route = append(route, a)
+		} else {
+			e.metrics.Count("imdn.route_dropped", 1)
+		}
 	}
 	mid, err := imdn.NewMessageID(e.rand)
 	if err != nil {
@@ -141,7 +241,7 @@ func (e *Engine) notification(m store.Message, k imdn.Kind, s imdn.Status, id st
 	}
 	out, err := n.Message(imdn.Envelope{
 		From: cpim.Address{URI: m.Recipient}, To: cpim.Address{URI: m.Sender},
-		Route: req.RecordRoute, MessageID: mid, DateTime: now,
+		Route: route, MessageID: mid, DateTime: now,
 	})
 	if err != nil {
 		return store.Message{}, err
@@ -158,12 +258,21 @@ func (e *Engine) notification(m store.Message, k imdn.Kind, s imdn.Status, id st
 }
 
 // enqueueNotification queues n, which notification built. ErrExists means
-// an earlier attempt already did.
+// an earlier attempt already did. A full queue drops it: the sender has
+// more waiting than it can take, and a notification is not worth refusing
+// anything for.
 func (e *Engine) enqueueNotification(ctx context.Context, n store.Message, s imdn.Status) error {
-	if err := e.store.Enqueue(ctx, n); err != nil && !errors.Is(err, store.ErrExists) {
+	err := e.store.Enqueue(ctx, n, e.limit)
+	switch {
+	case errors.Is(err, store.ErrQueueFull):
+		e.metrics.Count("imdn.dropped.queue_full", 1)
+		return nil
+	case err != nil && !errors.Is(err, store.ErrExists):
 		return err
 	}
 	e.metrics.Count("imdn.generated."+string(s), 1)
-	e.kick(n.Recipient)
+	if err == nil {
+		e.kickNew(n)
+	}
 	return nil
 }

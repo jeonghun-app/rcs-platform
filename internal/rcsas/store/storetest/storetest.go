@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,8 @@ import (
 )
 
 var t0 = time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+
+var none store.Limit
 
 // Recipients and senders use the fictional numbers of
 // .github/allowed-test-identifiers.txt.
@@ -46,16 +49,20 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("OnlyTheOwnerReleasesOrRemoves", func(t *testing.T) { ownership(t, newStore(t)) })
 	t.Run("ExpiredListsFreeExpiredMessagesOfEveryRecipient", func(t *testing.T) { expired(t, newStore(t)) })
 	t.Run("SentRecordsAreKeptUntilTheyExpire", func(t *testing.T) { sent(t, newStore(t)) })
+	t.Run("RepeatedWritesSucceed", func(t *testing.T) { retriedWrites(t, newStore(t)) })
+	t.Run("QueuesAreBoundedByCountAndBytes", func(t *testing.T) { limits(t, newStore(t)) })
+	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
+	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 }
 
 func pendingOrder(t *testing.T, s store.Store) {
 	ctx := context.Background()
 	for i, id := range []string{"0003", "0001", "0002"} {
-		if err := s.Enqueue(ctx, message(bob, id, t0.Add(time.Duration(i)*time.Second))); err != nil {
+		if err := s.Enqueue(ctx, message(bob, id, t0.Add(time.Duration(i)*time.Second)), none); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.Enqueue(ctx, message(carol, "0000", t0)); err != nil {
+	if err := s.Enqueue(ctx, message(carol, "0000", t0), none); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Pending(ctx, bob, "", t0, 10)
@@ -94,21 +101,21 @@ func pendingOrder(t *testing.T, s store.Store) {
 
 func duplicate(t *testing.T, s store.Store) {
 	ctx := context.Background()
-	if err := s.Enqueue(ctx, message(bob, "0001", t0)); err != nil {
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), none); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Enqueue(ctx, message(bob, "0001", t0)); !errors.Is(err, store.ErrExists) {
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), none); !errors.Is(err, store.ErrExists) {
 		t.Fatalf("second Enqueue = %v, want ErrExists", err)
 	}
 	// The same id in another queue is another message.
-	if err := s.Enqueue(ctx, message(carol, "0001", t0)); err != nil {
+	if err := s.Enqueue(ctx, message(carol, "0001", t0), none); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func concurrentClaims(t *testing.T, s store.Store) {
 	ctx := context.Background()
-	if err := s.Enqueue(ctx, message(bob, "0001", t0)); err != nil {
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), none); err != nil {
 		t.Fatal(err)
 	}
 	var wins, conflicts atomic.Int32
@@ -139,7 +146,7 @@ func concurrentClaims(t *testing.T, s store.Store) {
 
 func lapsedLease(t *testing.T, s store.Store) {
 	ctx := context.Background()
-	if err := s.Enqueue(ctx, message(bob, "0001", t0)); err != nil {
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), none); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Claim(ctx, bob, "0001", "task-a", t0, t0.Add(time.Minute)); err != nil {
@@ -157,17 +164,18 @@ func lapsedLease(t *testing.T, s store.Store) {
 		t.Fatalf("claim after the lease = %+v, %v", m, err)
 	}
 	// The task that lost its lease can no longer act on the message.
-	if err := s.Remove(ctx, bob, "0001", "task-a"); !errors.Is(err, store.ErrConflict) {
+	if err := s.Remove(ctx, m, "task-a"); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("Remove by the former owner = %v", err)
 	}
 }
 
 func ownership(t *testing.T, s store.Store) {
 	ctx := context.Background()
-	if err := s.Enqueue(ctx, message(bob, "0001", t0)); err != nil {
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), none); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Release(ctx, bob, "0001", "task-a"); !errors.Is(err, store.ErrConflict) {
+	// Nobody holds it: a release is a repeat of one that took effect.
+	if err := s.Release(ctx, bob, "0001", "task-a"); err != nil {
 		t.Fatalf("Release of an unclaimed message = %v", err)
 	}
 	if _, err := s.Claim(ctx, bob, "0001", "task-a", t0, t0.Add(time.Minute)); err != nil {
@@ -175,7 +183,7 @@ func ownership(t *testing.T, s store.Store) {
 	}
 	for name, op := range map[string]func(owner string) error{
 		"Release": func(o string) error { return s.Release(ctx, bob, "0001", o) },
-		"Remove":  func(o string) error { return s.Remove(ctx, bob, "0001", o) },
+		"Remove":  func(o string) error { return s.Remove(ctx, message(bob, "0001", t0), o) },
 	} {
 		if err := op("task-b"); !errors.Is(err, store.ErrConflict) {
 			t.Fatalf("%s by another task = %v", name, err)
@@ -187,17 +195,15 @@ func ownership(t *testing.T, s store.Store) {
 	if got, _ := s.Pending(ctx, bob, "", t0, 10); len(got) != 1 {
 		t.Fatal("a released message is not pending")
 	}
-	if _, err := s.Claim(ctx, bob, "0001", "task-b", t0, t0.Add(time.Minute)); err != nil {
+	held, err := s.Claim(ctx, bob, "0001", "task-b", t0, t0.Add(time.Minute))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Remove(ctx, bob, "0001", "task-b"); err != nil {
+	if err := s.Remove(ctx, held, "task-b"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.Pending(ctx, bob, "", t0, 10); len(got) != 0 {
 		t.Fatal("a removed message is still pending")
-	}
-	if err := s.Remove(ctx, bob, "0001", "task-b"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("second Remove = %v", err)
 	}
 }
 
@@ -207,25 +213,188 @@ func expired(t *testing.T, s store.Store) {
 	other := message(carol, "0002", t0.Add(-90*time.Minute))
 	fresh := message(bob, "0003", t0)
 	for _, m := range []store.Message{old, other, fresh} {
-		if err := s.Enqueue(ctx, m); err != nil {
+		if err := s.Enqueue(ctx, m, none); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.Expired(ctx, t0, 10)
-	if err != nil {
-		t.Fatal(err)
+	got, cursor, err := s.Expired(ctx, t0, "", 10)
+	if err != nil || cursor != "" {
+		t.Fatalf("Expired = %v, %q, %v", idsOf(got), cursor, err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("Expired = %v", idsOf(got))
+	// Oldest expiry first, whatever the queue; only the keys and expiry
+	// are promised.
+	if fmt.Sprint(idsOf(got)) != "[0001 0002]" || got[0].Recipient != bob || !got[0].Expires.Equal(old.Expires) {
+		t.Fatalf("Expired = %+v", got)
+	}
+	// One at a time: each call resumes where the last stopped, and the
+	// end gives an empty cursor.
+	first, cursor, err := s.Expired(ctx, t0, "", 1)
+	if err != nil || len(first) != 1 || first[0].ID != "0001" || cursor == "" {
+		t.Fatalf("Expired page 1 = %v, %q, %v", idsOf(first), cursor, err)
+	}
+	// A backend may need one more call to see that the end is reached.
+	var rest []store.Message
+	for page := 0; cursor != "" && page < 3; page++ {
+		var got []store.Message
+		got, cursor, err = s.Expired(ctx, t0, cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rest = append(rest, got...)
+	}
+	if fmt.Sprint(idsOf(rest)) != "[0002]" || cursor != "" {
+		t.Fatalf("Expired after page 1 = %v, cursor %q", idsOf(rest), cursor)
 	}
 	if _, err := s.Claim(ctx, bob, "0001", "task-a", t0, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.Expired(ctx, t0, 10); len(got) != 1 || got[0].ID != "0002" {
+	if got, _, _ := s.Expired(ctx, t0, "", 10); len(got) != 1 || got[0].ID != "0002" {
 		t.Fatalf("Expired with one claimed = %v", idsOf(got))
 	}
-	if got, _ := s.Expired(ctx, t0, 0); len(got) != 0 {
+	if got, _, _ := s.Expired(ctx, t0, "", 0); len(got) != 0 {
 		t.Fatalf("limit 0 returned %d", len(got))
+	}
+}
+
+func retriedWrites(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), none); err != nil {
+		t.Fatal(err)
+	}
+	until := t0.Add(time.Minute)
+	m, err := s.Claim(ctx, bob, "0001", "task-a", t0, until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The repeat of a claim that took effect gets the message again; the
+	// same owner with another lease is a new claim, which is refused.
+	if again, err := s.Claim(ctx, bob, "0001", "task-a", t0, until); err != nil || again.Owner != "task-a" || !bytes.Equal(again.CPIM, m.CPIM) {
+		t.Fatalf("repeated Claim = %+v, %v", again, err)
+	}
+	if _, err := s.Claim(ctx, bob, "0001", "task-a", t0, until.Add(time.Second)); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Claim with another lease = %v", err)
+	}
+	for range 2 {
+		if err := s.Release(ctx, bob, "0001", "task-a"); err != nil {
+			t.Fatalf("Release = %v", err)
+		}
+	}
+	if m, err = s.Claim(ctx, bob, "0001", "task-b", t0, until); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := s.Remove(ctx, m, "task-b"); err != nil {
+			t.Fatalf("Remove = %v", err)
+		}
+	}
+}
+
+func limits(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	m := message(bob, "0001", t0)
+	size := m.Size()
+	byCount := store.Limit{Count: 2}
+	for _, id := range []string{"0001", "0002"} {
+		if err := s.Enqueue(ctx, message(bob, id, t0), byCount); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Enqueue(ctx, message(bob, "0003", t0), byCount); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("Enqueue beyond the count = %v", err)
+	}
+	// Another queue has a bound of its own.
+	if err := s.Enqueue(ctx, message(carol, "0003", t0), byCount); err != nil {
+		t.Fatal(err)
+	}
+	// Removing makes room.
+	held, err := s.Claim(ctx, bob, "0001", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, held, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, message(bob, "0003", t0), byCount); err != nil {
+		t.Fatalf("Enqueue after a removal = %v", err)
+	}
+	// Bytes: bob holds two messages; room for exactly one more.
+	byBytes := store.Limit{Bytes: 3*size + size/2}
+	if err := s.Enqueue(ctx, message(bob, "0004", t0), byBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, message(bob, "0005", t0), byBytes); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("Enqueue beyond the bytes = %v", err)
+	}
+	if err := s.Enqueue(ctx, message(alice, "0001", t0), store.Limit{Bytes: size - 1}); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("a message larger than the whole bound = %v", err)
+	}
+}
+
+func longKeys(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	// The longest identity and Message-ID the engine lets through.
+	who := "sip:" + strings.Repeat("a", 240) + "@example.net"
+	id := strings.Repeat("m", 128)
+	m := message(who, id, t0)
+	m.Sender = who
+	if err := s.Enqueue(ctx, m, none); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Pending(ctx, who, "", t0, 1); err != nil || len(got) != 1 || got[0].ID != id || got[0].Recipient != who {
+		t.Fatalf("Pending = %+v, %v", got, err)
+	}
+	r := store.Sent{Sender: who, MessageID: id, Recipients: []string{who}, Dispositions: imdn.Display, Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, r, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNotified(ctx, who, id, "display-notification "+who, "t1", t0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Sent(ctx, who, id, t0); err != nil || got.Recipients[0] != who {
+		t.Fatalf("Sent = %+v, %v", got, err)
+	}
+}
+
+func marks(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	if err := s.MarkNotified(ctx, alice, "m-1", "k", "t1", t0); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("MarkNotified without a record = %v", err)
+	}
+	r := store.Sent{Sender: alice, MessageID: "m-1", Recipients: []string{bob}, Dispositions: imdn.Display, Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, r, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t1", t0); err != nil {
+		t.Fatal(err)
+	}
+	// The same attempt again succeeds; another attempt is a duplicate.
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t1", t0); err != nil {
+		t.Fatalf("repeated MarkNotified = %v", err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t2", t0); !errors.Is(err, store.ErrExists) {
+		t.Fatalf("a second notification = %v", err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "delivery "+bob, "t2", t0); err != nil {
+		t.Fatalf("another kind = %v", err)
+	}
+	// Undone by another attempt: nothing happens; by its own: free again.
+	if err := s.UnmarkNotified(ctx, alice, "m-1", "display "+bob, "t2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t3", t0); !errors.Is(err, store.ErrExists) {
+		t.Fatalf("after another attempt's unmark = %v", err)
+	}
+	if err := s.UnmarkNotified(ctx, alice, "m-1", "display "+bob, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t3", t0); err != nil {
+		t.Fatalf("after its own unmark = %v", err)
+	}
+	if err := s.UnmarkNotified(ctx, carol, "m-9", "k", "t1"); err != nil {
+		t.Fatalf("UnmarkNotified without a record = %v", err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "processing", "t4", t0.Add(time.Hour)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("MarkNotified after expiry = %v", err)
 	}
 }
 

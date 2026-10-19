@@ -3,6 +3,7 @@ package messaging
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -34,6 +35,8 @@ type Message struct {
 	Notification *imdn.Notification
 }
 
+var errLongMessageID = errors.New("messaging: Message-ID longer than " + strconv.Itoa(MaxMessageIDLength) + " bytes")
+
 // ParseMessage reads a message/cpim body of at most maxSize bytes. Its
 // errors are *Rejection.
 func ParseMessage(raw []byte, maxSize int) (*Message, error) {
@@ -54,6 +57,9 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 		if err != nil {
 			return nil, reject(ReasonIMDNMalformed, err)
 		}
+		if len(n.MessageID) > MaxMessageIDLength {
+			return nil, reject(ReasonIMDNMalformed, errLongMessageID)
+		}
 		m.Notification = &n
 		return m, nil
 	}
@@ -63,6 +69,10 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 		m.Request, m.IncompleteRequest = imdn.Request{}, true
 	case err != nil:
 		return nil, reject(ReasonMalformed, err)
+	case len(m.Request.MessageID) > MaxMessageIDLength:
+		// RFC 5438 §6.3 sets no bound; the ID becomes a store key, and a
+		// real one is a few dozen characters.
+		return nil, reject(ReasonMalformed, errLongMessageID)
 	}
 	return m, nil
 }
@@ -73,12 +83,15 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 // characters that would end or corrupt a header line; each becomes a \uXXXX
 // escape, as do quote, backslash and the Unicode line and paragraph
 // separators, so the result can sit inside a quoted string (RFC 3261 §25.1)
-// as it is. Invalid UTF-8 becomes U+FFFD.
+// as it is. So do the bidirectional controls and zero-width characters
+// (U+061C, U+200B-U+200F, U+202A-U+202E, U+2066-U+2069), with which a name
+// can be made to display as another. Invalid UTF-8 becomes U+FFFD.
 func EscapeDisplayName(name string) string {
 	var b strings.Builder
 	for _, r := range name {
 		switch {
-		case r < 0x20, r == 0x7f, 0x80 <= r && r < 0xa0, r == '"', r == '\\', r == 0x2028, r == 0x2029:
+		case r < 0x20, r == 0x7f, 0x80 <= r && r < 0xa0, r == '"', r == '\\', r == 0x2028, r == 0x2029,
+			r == 0x061c, 0x200b <= r && r <= 0x200f, 0x202a <= r && r <= 0x202e, 0x2066 <= r && r <= 0x2069:
 			fmt.Fprintf(&b, `\u%04x`, r)
 		default:
 			// range yields utf8.RuneError for invalid bytes, which

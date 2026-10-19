@@ -43,14 +43,19 @@ type Conversation struct {
 // RCC.07 defines no grammar beyond the SIP header syntax, so each value is
 // taken as one RFC 3261 token, the form clients generate (hex strings and
 // UUIDs), of at most MaxIDLength characters, with surrounding white space
-// removed. Conversation-ID and Contribution-ID are required, since a
-// message without them cannot be put in any conversation;
-// InReplyTo-Contribution-ID is optional.
+// removed. A request with none of the three gives the zero Conversation:
+// pager-mode notifications come without them (rcsjta), and the engine
+// does not need them for a notification. Otherwise Conversation-ID and
+// Contribution-ID are required, since a message without them cannot be
+// put in any conversation; InReplyTo-Contribution-ID is optional.
 func ParseConversationHeaders(conversationID, contributionID, inReplyTo string) (Conversation, error) {
 	c := Conversation{
 		ID:           trimSpace(conversationID),
 		Contribution: trimSpace(contributionID),
 		InReplyTo:    trimSpace(inReplyTo),
+	}
+	if c == (Conversation{}) {
+		return c, nil
 	}
 	if !isID(c.ID) || !isID(c.Contribution) || c.InReplyTo != "" && !isID(c.InReplyTo) {
 		return Conversation{}, ErrInvalidConversation

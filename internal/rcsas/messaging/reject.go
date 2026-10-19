@@ -28,6 +28,9 @@ const (
 	// messages to different recipients, which would let it collect
 	// notifications from the second about the first (RFC 5438 §6.3).
 	ReasonMessageIDReused Reason = "message_id_reused"
+	// ReasonQueueFull: the recipient's queue holds as many messages or
+	// bytes as it may (Config.MaxQueueMessages, MaxQueueBytes).
+	ReasonQueueFull Reason = "queue_full"
 	// ReasonIMDNMalformed: a notification whose document cannot be read.
 	ReasonIMDNMalformed Reason = "imdn_malformed"
 	// ReasonIMDNUnknown: a notification about a message the recipient of

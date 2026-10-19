@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,29 +15,49 @@ import (
 type Memory struct {
 	mu     sync.Mutex
 	queues map[string]map[string]Message
-	sent   map[sentKey]Sent
+	sent   map[sentKey]*sentRecord
 }
 
 type sentKey struct{ sender, messageID string }
+
+type sentRecord struct {
+	Sent
+	marks map[string]string // notification key → token
+}
 
 var _ Store = (*Memory)(nil)
 
 // NewMemory returns an empty Memory.
 func NewMemory() *Memory {
-	return &Memory{queues: map[string]map[string]Message{}, sent: map[sentKey]Sent{}}
+	return &Memory{queues: map[string]map[string]Message{}, sent: map[sentKey]*sentRecord{}}
+}
+
+// Len reports how many messages recipient's queue holds, claimed, expired
+// or not; Pending shows only those ready to deliver. For tests.
+func (s *Memory) Len(recipient string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.queues[recipient])
 }
 
 // Enqueue implements Store.
-func (s *Memory) Enqueue(_ context.Context, m Message) error {
+func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	q := s.queues[m.Recipient]
+	if _, ok := q[m.ID]; ok {
+		return fmt.Errorf("store: enqueue: %w", ErrExists)
+	}
+	var bytes int64
+	for _, x := range q {
+		bytes += x.Size()
+	}
+	if l.Count > 0 && len(q)+1 > l.Count || l.Bytes > 0 && bytes+m.Size() > l.Bytes {
+		return fmt.Errorf("store: enqueue: %w", ErrQueueFull)
+	}
 	if q == nil {
 		q = map[string]Message{}
 		s.queues[m.Recipient] = q
-	}
-	if _, ok := q[m.ID]; ok {
-		return fmt.Errorf("store: enqueue: %w", ErrExists)
 	}
 	m = m.Clone()
 	m.Owner, m.LeaseUntil = "", time.Time{}
@@ -55,7 +76,7 @@ func (s *Memory) Pending(_ context.Context, recipient, after string, now time.Ti
 		}
 	}
 	slices.SortFunc(out, func(a, b Message) int { return cmp.Compare(a.ID, b.ID) })
-	return out[:min(len(out), limit)], nil
+	return out[:min(len(out), max(limit, 0))], nil
 }
 
 // Claim implements Store.
@@ -63,10 +84,13 @@ func (s *Memory) Claim(_ context.Context, recipient, id, owner string, now, unti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ok := s.queues[recipient][id]
-	if !ok {
+	switch {
+	case !ok:
 		return Message{}, fmt.Errorf("store: claim: %w", ErrNotFound)
-	}
-	if !m.Free(now) {
+	case m.Owner == owner && m.LeaseUntil.Equal(until):
+		// A repeat of a claim that took effect.
+		return m.Clone(), nil
+	case !m.Free(now):
 		return Message{}, fmt.Errorf("store: claim: %w", ErrConflict)
 	}
 	m.Owner, m.LeaseUntil = owner, until
@@ -78,9 +102,12 @@ func (s *Memory) Claim(_ context.Context, recipient, id, owner string, now, unti
 func (s *Memory) Release(_ context.Context, recipient, id, owner string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m, err := s.held(recipient, id, owner)
-	if err != nil {
-		return fmt.Errorf("store: release: %w", err)
+	m, ok := s.queues[recipient][id]
+	switch {
+	case !ok || m.Owner == "":
+		return nil
+	case m.Owner != owner:
+		return fmt.Errorf("store: release: %w", ErrConflict)
 	}
 	m.Owner, m.LeaseUntil = "", time.Time{}
 	s.queues[recipient][id] = m
@@ -88,46 +115,46 @@ func (s *Memory) Release(_ context.Context, recipient, id, owner string) error {
 }
 
 // Remove implements Store.
-func (s *Memory) Remove(_ context.Context, recipient, id, owner string) error {
+func (s *Memory) Remove(_ context.Context, msg Message, owner string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.held(recipient, id, owner); err != nil {
-		return fmt.Errorf("store: remove: %w", err)
+	m, ok := s.queues[msg.Recipient][msg.ID]
+	switch {
+	case !ok:
+		return nil
+	case m.Owner != owner:
+		return fmt.Errorf("store: remove: %w", ErrConflict)
 	}
-	delete(s.queues[recipient], id)
-	if len(s.queues[recipient]) == 0 {
-		delete(s.queues, recipient)
+	delete(s.queues[msg.Recipient], msg.ID)
+	if len(s.queues[msg.Recipient]) == 0 {
+		delete(s.queues, msg.Recipient)
 	}
 	return nil
 }
 
-func (s *Memory) held(recipient, id, owner string) (Message, error) {
-	m, ok := s.queues[recipient][id]
-	switch {
-	case !ok:
-		return Message{}, ErrNotFound
-	case m.Owner != owner:
-		return Message{}, ErrConflict
-	}
-	return m, nil
-}
-
-// Expired implements Store.
-func (s *Memory) Expired(_ context.Context, now time.Time, limit int) ([]Message, error) {
+// Expired implements Store. The cursor is the last key returned.
+func (s *Memory) Expired(_ context.Context, now time.Time, cursor string, limit int) ([]Message, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []Message
 	for _, q := range s.queues {
 		for _, m := range q {
-			if !m.Expires.After(now) && m.Free(now) {
-				out = append(out, m.Clone())
+			if !m.Expires.After(now) && m.Free(now) && expiryKey(m) > cursor {
+				out = append(out, Message{Recipient: m.Recipient, ID: m.ID, Expires: m.Expires})
 			}
 		}
 	}
-	slices.SortFunc(out, func(a, b Message) int {
-		return cmp.Or(a.Expires.Compare(b.Expires), cmp.Compare(a.Recipient, b.Recipient), cmp.Compare(a.ID, b.ID))
-	})
-	return out[:min(len(out), limit)], nil
+	slices.SortFunc(out, func(a, b Message) int { return strings.Compare(expiryKey(a), expiryKey(b)) })
+	if limit <= 0 || len(out) <= limit {
+		return out[:min(len(out), max(limit, 0))], "", nil
+	}
+	out = out[:limit]
+	return out, expiryKey(out[limit-1]), nil
+}
+
+// expiryKey orders messages by expiry, then queue and ID.
+func expiryKey(m Message) string {
+	return fmt.Sprintf("%020d\x00%s\x00%s", m.Expires.UnixNano(), m.Recipient, m.ID)
 }
 
 // RecordSent implements Store.
@@ -138,7 +165,7 @@ func (s *Memory) RecordSent(_ context.Context, r Sent, now time.Time) error {
 	if old, ok := s.sent[k]; ok && old.Expires.After(now) {
 		return fmt.Errorf("store: record sent: %w", ErrExists)
 	}
-	s.sent[k] = r.Clone()
+	s.sent[k] = &sentRecord{Sent: r.Clone(), marks: map[string]string{}}
 	return nil
 }
 
@@ -146,14 +173,48 @@ func (s *Memory) RecordSent(_ context.Context, r Sent, now time.Time) error {
 func (s *Memory) Sent(_ context.Context, sender, messageID string, now time.Time) (Sent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	r, err := s.live(sender, messageID, now)
+	if err != nil {
+		return Sent{}, fmt.Errorf("store: sent: %w", err)
+	}
+	return r.Clone(), nil
+}
+
+// live needs s.mu.
+func (s *Memory) live(sender, messageID string, now time.Time) (*sentRecord, error) {
 	k := sentKey{sender, messageID}
 	r, ok := s.sent[k]
 	if !ok {
-		return Sent{}, fmt.Errorf("store: sent: %w", ErrNotFound)
+		return nil, ErrNotFound
 	}
 	if !r.Expires.After(now) {
 		delete(s.sent, k)
-		return Sent{}, fmt.Errorf("store: sent: %w", ErrNotFound)
+		return nil, ErrNotFound
 	}
-	return r.Clone(), nil
+	return r, nil
+}
+
+// MarkNotified implements Store.
+func (s *Memory) MarkNotified(_ context.Context, sender, messageID, key, token string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, err := s.live(sender, messageID, now)
+	if err != nil {
+		return fmt.Errorf("store: mark notified: %w", err)
+	}
+	if t, ok := r.marks[key]; ok && t != token {
+		return fmt.Errorf("store: mark notified: %w", ErrExists)
+	}
+	r.marks[key] = token
+	return nil
+}
+
+// UnmarkNotified implements Store.
+func (s *Memory) UnmarkNotified(_ context.Context, sender, messageID, key, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r, ok := s.sent[sentKey{sender, messageID}]; ok && r.marks[key] == token {
+		delete(r.marks, key)
+	}
+	return nil
 }

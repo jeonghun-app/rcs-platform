@@ -25,13 +25,13 @@ func TestAStandaloneMessageWaitsForTheRecipientToRegister(t *testing.T) {
 	waitFor(t, "the message to be released", func() bool { return r.queued(t, bob) == 1 })
 
 	r.d.onPager(nil)
-	r.e.UserRegistered(bob)
+	r.e.UserRegistered(bob, false)
 	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, msg) {
 		t.Fatalf("redelivery %+v", d)
 	}
 	waitFor(t, "the delivery to be counted", func() bool { return r.m.get("delivery.pager") == 1 })
 	if r.queued(t, bob) != 0 || r.m.get("delivery.pager_failed") != 1 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -49,7 +49,15 @@ func TestAnExpiredMessageSendsTheNegativeNotificationItsSenderAskedFor(t *testin
 		if err := r.e.Submit(t.Context(), standalone(alice, bob, m)); err != nil {
 			t.Fatal(err)
 		}
-		r.d.nextPager(t)
+	}
+	// The first attempt finds bob unreachable; what follows waits for a
+	// registration or the retry timer.
+	r.d.nextPager(t)
+	waitFor(t, "idle", r.idle)
+	for len(r.d.pagers) > 0 {
+		if d := <-r.d.pagers; d.Recipient != bob {
+			t.Fatalf("delivery %+v", d)
+		}
 	}
 	waitFor(t, "both messages to be released", func() bool { return r.queued(t, bob) == 2 })
 
@@ -75,7 +83,7 @@ func TestAnExpiredMessageSendsTheNegativeNotificationItsSenderAskedFor(t *testin
 	case <-time.After(50 * time.Millisecond):
 	}
 	if r.queued(t, bob) != 0 || r.m.get("message.expired") != 2 || r.m.get("imdn.generated.failed") != 1 {
-		t.Fatalf("queued %d, metrics %v", r.queued(t, bob), r.m.n)
+		t.Fatalf("queued %d, metrics %v", r.queued(t, bob), r.m)
 	}
 }
 
@@ -97,7 +105,7 @@ func TestAnUndeliverableMessageIsAnsweredAtOnce(t *testing.T) {
 	}
 	waitFor(t, "the failure to be counted", func() bool { return r.m.get("delivery.undeliverable") == 1 })
 	if r.queued(t, bob) != 0 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -119,7 +127,7 @@ func TestANotificationIsNeverAnsweredWithAnother(t *testing.T) {
 	}
 	// Only the message gets a notification; the notification gets none.
 	if r.m.get("imdn.generated.failed") != 1 {
-		t.Fatalf("metrics %v", r.m.n)
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -187,7 +195,7 @@ func TestTwoEnginesSharingAStoreDeliverEachMessageOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, r := range []*rig{r1, r2} {
 		wg.Add(1)
-		go func() { defer wg.Done(); r.e.UserRegistered(bob) }()
+		go func() { defer wg.Done(); r.e.UserRegistered(bob, false) }()
 	}
 	wg.Wait()
 	waitFor(t, "bob's queue to empty", func() bool { return r1.queued(t, bob) == 0 })
@@ -236,15 +244,23 @@ func TestAClientThatTakesNoSessionsGetsWhatFitsByPager(t *testing.T) {
 		t.Fatalf("invited again: %+v", inv)
 	default:
 	}
+	// A refresh on the same flow keeps the marker (ADR 0004).
+	r.e.UserRegistered(bob, false)
+	waitFor(t, "the refresh to be handled", r.idle)
+	select {
+	case inv := <-r.d.invites:
+		t.Fatalf("invited after a refresh: %+v", inv)
+	case <-time.After(20 * time.Millisecond):
+	}
 	r.d.onInvite(nil)
-	r.e.UserRegistered(bob)
+	r.e.UserRegistered(bob, true)
 	if inv := r.d.nextInvite(t); inv.Recipient != bob {
 		t.Fatalf("invitation %+v", inv)
 	}
 }
 
 func TestAFailedInvitationIsRetriedOnlyAfterTheInviteTimeout(t *testing.T) {
-	r := newRig(t, Config{InviteTimeout: time.Minute})
+	r := newRig(t, Config{InviteTimeout: time.Minute, RetryInterval: time.Hour})
 	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
@@ -267,8 +283,9 @@ func TestAFailedInvitationIsRetriedOnlyAfterTheInviteTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.d.nextInvite(t)
-	if r.m.get("invite.failed") != 1 || r.m.get("invite.sent") != 2 {
-		t.Fatalf("metrics %v", r.m.n)
+	waitFor(t, "the second invitation to be counted", func() bool { return r.m.get("invite.sent") == 2 })
+	if r.m.get("invite.failed") != 1 {
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 

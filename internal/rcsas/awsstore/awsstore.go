@@ -7,20 +7,30 @@
 // # Table layout
 //
 // One table, partition key pk and sort key sk (both strings), TTL attribute
-// ttl, holds two kinds of item:
+// ttl, holds three kinds of item:
 //
 //	pk q#<len(recipient)>#<recipient>  sk <message id>   a queued message
+//	pk c#<len(recipient)>#<recipient>  sk n              the queue's size
 //	pk s#<len(sender)>#<sender>        sk <Message-ID>   a sent-message record
 //
 // The length prefix keeps one identity from being a prefix-collision of
 // another. A recipient's queue is one partition, read in sort-key order,
-// which the engine makes the enqueue order.
+// which the engine makes the enqueue order. The size item is written in the
+// same transaction as each enqueue and removal, which is what bounds a
+// queue across tasks.
 //
-// Every read is strongly consistent: a message may be claimed milliseconds
-// after another task enqueued it. Claims are conditional updates
+// The global secondary index expiry (partition key xb, sort key expires,
+// projecting owner and lease_until) finds expired messages without reading
+// the table: only queue items carry xb, one of ExpiryBuckets values chosen
+// by recipient, so the index is sparse and no single index partition takes
+// every write.
+//
+// Every table read is strongly consistent: a message may be claimed
+// milliseconds after another task enqueued it. The index cannot be, which
+// is harmless since Claim checks again. Claims are conditional updates
 // (attribute_not_exists(owner) OR lease <= now), so exactly one task wins
-// one; Release and Remove are conditional on the owner. Items carry their own
-// expiry and the store checks it on every read, because DynamoDB TTL
+// one; Release and Remove are conditional on the owner. Items carry their
+// own expiry and the store checks it on every read, because DynamoDB TTL
 // deletion can lag by days; the ttl attribute only keeps the table small.
 //
 // # Errors
@@ -52,9 +62,8 @@ type DynamoAPI interface {
 	GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	PutItem(context.Context, *dynamodb.PutItemInput, ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 	UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
-	DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
 	Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
-	Scan(context.Context, *dynamodb.ScanInput, ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
+	TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
 	DescribeTable(context.Context, *dynamodb.DescribeTableInput, ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }
 

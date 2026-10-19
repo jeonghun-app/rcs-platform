@@ -3,11 +3,14 @@ package awsstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
 
@@ -50,14 +53,16 @@ func TestEveryOperationReportsAFailedRequest(t *testing.T) {
 	ctx := context.Background()
 	f.fail = &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException"}
 	for name, op := range map[string]func() error{
-		"Enqueue":    func() error { return s.Enqueue(ctx, store.Message{Recipient: "r", ID: "1"}) },
-		"Pending":    func() error { _, err := s.Pending(ctx, "r", "", t0, 1); return err },
-		"Claim":      func() error { _, err := s.Claim(ctx, "r", "1", "o", t0, t0); return err },
-		"Release":    func() error { return s.Release(ctx, "r", "1", "o") },
-		"Remove":     func() error { return s.Remove(ctx, "r", "1", "o") },
-		"Expired":    func() error { _, err := s.Expired(ctx, t0, 1); return err },
-		"RecordSent": func() error { return s.RecordSent(ctx, store.Sent{Sender: "s", MessageID: "m"}, t0) },
-		"Sent":       func() error { _, err := s.Sent(ctx, "s", "m", t0); return err },
+		"Enqueue":        func() error { return s.Enqueue(ctx, store.Message{Recipient: "r", ID: "1"}, store.Limit{}) },
+		"Pending":        func() error { _, err := s.Pending(ctx, "r", "", t0, 1); return err },
+		"Claim":          func() error { _, err := s.Claim(ctx, "r", "1", "o", t0, t0); return err },
+		"Release":        func() error { return s.Release(ctx, "r", "1", "o") },
+		"Remove":         func() error { return s.Remove(ctx, store.Message{Recipient: "r", ID: "1"}, "o") },
+		"Expired":        func() error { _, _, err := s.Expired(ctx, t0, "", 1); return err },
+		"RecordSent":     func() error { return s.RecordSent(ctx, store.Sent{Sender: "s", MessageID: "m"}, t0) },
+		"Sent":           func() error { _, err := s.Sent(ctx, "s", "m", t0); return err },
+		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "t", t0) },
+		"UnmarkNotified": func() error { return s.UnmarkNotified(ctx, "s", "m", "k", "t") },
 	} {
 		if err := op(); err == nil || !strings.Contains(err.Error(), "ProvisionedThroughputExceededException") {
 			t.Errorf("%s = %v", name, err)
@@ -111,7 +116,7 @@ func TestOptionalAttributesAreLeftOutRatherThanStoredEmpty(t *testing.T) {
 	f := newFakeDynamo(t)
 	s := NewWithClient("messages", f)
 	m := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Standalone, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
-	if err := s.Enqueue(context.Background(), m); err != nil {
+	if err := s.Enqueue(context.Background(), m, store.Limit{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{attrConversation, attrContribution, attrInReplyTo, attrMessageID, attrOwner} {
@@ -126,7 +131,7 @@ func TestLimitZeroAsksForNothing(t *testing.T) {
 	if got, err := s.Pending(context.Background(), "r", "", t0, 0); err != nil || got != nil {
 		t.Fatalf("Pending = %v, %v", got, err)
 	}
-	if got, err := s.Expired(context.Background(), t0, 0); err != nil || got != nil {
+	if got, _, err := s.Expired(context.Background(), t0, "", 0); err != nil || got != nil {
 		t.Fatalf("Expired = %v, %v", got, err)
 	}
 }
@@ -142,8 +147,120 @@ func TestAMessageLargerThanAnItemIsRefusedBeforeAnyRequest(t *testing.T) {
 	f := newFakeDynamo(t)
 	f.fail = errors.New("no request expected")
 	s := NewWithClient("messages", f)
-	err := s.Enqueue(context.Background(), store.Message{Recipient: "r", ID: "1", CPIM: make([]byte, MaxCPIMSize+1)})
+	err := s.Enqueue(context.Background(), store.Message{Recipient: "r", ID: "1", CPIM: make([]byte, MaxCPIMSize+1)}, store.Limit{})
 	if !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Enqueue = %v", err)
+	}
+}
+
+// lostAnswers performs every conditional update twice and returns the
+// second answer, as when the SDK retries a request whose first answer was
+// lost after it took effect.
+type lostAnswers struct{ *fakeDynamo }
+
+func (l lostAnswers) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if _, err := l.fakeDynamo.UpdateItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return l.fakeDynamo.UpdateItem(ctx, in, o...)
+}
+
+func (l lostAnswers) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	// DynamoDB answers a repeat with the same ClientRequestToken as it
+	// answered the first; only a removal is repeated without one here,
+	// as a caller retrying after a timeout would.
+	out, err := l.fakeDynamo.TransactWriteItems(ctx, in, o...)
+	if err != nil || in.TransactItems[0].Delete == nil {
+		return out, err
+	}
+	return l.fakeDynamo.TransactWriteItems(ctx, in, o...)
+}
+
+func TestARepeatedWriteThatTookEffectIsNotAConflict(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", lostAnswers{f})
+	ctx := context.Background()
+	m := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := s.Claim(ctx, "r", "1", "task-a", t0, t0.Add(time.Minute))
+	if err != nil || held.Owner != "task-a" {
+		t.Fatalf("Claim = %+v, %v", held, err)
+	}
+	if err := s.Release(ctx, "r", "1", "task-a"); err != nil {
+		t.Fatalf("Release = %v", err)
+	}
+	if held, err = s.Claim(ctx, "r", "1", "task-a", t0, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, held, "task-a"); err != nil {
+		t.Fatalf("Remove = %v", err)
+	}
+	// The repeated removal failed its condition, so the queue's size was
+	// taken down once.
+	if got := nOf(f.rows["c#1#r\x00n"][attrCount]); got != 0 {
+		t.Fatalf("queue size after a repeated removal = %d", got)
+	}
+	r := store.Sent{Sender: "s", MessageID: "m", Recipients: []string{"r"}, Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, r, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNotified(ctx, "s", "m", "k", "t1", t0); err != nil {
+		t.Fatalf("MarkNotified = %v", err)
+	}
+}
+
+func TestExpiredReadsTheIndexAndResumes(t *testing.T) {
+	f := newFakeDynamo(t)
+	f.pageSize = 1
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	// Recipients spread over the buckets, expiring in turn.
+	var want []string
+	for i := range 40 {
+		r := fmt.Sprintf("sip:user%d@example.net", i)
+		m := store.Message{Recipient: r, ID: fmt.Sprint(i), Sender: "s", Mode: store.Chat, CPIM: []byte("x"),
+			Enqueued: t0, Expires: t0.Add(time.Duration(i) * time.Second)}
+		if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, m.ID)
+	}
+	var got []string
+	cursor := ""
+	for range 100 {
+		page, next, err := s.Expired(ctx, t0.Add(time.Hour), cursor, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range page {
+			got = append(got, m.ID)
+			if m.Recipient == "" || m.Expires.IsZero() {
+				t.Fatalf("Expired = %+v", m)
+			}
+		}
+		if cursor = next; cursor == "" {
+			break
+		}
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("Expired found %v, want %v", got, want)
+	}
+	// A failure part-way keeps what was found and where to go on.
+	f.pageSize = 100
+	first, cursor, err := s.Expired(ctx, t0.Add(time.Hour), "", 3)
+	if err != nil || len(first) != 3 || cursor == "" {
+		t.Fatalf("Expired = %v, %q, %v", first, cursor, err)
+	}
+	f.fail = &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException"}
+	if part, again, err := s.Expired(ctx, t0.Add(time.Hour), cursor, 3); err == nil || len(part) != 0 || again != cursor {
+		t.Fatalf("Expired while failing = %v, %q, %v", part, again, err)
+	}
+	f.fail = nil
+	if _, _, err := s.Expired(ctx, t0.Add(time.Hour), "not a cursor", 1); err != nil {
+		t.Fatalf("a cursor from elsewhere = %v", err)
 	}
 }

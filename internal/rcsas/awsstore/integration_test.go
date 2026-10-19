@@ -46,11 +46,24 @@ func integrationStore(t *testing.T) store.Store {
 		AttributeDefinitions: []dtypes.AttributeDefinition{
 			{AttributeName: aws.String(attrPK), AttributeType: dtypes.ScalarAttributeTypeS},
 			{AttributeName: aws.String(attrSK), AttributeType: dtypes.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrBucket), AttributeType: dtypes.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrExpires), AttributeType: dtypes.ScalarAttributeTypeN},
 		},
 		KeySchema: []dtypes.KeySchemaElement{
 			{AttributeName: aws.String(attrPK), KeyType: dtypes.KeyTypeHash},
 			{AttributeName: aws.String(attrSK), KeyType: dtypes.KeyTypeRange},
 		},
+		GlobalSecondaryIndexes: []dtypes.GlobalSecondaryIndex{{
+			IndexName: aws.String(IndexExpiry),
+			KeySchema: []dtypes.KeySchemaElement{
+				{AttributeName: aws.String(attrBucket), KeyType: dtypes.KeyTypeHash},
+				{AttributeName: aws.String(attrExpires), KeyType: dtypes.KeyTypeRange},
+			},
+			Projection: &dtypes.Projection{
+				ProjectionType:   dtypes.ProjectionTypeInclude,
+				NonKeyAttributes: []string{attrOwner, attrLease},
+			},
+		}},
 	}); err != nil {
 		t.Fatalf("creating the table: %v", err)
 	}
@@ -117,7 +130,7 @@ func TestIntegrationTwoEnginesShareTheQueueAndDeliverEachMessageOnce(t *testing.
 	var wg sync.WaitGroup
 	for _, e := range engines {
 		wg.Add(1)
-		go func() { defer wg.Done(); e.UserRegistered("tel:+15550100002") }()
+		go func() { defer wg.Done(); e.UserRegistered("tel:+15550100002", false) }()
 	}
 	wg.Wait()
 	deadline := time.Now().Add(30 * time.Second)

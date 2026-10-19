@@ -35,9 +35,10 @@ type Deliverer interface {
 	Pager(ctx context.Context, d Delivery) error
 	// Invite starts a terminating session to inv.Recipient on behalf of
 	// inv.Peer: rcs-as offers actpass and its instance address (ADR 0004),
-	// with a local URI from Engine.LocalURI. It returns once the INVITE is
-	// on its way; when the answer comes the SIP layer opens the leg with
-	// Engine.OpenLeg, or reports the failure with Engine.InviteFailed.
+	// in the SDP of a leg from Engine.Offer (Direction Terminating, with
+	// inv's QueueID). It returns once the INVITE is on its way; the answer
+	// goes to Leg.Answer, a failure to Engine.InviteFailed and Leg.Close.
+	// A large-mode session is ended once the leg is Finished.
 	Invite(ctx context.Context, inv Invitation) error
 }
 
@@ -47,14 +48,20 @@ type Delivery struct {
 	Recipient string
 	Sender    string
 	// SenderName is the CPIM From formal name, escaped with
-	// EscapeDisplayName so it can be a SIP display name as it is.
+	// EscapeDisplayName so it can be a SIP display name as it is. The
+	// sender chose it, whatever its identity, so it may only be shown: the
+	// display name of From, never of P-Asserted-Identity or any other
+	// header the network vouches for.
 	SenderName   string
 	Conversation Conversation
 	Mode         store.Mode
 	// Notification marks a disposition notification.
 	Notification bool
-	// Route is the next IMDN-Route of a notification that names another
-	// intermediary, which the request goes through; empty otherwise.
+	// Route is the next IMDN-Route of a notification, which the request
+	// goes through, when it names a host of Config.TrustedRouteDomains;
+	// empty otherwise. The engine has checked it; the SIP layer routes
+	// through Route only when it is set and never through a route header
+	// it reads from the body itself.
 	Route string
 	// CPIM is the body, as the sender sent it.
 	CPIM []byte
@@ -66,4 +73,7 @@ type Invitation struct {
 	Peer         string
 	Conversation Conversation
 	Mode         store.Mode
+	// QueueID names, for a large-mode session, the one queued message it
+	// is for; empty for a chat session.
+	QueueID string
 }

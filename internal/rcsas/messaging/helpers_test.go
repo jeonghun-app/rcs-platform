@@ -116,6 +116,13 @@ func (c *counter) Count(name string, n int64) {
 	c.n[name] += n
 }
 
+// String formats every count, for failure messages.
+func (c *counter) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return fmt.Sprint(c.n)
+}
+
 func (c *counter) get(name string) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -125,23 +132,27 @@ func (c *counter) get(name string) int64 {
 // fakeDeliverer stands in for the SIP layer. pager and invite decide the
 // outcome of each attempt; every attempt is also sent on a channel.
 type fakeDeliverer struct {
-	mu      sync.Mutex
-	pager   func(Delivery) error
-	invite  func(Invitation) error
-	pagers  chan Delivery
-	invites chan Invitation
+	mu       sync.Mutex
+	pagerCtx func(context.Context, Delivery) error
+	pager    func(Delivery) error
+	invite   func(Invitation) error
+	pagers   chan Delivery
+	invites  chan Invitation
 }
 
 func newFakeDeliverer() *fakeDeliverer {
 	return &fakeDeliverer{pagers: make(chan Delivery, 256), invites: make(chan Invitation, 256)}
 }
 
-func (f *fakeDeliverer) Pager(_ context.Context, d Delivery) error {
+func (f *fakeDeliverer) Pager(ctx context.Context, d Delivery) error {
 	f.mu.Lock()
-	h := f.pager
+	h, hc := f.pager, f.pagerCtx
 	f.mu.Unlock()
 	var err error
-	if h != nil {
+	switch {
+	case hc != nil:
+		err = hc(ctx, d)
+	case h != nil:
 		err = h(d)
 	}
 	f.pagers <- d
@@ -164,6 +175,12 @@ func (f *fakeDeliverer) onPager(h func(Delivery) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pager = h
+}
+
+func (f *fakeDeliverer) onPagerCtx(h func(context.Context, Delivery) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pagerCtx = h
 }
 
 func (f *fakeDeliverer) onInvite(h func(Invitation) error) {
@@ -380,16 +397,27 @@ var clientSeq int
 // as msrp-relay would.
 func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client) {
 	t.Helper()
-	clientSeq++
-	local := msrp.URI{Host: "127.0.0.1", Port: 40000 + clientSeq, SessionID: fmt.Sprintf("client%d", clientSeq), Transport: "tcp"}
+	local := clientURI()
 	p.Remote = []msrp.URI{local}
+	if p.Direction == 0 {
+		p.Direction = Originating
+	}
 	leg, err := r.e.OpenLeg(p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = leg.Close() })
+	c := r.dial(t, l, local, leg.Local())
+	return leg, c
+}
+
+// dial connects a client session at local to the leg at remote, as
+// msrp-relay does once the client has connected to it.
+func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client {
+	t.Helper()
+	var err error
 	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64)}
-	c.session, err = msrp.NewSession(msrp.SessionConfig{Local: local, Remote: []msrp.URI{leg.Local()}, Handler: c})
+	c.session, err = msrp.NewSession(msrp.SessionConfig{Local: local, Remote: []msrp.URI{remote}, Handler: c})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +433,28 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 	if err := conn.Open(context.Background(), c.session); err != nil {
 		t.Fatal(err)
 	}
-	return leg, c
+	return c
+}
+
+// clientURI is a fresh URI for a fake client.
+func clientURI() msrp.URI {
+	clientSeq++
+	return msrp.URI{Host: "127.0.0.1", Port: 40000 + clientSeq, SessionID: fmt.Sprintf("client%d", clientSeq), Transport: "tcp"}
+}
+
+// idle reports whether no queue is being delivered or waits to be.
+func (r *rig) idle() bool {
+	r.e.mu.Lock()
+	defer r.e.mu.Unlock()
+	if len(r.e.queue) > 0 {
+		return false
+	}
+	for _, x := range r.e.recipients {
+		if x.run != runIdle {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *client) send(t *testing.T, body []byte) {
@@ -419,7 +468,7 @@ func (c *client) send(t *testing.T, body []byte) {
 // Send returned, or the code of the report about it.
 func (c *client) outcome(t *testing.T, contentType string, body []byte) int {
 	t.Helper()
-	id, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: contentType, Body: body})
+	id, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: contentType, Body: body, SuccessReport: true})
 	var se *msrp.StatusError
 	if errors.As(err, &se) {
 		return se.Code
@@ -439,5 +488,23 @@ var errStore = errors.New("store unavailable")
 // failingStore fails every write.
 type failingStore struct{ store.Store }
 
-func (failingStore) Enqueue(context.Context, store.Message) error            { return errStore }
-func (failingStore) RecordSent(context.Context, store.Sent, time.Time) error { return errStore }
+func (failingStore) Enqueue(context.Context, store.Message, store.Limit) error { return errStore }
+func (failingStore) RecordSent(context.Context, store.Sent, time.Time) error   { return errStore }
+
+// largeMode does what the SIP layer does for an invitation to a large-mode
+// session: offers a leg for its message, has the client connect, answers.
+func (r *rig) largeMode(t *testing.T, l net.Listener, inv Invitation) (*client, *Leg) {
+	t.Helper()
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	u := clientURI()
+	c := r.dial(t, l, u, leg.Local())
+	if err := leg.Answer([]msrp.URI{u}); err != nil {
+		t.Fatal(err)
+	}
+	return c, leg
+}
