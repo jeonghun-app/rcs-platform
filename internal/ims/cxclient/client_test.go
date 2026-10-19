@@ -853,6 +853,42 @@ func TestAnAttemptTimesOutByEitherTimerWhileTheCallerWaits(t *testing.T) {
 	}
 }
 
+// A failed attempt is repeated on another task when the task was busy or
+// shutting down or the request did not get through, by either timer, and
+// only while the caller still waits.
+func TestWhatIsRetriedOnAnotherTask(t *testing.T) {
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	answer := func(rc uint32) *diameter.Message {
+		m := &diameter.Message{}
+		m.Add(diameter.NewAVP(diameter.AVPResultCode, diameter.FlagMandatory, 0, diameter.Unsigned32(rc)))
+		return m
+	}
+	for _, tt := range []struct {
+		ctx  context.Context
+		ans  *diameter.Message
+		err  error
+		want bool
+	}{
+		{context.Background(), nil, diameter.ErrPeerUnavailable, true},
+		{context.Background(), nil, diameter.ErrConnectionClosed, true},
+		{context.Background(), nil, diameter.ErrTimeout, true},
+		{context.Background(), nil, fmt.Errorf("send: %w", context.DeadlineExceeded), true},
+		{context.Background(), nil, diameter.ErrApplicationNotNegotiated, true},
+		{context.Background(), nil, errors.New("other"), false},
+		{context.Background(), answer(diameter.ResultTooBusy), nil, true},
+		{context.Background(), answer(diameter.ResultUnableToDeliver), nil, true},
+		{context.Background(), answer(diameter.ResultSuccess), nil, false},
+		{context.Background(), &diameter.Message{}, nil, false},
+		{gone, nil, diameter.ErrTimeout, false},
+		{gone, answer(diameter.ResultTooBusy), nil, false},
+	} {
+		if got := retryable(tt.ctx, tt.ans, tt.err); got != tt.want {
+			t.Errorf("retryable(caller err %v, answer %v, %v) = %v, want %v", tt.ctx.Err(), tt.ans, tt.err, got, tt.want)
+		}
+	}
+}
+
 func TestReadyNeedsAnAvailableTask(t *testing.T) {
 	e := newEnv(t, nil)
 	if err := e.client.Ready(); !errors.Is(err, ErrNoPeer) {
