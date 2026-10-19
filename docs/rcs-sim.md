@@ -63,14 +63,21 @@ The FT client follows the GSMA rcsjta reference client
 One wait is the simulator's own. A device resumes once it is back on a
 network, seconds after the break; the simulator asks at once, before
 `ft-server` may have noticed the break. So `get_upload_info` asks again, every
-100 ms for up to 3 s, until it answers 404 no more and two answers in a row
-name the same bytes held. The step reports how often it asked again
-(`retries`) and how many of those answers were 404 (`not_held`).
+100 ms. It stops once the answers have named the same bytes held for 300 ms.
+A 404 is asked again for up to 3 s. Two equal answers in a row were not enough:
+`ft-server` may still hold the broken upload, and about one resume in 800 got
+503 (#77). Nothing in the upload-info document says the upload is released.
+Its lease runs for minutes when the process holding it has gone, so waiting
+for it is no option. The 300 ms stand for the time a device takes to come back
+on a network. The step reports how often it asked again (`retries`) and how
+many of those answers were 404 (`not_held`).
 
-`make e2e` asserts that `retries` is at most 10, that `ft-resume` resumed
-rather than uploading again, and that `busy_retries` is 0 on every step. So a
-server that is slow to keep a broken upload, or busy on an idle stack, fails
-the run.
+`make e2e` asserts that `get_upload_info` took at most 2 s, its quiet time
+included. It also asserts that `ft-resume` resumed rather than uploading again,
+and that `busy_retries` is 0 on every step. So a server that is slow to keep a
+broken upload, or busy on an idle stack, fails the run. The bound is on
+elapsed time rather than on the number of answers, so a loaded host that
+answers slowly keeps the margin.
 
 The chat client connects actively, as a device behind NAT does: over TLS for
 an `msrps:` path, plain for `msrp:`. It binds the session with a bodiless SEND
@@ -124,7 +131,12 @@ status or cause. Results never carry a URL, a session id, a user name, a
 password, a token or an address: download URLs and MSRP session ids are
 capabilities, and the run's output goes to CI logs. Network failures are
 reduced to a fixed reason ("connection refused", "host name not resolved"),
-without the address, host name or resolver Go's errors name.
+without the address, host name or resolver Go's errors name. So are
+`net/http`'s own failures, which can quote what the server sent:
+- "the answer is not HTTP";
+- "the HTTP exchange failed", for a bad `Content-Length` or a link with another
+  scheme;
+- "the answer's body could not be read", for a broken chunked encoding.
 
 The exit status is 0 when every step succeeded, 1 when one failed, and 2 for a
 usage error.

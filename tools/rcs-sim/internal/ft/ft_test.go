@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -92,10 +93,10 @@ func TestBrokenUploadIsResumedFromWhatTheServerHolds(t *testing.T) {
 	if err := c.SendInterrupted(ctx(t), up, 4*part); err != nil {
 		t.Fatal(err)
 	}
-	// The scenario's rule: two answers in a row with the same bytes held,
-	// so the server has noticed the break and released the upload. The PUT
-	// is then sent once, as rcsjta sends it.
-	info, _, err := c.SettledUploadInfo(ctx(t), up.TID, 10*time.Second, 100*time.Millisecond)
+	// The scenario's rule: the same bytes held for a quiet time, so the
+	// server has noticed the break and released the upload. The PUT is then
+	// sent once, as rcsjta sends it.
+	info, _, err := c.SettledUploadInfo(ctx(t), up.TID, 10*time.Second, 100*time.Millisecond, 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("get_upload_info = %v", err)
 	}
@@ -321,6 +322,72 @@ func TestRetryAfterIsWholeSecondsCapped(t *testing.T) {
 		if got := ft.RetryAfter(v); got != want {
 			t.Errorf("retryAfter(%q) = %v, want %v", v, got, want)
 		}
+	}
+}
+
+// resumeInfo is an upload-info document holding held bytes.
+func resumeInfo(held int) string {
+	return `<?xml version="1.0"?><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp">` +
+		`<file-range start="0" end="` + strconv.Itoa(held-1) + `"/><data url="/ft/x"/></file-resume-info>`
+}
+
+func TestUploadInfoSettlesOnlyAfterAQuietTime(t *testing.T) {
+	// 404, then 10 bytes, then 20 bytes from the fourth answer on: the
+	// quiet time starts again when the bytes held change.
+	var mu sync.Mutex
+	var signed []time.Time
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		signed = append(signed, time.Now())
+		n := len(signed)
+		mu.Unlock()
+		switch {
+		case n == 1:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		case n <= 3:
+			w.Header().Set("Content-Type", ft.ContentType)
+			_, _ = io.WriteString(w, resumeInfo(10))
+		default:
+			w.Header().Set("Content-Type", ft.ContentType)
+			_, _ = io.WriteString(w, resumeInfo(20))
+		}
+	})
+	const quiet = 50 * time.Millisecond
+	info, st, err := c.SettledUploadInfo(ctx(t), "x", 5*time.Second, 5*time.Millisecond, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, _ := info.Held()
+	mu.Lock()
+	defer mu.Unlock()
+	if held != 20 || st.NotHeld != 1 || st.Retries != int64(len(signed)-1) {
+		t.Fatalf("held %d, %+v after %d answers", held, st, len(signed))
+	}
+	// The answer it settled on came a quiet time after the first answer
+	// naming 20 bytes.
+	if gap := signed[len(signed)-1].Sub(signed[3]); gap < quiet {
+		t.Fatalf("settled %v after the bytes held last changed, want at least %v", gap, quiet)
+	}
+}
+
+func TestUploadInfoThatNeverHoldsAnythingEndsAsNothingHeld(t *testing.T) {
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	_, st, err := c.SettledUploadInfo(ctx(t), "x", 30*time.Millisecond, 5*time.Millisecond, time.Second)
+	if !errors.Is(err, ft.ErrNothingHeld) || st.NotHeld < 2 || st.NotHeld != st.Retries+1 {
+		t.Fatalf("SettledUploadInfo = %v, %+v", err, st)
 	}
 }
 

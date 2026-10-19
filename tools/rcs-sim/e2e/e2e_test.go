@@ -29,10 +29,13 @@ const (
 	// rule), so the resume file is a little over one part.
 	partSize   = 5 << 20
 	resumeSize = partSize + 1<<20
-	// maxInfoRetries bounds how often ft-resume asks get_upload_info again
-	// while ft-server notices the break (100 ms apart): a server that is
-	// slow to keep a broken upload fails here instead of passing on retries.
-	maxInfoRetries = 10
+	// maxInfoWait bounds how long ft-resume's get_upload_info step waits
+	// for ft-server to notice the break and keep the parts, its 300 ms quiet
+	// time included: a server that is slow to keep a broken upload fails
+	// here instead of passing on retries. A bound on elapsed time rather
+	// than on the number of answers keeps its margin when a loaded host
+	// answers slowly.
+	maxInfoWait = 2000 // ms
 )
 
 // result is one line of rcs-sim's output.
@@ -40,6 +43,7 @@ type result struct {
 	Scenario string           `json:"scenario"`
 	Step     string           `json:"step"`
 	OK       bool             `json:"ok"`
+	Millis   int64            `json:"ms"`
 	Error    string           `json:"error"`
 	Detail   map[string]int64 `json:"detail"`
 }
@@ -124,9 +128,9 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 	if _, ok := seen["ft-resume/upload-again"]; ok {
 		t.Error("ft-resume uploaded again: ft-server kept nothing of the broken upload")
 	}
-	if info := seen["ft-resume/get_upload_info"]; info.Detail["retries"] > maxInfoRetries {
-		t.Errorf("get_upload_info asked again %d times (%d of them 404), more than %d: ft-server is slow to keep a broken upload",
-			info.Detail["retries"], info.Detail["not_held"], maxInfoRetries)
+	if info := seen["ft-resume/get_upload_info"]; info.Millis > maxInfoWait {
+		t.Errorf("get_upload_info took %d ms (%d answers asked again, %d of them 404), more than %d ms: ft-server is slow to keep a broken upload",
+			info.Millis, info.Detail["retries"], info.Detail["not_held"], maxInfoWait)
 	}
 	// Nothing on an idle stack is busy: a retry rcsjta would make here
 	// would hide an overloaded or misconfigured ft-server.
