@@ -63,8 +63,9 @@ Flow Failed.
 - **Flows in all.** Client flows take at most `PCSCF_MAX_CLIENT_FLOWS` of the
   transport's `PCSCF_MAX_CONNECTIONS`. At least `PCSCF_CORE_CONNECTIONS` of
   the rest stay for the core listener, so clients cannot keep `scscf` out.
-  Connections still in their PROXY header or TLS handshake are not counted
-  yet; per-listener limits for them are #193.
+  A connection counts once its PROXY header is read, so its TLS handshake
+  is counted; connections still sending the PROXY header are not yet, and
+  per-listener limits for them are #193.
 
 ## Registration
 

@@ -29,7 +29,8 @@ type deps struct {
 	listening func(bound)
 	// router, if set, replaces pcscf's.
 	router proxy.Router
-	// now is the clock of registrations and limits; nil is time.Now.
+	// now is the clock of registrations, limits and the drain's schedule;
+	// nil is time.Now.
 	now func() time.Time
 	// started, if set, gets the service's state once it runs.
 	started func(*pcscf)
@@ -152,7 +153,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer cancel()
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
-	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep)
+	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
 	return nil
 }
 
