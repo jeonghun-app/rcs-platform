@@ -168,12 +168,13 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		"no conference host": {with(devEnv, "RCSAS_CONFERENCE_HOST", ""), "RCSAS_CONFERENCE_HOST"},
-		"no participants":    {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "0"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
-		"no idle time":       {with(devEnv, "RCSAS_GROUP_IDLE_TTL", "0s"), "RCSAS_GROUP_IDLE_TTL"},
-		"a small fan-out":    {with(devEnv, "RCSAS_GROUP_FANOUT_BURST", "50"), "RCSAS_GROUP_FANOUT_BURST"},
-		"a negative rate":    {with(devEnv, "RCSAS_GROUP_ADD_RATE", "-1"), "RCSAS_GROUP_ADD_RATE"},
-		"a negative burst":   {with(devEnv, "RCSAS_GROUP_CREATE_BURST", "-1"), "RCSAS_GROUP_CREATE_BURST"},
+		"no conference host":    {with(devEnv, "RCSAS_CONFERENCE_HOST", ""), "RCSAS_CONFERENCE_HOST"},
+		"no participants":       {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "0"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
+		"too many participants": {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "201", "RCSAS_GROUP_FANOUT_BURST", "1000"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
+		"no idle time":          {with(devEnv, "RCSAS_GROUP_IDLE_TTL", "0s"), "RCSAS_GROUP_IDLE_TTL"},
+		"a small fan-out":       {with(devEnv, "RCSAS_GROUP_FANOUT_BURST", "50"), "RCSAS_GROUP_FANOUT_BURST"},
+		"a negative rate":       {with(devEnv, "RCSAS_GROUP_ADD_RATE", "-1"), "RCSAS_GROUP_ADD_RATE"},
+		"a negative burst":      {with(devEnv, "RCSAS_GROUP_CREATE_BURST", "-1"), "RCSAS_GROUP_CREATE_BURST"},
 	} {
 		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v", name, err)

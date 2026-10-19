@@ -19,7 +19,11 @@ import (
 // Defaults for the zero fields of Config; docs/rcs-as.md has the settings.
 const (
 	DefaultMaxParticipants = 100
-	DefaultIdleTTL         = 30 * 24 * time.Hour
+	// LimitParticipants is the largest MaxParticipants: a group keeps as
+	// many former participants as current ones at most, and both must fit
+	// in one stored group (groupstore.MaxEntries).
+	LimitParticipants = groupstore.MaxEntries / 2
+	DefaultIdleTTL    = 30 * 24 * time.Hour
 	// DefaultTouchInterval is how often a group in use has its activity
 	// written: often enough for a 30-day idle limit, rarely enough not to
 	// cost a write per message.
@@ -182,6 +186,9 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		return nil, errors.New("group: ConferenceHost is required")
 	}
 	cfg = cfg.withDefaults()
+	if cfg.MaxParticipants > LimitParticipants {
+		return nil, fmt.Errorf("group: MaxParticipants above %d", LimitParticipants)
+	}
 	if cfg.FanoutRate.PerMinute > 0 && cfg.FanoutRate.Burst < cfg.MaxParticipants-1 {
 		// Otherwise a message to a full group could never be sent.
 		return nil, errors.New("group: the fan-out burst must cover a full group")
@@ -457,6 +464,7 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 		if len(changed) == 0 {
 			return g, nil
 		}
+		deleted := s.forget(&g)
 		g.Version++
 		g.Active = now
 		if g.Expires.After(now) {
@@ -478,7 +486,7 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 			return groupstore.Group{}, err
 		}
 		g.Rev++
-		doc, err := partialDocument(g, changed)
+		doc, err := partialDocument(g, changed, deleted)
 		if err != nil {
 			return groupstore.Group{}, err
 		}
@@ -487,6 +495,24 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 		return g, nil
 	}
 	return groupstore.Group{}, ErrBusy
+}
+
+// forget drops the oldest former participants of g beyond MaxParticipants
+// of them and returns who it dropped. Without it, adding and removing one
+// stranger after another would grow the stored group without bound.
+func (s *Service) forget(g *groupstore.Group) []string {
+	var deleted []string
+	for len(g.Participants)-activeCount(g) > s.cfg.MaxParticipants {
+		oldest := -1
+		for i, p := range g.Participants {
+			if !p.State.Active() && (oldest < 0 || p.Since.Before(g.Participants[oldest].Since)) {
+				oldest = i
+			}
+		}
+		deleted = append(deleted, g.Participants[oldest].Identity)
+		g.Participants = slices.Delete(g.Participants, oldest, oldest+1)
+	}
+	return deleted
 }
 
 func reasonOf(err error) string {

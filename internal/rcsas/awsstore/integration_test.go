@@ -248,6 +248,28 @@ func TestIntegrationGroupsStoreMeetsTheContract(t *testing.T) {
 
 // Two tasks raising one group's roster version at once, each from what it
 // read: every version is written once and none is lost.
+// DynamoDB itself takes and returns the largest group rcs-as keeps.
+func TestIntegrationTheLargestGroupIsStoredWhole(t *testing.T) {
+	groups := integrationGroups(t)
+	ctx := t.Context()
+	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	g := largestGroup(t1)
+	if err := groups.Create(ctx, g, "c", t1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := groups.Get(ctx, g.URI, t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Participants) != groupstore.MaxEntries {
+		t.Fatalf("read back %d participants", len(got.Participants))
+	}
+	last, want := got.Participants[groupstore.MaxEntries-1], g.Participants[groupstore.MaxEntries-1]
+	if last.Identity != want.Identity || last.DisplayName != want.DisplayName || last.AddedBy != want.AddedBy {
+		t.Fatalf("last participant %+v", last)
+	}
+}
+
 func TestIntegrationGroupVersionsCountAcrossWriters(t *testing.T) {
 	groups := integrationGroups(t)
 	ctx := t.Context()

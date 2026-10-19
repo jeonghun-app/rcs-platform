@@ -18,9 +18,10 @@ import (
 //	removed  disconnected, booted
 //
 // Former participants stay in the roster as disconnected, as clients show
-// who left; a partial document carries each changed user whole (state
-// full) under a <users> marked partial, which RFC 4575 §4.6 merges by
-// entity.
+// who left, up to as many as the group's size limit; older ones leave it
+// as deleted users (RFC 4575 §4.4). A partial document carries each
+// changed user whole (state full) under a <users> marked partial, which
+// RFC 4575 §4.6 merges by entity.
 
 func endpoint(p groupstore.Participant) conference.Endpoint {
 	e := conference.Endpoint{Entity: p.Identity, State: conference.Full}
@@ -60,15 +61,19 @@ func fullDocument(g groupstore.Group) ([]byte, error) {
 	return c.Marshal()
 }
 
-// partialDocument is the change to the participants named in changed, at
-// g's version, one above the document before.
-func partialDocument(g groupstore.Group, changed []string) ([]byte, error) {
+// partialDocument is the change to the participants named in changed, and
+// the removal of those in deleted, at g's version, one above the document
+// before.
+func partialDocument(g groupstore.Group, changed, deleted []string) ([]byte, error) {
 	c := info(g, conference.Partial)
 	c.Users = &conference.Users{State: conference.Partial}
 	for _, p := range g.Participants {
 		if slices.Contains(changed, p.Identity) {
 			c.Users.List = append(c.Users.List, user(p))
 		}
+	}
+	for _, id := range deleted {
+		c.Users.List = append(c.Users.List, conference.User{Entity: id, State: conference.Deleted})
 	}
 	return c.Marshal()
 }

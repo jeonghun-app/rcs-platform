@@ -87,6 +87,12 @@ type Participant struct {
 	Since time.Time
 }
 
+// MaxEntries is the most participants, current and former, one group
+// holds. Every backend must store a group of this many with every field
+// at its longest: in DynamoDB that is the whole roster in one item, under
+// the 400 KB item limit.
+const MaxEntries = 400
+
 // Group is one group chat.
 type Group struct {
 	// URI is the conference URI, the group's identity.
@@ -95,8 +101,9 @@ type Group struct {
 	Conversation string
 	Subject      string
 	Creator      string
-	// Participants are everyone ever in the group, in the order they were
-	// added; former ones stay, so that the roster can say they left.
+	// Participants are the group's current participants and its most
+	// recent former ones, in the order they were added; former ones stay,
+	// so that the roster can say they left, up to MaxEntries in all.
 	Participants []Participant
 	// Version is the conference-info version of the last roster change
 	// (RFC 4575 §4.3), one more with every change.

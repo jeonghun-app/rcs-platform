@@ -19,8 +19,9 @@ import (
 //
 //	pk g#<len(uri)>#<uri>  sk group
 //
-// holding the participants as a list, which a group of a few hundred fits
-// in well under DynamoDB's 400 KB item limit. Every change rewrites the
+// holding the participants as a list: groupstore.MaxEntries of them with
+// every field at its longest stay under DynamoDB's 400 KB item limit
+// (TestTheLargestGroupFitsInOneItem). Every change rewrites the
 // item on the condition that its revision (rev) is the one the change was
 // computed from, with a token (wtoken) that tells a repeat of the write
 // from another writer's. Touch updates only active, expires and ttl.

@@ -174,6 +174,9 @@ func Configure(s *runtime.Settings) Config {
 		CreateRate:      readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
 	}
 	positive(e, "GROUP_MAX_PARTICIPANTS", c.Group.MaxParticipants)
+	if c.Group.MaxParticipants > group.LimitParticipants {
+		e.Invalid("GROUP_MAX_PARTICIPANTS", "above "+strconv.Itoa(group.LimitParticipants)+", the most one stored group holds")
+	}
 	if c.Group.IdleTTL <= 0 {
 		e.Invalid("GROUP_IDLE_TTL", "must be positive")
 	}

@@ -162,3 +162,66 @@ func (s slowReads) Get(ctx context.Context, uri string, now time.Time) (groupsto
 	time.Sleep(200 * time.Microsecond)
 	return g, err
 }
+
+// A chairman who adds and removes stranger after stranger must not grow
+// the group's item past DynamoDB's limit: beyond MaxParticipants former
+// participants, the oldest leave the roster, as deleted users, and a
+// subscriber's merged roster still matches the full one.
+func TestTheOldestFormerParticipantsLeaveTheRosterBeyondTheSizeLimit(t *testing.T) {
+	const max = 3
+	r := newRig(t, Config{MaxParticipants: max, AddRate: rateOff})
+	g := r.create(bob)
+	ctx := t.Context()
+	for i := range 10 {
+		r.clock.Advance(time.Minute)
+		who := fmt.Sprintf("sip:x%d@example.net", i)
+		if err := r.s.Add(ctx, g.URI, alice, []Invitee{{Identity: who}}); err != nil {
+			t.Fatal(err)
+		}
+		r.clock.Advance(time.Minute)
+		if err := r.s.Remove(ctx, g.URI, alice, who); err != nil {
+			t.Fatal(err)
+		}
+	}
+	final, err := r.s.Get(ctx, g.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, p := range final.Participants {
+		kept = append(kept, p.Identity)
+	}
+	if want := []string{alice, bob, "sip:x7@example.net", "sip:x8@example.net", "sip:x9@example.net"}; !slices.Equal(kept, want) {
+		t.Fatalf("kept %v, want %v", kept, want)
+	}
+	var state *conference.Info
+	var deleted []string
+	for _, u := range r.n.all() {
+		doc := roster(t, u.Document)
+		if doc.Users != nil {
+			for _, us := range doc.Users.List {
+				if us.State == conference.Deleted {
+					deleted = append(deleted, us.Entity)
+				}
+			}
+		}
+		if state, err = conference.Merge(state, doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := []string{"sip:x0@example.net", "sip:x1@example.net", "sip:x2@example.net", "sip:x3@example.net",
+		"sip:x4@example.net", "sip:x5@example.net", "sip:x6@example.net"}; !slices.Equal(deleted, want) {
+		t.Fatalf("deleted %v, want %v", deleted, want)
+	}
+	full, _, err := r.s.Roster(ctx, g.URI, alice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := state.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(merged, full) {
+		t.Fatalf("merged roster\n%s\nfull roster\n%s", merged, full)
+	}
+}

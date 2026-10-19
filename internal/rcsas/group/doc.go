@@ -26,6 +26,9 @@
 //     leave.
 //   - A participant who left or was removed comes back only by being added
 //     again; being in the roster once is not a standing invitation.
+//   - A group remembers at most as many former participants as its size
+//     limit; the one who left longest ago is forgotten first, so that
+//     churn cannot grow the stored group without bound.
 //   - When the chairman leaves, the role passes to the participant who has
 //     been in the group longest.
 //   - Only a joined participant may write in the group, and what it writes

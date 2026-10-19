@@ -2,6 +2,7 @@ package awsstore
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,8 +11,10 @@ import (
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore/storetest"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 )
 
 func TestTheGroupsStoreMeetsTheContractOverTheFake(t *testing.T) {
@@ -100,5 +103,61 @@ func TestADamagedGroupIsReportedNotGuessed(t *testing.T) {
 	t.Setenv("AWS_REGION", "us-east-1")
 	if _, err := NewGroups(context.Background(), Config{Table: "groupchats", Endpoint: "http://127.0.0.1:1"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// largestGroup is a group of groupstore.MaxEntries participants with every
+// field as long as rcs-as lets it be.
+func largestGroup(at time.Time) groupstore.Group {
+	long := func(prefix string, n int) string { return prefix + strings.Repeat("x", n-len(prefix)) }
+	g := groupstore.Group{
+		URI: "sip:chat-" + strings.Repeat("f", 32) + "@conf.example.net", Conversation: long("c", messaging.MaxIDLength),
+		Subject: long("s", group.MaxSubjectLength), Creator: long("sip:creator", messaging.MaxIdentityLength),
+		Version: 1, Created: at, Active: at, Expires: at.Add(time.Hour),
+	}
+	for i := range groupstore.MaxEntries {
+		g.Participants = append(g.Participants, groupstore.Participant{
+			Identity: long(fmt.Sprintf("sip:p%d", i), messaging.MaxIdentityLength), DisplayName: long("n", group.MaxDisplayNameLength),
+			Role: groupstore.Chairman, State: groupstore.Removed, AddedBy: long("sip:adder", messaging.MaxIdentityLength), Since: at,
+		})
+	}
+	return g
+}
+
+// itemSize is an upper bound on DynamoDB's size of an item: attribute
+// names and string values count their bytes, a number at most 21, and a
+// list or map 3 bytes plus 1 per element.
+func itemSize(item map[string]dtypes.AttributeValue) int {
+	n := 0
+	for name, v := range item {
+		n += len(name) + valueSize(v)
+	}
+	return n
+}
+
+func valueSize(v dtypes.AttributeValue) int {
+	switch v := v.(type) {
+	case *dtypes.AttributeValueMemberS:
+		return len(v.Value)
+	case *dtypes.AttributeValueMemberN:
+		return 21
+	case *dtypes.AttributeValueMemberL:
+		n := 3
+		for _, e := range v.Value {
+			n += 1 + valueSize(e)
+		}
+		return n
+	case *dtypes.AttributeValueMemberM:
+		return 3 + len(v.Value) + itemSize(v.Value)
+	}
+	panic(fmt.Sprintf("no size for %T", v))
+}
+
+// The roster of a group is one item: the largest group rcs-as keeps must
+// fit under DynamoDB's 400 KB item limit, with room to spare.
+func TestTheLargestGroupFitsInOneItem(t *testing.T) {
+	const limit = 400 * 1024
+	if n := itemSize(encodeGroup(largestGroup(t0), 1, "0123456789abcdef")); n > limit*9/10 {
+		t.Fatalf("the largest group is %d bytes, over 90%% of %d", n, limit)
 	}
 }

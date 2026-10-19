@@ -358,6 +358,11 @@ with one user per participant, current or former, and one endpoint each:
 | left | `disconnected` | `departed` |
 | removed | `disconnected` | `booted` |
 
+A group keeps at most as many former participants as
+`RCSAS_GROUP_MAX_PARTICIPANTS`. Beyond that, whoever left longest ago leaves the
+roster, as a `state="deleted"` user in the partial document of the change that
+pushed it out.
+
 The roles are `chairman` and `participant`. Creating a group produces a full
 document at version 1. Every change after that writes the group conditionally
 on the revision it was computed from (`groupstore.Store.Update`) and raises the
@@ -403,7 +408,7 @@ settings:
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
 | `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as` |
 | `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
-| `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group |
+| `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200 |
 | `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
 | `RCSAS_GROUP_SENDER_RATE`, `RCSAS_GROUP_SENDER_BURST` | `60`, `30` | Messages per minute one participant writes in one group, per task; also renames |
 | `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. The burst must cover a full group |
@@ -506,7 +511,10 @@ TTL attribute `ttl`) and no index. Each group is one item:
 
 - **Contents.** The item holds the subject, creator, Conversation-ID, roster
   version, times and the participants as a list. A group of 100 is about 15
-  KB, and the item limit is 400 KB.
+  KB, and the item limit is 400 KB. A group holds at most 400 participants,
+  current and former, which is about 340 KB with every field at its longest
+  (`groupstore.MaxEntries`; `RCSAS_GROUP_MAX_PARTICIPANTS` is therefore at most
+  200).
 - **Writes.** Every change rewrites the item on the condition that its `rev`
   is the one the change was computed from. A token (`wtoken`) tells a repeat
   of the write from another writer's; `Create` uses one too.

@@ -207,7 +207,10 @@ metadata.
   - per group, a fan-out budget of deliveries per minute;
   - each recipient's queue as in 1-to-1 chat, with a group holding at most a
     sender's share;
-  - names, subject and Conversation-ID, 256 bytes each.
+  - names, subject and Conversation-ID, 256 bytes each;
+  - former participants, at most as many as the size limit; adding and
+    removing stranger after stranger cannot grow a group's stored item past
+    DynamoDB's limit and break the group.
 - **Metrics.** None names a group or a participant.
 
 **Status:** implemented in `internal/rcsas/group` (#108). The SIP layer must:

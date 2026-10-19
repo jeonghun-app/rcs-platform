@@ -249,6 +249,9 @@ func TestNewChecksItsDependenciesAndBudget(t *testing.T) {
 		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
 		t.Error("a fan-out burst smaller than a full group")
 	}
+	if _, err := New(Config{ConferenceHost: host, MaxParticipants: LimitParticipants + 1}, groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
+		t.Error("a size limit whose roster would not fit in one item")
+	}
 }
 
 // A new name is a roster change for every subscriber: renaming is
