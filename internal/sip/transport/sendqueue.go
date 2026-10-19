@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,9 +32,13 @@ func noWait(opts []SendOption) bool {
 //
 // Every write to a stream goes through one, so a write never runs on a caller's
 // goroutine. A caller that originates a message waits, for at most WriteTimeout,
-// while the queue is over its limit, so a burst is paced by the peer; a NoWait
-// caller never waits. A queue that stays full closes its connection: its peer is
-// not reading, and cannot slow anyone else down for longer than that.
+// while the queue is over its limit, so a burst is paced by the peer. If no room
+// comes, only that send fails: a peer can be reading, just slower than the burst
+// arrives, and closing its connection would throw away everything already
+// queued for it. A peer that stops reading altogether is closed by the writer,
+// whose write then misses its deadline. A NoWait caller never waits; a NoWait
+// message that does not fit even in the reserve closes the connection, since
+// the goroutine reading it has no other way to make progress.
 type sendQueue struct {
 	budget *queueBudget
 
@@ -80,10 +85,11 @@ func (b *queueBudget) release(n int) { b.used.Add(-int64(n)) }
 type pushResult int
 
 const (
-	pushed     pushResult = iota
-	queueFull             // over this connection's limit
-	overBudget            // over the transport's budget
-	queueGone             // the connection has closed
+	pushed       pushResult = iota
+	queueFull               // over this connection's limit, or its reserve for NoWait
+	waitTimedOut            // no room came within the timeout
+	overBudget              // over the transport's budget
+	queueGone               // the connection has closed
 )
 
 // tryPush queues b if it fits within max and the transport's budget. A message
@@ -133,7 +139,7 @@ func (q *sendQueue) push(b []byte, wait bool, timeout time.Duration) pushResult 
 		case <-q.done:
 			return queueGone
 		case <-deadline:
-			return queueFull
+			return waitTimedOut
 		}
 	}
 }
@@ -187,9 +193,48 @@ func (q *sendQueue) close() {
 	notify(q.wake)
 }
 
+// writeChunk is how much the writer hands the kernel at a time.
+const writeChunk = 32 << 10
+
+// socketSendBuffer caps the kernel's send buffer of every stream socket. Linux
+// grows it to several MiB by itself, which is memory the queue budget cannot
+// see, and reports a full socket writable again only once a large part of it
+// has drained; with a slow reader that wait alone could exceed WriteTimeout. A
+// small buffer keeps waiting output in the accounted queue and makes the write
+// deadline mean "no progress". 128 KiB per round trip is far more than SIP needs
+// inside a VPC or across the internet.
+const socketSendBuffer = 128 << 10
+
+// capSendBuffer applies socketSendBuffer to a TCP connection; other connections,
+// such as a test's pipe, are left alone.
+func capSendBuffer(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetWriteBuffer(socketSendBuffer)
+	}
+}
+
+// writeAll writes b in chunks, each with its own deadline, so WriteTimeout
+// measures how long the peer goes without taking any data rather than how long a
+// whole message takes. A peer reading slowly but steadily keeps its connection;
+// one that stops reading loses it after WriteTimeout.
+func (t *Transport) writeAll(f *flow, b []byte) error {
+	for len(b) > 0 {
+		n := min(len(b), writeChunk)
+		if err := f.conn.SetWriteDeadline(time.Now().Add(t.cfg.WriteTimeout)); err != nil {
+			return err
+		}
+		if _, err := f.conn.Write(b[:n]); err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
 // writeLoop writes a stream flow's queue until the flow closes. A write that
-// fails or misses WriteTimeout closes the connection, since part of a message
-// may have been sent and the peer could not find the start of the next.
+// fails, or makes no progress for WriteTimeout, closes the connection, since part
+// of a message may have been sent and the peer could not find the start of the
+// next.
 func (t *Transport) writeLoop(f *flow) {
 	defer t.wg.Done()
 	for range f.q.wake {
@@ -198,11 +243,7 @@ func (t *Transport) writeLoop(f *flow) {
 			return
 		}
 		for _, b := range bufs {
-			err := f.conn.SetWriteDeadline(time.Now().Add(t.cfg.WriteTimeout))
-			if err == nil {
-				_, err = f.conn.Write(b)
-			}
-			if err != nil {
+			if err := t.writeAll(f, b); err != nil {
 				if !f.closed.Load() {
 					t.stats.writeErrors.Add(1)
 				}

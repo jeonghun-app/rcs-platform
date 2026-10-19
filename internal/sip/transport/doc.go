@@ -52,8 +52,9 @@
 //
 // Writes never happen on the caller's goroutine. Each stream connection has a
 // send queue and a writer goroutine; a sender waits, for at most WriteTimeout,
-// only while the queue is over SendQueueBytes, and a NoWait sender, such as the
-// goroutine that reads the same connection, never waits. Two peers that both
+// only while the queue is over SendQueueBytes, and fails alone with ErrQueueFull
+// if no room comes, while a NoWait sender, such as the goroutine that reads the
+// same connection, never waits. Two peers that both
 // send faster than they read therefore cannot deadlock each other, and a peer
 // that stops reading loses its connection without slowing anyone else. When all
 // queues together reach MaxQueuedBytes, the connection holding the most is
@@ -71,7 +72,10 @@
 //	+ min(MaxQueuedBytes, Σ 2 × send queue limit)              output
 //
 // which with the defaults is 10000 × 1.02 MiB ≈ 10 GiB of input plus at most
-// 256 MiB of output, since MaxQueuedBytes caps all queues together. Reaching the
+// 256 MiB of output, since MaxQueuedBytes caps all queues together. The kernel
+// adds each stream socket's send buffer, which the transport caps at 128 KiB
+// (Linux doubles it, so up to 256 KiB, about 2.5 GiB for 10000 connections that
+// all stop reading) and its receive buffer, which Linux sizes itself. Reaching the
 // input term needs every client to send a maximal body at once; size the task,
 // MaxConnections and Limits.MaxBodyBytes together. Each UDP socket has one
 // 64 KiB buffer.
