@@ -32,9 +32,11 @@
 //	RCS_ADMIN_ADDR        admin listener, IP:port or :port (default :8080)
 //	RCS_SHUTDOWN_TIMEOUT  drain deadline after SIGTERM (default 20s)
 //	RCS_METRICS_NAMESPACE CloudWatch namespace for EMF metrics (default RCS)
-//	RCS_SERVICE_NAMESPACE Cloud Map namespace (a DNS name); names inside it
-//	                      count as private hosts for plain-http internal APIs
-//	                      (Settings.ServiceNamespace, IsPrivateInternalURL)
+//	RCS_SERVICE_NAMESPACE Cloud Map namespace, a DNS name such as rcs.local
+//	                      (two or more labels in staging and prod); names
+//	                      inside it count as private hosts for plain-http
+//	                      internal APIs (Settings.ServiceNamespace,
+//	                      IsPrivateInternalURL)
 //	RCS_PII_HMAC_KEY      at least 32 bytes; keys the correlation hints of
 //	                      internal/pii; required in staging and prod (unkeyed
 //	                      hints, allowed in dev and test, show the last two

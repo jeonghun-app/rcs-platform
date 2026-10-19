@@ -29,12 +29,15 @@ func IsPrivateHost(host, namespace string) bool {
 // InServiceNamespace reports whether the DNS name host lies inside
 // namespace. Whole labels are compared, so "hss.evil-rcs.local" is not inside
 // "rcs.local", and the namespace itself is not inside itself: Cloud Map
-// registers services below it. Case and a trailing dot do not matter. An
-// empty namespace contains nothing.
+// registers services below it. The labels before the namespace must form a
+// DNS name, so ".rcs.local", "a..b.rcs.local" and "*.rcs.local" are not
+// inside it. Case and a trailing dot do not matter. An empty namespace
+// contains nothing.
 func InServiceNamespace(host, namespace string) bool {
 	namespace = strings.TrimSuffix(strings.ToLower(namespace), ".")
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	return namespace != "" && strings.HasSuffix(host, "."+namespace)
+	name, inside := strings.CutSuffix(host, "."+namespace)
+	return namespace != "" && inside && validDNSName(name)
 }
 
 // IsPrivateInternalURL reports whether u is an http or https URL whose host
@@ -56,8 +59,10 @@ func IsPrivateInternalURL(u *url.URL, namespace string) bool {
 func RefuseRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // validDNSName reports whether v is a DNS name of letters, digits and
-// hyphens (RFC 1123 §2.1), as Cloud Map namespaces are: labels of 1 to 63
-// characters not starting or ending with a hyphen, 253 characters at most.
+// hyphens (RFC 1123 §2.1): labels of 1 to 63 characters not starting or
+// ending with a hyphen, 253 characters at most. It is the rule of
+// identity.IsDomainName, restated so that the runtime, which every service
+// imports, does not depend on the IMS packages.
 func validDNSName(v string) bool {
 	if v == "" || len(v) > 253 {
 		return false
@@ -73,4 +78,13 @@ func validDNSName(v string) bool {
 		}
 	}
 	return true
+}
+
+// validServiceNamespace reports whether v may be the Cloud Map namespace: a
+// DNS name whose last label is not all digits, which would make it an IPv4
+// address rather than a name (RFC 1123 §2.1). loadShared also requires two
+// labels or more in staging and prod.
+func validServiceNamespace(v string) bool {
+	last := v[strings.LastIndexByte(v, '.')+1:]
+	return validDNSName(v) && strings.Trim(last, "0123456789") != ""
 }

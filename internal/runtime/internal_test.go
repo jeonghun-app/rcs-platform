@@ -15,9 +15,10 @@ func TestPrivateHostsAreRFC1918ULAAndNamesInTheNamespace(t *testing.T) {
 		"hss.rcs.local":   true, "HSS.RCS.LOCAL.": true, "rcs-as.prod.rcs.local": true,
 		// ADR 0007 §5 refuses these.
 		"127.0.0.1": false, "::1": false, "169.254.169.254": false, "169.254.170.2": false,
-		"fe80::1": false, "fe80::1%eth0": false, "2001:db8::1": false,
+		"fe80::1": false, "fe80::1%eth0": false, "fd00::1%eth0": false, "2001:db8::1": false,
 		"8.8.8.8": false, "172.32.0.1": false, "::ffff:8.8.8.8": false,
 		"hss.example.com": false, "rcs.local": false, "evilrcs.local": false, "hss.evil-rcs.local": false,
+		".rcs.local": false, "..rcs.local": false, "a..b.rcs.local": false, "*.rcs.local": false, "-a.rcs.local": false,
 		"localhost": false, "": false,
 	} {
 		if got := IsPrivateHost(host, "rcs.local"); got != want {
@@ -77,12 +78,18 @@ func TestInternalClientsDoNotFollowRedirects(t *testing.T) {
 }
 
 func TestServiceNamespaceIsAValidatedSharedSetting(t *testing.T) {
+	if len(longNamespace) != 253 {
+		t.Fatalf("longNamespace has %d characters", len(longNamespace))
+	}
 	for v, want := range map[string]string{
 		"":                "",
 		"rcs.local":       "rcs.local",
 		"RCS.Prod.Local.": "rcs.prod.local",
 		"prod-1.internal": "prod-1.internal",
-		"x":               "x",
+		"a.b":             "a.b",
+		"rcs.local1":      "rcs.local1",
+		"x":               "x", // one label is allowed in dev only
+		longNamespace:     longNamespace,
 	} {
 		e := NewEnv("RCS_", envMap{"RCS_ENV": "dev", "RCS_SERVICE_NAMESPACE": v}.lookup)
 		loadShared(e)
@@ -93,7 +100,12 @@ func TestServiceNamespaceIsAValidatedSharedSetting(t *testing.T) {
 			t.Errorf("ServiceNamespace() for %q = %q, want %q", v, got, want)
 		}
 	}
-	for _, v := range []string{"rcs_local", "-rcs.local", "rcs-.local", "rcs..local", ".", strings.Repeat("a", 64) + ".local", "rcs.local/x", "rcs local"} {
+	for _, v := range []string{
+		"rcs_local", "-rcs.local", "rcs-.local", "rcs..local", ".", strings.Repeat("a", 64) + ".local", "rcs.local/x", "rcs local",
+		// An all-digit last label is an address, not a name.
+		"1.2.3.4", "rcs.0", "0",
+		longNamespace + "a",
+	} {
 		e := NewEnv("RCS_", envMap{"RCS_ENV": "dev", "RCS_SERVICE_NAMESPACE": v}.lookup)
 		loadShared(e)
 		if err := e.Err(); err == nil || !strings.Contains(err.Error(), "RCS_SERVICE_NAMESPACE") {
@@ -104,3 +116,21 @@ func TestServiceNamespaceIsAValidatedSharedSetting(t *testing.T) {
 		}
 	}
 }
+
+func TestStagingAndProdNeedANamespaceOfTwoOrMoreLabels(t *testing.T) {
+	for _, env := range []string{"staging", "prod"} {
+		for v, ok := range map[string]bool{"local": false, "com": false, "rcs.local": true, "prod.rcs.internal": true} {
+			e := NewEnv("RCS_", envMap{"RCS_ENV": env, "RCS_SERVICE_NAMESPACE": v}.lookup)
+			loadShared(e)
+			err := e.Err()
+			refused := err != nil && strings.Contains(err.Error(), "RCS_SERVICE_NAMESPACE")
+			if refused == ok {
+				t.Errorf("%s with %q: %v", env, v, err)
+			}
+		}
+	}
+}
+
+// longNamespace is a valid namespace of 253 characters, the most a DNS name
+// may have.
+var longNamespace = strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
