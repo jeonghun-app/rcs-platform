@@ -77,6 +77,28 @@ func TestSIPUsageErrorsNameNoValue(t *testing.T) {
 	}
 }
 
+func TestThePeersClientIsConfiguredLikeTheSelfsWithItsOwnIdentity(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
+		"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+	// A usage error about the peer names it, never its value.
+	code, _, errOut := call(env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "x", "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc),
+		"-sip-proxy", "127.0.0.1:5060", "-peer", "tel:+15550100002", "all")
+	if code != exitUsage || !strings.Contains(errOut, "peer: -self and -peer must be SIP URIs") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	self, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka"}, defaultSelf, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", impi: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org"}, defaultPeer, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peer.IMPU.String() != defaultPeer || peer.InstanceID == self.InstanceID || peer.Proxy != self.Proxy {
+		t.Fatalf("peer %+v, self %+v", peer, self)
+	}
+}
+
 func TestTheSIPRealmFlagReachesTheClient(t *testing.T) {
 	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
 	cfg, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", realm: "realm.example.net"}, defaultSelf, lookup)

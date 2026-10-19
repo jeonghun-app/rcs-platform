@@ -571,3 +571,26 @@ func (d *Dialog) receive(tx *transaction.ServerTransaction) {
 		_ = tx.Respond(res)
 	}
 }
+
+// ICSI of standalone messaging, pager mode, unescaped as P-Preferred-Service
+// carries it (RCC.07, RFC 6050).
+const standaloneService = "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg"
+
+// NewMessage returns a pager-mode MESSAGE to target (RFC 3428, RCC.07
+// standalone messaging): NewRequest's fields, the standalone messaging ICSI
+// in Accept-Contact and P-Preferred-Service, and body of contentType,
+// normally message/cpim. Send sends it.
+func (ua *UA) NewMessage(target sip.URI, contentType string, body []byte) (*sip.Request, error) {
+	req, err := ua.NewRequest("MESSAGE", target)
+	if err != nil {
+		return nil, err
+	}
+	add(req, &err, "Accept-Contact", `*;+g.3gpp.icsi-ref="`+ICSIStandalone+`"`)
+	add(req, &err, "P-Preferred-Service", standaloneService)
+	add(req, &err, "Content-Type", contentType)
+	if err != nil {
+		return nil, err
+	}
+	req.Body = slices.Clone(body)
+	return req, nil
+}

@@ -664,6 +664,33 @@ func label(m sip.Message) string {
 	return "nothing"
 }
 
+func TestAPagerMessageCarriesTheStandaloneService(t *testing.T) {
+	s := newStandIn(t, transport.TCP)
+	ua := dial(t, s.config())
+	register(t, ua)
+	req, err := ua.NewMessage(mustURI(t, testPeer), "message/cpim", []byte("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := ua.Send(context.Background(), req); err != nil || res.StatusCode != 200 {
+		t.Fatalf("Send = %v, %v", res, err)
+	}
+	got := s.nextMethod(t, "MESSAGE").req
+	for name, want := range map[string]string{
+		"Accept-Contact":       `*;+g.3gpp.icsi-ref="` + ICSIStandalone + `"`,
+		"P-Preferred-Service":  "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg",
+		"P-Preferred-Identity": "<" + testIMPU + ">",
+		"Content-Type":         "message/cpim",
+	} {
+		if v := got.Header.Get(name); v != want {
+			t.Errorf("%s = %q, want %q", name, v, want)
+		}
+	}
+	if string(got.Body) != "body" || got.URI.String() != testPeer {
+		t.Errorf("MESSAGE %s %q", got.URI, got.Body)
+	}
+}
+
 func TestACancelledInviteWithoutAFinalResponseEndsAfter64T1(t *testing.T) {
 	// QA on #194: a CANCEL answered 200 and an INVITE never answered.
 	// RFC 3261 §9.1: 64*T1 later the INVITE is given up, and Invite

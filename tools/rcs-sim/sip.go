@@ -19,12 +19,20 @@ import (
 // addresses come from flags, credentials from the environment only.
 type sipFlags struct {
 	proxy, transport, serverName, domain, realm, impi, auth, instance string
+	// peerIMPI is the far end's private identity, for the scenarios with
+	// two clients; empty leaves them out.
+	peerIMPI string
 }
 
 // envIMPI is where the IMPI comes from when -sip-impi is not given. It is
 // an identity, not a secret, but it is the IMSI-based one, so a deployment
 // keeps it with the credentials.
 const envIMPI = "RCS_SIM_SIP_IMPI"
+
+// envPeerIMPI is the far end's, for the scenarios with two clients. Both
+// subscribers take their credentials from the same variables: the harness
+// provisions them alike (#135).
+const envPeerIMPI = "RCS_SIM_SIP_PEER_IMPI"
 
 // sipConfig builds the SIP client's configuration, with self as the IMPU.
 // The errors name flags and variables, never their values: an IMPI is an
@@ -59,7 +67,7 @@ func sipConfig(ctx context.Context, f sipFlags, self string, lookup func(string)
 		}
 	}
 	if cfg.IMPU, err = sip.ParseURI(self); err != nil || !cfg.IMPU.IsSIP() {
-		return nil, errors.New("-self must be a SIP URI to register")
+		return nil, errors.New("-self and -peer must be SIP URIs to register")
 	}
 	cfg.Domain = f.domain
 	if cfg.Domain == "" {
