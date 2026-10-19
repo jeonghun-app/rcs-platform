@@ -320,8 +320,10 @@ The table's properties:
   enqueue that a bound refuses therefore counts the queue once (a consistent
   query of the partition, projecting sender and size). It lowers each size
   item that says more than it found, conditional on the item being unchanged
-  since it was read, and tries the enqueue again. Refusals are rare, so the
-  extra read is cheap.
+  since it was read, and tries the enqueue again. A count reads the whole
+  partition, so each queue is counted at most once per 10 minutes: a
+  conditional update of `recounted_at` on the queue's size item decides which
+  task counts, and later refusals within the interval are not counted.
 - **Expiry index.** Only queue items carry `xb`, one of 16 values chosen by
   recipient. The index is sparse and spreads its writes. A sweep queries it
   bucket by bucket instead of reading the table.

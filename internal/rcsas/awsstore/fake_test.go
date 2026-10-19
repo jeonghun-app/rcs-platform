@@ -26,8 +26,10 @@ type fakeDynamo struct {
 	fail     error
 	pageSize int
 	status   dtypes.TableStatus
-	// queries counts Query calls on the expiry index.
+	// indexQueries counts Query calls on the expiry index, recounts those
+	// that count a queue.
 	indexQueries int
+	recounts     int
 }
 
 func newFakeDynamo(t *testing.T) *fakeDynamo {
@@ -142,6 +144,16 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 			return nil, errCondition
 		}
 		delete(seen(row), mark)
+		return &dynamodb.UpdateItemOutput{}, nil
+	case cond == "attribute_not_exists(#recounted) OR #recounted <= :before" && upd == "SET #recounted = :now":
+		if exists && row[attrRecounted] != nil && nOf(row[attrRecounted]) > nOf(vals[":before"]) {
+			return nil, errCondition
+		}
+		if !exists {
+			row = maps.Clone(in.Key)
+			f.rows[k] = row
+		}
+		row[attrRecounted] = vals[":now"]
 		return &dynamodb.UpdateItemOutput{}, nil
 	case cond == "#count = :wasCount AND #bytes = :wasBytes" && upd == "SET #count = :count, #bytes = :bytes":
 		if !exists || nOf(row[attrCount]) != nOf(vals[":wasCount"]) || nOf(row[attrBytes]) != nOf(vals[":wasBytes"]) {
@@ -323,6 +335,7 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 	}
 	if aws.ToString(in.ProjectionExpression) == "#sender, #size" {
 		// recount: the whole partition, keys and the two attributes.
+		f.recounts++
 		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
 			f.t.Errorf("recount query %+v", in)
 		}

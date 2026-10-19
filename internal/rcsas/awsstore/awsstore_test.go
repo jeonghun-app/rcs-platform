@@ -295,3 +295,33 @@ func TestASizeThatDriftedIsCorrectedWhenItRefuses(t *testing.T) {
 		t.Fatalf("Enqueue to a full queue = %v", err)
 	}
 }
+
+// A count reads the whole partition: a queue refused again and again is
+// counted at most once per RecountInterval, by whichever task wins.
+func TestAFullQueueIsRecountedAtMostOncePerInterval(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 1}
+	at := func(id string, when time.Time) store.Message {
+		return store.Message{Recipient: "r", ID: id, Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: when, Expires: when.Add(time.Hour)}
+	}
+	if err := s.Enqueue(ctx, at("0", t0), l); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 50 {
+		when := t0.Add(time.Duration(i) * time.Second)
+		if err := s.Enqueue(ctx, at(fmt.Sprint("a", i), when), l); !errors.Is(err, store.ErrQueueFull) {
+			t.Fatalf("Enqueue %d = %v", i, err)
+		}
+	}
+	if f.recounts != 1 {
+		t.Fatalf("%d recounts for 50 refusals within an interval", f.recounts)
+	}
+	if err := s.Enqueue(ctx, at("b", t0.Add(RecountInterval)), l); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatal(err)
+	}
+	if f.recounts != 2 {
+		t.Fatalf("%d recounts once the interval passed", f.recounts)
+	}
+}

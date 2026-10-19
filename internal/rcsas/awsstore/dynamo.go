@@ -55,6 +55,7 @@ const (
 	attrSeen         = "seen"
 	attrCount        = "count"
 	attrSize         = "size"
+	attrRecounted    = "recounted_at"
 	attrBytes        = "bytes"
 )
 
@@ -170,10 +171,15 @@ func senderSizeKey(recipient, sender string) map[string]types.AttributeValue {
 //
 // The sizes are kept by this store, so an item deleted another way (by
 // DynamoDB's TTL, or by hand) would count for ever. A refusal therefore
-// counts the queue once, corrects a size that is too high, and tries again.
+// counts the queue, corrects a size that is too high, and tries again;
+// at most once per RecountInterval per queue, since a count reads the
+// whole partition and a full queue may be refused many times a minute.
 func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
 	err := s.enqueue(ctx, m, l)
 	if !errors.Is(err, store.ErrQueueFull) && !errors.Is(err, store.ErrSenderShareFull) {
+		return err
+	}
+	if !s.mayRecount(ctx, m.Recipient, m.Enqueued) {
 		return err
 	}
 	fixed, cerr := s.recount(ctx, m.Recipient, m.Sender)
@@ -239,6 +245,26 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		return sanitize("enqueue", err)
 	}
 	return nil
+}
+
+// RecountInterval is how often one queue may be counted again.
+const RecountInterval = 10 * time.Minute
+
+// mayRecount takes recipient's turn to count its queue at now, with a
+// conditional update of the queue's size item: of the tasks refused at
+// once, one counts, and none again within RecountInterval.
+func (s *Store) mayRecount(ctx context.Context, recipient string, now time.Time) bool {
+	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                aws.String(s.table),
+		Key:                      queueSizeKey(recipient),
+		UpdateExpression:         aws.String("SET #recounted = :now"),
+		ConditionExpression:      aws.String("attribute_not_exists(#recounted) OR #recounted <= :before"),
+		ExpressionAttributeNames: map[string]string{"#recounted": attrRecounted},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":now": stamp(now), ":before": stamp(now.Add(-RecountInterval)),
+		},
+	})
+	return err == nil
 }
 
 // recount counts recipient's queue, and what sender has in it, and sets
