@@ -1,0 +1,263 @@
+//go:build e2ecompose
+
+package e2e
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// The compose stack as deploy/docker-compose.yml names it: the test runs on
+// its network (make e2e-compose), with deploy/compose.env as its
+// environment. The subscriber is the one stack-seed provisions.
+const (
+	composeIMSI   = "001010000000001"
+	composeMSISDN = "+15550100001"
+	hssAPI        = "http://hss:8081"
+	acsURL        = "http://acs:8080"
+	relayControl  = "http://msrp-relay:8082"
+)
+
+func TestE2EComposeStack(t *testing.T) {
+	domain := env(t, "RCS_IMS_DOMAIN")
+	ftBase := env(t, "FT_PUBLIC_BASE")
+	impi := composeIMSI + "@" + domain
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay"} {
+		waitReady(ctx, t, "http://"+svc+":8080/readyz")
+	}
+	waitReady(ctx, t, acsURL+"/readyz")
+
+	// acs: what a device is told points at this stack (stack-seed's
+	// overrides, docs/local-stack.md).
+	doc := acsConfiguration(ctx, t, env(t, "ACS_ADMIN_TOKEN"))
+	for _, want := range []struct{ characteristic, parm, value string }{
+		{"FT", "ftHTTPCSURI", ftBase + "/ft"},
+		{"FT", "ftHTTPDLURI", ftBase + "/dl"},
+		{"LBO_P-CSCF_Address", "Address", env(t, "PCSCF_PUBLIC_HOST")},
+		{"CHAT", "ConfFctyURI", "sip:conf-factory@" + domain},
+	} {
+		if got := doc.value(want.characteristic, want.parm); got != want.value {
+			t.Errorf("acs provisions %s %s = %q, want %q", want.characteristic, want.parm, got, want.value)
+		}
+	}
+	uploadURL := doc.value("FT", "ftHTTPCSURI")
+
+	// acs 1.4.0 cannot provision ftHTTPCSUser and ftHTTPCSPwd yet
+	// (auto-configuration-server#69), so the test issues the FT password
+	// from hss itself, as acs will.
+	var issued struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if status := callJSON(ctx, t, http.MethodPost, hssAPI+"/v1/subscriptions/"+url.PathEscape(impi)+"/ft-credential",
+		env(t, "HSS_ADMIN_TOKEN"), nil, &issued); status != http.StatusCreated || issued.Username != impi || issued.Password == "" {
+		t.Fatalf("hss: issuing the FT credential answered %d", status)
+	}
+
+	// rcs-sim: file transfer through ft-server on S3Mock and DynamoDB Local
+	// with its credentials looked up in hss, and chat through msrp-relay on
+	// DynamoDB Local, rcs-sim standing in for pcscf and rcs-as until they
+	// exist. The relay connects to the stand-in on this container's address.
+	bin := build(t, "./tools/rcs-sim")
+	self := ownAddress(t)
+	cmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
+		"-ft-upload-url", uploadURL, "-ft-user", impi,
+		"-relay-control", relayControl,
+		"-core-listen", net.JoinHostPort(self, "2855"), "-core-advertise", self,
+		"-msrp-keepalive", "300ms", "-idle-wait", "1500ms",
+		"all")
+	cmd.Env = append(os.Environ(), "RCS_SIM_FT_PASSWORD="+issued.Password, "RCS_SIM_RELAY_TOKEN="+env(t, "RELAY_PCSCF_TOKEN"))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	t.Logf("rcs-sim output:\n%s%s", stdout.String(), stderr.String())
+	if err != nil {
+		t.Errorf("rcs-sim: %v", err)
+	}
+	checkResults(t, stdout.String(), stderr.String(), []string{
+		"ft/upload", "ft/download", "ft/download-range", "ft/download-resume", "ft/download-thumbnail",
+		"ft-resume/interrupted-upload", "ft-resume/get_upload_info", "ft-resume/resume", "ft-resume/download",
+		"chat-client-originated/client-to-core", "chat-client-originated/keep-alive", "chat-client-originated/release",
+		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/release",
+	}, issued.Password, env(t, "RELAY_PCSCF_TOKEN"), impi, self)
+}
+
+// env returns a setting of deploy/compose.env, which make e2e-compose passes.
+func env(t *testing.T, name string) string {
+	t.Helper()
+	v := os.Getenv(name)
+	if v == "" {
+		t.Fatalf("%s is not set: run this through make e2e-compose, after make up", name)
+	}
+	return v
+}
+
+// waitReady polls target until it answers 200: make up waits for the
+// processes (/healthz); their stores may take a moment longer.
+func waitReady(ctx context.Context, t *testing.T, target string) {
+	t.Helper()
+	var last string
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+			last = resp.Status
+		} else {
+			last = err.Error()
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("%s is not ready (%s): is the stack up (make up)?", target, last)
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// callJSON sends body (none when nil) with a bearer token and decodes a
+// JSON answer into out (when not nil). It returns the status.
+func callJSON(ctx context.Context, t *testing.T, method, target, token string, body, out any) int {
+	t.Helper()
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, target, err)
+	}
+	defer resp.Body.Close()
+	if out != nil && resp.StatusCode < 300 {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(out); err != nil {
+			t.Fatalf("%s %s: %v", method, target, err)
+		}
+	}
+	return resp.StatusCode
+}
+
+// provisioningDoc is the part of an OMA-CP document the test reads.
+type provisioningDoc struct {
+	Characteristics []characteristic `xml:"characteristic"`
+}
+
+type characteristic struct {
+	Type            string           `xml:"type,attr"`
+	Parms           []parm           `xml:"parm"`
+	Characteristics []characteristic `xml:"characteristic"`
+}
+
+type parm struct {
+	Name  string `xml:"name,attr"`
+	Value string `xml:"value,attr"`
+}
+
+// value returns the first parm called name in a characteristic of type
+// typ, anywhere in the document.
+func (d provisioningDoc) value(typ, name string) string {
+	var walk func([]characteristic) (string, bool)
+	walk = func(cs []characteristic) (string, bool) {
+		for _, c := range cs {
+			if c.Type == typ {
+				for _, p := range c.Parms {
+					if p.Name == name {
+						return p.Value, true
+					}
+				}
+			}
+			if v, ok := walk(c.Characteristics); ok {
+				return v, true
+			}
+		}
+		return "", false
+	}
+	v, _ := walk(d.Characteristics)
+	return v
+}
+
+// acsConfiguration fetches the test subscriber's configuration the way
+// acs's own deployment check does (scripts/verify_stack.py): a token issued
+// through the admin API, presented in an RCC.14 configuration request.
+func acsConfiguration(ctx context.Context, t *testing.T, adminToken string) provisioningDoc {
+	t.Helper()
+	var issued struct {
+		Token string `json:"token"`
+	}
+	if status := callJSON(ctx, t, http.MethodPost, acsURL+"/admin/subscribers/"+composeIMSI+"/issue-token", adminToken, nil, &issued); status != http.StatusOK || issued.Token == "" {
+		t.Fatalf("acs: issuing a provisioning token answered %d", status)
+	}
+	q := url.Values{
+		"vers": {"0"}, "IMSI": {composeIMSI}, "msisdn": {composeMSISDN}, "token": {issued.Token},
+		"terminal_vendor": {"RCSSIM"}, "terminal_model": {"rcs-sim"}, "terminal_sw_version": {"1"},
+		"client_vendor": {"RCSSIM"}, "client_version": {"1.0"}, "rcs_version": {"9.0"}, "rcs_profile": {"UP_2.4"},
+		"rcs_state": {"0"}, "default_sms_app": {"1"}, "provisioning_version": {"1"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, acsURL+"/?"+q.Encode(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "text/xml")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("acs: configuration request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("acs: configuration request answered %d (%v)", resp.StatusCode, err)
+	}
+	var doc provisioningDoc
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatalf("acs: configuration document: %v", err)
+	}
+	return doc
+}
+
+// ownAddress is this container's address on the compose network, where the
+// relay reaches the rcs-as stand-in.
+func ownAddress(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range addrs {
+		if ip, ok := a.(*net.IPNet); ok && ip.IP.To4() != nil && !ip.IP.IsLoopback() {
+			return ip.IP.String()
+		}
+	}
+	t.Fatal("no IPv4 address on the compose network")
+	return ""
+}

@@ -145,6 +145,11 @@ It then runs `rcs-sim all` against them and checks every result line. The
 unit tests of `tools/rcs-sim` run the same scenarios against the same service
 code inside the test process (`internal/simtest`).
 
+`make e2e-compose` runs `rcs-sim all` against the local compose stack instead:
+the platform image on DynamoDB Local and S3Mock, with `ft-server` checking
+credentials against `hss` and the FT URI taken from what `acs` provisions
+([local-stack.md](local-stack.md#make-e2e-compose)).
+
 ## Findings
 
 - A client that breaks an upload and at once sends another request under the

@@ -1,0 +1,234 @@
+# The whole platform on one host: the services from the one platform image,
+# DynamoDB Local and S3Mock in place of DynamoDB and S3, and the pinned acs
+# release. docs/local-stack.md describes it.
+#
+# Run it through make, which builds the image, pins the other images and
+# writes deploy/compose.env with fresh secrets:
+#
+#   make up             build, start, wait until every service is healthy
+#   make e2e-compose    rcs-sim against the running stack
+#   make logs           the services' logs
+#   make down           stop and remove everything, data included
+#
+# Every service's environment follows its document (docs/hss.md,
+# docs/ft-server.md, docs/msrp-relay.md) and is the same contract the AWS
+# deployment (#56) sets, with local endpoints and dev-only choices marked.
+name: rcs-local
+
+x-aws: &aws
+  # DynamoDB Local and S3Mock accept any credentials; the SDK needs some.
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+
+x-shared: &shared
+  <<: *aws
+  # dev allows what a local stack needs and staging and prod refuse:
+  # plain http between services, plain MSRP, a local hss data key.
+  RCS_ENV: dev
+  RCS_LOG_LEVEL: ${RCS_LOG_LEVEL:-info}
+  RCS_IMS_DOMAIN: ${RCS_IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
+  RCS_PII_HMAC_KEY: ${RCS_PII_HMAC_KEY:?run make up, which writes deploy/compose.env}
+  RCS_SHUTDOWN_TIMEOUT: 20s
+
+# What the platform services share: the image, and starting once their
+# tables exist. Each one's health check runs its own binary with
+# -healthcheck, which asks the process's /healthz on RCS_ADMIN_ADDR as ECS
+# does: the distroless image has no shell or curl.
+x-platform: &platform
+  image: ${RCS_IMAGE:?run make up, which builds the platform image}
+  restart: "no"
+  depends_on:
+    stack-tables:
+      condition: service_completed_successfully
+
+services:
+  # ---- AWS stand-ins, pinned in the Makefile like make test-integration --
+  dynamodb:
+    image: ${DDBLOCAL_IMAGE:?run make up, which pins DynamoDB Local}
+    # In memory: make down loses everything, and make up starts clean.
+    # -sharedDb: one database whatever the credentials and region.
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["127.0.0.1:${DYNAMODB_HOST_PORT:-18000}:8000"]
+    healthcheck:
+      # DynamoDB Local answers a bare GET with 400 once it serves.
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/ | grep -q 400"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  s3:
+    image: ${S3MOCK_IMAGE:?run make up, which pins S3Mock}
+    ports: ["127.0.0.1:${S3_HOST_PORT:-19090}:9090"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # ---- Bootstrap (tools/stack-init) -----------------------------------
+  # The tables and the bucket the services expect, as their documents
+  # describe them for the infrastructure; in AWS CloudFormation makes them.
+  # The services do not create anything themselves.
+  stack-tables:
+    image: rcs-local-stack-init
+    build:
+      context: ..
+      dockerfile: deploy/stack-init.Dockerfile
+    command: ["tables"]
+    restart: "no"
+    environment:
+      <<: *aws
+      STACK_DYNAMODB_ENDPOINT: http://dynamodb:8000
+      STACK_S3_ENDPOINT: http://s3:9090
+      FT_S3_BUCKET: ft-content
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+
+  # The test subscriber (IMSI 001010000000001, +15550100001) in hss and acs,
+  # with acs pointed at this stack: see docs/local-stack.md, acs. make up
+  # runs it once the services are healthy (docker compose run): in a
+  # profile, because `up --wait` counts a one-shot that nothing depends on
+  # as a failure once it exits.
+  stack-seed:
+    image: rcs-local-stack-init
+    profiles: ["seed"]
+    command: ["seed"]
+    restart: "no"
+    environment:
+      RCS_IMS_DOMAIN: ${RCS_IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
+      STACK_HSS_API: http://hss:8081
+      HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      STACK_ACS_URL: http://acs:8080
+      ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      STACK_PCSCF_ADDRESS: ${PCSCF_PUBLIC_HOST:-pcscf}
+      FT_UPLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/ft
+      FT_DOWNLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/dl
+    depends_on:
+      hss:
+        condition: service_healthy
+      acs:
+        condition: service_healthy
+
+  # ---- Platform services ----------------------------------------------
+  hss:
+    <<: *platform
+    command: ["hss"]
+    environment:
+      <<: *shared
+      HSS_STORE: dynamodb
+      HSS_DYNAMODB_ENDPOINT: http://dynamodb:8000
+      # No KMS locally: the dev keyring path, a data key from the env file
+      # (docs/hss.md, Secrets). AWS sets HSS_KMS_KEY_ID instead.
+      HSS_DATA_KEY: ${HSS_DATA_KEY:?run make up, which writes deploy/compose.env}
+      HSS_FT_REALM: ${FT_REALM:-ft.ims.mnc001.mcc001.3gppnetwork.org}
+      HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      HSS_ACS_TOKEN: ${HSS_ACS_TOKEN:?run make up, which writes deploy/compose.env}
+      HSS_FT_TOKEN: ${HSS_FT_TOKEN:?run make up, which writes deploy/compose.env}
+    ports:
+      # The provisioning API, for an operator on this host.
+      - "127.0.0.1:${HSS_API_HOST_PORT:-18082}:8081"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/hss", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  ft-server:
+    <<: *platform
+    command: ["ft-server"]
+    environment:
+      <<: *shared
+      # The URIs clients are given: the compose network name, so rcs-sim
+      # (make e2e-compose) follows them. docs/local-stack.md explains
+      # FT_PUBLIC_BASE for clients on the host.
+      FT_UPLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/ft
+      FT_DOWNLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/dl
+      FT_REALM: ${FT_REALM:-ft.ims.mnc001.mcc001.3gppnetwork.org}
+      FT_NONCE_KEY: ${FT_NONCE_KEY:?run make up, which writes deploy/compose.env}
+      FT_CREDENTIALS: hss
+      FT_HSS_URL: http://hss:8081
+      FT_HSS_TOKEN: ${HSS_FT_TOKEN:?run make up, which writes deploy/compose.env}
+      FT_STORE: aws
+      FT_S3_BUCKET: ft-content
+      FT_S3_ENDPOINT: http://s3:9090
+      FT_DYNAMODB_ENDPOINT: http://dynamodb:8000
+    ports: ["127.0.0.1:${FT_HOST_PORT:-18081}:8081"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ft-server", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  msrp-relay:
+    <<: *platform
+    command: ["msrp-relay"]
+    environment:
+      <<: *shared
+      RELAY_STORE: dynamodb
+      RELAY_DYNAMODB_ENDPOINT: http://dynamodb:8000
+      # Plain MSRP without PROXY headers: there is no NLB in front (dev only;
+      # staging and prod refuse both).
+      RELAY_PUBLIC_HOST: ${RELAY_PUBLIC_HOST:-msrp-relay}
+      RELAY_PUBLIC_PORT: "2855"
+      RELAY_PUBLIC_TLS: "false"
+      RELAY_PCSCF_TOKEN: ${RELAY_PCSCF_TOKEN:?run make up, which writes deploy/compose.env}
+    ports:
+      - "127.0.0.1:${RELAY_MSRP_HOST_PORT:-12855}:2855"
+      - "127.0.0.1:${RELAY_CONTROL_HOST_PORT:-18083}:8082"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/msrp-relay", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # ---- Later services: enable each in the pull request that adds it,
+  # with the environment its document gives (docs/local-stack.md, Adding a
+  # service). Each takes the platform image, the shared settings and the
+  # -healthcheck health check, like the services above.
+  #
+  # pcscf:     the SIP edge. acs provisions its name (PCSCF_PUBLIC_HOST), and
+  #            it calls msrp-relay's control API with RELAY_PCSCF_TOKEN.
+  #   <<: *platform
+  #   command: ["pcscf"]
+  #   environment: { <<: *shared }
+  #   healthcheck: { test: ["CMD", "/usr/local/bin/pcscf", "-healthcheck"], interval: 2s, timeout: 5s, retries: 60 }
+  #
+  # icscf:     Diameter Cx toward hss:3868.
+  #   <<: *platform
+  #   command: ["icscf"]
+  #
+  # scscf:     Diameter Cx toward hss:3868, iFC evaluation.
+  #   <<: *platform
+  #   command: ["scscf"]
+  #
+  # rcs-as:    chat and conferences; msrp-relay connects to it on
+  #            RELAY_CORE_PORTS (2855).
+  #   <<: *platform
+  #   command: ["rcs-as"]
+
+  # ---- acs, the pinned release (ADR 0006) -----------------------------
+  acs:
+    image: ${ACS_IMAGE:?run make up, which pins the acs release}
+    restart: "no"
+    environment:
+      ACS_ENV: dev
+      # acs's own table layout belongs to its repository; locally it keeps
+      # its state in memory (docs/local-stack.md, acs).
+      ACS_STORE_BACKEND: memory
+      ACS_SMS_PROVIDER: mock
+      # The mock SMS outbox (/dev/sms), for the OTP flow by hand.
+      ACS_DEV_ENDPOINTS_ENABLED: "true"
+      ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      ACS_DM_ACCOUNT_URI: ${ACS_PUBLIC_BASE:-http://acs:8080}/dm
+      ACS_PII_LOG_MODE: mask
+    ports: ["127.0.0.1:${ACS_HOST_PORT:-18080}:8080"]
+    healthcheck:
+      # The image's own check, more often.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status == 200 else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
