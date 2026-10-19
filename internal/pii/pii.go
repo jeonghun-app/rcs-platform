@@ -14,6 +14,9 @@
 // "010-0000-0001") are recognised when they start with "+" or with a word-initial
 // trunk prefix such as 010; other grouped numbers are not (see numberAt).
 //
+// A client's IP address is personal data too; [ClientIP] and [TruncateIP] log
+// only the network it belongs to (IPv4 /24, IPv6 /48).
+//
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
 // never be logged at all (CONTRIBUTING.md, Privacy).

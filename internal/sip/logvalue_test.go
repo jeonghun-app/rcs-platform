@@ -8,7 +8,8 @@ import (
 )
 
 func TestLoggedValuesLeaveOutIdentitiesAndCredentials(t *testing.T) {
-	secrets := []string{"15550100001", "001010000000001", "Alice Secret", "n0nce-value", "r3sponse-value", "cn0nce", "0paque", "s3cret"}
+	// 192.0.2.1 is the UE's public address in its Contact (#36).
+	secrets := []string{"15550100001", "001010000000001", "Alice Secret", "n0nce-value", "r3sponse-value", "cn0nce", "0paque", "s3cret", "192.0.2.1"}
 	m := mustParse(t, lines(
 		"REGISTER sip:+15550100001@ims.example.net;user=phone SIP/2.0",
 		"Via: SIP/2.0/TCP client.example.com;branch=z9hG4bK1",
@@ -42,7 +43,7 @@ func TestLoggedValuesLeaveOutIdentitiesAndCredentials(t *testing.T) {
 	}
 	for _, want := range []string{
 		`"method":"REGISTER"`, `"uri":"sip:***@ims.example.net"`, `"status":200`, `"to":{"uri":"tel:***","tag":""}`,
-		`"contact":{"uri":"sip:***@192.0.2.1","tag":""}`, `"star":"*"`, `"realm":"ims.example.net"`, `"algorithm":"AKAv1-MD5"`,
+		`"contact":{"uri":"sip:***@192.0.2.0/24","tag":""}`, `"star":"*"`, `"realm":"ims.example.net"`, `"algorithm":"AKAv1-MD5"`,
 		`"zero":""`, `"urn":"urn:***"`, `"body_bytes":11`, `"reqv":{"method":"REGISTER"`, `"resv":{"status":200`,
 		`"header":{"fields":9}`, `"headerp":{"fields":9}`,
 	} {
@@ -53,4 +54,41 @@ func TestLoggedValuesLeaveOutIdentitiesAndCredentials(t *testing.T) {
 	if got := (URI{Scheme: "sip", Host: "example.com"}).LogValue().String(); got != "sip:example.com" {
 		t.Errorf("URI without user logs %q", got)
 	}
+}
+
+func TestPublicIPHostsAreLoggedAsTheirNetworkAndPrivateOnesWhole(t *testing.T) {
+	for host, want := range map[string]string{
+		"198.51.100.23":        "198.51.100.0/24",
+		"[2001:db8:5:6::9]":    "2001:db8:5::/48",
+		"10.0.1.5":             "10.0.1.5",
+		"[fd00::5]":            "[fd00::5]",
+		"127.0.0.1":            "127.0.0.1",
+		"pcscf-1.rcs.internal": "pcscf-1.rcs.internal",
+	} {
+		if got := (URI{Scheme: "sip", User: "alice", Host: host}).LogValue().String(); got != "sip:***@"+want {
+			t.Errorf("URI host %s logs %q, want sip:***@%s", host, got, want)
+		}
+	}
+}
+
+func TestViaLogsItsHostLikeAURIAndLeavesOutTheReceivedAddress(t *testing.T) {
+	vias := mustParseVias(t, "SIP/2.0/TCP 198.51.100.23:40001;branch=z9hG4bK77;received=198.51.100.23;rport=40001")
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("x", "via", vias[0])
+	out := buf.String()
+	if strings.Contains(out, "198.51.100.23") || strings.Contains(out, "40001") {
+		t.Errorf("Via log has the client address: %s", out)
+	}
+	if !strings.Contains(out, `"via":{"transport":"TCP","host":"198.51.100.0/24","branch":"z9hG4bK77"}`) {
+		t.Errorf("Via log = %s", out)
+	}
+}
+
+func mustParseVias(t *testing.T, s string) []Via {
+	t.Helper()
+	vias, err := ParseVia(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vias
 }

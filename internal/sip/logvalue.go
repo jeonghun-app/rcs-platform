@@ -1,6 +1,12 @@
 package sip
 
-import "log/slog"
+import (
+	"log/slog"
+	"net/netip"
+	"strings"
+
+	"github.com/jeonghun-app/rcs-platform/internal/pii"
+)
 
 // The values below carry subscriber identities (a SIP user part or tel number is
 // an MSISDN or IMSI-based identity) and credentials, which docs/architecture.md
@@ -18,7 +24,7 @@ import "log/slog"
 
 const redactedMark = "***"
 
-// LogValue logs the scheme and host only.
+// LogValue logs the scheme and host only, a public IP host truncated.
 func (u URI) LogValue() slog.Value { return slog.StringValue(u.redacted()) }
 
 func (u URI) redacted() string {
@@ -26,13 +32,32 @@ func (u URI) redacted() string {
 	case "":
 		return ""
 	case "sip", "sips":
+		host := loggedHost(u.Host)
 		if u.User == "" {
-			return u.Scheme + ":" + u.Host
+			return u.Scheme + ":" + host
 		}
-		return u.Scheme + ":" + redactedMark + "@" + u.Host
+		return u.Scheme + ":" + redactedMark + "@" + host
 	default:
 		return u.Scheme + ":" + redactedMark
 	}
+}
+
+// loggedHost is a URI or Via host as it may be logged. A public IP address
+// there is a client's, the address of a UE's Contact or first Via, and is
+// personal data, so only its network is logged (pii.TruncateIP: /24 or /48,
+// #36). A private address (RFC 1918, ULA, loopback, link-local) names a task
+// inside the VPC, such as the pcscf instance a Path or Record-Route points
+// at (ADR 0005), or a UE's LAN behind NAT, which identifies no one; it is
+// kept so operators can tell instances apart. Domain names are kept.
+func loggedHost(host string) string {
+	ip, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+	if err != nil {
+		return host
+	}
+	if ip = ip.Unmap(); ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return host
+	}
+	return pii.TruncateIP(host)
 }
 
 // LogValue logs the redacted URI and the tag; the display name is left out.
@@ -64,6 +89,17 @@ func authLogValue(scheme string, ps Params) slog.Value {
 		}
 	}
 	return slog.GroupValue(attrs...)
+}
+
+// LogValue logs the transport, the sent-by host (truncated like a URI's when
+// it is a public IP address) and the branch; received and rport, which hold
+// the client's address as the server saw it, are left out.
+func (v Via) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("transport", v.Transport),
+		slog.String("host", loggedHost(v.Host)),
+		slog.String("branch", v.Branch()),
+	)
 }
 
 // LogValue logs the number of fields; names and values are left out, since
