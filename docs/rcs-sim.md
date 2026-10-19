@@ -165,8 +165,9 @@ It sets up 1-to-1 chats as the caller (RFC 3261 §12–15):
   with BYE.
 - In the dialog, the client sends BYE. It answers the network's BYE with 200
   and refuses a re-INVITE with 488, since a chat needs no other session. A
-  request with a lower CSeq gets 500, and one for a dialog it no longer
-  knows gets 481.
+  request with a lower CSeq gets 500. Without `OnRequest`, a request for a
+  dialog it does not know, or no longer knows, gets 481; with it, such a
+  request goes to `OnRequest`.
 
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an

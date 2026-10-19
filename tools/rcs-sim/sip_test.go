@@ -56,7 +56,9 @@ func TestSIPUsageErrorsNameNoValue(t *testing.T) {
 		{"bad auth", aka, []string{"-sip-auth", "none"}, "-sip-auth"},
 		{"bad transport", aka, []string{"-sip-transport", "udp"}, "-sip-transport"},
 		{"tel self", aka, []string{"-self", "tel:+15550100001"}, "-self"},
-		{"TLS to an address without a name", aka, []string{"-sip-transport", "tls"}, "server name"},
+		{"TLS to an address without a name", aka, []string{"-sip-transport", "tls"}, "-sip-server-name"},
+		{"domain not a host", aka, []string{"-sip-domain", "a b"}, "-sip-domain"},
+		{"server name not a host", aka, []string{"-sip-server-name", "a;b"}, "-sip-server-name"},
 		{"no port", aka, []string{"-sip-proxy", "pcscf.operator-host.invalid"}, "-sip-proxy"},
 		{"host that does not resolve", aka, []string{"-sip-proxy", "pcscf.operator-host.invalid:5060"}, "-sip-proxy"},
 	} {
@@ -80,5 +82,19 @@ func TestTheSIPRealmFlagReachesTheClient(t *testing.T) {
 	cfg, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", realm: "realm.example.net"}, defaultSelf, lookup)
 	if err != nil || cfg.Realm != "realm.example.net" {
 		t.Fatalf("config %+v, %v", cfg, err)
+	}
+}
+
+func TestSIPFlagsWithoutAProxyAreAUsageError(t *testing.T) {
+	code, _, errOut := call(env(), "-sip-impi", testIMPI, "all")
+	if code != exitUsage || !strings.Contains(errOut, "-sip-impi needs -sip-proxy") || strings.Contains(errOut, "001010000000001") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSIPAuthIsCaseInsensitive(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+	if _, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "AKA"}, defaultSelf, lookup); err != nil {
+		t.Fatal(err)
 	}
 }

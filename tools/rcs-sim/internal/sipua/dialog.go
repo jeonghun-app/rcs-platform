@@ -3,6 +3,7 @@ package sipua
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -34,6 +35,11 @@ var ErrDialogEnded = errors.New("sipua: the dialog has ended")
 // §4.3), the same ICSI in Accept-Contact and P-Preferred-Service, and offer
 // as the SDP body.
 func (ua *UA) NewInvite(target sip.URI, offer []byte) (*sip.Request, error) {
+	if len(offer) == 0 {
+		// An offer in the 2xx would need its answer in the ACK (§13.2.1),
+		// which this UA does not send.
+		return nil, errors.New("sipua: an INVITE needs an SDP offer")
+	}
 	req, err := ua.NewRequest("INVITE", target)
 	if err != nil {
 		return nil, err
@@ -46,10 +52,10 @@ func (ua *UA) NewInvite(target sip.URI, offer []byte) (*sip.Request, error) {
 	add(req, &err, "Accept-Contact", `*;+g.3gpp.icsi-ref="`+ICSIChat+`"`)
 	add(req, &err, "P-Preferred-Service", chatService)
 	add(req, &err, "Allow", "INVITE, ACK, CANCEL, BYE")
-	if len(offer) > 0 {
-		add(req, &err, "Content-Type", "application/sdp")
-		req.Body = slices.Clone(offer)
-	}
+	// TS 24.229 §5.1.2A.1.1: a UE that registers with outbound says so.
+	add(req, &err, "Supported", "outbound")
+	add(req, &err, "Content-Type", "application/sdp")
+	req.Body = slices.Clone(offer)
 	if err != nil {
 		return nil, err
 	}
@@ -74,25 +80,60 @@ func (ua *UA) Invite(ctx context.Context, req *sip.Request, progress func(*sip.R
 	if err := ua.Err(); err != nil {
 		return nil, nil, err
 	}
+	from, err := req.Header.From()
+	if err != nil {
+		return nil, nil, err
+	}
+	cseq, err := req.Header.CSeq()
+	if err != nil {
+		return nil, nil, err
+	}
 	// At most one final response or error, and the 2xx: room for all, so
 	// the handler never waits.
-	inv := &invite{ua: ua, req: req, progress: progress, events: make(chan result, 4), provisional: make(chan struct{})}
+	inv := &invite{
+		ua: ua, req: req, progress: progress, cseq: cseq.Seq, key: dialogKey(req.Header.Get("Call-ID"), from.Tag(), ""),
+		events: make(chan result, 4), provisional: make(chan struct{}), forks: map[string]*Dialog{},
+	}
+	// Kept for 64*T1 after Invite returns, so that a 2xx arriving as a
+	// stray, after the transaction has ended, is still ACKed (§13.2.2.4).
+	ua.mu.Lock()
+	ua.invites[inv.key] = inv
+	ua.mu.Unlock()
+	defer ua.cfg.Clock.AfterFunc(64*transaction.DefaultT1, func() {
+		ua.mu.Lock()
+		delete(ua.invites, inv.key)
+		ua.mu.Unlock()
+	})
 	tx, err := ua.layer.Request(req, ua.destination(), inv.handle)
 	if err != nil {
 		return nil, nil, ua.sendError(err)
 	}
-	cancelled, cancelSent := false, false
+	var cancelTimer transaction.Timer
+	defer func() {
+		if cancelTimer != nil {
+			cancelTimer.Stop()
+		}
+	}()
+	cancelled := false
+	sendCancel := func() {
+		inv.cancel()
+		// §9.1: without a final response 64*T1 after the CANCEL, the
+		// INVITE is given up. The client transaction leaves that to its TU.
+		cancelTimer = ua.cfg.Clock.AfterFunc(64*transaction.DefaultT1, tx.Terminate)
+	}
 	ctxDone, provisional := ctx.Done(), inv.provisional
 	for {
 		select {
 		case <-provisional:
 			provisional = nil
-			if cancelled && !cancelSent {
-				inv.cancel()
-				cancelSent = true
+			if cancelled && cancelTimer == nil {
+				sendCancel()
 			}
 		case ev := <-inv.events:
 			if ev.err != nil {
+				if cancelled && errors.Is(ev.err, transaction.ErrTerminated) {
+					return nil, nil, fmt.Errorf("sipua: no final response to the INVITE 64*T1 after its CANCEL: %w", ctx.Err())
+				}
 				return nil, nil, ua.sendError(ev.err)
 			}
 			res := ev.res
@@ -108,9 +149,8 @@ func (ua *UA) Invite(ctx context.Context, req *sip.Request, progress func(*sip.R
 			return nil, res, ctx.Err()
 		case <-ctxDone:
 			ctxDone, cancelled = nil, true
-			if provisional == nil && !cancelSent {
-				inv.cancel()
-				cancelSent = true
+			if provisional == nil && cancelTimer == nil {
+				sendCancel()
 			}
 		case <-ua.done:
 			tx.Terminate()
@@ -125,6 +165,10 @@ type invite struct {
 	ua       *UA
 	req      *sip.Request
 	progress func(*sip.Response)
+	// cseq is the INVITE's CSeq number, which every ACK to a 2xx carries
+	// (§13.2.2.4); key its Call-ID and From tag.
+	cseq uint32
+	key  string
 	// events carries the final response or the error; provisional is
 	// closed at the first provisional response.
 	events          chan result
@@ -132,8 +176,12 @@ type invite struct {
 	provisionalOnce sync.Once
 
 	mu sync.Mutex
-	// d is the dialog the first 2xx made.
-	d *Dialog
+	// d is the dialog the first 2xx made; forks are the other branches'
+	// 2xx, ACKed and ended, by To tag. final is set once the transaction
+	// has passed a final response on.
+	d     *Dialog
+	forks map[string]*Dialog
+	final bool
 }
 
 // handle is the INVITE transaction's response handler. It runs on the
@@ -148,32 +196,66 @@ func (inv *invite) handle(res *sip.Response, err error) {
 		inv.provisionalOnce.Do(func() { close(inv.provisional) })
 		return
 	case err != nil || res.StatusCode >= 300:
+		if err == nil {
+			inv.mu.Lock()
+			inv.final = true
+			inv.mu.Unlock()
+		}
 		select {
 		case inv.events <- result{res, err}:
 		default:
 		}
 		return
 	}
-	inv.mu.Lock()
-	defer inv.mu.Unlock()
-	if inv.d != nil {
-		inv.ua.ackAgain(inv.d, res)
+	inv.ok(res)
+}
+
+// ok takes a 2xx to the INVITE, from the transaction or as a stray after
+// it (§13.2.2.4). The first, before any other final response, makes the
+// dialog. The same 2xx again, by its To tag, is ACKed again. A 2xx from
+// another branch of a fork, or one after a failure response, is ACKed and
+// its dialog ended with BYE, once per branch: the call is up already, or
+// was refused.
+func (inv *invite) ok(res *sip.Response) {
+	to, err := res.Header.To()
+	if err != nil {
 		return
 	}
-	d, err := inv.ua.newDialog(inv.req, res)
-	if err != nil {
+	tag := to.Tag()
+	inv.mu.Lock()
+	defer inv.mu.Unlock()
+	if inv.d != nil && tag == inv.d.remoteTag {
+		inv.d.sendACK()
+		return
+	}
+	if f := inv.forks[tag]; f != nil {
+		f.sendACK()
+		return
+	}
+	if inv.d == nil && !inv.final {
+		d, err := inv.ua.newDialog(inv.req, res)
+		if err != nil {
+			select {
+			case inv.events <- result{nil, err}:
+			default:
+			}
+			return
+		}
+		inv.d, inv.final = d, true
+		d.sendACK()
 		select {
-		case inv.events <- result{nil, err}:
+		case inv.events <- result{res, nil}:
 		default:
 		}
 		return
 	}
-	inv.d = d
-	d.sendACK()
-	select {
-	case inv.events <- result{res, nil}:
-	default:
+	f, err := inv.ua.buildDialog(inv.req, res)
+	if err != nil {
+		return
 	}
+	inv.forks[tag] = f
+	f.sendACK()
+	go func() { _, _ = f.Bye(context.Background()) }()
 }
 
 func (inv *invite) dialog() *Dialog {
@@ -221,7 +303,10 @@ type Dialog struct {
 	// included.
 	callID        string
 	local, remote string
-	remoteTarget  sip.URI
+	// remoteTag is the other side's tag, which tells a retransmitted 2xx
+	// from another branch's (§13.2.2.4).
+	remoteTag    string
+	remoteTarget sip.URI
 	// routes is the route set, the 2xx's Record-Route reversed (§12.1.2).
 	routes []string
 	answer *sip.Response
@@ -237,6 +322,19 @@ type Dialog struct {
 // newDialog makes the dialog of a 2xx to invite (RFC 3261 §12.1.2) and
 // keeps it, so that the network's requests in it find it.
 func (ua *UA) newDialog(invite *sip.Request, res *sip.Response) (*Dialog, error) {
+	d, err := ua.buildDialog(invite, res)
+	if err != nil {
+		return nil, err
+	}
+	ua.mu.Lock()
+	ua.dialogs[d.key] = d
+	ua.mu.Unlock()
+	return d, nil
+}
+
+// buildDialog makes the dialog of a 2xx to invite without keeping it, with
+// the ACK for that 2xx, which carries the INVITE's CSeq number.
+func (ua *UA) buildDialog(invite *sip.Request, res *sip.Response) (*Dialog, error) {
 	from, err := invite.Header.From()
 	if err != nil {
 		return nil, err
@@ -269,6 +367,7 @@ func (ua *UA) newDialog(invite *sip.Request, res *sip.Response) (*Dialog, error)
 		callID:       callID,
 		local:        invite.Header.Get("From"),
 		remote:       res.Header.Get("To"),
+		remoteTag:    to.Tag(),
 		remoteTarget: target,
 		answer:       res,
 		cseq:         cseq.Seq,
@@ -283,9 +382,6 @@ func (ua *UA) newDialog(invite *sip.Request, res *sip.Response) (*Dialog, error)
 	if d.ack, err = d.request("ACK", cseq.Seq); err != nil {
 		return nil, err
 	}
-	ua.mu.Lock()
-	ua.dialogs[d.key] = d
-	ua.mu.Unlock()
 	return d, nil
 }
 
@@ -306,7 +402,9 @@ func (ua *UA) dialogOf(req *sip.Request) *Dialog {
 	return ua.dialogs[dialogKey(req.Header.Get("Call-ID"), to.Tag(), from.Tag())]
 }
 
-// strayResponse ACKs again a 2xx to an INVITE whose transaction has ended.
+// strayResponse takes a 2xx to an INVITE whose transaction has ended: the
+// invite, if it is recent, handles it as any 2xx; a dialog that outlived
+// it ACKs it again.
 func (ua *UA) strayResponse(res *sip.Response) {
 	cseq, err := res.Header.CSeq()
 	if err != nil || cseq.Method != "INVITE" || res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -317,38 +415,17 @@ func (ua *UA) strayResponse(res *sip.Response) {
 	if err1 != nil || err2 != nil {
 		return
 	}
+	callID := res.Header.Get("Call-ID")
 	ua.mu.Lock()
-	d := ua.dialogs[dialogKey(res.Header.Get("Call-ID"), from.Tag(), to.Tag())]
+	inv := ua.invites[dialogKey(callID, from.Tag(), "")]
+	d := ua.dialogs[dialogKey(callID, from.Tag(), to.Tag())]
 	ua.mu.Unlock()
-	if d != nil {
+	switch {
+	case inv != nil:
+		inv.ok(res)
+	case d != nil:
 		d.sendACK()
 	}
-}
-
-// ackAgain answers a further 2xx to an INVITE whose dialog is d. The same
-// 2xx again means the ACK was lost, so it is sent again. A 2xx with another
-// To tag comes from another branch of a fork: it is ACKed and that dialog
-// ended at once, since the call is already up (RFC 3261 §13.2.2.4).
-func (ua *UA) ackAgain(d *Dialog, res *sip.Response) {
-	if res.Header.Get("To") != d.remote {
-		other := &Dialog{ua: ua, callID: d.callID, local: d.local, remote: res.Header.Get("To"),
-			remoteTarget: d.remoteTarget, cseq: d.cseq, done: make(chan struct{})}
-		if cs, err := res.Header.Contact(); err == nil && len(cs) > 0 && !cs[0].Star {
-			other.remoteTarget = cs[0].URI
-		}
-		if rr, err := res.Header.RecordRoute(); err == nil {
-			for _, a := range slices.Backward(rr) {
-				other.routes = append(other.routes, a.String())
-			}
-		}
-		if ack, err := other.request("ACK", d.cseq); err == nil {
-			other.ack = ack
-			other.sendACK()
-			go func() { _, _ = other.Bye(context.Background()) }()
-		}
-		return
-	}
-	d.sendACK()
 }
 
 // sendACK sends the 2xx's ACK, straight through the transport: an ACK to a
