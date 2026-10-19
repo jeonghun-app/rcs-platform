@@ -65,6 +65,8 @@ a maintainer; behaviour built on it is listed as unverified in
 | 6733, 4006 | Diameter base protocol |
 | 4740 | Diameter SIP application: the Digest-* AVPs that Cx reuses (TS 29.229 §6.3.37 to §6.3.41) |
 | 3966 | tel URI: the telephone-subscriber that iFC Request-URI patterns match (TS 29.228 Annex F) |
+| 7542 | Network Access Identifier: the user@realm form of a private user identity (IMPI), which `hss` checks on provisioning |
+| 6050 | `P-Asserted-Service` and `P-Preferred-Service`: the ICSI the default `hss` service profile sends to `rcs-as` |
 | 3539 | AAA transport profile: Diameter watchdog (DWR/DWA, Tw, REOPEN) |
 | 4330 | Simple Network Time Protocol: era rule for Diameter `Time` after 2036 |
 | 9110 | HTTP semantics: byte ranges, `Range`, `If-Range`, `Content-Range`, partial PUT (`ft-server`) |
