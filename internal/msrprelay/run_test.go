@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -290,7 +291,10 @@ func TestSystemClockIsRealTime(t *testing.T) {
 	}
 }
 
-func TestFlushWritesCountsOnceAndGaugesEveryTime(t *testing.T) {
+// The relay hands its counters to the runtime every RELAY_METRICS_INTERVAL,
+// which may be shorter than the runtime's interval: counts must add up and
+// gauges must not.
+func TestFlushWritesCountsOnceAndGaugesAsTheirCurrentValue(t *testing.T) {
 	h := runtimetest.New(t, "msrp-relay")
 	m := newCounters()
 	m.add(mBindingsCreated, 2)
@@ -298,14 +302,24 @@ func TestFlushWritesCountsOnceAndGaugesEveryTime(t *testing.T) {
 	m.bytesIn.Add(10)
 	m.bytesOut.Add(20)
 	m.bridges.Add(3)
+	m.conns.Add(2)
 	m.flush(h.Runtime.Metrics)
 	m.flush(h.Runtime.Metrics)
 	for name, want := range map[string]float64{
 		mBindingsCreated: 2, mRefusedPrefix + reasonClaimed: 1, mBytesFromClients: 10, mBytesToClients: 20,
-		mActiveBridges: 6, mClientConnections: 0,
 	} {
 		if got, ok := h.Metric(name); !ok || got != want {
 			t.Fatalf("%s = %v (%v), want %v", name, got, ok, want)
+		}
+	}
+	// Each line is read, not their sum, so one line of 6 cannot pass for
+	// two lines of 3.
+	m.bridges.Add(-1)
+	m.conns.Add(-1)
+	m.flush(h.Runtime.Metrics)
+	for name, want := range map[string][]float64{mActiveBridges: {3, 2}, mClientConnections: {2, 1}} {
+		if got := h.MetricValues(name); !slices.Equal(got, want) {
+			t.Fatalf("%s lines = %v, want %v", name, got, want)
 		}
 	}
 }

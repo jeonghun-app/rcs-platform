@@ -233,16 +233,19 @@ that clients are not all cut at once on a rolling update.
 ## Metrics
 
 EMF lines through `internal/runtime`, with `Service` as the only dimension.
-Counters accumulate and are written every `RELAY_METRICS_INTERVAL`, so a busy
-relay writes a few dozen lines a minute, not one per event. Names come from
-fixed sets and never carry an identifier.
+Counters accumulate in the relay and are handed to the runtime every
+`RELAY_METRICS_INTERVAL`; the runtime writes one line per metric a minute
+(docs/architecture.md §8), so a busy relay writes a few dozen lines a minute,
+not one per event. Counts handed over within a minute are summed; the gauges
+are the last value, so a `RELAY_METRICS_INTERVAL` shorter than a minute does
+not multiply them. Names come from fixed sets and never carry an identifier.
 
 | Metric | Kind | Meaning |
 |---|---|---|
 | `BindingsCreated`, `BindingsReleased` | count | control API POST and DELETE |
 | `BindingsClaimed` | count | bindings a client connection claimed |
 | `BindingsExpired` | count | bridges ended because their binding expired or was released |
-| `ActiveBridges`, `ClientConnections` | gauge, written every interval | use Average or Maximum |
+| `ActiveBridges`, `ClientConnections` | gauge, the last value of each minute | use Average or Maximum |
 | `BytesFromClients`, `BytesToClients` | Bytes | octets on client connections, MSRP framing included |
 | `ProxyHealthChecks` | count | PROXY `LOCAL` connections |
 | `ClientsClosedIdle` | count | client connections closed by `RELAY_IDLE_TIMEOUT` |
