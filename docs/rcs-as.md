@@ -337,7 +337,11 @@ chat (size, CPIM parse, `From` check, per-sender rate). Then:
   sender may use at most a quarter of the budget (`group.FanoutSenderShare`),
   in rate and in burst. Without that, one participant of a full group writing
   as fast as its own rate allows would use the whole budget, and the others'
-  messages would be refused.
+  messages would be refused. The burst is sized so that a quarter of it still
+  carries 10 messages in a row to a full group
+  (`group.FanoutSenderMessages`): people send a few short messages in quick
+  succession, and the reference client ends its session with the group when
+  one is refused.
 - **CPIM rewrite.** rcs-as builds the header block anew: `From`, the sender's
   asserted identity under its display name in the roster (not the one its
   client wrote), then `To`, the group, then every other header in its order.
@@ -491,7 +495,7 @@ settings:
 | `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200 |
 | `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
 | `RCSAS_GROUP_SENDER_RATE`, `RCSAS_GROUP_SENDER_BURST` | `60`, `30` | Messages per minute one participant writes in one group, per task; also renames |
-| `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, so a quarter of the burst must cover a full group |
+| `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
 

@@ -214,7 +214,10 @@ metadata.
   - per participant and group, messages and renames per minute;
   - per group, a fan-out budget of deliveries per minute, of which one
     sender may use at most a quarter, so that no participant can silence a
-    group by writing at its own full rate;
+    group by writing at its own full rate. The burst lets one sender send 10
+    messages in a row to a full group. Residual risk: four accounts in one
+    group, each writing at its full share, use up the whole budget, and a
+    fifth participant then has about a quarter of its messages refused;
   - each recipient's queue as in 1-to-1 chat, where a group message counts
     against its author's share, the one its 1-to-1 messages use, and all
     group notifications together hold one share, beyond which they are

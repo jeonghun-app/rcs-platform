@@ -186,23 +186,31 @@ func TestAGroupBoundsEachSenderAndItsFanOut(t *testing.T) {
 		t.Fatalf("bob: %v", err)
 	}
 	// The group's budget: each message to the four others costs four
-	// deliveries, and each sender may use a quarter of the 16, so four
-	// senders use it up and the fifth waits for it to refill.
-	r = newRig(t, Config{MaxParticipants: 5, FanoutRate: messaging.Rate{PerMinute: 60, Burst: 16}})
+	// deliveries, and each sender's quarter of the 160 covers ten of them.
+	// alice's eleventh is refused for her share; four senders' ten use up
+	// the budget, and the fifth waits for it to refill.
+	r = newRig(t, Config{MaxParticipants: 5, FanoutRate: messaging.Rate{PerMinute: 240, Burst: 160}})
 	g = r.create(bob, carol, dave, erin)
 	for _, from := range []string{alice, bob, carol, dave} {
-		if err := send(r, g, from, "m-"+from); err != nil {
-			t.Fatal(err)
+		for i := range FanoutSenderMessages {
+			if err := send(r, g, from, fmt.Sprint("m", i, from)); err != nil {
+				t.Fatalf("%s's message %d: %v", from, i, err)
+			}
+		}
+		if from == alice {
+			if err := send(r, g, alice, "a11"); err == nil {
+				t.Fatal("alice's share of the budget did not hold")
+			}
 		}
 	}
 	if err := send(r, g, erin, "e1"); err == nil {
 		t.Fatal("the group's fan-out budget did not hold")
 	}
-	r.clock.Advance(16 * time.Second)
+	r.clock.Advance(time.Second)
 	if err := send(r, g, erin, "e2"); err != nil {
 		t.Fatalf("erin once the budget refilled: %v", err)
 	}
-	if r.m.get("group.fanout_budget_exceeded") != 1 || r.m.get("group.fanout_share_exceeded") != 0 || r.m.get("message.rejected.rate_limited") != 1 {
+	if r.m.get("group.fanout_budget_exceeded") != 1 || r.m.get("group.fanout_share_exceeded") != 1 || r.m.get("message.rejected.rate_limited") != 2 {
 		t.Fatalf("metrics %v", r.m)
 	}
 	// The engine's size limit applies to group messages too.
@@ -250,6 +258,38 @@ func TestOneMemberCannotSilenceAFullGroup(t *testing.T) {
 	}
 	if r.m.get("group.fanout_share_exceeded") == 0 {
 		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// QA's and the code review's reproduction (PR #118, round 2): a quarter
+// of the old burst held one sender in a full group to two messages in a
+// row, and the third, half a second later, was refused. Now a few quick
+// messages go through at the default limit and at the largest one.
+func TestQuickMessagesInAFullGroupAreAccepted(t *testing.T) {
+	for _, size := range []int{DefaultMaxParticipants, LimitParticipants} {
+		r := newRig(t, Config{MaxParticipants: size})
+		var in []Invitee
+		for i := range size - 1 {
+			in = append(in, Invitee{Identity: fmt.Sprintf("sip:u%d@example.net", i)})
+		}
+		g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: in})
+		if err != nil {
+			t.Fatal(err)
+		}
+		me := "sip:u0@example.net"
+		if _, err := r.s.Join(t.Context(), g.URI, me, ""); err != nil {
+			t.Fatal(err)
+		}
+		// Five in two seconds, then the rest of the ten the share covers.
+		for i := range FanoutSenderMessages {
+			if _, err := r.s.Recipients(t.Context(), g.URI, me, messaging.GroupText); err != nil {
+				t.Fatalf("%d members: message %d, %v after the first, refused: %v", size, i+1, time.Duration(i)*500*time.Millisecond, err)
+			}
+			r.clock.Advance(500 * time.Millisecond)
+		}
+		if r.m.get("group.fanout_share_exceeded") != 0 {
+			t.Fatalf("metrics %v", r.m)
+		}
 	}
 }
 

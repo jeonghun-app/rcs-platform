@@ -312,9 +312,9 @@ func TestNewChecksItsDependenciesAndBudget(t *testing.T) {
 		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
 		t.Error("a fan-out burst smaller than a full group")
 	}
-	if _, err := New(Config{ConferenceHost: host, MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: 6000, Burst: 395}},
+	if _, err := New(Config{ConferenceHost: host, MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: 6000, Burst: 3959}},
 		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
-		t.Error("a sender's quarter of the fan-out burst smaller than a full group")
+		t.Error("a sender's quarter of the fan-out burst smaller than ten messages to a full group")
 	}
 	if _, err := New(Config{ConferenceHost: host, MaxParticipants: 100, AddRate: messaging.Rate{PerMinute: 30, Burst: 98}},
 		groupstore.NewMemory(), r.e, r.n, r.m); err == nil {
@@ -325,7 +325,7 @@ func TestNewChecksItsDependenciesAndBudget(t *testing.T) {
 	}
 	// Exactly enough is enough, and an unlimited budget needs no burst.
 	for _, c := range []Config{
-		{MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: 6000, Burst: 396}, AddRate: messaging.Rate{PerMinute: 30, Burst: 99}},
+		{MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: 6000, Burst: 3960}, AddRate: messaging.Rate{PerMinute: 30, Burst: 99}},
 		{MaxParticipants: 100, FanoutRate: messaging.Rate{PerMinute: -1}, AddRate: messaging.Rate{PerMinute: -1}},
 		{MaxParticipants: LimitParticipants},
 	} {
@@ -336,6 +336,11 @@ func TestNewChecksItsDependenciesAndBudget(t *testing.T) {
 	}
 	if got := DefaultAddBurst(LimitParticipants); got != LimitParticipants-1 {
 		t.Errorf("DefaultAddBurst(%d) = %d", LimitParticipants, got)
+	}
+	for max, want := range map[int]int{2: DefaultFanoutRate.Burst, 100: 3960, 200: 7960} {
+		if got := DefaultFanoutBurst(max); got != want {
+			t.Errorf("DefaultFanoutBurst(%d) = %d, want %d", max, got, want)
+		}
 	}
 }
 

@@ -171,9 +171,10 @@ func Configure(s *runtime.Settings) Config {
 		MaxParticipants: maxParticipants,
 		IdleTTL:         e.Duration("GROUP_IDLE_TTL", group.DefaultIdleTTL),
 		SenderRate:      readRate(e, "GROUP_SENDER", group.DefaultSenderRate),
-		FanoutRate:      readRate(e, "GROUP_FANOUT", group.DefaultFanoutRate),
-		AddRate:         readRate(e, "GROUP_ADD", addRate),
-		CreateRate:      readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
+		FanoutRate: readRate(e, "GROUP_FANOUT",
+			messaging.Rate{PerMinute: group.DefaultFanoutRate.PerMinute, Burst: group.DefaultFanoutBurst(maxParticipants)}),
+		AddRate:    readRate(e, "GROUP_ADD", addRate),
+		CreateRate: readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
 	}
 	positive(e, "GROUP_MAX_PARTICIPANTS", c.Group.MaxParticipants)
 	if c.Group.MaxParticipants > group.LimitParticipants {
@@ -182,10 +183,11 @@ func Configure(s *runtime.Settings) Config {
 	if c.Group.IdleTTL <= 0 {
 		e.Invalid("GROUP_IDLE_TTL", "must be positive")
 	}
-	if r := c.Group.FanoutRate; r.PerMinute > 0 && r.Burst/group.FanoutSenderShare < c.Group.MaxParticipants-1 {
-		// One sender may use a quarter of the budget; otherwise a message
-		// to a full group could never be sent.
-		e.Invalid("GROUP_FANOUT_BURST", "a quarter of it is smaller than a full group's fan-out (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
+	if r := c.Group.FanoutRate; r.PerMinute > 0 && r.Burst/group.FanoutSenderShare < group.FanoutSenderMessages*(c.Group.MaxParticipants-1) {
+		// One sender may use a quarter of the budget, which must still
+		// carry a few messages in a row to a full group.
+		e.Invalid("GROUP_FANOUT_BURST", "a quarter of it does not cover "+strconv.Itoa(group.FanoutSenderMessages)+
+			" messages to a full group (RCSAS_GROUP_MAX_PARTICIPANTS - 1 each)")
 	}
 	if r := c.Group.AddRate; r.PerMinute > 0 && r.Burst < c.Group.MaxParticipants-1 {
 		// Otherwise a full group could never be created.
