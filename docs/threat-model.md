@@ -224,4 +224,12 @@ metadata.
 
 - pass asserted identities;
 - send roster NOTIFYs only to subscriptions `Roster` accepted;
-- end the session of a participant who leaves or is removed.
+- map a 603 Decline of the focus's INVITE to `Leave`, so that someone who
+  declines a group of strangers leaves it rather than being invited again;
+- end the session and the conference subscriptions of a participant who
+  leaves or is removed, so that it receives no later message or roster
+  change.
+
+The engine asks the group whether someone is still a participant before it
+invites them back to deliver a queued copy, and gives up the copies of
+anyone who left.

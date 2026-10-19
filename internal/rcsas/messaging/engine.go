@@ -130,7 +130,8 @@ type Config struct {
 	// Workers bounds the recipients whose queues are delivered at once.
 	Workers int
 	// MaxTracked bounds the senders and recipients whose state is kept in
-	// memory: rate buckets, pager-only markers, pending invitations.
+	// memory: rate buckets, pager-only markers, pending invitations, marks
+	// of participants that left a group.
 	MaxTracked int
 
 	// MSRP tunes the MSRP connections; its Clock and Rand are replaced by
@@ -180,8 +181,11 @@ type Engine struct {
 	invites    map[inviteKey]time.Time
 	pagerOnly  map[string]struct{}
 	groups     GroupHandler
-	lastID     int64
-	sweepAt    string
+	// departed marks the participants that left a group on this task
+	// (ParticipantLeft), until when their copies could still be queued.
+	departed map[legKey]time.Time
+	lastID   int64
+	sweepAt  string
 }
 
 // legKey names the chat legs a queued message may be delivered on: those
@@ -216,6 +220,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		legs:       map[legKey][]*Leg{},
 		invites:    map[inviteKey]time.Time{},
 		pagerOnly:  map[string]struct{}{},
+		departed:   map[legKey]time.Time{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {

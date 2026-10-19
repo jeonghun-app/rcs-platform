@@ -42,6 +42,10 @@ type GroupHandler interface {
 	// there now. For a notification, only the refusal matters: it goes to
 	// the author of the message it reports on.
 	Recipients(ctx context.Context, group, sender string, kind GroupKind) (Audience, error)
+	// Member reports whether user is a current participant of group, one
+	// that messages are kept for; false, without an error, when the group
+	// has ended.
+	Member(ctx context.Context, group, user string) (bool, error)
 }
 
 // Audience is who a participant's message in a group goes to, and the
@@ -66,6 +70,51 @@ func (e *Engine) groupHandler() GroupHandler {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.groups
+}
+
+// ParticipantLeft tells the engine that user is no longer a participant
+// of group: it left, declined or was removed, or tried to join without
+// being one. What is queued for it from the group is not delivered on a
+// session that is still open, nor used to invite it back: the next
+// attempt, made now, asks the GroupHandler and gives up on each message
+// if user is still not a participant. The mark is per task; elsewhere the
+// GroupHandler is asked before every invitation.
+func (e *Engine) ParticipantLeft(group, user string) {
+	now := e.clock.Now()
+	e.mu.Lock()
+	if len(e.departed) >= e.cfg.MaxTracked {
+		for k, until := range e.departed {
+			if !now.Before(until) {
+				delete(e.departed, k)
+			}
+		}
+		for k := range e.departed {
+			if len(e.departed) < e.cfg.MaxTracked {
+				break
+			}
+			delete(e.departed, k)
+		}
+	}
+	// Nothing queued outlives StoreTTL, so neither need the mark.
+	e.departed[legKey{user, group}] = now.Add(e.cfg.StoreTTL)
+	delete(e.invites, inviteKey{user, group, store.Group, ""})
+	e.mu.Unlock()
+	e.kickEvent(user)
+}
+
+// ParticipantAdded tells the engine that user is a participant of group
+// again, after ParticipantLeft.
+func (e *Engine) ParticipantAdded(group, user string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.departed, legKey{user, group})
+}
+
+func (e *Engine) hasDeparted(k legKey) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	until, ok := e.departed[k]
+	return ok && e.clock.Now().Before(until)
 }
 
 // GroupOrigin describes a message a participant wrote in a group.

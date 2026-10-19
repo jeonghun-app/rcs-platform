@@ -10,9 +10,11 @@
 //
 // The package has no SIP code. The SIP layer (a later issue) calls Create
 // when a client's INVITE reaches the conference factory, Join when a
-// participant's session with the group is set up, Leave on its BYE, Add on
-// a REFER, Remove on a REFER with method=BYE, and Roster for a SUBSCRIBE;
-// it implements Notifier, through which roster changes become NOTIFYs.
+// participant's session with the group is set up, Leave on its BYE or on a
+// 603 Decline of the focus's INVITE, Add on a REFER, Remove on a REFER with
+// method=BYE, and Roster for a SUBSCRIBE; it implements Notifier, through
+// which roster changes become NOTIFYs, and ends the session and the
+// subscriptions of whoever leaves or is removed.
 //
 // # Rules
 //

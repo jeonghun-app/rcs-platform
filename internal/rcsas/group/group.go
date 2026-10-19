@@ -285,10 +285,22 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 // Join records that who joined the group: an invited participant
 // answering, or a joined one setting up its session again. Who is not a
 // current participant cannot join (ErrNotParticipant).
+//
+// A Join refused that way also tells the engine that who is not in the
+// group (messaging.Engine.ParticipantLeft): a copy queued before it left
+// or was removed is then given up, not kept to invite it again.
 func (s *Service) Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
 	if len(displayName) > MaxDisplayNameLength {
 		return groupstore.Group{}, ErrInvalid
 	}
+	g, err := s.join(ctx, uri, who, displayName)
+	if errors.Is(err, ErrNotParticipant) {
+		s.engine.ParticipantLeft(uri, who)
+	}
+	return g, err
+}
+
+func (s *Service) join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
 	return s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		i := index(g, who)
 		if i < 0 || !g.Participants[i].State.Active() {
@@ -313,9 +325,11 @@ func (s *Service) Join(ctx context.Context, uri, who, displayName string) (group
 	})
 }
 
-// Leave records that who left the group. A chairman's role passes to the
-// participant in the group longest, joined ones first; when nobody is
-// left, the group ends.
+// Leave records that who left the group, by a BYE or by declining the
+// focus's INVITE. A chairman's role passes to the participant in the group
+// longest, joined ones first; when nobody is left, the group ends. What is
+// still queued for who from the group is given up
+// (messaging.Engine.ParticipantLeft).
 func (s *Service) Leave(ctx context.Context, uri, who string) error {
 	_, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		i := index(g, who)
@@ -338,6 +352,9 @@ func (s *Service) Leave(ctx context.Context, uri, who string) error {
 		}
 		return changed, nil
 	})
+	if err == nil {
+		s.engine.ParticipantLeft(uri, who)
+	}
 	return err
 }
 
@@ -354,7 +371,8 @@ func successor(g *groupstore.Group) int {
 
 // Add adds participants, invited, on behalf of by, a joined participant.
 // Current participants are left as they are; former ones are invited
-// again.
+// again, and messages are kept for them once more
+// (messaging.Engine.ParticipantAdded).
 func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error {
 	for _, in := range who {
 		if !validIdentity(in.Identity) || len(in.DisplayName) > MaxDisplayNameLength {
@@ -366,7 +384,9 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		s.metrics.Count("group.rejected.rate_limited", 1)
 		return ErrRateLimited
 	}
+	var added []string
 	_, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
+		added = nil
 		if i := index(g, by); i < 0 || g.Participants[i].State != groupstore.Joined {
 			return nil, ErrNotParticipant
 		}
@@ -388,8 +408,14 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		if activeCount(g) > s.cfg.MaxParticipants {
 			return nil, ErrTooMany
 		}
+		added = changed
 		return changed, nil
 	})
+	if err == nil {
+		for _, who := range added {
+			s.engine.ParticipantAdded(uri, who)
+		}
+	}
 	return err
 }
 
@@ -413,6 +439,9 @@ func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
 		g.Participants[j].State, g.Participants[j].Since = groupstore.Removed, now
 		return []string{who}, nil
 	})
+	if err == nil {
+		s.engine.ParticipantLeft(uri, who)
+	}
 	return err
 }
 
@@ -582,6 +611,20 @@ func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messa
 		s.touch(ctx, g, now)
 	}
 	return aud, nil
+}
+
+// Member implements messaging.GroupHandler: whether user is a current
+// participant, invited or joined.
+func (s *Service) Member(ctx context.Context, uri, user string) (bool, error) {
+	g, err := s.get(ctx, uri)
+	switch {
+	case errors.Is(err, ErrNoGroup):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	i := index(&g, user)
+	return i >= 0 && g.Participants[i].State.Active(), nil
 }
 
 // touch writes that the group is in use, at most once per TouchInterval

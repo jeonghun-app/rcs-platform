@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,11 @@ const groupURI = "sip:chat-1@conf.ims.example.net"
 
 // members is a GroupHandler of one group whose participants all write to
 // each other, under the names in names, or refuse when refuse is set.
+// Member leaves out those in left: a copy written to them before they
+// left.
 type members struct {
 	all    []string
+	left   []string
 	names  map[string]string
 	refuse error
 }
@@ -37,6 +41,13 @@ func (h members) Recipients(_ context.Context, group, sender string, kind GroupK
 		}
 	}
 	return aud, nil
+}
+
+func (h members) Member(_ context.Context, group, user string) (bool, error) {
+	if h.refuse != nil && !errors.As(h.refuse, new(*Rejection)) {
+		return false, h.refuse
+	}
+	return group == groupURI && slices.Contains(h.all, user) && !slices.Contains(h.left, user), nil
 }
 
 func groupFrom(sender string, body []byte) GroupOrigin {
@@ -402,5 +413,70 @@ func TestReceiptsFromALargeGroupDoNotFillTheAuthorsQueue(t *testing.T) {
 	}
 	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
 		t.Fatalf("a 1-to-1 message to alice: %v", err)
+	}
+}
+
+// ParticipantLeft makes the next attempt ask the GroupHandler, even with
+// a session open; an answer that the recipient is in the group after all
+// (added back on another path) costs it nothing.
+func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
+	r := newRig(t, Config{MaxTracked: 4})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	l := r.listen(t)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "one", 0))); err != nil {
+		t.Fatal(err)
+	}
+	r.d.nextInvite(t)
+	r.e.ParticipantLeft(groupURI, bob)
+	// Still a member: invited again at once, the mark forgotten.
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v", inv)
+	}
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	if got := b.next(t); !strings.HasSuffix(string(got.Body), "one") {
+		t.Fatalf("bob got %q", got.Body)
+	}
+	// Gone now, with the session still open: the next copy is not sent on
+	// it.
+	r.e.SetGroupHandler(members{all: []string{alice, bob}, left: []string{bob}})
+	r.e.ParticipantLeft(groupURI, bob)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m2", "two", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the copy given up", func() bool { return r.m.get("delivery.not_participant") == 1 })
+	select {
+	case m := <-b.got:
+		t.Fatalf("a former participant got %q", m.Body)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// The marks are bounded.
+	for i := range 10 {
+		r.e.ParticipantLeft(groupURI, fmt.Sprintf("sip:u%d@example.net", i))
+	}
+	r.e.mu.Lock()
+	n := len(r.e.departed)
+	r.e.mu.Unlock()
+	if n > 4 {
+		t.Fatalf("%d departures tracked, MaxTracked 4", n)
+	}
+}
+
+// Without a GroupHandler that can answer, a copy is kept, uninvited.
+func TestAGroupCopyWaitsWhenTheGroupCannotSay(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	for _, h := range []GroupHandler{members{refuse: errStore}, nil} {
+		r.e.SetGroupHandler(h)
+		r.clock.Advance(DefaultInviteTimeout)
+		r.e.UserRegistered(bob, true)
+		waitFor(t, "idle", r.idle)
+	}
+	if len(r.d.invites) != 0 || r.store.(*store.Memory).Len(bob) != 1 || r.m.get("store.failed") != 1 {
+		t.Fatalf("invites %d, metrics %v", len(r.d.invites), r.m)
 	}
 }

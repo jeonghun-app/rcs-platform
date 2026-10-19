@@ -282,13 +282,15 @@ has a session with it: a leg of mode `group` whose peer is that URI.
 | SIP event | Call |
 |---|---|
 | An INVITE to the conference factory, with a resource list | `group.Service.Create` (the creator is joined; the invitees are invited, and the SIP layer invites them) |
-| A participant's session with the group is set up (its INVITE, or its answer to the focus's) | `Join`, then `OpenLeg` / `Offer` and `Leg.Answer` with `Mode: store.Group` and the conference URI as `Peer` |
+| A participant's session with the group is set up (its INVITE, or its answer to the focus's) | `Join`, then `OpenLeg` / `Offer` and `Leg.Answer` with `Mode: store.Group` and the conference URI as `Peer`. If `Join` refuses, the session is refused and no leg opened |
 | A BYE on that session | `Leave`, and `Leg.Close` |
+| A 603 Decline to the focus's INVITE | `Leave`, not `InviteFailed`. The reference client declines the first INVITE of a group it left while offline (RCC.07 6.3.3.1; rcsjta `isGroupChatNextInviteRejected`), and accepts later ones as a new addition. Other failures stay `InviteFailed` |
 | A REFER adding someone | `Add` |
-| A REFER with `method=BYE` removing someone | `Remove` |
+| A REFER with `method=BYE` removing someone | `Remove`, then a BYE on the removed participant's session and `Leg.Close` |
+| `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated`), so that it learns no later roster change |
 | A SUBSCRIBE to the conference event package | `Roster`: the full document for the first NOTIFY |
 | `Notifier.RosterChanged` | a NOTIFY with the document to each subscription |
-| `Deliverer.Invite` with `Mode: store.Group` | an INVITE that brings the participant back into the group |
+| `Deliverer.Invite` with `Mode: store.Group` | an INVITE that brings the participant back into the group. The engine asks `Member` first, so it is only ever for a current participant |
 
 ### Rules
 
@@ -333,7 +335,14 @@ chat (size, CPIM parse, `From` check, per-sender rate). Then:
   by its own worker:
   - a slow participant holds up its own queue only;
   - an absent one has its copy kept while the engine asks the SIP layer to
-    bring it back (`Invite`, mode `group`);
+    bring it back (`Invite`, mode `group`), each time after asking the group
+    (`GroupHandler.Member`) whether it is still a participant;
+  - a copy for someone who is no longer a participant is given up
+    (`delivery.not_participant`), with the negative delivery notification if
+    the author asked for one. `Leave`, `Remove` and a refused `Join` tell the
+    engine at once (`ParticipantLeft`), and it gives up that participant's
+    copies from the group even while its session is still open. Another
+    task finds out when it would invite the participant;
   - pager mode is never used, since a client cannot place a group message
     that arrives outside the group.
 - **Is-composing.** Indications go to the joined participants' open sessions
@@ -571,7 +580,7 @@ identifier ever appears in a metric name.
 | `imdn.duplicate` | Notifications dropped as repeats |
 | `imdn.route_untrusted`, `imdn.route_dropped` | IMDN routes not followed: in a forwarded notification, and in a generated one's record route |
 | `delivery.msrp`, `delivery.pager`, `delivery.msrp_failed`, `delivery.pager_failed` | Delivery attempts |
-| `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `message.expired` | Messages given up on |
+| `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
 | `invite.sent`, `invite.failed`, `invite.no_sessions`, `invite.untracked` | Terminating session requests |
@@ -639,9 +648,12 @@ Signals to alarm on (Phase 7):
   only participants on the same task. The delivery workers are shared, so
   more slow participants than `Workers` (32) at once slow everyone, by up to
   `RCSAS_DELIVERY_TIMEOUT` each.
-- **Leaving keeps what was queued.** Messages queued for a participant before
-  it left or was removed are still delivered while its session lasts. The SIP
-  layer ends that session.
+- **Leaving is known per task.** The task that ran `Leave` or `Remove` gives up
+  that participant's queued copies at once. Another task gives them up only
+  when it would invite the participant back, so a session the SIP layer has
+  not ended yet may still carry them there. A client that takes no sessions
+  has its copies given up when it registers on a new flow, or when they
+  expire.
 - **Group rates are per task**, like the 1-to-1 ones.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
