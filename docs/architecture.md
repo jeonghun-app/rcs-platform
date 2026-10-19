@@ -214,7 +214,9 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   (memory store, no TLS on the public listener, no admin token) refuses to start
   when `RCS_ENV` is `staging` or `prod`.
 - **Logging**: JSON lines through `log/slog`. SIP URIs, `tel:` URIs, IMSI, IMEI and
-  MSISDN pass through `internal/pii` before they are logged. Message bodies,
+  MSISDN pass through `internal/pii` before they are logged. Client IP
+  addresses, private ones included, are logged only as their network, through
+  `pii.ClientIP` or the sip log values (IPv4 /24, IPv6 /48). Message bodies,
   credentials, nonces, RAND/AUTN, keys and tokens are never logged.
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
   needed. No identifier is ever a metric dimension.
