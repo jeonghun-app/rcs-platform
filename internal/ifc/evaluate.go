@@ -163,7 +163,8 @@ func (c Context) registered() bool {
 // reads only the set's compiled form, which nothing changes after Compile, so
 // one set can serve every request of a registration concurrently. The
 // criteria that Match and Next return share their trigger points with the
-// ones passed to Compile; treat them as read-only.
+// ones passed to Compile; treat them as read-only. A Set that Compile did not
+// build, such as a zero Set, is empty.
 type Set struct {
 	// compiled is what Compile built, never changed after: a Set derived
 	// with WithLimits shares it, so whatever is added to it carries over.
@@ -856,10 +857,24 @@ func estimateSize(re *syntax.Regexp) int {
 
 // CompileCost returns what compiling the set took, in the units of
 // MaxSetCompileCost: the same for the same criteria on every host.
-func (s *Set) CompileCost() int { return s.compileCost }
+func (s *Set) CompileCost() int {
+	if s.compiled == nil {
+		return 0
+	}
+	return s.compileCost
+}
 
 // Len returns the number of criteria in the set.
-func (s *Set) Len() int { return len(s.criteria) }
+func (s *Set) Len() int { return len(s.list()) }
+
+// list returns the compiled criteria in priority order: none for a Set that
+// Compile did not build.
+func (s *Set) list() []compiledCriteria {
+	if s.compiled == nil {
+		return nil
+	}
+	return s.criteria
+}
 
 // Match returns, in priority order, every criterion that applies to the
 // request: the S-CSCF sends a third-party REGISTER to each of their servers
@@ -870,9 +885,10 @@ func (s *Set) Match(req Request, ctx Context) ([]FilterCriteria, error) {
 	in := newInput(req, ctx, s.maxWork)
 	defer s.count(in)
 	var out []FilterCriteria
-	for i := range s.criteria {
-		if s.criteria[i].matches(in) {
-			out = append(out, s.criteria[i].fc)
+	criteria := s.list()
+	for i := range criteria {
+		if criteria[i].matches(in) {
+			out = append(out, criteria[i].fc)
 		}
 		if in.limit != "" {
 			return nil, &LimitError{Limit: in.limit}
@@ -913,8 +929,9 @@ func (s *Set) count(in *input) {
 func (s *Set) Next(req Request, ctx Context, after int) (FilterCriteria, bool, error) {
 	in := newInput(req, ctx, s.maxWork)
 	defer s.count(in)
-	for i := range s.criteria {
-		c := &s.criteria[i]
+	criteria := s.list()
+	for i := range criteria {
+		c := &criteria[i]
 		if c.fc.Priority <= after {
 			continue
 		}

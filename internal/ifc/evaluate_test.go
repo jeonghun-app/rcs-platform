@@ -1163,3 +1163,21 @@ func TestAPatternThatCostsExactlyWhatIsLeftFits(t *testing.T) {
 		}
 	}
 }
+
+// A Set that Compile did not build, such as a zero Set or new(Set), is an
+// empty set: it matches nothing and costs nothing, rather than panicking on
+// its missing compiled part (review of #125, #142).
+func TestTheZeroSetIsEmpty(t *testing.T) {
+	r := req("MESSAGE", "sip:bob@example.net")
+	for name, s := range map[string]*Set{"Set{}": {}, "new(Set)": new(Set), "WithLimits of Set{}": (&Set{}).WithLimits(Limits{MaxWork: 10})} {
+		if s.Len() != 0 || s.CompileCost() != 0 {
+			t.Errorf("%s: %d criteria, cost %d", name, s.Len(), s.CompileCost())
+		}
+		if got, err := s.Match(r, Context{}); got != nil || err != nil {
+			t.Errorf("%s: Match = %v, %v", name, got, err)
+		}
+		if _, ok, err := s.Next(r, Context{}, -1); ok || err != nil {
+			t.Errorf("%s: Next = %v, %v", name, ok, err)
+		}
+	}
+}
