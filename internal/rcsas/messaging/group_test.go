@@ -422,7 +422,8 @@ func TestReceiptsFromALargeGroupDoNotFillTheAuthorsQueue(t *testing.T) {
 // (added back on another path) costs it nothing.
 func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 	r := newRig(t, Config{MaxTracked: 4})
-	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	reads := new(atomic.Int64)
+	r.e.SetGroupHandler(counted{members{all: []string{alice, bob}}, reads})
 	l := r.listen(t)
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "one", 0))); err != nil {
 		t.Fatal(err)
@@ -436,6 +437,14 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
 	if got := b.next(t); !strings.HasSuffix(string(got.Body), "one") {
 		t.Fatalf("bob got %q", got.Body)
+	}
+	// With the mark gone, a copy goes on the open session unasked.
+	before := reads.Load()
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1b", "again", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.next(t); !strings.HasSuffix(string(got.Body), "again") || reads.Load() != before+1 {
+		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body, reads.Load()-before)
 	}
 	// Gone now, with the session still open: the next copy is not sent on
 	// it.

@@ -39,6 +39,11 @@ func (h counted) Recipients(ctx context.Context, group, sender string, kind Grou
 	return h.members.Recipients(ctx, group, sender, kind)
 }
 
+func (h counted) Member(ctx context.Context, group, user string) (bool, error) {
+	h.reads.Add(1)
+	return h.members.Member(ctx, group, user)
+}
+
 // rcsjta sends a display notification about a group message as a SIP
 // MESSAGE to the author when the group session is gone, with anonymous
 // From and To. The author's own record of the message finds the group's,
