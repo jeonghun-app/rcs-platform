@@ -4,6 +4,7 @@ package awsstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -27,6 +28,14 @@ import (
 // codes the unit tests fake. RCSAS_IT_DYNAMODB_ENDPOINT names the container.
 
 func integrationStore(t *testing.T) store.Store {
+	t.Helper()
+	s, _ := integrationTable(t)
+	return s
+}
+
+// integrationTable creates a table and returns the store over it, and the
+// store itself for reaching the table behind its back.
+func integrationTable(t *testing.T) (store.Store, *Store) {
 	t.Helper()
 	endpoint := os.Getenv("RCSAS_IT_DYNAMODB_ENDPOINT")
 	if endpoint == "" {
@@ -74,7 +83,7 @@ func integrationStore(t *testing.T) store.Store {
 	if err := s.Ready(ctx); err != nil {
 		t.Fatalf("Ready = %v", err)
 	}
-	return s
+	return s, s
 }
 
 func TestIntegrationStoreMeetsTheContract(t *testing.T) {
@@ -155,6 +164,37 @@ func TestIntegrationTwoEnginesShareTheQueueAndDeliverEachMessageOnce(t *testing.
 	for body, c := range p.got {
 		if c != 1 {
 			t.Fatalf("%q delivered %d times", body, c)
+		}
+	}
+}
+
+// The recount that corrects a drifted queue size, with its rate limit, as
+// DynamoDB itself evaluates the expressions.
+func TestIntegrationADriftedQueueSizeIsCorrectedOnce(t *testing.T) {
+	_, s := integrationTable(t)
+	ctx := t.Context()
+	l := store.Limit{Count: 1, SenderCount: 1}
+	at := func(id string, when time.Time) store.Message {
+		return store.Message{Recipient: "sip:r@example.net", ID: id, Sender: "sip:s@example.net", Mode: store.Chat,
+			CPIM: []byte("x"), Enqueued: when, Expires: when.Add(time.Hour)}
+	}
+	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	if err := s.Enqueue(ctx, at("1", t1), l); err != nil {
+		t.Fatal(err)
+	}
+	// The queue item goes behind the store's back, as DynamoDB's TTL would.
+	if _, err := s.api.(*dynamodb.Client).DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(s.table), Key: key(identityKey(queuePrefix, "sip:r@example.net"), "1"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, at("2", t1.Add(time.Second)), l); err != nil {
+		t.Fatalf("Enqueue after drift = %v", err)
+	}
+	// Full now, really: refused, and not counted again within the interval.
+	for i := range 3 {
+		if err := s.Enqueue(ctx, at(fmt.Sprint("x", i), t1.Add(time.Duration(2+i)*time.Second)), l); !errors.Is(err, store.ErrQueueFull) {
+			t.Fatalf("Enqueue to a full queue = %v", err)
 		}
 	}
 }
