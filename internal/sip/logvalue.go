@@ -1,6 +1,8 @@
 package sip
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/netip"
 	"strconv"
@@ -15,10 +17,15 @@ import (
 // redacted forms instead of the exported fields, the same line of defence as
 // messages having no String method.
 //
-// slog applies LogValue only to the value it is handed. A slice of these values,
-// or a struct of the service's own that holds one, reaches the JSON handler
-// through encoding/json, which ignores LogValue and writes every field: log the
-// elements or the fields one by one instead.
+// slog applies LogValue only to the value it is handed. A plain slice of these
+// values, or a struct of the service's own that holds one, reaches the JSON
+// handler through encoding/json, which ignores LogValue. So the parsers and
+// accessors return lists as the slice types below (Vias, Contacts, Addresses,
+// Challenges, CredentialsList), which log each element through its LogValue,
+// and every type with a LogValue also has a MarshalJSON writing the same
+// redacted form, which covers plain slices and struct fields. Text handlers
+// format such values with fmt instead; the platform logs JSON only
+// (docs/architecture.md §8).
 //
 // TODO(#2): pass user parts and numbers through internal/pii once it lands, so
 // operators can correlate the masked form; until then they are left out.
@@ -111,8 +118,40 @@ func (v Via) LogValue() slog.Value {
 // a plain []Via would be logged field by field, received included.
 type Vias []Via
 
+// Contacts is a Contact header's elements, as ParseContacts and
+// Header.Contact return them; logged, each goes through Contact.LogValue.
+type Contacts []Contact
+
+// Addresses is the name-addrs of a header such as Route, Record-Route, Path
+// or P-Asserted-Identity; logged, each goes through Address.LogValue.
+type Addresses []Address
+
+// Challenges is one challenge per WWW-Authenticate or Proxy-Authenticate
+// field; logged, each goes through Challenge.LogValue, nonce left out.
+type Challenges []Challenge
+
+// CredentialsList is one set of credentials per Authorization or
+// Proxy-Authorization field; logged, each goes through Credentials.LogValue,
+// response and nonce left out.
+type CredentialsList []Credentials
+
 // LogValue logs each element by its position, top first.
-func (vs Vias) LogValue() slog.Value {
+func (vs Vias) LogValue() slog.Value { return listValue(vs) }
+
+// LogValue logs each element by its position.
+func (cs Contacts) LogValue() slog.Value { return listValue(cs) }
+
+// LogValue logs each element by its position, top first.
+func (as Addresses) LogValue() slog.Value { return listValue(as) }
+
+// LogValue logs each element by its position.
+func (cs Challenges) LogValue() slog.Value { return listValue(cs) }
+
+// LogValue logs each element by its position.
+func (cs CredentialsList) LogValue() slog.Value { return listValue(cs) }
+
+// listValue is a group of the elements' own log values, keyed by position.
+func listValue[T slog.LogValuer](vs []T) slog.Value {
 	attrs := make([]slog.Attr, len(vs))
 	for i, v := range vs {
 		attrs[i] = slog.Any(strconv.Itoa(i), v)
@@ -147,4 +186,72 @@ func (r Response) LogValue() slog.Value {
 		slog.Int("headers", r.Header.Len()),
 		slog.Int("body_bytes", len(r.Body)),
 	)
+}
+
+// The types above also marshal to JSON as their log values, so that a plain
+// slice of them, or a field of a struct of the service's own, logged through
+// slog's JSON handler (which hands such values to encoding/json) or encoded
+// any other way, is redacted too. No API encodes these types as JSON for
+// another purpose; one that needs the full value encodes its String form.
+
+// MarshalJSON writes the log value.
+func (u URI) MarshalJSON() ([]byte, error) { return jsonOf(u.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (a Address) MarshalJSON() ([]byte, error) { return jsonOf(a.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (c Contact) MarshalJSON() ([]byte, error) { return jsonOf(c.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (c Challenge) MarshalJSON() ([]byte, error) { return jsonOf(c.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (c Credentials) MarshalJSON() ([]byte, error) { return jsonOf(c.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (v Via) MarshalJSON() ([]byte, error) { return jsonOf(v.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (h Header) MarshalJSON() ([]byte, error) { return jsonOf(h.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (r Request) MarshalJSON() ([]byte, error) { return jsonOf(r.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (r Response) MarshalJSON() ([]byte, error) { return jsonOf(r.LogValue()) }
+
+// jsonOf writes v as JSON in the shape slog's JSON handler gives it: a group
+// as an object with its attributes in order, anything else as encoding/json
+// writes it.
+func jsonOf(v slog.Value) ([]byte, error) {
+	var b bytes.Buffer
+	err := appendJSON(&b, v)
+	return b.Bytes(), err
+}
+
+func appendJSON(b *bytes.Buffer, v slog.Value) error {
+	v = v.Resolve()
+	if v.Kind() != slog.KindGroup {
+		j, err := json.Marshal(v.Any())
+		b.Write(j)
+		return err
+	}
+	b.WriteByte('{')
+	for i, a := range v.Group() {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		k, err := json.Marshal(a.Key)
+		if err != nil {
+			return err
+		}
+		b.Write(k)
+		b.WriteByte(':')
+		if err := appendJSON(b, a.Value); err != nil {
+			return err
+		}
+	}
+	b.WriteByte('}')
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -117,6 +118,20 @@ func TestProfileWithAPatternOverMaxPatternBytesIsRefusedNamingTheLimit(t *testin
 	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
 	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxPatternBytes") {
 		t.Fatalf("%d %v, want 400 naming MaxPatternBytes", code, body)
+	}
+}
+
+func TestProfileCostlierToCompileThanMaxSetCompileCostIsRefusedNamingTheLimit(t *testing.T) {
+	a := newAPIEnv(t)
+	items := make([]string, 12)
+	for i := range items {
+		items[i] = `{"priority":` + strconv.Itoa(i+1) + `,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+			`{"group":[0],"request_uri":"` + strings.Repeat("[^a]", ifc.MaxPatternBytes/4) + `"}]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}`
+	}
+	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, `{"id":"slow","initial_filter_criteria":[`+strings.Join(items, ",")+`]}`)
+	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxSetCompileCost") {
+		t.Fatalf("%d %v, want 400 naming MaxSetCompileCost", code, body)
 	}
 }
 
