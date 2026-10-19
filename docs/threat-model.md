@@ -252,7 +252,9 @@ metadata.
   - each recipient's queue as in 1-to-1 chat, where a group message counts
     against its author's share, the one its 1-to-1 messages use; each
     group's notifications hold one share, and all groups' together a quarter
-    of the queue, beyond which they are dropped;
+    of the queue; beyond that they are summarized as one queue item per
+    message, sent from the marks of notifications already accepted, so the
+    summary adds nothing a participant did not report;
   - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
     be SIP or tel URIs, compared in canonical form, and names XML-safe text,
     so that one bad value cannot make the stored roster unwritable;

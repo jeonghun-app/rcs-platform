@@ -29,17 +29,9 @@ func (s *readCounter) Pending(ctx context.Context, r, after string, now time.Tim
 	return ms, err
 }
 
-func drainInvites(t *testing.T, d *fakeDeliverer) {
-	go func() {
-		for {
-			select {
-			case <-d.invites:
-			case <-t.Context().Done():
-				return
-			}
-		}
-	}()
-}
+// drainInvites has d keep no invitations, for a test that does not look
+// at them.
+func drainInvites(_ *testing.T, d *fakeDeliverer) { d.discardInvites.Store(true) }
 
 // Messages that wait for a session are not read again for each new one:
 // the reads grow with the messages, not with their square.

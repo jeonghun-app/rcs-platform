@@ -445,9 +445,27 @@ eighth by default), so that one busy group does not crowd out another's. All
 group notifications in a queue together, from every group, hold at most a
 quarter of it (`#group-notifications`, 250 by default): an author in many
 large groups is not locked out of 1-to-1 messages by receipts. A notification
-beyond its group's share, the total or the queue is taken (200)
-and dropped, counted as `group.notification.dropped`, rather than refused: the
+beyond its group's share or the total is taken (200), not refused: the
 reference client ends its session with the group when one is refused.
+
+What does not fit is summarized, not lost (#166). The group's sent-message
+record already holds a mark for every notification accepted, with the status
+it reported, so it is the summary; the author's queue gets one **summary item**
+per message (queue ID `r-<Message-ID>`, no body), counted toward the queue
+only, not toward any share or the total. When the summary is delivered, on the
+author's session with the group, rcs-as reads the record and sends, for each
+participant that reported, its strongest notification (display before delivery
+before processing) as a notification of its own: `From` the participant, `To`
+the author, the message's `DateTime` echoed, without a success report. The
+reference client takes notifications in a group only that way: one
+`message/imdn+xml` per CPIM message, the status the `From`'s
+(`GroupChatSession`); it ignores an RFC 5438 §8.3 aggregate
+(`multipart/mixed`). The summary is removed only if no notification was marked
+since the record was read (the record counts its marks); otherwise it stays
+and goes again with the new ones, and the author's client takes a repeat as
+the same status. A summary expires with the record (`RCSAS_SENT_TTL`), without
+a notification. A notification is dropped (`group.notification.dropped`) only
+when the queue itself is full.
 
 Notifications rcs-as generates (expiry, full queue) go to the author the same
 way, from the recipient.
@@ -603,7 +621,13 @@ The table's properties:
   - a removal of a message already gone.
 - **Notifications seen.** A sent-message record holds a map of the
   notifications accepted. Each entry is set with a condition and holds the
-  token of the attempt that set it.
+  token of the attempt that set it and the status it reported; `marks` counts
+  the entries ever set, in the same update, and only grows. A group
+  message's record also holds its `datetime`.
+- **Summaries.** A summary is a queue item with `summary` set and no body. Its
+  removal is one transaction: the `Delete`, the queue size, and a
+  `ConditionCheck` that the sent-message record's `marks` is the count the
+  summary was expanded from, or that the record is gone.
 - **Expiry.** Items carry their own expiry and every read checks it. `ttl` is
   only the backstop that keeps the table small, because TTL deletion can lag
   by days:
@@ -617,15 +641,15 @@ The task role needs these IAM actions:
 | `dynamodb:GetItem` | table | `Sent`; reads after a refused conditional write; recounts |
 | `dynamodb:PutItem` | table | `RecordSent`, and the `Put` inside the enqueue transaction |
 | `dynamodb:UpdateItem` | table | `Claim`, `Release`, `MarkNotified`, `UnmarkNotified`, size corrections, and the `Update`s inside both transactions |
-| `dynamodb:DeleteItem` | table | the `Delete` inside the removal transaction |
+| `dynamodb:DeleteItem` | table | the `Delete` inside the removal transactions |
+| `dynamodb:ConditionCheckItem` | table | the `ConditionCheck` inside a summary's removal |
 | `dynamodb:Query` | table | `Pending`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
 | `dynamodb:DescribeTable` | table | readiness |
 
-There is no IAM action for a transaction itself. Each write inside one is
-allowed by the action of its kind (`PutItem`, `UpdateItem`, `DeleteItem`). The
-transactions use no `ConditionCheck` items, so `ConditionCheckItem` is not
-needed.
+There is no IAM action for a transaction itself. Each item inside one is
+allowed by the action of its kind (`PutItem`, `UpdateItem`, `DeleteItem`,
+`ConditionCheckItem`).
 
 `make test-integration` runs the store contract against DynamoDB Local. It
 also runs two engines that share one table and must deliver each message
@@ -694,7 +718,8 @@ identifier ever appears in a metric name.
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
-| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
+| `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent` | Notifications that went to a summary for want of room, summaries delivered, and the notifications they sent |
+| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through
 `internal/pii`. MSRP session ids never appear: they are capabilities ([threat
@@ -754,19 +779,15 @@ Signals to alarm on (Phase 7):
   task. The delivery workers are shared, so more slow participants than
   `Workers` (32) at once slow everyone, by up to `RCSAS_DELIVERY_TIMEOUT`
   each.
-- **Receipts for an offline author can be dropped.** While the author has no
-  session, its queue keeps at most a share (125 by default) of one group's
-  notifications, and 250 of all groups' together. One message to a full group
-  of 100 that asks for both kinds is answered with 198: 125 are kept and 73
-  dropped (`group.notification.dropped`); one message in each of nine such
-  groups keeps 250 of 1782. The reference client marks a group message
-  displayed only when every recipient has said so
-  (`GroupChatImpl.isDisplayedByAllRecipients`), so such a message is never
-  shown as read by all. An author with a session, or that the engine can
-  invite, takes them as they come and loses none.
-  This is accepted for now: an author that goes offline right after writing to
-  a large group may never see "read by all". Aggregating the receipts is
-  [#166](https://github.com/jeonghun-app/rcs-platform/issues/166).
+- **Receipts for an offline author come back summarized.** While the author has
+  no session, its queue keeps at most a share (125 by default) of one group's
+  notifications, and 250 of all groups' together; the rest are summarized
+  (#166). One message to a full group of 100 that asks for both kinds is
+  answered with 198: 125 are queued, and once back the author also gets the
+  summary's 99, each participant's strongest, so the reference client shows
+  the message read by all (`GroupChatImpl.isDisplayedByAllRecipients`). The
+  author may get a participant's notification twice; a delivery notification
+  that a display one made redundant is not sent again.
 - **Group fan-out is sequential.** A group message is queued for its
   recipients one enqueue transaction after another, on the sender's session,
   before the sender's answer. A message to 99 others at 10 ms an enqueue takes

@@ -22,8 +22,10 @@ type sentKey struct{ sender, messageID string }
 
 type sentRecord struct {
 	Sent
-	marks map[string]string // notification key → token
+	marks map[string]mark // notification key → the attempt and status
 }
+
+type mark struct{ token, status string }
 
 var _ Store = (*Memory)(nil)
 
@@ -145,6 +147,27 @@ func (s *Memory) Remove(_ context.Context, msg Message, owner string) error {
 	return nil
 }
 
+// RemoveSummary implements Store.
+func (s *Memory) RemoveSummary(_ context.Context, msg Message, owner string, marks int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.queues[msg.Recipient][msg.ID]
+	switch {
+	case !ok:
+		return nil
+	case m.Owner != owner:
+		return fmt.Errorf("store: remove summary: %w", ErrConflict)
+	}
+	if r, ok := s.sent[sentKey{msg.Sender, msg.MessageID}]; ok && r.MarkCount != marks {
+		return fmt.Errorf("store: remove summary: %w", ErrMarksChanged)
+	}
+	delete(s.queues[msg.Recipient], msg.ID)
+	if len(s.queues[msg.Recipient]) == 0 {
+		delete(s.queues, msg.Recipient)
+	}
+	return nil
+}
+
 // Expired implements Store. The cursor is the last key returned.
 func (s *Memory) Expired(_ context.Context, now time.Time, cursor string, limit int) ([]Message, string, error) {
 	s.mu.Lock()
@@ -178,7 +201,9 @@ func (s *Memory) RecordSent(_ context.Context, r Sent, now time.Time) error {
 	if old, ok := s.sent[k]; ok && old.Expires.After(now) {
 		return fmt.Errorf("store: record sent: %w", ErrExists)
 	}
-	s.sent[k] = &sentRecord{Sent: r.Clone(), marks: map[string]string{}}
+	r = r.Clone()
+	r.Marks, r.MarkCount = nil, 0
+	s.sent[k] = &sentRecord{Sent: r, marks: map[string]mark{}}
 	return nil
 }
 
@@ -190,7 +215,12 @@ func (s *Memory) Sent(_ context.Context, sender, messageID string, now time.Time
 	if err != nil {
 		return Sent{}, fmt.Errorf("store: sent: %w", err)
 	}
-	return r.Clone(), nil
+	out := r.Sent.Clone()
+	out.Marks = make(map[string]string, len(r.marks))
+	for k, m := range r.marks {
+		out.Marks[k] = m.status
+	}
+	return out, nil
 }
 
 // live needs s.mu.
@@ -208,17 +238,21 @@ func (s *Memory) live(sender, messageID string, now time.Time) (*sentRecord, err
 }
 
 // MarkNotified implements Store.
-func (s *Memory) MarkNotified(_ context.Context, sender, messageID, key, token string, now time.Time) error {
+func (s *Memory) MarkNotified(_ context.Context, sender, messageID, key, status, token string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, err := s.live(sender, messageID, now)
 	if err != nil {
 		return fmt.Errorf("store: mark notified: %w", err)
 	}
-	if t, ok := r.marks[key]; ok && t != token {
-		return fmt.Errorf("store: mark notified: %w", ErrExists)
+	if m, ok := r.marks[key]; ok {
+		if m.token != token {
+			return fmt.Errorf("store: mark notified: %w", ErrExists)
+		}
+		return nil
 	}
-	r.marks[key] = token
+	r.marks[key] = mark{token: token, status: status}
+	r.MarkCount++
 	return nil
 }
 
@@ -226,7 +260,7 @@ func (s *Memory) MarkNotified(_ context.Context, sender, messageID, key, token s
 func (s *Memory) UnmarkNotified(_ context.Context, sender, messageID, key, token string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r, ok := s.sent[sentKey{sender, messageID}]; ok && r.marks[key] == token {
+	if r, ok := s.sent[sentKey{sender, messageID}]; ok && r.marks[key].token == token {
 		delete(r.marks, key)
 	}
 	return nil

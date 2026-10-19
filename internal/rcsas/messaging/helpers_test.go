@@ -178,6 +178,10 @@ type fakeDeliverer struct {
 	pagers   chan Delivery
 	invites  chan Invitation
 	overflow atomic.Int64
+	// discardInvites, set by drainInvites, keeps invitations off the
+	// channel for a test that does not look at them: a channel drained
+	// alongside can fall behind a burst and count as overflow.
+	discardInvites atomic.Bool
 }
 
 func newFakeDeliverer() *fakeDeliverer {
@@ -210,6 +214,9 @@ func (f *fakeDeliverer) Invite(_ context.Context, inv Invitation) error {
 	var err error
 	if h != nil {
 		err = h(inv)
+	}
+	if f.discardInvites.Load() {
+		return err
 	}
 	select {
 	case f.invites <- inv:

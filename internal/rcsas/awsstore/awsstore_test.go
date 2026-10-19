@@ -61,7 +61,7 @@ func TestEveryOperationReportsAFailedRequest(t *testing.T) {
 		"Expired":        func() error { _, _, err := s.Expired(ctx, t0, "", 1); return err },
 		"RecordSent":     func() error { return s.RecordSent(ctx, store.Sent{Sender: "s", MessageID: "m"}, t0) },
 		"Sent":           func() error { _, err := s.Sent(ctx, "s", "m", t0); return err },
-		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "t", t0) },
+		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "displayed", "t", t0) },
 		"UnmarkNotified": func() error { return s.UnmarkNotified(ctx, "s", "m", "k", "t") },
 	} {
 		if err := op(); err == nil || !strings.Contains(err.Error(), "ProvisionedThroughputExceededException") {
@@ -206,7 +206,7 @@ func TestARepeatedWriteThatTookEffectIsNotAConflict(t *testing.T) {
 	if err := s.RecordSent(ctx, r, t0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkNotified(ctx, "s", "m", "k", "t1", t0); err != nil {
+	if err := s.MarkNotified(ctx, "s", "m", "k", "displayed", "t1", t0); err != nil {
 		t.Fatalf("MarkNotified = %v", err)
 	}
 }
