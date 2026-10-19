@@ -36,7 +36,7 @@ RUNGO = $(DOCKER) run --rm \
 	-v $(GOCACHE_VOL):/gocache \
 	-v $(GOMOD_VOL):/gomodcache \
 	-e GOCACHE=/gocache -e GOMODCACHE=/gomodcache -e HOME=/tmp \
-	-e GOFLAGS=-buildvcs=false
+	-e GOFLAGS=-buildvcs=false -e CI
 
 # Seconds each fuzz target runs in `make fuzz`; CI uses the default.
 FUZZTIME ?= 10s
@@ -101,13 +101,13 @@ test-integration: volumes ## Storage backends against S3 and DynamoDB containers
 	$(RUNGO) --network "$$id" \
 	  -e FT_IT_S3_ENDPOINT="http://$$id-s3:9090" -e FT_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
 	  -e RELAY_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" -e HSS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
-	  -e RCSAS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
+	  -e SCSCF_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" -e RCSAS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
 	  -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=local -e AWS_SECRET_ACCESS_KEY=local \
 	  $(GOIMAGE) sh -c 'for url in "$$FT_IT_S3_ENDPOINT" "$$FT_IT_DYNAMODB_ENDPOINT"; do \
 	      n=0; until wget -S -O /dev/null "$$url/" 2>&1 | grep -q "HTTP/"; do \
 	        n=$$((n + 1)); [ "$$n" -lt 120 ] || { echo "$$url did not start" >&2; exit 1; }; sleep 1; done; \
 	    done; \
-	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/hss/... ./internal/rcsas/... ./tools/stack-init/'
+	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/hss/... ./internal/rcsas/... ./internal/scscf/... ./tools/stack-init/'
 
 # rcs-sim against the built ft-server and msrp-relay binaries
 # (tools/rcs-sim/e2e). Not part of `check`: it builds and starts three

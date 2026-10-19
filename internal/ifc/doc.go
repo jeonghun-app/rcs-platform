@@ -43,8 +43,11 @@
 //   - Compile: a pattern is at most [MaxPatternBytes] long, which bounds
 //     the cost of parsing it, and compiles to at most
 //     [MaxPatternInstructions]; a set compiles to at most
-//     [MaxSetInstructions]. Compile refuses more, and refuses an oversized
-//     pattern before parsing it or building its program.
+//     [MaxSetInstructions], and its compiling costs at most
+//     [MaxSetCompileCost], a count of bytes and instructions processed
+//     rather than a time, so the same profile is refused on every host.
+//     Compile refuses more, and refuses an oversized pattern before
+//     parsing it or building its program.
 //   - Input: one evaluation examines a Request-URI of at most
 //     [MaxRequestURILength], header names and values of at most
 //     [MaxHeaderLength] and [MaxHeaderBytes] together, and SDP lines of at
