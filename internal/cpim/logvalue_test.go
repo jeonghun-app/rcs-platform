@@ -157,3 +157,22 @@ meet me at 15550100005`))
 		}
 	}
 }
+
+// The media type is the sender's token too, masked like other text, and a
+// nil *Message logs as an empty group rather than as LogValue's panic
+// (review of #132).
+func TestMessageLogValueMasksTheMediaTypeAndTakesANilMessage(t *testing.T) {
+	m := mustParse(t, crlf("From: <"+alice+">\nTo: <"+bob+">\n\nContent-Type: text/x15550100004\n\nhi"))
+	var nilMsg *Message
+	var js bytes.Buffer
+	jsonLog, _ := untimedLoggers(&js, io.Discard)
+	jsonLog.Info("x", "msg", m, "none", nilMsg)
+	out := js.String()
+	if strings.Contains(out, "15550100004") || !strings.Contains(out, `"content_type":"text/x***04"`) {
+		t.Errorf("media type logged as:\n%s", out)
+	}
+	if strings.Contains(out, "panic") || strings.Contains(out, `"none"`) {
+		// slog drops an empty group.
+		t.Errorf("nil message logged as:\n%s", out)
+	}
+}

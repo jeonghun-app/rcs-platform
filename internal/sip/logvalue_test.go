@@ -115,18 +115,46 @@ func TestLoggedURIKeepsTheSchemeAndHostOnly(t *testing.T) {
 		"im:alice@[2001:db8:5:6::7]":                                               "im:***@2001:db8:5::/48",
 		"pres:alice@10.20.30.40?subject=x":                                         "pres:***@10.20.30.0/24",
 		"im:alice@secret@ims.example.net":                                          "im:***@ims.example.net",
-		"im:alice.secret":                                                          "im:***",
-		`im:"bob@smith"@ims.example.net`:                                           "im:***",
-		"mailto:alice.secret@example.com":                                          "mailto:***",
-		"xmpp:alice.secret@example.com":                                            "xmpp:***",
-		"http://alice.secret:pw@example.com/":                                      "http:***",
-		"urn:gsma:imei:00101000-000003-1":                                          "urn:***",
-		"x15550100001:alice":                                                       "x***01:***",
-		"sip:":                                                                     "sip:***",
-		"not a uri":                                                                "***",
+		// The domain ends where a host does; what follows is left out, and
+		// a domain that is not a host is masked (review of #132).
+		"im:bob@example.com;gr=urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6": "im:***@example.com",
+		"im:bob@example.com/Alice.Secret":                                     "im:***@example.com",
+		"im:bob@%31%35%35%35%30%31%30%30%30%30%31.example":                    "im:***",
+		"im:alice@10.20.30.40:5060":                                           "im:***@10.20.30.0/24",
+		"pres:alice@198.51.100.7:5061":                                        "pres:***@198.51.100.0/24",
+		"im:alice@10.20.30.40;x=y":                                            "im:***@10.20.30.0/24",
+		"im:alice@example.com;alice.secret":                                   "im:***@example.com",
+		"im:alice@[2001:db8:5:6::7]:5060":                                     "im:***@2001:db8:5::/48",
+		"im:alice@example.com:x":                                              "im:***",
+		"im:alice@example.com:":                                               "im:***",
+		"im:alice@":                                                           "im:***",
+		"x15550100001:%zz":                                                    "x***01:***",
+		"im:alice.secret":                                                     "im:***",
+		`im:"bob@smith"@ims.example.net`:                                      "im:***",
+		"mailto:alice.secret@example.com":                                     "mailto:***",
+		"xmpp:alice.secret@example.com":                                       "xmpp:***",
+		"http://alice.secret:pw@example.com/":                                 "http:***",
+		"urn:gsma:imei:00101000-000003-1":                                     "urn:***",
+		"x15550100001:alice":                                                  "x***01:***",
+		"sip:":                                                                "sip:***",
+		"not a uri":                                                           "***",
 	} {
 		if got := LoggedURI(in); got != want {
 			t.Errorf("LoggedURI(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The same in a SIP header, which main logged as im:*** (review of
+	// #132).
+	for in, want := range map[string]string{
+		"<im:alice@ims.example.net;gr=urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6>;tag=1": `{"uri":"im:***@ims.example.net","tag":"1"}`,
+		"<im:alice@10.20.30.40:5060>": `{"uri":"im:***@10.20.30.0/24","tag":""}`,
+	} {
+		a, err := ParseAddress(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := json.Marshal(a); err != nil || string(got) != want {
+			t.Errorf("From %s logs %s, %v; want %s", in, got, err, want)
 		}
 	}
 }

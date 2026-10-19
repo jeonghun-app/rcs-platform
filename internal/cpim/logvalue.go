@@ -14,9 +14,16 @@ import (
 // sender's text and content, and a header such as a formal name or a
 // Subject can name a person (#109). The names, the sender's tokens, are
 // masked like other text (internal/pii). An address that does not parse is
-// left out. The receiver is a value so that a Message and a *Message both
-// log this way.
-func (m Message) LogValue() slog.Value {
+// left out. A nil *Message logs as an empty group.
+//
+// The receiver is a pointer so that a nil one can be told apart: a value
+// receiver would make slog log the panic of its call. A Message value,
+// which has no LogValue then, reaches slog's JSON handler through
+// encoding/json, and MarshalJSON writes the same fields.
+func (m *Message) LogValue() slog.Value {
+	if m == nil {
+		return slog.GroupValue()
+	}
 	l := m.logged()
 	attrs := []slog.Attr{slog.Any("headers", l.Headers)}
 	if l.From != nil {

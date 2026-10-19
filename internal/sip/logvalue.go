@@ -48,18 +48,43 @@ func (u URI) redacted() string {
 		}
 		return u.Scheme + ":" + redactedMark + "@" + host
 	case "im", "pres":
-		// A mailbox, user@domain, then headers (RFC 3860 §3, RFC 3859
-		// §3). The user may be a quoted string holding "@", the domain
-		// cannot.
-		mailbox, _, _ := strings.Cut(u.Opaque, "?")
-		if at := strings.LastIndexByte(mailbox, '@'); at >= 0 {
-			return u.Scheme + ":" + redactedMark + "@" + loggedHost(mailbox[at+1:])
+		if domain, ok := mailboxDomain(u.Opaque); ok {
+			return u.Scheme + ":" + redactedMark + "@" + loggedHost(domain)
 		}
 		return u.Scheme + ":" + redactedMark
 	default:
 		// The scheme is the peer's text too, if a token.
 		return pii.Redact(u.Scheme) + ":" + redactedMark
 	}
+}
+
+// mailboxDomain returns the domain of an im or pres URI's mailbox,
+// user@domain then headers (RFC 3860 §3, RFC 3859 §3), if it is a host as
+// a SIP URI's is. The domain ends at the first ";", "/", "?" or ">", and a
+// port is dropped: what follows is the peer's text, a gr parameter or a
+// path (review of #132). The user may hold "@", the domain cannot.
+func mailboxDomain(opaque string) (string, bool) {
+	mailbox, _, _ := strings.Cut(opaque, "?")
+	at := strings.LastIndexByte(mailbox, '@')
+	if at < 0 {
+		return "", false
+	}
+	domain := mailbox[at+1:]
+	if i := strings.IndexAny(domain, ";/>"); i >= 0 {
+		domain = domain[:i]
+	}
+	host, port := domain, ""
+	if strings.HasPrefix(domain, "[") {
+		if end := strings.IndexByte(domain, ']'); end >= 0 {
+			host, port = domain[:end+1], domain[end+1:]
+		}
+	} else if i := strings.IndexByte(domain, ':'); i >= 0 {
+		host, port = domain[:i], domain[i:]
+	}
+	if port != "" && (len(port) < 2 || port[0] != ':' || strings.Trim(port[1:], "0123456789") != "") {
+		return "", false
+	}
+	return host, validHost(host)
 }
 
 // LoggedURI returns the URI s as URI.LogValue logs it, for a URI that
