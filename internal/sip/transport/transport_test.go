@@ -582,8 +582,13 @@ func TestProxyLocalHealthCheckIsClosedWithoutAFlow(t *testing.T) {
 	c := dialRaw(t, addr)
 	c.Write(proxyHeader(0x20, 0x00, nil, nil))
 	waitClosed(t, c)
-	eventually(t, "the health check to be counted", func() bool { return server.Stats().HealthChecks == 1 })
-	if s := server.Stats(); s.OpenInbound != 0 || s.PendingAccepted != 0 || s.ProxyHeaderErrors != 0 {
+	// The connection leaves the pending set after the health check is
+	// counted, so wait for the whole picture rather than the first part of it.
+	eventually(t, "the health check to be counted and released", func() bool {
+		s := server.Stats()
+		return s.HealthChecks == 1 && s.PendingAccepted == 0 && s.OpenInbound == 0
+	})
+	if s := server.Stats(); s.ProxyHeaderErrors != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 	rec.none(t)
@@ -668,8 +673,8 @@ func TestNoWaitSendNeverBlocksAndOverflowingTheReserveCloses(t *testing.T) {
 	if err := q.send(NoWait); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.send(NoWait); !errors.Is(err, ErrQueueFull) {
-		t.Fatalf("third send = %v, want ErrQueueFull", err)
+	if err := q.send(NoWait); !errors.Is(err, ErrNoFlow) || errors.Is(err, ErrQueueFull) {
+		t.Fatalf("third send = %v, want ErrNoFlow: the connection was closed", err)
 	}
 	if s := tr.Stats(); s.QueueOverflows != 1 || s.OpenOutbound != 0 {
 		t.Fatalf("stats = %+v", s)

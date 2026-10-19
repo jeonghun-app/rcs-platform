@@ -68,7 +68,9 @@ var (
 	// from an earlier process, or its connection has closed. A proxy answers
 	// a request it cannot forward for this reason with 430 Flow Failed (RFC 5626
 	// §5.3.1). A response to a request from a client-facing listener whose
-	// connection has closed also fails with it.
+	// connection has closed also fails with it, and so does every send after
+	// which the transport closed the connection itself; the error then says
+	// why, and still satisfies errors.Is(err, ErrNoFlow).
 	ErrNoFlow = errors.New("transport: no such flow")
 	// ErrClosed means the transport has been closed.
 	ErrClosed = errors.New("transport: closed")
@@ -83,10 +85,11 @@ var (
 	// ErrTooManyConnections means MaxDialedConnections outbound connections
 	// are open or being opened.
 	ErrTooManyConnections = errors.New("transport: too many outbound connections")
-	// ErrQueueFull means a stream connection's send queue had no room. After
-	// waiting WriteTimeout for room, only that send fails and the connection
-	// stays open, so a TU can answer 503 for a peer that is merely slow; a
-	// NoWait send that does not fit even in the reserve closes the connection.
+	// ErrQueueFull means only that send failed and the connection is still
+	// open: its queue had no room within WriteTimeout, or every queue together
+	// was at MaxQueuedBytes and no stalled connection could be closed to make
+	// room. A TU can answer 503 for a request it could not forward. (When the
+	// transport does close a connection, the error is ErrNoFlow instead.)
 	ErrQueueFull = errors.New("transport: send queue full")
 )
 
@@ -170,9 +173,14 @@ type Config struct {
 	// overrides it per listener.
 	SendQueueBytes int
 	// MaxQueuedBytes bounds the output every send queue holds together. When a
-	// message would take the total past it, the connection holding the most is
-	// closed to make room. Size it, with the limits above, against the task's
-	// memory (see the package documentation).
+	// message would take the total past it, one connection whose peer has
+	// stopped reading is closed to make room: never the sender's own, never one
+	// whose writer made progress in the last second (or half WriteTimeout, if
+	// shorter), and client-facing ones before core ones, fullest relative to
+	// their own limit first. If there is none, that send fails with
+	// ErrQueueFull. It must hold at least one message of the largest size
+	// Limits allow. Size it, with the limits above, against the task's memory
+	// (see the package documentation).
 	MaxQueuedBytes int
 	// DialTimeout bounds opening an outbound connection, TLS handshake
 	// included.
@@ -191,8 +199,13 @@ type Config struct {
 	// OnFlowClosed, if set, is told once about every flow that ends: each
 	// admitted inbound flow (even if its TLS handshake then fails) and each
 	// outbound connection. UDP flows end when they expire, which is noticed on
-	// the next lookup or datagram, when they are displaced, or on Close. It must
-	// not block, and must not call back into the transport synchronously.
+	// the next lookup or datagram, when they are displaced, or on Close.
+	//
+	// Calls run one at a time, in the order the flows ended, on a goroutine of
+	// their own: a flow can end inside any send, with a transaction's lock
+	// held, so a synchronous call could not safely reach back into the
+	// transaction layer. This one may call anything. Close returns once every
+	// call has been made.
 	OnFlowClosed func(id FlowID, info FlowInfo)
 
 	// Dialer opens outbound connections; nil uses a net.Dialer with the core
@@ -302,6 +315,8 @@ type Transport struct {
 	flows   *flowTable
 	stats   counters
 	budget  queueBudget
+	// closures delivers OnFlowClosed; nil when there is none.
+	closures *closureQueue
 
 	mu        sync.Mutex
 	listeners []*listener
@@ -331,6 +346,11 @@ func New(cfg Config, h Handler) (*Transport, error) {
 		return nil, errors.New("transport: nil handler")
 	}
 	cfg = cfg.withDefaults()
+	if maxMsg := largestMessage(cfg.Limits); cfg.MaxQueuedBytes < maxMsg {
+		// A smaller budget could never queue the largest message the limits
+		// allow, even with every queue empty.
+		return nil, fmt.Errorf("transport: MaxQueuedBytes %d is below the largest message, %d bytes", cfg.MaxQueuedBytes, maxMsg)
+	}
 	var key [sha256.Size]byte
 	if _, err := io.ReadFull(cfg.Rand, key[:]); err != nil {
 		return nil, fmt.Errorf("transport: drawing the flow key: %w", err)
@@ -342,6 +362,9 @@ func New(cfg Config, h Handler) (*Transport, error) {
 		pending: make(map[net.Conn]struct{}),
 	}
 	t.budget.max = int64(cfg.MaxQueuedBytes)
+	if cfg.OnFlowClosed != nil {
+		t.closures = newClosureQueue(cfg.OnFlowClosed)
+	}
 	t.flows = newFlowTable(key, cfg.Now, tableConfig{
 		udpTimeout:  cfg.UDPFlowTimeout,
 		maxUDP:      cfg.MaxUDPFlows,
@@ -352,9 +375,80 @@ func New(cfg Config, h Handler) (*Transport, error) {
 }
 
 func (t *Transport) flowClosed(f *flow) {
-	if t.cfg.OnFlowClosed != nil {
-		t.cfg.OnFlowClosed(f.id, f.info())
+	if t.closures != nil {
+		t.closures.add(f.id, f.info())
 	}
+}
+
+// largestMessage is the size of the largest message lim allows.
+func largestMessage(lim sip.Limits) int {
+	h, b := lim.MaxHeaderBytes, lim.MaxBodyBytes
+	if h <= 0 {
+		h = sip.DefaultMaxHeaderBytes
+	}
+	if b <= 0 {
+		b = sip.DefaultMaxBodyBytes
+	}
+	return h + b
+}
+
+// closureQueue delivers OnFlowClosed calls in order on one goroutine.
+type closureQueue struct {
+	call func(FlowID, FlowInfo)
+
+	mu      sync.Mutex
+	pending []closure
+	wake    chan struct{}
+	stopped bool
+	done    chan struct{}
+}
+
+type closure struct {
+	id   FlowID
+	info FlowInfo
+}
+
+func newClosureQueue(call func(FlowID, FlowInfo)) *closureQueue {
+	q := &closureQueue{call: call, wake: make(chan struct{}, 1), done: make(chan struct{})}
+	go q.run()
+	return q
+}
+
+func (q *closureQueue) add(id FlowID, info FlowInfo) {
+	q.mu.Lock()
+	q.pending = append(q.pending, closure{id, info})
+	q.mu.Unlock()
+	notify(q.wake)
+}
+
+func (q *closureQueue) run() {
+	defer close(q.done)
+	for range q.wake {
+		for {
+			q.mu.Lock()
+			if len(q.pending) == 0 {
+				stopped := q.stopped
+				q.mu.Unlock()
+				if stopped {
+					return
+				}
+				break
+			}
+			c := q.pending[0]
+			q.pending = q.pending[1:]
+			q.mu.Unlock()
+			q.call(c.id, c.info)
+		}
+	}
+}
+
+// stop delivers what is pending and waits for the goroutine to end.
+func (q *closureQueue) stop() {
+	q.mu.Lock()
+	q.stopped = true
+	q.mu.Unlock()
+	notify(q.wake)
+	<-q.done
 }
 
 // admit asks Config.Admit about a new inbound flow.
@@ -443,6 +537,9 @@ func (t *Transport) Close() error {
 		t.closeFlow(f)
 	}
 	t.wg.Wait()
+	if t.closures != nil {
+		t.closures.stop()
+	}
 	return errors.Join(errs...)
 }
 
@@ -487,7 +584,9 @@ type Stats struct {
 	WriteErrors        uint64
 	QueueOverflows     uint64 // stream connections closed because a NoWait send overflowed their reserve
 	QueueWaitTimeouts  uint64 // sends that found no queue room within WriteTimeout; the connection stays
-	BudgetSheds        uint64 // stream connections closed to keep all queues within MaxQueuedBytes
+	BudgetSheds        uint64 // stalled connections closed to keep all queues within MaxQueuedBytes
+	BudgetRefusals     uint64 // sends refused, connection kept, because the budget was full and nothing could be shed
+	ResponseFlowCloses uint64 // client-facing flows closed because a response could not be queued
 	KeepAlives         uint64 // CRLF pings answered
 	MalformedDatagrams uint64
 	InvalidMessages    uint64 // framed but refused by Validate; dropped
@@ -498,7 +597,7 @@ type Stats struct {
 type counters struct {
 	accepted, rejected, refused, dialed, dialErrors, dialLimited,
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
-	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, keepAlives,
+	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses atomic.Uint64
 }
 
@@ -532,6 +631,8 @@ func (t *Transport) Stats() Stats {
 		QueueOverflows:     c.queueOverflows.Load(),
 		QueueWaitTimeouts:  c.queueWaitTimeouts.Load(),
 		BudgetSheds:        c.budgetSheds.Load(),
+		BudgetRefusals:     c.budgetRefusals.Load(),
+		ResponseFlowCloses: c.responseFlowCloses.Load(),
 		KeepAlives:         c.keepAlives.Load(),
 		MalformedDatagrams: c.malformedDatagrams.Load(),
 		InvalidMessages:    c.invalidMessages.Load(),

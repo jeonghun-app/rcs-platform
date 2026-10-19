@@ -154,6 +154,15 @@ func (tx *ClientTransaction) State() State {
 // Request returns the request the transaction sent.
 func (tx *ClientTransaction) Request() *sip.Request { return tx.req }
 
+// Network returns the transport the request actually went over, which may be
+// TCP for a large request meant for UDP (RFC 3261 §18.1.1). A proxy needs it, for
+// one, to know whether the downstream hop is reliable without reading the Via.
+func (tx *ClientTransaction) Network() transport.Network {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	return tx.network
+}
+
 // Terminate ends the transaction now, and its handler receives ErrTerminated
 // unless the transaction had already ended; nothing reaches the handler after
 // that. Called from inside the handler, it returns before ErrTerminated is

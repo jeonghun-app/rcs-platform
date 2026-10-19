@@ -160,6 +160,12 @@ func (t *Transport) sendDatagram(l *listener, to netip.AddrPort, b []byte) error
 // Over a live connection SendResponse waits for at most WriteTimeout for room in
 // the send queue, and not at all with NoWait; opening a new connection adds up to
 // DialTimeout. A UDP send does not block.
+//
+// A response that cannot be queued on a client-facing flow closes that flow and
+// fails with ErrNoFlow: the client does not retransmit over TCP or TLS, and would
+// otherwise wait for its transaction to time out. On a core flow it fails with
+// ErrQueueFull and the connection stays, since closing it would fail every other
+// transaction on it; the peer's transaction times out.
 func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOption) error {
 	wait := !noWait(opts)
 	if t.isClosed() {
@@ -174,7 +180,16 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 	}
 	if src.Network.Reliable() {
 		if f := t.flows.lookup(src.Flow); f != nil {
-			return t.writeMessage(f, res, wait)
+			err := t.writeMessage(f, res, wait)
+			if errors.Is(err, ErrQueueFull) && f.lis != nil && f.lis.clientFacing {
+				// Over a reliable transport the client will not retransmit, so a
+				// dropped response would leave it waiting for Timer B or F. Closing
+				// the flow tells it at once; it reconnects (RFC 5626 §4.4).
+				t.stats.responseFlowCloses.Add(1)
+				t.closeFlow(f)
+				return fmt.Errorf("%w: response could not be queued; client flow closed", ErrNoFlow)
+			}
+			return err
 		}
 		if l := t.listenerNamed(src.Listener); l != nil && l.clientFacing {
 			return ErrNoFlow
