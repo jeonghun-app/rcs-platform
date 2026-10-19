@@ -15,10 +15,13 @@ import (
 // redacted forms instead of the exported fields, the same line of defence as
 // messages having no String method.
 //
-// slog applies LogValue only to the value it is handed. A slice of these values,
-// or a struct of the service's own that holds one, reaches the JSON handler
-// through encoding/json, which ignores LogValue and writes every field: log the
-// elements or the fields one by one instead.
+// slog applies LogValue only to the value it is handed. A plain slice of these
+// values, or a struct of the service's own that holds one, reaches the JSON
+// handler through encoding/json, which ignores LogValue and writes every field.
+// So the parsers and accessors return lists as the slice types below (Vias,
+// Contacts, Addresses, Challenges, CredentialsList), which log each element
+// through its LogValue; a service that builds a list of its own logs it as
+// one of them.
 //
 // TODO(#2): pass user parts and numbers through internal/pii once it lands, so
 // operators can correlate the masked form; until then they are left out.
@@ -111,8 +114,40 @@ func (v Via) LogValue() slog.Value {
 // a plain []Via would be logged field by field, received included.
 type Vias []Via
 
+// Contacts is a Contact header's elements, as ParseContacts and
+// Header.Contact return them; logged, each goes through Contact.LogValue.
+type Contacts []Contact
+
+// Addresses is the name-addrs of a header such as Route, Record-Route, Path
+// or P-Asserted-Identity; logged, each goes through Address.LogValue.
+type Addresses []Address
+
+// Challenges is one challenge per WWW-Authenticate or Proxy-Authenticate
+// field; logged, each goes through Challenge.LogValue, nonce left out.
+type Challenges []Challenge
+
+// CredentialsList is one set of credentials per Authorization or
+// Proxy-Authorization field; logged, each goes through Credentials.LogValue,
+// response and nonce left out.
+type CredentialsList []Credentials
+
 // LogValue logs each element by its position, top first.
-func (vs Vias) LogValue() slog.Value {
+func (vs Vias) LogValue() slog.Value { return listValue(vs) }
+
+// LogValue logs each element by its position.
+func (cs Contacts) LogValue() slog.Value { return listValue(cs) }
+
+// LogValue logs each element by its position, top first.
+func (as Addresses) LogValue() slog.Value { return listValue(as) }
+
+// LogValue logs each element by its position.
+func (cs Challenges) LogValue() slog.Value { return listValue(cs) }
+
+// LogValue logs each element by its position.
+func (cs CredentialsList) LogValue() slog.Value { return listValue(cs) }
+
+// listValue is a group of the elements' own log values, keyed by position.
+func listValue[T slog.LogValuer](vs []T) slog.Value {
 	attrs := make([]slog.Attr, len(vs))
 	for i, v := range vs {
 		attrs[i] = slog.Any(strconv.Itoa(i), v)

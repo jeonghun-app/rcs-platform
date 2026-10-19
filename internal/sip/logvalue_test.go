@@ -2,6 +2,7 @@ package sip
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -114,4 +115,70 @@ func mustParseVias(t *testing.T, s string) Vias {
 		t.Fatal(err)
 	}
 	return vias
+}
+
+// slog does not apply LogValue to a slice's elements, so the lists the
+// accessors return must log each element through it (#95). Only the
+// attributes are searched, not the line's time.
+func TestWholeHeaderListsLogTheirElementsRedacted(t *testing.T) {
+	m := mustParse(t, lines(
+		"INVITE sip:bob@ims.example.net SIP/2.0",
+		"Via: SIP/2.0/TCP 198.51.100.7:5060;branch=z9hG4bK1",
+		"From: <sip:alice@ims.example.net>;tag=1",
+		"To: <sip:bob@ims.example.net>",
+		"Call-ID: a@b",
+		"CSeq: 1 INVITE",
+		`Contact: "Alice Secret" <sip:+15550100001@198.51.100.7:5060;transport=tcp>;+sip.instance="<urn:gsma:imei:00101000-000003-1>", <sip:001010000000001@10.20.30.40>`,
+		"Route: <sip:pcscf-1.rcs.internal;lr>, <sip:+15550100002@198.51.100.9;lr>",
+		"Record-Route: <sip:scscf.rcs.internal;lr;secretparam=r0ute>",
+		"Path: <sip:term@pcscf-1.rcs.internal;lr;ob>",
+		"P-Asserted-Identity: <tel:+15550100001>",
+		`Authorization: Digest username="001010000000001@ims.example.net", realm="ims.example.net", nonce="n0nce-value", uri="sip:ims.example.net", response="r3sponse-value"`,
+		`WWW-Authenticate: Digest realm="ims.example.net", nonce="n0nce-value", opaque="0paque"`,
+		"Content-Length: 0",
+	))
+	h := &m.(*Request).Header
+	contacts, err1 := h.Contact()
+	route, err2 := h.Route()
+	rr, err3 := h.RecordRoute()
+	path, err4 := h.Path()
+	pai, err5 := h.PAssertedIdentity()
+	creds, err6 := h.Authorization()
+	chs, err7 := h.WWWAuthenticate()
+	parsed, err8 := ParseContacts("<sip:+15550100003@192.0.2.44>;expires=600")
+	if err := errors.Join(err1, err2, err3, err4, err5, err6, err7, err8); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}})).Info("x", "contacts", contacts, "route", route, "rr", rr, "path", path, "pai", pai,
+		"creds", creds, "challenges", chs, "parsed", parsed)
+	out := buf.String()
+	for _, secret := range []string{
+		"15550100001", "15550100002", "15550100003", "001010000000001", "00101000-000003-1", "Alice Secret",
+		"198.51.100.7", "198.51.100.9", "10.20.30.40", "192.0.2.44", ":5060", "transport", "instance", ";lr", ";ob",
+		"secretparam", "r0ute", "expires", "n0nce-value", "r3sponse-value", "0paque", "term@",
+	} {
+		if strings.Contains(out, secret) {
+			t.Errorf("log contains %q:\n%s", secret, out)
+		}
+	}
+	for _, want := range []string{
+		`"contacts":{"0":{"uri":"sip:***@198.51.100.0/24","tag":""},"1":{"uri":"sip:***@10.20.30.0/24","tag":""}}`,
+		`"route":{"0":{"uri":"sip:pcscf-1.rcs.internal","tag":""},"1":{"uri":"sip:***@198.51.100.0/24","tag":""}}`,
+		`"rr":{"0":{"uri":"sip:scscf.rcs.internal","tag":""}}`,
+		`"path":{"0":{"uri":"sip:***@pcscf-1.rcs.internal","tag":""}}`,
+		`"pai":{"0":{"uri":"tel:***","tag":""}}`,
+		`"creds":{"0":{"scheme":"Digest","realm":"ims.example.net"`,
+		`"challenges":{"0":{"scheme":"Digest","realm":"ims.example.net"`,
+		`"parsed":{"0":{"uri":"sip:***@192.0.2.0/24","tag":""}}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %s:\n%s", want, out)
+		}
+	}
 }
