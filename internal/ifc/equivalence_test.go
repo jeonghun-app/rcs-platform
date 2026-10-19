@@ -1,9 +1,12 @@
 package ifc
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"regexp"
 	"regexp/syntax"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -324,7 +327,9 @@ func TestCompilingIsCheapForPatternsOfNegatedClasses(t *testing.T) {
 	if _, err := Compile([]FilterCriteria{oversized}); err == nil {
 		t.Fatal("oversized pattern accepted")
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	// The race detector slows everything severalfold, and a shared runner
+	// more; only an unloaded run says anything about the bound.
+	if elapsed := time.Since(start); !raceEnabled && elapsed > 20*time.Second {
 		t.Errorf("compiling took %s", elapsed)
 	}
 }
@@ -335,16 +340,18 @@ func TestCompilingIsCheapForPatternsOfNegatedClasses(t *testing.T) {
 func TestWriteTreeKeepsWhatPerlTreesMean(t *testing.T) {
 	for _, src := range []string{`(?m:^a$)`, `a+?b`, `a{2,}?`, `[^\x00-\x{10FFFF}]`, `(?i:k)`, `\Aa\z`} {
 		tree := mustParsePerl(t, src)
-		var b strings.Builder
-		if !writeTree(&b, tree) {
-			t.Fatalf("%q not written", src)
-		}
-		if back := mustParsePerl(t, b.String()); !sameMeaning(back, tree) {
-			t.Errorf("%q written as %q, which means something else", src, b.String())
+		for _, captures := range []bool{false, true} {
+			var b strings.Builder
+			if !writeTree(&b, tree, captures) {
+				t.Fatalf("%q not written", src)
+			}
+			if back := mustParsePerl(t, b.String()); !sameMeaning(back, tree) {
+				t.Errorf("%q written as %q, which means something else", src, b.String())
+			}
 		}
 	}
 	var b strings.Builder
-	if writeTree(&b, mustParsePerl(t, `\ba`)) {
+	if writeTree(&b, mustParsePerl(t, `\ba`), false) {
 		t.Error(`\b written`)
 	}
 }
@@ -352,6 +359,114 @@ func TestWriteTreeKeepsWhatPerlTreesMean(t *testing.T) {
 func mustParsePerl(t *testing.T, src string) *syntax.Regexp {
 	t.Helper()
 	re, err := syntax.Parse(src, syntax.Perl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return re
+}
+
+// TestAlternativesCompileToTheProgramTheParserBuilds checks that writing a
+// tree out costs no instructions: an alternation compiles to as many as Go
+// compiles the same source to, where the two syntaxes read it alike. Capture
+// groups, which the proof falls back to, would add two per alternative,
+// tightening every size and work limit.
+func TestAlternativesCompileToTheProgramTheParserBuilds(t *testing.T) {
+	methods := "INVITE|MESSAGE|OPTIONS|SUBSCRIBE|NOTIFY|PUBLISH|REFER|INFO"
+	var tels, digits []string
+	for i := range 100 {
+		tels = append(tels, fmt.Sprintf(`tel:\+15550100%03d`, i))
+	}
+	for i := 100; i < 400; i++ {
+		digits = append(digits, strconv.Itoa(i))
+	}
+	for _, src := range []string{
+		methods,
+		`urn%3Aurn-7%3A3gpp-service\.ims\.icsi\.oma\.cpm\.(msg|session|largemsg|filetransfer|deferred|systemmsg)`,
+		strings.Join(tels, "|"),
+		strings.Join(digits, "|"),
+		"(INVITE|MESSAGE|OPTIONS|SUBSCRIBE|REFER)",
+	} {
+		budget := MaxSetInstructions
+		got, err := compilePattern("Content", src, 0, &budget)
+		if err != nil {
+			t.Fatalf("%.40q refused: %v", src, err)
+		}
+		prog, err := syntax.Compile(mustParsePerl(t, "(?:"+src+")").Simplify())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.insts != len(prog.Inst) {
+			t.Errorf("%.40q compiles to %d instructions, Go to %d", src, got.insts, len(prog.Inst))
+		}
+	}
+	budget := MaxSetInstructions
+	if got, _ := compilePattern("Content", methods, 0, &budget); got.insts != 60 {
+		t.Errorf("the method alternation compiles to %d instructions, want 60", got.insts)
+	}
+	// 400 two-letter alternatives fit the limit as they do on main.
+	if _, err := compilePattern("Content", strings.Repeat("(ab|cd)", 200), 0, &budget); err != nil {
+		t.Errorf("(ab|cd)×200 refused: %v", err)
+	}
+}
+
+// TestAnOversizedPatternIsRefusedBeforeItIsBuilt pins the size estimate
+// that runs before the tree is written out or compiled: without it, a
+// pattern of chained counted repetitions allocates its whole program first.
+func TestAnOversizedPatternIsRefusedBeforeItIsBuilt(t *testing.T) {
+	src := strings.Repeat("[ab]{1000}", 100)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	budget := MaxSetInstructions
+	_, err := compilePattern("Content", src, 0, &budget)
+	runtime.ReadMemStats(&after)
+	if err == nil || !strings.Contains(err.Error(), "instructions") {
+		t.Fatalf("err = %v, want the size limit", err)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 1<<20 {
+		t.Errorf("refusing it allocated %d KiB", alloc>>10)
+	}
+}
+
+// TestDeeplyNestedAlternativesAreRefusedForTheirNesting checks that a
+// pattern too deep to write out is refused for that, or for its size, not
+// as a change of meaning, and that a moderately deep one is compiled.
+func TestDeeplyNestedAlternativesAreRefusedForTheirNesting(t *testing.T) {
+	nested := func(depth int) string {
+		return strings.Repeat("(a|", depth) + "b" + strings.Repeat(")", depth)
+	}
+	budget := MaxSetInstructions * 10
+	if _, err := compilePattern("Content", nested(200), 0, &budget); err != nil {
+		t.Errorf("depth 200 refused: %v", err)
+	}
+	// The text nests no deeper than the source, so in practice nothing the
+	// parser accepts fails here; if a change to the writer made it deeper,
+	// the error must say so.
+	for depth := 300; depth < 520; depth += 10 {
+		tree, err := syntax.Parse(nested(depth), posixFlags)
+		if err != nil {
+			break // too deep for the parser itself
+		}
+		if _, err := provenText("Content", tree); err != nil {
+			if !strings.Contains(err.Error(), "nests too deeply") {
+				t.Errorf("depth %d: %v, want the nesting limit named", depth, err)
+			}
+		}
+	}
+	// A tree deeper than Go's parser accepts, as only a later change to the
+	// writer could produce, names the nesting limit.
+	deep := &syntax.Regexp{Op: syntax.OpLiteral, Rune: []rune("b")}
+	for range 1100 {
+		deep = &syntax.Regexp{Op: syntax.OpCapture, Sub: []*syntax.Regexp{deep}}
+	}
+	if _, err := provenText("Content", deep); err == nil || !strings.Contains(err.Error(), "nests too deeply") {
+		t.Errorf("1100 nested groups: %v, want the nesting limit named", err)
+	}
+}
+
+func mustParsePOSIX(t *testing.T, src string) *syntax.Regexp {
+	t.Helper()
+	re, err := syntax.Parse(src, posixFlags)
 	if err != nil {
 		t.Fatal(err)
 	}

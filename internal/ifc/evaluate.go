@@ -340,13 +340,9 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if estimateSize(tree) > 4*MaxPatternInstructions {
 		return pattern{}, tooComplex
 	}
-	var b strings.Builder
-	if !writeTree(&b, tree) {
-		return pattern{}, fmt.Errorf("%s cannot be compiled without changing its meaning", name)
-	}
-	body := b.String()
-	if back, err := syntax.Parse(body, syntax.Perl); err != nil || !sameMeaning(back, tree) {
-		return pattern{}, fmt.Errorf("%s cannot be compiled without changing its meaning", name)
+	body, err := provenText(name, tree)
+	if err != nil {
+		return pattern{}, err
 	}
 	expr := body
 	if mode&patternWhole != 0 {
@@ -380,15 +376,42 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	return p, nil
 }
 
+// provenText writes tree out and returns the text once it is shown to parse
+// back to the same meaning. Alternatives are first written as plain groups,
+// which compile to the same program as the parser's own tree; when parsing
+// back factors them into a shape the proof cannot match ("0.|00|0.0"), they
+// are written again as capture groups, which the parser leaves alone, at a
+// cost of two instructions each.
+func provenText(name string, tree *syntax.Regexp) (string, error) {
+	var err error
+	for _, captures := range []bool{false, true} {
+		var b strings.Builder
+		if !writeTree(&b, tree, captures) {
+			break
+		}
+		var back *syntax.Regexp
+		back, err = syntax.Parse(b.String(), syntax.Perl)
+		if err == nil && sameMeaning(back, tree) {
+			return b.String(), nil
+		}
+	}
+	var se *syntax.Error
+	if errors.As(err, &se) && se.Code == syntax.ErrNestingDepth {
+		return "", fmt.Errorf("%s nests too deeply", name)
+	}
+	return "", fmt.Errorf("%s cannot be compiled without changing its meaning", name)
+}
+
 // writeTree writes re in Go's Perl syntax, spelling out what the POSIX parse
 // decided so that nothing depends on flags inherited from the context: a
 // folded literal in (?i:...), a class as its explicit ranges, "." and the
-// anchors in their flag-independent forms, every quantified operand in a
-// group and every alternative in a capture group. Captures do not change
-// whether a pattern matches. It reports false for an operator the POSIX
+// anchors in their flag-independent forms, every quantified operand and
+// every alternation in a group, and, when captures is set, every
+// alternative in a capture group. Captures do not change whether a pattern
+// matches. It reports false for an operator the POSIX
 // parse does not produce. Regexp.String would also do, but it scans the
 // whole Unicode case table for every negated class, milliseconds each.
-func writeTree(b *strings.Builder, re *syntax.Regexp) bool {
+func writeTree(b *strings.Builder, re *syntax.Regexp, captures bool) bool {
 	switch re.Op {
 	case syntax.OpNoMatch:
 		b.WriteString(`[^\x00-\x{10FFFF}]`)
@@ -432,13 +455,13 @@ func writeTree(b *strings.Builder, re *syntax.Regexp) bool {
 		b.WriteString(`(?m:$)`)
 	case syntax.OpCapture:
 		b.WriteString(`(`)
-		if !writeTree(b, re.Sub[0]) {
+		if !writeTree(b, re.Sub[0], captures) {
 			return false
 		}
 		b.WriteString(`)`)
 	case syntax.OpStar, syntax.OpPlus, syntax.OpQuest, syntax.OpRepeat:
 		b.WriteString(`(?:`)
-		if !writeTree(b, re.Sub[0]) {
+		if !writeTree(b, re.Sub[0], captures) {
 			return false
 		}
 		b.WriteString(`)`)
@@ -463,28 +486,28 @@ func writeTree(b *strings.Builder, re *syntax.Regexp) bool {
 			b.WriteString(`?`)
 		}
 	case syntax.OpConcat:
-		b.WriteString(`(?:`)
+		// No group needed: a concatenation binds tighter than "|", and a
+		// quantifier groups its operand itself.
 		for _, sub := range re.Sub {
-			if !writeTree(b, sub) {
+			if !writeTree(b, sub, captures) {
 				return false
 			}
 		}
-		b.WriteString(`)`)
 	case syntax.OpAlternate:
-		// Each alternative is a capture group so that parsing the text
-		// back does not factor or merge the alternatives again, which it
-		// would do differently from the first parse ("0.|00|0.0"); the
-		// proof compares the trees without captures.
 		b.WriteString(`(?:`)
 		for i, sub := range re.Sub {
 			if i > 0 {
 				b.WriteString(`|`)
 			}
-			b.WriteString(`(`)
-			if !writeTree(b, sub) {
+			if captures {
+				b.WriteString(`(`)
+			}
+			if !writeTree(b, sub, captures) {
 				return false
 			}
-			b.WriteString(`)`)
+			if captures {
+				b.WriteString(`)`)
+			}
 		}
 		b.WriteString(`)`)
 	default:
