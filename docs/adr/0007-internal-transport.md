@@ -80,7 +80,9 @@ traffic within an AZ is not assumed to be.
    are now named here.) In `staging`/`prod` internal HTTP clients, `https://`
    ones included, also check the address a name resolves to when they connect
    (`runtime.InternalDialer`) and connect only to RFC 1918 or ULA addresses, so
-   a record in the namespace cannot send a token elsewhere. (Amended in #87.)
+   a record in the namespace cannot send a token elsewhere. The `-healthcheck`
+   probe of a task's own admin port on loopback is not an internal API client
+   and carries no token; it is exempt. (Amended in #87.)
    Operators reach the HSS API only from inside the VPC (a task or an internal
    ALB with TLS); it is never on the public ALB.
 6. Diameter: in `staging`/`prod` every accept rule must restrict `Networks`, and

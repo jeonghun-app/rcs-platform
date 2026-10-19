@@ -66,7 +66,12 @@ type InternalDialer struct {
 
 // DialContext resolves address's host and connects to its private
 // addresses in order, skipping the others. It fails with
-// ErrAddressNotPrivate when there is none; the error names no address.
+// ErrAddressNotPrivate when there is none; the error names no address. The
+// time left (ctx's deadline or Timeout, whichever is sooner) is shared out
+// as net.Dialer shares it: each attempt gets the time left divided by the
+// addresses left, at least two seconds, so that an address that does not
+// answer, such as a stopped task's still in the namespace's records, does
+// not use up the time the next one needs.
 func (d InternalDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -84,24 +89,58 @@ func (d InternalDialer) DialContext(ctx context.Context, network, address string
 			return nil, err
 		}
 	}
+	var private []netip.Addr
+	for _, ip := range addrs {
+		if IsPrivateAddr(ip) {
+			private = append(private, ip.Unmap())
+		}
+	}
+	if len(private) == 0 {
+		return nil, ErrAddressNotPrivate
+	}
+	if d.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.Timeout)
+		defer cancel()
+	}
 	dial := d.Dial
 	if dial == nil {
-		dial = (&net.Dialer{Timeout: d.Timeout}).DialContext
+		dial = (&net.Dialer{}).DialContext
 	}
-	err = ErrAddressNotPrivate
-	for _, ip := range addrs {
-		if !IsPrivateAddr(ip) {
-			continue
-		}
-		conn, dialErr := dial(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+	for i, ip := range private {
+		attempt, cancel := attemptContext(ctx, len(private)-i)
+		conn, dialErr := dial(attempt, network, net.JoinHostPort(ip.String(), port))
+		cancel()
 		if dialErr == nil {
 			return conn, nil
 		}
-		if errors.Is(err, ErrAddressNotPrivate) {
-			err = dialErr // the first real failure says the most
+		if err == nil {
+			err = dialErr // the first failure says the most
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	return nil, err
+}
+
+// minAttempt is the least time an attempt gets while there is that much
+// left, as in net.Dialer.
+const minAttempt = 2 * time.Second
+
+// attemptContext bounds one of left remaining attempts to its share of the
+// time ctx has left.
+func attemptContext(ctx context.Context, left int) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || left <= 1 {
+		return context.WithCancel(ctx)
+	}
+	remaining := time.Until(deadline)
+	share := remaining / time.Duration(left)
+	if share < minAttempt {
+		share = min(minAttempt, remaining)
+	}
+	return context.WithTimeout(ctx, share)
 }
 
 // InServiceNamespace reports whether the DNS name host lies inside

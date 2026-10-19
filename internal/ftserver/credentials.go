@@ -99,8 +99,11 @@ func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration
 	// A transport of its own: the default one has no connection limit and
 	// is shared with whatever else uses it.
 	transport := &http.Transport{
-		Proxy:               nil,
-		DialContext:         dial,
+		Proxy:       nil,
+		DialContext: dial,
+		// A DialContext of its own turns HTTP/2 off unless asked for; an
+		// https HSS keeps it in every environment.
+		ForceAttemptHTTP2:   true,
 		MaxConnsPerHost:     maxConns,
 		MaxIdleConnsPerHost: maxConns,
 		IdleConnTimeout:     90 * time.Second,

@@ -5,12 +5,17 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	goruntime "runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 func listenLoopback(string, string) (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") }
@@ -157,5 +162,59 @@ func TestSweepRunsOnEveryTickAndReportsFailures(t *testing.T) {
 	<-done
 	if f.metric("sweep.failed") < 1 || len(f.h.Logs("sweep failed")) < 1 {
 		t.Fatal("sweep failure not reported")
+	}
+}
+
+// The production wiring, end to end: Run in staging builds the HSS client
+// with runtime.InternalDialer, so an HSS URL that is (or resolves to) a
+// loopback address gets no request and no token, while in test, which runs
+// the HSS on loopback, the same lookup reaches it (#87).
+func TestRunInStagingNeverSendsTheHSSTokenToALoopbackAddress(t *testing.T) {
+	for env, wantReached := range map[runtime.Environment]int{runtime.Staging: 0, runtime.Test: 1} {
+		t.Run(string(env), func(t *testing.T) {
+			var reached atomic.Int32
+			hss := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached.Add(1)
+				http.NotFound(w, r)
+			}))
+			defer hss.Close()
+			cfg, err := configure(with(devEnv, "FT_CREDENTIALS", "hss", "FT_HSS_URL", hss.URL, "FT_HSS_TOKEN", "provisioning-token", "FT_STATIC_USERS", ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := runtimetest.New(t, "ft-server")
+			h.Runtime.Environment = env
+			addr, cancel, done := startRun(t, h, cfg)
+			defer func() { cancel(); <-done }()
+			resp, err := http.Post("http://"+addr+"/ft", "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			var ch digest.Challenge
+			for _, v := range resp.Header.Values("WWW-Authenticate") {
+				if c, err := digest.ParseChallenge(v); err == nil && c.Algorithm == digest.SHA256 {
+					ch = c
+				}
+			}
+			c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: []byte(password), Method: http.MethodPost,
+				URI: "/ft", CNonce: "cnonce-1", NC: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/ft", nil)
+			req.Header.Set("Authorization", c.Header())
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if got := int(reached.Load()); got != wantReached {
+				t.Fatalf("the HSS got %d requests, want %d (status %d)", got, wantReached, resp.StatusCode)
+			}
+			if strings.Contains(h.Output(), "provisioning-token") {
+				t.Fatalf("the token was logged:\n%s", h.Output())
+			}
+		})
 	}
 }

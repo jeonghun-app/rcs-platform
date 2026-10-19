@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPrivateHostsAreRFC1918ULAAndNamesInTheNamespace(t *testing.T) {
@@ -215,5 +216,53 @@ func TestTheInternalDialerConnectsOnlyToPrivateAddresses(t *testing.T) {
 	}
 	if _, err := d.DialContext(context.Background(), "tcp", "no-port"); err == nil {
 		t.Error("an address without a port was dialed")
+	}
+}
+
+// An address that does not answer must leave the next one time to answer:
+// the time left is shared out as net.Dialer shares it (#87 review).
+func TestEachAddressGetsItsShareOfTheDialTime(t *testing.T) {
+	var shares []time.Duration
+	var networks []string
+	d := InternalDialer{
+		Timeout: 6 * time.Second,
+		Lookup: func(_ context.Context, network, _ string) ([]netip.Addr, error) {
+			networks = append(networks, network)
+			return addrs("10.0.0.1", "203.0.113.1", "10.0.0.2"), nil
+		},
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				return nil, errors.New("no deadline")
+			}
+			shares = append(shares, time.Until(deadline))
+			return nil, errNoListener
+		},
+	}
+	start := time.Now()
+	if _, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081"); !errors.Is(err, errNoListener) {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// Two private addresses: the first gets half of 6 s, the second what
+	// is left. The public one is not dialed.
+	if len(shares) != 2 || shares[0] > 3*time.Second || shares[0] < 3*time.Second-elapsed ||
+		shares[1] > 6*time.Second || shares[1] < 6*time.Second-elapsed {
+		t.Fatalf("shares %v in %v, want about 3s then 6s", shares, elapsed)
+	}
+	// Both address families are looked up, so a name with only an AAAA
+	// (ULA) record is reachable.
+	if !slices.Equal(networks, []string{"ip"}) {
+		t.Fatalf("looked up %q, want ip", networks)
+	}
+	// The share never drops below two seconds while that much is left.
+	shares = nil
+	d.Timeout = 3 * time.Second
+	d.Lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		return addrs("10.0.0.1", "10.0.0.2", "10.0.0.3"), nil
+	}
+	_, _ = d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081")
+	if len(shares) != 3 || shares[0] > 2*time.Second || shares[0] < 2*time.Second-time.Second {
+		t.Fatalf("shares %v, want the first about 2s", shares)
 	}
 }
