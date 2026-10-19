@@ -89,6 +89,36 @@ request (RFC 5438). It answers delivery requests at once. Display
 notifications go out when the scenario reads the message, as a user would.
 The rcs-as stand-in answers both at once.
 
+### The SIP client (step 2, in progress)
+
+Step 2 (#135) gives the simulator a SIP client, `internal/sipua`. No scenario
+uses it yet: they come once pcscf and scscf exist. It is built on the
+platform's own `internal/sip/transport` and `internal/sip/transaction`, and
+behaves as a device behind NAT does:
+
+- It opens one TCP or TLS connection to pcscf and never another. If that
+  connection closes, the client fails rather than reconnecting, since a new
+  connection is a new flow the registrar knows nothing of.
+- It registers with SIP outbound (RFC 5626 §4.2): `+sip.instance` and `reg-id`
+  in Contact, `Supported: path, outbound`, and a Route to pcscf alone. The
+  Contact has the connection's address and no user part.
+- Once the registrar's 2xx carries `Require: outbound` (RFC 5626 §4.2.1), it
+  sends CRLF pings. Each interval is drawn anew between 80% and 100% of the
+  registrar's `Flow-Timer`, or of 120 s without one. A pong that takes more
+  than 10 s fails the flow (RFC 5626 §4.4.1), and the client closes the
+  connection.
+- REGISTERs go one at a time: a refresh and a de-registration never overlap
+  on the one Call-ID (RFC 3261 §10.2). The registered identity is a SIP URI
+  (TS 24.229 §5.1.1.2.1).
+- Requests from the network arrive over that same connection.
+- After registration, every request carries the route set of TS 24.229
+  §5.1.2A.1.1: pcscf, then the `Service-Route` of the last 2xx to REGISTER.
+
+Errors carry methods, status codes and fixed reasons, never an identity, an
+address or a Call-ID. Its tests run it against an in-process stand-in for
+pcscf and the registrar. Authentication (Digest and AKA) and INVITE dialogs
+come next.
+
 ## Running it
 
 ```bash
