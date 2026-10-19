@@ -2,9 +2,12 @@ package group
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -135,5 +138,92 @@ func TestOneAddOfTheLongestValuesKeepsTheRosterReadable(t *testing.T) {
 		if _, err := conference.Parse(d); err != nil {
 			t.Fatalf("%d-byte document: %v", len(d), err)
 		}
+	}
+}
+
+// QA's reproduction (PR #118, round 3): with 200 members a roster keeps 9
+// former participants, so once 9 others left, a removed participant was
+// forgotten and any participant could add them back. Those who left are
+// forgotten first, and a removed one forgotten by the roster is still
+// known as removed.
+func TestAForgottenRemovedParticipantStaysRemoved(t *testing.T) {
+	r := newRig(t, Config{MaxParticipants: LimitParticipants})
+	var in []Invitee
+	var ids []string
+	for i := range 30 {
+		ids = append(ids, fmt.Sprintf("sip:u%d@example.net", i))
+		in = append(in, Invitee{Identity: ids[i]})
+	}
+	g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if _, err := r.s.Join(t.Context(), g.URI, id, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mallory := ids[0]
+	if err := r.s.Remove(t.Context(), g.URI, alice, mallory); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids[2:12] {
+		r.clock.Advance(time.Second)
+		if err := r.s.Leave(t.Context(), g.URI, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := r.s.Get(t.Context(), g.URI)
+	if p, ok := got.Participant(mallory); !ok || p.State != groupstore.Removed {
+		t.Fatalf("mallory left the roster before those who left after her: %+v", got.Participants)
+	}
+	if err := r.s.Add(t.Context(), g.URI, ids[1], []Invitee{{Identity: mallory}}); !errors.Is(err, ErrNotChairman) {
+		t.Fatalf("a participant added the removed mallory back: %v", err)
+	}
+	// Remove more than the roster keeps: the removed are dropped from the
+	// roster, and known as removed all the same.
+	for _, id := range ids[12:25] {
+		r.clock.Advance(time.Second)
+		if err := r.s.Remove(t.Context(), g.URI, alice, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ = r.s.Get(t.Context(), g.URI)
+	if _, ok := got.Participant(mallory); ok || !slices.Contains(got.Removed, mallory) {
+		t.Fatalf("roster %d entries, removed %v", len(got.Participants), got.Removed)
+	}
+	for _, id := range []string{mallory, ids[12]} {
+		if err := r.s.Add(t.Context(), g.URI, ids[1], []Invitee{{Identity: id}}); !errors.Is(err, ErrNotChairman) {
+			t.Fatalf("a participant added the removed %s back: %v", id, err)
+		}
+		if ok, _ := r.s.Member(t.Context(), g.URI, id); ok {
+			t.Fatalf("%s is a member", id)
+		}
+	}
+	// The chairman can, and then they are no longer listed as removed.
+	if err := r.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: mallory}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = r.s.Get(t.Context(), g.URI)
+	if slices.Contains(got.Removed, mallory) {
+		t.Fatalf("removed %v", got.Removed)
+	}
+	if _, err := r.s.Join(t.Context(), g.URI, mallory, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The removed identities are bounded too: beyond groupstore.MaxRemoved,
+// the one removed longest ago is forgotten.
+func TestTheRemovedAGroupRemembersAreBounded(t *testing.T) {
+	s := &Service{maxFormer: 0}
+	g := groupstore.Group{}
+	for i := range groupstore.MaxRemoved + 5 {
+		g.Participants = append(g.Participants, groupstore.Participant{Identity: fmt.Sprint("sip:r", i, "@example.net"),
+			State: groupstore.Removed, Since: time.Unix(int64(i), 0)})
+		s.forget(&g)
+	}
+	if len(g.Removed) != groupstore.MaxRemoved || g.Removed[0] != "sip:r5@example.net" || len(g.Participants) != 0 {
+		t.Fatalf("%d removed, first %s, %d entries", len(g.Removed), g.Removed[0], len(g.Participants))
 	}
 }

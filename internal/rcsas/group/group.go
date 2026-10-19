@@ -517,11 +517,13 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 			switch {
 			case i >= 0 && g.Participants[i].State.Active():
 				continue
-			case i >= 0 && g.Participants[i].State == groupstore.Removed && g.Participants[adder].Role != groupstore.Chairman:
+			case (i >= 0 && g.Participants[i].State == groupstore.Removed || slices.Contains(g.Removed, in.Identity)) &&
+				g.Participants[adder].Role != groupstore.Chairman:
 				// Otherwise any participant could undo the chairman's
 				// removal at once (threat model T11).
 				return nil, ErrNotChairman
 			}
+			g.Removed = slices.DeleteFunc(g.Removed, func(id string) bool { return id == in.Identity })
 			name := in.DisplayName
 			switch {
 			case key != "" && names[key] != "" && names[key] != in.Identity:
@@ -680,18 +682,34 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 // forget drops the oldest former participants of g beyond maxFormer of
 // them and returns who it dropped. Without it, adding and removing one
 // stranger after another would grow the stored group, and its roster,
-// without bound.
+// without bound. Those who left go first. A removed one dropped from the
+// roster is still kept in g.Removed, identity only, so that only the
+// chairman can add it back however many leave after it (the roster of a
+// group of 200 keeps only 9 former participants); beyond
+// groupstore.MaxRemoved, the one removed longest ago is forgotten.
 func (s *Service) forget(g *groupstore.Group) []string {
 	var deleted []string
 	for len(g.Participants)-activeCount(g) > s.maxFormer {
 		oldest := -1
-		for i, p := range g.Participants {
-			if !p.State.Active() && (oldest < 0 || p.Since.Before(g.Participants[oldest].Since)) {
-				oldest = i
+		for _, want := range []groupstore.State{groupstore.Left, groupstore.Removed} {
+			for i, p := range g.Participants {
+				if p.State == want && (oldest < 0 || p.Since.Before(g.Participants[oldest].Since)) {
+					oldest = i
+				}
+			}
+			if oldest >= 0 {
+				break
 			}
 		}
-		deleted = append(deleted, g.Participants[oldest].Identity)
+		p := g.Participants[oldest]
+		if p.State == groupstore.Removed {
+			g.Removed = append(g.Removed, p.Identity)
+		}
+		deleted = append(deleted, p.Identity)
 		g.Participants = slices.Delete(g.Participants, oldest, oldest+1)
+	}
+	if n := len(g.Removed) - groupstore.MaxRemoved; n > 0 {
+		g.Removed = slices.Delete(g.Removed, 0, n)
 	}
 	return deleted
 }

@@ -193,7 +193,9 @@ metadata.
   - only joined participants add, and only the chairman removes;
   - someone who left or was removed returns only when added again, and
     someone removed only when the chairman adds them back, so that no
-    participant can undo the chairman's removal;
+    participant can undo the chairman's removal. A removed identity is kept
+    after the roster forgets its entry (up to 200 a group), and the roster
+    forgets those who left first;
   - only current participants read the roster;
   - only joined participants write.
 

@@ -121,6 +121,9 @@ func largestGroup(at time.Time) groupstore.Group {
 			Role: groupstore.Chairman, State: groupstore.Removed, AddedBy: long("sip:adder", messaging.MaxIdentityLength), Since: at,
 		})
 	}
+	for i := range groupstore.MaxRemoved {
+		g.Removed = append(g.Removed, long(fmt.Sprintf("sip:r%d", i), messaging.MaxIdentityLength))
+	}
 	return g
 }
 

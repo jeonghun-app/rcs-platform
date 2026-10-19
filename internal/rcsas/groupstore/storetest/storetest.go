@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,7 +57,7 @@ func equal(t *testing.T, got, want groupstore.Group) {
 	t.Helper()
 	if got.URI != want.URI || got.Conversation != want.Conversation || got.Subject != want.Subject || got.Creator != want.Creator ||
 		got.Version != want.Version || !got.Created.Equal(want.Created) || !got.Active.Equal(want.Active) ||
-		!got.Expires.Equal(want.Expires) || len(got.Participants) != len(want.Participants) {
+		!got.Expires.Equal(want.Expires) || len(got.Participants) != len(want.Participants) || !slices.Equal(got.Removed, want.Removed) {
 		t.Fatalf("got %+v\nwant %+v", got, want)
 	}
 	for i, p := range got.Participants {
@@ -256,6 +257,9 @@ func large(t *testing.T, s groupstore.Store) {
 		g.Participants = append(g.Participants, groupstore.Participant{
 			Identity: id, DisplayName: strings.Repeat("N", 64), Role: groupstore.Member, State: groupstore.Joined, AddedBy: alice, Since: t0,
 		})
+	}
+	for i := range groupstore.MaxRemoved {
+		g.Removed = append(g.Removed, fmt.Sprintf("sip:removed%d@example.net", i))
 	}
 	if err := s.Create(ctx, g, "c1", t0); err != nil {
 		t.Fatal(err)

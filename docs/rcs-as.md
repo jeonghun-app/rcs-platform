@@ -467,7 +467,10 @@ A group keeps at most as many former participants as
 beyond 256 KiB (`conference.MaxDocumentSize`, what `internal/conference` reads
 back). Beyond that, whoever left longest ago leaves the roster, as a
 `state="deleted"` user in the partial document of the change that pushed it
-out.
+out; those who left go before those who were removed. A removed participant
+that leaves the roster is still kept, identity only, in the group's
+`removed` list (up to 200, oldest forgotten first), which is not part of the
+roster: only the chairman adds them back, however many have left since.
 
 The roster's size is bounded by the limits, not checked as it grows, so that no
 Leave or Remove can be refused for it. When the service starts, it builds the
@@ -636,7 +639,8 @@ TTL attribute `ttl`) and no index. Each group is one item:
 | `g#<len>#<conference URI>` | `group` |
 
 - **Contents.** The item holds the subject, creator, Conversation-ID, roster
-  version, times and the participants as a list. A group of 100 is about 15
+  version, times, the participants as a list, and the identities of removed
+  participants the roster no longer lists (`removed`, at most 200). A group of 100 is about 15
   KB, and the item limit is 400 KB. A group holds at most 400 participants,
   current and former, which is about 340 KB with every field at its longest
   (`groupstore.MaxEntries`; `RCSAS_GROUP_MAX_PARTICIPANTS` is therefore at most

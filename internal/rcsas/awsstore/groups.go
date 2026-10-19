@@ -19,7 +19,9 @@ import (
 //
 //	pk g#<len(uri)>#<uri>  sk group
 //
-// holding the participants as a list: groupstore.MaxEntries of them with
+// holding the participants as a list, and the identities of removed ones
+// the roster no longer lists (removed): groupstore.MaxEntries and
+// groupstore.MaxRemoved of them with
 // every field at its longest stay under DynamoDB's 400 KB item limit
 // (TestTheLargestGroupFitsInOneItem). Every change rewrites the
 // item on the condition that its revision (rev) is the one the change was
@@ -42,6 +44,7 @@ const (
 	attrState        = "state"
 	attrAddedBy      = "added_by"
 	attrSince        = "since"
+	attrRemoved      = "removed"
 )
 
 const (
@@ -115,6 +118,13 @@ func encodeGroup(g groupstore.Group, rev int64, token string) map[string]types.A
 		list[i] = &types.AttributeValueMemberM{Value: m}
 	}
 	item[attrParticipants] = &types.AttributeValueMemberL{Value: list}
+	if len(g.Removed) > 0 {
+		removed := make([]types.AttributeValue, len(g.Removed))
+		for i, id := range g.Removed {
+			removed[i] = str(id)
+		}
+		item[attrRemoved] = &types.AttributeValueMemberL{Value: removed}
+	}
 	return item
 }
 
@@ -156,6 +166,16 @@ func decodeGroup(uri string, item map[string]types.AttributeValue) (groupstore.G
 			)
 			p.Role, p.State = groupstore.Role(role), groupstore.State(state)
 			g.Participants = append(g.Participants, p)
+		}
+	}
+	if l, ok := item[attrRemoved].(*types.AttributeValueMemberL); ok {
+		for _, v := range l.Value {
+			id, ok := v.(*types.AttributeValueMemberS)
+			if !ok {
+				err = errors.Join(err, errors.New("removed identity is not a string"))
+				continue
+			}
+			g.Removed = append(g.Removed, id.Value)
 		}
 	}
 	if err != nil {

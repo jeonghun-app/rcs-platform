@@ -87,6 +87,9 @@ type Participant struct {
 	Since time.Time
 }
 
+// MaxRemoved is the most identities one group keeps in Group.Removed.
+const MaxRemoved = 200
+
 // MaxEntries is the most participants, current and former, one group
 // holds. Every backend must store a group of this many with every field
 // at its longest: in DynamoDB that is the whole roster in one item, under
@@ -105,6 +108,11 @@ type Group struct {
 	// recent former ones, in the order they were added; former ones stay,
 	// so that the roster can say they left, up to MaxEntries in all.
 	Participants []Participant
+	// Removed are identities the chairman removed that Participants no
+	// longer lists, oldest first, up to MaxRemoved: the roster forgets
+	// former participants, but who was removed stays known, so that only
+	// the chairman adds them back. They are not part of the roster.
+	Removed []string
 	// Version is the conference-info version of the last roster change
 	// (RFC 4575 §4.3), one more with every change.
 	Version uint32
@@ -130,6 +138,7 @@ func (g Group) Participant(identity string) (Participant, bool) {
 // Clone returns a copy of g that shares no memory with it.
 func (g Group) Clone() Group {
 	g.Participants = slices.Clone(g.Participants)
+	g.Removed = slices.Clone(g.Removed)
 	return g
 }
 
