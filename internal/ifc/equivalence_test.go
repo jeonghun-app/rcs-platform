@@ -290,6 +290,34 @@ func TestAFoldedAlternationThatMergesIntoOneRuneIsCompiled(t *testing.T) {
 	}
 }
 
+// Case pairs on adjacent code points (Ā and ā, U+0100 and U+0101), which
+// the parser merges into one range, compile in every mode and mean what
+// POSIX says when case counts (#206 review).
+func TestAlternativesOfAdjacentCasePairsAreCompiled(t *testing.T) {
+	for _, p := range []string{"|Ā|ā", "|ā|[Ā]", "Ā|[ā]|", "[Ā]|[ā]|", "(Ā|ā)x"} {
+		ref, err := regexp.CompilePOSIX(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, mode := range []patternMode{0, patternFoldCase, patternFoldCase | patternWhole} {
+			budget := MaxSetInstructions
+			got, err := compilePattern("Pattern", p, mode, &budget)
+			if err != nil {
+				t.Errorf("%q (mode %d) refused: %v", p, mode, err)
+				continue
+			}
+			if mode != 0 {
+				continue
+			}
+			for _, v := range []string{"", "Āx", "āx", "x", "Ax", "ā"} {
+				if got.re.MatchString(v) != ref.MatchString(v) {
+					t.Errorf("%q on %q: %t, POSIX %t", p, v, got.re.MatchString(v), ref.MatchString(v))
+				}
+			}
+		}
+	}
+}
+
 // The meaning check takes a class of one rune for that rune's literal, and
 // nothing wider: a class of two runes, or a folded literal against a class
 // missing one of its case variants, still differs.
@@ -309,6 +337,8 @@ func TestTheMeaningCheckTakesAOneRuneClassForItsLiteralOnly(t *testing.T) {
 		{"[01] and 0", class('0', '0', '1', '1'), lit(0, '0'), false},
 		{"[a] and folded a", class('a', 'a'), lit(syntax.FoldCase, 'a'), false},
 		{"[Aa] and folded a", class('A', 'A', 'a', 'a'), lit(syntax.FoldCase, 'a'), true},
+		{"[Ā-ā] and folded ā", class('Ā', 'ā'), lit(syntax.FoldCase, 'ā'), true},
+		{"[Ā] and folded ā", class('Ā', 'Ā'), lit(syntax.FoldCase, 'ā'), false},
 	} {
 		if got := sameMeaning(tc.a, tc.b); got != tc.want {
 			t.Errorf("%s: sameMeaning = %t, want %t", tc.name, got, tc.want)

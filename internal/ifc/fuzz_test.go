@@ -64,6 +64,11 @@ func FuzzEvaluateTrigger(f *testing.F) {
 	f.Add(uint8(3), "", "", "OPTIONS", "", "", "", "")
 	f.Add(uint8(2), "Subject", `[\.]com|\x41`, "MESSAGE", "sip:a@b", "Subject", `\com`, "")
 	f.Add(uint8(4), "[]^[:alpha:]]", "[[.a.]]|[[=a=]]|[^]a[]", "INVITE", "", "", "", "m=]")
+	// Case pairs on adjacent code points, which the parser merges into
+	// one range (#206 review).
+	f.Add(uint8(2), "Subject", "|Ā|ā", "MESSAGE", "sip:a@b", "Subject", "ā", "")
+	f.Add(uint8(2), "Subject", "|ā|[Ā]", "MESSAGE", "sip:a@b", "Subject", "Ā", "")
+	f.Add(uint8(0), "[Ā]|[ā]|", "", "INVITE", "sip:ā@b", "", "", "")
 	f.Fuzz(func(t *testing.T, kind uint8, p1, p2, method, uri, name, value, line string) {
 		var c Condition
 		switch kind % 5 {
