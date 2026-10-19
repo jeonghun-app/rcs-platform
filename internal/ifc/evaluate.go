@@ -67,18 +67,20 @@ const (
 	// units counted rather than timed, so the same profile is accepted or
 	// refused on every host (see patternCost for what a pattern costs).
 	// Patterns near MaxPatternBytes fit the instruction budget in dozens,
-	// and 47 of them took about half a second (#111). On a 32-core
-	// development host under a load of 50 to 150, sets at the bound of
-	// each of twelve shapes took 5 to 37 ms to compile, the baseline shape
-	// (case-folded negated classes) 31 to 35 ms in the same runs, and no
-	// shape more than 1.1 times the baseline; times on another host, or
-	// under other load, differ, and the HSS compiles a profile several
-	// times per write. The default RCS profile costs about 21 000 units.
-	// Compile refuses a set that costs more,
-	// before parsing the pattern that would cross the bound when its
-	// source alone does; at most one pattern's work, which MaxPatternBytes
-	// bounds, is spent past it.
-	MaxSetCompileCost = 500_000
+	// and 47 of them took about half a second (#111); now the tenth is
+	// refused. A profile of MaxCriteria ordinary RCS criteria costs about
+	// 921 000 units, and the default RCS profile about 21 000. Measured on
+	// a 32-core development host at load 140 to 230, a set at the bound of
+	// the baseline shape (case-folded negated classes, 4 KiB) took 39 to
+	// 48 ms of CPU, 33 to 70 ms of wall time; sets of other 4 KiB shapes
+	// took about 1.1 times as long as the baseline's in the same run or
+	// less, and sets of hundreds of short patterns about 2 to 2.3 times.
+	// Other hosts and loads differ, and the HSS compiles a profile several
+	// times on each write (once, after #120). Compile refuses a set that costs more, before parsing the
+	// pattern that would cross the bound when its source alone does; at
+	// most one pattern's work, which MaxPatternBytes bounds, is spent past
+	// it.
+	MaxSetCompileCost = 1_000_000
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
 	// repetition ("{n}") is what multiplies the size.
@@ -260,42 +262,41 @@ type setBudget struct{ insts, cost int }
 // whose source alone exceeds what is left of the cost budget is refused
 // before it is parsed.
 func (b *setBudget) compile(name, source string, mode patternMode) (pattern, error) {
-	p, _, err := b.compileUnlessAny(name, source, mode, false)
-	return p, err
+	return b.charged(name, source, mode, false)
 }
 
 // compileContent compiles a Content pattern of the set as compile does,
 // unless it matches every value (empty, or ".*"), which is the same as no
-// Content: then any is true and only its parse, the source cost, is
-// charged. The pattern is parsed once either way, so every parse is
-// pre-checked and paid for (#115).
-func (b *setBudget) compileContent(name, source string) (p pattern, any bool, err error) {
-	return b.compileUnlessAny(name, source, 0, true)
+// Content: then it returns the zero pattern, no condition, and only its
+// parse, the source cost, is charged. The pattern is parsed once either
+// way, so every parse is pre-checked and paid for (#115).
+func (b *setBudget) compileContent(name, source string) (pattern, error) {
+	return b.charged(name, source, 0, true)
 }
 
-func (b *setBudget) compileUnlessAny(name, source string, mode patternMode, content bool) (pattern, bool, error) {
+func (b *setBudget) charged(name, source string, mode patternMode, content bool) (pattern, error) {
 	// A pattern over MaxPatternBytes is refused by parsePattern, naming
 	// that limit, before anything is parsed.
 	if len(source) <= MaxPatternBytes && sourceCost(len(source)) > b.cost {
-		return pattern{}, false, b.exceeded()
+		return pattern{}, b.exceeded()
 	}
 	tree, err := parsePattern(name, source, mode)
 	if err != nil {
-		return pattern{}, false, err
+		return pattern{}, err
 	}
 	if content && tree.Op == syntax.OpEmptyMatch {
 		b.cost -= sourceCost(len(source))
-		return pattern{}, true, nil
+		return pattern{}, nil
 	}
 	p, err := buildPattern(name, source, tree, mode, &b.insts)
 	if err != nil {
-		return pattern{}, false, err
+		return pattern{}, err
 	}
 	if p.cost > b.cost {
-		return pattern{}, false, b.exceeded()
+		return pattern{}, b.exceeded()
 	}
 	b.cost -= p.cost
-	return p, false, nil
+	return p, nil
 }
 
 func (b *setBudget) exceeded() error {
@@ -340,14 +341,14 @@ func compileSPT(spt *SPT, b *setBudget) (compiledSPT, error) {
 		// Accept-Contact or Reject-Contact. Values are matched as written,
 		// anywhere in the value, as Annex F's regexec semantics give.
 		if c.name, err = b.compile("Header", v.Header, patternFoldCase|patternWhole); err == nil {
-			c.value, _, err = b.compileContent("Content", v.Content)
+			c.value, err = b.compileContent("Content", v.Content)
 		}
 	case SessionCase:
 		c.kind, c.session = kindSessionCase, v
 	case SessionDescription:
 		c.kind = kindSessionDescription
 		if c.name, err = b.compile("Line", v.Line, 0); err == nil {
-			c.value, _, err = b.compileContent("Content", v.Content)
+			c.value, err = b.compileContent("Content", v.Content)
 		}
 	}
 	return c, err

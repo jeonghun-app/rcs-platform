@@ -971,7 +971,7 @@ func TestAPatternTheCostBudgetCannotPayForIsRefusedBeforeItIsParsed(t *testing.T
 	}
 	// So is a Content that would match every value.
 	b = setBudget{insts: MaxSetInstructions, cost: 1000}
-	if _, _, err := b.compileContent("Content", strings.Repeat("|", 500)); err == nil || b.cost != 1000 {
+	if _, err := b.compileContent("Content", strings.Repeat("|", 500)); err == nil || b.cost != 1000 {
 		t.Fatalf("a Content matching everything: %v, %d left", err, b.cost)
 	}
 }
@@ -1085,6 +1085,57 @@ func TestTheCostModelChargesEveryShapeAtLeastItsShareOfTheWork(t *testing.T) {
 		got := cost(SIPHeader{Header: "S", Content: tc.content})
 		if float64(got) < tc.share*float64(base) {
 			t.Errorf("%s: %d units, %.2f of the baseline's %d, want at least %.2f", tc.name, got, float64(got)/float64(base), base, tc.share)
+		}
+	}
+}
+
+// A profile of MaxCriteria (64) ordinary RCS criteria, each with six short
+// patterns, fits every other limit (MaxSPTs, MaxSetInstructions, and the
+// HSS's MaxDocumentSize at 65 KB of JSON) and must compile (QA's test from
+// the review of #115; it costs about 921 000 units).
+func TestAnOrdinaryProfileOfSixtyFourCriteriaCompiles(t *testing.T) {
+	var cs []FilterCriteria
+	for i := range 64 {
+		icsi := strings.ReplaceAll(rcsICSIs[i%len(rcsICSIs)], ".", `\.`)
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+			{Groups: []int{0}, Condition: Method("INVITE")},
+			{Groups: []int{0}, Condition: Method("MESSAGE")},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Contact", Content: `.*\+g\.3gpp\.icsi-ref="urn%3Aurn-7%3A3gpp-service\.ims\.icsi\.` + icsi + `".*`}},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `.*` + icsi + `.*`}},
+			{ConditionNegated: true, Groups: []int{2}, Condition: SIPHeader{Header: "P-Served-User"}},
+			{Groups: []int{3}, Condition: RequestURI(`^(sip|tel):\+?[0-9]{6,15}(@ims\.mnc001\.mcc001\.3gppnetwork\.org)?(;.*)?$`)},
+			{Groups: []int{3}, Condition: SIPHeader{Header: "(Accept|Reject)-Contact", Content: `.*\+g\.3gpp\.icsi-ref="[^"]*(oma\.cpm\.(msg|largemsg|session|filetransfer)|gsma\.rcs\.(chatbot|botversion))[^"]*".*`}},
+			{Groups: []int{4}, Condition: SessionDescription{Line: "m", Content: `^(message|audio|video) [0-9]+ (TCP|TCP/TLS)/MSRP \*`}},
+		}}))
+	}
+	if _, err := Compile(cs); err != nil {
+		t.Fatalf("64 ordinary criteria refused: %v", err)
+	}
+}
+
+// A set that costs exactly what is left fits: the bound refuses only what
+// costs more, both before the parse and after the compile.
+func TestAPatternThatCostsExactlyWhatIsLeftFits(t *testing.T) {
+	budget := MaxSetInstructions
+	p, err := compilePattern("Content", "abc", 0, &budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for left, fits := range map[int]bool{p.cost: true, p.cost - 1: false} {
+		b := setBudget{insts: MaxSetInstructions, cost: left}
+		_, err := b.compile("Content", "abc", 0)
+		if fits && (err != nil || b.cost != 0) || !fits && err == nil {
+			t.Errorf("abc (%d units) with %d left: %v, %d left after", p.cost, left, err, b.cost)
+		}
+	}
+	// A Content matching every value costs its source alone, which the
+	// check before the parse compares.
+	any := strings.Repeat("|", 100)
+	for left, fits := range map[int]bool{sourceCost(len(any)): true, sourceCost(len(any)) - 1: false} {
+		b := setBudget{insts: MaxSetInstructions, cost: left}
+		_, err := b.compileContent("Content", any)
+		if fits && (err != nil || b.cost != 0) || !fits && err == nil {
+			t.Errorf("100 bars (%d units) with %d left: %v, %d left after", sourceCost(len(any)), left, err, b.cost)
 		}
 	}
 }
