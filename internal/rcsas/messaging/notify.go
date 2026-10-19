@@ -38,6 +38,11 @@ func (e *Engine) submitNotification(ctx context.Context, o Origin, m *Message, n
 	if err != nil {
 		return err
 	}
+	if sent.Group != "" {
+		// About a group message: matched and marked in the group.
+		g := GroupOrigin{Group: sent.Group, Sender: o.Sender, Identities: o.Identities, Conversation: o.Conversation, CPIM: o.CPIM}
+		return e.submitGroupNotification(ctx, nil, g, m, o.Recipient, now)
+	}
 	switch {
 	case slices.Contains(sent.Recipients, o.Sender):
 	case slices.Contains(e.cfg.Intermediaries, o.Sender) && intermediaryMay(n.Kind, n.Status):
@@ -204,8 +209,14 @@ func (e *Engine) notification(m store.Message, d disposition, id string, now tim
 	if err != nil {
 		return store.Message{}, err
 	}
+	// It goes to whoever wrote m, from m's recipient. In a group that is
+	// m's author, in the author's session with the group.
+	to, sender, author := m.Sender, m.Recipient, ""
+	if m.Mode == store.Group {
+		to, sender, author = m.Author, m.Sender, m.Recipient
+	}
 	out, err := n.Message(imdn.Envelope{
-		From: cpim.Address{URI: m.Recipient}, To: cpim.Address{URI: m.Sender},
+		From: cpim.Address{URI: m.Recipient}, To: cpim.Address{URI: to},
 		Route: route, MessageID: mid, DateTime: now,
 	})
 	if err != nil {
@@ -216,7 +227,7 @@ func (e *Engine) notification(m store.Message, d disposition, id string, now tim
 		return store.Message{}, err
 	}
 	return store.Message{
-		Recipient: m.Sender, ID: id, Sender: m.Recipient,
+		Recipient: to, ID: id, Sender: sender, Author: author,
 		Conversation: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo,
 		Mode: m.Mode, Notification: true, CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
 	}, nil

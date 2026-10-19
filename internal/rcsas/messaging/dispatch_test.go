@@ -499,7 +499,8 @@ func TestOneSenderCannotLockOthersOutOfAQueue(t *testing.T) {
 	if r.m.get("message.rejected.queue_share_full") != 1 || r.m.get("message.rejected.queue_full") != 0 {
 		t.Fatalf("metrics %v", r.m)
 	}
-	if got := queueLimit(r.e.cfg); got != (store.Limit{Count: 8, Bytes: DefaultMaxQueueBytes, SenderCount: 2, SenderBytes: DefaultMaxQueueBytes / 4}) {
+	if got := queueLimit(r.e.cfg); got != (store.Limit{Count: 8, Bytes: DefaultMaxQueueBytes, SenderCount: 2, SenderBytes: DefaultMaxQueueBytes / 4,
+		GroupCount: 2, GroupBytes: DefaultMaxQueueBytes / 4}) {
 		t.Fatalf("limit %+v", got)
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
@@ -31,6 +32,7 @@ const (
 const (
 	DefaultMSRPListenAddr = ":2855"
 	DefaultTable          = "messages"
+	DefaultGroupsTable    = "groupchats"
 )
 
 // Config is rcs-as's configuration.
@@ -42,6 +44,11 @@ type Config struct {
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
 	// are left for the service to set.
 	Messaging messaging.Config
+	// GroupsTable is the groupchats table, with RCSAS_STORE=dynamodb.
+	GroupsTable string
+	// Group is the group chat focus's configuration; its Clock and Rand
+	// are left for the service to set.
+	Group group.Config
 }
 
 // Configure reads the RCSAS_ settings and refuses the ones unsafe with more
@@ -156,7 +163,53 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("STORE", "must be memory or dynamodb")
 	}
 	s.ForbidInProduction(c.DynamoDB.Endpoint != "", "RCSAS_DYNAMODB_ENDPOINT replaces the AWS endpoint")
+	c.GroupsTable = e.String("GROUPCHATS_TABLE", DefaultGroupsTable)
+	maxParticipants := e.Int("GROUP_MAX_PARTICIPANTS", group.DefaultMaxParticipants)
+	addRate := messaging.Rate{PerMinute: group.DefaultAddRate.PerMinute, Burst: group.DefaultAddBurst(maxParticipants)}
+	c.Group = group.Config{
+		ConferenceHost:  e.RequiredString("CONFERENCE_HOST"),
+		MaxParticipants: maxParticipants,
+		IdleTTL:         e.Duration("GROUP_IDLE_TTL", group.DefaultIdleTTL),
+		SenderRate:      readRate(e, "GROUP_SENDER", group.DefaultSenderRate),
+		FanoutRate: readRate(e, "GROUP_FANOUT",
+			messaging.Rate{PerMinute: group.DefaultFanoutRate.PerMinute, Burst: group.DefaultFanoutBurst(maxParticipants)}),
+		AddRate:    readRate(e, "GROUP_ADD", addRate),
+		CreateRate: readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
+	}
+	positive(e, "GROUP_MAX_PARTICIPANTS", c.Group.MaxParticipants)
+	if c.Group.MaxParticipants > group.LimitParticipants {
+		e.Invalid("GROUP_MAX_PARTICIPANTS", "above "+strconv.Itoa(group.LimitParticipants)+", the most one stored group holds")
+	}
+	if c.Group.IdleTTL <= 0 {
+		e.Invalid("GROUP_IDLE_TTL", "must be positive")
+	}
+	if r := c.Group.FanoutRate; r.PerMinute > 0 && r.Burst/group.FanoutSenderShare < group.FanoutSenderMessages*(c.Group.MaxParticipants-1) {
+		// One sender may use a quarter of the budget, which must still
+		// carry a few messages in a row to a full group.
+		e.Invalid("GROUP_FANOUT_BURST", "a quarter of it does not cover "+strconv.Itoa(group.FanoutSenderMessages)+
+			" messages to a full group (RCSAS_GROUP_MAX_PARTICIPANTS - 1 each)")
+	}
+	if r := c.Group.AddRate; r.PerMinute > 0 && r.Burst < c.Group.MaxParticipants-1 {
+		// Otherwise a full group could never be created.
+		e.Invalid("GROUP_ADD_BURST", "smaller than a full group's invitees (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
+	}
 	return c
+}
+
+// readRate reads <prefix>RATE and <prefix>BURST; a rate of 0 turns the
+// limit off, which the packages spell as a negative rate.
+func readRate(e *runtime.Env, prefix string, def messaging.Rate) messaging.Rate {
+	r := messaging.Rate{PerMinute: e.Int(prefix+"_RATE", def.PerMinute), Burst: e.Int(prefix+"_BURST", def.Burst)}
+	if r.Burst < 0 {
+		e.Invalid(prefix+"_BURST", "must not be negative")
+	}
+	switch {
+	case r.PerMinute < 0:
+		e.Invalid(prefix+"_RATE", "must not be negative")
+	case r.PerMinute == 0:
+		r.PerMinute = -1
+	}
+	return r
 }
 
 func positive(e *runtime.Env, name string, v int) {

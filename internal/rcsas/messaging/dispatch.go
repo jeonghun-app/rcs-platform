@@ -272,7 +272,7 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 				return res
 			case skip:
 				res.skipped = true
-				if m.Mode == store.Chat || m.Notification {
+				if sessionBound(m) {
 					waited[m.Sender] = true
 				}
 			case whole:
@@ -307,7 +307,7 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map
 			return res
 		case skip:
 			res.skipped = true
-			if m.Mode == store.Chat || m.Notification {
+			if sessionBound(m) {
 				res.waited[m.Sender] = true
 			}
 		}
@@ -323,6 +323,9 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map
 // behind says older messages from m's sender wait for a chat leg: if one
 // is open now, m is not sent ahead of them (whole).
 func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outcome {
+	if m.Mode == store.Group {
+		return e.deliverGroup(ctx, m, behind)
+	}
 	fits := len(m.CPIM) <= e.cfg.PagerLimit
 	if m.Mode == store.Chat || m.Notification {
 		if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
@@ -352,6 +355,79 @@ func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outc
 	}
 	e.invite(ctx, m)
 	return skip
+}
+
+// sessionBound reports whether m waits for a session with its sender: a
+// chat or group message, or a notification.
+func sessionBound(m store.Message) bool {
+	return m.Mode == store.Chat || m.Mode == store.Group || m.Notification
+}
+
+// deliverGroup makes one attempt at a group message or notification: on
+// the recipient's open session with the group, or by asking the SIP layer
+// to bring the recipient back into the group. Pager mode is never used: a
+// group message out of the group's session would reach a client that
+// cannot place it in the group (RCC.07 Group Chat). Messages for a client
+// that takes no sessions wait until it opens one itself.
+//
+// Before inviting, and for a recipient that left the group on this task
+// (ParticipantLeft) whether its session is still open or not, the
+// GroupHandler says whether the recipient is still a participant: if not,
+// the message is given up, so that a copy queued before someone left or
+// was removed neither reaches them nor brings them back, at every retry,
+// into a group they are not in.
+func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool) outcome {
+	key := legKey{m.Recipient, m.Sender}
+	asked := false
+	if e.hasDeparted(key) {
+		if o, member := e.stillMember(ctx, m); !member {
+			return o
+		}
+		// Added again since: the mark is stale.
+		e.ParticipantAdded(m.Sender, m.Recipient)
+		asked = true
+	}
+	if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
+		if behind {
+			return whole
+		}
+		return e.viaLeg(ctx, l, m)
+	}
+	e.mu.Lock()
+	_, pagerOnly := e.pagerOnly[m.Recipient]
+	e.mu.Unlock()
+	if pagerOnly || !e.inviteDue(m) {
+		return skip
+	}
+	if !asked {
+		if o, member := e.stillMember(ctx, m); !member {
+			return o
+		}
+	}
+	e.invite(ctx, m)
+	return skip
+}
+
+// stillMember asks the GroupHandler whether m's recipient is still a
+// participant of m's group, and gives m up if not. When it is not, or
+// cannot tell, it returns the outcome of the attempt.
+func (e *Engine) stillMember(ctx context.Context, m store.Message) (outcome, bool) {
+	h := e.groupHandler()
+	if h == nil {
+		return skip, false
+	}
+	member, err := h.Member(ctx, m.Sender, m.Recipient)
+	switch {
+	case err != nil:
+		e.storeFailed("group member", m.Recipient, err)
+		return skip, false
+	case !member:
+		if c, ok := e.claim(ctx, m); ok {
+			e.giveUp(c, "delivery.not_participant")
+		}
+		return done, false
+	}
+	return done, true
 }
 
 // chatLeg returns the newest open chat leg of user with peer.
@@ -461,10 +537,8 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 	return stop
 }
 
-// invite asks for a session to deliver m on, unless one was asked for
-// within InviteTimeout: a chat session for a chat message, a large-mode
-// session for this message alone for a standalone one.
-func (e *Engine) invite(ctx context.Context, m store.Message) {
+// invitation is the session m waits for, and its key in e.invites.
+func invitation(m store.Message) (Invitation, inviteKey) {
 	inv := Invitation{
 		Recipient: m.Recipient, Peer: m.Sender, Mode: m.Mode,
 		Conversation: Conversation{ID: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo},
@@ -472,7 +546,24 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 	if m.Mode == store.Standalone {
 		inv.QueueID = m.ID
 	}
-	key := inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
+	return inv, inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
+}
+
+// inviteDue reports whether invite would ask for m's session now, none
+// having been asked for within InviteTimeout.
+func (e *Engine) inviteDue(m store.Message) bool {
+	_, key := invitation(m)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	until, ok := e.invites[key]
+	return !ok || !e.clock.Now().Before(until)
+}
+
+// invite asks for a session to deliver m on, unless one was asked for
+// within InviteTimeout: a chat session for a chat message, a large-mode
+// session for this message alone for a standalone one.
+func (e *Engine) invite(ctx context.Context, m store.Message) {
+	inv, key := invitation(m)
 	now := e.clock.Now()
 	e.mu.Lock()
 	if until, ok := e.invites[key]; ok && now.Before(until) {
