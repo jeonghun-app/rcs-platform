@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+
+	"github.com/jeonghun-app/rcs-platform/internal/pii"
 )
 
 // The session-id in an MSRP URI is the only secret that ties a connection
@@ -18,16 +20,37 @@ import (
 const redacted = "[redacted]"
 
 // Redacted returns u as String does, but with the session-id and any
-// userinfo replaced by a placeholder.
+// userinfo replaced by a placeholder, an IP address host logged as its
+// network only, and no parameters after the transport.
+//
+// A client's a=path names the UE's own address, which is personal data
+// whatever its range (#36, #80): only its /24 or /48 is logged, without the
+// port, by the rule sip's hosts follow (pii.TruncateIP). A host name is
+// kept, with its port, and any long digit run in it masked like other text.
+// The parameters are the client's own text, which could name the address
+// again, and sip's log values leave theirs out too.
 func (u URI) Redacted() string {
 	v := u
+	v.Params = nil
 	if v.SessionID != "" {
 		v.SessionID = redacted
 	}
 	if v.User != "" {
 		v.User = redacted
 	}
+	if ipHost(v.Host) {
+		v.Host, v.Port = pii.TruncateIP(v.Host), 0
+	} else {
+		v.Host = pii.Redact(v.Host)
+	}
 	return v.String()
+}
+
+// ipHost reports whether host is an IP address rather than a name: an IPv6
+// address (Host holds it without brackets), or digits and dots only, which
+// pii.TruncateIP reads as an IPv4 address or masks whole.
+func ipHost(host string) bool {
+	return strings.IndexByte(host, ':') >= 0 || host != "" && strings.Trim(host, "0123456789.") == ""
 }
 
 // LogValue implements slog.LogValuer with the redacted form.
