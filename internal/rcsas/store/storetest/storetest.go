@@ -51,6 +51,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("SentRecordsAreKeptUntilTheyExpire", func(t *testing.T) { sent(t, newStore(t)) })
 	t.Run("RepeatedWritesSucceed", func(t *testing.T) { retriedWrites(t, newStore(t)) })
 	t.Run("QueuesAreBoundedByCountAndBytes", func(t *testing.T) { limits(t, newStore(t)) })
+	t.Run("EachSenderHasAShareOfAQueue", func(t *testing.T) { senderShares(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 }
@@ -327,6 +328,43 @@ func limits(t *testing.T, s store.Store) {
 	}
 	if err := s.Enqueue(ctx, message(alice, "0001", t0), store.Limit{Bytes: size - 1}); !errors.Is(err, store.ErrQueueFull) {
 		t.Fatalf("a message larger than the whole bound = %v", err)
+	}
+}
+
+func senderShares(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	from := func(sender, id string) store.Message {
+		m := message(bob, id, t0)
+		m.Sender = sender
+		return m
+	}
+	l := store.Limit{Count: 10, SenderCount: 2}
+	for _, id := range []string{"0001", "0002"} {
+		if err := s.Enqueue(ctx, from(alice, id), l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Enqueue(ctx, from(alice, "0003"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond alice's share = %v", err)
+	}
+	// Another sender still gets through.
+	if err := s.Enqueue(ctx, from(carol, "0004"), l); err != nil {
+		t.Fatalf("carol = %v", err)
+	}
+	// A removal gives alice room again.
+	held, err := s.Claim(ctx, bob, "0001", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, held, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, from(alice, "0005"), l); err != nil {
+		t.Fatalf("alice after a removal = %v", err)
+	}
+	size := from(alice, "x").Size()
+	if err := s.Enqueue(ctx, from(carol, "0006"), store.Limit{SenderBytes: 2*size - 1}); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond carol's bytes = %v", err)
 	}
 }
 

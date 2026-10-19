@@ -31,6 +31,10 @@ const (
 	// ReasonQueueFull: the recipient's queue holds as many messages or
 	// bytes as it may (Config.MaxQueueMessages, MaxQueueBytes).
 	ReasonQueueFull Reason = "queue_full"
+	// ReasonQueueShareFull: the sender holds as much of the recipient's
+	// queue as one sender may (Config.QueueSenderShare); others still get
+	// through.
+	ReasonQueueShareFull Reason = "queue_share_full"
 	// ReasonIMDNMalformed: a notification whose document cannot be read.
 	ReasonIMDNMalformed Reason = "imdn_malformed"
 	// ReasonIMDNUnknown: a notification about a message the recipient of

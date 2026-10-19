@@ -46,7 +46,7 @@ func drainInvites(t *testing.T, d *fakeDeliverer) {
 func TestAnOfflineChatQueueIsNotReReadForEveryNewMessage(t *testing.T) {
 	const n = 400
 	st := &readCounter{Store: store.NewMemory()}
-	r := newRigWith(t, Config{SenderRate: Rate{PerMinute: -1}}, st, newFakeClock())
+	r := newRigWith(t, Config{SenderRate: Rate{PerMinute: -1}, QueueSenderShare: 1}, st, newFakeClock())
 	r.d.onInvite(func(Invitation) error { return ErrOffline })
 	drainInvites(t, r.d)
 	for i := range n {
@@ -310,7 +310,7 @@ func TestPartialSuccessReportsAddUpToADelivery(t *testing.T) {
 }
 
 func TestAFullQueueRefusesTheMessageAndTellsTheSender(t *testing.T) {
-	r := newRig(t, Config{MaxQueueMessages: 2})
+	r := newRig(t, Config{MaxQueueMessages: 2, QueueSenderShare: 1})
 	r.d.onPager(func(d Delivery) error {
 		if d.Recipient == bob {
 			return ErrOffline
@@ -448,5 +448,103 @@ func TestServeWaitsOutAFailedAccept(t *testing.T) {
 	l2.Close()
 	if err := r.e.Serve(t.Context(), l2); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Serve on a closed listener = %v", err)
+	}
+}
+
+// One sender cannot fill a recipient's queue: past its share it is refused,
+// and others still get through.
+func TestOneSenderCannotLockOthersOutOfAQueue(t *testing.T) {
+	r := newRig(t, Config{MaxQueueMessages: 8, QueueSenderShare: 4, SenderRate: Rate{PerMinute: -1}})
+	r.d.onPager(func(d Delivery) error {
+		if d.Recipient == bob {
+			return ErrOffline
+		}
+		return nil
+	})
+	for i := range 2 {
+		if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, fmt.Sprint("a", i), "hi", 0))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "a2", "flood", imdn.NegativeDelivery)))
+	if got := rejected(err); got != ReasonQueueShareFull {
+		t.Fatalf("alice beyond her share: %v", err)
+	}
+	var d Delivery
+	for d = r.d.nextPager(t); d.Recipient != alice; d = r.d.nextPager(t) {
+	}
+	if n := readNotification(t, d.CPIM); n.MessageID != "a2" || n.Status != imdn.Failed {
+		t.Fatalf("notification %+v", n)
+	}
+	for i := range 2 {
+		if err := r.e.Submit(t.Context(), standalone(carol, bob, chat(t, fmt.Sprint("c", i), "hi", 0))); err != nil {
+			t.Fatalf("carol: %v", err)
+		}
+	}
+	if r.m.get("message.rejected.queue_share_full") != 1 || r.m.get("message.rejected.queue_full") != 0 {
+		t.Fatalf("metrics %v", r.m)
+	}
+	if got := queueLimit(r.e.cfg); got != (store.Limit{Count: 8, Bytes: DefaultMaxQueueBytes, SenderCount: 2, SenderBytes: DefaultMaxQueueBytes / 4}) {
+		t.Fatalf("limit %+v", got)
+	}
+}
+
+// While a queue is held, new messages to try on their own are kept up to a
+// batch; the rest wait for the next read of the queue.
+func TestTheMessagesKeptForAHeldQueueAreBounded(t *testing.T) {
+	r := newRig(t, Config{Batch: 3, SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour})
+	release := make(chan struct{})
+	var once sync.Once
+	r.d.onInvite(func(Invitation) error { return nil })
+	drainInvites(t, r.d)
+	// The first message leaves the queue waiting for a session; the next
+	// attempt is held up so that new messages pile up meanwhile.
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m0", "hi", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	r.d.onInvite(func(Invitation) error { once.Do(func() { <-release }); return nil })
+	r.e.mu.Lock()
+	delete(r.e.invites, inviteKey{bob, alice, store.Chat, ""})
+	r.e.mu.Unlock()
+	for i := range 10 {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("m", i+1), "hi", 0)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.e.mu.Lock()
+	kept := len(r.e.recipients[bob].single)
+	r.e.mu.Unlock()
+	close(release)
+	if kept > 3 {
+		t.Fatalf("%d messages kept for a held queue", kept)
+	}
+}
+
+// The outcome of an attempt that ends after Close has cancelled it is
+// still recorded, so another task does not repeat it.
+func TestAnOutcomeAfterTheCloseBoundIsStillRecorded(t *testing.T) {
+	st, clock := cancelStore{store.NewMemory()}, newFakeClock()
+	r := newRigWith(t, Config{InstanceID: "task-1"}, st, clock)
+	entered, answered := make(chan struct{}), make(chan struct{})
+	r.d.onPager(func(Delivery) error { close(entered); <-answered; return nil })
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	closed := make(chan struct{})
+	go func() { r.e.Close(); close(closed) }()
+	waitFor(t, "Close to begin", r.e.isClosed)
+	clock.Advance(DefaultDeliveryTimeout + 2*DefaultStoreTimeout) // the bound cancels
+	close(answered)                                               // the 200 OK comes after
+	<-closed
+	<-r.d.pagers
+	clock.Advance(3*DefaultDeliveryTimeout + time.Second)
+	r2 := newRigWith(t, Config{InstanceID: "task-2", Rand: seeded(2)}, st, clock)
+	r2.e.UserRegistered(bob, true)
+	select {
+	case d := <-r2.d.pagers:
+		t.Fatalf("delivered again by task-2: %q", d.CPIM)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

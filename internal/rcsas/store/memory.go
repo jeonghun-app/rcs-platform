@@ -48,12 +48,19 @@ func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 	if _, ok := q[m.ID]; ok {
 		return fmt.Errorf("store: enqueue: %w", ErrExists)
 	}
-	var bytes int64
+	var bytes, senderBytes int64
+	senderCount := 0
 	for _, x := range q {
 		bytes += x.Size()
+		if x.Sender == m.Sender {
+			senderCount, senderBytes = senderCount+1, senderBytes+x.Size()
+		}
 	}
-	if l.Count > 0 && len(q)+1 > l.Count || l.Bytes > 0 && bytes+m.Size() > l.Bytes {
+	switch {
+	case l.Count > 0 && len(q)+1 > l.Count, l.Bytes > 0 && bytes+m.Size() > l.Bytes:
 		return fmt.Errorf("store: enqueue: %w", ErrQueueFull)
+	case l.SenderCount > 0 && senderCount+1 > l.SenderCount, l.SenderBytes > 0 && senderBytes+m.Size() > l.SenderBytes:
+		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
 	}
 	if q == nil {
 		q = map[string]Message{}

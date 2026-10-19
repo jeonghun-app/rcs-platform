@@ -54,6 +54,7 @@ const (
 	attrDispositions = "dispositions"
 	attrSeen         = "seen"
 	attrCount        = "count"
+	attrSize         = "size"
 	attrBytes        = "bytes"
 )
 
@@ -70,6 +71,7 @@ const (
 	sizePrefix  = "c#"
 	sentPrefix  = "s#"
 	sizeSK      = "n"
+	senderSK    = "s#"
 )
 
 const conditionFailed = "ConditionalCheckFailedException"
@@ -122,16 +124,76 @@ func canceled(err error) (failed []bool, ok bool) {
 	return failed, true
 }
 
-// Enqueue implements store.Store: the message and its queue's size in one
-// transaction, the size conditional on l. The SDK gives the transaction an
-// idempotency token, so its own retry of one that took effect succeeds.
+// sizeUpdate adds count and bytes to a size item, conditional on the
+// bounds that are not zero.
+func (s *Store) sizeUpdate(k map[string]types.AttributeValue, count, bytes int64, maxCount int, maxBytes int64, ttl time.Time) *types.Update {
+	u := &types.Update{
+		TableName:        aws.String(s.table),
+		Key:              k,
+		UpdateExpression: aws.String("ADD #count :count, #bytes :bytes SET #ttl = :ttl"),
+		ExpressionAttributeNames: map[string]string{
+			"#count": attrCount, "#bytes": attrBytes, "#ttl": attrTTL,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":count": num(count), ":bytes": num(bytes), ":ttl": ttlOf(ttl),
+		},
+	}
+	var bounds []string
+	if maxCount > 0 {
+		bounds = append(bounds, "#count < :maxCount")
+		u.ExpressionAttributeValues[":maxCount"] = num(int64(maxCount))
+	}
+	if maxBytes > 0 {
+		bounds = append(bounds, "#bytes <= :room")
+		u.ExpressionAttributeValues[":room"] = num(maxBytes - bytes)
+	}
+	if len(bounds) > 0 {
+		u.ConditionExpression = aws.String("attribute_not_exists(#count) OR (" + strings.Join(bounds, " AND ") + ")")
+	}
+	return u
+}
+
+// queueSizeKey is the size item of recipient's queue; senderSizeKey the
+// size item of what sender has in it.
+func queueSizeKey(recipient string) map[string]types.AttributeValue {
+	return key(identityKey(sizePrefix, recipient), sizeSK)
+}
+
+func senderSizeKey(recipient, sender string) map[string]types.AttributeValue {
+	return key(identityKey(sizePrefix, recipient), identityKey(senderSK, sender))
+}
+
+// Enqueue implements store.Store: the message, its queue's size and its
+// sender's share of it in one transaction, the sizes conditional on l. The
+// SDK gives the transaction an idempotency token, so its own retry of one
+// that took effect succeeds.
+//
+// The sizes are kept by this store, so an item deleted another way (by
+// DynamoDB's TTL, or by hand) would count for ever. A refusal therefore
+// counts the queue once, corrects a size that is too high, and tries again.
 func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
+	err := s.enqueue(ctx, m, l)
+	if !errors.Is(err, store.ErrQueueFull) && !errors.Is(err, store.ErrSenderShareFull) {
+		return err
+	}
+	fixed, cerr := s.recount(ctx, m.Recipient, m.Sender)
+	if cerr != nil || !fixed {
+		return err
+	}
+	return s.enqueue(ctx, m, l)
+}
+
+func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) error {
 	if len(m.CPIM) > MaxCPIMSize {
 		return ErrTooLarge
 	}
-	if l.Bytes > 0 && m.Size() > l.Bytes {
+	switch {
+	case l.Bytes > 0 && m.Size() > l.Bytes:
 		return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
+	case l.SenderBytes > 0 && m.Size() > l.SenderBytes:
+		return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
 	}
+	ttl := m.Expires.Add(retention)
 	item := map[string]types.AttributeValue{
 		attrPK:           str(identityKey(queuePrefix, m.Recipient)),
 		attrSK:           str(m.ID),
@@ -140,9 +202,10 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		attrMode:         num(int64(m.Mode)),
 		attrNotification: &types.AttributeValueMemberBOOL{Value: m.Notification},
 		attrCPIM:         &types.AttributeValueMemberB{Value: m.CPIM},
+		attrSize:         num(m.Size()),
 		attrEnqueued:     stamp(m.Enqueued),
 		attrExpires:      stamp(m.Expires),
-		attrTTL:          ttlOf(m.Expires.Add(retention)),
+		attrTTL:          ttlOf(ttl),
 	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
@@ -152,29 +215,6 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 			item[name] = str(v)
 		}
 	}
-	size := &types.Update{
-		TableName:        aws.String(s.table),
-		Key:              key(identityKey(sizePrefix, m.Recipient), sizeSK),
-		UpdateExpression: aws.String("ADD #count :one, #bytes :size SET #ttl = :ttl"),
-		ExpressionAttributeNames: map[string]string{
-			"#count": attrCount, "#bytes": attrBytes, "#ttl": attrTTL,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":one": num(1), ":size": num(m.Size()), ":ttl": ttlOf(m.Expires.Add(retention)),
-		},
-	}
-	var bounds []string
-	if l.Count > 0 {
-		bounds = append(bounds, "#count < :maxCount")
-		size.ExpressionAttributeValues[":maxCount"] = num(int64(l.Count))
-	}
-	if l.Bytes > 0 {
-		bounds = append(bounds, "#bytes <= :room")
-		size.ExpressionAttributeValues[":room"] = num(l.Bytes - m.Size())
-	}
-	if len(bounds) > 0 {
-		size.ConditionExpression = aws.String("attribute_not_exists(#count) OR (" + strings.Join(bounds, " AND ") + ")")
-	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Put: &types.Put{
 			TableName:                aws.String(s.table),
@@ -182,7 +222,8 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 			ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
 			ExpressionAttributeNames: map[string]string{"#pk": attrPK},
 		}},
-		{Update: size},
+		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), 1, m.Size(), l.Count, l.Bytes, ttl)},
+		{Update: s.sizeUpdate(senderSizeKey(m.Recipient, m.Sender), 1, m.Size(), l.SenderCount, l.SenderBytes, ttl)},
 	}})
 	if failed, ok := canceled(err); ok {
 		switch {
@@ -190,12 +231,96 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
 		case len(failed) > 1 && failed[1]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
+		case len(failed) > 2 && failed[2]:
+			return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
 		}
 	}
 	if err != nil {
 		return sanitize("enqueue", err)
 	}
 	return nil
+}
+
+// recount counts recipient's queue, and what sender has in it, and sets
+// any size item that says more to what is there. It reports whether it
+// corrected one. Each correction is conditional on the size item being
+// unchanged since it was read, before the queue was: a size that moved
+// meanwhile reflects an enqueue or removal the count may have missed.
+func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, error) {
+	type size struct{ count, bytes int64 }
+	read := func(k map[string]types.AttributeValue) (size, error) {
+		out, err := s.api.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(s.table), Key: k, ConsistentRead: aws.Bool(true)})
+		if err != nil {
+			return size{}, sanitize("recount", err)
+		}
+		var z size
+		_ = getNum(out.Item, attrCount, &z.count)
+		_ = getNum(out.Item, attrBytes, &z.bytes)
+		return z, nil
+	}
+	queueKey, senderKey := queueSizeKey(recipient), senderSizeKey(recipient, sender)
+	queueWas, err := read(queueKey)
+	if err != nil {
+		return false, err
+	}
+	senderWas, err := read(senderKey)
+	if err != nil {
+		return false, err
+	}
+	var queueIs, senderIs size
+	in := &dynamodb.QueryInput{
+		TableName:                 aws.String(s.table),
+		ConsistentRead:            aws.Bool(true),
+		KeyConditionExpression:    aws.String("#pk = :pk"),
+		ProjectionExpression:      aws.String("#sender, #size"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#sender": attrSender, "#size": attrSize},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(queuePrefix, recipient))},
+	}
+	for {
+		page, err := s.api.Query(ctx, in)
+		if err != nil {
+			return false, sanitize("recount", err)
+		}
+		for _, item := range page.Items {
+			var n int64
+			_ = getNum(item, attrSize, &n)
+			queueIs.count, queueIs.bytes = queueIs.count+1, queueIs.bytes+n
+			if sv, _ := item[attrSender].(*types.AttributeValueMemberS); sv != nil && sv.Value == sender {
+				senderIs.count, senderIs.bytes = senderIs.count+1, senderIs.bytes+n
+			}
+		}
+		if len(page.LastEvaluatedKey) == 0 {
+			break
+		}
+		in.ExclusiveStartKey = page.LastEvaluatedKey
+	}
+	fixed := false
+	for _, c := range []struct {
+		k        map[string]types.AttributeValue
+		was, now size
+	}{{queueKey, queueWas, queueIs}, {senderKey, senderWas, senderIs}} {
+		if c.now.count >= c.was.count && c.now.bytes >= c.was.bytes {
+			continue
+		}
+		_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                aws.String(s.table),
+			Key:                      c.k,
+			UpdateExpression:         aws.String("SET #count = :count, #bytes = :bytes"),
+			ConditionExpression:      aws.String("#count = :wasCount AND #bytes = :wasBytes"),
+			ExpressionAttributeNames: map[string]string{"#count": attrCount, "#bytes": attrBytes},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":count": num(c.now.count), ":bytes": num(c.now.bytes),
+				":wasCount": num(c.was.count), ":wasBytes": num(c.was.bytes),
+			},
+		})
+		switch {
+		case err == nil:
+			fixed = true
+		case errorCode(err) != conditionFailed:
+			return fixed, sanitize("recount", err)
+		}
+	}
+	return fixed, nil
 }
 
 // freeAt is the condition of a message nobody holds at :now.
@@ -318,9 +443,10 @@ func (s *Store) Release(ctx context.Context, recipient, id, owner string) error 
 }
 
 // Remove implements store.Store: the message and its share of the queue's
-// size in one transaction.
+// and its sender's sizes in one transaction.
 func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error {
 	k := key(identityKey(queuePrefix, m.Recipient), m.ID)
+	ttl := m.Expires.Add(retention)
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Delete: &types.Delete{
 			TableName:                 aws.String(s.table),
@@ -329,13 +455,8 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 			ExpressionAttributeNames:  map[string]string{"#owner": attrOwner},
 			ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
 		}},
-		{Update: &types.Update{
-			TableName:                 aws.String(s.table),
-			Key:                       key(identityKey(sizePrefix, m.Recipient), sizeSK),
-			UpdateExpression:          aws.String("ADD #count :minus, #bytes :size"),
-			ExpressionAttributeNames:  map[string]string{"#count": attrCount, "#bytes": attrBytes},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":minus": num(-1), ":size": num(-m.Size())},
-		}},
+		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), -1, -m.Size(), 0, 0, ttl)},
+		{Update: s.sizeUpdate(senderSizeKey(m.Recipient, m.Sender), -1, -m.Size(), 0, 0, ttl)},
 	}})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
 		_, err := s.current(ctx, "remove", k)

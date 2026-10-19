@@ -58,7 +58,7 @@ type Delivery struct {
 	// Notification marks a disposition notification.
 	Notification bool
 	// Route is the next IMDN-Route of a notification, which the request
-	// goes through, when it names a host of Config.TrustedRouteDomains;
+	// goes through, when it is one of Config.TrustedRoutes;
 	// empty otherwise. The engine has checked it; the SIP layer routes
 	// through Route only when it is set and never through a route header
 	// it reads from the body itself.

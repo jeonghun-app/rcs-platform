@@ -264,3 +264,34 @@ func TestExpiredReadsTheIndexAndResumes(t *testing.T) {
 		t.Fatalf("a cursor from elsewhere = %v", err)
 	}
 }
+
+// A queue item deleted behind the store's back (DynamoDB's TTL, by hand)
+// would count for ever: a refusal counts the queue and corrects the size.
+func TestASizeThatDriftedIsCorrectedWhenItRefuses(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 2, SenderCount: 2}
+	msg := func(id string) store.Message {
+		return store.Message{Recipient: "r", ID: id, Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	for _, id := range []string{"1", "2"} {
+		if err := s.Enqueue(ctx, msg(id), l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delete(f.rows, "q#1#r\x001") // the TTL took it
+	if err := s.Enqueue(ctx, msg("3"), l); err != nil {
+		t.Fatalf("Enqueue after drift = %v", err)
+	}
+	if got := nOf(f.rows["c#1#r\x00n"][attrCount]); got != 2 {
+		t.Fatalf("queue size %d", got)
+	}
+	if got := nOf(f.rows["c#1#r\x00s#1#s"][attrCount]); got != 2 {
+		t.Fatalf("sender size %d", got)
+	}
+	// A queue that is really full stays refused.
+	if err := s.Enqueue(ctx, msg("4"), l); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("Enqueue to a full queue = %v", err)
+	}
+}

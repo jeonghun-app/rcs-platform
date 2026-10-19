@@ -40,12 +40,19 @@ var (
 	// ErrQueueFull means Enqueue would take the recipient's queue past its
 	// Limit.
 	ErrQueueFull = errors.New("store: recipient's queue is full")
+	// ErrSenderShareFull means Enqueue would take the sender's share of the
+	// recipient's queue past its Limit.
+	ErrSenderShareFull = errors.New("store: sender's share of the queue is full")
 )
 
-// Limit bounds one recipient's queue. A zero field is no bound.
+// Limit bounds one recipient's queue, and the share of it one sender may
+// hold, so that a sender cannot fill a queue and lock every other sender
+// out. A zero field is no bound.
 type Limit struct {
-	Count int
-	Bytes int64
+	Count       int
+	Bytes       int64
+	SenderCount int
+	SenderBytes int64
 }
 
 // Mode is how a message was sent, which decides how it may be delivered.
@@ -151,7 +158,7 @@ func (s Sent) Clone() Sent {
 type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
-	// beyond l.
+	// beyond l, ErrSenderShareFull if what m.Sender has in it would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID

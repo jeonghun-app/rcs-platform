@@ -57,16 +57,17 @@ func Configure(s *runtime.Settings) Config {
 			Endpoint: e.String("DYNAMODB_ENDPOINT", ""),
 		},
 		Messaging: messaging.Config{
-			MSRPHost:            e.RequiredString("MSRP_HOST"),
-			Self:                e.List("SELF_URIS", nil),
-			Intermediaries:      e.List("IMDN_INTERMEDIARIES", nil),
-			MaxMessageSize:      e.Int("MAX_MESSAGE_SIZE", messaging.DefaultMaxMessageSize),
-			PagerLimit:          e.Int("PAGER_LIMIT", messaging.DefaultPagerLimit),
-			StoreTTL:            storeTTL,
-			SentTTL:             e.Duration("SENT_TTL", storeTTL+messaging.DefaultSentMargin),
-			TrustedRouteDomains: e.List("TRUSTED_ROUTE_DOMAINS", nil),
-			MaxQueueMessages:    e.Int("MAX_QUEUE_MESSAGES", messaging.DefaultMaxQueueMessages),
-			MaxQueueBytes:       int64(e.Int("MAX_QUEUE_BYTES", messaging.DefaultMaxQueueBytes)),
+			MSRPHost:         e.RequiredString("MSRP_HOST"),
+			Self:             e.List("SELF_URIS", nil),
+			Intermediaries:   e.List("IMDN_INTERMEDIARIES", nil),
+			MaxMessageSize:   e.Int("MAX_MESSAGE_SIZE", messaging.DefaultMaxMessageSize),
+			PagerLimit:       e.Int("PAGER_LIMIT", messaging.DefaultPagerLimit),
+			StoreTTL:         storeTTL,
+			SentTTL:          e.Duration("SENT_TTL", storeTTL+messaging.DefaultSentMargin),
+			TrustedRoutes:    e.List("TRUSTED_ROUTES", nil),
+			MaxQueueMessages: e.Int("MAX_QUEUE_MESSAGES", messaging.DefaultMaxQueueMessages),
+			MaxQueueBytes:    int64(e.Int("MAX_QUEUE_BYTES", messaging.DefaultMaxQueueBytes)),
+			QueueSenderShare: e.Int("QUEUE_SENDER_SHARE", messaging.DefaultQueueSenderShare),
 			SenderRate: messaging.Rate{
 				PerMinute: e.Int("SENDER_RATE", messaging.DefaultSenderRate.PerMinute),
 				Burst:     e.Int("SENDER_BURST", messaging.DefaultSenderRate.Burst),
@@ -115,6 +116,11 @@ func Configure(s *runtime.Settings) Config {
 	positive(e, "PAGER_LIMIT", c.Messaging.PagerLimit)
 	positive(e, "MAX_QUEUE_MESSAGES", c.Messaging.MaxQueueMessages)
 	positive(e, "MAX_QUEUE_BYTES", int(c.Messaging.MaxQueueBytes))
+	positive(e, "QUEUE_SENDER_SHARE", c.Messaging.QueueSenderShare)
+	if c.Messaging.QueueSenderShare > 0 && c.Messaging.MaxQueueBytes/int64(c.Messaging.QueueSenderShare) < int64(c.Messaging.MaxMessageSize) {
+		// Otherwise a message of the largest size could never be queued.
+		e.Invalid("QUEUE_SENDER_SHARE", "leaves a sender less than RCSAS_MAX_MESSAGE_SIZE of RCSAS_MAX_QUEUE_BYTES")
+	}
 	for name, d := range map[string]bool{
 		"STORE_TTL": c.Messaging.StoreTTL > 0, "SENT_TTL": c.Messaging.SentTTL > 0,
 		"DELIVERY_TIMEOUT": c.Messaging.DeliveryTimeout > 0, "INVITE_TIMEOUT": c.Messaging.InviteTimeout > 0,

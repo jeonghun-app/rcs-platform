@@ -39,6 +39,10 @@ const (
 	// recipient's queue: room for a long absence, not for a flood.
 	DefaultMaxQueueMessages = 1000
 	DefaultMaxQueueBytes    = 16 << 20
+	// DefaultQueueSenderShare: one sender may hold an eighth of a
+	// recipient's queue, so that no single sender can fill it and lock the
+	// others out (threat model T10).
+	DefaultQueueSenderShare = 8
 	DefaultDeliveryTimeout  = 30 * time.Second
 	DefaultInviteTimeout    = 2 * time.Minute
 	// DefaultAnswerTimeout is how long an offered leg waits for its
@@ -82,12 +86,11 @@ type Config struct {
 	// Self are the URIs by which notifications are routed through rcs-as
 	// (IMDN-Route, RFC 5438 §8).
 	Self []string
-	// TrustedRouteDomains are the hosts (and their subdomains) a
-	// notification may be routed through: the platform's own application
-	// servers and CSCFs. IMDN-Record-Route and IMDN-Route entries are
-	// written by clients, so any other entry is dropped (threat model
-	// T10).
-	TrustedRouteDomains []string
+	// TrustedRoutes are the URIs a notification may be routed through,
+	// compared exactly: the platform's own application servers and CSCFs.
+	// IMDN-Record-Route and IMDN-Route entries are written by clients, so
+	// any other entry is dropped (threat model T10).
+	TrustedRoutes []string
 	// Intermediaries are the identities, besides a message's recipients,
 	// allowed to send processing and negative delivery notifications about
 	// it (RFC 5438 §8.2), for example another network's messaging server.
@@ -101,6 +104,10 @@ type Config struct {
 	SentTTL          time.Duration
 	MaxQueueMessages int
 	MaxQueueBytes    int64
+	// QueueSenderShare is how many senders' worth a queue holds: each
+	// sender may hold 1/QueueSenderShare of its messages and bytes. 1 lets
+	// one sender fill it.
+	QueueSenderShare int
 	SenderRate       Rate
 	NotificationRate Rate
 	// DeliveryTimeout bounds one delivery attempt: a pager request, or an
@@ -197,7 +204,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 	e := &Engine{
 		cfg: cfg, store: st, deliverer: d, metrics: metrics, clock: cfg.Clock, log: cfg.Logger,
 		rand:       &lockedReader{r: cfg.Rand},
-		limit:      store.Limit{Count: cfg.MaxQueueMessages, Bytes: cfg.MaxQueueBytes},
+		limit:      queueLimit(cfg),
 		senders:    newLimiter(cfg.SenderRate, cfg.MaxTracked),
 		notifiers:  newLimiter(cfg.NotificationRate, cfg.MaxTracked),
 		recipients: map[string]*recipient{},
@@ -224,6 +231,17 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 	return e, nil
 }
 
+// queueLimit is the bound of each recipient's queue and of each sender's
+// share of it.
+func queueLimit(c Config) store.Limit {
+	l := store.Limit{Count: c.MaxQueueMessages, Bytes: c.MaxQueueBytes}
+	if c.QueueSenderShare > 1 {
+		l.SenderCount = (c.MaxQueueMessages + c.QueueSenderShare - 1) / c.QueueSenderShare
+		l.SenderBytes = c.MaxQueueBytes / int64(c.QueueSenderShare)
+	}
+	return l
+}
+
 func (c Config) withDefaults() Config {
 	setDefault(&c.MaxMessageSize, DefaultMaxMessageSize)
 	setDefault(&c.PagerLimit, DefaultPagerLimit)
@@ -231,6 +249,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.SentTTL, c.StoreTTL+DefaultSentMargin)
 	setDefault(&c.MaxQueueMessages, DefaultMaxQueueMessages)
 	setDefault(&c.MaxQueueBytes, DefaultMaxQueueBytes)
+	setDefault(&c.QueueSenderShare, DefaultQueueSenderShare)
 	setDefault(&c.DeliveryTimeout, DefaultDeliveryTimeout)
 	setDefault(&c.InviteTimeout, DefaultInviteTimeout)
 	setDefault(&c.AnswerTimeout, DefaultAnswerTimeout)
@@ -417,12 +436,15 @@ func (e *Engine) submitMessage(ctx context.Context, o Origin, m *Message, now ti
 	}
 	q := queued(o, id, o.CPIM, false, m.Request.MessageID, now, e.cfg.StoreTTL)
 	err = e.enqueue(ctx, q)
-	if errors.Is(err, store.ErrQueueFull) {
+	if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {
 		// The sender learns of it twice, as a refusal and, if it asked,
 		// as the negative delivery notification a store-and-forward
 		// server sends for a message it cannot keep.
 		if n, err := e.notification(q, failedDelivery, q.ID+"-f", now); err == nil {
 			_ = e.enqueueNotification(ctx, n, failedDelivery.status)
+		}
+		if errors.Is(err, store.ErrSenderShareFull) {
+			return reject(ReasonQueueShareFull, nil)
 		}
 		return reject(ReasonQueueFull, nil)
 	}

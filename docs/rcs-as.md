@@ -39,8 +39,8 @@ The SIP layer implements `Deliverer`:
   answer. `ErrNoSessions` says the contact takes no terminating sessions on
   its current flow.
 - `Delivery.Route`, when set, is the next hop of a notification. The engine
-  sets it only to a host of `RCSAS_TRUSTED_ROUTE_DOMAINS`. The SIP layer never
-  routes on IMDN headers of its own reading.
+  sets it only to one of the URIs in `RCSAS_TRUSTED_ROUTES`, compared exactly.
+  The SIP layer never routes on IMDN headers of its own reading.
 - `Delivery.SenderName` is display text the sender chose. It may be the
   display name of `From` only, never of `P-Asserted-Identity` or another
   header the network vouches for.
@@ -101,8 +101,13 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    queue is delivered.
    - Each queue holds at most `RCSAS_MAX_QUEUE_MESSAGES` messages and
      `RCSAS_MAX_QUEUE_BYTES` bytes, across tasks.
-   - Beyond that the message is refused as `queue_full`, and the sender gets
-     the negative delivery notification it asked for.
+   - Each sender may hold `1/RCSAS_QUEUE_SENDER_SHARE` of either (an eighth
+     by default). One sender therefore cannot fill a queue and lock the others
+     out.
+   - Beyond these bounds the message is refused as `queue_full` or
+     `queue_share_full`, and the sender gets the negative delivery
+     notification it asked for. A refusal from a full share affects that
+     sender only.
 
 A refused message is answered with a `Rejection`. Over MSRP its code is:
 
@@ -121,10 +126,14 @@ top `IMDN-Route` names rcs-as (`RCSAS_SELF_URIS`): that entry is removed
 (RFC 5438 §8), and the notification is written in canonical form.
 
 Is-composing indications (RFC 3994) in a chat session are not stored. Each
-one goes, as it is, to the peer's open chat leg on the same task. One is
-forwarded per leg at a time, and the rest are dropped. They are answered with
-200 either way. The state they report lasts seconds, and the reference client
-ends the session on a refusal.
+one goes, as it is, to the peer's open chat leg on the same task, under two
+limits:
+
+- one forwarded per leg at a time;
+- 60 a minute per sending leg, with a burst of 5.
+
+The rest are dropped. They are answered with 200 either way: the state they
+report lasts seconds, and the reference client ends the session on a refusal.
 
 ## Notifications
 
@@ -156,11 +165,19 @@ rcs-as generates a notification itself:
 
 These notifications are from the recipient. They answer the message's
 `DateTime` verbatim and copy its `IMDN-Record-Route` into `IMDN-Route`
-(RFC 5438 §7.2.1). Only entries naming a host of
-`RCSAS_TRUSTED_ROUTE_DOMAINS` are copied (`imdn.route_dropped` counts the
-rest). A client writes these headers, and a route rcs-as followed blindly
-would let any subscriber pick where rcs-as sends a request from inside the
-network (T10).
+(RFC 5438 §7.2.1). Only entries that are one of `RCSAS_TRUSTED_ROUTES` are
+copied (`imdn.route_dropped` counts the rest). A client writes these headers,
+and a route rcs-as followed blindly would let any subscriber pick where rcs-as
+sends a request from inside the network (T10).
+
+Whole URIs are compared, not hosts read out of them. A host check would have
+to agree with every SIP parser the request later meets on these points:
+
+- where a user part that holds `;` or `?` ends;
+- what `maddr` does (it redirects the request, RFC 3261 §19.1.1);
+- what URI headers such as `?Route=` add.
+
+An exact list leaves nothing to interpret.
 
 ## Delivery
 
@@ -250,12 +267,13 @@ settings:
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
 | `RCSAS_DYNAMODB_ENDPOINT` | AWS | Local containers only (refused in staging and prod) |
 | `RCSAS_SELF_URIS` | none | URIs by which notifications are routed through rcs-as (`IMDN-Route`) |
-| `RCSAS_TRUSTED_ROUTE_DOMAINS` | none | Hosts (and their subdomains) a notification may be routed through: the platform's own application servers and CSCFs. With none, no IMDN route is followed |
+| `RCSAS_TRUSTED_ROUTES` | none | The URIs, compared exactly, a notification may be routed through: the platform's own application servers and CSCFs, as they write themselves into `IMDN-Record-Route`. With none, no IMDN route is followed |
 | `RCSAS_IMDN_INTERMEDIARIES` | none | Identities that may send processing and failed-delivery notifications about any message |
 | `RCSAS_MAX_MESSAGE_SIZE` | `262144` (256 KiB) | Largest CPIM body. At most 389120 with `dynamodb` (one item) |
 | `RCSAS_PAGER_LIMIT` | `1300` | Largest body in pager mode, both ways, and largest notification |
 | `RCSAS_MAX_QUEUE_MESSAGES` | `1000` | Messages one recipient's queue holds |
 | `RCSAS_MAX_QUEUE_BYTES` | `16777216` (16 MiB) | Bytes one recipient's queue holds. At least `RCSAS_MAX_MESSAGE_SIZE` |
+| `RCSAS_QUEUE_SENDER_SHARE` | `8` | Each sender may hold this fraction (1/N) of a queue's messages and bytes. `1` lets one sender fill it. `RCSAS_MAX_QUEUE_BYTES` / N must be at least `RCSAS_MAX_MESSAGE_SIZE` |
 | `RCSAS_STORE_TTL` | `168h` | How long an undelivered message is kept |
 | `RCSAS_SENT_TTL` | `RCSAS_STORE_TTL` + `24h` | How long notifications about a sent message are accepted, and how long the record of who wrote to whom is kept. At least `RCSAS_STORE_TTL` |
 | `RCSAS_SENDER_RATE`, `RCSAS_SENDER_BURST` | `60`, `30` | Messages per minute and burst, per sender and task. `0` turns the limit off |
@@ -278,6 +296,7 @@ There is one table with partition key `pk` and sort key `sk` (both strings).
 |---|---|---|
 | Queued message | `q#<len>#<recipient>` | queue ID: enqueue time in hex, then random |
 | Queue size | `c#<len>#<recipient>` | `n` |
+| A sender's share of a queue | `c#<len>#<recipient>` | `s#<len>#<sender>` |
 | Sent-message record | `s#<len>#<sender>` | IMDN Message-ID |
 
 There is one global secondary index, `expiry`:
@@ -291,10 +310,18 @@ The table's properties:
   can never be a prefix of another's key.
 - **Partitions.** A recipient's queue is one partition, read in sort-key
   order, which is enqueue order.
-- **Bounds.** The queue size item counts messages and bytes. It is written in
-  the same transaction as each enqueue and removal, and the enqueue is
-  conditional on the bound. The SDK's idempotency token makes its own retry of
-  a transaction safe.
+- **Bounds.** The queue's size item and the sender's share item count messages
+  and bytes. Both are written in the same transaction as each enqueue and
+  removal, and the enqueue is conditional on both bounds. Each queue item
+  carries its own `size`. The SDK's idempotency token makes its own retry of a
+  transaction safe.
+- **Drift.** The sizes are kept by rcs-as, so a queue item deleted another way
+  (by DynamoDB's TTL, or by hand) would count until it was corrected. An
+  enqueue that a bound refuses therefore counts the queue once (a consistent
+  query of the partition, projecting sender and size). It lowers each size
+  item that says more than it found, conditional on the item being unchanged
+  since it was read, and tries the enqueue again. Refusals are rare, so the
+  extra read is cheap.
 - **Expiry index.** Only queue items carry `xb`, one of 16 values chosen by
   recipient. The index is sparse and spreads its writes. A sweep queries it
   bucket by bucket instead of reading the table.
@@ -315,11 +342,22 @@ The table's properties:
   - for queue and size items: the expiry plus one day;
   - for sent-message records: their expiry.
 
-The task role needs these actions on the table and its index:
+The task role needs these IAM actions:
 
-- `dynamodb:GetItem`, `PutItem`, `UpdateItem`;
-- `dynamodb:TransactWriteItems`, `Query`;
-- `dynamodb:DescribeTable` (readiness).
+| Action | Resource | Used by |
+|---|---|---|
+| `dynamodb:GetItem` | table | `Sent`; reads after a refused conditional write; recounts |
+| `dynamodb:PutItem` | table | `RecordSent`, and the `Put` inside the enqueue transaction |
+| `dynamodb:UpdateItem` | table | `Claim`, `Release`, `MarkNotified`, `UnmarkNotified`, size corrections, and the `Update`s inside both transactions |
+| `dynamodb:DeleteItem` | table | the `Delete` inside the removal transaction |
+| `dynamodb:Query` | table | `Pending`, recounts |
+| `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
+| `dynamodb:DescribeTable` | table | readiness |
+
+There is no IAM action for a transaction itself. Each write inside one is
+allowed by the action of its kind (`PutItem`, `UpdateItem`, `DeleteItem`). The
+transactions use no `ConditionCheck` items, so `ConditionCheckItem` is not
+needed.
 
 `make test-integration` runs the store contract against DynamoDB Local. It
 also runs two engines that share one table and must deliver each message
@@ -333,7 +371,7 @@ identifier ever appears in a metric name.
 | Metric | Counts |
 |---|---|
 | `message.accepted`, `message.accepted.notification`, `message.resent` | Accepted messages, notifications, resends |
-| `message.rejected.<reason>` | Refusals: `too_large`, `rate_limited`, `content_type`, `malformed`, `from_mismatch`, `message_id_reused`, `queue_full`, `imdn_malformed`, `imdn_unknown`, `imdn_forged`, `imdn_not_requested` |
+| `message.rejected.<reason>` | Refusals: `too_large`, `rate_limited`, `content_type`, `malformed`, `from_mismatch`, `message_id_reused`, `queue_full`, `queue_share_full`, `imdn_malformed`, `imdn_unknown`, `imdn_forged`, `imdn_not_requested` |
 | `cpim.rejected.<reason>` | The CPIM parser's reason for `malformed` (`internal/cpim` `Reason`) |
 | `cpim.deviation.<name>` | Accepted layout deviations: `bare-lf`, `spacing`, `trailing-ws`, `empty-value` |
 | `imdn.incomplete_request` | Messages asking for notifications without a Message-ID or DateTime; delivered without them |
@@ -359,8 +397,9 @@ Signals to alarm on (Phase 7):
 |---|---|
 | `store.failed` > 0 | DynamoDB fails; messages are refused or stay queued |
 | `message.rejected.imdn_forged` > 0 | Someone sends notifications about messages it did not receive |
-| `message.rejected.queue_full` sustained | A recipient is flooded, or away much longer than usual |
-| `imdn.route_untrusted`, `imdn.route_dropped` > 0 | Clients write IMDN routes; check `RCSAS_TRUSTED_ROUTE_DOMAINS` if a partner network expects them followed |
+| `message.rejected.queue_full` sustained | A recipient is away much longer than usual, or flooded by many senders |
+| `message.rejected.queue_share_full` sustained | One sender keeps writing to a recipient who does not take its messages: a flood |
+| `imdn.route_untrusted`, `imdn.route_dropped` > 0 | Clients write IMDN routes; check `RCSAS_TRUSTED_ROUTES` if a partner network expects them followed |
 | `invite.no_sessions` sustained | Clients answering `passive`; their large content waits (ADR 0004) |
 | `message.expired` rising | Recipients unreachable for `RCSAS_STORE_TTL` |
 | `msrp.accept_failed` > 0 | The MSRP listener ran out of file descriptors or the like |
@@ -395,8 +434,8 @@ Signals to alarm on (Phase 7):
 - **The 500 for store failures.** RFC 4975 does not define it (see the
   pipeline). How clients other than the reference one treat it is unverified.
 - **The queue size is kept by rcs-as.** A queue item that DynamoDB's TTL
-  deletes, because no sweep reached it, still counts until its size item
-  expires as well, at most a day after its last message's expiry.
+  deletes, because no sweep reached it, still counts until the next refusal
+  recounts the queue.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;

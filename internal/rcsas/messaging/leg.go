@@ -19,6 +19,11 @@ const IsComposingType = "application/im-iscomposing+xml"
 // hundred bytes.
 const MaxIsComposingSize = 4 << 10
 
+// IsComposingRate bounds the indications one leg forwards. A client sends
+// one when typing starts or stops and refreshes it every tens of seconds
+// (RFC 3994 §3); more is a peer keeping the other device busy.
+var IsComposingRate = Rate{PerMinute: 60, Burst: 5}
+
 // StatusTryAgain answers a message rcs-as could not store. RFC 4975 §10
 // defines no code for a passing failure of the receiver; a 5xx code is not
 // one a sender may take as a judgement on the message (403, 413, 415), so
@@ -82,13 +87,16 @@ type Leg struct {
 	mu       sync.Mutex
 	waiting  map[string]*delivery
 	answered bool
+	expired  bool
 	pending  msrp.Timer
 	finished chan struct{}
 	finish   sync.Once
 
 	// composing is set while an is-composing indication is being
-	// forwarded to this leg; others meanwhile are dropped.
-	composing atomic.Bool
+	// forwarded to this leg; others meanwhile are dropped. composingRate
+	// bounds those this leg's user sends.
+	composing     atomic.Bool
+	composingRate *limiter
 }
 
 // delivery waits for the success report that covers a whole message
@@ -143,10 +151,13 @@ func (e *Engine) Offer(p LegParams) (*Leg, error) {
 	}
 	l.mu.Lock()
 	l.pending = e.clock.AfterFunc(e.cfg.AnswerTimeout, func() {
+		// Deciding and marking under one lock: an Answer either comes
+		// first and keeps the leg, or finds it expired.
 		l.mu.Lock()
-		answered := l.answered
+		expire := !l.answered
+		l.expired = expire
 		l.mu.Unlock()
-		if !answered {
+		if expire {
 			e.metrics.Count("leg.unanswered", 1)
 			l.Close()
 		}
@@ -164,7 +175,7 @@ func (e *Engine) newLeg(p LegParams) (*Leg, error) {
 		return nil, err
 	}
 	local := msrp.URI{Host: e.cfg.MSRPHost, Port: e.cfg.MSRPPort, SessionID: id, Transport: "tcp"}
-	l := &Leg{e: e, p: p, waiting: map[string]*delivery{}, finished: make(chan struct{})}
+	l := &Leg{e: e, p: p, waiting: map[string]*delivery{}, finished: make(chan struct{}), composingRate: newLimiter(IsComposingRate, 1)}
 	s, err := msrp.NewSession(msrp.SessionConfig{
 		Local: local, Remote: p.Remote, RemoteLater: len(p.Remote) == 0, Handler: l, AcceptTypes: AcceptTypes(p.Mode),
 	})
@@ -186,6 +197,10 @@ func (l *Leg) Answer(remote []msrp.URI) error {
 	if l.answered {
 		l.mu.Unlock()
 		return errors.New("messaging: the leg is already answered")
+	}
+	if l.expired {
+		l.mu.Unlock()
+		return errors.New("messaging: the offer expired before its answer")
 	}
 	select {
 	case <-l.session.Done():
@@ -328,20 +343,22 @@ func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 // forwardComposing passes an is-composing indication to the peer's open
 // chat leg, as it is and without storing it: the state it reports is over
 // within seconds (RFC 3994 §3), so one that cannot go now is dropped. One
-// at a time per leg, so a client sending them in a loop cannot make rcs-as
-// queue them.
+// at a time per leg and IsComposingRate per sending leg, so a client
+// sending them in a loop can neither make rcs-as queue them nor keep the
+// other device busy.
 func (e *Engine) forwardComposing(from *Leg, body []byte) {
 	to := e.chatLeg(from.p.Peer, from.p.User)
-	if to == nil || len(body) > MaxIsComposingSize || !to.composing.CompareAndSwap(false, true) {
+	if to == nil || len(body) > MaxIsComposingSize || !from.composingRate.allow("", e.clock.Now()) ||
+		!to.composing.CompareAndSwap(false, true) {
 		e.metrics.Count("iscomposing.dropped", 1)
 		return
 	}
 	body = append([]byte(nil), body...)
 	go func() {
-		defer to.composing.Store(false)
 		ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
-		defer cancel()
 		_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: IsComposingType, Body: body, FailureReport: msrp.ReportNo})
+		cancel()
+		to.composing.Store(false)
 		if err != nil {
 			e.metrics.Count("iscomposing.dropped", 1)
 			return

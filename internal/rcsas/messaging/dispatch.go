@@ -157,6 +157,9 @@ func (e *Engine) work() {
 				res = e.trySingles(e.ctx, single)
 			}
 			e.mu.Lock()
+			if res.again {
+				r.full = true
+			}
 			e.settle(user, r, res, full)
 			if e.closed {
 				break
@@ -170,8 +173,9 @@ func (e *Engine) work() {
 	}
 }
 
-// passResult is what one pass over a queue found.
-type passResult struct{ stopped, skipped bool }
+// passResult is what one pass over a queue found; again asks for the
+// whole queue to be read.
+type passResult struct{ stopped, skipped, again bool }
 
 // settle needs e.mu. It records what a pass found and arms the retry timer
 // of a queue left held.
@@ -210,6 +214,9 @@ const (
 	// stop: m stays queued because the recipient cannot be reached now,
 	// which holds for the messages after it too.
 	stop
+	// whole: m found a leg that older messages wait for, and was not
+	// sent ahead of them; the queue is to be read again, in order.
+	whole
 )
 
 // drain delivers recipient's queue, oldest first, until a message finds the
@@ -217,6 +224,10 @@ const (
 func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	var res passResult
 	after := ""
+	// waited holds the senders whose chat messages this pass left waiting
+	// for a session. If that session opens part-way through the pass, a
+	// later message from the same sender must not go before them.
+	waited := map[string]bool{}
 	for ctx.Err() == nil && !e.isClosed() {
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 		batch, err := e.store.Pending(sctx, recipient, after, e.clock.Now(), e.cfg.Batch)
@@ -226,12 +237,18 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 			return passResult{stopped: true}
 		}
 		for _, m := range batch {
-			switch e.deliver(ctx, m) {
+			switch e.deliver(ctx, m, waited[m.Sender]) {
 			case stop:
 				res.stopped = true
 				return res
 			case skip:
 				res.skipped = true
+				if m.Mode == store.Chat || m.Notification {
+					waited[m.Sender] = true
+				}
+			case whole:
+				res.again = true
+				return res
 			}
 			after = m.ID
 			if e.isClosed() {
@@ -245,11 +262,16 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	return res
 }
 
-// trySingles tries new messages of a held queue on their own.
+// trySingles tries new messages of a held queue on their own. A message
+// that finds a chat leg open has older ones waiting for that same leg: the
+// whole queue is read instead, so that they go first.
 func (e *Engine) trySingles(ctx context.Context, ms []store.Message) passResult {
 	var res passResult
 	for _, m := range ms {
-		switch e.deliver(ctx, m) {
+		switch e.deliver(ctx, m, true) {
+		case whole:
+			res.again = true
+			return res
 		case stop:
 			res.stopped = true
 			return res
@@ -265,10 +287,15 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message) passResult 
 // message within the pager limit, and a chat message within it to a client
 // that takes no sessions go in pager mode; anything else waits for a
 // terminating session, a chat session or a large-mode session of its own.
-func (e *Engine) deliver(ctx context.Context, m store.Message) outcome {
+// behind says older messages from m's sender wait for a chat leg: if one
+// is open now, m is not sent ahead of them (whole).
+func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outcome {
 	fits := len(m.CPIM) <= e.cfg.PagerLimit
 	if m.Mode == store.Chat || m.Notification {
 		if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
+			if behind {
+				return whole
+			}
 			return e.viaLeg(ctx, l, m)
 		}
 	}

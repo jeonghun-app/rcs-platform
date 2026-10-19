@@ -149,11 +149,16 @@ metadata.
   - It is accepted once per notifier and kind.
   - Who sent it is the identity the network asserted (T2), never the CPIM
     `From`.
-- **Routes.** IMDN routes are followed only to hosts of
-  `RCSAS_TRUSTED_ROUTE_DOMAINS`. Other entries are dropped from generated
-  notifications and ignored in forwarded ones.
+- **Routes.** IMDN routes are followed only when the whole URI is one of
+  `RCSAS_TRUSTED_ROUTES`. A host check is not used, because a user part, a
+  `maddr` or URI headers could make it pass a URI that leads elsewhere. Other
+  entries are dropped from generated notifications and ignored in forwarded
+  ones.
 - **Floods.** These are bounded:
   - per-recipient queues, by count and bytes, across tasks;
+  - each sender's share of a queue (an eighth by default), so that no sender
+    can lock the others out;
+  - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
   - store keys built from client input, which are limited in length.

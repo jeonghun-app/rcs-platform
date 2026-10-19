@@ -143,6 +143,12 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 		}
 		delete(seen(row), mark)
 		return &dynamodb.UpdateItemOutput{}, nil
+	case cond == "#count = :wasCount AND #bytes = :wasBytes" && upd == "SET #count = :count, #bytes = :bytes":
+		if !exists || nOf(row[attrCount]) != nOf(vals[":wasCount"]) || nOf(row[attrBytes]) != nOf(vals[":wasBytes"]) {
+			return nil, errCondition
+		}
+		row[attrCount], row[attrBytes] = vals[":count"], vals[":bytes"]
+		return &dynamodb.UpdateItemOutput{}, nil
 	default:
 		f.t.Errorf("UpdateItem %q if %q", upd, cond)
 		return nil, errCondition
@@ -162,65 +168,77 @@ func cancelled(failed ...bool) error {
 }
 
 // TransactWriteItems knows the two transactions the store sends: enqueue
-// (put the message, add to its queue's size) and remove (delete the
-// message, take it off the size).
+// (put the message, add to its queue's and its sender's sizes) and remove
+// (delete the message, take it off both).
 func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return nil, f.fail
 	}
-	if len(in.TransactItems) != 2 || in.TransactItems[1].Update == nil {
+	if len(in.TransactItems) != 3 || in.TransactItems[1].Update == nil || in.TransactItems[2].Update == nil {
 		f.t.Fatalf("transaction %+v", in.TransactItems)
 	}
-	size := in.TransactItems[1].Update
-	sizeRow := f.rows[rowKey(size.Key)]
-	vals := size.ExpressionAttributeValues
+	sizes := []*dtypes.Update{in.TransactItems[1].Update, in.TransactItems[2].Update}
+	failed := []bool{false, false, false}
+	for i, u := range sizes {
+		if aws.ToString(u.UpdateExpression) != "ADD #count :count, #bytes :bytes SET #ttl = :ttl" {
+			f.t.Errorf("size update %q", aws.ToString(u.UpdateExpression))
+		}
+		failed[i+1] = !f.sizeFits(u)
+	}
 	switch first := in.TransactItems[0]; {
 	case first.Put != nil:
-		if aws.ToString(first.Put.ConditionExpression) != "attribute_not_exists(#pk)" ||
-			aws.ToString(size.UpdateExpression) != "ADD #count :one, #bytes :size SET #ttl = :ttl" {
-			f.t.Errorf("enqueue %q, %q", aws.ToString(first.Put.ConditionExpression), aws.ToString(size.UpdateExpression))
+		if aws.ToString(first.Put.ConditionExpression) != "attribute_not_exists(#pk)" {
+			f.t.Errorf("enqueue %q", aws.ToString(first.Put.ConditionExpression))
 		}
-		_, exists := f.rows[rowKey(first.Put.Item)]
-		full := false
-		if cond := aws.ToString(size.ConditionExpression); cond != "" && sizeRow != nil {
-			want := map[string]bool{
-				"attribute_not_exists(#count) OR (#count < :maxCount)":                     true,
-				"attribute_not_exists(#count) OR (#bytes <= :room)":                        true,
-				"attribute_not_exists(#count) OR (#count < :maxCount AND #bytes <= :room)": true,
-			}
-			if !want[cond] {
-				f.t.Errorf("size condition %q", cond)
-			}
-			if c, ok := vals[":maxCount"]; ok && nOf(sizeRow[attrCount]) >= nOf(c) {
-				full = true
-			}
-			if r, ok := vals[":room"]; ok && nOf(sizeRow[attrBytes]) > nOf(r) {
-				full = true
-			}
-		}
-		if exists || full {
-			return nil, cancelled(exists, full)
+		_, failed[0] = f.rows[rowKey(first.Put.Item)]
+		if failed[0] || failed[1] || failed[2] {
+			return nil, cancelled(failed...)
 		}
 		f.rows[rowKey(first.Put.Item)] = maps.Clone(first.Put.Item)
-		f.add(size.Key, vals[":one"], vals[":size"])
-		f.rows[rowKey(size.Key)][attrTTL] = vals[":ttl"]
 	case first.Delete != nil:
-		if aws.ToString(first.Delete.ConditionExpression) != "#owner = :owner" ||
-			aws.ToString(size.UpdateExpression) != "ADD #count :minus, #bytes :size" {
-			f.t.Errorf("remove %q, %q", aws.ToString(first.Delete.ConditionExpression), aws.ToString(size.UpdateExpression))
+		if aws.ToString(first.Delete.ConditionExpression) != "#owner = :owner" || sizes[0].ConditionExpression != nil {
+			f.t.Errorf("remove %q", aws.ToString(first.Delete.ConditionExpression))
 		}
 		row, ok := f.rows[rowKey(first.Delete.Key)]
 		if !ok || sOf(row[attrOwner]) != sOf(first.Delete.ExpressionAttributeValues[":owner"]) {
-			return nil, cancelled(true, false)
+			return nil, cancelled(true, false, false)
 		}
 		delete(f.rows, rowKey(first.Delete.Key))
-		f.add(size.Key, vals[":minus"], vals[":size"])
 	default:
 		f.t.Fatalf("transaction %+v", in.TransactItems)
 	}
+	for _, u := range sizes {
+		f.add(u.Key, u.ExpressionAttributeValues[":count"], u.ExpressionAttributeValues[":bytes"])
+		f.rows[rowKey(u.Key)][attrTTL] = u.ExpressionAttributeValues[":ttl"]
+	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
+}
+
+// sizeFits evaluates a size update's condition; needs f.mu.
+func (f *fakeDynamo) sizeFits(u *dtypes.Update) bool {
+	cond := aws.ToString(u.ConditionExpression)
+	row := f.rows[rowKey(u.Key)]
+	if cond == "" || row == nil {
+		return true
+	}
+	want := map[string]bool{
+		"attribute_not_exists(#count) OR (#count < :maxCount)":                     true,
+		"attribute_not_exists(#count) OR (#bytes <= :room)":                        true,
+		"attribute_not_exists(#count) OR (#count < :maxCount AND #bytes <= :room)": true,
+	}
+	if !want[cond] {
+		f.t.Errorf("size condition %q", cond)
+	}
+	vals := u.ExpressionAttributeValues
+	if c, ok := vals[":maxCount"]; ok && nOf(row[attrCount]) >= nOf(c) {
+		return false
+	}
+	if r, ok := vals[":room"]; ok && nOf(row[attrBytes]) > nOf(r) {
+		return false
+	}
+	return true
 }
 
 // add needs f.mu.
@@ -301,6 +319,22 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 			}
 		}
 		items, last := f.page(rows, indexOrder, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool { return free(r, vals[":now"]) }, indexKey)
+		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
+	}
+	if aws.ToString(in.ProjectionExpression) == "#sender, #size" {
+		// recount: the whole partition, keys and the two attributes.
+		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
+			f.t.Errorf("recount query %+v", in)
+		}
+		var rows []map[string]dtypes.AttributeValue
+		for _, r := range f.rows {
+			if sOf(r[attrPK]) == sOf(vals[":pk"]) {
+				p := tableKey(r)
+				p[attrSender], p[attrSize] = r[attrSender], r[attrSize]
+				rows = append(rows, p)
+			}
+		}
+		items, last := f.page(rows, rowKey, in.ExclusiveStartKey, func(map[string]dtypes.AttributeValue) bool { return true }, tableKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
 	if !aws.ToBool(in.ConsistentRead) || !aws.ToBool(in.ScanIndexForward) {

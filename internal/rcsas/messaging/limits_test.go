@@ -241,7 +241,7 @@ func (f *flakyStore) Expired(ctx context.Context, now time.Time, cursor string, 
 }
 
 func TestStoreFailuresDuringDeliveryKeepTheMessageAndLogNoContent(t *testing.T) {
-	var logs bytes.Buffer
+	var logs syncBuffer
 	st := &flakyStore{Store: store.NewMemory()}
 	r := newRigWith(t, Config{StoreTTL: time.Hour, Logger: slog.New(slog.NewJSONHandler(&logs, nil))}, st, newFakeClock())
 	r.d.onPager(func(Delivery) error { return ErrOffline })
@@ -319,4 +319,22 @@ func TestTheSystemClockIsTheDefault(t *testing.T) {
 	if err != nil || len(ms) != 1 || time.Since(ms[0].Enqueued) > time.Minute {
 		t.Fatalf("Pending = %+v, %v", ms, err)
 	}
+}
+
+// syncBuffer is a log sink the engine's goroutines and the test share.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

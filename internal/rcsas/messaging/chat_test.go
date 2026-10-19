@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 	"time"
 
@@ -275,5 +276,115 @@ func TestAStoreFailureOnALegIsAnsweredAsRetryable(t *testing.T) {
 	_, a := r.connect(t, l, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Chat})
 	if code := a.outcome(t, cpim.ContentType, chat(t, "m1", "hi", 0)); code != StatusTryAgain {
 		t.Fatalf("a message rcs-as could not store was answered %d", code)
+	}
+}
+
+func TestIsComposingIsRateLimitedPerLeg(t *testing.T) {
+	r := newRig(t, Config{})
+	l := r.listen(t)
+	_, a := r.connect(t, l, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Chat})
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	body := []byte(`<isComposing xmlns="urn:ietf:params:xml:ns:im-iscomposing"><state>active</state></isComposing>`)
+	seen := int64(0)
+	send := func(n int) {
+		for range n {
+			if code := a.outcome(t, IsComposingType, body); code != msrp.StatusOK {
+				t.Fatalf("answered %d", code)
+			}
+			// One at a time is not what limits here: let each go first.
+			seen++
+			waitFor(t, "the forward", func() bool { return r.m.get("iscomposing.forwarded")+r.m.get("iscomposing.dropped") == seen })
+		}
+	}
+	send(IsComposingRate.Burst + 3)
+	waitFor(t, "the counts", func() bool {
+		return r.m.get("iscomposing.forwarded")+r.m.get("iscomposing.dropped") == int64(IsComposingRate.Burst+3)
+	})
+	if got := r.m.get("iscomposing.forwarded"); got != int64(IsComposingRate.Burst) {
+		t.Fatalf("%d forwarded from a burst of %d", got, IsComposingRate.Burst+3)
+	}
+	r.clock.Advance(time.Second)
+	send(1)
+	if got := r.m.get("iscomposing.forwarded"); got != int64(IsComposingRate.Burst+1) {
+		t.Fatalf("%d forwarded after a token refilled", got)
+	}
+	for range IsComposingRate.Burst + 1 {
+		b.next(t)
+	}
+}
+
+// At the answer timeout's boundary either the answer wins and the leg
+// stays, or the timeout wins and the answer is refused: never an answered
+// leg that then closes.
+// The timeout decides under the leg's lock and closes the leg after: an
+// Answer in between finds the decision and is refused.
+func TestAnAnswerAfterTheTimeoutDecidedIsRefused(t *testing.T) {
+	r := newRig(t, Config{})
+	leg, err := r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leg.Close()
+	leg.mu.Lock()
+	leg.expired = true // as the timeout leaves it just before it closes the leg
+	leg.mu.Unlock()
+	if err := leg.Answer([]msrp.URI{clientURI()}); err == nil {
+		t.Fatal("an answer after the timeout decided was taken")
+	}
+}
+
+func TestAnAnswerAtTheTimeoutEitherWinsOrIsRefused(t *testing.T) {
+	for range 50 {
+		r := newRig(t, Config{AnswerTimeout: time.Second})
+		leg, err := r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
+		if err != nil {
+			t.Fatal(err)
+		}
+		answered := make(chan error, 1)
+		go func() { answered <- leg.Answer([]msrp.URI{clientURI()}) }()
+		r.clock.Advance(time.Second)
+		err = <-answered
+		select {
+		case <-leg.Done():
+			if err == nil {
+				t.Fatal("an answered leg was closed by the timeout")
+			}
+		default:
+			if err != nil {
+				t.Fatalf("a refused answer left the leg open: %v", err)
+			}
+		}
+		leg.Close()
+	}
+}
+
+// The session for waiting messages opens while a pass over the queue is
+// half-way: a later message must not go ahead of the waiting ones.
+func TestASessionOpeningMidwayKeepsTheQueueInOrder(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}})
+	l := r.listen(t)
+	for _, id := range []string{"m1", "m2", "m3"} {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, id, id, 0)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "idle", r.idle)
+	drainInvites(t, r.d)
+	opened := make(chan *client, 1)
+	var once sync.Once
+	r.d.onInvite(func(Invitation) error {
+		// The answer arrives while the pass that asked is still going.
+		once.Do(func() {
+			_, c := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+			opened <- c
+		})
+		return nil
+	})
+	r.e.UserRegistered(bob, true)
+	b := <-opened
+	for _, want := range []string{"m1", "m2", "m3"} {
+		if got := b.next(t); !bytes.HasSuffix(got.Body, []byte(want)) {
+			t.Fatalf("got %q, want %s", got.Body, want)
+		}
 	}
 }

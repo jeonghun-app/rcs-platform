@@ -87,8 +87,8 @@ func TestGenuineNotificationsReachTheSender(t *testing.T) {
 	}
 }
 
-// trustedRoutes is a configuration trusting the domain of elsewhere.
-var trustedRoutes = Config{TrustedRouteDomains: []string{"Example.org"}}
+// trustedRoutes is a configuration trusting elsewhere and one more route.
+var trustedRoutes = Config{TrustedRoutes: []string{elsewhere, "sips:as.ims.example.org:5061;lr"}}
 
 func TestANotificationLeavesRcsAsOutOfItsRoute(t *testing.T) {
 	r := newRig(t, trustedRoutes)
@@ -116,12 +116,22 @@ func TestANotificationLeavesRcsAsOutOfItsRoute(t *testing.T) {
 func TestOnlyATrustedRouteIsFollowed(t *testing.T) {
 	for route, want := range map[string]string{
 		elsewhere:                         elsewhere,
-		"sips:as.ims.EXAMPLE.org:5061;lr": "sips:as.ims.EXAMPLE.org:5061;lr",
+		"sips:as.ims.example.org:5061;lr": "sips:as.ims.example.org:5061;lr",
 		"sip:10.0.0.9:5060":               "",
 		"sip:mstore@evilexample.org":      "",
 		"sip:example.org.evil.net":        "",
 		"tel:+15550100005":                "",
 		"http://example.org/":             "",
+		// A trusted host behind a user part or redirected by what follows
+		// it: a parser that reads the host differently, maddr and URI
+		// headers all send the request elsewhere.
+		"sip:x;mstore.example.org@10.0.0.9":               "",
+		"sip:x?mstore.example.org@10.0.0.9":               "",
+		"sip:u@mstore.example.org":                        "",
+		"sip:mstore.example.org;maddr=10.0.0.9":           "",
+		"sip:mstore.example.org?Route=%3Csip:10.0.0.9%3E": "",
+		"sip:mstore.example.org;lr":                       "",
+		"SIP:MSTORE.EXAMPLE.ORG":                          "",
 	} {
 		r := newRig(t, trustedRoutes)
 		sentToBob(t, r, imdn.PositiveDelivery)
@@ -135,22 +145,6 @@ func TestOnlyATrustedRouteIsFollowed(t *testing.T) {
 		}
 		if untrusted := r.m.get("imdn.route_untrusted"); (want == "") != (untrusted == 1) {
 			t.Errorf("route %s: metrics %v", route, r.m)
-		}
-	}
-}
-
-func TestSIPHostsAreFoundWithoutTheRestOfTheURI(t *testing.T) {
-	for uri, want := range map[string]string{
-		"sip:as.example.org":                 "as.example.org",
-		"SIP:Alice@AS.Example.org:5060;lr":   "as.example.org",
-		"sips:[2001:db8::1]:5061":            "[2001:db8::1]",
-		"sip:a@b@host.example?x=y":           "host.example",
-		"<sip:host.example>":                 "",
-		"sips:[2001:db8::1":                  "",
-		"tel:+15550100005;phone-context=x.y": "",
-	} {
-		if got := sipHost(uri); got != want {
-			t.Errorf("sipHost(%q) = %q, want %q", uri, got, want)
 		}
 	}
 }
