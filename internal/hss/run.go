@@ -24,7 +24,9 @@ import (
 
 // Service is the HSS for runtime.Main.
 func Service() runtime.Service[Config] {
-	return runtime.Service[Config]{Name: "hss", EnvPrefix: "HSS_", Configure: Configure, Run: Run}
+	// LiveAfterReady: start-up opens DynamoDB and KMS and may end at
+	// HSS_START_TIMEOUT (#58); until then the container is not healthy.
+	return runtime.Service[Config]{Name: "hss", EnvPrefix: "HSS_", Configure: Configure, Run: Run, LiveAfterReady: true}
 }
 
 // deps are what Run takes from the outside world, replaced in tests.

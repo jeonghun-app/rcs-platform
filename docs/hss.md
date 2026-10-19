@@ -252,12 +252,15 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
 
 ## Operations
 
-- `/healthz` and `/readyz` are on `RCS_ADMIN_ADDR`; `/readyz` answers "starting"
-  until the store, the keyring and the listeners are up, then checks both tables.
-  No load balancer sends to `hss`, so nothing acts on `/readyz`: a deployment
-  relies on the container health check (`/healthz`, which only says the process
-  runs) and ECS's deployment circuit breaker, which sees a task that exits at
-  `HSS_START_TIMEOUT`.
+- `/healthz` and `/readyz` are on `RCS_ADMIN_ADDR`. Both answer 503 "starting"
+  until the store, the keyring and the listeners are up (`/healthz` waits too,
+  #58); then `/healthz` passes for as long as the process runs and `/readyz`
+  checks both tables. No load balancer sends to `hss`, so nothing acts on
+  `/readyz`: a deployment relies on the container health check (`-healthcheck`,
+  which probes `/healthz`) and ECS's deployment circuit breaker, which sees a
+  task that exits at `HSS_START_TIMEOUT`. The task definition's health check
+  `startPeriod` must be longer than `HSS_START_TIMEOUT`, or ECS replaces a task
+  that is still starting.
 - The API logs one `audit: provisioning request` line per request: operation,
   caller, token slot (`current` or `next`), status and the masked IMPI.
 - Metrics: `cx.<command>` (latency), `cx.<command>.<result>` (`e` before an

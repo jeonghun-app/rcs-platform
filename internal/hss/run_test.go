@@ -366,3 +366,11 @@ func TestStartUpGivesUpAtItsDeadline(t *testing.T) {
 		t.Error("ready although start-up failed")
 	}
 }
+
+// The HSS's start-up waits on DynamoDB and KMS and may end at
+// HSS_START_TIMEOUT, so its container is not healthy until it is ready (#58).
+func TestTheHSSIsLiveOnlyOnceItHasStarted(t *testing.T) {
+	if !Service().LiveAfterReady {
+		t.Fatal("hss does not ask for LiveAfterReady")
+	}
+}
