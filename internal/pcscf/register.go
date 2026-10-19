@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -70,14 +69,6 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !p.registers.allow(clientKey(src.Addr)) {
 		return p.refuse(r, 503, "Too Many Registrations")
 	}
-	// Every REGISTER, authenticated or not, costs the core a UAR and an
-	// authentication vector, so the task as a whole is bounded as well.
-	if !p.allRegisters.allow(netip.Addr{}) {
-		if p.metrics != nil {
-			p.metrics.Count(metricRegisterTaskLimit, 1)
-		}
-		return p.refuse(r, 503, "Too Many Registrations")
-	}
 	to, err := r.Message.Header.To()
 	if err != nil {
 		return proxy.Decision{Status: 400, Reason: "Bad To"}
@@ -91,7 +82,19 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 400, Reason: "Bad Authorization"}
 	}
 	aor := aorKey(to.URI)
-	switch err := p.registry.reserve(src.Flow, aor, p.now().Add(reservationHold)); {
+	// Every REGISTER, authenticated or not, costs the core a UAR and an
+	// authentication vector, so the task as a whole is bounded as well; one
+	// the core will not see, refused above, costs nothing. A refresh of a
+	// registration this flow holds has a share new ones cannot take, so a
+	// flood of new registrations does not make clients lose theirs.
+	_, refresh := p.registry.lookup(src.Flow, aor)
+	if !p.allRegisters.allow(refresh) {
+		if p.metrics != nil {
+			p.metrics.Count(metricRegisterTaskLimit, 1)
+		}
+		return p.refuse(r, 503, "Too Many Registrations")
+	}
+	switch err := p.registry.reserve(src.Flow, aor, clientKey(src.Addr), p.now().Add(reservationHold)); {
 	case errors.Is(err, errTooManyPending):
 		return p.refuse(r, 503, "Too Many Registrations")
 	case err != nil:

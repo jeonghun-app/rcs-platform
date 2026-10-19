@@ -272,7 +272,8 @@ func TestRegistrationsOfFlowsThatClosedBeforeThe200AreNotKept(t *testing.T) {
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	var pc *pcscf
 	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
-	const n = 20
+	// As many as one client may have under way at once.
+	const n = maxPendingPerClient
 	var tokens []transport.FlowID
 	for range n {
 		c := dial(t, s.client, nil)

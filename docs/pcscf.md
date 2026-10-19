@@ -123,12 +123,18 @@ listener (TS 24.229 §5.2.2.1):
   `PCSCF_MAX_REGISTRATIONS` registrations. A REGISTER takes its slot before
   it is forwarded and gives it back if it ends unregistered, so a new one
   past the limit is refused at once rather than after a 200 `pcscf` could not
-  keep. One flow may have REGISTERs under way for at most eight identities,
-  so a client cannot hold slots by writing new To values while the core is
-  slow. Every REGISTER costs the core a UAR and an authentication vector,
-  so the task as a whole takes at most `PCSCF_MAX_REGISTER_RATE` a second,
-  with a burst of `PCSCF_MAX_REGISTER_BURST`, and counts the ones it refuses
-  in `register.refused_task_rate`. Refusals are 503 with `Retry-After: 1`.
+  keep. One client address (or IPv6 /64) may have REGISTERs under way for
+  at most eight identities over all its flows, so a client cannot hold
+  slots by writing new To values while the core is slow; behind a
+  carrier-grade NAT more clients than that registering at once while the
+  core is slow are told to retry. Every REGISTER the core will see costs it
+  a UAR and an authentication vector, so once it has parsed the task as a
+  whole takes at most `PCSCF_MAX_REGISTER_RATE` a second, with a burst of
+  `PCSCF_MAX_REGISTER_BURST`, and counts the ones it refuses in
+  `register.refused_task_rate`. New registrations may use three quarters of
+  that; the rest is kept for refreshes of registrations the flow holds, so
+  a flood of new ones does not make clients lose theirs. Refusals are 503
+  with `Retry-After: 1`.
 
 Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 
@@ -139,9 +145,10 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
   address, in a new random order each time.
 - A name is looked up by one lookup at a time, which no request waits on
   while there is an answer to use: past its TTL the last answer is used at
-  once while it is refreshed, for up to 5 minutes. After a failed lookup the
-  next waits 5 s, doubling to a minute while they keep failing; a name with
-  no answer gets the last error until then. A failed lookup is logged once,
+  once while it is refreshed, for up to 5 minutes. After a failed refresh
+  the next waits 5 s, doubling to a minute while they keep failing. A name
+  with no answer at all is looked up again every 5 s, so a new stack or a
+  recovering service is found soon, and gets the last error in between. A failed lookup is logged once,
   then at most once a minute while it keeps failing, with its class: `not
   found` (a missing record, so a configuration error), `timeout` or
   `error`.

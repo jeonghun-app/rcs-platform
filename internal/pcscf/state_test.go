@@ -207,5 +207,5 @@ func TestRegistrySlotsAreReservedUntilReleasedOrLapsed(t *testing.T) {
 
 // tryReserve is reserve that reports only whether it took the slot.
 func (r *registry) tryReserve(flow transport.FlowID, aor string, until time.Time) bool {
-	return r.reserve(flow, aor, until) == nil
+	return r.reserve(flow, aor, netip.MustParseAddr("192.0.2.10"), until) == nil
 }

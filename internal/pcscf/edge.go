@@ -181,7 +181,7 @@ type pcscf struct {
 	now   func() time.Time
 	log   *slog.Logger
 	// allRegisters limits the REGISTERs of all clients together.
-	allRegisters *limiter
+	allRegisters taskLimit
 	// icscfFirst and icscfTotal bound a REGISTER's first attempt at icscf
 	// and all of them.
 	icscfFirst, icscfTotal time.Duration

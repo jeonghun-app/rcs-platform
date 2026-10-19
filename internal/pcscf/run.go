@@ -106,7 +106,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		cfg: cfg, corePort: int(coreAddr.Port()),
 		registry:     newRegistry(cfg.MaxRegistrations, d.now),
 		registers:    newLimiter(cfg.RegisterRate, cfg.RegisterBurst, d.now),
-		allRegisters: newLimiter(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, d.now),
+		allRegisters: newTaskLimit(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, d.now),
 		icscfFirst:   cmp.Or(d.icscfFirst, icscfFirstTimeout), icscfTotal: cmp.Or(d.icscfTotal, icscfTotalTimeout),
 		metrics: rt.Metrics,
 		icscfs:  resolver, rand: rand.Reader,
