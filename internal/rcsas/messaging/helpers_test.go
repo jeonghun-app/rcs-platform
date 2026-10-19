@@ -43,8 +43,10 @@ type fakeClock struct {
 }
 
 type fakeTimer struct {
-	c        *fakeClock
-	when     time.Time
+	c    *fakeClock
+	when time.Time
+	// d is the duration the timer was set with, which armed and fire go by.
+	d        time.Duration
 	f        func()
 	inactive bool
 }
@@ -62,7 +64,7 @@ func (c *fakeClock) Now() time.Time {
 func (c *fakeClock) AfterFunc(d time.Duration, f func()) msrp.Timer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	t := &fakeTimer{c: c, when: c.now.Add(d), f: f}
+	t := &fakeTimer{c: c, when: c.now.Add(d), d: d, f: f}
 	c.timers = append(c.timers, t)
 	return t
 }
@@ -75,19 +77,37 @@ func (t *fakeTimer) Stop() bool {
 	return active
 }
 
-// armed reports whether a live timer is due d from now: one set by
-// AfterFunc(d, …) since the clock last moved. A test that advances the clock
-// to fire a timer must first see it armed; advancing earlier moves the clock
-// past a timer that does not exist yet, which then never fires (#143).
+// armed reports whether a live timer set with AfterFunc(d, …) exists. A
+// test that advances the clock to fire a timer must first see it armed:
+// advancing earlier moves the clock past a timer that does not exist yet,
+// which then never fires (#143, #149).
 func (c *fakeClock) armed(d time.Duration) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, t := range c.timers {
-		if !t.inactive && t.when.Sub(c.now) == d {
+		if !t.inactive && t.d == d {
 			return true
 		}
 	}
 	return false
+}
+
+// fire runs every live timer set with AfterFunc(d, …) without moving the
+// clock, so a test can fire one timer before others that would come due
+// first.
+func (c *fakeClock) fire(d time.Duration) {
+	c.mu.Lock()
+	var due []*fakeTimer
+	for _, t := range c.timers {
+		if !t.inactive && t.d == d {
+			t.inactive = true
+			due = append(due, t)
+		}
+	}
+	c.mu.Unlock()
+	for _, t := range due {
+		t.f()
+	}
 }
 
 // Advance moves the clock and runs every timer that has come due.
@@ -450,7 +470,7 @@ func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client
 	ctx, cancel := context.WithTimeout(context.Background(), hangGuard)
 	defer cancel()
 	if err := conn.Open(ctx, c.session); err != nil {
-		t.Fatal(err)
+		t.Fatalf("open the client session: %v", err)
 	}
 	return c
 }
@@ -526,4 +546,24 @@ func (r *rig) largeMode(t *testing.T, l net.Listener, inv Invitation) (*client, 
 		t.Fatal(err)
 	}
 	return c, leg
+}
+
+func TestArmedMeansSetWithThatDuration(t *testing.T) {
+	// QA on #147: a timer set for 10 ms with 5 ms left is not armed(5 ms).
+	c := newFakeClock()
+	c.AfterFunc(10*time.Millisecond, func() {})
+	c.Advance(5 * time.Millisecond)
+	if c.armed(5 * time.Millisecond) {
+		t.Error("after Advance(5 ms), a timer set by AfterFunc(10 ms) is reported as armed(5 ms)")
+	}
+	if !c.armed(10 * time.Millisecond) {
+		t.Error("a timer set by AfterFunc(10 ms) is not armed(10 ms)")
+	}
+	fired := 0
+	c.AfterFunc(time.Hour, func() { fired++ })
+	c.fire(time.Hour)
+	c.fire(time.Hour)
+	if fired != 1 || c.armed(time.Hour) {
+		t.Errorf("fire ran the timer %d times, armed after %v", fired, c.armed(time.Hour))
+	}
 }
