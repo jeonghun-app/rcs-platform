@@ -214,6 +214,26 @@ func touch(t *testing.T, s groupstore.Store) {
 	if err := s.Touch(ctx, g.URI, t0.Add(3*time.Hour), t0.Add(4*time.Hour)); !errors.Is(err, groupstore.ErrNotFound) {
 		t.Fatalf("Touch of an expired group = %v", err)
 	}
+	// A touch older than the last write moves nothing, not even a later
+	// expiry: a message's touch that arrives after the last participant
+	// left must not bring the group back.
+	g2 := group()
+	g2.URI = "sip:chat-2@conf.example.net"
+	if err := s.Create(ctx, g2, "c2", t0); err != nil {
+		t.Fatal(err)
+	}
+	stale := t0.Add(time.Minute)
+	ended, _ := s.Get(ctx, g2.URI, t0)
+	ended.Active, ended.Expires = t0.Add(2*time.Minute), t0.Add(2*time.Minute)
+	if err := s.Update(ctx, ended, "end"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Touch(ctx, g2.URI, stale, stale.Add(30*24*time.Hour)); err != nil {
+		t.Fatalf("a stale Touch = %v", err)
+	}
+	if got, err := s.Get(ctx, g2.URI, t0.Add(2*time.Minute)); !errors.Is(err, groupstore.ErrNotFound) {
+		t.Fatalf("a stale Touch revived the group: %+v, %v", got, err)
+	}
 }
 
 func expiry(t *testing.T, s groupstore.Store) {

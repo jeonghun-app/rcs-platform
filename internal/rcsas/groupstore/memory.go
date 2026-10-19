@@ -79,12 +79,12 @@ func (s *Memory) Touch(_ context.Context, uri string, active, expires time.Time)
 	if !ok || !st.g.Expires.After(active) {
 		return fmt.Errorf("groupstore: touch: %w", ErrNotFound)
 	}
-	if active.After(st.g.Active) {
-		st.g.Active = active
+	// Both move or neither, as in DynamoDB (awsstore.Groups.Touch): a
+	// touch older than the last write, which may have ended the group,
+	// must not move its expiry.
+	if active.After(st.g.Active) && expires.After(st.g.Expires) {
+		st.g.Active, st.g.Expires = active, expires
+		s.groups[uri] = st
 	}
-	if expires.After(st.g.Expires) {
-		st.g.Expires = expires
-	}
-	s.groups[uri] = st
 	return nil
 }

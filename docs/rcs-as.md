@@ -590,8 +590,12 @@ TTL attribute `ttl`) and no index. Each group is one item:
 - **Writes.** Every change rewrites the item on the condition that its `rev`
   is the one the change was computed from. A token (`wtoken`) tells a repeat
   of the write from another writer's; `Create` uses one too.
-- **Touch.** At most once an hour per task, a group in use has its `active`,
-  `expires` and `ttl` moved forward, without changing `rev`.
+- **Touch.** At most once an hour per task, and not within an hour of a
+  change, a group in use has its `active`, `expires` and `ttl` moved forward,
+  without changing `rev`. The update is conditional on the stored `active`
+  being older, so a touch that arrives after a later write (which may have
+  ended the group) changes nothing. Creating a group and every change set
+  `expires` to `RCSAS_GROUP_IDLE_TTL` from then.
 - **Expiry.** `ttl` is the group's expiry plus a day; every read checks the
   expiry itself.
 - **IAM.** The task role needs `GetItem`, `PutItem`, `UpdateItem` and

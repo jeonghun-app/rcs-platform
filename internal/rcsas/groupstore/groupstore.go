@@ -149,8 +149,10 @@ type Store interface {
 	// that a repeat of an update that took effect (an SDK retry) succeeds.
 	Update(ctx context.Context, g Group, token string) error
 	// Touch records that the group was used at active, moving Active and
-	// Expires forward and never back; ErrNotFound if it is gone or has
-	// expired at active. It does
-	// not change the revision, so it never makes an Update fail.
+	// Expires forward together, and only when active is later than the
+	// stored Active: a touch older than the last write, which may have
+	// ended the group, changes nothing. ErrNotFound if the group is gone
+	// or has expired at active. It does not change the revision, so it
+	// never makes an Update fail.
 	Touch(ctx context.Context, uri string, active, expires time.Time) error
 }
