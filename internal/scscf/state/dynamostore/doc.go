@@ -7,7 +7,8 @@
 //
 // # Tables
 //
-// registrations, partition key pk (string = canonical IMPU):
+// registrations, partition key pk (string), holds three kinds of item. A
+// set's registration, pk set#<IMPI>#<default IMPU>:
 //
 //	version  number   optimistic concurrency; a new item starts at a random
 //	                  value, so a deleted and recreated one never repeats one
@@ -19,9 +20,10 @@
 //	                  without contacts the end of the deregistration lease, or
 //	                  else the end of an unregistered user's state
 //
-// The doc names the IMPU's implicit registration set by its default IMPU.
-// The same table holds the profiles, one per set, partition key
-// profile#<IMPI>#<default IMPU>, with the User-Data in doc, received
+// An identity, pk = the canonical IMPU, holds version, writer and a doc
+// naming its set and the set's incarnation, and no index attribute. The
+// profiles, one per set, pk profile#<IMPI>#<default IMPU>, hold the
+// User-Data in doc, received
 // (number, Unix ns) ordering them, and ttl (number, Unix seconds), the table's
 // TTL attribute, holding KeepUntil. They have no index attribute, so no index
 // lists them. Registrations have no ttl: DynamoDB must never delete one, only

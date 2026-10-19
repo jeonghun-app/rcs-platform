@@ -17,12 +17,42 @@ import (
 // instance runs before it is relied on.
 
 type registrationDoc struct {
-	IMPU          string       `json:"impu"`
-	IMPI          string       `json:"impi"`
-	DefaultIMPU   string       `json:"default_impu"`
-	Contacts      []contactDoc `json:"contacts,omitempty"`
-	Deregistering *time.Time   `json:"deregistering,omitempty"`
-	Unregistered  *time.Time   `json:"unregistered,omitempty"`
+	IMPI          string        `json:"impi"`
+	DefaultIMPU   string        `json:"default_impu"`
+	Incarnation   int64         `json:"incarnation"`
+	Identities    []identityRef `json:"identities"`
+	Contacts      []contactDoc  `json:"contacts,omitempty"`
+	Deregistering *time.Time    `json:"deregistering,omitempty"`
+	Unregistered  *time.Time    `json:"unregistered,omitempty"`
+}
+
+type identityRef struct {
+	IMPU   string `json:"impu"`
+	Barred bool   `json:"barred,omitempty"`
+}
+
+// identityDoc is what an identity item holds.
+type identityDoc struct {
+	IMPI        string `json:"impi"`
+	DefaultIMPU string `json:"default_impu"`
+	Incarnation int64  `json:"incarnation"`
+	Barred      bool   `json:"barred,omitempty"`
+}
+
+func encodeIdentity(i *state.Identity) ([]byte, error) {
+	return json.Marshal(identityDoc{IMPI: i.Set.IMPI, DefaultIMPU: i.Set.IMPU, Incarnation: i.Incarnation, Barred: i.Barred})
+}
+
+func decodeIdentity(b []byte, impu string, version int64) (*state.Identity, error) {
+	var doc identityDoc
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return nil, fmt.Errorf("%w: identity document does not decode", state.ErrInvalid)
+	}
+	i := &state.Identity{IMPU: impu, Set: state.SetKey{IMPI: doc.IMPI, IMPU: doc.DefaultIMPU}, Incarnation: doc.Incarnation, Barred: doc.Barred, Version: version}
+	if err := i.Validate(); err != nil {
+		return nil, err
+	}
+	return i, nil
 }
 
 type contactDoc struct {
@@ -40,7 +70,10 @@ type contactDoc struct {
 }
 
 func encodeRegistration(r *state.Registration) ([]byte, error) {
-	doc := registrationDoc{IMPU: r.IMPU, IMPI: r.IMPI, DefaultIMPU: r.DefaultIMPU}
+	doc := registrationDoc{IMPI: r.Key.IMPI, DefaultIMPU: r.Key.IMPU, Incarnation: r.Incarnation}
+	for _, id := range r.Identities {
+		doc.Identities = append(doc.Identities, identityRef{IMPU: id.IMPU, Barred: id.Barred})
+	}
 	if !r.Deregistering.IsZero() {
 		t := r.Deregistering.UTC()
 		doc.Deregistering = &t
@@ -63,7 +96,10 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: registration document does not decode", state.ErrInvalid)
 	}
-	r := &state.Registration{IMPU: doc.IMPU, IMPI: doc.IMPI, DefaultIMPU: doc.DefaultIMPU, Version: version}
+	r := &state.Registration{Key: state.SetKey{IMPI: doc.IMPI, IMPU: doc.DefaultIMPU}, Incarnation: doc.Incarnation, Version: version}
+	for _, id := range doc.Identities {
+		r.Identities = append(r.Identities, state.SetIdentity{IMPU: id.IMPU, Barred: id.Barred})
+	}
 	if doc.Deregistering != nil {
 		r.Deregistering = *doc.Deregistering
 	}
