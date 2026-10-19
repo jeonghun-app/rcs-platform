@@ -214,7 +214,11 @@ func (r *run) converse(cs *chatSession) error {
 		return err
 	}
 	if r.cfg.IdleWait > 0 {
-		if err := r.step("keep-alive", func(ctx context.Context) (map[string]int64, error) {
+		timeout := r.cfg.KeepAliveTimeout
+		if timeout <= 0 {
+			timeout = r.cfg.StepTimeout
+		}
+		if err := r.stepWithin("keep-alive", timeout, func(ctx context.Context) (map[string]int64, error) {
 			before, sends := cs.traffic.written.Load(), cs.traffic.sends.Load()
 			// What the client wrote while quiet goes into the result whether
 			// the step passes or fails: a failure with bytes written means
