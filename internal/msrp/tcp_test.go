@@ -339,8 +339,15 @@ func (rig *relayRigTCP) dialClient(t *testing.T, local, relayPub URI, h Handler)
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	s, _ := NewSession(SessionConfig{Local: local, Remote: []URI{relayPub}, Handler: h})
+	start := time.Now()
 	if err := c.Open(context.Background(), s); err != nil {
-		t.Fatal(err)
+		// A bind normally takes milliseconds, under a starved CPU well
+		// under a second; one that waits out the 30 s transaction timeout
+		// in CI could not be reproduced (#140), so the failure carries
+		// where every goroutine was.
+		buf := make([]byte, 16<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		t.Fatalf("bind of %s failed after %v: %v\ngoroutines:\n%s", local.SessionID, time.Since(start), err, buf)
 	}
 	return s, c
 }
