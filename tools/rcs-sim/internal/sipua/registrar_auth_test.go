@@ -2,7 +2,9 @@ package sipua
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"sync"
@@ -58,6 +60,16 @@ type authRegistrar struct {
 	wrongXRES  bool
 	// proxy challenges with 407 and Proxy-Authenticate, as a proxy does.
 	proxy bool
+	// foreign, when set, challenges first for another realm, with a valid
+	// challenge of each algorithm from its own server; foreignOnly leaves
+	// the home realm's out.
+	foreign     *digest.Server
+	foreignOnly bool
+	// before are raw challenge values sent ahead of the registrar's own.
+	before []string
+	// noQOP sends AKA challenges without qop and checks the answer in the
+	// form without it (RFC 3310 §3.3, RFC 2617 §3.2.2.1).
+	noQOP bool
 
 	mu        sync.Mutex
 	vectors   map[string][]byte // nonce to XRES
@@ -120,6 +132,16 @@ func (a *authRegistrar) check(t *testing.T, req *sip.Request, tag string) *sip.R
 		if a.wrongXRES {
 			xres = []byte("not-the-xres")
 		}
+		if a.noQOP {
+			// digest.Server verifies qop=auth only; this is the form
+			// without qop, computed here from RFC 2617 §3.2.2.1.
+			ha1 := md5hex(c.Username + ":" + c.Realm + ":" + string(xres))
+			if c.QOP != "" || c.Response != md5hex(ha1+":"+c.Nonce+":"+md5hex("REGISTER:"+c.URI)) {
+				return a.refuse(t, req, tag)
+			}
+			delete(a.vectors, c.Nonce)
+			return nil
+		}
 		err := a.ds.VerifyAKA(context.Background(), "REGISTER", c, xres, time.Now().Add(time.Minute))
 		var sf *digest.SyncFailure
 		switch {
@@ -151,6 +173,27 @@ func (a *authRegistrar) challenge(t *testing.T, req *sip.Request, tag string, st
 		code, field = 407, "Proxy-Authenticate"
 	}
 	res := mustResponse(t, req, code, tag)
+	for _, v := range a.before {
+		res.Header.Add(field, v)
+	}
+	servers := []*digest.Server{a.ds}
+	switch {
+	case a.foreignOnly:
+		servers = []*digest.Server{a.foreign}
+	case a.foreign != nil:
+		servers = []*digest.Server{a.foreign, a.ds}
+	}
+	for _, ds := range servers {
+		for _, h := range a.challenges(t, ds, stale) {
+			res.Header.Add(field, h)
+		}
+	}
+	return res
+}
+
+// challenges are ds's challenges, one per algorithm.
+func (a *authRegistrar) challenges(t *testing.T, ds *digest.Server, stale bool) []string {
+	var out []string
 	for _, alg := range a.algorithms {
 		var ch digest.Challenge
 		var err error
@@ -164,18 +207,21 @@ func (a *authRegistrar) challenge(t *testing.T, req *sip.Request, tag string, st
 			rand.Read(r[:])
 			vec := a.m.Vector(r, a.sqn, [milenage.AMFSize]byte{0x80, 0x00})
 			rnd, autn := vec.RAND(), vec.AUTN()
-			ch, err = a.ds.AKAChallenge(rnd[:], autn[:], stale)
+			ch, err = ds.AKAChallenge(rnd[:], autn[:], stale)
 			xres := vec.XRES()
 			a.vectors[ch.Nonce] = xres[:]
+			if a.noQOP {
+				ch.QOP = nil
+			}
 		} else {
-			ch, err = a.ds.Challenge(alg, stale)
+			ch, err = ds.Challenge(alg, stale)
 		}
 		if err != nil {
 			t.Errorf("registrar: %v", err)
 		}
-		res.Header.Add(field, ch.Header())
+		out = append(out, ch.Header())
 	}
-	return res
+	return out
 }
 
 func (a *authRegistrar) refuse(t *testing.T, req *sip.Request, tag string) *sip.Response {
@@ -187,6 +233,11 @@ func (a *authRegistrar) refuse(t *testing.T, req *sip.Request, tag string) *sip.
 		}
 	}
 	return mustResponse(t, req, code, tag)
+}
+
+func md5hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
 func mustResponse(t *testing.T, req *sip.Request, code int, tag string) *sip.Response {

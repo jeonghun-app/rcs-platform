@@ -121,18 +121,28 @@ behaves as a device behind NAT does:
 
 It answers the registrar's challenge:
 
-- The first REGISTER carries an `Authorization` with the IMPI, the home domain
-  as realm and an empty nonce and response, from which the S-CSCF learns the
-  private identity (TS 24.229 §5.1.1.2.1).
-- With a password, it answers the first MD5 or SHA-256 challenge offered
-  (RFC 7616, RFC 8760).
-- With AKA keys, it answers AKAv1-MD5 as a card does (RFC 3310, TS 33.102
-  §6.3.3). AUTN must verify. A fresh SQN is answered with RES. An SQN the card
-  will not accept is answered with AUTS, after which the network
-  resynchronises and challenges again. An AUTN that does not verify ends the
-  registration.
-- Credentials refused once are not tried again: a second 401 is the result,
-  unless it follows AUTS or says the nonce was stale.
+- Every unchallenged REGISTER, a de-registration too, carries an
+  `Authorization` with the IMPI, the home domain as realm and an empty nonce
+  and response, from which the S-CSCF learns the private identity (TS 24.229
+  §5.1.1.2.2, §5.1.1.2.3).
+- It answers only challenges for the home domain's realm. An answer for
+  another realm would give that hop a response computed from the home
+  password to guess it from offline. Of those, it takes the topmost it can
+  meet (§5.1.1.5.4): with a password, MD5 or SHA-256 with `qop=auth` (RFC
+  7616, RFC 8760); with AKA keys, AKAv1-MD5 with `qop=auth` or without qop
+  (§5.4.1.2.1A).
+- With AKA keys it answers as a card does (RFC 3310, TS 33.102 §6.3.3). A
+  fresh SQN is answered with RES. An SQN the card will not accept is answered
+  with AUTS, after which the network resynchronises and challenges again. An
+  AUTN that does not verify, or a nonce without RAND and AUTN, is reported in
+  one more REGISTER with an empty response and no `auts` (§5.1.1.5.3). The
+  answer to that is the result.
+- A 407 and a 401 are answered side by side: each REGISTER after them carries
+  both credentials (RFC 3261 §22.3), with the next nonce-count and a new
+  cnonce.
+- Credentials refused once are not tried again: a second challenge of the
+  same kind is the result, unless it follows AUTS or says the nonce was
+  stale. One registration answers at most three challenges.
 
 The credentials come from the environment only: K and OPc as 32 hex digits in
 `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`, the Digest password in

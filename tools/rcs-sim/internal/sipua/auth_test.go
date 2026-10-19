@@ -61,7 +61,7 @@ func TestDigestChallengeIsAnsweredForTheRealm(t *testing.T) {
 }
 
 func TestTheFirstREGISTERNamesTheIMPI(t *testing.T) {
-	// TS 24.229 §5.1.1.2.1: the unchallenged REGISTER carries Authorization
+	// TS 24.229 §5.1.1.2.2, §5.1.1.2.3: the unchallenged REGISTER carries Authorization
 	// with the IMPI, the home domain as realm, and an empty nonce and
 	// response, so the S-CSCF knows which private identity registers.
 	a := newAuthRegistrar(t, digest.SHA256)
@@ -166,9 +166,11 @@ func TestWrongCredentialsAreRefusedAndNotTriedAgain(t *testing.T) {
 	}
 }
 
-func TestAKAKeysThatDoNotVerifyTheNetworkAreNotAnswered(t *testing.T) {
-	// The card's K differs from the network's: AUTN does not verify, and
-	// the card does not answer a network it cannot authenticate.
+func TestAKAKeysThatDoNotVerifyTheNetworkAreReportedInOneMoreREGISTER(t *testing.T) {
+	// The card's K differs from the HSS's, so AUTN does not verify. TS
+	// 24.229 §5.1.1.5.3: the UE says so in a further REGISTER with the
+	// challenge's nonce, an empty response and no auts, and the answer to
+	// that, here 403, is the result (TS 33.203 §6.1.2.2).
 	a := newAuthRegistrar(t, digest.AKAv1MD5)
 	other := testK
 	other[0] ^= 1
@@ -178,8 +180,108 @@ func TestAKAKeysThatDoNotVerifyTheNetworkAreNotAnswered(t *testing.T) {
 	}
 	s, cfg := authStandIn(t, a, creds)
 	_, err = dial(t, cfg).Register(context.Background())
-	if !errors.Is(err, ErrNetworkNotAuthenticated) || s.registerCount() != 1 {
-		t.Fatalf("Register = %v after %d REGISTERs", err, s.registerCount())
+	var se *StatusError
+	if !errors.Is(err, ErrNetworkNotAuthenticated) || !errors.As(err, &se) || se.Code != 403 || s.registerCount() != 2 {
+		t.Fatalf("Register = %v after %d REGISTERs; want ErrNetworkNotAuthenticated with the 403, after 2", err, s.registerCount())
+	}
+	_, answered, _ := a.seen()
+	if len(answered) != 1 {
+		t.Fatalf("%d answers", len(answered))
+	}
+	if c := answered[0]; c.Response != "" || len(c.AUTS) != 0 || c.Nonce == "" || c.Username != testIMPI || c.Algorithm != digest.AKAv1MD5 {
+		t.Fatalf("the report carried response %q, auts %v, nonce %t; want an empty response, no auts, the nonce", c.Response, len(c.AUTS) > 0, c.Nonce != "")
+	}
+	noSecrets(t, err.Error())
+}
+
+func TestChallengesForAnotherRealmAreNotAnswered(t *testing.T) {
+	// A hop that challenges for its own realm would otherwise get a
+	// response computed from the home password, to guess it from offline
+	// (security review of #187).
+	foreign, err := digest.NewServer(digest.ServerConfig{
+		Realm: "foreign.example", NonceKey: []byte(strings.Repeat("f", digest.MinNonceKeySize)),
+		NonceCounts: digest.NewMemoryNonceCounts(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, alg := range []digest.Algorithm{digest.SHA256, digest.AKAv1MD5} {
+		for _, proxy := range []bool{false, true} {
+			name := fmt.Sprintf("%s, 407 %v", alg, proxy)
+			creds := digestCreds(t, testPassword)
+			if alg == digest.AKAv1MD5 {
+				creds = akaCreds(t)
+			}
+			// Foreign alone: nothing to answer.
+			a := newAuthRegistrar(t, alg)
+			a.proxy, a.foreign, a.foreignOnly = proxy, foreign, true
+			s, cfg := authStandIn(t, a, creds)
+			if _, err := dial(t, cfg).Register(context.Background()); !errors.Is(err, ErrNoUsableChallenge) || s.registerCount() != 1 {
+				t.Errorf("%s, foreign only: Register = %v after %d REGISTERs", name, err, s.registerCount())
+			}
+			// Foreign first, then home: the home one is answered.
+			a = newAuthRegistrar(t, alg)
+			a.proxy, a.foreign = proxy, foreign
+			if alg == digest.AKAv1MD5 {
+				creds = akaCreds(t)
+			}
+			_, cfg = authStandIn(t, a, creds)
+			register(t, dial(t, cfg))
+			if _, answered, _ := a.seen(); len(answered) != 1 || answered[0].Realm != testDomain {
+				t.Errorf("%s, foreign then home: answered %v", name, answered)
+			}
+		}
+	}
+}
+
+func TestTheTopmostChallengeWithAQOPItCanMeetIsAnswered(t *testing.T) {
+	// TS 24.229 §5.1.1.5.4: the topmost one it supports. qop=auth-int,
+	// or no qop for Digest, is not supported (RFC 8760 §2.6).
+	for name, before := range map[string]string{
+		"auth-int":          `Digest realm="` + testDomain + `", nonce="bm9uY2U=", algorithm=SHA-256, qop="auth-int"`,
+		"MD5 without qop":   `Digest realm="` + testDomain + `", nonce="bm9uY2U=", algorithm=MD5`,
+		"unknown algorithm": `Digest realm="` + testDomain + `", nonce="bm9uY2U=", algorithm=SHA-512-256, qop="auth"`,
+	} {
+		a := newAuthRegistrar(t, digest.MD5)
+		a.before = []string{before}
+		_, cfg := authStandIn(t, a, digestCreds(t, testPassword))
+		register(t, dial(t, cfg))
+		if _, answered, _ := a.seen(); answered[0].Algorithm != digest.MD5 {
+			t.Errorf("%s first: answered %s", name, answered[0].Algorithm)
+		}
+	}
+}
+
+func TestAnAKAChallengeWithoutQOPIsAnswered(t *testing.T) {
+	// TS 24.229 §5.4.1.2.1A has no qop in the S-CSCF's challenge.
+	a := newAuthRegistrar(t, digest.AKAv1MD5)
+	a.noQOP = true
+	_, cfg := authStandIn(t, a, akaCreds(t))
+	register(t, dial(t, cfg))
+	if _, answered, _ := a.seen(); answered[0].QOP != "" || answered[0].NC != 0 {
+		t.Fatalf("answered %v with qop or nc", answered[0])
+	}
+}
+
+func TestAProxyChallengeAndARegistrarChallengeAreBothAnswered(t *testing.T) {
+	// A proxy challenges with 407, then the registrar with 401. The
+	// second answer is sent with the first (RFC 3261 §22.3), and the
+	// Authorization with the IMPI rides along while the proxy challenges
+	// (TS 24.229 §5.1.1.2.2).
+	reg := newAuthRegistrar(t, digest.SHA256)
+	proxy := newAuthRegistrar(t, digest.SHA256)
+	proxy.proxy = true
+	s, cfg := authStandIn(t, reg, digestCreds(t, testPassword))
+	s.proxyAuth = proxy
+	r := register(t, dial(t, cfg))
+	if r.Challenges != 2 || s.registerCount() != 3 {
+		t.Fatalf("registration = %+v after %d REGISTERs", r, s.registerCount())
+	}
+	first, _, _ := reg.seen()
+	for _, v := range first {
+		if c, err := digest.ParseCredentials(v); err != nil || c.Username != testIMPI {
+			t.Fatalf("an unchallenged REGISTER's Authorization = %q", v)
+		}
 	}
 }
 

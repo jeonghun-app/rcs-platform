@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
@@ -25,13 +27,16 @@ const (
 // Authentication errors.
 var (
 	// ErrNoUsableChallenge means a 401 or 407 offered no challenge these
-	// credentials can answer: AKAv1-MD5 for AKA keys, MD5 or SHA-256 for a
-	// password.
+	// credentials can answer: one for the home domain's realm, AKAv1-MD5
+	// for AKA keys or MD5 or SHA-256 for a password, with qop=auth (AKA may
+	// offer no qop).
 	ErrNoUsableChallenge = errors.New("sipua: no challenge these credentials can answer")
 	// ErrNetworkNotAuthenticated means AUTN did not verify with the card's
-	// keys (TS 33.102 §6.3.3): the challenge was not made with them. The UA
-	// stops there rather than registering again; for a simulator it means
-	// the test was set up with keys the HSS does not hold.
+	// keys, or the nonce held no RAND and AUTN (TS 33.102 §6.3.3). The UA
+	// reports it in one more REGISTER, with an empty response and no auts,
+	// as TS 24.229 §5.1.1.5.3 has a UE do, and the answer to that is the
+	// result: a *StatusError that wraps this error. For a simulator it
+	// means the HSS holds other keys than the card.
 	ErrNetworkNotAuthenticated = errors.New("sipua: AUTN did not verify: the challenge is not from the home network")
 )
 
@@ -47,7 +52,7 @@ type Credentials struct {
 
 type credentials struct {
 	// impi is the private user identity, the Digest username (TS 24.229
-	// §5.1.1.2.1).
+	// §5.1.1.2.2, §5.1.1.2.3).
 	impi     string
 	password []byte
 	card     *card
@@ -141,58 +146,95 @@ func (c Credentials) MarshalJSON() ([]byte, error) { return json.Marshal(redacte
 // initialAuthorization is the Authorization of an unchallenged REGISTER:
 // the IMPI and the home domain with an empty nonce and response, from
 // which the S-CSCF learns which private identity registers (TS 24.229
-// §5.1.1.2.1).
+// §5.1.1.2.2 for IMS AKA, §5.1.1.2.3 for SIP digest).
 func (ua *UA) initialAuthorization(uri string) string {
 	return digest.Credentials{Username: ua.cfg.Credentials.p.impi, Realm: ua.cfg.Domain, URI: uri}.Header()
 }
 
-// authorize answers the first usable challenge of a 401 or 407 to a
-// REGISTER for uri. It returns the header field to send, its value, and
-// whether the answer is a resynchronisation (AUTS) rather than RES, after
-// which the network challenges again.
-func (ua *UA) authorize(res *sip.Response, uri string) (field, value string, resync bool, err error) {
-	asked, field := "WWW-Authenticate", "Authorization"
-	if res.StatusCode == 407 {
-		asked, field = "Proxy-Authenticate", "Proxy-Authorization"
-	}
-	c := ua.cfg.Credentials.p
-	ch, ok := firstUsable(res.Header.Values(asked), c.card != nil)
-	if !ok {
-		return "", "", false, ErrNoUsableChallenge
-	}
-	cnonce, err := digest.NewCNonce(ua.cfg.Rand)
-	if err != nil {
-		return "", "", false, err
-	}
-	p := digest.ClientParams{Username: c.impi, Method: "REGISTER", URI: uri, CNonce: cnonce, NC: 1}
-	if c.card == nil {
-		p.Password = c.password
-	} else if p.Password, p.AUTS, err = c.card.answer(ch.Nonce); err != nil {
-		return "", "", false, err
-	}
-	creds, err := digest.Respond(ch, p)
-	if err != nil {
-		// Respond's errors name parameters, not values.
-		return "", "", false, fmt.Errorf("sipua: answering the challenge: %w", err)
-	}
-	return field, creds.Header(), len(p.AUTS) > 0, nil
+// authAnswer is the answer to one challenge: the header field, and next,
+// which gives its value for each REGISTER it goes in. A REGISTER after the
+// first under the same nonce takes the next nonce-count and a new cnonce
+// (RFC 7616 §3.4), or a proxy that checks them would take it for a replay.
+// resync marks an answer with AUTS, after which the network challenges
+// again; failure an answer that reports an AUTN that did not verify, after
+// which nothing is answered.
+type authAnswer struct {
+	field           string
+	next            func() (string, error)
+	resync, failure bool
 }
 
-// firstUsable returns the first challenge, in the server's order of
-// preference (RFC 8760 §2.4), that the credentials can answer.
-func firstUsable(values []string, aka bool) (digest.Challenge, bool) {
+// fixed is an authAnswer.next for a value that does not change.
+func fixed(v string) func() (string, error) { return func() (string, error) { return v, nil } }
+
+// authorize answers the topmost usable challenge of a 401 or 407 to a
+// REGISTER for uri (TS 24.229 §5.1.1.5.1, §5.1.1.5.4).
+func (ua *UA) authorize(res *sip.Response, uri string) (authAnswer, error) {
+	asked, a := "WWW-Authenticate", authAnswer{field: "Authorization"}
+	if res.StatusCode == 407 {
+		asked, a.field = "Proxy-Authenticate", "Proxy-Authorization"
+	}
+	c := ua.cfg.Credentials.p
+	values := res.Header.Values(asked)
+	if len(values) == 0 {
+		// No challenge at all: the status is the whole answer.
+		return a, &StatusError{Method: "REGISTER", Code: res.StatusCode}
+	}
+	ch, ok := firstUsable(values, c.card != nil, ua.cfg.Domain)
+	if !ok {
+		return a, &StatusError{Method: "REGISTER", Code: res.StatusCode, Err: ErrNoUsableChallenge}
+	}
+	var err error
+	p := digest.ClientParams{Username: c.impi, Method: "REGISTER", URI: uri}
+	if c.card == nil {
+		p.Password = c.password
+	} else if p.Password, p.AUTS, err = c.card.answer(ch.Nonce); errors.Is(err, ErrNetworkNotAuthenticated) {
+		// TS 24.229 §5.1.1.5.3: the network failed authentication, and
+		// the UE says so in a further REGISTER with the challenge's
+		// nonce, an empty response and no auts.
+		a.next = fixed(digest.Credentials{Username: c.impi, Realm: ch.Realm, Nonce: ch.Nonce, URI: uri, Algorithm: digest.AKAv1MD5, Opaque: ch.Opaque}.Header())
+		a.failure = true
+		return a, nil
+	} else if err != nil {
+		return a, err
+	}
+	a.resync = len(p.AUTS) > 0
+	a.next = func() (string, error) {
+		p.NC++
+		cnonce, err := digest.NewCNonce(ua.cfg.Rand)
+		if err != nil {
+			return "", err
+		}
+		p.CNonce = cnonce
+		creds, err := digest.Respond(ch, p)
+		if err != nil {
+			// Respond's errors name parameters, not values.
+			return "", fmt.Errorf("sipua: answering the challenge: %w", err)
+		}
+		return creds.Header(), nil
+	}
+	return a, nil
+}
+
+// firstUsable returns the topmost challenge the credentials can answer
+// (TS 24.229 §5.1.1.5.4, RFC 8760 §2.4). Only a challenge for realm, the
+// home domain, is: an answer for another realm would hand whoever sent it
+// a response computed from the home password, to guess it from offline.
+// Digest needs qop=auth; AKA may offer no qop (§5.4.1.2.1A).
+func firstUsable(values []string, aka bool, realm string) (digest.Challenge, bool) {
 	for _, v := range values {
 		ch, err := digest.ParseChallenge(v)
-		if err != nil {
+		if err != nil || !strings.EqualFold(ch.Realm, realm) {
 			continue
 		}
+		auth := slices.ContainsFunc(ch.QOP, func(q string) bool { return strings.EqualFold(q, digest.QOPAuth) })
 		switch ch.Algorithm {
 		case digest.AKAv1MD5:
-			if aka {
+			if aka && (auth || len(ch.QOP) == 0) {
 				return ch, true
 			}
 		case digest.MD5, digest.SHA256:
-			if !aka {
+			if !aka && auth {
 				return ch, true
 			}
 		}
@@ -207,7 +249,9 @@ func firstUsable(values []string, aka bool) (digest.Challenge, bool) {
 func (c *card) answer(nonce string) (res, auts []byte, err error) {
 	rand, autn, err := digest.ParseAKANonce(nonce)
 	if err != nil {
-		return nil, nil, errors.New("sipua: the AKA nonce does not hold RAND and AUTN")
+		// Without RAND and AUTN the network cannot be authenticated
+		// either; it is answered the same way.
+		return nil, nil, ErrNetworkNotAuthenticated
 	}
 	sqn, err := c.m.CheckAUTN(rand, autn)
 	if err != nil {

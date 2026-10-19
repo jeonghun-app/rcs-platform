@@ -74,15 +74,23 @@ var (
 	ErrNoBinding = errors.New("sipua: the registrar lists no binding for this flow")
 )
 
-// StatusError is a final response that is not a success.
+// StatusError is a final response that is not a success. Err, when set,
+// says more: ErrNetworkNotAuthenticated, which the UA had reported in the
+// request, or ErrNoUsableChallenge, for a 401 or 407 it could not answer.
 type StatusError struct {
 	Method string
 	Code   int
+	Err    error
 }
 
 func (e *StatusError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%v; %s answered %d", e.Err, e.Method, e.Code)
+	}
 	return fmt.Sprintf("sipua: %s answered %d", e.Method, e.Code)
 }
+
+func (e *StatusError) Unwrap() error { return e.Err }
 
 // Config configures a UA.
 type Config struct {
@@ -459,30 +467,43 @@ func (ua *UA) register(ctx context.Context, expires time.Duration) (*Registratio
 	domain := sip.URI{Scheme: "sip", Host: ua.cfg.Domain}
 	uri := domain.String()
 	creds := ua.cfg.Credentials
-	var field, value string
+	// auth holds the credentials sent, by field. A 407 and a 401 are
+	// answered side by side: what one hop's challenge asked for goes in
+	// every later REGISTER of the Call-ID (RFC 3261 §22.3), and the
+	// Authorization with the IMPI stays even while a proxy challenges
+	// (TS 24.229 §5.1.1.2.2).
+	auth := map[string]func() (string, error){}
 	if creds.set() {
-		field, value = "Authorization", ua.initialAuthorization(uri)
+		auth["Authorization"] = fixed(ua.initialAuthorization(uri))
 	}
-	challenges, resynced, lastResync := 0, false, false
+	answered := map[int]bool{}
+	challenges, resynced, lastResync, reportedFailure := 0, false, false, false
 	for {
-		res, err := ua.sendRegister(ctx, domain, expires, field, value)
+		res, err := ua.sendRegister(ctx, domain, expires, auth)
 		if err != nil {
 			return nil, err
 		}
+		if reportedFailure && res.StatusCode >= 200 {
+			return nil, &StatusError{Method: "REGISTER", Code: res.StatusCode, Err: ErrNetworkNotAuthenticated}
+		}
 		if res.StatusCode == 401 || res.StatusCode == 407 {
-			// The first challenge is answered. Another only after AUTS,
-			// when the network challenges again with a fresh vector, or
-			// when it says the nonce had gone stale; otherwise a 401 to
-			// these credentials is final.
-			answer := challenges == 0 || lastResync || staleChallenge(res)
+			// Each kind of challenge is answered once. Another only after
+			// AUTS, when the network challenges again with a fresh vector,
+			// or when it says the nonce had gone stale; otherwise a
+			// challenge to these credentials is final.
+			answer := !answered[res.StatusCode] || lastResync || staleChallenge(res)
 			if !creds.set() || !answer || challenges == maxChallenges {
 				return nil, &StatusError{Method: "REGISTER", Code: res.StatusCode}
 			}
 			challenges++
-			if field, value, lastResync, err = ua.authorize(res, uri); err != nil {
+			answered[res.StatusCode] = true
+			a, err := ua.authorize(res, uri)
+			if err != nil {
 				return nil, err
 			}
-			resynced = resynced || lastResync
+			auth[a.field] = a.next
+			lastResync, reportedFailure = a.resync, a.failure
+			resynced = resynced || a.resync
 			continue
 		}
 		if res.StatusCode >= 300 {
@@ -512,7 +533,7 @@ func staleChallenge(res *sip.Response) bool {
 
 // sendRegister sends one REGISTER, in the registration's Call-ID with the
 // next CSeq, and returns its final response.
-func (ua *UA) sendRegister(ctx context.Context, domain sip.URI, expires time.Duration, authField, auth string) (*sip.Response, error) {
+func (ua *UA) sendRegister(ctx context.Context, domain sip.URI, expires time.Duration, auth map[string]func() (string, error)) (*sip.Response, error) {
 	ua.mu.Lock()
 	ua.regCSeq++
 	cseq := ua.regCSeq
@@ -528,8 +549,13 @@ func (ua *UA) sendRegister(ctx context.Context, domain sip.URI, expires time.Dur
 	add(req, &err, "Supported", "path, outbound")
 	add(req, &err, "Contact", ua.contact.String())
 	add(req, &err, "Expires", strconv.FormatInt(int64(expires/time.Second), 10))
-	if authField != "" {
-		add(req, &err, authField, auth)
+	for _, field := range []string{"Authorization", "Proxy-Authorization"} {
+		if next, ok := auth[field]; ok && err == nil {
+			var v string
+			if v, err = next(); err == nil {
+				add(req, &err, field, v)
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
