@@ -30,16 +30,25 @@ func TestNetworkFailuresLoseTheirAddresses(t *testing.T) {
 	}
 	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 	_ = ln.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The lookup goes to a resolver that cannot be reached, which fails at
+	// once with a *net.DNSError that is not a timeout. The host's own
+	// resolver answered in its own time, which on a loaded host came after
+	// the test's deadline (#130). The NXDOMAIN shape (IsNotFound) is
+	// TestEachFailureHasItsReason's.
+	noResolver := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("no resolver here")
+	}}
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: (&net.Dialer{Resolver: noResolver}).DialContext,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	client := &http.Client{}
 	for _, tt := range []struct {
 		url  string
 		want []error
 	}{
 		{"http://127.0.0.1:" + port + "/ft", []error{safeerr.ErrRefused}},
-		// Without a resolver to ask, the lookup times out instead.
-		{"http://ft.rcs-sim-test.invalid/ft", []error{safeerr.ErrNoSuchHost, safeerr.ErrTimeout}},
+		{"http://ft.rcs-sim-test.invalid/ft", []error{safeerr.ErrNoSuchHost}},
 	} {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tt.url, nil)
 		_, err := client.Do(req)
