@@ -356,10 +356,9 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 }
 
 // Leave records that who left the group, by a BYE or by declining the
-// focus's INVITE. A chairman's role passes to the participant in the group
-// longest, joined ones first; when nobody is left, the group ends. What is
-// still queued for who from the group is given up
-// (messaging.Engine.ParticipantLeft).
+// focus's INVITE. A chairman's role passes on (successor); when nobody is
+// left, the group ends. What is still queued for who from the group is
+// given up (messaging.Engine.ParticipantLeft).
 func (s *Service) Leave(ctx context.Context, uri, who string) error {
 	who, ok := canonical(who)
 	if !ok {

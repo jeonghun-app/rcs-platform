@@ -486,7 +486,8 @@ func TestAGroupCopyWaitsWhenTheGroupCannotSay(t *testing.T) {
 		r.e.UserRegistered(bob, true)
 		waitFor(t, "idle", r.idle)
 	}
-	if len(r.d.invites) != 0 || r.store.(*store.Memory).Len(bob) != 1 || r.m.get("store.failed") != 1 {
+	// The retry timer and the registration may each make an attempt.
+	if len(r.d.invites) != 0 || r.store.(*store.Memory).Len(bob) != 1 || r.m.get("store.failed") == 0 {
 		t.Fatalf("invites %d, metrics %v", len(r.d.invites), r.m)
 	}
 }

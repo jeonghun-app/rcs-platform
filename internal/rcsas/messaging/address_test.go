@@ -108,7 +108,7 @@ func TestAOneToOneMessageNamesItsSenderOnce(t *testing.T) {
 			t.Errorf("%q: %q", extra, got)
 		}
 	}
-	if r.store.(*store.Memory).Len(bob) != 0 {
+	if r.store.(*store.Memory).Len(bob) != 0 || len(r.d.pagers) != 0 {
 		t.Fatal("a refused message was queued")
 	}
 	// What the path accepts goes out as it came, and reads the same way.
@@ -116,11 +116,11 @@ func TestAOneToOneMessageNamesItsSenderOnce(t *testing.T) {
 	if err := r.e.Submit(t.Context(), standalone(alice, bob, body)); err != nil {
 		t.Fatal(err)
 	}
-	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
-	if err != nil || len(ms) != 1 || string(ms[0].CPIM) != string(body) {
-		t.Fatalf("queued %+v, %v", ms, err)
+	d := r.d.nextPager(t)
+	if string(d.CPIM) != string(body) {
+		t.Fatalf("delivered %q", d.CPIM)
 	}
-	readAddresses(t, ms[0].CPIM, cpim.Address{URI: AnonymousURI}, "<"+AnonymousURI+">")
+	readAddresses(t, d.CPIM, cpim.Address{URI: AnonymousURI}, "<"+AnonymousURI+">")
 }
 
 // A group's participants read the author rcs-as checked, under the name the
