@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	goruntime "runtime"
 	"strings"
 	"sync/atomic"
@@ -167,20 +168,33 @@ func TestSweepRunsOnEveryTickAndReportsFailures(t *testing.T) {
 	}
 }
 
+// inCI reports whether the tests run in CI, where make passes the CI
+// variable into the toolchain container. "false" and "0" mean not.
+func inCI() bool {
+	v := os.Getenv("CI")
+	return v != "" && v != "false" && v != "0"
+}
+
 // privateIPv4 returns an RFC 1918 address of this host, such as a
-// container's eth0, or skips the test when there is none.
+// container's eth0. Without one the test is skipped, except in CI (the CI
+// variable, which make passes into the toolchain container), where a skip
+// would go unseen without -v and leave the production dial untested (#119).
 func privateIPv4(t *testing.T) netip.Addr {
 	t.Helper()
+	skip := t.Skipf
+	if inCI() {
+		skip = t.Fatalf
+	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		t.Skipf("no interface addresses: %v", err)
+		skip("no interface addresses: %v", err)
 	}
 	for _, a := range addrs {
 		if p, err := netip.ParsePrefix(a.String()); err == nil && p.Addr().Is4() && runtime.IsPrivateAddr(p.Addr()) {
 			return p.Addr()
 		}
 	}
-	t.Skip("this host has no RFC 1918 address to put the HSS on")
+	skip("this host has no RFC 1918 address to put the HSS on")
 	return netip.Addr{}
 }
 
@@ -266,12 +280,47 @@ func TestRunInStagingReachesTheHSSOnlyAtAPrivateAddress(t *testing.T) {
 					!strings.Contains(fmt.Sprint(failures[0]["error"]), runtime.ErrAddressNotPrivate.Error()) {
 					t.Fatalf("status %d, lookup failures %v, want 503 and ErrAddressNotPrivate", status, failures)
 				}
-			} else if status == http.StatusServiceUnavailable || status == http.StatusUnauthorized || len(failures) != 0 {
+			} else if status != http.StatusNoContent || len(failures) != 0 {
 				t.Fatalf("status %d, lookup failures %v, want alice authenticated", status, failures)
 			}
 			if strings.Contains(h.Output(), "provisioning-token") {
 				t.Fatalf("the token was logged:\n%s", h.Output())
 			}
 		})
+	}
+}
+
+// The production wiring gives the dialer FT_HSS_TIMEOUT: http.Client's
+// Timeout answers the caller in time, but the transport dials with a
+// context the request's end does not cancel, so without it a dial to an
+// address that never answers would hold a connection slot long after
+// (#119; QA's test from the reviews of #116 and #123). 10.255.255.1 hangs
+// on this host and CI runners. Where it is refused at once instead, the
+// test cannot see the dial timeout, and says so: it skips, or in CI fails.
+// The deadline counts from the start of the lookup, so a dialer given a
+// longer timeout than FT_HSS_TIMEOUT (DefaultHSSTimeout, say) fails too.
+func TestTheProductionHSSDialEndsWithinTheHSSTimeout(t *testing.T) {
+	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL("http://10.255.255.1:8081"), HSSTimeout: 300 * time.Millisecond, MaxLookups: 1, Realm: realm}
+	src := credentialSource(cfg, true).(*HSSCredentials)
+	start := time.Now()
+	_, err := src.Lookup(t.Context(), alice, digest.SHA256)
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		msg := "10.255.255.1 did not hang here (%v), so this test cannot see the dial timeout"
+		if inCI() {
+			t.Fatalf(msg, err)
+		}
+		t.Skipf(msg, err)
+	}
+	deadline := start.Add(cfg.HSSTimeout + time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		if !strings.Contains(string(buf[:goruntime.Stack(buf, true)]), "InternalDialer.DialContext") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the dial still runs %v after a %v FT_HSS_TIMEOUT", time.Since(start), cfg.HSSTimeout)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
