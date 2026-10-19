@@ -67,6 +67,12 @@ type Limit struct {
 	SenderBytes int64
 	GroupCount  int
 	GroupBytes  int64
+	// SummaryCount and SummaryBytes bound the group notification summaries
+	// in a queue together (Message.InSummaryTotal, GroupSummaries): beside
+	// the group notifications' total, so that the two together still leave
+	// most of a queue to everyone else.
+	SummaryCount int
+	SummaryBytes int64
 }
 
 // Mode is how a message was sent, which decides how it may be delivered.
@@ -150,6 +156,14 @@ type Message struct {
 // Neither is an identity, which is a URI.
 const GroupNotifications = "#group-notifications"
 
+// GroupSummaries names the total of a queue's group notification
+// summaries (Limit.SummaryCount). It is not an identity, which is a URI.
+const GroupSummaries = "#group-summaries"
+
+// InSummaryTotal reports whether m counts toward GroupSummaries: it is a
+// summary.
+func (m Message) InSummaryTotal() bool { return m.Summary }
+
 // InGroupTotal reports whether m counts toward the total of a queue's
 // group notifications, GroupNotifications: it is a group notification.
 func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification && !m.Summary }
@@ -169,9 +183,9 @@ func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification 
 //     keeps one busy group from crowding out the receipts of the others;
 //   - a 1-to-1 notification counts against none.
 //
-// A summary counts against none, nor toward the group total: it is there
-// because those were full, and there is at most one per message the
-// queue's owner wrote.
+// A summary counts against none, nor toward the group total, since it is
+// there because those were full; summaries have a total of their own
+// (InSummaryTotal).
 func (m Message) ShareKey() (string, bool) {
 	switch {
 	case m.Summary:
@@ -255,7 +269,8 @@ type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
 	// beyond l, ErrSenderShareFull if what counts against m's share
-	// (Message.ShareKey), or the total of group notifications for one, would.
+	// (Message.ShareKey), or the total of group notifications or of
+	// summaries for one, would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID

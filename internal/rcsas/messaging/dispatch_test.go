@@ -492,7 +492,7 @@ func TestOneSenderCannotLockOthersOutOfAQueue(t *testing.T) {
 		t.Fatalf("metrics %v", r.m)
 	}
 	if got := queueLimit(r.e.cfg); got != (store.Limit{Count: 8, Bytes: DefaultMaxQueueBytes, SenderCount: 2, SenderBytes: DefaultMaxQueueBytes / 4,
-		GroupCount: 2, GroupBytes: DefaultMaxQueueBytes / 4}) {
+		GroupCount: 2, GroupBytes: DefaultMaxQueueBytes / 4, SummaryCount: 1, SummaryBytes: DefaultMaxQueueBytes / 8}) {
 		t.Fatalf("limit %+v", got)
 	}
 }

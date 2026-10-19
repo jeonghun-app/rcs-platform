@@ -430,3 +430,33 @@ func TestAConnectedAuthorGetsItsReceiptsAsTheyCome(t *testing.T) {
 		t.Fatalf("metrics %v", r.m)
 	}
 }
+
+// The reviews' scaled case: an author's summaries have a total of their
+// own, so that with its receipts they never fill the queue. Queue 40,
+// receipts' total 10, summaries' 5: of the 40 receipts bob sends, 10 are
+// queued, 5 summarized and 25 dropped, and dave's 1-to-1 message goes in.
+func TestSummariesLeaveTheQueueTo1To1Messages(t *testing.T) {
+	const dave = "tel:+15550100005"
+	r := newRig(t, Config{MaxQueueMessages: 40, QueueSenderShare: 1, SenderRate: Rate{PerMinute: -1}})
+	r.e.SetGroupHandler(members{all: []string{alice, bob, carol}})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	for i := range 40 {
+		id := fmt.Sprint("m", i)
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, id, "hi", imdn.Display))); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(bob, receipt(t, id, imdn.DisplayNotification, imdn.Displayed))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if notes, sums := queuedReceipts(t, r, alice); notes != 10 || sums != 5 {
+		t.Fatalf("%d receipts and %d summaries queued", notes, sums)
+	}
+	if got := r.m.get("group.notification.dropped"); got != 25 {
+		t.Fatalf("%d dropped", got)
+	}
+	if err := r.e.Submit(t.Context(), standalone(dave, alice, chat(t, "d1", "are you there?", 0))); err != nil {
+		t.Fatalf("dave's 1-to-1 message: %v", err)
+	}
+}

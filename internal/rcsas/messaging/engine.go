@@ -49,8 +49,12 @@ const (
 	// group's sender share of them: an author in many groups is not locked
 	// out of 1-to-1 messages by receipts (threat model T10, T11).
 	GroupNotificationsShare = 4
-	DefaultDeliveryTimeout  = 30 * time.Second
-	DefaultInviteTimeout    = 2 * time.Minute
+	// GroupSummariesShare: the summaries of group notifications in a
+	// queue (#166) hold at most an eighth of it, beside the notifications'
+	// quarter, so that the two together never lock out 1-to-1 messages.
+	GroupSummariesShare    = 8
+	DefaultDeliveryTimeout = 30 * time.Second
+	DefaultInviteTimeout   = 2 * time.Minute
 	// DefaultAnswerTimeout is how long an offered leg waits for its
 	// answer: the INVITE client transaction's limit (RFC 3261 §17.1.1.2,
 	// 64 × T1).
@@ -264,8 +268,10 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 func queueLimit(c Config) store.Limit {
 	l := store.Limit{
 		Count: c.MaxQueueMessages, Bytes: c.MaxQueueBytes,
-		GroupCount: (c.MaxQueueMessages + GroupNotificationsShare - 1) / GroupNotificationsShare,
-		GroupBytes: c.MaxQueueBytes / GroupNotificationsShare,
+		GroupCount:   (c.MaxQueueMessages + GroupNotificationsShare - 1) / GroupNotificationsShare,
+		GroupBytes:   c.MaxQueueBytes / GroupNotificationsShare,
+		SummaryCount: (c.MaxQueueMessages + GroupSummariesShare - 1) / GroupSummariesShare,
+		SummaryBytes: c.MaxQueueBytes / GroupSummariesShare,
 	}
 	if c.QueueSenderShare > 1 {
 		l.SenderCount = (c.MaxQueueMessages + c.QueueSenderShare - 1) / c.QueueSenderShare

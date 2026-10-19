@@ -650,6 +650,43 @@ func summaries(t *testing.T, s store.Store) {
 	if err := s.RemoveSummary(ctx, h2, "task-a", 0); err != nil {
 		t.Fatalf("RemoveSummary without a record = %v", err)
 	}
+	// Summaries have a total of their own, which a removal frees.
+	capped := store.Limit{Count: 10, SummaryCount: 1}
+	summary := func(id string) store.Message {
+		return store.Message{Recipient: alice, ID: "r-" + id, Sender: group, Mode: store.Group, Notification: true,
+			Summary: true, MessageID: id, Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	if err := s.Enqueue(ctx, summary("g-4"), capped); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, summary("g-5"), capped); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("a summary beyond the summaries' total = %v", err)
+	}
+	n2 := message(alice, "n2", t0)
+	n2.Sender, n2.Author, n2.Mode, n2.Notification = group, carol, store.Group, true
+	if err := s.Enqueue(ctx, n2, capped); err != nil {
+		t.Fatalf("a notification beside a full summaries' total = %v", err)
+	}
+	h4, err := s.Claim(ctx, alice, "r-g-4", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveSummary(ctx, h4, "task-a", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, summary("g-5"), capped); err != nil {
+		t.Fatalf("a summary after RemoveSummary freed the total = %v", err)
+	}
+	h5, err := s.Claim(ctx, alice, "r-g-5", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, h5, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, summary("g-6"), capped); err != nil {
+		t.Fatalf("a summary after Remove freed the total = %v", err)
+	}
 }
 
 func sent(t *testing.T, s store.Store) {

@@ -209,6 +209,9 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if m.InGroupTotal() {
 		shares = append(shares, store.GroupNotifications)
 	}
+	if m.InSummaryTotal() {
+		shares = append(shares, store.GroupSummaries)
+	}
 	fixed, cerr := s.recount(ctx, m.Recipient, shares...)
 	if cerr != nil || !fixed {
 		return err
@@ -267,6 +270,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if m.InGroupTotal() {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupNotifications), 1, m.Size(), l.GroupCount, l.GroupBytes, ttl)})
 	}
+	if m.InSummaryTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), 1, m.Size(), l.SummaryCount, l.SummaryBytes, ttl)})
+	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok {
 		switch {
@@ -314,6 +320,9 @@ func sharesOf(item map[string]types.AttributeValue) []string {
 	}
 	if m.InGroupTotal() {
 		out = append(out, store.GroupNotifications)
+	}
+	if m.InSummaryTotal() {
+		out = append(out, store.GroupSummaries)
 	}
 	return out
 }
@@ -566,6 +575,9 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 	if m.InGroupTotal() {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupNotifications), -1, -m.Size(), 0, 0, time.Time{})})
 	}
+	if m.InSummaryTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), -1, -m.Size(), 0, 0, time.Time{})})
+	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
 		_, err := s.current(ctx, "remove", k)
@@ -597,6 +609,7 @@ func (s *Store) RemoveSummary(ctx context.Context, m store.Message, owner string
 			ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
 		}},
 		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), -1, -m.Size(), 0, 0, time.Time{})},
+		{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), -1, -m.Size(), 0, 0, time.Time{})},
 		{ConditionCheck: &types.ConditionCheck{
 			TableName:                 aws.String(s.table),
 			Key:                       key(identityKey(sentPrefix, m.Sender), m.MessageID),
@@ -617,7 +630,7 @@ func (s *Store) RemoveSummary(ctx context.Context, m store.Message, owner string
 				return err
 			}
 			return fmt.Errorf("awsstore: remove summary: %w", store.ErrConflict)
-		case len(failed) > 2 && failed[2]:
+		case len(failed) > 3 && failed[3]:
 			return fmt.Errorf("awsstore: remove summary: %w", store.ErrMarksChanged)
 		}
 	}
