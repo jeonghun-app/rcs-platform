@@ -70,12 +70,14 @@
 // only the ends of the value. Where Go's parser departs from IEEE 1003.1,
 // Compile refuses the pattern and names the construct rather than compile
 // Go's reading (#67): a backslash inside a bracket expression ("[\.]" is a
-// backslash or a dot in POSIX, a dot in Go), a backslash before a letter or
-// digit ("\x41", "\d", "\n", "\1"), and collating symbols and equivalence
-// classes ("[[.a.]]", "[[=a=]]"). A backslash before punctuation ("\.",
-// "\+") is a literal, as everywhere. Wrapping a pattern in ".*" on both
-// sides never changes what it selects. Operators writing iFC, and
-// docs/hss.md, follow these rules.
+// backslash or a dot in POSIX, a dot in Go), a backslash before anything but
+// an ERE special character ("\x41", "\d", "\n", "\1", "\<", "\@"),
+// collating symbols and equivalence classes ("[[.a.]]", "[[=a=]]"), the
+// non-class "[[:^alpha:]]" and an interval without a lower bound ("a{,3}").
+// A backslash before a special character ("\.", "\+") is a literal, as
+// everywhere. Named classes hold ASCII characters only, as in the POSIX
+// locale. Wrapping a pattern in ".*" on both sides never changes what it
+// selects. Operators writing iFC, and docs/hss.md, follow these rules.
 //
 // # Presenting a SIP request
 //

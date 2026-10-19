@@ -310,8 +310,9 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // IEEE 1003.1 is refused first, naming it ([ereDeparture]). The pattern is
 // then parsed as an ERE, which refuses Perl extensions such as (?i), and the
 // parsed tree, not the source text, is what gets compiled: Go's matcher
-// reads Perl syntax, in which some valid EREs mean something else. "0+?" is (0+)? in an ERE, which matches the empty value,
-// but the lazy 0+? in Perl, which needs a 0 (#61).
+// reads Perl syntax, in which some valid EREs mean something else. "0+?"
+// is (0+)? in an ERE, which matches the empty value, but the lazy 0+? in
+// Perl, which needs a 0 (#61).
 //
 // A case-insensitive pattern is parsed with FoldCase, so that the parser
 // folds every literal and bracket expression before it merges them; folding

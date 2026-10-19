@@ -40,6 +40,30 @@ func TestCompileRefusesWhatGoReadsDifferentlyFromAPOSIXERE(t *testing.T) {
 		{`[[.a.]]`, `the collating symbol [. .]`},
 		{`[[=a=]]`, `the equivalence class [= =]`},
 		{`x[^[.-.]]`, `the collating symbol [. .]`},
+		// §9.4.6 leaves "{" not followed by a digit undefined; glibc reads
+		// "{,3}" as {0,3}, Go as the text "{,3}".
+		{`a{,3}`, `the interval {,n}`},
+		{`^x{,}$`, `the interval {,n}`},
+		// Not a POSIX class name; Go reads it as the negated class.
+		{`[[:^alpha:]]`, `the negated class [:^ :]`},
+		// Only special characters may be escaped (§9.4.2): glibc and musl
+		// read \< and \> as word boundaries, glibc \` and \' as the ends of
+		// the value; Go reads all of these as the characters themselves.
+		{`\<a`, `the escape \<`},
+		{`a\>`, `the escape \>`},
+		{"\\`a", "the escape \\`"},
+		{`a\'`, `the escape \'`},
+		{`a\-b`, `the escape \-`},
+		{`user\@host`, `the escape \@`},
+		{`a\/b`, `the escape \/`},
+		{`tel\:`, `the escape \:`},
+		{`\"x\"`, `the escape \"`},
+		{"x\\\xc3\xa9", "a backslash before a character that is not special"},
+		// A "]" first in the list, after an optional "^", is a member, so
+		// the backslash after it is still inside the brackets.
+		{`[]\.]`, `a backslash inside a bracket expression`},
+		{`[^]\.]`, `a backslash inside a bracket expression`},
+		{`[a[:^digit:]]`, `the negated class [:^ :]`},
 	}
 	for _, tc := range tests {
 		for _, c := range []Condition{RequestURI(tc.pattern), SIPHeader{Header: tc.pattern}, SIPHeader{Header: "From", Content: tc.pattern}, SessionDescription{Line: "m", Content: tc.pattern}} {
@@ -51,19 +75,21 @@ func TestCompileRefusesWhatGoReadsDifferentlyFromAPOSIXERE(t *testing.T) {
 	}
 }
 
-func TestCompileKeepsEscapedPunctuationAndBracketsWithoutBackslashes(t *testing.T) {
+func TestCompileKeepsEscapedSpecialCharactersAndBracketsWithoutBackslashes(t *testing.T) {
 	for pattern, value := range map[string]string{
-		`conf\.example\.com`: "sip:conf.example.com",
-		`\+1555`:             "tel:+15550100001",
-		`a\-b\@c\/d\:e`:      "a-b@c/d:e",
-		`\\`:                 `a\b`,
-		`[.]com`:             ".com",
-		`[]a]`:               "]",
-		`[^]a]`:              "b",
-		`[[:digit:]]+`:       "42",
-		`[a-z[]`:             "[",
-		`x\[\.a\.\]`:         "x[.a.]",
-		`\(\)\*\?\{\}\|\^\$`: "()*?{}|^$",
+		`conf\.example\.com`:         "sip:conf.example.com",
+		`\+1555`:                     "tel:+15550100001",
+		`\\`:                         `a\b`,
+		`[.]com`:                     ".com",
+		`[]a]`:                       "]",
+		`[^]a]`:                      "b",
+		`[[:digit:]]+`:               "42",
+		`[a-z[]`:                     "[",
+		`x\[\.a\.\]`:                 "x[.a.]",
+		`\(\)\*\?\{\}\|\^\$\[\]\.\+`: "()*?{}|^$[].+",
+		`a\{,3\}`:                    "a{,3}",
+		`a{0,3}b`:                    "aab",
+		`[{,]`:                       ",",
 	} {
 		budget := MaxSetInstructions
 		p, err := compilePattern("Content", pattern, 0, &budget)
@@ -83,6 +109,22 @@ func TestUnclosedBracketExpressionsAreStillRefusedAsInvalid(t *testing.T) {
 		_, err := compilePattern("Content", pattern, 0, &budget)
 		if err == nil || !strings.Contains(err.Error(), "is not a POSIX extended regular expression") {
 			t.Errorf("%q: %v", pattern, err)
+		}
+	}
+}
+
+// Compile takes profiles of up to the provisioning API's 256 KiB, so the scan
+// must stay linear: a "[:" with no ":]" after it is searched for once, not
+// once per "[:". A quadratic scan would run for many minutes on this input
+// and fail by the test timeout; a linear one takes milliseconds.
+func TestTheDepartureScanIsLinear(t *testing.T) {
+	for _, in := range []string{
+		"[" + strings.Repeat("[:", 2<<20) + "a]",
+		strings.Repeat("[[:", 1<<20),
+		strings.Repeat("[[:alpha:]", 1<<19) + "]",
+	} {
+		if got := ereDeparture(in); got != "" {
+			t.Fatalf("departure %q in a pattern without one", got)
 		}
 	}
 }
