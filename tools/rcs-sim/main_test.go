@@ -46,6 +46,7 @@ func TestUsageErrorsExitWithTwo(t *testing.T) {
 		{"self not a URI", nil, []string{"-self", "nobody", "all"}, "-self"},
 		{"peer not a URI", nil, []string{"-peer", "nobody", "all"}, "-peer"},
 		{"no file size", nil, []string{"-file-size", "0", "all"}, "-file-size"},
+		{"no settle time", nil, []string{"-upload-settle", "0s", "all"}, "-upload-settle"},
 		{"step timeout within the idle wait", nil, []string{"-idle-wait", "30s", "-step-timeout", "30s", "all"}, "-step-timeout must be longer than -idle-wait"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -84,6 +85,9 @@ func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 		// Quiet for six keep-alive intervals, so a slow scheduler still
 		// sees one go out.
 		"-msrp-keepalive", "100ms", "-idle-wait", "600ms",
+		// Only the step timeout bounds get_upload_info: one slow answer
+		// on a loaded host must not end it (#176).
+		"-upload-settle", "1h",
 		"all",
 	}
 	code, out, errOut := call(lookup, args...)
