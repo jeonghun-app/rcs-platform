@@ -30,7 +30,15 @@ const waitFor = 5 * time.Second
 // recorder is a Handler that queues what it receives.
 type recorder chan Inbound
 
-func (r recorder) handle(in Inbound) { r <- in }
+// handle never blocks the transport: a test that receives far more than it
+// expects then fails on its assertions rather than hanging in Close, which
+// waits for the reading goroutines.
+func (r recorder) handle(in Inbound) {
+	select {
+	case r <- in:
+	default:
+	}
+}
 
 func (r recorder) next(t *testing.T) Inbound {
 	t.Helper()
@@ -54,7 +62,7 @@ func (r recorder) none(t *testing.T) {
 
 func newTransport(t *testing.T, cfg Config) (*Transport, recorder) {
 	t.Helper()
-	rec := make(recorder, 16)
+	rec := make(recorder, 1024)
 	tr, err := New(cfg, rec.handle)
 	if err != nil {
 		t.Fatal(err)

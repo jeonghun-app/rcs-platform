@@ -436,12 +436,24 @@ func TestNewUDPSourceIsCheapWhenTheTableIsFull(t *testing.T) {
 	for i := range DefaultMaxUDPFlows {
 		tab.addUDP(tab.newFlow(UDP, lis, netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), 5060)))
 	}
-	start := time.Now()
-	for i := range 100 {
-		tab.addUDP(tab.newFlow(UDP, lis, netip.AddrPortFrom(netip.AddrFrom4([4]byte{11, 0, 0, byte(i)}), 5060)))
+	// The best of five batches, so a loaded host's scheduling does not count.
+	// A scan of the table costs milliseconds (3.3 ms when QA measured it, ten
+	// times that under the race detector); the limit sits far below either and
+	// far above an O(1) insert.
+	limit := 100 * time.Microsecond
+	if raceEnabled {
+		limit = time.Millisecond
 	}
-	if per := time.Since(start) / 100; per > 100*time.Microsecond {
-		t.Fatalf("each new source held the flow-table lock for %v", per)
+	best := time.Hour
+	for batch := range 5 {
+		start := time.Now()
+		for i := range 20 {
+			tab.addUDP(tab.newFlow(UDP, lis, netip.AddrPortFrom(netip.AddrFrom4([4]byte{11, 0, byte(batch), byte(i)}), 5060)))
+		}
+		best = min(best, time.Since(start)/20)
+	}
+	if best > limit {
+		t.Fatalf("each new source held the flow-table lock for %v", best)
 	}
 	if s := tab.stats(); s.udp != DefaultMaxUDPFlows || s.evicted != 100 {
 		t.Fatalf("stats = %+v", s)
@@ -472,10 +484,20 @@ func TestOnFlowClosedRunsOffTheClosingGoroutineAndInOrder(t *testing.T) {
 		ids = append(ids, rec.next(t).Source.Flow)
 	}
 	mu.Lock()
+	locked := true
+	// If a CloseFlow blocks and the test fails, release the lock before the
+	// transport's cleanup closes the remaining flows, so the failure is
+	// reported instead of hanging.
+	defer func() {
+		if locked {
+			mu.Unlock()
+		}
+	}()
 	for _, id := range ids {
 		within(t, func() error { server.CloseFlow(id); return nil })
 	}
 	mu.Unlock()
+	locked = false
 	for _, want := range ids {
 		select {
 		case got := <-order:

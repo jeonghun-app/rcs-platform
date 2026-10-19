@@ -204,8 +204,9 @@ type Config struct {
 	// Calls run one at a time, in the order the flows ended, on a goroutine of
 	// their own: a flow can end inside any send, with a transaction's lock
 	// held, so a synchronous call could not safely reach back into the
-	// transaction layer. This one may call anything. Close returns once every
-	// call has been made.
+	// transaction layer. This one may call anything except Transport.Close,
+	// which waits for this goroutine to finish and so would wait for itself.
+	// Close returns once every call has been made.
 	OnFlowClosed func(id FlowID, info FlowInfo)
 
 	// Dialer opens outbound connections; nil uses a net.Dialer with the core
@@ -317,6 +318,9 @@ type Transport struct {
 	budget  queueBudget
 	// closures delivers OnFlowClosed; nil when there is none.
 	closures *closureQueue
+	// lastShedScan is when shedStalledQueue last looked at every flow, in Unix
+	// nanoseconds.
+	lastShedScan atomic.Int64
 
 	mu        sync.Mutex
 	listeners []*listener
@@ -550,12 +554,15 @@ func (t *Transport) isClosed() bool {
 }
 
 // closeFlow closes a flow's connection, if it has one, and forgets the flow.
-func (t *Transport) closeFlow(f *flow) {
-	if f.closed.CompareAndSwap(false, true) && f.conn != nil {
+// It reports whether this call was the one that closed it.
+func (t *Transport) closeFlow(f *flow) bool {
+	first := f.closed.CompareAndSwap(false, true)
+	if first && f.conn != nil {
 		f.conn.Close()
 		f.q.close()
 	}
 	t.flows.remove(f)
+	return first
 }
 
 // Stats is a snapshot of the transport's gauges and counters, for metrics.

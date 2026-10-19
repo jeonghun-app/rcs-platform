@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -181,7 +182,7 @@ func TestSendQueueBudgetIsReturnedWhenAQueueCloses(t *testing.T) {
 	var b queueBudget
 	b.max = 1000
 	q := newSendQueue(1000, &b)
-	if q.push(make([]byte, 400), false, 0) != pushed || b.used.Load() != 400 {
+	if q.push(make([]byte, 400), false, time.Time{}) != pushed || b.used.Load() != 400 {
 		t.Fatalf("budget used %d", b.used.Load())
 	}
 	q.close()
@@ -189,7 +190,7 @@ func TestSendQueueBudgetIsReturnedWhenAQueueCloses(t *testing.T) {
 	if b.used.Load() != 0 {
 		t.Fatalf("budget used %d after close", b.used.Load())
 	}
-	if q.push([]byte("x"), false, 0) != queueGone {
+	if q.push([]byte("x"), false, time.Time{}) != queueGone {
 		t.Fatal("a closed queue accepted a message")
 	}
 }
@@ -405,8 +406,119 @@ func TestQueueThatWasIdleDoesNotLookStalledWhenOutputArrives(t *testing.T) {
 	b.max = 1 << 20
 	q := newSendQueue(1<<20, &b)
 	q.progress.Store(time.Now().Add(-time.Hour).UnixNano()) // idle for an hour
-	q.push(make([]byte, 100), false, 0)
+	q.push(make([]byte, 100), false, time.Time{})
 	if _, idle := q.stall(time.Now()); idle > time.Second {
 		t.Fatalf("a queue that just received output looks stalled for %v", idle)
+	}
+}
+
+// Code review (PR #35, round 4): a response the transport-wide budget refuses
+// says nothing about the client it is for, so that client's flow stays open;
+// only a client whose own queue has no room loses its flow.
+func TestBudgetRefusalOfAResponseLeavesTheClientFlowOpen(t *testing.T) {
+	dialer := &pipesDialer{}
+	server, rec := newTransport(t, Config{Dialer: dialer, WriteTimeout: time.Hour, MaxQueuedBytes: 3072,
+		Limits: sip.Limits{MaxHeaderBytes: 1024, MaxBodyBytes: 2048}})
+	t.Cleanup(func() {
+		for _, p := range dialer.peers {
+			p.Close()
+		}
+	})
+	edge := listen(t, server, ListenerConfig{Network: TCP, ClientFacing: true})
+	listen(t, server, ListenerConfig{Network: TCP, Name: "core"})
+
+	// A client that reads everything it is sent.
+	c := dialRaw(t, edge)
+	go io.Copy(io.Discard, c)
+	c.Write([]byte(rawRequest("MESSAGE", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bKr")))
+	in := rec.next(t)
+
+	// Three core connections fill the budget just now, inside the shedding
+	// grace, so none of them can be shed yet.
+	for _, h := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
+		req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK"+h)
+		req.Body = make([]byte, 600) // about 850 bytes
+		if _, err := server.SendRequest(req, Destination{Network: TCP, Addr: netip.MustParseAddrPort(h + ":5060")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := respond(t, in.Message.(*sip.Request), 200)
+	res.Body = make([]byte, 1450) // about 1.7 KiB
+	err := server.SendResponse(res, in.Source)
+	if !errors.Is(err, ErrQueueFull) || errors.Is(err, ErrNoFlow) {
+		t.Fatalf("SendResponse = %v, want ErrQueueFull alone", err)
+	}
+	if _, open := server.Flow(in.Source.Flow); !open {
+		t.Fatal("a budget refusal closed a healthy client's flow")
+	}
+	if s := server.Stats(); s.ResponseFlowCloses != 0 || s.BudgetRefusals != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+// push takes an absolute deadline, which write computes once per send, so the
+// retry after shedding gives up when the first attempt would have and a send
+// blocks for at most WriteTimeout in all.
+func TestWaitingPushGivesUpAtItsDeadline(t *testing.T) {
+	var b queueBudget
+	b.max = 1 << 20
+	q := newSendQueue(100, &b)
+	q.push(make([]byte, 100), false, time.Time{}) // the queue is now at its limit
+	start := time.Now()
+	if r := q.push(make([]byte, 100), true, start.Add(-time.Second)); r != waitTimedOut {
+		t.Fatalf("push past its deadline = %v, want waitTimedOut", r)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("a push whose deadline had passed waited %v", d)
+	}
+}
+
+// QA (PR #35, final check): a flow that is already closing frees nothing, so
+// it is never chosen, and only a shed that closes something is counted.
+func TestSheddingSkipsAFlowThatIsAlreadyClosing(t *testing.T) {
+	r := newBudgetRig(t)
+	for _, h := range []string{"192.0.2.1", "192.0.2.2"} {
+		if err := r.send(h, 600); err != nil {
+			t.Fatal(err)
+		}
+		stalled(r.flow(h))
+	}
+	closing, other := r.flow("192.0.2.1"), r.flow("192.0.2.2")
+	// The fuller of the two candidates, but already on its way out: closeFlow
+	// has marked it and not yet closed its connection and queue. The cleanup
+	// finishes that close, so the transport's own Close does not wait for this
+	// writer forever.
+	closing.q.mu.Lock()
+	closing.q.budget.reserve(100)
+	closing.q.queued += 100
+	closing.q.mu.Unlock()
+	closing.closed.Store(true)
+	t.Cleanup(func() {
+		closing.conn.Close()
+		closing.q.close()
+	})
+	if !r.tr.shedStalledQueue(nil) {
+		t.Fatal("no connection was shed")
+	}
+	if !other.closed.Load() {
+		t.Fatal("the shed went to the flow that was already closing")
+	}
+}
+
+func TestSheddingScansAtMostOncePerInterval(t *testing.T) {
+	r := newBudgetRig(t)
+	if err := r.send("192.0.2.1", 600); err != nil {
+		t.Fatal(err)
+	}
+	f := r.flow("192.0.2.1")
+	stalled(f)
+	r.tr.lastShedScan.Store(time.Now().UnixNano())
+	if r.tr.shedStalledQueue(nil) || f.closed.Load() {
+		t.Fatal("a second scan within the interval ran")
+	}
+	r.tr.lastShedScan.Store(time.Now().Add(-shedScanInterval).UnixNano())
+	if !r.tr.shedStalledQueue(nil) || !f.closed.Load() {
+		t.Fatal("a scan after the interval did not run")
 	}
 }
