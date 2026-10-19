@@ -163,6 +163,8 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// shuttingDown counts node shutdowns in progress, for tests.
+	shuttingDown atomic.Int32
 }
 
 // hssPeer is one HSS task. Each has a node of its own because a node keeps
@@ -397,8 +399,10 @@ func (c *Client) connect(a netip.Addr) (*hssPeer, error) {
 // requests in flight, which must not hold up Refresh. The caller has counted
 // it in c.wg.
 func (c *Client) shutdown(p *hssPeer) {
+	c.shuttingDown.Add(1)
 	go func() {
 		defer c.wg.Done()
+		defer c.shuttingDown.Add(-1)
 		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.RequestTimeout)
 		defer cancel()
 		_ = p.node.Shutdown(ctx)
@@ -494,7 +498,9 @@ func matchHost(pattern, host string) bool {
 }
 
 // Ready reports whether a request can be sent now: some HSS task is connected
-// and available. It is the client's part of /readyz.
+// and available. It is the client's part of /readyz, and only of readiness:
+// never wire it into /healthz, whose failure restarts the task, since an HSS
+// that is down or restarting would then take every CSCF task down with it.
 func (c *Client) Ready() error {
 	if len(c.usable(nil)) == 0 {
 		return ErrNoPeer

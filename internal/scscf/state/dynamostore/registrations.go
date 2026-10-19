@@ -144,15 +144,26 @@ func (d *Dynamo) Profile(ctx context.Context, impi string) ([]byte, error) {
 	return docOf(item)
 }
 
-// SaveProfile implements state.Profiles with an unconditional PutItem: the
-// last profile received wins, and a resend writes the same again.
-func (d *Dynamo) SaveProfile(ctx context.Context, impi string, userData []byte) error {
-	if err := state.ValidProfile(impi, userData); err != nil {
+// SaveProfile implements state.Profiles with a PutItem conditional on no
+// later profile being stored. A resend carries the same time and passes.
+func (d *Dynamo) SaveProfile(ctx context.Context, impi string, userData []byte, received time.Time) error {
+	if err := state.ValidProfile(impi, userData, received); err != nil {
 		return err
 	}
 	item := key(profilePrefix + impi)
 	item[attrDoc] = bin(userData)
-	if _, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(d.registrations), Item: item}); err != nil {
+	item[attrReceived] = num(received.UnixNano())
+	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                 aws.String(d.registrations),
+		Item:                      item,
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #rcv <= :rcv"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#rcv": attrReceived},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(received.UnixNano())},
+	})
+	switch {
+	case ccf(err):
+		return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
+	case err != nil:
 		return sanitize("save profile", err)
 	}
 	return nil

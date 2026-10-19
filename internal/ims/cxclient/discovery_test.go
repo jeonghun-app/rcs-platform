@@ -30,11 +30,14 @@ func TestCloudMapDiscoveryListsEveryHealthyTask(t *testing.T) {
 		insts = append(insts, types.HttpInstanceSummary{Attributes: map[string]string{"AWS_INSTANCE_IPV4": "192.0.2." + itoa(i)}})
 	}
 	insts = append(insts, types.HttpInstanceSummary{Attributes: map[string]string{"AWS_INSTANCE_IPV6": "2001:db8::1"}},
-		types.HttpInstanceSummary{Attributes: map[string]string{"other": "x"}})
+		types.HttpInstanceSummary{Attributes: map[string]string{"other": "x"}},
+		// A dual-stack task is one peer, by its IPv4 address.
+		types.HttpInstanceSummary{Attributes: map[string]string{"AWS_INSTANCE_IPV4": "192.0.2.99", "AWS_INSTANCE_IPV6": "2001:db8::99"}})
 	f := &fakeCloudMap{out: &servicediscovery.DiscoverInstancesOutput{Instances: insts}}
 	d := CloudMapDiscovery{API: f, Namespace: "rcs.local", Service: "hss"}
 	got, err := d.HSSAddresses(context.Background())
-	if err != nil || len(got) != 13 || !slices.Contains(got, netip.MustParseAddr("2001:db8::1")) {
+	if err != nil || len(got) != 14 || !slices.Contains(got, netip.MustParseAddr("2001:db8::1")) ||
+		!slices.Contains(got, netip.MustParseAddr("192.0.2.99")) || slices.Contains(got, netip.MustParseAddr("2001:db8::99")) {
 		t.Fatalf("addresses %v, %v", got, err)
 	}
 	if aws.ToString(f.in.NamespaceName) != "rcs.local" || aws.ToString(f.in.ServiceName) != "hss" || f.in.HealthStatus != types.HealthStatusFilterHealthy {

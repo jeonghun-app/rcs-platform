@@ -53,6 +53,8 @@ const (
 	attrCSeq    = "cseq"
 	attrRver    = "rver"
 	attrNToken  = "ntoken"
+	// attrReceived orders profiles: when the SAA or PPR arrived, Unix ns.
+	attrReceived = "received"
 
 	IMPIIndex   = "impi-index"
 	IMPUIndex   = "impu-index"

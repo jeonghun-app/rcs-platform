@@ -137,8 +137,8 @@ func testBoundaries(t *testing.T, a, _ state.Store, _ Options) {
 	wantErr(t, err, state.ErrInvalid)
 	must(a.SaveRegistration(ctx(t), at(time.Unix(0, 0).UTC())))(t)
 
-	wantErr(t, a.SaveProfile(ctx(t), IMPI1, make([]byte, state.MaxUserData+1)), state.ErrInvalid)
-	if err := a.SaveProfile(ctx(t), IMPI1, make([]byte, state.MaxUserData)); err != nil {
+	wantErr(t, a.SaveProfile(ctx(t), IMPI1, make([]byte, state.MaxUserData+1), T0), state.ErrInvalid)
+	if err := a.SaveProfile(ctx(t), IMPI1, make([]byte, state.MaxUserData), T0); err != nil {
 		t.Errorf("a profile of MaxUserData bytes: %v", err)
 	}
 
@@ -268,14 +268,20 @@ func testCounterLimit(t *testing.T, a, b state.Store, _ Options) {
 }
 
 func testProfiles(t *testing.T, a, b state.Store, _ Options) {
-	if err := a.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>1</IMSSubscription>")); err != nil {
+	if err := a.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>1</IMSSubscription>"), T0); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>2</IMSSubscription>")); err != nil {
+	if err := b.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second)); err != nil {
 		t.Fatal(err)
+	}
+	// An SAA received before the PPR that followed it, saved late, loses.
+	wantErr(t, a.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>1</IMSSubscription>"), T0), state.ErrConflict)
+	// Saving the same one again, as an SDK resend does, is fine.
+	if err := b.SaveProfile(ctx(t), IMPI1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second)); err != nil {
+		t.Errorf("saving the stored profile again: %v", err)
 	}
 	if got := must(a.Profile(ctx(t), IMPI1))(t); string(got) != "<IMSSubscription>2</IMSSubscription>" {
-		t.Errorf("profile %q, want the last one saved", got)
+		t.Errorf("profile %q, want the one received last", got)
 	}
 	// A profile is not a registration: no listing or sweep sees it.
 	if regs := must(a.RegistrationsOf(ctx(t), IMPI1))(t); len(regs) != 0 {
@@ -292,5 +298,6 @@ func testProfiles(t *testing.T, a, b state.Store, _ Options) {
 	if err := b.DeleteProfile(ctx(t), IMPI1); err != nil {
 		t.Errorf("deleting no profile: %v", err)
 	}
-	wantErr(t, a.SaveProfile(ctx(t), IMPI1, nil), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), IMPI1, nil, T0), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), IMPI1, []byte("x"), time.Time{}), state.ErrInvalid)
 }

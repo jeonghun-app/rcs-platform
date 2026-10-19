@@ -276,18 +276,24 @@ type Registrations interface {
 type Profiles interface {
 	// Profile returns the User-Data stored for impi.
 	Profile(ctx context.Context, impi string) ([]byte, error)
-	// SaveProfile stores userData for impi, replacing what was there: the
-	// last SAA or PPR received wins.
-	SaveProfile(ctx context.Context, impi string, userData []byte) error
+	// SaveProfile stores userData for impi, received at received: the time the
+	// SAA or PPR that carried it arrived, which orders the profiles of one
+	// user across instances. A profile received earlier than the stored one
+	// is not stored (ErrConflict): an SAA that took longer to arrive must not
+	// undo the PPR that followed it. Saving the same one again succeeds.
+	SaveProfile(ctx context.Context, impi string, userData []byte, received time.Time) error
 	// DeleteProfile deletes the profile of impi; deleting none is no error.
 	DeleteProfile(ctx context.Context, impi string) error
 }
 
 // ValidProfile checks a profile against the limits of this package; the
 // backends apply it in SaveProfile.
-func ValidProfile(impi string, userData []byte) error {
+func ValidProfile(impi string, userData []byte, received time.Time) error {
 	if err := identity.ValidIMPI(impi); err != nil {
 		return fmt.Errorf("%w: profile IMPI: %w", ErrInvalid, err)
+	}
+	if !validTime(received) {
+		return fmt.Errorf("%w: a profile needs the time it was received", ErrInvalid)
 	}
 	if len(userData) == 0 || len(userData) > MaxUserData {
 		return fmt.Errorf("%w: User-Data empty or larger than %d bytes", ErrInvalid, MaxUserData)

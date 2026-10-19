@@ -79,10 +79,12 @@ func (d CloudMapDiscovery) HSSAddresses(ctx context.Context) ([]netip.Addr, erro
 	}
 	var addrs []netip.Addr
 	for _, inst := range out.Instances {
-		// ECS registers a task's address under these attributes.
+		// ECS registers a task's address under these attributes. One
+		// address per task, IPv4 first, so a dual-stack task is one peer.
 		for _, attr := range []string{"AWS_INSTANCE_IPV4", "AWS_INSTANCE_IPV6"} {
 			if a, err := netip.ParseAddr(inst.Attributes[attr]); err == nil {
 				addrs = append(addrs, a)
+				break
 			}
 		}
 	}

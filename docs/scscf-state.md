@@ -22,6 +22,21 @@ point-in-time recovery with a stated retention, and grant the tables to the
 `scscf` task role only, with no `dynamodb:Scan` for anyone else. Challenges are
 additionally sealed (below).
 
+## Rules for scscf
+
+- **A REGISTER during a deregistration.** When the last contact of an IMPU
+  expires, a sweep claims the registration for a lease (`Deregistering`, one
+  minute) while it sends SAR TIMEOUT_DEREGISTRATION and the reg event NOTIFY,
+  and deletes it afterwards. A REGISTER that finds a registration without
+  contacts, leased or not, is handled as an initial registration: SAR
+  REGISTRATION, and a save conditional on the version read, which makes the
+  sweep's later delete fail harmlessly (#14).
+- **Profiles are ordered by arrival.** `SaveProfile` takes the time the SAA or
+  PPR arrived and keeps the later one, so an SAA answered slowly cannot undo
+  the PPR that followed it; a refused save (`ErrConflict`) is not an error to
+  report. The profile is deleted when the HSS no longer assigns the user to
+  this S-CSCF, never by a sweep.
+
 ## Challenge keys
 
 Challenges hold XRES, CK, IK and HA1. They are sealed with AES-256-GCM under
@@ -41,7 +56,12 @@ client one more 401, not a failed registration.
 
 A re-registration is one strongly consistent read and one put of the IMPU's
 registration item (a few KB), plus two writes to `expiry-index`; the profile is
-written only on SAR and PPR. With 1 M users of two IMPUs re-registering every
+written only on SAR and PPR. Every terminating request reads the IMPU's
+registration and the IMPI's profile, two strongly consistent reads: about 1
+read request unit for the registration and 1 per 4 KB of profile (2 for a
+typical 5 KB IMSSubscription, 32 for the 128 KiB maximum), so 3 RRU per
+terminating request, $0.4 per million at the same prices. With 1 M users of
+two IMPUs re-registering every
 600 s that is about 8.6 G saves and 30 G write request units a month, some
 $20k at ap-northeast-2 on-demand prices (October 2026); 3600 s registrations
 cost a sixth of that. Authentication adds a put and a conditional delete per

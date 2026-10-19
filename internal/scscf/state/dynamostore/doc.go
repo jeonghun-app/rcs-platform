@@ -19,7 +19,8 @@
 //	                  without contacts the end of the deregistration lease
 //
 // The same table holds the profiles, partition key profile#<IMPI>, with the
-// User-Data in doc and no other attribute, so no index lists them.
+// User-Data in doc and received (number, Unix ns) ordering them, and no
+// index attribute, so no index lists them.
 //
 // with global secondary indexes impi-index (partition impi) and expiry-index
 // (partition shard, sort expires), both keys only. The shard spreads the

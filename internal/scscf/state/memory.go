@@ -22,13 +22,18 @@ type Memory struct {
 
 	mu            sync.Mutex
 	registrations map[string]*Registration
-	profiles      map[string][]byte
+	profiles      map[string]storedProfile
 	challenges    map[challengeKey]*Challenge
 	added         int
 	subscriptions map[string]*Subscription
 }
 
 type challengeKey struct{ impi, nonce string }
+
+type storedProfile struct {
+	userData []byte
+	received time.Time
+}
 
 var _ Store = (*Memory)(nil)
 
@@ -37,7 +42,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		rand:          randReader,
 		registrations: map[string]*Registration{},
-		profiles:      map[string][]byte{},
+		profiles:      map[string]storedProfile{},
 		challenges:    map[challengeKey]*Challenge{},
 		subscriptions: map[string]*Subscription{},
 	}
@@ -154,17 +159,20 @@ func (m *Memory) Profile(_ context.Context, impi string) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("state: profile: %w", ErrNotFound)
 	}
-	return slices.Clone(p), nil
+	return slices.Clone(p.userData), nil
 }
 
 // SaveProfile implements Profiles.
-func (m *Memory) SaveProfile(_ context.Context, impi string, userData []byte) error {
-	if err := ValidProfile(impi, userData); err != nil {
+func (m *Memory) SaveProfile(_ context.Context, impi string, userData []byte, received time.Time) error {
+	if err := ValidProfile(impi, userData, received); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.profiles[impi] = slices.Clone(userData)
+	if cur, ok := m.profiles[impi]; ok && cur.received.After(received) {
+		return fmt.Errorf("state: save profile: %w", ErrConflict)
+	}
+	m.profiles[impi] = storedProfile{userData: slices.Clone(userData), received: received}
 	return nil
 }
 

@@ -63,6 +63,9 @@ func TestATaskIsDroppedOnlyOnceGoneFromDNSAndDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.waitAvailable("192.0.2.2", "192.0.2.3")
+	// Count once the dropped node has shut down: until then its reconnect
+	// loop may still be dialling.
+	eventually(t, "the dropped node to shut down", func() bool { return e.client.shuttingDown.Load() == 0 })
 	dials := e.net.dialsTo("192.0.2.1")
 	time.Sleep(100 * time.Millisecond)
 	if e.net.dialsTo("192.0.2.1") != dials {
