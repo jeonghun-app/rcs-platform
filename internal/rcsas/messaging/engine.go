@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -637,6 +638,18 @@ func (e *Engine) newID(now time.Time) (string, error) {
 	e.lastID = n
 	e.mu.Unlock()
 	return fmt.Sprintf("%016x", uint64(n)) + r, nil
+}
+
+// randomIndex returns a random index into a list of n, 0 when n is 0.
+func (e *Engine) randomIndex(n int) (int, error) {
+	if n <= 1 {
+		return 0, nil
+	}
+	var b [4]byte
+	if _, err := io.ReadFull(e.rand, b[:]); err != nil {
+		return 0, fmt.Errorf("messaging: random source: %w", err)
+	}
+	return int(binary.BigEndian.Uint32(b[:]) % uint32(n)), nil
 }
 
 func (e *Engine) randomHex(n int) (string, error) {

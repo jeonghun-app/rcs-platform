@@ -264,10 +264,19 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 	// them together are bounded too: past FanoutTimeout the rest are left
 	// out and the sender, answered as for a store failure, sends again
 	// (recipients drop the repeats by Message-ID).
+	//
+	// Each message starts at a random recipient: with a store too slow for
+	// the whole list, the ones left out differ from one message, or one
+	// resend, to the next, rather than always being those at its end.
 	fctx, done := e.withTimeout(ctx, e.cfg.FanoutTimeout)
 	defer done()
+	start, err := e.randomIndex(len(recipients))
+	if err != nil {
+		return err
+	}
 	var failed error
-	for i, r := range recipients {
+	for i := range recipients {
+		r := recipients[(start+i)%len(recipients)]
 		if err := fctx.Err(); err != nil {
 			e.metrics.Count("group.fanout.timed_out", int64(len(recipients)-i))
 			if failed == nil {

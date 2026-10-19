@@ -735,9 +735,9 @@ Signals to alarm on (Phase 7):
   before the sender's answer. A message to 99 others at 10 ms an enqueue takes
   about a second. Past 20 s (`Config.FanoutTimeout`, within the 30 s an MSRP
   client waits) the remaining recipients are left out
-  (`group.fanout.timed_out` counts them), and the sender gets `StatusTryAgain`
-  and sends again; recipients that already have it drop the repeat by
-  Message-ID. Other sessions are not held up.
+  (`group.fanout.timed_out` counts them), and the sender gets `StatusTryAgain`.
+  Each message starts at a random recipient, so the ones left out are not the
+  same every time. Other sessions are not held up.
 - **Leaving is known per task.** The task that ran `Leave` or `Remove` gives up
   that participant's queued copies at once. Another task gives them up only
   when it would invite the participant back, so a session the SIP layer has

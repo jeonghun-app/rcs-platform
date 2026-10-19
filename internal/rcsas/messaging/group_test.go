@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -499,12 +501,27 @@ type slowStore struct {
 	clock *fakeClock
 	step  time.Duration
 	calls atomic.Int64
+
+	mu      sync.Mutex
+	reached map[string]bool
 }
 
 func (s *slowStore) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
 	s.calls.Add(1)
+	s.mu.Lock()
+	if s.reached == nil {
+		s.reached = map[string]bool{}
+	}
+	s.reached[m.Recipient] = true
+	s.mu.Unlock()
 	s.clock.Advance(s.step)
 	return s.Store.Enqueue(ctx, m, l)
+}
+
+func (s *slowStore) recipients() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.reached)
 }
 
 // The fan-out runs on the sender's session one recipient after another; a
@@ -531,6 +548,15 @@ func TestASlowFanOutAnswersTheSenderInTime(t *testing.T) {
 	n := st.calls.Load()
 	if n >= 99 || r.m.get("group.fanout.timed_out") != 99-n {
 		t.Fatalf("%d enqueues; metrics %v", n, r.m)
+	}
+	// The client may send it again; the copies go to others first, not
+	// to the same ones every time.
+	first := st.recipients()
+	for range 3 {
+		_ = r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi all", 0)))
+	}
+	if got := len(st.recipients()); got <= len(first) {
+		t.Fatalf("four attempts reached %d recipients, the first alone %d", got, len(first))
 	}
 }
 
