@@ -115,11 +115,11 @@ func TestOneFullQueueCostsOnlyThatParticipantTheMessage(t *testing.T) {
 	r := newRig(t, Config{MaxQueueMessages: 1, QueueSenderShare: 1})
 	r.e.SetGroupHandler(members{all: []string{alice, bob, carol}})
 	mem := r.store.(*store.Memory)
-	// carol's queue is full already.
+	// carol's queue is full already: she is offline before it is sent.
+	r.d.onPager(func(Delivery) error { return ErrOffline })
 	if err := r.e.Submit(t.Context(), standalone(bob, carol, chat(t, "x", "x", 0))); err != nil {
 		t.Fatal(err)
 	}
-	r.d.onPager(func(Delivery) error { return ErrOffline })
 	waitFor(t, "idle", r.idle)
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", imdn.NegativeDelivery))); err != nil {
 		t.Fatal(err)
