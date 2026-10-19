@@ -111,7 +111,8 @@ func (e *LimitError) Error() string { return "ifc: request exceeds the evaluatio
 // Unwrap returns ErrEvaluationLimit.
 func (e *LimitError) Unwrap() error { return ErrEvaluationLimit }
 
-// Limits configures [CompileWithLimits]. Zero fields take the defaults.
+// Limits configures [CompileWithLimits] and [Set.WithLimits]. Zero fields
+// take the defaults.
 type Limits struct {
 	// MaxWork is the work budget of one evaluation; zero means
 	// DefaultMaxWork.
@@ -147,10 +148,17 @@ func (c Context) registered() bool {
 // criteria that Match and Next return share their trigger points with the
 // ones passed to Compile; treat them as read-only.
 type Set struct {
-	criteria  []compiledCriteria
+	// compiled is what Compile built, never changed after: a Set derived
+	// with WithLimits shares it, so whatever is added to it carries over.
+	*compiled
 	maxWork   int
 	oversized atomic.Uint64
 	exhausted atomic.Uint64
+}
+
+// compiled is the immutable part of a Set.
+type compiled struct {
+	criteria []compiledCriteria
 }
 
 type compiledCriteria struct {
@@ -204,7 +212,7 @@ func Compile(criteria []FilterCriteria) (*Set, error) {
 // so a set compiled once can be evaluated under several budgets. Its
 // counters start at zero.
 func (s *Set) WithLimits(lim Limits) *Set {
-	w := &Set{criteria: s.criteria, maxWork: lim.MaxWork}
+	w := &Set{compiled: s.compiled, maxWork: lim.MaxWork}
 	if w.maxWork <= 0 {
 		w.maxWork = DefaultMaxWork
 	}
@@ -220,7 +228,7 @@ func CompileWithLimits(criteria []FilterCriteria, lim Limits) (*Set, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	s := &Set{criteria: make([]compiledCriteria, 0, len(criteria)), maxWork: lim.MaxWork}
+	s := &Set{compiled: &compiled{criteria: make([]compiledCriteria, 0, len(criteria))}, maxWork: lim.MaxWork}
 	if s.maxWork <= 0 {
 		s.maxWork = DefaultMaxWork
 	}

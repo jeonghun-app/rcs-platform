@@ -1,11 +1,13 @@
 package hss
 
 import (
+	"encoding/json"
 	"net/http"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/hss/ifcjson"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 )
 
@@ -176,6 +178,45 @@ func TestAProfileWriteCompilesItsCriteriaOnce(t *testing.T) {
 		}
 		if compiles != 1 {
 			t.Errorf("%s compiled the criteria %d times, want once", w.method, compiles)
+		}
+	}
+}
+
+// compileProfile is the only compile of a write (#120): its criteria do not
+// compile, so any other compile (ToIFC, the store, the cost warning) would
+// refuse them, while the injected compile hands over a set compiled from
+// costly but valid criteria, whose cost warning must come back (QA's test
+// from the review of #125).
+func TestTheInjectedCompileIsTheOnlyCompileOfAWrite(t *testing.T) {
+	a := newAPIEnv(t)
+	var valid []ifc.FilterCriteria
+	for _, p := range []int{1, 2} {
+		valid = append(valid, ifc.FilterCriteria{Priority: p,
+			TriggerPoint:      &ifc.TriggerPoint{SPTs: []ifc.SPT{{Groups: []int{0}, Condition: ifc.SIPHeader{Header: "Contact", Content: "x[ab]{160}y"}}}},
+			ApplicationServer: ifc.ApplicationServer{ServerName: asURI, DefaultHandling: ifc.SessionContinued}})
+	}
+	compiles := 0
+	compileProfile = func([]ifc.FilterCriteria) (*ifc.Set, error) { compiles++; return ifc.Compile(valid) }
+	t.Cleanup(func() { compileProfile = ifc.Compile })
+	bad := ifcjson.FromIFC(valid)
+	u := "(unclosed"
+	bad[0].TriggerPoint.SPTs[0] = ifcjson.SPT{Groups: []int{0}, RequestURI: &u}
+	enc, err := json.Marshal(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"id":"once","initial_filter_criteria":` + string(enc) + `}`
+	for _, w := range []struct{ method, path string }{{"POST", "/v1/service-profiles"}, {"PUT", "/v1/service-profiles/once"}} {
+		compiles = 0
+		code, resp, _ := a.do(w.method, w.path, adminToken, body)
+		if code != http.StatusCreated && code != http.StatusOK {
+			t.Fatalf("%s = %d %v: something besides compileProfile compiled the criteria", w.method, code, resp)
+		}
+		if ws, _ := resp["warnings"].([]any); len(ws) != 1 || !strings.Contains(ws[0].(string), "MaxWork") {
+			t.Fatalf("%s: warnings %v, want the cost warning of the injected set", w.method, resp["warnings"])
+		}
+		if compiles != 1 {
+			t.Errorf("%s: %d compiles, want 1", w.method, compiles)
 		}
 	}
 }

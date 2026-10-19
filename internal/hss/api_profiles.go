@@ -47,14 +47,17 @@ func profileResponse(p *store.ServiceProfile, warnings []string) profileResponse
 // needs more than half of the S-CSCF's default budget is accepted with a
 // warning, returned and logged, because a client sending somewhat larger
 // requests than the reference ones would push it over.
-func (a *API) costWarnings(p *store.ServiceProfile) []string {
-	err := checkWork(p.Compiled, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2})
+//
+// It takes the set compiled from the request, so that a write never
+// compiles the profile again for it.
+func (a *API) costWarnings(id string, compiled *ifc.Set) []string {
+	err := checkWork(compiled, ifc.Limits{MaxWork: ifc.DefaultMaxWork / 2})
 	if err == nil {
 		return nil
 	}
 	w := "initial_filter_criteria: more than half of the S-CSCF's default work budget is needed: " + err.Error()
 	a.h.metrics.Count("profile.costly", 1)
-	a.h.log.Warn("costly service profile", slog.String("profile", pii.Redact(p.ID)), slog.String("warning", w))
+	a.h.log.Warn("costly service profile", slog.String("profile", pii.Redact(id)), slog.String("warning", w))
 	return []string{w}
 }
 
@@ -135,7 +138,7 @@ func (a *API) createProfile(w http.ResponseWriter, r *http.Request, _ Scope) err
 	}
 	w.Header().Set("Location", "/v1/service-profiles/"+saved.ID)
 	w.Header().Set("ETag", etag(saved.Version))
-	writeJSON(w, http.StatusCreated, profileResponse(saved, a.costWarnings(p)))
+	writeJSON(w, http.StatusCreated, profileResponse(saved, a.costWarnings(saved.ID, p.Compiled)))
 	return nil
 }
 
@@ -193,7 +196,7 @@ func (a *API) putProfile(w http.ResponseWriter, r *http.Request, _ Scope) error 
 	}
 	a.fanout(id)
 	w.Header().Set("ETag", etag(saved.Version))
-	writeJSON(w, http.StatusOK, profileResponse(saved, a.costWarnings(p)))
+	writeJSON(w, http.StatusOK, profileResponse(saved, a.costWarnings(saved.ID, p.Compiled)))
 	return nil
 }
 

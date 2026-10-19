@@ -233,12 +233,14 @@ func ValidateSubscription(s *Subscription) error {
 
 // ValidateProfile checks the structural rules every stored profile keeps,
 // and that its criteria compile (ifc.Compile), unless p.Compiled shows
-// they already have.
+// they already have. A set of another number of criteria than p has is
+// not taken for theirs: it catches a profile whose criteria were added to
+// or cut after compiling, at no cost.
 func ValidateProfile(p *ServiceProfile) error {
 	if err := checkProfile(p); err != nil {
 		return err
 	}
-	if p.Compiled != nil {
+	if p.Compiled != nil && p.Compiled.Len() == len(p.Criteria) {
 		return nil
 	}
 	if _, err := ifc.Compile(p.Criteria); err != nil {

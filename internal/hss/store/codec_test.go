@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -150,9 +151,17 @@ func TestValidateProfileCompilesOnlyWhatWasNotCompiled(t *testing.T) {
 	// The criteria above would fail to compile, so a nil error shows that
 	// the store used the set it was given rather than compiling.
 	given := uncompilable()
-	given.Compiled = &ifc.Set{}
+	given.Compiled = oneCriterion(t)
 	if err := store.ValidateProfile(given); err != nil {
 		t.Fatalf("a profile with its compiled set: %v", err)
+	}
+	// A set of another number of criteria is not taken for theirs.
+	added := uncompilable()
+	added.Criteria = append(added.Criteria, added.Criteria[0])
+	added.Criteria[1].Priority = 2
+	added.Compiled = oneCriterion(t)
+	if err := store.ValidateProfile(added); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("criteria added after compiling: %v, want them compiled and refused", err)
 	}
 	// The structural rules still apply.
 	given.ID = ""
@@ -170,5 +179,37 @@ func TestValidateProfileCompilesOnlyWhatWasNotCompiled(t *testing.T) {
 	}
 	if back, err := store.DecodeProfile(doc, 1); err != nil || back.Compiled != nil {
 		t.Fatalf("decoded %+v, %v, want no compiled set", back, err)
+	}
+}
+
+// oneCriterion is a compiled set of one criterion.
+func oneCriterion(t *testing.T) *ifc.Set {
+	t.Helper()
+	set, err := ifc.Compile(storetest.Profile("one").Criteria)
+	if err != nil || set.Len() != 1 {
+		t.Fatalf("%v, %d criteria", err, set.Len())
+	}
+	return set
+}
+
+// The memory store's writes take the compiled set as well: criteria that
+// do not compile are stored when the set says they did, so neither
+// CreateProfile nor UpdateProfile compiled them (QA's test from the review
+// of #125, with a set of as many criteria).
+func TestMemoryWritesAProfileWithItsCompiledSetWithoutCompiling(t *testing.T) {
+	ctx := context.Background()
+	m := store.NewMemory()
+	p := &store.ServiceProfile{ID: "p", Compiled: oneCriterion(t), Criteria: []ifc.FilterCriteria{{
+		Priority:          1,
+		TriggerPoint:      &ifc.TriggerPoint{SPTs: []ifc.SPT{{Groups: []int{0}, Condition: ifc.RequestURI("(unclosed")}}},
+		ApplicationServer: ifc.ApplicationServer{ServerName: "sip:as.example.net", DefaultHandling: ifc.SessionContinued},
+	}}}
+	saved, err := m.CreateProfile(ctx, p)
+	if err != nil {
+		t.Fatalf("CreateProfile compiled again: %v", err)
+	}
+	p.Version = saved.Version
+	if _, err := m.UpdateProfile(ctx, p); err != nil {
+		t.Fatalf("UpdateProfile compiled again: %v", err)
 	}
 }
