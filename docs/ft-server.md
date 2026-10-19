@@ -232,7 +232,11 @@ Credentials come from a `CredentialSource`:
     prod only to a private host, together with the service bearer token
     `FT_HSS_TOKEN` from Secrets Manager. A private host is an RFC 1918 or ULA
     address, or a name inside the Cloud Map namespace `RCS_SERVICE_NAMESPACE`.
-    Anything else must be `https://`.
+    Anything else must be `https://`. In staging and prod the client also
+    checks the address the name resolves to, for `http://` and `https://`
+    alike, and connects only to an RFC 1918 or ULA address: a record pointed
+    at the task metadata address, a loopback or a public address gets no
+    connection and no token.
 - `FT_CREDENTIALS=static`. `FT_STATIC_USERS=user=password,...`, for dev and
   test stacks. It is refused in staging and prod.
 

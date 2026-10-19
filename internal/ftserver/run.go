@@ -59,7 +59,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 		DownloadURI:                  cfg.DownloadURI,
 		BrandedURI:                   cfg.BrandedURI,
 		Digest:                       ds,
-		Credentials:                  credentialSource(cfg),
+		Credentials:                  credentialSource(cfg, rt.Environment.Production()),
 		Metadata:                     stores.metadata,
 		Blobs:                        stores.blobs,
 		Logger:                       rt.Logger,
@@ -192,7 +192,10 @@ func openStores(ctx context.Context, cfg Config, rt *runtime.Runtime) (stores, e
 	return stores{metadata: s.Metadata, blobs: s.Blobs, nonces: s.NonceCounts}, nil
 }
 
-func credentialSource(cfg Config) CredentialSource {
+// credentialSource builds the configured source. In staging and prod the
+// HSS client connects only to private addresses (ADR 0007 §5); dev and test
+// may run the HSS on loopback.
+func credentialSource(cfg Config, production bool) CredentialSource {
 	if cfg.Credentials == CredentialsStatic {
 		users := make(map[string]string, len(cfg.StaticUsers))
 		for name, password := range cfg.StaticUsers {
@@ -200,5 +203,9 @@ func credentialSource(cfg Config) CredentialSource {
 		}
 		return NewStaticCredentials(users)
 	}
-	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.v, cfg.Realm, cfg.HSSTimeout, cfg.MaxLookups)
+	var dial func(ctx context.Context, network, address string) (net.Conn, error)
+	if production {
+		dial = runtime.InternalDialer{Timeout: cfg.HSSTimeout}.DialContext
+	}
+	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.v, cfg.Realm, cfg.HSSTimeout, cfg.MaxLookups, dial)
 }
