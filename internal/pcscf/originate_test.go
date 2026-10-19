@@ -92,6 +92,12 @@ func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing
 	if strings.Contains(r.Message.Header.Get("Route"), "orig") || r.Message.Header.Has("P-Asserted-Identity") {
 		t.Error("Prepare changed the shared request")
 	}
+	// A client using outbound for the dialog has ob on the flow's entry
+	// (TS 24.229 §5.2.6.3.3 5)).
+	ob := p.Route(context.Background(), clientRequest(t, initialText("INVITE", "Contact: <sip:alice@192.0.2.10:40000;transport=tcp;ob>"), "FLOW-A"))
+	if got := ob.RecordRoute[0].String(); got != "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob>" || ob.RecordRoute[1].URI.Params.Has("ob") {
+		t.Errorf("Record-Route %q, %q with an ob Contact", got, ob.RecordRoute[1].String())
+	}
 	// Each request is charged on its own.
 	r = clientRequest(t, initialText("MESSAGE"), "FLOW-A")
 	if again := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); again == first || !icidValue.MatchString(again) {
@@ -257,6 +263,8 @@ func TestAnInDialogRequestMustFollowThisPcscfsRouteForItsFlow(t *testing.T) {
 		{"the client's only", []string{client}, []string{"Route: " + scscfRoute}, false},
 		{"none", nil, []string{"Route: " + scscfRoute}, false},
 		{"a public next hop", []string{client, core}, []string{"Route: <sip:198.51.100.7;lr>"}, false},
+		// Not even looked up: outside the service namespace (ADR 0007 §5).
+		{"a name outside the namespace", []string{client, core}, []string{"Route: <sip:scscf.example.net;lr>"}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})

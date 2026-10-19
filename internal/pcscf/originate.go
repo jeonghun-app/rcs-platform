@@ -38,7 +38,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	routes := slices.Clone(reg.serviceRoute)
 	return proxy.Decision{
 		Targets:     []proxy.Target{{URI: r.Message.URI}},
-		RecordRoute: p.recordRoute(src.Flow),
+		RecordRoute: p.recordRoute(src.Flow, contactHasOb(r.Message)),
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 			// The Service-Route replaces the Route (§5.2.6.3.3): what the
 			// client wrote below pcscf's own entry is not where it
@@ -120,11 +120,16 @@ func bare(u sip.URI) sip.URI {
 // recordRoute is pcscf's two Record-Route values, topmost first (RFC 5658
 // §5): the one the core sees, which names this task's core listener and the
 // flow, so that the dialog's requests from the core reach this flow (ADR
-// 0005), and the one the client sees, the public name it dials.
-func (p *pcscf) recordRoute(flow transport.FlowID) []sip.Address {
+// 0005), with ob when the client's Contact has it (TS 24.229 §5.2.6.3.3
+// 5), RFC 5626 §5.1), and the one the client sees, the public name it
+// dials.
+func (p *pcscf) recordRoute(flow transport.FlowID, ob bool) []sip.Address {
 	core := sip.URI{Scheme: "sip", User: string(flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
 	core.Params.Set("transport", "tcp")
 	core.Params.SetFlag("lr")
+	if ob {
+		core.Params.SetFlag("ob")
+	}
 	client := sip.URI{Scheme: "sip", Host: p.cfg.PublicHost, Port: p.cfg.PublicPort}
 	if p.cfg.ClientTransport == ClientTCP {
 		client.Params.Set("transport", "tcp")
@@ -133,6 +138,13 @@ func (p *pcscf) recordRoute(flow transport.FlowID) []sip.Address {
 	}
 	client.Params.SetFlag("lr")
 	return []sip.Address{{URI: core}, {URI: client}}
+}
+
+// contactHasOb reports whether the request's Contact has the ob parameter:
+// the client uses outbound for this dialog (RFC 5626 §4.3).
+func contactHasOb(req *sip.Request) bool {
+	contacts, err := req.Header.Contact()
+	return err == nil && len(contacts) == 1 && !contacts[0].Star && contacts[0].URI.Params.Has("ob")
 }
 
 // inDialog forwards a client's request inside a dialog (#16 question 6), as

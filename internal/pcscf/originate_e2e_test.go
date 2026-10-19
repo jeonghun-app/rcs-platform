@@ -155,7 +155,7 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 		t.Errorf("Route %q, want the Service-Route alone", got)
 	}
 	wantRR := []string{
-		fmt.Sprintf("<sip:%s@127.0.0.1:%d;transport=tcp;lr>", token, s.core.Port()),
+		fmt.Sprintf("<sip:%s@127.0.0.1:%d;transport=tcp;lr;ob>", token, s.core.Port()),
 		fmt.Sprintf("<sip:%s:5060;transport=tcp;lr>", publicHost),
 	}
 	if got := invite.Header.Values("Record-Route"); !slices.Equal(got, wantRR) {

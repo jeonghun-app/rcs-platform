@@ -7,10 +7,9 @@ over `internal/sip/transport`; the service is `internal/pcscf`, and
 `cmd/pcscf` only wires it to `internal/runtime`.
 
 `pcscf` is built in steps (#16). This page describes what is in place: the
-listeners, the edge rules, registration and the shutdown. Originating and
-terminating routing and the reg event follow. Until they land, a client's
-request other than REGISTER is answered 403 and a request from the core 430
-Flow Failed.
+listeners, the edge rules, registration, a client's requests and the
+shutdown. Terminating routing and the reg event follow. Until they land, a
+request from the core is answered 430 Flow Failed.
 
 ## Listeners
 
@@ -131,6 +130,54 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 - A Cloud Map answer holds at most eight records, chosen at random when more
   instances are registered. That is enough for CSCF fleets of that size.
 
+## A client's requests
+
+**Outside a dialog** (no To tag, TS 24.229 §5.2.6.3.3), a request needs a
+registration over the flow it comes on; without one it is answered 403.
+
+- **Route.** The request goes along the `Service-Route` its registration
+  received, which replaces whatever Route the client wrote below `pcscf`'s
+  own. A registration without a `Service-Route` is answered 500, since the
+  next hop would otherwise be a core address the client chose.
+- **Identity.** `pcscf` removes `P-Preferred-Identity` and asserts one
+  identity in `P-Asserted-Identity` (#16 decision 5):
+  - the first `P-Preferred-Identity` value that a registration over the
+    flow lists in its `P-Associated-URI`, which holds no barred identity;
+    the request then goes along that registration's `Service-Route`;
+  - otherwise the default public identity, the first `P-Associated-URI` of
+    the flow's first registration.
+
+  A SIP or SIPS identity is joined by the registration's first tel URI
+  (RFC 3325 §9.1 allows one of each). Parameters other than `user` are
+  dropped.
+- **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request.
+- **Record-Route.** `pcscf` records two values (RFC 5658), topmost first:
+  `<sip:<flow token>@<task address>:<core port>;transport=tcp;lr>`, with `ob`
+  when the client's Contact has it, for the core, and
+  `<sip:<PCSCF_PUBLIC_HOST>:<PCSCF_PUBLIC_PORT>;transport=tls;lr>` (`tcp`
+  with `tcp`) for the client. The dialog's later requests come back through
+  this task on both sides.
+- **Limit.** A client address may send `PCSCF_INITIAL_RATE` such requests a
+  second, with a burst of `PCSCF_INITIAL_BURST`, beside its REGISTERs. Past
+  that it gets 503 with `Retry-After: 1`.
+
+**Inside a dialog** (#16 decision 6): `pcscf` keeps no dialog state, so the
+route a request carries must show that the dialog was set up through this
+`pcscf` and this flow. It is forwarded as its Route says only if:
+
+- both of `pcscf`'s Record-Route values were among the Route values it
+  consumed: one naming the public host or an NLB address, and one naming
+  this task's core listener;
+- the core one's flow token is the flow the request came on;
+- the next hop, the Route below them or else the Request-URI, resolves to a
+  private address, a name being looked up only inside
+  `RCS_SERVICE_NAMESPACE`.
+
+Anything else is answered 403, so a client cannot aim a request at a core
+address of its choosing past the services that should see it. An ACK for a
+2xx follows the same rule. No registration is needed, so a call can still
+be ended after the client deregisters.
+
 ## Settings
 
 Environment variables with the `PCSCF_` prefix, plus the shared ones of
@@ -153,6 +200,7 @@ start with that value.
 | `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | the Route of a REGISTER: a `sip` URI with `transport=tcp` and `lr`, of an address or a name inside `RCS_SERVICE_NAMESPACE`; required without a namespace |
 | `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3); required without `RCS_IMS_DOMAIN` |
 | `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
+| `PCSCF_INITIAL_RATE`, `PCSCF_INITIAL_BURST` | `50`, `200` | requests outside a dialog a second per client address, and the burst |
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | client flows among them; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
