@@ -380,3 +380,34 @@ func TestCredentialsForAnotherAlgorithmAreChallengedAgainAndUseUpNothing(t *test
 	wantStatus(t, g.Register(bg, u.request(600, u.respond(md5, nil)), upstream), 401)
 	wantStatus(t, g.Register(bg, u.request(600, u.respond(sha, nil)), upstream), 200)
 }
+
+func TestAUEThatCouldNotAuthenticateTheNetworkIsForbiddenAndTheHSSIsTold(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	u := e.akaUser(impi1, impu1)
+	ch := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	// What a UE sends when AUTN did not verify, as rcs-sim does (#187): the
+	// challenge's nonce and opaque, an empty response, no qop, nc or auts.
+	failed := digest.Credentials{Username: impi1, Realm: realm, Nonce: ch.Nonce, URI: "sip:" + realm, Algorithm: digest.AKAv1MD5, Opaque: ch.Opaque}.Header()
+	wantStatus(t, g.Register(bg, u.request(600, failed), upstream), 403)
+	if s := e.hss.lastSAR(t); s.AssignmentType != cx.AuthenticationFailure || s.UserName != impi1 {
+		t.Errorf("SAR %+v, want AUTHENTICATION_FAILURE", s)
+	}
+	// The vector is gone: the RES the card would have computed no longer
+	// registers.
+	res := g.Register(bg, u.request(600, u.respond(ch, nil)), upstream)
+	if !u.challengeOf(res, 0).Stale {
+		t.Error("the vector survived the failure report")
+	}
+	if _, err := e.store.Registration(bg, impu1); err == nil {
+		t.Error("a registration was stored")
+	}
+	// A nonce no instance issued is challenged again, with no store read or
+	// SAR.
+	_, sars := e.hss.counts()
+	forged := strings.Replace(failed, ch.Nonce, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 1)
+	wantStatus(t, g.Register(bg, u.request(600, forged), upstream), 401)
+	if _, n := e.hss.counts(); n != sars {
+		t.Error("a forged failure report reached SAR")
+	}
+}

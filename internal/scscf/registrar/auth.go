@@ -28,6 +28,9 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 	if c == nil || c.Nonce == "" {
 		return g.challenge(ctx, r, false)
 	}
+	if c.Algorithm == digest.AKAv1MD5 && c.Response == "" && len(c.AUTS) == 0 {
+		return g.networkNotAuthenticated(ctx, r, c)
+	}
 	// Check needs no secret, so a nonce no instance issued costs no read.
 	if g.digest.Check(*c) != nil {
 		return g.challenge(ctx, r, false)
@@ -62,6 +65,45 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 	}
 	g.count("registrar.auth_failed")
 	return refuse(403, "Authentication failed")
+}
+
+// networkNotAuthenticated answers the REGISTER of a UE whose card did not
+// verify the challenge's AUTN: the challenge's nonce, an empty response and
+// no auts (TS 33.203 §6.1.2.2, TS 24.229 §5.4.1.2.3A). The vector is deleted,
+// the HSS is told (SAR AUTHENTICATION_FAILURE, TS 29.228 §6.1.2) so it ends
+// the pending authentication, and the UE gets 403.
+func (g *Registrar) networkNotAuthenticated(ctx context.Context, r *register, c *digest.Credentials) *failure {
+	// The answer carries no qop, nc or cnonce, which Check requires; with
+	// them filled in, Check still proves the nonce and opaque are an
+	// instance's own before anything is read.
+	probe := *c
+	probe.QOP, probe.NC, probe.CNonce = digest.QOPAuth, 1, "-"
+	if g.digest.Check(probe) != nil {
+		return g.challenge(ctx, r, false)
+	}
+	g.count("registrar.network_not_authenticated")
+	ch, err := g.cfg.Store.TakeChallenge(ctx, r.impi, c.Nonce, g.cfg.Now())
+	switch {
+	case errors.Is(err, state.ErrNotFound), errors.Is(err, state.ErrInvalid):
+		// Expired or answered already: nothing is pending at the HSS.
+		return refuse(403, "Network authentication failed")
+	case err != nil:
+		return g.internal("taking a challenge", err)
+	}
+	if ch.AKA == nil || ch.IMPU != r.impu {
+		return refuse(403, "Network authentication failed")
+	}
+	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: r.impi, PublicIdentities: []string{r.impu}, AssignmentType: cx.AuthenticationFailure})
+	var res cx.Result
+	if saa != nil {
+		res = saa.Result
+	}
+	// The 403 stands whatever the HSS answers; one that missed the SAR ends
+	// the pending authentication when it times out (TS 29.228 §6.1.2).
+	if cxclient.Classify(res) != cxclient.Success || err != nil {
+		g.count("registrar.hss_failed")
+	}
+	return refuse(403, "Network authentication failed")
 }
 
 func (g *Registrar) verifyDigest(ctx context.Context, c *digest.Credentials, d *state.DigestChallenge) error {

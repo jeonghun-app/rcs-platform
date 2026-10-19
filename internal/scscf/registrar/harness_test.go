@@ -181,7 +181,7 @@ func (f *fakeHSS) SAR(_ context.Context, r *cx.SAR) (*cx.SAA, error) {
 		return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
 	}
 	saa := &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}}
-	if r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable && r.AssignmentType != cx.UserDeregistration {
+	if r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable && (r.AssignmentType == cx.Registration || r.AssignmentType == cx.ReRegistration) {
 		sp := ifc.ServiceProfile{}
 		for _, id := range s.set {
 			sp.PublicIdentities = append(sp.PublicIdentities, ifc.PublicIdentity{Identity: id, BarringIndication: s.barred[id]})
