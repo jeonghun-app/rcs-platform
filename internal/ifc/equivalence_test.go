@@ -260,6 +260,36 @@ func TestCaseFoldedAlternativeOfALetterAndANegatedClassStillMatchesTheLetter(t *
 	}
 }
 
+// A case-insensitive pattern whose alternatives the parser merges into a
+// class of one rune without case variants ("|0|[0]" into the empty match
+// or [0]) is compiled, and means what POSIX says: Go's parser reads the
+// class back as a literal, which the meaning check takes for the same
+// thing (#206, found by FuzzEvaluateTrigger).
+func TestAFoldedAlternationThatMergesIntoOneRuneIsCompiled(t *testing.T) {
+	for _, p := range []string{"|0|[0]", "|0|[0]|", "[0]|0|", "(|1|[1])x", "^(-|[-])$", "|[0]|0"} {
+		ref, err := regexp.CompilePOSIX(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, mode := range []patternMode{0, patternFoldCase, patternFoldCase | patternWhole} {
+			budget := MaxSetInstructions
+			got, err := compilePattern("Pattern", p, mode, &budget)
+			if err != nil {
+				t.Errorf("%q (mode %d) refused: %v", p, mode, err)
+				continue
+			}
+			if mode&patternWhole != 0 {
+				continue
+			}
+			for _, v := range []string{"", "0", "1x", "x", "-", "a"} {
+				if got.re.MatchString(v) != ref.MatchString(v) {
+					t.Errorf("%q (mode %d) on %q: %t, POSIX %t", p, mode, v, got.re.MatchString(v), ref.MatchString(v))
+				}
+			}
+		}
+	}
+}
+
 // Bracket case pairs are the ERE idiom for "ignore case"; main accepts them.
 func TestCasePairBracketsAreNotRefused(t *testing.T) {
 	tp := func(c Condition) *TriggerPoint {
