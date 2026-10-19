@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -47,6 +48,31 @@ type FT struct {
 	Server    *httptest.Server
 	// Harness holds ft-server's log and metric lines.
 	Harness *runtimetest.Harness
+
+	// inFlight is how many requests ft-server is still handling, and
+	// brokenDelay how long a request body's read error is held back.
+	inFlight    atomic.Int64
+	brokenDelay atomic.Int64
+}
+
+// SetBrokenUploadDelay makes ft-server notice a broken upload d late: the
+// read that fails returns only after d, with the parts read so far stored
+// and the upload still leased. A loaded host does the same (#176).
+func (f *FT) SetBrokenUploadDelay(d time.Duration) { f.brokenDelay.Store(int64(d)) }
+
+// lateError is a request body whose read errors come late; see
+// SetBrokenUploadDelay.
+type lateError struct {
+	io.ReadCloser
+	delay time.Duration
+}
+
+func (l lateError) Read(p []byte) (int, error) {
+	n, err := l.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		time.Sleep(l.delay)
+	}
+	return n, err
 }
 
 // StartFT starts ft-server with memory stores and parts of partSize, so a
@@ -82,10 +108,35 @@ func StartFT(t testing.TB, partSize int64) *FT {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs := &httptest.Server{Listener: ln, Config: &http.Server{Handler: srv}}
-	hs.Start()
-	t.Cleanup(hs.Close)
-	return &FT{UploadURL: upload, Server: hs, Harness: h}
+	f := &FT{UploadURL: upload, Harness: h}
+	// A get_upload_info is answered only once ft-server is done with every
+	// request before it, the broken upload above all: its parts stored and
+	// its lease released. A device asks seconds after the break, once it is
+	// back on a network, and a deployed server is done by then; a test asks
+	// at once, and a server still storing could answer the same bytes for
+	// the whole quiet time and then refuse the resume 503 (#176). The
+	// request's context bounds the wait.
+	counted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.RawQuery, "get_upload_info") {
+			for f.inFlight.Load() > 0 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+		f.inFlight.Add(1)
+		defer f.inFlight.Add(-1)
+		if d := time.Duration(f.brokenDelay.Load()); d > 0 && r.Body != nil {
+			r.Body = lateError{r.Body, d}
+		}
+		srv.ServeHTTP(w, r)
+	})
+	f.Server = &httptest.Server{Listener: ln, Config: &http.Server{Handler: counted}}
+	f.Server.Start()
+	t.Cleanup(f.Server.Close)
+	return f
 }
 
 // Relay is an msrp-relay in the test process.
