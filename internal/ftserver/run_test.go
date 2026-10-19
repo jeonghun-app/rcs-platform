@@ -297,12 +297,36 @@ func TestRunInStagingReachesTheHSSOnlyAtAPrivateAddress(t *testing.T) {
 // (#119; QA's test from the reviews of #116 and #123). 10.255.255.1 hangs
 // on this host and CI runners. Where it is refused at once instead, the
 // test cannot see the dial timeout, and says so: it skips, or in CI fails.
-// The deadline counts from the start of the lookup, so a dialer given a
-// longer timeout than FT_HSS_TIMEOUT (DefaultHSSTimeout, say) fails too.
+//
+// The production dialer is wrapped to see when it returns. A dialer bound
+// by FT_HSS_TIMEOUT returns no sooner than that after it began, since a
+// deadline never fires early, and one given DefaultHSSTimeout instead
+// returns sooner than the 3 s here. The upper bound only has to tell a
+// bounded dial from an unbounded one, which runs until the kernel gives
+// up on the connection after minutes, so a loaded host's delays cannot
+// fail it (#158).
 func TestTheProductionHSSDialEndsWithinTheHSSTimeout(t *testing.T) {
-	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL("http://10.255.255.1:8081"), HSSTimeout: 300 * time.Millisecond, MaxLookups: 1, Realm: realm}
+	const hssTimeout = 3 * time.Second
+	if DefaultHSSTimeout >= hssTimeout {
+		t.Fatalf("DefaultHSSTimeout %v is not below the %v this test uses", DefaultHSSTimeout, hssTimeout)
+	}
+	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL("http://10.255.255.1:8081"), HSSTimeout: hssTimeout, MaxLookups: 1, Realm: realm}
 	src := credentialSource(cfg, true).(*HSSCredentials)
-	start := time.Now()
+	transport := src.client.Transport.(*http.Transport)
+	dial := transport.DialContext
+	if dial == nil {
+		t.Fatal("the production HSS client has no dialer of its own")
+	}
+	took := make(chan time.Duration, 1)
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		start := time.Now()
+		c, err := dial(ctx, network, address)
+		select {
+		case took <- time.Since(start):
+		default:
+		}
+		return c, err
+	}
 	_, err := src.Lookup(t.Context(), alice, digest.SHA256)
 	var ne net.Error
 	if !errors.As(err, &ne) || !ne.Timeout() {
@@ -312,15 +336,12 @@ func TestTheProductionHSSDialEndsWithinTheHSSTimeout(t *testing.T) {
 		}
 		t.Skipf(msg, err)
 	}
-	deadline := start.Add(cfg.HSSTimeout + time.Second)
-	for {
-		buf := make([]byte, 1<<20)
-		if !strings.Contains(string(buf[:goruntime.Stack(buf, true)]), "InternalDialer.DialContext") {
-			return
+	select {
+	case d := <-took:
+		if d < hssTimeout {
+			t.Fatalf("the dial gave up after %v, before the %v FT_HSS_TIMEOUT: it has another timeout", d, hssTimeout)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the dial still runs %v after a %v FT_HSS_TIMEOUT", time.Since(start), cfg.HSSTimeout)
-		}
-		time.Sleep(20 * time.Millisecond)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the dial still runs 30s after it began, with a %v FT_HSS_TIMEOUT", hssTimeout)
 	}
 }

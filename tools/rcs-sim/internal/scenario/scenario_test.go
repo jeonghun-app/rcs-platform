@@ -181,14 +181,38 @@ func (a *answering) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // intercept puts a in front of c's transport.
-func intercept(c *http.Client, a *answering) *http.Client {
-	a.next = c.Transport
-	if a.next == nil {
-		a.next = http.DefaultTransport
+func intercept(c *http.Client, a interface {
+	http.RoundTripper
+	setNext(http.RoundTripper)
+}) *http.Client {
+	next := c.Transport
+	if next == nil {
+		next = http.DefaultTransport
 	}
+	a.setNext(next)
 	wrapped := *c
 	wrapped.Transport = a
 	return &wrapped
+}
+
+func (a *answering) setNext(next http.RoundTripper) { a.next = next }
+
+// delaying holds the first request that matches for delay, then passes
+// every request on.
+type delaying struct {
+	next  http.RoundTripper
+	match func(*http.Request) bool
+	delay time.Duration
+	done  atomic.Bool
+}
+
+func (d *delaying) setNext(next http.RoundTripper) { d.next = next }
+
+func (d *delaying) RoundTrip(r *http.Request) (*http.Response, error) {
+	if d.match(r) && d.done.CompareAndSwap(false, true) {
+		time.Sleep(d.delay)
+	}
+	return d.next.RoundTrip(r)
 }
 
 func TestAResumeAnsweredOtherThan200FailsWithoutARetry(t *testing.T) {
@@ -224,6 +248,12 @@ func TestABusyUploadIsSentAgainAndCounted(t *testing.T) {
 }
 
 func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
+	// The answers below decide how often get_upload_info is asked, so the
+	// step's own timeout is the only bound. Under load one signed request
+	// took the whole of the default settle time, which ended the step after
+	// a single 404 (#159); the first one here is made that slow on purpose.
+	slow := scenario.UploadSettle() + 100*time.Millisecond
+	defer scenario.SetUploadSettle(time.Hour)()
 	cfg := stack(t)
 	// The first three signed get_upload_info answer 404, as when the server
 	// has not yet noticed the break.
@@ -232,6 +262,9 @@ func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
 		return strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != "" && signed.Add(1) <= 3
 	}, status: http.StatusNotFound}
 	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+	cfg.FT.HTTP = intercept(cfg.FT.HTTP, &delaying{match: func(r *http.Request) bool {
+		return strings.Contains(r.URL.RawQuery, "get_upload_info")
+	}, delay: slow})
 	ok, results := runAll(t, cfg, "ft-resume")
 	info := byStep(results)["get_upload_info"]
 	if !ok || info.Detail["not_held"] != 3 || info.Detail["retries"] < 4 || info.Detail["held"] == 0 {
