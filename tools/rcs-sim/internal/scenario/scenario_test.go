@@ -249,9 +249,10 @@ func TestABusyUploadIsSentAgainAndCounted(t *testing.T) {
 
 func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
 	// The answers below decide how often get_upload_info is asked, so the
-	// step's own timeout is the only bound. Under load one signed request
-	// took the whole of the default settle time, which ended the step after
-	// a single 404 (#159); the first one here is made that slow on purpose.
+	// step's own timeout is the only bound. Under load one request took the
+	// whole of the default settle time, which ended the step after a single
+	// 404 (#159); the first one here, the unsigned GET that draws the
+	// challenge, is made that slow on purpose.
 	slow := scenario.UploadSettle() + 100*time.Millisecond
 	defer scenario.SetUploadSettle(time.Hour)()
 	cfg := stack(t)
