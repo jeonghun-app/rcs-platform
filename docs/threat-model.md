@@ -221,15 +221,21 @@ metadata.
   `From`, the writer's asserted identity under its roster name, and one `To`,
   the group. No other header that any receiver could read as a `From` or `To`
   survives, whatever its case, prefix or namespace, so nobody writes as
-  someone else by address. Nor by name: a name another participant,
-  current or former, goes by, compared without case, extra space and
-  characters that show as nothing, is dropped, and its owner joins under
-  its identity alone; nobody is kept out for a name. A 1-to-1 message,
-  forwarded unchanged, is refused if it has such a header.
+  someone else by address: the `From` address is the asserted identity
+  and cannot be forged. A name is weaker. It is first come, first served
+  and unverified: whoever takes a name first in a group keeps it, and
+  nothing checks that it is the person's. A later name that another
+  participant, current or former, goes by (compared without case, extra
+  space and characters that show as nothing) is dropped. Its owner keeps
+  the name it had, or joins under its identity alone; nobody is kept out
+  for a name. A 1-to-1 message, forwarded unchanged, is refused if it has
+  such a header.
   Residual risk: names are not normalized (NFC), so canonically equivalent
-  spellings (an é composed or decomposed) compare different, and look-alike
-  letters of other scripts are not folded; such a name can still look like
-  another's, next to a different identity.
+  spellings (an é composed or decomposed) compare different. Look-alike
+  letters of other scripts are not folded, nor are visible symbols that
+  look blank (U+2800 BRAILLE PATTERN BLANK, and the like), which are not
+  default-ignorable. Such a name can still look like another's, next to a
+  different identity.
 - **Notifications.** They are matched by the group's own record of the
   message, in the group or sent to the author outside it, accepted only from
   participants it went to, for themselves (`recipient-uri`), once per kind.

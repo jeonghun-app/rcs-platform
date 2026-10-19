@@ -54,6 +54,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("QueuesAreBoundedByCountAndBytes", func(t *testing.T) { limits(t, newStore(t)) })
 	t.Run("EachSenderHasAShareOfAQueue", func(t *testing.T) { senderShares(t, newStore(t)) })
 	t.Run("AGroupMessageCountsAgainstItsAuthorsShare", func(t *testing.T) { groupShares(t, newStore(t)) })
+	t.Run("RemovingAGroupNotificationFreesTheTotal", func(t *testing.T) { groupTotalFreed(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 }
@@ -474,6 +475,28 @@ func groupShares(t *testing.T, s store.Store) {
 	}
 	if err := s.Enqueue(ctx, direct("0007"), l); err != nil {
 		t.Fatalf("alice after a removal = %v", err)
+	}
+}
+
+// QA's test (PR #118, round 4): delivering (removing) a group
+// notification frees its place in the total of group notifications, or a
+// connected author's receipts would be dropped until the next recount.
+func groupTotalFreed(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	l := store.Limit{Count: 100, GroupCount: 3}
+	for i := range 12 {
+		m := message(bob, fmt.Sprintf("n%03d", i), t0)
+		m.Sender, m.Author, m.Mode, m.Notification = fmt.Sprintf("sip:chat-%d@conf.example.net", i), carol, store.Group, true
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatalf("notification %d after %d delivered: %v", i, i, err)
+		}
+		held, err := s.Claim(ctx, bob, m.ID, "task-a", t0, t0.Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Remove(ctx, held, "task-a"); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

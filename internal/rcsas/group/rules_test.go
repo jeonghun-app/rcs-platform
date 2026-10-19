@@ -407,12 +407,12 @@ func TestRenamingInAGroupIsBounded(t *testing.T) {
 	if _, err := r.s.Join(t.Context(), g.URI, bob, "Bob again"); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("beyond the rate: %v", err)
 	}
-	// An overlong name is dropped, not refused: bob is left nameless,
-	// carol added without one.
+	// An overlong name is dropped, not refused: bob keeps the name he
+	// had, carol is added without one.
 	r.clock.Advance(time.Minute)
 	if g, err := r.s.Join(t.Context(), g.URI, bob, strings.Repeat("n", MaxDisplayNameLength+1)); err != nil {
 		t.Fatalf("an overlong name: %v", err)
-	} else if p, _ := g.Participant(bob); p.DisplayName != "" {
+	} else if p, _ := g.Participant(bob); p.DisplayName != "Bob 1" {
 		t.Fatalf("bob %+v", p)
 	}
 	if err := r.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: carol, DisplayName: strings.Repeat("n", MaxDisplayNameLength+1)}}); err != nil {

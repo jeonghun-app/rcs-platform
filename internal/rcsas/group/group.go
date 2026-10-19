@@ -394,12 +394,13 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 		}
 		p := &g.Participants[i]
 		// A name that is not valid text, or that someone else goes by, is
-		// not refused but dropped: whoever asks still joins, under its
-		// identity alone, and passes for nobody.
+		// not refused but dropped: whoever asks still joins, under the
+		// name it had (one an adder gave it, or none), and passes for
+		// nobody. A rename dropped so is no change, and costs nothing.
 		name := displayName
 		dropped = name != "" && (!validText(name, MaxDisplayNameLength) || nameTaken(g, who, name))
 		if dropped {
-			name = ""
+			name = p.DisplayName
 		}
 		if p.State == groupstore.Joined && (displayName == "" || name == p.DisplayName) {
 			return nil, nil

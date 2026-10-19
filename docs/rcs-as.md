@@ -337,9 +337,11 @@ request (`invalid`); a bad invitee or name never does:
   UTF-8 that XML can carry, without control characters.
 - **A name is one participant's, and never keeps anyone out.** A name that is
   too long, is not valid text, or that another participant, current or
-  former, goes by, is dropped: `Create`, `Join` and `Add` store that
-  participant without a name (`group.name_dropped`), and its roster entry and
-  the `From` of what it writes carry its identity alone. Names are not cut
+  former, goes by, is dropped (`group.name_dropped`): `Create` and `Add` store
+  that participant without a name, and `Join` keeps the name it had, if any,
+  as a rename that is no change and uses none of the renaming rate. Without
+  a name, its roster entry and the `From` of what it writes carry its
+  identity alone. Names are first come, first served, and unverified. Names are not cut
   short, which could make two equal. They are compared without case, extra
   white space, and every character that shows as nothing (Unicode format
   characters and the other default-ignorable code points: bidirectional
@@ -762,6 +764,9 @@ Signals to alarm on (Phase 7):
   (`GroupChatImpl.isDisplayedByAllRecipients`), so such a message is never
   shown as read by all. An author with a session, or that the engine can
   invite, takes them as they come and loses none.
+  This is accepted for now: an author that goes offline right after writing to
+  a large group may never see "read by all". Aggregating the receipts is
+  [#166](https://github.com/jeonghun-app/rcs-platform/issues/166).
 - **Group fan-out is sequential.** A group message is queued for its
   recipients one enqueue transaction after another, on the sender's session,
   before the sender's answer. A message to 99 others at 10 ms an enqueue takes

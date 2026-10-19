@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 )
 
 // Values internal/conference could not write, or that no identity is.
@@ -273,6 +274,36 @@ func TestANameSomeoneElseGoesByIsDroppedNotRefused(t *testing.T) {
 	}
 	if err := joinErr(r, g, "sip:long@example.net", long); err != nil || nameOf("sip:long@example.net") != "" {
 		t.Fatalf("a long name: %v, stored %q", err, nameOf("sip:long@example.net"))
+	}
+	// A rename to someone else's name, or to one too long, leaves the old
+	// name, and costs none of the renaming allowance.
+	r4 := newRig(t, Config{SenderRate: messaging.Rate{PerMinute: 1, Burst: 1}})
+	g4, err := r4.s.Create(t.Context(), CreateRequest{Creator: alice, CreatorName: "Alice", Invitees: []Invitee{
+		{Identity: bob}, {Identity: carol, DisplayName: "Carol"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := joinErr(r4, g4, bob, "Bob"); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"alice", strings.Repeat("b", MaxDisplayNameLength+1), "ALICE "} {
+		if err := joinErr(r4, g4, bob, n); err != nil {
+			t.Fatalf("bob renaming to %q: %v", n, err)
+		}
+	}
+	if err := joinErr(r4, g4, carol, "Alice"); err != nil {
+		t.Fatalf("carol joining as Alice: %v", err)
+	}
+	got4, _ := r4.s.Get(t.Context(), g4.URI)
+	if p, _ := got4.Participant(bob); p.DisplayName != "Bob" {
+		t.Fatalf("bob %+v", p)
+	}
+	if p, _ := got4.Participant(carol); p.DisplayName != "Carol" || p.State != groupstore.Joined {
+		t.Fatalf("carol %+v", p)
+	}
+	if err := joinErr(r4, g4, bob, "Robert"); err != nil {
+		t.Fatalf("bob's one real rename: %v", err)
 	}
 	// One's own name, a new one, and others are fine.
 	for _, c := range []struct{ who, name string }{{bob, "Kim"}, {bob, "kim "}, {carol, "Carol"}, {bob, "Kimberly"}} {
