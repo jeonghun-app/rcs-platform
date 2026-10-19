@@ -57,10 +57,11 @@
 // same connection, never waits. Two peers that both
 // send faster than they read therefore cannot deadlock each other, and a peer
 // that stops reading loses its connection without slowing anyone else. When all
-// queues together reach MaxQueuedBytes, a connection whose writer has stopped
-// making progress is closed to make room, a client-facing one first and the
-// fullest relative to its own limit first; a connection that is making progress
-// is never closed for this, and if no connection qualifies only the send that
+// queues together reach MaxQueuedBytes, connections whose writers have stopped
+// making progress are closed to make room, client-facing ones first and the
+// fullest relative to their own limit first, until the budget is 10% below full
+// again, so a burst after a mass stall recovers within one scan; a connection
+// that is making progress is never closed for this, and if no connection qualifies only the send that
 // found the budget full fails, with ErrQueueFull. ErrQueueFull always means the
 // connection is still open; whenever the transport closes one, the send fails
 // with an error that satisfies errors.Is(err, ErrNoFlow).

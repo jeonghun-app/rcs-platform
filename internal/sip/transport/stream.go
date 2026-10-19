@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -213,11 +214,11 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	r := f.q.push(b, wait, deadline)
 	if r == overBudget {
 		// Every queue together is at Config.MaxQueuedBytes. Make room by closing
-		// a connection whose peer has stopped reading, if there is one, and try
-		// once more; otherwise only this send fails. f's own connection is
+		// connections whose peers have stopped reading, if there are any, and
+		// try once more; otherwise only this send fails. f's own connection is
 		// never closed for the budget: it may be perfectly healthy.
-		if t.shedStalledQueue(f) {
-			t.stats.budgetSheds.Add(1)
+		if n := t.shedStalledQueues(f, len(b)); n > 0 {
+			t.stats.budgetSheds.Add(uint64(n))
 			r = f.q.push(b, wait, deadline)
 		}
 		if r == overBudget {
@@ -280,26 +281,41 @@ func (a shedRank) before(b shedRank) bool {
 	return a.stalled > b.stalled
 }
 
-// shedScanInterval bounds how often shedStalledQueue looks at every flow. A
+// shedScanInterval bounds how often shedStalledQueues looks at every flow. A
 // scan of a few thousand flows takes some hundreds of microseconds under the
 // flow table's lock, and a full budget refuses sends in bursts; one scan per
 // interval keeps that to a fraction of a percent of one core, and a stalled
 // peer that one scan missed is still stalled at the next.
 const shedScanInterval = 100 * time.Millisecond
 
-// shedStalledQueue closes the best candidate for shedding other than except and
-// reports whether it closed one. A connection with nothing queued, already
-// closing, or whose writer made progress within shedGrace, is never a
-// candidate. It scans every stream flow, at most once per shedScanInterval.
-func (t *Transport) shedStalledQueue(except *flow) bool {
+// shedHeadroom is the share of MaxQueuedBytes a scan leaves free beyond the
+// send that triggered it. Freeing only that send's shortfall would leave the
+// budget full again for the next send, and scans run at most once per
+// shedScanInterval, so a burst after a mass stall would be refused for many
+// intervals while stalled connections remained to be shed.
+const shedHeadroom = 0.10
+
+// shedStalledQueues closes stalled connections other than except until all
+// queues together, plus need more bytes, fit in all but shedHeadroom of the
+// budget, or the candidates run out. It returns how many it closed.
+//
+// A connection with nothing queued, already closing, or whose writer made
+// progress within shedGrace, is never a candidate; the others are closed in
+// shedRank order. It scans every stream flow, at most once per
+// shedScanInterval.
+func (t *Transport) shedStalledQueues(except *flow, need int) int {
 	now := time.Now()
 	last := t.lastShedScan.Load()
 	if now.UnixNano()-last < int64(shedScanInterval) || !t.lastShedScan.CompareAndSwap(last, now.UnixNano()) {
-		return false
+		return 0
 	}
 	grace := t.shedGrace()
-	var victim *flow
-	var best shedRank
+	type candidate struct {
+		f      *flow
+		rank   shedRank
+		queued int
+	}
+	var cands []candidate
 	for _, f := range t.flows.streams() {
 		if f == except || f.closed.Load() {
 			continue
@@ -308,14 +324,33 @@ func (t *Transport) shedStalledQueue(except *flow) bool {
 		if queued == 0 || idle < grace {
 			continue
 		}
-		r := shedRank{client: f.lis != nil && f.lis.clientFacing, share: float64(queued) / float64(f.q.limit), stalled: idle}
-		if victim == nil || r.before(best) {
-			victim, best = f, r
+		cands = append(cands, candidate{f, shedRank{client: f.lis != nil && f.lis.clientFacing,
+			share: float64(queued) / float64(f.q.limit), stalled: idle}, queued})
+	}
+	slices.SortFunc(cands, func(a, b candidate) int {
+		switch {
+		case a.rank.before(b.rank):
+			return -1
+		case b.rank.before(a.rank):
+			return 1
+		}
+		return 0
+	})
+	target := int64(float64(t.budget.max) * (1 - shedHeadroom))
+	excess := t.budget.used.Load() + int64(need) - target
+	closed := 0
+	for _, c := range cands {
+		if excess <= 0 {
+			break
+		}
+		// A candidate may have started closing since it was looked at; then it
+		// frees nothing here and is not counted.
+		if t.closeFlow(c.f) {
+			closed++
+			excess -= int64(c.queued)
 		}
 	}
-	// The victim may have started closing since it was looked at; then the
-	// shed freed nothing and the send is refused.
-	return victim != nil && t.closeFlow(victim)
+	return closed
 }
 
 // startWriter gives a stream flow its send queue and writer goroutine. It is

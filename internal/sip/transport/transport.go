@@ -173,12 +173,13 @@ type Config struct {
 	// overrides it per listener.
 	SendQueueBytes int
 	// MaxQueuedBytes bounds the output every send queue holds together. When a
-	// message would take the total past it, one connection whose peer has
-	// stopped reading is closed to make room: never the sender's own, never one
-	// whose writer made progress in the last second (or half WriteTimeout, if
-	// shorter), and client-facing ones before core ones, fullest relative to
-	// their own limit first. If there is none, that send fails with
-	// ErrQueueFull. It must hold at least one message of the largest size
+	// message would take the total past it, connections whose peers have
+	// stopped reading are closed until the total, with the message, is 10%
+	// below the budget: never the sender's own, never one whose writer made
+	// progress in the last second (or half WriteTimeout, if shorter), and
+	// client-facing ones before core ones, fullest relative to their own limit
+	// first. This happens at most every 100 ms; a send that finds the budget
+	// full in between, or no candidate, fails with ErrQueueFull. It must hold at least one message of the largest size
 	// Limits allow. Size it, with the limits above, against the task's memory
 	// (see the package documentation).
 	MaxQueuedBytes int
@@ -318,7 +319,7 @@ type Transport struct {
 	budget  queueBudget
 	// closures delivers OnFlowClosed; nil when there is none.
 	closures *closureQueue
-	// lastShedScan is when shedStalledQueue last looked at every flow, in Unix
+	// lastShedScan is when shedStalledQueues last looked at every flow, in Unix
 	// nanoseconds.
 	lastShedScan atomic.Int64
 

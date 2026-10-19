@@ -152,7 +152,9 @@ func TestFullBudgetFailsOnlyTheSendNeverTheSendersConnection(t *testing.T) {
 				if err := r.send(h, 600); err != nil {
 					t.Fatal(err)
 				}
-				if tc.stallOthers {
+				// Only the first one stalls, so shedding everything it can still
+				// frees less than the send needs.
+				if tc.stallOthers && h == "192.0.2.1" {
 					stalled(r.flow(h))
 				}
 			}
@@ -498,7 +500,7 @@ func TestSheddingSkipsAFlowThatIsAlreadyClosing(t *testing.T) {
 		closing.conn.Close()
 		closing.q.close()
 	})
-	if !r.tr.shedStalledQueue(nil) {
+	if r.tr.shedStalledQueues(nil, 3000) == 0 {
 		t.Fatal("no connection was shed")
 	}
 	if !other.closed.Load() {
@@ -514,11 +516,67 @@ func TestSheddingScansAtMostOncePerInterval(t *testing.T) {
 	f := r.flow("192.0.2.1")
 	stalled(f)
 	r.tr.lastShedScan.Store(time.Now().UnixNano())
-	if r.tr.shedStalledQueue(nil) || f.closed.Load() {
+	if r.tr.shedStalledQueues(nil, 3000) > 0 || f.closed.Load() {
 		t.Fatal("a second scan within the interval ran")
 	}
 	r.tr.lastShedScan.Store(time.Now().Add(-shedScanInterval).UnixNano())
-	if !r.tr.shedStalledQueue(nil) || !f.closed.Load() {
+	if r.tr.shedStalledQueues(nil, 3000) == 0 || !f.closed.Load() {
 		t.Fatal("a scan after the interval did not run")
+	}
+}
+
+// #144: one scan after a mass stall closes as many stalled connections as it
+// takes, so a burst that needs several of them freed goes through without a
+// refusal, and the busy core connection that sends it is never closed.
+func TestOneScanFreesEnoughForABurstAfterAMassStall(t *testing.T) {
+	const budget = 100 << 10
+	dialer := &pipesDialer{}
+	server, _ := newTransport(t, Config{Dialer: dialer, WriteTimeout: time.Hour, MaxQueuedBytes: budget,
+		Limits: sip.Limits{MaxHeaderBytes: 4 << 10, MaxBodyBytes: 16 << 10}})
+	t.Cleanup(func() {
+		for _, p := range dialer.peers {
+			p.Close()
+		}
+	})
+	listen(t, server, ListenerConfig{Network: TCP, Name: "edge", ClientFacing: true})
+	listen(t, server, ListenerConfig{Network: TCP, Name: "core"})
+	msg := func(body int) *sip.Request {
+		req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKm")
+		req.Body = make([]byte, body)
+		return req
+	}
+
+	// Twenty clients stop reading with about 4.75 KiB each: 95% of the budget.
+	var clients []*flow
+	for i := range 20 {
+		f := pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.80"), uint16(40000+i)))
+		if _, err := server.SendRequest(msg(4864-300), Destination{Flow: f.id}, NoWait); err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, f)
+	}
+	for _, f := range clients {
+		stalled(f)
+	}
+	core := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
+
+	// A burst of four 3 KiB requests on the core connection needs more than one
+	// stalled client freed.
+	for i := range 4 {
+		if _, err := server.SendRequest(msg(3<<10-300), core); err != nil {
+			t.Fatalf("request %d of the burst was refused: %v (%+v)", i, err, server.Stats())
+		}
+	}
+	coreFlow := server.flows.peer(reuseKey{network: TCP, remote: core.Addr})
+	if coreFlow == nil || coreFlow.closed.Load() {
+		t.Fatal("the core connection was closed")
+	}
+	s := server.Stats()
+	if s.BudgetRefusals != 0 || s.BudgetSheds < 2 || s.QueuedBytes > budget {
+		t.Fatalf("stats = %+v", s)
+	}
+	// One scan did it: the burst fits in the headroom that scan left.
+	if s.BudgetSheds > 3 {
+		t.Fatalf("shed %d connections, more than the headroom needs", s.BudgetSheds)
 	}
 }
