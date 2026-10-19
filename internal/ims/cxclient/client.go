@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"slices"
@@ -273,13 +274,7 @@ func (c *Client) Refresh(ctx context.Context) error {
 		c.metrics.Count("cxclient.resolve.error", 1)
 		return fmt.Errorf("cxclient: %s has no address", c.cfg.HSS)
 	}
-	sorted := slices.SortedFunc(func(yield func(netip.Addr) bool) {
-		for a := range want {
-			if !yield(a) {
-				return
-			}
-		}
-	}, func(a, b netip.Addr) int { return a.Compare(b) })
+	sorted := slices.SortedFunc(maps.Keys(want), func(a, b netip.Addr) int { return a.Compare(b) })
 	if len(sorted) > c.cfg.MaxPeers {
 		c.log.Warn("cxclient: more HSS addresses than MaxPeers; ignoring the rest", slog.Int("addresses", len(sorted)))
 		sorted = sorted[:c.cfg.MaxPeers]
@@ -315,6 +310,8 @@ func (c *Client) Refresh(ctx context.Context) error {
 		c.metrics.Count("cxclient.peer.added", 1)
 		c.log.Info("cxclient: HSS task added", slog.String("address", a.String()))
 	}
+	// Counted while closed is false under mu, so Close waits for them.
+	c.wg.Add(len(gone))
 	c.mu.Unlock()
 
 	for _, p := range gone {
@@ -350,9 +347,9 @@ func (c *Client) connect(a netip.Addr) (*hssPeer, error) {
 }
 
 // shutdown stops a node in the background: its DPR exchange waits for the
-// requests in flight, which must not hold up Refresh.
+// requests in flight, which must not hold up Refresh. The caller has counted
+// it in c.wg.
 func (c *Client) shutdown(p *hssPeer) {
-	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.RequestTimeout)
