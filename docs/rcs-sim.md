@@ -28,6 +28,7 @@ MESSAGE through pcscf) replaces both parts.
 | `chat-client-originated` | listen-core, allocate (client path), answer (core path), connect, client-to-core, core-to-client, chunked-message, keep-alive, clean, release | ADR 0004's first row: messages both ways with CPIM and IMDN, delivered and displayed notifications, the success report of each message by its Message-ID, a 100 KiB message in 2 KiB chunks, keep-alives on a quiet session; after the release, the client path is refused with 481 |
 | `chat-core-originated` | listen-core, allocate (core path), connect-then-answer, core-sends-first, then as above | ADR 0004's second row: the client connects as soon as it has answered, before pcscf records its path (the PATCH goes 300 ms later, so the relay must wait, `RELAY_PATH_WAIT`), and the network speaks first |
 | `pager-message` | register (both clients), message, receive, delivery-notification | RCC.07 standalone messaging, pager mode (#135): a MESSAGE with CPIM and an IMDN delivery request from the client to the peer's IMPU, answered 200 and received on the peer's flow, its text and Message-ID intact; the delivery notification back to the client as a MESSAGE of its own (RFC 5438 §7.1.1), matched by Message-ID. Both clients unregister at the end. Needs `-sip-proxy` and a peer IMPI |
+| `reg-event` | register, subscribe, re-register, unregister | the reg event of the client's own IMPU (RFC 3680, TS 24.229 §5.1.1.3, #135): the SUBSCRIBE is answered 2xx and the first NOTIFY is the full state with the client's contact active; a refresh REGISTER brings a NOTIFY with the contact still active; the de-registration brings one with the contact terminated, which ends the subscription. Each NOTIFY's version is one above the last (§5.3.1). Needs `-sip-proxy` |
 
 `all` runs every scenario. It leaves the SIP ones out unless both SIP clients are configured, since a stack without pcscf cannot run them. A scenario stops at its first failed step.
 
@@ -210,12 +211,12 @@ which also calls it. The registrar
 authenticates with `internal/sip/digest`'s server side and Milenage vectors.
 
 `-sip-proxy` turns the client's configuration on (see [Running it](#running-it)),
-and `-sip-peer-impi` a second client for the far end. `pager-message` is the
-first scenario that uses them; the others of #135 come with pcscf and scscf.
+and `-sip-peer-impi` a second client for the far end. `pager-message` and
+`reg-event` use them; the others of #135 come with pcscf and scscf.
 Until then the scenario tests run it against `simtest.IMSCore`, an in-process
-stand-in for the IMS core: a registrar that authenticates with SIP Digest and
-a proxy that routes each request to the flow its Request-URI is registered
-on.
+stand-in for the IMS core: a registrar that authenticates with SIP Digest, a
+notifier for the reg event of each IMPU, and a proxy that routes each request
+to the flow its Request-URI is registered on.
 
 ## Running it
 

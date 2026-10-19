@@ -332,3 +332,7 @@ func notification(req *sip.Request) Notification {
 	n.Info, n.Err = ParseRegInfo(req.Body)
 	return n
 }
+
+// ContactURI is the URI of the UA's registered contact, as reginfo lists
+// it.
+func (ua *UA) ContactURI() sip.URI { return ua.contact.URI }

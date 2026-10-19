@@ -100,11 +100,12 @@ var scenarios = map[string]func(*run) error{
 	"chat-client-originated": chatClientOriginated,
 	"chat-core-originated":   chatCoreOriginated,
 	"pager-message":          pagerMessage,
+	"reg-event":              regEvent,
 }
 
 // sipScenarios need the SIP clients; "all" runs them only when they are
 // configured, as a stack without pcscf cannot (#135).
-var sipScenarios = map[string]bool{"pager-message": true}
+var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true}
 
 // Names lists the built-in scenarios, sorted.
 func Names() []string {

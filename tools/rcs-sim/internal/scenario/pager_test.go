@@ -83,13 +83,15 @@ func TestSIPScenariosWaitForASIPConfiguration(t *testing.T) {
 	cfg := stack(t)
 	_, results := runAll(t, cfg, "all")
 	for _, r := range results {
-		if r.Scenario == "pager-message" {
+		if r.Scenario == "pager-message" || r.Scenario == "reg-event" {
 			t.Fatalf("all ran %+v without SIP", r)
 		}
 	}
-	ok, results := runAll(t, cfg, "pager-message")
-	if ok || len(results) != 1 || results[0].OK {
-		t.Fatalf("results %+v", results)
+	for _, name := range []string{"pager-message", "reg-event"} {
+		ok, results := runAll(t, cfg, name)
+		if ok || len(results) != 1 || results[0].OK {
+			t.Fatalf("%s: results %+v", name, results)
+		}
 	}
 }
 
