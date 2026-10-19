@@ -426,7 +426,7 @@ type Challenge struct {
 	AKA    *AKAVector
 	Digest *DigestChallenge
 	// Resynchronised marks an AKA challenge whose vector the HSS issued
-	// after a resynchronisation (TS 33.203 §6.1.2): a further synchronisation
+	// after a resynchronisation (TS 33.102 §6.3.5): a further synchronisation
 	// failure for it is not sent to the HSS again.
 	Resynchronised bool
 }
