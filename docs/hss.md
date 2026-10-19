@@ -241,6 +241,10 @@ A backslash before a special character, such as `\.` or `\+`, is a literal and
 is fine. Named classes such as `[[:alpha:]]` hold ASCII characters only, as in
 the POSIX locale: `[[:alpha:]]` does not match `ä`, and `[^[:upper:]]` does.
 
+A pattern is at most 4 KiB (`MaxPatternBytes`); a longer one is refused with
+400 naming the limit. The limit bounds the time to parse a pattern, which for
+some inputs grows with the square of their length.
+
 The API checks patterns when a profile is written. A profile stored before
 this rule keeps working as it is, and needs these constructs removed when it
 is next changed.

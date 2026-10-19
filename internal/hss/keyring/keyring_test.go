@@ -272,6 +272,11 @@ func TestKeyringNeverPrintsItsKeys(t *testing.T) {
 	if strings.Contains(buf.String(), `"time"`) {
 		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", buf.String())
 	}
+	// The keyring is in the line, as its placeholder, so the search below
+	// looks at what it logs and not at a line without it.
+	if !strings.Contains(buf.String(), placeholder) {
+		t.Fatalf("the line does not log the keyring as %s:\n%s", placeholder, buf.String())
+	}
 	j, _ := json.Marshal(struct{ K *Keyring }{k})
 	for _, s := range []string{fmt.Sprint(k), fmt.Sprintf("%#v", k), fmt.Sprintf("%x", k), k.String(), buf.String(), string(j)} {
 		if strings.Contains(s, "0707") || strings.Contains(s, "aead") {

@@ -77,7 +77,12 @@ traffic within an AZ is not assumed to be.
    address), loopback and public hosts are refused in `staging`/`prod`.
    Internal clients never follow redirects. IPv6 GUAs are refused (fails safe on
    dual-stack VPCs). (Amended in #64: ULAs were always accepted by the code and
-   are now named here.)
+   are now named here.) In `staging`/`prod` internal HTTP clients, `https://`
+   ones included, also check the address a name resolves to when they connect
+   (`runtime.InternalDialer`) and connect only to RFC 1918 or ULA addresses, so
+   a record in the namespace cannot send a token elsewhere. The `-healthcheck`
+   probe of a task's own admin port on loopback is not an internal API client
+   and carries no token; it is exempt. (Amended in #87.)
    Operators reach the HSS API only from inside the VPC (a task or an internal
    ALB with TLS); it is never on the public ALB.
 6. Diameter: in `staging`/`prod` every accept rule must restrict `Networks`, and
