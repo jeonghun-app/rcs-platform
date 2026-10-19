@@ -639,7 +639,7 @@ identifier ever appears in a metric name.
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
-| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget |
+| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through
 `internal/pii`. MSRP session ids never appear: they are capabilities ([threat
@@ -698,6 +698,14 @@ Signals to alarm on (Phase 7):
   only participants on the same task. The delivery workers are shared, so
   more slow participants than `Workers` (32) at once slow everyone, by up to
   `RCSAS_DELIVERY_TIMEOUT` each.
+- **Group fan-out is sequential.** A group message is queued for its
+  recipients one enqueue transaction after another, on the sender's session,
+  before the sender's answer. A message to 99 others at 10 ms an enqueue takes
+  about a second. Past 20 s (`Config.FanoutTimeout`, within the 30 s an MSRP
+  client waits) the remaining recipients are left out
+  (`group.fanout.timed_out` counts them), and the sender gets `StatusTryAgain`
+  and sends again; recipients that already have it drop the repeat by
+  Message-ID. Other sessions are not held up.
 - **Leaving is known per task.** The task that ran `Leave` or `Remove` gives up
   that participant's queued copies at once. Another task gives them up only
   when it would invite the participant back, so a session the SIP layer has

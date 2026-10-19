@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -478,5 +479,47 @@ func TestAGroupCopyWaitsWhenTheGroupCannotSay(t *testing.T) {
 	}
 	if len(r.d.invites) != 0 || r.store.(*store.Memory).Len(bob) != 1 || r.m.get("store.failed") != 1 {
 		t.Fatalf("invites %d, metrics %v", len(r.d.invites), r.m)
+	}
+}
+
+// slowStore takes step of the fake clock for each enqueue: a store that
+// answers, but slowly.
+type slowStore struct {
+	store.Store
+	clock *fakeClock
+	step  time.Duration
+	calls atomic.Int64
+}
+
+func (s *slowStore) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
+	s.calls.Add(1)
+	s.clock.Advance(s.step)
+	return s.Store.Enqueue(ctx, m, l)
+}
+
+// The fan-out runs on the sender's session one recipient after another; a
+// slow store cannot hold the sender past FanoutTimeout. The recipients not
+// reached are left out and the sender is told to try again.
+func TestASlowFanOutAnswersTheSenderInTime(t *testing.T) {
+	clock := newFakeClock()
+	st := &slowStore{Store: store.NewMemory(), clock: clock, step: 3 * time.Second}
+	r := newRigWith(t, Config{}, st, clock)
+	everyone := []string{alice}
+	for i := range 99 {
+		everyone = append(everyone, fmt.Sprintf("sip:u%d@example.net", i))
+	}
+	r.e.SetGroupHandler(members{all: everyone})
+	drainInvites(t, r.d)
+	start := clock.Now()
+	err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi all", 0)))
+	if err == nil || rejected(err) != "" {
+		t.Fatalf("SubmitGroup = %v, want a failure to retry", err)
+	}
+	if took := clock.Now().Sub(start); took > DefaultFanoutTimeout+st.step {
+		t.Fatalf("the sender waited %v", took)
+	}
+	n := st.calls.Load()
+	if n >= 99 || r.m.get("group.fanout.timed_out") != 99-n {
+		t.Fatalf("%d enqueues; metrics %v", n, r.m)
 	}
 }

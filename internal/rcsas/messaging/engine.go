@@ -52,10 +52,14 @@ const (
 	DefaultRetryInterval    = time.Minute
 	DefaultMaxRetryInterval = time.Hour
 	DefaultStoreTimeout     = 5 * time.Second
-	DefaultSweepInterval    = time.Minute
-	DefaultBatch            = 50
-	DefaultWorkers          = 32
-	DefaultMaxTracked       = 100_000
+	// DefaultFanoutTimeout leaves a group message's sender its answer well
+	// within the 30 s an MSRP client waits for one (rcsjta's transaction
+	// timeout).
+	DefaultFanoutTimeout = 20 * time.Second
+	DefaultSweepInterval = time.Minute
+	DefaultBatch         = 50
+	DefaultWorkers       = 32
+	DefaultMaxTracked    = 100_000
 )
 
 // Bounds on identifiers that become store keys: DynamoDB keys hold at
@@ -123,7 +127,11 @@ type Config struct {
 	RetryInterval    time.Duration
 	MaxRetryInterval time.Duration
 	// StoreTimeout bounds each store call.
-	StoreTimeout  time.Duration
+	StoreTimeout time.Duration
+	// FanoutTimeout bounds the queueing of one group message for all its
+	// recipients, one store call after another; those not reached by then
+	// are not queued, and the sender is answered as for a store failure.
+	FanoutTimeout time.Duration
 	SweepInterval time.Duration
 	// Batch is how many queued messages one store read returns.
 	Batch int
@@ -269,6 +277,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.RetryInterval, DefaultRetryInterval)
 	setDefault(&c.MaxRetryInterval, DefaultMaxRetryInterval)
 	setDefault(&c.StoreTimeout, DefaultStoreTimeout)
+	setDefault(&c.FanoutTimeout, DefaultFanoutTimeout)
 	setDefault(&c.SweepInterval, DefaultSweepInterval)
 	setDefault(&c.Batch, DefaultBatch)
 	setDefault(&c.Workers, DefaultWorkers)

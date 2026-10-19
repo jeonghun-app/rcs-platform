@@ -260,8 +260,21 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 	}
 	// Each recipient's queue is its own: one that is full, or a store
 	// call that fails, costs that recipient the message and nobody else.
+	// The calls run one after another on the sender's session, so all of
+	// them together are bounded too: past FanoutTimeout the rest are left
+	// out and the sender, answered as for a store failure, sends again
+	// (recipients drop the repeats by Message-ID).
+	fctx, done := e.withTimeout(ctx, e.cfg.FanoutTimeout)
+	defer done()
 	var failed error
-	for _, r := range recipients {
+	for i, r := range recipients {
+		if err := fctx.Err(); err != nil {
+			e.metrics.Count("group.fanout.timed_out", int64(len(recipients)-i))
+			if failed == nil {
+				failed = err
+			}
+			break
+		}
 		id, err := e.newID(now)
 		if err != nil {
 			return err
@@ -271,7 +284,7 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 			Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
 			CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
 		}
-		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
+		sctx, cancel := e.withTimeout(fctx, e.cfg.StoreTimeout)
 		err = e.enqueue(sctx, q)
 		if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {
 			e.metrics.Count("group.fanout.queue_full", 1)
