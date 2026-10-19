@@ -44,6 +44,12 @@ func (m *Metrics) Count(name string, n int64) {
 	m.emit(name, "Count", n)
 }
 
+// Bytes records n octets for name, with the Bytes unit so that CloudWatch
+// can show and scale them as data sizes.
+func (m *Metrics) Bytes(name string, n int64) {
+	m.emit(name, "Bytes", n)
+}
+
 // Timing records one duration for name, in milliseconds.
 func (m *Metrics) Timing(name string, d time.Duration) {
 	m.emit(name, "Milliseconds", float64(d)/float64(time.Millisecond))

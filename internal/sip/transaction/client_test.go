@@ -380,11 +380,15 @@ func TestReliabilityFollowsTheTransportActuallyUsed(t *testing.T) {
 	// The transport may send a large UDP request over TCP (RFC 3261 §18.1.1); the
 	// transaction must then not retransmit.
 	h := newHarness(t, transport.TCP, Config{})
-	if _, err := h.layer.Request(request(t, "MESSAGE", "z9hG4bKbig"), transport.Destination{Network: transport.UDP}, h.handler); err != nil {
+	tx, err := h.layer.Request(request(t, "MESSAGE", "z9hG4bKbig"), transport.Destination{Network: transport.UDP}, h.handler)
+	if err != nil {
 		t.Fatal(err)
 	}
 	h.clock.advance(10 * time.Second)
 	check(t, "sent", h.sender.take(), []string{"MESSAGE"})
+	if n := tx.Network(); n != transport.TCP {
+		t.Fatalf("Network() = %s, want the transport actually used", n)
+	}
 }
 
 func TestStateNamesAreReadable(t *testing.T) {

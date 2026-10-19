@@ -5,9 +5,12 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 func TestClientFacingListenersGetASmallSendQueue(t *testing.T) {
@@ -40,8 +43,10 @@ func TestClientThatStopsReadingIsClosedBeforeItsQueuePassesTheListenerLimit(t *t
 			t.Fatalf("queue reached %d bytes, past the listener's %d", n, limit)
 		}
 	}
-	if !errors.Is(err, ErrQueueFull) {
-		t.Fatalf("flooding a client that does not read ended with %v, want ErrQueueFull", err)
+	// The transport closed the connection, so the error says no flow, which a
+	// P-CSCF answers with 430.
+	if !errors.Is(err, ErrNoFlow) || errors.Is(err, ErrQueueFull) {
+		t.Fatalf("flooding a client that does not read ended with %v, want ErrNoFlow", err)
 	}
 	if _, ok := server.Flow(id); ok {
 		t.Fatal("the connection is still open")
@@ -65,36 +70,110 @@ func (d *pipesDialer) DialContext(context.Context, string, string) (net.Conn, er
 	return a, nil
 }
 
-func TestFullBudgetClosesTheConnectionHoldingTheMostOutput(t *testing.T) {
+// stalled marks a flow's writer as having made no progress for a long time, as
+// a peer that stopped reading leaves it; the pipes in these tests stall at
+// once, and waiting out the shedding grace for real would only slow the tests.
+func stalled(f *flow) { f.q.progress.Store(time.Now().Add(-time.Hour).UnixNano()) }
+
+// budgetRig is a transport with a 3000-byte budget whose dials are pipes no
+// one reads, and a sender of ~850-byte MESSAGEs (or larger, with extra body).
+type budgetRig struct {
+	t      *testing.T
+	tr     *Transport
+	dialer *pipesDialer
+}
+
+func newBudgetRig(t *testing.T) *budgetRig {
 	dialer := &pipesDialer{}
-	tr, _ := newTransport(t, Config{Dialer: dialer, WriteTimeout: time.Hour, SendQueueBytes: 1 << 20, MaxQueuedBytes: 3000})
-	listen(t, tr, ListenerConfig{Network: TCP})
+	tr, err := New(Config{Dialer: dialer, WriteTimeout: time.Hour, SendQueueBytes: 1 << 20, MaxQueuedBytes: 3000,
+		Limits: sip.Limits{MaxHeaderBytes: 1000, MaxBodyBytes: 2000}}, func(Inbound) {})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
+		tr.Close()
 		for _, p := range dialer.peers {
 			p.Close()
 		}
 	})
-	hog := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.1:5060")}
-	other := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.2:5060")}
-	send := func(dst Destination, branch string) error {
-		req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch="+branch)
-		req.Body = make([]byte, 600) // about 850 bytes on the wire
-		return within(t, func() error { _, err := tr.SendRequest(req, dst); return err })
-	}
-	for _, b := range []string{"z9hG4bKh1", "z9hG4bKh2", "z9hG4bKh3"} {
-		if err := send(hog, b); err != nil {
+	listen(t, tr, ListenerConfig{Network: TCP})
+	return &budgetRig{t: t, tr: tr, dialer: dialer}
+}
+
+func (r *budgetRig) send(host string, body int) error {
+	r.t.Helper()
+	req := newRequest(r.t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK"+host+strconv.Itoa(body))
+	req.Body = make([]byte, body)
+	dst := Destination{Network: TCP, Addr: netip.MustParseAddrPort(host + ":5060")}
+	return within(r.t, func() error { _, err := r.tr.SendRequest(req, dst); return err })
+}
+
+func (r *budgetRig) flow(host string) *flow {
+	return r.tr.flows.peer(reuseKey{network: TCP, remote: netip.MustParseAddrPort(host + ":5060")})
+}
+
+func TestFullBudgetShedsAStalledConnectionToMakeRoom(t *testing.T) {
+	r := newBudgetRig(t)
+	for range 3 {
+		if err := r.send("192.0.2.1", 600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	hogFlow := tr.flows.peer(reuseKey{network: TCP, remote: hog.Addr})
-	if err := send(other, "z9hG4bKo1"); err != nil {
-		t.Fatalf("the connection within its share was refused: %v", err)
+	hog := r.flow("192.0.2.1")
+	stalled(hog)
+	if err := r.send("192.0.2.2", 600); err != nil {
+		t.Fatalf("a send that shedding made room for failed: %v", err)
 	}
-	if !hogFlow.closed.Load() {
-		t.Fatal("the connection holding the most output was not closed")
+	if !hog.closed.Load() {
+		t.Fatal("the stalled connection was not closed")
 	}
-	if s := tr.Stats(); s.BudgetSheds != 1 || s.QueuedBytes > 3000 || s.OpenOutbound != 1 {
+	if s := r.tr.Stats(); s.BudgetSheds != 1 || s.BudgetRefusals != 0 || s.QueuedBytes > 3000 || s.OpenOutbound != 1 {
 		t.Fatalf("stats = %+v", s)
+	}
+}
+
+// Code review (PR #35, round 3), finding 1: when the budget is full, the send
+// fails alone and the sender's healthy connection stays open, whether nothing
+// could be shed or what was shed did not free enough.
+func TestFullBudgetFailsOnlyTheSendNeverTheSendersConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		stallOthers, stallOwn bool
+		sheds                 uint64
+	}{
+		{"nothing to shed", false, false, 0},
+		{"shedding frees too little", true, false, 1},
+		{"only the sender has stalled", false, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newBudgetRig(t)
+			for _, h := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
+				if err := r.send(h, 600); err != nil {
+					t.Fatal(err)
+				}
+				if tc.stallOthers {
+					stalled(r.flow(h))
+				}
+			}
+			// The sender's connection exists before the budget runs out. It is
+			// the one sending, so it is never shed.
+			if err := r.send("192.0.2.9", 10); err != nil {
+				t.Fatal(err)
+			}
+			if tc.stallOwn {
+				stalled(r.flow("192.0.2.9"))
+			}
+			err := r.send("192.0.2.9", 1700)
+			if !errors.Is(err, ErrQueueFull) || errors.Is(err, ErrNoFlow) {
+				t.Fatalf("send = %v, want ErrQueueFull alone", err)
+			}
+			if f := r.flow("192.0.2.9"); f == nil || f.closed.Load() {
+				t.Fatal("the sender's own connection was closed")
+			}
+			if s := r.tr.Stats(); s.QueueOverflows != 0 || s.BudgetRefusals != 1 || s.BudgetSheds != tc.sheds {
+				t.Fatalf("stats = %+v", s)
+			}
+		})
 	}
 }
 
@@ -167,5 +246,167 @@ func TestSetFlowIdleTimeoutRefusesWhatItCannotApply(t *testing.T) {
 		if ok {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// Code review (PR #35, round 3), finding 2: core connections have queue limits
+// 64 times a client's, so shedding by raw bytes would always close a core link.
+// Clients that stopped reading go first; a connection that is making progress
+// is never shed.
+func TestFullBudgetShedsAStalledClientNotABusyCoreConnection(t *testing.T) {
+	for name, coreProgressing := range map[string]bool{"core progressing": true, "core stalled too": false} {
+		t.Run(name, func(t *testing.T) {
+			dialer := &pipesDialer{}
+			server, _ := newTransport(t, Config{Dialer: dialer, WriteTimeout: time.Hour, MaxQueuedBytes: 420 << 10,
+				Limits: sip.Limits{MaxHeaderBytes: 16 << 10, MaxBodyBytes: 64 << 10}})
+			t.Cleanup(func() {
+				for _, p := range dialer.peers {
+					p.Close()
+				}
+			})
+			listen(t, server, ListenerConfig{Network: TCP, Name: "edge", ClientFacing: true})
+			listen(t, server, ListenerConfig{Network: TCP, Name: "core"})
+
+			// Three client flows on the client-facing listener. Their connections are
+			// pipes, which take nothing until read, so a writer that stops is stopped
+			// for good; the first two are never read.
+			var clients []*flow
+			for i := range 3 {
+				clients = append(clients, pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.80"), uint16(40000+i))))
+			}
+			msg := func(body int) *sip.Request {
+				req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKm")
+				req.Body = make([]byte, body)
+				return req
+			}
+			// The core connection holds about 200 KiB, a twentieth of its limit, and keeps
+			// making progress.
+			core := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
+			for range 25 {
+				if _, err := server.SendRequest(msg(8<<10), core); err != nil {
+					t.Fatal(err)
+				}
+			}
+			coreFlow := server.flows.peer(reuseKey{network: TCP, remote: core.Addr})
+			// Each stalled client holds about 80% of its 128 KiB reserve, once its
+			// writer has filled the kernel's buffers and stopped.
+			for _, f := range clients[:2] {
+				for f.q.size() < 100<<10 {
+					if _, err := server.SendRequest(msg(1<<10), Destination{Flow: f.id}, NoWait); err != nil {
+						t.Fatal(err)
+					}
+				}
+				stalled(f)
+			}
+			if coreProgressing {
+				coreFlow.q.progress.Store(time.Now().UnixNano())
+			} else {
+				// Stalled as well: it holds the most bytes, but a far smaller share of
+				// its own limit than the clients do.
+				stalled(coreFlow)
+			}
+
+			// A message to the third client takes the total past the budget.
+			over := 420<<10 - int(server.budget.used.Load()) + 1<<10
+			if _, err := server.SendRequest(msg(over), Destination{Flow: clients[2].id}, NoWait); err != nil {
+				t.Fatalf("send to the third client: %v", err)
+			}
+			if coreFlow.closed.Load() {
+				t.Fatal("the busy core connection was shed")
+			}
+			if clients[0].closed.Load() == clients[1].closed.Load() {
+				t.Fatalf("want exactly one stalled client shed: %v %v", clients[0].closed.Load(), clients[1].closed.Load())
+			}
+			if s := server.Stats(); s.BudgetSheds != 1 || s.QueuedBytes > 420<<10 {
+				t.Fatalf("stats = %+v", s)
+			}
+		})
+	}
+}
+
+// pipeFlow enters an accepted flow on the named listener whose connection is a
+// pipe nobody reads, as if a client had connected from remote.
+func pipeFlow(t *testing.T, tr *Transport, listener string, remote netip.AddrPort) *flow {
+	t.Helper()
+	a, b := net.Pipe()
+	t.Cleanup(func() { b.Close() })
+	l := tr.listenerNamed(listener)
+	f := tr.flows.newFlow(TCP, l, remote)
+	f.conn = a
+	f.idle.Store(int64(l.idle))
+	tr.startWriter(f)
+	if !tr.flows.addStream(f) {
+		t.Fatal("flow not entered")
+	}
+	return f
+}
+
+func TestNewRefusesABudgetSmallerThanTheLargestMessage(t *testing.T) {
+	if _, err := New(Config{MaxQueuedBytes: 4096}, func(Inbound) {}); err == nil {
+		t.Fatal("accepted a budget below the default largest message")
+	}
+	if _, err := New(Config{MaxQueuedBytes: 4096, Limits: sip.Limits{MaxHeaderBytes: 1024, MaxBodyBytes: 3072}}, func(Inbound) {}); err != nil {
+		t.Fatalf("refused a budget equal to the largest message: %v", err)
+	}
+}
+
+// fillQueue makes a flow's queue look full without a writer to drain it.
+func fillQueue(f *flow) {
+	f.q.mu.Lock()
+	defer f.q.mu.Unlock()
+	f.q.budget.reserve(f.q.limit)
+	f.q.queued += f.q.limit
+}
+
+func TestResponseThatCannotBeQueuedClosesAClientFlowButNotACoreOne(t *testing.T) {
+	for name, clientFacing := range map[string]bool{"client-facing": true, "core": false} {
+		t.Run(name, func(t *testing.T) {
+			server, rec := newTransport(t, Config{WriteTimeout: 20 * time.Millisecond})
+			addr := listen(t, server, ListenerConfig{Network: TCP, ClientFacing: clientFacing})
+			c := dialRaw(t, addr)
+			c.Write([]byte(rawRequest("MESSAGE", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bK1")))
+			in := rec.next(t)
+			f := server.flows.lookup(in.Source.Flow)
+			fillQueue(f)
+			err := server.SendResponse(respond(t, in.Message.(*sip.Request), 200), in.Source)
+			_, open := server.Flow(in.Source.Flow)
+			if clientFacing {
+				if !errors.Is(err, ErrNoFlow) || open || server.Stats().ResponseFlowCloses != 1 {
+					t.Fatalf("err %v, open %v: a client flow must be closed so the client sees the failure", err, open)
+				}
+				return
+			}
+			if !errors.Is(err, ErrQueueFull) || !open {
+				t.Fatalf("err %v, open %v: a core flow must stay open", err, open)
+			}
+		})
+	}
+}
+
+func TestSheddingPrefersClientsThenTheFullestShareThenTheLongestStall(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b shedRank
+	}{
+		{"a client before a fuller core connection", shedRank{client: true, share: 0.1}, shedRank{share: 0.9, stalled: time.Hour}},
+		{"the fuller share among clients", shedRank{client: true, share: 0.9}, shedRank{client: true, share: 0.5, stalled: time.Hour}},
+		{"the fuller share among core connections", shedRank{share: 0.6}, shedRank{share: 0.2}},
+		{"the longer stall at equal shares", shedRank{client: true, share: 0.5, stalled: time.Minute}, shedRank{client: true, share: 0.5, stalled: time.Second}},
+	}
+	for _, tt := range tests {
+		if !tt.a.before(tt.b) || tt.b.before(tt.a) {
+			t.Errorf("%s: order is wrong", tt.name)
+		}
+	}
+}
+
+func TestQueueThatWasIdleDoesNotLookStalledWhenOutputArrives(t *testing.T) {
+	var b queueBudget
+	b.max = 1 << 20
+	q := newSendQueue(1<<20, &b)
+	q.progress.Store(time.Now().Add(-time.Hour).UnixNano()) // idle for an hour
+	q.push(make([]byte, 100), false, 0)
+	if _, idle := q.stall(time.Now()); idle > time.Second {
+		t.Fatalf("a queue that just received output looks stalled for %v", idle)
 	}
 }

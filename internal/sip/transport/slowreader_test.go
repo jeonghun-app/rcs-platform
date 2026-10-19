@@ -68,10 +68,10 @@ func TestSlowButReadingPeerKeepsItsConnectionUnderABurst(t *testing.T) {
 }
 
 func TestLargeMessageToASteadyReaderIsNotCutByTheWriteTimeout(t *testing.T) {
-	// The whole message takes about 800 ms to drain, longer than WriteTimeout,
-	// but the peer takes 32 KiB every 100 ms, so the writer never goes
-	// WriteTimeout without progress.
-	tr, peer := pipeTransport(t, Config{WriteTimeout: 300 * time.Millisecond})
+	// The whole message takes about 1.6 s to drain, longer than WriteTimeout,
+	// but the peer takes 32 KiB every 100 ms, so the writer makes progress ten
+	// times per WriteTimeout, which leaves room for a loaded host.
+	tr, peer := pipeTransport(t, Config{WriteTimeout: time.Second})
 	got := make(chan int, 1)
 	go func() {
 		buf := make([]byte, writeChunk)
@@ -79,7 +79,7 @@ func TestLargeMessageToASteadyReaderIsNotCutByTheWriteTimeout(t *testing.T) {
 		for {
 			n, err := peer.Read(buf)
 			total += n
-			if err != nil || total >= 256<<10 {
+			if err != nil || total >= 512<<10 {
 				got <- total
 				return
 			}
@@ -87,13 +87,13 @@ func TestLargeMessageToASteadyReaderIsNotCutByTheWriteTimeout(t *testing.T) {
 		}
 	}()
 	req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKbig")
-	req.Body = make([]byte, 256<<10)
+	req.Body = make([]byte, 512<<10)
 	if _, err := tr.SendRequest(req, pipeDst); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case n := <-got:
-		if n < 256<<10 {
+		if n < 512<<10 {
 			t.Fatalf("peer read %d bytes", n)
 		}
 	case <-time.After(waitFor):

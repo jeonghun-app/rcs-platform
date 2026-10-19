@@ -120,7 +120,18 @@ byte 0, and the resume URL:
     Operations notes). A task that crashes leaves it to lapse within the lease
     time.
 - The update that completes an upload depends on the version the writer holds,
-  so two tasks cannot both complete the same `tid`. Content is safe even if a
+  so two tasks cannot both complete the same `tid`. A transient failure of that
+  update is retried, and each attempt gets its own `FT_STORAGE_TIMEOUT`, all
+  within the completion budget (see Operations notes).
+  - An update can be applied with its answer lost, either because our deadline
+    ended the call after DynamoDB wrote, or because the SDK's retry met the write
+    as a conflict.
+  - So before a conflict, or any failure that leaves the outcome unknown, is
+    answered, the record is read back once with a fresh context.
+  - If it is complete with this completion's object key and hash, the upload is
+    reported as complete (`upload.commit_recovered`) rather than failed.
+
+  Content is safe even if a
   lease is broken, for example by a writer stalled past it or by clocks far
   apart:
   - each upload attempt writes its multipart upload under its own key;
@@ -135,15 +146,26 @@ byte 0, and the resume URL:
 
 - Every answer except a live, complete file is `404`: an unknown or malformed
   id, an upload in progress, a file past its validity, or an expired record.
-- A task serves at most `FT_MAX_CONCURRENT_DOWNLOADS` at once, and at most
-  `FT_MAX_DOWNLOADS_PER_FILE` of one file. Beyond either limit it answers `503`
-  with `Retry-After`. The per-file limit matters because with
-  `FT_DOWNLOAD_AUTH` off, anyone holding a link can open connections; a
-  recipient resuming a download needs one or two.
-- A download read more slowly than `FT_MIN_DOWNLOAD_RATE`, measured over each
-  minute, is cut off. Otherwise a reader that reads just enough to beat the
-  write deadline could hold a slot for hours. The client sees a broken download,
+- A task serves at most `FT_MAX_CONCURRENT_DOWNLOADS` downloads at once. Within
+  that, it serves at most `FT_MAX_DOWNLOADS_PER_UPLOADER` across all the files of
+  one uploader, and at most `FT_MAX_DOWNLOADS_PER_FILE` of one file. Beyond any
+  of these limits it answers `503` with `Retry-After`.
+  - The per-file limit is sized for a group chat, where every member fetches the
+    same link within seconds of the message (64 with the defaults).
+  - The per-uploader limit keeps one subscriber's links from taking every slot
+    of the task. With `FT_DOWNLOAD_AUTH` off, anyone holding a link can open
+    connections.
+- A download read more slowly than the rate floor, measured over each minute,
+  is cut off. Otherwise a reader that reads just enough to beat the write
+  deadline could hold a slot for hours. The client sees a broken download,
   which it can resume with a range.
+  - The floor is `FT_MIN_DOWNLOAD_RATE`, 4 KiB/s (32 kbit/s), which a congested
+    or cell-edge mobile link still makes.
+  - It rises to `FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE`, 16 KiB/s, only while more
+    than `FT_DOWNLOAD_PRESSURE_PERCENT` (75%) of the task's download slots are
+    taken. When slots run short, slow readers make room for others. Under
+    pressure, a link slower than about 128 kbit/s cannot finish a file of more
+    than a few MiB without resuming.
 - Headers:
   - the declared `Content-Type`;
   - `Content-Disposition: attachment` with the file name (RFC 6266);
@@ -250,7 +272,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_REALM` | required | Digest realm of the FT credentials |
 | `FT_NONCE_KEY` | random per start | At least 32 bytes, shared by every task. Required in staging and prod |
 | `FT_CREDENTIALS` | `hss` | `hss` or `static` (refused in staging and prod) |
-| `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
+| `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base, such as `http://hss.rcs.local:8081` (the HSS API port, `HSS_API_ADDR`), and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
 | `FT_HSS_TIMEOUT` | `2s` | Per lookup |
 | `FT_MAX_CONCURRENT_LOOKUPS` | `16` | Credential lookups in progress per task, and HSS connections |
 | `FT_STATIC_USERS` | required with `static` | `user=password,...` |
@@ -271,8 +293,11 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_MAX_UPLOADS_PER_USER` | `4` | Uploads and resumes in progress per user and task |
 | `FT_MIN_UPLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower upload is cut off with `408`. `0` turns the check off |
 | `FT_MAX_CONCURRENT_DOWNLOADS` | `256` | Downloads in progress per task |
-| `FT_MAX_DOWNLOADS_PER_FILE` | `4` | Downloads of one file in progress per task |
-| `FT_MIN_DOWNLOAD_RATE` | `1024` | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off |
+| `FT_MAX_DOWNLOADS_PER_FILE` | `64` | Downloads of one file in progress per task, enough for a group chat fetching one link at once |
+| `FT_MAX_DOWNLOADS_PER_UPLOADER` | `128` | Downloads in progress per task across all the files of one uploader. The download limits must nest: `FT_MAX_DOWNLOADS_PER_FILE` ≤ `FT_MAX_DOWNLOADS_PER_UPLOADER` < `FT_MAX_CONCURRENT_DOWNLOADS`. The second comparison is strict, because a per-uploader limit equal to the task's lets one subscriber's links take every slot. Otherwise staging and prod refuse to start, and dev warns |
+| `FT_MIN_DOWNLOAD_RATE` | `4096` (4 KiB/s) | Bytes per second, measured over each minute. A slower download is cut off. `0` turns the check off in both regimes, under pressure too |
+| `FT_MIN_DOWNLOAD_RATE_UNDER_PRESSURE` | `16384` (16 KiB/s) | The floor while the task's download slots are under pressure. It must not be below `FT_MIN_DOWNLOAD_RATE`: staging and prod refuse to start, and dev warns |
+| `FT_DOWNLOAD_PRESSURE_PERCENT` | `75` | Share of `FT_MAX_CONCURRENT_DOWNLOADS` in use, from 1 to 100, above which the pressure floor applies |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
 | `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
@@ -383,10 +408,10 @@ identifier ever appears in a metric name:
 | Metric | Counts |
 |---|---|
 | `upload.precheck`, `upload.started`, `upload.restarted`, `upload.resumed`, `upload.completed` | Upload steps |
-| `upload.bytes`, `upload.parts`, `upload.lease_renewed`, `upload.commit_retried` | Bytes completed, parts stored, lease renewals, retries of the update that completes an upload |
+| `upload.bytes`, `upload.parts`, `upload.lease_renewed`, `upload.commit_retried`, `upload.commit_recovered` | Bytes completed, parts stored, lease renewals, retries of the update that completes an upload, and completions recognised after that update's answer was lost |
 | `upload.failed.<reason>` | Failures, by reason (see below) |
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
-| `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.missing_object` | Failed downloads |
+| `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.uploader_busy`, `download.failed.missing_object` | Failed downloads |
 | `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
@@ -417,7 +442,11 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 | `auth.bad_credential_record` > 0 | A subscriber's FT credential record in the HSS is unusable. That user cannot upload |
 | `upload.failed.storage`, `download.failed.storage` > 0 | S3 or DynamoDB fails |
 | `download.failed.missing_object` > 0 | A valid file's object is gone. The lifecycle rule is shorter than the validity |
-| `upload.failed.busy`, `download.failed.busy` sustained | The tasks are full. Uploads are I/O bound, so scale on this, not on CPU |
+| `upload.failed.busy` sustained | The tasks' upload slots are full. Uploads are I/O bound, so scale on this, not on CPU |
+| `download.failed.busy` sustained | The tasks' download slots are full. Scale out, or raise `FT_MAX_CONCURRENT_DOWNLOADS` if memory allows |
+| `download.failed.file_busy` sustained | One link hit its limit: a group chat larger than the per-file limit per task, or one link being hammered. Check the WAF rule before raising the limit |
+| `download.failed.uploader_busy` sustained | One uploader's links hit their limit. This is usually an album: one sender posts several photos to a large group chat. With one task, 63 recipients × 3 photos is 189 downloads (thumbnails count too), over the 128 limit, so the rest get `503` and retry after 10 s. Two or more tasks share the load. If it persists with several tasks and no album traffic, look for abuse of one subscriber's links |
+| `download.failed.too_slow` / (`download.served` + `download.partial`) above a few percent | Recipients are cut off by the rate floor. If it happens without pressure, the 4 KiB/s floor is too high for the network. Under pressure it is expected: add capacity |
 | `sweep.failed` > 0, or no `sweep.duration` for two intervals | The sweeper is failing or stuck. Until the expiry index exists (follow-up), a table too large to scan within `FT_STORAGE_TIMEOUT` makes every sweep fail. Raise the timeout or build the index before alarming on this |
 
 ## Operations notes
@@ -437,6 +466,13 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 - **Rate limit.** The upload rate limit is per task, so a user spread over N
   tasks can start N times as many uploads. It stops a runaway client; the WAF
   rule stops a determined one.
+- **Completion time.** Completing an upload covers storing the last part,
+  closing the object, every try of the completing update and the read-back. It
+  all runs within a budget of two thirds of a lease: 2 minutes with the default
+  3-minute lease. If less than that is left of the lease, the lease is renewed
+  first, so a writer is done, committed or failed, while it still holds the
+  lease. Each call still has its own `FT_STORAGE_TIMEOUT`, and a quarter of the
+  budget (at most one `FT_STORAGE_TIMEOUT`) is kept for the read-back.
 - **Dead task.** A task that crashes while writing leaves the upload's lease
   until it lapses, which takes up to 3 minutes with the defaults. During that
   time the client gets `503` with `Retry-After` on resume.

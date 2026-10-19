@@ -1,6 +1,7 @@
 package ftserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding"
@@ -115,10 +116,15 @@ func (w *writer) copy(ctx context.Context, src io.Reader) error {
 // left by a task that died lapses within minutes; renewing it is what keeps
 // it from lapsing under a writer that is merely slow.
 func (w *writer) renew(ctx context.Context) error {
-	now := w.s.now()
-	if now.Sub(w.renewed) < w.s.leaseTTL/4 {
+	if w.s.now().Sub(w.renewed) < w.s.leaseTTL/4 {
 		return nil
 	}
+	return w.extendLease(ctx)
+}
+
+// extendLease renews the lease to a full leaseTTL from now.
+func (w *writer) extendLease(ctx context.Context) error {
+	now := w.s.now()
 	ctx, cancel := w.s.storageContext(ctx)
 	defer cancel()
 	r := w.rec
@@ -207,8 +213,22 @@ func (w *writer) flush(ctx context.Context, n int) error {
 // a key of its own for every completion, a multipart one is joined by S3 only
 // from parts whose ETags match the list given, and the conditional record
 // update commits exactly one of them.
-func (w *writer) complete(ctx context.Context) (store.Record, error) {
-	ctx, cancel := w.s.storageContext(ctx)
+//
+// The whole completion runs within completeBudget, two thirds of a lease,
+// and the lease is first renewed if less than that is left of it: the
+// writer must be done, committed or failed, while it still holds the lease.
+func (w *writer) complete(parent context.Context) (store.Record, error) {
+	budget := w.s.completeBudget()
+	if w.rec.LeaseUntil.Sub(w.s.now()) < budget {
+		if err := w.extendLease(parent); err != nil {
+			return store.Record{}, err
+		}
+	}
+	// The last part of the budget is kept for reading the record back.
+	reserve := min(w.s.o.StorageTimeout, budget/4)
+	bctx, bcancel := context.WithTimeout(context.WithoutCancel(parent), budget-reserve)
+	defer bcancel()
+	ctx, cancel := context.WithTimeout(bctx, w.s.o.StorageTimeout)
 	defer cancel()
 	tail := *w.buf
 	size := w.rec.Received + int64(len(tail))
@@ -247,7 +267,7 @@ func (w *writer) complete(ctx context.Context) (store.Record, error) {
 	r.Lease, r.LeaseUntil = "", time.Time{}
 	r.Completed = now
 	r.Expires = now.Add(w.s.o.Validity)
-	rec, err := w.commit(ctx, r)
+	rec, err := w.commit(bctx, reserve, r)
 	if err != nil {
 		return store.Record{}, metadataErr(err)
 	}
@@ -264,24 +284,69 @@ const commitAttempts = 4
 // throttled table, a timed-out call) is therefore retried, with backoff. The
 // update is conditional on the version this writer holds, so a retry can
 // only ever write it once: a conflict ends the retries at once.
-func (w *writer) commit(ctx context.Context, r store.Record) (store.Record, error) {
+//
+// Each attempt gets a storage context of its own (FT_STORAGE_TIMEOUT is per
+// call), within budget, so that one attempt timing out leaves time for the
+// next. An update can be applied and its answer lost: our own deadline ends
+// the call after DynamoDB wrote, or the SDK's retry of a lost answer meets
+// the write as ConditionalCheckFailed. So a conflict, and every failure that
+// leaves the outcome unknown, is checked against the stored record before it
+// is answered, with reserve set aside for that read: if the record is
+// complete with this completion's object key and hash, the upload did
+// complete and is reported as such (#50).
+func (w *writer) commit(budget context.Context, reserve time.Duration, r store.Record) (store.Record, error) {
 	var err error
 	for attempt := range commitAttempts {
 		if attempt > 0 {
 			select {
 			case <-time.After(w.s.retryWait(attempt)):
-			case <-ctx.Done():
-				return store.Record{}, err
+			case <-budget.Done():
 			}
 		}
+		if budget.Err() != nil {
+			break
+		}
+		actx, cancel := context.WithTimeout(budget, w.s.o.StorageTimeout)
 		var rec store.Record
-		rec, err = w.s.o.Metadata.Update(ctx, r)
-		if err == nil || errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+		rec, err = w.s.o.Metadata.Update(actx, r)
+		cancel()
+		switch {
+		case err == nil, errors.Is(err, store.ErrNotFound):
+			return rec, err
+		case errors.Is(err, store.ErrConflict):
+			if mine, ok := w.committed(reserve, r); ok {
+				return mine, nil
+			}
 			return rec, err
 		}
 		w.s.metrics.Count("upload.commit_retried", 1)
 	}
+	if err == nil {
+		err = budget.Err()
+	}
+	// Every attempt failed without saying whether it wrote: look once more.
+	if mine, ok := w.committed(reserve, r); ok {
+		return mine, nil
+	}
 	return store.Record{}, err
+}
+
+// committed reads the record back, with a context of its own lasting
+// reserve, and reports whether it holds this completion, r.
+//
+// The object key and the hash together identify r. A single-object file is
+// written under a new key for every completion, so no other completion can
+// share it. Writers resuming one multipart upload do share its key, but S3
+// completes a multipart upload only once, and the hash covers the content.
+func (w *writer) committed(reserve time.Duration, r store.Record) (store.Record, bool) {
+	gctx, cancel := context.WithTimeout(context.Background(), reserve)
+	defer cancel()
+	stored, err := w.s.o.Metadata.Get(gctx, r.ID)
+	if err != nil || stored.State != store.Complete || stored.Object != r.Object || !bytes.Equal(stored.SHA256, r.SHA256) {
+		return store.Record{}, false
+	}
+	w.s.metrics.Count("upload.commit_recovered", 1)
+	return stored, true
 }
 
 // release gives up the lease after a request that did not complete, keeping

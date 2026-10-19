@@ -49,6 +49,10 @@ type sendQueue struct {
 	queued int
 	limit  int
 	closed bool
+	// progress is when the queue last went from empty to holding output, or
+	// its writer last wrote a chunk, in Unix nanoseconds, which tells a stalled
+	// peer from a slow one.
+	progress atomic.Int64
 	// wake tells the writer there is work; room tells a waiting sender that the
 	// writer has made progress; done is closed with the queue.
 	wake chan struct{}
@@ -57,7 +61,9 @@ type sendQueue struct {
 }
 
 func newSendQueue(limit int, budget *queueBudget) *sendQueue {
-	return &sendQueue{budget: budget, limit: limit, wake: make(chan struct{}, 1), room: make(chan struct{}, 1), done: make(chan struct{})}
+	q := &sendQueue{budget: budget, limit: limit, wake: make(chan struct{}, 1), room: make(chan struct{}, 1), done: make(chan struct{})}
+	q.progress.Store(time.Now().UnixNano())
+	return q
 }
 
 // queueBudget is the output every send queue of a transport may hold together
@@ -106,6 +112,11 @@ func (q *sendQueue) tryPush(b []byte, max int) pushResult {
 	}
 	if !q.budget.reserve(len(b)) {
 		return overBudget
+	}
+	if q.queued == 0 {
+		// A stall is measured from when output became pending, so a queue that
+		// was merely idle, or whose writer has yet to run, does not look stalled.
+		q.progress.Store(time.Now().UnixNano())
 	}
 	q.bufs = append(q.bufs, b)
 	q.queued += len(b)
@@ -157,6 +168,14 @@ func (q *sendQueue) take() (bufs [][]byte, closed bool) {
 	defer q.mu.Unlock()
 	bufs, q.bufs = q.bufs, nil
 	return bufs, q.closed
+}
+
+// stall returns what the queue holds and how long its writer has gone without
+// progress.
+func (q *sendQueue) stall(now time.Time) (queued int, idle time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.queued, now.Sub(time.Unix(0, q.progress.Load()))
 }
 
 // written releases n bytes the writer has sent.
@@ -226,6 +245,7 @@ func (t *Transport) writeAll(f *flow, b []byte) error {
 		if _, err := f.conn.Write(b[:n]); err != nil {
 			return err
 		}
+		f.q.progress.Store(time.Now().UnixNano())
 		b = b[n:]
 	}
 	return nil
