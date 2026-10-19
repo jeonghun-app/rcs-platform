@@ -1,11 +1,15 @@
 package cpim
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // Address is the value of a From, To or cc header:
@@ -56,6 +60,42 @@ func ParseAddress(v string) (Address, error) {
 	}
 	a.URI = uri
 	return a, nil
+}
+
+// LogValue logs the URI as a SIP URI is logged (sip.LoggedURI) and leaves
+// out the formal name, a person's name as the sender chose it (#109). The
+// URI keeps its scheme and host, which say which service sent it, an IP
+// host truncated to its network; the user is masked, parameters and
+// headers are left out, and a URI of another scheme than sip, sips, im or
+// pres keeps its scheme only, since its user cannot be told apart from the
+// rest. A service logging a message's From, To or cc gets this form, and
+// so does one that encodes an Address as JSON (MarshalJSON), in a slice or
+// a struct field.
+func (a Address) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("uri", sip.LoggedURI(a.URI)))
+}
+
+// MarshalJSON writes the log value, so that an Address encoded as JSON,
+// as slog's JSON handler encodes a slice or a struct field holding one, is
+// redacted too. Nothing encodes an Address as JSON for another purpose; one
+// that needs the value encodes its String form.
+func (a Address) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]string{"uri": sip.LoggedURI(a.URI)})
+}
+
+// Addresses is the addresses of the To or cc headers, as Message.To and
+// Message.Cc return them; logged, each goes through Address.LogValue. A
+// plain []Address handed to slog would reach a text handler through fmt,
+// which prints the formal names and full URIs.
+type Addresses []Address
+
+// LogValue logs each element by its position.
+func (as Addresses) LogValue() slog.Value {
+	attrs := make([]slog.Attr, len(as))
+	for i, a := range as {
+		attrs[i] = slog.Any(strconv.Itoa(i), a)
+	}
+	return slog.GroupValue(attrs...)
 }
 
 // String formats a as a header value, quoting the formal name only when it is
