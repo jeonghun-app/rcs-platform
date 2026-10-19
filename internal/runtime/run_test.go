@@ -745,3 +745,46 @@ type failingListener struct{}
 func (failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed") }
 func (failingListener) Close() error              { return nil }
 func (failingListener) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1} }
+
+// TestALiveAfterReadyServiceFailsItsHealthCheckUntilItIsReady runs a service
+// whose start-up is held open, the way hss waits on KMS and DynamoDB, and
+// probes it as the container health check does.
+func TestALiveAfterReadyServiceFailsItsHealthCheckUntilItIsReady(t *testing.T) {
+	release, ready := make(chan struct{}), make(chan struct{})
+	svc := testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil
+		}
+		rt.Ready()
+		close(ready)
+		<-ctx.Done()
+		return nil
+	})
+	svc.LiveAfterReady = true
+	h := startService(t, devEnv(), svc)
+	healthz := h.adminURL("/healthz")
+	if code := httpGet(t, healthz); code != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz while starting = %d, want 503", code)
+	}
+	probe := func() int {
+		u, _ := url.Parse(healthz)
+		return Run(context.Background(), svc, Process{
+			Args: []string{"-healthcheck"}, LookupEnv: envMap{"RCS_ADMIN_ADDR": u.Host}.lookup, Stderr: io.Discard,
+		})
+	}
+	if code := probe(); code != ExitFailure {
+		t.Fatalf("-healthcheck while starting = %d, want failure", code)
+	}
+	close(release)
+	<-ready
+	if code := httpGet(t, healthz); code != http.StatusOK {
+		t.Fatalf("/healthz once ready = %d", code)
+	}
+	if code := probe(); code != ExitOK {
+		t.Fatalf("-healthcheck once ready = %d", code)
+	}
+	h.cancel()
+	h.wait()
+}

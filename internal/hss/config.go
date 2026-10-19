@@ -29,6 +29,12 @@ const (
 	DefaultProfileID        = "rcs-default"
 	// DefaultStartTimeout bounds opening the store and the keyring.
 	DefaultStartTimeout = 60 * time.Second
+	// MaxStartTimeout keeps HSS_START_TIMEOUT within what a container
+	// health check can wait for: /healthz fails until the start-up ends,
+	// and ECS allows a startPeriod of at most 300 s, so a longer start-up
+	// would have a task that is still starting replaced. The margin leaves
+	// room for the check's interval and retries.
+	MaxStartTimeout = 240 * time.Second
 )
 
 // Config is the HSS configuration, read by Configure from HSS_ variables.
@@ -167,6 +173,9 @@ func Configure(s *runtime.Settings) Config {
 		if d.v <= 0 {
 			e.Invalid(d.name, "must be greater than zero")
 		}
+	}
+	if c.StartTimeout > MaxStartTimeout {
+		e.Invalid("START_TIMEOUT", "must be at most 240s, which a container health check's startPeriod (300 s at most) can cover")
 	}
 
 	switch c.Store {

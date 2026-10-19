@@ -220,7 +220,9 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   needed. No identifier is ever a metric dimension.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
-  distroless image can run an ECS container health check.
+  distroless image can run an ECS container health check. A service whose
+  start-up waits on remote services and ends at a start-up deadline (hss) sets
+  `Service.LiveAfterReady`, so that `/healthz` fails until it is ready.
 - **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
   linear in its input (a test parses a maximum-size adversarial input), and never
   repairs content it does not own: message bodies such as CPIM and MSRP payloads
