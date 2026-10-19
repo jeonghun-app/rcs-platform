@@ -3,10 +3,8 @@
 package e2e
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
@@ -29,27 +26,10 @@ const (
 	// rule), so the resume file is a little over one part.
 	partSize   = 5 << 20
 	resumeSize = partSize + 1<<20
-	// maxInfoWait bounds how long ft-resume's get_upload_info step waits
-	// for ft-server to notice the break and keep the parts, its 300 ms quiet
-	// time included: a server that is slow to keep a broken upload fails
-	// here instead of passing on retries. A bound on elapsed time rather
-	// than on the number of answers keeps its margin when a loaded host
-	// answers slowly.
-	maxInfoWait = 2000 // ms
 )
 
-// result is one line of rcs-sim's output.
-type result struct {
-	Scenario string           `json:"scenario"`
-	Step     string           `json:"step"`
-	OK       bool             `json:"ok"`
-	Millis   int64            `json:"ms"`
-	Error    string           `json:"error"`
-	Detail   map[string]int64 `json:"detail"`
-}
-
 func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
-	bin := build(t)
+	bin := build(t, "./cmd/ft-server", "./cmd/msrp-relay", "./tools/rcs-sim")
 
 	ftPort, ftAdmin := freePort(t), freePort(t)
 	start(t, bin, "ft-server", ftAdmin, map[string]string{
@@ -98,67 +78,14 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		t.Fatalf("rcs-sim: %v", err)
 	}
 
-	out := stdout.String() + stderr.String()
-	seen := map[string]result{}
-	sc := bufio.NewScanner(&stdout)
-	for sc.Scan() {
-		var r result
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			t.Fatalf("not a result line: %q", sc.Text())
-		}
-		if !r.OK {
-			t.Errorf("%s/%s: %s", r.Scenario, r.Step, r.Error)
-		}
-		seen[r.Scenario+"/"+r.Step] = r
-	}
-	for _, want := range []string{
+	checkResults(t, stdout.String(), stderr.String(), []string{
 		"ft/upload", "ft/download", "ft/download-range", "ft/download-resume", "ft/download-thumbnail",
 		"ft-resume/interrupted-upload", "ft-resume/get_upload_info", "ft-resume/resume", "ft-resume/download",
 		"chat-client-originated/client-to-core", "chat-client-originated/core-to-client", "chat-client-originated/keep-alive",
 		"chat-client-originated/release",
 		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/client-to-core",
 		"chat-core-originated/release",
-	} {
-		if _, ok := seen[want]; !ok {
-			t.Errorf("step %s did not run", want)
-		}
-	}
-	// The parts of the broken upload were kept: rcsjta would have uploaded
-	// the whole file again.
-	if _, ok := seen["ft-resume/upload-again"]; ok {
-		t.Error("ft-resume uploaded again: ft-server kept nothing of the broken upload")
-	}
-	if info := seen["ft-resume/get_upload_info"]; info.Millis > maxInfoWait {
-		t.Errorf("get_upload_info took %d ms (%d answers asked again, %d of them 404), more than %d ms: ft-server is slow to keep a broken upload",
-			info.Millis, info.Detail["retries"], info.Detail["not_held"], maxInfoWait)
-	}
-	// Nothing on an idle stack is busy: a retry rcsjta would make here
-	// would hide an overloaded or misconfigured ft-server.
-	for name, r := range seen {
-		if n := r.Detail["busy_retries"]; n != 0 {
-			t.Errorf("%s: %d upload POSTs sent again after 503", name, n)
-		}
-	}
-	// The same rule as the unit tests' (scenario_test.go): no secret, test
-	// number, URL or address, on either stream.
-	for _, leak := range []string{ftPassword, relayToken, ftUser, "15550100001", "15550100002", "http://", "msrp://", "127.0.0.1"} {
-		if strings.Contains(out, leak) {
-			t.Errorf("rcs-sim printed %q", leak)
-		}
-	}
-}
-
-// build compiles the three binaries into a temporary directory.
-func build(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	cmd := exec.Command("go", "build", "-o", dir, "./cmd/ft-server", "./cmd/msrp-relay", "./tools/rcs-sim")
-	cmd.Dir = filepath.Join("..", "..", "..")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	return dir
+	}, ftPassword, relayToken, ftUser, "127.0.0.1")
 }
 
 // start runs one service binary with env and the shared settings of a test
