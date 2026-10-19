@@ -292,6 +292,37 @@ func TestALostTaskIsFailedOverAndDroppedFromTheRotation(t *testing.T) {
 	}
 }
 
+// expiring is a caller's context that runs out of time when the test says
+// so, rather than after a fixed delay: its Err is then
+// context.DeadlineExceeded, as a deadline's is, which is what the client
+// must tell apart from an attempt's own RequestTimeout.
+type expiring struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newExpiring(parent context.Context) *expiring {
+	return &expiring{Context: parent, done: make(chan struct{})}
+}
+
+func (e *expiring) Done() <-chan struct{} { return e.done }
+
+func (e *expiring) Err() error {
+	select {
+	case <-e.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (e *expiring) expire() { e.once.Do(func() { close(e.done) }) }
+
+// Once the caller's deadline has passed, a request that has not been
+// answered is not tried on another task. The deadline passes as soon as the
+// first attempt has reached its task: a fixed 100 ms could pass, on a loaded
+// host, before the first request was even written (#167).
 func TestNoRetryOnceTheCallerHasGivenUp(t *testing.T) {
 	e := newEnv(t, func(c *Config) { c.RequestTimeout = time.Minute })
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
@@ -299,19 +330,31 @@ func TestNoRetryOnceTheCallerHasGivenUp(t *testing.T) {
 	e.refresh("192.0.2.1", "192.0.2.2")
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
+	arrived := make(chan struct{}, 2)
 	hung := func(uint32, *diameter.Message) (*diameter.Message, error) {
+		arrived <- struct{}{}
 		<-hang
 		return nil, errors.New("gone")
 	}
 	a.setAnswer(hung)
 	b.setAnswer(hung)
-	c, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+	c := newExpiring(ctx(t))
+	go func() {
+		select {
+		case <-arrived:
+		case <-time.After(realWait):
+			// Nothing arrived: the count below fails the test.
+		}
+		c.expire()
+	}()
 	if _, err := e.client.UAR(c, uar()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want the caller's deadline", err)
 	}
-	if n := len(a.requests()) + len(b.requests()); n != 1 {
-		t.Errorf("%d attempts after the caller gave up, want 1", n)
+	// A retry with the caller's context gone may never leave the node, so
+	// the tasks' count alone would not show one; the client's own count
+	// does.
+	if n := len(a.requests()) + len(b.requests()); n != 1 || e.metrics.count("cxclient.UAR.retry") != 0 {
+		t.Errorf("%d attempts, %d retries after the caller gave up, want 1 and 0", n, e.metrics.count("cxclient.UAR.retry"))
 	}
 }
 
