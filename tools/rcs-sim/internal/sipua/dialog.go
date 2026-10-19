@@ -347,6 +347,9 @@ type Dialog struct {
 	// giveUpTimer.
 	ackGiveUp   chan struct{}
 	giveUpTimer transaction.Timer
+	// byeQueued is set once a Bye whose context ended has left the BYE to
+	// byeLater.
+	byeQueued bool
 }
 
 // closed is a channel that is always closed.
@@ -512,7 +515,9 @@ func (d *Dialog) Done() <-chan struct{} { return d.done }
 //
 // On the called side the BYE waits for the ACK of the 200, or for 64*T1
 // to have passed without it (§15): a BYE that overtook the ACK could reach
-// a caller that has not yet confirmed the dialog.
+// a caller that has not yet confirmed the dialog. If ctx ends during that
+// wait, Bye returns its error and the BYE still goes, in the background,
+// when the wait is over: the dialog never stays up.
 func (d *Dialog) Bye(ctx context.Context) (*sip.Response, error) {
 	if d.confirmed != nil {
 		select {
@@ -520,6 +525,7 @@ func (d *Dialog) Bye(ctx context.Context) (*sip.Response, error) {
 		case <-d.ackGiveUp:
 		case <-d.done:
 		case <-ctx.Done():
+			d.byeLater()
 			return nil, ctx.Err()
 		}
 	}
@@ -536,6 +542,29 @@ func (d *Dialog) Bye(ctx context.Context) (*sip.Response, error) {
 		return nil, err
 	}
 	return d.ua.Send(ctx, bye)
+}
+
+// byeLater sends, once, the BYE of a called-side Bye whose context ended
+// before the ACK came: when the ACK comes, or at 64*T1 without it.
+func (d *Dialog) byeLater() {
+	d.mu.Lock()
+	queued := d.byeQueued || d.ended
+	d.byeQueued = true
+	d.mu.Unlock()
+	if queued {
+		return
+	}
+	d.ua.byes.Go(func() {
+		select {
+		case <-d.confirmed:
+		case <-d.ackGiveUp:
+		case <-d.done:
+			return
+		case <-d.ua.done:
+			return
+		}
+		_, _ = d.Bye(context.Background())
+	})
 }
 
 func (d *Dialog) endLocked() {

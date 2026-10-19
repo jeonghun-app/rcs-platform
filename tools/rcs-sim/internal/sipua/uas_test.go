@@ -441,6 +441,42 @@ func TestTheSameInviteByAnotherWayIs482(t *testing.T) {
 	}
 }
 
+func TestTheSameInviteAfterItsAnswerIs482UntilItsTransactionEnds(t *testing.T) {
+	// QA on #202: answered, the first INVITE's transaction still lives
+	// for 64*T1 (Timer L, RFC 6026), so a copy is still merged. After
+	// that it is a new request.
+	clock := newFakeClock()
+	s, _, flow, calls := calleeUA(t, clock)
+	callID, _ := s.ids.CallID("")
+	first := s.callWith(t, flow, callID)
+	if _, err := nextCall(t, calls).Accept([]byte(testAnswer)); err != nil {
+		t.Fatal(err)
+	}
+	first.next(t)
+	first.ack(t)
+	if res := s.callWith(t, flow, callID).next(t); res.StatusCode != 482 {
+		t.Fatalf("a copy after the 200 answered %d, want 482", res.StatusCode)
+	}
+	clock.advance(64 * transaction.DefaultT1)
+	s.callWith(t, flow, callID)
+	nextCall(t, calls)
+}
+
+func TestAFailedServerTransactionForgetsItsCall(t *testing.T) {
+	// QA on #202: an INVITE whose transaction failed can no longer be
+	// answered, so the UA does not keep it.
+	s, ua, flow, calls := calleeUA(t, nil)
+	s.call(t, flow)
+	c := nextCall(t, calls)
+	tu{ua}.ServerFailed(c.tx, errors.New("the flow broke"))
+	ua.mu.Lock()
+	n := len(ua.calls)
+	ua.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d calls kept", n)
+	}
+}
+
 func TestTheCalledPartysByeWaitsForTheACK(t *testing.T) {
 	// RFC 3261 §15: the called party's BYE waits until the ACK of its 200
 	// has come (or 64*T1 have passed).
@@ -465,6 +501,54 @@ func TestTheCalledPartysByeWaitsForTheACK(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.nextMethod(t, "BYE")
+}
+
+func TestACalledPartysByeWhoseContextEndsStillGoes(t *testing.T) {
+	// QA on #202: Bye's context ends while it waits for the ACK. The BYE
+	// still goes, once, when the ACK comes or at 64*T1 without it, and
+	// the dialog ends.
+	for name, acked := range map[string]bool{"at the ACK": true, "at 64*T1": false} {
+		t.Run(name, func(t *testing.T) {
+			clock := newFakeClock()
+			s, ua, flow, calls := calleeUA(t, clock)
+			cl := s.call(t, flow)
+			d, err := nextCall(t, calls).Accept([]byte(testAnswer))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cl.next(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := d.Bye(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Bye = %v, want context.Canceled", err)
+			}
+			if _, err := d.Bye(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("second Bye = %v, want context.Canceled", err)
+			}
+			if acked {
+				cl.ack(t)
+			} else {
+				clock.advance(64 * transaction.DefaultT1)
+			}
+			select {
+			case <-d.Done():
+			case <-time.After(waitFor):
+				t.Fatal("the dialog stayed up")
+			}
+			s.nextMethod(t, "BYE")
+			ua.byes.Wait()
+			for {
+				select {
+				case r := <-s.got:
+					if r.req.Method == "BYE" {
+						t.Fatal("a second BYE")
+					}
+				default:
+					return
+				}
+			}
+		})
+	}
 }
 
 func TestACancelWithoutOnInviteGoesToOnRequest(t *testing.T) {

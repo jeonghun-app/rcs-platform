@@ -151,7 +151,11 @@ type Config struct {
 	// OnRequest receives each request the network sends over the flow, a
 	// MESSAGE or a NOTIFY say, and answers it with tx.Respond. It runs on
 	// the connection's reading goroutine, so it must not block (see
-	// transaction.TU). Nil answers every request 501.
+	// transaction.TU). Nil answers every request 501. A request outside a
+	// dialog that has a Require is answered 420 by the UA before it gets
+	// here, whatever its method: the UA supports no extension a request
+	// may require, and RFC 3261 §8.2.2.3 applies to every method but ACK
+	// and CANCEL.
 	OnRequest func(tx *transaction.ServerTransaction)
 
 	// Rand supplies tags, Call-IDs, branches and the keep-alive jitter, from
@@ -237,6 +241,9 @@ type UA struct {
 	// the incoming INVITEs not yet answered, by their transaction.
 	dialogs map[string]*Dialog
 	calls   map[*transaction.ServerTransaction]*IncomingCall
+	// answeredCalls are the merge keys of incoming INVITEs answered in the
+	// last 64*T1 (see answered).
+	answeredCalls map[string]struct{}
 	// invites are the INVITEs sent in the last 64*T1, by Call-ID and From
 	// tag, for 2xx that arrive after their transaction.
 	invites map[string]*invite
@@ -281,14 +288,15 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		return nil, fmt.Errorf("sipua: connecting: %w", safeerr.Reason(err))
 	}
 	ua := &UA{
-		cfg:     cfg,
-		ids:     sip.IDGenerator{Rand: cfg.Rand},
-		dialer:  &oneConn{c: c},
-		done:    make(chan struct{}),
-		dialogs: map[string]*Dialog{},
-		calls:   map[*transaction.ServerTransaction]*IncomingCall{},
-		invites: map[string]*invite{},
-		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
+		cfg:           cfg,
+		ids:           sip.IDGenerator{Rand: cfg.Rand},
+		dialer:        &oneConn{c: c},
+		done:          make(chan struct{}),
+		dialogs:       map[string]*Dialog{},
+		calls:         map[*transaction.ServerTransaction]*IncomingCall{},
+		answeredCalls: map[string]struct{}{},
+		invites:       map[string]*invite{},
+		dst:           transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
 		ap := la.AddrPort()
