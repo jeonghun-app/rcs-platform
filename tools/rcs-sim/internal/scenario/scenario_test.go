@@ -278,6 +278,19 @@ func TestAReleaseThatLeavesTheBindingFails(t *testing.T) {
 	}
 }
 
+func TestAClientThatSendsNoKeepAliveFailsTheStep(t *testing.T) {
+	// The keep-alive step waits for the keep-alive past IdleWait (#97);
+	// one that never comes still fails, at the step's timeout.
+	cfg := stack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	cfg.StepTimeout = 2 * time.Second
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka := byStep(results)["keep-alive"]
+	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+		t.Fatalf("keep-alive %+v", ka)
+	}
+}
+
 func TestAWrongRelayTokenFailsTheChatAtAllocation(t *testing.T) {
 	cfg := stack(t)
 	cfg.Control.Token = anchor.NewToken("wrong-wrong-wrong-wrong-wrong-wrong-wrong-xx")

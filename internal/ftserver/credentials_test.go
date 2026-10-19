@@ -63,7 +63,7 @@ func TestHSSCredentialsVerifyAnUpload(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, credentialJSON(t, digest.Algorithm(r.URL.Query().Get("algorithm")), alice))
 	})
-	src := NewHSSCredentials(mustURL(h.URL+"/hss/"), "provisioning-token", realm, time.Second, 4)
+	src := NewHSSCredentials(mustURL(h.URL+"/hss/"), "provisioning-token", realm, lookupTimeout, 4)
 	e := newEnv(t, func(o *Options) { o.Credentials = src })
 	doc := e.user(alice).uploadFile("via-hss", "content")
 	if len(doc.Infos) != 1 {
@@ -87,7 +87,7 @@ func TestHSSCredentialsVerifyAnUpload(t *testing.T) {
 
 func TestHSSRequestEscapesTheIMPIAsOnePathSegment(t *testing.T) {
 	h := newHSS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
-	src := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second, 4)
+	src := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4)
 	for _, name := range []string{"a/../../admin", "a?b#c", "a%2Fb", "."} {
 		_, err := src.Lookup(t.Context(), name, digest.MD5)
 		if !errors.Is(err, ErrUnknownUser) {
@@ -100,6 +100,11 @@ func TestHSSRequestEscapesTheIMPIAsOnePathSegment(t *testing.T) {
 		}
 	}
 }
+
+// lookupTimeout is the HSS client timeout of the tests below. None of them
+// is about the timeout, and a test HSS on loopback took more than the 1 s
+// they had under load (#97); go test's own timeout still bounds a hang.
+const lookupTimeout = time.Minute
 
 func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 	for name, c := range map[string]struct {
@@ -127,7 +132,7 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 			w.WriteHeader(c.status)
 			fmt.Fprint(w, c.body)
 		})
-		_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second, 4).Lookup(t.Context(), alice, digest.SHA256)
+		_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4).Lookup(t.Context(), alice, digest.SHA256)
 		if err == nil || errors.Is(err, ErrUnknownUser) != c.unknown {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -145,7 +150,7 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 func TestUnreachableHSSIsAnErrorWithoutTheURL(t *testing.T) {
 	h := newHSS(t, nil)
 	h.Close()
-	_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, time.Second, 4).Lookup(context.Background(), alice, digest.SHA256)
+	_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4).Lookup(context.Background(), alice, digest.SHA256)
 	if err == nil || strings.Contains(err.Error(), "subscriptions") {
 		t.Fatalf("err = %v", err)
 	}
@@ -173,7 +178,7 @@ func TestTheHSSClientDoesNotFollowARedirectToAUsableAnswer(t *testing.T) {
 	h := newHSS(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
 	})
-	_, err := NewHSSCredentials(mustURL(h.URL), "provisioning-token", realm, time.Second, 4).Lookup(t.Context(), alice, digest.SHA256)
+	_, err := NewHSSCredentials(mustURL(h.URL), "provisioning-token", realm, lookupTimeout, 4).Lookup(t.Context(), alice, digest.SHA256)
 	if err == nil {
 		t.Error("a redirected lookup succeeded")
 	}

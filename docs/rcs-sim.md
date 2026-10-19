@@ -101,7 +101,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-core-listen` | `127.0.0.1:0` | where the rcs-as stand-in listens; the port must be in the relay's `RELAY_CORE_PORTS` |
 | `-core-advertise` | the listener's address | host the relay is told to connect to |
 | `-msrp-keepalive` | 240s | MSRP keep-alive interval of both ends (ADR 0003) |
-| `-idle-wait` | 0 (skip) | stay quiet this long in the chat scenarios, to see keep-alives go out; set it above `-msrp-keepalive` |
+| `-idle-wait` | 0 (skip) | stay quiet this long in the chat scenarios, to see keep-alives go out; set it above `-msrp-keepalive`. If no keep-alive has gone out by then, the step waits for one until `-step-timeout`, since a loaded host can run the timer late |
 | `-self`, `-peer` | `+15550100001`, `+15550100002` in the MCC 001 test domain | the CPIM addresses of the two ends |
 | `-step-timeout` | 30s | bound on each step |
 | `-list`, `-version` | | print the scenarios or the version |

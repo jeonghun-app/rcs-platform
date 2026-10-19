@@ -223,10 +223,21 @@ func (r *run) converse(cs *chatSession) error {
 			case <-client.Done():
 				return nil, errors.New("the session ended while quiet")
 			}
-			sent := cs.written.Load() - before
-			if sent == 0 {
-				return nil, errors.New("no keep-alive went out while the session was quiet")
+			// Quiet for IdleWait, the client must have sent a keep-alive.
+			// On a loaded host its timer can run late, past IdleWait (#97),
+			// so the step waits for the keep-alive itself rather than
+			// judging by the clock: a client that sends none fails at the
+			// step's timeout.
+			for cs.written.Load() == before {
+				select {
+				case <-time.After(10 * time.Millisecond):
+				case <-ctx.Done():
+					return nil, errors.New("no keep-alive went out while the session was quiet")
+				case <-client.Done():
+					return nil, errors.New("the session ended while quiet")
+				}
 			}
+			sent := cs.written.Load() - before
 			// The session survives the quiet spell end to end.
 			err := r.exchange(ctx, cs.client, client, cs.coreEnd, cs.coreSession, []byte("still here"), false)
 			return map[string]int64{"bytes_while_quiet": sent}, err
