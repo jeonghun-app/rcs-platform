@@ -2,6 +2,7 @@ package pcscf
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
@@ -36,6 +37,9 @@ type deps struct {
 	started func(*pcscf)
 	// lookup resolves core host names; nil is the system resolver.
 	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	// sweep is how often expired registrations are dropped; zero is
+	// sweepInterval.
+	sweep time.Duration
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -93,11 +97,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if err != nil {
 		return fmt.Errorf("pcscf: core listener: %w", err)
 	}
+	resolver := coreResolver{dns: &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: allowCore(cfg), Logger: rt.Logger}}
 	pc := &pcscf{
 		cfg: cfg, corePort: int(coreAddr.Port()),
 		registry:  newRegistry(cfg.MaxRegistrations, d.now),
 		registers: newLimiter(cfg.RegisterRate, cfg.RegisterBurst, d.now),
-		flows:     tr, now: d.now, log: rt.Logger,
+		icscfs:    resolver, rand: rand.Reader,
+		flows: tr, now: d.now, log: rt.Logger,
 	}
 	// A closed flow's registrations are gone (RFC 5626 §5.3).
 	fl.onClosed = pc.registry.removeFlow
@@ -108,7 +114,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	px, err := proxy.New(tr, proxy.Config{
 		Self:      selfURIs(cfg, int(coreAddr.Port())),
 		Router:    router,
-		Resolver:  coreResolver{dns: &proxy.DNSResolver{Lookup: d.lookup, Allow: allowCore(cfg)}},
+		Resolver:  resolver,
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
 	})
@@ -140,7 +146,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		slog.String("core_addr", coreAddr.String()),
 		slog.Bool("proxy_protocol", cfg.ProxyProtocol))
 	rt.Ready()
-	stopSweep := every(sweepInterval, pc.registry.sweep)
+	if d.sweep == 0 {
+		d.sweep = sweepInterval
+	}
+	stopSweep := every(d.sweep, pc.registry.sweep)
 	defer stopSweep()
 
 	<-ctx.Done()
@@ -157,8 +166,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	return nil
 }
 
-// sweepInterval is how often expired registrations are dropped; a lookup
-// drops an expired one itself, so this only bounds memory.
+// sweepInterval is how often expired registrations, and reservations no
+// response released, are dropped; a lookup drops an expired registration
+// itself, so this bounds memory and frees the slots.
 const sweepInterval = 30 * time.Second
 
 // every runs f every interval until the returned stop is called.
@@ -187,6 +197,21 @@ func (c coreResolver) Resolve(ctx context.Context, u sip.URI) (transport.Destina
 	d, err := c.dns.Resolve(ctx, u)
 	d.Listener = coreListener
 	return d, err
+}
+
+// ResolveAll is Resolve for every address of u's host.
+func (c coreResolver) ResolveAll(ctx context.Context, u sip.URI) ([]transport.Destination, error) {
+	all, err := c.dns.ResolveAll(ctx, u)
+	for i := range all {
+		all[i].Listener = coreListener
+	}
+	return all, err
+}
+
+// allResolver finds every address a URI resolves to, in the order to try
+// them: proxy.DNSResolver.ResolveAll, through the core listener.
+type allResolver interface {
+	ResolveAll(ctx context.Context, u sip.URI) ([]transport.Destination, error)
 }
 
 // allowCore is the addresses a core hop may resolve to: private ones (ADR

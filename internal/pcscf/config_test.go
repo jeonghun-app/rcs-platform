@@ -24,6 +24,7 @@ var devEnv = map[string]string{
 	"PCSCF_CORE_HOST":        "10.0.2.9",
 	"PCSCF_CLIENT_TRANSPORT": "tcp",
 	"RCS_SERVICE_NAMESPACE":  "rcs.internal",
+	"RCS_IMS_DOMAIN":         "ims.mnc001.mcc001.3gppnetwork.org",
 }
 
 // prodEnv is a valid production configuration, so every reason a test sees
@@ -85,6 +86,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		DrainTimeout:   runtime.DefaultShutdownTimeout - stopMargin,
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
+		Namespace: "rcs.internal", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 	}
 	if !reflect.DeepEqual(c, want) {
@@ -99,6 +101,28 @@ func mustURI(t *testing.T, s string) sip.URI {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// The visited network is the home domain unless set (TS 24.229 §5.2.2.1).
+func TestTheVisitedNetworkIsTheHomeDomainUnlessSet(t *testing.T) {
+	for _, v := range []string{"ims.mnc001.mcc002.3gppnetwork.org", `"Visited network number 1";x=1`} {
+		c, err := configure(with(devEnv, "PCSCF_VISITED_NETWORK_ID", v))
+		if err != nil || c.VisitedNetworkID != v {
+			t.Errorf("%q: %q, %v", v, c.VisitedNetworkID, err)
+		}
+	}
+	c, err := configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "", "PCSCF_ICSCF_URI", "sip:10.0.3.7;transport=tcp;lr", "PCSCF_VISITED_NETWORK_ID", "visited.example.net"))
+	if err != nil || c.Namespace != "" || c.VisitedNetworkID != "visited.example.net" {
+		t.Errorf("without a namespace: %+v, %v", c, err)
+	}
+}
+
+// Each problem is reported once (QA of #198).
+func TestAProblemIsReportedOnce(t *testing.T) {
+	_, err := configure(with(devEnv, "PCSCF_MAX_FLOWS_PER_IP", "0"))
+	if err == nil || strings.Count(err.Error(), "PCSCF_MAX_FLOWS_PER_IP") != 1 {
+		t.Fatalf("error %v", err)
+	}
 }
 
 func TestTheICSCFURIAndLoopbackFollowTheSettings(t *testing.T) {
@@ -179,10 +203,21 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_REGISTER_RATE", "-1"}, "PCSCF_REGISTER_RATE: must be positive"},
 		{[]string{"PCSCF_REGISTER_BURST", "0"}, "PCSCF_REGISTER_BURST: must be positive"},
 		{[]string{"RCS_SERVICE_NAMESPACE", ""}, "PCSCF_ICSCF_URI: required when RCS_SERVICE_NAMESPACE is unset"},
-		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal"}, "PCSCF_ICSCF_URI: not a sip or sips URI of a host with lr"},
-		{[]string{"PCSCF_ICSCF_URI", "tel:+15550100001"}, "PCSCF_ICSCF_URI: not a sip or sips URI"},
-		{[]string{"PCSCF_ICSCF_URI", "sip:icscf@rcs.internal;lr"}, "PCSCF_ICSCF_URI: not a sip or sips URI"},
-		{[]string{"PCSCF_ICSCF_URI", "::"}, "PCSCF_ICSCF_URI: not a sip or sips URI"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=tcp"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp and lr"},
+		{[]string{"PCSCF_ICSCF_URI", "tel:+15550100001"}, "PCSCF_ICSCF_URI: not a sip URI"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf@rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: not a sip URI"},
+		{[]string{"PCSCF_ICSCF_URI", "::"}, "PCSCF_ICSCF_URI: not a sip URI"},
+		// It is reached over TCP through the core listener (QA of #198).
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sips:icscf.rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=tls;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=udp;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.example.net;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.evil-rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
+		{[]string{"RCS_IMS_DOMAIN", ""}, "PCSCF_VISITED_NETWORK_ID: required when RCS_IMS_DOMAIN is unset"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "a, b"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "\"open"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "a\r\nRoute: <sip:x>"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"PCSCF_CLIENT_IDLE_TIMEOUT", "0s"}, "PCSCF_CLIENT_IDLE_TIMEOUT: must be greater than zero"},
 		{[]string{"PCSCF_DRAIN_TIMEOUT", "16s"}, "PCSCF_DRAIN_TIMEOUT: plus 5s must not exceed RCS_SHUTDOWN_TIMEOUT (20s)"},
 		{[]string{"PCSCF_DRAIN_TIMEOUT", "0s"}, "PCSCF_DRAIN_TIMEOUT: must be greater than zero"},

@@ -52,9 +52,9 @@ Flow Failed.
   `P-Asserted-Identity`, `P-Served-User`, `P-Asserted-Service`,
   `P-Charging-Vector`, `P-Charging-Function-Addresses`,
   `P-Visited-Network-ID`, `P-Associated-URI`, `P-Called-Party-ID`,
-  `P-Media-Authorization`, `Feature-Caps`, `P-Private-Network-Indication` and
-  `P-Profile-Key`. It also loses every `P-Access-Network-Info` value with the
-  `network-provided` parameter.
+  `P-Media-Authorization`, `Feature-Caps`, `P-Private-Network-Indication`,
+  `P-Profile-Key` and `Path`, which a registrar would keep. It also loses
+  every `P-Access-Network-Info` value with the `network-provided` parameter.
 - **Flows per client.** One client holds at most `PCSCF_MAX_FLOWS_PER_IP`
   client flows. A client is the address in the PROXY header behind the NLB:
   an IPv4 address, or the /64 of an IPv6 one. A flow beyond that is refused
@@ -73,13 +73,23 @@ A client's REGISTER goes to `icscf` (`PCSCF_ICSCF_URI`, by default
 `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr`), out of the core
 listener (TS 24.229 §5.2.2.1):
 
+- **Route.** `icscf` is the only Route. `pcscf` chooses the I-CSCF, so a
+  Route the client wrote below `pcscf`'s own is dropped.
 - **Path.** `pcscf` adds `Path: <sip:<flow token>@<task address>:<core
   port>;transport=tcp;lr>`, with `ob` when the client uses outbound (RFC 5626
-  §5.1), and `Supported: path`. The flow token is the transport's flow ID,
+  §5.1), and `Require: path`. The flow token is the transport's flow ID,
   an HMAC under a key drawn at every start
-  ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)).
-- **Headers.** The network-only headers are removed, as from every client
-  request.
+  ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)). A `Path`
+  the client wrote is gone already, with the other network-only headers.
+- **Network headers.** `pcscf` adds `P-Visited-Network-ID`
+  (`PCSCF_VISITED_NETWORK_ID`, the home domain by default), from which
+  `icscf` takes the Visited-Network-Identifier of its UAR, and
+  `P-Charging-Vector` with a new `icid-value` for each REGISTER.
+- **Failover.** `pcscf` tries `icscf`'s addresses in a random order. An
+  address it cannot connect to, that does not answer within 8 s, or that
+  answers 3xx, 480 or 503 gives way to the next, up to three (§5.2.2.1 7)).
+  The client gets 504 when all of them have failed, or when the lookup
+  failed, well before its own 32 s timeout.
 - **The 200.** `pcscf` keeps the following in instance memory, for each
   public identity registered over each flow:
   - the client's contacts on that flow that the 200 lists;
@@ -89,23 +99,34 @@ listener (TS 24.229 §5.2.2.1):
     (RFC 7315).
 
   A 200 that lists none of those contacts, after a removal, forgets the
-  registration. So does the flow closing (RFC 5626 §5.3).
+  registration. So does the flow closing (RFC 5626 §5.3), even when it
+  closes before the 200 arrives. A REGISTER without `Contact` only fetches
+  the bindings and changes nothing.
 - **Keep-alive** ([ADR 0003](adr/0003-aws-topology.md)):
 
   | The client | It gets | Flow idle timeout |
   |---|---|---|
-  | uses outbound: `Supported: outbound`, and `+sip.instance` and `reg-id` on every contact | `Flow-Timer: 120` and `Require: outbound` in the 200 | 180 s with TLS to the NLB, 1740 s with `tcp` |
+  | uses outbound: `Supported: outbound` or `Require: outbound`, and `+sip.instance` and `reg-id` on every contact, and the registrar's 200 has `Require: outbound` (RFC 5626 §5.4) | `Flow-Timer: 120` in the 200 | 180 s with TLS to the NLB, 1740 s with `tcp` |
   | asks with the Via `keep` parameter (RFC 6223) | `keep=120` in its Via of the 200 | the same |
   | does neither | its expiries capped to 600 s, in the REGISTER and in the 200 | `PCSCF_CLIENT_IDLE_TIMEOUT` (340 s) |
 - **Limits.** A client address may send `PCSCF_REGISTER_RATE` REGISTERs a
   second, with a burst of `PCSCF_REGISTER_BURST`. A task keeps at most
-  `PCSCF_MAX_REGISTRATIONS` registrations, and a new one past that is
-  refused. Refusals are 503 with `Retry-After: 1`.
+  `PCSCF_MAX_REGISTRATIONS` registrations. A REGISTER takes its slot before
+  it is forwarded and gives it back if it ends unregistered, so a new one
+  past the limit is refused at once rather than after a 200 `pcscf` could not
+  keep. Refusals are 503 with `Retry-After: 1`.
 
 Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 
-- It looks up A and AAAA records, keeps each answer for 10 s, and spreads
-  branches over its addresses.
+- It looks up only names inside `RCS_SERVICE_NAMESPACE`, whole labels
+  compared ([ADR 0007](adr/0007-internal-transport.md) §5), so a name a
+  client wrote costs no lookup.
+- It looks up A and AAAA records, keeps each answer for 10 s, and gives every
+  address, in a new random order each time.
+- When a lookup fails, the last answer is still used for 5 minutes. A failed
+  lookup is logged once, then at most once a minute while it keeps failing,
+  with its class: `not found` (a missing record, so a configuration error),
+  `timeout` or `error`.
 - It uses only private addresses. Dev and test also accept loopback.
 - A Cloud Map answer holds at most eight records, chosen at random when more
   instances are registered. That is enough for CSCF fleets of that size.
@@ -129,7 +150,8 @@ start with that value.
 | `PCSCF_CORE_HOST` | this task's one private IPv4 | the task address `pcscf` names itself by |
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client (IPv4 address or IPv6 /64) |
-| `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | first Route of a REGISTER; required without a namespace |
+| `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | the Route of a REGISTER: a `sip` URI with `transport=tcp` and `lr`, of an address or a name inside `RCS_SERVICE_NAMESPACE`; required without a namespace |
+| `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3); required without `RCS_IMS_DOMAIN` |
 | `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |

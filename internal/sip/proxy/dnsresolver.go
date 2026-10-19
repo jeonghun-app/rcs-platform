@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -19,18 +21,32 @@ import (
 // TTL the platform gives its Cloud Map records.
 const DefaultDNSTTL = 10 * time.Second
 
+// DefaultDNSStale is how long past its TTL a DNSResolver still uses an answer
+// by default when a new lookup fails: a short outage or throttling of the
+// VPC resolver then fails no request, while instances keep their addresses
+// that long in any case.
+const DefaultDNSStale = 5 * time.Minute
+
 // maxDNSNames bounds the names a DNSResolver keeps answers for: the core has
-// a handful, and a URI a client wrote may name any.
+// a handful.
 const maxDNSNames = 256
+
+// failureLogEvery is how often a DNSResolver logs a name whose lookups keep
+// failing: once when they start, then at most this often.
+const failureLogEvery = time.Minute
 
 // DNSResolver resolves SIP and SIPS URIs to the private addresses of their
 // host, for services that reach one another by name inside the VPC, such as
 // pcscf, icscf and scscf through Cloud Map (icscf.<namespace>). It looks up
-// A and AAAA records, uses only the answers that are private addresses
-// (runtime.IsPrivateAddr, ADR 0007 §5), keeps them for TTL and picks one at
-// random for each branch, so requests spread over the instances; a host that
-// is already an address is checked the same way. The transport and port
-// follow the URI as for NumericResolver; TLS verifies the host name.
+// only names inside Namespace, A and AAAA records, uses only the answers
+// that are private addresses (runtime.IsPrivateAddr, ADR 0007 §5), and
+// keeps them for TTL; a host that is already an address is checked the
+// same way. The transport and port follow the URI as for NumericResolver;
+// TLS verifies the host name.
+//
+// ResolveAll gives every address in a random order, so that requests spread
+// over the instances and a caller can try the next address when one fails,
+// as pcscf does for icscf (TS 24.229 §5.2.2.1); Resolve gives the first.
 //
 // A Cloud Map answer holds at most eight records, chosen at random when
 // more instances are registered: each answer then spreads over a different
@@ -42,61 +58,95 @@ type DNSResolver struct {
 	Lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 	// TTL is how long an answer is reused; zero is DefaultDNSTTL.
 	TTL time.Duration
+	// Stale is how long past its TTL an answer is still used when a new
+	// lookup fails; zero is DefaultDNSStale.
+	Stale time.Duration
+	// Namespace is the Cloud Map namespace, RCS_SERVICE_NAMESPACE: a name
+	// outside it (runtime.InServiceNamespace) is not looked up, so a URI a
+	// client wrote cannot spend the VPC resolver's packet budget. Empty, no
+	// name is looked up and only addresses resolve.
+	Namespace string
 	// Allow says which addresses may be used; nil is runtime.IsPrivateAddr.
 	// A test or dev stack on one host may add loopback.
 	Allow func(netip.Addr) bool
-	// Now and Pick are for tests: the clock, and the choice among n
-	// addresses (rand.IntN by default).
-	Now  func() time.Time
-	Pick func(n int) int
+	// Logger hears of failed lookups; nil is slog.Default().
+	Logger *slog.Logger
+	// Now and Shuffle are for tests: the clock, and the order of the
+	// addresses (rand.Shuffle by default).
+	Now     func() time.Time
+	Shuffle func(n int, swap func(i, j int))
 
 	mu    sync.Mutex
 	names map[string]dnsAnswer
 }
 
+// dnsAnswer is what a DNSResolver keeps of a name: its last answer, until
+// expires and then for Stale if lookups fail, and since when they have
+// failed, with when that was last logged.
 type dnsAnswer struct {
-	addrs   []netip.Addr
-	expires time.Time
+	addrs             []netip.Addr
+	expires           time.Time
+	failing, reported time.Time
 }
 
-// Resolve implements Resolver.
+// Resolve implements Resolver: the first of ResolveAll.
 func (r *DNSResolver) Resolve(ctx context.Context, u sip.URI) (transport.Destination, error) {
-	d, err := NumericResolver{}.withAddr(u, netip.IPv6Unspecified())
+	all, err := r.ResolveAll(ctx, u)
 	if err != nil {
 		return transport.Destination{}, err
 	}
+	return all[0], nil
+}
+
+// ResolveAll returns a destination at each usable address of u's host, in a
+// random order. The error wraps ErrUnresolvable, and the lookup's own error
+// when that failed.
+func (r *DNSResolver) ResolveAll(ctx context.Context, u sip.URI) ([]transport.Destination, error) {
+	d, err := NumericResolver{}.withAddr(u, netip.IPv6Unspecified())
+	if err != nil {
+		return nil, err
+	}
 	host := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]"))
 	var addrs []netip.Addr
+	named := false
 	if a, err := netip.ParseAddr(host); err == nil {
 		addrs = []netip.Addr{a.Unmap()}
+	} else if !runtime.InServiceNamespace(host, r.Namespace) {
+		return nil, fmt.Errorf("%w: %s is outside the service namespace", ErrUnresolvable, host)
 	} else if addrs, err = r.lookup(ctx, host); err != nil {
-		return transport.Destination{}, err
+		return nil, err
+	} else {
+		named = true
 	}
 	allow := runtime.IsPrivateAddr
 	if r.Allow != nil {
 		allow = r.Allow
 	}
-	var private []netip.Addr
+	var out []transport.Destination
 	for _, a := range addrs {
-		if allow(a) {
-			private = append(private, a)
+		if !allow(a) {
+			continue
 		}
+		dst := d
+		dst.Addr = netip.AddrPortFrom(a, d.Addr.Port())
+		if dst.Network == transport.TLS && named {
+			dst.ServerName = host
+		}
+		out = append(out, dst)
 	}
-	if len(private) == 0 {
-		return transport.Destination{}, fmt.Errorf("%w: no private address", ErrUnresolvable)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: no private address", ErrUnresolvable)
 	}
-	pick := rand.IntN
-	if r.Pick != nil {
-		pick = r.Pick
+	shuffle := rand.Shuffle
+	if r.Shuffle != nil {
+		shuffle = r.Shuffle
 	}
-	d.Addr = netip.AddrPortFrom(private[pick(len(private))], d.Addr.Port())
-	if d.Network == transport.TLS && net.ParseIP(host) == nil {
-		d.ServerName = host
-	}
-	return d, nil
+	shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out, nil
 }
 
-// lookup returns the addresses of host, from a kept answer if it is fresh.
+// lookup returns the addresses of host, from a kept answer if it is fresh,
+// or if it is stale and a new lookup fails.
 func (r *DNSResolver) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	now := time.Now
 	if r.Now != nil {
@@ -104,18 +154,32 @@ func (r *DNSResolver) lookup(ctx context.Context, host string) ([]netip.Addr, er
 	}
 	t := now()
 	r.mu.Lock()
-	if a, ok := r.names[host]; ok && t.Before(a.expires) {
-		r.mu.Unlock()
-		return a.addrs, nil
-	}
+	kept, ok := r.names[host]
 	r.mu.Unlock()
+	if ok && kept.addrs != nil && t.Before(kept.expires) {
+		return kept.addrs, nil
+	}
 	lookup := net.DefaultResolver.LookupNetIP
 	if r.Lookup != nil {
 		lookup = r.Lookup
 	}
 	addrs, err := lookup(ctx, "ip", host)
 	if err != nil {
-		return nil, fmt.Errorf("%w: lookup failed", ErrUnresolvable)
+		stale := r.Stale
+		if stale <= 0 {
+			stale = DefaultDNSStale
+		}
+		usable := kept.addrs != nil && t.Before(kept.expires.Add(stale))
+		r.failed(host, t, err, usable)
+		if usable {
+			return kept.addrs, nil
+		}
+		return nil, fmt.Errorf("%w: lookup of %s failed (%s): %w", ErrUnresolvable, host, lookupFailure(err), err)
+	}
+	if len(addrs) == 0 {
+		// Not kept: a nil answer is how a failure with nothing to fall back
+		// on is recorded.
+		return nil, nil
 	}
 	for i, a := range addrs {
 		addrs[i] = a.Unmap()
@@ -126,13 +190,49 @@ func (r *DNSResolver) lookup(ctx context.Context, host string) ([]netip.Addr, er
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.keepLocked(host, t, dnsAnswer{addrs: addrs, expires: t.Add(ttl)})
+	return addrs, nil
+}
+
+// failed records and logs a failed lookup of host: the first of a run, and
+// then at most every failureLogEvery. Its class tells a missing record, a
+// configuration error, from a resolver that does not answer.
+func (r *DNSResolver) failed(host string, t time.Time, err error, stale bool) {
+	r.mu.Lock()
+	a := r.names[host]
+	if a.failing.IsZero() {
+		a.failing = t
+	}
+	report := a.reported.IsZero() || t.Sub(a.reported) >= failureLogEvery
+	if report {
+		a.reported = t
+	}
+	r.keepLocked(host, t, a)
+	r.mu.Unlock()
+	if !report {
+		return
+	}
+	log := r.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Warn("DNS lookup failed", slog.String("host", host), slog.String("failure", lookupFailure(err)),
+		slog.Bool("using_stale_answer", stale), slog.Duration("failing_for", t.Sub(a.failing)), slog.String("error", err.Error()))
+}
+
+// keepLocked stores a's answer for host, making room if the names are at
+// maxDNSNames: the answers no longer usable go first, or else any one.
+func (r *DNSResolver) keepLocked(host string, t time.Time, a dnsAnswer) {
 	if r.names == nil {
 		r.names = map[string]dnsAnswer{}
 	}
 	if _, ok := r.names[host]; !ok && len(r.names) >= maxDNSNames {
-		// Drop the expired answers, or else any one.
-		for name, a := range r.names {
-			if !t.Before(a.expires) {
+		stale := r.Stale
+		if stale <= 0 {
+			stale = DefaultDNSStale
+		}
+		for name, old := range r.names {
+			if !t.Before(old.expires.Add(stale)) {
 				delete(r.names, name)
 			}
 		}
@@ -143,6 +243,18 @@ func (r *DNSResolver) lookup(ctx context.Context, host string) ([]netip.Addr, er
 			delete(r.names, name)
 		}
 	}
-	r.names[host] = dnsAnswer{addrs: addrs, expires: t.Add(ttl)}
-	return addrs, nil
+	r.names[host] = a
+}
+
+// lookupFailure names the class of a failed lookup for logs and errors.
+func lookupFailure(err error) string {
+	var de *net.DNSError
+	switch {
+	case errors.As(err, &de) && de.IsNotFound:
+		return "not found"
+	case errors.As(err, &de) && de.IsTimeout, errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "error"
+	}
 }

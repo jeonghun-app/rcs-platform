@@ -84,9 +84,17 @@ type Config struct {
 	MaxConnections, MaxClientFlows, CoreConnections int
 	// ClientIdleTimeout closes a quiet client connection.
 	ClientIdleTimeout time.Duration
-	// ICSCF is the first Route of a REGISTER: icscf, by its Cloud Map name
-	// by default (sip:icscf.<namespace>;transport=tcp;lr).
+	// ICSCF is the only Route of a REGISTER: icscf, by its Cloud Map name
+	// by default (sip:icscf.<namespace>;transport=tcp;lr). It is reached
+	// over TCP through the core listener, so its URI must say tcp.
 	ICSCF sip.URI
+	// Namespace is RCS_SERVICE_NAMESPACE, the only names a core hop is
+	// looked up in (ADR 0007 §5).
+	Namespace string
+	// VisitedNetworkID is the P-Visited-Network-ID of REGISTERs (TS 24.229
+	// §5.2.2.1, RFC 7315 §4.3), RCS_IMS_DOMAIN by default: icscf takes the
+	// Visited-Network-Identifier of its UAR from it.
+	VisitedNetworkID string
 	// AllowLoopback lets a core hop resolve to a loopback address, for a
 	// stack on one host; it is false in staging and prod, where only
 	// private addresses are reached (ADR 0007 §5).
@@ -125,8 +133,16 @@ func Configure(s *runtime.Settings) Config {
 		MaxRegistrations:  e.Int("MAX_REGISTRATIONS", DefaultMaxRegistrations),
 		RegisterRate:      e.Int("REGISTER_RATE", DefaultRegisterRate),
 		RegisterBurst:     e.Int("REGISTER_BURST", DefaultRegisterBurst),
+		Namespace:         s.ServiceNamespace(),
+		VisitedNetworkID:  e.String("VISITED_NETWORK_ID", s.Shared.String("IMS_DOMAIN", "")),
 	}
 	c.ICSCF = icscfURI(s)
+	switch {
+	case c.VisitedNetworkID == "":
+		e.Invalid("VISITED_NETWORK_ID", "required when RCS_IMS_DOMAIN is unset")
+	case !validVisitedNetwork(c.VisitedNetworkID):
+		e.Invalid("VISITED_NETWORK_ID", "not one network identifier (RFC 7315 §4.3)")
+	}
 	if c.PublicHost != "" && !validHostName(c.PublicHost) {
 		e.Invalid("PUBLIC_HOST", "not a host name")
 	}
@@ -175,7 +191,7 @@ func Configure(s *runtime.Settings) Config {
 		name string
 		v    int
 	}{
-		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_REGISTRATIONS", c.MaxRegistrations},
+		{"MAX_REGISTRATIONS", c.MaxRegistrations},
 		{"REGISTER_RATE", c.RegisterRate}, {"REGISTER_BURST", c.RegisterBurst},
 		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
@@ -229,11 +245,28 @@ func icscfURI(s *runtime.Settings) sip.URI {
 		v = "sip:icscf." + ns + ";transport=tcp;lr"
 	}
 	u, err := sip.ParseURI(v)
-	if err != nil || u.Scheme != "sip" && u.Scheme != "sips" || u.User != "" || !u.Params.Has("lr") {
-		e.Invalid("ICSCF_URI", "not a sip or sips URI of a host with lr")
+	network, _ := u.Param("transport")
+	if err != nil || u.Scheme != "sip" || u.User != "" || !u.Params.Has("lr") || !strings.EqualFold(network, "tcp") {
+		e.Invalid("ICSCF_URI", "not a sip URI of a host with transport=tcp and lr")
+		return sip.URI{}
+	}
+	host := strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]")
+	if _, err := netip.ParseAddr(host); err != nil && !runtime.InServiceNamespace(host, s.ServiceNamespace()) {
+		e.Invalid("ICSCF_URI", "a host name outside RCS_SERVICE_NAMESPACE, which pcscf does not look up (ADR 0007 §5)")
 		return sip.URI{}
 	}
 	return u
+}
+
+// validVisitedNetwork reports whether v is one P-Visited-Network-ID element,
+// so that pcscf never writes a header the core cannot parse.
+func validVisitedNetwork(v string) bool {
+	var h sip.Header
+	if h.Set("P-Visited-Network-ID", v) != nil {
+		return false
+	}
+	ids, err := h.PVisitedNetworkID()
+	return err == nil && len(ids) == 1
 }
 
 // validHostName reports whether h is a DNS name pcscf can be dialled by:

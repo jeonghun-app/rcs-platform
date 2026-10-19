@@ -34,6 +34,7 @@ func testConfig() Config {
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout, DrainTimeout: time.Second,
 		ICSCF:         sip.URI{Scheme: "sip", Host: "icscf.rcs.internal", Params: sip.Params{{Name: "transport", Value: "tcp"}, {Name: "lr"}}},
 		AllowLoopback: true, MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
+		Namespace: "rcs.internal", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 	}
 }
@@ -518,15 +519,31 @@ func TestTheClientListenersAreClientFacing(t *testing.T) {
 // the core listener always has room for scscf (review of #188).
 func TestClientFlowsLeaveRoomForTheCore(t *testing.T) {
 	cfg := testConfig()
-	cfg.MaxClientFlows = 2
+	// At the boundary the configuration allows: the transport's last
+	// connection is the core's (review of #188).
+	cfg.MaxClientFlows, cfg.CoreConnections = 2, 1
+	cfg.MaxConnections = cfg.MaxClientFlows + cfg.CoreConnections
 	s := start(t, cfg, deps{})
 	dial(t, s.client, nil).request()
 	dial(t, s.client, nil).request()
 	if !dial(t, s.client, nil).closed() {
 		t.Fatal("a client flow past MaxClientFlows was admitted")
 	}
-	if res := dial(t, s.core, nil).request(); res.StatusCode != 430 {
-		t.Fatalf("the core answered %d", res.StatusCode)
+	// The refused connection gives its transport slot back just after it
+	// is closed, so the core may have to try again.
+	deadline := time.Now().Add(waitFor)
+	for {
+		res, err := dial(t, s.core, nil).try()
+		if err == nil {
+			if res.StatusCode != 430 {
+				t.Fatalf("the core answered %d", res.StatusCode)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the core was kept out: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

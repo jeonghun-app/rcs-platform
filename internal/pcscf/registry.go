@@ -29,10 +29,12 @@ type registration struct {
 	// identity (RFC 7315 §4.1).
 	serviceRoute []sip.Address
 	associated   []sip.Address
-	// outbound says the client registered with RFC 5626 outbound, and
-	// keepAlive that it keeps the flow alive (outbound or Via keep).
-	outbound, keepAlive bool
-	expires             time.Time
+	// outbound says the client uses RFC 5626 outbound, and once saved that
+	// the registrar applied it too; viaKeep that it asked for keep-alive in
+	// its Via (RFC 6223); and keepAlive, once saved, that it keeps the flow
+	// alive by either.
+	outbound, viaKeep, keepAlive bool
+	expires                      time.Time
 }
 
 // aorKey writes a public identity for comparison: scheme, user and host, the
@@ -57,43 +59,114 @@ func aorKey(u sip.URI) string {
 // registry holds the registrations of the flows on this task, in instance
 // memory: a flow, and so its registrations, lives on one task (ADR 0005).
 // Its methods are safe for concurrent use.
+//
+// Each identity over a flow takes one of max slots while it is registered
+// or a REGISTER for it is under way: a REGISTER reserves its slot before it
+// is forwarded, so a 200 always finds room and a client is never told it is
+// registered when pcscf keeps nothing (QA of #198).
 type registry struct {
 	max int
 	now func() time.Time
 
-	mu     sync.Mutex
-	byFlow map[transport.FlowID]map[string]*registration
-	count  int
+	mu      sync.Mutex
+	byFlow  map[transport.FlowID]map[string]*registration
+	pending map[slotKey]*reservation
+	// count is the slots taken: identities with a registration, a
+	// reservation or both.
+	count int
+}
+
+type slotKey struct {
+	flow transport.FlowID
+	aor  string
+}
+
+// reservation is the REGISTERs under way for one identity over one flow,
+// and when the last of them gives up its slot if its final response never
+// releases it.
+type reservation struct {
+	n     int
+	until time.Time
 }
 
 func newRegistry(maxRegistrations int, now func() time.Time) *registry {
-	return &registry{max: maxRegistrations, now: now, byFlow: map[transport.FlowID]map[string]*registration{}}
+	return &registry{max: maxRegistrations, now: now,
+		byFlow: map[transport.FlowID]map[string]*registration{}, pending: map[slotKey]*reservation{}}
 }
 
-// room reports whether a registration of aor over flow could be saved: it
-// exists already, or the registry has room.
-func (r *registry) room(flow transport.FlowID, aor string) bool {
+// holdsLocked reports whether k has a slot. mu must be held.
+func (r *registry) holdsLocked(k slotKey) bool {
+	_, saved := r.byFlow[k.flow][k.aor]
+	_, reserved := r.pending[k]
+	return saved || reserved
+}
+
+// reserve takes the slot of a REGISTER of aor over flow, until release or
+// until, if the registry has room or the identity has its slot already.
+func (r *registry) reserve(flow transport.FlowID, aor string, until time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, ok := r.byFlow[flow][aor]
-	return ok || r.count < r.max
+	k := slotKey{flow, aor}
+	if !r.holdsLocked(k) {
+		if r.count >= r.max {
+			return false
+		}
+		r.count++
+	}
+	res := r.pending[k]
+	if res == nil {
+		res = &reservation{}
+		r.pending[k] = res
+	}
+	res.n++
+	if until.After(res.until) {
+		res.until = until
+	}
+	return true
+}
+
+// release ends a reservation of reserve. The slot stays taken if the
+// identity is registered.
+func (r *registry) release(flow transport.FlowID, aor string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	k := slotKey{flow, aor}
+	res := r.pending[k]
+	if res == nil {
+		return
+	}
+	if res.n--; res.n > 0 {
+		return
+	}
+	r.dropReservationLocked(k)
+}
+
+// dropReservationLocked forgets k's reservation, and frees its slot if it is
+// not registered. mu must be held.
+func (r *registry) dropReservationLocked(k slotKey) {
+	delete(r.pending, k)
+	if _, saved := r.byFlow[k.flow][k.aor]; !saved {
+		r.count--
+	}
 }
 
 // save stores reg, replacing any registration of the same identity over the
-// same flow.
+// same flow. It takes a slot if the identity has none, as when a
+// reservation lapsed.
 func (r *registry) save(reg *registration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	regs := r.byFlow[reg.flow]
-	if _, ok := regs[reg.aor]; !ok {
+	k := slotKey{reg.flow, reg.aor}
+	if !r.holdsLocked(k) {
 		if r.count >= r.max {
 			return errRegistryFull
 		}
-		if regs == nil {
-			regs = map[string]*registration{}
-			r.byFlow[reg.flow] = regs
-		}
 		r.count++
+	}
+	regs := r.byFlow[reg.flow]
+	if regs == nil {
+		regs = map[string]*registration{}
+		r.byFlow[reg.flow] = regs
 	}
 	regs[reg.aor] = reg
 	return nil
@@ -112,19 +185,23 @@ func (r *registry) removeLocked(flow transport.FlowID, aor string) {
 		return
 	}
 	delete(regs, aor)
-	r.count--
 	if len(regs) == 0 {
 		delete(r.byFlow, flow)
+	}
+	if _, reserved := r.pending[slotKey{flow, aor}]; !reserved {
+		r.count--
 	}
 }
 
 // removeFlow forgets every registration over a flow that closed: its
-// contacts are gone (RFC 5626 §5.3).
+// contacts are gone (RFC 5626 §5.3). A REGISTER still under way keeps its
+// slot until its response; registered drops what its 200 would save.
 func (r *registry) removeFlow(flow transport.FlowID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.count -= len(r.byFlow[flow])
-	delete(r.byFlow, flow)
+	for aor := range r.byFlow[flow] {
+		r.removeLocked(flow, aor)
+	}
 }
 
 // lookup returns the registration of aor over flow if it has not expired.
@@ -143,7 +220,8 @@ func (r *registry) lookup(flow transport.FlowID, aor string) (*registration, boo
 	return reg, true
 }
 
-// sweep forgets every expired registration.
+// sweep forgets every expired registration, and every reservation whose
+// REGISTER never released it.
 func (r *registry) sweep() {
 	t := r.now()
 	r.mu.Lock()
@@ -155,9 +233,15 @@ func (r *registry) sweep() {
 			}
 		}
 	}
+	for k, res := range r.pending {
+		if !t.Before(res.until) {
+			r.dropReservationLocked(k)
+		}
+	}
 }
 
-// size returns how many registrations are kept.
+// size returns how many slots are taken: registrations, and REGISTERs under
+// way for identities not yet registered.
 func (r *registry) size() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
