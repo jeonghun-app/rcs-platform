@@ -217,10 +217,14 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 		// connections whose peers have stopped reading, if there are any, and
 		// try once more; otherwise only this send fails. f's own connection is
 		// never closed for the budget: it may be perfectly healthy.
-		if n := t.shedStalledQueues(f, len(b)); n > 0 {
-			t.stats.budgetSheds.Add(uint64(n))
-			r = f.q.push(b, wait, deadline)
+		// Try again after the scan whatever it did: this send may have waited
+		// for another sender's scan, which made room, and other sends or
+		// writers may have freed some meanwhile.
+		if testHookBeforeShed != nil {
+			testHookBeforeShed()
 		}
+		t.stats.budgetSheds.Add(uint64(t.shedStalledQueues(f, len(b))))
+		r = f.q.push(b, wait, deadline)
 		if r == overBudget {
 			t.stats.budgetRefusals.Add(1)
 			return errBudgetFull
@@ -288,46 +292,33 @@ func (a shedRank) before(b shedRank) bool {
 // peer that one scan missed is still stalled at the next.
 const shedScanInterval = 100 * time.Millisecond
 
-// shedHeadroom is the share of MaxQueuedBytes a scan leaves free beyond the
-// send that triggered it. Freeing only that send's shortfall would leave the
-// budget full again for the next send, and scans run at most once per
-// shedScanInterval, so a burst after a mass stall would be refused for many
-// intervals while stalled connections remained to be shed.
+// testHookBeforeShed, when a test sets it, runs between a push the budget
+// refused and the shedding scan, where other goroutines may free room.
+var testHookBeforeShed func()
+
+// shedHeadroom is the share of MaxQueuedBytes a scan tries to free beyond the
+// send that triggered it, by closing stalled client-facing connections.
+// Freeing only that send's shortfall would leave the budget full again for the
+// next send, and scans run at most once per shedScanInterval, so a burst after
+// a mass stall would be refused for many intervals while stalled clients
+// remained to be shed. It is best effort: when every stalled client together
+// cannot make it, because healthy queues hold most of the budget, closing them
+// all would gain little, so only the real shortfall is covered. Core
+// connections are never closed for headroom: losing one fails every
+// transaction on it, so one is shed only while the send itself does not fit.
 const shedHeadroom = 0.10
 
-// shedStalledQueues closes stalled connections other than except until all
-// queues together, plus need more bytes, fit in all but shedHeadroom of the
-// budget, or the candidates run out. It returns how many it closed.
-//
-// A connection with nothing queued, already closing, or whose writer made
-// progress within shedGrace, is never a candidate; the others are closed in
-// shedRank order. It scans every stream flow, at most once per
-// shedScanInterval.
-func (t *Transport) shedStalledQueues(except *flow, need int) int {
-	now := time.Now()
-	last := t.lastShedScan.Load()
-	if now.UnixNano()-last < int64(shedScanInterval) || !t.lastShedScan.CompareAndSwap(last, now.UnixNano()) {
-		return 0
-	}
-	grace := t.shedGrace()
-	type candidate struct {
-		f      *flow
-		rank   shedRank
-		queued int
-	}
-	var cands []candidate
-	for _, f := range t.flows.streams() {
-		if f == except || f.closed.Load() {
-			continue
-		}
-		queued, idle := f.q.stall(now)
-		if queued == 0 || idle < grace {
-			continue
-		}
-		cands = append(cands, candidate{f, shedRank{client: f.lis != nil && f.lis.clientFacing,
-			share: float64(queued) / float64(f.q.limit), stalled: idle}, queued})
-	}
-	slices.SortFunc(cands, func(a, b candidate) int {
+// shedCandidate is a connection a scan may close, with what closing it frees.
+type shedCandidate struct {
+	f      *flow
+	rank   shedRank
+	queued int
+}
+
+// sortCandidates puts the candidates in the order a scan closes them. The flow
+// table is a map, so they arrive in no particular order.
+func sortCandidates(cands []shedCandidate) {
+	slices.SortFunc(cands, func(a, b shedCandidate) int {
 		switch {
 		case a.rank.before(b.rank):
 			return -1
@@ -336,18 +327,71 @@ func (t *Transport) shedStalledQueues(except *flow, need int) int {
 		}
 		return 0
 	})
-	target := int64(float64(t.budget.max) * (1 - shedHeadroom))
-	excess := t.budget.used.Load() + int64(need) - target
-	closed := 0
+}
+
+// shedStalledQueues closes stalled connections other than except, in shedRank
+// order: client-facing ones until all queues together, plus need more bytes,
+// fit in all but shedHeadroom of the budget if they can get it there, and to
+// cover the real shortfall otherwise; core ones only while that shortfall
+// remains. It returns how many it closed.
+//
+// Scans are serialized: a sender that finds the budget full while another
+// sender scans waits for that scan and then retries in the room it made,
+// rather than being turned away by the rate limit.
+//
+// A connection with nothing queued, already closing, or whose writer made
+// progress within shedGrace, is never a candidate; the others are closed in
+// shedRank order. It scans every stream flow, at most once per
+// shedScanInterval.
+func (t *Transport) shedStalledQueues(except *flow, need int) (closed int) {
+	t.shedMu.Lock()
+	defer t.shedMu.Unlock()
+	now := time.Now()
+	if now.UnixNano()-t.lastShedScan.Load() < int64(shedScanInterval) {
+		return 0
+	}
+	t.lastShedScan.Store(now.UnixNano())
+	grace := t.shedGrace()
+	var cands []shedCandidate
+	for _, f := range t.flows.streams() {
+		if f == except || f.closed.Load() {
+			continue
+		}
+		queued, idle := f.q.stall(now)
+		if queued == 0 || idle < grace {
+			continue
+		}
+		cands = append(cands, shedCandidate{f, shedRank{client: f.lis != nil && f.lis.clientFacing,
+			share: float64(queued) / float64(f.q.limit), stalled: idle}, queued})
+	}
+	sortCandidates(cands)
+	wanted := t.budget.used.Load() + int64(need)
+	overBudget := wanted - t.budget.max
+	clientGoal := wanted - int64(float64(t.budget.max)*(1-shedHeadroom))
+	var clientBytes int64
 	for _, c := range cands {
-		if excess <= 0 {
+		if c.rank.client {
+			clientBytes += int64(c.queued)
+		}
+	}
+	if clientBytes < clientGoal {
+		// The headroom is out of reach; cover the shortfall only.
+		clientGoal = overBudget
+	}
+	for _, c := range cands {
+		// Clients sort first. A client is worth closing while the client goal
+		// is unmet, a core connection while the send does not fit at all; the
+		// goal is never below the shortfall, so once a candidate is not worth
+		// closing none after it is either.
+		if (c.rank.client && clientGoal <= 0) || (!c.rank.client && overBudget <= 0) {
 			break
 		}
 		// A candidate may have started closing since it was looked at; then it
 		// frees nothing here and is not counted.
 		if t.closeFlow(c.f) {
 			closed++
-			excess -= int64(c.queued)
+			clientGoal -= int64(c.queued)
+			overBudget -= int64(c.queued)
 		}
 	}
 	return closed

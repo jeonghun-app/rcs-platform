@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -525,9 +526,8 @@ func TestSheddingScansAtMostOncePerInterval(t *testing.T) {
 	}
 }
 
-// #144: one scan after a mass stall closes as many stalled connections as it
-// takes, so a burst that needs several of them freed goes through without a
-// refusal, and the busy core connection that sends it is never closed.
+// #144: one scan after a mass stall closes as many stalled clients as it takes,
+// so a burst that needs several of them freed goes through without a refusal.
 func TestOneScanFreesEnoughForABurstAfterAMassStall(t *testing.T) {
 	const budget = 100 << 10
 	dialer := &pipesDialer{}
@@ -568,8 +568,11 @@ func TestOneScanFreesEnoughForABurstAfterAMassStall(t *testing.T) {
 		}
 	}
 	coreFlow := server.flows.peer(reuseKey{network: TCP, remote: core.Addr})
+	// The sender's own connection is never a candidate; a stalled core
+	// connection among the candidates is covered by
+	// TestHeadroomNeverClosesAStalledCoreConnection.
 	if coreFlow == nil || coreFlow.closed.Load() {
-		t.Fatal("the core connection was closed")
+		t.Fatal("the sending connection was closed")
 	}
 	s := server.Stats()
 	if s.BudgetRefusals != 0 || s.BudgetSheds < 2 || s.QueuedBytes > budget {
@@ -578,5 +581,117 @@ func TestOneScanFreesEnoughForABurstAfterAMassStall(t *testing.T) {
 	// One scan did it: the burst fits in the headroom that scan left.
 	if s.BudgetSheds > 3 {
 		t.Fatalf("shed %d connections, more than the headroom needs", s.BudgetSheds)
+	}
+}
+
+// #144 review: the headroom is made from stalled clients only. A stalled core
+// connection is closed only while the send does not fit in the budget at all,
+// because closing it fails every transaction on it.
+func TestHeadroomNeverClosesAStalledCoreConnection(t *testing.T) {
+	const budget = 100 << 10
+	for _, tc := range []struct {
+		name       string
+		clients    int  // stalled clients of about 5 KiB each
+		coreShed   bool // whether the stalled core connection must go
+		wantClosed int
+	}{
+		// Two clients cannot reach the headroom, so only the shortfall is
+		// covered, by one of them; the stalled core connection stays.
+		{"clients cover the shortfall", 2, false, 1},
+		// No clients: the send does not fit, so the core connection goes.
+		{"only the core can make room", 0, true, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dialer := &pipesDialer{}
+			server, _ := newTransport(t, Config{Dialer: dialer, WriteTimeout: time.Hour, MaxQueuedBytes: budget,
+				Limits: sip.Limits{MaxHeaderBytes: 4 << 10, MaxBodyBytes: 16 << 10}})
+			t.Cleanup(func() {
+				for _, p := range dialer.peers {
+					p.Close()
+				}
+			})
+			listen(t, server, ListenerConfig{Network: TCP, Name: "edge", ClientFacing: true})
+			listen(t, server, ListenerConfig{Network: TCP, Name: "core"})
+			msg := func(body int) *sip.Request {
+				req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKm")
+				req.Body = make([]byte, body)
+				return req
+			}
+			// A stalled core connection holds the rest of 95% of the budget.
+			stalledCore := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.60:5060")}
+			for server.budget.used.Load() < int64(95<<10-tc.clients*(5<<10))-(12<<10) {
+				if _, err := server.SendRequest(msg(12<<10), stalledCore); err != nil {
+					t.Fatal(err)
+				}
+			}
+			coreFlow := server.flows.peer(reuseKey{network: TCP, remote: stalledCore.Addr})
+			for i := range tc.clients {
+				f := pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.80"), uint16(40000+i)))
+				if _, err := server.SendRequest(msg(5<<10-300), Destination{Flow: f.id}, NoWait); err != nil {
+					t.Fatal(err)
+				}
+				stalled(f)
+			}
+			stalled(coreFlow)
+			// Top the budget up to just short of full, then send what no longer fits.
+			free := budget - int(server.budget.used.Load())
+			sender := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
+			if _, err := server.SendRequest(msg(free+(1<<10)-300), sender); err != nil {
+				t.Fatalf("send = %v (%+v)", err, server.Stats())
+			}
+			if got := coreFlow.closed.Load(); got != tc.coreShed {
+				t.Fatalf("stalled core connection closed = %v, want %v", got, tc.coreShed)
+			}
+			if s := server.Stats(); s.BudgetSheds != uint64(tc.wantClosed) || s.BudgetRefusals != 0 {
+				t.Fatalf("stats = %+v", s)
+			}
+		})
+	}
+}
+
+// #144 review: a scan that closes nothing, because others freed room meanwhile,
+// still lets the send try again rather than refusing it with room available.
+func TestSendIsRetriedAfterAScanThatClosedNothing(t *testing.T) {
+	r := newBudgetRig(t)
+	for _, h := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
+		if err := r.send(h, 600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Nothing is stalled, so the scan closes nothing; meanwhile another
+	// connection closes and returns its bytes to the budget.
+	gone, f := r.flow("192.0.2.1"), r.flow("192.0.2.2")
+	testHookBeforeShed = func() { r.tr.closeFlow(gone) }
+	t.Cleanup(func() { testHookBeforeShed = nil })
+	if err := r.tr.write(f, make([]byte, 1000), false); err != nil {
+		t.Fatalf("write = %v with room available", err)
+	}
+	if s := r.tr.Stats(); s.BudgetRefusals != 0 || s.BudgetSheds != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+// The order of a multi-shed is the sort's, not the flow table's: a map, whose
+// order a flow-level test cannot pin. So the sort is checked on its own, from
+// an order that is wrong in every respect.
+func TestCandidatesAreClosedClientsFirstThenFullestThenLongestStalled(t *testing.T) {
+	c := func(name string, client bool, share float64, stalled time.Duration) shedCandidate {
+		return shedCandidate{f: &flow{id: FlowID(name)}, rank: shedRank{client: client, share: share, stalled: stalled}}
+	}
+	cands := []shedCandidate{
+		c("core-full", false, 0.9, time.Hour),
+		c("core-light", false, 0.1, time.Hour),
+		c("client-light", true, 0.2, time.Hour),
+		c("client-full-recent", true, 0.8, time.Second),
+		c("client-full-old", true, 0.8, time.Minute),
+	}
+	sortCandidates(cands)
+	var got []string
+	for _, x := range cands {
+		got = append(got, string(x.f.id))
+	}
+	want := []string{"client-full-old", "client-full-recent", "client-light", "core-full", "core-light"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v, want %v", got, want)
 	}
 }
