@@ -142,11 +142,13 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //
 // Digits of any script count: every decimal digit (Unicode Nd) outside ASCII,
 // such as a full-width digit from a CJK input mode or an Arabic-Indic digit,
-// is written as the ASCII digit of the same value first, and full-width
-// separators ("＋", "－", "．", "（", "）", U+3000) as ASCII ones, so a number
-// in any script is masked like the same number in ASCII, with the same hint
-// ("０１０－００００－０００１" like "010-0000-0001"). Other digit-like
-// characters (superscripts, circled digits) are not digits here.
+// is written as the ASCII digit of the same value first, and the spaces,
+// dashes and full-width "＋", "．", "（", "）" that group a number as ASCII
+// ones, so a number in any script is masked like the same number in ASCII,
+// with the same hint ("０１０－００００－０００１", "010ー0000ー0001" and
+// "+1 555 010 0001" with no-break spaces like their ASCII forms); see
+// [asciiNumberChars]. Other digit-like characters (superscripts, circled
+// digits) are not digits here.
 //
 // Schemes match case-insensitively (RFC 3261 §19.1.4, RFC 3966 §3). The output
 // never contains a run of eight or more decimal digits. Redact runs in time
@@ -250,8 +252,10 @@ func startsNumber(s string, i int) bool {
 // that look like national numbers, such as the date 09.10.2026 or the ports
 // "05060 05061". National numbers without a trunk prefix written in groups,
 // such as North American (555) 010-0001, are not recognised, nor are numbers
-// grouped with tabs, en dashes or " - ". The number ends where three separators or a separator followed by
-// something other than a digit appear, so each byte is scanned once.
+// grouped with tabs or " - ". The number ends where three separators or a
+// separator followed by something other than a digit appear, so each byte is
+// scanned once. Spaces and dashes outside ASCII reach it as ASCII ones (see
+// [asciiNumberChars]).
 func numberAt(s string, i int) (from, end int) {
 	p := i
 	if s[p] == '+' {
@@ -450,18 +454,33 @@ func hasUserinfo(scheme string) bool {
 	return false
 }
 
-// asciiNumberChars rewrites every decimal digit outside ASCII as the ASCII
-// digit of the same value, and the full-width forms of the characters that
-// write a number ("＋", "－", "．", "（", "）" and the ideographic space
-// U+3000) as their ASCII ones, so that the scan in Redact, which reads
-// ASCII, treats a number in any script or input mode as it treats the
-// number in ASCII: runs, numbers in groups and URI users alike, with the same
-// hint. Rewriting only long digit runs would let a short run sit next to a
-// mask and form a long one with the hint ("…-２３４５６７" after a tel
-// number), and would miss numbers written in groups. Text such as
-// "２０２６年" or "（注）" reads the same with ASCII characters, and text
-// without a digit is not rewritten at all. Only these runes are replaced, so
-// the text around them, valid UTF-8 or not, is kept.
+// asciiNumberChars rewrites the characters of a number written outside ASCII
+// as their ASCII forms, so that the scan in Redact, which reads ASCII, treats
+// a number in any script, input mode or typography as it treats the number in
+// ASCII: runs, numbers in groups and URI users alike, with the same hint.
+//
+// Every decimal digit (Unicode Nd) becomes the ASCII digit of the same value,
+// wherever it is: rewriting only long digit runs would let a short run sit
+// next to a mask and form a long one with the hint ("…-２３４５６７" after a
+// tel number). The characters that group a number become ASCII only where
+// they do: every space (Unicode Zs: U+3000, no-break and thin spaces) becomes
+// " ", every dash (Unicode Pd, U+2212 minus and the long vowel marks "ー" and
+// "ｰ" that the "-" key types in a Japanese kana mode) becomes "-", and "．",
+// "（", "）" and "＋" become ASCII,
+//
+//   - when one or two of them join two digits, as numberAt reads them
+//     ("０１０ー１２３４", "+1 (555)" with U+3000 and "（");
+//   - for "＋", before a digit;
+//   - for brackets, around digits alone ("（０３）");
+//   - in the user or subscriber of a URI, while it reads as a number
+//     (isNumberChar), as Redact masks all of it ("tel:（０３）１２３４").
+//
+// Elsewhere they are prose, such as "名前　（注）　10", "failed — retry" or
+// "データー", and are kept. Text without a digit is not rewritten at all.
+// Only these runes are replaced, so the text around them, valid UTF-8 or not,
+// is kept. Each rune is looked at a bounded number of times (two runes
+// ahead, and the digits after an opening bracket once more), so this is
+// linear.
 func asciiNumberChars(s string) string {
 	// Text without a digit holds no number, and is left alone.
 	if isASCII(s) || !strings.ContainsFunc(s, unicode.IsDigit) {
@@ -469,13 +488,52 @@ func asciiNumberChars(s string) string {
 	}
 	var b strings.Builder
 	last := 0 // s[:last] has been written
+	// seps counts the separators since the last digit, or is -1 if something
+	// else came after it.
+	seps := -1
+	inURI := false // in the user or subscriber of a URI
+	closeAt := -1  // where a non-ASCII bracket closes a group of digits
 	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if c, ok := asciiNumberChar(r); ok {
+		if n := schemeLen(s[i:]); n > 0 {
+			// Redact goes on from the end of a URI's number as from a digit
+			// (continueWritten), and the number may be empty.
+			i += n
+			seps, inURI = 0, true
+			continue
+		}
+		c, size := numberCharAt(s, i)
+		rewrite := false
+		switch {
+		case isDigit(c):
+			rewrite = true
+		case inURI && isNumberChar(c):
+			rewrite = true
+		case c == '+':
+			next, _ := numberCharAt(s, i+size)
+			rewrite = isDigit(next)
+		case isNumberSeparator(c):
+			rewrite = i == closeAt || joinsDigits(s, i+size, seps)
+			if c == '(' {
+				if j, ok := bracketedDigits(s, i+size); ok {
+					rewrite = true
+					closeAt = j
+				}
+			}
+		}
+		if size > 1 && rewrite {
 			b.WriteString(s[last:i])
 			b.WriteByte(c)
 			last = i + size
 		}
+		switch {
+		case isDigit(c), inURI && isNumberChar(c):
+			seps = 0
+		case isNumberSeparator(c) && seps >= 0:
+			seps++
+		default:
+			seps = -1
+		}
+		inURI = inURI && isNumberChar(c)
 		i += size
 	}
 	if last == 0 {
@@ -485,17 +543,72 @@ func asciiNumberChars(s string) string {
 	return b.String()
 }
 
-// asciiNumberChar returns the ASCII character asciiNumberChars writes for r,
-// if r is one it rewrites.
+// numberCharAt returns the ASCII form of the rune at s[i] if it has one (see
+// asciiNumberChar), or 0, and the rune's size; at the end of s it returns 0,
+// 0.
+func numberCharAt(s string, i int) (c byte, size int) {
+	if i >= len(s) {
+		return 0, 0
+	}
+	if s[i] < utf8.RuneSelf {
+		return s[i], 1
+	}
+	r, size := utf8.DecodeRuneInString(s[i:])
+	c, _ = asciiNumberChar(r)
+	return c, size
+}
+
+// joinsDigits reports whether a separator that follows seps separators after
+// a digit, and is followed by s[i:], is one of at most two separators between
+// two digits.
+func joinsDigits(s string, i, seps int) bool {
+	next, size := numberCharAt(s, i)
+	switch seps {
+	case 0:
+		if isNumberSeparator(next) {
+			next, _ = numberCharAt(s, i+size)
+		}
+		return isDigit(next)
+	case 1:
+		return isDigit(next)
+	}
+	return false
+}
+
+// bracketedDigits reports whether s[i:] is one or more digits followed by a
+// closing bracket, and where the bracket is if it is not ASCII, or -1.
+func bracketedDigits(s string, i int) (closeAt int, ok bool) {
+	j := i
+	for {
+		c, size := numberCharAt(s, j)
+		switch {
+		case isDigit(c):
+			j += size
+			continue
+		case c == ')' && j > i:
+			if size > 1 {
+				return j, true
+			}
+			return -1, true
+		}
+		return -1, false
+	}
+}
+
+// asciiNumberChar returns the ASCII character that r stands for in a number,
+// if it stands for one: a decimal digit, a space, a dash, or one of the
+// full-width "＋", "．", "（", "）".
 func asciiNumberChar(r rune) (byte, bool) {
 	switch {
 	case r < utf8.RuneSelf:
 		return 0, false
 	case unicode.IsDigit(r):
 		return asciiDigit(r), true
-	case r == '\u3000':
+	case unicode.Is(unicode.Zs, r):
 		return ' ', true
-	case r == '＋', r == '－', r == '．', r == '（', r == '）':
+	case unicode.Is(unicode.Pd, r), r == '\u2212', r == 'ー', r == 'ｰ':
+		return '-', true
+	case r == '＋', r == '．', r == '（', r == '）':
 		// The full-width forms block mirrors ASCII 0x21-0x7E at U+FF01.
 		return byte(r - '！' + '!'), true
 	}
