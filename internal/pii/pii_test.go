@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"unicode"
@@ -341,7 +342,7 @@ func hintOf(t *testing.T, redacted string) string {
 // milliseconds, so a regression shows up as a test timeout, not a flaky timing.
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
-	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－"} {
+	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－", "1\u00a0", "1ー", "（１２", "(1", "tel:－", "１—\u202f", "1 \u2013", "＋"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
@@ -404,6 +405,28 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 		{"full-width plus and ideographic spaces", "call ＋１\u3000５５５\u3000０１０\u3000０００１", "call +***01"},
 		{"full-width parentheses and full stops", "（０７７００）\u3000９００．００１", "(***01"},
 		{"full-width separators around ASCII digits", "010－0000－0001", "***01"},
+		{"full-width parentheses and a space between groups", "＋１\u3000（５５５）\u3000０１０－０００１", "+***01"},
+		// Every Unicode space and dash groups a number too (#110): a number
+		// copied from a formatter or a web page may carry no-break or thin
+		// spaces, and the "-" key of a Japanese IME in kana mode types "ー".
+		{"no-break spaces", "call +1\u00a0555\u00a0010\u00a00001", "call +***01"},
+		{"narrow no-break spaces", "010\u202f0000\u202f0001", "***01"},
+		{"thin spaces", "+1\u2009555\u2009010\u20090001", "+***01"},
+		{"hyphens", "010\u20100000\u20100001", "***01"},
+		{"non-breaking hyphens", "010\u20110000\u20110001", "***01"},
+		{"figure dashes", "010\u20120000\u20120001", "***01"},
+		{"en dashes", "010\u20130000\u20130001", "***01"},
+		{"em dashes", "010\u20140000\u20140001", "***01"},
+		{"horizontal bars", "010\u20150000\u20150001", "***01"},
+		{"minus signs", "010\u22120000\u22120001", "***01"},
+		{"katakana long vowel marks", "０１０ー１２３４ー５６７８", "***78"},
+		{"half-width long vowel marks", "010ｰ0000ｰ0001", "***01"},
+		{"an en dash and a space", "+1\u2013 555\u2013 010\u2013 0001", "+***01"},
+		// Inside a tel URI every number character counts, as in ASCII.
+		{"full-width parentheses in a tel URI", "tel:（０３）１２３４", "tel:***34"},
+		{"full-width hyphens in a tel URI", "tel:１２－－－３４５６", "tel:***56"},
+		{"a dash after a tel URI's scheme", "tel:\u2010123456", "tel:***56"},
+		{"a space after a tel URI's scheme", "tel:\u3000１２３４５６", "tel:***56"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := r.Redact(tt.in); got != tt.want {
@@ -424,11 +447,179 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 		"010-0000-0001":     "０１０－００００－０００１",
 		"(07700) 900.001":   "（０７７００）\u3000９００．００１",
 		"tel:+1-555-0100-1": "tel:＋１－５５５－０１００－１",
+		"+1 555 010 0002":   "+1\u00a0555\u202f010\u20090002",
+		"010-0000-0002":     "０１０ー００００\u2212０００２",
+		"+1 (555) 010-0001": "＋１\u3000（５５５）\u00a0０１０\u2013０００１",
+		"tel:(03)1234-5678": "tel:（０３）１２３４—５６７８",
 	} {
 		if a, b := k.Redact(ascii), k.Redact(wide); a != b || !strings.Contains(a, mark) {
 			t.Errorf("%q gives %q but %q gives %q", ascii, a, wide, b)
 		}
 	}
+}
+
+// Only the characters of a number are rewritten: brackets, spaces and dashes
+// in the text around it keep the form they were written in (#110).
+func TestRedactKeepsTheTextAroundANumber(t *testing.T) {
+	r := NewRedactor(nil)
+	for _, in := range []string{
+		"名前\u3000（注）\u300010",
+		"failed \u2014 retry 3 times",
+		"pages 10 \u2013 20",
+		"1\u3000\u2212\u30002",
+		"ゲーム10本",
+		"データー 10",
+		"＋ 1",
+		"（注1）",
+		"（1",
+		"1）",
+		"10\u00a0€",
+		"欄（）1",
+	} {
+		if got := r.Redact(in); got != in {
+			t.Errorf("Redact(%q) = %q, want it unchanged", in, got)
+		}
+	}
+	for in, want := range map[string]string{
+		"（１）":        "(1)",
+		"(１）":        "(1)",
+		"（注１）２":      "（注1)2",
+		"10\u201320": "10-20",
+		"コード１ー２ー３":   "コード1-2-3",
+		"２０２６年":      "2026年",
+		// A URI's number ends where it does in ASCII.
+		"tel:１２３４５６\u3000（注）": "tel:***56\u3000（注）",
+	} {
+		if got := r.Redact(in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Redact masks a number written in any digits and any Unicode spaces and
+// dashes as it masks the number written in ASCII, hint included: the
+// differential check from the QA of #106, with the separators of #110. Each
+// text is built from numbers, URIs and words in ASCII, then every digit and
+// separator in it is replaced at random by a form from another script. As
+// only the characters of a number are rewritten, the output is compared
+// after the remaining forms are read back as ASCII.
+func TestRedactReadsANumberInAnyFormAsInASCII(t *testing.T) {
+	n := 20_000
+	if testing.Short() {
+		n = 2_000
+	}
+	rng := rand.New(rand.NewPCG(110, 106))
+	unkeyed, keyed := NewRedactor(nil), NewRedactor(testKey)
+	for range n {
+		ascii := asciiNumberText(rng)
+		wide := anyFormOf(rng, ascii)
+		for _, r := range []*Redactor{unkeyed, keyed} {
+			if want, got := r.Redact(ascii), r.Redact(wide); asciiForm(got) != want {
+				t.Fatalf("Redact(%q) = %q\nRedact(%q) = %q", ascii, want, wide, got)
+			}
+		}
+	}
+}
+
+// asciiNumberText returns a text of numbers, number URIs and words, joined
+// as they may be in a log line.
+func asciiNumberText(rng *rand.Rand) string {
+	pick := func(xs ...string) string { return xs[rng.IntN(len(xs))] }
+	digits := func() string {
+		var b strings.Builder
+		for range 1 + rng.IntN(5) {
+			b.WriteByte(byte('0' + rng.IntN(10)))
+		}
+		return b.String()
+	}
+	number := func(seps ...string) string {
+		var b strings.Builder
+		b.WriteString(pick("", "", "+", "(", "0"))
+		b.WriteString(digits())
+		for range rng.IntN(6) {
+			b.WriteString(pick(seps...))
+			b.WriteString(digits())
+		}
+		return b.String()
+	}
+	grouping := []string{" ", "-", ".", "(", ")", "  ", " (", ") ", ")-", "--", " - ", "-.", ".("}
+	// A sip user cannot hold a space (RFC 3261 §25.1).
+	userGrouping := []string{"-", ".", "(", ")", ")-", "--", "-.", "---"}
+	var b strings.Builder
+	for range 1 + rng.IntN(5) {
+		switch rng.IntN(6) {
+		case 0, 1:
+			b.WriteString(number(grouping...))
+		case 2:
+			b.WriteString(pick("tel:", "TEL:", "urn:gsma:imei:"))
+			b.WriteString(number(grouping...))
+			b.WriteString(pick("", ";phone-context=example.net", "-", ")"))
+		case 3:
+			b.WriteString(pick("sip:", "sips:", "im:", "pres:"))
+			b.WriteString(number(userGrouping...))
+			b.WriteString("@" + testDomain)
+		default:
+			b.WriteString(pick("call", "msisdn=", "id", "x", "abc", "Tel.", "v", "a-b", "(x)", "#", "*", "-", "+", "."))
+		}
+		b.WriteString(pick("", " ", " ", "-", " (", ") ", ", ", " - ", "(", ")", "."))
+	}
+	return b.String()
+}
+
+// The forms anyFormOf writes for each ASCII character of a number.
+var (
+	digitZeros = []rune{'0', '０', '٠', '۰', '०', '০', '𝟎', '𝟘'}
+	otherForms = map[byte][]rune{
+		' ': {' ', '\u3000', '\u00a0', '\u202f', '\u2009', '\u2002', '\u205f'},
+		'-': {'-', '－', '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212', 'ー', 'ｰ', '\ufe63'},
+		'.': {'.', '．'},
+		'(': {'(', '（'},
+		')': {')', '）'},
+		'+': {'+', '＋'},
+	}
+)
+
+// anyFormOf replaces every digit and number character in s, outside URI
+// schemes and the domain, by a form chosen at random.
+func anyFormOf(rng *rand.Rand, s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if n := schemeLen(s[i:]); n > 0 {
+			b.WriteString(s[i : i+n])
+			i += n - 1
+			continue
+		}
+		if strings.HasPrefix(s[i:], "@"+testDomain) {
+			b.WriteString("@" + testDomain)
+			i += len(testDomain)
+			continue
+		}
+		c := s[i]
+		switch {
+		case isDigit(c):
+			b.WriteRune(digitZeros[rng.IntN(len(digitZeros))] + rune(c-'0'))
+		case otherForms[c] != nil:
+			forms := otherForms[c]
+			b.WriteRune(forms[rng.IntN(len(forms))])
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// asciiForm writes every character that Redact can read as a number
+// character in its ASCII form, wherever it is.
+func asciiForm(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if c, ok := asciiNumberChar(r); ok {
+			b.WriteByte(c)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func TestDigitValuesFollowTheUnicodeDecimalDigits(t *testing.T) {

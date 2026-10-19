@@ -244,60 +244,150 @@ func TestTrafficTowardTheClientKeepsItsConnectionOpen(t *testing.T) {
 	// still must not be cut while messages flow to it. The idle timeout is
 	// real time, so it is shortened here. "yes" is the control case: the client
 	// answers every chunk.
+	//
+	// The test waits on progress (#124): the test sends the next message
+	// only once the last one arrived, so a relay that cuts correctly, after
+	// the idle timeout without a write, leaves two consecutive gaps between
+	// deliveries that add up to the idle timeout or more. A cut while every
+	// gap of the attempt stayed under half the idle timeout is the relay's
+	// fault; otherwise the host may have stalled (the deadline can even fire
+	// after the next message was written), the attempt is inconclusive, and
+	// the test starts over on a new connection, up to maxAttempts.
+	const maxAttempts = 5
 	for _, tt := range []struct {
 		name string
 		mode msrp.ReportMode
 	}{{"no", msrp.ReportNo}, {"partial", msrp.ReportPartial}, {"yes", msrp.ReportYes}} {
 		t.Run("Failure-Report "+tt.name, func(t *testing.T) {
-			idle := time.Second
-			r := newRig(t, 1, func(o *relayOptions) { o.IdleTimeout = idle })
-			sid := "asquiet" + tt.name
-			b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{r.as.uri(sid)}})
-			as := r.as.session(t, sid, b.coreLocal, newRecorder())
-			clientH := newRecorder()
-			c := r.dial(0, nil)
-			if _, err := c.open(t, b.clientPath, clientH); err != nil {
-				t.Fatal(err)
-			}
-			// Traffic goes out every idle/10. Should this goroutine itself be
-			// held up for longer than the idle timeout (a host far too loaded
-			// for real-time deadlines), the premise of the test is gone, and it
-			// is skipped rather than reported as a relay fault.
-			deadline := time.Now().Add(3 * idle)
-			last := time.Now()
-			for time.Now().Before(deadline) {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_, err := as.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: []byte("to a quiet client"), FailureReport: tt.mode})
-				cancel()
-				if err != nil {
-					t.Fatalf("Send = %v", err)
+			delivered := 0
+			for attempt := 1; ; attempt++ {
+				ok, n := trafficKeepsTheClientConnected(t, tt.name, tt.mode, -1)
+				if ok {
+					return
 				}
-				select {
-				case m := <-clientH.msgs:
-					if string(m.Body) != "to a quiet client" {
-						t.Fatalf("client got %q", m.Body)
+				delivered += n
+				if attempt == maxAttempts {
+					// A loaded host delays messages; it does not lose
+					// every one of them.
+					if delivered == 0 {
+						t.Fatalf("no message reached the client in %d attempts", maxAttempts)
 					}
-				case <-c.conn.Done():
-					if gap := time.Since(last); gap >= idle/2 {
-						t.Skipf("the test was held up for %v, too close to the %v idle timeout", gap, idle)
-					}
-					t.Fatal("the client was cut while receiving")
-				case <-time.After(5 * time.Second):
-					t.Fatal("no message arrived")
+					t.Skipf("traffic was held up for half the idle timeout or longer in all %d attempts: the host is too loaded for real-time deadlines", maxAttempts)
 				}
-				last = time.Now()
-				time.Sleep(idle / 10)
 			}
-			select {
-			case <-c.conn.Done():
-				t.Fatal("the client was cut while receiving")
-			default:
-			}
-			// Once nothing flows either way, the idle timeout applies.
-			waitDone(t, c.conn.Done(), "the idle connection")
-			eventually(t, "the idle close to be counted", func() bool { return r.metrics.count(mIdleClosed) == 1 })
 		})
 	}
+}
+
+// A stall of the test itself, after a message is sent and before it is
+// read, lets the relay close the quiet connection correctly; the attempt
+// must come out inconclusive, not as a relay fault (review of #128). The
+// stall waits for the cut and then reads the message, so the attempt takes
+// the same path every time: a delivery after the stall, then the cut seen
+// soon after it.
+func TestAStallOfTheTestIsNotTakenForARelayFault(t *testing.T) {
+	for _, stallAt := range []int{0, 3} {
+		if ok, _ := trafficKeepsTheClientConnected(t, "stall", msrp.ReportNo, stallAt); ok {
+			t.Fatalf("stall after message %d: the attempt passed, so the stall did not happen", stallAt)
+		}
+	}
+}
+
+// trafficKeepsTheClientConnected runs one attempt of the test above on a new
+// relay and connection: messages toward a client that sends nothing keep it
+// connected for three idle timeouts, and once nothing flows the idle
+// timeout closes it. It fails the test if the client is cut while traffic
+// flows, and returns false, inconclusive, if a stall of the host stopped
+// the traffic first. With stallAt >= 0, the test stalls for longer than the
+// idle timeout after sending message stallAt, as a loaded host can, and
+// until the relay has cut the client.
+func trafficKeepsTheClientConnected(t *testing.T, name string, mode msrp.ReportMode, stallAt int) (bool, int) {
+	t.Helper()
+	idle := time.Second
+	r := newRig(t, 1, func(o *relayOptions) { o.IdleTimeout = idle })
+	sid := "asquiet" + name
+	b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{r.as.uri(sid)}})
+	as := r.as.session(t, sid, b.coreLocal, newRecorder())
+	clientH := newRecorder()
+	// last is the latest delivery (at first, before the bind), worst the
+	// longest gap between two deliveries so far.
+	last := time.Now()
+	var worst time.Duration
+	delivered := 0
+	gap := func() {
+		now := time.Now()
+		worst = max(worst, now.Sub(last))
+		last = now
+	}
+	c := r.dial(0, nil)
+	if _, err := c.open(t, b.clientPath, clientH); err != nil {
+		t.Fatal(err)
+	}
+	// cut reports a cut seen at this moment: the relay's fault if every gap
+	// between deliveries, this last one included, stayed under half the
+	// idle timeout, a stall of the host otherwise.
+	cut := func() (bool, int) {
+		gap()
+		if worst >= idle/2 {
+			t.Logf("traffic was held up for %v, half the %v idle timeout or more; starting over", worst, idle)
+			return false, delivered
+		}
+		t.Fatalf("the client was cut while every gap between deliveries stayed under %v", worst)
+		return false, delivered
+	}
+	// Traffic goes out every idle/10.
+	deadline := time.Now().Add(3 * idle)
+	for i := 0; time.Now().Before(deadline); i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := as.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: []byte("to a quiet client"), FailureReport: mode})
+		cancel()
+		if err != nil {
+			select {
+			case <-c.conn.Done():
+				return cut()
+			default:
+			}
+			t.Fatalf("Send = %v", err)
+		}
+		if i == stallAt {
+			time.Sleep(idle + idle/5)
+			// The relay wrote the message before it cut the client: read
+			// it only once the cut is seen, so that a select choosing
+			// between the two does not decide what the attempt checks.
+			waitDone(t, c.conn.Done(), "the quiet connection after the stall")
+			select {
+			case <-clientH.msgs:
+			default:
+				// It was dropped with the session before the handler ran.
+				return cut()
+			}
+			delivered++
+			gap()
+			continue
+		}
+		select {
+		case m := <-clientH.msgs:
+			if string(m.Body) != "to a quiet client" {
+				t.Fatalf("client got %q", m.Body)
+			}
+		case <-c.conn.Done():
+			return cut()
+		case <-time.After(5 * time.Second):
+			t.Fatal("no message arrived")
+		}
+		delivered++
+		gap()
+		time.Sleep(idle / 10)
+	}
+	select {
+	case <-c.conn.Done():
+		return cut()
+	default:
+	}
+	// Once nothing flows either way, the idle timeout applies.
+	waitDone(t, c.conn.Done(), "the idle connection")
+	eventually(t, "the idle close to be counted", func() bool { return r.metrics.count(mIdleClosed) == 1 })
+	return true, delivered
 }
 
 func TestConnectionWhoseLastBridgeEndedStaysForTheIdleTimeout(t *testing.T) {
