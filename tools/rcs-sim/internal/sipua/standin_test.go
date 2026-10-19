@@ -88,6 +88,8 @@ type standIn struct {
 	// the stand-in's 487.
 	onCancel func(inv *transaction.ServerTransaction)
 	acks     chan *sip.Request
+	// onSubscribe, when set, answers each SUBSCRIBE, as the notifier.
+	onSubscribe func(tx *transaction.ServerTransaction)
 	// closing is set as the test ends: a request it has already read may
 	// still be answered then, and fail to be, which is no fault.
 	closing atomic.Bool
@@ -146,6 +148,9 @@ func (s *standIn) Request(tx *transaction.ServerTransaction) {
 	switch {
 	case req.Method == "INVITE" && s.onInvite != nil:
 		s.onInvite(tx)
+		return
+	case req.Method == "SUBSCRIBE" && s.onSubscribe != nil:
+		s.onSubscribe(tx)
 		return
 	case req.Method == "CANCEL":
 		if res, err := sip.NewResponse(req, 200, "", "c1"); err == nil {

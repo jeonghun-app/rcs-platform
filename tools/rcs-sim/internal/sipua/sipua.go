@@ -232,6 +232,8 @@ type UA struct {
 	// the incoming INVITEs not yet answered, by their transaction.
 	dialogs map[string]*Dialog
 	calls   map[*transaction.ServerTransaction]*IncomingCall
+	// subs are the reg event subscriptions, by subscriptionKey.
+	subs map[string]*Subscription
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -273,6 +275,7 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		done:    make(chan struct{}),
 		dialogs: map[string]*Dialog{},
 		calls:   map[*transaction.ServerTransaction]*IncomingCall{},
+		subs:    map[string]*Subscription{},
 		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
@@ -897,6 +900,10 @@ type tu struct{ ua *UA }
 
 func (t tu) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
+	if s := t.ua.subscriptionOf(req); s != nil {
+		s.receive(tx)
+		return
+	}
 	if d := t.ua.dialogOf(req); d != nil {
 		d.receive(tx)
 		return
