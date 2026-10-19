@@ -240,6 +240,9 @@ type UA struct {
 	// invites are the INVITEs sent in the last 64*T1, by Call-ID and From
 	// tag, for 2xx that arrive after their transaction.
 	invites map[string]*invite
+	// byes counts the BYEs sent in the background to end dialogs nobody
+	// holds, so that a test can tell when none is left to come.
+	byes sync.WaitGroup
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
