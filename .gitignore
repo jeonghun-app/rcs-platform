@@ -7,3 +7,6 @@ coverage.*
 .env.*
 !.env.example
 .DS_Store
+# The local compose stack's secrets (scripts/compose-env.sh).
+/deploy/compose.env
+/deploy/compose.env.tmp.*

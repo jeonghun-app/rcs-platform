@@ -52,6 +52,16 @@ make fuzz      # 모든 파서의 퍼즈 테스트
 make vuln      # go mod verify + govulncheck
 ```
 
+docker compose로 플랫폼 전체를 로컬에서 실행할 수 있습니다. 서비스, DynamoDB
+Local, S3Mock, 고정된 `acs` 릴리스가 함께 뜹니다.
+[docs/local-stack.md](docs/local-stack.md)를 참고하세요.
+
+```bash
+make up            # 로컬 스택을 띄우고 모두 정상이 될 때까지 기다림
+make e2e-compose   # 클라이언트 시뮬레이터를 스택에 실행
+make down          # 스택을 멈추고 데이터를 지움
+```
+
 ## 로드맵
 
 1. 프로토콜 기반: 서비스 런타임, SIP 스택, SDP, Diameter, MSRP, CPIM/IMDN, Milenage

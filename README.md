@@ -54,6 +54,16 @@ make fuzz      # every parser's fuzz target
 make vuln      # go mod verify + govulncheck
 ```
 
+The whole platform runs locally with docker compose: the services, DynamoDB
+Local, S3Mock and the pinned `acs` release. See
+[docs/local-stack.md](docs/local-stack.md).
+
+```bash
+make up            # start the local stack and wait until it is healthy
+make e2e-compose   # the client simulator against it
+make down          # stop it and remove its data
+```
+
 ## Roadmap
 
 1. Protocol foundations: service runtime, SIP stack, SDP, Diameter, MSRP, CPIM/IMDN, Milenage
