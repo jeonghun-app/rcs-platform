@@ -733,7 +733,24 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		}
 	}
 
+	// The unconnected client's edge, looked up once: Bind removes it from
+	// pairs, and a later change of order should fail on a message here,
+	// not on a nil edge.
+	rig.relay.mu.Lock()
+	lateEdges := rig.relay.pairs[rpLate.SessionID]
+	rig.relay.mu.Unlock()
+	if len(lateEdges) == 0 {
+		t.Fatal("the relay has no edge for the unconnected client's session")
+	}
+	lateEdge := lateEdges[0]
+	held := func() int {
+		lateEdge.mu.Lock()
+		defer lateEdge.mu.Unlock()
+		return len(lateEdge.held)
+	}
+
 	// A stored message for a client that has not connected yet is held.
+	sendsStart := time.Now()
 	stored := make(chan error, 1)
 	go func() {
 		_, err := asLate.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("kept for you")})
@@ -747,30 +764,50 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		over <- err
 	}()
 	// The connected client gets its messages while the unconnected one's
-	// is still held: proved by order, not by a time bound, which a loaded
-	// host broke (#157). A relay that held other sessions up behind the
-	// unconnected one would deliver nothing here before that client came,
-	// and the wait would end at hangGuard.
-	held := func() int {
-		rig.relay.mu.Lock()
-		edge := rig.relay.pairs[rpLate.SessionID][0]
-		rig.relay.mu.Unlock()
-		edge.mu.Lock()
-		defer edge.mu.Unlock()
-		return len(edge.held)
-	}
-	waitProgress(t, "the message for the unconnected client to be held", func() bool { return held() > 0 }, func() int64 { return 0 }, nil)
-	for i := range 5 {
-		if _, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))}); err != nil {
-			t.Fatal(err)
+	// is still held: proved by order, not by a prompt bound, which a loaded
+	// host broke (#157). Each wait still ends at stallBound, far above any
+	// delivery a loaded host has shown, so a relay that stalls the shared
+	// rcs-as connection for seconds behind the unconnected client fails
+	// here, not only one that stalls it until the 30 s transaction timeout.
+	for held() == 0 {
+		if time.Since(sendsStart) > stallBound {
+			t.Fatalf("the message for the unconnected client was not held within %v", stallBound)
 		}
-		select {
-		case <-fastH.got:
-		case <-time.After(hangGuard):
-			t.Fatalf("message %d to the connected client never arrived", i)
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The relay refuses the push over the bound on the same shared
+	// connection. Messages go on until one has been sent after the refusal
+	// was seen, so a stall in the refusal path falls inside this loop too.
+	start := time.Now()
+	for i, afterRefusal := 0, false; i < 5 || !afterRefusal; i++ {
+		refused := overH.failures.Load() > 0
+		// The bound runs from the start of the send, which itself waits
+		// for the relay's answer.
+		bound := time.After(stallBound)
+		sent := make(chan error, 1)
+		go func() {
+			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))})
+			sent <- err
+		}()
+		for got, answered := false, false; !got || !answered; {
+			select {
+			case <-fastH.got:
+				got = true
+			case err := <-sent:
+				if err != nil {
+					t.Fatalf("message %d: %v", i, err)
+				}
+				answered = true
+			case <-bound:
+				t.Fatalf("message %d to the connected client: delivered %v, answered %v after %v", i, got, answered, stallBound)
+			}
 		}
 		if held() == 0 {
 			t.Fatalf("message %d arrived only after the unconnected client's message was released", i)
+		}
+		afterRefusal = refused
+		if !afterRefusal && time.Since(start) > hangGuard {
+			t.Fatalf("the push over the bound was not refused within %v", hangGuard)
 		}
 	}
 	if err := <-stored; err != nil {
