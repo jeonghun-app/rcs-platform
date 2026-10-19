@@ -284,3 +284,23 @@ metadata.
 The engine asks the group whether someone is still a participant before it
 invites them back to deliver a queued copy, and gives up the copies of
 anyone who left.
+
+## T12 — Authentication floods against one subscriber
+
+Every REGISTER without credentials costs the S-CSCF a MAR, and the HSS
+answers it under that subscriber's lock, updating the AKA sequence number. A
+distributed flood of REGISTERs for one (IMPI, IMPU) pair, from addresses
+the P-CSCF's per-source limits each let through, would starve the
+subscriber's own MAR; a forged AUTS, which anyone holding a challenge can
+send (`digest.SyncFailure`), would do the same through resynchronisation.
+
+**Control:** the registrar counts the MARs of each IMPI in a window shared by
+every `scscf` instance (DynamoDB atomic counter beside the challenges, with
+TTL) and over the limit answers 503 with Retry-After, without a MAR; at
+most one resynchronisation per IMPI per challenge lifetime reaches the HSS.
+Metrics `registrar.challenge_limited` and `registrar.resync_limited` carry no
+identifier. The subscriber's own UE gets the same 503 during the flood and
+registers once its window ends; the flood cannot reach the HSS.
+**Status:** implemented in `internal/scscf/registrar` (#201); wired to a
+listener with `cmd/scscf` (#14 PR F).
+

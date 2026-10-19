@@ -25,10 +25,22 @@ type Memory struct {
 	profiles      map[ProfileKey]*Profile
 	challenges    map[challengeKey]*Challenge
 	added         int
+	attempts      map[attemptKey]*attempt
+	counted       int
 	subscriptions map[string]*Subscription
 }
 
 type challengeKey struct{ impi, nonce string }
+
+type attemptKey struct {
+	impi, kind string
+	window     time.Time
+}
+
+type attempt struct {
+	n       int64
+	expires time.Time
+}
 
 var _ Store = (*Memory)(nil)
 
@@ -39,6 +51,7 @@ func NewMemory() *Memory {
 		registrations: map[string]*Registration{},
 		profiles:      map[ProfileKey]*Profile{},
 		challenges:    map[challengeKey]*Challenge{},
+		attempts:      map[attemptKey]*attempt{},
 		subscriptions: map[string]*Subscription{},
 	}
 }
@@ -209,6 +222,31 @@ func (m *Memory) DeleteProfile(_ context.Context, k ProfileKey) error {
 	defer m.mu.Unlock()
 	delete(m.profiles, k)
 	return nil
+}
+
+// CountAttempt implements Challenges. Every purgeEvery counts it forgets the
+// windows that have expired by the new one's start.
+func (m *Memory) CountAttempt(_ context.Context, impi, kind string, window, expires time.Time) (int64, error) {
+	if err := ValidAttempt(impi, kind, window, expires); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := attemptKey{impi, kind, window.UTC().Truncate(time.Second)}
+	a := m.attempts[k]
+	if a == nil {
+		a = &attempt{expires: expires}
+		m.attempts[k] = a
+	}
+	a.n++
+	if m.counted++; m.counted%purgeEvery == 0 {
+		for k, v := range m.attempts {
+			if !v.expires.After(window) {
+				delete(m.attempts, k)
+			}
+		}
+	}
+	return a.n, nil
 }
 
 // AddChallenge implements Challenges. Every purgeEvery challenges it forgets

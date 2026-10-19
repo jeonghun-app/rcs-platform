@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -511,7 +512,7 @@ func (c *Challenge) Validate() error {
 	if err := identity.ValidIMPI(c.IMPI); err != nil {
 		return fmt.Errorf("%w: challenge IMPI: %w", ErrInvalid, err)
 	}
-	if !KeyOK(c.Nonce, MaxNonce) || !textOK(c.IMPU) {
+	if !KeyOK(c.Nonce, MaxNonce) || !textOK(c.IMPU) || strings.HasPrefix(c.Nonce, ReservedNoncePrefix) {
 		return fmt.Errorf("%w: a challenge needs a nonce of 1 to %d bytes", ErrInvalid, MaxNonce)
 	}
 	if !validTime(c.Issued) || !c.Expires.After(c.Issued) || c.Expires.Sub(c.Issued) > MaxChallengeLifetime {
@@ -561,6 +562,38 @@ type Challenges interface {
 	// mean the challenge is unusable: the S-CSCF challenges again with a 401,
 	// rather than failing the REGISTER.
 	TakeChallenge(ctx context.Context, impi, nonce string, now time.Time) (*Challenge, error)
+	// CountAttempt adds one to impi's count of kind (AttemptChallenge,
+	// AttemptResync) for the window that starts at window, and returns the
+	// count after. Every instance counts into the same count, which is kept
+	// until expires. A resent request may count twice: that errs on the
+	// side of the limit.
+	CountAttempt(ctx context.Context, impi, kind string, window, expires time.Time) (int64, error)
+}
+
+// ReservedNoncePrefix starts no challenge's nonce: the backends keep their
+// attempt counts beside the challenges, under keys that start with it. Digest
+// and AKA nonces are base64, which never contains it.
+const ReservedNoncePrefix = "#"
+
+// The kinds of CountAttempt: the challenges the S-CSCF asks the HSS for (a
+// MAR each), and the resynchronisations among them.
+const (
+	AttemptChallenge = "challenge"
+	AttemptResync    = "resync"
+)
+
+// ValidAttempt checks CountAttempt's arguments; the backends apply it.
+func ValidAttempt(impi, kind string, window, expires time.Time) error {
+	if err := identity.ValidIMPI(impi); err != nil {
+		return fmt.Errorf("%w: attempt IMPI: %w", ErrInvalid, err)
+	}
+	if kind != AttemptChallenge && kind != AttemptResync {
+		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
+	}
+	if !validTime(window) || !expires.After(window) {
+		return fmt.Errorf("%w: an attempt window needs a start and a later expiry", ErrInvalid)
+	}
+	return nil
 }
 
 // Subscription is a subscription to the reg event package (RFC 3680) that the

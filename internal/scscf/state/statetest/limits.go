@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -583,5 +585,63 @@ func testDeleteProfileIf(t *testing.T, a, b state.Store, _ Options) {
 	}
 	if err := a.DeleteProfileIf(ctx(t), state.ProfileKey{IMPI: IMPI1}, T0); err != nil {
 		t.Errorf("deleting an impossible profile: %v", err)
+	}
+}
+
+// testAttemptCounts: every instance counts into one count per IMPI, kind and
+// window, and concurrent counts are all counted.
+func testAttemptCounts(t *testing.T, a, b state.Store, _ Options) {
+	w, exp := T0, T0.Add(2*time.Minute)
+	for i, s := range []state.Store{a, b, a} {
+		if n := must(s.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, exp))(t); n != int64(i+1) {
+			t.Fatalf("count %d, want %d", n, i+1)
+		}
+	}
+	// Another IMPI, kind or window counts apart.
+	for _, c := range []struct {
+		impi, kind string
+		window     time.Time
+	}{{IMPI2, state.AttemptChallenge, w}, {IMPI1, state.AttemptResync, w}, {IMPI1, state.AttemptChallenge, w.Add(time.Minute)}} {
+		if n := must(b.CountAttempt(ctx(t), c.impi, c.kind, c.window, c.window.Add(2*time.Minute)))(t); n != 1 {
+			t.Errorf("%+v counted %d, want a count of its own", c, n)
+		}
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		for _, s := range []state.Store{a, b} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := s.CountAttempt(ctx(t), IMPI1, state.AttemptResync, w, exp); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	if n := must(a.CountAttempt(ctx(t), IMPI1, state.AttemptResync, w, exp))(t); n != 18 {
+		t.Errorf("after 16 concurrent counts and 2 others: %d", n)
+	}
+	for _, bad := range []struct {
+		impi, kind string
+		exp        time.Time
+	}{{"not an impi", state.AttemptChallenge, exp}, {IMPI1, "other", exp}, {IMPI1, state.AttemptChallenge, w}} {
+		_, err := a.CountAttempt(ctx(t), bad.impi, bad.kind, w, bad.exp)
+		wantErr(t, err, state.ErrInvalid)
+	}
+}
+
+// testAttemptCountNotAChallenge: counts are kept beside the challenges, so no
+// challenge may have a nonce that names one, and taking one finds nothing
+// and leaves the count.
+func testAttemptCountNotAChallenge(t *testing.T, a, _ state.Store, _ Options) {
+	w := T0
+	must(a.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, w.Add(time.Minute)))(t)
+	wantErr(t, a.AddChallenge(ctx(t), Challenge(IMPI1, state.ReservedNoncePrefix+"x", time.Minute)), state.ErrInvalid)
+	nonce := state.ReservedNoncePrefix + "count#" + state.AttemptChallenge + "#" + strconv.FormatInt(w.Unix(), 10)
+	_, err := a.TakeChallenge(ctx(t), IMPI1, nonce, T0)
+	wantErr(t, err, state.ErrNotFound)
+	if n := must(a.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, w.Add(time.Minute)))(t); n != 2 {
+		t.Errorf("count %d after a take of it, want 2", n)
 	}
 }

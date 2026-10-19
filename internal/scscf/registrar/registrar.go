@@ -39,6 +39,8 @@ const (
 	DefaultMinExpires        = 5 * time.Minute
 	DefaultMaxExpires        = 2 * time.Hour
 	DefaultChallengeLifetime = 4 * time.Minute
+	DefaultChallengeLimit    = 10
+	DefaultChallengeWindow   = time.Minute
 )
 
 // Config configures a Registrar.
@@ -67,6 +69,13 @@ type Config struct {
 	// ChallengeLifetime is how long a 401's challenge can be answered; at most
 	// state.MaxChallengeLifetime.
 	ChallengeLifetime time.Duration
+	// ChallengeLimit bounds the challenges, each a MAR, that one IMPI gets
+	// in a ChallengeWindow, counted by every instance together; past it a
+	// REGISTER is answered 503 with Retry-After, without a MAR. A flood of
+	// REGISTERs for one subscriber, from anywhere, then cannot starve the
+	// subscriber's own MAR behind the HSS's lock on it (#201).
+	ChallengeLimit  int
+	ChallengeWindow time.Duration
 	// TrustIntegrityProtected lets a re-registration whose Authorization
 	// carries integrity-protected="tls-yes" go without a challenge (TS 24.229
 	// §5.4.1.2.1). Only for a P-CSCF that removes the parameter from what
@@ -120,6 +129,12 @@ func New(cfg Config) (*Registrar, error) {
 	}
 	if cfg.ChallengeLifetime == 0 {
 		cfg.ChallengeLifetime = DefaultChallengeLifetime
+	}
+	if cfg.ChallengeLimit <= 0 {
+		cfg.ChallengeLimit = DefaultChallengeLimit
+	}
+	if cfg.ChallengeWindow <= 0 {
+		cfg.ChallengeWindow = DefaultChallengeWindow
 	}
 	switch {
 	case cfg.MinExpires > cfg.MaxExpires || cfg.DefaultExpires < cfg.MinExpires || cfg.DefaultExpires > cfg.MaxExpires:

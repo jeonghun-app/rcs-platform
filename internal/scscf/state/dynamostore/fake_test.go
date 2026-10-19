@@ -217,6 +217,16 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 			}
 			return next
 		}
+	case "ADD #n :one SET #exp = :exp":
+		update = func(cur map[string]types.AttributeValue) map[string]types.AttributeValue {
+			next := maps.Clone(cur)
+			if next == nil {
+				next = maps.Clone(in.Key)
+			}
+			next[n["#n"]] = num(number(next[n["#n"]]) + number(v[":one"]))
+			next[n["#exp"]] = v[":exp"]
+			return next
+		}
 	case "SET #ttl = :until":
 		update = func(cur map[string]types.AttributeValue) map[string]types.AttributeValue {
 			next := maps.Clone(cur)
@@ -248,7 +258,7 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 	if err != nil {
 		return nil, err
 	}
-	if in.ReturnValues != types.ReturnValueAllNew {
+	if in.ReturnValues != types.ReturnValueAllNew && in.ReturnValues != types.ReturnValueUpdatedNew {
 		return &dynamodb.UpdateItemOutput{}, nil
 	}
 	return &dynamodb.UpdateItemOutput{Attributes: updated}, nil

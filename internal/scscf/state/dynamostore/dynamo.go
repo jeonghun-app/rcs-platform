@@ -52,7 +52,9 @@ const (
 	attrExpires = "expires"
 	attrCSeq    = "cseq"
 	attrRver    = "rver"
-	attrNToken  = "ntoken"
+	// attrCount is an attempt count (state.Challenges.CountAttempt).
+	attrCount  = "n"
+	attrNToken = "ntoken"
 	// attrReceived orders profiles: when the SAA or PPR arrived, Unix ns.
 	attrReceived = "received"
 	// attrTTL is the registrations table's TTL attribute, on profiles only:

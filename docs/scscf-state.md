@@ -11,7 +11,7 @@ them.
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
 | `registrations` | `pk` (S): canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only; TTL on `ttl` | the bindings of each IMPU, the records of unregistered users, and the User-Data of each implicit registration set |
-| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed |
+| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions and their NOTIFY counters |
 
 Data at rest: registration items hold Contact URIs (device addresses),
@@ -63,6 +63,13 @@ additionally sealed (below).
   found, whether or not DynamoDB has removed it yet. Registrations have no `ttl`: only a sweep, which sends the SAR, may
   remove one, so the infrastructure must enable TTL on `ttl`, never on
   `expires`.
+- **Challenges are limited per IMPI.** Before each MAR the registrar adds one
+  to the IMPI's count for the current window (default 10 per minute,
+  `ChallengeLimit`, `ChallengeWindow`), and over the limit answers 503 with
+  Retry-After without asking the HSS; at most one resynchronisation per IMPI
+  per challenge lifetime reaches it. Every instance counts into the same
+  item, beside the IMPI's challenges, which the table's TTL removes. No nonce
+  starts with `#`, so no client can take a count as a challenge (#201).
 - **A permanent SAR failure ends the deregistration.** The sweep's handler
   returns an error only for failures that may pass (the HSS unreachable, a
   busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
@@ -106,8 +113,9 @@ maximum), so 3 RRU per terminating request, $0.4 per million at the same
 prices. With 1 M users of two IMPUs re-registering every 600 s that is about
 8.6 G saves and 30 G write request units a month, some $20k at ap-northeast-2
 on-demand prices (October 2026); 3600 s registrations cost a sixth of that.
-Authentication adds a put and a conditional delete per challenge. Sweeps read
-each expiring item once.
+Authentication adds a put and a conditional delete per challenge, and one
+update of the IMPI's count before each MAR. Sweeps read each expiring item
+once.
 
 `expiry-index` is spread over 16 shards, which carry about 8000 saves per
 second, some 4.8 M IMPUs at 600 s re-registrations. The shard of an item is
