@@ -303,6 +303,9 @@ func TestAttributesNeverCarryTheRawValueIntoALogLine(t *testing.T) {
 		Identity("impi", testIMSI+"@"+testDomain),
 	)
 	line := buf.String()
+	if strings.Contains(line, `"time"`) {
+		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", line)
+	}
 	for _, raw := range []string{testMSISDN, testIMSI, "15550100001"} {
 		if strings.Contains(line, raw) {
 			t.Fatalf("log line contains %q: %s", raw, line)
