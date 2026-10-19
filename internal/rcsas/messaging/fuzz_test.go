@@ -19,6 +19,13 @@ func FuzzParseConversationHeaders(f *testing.F) {
 				t.Fatalf("accepted %q", v)
 			}
 		}
+		if c == (Conversation{}) {
+			// Only a request without any of the headers has none.
+			if strings.Trim(conv+contrib+reply, " \t") != "" {
+				t.Fatalf("%q, %q, %q gave no conversation", conv, contrib, reply)
+			}
+			return
+		}
 		if c.ID == "" || c.Contribution == "" {
 			t.Fatalf("accepted %+v", c)
 		}
