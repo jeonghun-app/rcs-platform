@@ -234,7 +234,34 @@ func TestATargetTimeoutEndsItsBranchInTimeForAnotherTarget(t *testing.T) {
 	}
 }
 
-func TestATargetTimeoutCancelsAnInviteBranchThatIsRinging(t *testing.T) {
+// TestATargetTimeoutEndsARingingInviteBranchAtOnce: the branch is cancelled
+// and counts as a 408 when the timeout passes, without waiting for the 487,
+// so a replacement starts at once; the late 487 is absorbed.
+func TestATargetTimeoutEndsARingingInviteBranchAtOnce(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{
+		Targets: []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: 2 * time.Second}},
+		OnBranchFailure: func(_ context.Context, f BranchFailure) []Target {
+			if f.Target.URI.User == "as" && errors.Is(f.Err, errTargetTimeout) {
+				return []Target{target("sip:bob@192.0.2.30")}
+			}
+			return nil
+		},
+	})
+	h.receive(invite(t))
+	as := h.one()
+	h.reply(as, 100)
+	h.advance(2 * time.Second)
+	sent := h.sent()
+	check(t, "sent at the timeout", methodsOf(sent), []string{"CANCEL sip:as@192.0.2.40", "INVITE sip:bob@192.0.2.30"})
+	h.reply(as, 487)
+	// Only the server transaction's own 100 Trying, at 200 ms.
+	check(t, "upstream after the late 487", h.upstream(), codes(100))
+	h.reply(byURI(t, sent, "INVITE", "sip:bob@192.0.2.30"), 200)
+	check(t, "upstream", h.upstream(), codes(200))
+}
+
+func TestATargetTimeoutWithoutReplacementAnswersAnInvite408(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.decide(Decision{Targets: []Target{{URI: mustURI("sip:bob@192.0.2.30"), Timeout: 5 * time.Second}}})
 	h.receive(invite(t))
@@ -242,8 +269,125 @@ func TestATargetTimeoutCancelsAnInviteBranchThatIsRinging(t *testing.T) {
 	h.reply(b, 180)
 	h.advance(5 * time.Second)
 	check(t, "sent", h.sentMethods(), []string{"CANCEL sip:bob@192.0.2.30"})
-	h.reply(b, 487)
-	check(t, "upstream", h.upstream(), codes(180, 487))
+	check(t, "upstream", h.upstream(), codes(180, 408))
+	// Its CANCEL unanswered, the transaction still ends at 64*T1.
+	h.advance(64 * t1)
+	if clients, _ := h.p.Layer().Len(); clients != 0 {
+		t.Errorf("%d client transactions left", clients)
+	}
+}
+
+func TestATargetTimeoutOnANonInviteIsAnswered504ThroughOnFinal(t *testing.T) {
+	h := newHarness(t, Config{})
+	var seen []int
+	h.decide(Decision{
+		Targets: []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: 2 * time.Second}},
+		OnFinal: func(_ context.Context, res *sip.Response) { seen = append(seen, res.StatusCode) },
+	})
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+	h.one()
+	h.advance(2 * time.Second)
+	check(t, "upstream", h.upstream(), codes(504))
+	check(t, "OnFinal saw", seen, codes(504))
+	if n := h.p.Stats().Silenced; n != 0 {
+		t.Errorf("Silenced = %d", n)
+	}
+}
+
+func TestTheByteBudgetIsHeldWhileA2xxCanStillBeRetransmitted(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.receive(withBody(t, "INVITE", "sip:bob@example.com", strings.Repeat("x", 4096)))
+	h.reply(h.one(), 200)
+	if n := h.p.Stats().Contexts; n != 0 {
+		t.Fatalf("Contexts = %d", n)
+	}
+	if n := h.p.Stats().ContextBytes; n < 4096 {
+		t.Errorf("ContextBytes = %d right after the 2xx; the transactions still hold the body", n)
+	}
+	h.advance(64 * t1)
+	if n := h.p.Stats().ContextBytes; n != 0 {
+		t.Errorf("ContextBytes = %d after 64*T1", n)
+	}
+}
+
+func TestOnResponseSeesTheChosenFinalOfAFork(t *testing.T) {
+	h := newHarness(t, Config{})
+	var seen []int
+	h.decide(Decision{
+		Targets:    []Target{target("sip:a@192.0.2.1"), target("sip:b@192.0.2.2")},
+		OnResponse: func(_ context.Context, res *sip.Response) { seen = append(seen, res.StatusCode) },
+	})
+	h.receive(request(t, "REGISTER", "sip:example.com"))
+	sent := h.sent()
+	h.reply(byURI(t, sent, "REGISTER", "sip:a@192.0.2.1"), 401, `WWW-Authenticate: Digest realm="example.com", nonce="n"`)
+	h.reply(byURI(t, sent, "REGISTER", "sip:b@192.0.2.2"), 404)
+	check(t, "OnResponse saw", seen, codes(401))
+	check(t, "upstream", h.upstream(), codes(401))
+}
+
+func TestAServiceThatReturnsAfterACancelWithoutAnsweringGets487(t *testing.T) {
+	h := newHarness(t, Config{})
+	inv := invite(t)
+	s := serve(t, h, inv)
+	h.p.Receive(inboundFrom(uacCancel(t, inv), "up"))
+	s.release()
+	h.settle()
+	check(t, "upstream", labels(h.upstreamResponses()), []string{"200 CANCEL", "487 INVITE"})
+}
+
+func Test2xxRetransmissionsQueuedForASlowUpstreamAreBounded(t *testing.T) {
+	net := &stalledUp{fakeNet: &fakeNet{}, block: make(chan struct{})}
+	p, err := New(net, Config{Self: []sip.URI{selfURI}, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(net.block)
+		}
+		p.Close()
+	}()
+	p.Receive(inboundFrom(invite(t), "up"))
+	var a *sip.Request
+	for a == nil {
+		net.mu.Lock()
+		if len(net.requests) > 0 {
+			a = net.requests[0].req
+		}
+		net.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	var c *respContext
+	p.mu.Lock()
+	for _, x := range p.contexts {
+		c = x
+	}
+	p.mu.Unlock()
+	wire, err := responseTo(t, a, 200).Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2000 {
+		m, err := sip.ParseMessage(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Receive(inboundFrom(m, "down"))
+	}
+	c.up.mu.Lock()
+	queued := len(c.up.queue)
+	c.up.mu.Unlock()
+	// The first 2xx, at most 16 retransmissions and the context's release.
+	if queued > maxQueuedProvisionals+2 {
+		t.Errorf("%d responses queued for one slow upstream transaction", queued)
+	}
+	if p.Stats().RetransmissionsDropped == 0 {
+		t.Error("no retransmission was counted as dropped")
+	}
+	close(net.block)
+	released = true
+	p.wait()
 }
 
 // A CANCEL that arrives while Prepare runs is answered 200; the INVITE must

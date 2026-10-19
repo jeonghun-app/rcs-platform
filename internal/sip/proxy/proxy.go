@@ -400,10 +400,12 @@ func (p *Proxy) newContext(tx *transaction.ServerTransaction) *respContext {
 	return c
 }
 
-// release ends a context. With linger, a 2xx went upstream, whose
-// retransmissions keep arriving for 64*T1 (Timer M of the client transaction,
-// RFC 6026 §7.2) and go through OnResponse, so the hooks' context lives that
-// long; the context's slot and bytes come back at once either way.
+// release ends a context; its slot comes back at once. With linger, a 2xx went
+// upstream, whose retransmissions keep arriving for 64*T1 (Timer M of the
+// client transaction, RFC 6026 §7.2) and go through OnResponse, or a branch
+// still waits for the answer to its CANCEL, up to 64*T1: the hooks' context
+// lives that long, and so does the budget the context's bytes take, because
+// the transactions keep the request until then.
 func (p *Proxy) release(c *respContext, linger bool) {
 	p.mu.Lock()
 	delete(p.contexts, c.tx)
@@ -412,12 +414,15 @@ func (p *Proxy) release(c *respContext, linger bool) {
 	n := c.reserved
 	c.reserved = 0
 	c.mu.Unlock()
-	p.bytes.Add(-n)
 	c.cancelReq()
 	if linger {
-		p.clock.AfterFunc(64*p.t1, c.cancelCtx)
+		p.clock.AfterFunc(64*p.t1, func() {
+			p.bytes.Add(-n)
+			c.cancelCtx()
+		})
 		return
 	}
+	p.bytes.Add(-n)
 	c.cancelCtx()
 }
 
@@ -499,17 +504,20 @@ type Stats struct {
 	Loops               uint64 // requests answered 482 (RFC 3261 §16.3 step 4)
 	Silenced            uint64 // non-INVITE requests left unanswered instead of 408 (RFC 4320 §4.2)
 	ProvisionalsDropped uint64 // provisional responses dropped for a slow upstream peer
-	StrayResponses      uint64 // responses matching no transaction, dropped (RFC 6026 §7.3)
-	ACKsForwarded       uint64 // ACKs for 2xx forwarded statelessly
-	ACKsConsumed        uint64 // ACKs for a 2xx a Serve handler sent, delivered to it
-	ACKsMissing         uint64 // 2xx a Serve handler sent whose ACK never came
-	ACKsDropped         uint64 // ACKs that could not be forwarded
-	UpstreamErrors      uint64 // responses the upstream transaction could not send, dropped (§16.9)
+	// 2xx retransmissions dropped for a slow upstream peer; the UAS sends them
+	// again until the ACK.
+	RetransmissionsDropped uint64
+	StrayResponses         uint64 // responses matching no transaction, dropped (RFC 6026 §7.3)
+	ACKsForwarded          uint64 // ACKs for 2xx forwarded statelessly
+	ACKsConsumed           uint64 // ACKs for a 2xx a Serve handler sent, delivered to it
+	ACKsMissing            uint64 // 2xx a Serve handler sent whose ACK never came
+	ACKsDropped            uint64 // ACKs that could not be forwarded
+	UpstreamErrors         uint64 // responses the upstream transaction could not send, dropped (§16.9)
 }
 
 type counters struct {
 	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
-	provisionalsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
+	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
 	upstreamErrors atomic.Uint64
 }
 
@@ -520,22 +528,23 @@ func (p *Proxy) Stats() Stats {
 	p.mu.Unlock()
 	s := &p.stats
 	return Stats{
-		Contexts:            n,
-		ContextBytes:        p.bytes.Load(),
-		Branches:            s.branches.Load(),
-		TargetsDropped:      s.targetsDropped.Load(),
-		Cancels:             s.cancels.Load(),
-		TimerC:              s.timerC.Load(),
-		TargetTimeouts:      s.targetTimeouts.Load(),
-		Overloaded:          s.overloaded.Load(),
-		Loops:               s.loops.Load(),
-		Silenced:            s.silenced.Load(),
-		ProvisionalsDropped: s.provisionalsDropped.Load(),
-		StrayResponses:      s.strayResponses.Load(),
-		ACKsForwarded:       s.acksForwarded.Load(),
-		ACKsConsumed:        s.acksConsumed.Load(),
-		ACKsMissing:         s.acksMissing.Load(),
-		ACKsDropped:         s.acksDropped.Load(),
-		UpstreamErrors:      s.upstreamErrors.Load(),
+		Contexts:               n,
+		ContextBytes:           p.bytes.Load(),
+		Branches:               s.branches.Load(),
+		TargetsDropped:         s.targetsDropped.Load(),
+		Cancels:                s.cancels.Load(),
+		TimerC:                 s.timerC.Load(),
+		TargetTimeouts:         s.targetTimeouts.Load(),
+		Overloaded:             s.overloaded.Load(),
+		Loops:                  s.loops.Load(),
+		Silenced:               s.silenced.Load(),
+		ProvisionalsDropped:    s.provisionalsDropped.Load(),
+		RetransmissionsDropped: s.retransmissionsDropped.Load(),
+		StrayResponses:         s.strayResponses.Load(),
+		ACKsForwarded:          s.acksForwarded.Load(),
+		ACKsConsumed:           s.acksConsumed.Load(),
+		ACKsMissing:            s.acksMissing.Load(),
+		ACKsDropped:            s.acksDropped.Load(),
+		UpstreamErrors:         s.upstreamErrors.Load(),
 	}
 }

@@ -155,11 +155,14 @@ type Target struct {
 	// pcscf sends a terminating request over the client's flow.
 	Destination *transport.Destination
 	// Timeout, if set, bounds the branch: when it passes without a final
-	// response an INVITE branch with a provisional one is cancelled, and any
-	// other branch ends at once as a 408, so that OnBranchFailure or the next
-	// fork group can still answer in time. scscf applies an application
-	// server's default handling this way when the server does not answer (TS
-	// 24.229 §5.4.3.2).
+	// response the branch ends at once as a 408, so that OnBranchFailure or
+	// the next fork group can still answer in time. An INVITE branch that has
+	// a provisional response is cancelled as well, and its transaction left to
+	// take the 487 (a 2xx from it is still forwarded). scscf applies an
+	// application server's default handling this way when the server does not
+	// answer (TS 24.229 §5.4.3.2). A non-INVITE request that ends on such a
+	// timeout is answered 504, which OnFinal may change: unlike a 408 after
+	// Timer F (RFC 4320 §4.2) it reaches the client in time.
 	Timeout time.Duration
 }
 

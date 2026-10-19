@@ -89,14 +89,22 @@ func (u *UAS) Respond(res *sip.Response) error {
 		u.answered = true
 	}
 	u.mu.Unlock()
+	accept := final && u.c.invite && res.StatusCode < 300
+	if accept {
+		// Waiting for the ACK before the 2xx leaves, so an ACK that comes
+		// back at once is not taken for one to forward.
+		u.retransmit(res)
+	}
 	if err := u.tx.Respond(res); err != nil {
+		if accept {
+			u.end()
+		}
 		return err
 	}
-	if final && u.c.invite && res.StatusCode < 300 {
+	if accept {
 		u.mu.Lock()
 		u.accepted = true
 		u.mu.Unlock()
-		u.retransmit(res)
 	}
 	return nil
 }

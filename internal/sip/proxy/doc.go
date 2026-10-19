@@ -52,8 +52,10 @@
 // downstream run on a goroutine per request or branch, and the responses of a
 // request go upstream in order on a goroutine of their own, so a peer that is
 // slow to take what it is sent delays only the messages addressed to it; while
-// it is, at most 16 provisional responses of a request wait for it, and later
-// ones are dropped and counted (finals and 2xx never are). The exceptions are
+// it is, at most 16 provisional responses or 2xx retransmissions of a request
+// wait for it, and later ones are dropped and counted (the first 2xx of a
+// branch and the final response never are; the UAS resends a 2xx until its
+// ACK). The exceptions are
 // the 503 sent at MaxContexts and the answers to a CANCEL: they go back to the
 // peer the request just came from and wait only if that peer has stopped
 // reading, for at most the transport's WriteTimeout.
@@ -66,7 +68,9 @@
 //	body + (2 + 2 × branches) × header + branches × response
 //
 // per context. MaxContextBytes bounds the request part over all contexts
-// together; the responses are bounded by MaxBranches and the transport's
+// together, and keeps it charged for 64*T1 after a 2xx, or while a branch's
+// CANCEL waits for an answer, since the transactions hold the request that
+// long; the responses are bounded by MaxBranches and the transport's
 // message limits. A context lives until every branch has ended. Timer C ends
 // a silent INVITE branch; one that receives a provisional response at least
 // every TimerC keeps its context, as ringing does, and holds a MaxContexts

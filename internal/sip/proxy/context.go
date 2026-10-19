@@ -73,6 +73,9 @@ type respContext struct {
 	// forwarded2xx records that a 2xx went upstream, whose retransmissions
 	// keep coming for 64*T1.
 	forwarded2xx bool
+	// abandoned records a branch ended at its Target.Timeout while its
+	// transaction still waits for the answer to its CANCEL.
+	abandoned bool
 	// finals are the final responses kept for choosing the best (§16.7 step 4).
 	finals []final
 	done   bool
@@ -87,6 +90,8 @@ type final struct {
 	overload bool
 	// made marks a response the proxy made up rather than received.
 	made bool
+	// timeout marks the 408 of a branch whose Target.Timeout passed.
+	timeout bool
 }
 
 type cancelState int
@@ -117,6 +122,8 @@ type branch struct {
 	timerCGen    int
 	cancelTimer  transaction.Timer
 	timeoutTimer transaction.Timer
+	// timedOut records that Target.Timeout ended the branch.
+	timedOut bool
 }
 
 func newRespContext(p *Proxy, tx *transaction.ServerTransaction, cost, header int64) *respContext {
@@ -289,7 +296,7 @@ func (c *respContext) progress() []func() {
 	c.done = true
 	// The context is released only once the responses queued before it have
 	// gone, so OnResponse never sees a cancelled context for them.
-	linger := c.forwarded2xx
+	linger := c.forwarded2xx || c.abandoned
 	return append(acts, func() { c.up.do(func() { c.p.release(c, linger) }) })
 }
 
@@ -550,6 +557,9 @@ func (b *branch) failed(err error) []func() {
 	timedOut := errors.Is(err, transaction.ErrTerminated) || errors.Is(err, transaction.ErrTimeout)
 	var f final
 	switch {
+	case timedOut && b.timedOut:
+		f = c.timeoutFinal()
+		err = errTargetTimeout
 	case timedOut && b.cancel != cancelNone:
 		// A branch being cancelled that ends without a final response, its
 		// CANCEL unanswered for 64*T1 (§9.1) or its timers expired, counts
@@ -565,11 +575,27 @@ func (b *branch) failed(err error) []func() {
 	return c.branchEnded(b, f, err)
 }
 
+// timeoutFinal is what a branch ended by its Target.Timeout counts as. mu must
+// be held.
+func (c *respContext) timeoutFinal() final {
+	f := c.made(408)
+	f.timeout = true
+	return f
+}
+
+// errTargetTimeout is the BranchFailure.Err of a branch its Target.Timeout
+// ended.
+var errTargetTimeout = errors.New("proxy: the target's timeout passed")
+
 // received handles a response on the branch (§16.7 steps 2 to 10). mu must be
 // held.
 func (b *branch) received(res *sip.Response) []func() {
 	c := b.c
 	code := res.StatusCode
+	if code >= 200 && b.cancelTimer != nil {
+		// The INVITE is answered, so its CANCEL needs no deadline.
+		b.cancelTimer.Stop()
+	}
 	// §16.7 step 3: the top Via is the proxy's own.
 	if err := res.Header.RemoveFirstElement("Via"); err != nil || !res.Header.Has("Via") {
 		// A response must carry every Via of its request (§8.2.6.2). One
@@ -589,7 +615,7 @@ func (b *branch) received(res *sip.Response) []func() {
 		// from further forks downstream reach here, and every 2xx to an INVITE
 		// is forwarded (§16.7 step 5).
 		if c.invite && code >= 200 && code < 300 {
-			return []func(){c.forward(res)}
+			return []func(){c.forwardRetransmission(res)}
 		}
 		return nil
 	}
@@ -663,10 +689,13 @@ func (c *respContext) branchEnded(b *branch, f final, err error) []func() {
 	}}
 }
 
-// end marks the branch finished and stops its timers. mu must be held.
+// end marks the branch finished and stops its timers. The CANCEL's deadline
+// keeps running: a branch its Target.Timeout ended may still wait for the
+// answer to its CANCEL, and the deadline ends its transaction (received stops
+// it when the INVITE is answered).
 func (b *branch) end() {
 	b.final = true
-	for _, t := range []transaction.Timer{b.timerC, b.cancelTimer, b.timeoutTimer} {
+	for _, t := range []transaction.Timer{b.timerC, b.timeoutTimer} {
 		if t != nil {
 			t.Stop()
 		}
@@ -734,7 +763,8 @@ func (b *branch) sendCancel() []func() {
 }
 
 // terminate ends the branch's transaction from a timer; its handler then
-// records what the branch counts as.
+// records what the branch counts as, unless the branch has ended already. A
+// transaction that has ended is not affected.
 func (b *branch) terminate() {
 	c := b.c
 	if c.p.isClosed() {
@@ -742,16 +772,18 @@ func (b *branch) terminate() {
 	}
 	c.mu.Lock()
 	tx := b.tx
-	live := !b.final && tx != nil
 	c.mu.Unlock()
-	if live {
+	if tx != nil {
 		tx.Terminate()
 	}
 }
 
-// armTimeout starts the target's own timer (Target.Timeout). When it fires an
-// INVITE branch that has a provisional response is cancelled, and any other
-// branch ends at once, counting as a 408. mu must be held.
+// armTimeout starts the target's own timer (Target.Timeout). When it fires the
+// branch ends at once, counting as a 408, so a replacement can start without
+// waiting: an INVITE branch that has a provisional response is cancelled and
+// its transaction left to absorb the 487 (a 2xx from it is still forwarded,
+// §16.7 step 5), and any other branch's transaction is terminated. mu must be
+// held.
 func (b *branch) armTimeout() {
 	c, p := b.c, b.c.p
 	b.timeoutTimer = p.clock.AfterFunc(b.target.Timeout, func() {
@@ -764,11 +796,15 @@ func (b *branch) armTimeout() {
 			return
 		}
 		p.stats.targetTimeouts.Add(1)
+		b.timedOut = true
 		if c.invite && b.provisional {
 			var acts []func()
 			if b.cancel != cancelSent && b.tx != nil {
 				acts = b.sendCancel()
 			}
+			c.abandoned = true
+			acts = append(acts, c.branchEnded(b, c.timeoutFinal(), errTargetTimeout)...)
+			acts = append(acts, c.progress()...)
 			c.mu.Unlock()
 			runAll(acts)
 			return
@@ -833,7 +869,16 @@ func (c *respContext) stopTimers() {
 // forward queues res for the upstream transaction (§16.7 step 9). mu must be
 // held; the returned action does the queueing, so responses keep the order in
 // which they were decided.
-func (c *respContext) forward(res *sip.Response) func() {
+func (c *respContext) forward(res *sip.Response) func() { return c.forwardAs(res, false) }
+
+// forwardRetransmission queues a 2xx that came after its branch's final
+// response: a retransmission, or a 2xx from a fork further downstream. Like a
+// provisional response it is dropped when the upstream peer is not taking
+// responses: the UAS retransmits it until the ACK (RFC 6026 §8.1). mu must be
+// held.
+func (c *respContext) forwardRetransmission(res *sip.Response) func() { return c.forwardAs(res, true) }
+
+func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 	hook := c.dec.OnResponse
 	code := res.StatusCode
 	if c.invite && code >= 200 && code < 300 {
@@ -849,10 +894,17 @@ func (c *respContext) forward(res *sip.Response) func() {
 			c.p.stats.upstreamErrors.Add(1)
 		}
 	}
-	if code < 200 {
+	switch {
+	case code < 200:
 		return func() {
 			if !c.up.doUnlessBacklogged(send, maxQueuedProvisionals) {
 				c.p.stats.provisionalsDropped.Add(1)
+			}
+		}
+	case again:
+		return func() {
+			if !c.up.doUnlessBacklogged(send, maxQueuedProvisionals) {
+				c.p.stats.retransmissionsDropped.Add(1)
 			}
 		}
 	}
@@ -868,10 +920,17 @@ func (c *respContext) sendBest() []func() {
 		return nil
 	}
 	if !c.invite && f.made && f.res.StatusCode == 408 {
-		// RFC 4320 §4.2: a 408 to a non-INVITE request always comes after
-		// the client has given up, so none is sent. The transaction still has
-		// to end, so it gets a 408 the proxy's sender never sends.
-		return []func(){func() { c.up.do(func() { c.p.silence(c.tx, f.res) }) }}
+		if !f.timeout {
+			// RFC 4320 §4.2: a 408 to a non-INVITE request that timed out
+			// comes after the client has given up, so none is sent. The
+			// transaction still has to end, so it gets a 408 the proxy's
+			// sender never sends.
+			return []func(){func() { c.up.do(func() { c.p.silence(c.tx, f.res) }) }}
+		}
+		// A Target.Timeout ended the request well before the client's Timer
+		// F, so it is answered, with 504 rather than the 408 RFC 4320 §4.2
+		// forbids, and OnFinal may change that.
+		f.res.StatusCode, f.res.Reason = 504, sip.DefaultReason(504)
 	}
 	res := f.res
 	onFinal := c.dec.OnFinal
@@ -934,7 +993,7 @@ func (c *respContext) best() final {
 			}
 		}
 	}
-	return final{res: res, overload: chosen.overload, made: chosen.made}
+	return final{res: res, overload: chosen.overload, made: chosen.made, timeout: chosen.timeout}
 }
 
 // better reports whether a is a better final response than b (§16.7 step 6): any
