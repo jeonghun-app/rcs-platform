@@ -51,11 +51,18 @@ var (
 // Message.ShareKey: a 1-to-1 notification counts toward the queue only,
 // since what one notifier may put in a queue is already bounded by the
 // messages the queue's owner sent it, each answered once per kind.
+//
+// GroupCount and GroupBytes bound all group notifications in a queue
+// together (Message.InGroupTotal), whichever group they come from: each
+// group's have a share of their own, and without a total, an author in
+// enough groups would have its queue filled by receipts alone.
 type Limit struct {
 	Count       int
 	Bytes       int64
 	SenderCount int
 	SenderBytes int64
+	GroupCount  int
+	GroupBytes  int64
 }
 
 // Mode is how a message was sent, which decides how it may be delivered.
@@ -127,11 +134,16 @@ type Message struct {
 	LeaseUntil time.Time
 }
 
-// GroupNotifications prefixes the share of a queue that notifications
-// about one group's messages count against, whichever participant sends
-// them: the share is GroupNotifications followed by the group's conference
-// URI. It is not an identity, which is a URI.
-const GroupNotifications = "#group-notifications "
+// GroupNotifications names the total of all group notifications in a
+// queue (Limit.GroupCount), and followed by a space and a group's
+// conference URI, the share of a queue that notifications about that
+// group's messages count against, whichever participant sends them.
+// Neither is an identity, which is a URI.
+const GroupNotifications = "#group-notifications"
+
+// InGroupTotal reports whether m counts toward the total of a queue's
+// group notifications, GroupNotifications: it is a group notification.
+func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification }
 
 // ShareKey returns whose share of the recipient's queue m counts against,
 // and false when it counts against none:
@@ -150,7 +162,7 @@ const GroupNotifications = "#group-notifications "
 func (m Message) ShareKey() (string, bool) {
 	switch {
 	case m.Mode == Group && m.Notification:
-		return GroupNotifications + m.Sender, true
+		return GroupNotifications + " " + m.Sender, true
 	case m.Mode == Group && m.Author != "":
 		return m.Author, true
 	case !m.Notification:
@@ -217,7 +229,7 @@ type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
 	// beyond l, ErrSenderShareFull if what counts against m's share
-	// (Message.ShareKey) would.
+	// (Message.ShareKey), or the total of group notifications for one, would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID

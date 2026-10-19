@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -190,5 +191,56 @@ func TestGroupIsComposingIsBoundedAndReadsTheGroupOnlyForSomeone(t *testing.T) {
 	b.next(t)
 	if r.m.get("iscomposing.dropped") < int64(2*IsComposingRate.Burst) {
 		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// everyGroup is members of any group URI: the same people in each.
+type everyGroup struct{ members }
+
+func (h everyGroup) Recipients(ctx context.Context, _, sender string, kind GroupKind) (Audience, error) {
+	return h.members.Recipients(ctx, groupURI, sender, kind)
+}
+
+func (h everyGroup) Member(ctx context.Context, _, user string) (bool, error) {
+	return h.members.Member(ctx, groupURI, user)
+}
+
+// The reviews' reproduction (PR #118, round 3): with a share per group, an
+// offline author of one message in each of nine full groups had its queue
+// filled by receipts, and a 1-to-1 message to it was refused. All groups'
+// notifications together now hold at most a quarter of the queue.
+func TestReceiptsFromManyGroupsDoNotFillTheAuthorsQueue(t *testing.T) {
+	everyone := []string{alice}
+	for i := range 99 {
+		everyone = append(everyone, fmt.Sprintf("sip:u%d@example.net", i))
+	}
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(everyGroup{members{all: everyone}})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	for g := range 9 {
+		o := GroupOrigin{Group: fmt.Sprintf("sip:chat-%d@conf.example.net", g), Sender: alice, Conversation: conv,
+			CPIM: chat(t, fmt.Sprint("g", g), "hi all", imdn.PositiveDelivery|imdn.Display)}
+		if err := r.e.SubmitGroup(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range everyone[1:] {
+			for _, k := range []struct {
+				kind   imdn.Kind
+				status imdn.Status
+			}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
+				n := GroupOrigin{Group: o.Group, Sender: p, Conversation: conv, CPIM: receipt(t, fmt.Sprint("g", g), k.kind, k.status)}
+				if err := r.e.SubmitGroup(t.Context(), n); err != nil {
+					t.Fatalf("%s's receipt: %v", p, err)
+				}
+			}
+		}
+	}
+	l := queueLimit(r.e.cfg)
+	if got := r.store.(*store.Memory).Len(alice); got != l.GroupCount || got != 250 {
+		t.Fatalf("%d receipts queued for alice, the total is %d", got, l.GroupCount)
+	}
+	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
+		t.Fatalf("a 1-to-1 message to alice: %v", err)
 	}
 }

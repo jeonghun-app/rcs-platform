@@ -296,6 +296,36 @@ func TestASizeThatDriftedIsCorrectedWhenItRefuses(t *testing.T) {
 	}
 }
 
+// The total of group notifications drifts like any size, and a refusal
+// for it corrects it the same way.
+func TestADriftedGroupNotificationTotalIsCorrected(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 10, SenderCount: 10, GroupCount: 2}
+	notice := func(id, group string) store.Message {
+		return store.Message{Recipient: "r", ID: id, Sender: group, Author: "sip:p@example.net", Mode: store.Group, Notification: true,
+			CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	for _, id := range []string{"1", "2"} {
+		if err := s.Enqueue(ctx, notice(id, "sip:g"+id), l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delete(f.rows, "q#1#r\x001") // the TTL took it
+	if err := s.Enqueue(ctx, notice("3", "sip:g3"), l); err != nil {
+		t.Fatalf("Enqueue after drift = %v", err)
+	}
+	key := "c#1#r\x00s#" + fmt.Sprint(len(store.GroupNotifications)) + "#" + store.GroupNotifications
+	if got := nOf(f.rows[key][attrCount]); got != 2 {
+		t.Fatalf("total %d", got)
+	}
+	// Really full, it stays refused.
+	if err := s.Enqueue(ctx, notice("4", "sip:g4"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond the total = %v", err)
+	}
+}
+
 // A count reads the whole partition: a queue refused again and again is
 // counted at most once per RecountInterval, by whichever task wins.
 func TestAFullQueueIsRecountedAtMostOncePerInterval(t *testing.T) {

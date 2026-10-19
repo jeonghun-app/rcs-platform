@@ -194,16 +194,18 @@ func cancelled(failed ...bool) error {
 }
 
 // TransactWriteItems knows the two transactions the store sends: enqueue
-// (put the message, add to its queue's and its sender's sizes) and remove
-// (delete the message, take it off both).
+// (put the message, add to its queue's size, its share's and, for a group
+// notification, the group notifications' total) and remove (delete the
+// message, take it off each).
 func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return nil, f.fail
 	}
-	// A notification has no share item: two items, else three.
-	if n := len(in.TransactItems); n != 2 && n != 3 {
+	// A 1-to-1 notification has no share item: two items; a group
+	// notification has the total besides: four; else three.
+	if n := len(in.TransactItems); n < 2 || n > 4 {
 		f.t.Fatalf("transaction %+v", in.TransactItems)
 	}
 	var sizes []*dtypes.Update

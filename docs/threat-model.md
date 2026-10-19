@@ -159,7 +159,8 @@ metadata.
   - each sender's share of a queue (an eighth by default), so that no sender
     can lock the others out, whether it writes 1-to-1 or in groups; 1-to-1
     notifications are bounded by the sent records and by being accepted once
-    instead, group notifications by one share per group (T11);
+    instead, group notifications by one share per group and a quarter of the
+    queue for all groups together (T11);
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
@@ -222,8 +223,9 @@ metadata.
     group, each writing at its full share, use up the whole budget, and a
     fifth participant then has about a quarter of its messages refused;
   - each recipient's queue as in 1-to-1 chat, where a group message counts
-    against its author's share, the one its 1-to-1 messages use, and each
-    group's notifications hold one share, beyond which they are dropped;
+    against its author's share, the one its 1-to-1 messages use; each
+    group's notifications hold one share, and all groups' together a quarter
+    of the queue, beyond which they are dropped;
   - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
     be SIP or tel URIs, compared in canonical form, and names XML-safe text,
     so that one bad value cannot make the stored roster unwritable;

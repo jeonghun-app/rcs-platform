@@ -48,20 +48,24 @@ func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 	if _, ok := q[m.ID]; ok {
 		return fmt.Errorf("store: enqueue: %w", ErrExists)
 	}
-	var bytes, senderBytes int64
-	senderCount := 0
+	var bytes, senderBytes, groupBytes int64
+	senderCount, groupCount := 0, 0
 	share, shared := m.ShareKey()
 	for _, x := range q {
 		bytes += x.Size()
 		if k, ok := x.ShareKey(); ok && shared && k == share {
 			senderCount, senderBytes = senderCount+1, senderBytes+x.Size()
 		}
+		if x.InGroupTotal() {
+			groupCount, groupBytes = groupCount+1, groupBytes+x.Size()
+		}
 	}
 	switch {
 	case l.Count > 0 && len(q)+1 > l.Count, l.Bytes > 0 && bytes+m.Size() > l.Bytes:
 		return fmt.Errorf("store: enqueue: %w", ErrQueueFull)
-	case !shared:
-	case l.SenderCount > 0 && senderCount+1 > l.SenderCount, l.SenderBytes > 0 && senderBytes+m.Size() > l.SenderBytes:
+	case shared && (l.SenderCount > 0 && senderCount+1 > l.SenderCount || l.SenderBytes > 0 && senderBytes+m.Size() > l.SenderBytes):
+		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
+	case m.InGroupTotal() && (l.GroupCount > 0 && groupCount+1 > l.GroupCount || l.GroupBytes > 0 && groupBytes+m.Size() > l.GroupBytes):
 		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
 	}
 	if q == nil {

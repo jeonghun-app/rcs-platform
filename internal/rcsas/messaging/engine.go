@@ -44,6 +44,11 @@ const (
 	// recipient's queue, so that no single sender can fill it and lock the
 	// others out (threat model T10).
 	DefaultQueueSenderShare = 8
+	// GroupNotificationsShare: all group notifications in a queue, from
+	// every group, hold at most a quarter of it together, beside each
+	// group's sender share of them: an author in many groups is not locked
+	// out of 1-to-1 messages by receipts (threat model T10, T11).
+	GroupNotificationsShare = 4
 	DefaultDeliveryTimeout  = 30 * time.Second
 	DefaultInviteTimeout    = 2 * time.Minute
 	// DefaultAnswerTimeout is how long an offered leg waits for its
@@ -257,7 +262,11 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 // queueLimit is the bound of each recipient's queue and of each sender's
 // share of it.
 func queueLimit(c Config) store.Limit {
-	l := store.Limit{Count: c.MaxQueueMessages, Bytes: c.MaxQueueBytes}
+	l := store.Limit{
+		Count: c.MaxQueueMessages, Bytes: c.MaxQueueBytes,
+		GroupCount: (c.MaxQueueMessages + GroupNotificationsShare - 1) / GroupNotificationsShare,
+		GroupBytes: c.MaxQueueBytes / GroupNotificationsShare,
+	}
 	if c.QueueSenderShare > 1 {
 		l.SenderCount = (c.MaxQueueMessages + c.QueueSenderShare - 1) / c.QueueSenderShare
 		l.SenderBytes = c.MaxQueueBytes / int64(c.QueueSenderShare)

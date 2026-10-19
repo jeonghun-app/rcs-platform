@@ -426,9 +426,11 @@ notification in a group only when it is `To` itself (rcsjta).
 Every message an author writes is answered by every other participant, up to
 twice. So the notifications about one group's messages in a queue, from any
 notifier, share one sender's share of it (`#group-notifications <group>`, an
-eighth by default): the receipts for a few messages to a full group cannot
-fill the author's queue and lock out 1-to-1 messages, nor crowd out another
-group's. A notification beyond that share, or beyond the queue, is taken (200)
+eighth by default), so that one busy group does not crowd out another's. All
+group notifications in a queue together, from every group, hold at most a
+quarter of it (`#group-notifications`, 250 by default): an author in many
+large groups is not locked out of 1-to-1 messages by receipts. A notification
+beyond its group's share, the total or the queue is taken (200)
 and dropped, counted as `group.notification.dropped`, rather than refused: the
 reference client ends its session with the group when one is refused.
 
@@ -553,7 +555,9 @@ The table's properties:
   removal, and the enqueue is conditional on both bounds. A 1-to-1
   notification has no share item. A group message counts in its author's
   share item, a group notification in its group's, named
-  `#group-notifications <group>`, which no identity can be. An enqueue moves a size item's TTL to its message's, which
+  `#group-notifications <group>`, and in the total of all group notifications,
+  `#group-notifications`; no identity can be either. An enqueue moves a size
+  item's TTL to its message's, which
   only lengthens it, since messages are enqueued in time order with one
   lifetime. A removal leaves the TTL alone. Each queue item
   carries its own `size`. The SDK's idempotency token makes its own retry of a
@@ -732,9 +736,10 @@ Signals to alarm on (Phase 7):
   each.
 - **Receipts for an offline author can be dropped.** While the author has no
   session, its queue keeps at most a share (125 by default) of one group's
-  notifications. One message to a full group of 100 that asks for both kinds
-  is answered with 198: 125 are kept and 73 dropped
-  (`group.notification.dropped`). The reference client marks a group message
+  notifications, and 250 of all groups' together. One message to a full group
+  of 100 that asks for both kinds is answered with 198: 125 are kept and 73
+  dropped (`group.notification.dropped`); one message in each of nine such
+  groups keeps 250 of 1782. The reference client marks a group message
   displayed only when every recipient has said so
   (`GroupChatImpl.isDisplayedByAllRecipients`), so such a message is never
   shown as read by all. An author with a session, or that the engine can

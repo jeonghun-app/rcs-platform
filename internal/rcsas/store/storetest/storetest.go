@@ -449,6 +449,21 @@ func groupShares(t *testing.T, s store.Store) {
 	if err := s.Enqueue(ctx, notice(other, "n6"), l); err != nil {
 		t.Fatalf("another group's notification = %v", err)
 	}
+	// All groups' notifications together are bounded too.
+	total := l
+	total.GroupCount = 5 // n1-n4 and n6
+	if err := s.Enqueue(ctx, notice("sip:chat-3@conf.example.net", "n7"), total); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond the group notifications' total = %v", err)
+	}
+	if err := s.Enqueue(ctx, direct("0008"), total); !errors.Is(err, store.ErrSenderShareFull) {
+		// alice is at her share still; anyone else's 1-to-1 goes in.
+		t.Fatalf("alice at her share = %v", err)
+	}
+	other1 := message(bob, "0009", t0)
+	other1.Sender = carol
+	if err := s.Enqueue(ctx, other1, total); err != nil {
+		t.Fatalf("carol beside the full total = %v", err)
+	}
 	// Removing alice's group message frees her share, for any path.
 	held, err := s.Claim(ctx, bob, "0002", "task-a", t0, t0.Add(time.Minute))
 	if err != nil {

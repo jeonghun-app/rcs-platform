@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -194,8 +195,14 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if !s.mayRecount(ctx, m.Recipient, m.Enqueued) {
 		return err
 	}
-	share, _ := m.ShareKey()
-	fixed, cerr := s.recount(ctx, m.Recipient, share)
+	var shares []string
+	if share, ok := m.ShareKey(); ok {
+		shares = append(shares, share)
+	}
+	if m.InGroupTotal() {
+		shares = append(shares, store.GroupNotifications)
+	}
+	fixed, cerr := s.recount(ctx, m.Recipient, shares...)
 	if cerr != nil || !fixed {
 		return err
 	}
@@ -246,6 +253,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if share, ok := m.ShareKey(); ok {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, share), 1, m.Size(), l.SenderCount, l.SenderBytes, ttl)})
 	}
+	if m.InGroupTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupNotifications), 1, m.Size(), l.GroupCount, l.GroupBytes, ttl)})
+	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok {
 		switch {
@@ -253,7 +263,7 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
 		case len(failed) > 1 && failed[1]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
-		case len(failed) > 2 && failed[2]:
+		case slices.Contains(failed[min(2, len(failed)):], true):
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
 		}
 	}
@@ -283,8 +293,22 @@ func (s *Store) mayRecount(ctx context.Context, recipient string, now time.Time)
 	return err == nil
 }
 
-// shareOf is Message.ShareKey of a projected queue item.
-func shareOf(item map[string]types.AttributeValue) (string, bool) {
+// sharesOf are the shares a projected queue item counts against: its
+// Message.ShareKey, and GroupNotifications for a group notification.
+func sharesOf(item map[string]types.AttributeValue) []string {
+	m := projected(item)
+	var out []string
+	if k, ok := m.ShareKey(); ok {
+		out = append(out, k)
+	}
+	if m.InGroupTotal() {
+		out = append(out, store.GroupNotifications)
+	}
+	return out
+}
+
+// projected is what a recount projects of a queue item.
+func projected(item map[string]types.AttributeValue) store.Message {
 	var m store.Message
 	var mode int64
 	_ = getString(item, attrSender, &m.Sender, false)
@@ -294,16 +318,16 @@ func shareOf(item map[string]types.AttributeValue) (string, bool) {
 		m.Notification = b.Value
 	}
 	m.Mode = store.Mode(mode)
-	return m.ShareKey()
+	return m
 }
 
-// recount counts recipient's queue, and what sender's share holds of it
-// (Message.ShareKey), and sets
-// any size item that says more to what is there. It reports whether it
-// corrected one. Each correction is conditional on the size item being
-// unchanged since it was read, before the queue was: a size that moved
-// meanwhile reflects an enqueue or removal the count may have missed.
-func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, error) {
+// recount counts recipient's queue, and what each of shares holds of it
+// (Message.ShareKey, store.GroupNotifications), and sets any size item that
+// says more to what is there. It reports whether it corrected one. Each
+// correction is conditional on the size item being unchanged since it was
+// read, before the queue was: a size that moved meanwhile reflects an
+// enqueue or removal the count may have missed.
+func (s *Store) recount(ctx context.Context, recipient string, shares ...string) (bool, error) {
 	type size struct{ count, bytes int64 }
 	read := func(k map[string]types.AttributeValue) (size, error) {
 		out, err := s.api.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(s.table), Key: k, ConsistentRead: aws.Bool(true)})
@@ -315,16 +339,23 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 		_ = getNum(out.Item, attrBytes, &z.bytes)
 		return z, nil
 	}
-	queueKey, senderKey := queueSizeKey(recipient), senderSizeKey(recipient, sender)
-	queueWas, err := read(queueKey)
-	if err != nil {
-		return false, err
+	type counted struct {
+		k        map[string]types.AttributeValue
+		was, now size
 	}
-	senderWas, err := read(senderKey)
-	if err != nil {
-		return false, err
+	all := []*counted{{k: queueSizeKey(recipient)}}
+	byShare := map[string]*counted{}
+	for _, share := range shares {
+		c := &counted{k: senderSizeKey(recipient, share)}
+		all, byShare[share] = append(all, c), c
 	}
-	var queueIs, senderIs size
+	for _, c := range all {
+		was, err := read(c.k)
+		if err != nil {
+			return false, err
+		}
+		c.was = was
+	}
 	in := &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
 		ConsistentRead:         aws.Bool(true),
@@ -343,9 +374,11 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 		for _, item := range page.Items {
 			var n int64
 			_ = getNum(item, attrSize, &n)
-			queueIs.count, queueIs.bytes = queueIs.count+1, queueIs.bytes+n
-			if k, ok := shareOf(item); ok && k == sender {
-				senderIs.count, senderIs.bytes = senderIs.count+1, senderIs.bytes+n
+			all[0].now.count, all[0].now.bytes = all[0].now.count+1, all[0].now.bytes+n
+			for _, k := range sharesOf(item) {
+				if c := byShare[k]; c != nil {
+					c.now.count, c.now.bytes = c.now.count+1, c.now.bytes+n
+				}
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {
@@ -354,10 +387,7 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}
 	fixed := false
-	for _, c := range []struct {
-		k        map[string]types.AttributeValue
-		was, now size
-	}{{queueKey, queueWas, queueIs}, {senderKey, senderWas, senderIs}} {
+	for _, c := range all {
 		if c.now.count >= c.was.count && c.now.bytes >= c.was.bytes {
 			continue
 		}
@@ -517,6 +547,9 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 	}
 	if share, ok := m.ShareKey(); ok {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, share), -1, -m.Size(), 0, 0, time.Time{})})
+	}
+	if m.InGroupTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupNotifications), -1, -m.Size(), 0, 0, time.Time{})})
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
