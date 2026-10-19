@@ -166,17 +166,18 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
   - the identity is the first `P-Preferred-Identity` value that a
     registration over the flow lists in its `P-Associated-URI`, which holds
     no barred identity; the request then goes along that registration's
-    `Service-Route`. A second such value is the alternative identity,
-    asserted beside it if it is of the other kind (RFC 3325 §9.1 allows one
-    SIP or SIPS and one tel URI);
+    `Service-Route`. A later value that same registration lists is the
+    alternative identity, asserted beside it if it is of the other kind
+    (RFC 3325 §9.1 allows one SIP or SIPS and one tel URI);
   - with no match, the identity is the default public identity, the first
     `P-Associated-URI` of the flow's first registration;
   - values are matched without case in the host, with the user part
     unescaped and a tel number without visual separators. A `user=phone`
     SIP URI with a `+` number also matches the tel URI of that number;
-  - without an alternative, a `user=phone` SIP identity is joined by the
-    registration's tel URI of the same number, if it has one, and by no
-    other number;
+  - without an alternative, a SIP identity is joined by a tel URI of the
+    same registration: for a `user=phone` one, the tel URI of the same
+    number, or none if there is no such one, so no other number is asserted
+    beside it; otherwise the first tel URI (#16 decision 5);
   - the values asserted are the registration's, with parameters other than
     `user` dropped.
 - **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request
@@ -209,16 +210,18 @@ to `scscf`. It is forwarded as its Route says only if:
 
 Anything else is answered 403, so a client cannot aim a request at a core
 address of its choosing past `scscf`. A failed lookup of `scscf` is 503 with
-`Retry-After: 1`. Requests count against the client's initial-request limit,
-except an ACK for a 2xx, which cannot be answered; an ACK follows the route
-rule too. No registration is needed, so a call can still be ended after the
+`Retry-After: 1`. Requests count against the client's initial-request limit; an ACK
+for a 2xx, which cannot be answered 503, is dropped past it and counted in
+`requests.ack_rate_discarded`, and follows the route rule too. No registration is needed, so a call can still be ended after the
 client deregisters.
 
 The forwarded request gets a `P-Charging-Vector` with the dialog's icid,
 read back from the core-facing Record-Route value in its route, and the
 `orig-ioi` (§5.2.6.3.5 7), §5.2.6.3.9 3)). The client holds that value, so
-it can change the icid on its own dialog's requests; a missing or malformed
-one is replaced by a new icid.
+it can choose the icid of its own dialog's requests; a missing or malformed
+one is replaced by a new icid. Nothing consumes charging yet; the value is
+to be signed, like the flow token, when charging (Rf/Ro) does (threat
+model T2).
 
 No core hop of any request, REGISTER and initial requests included, ever
 resolves to this task's own address, however it is written, and every form

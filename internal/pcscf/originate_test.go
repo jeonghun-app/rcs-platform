@@ -136,6 +136,8 @@ func TestTheAssertedIdentityIsAPreferredOneTheFlowRegistered(t *testing.T) {
 	// dave has two numbers.
 	dave := &registration{uri: mustURI(t, aliceIMPU), seq: 5,
 		associated: addrs(t, aliceIMPUPhone, aliceTel, daveIMPUPhone, daveTel)}
+	// frank's number has no tel URI of its own.
+	frank := &registration{uri: mustURI(t, aliceIMPU), seq: 7, associated: addrs(t, daveIMPUPhone, aliceTel)}
 	// erin has a second number as a tel URI only.
 	erin := &registration{uri: mustURI(t, aliceIMPU), seq: 6, associated: addrs(t, aliceIMPU, aliceTel, daveTel)}
 	regs := []*registration{alice, bob, carol}
@@ -148,13 +150,17 @@ func TestTheAssertedIdentityIsAPreferredOneTheFlowRegistered(t *testing.T) {
 	}{
 		{"none", regs, nil, alice, []string{"<" + aliceIMPU + ";user=phone>", "<" + aliceTel + ">"}},
 		{"the default", regs, []string{"<" + aliceIMPU + ">"}, alice, []string{"<" + aliceIMPU + ";user=phone>", "<" + aliceTel + ">"}},
-		// Not a number, so no tel URI beside it (security review of #208).
-		{"another SIP URI", regs, []string{"<sip:alice@IMS.mnc001.mcc001.3gppnetwork.org>"}, alice, []string{"<sip:alice@ims.mnc001.mcc001.3gppnetwork.org>"}},
+		// Not a number: the registration's first tel URI beside it.
+		{"another SIP URI", regs, []string{"<sip:alice@IMS.mnc001.mcc001.3gppnetwork.org>"}, alice, []string{"<sip:alice@ims.mnc001.mcc001.3gppnetwork.org>", "<" + aliceTel + ">"}},
 		{"a tel URI", regs, []string{"<" + aliceTel + ">"}, alice, []string{"<" + aliceTel + ">"}},
 		{"another registration", regs, []string{"<" + bobIMPU + ">"}, bob, []string{"<" + bobIMPU + ">"}},
 		{"another registration's tel URI", regs, []string{"<" + carolTel + ">"}, carol, []string{"<" + carolTel + ">"}},
 		// The second registered one is the alternative identity (§5.2.6.3.1).
-		{"the first listed", regs, []string{"<sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>", "<" + bobIMPU + ">", "<" + aliceTel + ">"}, bob, []string{"<" + bobIMPU + ">", "<" + aliceTel + ">"}},
+		// An alternative only from the chosen registration (security
+		// review of #208).
+		{"the first listed", regs, []string{"<sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>", "<" + bobIMPU + ">", "<" + aliceTel + ">"}, bob, []string{"<" + bobIMPU + ">"}},
+		{"an alternative of the chosen registration", []*registration{dave}, []string{"<" + daveIMPUPhone + ">", "<" + aliceTel + ">"}, dave, []string{"<" + daveIMPUPhone + ">", "<" + aliceTel + ">"}},
+		{"a number without its tel URI", []*registration{frank}, nil, frank, []string{"<" + daveIMPUPhone + ">"}},
 		{"an alternative of the same kind", regs, []string{"<" + bobIMPU + ">", "<" + aliceIMPU + ">"}, bob, []string{"<" + bobIMPU + ">"}},
 		{"the same one twice", regs, []string{"<" + aliceTel + ">", "<" + aliceTel + ">"}, alice, []string{"<" + aliceTel + ">"}},
 		// A number written as a SIP URI matches its tel URI (§5.2.6.3.1).
@@ -431,8 +437,7 @@ func TestAnInDialogRequestWhoseLookupFailsIs503(t *testing.T) {
 }
 
 // Requests inside a dialog count against the client's initial-request
-// bucket, so a To tag does not lift the limit; an ACK for a 2xx, which
-// cannot be answered, does not count (security review of #208).
+// bucket, so a To tag does not lift the limit (security review of #208).
 func TestInDialogRequestsShareTheInitialRequestLimit(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	p, _ := newTestPcscf(clock)
@@ -446,10 +451,18 @@ func TestInDialogRequestsShareTheInitialRequestLimit(t *testing.T) {
 	if d := bye(); d.Response == nil || d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
 		t.Fatalf("BYE past the limit %+v, want 503 with Retry-After", d)
 	}
-	ack := clientRequest(t, strings.Replace(inDialogText("ACK", "Route: "+scscfRoute), "CSeq: 1 ACK", "CSeq: 1 ACK", 1), "FLOW-A")
+	// An ACK cannot be answered 503: past the limit it is dropped, and
+	// counted (security review of #208).
+	var out strings.Builder
+	p.metrics = runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, p.log)
+	ack := clientRequest(t, inDialogText("ACK", "Route: "+scscfRoute), "FLOW-A")
 	ack.Routed = []sip.Address{{URI: mustURI(t, clientEnt)}, {URI: mustURI(t, coreEntry)}}
-	if d := p.Route(context.Background(), ack); len(d.Targets) != 1 {
-		t.Fatalf("ACK past the limit %+v, want it forwarded", d)
+	if d := p.Route(context.Background(), ack); !d.Discard || len(d.Targets) != 0 {
+		t.Fatalf("ACK past the limit %+v, want it dropped", d)
+	}
+	p.metrics.Flush()
+	if !strings.Contains(out.String(), `"`+metricACKDiscarded+`":1`) {
+		t.Errorf("metrics %s", out.String())
 	}
 	// Made-up dialogs to any core address go nowhere, and soon not even
 	// to the route check.
@@ -514,5 +527,27 @@ func TestFlowRegistrationsForgetsTheExpired(t *testing.T) {
 	clock.t = clock.t.Add(2 * time.Minute)
 	if regs := r.flowRegistrations("F"); len(regs) != 1 || r.size() != 1 {
 		t.Fatalf("%d registrations, size %d", len(regs), r.size())
+	}
+}
+
+// Made-up ACKs, which cannot be answered, are held to the client's rate
+// like any other request inside a dialog (QA of #208).
+func TestMadeUpACKsAreHeldToTheClientsRate(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	p, _ := newTestPcscf(clock)
+	p.initials = newLimiter(1, 1, clock.now)
+	forwarded := 0
+	for range 1000 {
+		r := clientRequest(t, inDialogText("ACK", "Route: <sip:scscf.rcs.internal:5060;transport=tcp;lr>"), "FLOW-A")
+		r.Message.URI = mustURI(t, "sip:bob@198.51.100.20:5060;transport=tcp")
+		for _, u := range []string{clientEnt, coreEntry} {
+			r.Routed = append(r.Routed, sip.Address{URI: mustURI(t, u)})
+		}
+		if d := p.Route(context.Background(), r); d.Status == 0 && d.Response == nil && len(d.Targets) == 1 {
+			forwarded++
+		}
+	}
+	if forwarded > 1 {
+		t.Errorf("made-up ACKs forwarded with burst 1: %d of 1000", forwarded)
 	}
 }

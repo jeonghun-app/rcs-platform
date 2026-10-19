@@ -110,7 +110,7 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	scscfURI := fmt.Sprintf("sip:orig@scscf.rcs.internal:%d;transport=tcp;lr", scscfPort)
 	icscf := startCoreNode(t, func(req *sip.Request) string {
 		return strings.Replace(strings.Replace(echo200(req), "<sip:orig@10.0.4.4;lr>", "<"+scscfURI+">", 1),
-			"P-Associated-URI: <"+aliceIMPU+">", "P-Associated-URI: <"+aliceIMPU+";user=phone>, <"+aliceTel+">", 1)
+			"P-Associated-URI: <"+aliceIMPU+">", "P-Associated-URI: <"+aliceIMPU+">, <"+aliceTel+">", 1)
 	})
 	cfg := testConfig()
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
@@ -135,7 +135,7 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	pcscfRoute := fmt.Sprintf("Route: <sip:%s:5060;transport=tcp;lr>", publicHost)
 	c.send(call, "INVITE "+bobIMPU+" SIP/2.0", "", 1, "INVITE",
 		append([]string{pcscfRoute, "Route: <sip:10.0.9.9;lr>", "Contact: <sip:alice@192.0.2.10:40000;transport=tcp;ob>",
-			"P-Preferred-Identity: <" + aliceIMPU + ";user=phone>"}, forged...)...)
+			"P-Preferred-Identity: <" + aliceIMPU + ">"}, forged...)...)
 	invite := scscf.receive(t)
 	noForged(t, invite)
 	if got := invite.Header.Values("Route"); !slices.Equal(got, []string{"<" + scscfURI + ">"}) {
@@ -150,7 +150,9 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	if got := invite.Header.Values("Record-Route"); !slices.Equal(got, wantRR) {
 		t.Errorf("Record-Route %q, want %q", got, wantRR)
 	}
-	if got := invite.Header.Values("P-Asserted-Identity"); !slices.Equal(got, []string{"<" + aliceIMPU + ";user=phone>", "<" + aliceTel + ">"}) {
+	// Not a user=phone identity: the registration's tel URI beside it (#16
+	// decision 5).
+	if got := invite.Header.Values("P-Asserted-Identity"); !slices.Equal(got, []string{"<" + aliceIMPU + ">", "<" + aliceTel + ">"}) {
 		t.Errorf("P-Asserted-Identity %q", got)
 	}
 	if invite.Header.Has("P-Preferred-Identity") {

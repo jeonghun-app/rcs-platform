@@ -15,8 +15,12 @@ import (
 )
 
 // metricUnregistered counts the requests discarded because their flow has no
-// registration.
-const metricUnregistered = "requests.unregistered_discarded"
+// registration, and metricACKDiscarded the ACKs dropped past their client's
+// rate.
+const (
+	metricUnregistered = "requests.unregistered_discarded"
+	metricACKDiscarded = "requests.ack_rate_discarded"
+)
 
 // originate routes a client's request outside a dialog (TS 24.229
 // §5.2.6.3.3). It must come over a registered flow: one that is not is
@@ -77,16 +81,18 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 // identities pcscf asserts for it (TS 24.229 §5.2.6.3.1, §5.2.6.3.3 6), #16
 // question 5). The identity is the first P-Preferred-Identity value a
 // registration over the flow lists in its P-Associated-URI, and the request
-// goes under that registration; a second such value is the alternative
-// identity. A SIP URI with user=phone and a number is matched as the tel URI
-// of that number too. With no match the identity is the default public
-// identity, the first P-Associated-URI of the first registration.
+// goes under that registration; a later value that same registration lists
+// is the alternative identity. A SIP URI with user=phone and a number is
+// matched as the tel URI of that number too. With no match the identity is
+// the default public identity, the first P-Associated-URI of the first
+// registration.
 //
-// Without an alternative identity, an identity that is a user=phone SIP URI
-// is joined by the registration's tel URI of the same number, if it has one;
-// no other number is asserted beside it. RFC 3325 §9.1 allows one SIP or
-// SIPS and one tel URI, so an alternative of the identity's own kind is not
-// used. The values asserted are the registration's, without parameters
+// Without an alternative identity, a SIP identity is joined by a tel URI of
+// the same registration: the one of the same number for a user=phone SIP
+// URI, or none if the registration has no such one, so no other number is
+// asserted beside it; the first one otherwise. RFC 3325 §9.1 allows one SIP
+// or SIPS and one tel URI, so an alternative of the identity's own kind is
+// not used. The values asserted are the registration's, without parameters
 // other than user; the P-Associated-URI lists no barred identity (TS 24.229
 // §5.4.1.2.2), so none is asserted.
 func assertedIdentity(regs []*registration, req *sip.Request) (*registration, []sip.Address) {
@@ -96,6 +102,9 @@ func assertedIdentity(regs []*registration, req *sip.Request) (*registration, []
 		for _, want := range preferred {
 			keys := matchKeys(want.URI)
 			for _, r := range regs {
+				if reg != nil && r != reg {
+					continue
+				}
 				i := slices.IndexFunc(r.associated, func(a sip.Address) bool { return slices.Contains(keys, identityKey(a.URI)) })
 				if i < 0 {
 					continue
@@ -122,9 +131,13 @@ func assertedIdentity(regs []*registration, req *sip.Request) (*registration, []
 		}
 		ids = []sip.URI{id}
 	}
-	if number, ok := phoneNumber(ids[0]); ok && len(ids) == 1 {
-		tel := identityKey(sip.URI{Scheme: "tel", User: number})
-		if i := slices.IndexFunc(reg.associated, func(a sip.Address) bool { return identityKey(a.URI) == tel }); i >= 0 {
+	if len(ids) == 1 && ids[0].IsSIP() {
+		tel := func(a sip.Address) bool { return a.URI.Scheme == "tel" }
+		if number, ok := phoneNumber(ids[0]); ok {
+			key := identityKey(sip.URI{Scheme: "tel", User: number})
+			tel = func(a sip.Address) bool { return identityKey(a.URI) == key }
+		}
+		if i := slices.IndexFunc(reg.associated, tel); i >= 0 {
 			ids = append(ids, reg.associated[i].URI)
 		}
 	}
@@ -260,11 +273,21 @@ func contactHasOb(req *sip.Request) bool {
 // Anything else is 403, so a client cannot aim a request at a core address
 // of its choosing, past the services that should see it; a failed lookup of
 // scscf is 503. The requests count against the client's initial-request
-// bucket, so a To tag does not lift its rate, except an ACK for a 2xx, which
-// cannot be answered. The forwarded request carries the dialog's icid,
-// from the core-facing value, in a P-Charging-Vector of its own.
+// bucket, so a To tag does not lift its rate; an ACK past it, which cannot
+// be answered 503, is dropped. The forwarded request carries the dialog's
+// icid, from the core-facing value, in a P-Charging-Vector of its own; the
+// client holds that value, so it can choose its own dialog's icid (threat
+// model T2).
 func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
-	if r.Message.Method != "ACK" && !p.initials.allow(clientKey(r.Source.Addr)) {
+	if !p.initials.allow(clientKey(r.Source.Addr)) {
+		if r.Message.Method == "ACK" {
+			// An ACK cannot be answered, so one past the limit is
+			// dropped, and counted.
+			if p.metrics != nil {
+				p.metrics.Count(metricACKDiscarded, 1)
+			}
+			return proxy.Decision{Discard: true}
+		}
 		return p.refuse(r, 503, "Too Many Requests")
 	}
 	var core *sip.URI

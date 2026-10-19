@@ -48,10 +48,17 @@ separate from its core listener; core SIP ports admit only platform services
 request against its own Record-Route values only, keeping no dialog state.
 The peer of a past call has seen the core-facing value, with the flow token,
 so it can go on sending "in-dialog" requests to that flow after the call has
-ended, for as long as the flow lives. Such requests still pass through
-`scscf` and `rcs-as`, which both record themselves in the dialog, so the
-application server sees them. A possible mitigation is a dialog-state check
-in `scscf`, such as a signed Record-Route parameter it verifies.
+ended, for as long as the flow lives. `pcscf` fixes only the first hop of a
+client's in-dialog request, to `scscf`; whether such requests then reach
+`rcs-as`, which records itself in the dialog, depends on `scscf`, which
+checks it as an acceptance criterion of
+[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
+mitigation is a dialog-state check in `scscf`, such as a signed
+Record-Route parameter it verifies.
+**Residual risk (accepted, #208):** a client can choose the icid of its own
+dialog's in-dialog requests, since `pcscf` reads it back from the
+Record-Route value the client holds. Nothing consumes charging yet; the
+value is to be signed, like the flow token, when charging (Rf/Ro) does.
 
 ## T3 — MSRP session access on `rcs-as`
 
