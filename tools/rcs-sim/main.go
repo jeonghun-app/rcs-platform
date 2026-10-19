@@ -58,6 +58,12 @@ func main() {
 }
 
 // run is main without the process, for tests.
+// defaultKeepAlive is the simulated client's MSRP keep-alive interval: below
+// msrp-relay's own (RELAY_KEEPALIVE_INTERVAL, 240 s by default), because the
+// relay's keep-alive resets the client's timer, and a client that never
+// reaches its interval sends none for the keep-alive step to see.
+const defaultKeepAlive = 200 * time.Second
+
 func run(ctx context.Context, args []string, lookup func(string) (string, bool), stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("rcs-sim", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -71,7 +77,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		control       = fs.String("relay-control", "", "msrp-relay control API base URL")
 		coreListen    = fs.String("core-listen", "127.0.0.1:0", "where the rcs-as stand-in listens")
 		coreAdvertise = fs.String("core-advertise", "", "host the relay connects to for the stand-in (default: the listener's)")
-		keepAlive     = fs.Duration("msrp-keepalive", msrp.DefaultKeepAliveInterval, "MSRP keep-alive interval of both ends")
+		keepAlive     = fs.Duration("msrp-keepalive", defaultKeepAlive, "MSRP keep-alive interval of both ends; shorter than the relay's")
 		idleWait      = fs.Duration("idle-wait", 0, "stay quiet this long in chat scenarios to see keep-alives (0 skips)")
 		self          = fs.String("self", defaultSelf, "the simulated client's address")
 		peer          = fs.String("peer", defaultPeer, "the far end's address")
@@ -122,6 +128,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	}
 	if *fileSize < 1 || *resumeSize < 1 {
 		return usage("-file-size and -resume-size must be positive")
+	}
+	if *idleWait > 0 && *stepTimeout <= *idleWait {
+		return usage("-step-timeout must be longer than -idle-wait: the keep-alive step waits -idle-wait within it")
 	}
 	if *uploadURL != "" {
 		u, err := absolute(*uploadURL)

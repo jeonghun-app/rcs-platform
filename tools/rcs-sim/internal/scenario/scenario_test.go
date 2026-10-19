@@ -2,6 +2,7 @@ package scenario_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -288,6 +289,79 @@ func TestAReleaseThatLeavesTheBindingFails(t *testing.T) {
 	release := byStep(results)["release"]
 	if ok || release.OK || !strings.Contains(release.Error, "released session") {
 		t.Fatalf("release %+v", release)
+	}
+}
+
+func TestAClientThatSendsNoKeepAliveFailsTheStep(t *testing.T) {
+	// The keep-alive step waits for the keep-alive past IdleWait (#97). A
+	// client that sends none must still fail with the stack's own step
+	// timeout (20 s), which outlasts the test relay's 10 s keep-alive: the
+	// client's 200 to that is not a keep-alive of its own (QA on #102).
+	cfg := stack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran {
+		t.Fatalf("the keep-alive step did not run: %+v", results)
+	}
+	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+	// The client did write while quiet, its answer to the relay's
+	// keep-alive, so this is the case the step must not count.
+	if ka.Detail["bytes_while_quiet"] == 0 {
+		t.Fatalf("no bytes written while quiet: the relay's keep-alive never came, so the test proves less than it says: %+v", ka)
+	}
+}
+
+func TestAClientThatSendsNoKeepAliveFailsAtTheStepTimeout(t *testing.T) {
+	// The same with a step timeout shorter than the relay's keep-alive.
+	cfg := stack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	cfg.StepTimeout = 2 * time.Second
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran {
+		t.Fatalf("the keep-alive step did not run: %+v", results)
+	}
+	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+}
+
+// tlsStack is stack(t) with the client's side of the relay behind a TLS
+// terminator, as behind the NLB (ADR 0003): client_path is msrps: and the
+// client speaks TLS, while the relay listens plain (QA's probe on #102).
+func tlsStack(t *testing.T) scenario.Config {
+	t.Helper()
+	cfg := stack(t)
+	corePort := simtest.FreePort(t)
+	r := simtest.StartRelayBehindTLS(t, corePort)
+	cfg.Control = &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)}
+	cfg.CoreListen = "127.0.0.1:" + strconv.Itoa(corePort)
+	cfg.TLS = &tls.Config{RootCAs: r.TLSRoots, MinVersion: tls.VersionTLS12}
+	return cfg
+}
+
+// The keep-alive step watches the MSRP inside TLS: over msrps:, the
+// deployed path (ADR 0003), a client's keep-alives count (QA on #102: the
+// wrapper once saw only ciphertext, and the step always failed there).
+func TestTheKeepAliveStepWorksOverTLS(t *testing.T) {
+	cfg := tlsStack(t)
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	if !ok {
+		t.Fatalf("chat-client-originated over msrps: %+v", results)
+	}
+}
+
+func TestAClientWithoutKeepAlivesFailsOverTLSToo(t *testing.T) {
+	cfg := tlsStack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	cfg.StepTimeout = 2 * time.Second
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran || ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
 	}
 }
 

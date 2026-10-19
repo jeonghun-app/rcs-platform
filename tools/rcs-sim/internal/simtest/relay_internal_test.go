@@ -44,7 +44,7 @@ func TestChildRelayOnATakenPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	_, err = startRelay(t, ln.Addr().(*net.TCPAddr).Port, FreePort(t), nil)
+	_, err = startRelay(t, ln.Addr().(*net.TCPAddr).Port, FreePort(t), nil, nil)
 	if !errors.Is(err, syscall.EADDRINUSE) {
 		t.Errorf("startRelay = %v, want EADDRINUSE, which StartRelay retries", err)
 	}
