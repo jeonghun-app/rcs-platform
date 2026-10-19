@@ -327,6 +327,47 @@ func TestADriftedGroupNotificationTotalIsCorrected(t *testing.T) {
 	}
 }
 
+// A recount tells summaries from group notifications: neither total
+// counts the other's items.
+func TestARecountCountsSummariesApartFromNotifications(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 10, SenderCount: 10, GroupCount: 2, SummaryCount: 2}
+	notice := func(id string) store.Message {
+		return store.Message{Recipient: "r", ID: id, Sender: "sip:g" + id, Author: "sip:p@example.net", Mode: store.Group, Notification: true,
+			CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	summary := func(id string) store.Message {
+		return store.Message{Recipient: "r", ID: "r-" + id, Sender: "sip:g" + id, Mode: store.Group, Notification: true, Summary: true,
+			MessageID: id, Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	for _, m := range []store.Message{notice("1"), notice("2"), summary("1"), summary("2")} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	total := func(name string) int64 {
+		return nOf(f.rows["c#1#r\x00s#"+fmt.Sprint(len(name))+"#"+name][attrCount])
+	}
+	delete(f.rows, "q#1#r\x001") // the TTL took notice 1
+	if err := s.Enqueue(ctx, notice("3"), l); err != nil {
+		t.Fatalf("a notification after drift = %v", err)
+	}
+	if n, sums := total(store.GroupNotifications), total(store.GroupSummaries); n != 2 || sums != 2 {
+		t.Fatalf("totals after the notifications' recount: %d notifications, %d summaries", n, sums)
+	}
+	delete(f.rows, "q#1#r\x00r-1") // and summary 1
+	later := summary("3")
+	later.Enqueued = t0.Add(RecountInterval) // the queue may be counted again
+	if err := s.Enqueue(ctx, later, l); err != nil {
+		t.Fatalf("a summary after drift = %v", err)
+	}
+	if n, sums := total(store.GroupNotifications), total(store.GroupSummaries); n != 2 || sums != 2 {
+		t.Fatalf("totals after the summaries' recount: %d notifications, %d summaries", n, sums)
+	}
+}
+
 // A count reads the whole partition: a queue refused again and again is
 // counted at most once per RecountInterval, by whichever task wins.
 func TestAFullQueueIsRecountedAtMostOncePerInterval(t *testing.T) {
