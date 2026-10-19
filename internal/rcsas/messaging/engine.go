@@ -205,6 +205,9 @@ type Engine struct {
 	departed map[legKey]time.Time
 	// groupLegs counts the open group legs of each group on this task.
 	groupLegs map[string]int
+	// summaries remembers group notification summaries between their
+	// deliveries (sendSummary), up to MaxTracked.
+	summaries map[legKey]*summaryState
 	lastID    int64
 	sweepAt   string
 }
@@ -243,6 +246,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		pagerOnly:  map[string]struct{}{},
 		departed:   map[legKey]time.Time{},
 		groupLegs:  map[string]int{},
+		summaries:  map[legKey]*summaryState{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {

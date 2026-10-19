@@ -406,10 +406,16 @@ type client struct {
 	got     chan *msrp.Message
 	reports chan msrp.Report
 	refuse  error
+	// hold, when set, runs before HandleMessage returns: one that blocks
+	// is a client that takes the bytes and processes nothing.
+	hold func(*msrp.Message)
 }
 
 func (c *client) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	c.got <- m
+	if c.hold != nil {
+		c.hold(m)
+	}
 	return c.refuse
 }
 
@@ -457,6 +463,13 @@ var clientSeq int
 // as msrp-relay would.
 func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client) {
 	t.Helper()
+	return r.connectHolding(t, l, p, nil)
+}
+
+// connectHolding is connect with a client that runs hold on every message
+// it gets before it answers (client.hold).
+func (r *rig) connectHolding(t *testing.T, l net.Listener, p LegParams, hold func(*msrp.Message)) (*Leg, *client) {
+	t.Helper()
 	local := clientURI()
 	p.Remote = []msrp.URI{local}
 	if p.Direction == 0 {
@@ -467,7 +480,7 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = leg.Close() })
-	c := r.dial(t, l, local, leg.Local())
+	c := r.dialHolding(t, l, local, leg.Local(), hold)
 	return leg, c
 }
 
@@ -475,8 +488,13 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 // msrp-relay does once the client has connected to it.
 func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client {
 	t.Helper()
+	return r.dialHolding(t, l, local, remote, nil)
+}
+
+func (r *rig) dialHolding(t *testing.T, l net.Listener, local, remote msrp.URI, hold func(*msrp.Message)) *client {
+	t.Helper()
 	var err error
-	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64)}
+	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64), hold: hold}
 	c.session, err = msrp.NewSession(msrp.SessionConfig{Local: local, Remote: []msrp.URI{remote}, Handler: c})
 	if err != nil {
 		t.Fatal(err)

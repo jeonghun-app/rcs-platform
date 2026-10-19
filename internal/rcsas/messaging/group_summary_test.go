@@ -11,6 +11,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
@@ -431,6 +432,61 @@ func TestAConnectedAuthorGetsItsReceiptsAsTheyCome(t *testing.T) {
 	}
 }
 
+// A summary goes only once the client confirms it has every notification:
+// all but the last are sent without reports, the last with a success
+// report, and a client that takes the bytes and processes none of them
+// leaves the summary queued.
+func TestASummaryStaysUntilTheClientConfirmsIt(t *testing.T) {
+	everyone := []string{alice, bob, carol}
+	clock := newFakeClock()
+	r := newRigWith(t, smallQueue, store.NewMemory(), clock)
+	r.e.SetGroupHandler(members{all: everyone})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{bob, carol} {
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(p, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, sums := queuedReceipts(t, r, alice); sums != 1 {
+		t.Fatalf("%d summaries", sums)
+	}
+	// The client answers bob's receipt, queued whole, and then hangs.
+	var taken atomic.Int32
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	l := r.listen(t)
+	leg, c := r.connectHolding(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group}, func(*msrp.Message) {
+		if taken.Add(1) > 1 {
+			<-stuck
+		}
+	})
+	queued := c.next(t)
+	first := c.next(t)
+	if queued.SuccessReport != msrp.ReportYes || first.SuccessReport != msrp.ReportUnset || first.FailureReport != msrp.ReportNo {
+		t.Fatalf("reports asked: queued %v/%v, summary's first %v/%v", queued.SuccessReport, queued.FailureReport,
+			first.SuccessReport, first.FailureReport)
+	}
+	waitFor(t, "the summary's last sent", func() bool { return r.m.get("group.summary.sent") == 1 && clock.armed(DefaultDeliveryTimeout) })
+	clock.Advance(DefaultDeliveryTimeout)
+	// A kick that came during the pass may start another at once, which
+	// hangs the same way: the summary is kept either way.
+	waitFor(t, "the attempt given up", func() bool { return r.m.get("delivery.msrp_failed") >= 1 })
+	if n := r.store.(*store.Memory).Len(alice); n != 1 || r.m.get("group.summary.expanded") != 0 {
+		t.Fatalf("%d queued, metrics %v", n, r.m)
+	}
+	// The next session gets what the stuck one did not confirm.
+	_ = leg.Close()
+	a := newAuthor(alice)
+	_, c2 := r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	a.listen(t, c2)
+	waitFor(t, "read by all", func() bool { return a.readByAll("m1", []string{bob, carol}) })
+	waitFor(t, "the summary expanded", func() bool { return r.m.get("group.summary.expanded") == 1 })
+}
+
 // The reviews' scaled case: an author's summaries have a total of their
 // own, so that with its receipts they never fill the queue. Queue 40,
 // receipts' total 10, summaries' 5: of the 40 receipts bob sends, 10 are
@@ -458,6 +514,61 @@ func TestSummariesLeaveTheQueueTo1To1Messages(t *testing.T) {
 	}
 	if err := r.e.Submit(t.Context(), standalone(dave, alice, chat(t, "d1", "are you there?", 0))); err != nil {
 		t.Fatalf("dave's 1-to-1 message: %v", err)
+	}
+}
+
+// failingRemoval fails every RemoveSummary.
+type failingRemoval struct {
+	store.Store
+	tries atomic.Int32
+}
+
+func (s *failingRemoval) RemoveSummary(context.Context, store.Message, string, int64) error {
+	s.tries.Add(1)
+	return errStore
+}
+
+// A summary whose removal keeps failing is tried again later, not at once,
+// sends only what it has not sent, and after MaxSummaryFailures in a row
+// is given up.
+func TestASummaryThatCannotBeRemovedIsGivenUp(t *testing.T) {
+	everyone := []string{alice, bob, carol}
+	st := &failingRemoval{Store: store.NewMemory()}
+	clock := newFakeClock()
+	cfg := smallQueue
+	cfg.RetryInterval, cfg.MaxRetryInterval = time.Minute, time.Minute
+	r := newRigWith(t, cfg, st, clock)
+	r.e.SetGroupHandler(members{all: everyone})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{bob, carol} {
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(p, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := newAuthor(alice)
+	l := r.listen(t)
+	_, c := r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	a.listen(t, c)
+	for try := int32(1); try < MaxSummaryFailures; try++ {
+		waitFor(t, fmt.Sprint("removal ", try), func() bool { return st.tries.Load() == try && r.idle() })
+		if _, sums := queuedReceipts(t, r, alice); sums != 1 {
+			t.Fatalf("%d summaries after %d failed removals", sums, try)
+		}
+		waitFor(t, "the retry", func() bool { return clock.armed(time.Minute) })
+		clock.Advance(time.Minute)
+	}
+	waitFor(t, "the summary given up", func() bool { return r.m.get("group.summary.abandoned") == 1 && r.idle() })
+	if _, sums := queuedReceipts(t, r, alice); sums != 0 || st.tries.Load() != MaxSummaryFailures {
+		t.Fatalf("%d summaries after %d removals", sums, st.tries.Load())
+	}
+	// Two notifications from the summary (bob's went whole), once: the
+	// passes after the first had nothing new to send.
+	if got := r.m.get("group.summary.sent"); got != 2 || !a.readByAll("m1", []string{bob, carol}) {
+		t.Fatalf("summary sent %d notifications", got)
 	}
 }
 

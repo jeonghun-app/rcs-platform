@@ -481,12 +481,16 @@ func (e *Engine) summarize(ctx context.Context, sent store.Sent, o GroupOrigin, 
 // sendSummary delivers a claimed summary on the author's leg l: from the
 // group's sent record, for each participant that reported, its strongest
 // notification (display before delivery before processing), as a
-// notification of its own From the participant To the author, without a
-// success report. The summary is removed only if no notification was
-// marked since the record was read (store.Store.RemoveSummary); otherwise
-// it is released and the queue read again, so that it goes out once more
-// with the new ones. The author's client takes a repeat as the same
-// status again.
+// notification of its own From the participant To the author. All but the
+// last go without reports (Failure-Report: no, no Success-Report); the
+// last asks for a success report (Leg.send), and since one session
+// delivers in order, its 200 says the client has them all. Only then is
+// the summary removed, and only if no notification was marked since the
+// record was read (store.Store.RemoveSummary); otherwise it is released
+// and the queue read again, so that it goes out once more with the new
+// ones, to the participants whose notification changed. A removal that
+// fails otherwise is tried again at the next delivery, MaxSummaryFailures
+// times in a row at most, after which the summary is given up.
 func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outcome {
 	now := e.clock.Now()
 	sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
@@ -495,6 +499,7 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		// The record expired: there is nothing left to send.
+		e.forgetSummary(m)
 		e.remove(m)
 		return done
 	case err != nil:
@@ -502,44 +507,162 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 		e.release(m)
 		return stop
 	}
-	bodies, err := e.summaryNotifications(sent, now)
+	notes, err := e.summaryNotifications(sent, now)
 	if err != nil {
 		e.metrics.Count("imdn.generate_failed", 1)
+		e.forgetSummary(m)
 		e.remove(m)
 		return done
 	}
-	for _, body := range bodies {
+	confirmed := e.summarySent(m)
+	var send []summaryNote
+	for _, n := range notes {
+		if confirmed[n.notifier] != n.state {
+			send = append(send, n)
+		}
+	}
+	for i, n := range send {
 		dctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
-		_, err := l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, FailureReport: msrp.ReportNo})
+		if i < len(send)-1 {
+			_, err = l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: n.body, FailureReport: msrp.ReportNo})
+			cancel()
+			if err != nil {
+				e.metrics.Count("delivery.msrp_failed", 1)
+				e.release(m)
+				return stop
+			}
+			e.metrics.Count("group.summary.sent", 1)
+			continue
+		}
+		code, err := l.send(dctx, n.body)
 		cancel()
-		if err != nil {
+		switch {
+		case err == nil && code == msrp.StatusOK:
+			e.metrics.Count("group.summary.sent", 1)
+		case err == nil && permanent(code):
+			e.forgetSummary(m)
+			e.giveUp(m, "delivery.refused")
+			return done
+		default:
 			e.metrics.Count("delivery.msrp_failed", 1)
 			e.release(m)
 			return stop
 		}
-		e.metrics.Count("group.summary.sent", 1)
 	}
+	// The client has every one of them now.
+	states := make(map[string]string, len(notes))
+	for _, n := range notes {
+		states[n.notifier] = n.state
+	}
+	e.rememberSummary(m, states)
 	rctx, cancel := e.recordCtx()
 	err = e.store.RemoveSummary(rctx, m, e.cfg.InstanceID, sent.MarkCount)
 	cancel()
 	switch {
+	case err == nil:
+		e.forgetSummary(m)
+		e.metrics.Count("group.summary.expanded", 1)
+		return done
 	case errors.Is(err, store.ErrMarksChanged):
+		e.summaryProgressed(m)
 		e.release(m)
 		return whole
-	case err != nil:
-		e.storeFailed("remove summary", m.Recipient, err)
 	}
-	e.metrics.Count("group.summary.expanded", 1)
-	return done
+	e.storeFailed("remove summary", m.Recipient, err)
+	if e.summaryFailed(m) >= MaxSummaryFailures {
+		// Sent whole that many times: giving it up is better than sending
+		// it again at every lease for as long as the store refuses.
+		e.forgetSummary(m)
+		e.giveUp(m, "group.summary.abandoned")
+		return done
+	}
+	e.release(m)
+	return stop
+}
+
+// MaxSummaryFailures is how many times in a row a summary's removal may
+// fail, other than for new marks, before it is given up.
+const MaxSummaryFailures = 3
+
+// summaryState is what the engine remembers of a summary between
+// deliveries on this task: the notification state each participant was
+// last sent in a pass the client confirmed, and how many removals have
+// failed in a row.
+type summaryState struct {
+	sent     map[string]string
+	failures int
+}
+
+func summaryKey(m store.Message) legKey { return legKey{m.Recipient, m.ID} }
+
+func (e *Engine) summarySent(m store.Message) map[string]string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if st := e.summaries[summaryKey(m)]; st != nil {
+		return st.sent
+	}
+	return nil
+}
+
+// summaryFor needs e.mu.
+func (e *Engine) summaryFor(m store.Message) *summaryState {
+	k := summaryKey(m)
+	st := e.summaries[k]
+	if st == nil {
+		if len(e.summaries) >= e.cfg.MaxTracked {
+			for x := range e.summaries {
+				delete(e.summaries, x)
+				break
+			}
+		}
+		st = &summaryState{}
+		e.summaries[k] = st
+	}
+	return st
+}
+
+func (e *Engine) rememberSummary(m store.Message, sent map[string]string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.summaryFor(m).sent = sent
+}
+
+func (e *Engine) summaryFailed(m store.Message) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	st := e.summaryFor(m)
+	st.failures++
+	return st.failures
+}
+
+// summaryProgressed restarts the count of failed removals: new marks are
+// not a failure.
+func (e *Engine) summaryProgressed(m store.Message) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.summaryFor(m).failures = 0
+}
+
+func (e *Engine) forgetSummary(m store.Message) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.summaries, summaryKey(m))
 }
 
 // kindRank orders notification kinds by strength: what a participant
 // displayed it has had delivered.
 var kindRank = map[imdn.Kind]int{imdn.ProcessingNotification: 1, imdn.DeliveryNotification: 2, imdn.DisplayNotification: 3}
 
-// summaryNotifications builds the notifications sendSummary sends, in the
-// order of the participants' identities.
-func (e *Engine) summaryNotifications(sent store.Sent, now time.Time) ([][]byte, error) {
+// summaryNote is one notification a summary sends: from notifier, in
+// state (kind and status), as body.
+type summaryNote struct {
+	notifier, state string
+	body            []byte
+}
+
+// summaryNotifications builds the notifications a summary stands for, in
+// the order of the participants' identities.
+func (e *Engine) summaryNotifications(sent store.Sent, now time.Time) ([]summaryNote, error) {
 	type best struct {
 		kind   imdn.Kind
 		status imdn.Status
@@ -556,7 +679,7 @@ func (e *Engine) summaryNotifications(sent store.Sent, now time.Time) ([][]byte,
 		}
 	}
 	notifiers := slices.Sorted(maps.Keys(strongest))
-	bodies := make([][]byte, 0, len(notifiers))
+	notes := make([]summaryNote, 0, len(notifiers))
 	for _, notifier := range notifiers {
 		b := strongest[notifier]
 		id, err := imdn.NewMessageID(e.rand)
@@ -572,9 +695,9 @@ func (e *Engine) summaryNotifications(sent store.Sent, now time.Time) ([][]byte,
 		if err != nil {
 			return nil, err
 		}
-		bodies = append(bodies, body)
+		notes = append(notes, summaryNote{notifier: notifier, state: string(b.kind) + " " + string(b.status), body: body})
 	}
-	return bodies, nil
+	return notes, nil
 }
 
 // groupComposing passes an is-composing indication to the open sessions
