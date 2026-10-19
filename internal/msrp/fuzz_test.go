@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
+	"strings"
 	"testing"
 	"testing/iotest"
+
+	"github.com/jeonghun-app/rcs-platform/internal/pii"
 )
 
 var fuzzSeeds = []string{
@@ -85,7 +89,8 @@ func transcript(t *testing.T, src io.Reader) string {
 }
 
 // FuzzParseURI checks that every URI ParseURI accepts formats to a string
-// that parses to an equal URI.
+// that parses to an equal URI, and that its redacted form never shows an
+// IP address host whole (#80).
 func FuzzParseURI(f *testing.F) {
 	for _, s := range []string{
 		aliceURI, "msrps://u@[2001:db8::1]:2856/a+b=c/d;tcp;x=y;z", "msrp://192.0.2.1:1;TCP",
@@ -105,6 +110,13 @@ func FuzzParseURI(f *testing.F) {
 		}
 		if !u.Equal(v) || !v.Equal(u) || v.String() != formatted || !u.valid() {
 			t.Fatalf("%q and %q differ", s, formatted)
+		}
+		if ip, err := netip.ParseAddr(u.Host); err == nil {
+			// The network is shown, and the address nowhere else.
+			r, network := u.Redacted(), pii.TruncateIP(u.Host)
+			if !strings.Contains(r, network) || strings.Contains(strings.Replace(r, network, "", 1), ip.Unmap().String()) {
+				t.Fatalf("%q redacts to %q, want only its network %s", s, r, network)
+			}
 		}
 	})
 }

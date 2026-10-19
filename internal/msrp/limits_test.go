@@ -687,6 +687,38 @@ func TestURIsPrintWithoutTheirSessionID(t *testing.T) {
 	}
 }
 
+func TestClientAddressesInURIsAreLoggedAsTheirNetwork(t *testing.T) {
+	// A client's a=path names the UE's address (#80); like sip's hosts,
+	// every IP address is logged as its /24 or /48 without the port, and a
+	// name is kept.
+	for _, tt := range []struct{ uri, want string }{
+		{"msrp://198.51.100.23:49152/s3cr3tsess10n;tcp", "msrp://198.51.100.0/24/[redacted];tcp"},
+		{"msrps://10.20.30.40:2856/s3cr3tsess10n;tcp", "msrps://10.20.30.0/24/[redacted];tcp"},
+		{"msrp://[2001:db8:5:6::17]:2855/s3cr3tsess10n;tcp", "msrp://[2001:db8:5::/48]/[redacted];tcp"},
+		{"msrp://[::ffff:198.51.100.23]:2855/s3cr3tsess10n;tcp", "msrp://198.51.100.0/24/[redacted];tcp"},
+		{"msrp://relay.example.com:2855/s3cr3tsess10n;tcp", "msrp://relay.example.com:2855/[redacted];tcp"},
+	} {
+		u := mustURI(t, tt.uri)
+		if got := u.Redacted(); got != tt.want {
+			t.Errorf("Redacted(%s) = %q, want %q", tt.uri, got, tt.want)
+		}
+	}
+	// The same in a message's paths, as every log line shows them.
+	m := &Message{TransactionID: "t1", Method: MethodSend,
+		ToPath:   []URI{mustURI(t, "msrp://relay.example.com:2855/r3l4ysess;tcp")},
+		FromPath: []URI{mustURI(t, "msrp://198.51.100.23:49152/s3cr3tsess10n;tcp")}}
+	var logged bytes.Buffer
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("x", "msg", m)
+	for _, out := range []string{logged.String(), fmt.Sprint(m)} {
+		if strings.Contains(out, "198.51.100.23") || strings.Contains(out, "49152") {
+			t.Errorf("the client's address is logged: %s", out)
+		}
+		if !strings.Contains(out, "198.51.100.0/24") {
+			t.Errorf("the client's network is lost: %s", out)
+		}
+	}
+}
+
 func TestMessagesPrintWithoutBodiesOrSessionIDs(t *testing.T) {
 	m := &Message{TransactionID: "l0gged", Method: MethodSend, ToPath: []URI{mustURI(t, asURI)}, FromPath: []URI{mustURI(t, clientURI)},
 		MessageID: "msg1", ByteRange: &ByteRange{1, 15, 15}, ContentType: "text/plain",
