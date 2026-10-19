@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"unicode"
 )
 
 // Request is the view of a SIP request that service point triggers examine.
@@ -307,17 +308,24 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // such as \d and (?i), and the parsed tree, not the source text, is what gets
 // compiled: Go's matcher reads Perl syntax, in which some valid EREs mean
 // something else. "0+?" is (0+)? in an ERE, which matches the empty value,
-// but the lazy 0+? in Perl, which needs a 0 (#61). The tree is written out in
-// Go's own syntax with every flag explicit, and the text is parsed back and
-// compared with the tree, so a pattern whose meaning could not be kept
-// exactly is refused rather than compiled into something else.
+// but the lazy 0+? in Perl, which needs a 0 (#61).
 //
-// The program size is estimated from the parse tree before anything is
-// expanded, so a pattern such as "[ab]{1000}" repeated is refused without
-// building its program, and then counted exactly against
-// MaxPatternInstructions and the set's remaining budget.
+// A case-insensitive pattern is parsed with FoldCase, so that the parser
+// folds every literal and bracket expression before it merges them; folding
+// text afterwards would fold the gaps of a negated class instead (the class
+// [^a-z] that "K|[^[:lower:]]" merges into would lose k and K).
+//
+// The tree's size is checked first, and then the tree is written out by
+// writeTree, which spells every node explicitly in time linear in the tree.
+// The text is parsed back and compared with the tree by meaning
+// ([sameMeaning]), so a pattern whose meaning could not be kept exactly is
+// refused rather than compiled into something else.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
-	tree, err := syntax.Parse(source, posixFlags)
+	flags := posixFlags
+	if mode&patternFoldCase != 0 {
+		flags |= syntax.FoldCase
+	}
+	tree, err := syntax.Parse(source, flags)
 	if err != nil {
 		var se *syntax.Error
 		if errors.As(err, &se) {
@@ -328,26 +336,25 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if mode&patternWhole == 0 {
 		tree = withoutOuterDotStar(tree)
 	}
-	body := tree.String()
-	if back, err := syntax.Parse(body, syntax.Perl); err != nil || !back.Equal(tree) {
+	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
+	if estimateSize(tree) > 4*MaxPatternInstructions {
+		return pattern{}, tooComplex
+	}
+	var b strings.Builder
+	if !writeTree(&b, tree) {
 		return pattern{}, fmt.Errorf("%s cannot be compiled without changing its meaning", name)
 	}
-	// Case folding is applied around the proven text, so that it cannot
-	// change the structure the comparison above checked.
-	expr := "(?:" + body + ")"
-	if mode&patternFoldCase != 0 {
-		expr = "(?i:" + body + ")"
+	body := b.String()
+	if back, err := syntax.Parse(body, syntax.Perl); err != nil || !sameMeaning(back, tree) {
+		return pattern{}, fmt.Errorf("%s cannot be compiled without changing its meaning", name)
 	}
+	expr := body
 	if mode&patternWhole != 0 {
-		expr = "^" + expr + "$"
+		expr = `\A(?:` + body + `)\z`
 	}
 	perl, err := syntax.Parse(expr, syntax.Perl)
 	if err != nil {
 		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
-	}
-	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
-	if estimateSize(perl) > 4*MaxPatternInstructions {
-		return pattern{}, tooComplex
 	}
 	prog, err := syntax.Compile(perl.Simplify())
 	if err != nil {
@@ -371,6 +378,204 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	}
 	_, p.linear = re.LiteralPrefix()
 	return p, nil
+}
+
+// writeTree writes re in Go's Perl syntax, spelling out what the POSIX parse
+// decided so that nothing depends on flags inherited from the context: a
+// folded literal in (?i:...), a class as its explicit ranges, "." and the
+// anchors in their flag-independent forms, every quantified operand in a
+// group and every alternative in a capture group. Captures do not change
+// whether a pattern matches. It reports false for an operator the POSIX
+// parse does not produce. Regexp.String would also do, but it scans the
+// whole Unicode case table for every negated class, milliseconds each.
+func writeTree(b *strings.Builder, re *syntax.Regexp) bool {
+	switch re.Op {
+	case syntax.OpNoMatch:
+		b.WriteString(`[^\x00-\x{10FFFF}]`)
+	case syntax.OpEmptyMatch:
+		b.WriteString(`(?:)`)
+	case syntax.OpLiteral:
+		if re.Flags&syntax.FoldCase != 0 {
+			b.WriteString(`(?i:`)
+		} else {
+			b.WriteString(`(?-i:`)
+		}
+		for _, r := range re.Rune {
+			writeRune(b, r)
+		}
+		b.WriteString(`)`)
+	case syntax.OpCharClass:
+		if len(re.Rune) == 0 {
+			b.WriteString(`[^\x00-\x{10FFFF}]`)
+			break
+		}
+		b.WriteString(`[`)
+		for i := 0; i+1 < len(re.Rune); i += 2 {
+			writeRune(b, re.Rune[i])
+			if re.Rune[i+1] != re.Rune[i] {
+				b.WriteString(`-`)
+				writeRune(b, re.Rune[i+1])
+			}
+		}
+		b.WriteString(`]`)
+	case syntax.OpAnyChar:
+		b.WriteString(`(?s:.)`)
+	case syntax.OpAnyCharNotNL:
+		b.WriteString(`(?-s:.)`)
+	case syntax.OpBeginText:
+		b.WriteString(`\A`)
+	case syntax.OpEndText:
+		b.WriteString(`\z`)
+	case syntax.OpBeginLine:
+		b.WriteString(`(?m:^)`)
+	case syntax.OpEndLine:
+		b.WriteString(`(?m:$)`)
+	case syntax.OpCapture:
+		b.WriteString(`(`)
+		if !writeTree(b, re.Sub[0]) {
+			return false
+		}
+		b.WriteString(`)`)
+	case syntax.OpStar, syntax.OpPlus, syntax.OpQuest, syntax.OpRepeat:
+		b.WriteString(`(?:`)
+		if !writeTree(b, re.Sub[0]) {
+			return false
+		}
+		b.WriteString(`)`)
+		switch re.Op {
+		case syntax.OpStar:
+			b.WriteString(`*`)
+		case syntax.OpPlus:
+			b.WriteString(`+`)
+		case syntax.OpQuest:
+			b.WriteString(`?`)
+		default:
+			switch {
+			case re.Max == re.Min:
+				fmt.Fprintf(b, "{%d}", re.Min)
+			case re.Max < 0:
+				fmt.Fprintf(b, "{%d,}", re.Min)
+			default:
+				fmt.Fprintf(b, "{%d,%d}", re.Min, re.Max)
+			}
+		}
+		if re.Flags&syntax.NonGreedy != 0 {
+			b.WriteString(`?`)
+		}
+	case syntax.OpConcat:
+		b.WriteString(`(?:`)
+		for _, sub := range re.Sub {
+			if !writeTree(b, sub) {
+				return false
+			}
+		}
+		b.WriteString(`)`)
+	case syntax.OpAlternate:
+		// Each alternative is a capture group so that parsing the text
+		// back does not factor or merge the alternatives again, which it
+		// would do differently from the first parse ("0.|00|0.0"); the
+		// proof compares the trees without captures.
+		b.WriteString(`(?:`)
+		for i, sub := range re.Sub {
+			if i > 0 {
+				b.WriteString(`|`)
+			}
+			b.WriteString(`(`)
+			if !writeTree(b, sub) {
+				return false
+			}
+			b.WriteString(`)`)
+		}
+		b.WriteString(`)`)
+	default:
+		return false
+	}
+	return true
+}
+
+// writeRune writes r so that it reads as itself in a pattern and in a class.
+func writeRune(b *strings.Builder, r rune) {
+	if r < 0x80 && (unicode.IsLetter(r) || unicode.IsDigit(r)) {
+		b.WriteRune(r)
+		return
+	}
+	fmt.Fprintf(b, `\x{%x}`, r)
+}
+
+// sameMeaning reports whether two trees match the same values. Writing a tree
+// out and parsing it back often changes its shape without changing its
+// meaning: "[Tt][Ee][Ll]:" parses to a case-folded literal "TEL" followed by
+// ":", and comes back as one folded "TEL:"; "ab|aB" is factored into a
+// class, a[Bb], and comes back as a folded literal. So the trees are compared
+// by their structure without captures (writeTree adds some), and failing
+// that by the programs they compile to, after folded literals have been
+// spelt out as the classes of their case variants and the flag that has no
+// effect on a class removed.
+func sameMeaning(a, b *syntax.Regexp) bool {
+	if a.Equal(b) || withoutCaptures(a).Equal(withoutCaptures(b)) {
+		return true
+	}
+	pa, errA := syntax.Compile(withoutFolding(withoutCaptures(a)).Simplify())
+	pb, errB := syntax.Compile(withoutFolding(withoutCaptures(b)).Simplify())
+	return errA == nil && errB == nil && pa.String() == pb.String()
+}
+
+// withoutCaptures returns a copy of re with every capture group replaced by
+// its content: captures decide what a match reports, not whether there is one.
+func withoutCaptures(re *syntax.Regexp) *syntax.Regexp {
+	if re.Op == syntax.OpCapture {
+		return withoutCaptures(re.Sub[0])
+	}
+	c := *re
+	c.Sub = make([]*syntax.Regexp, len(re.Sub))
+	for i, sub := range re.Sub {
+		c.Sub[i] = withoutCaptures(sub)
+	}
+	return &c
+}
+
+// withoutFolding returns a copy of re in which every case-folded literal is a
+// sequence of plain literals and classes of all case variants
+// (unicode.SimpleFold), and no class carries the FoldCase flag: classes list
+// their runes, so the flag adds nothing to what they match.
+func withoutFolding(re *syntax.Regexp) *syntax.Regexp {
+	c := *re
+	c.Sub = make([]*syntax.Regexp, len(re.Sub))
+	for i, sub := range re.Sub {
+		c.Sub[i] = withoutFolding(sub)
+	}
+	switch re.Op {
+	case syntax.OpCharClass:
+		c.Flags &^= syntax.FoldCase
+		c.Rune = slices.Clone(re.Rune)
+	case syntax.OpLiteral:
+		if re.Flags&syntax.FoldCase == 0 {
+			c.Rune = slices.Clone(re.Rune)
+			return &c
+		}
+		parts := make([]*syntax.Regexp, len(re.Rune))
+		for i, r := range re.Rune {
+			variants := []rune{r}
+			for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+				variants = append(variants, f)
+			}
+			if len(variants) == 1 {
+				parts[i] = &syntax.Regexp{Op: syntax.OpLiteral, Flags: re.Flags &^ syntax.FoldCase, Rune: variants}
+				continue
+			}
+			slices.Sort(variants)
+			ranges := make([]rune, 0, 2*len(variants))
+			for _, v := range variants {
+				ranges = append(ranges, v, v)
+			}
+			parts[i] = &syntax.Regexp{Op: syntax.OpCharClass, Rune: ranges}
+		}
+		if len(parts) == 1 {
+			return parts[0]
+		}
+		return &syntax.Regexp{Op: syntax.OpConcat, Sub: parts}
+	}
+	return &c
 }
 
 // isPlainToken reports whether s is a header name made only of token
@@ -408,14 +613,15 @@ func matchesSomething(content string) bool {
 // substring search instead of the full engine. Only the compiled form
 // changes; the criteria keep the pattern as provisioned.
 //
-// The two match the same values. "." matches every character (posixFlags),
-// so if P matches at some position of a value, ".*P" matches from its start
-// with ".*" taking what precedes P, and every match of ".*P" contains one of
-// P after the ".*"; any anchor in P is checked at the same position either
-// way. The same holds at the end. Only the operands of the top-level
-// concatenation are dropped, and only when they are exactly a star over a
-// dot: ".*a|b" is an alternation and keeps its ".*", and ".*?", which an ERE
-// reads as (.*)?, is left alone.
+// The two match the same values, whatever "." matches: the search is
+// unanchored and ".*" may match the empty string, so ".*P" matches a value
+// exactly when P matches somewhere in it, with ".*" taking nothing or what
+// precedes P; any anchor in P is checked at the same position either way.
+// The same holds at the end. (The disagreement in #61 came from the plain
+// path compiling the source as Perl, not from the removal.) Only the
+// operands of the top-level concatenation are dropped, and only when they
+// are exactly a star over a dot: ".*a|b" is an alternation and keeps its
+// ".*", and ".*?", which an ERE reads as (.*)?, is left alone.
 func withoutOuterDotStar(tree *syntax.Regexp) *syntax.Regexp {
 	dotStar := func(re *syntax.Regexp) bool {
 		return re.Op == syntax.OpStar && (re.Sub[0].Op == syntax.OpAnyChar || re.Sub[0].Op == syntax.OpAnyCharNotNL)
