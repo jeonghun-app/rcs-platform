@@ -120,7 +120,8 @@ It answers the registrar's challenge:
   `Authorization` with the IMPI, the home domain as realm and an empty nonce
   and response, from which the S-CSCF learns the private identity (TS 24.229
   §5.1.1.2.2, §5.1.1.2.3).
-- It answers only challenges for the home domain's realm. An answer for
+- It answers only challenges for the S-CSCF's realm (`Config.Realm`), which is
+  the home domain unless the HSS's realm (`HSS_IMS_REALM`) was set apart. An answer for
   another realm would give that hop a response computed from the home
   password to guess it from offline. Of those, it takes the topmost it can
   meet (§5.1.1.5.4): with a password, MD5 or SHA-256 with `qop=auth` (RFC

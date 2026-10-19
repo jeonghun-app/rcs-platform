@@ -1,6 +1,7 @@
 package digest
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
@@ -48,5 +49,34 @@ func TestOnlyAKAMayGoWithoutQOP(t *testing.T) {
 		if _, err := Respond(ch, p); !errors.Is(err, ErrUnsupportedQOP) {
 			t.Errorf("%s: Respond = %v, want ErrUnsupportedQOP", name, err)
 		}
+	}
+}
+
+func TestVerifyAKARefusesCredentialsWithoutQOP(t *testing.T) {
+	// The client answers an AKA challenge without qop in the form without
+	// it; the server side, which always offers qop=auth, must still refuse
+	// that form: it has no nonce-count to stop a replay (security review
+	// of #187).
+	h := newHarness(t)
+	_, v := set1(t)
+	ch, err := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch.QOP = nil
+	answer, err := Respond(ch, ClientParams{Username: testUser, Password: v.XRES[:], Method: "REGISTER", URI: testURI})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// As the server reads it off the wire.
+	c, err := ParseCredentials(answer.Header())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], h.vectorExpires); !errors.Is(err, ErrUnsupportedQOP) {
+		t.Fatalf("VerifyAKA = %v, want ErrUnsupportedQOP", err)
+	}
+	if err := h.server.Check(c); !errors.Is(err, ErrUnsupportedQOP) {
+		t.Fatalf("Check = %v, want ErrUnsupportedQOP", err)
 	}
 }
