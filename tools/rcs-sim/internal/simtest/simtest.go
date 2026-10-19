@@ -8,12 +8,14 @@ package simtest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -93,9 +95,30 @@ type Relay struct {
 // listener on loopback (no NLB, so no PROXY header and no TLS), and the
 // core side limited to loopback and corePorts. It is configured through
 // msrprelay.Configure from the environment it would get in a test stack.
+//
+// The relay must be told its ports before it listens, so they come from
+// FreePorts, which gives two different ones. Something can still take one
+// before the relay listens on it. Then the relay stops at once, and
+// StartRelay tries again with fresh ports, up to three times.
 func StartRelay(t testing.TB, corePorts ...int) *Relay {
 	t.Helper()
-	public, control := FreePort(t), FreePort(t)
+	for attempt := 1; ; attempt++ {
+		ports := freePorts(t, 2)
+		r, err := startRelay(t, ports[0], ports[1], corePorts)
+		switch {
+		case err == nil:
+			return r
+		case !errors.Is(err, syscall.EADDRINUSE) || attempt == 3:
+			t.Fatalf("msrp-relay stopped: %v", err)
+		}
+	}
+}
+
+// startRelay starts the relay on the given ports and waits until it is
+// ready. If the relay stops first, it returns the error the relay stopped
+// with; the relay's cleanup does not wait for it a second time.
+func startRelay(t testing.TB, public, control int, corePorts []int) (*Relay, error) {
+	t.Helper()
 	ports := make([]string, len(corePorts))
 	for i, p := range corePorts {
 		ports[i] = strconv.Itoa(p)
@@ -123,11 +146,19 @@ func StartRelay(t testing.TB, corePorts ...int) *Relay {
 	}
 	h := runtimetest.New(t, "msrp-relay")
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- msrprelay.Run(ctx, h.Runtime, cfg) }()
+	// Closed when Run returns, with runErr set: both the wait for
+	// readiness and the cleanup can see it. A channel holding the one
+	// value let the readiness wait take it, and the cleanup then waited
+	// for ever (#107).
+	stopped := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = msrprelay.Run(ctx, h.Runtime, cfg)
+		close(stopped)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		<-done
+		<-stopped
 	})
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -135,8 +166,8 @@ func StartRelay(t testing.TB, corePorts ...int) *Relay {
 			break
 		}
 		select {
-		case err := <-done:
-			t.Fatalf("msrp-relay stopped: %v", err)
+		case <-stopped:
+			return nil, runErr
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -145,19 +176,37 @@ func StartRelay(t testing.TB, corePorts ...int) *Relay {
 		time.Sleep(10 * time.Millisecond)
 	}
 	u, _ := url.Parse("http://127.0.0.1:" + strconv.Itoa(control))
-	return &Relay{Control: u, Harness: h}
+	return &Relay{Control: u, Harness: h}, nil
 }
 
-// FreePort returns a loopback port nothing listens on at the moment. A
-// service under test that must be told its port before it listens needs
-// one; another process could take it in between, which on a test host is
-// rare enough.
+// FreePort returns a loopback port nothing listens on at the moment, for a
+// service under test that must be told its port before it listens. Nothing
+// stops another socket from taking it before the service listens on it.
+// A caller that needs several ports at once takes them from FreePorts,
+// since two calls in a row can return the same port.
 func FreePort(t testing.TB) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	return FreePorts(t, 1)[0]
 }
+
+// FreePorts returns n different loopback ports nothing listens on at the
+// moment. It holds a listener on each until it has all of them: a port
+// closed before the next is picked can be the next, which made StartRelay
+// give its public and control listeners the same port (QA on #127).
+func FreePorts(t testing.TB, n int) []int {
+	t.Helper()
+	ports := make([]int, n)
+	for i := range ports {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		ports[i] = ln.Addr().(*net.TCPAddr).Port
+	}
+	return ports
+}
+
+// freePorts is where StartRelay takes its ports from; a test replaces it to
+// hand out a taken one.
+var freePorts = FreePorts
