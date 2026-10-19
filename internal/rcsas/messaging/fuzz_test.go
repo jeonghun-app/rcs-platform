@@ -52,6 +52,7 @@ func FuzzParseMessage(f *testing.F) {
 		if string(m.Raw) != string(data) || (m.Notification != nil && m.Request.Dispositions != 0) {
 			t.Fatalf("message %+v", m)
 		}
+		checkAccepted(t, m)
 	})
 }
 
@@ -69,31 +70,30 @@ func FuzzEscapeDisplayName(f *testing.F) {
 }
 
 func FuzzGroupView(f *testing.F) {
-	f.Add(chat(f, "m1", "hi", 3))
-	f.Add([]byte("From: \"A\" <sip:a@x>\r\nTo: <sip:b@x>\r\nTo: <sip:c@x>\r\n\r\nContent-Type: text/plain\r\n\r\nhi"))
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Add(chat(f, "m1", "hi", 3), "Alice")
+	f.Add([]byte("From: \"A\" <sip:a@x>\r\nTo: <sip:b@x>\r\nTo: <sip:c@x>\r\n\r\nContent-Type: text/plain\r\n\r\nhi"), "")
+	for _, extra := range secondSender {
+		f.Add(withHeaders(extra, ""), "A \"name\"")
+	}
+	f.Add(withHeaders("", "From: <"+carol+">\r\n"), "")
+	f.Fuzz(func(t *testing.T, data []byte, name string) {
 		c, err := cpim.Limits{MaxSize: 4096}.Parse(data)
 		if err != nil {
 			return
 		}
-		from, err := c.From()
-		if err != nil {
-			return
+		// What participants get, as any receiver reads it, is from the
+		// author under the roster's name to the group, and names nobody
+		// else as either; a notification keeps its notifier's To.
+		// A roster name is valid UTF-8 (the group package checks).
+		author := cpim.Address{Name: strings.ToValidUTF8(name, "\ufffd"), URI: alice}
+		if out, err := groupView(c, author, groupURI); err == nil {
+			if from := readAddresses(t, out, author, "<"+groupURI+">"); string(from.Body) != string(c.Body) {
+				t.Fatalf("body %q, want %q", from.Body, c.Body)
+			}
 		}
-		out, err := groupView(c, cpim.Address{Name: from.Name, URI: alice}, groupURI)
-		if err != nil {
-			return
-		}
-		// What participants get always parses, from the author to the
-		// group.
-		got, err := cpim.Parse(out)
-		if err != nil {
-			t.Fatalf("groupView output does not parse: %v\n%q", err, out)
-		}
-		f2, err := got.From()
-		to, err2 := got.To()
-		if err != nil || err2 != nil || f2.URI != alice || len(to) != 1 || to[0].URI != groupURI {
-			t.Fatalf("From %v (%v), To %v (%v)", f2, err, to, err2)
+		to, ok := c.Get(cpim.CoreNamespace, cpim.HeaderTo)
+		if out, err := groupView(c, cpim.Address{URI: alice}, ""); err == nil && ok {
+			readAddresses(t, out, cpim.Address{URI: alice}, to.Value)
 		}
 	})
 }

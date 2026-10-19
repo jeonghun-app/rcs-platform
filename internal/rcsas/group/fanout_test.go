@@ -63,9 +63,10 @@ func TestAMessageReachesEveryParticipantWithoutWaitingForTheSlowOrTheOffline(t *
 	}
 	got := asSeen(t, b.next(t))
 	from, to := fromTo(t, got)
-	// From is alice's asserted identity, with her chosen name; To is the
-	// group; everything else is hers.
-	if from.URI != alice || from.Name != "A Name" || to != g.URI || string(got.Body) != "hello all" {
+	// From is alice's asserted identity, under her name in the roster
+	// rather than the one her client wrote; To is the group; everything
+	// else is hers.
+	if from.URI != alice || from.Name != "Alice" || to != g.URI || string(got.Body) != "hello all" {
 		t.Fatalf("bob got From %v To %s: %q", from, to, got.Body)
 	}
 	if h, ok := got.Get(imdn.Namespace, imdn.HeaderMessageID); !ok || h.Value != "m1" {

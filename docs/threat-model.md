@@ -196,8 +196,12 @@ metadata.
   Who asks is the identity the network asserted (T2). Every change is a
   conditional write on the revision it was computed from, so no concurrent
   change is lost or reordered.
-- **Authorship.** A group message's CPIM `From` is rewritten to the writer's
-  asserted identity, so nobody writes as someone else.
+- **Authorship.** A group message's CPIM header block is rebuilt with one
+  `From`, the writer's asserted identity under its roster name, and one `To`,
+  the group. No other header that any receiver could read as a `From` or `To`
+  survives, whatever its case, prefix or namespace, so nobody writes as
+  someone else, by address or by name. A 1-to-1 message, forwarded unchanged,
+  is refused if it has such a header.
 - **Notifications.** They are matched by the group's own record of the
   message, accepted only from participants it went to, once per kind.
 - **Floods and spam.** These are bounded:

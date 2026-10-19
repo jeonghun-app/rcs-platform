@@ -35,7 +35,10 @@ type Message struct {
 	Notification *imdn.Notification
 }
 
-var errLongMessageID = errors.New("messaging: Message-ID longer than " + strconv.Itoa(MaxMessageIDLength) + " bytes")
+var (
+	errLongMessageID   = errors.New("messaging: Message-ID longer than " + strconv.Itoa(MaxMessageIDLength) + " bytes")
+	errAmbiguousSender = errors.New("messaging: more than one header that could be read as From or To")
+)
 
 // ParseMessage reads a message/cpim body of at most maxSize bytes. Its
 // errors are *Rejection.
@@ -50,6 +53,9 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 	from, err := c.From()
 	if err != nil {
 		return nil, reject(ReasonMalformed, err)
+	}
+	if !singleAddresses(c) {
+		return nil, reject(ReasonMalformed, errAmbiguousSender)
 	}
 	m := &Message{Raw: raw, CPIM: c, From: from}
 	if imdn.IsNotification(c) {
@@ -75,6 +81,51 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 		return nil, reject(ReasonMalformed, errLongMessageID)
 	}
 	return m, nil
+}
+
+// addressHeader returns cpim.HeaderFrom or cpim.HeaderTo when a header
+// called name could be taken for one by some receiver, whatever its case,
+// namespace prefix or namespace, and "" otherwise. RFC 3862 §2.2 makes
+// header names case-sensitive and §3.4 puts a prefixed name in the
+// namespace its NS header binds, but a receiver that compares names
+// loosely, or reads a prefix bound to the core namespace under another
+// spelling of its URN, would find a From or To there all the same.
+func addressHeader(name string) string {
+	local := name[strings.LastIndexByte(name, '.')+1:]
+	switch {
+	case strings.EqualFold(local, cpim.HeaderFrom):
+		return cpim.HeaderFrom
+	case strings.EqualFold(local, cpim.HeaderTo):
+		return cpim.HeaderTo
+	}
+	return ""
+}
+
+// singleAddresses reports whether c names its sender once and its
+// recipient at most once: the only header that addressHeader takes for a
+// From is the core From, the only one it takes for a To, if any, the core
+// To, and no content header looks like either. The engine checks the core
+// From against the sender's identities and forwards a 1-to-1 message as it
+// came (RFC 3862 §2.2), so a second From that a receiver might read
+// instead would let a sender write as someone else. RFC 3862 §4.2 allows
+// several To headers; RCS clients write one.
+func singleAddresses(c *cpim.Message) bool {
+	var from, to int
+	for _, h := range c.Headers {
+		switch addressHeader(h.Name) {
+		case cpim.HeaderFrom:
+			from++
+		case cpim.HeaderTo:
+			to++
+		}
+	}
+	for _, f := range c.ContentHeaders {
+		if addressHeader(f.Name) != "" {
+			return false
+		}
+	}
+	return from == 1 && to <= 1 && len(c.All(cpim.CoreNamespace, cpim.HeaderFrom)) == 1 &&
+		len(c.All(cpim.CoreNamespace, cpim.HeaderTo)) == to
 }
 
 // EscapeDisplayName makes a CPIM formal name safe to copy into another

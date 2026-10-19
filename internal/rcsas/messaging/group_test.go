@@ -15,26 +15,27 @@ import (
 const groupURI = "sip:chat-1@conf.ims.example.net"
 
 // members is a GroupHandler of one group whose participants all write to
-// each other, or refuse when refuse is set.
+// each other, under the names in names, or refuse when refuse is set.
 type members struct {
 	all    []string
+	names  map[string]string
 	refuse error
 }
 
-func (h members) Recipients(_ context.Context, group, sender string, kind GroupKind) ([]string, error) {
+func (h members) Recipients(_ context.Context, group, sender string, kind GroupKind) (Audience, error) {
 	if h.refuse != nil {
-		return nil, h.refuse
+		return Audience{}, h.refuse
 	}
 	if group != groupURI {
-		return nil, Reject(ReasonNoGroup)
+		return Audience{}, Reject(ReasonNoGroup)
 	}
-	var to []string
+	aud := Audience{SenderName: h.names[sender]}
 	for _, m := range h.all {
 		if m != sender {
-			to = append(to, m)
+			aud.Recipients = append(aud.Recipients, m)
 		}
 	}
-	return to, nil
+	return aud, nil
 }
 
 func groupFrom(sender string, body []byte) GroupOrigin {
@@ -179,14 +180,9 @@ func TestGroupViewSetsTheAuthorAndTheGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := cpim.Parse(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	from, _ := got.From()
-	to, _ := got.To()
-	if from != (cpim.Address{Name: "Al", URI: alice}) || len(to) != 1 || to[0].URI != groupURI || string(got.Body) != "hi" {
-		t.Fatalf("From %v To %v body %q", from, to, got.Body)
+	got := readAddresses(t, out, cpim.Address{Name: "Al", URI: alice}, "<"+groupURI+">")
+	if string(got.Body) != "hi" {
+		t.Fatalf("body %q", got.Body)
 	}
 	if dt, ok := got.Get(cpim.CoreNamespace, cpim.HeaderDateTime); !ok || dt.Value != "2026-03-04T05:06:07Z" {
 		t.Fatalf("DateTime %v", dt)

@@ -37,11 +37,21 @@ const (
 
 // GroupHandler decides who a participant's message in a group goes to.
 type GroupHandler interface {
-	// Recipients returns the participants a kind of message from sender
-	// in group goes to, sender left out, or a *Rejection when sender may
-	// not send it there now. For a notification, only the refusal
-	// matters: it goes to the author of the message it reports on.
-	Recipients(ctx context.Context, group, sender string, kind GroupKind) ([]string, error)
+	// Recipients returns who a kind of message from sender in group goes
+	// to, sender left out, or a *Rejection when sender may not send it
+	// there now. For a notification, only the refusal matters: it goes to
+	// the author of the message it reports on.
+	Recipients(ctx context.Context, group, sender string, kind GroupKind) (Audience, error)
+}
+
+// Audience is who a participant's message in a group goes to, and the
+// name the group knows the participant by.
+type Audience struct {
+	Recipients []string
+	// SenderName is the sender's display name in the group's roster, or
+	// empty. It replaces the name the sender's client wrote in the CPIM
+	// From, which could be another participant's.
+	SenderName string
 }
 
 // SetGroupHandler gives the engine the group package that runs the
@@ -78,11 +88,11 @@ type GroupOrigin struct {
 // rcs-as could not take it for every recipient, which the client may retry
 // (each recipient's client drops a duplicate by its Message-ID).
 //
-// rcs-as rewrites the CPIM From to the sender's asserted identity, keeping
-// the display name it chose, and the To to the group. Clients take the
-// author of a group message from its From (rcsjta GroupChatSession), and
-// the sender's own client writes its own address there, which nothing
-// else checks.
+// rcs-as rewrites the CPIM From to the sender's asserted identity, under
+// the name the roster gives it, and the To to the group (groupView).
+// Clients take the author of a group message from its From (rcsjta
+// GroupChatSession), and the sender's own client writes its own address
+// and name there, which nothing else checks.
 func (e *Engine) SubmitGroup(ctx context.Context, o GroupOrigin) error {
 	err := e.submitGroup(ctx, o)
 	var r *Rejection
@@ -136,11 +146,11 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 	if !e.senders.allow(o.Sender, now) {
 		return reject(ReasonRateLimited, nil)
 	}
-	recipients, err := h.Recipients(ctx, o.Group, o.Sender, GroupText)
+	aud, err := h.Recipients(ctx, o.Group, o.Sender, GroupText)
 	if err != nil {
 		return err
 	}
-	return e.submitGroupMessage(ctx, o, m, recipients, now)
+	return e.submitGroupMessage(ctx, o, m, aud, now)
 }
 
 // isComposing reports whether a CPIM message carries an is-composing
@@ -151,39 +161,39 @@ func isComposing(c *cpim.Message) bool {
 	return err == nil && t == IsComposingType
 }
 
-// groupView rewrites a CPIM message as the group's participants see it:
-// From the sender's asserted identity, with the display name the sender
-// chose, and To the group, when to is set.
+// groupView is c as the group's participants see it. Its header block is
+// built anew: From, the sender's asserted identity under its roster name,
+// then To, the group, or when to is empty the To the sender wrote (a
+// notification's, which names the author), then every other header of c
+// in its order. A header that a receiver could take for a From or To
+// (addressHeader) is left out wherever it was, in whatever case, prefix or
+// namespace, so that every receiver reads the author rcs-as checked, and
+// so are content headers that look like one. The two come before any NS
+// header, so they are in the core namespace (RFC 3862 §3.4).
 func groupView(c *cpim.Message, from cpim.Address, to string) ([]byte, error) {
-	for {
-		h, ok := c.Get(cpim.CoreNamespace, cpim.HeaderFrom)
-		if !ok {
-			break
-		}
-		i := slices.Index(c.Headers, h)
-		c.Headers = slices.Delete(c.Headers, i, i+1)
+	out := &cpim.Message{Headers: []cpim.Header{{Name: cpim.HeaderFrom, Value: from.String()}}, Body: c.Body}
+	switch h, ok := c.Get(cpim.CoreNamespace, cpim.HeaderTo); {
+	case to != "":
+		out.Headers = append(out.Headers, cpim.Header{Name: cpim.HeaderTo, Value: cpim.Address{URI: to}.String()})
+	case ok:
+		out.Headers = append(out.Headers, cpim.Header{Name: cpim.HeaderTo, Params: h.Params, Value: h.Value})
 	}
-	for to != "" {
-		h, ok := c.Get(cpim.CoreNamespace, cpim.HeaderTo)
-		if !ok {
-			break
-		}
-		i := slices.Index(c.Headers, h)
-		c.Headers = slices.Delete(c.Headers, i, i+1)
-	}
-	if err := c.AddFirst(cpim.CoreNamespace, cpim.HeaderFrom, from.String()); err != nil {
-		return nil, err
-	}
-	if to != "" {
-		if err := c.AddFirst(cpim.CoreNamespace, cpim.HeaderTo, cpim.Address{URI: to}.String()); err != nil {
-			return nil, err
+	for _, h := range c.Headers {
+		if addressHeader(h.Name) == "" {
+			out.Headers = append(out.Headers, h)
 		}
 	}
-	return c.Marshal()
+	for _, f := range c.ContentHeaders {
+		if addressHeader(f.Name) == "" {
+			out.ContentHeaders = append(out.ContentHeaders, f)
+		}
+	}
+	return out.Marshal()
 }
 
-func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Message, recipients []string, now time.Time) error {
-	body, err := groupView(m.CPIM, cpim.Address{Name: m.From.Name, URI: o.Sender}, o.Group)
+func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Message, aud Audience, now time.Time) error {
+	recipients := aud.Recipients
+	body, err := groupView(m.CPIM, cpim.Address{Name: aud.SenderName, URI: o.Sender}, o.Group)
 	if err != nil {
 		return reject(ReasonMalformed, err)
 	}
@@ -317,15 +327,15 @@ func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrig
 		e.metrics.Count("iscomposing.dropped", 1)
 		return nil
 	}
-	recipients, err := h.Recipients(ctx, o.Group, o.Sender, GroupComposing)
+	aud, err := h.Recipients(ctx, o.Group, o.Sender, GroupComposing)
 	if err != nil {
 		return err
 	}
-	body, err := groupView(m.CPIM, cpim.Address{Name: m.From.Name, URI: o.Sender}, o.Group)
+	body, err := groupView(m.CPIM, cpim.Address{Name: aud.SenderName, URI: o.Sender}, o.Group)
 	if err != nil {
 		return reject(ReasonMalformed, err)
 	}
-	for _, r := range recipients {
+	for _, r := range aud.Recipients {
 		to := e.chatLeg(r, o.Group)
 		if to == nil || !to.composing.CompareAndSwap(false, true) {
 			e.metrics.Count("iscomposing.dropped", 1)

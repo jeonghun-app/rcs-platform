@@ -547,40 +547,41 @@ func activeCount(g *groupstore.Group) int {
 // writes in a group, under its rate per group and the group's fan-out
 // budget, and a message goes to every other current participant; an
 // is-composing indication only to the joined ones, which have a session to
-// show it on.
-func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messaging.GroupKind) ([]string, error) {
+// show it on. The sender's name is the one the roster holds.
+func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messaging.GroupKind) (messaging.Audience, error) {
 	g, err := s.get(ctx, uri)
 	if errors.Is(err, ErrNoGroup) {
-		return nil, messaging.Reject(messaging.ReasonNoGroup)
+		return messaging.Audience{}, messaging.Reject(messaging.ReasonNoGroup)
 	}
 	if err != nil {
-		return nil, err
+		return messaging.Audience{}, err
 	}
-	if i := index(&g, sender); i < 0 || g.Participants[i].State != groupstore.Joined {
-		return nil, messaging.Reject(messaging.ReasonNotParticipant)
+	i := index(&g, sender)
+	if i < 0 || g.Participants[i].State != groupstore.Joined {
+		return messaging.Audience{}, messaging.Reject(messaging.ReasonNotParticipant)
 	}
 	now := s.cfg.Clock.Now()
-	var to []string
+	aud := messaging.Audience{SenderName: g.Participants[i].DisplayName}
 	for _, p := range g.Participants {
 		if p.Identity == sender || !p.State.Active() || kind == messaging.GroupComposing && p.State != groupstore.Joined {
 			continue
 		}
-		to = append(to, p.Identity)
+		aud.Recipients = append(aud.Recipients, p.Identity)
 	}
 	switch kind {
 	case messaging.GroupNotification:
-		return nil, nil
+		return messaging.Audience{}, nil
 	case messaging.GroupText:
 		if !s.senders.Allow(uri+"\x00"+sender, now, 1) {
-			return nil, messaging.Reject(messaging.ReasonRateLimited)
+			return messaging.Audience{}, messaging.Reject(messaging.ReasonRateLimited)
 		}
-		if !s.fanout.Allow(uri, now, len(to)) {
+		if !s.fanout.Allow(uri, now, len(aud.Recipients)) {
 			s.metrics.Count("group.fanout_budget_exceeded", 1)
-			return nil, messaging.Reject(messaging.ReasonRateLimited)
+			return messaging.Audience{}, messaging.Reject(messaging.ReasonRateLimited)
 		}
 		s.touch(ctx, g, now)
 	}
-	return to, nil
+	return aud, nil
 }
 
 // touch writes that the group is in use, at most once per TouchInterval

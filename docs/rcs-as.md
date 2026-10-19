@@ -96,7 +96,14 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    separate token buckets, per task.
 4. **CPIM From.** It must be one of the sender's asserted identities, or the
    anonymous URI `sip:anonymous@anonymous.invalid` that RCS clients put in
-   1-to-1 chat.
+   1-to-1 chat. It must also be the only header that a receiver could read as
+   a From, and at most one header may read as a To: a second `From`, a `from`
+   or `FROM`, a prefixed `x.From` (whatever namespace the prefix is bound
+   to), a `From` after an NS header that changes the default namespace, and
+   a content header named `From` or `To` are all refused as `malformed`. The
+   message is forwarded unchanged, so a receiver that compares header names
+   loosely or reads namespaces differently from `internal/cpim` would
+   otherwise read a sender the engine never checked.
 5. **Sent-message record.** A message that asks for notifications gets one:
    sender, Message-ID, recipients, the dispositions asked for. It is kept for
    `RCSAS_SENT_TTL`. A resend with the same Message-ID to the same recipient
@@ -307,9 +314,13 @@ chat (size, CPIM parse, `From` check, per-sender rate). Then:
 
 - **Rate and budget.** The group applies the sender's rate in this group and
   the group's fan-out budget, which counts one delivery per recipient.
-- **CPIM rewrite.** rcs-as rewrites `From` to the sender's asserted identity
-  (keeping its display name) and `To` to the group, then queues one copy for
-  every other current participant, invited ones included:
+- **CPIM rewrite.** rcs-as builds the header block anew: `From`, the sender's
+  asserted identity under its display name in the roster (not the one its
+  client wrote), then `To`, the group, then every other header in its order.
+  Any header a receiver could take for a `From` or `To` is left out, in any
+  case, prefix or namespace, and both come before any NS header, so they are
+  in the core namespace. It then queues one copy for every other current
+  participant, invited ones included:
   - each copy has `Sender` = the group and `Author` = the writer;
   - each recipient's queue is bounded as in 1-to-1 chat, and the group holds
     at most a share of it like any sender;
@@ -342,7 +353,8 @@ A notification is accepted only when all of these hold:
 - the author asked for that kind;
 - it is the first of its kind from that notifier.
 
-Its `From` is rewritten to the notifier's asserted identity. Notifications
+Its header block is rebuilt as for a message: `From` the notifier's asserted
+identity, and the `To` the notifier wrote, which names the author. Notifications
 rcs-as generates (expiry, full queue) go to the author the same way, from the
 recipient.
 
@@ -623,4 +635,6 @@ Signals to alarm on (Phase 7):
   - is-composing outside CPIM in 1-to-1 chat, and inside CPIM in a group;
   - one message per large-mode session;
   - the group rules above, and the author taken from a group message's CPIM
-    `From`.
+    `From`;
+  - one `From` and at most one `To` per message: RFC 3862 §4.2 allows
+    several `To` headers, but RCS clients write one.
