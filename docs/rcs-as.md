@@ -473,8 +473,13 @@ echoed. The reference client takes notifications in a group only that way: one
 - all but the last: `Failure-Report: no` and no `Success-Report`, so they cost
   no round trip;
 - the last: `Success-Report: yes` and `Failure-Report` left out (yes), like any
-  queued message. One session delivers in order, so its success report says
-  the client has them all.
+  queued message. One session delivers in order over one connection, so its
+  success report says every one of them reached the client.
+
+That is a transport guarantee: nothing was lost on the way. It does not say
+the client took each one, since a client that refuses one in the middle sends
+no report for it under `Failure-Report: no`. Neither the reference client nor
+msrp-relay refuses a single notification within a session.
 
 The summary is removed only once that report says 200, and only if no
 notification was marked since the record was read (the record counts its
@@ -483,9 +488,13 @@ session ending releases it for the next attempt. New marks release it too, and
 it goes again at once, to the participants whose notification changed since
 the last pass the client confirmed (the task remembers, up to
 `Config.MaxTracked` summaries); the author's client takes a repeat as the same
-status. A removal that fails otherwise releases it for the queue's retry, and
-after three such failures in a row it is given up
-(`group.summary.abandoned`). A summary expires with the record
+status. A removal that fails otherwise releases it for the queue's retry.
+A busy store (`store.ErrBusy`, writes to the record that kept conflicting)
+does not count against it, since those writes are mostly the marks
+themselves. After three other failures in a row, the record is read again:
+if notifications were merged into the summary since the pass read it, the
+count starts over and the summary goes again with them. Otherwise it is given
+up (`group.summary.abandoned`). A summary expires with the record
 (`RCSAS_SENT_TTL`), without a notification. A notification is dropped
 (`group.notification.dropped`) only when the summaries' total or the queue
 itself is full.
@@ -749,7 +758,7 @@ identifier ever appears in a metric name.
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
-| `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals |
+| `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but neither queued nor summarized, the summaries' total or the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through
