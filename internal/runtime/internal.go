@@ -1,10 +1,14 @@
 package runtime
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // The rule for plain-http internal APIs (ADR 0007 §5) is applied in one place
@@ -21,9 +25,83 @@ import (
 // address is judged as the IPv4 address it carries.
 func IsPrivateHost(host, namespace string) bool {
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return ip.Zone() == "" && ip.Unmap().IsPrivate()
+		return IsPrivateAddr(ip)
 	}
 	return InServiceNamespace(host, namespace)
+}
+
+// IsPrivateAddr reports whether an internal client may connect to ip
+// (ADR 0007 §5): an RFC 1918 or unique local address without a zone, an
+// IPv4-mapped address judged as the IPv4 address it carries.
+func IsPrivateAddr(ip netip.Addr) bool {
+	return ip.Zone() == "" && ip.Unmap().IsPrivate()
+}
+
+// ErrAddressNotPrivate is the error of an [InternalDialer] asked to reach a
+// host none of whose addresses is private.
+var ErrAddressNotPrivate = errors.New("runtime: the internal API host has no private address (ADR 0007 §5)")
+
+// InternalDialer connects the HTTP client of an internal API only to private
+// addresses ([IsPrivateAddr]), checked after the host name resolves. A name
+// is allowed by [IsPrivateInternalURL] because it lies in the Cloud Map
+// namespace, but whoever can write to the namespace's hosted zone could
+// point it at the task metadata address, a loopback or a public address,
+// and the client would send its bearer token there (#87). Checking at dial
+// time covers https too, before any byte is sent, where the URL check only
+// covers http.
+//
+// Its zero value resolves with net.DefaultResolver and dials with a
+// net.Dialer. Use DialContext as an http.Transport's DialContext in staging
+// and prod; dev runs internal APIs on loopback.
+type InternalDialer struct {
+	// Timeout bounds each connection attempt; 0 means none beyond ctx.
+	Timeout time.Duration
+	// Lookup resolves a host name, for tests; nil means
+	// net.DefaultResolver.LookupNetIP.
+	Lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	// Dial connects to an address already checked, for tests; nil means a
+	// net.Dialer with Timeout.
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// DialContext resolves address's host and connects to its private
+// addresses in order, skipping the others. It fails with
+// ErrAddressNotPrivate when there is none; the error names no address.
+func (d InternalDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	var addrs []netip.Addr
+	if ip, err := netip.ParseAddr(host); err == nil {
+		addrs = []netip.Addr{ip}
+	} else {
+		lookup := d.Lookup
+		if lookup == nil {
+			lookup = net.DefaultResolver.LookupNetIP
+		}
+		if addrs, err = lookup(ctx, "ip", host); err != nil {
+			return nil, err
+		}
+	}
+	dial := d.Dial
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: d.Timeout}).DialContext
+	}
+	err = ErrAddressNotPrivate
+	for _, ip := range addrs {
+		if !IsPrivateAddr(ip) {
+			continue
+		}
+		conn, dialErr := dial(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		if errors.Is(err, ErrAddressNotPrivate) {
+			err = dialErr // the first real failure says the most
+		}
+	}
+	return nil, err
 }
 
 // InServiceNamespace reports whether the DNS name host lies inside
