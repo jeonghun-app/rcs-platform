@@ -125,7 +125,8 @@ It answers the registrar's challenge:
   `Authorization` with the IMPI, the home domain as realm and an empty nonce
   and response, from which the S-CSCF learns the private identity (TS 24.229
   §5.1.1.2.2, §5.1.1.2.3).
-- It answers only challenges for the home domain's realm. An answer for
+- It answers only challenges for the S-CSCF's realm (`Config.Realm`), which is
+  the home domain unless the HSS's realm (`HSS_IMS_REALM`) was set apart. An answer for
   another realm would give that hop a response computed from the home
   password to guess it from offline. Of those, it takes the topmost it can
   meet (§5.1.1.5.4): with a password, MD5 or SHA-256 with `qop=auth` (RFC
@@ -233,6 +234,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-sip-transport` | `tcp` | `tcp` or `tls` to pcscf |
 | `-sip-server-name` | `-sip-proxy`'s host | the name pcscf's certificate is verified for, and the host of the first Route; TLS to an address needs it |
 | `-sip-domain` | `-self`'s host | home network domain, REGISTER's Request-URI |
+| `-sip-realm` | `-sip-domain` | the S-CSCF's Digest realm, the only one whose challenges are answered; set it when the HSS's `HSS_IMS_REALM` differs from the domain |
 | `-sip-impi` | `RCS_SIM_SIP_IMPI` | private user identity, the Digest username |
 | `-sip-auth` | `aka` | `aka` takes K and OPc from `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`; `digest` takes the password from `RCS_SIM_SIP_PASSWORD` |
 | `-sip-instance` | a new `urn:uuid` | `+sip.instance` (RFC 5626 §4.1) |

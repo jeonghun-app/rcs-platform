@@ -36,7 +36,7 @@ func TestSIPFlagsAndEnvironmentMakeTheClientConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Network != transport.TLS || cfg.ServerName != "localhost" || !cfg.Proxy.Addr().IsLoopback() || cfg.Domain != "ims.example.com" {
+	if cfg.Network != transport.TLS || cfg.ServerName != "localhost" || !cfg.Proxy.Addr().IsLoopback() || cfg.Domain != "ims.example.com" || cfg.Realm != "" {
 		t.Fatalf("config = %+v", cfg)
 	}
 }
@@ -72,5 +72,13 @@ func TestSIPUsageErrorsNameNoValue(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTheSIPRealmFlagReachesTheClient(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+	cfg, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", realm: "realm.example.net"}, defaultSelf, lookup)
+	if err != nil || cfg.Realm != "realm.example.net" {
+		t.Fatalf("config %+v, %v", cfg, err)
 	}
 }
