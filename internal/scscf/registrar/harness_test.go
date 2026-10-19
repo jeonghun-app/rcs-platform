@@ -96,8 +96,11 @@ type fakeHSS struct {
 	unavailable bool
 	// sarResult, if set, is the result of every SAR.
 	sarResult *cx.Result
-	mars      []*cx.MAR
-	sars      []*cx.SAR
+	// sarHook, if set, answers a SAR in place of the HSS, unless it returns
+	// nil and no error.
+	sarHook func(*cx.SAR) (*cx.SAA, error)
+	mars    []*cx.MAR
+	sars    []*cx.SAR
 }
 
 func newFakeHSS() *fakeHSS { return &fakeHSS{subs: map[string]*subscriber{}} }
@@ -176,21 +179,18 @@ func (f *fakeHSS) SAR(_ context.Context, r *cx.SAR) (*cx.SAA, error) {
 	if f.sarResult != nil {
 		return &cx.SAA{Answer: cx.Answer{Result: *f.sarResult}}, nil
 	}
+	if f.sarHook != nil {
+		if saa, err := f.sarHook(&cp); saa != nil || err != nil {
+			return saa, err
+		}
+	}
 	s := f.subs[r.UserName]
 	if s == nil {
 		return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
 	}
 	saa := &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}}
 	if r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable && (r.AssignmentType == cx.Registration || r.AssignmentType == cx.ReRegistration) {
-		sp := ifc.ServiceProfile{}
-		for _, id := range s.set {
-			sp.PublicIdentities = append(sp.PublicIdentities, ifc.PublicIdentity{Identity: id, BarringIndication: s.barred[id]})
-		}
-		doc, err := (&ifc.Subscription{PrivateID: s.impi, ServiceProfiles: []ifc.ServiceProfile{sp}}).Marshal()
-		if err != nil {
-			return nil, err
-		}
-		saa.UserData = doc
+		saa.UserData = userDataOf(s.impi, s.barred, s.set...)
 	}
 	return saa, nil
 }
@@ -291,6 +291,9 @@ type ue struct {
 	noAuth bool
 	// algorithm, if set, is named in the first Authorization.
 	algorithm string
+	// path replaces the default Path, one field per entry; empty but not
+	// nil sends none.
+	path []string
 }
 
 var upstream = transport.Source{Flow: "pcscf", Network: transport.TCP, Listener: "core"}
@@ -329,7 +332,13 @@ func requestText(u *ue, expires int, auth string, extra ...string) string {
 		c += `;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`
 		fmt.Fprintf(&b, "Contact: %s\r\n", c)
 	}
-	b.WriteString("Path: <sip:flow-token@pcscf." + realm + ";lr;ob>\r\n")
+	path := u.path
+	if path == nil {
+		path = []string{"<sip:flow-token@pcscf." + realm + ";lr;ob>"}
+	}
+	for _, p := range path {
+		b.WriteString("Path: " + p + "\r\n")
+	}
 	if !u.noAuth {
 		if auth == "" {
 			auth = fmt.Sprintf(`Digest username="%s", realm="%s", nonce="", uri="sip:%s", response=""`, u.impi, realm, realm)
@@ -425,4 +434,70 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.w.Write(p)
+}
+
+var (
+	set1 = state.ProfileKey{IMPI: impi1, IMPU: impu1}
+	set2 = state.ProfileKey{IMPI: impi1, IMPU: impu2}
+)
+
+func gone(t *testing.T, e *env, impus ...string) {
+	t.Helper()
+	for _, impu := range impus {
+		if r, err := e.store.Registration(bg, impu); err == nil {
+			t.Errorf("%s is still stored: %+v", impu, r)
+		}
+	}
+}
+
+// twoSets registers impi1's two implicit registration sets, {impu1, tel1}
+// and {impu2, impu3}, from two devices.
+func twoSets(t *testing.T, e *env, g *Registrar) {
+	t.Helper()
+	u := e.akaUser(impi1, impu1, tel1)
+	wantStatus(t, u.registerWith(g, 600), 200)
+	other := e.akaUser(impi2, impu2, impu3)
+	// The second set belongs to impi1 too; the fake HSS keys by IMPI.
+	e.hss.mu.Lock()
+	s := e.hss.subs[impi2]
+	delete(e.hss.subs, impi2)
+	e.hss.subs[impi1].set = append(e.hss.subs[impi1].set, s.set...)
+	e.hss.mu.Unlock()
+	other.impi = impi1
+	other.callID = "set-2"
+	wantStatus(t, other.registerWith(g, 600), 200)
+	// The fake HSS answered both with one document; split them as the HSS
+	// does, one set per profile.
+	for k, ids := range map[state.ProfileKey][]string{set1: {impu1, tel1}, set2: {impu2, impu3}} {
+		must(0, e.store.SaveProfile(bg, &state.Profile{Key: k, UserData: userDataOf(impi1, nil, ids...), Received: e.clock.Now(), KeepUntil: t0.Add(25 * time.Hour)}))(t)
+		for _, impu := range ids {
+			r := must(e.store.Registration(bg, impu))(t)
+			r.DefaultIMPU = k.IMPU
+			must(e.store.SaveRegistration(bg, r))(t)
+		}
+	}
+}
+
+// userDataOf is the IMSSubscription of one implicit registration set.
+func userDataOf(impi string, barred map[string]bool, set ...string) []byte {
+	sp := ifc.ServiceProfile{}
+	for _, id := range set {
+		sp.PublicIdentities = append(sp.PublicIdentities, ifc.PublicIdentity{Identity: id, BarringIndication: barred[id]})
+	}
+	doc, err := (&ifc.Subscription{PrivateID: impi, ServiceProfiles: []ifc.ServiceProfile{sp}}).Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return doc
+}
+
+// sarsOf returns the assignment types of the SARs sent so far.
+func (f *fakeHSS) sarsOf() []cx.ServerAssignmentType {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []cx.ServerAssignmentType
+	for _, s := range f.sars {
+		out = append(out, s.AssignmentType)
+	}
+	return out
 }

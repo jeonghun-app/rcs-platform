@@ -52,6 +52,12 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 		err = g.digest.VerifyAKA(ctx, "REGISTER", *c, ch.AKA.XRES, ch.Expires)
 		var sync *digest.SyncFailure
 		if errors.As(err, &sync) {
+			if ch.Resynchronised {
+				// The HSS resynchronised for this window already; another
+				// failure is not worth another round trip.
+				g.count("registrar.auth_failed")
+				return refuse(403, "Authentication failed")
+			}
 			return g.resynchronise(ctx, r, sync)
 		}
 	} else {
@@ -126,11 +132,12 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 		return refuse(403, "Unsupported algorithm")
 	}
 	maa, err := g.cfg.HSS.Authenticate(ctx, &cx.MAR{UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1}, schemes)
-	return g.challengeFrom(ctx, r, maa, err, stale)
+	return g.challengeFrom(ctx, r, maa, err, stale, false)
 }
 
-// resynchronise sends the client's AUTS to the HSS (TS 33.203 §6.1.2) and
-// challenges with the vector it returns.
+// resynchronise sends the client's AUTS to the HSS (TS 33.102 §6.3.5) and
+// challenges with the vector it returns, marked so that a further AUTS for it
+// is refused: one resynchronisation per challenge window.
 func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure) *failure {
 	g.count("registrar.resync")
 	auth := make([]byte, 0, len(sync.RAND)+len(sync.AUTS))
@@ -139,10 +146,10 @@ func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest
 		UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1,
 		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: auth},
 	})
-	return g.challengeFrom(ctx, r, maa, err, false)
+	return g.challengeFrom(ctx, r, maa, err, false, true)
 }
 
-func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA, err error, stale bool) *failure {
+func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA, err error, stale, resynced bool) *failure {
 	var res cx.Result
 	if maa != nil {
 		res = maa.Result
@@ -157,7 +164,7 @@ func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA,
 	var f *failure
 	switch item.Scheme {
 	case cx.SchemeDigestAKAv1MD5:
-		f, err = g.akaChallenge(ctx, r, item, stale)
+		f, err = g.akaChallenge(ctx, r, item, stale, resynced)
 	case cx.SchemeSIPDigest:
 		f, err = g.digestChallenges(ctx, r, item.Digest, stale)
 	default:
@@ -170,7 +177,7 @@ func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA,
 	return f
 }
 
-func (g *Registrar) akaChallenge(ctx context.Context, r *register, item cx.AuthDataItem, stale bool) (*failure, error) {
+func (g *Registrar) akaChallenge(ctx context.Context, r *register, item cx.AuthDataItem, stale, resynced bool) (*failure, error) {
 	if len(item.Authenticate) != akaVectorSize || len(item.Authorization) == 0 {
 		return nil, errors.New("AKA item without a vector")
 	}
@@ -182,7 +189,7 @@ func (g *Registrar) akaChallenge(ctx context.Context, r *register, item cx.AuthD
 	// CK and IK are kept for a security association with the P-CSCF, which
 	// this platform does not set up (it uses TLS), so they are not sent in
 	// the 401 (TS 24.229 §5.4.1.2.1 adds them for IPsec only).
-	err = g.store(ctx, r, ch.Nonce, &state.Challenge{AKA: &state.AKAVector{
+	err = g.store(ctx, r, ch.Nonce, &state.Challenge{Resynchronised: resynced, AKA: &state.AKAVector{
 		RAND: rand, AUTN: autn, XRES: item.Authorization, CK: item.ConfidentialityKey, IK: item.IntegrityKey,
 	}})
 	if err != nil {

@@ -95,8 +95,12 @@ func TestBindingsAreBounded(t *testing.T) {
 		contacts = append(contacts, fmt.Sprintf("Contact: <sip:ue%d@192.0.2.10>;expires=600", i))
 	}
 	u.contact = ""
-	auth := u.answer(g.Register(bg, u.request(-1, "", contacts...), upstream), 0)
-	wantStatus(t, g.Register(bg, u.request(-1, auth, contacts...), upstream), 403)
+	// Refused before authentication: the binding rules cost the square of
+	// the contacts, and an authenticated user should not get to pay that.
+	wantStatus(t, g.Register(bg, u.request(-1, "", contacts...), upstream), 403)
+	if mars, _ := e.hss.counts(); mars != 0 {
+		t.Errorf("%d MARs for a REGISTER with too many contacts", mars)
+	}
 }
 
 func TestMalformedREGISTERsAreRefusedBeforeAnyCxRequest(t *testing.T) {
@@ -185,7 +189,15 @@ func TestAnIdentityRegisteredByAnotherPrivateIdentityIsForbidden(t *testing.T) {
 	g := e.instance(1)
 	wantStatus(t, e.akaUser(impi1, impu1).registerWith(g, 600), 200)
 	other := e.akaUser(impi2, impu1)
-	wantStatus(t, g.Register(bg, other.request(600, ""), upstream), 403)
+	// The same 401 as for anyone, so that an unauthenticated sender learns
+	// nothing of who is registered; the refusal comes once authenticated.
+	res := g.Register(bg, other.request(600, ""), upstream)
+	wantStatus(t, res, 401)
+	res = g.Register(bg, other.request(600, other.answer(res, 0)), upstream)
+	wantStatus(t, res, 403)
+	if res.Reason != "Forbidden" {
+		t.Errorf("reason %q tells more than any other 403", res.Reason)
+	}
 }
 
 func TestWithoutCredentialsThePrivateIdentityIsTheIMPUWithoutItsScheme(t *testing.T) {
@@ -246,9 +258,11 @@ func (r *racingStore) SaveRegistration(ctx context.Context, reg *state.Registrat
 func TestConcurrentREGISTERsOfTwoDevicesKeepBothBindings(t *testing.T) {
 	e := newEnv(t)
 	first := e.akaUser(impi1, impu1)
+	first.instance = "<urn:uuid:00000000-0000-0000-0000-00000000000a>"
 	wantStatus(t, first.registerWith(e.instance(1), 600), 200)
 	second := *first
 	second.callID, second.contact = "device-2", "sip:ue2@192.0.2.20:5060;transport=tcp"
+	second.instance = "<urn:uuid:00000000-0000-0000-0000-00000000000b>"
 	rs := &racingStore{Memory: e.store}
 	rs.race = func() {
 		// The first device re-registers on another instance meanwhile.

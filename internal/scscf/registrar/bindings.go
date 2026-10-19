@@ -1,6 +1,7 @@
 package registrar
 
 import (
+	"errors"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,18 +29,27 @@ func limitsOf(cfg Config) expiryLimits {
 	return expiryLimits{def: s(cfg.DefaultExpires), min: s(cfg.MinExpires), max: s(cfg.MaxExpires)}
 }
 
-// applyContacts returns the bindings after r (RFC 3261 §10.3 steps 6 to 8,
-// RFC 5626 §6), given the current ones, or the response that refuses r. It
-// changes nothing it is given. Expired bindings are dropped first.
-func applyContacts(cur []state.Contact, r *register, now time.Time, lim expiryLimits) ([]state.Contact, *failure) {
-	if r.star {
-		return nil, nil
-	}
-	next := slices.DeleteFunc(slices.Clone(cur), func(c state.Contact) bool { return c.Expired(now) })
+// contactOp is one Contact of a REGISTER, ready to apply to any identity's
+// bindings: the binding it adds or refreshes, or with seconds 0 the binding
+// it removes.
+type contactOp struct {
+	b       state.Contact
+	uri     sip.URI
+	seconds uint32
+}
+
+// prepare reads r's contacts into operations, or returns the response that
+// refuses r: a malformed or duplicate contact, an expiry below MinExpires
+// (423, RFC 3261 §10.3 step 7), or a reg-id the first hop cannot serve (439,
+// RFC 5626 §6).
+func prepare(r *register, lim expiryLimits) ([]contactOp, *failure) {
 	outbound, flow := outboundPath(r.path)
+	var ops []contactOp
 	for _, c := range r.contacts {
 		exp, present, err := c.Expires()
 		switch {
+		case errors.Is(err, sip.ErrOutOfRange):
+			// As for the Expires field: the most there is, capped below.
 		case err != nil:
 			return nil, refuse(400, "Bad Contact expires")
 		case !present && r.hasExpires:
@@ -47,36 +57,101 @@ func applyContacts(cur []state.Contact, r *register, now time.Time, lim expiryLi
 		case !present:
 			exp = lim.def
 		}
+		if exp != 0 && exp < lim.min {
+			return nil, &failure{code: 423, fields: [][2]string{{"Min-Expires", strconv.FormatUint(uint64(lim.min), 10)}}}
+		}
 		b, f := binding(c, r, outbound, flow)
 		if f != nil {
 			return nil, f
 		}
-		i := slices.IndexFunc(next, func(o state.Contact) bool { return sameBinding(o, b) })
-		// Step 7: an older or repeated REGISTER of the same UA must not
-		// undo a newer one.
-		if i >= 0 && next[i].CallID == r.callID && r.cseq <= next[i].CSeq {
+		op := contactOp{b: b, uri: c.URI, seconds: min(exp, lim.max)}
+		for _, o := range ops {
+			if o.uri.Equal(op.uri) || op.b.InstanceID != "" && sameInstance(o.b, op.b) {
+				return nil, refuse(400, "Duplicate Contact")
+			}
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
+// applyDelta returns the bindings after r's operations (RFC 3261 §10.3 steps
+// 6 to 8), given an identity's current ones, or the response that refuses r.
+// Every identity of an implicit registration set gets the same delta applied
+// to its own current bindings, so that REGISTERs of different devices, or
+// of different identities of the set, that land at once all take effect. It
+// changes nothing it is given. Expired bindings are dropped first.
+//
+// A contact with +sip.instance replaces every binding of that instance, but
+// for another flow of it (another reg-id, RFC 5626 §6); one without replaces
+// the bindings without an instance that came from another Call-ID, the UE's
+// earlier registrations (TS 24.229 §5.4.1.2.2 4A), and any of its own URI.
+func applyDelta(cur []state.Contact, r *register, ops []contactOp, now time.Time) ([]state.Contact, *failure) {
+	next := slices.DeleteFunc(slices.Clone(cur), func(c state.Contact) bool { return c.Expired(now) })
+	uris := uriCache{}
+	// Step 6: an older or repeated REGISTER of the same UA must not undo a
+	// newer one, "*" included.
+	stale := func(o state.Contact) bool { return o.CallID == r.callID && r.cseq <= o.CSeq }
+	if r.star {
+		if slices.ContainsFunc(next, stale) {
 			return nil, refuse(500, "Out of order REGISTER")
 		}
-		if exp == 0 {
-			if i >= 0 {
-				next = slices.Delete(next, i, i+1)
+		return nil, nil
+	}
+	removals, removed := 0, false
+	for _, op := range ops {
+		covered := func(o state.Contact) bool {
+			switch {
+			case op.b.InstanceID != "":
+				return sameInstance(o, op.b)
+			case o.RegID == 0 && uris.equal(o.URI, op.uri):
+				// An outbound flow is matched by instance and reg-id only.
+				return true
 			}
+			return op.seconds != 0 && o.InstanceID == "" && o.CallID != r.callID
+		}
+		if slices.ContainsFunc(next, func(o state.Contact) bool { return covered(o) && stale(o) }) {
+			return nil, refuse(500, "Out of order REGISTER")
+		}
+		n := len(next)
+		next = slices.DeleteFunc(next, covered)
+		if op.seconds == 0 {
+			removals++
+			removed = removed || len(next) < n
 			continue
 		}
-		if exp < lim.min {
-			return nil, &failure{code: 423, fields: [][2]string{{"Min-Expires", strconv.FormatUint(uint64(lim.min), 10)}}}
-		}
-		b.Expires = now.Add(time.Duration(min(exp, lim.max)) * time.Second)
-		if i >= 0 {
-			next[i] = b
-		} else {
-			next = append(next, b)
-		}
+		b := op.b
+		b.Expires = now.Add(time.Duration(op.seconds) * time.Second)
+		next = append(next, b)
+	}
+	if removals > 0 && removals == len(ops) && !removed {
+		// TS 24.229 §5.4.1.4.1: removing only bindings there are none of.
+		return nil, refuse(481, "No such binding")
 	}
 	if len(next) > state.MaxContacts {
 		return nil, refuse(403, "Too many contacts")
 	}
 	return next, nil
+}
+
+// sameInstance reports whether b, of an instance, replaces o: the same
+// instance, unless both are outbound flows with different reg-ids.
+func sameInstance(o, b state.Contact) bool {
+	return o.InstanceID == b.InstanceID && (o.RegID == 0 || b.RegID == 0 || o.RegID == b.RegID)
+}
+
+// uriCache parses each stored URI once per delta.
+type uriCache map[string]*sip.URI
+
+func (c uriCache) equal(stored string, u sip.URI) bool {
+	p, ok := c[stored]
+	if !ok {
+		if v, err := sip.ParseURI(stored); err == nil {
+			p = &v
+		}
+		c[stored] = p
+	}
+	return p != nil && p.Equal(u)
 }
 
 // binding is the stored form of c, without its expiry.
@@ -97,14 +172,20 @@ func binding(c sip.Contact, r *register, outbound bool, flow string) (state.Cont
 		return b, refuse(400, "Bad Contact reg-id")
 	}
 	if present {
-		// RFC 5626 §6: a reg-id is meaningful only with an instance ID,
-		// and is never 0 (§4.2).
-		if b.InstanceID == "" || id == 0 {
+		// RFC 5626 §6: a reg-id is meaningful only with an instance ID, is
+		// never 0 (§4.2), and only over an edge proxy that does outbound,
+		// as the "ob" of the first Path says; without one it is ignored,
+		// unless the UA needs outbound.
+		switch {
+		case b.InstanceID == "" || id == 0:
 			return b, refuse(400, "reg-id without +sip.instance")
+		case !outbound && r.supportsOutbound:
+			return b, refuse(439, "First Hop Lacks Outbound Support")
+		case outbound:
+			b.RegID = id
+			b.FlowToken = flow
+			b.KeepAlive = true
 		}
-		b.RegID = id
-		b.FlowToken = flow
-		b.KeepAlive = outbound
 	}
 	for _, p := range c.Params {
 		name := strings.ToLower(p.Name)
@@ -114,20 +195,6 @@ func binding(c sip.Contact, r *register, outbound bool, flow string) (state.Cont
 		b.FeatureTags = append(b.FeatureTags, paramText(p))
 	}
 	return b, nil
-}
-
-// sameBinding is the RFC 5626 §6 match by instance and reg-id when the new
-// binding has both, and the RFC 3261 §10.3 match by URI otherwise.
-func sameBinding(old, b state.Contact) bool {
-	if b.InstanceID != "" && b.RegID != 0 {
-		return old.InstanceID == b.InstanceID && old.RegID == b.RegID
-	}
-	if old.RegID != 0 {
-		return false
-	}
-	u, err1 := sip.ParseURI(old.URI)
-	v, err2 := sip.ParseURI(b.URI)
-	return err1 == nil && err2 == nil && u.Equal(v)
 }
 
 // outboundPath reports whether the edge proxy that added the topmost Path
@@ -147,11 +214,12 @@ func outboundPath(path []string) (bool, string) {
 	return true, a.URI.User
 }
 
-// paramText writes p as a Contact carries it.
+// paramText writes p as a Contact carries it. The parser unescapes a
+// quoted-string, so it is escaped again here.
 func paramText(p sip.Param) string {
 	switch {
 	case p.Quoted:
-		return p.Name + `="` + p.Value + `"`
+		return p.Name + "=" + quoted(p.Value)
 	case p.Value != "":
 		return p.Name + "=" + p.Value
 	}
@@ -165,7 +233,7 @@ func contactField(c state.Contact, now time.Time) string {
 	b.WriteString("<" + c.URI + ">;expires=")
 	b.WriteString(strconv.FormatInt(int64(max(c.Expires.Sub(now)/time.Second, 0)), 10))
 	if c.InstanceID != "" {
-		b.WriteString(`;+sip.instance="` + c.InstanceID + `"`)
+		b.WriteString(";+sip.instance=" + quoted(c.InstanceID))
 	}
 	if c.RegID != 0 {
 		b.WriteString(";reg-id=" + strconv.FormatUint(uint64(c.RegID), 10))
@@ -173,5 +241,20 @@ func contactField(c state.Contact, now time.Time) string {
 	for _, t := range c.FeatureTags {
 		b.WriteString(";" + t)
 	}
+	return b.String()
+}
+
+// quoted writes v as a quoted-string, with a quoted-pair for each double
+// quote and backslash (RFC 3261 §25.1).
+func quoted(v string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(v); i++ {
+		if v[i] == '"' || v[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(v[i])
+	}
+	b.WriteByte('"')
 	return b.String()
 }
