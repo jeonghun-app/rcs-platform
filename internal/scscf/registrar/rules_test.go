@@ -16,7 +16,7 @@ import (
 
 func contactCount(t *testing.T, e *env, impu string) int {
 	t.Helper()
-	return len(must(e.store.Registration(bg, impu))(t).Contacts)
+	return len(must(regOf(e, impu))(t).Contacts)
 }
 
 func TestAClientThatReconnectsWithANewAddressKeepsOneBinding(t *testing.T) {
@@ -46,7 +46,7 @@ func TestAContactWithoutAnInstanceReplacesTheUEsEarlierRegistrations(t *testing.
 	// instance ends the earlier one at another address.
 	u.callID, u.contact, u.cseq = "again", "sip:ue@192.0.2.99:5060;transport=tcp", 0
 	wantStatus(t, u.registerWith(g, 600), 200)
-	if got := must(e.store.Registration(bg, impu1))(t).Contacts; len(got) != 1 || got[0].CallID != "again" {
+	if got := must(regOf(e, impu1))(t).Contacts; len(got) != 1 || got[0].CallID != "again" {
 		t.Errorf("bindings %+v, want only the new one", got)
 	}
 	// Two contacts of one REGISTER are both kept.
@@ -95,7 +95,7 @@ func TestOutboundAppliesOnlyToARequestContactOverAnObEdgeProxy(t *testing.T) {
 		if res.Header.Has("Require") {
 			t.Error("Require: outbound without ob in the first Path")
 		}
-		if c := must(e.store.Registration(bg, impu1))(t).Contacts[0]; c.RegID != 0 || c.KeepAlive {
+		if c := must(regOf(e, impu1))(t).Contacts[0]; c.RegID != 0 || c.KeepAlive {
 			t.Errorf("binding %+v kept its reg-id", c)
 		}
 	})
@@ -346,7 +346,7 @@ func TestAContactThatCannotBeWrittenBackIsRefusedBeforeSAR(t *testing.T) {
 				if _, sars := e.hss.counts(); sars != 0 {
 					t.Error("refused after SAR")
 				}
-				if _, err := e.store.Registration(bg, impu1); err == nil {
+				if _, err := regOf(e, impu1); err == nil {
 					t.Error("the binding was stored, and would break every 200 of the set")
 				}
 			})

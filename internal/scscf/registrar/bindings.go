@@ -80,11 +80,10 @@ func prepare(r *register, lim expiryLimits) ([]contactOp, *failure) {
 }
 
 // applyDelta returns the bindings after r's operations (RFC 3261 §10.3 steps
-// 6 to 8), given an identity's current ones, or the response that refuses r.
-// Every identity of an implicit registration set gets the same delta applied
-// to its own current bindings, so that REGISTERs of different devices, or
-// of different identities of the set, that land at once all take effect. It
-// changes nothing it is given. Expired bindings are dropped first.
+// 6 to 8), given the set's current ones, or the response that refuses r. A
+// REGISTER that lost a save to another instance applies it again to what won,
+// so that REGISTERs of different devices that land at once all take effect.
+// It changes nothing it is given. Expired bindings are dropped first.
 //
 // A contact with +sip.instance replaces every binding of that instance, but
 // for another flow of it (another reg-id, RFC 5626 §6); one without replaces

@@ -76,8 +76,9 @@ func (l *lockedRand) Read(p []byte) (int, error) {
 type subscriber struct {
 	impi string
 	// set is the implicit registration set, default identity first unless
-	// barred says otherwise.
+	// barred says otherwise, and more the IMPI's other sets.
 	set    []string
+	more   [][]string
 	barred map[string]bool
 	aka    *milenage.Milenage
 	sqn    milenage.SQN
@@ -131,7 +132,7 @@ func (f *fakeHSS) MAR(_ context.Context, r *cx.MAR) (*cx.MAA, error) {
 		return nil, errUnreachable
 	}
 	s := f.subs[r.UserName]
-	if s == nil || !slicesContains(s.set, r.PublicIdentity) {
+	if s == nil || s.setOf(r.PublicIdentity) == nil {
 		return &cx.MAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
 	}
 	switch {
@@ -190,7 +191,11 @@ func (f *fakeHSS) SAR(_ context.Context, r *cx.SAR) (*cx.SAA, error) {
 	}
 	saa := &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}}
 	if r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable && (r.AssignmentType == cx.Registration || r.AssignmentType == cx.ReRegistration) {
-		saa.UserData = userDataOf(s.impi, s.barred, s.set...)
+		set := s.setOf(r.PublicIdentities[0])
+		if set == nil {
+			return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorIdentitiesDontMatch)}}, nil
+		}
+		saa.UserData = userDataOf(s.impi, s.barred, set...)
 	}
 	return saa, nil
 }
@@ -209,6 +214,16 @@ func (f *fakeHSS) counts() (mars, sars int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.mars), len(f.sars)
+}
+
+// setOf returns the set of s that impu belongs to, nil if none.
+func (s *subscriber) setOf(impu string) []string {
+	for _, set := range append([][]string{s.set}, s.more...) {
+		if slicesContains(set, impu) {
+			return set
+		}
+	}
+	return nil
 }
 
 func slicesContains(s []string, v string) bool {
@@ -437,45 +452,59 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 }
 
 var (
-	set1 = state.ProfileKey{IMPI: impi1, IMPU: impu1}
-	set2 = state.ProfileKey{IMPI: impi1, IMPU: impu2}
+	set1 = state.SetKey{IMPI: impi1, IMPU: impu1}
+	set2 = state.SetKey{IMPI: impi1, IMPU: impu2}
 )
 
 func gone(t *testing.T, e *env, impus ...string) {
 	t.Helper()
 	for _, impu := range impus {
-		if r, err := e.store.Registration(bg, impu); err == nil {
-			t.Errorf("%s is still stored: %+v", impu, r)
+		if r, err := regOf(e, impu); err == nil {
+			t.Errorf("%s is still registered: %+v", impu, r)
 		}
 	}
 }
 
+// regOf returns the record of the set impu belongs to.
+func regOf(e *env, impu string) (*state.Registration, error) {
+	id, err := e.store.Identity(bg, impu)
+	if err != nil {
+		return nil, err
+	}
+	return e.store.Registration(bg, id.Set)
+}
+
+// seed stores a record for the set of impi made of set (default first),
+// changed by change, with its identities pointing at it.
+func seed(t *testing.T, e *env, impi string, set []string, change func(*state.Registration)) *state.Registration {
+	t.Helper()
+	r := &state.Registration{Key: state.SetKey{IMPI: impi, IMPU: set[0]}, Incarnation: 77}
+	for _, impu := range set {
+		r.Identities = append(r.Identities, state.SetIdentity{IMPU: impu})
+	}
+	if change != nil {
+		change(r)
+	}
+	saved := must(e.store.SaveRegistration(bg, r))(t)
+	for _, impu := range set {
+		must(e.store.SaveIdentity(bg, &state.Identity{IMPU: impu, Set: r.Key, Incarnation: 77}))(t)
+	}
+	return saved
+}
+
 // twoSets registers impi1's two implicit registration sets, {impu1, tel1}
-// and {impu2, impu3}, from two devices.
-func twoSets(t *testing.T, e *env, g *Registrar) {
+// and {impu2, impu3}, from two devices, which it returns.
+func twoSets(t *testing.T, e *env, g *Registrar) (*ue, *ue) {
 	t.Helper()
 	u := e.akaUser(impi1, impu1, tel1)
-	wantStatus(t, u.registerWith(g, 600), 200)
-	other := e.akaUser(impi2, impu2, impu3)
-	// The second set belongs to impi1 too; the fake HSS keys by IMPI.
 	e.hss.mu.Lock()
-	s := e.hss.subs[impi2]
-	delete(e.hss.subs, impi2)
-	e.hss.subs[impi1].set = append(e.hss.subs[impi1].set, s.set...)
+	e.hss.subs[impi1].more = [][]string{{impu2, impu3}}
 	e.hss.mu.Unlock()
-	other.impi = impi1
-	other.callID = "set-2"
+	wantStatus(t, u.registerWith(g, 600), 200)
+	other := device(u, 2)
+	other.impu = impu2
 	wantStatus(t, other.registerWith(g, 600), 200)
-	// The fake HSS answered both with one document; split them as the HSS
-	// does, one set per profile.
-	for k, ids := range map[state.ProfileKey][]string{set1: {impu1, tel1}, set2: {impu2, impu3}} {
-		must(0, e.store.SaveProfile(bg, &state.Profile{Key: k, UserData: userDataOf(impi1, nil, ids...), Received: e.clock.Now(), KeepUntil: t0.Add(25 * time.Hour)}))(t)
-		for _, impu := range ids {
-			r := must(e.store.Registration(bg, impu))(t)
-			r.DefaultIMPU = k.IMPU
-			must(e.store.SaveRegistration(bg, r))(t)
-		}
-	}
+	return u, other
 }
 
 // userDataOf is the IMSSubscription of one implicit registration set.

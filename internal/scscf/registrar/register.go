@@ -2,6 +2,7 @@ package registrar
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"time"
@@ -18,16 +19,18 @@ import (
 // read and applied again.
 const saveAttempts = 3
 
-// register runs a REGISTER: once authenticated, the bindings of r.impu
-// change, and with them those of every identity of its implicit registration
-// set.
+// register runs a REGISTER: once authenticated, the bindings of r.impu's
+// implicit registration set change. The set is one record, read through the
+// identity's item, and every change is one save of it conditional on the
+// version read; a save that loses reads the record again and applies the
+// request to what won.
 func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register) (*sip.Response, *failure) {
-	cur, f := g.read(ctx, r.impu)
+	cur, f := g.setOf(ctx, r.impu)
 	if f != nil {
 		return nil, f
 	}
 	registered := isRegistered(cur)
-	own := registered && cur.IMPI == r.impi
+	own := registered && cur.Key.IMPI == r.impi
 	if f := g.authenticate(ctx, r, own); f != nil {
 		if f.code == 401 && r.outbound {
 			// TS 24.229 §5.4.1.2.1: the 401 already says outbound applies.
@@ -73,43 +76,63 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 			return nil, f
 		}
 		var err error
-		var set *implicitSet
+		var saved *state.Registration
 		switch {
 		case len(next) == 0 && registered:
-			err = g.deregister(ctx, r, ops, cur)
+			err = g.deregister(ctx, r, cur)
 		case len(next) == 0:
 			// Nothing was registered and nothing is: no assignment to make.
 		default:
 			// What the store would refuse is refused before the HSS hears of
 			// the registration.
-			probe := &state.Registration{IMPU: r.impu, IMPI: r.impi, DefaultIMPU: r.impu, Contacts: next}
+			probe := &state.Registration{
+				Key: state.SetKey{IMPI: r.impi, IMPU: r.impu}, Incarnation: 1,
+				Identities: []state.SetIdentity{{IMPU: r.impu}}, Contacts: next,
+			}
 			if probe.Validate() != nil {
 				return nil, refuse(400, "Contact beyond the registrar's limits")
 			}
-			set, next, err = g.assign(ctx, r, ops, cur, registered, next)
+			saved, err = g.assign(ctx, r, cur, registered, next)
 		}
 		var fl *failure
+		var moved *movedError
 		switch {
 		case errors.As(err, &fl):
 			return nil, fl
-		case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrExists), errors.Is(err, state.ErrNotFound):
-			// Another instance changed the registration since it was read,
-			// or deregistered the whole set: read it again, which may make
-			// this an initial registration.
-			if cur, f = g.read(ctx, r.impu); f != nil {
+		case errors.As(err, &moved):
+			// The set's record is under another key than the identity named:
+			// the HSS changed its default identity, or another instance
+			// created the record first.
+			if cur, f = g.set(ctx, moved.key); f != nil {
 				return nil, f
 			}
-			registered = isRegistered(cur)
-			conflicted = true
-			continue
+		case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrExists), errors.Is(err, state.ErrNotFound):
+			// Another instance changed or deregistered the set since it was
+			// read: read it again, which may make this an initial
+			// registration.
+			if cur, f = g.setOf(ctx, r.impu); f != nil {
+				return nil, f
+			}
 		case err != nil:
 			return nil, g.internal("saving the registration", err)
+		default:
+			g.count("registrar.registered")
+			if saved == nil {
+				return g.ok(req, r, nil, nil), nil
+			}
+			return g.ok(req, r, saved.Contacts, saved), nil
 		}
-		g.count("registrar.registered")
-		return g.ok(req, r, next, set), nil
+		registered = isRegistered(cur)
+		conflicted = true
 	}
 	return nil, g.internal("saving the registration", errors.New("lost every attempt to another instance"))
 }
+
+// movedError reports that the set a registration is for has its record under
+// key, which the caller reads before trying again.
+type movedError struct{ key state.SetKey }
+
+func (*movedError) Error() string { return "registrar: the set's record is under another key" }
 
 // isRegistered reports whether r has bindings, rather than being absent, a
 // deregistration's lease, or an unregistered user's record.
@@ -127,9 +150,22 @@ func applied(reg *state.Registration, r *register) bool {
 	})
 }
 
-// read returns the registration of impu, nil if there is none.
-func (g *Registrar) read(ctx context.Context, impu string) (*state.Registration, *failure) {
-	cur, err := g.cfg.Store.Registration(ctx, impu)
+// setOf returns the record of the set impu belongs to, nil if impu names no
+// set or the set has no record.
+func (g *Registrar) setOf(ctx context.Context, impu string) (*state.Registration, *failure) {
+	id, err := g.cfg.Store.Identity(ctx, impu)
+	switch {
+	case errors.Is(err, state.ErrNotFound):
+		return nil, nil
+	case err != nil:
+		return nil, g.internal("reading the identity", err)
+	}
+	return g.set(ctx, id.Set)
+}
+
+// set returns the record of the set k, nil if there is none.
+func (g *Registrar) set(ctx context.Context, k state.SetKey) (*state.Registration, *failure) {
+	cur, err := g.cfg.Store.Registration(ctx, k)
 	switch {
 	case errors.Is(err, state.ErrNotFound):
 		return nil, nil
@@ -143,13 +179,8 @@ func (g *Registrar) read(ctx context.Context, impu string) (*state.Registration,
 // from its User-Data: every identity in order, and the default one, the first
 // that is not barred (TS 24.229 §5.4.1.2.2F).
 type implicitSet struct {
-	identities []setIdentity
+	identities []state.SetIdentity
 	defaultID  string
-}
-
-type setIdentity struct {
-	impu   string
-	barred bool
 }
 
 func parseSet(userData []byte) (*implicitSet, error) {
@@ -164,48 +195,43 @@ func parseSet(userData []byte) (*implicitSet, error) {
 				continue
 			}
 			impu, ok := identity.CanonicalIMPU(p.Identity)
-			if !ok {
+			if !ok || set.has(impu) {
 				continue
 			}
-			set.identities = append(set.identities, setIdentity{impu: impu, barred: p.BarringIndication})
+			set.identities = append(set.identities, state.SetIdentity{IMPU: impu, Barred: p.BarringIndication})
 			if set.defaultID == "" && !p.BarringIndication {
 				set.defaultID = impu
 			}
 		}
 	}
-	if set.defaultID == "" {
-		return nil, errors.New("User-Data without an identity that is not barred")
+	if set.defaultID == "" || len(set.identities) > state.MaxIdentities {
+		return nil, errors.New("User-Data without an identity that is not barred, or with too many")
 	}
 	return set, nil
 }
 
 func (s *implicitSet) has(impu string) bool {
-	for _, id := range s.identities {
-		if id.impu == impu {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(s.identities, func(id state.SetIdentity) bool { return id.IMPU == impu })
 }
 
 // assign tells the HSS this S-CSCF serves r.impi (SAR REGISTRATION or
 // RE_REGISTRATION, TS 29.228 §6.1.2), keeps the set's profile, and saves the
-// bindings of every identity of the set. It returns the set and r.impu's
-// bindings as saved.
-func (g *Registrar) assign(ctx context.Context, r *register, ops []contactOp, cur *state.Registration, registered bool, bindings []state.Contact) (*implicitSet, []state.Contact, error) {
+// set's record with bindings, conditional on cur. A record created anew gets
+// a fresh incarnation, and every identity of the set is pointed at it.
+func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registration, registered bool, bindings []state.Contact) (*state.Registration, error) {
 	sar := &cx.SAR{UserName: r.impi, PublicIdentities: []string{r.impu}, AssignmentType: cx.Registration}
 	var stored *state.Profile
 	if registered {
 		sar.AssignmentType = cx.ReRegistration
 		// A re-registration needs the profile again only if this S-CSCF
 		// lost it.
-		p, err := g.cfg.Store.Profile(ctx, cur.ProfileKey(), g.cfg.Now())
+		p, err := g.cfg.Store.Profile(ctx, cur.Key, g.cfg.Now())
 		switch {
 		case err == nil:
 			stored = p
 			sar.UserDataAlreadyAvailable = cx.UserDataAlreadyAvailable
 		case !errors.Is(err, state.ErrNotFound):
-			return nil, nil, err
+			return nil, err
 		}
 	}
 	saa, err := g.cfg.HSS.SAR(ctx, sar)
@@ -214,7 +240,7 @@ func (g *Registrar) assign(ctx context.Context, r *register, ops []contactOp, cu
 		res = saa.Result
 	}
 	if f := g.cxFailure("SAR", res, err); f != nil {
-		return nil, nil, f
+		return nil, f
 	}
 	received := g.cfg.Now()
 	userData := saa.UserData
@@ -223,9 +249,19 @@ func (g *Registrar) assign(ctx context.Context, r *register, ops []contactOp, cu
 	}
 	set, err := parseSet(userData)
 	if err != nil || !set.has(r.impu) {
-		return nil, nil, g.internal("reading the implicit registration set", err)
+		return nil, g.internal("reading the implicit registration set", err)
 	}
-	key := state.ProfileKey{IMPI: r.impi, IMPU: set.defaultID}
+	key := state.SetKey{IMPI: r.impi, IMPU: set.defaultID}
+	if cur == nil || cur.Key != key {
+		// The record under key may exist already, created by another
+		// instance or under the HSS's new default identity: apply this
+		// request to it instead.
+		if other, f := g.set(ctx, key); f != nil {
+			return nil, f
+		} else if other != nil {
+			return nil, &movedError{key: key}
+		}
+	}
 	last := latestExpiry(bindings)
 	keep := last.Add(state.ProfileGrace)
 	switch {
@@ -233,38 +269,22 @@ func (g *Registrar) assign(ctx context.Context, r *register, ops []contactOp, cu
 		err := g.cfg.Store.SaveProfile(ctx, &state.Profile{Key: key, UserData: saa.UserData, Received: received, KeepUntil: keep})
 		// A later PPR stored first: it is the newer profile.
 		if err != nil && !errors.Is(err, state.ErrConflict) {
-			return nil, nil, err
-		}
-		if cur != nil && cur.DefaultIMPU != "" && cur.ProfileKey() != key {
-			// The set's default identity changed: the profile under the
-			// old one would only wait for its KeepUntil.
-			if err := g.cfg.Store.DeleteProfile(ctx, cur.ProfileKey()); err != nil {
-				return nil, nil, err
-			}
+			return nil, err
 		}
 	case stored.KeepDue(last):
 		if err := g.cfg.Store.KeepProfile(ctx, key, keep, received); err != nil && !errors.Is(err, state.ErrNotFound) {
-			return nil, nil, err
+			return nil, err
 		}
 	}
-	saved, err := g.save(ctx, r, ops, cur, registered, set, bindings)
-	if err != nil {
-		return nil, nil, err
-	}
-	return set, saved, nil
-}
-
-// save stores bindings for r.impu, conditional on cur, and then applies r to
-// every other identity of the set (TS 23.228 §5.2.1a), each under its own
-// version. A loss on r.impu is reported, so that register reads it again.
-func (g *Registrar) save(ctx context.Context, r *register, ops []contactOp, cur *state.Registration, registered bool, set *implicitSet, bindings []state.Contact) ([]state.Contact, error) {
-	n := &state.Registration{IMPU: r.impu, IMPI: r.impi, DefaultIMPU: set.defaultID, Contacts: bindings}
-	if cur != nil {
-		n.Version = cur.Version
+	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings}
+	if cur != nil && cur.Key == key {
+		n.Incarnation, n.Version = cur.Incarnation, cur.Version
+	} else if n.Incarnation, err = g.incarnation(); err != nil {
+		return nil, err
 	}
 	saved, err := g.cfg.Store.SaveRegistration(ctx, n)
 	if errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrExists) {
-		if again, f := g.read(ctx, r.impu); f == nil && applied(again, r) {
+		if again, f := g.set(ctx, key); f == nil && applied(again, r) {
 			saved, err = again, nil
 		}
 	}
@@ -276,64 +296,87 @@ func (g *Registrar) save(ctx context.Context, r *register, ops []contactOp, cur 
 	if err != nil {
 		return nil, err
 	}
-	now := g.cfg.Now()
-	for _, id := range set.identities {
-		if id.impu == r.impu {
-			continue
-		}
-		if _, err := g.applyTo(ctx, r, ops, id.impu, set.defaultID, now); err != nil {
+	if cur == nil || cur.Incarnation != saved.Incarnation || !slices.Equal(cur.Identities, saved.Identities) {
+		if err := g.point(ctx, saved); err != nil {
 			return nil, err
 		}
 	}
-	return saved.Contacts, nil
+	if cur != nil && cur.Key != key {
+		// The HSS moved the set to another default identity: the record and
+		// profile under the old one would only wait for a sweep.
+		g.dropOld(ctx, cur)
+	}
+	return saved, nil
 }
 
-// applyTo applies r's contacts to impu's current bindings, under the version
-// read, and reports whether impu keeps bindings. One that another private
-// identity registered, or that a newer REGISTER of the same UA reached
-// first, is left alone.
-func (g *Registrar) applyTo(ctx context.Context, r *register, ops []contactOp, impu, defaultID string, now time.Time) (bool, error) {
-	for range saveAttempts {
-		o, f := g.read(ctx, impu)
-		if f != nil {
-			return false, f
-		}
-		if o != nil && o.IMPI != r.impi && len(o.Contacts) > 0 {
-			return true, nil
-		}
-		if applied(o, r) {
-			return true, nil
-		}
-		var base []state.Contact
-		if o != nil {
-			base = o.Contacts
-		}
-		n, fl := applyDelta(base, r, ops, now)
-		if fl != nil {
-			return o != nil && live(o, now), nil
-		}
-		var err error
-		switch {
-		case len(n) > 0:
-			next := &state.Registration{IMPU: impu, IMPI: r.impi, DefaultIMPU: defaultID, Contacts: n}
-			if o != nil {
-				next.Version = o.Version
-			}
-			_, err = g.cfg.Store.SaveRegistration(ctx, next)
-		case o != nil:
-			err = g.cfg.Store.DeleteRegistration(ctx, o)
-		}
-		switch {
-		case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrExists):
-			continue
-		case errors.Is(err, state.ErrNotFound):
-			return false, nil
-		case err != nil:
-			return false, err
-		}
-		return len(n) > 0, nil
+// incarnation draws a set record's incarnation, never 0.
+func (g *Registrar) incarnation() (int64, error) {
+	var b [8]byte
+	if _, err := g.cfg.Rand.Read(b[:]); err != nil {
+		return 0, err
 	}
-	return false, errors.New("registrar: an identity of the set kept changing")
+	return int64(binary.BigEndian.Uint64(b[:])>>1) | 1, nil
+}
+
+// point makes every identity of reg name it, under the version read.
+func (g *Registrar) point(ctx context.Context, reg *state.Registration) error {
+	for _, id := range reg.Identities {
+		want := state.Identity{IMPU: id.IMPU, Set: reg.Key, Incarnation: reg.Incarnation, Barred: id.Barred}
+		if err := g.pointOne(ctx, want); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (g *Registrar) pointOne(ctx context.Context, want state.Identity) error {
+	for range saveAttempts {
+		cur, err := g.cfg.Store.Identity(ctx, want.IMPU)
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+			want.Version = 0
+		case err != nil:
+			return err
+		case cur.Set == want.Set && cur.Incarnation == want.Incarnation && cur.Barred == want.Barred:
+			return nil
+		default:
+			want.Version = cur.Version
+		}
+		_, err = g.cfg.Store.SaveIdentity(ctx, &want)
+		if !errors.Is(err, state.ErrConflict) && !errors.Is(err, state.ErrExists) && !errors.Is(err, state.ErrNotFound) {
+			return err
+		}
+	}
+	return errors.New("registrar: an identity kept changing")
+}
+
+// unpoint deletes the items of the identities that still name reg's
+// incarnation, under the version read: one a new record of the set took
+// meanwhile stays.
+func (g *Registrar) unpoint(ctx context.Context, reg *state.Registration) {
+	for _, id := range reg.Identities {
+		for range saveAttempts {
+			cur, err := g.cfg.Store.Identity(ctx, id.IMPU)
+			if err != nil || cur.Set != reg.Key || cur.Incarnation != reg.Incarnation {
+				break
+			}
+			if err := g.cfg.Store.DeleteIdentity(ctx, cur); !errors.Is(err, state.ErrConflict) {
+				break
+			}
+		}
+	}
+}
+
+// dropOld deletes the record and profile of a set the HSS moved to another
+// default identity, unless another instance changed the record since.
+func (g *Registrar) dropOld(ctx context.Context, old *state.Registration) {
+	if err := g.cfg.Store.DeleteRegistration(ctx, old); err != nil {
+		return
+	}
+	g.unpoint(ctx, old)
+	if err := g.cfg.Store.DeleteProfile(ctx, old.Key); err != nil {
+		g.internal("deleting a moved set's profile", err)
+	}
 }
 
 // unassign tells the HSS that a registration it accepted could not be kept
@@ -346,28 +389,23 @@ func (g *Registrar) unassign(ctx context.Context, r *register) {
 	}
 }
 
-// deregister ends the registration of r.impu's set after its last binding
-// was removed: SAR USER_DEREGISTRATION, then r is applied to every identity
-// of the set, each under the version read before the SAR, and the profile
-// goes only if no identity kept bindings and it is still the one read
-// (DeleteProfileIf). So a REGISTER of another device that lands meanwhile, on
-// any identity of the set, keeps its bindings and its profile. The bindings
-// stay if the HSS cannot be told, so the client's retry, or the sweep at
-// their expiry, tells it later.
-func (g *Registrar) deregister(ctx context.Context, r *register, ops []contactOp, cur *state.Registration) error {
+// deregister ends the registration of r.impu's set after its last binding was
+// removed. The record is first claimed for a lease without bindings, as a
+// sweep claims one, so that a REGISTER of another device that lands meanwhile
+// sees no registration and registers afresh; then SAR USER_DEREGISTRATION,
+// and endSet. If the HSS cannot be told, the bindings are put back, or, if
+// another instance changed the record meanwhile, a sweep tells the HSS after
+// the lease.
+func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Registration) error {
 	now := g.cfg.Now()
-	listed, err := g.cfg.Store.RegistrationsOf(ctx, r.impi)
-	if err != nil {
+	profile, err := g.cfg.Store.Profile(ctx, cur.Key, now)
+	if err != nil && !errors.Is(err, state.ErrNotFound) {
 		return err
 	}
-	var others []*state.Registration
-	for _, o := range listed {
-		if o.DefaultIMPU == cur.DefaultIMPU && o.IMPU != r.impu {
-			others = append(others, o)
-		}
-	}
-	profile, err := g.cfg.Store.Profile(ctx, cur.ProfileKey(), now)
-	if err != nil && !errors.Is(err, state.ErrNotFound) {
+	lease := cur.Clone()
+	lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
+	claimed, err := g.cfg.Store.SaveRegistration(ctx, lease)
+	if err != nil {
 		return err
 	}
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: r.impi, PublicIdentities: []string{r.impu}, AssignmentType: cx.UserDeregistration})
@@ -376,66 +414,71 @@ func (g *Registrar) deregister(ctx context.Context, r *register, ops []contactOp
 		res = saa.Result
 	}
 	if f := g.cxFailure("SAR", res, err); f != nil {
+		back := claimed.Clone()
+		back.Contacts, back.Deregistering = cur.Contacts, time.Time{}
+		if _, err := g.cfg.Store.SaveRegistration(ctx, back); err != nil {
+			g.count("registrar.deregistration_left_to_sweep")
+		}
 		return f
 	}
-	if err := g.cfg.Store.DeleteRegistration(ctx, cur); err != nil && !errors.Is(err, state.ErrNotFound) {
-		return err
-	}
-	kept := false
-	for _, o := range others {
-		k, err := g.removeFrom(ctx, r, ops, o, now)
-		if err != nil {
-			return err
-		}
-		kept = kept || k
-	}
 	g.count("registrar.deregistered")
-	if kept || profile == nil {
-		return nil
-	}
-	if err := g.cfg.Store.DeleteProfileIf(ctx, cur.ProfileKey(), profile.Received); err != nil && !errors.Is(err, state.ErrConflict) {
-		return err
-	}
-	return nil
+	return g.endSet(ctx, claimed, profile)
 }
 
-// removeFrom applies a deregistration to o, under the version it was read
-// with, reading it again if it changed, and reports whether it keeps
-// bindings.
-func (g *Registrar) removeFrom(ctx context.Context, r *register, ops []contactOp, o *state.Registration, now time.Time) (bool, error) {
+// endSet finishes a deregistration the HSS has taken, of a set claimed for a
+// lease without bindings: the record is read again, and if another device
+// registered meanwhile, the HSS is told the set is assigned again (SAR
+// REGISTRATION), since its SAR may have crossed the deregistration's.
+// Otherwise the record goes, under the version claimed, with the identity
+// items that name its incarnation and, if still the one read (received), its
+// profile.
+func (g *Registrar) endSet(ctx context.Context, claimed *state.Registration, profile *state.Profile) error {
 	for range saveAttempts {
-		n, f := applyDelta(o.Contacts, r, ops, now)
-		if f != nil {
-			// A newer REGISTER of the same UA reached it, or it never had
-			// these bindings.
-			return live(o, now), nil
+		now := g.cfg.Now()
+		again, f := g.set(ctx, claimed.Key)
+		switch {
+		case f != nil:
+			return f
+		case again == nil:
+			return nil
+		case live(again, now):
+			g.reassign(ctx, again)
+			return nil
+		case again.Version != claimed.Version:
+			// Another deregistration claimed it since: it finishes.
+			return nil
 		}
-		var err error
-		if len(n) == 0 {
-			err = g.cfg.Store.DeleteRegistration(ctx, o)
-		} else {
-			next := o.Clone()
-			next.Contacts = n
-			_, err = g.cfg.Store.SaveRegistration(ctx, next)
-		}
+		err := g.cfg.Store.DeleteRegistration(ctx, again)
 		switch {
 		case errors.Is(err, state.ErrConflict):
-			var fl *failure
-			if o, fl = g.read(ctx, o.IMPU); fl != nil {
-				return false, fl
-			}
-			if o == nil {
-				return false, nil
-			}
 			continue
 		case errors.Is(err, state.ErrNotFound):
-			return false, nil
+			return nil
 		case err != nil:
-			return false, err
+			return err
 		}
-		return len(n) > 0, nil
+		g.unpoint(ctx, again)
+		if profile != nil {
+			if err := g.cfg.Store.DeleteProfileIf(ctx, again.Key, profile.Received); err != nil && !errors.Is(err, state.ErrConflict) {
+				return err
+			}
+		}
+		return nil
 	}
-	return true, errors.New("registrar: an identity of the set kept changing")
+	return errors.New("registrar: the set kept changing while it was deregistered")
+}
+
+// reassign tells the HSS again that this S-CSCF serves reg's set, after a
+// deregistration that a REGISTER of another device overtook.
+func (g *Registrar) reassign(ctx context.Context, reg *state.Registration) {
+	g.count("registrar.reassigned")
+	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
+		UserName: reg.Key.IMPI, PublicIdentities: []string{reg.Key.IMPU},
+		AssignmentType: cx.Registration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
+	})
+	if err != nil || saa == nil || cxclient.Classify(saa.Result) != cxclient.Success {
+		g.count("registrar.hss_failed")
+	}
 }
 
 // live reports whether r still serves terminating requests at now: a
@@ -462,7 +505,7 @@ func latestExpiry(bindings []state.Contact) time.Time {
 // ok is the 200 to an accepted REGISTER (RFC 3261 §10.3 step 8, TS 24.229
 // §5.4.1.2.2F): the bindings, the Path as received, and for a registration
 // the Service-Route back to this S-CSCF and the set's identities.
-func (g *Registrar) ok(req *sip.Request, r *register, bindings []state.Contact, set *implicitSet) *sip.Response {
+func (g *Registrar) ok(req *sip.Request, r *register, bindings []state.Contact, set *state.Registration) *sip.Response {
 	res := g.response(req, 200, "")
 	now := g.cfg.Now()
 	var fields [][2]string
@@ -472,20 +515,16 @@ func (g *Registrar) ok(req *sip.Request, r *register, bindings []state.Contact, 
 	for _, p := range r.path {
 		fields = append(fields, [2]string{"Path", p})
 	}
-	if set != nil {
+	if set != nil && len(bindings) > 0 {
 		u := g.cfg.ServiceRoute
 		u.Params = append(sip.Params(nil), u.Params...)
 		u.Params.SetFlag("lr")
 		u.Params.SetFlag("orig")
 		fields = append(fields, [2]string{"Service-Route", "<" + u.String() + ">"})
-		for _, id := range set.identities {
-			if !id.barred && id.impu == set.defaultID {
-				fields = append(fields, [2]string{"P-Associated-URI", "<" + id.impu + ">"})
-			}
-		}
-		for _, id := range set.identities {
-			if !id.barred && id.impu != set.defaultID {
-				fields = append(fields, [2]string{"P-Associated-URI", "<" + id.impu + ">"})
+		fields = append(fields, [2]string{"P-Associated-URI", "<" + set.Key.IMPU + ">"})
+		for _, id := range set.Identities {
+			if !id.Barred && id.IMPU != set.Key.IMPU {
+				fields = append(fields, [2]string{"P-Associated-URI", "<" + id.IMPU + ">"})
 			}
 		}
 		if r.outbound {

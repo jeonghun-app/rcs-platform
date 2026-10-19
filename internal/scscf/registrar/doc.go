@@ -10,16 +10,19 @@
 // on that first use, so a response is never checked twice. Digest nonces are
 // authenticated with a key every instance shares.
 //
-// Each identity of an implicit registration set has a record of its own, and
-// a REGISTER applies only its own change (its contacts added, refreshed or
-// removed) to each record's current bindings, under that record's version,
-// reading it again when it lost to another instance. So REGISTERs of several
-// devices, or of several identities of one set, landing at once all take
-// effect everywhere, and a deregistration never deletes a record, or the
-// set's profile, that another device saved since it read them. A contact
-// with +sip.instance replaces the bindings of its instance but for its other
-// outbound flows; one without replaces the IMPI's earlier bindings without
-// an instance (TS 24.229 §5.4.1.2.2 4A).
+// An implicit registration set has one record (state.Registration), which
+// each of its identities points at, so a REGISTER for any of them, a
+// deregistration and a sweep are each one save of it conditional on the
+// version read; a REGISTER that loses reads the record again and applies its
+// contacts to what won. A deregistration first claims the record for a lease
+// without bindings, as a sweep does, then tells the HSS, then reads the
+// record again: if another device registered meanwhile, it gives the set
+// back to the HSS (SAR REGISTRATION), whose two SARs may have crossed;
+// otherwise it deletes the record, the identities that still name it, and,
+// if no one saved another since, the profile. A contact with +sip.instance
+// replaces the bindings of its instance but for its other outbound flows;
+// one without replaces the IMPI's earlier bindings without an instance (TS
+// 24.229 §5.4.1.2.2 4A).
 //
 // Every REGISTER is authenticated unless Config.TrustIntegrityProtected lets
 // a re-registration over a P-CSCF's protected connection go unchallenged.

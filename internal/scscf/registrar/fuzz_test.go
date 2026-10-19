@@ -47,7 +47,7 @@ func FuzzParseRegister(f *testing.F) {
 		if len(next) > state.MaxContacts {
 			t.Fatalf("%d bindings", len(next))
 		}
-		probe := &state.Registration{IMPU: r.impu, IMPI: r.impi, DefaultIMPU: r.impu, Contacts: next}
+		probe := &state.Registration{Key: state.SetKey{IMPI: r.impi, IMPU: r.impu}, Incarnation: 1, Identities: []state.SetIdentity{{IMPU: r.impu}}, Contacts: next}
 		storable := probe.Validate() == nil
 		for _, c := range next {
 			if c.Expires.After(t0.Add(7200 * time.Second)) {
