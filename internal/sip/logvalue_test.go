@@ -99,6 +99,38 @@ func TestIPHostsAreLoggedAsTheirNetworkOnly(t *testing.T) {
 	}
 }
 
+// A URI carried as text by another protocol, such as a CPIM From, logs as
+// a parsed one does: scheme and host, the user masked, parameters and
+// headers left out, and a scheme it cannot read masked whole after the
+// scheme (review of #132).
+func TestLoggedURIKeepsTheSchemeAndHostOnly(t *testing.T) {
+	for in, want := range map[string]string{
+		"sip:+15550100001@10.20.30.40":                                             "sip:***@10.20.30.0/24",
+		"sip:alice@198.51.100.7:5061;transport=tls":                                "sip:***@198.51.100.0/24",
+		"sip:[fe80::0211:22ff:fe33:4455]":                                          "sip:fe80::/48",
+		"SIPS:bob@ims.example.net?Subject=Alice%20Secret":                          "sips:***@ims.example.net",
+		"sip:bob@ims.example.net;gr=urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6": "sip:***@ims.example.net",
+		"tel:+15550100001;phone-context=ims.example.net":                           "tel:***",
+		"im:alice.secret@ims.example.net":                                          "im:***@ims.example.net",
+		"im:alice@[2001:db8:5:6::7]":                                               "im:***@2001:db8:5::/48",
+		"pres:alice@10.20.30.40?subject=x":                                         "pres:***@10.20.30.0/24",
+		"im:alice@secret@ims.example.net":                                          "im:***@ims.example.net",
+		"im:alice.secret":                                                          "im:***",
+		`im:"bob@smith"@ims.example.net`:                                           "im:***",
+		"mailto:alice.secret@example.com":                                          "mailto:***",
+		"xmpp:alice.secret@example.com":                                            "xmpp:***",
+		"http://alice.secret:pw@example.com/":                                      "http:***",
+		"urn:gsma:imei:00101000-000003-1":                                          "urn:***",
+		"x15550100001:alice":                                                       "x***01:***",
+		"sip:":                                                                     "sip:***",
+		"not a uri":                                                                "***",
+	} {
+		if got := LoggedURI(in); got != want {
+			t.Errorf("LoggedURI(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestViaLogsItsHostLikeAURIAndLeavesOutTheReceivedAddress(t *testing.T) {
 	vias := mustParseVias(t, "SIP/2.0/TCP 198.51.100.23:40001;branch=z9hG4bK77;received=198.51.100.23;rport=40001")
 	var buf bytes.Buffer
@@ -333,7 +365,7 @@ func TestAcceptContactReasonAndReasonPhrasesLogNoPeerText(t *testing.T) {
 	for _, want := range []string{
 		`"accept":{"0":{"params":"+g.3gpp.icsi-ref;+sip.instance;require"}}`,
 		`"reasons":{"0":{"protocol":"SIP","cause":486}}`,
-		`"resp":{"status":486,"reason":"Busy ***01"`,
+		`"resp":{"status":486,"reason":"(custom)"`,
 	} {
 		if !strings.Contains(js.String(), want) {
 			t.Errorf("JSON log lacks %s:\n%s", want, js.String())
@@ -343,4 +375,60 @@ func TestAcceptContactReasonAndReasonPhrasesLogNoPeerText(t *testing.T) {
 		!strings.Contains(text.String(), "reasons.0.cause=486") {
 		t.Errorf("text log = %s", text.String())
 	}
+}
+
+// The names of Accept-Contact parameters and the Reason protocol are the
+// peer's tokens, masked like other text; a cause longer than a SIP or Q.850
+// cause is marked, and a reason phrase other than the registered one is
+// marked as custom (review of #132).
+func TestPeerTokensInAcceptContactReasonAndPhrasesAreMasked(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		v    slog.LogValuer
+		want string
+	}{
+		{"Accept-Contact parameter name", mustAcceptContact(t, "*;+15550100001"), `{"params":"+***01"}`},
+		{"Reason protocol", mustReason(t, "15550100001;cause=1"), `{"protocol":"***01","cause":1}`},
+		{"eight-digit cause", mustReason(t, "SIP;cause=91234567"), `{"protocol":"SIP","cause":"***"}`},
+		{"ten-digit cause with zeros", mustReason(t, "SIP;cause=0091234567"), `{"protocol":"SIP","cause":"***"}`},
+		{"largest cause logged", mustReason(t, "Q.850;cause=999"), `{"protocol":"Q.850","cause":999}`},
+		{"smallest cause marked", mustReason(t, "Q.850;cause=1000"), `{"protocol":"Q.850","cause":"***"}`},
+		{"registered phrase", Response{StatusCode: 486, Reason: "Busy Here"}, `"reason":"Busy Here"`},
+		{"registered phrase in another case", Response{StatusCode: 486, Reason: "busy here"}, `"reason":"busy here"`},
+		{"class name of an unregistered code", Response{StatusCode: 499, Reason: "Client Error"}, `"reason":"Client Error"`},
+		{"no phrase", Response{StatusCode: 200}, `"reason":""`},
+		{"a name in the phrase", Response{StatusCode: 486, Reason: "Alice Secret is busy"}, `"reason":"(custom)"`},
+		{"the registered phrase and more", Response{StatusCode: 486, Reason: "Busy Here 10.20.30.40"}, `"reason":"(custom)"`},
+		{"another code's phrase", Response{StatusCode: 486, Reason: "Decline"}, `"reason":"(custom)"`},
+	} {
+		out, err := json.Marshal(tt.v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var js bytes.Buffer
+		untimedJSONLogger(&js).Info("x", "v", tt.v)
+		for name, got := range map[string]string{"json.Marshal": string(out), "JSON handler": js.String()} {
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("%s: %s gives %s, want %s", tt.name, name, got, tt.want)
+			}
+		}
+	}
+}
+
+func mustAcceptContact(t *testing.T, v string) AcceptContact {
+	t.Helper()
+	acs, err := headerWith(t, "Accept-Contact", v).AcceptContact()
+	if err != nil || len(acs) != 1 {
+		t.Fatalf("Accept-Contact %q = %v, %v", v, acs, err)
+	}
+	return acs[0]
+}
+
+func mustReason(t *testing.T, v string) Reason {
+	t.Helper()
+	rs, err := headerWith(t, "Reason", v).Reason()
+	if err != nil || len(rs) != 1 {
+		t.Fatalf("Reason %q = %v, %v", v, rs, err)
+	}
+	return rs[0]
 }
