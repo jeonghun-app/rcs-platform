@@ -246,13 +246,16 @@ func TestTrafficTowardTheClientKeepsItsConnectionOpen(t *testing.T) {
 	// answers every chunk.
 	//
 	// The test waits on progress (#124): the test sends the next message
-	// only once the last one arrived, so a relay that cuts correctly, after
-	// the idle timeout without a write, leaves two consecutive gaps between
-	// deliveries that add up to the idle timeout or more. A cut while every
-	// gap of the attempt stayed under half the idle timeout is the relay's
-	// fault; otherwise the host may have stalled (the deadline can even fire
-	// after the next message was written), the attempt is inconclusive, and
-	// the test starts over on a new connection, up to maxAttempts.
+	// only once the last one arrived, and the relay writes one message at a
+	// time and resets its idle deadline once each write returns. So a relay
+	// that cuts correctly, after the idle timeout without a reset, leaves
+	// three consecutive gaps between deliveries that add up to the idle
+	// timeout or more: the reset after a delivery may come as late as the
+	// next delivery (review of #128, #150). A cut while every gap of the
+	// attempt stayed under a third of the idle timeout is the relay's fault;
+	// otherwise the host may have stalled (the deadline can even fire after
+	// the next message was written), the attempt is inconclusive, and the
+	// test starts over on a new connection, up to maxAttempts.
 	const maxAttempts = 5
 	for _, tt := range []struct {
 		name string
@@ -272,7 +275,7 @@ func TestTrafficTowardTheClientKeepsItsConnectionOpen(t *testing.T) {
 					if delivered == 0 {
 						t.Fatalf("no message reached the client in %d attempts", maxAttempts)
 					}
-					t.Skipf("traffic was held up for half the idle timeout or longer in all %d attempts: the host is too loaded for real-time deadlines", maxAttempts)
+					t.Skipf("traffic was held up for a third of the idle timeout or longer in all %d attempts: the host is too loaded for real-time deadlines", maxAttempts)
 				}
 			}
 		})
@@ -324,15 +327,15 @@ func trafficKeepsTheClientConnected(t *testing.T, name string, mode msrp.ReportM
 		t.Fatal(err)
 	}
 	// cut reports a cut seen at this moment: the relay's fault if every gap
-	// between deliveries, this last one included, stayed under half the
-	// idle timeout, a stall of the host otherwise.
+	// between deliveries, this last one included, stayed under a third of
+	// the idle timeout, a stall of the host otherwise.
 	cut := func() (bool, int) {
 		gap()
-		if worst >= idle/2 {
-			t.Logf("traffic was held up for %v, half the %v idle timeout or more; starting over", worst, idle)
+		if worst >= idle/3 {
+			t.Logf("traffic was held up for %v, a third of the %v idle timeout or more; starting over", worst, idle)
 			return false, delivered
 		}
-		t.Fatalf("the client was cut while every gap between deliveries stayed under %v", worst)
+		t.Fatalf("the client was cut although the longest gap between deliveries was %v, under a third of the %v idle timeout", worst, idle)
 		return false, delivered
 	}
 	// Traffic goes out every idle/10.
