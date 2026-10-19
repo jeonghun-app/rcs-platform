@@ -52,6 +52,7 @@ func TestDNSResolverResolvesNamesAndAddressesToPrivateDestinations(t *testing.T)
 	}{
 		{"sip:icscf.rcs.internal;transport=tcp;lr", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5060")}},
 		{"sip:ICSCF.rcs.internal:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5070")}},
+		{"sip:icscf.rcs.internal.:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5070")}},
 		{"sips:icscf.rcs.internal", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.3.7:5061"), ServerName: "icscf.rcs.internal"}},
 		{"sip:icscf.rcs.internal;transport=tls", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.3.7:5061"), ServerName: "icscf.rcs.internal"}},
 		{"sip:v6.rcs.internal;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("[fd00::7]:5060")}},

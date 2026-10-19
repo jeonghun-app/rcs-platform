@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -182,6 +183,8 @@ type pcscf struct {
 	ids   sip.IDGenerator
 	now   func() time.Time
 	log   *slog.Logger
+	// metrics counts what is worth an alarm; nil in tests that need none.
+	metrics *runtime.Metrics
 }
 
 // Route implements proxy.Router. A client's REGISTER goes to icscf, its

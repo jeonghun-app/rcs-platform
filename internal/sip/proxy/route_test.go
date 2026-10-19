@@ -3,6 +3,7 @@ package proxy
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -106,6 +107,35 @@ func TestRouteProcessing(t *testing.T) {
 			wantURI:    "sip:bob@example.com",
 			wantHop:    "example.com",
 			wantRouted: []string{"<sips:proxy.example.net;lr>"},
+		},
+		{
+			// An address written another way is still this proxy's
+			// (review of #208): IPv4-mapped, bracketed, case, trailing dot.
+			name:       "an IPv4-mapped form of its address is this proxy",
+			self:       []string{"sip:10.0.2.9:5070"},
+			uri:        "sip:bob@example.com",
+			routes:     []string{"<sip:[::ffff:10.0.2.9]:5070;transport=tcp;lr>"},
+			wantURI:    "sip:bob@example.com",
+			wantHop:    "example.com",
+			wantRouted: []string{"<sip:[::ffff:10.0.2.9]:5070;transport=tcp;lr>"},
+		},
+		{
+			name:       "another spelling of its IPv6 address is this proxy",
+			self:       []string{"sip:[fd00:0:0::9]:5070"},
+			uri:        "sip:bob@example.com",
+			routes:     []string{"<sip:[FD00::9]:5070;lr>"},
+			wantURI:    "sip:bob@example.com",
+			wantHop:    "example.com",
+			wantRouted: []string{"<sip:[FD00::9]:5070;lr>"},
+		},
+		{
+			name:       "a name with a trailing dot is this proxy",
+			self:       []string{"sip:proxy.example.net"},
+			uri:        "sip:bob@example.com",
+			routes:     []string{"<sip:PROXY.example.net.:5060;lr>"},
+			wantURI:    "sip:bob@example.com",
+			wantHop:    "example.com",
+			wantRouted: []string{"<sip:PROXY.example.net.:5060;lr>"},
 		},
 		{
 			name:       "another port of the same host is another element",
@@ -446,4 +476,25 @@ func TestPrepareErrorFailsTheBranchWith500(t *testing.T) {
 	h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
 	check(t, "sent", h.sentMethods(), nil)
 	check(t, "upstream", h.upstream(), codes(500))
+}
+
+// A discarded request gets no response at all, not even a 100 Trying, and
+// its retransmission is absorbed (TS 24.229 §5.2.6.3.2A).
+func TestADiscardedRequestGetsNoResponse(t *testing.T) {
+	for _, method := range []string{"MESSAGE", "INVITE"} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.decide(Decision{Discard: true, Status: 403})
+			req := request(t, method, "sip:bob@example.com")
+			h.receive(req)
+			h.advance(time.Second)
+			h.receive(req)
+			h.advance(time.Second)
+			check(t, "sent", h.sentMethods(), nil)
+			check(t, "upstream", h.upstream(), nil)
+			if n := h.p.Stats().Contexts; n != 0 {
+				t.Errorf("Contexts = %d after the discard, want 0", n)
+			}
+		})
+	}
 }

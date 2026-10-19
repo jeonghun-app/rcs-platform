@@ -26,21 +26,25 @@ import (
 // never a protocol timer.
 const waitFor = 10 * time.Second
 
-// testConfig serves plain TCP on loopback, with the task address 127.0.0.1.
+// testConfig serves plain TCP on loopback, with the task address 127.0.0.2:
+// a core hop never resolves to the task's own address, and the fake core
+// nodes listen on 127.0.0.1.
 func testConfig() Config {
 	return Config{
 		PublicHost: publicHost, PublicPort: 5060, ClientTransport: ClientTCP, ClientAddr: "127.0.0.1:0",
-		CoreAddr: "127.0.0.1:0", CoreHost: netip.MustParseAddr("127.0.0.1"),
+		CoreAddr: "127.0.0.2:0", CoreHost: netip.MustParseAddr("127.0.0.2"),
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout, DrainTimeout: time.Second,
 		ICSCF:         sip.URI{Scheme: "sip", Host: "icscf.rcs.internal", Params: sip.Params{{Name: "transport", Value: "tcp"}, {Name: "lr"}}},
 		AllowLoopback: true, MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
+		SCSCFHost: "scscf.rcs.internal", SCSCFPort: DefaultSCSCFPort,
 		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 	}
 }
 
 type service struct {
+	h                 *runtimetest.Harness
 	client, udp, core netip.AddrPort
 	stop              func()
 	done              chan error
@@ -51,7 +55,7 @@ func start(t *testing.T, cfg Config, d deps) *service {
 	t.Helper()
 	h := runtimetest.New(t, "pcscf")
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &service{done: make(chan error, 1)}
+	s := &service{h: h, done: make(chan error, 1)}
 	listening := make(chan struct{})
 	d.listening = func(b bound) {
 		s.client, s.udp, s.core = b.client, b.udp, b.core
@@ -132,8 +136,10 @@ func (p *peer) try(routes ...string) (*sip.Response, error) {
 	return p.tryWith(fields...)
 }
 
-// tryWith sends an OPTIONS with extra header fields and returns the
-// response.
+// tryWith sends an OPTIONS inside a made-up dialog, with extra header fields,
+// and returns the response: without a route this pcscf recorded it is
+// answered 403 (an OPTIONS outside a dialog from a flow without a
+// registration would be discarded).
 func (p *peer) tryWith(fields ...string) (*sip.Response, error) {
 	n := requests.Add(1)
 	var b strings.Builder
@@ -141,7 +147,7 @@ func (p *peer) tryWith(fields ...string) (*sip.Response, error) {
 	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.10:40000;branch=z9hG4bK-pcscf-%d\r\n", n)
 	b.WriteString("Max-Forwards: 70\r\n")
 	b.WriteString("From: <sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org>;tag=a1\r\n")
-	b.WriteString("To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>\r\n")
+	b.WriteString("To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>;tag=b1\r\n")
 	fmt.Fprintf(&b, "Call-ID: pcscf-test-%d\r\n", n)
 	fmt.Fprintf(&b, "CSeq: %d OPTIONS\r\n", n)
 	for _, f := range fields {
@@ -173,10 +179,33 @@ func (p *peer) closed() bool {
 	return err != nil && !(errors.As(err, &ne) && ne.Timeout())
 }
 
+// Until it registers, a client's request outside a dialog is discarded and
+// counted (TS 24.229 §5.2.6.3.2A), and one inside a dialog pcscf did not
+// record is refused with 403; the core gets 430 until terminating routing
+// lands.
 func TestUntilRegistrationClientsGet403AndTheCore430(t *testing.T) {
 	s := start(t, testConfig(), deps{})
-	if res := dial(t, s.client, nil).request(); res.StatusCode != 403 {
-		t.Fatalf("client OPTIONS answered %d, want 403", res.StatusCode)
+	c := dial(t, s.client, nil)
+	discarded := strings.Replace(registerText(""), "REGISTER", "OPTIONS", -1)
+	_ = c.nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := io.WriteString(c.nc, discarded); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(waitFor)
+	for {
+		if v, ok := s.h.Metric(metricUnregistered); ok && v == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the discard was not counted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The first response is the in-dialog request's: the discarded one had
+	// none.
+	res := c.request()
+	if res.StatusCode != 403 || res.Header.Get("Call-ID") == "reg-1" {
+		t.Fatalf("client OPTIONS answered %d (Call-ID %s), want 403 to the in-dialog one", res.StatusCode, res.Header.Get("Call-ID"))
 	}
 	if res := dial(t, s.core, nil).request(); res.StatusCode != 430 {
 		t.Fatalf("core OPTIONS answered %d, want 430", res.StatusCode)
@@ -215,9 +244,12 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 		// The NLB's address, as rcsjta writes its first Route (review of #188).
 		"sip:203.0.113.10:5061;transport=tls;lr",
 		"sip:203.0.113.10;lr",
-		"sip:127.0.0.1;lr",
-		"sip:127.0.0.1:5061;lr",
-		"sip:127.0.0.1:" + fmt.Sprint(s.core.Port()) + ";lr",
+		"sip:127.0.0.2;lr",
+		"sip:127.0.0.2:5061;lr",
+		"sip:127.0.0.2:" + fmt.Sprint(s.core.Port()) + ";lr",
+		// Its address written another way (review of #208).
+		"sip:[::ffff:127.0.0.2]:" + fmt.Sprint(s.core.Port()) + ";transport=tcp;lr",
+		"sip:PCSCF.rcs.example.net.:5060;lr",
 	} {
 		rec.seen = nil
 		c.request(r, "sip:scscf.example.net;lr")
@@ -225,7 +257,7 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 			t.Errorf("Route %s: router saw %q, want it taken as pcscf's own", r, rec.seen)
 		}
 	}
-	for _, r := range []string{"sip:other.rcs.example.net;lr", "sip:127.0.0.2;lr", "sip:" + publicHost + ":5070;lr", "sip:203.0.113.11:5061;lr"} {
+	for _, r := range []string{"sip:other.rcs.example.net;lr", "sip:127.0.0.3;lr", "sip:" + publicHost + ":5070;lr", "sip:203.0.113.11:5061;lr"} {
 		rec.seen = nil
 		c.request(r)
 		if len(rec.seen) != 1 || !strings.HasPrefix(rec.seen[0], "0 ") {
@@ -461,7 +493,7 @@ func TestAUDPClientIsAClient(t *testing.T) {
 		"Via: SIP/2.0/UDP 192.0.2.10:40000;rport;branch=z9hG4bK-pcscf-udp\r\n" +
 		"Max-Forwards: 70\r\n" +
 		"From: <sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org>;tag=a1\r\n" +
-		"To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>\r\n" +
+		"To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>;tag=b1\r\n" +
 		"Call-ID: pcscf-test-udp\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n"
 	_ = nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(nc, req); err != nil {

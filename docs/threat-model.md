@@ -44,6 +44,14 @@ Anything that reaches a core SIP port can send as any subscriber by setting
 separate from its core listener; core SIP ports admit only platform services
 (ADR 0007 §2, §7).
 **Status:** planned (#16, Phase 7 infrastructure).
+**Residual risk (accepted, #208):** `pcscf` checks a client's in-dialog
+request against its own Record-Route values only, keeping no dialog state.
+The peer of a past call has seen the core-facing value, with the flow token,
+so it can go on sending "in-dialog" requests to that flow after the call has
+ended, for as long as the flow lives. Such requests still pass through
+`scscf` and `rcs-as`, which both record themselves in the dialog, so the
+application server sees them. A possible mitigation is a dialog-state check
+in `scscf`, such as a signed Record-Route parameter it verifies.
 
 ## T3 — MSRP session access on `rcs-as`
 
@@ -91,7 +99,7 @@ compromised, its reach is what its security group and tokens allow:
 
 | Service | Implemented in the service | Planned |
 |---|---|---|
-| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, with connections kept for the core listener; registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to a private next hop ([pcscf](pcscf.md)) | terminating routing and the reg event (#16), per-listener handshake limits (#193), security groups (#56) |
+| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, with connections kept for the core listener; registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to `scscf`'s service name alone and never back into the task ([pcscf](pcscf.md)) | terminating routing and the reg event (#16), per-listener handshake limits (#193), security groups (#56), a dialog-state check in `scscf` (T2 residual risk) |
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |

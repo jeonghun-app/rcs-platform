@@ -37,6 +37,8 @@ const (
 	// outside a dialog likewise.
 	DefaultInitialRate  = 50
 	DefaultInitialBurst = 200
+	// DefaultSCSCFPort is scscf's SIP port.
+	DefaultSCSCFPort = 5060
 	// DefaultMaxClientFlows and DefaultCoreConnections split the transport's
 	// DefaultMaxConnections: client flows may take no more than their share,
 	// so the core listener always has room for scscf (review of #188).
@@ -95,6 +97,12 @@ type Config struct {
 	// Namespace is RCS_SERVICE_NAMESPACE, the only names a core hop is
 	// looked up in (ADR 0007 §5).
 	Namespace string
+	// SCSCFHost and SCSCFPort are scscf's service name, in lower case, and
+	// SIP port: the only next hop of a client's request inside a dialog,
+	// since scscf records its service name in every dialog pcscf is in (ADR
+	// 0005).
+	SCSCFHost string
+	SCSCFPort int
 	// HomeDomain is RCS_IMS_DOMAIN, the operator's IMS domain: the type 1
 	// orig-ioi of P-Charging-Vector, naming the network that sends a
 	// request (TS 24.229 §5.2.2.1 4), §5.2.6.3.3 7)), and the visited
@@ -152,6 +160,7 @@ func Configure(s *runtime.Settings) Config {
 	}
 	c.VisitedNetworkID = e.String("VISITED_NETWORK_ID", c.HomeDomain)
 	c.ICSCF = icscfURI(s)
+	c.SCSCFHost, c.SCSCFPort = scscfService(s, c.PublicHost)
 	if c.HomeDomain != "" && !validHostName(c.HomeDomain) {
 		s.Shared.Invalid("IMS_DOMAIN", "not a host name")
 	}
@@ -272,6 +281,32 @@ func icscfURI(s *runtime.Settings) sip.URI {
 		return sip.URI{}
 	}
 	return u
+}
+
+// scscfService reads PCSCF_SCSCF_HOST and PCSCF_SCSCF_PORT: a name inside the
+// namespace, scscf.<namespace> by default, that is not pcscf's own, so that
+// an in-dialog request can never be sent back to pcscf.
+func scscfService(s *runtime.Settings, publicHost string) (string, int) {
+	e := s.Env
+	ns := s.ServiceNamespace()
+	def := ""
+	if ns != "" {
+		def = "scscf." + ns
+	}
+	host := strings.TrimSuffix(strings.ToLower(e.String("SCSCF_HOST", def)), ".")
+	port := e.Int("SCSCF_PORT", DefaultSCSCFPort)
+	switch {
+	case host == "":
+		e.Invalid("SCSCF_HOST", "required when RCS_SERVICE_NAMESPACE is unset")
+	case !runtime.InServiceNamespace(host, ns):
+		e.Invalid("SCSCF_HOST", "not a name inside RCS_SERVICE_NAMESPACE")
+	case host == publicHost || host == "pcscf."+ns:
+		e.Invalid("SCSCF_HOST", "names pcscf itself")
+	}
+	if port < 1 || port > 65535 {
+		e.Invalid("SCSCF_PORT", "not a port from 1 to 65535")
+	}
+	return host, port
 }
 
 // validVisitedNetwork reports whether v is one P-Visited-Network-ID element,

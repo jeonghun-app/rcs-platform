@@ -106,7 +106,8 @@ func (r *DNSResolver) ResolveAll(ctx context.Context, u sip.URI) ([]transport.De
 	if err != nil {
 		return nil, err
 	}
-	host := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]"))
+	// One name however it is written, so it is looked up and kept once.
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]")), ".")
 	var addrs []netip.Addr
 	named := false
 	if a, err := netip.ParseAddr(host); err == nil {
