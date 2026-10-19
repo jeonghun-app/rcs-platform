@@ -377,42 +377,57 @@ func sessionBound(m store.Message) bool {
 // was removed neither reaches them nor brings them back, at every retry,
 // into a group they are not in.
 func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool) outcome {
-	departed := e.hasDeparted(legKey{m.Recipient, m.Sender})
-	if !departed {
-		if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
-			if behind {
-				return whole
-			}
-			return e.viaLeg(ctx, l, m)
+	key := legKey{m.Recipient, m.Sender}
+	asked := false
+	if e.hasDeparted(key) {
+		if o, member := e.stillMember(ctx, m); !member {
+			return o
 		}
-		e.mu.Lock()
-		_, pagerOnly := e.pagerOnly[m.Recipient]
-		e.mu.Unlock()
-		if pagerOnly || !e.inviteDue(m) {
-			return skip
+		// Added again since: the mark is stale.
+		e.ParticipantAdded(m.Sender, m.Recipient)
+		asked = true
+	}
+	if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
+		if behind {
+			return whole
+		}
+		return e.viaLeg(ctx, l, m)
+	}
+	e.mu.Lock()
+	_, pagerOnly := e.pagerOnly[m.Recipient]
+	e.mu.Unlock()
+	if pagerOnly || !e.inviteDue(m) {
+		return skip
+	}
+	if !asked {
+		if o, member := e.stillMember(ctx, m); !member {
+			return o
 		}
 	}
+	e.invite(ctx, m)
+	return skip
+}
+
+// stillMember asks the GroupHandler whether m's recipient is still a
+// participant of m's group, and gives m up if not. When it is not, or
+// cannot tell, it returns the outcome of the attempt.
+func (e *Engine) stillMember(ctx context.Context, m store.Message) (outcome, bool) {
 	h := e.groupHandler()
 	if h == nil {
-		return skip
+		return skip, false
 	}
 	member, err := h.Member(ctx, m.Sender, m.Recipient)
 	switch {
 	case err != nil:
 		e.storeFailed("group member", m.Recipient, err)
-		return skip
+		return skip, false
 	case !member:
 		if c, ok := e.claim(ctx, m); ok {
 			e.giveUp(c, "delivery.not_participant")
 		}
-		return done
-	case departed:
-		// Added again since: the mark is stale.
-		e.ParticipantAdded(m.Sender, m.Recipient)
-		return e.deliverGroup(ctx, m, behind)
+		return done, false
 	}
-	e.invite(ctx, m)
-	return skip
+	return done, true
 }
 
 // chatLeg returns the newest open chat leg of user with peer.
