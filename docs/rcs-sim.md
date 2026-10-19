@@ -65,7 +65,7 @@ network, seconds after the break; the simulator asks at once, before
 `ft-server` may have noticed the break. So `get_upload_info` asks again, every
 100 ms. It stops once the answers have named the same bytes held for 300 ms,
 counted from the request that first got that value. A 404 is asked again for
-up to 3 s. If the bytes held are still changing when the 3 s have passed, the
+up to 3 s (`-upload-settle`). If the bytes held are still changing when the 3 s have passed, the
 step fails ("the server is still storing the broken upload") instead of
 resuming from a value that has not settled. Two equal answers in a row were not enough:
 `ft-server` may still hold the broken upload, and about one resume in 800 got
@@ -136,6 +136,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-ft-upload-url` | none | ft-server's upload URI (`ftHTTPCSURI`); the FT scenarios fail without it |
 | `-ft-user` | `RCS_SIM_FT_USER` | FT user name (`ftHTTPCSUser`) |
 | `-file-size` | 256 KiB | size of the `ft` file |
+| `-upload-settle` | 3s | how long `get_upload_info` is asked again for a broken upload to show; when it ends with the bytes still changing, the step fails. Tests that run the in-process stack set an hour, so that only `-step-timeout` bounds the step |
 | `-resume-size` | 12 MiB | size of the `ft-resume` file; must exceed the server's `FT_PART_SIZE`, since only whole parts survive a break; otherwise nothing is held and the scenario uploads again instead of resuming |
 | `-relay-control` | none | msrp-relay control API base URL; the chat scenarios fail without it |
 | `-core-listen` | `127.0.0.1:0` | where the rcs-as stand-in listens; the port must be in the relay's `RELAY_CORE_PORTS` |
