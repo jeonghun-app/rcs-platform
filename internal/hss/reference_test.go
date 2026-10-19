@@ -87,6 +87,23 @@ func TestProfileBeyondTheWorkBudgetIsRefusedWithTheLimitName(t *testing.T) {
 	}
 }
 
+func TestProfileWithAPatternGoReadsDifferentlyFromPOSIXIsRefusedNamingTheConstruct(t *testing.T) {
+	a := newAPIEnv(t)
+	// The contents are JSON strings, so each backslash is written twice.
+	for content, construct := range map[string]string{
+		`[\\.]com`: "a backslash inside a bracket expression",
+		`\\x41`:    `the escape \x`,
+	} {
+		profile := `{"id":"corner","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+			`{"group":[0],"sip_header":{"header":"Subject","content":"` + content + `"}}]},` +
+			`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}]}`
+		code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
+		if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, construct) {
+			t.Errorf("%s: %d %v, want 400 naming %s", content, code, body, construct)
+		}
+	}
+}
+
 func TestCostlyProfileIsAcceptedWithAWarning(t *testing.T) {
 	a := newAPIEnv(t)
 	// Two counted repetitions over the 2 KB Contact cost about 340 000

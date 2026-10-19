@@ -181,9 +181,11 @@ const (
 // Compile checks criteria (as Subscription.Marshal would), compiles their
 // patterns and orders them by priority. It fails when two criteria share a
 // priority, which TS 29.228 B.2.2 forbids and which would leave their order
-// to chance, or when a pattern is not a POSIX extended regular expression.
+// to chance, when a pattern is not a POSIX extended regular expression, or
+// when it uses a construct Go reads differently (see the package doc).
 // Errors name the criterion by priority and never quote a pattern, which may
-// hold a subscriber identity.
+// hold a subscriber identity; a refused construct is named by its own
+// characters only.
 func Compile(criteria []FilterCriteria) (*Set, error) {
 	return CompileWithLimits(criteria, Limits{})
 }
@@ -304,11 +306,13 @@ const (
 const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 
 // compilePattern compiles a POSIX extended regular expression (TS 29.228
-// Annex F). The pattern is parsed as an ERE, which refuses Perl extensions
-// such as \d and (?i), and the parsed tree, not the source text, is what gets
-// compiled: Go's matcher reads Perl syntax, in which some valid EREs mean
-// something else. "0+?" is (0+)? in an ERE, which matches the empty value,
-// but the lazy 0+? in Perl, which needs a 0 (#61).
+// Annex F). A pattern using a construct Go's parser reads differently from
+// IEEE 1003.1 is refused first, naming it ([ereDeparture]). The pattern is
+// then parsed as an ERE, which refuses Perl extensions such as (?i), and the
+// parsed tree, not the source text, is what gets compiled: Go's matcher
+// reads Perl syntax, in which some valid EREs mean something else. "0+?"
+// is (0+)? in an ERE, which matches the empty value, but the lazy 0+? in
+// Perl, which needs a 0 (#61).
 //
 // A case-insensitive pattern is parsed with FoldCase, so that the parser
 // folds every literal and bracket expression before it merges them; folding
@@ -321,6 +325,9 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // ([sameMeaning]), so a pattern whose meaning could not be kept exactly is
 // refused rather than compiled into something else.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
+	if construct := ereDeparture(source); construct != "" {
+		return pattern{}, fmt.Errorf("%s uses %s, which this engine reads differently from a POSIX ERE", name, construct)
+	}
 	flags := posixFlags
 	if mode&patternFoldCase != 0 {
 		flags |= syntax.FoldCase

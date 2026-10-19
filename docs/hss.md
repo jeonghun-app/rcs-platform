@@ -222,6 +222,29 @@ selects `Contact`, not `Accept-Contact`); every other pattern matches anywhere i
 its field, so anchor it with `^`/`$` to match a whole value. Request-URI patterns
 ignore case.
 
+A few constructs mean one thing to POSIX and another to the Go engine the S-CSCF
+runs, so the API refuses them with 400, naming the construct:
+
+- a backslash inside brackets (`[\.]com`; write `[.]com` or `\.com`);
+- a backslash before anything but an ERE special character, one of
+  `. [ ] ( ) * + ? { } | ^ $ \`: letters and digits (`\d`, `\w`, `\b`, `\x41`,
+  `\n`, `\1`), which some engines read as classes or escapes, `\<`, `\>`, `` \` ``
+  and `\'`, which glibc and musl read as word or value boundaries, and other
+  punctuation (`\-`, `\@`, `\/`, `\:`). Write `[[:digit:]]`, `[[:space:]]` and
+  so on, or the character itself;
+- collating symbols and equivalence classes (`[[.a.]]`, `[[=a=]]`), and
+  `[[:^alpha:]]`, which is not a class name (write `[^[:alpha:]]`);
+- an interval without a lower bound (`a{,3}`; write `a{0,3}`, or `a\{,3\}` for
+  the text).
+
+A backslash before a special character, such as `\.` or `\+`, is a literal and
+is fine. Named classes such as `[[:alpha:]]` hold ASCII characters only, as in
+the POSIX locale: `[[:alpha:]]` does not match `ä`, and `[^[:upper:]]` does.
+
+The API checks patterns when a profile is written. A profile stored before
+this rule keeps working as it is, and needs these constructs removed when it
+is next changed.
+
 The S-CSCF evaluates a profile for every initial request within a work budget
 (`internal/ifc`, `DefaultMaxWork`) and fails the evaluation of a request the
 budget cannot pay for. Write each condition as a plain header name and a literal
