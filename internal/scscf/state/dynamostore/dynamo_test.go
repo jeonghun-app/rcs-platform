@@ -130,8 +130,9 @@ func TestAResentKeepProfileSucceeds(t *testing.T) {
 
 // TestAKeepProfileThatRacesASaveStillExtendsTheProfile: the profile is
 // already kept as long, so the update's condition fails; before the read
-// back, another instance saves it again with an earlier KeepUntil. The second
-// attempt extends the saved profile, and nothing reports a conflict.
+// back, another instance deletes it and a third saves it anew with an earlier
+// KeepUntil. The second attempt extends the new profile, and nothing reports
+// a conflict.
 func TestAKeepProfileThatRacesASaveStillExtendsTheProfile(t *testing.T) {
 	f := newFake(t)
 	d := newTestStore(t, f)
@@ -147,6 +148,11 @@ func TestAKeepProfileThatRacesASaveStillExtendsTheProfile(t *testing.T) {
 			return
 		}
 		saved = true
+		// Deleted, by a deregistration, and saved again by a new
+		// registration, with an earlier KeepUntil.
+		if err := d.DeleteProfile(bg(), statetest.Set1); err != nil {
+			t.Error(err)
+		}
 		q := statetest.Profile(statetest.Set1, []byte("y"), statetest.T0.Add(time.Second))
 		q.KeepUntil = statetest.T0.Add(time.Hour)
 		if err := d.SaveProfile(bg(), q); err != nil {
@@ -293,8 +299,8 @@ func TestACorruptItemIsReportedWithoutHidingTheOthers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	f.tables[DefaultRegistrationsTable][itemKey(key(statetest.IMPU2))][attrDoc] = bin([]byte("{"))
-	if _, err := d.Registration(bg(), statetest.IMPU2); !errors.Is(err, state.ErrInvalid) {
+	f.tables[DefaultRegistrationsTable][itemKey(key(setPK(statetest.Key1(statetest.IMPU2))))][attrDoc] = bin([]byte("{"))
+	if _, err := d.Registration(bg(), statetest.Key1(statetest.IMPU2)); !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("error = %v, want ErrInvalid", err)
 	}
 	regs, err := d.ExpiringRegistrations(bg(), statetest.T0, 10)
@@ -316,7 +322,7 @@ func TestSDKErrorsCarryNoKey(t *testing.T) {
 	d := newTestStore(t, f)
 	f.fail = &types.ProvisionedThroughputExceededException{Message: aws.String("throttled " + statetest.IMPU1)}
 	checks := []error{
-		func() error { _, err := d.Registration(bg(), statetest.IMPU1); return err }(),
+		func() error { _, err := d.Registration(bg(), statetest.Key1(statetest.IMPU1)); return err }(),
 		func() error {
 			_, err := d.SaveRegistration(bg(), statetest.Registration(statetest.IMPI1, statetest.IMPU1, time.Hour))
 			return err
@@ -333,7 +339,7 @@ func TestSDKErrorsCarryNoKey(t *testing.T) {
 		}
 	}
 	f.fail = context.DeadlineExceeded
-	if _, err := d.Registration(bg(), statetest.IMPU1); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := d.Registration(bg(), statetest.Key1(statetest.IMPU1)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("a deadline is reported as %v", err)
 	}
 }
@@ -401,10 +407,10 @@ func TestMalformedItemsAreInvalid(t *testing.T) {
 			}
 		})
 	}
-	f.tables[DefaultRegistrationsTable][itemKey(key(statetest.IMPU1))] = map[string]types.AttributeValue{
+	f.tables[DefaultRegistrationsTable][itemKey(key(setPK(statetest.Key1(statetest.IMPU1))))] = map[string]types.AttributeValue{
 		attrPK: str(statetest.IMPU1), attrDoc: bin([]byte("{}")),
 	}
-	if _, err := d.Registration(bg(), statetest.IMPU1); !errors.Is(err, state.ErrInvalid) {
+	if _, err := d.Registration(bg(), statetest.Key1(statetest.IMPU1)); !errors.Is(err, state.ErrInvalid) {
 		t.Errorf("a registration without a version: %v", err)
 	}
 }
@@ -413,12 +419,12 @@ func TestTransportErrorsAreReducedToTheirCause(t *testing.T) {
 	f := newFake(t)
 	d := newTestStore(t, f)
 	f.fail = &url.Error{Op: "Post", URL: "https://dynamodb.example/" + statetest.IMPU1, Err: errors.New("connection refused")}
-	_, err := d.Registration(bg(), statetest.IMPU1)
+	_, err := d.Registration(bg(), statetest.Key1(statetest.IMPU1))
 	if err == nil || strings.Contains(err.Error(), "15550100001") || !strings.Contains(err.Error(), "connection refused") {
 		t.Errorf("error %v", err)
 	}
 	f.fail = errors.New("something " + statetest.IMPU1)
-	if _, err := d.Registration(bg(), statetest.IMPU1); err == nil || strings.Contains(err.Error(), "15550100001") {
+	if _, err := d.Registration(bg(), statetest.Key1(statetest.IMPU1)); err == nil || strings.Contains(err.Error(), "15550100001") {
 		t.Errorf("error %v", err)
 	}
 }

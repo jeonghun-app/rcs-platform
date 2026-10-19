@@ -16,6 +16,11 @@ func FuzzParseRegister(f *testing.F) {
 	u := &ue{t: &testing.T{}, impi: impi1, impu: impu1, callID: "c", contact: "sip:ue@192.0.2.10", instance: "<urn:uuid:1>", regID: 1}
 	f.Add([]byte(requestText(u, 600, "")))
 	f.Add([]byte(requestText(u, 600, "", `Contact: <sip:b@192.0.2.10>;+g.x="a\\b";+g.y="c\"d"`)))
+	// From the #196 re-check: control characters behind a quoted-pair.
+	for _, c := range []string{"\x00", "\x01", "\x7f"} {
+		f.Add([]byte(requestText(u, 600, "", "Contact: <sip:b@192.0.2.10>;+g.x=\"a\\"+c+"b\"")))
+		f.Add([]byte(requestText(u, 600, "", "Contact: <sip:b@192.0.2.10>;+sip.instance=\"<urn:uuid:a\\"+c+"b>\"")))
+	}
 	f.Add([]byte("REGISTER sip:" + realm + " SIP/2.0\r\nVia: SIP/2.0/TCP h;branch=z9hG4bK1\r\nFrom: <sip:a@b>;tag=1\r\nTo: <sip:a@b>\r\nCall-ID: c\r\nCSeq: 1 REGISTER\r\nContact: *\r\nExpires: 0\r\nContent-Length: 0\r\n\r\n"))
 	lim := expiryLimits{def: 3600, min: 300, max: 7200}
 	f.Fuzz(func(t *testing.T, b []byte) {
@@ -42,7 +47,7 @@ func FuzzParseRegister(f *testing.F) {
 		if len(next) > state.MaxContacts {
 			t.Fatalf("%d bindings", len(next))
 		}
-		probe := &state.Registration{IMPU: r.impu, IMPI: r.impi, DefaultIMPU: r.impu, Contacts: next}
+		probe := &state.Registration{Key: state.SetKey{IMPI: r.impi, IMPU: r.impu}, Incarnation: 1, Identities: []state.SetIdentity{{IMPU: r.impu}}, Contacts: next}
 		storable := probe.Validate() == nil
 		for _, c := range next {
 			if c.Expires.After(t0.Add(7200 * time.Second)) {
@@ -53,6 +58,10 @@ func FuzzParseRegister(f *testing.F) {
 				continue
 			}
 			v := contactField(c, t0)
+			var h sip.Header
+			if err := h.Add("Contact", v); err != nil {
+				t.Fatalf("200 Contact %q cannot be added: %v", v, err)
+			}
 			back, err := sip.ParseContacts(v)
 			if err != nil || len(back) != 1 {
 				t.Fatalf("200 Contact %q does not parse: %v", v, err)

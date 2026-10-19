@@ -1,6 +1,7 @@
 package registrar
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -15,7 +16,7 @@ import (
 
 func contactCount(t *testing.T, e *env, impu string) int {
 	t.Helper()
-	return len(must(e.store.Registration(bg, impu))(t).Contacts)
+	return len(must(regOf(e, impu))(t).Contacts)
 }
 
 func TestAClientThatReconnectsWithANewAddressKeepsOneBinding(t *testing.T) {
@@ -47,7 +48,7 @@ func TestAContactWithoutAnInstanceReplacesTheUEsEarlierRegistrations(t *testing.
 	// instance ends the earlier one at another address.
 	u.callID, u.contact, u.cseq = "again", "sip:ue@192.0.2.99:5060;transport=tcp", 0
 	wantStatus(t, u.registerWith(g, 600), 200)
-	if got := must(e.store.Registration(bg, impu1))(t).Contacts; len(got) != 1 || got[0].CallID != "again" {
+	if got := must(regOf(e, impu1))(t).Contacts; len(got) != 1 || got[0].CallID != "again" {
 		t.Errorf("bindings %+v, want only the new one", got)
 	}
 	// Two contacts of one REGISTER are both kept.
@@ -96,7 +97,7 @@ func TestOutboundAppliesOnlyToARequestContactOverAnObEdgeProxy(t *testing.T) {
 		if res.Header.Has("Require") {
 			t.Error("Require: outbound without ob in the first Path")
 		}
-		if c := must(e.store.Registration(bg, impu1))(t).Contacts[0]; c.RegID != 0 || c.KeepAlive {
+		if c := must(regOf(e, impu1))(t).Contacts[0]; c.RegID != 0 || c.KeepAlive {
 			t.Errorf("binding %+v kept its reg-id", c)
 		}
 	})
@@ -290,29 +291,67 @@ func TestNoVectorPartOrHA1IsLogged(t *testing.T) {
 	e := newEnv(t)
 	g := e.instance(1)
 	u := e.akaUser(impi1, impu1)
+	d := e.digestUser(impi2, impu2)
 	ch := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
 	auth := u.respond(ch, nil)
-	// Every path that logs: a Cx failure, a store failure.
+	dch := d.challengeOf(g.Register(bg, d.request(600, ""), upstream), 1)
+	dauth := d.respond(dch, nil)
+	// Every path that logs: a Cx failure, a store failure, for either user.
 	e.hss.mu.Lock()
 	e.hss.unavailable = true
 	e.hss.mu.Unlock()
 	g.Register(bg, u.request(600, ""), upstream)
+	g.Register(bg, d.request(600, ""), upstream)
 	broken := e.instance(2, func(c *Config) { c.Store = failingStore{e.store} })
 	broken.Register(bg, u.request(600, auth), upstream)
-	rnd, _, _ := digest.ParseAKANonce(ch.Nonce)
-	xres, ck, ik := u.m.F2(rnd), u.m.F3(rnd), u.m.F4(rnd)
-	ha1, _ := digest.ComputeHA1(digest.MD5, impi1, realm, []byte("not-a-real-password"))
-	creds, _ := digest.ParseCredentials(auth)
+	broken.Register(bg, d.request(600, dauth), upstream)
 	logs := e.logs.String()
 	if logs == "" {
 		t.Fatal("nothing was logged; the check below would prove nothing")
 	}
-	for name, secret := range map[string]string{
-		"XRES": hex.EncodeToString(xres[:]), "CK": hex.EncodeToString(ck[:]), "IK": hex.EncodeToString(ik[:]),
-		"HA1": ha1, "RES response": creds.Response, "nonce": ch.Nonce, "IMPI": impi1,
-	} {
-		if strings.Contains(logs, secret) {
-			t.Errorf("the log has the %s", name)
+	rnd, _, _ := digest.ParseAKANonce(ch.Nonce)
+	xres, ck, ik := u.m.F2(rnd), u.m.F3(rnd), u.m.F4(rnd)
+	md5, _ := digest.ComputeHA1(digest.MD5, impi2, realm, d.password)
+	sha, _ := digest.ComputeHA1(digest.SHA256, impi2, realm, d.password)
+	creds, _ := digest.ParseCredentials(auth)
+	dcreds, _ := digest.ParseCredentials(dauth)
+	secrets := map[string][]byte{
+		"XRES": xres[:], "CK": ck[:], "IK": ik[:], "MD5 HA1": []byte(md5), "SHA-256 HA1": []byte(sha),
+		"AKA response": []byte(creds.Response), "Digest response": []byte(dcreds.Response),
+		"AKA nonce": []byte(ch.Nonce), "Digest nonce": []byte(dch.Nonce), "IMPI": []byte(impi1), "password": d.password,
+	}
+	for name, secret := range secrets {
+		for form, v := range map[string]string{
+			"as is": string(secret), "hex": hex.EncodeToString(secret),
+			"base64": base64.StdEncoding.EncodeToString(secret), "base64url": base64.RawURLEncoding.EncodeToString(secret),
+		} {
+			if len(v) >= 8 && strings.Contains(logs, v) {
+				t.Errorf("the log has the %s (%s)", name, form)
+			}
+		}
+	}
+}
+
+func TestAContactThatCannotBeWrittenBackIsRefusedBeforeSAR(t *testing.T) {
+	for _, c := range []string{"\x00", "\x01", "\x7f"} {
+		for name, contact := range map[string]string{
+			"feature tag": "Contact: <sip:uea@192.0.2.10:5060;transport=tcp>;expires=600;+x.tag=\"a\\" + c + "b\"",
+			"instance":    "Contact: <sip:uea@192.0.2.10:5060;transport=tcp>;expires=600;+sip.instance=\"<urn:uuid:a\\" + c + "b>\"",
+		} {
+			t.Run(fmt.Sprintf("%s %q", name, c), func(t *testing.T) {
+				e := newEnv(t)
+				g := e.instance(1)
+				u := e.akaUser(impi1, impu1)
+				u.contact = ""
+				auth := u.answer(g.Register(bg, u.request(-1, "", contact), upstream), 0)
+				wantStatus(t, g.Register(bg, u.request(-1, auth, contact), upstream), 400)
+				if _, sars := e.hss.counts(); sars != 0 {
+					t.Error("refused after SAR")
+				}
+				if _, err := regOf(e, impu1); err == nil {
+					t.Error("the binding was stored, and would break every 200 of the set")
+				}
+			})
 		}
 	}
 }

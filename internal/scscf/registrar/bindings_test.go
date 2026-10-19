@@ -166,17 +166,13 @@ func TestARegistrationWithoutContactsIsAnInitialRegistration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
-			r := &state.Registration{IMPU: impu1, IMPI: impi1, DefaultIMPU: impu1}
-			tc.stored(r)
-			if _, err := e.store.SaveRegistration(bg, r); err != nil {
-				t.Fatal(err)
-			}
+			seed(t, e, impi1, []string{impu1}, tc.stored)
 			u := e.akaUser(impi1, impu1)
 			wantStatus(t, u.registerWith(e.instance(1), 600), 200)
 			if s := e.hss.lastSAR(t); s.AssignmentType != cx.Registration || s.UserDataAlreadyAvailable != cx.UserDataNotAvailable {
 				t.Errorf("SAR %+v, want REGISTRATION asking for User-Data", s)
 			}
-			got := must(e.store.Registration(bg, impu1))(t)
+			got := must(regOf(e, impu1))(t)
 			if len(got.Contacts) != 1 || !got.Unregistered.IsZero() || !got.Deregistering.IsZero() {
 				t.Errorf("stored %+v", got)
 			}
@@ -197,6 +193,18 @@ func TestAnIdentityRegisteredByAnotherPrivateIdentityIsForbidden(t *testing.T) {
 	wantStatus(t, res, 403)
 	if res.Reason != "Forbidden" {
 		t.Errorf("reason %q tells more than any other 403", res.Reason)
+	}
+	// Nothing of the registration changed, and the HSS heard nothing for the
+	// other IMPI.
+	if r := must(regOf(e, impu1))(t); r.Key.IMPI != impi1 || len(r.Contacts) != 1 || r.Contacts[0].CallID != "call-"+impi1[:15] {
+		t.Errorf("after the refusal: %+v", r)
+	}
+	e.hss.mu.Lock()
+	defer e.hss.mu.Unlock()
+	for _, s := range e.hss.sars {
+		if s.UserName == impi2 {
+			t.Errorf("SAR %v for the refused IMPI", s.AssignmentType)
+		}
 	}
 }
 
@@ -272,7 +280,7 @@ func TestConcurrentREGISTERsOfTwoDevicesKeepBothBindings(t *testing.T) {
 	auth := second.answer(g.Register(bg, second.request(600, ""), upstream), 0)
 	res := g.Register(bg, second.request(600, auth), upstream)
 	wantStatus(t, res, 200)
-	if got := must(e.store.Registration(bg, impu1))(t).Contacts; len(got) != 2 {
+	if got := must(regOf(e, impu1))(t).Contacts; len(got) != 2 {
 		t.Errorf("stored %d bindings, want both devices'", len(got))
 	}
 }
@@ -303,7 +311,7 @@ func TestNoIdentityOrCredentialIsLogged(t *testing.T) {
 
 type failingStore struct{ *state.Memory }
 
-func (failingStore) Registration(context.Context, string) (*state.Registration, error) {
+func (failingStore) Identity(context.Context, string) (*state.Identity, error) {
 	return nil, fmt.Errorf("store: unavailable")
 }
 

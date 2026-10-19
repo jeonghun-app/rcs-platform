@@ -2,34 +2,12 @@ package registrar
 
 import (
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
-
-// counts records the registrar's metrics.
-type counts struct {
-	mu sync.Mutex
-	m  map[string]int64
-}
-
-func (c *counts) Count(name string, n int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = map[string]int64{}
-	}
-	c.m[name] += n
-}
-
-func (c *counts) get(name string) int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.m[name]
-}
 
 func TestChallengesForOneIMPIAreLimitedAcrossInstances(t *testing.T) {
 	e := newEnv(t)

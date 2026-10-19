@@ -10,7 +10,7 @@ them.
 
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
-| `registrations` | `pk` (S): canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only; TTL on `ttl` | the bindings of each IMPU, the records of unregistered users, and the User-Data of each implicit registration set |
+| `registrations` | `pk` (S): `set#<IMPI>#<default IMPU>`, a canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only, of sets only; TTL on `ttl` | per implicit registration set its bindings (or an unregistered user's record) and its User-Data, and per IMPU the set it belongs to |
 | `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions and their NOTIFY counters |
 
@@ -40,10 +40,16 @@ additionally sealed (below).
   turns it into a registration. PPR and RTR apply to it as to a registration.
 - **One profile per implicit registration set.** The HSS sends User-Data per
   set: an SAA for the set of the IMPU in the request, a PPR for one set at a
-  time. A profile is therefore keyed by the IMPI and the set's default IMPU
-  (`state.ProfileKey`), a PPR saves only its own set, and each registration
-  records its set's default IMPU (`DefaultIMPU`), which a terminating request
-  uses to find the profile.
+  time. A set is therefore keyed by the IMPI and its default IMPU
+  (`state.SetKey`), which names both its registration and its profile, and a
+  PPR saves only its own set.
+- **One record per set.** The bindings that every identity of a set shares
+  are one item, so a REGISTER, a deregistration or a sweep is one
+  conditional save, whichever identity it came for; each IMPU's item only
+  names its set and the set's incarnation (`state.Identity`), written when
+  the S-CSCF is assigned the set or the set changes, never by a
+  re-registration. A terminating request reads the IMPU's item, the set and
+  the profile.
 - **Profiles are ordered by arrival, per set.** `SaveProfile` takes the time
   the SAA or PPR arrived and keeps the later one, so an SAA answered slowly
   cannot undo the PPR that followed it; a refused save (`ErrConflict`) is not
@@ -99,23 +105,21 @@ client one more 401, not a failed registration.
 
 ## Capacity and cost
 
-A re-registration is two strongly consistent reads, of the IMPU's registration
-item (a few KB) and of its set's profile (which tells whether `KeepUntil` is
-due), and one put of the registration, plus two writes to `expiry-index`; the
-profile is written only on SAR and PPR, plus about two updates of its `ttl` a
-day. The profile read is 2 RRU for a typical 5 KB IMSSubscription, 32 for the
-128 KiB maximum: with 1 M users of two IMPUs re-registering every 600 s, some
-8.6 G RRU and $1.1k a month at the prices below for typical profiles. Every
-terminating request reads the IMPU's registration and its set's profile, two
-strongly consistent reads: about 1 read request unit for the registration and 1
-per 4 KB of profile (2 for a typical 5 KB IMSSubscription, 32 for the 128 KiB
-maximum), so 3 RRU per terminating request, $0.4 per million at the same
-prices. With 1 M users of two IMPUs re-registering every 600 s that is about
-8.6 G saves and 30 G write request units a month, some $20k at ap-northeast-2
-on-demand prices (October 2026); 3600 s registrations cost a sixth of that.
+A re-registration is three strongly consistent reads, of the IMPU's item (under
+1 KB), of its set's registration (a few KB) and of the set's profile (which
+tells whether `KeepUntil` is due), and one put of the set's registration, plus
+two writes to `expiry-index`, whatever the size of the set; the profile is
+written only on SAR and PPR, plus about two updates of its `ttl` a day, and the
+IMPU items only when the S-CSCF is assigned the set. The reads are about 1 + 1
++ 2 RRU for a typical 5 KB IMSSubscription (1 + 1 + 32 for the 128 KiB
+maximum). Every terminating request reads the IMPU's item, the set's
+registration and its profile: about 4 RRU, $0.55 per million at the prices
+below. With 1 M users of two IMPUs re-registering every 600 s that is about 4.3
+G saves a month, some 15 G write request units and $10k at ap-northeast-2
+on-demand prices (October 2026), half what one item per IMPU cost, plus some 17
+G RRU and $2.2k for the reads; 3600 s registrations cost a sixth of that.
 Authentication adds a put and a conditional delete per challenge, and one
-update of the IMPI's count before each MAR. Sweeps read each expiring item
-once.
+update of the IMPI's count before each MAR. Sweeps read each expiring set once.
 
 `expiry-index` is spread over 16 shards, which carry about 8000 saves per
 second, some 4.8 M IMPUs at 600 s re-registrations. The shard of an item is

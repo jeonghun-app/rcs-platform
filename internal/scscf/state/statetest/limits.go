@@ -53,7 +53,7 @@ func testSweepFromAStaleListing(t *testing.T, a, b state.Store, o Options) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	got, err := a.Registration(ctx(t), IMPU1)
+	got, err := a.Registration(ctx(t), Key1(IMPU1))
 	if err != nil || len(got.Contacts) != 1 || handledB != 0 {
 		t.Fatalf("fresh registration: %v, B handled %d expiries", err, handledB)
 	}
@@ -61,7 +61,7 @@ func testSweepFromAStaleListing(t *testing.T, a, b state.Store, o Options) {
 
 func testStaleSaveAfterRecreate(t *testing.T, a, b state.Store, _ Options) {
 	r := must(a.SaveRegistration(ctx(t), Registration(IMPI1, IMPU2, time.Hour)))(t)
-	stale := must(b.Registration(ctx(t), IMPU2))(t)
+	stale := must(b.Registration(ctx(t), Key1(IMPU2)))(t)
 	if err := a.DeleteRegistration(ctx(t), r); err != nil {
 		t.Fatal(err)
 	}
@@ -92,13 +92,13 @@ func testImpossibleKeys(t *testing.T, a, _ state.Store, _ Options) {
 		wantErr(t, err, state.ErrNotFound)
 	}
 	for _, impu := range []string{"", strings.Repeat("u", 3000)} {
-		_, err := a.Registration(ctx(t), impu)
+		_, err := a.Registration(ctx(t), Key1(impu))
 		wantErr(t, err, state.ErrNotFound)
 		_, err = a.Subscription(ctx(t), impu)
 		wantErr(t, err, state.ErrNotFound)
 		_, _, err = a.NextNotify(ctx(t), impu)
 		wantErr(t, err, state.ErrNotFound)
-		for _, k := range []state.ProfileKey{{IMPI: IMPI1, IMPU: impu}, {IMPI: impu, IMPU: IMPU1}} {
+		for _, k := range []state.SetKey{{IMPI: IMPI1, IMPU: impu}, {IMPI: impu, IMPU: IMPU1}} {
 			_, err = a.Profile(ctx(t), k, T0)
 			wantErr(t, err, state.ErrNotFound)
 			if err := a.DeleteProfile(ctx(t), k); err != nil {
@@ -182,7 +182,7 @@ func testSweepRetry(t *testing.T, a, b state.Store, o Options) {
 	if n != 1 || !errors.Is(err, failing) {
 		t.Fatalf("first sweep: %d handled, %v", n, err)
 	}
-	if got := must(b.Registration(ctx(t), IMPU1))(t); len(got.Contacts) != 0 || got.Deregistering.IsZero() {
+	if got := must(b.Registration(ctx(t), Key1(IMPU1)))(t); len(got.Contacts) != 0 || got.Deregistering.IsZero() {
 		t.Fatalf("after the failure: %+v", got)
 	}
 	called := 0
@@ -211,7 +211,7 @@ func testSweepRetry(t *testing.T, a, b state.Store, o Options) {
 	if called != 1 {
 		t.Fatalf("the retry was handled %d times", called)
 	}
-	_, err = a.Registration(ctx(t), IMPU1)
+	_, err = a.Registration(ctx(t), Key1(IMPU1))
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -311,8 +311,8 @@ func testProfiles(t *testing.T, a, b state.Store, _ Options) {
 	forever := Profile(Set1, []byte("x"), T0)
 	forever.KeepUntil = time.Time{}
 	wantErr(t, a.SaveProfile(ctx(t), forever), state.ErrInvalid)
-	wantErr(t, a.SaveProfile(ctx(t), Profile(state.ProfileKey{IMPI: IMPI1}, []byte("x"), T0)), state.ErrInvalid)
-	wantErr(t, a.SaveProfile(ctx(t), Profile(state.ProfileKey{IMPI: IMPI1, IMPU: "sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}, []byte("x"), T0)), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), Profile(state.SetKey{IMPI: IMPI1}, []byte("x"), T0)), state.ErrInvalid)
+	wantErr(t, a.SaveProfile(ctx(t), Profile(state.SetKey{IMPI: IMPI1, IMPU: "sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}, []byte("x"), T0)), state.ErrInvalid)
 }
 
 // testProfilesPerSet: the HSS sends User-Data per implicit registration set,
@@ -326,7 +326,7 @@ func testProfilesPerSet(t *testing.T, a, b state.Store, _ Options) {
 	if err := b.SaveProfile(ctx(t), Profile(Set2, []byte(two), T0)); err != nil {
 		t.Fatal(err)
 	}
-	for k, want := range map[state.ProfileKey]string{Set1: one, Set2: two} {
+	for k, want := range map[state.SetKey]string{Set1: one, Set2: two} {
 		for _, s := range []state.Store{a, b} {
 			if got := must(s.Profile(ctx(t), k, T0))(t); string(got.UserData) != want {
 				t.Errorf("profile of %s = %q, want %q", k.IMPU, got.UserData, want)
@@ -369,14 +369,101 @@ func testPPRForOneSet(t *testing.T, a, b state.Store, _ Options) {
 	}
 }
 
-// testRegistrationProfileKey: every IMPU of a set, explicitly registered or
-// not, finds the set's profile through its registration.
-func testRegistrationProfileKey(t *testing.T, a, b state.Store, _ Options) {
-	r := Registration(IMPI1, IMPU2, time.Hour)
-	r.DefaultIMPU = IMPU1
+// testIdentities: a set's identities point at its one record, through items
+// of their own, with the same optimistic concurrency as registrations.
+func testIdentities(t *testing.T, a, b state.Store, _ Options) {
+	r := Registration(IMPI1, IMPU1, time.Hour)
+	r.Identities = append(r.Identities, state.SetIdentity{IMPU: TEL1}, state.SetIdentity{IMPU: IMPU2, Barred: true})
+	r.Incarnation = 42
 	must(a.SaveRegistration(ctx(t), r))(t)
-	if got := must(b.Registration(ctx(t), IMPU2))(t).ProfileKey(); got != Set1 {
-		t.Errorf("ProfileKey of a non-default IMPU = %+v, want %+v", got, Set1)
+	for _, id := range r.Identities {
+		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: id.IMPU, Set: Set1, Incarnation: 42, Barred: id.Barred}))(t)
+	}
+	for _, id := range r.Identities {
+		got := must(b.Identity(ctx(t), id.IMPU))(t)
+		if got.Set != Set1 || got.Incarnation != 42 || got.Barred != id.Barred {
+			t.Errorf("%s points at %+v", id.IMPU, got)
+		}
+		reg := must(b.Registration(ctx(t), got.Set))(t)
+		if len(reg.Identities) != 3 || reg.Incarnation != 42 {
+			t.Errorf("the set read back as %+v", reg)
+		}
+	}
+	// Two private identities' sets with the same default identity (a shared
+	// public identity, TS 23.228 §4.3.3.4) are two records.
+	other := Registration(IMPI2, IMPU1, 2*time.Hour)
+	other.Incarnation = 43
+	must(b.SaveRegistration(ctx(t), other))(t)
+	if got := must(a.Registration(ctx(t), Set1))(t); got.Incarnation != 42 || len(got.Contacts) != 1 || !got.Contacts[0].Expires.Equal(T0.Add(time.Hour)) {
+		t.Errorf("IMPI1's set read back as %+v", got)
+	}
+	if got := must(a.Registration(ctx(t), state.SetKey{IMPI: IMPI2, IMPU: IMPU1}))(t); got.Incarnation != 43 {
+		t.Errorf("IMPI2's set read back as %+v", got)
+	}
+	// An identity item is not a registration: no listing or sweep sees it.
+	if regs := must(b.RegistrationsOf(ctx(t), IMPI1))(t); len(regs) != 1 {
+		t.Errorf("RegistrationsOf lists %d, want the one set", len(regs))
+	}
+	tel := must(a.Identity(ctx(t), TEL1))(t)
+	_, err := b.SaveIdentity(ctx(t), &state.Identity{IMPU: TEL1, Set: Set1, Incarnation: 42})
+	wantErr(t, err, state.ErrExists)
+	moved := *tel
+	moved.Set, moved.Incarnation = Set2, 7
+	must(b.SaveIdentity(ctx(t), &moved))(t)
+	wantErr(t, a.DeleteIdentity(ctx(t), tel), state.ErrConflict)
+	if got := must(a.Identity(ctx(t), TEL1))(t); got.Set != Set2 {
+		t.Errorf("a stale delete changed %+v", got)
+	}
+	again := must(a.Identity(ctx(t), TEL1))(t)
+	if err := a.DeleteIdentity(ctx(t), again); err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.Identity(ctx(t), TEL1)
+	wantErr(t, err, state.ErrNotFound)
+	wantErr(t, b.DeleteIdentity(ctx(t), again), state.ErrNotFound)
+	for _, bad := range []*state.Identity{
+		{IMPU: "not an impu", Set: Set1, Incarnation: 1},
+		{IMPU: TEL1, Set: state.SetKey{IMPI: IMPI1}, Incarnation: 1},
+		{IMPU: TEL1, Set: Set1},
+	} {
+		_, err := a.SaveIdentity(ctx(t), bad)
+		wantErr(t, err, state.ErrInvalid)
+	}
+	for _, impu := range []string{"", strings.Repeat("u", 3000)} {
+		_, err := a.Identity(ctx(t), impu)
+		wantErr(t, err, state.ErrNotFound)
+	}
+}
+
+// testSaveProfileKeepsKeepUntil: a profile saved again, as a PPR does, with a
+// KeepUntil earlier than the one stored (which a registration on another
+// instance just extended) keeps the later one, or the profile could run out
+// while its bindings live. From QA's review of #184.
+func testSaveProfileKeepsKeepUntil(t *testing.T, a, b state.Store, _ Options) {
+	if err := a.SaveProfile(ctx(t), Profile(Set1, []byte("<IMSSubscription>1</IMSSubscription>"), T0)); err != nil {
+		t.Fatal(err)
+	}
+	long := T0.Add(166*time.Hour + 40*time.Minute + state.ProfileGrace)
+	if err := a.KeepProfile(ctx(t), Set1, long, T0); err != nil {
+		t.Fatal(err)
+	}
+	ppr := Profile(Set1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Minute))
+	ppr.KeepUntil = T0.Add(25*time.Hour + 10*time.Minute)
+	if err := b.SaveProfile(ctx(t), ppr); err != nil {
+		t.Fatal(err)
+	}
+	got := must(a.Profile(ctx(t), Set1, T0.Add(100*time.Hour)))(t)
+	if string(got.UserData) != "<IMSSubscription>2</IMSSubscription>" || !got.KeepUntil.Equal(long) {
+		t.Errorf("after the PPR: %q kept until %v, want the PPR's data kept until %v", got.UserData, got.KeepUntil, long)
+	}
+	// A later KeepUntil from the save does count.
+	later := Profile(Set1, []byte("<IMSSubscription>3</IMSSubscription>"), T0.Add(2*time.Minute))
+	later.KeepUntil = long.Add(time.Hour)
+	if err := b.SaveProfile(ctx(t), later); err != nil {
+		t.Fatal(err)
+	}
+	if got := must(a.Profile(ctx(t), Set1, T0))(t); !got.KeepUntil.Equal(long.Add(time.Hour)) {
+		t.Errorf("kept until %v, want the save's later one", got.KeepUntil)
 	}
 }
 
@@ -436,7 +523,7 @@ func testKeepProfile(t *testing.T, a, b state.Store, _ Options) {
 }
 
 // Unregistered returns the record of an unregistered user of impu's set
-// (DefaultIMPU impu), whose unregistered state ends at until.
+// (its default identity impu), whose unregistered state ends at until.
 func Unregistered(impi, impu string, until time.Time) *state.Registration {
 	r := Registration(impi, impu)
 	r.Unregistered = until
@@ -454,11 +541,11 @@ func testUnregisteredLifeCycle(t *testing.T, a, b state.Store, o Options) {
 	}
 	// A later terminating request, on another instance, finds the record
 	// and through it the stored profile.
-	r := must(b.Registration(ctx(t), IMPU1))(t)
+	r := must(b.Registration(ctx(t), Key1(IMPU1)))(t)
 	if !r.Unregistered.Equal(end) || len(r.Contacts) != 0 || !r.Deregistering.IsZero() {
 		t.Fatalf("read back %+v", r)
 	}
-	must(b.Profile(ctx(t), r.ProfileKey(), T0.Add(30*time.Minute)))(t)
+	must(b.Profile(ctx(t), r.Key, T0.Add(30*time.Minute)))(t)
 
 	before := end.Add(-time.Second)
 	if regs := must(b.ExpiringRegistrations(ctx(t), before, 10))(t); len(regs) != 0 {
@@ -486,7 +573,7 @@ func testUnregisteredLifeCycle(t *testing.T, a, b state.Store, o Options) {
 	if n != 1 || called != 1 || err != nil {
 		t.Fatalf("sweep at the end: %d handled, %d calls, %v", n, called, err)
 	}
-	_, err = b.Registration(ctx(t), IMPU1)
+	_, err = b.Registration(ctx(t), Key1(IMPU1))
 	wantErr(t, err, state.ErrNotFound)
 
 	withContact := Unregistered(IMPI1, IMPU2, end)
@@ -501,7 +588,7 @@ func testUnregisteredLifeCycle(t *testing.T, a, b state.Store, o Options) {
 func testRegisterEndsUnregistered(t *testing.T, a, b state.Store, _ Options) {
 	end := T0.Add(time.Hour)
 	stale := must(a.SaveRegistration(ctx(t), Unregistered(IMPI1, IMPU1, end)))(t)
-	r := must(b.Registration(ctx(t), IMPU1))(t)
+	r := must(b.Registration(ctx(t), Key1(IMPU1)))(t)
 	r.Unregistered = time.Time{}
 	r.Contacts = Registration(IMPI1, IMPU1, 2*time.Hour).Contacts
 	registered := must(b.SaveRegistration(ctx(t), r))(t)
@@ -518,7 +605,7 @@ func testRegisterEndsUnregistered(t *testing.T, a, b state.Store, _ Options) {
 	stale.Deregistering = end.Add(state.SweepLease)
 	_, err = a.SaveRegistration(ctx(t), stale)
 	wantErr(t, err, state.ErrConflict)
-	if got := must(a.Registration(ctx(t), IMPU1))(t); !got.Unregistered.IsZero() || len(got.Contacts) != 1 {
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); !got.Unregistered.IsZero() || len(got.Contacts) != 1 {
 		t.Errorf("after the stale save: %+v", got)
 	}
 }
@@ -557,7 +644,7 @@ func testUnregisteredRetry(t *testing.T, a, b state.Store, o Options) {
 	if called != 1 {
 		t.Fatalf("handled %d times", called)
 	}
-	_, err = a.Registration(ctx(t), IMPU1)
+	_, err = a.Registration(ctx(t), Key1(IMPU1))
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -583,7 +670,7 @@ func testDeleteProfileIf(t *testing.T, a, b state.Store, _ Options) {
 	if err := a.DeleteProfileIf(ctx(t), Set1, T0); err != nil {
 		t.Errorf("deleting no profile: %v", err)
 	}
-	if err := a.DeleteProfileIf(ctx(t), state.ProfileKey{IMPI: IMPI1}, T0); err != nil {
+	if err := a.DeleteProfileIf(ctx(t), state.SetKey{IMPI: IMPI1}, T0); err != nil {
 		t.Errorf("deleting an impossible profile: %v", err)
 	}
 }

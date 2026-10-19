@@ -21,8 +21,9 @@ type Memory struct {
 	rand io.Reader
 
 	mu            sync.Mutex
-	registrations map[string]*Registration
-	profiles      map[ProfileKey]*Profile
+	registrations map[SetKey]*Registration
+	identities    map[string]*Identity
+	profiles      map[SetKey]*Profile
 	challenges    map[challengeKey]*Challenge
 	added         int
 	attempts      map[attemptKey]*attempt
@@ -48,8 +49,9 @@ var _ Store = (*Memory)(nil)
 func NewMemory() *Memory {
 	return &Memory{
 		rand:          randReader,
-		registrations: map[string]*Registration{},
-		profiles:      map[ProfileKey]*Profile{},
+		registrations: map[SetKey]*Registration{},
+		identities:    map[string]*Identity{},
+		profiles:      map[SetKey]*Profile{},
 		challenges:    map[challengeKey]*Challenge{},
 		attempts:      map[attemptKey]*attempt{},
 		subscriptions: map[string]*Subscription{},
@@ -57,10 +59,10 @@ func NewMemory() *Memory {
 }
 
 // Registration implements Registrations.
-func (m *Memory) Registration(_ context.Context, impu string) (*Registration, error) {
+func (m *Memory) Registration(_ context.Context, k SetKey) (*Registration, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.registrations[impu]
+	r, ok := m.registrations[k]
 	if !ok {
 		return nil, fmt.Errorf("state: registration: %w", ErrNotFound)
 	}
@@ -73,11 +75,11 @@ func (m *Memory) RegistrationsOf(_ context.Context, impi string) ([]*Registratio
 	defer m.mu.Unlock()
 	var out []*Registration
 	for _, r := range m.registrations {
-		if r.IMPI == impi {
+		if r.Key.IMPI == impi {
 			out = append(out, r.Clone())
 		}
 	}
-	slices.SortFunc(out, func(a, b *Registration) int { return strings.Compare(a.IMPU, b.IMPU) })
+	slices.SortFunc(out, func(a, b *Registration) int { return strings.Compare(a.Key.IMPU, b.Key.IMPU) })
 	return out, nil
 }
 
@@ -88,7 +90,7 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cur, ok := m.registrations[r.IMPU]
+	cur, ok := m.registrations[r.Key]
 	var stored int64
 	if ok {
 		stored = cur.Version
@@ -99,8 +101,59 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 	}
 	saved := r.Clone()
 	saved.Version = version
-	m.registrations[r.IMPU] = saved
+	m.registrations[r.Key] = saved
 	return saved.Clone(), nil
+}
+
+// Identity implements Registrations.
+func (m *Memory) Identity(_ context.Context, impu string) (*Identity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.identities[impu]
+	if !ok {
+		return nil, fmt.Errorf("state: identity: %w", ErrNotFound)
+	}
+	c := *i
+	return &c, nil
+}
+
+// SaveIdentity implements Registrations.
+func (m *Memory) SaveIdentity(_ context.Context, i *Identity) (*Identity, error) {
+	if err := i.Validate(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.identities[i.IMPU]
+	var stored int64
+	if ok {
+		stored = cur.Version
+	}
+	version, err := m.nextVersion("identity", ok, stored, i.Version)
+	if err != nil {
+		return nil, err
+	}
+	saved := *i
+	saved.Version = version
+	m.identities[i.IMPU] = &saved
+	out := saved
+	return &out, nil
+}
+
+// DeleteIdentity implements Registrations.
+func (m *Memory) DeleteIdentity(_ context.Context, i *Identity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.identities[i.IMPU]
+	var stored int64
+	if ok {
+		stored = cur.Version
+	}
+	if err := checkDelete("identity", ok, stored, i.Version); err != nil {
+		return err
+	}
+	delete(m.identities, i.IMPU)
+	return nil
 }
 
 // nextVersion applies the optimistic concurrency rule of the Save methods and
@@ -123,7 +176,7 @@ func (m *Memory) nextVersion(what string, exists bool, stored, given int64) (int
 func (m *Memory) DeleteRegistration(_ context.Context, r *Registration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cur, ok := m.registrations[r.IMPU]
+	cur, ok := m.registrations[r.Key]
 	var stored int64
 	if ok {
 		stored = cur.Version
@@ -131,7 +184,7 @@ func (m *Memory) DeleteRegistration(_ context.Context, r *Registration) error {
 	if err := checkDelete("registration", ok, stored, r.Version); err != nil {
 		return err
 	}
-	delete(m.registrations, r.IMPU)
+	delete(m.registrations, r.Key)
 	return nil
 }
 
@@ -161,7 +214,7 @@ func (m *Memory) ExpiringRegistrations(_ context.Context, now time.Time, limit i
 
 // Profile implements Profiles. A profile past its KeepUntil stays until it is
 // deleted or saved again, as in DynamoDB before TTL removes it.
-func (m *Memory) Profile(_ context.Context, k ProfileKey, now time.Time) (*Profile, error) {
+func (m *Memory) Profile(_ context.Context, k SetKey, now time.Time) (*Profile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.profiles[k]
@@ -183,12 +236,16 @@ func (m *Memory) SaveProfile(_ context.Context, p *Profile) error {
 	}
 	c := p.Clone()
 	c.KeepUntil = c.KeepUntil.Truncate(time.Second)
+	if cur, ok := m.profiles[p.Key]; ok && cur.KeepUntil.After(c.KeepUntil) {
+		// Never brought closer: a registration may have just extended it.
+		c.KeepUntil = cur.KeepUntil
+	}
 	m.profiles[p.Key] = c
 	return nil
 }
 
 // KeepProfile implements Profiles.
-func (m *Memory) KeepProfile(_ context.Context, k ProfileKey, until, now time.Time) error {
+func (m *Memory) KeepProfile(_ context.Context, k SetKey, until, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.profiles[k]
@@ -202,7 +259,7 @@ func (m *Memory) KeepProfile(_ context.Context, k ProfileKey, until, now time.Ti
 }
 
 // DeleteProfileIf implements Profiles.
-func (m *Memory) DeleteProfileIf(_ context.Context, k ProfileKey, received time.Time) error {
+func (m *Memory) DeleteProfileIf(_ context.Context, k SetKey, received time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.profiles[k]
@@ -217,7 +274,7 @@ func (m *Memory) DeleteProfileIf(_ context.Context, k ProfileKey, received time.
 }
 
 // DeleteProfile implements Profiles.
-func (m *Memory) DeleteProfile(_ context.Context, k ProfileKey) error {
+func (m *Memory) DeleteProfile(_ context.Context, k SetKey) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.profiles, k)

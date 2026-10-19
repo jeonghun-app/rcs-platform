@@ -54,7 +54,8 @@ type Config struct {
 	Realm string
 	// ServiceRoute is the S-CSCF's service URI, such as sip:scscf.rcs.local;
 	// the registrar returns it with lr and orig (TS 24.229 §5.4.1.2.2) so
-	// that originating requests come back to any instance.
+	// that originating requests come back to any instance, and with
+	// transport=tcp unless it names a transport.
 	ServiceRoute sip.URI
 	// NonceKey authenticates Digest nonces; every instance uses the same one
 	// (digest.ServerConfig.NonceKey).
@@ -78,8 +79,11 @@ type Config struct {
 	ChallengeWindow time.Duration
 	// TrustIntegrityProtected lets a re-registration whose Authorization
 	// carries integrity-protected="tls-yes" go without a challenge (TS 24.229
-	// §5.4.1.2.1). Only for a P-CSCF that removes the parameter from what
-	// clients send.
+	// §5.4.1.2.1). It needs a P-CSCF that sets the parameter itself, for a
+	// connection it has authenticated, and removes it from what clients
+	// send. This platform's pcscf removes it and sets none (#198), so no such
+	// mode exists yet: cmd/scscf must not tie this to its environment or
+	// configuration, and every REGISTER is challenged.
 	TrustIntegrityProtected bool
 
 	Now     func() time.Time
