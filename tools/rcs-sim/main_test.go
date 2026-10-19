@@ -146,10 +146,65 @@ func TestFailureResultsCarryNoAddress(t *testing.T) {
 		if code != exitFailed || strings.Count(out, `"ok":false`) != 2 {
 			t.Fatalf("%s: exit %d, output %q", host, code, out)
 		}
+		text := stringsIn(t, out) + errOut
 		for _, leak := range []string{port, banner, "127.0.0.1", "operator-host", ":53", "secret-host"} {
-			if strings.Contains(out+errOut, leak) {
+			if strings.Contains(text, leak) {
 				t.Errorf("%s: output names %q:\n%s", host, leak, out)
 			}
+		}
+	}
+}
+
+// stringsIn returns every string value of the result lines in out, one per
+// line. Only strings can name an address: searching the raw lines would
+// also find ":53" in a step that took 53 ms ("ms":53, #84), and a port
+// number among the sizes and times.
+func stringsIn(t *testing.T, out string) string {
+	t.Helper()
+	var b strings.Builder
+	var walk func(any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case string:
+			b.WriteString(v)
+			b.WriteByte('\n')
+		case map[string]any:
+			for k, e := range v {
+				walk(k)
+				walk(e)
+			}
+		case []any:
+			for _, e := range v {
+				walk(e)
+			}
+		}
+	}
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		var line any
+		if err := json.Unmarshal(sc.Bytes(), &line); err != nil {
+			t.Fatalf("not a result line: %q", sc.Text())
+		}
+		walk(line)
+	}
+	return b.String()
+}
+
+func TestTheLeakCheckReadsStringsNotTimes(t *testing.T) {
+	// A step that took 53 ms names no resolver; an error that quotes one
+	// does.
+	clean := `{"scenario":"ft","step":"pre-check","ok":false,"ms":53,"error":"ft: pre-check: host name not resolved"}` + "\n" +
+		`{"scenario":"ft","step":"upload","ok":true,"ms":5301,"detail":{"bytes":40123}}`
+	if text := stringsIn(t, clean); strings.Contains(text, ":53") || strings.Contains(text, "40123") {
+		t.Fatalf("times and sizes taken for text:\n%s", text)
+	}
+	for _, leaked := range []string{
+		`{"error":"dial tcp: lookup ft.operator-host.invalid on 127.0.0.1:53: no such host"}`,
+		`{"error":"dial tcp [::1]:53: connect: connection refused"}`,
+		`{"detail":{"127.0.0.1:53":1}}`,
+	} {
+		if !strings.Contains(stringsIn(t, leaked), ":53") {
+			t.Errorf("an address in %s is not seen", leaked)
 		}
 	}
 }

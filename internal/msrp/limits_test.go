@@ -54,28 +54,58 @@ func TestReassemblyMemoryFollowsReceivedOctetsNotDeclaredRanges(t *testing.T) {
 	}
 }
 
+// fastest runs f three times and returns its shortest time: other work on
+// the host can only lengthen a run, so the shortest is the closest to f's
+// own cost.
+func fastest(f func()) time.Duration {
+	best := time.Duration(1<<63 - 1)
+	for range 3 {
+		start := time.Now()
+		f()
+		best = min(best, time.Since(start))
+	}
+	return best
+}
+
 func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	// 64k one-octet chunks spread over one megabyte message, the input
 	// that is quadratic for a reassembler that keeps every gap.
 	const size = 1 << 20
 	const chunks = 1 << 16
-	msgs := make([]*Message, chunks)
-	for i := range msgs {
+	spread := make([]*Message, chunks)
+	for i := range spread {
 		pos := int64(i)*(size/chunks) + 1
-		msgs[i] = chunkMsg("spread", ByteRange{pos, pos, Unknown}, "s", FlagMore)
+		spread[i] = chunkMsg("spread", ByteRange{pos, pos, Unknown}, "s", FlagMore)
 	}
-	r := Reassembler{MaxSize: size}
+	// The same number of one-octet chunks in order, which costs the same
+	// for every chunk: the yardstick for the spread.
+	inOrder := make([]*Message, chunks)
+	for i := range inOrder {
+		pos := int64(i) + 1
+		inOrder[i] = chunkMsg("inorder", ByteRange{pos, pos, Unknown}, "s", FlagMore)
+	}
 	refused, maxHeld := 0, int64(0)
-	start := time.Now()
-	n := allocated(func() {
-		for _, m := range msgs {
-			if _, err := r.Add(m, t0); err != nil {
-				refused++
+	var n uint64
+	spreadTime := fastest(func() {
+		r := Reassembler{MaxSize: size}
+		refused, maxHeld = 0, 0
+		n = allocated(func() {
+			for _, m := range spread {
+				if _, err := r.Add(m, t0); err != nil {
+					refused++
+				}
+				maxHeld = max(maxHeld, r.Buffered())
 			}
-			maxHeld = max(maxHeld, r.Buffered())
+		})
+	})
+	baseTime := fastest(func() {
+		r := Reassembler{MaxSize: size}
+		for _, m := range inOrder {
+			if _, err := r.Add(m, t0); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
-	elapsed := time.Since(start)
 	// The 65th gap is refused and the message dropped, so it starts over;
 	// at most one fragment limit's worth is ever held.
 	if refused < chunks/(DefaultMaxFragments+1)-1 || maxHeld > DefaultMaxFragments {
@@ -84,10 +114,15 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	if n > 32<<20 {
 		t.Fatalf("%d bytes allocated for %d one-octet chunks", n, chunks)
 	}
-	// Generous enough for a loaded CI runner; the quadratic version takes
-	// tens of seconds here.
-	if elapsed > 2*time.Second {
-		t.Fatalf("%d chunks took %v", chunks, elapsed)
+	// Time relative to a yardstick measured in the same run, so that a
+	// loaded host or the race detector, which slow both alike, do not
+	// matter. Per chunk the spread costs a few times an in-order chunk
+	// (it holds up to a fragment limit of gaps); a reassembler whose cost
+	// grows with the gaps or the declared size is hundreds of times
+	// slower.
+	t.Logf("spread %v, in order %v (%.1fx)", spreadTime, baseTime, float64(spreadTime)/float64(baseTime))
+	if spreadTime > 25*baseTime {
+		t.Fatalf("%d spread chunks took %v, %d in order %v", chunks, spreadTime, chunks, baseTime)
 	}
 }
 
