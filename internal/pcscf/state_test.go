@@ -77,7 +77,7 @@ func TestTheRegistryCountsExpiresAndForgetsFlows(t *testing.T) {
 	if err := save("A", "sip:1@h", 2*time.Minute); err != nil || r.size() != 3 {
 		t.Fatalf("a refresh = %v, size %d", err, r.size())
 	}
-	if r.reserve("C", "sip:1@h", clock.t.Add(time.Minute)) || !r.reserve("A", "sip:2@h", clock.t.Add(time.Minute)) {
+	if r.tryReserve("C", "sip:1@h", clock.t.Add(time.Minute)) || !r.tryReserve("A", "sip:2@h", clock.t.Add(time.Minute)) {
 		t.Fatal("a full registry reserved a new slot, or refused a registered one")
 	}
 	r.release("A", "sip:2@h")
@@ -161,20 +161,20 @@ func TestRegistrySlotsAreReservedUntilReleasedOrLapsed(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	r := newRegistry(2, clock.now)
 	until := clock.t.Add(time.Minute)
-	if !r.reserve("F1", "sip:1@h", until) || !r.reserve("F1", "sip:1@h", until) || !r.reserve("F2", "sip:1@h", until) {
+	if !r.tryReserve("F1", "sip:1@h", until) || !r.tryReserve("F1", "sip:1@h", until) || !r.tryReserve("F2", "sip:1@h", until) {
 		t.Fatal("refused with room")
 	}
-	if r.reserve("F3", "sip:1@h", until) || r.size() != 2 {
+	if r.tryReserve("F3", "sip:1@h", until) || r.size() != 2 {
 		t.Fatalf("a third slot was taken: size %d", r.size())
 	}
 	// The second REGISTER of F1 still holds the slot after the first ends.
 	r.release("F1", "sip:1@h")
-	if r.reserve("F3", "sip:1@h", until) {
+	if r.tryReserve("F3", "sip:1@h", until) {
 		t.Fatal("a slot still reserved was given away")
 	}
 	r.release("F1", "sip:1@h")
 	r.release("F1", "sip:1@h")
-	if r.size() != 1 || !r.reserve("F3", "sip:1@h", until) {
+	if r.size() != 1 || !r.tryReserve("F3", "sip:1@h", until) {
 		t.Fatalf("a released slot was not freed: size %d", r.size())
 	}
 	// A reservation that becomes a registration keeps its slot.
@@ -192,7 +192,7 @@ func TestRegistrySlotsAreReservedUntilReleasedOrLapsed(t *testing.T) {
 		t.Fatalf("size %d, %d reservations after they lapsed", r.size(), len(r.pending))
 	}
 	// A flow that closes keeps a REGISTER's slot until it ends.
-	if !r.reserve("F2", "sip:2@h", clock.t.Add(time.Minute)) {
+	if !r.tryReserve("F2", "sip:2@h", clock.t.Add(time.Minute)) {
 		t.Fatal("refused")
 	}
 	r.removeFlow("F2")
@@ -203,4 +203,9 @@ func TestRegistrySlotsAreReservedUntilReleasedOrLapsed(t *testing.T) {
 	if r.size() != 0 {
 		t.Fatalf("size %d at the end", r.size())
 	}
+}
+
+// tryReserve is reserve that reports only whether it took the slot.
+func (r *registry) tryReserve(flow transport.FlowID, aor string, until time.Time) bool {
+	return r.reserve(flow, aor, until) == nil
 }

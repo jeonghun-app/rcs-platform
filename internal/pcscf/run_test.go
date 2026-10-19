@@ -38,6 +38,7 @@ func testConfig() Config {
 		AllowLoopback: true, MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
 		SCSCFHost: "scscf.rcs.internal", SCSCFPort: DefaultSCSCFPort,
+		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst,
 		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 	}

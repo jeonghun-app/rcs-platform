@@ -11,8 +11,19 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
-// errRegistryFull refuses a registration beyond PCSCF_MAX_REGISTRATIONS.
-var errRegistryFull = errors.New("pcscf: registry full")
+// errRegistryFull refuses a registration beyond PCSCF_MAX_REGISTRATIONS, and
+// errTooManyPending a REGISTER for one more identity over a flow that has
+// maxPendingPerFlow under way.
+var (
+	errRegistryFull   = errors.New("pcscf: registry full")
+	errTooManyPending = errors.New("pcscf: too many registrations under way on the flow")
+)
+
+// maxPendingPerFlow bounds the identities one flow may have REGISTERs under
+// way for at once, so that a client cannot hold slots by writing new To
+// values while the core is slow (QA of #198). A UE registers one or two
+// identities over a flow.
+const maxPendingPerFlow = 8
 
 // registration is what pcscf keeps of a public identity registered over a
 // flow (TS 24.229 §5.2.2.1): the 200 to its REGISTER told it the
@@ -78,6 +89,8 @@ type registry struct {
 	mu      sync.Mutex
 	byFlow  map[transport.FlowID]map[string]*registration
 	pending map[slotKey]*reservation
+	// pendingByFlow counts the reservations of each flow.
+	pendingByFlow map[transport.FlowID]int
 	// count is the slots taken: identities with a registration, a
 	// reservation or both.
 	count int
@@ -100,7 +113,8 @@ type reservation struct {
 
 func newRegistry(maxRegistrations int, now func() time.Time) *registry {
 	return &registry{max: maxRegistrations, now: now,
-		byFlow: map[transport.FlowID]map[string]*registration{}, pending: map[slotKey]*reservation{}}
+		byFlow: map[transport.FlowID]map[string]*registration{}, pending: map[slotKey]*reservation{},
+		pendingByFlow: map[transport.FlowID]int{}}
 }
 
 // holdsLocked reports whether k has a slot. mu must be held.
@@ -111,27 +125,33 @@ func (r *registry) holdsLocked(k slotKey) bool {
 }
 
 // reserve takes the slot of a REGISTER of aor over flow, until release or
-// until, if the registry has room or the identity has its slot already.
-func (r *registry) reserve(flow transport.FlowID, aor string, until time.Time) bool {
+// until: errRegistryFull if the registry has no room, errTooManyPending if
+// the flow has maxPendingPerFlow other identities under way. An identity
+// that has its slot already keeps it.
+func (r *registry) reserve(flow transport.FlowID, aor string, until time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	k := slotKey{flow, aor}
+	res := r.pending[k]
+	if res == nil && r.pendingByFlow[flow] >= maxPendingPerFlow {
+		return errTooManyPending
+	}
 	if !r.holdsLocked(k) {
 		if r.count >= r.max {
-			return false
+			return errRegistryFull
 		}
 		r.count++
 	}
-	res := r.pending[k]
 	if res == nil {
 		res = &reservation{}
 		r.pending[k] = res
+		r.pendingByFlow[flow]++
 	}
 	res.n++
 	if until.After(res.until) {
 		res.until = until
 	}
-	return true
+	return nil
 }
 
 // release ends a reservation of reserve. The slot stays taken if the
@@ -154,6 +174,9 @@ func (r *registry) release(flow transport.FlowID, aor string) {
 // not registered. mu must be held.
 func (r *registry) dropReservationLocked(k slotKey) {
 	delete(r.pending, k)
+	if r.pendingByFlow[k.flow]--; r.pendingByFlow[k.flow] <= 0 {
+		delete(r.pendingByFlow, k.flow)
+	}
 	if _, saved := r.byFlow[k.flow][k.aor]; !saved {
 		r.count--
 	}

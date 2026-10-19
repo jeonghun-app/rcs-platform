@@ -183,6 +183,11 @@ type pcscf struct {
 	ids   sip.IDGenerator
 	now   func() time.Time
 	log   *slog.Logger
+	// allRegisters limits the REGISTERs of all clients together.
+	allRegisters *limiter
+	// icscfFirst and icscfTotal bound a REGISTER's first attempt at icscf
+	// and all of them.
+	icscfFirst, icscfTotal time.Duration
 	// metrics counts what is worth an alarm; nil in tests that need none.
 	metrics *runtime.Metrics
 }

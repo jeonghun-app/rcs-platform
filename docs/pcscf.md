@@ -84,12 +84,20 @@ listener (TS 24.229 §5.2.2.1):
   (`PCSCF_VISITED_NETWORK_ID`, the home domain by default), from which
   `icscf` takes the Visited-Network-Identifier of its UAR, and
   `P-Charging-Vector` with a new `icid-value` for each REGISTER and
-  `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.2.1 4)).
+  `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.2.1 3)).
+- **Credentials.** `pcscf` owns the `integrity-protected` parameter of
+  `Authorization` (§5.2.2.1). It sets none, so `scscf` always challenges,
+  and removes whatever value a client wrote. A REGISTER whose
+  `Authorization` cannot be parsed is answered 400.
 - **Failover.** `pcscf` tries `icscf`'s addresses in a random order. An
-  address it cannot connect to, that does not answer within 8 s, or that
+  address it cannot connect to, that does not answer in time, or that
   answers 3xx, 480 or 503 gives way to the next, up to three (§5.2.2.1 7)).
-  The client gets 504 when all of them have failed, or when the lookup
-  failed, well before its own 32 s timeout.
+  The first attempt may take 12 s, longer than the core's own retry of an
+  HSS (two attempts of 5 s), so a slow but working core is not taken for a
+  dead one; the next ones share what is left of 30 s, which is usually one
+  more. The client gets 504 when all of them have failed, or when the lookup
+  failed, before its own 32 s timeout. A 200 that arrives after its attempt
+  was cut short is dropped, and the client's next REGISTER recovers.
 - **The 200.** `pcscf` keeps the following in instance memory, for each
   public identity registered over each flow:
   - the client's contacts on that flow that the 200 lists;
@@ -114,7 +122,12 @@ listener (TS 24.229 §5.2.2.1):
   `PCSCF_MAX_REGISTRATIONS` registrations. A REGISTER takes its slot before
   it is forwarded and gives it back if it ends unregistered, so a new one
   past the limit is refused at once rather than after a 200 `pcscf` could not
-  keep. Refusals are 503 with `Retry-After: 1`.
+  keep. One flow may have REGISTERs under way for at most eight identities,
+  so a client cannot hold slots by writing new To values while the core is
+  slow. Every REGISTER costs the core a UAR and an authentication vector,
+  so the task as a whole takes at most `PCSCF_MAX_REGISTER_RATE` a second,
+  with a burst of `PCSCF_MAX_REGISTER_BURST`, and counts the ones it refuses
+  in `register.refused_task_rate`. Refusals are 503 with `Retry-After: 1`.
 
 Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 
@@ -123,10 +136,14 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
   client wrote costs no lookup.
 - It looks up A and AAAA records, keeps each answer for 10 s, and gives every
   address, in a new random order each time.
-- When a lookup fails, the last answer is still used for 5 minutes. A failed
-  lookup is logged once, then at most once a minute while it keeps failing,
-  with its class: `not found` (a missing record, so a configuration error),
-  `timeout` or `error`.
+- A name is looked up by one lookup at a time, which no request waits on
+  while there is an answer to use: past its TTL the last answer is used at
+  once while it is refreshed, for up to 5 minutes. After a failed lookup the
+  next waits 5 s, doubling to a minute while they keep failing; a name with
+  no answer gets the last error until then. A failed lookup is logged once,
+  then at most once a minute while it keeps failing, with its class: `not
+  found` (a missing record, so a configuration error), `timeout` or
+  `error`.
 - It uses only private addresses. Dev and test also accept loopback.
 - A Cloud Map answer holds at most eight records, chosen at random when more
   instances are registered. That is enough for CSCF fleets of that size.
@@ -233,6 +250,7 @@ start with that value.
 | `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3) |
 | `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
 | `PCSCF_INITIAL_RATE`, `PCSCF_INITIAL_BURST` | `50`, `200` | requests outside a dialog a second per client address, and the burst |
+| `PCSCF_MAX_REGISTER_RATE`, `PCSCF_MAX_REGISTER_BURST` | `2000`, `4000` | REGISTERs a second for all clients of a task together, and the burst |
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | client flows among them; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |

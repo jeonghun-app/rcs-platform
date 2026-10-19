@@ -1,6 +1,7 @@
 package pcscf
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -40,6 +41,9 @@ type deps struct {
 	// sweep is how often expired registrations are dropped; zero is
 	// sweepInterval.
 	sweep time.Duration
+	// icscfFirst and icscfTotal replace icscfFirstTimeout and
+	// icscfTotalTimeout when set.
+	icscfFirst, icscfTotal time.Duration
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -100,10 +104,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	resolver := coreResolver{dns: &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: allowCore(cfg), Logger: rt.Logger}}
 	pc := &pcscf{
 		cfg: cfg, corePort: int(coreAddr.Port()),
-		registry:  newRegistry(cfg.MaxRegistrations, d.now),
-		registers: newLimiter(cfg.RegisterRate, cfg.RegisterBurst, d.now),
-		initials:  newLimiter(cfg.InitialRate, cfg.InitialBurst, d.now),
-		resolve:   resolver, icscfs: resolver, rand: rand.Reader,
+		registry:     newRegistry(cfg.MaxRegistrations, d.now),
+		registers:    newLimiter(cfg.RegisterRate, cfg.RegisterBurst, d.now),
+		allRegisters: newLimiter(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, d.now),
+		initials:     newLimiter(cfg.InitialRate, cfg.InitialBurst, d.now),
+		icscfFirst:   cmp.Or(d.icscfFirst, icscfFirstTimeout), icscfTotal: cmp.Or(d.icscfTotal, icscfTotalTimeout),
+		resolve: resolver, icscfs: resolver, rand: rand.Reader,
 		flows: tr, now: d.now, log: rt.Logger, metrics: rt.Metrics,
 	}
 	// A closed flow's registrations are gone (RFC 5626 §5.3).

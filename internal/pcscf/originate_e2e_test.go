@@ -71,24 +71,6 @@ func (p *peer) send(callID, line, toTag string, cseq int, method string, extra .
 	}
 }
 
-// final reads responses until a final one.
-func (p *peer) final() *sip.Response {
-	p.t.Helper()
-	for {
-		m, err := p.r.ReadMessage()
-		if err != nil {
-			p.t.Fatal(err)
-		}
-		res, ok := m.(*sip.Response)
-		if !ok {
-			p.t.Fatalf("got a request: %v", m)
-		}
-		if res.StatusCode >= 200 {
-			return res
-		}
-	}
-}
-
 // forged are header fields a client may not set, and so must never reach the
 // core from it as the client wrote them (TS 24.229 §5.2, ADR 0007 §7).
 var forged = []string{

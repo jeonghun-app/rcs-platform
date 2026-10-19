@@ -2,6 +2,7 @@ package pcscf
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	mrand "math/rand/v2"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -114,11 +116,13 @@ func newTestPcscf(clock *testClock) (*pcscf, idleSet) {
 	cfg.CoreHost = netip.MustParseAddr("10.0.2.9")
 	return &pcscf{
 		cfg: cfg, corePort: 5070,
-		registry:  newRegistry(cfg.MaxRegistrations, clock.now),
-		registers: newLimiter(cfg.RegisterRate, cfg.RegisterBurst, clock.now),
-		initials:  newLimiter(cfg.InitialRate, cfg.InitialBurst, clock.now),
-		resolve:   coreResolver{dns: &proxy.DNSResolver{Namespace: cfg.Namespace, Allow: allowCore(cfg), Lookup: scscfAt("10.0.4.4")}},
-		icscfs:    icscfAt{"10.0.3.7:5060", "10.0.3.8:5060", "10.0.3.9:5060", "10.0.3.10:5060"}, rand: seededRand(),
+		registry:     newRegistry(cfg.MaxRegistrations, clock.now),
+		registers:    newLimiter(cfg.RegisterRate, cfg.RegisterBurst, clock.now),
+		allRegisters: newLimiter(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, clock.now),
+		initials:     newLimiter(cfg.InitialRate, cfg.InitialBurst, clock.now),
+		icscfFirst:   icscfFirstTimeout, icscfTotal: icscfTotalTimeout,
+		resolve: coreResolver{dns: &proxy.DNSResolver{Namespace: cfg.Namespace, Allow: allowCore(cfg), Lookup: scscfAt("10.0.4.4")}},
+		icscfs:  icscfAt{"10.0.3.7:5060", "10.0.3.8:5060", "10.0.3.9:5060", "10.0.3.10:5060"}, rand: seededRand(),
 		flows: idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, idle
 }
@@ -169,7 +173,7 @@ func TestARegisterGoesToICSCFWithAPathNamingTheFlow(t *testing.T) {
 	r := clientRequest(t, registerText(outboundContact, "Supported: outbound", "Route: <sip:10.0.9.9;lr>"), "FLOWTOKEN1")
 	d := p.Route(context.Background(), r)
 	if len(d.Targets) != 1 || d.Targets[0].URI.String() != homeURI || d.Targets[0].Destination == nil ||
-		d.Targets[0].Destination.Addr.String() != "10.0.3.7:5060" || d.Targets[0].Destination.Listener != coreListener || d.Targets[0].Timeout != icscfAttemptTimeout {
+		d.Targets[0].Destination.Addr.String() != "10.0.3.7:5060" || d.Targets[0].Destination.Listener != coreListener || d.Targets[0].Timeout != icscfFirstTimeout {
 		t.Fatalf("decision %+v", d)
 	}
 	req := prepared(t, d, r)
@@ -185,6 +189,11 @@ func TestARegisterGoesToICSCFWithAPathNamingTheFlow(t *testing.T) {
 	}
 	if got := req.Header.Get("P-Visited-Network-ID"); got != p.cfg.VisitedNetworkID {
 		t.Errorf("P-Visited-Network-ID %q", got)
+	}
+	// The configured visited network, not the home domain (QA of #198).
+	p.cfg.VisitedNetworkID = "visited.example.net"
+	if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Visited-Network-ID"); got != "visited.example.net" {
+		t.Errorf("P-Visited-Network-ID %q, want PCSCF_VISITED_NETWORK_ID", got)
 	}
 	first := req.Header.Get("P-Charging-Vector")
 	if !icidValue.MatchString(first) {
@@ -589,7 +598,8 @@ func TestARegisterTriesTheNextICSCFAndEndsIn504(t *testing.T) {
 			next := d.OnBranchFailure(context.Background(), failure(t, code))
 			if len(next) == 1 {
 				tried = append(tried, next[0].Destination.Addr.String())
-				if next[0].Timeout != icscfAttemptTimeout || next[0].Destination.Listener != coreListener || next[0].URI.String() != homeURI {
+				// Failing at once, the next attempt has all the time left.
+				if next[0].Timeout != icscfTotalTimeout || next[0].Destination.Listener != coreListener || next[0].URI.String() != homeURI {
 					t.Errorf("%d: next target %+v", code, next[0])
 				}
 			}
@@ -638,5 +648,119 @@ func TestProductionCoreHopsArePrivateOnly(t *testing.T) {
 	cfg.AllowLoopback = true
 	if !allowCore(cfg)(netip.MustParseAddr("127.0.0.1")) {
 		t.Error("dev refuses loopback")
+	}
+}
+
+// The first attempt at icscf may take 12 s, longer than the core's own
+// retry of an HSS, and the next only what is left of 30 s, so the client's
+// 504 comes before its Timer F (review of #198); a registry slot is held
+// for longer than all of that.
+func TestTheICSCFAttemptsShareThirtySeconds(t *testing.T) {
+	if icscfFirstTimeout != 12*time.Second || icscfTotalTimeout != 30*time.Second || icscfTotalTimeout >= 32*time.Second {
+		t.Fatalf("first %v, total %v", icscfFirstTimeout, icscfTotalTimeout)
+	}
+	if reservationHold < icscfTotalTimeout || reservationHold < maxICSCFAttempts*icscfFirstTimeout {
+		t.Fatalf("reservationHold %v is shorter than the attempts", reservationHold)
+	}
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	p, _ := newTestPcscf(clock)
+	d := p.Route(context.Background(), clientRequest(t, registerText(outboundContact), "F"))
+	timeout := parseResponse(t, strings.Replace(okText(""), "200 OK", "408 Request Timeout", 1))
+	clock.t = clock.t.Add(icscfFirstTimeout)
+	next := d.OnBranchFailure(context.Background(), proxy.BranchFailure{Response: timeout})
+	if len(next) != 1 || next[0].Timeout != 18*time.Second {
+		t.Fatalf("second attempt %+v, want 18 s", next)
+	}
+	clock.t = clock.t.Add(18 * time.Second)
+	if next := d.OnBranchFailure(context.Background(), proxy.BranchFailure{Response: timeout}); next != nil {
+		t.Fatalf("a third attempt with no time left: %+v", next)
+	}
+	res := parseResponse(t, strings.Replace(okText(""), "200 OK", "408 Request Timeout", 1))
+	if d.OnFinal(context.Background(), res); res.StatusCode != 504 {
+		t.Fatalf("the client got %d", res.StatusCode)
+	}
+}
+
+// A flow may have REGISTERs under way for at most eight identities: a
+// client writing new To values while the core is slow holds no more slots,
+// and a client on another flow still registers (QA of #198).
+func TestAFlowHoldsAFewSlotsForUnansweredRegisters(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	p, _ := newTestPcscf(clock)
+	p.registry = newRegistry(100, clock.now)
+	refused := 0
+	for i := range 100 {
+		text := strings.ReplaceAll(registerText("<sip:x@192.0.2.10:40000>"), aliceIMPU, fmt.Sprintf("sip:user%d@ims.mnc001.mcc001.3gppnetwork.org", i))
+		if d := p.Route(context.Background(), clientRequest(t, text, "BUSY")); d.Response != nil {
+			if d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
+				t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
+			}
+			refused++
+		}
+	}
+	if n := p.registry.size(); n > maxPendingPerFlow || refused != 100-maxPendingPerFlow {
+		t.Fatalf("%d slots held, %d refused", n, refused)
+	}
+	// A refresh of an identity already under way is not a new one.
+	if d := p.Route(context.Background(), clientRequest(t, strings.ReplaceAll(registerText("<sip:x@192.0.2.10:40000>"), aliceIMPU, "sip:user0@ims.mnc001.mcc001.3gppnetwork.org"), "BUSY")); d.Response != nil {
+		t.Fatal("a retransmitted identity was refused")
+	}
+	d := p.Route(context.Background(), clientRequest(t, registerText(outboundContact, "Supported: outbound"), "OTHER"))
+	if d.Response != nil {
+		t.Fatalf("a client on another flow was refused: %+v", d.Response)
+	}
+	d.OnResponse(context.Background(), parseResponse(t, okText(outboundContact+";expires=3600", "Require: outbound")))
+	if _, ok := p.registry.lookup("OTHER", aorKey(mustURI(t, aliceIMPU))); !ok {
+		t.Fatal("not registered")
+	}
+}
+
+// The REGISTERs of all clients together are bounded, and a refusal is
+// counted (security review of #198).
+func TestTheTaskBoundsTheRegistersOfAllClients(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	p, _ := newTestPcscf(clock)
+	var out strings.Builder
+	p.metrics = runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, p.log)
+	p.allRegisters = newLimiter(1, 2, clock.now)
+	for i := range 3 {
+		r := clientRequest(t, registerText(outboundContact), transport.FlowID(fmt.Sprint("F", i)))
+		r.Source.Addr = netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(20 + i)}), 40000)
+		d := p.Route(context.Background(), r)
+		if refused := d.Response != nil; refused != (i == 2) {
+			t.Fatalf("REGISTER %d refused %v", i, refused)
+		}
+		if d.Response != nil && (d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1") {
+			t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
+		}
+	}
+	p.metrics.Flush()
+	if !strings.Contains(out.String(), `"`+metricRegisterTaskLimit+`":1`) {
+		t.Errorf("metrics %s", out.String())
+	}
+}
+
+// pcscf sets no integrity-protected: whatever a client says of it is
+// dropped, the rest of its credentials kept.
+func TestPcscfOwnsIntegrityProtected(t *testing.T) {
+	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
+	auth := `Digest username="001010000000001@ims.mnc001.mcc001.3gppnetwork.org", realm="ims.mnc001.mcc001.3gppnetwork.org", nonce="", uri="sip:ims.mnc001.mcc001.3gppnetwork.org", response="", integrity-protected="yes"`
+	r := clientRequest(t, registerText(outboundContact, "Authorization: "+auth, `Authorization: Digest username="u", realm="r", nonce="n", uri="sip:x", response="y", Integrity-Protected=tls-yes`), "F")
+	req := prepared(t, p.Route(context.Background(), r), r)
+	creds, err := req.Header.Authorization()
+	if err != nil || len(creds) != 2 {
+		t.Fatalf("credentials %v, %v", creds, err)
+	}
+	for _, c := range creds {
+		if _, ok := c.Param("integrity-protected"); ok {
+			t.Errorf("integrity-protected kept: %s", c)
+		}
+		if v, _ := c.Param("username"); v == "" {
+			t.Errorf("credentials lost: %s", c)
+		}
+	}
+	bad := clientRequest(t, registerText(outboundContact, "Authorization: Digest ,,"), "F")
+	if d := p.Route(context.Background(), bad); d.Status != 400 {
+		t.Errorf("malformed credentials: %+v", d)
 	}
 }

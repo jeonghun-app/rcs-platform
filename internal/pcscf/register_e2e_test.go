@@ -345,3 +345,90 @@ func TestTheSweepDropsExpiredRegistrations(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// Whatever integrity-protected a client writes in its credentials does not
+// reach icscf: pcscf owns that parameter (security review of #198).
+func TestAClientsIntegrityProtectedDoesNotReachICSCF(t *testing.T) {
+	icscf := startCoreNode(t, echo200)
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
+	s := start(t, cfg, deps{})
+	c := dial(t, s.client, nil)
+	for _, v := range []string{`"yes"`, "tls-yes", `"ip-assoc-yes"`} {
+		text := strings.ReplaceAll(registerText(outboundContact, "Supported: outbound",
+			`Authorization: Digest username="001010000000001@ims.mnc001.mcc001.3gppnetwork.org", realm="ims.mnc001.mcc001.3gppnetwork.org", nonce="", uri="sip:ims.mnc001.mcc001.3gppnetwork.org", response="", integrity-protected=`+v),
+			"reg-1", fmt.Sprintf("reg-ip-%d", requests.Add(1)))
+		_ = c.nc.SetDeadline(time.Now().Add(waitFor))
+		if _, err := io.WriteString(c.nc, text); err != nil {
+			t.Fatal(err)
+		}
+		got := icscf.receive(t)
+		if a := got.Header.Get("Authorization"); strings.Contains(strings.ToLower(a), "integrity-protected") || !strings.Contains(a, "username=") {
+			t.Errorf("icscf got Authorization %q", a)
+		}
+		if res := c.final(); res.StatusCode != 200 {
+			t.Fatalf("REGISTER: %d", res.StatusCode)
+		}
+	}
+}
+
+// A core that answers the first copy of a REGISTER slowly, as when its HSS
+// stalls and it retries another, still registers the client: the first
+// attempt outlasts that retry, and a second copy elsewhere, which a
+// registrar refuses as out of order, is never sent (review of #198). The
+// timeouts are scaled down for the test.
+func TestASlowCoreStillRegistersTheClient(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	node := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), answer: func(req *sip.Request) string {
+		key := req.Header.Get("Call-ID") + " " + req.Header.Get("CSeq")
+		mu.Lock()
+		again := seen[key]
+		seen[key] = true
+		mu.Unlock()
+		if again {
+			return strings.Replace(echo200(req), "200 OK", "500 Out of Order REGISTER", 1)
+		}
+		time.Sleep(time.Second) // 9 s of 12, scaled
+		return echo200(req)
+	}}
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go node.serve(t, nc)
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, fmt.Sprintf("sip:icscf.rcs.internal:%d;transport=tcp;lr", port))
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1", "127.0.0.6"), icscfFirst: 2 * time.Second, icscfTotal: 4 * time.Second})
+	if res := registerOver(t, dial(t, s.client, nil)); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d, want the slow 200", res.StatusCode)
+	}
+}
+
+// final reads responses until a final one.
+func (p *peer) final() *sip.Response {
+	p.t.Helper()
+	for {
+		m, err := p.r.ReadMessage()
+		if err != nil {
+			p.t.Fatal(err)
+		}
+		res, ok := m.(*sip.Response)
+		if !ok {
+			p.t.Fatalf("got a request: %v", m)
+		}
+		if res.StatusCode >= 200 {
+			return res
+		}
+	}
+}
