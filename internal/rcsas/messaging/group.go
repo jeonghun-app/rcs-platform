@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -185,12 +186,9 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 		if !e.notifiers.allow(o.Sender, now) {
 			return reject(ReasonRateLimited, nil)
 		}
-		if _, err := h.Recipients(ctx, o.Group, o.Sender, GroupNotification); err != nil {
-			return err
-		}
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 		defer cancel()
-		return e.submitGroupNotification(sctx, o, m, now)
+		return e.submitGroupNotification(sctx, h, o, m, "", now)
 	}
 	if !e.senders.allow(o.Sender, now) {
 		return reject(ReasonRateLimited, nil)
@@ -253,25 +251,8 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 		e.metrics.Count("imdn.incomplete_request", 1)
 	}
 	if req := m.Request; req.Dispositions != 0 {
-		// Keyed by the group, so that a notification is matched to its
-		// message whatever form of the author's identity the notifier
-		// writes in its To.
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
-		err := e.store.RecordSent(sctx, store.Sent{
-			Sender: o.Group, MessageID: req.MessageID, Author: o.Sender, Recipients: recipients,
-			Dispositions: req.Dispositions, Expires: now.Add(e.cfg.SentTTL),
-		}, now)
-		if errors.Is(err, store.ErrExists) {
-			var s store.Sent
-			s, err = e.store.Sent(sctx, o.Group, req.MessageID, now)
-			switch {
-			case err != nil:
-			case s.Author != o.Sender:
-				err = reject(ReasonMessageIDReused, nil)
-			default:
-				e.metrics.Count("message.resent", 1)
-			}
-		}
+		err := e.recordGroupSent(sctx, o, req, recipients, now)
 		cancel()
 		if err != nil {
 			return err
@@ -309,26 +290,88 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 	return failed
 }
 
+// recordGroupSent records a group message that asks for notifications,
+// twice. The group's record (Sender the group) matches a notification sent
+// in the group to its message whatever form of the author's identity the
+// notifier writes in its To, and holds the marks of the notifications
+// accepted. The author's own record (Sender the author, naming the group)
+// is what a notification sent to the author outside the group finds
+// (submitNotification). The author's comes first: it is the one a 1-to-1
+// message could already hold under the same Message-ID, which makes the
+// group message a reuse rather than a resend (RFC 5438 §6.3).
+func (e *Engine) recordGroupSent(ctx context.Context, o GroupOrigin, req imdn.Request, recipients []string, now time.Time) error {
+	resent := false
+	for _, r := range []store.Sent{
+		{Sender: o.Sender, MessageID: req.MessageID, Group: o.Group},
+		{Sender: o.Group, MessageID: req.MessageID, Author: o.Sender},
+	} {
+		r.Recipients, r.Dispositions, r.Expires = recipients, req.Dispositions, now.Add(e.cfg.SentTTL)
+		err := e.store.RecordSent(ctx, r, now)
+		if !errors.Is(err, store.ErrExists) {
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		s, err := e.store.Sent(ctx, r.Sender, req.MessageID, now)
+		switch {
+		case err != nil:
+			return err
+		case s.Group != r.Group || s.Author != r.Author:
+			return reject(ReasonMessageIDReused, nil)
+		}
+		resent = true
+	}
+	if resent {
+		e.metrics.Count("message.resent", 1)
+	}
+	return nil
+}
+
 // submitGroupNotification accepts a notification about a group's message
 // on the same terms as submitNotification: the message must be the
 // group's, the notifier one of the participants it went to, and the kind
-// one its author asked for, once.
-func (e *Engine) submitGroupNotification(ctx context.Context, o GroupOrigin, m *Message, now time.Time) error {
+// one its author asked for, once. A recipient-uri in it, if any, must name
+// the notifier, so that no participant reports for another.
+//
+// It arrives in the notifier's session with the group, where h checks that
+// the notifier may send there, or outside it, in a SIP MESSAGE to author,
+// whose own record of the message named the group: rcsjta sends display
+// notifications that way once the group session is gone
+// (ChatServiceImpl.sendGroupChatDisplayedDeliveryReport). Either way it
+// goes to the author in the group, From the notifier; one from outside,
+// whose To is the anonymous URI, gets To the author, since a client takes
+// a notification in a group only when it is To itself (rcsjta).
+//
+// The record is read before the group: a notification about nothing costs
+// one small read, not one of the group's item.
+func (e *Engine) submitGroupNotification(ctx context.Context, h GroupHandler, o GroupOrigin, m *Message, author string, now time.Time) error {
 	n := m.Notification
 	sent, err := e.store.Sent(ctx, o.Group, n.MessageID, now)
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || err == nil && (sent.Author == "" || author != "" && sent.Author != author) {
 		return reject(ReasonIMDNUnknown, nil)
 	}
 	if err != nil {
 		return err
 	}
 	switch {
-	case sent.Author == "" || !slices.Contains(sent.Recipients, o.Sender):
+	case !slices.Contains(sent.Recipients, o.Sender):
+		return reject(ReasonIMDNForged, nil)
+	case n.RecipientURI != "" && n.RecipientURI != o.Sender && n.RecipientURI != AnonymousURI && !slices.Contains(o.Identities, n.RecipientURI):
 		return reject(ReasonIMDNForged, nil)
 	case !sent.Dispositions.Wants(n.Kind, n.Status):
 		return reject(ReasonIMDNNotRequested, nil)
 	}
-	body, err := groupView(m.CPIM, cpim.Address{URI: o.Sender}, "")
+	if h != nil {
+		if _, err := h.Recipients(ctx, o.Group, o.Sender, GroupNotification); err != nil {
+			return err
+		}
+	}
+	to := ""
+	if author != "" {
+		to = sent.Author
+	}
+	body, err := groupView(m.CPIM, cpim.Address{URI: o.Sender}, to)
 	if err != nil {
 		return reject(ReasonIMDNMalformed, err)
 	}

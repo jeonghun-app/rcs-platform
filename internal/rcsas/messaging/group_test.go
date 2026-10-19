@@ -277,7 +277,7 @@ func TestGroupNotificationsAreCheckedLikeAnyOther(t *testing.T) {
 		"about nothing":     {groupFrom(bob, receipt(t, "m9", imdn.DeliveryNotification, imdn.Delivered)), ReasonIMDNUnknown},
 		"not asked for":     {groupFrom(bob, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)), ReasonIMDNNotRequested},
 		"from the author":   {groupFrom(alice, receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)), ReasonIMDNForged},
-		"in another group":  {GroupOrigin{Group: "sip:chat-2@x", Sender: bob, CPIM: receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)}, ReasonNoGroup},
+		"in another group":  {GroupOrigin{Group: "sip:chat-2@x", Sender: bob, CPIM: receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)}, ReasonIMDNUnknown},
 		"too large to send": {groupFrom(bob, bigReceipt(t)), ReasonTooLarge},
 	} {
 		if got := rejected(r.e.SubmitGroup(t.Context(), c.o)); got != c.want {

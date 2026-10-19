@@ -38,6 +38,11 @@ func (e *Engine) submitNotification(ctx context.Context, o Origin, m *Message, n
 	if err != nil {
 		return err
 	}
+	if sent.Group != "" {
+		// About a group message: matched and marked in the group.
+		g := GroupOrigin{Group: sent.Group, Sender: o.Sender, Identities: o.Identities, Conversation: o.Conversation, CPIM: o.CPIM}
+		return e.submitGroupNotification(ctx, nil, g, m, o.Recipient, now)
+	}
 	switch {
 	case slices.Contains(sent.Recipients, o.Sender):
 	case slices.Contains(e.cfg.Intermediaries, o.Sender) && intermediaryMay(n.Kind, n.Status):

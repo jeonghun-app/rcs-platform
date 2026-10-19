@@ -432,7 +432,7 @@ func (e *Engine) submitMessage(ctx context.Context, o Origin, m *Message, now ti
 			if err != nil {
 				return err
 			}
-			if !slices.Contains(s.Recipients, o.Recipient) {
+			if s.Group != "" || !slices.Contains(s.Recipients, o.Recipient) {
 				return reject(ReasonMessageIDReused, nil)
 			}
 			e.metrics.Count("message.resent", 1)

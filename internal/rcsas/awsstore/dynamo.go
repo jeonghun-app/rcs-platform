@@ -40,6 +40,7 @@ const (
 	attrBucket       = "xb"
 	attrSender       = "sender"
 	attrAuthor       = "author"
+	attrGroup        = "group"
 	attrConversation = "conversation"
 	attrContribution = "contribution"
 	attrInReplyTo    = "in_reply_to"
@@ -673,6 +674,9 @@ func (s *Store) RecordSent(ctx context.Context, r store.Sent, now time.Time) err
 	if r.Author != "" {
 		item[attrAuthor] = str(r.Author)
 	}
+	if r.Group != "" {
+		item[attrGroup] = str(r.Group)
+	}
 	_, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                 aws.String(s.table),
 		Item:                      item,
@@ -707,6 +711,7 @@ func (s *Store) Sent(ctx context.Context, sender, messageID string, now time.Tim
 		getNum(out.Item, attrDispositions, &dispositions),
 		getTime(out.Item, attrExpires, &expires),
 		getString(out.Item, attrAuthor, &r.Author, false),
+		getString(out.Item, attrGroup, &r.Group, false),
 	)
 	if l, ok := out.Item[attrRecipients].(*types.AttributeValueMemberL); ok {
 		for _, v := range l.Value {

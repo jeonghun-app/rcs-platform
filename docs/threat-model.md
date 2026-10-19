@@ -204,7 +204,8 @@ metadata.
   someone else, by address or by name. A 1-to-1 message, forwarded unchanged,
   is refused if it has such a header.
 - **Notifications.** They are matched by the group's own record of the
-  message, accepted only from participants it went to, once per kind.
+  message, in the group or sent to the author outside it, accepted only from
+  participants it went to, for themselves (`recipient-uri`), once per kind.
 - **Floods and spam.** These are bounded:
   - group size (`RCSAS_GROUP_MAX_PARTICIPANTS`);
   - per user, groups created and participants added per minute;

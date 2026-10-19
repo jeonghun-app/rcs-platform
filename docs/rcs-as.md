@@ -356,17 +356,34 @@ author one by one, in the author's session with the group. They are not
 aggregated: RFC 5438 §8.3 aggregation is optional and `internal/imdn` does not
 decode it.
 
-A notification is accepted only when all of these hold:
+A group message that asks for notifications gets two sent-message records:
 
-- the group's record of the message exists. Records are keyed by the group and
-  the Message-ID, so the To a notifier's client writes, in whatever form it
-  knows the author, does not matter;
+- the group's, keyed by the group and the Message-ID. It matches a
+  notification sent in the group whatever form of the author's identity the
+  notifier's client writes in its To, and holds the marks of the
+  notifications accepted;
+- the author's own, keyed by the author and naming the group. A notification
+  sent outside the group finds it. rcsjta sends display notifications as a
+  SIP MESSAGE to the author, with anonymous From and To, once the group
+  session is gone (`ChatServiceImpl.sendGroupChatDisplayedDeliveryReport`).
+  It also means that an author's Message-ID names one message: the same ID
+  in a group and in a 1-to-1 message is refused as `message_id_reused`.
+
+A notification, in the group or outside it, is accepted only when all of these
+hold:
+
+- the group's record of the message exists. It is read before the group, so
+  a notification about nothing costs no read of the group's item;
 - the notifier is one of the participants the message went to;
+- its `recipient-uri`, if it has one, is the notifier's identity (or the
+  anonymous URI): no participant reports for another;
 - the author asked for that kind;
-- it is the first of its kind from that notifier.
+- it is the first of its kind from that notifier, whichever way it came.
 
-Its header block is rebuilt as for a message: `From` the notifier's asserted
-identity, and the `To` the notifier wrote, which names the author.
+It goes to the author in the group. Its header block is rebuilt as for a
+message: `From` the notifier's asserted identity, and `To` the one the notifier
+wrote in the group, or the author for one that came from outside, since a
+client takes a notification in a group only when it is `To` itself (rcsjta).
 
 Every message an author writes is answered by every other participant, up to
 twice. So all group notifications in a queue, from any group and notifier,
@@ -375,9 +392,10 @@ few messages to a full group cannot fill the author's queue and lock out
 1-to-1 messages. A notification beyond that share, or beyond the queue, is
 taken (200) and dropped, counted as `group.notification.dropped`, rather than
 refused: the reference client ends its session with the group when one is
-refused. Notifications
-rcs-as generates (expiry, full queue) go to the author the same way, from the
-recipient.
+refused.
+
+Notifications rcs-as generates (expiry, full queue) go to the author the same
+way, from the recipient.
 
 ### Roster events
 
@@ -462,7 +480,7 @@ There is one table with partition key `pk` and sort key `sk` (both strings).
 | Queued message | `q#<len>#<recipient>` | queue ID: enqueue time in hex, then random |
 | Queue size | `c#<len>#<recipient>` | `n` |
 | A sender's share of a queue | `c#<len>#<recipient>` | `s#<len>#<sender>` |
-| Sent-message record | `s#<len>#<sender>` | IMDN Message-ID |
+| Sent-message record | `s#<len>#<sender>` | IMDN Message-ID; for a group message, one under the group and one under the author, which names the group (`group`) |
 
 There is one global secondary index, `expiry`:
 

@@ -552,8 +552,17 @@ func sent(t *testing.T, s store.Store) {
 	if err := s.RecordSent(ctx, g, t0); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := s.Sent(ctx, g.Sender, "m-1", t0); err != nil || got.Author != alice || len(got.Recipients) != 2 {
+	if got, err := s.Sent(ctx, g.Sender, "m-1", t0); err != nil || got.Author != alice || len(got.Recipients) != 2 || got.Group != "" {
 		t.Fatalf("group Sent = %+v, %v", got, err)
+	}
+	// The author's own record of it names the group.
+	own := store.Sent{Sender: alice, MessageID: "m-own", Group: g.Sender, Recipients: []string{bob, carol},
+		Dispositions: imdn.Display, Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, own, t0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Sent(ctx, alice, "m-own", t0); err != nil || got.Group != g.Sender || got.Author != "" {
+		t.Fatalf("author's Sent = %+v, %v", got, err)
 	}
 	// The record is the sender's: another sender with the same Message-ID
 	// has none.

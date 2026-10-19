@@ -184,6 +184,11 @@ type Sent struct {
 	// Author is, for a group message, the participant who wrote it, whom
 	// its notifications go to; empty otherwise.
 	Author string
+	// Group is set on the author's own record of a group message (Sender
+	// the author), which a notification sent outside the group's session
+	// finds: the group's conference URI, whose record holds the marks of
+	// the notifications already accepted. Empty otherwise.
+	Group string
 	// Recipients are the identities a notification about the message may
 	// come from.
 	Recipients []string
