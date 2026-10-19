@@ -89,6 +89,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	fs.StringVar(&sf.transport, "sip-transport", "tcp", "tcp or tls, to pcscf")
 	fs.StringVar(&sf.serverName, "sip-server-name", "", "name pcscf's certificate is verified for (default: -sip-proxy's host)")
 	fs.StringVar(&sf.domain, "sip-domain", "", "home network domain, REGISTER's Request-URI (default: -self's host)")
+	fs.StringVar(&sf.realm, "sip-realm", "", "the S-CSCF's Digest realm, the only one answered (default: -sip-domain)")
 	fs.StringVar(&sf.impi, "sip-impi", "", "private user identity (default: "+envIMPI+")")
 	fs.StringVar(&sf.auth, "sip-auth", "aka", "aka (RCS_SIM_AKA_K, RCS_SIM_AKA_OPC) or digest (RCS_SIM_SIP_PASSWORD)")
 	fs.StringVar(&sf.instance, "sip-instance", "", "+sip.instance URN (default: a new urn:uuid)")

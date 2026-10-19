@@ -205,6 +205,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-sip-transport` | `tcp` | `tcp` or `tls` to pcscf |
 | `-sip-server-name` | `-sip-proxy`'s host | the name pcscf's certificate is verified for, and the host of the first Route; TLS to an address needs it |
 | `-sip-domain` | `-self`'s host | home network domain, REGISTER's Request-URI |
+| `-sip-realm` | `-sip-domain` | the S-CSCF's Digest realm, the only one whose challenges are answered; set it when the HSS's `HSS_IMS_REALM` differs from the domain |
 | `-sip-impi` | `RCS_SIM_SIP_IMPI` | private user identity, the Digest username |
 | `-sip-auth` | `aka` | `aka` takes K and OPc from `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`; `digest` takes the password from `RCS_SIM_SIP_PASSWORD` |
 | `-sip-instance` | a new `urn:uuid` | `+sip.instance` (RFC 5626 §4.1) |
