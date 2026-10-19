@@ -115,8 +115,8 @@ type SessionConfig struct {
 // and a replacement needs a new SDP exchange.
 type Session struct {
 	local URI
-	// remote is written once, before remoteSet is closed, and read only
-	// after it is.
+	// remote is written once, under mu and before remoteSet is closed, and
+	// read only after that or under mu.
 	remote    []URI
 	remoteSet chan struct{}
 	handler   Handler

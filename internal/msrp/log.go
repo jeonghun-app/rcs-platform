@@ -125,10 +125,12 @@ func formatGroup(f fmt.State, v slog.Value) {
 func (s *Session) LogValue() slog.Value {
 	s.mu.Lock()
 	bound, closed := s.conn != nil, s.closed
+	// SetRemote writes remote under the lock.
+	remote := s.remote
 	s.mu.Unlock()
 	return slog.GroupValue(
 		slog.String("local", s.local.Redacted()),
-		slog.String("remote", redactedPath(s.remote)),
+		slog.String("remote", redactedPath(remote)),
 		slog.Bool("bound", bound),
 		slog.Bool("closed", closed),
 	)

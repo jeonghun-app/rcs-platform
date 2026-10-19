@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,5 +122,42 @@ func TestOnlyARemoteLaterSessionMayLackItsPath(t *testing.T) {
 	defer c.Close()
 	if err := c.Open(context.Background(), s); err == nil {
 		t.Fatal("an active session opened without the peer's path")
+	}
+}
+
+// Logging a session while its path arrives is safe (go test -race).
+func TestLoggingASessionWhileItsPathIsSetIsSafe(t *testing.T) {
+	s, err := NewSession(SessionConfig{Local: mustURI(t, asURI), RemoteLater: true, Handler: newRecorder()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 100 {
+			_ = s.LogValue().String()
+		}
+	}()
+	if err := s.SetRemote([]URI{mustURI(t, clientURI)}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if !strings.Contains(s.LogValue().String(), "remote=") {
+		t.Fatalf("LogValue = %v", s.LogValue())
+	}
+}
+
+func TestAPathlessSessionCannotBePooledOrBridged(t *testing.T) {
+	s, err := NewSession(SessionConfig{Local: mustURI(t, clientURI), RemoteLater: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Pool{Dial: func(context.Context, URI) (net.Conn, error) { t.Fatal("dialled"); return nil, nil }}
+	if err := p.Open(context.Background(), s); err == nil {
+		t.Fatal("pooled a session without its path")
+	}
+	other := newTestSession(t, asURI, clientURI, nil)
+	if err := Bridge(s, other); err == nil {
+		t.Fatal("bridged a session without its path")
 	}
 }
