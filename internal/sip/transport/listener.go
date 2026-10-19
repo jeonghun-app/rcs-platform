@@ -288,6 +288,7 @@ func (l *listener) serveAccepted(raw net.Conn) {
 	t := l.t
 	defer t.wg.Done()
 	defer t.releaseAccepted(raw)
+	capSendBuffer(raw)
 
 	remote := addrPortOf(raw.RemoteAddr())
 	if l.proxy {

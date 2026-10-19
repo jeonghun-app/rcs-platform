@@ -691,17 +691,24 @@ func TestSendWaitsForRoomWhileThePeerReads(t *testing.T) {
 	}
 }
 
-func TestSendThatFindsNoRoomWithinTheWriteTimeoutFails(t *testing.T) {
+func TestPeerThatNeverReadsFailsTheWaitingSendAndIsClosedByTheWriter(t *testing.T) {
 	tr, _ := pipeTransport(t, Config{WriteTimeout: 50 * time.Millisecond, SendQueueBytes: 1000})
 	q := &queueTest{t: t, tr: tr}
 	if err := q.send(); err != nil {
 		t.Fatal(err)
 	}
 	q.writerBusy()
-	if err := q.send(); err == nil {
-		t.Fatal("a send to a peer that never reads succeeded")
+	// The waiting send fails, by timing out (ErrQueueFull) or by seeing the
+	// connection close, whichever happens first: both run out after
+	// WriteTimeout. What closes the connection is the stalled write, not the
+	// full queue.
+	if err := q.send(); !errors.Is(err, ErrQueueFull) && !errors.Is(err, ErrNoFlow) {
+		t.Fatalf("send = %v, want ErrQueueFull or ErrNoFlow", err)
 	}
 	eventually(t, "the connection to close", func() bool { return tr.Stats().OpenOutbound == 0 })
+	if s := tr.Stats(); s.QueueOverflows != 0 || s.WriteErrors != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
 }
 
 func TestDialedConnectionWithoutAnAddressOrListenerIsNotGivenABrokenVia(t *testing.T) {
