@@ -81,9 +81,13 @@ internal/
   msrprelay/store/          binding store interface, memory backend, storetest
                             contract
   msrprelay/dynamostore/    msrp-relay DynamoDB backend (`msrp-bindings`)
-deploy/                     Dockerfile (service image), toolchain.Dockerfile
+deploy/                     Dockerfile (service image), toolchain.Dockerfile,
+                            docker-compose.yml (the local stack, docs/local-stack.md)
+                            and stack-init.Dockerfile (its bootstrap)
 infra/                      CloudFormation (empty until Phase 7)
-scripts/                    fuzz, privacy and docs-link checks
+scripts/                    fuzz, privacy and docs-link checks, compose-env.sh
+tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
+tools/stack-init/           creates the local stack's tables and seeds its test subscriber
 docs/                       this file, ADRs, threat model, service docs
                             (ft-server.md, msrp-relay.md), api/ (OpenAPI)
 ```
@@ -95,10 +99,8 @@ internal/sip/transport/     UDP, TCP and TLS listeners and connection table (flo
 internal/sip/transaction/   client and server transaction state machines and timers
 internal/<service>/         pcscf/, icscf/, scscf/, hss/, rcsas/: service logic,
                             each with its own store/ and AWS backend as above
-deploy/docker-compose.yml   the full local stack
 infra/                      ecr.yaml, platform.yaml
 scripts/                    deploy.sh, teardown.sh
-tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
 docs/                       runbook, conformance, aws-deployment.md
 ```
 
@@ -203,7 +205,7 @@ through the NLB to a surviving task. Every other service is stateless apart from
 its tables.
 
 Every table has a memory backend for unit tests and local runs; the compose stack
-uses DynamoDB Local and a local S3.
+([local-stack.md](local-stack.md)) uses DynamoDB Local and S3Mock.
 
 ## 8. Cross-cutting rules
 
@@ -218,7 +220,9 @@ uses DynamoDB Local and a local S3.
   needed. No identifier is ever a metric dimension.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
-  distroless image can run an ECS container health check.
+  distroless image can run an ECS container health check. A service whose
+  start-up waits on remote services and ends at a start-up deadline (hss) sets
+  `Service.LiveAfterReady`, so that `/healthz` fails until it is ready.
 - **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
   linear in its input (a test parses a maximum-size adversarial input), and never
   repairs content it does not own: message bodies such as CPIM and MSRP payloads

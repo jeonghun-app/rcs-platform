@@ -60,6 +60,13 @@ const (
 	attrNC         = "nc"
 )
 
+// PartitionKey is the name of the table's partition key, for whoever
+// creates the table (the compose stack's stack-init; CloudFormation in AWS).
+const PartitionKey = attrPK
+
+// TTLAttribute is the name of the table's TTL attribute.
+const TTLAttribute = attrTTL
+
 func fileKey(id string) string { return "f#" + id }
 
 func tidKey(owner, tid string) string {
