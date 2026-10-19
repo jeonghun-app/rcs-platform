@@ -10,9 +10,10 @@
 // Masking is deliberately over-inclusive: any run of eight or more decimal
 // digits, in ASCII or another script, is treated as an identifier, because
 // national-format MSISDNs, IMSIs (TS 23.003 §2.2) and IMEIs (TS 23.003 §6.2)
-// are all digit runs and a false positive costs only a less useful log line. Numbers written in groups ("+1 555 010-0001",
-// "010-0000-0001") are recognised when they start with "+" or with a word-initial
-// trunk prefix such as 010; other grouped numbers are not (see numberAt).
+// are all digit runs and a false positive costs only a less useful log line.
+// Numbers written in groups ("+1 555 010-0001", "010-0000-0001") are
+// recognised when they start with "+" or with a word-initial trunk prefix
+// such as 010; other grouped numbers are not (see numberAt).
 //
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
@@ -103,11 +104,11 @@ func URI(key, v string) slog.Attr { return defaultRedactor().URI(key, v) }
 // Redactor; see [Redactor.Identity].
 func Identity(key, v string) slog.Attr { return defaultRedactor().Identity(key, v) }
 
-// URI returns a log attribute for a SIP, SIPS, tel or urn:gsma:imei URI. The
-// subscriber part is masked and the scheme, host and parameters are kept, since
-// they say which node or route was involved. A value that does not start with
-// one of those schemes is masked whole: its identifying part cannot be told apart
-// from the rest.
+// URI returns a log attribute for a SIP, SIPS, im, pres, tel or urn:gsma:imei
+// URI. The subscriber part is masked and the scheme, host and parameters are
+// kept, since they say which node or route was involved. A value that does
+// not start with one of those schemes is masked whole: its identifying part
+// cannot be told apart from the rest.
 func (r *Redactor) URI(key, v string) slog.Attr {
 	if schemeLen(v) > 0 {
 		return slog.String(key, r.Redact(v))
@@ -131,20 +132,23 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //     (07700) 900001, Tel.010-0000-0001); see [numberAt];
 //   - the subscriber of a tel URI (RFC 3966 §3), visual separators included;
 //   - the userinfo of a sip or sips URI (RFC 3261 §19.1.1), password included,
-//     and the user of an im or pres URI (RFC 3860 §3, RFC 3859 §3), as CPIM
-//     From and To carry them (RFC 3862 §3.4);
+//     and the user of an im or pres URI (RFC 3860 §3, RFC 3859 §3), quoted or
+//     not, as CPIM From and To carry them (RFC 3862 §3.4);
 //   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups.
 //
-// Digits of any script count: a run of eight or more decimal digits that has
-// some outside ASCII (full-width digits from a CJK input mode, Arabic-Indic
-// digits) is masked like the same run in ASCII, with the same hint. Numbers
-// written in groups are recognised in ASCII only.
+// Digits of any script count: every decimal digit (Unicode Nd) outside ASCII,
+// such as a full-width digit from a CJK input mode or an Arabic-Indic digit,
+// is written as the ASCII digit of the same value first, so a number in any
+// script is masked like the same number in ASCII, with the same hint. Other
+// digit-like characters (superscripts, circled digits) are not digits here,
+// and separators must be ASCII: a number grouped with full-width separators
+// ("０１０－００００－０００１") is not recognised as one (#85).
 //
 // Schemes match case-insensitively (RFC 3261 §19.1.4, RFC 3966 §3). The output
 // never contains a run of eight or more decimal digits. Redact runs in time
 // linear in len(s), because it is given attacker-controlled header values.
 func (r *Redactor) Redact(s string) string {
-	s = asciiDigitRuns(s)
+	s = asciiDigits(s)
 	var b strings.Builder
 	b.Grow(len(s))
 	// A sip or sips URI that starts before noUserBefore has no '@' before its end:
@@ -176,6 +180,11 @@ func (r *Redactor) Redact(s string) string {
 		i = start
 		switch {
 		case hasUserinfo(s[start-n : start]):
+			if at := quotedUserEnd(s, start, s[start-n:start]); at > 0 {
+				b.WriteString(r.mask(s[start+1 : at-1]))
+				i = at
+				continue
+			}
 			if start < noUserBefore {
 				continue
 			}
@@ -401,6 +410,31 @@ func schemeLen(s string) int {
 	return 0
 }
 
+// quotedUserEnd returns the index of the '@' after a quoted user that starts
+// at s[start], or -1 when there is none. Only im and pres users may be quoted:
+// RFC 3860 §3 and RFC 3859 §3 take the user from an RFC 5322 addr-spec, whose
+// local part may be a quoted string with spaces and backslash-escaped
+// characters. The scans of two such users never overlap, because a user's
+// opening quote follows the scheme's ':' and so cannot be an escaped quote
+// inside an earlier user, which keeps Redact linear.
+func quotedUserEnd(s string, start int, scheme string) int {
+	if start >= len(s) || s[start] != '"' || !strings.EqualFold(scheme, "im:") && !strings.EqualFold(scheme, "pres:") {
+		return -1
+	}
+	for j := start + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++ // the escaped character, even a quote
+		case '"':
+			if j+1 < len(s) && s[j+1] == '@' {
+				return j + 1
+			}
+			return -1
+		}
+	}
+	return -1
+}
+
 // hasUserinfo reports whether the scheme's identifier is the part before '@'
 // (sip, sips, im, pres) rather than a number (tel, urn:gsma:imei).
 func hasUserinfo(scheme string) bool {
@@ -412,12 +446,16 @@ func hasUserinfo(scheme string) bool {
 	return false
 }
 
-// asciiDigitRuns rewrites, in ASCII, every run of minRun or more decimal
-// digits that has a digit outside ASCII, so that the scan in Redact, which
-// reads ASCII digits, masks it. Shorter runs are left as they are: they are
-// not identifiers, and "２０２６年" should stay readable. Only runes are
-// replaced within a run, so text around it, valid UTF-8 or not, is kept.
-func asciiDigitRuns(s string) string {
+// asciiDigits rewrites every decimal digit outside ASCII as the ASCII digit
+// of the same value, so that the scan in Redact, which reads ASCII digits,
+// treats a number in any script as it treats the number in ASCII: runs,
+// numbers in groups and URI users alike. Rewriting only long runs would let a
+// short run sit next to a mask and form a long one with the hint ("…-２３４５６７"
+// after a tel number), and would miss full-width numbers written in ASCII
+// groups. A short number such as "２０２６年" reads the same in ASCII. Only
+// digit runes are replaced, so the text around them, valid UTF-8 or not, is
+// kept.
+func asciiDigits(s string) string {
 	if isASCII(s) {
 		return s
 	}
@@ -425,28 +463,12 @@ func asciiDigitRuns(s string) string {
 	last := 0 // s[:last] has been written
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if !unicode.IsDigit(r) {
-			i += size
-			continue
-		}
-		start, count, wide := i, 0, false
-		for i < len(s) {
-			r, size = utf8.DecodeRuneInString(s[i:])
-			if !unicode.IsDigit(r) {
-				break
-			}
-			count++
-			wide = wide || r >= utf8.RuneSelf
-			i += size
-		}
-		if count < minRun || !wide {
-			continue
-		}
-		b.WriteString(s[last:start])
-		for _, r := range s[start:i] {
+		if r >= utf8.RuneSelf && unicode.IsDigit(r) {
+			b.WriteString(s[last:i])
 			b.WriteByte(asciiDigit(r))
+			last = i + size
 		}
-		last = i
+		i += size
 	}
 	if last == 0 {
 		return s

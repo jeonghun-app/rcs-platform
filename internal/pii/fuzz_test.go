@@ -8,9 +8,10 @@ import (
 	"unicode/utf8"
 )
 
-// FuzzRedact checks the guarantee services rely on: whatever the input, keyed or
-// not, the output has no run of minRun or more decimal digits of any script and no number written in
-// groups that Redact promises to mask, and valid UTF-8 stays valid. The grouped
+// FuzzRedact checks the guarantee services rely on: whatever the input, keyed
+// or not, the output has no run of minRun or more decimal digits of any
+// script and no number written in groups, in any script's digits, that
+// Redact promises to mask, and valid UTF-8 stays valid. The grouped
 // rules are restated here independently of numberAt: a national number is any
 // group of two or more digits starting with 0, not preceded by a letter or
 // digit, followed by eight digits in total. The one documented exception is
@@ -73,6 +74,12 @@ func FuzzRedact(f *testing.F) {
 		"pres:" + testMSISDN + "@" + testDomain,
 		"msisdn=１５５５０１００００１ ２０２６年",
 		"imsi ٠٠١٠١٠٠٠٠٠٠٠٠٠١ 1555０１００\xff００1",
+		"tel:+15550100001-２３４５６７",
+		"0000000 0０１0000",
+		"urn:gsma:imei:00101000-１７６１４８-１",
+		"０１０-００００-０００１ +１ ５５５ ０１００ ００１",
+		`From: <im:"bob smith"@` + testDomain + `> pres:"a \"" im:"x`,
+		`im:"` + testMSISDN + `"@` + testDomain,
 	} {
 		f.Add(s, false)
 		f.Add(s, true)
@@ -92,10 +99,12 @@ func FuzzRedact(f *testing.F) {
 			if run := longestDigitRun(a); run >= minRun {
 				t.Fatalf("redacting %q gave %q, which keeps a %d-digit run", s, a, run)
 			}
-			if m := groupedInternational.FindString(a); m != "" {
+			// The grouped rules read ASCII digits; a number in another
+			// script's digits must be masked as well.
+			if m := groupedInternational.FindString(asciiDigits(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
-			if m := nationalNumberIn(a); m != "" {
+			if m := nationalNumberIn(asciiDigits(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
 		}

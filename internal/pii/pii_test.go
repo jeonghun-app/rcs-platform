@@ -337,7 +337,7 @@ func hintOf(t *testing.T, redacted string) string {
 // milliseconds, so a regression shows up as a test timeout, not a flaky timing.
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
-	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1"} {
+	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
@@ -355,6 +355,14 @@ func TestRedactMasksTheUserOfImAndPresURIs(t *testing.T) {
 		{"IM:carol.jones@" + testDomain, "IM:***es@" + testDomain},
 		{"Pres:" + testMSISDN + "@" + testDomain, "Pres:***01@" + testDomain},
 		{"im:conference-factory", "im:conference-factory"},
+		// RFC 3860 §3: the user is an RFC 5322 local part, which may be a
+		// quoted string with spaces and escaped quotes.
+		{`From: <im:"bob smith"@` + testDomain + ">", "From: <im:***th@" + testDomain + ">"},
+		{`pres:"a \"b\" c"@` + testDomain, "pres:***@" + testDomain},
+		{`im:"` + testMSISDN + `"@` + testDomain, "im:***01@" + testDomain},
+		// A quoted string not followed by '@' is not a user.
+		{`im:"bob smith" said`, `im:"bob smith" said`},
+		{`sip:"bob smith"@` + testDomain, `sip:"bob smith"@` + testDomain},
 	} {
 		if got := r.Redact(tt.in); got != tt.want {
 			t.Errorf("Redact(%q)\n got %q\nwant %q", tt.in, got, tt.want)
@@ -376,7 +384,16 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 		{"ASCII and full-width mixed", "id 1555０１０0003 seen", "id ***03 seen"},
 		{"Arabic-Indic IMSI", "imsi ٠٠١٠١٠٠٠٠٠٠٠٠٠١", "imsi ***01"},
 		{"Extended Arabic-Indic digits", "شماره ۱۵۵۵۰۱۰۰۰۰۴", "شماره ***04"},
-		{"short full-width numbers are kept", "２０２６年１０月", "２０２６年１０月"},
+		{"short full-width numbers read the same in ASCII", "２０２６年１０月", "2026年10月"},
+		{"eight full-width digits are a run", "２０２６１０１９", "***19"},
+		{"seven full-width digits are not", "２０２６１０１", "2026101"},
+		{"full-width trunk number with ASCII hyphens", "０１０-１２３４-５６７８", "***78"},
+		{"ASCII trunk prefix and full-width groups", "010-１２３４-５６７８", "***78"},
+		{"a short run after a tel number", "tel:+15550100001-２３４５６７", "tel:+***67"},
+		{"a short run after a digit run", "0000000 0０１0000", "***00"},
+		{"full-width IMEI groups", "urn:gsma:imei:00101000-１７６１４８-１", "urn:gsma:imei:***81"},
+		{"full-width national number in ASCII groups", "call ０１０-００００-０００１", "call ***01"},
+		{"full-width international number in ASCII groups", "call +１ ５５５ ０１００ ００１", "call +***01"},
 		{"full-width inside a sip URI user", "sip:１５５５０１００００１@" + testDomain, "sip:***01@" + testDomain},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
