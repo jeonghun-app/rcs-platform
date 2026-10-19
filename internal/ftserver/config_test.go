@@ -152,7 +152,7 @@ func TestProductionRefusesEveryUnsafeSetting(t *testing.T) {
 }
 
 func TestProductionRefusesPlainHTTPToTheHSS(t *testing.T) {
-	_, out := runService(t, with(devEnv, "RCS_ENV", "prod", "FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss:8080", "FT_HSS_TOKEN", "t"))
+	_, out := runService(t, with(devEnv, "RCS_ENV", "prod", "FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss:8081", "FT_HSS_TOKEN", "t"))
 	if !strings.Contains(out, "FT_HSS_URL is http to a host that is not private") {
 		t.Fatalf("output:\n%s", out)
 	}
@@ -183,7 +183,7 @@ func TestPlainHTTPToTheHSSIsAllowedOnlyForPrivateHosts(t *testing.T) {
 		t.Error("a name is private without a namespace")
 	}
 	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCS_SERVICE_NAMESPACE", "rcs.local",
-		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss.rcs.local:8080", "FT_HSS_TOKEN", strings.Repeat("t", 43), "FT_STATIC_USERS", "")
+		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss.rcs.local:8081", "FT_HSS_TOKEN", strings.Repeat("t", 43), "FT_STATIC_USERS", "")
 	if _, out := runService(t, prod); strings.Contains(out, "FT_HSS_URL") {
 		t.Fatalf("http to the Cloud Map name was refused:\n%s", out)
 	}

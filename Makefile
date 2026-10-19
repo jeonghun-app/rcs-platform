@@ -77,12 +77,14 @@ test: volumes ## Unit tests with coverage summary
 race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
-# The storage backends (internal/ftserver/awsstore,
-# internal/msrprelay/dynamostore, internal/rcsas/awsstore) against an
-# S3-compatible container and DynamoDB Local on a private network. Names carry
-# the shell's PID so parallel runs on one host do not meet; the trap removes
-# everything however the run ends. Not part of `check`: it pulls two images
-# and starts two JVMs.
+# The storage backends against an S3-compatible container and DynamoDB Local
+# on a private network: ft-server's (internal/ftserver/awsstore), msrp-relay's
+# (internal/msrprelay/dynamostore), the HSS's (internal/hss/awsstore, and
+# two HSS tasks issuing AKA vectors at once) and rcs-as's
+# (internal/rcsas/awsstore, and two rcs-as tasks sharing one queue). Names
+# carry the shell's PID so parallel runs on one host do not meet; the trap
+# removes everything however the run ends. Not part of `check`: it pulls two
+# images and starts two JVMs.
 .PHONY: test-integration
 test-integration: volumes ## Storage backends against S3 and DynamoDB containers
 	@set -eu; id=rcs-platform-it-$$$$; \
@@ -92,14 +94,14 @@ test-integration: volumes ## Storage backends against S3 and DynamoDB containers
 	$(DOCKER) run -d --rm --name "$$id-ddb" --network "$$id" $(DDBLOCAL_IMAGE) >/dev/null; \
 	$(RUNGO) --network "$$id" \
 	  -e FT_IT_S3_ENDPOINT="http://$$id-s3:9090" -e FT_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
-	  -e RELAY_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
+	  -e RELAY_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" -e HSS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
 	  -e RCSAS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
 	  -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=local -e AWS_SECRET_ACCESS_KEY=local \
 	  $(GOIMAGE) sh -c 'for url in "$$FT_IT_S3_ENDPOINT" "$$FT_IT_DYNAMODB_ENDPOINT"; do \
 	      n=0; until wget -S -O /dev/null "$$url/" 2>&1 | grep -q "HTTP/"; do \
 	        n=$$((n + 1)); [ "$$n" -lt 120 ] || { echo "$$url did not start" >&2; exit 1; }; sleep 1; done; \
 	    done; \
-	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/rcsas/...'
+	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/hss/... ./internal/rcsas/...'
 
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz
