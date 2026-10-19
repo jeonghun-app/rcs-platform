@@ -10,7 +10,9 @@
 // adds on top: the registration with its +sip.instance and reg-id (RFC 5626
 // §4.2) and its challenges (RFC 3310, RFC 7616, TS 24.229 §5.1.1.2), the
 // route set every later request is sent with (RFC 3608, TS 24.229
-// §5.1.2A.1.1), and the timing of the keep-alive pongs (RFC 5626 §4.4.1).
+// §5.1.2A.1.1), the timing of the keep-alive pongs (RFC 5626 §4.4.1), and
+// the caller's side of an INVITE dialog (RFC 3261 §12–15): ACK, CANCEL,
+// BYE, and refusing a re-INVITE.
 //
 // A failed flow is not recovered: the UA reports it and stops, and a
 // scenario that wants to go on dials a new one.
@@ -209,6 +211,8 @@ type UA struct {
 	err                   error
 	done                  chan struct{}
 	closeOnce             sync.Once
+	// dialogs are the INVITE dialogs in progress, by dialogKey.
+	dialogs map[string]*Dialog
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -244,11 +248,12 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		return nil, fmt.Errorf("sipua: connecting: %w", safeerr.Reason(err))
 	}
 	ua := &UA{
-		cfg:    cfg,
-		ids:    sip.IDGenerator{Rand: cfg.Rand},
-		dialer: &oneConn{c: c},
-		done:   make(chan struct{}),
-		dst:    transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
+		cfg:     cfg,
+		ids:     sip.IDGenerator{Rand: cfg.Rand},
+		dialer:  &oneConn{c: c},
+		done:    make(chan struct{}),
+		dialogs: map[string]*Dialog{},
+		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
 		ap := la.AddrPort()
@@ -279,6 +284,9 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 	ua.layer = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock})
 	return ua, nil
 }
+
+// Validate reports what Dial would refuse in c, without dialing.
+func (c Config) Validate() error { return c.validate() }
 
 func (c Config) validate() error {
 	switch {
@@ -315,6 +323,11 @@ func (ua *UA) buildAddresses() error {
 	ua.contact.URI.Params.Set("transport", tp)
 	ua.contact.Params.Set("+sip.instance", "<"+ua.cfg.InstanceID+">")
 	ua.contact.Params.Set("reg-id", strconv.FormatUint(uint64(ua.cfg.RegID), 10))
+	// The RCS services the client registers for (RCC.07, TS 24.229
+	// §5.1.1.2.1): 1-to-1 chat, standalone messaging, file transfer over
+	// HTTP.
+	ua.contact.Params.Set("+g.3gpp.icsi-ref", strings.Join([]string{ICSIChat, ICSIStandalone, ICSIStandaloneLarge}, ","))
+	ua.contact.Params.Set("+g.3gpp.iari-ref", IARIFileTransfer)
 
 	// TS 24.229 §5.1.2A.1.1 puts the P-CSCF's IP address in this Route, and
 	// its NOTE 15 has a UE resolve an FQDN from discovery first. Clients
@@ -581,8 +594,10 @@ func (ua *UA) isOurs(c sip.Contact) bool {
 
 // NewRequest returns a request outside any dialog, from the IMPU to target,
 // with the route set of TS 24.229 §5.1.2A.1.1: the P-CSCF, then the
-// Service-Route. The caller adds what the method needs and sends it with
-// Send.
+// Service-Route, and the IMPU as P-Preferred-Identity (§5.1.2A.1.1, RFC
+// 3325 §9.2), which the P-CSCF checks against the registered set before
+// asserting it. The caller adds what the method needs and sends it with
+// Send, or for INVITE uses NewInvite and Invite.
 func (ua *UA) NewRequest(method string, target sip.URI) (*sip.Request, error) {
 	ua.mu.Lock()
 	registered, route := ua.registered, ua.serviceRoute
@@ -606,6 +621,7 @@ func (ua *UA) NewRequest(method string, target sip.URI) (*sip.Request, error) {
 	for _, r := range route {
 		add(req, &err, "Route", r.String())
 	}
+	add(req, &err, "P-Preferred-Identity", sip.Address{URI: ua.cfg.IMPU}.String())
 	if err != nil {
 		return nil, err
 	}
@@ -649,21 +665,16 @@ var errInvalidField = errors.New("invalid value")
 
 // Send sends a request built by NewRequest, or by the UA itself, in a client
 // transaction and returns its final response, whatever the status.
-// Provisional responses are passed over. INVITE is not sent here: it needs
-// the dialog handling, ACK included, that this package does not have yet.
+// Provisional responses are passed over. An INVITE goes through Invite,
+// which keeps its dialog, and an ACK is never a transaction.
 func (ua *UA) Send(ctx context.Context, req *sip.Request) (*sip.Response, error) {
 	if req.Method == "INVITE" || req.Method == "ACK" {
-		return nil, errors.New("sipua: Send does not handle INVITE dialogs")
+		return nil, errors.New("sipua: an INVITE is sent with Invite, an ACK by the dialog")
 	}
 	if err := ua.Err(); err != nil {
 		return nil, err
 	}
-	dst := ua.dst
-	ua.mu.Lock()
-	if ua.flow != "" {
-		dst = transport.Destination{Flow: ua.flow}
-	}
-	ua.mu.Unlock()
+	dst := ua.destination()
 
 	final := make(chan result, 1)
 	tx, err := ua.layer.Request(req, dst, func(res *sip.Response, err error) {
@@ -696,6 +707,17 @@ func (ua *UA) Send(ctx context.Context, req *sip.Request) (*sip.Response, error)
 type result struct {
 	res *sip.Response
 	err error
+}
+
+// destination is where every request goes: the flow once it is known, the
+// P-CSCF's address before (the one connection either way).
+func (ua *UA) destination() transport.Destination {
+	ua.mu.Lock()
+	defer ua.mu.Unlock()
+	if ua.flow != "" {
+		return transport.Destination{Flow: ua.flow}
+	}
+	return ua.dst
 }
 
 // sendError reduces what the transport and transaction layers report. A
@@ -836,20 +858,36 @@ func orDefault(d, fallback time.Duration) time.Duration {
 type tu struct{ ua *UA }
 
 func (t tu) Request(tx *transaction.ServerTransaction) {
+	if d := t.ua.dialogOf(tx.Request()); d != nil {
+		d.receive(tx)
+		return
+	}
 	if t.ua.cfg.OnRequest != nil {
 		t.ua.cfg.OnRequest(tx)
 		return
 	}
+	// A request with a To tag belongs to a dialog; one this UA does not
+	// know, or no longer, is 481 (RFC 3261 §12.2.2). Anything else it
+	// does not handle is 501.
+	code := 501
+	if to, err := tx.Request().Header.To(); err == nil && to.Tag() != "" {
+		code = 481
+	}
 	if tag, err := t.ua.ids.Tag(); err == nil {
-		if res, err := sip.NewResponse(tx.Request(), 501, "", tag); err == nil {
+		if res, err := sip.NewResponse(tx.Request(), code, "", tag); err == nil {
 			tx.Respond(res)
 		}
 	}
 }
 
-// Stray drops what matches no transaction: a retransmitted 2xx or an ACK,
-// neither of which a UA without INVITE dialogs expects.
-func (tu) Stray(transport.Inbound) {}
+// Stray takes what matches no transaction. A 2xx to an INVITE whose
+// transaction has ended is a retransmission whose ACK was lost, and is
+// ACKed again (RFC 3261 §13.2.2.4); anything else is dropped.
+func (t tu) Stray(in transport.Inbound) {
+	if res, ok := in.Message.(*sip.Response); ok {
+		t.ua.strayResponse(res)
+	}
+}
 
 // ServerFailed has nothing to undo: the UA keeps no state for a request it
 // answered.

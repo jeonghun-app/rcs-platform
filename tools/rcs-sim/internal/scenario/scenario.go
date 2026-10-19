@@ -25,6 +25,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // Config is what the scenarios run against.
@@ -54,6 +55,10 @@ type Config struct {
 
 	// Self is the simulated client and Peer the far end of its chats.
 	Self, Peer cpim.Address
+
+	// SIP configures the SIP client the scenarios of #135 register with;
+	// none uses it yet, as they need pcscf and scscf.
+	SIP *sipua.Config
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
