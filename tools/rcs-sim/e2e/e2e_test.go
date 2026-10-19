@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
 )
 
 // The stack's test identities: an IMPI of the MCC 001 test network (on the
@@ -44,7 +46,10 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		"FT_SWEEP_INTERVAL": "1h",
 	})
 
-	public, control, relayAdmin, core := freePort(t), freePort(t), freePort(t), freePort(t)
+	public, control, relayAdmin := freePort(t), freePort(t), freePort(t)
+	// rcs-sim's rcs-as stand-in listens here, below the ephemeral range,
+	// where no outgoing connection or freePort can take it (#133).
+	core := strconv.Itoa(simtest.StandInPort(t))
 	start(t, bin, "msrp-relay", relayAdmin, map[string]string{
 		"RELAY_LISTEN_ADDR":   "127.0.0.1:" + public,
 		"RELAY_CONTROL_ADDR":  "127.0.0.1:" + control,
