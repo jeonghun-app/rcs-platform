@@ -2,8 +2,9 @@
 
 `rcs-as` is the RCS messaging application server
 ([architecture](architecture.md) §2). This document describes its messaging
-core: how 1-to-1 chat and standalone messages are accepted, stored, delivered
-and answered with disposition notifications (IMDN, RFC 5438). The SIP side
+core: how 1-to-1 chat, group chat and standalone messages are accepted,
+stored, delivered and answered with disposition notifications (IMDN, RFC
+5438), and how group chats are run ([Group chat](#group-chat)). The SIP side
 (INVITE and MESSAGE handling, SDP, the third-party REGISTER from `scscf`) is a
 later issue. The core is driven through interfaces so that it can be built and
 tested first.
@@ -13,7 +14,11 @@ The code:
 - `internal/rcsas/messaging`: the engine. It has no SIP and no AWS code.
 - `internal/rcsas/store`: the `Store` interface, the memory backend and the
   contract test (`storetest`) that every backend passes.
-- `internal/rcsas/awsstore`: the DynamoDB backend.
+- `internal/rcsas/group`: the group chat focus: rules, rosters, and who a
+  group message goes to. No SIP code either.
+- `internal/rcsas/groupstore`: the groups' `Store` interface, memory backend
+  and contract test.
+- `internal/rcsas/awsstore`: the DynamoDB backends of both.
 - `internal/rcsas`: the `RCSAS_` settings.
 
 ## How the SIP layer drives the engine
@@ -257,6 +262,114 @@ expired after `RCSAS_STORE_TTL` and gives up on them.
 - **Partial reads.** A read that fails part-way still hands over what it
   found.
 
+## Group chat
+
+`rcs-as` is the controlling function of RCC.07 Group Chat: a conference focus
+that the conference factory URI reaches. Each group has a conference URI of its
+own, `sip:chat-<128 random bits>@RCSAS_CONFERENCE_HOST`, and every participant
+has a session with it: a leg of mode `group` whose peer is that URI.
+
+### How the SIP layer drives it
+
+| SIP event | Call |
+|---|---|
+| An INVITE to the conference factory, with a resource list | `group.Service.Create` (the creator is joined; the invitees are invited, and the SIP layer invites them) |
+| A participant's session with the group is set up (its INVITE, or its answer to the focus's) | `Join`, then `OpenLeg` / `Offer` and `Leg.Answer` with `Mode: store.Group` and the conference URI as `Peer` |
+| A BYE on that session | `Leave`, and `Leg.Close` |
+| A REFER adding someone | `Add` |
+| A REFER with `method=BYE` removing someone | `Remove` |
+| A SUBSCRIBE to the conference event package | `Roster`: the full document for the first NOTIFY |
+| `Notifier.RosterChanged` | a NOTIFY with the document to each subscription |
+| `Deliverer.Invite` with `Mode: store.Group` | an INVITE that brings the participant back into the group |
+
+### Rules
+
+These are this implementation's reading of RCC.07 Group Chat and OMA CPM
+group sessions. They have not been checked against the licensed texts.
+
+| Operation | Who may | Conditions |
+|---|---|---|
+| Create | anyone | 1 to `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 others; the creator becomes chairman, joined; rate per creator, and the invitees count toward its add rate |
+| Join | a current (invited or joined) participant | someone who left or was removed must be added again; a joined participant joining again only updates its name, at its group rate |
+| Leave | a current participant | the chairman's role passes to the joined participant longest in the group, else the longest-invited one; the last one out ends the group |
+| Add | a joined participant | within the size limit, at its add rate; current participants are left alone, former ones invited again |
+| Remove | the chairman | not itself (that is Leave); the target must be current |
+| Write | a joined participant | at `RCSAS_GROUP_SENDER_RATE` per group, within the group's fan-out budget |
+| Read the roster | a current participant | |
+
+Identities are at most 256 bytes; names, the subject and the Conversation-ID
+are at most 256 bytes each.
+
+### Fan-out
+
+A message a joined participant writes goes through the same pipeline as 1-to-1
+chat (size, CPIM parse, `From` check, per-sender rate). Then:
+
+- **Rate and budget.** The group applies the sender's rate in this group and
+  the group's fan-out budget, which counts one delivery per recipient.
+- **CPIM rewrite.** rcs-as rewrites `From` to the sender's asserted identity
+  (keeping its display name) and `To` to the group, then queues one copy for
+  every other current participant, invited ones included:
+  - each copy has `Sender` = the group and `Author` = the writer;
+  - each recipient's queue is bounded as in 1-to-1 chat, and the group holds
+    at most a share of it like any sender;
+  - a full queue costs that recipient the copy, with the negative delivery
+    notification if the author asked for one, and nobody else anything.
+- **Delivery.** Each copy goes on the recipient's own session with the group,
+  by its own worker:
+  - a slow participant holds up its own queue only;
+  - an absent one has its copy kept while the engine asks the SIP layer to
+    bring it back (`Invite`, mode `group`);
+  - pager mode is never used, since a client cannot place a group message
+    that arrives outside the group.
+- **Is-composing.** Indications go to the joined participants' open sessions
+  on this task, unstored, with `From` rewritten. rcsjta sends them wrapped in
+  CPIM in a group; a bare one is wrapped.
+
+### Notifications in a group
+
+Each participant's delivery and display notifications are forwarded to the
+author one by one, in the author's session with the group. They are not
+aggregated: RFC 5438 §8.3 aggregation is optional and `internal/imdn` does not
+decode it.
+
+A notification is accepted only when all of these hold:
+
+- the group's record of the message exists. Records are keyed by the group and
+  the Message-ID, so the To a notifier's client writes, in whatever form it
+  knows the author, does not matter;
+- the notifier is one of the participants the message went to;
+- the author asked for that kind;
+- it is the first of its kind from that notifier.
+
+Its `From` is rewritten to the notifier's asserted identity. Notifications
+rcs-as generates (expiry, full queue) go to the author the same way, from the
+recipient.
+
+### Roster events
+
+The roster is a conference-info document (RFC 4575, `internal/conference`)
+with one user per participant, current or former, and one endpoint each:
+
+| Participant | Endpoint status | Disconnection method |
+|---|---|---|
+| invited | `dialing-out` | |
+| joined | `connected` | |
+| left | `disconnected` | `departed` |
+| removed | `disconnected` | `booted` |
+
+The roles are `chairman` and `participant`. Creating a group produces a full
+document at version 1. Every change after that writes the group conditionally
+on the revision it was computed from (`groupstore.Store.Update`) and raises the
+version by exactly one. Two tasks changing one group therefore never lose a
+change and never reuse a version.
+
+Each change is sent as a partial document: `<users state="partial">` with each
+changed user whole (`state="full"`), which RFC 4575 §4.6 merges by entity.
+Versions count per group across tasks, so a subscription that misses one sees
+the gap and refreshes for a full document. A task that stops between writing a
+change and notifying it leaves exactly such a gap.
+
 ## Settings
 
 Shared `RCS_` settings are described in `internal/runtime`. The `RCSAS_`
@@ -288,6 +401,16 @@ settings:
 | `RCSAS_RETRY_INTERVAL`, `RCSAS_MAX_RETRY_INTERVAL` | `1m`, `1h` | First and longest wait before a held queue is read again |
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
+| `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as` |
+| `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
+| `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group |
+| `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
+| `RCSAS_GROUP_SENDER_RATE`, `RCSAS_GROUP_SENDER_BURST` | `60`, `30` | Messages per minute one participant writes in one group, per task; also renames |
+| `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. The burst must cover a full group |
+| `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` | Participants one user adds per minute, in groups it creates too |
+| `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
+
+A rate of `0` turns that limit off.
 
 Durations use Go syntax (`168h`, not `7d`).
 
@@ -372,6 +495,32 @@ needed.
 also runs two engines that share one table and must deliver each message
 once.
 
+## DynamoDB `groupchats` table
+
+The `groupchats` table has the same key schema as `messages` (`pk`, `sk`,
+TTL attribute `ttl`) and no index. Each group is one item:
+
+| `pk` | `sk` |
+|---|---|
+| `g#<len>#<conference URI>` | `group` |
+
+- **Contents.** The item holds the subject, creator, Conversation-ID, roster
+  version, times and the participants as a list. A group of 100 is about 15
+  KB, and the item limit is 400 KB.
+- **Writes.** Every change rewrites the item on the condition that its `rev`
+  is the one the change was computed from. A token (`wtoken`) tells a repeat
+  of the write from another writer's; `Create` uses one too.
+- **Touch.** At most once an hour per task, a group in use has its `active`,
+  `expires` and `ttl` moved forward, without changing `rev`.
+- **Expiry.** `ttl` is the group's expiry plus a day; every read checks the
+  expiry itself.
+- **IAM.** The task role needs `GetItem`, `PutItem`, `UpdateItem` and
+  `DescribeTable` on the table.
+
+Each group message costs one strongly consistent read of the group item and,
+per recipient, the enqueue transaction of the `messages` table. The fan-out
+budget bounds that per group.
+
 ## Metrics and logs
 
 Counts are written as CloudWatch EMF. The only dimension is `Service`, and no
@@ -395,6 +544,9 @@ identifier ever appears in a metric name.
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
+| `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
+| `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
+| `group.message.accepted`, `group.notification.accepted`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout_budget_exceeded` | Group messages |
 
 Logs never carry message content. Identities appear only through
 `internal/pii`. MSRP session ids never appear: they are capabilities ([threat
@@ -413,6 +565,8 @@ Signals to alarm on (Phase 7):
 | `message.expired` rising | Recipients unreachable for `RCSAS_STORE_TTL` |
 | `msrp.accept_failed` > 0 | The MSRP listener ran out of file descriptors or the like |
 | `invite.untracked` > 0 | More pending invitations than a task tracks (100 000); messages wait for the retry timer instead of an invitation |
+| `group.fanout_budget_exceeded` sustained | A group writing beyond its budget: a flood, or the budget is too small for real groups |
+| `group.rejected.rate_limited` sustained | Users creating groups or adding people faster than allowed: mass-add spam |
 
 ## Assumptions and limitations
 
@@ -445,9 +599,20 @@ Signals to alarm on (Phase 7):
 - **The queue size is kept by rcs-as.** A queue item that DynamoDB's TTL
   deletes, because no sweep reached it, still counts until the next refusal
   recounts the queue.
+- **Group delivery is per task like 1-to-1 chat.** A participant's session
+  with a group lives on the task its SIP dialog names. Is-composing reaches
+  only participants on the same task. The delivery workers are shared, so
+  more slow participants than `Workers` (32) at once slow everyone, by up to
+  `RCSAS_DELIVERY_TIMEOUT` each.
+- **Leaving keeps what was queued.** Messages queued for a participant before
+  it left or was removed are still delivered while its session lasts. The SIP
+  layer ends that session.
+- **Group rates are per task**, like the 1-to-1 ones.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;
   - the IMDN behaviour of chat sessions;
-  - is-composing outside CPIM;
-  - one message per large-mode session.
+  - is-composing outside CPIM in 1-to-1 chat, and inside CPIM in a group;
+  - one message per large-mode session;
+  - the group rules above, and the author taken from a group message's CPIM
+    `From`.

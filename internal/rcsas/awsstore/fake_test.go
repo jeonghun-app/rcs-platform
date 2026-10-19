@@ -78,11 +78,17 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 	}
 	k := rowKey(in.Item)
 	old, exists := f.rows[k]
-	if aws.ToString(in.ConditionExpression) != "attribute_not_exists(#pk) OR #expires <= :now" {
-		f.t.Errorf("PutItem condition %q", aws.ToString(in.ConditionExpression))
-	}
-	if exists && nOf(old[attrExpires]) > nOf(in.ExpressionAttributeValues[":now"]) {
-		return nil, errCondition
+	switch cond := aws.ToString(in.ConditionExpression); cond {
+	case "attribute_not_exists(#pk) OR #expires <= :now":
+		if exists && nOf(old[attrExpires]) > nOf(in.ExpressionAttributeValues[":now"]) {
+			return nil, errCondition
+		}
+	case "#rev = :rev":
+		if !exists || nOf(old[attrRev]) != nOf(in.ExpressionAttributeValues[":rev"]) {
+			return nil, errCondition
+		}
+	default:
+		f.t.Errorf("PutItem condition %q", cond)
 	}
 	f.rows[k] = maps.Clone(in.Item)
 	return &dynamodb.PutItemOutput{}, nil
@@ -154,6 +160,14 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 			f.rows[k] = row
 		}
 		row[attrRecounted] = vals[":now"]
+		return &dynamodb.UpdateItemOutput{}, nil
+	case cond == "attribute_exists(#pk) AND #expires > :active AND #active < :active AND #expires < :expires" &&
+		upd == "SET #active = :active, #expires = :expires, #ttl = :ttl":
+		if !exists || nOf(row[attrExpires]) <= nOf(vals[":active"]) || nOf(row[attrActive]) >= nOf(vals[":active"]) ||
+			nOf(row[attrExpires]) >= nOf(vals[":expires"]) {
+			return nil, errCondition
+		}
+		row[attrActive], row[attrExpires], row[attrTTL] = vals[":active"], vals[":expires"], vals[":ttl"]
 		return &dynamodb.UpdateItemOutput{}, nil
 	case cond == "#count = :wasCount AND #bytes = :wasBytes" && upd == "SET #count = :count, #bytes = :bytes":
 		if !exists || nOf(row[attrCount]) != nOf(vals[":wasCount"]) || nOf(row[attrBytes]) != nOf(vals[":wasBytes"]) {

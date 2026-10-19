@@ -173,3 +173,45 @@ metadata.
 
 **Status:** implemented in `internal/rcsas` (#59). The SIP-layer contracts
 (`Delivery.Route`, `Delivery.SenderName`) apply when the SIP layer is built.
+
+## T11 — Forged roster changes and mass-add spam in group chats
+
+`rcs-as` runs group chats ([rcs-as](rcs-as.md#group-chat)). A subscriber could:
+
+- remove or add others in a group it is not in, or as an ordinary participant
+  remove others;
+- read a group's roster without being in it;
+- write as someone else in a group;
+- put strangers in groups (spam), or flood a group so that every participant's
+  device and queue fills.
+
+**Control:**
+
+- **Authorisation.** Every operation is checked against the stored roster:
+  - only joined participants add, and only the chairman removes;
+  - someone who left or was removed returns only when added again;
+  - only current participants read the roster;
+  - only joined participants write.
+
+  Who asks is the identity the network asserted (T2). Every change is a
+  conditional write on the revision it was computed from, so no concurrent
+  change is lost or reordered.
+- **Authorship.** A group message's CPIM `From` is rewritten to the writer's
+  asserted identity, so nobody writes as someone else.
+- **Notifications.** They are matched by the group's own record of the
+  message, accepted only from participants it went to, once per kind.
+- **Floods and spam.** These are bounded:
+  - group size (`RCSAS_GROUP_MAX_PARTICIPANTS`);
+  - per user, groups created and participants added per minute;
+  - per participant and group, messages and renames per minute;
+  - per group, a fan-out budget of deliveries per minute;
+  - each recipient's queue as in 1-to-1 chat, with a group holding at most a
+    sender's share;
+  - names, subject and Conversation-ID, 256 bytes each.
+- **Metrics.** None names a group or a participant.
+
+**Status:** implemented in `internal/rcsas/group` (#108). The SIP layer must:
+
+- pass asserted identities;
+- send roster NOTIFYs only to subscriptions `Roster` accepted;
+- end the session of a participant who leaves or is removed.
