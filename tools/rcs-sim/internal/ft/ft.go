@@ -452,6 +452,11 @@ func (c *Client) UploadInfo(ctx context.Context, tid string) (ResumeDocument, er
 // ErrNothingHeld is get_upload_info's 404: start the upload again.
 var ErrNothingHeld = errors.New("ft: the server holds nothing of the upload")
 
+// ErrNotSettled is SettledUploadInfo's answer when the bytes held were still
+// changing as its time ran out: the server is still storing the broken
+// upload, and a resume now would likely get 409 or 503.
+var ErrNotSettled = errors.New("ft: the server is still storing the broken upload")
+
 // Settled says how SettledUploadInfo got its answer: how often it asked
 // again, and how many answers were 404.
 type Settled struct {
@@ -464,8 +469,11 @@ type Settled struct {
 // stored what it keeps and released the upload. So this asks every poll
 // until the same bytes held have been reported for at least quiet: two
 // answers in a row can agree while the server still holds the upload, and
-// a resume then gets 503. A 404 is asked again until within has passed, and
-// then returned as ErrNothingHeld.
+// a resume then gets 503. The quiet time runs from the request that first
+// got the value to the request that gets it again, so it is time the server
+// held the value, however slowly the answers came. A 404 is asked again until
+// within has passed, and then returned as ErrNothingHeld. Bytes held that are
+// still changing when within has passed are returned with ErrNotSettled.
 //
 // Nothing the server sends says the upload is released: its lease lasts
 // minutes when the process holding it dies, and ft-server's upload-info
@@ -477,6 +485,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 	last := int64(-1)
 	var since time.Time
 	for {
+		asked := time.Now()
 		info, err := c.UploadInfo(ctx, tid)
 		held := int64(-1)
 		switch {
@@ -486,14 +495,17 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 			return info, st, err
 		default:
 			held, _ = info.Held()
-			if held == last && time.Since(since) >= quiet {
+			if held == last && asked.Sub(since) >= quiet {
 				return info, st, nil
 			}
 		}
 		if held != last {
-			last, since = held, time.Now()
+			last, since = held, asked
 		}
 		if time.Now().After(deadline) {
+			if err == nil {
+				err = ErrNotSettled
+			}
 			return info, st, err
 		}
 		if err := sleep(ctx, poll); err != nil {
