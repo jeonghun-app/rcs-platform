@@ -98,6 +98,10 @@ func Bridge(edge, core *Session) error {
 	if edge.handler != nil || core.handler != nil {
 		return errors.New("msrp: a bridged session must not have a Handler")
 	}
+	if edge.Remote() == nil || core.Remote() == nil {
+		// A relay forwards to the peer's path from the first request on.
+		return errors.New("msrp: a bridged session needs its remote path")
+	}
 	// Bridge is the only place that holds two session locks; serialising
 	// it rules out two calls taking them in opposite orders.
 	bridgeMu.Lock()

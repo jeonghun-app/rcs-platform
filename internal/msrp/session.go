@@ -95,6 +95,12 @@ type SessionConfig struct {
 	Local URI
 	// Remote is the peer's a=path, the To-Path of requests sent.
 	Remote []URI
+	// RemoteLater lets Remote be empty until SetRemote, for a passive
+	// session offered before the answer naming the peer's path arrives:
+	// the peer may connect and bind first (rcs-as offering a session
+	// through msrp-relay, ADR 0004). The session receives meanwhile; Send
+	// and keep-alives wait for the path.
+	RemoteLater bool
 	// Handler receives messages and reports. A session given to Bridge has
 	// none.
 	Handler Handler
@@ -108,10 +114,13 @@ type SessionConfig struct {
 // whole life (§5.4); when the connection fails the session fails with it,
 // and a replacement needs a new SDP exchange.
 type Session struct {
-	local   URI
-	remote  []URI
-	handler Handler
-	accept  []string
+	local URI
+	// remote is written once, under mu and before remoteSet is closed, and
+	// read only after that or under mu.
+	remote    []URI
+	remoteSet chan struct{}
+	handler   Handler
+	accept    []string
 
 	// reasm and budget are set when the session is bound; budget has the
 	// connection's as its Parent.
@@ -164,7 +173,7 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 	if cfg.Local.SessionID == "" || !cfg.Local.valid() {
 		return nil, errors.New("msrp: a session needs a local URI with a session-id")
 	}
-	if len(cfg.Remote) == 0 {
+	if len(cfg.Remote) == 0 && !cfg.RemoteLater {
 		return nil, errors.New("msrp: a session needs the remote path")
 	}
 	for _, u := range cfg.Remote {
@@ -172,9 +181,14 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 			return nil, errors.New("msrp: invalid remote URI")
 		}
 	}
+	remoteSet := make(chan struct{})
+	if len(cfg.Remote) > 0 {
+		close(remoteSet)
+	}
 	return &Session{
 		local:      cfg.Local,
 		remote:     append([]URI(nil), cfg.Remote...),
+		remoteSet:  remoteSet,
 		handler:    cfg.Handler,
 		accept:     append([]string(nil), cfg.AcceptTypes...),
 		bound:      make(chan struct{}),
@@ -187,8 +201,52 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 // Local returns this side's URI.
 func (s *Session) Local() URI { return s.local }
 
-// Remote returns the path to the peer.
-func (s *Session) Remote() []URI { return append([]URI(nil), s.remote...) }
+// Remote returns the path to the peer; nil while a RemoteLater session
+// waits for it.
+func (s *Session) Remote() []URI {
+	select {
+	case <-s.remoteSet:
+		return append([]URI(nil), s.remote...)
+	default:
+		return nil
+	}
+}
+
+// SetRemote gives a RemoteLater session the peer's path, once.
+func (s *Session) SetRemote(path []URI) error {
+	if len(path) == 0 {
+		return errors.New("msrp: a session needs the remote path")
+	}
+	for _, u := range path {
+		if !u.valid() {
+			return errors.New("msrp: invalid remote URI")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.remoteSet:
+		return errors.New("msrp: the remote path is already set")
+	default:
+	}
+	s.remote = append([]URI(nil), path...)
+	close(s.remoteSet)
+	return nil
+}
+
+// waitRemote waits for SetRemote on a RemoteLater session.
+func (s *Session) waitRemote(ctx context.Context) error {
+	select {
+	case <-s.remoteSet:
+		return nil
+	case <-s.done:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // Done is closed when the session has ended.
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -337,6 +395,9 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 	}
 	c, err := s.waitBound(ctx)
 	if err != nil {
+		return "", err
+	}
+	if err := s.waitRemote(ctx); err != nil {
 		return "", err
 	}
 	id := out.MessageID
@@ -502,6 +563,13 @@ func (s *Session) keepAliveDue(c *Conn) {
 	idle := c.cfg.Clock.Now().Sub(s.lastActive)
 	s.mu.Unlock()
 	if closed {
+		return
+	}
+	select {
+	case <-s.remoteSet:
+	default:
+		// Nothing can be addressed to the peer before its path is known.
+		s.armKeepAlive(c, interval)
 		return
 	}
 	if idle < interval {
