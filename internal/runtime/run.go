@@ -380,8 +380,9 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	defer cancelRun()
 
 	log.Info("started", slog.String("environment", string(sh.environment)), slog.String("admin_addr", ln.Addr().String()))
-	// Metrics are flushed every interval until the process stops, and once
-	// more after the shutdown hooks so that the last interval is not lost.
+	// Metrics are flushed every interval until the process stops, when
+	// shutdown starts, and once more after the shutdown hooks so that what
+	// the drain records is not lost.
 	flushDone := make(chan struct{})
 	flushCtx, stopFlushing := context.WithCancel(context.Background())
 	go func() {
@@ -419,6 +420,10 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		log.Error("stopping: admin server failed", slog.String("error", pii.Redact(err.Error())))
 		failed = true
 	}
+	// What was recorded before the stop goes out now: a second signal, or a
+	// stop timeout shorter than the drain, ends the process before the
+	// last flush.
+	rt.Metrics.Flush()
 	// From here a second signal gets the default action and ends the process,
 	// for an operator who does not want to wait for the drain.
 	stopSignals()

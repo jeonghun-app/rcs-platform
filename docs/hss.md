@@ -270,8 +270,9 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   `api.data_error`.
 - Alarm candidates (Phase 7): `cx.*.error`, `lock.busy`, `api.store_failure`,
   `api.data_error`, `push.*.no_peer`, `push.*.failed`, `aka.sqn_exhausted`,
-  `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency against
-  `HSS_CX_TIMEOUT`.
+  `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency
+  (Maximum, or the average `cx.sar.sum / cx.sar.count`) against
+  `HSS_CX_TIMEOUT` (docs/architecture.md §8 has the rules for EMF alarms).
 - A shared profile's fan-out that a shutdown cuts short logs `profile push cut
   short by shutdown` with how many subscriptions it reached; apply the profile
   again to reach the rest before they register again.

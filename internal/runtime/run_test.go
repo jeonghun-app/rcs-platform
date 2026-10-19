@@ -749,11 +749,15 @@ func (failingListener) Addr() net.Addr            { return &net.TCPAddr{IP: net.
 func TestMetricsAreFlushedEveryIntervalAndOnceMoreAtShutdown(t *testing.T) {
 	counted := make(chan struct{})
 	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		// Counted by a shutdown hook, which runs after the flush when
+		// shutdown starts: only the last flush can write it.
+		rt.OnShutdown("drain", func(context.Context) error {
+			rt.Metrics.Count("while.stopping", 1)
+			return nil
+		})
 		rt.Metrics.Count("before.interval", 2)
 		close(counted)
 		<-ctx.Done()
-		// Counted while stopping: only the shutdown flush can write it.
-		rt.Metrics.Count("while.stopping", 1)
 		return nil
 	}))
 	<-counted
@@ -777,5 +781,35 @@ func TestMetricsAreFlushedEveryIntervalAndOnceMoreAtShutdown(t *testing.T) {
 	}
 	if strings.Index(out, "while.stopping") < strings.Index(out, `"msg":"stopped"`) {
 		t.Fatalf("the shutdown flush ran before the service stopped:\n%s", out)
+	}
+}
+
+func TestMetricsAreFlushedWhenShutdownStarts(t *testing.T) {
+	counted, entered, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		rt.OnShutdown("slow drain", func(context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		})
+		rt.Metrics.Count("before.stop", 1)
+		close(counted)
+		<-ctx.Done()
+		return nil
+	}))
+	<-counted
+	h.cancel()
+	// While the drain runs, which a second signal or a short ECS stop
+	// timeout could cut off, the count is already written.
+	<-entered
+	if !strings.Contains(h.out.String(), `"before.stop":1`) {
+		t.Errorf("not flushed when shutdown started:\n%s", h.out.String())
+	}
+	close(release)
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if n := strings.Count(h.out.String(), `"before.stop":`); n != 1 {
+		t.Fatalf("written %d times:\n%s", n, h.out.String())
 	}
 }
