@@ -18,7 +18,7 @@ import (
 const thumbnailSize = 2 << 10
 
 // uploadSettle is how long a broken upload may take to show in
-// get_upload_info, settlePoll how often the simulator asks meanwhile, and
+// get_upload_info unless Config.UploadSettle says otherwise, settlePoll how often the simulator asks meanwhile, and
 // settleQuiet how long the bytes held must stay the same before it resumes
 // (ft.Client.SettledUploadInfo).
 const (
@@ -201,7 +201,11 @@ func fileTransferResumed(r *run) error {
 			st  ft.Settled
 			err error
 		)
-		info, st, err = c.SettledUploadInfo(ctx, up.TID, uploadSettle, settlePoll, settleQuiet)
+		settle := r.cfg.UploadSettle
+		if settle <= 0 {
+			settle = uploadSettle
+		}
+		info, st, err = c.SettledUploadInfo(ctx, up.TID, settle, settlePoll, settleQuiet)
 		detail := map[string]int64{"retries": st.Retries, "not_held": st.NotHeld}
 		switch {
 		case errors.Is(err, ft.ErrNothingHeld):

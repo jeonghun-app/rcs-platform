@@ -48,6 +48,10 @@ type Config struct {
 	MSRP msrp.Config
 	// TLS configures the client's connection to an msrps relay path.
 	TLS *tls.Config
+	// UploadSettle is how long ft-resume asks get_upload_info again for a
+	// broken upload to show (ft.Client.SettledUploadInfo); zero is 3 s.
+	UploadSettle time.Duration
+
 	// IdleWait is how long the chat scenarios stay quiet to see keep-alives
 	// go out (it should exceed MSRP.KeepAliveInterval); zero skips the step.
 	IdleWait time.Duration

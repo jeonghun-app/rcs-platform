@@ -30,22 +30,38 @@ var (
 
 // stack starts ft-server and msrp-relay in the test process and returns a
 // Config for them.
+//
+// Two things a device and a deployed stack give ft-resume are made explicit
+// here, so that a loaded host cannot fail the scenarios that only pass
+// through it (#176):
+//   - UploadSettle is an hour, so only the step timeout bounds
+//     get_upload_info. Its own 3 s deadline is the ft package's to test;
+//     a test that needs the settle time to end, to see that nothing is
+//     held, sets its own.
+//   - Each get_upload_info waits until ft-server is done with every
+//     request before it. A device asks seconds after the break, once it is
+//     back on a network, by when the server has stored the broken upload;
+//     here it asks at once, and a server still storing it could answer the
+//     same bytes for the whole quiet time and then refuse the resume 503.
 func stack(t *testing.T) scenario.Config {
 	t.Helper()
 	f := simtest.StartFT(t, part)
 	corePort := simtest.StandInPort(t)
 	r := simtest.StartRelay(t, corePort)
+	client := f.Server.Client()
+	client.Transport = storedFirst{next: client.Transport, ft: f}
 	// IdleWait is six keep-alive intervals, so a slow scheduler still sees
 	// one go out.
 	return scenario.Config{
-		FT:         &ft.Client{HTTP: f.Server.Client(), UploadURL: f.UploadURL, User: simtest.FTUser, Password: ft.NewSecret(simtest.FTPassword)},
-		FileSize:   100 << 10,
-		ResumeSize: 5*part + 123,
-		Control:    &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)},
-		CoreListen: "127.0.0.1:" + strconv.Itoa(corePort),
-		MSRP:       msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
-		IdleWait:   600 * time.Millisecond,
-		Self:       self, Peer: peer,
+		FT:           &ft.Client{HTTP: client, UploadURL: f.UploadURL, User: simtest.FTUser, Password: ft.NewSecret(simtest.FTPassword)},
+		UploadSettle: time.Hour,
+		FileSize:     100 << 10,
+		ResumeSize:   5*part + 123,
+		Control:      &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)},
+		CoreListen:   "127.0.0.1:" + strconv.Itoa(corePort),
+		MSRP:         msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
+		IdleWait:     600 * time.Millisecond,
+		Self:         self, Peer: peer,
 		StepTimeout: 20 * time.Second,
 	}
 }
@@ -134,9 +150,34 @@ func byStep(results []scenario.Result) map[string]scenario.Result {
 	return m
 }
 
+// storedFirst holds each get_upload_info until ft-server has no request in
+// flight (see stack). The request's own context, the step's, bounds the
+// wait.
+type storedFirst struct {
+	next http.RoundTripper
+	ft   *simtest.FT
+}
+
+func (s storedFirst) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.Contains(r.URL.RawQuery, "get_upload_info") {
+		for s.ft.InFlight() > 0 {
+			select {
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
+	return s.next.RoundTrip(r)
+}
+
 func TestAResumeFileNoLargerThanAPartIsUploadedAgainAsRCSJTADoes(t *testing.T) {
 	cfg := stack(t)
 	cfg.ResumeSize = part / 2
+	// Nothing is held, and only the end of the settle time says so: a 404
+	// is asked again until then. So this test keeps a settle time that
+	// ends; a slow answer cannot fail it, since none of them holds bytes.
+	cfg.UploadSettle = time.Second
 	ok, results := runAll(t, cfg, "ft-resume")
 	steps := byStep(results)
 	info := steps["get_upload_info"]
@@ -242,6 +283,42 @@ func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
 	}
 }
 
+// slowFirst holds the first signed get_upload_info for delay before
+// sending it on.
+type slowFirst struct {
+	next  http.RoundTripper
+	delay time.Duration
+	n     atomic.Int32
+}
+
+func (s *slowFirst) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != "" && s.n.Add(1) == 1 {
+		select {
+		case <-time.After(s.delay):
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}
+	return s.next.RoundTrip(r)
+}
+
+func TestAResumeOutlastsASlowUploadInfoAnswer(t *testing.T) {
+	// One answer slower than the default 3 s settle time, as a loaded host
+	// gave (#176), ended get_upload_info with "the server is still storing
+	// the broken upload" although the bytes held never changed. In the
+	// stack only the step timeout bounds it.
+	cfg := stack(t)
+	slow := &slowFirst{delay: 3*time.Second + 100*time.Millisecond}
+	slow.next = cfg.FT.HTTP.Transport
+	client := *cfg.FT.HTTP
+	client.Transport = slow
+	cfg.FT.HTTP = &client
+	ok, results := runAll(t, cfg, "ft-resume")
+	if !ok || !byStep(results)["resume"].OK || slow.n.Load() == 0 {
+		t.Fatalf("ok %v, %d signed get_upload_info\nall results: %+v", ok, slow.n.Load(), results)
+	}
+}
+
 func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
 	// get_upload_info resumes only once the bytes held have stayed the same
 	// for 300 ms (docs/rcs-sim.md), so the step cannot be shorter than that.
@@ -251,7 +328,8 @@ func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
 	ok, results := runAll(t, stack(t), "ft-resume")
 	info := byStep(results)["get_upload_info"]
 	if !ok || time.Duration(info.Millis)*time.Millisecond < quiet {
-		t.Fatalf("ok %v, get_upload_info took %d ms, want at least %v", ok, info.Millis, quiet)
+		// Every result, so a failure says which step it was.
+		t.Fatalf("ok %v, get_upload_info took %d ms, want at least %v\nall results: %+v", ok, info.Millis, quiet, results)
 	}
 }
 

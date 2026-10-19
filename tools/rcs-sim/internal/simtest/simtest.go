@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -47,7 +48,15 @@ type FT struct {
 	Server    *httptest.Server
 	// Harness holds ft-server's log and metric lines.
 	Harness *runtimetest.Harness
+
+	inFlight atomic.Int64
 }
+
+// InFlight is how many requests ft-server is still handling. A request the
+// client gave up on is among them until the server is done with it: a
+// broken upload goes on being stored after the client's connection has
+// closed.
+func (f *FT) InFlight() int64 { return f.inFlight.Load() }
 
 // StartFT starts ft-server with memory stores and parts of partSize, so a
 // resume test needs a file of only a few parts.
@@ -82,10 +91,16 @@ func StartFT(t testing.TB, partSize int64) *FT {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs := &httptest.Server{Listener: ln, Config: &http.Server{Handler: srv}}
-	hs.Start()
-	t.Cleanup(hs.Close)
-	return &FT{UploadURL: upload, Server: hs, Harness: h}
+	f := &FT{UploadURL: upload, Harness: h}
+	counted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.inFlight.Add(1)
+		defer f.inFlight.Add(-1)
+		srv.ServeHTTP(w, r)
+	})
+	f.Server = &httptest.Server{Listener: ln, Config: &http.Server{Handler: counted}}
+	f.Server.Start()
+	t.Cleanup(f.Server.Close)
+	return f
 }
 
 // Relay is an msrp-relay in the test process.
