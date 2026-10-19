@@ -23,6 +23,19 @@ func TestClientIPsAreTruncatedToTheirNetwork(t *testing.T) {
 		"":                        "***",
 		"host.example.com:5060":   "***",
 		"192.0.2.300":             "***",
+		// Every address is a client's as far as a log can tell: private,
+		// loopback and link-local ones are truncated too (#36).
+		"[fe80::211:22ff:fe33:4455]": "fe80::/48",
+		"127.0.0.1":                  "127.0.0.0/24",
+		// Leading zeros, which SIP's IPv4address accepts (RFC 3261 §25.1).
+		"192.000.002.001":      "192.0.2.0/24",
+		"010.020.030.040:5060": "10.20.30.0/24",
+		"1.2.3.0004":           "***",
+		"1.2.3":                "***",
+		// A 6to4 address carries a whole IPv4 address in bits 16 to 47
+		// (RFC 3056 §2), so it keeps only its /16.
+		"2002:c000:201::1":         "2002::/16",
+		"[2002:cb00:7109:1::5]:80": "2002::/16",
 	} {
 		if got := TruncateIP(in); got != want {
 			t.Errorf("TruncateIP(%q) = %q, want %q", in, got, want)
@@ -48,7 +61,7 @@ func TestClientIPAttributeNeverCarriesTheFullAddress(t *testing.T) {
 // /24 or /48 prefix that contains the address the input names, so no more of
 // the address than its network is ever logged.
 func FuzzTruncateIP(f *testing.F) {
-	for _, s := range []string{"192.0.2.77", "[2001:db8::1]:5060", "fe80::1%eth0", "::ffff:1.2.3.4", "1.2.3.4:5", "x", ""} {
+	for _, s := range []string{"192.0.2.77", "[2001:db8::1]:5060", "fe80::1%eth0", "::ffff:1.2.3.4", "1.2.3.4:5", "x", "", "001.02.3.255:0", "2002:c000:201::1"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
@@ -57,12 +70,20 @@ func FuzzTruncateIP(f *testing.F) {
 			return
 		}
 		p, err := netip.ParsePrefix(out)
-		if err != nil || (p.Bits() != clientIPv4Bits && p.Bits() != clientIPv6Bits) || p != p.Masked() {
-			t.Fatalf("TruncateIP(%q) = %q, not a masked /24 or /48", s, out)
+		if err != nil || p != p.Masked() {
+			t.Fatalf("TruncateIP(%q) = %q, not a masked prefix", s, out)
 		}
 		ip, ok := parseIP(s)
 		if !ok || !p.Contains(ip) {
 			t.Fatalf("TruncateIP(%q) = %q, which does not contain the address", s, out)
+		}
+		switch {
+		case sixToFour.Contains(ip):
+			if p != sixToFour {
+				t.Fatalf("TruncateIP(%q) = %q keeps part of the IPv4 address in a 6to4 address", s, out)
+			}
+		case ip.Is4() && p.Bits() != clientIPv4Bits, ip.Is6() && p.Bits() != clientIPv6Bits:
+			t.Fatalf("TruncateIP(%q) = %q, not a /24 or /48", s, out)
 		}
 	})
 }

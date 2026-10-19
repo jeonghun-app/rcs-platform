@@ -176,7 +176,7 @@ func FuzzHeaderValues(f *testing.F) {
 		}},
 		{"Via", func(h *Header) (any, error) { return h.Via() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]Via) {
+			for _, x := range v.(Vias) {
 				out = append(out, x.String())
 			}
 			return join(out)

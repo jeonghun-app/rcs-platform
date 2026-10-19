@@ -9,7 +9,7 @@ import "strings"
 // allows one, or does not parse, yields an error wrapping ErrMalformed.
 
 // Via returns every Via element, top first.
-func (h *Header) Via() ([]Via, error) {
+func (h *Header) Via() (Vias, error) {
 	return listOf(h, "Via", parseViaElement)
 }
 

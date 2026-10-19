@@ -3,6 +3,7 @@ package sip
 import (
 	"log/slog"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
@@ -24,7 +25,8 @@ import (
 
 const redactedMark = "***"
 
-// LogValue logs the scheme and host only, a public IP host truncated.
+// LogValue logs the scheme and host only, an IP host truncated to its
+// network.
 func (u URI) LogValue() slog.Value { return slog.StringValue(u.redacted()) }
 
 func (u URI) redacted() string {
@@ -42,22 +44,22 @@ func (u URI) redacted() string {
 	}
 }
 
-// loggedHost is a URI or Via host as it may be logged. A public IP address
-// there is a client's, the address of a UE's Contact or first Via, and is
-// personal data, so only its network is logged (pii.TruncateIP: /24 or /48,
-// #36). A private address (RFC 1918, ULA, loopback, link-local) names a task
-// inside the VPC, such as the pcscf instance a Path or Record-Route points
-// at (ADR 0005), or a UE's LAN behind NAT, which identifies no one; it is
-// kept so operators can tell instances apart. Domain names are kept.
+// loggedHost is a URI or Via host as it may be logged. An IP address there
+// is a client's as far as a log can tell, the address of a UE's Contact or
+// first Via, and is personal data whatever its range: a UE on an operator's
+// APN often has an RFC 1918 address, and a link-local or unique local IPv6
+// address can carry the device's MAC address. So only its network is logged
+// (pii.TruncateIP, #36), and an address it cannot read is masked rather than
+// logged as if it were a name. A domain name is kept, with any digit run in
+// it masked like other text.
 func loggedHost(host string) string {
-	ip, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
-	if err != nil {
-		return host
+	if isIPv4(host) || strings.HasPrefix(host, "[") {
+		return pii.TruncateIP(host)
 	}
-	if ip = ip.Unmap(); ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-		return host
+	if _, err := netip.ParseAddr(host); err == nil {
+		return pii.TruncateIP(host)
 	}
-	return pii.TruncateIP(host)
+	return pii.Redact(host)
 }
 
 // LogValue logs the redacted URI and the tag; the display name is left out.
@@ -92,14 +94,30 @@ func authLogValue(scheme string, ps Params) slog.Value {
 }
 
 // LogValue logs the transport, the sent-by host (truncated like a URI's when
-// it is a public IP address) and the branch; received and rport, which hold
-// the client's address as the server saw it, are left out.
+// it is an IP address) and the branch; received and rport, which hold the
+// client's address as the server saw it, are left out. slog applies LogValue
+// only to the value it is given, not to the elements of a slice, so log a
+// whole header's Via elements as [Vias].
 func (v Via) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("transport", v.Transport),
 		slog.String("host", loggedHost(v.Host)),
 		slog.String("branch", v.Branch()),
 	)
+}
+
+// Vias is a Via header's elements, top first, as ParseVia and Header.Via
+// return them. It exists so that logging them all goes through Via.LogValue:
+// a plain []Via would be logged field by field, received included.
+type Vias []Via
+
+// LogValue logs each element by its position, top first.
+func (vs Vias) LogValue() slog.Value {
+	attrs := make([]slog.Attr, len(vs))
+	for i, v := range vs {
+		attrs[i] = slog.Any(strconv.Itoa(i), v)
+	}
+	return slog.GroupValue(attrs...)
 }
 
 // LogValue logs the number of fields; names and values are left out, since
