@@ -13,22 +13,23 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
-// fakeICSCF accepts pcscf's core connection and answers each REGISTER with
-// answer, after passing it to got.
-type fakeICSCF struct {
+// fakeCoreNode is icscf or scscf: it accepts pcscf's core connections and
+// answers each request with what answer returns, nothing if that is empty,
+// after passing it to got.
+type fakeCoreNode struct {
 	ln     net.Listener
 	got    chan *sip.Request
 	answer func(req *sip.Request) string
 }
 
-func startICSCF(t *testing.T, answer func(*sip.Request) string) *fakeICSCF {
+func startCoreNode(t *testing.T, answer func(*sip.Request) string) *fakeCoreNode {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	f := &fakeICSCF{ln: ln, got: make(chan *sip.Request, 16), answer: answer}
+	f := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), answer: answer}
 	go func() {
 		for {
 			nc, err := ln.Accept()
@@ -41,7 +42,7 @@ func startICSCF(t *testing.T, answer func(*sip.Request) string) *fakeICSCF {
 	return f
 }
 
-func (f *fakeICSCF) serve(t *testing.T, nc net.Conn) {
+func (f *fakeCoreNode) serve(t *testing.T, nc net.Conn) {
 	defer nc.Close()
 	r := sip.NewReader(bufio.NewReader(nc), sip.Limits{})
 	for {
@@ -95,7 +96,7 @@ func echo200(req *sip.Request) string {
 // transport knows, the client gets the Flow-Timer, and when the client's
 // connection closes its registration goes (RFC 5626 §5.3).
 func TestARegisterCrossesPcscfAndItsFlowsClosureEndsIt(t *testing.T) {
-	icscf := startICSCF(t, echo200)
+	icscf := startCoreNode(t, echo200)
 	cfg := testConfig()
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	var pc *pcscf

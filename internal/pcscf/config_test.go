@@ -86,6 +86,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
+		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -178,6 +179,11 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_MAX_REGISTRATIONS", "0"}, "PCSCF_MAX_REGISTRATIONS: must be positive"},
 		{[]string{"PCSCF_REGISTER_RATE", "-1"}, "PCSCF_REGISTER_RATE: must be positive"},
 		{[]string{"PCSCF_REGISTER_BURST", "0"}, "PCSCF_REGISTER_BURST: must be positive"},
+		{[]string{"PCSCF_INITIAL_RATE", "0"}, "PCSCF_INITIAL_RATE: must be positive"},
+		{[]string{"PCSCF_INITIAL_BURST", "-1"}, "PCSCF_INITIAL_BURST: must be positive"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "a, b"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "\"open"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "a\r\nRoute: <sip:x>"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"RCS_SERVICE_NAMESPACE", ""}, "PCSCF_ICSCF_URI: required when RCS_SERVICE_NAMESPACE is unset"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal"}, "PCSCF_ICSCF_URI: not a sip or sips URI of a host with lr"},
 		{[]string{"PCSCF_ICSCF_URI", "tel:+15550100001"}, "PCSCF_ICSCF_URI: not a sip or sips URI"},

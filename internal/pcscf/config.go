@@ -33,6 +33,10 @@ const (
 	// (#16 question 1).
 	DefaultRegisterRate  = 50
 	DefaultRegisterBurst = 200
+	// DefaultInitialRate and DefaultInitialBurst bound a client's requests
+	// outside a dialog likewise.
+	DefaultInitialRate  = 50
+	DefaultInitialBurst = 200
 	// DefaultMaxClientFlows and DefaultCoreConnections split the transport's
 	// DefaultMaxConnections: client flows may take no more than their share,
 	// so the core listener always has room for scscf (review of #188).
@@ -95,6 +99,12 @@ type Config struct {
 	// RegisterBurst the REGISTERs of one client address.
 	MaxRegistrations            int
 	RegisterRate, RegisterBurst int
+	// InitialRate and InitialBurst bound a client's requests outside a
+	// dialog.
+	InitialRate, InitialBurst int
+	// VisitedNetworkID, if set, is the P-Visited-Network-ID of REGISTERs
+	// and requests outside a dialog (TS 24.229 §5.2.2.1, RFC 7315 §4.3).
+	VisitedNetworkID string
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -125,6 +135,9 @@ func Configure(s *runtime.Settings) Config {
 		MaxRegistrations:  e.Int("MAX_REGISTRATIONS", DefaultMaxRegistrations),
 		RegisterRate:      e.Int("REGISTER_RATE", DefaultRegisterRate),
 		RegisterBurst:     e.Int("REGISTER_BURST", DefaultRegisterBurst),
+		InitialRate:       e.Int("INITIAL_RATE", DefaultInitialRate),
+		InitialBurst:      e.Int("INITIAL_BURST", DefaultInitialBurst),
+		VisitedNetworkID:  e.String("VISITED_NETWORK_ID", ""),
 	}
 	c.ICSCF = icscfURI(s)
 	if c.PublicHost != "" && !validHostName(c.PublicHost) {
@@ -177,6 +190,7 @@ func Configure(s *runtime.Settings) Config {
 	}{
 		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_REGISTRATIONS", c.MaxRegistrations},
 		{"REGISTER_RATE", c.RegisterRate}, {"REGISTER_BURST", c.RegisterBurst},
+		{"INITIAL_RATE", c.InitialRate}, {"INITIAL_BURST", c.InitialBurst},
 		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
 	} {
@@ -189,6 +203,9 @@ func Configure(s *runtime.Settings) Config {
 	}
 	if c.ClientIdleTimeout <= 0 {
 		e.Invalid("CLIENT_IDLE_TIMEOUT", "must be greater than zero")
+	}
+	if c.VisitedNetworkID != "" && !validVisitedNetwork(c.VisitedNetworkID) {
+		e.Invalid("VISITED_NETWORK_ID", "not one network identifier (RFC 7315 §4.3)")
 	}
 
 	// Run must return inside the runtime's stop deadline. The runtime
@@ -254,4 +271,15 @@ func validHostName(h string) bool {
 		}
 	}
 	return true
+}
+
+// validVisitedNetwork reports whether v is one P-Visited-Network-ID element,
+// so that pcscf never writes a header the core cannot parse.
+func validVisitedNetwork(v string) bool {
+	var h sip.Header
+	if h.Set("P-Visited-Network-ID", v) != nil {
+		return false
+	}
+	ids, err := h.PVisitedNetworkID()
+	return err == nil && len(ids) == 1
 }

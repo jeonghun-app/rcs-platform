@@ -52,7 +52,7 @@ func (p *pcscf) register(_ context.Context, r *proxy.Request) proxy.Decision {
 	if !p.registry.room(src.Flow, aor) {
 		return p.refuse(r, 503, "Registry Full")
 	}
-	reg := &registration{flow: src.Flow, aor: aor, outbound: usesOutbound(r.Message, contacts)}
+	reg := &registration{flow: src.Flow, uri: to.URI, aor: aor, outbound: usesOutbound(r.Message, contacts)}
 	reg.keepAlive = reg.outbound || viaKeep(r.Message)
 	return proxy.Decision{
 		Targets: []proxy.Target{{URI: r.Message.URI, Routes: []sip.Address{{URI: p.cfg.ICSCF}}}},
@@ -132,6 +132,11 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration) error {
 	}
 	if !hasOption(req.Header.Supported, "path") {
 		if err := req.Header.Add("Supported", "path"); err != nil {
+			return err
+		}
+	}
+	if p.cfg.VisitedNetworkID != "" {
+		if err := req.Header.Set("P-Visited-Network-ID", p.cfg.VisitedNetworkID); err != nil {
 			return err
 		}
 	}

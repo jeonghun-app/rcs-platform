@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	mrand "math/rand/v2"
 	"net/netip"
 	"strings"
 	"testing"
@@ -96,7 +97,9 @@ func newTestPcscf(clock *testClock) (*pcscf, idleSet) {
 		cfg: cfg, corePort: 5070,
 		registry:  newRegistry(cfg.MaxRegistrations, clock.now),
 		registers: newLimiter(cfg.RegisterRate, cfg.RegisterBurst, clock.now),
-		flows:     idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		initials:  newLimiter(cfg.InitialRate, cfg.InitialBurst, clock.now),
+		resolve:   coreResolver{dns: &proxy.DNSResolver{Allow: allowCore(cfg)}}, rand: seededRand(),
+		flows: idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, idle
 }
 
@@ -374,3 +377,5 @@ func TestMalformedRegistersAreAnswered400(t *testing.T) {
 		}
 	}
 }
+
+func seededRand() io.Reader { return mrand.NewChaCha8([32]byte{16}) }

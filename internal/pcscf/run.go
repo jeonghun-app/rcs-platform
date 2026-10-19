@@ -2,6 +2,7 @@ package pcscf
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
@@ -92,11 +93,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if err != nil {
 		return fmt.Errorf("pcscf: core listener: %w", err)
 	}
+	resolver := coreResolver{dns: &proxy.DNSResolver{Lookup: d.lookup, Allow: allowCore(cfg)}}
 	pc := &pcscf{
 		cfg: cfg, corePort: int(coreAddr.Port()),
 		registry:  newRegistry(cfg.MaxRegistrations, d.now),
 		registers: newLimiter(cfg.RegisterRate, cfg.RegisterBurst, d.now),
-		flows:     tr, now: d.now, log: rt.Logger,
+		initials:  newLimiter(cfg.InitialRate, cfg.InitialBurst, d.now),
+		resolve:   resolver, rand: rand.Reader,
+		flows: tr, now: d.now, log: rt.Logger,
 	}
 	// A closed flow's registrations are gone (RFC 5626 §5.3).
 	fl.onClosed = pc.registry.removeFlow
@@ -107,7 +111,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	px, err := proxy.New(tr, proxy.Config{
 		Self:      selfURIs(cfg, int(coreAddr.Port())),
 		Router:    router,
-		Resolver:  coreResolver{dns: &proxy.DNSResolver{Lookup: d.lookup, Allow: allowCore(cfg)}},
+		Resolver:  resolver,
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
 	})
