@@ -418,6 +418,19 @@ func testKeepProfile(t *testing.T, a, b state.Store, _ Options) {
 	wantErr(t, b.KeepProfile(ctx(t), Set2, T0.Add(25*time.Hour), T0), state.ErrNotFound)
 	// Past KeepUntil the profile is gone for KeepProfile as for Profile.
 	wantErr(t, b.KeepProfile(ctx(t), Set1, T0.Add(50*time.Hour), T0.Add(25*time.Hour)), state.ErrNotFound)
+
+	// KeepProfile keeps to the second, as SaveProfile does.
+	q := Profile(Set2, []byte("<IMSSubscription>2</IMSSubscription>"), T0)
+	q.KeepUntil = T0.Add(time.Hour)
+	if err := a.SaveProfile(ctx(t), q); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.KeepProfile(ctx(t), Set2, T0.Add(2*time.Hour+500*time.Millisecond), T0); err != nil {
+		t.Fatal(err)
+	}
+	must(a.Profile(ctx(t), Set2, T0.Add(2*time.Hour-time.Nanosecond)))(t)
+	_, err := a.Profile(ctx(t), Set2, T0.Add(2*time.Hour+100*time.Millisecond))
+	wantErr(t, err, state.ErrNotFound)
 }
 
 // Unregistered returns the record of an unregistered user of impu's set
@@ -506,4 +519,42 @@ func testRegisterEndsUnregistered(t *testing.T, a, b state.Store, _ Options) {
 	if got := must(a.Registration(ctx(t), IMPU1))(t); !got.Unregistered.IsZero() || len(got.Contacts) != 1 {
 		t.Errorf("after the stale save: %+v", got)
 	}
+}
+
+// testUnregisteredRetry: a sweep that claims an unregistered record and fails
+// to end the state leaves it unlisted for the lease, and the retry after it
+// still sees the record as an unregistered user's.
+func testUnregisteredRetry(t *testing.T, a, b state.Store, o Options) {
+	end := T0.Add(time.Hour)
+	must(a.SaveRegistration(ctx(t), Unregistered(IMPI1, IMPU1, end)))(t)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(a.ExpiringRegistrations(ctx(t), end, 10))(t)) == 1
+	})
+	n, err := state.SweepRegistrations(ctx(t), a, end, 10, func(_, _ *state.Registration) error { return errors.New("HSS down") })
+	if n != 1 || err == nil {
+		t.Fatalf("first sweep: %d, %v", n, err)
+	}
+	// Claimed: due at the end of the lease, not at end, which has passed.
+	if regs := must(b.ExpiringRegistrations(ctx(t), end.Add(30*time.Second), 10))(t); len(regs) != 0 {
+		t.Error("a claimed record is listed within its lease")
+	}
+	later := end.Add(state.SweepLease + time.Second)
+	eventually(t, o, "the index to list it again", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), later, 10))(t)) == 1
+	})
+	called := 0
+	if _, err := state.SweepRegistrations(ctx(t), b, later, 10, func(before, _ *state.Registration) error {
+		called++
+		if before.Unregistered.IsZero() {
+			t.Error("the retry lost the unregistered state")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("handled %d times", called)
+	}
+	_, err = a.Registration(ctx(t), IMPU1)
+	wantErr(t, err, state.ErrNotFound)
 }

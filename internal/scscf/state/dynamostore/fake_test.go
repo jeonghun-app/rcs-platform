@@ -23,6 +23,9 @@ type fakeDynamo struct {
 	t      *testing.T
 	mu     sync.Mutex
 	tables map[string]map[string]map[string]types.AttributeValue
+	// afterUpdate, if set, runs after every UpdateItem, outside the lock, as
+	// another instance's write between that request and the next would.
+	afterUpdate func()
 	// resendNext applies the next write twice, as the SDK does when the
 	// response to the first attempt is lost, and answers with the second
 	// attempt's outcome.
@@ -223,6 +226,9 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 	}
 	if err := checkKey(in.Key); err != nil {
 		return nil, err
+	}
+	if f.afterUpdate != nil {
+		defer f.afterUpdate()
 	}
 	var updated map[string]types.AttributeValue
 	err := f.write(func() error {

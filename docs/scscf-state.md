@@ -52,11 +52,13 @@ additionally sealed (below).
 - **A profile outlives its set by a day at most.** Every deregistration path
   (user, sweep, RTR, administrative) deletes the profile. As a safety net for
   one that fails to, a profile carries `KeepUntil`, stored as the TTL attribute
-  `ttl`: the last contact expiry of the set plus one day
-  (`state.ProfileGrace`). A re-registration extends it only once less than 12
-  hours are left (`KeepDue`, `KeepProfile`), about twice a day. From
-  `KeepUntil` on the profile is not found, whether or not DynamoDB has removed
-  it yet. Registrations have no `ttl`: only a sweep, which sends the SAR, may
+  `ttl`: the last contact expiry of the set, or the end of an unregistered
+  user's state, plus one day (`state.ProfileGrace`). A registration extends it
+  only when the new expiry is 12 hours or more past what `KeepUntil` covers
+  (`KeepDue`, `KeepProfile`): about twice a day for hourly re-registrations,
+  and at every one for registrations longer than half a day, so the profile
+  never runs out while a binding lives. From `KeepUntil` on the profile is not
+  found, whether or not DynamoDB has removed it yet. Registrations have no `ttl`: only a sweep, which sends the SAR, may
   remove one, so the infrastructure must enable TTL on `ttl`, never on
   `expires`.
 - **A permanent SAR failure ends the deregistration.** The sweep's handler
@@ -88,9 +90,13 @@ client one more 401, not a failed registration.
 
 ## Capacity and cost
 
-A re-registration is one strongly consistent read and one put of the IMPU's
-registration item (a few KB), plus two writes to `expiry-index`; the profile is
-written only on SAR and PPR, plus about two updates of its `ttl` a day. Every
+A re-registration is two strongly consistent reads, of the IMPU's registration
+item (a few KB) and of its set's profile (which tells whether `KeepUntil` is
+due), and one put of the registration, plus two writes to `expiry-index`; the
+profile is written only on SAR and PPR, plus about two updates of its `ttl` a
+day. The profile read is 2 RRU for a typical 5 KB IMSSubscription, 32 for the
+128 KiB maximum: with 1 M users of two IMPUs re-registering every 600 s, some
+8.6 G RRU and $1.1k a month at the prices below for typical profiles. Every
 terminating request reads the IMPU's registration and its set's profile, two
 strongly consistent reads: about 1 read request unit for the registration and 1
 per 4 KB of profile (2 for a typical 5 KB IMSSubscription, 32 for the 128 KiB

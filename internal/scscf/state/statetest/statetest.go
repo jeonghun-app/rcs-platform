@@ -94,6 +94,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"KeepProfileOnlyMovesKeepUntilLater", testKeepProfile},
 		{"AnUnregisteredUsersRecordLivesUntilItsStateEnds", testUnregisteredLifeCycle},
 		{"ARegisterTurnsAnUnregisteredRecordIntoARegistration", testRegisterEndsUnregistered},
+		{"AFailedEndOfAnUnregisteredStateIsRetriedAfterTheLease", testUnregisteredRetry},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -340,7 +341,11 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	badIMPI := Registration("not an impi", IMPU1, time.Hour)
 	noSet := Registration(IMPI1, IMPU1, time.Hour)
 	noSet.DefaultIMPU = ""
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noSet} {
+	before1970 := Registration(IMPI1, IMPU1)
+	before1970.Unregistered = time.Date(1969, 12, 31, 0, 0, 0, 0, time.UTC)
+	after9999 := Registration(IMPI1, IMPU1)
+	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noSet, before1970, after9999} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}
