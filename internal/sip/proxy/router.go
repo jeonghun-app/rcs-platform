@@ -217,13 +217,21 @@ var ErrUnresolvable = errors.New("proxy: cannot resolve the next hop")
 type NumericResolver struct{}
 
 // Resolve implements Resolver.
-func (NumericResolver) Resolve(_ context.Context, u sip.URI) (transport.Destination, error) {
+func (n NumericResolver) Resolve(_ context.Context, u sip.URI) (transport.Destination, error) {
 	if !u.IsSIP() {
 		return transport.Destination{}, fmt.Errorf("%w: %s URI", ErrUnresolvable, u.Scheme)
 	}
 	addr, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]"))
 	if err != nil {
 		return transport.Destination{}, fmt.Errorf("%w: host is not an IP address", ErrUnresolvable)
+	}
+	return n.withAddr(u, addr)
+}
+
+// withAddr is the destination of u at addr: the transport and port u names.
+func (NumericResolver) withAddr(u sip.URI, addr netip.Addr) (transport.Destination, error) {
+	if !u.IsSIP() {
+		return transport.Destination{}, fmt.Errorf("%w: %s URI", ErrUnresolvable, u.Scheme)
 	}
 	network := transport.UDP
 	if u.Scheme == "sips" {

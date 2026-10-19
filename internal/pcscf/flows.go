@@ -12,6 +12,8 @@ import (
 // admit and closed are the transport's Admit and OnFlowClosed.
 type flows struct {
 	max int
+	// onClosed, if set, hears about every client flow that closed.
+	onClosed func(transport.FlowID)
 
 	mu    sync.Mutex
 	perIP map[netip.Addr]int
@@ -46,14 +48,16 @@ func (f *flows) admit(id transport.FlowID, info transport.FlowInfo) bool {
 // closed forgets a flow that ended.
 func (f *flows) closed(id transport.FlowID, _ transport.FlowInfo) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	ip, ok := f.all[id]
-	if !ok {
-		return
+	if ok {
+		delete(f.all, id)
+		if f.perIP[ip]--; f.perIP[ip] <= 0 {
+			delete(f.perIP, ip)
+		}
 	}
-	delete(f.all, id)
-	if f.perIP[ip]--; f.perIP[ip] <= 0 {
-		delete(f.perIP, ip)
+	f.mu.Unlock()
+	if ok && f.onClosed != nil {
+		f.onClosed(id)
 	}
 }
 

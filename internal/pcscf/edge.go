@@ -2,7 +2,9 @@ package pcscf
 
 import (
 	"context"
+	"log/slog"
 	"net/netip"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -85,17 +87,33 @@ func hostOf(a netip.Addr) string {
 	return a.String()
 }
 
-// router is pcscf's location service. Until registration lands it serves no
-// one: a client's request is refused with 403, since no flow is registered,
-// and the core's with 430, since no flow it could name exists (RFC 5626
-// §5.3).
-type router struct{}
+// pcscf is the location service of the proxy (proxy.Router) and the state
+// behind it.
+type pcscf struct {
+	cfg      Config
+	corePort int
+	registry *registry
+	// registers limits the REGISTERs of one client address.
+	registers *limiter
+	// flows sets a flow's idle timeout; nil in tests that need none.
+	flows flowSetter
+	ids   sip.IDGenerator
+	now   func() time.Time
+	log   *slog.Logger
+}
 
-func (router) Route(_ context.Context, r *proxy.Request) proxy.Decision {
-	if fromClient(r.Source) {
-		return proxy.Decision{Status: 403, Reason: "Not Registered"}
+// Route implements proxy.Router. A client's REGISTER goes to icscf. Until
+// originating and terminating routing land (#16), any other request from a
+// client is refused with 403, and one from the core with 430, since no flow
+// it could name is served yet (RFC 5626 §5.3).
+func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
+	if !fromClient(r.Source) {
+		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
 	}
-	return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
+	if r.Message.Method == "REGISTER" {
+		return p.register(ctx, r)
+	}
+	return proxy.Decision{Status: 403, Reason: "Not Registered"}
 }
 
 // statusFlowFailed is 430 Flow Failed (RFC 5626 §11.5).

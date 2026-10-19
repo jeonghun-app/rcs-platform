@@ -7,10 +7,10 @@ over `internal/sip/transport`; the service is `internal/pcscf`, and
 `cmd/pcscf` only wires it to `internal/runtime`.
 
 `pcscf` is built in steps (#16). This page describes what is in place: the
-listeners, the edge rules and the shutdown. Registration, originating and
-terminating routing, and the reg event follow. Until registration lands,
-`pcscf` serves no one: a client's request is answered 403 and a request from
-the core 430 Flow Failed, since no flow is registered.
+listeners, the edge rules, registration and the shutdown. Originating and
+terminating routing and the reg event follow. Until they land, a client's
+request other than REGISTER is answered 403 and a request from the core 430
+Flow Failed.
 
 ## Listeners
 
@@ -51,6 +51,49 @@ the core 430 Flow Failed, since no flow is registered.
   mobile clients share public addresses behind carrier-grade NAT. Core flows
   are not counted.
 
+## Registration
+
+A client's REGISTER goes to `icscf` (`PCSCF_ICSCF_URI`, by default
+`sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr`), out of the core
+listener (TS 24.229 §5.2.2.1):
+
+- **Path.** `pcscf` adds `Path: <sip:<flow token>@<task address>:<core
+  port>;transport=tcp;lr>`, with `ob` when the client uses outbound (RFC 5626
+  §5.1), and `Supported: path`. The flow token is the transport's flow ID,
+  an HMAC under a key drawn at every start
+  ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)).
+- **Headers.** The network-only headers are removed, as from every client
+  request.
+- **The 200.** `pcscf` keeps the following in instance memory, for each
+  public identity registered over each flow:
+  - the client's contacts on that flow that the 200 lists;
+  - the expiry, the shortest of those contacts' expiries;
+  - `Service-Route` (RFC 3608);
+  - `P-Associated-URI`, whose first URI is the default public identity
+    (RFC 7315).
+
+  A 200 that lists none of those contacts, after a removal, forgets the
+  registration. So does the flow closing (RFC 5626 §5.3).
+- **Keep-alive** ([ADR 0003](adr/0003-aws-topology.md)):
+
+  | The client | It gets | Flow idle timeout |
+  |---|---|---|
+  | uses outbound: `Supported: outbound`, and `+sip.instance` and `reg-id` on every contact | `Flow-Timer: 120` and `Require: outbound` in the 200 | 180 s with TLS to the NLB, 1740 s with `tcp` |
+  | asks with the Via `keep` parameter (RFC 6223) | `keep=120` in its Via of the 200 | the same |
+  | does neither | its expiries capped to 600 s, in the REGISTER and in the 200 | `PCSCF_CLIENT_IDLE_TIMEOUT` (340 s) |
+- **Limits.** A client address may send `PCSCF_REGISTER_RATE` REGISTERs a
+  second, with a burst of `PCSCF_REGISTER_BURST`. A task keeps at most
+  `PCSCF_MAX_REGISTRATIONS` registrations, and a new one past that is
+  refused. Refusals are 503 with `Retry-After: 1`.
+
+Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
+
+- It looks up A and AAAA records, keeps each answer for 10 s, and spreads
+  branches over its addresses.
+- It uses only private addresses. Dev and test also accept loopback.
+- A Cloud Map answer holds at most eight records, chosen at random when more
+  instances are registered. That is enough for CSCF fleets of that size.
+
 ## Settings
 
 Environment variables with the `PCSCF_` prefix, plus the shared ones of
@@ -69,6 +112,9 @@ start with that value.
 | `PCSCF_CORE_HOST` | this task's one private IPv4 | the task address `pcscf` names itself by |
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client address |
+| `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | first Route of a REGISTER; required without a namespace |
+| `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
+| `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
 | `PCSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop spreads the closing of client flows over; plus 5 s it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 

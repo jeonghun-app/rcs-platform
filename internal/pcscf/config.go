@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // Client transports: what the client's connection to the NLB is, which
@@ -25,6 +26,13 @@ const (
 // Defaults of the settings in docs/pcscf.md.
 const (
 	DefaultCoreAddr = "0.0.0.0:5070"
+	// DefaultMaxRegistrations bounds the registrations one task keeps.
+	DefaultMaxRegistrations = 100_000
+	// DefaultRegisterRate and DefaultRegisterBurst bound the REGISTERs of one
+	// client address a second, generous for the same reason as the flows
+	// (#16 question 1).
+	DefaultRegisterRate  = 50
+	DefaultRegisterBurst = 200
 	// DefaultMaxFlowsPerIP is generous because mobile clients share public
 	// addresses behind carrier-grade NAT (#16 plan, question 1).
 	DefaultMaxFlowsPerIP = 1024
@@ -64,6 +72,17 @@ type Config struct {
 	MaxFlowsPerIP int
 	// ClientIdleTimeout closes a quiet client connection.
 	ClientIdleTimeout time.Duration
+	// ICSCF is the first Route of a REGISTER: icscf, by its Cloud Map name
+	// by default (sip:icscf.<namespace>;transport=tcp;lr).
+	ICSCF sip.URI
+	// AllowLoopback lets a core hop resolve to a loopback address, for a
+	// stack on one host; it is false in staging and prod, where only
+	// private addresses are reached (ADR 0007 §5).
+	AllowLoopback bool
+	// MaxRegistrations bounds the registrations kept; RegisterRate and
+	// RegisterBurst the REGISTERs of one client address.
+	MaxRegistrations            int
+	RegisterRate, RegisterBurst int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -87,7 +106,12 @@ func Configure(s *runtime.Settings) Config {
 		ProxyProtocol:     s.Shared.Bool("PROXY_PROTOCOL", false),
 		MaxFlowsPerIP:     e.Int("MAX_FLOWS_PER_IP", DefaultMaxFlowsPerIP),
 		ClientIdleTimeout: e.Duration("CLIENT_IDLE_TIMEOUT", DefaultClientIdleTimeout),
+		AllowLoopback:     !s.Environment.Production(),
+		MaxRegistrations:  e.Int("MAX_REGISTRATIONS", DefaultMaxRegistrations),
+		RegisterRate:      e.Int("REGISTER_RATE", DefaultRegisterRate),
+		RegisterBurst:     e.Int("REGISTER_BURST", DefaultRegisterBurst),
 	}
+	c.ICSCF = icscfURI(s)
 	if c.PublicHost != "" && !validHostName(c.PublicHost) {
 		e.Invalid("PUBLIC_HOST", "not a host name")
 	}
@@ -122,8 +146,16 @@ func Configure(s *runtime.Settings) Config {
 		"PCSCF_CLIENT_UDP_ADDR is set: the NLB's fixed 120 s UDP flow timeout would send a client's packets to another task (ADR 0003)")
 	s.ForbidInProduction(!c.ProxyProtocol,
 		"RCS_PROXY_PROTOCOL is false: every client would appear as the load balancer, so flows and per-client limits could not work (ADR 0003)")
-	if c.MaxFlowsPerIP <= 0 {
-		e.Invalid("MAX_FLOWS_PER_IP", "must be positive")
+	for _, n := range []struct {
+		name string
+		v    int
+	}{
+		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_REGISTRATIONS", c.MaxRegistrations},
+		{"REGISTER_RATE", c.RegisterRate}, {"REGISTER_BURST", c.RegisterBurst},
+	} {
+		if n.v <= 0 {
+			e.Invalid(n.name, "must be positive")
+		}
 	}
 	if c.ClientIdleTimeout <= 0 {
 		e.Invalid("CLIENT_IDLE_TIMEOUT", "must be greater than zero")
@@ -151,6 +183,27 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("DRAIN_TIMEOUT", "plus "+stopMargin.String()+" must not exceed RCS_SHUTDOWN_TIMEOUT ("+stop.String()+")")
 	}
 	return c
+}
+
+// icscfURI reads PCSCF_ICSCF_URI, a SIP URI with lr, or makes icscf's Cloud
+// Map name in RCS_SERVICE_NAMESPACE.
+func icscfURI(s *runtime.Settings) sip.URI {
+	e := s.Env
+	v := e.String("ICSCF_URI", "")
+	if v == "" {
+		ns := s.ServiceNamespace()
+		if ns == "" {
+			e.Invalid("ICSCF_URI", "required when RCS_SERVICE_NAMESPACE is unset")
+			return sip.URI{}
+		}
+		v = "sip:icscf." + ns + ";transport=tcp;lr"
+	}
+	u, err := sip.ParseURI(v)
+	if err != nil || u.Scheme != "sip" && u.Scheme != "sips" || u.User != "" || !u.Params.Has("lr") {
+		e.Invalid("ICSCF_URI", "not a sip or sips URI of a host with lr")
+		return sip.URI{}
+	}
+	return u
 }
 
 // validHostName reports whether h is a DNS name pcscf can be dialled by:

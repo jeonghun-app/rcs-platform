@@ -30,6 +30,8 @@ func testConfig() Config {
 		PublicHost: publicHost, PublicPort: 5060, ClientTransport: ClientTCP, ClientAddr: "127.0.0.1:0",
 		CoreAddr: "127.0.0.1:0", CoreHost: netip.MustParseAddr("127.0.0.1"),
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout, DrainTimeout: time.Second,
+		ICSCF:         sip.URI{Scheme: "sip", Host: "icscf.rcs.internal", Params: sip.Params{{Name: "transport", Value: "tcp"}, {Name: "lr"}}},
+		AllowLoopback: true, MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 	}
 }
 
