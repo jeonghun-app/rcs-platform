@@ -19,16 +19,23 @@ import (
 // No IMPU starts with it: a canonical one starts with sip:, sips: or tel:.
 const profilePrefix = "profile#"
 
-// profileKey is profile#<IMPI>#<default IMPU>. No two profiles share one: the
-// IMPI has a single '@' and after it a domain name, which has no '#', so the
-// first '#' after the first '@' ends the IMPI.
-func profileKey(k state.ProfileKey) map[string]types.AttributeValue {
+// setPrefix starts the key of a set's registration item; no IMPU starts with
+// it either.
+const setPrefix = "set#"
+
+// profileKey is profile#<IMPI>#<default IMPU>, and setPK set#<IMPI>#<default
+// IMPU>. No two sets share one: the IMPI has a single '@' and after it a
+// domain name, which has no '#', so the first '#' after the first '@' ends
+// the IMPI.
+func profileKey(k state.SetKey) map[string]types.AttributeValue {
 	return key(profilePrefix + k.IMPI + "#" + k.IMPU)
 }
 
-// possibleProfile reports whether k could name a stored profile; one that
+func setPK(k state.SetKey) string { return setPrefix + k.IMPI + "#" + k.IMPU }
+
+// possibleSet reports whether k could name a stored set or profile; one that
 // could not is not looked up, it is simply not found.
-func possibleProfile(k state.ProfileKey) bool {
+func possibleSet(k state.SetKey) bool {
 	return state.KeyOK(k.IMPI, state.MaxKey) && state.KeyOK(k.IMPU, state.MaxKey)
 }
 
@@ -41,13 +48,14 @@ func (d *Dynamo) registrationItem(r *state.Registration, version int64) (map[str
 	if t := r.SweepAt(); !t.IsZero() {
 		sweepAt = t.Unix()
 	}
+	pk := setPK(r.Key)
 	item := map[string]types.AttributeValue{
-		attrPK:      str(r.IMPU),
+		attrPK:      str(pk),
 		attrVersion: num(version),
 		attrDoc:     bin(doc),
 		attrWriter:  str(d.token()),
-		attrIMPI:    str(r.IMPI),
-		attrShard:   str(shardOf(r.IMPU)),
+		attrIMPI:    str(r.Key.IMPI),
+		attrShard:   str(shardOf(pk)),
 		// 0 without contacts, lease or unregistered state lists the
 		// registration as expiring at once, so a sweep deletes one that an
 		// instance left empty.
@@ -69,11 +77,11 @@ func decodeRegistrationItem(item map[string]types.AttributeValue) (*state.Regist
 }
 
 // Registration implements state.Registrations.
-func (d *Dynamo) Registration(ctx context.Context, impu string) (*state.Registration, error) {
-	if !state.KeyOK(impu, state.MaxKey) {
+func (d *Dynamo) Registration(ctx context.Context, k state.SetKey) (*state.Registration, error) {
+	if !possibleSet(k) {
 		return nil, fmt.Errorf("dynamostore: get registration: %w", state.ErrNotFound)
 	}
-	item, err := d.get(ctx, d.registrations, key(impu), "get registration")
+	item, err := d.get(ctx, d.registrations, key(setPK(k)), "get registration")
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +98,7 @@ func (d *Dynamo) RegistrationsOf(ctx context.Context, impi string) ([]*state.Reg
 		return nil, err
 	}
 	out, err := decodeAll(items, decodeRegistrationItem)
-	slices.SortFunc(out, func(a, b *state.Registration) int { return strings.Compare(a.IMPU, b.IMPU) })
+	slices.SortFunc(out, func(a, b *state.Registration) int { return strings.Compare(a.Key.IMPU, b.Key.IMPU) })
 	return out, err
 }
 
@@ -107,7 +115,7 @@ func (d *Dynamo) SaveRegistration(ctx context.Context, r *state.Registration) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := d.putVersioned(ctx, d.registrations, r.IMPU, r.Version, item, "save registration"); err != nil {
+	if err := d.putVersioned(ctx, d.registrations, setPK(r.Key), r.Version, item, "save registration"); err != nil {
 		return nil, err
 	}
 	saved := r.Clone()
@@ -117,10 +125,63 @@ func (d *Dynamo) SaveRegistration(ctx context.Context, r *state.Registration) (*
 
 // DeleteRegistration implements state.Registrations.
 func (d *Dynamo) DeleteRegistration(ctx context.Context, r *state.Registration) error {
-	if !state.KeyOK(r.IMPU, state.MaxKey) {
+	if !possibleSet(r.Key) {
 		return fmt.Errorf("dynamostore: delete registration: %w", state.ErrNotFound)
 	}
-	return d.deleteVersioned(ctx, d.registrations, r.IMPU, r.Version, "delete registration")
+	return d.deleteVersioned(ctx, d.registrations, setPK(r.Key), r.Version, "delete registration")
+}
+
+// Identity implements state.Registrations.
+func (d *Dynamo) Identity(ctx context.Context, impu string) (*state.Identity, error) {
+	if !state.KeyOK(impu, state.MaxKey) {
+		return nil, fmt.Errorf("dynamostore: get identity: %w", state.ErrNotFound)
+	}
+	item, err := d.get(ctx, d.registrations, key(impu), "get identity")
+	if err != nil {
+		return nil, err
+	}
+	doc, err := docOf(item)
+	if err != nil {
+		return nil, err
+	}
+	version, err := nv(item, attrVersion)
+	if err != nil {
+		return nil, err
+	}
+	return decodeIdentity(doc, impu, version)
+}
+
+// SaveIdentity implements state.Registrations. An identity item has no index
+// attribute: no listing or sweep sees it.
+func (d *Dynamo) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
+	if err := i.Validate(); err != nil {
+		return nil, err
+	}
+	version, err := d.nextVersion(i.Version)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := encodeIdentity(i)
+	if err != nil {
+		return nil, err
+	}
+	item := map[string]types.AttributeValue{
+		attrPK: str(i.IMPU), attrVersion: num(version), attrDoc: bin(doc), attrWriter: str(d.token()),
+	}
+	if err := d.putVersioned(ctx, d.registrations, i.IMPU, i.Version, item, "save identity"); err != nil {
+		return nil, err
+	}
+	saved := *i
+	saved.Version = version
+	return &saved, nil
+}
+
+// DeleteIdentity implements state.Registrations.
+func (d *Dynamo) DeleteIdentity(ctx context.Context, i *state.Identity) error {
+	if !state.KeyOK(i.IMPU, state.MaxKey) {
+		return fmt.Errorf("dynamostore: delete identity: %w", state.ErrNotFound)
+	}
+	return d.deleteVersioned(ctx, d.registrations, i.IMPU, i.Version, "delete identity")
 }
 
 // ExpiringRegistrations implements state.Registrations.
@@ -148,8 +209,8 @@ func (d *Dynamo) ExpiringRegistrations(ctx context.Context, now time.Time, limit
 
 // Profile implements state.Profiles. It checks KeepUntil itself, because TTL
 // deletion can lag by days.
-func (d *Dynamo) Profile(ctx context.Context, k state.ProfileKey, now time.Time) (*state.Profile, error) {
-	if !possibleProfile(k) {
+func (d *Dynamo) Profile(ctx context.Context, k state.SetKey, now time.Time) (*state.Profile, error) {
+	if !possibleSet(k) {
 		return nil, fmt.Errorf("dynamostore: get profile: %w", state.ErrNotFound)
 	}
 	item, err := d.get(ctx, d.registrations, profileKey(k), "get profile")
@@ -166,7 +227,7 @@ func (d *Dynamo) Profile(ctx context.Context, k state.ProfileKey, now time.Time)
 	return p, nil
 }
 
-func decodeProfile(k state.ProfileKey, item map[string]types.AttributeValue) (*state.Profile, error) {
+func decodeProfile(k state.SetKey, item map[string]types.AttributeValue) (*state.Profile, error) {
 	doc, err := docOf(item)
 	if err != nil {
 		return nil, err
@@ -183,38 +244,66 @@ func decodeProfile(k state.ProfileKey, item map[string]types.AttributeValue) (*s
 }
 
 // SaveProfile implements state.Profiles with a PutItem conditional on no
-// later profile of the set being stored. A resend carries the same time and
-// passes.
+// later profile of the set being stored and on ttl not having moved past the
+// one it writes, which is the later of p's KeepUntil and the stored one: a
+// save never brings KeepUntil closer, which a registration on another
+// instance may have just extended. The stored item is read first; one that
+// changes between the read and the put is read again. A resend carries the
+// same values and passes.
 func (d *Dynamo) SaveProfile(ctx context.Context, p *state.Profile) error {
 	if err := state.ValidProfile(p); err != nil {
 		return err
 	}
-	item := profileKey(p.Key)
-	item[attrDoc] = bin(p.UserData)
-	item[attrReceived] = num(p.Received.UnixNano())
-	item[attrTTL] = num(p.KeepUntil.Unix())
-	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName:                 aws.String(d.registrations),
-		Item:                      item,
-		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #rcv <= :rcv"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#rcv": attrReceived},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(p.Received.UnixNano())},
-	})
-	switch {
-	case ccf(err):
-		return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
-	case err != nil:
-		return sanitize("save profile", err)
+	for range saveProfileAttempts {
+		ttl := p.KeepUntil.Unix()
+		cur, err := d.get(ctx, d.registrations, profileKey(p.Key), "save profile")
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+		case err != nil:
+			return err
+		default:
+			stored, err := decodeProfile(p.Key, cur)
+			if err != nil {
+				return err
+			}
+			if stored.Received.After(p.Received) {
+				return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
+			}
+			ttl = max(ttl, stored.KeepUntil.Unix())
+		}
+		item := profileKey(p.Key)
+		item[attrDoc] = bin(p.UserData)
+		item[attrReceived] = num(p.Received.UnixNano())
+		item[attrTTL] = num(ttl)
+		_, err = d.api.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName:                 aws.String(d.registrations),
+			Item:                      item,
+			ConditionExpression:       aws.String("attribute_not_exists(#pk) OR (#rcv <= :rcv AND #ttl <= :ttl)"),
+			ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#rcv": attrReceived, "#ttl": attrTTL},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(p.Received.UnixNano()), ":ttl": num(ttl)},
+		})
+		switch {
+		case ccf(err):
+			// A later profile, or a later ttl, was stored meanwhile.
+			continue
+		case err != nil:
+			return sanitize("save profile", err)
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
 }
+
+// saveProfileAttempts bounds how often SaveProfile reads again a profile that
+// changed under it.
+const saveProfileAttempts = 3
 
 // KeepProfile implements state.Profiles with an UpdateItem of ttl alone,
 // conditional on the profile being there and ttl moving later. A resend, or a
 // profile already kept as long, fails the condition and is read back; one
 // that a save replaced with an earlier ttl meanwhile gets a second attempt.
-func (d *Dynamo) KeepProfile(ctx context.Context, k state.ProfileKey, until, now time.Time) error {
-	if !possibleProfile(k) {
+func (d *Dynamo) KeepProfile(ctx context.Context, k state.SetKey, until, now time.Time) error {
+	if !possibleSet(k) {
 		return fmt.Errorf("dynamostore: keep profile: %w", state.ErrNotFound)
 	}
 	for range 2 {
@@ -249,8 +338,8 @@ func (d *Dynamo) KeepProfile(ctx context.Context, k state.ProfileKey, until, now
 
 // DeleteProfileIf implements state.Profiles with a DeleteItem conditional on
 // received. A resend finds nothing and succeeds.
-func (d *Dynamo) DeleteProfileIf(ctx context.Context, k state.ProfileKey, received time.Time) error {
-	if !possibleProfile(k) {
+func (d *Dynamo) DeleteProfileIf(ctx context.Context, k state.SetKey, received time.Time) error {
+	if !possibleSet(k) {
 		return nil
 	}
 	_, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
@@ -270,8 +359,8 @@ func (d *Dynamo) DeleteProfileIf(ctx context.Context, k state.ProfileKey, receiv
 }
 
 // DeleteProfile implements state.Profiles.
-func (d *Dynamo) DeleteProfile(ctx context.Context, k state.ProfileKey) error {
-	if !possibleProfile(k) {
+func (d *Dynamo) DeleteProfile(ctx context.Context, k state.SetKey) error {
+	if !possibleSet(k) {
 		return nil
 	}
 	if _, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(d.registrations), Key: profileKey(k)}); err != nil {

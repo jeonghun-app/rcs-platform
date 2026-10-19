@@ -53,18 +53,18 @@ func TestAnAKARegistrationIsChallengedThenAccepted(t *testing.T) {
 	}
 	// Every identity of the implicit set is registered with the binding.
 	for _, impu := range []string{impu1, tel1} {
-		r, err := e.store.Registration(bg, impu)
+		r, err := regOf(e, impu)
 		if err != nil {
 			t.Fatalf("%s: %v", impu, err)
 		}
-		if r.IMPI != impi1 || r.DefaultIMPU != impu1 || len(r.Contacts) != 1 || !r.Contacts[0].Expires.Equal(t0.Add(600*time.Second)) {
+		if r.Key.IMPI != impi1 || r.Key.IMPU != impu1 || len(r.Contacts) != 1 || !r.Contacts[0].Expires.Equal(t0.Add(600*time.Second)) {
 			t.Errorf("%s: %+v", impu, r)
 		}
 		if c := r.Contacts[0]; c.FlowToken != "flow-token" || !c.KeepAlive || c.RegID != 1 || len(c.FeatureTags) != 1 {
 			t.Errorf("%s binding %+v", impu, c)
 		}
 	}
-	p, err := e.store.Profile(bg, state.ProfileKey{IMPI: impi1, IMPU: impu1}, t0)
+	p, err := e.store.Profile(bg, state.SetKey{IMPI: impi1, IMPU: impu1}, t0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestTheHSSDecidesWhoMayRegister(t *testing.T) {
 		e.hss.sarResult = &r
 		u := e.akaUser(impi1, impu1)
 		wantStatus(t, u.registerWith(e.instance(1), 600), 403)
-		if _, err := e.store.Registration(bg, impu1); err == nil {
+		if _, err := regOf(e, impu1); err == nil {
 			t.Error("a registration was stored")
 		}
 	})
@@ -225,14 +225,14 @@ func TestAReRegistrationAsksForUserDataOnlyIfTheProfileIsGone(t *testing.T) {
 	if s := e.hss.lastSAR(t); s.AssignmentType != cx.ReRegistration || s.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable {
 		t.Errorf("SAR %+v", s)
 	}
-	if err := e.store.DeleteProfile(bg, state.ProfileKey{IMPI: impi1, IMPU: impu1}); err != nil {
+	if err := e.store.DeleteProfile(bg, state.SetKey{IMPI: impi1, IMPU: impu1}); err != nil {
 		t.Fatal(err)
 	}
 	wantStatus(t, u.registerWith(g, 600), 200)
 	if s := e.hss.lastSAR(t); s.AssignmentType != cx.ReRegistration || s.UserDataAlreadyAvailable != cx.UserDataNotAvailable {
 		t.Errorf("SAR %+v", s)
 	}
-	if _, err := e.store.Profile(bg, state.ProfileKey{IMPI: impi1, IMPU: impu1}, e.clock.Now()); err != nil {
+	if _, err := e.store.Profile(bg, state.SetKey{IMPI: impi1, IMPU: impu1}, e.clock.Now()); err != nil {
 		t.Errorf("the profile was not stored again: %v", err)
 	}
 }
@@ -241,7 +241,7 @@ func TestReRegistrationsExtendTheProfileOnlyWhenItIsDue(t *testing.T) {
 	e := newEnv(t)
 	g := e.instance(1)
 	u := e.akaUser(impi1, impu1)
-	key := state.ProfileKey{IMPI: impi1, IMPU: impu1}
+	key := state.SetKey{IMPI: impi1, IMPU: impu1}
 	wantStatus(t, u.registerWith(g, 3600), 200)
 	first := must(e.store.Profile(bg, key, e.clock.Now()))(t).KeepUntil
 	for {
@@ -286,11 +286,11 @@ func TestDeregistrationEndsTheSetAndDeletesItsProfile(t *testing.T) {
 				t.Errorf("SAR %+v", s)
 			}
 			for _, impu := range []string{impu1, tel1} {
-				if _, err := e.store.Registration(bg, impu); err == nil {
+				if _, err := regOf(e, impu); err == nil {
 					t.Errorf("%s still registered", impu)
 				}
 			}
-			if _, err := e.store.Profile(bg, state.ProfileKey{IMPI: impi1, IMPU: impu1}, e.clock.Now()); err == nil {
+			if _, err := e.store.Profile(bg, state.SetKey{IMPI: impi1, IMPU: impu1}, e.clock.Now()); err == nil {
 				t.Error("the profile is still stored")
 			}
 		})
@@ -308,7 +308,7 @@ func TestADeregistrationTheHSSCannotBeToldOfKeepsTheBindings(t *testing.T) {
 	e.hss.unavailable = true
 	e.hss.mu.Unlock()
 	wantStatus(t, g.Register(bg, u.request(0, auth), upstream), 480)
-	if r, err := e.store.Registration(bg, impu1); err != nil || len(r.Contacts) != 1 {
+	if r, err := regOf(e, impu1); err != nil || len(r.Contacts) != 1 {
 		t.Errorf("after the failed deregistration: %+v, %v", r, err)
 	}
 }
@@ -344,18 +344,16 @@ func TestABarredIdentityRegistersButIsNotAssociatedNorDefault(t *testing.T) {
 		t.Errorf("P-Associated-URI %q, want the identities that are not barred, default first", got)
 	}
 	for _, impu := range []string{impu1, impu2, tel1} {
-		if r := must(e.store.Registration(bg, impu))(t); r.DefaultIMPU != impu2 {
-			t.Errorf("%s: default %s", impu, r.DefaultIMPU)
+		if r := must(regOf(e, impu))(t); r.Key.IMPU != impu2 {
+			t.Errorf("%s: default %s", impu, r.Key.IMPU)
 		}
 	}
 }
 
 func TestAProfileStoredUnderAnOldDefaultIdentityIsDeleted(t *testing.T) {
 	e := newEnv(t)
-	old := state.ProfileKey{IMPI: impi1, IMPU: impu1}
-	if _, err := e.store.SaveRegistration(bg, &state.Registration{IMPU: impu1, IMPI: impi1, DefaultIMPU: impu1, Unregistered: t0.Add(time.Hour)}); err != nil {
-		t.Fatal(err)
-	}
+	old := state.SetKey{IMPI: impi1, IMPU: impu1}
+	seed(t, e, impi1, []string{impu1}, func(r *state.Registration) { r.Unregistered = t0.Add(time.Hour) })
 	if err := e.store.SaveProfile(bg, &state.Profile{Key: old, UserData: []byte("<x/>"), Received: t0, KeepUntil: t0.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +364,7 @@ func TestAProfileStoredUnderAnOldDefaultIdentityIsDeleted(t *testing.T) {
 	if _, err := e.store.Profile(bg, old, t0); err == nil {
 		t.Error("the profile under the old default identity is still stored")
 	}
-	must(e.store.Profile(bg, state.ProfileKey{IMPI: impi1, IMPU: tel1}, t0))(t)
+	must(e.store.Profile(bg, state.SetKey{IMPI: impi1, IMPU: tel1}, t0))(t)
 }
 
 func TestCredentialsForAnotherAlgorithmAreChallengedAgainAndUseUpNothing(t *testing.T) {
@@ -401,7 +399,7 @@ func TestAUEThatCouldNotAuthenticateTheNetworkIsForbiddenAndTheHSSIsTold(t *test
 	if !u.challengeOf(res, 0).Stale {
 		t.Error("the vector survived the failure report")
 	}
-	if _, err := e.store.Registration(bg, impu1); err == nil {
+	if _, err := regOf(e, impu1); err == nil {
 		t.Error("a registration was stored")
 	}
 	// A nonce no instance issued is challenged again, with no store read or
