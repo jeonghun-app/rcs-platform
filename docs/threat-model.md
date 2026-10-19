@@ -35,8 +35,28 @@ separate from its core listener; core SIP ports admit only platform services
 MSRP session ids act as capabilities (ADR 0004). A task that reaches the `rcs-as`
 MSRP port and learns a session id could read or inject chat content.
 **Control:** only `msrp-relay` reaches that port; session ids carry ≥128 random
-bits and never appear in logs or errors.
-**Status:** planned (`internal/msrp` in #28, relay and security groups later).
+bits and never appear in logs or errors. On the client side of the relay
+([msrp-relay](msrp-relay.md)):
+- a session id not in the issued form (32 lower-case base32 characters, 160
+  bits) gets 481 without a store lookup;
+- bindings are keyed by the SHA-256 of the client-side session id, which is
+  never stored or logged, so a copy of the table does not let anyone connect as
+  the client;
+- one client connection claims a binding with a conditional write, on whichever
+  task it reaches; a second connection gets 403 and is logged (ADR 0004);
+- lookups that find nothing are rate-limited per source address (IPv6 /64) and
+  survive reconnects (`RELAY_FAILED_LOOKUPS_PER_SOURCE`), and unknown sessions
+  per connection are capped (`RELAY_MAX_UNKNOWN_SESSIONS`);
+- the relay connects only to hosts in `RELAY_CORE_NETWORKS` (private ranges)
+  or the Cloud Map namespace, on ports in `RELAY_CORE_PORTS`, and checks the
+  resolved address again before dialling.
+
+The table still holds `rcs-as`'s core-side session id in `core_path`, so read
+access to it must stay with the relay task role.
+**Status:** implemented in `internal/msrp` (session ids, no ids in logs) and
+`msrp-relay` (the controls above). Security groups that keep everything but
+`msrp-relay` off the `rcs-as` MSRP port, and the IAM policy test for the
+table, are planned (#56, Phase 7 infrastructure).
 
 ## T4 — Compromise of an internet-facing service
 
@@ -52,8 +72,16 @@ compromised, its reach is what its security group and tokens allow:
 
 **Control:** ADR 0007 §2–§4; parsers are fuzzed, bounded and linear
 (architecture §8).
-**Status:** parser rules implemented for merged libraries; reach limits planned
-(Phase 7 infrastructure, #12 token scopes). `acs` can re-issue credentials of
+**Status:** parser rules implemented for merged libraries. Per service:
+
+| Service | Implemented in the service | Planned |
+|---|---|---|
+| `pcscf` | nothing yet: the service is not built | the service (#16), security groups (#56) |
+| `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
+| `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
+| `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |
+
+`acs` can re-issue credentials of
 every `acs_managed` subscription; the audit log and rate limit bound and reveal
 that, they do not prevent it.
 
@@ -96,3 +124,52 @@ metric dimension (architecture §8).
 **Control:** every listener and parser has size, count, time and per-source limits;
 reviews check maximum-size inputs (architecture §8).
 **Status:** implemented for merged libraries; each service adds its own.
+
+## T10 — Forged receipts, routes and floods through `rcs-as`
+
+`rcs-as` stores messages for absent recipients and carries delivery and display
+notifications (IMDN) back to senders. A subscriber could:
+
+- send notifications about messages it never received (a false "read" or
+  "failed");
+- write `IMDN-Record-Route` or `IMDN-Route` headers that make `rcs-as` send a
+  request from inside the network to a host of its choosing;
+- fill another subscriber's queue, or resend one notification without end.
+
+The store also keeps a record of who wrote to whom, which is communication
+metadata.
+
+**Control** ([rcs-as](rcs-as.md)):
+
+- **Notifications.**
+  - A notification is accepted only from a recipient of the message it names,
+    or from a configured intermediary reporting processing or failure.
+  - It must name a message its addressee sent, and a disposition that message
+    asked for.
+  - It is accepted once per notifier and kind.
+  - Who sent it is the identity the network asserted (T2), never the CPIM
+    `From`.
+- **Routes.** IMDN routes are followed only when the whole URI is one of
+  `RCSAS_TRUSTED_ROUTES`. A host check is not used, because a user part, a
+  `maddr` or URI headers could make it pass a URI that leads elsewhere. Other
+  entries are dropped from generated notifications and ignored in forwarded
+  ones.
+- **Floods.** These are bounded:
+  - per-recipient queues, by count and bytes, across tasks;
+  - each sender's share of a queue (an eighth by default), so that no sender
+    can lock the others out; notifications are bounded by the sent records and
+    by being accepted once instead;
+  - is-composing forwarding, per leg;
+  - per-sender rates for messages and notifications;
+  - the size of notifications;
+  - store keys built from client input, which are limited in length.
+- **Display names.** Names copied from CPIM are escaped, bidirectional
+  controls included. They are for display only, never an asserted identity.
+- **Metadata.** Sent-message records hold sender, recipients, Message-ID and
+  the dispositions asked for, and no content. They are kept for
+  `RCSAS_SENT_TTL`, which defaults to `RCSAS_STORE_TTL` plus one day (8 days),
+  and DynamoDB's TTL deletes them at their own expiry. Queued message bodies
+  are removed when delivered or swept, with a one-day TTL backstop.
+
+**Status:** implemented in `internal/rcsas` (#59). The SIP-layer contracts
+(`Delivery.Route`, `Delivery.SenderName`) apply when the SIP layer is built.

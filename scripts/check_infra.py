@@ -7,7 +7,10 @@ platform the ADRs describe:
   the listed source groups on the listed ports, never an address range; every
   group replaces the default allow-all egress; egress mirrors the matrix plus
   HTTPS for the AWS APIs;
-* every NLB target group has Proxy Protocol v2 on (ADR 0003), and every
+* plain SIP and MSRP listeners, and their public ports, exist in dev only
+  (ADR 0003);
+* every NLB target group has Proxy Protocol v2 on and keeps connections at
+  deregistration (ADR 0003), and every
   internet-facing ALB has an AWS WAF web ACL (ft-server and acs limit per task
   only, docs/ft-server.md);
 * every task definition has a read-only root file system, drops all Linux
@@ -121,13 +124,29 @@ def _rule(group: str, props: dict, peer_key: str) -> Rule:
     )
 
 
+def inline_rules(items: list) -> list[tuple[dict, str | None]]:
+    """Inline rules with the condition each depends on.
+
+    A rule may be wrapped in Fn::If [Condition, rule, AWS::NoValue]; both
+    branches are rules the template can produce, so both are checked.
+    """
+    found = []
+    for item in items:
+        if isinstance(item, dict) and "Fn::If" in item:
+            condition, *branches = item["Fn::If"]
+            found += [(b, condition) for b in branches if isinstance(b, dict) and "Ref" not in b]
+        else:
+            found.append((item, None))
+    return found
+
+
 def collect(template: dict) -> tuple[list[Rule], list[Rule]]:
     """Every ingress and egress rule, inline or separate."""
     ingress, egress = [], []
     for name, sg in resources(template, "AWS::EC2::SecurityGroup").items():
         props = sg.get("Properties", {})
-        ingress += [_rule(name, p, "SourceSecurityGroupId") for p in props.get("SecurityGroupIngress", [])]
-        egress += [_rule(name, p, "DestinationSecurityGroupId") for p in props.get("SecurityGroupEgress", [])]
+        ingress += [_rule(name, p, "SourceSecurityGroupId") for p, _ in inline_rules(props.get("SecurityGroupIngress", []))]
+        egress += [_rule(name, p, "DestinationSecurityGroupId") for p, _ in inline_rules(props.get("SecurityGroupEgress", []))]
     for r in resources(template, "AWS::EC2::SecurityGroupIngress").values():
         props = r.get("Properties", {})
         ingress.append(_rule(logical_id(props.get("GroupId")) or "?", props, "SourceSecurityGroupId"))
@@ -201,6 +220,36 @@ def check_target_groups(template: dict) -> list[str]:
             # With client addresses preserved, targets would have to admit the
             # clients' address ranges, outside the matrix.
             problems.append(f"{name}: NLB target group must not preserve client addresses (PPv2 carries them)")
+        if attrs.get("deregistration_delay.connection_termination.enabled") != "false":
+            # On, the NLB resets every connection of a deregistered target at
+            # once, ahead of the service's staggered drain (ADR 0003).
+            problems.append(f"{name}: NLB target group must keep connections at deregistration (connection_termination false)")
+    return problems
+
+
+# Plain SIP and MSRP on the NLB: ADR 0003 refuses them in staging and prod.
+PLAIN_PORTS = {5060, 2855}
+PLAIN_PROTOCOLS = {"TCP", "UDP", "TCP_UDP"}
+
+
+def dev_only(template: dict, condition: str | None) -> bool:
+    """Whether a condition holds only in dev: IsDev, or an And that has it."""
+    if condition == "IsDev":
+        return True
+    definition = template.get("Conditions", {}).get(condition) if condition else None
+    return isinstance(definition, dict) and {"Condition": "IsDev"} in definition.get("Fn::And", [])
+
+
+def check_plain_listeners(template: dict) -> list[str]:
+    problems = []
+    for name, listener in resources(template, "AWS::ElasticLoadBalancingV2::Listener").items():
+        protocol = listener.get("Properties", {}).get("Protocol")
+        if protocol in PLAIN_PROTOCOLS and not dev_only(template, listener.get("Condition")):
+            problems.append(f"{name}: a plain {protocol} listener outside dev (ADR 0003)")
+    nlb = resources(template, "AWS::EC2::SecurityGroup").get("NlbSecurityGroup", {})
+    for rule, condition in inline_rules(nlb.get("Properties", {}).get("SecurityGroupIngress", [])):
+        if rule.get("FromPort") in PLAIN_PORTS and not dev_only(template, condition):
+            problems.append(f"NlbSecurityGroup: plain port {rule.get('FromPort')} open outside dev (ADR 0003)")
     return problems
 
 
@@ -365,6 +414,7 @@ def check_table_readers(template: dict) -> list[str]:
 CHECKS = (
     check_security_groups,
     check_target_groups,
+    check_plain_listeners,
     check_waf,
     check_tasks,
     check_tables,

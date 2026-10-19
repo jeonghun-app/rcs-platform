@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"regexp"
+	"regexp/syntax"
 	"strings"
 	"testing"
 )
@@ -60,6 +62,8 @@ func FuzzEvaluateTrigger(f *testing.F) {
 	f.Add(uint8(4), "m", "TCP/(TLS/)?MSRP", "INVITE", "sip:a@b", "", "", "m=message 9 TCP/TLS/MSRP *")
 	f.Add(uint8(1), "MESSAGE", "", "MESSAGE", "", "", "", "")
 	f.Add(uint8(3), "", "", "OPTIONS", "", "", "", "")
+	f.Add(uint8(2), "Subject", `[\.]com|\x41`, "MESSAGE", "sip:a@b", "Subject", `\com`, "")
+	f.Add(uint8(4), "[]^[:alpha:]]", "[[.a.]]|[[=a=]]|[^]a[]", "INVITE", "", "", "", "m=]")
 	f.Fuzz(func(t *testing.T, kind uint8, p1, p2, method, uri, name, value, line string) {
 		var c Condition
 		switch kind % 5 {
@@ -109,6 +113,33 @@ func FuzzEvaluateTrigger(f *testing.F) {
 				_, b, errB := padded.Next(hr, Context{}, -1)
 				if errA == nil && errB == nil && a != b {
 					t.Fatalf("%q and .*%q.* disagree on %q: %t, %t", p2, p2, value, a, b)
+				}
+			}
+			// And the compiled pattern means what Go's POSIX compiler
+			// says the ERE means (#61: "0+?" is (0+)?, not lazy).
+			budget := MaxSetInstructions
+			if got, err := compilePattern("Content", p2, 0, &budget); err == nil {
+				if ref, err := regexp.CompilePOSIX(p2); err == nil && got.re.MatchString(value) != ref.MatchString(value) {
+					t.Fatalf("%q on %q: compiled %t, POSIX %t", p2, value, got.re.MatchString(value), ref.MatchString(value))
+				}
+			}
+		}
+		// An ERE is refused only for its size or for a construct Go reads
+		// differently from IEEE 1003.1, which the refusal names (#67), in
+		// every mode.
+		for _, p := range []string{p1, p2} {
+			if _, err := syntax.Parse(p, posixFlags); err != nil {
+				continue
+			}
+			departure := ereDeparture(p)
+			for _, mode := range []patternMode{0, patternFoldCase, patternFoldCase | patternWhole} {
+				budget := MaxSetInstructions
+				_, err := compilePattern("Pattern", p, mode, &budget)
+				switch {
+				case departure != "" && (err == nil || !strings.Contains(err.Error(), departure)):
+					t.Fatalf("%q (mode %d) uses %s but was not refused for it: %v", p, mode, departure, err)
+				case departure == "" && err != nil && !strings.Contains(err.Error(), "instructions"):
+					t.Fatalf("%q (mode %d) refused: %v", p, mode, err)
 				}
 			}
 		}

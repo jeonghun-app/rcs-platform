@@ -52,6 +52,13 @@ Resources:
         ScanOnPush: true
       EncryptionConfiguration:
         EncryptionType: AES256
+      # Rule 1 expires untagged images, such as the platform and attestation
+      # manifests under the acs release index. ECR never expires an image an
+      # index still refers to ("If an image is referenced by a manifest list,
+      # it cannot be expired ... without the manifest list being deleted
+      # first", ECR User Guide, lifecycle policy evaluation rules), so only
+      # orphans go. Rule 2 counts tagged images only, so MaxTaggedImages is
+      # the number of releases a rollback can reach.
       LifecyclePolicy:
         LifecyclePolicyText: !Sub |
           {
@@ -71,7 +78,8 @@ Resources:
                 "rulePriority": 2,
                 "description": "Keep a bounded number of tagged images",
                 "selection": {
-                  "tagStatus": "any",
+                  "tagStatus": "tagged",
+                  "tagPatternList": ["*"],
                   "countType": "imageCountMoreThan",
                   "countNumber": ${MaxTaggedImages}
                 },
@@ -112,7 +120,8 @@ Resources:
                 "rulePriority": 2,
                 "description": "Keep a bounded number of tagged images",
                 "selection": {
-                  "tagStatus": "any",
+                  "tagStatus": "tagged",
+                  "tagPatternList": ["*"],
                   "countType": "imageCountMoreThan",
                   "countNumber": ${MaxTaggedImages}
                 },

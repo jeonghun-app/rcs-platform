@@ -232,7 +232,11 @@ Credentials come from a `CredentialSource`:
     prod only to a private host, together with the service bearer token
     `FT_HSS_TOKEN` from Secrets Manager. A private host is an RFC 1918 or ULA
     address, or a name inside the Cloud Map namespace `RCS_SERVICE_NAMESPACE`.
-    Anything else must be `https://`.
+    Anything else must be `https://`. In staging and prod the client also
+    checks the address the name resolves to, for `http://` and `https://`
+    alike, and connects only to an RFC 1918 or ULA address: a record pointed
+    at the task metadata address, a loopback or a public address gets no
+    connection and no token.
 - `FT_CREDENTIALS=static`. `FT_STATIC_USERS=user=password,...`, for dev and
   test stacks. It is refused in staging and prod.
 
@@ -272,7 +276,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_REALM` | required | Digest realm of the FT credentials |
 | `FT_NONCE_KEY` | random per start | At least 32 bytes, shared by every task. Required in staging and prod |
 | `FT_CREDENTIALS` | `hss` | `hss` or `static` (refused in staging and prod) |
-| `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
+| `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base, such as `http://hss.rcs.local:8081` (the HSS API port, `HSS_API_ADDR`), and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
 | `FT_HSS_TIMEOUT` | `2s` | Per lookup |
 | `FT_MAX_CONCURRENT_LOOKUPS` | `16` | Credential lookups in progress per task, and HSS connections |
 | `FT_STATIC_USERS` | required with `static` | `user=password,...` |

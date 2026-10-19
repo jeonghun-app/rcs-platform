@@ -11,6 +11,21 @@ with one command. Device configuration comes from
 > **Status: under construction.** The services are being built in the order of the
 > [roadmap](#roadmap). Nothing here is production-ready yet.
 
+## Status
+
+Built and merged on `main` (details in [CHANGELOG.md](CHANGELOG.md)):
+
+- **Libraries**: service runtime, identifier masking, SIP messages, SIP/HTTP
+  Digest and AKA, Milenage, SDP, Diameter base, Cx and Sh, iFC, MSRP, CPIM,
+  IMDN, conference-info, PROXY protocol v2.
+- **Services**: `ft-server` ([docs](docs/ft-server.md)) and `msrp-relay`
+  ([docs](docs/msrp-relay.md)). Both run on their own; nothing calls them yet.
+- **Decisions**: ADRs 0001–0007 and the [threat model](docs/threat-model.md).
+
+Not built yet: SIP transport and transactions, `hss`, `pcscf`, `icscf`,
+`scscf`, `rcs-as`, the client simulator, the local stack and the AWS
+infrastructure. There is no release yet.
+
 ## Services
 
 | Service | What it does |
@@ -37,6 +52,16 @@ Only Docker is needed; Go runs in a pinned container.
 make check     # format, vet, tests, race detector, build, docs links, privacy
 make fuzz      # every parser's fuzz target
 make vuln      # go mod verify + govulncheck
+```
+
+The whole platform runs locally with docker compose: the services, DynamoDB
+Local, S3Mock and the pinned `acs` release. See
+[docs/local-stack.md](docs/local-stack.md).
+
+```bash
+make up            # start the local stack and wait until it is healthy
+make e2e-compose   # the client simulator against it
+make down          # stop it and remove its data
 ```
 
 ## Roadmap

@@ -99,6 +99,15 @@ func loadShared(e *Env) shared {
 		e.Invalid("METRICS_NAMESPACE", "not a CloudWatch namespace (1-255 of A-Z a-z 0-9 . - _ / # : space, not starting with AWS/)")
 	}
 
+	if ns := serviceNamespace(e); e.String("SERVICE_NAMESPACE", "") != "" && ns == "" {
+		e.Invalid("SERVICE_NAMESPACE", "not a DNS name (labels of letters, digits and hyphens, the last not all digits)")
+	} else if !strings.Contains(ns, ".") && ns != "" && (s.environment == Staging || s.environment == Prod) {
+		// One label ("local", "com") would make every name under a
+		// top-level domain private (ADR 0007 §5); Cloud Map private
+		// namespaces such as rcs.local have two or more. Dev may use one.
+		e.Invalid("SERVICE_NAMESPACE", "needs two or more labels in staging and prod")
+	}
+
 	if key := e.String("PII_HMAC_KEY", ""); key != "" {
 		s.piiKeySet = true
 		if len(key) < minPIIKeyLen {
@@ -108,6 +117,16 @@ func loadShared(e *Env) shared {
 		}
 	}
 	return s
+}
+
+// serviceNamespace reads RCS_SERVICE_NAMESPACE from the shared variables,
+// normalised, or "" when it is unset or not a DNS name.
+func serviceNamespace(shared *Env) string {
+	v := strings.TrimSuffix(strings.ToLower(shared.String("SERVICE_NAMESPACE", "")), ".")
+	if !validServiceNamespace(v) {
+		return ""
+	}
+	return v
 }
 
 // adminAddr is where the admin server listens and where -healthcheck looks for

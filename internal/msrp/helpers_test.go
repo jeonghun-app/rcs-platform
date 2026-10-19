@@ -82,7 +82,7 @@ func (c *fakeClock) waitTimer(t *testing.T, d time.Duration) {
 			if got == d {
 				return
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(hangGuard):
 			t.Fatalf("no %v timer was armed", d)
 		}
 	}
@@ -154,7 +154,7 @@ func (p *wirePeer) next(t *testing.T) *Message {
 			t.Fatalf("connection ended: %v", <-p.errs)
 		}
 		return m
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("no message arrived")
 	}
 	return nil
@@ -169,7 +169,7 @@ func (p *wirePeer) closed(t *testing.T) {
 			if !ok {
 				return
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(hangGuard):
 			t.Fatal("connection stayed open")
 		}
 	}
@@ -219,7 +219,7 @@ func newSyncPeer(t *testing.T, nc net.Conn) *syncPeer {
 func (p *syncPeer) next(t *testing.T) *Message {
 	t.Helper()
 	// The deadline only stops a broken test from hanging.
-	_ = p.nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = p.nc.SetReadDeadline(time.Now().Add(hangGuard))
 	m, err := p.r.ReadMessage(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatalf("peer read: %v", err)
@@ -291,7 +291,7 @@ func (h *recorder) message(t *testing.T) *Message {
 	select {
 	case m := <-h.messages:
 		return m
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("no message delivered")
 	}
 	return nil
@@ -302,7 +302,7 @@ func (h *recorder) report(t *testing.T) Report {
 	select {
 	case r := <-h.reports:
 		return r
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("no report delivered")
 	}
 	return Report{}
@@ -320,7 +320,7 @@ func waitDone(t *testing.T, done <-chan struct{}, what string) {
 	t.Helper()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatalf("%s did not end", what)
 	}
 }
