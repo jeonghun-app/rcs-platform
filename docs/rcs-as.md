@@ -286,11 +286,11 @@ limitations](#assumptions-and-limitations)).
 
 | SIP event | Call |
 |---|---|
-| An INVITE to the conference factory, with a resource list | `group.Service.Create` (the creator is joined; the invitees are invited, and the SIP layer invites them) |
+| An INVITE to the conference factory, with a resource list | `group.Service.Create` (the creator is joined; the invitees are invited, and the SIP layer invites them). A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` entries is refused (`ErrTooMany`) before any entry is read; the SIP layer should bound the resource-list body it parses to about that many entries too |
 | A participant's session with the group is set up (its INVITE, or its answer to the focus's) | `Join`, then `OpenLeg` / `Offer` and `Leg.Answer` with `Mode: store.Group` and the conference URI as `Peer`. If `Join` refuses, the session is refused and no leg opened |
 | A BYE on that session | `Leave`, and `Leg.Close` |
 | A 603 Decline to the focus's INVITE | `Leave`, not `InviteFailed`. The reference client declines the first INVITE of a group it left while offline (RCC.07 6.3.3.1; rcsjta `isGroupChatNextInviteRejected`), and accepts later ones as a new addition. Other failures stay `InviteFailed` |
-| A REFER adding someone | `Add` |
+| A REFER adding someone | `Add`. A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 is refused unread, as for `Create` |
 | A REFER with `method=BYE` removing someone | `Remove`, then a BYE on the removed participant's session and `Leg.Close` |
 | `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated`), so that it learns no later roster change |
 | A SUBSCRIBE to the conference event package | `Roster`: the full document for the first NOTIFY |

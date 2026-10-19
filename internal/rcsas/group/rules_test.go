@@ -145,9 +145,13 @@ func TestAddingRespectsTheSizeLimitAndTheAddersRate(t *testing.T) {
 	if err := r.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: carol}, {Identity: dave}}); err != nil {
 		t.Fatalf("up to the limit: %v", err)
 	}
-	// alice's burst went on creating the group with bob (1) ...
+	// alice's burst went on creating the group with bob (1) and another
+	// with three (3) ...
+	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}, {Identity: carol}, {Identity: dave}}}); err != nil {
+		t.Fatal(err)
+	}
 	var many []Invitee
-	for i := range 5 {
+	for i := range 3 {
 		many = append(many, Invitee{Identity: fmt.Sprintf("sip:u%d@example.net", i)})
 	}
 	if err := r.s.Add(t.Context(), g.URI, alice, many); !errors.Is(err, ErrRateLimited) {
@@ -158,6 +162,44 @@ func TestAddingRespectsTheSizeLimitAndTheAddersRate(t *testing.T) {
 	}
 	if r.m.get("group.rejected.too_many") != 1 || r.m.get("group.rejected.rate_limited") != 1 {
 		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// The security review (PR #118, round 2): an invitation list is bounded
+// by its length before any identity in it is looked at, so a list of tens
+// of thousands costs nothing. The invalid identity at its end shows the
+// order: it would be ErrInvalid if the list were read first.
+func TestAnOverlongInvitationListIsRefusedUnread(t *testing.T) {
+	r := newRig(t, Config{MaxParticipants: 5})
+	g := r.create(bob)
+	list := func(n int) []Invitee {
+		in := make([]Invitee, n)
+		for i := range in[:n-1] {
+			in[i] = Invitee{Identity: fmt.Sprintf("sip:u%d@example.net", i)}
+		}
+		in[n-1] = Invitee{Identity: "not a URI"}
+		return in
+	}
+	for _, n := range []int{6, 30_000} {
+		if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: list(n)}); !errors.Is(err, ErrTooMany) {
+			t.Errorf("Create with %d: %v", n, err)
+		}
+		if err := r.s.Add(t.Context(), g.URI, bob, list(n-1)); !errors.Is(err, ErrTooMany) {
+			t.Errorf("Add of %d: %v", n-1, err)
+		}
+	}
+	// At the bound, the list is read, and the bad identity found.
+	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: list(5)}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Create with 5: %v", err)
+	}
+	if err := r.s.Add(t.Context(), g.URI, bob, list(4)); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Add of 4: %v", err)
+	}
+	// A list with the creator and repeats in it still fits.
+	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{
+		{Identity: alice}, {Identity: bob}, {Identity: "tel:+1-555-010-0002"}, {Identity: carol}, {Identity: dave},
+	}}); err != nil {
+		t.Errorf("a list with the creator and a repeat: %v", err)
 	}
 }
 

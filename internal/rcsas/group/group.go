@@ -266,6 +266,11 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		return groupstore.Group{}, ErrInvalid
 	}
 	r.Creator = creator
+	if len(r.Invitees) > s.cfg.MaxParticipants {
+		// Refused before any work on the list, which the client sizes:
+		// even with the creator and a repeat in it, it cannot fit.
+		return groupstore.Group{}, ErrTooMany
+	}
 	invitees, err := canonicalInvitees(r.Invitees)
 	if err != nil {
 		return groupstore.Group{}, err
@@ -323,14 +328,17 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 
 // canonicalInvitees checks the invitees and puts their identities in
 // canonical form, leaving out the repeats that canonical form reveals.
+// Callers bound the list's length first.
 func canonicalInvitees(in []Invitee) ([]Invitee, error) {
-	var out []Invitee
+	out := make([]Invitee, 0, len(in))
+	seen := make(map[string]bool, len(in))
 	for _, x := range in {
 		id, ok := canonical(x.Identity)
 		if !ok || !validText(x.DisplayName, MaxDisplayNameLength) {
 			return nil, ErrInvalid
 		}
-		if !slices.ContainsFunc(out, func(y Invitee) bool { return y.Identity == id }) {
+		if !seen[id] {
+			seen[id] = true
 			out = append(out, Invitee{Identity: id, DisplayName: x.DisplayName})
 		}
 	}
@@ -445,6 +453,10 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 	by, ok := canonical(by)
 	if !ok {
 		return ErrInvalid
+	}
+	if len(who) > s.cfg.MaxParticipants-1 {
+		// As in Create: the group has someone in it already.
+		return ErrTooMany
 	}
 	who, err := canonicalInvitees(who)
 	if err != nil {
