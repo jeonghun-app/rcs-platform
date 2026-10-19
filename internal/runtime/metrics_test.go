@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"reflect"
@@ -86,6 +87,7 @@ func TestInvalidMetricNamesAreDroppedAndReportedOnce(t *testing.T) {
 		"auth.fail.001010000000001", "msisdn15550100001", "x.12345678",
 	} {
 		m.Count(name, 1)
+		m.Gauge(name, 1)
 		m.Timing(name, time.Millisecond)
 	}
 	m.Flush()
@@ -338,6 +340,26 @@ func TestAQuietTimingIsWrittenAsEveryValueAsRecorded(t *testing.T) {
 	}
 	if vs := values(t, byName(metricLines(t, m, &buf))["t"]); len(vs) != 100 || vs[37] != 37.001 {
 		t.Fatalf("100 values written as %v", vs)
+	}
+	for i := range 101 {
+		m.Timing("t", time.Duration(i)*time.Millisecond+time.Microsecond)
+	}
+	if vs := values(t, byName(metricLines(t, m, &buf))["t"]); len(vs) != 100 || vs[0] != 0.001 || vs[99] != 100.001 {
+		t.Fatalf("101 values written as %d values from %v to %v, want 100 with the exact ends", len(vs), vs[0], vs[len(vs)-1])
+	}
+}
+
+func TestABusyTimingKeepsNoValuesOnlyBuckets(t *testing.T) {
+	m := NewMetrics(io.Discard, "RCS", "pcscf", func() time.Time { return epoch }, discardLogger())
+	for i := range 100_000 {
+		m.Timing("sip.latency", time.Duration(i%3+1)*time.Millisecond)
+	}
+	m.mu.Lock()
+	tm := m.timings["sip.latency"]
+	kept, buckets := len(tm.exact), len(tm.buckets)
+	m.mu.Unlock()
+	if kept != 0 || buckets != 3 {
+		t.Fatalf("100000 durations of 3 values keep %d values in %d buckets, want none in 3", kept, buckets)
 	}
 }
 

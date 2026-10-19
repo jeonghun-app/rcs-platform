@@ -302,6 +302,7 @@ func TestFlushWritesCountsOnceAndGaugesAsTheirCurrentValue(t *testing.T) {
 	m.bytesIn.Add(10)
 	m.bytesOut.Add(20)
 	m.bridges.Add(3)
+	m.conns.Add(2)
 	m.flush(h.Runtime.Metrics)
 	m.flush(h.Runtime.Metrics)
 	for name, want := range map[string]float64{
@@ -314,8 +315,9 @@ func TestFlushWritesCountsOnceAndGaugesAsTheirCurrentValue(t *testing.T) {
 	// Each line is read, not their sum, so one line of 6 cannot pass for
 	// two lines of 3.
 	m.bridges.Add(-1)
+	m.conns.Add(-1)
 	m.flush(h.Runtime.Metrics)
-	for name, want := range map[string][]float64{mActiveBridges: {3, 2}, mClientConnections: {0, 0}} {
+	for name, want := range map[string][]float64{mActiveBridges: {3, 2}, mClientConnections: {2, 1}} {
 		if got := h.MetricValues(name); !slices.Equal(got, want) {
 			t.Fatalf("%s lines = %v, want %v", name, got, want)
 		}
