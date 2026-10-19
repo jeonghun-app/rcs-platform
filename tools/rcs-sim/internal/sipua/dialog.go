@@ -104,6 +104,20 @@ func (ua *UA) Invite(ctx context.Context, req *sip.Request, progress func(*sip.R
 		delete(ua.invites, inv.key)
 		ua.mu.Unlock()
 	})
+	// Once Invite has returned, nobody holds a dialog a 2xx makes: from
+	// then on a 2xx takes the fork route, ACK and BYE, as one after a
+	// failure response does. A dialog made just before, by a 2xx that
+	// raced the return, is ended too.
+	var handed *Dialog
+	defer func() {
+		inv.mu.Lock()
+		inv.final = true
+		d := inv.d
+		inv.mu.Unlock()
+		if d != nil && d != handed {
+			go func() { _, _ = d.Bye(context.Background()) }()
+		}
+	}()
 	tx, err := ua.layer.Request(req, ua.destination(), inv.handle)
 	if err != nil {
 		return nil, nil, ua.sendError(err)
@@ -139,6 +153,7 @@ func (ua *UA) Invite(ctx context.Context, req *sip.Request, progress func(*sip.R
 			res := ev.res
 			d := inv.dialog()
 			if !cancelled {
+				handed = d
 				return d, res, nil
 			}
 			if d != nil {
