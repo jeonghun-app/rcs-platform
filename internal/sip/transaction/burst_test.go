@@ -33,6 +33,37 @@ func (handoffTU) ServerFailed(*ServerTransaction, error) {}
 // the goroutines reading that connection; when those writes were synchronous,
 // both sides blocked writing to a peer that was not reading, and the connection
 // died at WriteTimeout with every transaction on it.
+// burstT1 makes Timer B and F (64*T1) far longer than any burst takes, even on
+// a starved CI runner: these tests are about the transport not deadlocking,
+// and slowness alone must not fail them. A deadlock still does, by closing the
+// connection at WriteTimeout.
+const burstT1 = 10 * time.Second
+
+// burstWriteTimeout is long for the same reason: a send waiting for queue room
+// on a slow runner is not a failure of what is tested here.
+const burstWriteTimeout = 30 * time.Second
+
+// failures tallies why client transactions of a burst failed.
+type failures struct {
+	mu    sync.Mutex
+	kinds map[string]int
+}
+
+func (f *failures) add(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.kinds == nil {
+		f.kinds = map[string]int{}
+	}
+	f.kinds[err.Error()]++
+}
+
+func (f *failures) String() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fmt.Sprint(f.kinds)
+}
+
 func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 	total := 20000
 	if raceEnabled {
@@ -45,11 +76,11 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 		t.Run(fmt.Sprintf("%d DelayTrying=%v", v.code, v.delay), func(t *testing.T) {
 			mk := func(code int) (*transport.Transport, *Layer, netip.AddrPort) {
 				var layer *Layer
-				tr, err := transport.New(transport.Config{WriteTimeout: 3 * time.Second}, func(in transport.Inbound) { layer.Receive(in) })
+				tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout}, func(in transport.Inbound) { layer.Receive(in) })
 				if err != nil {
 					t.Fatal(err)
 				}
-				layer = New(tr, handoffTU{code}, Config{DelayTrying: v.delay})
+				layer = New(tr, handoffTU{code}, Config{DelayTrying: v.delay, T1: burstT1})
 				a, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
 				if err != nil {
 					t.Fatal(err)
@@ -61,6 +92,7 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			btr, _, baddr := mk(v.code)
 			body := []byte(strings.Repeat("a=x\r\n", 800)) // 4 KiB
 			var final, failed atomic.Int64
+			var why failures
 			var wg sync.WaitGroup
 			for w := range 8 {
 				wg.Add(1)
@@ -75,23 +107,25 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 						_, err := al.Request(req, transport.Destination{Network: transport.TCP, Addr: baddr}, func(res *sip.Response, err error) {
 							if err != nil {
 								failed.Add(1)
+								why.add(err)
 							} else if res.StatusCode >= 200 {
 								final.Add(1)
 							}
 						})
 						if err != nil {
 							failed.Add(1)
+							why.add(err)
 						}
 					}
 				}()
 			}
 			wg.Wait()
-			for deadline := time.Now().Add(40 * time.Second); final.Load()+failed.Load() < int64(total) && time.Now().Before(deadline); {
+			for deadline := time.Now().Add(2 * burstWriteTimeout); final.Load()+failed.Load() < int64(total) && time.Now().Before(deadline); {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if failed.Load() > 0 || final.Load() != int64(total) {
-				t.Errorf("final=%d failed=%d of %d; WriteErrors A=%d B=%d", final.Load(), failed.Load(), total,
-					atr.Stats().WriteErrors, btr.Stats().WriteErrors)
+				t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), total, &why,
+					atr.Stats(), btr.Stats())
 			}
 		})
 	}
@@ -126,11 +160,11 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			mk := func() (*transport.Transport, *Layer, *sourceTU, netip.AddrPort) {
 				tu := &sourceTU{code: code, first: make(chan transport.Source, 1)}
 				var layer *Layer
-				tr, err := transport.New(transport.Config{}, func(in transport.Inbound) { layer.Receive(in) })
+				tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout}, func(in transport.Inbound) { layer.Receive(in) })
 				if err != nil {
 					t.Fatal(err)
 				}
-				layer = New(tr, tu, Config{})
+				layer = New(tr, tu, Config{T1: burstT1})
 				a, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
 				if err != nil {
 					t.Fatal(err)
@@ -143,9 +177,11 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			body := []byte(strings.Repeat("a=x\r\n", 32<<10/5)) // 32 KiB
 
 			var final, failed atomic.Int64
+			var why failures
 			collect := func(res *sip.Response, err error) {
 				if err != nil {
 					failed.Add(1)
+					why.add(err)
 				} else if res.StatusCode >= 200 {
 					final.Add(1)
 				}
@@ -170,6 +206,7 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 				for i := from; i < total; i += 4 {
 					if _, err := l.Request(invite(side, i), dst, collect); err != nil {
 						failed.Add(1)
+						why.add(err)
 					}
 				}
 			}
@@ -180,13 +217,13 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			}
 			wg.Wait()
 			want := int64(2 * total) // each side sends total INVITEs, A's first included
-			for deadline := time.Now().Add(40 * time.Second); final.Load()+failed.Load() < want && time.Now().Before(deadline); {
+			for deadline := time.Now().Add(2 * burstWriteTimeout); final.Load()+failed.Load() < want && time.Now().Before(deadline); {
 				time.Sleep(20 * time.Millisecond)
 			}
 			as, bs := atr.Stats(), btr.Stats()
 			if failed.Load() > 0 || final.Load() != want || as.Dialed != 1 || bs.Dialed != 0 ||
 				as.QueueOverflows+bs.QueueOverflows+as.WriteErrors+bs.WriteErrors > 0 {
-				t.Errorf("final=%d failed=%d of %d; A %+v; B %+v", final.Load(), failed.Load(), want, as, bs)
+				t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), want, &why, as, bs)
 			}
 		})
 	}
