@@ -90,9 +90,6 @@ var (
 	ErrInvalid = errors.New("group: invalid request")
 	// ErrRateLimited: whoever asked has used up its allowance.
 	ErrRateLimited = errors.New("group: rate limited")
-	// ErrNameTaken: another participant, current or former, goes by that
-	// display name (nameKey), which would let one pass for the other.
-	ErrNameTaken = errors.New("group: display name taken")
 	// ErrBusy: the group kept changing under the update; try again.
 	ErrBusy = errors.New("group: too many concurrent changes")
 )
@@ -264,27 +261,29 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 // (its INVITE is what creates it), and the invitees, invited.
 func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group, error) {
 	creator, ok := canonical(r.Creator)
-	if !ok || !validText(r.CreatorName, MaxDisplayNameLength) || !validText(r.Subject, MaxSubjectLength) ||
-		r.Conversation != "" && !messaging.ValidID(r.Conversation) {
+	if !ok || !validText(r.Subject, MaxSubjectLength) || r.Conversation != "" && !messaging.ValidID(r.Conversation) {
 		return groupstore.Group{}, ErrInvalid
 	}
 	r.Creator = creator
+	dropped := 0
+	if !validText(r.CreatorName, MaxDisplayNameLength) {
+		r.CreatorName, dropped = "", 1
+	}
 	if len(r.Invitees) > s.cfg.MaxParticipants {
 		// Refused before any work on the list, which the client sizes:
 		// even with the creator and a repeat in it, it cannot fit.
 		return groupstore.Group{}, ErrTooMany
 	}
-	invitees, err := canonicalInvitees(r.Invitees)
-	if err != nil {
-		return groupstore.Group{}, err
-	}
+	invitees, d := s.canonicalInvitees(r.Invitees)
+	dropped += d
 	invitees = slices.DeleteFunc(invitees, func(in Invitee) bool { return in.Identity == creator })
 	names := groupstore.Group{Participants: []groupstore.Participant{{Identity: creator, DisplayName: r.CreatorName}}}
-	for _, in := range invitees {
+	for i, in := range invitees {
 		if nameTaken(&names, in.Identity, in.DisplayName) {
-			return groupstore.Group{}, ErrNameTaken
+			invitees[i].DisplayName = ""
+			dropped++
 		}
-		names.Participants = append(names.Participants, groupstore.Participant{Identity: in.Identity, DisplayName: in.DisplayName})
+		names.Participants = append(names.Participants, groupstore.Participant{Identity: in.Identity, DisplayName: invitees[i].DisplayName})
 	}
 	switch {
 	case len(invitees) == 0:
@@ -332,27 +331,39 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	}
 	g.Rev = 1
 	s.metrics.Count("group.created", 1)
+	s.metrics.Count("group.name_dropped", int64(dropped))
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})
 	return g, nil
 }
 
-// canonicalInvitees checks the invitees and puts their identities in
-// canonical form, leaving out the repeats that canonical form reveals.
-// Callers bound the list's length first.
-func canonicalInvitees(in []Invitee) ([]Invitee, error) {
+// canonicalInvitees puts the invitees' identities in canonical form,
+// leaving out the repeats that canonical form reveals and anyone whose
+// identity is no SIP or tel URI the group can hold (counted as
+// group.invitee_skipped): a client's list is not refused for one entry,
+// and the caller finds who was added in the group it gets back. A name
+// that is not valid text is dropped, the invitee kept; it returns how many
+// were. Callers bound the list's length first.
+func (s *Service) canonicalInvitees(in []Invitee) ([]Invitee, int) {
 	out := make([]Invitee, 0, len(in))
 	seen := make(map[string]bool, len(in))
+	skipped, dropped := 0, 0
 	for _, x := range in {
 		id, ok := canonical(x.Identity)
-		if !ok || !validText(x.DisplayName, MaxDisplayNameLength) {
-			return nil, ErrInvalid
+		if !ok {
+			skipped++
+			continue
+		}
+		if !validText(x.DisplayName, MaxDisplayNameLength) {
+			x.DisplayName = ""
+			dropped++
 		}
 		if !seen[id] {
 			seen[id] = true
 			out = append(out, Invitee{Identity: id, DisplayName: x.DisplayName})
 		}
 	}
-	return out, nil
+	s.metrics.Count("group.invitee_skipped", int64(skipped))
+	return out, dropped
 }
 
 // Join records that who joined the group: an invited participant
@@ -364,7 +375,7 @@ func canonicalInvitees(in []Invitee) ([]Invitee, error) {
 // or was removed is then given up, not kept to invite it again.
 func (s *Service) Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
 	who, ok := canonical(who)
-	if !ok || !validText(displayName, MaxDisplayNameLength) {
+	if !ok {
 		return groupstore.Group{}, ErrInvalid
 	}
 	g, err := s.join(ctx, uri, who, displayName)
@@ -375,13 +386,22 @@ func (s *Service) Join(ctx context.Context, uri, who, displayName string) (group
 }
 
 func (s *Service) join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
-	return s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
+	dropped := false
+	g, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
 		i := index(g, who)
 		if i < 0 || !g.Participants[i].State.Active() {
 			return nil, ErrNotParticipant
 		}
 		p := &g.Participants[i]
-		if p.State == groupstore.Joined && (displayName == "" || displayName == p.DisplayName) {
+		// A name that is not valid text, or that someone else goes by, is
+		// not refused but dropped: whoever asks still joins, under its
+		// identity alone, and passes for nobody.
+		name := displayName
+		dropped = name != "" && (!validText(name, MaxDisplayNameLength) || nameTaken(g, who, name))
+		if dropped {
+			name = ""
+		}
+		if p.State == groupstore.Joined && (displayName == "" || name == p.DisplayName) {
 			return nil, nil
 		}
 		if p.State == groupstore.Joined && !s.senders.Allow(uri+"\x00"+who, now, 1) {
@@ -389,17 +409,18 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 			// participant renaming itself in a loop would spam them all.
 			return nil, ErrRateLimited
 		}
-		if displayName != "" && nameTaken(g, who, displayName) {
-			return nil, ErrNameTaken
-		}
 		if p.State != groupstore.Joined {
 			p.State, p.Since = groupstore.Joined, now
 		}
 		if displayName != "" {
-			p.DisplayName = displayName
+			p.DisplayName = name
 		}
 		return []string{who}, nil
 	})
+	if err == nil && dropped {
+		s.metrics.Count("group.name_dropped", 1)
+	}
+	return g, err
 }
 
 // Leave records that who left the group, by a BYE or by declining the
@@ -471,9 +492,9 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		// As in Create: the group has someone in it already.
 		return ErrTooMany
 	}
-	who, err := canonicalInvitees(who)
-	if err != nil {
-		return err
+	who, invalidNames := s.canonicalInvitees(who)
+	if len(who) == 0 {
+		return ErrInvalid
 	}
 	now := s.cfg.Clock.Now()
 	if !s.adds.Allow(by, now, len(who)) {
@@ -481,8 +502,9 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		return ErrRateLimited
 	}
 	var added []string
-	_, err = s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
-		added = nil
+	dropped := 0
+	_, err := s.change(ctx, uri, func(g *groupstore.Group, now time.Time) ([]string, error) {
+		added, dropped = nil, invalidNames
 		adder := index(g, by)
 		if adder < 0 || g.Participants[adder].State != groupstore.Joined {
 			return nil, ErrNotParticipant
@@ -499,14 +521,18 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 				// Otherwise any participant could undo the chairman's
 				// removal at once (threat model T11).
 				return nil, ErrNotChairman
-			case key != "" && names[key] != "" && names[key] != in.Identity:
-				return nil, ErrNameTaken
 			}
-			if key != "" {
+			name := in.DisplayName
+			switch {
+			case key != "" && names[key] != "" && names[key] != in.Identity:
+				// Someone else's: the invitee comes in without one.
+				name = ""
+				dropped++
+			case key != "":
 				names[key] = in.Identity
 			}
 			changed = append(changed, in.Identity)
-			p := groupstore.Participant{Identity: in.Identity, DisplayName: in.DisplayName, Role: groupstore.Member,
+			p := groupstore.Participant{Identity: in.Identity, DisplayName: name, Role: groupstore.Member,
 				State: groupstore.Invited, AddedBy: by, Since: now}
 			if i >= 0 {
 				g.Participants[i] = p
@@ -524,6 +550,7 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 		for _, who := range added {
 			s.engine.ParticipantAdded(uri, who)
 		}
+		s.metrics.Count("group.name_dropped", int64(dropped))
 	}
 	return err
 }
@@ -679,8 +706,6 @@ func reasonOf(err error) string {
 		return "too_many"
 	case errors.Is(err, ErrInvalid):
 		return "invalid"
-	case errors.Is(err, ErrNameTaken):
-		return "name_taken"
 	}
 	return "other"
 }

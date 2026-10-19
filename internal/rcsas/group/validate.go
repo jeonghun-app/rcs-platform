@@ -2,6 +2,7 @@ package group
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -65,19 +66,35 @@ func validText(s string, max int) bool {
 
 // nameKey is the form in which display names are compared for
 // uniqueness: lower case, white space runs as one space, the ends trimmed,
-// and the invisible format characters that make one name show as another
-// (bidirectional controls, zero-width characters, U+FEFF) left out. Names
-// a reader could not tell apart then compare equal. It does not fold
-// look-alike letters of different scripts.
+// and every character that shows as nothing left out: the format
+// characters (Unicode category Cf: bidirectional controls, zero-width
+// characters, the soft hyphen, tags, U+FEFF) and the other
+// Default_Ignorable_Code_Points (variation selectors, the combining
+// grapheme joiner, the Hangul fillers). Names a reader could not tell
+// apart then compare equal. It does not normalize (NFC), nor fold
+// look-alike letters of different scripts (threat model T11).
 func nameKey(name string) string {
 	clean := strings.Map(func(r rune) rune {
-		switch {
-		case r == 0x061c, 0x200b <= r && r <= 0x200f, 0x202a <= r && r <= 0x202e, 0x2066 <= r && r <= 0x2069, r == 0xfeff:
+		if invisible(r) {
 			return -1
 		}
 		return r
 	}, name)
 	return strings.ToLower(strings.Join(strings.Fields(clean), " "))
+}
+
+// invisible reports whether r is a format character or another
+// Default_Ignorable_Code_Point (Unicode PropList).
+func invisible(r rune) bool {
+	switch {
+	case unicode.Is(unicode.Cf, r),
+		r == 0x034f, r == 0x115f, r == 0x1160, r == 0x17b4, r == 0x17b5, r == 0x3164, r == 0xffa0,
+		0x180b <= r && r <= 0x180f, 0x2060 <= r && r <= 0x206f, 0xfe00 <= r && r <= 0xfe0f,
+		0xfff0 <= r && r <= 0xfff8, 0x1bca0 <= r && r <= 0x1bca3, 0x1d173 <= r && r <= 0x1d17a,
+		0xe0000 <= r && r <= 0xe0fff:
+		return true
+	}
+	return false
 }
 
 // nameTaken reports whether someone in g other than who, current or

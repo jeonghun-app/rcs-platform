@@ -204,11 +204,15 @@ metadata.
   `From`, the writer's asserted identity under its roster name, and one `To`,
   the group. No other header that any receiver could read as a `From` or `To`
   survives, whatever its case, prefix or namespace, so nobody writes as
-  someone else by address. Nor by name: a roster refuses a name another
-  participant, current or former, goes by, compared without case, extra
-  space and invisible format characters (look-alike letters of other
-  scripts are not folded). A 1-to-1 message, forwarded unchanged,
-  is refused if it has such a header.
+  someone else by address. Nor by name: a name another participant,
+  current or former, goes by, compared without case, extra space and
+  characters that show as nothing, is dropped, and its owner joins under
+  its identity alone; nobody is kept out for a name. A 1-to-1 message,
+  forwarded unchanged, is refused if it has such a header.
+  Residual risk: names are not normalized (NFC), so canonically equivalent
+  spellings (an é composed or decomposed) compare different, and look-alike
+  letters of other scripts are not folded; such a name can still look like
+  another's, next to a different identity.
 - **Notifications.** They are matched by the group's own record of the
   message, in the group or sent to the author outside it, accepted only from
   participants it went to, for themselves (`recipient-uri`), once per kind.

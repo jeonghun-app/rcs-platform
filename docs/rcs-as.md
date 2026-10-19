@@ -314,11 +314,15 @@ group sessions. They have not been checked against the licensed texts.
 
 Every value is checked before anything is stored, and the roster documents are
 built before each write, so that no request can store a group whose roster
-cannot be written (`invalid`):
+cannot be written. A bad creator, subject or Conversation-ID refuses the
+request (`invalid`); a bad invitee or name never does:
 
 - **Identities** must be SIP or tel URIs that name a user, at most 255 bytes
   (`identity.MaxLength`), without `&` or `'`, which XML would escape in the
-  roster.
+  roster. An invitee in `Create` or `Add` whose identity is not one is left
+  out (`group.invitee_skipped`) and the others are invited; the SIP layer
+  finds who was in the group returned. A list with nobody left is
+  `invalid`.
   They are stored and compared in canonical form (`identity.CanonicalIMPU`,
   the form the HSS provisions): a SIP URI keeps its user part, loses its
   parameters and has its host in lower case; a tel URI is a global number
@@ -329,12 +333,19 @@ cannot be written (`invalid`):
   leg opened under another spelling still gets its participant's copies.
 - **Names** are at most 100 bytes and **the subject** at most 256 bytes of
   UTF-8 that XML can carry, without control characters.
-- **A name is one participant's.** `Create`, `Join` and `Add` refuse a name
-  that another participant, current or former, goes by (`name_taken`), as
-  compared without case, extra white space, bidirectional controls and
-  zero-width characters. The author's roster name is in the `From` of every
-  group message, so one participant cannot pass for another by name.
-  Look-alike letters of different scripts are not folded.
+- **A name is one participant's, and never keeps anyone out.** A name that is
+  too long, is not valid text, or that another participant, current or
+  former, goes by, is dropped: `Create`, `Join` and `Add` store that
+  participant without a name (`group.name_dropped`), and its roster entry and
+  the `From` of what it writes carry its identity alone. Names are not cut
+  short, which could make two equal. They are compared without case, extra
+  white space, and every character that shows as nothing (Unicode format
+  characters and the other default-ignorable code points: bidirectional
+  controls, zero-width characters, the soft hyphen, variation selectors,
+  tags, Hangul fillers). The author's roster name is in the `From` of every
+  group message, so one participant cannot pass for another by name. Names
+  are not normalized (NFC), and look-alike letters of different scripts are
+  not folded.
 - **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
   in 1-to-1 chat.
 
@@ -673,7 +684,8 @@ identifier ever appears in a metric name.
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
-| `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `name_taken`, `rate_limited` |
+| `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
+| `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through

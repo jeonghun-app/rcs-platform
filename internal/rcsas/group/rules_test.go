@@ -57,8 +57,9 @@ func TestCreationIsBounded(t *testing.T) {
 		"beyond the size limit": {CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}, {Identity: carol}, {Identity: dave}}}, ErrTooMany},
 		"an overlong subject": {CreateRequest{Creator: alice, Subject: strings.Repeat("s", MaxSubjectLength+1),
 			Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
+		// Kept, without the name.
 		"an overlong name": {CreateRequest{Creator: alice,
-			Invitees: []Invitee{{Identity: bob, DisplayName: strings.Repeat("n", MaxDisplayNameLength+1)}}}, ErrInvalid},
+			Invitees: []Invitee{{Identity: bob, DisplayName: strings.Repeat("n", MaxDisplayNameLength+1)}}}, nil},
 		"an overlong Conversation-ID": {CreateRequest{Creator: alice, Conversation: strings.Repeat("c", messaging.MaxIDLength+1),
 			Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
 		"a Conversation-ID with a space": {CreateRequest{Creator: alice, Conversation: "a b", Invitees: []Invitee{{Identity: bob}}}, ErrInvalid},
@@ -191,12 +192,16 @@ func TestAnOverlongInvitationListIsRefusedUnread(t *testing.T) {
 			t.Errorf("Add of %d: %v", n-1, err)
 		}
 	}
-	// At the bound, the list is read, and the bad identity found.
-	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: list(5)}); !errors.Is(err, ErrInvalid) {
-		t.Errorf("Create with 5: %v", err)
+	// At the bound, the list is read: the bad identity is left out and
+	// the others are invited.
+	if c, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: list(5)}); err != nil || len(c.Participants) != 5 {
+		t.Errorf("Create with 5: %v, %d participants", err, len(c.Participants))
 	}
-	if err := r.s.Add(t.Context(), g.URI, bob, list(4)); !errors.Is(err, ErrInvalid) {
+	if err := r.s.Add(t.Context(), g.URI, bob, list(4)); err != nil {
 		t.Errorf("Add of 4: %v", err)
+	}
+	if r.m.get("group.invitee_skipped") != 2 {
+		t.Errorf("metrics %v", r.m)
 	}
 	// A list with the creator and repeats in it still fits.
 	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{
@@ -402,10 +407,18 @@ func TestRenamingInAGroupIsBounded(t *testing.T) {
 	if _, err := r.s.Join(t.Context(), g.URI, bob, "Bob again"); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("beyond the rate: %v", err)
 	}
-	if _, err := r.s.Join(t.Context(), g.URI, bob, strings.Repeat("n", MaxDisplayNameLength+1)); !errors.Is(err, ErrInvalid) {
+	// An overlong name is dropped, not refused: bob is left nameless,
+	// carol added without one.
+	r.clock.Advance(time.Minute)
+	if g, err := r.s.Join(t.Context(), g.URI, bob, strings.Repeat("n", MaxDisplayNameLength+1)); err != nil {
 		t.Fatalf("an overlong name: %v", err)
+	} else if p, _ := g.Participant(bob); p.DisplayName != "" {
+		t.Fatalf("bob %+v", p)
 	}
-	if err := r.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: carol, DisplayName: strings.Repeat("n", MaxDisplayNameLength+1)}}); !errors.Is(err, ErrInvalid) {
+	if err := r.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: carol, DisplayName: strings.Repeat("n", MaxDisplayNameLength+1)}}); err != nil {
 		t.Fatalf("adding with an overlong name: %v", err)
+	}
+	if r.m.get("group.name_dropped") != 2 {
+		t.Fatalf("metrics %v", r.m)
 	}
 }
