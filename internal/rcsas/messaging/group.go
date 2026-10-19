@@ -266,8 +266,10 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 	// call that fails, costs that recipient the message and nobody else.
 	// The calls run one after another on the sender's session, so all of
 	// them together are bounded too: past FanoutTimeout the rest are left
-	// out and the sender, answered as for a store failure, sends again
-	// (recipients drop the repeats by Message-ID).
+	// out and the sender is answered as for a store failure. The reference
+	// client does not resend by itself: it marks the message failed and
+	// ends the session, and its user may send it again (recipients drop
+	// the repeats by Message-ID).
 	//
 	// Each message starts at a random recipient: with a store too slow for
 	// the whole list, the ones left out differ from one message, or one

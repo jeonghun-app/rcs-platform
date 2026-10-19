@@ -131,7 +131,8 @@ type Config struct {
 	StoreTimeout time.Duration
 	// FanoutTimeout bounds the queueing of one group message for all its
 	// recipients, one store call after another; those not reached by then
-	// are not queued, and the sender is answered as for a store failure.
+	// are not queued, and the sender is answered as for a store failure,
+	// after which its user may send the message again.
 	FanoutTimeout time.Duration
 	SweepInterval time.Duration
 	// Batch is how many queued messages one store read returns.
