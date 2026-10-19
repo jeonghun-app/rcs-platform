@@ -295,11 +295,14 @@ func TestALostTaskIsFailedOverAndDroppedFromTheRotation(t *testing.T) {
 // expiring is a caller's context that runs out of time when the test says
 // so, rather than after a fixed delay: its Err is then
 // context.DeadlineExceeded, as a deadline's is, which is what the client
-// must tell apart from an attempt's own RequestTimeout.
+// must tell apart from an attempt's own RequestTimeout. Deadline reports a
+// time already past once it has expired, as a real deadline would.
 type expiring struct {
 	context.Context
-	done chan struct{}
-	once sync.Once
+	done    chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	expired time.Time
 }
 
 func newExpiring(parent context.Context) *expiring {
@@ -317,7 +320,23 @@ func (e *expiring) Err() error {
 	}
 }
 
-func (e *expiring) expire() { e.once.Do(func() { close(e.done) }) }
+func (e *expiring) Deadline() (time.Time, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.expired.IsZero() {
+		return e.expired, true
+	}
+	return e.Context.Deadline()
+}
+
+func (e *expiring) expire() {
+	e.once.Do(func() {
+		e.mu.Lock()
+		e.expired = time.Now()
+		e.mu.Unlock()
+		close(e.done)
+	})
+}
 
 // Once the caller's deadline has passed, a request that has not been
 // answered is not tried on another task. The deadline passes as soon as the
@@ -355,6 +374,11 @@ func TestNoRetryOnceTheCallerHasGivenUp(t *testing.T) {
 	// does.
 	if n := len(a.requests()) + len(b.requests()); n != 1 || e.metrics.count("cxclient.UAR.retry") != 0 {
 		t.Errorf("%d attempts, %d retries after the caller gave up, want 1 and 0", n, e.metrics.count("cxclient.UAR.retry"))
+	}
+	// Nor is the task that was still answering taken out of the rotation:
+	// the caller ran out of time, not the task (QA, #175).
+	if n := e.metrics.count("cxclient.peer.excluded"); n != 0 {
+		t.Errorf("peer.excluded = %d after the caller's own deadline, want 0", n)
 	}
 }
 
