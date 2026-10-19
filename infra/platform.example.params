@@ -1,0 +1,70 @@
+# Parameters of infra/platform.yaml for scripts/deploy.sh --config.
+#
+# One Key=Value per line, taken literally (no quotes, no shell expansion).
+# Every parameter must be present, even when empty: deploy.sh passes each one
+# explicitly, so no deployment, rollback included, silently falls back to a
+# template default or to the previous value. deploy.sh sets EcrStackName,
+# ImageTag and AcsImageTag itself. What each parameter means is in its
+# Description in infra/platform.yaml and in docs/aws-deployment.md#parameters.
+#
+# These values are a dev stack: one task per service, one NAT gateway, plain
+# HTTP on the ALB, no msrp-relay (it needs NlbCertificateArn) and mock SMS.
+# Copy the file, keep your copy out of the repository if it names real
+# accounts or hosts, and read docs/aws-deployment.md before a staging or prod
+# stack: those need both certificates, the three host names, a real SMS
+# provider and two tasks of every service.
+
+# Stage
+Environment=dev
+
+# Network
+VpcCidr=10.30.0.0/16
+NatGateways=single
+ServiceNamespace=rcs.local
+# Narrow to your own address while the stack is not for real clients.
+PublicIngressCidr=203.0.113.10/32
+
+# Load balancers
+AlbCertificateArn=
+NlbCertificateArn=
+FtHostName=
+FtDeregistrationDelay=300
+PcscfEnabled=false
+WafRateLimit=1000
+
+# Identity (MCC 001 / MNC 01 is the test network)
+ImsDomain=ims.mnc001.mcc001.3gppnetwork.org
+FtRealm=ft.ims.mnc001.mcc001.3gppnetwork.org
+AcsHostName=
+RelayPublicHost=
+
+# Services
+HssDesiredCount=1
+HssTaskSize=512x1024
+HssKeyringBootstrap=false
+FtServerDesiredCount=1
+FtServerTaskSize=512x1024
+FtValidityDays=7
+FileEncryption=AES256
+RelayDesiredCount=1
+RelayTaskSize=512x1024
+RelayMaxConnections=5000
+AcsDesiredCount=1
+AcsTaskSize=512x1024
+AcsSmsProvider=mock
+AcsSmsOriginationIdentity=
+AcsDefaultRcsProfile=UP_2.4
+
+# Capacity and alarms
+SubscribersWarmReadUnits=12000
+SubscribersWarmWriteUnits=4000
+MsrpWarmReadUnits=12000
+MsrpWarmWriteUnits=4000
+MsrpReadBudget=1000
+AlarmTopicArn=
+MonthlyBudgetUsd=300
+DailyBudgetUsd=15
+
+# Observability
+ContainerInsights=disabled
+LogRetentionDays=14

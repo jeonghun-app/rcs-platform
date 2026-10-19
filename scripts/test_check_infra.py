@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import pathlib
+import re
 import unittest
 
 import check_infra
@@ -210,11 +211,144 @@ class PlatformServices(TemplateCase):
         del t["Resources"]["SubscribersTable"]["Properties"]["PointInTimeRecoverySpecification"]
         self.assertProblem(t, "SubscribersTable: point-in-time recovery is off")
 
+    def test_only_rcs_as_reads_the_messages(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Query",
+             "Resource": {"Fn::Sub": "${MessagesTable.Arn}/index/expiry"}})
+        self.assertProblem(t, "FtServerTaskRole: may read MessagesTable; only RcsAsTaskRole may")
+
+    def hss_container(self, t: dict) -> dict:
+        return t["Resources"]["HssTaskDefinition"]["Properties"]["ContainerDefinitions"][0]
+
+    def set_start_timeout(self, t: dict, value: str):
+        for e in self.hss_container(t)["Environment"]:
+            if e["Name"] == "HSS_START_TIMEOUT":
+                e["Value"] = value
+
+    def test_the_hss_health_check_outlasts_its_start_timeout(self):
+        t = copy.deepcopy(self.template)
+        self.set_start_timeout(t, "2m")
+        self.assertProblem(t, "StartPeriod + Interval x Retries (105 s) must exceed HSS_START_TIMEOUT (120 s)")
+
+    def test_the_hss_start_timeout_stays_within_what_ecs_can_wait(self):
+        t = copy.deepcopy(self.template)
+        self.set_start_timeout(t, "4m30s")
+        self.hss_container(t)["HealthCheck"]["StartPeriod"] = 300
+        self.assertProblem(t, "HSS_START_TIMEOUT is over 240 s")
+
+    def test_an_unreadable_start_timeout_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.set_start_timeout(t, "1.5m")
+        self.assertProblem(t, "HSS_START_TIMEOUT is not a duration")
+
     def test_a_service_task_role_reading_its_secrets_is_refused(self):
         t = copy.deepcopy(self.template)
         t["Resources"]["FtServerTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
             {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "FtNonceKey"}})
         self.assertProblem(t, "FtServerTaskRole: a task role may read secrets")
+
+
+
+class Parameters(TemplateCase):
+    """Parameter constraints that save a deployment that would fail later."""
+
+    def vpc_cidr_allowed(self, value: str) -> bool:
+        # CloudFormation matches AllowedPattern as a Java regex; this pattern
+        # uses nothing Java and Python read differently.
+        return re.fullmatch(self.template["Parameters"]["VpcCidr"]["AllowedPattern"], value) is not None
+
+    def test_the_vpc_is_rfc_1918_space(self):
+        for value in ("10.30.0.0/16", "10.0.0.0/16", "10.255.0.0/16", "172.16.0.0/16", "172.31.0.0/16", "192.168.0.0/16"):
+            self.assertTrue(self.vpc_cidr_allowed(value), value)
+
+    def test_other_ranges_are_refused(self):
+        # 100.64.0.0/16 is shared address space (RFC 6598): the internal
+        # dialer refuses it, so every HSS lookup would fail (#112).
+        for value in ("100.64.0.0/16", "198.18.0.0/16", "8.8.0.0/16", "999.1.0.0/16", "172.32.0.0/16",
+                      "172.15.0.0/16", "10.256.0.0/16", "192.169.0.0/16", "10.30.1.0/16", "10.30.0.0/20"):
+            self.assertFalse(self.vpc_cidr_allowed(value), value)
+
+
+class AlarmRules(TemplateCase):
+    """docs/architecture.md §8: how alarms read aggregated EMF metrics."""
+
+    def alarm(self, t: dict, name: str) -> dict:
+        return t["Resources"][name]["Properties"]
+
+    def test_a_single_evaluation_period_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "FtAuthBackendError")["EvaluationPeriods"] = 1
+        self.assertProblem(t, "FtAuthBackendError: EvaluationPeriods must be 2 or more")
+
+    def test_a_period_under_a_minute_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "HssLockBusy")["Metrics"][0]["MetricStat"]["Period"] = 10
+        self.assertProblem(t, "HssLockBusy: a period is under 60 s")
+
+    def test_missing_data_must_be_stated(self):
+        t = copy.deepcopy(self.template)
+        del self.alarm(t, "AcsOtpVolume")["TreatMissingData"]
+        self.assertProblem(t, "AcsOtpVolume: TreatMissingData is not set")
+
+    def test_a_missing_count_is_zero(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "RelayStoreErrors")["TreatMissingData"] = "missing"
+        self.assertProblem(t, "RelayStoreErrors: a count treats missing data as missing")
+
+    def test_a_missing_gauge_is_not_zero(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "RelayConnectionsNearLimit")["TreatMissingData"] = "notBreaching"
+        self.assertProblem(t, "RelayConnectionsNearLimit: a gauge or latency treats missing data as notBreaching")
+
+    def test_a_timings_sample_count_is_refused(self):
+        t = copy.deepcopy(self.template)
+        stat = self.alarm(t, "FtSweepStalled")["Metrics"][0]["MetricStat"]
+        stat["Metric"]["MetricName"], stat["Stat"] = "sweep.duration", "SampleCount"
+        self.assertProblem(t, "FtSweepStalled: statistic SampleCount on a service metric")
+
+
+class TableKeys(TemplateCase):
+    def test_the_scscf_tables_use_the_stacks_key(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AuthChallengesTable"]["Properties"]["SSESpecification"] = {"SSEEnabled": True}
+        self.assertProblem(t, "AuthChallengesTable: not encrypted with a customer-managed key of the stack")
+
+    def test_only_scscf_reads_its_state(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Scan", "Resource": {"Fn::GetAtt": ["RegistrationsTable", "Arn"]}})
+        self.assertProblem(t, "HssTaskRole: may read RegistrationsTable; only ScscfTaskRole may")
+
+
+RUNBOOK = TEMPLATE.parent.parent / "docs" / "runbook.md"
+
+
+class AlarmRunbook(TemplateCase):
+    """Every alarm sends whoever is paged to its own runbook section."""
+
+    def anchors(self) -> set[str]:
+        return check_infra.runbook_anchors(str(RUNBOOK))
+
+    def test_the_runbook_has_a_section_for_every_alarm(self):
+        self.assertEqual(check_infra.check_runbook(self.template, self.anchors()), [])
+
+    def test_an_alarm_without_a_link_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["FtAuthBackendError"]["Properties"]["AlarmDescription"]
+        self.assertIn("FtAuthBackendError: the description must link docs/runbook.md#ftauthbackenderror",
+                      " ".join(check_infra.check_runbook(t, self.anchors())))
+
+    def test_a_link_to_another_alarms_section_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssLockBusy"]["Properties"]["AlarmDescription"] = "See docs/runbook.md#hsscxerrors."
+        self.assertIn("HssLockBusy: the description must link docs/runbook.md#hsslockbusy",
+                      " ".join(check_infra.check_runbook(t, self.anchors())))
+
+    def test_a_missing_section_is_refused(self):
+        anchors = self.anchors() - {"relaystoreerrors"}
+        self.assertEqual(check_infra.check_runbook(self.template, anchors),
+                         ["RelayStoreErrors: docs/runbook.md has no section RelayStoreErrors"])
 
 
 if __name__ == "__main__":

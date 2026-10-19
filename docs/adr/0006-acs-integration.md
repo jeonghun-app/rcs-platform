@@ -13,8 +13,9 @@ URLs, and must hand out credentials the platform's `hss` accepts.
 ## Decision
 
 - `acs` is not copied into this repository. `infra/platform.yaml` runs it as an
-  ECS service in the platform VPC from an image built from a pinned `acs` release
-  tag (`ACS_VERSION` in `scripts/deploy.sh`).
+  ECS service in the platform VPC from `acs`'s own release image, pinned by
+  version and digest (`ACS_VERSION`, `ACS_DIGEST` in `scripts/deploy.sh`) and
+  copied into ECR byte for byte, so the stack runs the image that was tested.
 - The platform sets the `acs` environment so that the provisioned values point at
   the deployed `pcscf`, `ft-server` and `rcs-as` URIs.
 - Credential hand-off: `acs` asks `hss` to issue the subscriber's IMS credentials

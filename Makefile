@@ -8,6 +8,7 @@ IMAGE    ?= rcs-platform
 GOIMAGE  ?= rcs-platform-go:$(shell cat deploy/toolchain.Dockerfile 2>/dev/null | sha256sum | cut -c1-12)
 DOCKER   ?= docker
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+SHELLCHECK_IMAGE ?= koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
 # Stand-ins for S3 and DynamoDB in `make test-integration`, pinned like the
 # toolchain so a run tests the same server code every time.
 S3MOCK_IMAGE   ?= adobe/s3mock:5.2.3@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
@@ -87,12 +88,13 @@ infra-tools:
 	  $(DOCKER) build -q -f deploy/infra-tools.Dockerfile -t $(INFRAIMAGE) deploy >/dev/null
 
 .PHONY: infra-lint
-infra-lint: infra-tools ## cfn-lint and the policy checks on infra/*.yaml (no AWS access)
+infra-lint: infra-tools ## cfn-lint, the policy checks and the deploy script tests (no AWS access)
+	$(DOCKER) run --rm -v $(CURDIR):/mnt:ro -w /mnt $(SHELLCHECK_IMAGE) scripts/deploy.sh scripts/teardown.sh
 	$(DOCKER) run --rm -u $(shell id -u):$(shell id -g) -v $(CURDIR):/src:ro -w /src \
 	  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 $(INFRAIMAGE) sh -c '\
 	    set -e; cfn-lint infra/ecr.yaml infra/platform.yaml; \
-	    python3 -m unittest discover -s scripts -p "test_check_infra.py"; \
-	    python3 scripts/check_infra.py infra/platform.yaml'
+	    python3 -m unittest discover -s scripts -p "test_*.py"; \
+	    python3 scripts/check_infra.py --runbook docs/runbook.md infra/platform.yaml'
 
 # The storage backends (internal/ftserver/awsstore) against an S3-compatible
 # container and DynamoDB Local on a private network. Names carry the shell's

@@ -12,21 +12,30 @@ platform the ADRs describe:
   only, docs/ft-server.md);
 * every task definition has a read-only root file system, drops all Linux
   capabilities and is not privileged, and no service enables ECS Exec
-  (ADR 0007 §9);
+  (ADR 0007 §9); hss's health check outlasts HSS_START_TIMEOUT;
 * every DynamoDB table has point-in-time recovery (ADR 0003);
 * no task role can read a secret: secrets reach tasks through the execution
   role only (ADR 0007 §4);
-* tables holding capabilities are read only by their own service's task
-  role, and nothing may export them: msrp-bindings holds rcs-as session ids
-  (threat model T3, #54).
+* tables holding capabilities or message content are read only by their own
+  service's task role, and nothing may export them: msrp-bindings holds
+  rcs-as session ids (threat model T3, #54), messages holds queued messages,
+  the S-CSCF tables hold IMPIs and device addresses, under their own key;
+* alarms follow the EMF rules of docs/architecture.md §8: periods of 60 s or
+  more, N >= 2, explicit treatMissingData, no sampled timing statistics;
+* with --runbook, every alarm links the runbook section named after it, and
+  that section exists, so whoever is paged lands on what to do.
 
 Runs in the infra tools image (deploy/infra-tools.Dockerfile), which provides
-cfn-lint's CloudFormation YAML decoder. Usage: check_infra.py TEMPLATE...
+cfn-lint's CloudFormation YAML decoder. Usage:
+check_infra.py [--runbook docs/runbook.md] TEMPLATE...
 Exit status 1 lists every problem.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import pathlib
+import re
 import sys
 from dataclasses import dataclass
 
@@ -237,6 +246,102 @@ def check_tasks(template: dict) -> list[str]:
     return problems
 
 
+# ECS allows a container health check StartPeriod of 300 s at most.
+MAX_START_TIMEOUT = 240
+
+
+def _seconds(value) -> float | None:
+    """A Go duration of whole units (60s, 4m, 1m30s), or None."""
+    if not isinstance(value, str):
+        return None
+    parts = re.findall(r"(\d+)(h|m|s)", value)
+    if not parts or "".join(n + u for n, u in parts) != value:
+        return None
+    return sum(int(n) * {"h": 3600, "m": 60, "s": 1}[u] for n, u in parts)
+
+
+def check_start_period(template: dict) -> list[str]:
+    """hss's container health check outlasts its start timeout.
+
+    hss exits once HSS_START_TIMEOUT passes without its store and keyring,
+    which the deployment circuit breaker sees. A health check that gave up
+    first would stop the task for a different reason, hiding that one.
+    """
+    problems = []
+    for name, td in resources(template, "AWS::ECS::TaskDefinition").items():
+        for c in td.get("Properties", {}).get("ContainerDefinitions", []):
+            env = {e.get("Name"): e.get("Value") for e in c.get("Environment", [])}
+            if "HSS_START_TIMEOUT" not in env:
+                continue
+            where = f"{name}/{c.get('Name', '?')}"
+            timeout = _seconds(env["HSS_START_TIMEOUT"])
+            check = c.get("HealthCheck", {})
+            if timeout is None:
+                problems.append(f"{where}: HSS_START_TIMEOUT is not a duration in h, m and s")
+                continue
+            if timeout > MAX_START_TIMEOUT:
+                problems.append(f"{where}: HSS_START_TIMEOUT is over {MAX_START_TIMEOUT} s")
+            grace = check.get("StartPeriod", 0) + check.get("Interval", 30) * check.get("Retries", 3)
+            if grace <= timeout:
+                problems.append(f"{where}: StartPeriod + Interval x Retries ({grace} s) must exceed HSS_START_TIMEOUT ({timeout:g} s)")
+    return problems
+
+
+def check_table_keys(template: dict) -> list[str]:
+    problems = []
+    tables = resources(template, "AWS::DynamoDB::Table")
+    for name in sorted(CMK_TABLES):
+        sse = tables.get(name, {}).get("Properties", {}).get("SSESpecification", {})
+        if sse.get("SSEType") != "KMS" or logical_id(sse.get("KMSMasterKeyId")) not in resources(template, "AWS::KMS::Key"):
+            problems.append(f"{name}: not encrypted with a customer-managed key of the stack")
+    return problems
+
+
+def _namespace(metric: dict) -> str:
+    ns = metric.get("Namespace", "")
+    return ns.get("Fn::Sub", "") if isinstance(ns, dict) else ns
+
+
+def check_alarm_rules(template: dict) -> list[str]:
+    """The alarm rules of docs/architecture.md §8 for EMF metrics.
+
+    A minute's EMF values arrive up to a minute late and a task's flushes are
+    not aligned, so every alarm uses periods of 60 s or more and N >= 2
+    evaluation periods, and states treatMissingData. On the services' own
+    metrics, counts (Sum) treat missing as not breaching, except an alarm
+    that fires on too few (missing then is the breach); gauges and latency
+    Maximums treat missing as missing or ignore; and no alarm uses a
+    statistic that describes a timing's sampled values (SampleCount, Average).
+    """
+    problems = []
+    for name, alarm in resources(template, "AWS::CloudWatch::Alarm").items():
+        props = alarm.get("Properties", {})
+        stats = [m["MetricStat"] for m in props.get("Metrics", []) if "MetricStat" in m]
+        if "MetricName" in props:
+            stats.append({"Metric": props, "Period": props.get("Period"), "Stat": props.get("Statistic")})
+        if not isinstance(props.get("EvaluationPeriods"), int) or props["EvaluationPeriods"] < 2:
+            problems.append(f"{name}: EvaluationPeriods must be 2 or more")
+        missing = props.get("TreatMissingData")
+        if missing is None:
+            problems.append(f"{name}: TreatMissingData is not set")
+        for stat in stats:
+            if not isinstance(stat.get("Period"), int) or stat["Period"] < 60:
+                problems.append(f"{name}: a period is under 60 s")
+            if not _namespace(stat.get("Metric", {})).startswith("RCS/"):
+                continue
+            kind = stat.get("Stat")
+            if kind == "Sum":
+                fewer = str(props.get("ComparisonOperator", "")).startswith("LessThan")
+                if missing != ("breaching" if fewer else "notBreaching"):
+                    problems.append(f"{name}: a count treats missing data as {missing}")
+            elif kind == "Maximum":
+                if missing not in ("missing", "ignore"):
+                    problems.append(f"{name}: a gauge or latency treats missing data as {missing}")
+            else:
+                problems.append(f"{name}: statistic {kind} on a service metric (use Sum or Maximum)")
+    return problems
+
+
 def check_tables(template: dict) -> list[str]:
     problems = []
     for name, table in resources(template, "AWS::DynamoDB::Table").items():
@@ -289,8 +394,19 @@ def check_secret_access(template: dict) -> list[str]:
     return problems
 
 
-# Tables whose items are capabilities, and the only roles that may read them.
-TABLE_READERS: dict[str, set[str]] = {"MsrpBindingsTable": {"MsrpRelayTaskRole"}}
+# Tables whose items are capabilities or message content, and the only roles
+# that may read them.
+TABLE_READERS: dict[str, set[str]] = {
+    "MsrpBindingsTable": {"MsrpRelayTaskRole"},
+    "MessagesTable": {"RcsAsTaskRole"},
+    "RegistrationsTable": {"ScscfTaskRole"},
+    "AuthChallengesTable": {"ScscfTaskRole"},
+    "RegSubscriptionsTable": {"ScscfTaskRole"},
+}
+
+# Tables encrypted with a customer-managed key of the stack: their items
+# hold IMPIs, contact addresses and instance ids (docs/scscf-state.md).
+CMK_TABLES = {"RegistrationsTable", "AuthChallengesTable", "RegSubscriptionsTable"}
 
 READ_ACTIONS = {
     "dynamodb:getitem",
@@ -362,12 +478,45 @@ def check_table_readers(template: dict) -> list[str]:
     return problems
 
 
+RUNBOOK_LINK = re.compile(r"docs/runbook\.md#([\w-]+)")
+
+
+def check_runbook(template: dict, anchors: set[str]) -> list[str]:
+    """Every alarm links exactly its own runbook section, which exists.
+
+    The section is named after the alarm's logical id (also its AlarmName
+    after the stack prefix), so the anchor is the id in lower case.
+    """
+    problems = []
+    for name, alarm in resources(template, "AWS::CloudWatch::Alarm").items():
+        anchor = name.lower()
+        description = alarm.get("Properties", {}).get("AlarmDescription")
+        links = RUNBOOK_LINK.findall(description) if isinstance(description, str) else []
+        if links != [anchor]:
+            problems.append(f"{name}: the description must link docs/runbook.md#{anchor} and nothing else")
+        elif anchor not in anchors:
+            problems.append(f"{name}: docs/runbook.md has no section {name}")
+    return problems
+
+
+def runbook_anchors(path: str) -> set[str]:
+    """Heading anchors of a Markdown file, as `make docs` computes them."""
+    source = pathlib.Path(__file__).resolve().parent / "check-links.py"
+    spec = importlib.util.spec_from_file_location("check_links", source)
+    links = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(links)
+    return links.anchors(pathlib.Path(path).read_text())
+
+
 CHECKS = (
     check_security_groups,
     check_target_groups,
     check_waf,
     check_tasks,
+    check_start_period,
     check_tables,
+    check_table_keys,
+    check_alarm_rules,
     check_secret_access,
     check_table_readers,
 )
@@ -380,10 +529,17 @@ def problems(template: dict) -> list[str]:
     return found
 
 
-def main(paths: list[str]) -> int:
-    status = 0
+def main(args: list[str]) -> int:
+    anchors = None
+    if args[:1] == ["--runbook"]:
+        anchors, args = runbook_anchors(args[1]), args[2:]
+    paths, status = args, 0
     for path in paths:
-        for problem in problems(load(path)):
+        template = load(path)
+        found = problems(template)
+        if anchors is not None:
+            found += check_runbook(template, anchors)
+        for problem in found:
             print(f"{path}: {problem}")
             status = 1
     if status == 0:
