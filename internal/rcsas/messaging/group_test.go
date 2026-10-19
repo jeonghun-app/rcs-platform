@@ -625,3 +625,25 @@ func TestTheRewrittenGroupMessageMustFitTheSizeLimit(t *testing.T) {
 		t.Fatalf("one that fits after the rewrite: %v", err)
 	}
 }
+
+// A group message's sender is named in canonical form, as the group names
+// its participants: its author, its share and its From are the ones its
+// own legs and records go by.
+func TestAGroupSenderIsNamedInCanonicalForm(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom("tel:+1-555-010-0001", chat(t, "m1", "hi", imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 || ms[0].Author != alice {
+		t.Fatalf("bob's queue %+v, %v", ms, err)
+	}
+	readAddresses(t, ms[0].CPIM, cpim.Address{URI: alice}, "<"+groupURI+">")
+	if _, err := r.store.Sent(t.Context(), alice, "m1", r.clock.Now()); err != nil {
+		t.Fatalf("alice's own record: %v", err)
+	}
+	if got := rejected(r.e.SubmitGroup(t.Context(), groupFrom("not a URI", chat(t, "m2", "hi", 0)))); got != ReasonNotParticipant {
+		t.Fatalf("a sender that is no URI: %q", got)
+	}
+}
