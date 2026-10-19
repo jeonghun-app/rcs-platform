@@ -232,6 +232,24 @@ type Dialog struct {
 	remoteCSeq uint32
 	ended      bool
 	done       chan struct{}
+	// confirmed is closed when the ACK of the 2xx this UA sent arrives;
+	// nil for a dialog this UA made with Invite, confirmed by its own ACK.
+	// retransmitTimer sends that 2xx again meanwhile (uas.go).
+	confirmed       chan struct{}
+	retransmitTimer transaction.Timer
+}
+
+// closed is a channel that is always closed.
+var closed = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+// Confirmed is closed once the dialog is confirmed (RFC 3261 §12): at once
+// for a dialog Invite made, when the ACK of its 2xx arrives for one
+// IncomingCall.Accept made.
+func (d *Dialog) Confirmed() <-chan struct{} {
+	if d.confirmed == nil {
+		return closed
+	}
+	return d.confirmed
 }
 
 // newDialog makes the dialog of a 2xx to invite (RFC 3261 §12.1.2) and
@@ -411,6 +429,9 @@ func (d *Dialog) endLocked() {
 	}
 	d.ended = true
 	close(d.done)
+	if d.retransmitTimer != nil {
+		d.retransmitTimer.Stop()
+	}
 	d.ua.mu.Lock()
 	delete(d.ua.dialogs, d.key)
 	d.ua.mu.Unlock()

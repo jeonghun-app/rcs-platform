@@ -167,9 +167,24 @@ It sets up 1-to-1 chats as the caller (RFC 3261 §12–15):
   request with a lower CSeq gets 500, and one for a dialog it no longer
   knows gets 481.
 
+As the called party, it hands each INVITE from the network to the scenario
+(`Config.OnInvite`):
+
+- `Ring` answers 180, and `Reject` answers 486, 480, 603 and the like. `Accept`
+  answers 200 with the SDP answer and a Contact with the chat ICSI and `ob`.
+  Every response carries the INVITE's `Record-Route` and the same To tag
+  (RFC 3261 §12.1.1).
+- The 200 is sent again at T1, doubling up to T2, until its ACK confirms the
+  dialog (§13.3.1.4). Without an ACK in 64*T1, the dialog is ended with BYE.
+- The dialog's route set is the INVITE's `Record-Route` in order, and its
+  remote target the INVITE's Contact.
+- A CANCEL before the answer gets 200, and the INVITE 487 (§9.2). After the
+  answer it gets 200 and changes nothing. A CANCEL for no INVITE gets 481.
+
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an
-in-process stand-in for pcscf, the registrar and the far end. The registrar
+in-process stand-in for pcscf, the registrar and the far end, which also
+calls it. The registrar
 authenticates with `internal/sip/digest`'s server side and Milenage vectors.
 
 `-sip-proxy` turns the client's configuration on (see [Running it](#running-it)).

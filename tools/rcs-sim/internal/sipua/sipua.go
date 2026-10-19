@@ -11,8 +11,10 @@
 // §4.2) and its challenges (RFC 3310, RFC 7616, TS 24.229 §5.1.1.2), the
 // route set every later request is sent with (RFC 3608, TS 24.229
 // §5.1.2A.1.1), the timing of the keep-alive pongs (RFC 5626 §4.4.1), and
-// the caller's side of an INVITE dialog (RFC 3261 §12–15): ACK, CANCEL,
-// BYE, and refusing a re-INVITE.
+// both sides of an INVITE dialog (RFC 3261 §12–15): as the caller, ACK,
+// CANCEL and BYE; as the called party, 180 and 200 with the SDP answer,
+// the 2xx sent again until its ACK, CANCEL answered 487; and refusing a
+// re-INVITE either way.
 //
 // A failed flow is not recovered: the UA reports it and stops, and a
 // scenario that wants to go on dials a new one.
@@ -134,6 +136,13 @@ type Config struct {
 	// DefaultPongTimeout.
 	PongTimeout time.Duration
 
+	// OnInvite receives each INVITE the network sends outside a dialog, a
+	// chat for this UA as the called party, to Ring, Accept or Reject. It
+	// runs on the connection's reading goroutine, so it must not block;
+	// the answers may come from any goroutine. Nil leaves INVITEs to
+	// OnRequest.
+	OnInvite func(*IncomingCall)
+
 	// OnRequest receives each request the network sends over the flow, a
 	// MESSAGE or a NOTIFY say, and answers it with tx.Respond. It runs on
 	// the connection's reading goroutine, so it must not block (see
@@ -219,8 +228,10 @@ type UA struct {
 	err                   error
 	done                  chan struct{}
 	closeOnce             sync.Once
-	// dialogs are the INVITE dialogs in progress, by dialogKey.
+	// dialogs are the INVITE dialogs in progress, by dialogKey, and calls
+	// the incoming INVITEs not yet answered, by their transaction.
 	dialogs map[string]*Dialog
+	calls   map[*transaction.ServerTransaction]*IncomingCall
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -261,6 +272,7 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		dialer:  &oneConn{c: c},
 		done:    make(chan struct{}),
 		dialogs: map[string]*Dialog{},
+		calls:   map[*transaction.ServerTransaction]*IncomingCall{},
 		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
@@ -884,8 +896,17 @@ func orDefault(d, fallback time.Duration) time.Duration {
 type tu struct{ ua *UA }
 
 func (t tu) Request(tx *transaction.ServerTransaction) {
-	if d := t.ua.dialogOf(tx.Request()); d != nil {
+	req := tx.Request()
+	if d := t.ua.dialogOf(req); d != nil {
 		d.receive(tx)
+		return
+	}
+	if req.Method == "CANCEL" {
+		t.ua.cancel(tx)
+		return
+	}
+	if to, err := req.Header.To(); req.Method == "INVITE" && err == nil && to.Tag() == "" && t.ua.cfg.OnInvite != nil {
+		t.ua.incoming(tx)
 		return
 	}
 	if t.ua.cfg.OnRequest != nil {
@@ -908,10 +929,17 @@ func (t tu) Request(tx *transaction.ServerTransaction) {
 
 // Stray takes what matches no transaction. A 2xx to an INVITE whose
 // transaction has ended is a retransmission whose ACK was lost, and is
-// ACKed again (RFC 3261 §13.2.2.4); anything else is dropped.
+// ACKed again (RFC 3261 §13.2.2.4). An ACK confirms the dialog of the 2xx
+// it acknowledges. Anything else is dropped.
 func (t tu) Stray(in transport.Inbound) {
-	if res, ok := in.Message.(*sip.Response); ok {
-		t.ua.strayResponse(res)
+	switch m := in.Message.(type) {
+	case *sip.Response:
+		t.ua.strayResponse(m)
+	case *sip.Request:
+		// The ACK of a 2xx this UA sent (§13.3.1.4).
+		if d := t.ua.dialogOf(m); m.Method == "ACK" && d != nil {
+			d.confirm()
+		}
 	}
 }
 
