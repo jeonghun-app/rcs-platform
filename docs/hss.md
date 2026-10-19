@@ -302,9 +302,10 @@ units, a re-registration about 4 read and 1–2 write units. At ap-northeast-2
 on-demand prices (read $0.1355 and write $0.68 per million units, 2026-10), a
 million registrations cost about $3 in DynamoDB and a million re-registrations
 about $1.5; a million subscribers re-registering every hour, about $1.1k a month,
-and up to six times that for clients on 600 s registrations (ADR 0003). Each Cx request writes two EMF lines (count and
-latency, about 300 bytes each), about 2.4 KB per registration: some 2.4 GB, $1.8
-of log ingestion at $0.76/GB, per million registrations. KMS sees only one
+and up to six times that for clients on 600 s registrations (ADR 0003). Metrics
+cost almost nothing in log ingestion: the runtime aggregates them and writes one
+EMF line per metric a minute, at most a few kilobytes each, however many Cx
+requests a task serves. KMS sees only one
 `Decrypt` per task start.
 
 On a task, the profile work of a SAR, reading the stored profile and writing

@@ -745,3 +745,37 @@ type failingListener struct{}
 func (failingListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed") }
 func (failingListener) Close() error              { return nil }
 func (failingListener) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1} }
+
+func TestMetricsAreFlushedEveryIntervalAndOnceMoreAtShutdown(t *testing.T) {
+	counted := make(chan struct{})
+	h := startService(t, devEnv(), testService(func(ctx context.Context, rt *Runtime, _ testConfig) error {
+		rt.Metrics.Count("before.interval", 2)
+		close(counted)
+		<-ctx.Done()
+		// Counted while stopping: only the shutdown flush can write it.
+		rt.Metrics.Count("while.stopping", 1)
+		return nil
+	}))
+	<-counted
+	h.timers.WaitFor(DefaultMetricsInterval)
+	if strings.Contains(h.out.String(), "before.interval") {
+		t.Fatalf("a count was written before the interval ended:\n%s", h.out.String())
+	}
+	h.timers.Fire(DefaultMetricsInterval)
+	// The loop makes its next timer once the flush is written.
+	h.timers.WaitForN(DefaultMetricsInterval, 2)
+	if n := strings.Count(h.out.String(), `"before.interval":2`); n != 1 {
+		t.Fatalf("%d lines for the first interval:\n%s", n, h.out.String())
+	}
+	h.cancel()
+	if code := h.wait(); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	out := h.out.String()
+	if strings.Count(out, `"before.interval":`) != 1 || !strings.Contains(out, `"while.stopping":1`) {
+		t.Fatalf("the shutdown flush is missing or repeats the first interval:\n%s", out)
+	}
+	if strings.Index(out, "while.stopping") < strings.Index(out, `"msg":"stopped"`) {
+		t.Fatalf("the shutdown flush ran before the service stopped:\n%s", out)
+	}
+}

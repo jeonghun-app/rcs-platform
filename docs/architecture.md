@@ -215,7 +215,9 @@ uses DynamoDB Local and a local S3.
   MSISDN pass through `internal/pii` before they are logged. Message bodies,
   credentials, nonces, RAND/AUTN, keys and tokens are never logged.
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
-  needed. No identifier is ever a metric dimension.
+  needed. They are aggregated in memory and written once a minute and at
+  shutdown, one line per metric, so log volume does not grow with traffic. No
+  identifier is ever a metric dimension.
 - **Health**: every service serves `/healthz` (process alive) and `/readyz`
   (dependencies reachable) on its admin port, and supports `-healthcheck` so a
   distroless image can run an ECS container health check.

@@ -380,6 +380,19 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	defer cancelRun()
 
 	log.Info("started", slog.String("environment", string(sh.environment)), slog.String("admin_addr", ln.Addr().String()))
+	// Metrics are flushed every interval until the process stops, and once
+	// more after the shutdown hooks so that the last interval is not lost.
+	flushDone := make(chan struct{})
+	flushCtx, stopFlushing := context.WithCancel(context.Background())
+	go func() {
+		defer close(flushDone)
+		flushEvery(flushCtx, rt.Metrics, DefaultMetricsInterval, p.After)
+	}()
+	defer func() {
+		stopFlushing()
+		<-flushDone
+		rt.Metrics.Flush()
+	}()
 	runDone := make(chan error, 1)
 	go func() { runDone <- svc.Run(runCtx, rt, cfg) }()
 
@@ -436,6 +449,18 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	}
 	log.Info("stopped")
 	return ExitOK
+}
+
+// flushEvery flushes m every interval on the injected clock until ctx ends.
+func flushEvery(ctx context.Context, m *Metrics, interval time.Duration, after func(time.Duration) <-chan time.Time) {
+	for {
+		select {
+		case <-after(interval):
+			m.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // stopFailed logs and reports an error Service.Run returned after it was asked

@@ -122,17 +122,27 @@ func (h *Harness) Logs(msg string) []map[string]any {
 	return out
 }
 
-// Metric returns the sum of every value written for the metric name, and
-// whether any was written.
+// Metric flushes the runtime's metrics and returns the sum of every value
+// written for the metric name, and whether any was written. For a timing the
+// sum is of the values written, which are the recorded durations themselves
+// while there are 100 or fewer per flush.
 func (h *Harness) Metric(name string) (float64, bool) {
 	h.t.Helper()
+	h.Runtime.Metrics.Flush()
 	sum, found := 0.0, false
 	for _, rec := range h.Records() {
 		if _, isMetric := rec["_aws"]; !isMetric {
 			continue
 		}
-		if v, ok := rec[name].(float64); ok {
+		switch v := rec[name].(type) {
+		case float64:
 			sum, found = sum+v, true
+		case []any:
+			for _, x := range v {
+				if f, ok := x.(float64); ok {
+					sum, found = sum+f, true
+				}
+			}
 		}
 	}
 	return sum, found
