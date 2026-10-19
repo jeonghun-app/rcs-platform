@@ -382,6 +382,11 @@ func (c *Conn) Open(ctx context.Context, s *Session) error {
 	if c.passive {
 		return ErrPassive
 	}
+	select {
+	case <-s.remoteSet:
+	default:
+		return errors.New("msrp: an active session needs the remote path")
+	}
 	if err := s.attach(c); err != nil {
 		return err
 	}
