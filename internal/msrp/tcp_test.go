@@ -676,9 +676,11 @@ func TestARelayKeepsItsRcsAsConnectionUnderPacedChatAndFilePush(t *testing.T) {
 
 func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	ours, theirs := net.Pipe()
-	// A write deadline well above prompt, so that a Send waiting for it
-	// instead of honouring its context fails, also under the race detector.
-	c, err := NewActiveConn(ours, Config{WriteTimeout: DefaultWriteTimeout})
+	// Write and transaction timeouts of an hour: a Send that waited for
+	// either instead of honouring its context would block far past the 20 s
+	// this test waits, which is below every default the package has (30 s),
+	// so no other bound can end it in time either (#130, review of #131).
+	c, err := NewActiveConn(ours, Config{WriteTimeout: time.Hour, TransactionTimeout: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,15 +693,27 @@ func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	start := time.Now()
-	_, err = s.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(10000)})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Send = %v", err)
+	sent := make(chan error, 1)
+	go func() {
+		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(10000)})
+		sent <- err
+	}()
+	// The peer takes one byte, so the write has begun, and then stops
+	// reading; only then is the context cancelled.
+	_ = theirs.SetReadDeadline(time.Now().Add(hangGuard))
+	if _, err := theirs.Read(make([]byte, 1)); err != nil {
+		t.Fatalf("the send never began: %v", err)
 	}
-	if d := time.Since(start); d > prompt {
-		t.Fatalf("Send ignored its context for %v", d)
+	cancel()
+	select {
+	case err := <-sent:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Send = %v, want its context's cancellation", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Send ignored its context while the peer was not reading")
 	}
 }
 
