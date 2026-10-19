@@ -123,10 +123,21 @@ func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
 	for name, every := range map[string]bool{"retry conflicts": false, "every attempt times out": true} {
 		t.Run(name, func(t *testing.T) {
 			meta := &appliedThenTimedOut{Metadata: store.NewMemory(), every: every}
-			e := newEnv(t, func(o *Options) { o.Metadata = meta; o.StorageTimeout = 300 * time.Millisecond })
+			// IdleTimeout 150 ms makes the lease 900 ms and the completion
+			// budget 600 ms, of which 450 ms are for the commit attempts:
+			// more than one 300 ms StorageTimeout, so a second attempt runs
+			// and the retry path is taken (review of #131). The one real
+			// time window left is that the first attempt must start within
+			// those 450 ms of the budget's start; it took at most 35 µs
+			// when measured under load, a margin of about 10^4.
+			e := newEnv(t, func(o *Options) {
+				o.Metadata = meta
+				o.StorageTimeout = 300 * time.Millisecond
+				o.IdleTimeout = 150 * time.Millisecond
+			})
 			e.srv.retryWait = func(int) time.Duration { return 0 }
 			data := pattern(20)
-			// The first attempt really expires; a later attempt meets the
+			// The first attempt really expires; the second meets the
 			// applied write as a conflict, or, if every attempt expires,
 			// the final read-back finds it.
 			u := e.user(alice)
@@ -146,8 +157,8 @@ func TestCommitAppliedBeforeItsDeadlineExpiredIsRecovered(t *testing.T) {
 			reserve := min(e.srv.o.StorageTimeout, budget/4)
 			meta.mu.Lock()
 			defer meta.mu.Unlock()
-			if len(meta.updates) == 0 || len(meta.reads) == 0 {
-				t.Fatalf("%d completing updates and %d reads back", len(meta.updates), len(meta.reads))
+			if len(meta.updates) < 2 || len(meta.reads) != 1 {
+				t.Fatalf("%d completing updates and %d reads back, want at least 2 and 1", len(meta.updates), len(meta.reads))
 			}
 			for i, c := range meta.updates {
 				if c.deadline.IsZero() || c.deadline.After(meta.updates[0].at.Add(budget-reserve)) {

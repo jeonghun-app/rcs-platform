@@ -31,9 +31,10 @@ func TestNetworkFailuresLoseTheirAddresses(t *testing.T) {
 	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 	_ = ln.Close()
 	// The lookup goes to a resolver that cannot be reached, which fails at
-	// once with a *net.DNSError, as an unknown name does. The host's own
-	// resolver (none in the toolchain container) answered in its own time,
-	// and on a loaded host after the test's deadline (#130).
+	// once with a *net.DNSError that is not a timeout. The host's own
+	// resolver answered in its own time, which on a loaded host came after
+	// the test's deadline (#130). The NXDOMAIN shape (IsNotFound) is
+	// TestEachFailureHasItsReason's.
 	noResolver := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
 		return nil, errors.New("no resolver here")
 	}}
