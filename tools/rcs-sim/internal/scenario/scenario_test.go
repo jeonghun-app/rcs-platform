@@ -315,10 +315,12 @@ func TestAClientThatSendsNoKeepAliveFailsTheStep(t *testing.T) {
 }
 
 func TestAClientThatSendsNoKeepAliveFailsAtTheStepTimeout(t *testing.T) {
-	// The same with a step timeout shorter than the relay's keep-alive.
+	// The same with a step timeout shorter than the relay's keep-alive. It
+	// is the keep-alive step's alone: a loaded host can take longer than
+	// that over the steps before it (#178).
 	cfg := stack(t)
 	cfg.MSRP.KeepAliveInterval = -1
-	cfg.StepTimeout = 2 * time.Second
+	cfg.KeepAliveTimeout = 2 * time.Second
 	ok, results := runAll(t, cfg, "chat-client-originated")
 	ka, ran := byStep(results)["keep-alive"]
 	if !ran {
@@ -326,6 +328,11 @@ func TestAClientThatSendsNoKeepAliveFailsAtTheStepTimeout(t *testing.T) {
 	}
 	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
 		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+	// Ended by its own 2 s, before the relay's 10 s keep-alive, not by the
+	// stack's 20 s step timeout.
+	if ka.Millis >= 10000 {
+		t.Fatalf("the keep-alive step took %d ms: KeepAliveTimeout did not bound it", ka.Millis)
 	}
 }
 
@@ -357,11 +364,22 @@ func TestTheKeepAliveStepWorksOverTLS(t *testing.T) {
 func TestAClientWithoutKeepAlivesFailsOverTLSToo(t *testing.T) {
 	cfg := tlsStack(t)
 	cfg.MSRP.KeepAliveInterval = -1
-	cfg.StepTimeout = 2 * time.Second
+	// Only the keep-alive step is short; the TLS connect and the chunked
+	// message before it got 2 s too once, and a loaded host took longer
+	// (#178).
+	cfg.KeepAliveTimeout = 2 * time.Second
 	ok, results := runAll(t, cfg, "chat-client-originated")
 	ka, ran := byStep(results)["keep-alive"]
-	if !ran || ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+	if !ran {
+		t.Fatalf("the keep-alive step did not run: %+v", results)
+	}
+	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
 		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+	// Ended by its own 2 s, before the relay's 10 s keep-alive, not by the
+	// stack's 20 s step timeout.
+	if ka.Millis >= 10000 {
+		t.Fatalf("the keep-alive step took %d ms: KeepAliveTimeout did not bound it", ka.Millis)
 	}
 }
 
