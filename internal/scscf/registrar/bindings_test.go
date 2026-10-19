@@ -198,6 +198,18 @@ func TestAnIdentityRegisteredByAnotherPrivateIdentityIsForbidden(t *testing.T) {
 	if res.Reason != "Forbidden" {
 		t.Errorf("reason %q tells more than any other 403", res.Reason)
 	}
+	// Nothing of the registration changed, and the HSS heard nothing for the
+	// other IMPI.
+	if r := must(e.store.Registration(bg, impu1))(t); r.IMPI != impi1 || len(r.Contacts) != 1 || r.Contacts[0].CallID != "call-"+impi1[:15] {
+		t.Errorf("after the refusal: %+v", r)
+	}
+	e.hss.mu.Lock()
+	defer e.hss.mu.Unlock()
+	for _, s := range e.hss.sars {
+		if s.UserName == impi2 {
+			t.Errorf("SAR %v for the refused IMPI", s.AssignmentType)
+		}
+	}
 }
 
 func TestWithoutCredentialsThePrivateIdentityIsTheIMPUWithoutItsScheme(t *testing.T) {
