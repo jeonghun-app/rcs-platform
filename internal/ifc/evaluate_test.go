@@ -492,6 +492,60 @@ func TestCompileRefusesPatternsWithAHugeProgram(t *testing.T) {
 	}
 }
 
+// unclosedClasses is a bracket expression of n bytes full of "[:" that no
+// ":]" closes: one character class, far below the instruction limits, on
+// which Go's parser searches for ":]" from every "[:" (#96).
+func unclosedClasses(n int) string {
+	s := "[" + strings.Repeat("[:", (n-3)/2)
+	return s + strings.Repeat("a", n-1-len(s)) + "]"
+}
+
+func TestCompileRefusesAPatternLongerThanMaxPatternBytes(t *testing.T) {
+	over := unclosedClasses(MaxPatternBytes + 1)
+	if len(over) != MaxPatternBytes+1 {
+		t.Fatalf("pattern of %d bytes", len(over))
+	}
+	for _, c := range []Condition{RequestURI(over), SIPHeader{Header: over}, SIPHeader{Header: "Subject", Content: over},
+		SessionDescription{Line: over}, SessionDescription{Line: "m", Content: over}} {
+		_, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: c}}})})
+		if err == nil || !strings.Contains(err.Error(), "MaxPatternBytes") {
+			t.Errorf("%T of %d bytes: %v, want a refusal naming MaxPatternBytes", c, len(over), err)
+		}
+	}
+	// Refused before any parse, Content's included: parsing the 256 KiB a
+	// provisioning request may carry takes seconds. Correct code takes
+	// microseconds, so the bound only shows a parse that came first.
+	huge := unclosedClasses(256 << 10)
+	start := time.Now()
+	_, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: huge}}}})})
+	if err == nil || !strings.Contains(err.Error(), "MaxPatternBytes") {
+		t.Fatalf("256 KiB Content: %v", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("refusing 256 KiB took %v: it was parsed first", d)
+	}
+}
+
+// The parse of the costliest pattern the limit lets through is quick: about
+// a millisecond, against seconds for the 240 KiB the API body would allow
+// without it. The bound below leaves a factor of hundreds for a loaded host.
+func TestTheCostliestPatternWithinTheLimitCompilesQuickly(t *testing.T) {
+	at := unclosedClasses(MaxPatternBytes)
+	if len(at) != MaxPatternBytes {
+		t.Fatalf("pattern of %d bytes", len(at))
+	}
+	start := time.Now()
+	_, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: at}}}})})
+	if err != nil {
+		t.Fatalf("a pattern at the limit refused: %v", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("compiling %d bytes took %v", len(at), d)
+	}
+}
+
 // bulkyPattern compiles to a little under MaxPatternInstructions.
 var bulkyPattern = "(" + strings.Repeat("[a-z]", 9) + "){150}"
 

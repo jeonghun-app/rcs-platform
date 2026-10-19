@@ -104,6 +104,17 @@ func TestProfileWithAPatternGoReadsDifferentlyFromPOSIXIsRefusedNamingTheConstru
 	}
 }
 
+func TestProfileWithAPatternOverMaxPatternBytesIsRefusedNamingTheLimit(t *testing.T) {
+	a := newAPIEnv(t)
+	profile := `{"id":"long","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[` +
+		`{"group":[0],"sip_header":{"header":"Subject","content":"` + strings.Repeat("a", ifc.MaxPatternBytes+1) + `"}}]},` +
+		`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_CONTINUED"}}]}`
+	code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile)
+	if msg, _ := body["error"].(string); code != http.StatusBadRequest || !strings.Contains(msg, "MaxPatternBytes") {
+		t.Fatalf("%d %v, want 400 naming MaxPatternBytes", code, body)
+	}
+}
+
 func TestCostlyProfileIsAcceptedWithAWarning(t *testing.T) {
 	a := newAPIEnv(t)
 	// Two counted repetitions over the 2 KB Contact cost about 340 000

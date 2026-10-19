@@ -40,9 +40,11 @@
 // with the size of the compiled pattern times the length of the value. What
 // is bounded, exactly:
 //
-//   - Compile: a pattern compiles to at most [MaxPatternInstructions] and a
-//     set to at most [MaxSetInstructions]; Compile refuses more, and refuses
-//     an oversized pattern before building its program.
+//   - Compile: a pattern is at most [MaxPatternBytes] long, which bounds
+//     the cost of parsing it, and compiles to at most
+//     [MaxPatternInstructions]; a set compiles to at most
+//     [MaxSetInstructions]. Compile refuses more, and refuses an oversized
+//     pattern before parsing it or building its program.
 //   - Input: one evaluation examines a Request-URI of at most
 //     [MaxRequestURILength], header names and values of at most
 //     [MaxHeaderLength] and [MaxHeaderBytes] together, and SDP lines of at

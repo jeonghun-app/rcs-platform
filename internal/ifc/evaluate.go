@@ -54,6 +54,12 @@ type Request interface {
 // bypass an application server, or reach one it should not. The S-CSCF
 // refuses such a request.
 const (
+	// MaxPatternBytes bounds the text of one pattern, so that the cost of
+	// parsing it is bounded: Go's parser is quadratic on some inputs, such
+	// as a bracket expression full of "[:" that no ":]" closes, which is a
+	// single character class the instruction limits do not catch (#96). A
+	// pattern a person writes is tens of bytes.
+	MaxPatternBytes = 4 << 10
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
 	// repetition ("{n}") is what multiplies the size.
@@ -325,6 +331,9 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // ([sameMeaning]), so a pattern whose meaning could not be kept exactly is
 // refused rather than compiled into something else.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
+	if len(source) > MaxPatternBytes {
+		return pattern{}, fmt.Errorf("%s is longer than MaxPatternBytes (%d bytes)", name, MaxPatternBytes)
+	}
 	if construct := ereDeparture(source); construct != "" {
 		return pattern{}, fmt.Errorf("%s uses %s, which this engine reads differently from a POSIX ERE", name, construct)
 	}
@@ -630,6 +639,9 @@ func isPlainToken(s string) bool {
 // matchesSomething reports whether a Content pattern restricts the value at
 // all; an empty one, or ".*", is the same as no Content.
 func matchesSomething(content string) bool {
+	if len(content) > MaxPatternBytes {
+		return true // compilePattern refuses it before parsing it
+	}
 	tree, err := syntax.Parse(content, posixFlags)
 	if err != nil {
 		return true // compilePattern reports the error
