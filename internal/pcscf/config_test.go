@@ -90,7 +90,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
-		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst,
+		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -227,6 +227,8 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_SCSCF_HOST", "pcscf.rcs.internal"}, "PCSCF_SCSCF_HOST: names pcscf itself"},
 		{[]string{"PCSCF_SCSCF_HOST", "edge.rcs.internal", "PCSCF_PUBLIC_HOST", "edge.rcs.internal"}, "PCSCF_SCSCF_HOST: names pcscf itself"},
 		{[]string{"PCSCF_SCSCF_PORT", "0"}, "PCSCF_SCSCF_PORT: not a port"},
+		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "0"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
+		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "1025"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
 		{[]string{"RCS_IMS_DOMAIN", "ims_1.example.net"}, "RCS_IMS_DOMAIN: not a host name"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "a, b"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "\"open"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},

@@ -44,6 +44,9 @@ const (
 	// core a UAR and an authentication vector (security review of #198).
 	DefaultMaxRegisterRate  = 2000
 	DefaultMaxRegisterBurst = 4000
+	// DefaultMaxPendingRegistersPerIP bounds the identities one client
+	// address may have REGISTERs under way for at once (registry).
+	DefaultMaxPendingRegistersPerIP = 64
 	// DefaultMaxClientFlows and DefaultCoreConnections split the transport's
 	// DefaultMaxConnections: client flows may take no more than their share,
 	// so the core listener always has room for scscf (review of #188).
@@ -131,6 +134,9 @@ type Config struct {
 	// MaxRegisterRate and MaxRegisterBurst bound the REGISTERs of all
 	// clients together.
 	MaxRegisterRate, MaxRegisterBurst int
+	// MaxPendingRegistersPerIP bounds the identities one client address may
+	// have REGISTERs under way for at once.
+	MaxPendingRegistersPerIP int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -145,28 +151,29 @@ var interfaceAddrs = net.InterfaceAddrs
 func Configure(s *runtime.Settings) Config {
 	e := s.Env
 	c := Config{
-		PublicHost:        strings.TrimSuffix(strings.ToLower(e.RequiredString("PUBLIC_HOST")), "."),
-		ClientTransport:   e.String("CLIENT_TRANSPORT", ClientTLS),
-		TLSCertFile:       e.String("TLS_CERT_FILE", ""),
-		TLSKeyFile:        e.String("TLS_KEY_FILE", ""),
-		ClientUDPAddr:     e.String("CLIENT_UDP_ADDR", ""),
-		CoreAddr:          e.String("CORE_ADDR", DefaultCoreAddr),
-		ProxyProtocol:     s.Shared.Bool("PROXY_PROTOCOL", false),
-		MaxFlowsPerIP:     e.Int("MAX_FLOWS_PER_IP", DefaultMaxFlowsPerIP),
-		MaxConnections:    e.Int("MAX_CONNECTIONS", DefaultMaxConnections),
-		MaxClientFlows:    e.Int("MAX_CLIENT_FLOWS", DefaultMaxClientFlows),
-		CoreConnections:   e.Int("CORE_CONNECTIONS", DefaultCoreConnections),
-		ClientIdleTimeout: e.Duration("CLIENT_IDLE_TIMEOUT", DefaultClientIdleTimeout),
-		AllowLoopback:     !s.Environment.Production(),
-		MaxRegistrations:  e.Int("MAX_REGISTRATIONS", DefaultMaxRegistrations),
-		RegisterRate:      e.Int("REGISTER_RATE", DefaultRegisterRate),
-		RegisterBurst:     e.Int("REGISTER_BURST", DefaultRegisterBurst),
-		InitialRate:       e.Int("INITIAL_RATE", DefaultInitialRate),
-		InitialBurst:      e.Int("INITIAL_BURST", DefaultInitialBurst),
-		MaxRegisterRate:   e.Int("MAX_REGISTER_RATE", DefaultMaxRegisterRate),
-		MaxRegisterBurst:  e.Int("MAX_REGISTER_BURST", DefaultMaxRegisterBurst),
-		Namespace:         s.ServiceNamespace(),
-		HomeDomain:        strings.TrimSuffix(strings.ToLower(s.Shared.RequiredString("IMS_DOMAIN")), "."),
+		PublicHost:               strings.TrimSuffix(strings.ToLower(e.RequiredString("PUBLIC_HOST")), "."),
+		ClientTransport:          e.String("CLIENT_TRANSPORT", ClientTLS),
+		TLSCertFile:              e.String("TLS_CERT_FILE", ""),
+		TLSKeyFile:               e.String("TLS_KEY_FILE", ""),
+		ClientUDPAddr:            e.String("CLIENT_UDP_ADDR", ""),
+		CoreAddr:                 e.String("CORE_ADDR", DefaultCoreAddr),
+		ProxyProtocol:            s.Shared.Bool("PROXY_PROTOCOL", false),
+		MaxFlowsPerIP:            e.Int("MAX_FLOWS_PER_IP", DefaultMaxFlowsPerIP),
+		MaxConnections:           e.Int("MAX_CONNECTIONS", DefaultMaxConnections),
+		MaxClientFlows:           e.Int("MAX_CLIENT_FLOWS", DefaultMaxClientFlows),
+		CoreConnections:          e.Int("CORE_CONNECTIONS", DefaultCoreConnections),
+		ClientIdleTimeout:        e.Duration("CLIENT_IDLE_TIMEOUT", DefaultClientIdleTimeout),
+		AllowLoopback:            !s.Environment.Production(),
+		MaxRegistrations:         e.Int("MAX_REGISTRATIONS", DefaultMaxRegistrations),
+		RegisterRate:             e.Int("REGISTER_RATE", DefaultRegisterRate),
+		RegisterBurst:            e.Int("REGISTER_BURST", DefaultRegisterBurst),
+		InitialRate:              e.Int("INITIAL_RATE", DefaultInitialRate),
+		InitialBurst:             e.Int("INITIAL_BURST", DefaultInitialBurst),
+		MaxRegisterRate:          e.Int("MAX_REGISTER_RATE", DefaultMaxRegisterRate),
+		MaxRegisterBurst:         e.Int("MAX_REGISTER_BURST", DefaultMaxRegisterBurst),
+		MaxPendingRegistersPerIP: e.Int("MAX_PENDING_REGISTERS_PER_IP", DefaultMaxPendingRegistersPerIP),
+		Namespace:                s.ServiceNamespace(),
+		HomeDomain:               strings.TrimSuffix(strings.ToLower(s.Shared.RequiredString("IMS_DOMAIN")), "."),
 	}
 	c.VisitedNetworkID = e.String("VISITED_NETWORK_ID", c.HomeDomain)
 	c.ICSCF = icscfURI(s)
@@ -235,6 +242,9 @@ func Configure(s *runtime.Settings) Config {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")
 		}
+	}
+	if c.MaxPendingRegistersPerIP < 1 || c.MaxPendingRegistersPerIP > 1024 {
+		e.Invalid("MAX_PENDING_REGISTERS_PER_IP", "not from 1 to 1024")
 	}
 	if c.MaxClientFlows+c.CoreConnections > c.MaxConnections {
 		e.Invalid("MAX_CLIENT_FLOWS", "plus PCSCF_CORE_CONNECTIONS must not exceed PCSCF_MAX_CONNECTIONS")
