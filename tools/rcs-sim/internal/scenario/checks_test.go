@@ -77,3 +77,20 @@ func TestOnlyTheSentMessagesReportCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOnlySendStartLinesCountAsKeepAlives(t *testing.T) {
+	for _, tt := range []struct {
+		wire string
+		want int
+	}{
+		{"MSRP a1b2 SEND\r\nTo-Path: msrp://relay.example.com:2855/s;tcp\r\nFrom-Path: msrp://rcs-sim.invalid:9/c;tcp\r\nMessage-ID: m1\r\nByte-Range: 1-0/0\r\n-------a1b2$\r\n", 1},
+		// The client's answer to the relay's keep-alive.
+		{"MSRP r3l4y 200 OK\r\nTo-Path: msrp://relay.example.com:2855/s;tcp\r\nFrom-Path: msrp://rcs-sim.invalid:9/c;tcp\r\n-------r3l4y$\r\n", 0},
+		{"MSRP r3l4y 200 OK\r\n-------r3l4y$\r\nMSRP a1b2 SEND\r\n-------a1b2$\r\n", 1},
+		{"MSRP a1b2 REPORT\r\n-------a1b2$\r\n", 0},
+	} {
+		if got := sendStartLines([]byte(tt.wire)); got != tt.want {
+			t.Errorf("%q: %d SENDs, want %d", tt.wire, got, tt.want)
+		}
+	}
+}

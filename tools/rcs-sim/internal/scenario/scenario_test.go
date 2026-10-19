@@ -292,15 +292,34 @@ func TestAReleaseThatLeavesTheBindingFails(t *testing.T) {
 }
 
 func TestAClientThatSendsNoKeepAliveFailsTheStep(t *testing.T) {
-	// The keep-alive step waits for the keep-alive past IdleWait (#97);
-	// one that never comes still fails, at the step's timeout.
+	// The keep-alive step waits for the keep-alive past IdleWait (#97). A
+	// client that sends none must still fail with the stack's own step
+	// timeout (20 s), which outlasts the test relay's 10 s keep-alive: the
+	// client's 200 to that is not a keep-alive of its own (QA on #102).
+	cfg := stack(t)
+	cfg.MSRP.KeepAliveInterval = -1
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran {
+		t.Fatalf("the keep-alive step did not run: %+v", results)
+	}
+	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
+	}
+}
+
+func TestAClientThatSendsNoKeepAliveFailsAtTheStepTimeout(t *testing.T) {
+	// The same with a step timeout shorter than the relay's keep-alive.
 	cfg := stack(t)
 	cfg.MSRP.KeepAliveInterval = -1
 	cfg.StepTimeout = 2 * time.Second
 	ok, results := runAll(t, cfg, "chat-client-originated")
-	ka := byStep(results)["keep-alive"]
+	ka, ran := byStep(results)["keep-alive"]
+	if !ran {
+		t.Fatalf("the keep-alive step did not run: %+v", results)
+	}
 	if ok || ka.OK || !strings.Contains(ka.Error, "no keep-alive went out") {
-		t.Fatalf("keep-alive %+v", ka)
+		t.Fatalf("keep-alive %+v\nall results: %+v", ka, results)
 	}
 }
 

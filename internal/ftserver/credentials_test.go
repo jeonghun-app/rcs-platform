@@ -104,9 +104,10 @@ func TestHSSRequestEscapesTheIMPIAsOnePathSegment(t *testing.T) {
 	}
 }
 
-// lookupTimeout is the HSS client timeout of the tests below. None of them
-// is about the timeout, and a test HSS on loopback took more than the 1 s
-// they had under load (#97); go test's own timeout still bounds a hang.
+// lookupTimeout is the HSS client timeout of the tests in this file. None
+// of them is about the timeout, and a test HSS on loopback took more than
+// the 1 s they had under load (#97); go test's own timeout still bounds a
+// hang.
 const lookupTimeout = time.Minute
 
 func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
@@ -215,7 +216,7 @@ func TestTheHSSClientInProductionConnectsOnlyToPrivateAddresses(t *testing.T) {
 		}
 	}
 	for _, addr := range []string{"127.0.0.1", "169.254.170.2", "203.0.113.9"} {
-		src := NewHSSCredentials(base, "provisioning-token", realm, time.Second, 4, resolveTo(addr).DialContext)
+		src := NewHSSCredentials(base, "provisioning-token", realm, lookupTimeout, 4, resolveTo(addr).DialContext)
 		_, err := src.Lookup(t.Context(), alice, digest.SHA256)
 		if !errors.Is(err, runtime.ErrAddressNotPrivate) || strings.Contains(err.Error(), "provisioning-token") {
 			t.Errorf("resolving to %s: %v, want ErrAddressNotPrivate without the token", addr, err)
@@ -224,7 +225,7 @@ func TestTheHSSClientInProductionConnectsOnlyToPrivateAddresses(t *testing.T) {
 	if len(reached) != 0 {
 		t.Fatalf("the HSS was reached with %q", reached)
 	}
-	src := NewHSSCredentials(base, "provisioning-token", realm, time.Second, 4, resolveTo("10.0.1.5").DialContext)
+	src := NewHSSCredentials(base, "provisioning-token", realm, lookupTimeout, 4, resolveTo("10.0.1.5").DialContext)
 	if _, err := src.Lookup(t.Context(), alice, digest.SHA256); err != nil || len(reached) != 1 {
 		t.Fatalf("resolving to 10.0.1.5: %v, reached %d times", err, len(reached))
 	}
@@ -253,7 +254,7 @@ func TestTheProductionHSSClientSpeaksHTTP2ToAnHTTPSHSS(t *testing.T) {
 	defer hss.Close()
 	_, port, _ := net.SplitHostPort(hss.Listener.Addr().String())
 	d := runtime.InternalDialer{
-		Timeout: time.Second,
+		Timeout: lookupTimeout,
 		Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
 			return []netip.Addr{netip.MustParseAddr("10.0.1.5")}, nil
 		},
@@ -262,7 +263,7 @@ func TestTheProductionHSSClientSpeaksHTTP2ToAnHTTPSHSS(t *testing.T) {
 		},
 	}
 	// httptest's certificate names example.com.
-	src := NewHSSCredentials(mustURL("https://example.com:"+port), "provisioning-token", realm, time.Second, 4, d.DialContext)
+	src := NewHSSCredentials(mustURL("https://example.com:"+port), "provisioning-token", realm, lookupTimeout, 4, d.DialContext)
 	tr := src.client.Transport.(*http.Transport)
 	tr.TLSClientConfig = hss.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
 	if _, err := src.Lookup(t.Context(), alice, digest.SHA256); err != nil {
