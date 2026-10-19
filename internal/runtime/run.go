@@ -93,6 +93,14 @@ type Settings struct {
 	unsafe []string
 }
 
+// ServiceNamespace returns RCS_SERVICE_NAMESPACE, the Cloud Map namespace the
+// services find each other in, in lower case without a trailing dot, or ""
+// when it is unset or invalid (the runtime reports an invalid one). Names
+// inside it are private hosts ([IsPrivateHost]).
+func (s *Settings) ServiceNamespace() string {
+	return serviceNamespace(s.Shared)
+}
+
 // ForbidInProduction refuses to start in staging and prod when unsafe is true,
 // giving reason (say what is unsafe and why, e.g. "PCSCF_STORE=memory keeps
 // registrations in one task"). Every refused reason is listed together. In dev
@@ -493,7 +501,7 @@ func probe(ctx context.Context, p Process) error {
 func probeClient() *http.Client {
 	return &http.Client{
 		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: RefuseRedirects,
 	}
 }
 
