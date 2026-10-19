@@ -159,3 +159,25 @@ func TestSecretsDoNotPrint(t *testing.T) {
 		}
 	}
 }
+
+// The existing redirect case points at a host that does not resolve, so it
+// fails whether or not the redirect is followed. Here the redirect leads to
+// a usable answer on the same host, where Go would keep the Authorization
+// header, so only refusing the redirect makes the lookup fail.
+func TestTheHSSClientDoesNotFollowARedirectToAUsableAnswer(t *testing.T) {
+	var reached []string
+	target := newHSS(t, func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Header.Get("Authorization"))
+		fmt.Fprint(w, credentialJSON(t, digest.SHA256, alice))
+	})
+	h := newHSS(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	_, err := NewHSSCredentials(mustURL(h.URL), "provisioning-token", realm, time.Second, 4).Lookup(t.Context(), alice, digest.SHA256)
+	if err == nil {
+		t.Error("a redirected lookup succeeded")
+	}
+	if len(reached) != 0 {
+		t.Errorf("the redirect was followed; the target saw Authorization %q", reached)
+	}
+}

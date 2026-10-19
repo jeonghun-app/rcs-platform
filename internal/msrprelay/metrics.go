@@ -113,8 +113,8 @@ func (m *counters) flush(out *runtime.Metrics) {
 	for _, name := range names {
 		out.Count(name, counts[name])
 	}
-	out.Count(mActiveBridges, m.bridges.Load())
-	out.Count(mClientConnections, m.conns.Load())
+	out.Gauge(mActiveBridges, m.bridges.Load())
+	out.Gauge(mClientConnections, m.conns.Load())
 }
 
 // onEvent counts what internal/msrp reports; prefix says which side.

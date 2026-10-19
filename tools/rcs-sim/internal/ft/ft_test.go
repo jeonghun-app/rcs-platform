@@ -12,10 +12,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
 )
 
@@ -92,10 +94,10 @@ func TestBrokenUploadIsResumedFromWhatTheServerHolds(t *testing.T) {
 	if err := c.SendInterrupted(ctx(t), up, 4*part); err != nil {
 		t.Fatal(err)
 	}
-	// The scenario's rule: two answers in a row with the same bytes held,
-	// so the server has noticed the break and released the upload. The PUT
-	// is then sent once, as rcsjta sends it.
-	info, _, err := c.SettledUploadInfo(ctx(t), up.TID, 10*time.Second, 100*time.Millisecond)
+	// The scenario's rule: the same bytes held for a quiet time, so the
+	// server has noticed the break and released the upload. The PUT is then
+	// sent once, as rcsjta sends it.
+	info, _, err := c.SettledUploadInfo(ctx(t), up.TID, 10*time.Second, 100*time.Millisecond, 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("get_upload_info = %v", err)
 	}
@@ -321,6 +323,133 @@ func TestRetryAfterIsWholeSecondsCapped(t *testing.T) {
 		if got := ft.RetryAfter(v); got != want {
 			t.Errorf("retryAfter(%q) = %v, want %v", v, got, want)
 		}
+	}
+}
+
+// resumeInfo is an upload-info document holding held bytes.
+func resumeInfo(held int) string {
+	return `<?xml version="1.0"?><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp">` +
+		`<file-range start="0" end="` + strconv.Itoa(held-1) + `"/><data url="/ft/x"/></file-resume-info>`
+}
+
+func TestUploadInfoSettlesOnlyAfterAQuietTime(t *testing.T) {
+	// 404, then 12 and 13 bytes, then 20 from the fourth answer on: the
+	// quiet time starts again whenever the bytes held change.
+	var mu sync.Mutex
+	var signed []time.Time
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		signed = append(signed, time.Now())
+		n := len(signed)
+		mu.Unlock()
+		switch {
+		case n == 1:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		case n <= 3:
+			w.Header().Set("Content-Type", ft.ContentType)
+			_, _ = io.WriteString(w, resumeInfo(10+n))
+		default:
+			w.Header().Set("Content-Type", ft.ContentType)
+			_, _ = io.WriteString(w, resumeInfo(20))
+		}
+	})
+	const quiet = 50 * time.Millisecond
+	info, st, err := c.SettledUploadInfo(ctx(t), "x", 5*time.Second, 5*time.Millisecond, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, _ := info.Held()
+	mu.Lock()
+	defer mu.Unlock()
+	if held != 20 || st.NotHeld != 1 || st.Retries != int64(len(signed)-1) {
+		t.Fatalf("held %d, %+v after %d answers", held, st, len(signed))
+	}
+	// The request it settled on reached the server at least a quiet time
+	// after the last answer naming other bytes (the third): the quiet time
+	// runs from the request that first got 20 bytes, which was sent after
+	// that answer.
+	if gap := signed[len(signed)-1].Sub(signed[2]); gap < quiet {
+		t.Fatalf("settled %v after the bytes held last changed, want at least %v", gap, quiet)
+	}
+}
+
+func TestUploadInfoThatNeverHoldsAnythingEndsAsNothingHeld(t *testing.T) {
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	_, st, err := c.SettledUploadInfo(ctx(t), "x", 30*time.Millisecond, 5*time.Millisecond, time.Second)
+	// Every answer was a 404 and was counted, however few came in time.
+	if !errors.Is(err, ft.ErrNothingHeld) || st.NotHeld < 1 || st.NotHeld != st.Retries+1 {
+		t.Fatalf("SettledUploadInfo = %v, %+v", err, st)
+	}
+}
+
+func TestUploadInfoStillChangingWhenTimeRunsOutIsNotSettled(t *testing.T) {
+	// Every answer holds more: the server is still storing.
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		held := 10 * n
+		mu.Unlock()
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(held))
+	})
+	info, _, err := c.SettledUploadInfo(ctx(t), "x", 50*time.Millisecond, 5*time.Millisecond, time.Second)
+	if held, _ := info.Held(); !errors.Is(err, ft.ErrNotSettled) || held == 0 {
+		t.Fatalf("SettledUploadInfo = %v, held %d", err, held)
+	}
+}
+
+// brokenChunks answers every request with status, contentType and a body
+// whose chunked encoding breaks after a few bytes, quoting secret where Go
+// would read a chunk length. The header must go out raw, so the handler
+// takes the connection over.
+func brokenChunks(t *testing.T, contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" && r.URL.Query().Has("tid") {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\nsecret-host\r\n")
+		_ = buf.Flush()
+	}
+}
+
+func TestABrokenBodyIsAFixedReasonForDownloadsAndDocuments(t *testing.T) {
+	c := fakeServer(t, brokenChunks(t, "application/octet-stream"))
+	_, err := c.Download(ctx(t), c.UploadURL.String(), "", 1<<20)
+	if !errors.Is(err, safeerr.ErrBadBody) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("Download = %v", err)
+	}
+	c = fakeServer(t, brokenChunks(t, ft.ContentType))
+	_, err = c.DownloadInfo(ctx(t), "x")
+	if !errors.Is(err, safeerr.ErrBadBody) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("DownloadInfo = %v", err)
 	}
 }
 

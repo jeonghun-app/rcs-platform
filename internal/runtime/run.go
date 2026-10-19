@@ -93,6 +93,14 @@ type Settings struct {
 	unsafe []string
 }
 
+// ServiceNamespace returns RCS_SERVICE_NAMESPACE, the Cloud Map namespace the
+// services find each other in, in lower case without a trailing dot, or ""
+// when it is unset or invalid (the runtime reports an invalid one). Names
+// inside it are private hosts ([IsPrivateHost]).
+func (s *Settings) ServiceNamespace() string {
+	return serviceNamespace(s.Shared)
+}
+
 // ForbidInProduction refuses to start in staging and prod when unsafe is true,
 // giving reason (say what is unsafe and why, e.g. "PCSCF_STORE=memory keeps
 // registrations in one task"). Every refused reason is listed together. In dev
@@ -394,6 +402,20 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	defer cancelRun()
 
 	log.Info("started", slog.String("environment", string(sh.environment)), slog.String("admin_addr", ln.Addr().String()))
+	// Metrics are flushed every interval until the process stops, when
+	// shutdown starts, and once more after the shutdown hooks so that what
+	// the drain records is not lost.
+	flushDone := make(chan struct{})
+	flushCtx, stopFlushing := context.WithCancel(context.Background())
+	go func() {
+		defer close(flushDone)
+		flushEvery(flushCtx, rt.Metrics, DefaultMetricsInterval, p.After)
+	}()
+	defer func() {
+		stopFlushing()
+		<-flushDone
+		rt.Metrics.Flush()
+	}()
 	runDone := make(chan error, 1)
 	go func() { runDone <- svc.Run(runCtx, rt, cfg) }()
 
@@ -420,6 +442,10 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		log.Error("stopping: admin server failed", slog.String("error", pii.Redact(err.Error())))
 		failed = true
 	}
+	// What was recorded before the stop goes out now: a second signal, or a
+	// stop timeout shorter than the drain, ends the process before the
+	// last flush.
+	rt.Metrics.Flush()
 	// From here a second signal gets the default action and ends the process,
 	// for an operator who does not want to wait for the drain.
 	stopSignals()
@@ -450,6 +476,18 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	}
 	log.Info("stopped")
 	return ExitOK
+}
+
+// flushEvery flushes m every interval on the injected clock until ctx ends.
+func flushEvery(ctx context.Context, m *Metrics, interval time.Duration, after func(time.Duration) <-chan time.Time) {
+	for {
+		select {
+		case <-after(interval):
+			m.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // stopFailed logs and reports an error Service.Run returned after it was asked
@@ -493,7 +531,7 @@ func probe(ctx context.Context, p Process) error {
 func probeClient() *http.Client {
 	return &http.Client{
 		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: RefuseRedirects,
 	}
 }
 

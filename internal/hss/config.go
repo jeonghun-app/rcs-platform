@@ -1,6 +1,7 @@
 package hss
 
 import (
+	"cmp"
 	"encoding/base64"
 	"net"
 	"net/netip"
@@ -115,7 +116,7 @@ func Configure(s *runtime.Settings) Config {
 		OriginHost:       e.String("DIAMETER_HOST", ""),
 		// The shared Cloud Map namespace ft-server also reads, unless the
 		// HSS is told otherwise.
-		Namespace:            e.String("NAMESPACE", s.Shared.String("SERVICE_NAMESPACE", DefaultNamespace)),
+		Namespace:            e.String("NAMESPACE", cmp.Or(s.ServiceNamespace(), DefaultNamespace)),
 		OriginRealm:          e.String("DIAMETER_REALM", domain),
 		PeerNetworks:         e.CIDRs("DIAMETER_PEER_NETWORKS", nil),
 		SCSCFNames:           e.List("SCSCF_NAMES", nil),
