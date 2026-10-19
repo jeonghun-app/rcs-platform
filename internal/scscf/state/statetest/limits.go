@@ -558,3 +558,30 @@ func testUnregisteredRetry(t *testing.T, a, b state.Store, o Options) {
 	_, err = a.Registration(ctx(t), IMPU1)
 	wantErr(t, err, state.ErrNotFound)
 }
+
+// testDeleteProfileIf: a deregistration deletes the profile it read, never
+// one another instance saved since for a registration of its own.
+func testDeleteProfileIf(t *testing.T, a, b state.Store, _ Options) {
+	if err := a.SaveProfile(ctx(t), Profile(Set1, []byte("<IMSSubscription>1</IMSSubscription>"), T0)); err != nil {
+		t.Fatal(err)
+	}
+	// Another instance's SAA, received later, replaced it.
+	if err := b.SaveProfile(ctx(t), Profile(Set1, []byte("<IMSSubscription>2</IMSSubscription>"), T0.Add(time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	wantErr(t, a.DeleteProfileIf(ctx(t), Set1, T0), state.ErrConflict)
+	if got := must(a.Profile(ctx(t), Set1, T0))(t); string(got.UserData) != "<IMSSubscription>2</IMSSubscription>" {
+		t.Errorf("profile %q after a refused delete", got.UserData)
+	}
+	if err := b.DeleteProfileIf(ctx(t), Set1, T0.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := a.Profile(ctx(t), Set1, T0)
+	wantErr(t, err, state.ErrNotFound)
+	if err := a.DeleteProfileIf(ctx(t), Set1, T0); err != nil {
+		t.Errorf("deleting no profile: %v", err)
+	}
+	if err := a.DeleteProfileIf(ctx(t), state.ProfileKey{IMPI: IMPI1}, T0); err != nil {
+		t.Errorf("deleting an impossible profile: %v", err)
+	}
+}

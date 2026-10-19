@@ -50,7 +50,9 @@ additionally sealed (below).
   an error to report. A profile is deleted when the HSS no longer assigns its
   set to this S-CSCF, never by a sweep.
 - **A profile outlives its set by a day at most.** Every deregistration path
-  (user, sweep, RTR, administrative) deletes the profile. As a safety net for
+  (user, sweep, RTR, administrative) deletes the profile; a user's own
+  deregistration deletes only the one it read (`DeleteProfileIf`), so a
+  registration that another instance saved meanwhile keeps its profile. As a safety net for
   one that fails to, a profile carries `KeepUntil`, stored as the TTL attribute
   `ttl`: the last contact expiry of the set, or the end of an unregistered
   user's state, plus one day (`state.ProfileGrace`). A registration extends it

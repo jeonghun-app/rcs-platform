@@ -75,6 +75,8 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return true
 	case "attribute_not_exists(#pk)":
 		return cur == nil
+	case "attribute_not_exists(#pk) OR #rcv = :rcv":
+		return cur == nil || number(cur[names["#rcv"]]) == number(values[":rcv"])
 	case "attribute_not_exists(#pk) OR #rcv <= :rcv":
 		return cur == nil || number(cur[names["#rcv"]]) <= number(values[":rcv"])
 	case "#v = :v":

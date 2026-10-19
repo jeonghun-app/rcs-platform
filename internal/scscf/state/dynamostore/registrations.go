@@ -247,6 +247,28 @@ func (d *Dynamo) KeepProfile(ctx context.Context, k state.ProfileKey, until, now
 	return nil
 }
 
+// DeleteProfileIf implements state.Profiles with a DeleteItem conditional on
+// received. A resend finds nothing and succeeds.
+func (d *Dynamo) DeleteProfileIf(ctx context.Context, k state.ProfileKey, received time.Time) error {
+	if !possibleProfile(k) {
+		return nil
+	}
+	_, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:                 aws.String(d.registrations),
+		Key:                       profileKey(k),
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #rcv = :rcv"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#rcv": attrReceived},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(received.UnixNano())},
+	})
+	switch {
+	case ccf(err):
+		return fmt.Errorf("dynamostore: delete profile: %w", state.ErrConflict)
+	case err != nil:
+		return sanitize("delete profile", err)
+	}
+	return nil
+}
+
 // DeleteProfile implements state.Profiles.
 func (d *Dynamo) DeleteProfile(ctx context.Context, k state.ProfileKey) error {
 	if !possibleProfile(k) {

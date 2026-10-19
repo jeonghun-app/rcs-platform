@@ -95,6 +95,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AnUnregisteredUsersRecordLivesUntilItsStateEnds", testUnregisteredLifeCycle},
 		{"ARegisterTurnsAnUnregisteredRecordIntoARegistration", testRegisterEndsUnregistered},
 		{"AFailedEndOfAnUnregisteredStateIsRetriedAfterTheLease", testUnregisteredRetry},
+		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -349,6 +350,11 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}
+	resyncDigest := &state.Challenge{
+		IMPI: IMPI1, Nonce: "n", IMPU: IMPU1, Issued: T0, Expires: T0.Add(time.Minute), Resynchronised: true,
+		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", HA1: "0123456789abcdef0123456789abcdef"},
+	}
+	wantErr(t, a.AddChallenge(ctx(t), resyncDigest), state.ErrInvalid)
 	both := Challenge(IMPI1, "n", time.Minute)
 	both.Digest = &state.DigestChallenge{Realm: Domain, HA1: "00"}
 	wantErr(t, a.AddChallenge(ctx(t), both), state.ErrInvalid)
@@ -393,8 +399,13 @@ func testChallengeRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	if err := a.AddChallenge(ctx(t), digest); err != nil {
 		t.Fatal(err)
 	}
+	resync := Challenge(IMPI1, "nonce-resync", time.Minute)
+	resync.Resynchronised = true
+	if err := a.AddChallenge(ctx(t), resync); err != nil {
+		t.Fatal(err)
+	}
 	wantErr(t, b.AddChallenge(ctx(t), Challenge(IMPI1, "nonce-aka", time.Minute)), state.ErrExists)
-	for _, want := range []*state.Challenge{aka, digest} {
+	for _, want := range []*state.Challenge{aka, digest, resync} {
 		got := must(b.TakeChallenge(ctx(t), want.IMPI, want.Nonce, T0))(t)
 		if !sameChallenge(got, want) {
 			t.Errorf("the second instance took %#v, want %#v", got, want)

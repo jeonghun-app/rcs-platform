@@ -330,6 +330,11 @@ type Profiles interface {
 	KeepProfile(ctx context.Context, k ProfileKey, until, now time.Time) error
 	// DeleteProfile deletes the profile of k; deleting none is no error.
 	DeleteProfile(ctx context.Context, k ProfileKey) error
+	// DeleteProfileIf deletes the profile of k only if it is still the one
+	// received at received (Profile.Received): one another instance saved
+	// since, for a registration of its own, stays and gives ErrConflict.
+	// Deleting none is no error.
+	DeleteProfileIf(ctx context.Context, k ProfileKey, received time.Time) error
 }
 
 // ProfileKey names the profile of one implicit registration set.
@@ -420,6 +425,10 @@ type Challenge struct {
 	// Exactly one of AKA and Digest is set.
 	AKA    *AKAVector
 	Digest *DigestChallenge
+	// Resynchronised marks an AKA challenge whose vector the HSS issued
+	// after a resynchronisation (TS 33.203 §6.1.2): a further synchronisation
+	// failure for it is not sent to the HSS again.
+	Resynchronised bool
 }
 
 // challengeRedacted is what a Challenge prints and logs.
@@ -510,6 +519,9 @@ func (c *Challenge) Validate() error {
 	}
 	if (c.AKA == nil) == (c.Digest == nil) {
 		return fmt.Errorf("%w: a challenge holds exactly one of an AKA vector and Digest state", ErrInvalid)
+	}
+	if c.Resynchronised && c.AKA == nil {
+		return fmt.Errorf("%w: only an AKA challenge is resynchronised", ErrInvalid)
 	}
 	return nil
 }
