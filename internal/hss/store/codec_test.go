@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -192,24 +191,20 @@ func oneCriterion(t *testing.T) *ifc.Set {
 	return set
 }
 
-// The memory store's writes take the compiled set as well: criteria that
-// do not compile are stored when the set says they did, so neither
-// CreateProfile nor UpdateProfile compiled them (QA's test from the review
-// of #125, with a set of as many criteria).
-func TestMemoryWritesAProfileWithItsCompiledSetWithoutCompiling(t *testing.T) {
-	ctx := context.Background()
-	m := store.NewMemory()
-	p := &store.ServiceProfile{ID: "p", Compiled: oneCriterion(t), Criteria: []ifc.FilterCriteria{{
-		Priority:          1,
-		TriggerPoint:      &ifc.TriggerPoint{SPTs: []ifc.SPT{{Groups: []int{0}, Condition: ifc.RequestURI("(unclosed")}}},
-		ApplicationServer: ifc.ApplicationServer{ServerName: "sip:as.example.net", DefaultHandling: ifc.SessionContinued},
-	}}}
-	saved, err := m.CreateProfile(ctx, p)
-	if err != nil {
-		t.Fatalf("CreateProfile compiled again: %v", err)
+// A zero ifc.Set is an empty set: a profile carrying one is validated as
+// one with no compiled criteria, its criteria compiled, not a panic (review
+// of #125, #142).
+func TestAProfileWithAZeroCompiledSetIsCompiled(t *testing.T) {
+	if err := store.ValidateProfile(&store.ServiceProfile{ID: "p", Compiled: &ifc.Set{}}); err != nil {
+		t.Errorf("no criteria: %v", err)
 	}
-	p.Version = saved.Version
-	if _, err := m.UpdateProfile(ctx, p); err != nil {
-		t.Fatalf("UpdateProfile compiled again: %v", err)
+	p := storetest.Profile("p")
+	p.Compiled = &ifc.Set{}
+	if err := store.ValidateProfile(p); err != nil {
+		t.Errorf("criteria that compile: %v", err)
+	}
+	p.Criteria[0].TriggerPoint.SPTs[0].Condition = ifc.RequestURI("(unclosed")
+	if err := store.ValidateProfile(p); !errors.Is(err, store.ErrInvalid) {
+		t.Errorf("criteria that do not compile: %v, want ErrInvalid", err)
 	}
 }

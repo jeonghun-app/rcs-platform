@@ -83,6 +83,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store, o Options) {
 		{"ProfilesHaveVersionsAndCannotBeDeletedInUse", testProfiles},
 		{"OnlyOneFirstDataKeyIsStored", testDataKeys},
 		{"StoredSubscriptionsAreSeen", testHasSubscriptions},
+		{"AProfileCarryingItsCompiledSetIsNotCompiledAgain", testPrecompiledProfile},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newStore(t), o) })
@@ -460,5 +461,30 @@ func testHasSubscriptions(t *testing.T, s store.Store, o Options) {
 			t.Fatal("a subscription is not seen")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// testPrecompiledProfile writes a profile whose Compiled set the HSS API
+// built when it validated the request, as the API passes it: the store must
+// take that set rather than compile the criteria again on each write (#125).
+// Criteria that do not compile are stored when the set says they did, so a
+// store that compiles them refuses the write (QA of #125, #142).
+func testPrecompiledProfile(t *testing.T, s store.Store, _ Options) {
+	set, err := ifc.Compile(Profile("compiled").Criteria)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &store.ServiceProfile{ID: "p", Compiled: set, Criteria: []ifc.FilterCriteria{{
+		Priority:          1,
+		TriggerPoint:      &ifc.TriggerPoint{SPTs: []ifc.SPT{{Groups: []int{0}, Condition: ifc.RequestURI("(unclosed")}}},
+		ApplicationServer: ifc.ApplicationServer{ServerName: "sip:as.example.net", DefaultHandling: ifc.SessionContinued},
+	}}}
+	saved, err := s.CreateProfile(ctx(t), p)
+	if err != nil {
+		t.Fatalf("CreateProfile compiled again: %v", err)
+	}
+	p.Version = saved.Version
+	if _, err := s.UpdateProfile(ctx(t), p); err != nil {
+		t.Fatalf("UpdateProfile compiled again: %v", err)
 	}
 }
