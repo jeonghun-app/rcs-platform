@@ -116,10 +116,11 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    - Each sender may hold `1/RCSAS_QUEUE_SENDER_SHARE` of either (an eighth
      by default). One sender therefore cannot fill a queue and lock the others
      out.
-   - Notifications count toward the queue but not toward a share. What one
-     notifier can put in a queue is already bounded: it needs a message the
-     queue's owner sent it, and is accepted once per kind. A recipient catching
-     up answers each message with up to two.
+   - A 1-to-1 notification counts toward the queue but not toward a share.
+     What one notifier can put in a queue is already bounded: it needs a
+     message the queue's owner sent it, and is accepted once per kind. A
+     recipient catching up answers each message with up to two. Group traffic
+     has shares of its own (see [Fan-out](#fan-out)).
    - Beyond these bounds the message is refused as `queue_full` or
      `queue_share_full`, and the sender gets the negative delivery
      notification it asked for. A refusal from a full share affects that
@@ -322,8 +323,10 @@ chat (size, CPIM parse, `From` check, per-sender rate). Then:
   in the core namespace. It then queues one copy for every other current
   participant, invited ones included:
   - each copy has `Sender` = the group and `Author` = the writer;
-  - each recipient's queue is bounded as in 1-to-1 chat, and the group holds
-    at most a share of it like any sender;
+  - each recipient's queue is bounded as in 1-to-1 chat, and a copy counts
+    against its author's share of it, the same share the author's 1-to-1
+    messages to that recipient use: one person holds one share of a queue,
+    however many groups it writes in;
   - a full queue costs that recipient the copy, with the negative delivery
     notification if the author asked for one, and nobody else anything.
 - **Delivery.** Each copy goes on the recipient's own session with the group,
@@ -354,7 +357,16 @@ A notification is accepted only when all of these hold:
 - it is the first of its kind from that notifier.
 
 Its header block is rebuilt as for a message: `From` the notifier's asserted
-identity, and the `To` the notifier wrote, which names the author. Notifications
+identity, and the `To` the notifier wrote, which names the author.
+
+Every message an author writes is answered by every other participant, up to
+twice. So all group notifications in a queue, from any group and notifier,
+share one sender's share of it (`#group-notifications`): the receipts for a
+few messages to a full group cannot fill the author's queue and lock out
+1-to-1 messages. A notification beyond that share, or beyond the queue, is
+taken (200) and dropped, counted as `group.notification.dropped`, rather than
+refused: the reference client ends its session with the group when one is
+refused. Notifications
 rcs-as generates (expiry, full queue) go to the author the same way, from the
 recipient.
 
@@ -456,8 +468,10 @@ The table's properties:
   order, which is enqueue order.
 - **Bounds.** The queue's size item and the sender's share item count messages
   and bytes. Both are written in the same transaction as each enqueue and
-  removal, and the enqueue is conditional on both bounds. A notification has
-  no share item. An enqueue moves a size item's TTL to its message's, which
+  removal, and the enqueue is conditional on both bounds. A 1-to-1
+  notification has no share item. A group message counts in its author's
+  share item, a group notification in the one named `#group-notifications`,
+  which no identity can be. An enqueue moves a size item's TTL to its message's, which
   only lengthens it, since messages are enqueued in time order with one
   lifetime. A removal leaves the TTL alone. Each queue item
   carries its own `size`. The SDK's idempotency token makes its own retry of a
@@ -465,7 +479,8 @@ The table's properties:
 - **Drift.** The sizes are kept by rcs-as, so a queue item deleted another way
   (by DynamoDB's TTL, or by hand) would count until it was corrected. An
   enqueue that a bound refuses therefore counts the queue once (a consistent
-  query of the partition, projecting sender and size). It lowers each size
+  query of the partition, projecting what decides an item's share and its
+  size). It lowers each size
   item that says more than it found, conditional on the item being unchanged
   since it was read, and tries the enqueue again. A count reads the whole
   partition, so each queue is counted at most once per 10 minutes: a
@@ -566,7 +581,7 @@ identifier ever appears in a metric name.
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
-| `group.message.accepted`, `group.notification.accepted`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout_budget_exceeded` | Group messages |
+| `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout_budget_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share |
 
 Logs never carry message content. Identities appear only through
 `internal/pii`. MSRP session ids never appear: they are capabilities ([threat

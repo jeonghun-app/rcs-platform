@@ -157,8 +157,9 @@ metadata.
 - **Floods.** These are bounded:
   - per-recipient queues, by count and bytes, across tasks;
   - each sender's share of a queue (an eighth by default), so that no sender
-    can lock the others out; notifications are bounded by the sent records and
-    by being accepted once instead;
+    can lock the others out, whether it writes 1-to-1 or in groups; 1-to-1
+    notifications are bounded by the sent records and by being accepted once
+    instead, group notifications by one share for all of them (T11);
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
@@ -209,8 +210,10 @@ metadata.
   - per user, groups created and participants added per minute;
   - per participant and group, messages and renames per minute;
   - per group, a fan-out budget of deliveries per minute;
-  - each recipient's queue as in 1-to-1 chat, with a group holding at most a
-    sender's share;
+  - each recipient's queue as in 1-to-1 chat, where a group message counts
+    against its author's share, the one its 1-to-1 messages use, and all
+    group notifications together hold one share, beyond which they are
+    dropped;
   - names, subject and Conversation-ID, 256 bytes each;
   - former participants, at most as many as the size limit; adding and
     removing stranger after stranger cannot grow a group's stored item past

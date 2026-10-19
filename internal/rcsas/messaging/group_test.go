@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -332,4 +333,74 @@ func bigReceipt(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// An author holds one sender's share of a recipient's queue, whether it
+// writes in a group or 1-to-1: the group is not a second sender.
+func TestAnAuthorHoldsOneShareOfAQueueInGroupsAnd1To1(t *testing.T) {
+	r := newRig(t, Config{MaxQueueMessages: 80, QueueSenderShare: 8, SenderRate: Rate{PerMinute: -1}})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.d.onPager(func(Delivery) error { return ErrOffline })
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	drainInvites(t, r.d)
+	for i := range 20 {
+		_ = r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, fmt.Sprint("g", i), "in the group", 0)))
+		_ = r.e.Submit(t.Context(), standalone(alice, bob, chat(t, fmt.Sprint("d", i), "directly", 0)))
+	}
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 10 {
+		t.Fatalf("alice holds %d of bob's queue, one share is 10", len(ms))
+	}
+	if r.m.get("group.fanout.queue_full") == 0 || r.m.get("message.rejected.queue_share_full") == 0 {
+		t.Fatalf("metrics %v", r.m)
+	}
+	// Someone else still gets through.
+	if err := r.e.Submit(t.Context(), standalone(carol, bob, chat(t, "c1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An offline author of a few messages to a large group gets every
+// participant's receipts: they take one share of its queue, the rest are
+// taken and dropped rather than refused, and 1-to-1 messages still reach
+// it.
+func TestReceiptsFromALargeGroupDoNotFillTheAuthorsQueue(t *testing.T) {
+	everyone := []string{alice}
+	for i := range 99 {
+		everyone = append(everyone, fmt.Sprintf("sip:u%d@example.net", i))
+	}
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: everyone})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	for i := range 6 {
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, fmt.Sprint("m", i), "hi all", imdn.PositiveDelivery|imdn.Display))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range everyone[1:] {
+		for i := range 6 {
+			for _, k := range []struct {
+				kind   imdn.Kind
+				status imdn.Status
+			}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
+				if err := r.e.SubmitGroup(t.Context(), groupFrom(p, receipt(t, fmt.Sprint("m", i), k.kind, k.status))); err != nil {
+					t.Fatalf("%s's receipt: %v", p, err)
+				}
+			}
+		}
+	}
+	share := queueLimit(r.e.cfg).SenderCount
+	if got := r.store.(*store.Memory).Len(alice); got != share {
+		t.Fatalf("%d receipts queued for alice, one share is %d", got, share)
+	}
+	if got := r.m.get("group.notification.dropped"); got != 99*12-int64(share) {
+		t.Fatalf("dropped %d; metrics %v", got, r.m)
+	}
+	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
+		t.Fatalf("a 1-to-1 message to alice: %v", err)
+	}
 }

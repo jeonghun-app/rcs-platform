@@ -193,7 +193,8 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if !s.mayRecount(ctx, m.Recipient, m.Enqueued) {
 		return err
 	}
-	fixed, cerr := s.recount(ctx, m.Recipient, m.Sender)
+	share, _ := m.ShareKey()
+	fixed, cerr := s.recount(ctx, m.Recipient, share)
 	if cerr != nil || !fixed {
 		return err
 	}
@@ -241,8 +242,8 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		}},
 		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), 1, m.Size(), l.Count, l.Bytes, ttl)},
 	}
-	if !m.Notification {
-		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, m.Sender), 1, m.Size(), l.SenderCount, l.SenderBytes, ttl)})
+	if share, ok := m.ShareKey(); ok {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, share), 1, m.Size(), l.SenderCount, l.SenderBytes, ttl)})
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok {
@@ -281,7 +282,22 @@ func (s *Store) mayRecount(ctx context.Context, recipient string, now time.Time)
 	return err == nil
 }
 
-// recount counts recipient's queue, and what sender has in it, and sets
+// shareOf is Message.ShareKey of a projected queue item.
+func shareOf(item map[string]types.AttributeValue) (string, bool) {
+	var m store.Message
+	var mode int64
+	_ = getString(item, attrSender, &m.Sender, false)
+	_ = getString(item, attrAuthor, &m.Author, false)
+	_ = getNum(item, attrMode, &mode)
+	if b, ok := item[attrNotification].(*types.AttributeValueMemberBOOL); ok {
+		m.Notification = b.Value
+	}
+	m.Mode = store.Mode(mode)
+	return m.ShareKey()
+}
+
+// recount counts recipient's queue, and what sender's share holds of it
+// (Message.ShareKey), and sets
 // any size item that says more to what is there. It reports whether it
 // corrected one. Each correction is conditional on the size item being
 // unchanged since it was read, before the queue was: a size that moved
@@ -309,11 +325,13 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 	}
 	var queueIs, senderIs size
 	in := &dynamodb.QueryInput{
-		TableName:                 aws.String(s.table),
-		ConsistentRead:            aws.Bool(true),
-		KeyConditionExpression:    aws.String("#pk = :pk"),
-		ProjectionExpression:      aws.String("#sender, #size, #notification"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#sender": attrSender, "#size": attrSize, "#notification": attrNotification},
+		TableName:              aws.String(s.table),
+		ConsistentRead:         aws.Bool(true),
+		KeyConditionExpression: aws.String("#pk = :pk"),
+		ProjectionExpression:   aws.String("#sender, #author, #mode, #size, #notification"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": attrPK, "#sender": attrSender, "#author": attrAuthor, "#mode": attrMode, "#size": attrSize, "#notification": attrNotification,
+		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(queuePrefix, recipient))},
 	}
 	for {
@@ -325,8 +343,7 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 			var n int64
 			_ = getNum(item, attrSize, &n)
 			queueIs.count, queueIs.bytes = queueIs.count+1, queueIs.bytes+n
-			note, _ := item[attrNotification].(*types.AttributeValueMemberBOOL)
-			if sv, _ := item[attrSender].(*types.AttributeValueMemberS); sv != nil && sv.Value == sender && (note == nil || !note.Value) {
+			if k, ok := shareOf(item); ok && k == sender {
 				senderIs.count, senderIs.bytes = senderIs.count+1, senderIs.bytes+n
 			}
 		}
@@ -497,8 +514,8 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 		}},
 		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), -1, -m.Size(), 0, 0, time.Time{})},
 	}
-	if !m.Notification {
-		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, m.Sender), -1, -m.Size(), 0, 0, time.Time{})})
+	if share, ok := m.ShareKey(); ok {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, share), -1, -m.Size(), 0, 0, time.Time{})})
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {

@@ -53,6 +53,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("RepeatedWritesSucceed", func(t *testing.T) { retriedWrites(t, newStore(t)) })
 	t.Run("QueuesAreBoundedByCountAndBytes", func(t *testing.T) { limits(t, newStore(t)) })
 	t.Run("EachSenderHasAShareOfAQueue", func(t *testing.T) { senderShares(t, newStore(t)) })
+	t.Run("AGroupMessageCountsAgainstItsAuthorsShare", func(t *testing.T) { groupShares(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 }
@@ -400,6 +401,63 @@ func senderShares(t *testing.T, s store.Store) {
 	}
 	if err := s.Enqueue(ctx, from(alice, "0008"), l); !errors.Is(err, store.ErrSenderShareFull) {
 		t.Fatalf("alice after a notification went = %v", err)
+	}
+}
+
+// One person holds one share of a queue whether they write 1-to-1 or in
+// groups, and notifications about group messages share one bound of their
+// own, whichever group they come from.
+func groupShares(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	const group, other = "sip:chat-1@conf.example.net", "sip:chat-2@conf.example.net"
+	l := store.Limit{Count: 20, SenderCount: 3}
+	direct := func(id string) store.Message {
+		m := message(bob, id, t0)
+		m.Sender = alice
+		return m
+	}
+	inGroup := func(g, id string) store.Message {
+		m := message(bob, id, t0)
+		m.Sender, m.Author, m.Mode = g, alice, store.Group
+		return m
+	}
+	notice := func(g, id string) store.Message {
+		m := message(bob, id, t0)
+		m.Sender, m.Author, m.Mode, m.Notification = g, carol, store.Group, true
+		return m
+	}
+	for _, m := range []store.Message{direct("0001"), inGroup(group, "0002"), inGroup(other, "0003")} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatalf("%s = %v", m.ID, err)
+		}
+	}
+	for _, m := range []store.Message{direct("0004"), inGroup(group, "0005"), inGroup(other, "0006")} {
+		if err := s.Enqueue(ctx, m, l); !errors.Is(err, store.ErrSenderShareFull) {
+			t.Fatalf("%s beyond alice's share = %v", m.ID, err)
+		}
+	}
+	// Group notifications have a share of their own, which alice's
+	// messages do not use up, and which a second group does not double.
+	for _, n := range []store.Message{notice(group, "n1"), notice(other, "n2"), notice(group, "n3")} {
+		if err := s.Enqueue(ctx, n, l); err != nil {
+			t.Fatalf("notification %s = %v", n.ID, err)
+		}
+	}
+	for _, n := range []store.Message{notice(group, "n4"), notice(other, "n5")} {
+		if err := s.Enqueue(ctx, n, l); !errors.Is(err, store.ErrSenderShareFull) {
+			t.Fatalf("%s beyond the group notifications' share = %v", n.ID, err)
+		}
+	}
+	// Removing alice's group message frees her share, for any path.
+	held, err := s.Claim(ctx, bob, "0002", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, held, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, direct("0007"), l); err != nil {
+		t.Fatalf("alice after a removal = %v", err)
 	}
 }
 

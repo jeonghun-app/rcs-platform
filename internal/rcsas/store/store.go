@@ -47,11 +47,10 @@ var (
 
 // Limit bounds one recipient's queue, and the share of it one sender may
 // hold, so that a sender cannot fill a queue and lock every other sender
-// out. A zero field is no bound. Notifications count toward the queue but
-// neither toward nor against a sender's share: what one notifier may put
-// in a queue is already bounded by the messages the queue's owner sent it,
-// each answered once per kind, and a recipient catching up on many
-// messages answers each with up to two.
+// out. A zero field is no bound. Whose share an item counts against is
+// Message.ShareKey: a 1-to-1 notification counts toward the queue only,
+// since what one notifier may put in a queue is already bounded by the
+// messages the queue's owner sent it, each answered once per kind.
 type Limit struct {
 	Count       int
 	Bytes       int64
@@ -128,6 +127,36 @@ type Message struct {
 	LeaseUntil time.Time
 }
 
+// GroupNotifications is the share of a queue that notifications about
+// group messages count against, whichever group and notifier they come
+// from. It is not an identity: those are URIs.
+const GroupNotifications = "#group-notifications"
+
+// ShareKey returns whose share of the recipient's queue m counts against,
+// and false when it counts against none:
+//
+//   - a message counts against its writer's share: the sender, or for a
+//     group message its author, so that one person holds one share of a
+//     queue whichever way they write;
+//   - a group notification counts against GroupNotifications: each
+//     message an author writes is answered by every other participant,
+//     so the bound that makes a 1-to-1 notification need no share (one
+//     recipient answers it, once per kind) does not hold, and without one
+//     the receipts for a few messages to a large group would fill the
+//     author's queue;
+//   - a 1-to-1 notification counts against none.
+func (m Message) ShareKey() (string, bool) {
+	switch {
+	case m.Mode == Group && m.Notification:
+		return GroupNotifications, true
+	case m.Mode == Group && m.Author != "":
+		return m.Author, true
+	case !m.Notification:
+		return m.Sender, true
+	}
+	return "", false
+}
+
 // Size is what m counts for against its queue's Limit.
 func (m Message) Size() int64 { return int64(len(m.CPIM)) }
 
@@ -180,8 +209,8 @@ func (s Sent) Clone() Sent {
 type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
-	// beyond l, ErrSenderShareFull if what m.Sender has in it would (m not
-	// being a notification).
+	// beyond l, ErrSenderShareFull if what counts against m's share
+	// (Message.ShareKey) would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID

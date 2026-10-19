@@ -303,16 +303,18 @@ func (e *Engine) submitGroupNotification(ctx context.Context, o GroupOrigin, m *
 		Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
 		CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
 	}
-	if err := e.enqueue(ctx, q); err != nil {
+	err = e.enqueue(ctx, q)
+	switch {
+	case errors.Is(err, store.ErrQueueFull), errors.Is(err, store.ErrSenderShareFull):
+		// Taken and dropped, the mark kept: a refusal would not make
+		// room, and the reference client ends its session with the group
+		// on one (rcsjta GroupChatSession.msrpTransferError).
+		e.metrics.Count("group.notification.dropped", 1)
+		return nil
+	case err != nil:
 		rctx, cancel := e.recordCtx()
 		_ = e.store.UnmarkNotified(rctx, o.Group, n.MessageID, mark, id)
 		cancel()
-		switch {
-		case errors.Is(err, store.ErrQueueFull):
-			return reject(ReasonQueueFull, nil)
-		case errors.Is(err, store.ErrSenderShareFull):
-			return reject(ReasonQueueShareFull, nil)
-		}
 		return err
 	}
 	e.metrics.Count("group.notification.accepted", 1)

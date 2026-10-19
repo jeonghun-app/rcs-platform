@@ -50,16 +50,17 @@ func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 	}
 	var bytes, senderBytes int64
 	senderCount := 0
+	share, shared := m.ShareKey()
 	for _, x := range q {
 		bytes += x.Size()
-		if x.Sender == m.Sender && !x.Notification {
+		if k, ok := x.ShareKey(); ok && shared && k == share {
 			senderCount, senderBytes = senderCount+1, senderBytes+x.Size()
 		}
 	}
 	switch {
 	case l.Count > 0 && len(q)+1 > l.Count, l.Bytes > 0 && bytes+m.Size() > l.Bytes:
 		return fmt.Errorf("store: enqueue: %w", ErrQueueFull)
-	case m.Notification:
+	case !shared:
 	case l.SenderCount > 0 && senderCount+1 > l.SenderCount, l.SenderBytes > 0 && senderBytes+m.Size() > l.SenderBytes:
 		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
 	}

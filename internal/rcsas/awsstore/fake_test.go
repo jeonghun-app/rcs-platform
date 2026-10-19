@@ -361,8 +361,8 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		items, last := f.page(rows, indexOrder, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool { return free(r, vals[":now"]) }, indexKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
-	if aws.ToString(in.ProjectionExpression) == "#sender, #size, #notification" {
-		// recount: the whole partition, keys and the two attributes.
+	if aws.ToString(in.ProjectionExpression) == "#sender, #author, #mode, #size, #notification" {
+		// recount: the whole partition, keys and the projected attributes.
 		f.recounts++
 		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
 			f.t.Errorf("recount query %+v", in)
@@ -371,7 +371,11 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		for _, r := range f.rows {
 			if sOf(r[attrPK]) == sOf(vals[":pk"]) {
 				p := tableKey(r)
-				p[attrSender], p[attrSize], p[attrNotification] = r[attrSender], r[attrSize], r[attrNotification]
+				for _, a := range []string{attrSender, attrAuthor, attrMode, attrSize, attrNotification} {
+					if v, ok := r[a]; ok {
+						p[a] = v
+					}
+				}
 				rows = append(rows, p)
 			}
 		}
