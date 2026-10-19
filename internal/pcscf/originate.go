@@ -55,7 +55,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 					return err
 				}
 			}
-			return req.Header.Set("P-Charging-Vector", "icid-value="+icid)
+			return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 		},
 	}
 }

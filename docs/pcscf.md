@@ -151,7 +151,8 @@ registration over the flow it comes on; without one it is answered 403.
   A SIP or SIPS identity is joined by the registration's first tel URI
   (RFC 3325 §9.1 allows one of each). Parameters other than `user` are
   dropped.
-- **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request.
+- **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request
+  and `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.6.3.3 7)).
 - **Record-Route.** `pcscf` records two values (RFC 5658), topmost first:
   `<sip:<flow token>@<task address>:<core port>;transport=tcp;lr>`, with `ob`
   when the client's Contact has it, for the core, and
