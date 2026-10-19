@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -868,3 +869,92 @@ func ctx(t *testing.T) context.Context {
 }
 
 const realWait = 10 * time.Second
+
+// startStalled forwards an INVITE through a proxy whose upstream sends are
+// held, and returns the branch's request and its context.
+func startStalled(t *testing.T) (*Proxy, *stalledUp, *sip.Request, *respContext) {
+	t.Helper()
+	net := &stalledUp{fakeNet: &fakeNet{}, block: make(chan struct{})}
+	p, err := New(net, Config{Self: []sip.URI{selfURI}, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Receive(inboundFrom(invite(t), "up"))
+	var a *sip.Request
+	for a == nil {
+		net.mu.Lock()
+		if len(net.requests) > 0 {
+			a = net.requests[0].req
+		}
+		net.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	var c *respContext
+	p.mu.Lock()
+	for _, x := range p.contexts {
+		c = x
+	}
+	p.mu.Unlock()
+	return p, net, a, c
+}
+
+func ok2xx(t *testing.T, req *sip.Request, tag string) *sip.Response {
+	t.Helper()
+	res, err := sip.NewResponse(req, 200, "", tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := res.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := sip.ParseMessage(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.(*sip.Response)
+}
+
+// From QA: a downstream that sends each 2xx with a new To tag cannot grow the
+// upstream queue without bound either; past maxDialogsPerBranch dialogs a 2xx
+// counts as a retransmission.
+func TestA2xxFloodWithNewToTagsQueuedForASlowUpstreamIsBounded(t *testing.T) {
+	p, net, a, c := startStalled(t)
+	defer func() { close(net.block); p.Close() }()
+	for i := range 20000 {
+		p.Receive(inboundFrom(ok2xx(t, a, fmt.Sprintf("t%d", i)), "down"))
+	}
+	c.up.mu.Lock()
+	queued := len(c.up.queue)
+	c.up.mu.Unlock()
+	// Each new dialog, the bounded retransmissions, and the release.
+	if queued > maxDialogsPerBranch+maxQueuedProvisionals+1 {
+		t.Errorf("%d responses queued for one slow upstream transaction", queued)
+	}
+}
+
+// TestANewDialog2xxIsNeverDropped: however many retransmissions fill the
+// upstream queue, a 2xx that starts another dialog is queued and goes up.
+func TestANewDialog2xxIsNeverDropped(t *testing.T) {
+	p, net, a, _ := startStalled(t)
+	defer p.Close()
+	for range 200 {
+		p.Receive(inboundFrom(ok2xx(t, a, "first"), "down"))
+	}
+	p.Receive(inboundFrom(ok2xx(t, a, "second"), "down"))
+	if p.Stats().RetransmissionsDropped == 0 {
+		t.Fatal("the queue never filled")
+	}
+	close(net.block)
+	p.wait()
+	net.mu.Lock()
+	defer net.mu.Unlock()
+	seen := map[string]bool{}
+	for _, res := range net.upstream {
+		to, _ := res.Header.To()
+		seen[to.Tag()] = true
+	}
+	if !seen["first"] || !seen["second"] {
+		t.Errorf("dialogs upstream %v, want both", seen)
+	}
+}
