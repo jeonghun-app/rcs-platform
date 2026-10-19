@@ -739,10 +739,12 @@ func TestASummaryThatCannotBeRemovedIsGivenUp(t *testing.T) {
 		t.Fatalf("%d summaries after %d removals", sums, st.tries.Load())
 	}
 	// Two notifications from the summary (bob's went whole), once: the
-	// passes after the first had nothing new to send.
-	if got := r.m.get("group.summary.sent"); got != 2 || !a.readByAll("m1", []string{bob, carol}) {
+	// passes after the first had nothing new to send. The author's client
+	// reads them on its own goroutine.
+	if got := r.m.get("group.summary.sent"); got != 2 {
 		t.Fatalf("summary sent %d notifications", got)
 	}
+	waitFor(t, "read by all", func() bool { return a.readByAll("m1", []string{bob, carol}) })
 }
 
 // New marks are not a failed removal: the failures counted before them
@@ -839,7 +841,8 @@ func TestASummaryIsNotGivenUpForABusyStore(t *testing.T) {
 	for try := int32(1); try <= 2*MaxSummaryFailures; try++ {
 		retried(t, r, clock, st, try)
 	}
-	waitFor(t, "read by all", func() bool { return a.readByAll("m1", []string{bob, carol, "tel:+15550100005"}) })
+	// Idle, the summary is not claimed by a pass, so Pending counts it.
+	waitFor(t, "read by all", func() bool { return a.readByAll("m1", []string{bob, carol, "tel:+15550100005"}) && r.idle() })
 	if _, sums := queuedReceipts(t, r, alice); sums != 1 || r.m.get("group.summary.abandoned") != 0 {
 		t.Fatalf("%d summaries queued, metrics %v", sums, r.m)
 	}
@@ -861,9 +864,9 @@ func TestNotificationsMergedBeforeASummaryIsGivenUpAreSent(t *testing.T) {
 	if got := st.tries.Load(); got != 2*MaxSummaryFailures {
 		t.Fatalf("given up after %d removals", got)
 	}
-	if !a.readByAll("m1", []string{bob, carol, "tel:+15550100005"}) {
-		t.Fatal("dave's display was given up with the summary")
-	}
+	waitFor(t, "dave's display, not given up with the summary", func() bool {
+		return a.readByAll("m1", []string{bob, carol, "tel:+15550100005"})
+	})
 	// bob's and carol's from the first pass, dave's from the fourth.
 	if got := r.m.get("group.summary.sent"); got != 3 {
 		t.Fatalf("summary sent %d notifications", got)
