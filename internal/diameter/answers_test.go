@@ -266,10 +266,11 @@ func TestAnAnswerReadyWhenTheWriterTakesTheDPAGoesFirst(t *testing.T) {
 	}
 }
 
-// The node's own request, once queued, must not wait behind an endless
-// stream of answers (QA of #148): here the peer keeps one request in progress at a time,
-// and the node never gets to write its own second request.
-func TestQA148OwnRequestIsNotStarvedByAStreamOfAnswers(t *testing.T) {
+// The node's own requests, once queued, do not wait behind an endless
+// stream of answers: the peer keeps one request in progress at a time, so
+// an answer is always ready, and the node's second request still goes out
+// within a few of them (QA of #148).
+func TestOwnRequestsAreNotStarvedByAStreamOfAnswers(t *testing.T) {
 	const rounds = 3 * testInFlight
 	hss, ln, _ := startResponder(t, func(c *Config) { c.MaxInFlight = testInFlight })
 	hss.HandleFunc(appCx, cmdTest, func(ctx context.Context, p *Peer, req *Message) (*Message, error) {
@@ -308,4 +309,45 @@ func TestQA148OwnRequestIsNotStarvedByAStreamOfAnswers(t *testing.T) {
 		}
 	}
 	t.Fatalf("the node's second request was still not written after %d answers (MaxInFlight %d)", answers, testInFlight)
+}
+
+// With a full answer queue and a full main queue, the last answer is
+// written after at most one of the node's requests per maxAnswersInARow
+// answers ahead of it: the run bound keeps AC1 of #117 (QA of #148).
+func TestAnAnswerBehindAFullAnswerQueueWaitsForFewRequests(t *testing.T) {
+	const inFlight = 64
+	hss, ln, _ := startResponder(t, func(c *Config) { c.MaxInFlight = inFlight })
+	hss.HandleFunc(appCx, cmdTest, func(ctx context.Context, p *Peer, req *Message) (*Message, error) {
+		return hss.NewAnswer(req, ResultSuccess), nil
+	})
+	s := openScript(t, ln, scscfHost)
+	var last *Message
+	for range inFlight {
+		last = s.request(&Message{Code: cmdTest, ApplicationID: appCx, AVPs: s.origin()})
+	}
+	p := hss.Peer(scscfHost)
+	c := p.current()
+	waitFor(t, "the answers to be queued", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.active == 0 && len(c.answers) == inFlight-1
+	})
+	for range inFlight {
+		go func() { _, _ = p.Send(context.Background(), hss.NewRequest(cmdTest, appCx, hss.NewSessionID(""))) }()
+	}
+	waitFor(t, "the main queue to fill", func() bool { return len(c.writes) == inFlight })
+	requests := 0
+	for {
+		m := s.read()
+		if m.IsRequest() {
+			requests++
+			continue
+		}
+		if m.HopByHop == last.HopByHop {
+			break
+		}
+	}
+	if want := (inFlight-1)/maxAnswersInARow + 1; requests > want {
+		t.Fatalf("%d of the node's requests came before the last queued answer, want at most %d", requests, want)
+	}
 }
