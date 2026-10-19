@@ -272,8 +272,7 @@ func TestRegistrationsOfFlowsThatClosedBeforeThe200AreNotKept(t *testing.T) {
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	var pc *pcscf
 	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
-	// As many as one client may have under way at once.
-	const n = maxPendingPerClient
+	const n = 20
 	var tokens []transport.FlowID
 	for range n {
 		c := dial(t, s.client, nil)
@@ -431,5 +430,16 @@ func (p *peer) final() *sip.Response {
 		if res.StatusCode >= 200 {
 			return res
 		}
+	}
+}
+
+// PCSCF_MAX_PENDING_REGISTERS_PER_IP reaches the registry.
+func TestTheRegistryTakesThePendingRegistersPerIP(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxPendingRegistersPerIP = 3
+	var pc *pcscf
+	start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
+	if pc.registry.perClient != 3 {
+		t.Fatalf("per-client bound %d", pc.registry.perClient)
 	}
 }

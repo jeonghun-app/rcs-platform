@@ -88,7 +88,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
 		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
-		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst,
+		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -220,6 +220,8 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.example.net;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.evil-rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
 		{[]string{"RCS_IMS_DOMAIN", ""}, "RCS_IMS_DOMAIN: required"},
+		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "0"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
+		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "1025"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
 		{[]string{"RCS_IMS_DOMAIN", "ims_1.example.net"}, "RCS_IMS_DOMAIN: not a host name"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "a, b"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "\"open"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},

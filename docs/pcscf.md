@@ -123,11 +123,12 @@ listener (TS 24.229 §5.2.2.1):
   `PCSCF_MAX_REGISTRATIONS` registrations. A REGISTER takes its slot before
   it is forwarded and gives it back if it ends unregistered, so a new one
   past the limit is refused at once rather than after a 200 `pcscf` could not
-  keep. One client address (or IPv6 /64) may have REGISTERs under way for
-  at most eight identities over all its flows, so a client cannot hold
-  slots by writing new To values while the core is slow; behind a
-  carrier-grade NAT more clients than that registering at once while the
-  core is slow are told to retry. Every REGISTER the core will see costs it
+  keep. One flow may have REGISTERs under way for at most eight
+  identities, and one client address (or IPv6 /64) for at most
+  `PCSCF_MAX_PENDING_REGISTERS_PER_IP` over all its flows, so a client
+  cannot hold slots by writing new To values while the core is slow. The
+  address bound is higher because carrier-grade NAT puts many phones behind
+  one address. Every REGISTER the core will see costs it
   a UAR and an authentication vector, so once it has parsed the task as a
   whole takes at most `PCSCF_MAX_REGISTER_RATE` a second, with a burst of
   `PCSCF_MAX_REGISTER_BURST`, and counts the ones it refuses in
@@ -181,6 +182,7 @@ start with that value.
 | `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
 | `PCSCF_MAX_REGISTER_RATE`, `PCSCF_MAX_REGISTER_BURST` | `2000`, `4000` | REGISTERs a second for all clients of a task together, and the burst |
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
+| `PCSCF_MAX_PENDING_REGISTERS_PER_IP` | `64` | identities one client address (IPv4 address or IPv6 /64) may have REGISTERs under way for at once, 1 to 1024 |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | client flows among them; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
 | `PCSCF_CORE_CONNECTIONS` | `256` | connections kept for the core listener |

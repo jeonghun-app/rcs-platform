@@ -673,44 +673,61 @@ func registerAs(t *testing.T, n int, flow transport.FlowID) *proxy.Request {
 	return clientRequest(t, text, flow)
 }
 
-// A client, an IPv4 address or IPv6 /64, may have REGISTERs under way for at
-// most eight identities over all its flows: one writing new To values while
-// the core is slow holds no more slots, and another client still registers
-// (QA of #198).
+// A flow may have REGISTERs under way for at most eight identities, and a
+// client address, an IPv4 address or IPv6 /64, for at most
+// PCSCF_MAX_PENDING_REGISTERS_PER_IP over all its flows: one writing new To
+// values while the core is slow holds no more slots, and another client
+// still registers (QA of #198).
 func TestAClientHoldsAFewSlotsForUnansweredRegisters(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	p, _ := newTestPcscf(clock)
-	p.registry = newRegistry(100, clock.now)
-	refused, n := 0, 0
-	// 13 connections from one address, 8 identities each.
-	for f := range 13 {
-		for range 8 {
-			if d := p.Route(context.Background(), registerAs(t, n, transport.FlowID(fmt.Sprint("BUSY-", f)))); d.Response != nil {
-				if d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
-					t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
-				}
-				refused++
+	p.registry = newRegistry(1000, clock.now)
+	refused := func(d proxy.Decision) bool {
+		if d.Response == nil {
+			return false
+		}
+		if d.Response.StatusCode != 503 || d.Response.Header.Get("Retry-After") != "1" {
+			t.Fatalf("refusal %d %q", d.Response.StatusCode, d.Response.Header.Get("Retry-After"))
+		}
+		return true
+	}
+	n := 0
+	// The ninth identity of one flow is refused.
+	for i := range maxPendingPerFlow + 1 {
+		if refused(p.Route(context.Background(), registerAs(t, n, "BUSY-0"))) != (i == maxPendingPerFlow) {
+			t.Fatalf("identity %d on one flow", i)
+		}
+		n++
+	}
+	// Nine flows from the address, eight identities each: the first 64 are
+	// held, and from the 65th on they are refused.
+	held := maxPendingPerFlow
+	for f := 1; f < 9; f++ {
+		for range maxPendingPerFlow {
+			if refused(p.Route(context.Background(), registerAs(t, n, transport.FlowID(fmt.Sprint("BUSY-", f))))) != (held >= DefaultMaxPendingRegistersPerIP) {
+				t.Fatalf("identity %d on flow %d, with %d held", n, f, held)
 			}
+			held = min(held+1, DefaultMaxPendingRegistersPerIP)
 			n++
 		}
 	}
-	if size := p.registry.size(); size > maxPendingPerClient || refused != n-maxPendingPerClient {
-		t.Fatalf("%d slots held, %d of %d refused", size, refused, n)
+	if size := p.registry.size(); size != DefaultMaxPendingRegistersPerIP {
+		t.Fatalf("%d slots held, want %d", size, DefaultMaxPendingRegistersPerIP)
 	}
 	// One already under way is not a new identity.
-	if d := p.Route(context.Background(), registerAs(t, 0, "BUSY-0")); d.Response != nil {
+	if refused(p.Route(context.Background(), registerAs(t, 0, "BUSY-0"))) {
 		t.Fatal("a retransmitted identity was refused")
 	}
 	// The same /64 is the same client.
-	r := registerAs(t, n, "BUSY-V6")
-	r.Source.Addr = netip.MustParseAddrPort("[2001:db8:1:2::1]:1")
-	for i := range maxPendingPerClient {
-		r := registerAs(t, n+1+i, "BUSY-V6")
+	p.registry.perClient = 2
+	for i := range 2 {
+		r := registerAs(t, 1000+i, transport.FlowID(fmt.Sprint("V6-", i)))
 		r.Source.Addr = netip.MustParseAddrPort("[2001:db8:1:2::1]:1")
 		_ = p.Route(context.Background(), r)
 	}
+	r := registerAs(t, 1002, "V6-2")
 	r.Source.Addr = netip.MustParseAddrPort("[2001:db8:1:2::99]:1")
-	if d := p.Route(context.Background(), r); d.Response == nil {
+	if !refused(p.Route(context.Background(), r)) {
 		t.Fatal("another address of the same /64 got slots of its own")
 	}
 	other := clientRequest(t, registerText(outboundContact, "Supported: outbound"), "OTHER")

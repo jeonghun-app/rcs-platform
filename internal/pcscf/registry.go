@@ -11,20 +11,22 @@ import (
 )
 
 // errRegistryFull refuses a registration beyond PCSCF_MAX_REGISTRATIONS, and
-// errTooManyPending a REGISTER for one more identity from a client that has
-// maxPendingPerClient under way.
+// errTooManyPending a REGISTER for one more identity from a flow or a client
+// that has as many under way as it may.
 var (
 	errRegistryFull   = errors.New("pcscf: registry full")
-	errTooManyPending = errors.New("pcscf: too many registrations under way on the flow")
+	errTooManyPending = errors.New("pcscf: too many registrations under way")
 )
 
-// maxPendingPerClient bounds the identities one client, an IPv4 address or
-// an IPv6 /64 (clientKey), may have REGISTERs under way for at once over
-// all its flows, so that it cannot hold slots by writing new To values
-// while the core is slow (QA of #198). A UE registers one or two identities,
-// and a REGISTER is under way for well under a second when the core is
+// The identities with REGISTERs under way at once are bounded, so that a
+// client cannot hold slots by writing new To values while the core is slow
+// (QA of #198): maxPendingPerFlow for one flow, since a UE registers one or
+// two identities over it, and PCSCF_MAX_PENDING_REGISTERS_PER_IP for one
+// client address, an IPv4 address or IPv6 /64 (clientKey), over all its
+// flows, which is more since carrier-grade NAT puts many phones behind one
+// address. A REGISTER is under way for well under a second when the core is
 // well.
-const maxPendingPerClient = 8
+const maxPendingPerFlow = 8
 
 // registration is what pcscf keeps of a public identity registered over a
 // flow (TS 24.229 §5.2.2.1): the 200 to its REGISTER told it the
@@ -85,8 +87,11 @@ type registry struct {
 	mu      sync.Mutex
 	byFlow  map[transport.FlowID]map[string]*registration
 	pending map[slotKey]*reservation
-	// pendingByClient counts the reservations of each client.
+	// pendingByFlow and pendingByClient count the reservations of each
+	// flow and each client, and perClient bounds the latter.
+	pendingByFlow   map[transport.FlowID]int
 	pendingByClient map[netip.Addr]int
+	perClient       int
 	// count is the slots taken: identities with a registration, a
 	// reservation or both.
 	count int
@@ -109,7 +114,8 @@ type reservation struct {
 func newRegistry(maxRegistrations int, now func() time.Time) *registry {
 	return &registry{max: maxRegistrations, now: now,
 		byFlow: map[transport.FlowID]map[string]*registration{}, pending: map[slotKey]*reservation{},
-		pendingByClient: map[netip.Addr]int{}}
+		pendingByFlow: map[transport.FlowID]int{}, pendingByClient: map[netip.Addr]int{},
+		perClient: DefaultMaxPendingRegistersPerIP}
 }
 
 // holdsLocked reports whether k has a slot. mu must be held.
@@ -121,14 +127,14 @@ func (r *registry) holdsLocked(k slotKey) bool {
 
 // reserve takes the slot of a REGISTER of aor over flow from client, a
 // clientKey, until release or until: errRegistryFull if the registry has no
-// room, errTooManyPending if the client has maxPendingPerClient other
-// identities under way. An identity that has its slot already keeps it.
+// room, errTooManyPending if the flow or the client has as many other
+// identities under way as it may. An identity that has its slot already keeps it.
 func (r *registry) reserve(flow transport.FlowID, aor string, client netip.Addr, until time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	k := slotKey{flow, aor}
 	res := r.pending[k]
-	if res == nil && r.pendingByClient[client] >= maxPendingPerClient {
+	if res == nil && (r.pendingByFlow[flow] >= maxPendingPerFlow || r.pendingByClient[client] >= r.perClient) {
 		return errTooManyPending
 	}
 	if !r.holdsLocked(k) {
@@ -140,6 +146,7 @@ func (r *registry) reserve(flow transport.FlowID, aor string, client netip.Addr,
 	if res == nil {
 		res = &reservation{client: client}
 		r.pending[k] = res
+		r.pendingByFlow[flow]++
 		r.pendingByClient[client]++
 	}
 	res.n++
@@ -171,6 +178,9 @@ func (r *registry) dropReservationLocked(k slotKey) {
 	if res := r.pending[k]; res != nil {
 		if r.pendingByClient[res.client]--; r.pendingByClient[res.client] <= 0 {
 			delete(r.pendingByClient, res.client)
+		}
+		if r.pendingByFlow[k.flow]--; r.pendingByFlow[k.flow] <= 0 {
+			delete(r.pendingByFlow, k.flow)
 		}
 	}
 	delete(r.pending, k)

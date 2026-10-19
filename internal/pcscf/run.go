@@ -112,6 +112,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		icscfs:  resolver, rand: rand.Reader,
 		flows: tr, now: d.now, log: rt.Logger,
 	}
+	pc.registry.perClient = cfg.MaxPendingRegistersPerIP
 	// A closed flow's registrations are gone (RFC 5626 §5.3).
 	fl.onClosed = pc.registry.removeFlow
 	router := d.router
