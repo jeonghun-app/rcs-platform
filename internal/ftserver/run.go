@@ -205,7 +205,14 @@ func credentialSource(cfg Config, production bool) CredentialSource {
 	}
 	var dial func(ctx context.Context, network, address string) (net.Conn, error)
 	if production {
-		dial = runtime.InternalDialer{Timeout: cfg.HSSTimeout}.DialContext
+		dial = hssDialer(cfg).DialContext
 	}
 	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.v, cfg.Realm, cfg.HSSTimeout, cfg.MaxLookups, dial)
+}
+
+// hssDialer is the production HSS client's dialer: private addresses only,
+// and FT_HSS_TIMEOUT for the whole dial, which http.Client's Timeout does
+// not reach (#119).
+func hssDialer(cfg Config) runtime.InternalDialer {
+	return runtime.InternalDialer{Timeout: cfg.HSSTimeout}
 }
