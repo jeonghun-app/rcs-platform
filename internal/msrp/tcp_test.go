@@ -774,19 +774,34 @@ func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *test
 	for _, s := range []*Session{asSilent, asSlow} {
 		sendMany(context.Background(), s, 1, 16, 1<<20, false)
 	}
+	// Each message to the fast client gets 5 s, counted from the start of
+	// its Send, which waits for the relay's answer. A relay that held the
+	// shared connection behind the slow client would stall for a write's
+	// 8–9 s or its 30 s timeout, past it. The bound is 5 s under the race
+	// detector too, not stallBound's 10 s, which an 8–9 s stall would fit
+	// in. A loaded host's delivery can take longer than prompt (1 s), as
+	// #157 showed; QA measured it well under 5 s, race or not (#173).
+	const fastBound = 5 * time.Second
 	for i := range 10 {
 		time.Sleep(200 * time.Millisecond)
-		start := time.Now()
-		if _, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))}); err != nil {
-			t.Fatalf("rcs-as could not send to the fast client: %v", err)
-		}
-		select {
-		case <-fastH.got:
-			if d := time.Since(start); d > prompt {
-				t.Errorf("message %d to the fast client took %v", i, d)
+		bound := time.After(fastBound)
+		sent := make(chan error, 1)
+		go func() {
+			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))})
+			sent <- err
+		}()
+		for got, answered := false, false; !got || !answered; {
+			select {
+			case <-fastH.got:
+				got = true
+			case err := <-sent:
+				if err != nil {
+					t.Fatalf("rcs-as could not send to the fast client: %v", err)
+				}
+				answered = true
+			case <-bound:
+				t.Fatalf("message %d to the fast client: delivered %v, answered %v after %v", i, got, answered, fastBound)
 			}
-		case <-time.After(hangGuard):
-			t.Fatalf("message %d to the fast client never arrived", i)
 		}
 	}
 	// The silent client has been cut off by the write deadline. The slow
