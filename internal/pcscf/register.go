@@ -37,7 +37,7 @@ const (
 // §5.2), and the 200 is remembered, with the keep-alive the client gets.
 func (p *pcscf) register(_ context.Context, r *proxy.Request) proxy.Decision {
 	src := r.Source
-	if !p.registers.allow(src.Addr.Addr().Unmap()) {
+	if !p.registers.allow(clientKey(src.Addr)) {
 		return p.refuse(r, 503, "Too Many Registrations")
 	}
 	to, err := r.Message.Header.To()
@@ -115,13 +115,12 @@ func viaKeep(req *sip.Request) bool {
 	return err == nil && len(vias) > 0 && vias[0].Params.Has("keep")
 }
 
-// prepareRegister readies the branch's REGISTER: no header only the network
-// may set, Path naming this task's core listener and the flow, with ob when
-// the client uses outbound (RFC 5626 §5.1), Supported: path, and, for a
-// client that does not keep its flow alive, expiries of at most
-// maxExpiresWithoutKeepAlive.
+// prepareRegister readies the branch's REGISTER: Path naming this task's
+// core listener and the flow, with ob when the client uses outbound (RFC
+// 5626 §5.1), Supported: path, and, for a client that does not keep its
+// flow alive, expiries of at most maxExpiresWithoutKeepAlive. The headers
+// only the network may set are gone already, removed on arrival.
 func (p *pcscf) prepareRegister(req *sip.Request, reg *registration) error {
-	stripNetworkHeaders(&req.Header)
 	path := sip.URI{Scheme: "sip", User: string(reg.flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
 	path.Params.Set("transport", "tcp")
 	path.Params.SetFlag("lr")

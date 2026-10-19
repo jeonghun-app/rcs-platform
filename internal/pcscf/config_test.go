@@ -33,6 +33,7 @@ var prodEnv = with(devEnv,
 	"RCS_PII_HMAC_KEY", strings.Repeat("k", 32),
 	"RCS_PROXY_PROTOCOL", "true",
 	"PCSCF_CLIENT_TRANSPORT", "nlb-tls",
+	"PCSCF_PUBLIC_ADDRS", "203.0.113.10, 203.0.113.11",
 )
 
 func with(base map[string]string, kv ...string) map[string]string {
@@ -81,8 +82,9 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		PublicHost: publicHost, PublicPort: 5060, ClientTransport: ClientTCP, ClientAddr: "0.0.0.0:5060",
 		CoreAddr: DefaultCoreAddr, CoreHost: netip.MustParseAddr("10.0.2.9"),
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout,
-		DrainTimeout: runtime.DefaultShutdownTimeout - stopMargin,
-		ICSCF:        mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
+		DrainTimeout:   runtime.DefaultShutdownTimeout - stopMargin,
+		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
+		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 	}
 	if !reflect.DeepEqual(c, want) {
@@ -107,6 +109,24 @@ func TestTheICSCFURIAndLoopbackFollowTheSettings(t *testing.T) {
 	p, err := configure(prodEnv)
 	if err != nil || p.AllowLoopback {
 		t.Fatalf("production allows loopback core hops: %v", err)
+	}
+}
+
+func TestThePublicNameAndAddressesAreNormalised(t *testing.T) {
+	c, err := configure(with(devEnv, "PCSCF_PUBLIC_HOST", "PCSCF.rcs.example.net.", "PCSCF_PUBLIC_ADDRS", "203.0.113.10,::ffff:203.0.113.11, 2001:db8::10"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Addr{netip.MustParseAddr("203.0.113.10"), netip.MustParseAddr("203.0.113.11"), netip.MustParseAddr("2001:db8::10")}
+	if c.PublicHost != publicHost || !reflect.DeepEqual(c.PublicAddrs, want) {
+		t.Fatalf("host %q, addresses %v", c.PublicHost, c.PublicAddrs)
+	}
+	label := strings.Repeat("a", 63)
+	long := strings.Repeat(label+".", 3) + strings.Repeat("b", 61) // 253 characters
+	for _, host := range []string{label + ".example.net", long} {
+		if _, err := configure(with(devEnv, "PCSCF_PUBLIC_HOST", host)); err != nil {
+			t.Errorf("%d-character host refused: %v", len(host), err)
+		}
 	}
 }
 
@@ -136,6 +156,15 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_PUBLIC_HOST", ""}, "PCSCF_PUBLIC_HOST"},
 		{[]string{"PCSCF_PUBLIC_HOST", "pcscf_1.example.net"}, "PCSCF_PUBLIC_HOST: not a host name"},
 		{[]string{"PCSCF_PUBLIC_HOST", "-pcscf.example.net"}, "PCSCF_PUBLIC_HOST: not a host name"},
+		{[]string{"PCSCF_PUBLIC_HOST", "pcscf.example.net.."}, "PCSCF_PUBLIC_HOST: not a host name"},
+		{[]string{"PCSCF_PUBLIC_HOST", strings.Repeat("a", 64) + ".example.net"}, "PCSCF_PUBLIC_HOST: not a host name"},
+		{[]string{"PCSCF_PUBLIC_HOST", strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 62)}, "PCSCF_PUBLIC_HOST: not a host name"},
+		{[]string{"PCSCF_PUBLIC_ADDRS", "203.0.113.10, nlb"}, "PCSCF_PUBLIC_ADDRS: item 2 is not an IP address"},
+		{[]string{"PCSCF_PUBLIC_ADDRS", "fe80::1%eth0"}, "PCSCF_PUBLIC_ADDRS: item 1 is not an IP address"},
+		{[]string{"PCSCF_MAX_CONNECTIONS", "0"}, "PCSCF_MAX_CONNECTIONS: must be positive"},
+		{[]string{"PCSCF_MAX_CLIENT_FLOWS", "0"}, "PCSCF_MAX_CLIENT_FLOWS: must be positive"},
+		{[]string{"PCSCF_CORE_CONNECTIONS", "0"}, "PCSCF_CORE_CONNECTIONS: must be positive"},
+		{[]string{"PCSCF_MAX_CLIENT_FLOWS", "9745"}, "PCSCF_MAX_CLIENT_FLOWS: plus PCSCF_CORE_CONNECTIONS must not exceed PCSCF_MAX_CONNECTIONS"},
 		{[]string{"PCSCF_CLIENT_TRANSPORT", "udp"}, "PCSCF_CLIENT_TRANSPORT: not one of tls, nlb-tls, tcp"},
 		{[]string{"PCSCF_CLIENT_TRANSPORT", "tls"}, "PCSCF_TLS_CERT_FILE: PCSCF_TLS_CERT_FILE and PCSCF_TLS_KEY_FILE are required"},
 		{[]string{"PCSCF_CLIENT_TRANSPORT", "tls", "PCSCF_TLS_CERT_FILE", "c.pem"}, "PCSCF_TLS_CERT_FILE: PCSCF_TLS_CERT_FILE and PCSCF_TLS_KEY_FILE are required"},
@@ -191,6 +220,7 @@ func TestProductionRefusesWhatLetsClientsPastTheEdge(t *testing.T) {
 		{[]string{"PCSCF_CLIENT_UDP_ADDR", "0.0.0.0:5060"}, "PCSCF_CLIENT_UDP_ADDR is set"},
 		{[]string{"RCS_PROXY_PROTOCOL", "false"}, "RCS_PROXY_PROTOCOL is false"},
 		{[]string{"RCS_PROXY_PROTOCOL", ""}, "RCS_PROXY_PROTOCOL is false"},
+		{[]string{"PCSCF_PUBLIC_ADDRS", ""}, "PCSCF_PUBLIC_ADDRS is unset"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			status, out := startup(t, with(prodEnv, tt.kv...))

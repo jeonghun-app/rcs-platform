@@ -6,8 +6,8 @@
 // framing on stream transports through the sip package's Reader, the received and
 // rport parameters a server adds to the top Via (RFC 3261 §18.2.1, RFC 3581 §4),
 // response routing (RFC 3261 §18.2.2), the sent-by a client inserts and checks
-// (RFC 3261 §18.1.1, §18.1.2), and the server side of the CRLF keep-alive of
-// RFC 5626 §4.4.1 and §5.4.
+// (RFC 3261 §18.1.1, §18.1.2), and both sides of the CRLF keep-alive of RFC
+// 5626 §4.4.1 and §5.4: answering pings, and, for a client, Ping and OnPong.
 // Transactions, dialogs and routing decisions belong to the layers above.
 //
 // # Flows

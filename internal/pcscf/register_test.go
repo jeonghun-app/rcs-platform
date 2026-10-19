@@ -112,7 +112,7 @@ func clientRequest(t *testing.T, text string, flow transport.FlowID) *proxy.Requ
 // 24.229 §5.2.2.1, RFC 5626 §5.1).
 func TestARegisterGoesToICSCFWithAPathNamingTheFlow(t *testing.T) {
 	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
-	r := clientRequest(t, registerText(outboundContact, "Supported: outbound", "P-Asserted-Identity: <"+aliceIMPU+">"), "FLOWTOKEN1")
+	r := clientRequest(t, registerText(outboundContact, "Supported: outbound"), "FLOWTOKEN1")
 	d := p.Route(context.Background(), r)
 	if len(d.Targets) != 1 || d.Targets[0].URI.String() != homeURI || len(d.Targets[0].Routes) != 1 || d.Targets[0].Routes[0].URI.String() != p.cfg.ICSCF.String() {
 		t.Fatalf("decision %+v", d)
@@ -126,9 +126,6 @@ func TestARegisterGoesToICSCFWithAPathNamingTheFlow(t *testing.T) {
 	}
 	if !hasOption(req.Header.Supported, "path") || !hasOption(req.Header.Supported, "outbound") {
 		t.Errorf("Supported %q", req.Header.Values("Supported"))
-	}
-	if req.Header.Has("P-Asserted-Identity") {
-		t.Error("the client's P-Asserted-Identity was forwarded")
 	}
 	// Outbound keeps the flow alive, so the expiry is the client's.
 	if c, _ := req.Header.Contact(); strings.Contains(c[0].String(), "expires") || req.Header.Has("Expires") {

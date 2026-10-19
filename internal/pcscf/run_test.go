@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ func testConfig() Config {
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout, DrainTimeout: time.Second,
 		ICSCF:         sip.URI{Scheme: "sip", Host: "icscf.rcs.internal", Params: sip.Params{{Name: "transport", Value: "tcp"}, {Name: "lr"}}},
 		AllowLoopback: true, MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
+		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 	}
 }
 
@@ -85,8 +87,12 @@ type peer struct {
 	t  *testing.T
 	nc net.Conn
 	r  *sip.Reader
-	n  int
 }
+
+// requests numbers every request a test sends, so no two share a branch or a
+// Call-ID: a server transaction of an earlier connection would take a new
+// one for its retransmission (QA of #188).
+var requests atomic.Int64
 
 func dial(t *testing.T, addr netip.AddrPort, prefix []byte) *peer {
 	t.Helper()
@@ -116,17 +122,27 @@ func (p *peer) request(routes ...string) *sip.Response {
 
 // try is request that returns an error when the connection fails.
 func (p *peer) try(routes ...string) (*sip.Response, error) {
-	p.n++
+	var fields []string
+	for _, r := range routes {
+		fields = append(fields, "Route: <"+r+">")
+	}
+	return p.tryWith(fields...)
+}
+
+// tryWith sends an OPTIONS with extra header fields and returns the
+// response.
+func (p *peer) tryWith(fields ...string) (*sip.Response, error) {
+	n := requests.Add(1)
 	var b strings.Builder
 	fmt.Fprintf(&b, "OPTIONS sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n")
-	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.10:40000;branch=z9hG4bK-pcscf-%d\r\n", p.n)
+	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.10:40000;branch=z9hG4bK-pcscf-%d\r\n", n)
 	b.WriteString("Max-Forwards: 70\r\n")
 	b.WriteString("From: <sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org>;tag=a1\r\n")
 	b.WriteString("To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>\r\n")
-	fmt.Fprintf(&b, "Call-ID: pcscf-test-%d\r\n", p.n)
-	fmt.Fprintf(&b, "CSeq: %d OPTIONS\r\n", p.n)
-	for _, r := range routes {
-		fmt.Fprintf(&b, "Route: <%s>\r\n", r)
+	fmt.Fprintf(&b, "Call-ID: pcscf-test-%d\r\n", n)
+	fmt.Fprintf(&b, "CSeq: %d OPTIONS\r\n", n)
+	for _, f := range fields {
+		b.WriteString(f + "\r\n")
 	}
 	b.WriteString("Content-Length: 0\r\n\r\n")
 	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
@@ -185,6 +201,7 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 	rec := &routes{}
 	cfg := testConfig()
 	cfg.PublicPort = 5061
+	cfg.PublicAddrs = []netip.Addr{netip.MustParseAddr("203.0.113.10")}
 	s := start(t, cfg, deps{router: rec})
 	c := dial(t, s.client, nil)
 	for _, r := range []string{
@@ -192,6 +209,9 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 		"sip:PCSCF.rcs.example.net:5060;lr",
 		"sip:" + publicHost + ":5061;transport=tls;lr",
 		"sips:" + publicHost + ";lr",
+		// The NLB's address, as rcsjta writes its first Route (review of #188).
+		"sip:203.0.113.10:5061;transport=tls;lr",
+		"sip:203.0.113.10;lr",
 		"sip:127.0.0.1;lr",
 		"sip:127.0.0.1:5061;lr",
 		"sip:127.0.0.1:" + fmt.Sprint(s.core.Port()) + ";lr",
@@ -202,7 +222,7 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 			t.Errorf("Route %s: router saw %q, want it taken as pcscf's own", r, rec.seen)
 		}
 	}
-	for _, r := range []string{"sip:other.rcs.example.net;lr", "sip:127.0.0.2;lr", "sip:" + publicHost + ":5070;lr"} {
+	for _, r := range []string{"sip:other.rcs.example.net;lr", "sip:127.0.0.2;lr", "sip:" + publicHost + ":5070;lr", "sip:203.0.113.11:5061;lr"} {
 		rec.seen = nil
 		c.request(r)
 		if len(rec.seen) != 1 || !strings.HasPrefix(rec.seen[0], "0 ") {
@@ -307,16 +327,32 @@ func TestAStopClosesTheClientFlowsOneByOne(t *testing.T) {
 	}
 	core := dial(t, s.core, nil)
 	core.request()
-	accepting := true
+	accepting, coreOK, served := true, false, 0
 	rec.during = func() {
 		nc, err := net.DialTimeout("tcp", s.client.String(), time.Second)
 		if accepting = err == nil; accepting {
 			_ = nc.Close()
 		}
+		// The core listener stays open, so scscf can still reach the
+		// clients not yet closed (review of #188).
+		if res, err := dial(t, s.core, nil).try(); err == nil && res.StatusCode == 430 {
+			coreOK = true
+		}
+		for _, p := range peers {
+			if res, err := p.try(); err == nil && res.StatusCode == 403 {
+				served++
+			}
+		}
 	}
 	s.stop()
 	if accepting {
 		t.Error("the client listener accepted a connection during the drain")
+	}
+	if !coreOK {
+		t.Error("the core listener was not served during the drain")
+	}
+	if served != 2 {
+		t.Errorf("%d client flows served during the drain, want the 2 not yet closed", served)
 	}
 	for i, p := range peers {
 		if !p.closed() {
@@ -327,6 +363,15 @@ func TestAStopClosesTheClientFlowsOneByOne(t *testing.T) {
 	defer rec.mu.Unlock()
 	if len(rec.gaps) != 2 || rec.gaps[0] != 30*time.Second || rec.gaps[1] != 30*time.Second {
 		t.Fatalf("gaps %v, want two of 30s", rec.gaps)
+	}
+}
+
+func TestAFlowThatAlreadyEndedTakesNoTimeOfTheDrain(t *testing.T) {
+	rec := &recordSleep{}
+	gone := map[transport.FlowID]bool{"b": true, "c": true}
+	drain(context.Background(), []transport.FlowID{"a", "b", "c", "d"}, 8*time.Second, func(id transport.FlowID) bool { return !gone[id] }, rec.sleep)
+	if len(rec.gaps) != 1 {
+		t.Fatalf("gaps %v, want one, after a", rec.gaps)
 	}
 }
 
@@ -392,4 +437,87 @@ func TestAQuietClientConnectionIsClosed(t *testing.T) {
 	if !c.closed() {
 		t.Fatal("a quiet client connection was kept open")
 	}
+}
+
+// The client listeners are client-facing, so no kernel keep-alive wakes a
+// phone and no connection is opened to a client's Via (ADR 0003), and the
+// UDP one names its own port in Via.
+func TestTheClientListenersAreClientFacing(t *testing.T) {
+	for _, tr := range []string{ClientTLS, ClientNLBTLS, ClientTCP} {
+		cfg := testConfig()
+		cfg.ClientTransport, cfg.ProxyProtocol, cfg.PublicPort = tr, true, 5061
+		lc := clientListenerConfig(cfg)
+		if !lc.ClientFacing || !lc.ProxyProtocol || lc.IdleTimeout != cfg.ClientIdleTimeout || lc.Name != clientListener ||
+			lc.AdvertisedHost != publicHost || lc.AdvertisedPort != 5061 || lc.KeepAlive != nil {
+			t.Errorf("%s: %+v", tr, lc)
+		}
+		if (lc.Network == transport.TLS) != (tr == ClientTLS) {
+			t.Errorf("%s: network %s", tr, lc.Network)
+		}
+	}
+	cfg := testConfig()
+	cfg.ClientUDPAddr, cfg.PublicPort = "0.0.0.0:5060", 5061
+	if u := udpListenerConfig(cfg); !u.ClientFacing || u.AdvertisedPort != 0 || u.Network != transport.UDP || u.Name != clientUDPListener {
+		t.Errorf("UDP: %+v", u)
+	}
+}
+
+// Client flows take at most MaxClientFlows of the transport's connections, so
+// the core listener always has room for scscf (review of #188).
+func TestClientFlowsLeaveRoomForTheCore(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxClientFlows = 2
+	s := start(t, cfg, deps{})
+	dial(t, s.client, nil).request()
+	dial(t, s.client, nil).request()
+	if !dial(t, s.client, nil).closed() {
+		t.Fatal("a client flow past MaxClientFlows was admitted")
+	}
+	if res := dial(t, s.core, nil).request(); res.StatusCode != 430 {
+		t.Fatalf("the core answered %d", res.StatusCode)
+	}
+}
+
+// The transport accepts at most MaxConnections connections in all.
+func TestTheTransportTakesMaxConnections(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxConnections, cfg.MaxClientFlows, cfg.CoreConnections = 2, 1, 1
+	s := start(t, cfg, deps{})
+	dial(t, s.core, nil).request()
+	dial(t, s.core, nil).request()
+	if res, err := dial(t, s.core, nil).try(); err == nil {
+		t.Fatalf("a connection past MaxConnections was answered %d", res.StatusCode)
+	}
+}
+
+// A client's message reaches the router without the headers only the
+// network may set: they are removed on arrival (review of #188).
+func TestTheRouterSeesNoNetworkHeaderFromAClient(t *testing.T) {
+	rec := &headerRecorder{}
+	s := start(t, testConfig(), deps{router: rec})
+	c := dial(t, s.client, nil)
+	if _, err := c.tryWith("P-Asserted-Identity: <sip:+15550100003@ims.mnc001.mcc001.3gppnetwork.org>", "P-Charging-Vector: icid-value=1"); err != nil {
+		t.Fatal(err)
+	}
+	core := dial(t, s.core, nil)
+	if _, err := core.tryWith("P-Asserted-Identity: <sip:+15550100003@ims.mnc001.mcc001.3gppnetwork.org>"); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.pai) != 2 || rec.pai[0] != "" || rec.pai[1] == "" {
+		t.Fatalf("P-Asserted-Identity seen %q, want removed from the client's only", rec.pai)
+	}
+}
+
+type headerRecorder struct {
+	mu  sync.Mutex
+	pai []string
+}
+
+func (h *headerRecorder) Route(_ context.Context, r *proxy.Request) proxy.Decision {
+	h.mu.Lock()
+	h.pai = append(h.pai, r.Message.Header.Get("P-Asserted-Identity")+r.Message.Header.Get("P-Charging-Vector"))
+	h.mu.Unlock()
+	return proxy.Decision{Status: 403}
 }

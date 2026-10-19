@@ -101,7 +101,11 @@ func TestARegisterCrossesPcscfAndItsFlowsClosureEndsIt(t *testing.T) {
 	var pc *pcscf
 	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
 	c := dial(t, s.client, nil)
-	text := registerText(outboundContact, "Supported: outbound")
+	// Headers only the network may set do not reach icscf (#16 plan, review
+	// of #188).
+	text := registerText(outboundContact, "Supported: outbound", "P-Asserted-Identity: <"+aliceIMPU+">",
+		"P-Charging-Vector: icid-value=1", "P-Access-Network-Info: 3GPP-E-UTRAN-FDD; network-provided",
+		"P-Access-Network-Info: 3GPP-E-UTRAN-FDD; utran-cell-id-3gpp=001010000000001")
 	_ = c.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(c.nc, text); err != nil {
 		t.Fatal(err)
@@ -115,6 +119,14 @@ func TestARegisterCrossesPcscfAndItsFlowsClosureEndsIt(t *testing.T) {
 		t.Fatalf("%d, Flow-Timer %q", res.StatusCode, res.Header.Get("Flow-Timer"))
 	}
 	got := <-icscf.got
+	for _, name := range networkOnlyHeaders {
+		if got.Header.Has(name) {
+			t.Errorf("%s reached icscf: %q", name, got.Header.Get(name))
+		}
+	}
+	if pani := got.Header.Values("P-Access-Network-Info"); len(pani) != 1 || strings.Contains(pani[0], "network-provided") {
+		t.Errorf("P-Access-Network-Info at icscf %q, want the client's own only", pani)
+	}
 	paths, err := got.Header.Path()
 	if err != nil || len(paths) != 1 {
 		t.Fatalf("Path %q, %v", got.Header.Get("Path"), err)

@@ -11,11 +11,12 @@
 // unknown and answered 430 Flow Failed (RFC 5626 §5.3).
 //
 // This version serves the edge and registration: it opens the listeners,
-// recognises itself in Route by its public FQDN or its addresses, removes
-// the headers only the network may set from client requests (TS 24.229
-// §5.2, ADR 0007 §7), limits the flows of one client address, routes
-// REGISTER to icscf with a Path naming the flow and keeps the 200 in
-// instance memory (§5.2.2.1), and drains flows gradually on shutdown.
+// recognises itself in Route by its public FQDN, the NLB's addresses or its
+// own, removes the headers only the network may set from every message a
+// client sends (TS 24.229 §5.2.1, ADR 0007 §7), limits the client flows of
+// one client and in all, routes REGISTER to icscf with a Path naming the
+// flow and keeps the 200 in instance memory (§5.2.2.1), and drains client
+// flows gradually on shutdown while the core listener stays open.
 // Originating and terminating routing follow in later changes (#16); until
 // then any other request from a client is refused with 403 and one from the
 // core with 430.
