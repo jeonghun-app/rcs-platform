@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -424,7 +423,7 @@ func (b *branch) start() {
 		// Built now, from the request as the transport sent it: the CANCEL
 		// needs the Via the transport wrote. The layer owns the INVITE but
 		// only reads it from here on.
-		cancel, dst = cancelFor(tx.Request(), dst)
+		cancel, dst = cancelFor(tx.Request(), tx.Network(), dst)
 	}
 
 	c.mu.Lock()
@@ -468,21 +467,18 @@ func (b *branch) addVia(fwd *sip.Request, dst transport.Destination) error {
 	return addVia(fwd, dst, id+"."+b.c.loop)
 }
 
-// cancelFor builds the CANCEL for an INVITE sent to dst, and where it goes: to
-// the same flow, or the same address over the transport the INVITE's Via names,
-// which differs from dst's when the transport moved a large INVITE from UDP to
-// TCP (RFC 3261 §18.1.1). A nil CANCEL means none can be built, and the branch
-// is then ended by the 64*T1 timer alone.
-func cancelFor(invite *sip.Request, dst transport.Destination) (*sip.Request, transport.Destination) {
+// cancelFor builds the CANCEL for an INVITE sent to dst over network, and where
+// it goes: to the same flow, or the same address over the transport the INVITE
+// actually used, which differs from dst's when the transport moved a large
+// INVITE from UDP to TCP (RFC 3261 §18.1.1). A nil CANCEL means none can be
+// built, and the branch is then ended by the 64*T1 timer alone.
+func cancelFor(invite *sip.Request, network transport.Network, dst transport.Destination) (*sip.Request, transport.Destination) {
 	cancel, err := buildCancel(invite)
 	if err != nil {
 		return nil, dst
 	}
-	if vias, err := invite.Header.Via(); err == nil && dst.Flow == "" {
-		switch n := transport.Network(strings.ToUpper(vias[0].Transport)); n {
-		case transport.UDP, transport.TCP, transport.TLS:
-			dst.Network = n
-		}
+	if dst.Flow == "" && network != "" {
+		dst.Network = network
 	}
 	return cancel, dst
 }
@@ -584,7 +580,7 @@ func (b *branch) failed(err error) []func() {
 	switch {
 	case timedOut && b.timedOut:
 		f = c.timeoutFinal()
-		err = errTargetTimeout
+		err = ErrTargetTimeout
 	case timedOut && b.cancel != cancelNone:
 		// A branch being cancelled that ends without a final response, its
 		// CANCEL unanswered for 64*T1 (§9.1) or its timers expired, counts
@@ -608,9 +604,10 @@ func (c *respContext) timeoutFinal() final {
 	return f
 }
 
-// errTargetTimeout is the BranchFailure.Err of a branch its Target.Timeout
-// ended.
-var errTargetTimeout = errors.New("proxy: the target's timeout passed")
+// ErrTargetTimeout is the BranchFailure.Err of a branch its Target.Timeout
+// ended, which tells it from a 408 the target sent itself: scscf applies an
+// application server's default handling on it (TS 24.229 §5.4.3.2).
+var ErrTargetTimeout = errors.New("proxy: the target's timeout passed")
 
 // received handles a response on the branch (§16.7 steps 2 to 10). mu must be
 // held.
@@ -837,7 +834,7 @@ func (b *branch) armTimeout() {
 				acts = b.sendCancel()
 			}
 			c.abandoned = true
-			acts = append(acts, c.branchEnded(b, c.timeoutFinal(), errTargetTimeout)...)
+			acts = append(acts, c.branchEnded(b, c.timeoutFinal(), ErrTargetTimeout)...)
 			acts = append(acts, c.progress()...)
 			c.mu.Unlock()
 			runAll(acts)

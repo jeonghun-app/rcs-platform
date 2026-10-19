@@ -242,7 +242,7 @@ func TestATargetTimeoutEndsARingingInviteBranchAtOnce(t *testing.T) {
 	h.decide(Decision{
 		Targets: []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: 2 * time.Second}},
 		OnBranchFailure: func(_ context.Context, f BranchFailure) []Target {
-			if f.Target.URI.User == "as" && errors.Is(f.Err, errTargetTimeout) {
+			if f.Target.URI.User == "as" && errors.Is(f.Err, ErrTargetTimeout) {
 				return []Target{target("sip:bob@192.0.2.30")}
 			}
 			return nil
@@ -270,7 +270,7 @@ func TestALateFirst2xxOfATimedOutBranchCancelsTheReplacement(t *testing.T) {
 	h.decide(Decision{
 		Targets: []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: 2 * time.Second}},
 		OnBranchFailure: func(_ context.Context, f BranchFailure) []Target {
-			if errors.Is(f.Err, errTargetTimeout) {
+			if errors.Is(f.Err, ErrTargetTimeout) {
 				return []Target{target("sip:bob@192.0.2.30")}
 			}
 			return nil
@@ -296,6 +296,81 @@ func TestALateFirst2xxOfATimedOutBranchCancelsTheReplacement(t *testing.T) {
 	check(t, "upstream", tags, []string{"200 tag-192-0-2-40", "200 tag-192-0-2-40"})
 	if n := h.p.Stats().RetransmissionsDropped; n != 0 {
 		t.Errorf("RetransmissionsDropped = %d", n)
+	}
+}
+
+// TestAnAbandonedBranchKeepsTheBudgetAndHookContextFor64T1: a branch its
+// Target.Timeout ended still waits for the answer to its CANCEL, and its
+// transaction holds the request, so the context's bytes and hook context stay
+// for 64*T1 after the final went upstream.
+func TestAnAbandonedBranchKeepsTheBudgetAndHookContextFor64T1(t *testing.T) {
+	h := newHarness(t, Config{})
+	var hookCtx context.Context
+	h.decide(Decision{
+		Targets:    []Target{{URI: mustURI("sip:bob@192.0.2.30"), Timeout: time.Second}},
+		OnResponse: func(ctx context.Context, _ *sip.Response) { hookCtx = ctx },
+	})
+	h.receive(withBody(t, "INVITE", "sip:bob@example.com", strings.Repeat("x", 4096)))
+	h.reply(h.one(), 180)
+	h.advance(time.Second)
+	check(t, "upstream", h.upstream(), codes(180, 408))
+	if n := h.p.Stats().Contexts; n != 0 {
+		t.Fatalf("Contexts = %d", n)
+	}
+	if n := h.p.Stats().ContextBytes; n < 4096 {
+		t.Errorf("ContextBytes = %d while the abandoned branch's transaction lives", n)
+	}
+	h.advance(64*t1 - time.Millisecond)
+	if hookCtx.Err() != nil {
+		t.Error("the hooks' context ended before 64*T1")
+	}
+	h.advance(time.Millisecond)
+	if n := h.p.Stats().ContextBytes; n != 0 || hookCtx.Err() == nil {
+		t.Errorf("after 64*T1: ContextBytes %d, context %v", n, hookCtx.Err())
+	}
+}
+
+// TestAnAbandonedBranchThatAnswers2xxIsNotTerminatedByItsCancelDeadline: once
+// the abandoned branch's INVITE is answered, the CANCEL's 64*T1 deadline no
+// longer applies, so the transaction lives out Timer M and the 2xx's
+// retransmissions still reach the proxy rather than turning stray.
+func TestAnAbandonedBranchThatAnswers2xxIsNotTerminatedByItsCancelDeadline(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{
+		Targets: []Target{{URI: mustURI("sip:bob@192.0.2.30"), Timeout: 2 * time.Second}},
+		// A replacement rings, so no final goes upstream before the late 200.
+		OnBranchFailure: func(context.Context, BranchFailure) []Target { return []Target{target("sip:bob2@192.0.2.31")} },
+	})
+	h.receive(invite(t))
+	b := h.one()
+	h.reply(b, 180)
+	h.advance(2 * time.Second) // CANCEL sent; its deadline is at 2 s + 64*T1
+	h.reply(byURI(t, h.sent(), "INVITE", "sip:bob2@192.0.2.31"), 180)
+	h.advance(time.Second)
+	h.reply(b, 200) // Timer M runs to 3 s + 64*T1
+	h.upstream()
+	h.advance(64*t1 - 500*time.Millisecond) // past the CANCEL's deadline
+	h.reply(b, 200)
+	check(t, "a retransmission after the CANCEL's deadline", h.upstream(), codes(200))
+	if n := h.p.Stats().StrayResponses; n != 0 {
+		t.Errorf("StrayResponses = %d", n)
+	}
+}
+
+// TestANonInviteBranchEndedByItsTimeoutReportsErrTargetTimeout: the branch is
+// ended by terminating its transaction, and the hook learns why.
+func TestANonInviteBranchEndedByItsTimeoutReportsErrTargetTimeout(t *testing.T) {
+	h := newHarness(t, Config{})
+	var got []error
+	h.decide(Decision{
+		Targets:         []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: time.Second}},
+		OnBranchFailure: func(_ context.Context, f BranchFailure) []Target { got = append(got, f.Err); return nil },
+	})
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+	h.one()
+	h.advance(time.Second)
+	if len(got) != 1 || !errors.Is(got[0], ErrTargetTimeout) {
+		t.Fatalf("OnBranchFailure got %v, want ErrTargetTimeout", got)
 	}
 }
 

@@ -187,7 +187,9 @@ type BranchFailure struct {
 	// (§16.9). Its top Via, the proxy's own, has been removed.
 	Response *sip.Response
 	// Err is the transport, timer or Prepare error behind a response the proxy
-	// made up, nil for a received one.
+	// made up, nil for a received one: ErrTargetTimeout when Target.Timeout
+	// ended the branch, transaction.ErrTimeout or ErrTerminated for Timer B,
+	// F or C.
 	Err error
 }
 
