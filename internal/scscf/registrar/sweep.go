@@ -17,21 +17,21 @@ const (
 	DefaultSweepLimit    = 100
 )
 
-// Sweep runs one deregistration sweep (state.SweepRegistrations): bindings
-// that have expired are removed, and a registration left without any, or an
-// unregistered user's record whose state has ended, is deregistered with
-// the HSS (SAR TIMEOUT_DEREGISTRATION, TS 29.228 §6.1.2) and deleted with,
-// once no identity of its set has bindings left, the set's profile. It
-// returns how many registrations it handled.
+// Sweep runs one deregistration sweep (state.SweepRegistrations) over up to
+// limit sets: bindings that have expired are removed, and a set left without
+// any, or an unregistered user's record whose state has ended, is
+// deregistered with the HSS, once for the whole set (SAR
+// TIMEOUT_DEREGISTRATION, TS 29.228 §6.1.2), and ends as a user's
+// deregistration does (endSet). It returns how many sets it handled.
 func (g *Registrar) Sweep(ctx context.Context, limit int) (int, error) {
 	return state.SweepRegistrations(ctx, g.cfg.Store, g.cfg.Now(), limit, func(before, after *state.Registration) error {
 		return g.swept(ctx, before, after)
 	})
 }
 
-// swept handles one registration a sweep changed. A failure that may pass,
-// such as an HSS out of reach, is an error, so a sweep after the lease tries
-// again; a permanent one is not (state.SweepRegistrations).
+// swept handles one set a sweep changed. A failure that may pass, such as an
+// HSS out of reach, is an error, so a sweep after the lease tries again; a
+// permanent one is not (state.SweepRegistrations).
 func (g *Registrar) swept(ctx context.Context, before, after *state.Registration) error {
 	if len(after.Contacts) > 0 {
 		// Some bindings expired, others remain: nothing to tell the HSS.
@@ -39,12 +39,12 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 	}
 	// Read before the SAR, so that only this profile goes: a device that
 	// registers the set again meanwhile saves one of its own.
-	profile, err := g.cfg.Store.Profile(ctx, before.ProfileKey(), g.cfg.Now())
+	profile, err := g.cfg.Store.Profile(ctx, before.Key, g.cfg.Now())
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
 		return err
 	}
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
-		UserName: before.IMPI, PublicIdentities: []string{before.IMPU}, AssignmentType: cx.TimeoutDeregistration,
+		UserName: before.Key.IMPI, PublicIdentities: []string{before.Key.IMPU}, AssignmentType: cx.TimeoutDeregistration,
 	})
 	var res cx.Result
 	if saa != nil {
@@ -57,43 +57,38 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 	switch o {
 	case cxclient.Success:
 		g.count("registrar.expired")
-	case cxclient.UserUnknown, cxclient.IdentitiesDontMatch, cxclient.NotRegistered, cxclient.Rejected:
-		// The HSS will not answer differently: the user is gone there, or
-		// was never registered here.
+	case cxclient.UserUnknown, cxclient.IdentitiesDontMatch, cxclient.NotRegistered, cxclient.ServedElsewhere, cxclient.Rejected:
+		// The HSS will not answer differently: the user is gone there, was
+		// never registered here, or is served by another S-CSCF now.
 		g.count("registrar.expired_refused")
 	default:
 		g.count("registrar.expire_failed")
 		return errors.New("registrar: SAR TIMEOUT_DEREGISTRATION failed: " + o.String())
 	}
-	if profile == nil {
-		return nil
-	}
-	return g.dropProfileIfIdle(ctx, before, profile.Received)
+	return g.endSet(ctx, after, profile)
 }
 
-// dropProfileIfIdle deletes the profile of gone's set, if it is still the one
-// received at received, unless another identity of the set still has
-// bindings, as one whose save failed halfway might.
-func (g *Registrar) dropProfileIfIdle(ctx context.Context, gone *state.Registration, received time.Time) error {
-	others, err := g.cfg.Store.RegistrationsOf(ctx, gone.IMPI)
-	if err != nil {
-		return err
-	}
-	now := g.cfg.Now()
-	for _, o := range others {
-		if o.IMPU != gone.IMPU && o.DefaultIMPU == gone.DefaultIMPU && live(o, now) {
-			return nil
+// sweepAll sweeps as many times as it takes to find fewer than limit sets
+// due, so that a mass expiry drains in one run rather than limit per
+// interval, and returns how many it handled.
+func (g *Registrar) sweepAll(ctx context.Context, limit int) int {
+	total := 0
+	for {
+		n, err := g.Sweep(ctx, limit)
+		total += n
+		if err != nil {
+			// The errors name no identity (state.SweepRegistrations joins
+			// the store's and swept's own).
+			g.log.Warn("registrar: sweep", slog.Int("handled", n), slog.String("error", err.Error()))
+		}
+		if n < limit || ctx.Err() != nil {
+			return total
 		}
 	}
-	if err := g.cfg.Store.DeleteProfileIf(ctx, gone.ProfileKey(), received); err != nil && !errors.Is(err, state.ErrConflict) {
-		return err
-	}
-	return nil
 }
 
-// RunSweeps sweeps every interval, as many times as it takes to find fewer
-// than limit registrations due, until ctx ends. Every instance runs it; the
-// store lets one instance handle each registration.
+// RunSweeps runs sweepAll every interval until ctx ends. Every instance runs
+// it; the store lets one instance handle each set.
 func (g *Registrar) RunSweeps(ctx context.Context, interval time.Duration, limit int) {
 	if interval <= 0 {
 		interval = DefaultSweepInterval
@@ -109,16 +104,6 @@ func (g *Registrar) RunSweeps(ctx context.Context, interval time.Duration, limit
 			return
 		case <-t.C:
 		}
-		for {
-			n, err := g.Sweep(ctx, limit)
-			if err != nil {
-				// The errors name no identity (state.SweepRegistrations joins
-				// the store's and swept's own).
-				g.log.Warn("registrar: sweep", slog.Int("handled", n), slog.String("error", err.Error()))
-			}
-			if n < limit || ctx.Err() != nil {
-				break
-			}
-		}
+		g.sweepAll(ctx, limit)
 	}
 }

@@ -19,98 +19,125 @@ var (
 )
 
 // HandleRTR answers a Registration-Termination-Request (TS 29.228 §6.1.3),
-// for cxclient.Config.OnRTR: the registrations of the identities it names,
-// with their implicit sets, or of every identity of its private identity,
-// are deleted with their profiles. Unregistered users' records go the same
-// way. With SERVER_CHANGE the user registers again elsewhere, possibly with
-// another default identity, so the profile goes by the key the registration
-// names (ProfileKey) rather than any the RTR implies.
+// for cxclient.Config.OnRTR. The sets of the identities it names, or every
+// set of its private identity, and of its Associated-Identities as well
+// (§6.1.3.1), end: their records, the identities that name them, and their
+// profiles. Unregistered users' records end the same way, and with
+// REMOVE_SCSCF they are the only ones that do: that reason takes back what an
+// unregistered user left assigned (TS 29.229 §6.3.16). A SERVER_CHANGE ends
+// the profile by the key the record names, so nothing stays under a default
+// identity the HSS is about to change.
 //
-// The registrations are listed through an index, which may miss one saved
-// within the last moments; the sweep deregisters that one when it expires.
+// A private identity's sets are listed through an index, which may miss one
+// saved within the last moments; the sweep deregisters that one when it
+// expires.
 func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
-	regs, err := g.cfg.Store.RegistrationsOf(ctx, r.UserName)
-	if err != nil {
-		g.log.Error("registrar: RTR: listing registrations", slog.String("error", err.Error()))
-		return resultUnableToComply
-	}
-	sets := map[string]bool{}
-	for _, reg := range regs {
-		if len(r.PublicIdentities) == 0 || named(r.PublicIdentities, reg.IMPU) {
-			sets[reg.DefaultIMPU] = true
+	impis := []string{r.UserName}
+	for _, a := range r.AssociatedIdentities {
+		if !slices.Contains(impis, a) {
+			impis = append(impis, a)
 		}
 	}
-	keys := map[state.ProfileKey]bool{}
-	for _, reg := range regs {
-		if !sets[reg.DefaultIMPU] {
-			continue
+	var keys []state.SetKey
+	if len(r.PublicIdentities) > 0 {
+		for _, s := range r.PublicIdentities {
+			impu, ok := identity.CanonicalIMPU(s)
+			if !ok {
+				continue
+			}
+			id, err := g.cfg.Store.Identity(ctx, impu)
+			switch {
+			case errors.Is(err, state.ErrNotFound):
+				continue
+			case err != nil:
+				g.log.Error("registrar: RTR: reading an identity", slog.String("error", err.Error()))
+				return resultUnableToComply
+			}
+			if slices.Contains(impis, id.Set.IMPI) && !slices.Contains(keys, id.Set) {
+				keys = append(keys, id.Set)
+			}
 		}
-		if err := g.deleteRegistration(ctx, reg); err != nil {
-			g.log.Error("registrar: RTR: deleting a registration", slog.String("error", err.Error()))
+	} else {
+		for _, impi := range impis {
+			regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
+			if err != nil {
+				g.log.Error("registrar: RTR: listing registrations", slog.String("error", err.Error()))
+				return resultUnableToComply
+			}
+			for _, reg := range regs {
+				keys = append(keys, reg.Key)
+			}
+		}
+	}
+	ended := 0
+	for _, k := range keys {
+		done, err := g.endSetNow(ctx, k, r.DeregistrationReason.Code == cx.RemoveSCSCF)
+		if err != nil {
+			g.log.Error("registrar: RTR: ending a set", slog.String("error", err.Error()))
 			return resultUnableToComply
 		}
-		keys[reg.ProfileKey()] = true
-	}
-	for k := range keys {
-		if err := g.cfg.Store.DeleteProfile(ctx, k); err != nil {
-			g.log.Error("registrar: RTR: deleting a profile", slog.String("error", err.Error()))
-			return resultUnableToComply
+		if done {
+			ended++
 		}
 	}
-	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(len(keys)))
+	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
 	return resultSuccess
 }
 
-// named reports whether impu is in list, compared in canonical form.
-func named(list []string, impu string) bool {
-	for _, s := range list {
-		if c, ok := identity.CanonicalIMPU(s); ok && c == impu {
-			return true
-		}
-	}
-	return false
-}
-
-// deleteRegistration deletes reg, reading it again if it changed since it
-// was listed. One already gone is no error.
-func (g *Registrar) deleteRegistration(ctx context.Context, reg *state.Registration) error {
+// endSetNow ends set k at the HSS's request: its record, under the version
+// read, reading it again if it changed, then its identities and profile. With
+// unregisteredOnly it ends k only as an unregistered user's record. It
+// reports whether it ended one.
+func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool) (bool, error) {
 	for range saveAttempts {
+		reg, f := g.set(ctx, k)
+		switch {
+		case f != nil:
+			return false, f
+		case reg == nil:
+			return false, nil
+		case unregisteredOnly && (reg.Unregistered.IsZero() || len(reg.Contacts) > 0):
+			return false, nil
+		}
 		err := g.cfg.Store.DeleteRegistration(ctx, reg)
-		if !errors.Is(err, state.ErrConflict) {
-			if errors.Is(err, state.ErrNotFound) {
-				return nil
-			}
-			return err
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			continue
+		case errors.Is(err, state.ErrNotFound):
+			return false, nil
+		case err != nil:
+			return false, err
 		}
-		if reg, err = g.cfg.Store.Registration(ctx, reg.IMPU); errors.Is(err, state.ErrNotFound) {
-			return nil
-		} else if err != nil {
-			return err
-		}
+		g.unpoint(ctx, reg)
+		return true, g.cfg.Store.DeleteProfile(ctx, k)
 	}
-	return errors.New("registrar: the registration kept changing")
+	return false, errors.New("registrar: the set kept changing")
 }
 
 // HandlePPR answers a Push-Profile-Request (TS 29.228 §6.2.2), for
 // cxclient.Config.OnPPR. Its User-Data is one implicit registration set's,
-// stored under that set's key only, so the user's other sets keep theirs.
-// The set may have changed: the registrations of its identities follow its
-// default identity, an identity added to it is registered like the others,
-// one removed from it is deregistered, and the profile under a former
-// default identity is deleted.
+// stored under that set's key only, so the user's other sets keep theirs. A
+// PPR never changes a set's default identity, which the HSS does with RTR
+// SERVER_CHANGE, so the set is the record under the default the User-Data
+// names. Its identities follow the User-Data: one that moved in from
+// another set is pointed at this one, and one that left is unpointed if it
+// still names this set; the set it moved to points it on its own PPR.
 //
-// A PPR for a user with no registration of the set here is answered
+// A PPR for a private identity with no record here is answered
 // DIAMETER_ERROR_USER_UNKNOWN, which tells the HSS this S-CSCF lost the user
-// (TS 29.228 §6.2.2.1); User-Data the S-CSCF cannot read is answered
-// DIAMETER_ERROR_NOT_SUPPORTED_USER_DATA, and the HSS deregisters the user.
+// (TS 29.228 §6.2.2.1), as is one for a set being deregistered; one for a set
+// not served here, of a user who has others, UNABLE_TO_COMPLY. User-Data the
+// S-CSCF cannot read is DIAMETER_ERROR_NOT_SUPPORTED_USER_DATA and too much
+// of it DIAMETER_ERROR_TOO_MUCH_DATA, after which the HSS deregisters the
+// user.
 func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 	if len(r.UserData) == 0 {
 		// Charging information or a new Digest credential only: the S-CSCF
 		// keeps neither, a challenge asks the HSS afresh.
 		return resultSuccess
 	}
-	received := g.cfg.Now()
 	if len(r.UserData) > state.MaxUserData {
+		g.count("registrar.ppr_refused")
 		return cx.ExperimentalResult(cx.ErrorTooMuchData)
 	}
 	set, err := parseSet(r.UserData)
@@ -118,96 +145,73 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 		g.count("registrar.ppr_refused")
 		return cx.ExperimentalResult(cx.ErrorNotSupportedUserData)
 	}
-	regs, err := g.cfg.Store.RegistrationsOf(ctx, r.UserName)
+	key := state.SetKey{IMPI: r.UserName, IMPU: set.defaultID}
+	received := g.cfg.Now()
+	for range saveAttempts {
+		reg, f := g.set(ctx, key)
+		if f != nil {
+			return resultUnableToComply
+		}
+		if reg == nil || !live(reg, received) {
+			return g.notServed(ctx, r.UserName, reg != nil)
+		}
+		p := &state.Profile{Key: key, UserData: r.UserData, Received: received, KeepUntil: keepUntil(reg).Add(state.ProfileGrace)}
+		if err := g.cfg.Store.SaveProfile(ctx, p); err != nil && !errors.Is(err, state.ErrConflict) {
+			// ErrConflict: an SAA that arrived after this PPR was stored first,
+			// and it is the newer.
+			g.log.Error("registrar: PPR: saving the profile", slog.String("error", err.Error()))
+			return resultUnableToComply
+		}
+		if slices.Equal(reg.Identities, set.identities) {
+			g.count("registrar.ppr_stored")
+			return resultSuccess
+		}
+		next := reg.Clone()
+		next.Identities = set.identities
+		saved, err := g.cfg.Store.SaveRegistration(ctx, next)
+		switch {
+		case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrNotFound):
+			// A REGISTER or a deregistration changed the set: apply this to
+			// what it left.
+			continue
+		case err != nil:
+			g.log.Error("registrar: PPR: saving the set", slog.String("error", err.Error()))
+			return resultUnableToComply
+		}
+		if err := g.point(ctx, saved); err != nil {
+			g.log.Error("registrar: PPR: pointing the identities", slog.String("error", err.Error()))
+			return resultUnableToComply
+		}
+		left := *reg
+		left.Identities = slices.DeleteFunc(slices.Clone(reg.Identities), func(id state.SetIdentity) bool {
+			return slices.ContainsFunc(set.identities, func(n state.SetIdentity) bool { return n.IMPU == id.IMPU })
+		})
+		g.unpoint(ctx, &left)
+		g.count("registrar.ppr_stored")
+		return resultSuccess
+	}
+	return resultUnableToComply
+}
+
+// notServed answers a PPR for a set without a live record here.
+func (g *Registrar) notServed(ctx context.Context, impi string, ending bool) cx.Result {
+	regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
 	if err != nil {
-		g.log.Error("registrar: PPR: listing registrations", slog.String("error", err.Error()))
 		return resultUnableToComply
 	}
-	// The set's registrations: its identities', and those that named one of
-	// its identities as their default, which an identity removed from the
-	// set still does.
-	oldDefaults := map[string]bool{}
-	var members []*state.Registration
-	for _, reg := range regs {
-		if set.has(reg.IMPU) {
-			members = append(members, reg)
-			oldDefaults[reg.DefaultIMPU] = true
-		}
-	}
-	if len(members) == 0 {
+	if ending || len(regs) == 0 {
 		g.count("registrar.ppr_unknown")
 		return cx.ExperimentalResult(cx.ErrorUserUnknown)
 	}
-	key := state.ProfileKey{IMPI: r.UserName, IMPU: set.defaultID}
-	p := &state.Profile{Key: key, UserData: r.UserData, Received: received, KeepUntil: keepUntil(members).Add(state.ProfileGrace)}
-	if err := g.cfg.Store.SaveProfile(ctx, p); err != nil && !errors.Is(err, state.ErrConflict) {
-		// ErrConflict: an SAA that arrived after this PPR was stored first,
-		// and it is the newer.
-		g.log.Error("registrar: PPR: saving the profile", slog.String("error", err.Error()))
-		return resultUnableToComply
-	}
-	if err := g.reconcile(ctx, r.UserName, set, regs, members, oldDefaults); err != nil {
-		g.log.Error("registrar: PPR: updating the set", slog.String("error", err.Error()))
-		return resultUnableToComply
-	}
-	g.count("registrar.ppr_stored")
-	return resultSuccess
+	g.count("registrar.ppr_other_set")
+	return resultUnableToComply
 }
 
-// keepUntil is the latest time any of regs serves terminating requests.
-func keepUntil(regs []*state.Registration) (t time.Time) {
-	for _, r := range regs {
-		if e := latestExpiry(r.Contacts); e.After(t) {
-			t = e
-		}
-		if r.Unregistered.After(t) {
-			t = r.Unregistered
-		}
+// keepUntil is the latest time reg serves terminating requests.
+func keepUntil(reg *state.Registration) time.Time {
+	t := latestExpiry(reg.Contacts)
+	if reg.Unregistered.After(t) {
+		t = reg.Unregistered
 	}
 	return t
-}
-
-// reconcile makes the registrations of impi match set (see HandlePPR).
-func (g *Registrar) reconcile(ctx context.Context, impi string, set *implicitSet, regs, members []*state.Registration, oldDefaults map[string]bool) error {
-	// The bindings an added identity gets: those of a member, all of which
-	// hold the same.
-	template := members[0]
-	for _, id := range set.identities {
-		i := slices.IndexFunc(regs, func(r *state.Registration) bool { return r.IMPU == id.impu })
-		var cur *state.Registration
-		if i >= 0 {
-			cur = regs[i]
-			if cur.DefaultIMPU == set.defaultID {
-				continue
-			}
-		}
-		next := &state.Registration{
-			IMPU: id.impu, IMPI: impi, DefaultIMPU: set.defaultID,
-			Contacts: template.Contacts, Unregistered: template.Unregistered,
-		}
-		if cur != nil {
-			next = cur.Clone()
-			next.DefaultIMPU = set.defaultID
-		}
-		if _, err := g.cfg.Store.SaveRegistration(ctx, next); err != nil && !errors.Is(err, state.ErrConflict) && !errors.Is(err, state.ErrExists) {
-			// A conflict means a REGISTER saved it meanwhile, with the set
-			// as its SAA had it.
-			return err
-		}
-	}
-	for _, reg := range regs {
-		if oldDefaults[reg.DefaultIMPU] && !set.has(reg.IMPU) {
-			if err := g.deleteRegistration(ctx, reg); err != nil {
-				return err
-			}
-		}
-	}
-	for d := range oldDefaults {
-		if d != set.defaultID {
-			if err := g.cfg.Store.DeleteProfile(ctx, state.ProfileKey{IMPI: impi, IMPU: d}); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
