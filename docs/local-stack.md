@@ -32,17 +32,37 @@ make logs          # the last 200 lines of every service; make logs LOGS="-f hss
 make down          # stop and remove the containers and all data
 ```
 
-`make up` can be run again on a running stack. It rebuilds the image if the
-source changed, recreates what changed, and runs the bootstrap again, which
-leaves existing tables and subscribers alone.
+`make up` can be run again on a running stack. It builds the platform and
+bootstrap images again and runs the bootstrap again, which leaves existing
+tables and subscribers alone. A build can give an image a new ID even when
+nothing changed: BuildKit's provenance attestation records the build time. In
+that case the service containers are recreated. Their data is in DynamoDB
+Local and S3Mock, whose containers keep running.
 
 The first `make up` writes `deploy/compose.env` (`scripts/compose-env.sh`) from
 [`deploy/compose.env.example`](../deploy/compose.env.example). The file holds
 every setting and fresh random secrets, 256 bits each
 ([ADR 0007](adr/0007-internal-transport.md) §4). It is readable by its owner
-only. Git and docker builds ignore it. Later runs keep it. Run
+only. Git and docker builds ignore it.
+
+Later runs keep its values. If a later change adds a setting to the example,
+`make up` appends it to the file, with a fresh value if it is a secret, and
+says which it added. It refuses a file in which a secret is empty. Run
 `scripts/compose-env.sh -f` and then `make down` and `make up` for new secrets.
 To change a setting, edit `deploy/compose.env`, not the example.
+
+### A second stack on the same host
+
+The stack is named `rcs-local` (`COMPOSE_PROJECT`). The name covers its
+containers, its network `rcs-local_default` and its bootstrap image
+`rcs-local-stack-init`. Two worktrees on one host that both run `make up` with
+the default name share one stack: the second replaces the first's containers
+and secrets. To run a second stack beside the first, give it its own name and
+host ports:
+
+1. set other `*_HOST_PORT` values in that worktree's `deploy/compose.env`;
+2. pass the name to every target, for example
+   `make up e2e-compose down COMPOSE_PROJECT=rcs-local-b`.
 
 The services' data is in memory: `make down` loses it, and so does a restart of
 DynamoDB Local or S3Mock.
@@ -156,6 +176,7 @@ deployment-wide, so the stack works around it:
 
 | Value | acs 1.4.0 | Here |
 |---|---|---|
+| home domain, IMPI and IMPU | from the IMSI's MCC and MNC, no setting | `RCS_IMS_DOMAIN` is fixed in the compose file to the same `ims.mnc001.mcc001.3gppnetwork.org`, so `hss` holds what `acs` hands out |
 | P-CSCF address (`LBO_P-CSCF_Address`, OMA-CP and OMA-DM) | `pcscf.{ims_domain}`, no setting | per-subscriber override `PCSCF_PUBLIC_HOST` |
 | `ftHTTPCSURI`, `ftHTTPDLURI` | `https://ft.{ims_domain}/…`, no setting | per-subscriber override from `FT_PUBLIC_BASE` |
 | `ConfFctyURI` | `sip:conf-factory@{ims_domain}`, no setting | per-subscriber override, the same value until `rcs-as` exists |
@@ -175,14 +196,24 @@ the new `ACS_` variables.
 
 `make e2e-compose` fetches the test subscriber's configuration as `acs`'s own
 deployment check does: a token issued through the admin API, then an RCC.14
-request. It checks the four overridden values. The `acs` admin API stores an
-override key it does not know without complaint (#70), so a mistyped key would
-show only there.
+request. It checks:
+- that the identities it hands out are the ones `hss` holds: IMPI, IMPU and
+  home domain;
+- the overridden values.
+
+The `acs` admin API stores an override key it does not know without complaint
+(#70), so a mistyped key shows only in this check. That holds for the FT URIs
+and the OMA-CP P-CSCF address, whose overrides differ from the defaults. It
+does not hold for two keys:
+- `ConfFctyURI`: its override equals the default until `rcs-as` exists;
+- the OMA-DM P-CSCF node: the test makes no DM session.
+
+Both keys were checked by hand against the v1.4.0 catalogue.
 
 ## make e2e-compose
 
 The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
-container on the stack's network (`rcs-local_default`), with
+container on the stack's network (`<COMPOSE_PROJECT>_default`), with
 `deploy/compose.env` as its environment. It:
 
 1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay` and `acs`;
@@ -209,6 +240,8 @@ describe them. #56 provides the AWS values. Locally:
 | Setting | Local | AWS |
 |---|---|---|
 | `RCS_ENV` | `dev` | `staging` or `prod` |
+| stop grace | `stop_grace_period: 25s`, above `RCS_SHUTDOWN_TIMEOUT` 20 s | the task definition's `stopTimeout` (at most 120 s), above `RCS_SHUTDOWN_TIMEOUT` ([msrp-relay](msrp-relay.md#settings)) |
+| `RCS_IMS_DOMAIN` | fixed, `ims.mnc001.mcc001.3gppnetwork.org` (see [acs](#acs)) | the operator's IMS domain |
 | `HSS_DYNAMODB_ENDPOINT`, `FT_DYNAMODB_ENDPOINT`, `FT_S3_ENDPOINT`, `RELAY_DYNAMODB_ENDPOINT` | `http://dynamodb:8000`, `http://s3:9090` | unset |
 | `AWS_*` credentials | `local` | the task role |
 | hss data key | `HSS_DATA_KEY` (dev keyring path) | `HSS_KMS_KEY_ID` |
@@ -245,10 +278,13 @@ describe them. #56 provides the AWS values. Locally:
 |---|---|
 | `make up` stops at "Waiting" and then fails with a service unhealthy | `make logs LOGS="<service>"`. A setting the service refuses is reported at start, every problem at once. |
 | "port is already allocated" | Another process uses a host port. Change it in `deploy/compose.env`. |
-| "run make up, which writes deploy/compose.env" from `docker compose` | The compose file was used without make. Use the make targets, which set the image variables. |
+| "not in deploy/compose.env; make up adds new settings to it" | The env file lacks a setting. `make up` adds it (`scripts/compose-env.sh`); running `docker compose` directly does not. |
+| "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |
+| Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
 | `stack-tables` fails with "only one of the hss tables exists" | A half-made stack. Run `make down` and `make up`. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
-| `make e2e-compose`: "… is not ready: is the stack up" | Run `make up` first. The test does not start the stack. |
+| `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |
+| `make e2e-compose`: "… is not ready: is the stack up" | The stack exists but a service is not ready within the test's wait. `make logs LOGS="<service>"`. |
 | `make e2e-compose`: wrong FT URIs from `acs` | `FT_PUBLIC_BASE` was changed after the subscriber was seeded. `make up` seeds it again. |
 | The `acs` image does not pull | `ghcr.io` is unreachable, or `ACS_VERSION` and `ACS_DIGEST` do not belong together. |
 | Out of memory or very slow on Docker Desktop | Give the VM more memory. DynamoDB Local and S3Mock take about 650 MB together. |

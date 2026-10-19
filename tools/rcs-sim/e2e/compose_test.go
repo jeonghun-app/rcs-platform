@@ -22,6 +22,8 @@ import (
 // its network (make e2e-compose), with deploy/compose.env as its
 // environment. The subscriber is the one stack-seed provisions.
 const (
+	// composeDomain is fixed: acs derives it from the IMSI's MCC and MNC.
+	composeDomain = "ims.mnc001.mcc001.3gppnetwork.org"
 	composeIMSI   = "001010000000001"
 	composeMSISDN = "+15550100001"
 	hssAPI        = "http://hss:8081"
@@ -30,9 +32,10 @@ const (
 )
 
 func TestE2EComposeStack(t *testing.T) {
-	domain := env(t, "RCS_IMS_DOMAIN")
+	domain := composeDomain
 	ftBase := env(t, "FT_PUBLIC_BASE")
 	impi := composeIMSI + "@" + domain
+	impu := "sip:" + composeMSISDN + "@" + domain
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -45,9 +48,15 @@ func TestE2EComposeStack(t *testing.T) {
 	// overrides, docs/local-stack.md).
 	doc := acsConfiguration(ctx, t, env(t, "ACS_ADMIN_TOKEN"))
 	for _, want := range []struct{ characteristic, parm, value string }{
+		// The identities acs hands out are the ones hss holds.
+		{"APPLICATION", "Private_User_Identity", impi},
+		{"APPLICATION", "Home_network_domain_name", domain},
+		{"Public_User_Identity", "Public_User_Identity", impu},
 		{"FT", "ftHTTPCSURI", ftBase + "/ft"},
 		{"FT", "ftHTTPDLURI", ftBase + "/dl"},
 		{"LBO_P-CSCF_Address", "Address", env(t, "PCSCF_PUBLIC_HOST")},
+		// The same as acs's default until rcs-as names its own, so this
+		// would not catch a mistyped override key (docs/local-stack.md).
 		{"CHAT", "ConfFctyURI", "sip:conf-factory@" + domain},
 	} {
 		if got := doc.value(want.characteristic, want.parm); got != want.value {

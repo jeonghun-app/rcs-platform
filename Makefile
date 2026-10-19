@@ -118,10 +118,17 @@ e2e: volumes ## End-to-end: rcs-sim against ft-server and msrp-relay
 # acs, with secrets in deploy/compose.env (scripts/compose-env.sh writes it
 # once). The images reach compose only through these variables, so the pins
 # above stay the only ones.
-COMPOSE_ENV ?= deploy/compose.env
+#
+# COMPOSE_PROJECT names the stack: its containers, its network
+# ($(COMPOSE_PROJECT)_default) and its stack-init image. A second stack on
+# the same host, from another worktree say, needs a name and host ports of
+# its own (docs/local-stack.md).
+COMPOSE_PROJECT ?= rcs-local
+COMPOSE_ENV     ?= deploy/compose.env
 COMPOSE = RCS_IMAGE="$(IMAGE):$$(printf %s "$$VERSION" | tr + _)" \
 	DDBLOCAL_IMAGE="$(DDBLOCAL_IMAGE)" S3MOCK_IMAGE="$(S3MOCK_IMAGE)" ACS_IMAGE="$(ACS_IMAGE)" \
-	$(DOCKER) compose -f deploy/docker-compose.yml --env-file $(COMPOSE_ENV)
+	STACK_INIT_IMAGE="$(COMPOSE_PROJECT)-stack-init" \
+	$(DOCKER) compose -p $(COMPOSE_PROJECT) -f deploy/docker-compose.yml --env-file $(COMPOSE_ENV)
 # Passed to `docker compose logs`, e.g. make logs LOGS="-f hss".
 LOGS ?= --tail=200
 
@@ -147,7 +154,9 @@ logs: compose-env ## Logs of the local stack (LOGS="-f hss" to follow one servic
 # the stack's network, so it reaches every service by its compose name.
 .PHONY: e2e-compose
 e2e-compose: volumes ## End-to-end: rcs-sim against the running local stack
-	$(RUNGO) --network rcs-local_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
+	@$(DOCKER) network inspect $(COMPOSE_PROJECT)_default >/dev/null 2>&1 && [ -f $(COMPOSE_ENV) ] || \
+	  { echo "no local stack $(COMPOSE_PROJECT) is running: run make up first" >&2; exit 1; }
+	$(RUNGO) --network $(COMPOSE_PROJECT)_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
 	  $(GOIMAGE) go test -tags e2ecompose -count=1 -v ./tools/rcs-sim/e2e/
 
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.

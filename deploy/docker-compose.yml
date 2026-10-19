@@ -13,6 +13,7 @@
 # Every service's environment follows its document (docs/hss.md,
 # docs/ft-server.md, docs/msrp-relay.md) and is the same contract the AWS
 # deployment (#56) sets, with local endpoints and dev-only choices marked.
+# make passes the project name (COMPOSE_PROJECT, default rcs-local).
 name: rcs-local
 
 x-aws: &aws
@@ -27,8 +28,11 @@ x-shared: &shared
   # plain http between services, plain MSRP, a local hss data key.
   RCS_ENV: dev
   RCS_LOG_LEVEL: ${RCS_LOG_LEVEL:-info}
-  RCS_IMS_DOMAIN: ${RCS_IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
-  RCS_PII_HMAC_KEY: ${RCS_PII_HMAC_KEY:?run make up, which writes deploy/compose.env}
+  # Fixed, not a setting: acs 1.4.0 derives the home domain from the
+  # IMSI's MCC and MNC (001/01), and hss must hold the identities it hands
+  # out.
+  RCS_IMS_DOMAIN: ims.mnc001.mcc001.3gppnetwork.org
+  RCS_PII_HMAC_KEY: ${RCS_PII_HMAC_KEY:?not in deploy/compose.env; make up adds new settings to it}
   RCS_SHUTDOWN_TIMEOUT: 20s
 
 # What the platform services share: the image, and starting once their
@@ -38,6 +42,9 @@ x-shared: &shared
 x-platform: &platform
   image: ${RCS_IMAGE:?run make up, which builds the platform image}
   restart: "no"
+  # Above RCS_SHUTDOWN_TIMEOUT (20 s), so a service finishes its own
+  # shutdown before docker kills it, as ECS's stopTimeout is meant to allow.
+  stop_grace_period: 25s
   depends_on:
     stack-tables:
       condition: service_completed_successfully
@@ -71,7 +78,7 @@ services:
   # describe them for the infrastructure; in AWS CloudFormation makes them.
   # The services do not create anything themselves.
   stack-tables:
-    image: rcs-local-stack-init
+    image: ${STACK_INIT_IMAGE:?run make up, which names the stack-init image after the stack}
     build:
       context: ..
       dockerfile: deploy/stack-init.Dockerfile
@@ -94,16 +101,16 @@ services:
   # profile, because `up --wait` counts a one-shot that nothing depends on
   # as a failure once it exits.
   stack-seed:
-    image: rcs-local-stack-init
+    image: ${STACK_INIT_IMAGE:?run make up, which names the stack-init image after the stack}
     profiles: ["seed"]
     command: ["seed"]
     restart: "no"
     environment:
-      RCS_IMS_DOMAIN: ${RCS_IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
+      RCS_IMS_DOMAIN: ims.mnc001.mcc001.3gppnetwork.org
       STACK_HSS_API: http://hss:8081
-      HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
       STACK_ACS_URL: http://acs:8080
-      ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
       STACK_PCSCF_ADDRESS: ${PCSCF_PUBLIC_HOST:-pcscf}
       FT_UPLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/ft
       FT_DOWNLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/dl
@@ -123,11 +130,11 @@ services:
       HSS_DYNAMODB_ENDPOINT: http://dynamodb:8000
       # No KMS locally: the dev keyring path, a data key from the env file
       # (docs/hss.md, Secrets). AWS sets HSS_KMS_KEY_ID instead.
-      HSS_DATA_KEY: ${HSS_DATA_KEY:?run make up, which writes deploy/compose.env}
+      HSS_DATA_KEY: ${HSS_DATA_KEY:?not in deploy/compose.env; make up adds new settings to it}
       HSS_FT_REALM: ${FT_REALM:-ft.ims.mnc001.mcc001.3gppnetwork.org}
-      HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
-      HSS_ACS_TOKEN: ${HSS_ACS_TOKEN:?run make up, which writes deploy/compose.env}
-      HSS_FT_TOKEN: ${HSS_FT_TOKEN:?run make up, which writes deploy/compose.env}
+      HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+      HSS_ACS_TOKEN: ${HSS_ACS_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+      HSS_FT_TOKEN: ${HSS_FT_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
     ports:
       # The provisioning API, for an operator on this host.
       - "127.0.0.1:${HSS_API_HOST_PORT:-18082}:8081"
@@ -148,10 +155,10 @@ services:
       FT_UPLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/ft
       FT_DOWNLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/dl
       FT_REALM: ${FT_REALM:-ft.ims.mnc001.mcc001.3gppnetwork.org}
-      FT_NONCE_KEY: ${FT_NONCE_KEY:?run make up, which writes deploy/compose.env}
+      FT_NONCE_KEY: ${FT_NONCE_KEY:?not in deploy/compose.env; make up adds new settings to it}
       FT_CREDENTIALS: hss
       FT_HSS_URL: http://hss:8081
-      FT_HSS_TOKEN: ${HSS_FT_TOKEN:?run make up, which writes deploy/compose.env}
+      FT_HSS_TOKEN: ${HSS_FT_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
       FT_STORE: aws
       FT_S3_BUCKET: ft-content
       FT_S3_ENDPOINT: http://s3:9090
@@ -175,7 +182,7 @@ services:
       RELAY_PUBLIC_HOST: ${RELAY_PUBLIC_HOST:-msrp-relay}
       RELAY_PUBLIC_PORT: "2855"
       RELAY_PUBLIC_TLS: "false"
-      RELAY_PCSCF_TOKEN: ${RELAY_PCSCF_TOKEN:?run make up, which writes deploy/compose.env}
+      RELAY_PCSCF_TOKEN: ${RELAY_PCSCF_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
     ports:
       - "127.0.0.1:${RELAY_MSRP_HOST_PORT:-12855}:2855"
       - "127.0.0.1:${RELAY_CONTROL_HOST_PORT:-18083}:8082"
@@ -222,7 +229,7 @@ services:
       ACS_SMS_PROVIDER: mock
       # The mock SMS outbox (/dev/sms), for the OTP flow by hand.
       ACS_DEV_ENDPOINTS_ENABLED: "true"
-      ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?run make up, which writes deploy/compose.env}
+      ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
       ACS_DM_ACCOUNT_URI: ${ACS_PUBLIC_BASE:-http://acs:8080}/dm
       ACS_PII_LOG_MODE: mask
     ports: ["127.0.0.1:${ACS_HOST_PORT:-18080}:8080"]
