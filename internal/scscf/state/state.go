@@ -322,10 +322,19 @@ type Profiles interface {
 	SaveProfile(ctx context.Context, p *Profile) error
 	// KeepProfile moves the KeepUntil of k's profile to until, if that is
 	// later; it never brings it closer. It returns ErrNotFound if Profile
-	// would at now.
+	// would at now. A profile saved again while it runs, with an earlier
+	// KeepUntil, is extended in a second attempt; if it is saved again
+	// during that one too, KeepProfile returns nil and the saved KeepUntil
+	// stands: that profile was just written, and the next registration
+	// extends it (KeepDue). It never returns ErrConflict.
 	KeepProfile(ctx context.Context, k ProfileKey, until, now time.Time) error
 	// DeleteProfile deletes the profile of k; deleting none is no error.
 	DeleteProfile(ctx context.Context, k ProfileKey) error
+	// DeleteProfileIf deletes the profile of k only if it is still the one
+	// received at received (Profile.Received): one another instance saved
+	// since, for a registration of its own, stays and gives ErrConflict.
+	// Deleting none is no error.
+	DeleteProfileIf(ctx context.Context, k ProfileKey, received time.Time) error
 }
 
 // ProfileKey names the profile of one implicit registration set.
@@ -339,9 +348,12 @@ type ProfileKey struct {
 
 // ProfileGrace is how long a profile outlives the last contact expiry of its
 // set, or the end of its unregistered state (Registration.Unregistered): the
-// S-CSCF sets KeepUntil to that time plus ProfileGrace. Within
-// ProfileKeepMargin of KeepUntil a re-registration extends it (KeepDue), so
-// it does so about twice a day rather than at every re-registration.
+// S-CSCF sets KeepUntil to that time plus ProfileGrace. A registration
+// extends it only when it has moved that time ProfileKeepMargin or more past
+// what KeepUntil covers (KeepDue), so a set re-registering every hour writes
+// it about twice a day, and KeepUntil stays at least ProfileGrace -
+// ProfileKeepMargin past every live binding, however long registrations
+// last.
 const (
 	ProfileGrace      = 24 * time.Hour
 	ProfileKeepMargin = 12 * time.Hour
@@ -361,9 +373,14 @@ type Profile struct {
 	KeepUntil time.Time
 }
 
-// KeepDue reports whether p's KeepUntil is within ProfileKeepMargin of now,
-// so that the next registration should extend it with KeepProfile.
-func (p *Profile) KeepDue(now time.Time) bool { return p.KeepUntil.Sub(now) < ProfileKeepMargin }
+// KeepDue reports whether a registration whose last binding of the set now
+// expires at lastExpiry should extend p with KeepProfile(lastExpiry +
+// ProfileGrace): when KeepUntil is less than ProfileGrace - ProfileKeepMargin
+// past lastExpiry. Measured from the expiry rather than the time left, a
+// registration longer than ProfileGrace still extends it before it runs out.
+func (p *Profile) KeepDue(lastExpiry time.Time) bool {
+	return p.KeepUntil.Sub(lastExpiry) < ProfileGrace-ProfileKeepMargin
+}
 
 // Clone returns a copy of p that shares no memory with it.
 func (p *Profile) Clone() *Profile {
@@ -408,6 +425,10 @@ type Challenge struct {
 	// Exactly one of AKA and Digest is set.
 	AKA    *AKAVector
 	Digest *DigestChallenge
+	// Resynchronised marks an AKA challenge whose vector the HSS issued
+	// after a resynchronisation (TS 33.203 §6.1.2): a further synchronisation
+	// failure for it is not sent to the HSS again.
+	Resynchronised bool
 }
 
 // challengeRedacted is what a Challenge prints and logs.
@@ -498,6 +519,9 @@ func (c *Challenge) Validate() error {
 	}
 	if (c.AKA == nil) == (c.Digest == nil) {
 		return fmt.Errorf("%w: a challenge holds exactly one of an AKA vector and Digest state", ErrInvalid)
+	}
+	if c.Resynchronised && c.AKA == nil {
+		return fmt.Errorf("%w: only an AKA challenge is resynchronised", ErrInvalid)
 	}
 	return nil
 }

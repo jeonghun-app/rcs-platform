@@ -128,6 +128,40 @@ func TestAResentKeepProfileSucceeds(t *testing.T) {
 	}
 }
 
+// TestAKeepProfileThatRacesASaveStillExtendsTheProfile: the profile is
+// already kept as long, so the update's condition fails; before the read
+// back, another instance saves it again with an earlier KeepUntil. The second
+// attempt extends the saved profile, and nothing reports a conflict.
+func TestAKeepProfileThatRacesASaveStillExtendsTheProfile(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	p := statetest.Profile(statetest.Set1, []byte("x"), statetest.T0)
+	p.KeepUntil = statetest.T0.Add(30 * time.Hour)
+	if err := d.SaveProfile(bg(), p); err != nil {
+		t.Fatal(err)
+	}
+	until := statetest.T0.Add(25 * time.Hour)
+	saved := false
+	f.afterUpdate = func() {
+		if saved {
+			return
+		}
+		saved = true
+		q := statetest.Profile(statetest.Set1, []byte("y"), statetest.T0.Add(time.Second))
+		q.KeepUntil = statetest.T0.Add(time.Hour)
+		if err := d.SaveProfile(bg(), q); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := d.KeepProfile(bg(), statetest.Set1, until, statetest.T0); err != nil {
+		t.Fatalf("KeepProfile: %v", err)
+	}
+	got, err := d.Profile(bg(), statetest.Set1, statetest.T0)
+	if err != nil || !got.KeepUntil.Equal(until) || string(got.UserData) != "y" {
+		t.Fatalf("after the race: %+v, %v; want the saved profile kept until %v", got, err, until)
+	}
+}
+
 // TestOnlyProfilesCarryTheTTLAttribute: DynamoDB deletes items by the table's
 // TTL attribute, ttl, in Unix seconds. A profile has it, so one a failed
 // deregistration left behind goes; a registration, unregistered or not, must
