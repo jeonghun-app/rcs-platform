@@ -83,7 +83,7 @@ func FuzzGroupView(f *testing.F) {
 		}
 		// What participants get, as any receiver reads it, is from the
 		// author under the roster's name to the group, and names nobody
-		// else as either; a notification keeps its notifier's To.
+		// else as either.
 		// A roster name is valid UTF-8 (the group package checks).
 		author := cpim.Address{Name: strings.ToValidUTF8(name, "\ufffd"), URI: alice}
 		if out, err := groupView(c, author, groupURI); err == nil {
@@ -91,9 +91,9 @@ func FuzzGroupView(f *testing.F) {
 				t.Fatalf("body %q, want %q", from.Body, c.Body)
 			}
 		}
-		to, ok := c.Get(cpim.CoreNamespace, cpim.HeaderTo)
-		if out, err := groupView(c, cpim.Address{URI: alice}, ""); err == nil && ok {
-			readAddresses(t, out, cpim.Address{URI: alice}, to.Value)
+		// A notification is From the notifier, To the author.
+		if out, err := groupView(c, cpim.Address{URI: bob}, alice); err == nil {
+			readAddresses(t, out, cpim.Address{URI: bob}, "<"+alice+">")
 		}
 	})
 }

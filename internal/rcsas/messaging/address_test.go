@@ -155,12 +155,12 @@ func TestAGroupMessageNamesItsAuthorOnce(t *testing.T) {
 		if dt, _ := got.Get(cpim.CoreNamespace, cpim.HeaderDateTime); dt != want || !slices.Equal(got.Headers[2:], others) {
 			t.Errorf("%s: DateTime %v, headers %v", name, dt, got.Headers)
 		}
-		// A notification keeps the To its notifier wrote, and only that.
-		out, err = groupView(c, cpim.Address{URI: bob}, "")
+		// A notification is To the author, whatever its notifier wrote.
+		out, err = groupView(c, cpim.Address{URI: bob}, alice)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		readAddresses(t, out, cpim.Address{URI: bob}, "<"+AnonymousURI+">")
+		readAddresses(t, out, cpim.Address{URI: bob}, "<"+alice+">")
 	}
 	c, err := cpim.Parse(withHeaders("", "From: <"+carol+">\r\nto: <"+carol+">\r\n"))
 	if err != nil {

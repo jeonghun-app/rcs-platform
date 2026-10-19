@@ -218,21 +218,17 @@ func isComposing(c *cpim.Message) bool {
 
 // groupView is c as the group's participants see it. Its header block is
 // built anew: From, the sender's asserted identity under its roster name,
-// then To, the group, or when to is empty the To the sender wrote (a
-// notification's, which names the author), then every other header of c
-// in its order. A header that a receiver could take for a From or To
+// then To, the group for a message or the author for a notification, then
+// every other header of c in its order. A header that a receiver could take for a From or To
 // (addressHeader) is left out wherever it was, in whatever case, prefix or
 // namespace, so that every receiver reads the author rcs-as checked, and
 // so are content headers that look like one. The two come before any NS
 // header, so they are in the core namespace (RFC 3862 §3.4).
 func groupView(c *cpim.Message, from cpim.Address, to string) ([]byte, error) {
-	out := &cpim.Message{Headers: []cpim.Header{{Name: cpim.HeaderFrom, Value: from.String()}}, Body: c.Body}
-	switch h, ok := c.Get(cpim.CoreNamespace, cpim.HeaderTo); {
-	case to != "":
-		out.Headers = append(out.Headers, cpim.Header{Name: cpim.HeaderTo, Value: cpim.Address{URI: to}.String()})
-	case ok:
-		out.Headers = append(out.Headers, cpim.Header{Name: cpim.HeaderTo, Params: h.Params, Value: h.Value})
-	}
+	out := &cpim.Message{Headers: []cpim.Header{
+		{Name: cpim.HeaderFrom, Value: from.String()},
+		{Name: cpim.HeaderTo, Value: cpim.Address{URI: to}.String()},
+	}, Body: c.Body}
 	for _, h := range c.Headers {
 		if addressHeader(h.Name) == "" {
 			out.Headers = append(out.Headers, h)
@@ -369,9 +365,10 @@ func (e *Engine) recordGroupSent(ctx context.Context, o GroupOrigin, req imdn.Re
 // whose own record of the message named the group: rcsjta sends display
 // notifications that way once the group session is gone
 // (ChatServiceImpl.sendGroupChatDisplayedDeliveryReport). Either way it
-// goes to the author in the group, From the notifier; one from outside,
-// whose To is the anonymous URI, gets To the author, since a client takes
-// a notification in a group only when it is To itself (rcsjta).
+// goes to the author in the group, From the notifier and To the author,
+// as the group's record names it: a client takes a notification in a group
+// only when it is To itself (rcsjta), and what the notifier wrote there
+// (the anonymous URI from outside the group) is not rcs-as's to pass on.
 //
 // The record is read before the group: a notification about nothing costs
 // one small read, not one of the group's item.
@@ -397,11 +394,7 @@ func (e *Engine) submitGroupNotification(ctx context.Context, h GroupHandler, o 
 			return err
 		}
 	}
-	to := ""
-	if author != "" {
-		to = sent.Author
-	}
-	body, err := groupView(m.CPIM, cpim.Address{URI: o.Sender}, to)
+	body, err := groupView(m.CPIM, cpim.Address{URI: o.Sender}, sent.Author)
 	if err != nil {
 		return reject(ReasonIMDNMalformed, err)
 	}

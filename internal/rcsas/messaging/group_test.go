@@ -294,6 +294,8 @@ func TestGroupNotificationsAreCheckedLikeAnyOther(t *testing.T) {
 	if len(ms) != 1 || ms[0].Author != bob || ms[0].Sender != groupURI || !ms[0].Notification {
 		t.Fatalf("alice's queue %+v", ms)
 	}
+	// bob wrote the anonymous URI in its To; rcs-as writes alice there.
+	readAddresses(t, ms[0].CPIM, cpim.Address{URI: bob}, "<"+alice+">")
 }
 
 // A client that takes no sessions has nothing to show a group message on:

@@ -412,9 +412,9 @@ hold:
 - it is the first of its kind from that notifier, whichever way it came.
 
 It goes to the author in the group. Its header block is rebuilt as for a
-message: `From` the notifier's asserted identity, and `To` the one the notifier
-wrote in the group, or the author for one that came from outside, since a
-client takes a notification in a group only when it is `To` itself (rcsjta).
+message: `From` the notifier's asserted identity and `To` the author, as the
+group's record names it, whatever the notifier wrote there. A client takes a
+notification in a group only when it is `To` itself (rcsjta).
 
 Every message an author writes is answered by every other participant, up to
 twice. So the notifications about one group's messages in a queue, from any
