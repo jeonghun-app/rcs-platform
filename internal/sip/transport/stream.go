@@ -199,10 +199,10 @@ func (t *Transport) countReadError(err error, strict bool) {
 }
 
 // write sends b on a UDP flow, or queues it for a stream flow's writer (see
-// sendQueue), waiting for room when wait is set. A stream whose queue stays full
-// is closed: its peer is not reading. An error writing a queued message later
-// closes the connection too, and is seen by the sender only as the flow going
-// away.
+// sendQueue), waiting for room when wait is set. A send that finds no room in
+// time fails alone; a NoWait send past the reserve closes the connection. An
+// error writing a queued message later closes the connection too, and is seen by
+// the sender only as the flow going away.
 func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	if f.conn == nil {
 		return t.sendDatagram(f.lis, f.remote, b)
@@ -221,6 +221,9 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 		return nil
 	case queueGone:
 		return ErrNoFlow
+	case waitTimedOut:
+		t.stats.queueWaitTimeouts.Add(1)
+		return ErrQueueFull
 	}
 	t.stats.queueOverflows.Add(1)
 	t.closeFlow(f)
@@ -313,6 +316,7 @@ func (t *Transport) dial(k reuseKey) (*flow, error) {
 		t.stats.dialErrors.Add(1)
 		return nil, fmt.Errorf("transport: connecting over %s: %w", k.network, err)
 	}
+	capSendBuffer(c)
 	if k.network == TLS {
 		cfg := &tls.Config{}
 		if t.cfg.TLSClient != nil {

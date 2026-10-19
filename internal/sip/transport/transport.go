@@ -83,9 +83,11 @@ var (
 	// ErrTooManyConnections means MaxDialedConnections outbound connections
 	// are open or being opened.
 	ErrTooManyConnections = errors.New("transport: too many outbound connections")
-	// ErrQueueFull means a stream connection's send queue was full, so its peer
-	// was not reading; the connection has been closed.
-	ErrQueueFull = errors.New("transport: send queue full; connection closed")
+	// ErrQueueFull means a stream connection's send queue had no room. After
+	// waiting WriteTimeout for room, only that send fails and the connection
+	// stays open, so a TU can answer 503 for a peer that is merely slow; a
+	// NoWait send that does not fit even in the reserve closes the connection.
+	ErrQueueFull = errors.New("transport: send queue full")
 )
 
 // Handler receives every message the transport accepts. It runs on the goroutine
@@ -162,8 +164,8 @@ type Config struct {
 	WriteTimeout time.Duration
 	// SendQueueBytes bounds what may wait to be written to one stream
 	// connection: a send waits for room, for at most WriteTimeout, while it is
-	// exceeded, and a NoWait send may use as much again. A connection whose
-	// queue stays full is closed. It applies to dialed connections and to
+	// exceeded, and fails with ErrQueueFull if none comes; a NoWait send may use
+	// as much again, and closes the connection past that. It applies to dialed connections and to
 	// listeners that are not client-facing; ListenerConfig.SendQueueBytes
 	// overrides it per listener.
 	SendQueueBytes int
@@ -483,7 +485,8 @@ type Stats struct {
 	IdleTimeouts       uint64
 	ReadTimeouts       uint64 // stream connections closed mid-message or before their first message
 	WriteErrors        uint64
-	QueueOverflows     uint64 // stream connections closed because their send queue was full
+	QueueOverflows     uint64 // stream connections closed because a NoWait send overflowed their reserve
+	QueueWaitTimeouts  uint64 // sends that found no queue room within WriteTimeout; the connection stays
 	BudgetSheds        uint64 // stream connections closed to keep all queues within MaxQueuedBytes
 	KeepAlives         uint64 // CRLF pings answered
 	MalformedDatagrams uint64
@@ -495,7 +498,7 @@ type Stats struct {
 type counters struct {
 	accepted, rejected, refused, dialed, dialErrors, dialLimited,
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
-	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, budgetSheds, keepAlives,
+	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses atomic.Uint64
 }
 
@@ -527,6 +530,7 @@ func (t *Transport) Stats() Stats {
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
 		QueueOverflows:     c.queueOverflows.Load(),
+		QueueWaitTimeouts:  c.queueWaitTimeouts.Load(),
 		BudgetSheds:        c.budgetSheds.Load(),
 		KeepAlives:         c.keepAlives.Load(),
 		MalformedDatagrams: c.malformedDatagrams.Load(),
