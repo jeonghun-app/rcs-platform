@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,11 +73,11 @@ func TestEveryScenarioPassesAgainstTheRealServices(t *testing.T) {
 		steps[r.Scenario+"/"+r.Step] = true
 	}
 	for _, want := range []string{
-		"ft/upload", "ft/download", "ft/download-range", "ft/download-thumbnail", "ft/get_download_info",
+		"ft/upload", "ft/download", "ft/download-range", "ft/download-resume", "ft/download-thumbnail", "ft/get_download_info",
 		"ft-resume/interrupted-upload", "ft-resume/get_upload_info", "ft-resume/resume", "ft-resume/download",
 		"chat-client-originated/connect", "chat-client-originated/client-to-core", "chat-client-originated/core-to-client",
 		"chat-client-originated/chunked-message", "chat-client-originated/keep-alive", "chat-client-originated/release",
-		"chat-core-originated/core-sends-first", "chat-core-originated/client-to-core", "chat-core-originated/release",
+		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/client-to-core", "chat-core-originated/release",
 	} {
 		if !steps[want] {
 			t.Errorf("step %s did not run", want)
@@ -120,13 +122,136 @@ func TestUnknownScenariosAreRefusedBeforeAnythingRuns(t *testing.T) {
 	}
 }
 
-func TestAResumeFileNoLargerThanAPartIsReportedAsSuch(t *testing.T) {
+// byStep indexes results by step.
+func byStep(results []scenario.Result) map[string]scenario.Result {
+	m := map[string]scenario.Result{}
+	for _, r := range results {
+		m[r.Step] = r
+	}
+	return m
+}
+
+func TestAResumeFileNoLargerThanAPartIsUploadedAgainAsRCSJTADoes(t *testing.T) {
 	cfg := stack(t)
 	cfg.ResumeSize = part / 2
 	ok, results := runAll(t, cfg, "ft-resume")
+	steps := byStep(results)
+	info := steps["get_upload_info"]
+	if !ok || !info.OK || info.Detail["held"] != 0 || info.Detail["not_held"] == 0 {
+		t.Fatalf("results %+v", results)
+	}
+	if _, resumed := steps["resume"]; resumed || !steps["upload-again"].OK || !steps["download"].OK {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+// answering answers the requests match picks with status instead of
+// sending them on, and counts them; others go to next.
+type answering struct {
+	next   http.RoundTripper
+	match  func(*http.Request) bool
+	status int
+	// body, when set, is sent as an ft document.
+	body string
+	n    atomic.Int32
+}
+
+func (a *answering) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !a.match(r) {
+		return a.next.RoundTrip(r)
+	}
+	a.n.Add(1)
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
+	resp := &http.Response{StatusCode: a.status, Header: http.Header{}, Body: http.NoBody, Request: r}
+	if a.body != "" {
+		resp.Header.Set("Content-Type", ft.ContentType)
+		resp.Body = io.NopCloser(strings.NewReader(a.body))
+	}
+	return resp, nil
+}
+
+// intercept puts a in front of c's transport.
+func intercept(c *http.Client, a *answering) *http.Client {
+	a.next = c.Transport
+	if a.next == nil {
+		a.next = http.DefaultTransport
+	}
+	wrapped := *c
+	wrapped.Transport = a
+	return &wrapped
+}
+
+func TestAResumeAnsweredOtherThan200FailsWithoutARetry(t *testing.T) {
+	for _, status := range []int{http.StatusConflict, http.StatusServiceUnavailable} {
+		cfg := stack(t)
+		a := &answering{match: func(r *http.Request) bool { return r.Method == http.MethodPut }, status: status}
+		cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+		ok, results := runAll(t, cfg, "ft-resume")
+		last := results[len(results)-1]
+		if ok || last.Step != "resume" || last.OK || !strings.Contains(last.Error, "rcsjta fails the transfer") {
+			t.Fatalf("%d: last result %+v", status, last)
+		}
+		if n := a.n.Load(); n != 1 {
+			t.Fatalf("%d: %d PUTs sent, want 1", status, n)
+		}
+	}
+}
+
+func TestUploadInfoAskedAgainIsCounted(t *testing.T) {
+	cfg := stack(t)
+	// The first three signed get_upload_info answer 404, as when the server
+	// has not yet noticed the break.
+	var signed atomic.Int32
+	a := &answering{match: func(r *http.Request) bool {
+		return strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != "" && signed.Add(1) <= 3
+	}, status: http.StatusNotFound}
+	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+	ok, results := runAll(t, cfg, "ft-resume")
+	info := byStep(results)["get_upload_info"]
+	if !ok || info.Detail["not_held"] != 3 || info.Detail["retries"] < 4 || info.Detail["held"] == 0 {
+		t.Fatalf("ok %v, get_upload_info %+v", ok, info)
+	}
+	if !byStep(results)["resume"].OK {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAnUploadInfoThatWouldOverflowFailsTheStep(t *testing.T) {
+	cfg := stack(t)
+	a := &answering{match: func(r *http.Request) bool {
+		return strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != ""
+	}, status: http.StatusOK, body: `<?xml version="1.0"?><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp">` +
+		`<file-range start="0" end="9223372036854775807"/><data url="/ft/x"/></file-resume-info>`}
+	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+	ok, results := runAll(t, cfg, "ft-resume")
 	last := results[len(results)-1]
-	if ok || last.Step != "get_upload_info" || !strings.Contains(last.Error, "FT_PART_SIZE") {
+	if ok || last.Step != "get_upload_info" || last.OK {
 		t.Fatalf("last result %+v", last)
+	}
+}
+
+func TestFilesOfOneAndTwoBytesTakeEveryDownloadPath(t *testing.T) {
+	for _, size := range []int{1, 2} {
+		cfg := stack(t)
+		cfg.FileSize = size
+		if ok, results := runAll(t, cfg, "ft"); !ok {
+			t.Fatalf("%d bytes: %+v", size, results)
+		}
+	}
+}
+
+func TestAReleaseThatLeavesTheBindingFails(t *testing.T) {
+	cfg := stack(t)
+	// The relay answers 204 but the binding stays (and is still claimed,
+	// so the probe is refused with 403, not 481).
+	a := &answering{match: func(r *http.Request) bool { return r.Method == http.MethodDelete }, status: http.StatusNoContent}
+	cfg.Control.HTTP = intercept(cfg.Control.HTTP, a)
+	ok, results := runAll(t, cfg, "chat-client-originated")
+	release := byStep(results)["release"]
+	if ok || release.OK || !strings.Contains(release.Error, "released session") {
+		t.Fatalf("release %+v", release)
 	}
 }
 

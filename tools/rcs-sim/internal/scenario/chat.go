@@ -24,6 +24,11 @@ const bindingLifetime = 10 * time.Minute
 // over internal/msrp's 2048-octet chunks, well under its 1 MiB limit.
 const largeMessage = 100 << 10
 
+// answerLag is how long after the client starts connecting chat-core-
+// originated sends pcscf's PATCH: well inside msrp-relay's RELAY_PATH_WAIT
+// (2 s by default), so the relay must wait for the path to bind.
+const answerLag = 300 * time.Millisecond
+
 var errNoControl = errors.New("no relay control API configured (-relay-control, RCS_SIM_RELAY_TOKEN)")
 
 // chatSession is one anchored chat: the client through the relay, the
@@ -69,8 +74,10 @@ func chatClientOriginated(r *run) error {
 }
 
 // chatCoreOriginated is the second row: rcs-as offers, so pcscf allocates
-// with rcs-as's path and records the client's from its answer; the client
-// connects as soon as it has answered, and rcs-as speaks first.
+// with rcs-as's path and records the client's from its answer. The client
+// connects as soon as it has answered, so its connection reaches the relay
+// before pcscf's PATCH does, and the relay waits for the path
+// (RELAY_PATH_WAIT); then rcs-as speaks first.
 func chatCoreOriginated(r *run) error {
 	cs := &chatSession{}
 	if err := r.listenCore(cs); err != nil {
@@ -87,12 +94,26 @@ func chatCoreOriginated(r *run) error {
 		return err
 	}
 	r.onEnd(func() { r.release(cs) })
-	if err := r.step("answer", func(ctx context.Context) (map[string]int64, error) {
-		return nil, r.cfg.Control.Complete(ctx, cs.binding.ID, anchor.Paths{Client: cs.clientURI}, 0)
+	if err := r.step("connect-then-answer", func(ctx context.Context) (map[string]int64, error) {
+		dialed := make(chan error, 1)
+		go func() { dialed <- r.dial(ctx, cs) }()
+		detail := map[string]int64{"answer_lag_ms": answerLag.Milliseconds()}
+		select {
+		case <-time.After(answerLag):
+		case err := <-dialed:
+			// The relay bound the session before it knew the client's
+			// path: the wait this step is for did not happen.
+			if err == nil {
+				return detail, errors.New("the relay bound the session before pcscf recorded the client's path")
+			}
+			return detail, err
+		}
+		if err := r.cfg.Control.Complete(ctx, cs.binding.ID, anchor.Paths{Client: cs.clientURI}, 0); err != nil {
+			<-dialed
+			return detail, err
+		}
+		return detail, <-dialed
 	}); err != nil {
-		return err
-	}
-	if err := r.connect(cs); err != nil {
 		return err
 	}
 	if err := r.step("core-sends-first", func(ctx context.Context) (map[string]int64, error) {
@@ -152,16 +173,20 @@ func (r *run) expectCore(cs *chatSession) error {
 // the relay opens the core leg as part of that.
 func (r *run) connect(cs *chatSession) error {
 	return r.step("connect", func(ctx context.Context) (map[string]int64, error) {
-		c, err := chat.Dial(ctx, cs.binding.ClientPath, cs.clientURI, cs.client, r.cfg.MSRP, r.cfg.TLS, func(nc net.Conn) net.Conn {
-			return &countingConn{Conn: nc, written: &cs.written}
-		})
-		if err != nil {
-			return nil, err
-		}
-		cs.clientConn = c
-		r.onEnd(func() { _ = c.Close() })
-		return nil, nil
+		return nil, r.dial(ctx, cs)
 	})
+}
+
+func (r *run) dial(ctx context.Context, cs *chatSession) error {
+	c, err := chat.Dial(ctx, cs.binding.ClientPath, cs.clientURI, cs.client, r.cfg.MSRP, r.cfg.TLS, func(nc net.Conn) net.Conn {
+		return &countingConn{Conn: nc, written: &cs.written}
+	})
+	if err != nil {
+		return err
+	}
+	cs.clientConn = c
+	r.onEnd(func() { _ = c.Close() })
+	return nil
 }
 
 // converse runs what every chat scenario checks once connected: messages
@@ -233,7 +258,7 @@ func (r *run) exchange(ctx context.Context, from *chat.Endpoint, fs *msrp.Sessio
 	if imdnToo {
 		d = imdn.PositiveDelivery | imdn.Display
 	}
-	id, err := from.Send(ctx, fs, to.Self, "text/plain;charset=UTF-8", body, d)
+	sent, err := from.Send(ctx, fs, to.Self, "text/plain;charset=UTF-8", body, d)
 	if err != nil {
 		return err
 	}
@@ -246,13 +271,13 @@ func (r *run) exchange(ctx context.Context, from *chat.Endpoint, fs *msrp.Sessio
 	if !bytes.Equal(got.Body, body) || got.From.URI != from.Self.URI {
 		return errors.New("the message arrived changed")
 	}
-	if err := waitReport(ctx, from); err != nil {
+	if err := waitReport(ctx, from, sent.MSRP); err != nil {
 		return err
 	}
 	if !imdnToo {
 		return nil
 	}
-	if got.Request.MessageID != id {
+	if got.Request.MessageID != sent.IMDN {
 		return errors.New("the IMDN Message-ID did not survive the relay")
 	}
 	if !to.AutoDisplay {
@@ -264,7 +289,7 @@ func (r *run) exchange(ctx context.Context, from *chat.Endpoint, fs *msrp.Sessio
 	for len(want) > 0 {
 		select {
 		case n := <-from.Notifications:
-			if n.MessageID != id || !want[n.Status] {
+			if n.MessageID != sent.IMDN || !want[n.Status] {
 				return fmt.Errorf("unexpected %s notification", n.Status)
 			}
 			delete(want, n.Status)
@@ -275,12 +300,17 @@ func (r *run) exchange(ctx context.Context, from *chat.Endpoint, fs *msrp.Sessio
 	return nil
 }
 
-// waitReport waits for the success report of the last message sent: the
-// far end confirming the whole message (RFC 4975 §7.1.3).
-func waitReport(ctx context.Context, e *chat.Endpoint) error {
+// waitReport waits for the success report of the message sent with MSRP
+// Message-ID id: the far end confirming the whole message (RFC 4975
+// §7.1.3). Reports for other messages, a duplicate of an earlier one say,
+// do not count.
+func waitReport(ctx context.Context, e *chat.Endpoint, id string) error {
 	for {
 		select {
 		case rep := <-e.Reports:
+			if rep.MessageID != id {
+				continue
+			}
 			if rep.Code != msrp.StatusOK {
 				return fmt.Errorf("delivery failed with %d", rep.Code)
 			}
@@ -293,13 +323,30 @@ func waitReport(ctx context.Context, e *chat.Endpoint) error {
 	}
 }
 
-// release deletes the binding, as pcscf does on BYE.
+// release deletes the binding, as pcscf does on BYE, and checks that it is
+// gone: a client connecting to its client_path again is refused with 481.
 func (r *run) release(cs *chatSession) {
 	if cs.binding.ID == "" {
 		return
 	}
 	_ = r.step("release", func(ctx context.Context) (map[string]int64, error) {
-		return nil, r.cfg.Control.Release(ctx, cs.binding.ID)
+		if err := r.cfg.Control.Release(ctx, cs.binding.ID); err != nil {
+			return nil, err
+		}
+		local, err := chat.LocalURI(r.cfg.Rand)
+		if err != nil {
+			return nil, err
+		}
+		c, err := chat.Dial(ctx, cs.binding.ClientPath, local, r.endpoint(r.cfg.Self, false), r.cfg.MSRP, r.cfg.TLS, nil)
+		var se *msrp.StatusError
+		switch {
+		case err == nil:
+			_ = c.Close()
+			return nil, errors.New("the relay still binds a released session")
+		case !errors.As(err, &se) || se.Code != msrp.StatusNoSession:
+			return nil, fmt.Errorf("binding a released session: %w, want 481", err)
+		}
+		return nil, nil
 	})
 }
 

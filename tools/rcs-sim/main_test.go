@@ -109,3 +109,22 @@ func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 		t.Fatalf("exit %d, output %q", code, out)
 	}
 }
+
+// Failed results name a fixed reason, never the address or host name that
+// failed, nor the resolver asked (QA's regression test on #68).
+func TestFailureResultsCarryNoAddress(t *testing.T) {
+	port := strconv.Itoa(simtest.FreePort(t))
+	lookup := env("RCS_SIM_FT_USER", "u", "RCS_SIM_FT_PASSWORD", "p", "RCS_SIM_RELAY_TOKEN", simtest.RelayToken)
+	for _, host := range []string{"127.0.0.1:" + port, "ft.operator-host.invalid"} {
+		code, out, errOut := call(lookup, "-ft-upload-url", "http://"+host+"/ft",
+			"-relay-control", "http://"+host, "-step-timeout", "2s", "ft", "chat-client-originated")
+		if code != exitFailed || strings.Count(out, `"ok":false`) != 2 {
+			t.Fatalf("%s: exit %d, output %q", host, code, out)
+		}
+		for _, leak := range []string{port, "127.0.0.1", "operator-host", ":53"} {
+			if strings.Contains(out+errOut, leak) {
+				t.Errorf("%s: output names %q:\n%s", host, leak, out)
+			}
+		}
+	}
+}

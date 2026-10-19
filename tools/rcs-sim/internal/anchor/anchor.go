@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 )
 
 // Control is a client of one relay's control API.
@@ -132,11 +133,7 @@ func (c *Control) call(ctx context.Context, op, method, path string, body map[st
 	req.Header.Set("Authorization", "Bearer "+c.Token.v)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
-		}
-		return fmt.Errorf("anchor: %s: %w", op, err)
+		return fmt.Errorf("anchor: %s: %w", op, safeerr.Reason(err))
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))

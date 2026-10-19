@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,15 +61,15 @@ func TestUploadThenDownloadAsRcsjtaDoes(t *testing.T) {
 	if !ok || thumb.Size != 100 || thumb.ContentType != "image/png" {
 		t.Fatalf("thumbnail info %+v", thumb)
 	}
-	got, err := c.Download(ctx(t), file.Data.URL, ft.Range{}, int64(len(up.Data)))
+	got, err := c.Download(ctx(t), file.Data.URL, "", int64(len(up.Data)))
 	if err != nil || got.Status != http.StatusOK || !bytes.Equal(got.Body, up.Data) || strings.Trim(got.ETag, `"`) != ft.SHA256(up.Data) {
 		t.Fatalf("download: %v, status %d, %d bytes, etag ok %v", err, got.Status, len(got.Body), strings.Trim(got.ETag, `"`) == ft.SHA256(up.Data))
 	}
-	part2, err := c.Download(ctx(t), file.Data.URL, ft.Range{First: 10, Last: 19}, 10)
+	part2, err := c.Download(ctx(t), file.Data.URL, ft.RangeHeader(10, 19), 10)
 	if err != nil || part2.Status != http.StatusPartialContent || !bytes.Equal(part2.Body, up.Data[10:20]) {
 		t.Fatalf("range download: %v, %d", err, part2.Status)
 	}
-	if _, err := c.Download(ctx(t), file.Data.URL, ft.Range{}, 10); err == nil {
+	if _, err := c.Download(ctx(t), file.Data.URL, "", 10); err == nil {
 		t.Fatal("a download over the expected size was accepted")
 	}
 	again, err := c.DownloadInfo(ctx(t), "tid-1")
@@ -122,7 +123,7 @@ func TestBrokenUploadIsResumedFromWhatTheServerHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	file, _ := doc.Info("file")
-	got, err := c.Download(ctx(t), file.Data.URL, ft.Range{}, int64(len(up.Data)))
+	got, err := c.Download(ctx(t), file.Data.URL, "", int64(len(up.Data)))
 	if err != nil || !bytes.Equal(got.Body, up.Data) {
 		t.Fatalf("resumed download: %v", err)
 	}
@@ -164,8 +165,8 @@ func TestRequestsBeforeAChallengeAreRefused(t *testing.T) {
 	if _, err := c.UploadInfo(ctx(t), "x"); err == nil {
 		t.Fatal("a request went out without a challenge")
 	}
-	if err := c.Precheck(ctx(t)); err == nil || strings.Contains(err.Error(), "127.0.0.1:1/ft") {
-		t.Fatalf("Precheck = %v; want a transport error without the URL", err)
+	if err := c.Precheck(ctx(t)); err == nil || strings.Contains(err.Error(), "127.0.0.1") {
+		t.Fatalf("Precheck = %v; want a transport error without the address", err)
 	}
 }
 
@@ -181,18 +182,16 @@ func fakeServer(t *testing.T, h http.HandlerFunc) *ft.Client {
 
 const challenge = `Digest realm="r", nonce="n", qop="auth", opaque="o"`
 
-func TestBusyServerIsRetriedAfterRetryAfter(t *testing.T) {
-	calls := 0
+func TestInfoRequestsGoOutUnauthenticatedFirstAndUseTheFreshNonce(t *testing.T) {
+	// rcsjta's sendGetInfo: a GET without credentials, then the same GET
+	// signed under the nonce of its 401, which starts again at nc 1.
+	var seen []string
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "" {
-			w.Header().Set("WWW-Authenticate", challenge)
+		auth := r.Header.Get("Authorization")
+		seen = append(seen, auth)
+		if auth == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="r", nonce="n`+strconv.Itoa(len(seen))+`", qop="auth", opaque="o"`)
 			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		calls++
-		if calls < 3 {
-			w.Header().Set("Retry-After", "0")
-			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -200,24 +199,50 @@ func TestBusyServerIsRetriedAfterRetryAfter(t *testing.T) {
 	if err := c.Precheck(ctx(t)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.UploadInfo(ctx(t), "x"); !errors.Is(err, ft.ErrNothingHeld) || calls != 3 {
-		t.Fatalf("UploadInfo = %v after %d calls", err, calls)
+	if _, err := c.UploadInfo(ctx(t), "x"); !errors.Is(err, ft.ErrNothingHeld) {
+		t.Fatalf("UploadInfo = %v", err)
+	}
+	if len(seen) != 3 || seen[1] != "" || !strings.Contains(seen[2], `nonce="n2"`) || !strings.Contains(seen[2], "nc=00000001") ||
+		!strings.Contains(seen[2], `uri="/ft"`) {
+		t.Fatalf("requests %q", seen)
 	}
 }
 
-func TestStaleNonceIsAnsweredOnceWithTheNewChallenge(t *testing.T) {
+func TestABusyServerIsAFailureNotARetry(t *testing.T) {
+	// rcsjta retries nothing on the resume path; neither does the client.
+	signed := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		signed++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	if _, err := c.UploadInfo(ctx(t), "x"); !ft.IsStatus(err, http.StatusServiceUnavailable) || signed != 1 {
+		t.Fatalf("UploadInfo = %v after %d signed requests", err, signed)
+	}
+}
+
+func TestASecondChallengeIsAnAuthenticationFailure(t *testing.T) {
 	calls := 0
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("WWW-Authenticate", challenge)
 		w.WriteHeader(http.StatusUnauthorized)
 	})
-	if err := c.Precheck(ctx(t)); err != nil {
-		t.Fatal(err)
+	if _, err := c.DownloadInfo(ctx(t), "x"); !ft.IsStatus(err, http.StatusUnauthorized) || calls != 2 {
+		t.Fatalf("DownloadInfo = %v after %d calls, want the unauthenticated GET, the signed one, then 401", err, calls)
 	}
-	calls = 0
-	if _, err := c.UploadInfo(ctx(t), "x"); !ft.IsStatus(err, http.StatusUnauthorized) || calls != 2 {
-		t.Fatalf("UploadInfo = %v after %d calls, want one retry then 401", err, calls)
+}
+
+func TestAnUploadInfoEndThatWouldOverflowIsRefused(t *testing.T) {
+	var d ft.ResumeDocument
+	d.Range.Start, d.Range.End = "0", "9223372036854775807"
+	if held, err := d.Held(); err == nil {
+		t.Fatalf("Held = %d", held)
 	}
 }
 

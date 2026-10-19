@@ -14,6 +14,8 @@ func FuzzDocuments(f *testing.F) {
 	f.Add([]byte(`<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="0" end="5242879"/><data url="/ft/t"/></file-resume-info>`))
 	f.Add([]byte(`<!DOCTYPE file [<!ENTITY x "y">]><file/>`))
 	f.Add([]byte(`<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="0" end="-1"/></file-resume-info>`))
+	// end+1 would overflow (found in review of #68).
+	f.Add([]byte(`<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="0" end="9223372036854775807"/></file-resume-info>`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var d FileDocument
 		_ = decode(bytes.NewReader(data), &d)
@@ -24,17 +26,6 @@ func FuzzDocuments(f *testing.F) {
 		}
 		if held, err := r.Held(); err == nil && held < 1 {
 			t.Fatalf("accepted a range holding %d bytes", held)
-		}
-	})
-}
-
-func FuzzRetryAfter(f *testing.F) {
-	for _, s := range []string{"0", "5", "120", "-1", "Fri, 31 Dec 1999 23:59:59 GMT", "", "99999999999999999999"} {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, v string) {
-		if d := retryAfter(v); d < 0 || d > maxRetryAfter {
-			t.Fatalf("retryAfter(%q) = %v", v, d)
 		}
 	})
 }

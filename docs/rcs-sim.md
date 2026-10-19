@@ -23,10 +23,10 @@ MESSAGE through pcscf) replaces both parts.
 
 | Scenario | Steps | Checks |
 |---|---|---|
-| `ft` | pre-check, upload (with a thumbnail), get_download_info, download, download-range, download-thumbnail | 401 before credentials; file-info sizes, type and links; content by SHA-256, against the server's strong ETag too; a single range gets 206 |
-| `ft-resume` | pre-check, interrupted-upload, get_upload_info, resume, get_download_info, download | the server keeps whole leading parts of a broken upload; the PUT with `Content-Range` completes it; the file comes back whole by SHA-256 |
-| `chat-client-originated` | listen-core, allocate (client path), answer (core path), connect, client-to-core, core-to-client, chunked-message, keep-alive, clean, release | ADR 0004's first row: messages both ways with CPIM and IMDN, delivered and displayed notifications, success reports, a 100 KiB message in 2 KiB chunks, keep-alives on a quiet session |
-| `chat-core-originated` | listen-core, allocate (core path), answer (client path), connect, core-sends-first, then as above | ADR 0004's second row: the client connects as soon as it has answered, and the network speaks first |
+| `ft` | pre-check, upload (with a thumbnail), get_download_info, download, download-range, download-resume, download-thumbnail | 401 before credentials; file-info sizes, type and links; content by SHA-256, against the server's strong ETag too; a single range gets 206, and so does rcsjta's download resume, `bytes=<received>-<total>` |
+| `ft-resume` | pre-check, interrupted-upload, get_upload_info, resume (or upload-again), get_download_info, download | the server keeps whole leading parts of a broken upload; the PUT with `Content-Range` completes it; the file comes back whole by SHA-256 |
+| `chat-client-originated` | listen-core, allocate (client path), answer (core path), connect, client-to-core, core-to-client, chunked-message, keep-alive, clean, release | ADR 0004's first row: messages both ways with CPIM and IMDN, delivered and displayed notifications, the success report of each message by its Message-ID, a 100 KiB message in 2 KiB chunks, keep-alives on a quiet session; after the release, the client path is refused with 481 |
+| `chat-core-originated` | listen-core, allocate (core path), connect-then-answer, core-sends-first, then as above | ADR 0004's second row: the client connects as soon as it has answered, before pcscf records its path (the PATCH goes 300 ms later, so the relay must wait, `RELAY_PATH_WAIT`), and the network speaks first |
 
 `all` runs every scenario. A scenario stops at its first failed step.
 
@@ -35,16 +35,30 @@ MESSAGE through pcscf) replaces both parts.
 The FT client follows the GSMA rcsjta reference client
 (HttpAuthenticationAgent, HttpUploadManager):
 
-- It starts each attempt with an empty POST and reads the challenge of the
+- It starts each upload with an empty POST and reads the challenge of the
   401.
 - It answers only the last `WWW-Authenticate` field, as MD5 without an
-  algorithm parameter.
-- It signs only the path for `get_upload_info` and `get_download_info`.
+  algorithm parameter, counting `nc` from 1 for each new nonce.
+- It sends `get_upload_info` and `get_download_info` without credentials
+  first, takes the fresh challenge of the 401, and signs the repeated GET for
+  the path only. A second 401 is a failure.
 - It sends the form as `tid`, `Thumbnail`, `File`, each part with its own
   `Content-Length`, and URL-encodes the file name.
-- It retries a 503 after its `Retry-After`.
-- It resumes with `get_upload_info` and a PUT from the first byte not held,
-  and asks again on 409.
+- It resumes with `get_upload_info` and a PUT from the first byte not held.
+  When `get_upload_info` holds nothing, it uploads the file again from the
+  start (`upload-again`).
+- It downloads the rest of a file with `Range: bytes=<received>-<total>`
+  (HttpDownloadManager), one past the last byte.
+- Like rcsjta, it retries nothing else: a 401 to a signed request, a 503, or a
+  PUT answered other than 200 fails the step.
+
+One wait is the simulator's own. A device resumes once it is back on a
+network, seconds after the break; the simulator asks at once, before
+`ft-server` may have noticed the break. So `get_upload_info` asks again, every
+100 ms for up to 3 s, until it answers 404 no more and two answers in a row
+name the same bytes held. The step reports how often it asked again
+(`retries`) and how many of those were 404 (`not_held`), and `make e2e` bounds
+both, so a server that is slow to keep a broken upload shows.
 
 The chat client connects actively, as a device behind NAT does: over TLS for
 an `msrps:` path, plain for `msrp:`. It binds the session with a bodiless SEND
@@ -70,7 +84,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-ft-upload-url` | none | ft-server's upload URI (`ftHTTPCSURI`); the FT scenarios fail without it |
 | `-ft-user` | `RCS_SIM_FT_USER` | FT user name (`ftHTTPCSUser`) |
 | `-file-size` | 256 KiB | size of the `ft` file |
-| `-resume-size` | 12 MiB | size of the `ft-resume` file; must exceed the server's `FT_PART_SIZE`, since only whole parts survive a break |
+| `-resume-size` | 12 MiB | size of the `ft-resume` file; must exceed the server's `FT_PART_SIZE`, since only whole parts survive a break; otherwise nothing is held and the scenario uploads again instead of resuming |
 | `-relay-control` | none | msrp-relay control API base URL; the chat scenarios fail without it |
 | `-core-listen` | `127.0.0.1:0` | where the rcs-as stand-in listens; the port must be in the relay's `RELAY_CORE_PORTS` |
 | `-core-advertise` | the listener's address | host the relay is told to connect to |
@@ -89,14 +103,16 @@ are visible in process listings: `RCS_SIM_FT_PASSWORD` and
 One JSON line per step on standard output:
 
 ```json
-{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":52,"detail":{"held":5242880}}
+{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2}}
 {"scenario":"chat-core-originated","step":"keep-alive","ok":true,"ms":1500,"detail":{"bytes_while_quiet":514}}
 ```
 
 A failed step has `"ok":false` and an `error` naming the operation and the
 status or cause. Results never carry a URL, a session id, a user name, a
 password, a token or an address: download URLs and MSRP session ids are
-capabilities, and the run's output goes to CI logs.
+capabilities, and the run's output goes to CI logs. Network failures are
+reduced to a fixed reason ("connection refused", "host name not resolved"),
+without the address, host name or resolver Go's errors name.
 
 The exit status is 0 when every step succeeded, 1 when one failed, and 2 for a
 usage error.
@@ -123,8 +139,9 @@ code inside the test process (`internal/simtest`).
   same nonce can lose the whole upload. The transport gives up on the broken
   request as soon as its body fails, possibly before ft-server has read its
   headers. If the next request, with a higher nonce-count, is verified first,
-  the broken one is refused as a replay (RFC 7616 §3.4.1) and stores nothing.
-  `get_upload_info` then answers 404, and the client starts over. The
-  simulator takes a fresh challenge after a break, as rcsjta does before every
-  upload attempt. rcsjta's resume reuses the nonce, though (as modelled in
-  `internal/ftserver/rcsjta_test.go`), so a real device can hit this (#66).
+  the broken one is refused as a replay (RFC 7616 §3.4) and stores nothing.
+  `get_upload_info` then answers 404, and the client starts over. rcsjta does
+  not hit this: it sends `get_upload_info` without credentials first and
+  answers the fresh nonce of that 401 with `nc` 1, so the broken POST's nonce
+  sees no later count. Only clients that keep the nonce across a break are
+  affected, so #66 is P2 hardening.

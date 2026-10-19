@@ -17,13 +17,14 @@ import (
 // thumbnailSize is the size of the thumbnail the ft scenario sends.
 const thumbnailSize = 2 << 10
 
-// uploadSettle is how long a broken upload may take to show in
-// get_upload_info.
-const uploadSettle = 3 * time.Second
-
-// maxResumeAttempts bounds the PUTs the resume step sends while the server
-// is still storing what it got of the broken upload.
-const maxResumeAttempts = 10
+// uploadSettle is how long a broken upload may take to show, unchanging, in
+// get_upload_info, and settlePoll how often the simulator asks meanwhile. A
+// device asks once it is back on a network, seconds later; the simulator
+// asks at once, so it must wait for the server to notice the break.
+const (
+	uploadSettle = 3 * time.Second
+	settlePoll   = 100 * time.Millisecond
+)
 
 // newTID returns a transfer id: 128 random bits, hex.
 func (r *run) newTID() (string, error) {
@@ -37,7 +38,8 @@ func (r *run) newTID() (string, error) {
 var errNoFTClient = errors.New("no file transfer client configured (-ft-upload-url, -ft-user, RCS_SIM_FT_PASSWORD)")
 
 // fileTransfer is an upload with a thumbnail, then every way a recipient
-// fetches it: get_download_info, the whole file, a range, the thumbnail.
+// fetches it: get_download_info, the whole file, a range, the rest of the
+// file as rcsjta resumes a download, the thumbnail.
 // Content is checked by SHA-256 end to end, against the server's ETag too.
 func fileTransfer(r *run) error {
 	c := r.cfg.FT
@@ -94,7 +96,7 @@ func fileTransfer(r *run) error {
 	}
 	file, _ := doc.Info("file")
 	if err := r.step("download", func(ctx context.Context) (map[string]int64, error) {
-		got, err := c.Download(ctx, file.Data.URL, ft.Range{}, int64(len(up.Data)))
+		got, err := c.Download(ctx, file.Data.URL, "", int64(len(up.Data)))
 		if err != nil {
 			return nil, err
 		}
@@ -113,20 +115,22 @@ func fileTransfer(r *run) error {
 	}
 	if err := r.step("download-range", func(ctx context.Context) (map[string]int64, error) {
 		first, last := int64(len(up.Data)/3), int64(len(up.Data)/3*2)
-		got, err := c.Download(ctx, file.Data.URL, ft.Range{First: first, Last: last}, last-first+1)
-		if err != nil {
-			return nil, err
-		}
-		if got.Status != http.StatusPartialContent {
-			return nil, fmt.Errorf("range download answered %d, want 206", got.Status)
-		}
-		return map[string]int64{"bytes": int64(len(got.Body))}, sameContent(got.Body, up.Data[first:last+1])
+		return rangeDownload(ctx, c, file.Data.URL, ft.RangeHeader(first, last), up.Data[first:last+1])
+	}); err != nil {
+		return err
+	}
+	if err := r.step("download-resume", func(ctx context.Context) (map[string]int64, error) {
+		// rcsjta resumes a download with bytes=<received>-<total>, one past
+		// the last byte (HttpDownloadManager); RFC 9110 §14.1.2 has the
+		// server read that as the rest of the file.
+		received := int64(len(up.Data) / 2)
+		return rangeDownload(ctx, c, file.Data.URL, "bytes="+strconv.FormatInt(received, 10)+"-"+strconv.Itoa(len(up.Data)), up.Data[received:])
 	}); err != nil {
 		return err
 	}
 	return r.step("download-thumbnail", func(ctx context.Context) (map[string]int64, error) {
 		thumb, _ := doc.Info("thumbnail")
-		got, err := c.Download(ctx, thumb.Data.URL, ft.Range{}, int64(len(up.Thumbnail)))
+		got, err := c.Download(ctx, thumb.Data.URL, "", int64(len(up.Thumbnail)))
 		if err != nil {
 			return nil, err
 		}
@@ -134,9 +138,25 @@ func fileTransfer(r *run) error {
 	})
 }
 
+// rangeDownload fetches link with a Range header and checks that the server
+// answers 206 with want.
+func rangeDownload(ctx context.Context, c *ft.Client, link, rangeHeader string, want []byte) (map[string]int64, error) {
+	got, err := c.Download(ctx, link, rangeHeader, int64(len(want)))
+	if err != nil {
+		return nil, err
+	}
+	if got.Status != http.StatusPartialContent {
+		return nil, fmt.Errorf("range download answered %d, want 206", got.Status)
+	}
+	return map[string]int64{"bytes": int64(len(got.Body))}, sameContent(got.Body, want)
+}
+
 // fileTransferResumed breaks an upload part-way, as a phone changing
 // networks does, and resumes it the way rcsjta does: get_upload_info, a PUT
-// of the rest with Content-Range, get_download_info, then the download.
+// of the rest with Content-Range, get_download_info, then the download. As
+// in rcsjta, a get_upload_info that holds nothing makes the upload start
+// again ("upload-again" instead of "resume"), and a PUT answered other than
+// 200 fails the transfer.
 func fileTransferResumed(r *run) error {
 	c := r.cfg.FT
 	var (
@@ -168,60 +188,57 @@ func fileTransferResumed(r *run) error {
 	}); err != nil {
 		return err
 	}
+	held := int64(0)
 	if err := r.step("get_upload_info", func(ctx context.Context) (map[string]int64, error) {
-		// The server stores what arrived only once it notices the break,
-		// which can be just after the simulator asks; a 404 is therefore
-		// asked again for a moment before it counts.
-		settle := time.Now().Add(uploadSettle)
-		var err error
-		for {
-			info, err = c.UploadInfo(ctx, up.TID)
-			if !errors.Is(err, ft.ErrNothingHeld) || time.Now().After(settle) {
-				break
-			}
-			select {
-			case <-time.After(50 * time.Millisecond):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+		var (
+			retries, notHeld int64
+			err              error
+		)
+		info, retries, notHeld, err = settledUploadInfo(ctx, c, up.TID)
+		detail := map[string]int64{"retries": retries, "not_held": notHeld}
+		switch {
+		case errors.Is(err, ft.ErrNothingHeld):
+			// rcsjta uploads the file again from the start; so does the
+			// next step.
+			detail["held"] = 0
+			return detail, nil
+		case err != nil:
+			return detail, err
 		}
-		if errors.Is(err, ft.ErrNothingHeld) {
-			return nil, errors.New("the server holds nothing; the file must be larger than FT_PART_SIZE")
-		}
-		if err != nil {
-			return nil, err
-		}
-		held, _ := info.Held()
+		held, _ = info.Held()
+		detail["held"] = held
 		if held >= int64(len(up.Data)) {
-			return nil, errors.New("the server holds the whole file of a broken upload")
+			return detail, errors.New("the server holds the whole file of a broken upload")
 		}
-		return map[string]int64{"held": held}, nil
+		return detail, nil
 	}); err != nil {
 		return err
 	}
-	if err := r.step("resume", func(ctx context.Context) (map[string]int64, error) {
+	if held == 0 {
+		if err := r.step("upload-again", func(ctx context.Context) (map[string]int64, error) {
+			// rcsjta's uploadFile, from its empty POST on.
+			if err := c.Precheck(ctx); err != nil {
+				return nil, err
+			}
+			var err error
+			if doc, err = c.Send(ctx, up); err != nil {
+				return nil, err
+			}
+			return map[string]int64{"bytes": int64(len(up.Data))}, checkDocument(doc, up)
+		}); err != nil {
+			return err
+		}
+	} else if err := r.step("resume", func(ctx context.Context) (map[string]int64, error) {
 		var err error
-		for attempt := 1; ; attempt++ {
-			doc, err = c.Resume(ctx, info, up.ContentType, up.Data)
-			if !ft.IsStatus(err, http.StatusConflict) || attempt == maxResumeAttempts {
-				break
-			}
-			// The server stored more of the broken upload after it
-			// answered get_upload_info, being still busy with the break;
-			// ask again, as rcsjta does on 409.
-			select {
-			case <-time.After(50 * time.Millisecond):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-			if info, err = c.UploadInfo(ctx, up.TID); err != nil {
-				break
-			}
+		doc, err = c.Resume(ctx, info, up.ContentType, up.Data)
+		if ft.IsStatus(err, http.StatusConflict) || ft.IsStatus(err, http.StatusServiceUnavailable) {
+			// The simulator does not retry: rcsjta ends the transfer on
+			// any answer to the PUT but 200.
+			return nil, fmt.Errorf("%w; rcsjta fails the transfer on this", err)
 		}
 		if err != nil {
 			return nil, err
 		}
-		held, _ := info.Held()
 		return map[string]int64{"bytes": int64(len(up.Data)) - held}, checkDocument(doc, up)
 	}); err != nil {
 		return err
@@ -237,7 +254,7 @@ func fileTransferResumed(r *run) error {
 	}
 	return r.step("download", func(ctx context.Context) (map[string]int64, error) {
 		file, _ := doc.Info("file")
-		got, err := c.Download(ctx, file.Data.URL, ft.Range{}, int64(len(up.Data)))
+		got, err := c.Download(ctx, file.Data.URL, "", int64(len(up.Data)))
 		if err != nil {
 			return nil, err
 		}
@@ -246,6 +263,42 @@ func fileTransferResumed(r *run) error {
 		}
 		return map[string]int64{"bytes": int64(len(got.Body))}, sameContent(got.Body, up.Data)
 	})
+}
+
+// settledUploadInfo asks get_upload_info until the server has noticed the
+// break and stored what it will keep: until two answers in a row name the
+// same bytes held. A 404 is asked again until uploadSettle has passed, and
+// then returned as ft.ErrNothingHeld. retries counts the answers asked again
+// for, notHeld the 404s among them; the scenario reports both, so a server
+// that is slow to keep a broken upload shows in the results.
+func settledUploadInfo(ctx context.Context, c *ft.Client, tid string) (info ft.ResumeDocument, retries, notHeld int64, err error) {
+	deadline := time.Now().Add(uploadSettle)
+	last := int64(-1)
+	for {
+		info, err = c.UploadInfo(ctx, tid)
+		held := int64(-1)
+		switch {
+		case errors.Is(err, ft.ErrNothingHeld):
+			notHeld++
+		case err != nil:
+			return info, retries, notHeld, err
+		default:
+			held, _ = info.Held()
+			if held == last {
+				return info, retries, notHeld, nil
+			}
+		}
+		last = held
+		if time.Now().After(deadline) {
+			return info, retries, notHeld, err
+		}
+		select {
+		case <-time.After(settlePoll):
+		case <-ctx.Done():
+			return info, retries, notHeld, ctx.Err()
+		}
+		retries++
+	}
 }
 
 // checkDocument checks a file-info document against what was uploaded.

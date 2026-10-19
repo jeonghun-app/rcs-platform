@@ -14,7 +14,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +25,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 )
 
 // queueLength bounds each channel an Endpoint delivers on; a scenario reads
@@ -171,9 +171,15 @@ func (e *Endpoint) HandleReport(_ *msrp.Session, r msrp.Report) {
 // Wait waits for the notifications the handler is still sending.
 func (e *Endpoint) Wait() { e.pending.Wait() }
 
+// Sent names a message Send sent: its IMDN Message-ID, which notifications
+// quote, and its MSRP Message-ID, which REPORTs quote.
+type Sent struct {
+	IMDN, MSRP string
+}
+
 // Send sends text to to on s as a CPIM message asking for the
-// notifications in d (none when zero), and returns its IMDN Message-ID.
-func (e *Endpoint) Send(ctx context.Context, s *msrp.Session, to cpim.Address, contentType string, text []byte, d imdn.Disposition) (string, error) {
+// notifications in d (none when zero).
+func (e *Endpoint) Send(ctx context.Context, s *msrp.Session, to cpim.Address, contentType string, text []byte, d imdn.Disposition) (Sent, error) {
 	m := &cpim.Message{}
 	var err error
 	add := func(name, value string) {
@@ -185,27 +191,28 @@ func (e *Endpoint) Send(ctx context.Context, s *msrp.Session, to cpim.Address, c
 	add(cpim.HeaderTo, to.String())
 	add(cpim.HeaderDateTime, cpim.FormatDateTime(e.now()))
 	if err != nil {
-		return "", err
+		return Sent{}, err
 	}
 	id, err := imdn.NewMessageID(e.random())
 	if err != nil {
-		return "", err
+		return Sent{}, err
 	}
 	if d != 0 {
 		if err := imdn.AddRequest(m, id, d); err != nil {
-			return "", err
+			return Sent{}, err
 		}
 	}
 	m.ContentHeaders = []cpim.Field{{Name: "Content-Type", Value: contentType}}
 	m.Body = text
 	body, err := m.Marshal()
 	if err != nil {
-		return "", err
+		return Sent{}, err
 	}
-	if _, err := s.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, SuccessReport: true}); err != nil {
-		return "", fmt.Errorf("chat: send: %w", err)
+	msrpID, err := s.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, SuccessReport: true})
+	if err != nil {
+		return Sent{}, fmt.Errorf("chat: send: %w", safeerr.Reason(err))
 	}
-	return id, nil
+	return Sent{IMDN: id, MSRP: msrpID}, nil
 }
 
 // Display sends the display notification r asked for, as a user reading the
@@ -271,20 +278,23 @@ func Dial(ctx context.Context, relayPath, local msrp.URI, h msrp.Handler, cfg ms
 	var d net.Dialer
 	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("chat: connecting to the relay: %w", dialError(err))
+		return nil, fmt.Errorf("chat: connecting to the relay: %w", safeerr.Reason(err))
 	}
 	if wrap != nil {
 		nc = wrap(nc)
 	}
 	if relayPath.Secure {
-		tc := &tls.Config{ServerName: relayPath.Host, MinVersion: tls.VersionTLS12}
+		tc := &tls.Config{MinVersion: tls.VersionTLS12}
 		if tlsConfig != nil {
 			tc = tlsConfig.Clone()
+		}
+		if tc.ServerName == "" {
+			tc.ServerName = relayPath.Host
 		}
 		conn := tls.Client(nc, tc)
 		if err := conn.HandshakeContext(ctx); err != nil {
 			_ = nc.Close()
-			return nil, fmt.Errorf("chat: TLS to the relay: %w", err)
+			return nil, fmt.Errorf("chat: TLS to the relay: %w", safeerr.Reason(err))
 		}
 		nc = conn
 	}
@@ -300,7 +310,7 @@ func Dial(ctx context.Context, relayPath, local msrp.URI, h msrp.Handler, cfg ms
 	}
 	if err := c.Open(ctx, s); err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("chat: binding the session: %w", err)
+		return nil, fmt.Errorf("chat: binding the session: %w", safeerr.Reason(err))
 	}
 	return &Client{Conn: c, Session: s}, nil
 }
@@ -309,15 +319,6 @@ func Dial(ctx context.Context, relayPath, local msrp.URI, h msrp.Handler, cfg ms
 func (c *Client) Close() error {
 	_ = c.Session.Close()
 	return c.Conn.Close()
-}
-
-// dialError keeps the cause of a dial failure without the address.
-func dialError(err error) error {
-	var op *net.OpError
-	if errors.As(err, &op) && op.Err != nil {
-		return op.Err
-	}
-	return err
 }
 
 // Core stands in for rcs-as: a passive MSRP listener the relay connects to,

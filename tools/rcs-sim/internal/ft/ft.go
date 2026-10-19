@@ -3,20 +3,32 @@
 // ft-server exercise what deployed devices actually send rather than what
 // the server's own tests assume.
 //
-// Like rcsjta (HttpAuthenticationAgent, HttpUploadManager), the client:
+// Like rcsjta (HttpAuthenticationAgent, HttpDigestMd5Authentication,
+// HttpUploadManager), the client:
 //
-//   - starts with an empty POST and reads the challenge of the 401;
+//   - starts an upload with an empty POST and reads the challenge of the
+//     401;
 //   - answers the last WWW-Authenticate field only, as MD5 without an
-//     algorithm parameter, with qop quoted;
-//   - signs only the path of the URL for get_upload_info and
-//     get_download_info (RFC 7616 §3.4.6 allows that absolute-path);
+//     algorithm parameter, with qop quoted, counting nc from 1 for each new
+//     nonce;
+//   - sends get_upload_info and get_download_info without credentials
+//     first, takes the fresh nonce of their 401, and signs the repeated GET
+//     for the path of the URL only (RFC 7616 §3.4.6 allows that
+//     absolute-path);
 //   - sends the form as tid, then Thumbnail, then File, each part with its
 //     own Content-Length;
 //   - resumes a broken upload with get_upload_info and a PUT with
 //     Content-Range from the first byte the server does not hold.
 //
-// Nothing here logs. Errors name the operation and the HTTP status, never the
-// user name, the password or a URL, because download URLs are capabilities.
+// Like rcsjta it retries nothing: a second 401, a PUT answered other than
+// 200, or a 503 is a failure the caller sees. (rcsjta restarts the upload
+// from the beginning when get_upload_info answers anything but 200; this
+// client reports that as ErrNothingHeld and leaves the restart to the
+// caller.)
+//
+// Nothing here logs. Errors name the operation and the HTTP status or a
+// fixed network reason (safeerr), never the user name, the password, a URL
+// or an address: download URLs are capabilities.
 package ft
 
 import (
@@ -29,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -36,9 +49,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 )
 
 // ContentType is the media type of the file-info and upload-info documents.
@@ -99,7 +112,7 @@ func (c *Client) Precheck(ctx context.Context) error {
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("ft: pre-check: %w", transport(err))
+		return fmt.Errorf("ft: pre-check: %w", safeerr.Reason(err))
 	}
 	drain(resp)
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -158,67 +171,59 @@ func (c *Client) random() io.Reader {
 	return rand.Reader
 }
 
-// maxBusyRetries bounds how often a 503 is retried. ft-server answers 503
-// with Retry-After while another request holds the upload's lease, which is
-// what a client sees right after its own broken upload, before the server
-// has noticed the break; RCS clients retry it (docs/ft-server.md).
-const maxBusyRetries = 10
-
-// maxRetryAfter caps the wait a Retry-After asks for.
-const maxRetryAfter = 5 * time.Second
-
-// do sends a signed request built by build, signing uri. A 401 renews the
-// challenge (a stale or expired nonce) and the request is sent once more,
-// as rcsjta does; a 503 is retried after its Retry-After.
+// do sends one request built by build, signed for uri under the current
+// challenge.
 func (c *Client) do(ctx context.Context, op, uri string, build func() (*http.Request, error)) (*http.Response, error) {
-	renewed, busy := false, 0
-	for {
-		req, err := build()
-		if err != nil {
-			return nil, err
-		}
-		req = req.WithContext(ctx)
-		if err := c.authorize(req, uri); err != nil {
-			return nil, err
-		}
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("ft: %s: %w", op, transport(err))
-		}
-		switch {
-		case resp.StatusCode == http.StatusUnauthorized && !renewed:
-			renewed = true
-			drain(resp)
-			if err := c.readChallenge(resp.Header); err != nil {
-				return nil, err
-			}
-		case resp.StatusCode == http.StatusServiceUnavailable && busy < maxBusyRetries:
-			busy++
-			wait := retryAfter(resp.Header.Get("Retry-After"))
-			drain(resp)
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return nil, fmt.Errorf("ft: %s: %w", op, ctx.Err())
-			}
-		default:
-			return resp, nil
-		}
+	req, err := build()
+	if err != nil {
+		return nil, err
 	}
+	req = req.WithContext(ctx)
+	if err := c.authorize(req, uri); err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	switch {
+	case errors.Is(err, errCut):
+		// The break SendInterrupted made on purpose, not a network failure.
+		return nil, fmt.Errorf("ft: %s: %w", op, errCut)
+	case err != nil:
+		return nil, fmt.Errorf("ft: %s: %w", op, safeerr.Reason(err))
+	}
+	return resp, nil
 }
 
-// retryAfter reads a delay-seconds Retry-After (RFC 9110 §10.2.3), capped;
-// anything else means a short pause.
-func retryAfter(v string) time.Duration {
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		return 200 * time.Millisecond
+// getInfo is rcsjta's sendGetInfo: target without credentials first; a 401
+// brings the challenge, and the GET is repeated signed for the path. An
+// answer other than 401 to the first GET is returned as it is.
+func (c *Client) getInfo(ctx context.Context, op, target string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
 	}
-	// Compared before multiplying: a large value would overflow.
-	if n >= int(maxRetryAfter/time.Second) {
-		return maxRetryAfter
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ft: %s: %w", op, safeerr.Reason(err))
 	}
-	return time.Duration(n) * time.Second
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	drain(resp)
+	if err := c.readChallenge(resp.Header); err != nil {
+		return nil, err
+	}
+	resp, err = c.do(ctx, op, c.UploadURL.Path, func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, target, nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		// rcsjta: "got 401 for the second time. Authentication rejected."
+		drain(resp)
+		return nil, &StatusError{Op: op, Status: resp.StatusCode}
+	}
+	return resp, nil
 }
 
 // Upload is one file to send.
@@ -323,27 +328,18 @@ func (c *Client) SendInterrupted(ctx context.Context, u Upload, cut int) error {
 	if !errors.Is(err, errCut) {
 		return err
 	}
-	// The transport gives up as soon as the body breaks, possibly before
-	// the server has even read the request's headers. A next request under
-	// the same nonce with a higher nonce-count could then be verified
-	// first, and the broken one refused as a replay (RFC 7616 §3.4.1)
-	// before it stored anything. A fresh challenge, as rcsjta starts every
-	// upload attempt with, takes the two out of one count sequence.
-	return c.Precheck(ctx)
+	return nil
 }
 
 type failing struct{}
 
 func (failing) Read([]byte) (int, error) { return 0, errCut }
 
-// UploadInfo asks what the server holds of tid (get_upload_info), signing
-// only the path. ErrNothingHeld means no byte is held and the client posts
-// again.
+// UploadInfo asks what the server holds of tid (get_upload_info) the way
+// rcsjta does (getInfo). ErrNothingHeld is a 404: no byte is held, and
+// rcsjta would upload the file again from the start.
 func (c *Client) UploadInfo(ctx context.Context, tid string) (ResumeDocument, error) {
-	target := c.infoURL(tid, "get_upload_info")
-	resp, err := c.do(ctx, "get_upload_info", c.UploadURL.Path, func() (*http.Request, error) {
-		return http.NewRequest(http.MethodGet, target, nil)
-	})
+	resp, err := c.getInfo(ctx, "get_upload_info", c.infoURL(tid, "get_upload_info"))
 	if err != nil {
 		return ResumeDocument{}, err
 	}
@@ -398,12 +394,9 @@ func (c *Client) Resume(ctx context.Context, d ResumeDocument, contentType strin
 }
 
 // DownloadInfo fetches the file-info document of a completed upload
-// (get_download_info), signing only the path.
+// (get_download_info) the way rcsjta does (getInfo).
 func (c *Client) DownloadInfo(ctx context.Context, tid string) (FileDocument, error) {
-	target := c.infoURL(tid, "get_download_info")
-	resp, err := c.do(ctx, "get_download_info", c.UploadURL.Path, func() (*http.Request, error) {
-		return http.NewRequest(http.MethodGet, target, nil)
-	})
+	resp, err := c.getInfo(ctx, "get_download_info", c.infoURL(tid, "get_download_info"))
 	if err != nil {
 		return FileDocument{}, err
 	}
@@ -416,9 +409,11 @@ func (c *Client) infoURL(tid, which string) string {
 	return u.String()
 }
 
-// Range is an inclusive byte range for Download; the zero value asks for
-// the whole file.
-type Range struct{ First, Last int64 }
+// RangeHeader returns a Range header value for the inclusive range
+// first-last.
+func RangeHeader(first, last int64) string {
+	return "bytes=" + strconv.FormatInt(first, 10) + "-" + strconv.FormatInt(last, 10)
+}
 
 // Downloaded is what a download returned.
 type Downloaded struct {
@@ -428,20 +423,21 @@ type Downloaded struct {
 	ETag string
 }
 
-// Download fetches link, which a recipient takes from a file-info document;
-// with r set it asks for that range alone. Downloads carry no credentials,
-// as recipients' clients send none (ft-server's default).
-func (c *Client) Download(ctx context.Context, link string, r Range, max int64) (Downloaded, error) {
+// Download fetches link, which a recipient takes from a file-info document,
+// sending rangeHeader as the Range header when it is not empty. Downloads
+// carry no credentials, as recipients' clients send none (ft-server's
+// default).
+func (c *Client) Download(ctx context.Context, link, rangeHeader string, max int64) (Downloaded, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 	if err != nil {
 		return Downloaded{}, errors.New("ft: unusable download URL")
 	}
-	if r != (Range{}) {
-		req.Header.Set("Range", "bytes="+strconv.FormatInt(r.First, 10)+"-"+strconv.FormatInt(r.Last, 10))
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return Downloaded{}, fmt.Errorf("ft: download: %w", transport(err))
+		return Downloaded{}, fmt.Errorf("ft: download: %w", safeerr.Reason(err))
 	}
 	defer drain(resp)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
@@ -449,7 +445,7 @@ func (c *Client) Download(ctx context.Context, link string, r Range, max int64) 
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return Downloaded{}, fmt.Errorf("ft: download: %w", transport(err))
+		return Downloaded{}, fmt.Errorf("ft: download: %w", safeerr.Reason(err))
 	}
 	if int64(len(body)) > max {
 		return Downloaded{}, errors.New("ft: download larger than expected")
@@ -505,10 +501,11 @@ type ResumeDocument struct {
 }
 
 // Held returns how many leading bytes the server holds. The document always
-// starts at byte 0 (ft-server keeps only whole leading parts).
+// starts at byte 0 (ft-server keeps only whole leading parts). An end at the
+// largest int64 is refused rather than overflowing into a negative count.
 func (d ResumeDocument) Held() (int64, error) {
 	end, err := strconv.ParseInt(d.Range.End, 10, 64)
-	if d.Range.Start != "0" || err != nil || end < 0 {
+	if d.Range.Start != "0" || err != nil || end < 0 || end == math.MaxInt64 {
 		return 0, errors.New("ft: upload-info range is not 0-<end>")
 	}
 	return end + 1, nil
@@ -538,7 +535,7 @@ func readFileDocument(resp *http.Response, op string) (FileDocument, error) {
 func decode(r io.Reader, v any) error {
 	data, err := io.ReadAll(io.LimitReader(r, maxDocument+1))
 	if err != nil {
-		return transport(err)
+		return safeerr.Reason(err)
 	}
 	if len(data) > maxDocument {
 		return errors.New("document too large")
@@ -555,14 +552,4 @@ func decode(r io.Reader, v any) error {
 func drain(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	_ = resp.Body.Close()
-}
-
-// transport strips a *url.Error down to its cause: the URL in it may be a
-// download capability.
-func transport(err error) error {
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		return ue.Err
-	}
-	return err
 }

@@ -90,12 +90,12 @@ func TestMessagesAreCPIMWithTheirIMDNRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := received(t, core)
-	if string(got.Body) != "hi" || got.From.URI != alice.URI || got.ContentType != "text/plain" || got.Request.MessageID != id ||
+	if string(got.Body) != "hi" || got.From.URI != alice.URI || got.ContentType != "text/plain" || got.Request.MessageID != id.IMDN ||
 		!got.Request.Dispositions.Wants(imdn.DisplayNotification, imdn.Displayed) {
 		t.Fatalf("received %+v", got)
 	}
 	// The recipient confirms delivery at once and display only when told.
-	if n := notification(t, client); n.MessageID != id || n.Status != imdn.Delivered || n.RecipientURI != bob.URI {
+	if n := notification(t, client); n.MessageID != id.IMDN || n.Status != imdn.Delivered || n.RecipientURI != bob.URI {
 		t.Fatalf("notification %+v", n)
 	}
 	select {
@@ -117,7 +117,7 @@ func TestDisplayIsSentWhenTheUserReads(t *testing.T) {
 	if err := core.Display(ctx(t), ss, received(t, core)); err != nil {
 		t.Fatal(err)
 	}
-	if n := notification(t, client); n.MessageID != id || n.Status != imdn.Displayed {
+	if n := notification(t, client); n.MessageID != id.IMDN || n.Status != imdn.Displayed {
 		t.Fatalf("notification %+v", n)
 	}
 	core.Wait()
@@ -133,7 +133,7 @@ func TestAutoDisplayAnswersBothRequestsAndNothingUnasked(t *testing.T) {
 	statuses := map[imdn.Status]bool{}
 	for range 2 {
 		n := notification(t, client)
-		if n.MessageID != id {
+		if n.MessageID != id.IMDN {
 			t.Fatal("notification for another message")
 		}
 		statuses[n.Status] = true

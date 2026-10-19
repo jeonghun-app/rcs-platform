@@ -34,7 +34,8 @@ type Config struct {
 	FT *ft.Client
 	// FileSize is the size of the file the ft scenario sends, and
 	// ResumeSize that of ft-resume, which must exceed ft-server's part size
-	// (FT_PART_SIZE): only whole parts survive a broken upload.
+	// (FT_PART_SIZE): only whole parts survive a broken upload, and with
+	// nothing held the scenario uploads again rather than resuming.
 	FileSize, ResumeSize int
 
 	// Control plays pcscf toward msrp-relay; nil fails the chat scenarios.
@@ -158,7 +159,7 @@ func (r *run) step(name string, f func(ctx context.Context) (map[string]int64, e
 	return nil
 }
 
-// defer registers f to run when the scenario ends, last first.
+// onEnd registers f to run when the scenario ends, last first.
 func (r *run) onEnd(f func()) { r.cleanups = append(r.cleanups, f) }
 
 func (r *run) cleanup() {
