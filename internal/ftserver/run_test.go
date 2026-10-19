@@ -168,6 +168,13 @@ func TestSweepRunsOnEveryTickAndReportsFailures(t *testing.T) {
 	}
 }
 
+// inCI reports whether the tests run in CI, where make passes the CI
+// variable into the toolchain container. "false" and "0" mean not.
+func inCI() bool {
+	v := os.Getenv("CI")
+	return v != "" && v != "false" && v != "0"
+}
+
 // privateIPv4 returns an RFC 1918 address of this host, such as a
 // container's eth0. Without one the test is skipped, except in CI (the CI
 // variable, which make passes into the toolchain container), where a skip
@@ -175,7 +182,7 @@ func TestSweepRunsOnEveryTickAndReportsFailures(t *testing.T) {
 func privateIPv4(t *testing.T) netip.Addr {
 	t.Helper()
 	skip := t.Skipf
-	if os.Getenv("CI") != "" {
+	if inCI() {
 		skip = t.Fatalf
 	}
 	addrs, err := net.InterfaceAddrs()
@@ -286,15 +293,26 @@ func TestRunInStagingReachesTheHSSOnlyAtAPrivateAddress(t *testing.T) {
 // The production wiring gives the dialer FT_HSS_TIMEOUT: http.Client's
 // Timeout answers the caller in time, but the transport dials with a
 // context the request's end does not cancel, so without it a dial to an
-// address that never answers (10.255.255.1 is not routed here or in CI)
-// would hold a connection slot long after (#119; QA's test from the review
-// of #116).
+// address that never answers would hold a connection slot long after
+// (#119; QA's test from the reviews of #116 and #123). 10.255.255.1 hangs
+// on this host and CI runners. Where it is refused at once instead, the
+// test cannot see the dial timeout, and says so: it skips, or in CI fails.
+// The deadline counts from the start of the lookup, so a dialer given a
+// longer timeout than FT_HSS_TIMEOUT (DefaultHSSTimeout, say) fails too.
 func TestTheProductionHSSDialEndsWithinTheHSSTimeout(t *testing.T) {
 	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL("http://10.255.255.1:8081"), HSSTimeout: 300 * time.Millisecond, MaxLookups: 1, Realm: realm}
 	src := credentialSource(cfg, true).(*HSSCredentials)
 	start := time.Now()
-	_, _ = src.Lookup(t.Context(), alice, digest.SHA256)
-	deadline := time.Now().Add(2 * time.Second)
+	_, err := src.Lookup(t.Context(), alice, digest.SHA256)
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		msg := "10.255.255.1 did not hang here (%v), so this test cannot see the dial timeout"
+		if inCI() {
+			t.Fatalf(msg, err)
+		}
+		t.Skipf(msg, err)
+	}
+	deadline := start.Add(cfg.HSSTimeout + time.Second)
 	for {
 		buf := make([]byte, 1<<20)
 		if !strings.Contains(string(buf[:goruntime.Stack(buf, true)]), "InternalDialer.DialContext") {
