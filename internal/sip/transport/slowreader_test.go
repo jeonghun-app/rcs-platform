@@ -102,17 +102,29 @@ func steadyReaderRun(t *testing.T, writeTimeout time.Duration) (read int, pause 
 		pause time.Duration
 	}
 	got := make(chan result, 1)
+	// lastRead is when the peer last took bytes, for the wait below.
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	// last, from which the pause before a cut is counted, is never later
+	// than the moment the writer set the deadline that cut it: first the
+	// start, before anything is sent, then the call of each Read that took
+	// a chunk. The peer's buffer is writeChunk, so one Read takes a whole
+	// Write, and net.Pipe does not let the Write return, and the writer set
+	// the next chunk's deadline, before that Read has taken it.
+	start := time.Now()
 	go func() {
 		buf := make([]byte, writeChunk)
-		total, last := 0, time.Now()
+		total, last := 0, start
 		for {
+			before := time.Now()
 			n, err := peer.Read(buf)
 			total += n
 			if err != nil {
 				got <- result{total, time.Since(last)}
 				return
 			}
-			last = time.Now()
+			last = before
+			lastRead.Store(time.Now().UnixNano())
 			if total >= 512<<10 {
 				got <- result{total, 0}
 				return
@@ -125,16 +137,23 @@ func steadyReaderRun(t *testing.T, writeTimeout time.Duration) (read int, pause 
 	if _, err := tr.SendRequest(req, pipeDst); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case r := <-got:
-		if r.n >= 512<<10 {
-			if s := tr.Stats(); s.WriteErrors != 0 || s.OpenOutbound != 1 {
-				t.Fatalf("stats = %+v", s)
+	// The peer ends either way, by reading everything or by being cut off,
+	// so the wait is on progress, not on the whole message: a loaded host
+	// can take longer than any fixed bound to drain it (#155). Only a writer
+	// that neither writes nor gives up keeps the peer waiting.
+	for {
+		select {
+		case r := <-got:
+			if r.n >= 512<<10 {
+				if s := tr.Stats(); s.WriteErrors != 0 || s.OpenOutbound != 1 {
+					t.Fatalf("stats = %+v", s)
+				}
+			}
+			return r.n, r.pause
+		case <-time.After(100 * time.Millisecond):
+			if time.Since(time.Unix(0, lastRead.Load())) > waitFor+writeTimeout {
+				t.Fatal("the writer neither wrote nor gave up")
 			}
 		}
-		return r.n, r.pause
-	case <-time.After(waitFor):
-		t.Fatal("the message never arrived")
 	}
-	return 0, 0
 }
