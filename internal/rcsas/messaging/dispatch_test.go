@@ -434,7 +434,12 @@ func TestServeWaitsOutAFailedAccept(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	served := make(chan error, 1)
 	go func() { served <- r.e.Serve(ctx, fl) }()
-	waitFor(t, "the failed accept", func() bool { return r.m.get("msrp.accept_failed") == 1 })
+	// Serve counts the failure before it sets its retry timer (the first
+	// pause, 5 ms), so the count alone does not say the timer is there yet.
+	waitFor(t, "the retry timer", func() bool { return r.clock.armed(5 * time.Millisecond) })
+	if n := r.m.get("msrp.accept_failed"); n != 1 {
+		t.Fatalf("msrp.accept_failed = %d, want 1", n)
+	}
 	r.clock.Advance(time.Second)
 	leg, c := r.connect(t, fl, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Chat})
 	_ = leg

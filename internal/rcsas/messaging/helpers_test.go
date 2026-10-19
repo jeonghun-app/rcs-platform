@@ -75,6 +75,21 @@ func (t *fakeTimer) Stop() bool {
 	return active
 }
 
+// armed reports whether a live timer is due d from now: one set by
+// AfterFunc(d, …) since the clock last moved. A test that advances the clock
+// to fire a timer must first see it armed; advancing earlier moves the clock
+// past a timer that does not exist yet, which then never fires (#143).
+func (c *fakeClock) armed(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.timers {
+		if !t.inactive && t.when.Sub(c.now) == d {
+			return true
+		}
+	}
+	return false
+}
+
 // Advance moves the clock and runs every timer that has come due.
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
@@ -430,7 +445,11 @@ func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := conn.Open(context.Background(), c.session); err != nil {
+	// Bounded, so a rig that never accepts fails here rather than at go
+	// test's timeout (#143).
+	ctx, cancel := context.WithTimeout(context.Background(), hangGuard)
+	defer cancel()
+	if err := conn.Open(ctx, c.session); err != nil {
 		t.Fatal(err)
 	}
 	return c
