@@ -319,7 +319,10 @@ func newEnv(t *testing.T, mutate func(*Config)) *env {
 		HSS: hssName, Resolver: e.dns,
 		// The loop resolves once at start; the tests call Refresh.
 		ResolveInterval: time.Hour,
-		RequestTimeout:  2 * time.Second,
+		// An attempt may take as long as any wait here: a test that is
+		// about the attempt timeout sets its own. A fixed 2 s timed out
+		// a healthy answer on a loaded host (#177).
+		RequestTimeout: realWait,
 		Node: diameter.Config{
 			Dial: e.net.dial, ReconnectMin: 10 * time.Millisecond, ReconnectMax: 50 * time.Millisecond,
 			HostIPAddresses: []netip.Addr{netip.MustParseAddr("192.0.2.100")},

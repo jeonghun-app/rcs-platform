@@ -259,7 +259,8 @@ func TestATaskShuttingDownIsRetriedOnAnother(t *testing.T) {
 }
 
 func TestALostTaskIsFailedOverAndDroppedFromTheRotation(t *testing.T) {
-	e := newEnv(t, nil)
+	// The hung task's requests fail over when RequestTimeout runs out.
+	e := newEnv(t, func(c *Config) { c.RequestTimeout = 2 * time.Second })
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
 	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
 	e.refresh("192.0.2.1", "192.0.2.2")
