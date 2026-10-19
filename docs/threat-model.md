@@ -175,7 +175,7 @@ metadata.
     can lock the others out, whether it writes 1-to-1 or in groups; 1-to-1
     notifications are bounded by the sent records and by being accepted once
     instead, group notifications by one share per group and a quarter of the
-    queue for all groups together (T11);
+    queue for all groups together, and their summaries by an eighth (T11);
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
@@ -253,8 +253,11 @@ metadata.
     against its author's share, the one its 1-to-1 messages use; each
     group's notifications hold one share, and all groups' together a quarter
     of the queue; beyond that they are summarized as one queue item per
-    message, sent from the marks of notifications already accepted, so the
-    summary adds nothing a participant did not report;
+    message, at most an eighth of the queue in all, sent from the marks of
+    notifications already accepted, so the summary adds nothing a participant
+    did not report. A participant who sends receipts for many of the author's
+    messages fills at most that eighth, and the author's 1-to-1 messages keep
+    the rest;
   - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
     be SIP or tel URIs, compared in canonical form, and names XML-safe text,
     so that one bad value cannot make the stored roster unwritable;
