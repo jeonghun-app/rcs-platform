@@ -124,6 +124,31 @@ type branch struct {
 	timeoutTimer transaction.Timer
 	// timedOut records that Target.Timeout ended the branch.
 	timedOut bool
+	// dialogs holds the To tags of the 2xx the branch has passed upstream:
+	// a 2xx with a new one starts a dialog (from the UAS, or a fork further
+	// down), a 2xx with a known one is a retransmission.
+	dialogs map[string]bool
+}
+
+// maxDialogsPerBranch bounds the 2xx dialogs one branch keeps apart; past it a
+// 2xx counts as a retransmission, which the UAS sends again until its ACK.
+const maxDialogsPerBranch = 16
+
+// newDialog records the dialog of a 2xx on b and reports whether it is new.
+// mu must be held.
+func (b *branch) newDialog(res *sip.Response) bool {
+	to, err := res.Header.To()
+	if err != nil {
+		return false
+	}
+	if b.dialogs[to.Tag()] || len(b.dialogs) >= maxDialogsPerBranch {
+		return false
+	}
+	if b.dialogs == nil {
+		b.dialogs = map[string]bool{}
+	}
+	b.dialogs[to.Tag()] = true
+	return true
 }
 
 func newRespContext(p *Proxy, tx *transaction.ServerTransaction, cost, header int64) *respContext {
@@ -611,13 +636,21 @@ func (b *branch) received(res *sip.Response) []func() {
 		res, code = made.res, 502
 	}
 	if b.final {
-		// After the branch's final response only 2xx retransmissions and 2xx
-		// from further forks downstream reach here, and every 2xx to an INVITE
-		// is forwarded (§16.7 step 5).
-		if c.invite && code >= 200 && code < 300 {
+		// After the branch ended only 2xx reach here: retransmissions, a 2xx
+		// from a fork further down, or the late answer of a branch its
+		// Target.Timeout ended. Every 2xx to an INVITE is forwarded (§16.7
+		// step 5); one that starts a dialog is a 2xx like the first, which
+		// cancels the branches still pending (§16.7 step 10) and is never
+		// dropped, while a retransmission may be.
+		if !c.invite || code < 200 || code >= 300 {
+			return nil
+		}
+		if !b.newDialog(res) {
 			return []func(){c.forwardRetransmission(res)}
 		}
-		return nil
+		acts := []func(){c.forward(res)}
+		c.finalSent = true
+		return append(acts, c.closeBranches()...)
 	}
 	var acts []func()
 	switch {
@@ -637,6 +670,7 @@ func (b *branch) received(res *sip.Response) []func() {
 		}
 	case code < 300:
 		b.end()
+		b.newDialog(res)
 		if c.invite || !c.finalSent {
 			acts = append(acts, c.forward(res))
 		}

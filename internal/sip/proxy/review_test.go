@@ -261,6 +261,44 @@ func TestATargetTimeoutEndsARingingInviteBranchAtOnce(t *testing.T) {
 	check(t, "upstream", h.upstream(), codes(200))
 }
 
+// TestALateFirst2xxOfATimedOutBranchCancelsTheReplacement: the AS answers
+// after its timeout, while the replacement rings. Its 200 starts a dialog
+// like any first 2xx: it goes upstream, never dropped, and the replacement is
+// cancelled (§16.7 step 10); its retransmission goes upstream too.
+func TestALateFirst2xxOfATimedOutBranchCancelsTheReplacement(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{
+		Targets: []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: 2 * time.Second}},
+		OnBranchFailure: func(_ context.Context, f BranchFailure) []Target {
+			if errors.Is(f.Err, errTargetTimeout) {
+				return []Target{target("sip:bob@192.0.2.30")}
+			}
+			return nil
+		},
+	})
+	h.receive(invite(t))
+	as := h.one()
+	h.reply(as, 100)
+	h.advance(2 * time.Second)
+	bob := byURI(t, h.sent(), "INVITE", "sip:bob@192.0.2.30")
+	h.reply(bob, 180)
+	h.upstream()
+	h.reply(as, 200)
+	check(t, "sent after the late 200", h.sentMethods(), []string{"CANCEL sip:bob@192.0.2.30"})
+	h.reply(as, 200)
+	h.reply(bob, 487)
+	got := h.upstreamResponses()
+	var tags []string
+	for _, r := range got {
+		to, _ := r.Header.To()
+		tags = append(tags, itoa(r.StatusCode)+" "+to.Tag())
+	}
+	check(t, "upstream", tags, []string{"200 tag-192-0-2-40", "200 tag-192-0-2-40"})
+	if n := h.p.Stats().RetransmissionsDropped; n != 0 {
+		t.Errorf("RetransmissionsDropped = %d", n)
+	}
+}
+
 func TestATargetTimeoutWithoutReplacementAnswersAnInvite408(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.decide(Decision{Targets: []Target{{URI: mustURI("sip:bob@192.0.2.30"), Timeout: 5 * time.Second}}})
