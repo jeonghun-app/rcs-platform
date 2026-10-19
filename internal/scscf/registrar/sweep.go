@@ -37,6 +37,12 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		// Some bindings expired, others remain: nothing to tell the HSS.
 		return nil
 	}
+	// Read before the SAR, so that only this profile goes: a device that
+	// registers the set again meanwhile saves one of its own.
+	profile, err := g.cfg.Store.Profile(ctx, before.ProfileKey(), g.cfg.Now())
+	if err != nil && !errors.Is(err, state.ErrNotFound) {
+		return err
+	}
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
 		UserName: before.IMPI, PublicIdentities: []string{before.IMPU}, AssignmentType: cx.TimeoutDeregistration,
 	})
@@ -59,12 +65,16 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		g.count("registrar.expire_failed")
 		return errors.New("registrar: SAR TIMEOUT_DEREGISTRATION failed: " + o.String())
 	}
-	return g.dropProfileIfIdle(ctx, before)
+	if profile == nil {
+		return nil
+	}
+	return g.dropProfileIfIdle(ctx, before, profile.Received)
 }
 
-// dropProfileIfIdle deletes the profile of gone's set unless another identity
-// of the set still has bindings, as one whose save failed halfway might.
-func (g *Registrar) dropProfileIfIdle(ctx context.Context, gone *state.Registration) error {
+// dropProfileIfIdle deletes the profile of gone's set, if it is still the one
+// received at received, unless another identity of the set still has
+// bindings, as one whose save failed halfway might.
+func (g *Registrar) dropProfileIfIdle(ctx context.Context, gone *state.Registration, received time.Time) error {
 	others, err := g.cfg.Store.RegistrationsOf(ctx, gone.IMPI)
 	if err != nil {
 		return err
@@ -75,7 +85,10 @@ func (g *Registrar) dropProfileIfIdle(ctx context.Context, gone *state.Registrat
 			return nil
 		}
 	}
-	return g.cfg.Store.DeleteProfile(ctx, gone.ProfileKey())
+	if err := g.cfg.Store.DeleteProfileIf(ctx, gone.ProfileKey(), received); err != nil && !errors.Is(err, state.ErrConflict) {
+		return err
+	}
+	return nil
 }
 
 // RunSweeps sweeps every interval, as many times as it takes to find fewer

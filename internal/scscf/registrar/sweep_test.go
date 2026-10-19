@@ -170,3 +170,24 @@ func TestRunSweepsSweepsUntilItsContextEnds(t *testing.T) {
 		t.Fatal("RunSweeps did not return once cancelled")
 	}
 }
+
+func TestADeviceRegisteringDuringASweepKeepsItsProfile(t *testing.T) {
+	e := newEnv(t)
+	a := e.akaUser(impi1, impu1)
+	a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+	e.clock.advance(601 * time.Second)
+	b := device(a, 2)
+	hs := newHookStore(e.store)
+	// The sweep has sent its SAR when B registers the set again.
+	hs.onOf = func() { wantStatus(t, b.registerWith(e.instance(2), 600), 200) }
+	g := e.instance(3, func(c *Config) { c.Store = hs })
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	r := must(e.store.Registration(bg, impu1))(t)
+	if len(r.Contacts) != 1 || r.Contacts[0].CallID != "device-2" {
+		t.Errorf("impu1 holds %+v, want B's binding", r.Contacts)
+	}
+	must(e.store.Profile(bg, set1, e.clock.Now()))(t)
+}
