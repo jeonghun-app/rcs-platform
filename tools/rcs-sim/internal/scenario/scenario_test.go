@@ -290,6 +290,36 @@ func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
 	}
 }
 
+func TestTheResumeQuietTimeIsCountedOnTheClock(t *testing.T) {
+	// The same 300 ms as above, without depending on how fast a loaded host
+	// asks (#197). The clock moves 50 ms each time it is read, twice per
+	// request, and the server always holds the same bytes, so the step
+	// sends exactly 300 ms / 100 ms + 1 = 4 requests; with no quiet time
+	// it would send 2.
+	const quiet = 300 * time.Millisecond
+	cfg := stack(t)
+	var reads atomic.Int64
+	start := time.Unix(0, 0)
+	cfg.FT.Now = func() time.Time { return start.Add(time.Duration(reads.Add(1)) * 50 * time.Millisecond) }
+	var signed atomic.Int32
+	a := &answering{match: func(r *http.Request) bool {
+		if strings.Contains(r.URL.RawQuery, "get_upload_info") && r.Header.Get("Authorization") != "" {
+			signed.Add(1)
+			return true
+		}
+		return false
+	}, status: http.StatusOK, body: `<?xml version="1.0"?><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp">` +
+		`<file-range start="0" end="65535"/><data url="/ft/x"/></file-resume-info>`}
+	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+	_, results := runAll(t, cfg, "ft-resume")
+	if info := byStep(results)["get_upload_info"]; !info.OK || info.Detail["held"] != 65536 {
+		t.Fatalf("get_upload_info %+v", info)
+	}
+	if want := int32(quiet/(2*50*time.Millisecond)) + 1; signed.Load() != want {
+		t.Fatalf("%d signed get_upload_info, want %d for a %v quiet time", signed.Load(), want, quiet)
+	}
+}
+
 func TestAnUploadInfoThatWouldOverflowFailsTheStep(t *testing.T) {
 	cfg := stack(t)
 	a := &answering{match: func(r *http.Request) bool {

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -564,5 +565,35 @@ func TestResumeRefusesWhatCannotBeResumed(t *testing.T) {
 	}
 	if err := c.SendInterrupted(ctx(t), ft.Upload{TID: "x", Name: "x", ContentType: "a/b", Data: []byte("x")}, 0); err == nil {
 		t.Fatal("a cut outside the body was accepted")
+	}
+}
+
+func TestUploadInfoMeasuresItsQuietTimeAndDeadlineOnItsClock(t *testing.T) {
+	// A clock that moves an hour each time it is read: the quiet time is
+	// over at the second answer and the deadline at the next read, both
+	// whatever the real time between requests (#197).
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		mu.Unlock()
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	var reads atomic.Int64
+	c.Now = func() time.Time { return time.Unix(0, 0).Add(time.Duration(reads.Add(1)) * time.Hour) }
+	if _, _, err := c.SettledUploadInfo(ctx(t), "x", 10*time.Hour, time.Millisecond, 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d answers, want 2: the quiet time was not taken from the clock", n)
 	}
 }
