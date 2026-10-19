@@ -38,6 +38,11 @@ func FuzzForwarding(f *testing.F) {
 		lines = append(lines, extra...)
 		f.Add([]byte(strings.Join(lines, "\r\n") + "\r\nContent-Length: 0\r\n\r\n"))
 	}
+	// An escaped NUL the parser accepts and Header.Add refuses (RFC 4475
+	// §3.1.1.2): the CANCEL must copy it, not write it again.
+	f.Add([]byte("INVITE sip:bob@example.com SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.10;branch=z9hG4bKn\r\n" +
+		"From: \"a\\\x00b\" <sip:alice@example.com>;tag=a1\r\nTo: <sip:bob@example.com>\r\nCall-ID: c\r\n" +
+		"CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"))
 	f.Add([]byte("BYE sip:proxy.example.net;lr SIP/2.0\r\nVia: SIP/2.0/UDP a.example.com;branch=z9hG4bK1\r\n" +
 		"To: <sip:b@example.com>;tag=1\r\nFrom: <sip:a@example.com>;tag=2\r\nCall-ID: c\r\nCSeq: 2 BYE\r\n" +
 		"Route: <sip:x.example.com;lr>, <sip:y@example.com>\r\nContent-Length: 0\r\n\r\n"))

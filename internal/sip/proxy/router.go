@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -44,11 +45,16 @@ func (r *Request) Initial() bool {
 // (registrar lookup in scscf, flow lookup in pcscf, HSS query in icscf).
 //
 // Route runs on a goroutine of its own, never the one reading the network, so
-// it may block on a database or another service. The ctx it and the Decision's
-// hooks get is cancelled when the proxy closes, and once the request has its
-// final response and every branch has ended. A CANCEL from upstream does not
-// cancel it, so a hook can still clean up after a cancelled call; a request
-// cancelled while Route runs is answered 487 when it returns.
+// it may block on a database or another service. Its ctx ends when the request
+// is cancelled upstream (§16.10), when it has been answered, and when the proxy
+// closes; a request cancelled while Route runs is answered 487 when it returns,
+// unless the Decision hands it to Serve, which then sees the cancelled ctx.
+//
+// The hooks of a Decision get another ctx, which a CANCEL does not end, so a
+// hook can still clean up after a cancelled call. It ends when the proxy closes
+// and once the request has its final response and every branch has ended, or
+// 64*T1 after that when a 2xx to an INVITE went upstream, whose retransmissions
+// pass through OnResponse until then (RFC 6026 §7.2).
 //
 // An ACK for a 2xx is forwarded statelessly (§16.11): only the first target is
 // used and nothing can be answered, and since its retransmissions must go
@@ -63,14 +69,23 @@ type RouterFunc func(ctx context.Context, r *Request) Decision
 // Route calls f.
 func (f RouterFunc) Route(ctx context.Context, r *Request) Decision { return f(ctx, r) }
 
-// Decision is a Router's answer. Exactly one of Response, Status and Targets is
-// used, in that order of precedence; an empty Decision is answered with 480
-// Temporarily Unavailable, which §16.5 prescribes for an empty target set.
+// Decision is a Router's answer. Exactly one of Serve, Response, Status and
+// Targets is used, in that order of precedence; an empty Decision is answered
+// with 480 Temporarily Unavailable, which §16.5 prescribes for an empty target
+// set.
 type Decision struct {
-	// Response answers the request instead of forwarding it, for a service that
-	// is the UAS of some requests (the scscf registrar). It must have been built
-	// for this request with sip.NewResponse. A 2xx to an INVITE is sent once:
-	// retransmitting it until the ACK arrives (§13.3.1.4) is the UAS core's job.
+	// Serve hands the request to the service, which answers it itself as a
+	// user agent server through the UAS: rcs-as, a B2BUA, takes INVITE and
+	// MESSAGE this way. It runs on the request's goroutine, with the Router's
+	// ctx, which ends if the request is cancelled upstream: the proxy has then
+	// answered the CANCEL, and the service sends the 487 (§9.2). If Serve
+	// returns without a final response the proxy sends one, 487 after a
+	// CANCEL and 500 otherwise.
+	Serve func(ctx context.Context, u *UAS)
+	// Response answers the request with a response built for it with
+	// sip.NewResponse, for a service that answers some requests at once (the
+	// scscf registrar). It is sent once, so a 2xx to an INVITE, which must be
+	// retransmitted until its ACK (§13.3.1.4), goes through Serve instead.
 	Response *sip.Response
 	// Status answers the request with a response the proxy builds, such as 404
 	// or 403, when no header beyond the mandatory ones is needed.
@@ -100,12 +115,22 @@ type Decision struct {
 	// branch with 500.
 	Prepare func(ctx context.Context, t Target, req *sip.Request) error
 	// OnResponse, if set, sees each response just before it is forwarded
-	// upstream and may change its header fields, such as pcscf recording the
-	// Service-Route of a 200 to REGISTER (RFC 3608). It must not change the body,
-	// or the To tag of a 1xx or 2xx (§16.7 step 9). Calls for one request are in
-	// order, on a goroutine that may block, which delays only that request's
-	// responses.
+	// upstream, retransmissions of a 2xx included, and may change its header
+	// fields, such as pcscf recording the Service-Route of a 200 to REGISTER
+	// (RFC 3608). Like Prepare it may also replace the body, though not modify
+	// it in place: pcscf, an IMS application level gateway (TS 24.229 §5.2,
+	// ADR 0004), rewrites the SDP answer to anchor MSRP, which §16.7 step 9
+	// forbids a plain proxy. A 2xx retransmission must be rewritten as the first
+	// copy was. It must not change the To tag of a 1xx or 2xx (§16.7 step 9).
+	// Calls for one request are in order, on a goroutine that may block, which
+	// delays only that request's responses.
 	OnResponse func(ctx context.Context, res *sip.Response)
+	// OnFinal, if set, sees the final response chosen from the branches'
+	// (§16.7 step 6) before OnResponse, and may change its status code and
+	// reason. Without it a 430 is sent upstream as 480: RFC 5626 §11.5 keeps
+	// 430 between edge and authoritative proxy, and an endpoint must not get
+	// it. pcscf, the edge proxy, keeps the 430 for scscf this way.
+	OnFinal func(ctx context.Context, res *sip.Response)
 	// OnBranchFailure, if set, is told about every branch that ended without a
 	// 2xx, and may return targets to try in its place while the request is still
 	// being forwarded. The authoritative proxy of RFC 5626 §7 uses it to forget a
@@ -129,11 +154,24 @@ type Target struct {
 	// Destination, if set, is the next hop and Resolver is not asked, as when
 	// pcscf sends a terminating request over the client's flow.
 	Destination *transport.Destination
+	// Timeout, if set, bounds the branch: when it passes without a final
+	// response an INVITE branch with a provisional one is cancelled, and any
+	// other branch ends at once as a 408, so that OnBranchFailure or the next
+	// fork group can still answer in time. scscf applies an application
+	// server's default handling this way when the server does not answer (TS
+	// 24.229 §5.4.3.2).
+	Timeout time.Duration
 }
 
 // Forward is the decision to send a request on to its Request-URI unchanged,
 // following its Route if it has one: what §16.12 does with an in-dialog request,
 // and with a request for a domain the proxy is not responsible for (§16.5).
+//
+// The Route below this proxy's own entries is whatever the sender wrote. At the
+// edge of the network, on a listener clients reach, a service checks it against
+// the route set the dialog was established with before it forwards, or a client
+// can aim its requests at any core address past the services that should see
+// them.
 func Forward(r *Request) Decision { return Decision{Targets: []Target{{URI: r.Message.URI}}} }
 
 // BranchFailure describes a branch that ended without a 2xx.
@@ -154,6 +192,12 @@ type BranchFailure struct {
 // there is none, §16.6 step 7). RFC 3263 resolution belongs to the service, which
 // knows its DNS, service discovery and TLS names; it runs on a goroutine that may
 // block.
+//
+// A service with more than one listener on a network, such as pcscf with its
+// client and core listeners, sets Destination.Listener: the request leaves with
+// that listener's sent-by in its Via, and with none it takes the first
+// listener's, so responses after a reconnection would be sent to the wrong
+// side.
 type Resolver interface {
 	Resolve(ctx context.Context, u sip.URI) (transport.Destination, error)
 }

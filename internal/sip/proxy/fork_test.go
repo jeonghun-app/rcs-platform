@@ -261,7 +261,9 @@ func TestTransportFailures(t *testing.T) {
 		want       int
 		retryAfter bool
 	}{
-		{"a vanished flow counts as 430", transport.ErrNoFlow, 430, false},
+		// The 430 reaches OnBranchFailure as such (TestOnBranchFailure…);
+		// upstream it becomes 480 unless OnFinal keeps it (TestOnFinal…).
+		{"a vanished flow counts as 430, sent upstream as 480", transport.ErrNoFlow, 480, false},
 		{"a full send queue counts as 503 with Retry-After, passed on", transport.ErrQueueFull, 503, true},
 		{"no room for a connection counts as 503 with Retry-After", transport.ErrTooManyConnections, 503, true},
 		{"any other failure counts as a 503 from the next hop, which becomes 500", transport.ErrUnroutable, 500, false},

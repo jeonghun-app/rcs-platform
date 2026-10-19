@@ -204,7 +204,7 @@ func writeIdentity(h hash.Hash, req *sip.Request) {
 // interpreted: IMS does not use it, and the transport does not honour it in a
 // Via either.
 func (p *Proxy) preprocess(req *sip.Request, src transport.Source) (*Request, error) {
-	in := req.Clone()
+	in := copyRequest(req)
 	r := &Request{Message: in, Source: src}
 	routes, err := in.Header.Route()
 	if err != nil {
@@ -227,6 +227,18 @@ func (p *Proxy) preprocess(req *sip.Request, src transport.Source) (*Request, er
 	}
 	return r, nil
 }
+
+// copyRequest copies req except for its body, which the copy shares: no copy
+// modifies a body in place (Prepare and OnResponse may only replace one), so a
+// context holds one body however many branches it forwards.
+func copyRequest(req *sip.Request) *sip.Request {
+	c := &sip.Request{Method: req.Method, URI: cloneURI(req.URI), Header: req.Header.Clone(), Body: req.Body}
+	return c
+}
+
+// cloneURI copies u, parameters included, so that a change to the copy's
+// parameters cannot reach u.
+func cloneURI(u sip.URI) sip.URI { return (&sip.Request{URI: u}).Clone().URI }
 
 // removeLastRoute removes the last Route element. Only the Route fields are
 // rewritten, one element per line with each element's text kept.
@@ -252,8 +264,8 @@ var errPrepare = errors.New("proxy: preparing the request failed")
 // and finds its next hop; the caller adds the Via (step 8). recordRoute is false
 // for an ACK, which cannot change a dialog's route set.
 func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Target, recordRoute bool) (*sip.Request, transport.Destination, error) {
-	fwd := r.Message.Clone()
-	fwd.URI = t.URI
+	fwd := copyRequest(r.Message)
+	fwd.URI = cloneURI(t.URI)
 	mf := "70"
 	if fwd.Header.Has("Max-Forwards") {
 		n, err := fwd.Header.MaxForwards()

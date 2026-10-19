@@ -31,6 +31,11 @@ const (
 	// and replacement included. A user has a few devices; a target set larger
 	// than this is a misconfiguration or an amplification attempt (RFC 5393 §3).
 	DefaultMaxBranches = 16
+	// DefaultMaxContextBytes bounds the request bytes all contexts hold
+	// together. Each holds its request once, the body shared by its copies,
+	// plus a header copy and a CANCEL per branch: a few KiB for a typical
+	// request, so the limit bites only when large bodies pile up.
+	DefaultMaxContextBytes = 256 << 20
 )
 
 // overloadRetryAfter is the Retry-After, in seconds, of a 503 the proxy sends
@@ -71,8 +76,14 @@ type Config struct {
 	// MaxBranches bounds the branches of one request; targets beyond it are
 	// dropped and counted.
 	MaxBranches int
+	// MaxContextBytes bounds the bytes of the requests the contexts hold
+	// (see DefaultMaxContextBytes): a request that would take the total past
+	// it is answered 503 with Retry-After, and a branch that would fails as a
+	// 503 of its own.
+	MaxContextBytes int64
 	// Rand is the source of branch IDs and of the key behind the proxy's
-	// hashes; nil is crypto/rand.
+	// hashes; nil is crypto/rand. Branches start concurrently, so it must be
+	// safe for concurrent use.
 	Rand io.Reader
 	// Logger receives operational events, never message content. Nil discards
 	// them.
@@ -89,11 +100,17 @@ type Proxy struct {
 	resolver  Resolver
 	supported map[string]bool
 	clock     transaction.Clock
-	t1        time.Duration
+	t1, t2    time.Duration
 	timerC    time.Duration
 	maxCtx    int
 	maxBranch int
-	ids       sip.IDGenerator
+	maxBytes  int64
+	// bytes is what the contexts hold of maxBytes.
+	bytes atomic.Int64
+	// silent holds the responses the layer may hand to the sender but that
+	// must not be sent (silence).
+	silent sync.Map
+	ids    sip.IDGenerator
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
@@ -106,6 +123,8 @@ type Proxy struct {
 	mu       sync.Mutex
 	contexts map[*transaction.ServerTransaction]*respContext
 	acks     int
+	// awaiting holds the UASs retransmitting a 2xx until its ACK.
+	awaiting map[ackKey]*UAS
 	closed   bool
 
 	// active counts the goroutines the proxy has started, so Close can wait for
@@ -145,6 +164,9 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if cfg.MaxBranches <= 0 {
 		cfg.MaxBranches = DefaultMaxBranches
 	}
+	if cfg.MaxContextBytes <= 0 {
+		cfg.MaxContextBytes = DefaultMaxContextBytes
+	}
 	if cfg.Router == nil {
 		cfg.Router = RouterFunc(func(_ context.Context, r *Request) Decision { return Forward(r) })
 	}
@@ -165,6 +187,9 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if tcfg.T1 <= 0 {
 		tcfg.T1 = transaction.DefaultT1
 	}
+	if tcfg.T2 <= 0 {
+		tcfg.T2 = transaction.DefaultT2
+	}
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(cfg.Rand, key); err != nil {
 		return nil, fmt.Errorf("proxy: reading the hash key: %w", err)
@@ -177,21 +202,72 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		supported: make(map[string]bool),
 		clock:     tcfg.Clock,
 		t1:        tcfg.T1,
+		t2:        tcfg.T2,
 		timerC:    cfg.TimerC,
 		maxCtx:    cfg.MaxContexts,
 		maxBranch: cfg.MaxBranches,
+		maxBytes:  cfg.MaxContextBytes,
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
+		awaiting:  make(map[ackKey]*UAS),
 	}
 	for _, tag := range cfg.Supported {
 		p.supported[strings.ToLower(tag)] = true
 	}
 	p.idle = sync.NewCond(&p.activeMu)
 	p.ctx, p.stop = context.WithCancel(context.Background())
-	p.layer = transaction.New(s, p, tcfg)
+	p.layer = transaction.New(quietSender{s, p}, p, tcfg)
 	return p, nil
+}
+
+// quietSender is the transaction layer's sender. It drops the responses silence
+// marked, the only way to end a server transaction without sending anything.
+type quietSender struct {
+	transaction.Sender
+	p *Proxy
+}
+
+func (q quietSender) SendResponse(res *sip.Response, src transport.Source, opts ...transport.SendOption) error {
+	if _, ok := q.p.silent.Load(res); ok {
+		return nil
+	}
+	return q.Sender.SendResponse(res, src, opts...)
+}
+
+// silence ends a non-INVITE server transaction without a response (RFC 4320
+// §4.2): the transaction is given res, which quietSender never sends, so it
+// completes and absorbs retransmissions as if it had answered. The mark is
+// removed once the transaction can no longer resend res (Timer J, 64*T1).
+func (p *Proxy) silence(tx *transaction.ServerTransaction, res *sip.Response) {
+	p.stats.silenced.Add(1)
+	p.silent.Store(res, true)
+	_ = tx.Respond(res)
+	p.clock.AfterFunc(64*p.t1+time.Second, func() { p.silent.Delete(res) })
+}
+
+// reserve takes n bytes of MaxContextBytes, or reports false if they are not
+// free.
+func (p *Proxy) reserve(n int64) bool {
+	for {
+		cur := p.bytes.Load()
+		if cur+n > p.maxBytes {
+			return false
+		}
+		if p.bytes.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+// headerSize estimates the bytes a header takes, as written.
+func headerSize(h *sip.Header) int64 {
+	var n int64
+	for _, f := range h.Fields() {
+		n += int64(len(f.Name) + len(f.Value) + 4)
+	}
+	return n
 }
 
 // Receive takes a message from the transport; it is the transport's Handler.
@@ -212,12 +288,21 @@ func (p *Proxy) Close() {
 	for _, c := range p.contexts {
 		all = append(all, c)
 	}
+	waiting := make([]*UAS, 0, len(p.awaiting))
+	for _, u := range p.awaiting {
+		waiting = append(waiting, u)
+	}
 	p.mu.Unlock()
-	p.stop()
+	// The layer closes first, so that nothing a Router or hook does once its
+	// context is cancelled can still reach the network.
+	p.layer.Close()
 	for _, c := range all {
 		c.stopTimers()
 	}
-	p.layer.Close()
+	for _, u := range waiting {
+		u.end()
+	}
+	p.stop()
 	p.wait()
 }
 
@@ -266,6 +351,7 @@ func (p *Proxy) Request(tx *transaction.ServerTransaction) {
 	}
 	c := p.newContext(tx)
 	if c == nil {
+		// At MaxContexts or MaxContextBytes.
 		p.stats.overloaded.Add(1)
 		p.reply(tx, 503, [2]string{"Retry-After", overloadRetryAfter})
 		return
@@ -299,20 +385,39 @@ func (p *Proxy) ServerFailed(*transaction.ServerTransaction, error) {
 // MaxContexts are in use. It is registered before the request is routed, so a
 // CANCEL that arrives meanwhile finds it.
 func (p *Proxy) newContext(tx *transaction.ServerTransaction) *respContext {
+	req := tx.Request()
+	header := headerSize(&req.Header)
+	// The request received and the Router's copy of its header; the body is
+	// shared.
+	cost := int64(len(req.Body)) + 2*header
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed || len(p.contexts) >= p.maxCtx {
+	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost) {
 		return nil
 	}
-	c := newRespContext(p, tx)
+	c := newRespContext(p, tx, cost, header)
 	p.contexts[tx] = c
 	return c
 }
 
-func (p *Proxy) release(c *respContext) {
+// release ends a context. With linger, a 2xx went upstream, whose
+// retransmissions keep arriving for 64*T1 (Timer M of the client transaction,
+// RFC 6026 §7.2) and go through OnResponse, so the hooks' context lives that
+// long; the context's slot and bytes come back at once either way.
+func (p *Proxy) release(c *respContext, linger bool) {
 	p.mu.Lock()
 	delete(p.contexts, c.tx)
 	p.mu.Unlock()
+	c.mu.Lock()
+	n := c.reserved
+	c.reserved = 0
+	c.mu.Unlock()
+	p.bytes.Add(-n)
+	c.cancelReq()
+	if linger {
+		p.clock.AfterFunc(64*p.t1, c.cancelCtx)
+		return
+	}
 	c.cancelCtx()
 }
 
@@ -349,10 +454,25 @@ func (p *Proxy) reply(tx *transaction.ServerTransaction, code int, fields ...[2]
 }
 
 // response builds a response of the proxy's own to req.
+//
+// sip.NewResponse adds the To tag by writing the To field again, which fails
+// for a To the parser accepted but Header.Set refuses to write, such as an
+// escaped NUL in the display name (RFC 4475 §3.1.1.2). The response is then
+// built with the request's To as it is, without a tag: the client's
+// transaction matches it all the same (§17.1.3), and answering beats leaving
+// the transaction without a response.
 func (p *Proxy) response(req *sip.Request, code int, fields ...[2]string) (*sip.Response, error) {
+	if code < 100 || code > 699 {
+		return nil, errors.New("proxy: status code outside 100-699")
+	}
 	res, err := sip.NewResponse(req, code, "", p.toTag(req))
 	if err != nil {
-		return nil, err
+		res, err = sip.NewResponse(req, 100, "", "")
+		if err != nil {
+			return nil, err
+		}
+		res.Header.Del("Timestamp")
+		res.StatusCode, res.Reason = code, sip.DefaultReason(code)
 	}
 	for _, f := range fields {
 		if err := res.Header.Add(f[0], f[1]); err != nil {
@@ -364,25 +484,33 @@ func (p *Proxy) response(req *sip.Request, code int, fields ...[2]string) (*sip.
 
 // Stats are counters a service exports as metrics.
 type Stats struct {
-	// Contexts is the number of requests in progress, against MaxContexts.
-	Contexts int
+	// Contexts is the number of requests in progress, against MaxContexts,
+	// and ContextBytes what they hold, against MaxContextBytes.
+	Contexts     int
+	ContextBytes int64
 
 	// Counters since New.
-	Branches       uint64 // branches started
-	TargetsDropped uint64 // targets refused past MaxBranches
-	Cancels        uint64 // CANCELs sent downstream
-	TimerC         uint64 // INVITE branches whose Timer C fired
-	Overloaded     uint64 // requests answered 503 at MaxContexts
-	Loops          uint64 // requests answered 482 (RFC 3261 §16.3 step 4)
-	StrayResponses uint64 // responses matching no transaction, dropped (RFC 6026 §7.3)
-	ACKsForwarded  uint64 // ACKs for 2xx forwarded statelessly
-	ACKsDropped    uint64 // ACKs that could not be forwarded
-	UpstreamErrors uint64 // responses the upstream transaction could not send, dropped (§16.9)
+	Branches            uint64 // branches started
+	TargetsDropped      uint64 // targets refused past MaxBranches
+	Cancels             uint64 // CANCELs sent downstream
+	TimerC              uint64 // INVITE branches whose Timer C fired
+	TargetTimeouts      uint64 // branches whose Target.Timeout fired
+	Overloaded          uint64 // requests and branches refused at MaxContexts or MaxContextBytes
+	Loops               uint64 // requests answered 482 (RFC 3261 §16.3 step 4)
+	Silenced            uint64 // non-INVITE requests left unanswered instead of 408 (RFC 4320 §4.2)
+	ProvisionalsDropped uint64 // provisional responses dropped for a slow upstream peer
+	StrayResponses      uint64 // responses matching no transaction, dropped (RFC 6026 §7.3)
+	ACKsForwarded       uint64 // ACKs for 2xx forwarded statelessly
+	ACKsConsumed        uint64 // ACKs for a 2xx a Serve handler sent, delivered to it
+	ACKsMissing         uint64 // 2xx a Serve handler sent whose ACK never came
+	ACKsDropped         uint64 // ACKs that could not be forwarded
+	UpstreamErrors      uint64 // responses the upstream transaction could not send, dropped (§16.9)
 }
 
 type counters struct {
-	branches, targetsDropped, cancels, timerC, overloaded, loops,
-	strayResponses, acksForwarded, acksDropped, upstreamErrors atomic.Uint64
+	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
+	provisionalsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
+	upstreamErrors atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -392,16 +520,22 @@ func (p *Proxy) Stats() Stats {
 	p.mu.Unlock()
 	s := &p.stats
 	return Stats{
-		Contexts:       n,
-		Branches:       s.branches.Load(),
-		TargetsDropped: s.targetsDropped.Load(),
-		Cancels:        s.cancels.Load(),
-		TimerC:         s.timerC.Load(),
-		Overloaded:     s.overloaded.Load(),
-		Loops:          s.loops.Load(),
-		StrayResponses: s.strayResponses.Load(),
-		ACKsForwarded:  s.acksForwarded.Load(),
-		ACKsDropped:    s.acksDropped.Load(),
-		UpstreamErrors: s.upstreamErrors.Load(),
+		Contexts:            n,
+		ContextBytes:        p.bytes.Load(),
+		Branches:            s.branches.Load(),
+		TargetsDropped:      s.targetsDropped.Load(),
+		Cancels:             s.cancels.Load(),
+		TimerC:              s.timerC.Load(),
+		TargetTimeouts:      s.targetTimeouts.Load(),
+		Overloaded:          s.overloaded.Load(),
+		Loops:               s.loops.Load(),
+		Silenced:            s.silenced.Load(),
+		ProvisionalsDropped: s.provisionalsDropped.Load(),
+		StrayResponses:      s.strayResponses.Load(),
+		ACKsForwarded:       s.acksForwarded.Load(),
+		ACKsConsumed:        s.acksConsumed.Load(),
+		ACKsMissing:         s.acksMissing.Load(),
+		ACKsDropped:         s.acksDropped.Load(),
+		UpstreamErrors:      s.upstreamErrors.Load(),
 	}
 }

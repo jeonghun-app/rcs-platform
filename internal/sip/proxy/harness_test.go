@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -186,7 +187,7 @@ func newHarness(t *testing.T, cfg Config) *harness {
 		cfg.Self = []sip.URI{selfURI}
 	}
 	if cfg.Rand == nil {
-		cfg.Rand = rand.NewChaCha8([32]byte{1})
+		cfg.Rand = &lockedReader{r: rand.NewChaCha8([32]byte{1})}
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = fakeResolver{}
@@ -210,6 +211,19 @@ func newHarness(t *testing.T, cfg Config) *harness {
 	h.p = p
 	t.Cleanup(p.Close)
 	return h
+}
+
+// lockedReader makes a seeded reader safe for the concurrent branch starts,
+// as Config.Rand must be.
+type lockedReader struct {
+	mu sync.Mutex
+	r  io.Reader
+}
+
+func (l *lockedReader) Read(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.r.Read(b)
 }
 
 // fakeResolver resolves any host to a TCP destination named after it, so tests

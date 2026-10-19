@@ -12,7 +12,10 @@
 //   - preprocesses its Route (§16.4): it undoes a strict router's rewrite and
 //     removes the Route values naming itself (Config.Self), two in a row when
 //     it recorded two (RFC 5658 §5), and hands them to the Router;
-//   - asks the Router for a Decision: an answer, or targets;
+//   - asks the Router for a Decision: an answer, targets, or to hand the
+//     request to the service (Serve), which answers it as a UAS and has its
+//     2xx retransmitted until the ACK, which is delivered to it (RFC 6026
+//     §8.1);
 //   - forwards to each target (§16.6) with a new Via whose branch ID carries a
 //     keyed loop-detection hash (RFC 5393 §4.2), the Record-Route values of
 //     the decision, the routes of the target, and Decision.Prepare's changes;
@@ -21,14 +24,18 @@
 //   - forwards provisional responses and every 2xx at once and keeps the
 //     other finals, then sends the best of them (§16.7): a 6xx over all, then
 //     the lowest class, preferring 401, 407, 415, 420 and 484 within 4xx, with
-//     the challenges of every 401 and 407 gathered into the one sent, and a
-//     503 from downstream turned into 500;
+//     the challenges of every 401 and 407 gathered into the one sent, a 503
+//     from downstream turned into 500, and a 430 into 480 unless OnFinal
+//     keeps it (RFC 5626 §11.5);
+//   - sends no 408 to a non-INVITE request that got no response, which would
+//     arrive after the client gave up (RFC 4320 §4.2);
 //   - cancels the INVITE branches still pending after a 2xx, a 6xx or a
 //     CANCEL from upstream, each only once it has a provisional response
 //     (§9.1), and terminates a branch whose CANCEL is not answered within
 //     64*T1;
 //   - runs Timer C on every INVITE branch (§16.8): a branch that has had a
-//     provisional response is cancelled, one that has not counts as a 408.
+//     provisional response is cancelled, one that has not counts as a 408;
+//     Target.Timeout bounds a branch more tightly where a service needs it.
 //
 // An ACK for a 2xx belongs to no transaction and is forwarded statelessly
 // (§16.11). Every other request, in-dialog ones included, has a server
@@ -44,18 +51,26 @@
 // read from that connection or UDP socket. Routing, Prepare and every send
 // downstream run on a goroutine per request or branch, and the responses of a
 // request go upstream in order on a goroutine of their own, so a peer that is
-// slow to take what it is sent delays only the messages addressed to it. The
-// exceptions are the 503 sent at MaxContexts and the answers to a CANCEL: they
-// go back to the peer the request just came from and wait only if that peer
-// has stopped reading, for at most the transport's WriteTimeout.
+// slow to take what it is sent delays only the messages addressed to it; while
+// it is, at most 16 provisional responses of a request wait for it, and later
+// ones are dropped and counted (finals and 2xx never are). The exceptions are
+// the 503 sent at MaxContexts and the answers to a CANCEL: they go back to the
+// peer the request just came from and wait only if that peer has stopped
+// reading, for at most the transport's WriteTimeout.
 //
 // Memory is bounded by MaxContexts response contexts of at most MaxBranches
-// branches, each holding a copy of the request: about MaxContexts ×
-// (MaxBranches + 1) messages, plus as many CANCELs and the final responses
-// kept for the choice. A context lives until every branch has ended. Timer C
-// ends a silent INVITE branch; one that receives a provisional response at
-// least every TimerC keeps its context, as ringing does, and holds a
-// MaxContexts slot as long.
+// branches. A context holds its request once, with its body shared by every
+// copy, plus a copy of the header and a CANCEL per branch, and the final
+// responses kept for the choice: about
+//
+//	body + (2 + 2 × branches) × header + branches × response
+//
+// per context. MaxContextBytes bounds the request part over all contexts
+// together; the responses are bounded by MaxBranches and the transport's
+// message limits. A context lives until every branch has ended. Timer C ends
+// a silent INVITE branch; one that receives a provisional response at least
+// every TimerC keeps its context, as ringing does, and holds a MaxContexts
+// slot as long.
 //
 // A branch the transport cannot send because the next hop's connection has no
 // room, or no connection can be opened (transport.ErrQueueFull,
@@ -64,6 +79,9 @@
 // from the next hop (§16.9), which becomes a 500 if chosen, and a vanished
 // flow as 430 (RFC 5626 §5.3.1). In every case the next fork group, or a
 // replacement target from OnBranchFailure, may still succeed.
+//
+// Max-Breadth (RFC 5393 §5) is not implemented; MaxBranches bounds forking
+// meanwhile (#75).
 //
 // Logs carry no message content, URIs or flow IDs.
 package proxy

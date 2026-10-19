@@ -5,12 +5,18 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
-// receiveACK forwards an ACK that belongs to no transaction: the ACK for a 2xx,
-// which is end to end (RFC 3261 §13.2.2.4, RFC 6026 §7.1). It is forwarded
-// statelessly (§16.11) on a goroutine of its own, since the send can block; at
-// MaxContexts ACKs in flight it is dropped, and the UAS's retransmitted 2xx
-// draws another from the UAC (§13.3.1.4).
+// receiveACK handles an ACK that belongs to no transaction: the ACK for a 2xx,
+// which is end to end (RFC 3261 §13.2.2.4, RFC 6026 §7.1). The ACK for a 2xx
+// a Serve handler sent is delivered to it. Any other is forwarded statelessly
+// (§16.11) on a goroutine of its own, since the send can block; at MaxContexts
+// ACKs in flight it is dropped, and the UAS's retransmitted 2xx draws another
+// from the UAC (§13.3.1.4).
 func (p *Proxy) receiveACK(req *sip.Request, src transport.Source) {
+	if u := p.takeACK(req); u != nil {
+		p.stats.acksConsumed.Add(1)
+		u.acknowledged(req)
+		return
+	}
 	p.mu.Lock()
 	if p.closed || p.acks >= p.maxCtx {
 		p.mu.Unlock()
