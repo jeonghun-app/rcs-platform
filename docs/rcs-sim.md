@@ -114,10 +114,31 @@ behaves as a device behind NAT does:
 - After registration, every request carries the route set of TS 24.229
   §5.1.2A.1.1: pcscf, then the `Service-Route` of the last 2xx to REGISTER.
 
+It answers the registrar's challenge:
+
+- The first REGISTER carries an `Authorization` with the IMPI, the home domain
+  as realm and an empty nonce and response, from which the S-CSCF learns the
+  private identity (TS 24.229 §5.1.1.2.1).
+- With a password, it answers the first MD5 or SHA-256 challenge offered
+  (RFC 7616, RFC 8760).
+- With AKA keys, it answers AKAv1-MD5 as a card does (RFC 3310, TS 33.102
+  §6.3.3). AUTN must verify. A fresh SQN is answered with RES. An SQN the card
+  will not accept is answered with AUTS, after which the network
+  resynchronises and challenges again. An AUTN that does not verify ends the
+  registration.
+- Credentials refused once are not tried again: a second 401 is the result,
+  unless it follows AUTS or says the nonce was stale.
+
+The credentials come from the environment only: K and OPc as 32 hex digits in
+`RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`, the Digest password in
+`RCS_SIM_SIP_PASSWORD`. Only made-up keys or the TS 35.208 test sets belong
+there. They print as a placeholder in every form.
+
 Errors carry methods, status codes and fixed reasons, never an identity, an
-address or a Call-ID. Its tests run it against an in-process stand-in for
-pcscf and the registrar. Authentication (Digest and AKA) and INVITE dialogs
-come next.
+address, a Call-ID, a nonce or a credential. Its tests run it against an
+in-process stand-in for pcscf and the registrar, which authenticates with
+`internal/sip/digest`'s server side and Milenage vectors. INVITE dialogs come
+next.
 
 ## Running it
 
