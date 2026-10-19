@@ -14,6 +14,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -222,6 +224,55 @@ type relayRigTCP struct {
 	asReg           *Registry
 	relay           *pairBinder
 	relayConns      chan *Conn
+	// users are the sessions of each user, by the relay's public
+	// session-id, kept for a failed bind's report (#140).
+	usersMu sync.Mutex
+	users   map[string][3]*Session // rcs-as, relay edge, relay core
+	// bindWatchdog is how long a client's bind may wait before the rig
+	// takes a report while it still waits (0: 5 s, far above the slowest
+	// bind measured and far below the 30 s transaction timeout);
+	// clientConfig is the Config of the clients dialClient connects.
+	bindWatchdog time.Duration
+	clientConfig Config
+	// conns are the connections the rig made or accepted, by role, and
+	// events what they refused, dropped or ended with, for the report.
+	diagMu sync.Mutex
+	conns  []roleConn
+	events []string
+}
+
+type roleConn struct {
+	role string
+	c    *Conn
+}
+
+// maxRigEvents bounds the events a rig keeps for its report: the latest.
+const maxRigEvents = 256
+
+// watch returns cfg with an OnEvent that records the connection's events
+// under role, as well as passing them to cfg's own.
+func (rig *relayRigTCP) watch(role string, cfg Config) Config {
+	next := cfg.OnEvent
+	cfg.OnEvent = func(e Event) {
+		rig.diagMu.Lock()
+		if len(rig.events) == maxRigEvents {
+			rig.events = rig.events[1:]
+		}
+		rig.events = append(rig.events, fmt.Sprintf("%s: %s %s %d %v", role, eventKindNames[e.Kind], e.Method, e.Code, e.Err))
+		rig.diagMu.Unlock()
+		if next != nil {
+			next(e)
+		}
+	}
+	return cfg
+}
+
+var eventKindNames = map[EventKind]string{EventRefused: "refused", EventDropped: "dropped", EventClosed: "closed"}
+
+func (rig *relayRigTCP) track(role string, c *Conn) {
+	rig.diagMu.Lock()
+	rig.conns = append(rig.conns, roleConn{role, c})
+	rig.diagMu.Unlock()
 }
 
 // pairBinder hands out prepared bridges by the relay session-id.
@@ -265,14 +316,15 @@ func newRelayRigTCP(t *testing.T, relayClientCfg, asCfg Config, opts ...func(*re
 			if err != nil {
 				return
 			}
-			c, err := NewPassiveConn(nc, rig.asReg, asCfg)
+			c, err := NewPassiveConn(nc, rig.asReg, rig.watch("rcs-as", asCfg))
 			if err != nil {
 				return
 			}
+			rig.track("rcs-as", c)
 			t.Cleanup(func() { _ = c.Close() })
 		}
 	}()
-	pool := &Pool{Dial: func(ctx context.Context, _ URI) (net.Conn, error) {
+	pool := &Pool{Config: rig.watch("relay core", Config{}), Dial: func(ctx context.Context, _ URI) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", asL.Addr().String())
 	}}
@@ -291,10 +343,11 @@ func newRelayRigTCP(t *testing.T, relayClientCfg, asCfg Config, opts ...func(*re
 			if rig.edgeConfig != nil {
 				cfg = rig.edgeConfig(n)
 			}
-			c, err := NewPassiveConn(nc, rig.relay, cfg)
+			c, err := NewPassiveConn(nc, rig.relay, rig.watch("relay edge", cfg))
 			if err != nil {
 				return
 			}
+			rig.track("relay edge", c)
 			rig.relayConns <- c
 			t.Cleanup(func() { _ = c.Close() })
 		}
@@ -324,25 +377,168 @@ func (rig *relayRigTCP) addUser(t *testing.T, n int, asH Handler) (asSess *Sessi
 	rig.relay.mu.Lock()
 	rig.relay.pairs[relPub.SessionID] = [2]*Session{a, b}
 	rig.relay.mu.Unlock()
+	rig.usersMu.Lock()
+	if rig.users == nil {
+		rig.users = map[string][3]*Session{}
+	}
+	rig.users[relPub.SessionID] = [3]*Session{as, a, b}
+	rig.usersMu.Unlock()
 	return as, cl, relPub
 }
 
 func (rig *relayRigTCP) dialClient(t *testing.T, local, relayPub URI, h Handler) (*Session, *Conn) {
 	t.Helper()
+	s, c, report := rig.openClient(t, local, relayPub, h)
+	if report != "" {
+		t.Fatal(report)
+	}
+	return s, c
+}
+
+// openClient connects a client and binds its session. A bind normally takes
+// milliseconds, under a starved CPU well under a second; one that waited
+// out the 30 s transaction timeout in CI could not be reproduced (#140), so
+// a failed bind returns a report instead of the session: how far the bind
+// got, the connections' queues and the events they reported, and every
+// goroutine, taken while the bind still waited (after bindWatchdog) and
+// again once it failed. The relay's own wait ends on a timer as long as
+// the client's, so by then it may be gone (QA of #165).
+func (rig *relayRigTCP) openClient(t *testing.T, local, relayPub URI, h Handler) (*Session, *Conn, string) {
+	t.Helper()
 	nc, err := net.Dial("tcp", rig.relayAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewActiveConn(nc, Config{})
+	c, err := NewActiveConn(nc, rig.watch("client "+local.SessionID, rig.clientConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
+	rig.track("client "+local.SessionID, c)
 	t.Cleanup(func() { _ = c.Close() })
 	s, _ := NewSession(SessionConfig{Local: local, Remote: []URI{relayPub}, Handler: h})
-	if err := c.Open(context.Background(), s); err != nil {
-		t.Fatal(err)
+	wait := rig.bindWatchdog
+	if wait <= 0 {
+		wait = 5 * time.Second
 	}
-	return s, c
+	waiting := make(chan string, 1)
+	watchdog := time.AfterFunc(wait, func() { waiting <- rig.report(relayPub) })
+	start := time.Now()
+	err = c.Open(context.Background(), s)
+	took := time.Since(start)
+	if err == nil {
+		watchdog.Stop()
+		return s, c, ""
+	}
+	early := "(the bind failed before the watchdog)"
+	if !watchdog.Stop() {
+		early = <-waiting
+	}
+	return nil, nil, fmt.Sprintf("bind of %s failed after %v: %v\n--- while it waited, after %v:\n%s\n--- once it failed:\n%s",
+		local.SessionID, took, err, wait, early, rig.report(relayPub))
+}
+
+// report is how far relayPub's bind got, the state of every connection the
+// rig knows and the latest events, then every goroutine's stack.
+func (rig *relayRigTCP) report(relayPub URI) string {
+	var b strings.Builder
+	b.WriteString(rig.bindState(relayPub))
+	b.WriteString("\nconnections:\n")
+	rig.diagMu.Lock()
+	conns := slices.Clone(rig.conns)
+	events := slices.Clone(rig.events)
+	rig.diagMu.Unlock()
+	pool := rig.relay.pool
+	pool.mu.Lock()
+	for _, c := range pool.conns {
+		conns = append(conns, roleConn{"relay core", c})
+	}
+	pool.mu.Unlock()
+	for _, rc := range conns {
+		c := rc.c
+		c.qmu.Lock()
+		queued, posted := len(c.queue), c.posted
+		c.qmu.Unlock()
+		c.mu.Lock()
+		awaiting, closed := len(c.pending), c.closed
+		c.mu.Unlock()
+		fmt.Fprintf(&b, "  %s %p: %d frames queued (%d bytes posted), %d requests awaiting an answer, closed %t\n",
+			rc.role, c, queued, posted, awaiting, closed)
+	}
+	b.WriteString("events:\n")
+	for _, e := range events {
+		b.WriteString("  " + e + "\n")
+	}
+	buf := make([]byte, 16<<20)
+	b.WriteString("goroutines:\n")
+	b.Write(buf[:runtime.Stack(buf, true)])
+	return b.String()
+}
+
+// A bind stuck on the relay's core open is caught while it waits: the
+// report taken then shows the relay's Bind in Pool.Open and the core
+// connection awaiting the answer to its bind, which the report taken once
+// the bind failed may no longer show (QA of #165). rcs-as here accepts the
+// relay's connection and never answers; the relay waits for it with the
+// default 30 s, so the report finds it waiting however late it is taken.
+func TestABindStuckOnTheCoreOpenIsReportedWhileItWaits(t *testing.T) {
+	rig := newRelayRigTCP(t, Config{}, Config{})
+	rig.clientConfig = Config{TransactionTimeout: 2 * time.Second}
+	rig.bindWatchdog = time.Second
+	hole := tcpListen(t)
+	go func() {
+		for {
+			nc, err := hole.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = nc.Close() })
+		}
+	}()
+	pool := &Pool{Config: rig.watch("relay core", Config{}), Dial: func(ctx context.Context, _ URI) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", hole.Addr().String())
+	}}
+	t.Cleanup(func() { _ = pool.Close() })
+	rig.relay.pool = pool
+	_, cl, rp := rig.addUser(t, 0, &countingHandler{})
+	_, _, report := rig.openClient(t, cl, rp, &countingHandler{})
+	waited, _, ok := strings.Cut(report, "--- once it failed:")
+	if !ok {
+		t.Fatalf("the bind did not fail:\n%s", report)
+	}
+	for _, want := range []string{"pairBinder).Bind", "(*Pool).Open", "relay pair still waiting for the bind: false", "requests awaiting an answer"} {
+		if !strings.Contains(waited, want) {
+			t.Errorf("the report taken while the bind waited lacks %q:\n%s", want, waited)
+		}
+	}
+	if !strings.Contains(waited, "relay core 0x") || !strings.Contains(waited, ": 0 frames queued (0 bytes posted), 1 requests awaiting an answer") {
+		t.Errorf("the report does not show the core connection awaiting its bind's answer:\n%s", waited)
+	}
+}
+
+// bindState says how far a client's bind got: whether the relay still
+// waits for it (its pair not taken, so the bind SEND never reached Bind),
+// and which of the user's sessions are attached to a connection. A pair
+// taken with every session attached is a bind whose 200 to the client was
+// lost; one with the core or rcs-as session unattached is a core bind that
+// failed or was never answered.
+func (rig *relayRigTCP) bindState(relayPub URI) string {
+	rig.relay.mu.Lock()
+	_, waiting := rig.relay.pairs[relayPub.SessionID]
+	rig.relay.mu.Unlock()
+	rig.usersMu.Lock()
+	u := rig.users[relayPub.SessionID]
+	rig.usersMu.Unlock()
+	attached := func(s *Session) bool {
+		if s == nil {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.conn != nil && !s.closed
+	}
+	return fmt.Sprintf("relay pair still waiting for the bind: %t; attached: relay edge %t, relay core %t, rcs-as %t",
+		waiting, attached(u[1]), attached(u[2]), attached(u[0]))
 }
 
 // rawClient binds a session with a bare TCP connection and returns it, so
@@ -733,7 +929,24 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		}
 	}
 
+	// The unconnected client's edge, looked up once: Bind removes it from
+	// pairs, and a later change of order should fail on a message here,
+	// not on a nil edge.
+	rig.relay.mu.Lock()
+	lateEdges := rig.relay.pairs[rpLate.SessionID]
+	rig.relay.mu.Unlock()
+	if len(lateEdges) == 0 {
+		t.Fatal("the relay has no edge for the unconnected client's session")
+	}
+	lateEdge := lateEdges[0]
+	held := func() int {
+		lateEdge.mu.Lock()
+		defer lateEdge.mu.Unlock()
+		return len(lateEdge.held)
+	}
+
 	// A stored message for a client that has not connected yet is held.
+	sendsStart := time.Now()
 	stored := make(chan error, 1)
 	go func() {
 		_, err := asLate.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("kept for you")})
@@ -746,18 +959,51 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		_, err := asOver.Send(context.Background(), Outgoing{ContentType: "application/octet-stream", Body: bodyOf(1 << 20), FailureReport: ReportPartial})
 		over <- err
 	}()
-	for i := range 5 {
-		start := time.Now()
-		if _, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))}); err != nil {
-			t.Fatal(err)
+	// The connected client gets its messages while the unconnected one's
+	// is still held: proved by order, not by a prompt bound, which a loaded
+	// host broke (#157). Each wait still ends at stallBound, far above any
+	// delivery a loaded host has shown, so a relay that stalls the shared
+	// rcs-as connection for seconds behind the unconnected client fails
+	// here, not only one that stalls it until the 30 s transaction timeout.
+	for held() == 0 {
+		if time.Since(sendsStart) > stallBound {
+			t.Fatalf("the message for the unconnected client was not held within %v", stallBound)
 		}
-		select {
-		case <-fastH.got:
-			if d := time.Since(start); d > prompt {
-				t.Errorf("message %d to the connected client took %v", i, d)
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The relay refuses the push over the bound on the same shared
+	// connection. Messages go on until one has been sent after the refusal
+	// was seen, so a stall in the refusal path falls inside this loop too.
+	start := time.Now()
+	for i, afterRefusal := 0, false; i < 5 || !afterRefusal; i++ {
+		refused := overH.failures.Load() > 0
+		// The bound runs from the start of the send, which itself waits
+		// for the relay's answer.
+		bound := time.After(stallBound)
+		sent := make(chan error, 1)
+		go func() {
+			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))})
+			sent <- err
+		}()
+		for got, answered := false, false; !got || !answered; {
+			select {
+			case <-fastH.got:
+				got = true
+			case err := <-sent:
+				if err != nil {
+					t.Fatalf("message %d: %v", i, err)
+				}
+				answered = true
+			case <-bound:
+				t.Fatalf("message %d to the connected client: delivered %v, answered %v after %v", i, got, answered, stallBound)
 			}
-		case <-time.After(hangGuard):
-			t.Fatalf("message %d to the connected client never arrived", i)
+		}
+		if held() == 0 {
+			t.Fatalf("message %d arrived only after the unconnected client's message was released", i)
+		}
+		afterRefusal = refused
+		if !afterRefusal && time.Since(start) > hangGuard {
+			t.Fatalf("the push over the bound was not refused within %v", hangGuard)
 		}
 	}
 	if err := <-stored; err != nil {

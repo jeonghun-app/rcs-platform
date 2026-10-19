@@ -209,6 +209,12 @@ type Config struct {
 	// which waits for this goroutine to finish and so would wait for itself.
 	// Close returns once every call has been made.
 	OnFlowClosed func(id FlowID, info FlowInfo)
+	// OnPong, if set, is told of every CRLF read between messages on a flow
+	// that Ping has been used on: the pong that answers a ping (RFC 5626
+	// §4.4.1). Timing the pong is the caller's; RFC 5626 counts the flow as
+	// failed when none comes within 10 seconds. It runs on the flow's reading
+	// goroutine and must not block.
+	OnPong func(id FlowID)
 
 	// Dialer opens outbound connections; nil uses a net.Dialer with the core
 	// keep-alive described at ListenerConfig.KeepAlive.
@@ -485,6 +491,34 @@ func (t *Transport) CloseFlow(id FlowID) bool {
 	}
 	t.closeFlow(f)
 	return true
+}
+
+// errNotPinging refuses Ping on a flow this transport did not open.
+var errNotPinging = errors.New("transport: only a TCP or TLS connection this transport opened sends pings")
+
+// Ping sends a double-CRLF keep-alive ping on a TCP or TLS connection this
+// transport opened, as the client end of an outbound flow does (RFC 5626
+// §4.4.1). From the first ping on, the flow is the pinging end: every CRLF it
+// reads is a pong, reported to Config.OnPong, which also starts the idle
+// timeout again, and two CRLFs read together are not answered as a ping. Ping
+// waits for room in the send queue for up to WriteTimeout. It fails with
+// ErrNoFlow for a flow that is gone.
+func (t *Transport) Ping(id FlowID) error {
+	if t.isClosed() {
+		return ErrClosed
+	}
+	f := t.flows.lookup(id)
+	if f == nil {
+		return ErrNoFlow
+	}
+	if f.lis != nil {
+		// An accepted connection or a UDP flow, whose keep-alive is STUN
+		// (RFC 5626 §4.4.2). A server answers pings and sends none: its
+		// CRLFs would be taken for pongs.
+		return errNotPinging
+	}
+	f.pinging.Store(true)
+	return t.write(f, ping, true)
 }
 
 // SetFlowIdleTimeout changes the idle timeout of one TCP or TLS flow, counted

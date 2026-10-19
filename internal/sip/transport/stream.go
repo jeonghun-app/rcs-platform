@@ -18,7 +18,10 @@ import (
 
 const streamBufferSize = 4096
 
-var crlf = []byte("\r\n")
+var (
+	crlf = []byte("\r\n")
+	ping = []byte("\r\n\r\n")
+)
 
 // deadlineReader moves the read deadline of a stream connection between two
 // regimes. Between messages the connection may stay quiet for the idle timeout,
@@ -158,7 +161,21 @@ func (t *Transport) serveStream(f *flow, accepted bool) {
 	f.dr.Store(d)
 	br := bufio.NewReaderSize(d, streamBufferSize)
 	r := sip.NewReader(br, t.cfg.Limits)
+	r.OnCRLF = func() {
+		if !f.pinging.Load() {
+			return
+		}
+		d.keepAlive(br)
+		if t.cfg.OnPong != nil {
+			t.cfg.OnPong(f.id)
+		}
+	}
 	r.OnKeepAlive = func() {
+		if f.pinging.Load() {
+			// Two pongs read back to back; answering them would make the
+			// peer count our CRLF towards its next ping.
+			return
+		}
 		// RFC 5626 §5.4: answer a double-CRLF ping with a single CRLF pong at once.
 		// It is queued without waiting, like everything sent from this
 		// goroutine; a peer that pings but does not read loses its connection

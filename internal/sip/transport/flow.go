@@ -61,6 +61,10 @@ type flow struct {
 	// that applies it, once the flow is being served.
 	idle atomic.Int64
 	dr   atomic.Pointer[deadlineReader]
+	// pinging is set by the first Transport.Ping: the flow is then the
+	// client end of the RFC 5626 keep-alive, and the CRLFs it reads are
+	// pongs.
+	pinging atomic.Bool
 
 	// UDP only, guarded by flowTable.mu: when the flow last received a
 	// datagram, and its places in the table's recency lists.
