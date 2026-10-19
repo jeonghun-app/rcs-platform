@@ -405,8 +405,8 @@ func senderShares(t *testing.T, s store.Store) {
 }
 
 // One person holds one share of a queue whether they write 1-to-1 or in
-// groups, and notifications about group messages share one bound of their
-// own, whichever group they come from.
+// groups, and notifications about one group's messages share one bound of
+// their own, whoever sends them; another group's have another.
 func groupShares(t *testing.T, s store.Store) {
 	ctx := context.Background()
 	const group, other = "sip:chat-1@conf.example.net", "sip:chat-2@conf.example.net"
@@ -436,17 +436,18 @@ func groupShares(t *testing.T, s store.Store) {
 			t.Fatalf("%s beyond alice's share = %v", m.ID, err)
 		}
 	}
-	// Group notifications have a share of their own, which alice's
-	// messages do not use up, and which a second group does not double.
-	for _, n := range []store.Message{notice(group, "n1"), notice(other, "n2"), notice(group, "n3")} {
+	// A group's notifications have a share of their own, which alice's
+	// messages do not use up; another group's notifications have another.
+	for _, n := range []store.Message{notice(group, "n1"), notice(group, "n2"), notice(other, "n3"), notice(group, "n4")} {
 		if err := s.Enqueue(ctx, n, l); err != nil {
 			t.Fatalf("notification %s = %v", n.ID, err)
 		}
 	}
-	for _, n := range []store.Message{notice(group, "n4"), notice(other, "n5")} {
-		if err := s.Enqueue(ctx, n, l); !errors.Is(err, store.ErrSenderShareFull) {
-			t.Fatalf("%s beyond the group notifications' share = %v", n.ID, err)
-		}
+	if err := s.Enqueue(ctx, notice(group, "n5"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond the group's notification share = %v", err)
+	}
+	if err := s.Enqueue(ctx, notice(other, "n6"), l); err != nil {
+		t.Fatalf("another group's notification = %v", err)
 	}
 	// Removing alice's group message frees her share, for any path.
 	held, err := s.Claim(ctx, bob, "0002", "task-a", t0, t0.Add(time.Minute))

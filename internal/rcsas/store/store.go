@@ -127,10 +127,11 @@ type Message struct {
 	LeaseUntil time.Time
 }
 
-// GroupNotifications is the share of a queue that notifications about
-// group messages count against, whichever group and notifier they come
-// from. It is not an identity: those are URIs.
-const GroupNotifications = "#group-notifications"
+// GroupNotifications prefixes the share of a queue that notifications
+// about one group's messages count against, whichever participant sends
+// them: the share is GroupNotifications followed by the group's conference
+// URI. It is not an identity, which is a URI.
+const GroupNotifications = "#group-notifications "
 
 // ShareKey returns whose share of the recipient's queue m counts against,
 // and false when it counts against none:
@@ -138,17 +139,18 @@ const GroupNotifications = "#group-notifications"
 //   - a message counts against its writer's share: the sender, or for a
 //     group message its author, so that one person holds one share of a
 //     queue whichever way they write;
-//   - a group notification counts against GroupNotifications: each
-//     message an author writes is answered by every other participant,
-//     so the bound that makes a 1-to-1 notification need no share (one
-//     recipient answers it, once per kind) does not hold, and without one
-//     the receipts for a few messages to a large group would fill the
-//     author's queue;
+//   - a group notification counts against its group's notification share
+//     (GroupNotifications): each message an author writes is answered by
+//     every other participant, so the bound that makes a 1-to-1
+//     notification need no share (one recipient answers it, once per
+//     kind) does not hold, and without one the receipts for a few messages
+//     to a large group would fill the author's queue. A share per group
+//     keeps one busy group from crowding out the receipts of the others;
 //   - a 1-to-1 notification counts against none.
 func (m Message) ShareKey() (string, bool) {
 	switch {
 	case m.Mode == Group && m.Notification:
-		return GroupNotifications, true
+		return GroupNotifications + m.Sender, true
 	case m.Mode == Group && m.Author != "":
 		return m.Author, true
 	case !m.Notification:

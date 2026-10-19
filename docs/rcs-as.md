@@ -415,13 +415,13 @@ wrote in the group, or the author for one that came from outside, since a
 client takes a notification in a group only when it is `To` itself (rcsjta).
 
 Every message an author writes is answered by every other participant, up to
-twice. So all group notifications in a queue, from any group and notifier,
-share one sender's share of it (`#group-notifications`): the receipts for a
-few messages to a full group cannot fill the author's queue and lock out
-1-to-1 messages. A notification beyond that share, or beyond the queue, is
-taken (200) and dropped, counted as `group.notification.dropped`, rather than
-refused: the reference client ends its session with the group when one is
-refused.
+twice. So the notifications about one group's messages in a queue, from any
+notifier, share one sender's share of it (`#group-notifications <group>`, an
+eighth by default): the receipts for a few messages to a full group cannot
+fill the author's queue and lock out 1-to-1 messages, nor crowd out another
+group's. A notification beyond that share, or beyond the queue, is taken (200)
+and dropped, counted as `group.notification.dropped`, rather than refused: the
+reference client ends its session with the group when one is refused.
 
 Notifications rcs-as generates (expiry, full queue) go to the author the same
 way, from the recipient.
@@ -543,8 +543,8 @@ The table's properties:
   and bytes. Both are written in the same transaction as each enqueue and
   removal, and the enqueue is conditional on both bounds. A 1-to-1
   notification has no share item. A group message counts in its author's
-  share item, a group notification in the one named `#group-notifications`,
-  which no identity can be. An enqueue moves a size item's TTL to its message's, which
+  share item, a group notification in its group's, named
+  `#group-notifications <group>`, which no identity can be. An enqueue moves a size item's TTL to its message's, which
   only lengthens it, since messages are enqueued in time order with one
   lifetime. A removal leaves the TTL alone. Each queue item
   carries its own `size`. The SDK's idempotency token makes its own retry of a
@@ -721,6 +721,15 @@ Signals to alarm on (Phase 7):
   task. The delivery workers are shared, so more slow participants than
   `Workers` (32) at once slow everyone, by up to `RCSAS_DELIVERY_TIMEOUT`
   each.
+- **Receipts for an offline author can be dropped.** While the author has no
+  session, its queue keeps at most a share (125 by default) of one group's
+  notifications. One message to a full group of 100 that asks for both kinds
+  is answered with 198: 125 are kept and 73 dropped
+  (`group.notification.dropped`). The reference client marks a group message
+  displayed only when every recipient has said so
+  (`GroupChatImpl.isDisplayedByAllRecipients`), so such a message is never
+  shown as read by all. An author with a session, or that the engine can
+  invite, takes them as they come and loses none.
 - **Group fan-out is sequential.** A group message is queued for its
   recipients one enqueue transaction after another, on the sender's session,
   before the sender's answer. A message to 99 others at 10 ms an enqueue takes
