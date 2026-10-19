@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -63,7 +66,7 @@ func TestHSSCredentialsVerifyAnUpload(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, credentialJSON(t, digest.Algorithm(r.URL.Query().Get("algorithm")), alice))
 	})
-	src := NewHSSCredentials(mustURL(h.URL+"/hss/"), "provisioning-token", realm, lookupTimeout, 4)
+	src := NewHSSCredentials(mustURL(h.URL+"/hss/"), "provisioning-token", realm, lookupTimeout, 4, nil)
 	e := newEnv(t, func(o *Options) { o.Credentials = src })
 	doc := e.user(alice).uploadFile("via-hss", "content")
 	if len(doc.Infos) != 1 {
@@ -87,7 +90,7 @@ func TestHSSCredentialsVerifyAnUpload(t *testing.T) {
 
 func TestHSSRequestEscapesTheIMPIAsOnePathSegment(t *testing.T) {
 	h := newHSS(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
-	src := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4)
+	src := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4, nil)
 	for _, name := range []string{"a/../../admin", "a?b#c", "a%2Fb", "."} {
 		_, err := src.Lookup(t.Context(), name, digest.MD5)
 		if !errors.Is(err, ErrUnknownUser) {
@@ -132,7 +135,7 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 			w.WriteHeader(c.status)
 			fmt.Fprint(w, c.body)
 		})
-		_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4).Lookup(t.Context(), alice, digest.SHA256)
+		_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4, nil).Lookup(t.Context(), alice, digest.SHA256)
 		if err == nil || errors.Is(err, ErrUnknownUser) != c.unknown {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -150,7 +153,7 @@ func TestHSSAnswersOtherThanACredentialFail(t *testing.T) {
 func TestUnreachableHSSIsAnErrorWithoutTheURL(t *testing.T) {
 	h := newHSS(t, nil)
 	h.Close()
-	_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4).Lookup(context.Background(), alice, digest.SHA256)
+	_, err := NewHSSCredentials(mustURL(h.URL), "t", realm, lookupTimeout, 4, nil).Lookup(context.Background(), alice, digest.SHA256)
 	if err == nil || strings.Contains(err.Error(), "subscriptions") {
 		t.Fatalf("err = %v", err)
 	}
@@ -178,11 +181,94 @@ func TestTheHSSClientDoesNotFollowARedirectToAUsableAnswer(t *testing.T) {
 	h := newHSS(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
 	})
-	_, err := NewHSSCredentials(mustURL(h.URL), "provisioning-token", realm, lookupTimeout, 4).Lookup(t.Context(), alice, digest.SHA256)
+	_, err := NewHSSCredentials(mustURL(h.URL), "provisioning-token", realm, lookupTimeout, 4, nil).Lookup(t.Context(), alice, digest.SHA256)
 	if err == nil {
 		t.Error("a redirected lookup succeeded")
 	}
 	if len(reached) != 0 {
 		t.Errorf("the redirect was followed; the target saw Authorization %q", reached)
+	}
+}
+
+// In staging and prod the HSS client dials through runtime.InternalDialer:
+// a name in the namespace that resolves to loopback (or the metadata
+// address, or a public one) gets no connection, so the token goes nowhere
+// (#87). The same name resolving to a private address reaches the HSS.
+func TestTheHSSClientInProductionConnectsOnlyToPrivateAddresses(t *testing.T) {
+	var reached []string
+	h := newHSS(t, func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Header.Get("Authorization"))
+		fmt.Fprint(w, credentialJSON(t, digest.SHA256, alice))
+	})
+	_, port, _ := net.SplitHostPort(h.Listener.Addr().String())
+	base := mustURL("http://hss.rcs.local:" + port)
+	resolveTo := func(addr string) runtime.InternalDialer {
+		return runtime.InternalDialer{
+			Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr(addr)}, nil
+			},
+			// A private address cannot be listened on here, so a dial
+			// the check let through goes to the test HSS.
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, h.Listener.Addr().String())
+			},
+		}
+	}
+	for _, addr := range []string{"127.0.0.1", "169.254.170.2", "203.0.113.9"} {
+		src := NewHSSCredentials(base, "provisioning-token", realm, time.Second, 4, resolveTo(addr).DialContext)
+		_, err := src.Lookup(t.Context(), alice, digest.SHA256)
+		if !errors.Is(err, runtime.ErrAddressNotPrivate) || strings.Contains(err.Error(), "provisioning-token") {
+			t.Errorf("resolving to %s: %v, want ErrAddressNotPrivate without the token", addr, err)
+		}
+	}
+	if len(reached) != 0 {
+		t.Fatalf("the HSS was reached with %q", reached)
+	}
+	src := NewHSSCredentials(base, "provisioning-token", realm, time.Second, 4, resolveTo("10.0.1.5").DialContext)
+	if _, err := src.Lookup(t.Context(), alice, digest.SHA256); err != nil || len(reached) != 1 {
+		t.Fatalf("resolving to 10.0.1.5: %v, reached %d times", err, len(reached))
+	}
+	// credentialSource sets the dialer in production only: dev runs the
+	// HSS on loopback.
+	cfg := Config{Credentials: CredentialsHSS, HSSURL: base, Realm: realm, HSSTimeout: time.Second, MaxLookups: 4}
+	for production, want := range map[bool]bool{true: true, false: false} {
+		tr := credentialSource(cfg, production).(*HSSCredentials).client.Transport.(*http.Transport)
+		if got := tr.DialContext != nil; got != want {
+			t.Errorf("production %t: dialer set %t", production, got)
+		}
+	}
+}
+
+// A DialContext of its own turns HTTP/2 off in net/http unless the
+// transport asks for it, so the production HSS client sets
+// ForceAttemptHTTP2: an https HSS keeps h2 in staging and prod (#114).
+func TestTheProductionHSSClientSpeaksHTTP2ToAnHTTPSHSS(t *testing.T) {
+	var proto string
+	hss := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proto = r.Proto
+		fmt.Fprint(w, credentialJSON(t, digest.SHA256, alice))
+	}))
+	hss.EnableHTTP2 = true
+	hss.StartTLS()
+	defer hss.Close()
+	_, port, _ := net.SplitHostPort(hss.Listener.Addr().String())
+	d := runtime.InternalDialer{
+		Timeout: time.Second,
+		Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("10.0.1.5")}, nil
+		},
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hss.Listener.Addr().String())
+		},
+	}
+	// httptest's certificate names example.com.
+	src := NewHSSCredentials(mustURL("https://example.com:"+port), "provisioning-token", realm, time.Second, 4, d.DialContext)
+	tr := src.client.Transport.(*http.Transport)
+	tr.TLSClientConfig = hss.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	if _, err := src.Lookup(t.Context(), alice, digest.SHA256); err != nil {
+		t.Fatal(err)
+	}
+	if proto != "HTTP/2.0" {
+		t.Fatalf("the HSS was asked over %s, want HTTP/2.0", proto)
 	}
 }

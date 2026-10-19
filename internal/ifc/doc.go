@@ -40,9 +40,11 @@
 // with the size of the compiled pattern times the length of the value. What
 // is bounded, exactly:
 //
-//   - Compile: a pattern compiles to at most [MaxPatternInstructions] and a
-//     set to at most [MaxSetInstructions]; Compile refuses more, and refuses
-//     an oversized pattern before building its program.
+//   - Compile: a pattern is at most [MaxPatternBytes] long, which bounds
+//     the cost of parsing it, and compiles to at most
+//     [MaxPatternInstructions]; a set compiles to at most
+//     [MaxSetInstructions]. Compile refuses more, and refuses an oversized
+//     pattern before parsing it or building its program.
 //   - Input: one evaluation examines a Request-URI of at most
 //     [MaxRequestURILength], header names and values of at most
 //     [MaxHeaderLength] and [MaxHeaderBytes] together, and SDP lines of at
@@ -67,11 +69,17 @@
 // reads an ERE, also where Perl syntax, which Go's matcher reads, would
 // differ: "0+?" is (0+)?, not a lazy repetition; and, as regexec reads a
 // value without REG_NEWLINE, "." and "[^x]" match a newline and "^" and "$"
-// only the ends of the value. Go's parser still departs from IEEE 1003.1 in
-// two ways: a backslash inside brackets escapes ("[\.]" is a dot, not a
-// backslash or a dot) and escapes such as "\x41" are accepted. Wrapping a
-// pattern in ".*" on both sides never changes what it selects. Operators
-// writing iFC, and docs/hss.md, follow these rules.
+// only the ends of the value. Where Go's parser departs from IEEE 1003.1,
+// Compile refuses the pattern and names the construct rather than compile
+// Go's reading (#67): a backslash inside a bracket expression ("[\.]" is a
+// backslash or a dot in POSIX, a dot in Go), a backslash before anything but
+// an ERE special character ("\x41", "\d", "\n", "\1", "\<", "\@"),
+// collating symbols and equivalence classes ("[[.a.]]", "[[=a=]]"), the
+// non-class "[[:^alpha:]]" and an interval without a lower bound ("a{,3}").
+// A backslash before a special character ("\.", "\+") is a literal, as
+// everywhere. Named classes hold ASCII characters only, as in the POSIX
+// locale. Wrapping a pattern in ".*" on both sides never changes what it
+// selects. Operators writing iFC, and docs/hss.md, follow these rules.
 //
 // # Presenting a SIP request
 //

@@ -54,6 +54,16 @@ type Request interface {
 // bypass an application server, or reach one it should not. The S-CSCF
 // refuses such a request.
 const (
+	// MaxPatternBytes bounds the text of one pattern, so that the cost of
+	// parsing it is bounded: Go's parser is quadratic on some inputs, such
+	// as a bracket expression full of "[:" that no ":]" closes, which is a
+	// single character class the instruction limits do not catch (#96).
+	// Within the limit the costliest patterns known take a few milliseconds
+	// to compile (about 10 ms for 1024 negated classes, case-folded); a
+	// profile's total is bounded only by MaxSetInstructions and the size of
+	// the request that carries it. A pattern a person writes is tens of
+	// bytes.
+	MaxPatternBytes = 4 << 10
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
 	// pattern a person writes compiles to tens of instructions; counted
 	// repetition ("{n}") is what multiplies the size.
@@ -181,9 +191,11 @@ const (
 // Compile checks criteria (as Subscription.Marshal would), compiles their
 // patterns and orders them by priority. It fails when two criteria share a
 // priority, which TS 29.228 B.2.2 forbids and which would leave their order
-// to chance, or when a pattern is not a POSIX extended regular expression.
+// to chance, when a pattern is not a POSIX extended regular expression, or
+// when it uses a construct Go reads differently (see the package doc).
 // Errors name the criterion by priority and never quote a pattern, which may
-// hold a subscriber identity.
+// hold a subscriber identity; a refused construct is named by its own
+// characters only.
 func Compile(criteria []FilterCriteria) (*Set, error) {
 	return CompileWithLimits(criteria, Limits{})
 }
@@ -304,11 +316,13 @@ const (
 const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 
 // compilePattern compiles a POSIX extended regular expression (TS 29.228
-// Annex F). The pattern is parsed as an ERE, which refuses Perl extensions
-// such as \d and (?i), and the parsed tree, not the source text, is what gets
-// compiled: Go's matcher reads Perl syntax, in which some valid EREs mean
-// something else. "0+?" is (0+)? in an ERE, which matches the empty value,
-// but the lazy 0+? in Perl, which needs a 0 (#61).
+// Annex F). A pattern using a construct Go's parser reads differently from
+// IEEE 1003.1 is refused first, naming it ([ereDeparture]). The pattern is
+// then parsed as an ERE, which refuses Perl extensions such as (?i), and the
+// parsed tree, not the source text, is what gets compiled: Go's matcher
+// reads Perl syntax, in which some valid EREs mean something else. "0+?"
+// is (0+)? in an ERE, which matches the empty value, but the lazy 0+? in
+// Perl, which needs a 0 (#61).
 //
 // A case-insensitive pattern is parsed with FoldCase, so that the parser
 // folds every literal and bracket expression before it merges them; folding
@@ -321,6 +335,12 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // ([sameMeaning]), so a pattern whose meaning could not be kept exactly is
 // refused rather than compiled into something else.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
+	if len(source) > MaxPatternBytes {
+		return pattern{}, fmt.Errorf("%s is longer than MaxPatternBytes (%d bytes)", name, MaxPatternBytes)
+	}
+	if construct := ereDeparture(source); construct != "" {
+		return pattern{}, fmt.Errorf("%s uses %s, which this engine reads differently from a POSIX ERE", name, construct)
+	}
 	flags := posixFlags
 	if mode&patternFoldCase != 0 {
 		flags |= syntax.FoldCase
@@ -623,6 +643,9 @@ func isPlainToken(s string) bool {
 // matchesSomething reports whether a Content pattern restricts the value at
 // all; an empty one, or ".*", is the same as no Content.
 func matchesSomething(content string) bool {
+	if len(content) > MaxPatternBytes {
+		return true // compilePattern refuses it before parsing it
+	}
 	tree, err := syntax.Parse(content, posixFlags)
 	if err != nil {
 		return true // compilePattern reports the error

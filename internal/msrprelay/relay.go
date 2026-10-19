@@ -304,7 +304,8 @@ func (r *Relay) handle(nc net.Conn) {
 }
 
 // source returns the client's address: from the PROXY header when one is
-// required, from the socket otherwise. A LOCAL header is an NLB health
+// required, from the socket otherwise. It is personal data: a log of it goes
+// through pii.ClientIP (#80). A LOCAL header is an NLB health
 // check and is closed without a word, as is a connection that sends nothing
 // at all, which is what a plain TCP health check does.
 func (r *Relay) source(nc net.Conn) (netip.Addr, bool) {

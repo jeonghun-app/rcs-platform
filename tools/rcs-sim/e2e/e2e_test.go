@@ -74,8 +74,10 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	t.Logf("rcs-sim output:\n%s%s", stdout.String(), stderr.String())
+	// A failed run is still checked: its error strings are where an
+	// address would leak.
 	if err != nil {
-		t.Fatalf("rcs-sim: %v", err)
+		t.Errorf("rcs-sim: %v", err)
 	}
 
 	checkResults(t, stdout.String(), stderr.String(), []string{

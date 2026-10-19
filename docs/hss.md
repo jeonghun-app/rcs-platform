@@ -222,6 +222,33 @@ selects `Contact`, not `Accept-Contact`); every other pattern matches anywhere i
 its field, so anchor it with `^`/`$` to match a whole value. Request-URI patterns
 ignore case.
 
+A few constructs mean one thing to POSIX and another to the Go engine the S-CSCF
+runs, so the API refuses them with 400, naming the construct:
+
+- a backslash inside brackets (`[\.]com`; write `[.]com` or `\.com`);
+- a backslash before anything but an ERE special character, one of
+  `. [ ] ( ) * + ? { } | ^ $ \`: letters and digits (`\d`, `\w`, `\b`, `\x41`,
+  `\n`, `\1`), which some engines read as classes or escapes, `\<`, `\>`, `` \` ``
+  and `\'`, which glibc and musl read as word or value boundaries, and other
+  punctuation (`\-`, `\@`, `\/`, `\:`). Write `[[:digit:]]`, `[[:space:]]` and
+  so on, or the character itself;
+- collating symbols and equivalence classes (`[[.a.]]`, `[[=a=]]`), and
+  `[[:^alpha:]]`, which is not a class name (write `[^[:alpha:]]`);
+- an interval without a lower bound (`a{,3}`; write `a{0,3}`, or `a\{,3\}` for
+  the text).
+
+A backslash before a special character, such as `\.` or `\+`, is a literal and
+is fine. Named classes such as `[[:alpha:]]` hold ASCII characters only, as in
+the POSIX locale: `[[:alpha:]]` does not match `ä`, and `[^[:upper:]]` does.
+
+A pattern is at most 4 KiB (`MaxPatternBytes`); a longer one is refused with
+400 naming the limit. The limit bounds the time to parse a pattern, which for
+some inputs grows with the square of their length.
+
+The API checks patterns when a profile is written. A profile stored before
+this rule keeps working as it is, and needs these constructs removed when it
+is next changed.
+
 The S-CSCF evaluates a profile for every initial request within a work budget
 (`internal/ifc`, `DefaultMaxWork`) and fails the evaluation of a request the
 budget cannot pay for. Write each condition as a plain header name and a literal
@@ -277,8 +304,9 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   `api.data_error`.
 - Alarm candidates (Phase 7): `cx.*.error`, `lock.busy`, `api.store_failure`,
   `api.data_error`, `push.*.no_peer`, `push.*.failed`, `aka.sqn_exhausted`,
-  `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency against
-  `HSS_CX_TIMEOUT`.
+  `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency
+  (Maximum, or the average `cx.sar.sum / cx.sar.count`) against
+  `HSS_CX_TIMEOUT` (docs/architecture.md §8 has the rules for EMF alarms).
 - A shared profile's fan-out that a shutdown cuts short logs `profile push cut
   short by shutdown` with how many subscriptions it reached; apply the profile
   again to reach the rest before they register again.
@@ -309,9 +337,10 @@ units, a re-registration about 4 read and 1–2 write units. At ap-northeast-2
 on-demand prices (read $0.1355 and write $0.68 per million units, 2026-10), a
 million registrations cost about $3 in DynamoDB and a million re-registrations
 about $1.5; a million subscribers re-registering every hour, about $1.1k a month,
-and up to six times that for clients on 600 s registrations (ADR 0003). Each Cx request writes two EMF lines (count and
-latency, about 300 bytes each), about 2.4 KB per registration: some 2.4 GB, $1.8
-of log ingestion at $0.76/GB, per million registrations. KMS sees only one
+and up to six times that for clients on 600 s registrations (ADR 0003). Metrics
+cost almost nothing in log ingestion: the runtime aggregates them and writes one
+EMF line per metric a minute, at most a few kilobytes each, however many Cx
+requests a task serves. KMS sees only one
 `Decrypt` per task start.
 
 On a task, the profile work of a SAR, reading the stored profile and writing
