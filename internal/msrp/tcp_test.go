@@ -222,6 +222,10 @@ type relayRigTCP struct {
 	asReg           *Registry
 	relay           *pairBinder
 	relayConns      chan *Conn
+	// users are the sessions of each user, by the relay's public
+	// session-id, kept for a failed bind's report (#140).
+	usersMu sync.Mutex
+	users   map[string][3]*Session // rcs-as, relay edge, relay core
 }
 
 // pairBinder hands out prepared bridges by the relay session-id.
@@ -324,6 +328,12 @@ func (rig *relayRigTCP) addUser(t *testing.T, n int, asH Handler) (asSess *Sessi
 	rig.relay.mu.Lock()
 	rig.relay.pairs[relPub.SessionID] = [2]*Session{a, b}
 	rig.relay.mu.Unlock()
+	rig.usersMu.Lock()
+	if rig.users == nil {
+		rig.users = map[string][3]*Session{}
+	}
+	rig.users[relPub.SessionID] = [3]*Session{as, a, b}
+	rig.usersMu.Unlock()
 	return as, cl, relPub
 }
 
@@ -344,12 +354,37 @@ func (rig *relayRigTCP) dialClient(t *testing.T, local, relayPub URI, h Handler)
 		// A bind normally takes milliseconds, under a starved CPU well
 		// under a second; one that waits out the 30 s transaction timeout
 		// in CI could not be reproduced (#140), so the failure carries
-		// where every goroutine was.
+		// how far the bind got at each hop and where every goroutine was.
 		buf := make([]byte, 16<<20)
 		buf = buf[:runtime.Stack(buf, true)]
-		t.Fatalf("bind of %s failed after %v: %v\ngoroutines:\n%s", local.SessionID, time.Since(start), err, buf)
+		t.Fatalf("bind of %s failed after %v: %v\n%s\ngoroutines:\n%s", local.SessionID, time.Since(start), err, rig.bindState(relayPub), buf)
 	}
 	return s, c
+}
+
+// bindState says how far a client's bind got: whether the relay still
+// waits for it (its pair not taken, so the bind SEND never reached Bind),
+// and which of the user's sessions are attached to a connection. A pair
+// taken with every session attached is a bind whose 200 to the client was
+// lost; one with the core or rcs-as session unattached is a core bind that
+// failed or was never answered.
+func (rig *relayRigTCP) bindState(relayPub URI) string {
+	rig.relay.mu.Lock()
+	_, waiting := rig.relay.pairs[relayPub.SessionID]
+	rig.relay.mu.Unlock()
+	rig.usersMu.Lock()
+	u := rig.users[relayPub.SessionID]
+	rig.usersMu.Unlock()
+	attached := func(s *Session) bool {
+		if s == nil {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.conn != nil && !s.closed
+	}
+	return fmt.Sprintf("relay pair still waiting for the bind: %t; attached: relay edge %t, relay core %t, rcs-as %t",
+		waiting, attached(u[1]), attached(u[2]), attached(u[0]))
 }
 
 // rawClient binds a session with a bare TCP connection and returns it, so
