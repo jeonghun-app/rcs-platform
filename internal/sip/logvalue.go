@@ -21,11 +21,11 @@ import (
 // values, or a struct of the service's own that holds one, reaches the JSON
 // handler through encoding/json, which ignores LogValue. So the parsers and
 // accessors return lists as the slice types below (Vias, Contacts, Addresses,
-// Challenges, CredentialsList), which log each element through its LogValue,
-// and every type with a LogValue also has a MarshalJSON writing the same
-// redacted form, which covers plain slices and struct fields. Text handlers
-// format such values with fmt instead; the platform logs JSON only
-// (docs/architecture.md §8).
+// Challenges, CredentialsList, AcceptContacts, Reasons), which log each
+// element through its LogValue, and every type with a LogValue also has a
+// MarshalJSON writing the same redacted form, which covers plain slices and
+// struct fields. Text handlers format such values with fmt instead; the
+// platform logs JSON only (docs/architecture.md §8).
 //
 // TODO(#2): pass user parts and numbers through internal/pii once it lands, so
 // operators can correlate the masked form; until then they are left out.
@@ -33,7 +33,8 @@ import (
 const redactedMark = "***"
 
 // LogValue logs the scheme and host only, an IP host truncated to its
-// network.
+// network. Parameters and headers are left out: a gr parameter holds the
+// device's instance ID (RFC 5627 §3.1), headers the peer's text.
 func (u URI) LogValue() slog.Value { return slog.StringValue(u.redacted()) }
 
 func (u URI) redacted() string {
@@ -46,9 +47,58 @@ func (u URI) redacted() string {
 			return u.Scheme + ":" + host
 		}
 		return u.Scheme + ":" + redactedMark + "@" + host
-	default:
+	case "im", "pres":
+		if domain, ok := mailboxDomain(u.Opaque); ok {
+			return u.Scheme + ":" + redactedMark + "@" + loggedHost(domain)
+		}
 		return u.Scheme + ":" + redactedMark
+	default:
+		// The scheme is the peer's text too, if a token.
+		return pii.Redact(u.Scheme) + ":" + redactedMark
 	}
+}
+
+// mailboxDomain returns the domain of an im or pres URI's mailbox,
+// user@domain then headers (RFC 3860 §3, RFC 3859 §3), if it is a host as
+// a SIP URI's is. The domain ends at the first ";", "/", "?" or ">", and a
+// port is dropped: what follows is the peer's text, a gr parameter or a
+// path (review of #132). The user may hold "@", the domain cannot.
+func mailboxDomain(opaque string) (string, bool) {
+	mailbox, _, _ := strings.Cut(opaque, "?")
+	at := strings.LastIndexByte(mailbox, '@')
+	if at < 0 {
+		return "", false
+	}
+	domain := mailbox[at+1:]
+	if i := strings.IndexAny(domain, ";/>"); i >= 0 {
+		domain = domain[:i]
+	}
+	host, port := domain, ""
+	if strings.HasPrefix(domain, "[") {
+		if end := strings.IndexByte(domain, ']'); end >= 0 {
+			host, port = domain[:end+1], domain[end+1:]
+		}
+	} else if i := strings.IndexByte(domain, ':'); i >= 0 {
+		host, port = domain[:i], domain[i:]
+	}
+	if port != "" && (len(port) < 2 || port[0] != ':' || strings.Trim(port[1:], "0123456789") != "") {
+		return "", false
+	}
+	return host, validHost(host)
+}
+
+// LoggedURI returns the URI s as URI.LogValue logs it, for a URI that
+// another protocol carries as text, such as a CPIM address
+// (internal/cpim). A URI that does not parse keeps only its scheme, or is
+// masked whole.
+func LoggedURI(s string) string {
+	if u, err := ParseURI(s); err == nil {
+		return u.redacted()
+	}
+	if scheme, _, ok := strings.Cut(s, ":"); ok && scheme != "" && validScheme(scheme) {
+		return pii.Redact(strings.ToLower(scheme)) + ":" + redactedMark
+	}
+	return redactedMark
 }
 
 // loggedHost is a URI or Via host as it may be logged. An IP address there
@@ -113,6 +163,36 @@ func (v Via) LogValue() slog.Value {
 	)
 }
 
+// LogValue logs the names of the feature parameters and flags only: their
+// values are the peer's text, and +sip.instance carries the device's
+// instance identifier, often its IMEI (RFC 5626 §4.1, RFC 7254) (#109).
+// The names, the peer's text too, go through internal/pii.
+func (a AcceptContact) LogValue() slog.Value {
+	names := make([]string, len(a.Params))
+	for i, p := range a.Params {
+		names[i] = p.Name
+	}
+	return slog.GroupValue(slog.String("params", pii.Redact(strings.Join(names, ";"))))
+}
+
+// LogValue logs the protocol and the cause; the text is the peer's free
+// text and is left out (#109). A cause is a SIP status code or a Q.850
+// cause (RFC 3326 §2), three digits at most; a longer number is the peer's
+// too, and only marked.
+func (r Reason) LogValue() slog.Value {
+	attrs := []slog.Attr{slog.String("protocol", pii.Redact(r.Protocol))}
+	if c, ok := r.Cause(); ok {
+		if 0 <= c && c <= maxLoggedCause {
+			attrs = append(attrs, slog.Int("cause", c))
+		} else {
+			attrs = append(attrs, slog.String("cause", redactedMark))
+		}
+	}
+	return slog.GroupValue(attrs...)
+}
+
+const maxLoggedCause = 999
+
 // Vias is a Via header's elements, top first, as ParseVia and Header.Via
 // return them. It exists so that logging them all goes through Via.LogValue:
 // a plain []Via would be logged field by field, received included.
@@ -129,6 +209,20 @@ type Addresses []Address
 // Challenges is one challenge per WWW-Authenticate or Proxy-Authenticate
 // field; logged, each goes through Challenge.LogValue, nonce left out.
 type Challenges []Challenge
+
+// AcceptContacts is an Accept-Contact header's elements; logged, each goes
+// through AcceptContact.LogValue.
+type AcceptContacts []AcceptContact
+
+// Reasons is a Reason header's elements; logged, each goes through
+// Reason.LogValue.
+type Reasons []Reason
+
+// LogValue logs each element by its position.
+func (as AcceptContacts) LogValue() slog.Value { return listValue(as) }
+
+// LogValue logs each element by its position.
+func (rs Reasons) LogValue() slog.Value { return listValue(rs) }
 
 // CredentialsList is one set of credentials per Authorization or
 // Proxy-Authorization field; logged, each goes through Credentials.LogValue,
@@ -182,11 +276,24 @@ func (r Request) LogValue() slog.Value {
 func (r Response) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Int("status", r.StatusCode),
-		slog.String("reason", r.Reason),
+		slog.String("reason", loggedReason(r.StatusCode, r.Reason)),
 		slog.Int("headers", r.Header.Len()),
 		slog.Int("body_bytes", len(r.Body)),
 	)
 }
+
+// loggedReason is a reason phrase as it may be logged: the peer's text,
+// which can name a person ("Alice is busy") in a way internal/pii cannot
+// recognise, so only the phrase registered for the code (DefaultReason) is
+// logged as it is; any other is marked as custom (#109).
+func loggedReason(code int, phrase string) string {
+	if phrase == "" || strings.EqualFold(phrase, DefaultReason(code)) {
+		return phrase
+	}
+	return customReason
+}
+
+const customReason = "(custom)"
 
 // The types above also marshal to JSON as their log values, so that a plain
 // slice of them, or a field of a struct of the service's own, logged through
@@ -211,6 +318,12 @@ func (c Credentials) MarshalJSON() ([]byte, error) { return jsonOf(c.LogValue())
 
 // MarshalJSON writes the log value.
 func (v Via) MarshalJSON() ([]byte, error) { return jsonOf(v.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (a AcceptContact) MarshalJSON() ([]byte, error) { return jsonOf(a.LogValue()) }
+
+// MarshalJSON writes the log value.
+func (r Reason) MarshalJSON() ([]byte, error) { return jsonOf(r.LogValue()) }
 
 // MarshalJSON writes the log value.
 func (h Header) MarshalJSON() ([]byte, error) { return jsonOf(h.LogValue()) }

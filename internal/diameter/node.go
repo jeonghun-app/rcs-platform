@@ -93,8 +93,10 @@ type Config struct {
 	// that long is treated as failed. It defaults to WatchdogInterval.
 	WriteTimeout time.Duration
 	// MaxInFlight bounds concurrent inbound requests per connection (more
-	// are answered with DIAMETER_TOO_BUSY) and the length of the write queue
-	// that handlers and Send wait on.
+	// are answered with DIAMETER_TOO_BUSY), the length of the queue of
+	// their answers, which handlers wait on, and the length of the queue of
+	// requests that Send waits on. Answers are written first, at most 16 in
+	// a row (MaxInFlight, if fewer) before one queued request.
 	MaxInFlight int
 
 	// Clock, Random and Dial are injected for tests. Random must be safe for
