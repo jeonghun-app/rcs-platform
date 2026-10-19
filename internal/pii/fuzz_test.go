@@ -78,6 +78,7 @@ func FuzzRedact(f *testing.F) {
 		"0000000 0０１0000",
 		"urn:gsma:imei:00101000-１７６１４８-１",
 		"０１０-００００-０００１ +１ ５５５ ０１００ ００１",
+		"call ０１０－００００－０００１ ＋１\u3000５５５\u3000０１０\u3000０００１ （０７７００）９００．００１",
 		`From: <im:"bob smith"@` + testDomain + `> pres:"a \"" im:"x`,
 		`im:"` + testMSISDN + `"@` + testDomain,
 	} {
@@ -101,10 +102,10 @@ func FuzzRedact(f *testing.F) {
 			}
 			// The grouped rules read ASCII digits; a number in another
 			// script's digits must be masked as well.
-			if m := groupedInternational.FindString(asciiDigits(a)); m != "" {
+			if m := groupedInternational.FindString(asciiNumberChars(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
-			if m := nationalNumberIn(asciiDigits(a)); m != "" {
+			if m := nationalNumberIn(asciiNumberChars(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
 			}
 		}
