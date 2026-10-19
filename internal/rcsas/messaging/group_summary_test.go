@@ -231,8 +231,9 @@ func (s *interrupting) Sent(ctx context.Context, sender, id string, now time.Tim
 var smallQueue = Config{MaxQueueMessages: 8, QueueSenderShare: 8}
 
 // Test plan 3: a receipt that comes in while a summary is being sent is
-// not lost. The summary's removal finds a new mark, so it stays, and goes
-// out again with the new one.
+// not lost. carol's delivery takes the share bob's left, so her display is
+// summarized; the summary's removal finds the new mark, so it stays, and
+// goes out again with hers only: bob's has not changed.
 func TestAReceiptDuringASummaryIsSentToo(t *testing.T) {
 	everyone := []string{alice, bob, carol}
 	st := &interrupting{Store: store.NewMemory()}
@@ -255,8 +256,16 @@ func TestAReceiptDuringASummaryIsSentToo(t *testing.T) {
 		t.Fatalf("%d summaries", sums)
 	}
 	st.hook = func() {
-		if err := r.e.SubmitGroup(t.Context(), groupFrom(carol, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))); err != nil {
-			t.Errorf("carol's receipt: %v", err)
+		for _, k := range []struct {
+			kind   imdn.Kind
+			status imdn.Status
+		}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
+			if err := r.e.SubmitGroup(t.Context(), groupFrom(carol, receipt(t, "m1", k.kind, k.status))); err != nil {
+				t.Errorf("carol's receipt: %v", err)
+			}
+		}
+		if got := r.m.get("group.notification.summarized"); got != 2 {
+			t.Errorf("carol's display went in whole: %d summarized", got)
 		}
 	}
 	a := newAuthor(alice)
@@ -266,6 +275,9 @@ func TestAReceiptDuringASummaryIsSentToo(t *testing.T) {
 	waitFor(t, "read by all", func() bool { return a.readByAll("m1", []string{bob, carol}) })
 	waitFor(t, "alice's queue empty", func() bool { return st.Store.(*store.Memory).Len(alice) == 0 })
 	waitFor(t, "the summary expanded", func() bool { return r.m.get("group.summary.expanded") == 1 })
+	if got := r.m.get("group.summary.sent"); got != 2 {
+		t.Fatalf("the summary sent %d notifications, want bob's, then carol's", got)
+	}
 }
 
 // Test plan 4: a session that ends while a summary is sent leaves the
