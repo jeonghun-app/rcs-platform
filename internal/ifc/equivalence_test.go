@@ -266,7 +266,7 @@ func TestCaseFoldedAlternativeOfALetterAndANegatedClassStillMatchesTheLetter(t *
 // class back as a literal, which the meaning check takes for the same
 // thing (#206, found by FuzzEvaluateTrigger).
 func TestAFoldedAlternationThatMergesIntoOneRuneIsCompiled(t *testing.T) {
-	for _, p := range []string{"|0|[0]", "|0|[0]|", "[0]|0|", "(|1|[1])x", "^(-|[-])$", "|[0]|0"} {
+	for _, p := range []string{"|0|[0]", "|0|[0]|", "[0]|0|", "(|1|[1])x", "^(-|[-])$", "^(-|[-]|)$", "|[0]|0"} {
 		ref, err := regexp.CompilePOSIX(p)
 		if err != nil {
 			t.Fatal(err)
