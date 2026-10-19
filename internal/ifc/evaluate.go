@@ -64,16 +64,19 @@ const (
 	// is tens of bytes.
 	MaxPatternBytes = 4 << 10
 	// MaxSetCompileCost bounds the work of compiling one [Set], in cost
-	// units: one per byte of a pattern's source and of the text it is
-	// written out as, which the proof and the compiler parse again, and
-	// compileCostPerInstruction per instruction of its program (see
-	// patternCost). Patterns near MaxPatternBytes fit the instruction
-	// budget in dozens, and 47 of them took about half a second (#111);
-	// a unit is about a tenth of a microsecond, so the bound is tens of
-	// milliseconds whatever the profile. The default RCS profile costs
-	// about 6 500 units. Compile refuses a set that costs more, before
-	// parsing the pattern that would cross the bound when its source
-	// alone does; at most one pattern's cost, which MaxPatternBytes
+	// units counted rather than timed, so the same profile is accepted or
+	// refused on every host (see patternCost for what a pattern costs).
+	// Patterns near MaxPatternBytes fit the instruction budget in dozens,
+	// and 47 of them took about half a second (#111). On a 32-core
+	// development host under a load of 50 to 150, sets at the bound of
+	// each of twelve shapes took 5 to 37 ms to compile, the baseline shape
+	// (case-folded negated classes) 31 to 35 ms in the same runs, and no
+	// shape more than 1.1 times the baseline; times on another host, or
+	// under other load, differ, and the HSS compiles a profile several
+	// times per write. The default RCS profile costs about 21 000 units.
+	// Compile refuses a set that costs more,
+	// before parsing the pattern that would cross the bound when its
+	// source alone does; at most one pattern's work, which MaxPatternBytes
 	// bounds, is spent past it.
 	MaxSetCompileCost = 500_000
 	// MaxPatternInstructions bounds the compiled program of one pattern. A
@@ -257,19 +260,46 @@ type setBudget struct{ insts, cost int }
 // whose source alone exceeds what is left of the cost budget is refused
 // before it is parsed.
 func (b *setBudget) compile(name, source string, mode patternMode) (pattern, error) {
-	errCost := fmt.Errorf("the criteria cost more than MaxSetCompileCost (%d units) to compile", MaxSetCompileCost)
-	if len(source) > b.cost {
-		return pattern{}, errCost
+	p, _, err := b.compileUnlessAny(name, source, mode, false)
+	return p, err
+}
+
+// compileContent compiles a Content pattern of the set as compile does,
+// unless it matches every value (empty, or ".*"), which is the same as no
+// Content: then any is true and only its parse, the source cost, is
+// charged. The pattern is parsed once either way, so every parse is
+// pre-checked and paid for (#115).
+func (b *setBudget) compileContent(name, source string) (p pattern, any bool, err error) {
+	return b.compileUnlessAny(name, source, 0, true)
+}
+
+func (b *setBudget) compileUnlessAny(name, source string, mode patternMode, content bool) (pattern, bool, error) {
+	// A pattern over MaxPatternBytes is refused by parsePattern, naming
+	// that limit, before anything is parsed.
+	if len(source) <= MaxPatternBytes && sourceCost(len(source)) > b.cost {
+		return pattern{}, false, b.exceeded()
 	}
-	p, err := compilePattern(name, source, mode, &b.insts)
+	tree, err := parsePattern(name, source, mode)
 	if err != nil {
-		return p, err
+		return pattern{}, false, err
+	}
+	if content && tree.Op == syntax.OpEmptyMatch {
+		b.cost -= sourceCost(len(source))
+		return pattern{}, true, nil
+	}
+	p, err := buildPattern(name, source, tree, mode, &b.insts)
+	if err != nil {
+		return pattern{}, false, err
 	}
 	if p.cost > b.cost {
-		return pattern{}, errCost
+		return pattern{}, false, b.exceeded()
 	}
 	b.cost -= p.cost
-	return p, nil
+	return p, false, nil
+}
+
+func (b *setBudget) exceeded() error {
+	return fmt.Errorf("the criteria cost more than MaxSetCompileCost (%d units) to compile", MaxSetCompileCost)
 }
 
 func compileTrigger(tp *TriggerPoint, b *setBudget) (*compiledTrigger, error) {
@@ -309,15 +339,15 @@ func compileSPT(spt *SPT, b *setBudget) (compiledSPT, error) {
 		// pattern must match the whole name: "Contact" must not select
 		// Accept-Contact or Reject-Contact. Values are matched as written,
 		// anywhere in the value, as Annex F's regexec semantics give.
-		if c.name, err = b.compile("Header", v.Header, patternFoldCase|patternWhole); err == nil && matchesSomething(v.Content) {
-			c.value, err = b.compile("Content", v.Content, 0)
+		if c.name, err = b.compile("Header", v.Header, patternFoldCase|patternWhole); err == nil {
+			c.value, _, err = b.compileContent("Content", v.Content)
 		}
 	case SessionCase:
 		c.kind, c.session = kindSessionCase, v
 	case SessionDescription:
 		c.kind = kindSessionDescription
-		if c.name, err = b.compile("Line", v.Line, 0); err == nil && matchesSomething(v.Content) {
-			c.value, err = b.compile("Content", v.Content, 0)
+		if c.name, err = b.compile("Line", v.Line, 0); err == nil {
+			c.value, _, err = b.compileContent("Content", v.Content)
 		}
 	}
 	return c, err
@@ -342,20 +372,40 @@ type pattern struct {
 
 const literalCost = 4
 
-// compileCostPerInstruction weighs one program instruction against one
-// byte of text in a pattern's compile cost: building a program, which
-// happens four times per pattern (the proof compiles the parsed and the
-// written-out trees, then syntax and regexp each compile the text), costs
-// several times as much per instruction as parsing costs per byte. It was
-// set so that the shapes measured for #111 (long literals, ".", negated and
-// folded classes) cost within a factor of three of each other per second.
-const compileCostPerInstruction = 8
+// The weights of a pattern's compile cost. A pattern costs
+// sourceCost(len(source)), one unit per byte of the text writeTree writes
+// it out as (the proof and the compiler parse it again), and
+// compileCostPerInstruction per program instruction: a program is built
+// four times per pattern (the proof compiles the parsed and the
+// written-out trees, then syntax and regexp each compile the text).
+//
+// They were set against the baseline shape, 1024 case-folded negated
+// classes in a Request-URI, by timing patterns of about 4 KiB alone in the
+// same run (#111, #115). Parse-dominated shapes, whose programs are small
+// ("0.|00|" repeated, a bracket full of unclosed "[:", a Content of "|"
+// that matches everything, short literal alternatives), took up to a third
+// of the baseline's time on one host while costing a tenth of its units,
+// and their parse grows faster than their length: hence the quadratic
+// source term, which is nothing for the tens of bytes a person writes and
+// a third of the baseline's cost at 4 KiB. With it no shape measured is
+// charged less per microsecond than the baseline, and the cheapest ones
+// (long literals) are charged up to several times more.
+const (
+	compileCostPerInstruction = 32
+	sourceCostPerByte         = 2
+	sourceCostQuadratic       = 512 // sourceCost adds n²/sourceCostQuadratic
+)
 
-// patternCost is the compile cost of a pattern with the given source,
-// written-out text and number of instructions.
-func patternCost(source, expr string, insts int) int {
-	return len(source) + len(expr) + compileCostPerInstruction*insts
+// patternCost is the compile cost of a pattern whose source, written-out
+// text and program have the given sizes.
+func patternCost(source, expr, insts int) int {
+	return sourceCost(source) + expr + compileCostPerInstruction*insts
 }
+
+// sourceCost is the cost of checking and parsing a pattern's source of n
+// bytes, whatever the parse finds; it is all a Content that matches every
+// value costs.
+func sourceCost(n int) int { return sourceCostPerByte*n + n*n/sourceCostQuadratic }
 
 type patternMode uint8
 
@@ -391,11 +441,21 @@ const posixFlags = syntax.POSIX | syntax.DotNL | syntax.ClassNL | syntax.OneLine
 // ([sameMeaning]), so a pattern whose meaning could not be kept exactly is
 // refused rather than compiled into something else.
 func compilePattern(name, source string, mode patternMode, budget *int) (pattern, error) {
+	tree, err := parsePattern(name, source, mode)
+	if err != nil {
+		return pattern{}, err
+	}
+	return buildPattern(name, source, tree, mode, budget)
+}
+
+// parsePattern checks source's length and constructs and parses it as an
+// ERE, without the outer ".*" of a pattern that matches anywhere.
+func parsePattern(name, source string, mode patternMode) (*syntax.Regexp, error) {
 	if len(source) > MaxPatternBytes {
-		return pattern{}, fmt.Errorf("%s is longer than MaxPatternBytes (%d bytes)", name, MaxPatternBytes)
+		return nil, fmt.Errorf("%s is longer than MaxPatternBytes (%d bytes)", name, MaxPatternBytes)
 	}
 	if construct := ereDeparture(source); construct != "" {
-		return pattern{}, fmt.Errorf("%s uses %s, which this engine reads differently from a POSIX ERE", name, construct)
+		return nil, fmt.Errorf("%s uses %s, which this engine reads differently from a POSIX ERE", name, construct)
 	}
 	flags := posixFlags
 	if mode&patternFoldCase != 0 {
@@ -405,13 +465,18 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if err != nil {
 		var se *syntax.Error
 		if errors.As(err, &se) {
-			return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
+			return nil, fmt.Errorf("%s is not a POSIX extended regular expression: %s", name, se.Code)
 		}
-		return pattern{}, fmt.Errorf("%s is not a POSIX extended regular expression", name)
+		return nil, fmt.Errorf("%s is not a POSIX extended regular expression", name)
 	}
 	if mode&patternWhole == 0 {
 		tree = withoutOuterDotStar(tree)
 	}
+	return tree, nil
+}
+
+// buildPattern compiles the parsed tree of source (see compilePattern).
+func buildPattern(name, source string, tree *syntax.Regexp, mode patternMode, budget *int) (pattern, error) {
 	tooComplex := fmt.Errorf("%s compiles to more than %d instructions", name, MaxPatternInstructions)
 	if estimateSize(tree) > 4*MaxPatternInstructions {
 		return pattern{}, tooComplex
@@ -444,7 +509,7 @@ func compilePattern(name, source string, mode patternMode, budget *int) (pattern
 	if err != nil {
 		return pattern{}, fmt.Errorf("%s cannot be compiled", name)
 	}
-	p := pattern{re: re, insts: n, cost: patternCost(source, expr, n)}
+	p := pattern{re: re, insts: n, cost: patternCost(len(source), len(expr), n)}
 	if mode&patternWhole != 0 && mode&patternFoldCase != 0 && isPlainToken(source) {
 		p.token = source
 	}
@@ -694,19 +759,6 @@ func isPlainToken(s string) bool {
 		}
 	}
 	return true
-}
-
-// matchesSomething reports whether a Content pattern restricts the value at
-// all; an empty one, or ".*", is the same as no Content.
-func matchesSomething(content string) bool {
-	if len(content) > MaxPatternBytes {
-		return true // compilePattern refuses it before parsing it
-	}
-	tree, err := syntax.Parse(content, posixFlags)
-	if err != nil {
-		return true // compilePattern reports the error
-	}
-	return withoutOuterDotStar(tree).Op != syntax.OpEmptyMatch
 }
 
 // withoutOuterDotStar drops a leading and a trailing ".*" from the tree of a

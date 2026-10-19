@@ -245,11 +245,12 @@ A pattern is at most 4 KiB (`MaxPatternBytes`); a longer one is refused with
 400 naming the limit. The limit bounds the time to parse a pattern, which for
 some inputs grows with the square of their length. A profile's patterns
 together may cost at most `MaxSetCompileCost` to compile, counted in bytes
-and instructions processed, so that each compile of a profile, the HSS's
-when it is written and the S-CSCF's when a user registers, stays within tens
-of milliseconds; about ten 4 KiB patterns of the
-costliest shape reach it, while the default RCS profile uses about 1%. A
-profile over it is refused with 400 naming the limit.
+and instructions processed rather than timed. A profile at the limit took 5
+to 37 ms per compile on a 32-core development host under a load of 50 to
+150, whatever its shape; other hosts and loads differ, and the HSS compiles
+a profile several times per write. Four to twelve 4 KiB patterns reach the
+limit, depending on their shape, while the default RCS profile uses about
+4%. A profile over it is refused with 400 naming the limit.
 
 The API checks patterns when a profile is written. A profile stored before
 this rule keeps working as it is, and needs these constructs removed when it
