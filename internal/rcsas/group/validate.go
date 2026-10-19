@@ -5,6 +5,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 )
 
@@ -60,4 +61,48 @@ func validText(s string, max int) bool {
 		}
 	}
 	return true
+}
+
+// nameKey is the form in which display names are compared for
+// uniqueness: lower case, white space runs as one space, the ends trimmed,
+// and the invisible format characters that make one name show as another
+// (bidirectional controls, zero-width characters, U+FEFF) left out. Names
+// a reader could not tell apart then compare equal. It does not fold
+// look-alike letters of different scripts.
+func nameKey(name string) string {
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case r == 0x061c, 0x200b <= r && r <= 0x200f, 0x202a <= r && r <= 0x202e, 0x2066 <= r && r <= 0x2069, r == 0xfeff:
+			return -1
+		}
+		return r
+	}, name)
+	return strings.ToLower(strings.Join(strings.Fields(clean), " "))
+}
+
+// nameTaken reports whether someone in g other than who, current or
+// former, goes by a name that compares equal to name. An empty name is
+// never taken.
+func nameTaken(g *groupstore.Group, who, name string) bool {
+	key := nameKey(name)
+	if key == "" {
+		return false
+	}
+	for _, p := range g.Participants {
+		if p.Identity != who && nameKey(p.DisplayName) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// nameOwners maps the nameKey of each name in g to whoever goes by it.
+func nameOwners(g *groupstore.Group) map[string]string {
+	owners := make(map[string]string, len(g.Participants))
+	for _, p := range g.Participants {
+		if k := nameKey(p.DisplayName); k != "" {
+			owners[k] = p.Identity
+		}
+	}
+	return owners
 }

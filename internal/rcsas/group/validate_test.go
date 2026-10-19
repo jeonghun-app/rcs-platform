@@ -3,6 +3,8 @@ package group
 import (
 	"errors"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 )
 
 // Values internal/conference could not write, or that no identity is.
@@ -162,4 +164,58 @@ func TestAGroupIsNotWrittenUnlessItsRosterCanBe(t *testing.T) {
 	if r.m.get("group.rejected.invalid") != 1 {
 		t.Fatalf("metrics %v", r.m)
 	}
+}
+
+// The security review (PR #118, round 2): a group message's From carries
+// its author's roster name, so no two people in a roster go by names a
+// reader could not tell apart.
+func TestADisplayNameIsOneParticipants(t *testing.T) {
+	r := newRig(t, Config{SenderRate: rateOff})
+	g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, CreatorName: "Alice", Invitees: []Invitee{
+		{Identity: bob, DisplayName: "Bob"}, {Identity: carol}, {Identity: dave, DisplayName: "Dave"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.s.Leave(t.Context(), g.URI, dave); err != nil {
+		t.Fatal(err)
+	}
+	for name, err := range map[string]error{
+		"bob as alice":                  joinErr(r, g, bob, "Alice"),
+		"carol as alice, shouting":      joinErr(r, g, carol, "  ALICE "),
+		"carol as alice, a zero width":  joinErr(r, g, carol, "Al\u200bice"),
+		"carol as alice, bidi controls": joinErr(r, g, carol, "\u202aAlice\u202c"),
+		"carol as dave, who left":       joinErr(r, g, carol, "dave"),
+		"adding erin as bob":            r.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: erin, DisplayName: "bob"}}),
+		"adding two of one name":        r.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: erin, DisplayName: "Eve"}, {Identity: "sip:x@example.net", DisplayName: "eve"}}),
+		"creating with two of one name": createErr(r, CreateRequest{Creator: erin, Invitees: []Invitee{{Identity: bob, DisplayName: "Ann"}, {Identity: carol, DisplayName: "ann"}}}),
+		"creating as one's own invitee": createErr(r, CreateRequest{Creator: erin, CreatorName: "Ann", Invitees: []Invitee{{Identity: bob, DisplayName: "ANN"}}}),
+	} {
+		if !errors.Is(err, ErrNameTaken) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// One's own name, a new one, and names that only look alike in other
+	// ways are fine.
+	for _, c := range []struct{ who, name string }{{bob, "Bob"}, {bob, "bob "}, {carol, "Carol"}, {bob, "Bobby"}} {
+		if err := joinErr(r, g, c.who, c.name); err != nil {
+			t.Errorf("%s as %q: %v", c.who, c.name, err)
+		}
+	}
+	if err := r.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: erin, DisplayName: "Bob"}}); err != nil {
+		t.Errorf("Bob is free since bob is Bobby: %v", err)
+	}
+	if r.m.get("group.rejected.name_taken") != 7 {
+		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+func joinErr(r *rig, g groupstore.Group, who, name string) error {
+	_, err := r.s.Join(r.t.Context(), g.URI, who, name)
+	return err
+}
+
+func createErr(r *rig, req CreateRequest) error {
+	_, err := r.s.Create(r.t.Context(), req)
+	return err
 }

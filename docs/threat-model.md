@@ -203,7 +203,10 @@ metadata.
   `From`, the writer's asserted identity under its roster name, and one `To`,
   the group. No other header that any receiver could read as a `From` or `To`
   survives, whatever its case, prefix or namespace, so nobody writes as
-  someone else, by address or by name. A 1-to-1 message, forwarded unchanged,
+  someone else by address. Nor by name: a roster refuses a name another
+  participant, current or former, goes by, compared without case, extra
+  space and invisible format characters (look-alike letters of other
+  scripts are not folded). A 1-to-1 message, forwarded unchanged,
   is refused if it has such a header.
 - **Notifications.** They are matched by the group's own record of the
   message, in the group or sent to the author outside it, accepted only from

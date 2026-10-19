@@ -329,6 +329,12 @@ cannot be written (`invalid`):
   leg opened under another spelling still gets its participant's copies.
 - **Names** are at most 100 bytes and **the subject** at most 256 bytes of
   UTF-8 that XML can carry, without control characters.
+- **A name is one participant's.** `Create`, `Join` and `Add` refuse a name
+  that another participant, current or former, goes by (`name_taken`), as
+  compared without case, extra white space, bidirectional controls and
+  zero-width characters. The author's roster name is in the `From` of every
+  group message, so one participant cannot pass for another by name.
+  Look-alike letters of different scripts are not folded.
 - **The Conversation-ID** is at most 256 bytes.
 
 ### Fan-out
@@ -662,7 +668,7 @@ identifier ever appears in a metric name.
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
-| `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
+| `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `name_taken`, `rate_limited` |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but not queued, beyond their share; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through

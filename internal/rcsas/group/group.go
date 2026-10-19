@@ -90,6 +90,9 @@ var (
 	ErrInvalid = errors.New("group: invalid request")
 	// ErrRateLimited: whoever asked has used up its allowance.
 	ErrRateLimited = errors.New("group: rate limited")
+	// ErrNameTaken: another participant, current or former, goes by that
+	// display name (nameKey), which would let one pass for the other.
+	ErrNameTaken = errors.New("group: display name taken")
 	// ErrBusy: the group kept changing under the update; try again.
 	ErrBusy = errors.New("group: too many concurrent changes")
 )
@@ -276,6 +279,13 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		return groupstore.Group{}, err
 	}
 	invitees = slices.DeleteFunc(invitees, func(in Invitee) bool { return in.Identity == creator })
+	names := groupstore.Group{Participants: []groupstore.Participant{{Identity: creator, DisplayName: r.CreatorName}}}
+	for _, in := range invitees {
+		if nameTaken(&names, in.Identity, in.DisplayName) {
+			return groupstore.Group{}, ErrNameTaken
+		}
+		names.Participants = append(names.Participants, groupstore.Participant{Identity: in.Identity, DisplayName: in.DisplayName})
+	}
 	switch {
 	case len(invitees) == 0:
 		return groupstore.Group{}, ErrInvalid
@@ -379,6 +389,9 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 			// participant renaming itself in a loop would spam them all.
 			return nil, ErrRateLimited
 		}
+		if displayName != "" && nameTaken(g, who, displayName) {
+			return nil, ErrNameTaken
+		}
 		if p.State != groupstore.Joined {
 			p.State, p.Since = groupstore.Joined, now
 		}
@@ -475,8 +488,10 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 			return nil, ErrNotParticipant
 		}
 		var changed []string
+		names := nameOwners(g)
 		for _, in := range who {
 			i := index(g, in.Identity)
+			key := nameKey(in.DisplayName)
 			switch {
 			case i >= 0 && g.Participants[i].State.Active():
 				continue
@@ -484,6 +499,11 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 				// Otherwise any participant could undo the chairman's
 				// removal at once (threat model T11).
 				return nil, ErrNotChairman
+			case key != "" && names[key] != "" && names[key] != in.Identity:
+				return nil, ErrNameTaken
+			}
+			if key != "" {
+				names[key] = in.Identity
 			}
 			changed = append(changed, in.Identity)
 			p := groupstore.Participant{Identity: in.Identity, DisplayName: in.DisplayName, Role: groupstore.Member,
@@ -659,6 +679,8 @@ func reasonOf(err error) string {
 		return "too_many"
 	case errors.Is(err, ErrInvalid):
 		return "invalid"
+	case errors.Is(err, ErrNameTaken):
+		return "name_taken"
 	}
 	return "other"
 }
