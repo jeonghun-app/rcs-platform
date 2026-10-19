@@ -103,6 +103,13 @@ test-integration: volumes ## Storage backends against S3 and DynamoDB containers
 	    done; \
 	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/hss/... ./internal/rcsas/...'
 
+# rcs-sim against the built ft-server and msrp-relay binaries
+# (tools/rcs-sim/e2e). Not part of `check`: it builds and starts three
+# binaries and runs every scenario, a few seconds of real traffic.
+.PHONY: e2e
+e2e: volumes ## End-to-end: rcs-sim against ft-server and msrp-relay
+	$(RUNGO) -e CGO_ENABLED=0 $(GOIMAGE) go test -tags e2e -count=1 -v ./tools/rcs-sim/e2e/
+
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz
 fuzz: volumes ## Run every fuzz target for FUZZTIME each

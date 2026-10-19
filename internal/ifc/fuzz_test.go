@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"regexp"
+	"regexp/syntax"
 	"strings"
 	"testing"
 )
@@ -109,6 +111,26 @@ func FuzzEvaluateTrigger(f *testing.F) {
 				_, b, errB := padded.Next(hr, Context{}, -1)
 				if errA == nil && errB == nil && a != b {
 					t.Fatalf("%q and .*%q.* disagree on %q: %t, %t", p2, p2, value, a, b)
+				}
+			}
+			// And the compiled pattern means what Go's POSIX compiler
+			// says the ERE means (#61: "0+?" is (0+)?, not lazy).
+			budget := MaxSetInstructions
+			if got, err := compilePattern("Content", p2, 0, &budget); err == nil {
+				if ref, err := regexp.CompilePOSIX(p2); err == nil && got.re.MatchString(value) != ref.MatchString(value) {
+					t.Fatalf("%q on %q: compiled %t, POSIX %t", p2, value, got.re.MatchString(value), ref.MatchString(value))
+				}
+			}
+		}
+		// An ERE is refused only for its size, in every mode.
+		for _, p := range []string{p1, p2} {
+			if _, err := syntax.Parse(p, posixFlags); err != nil {
+				continue
+			}
+			for _, mode := range []patternMode{0, patternFoldCase, patternFoldCase | patternWhole} {
+				budget := MaxSetInstructions
+				if _, err := compilePattern("Pattern", p, mode, &budget); err != nil && !strings.Contains(err.Error(), "instructions") {
+					t.Fatalf("%q (mode %d) refused: %v", p, mode, err)
 				}
 			}
 		}
