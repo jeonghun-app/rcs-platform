@@ -54,7 +54,9 @@ type pendingRequest struct {
 // that is bounded by bytes, served first, and never blocks; when it is full
 // the peer is not reading what it asked for, and the connection is closed
 // (a DWR is dropped instead, which the watchdog counts as unanswered).
-// Handlers and Send wait for room in the main queue, Send no longer than its
+// Handlers wait for room in the answer queue, which is written next, so an
+// admitted request's answer does not wait behind the node's own requests
+// (#117); Send waits for room in the main queue, no longer than its
 // timeout.
 type conn struct {
 	node *Node
@@ -66,7 +68,8 @@ type conn struct {
 	caps capabilities
 	apps []uint32
 
-	writes       chan []byte
+	writes       chan []byte   // requests, and the DPA, behind them
+	answers      chan []byte   // handlers' answers, written before writes
 	controlReady chan struct{} // wakes the writer when control gains an entry
 	wdFire       chan struct{}
 	done         chan struct{}
@@ -103,6 +106,7 @@ func newConn(n *Node, nc net.Conn) *conn {
 		nc:           nc,
 		br:           bufio.NewReader(nc),
 		writes:       make(chan []byte, n.cfg.MaxInFlight),
+		answers:      make(chan []byte, n.cfg.MaxInFlight),
 		controlReady: make(chan struct{}, 1),
 		wdFire:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
@@ -452,9 +456,14 @@ func (c *conn) popControl() ([]byte, bool) {
 	return b, true
 }
 
+// writeLoop writes the control queue first, then handlers' answers, then
+// the main queue. A message taken from the main queue waits for the answers
+// that arrived meanwhile: a select that found both queues ready picks one at
+// random, and an answer queued before a DPR or DPA must reach the peer
+// before it (drain).
 func (c *conn) writeLoop() {
 	for {
-		if b, ok := c.popControl(); ok {
+		if b, ok := c.popFirst(); ok {
 			if !c.write(b) {
 				return
 			}
@@ -462,13 +471,40 @@ func (c *conn) writeLoop() {
 		}
 		select {
 		case <-c.controlReady:
+		case b := <-c.answers:
+			if !c.write(b) {
+				return
+			}
 		case b := <-c.writes:
+			for {
+				first, ok := c.popFirst()
+				if !ok {
+					break
+				}
+				if !c.write(first) {
+					return
+				}
+			}
 			if !c.write(b) {
 				return
 			}
 		case <-c.done:
 			return
 		}
+	}
+}
+
+// popFirst returns the next control message, or else the next handler's
+// answer, without waiting.
+func (c *conn) popFirst() ([]byte, bool) {
+	if b, ok := c.popControl(); ok {
+		return b, true
+	}
+	select {
+	case b := <-c.answers:
+		return b, true
+	default:
+		return nil, false
 	}
 }
 
@@ -515,15 +551,28 @@ func (c *conn) answerNow(req, ans *Message) {
 	}
 }
 
-// answerQueued sends a handler's answer through the main queue, waiting for
-// room; handlers run on their own goroutines, so waiting stops no one else.
+// answerQueued sends a handler's answer through the answer queue, waiting
+// for room; handlers run on their own goroutines, so waiting stops no one
+// else. At most MaxInFlight handlers run, so the queue holds every running
+// handler's answer unless the writer is behind on answers already.
 func (c *conn) answerQueued(req, ans *Message) {
+	c.queueAnswer(c.answers, req, ans)
+}
+
+// answerLast sends an answer through the main queue, behind the requests
+// already queued and every handler answer queued before it: the DPA, which
+// ends what the peer is sent (RFC 6733 §5.4).
+func (c *conn) answerLast(req, ans *Message) {
+	c.queueAnswer(c.writes, req, ans)
+}
+
+func (c *conn) queueAnswer(q chan<- []byte, req, ans *Message) {
 	b, ok := c.encodeAnswer(req, ans)
 	if !ok {
 		return
 	}
 	select {
-	case c.writes <- b:
+	case q <- b:
 	case <-c.done:
 	}
 }
@@ -820,7 +869,7 @@ func (c *conn) disconnected(dpr *Message) {
 		t := n.cfg.Clock.AfterFunc(n.cfg.RequestTimeout, func() { close(stop) })
 		c.drain(stop)
 		t.Stop()
-		c.answerQueued(dpr, n.NewAnswer(dpr, ResultSuccess))
+		c.answerLast(dpr, n.NewAnswer(dpr, ResultSuccess))
 		n.cfg.Clock.AfterFunc(disconnectWaitForPeerToDrop, func() { c.close(errPeerDisconnect) })
 	}()
 }
