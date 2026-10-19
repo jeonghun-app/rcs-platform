@@ -561,28 +561,123 @@ func TestABusyTaskGetsOnlyItsShareOfFirstAttempts(t *testing.T) {
 	}
 }
 
+// heldTimers is a diameter.Clock that holds the timers of one duration,
+// the node's request timeout, until the test fires them; every other
+// timer runs on real time. It lets a request to a hung task time out
+// exactly when the test says, without a short timeout that a slow but
+// healthy answer could also run out of (#189).
+type heldTimers struct {
+	d    time.Duration
+	mu   sync.Mutex
+	held []*heldTimer
+}
+
+type heldTimer struct {
+	c    *heldTimers
+	f    func()
+	done bool
+}
+
+func (c *heldTimers) Now() time.Time { return time.Now() }
+
+func (c *heldTimers) AfterFunc(d time.Duration, f func()) diameter.Timer {
+	if d != c.d {
+		return time.AfterFunc(d, f)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &heldTimer{c: c, f: f}
+	c.held = append(c.held, t)
+	return t
+}
+
+func (t *heldTimer) Stop() bool {
+	t.c.mu.Lock()
+	defer t.c.mu.Unlock()
+	was := !t.done
+	t.done = true
+	return was
+}
+
+// pending reports whether a held timer is still to fire.
+func (c *heldTimers) pending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.held {
+		if !t.done {
+			return true
+		}
+	}
+	return false
+}
+
+// fire runs the held timers not yet stopped or fired.
+func (c *heldTimers) fire() {
+	c.mu.Lock()
+	var due []func()
+	for _, t := range c.held {
+		if !t.done {
+			t.done = true
+			due = append(due, t.f)
+		}
+	}
+	c.held = nil
+	c.mu.Unlock()
+	for _, f := range due {
+		f()
+	}
+}
+
+// A task whose attempt timed out gets no first attempts for
+// TimeoutExclusion: of ten requests, the hung task sees only the one that
+// timed out, and every request is answered by the other. The hung
+// request times out when the test fires its timer, once it has arrived;
+// no wall-clock bound is involved, so neither a slow healthy answer nor a
+// slow test can fail it (#189).
 func TestATaskThatTimedOutGetsNoFirstAttemptsForAWhile(t *testing.T) {
-	e := newEnv(t, func(c *Config) { c.RequestTimeout = 200 * time.Millisecond })
+	const nodeTimeout = 777 * time.Millisecond // tells the request timers apart
+	clock := &heldTimers{d: nodeTimeout}
+	e := newEnv(t, func(c *Config) { c.Node.Clock, c.Node.RequestTimeout = clock, nodeTimeout })
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
 	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
 	e.refresh("192.0.2.1", "192.0.2.2")
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
+	arrived := make(chan struct{}, 16)
 	a.setAnswer(func(uint32, *diameter.Message) (*diameter.Message, error) {
+		arrived <- struct{}{}
 		<-hang
 		return nil, errors.New("gone")
 	})
-	start := time.Now()
+	// The first request to reach the hung task times out; any later one
+	// is a first attempt it should not have had, and is let go at once.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for n := 0; ; n++ {
+			select {
+			case <-arrived:
+			case <-stop:
+				return
+			}
+			if n > 0 {
+				t.Errorf("the hung task got attempt %d while excluded", n+1)
+			}
+			// The client has sent it: its timer is held by now, or will
+			// be in a moment (FailNow is for the test's goroutine).
+			for deadline := time.Now().Add(realWait); !clock.pending() && time.Now().Before(deadline); {
+				time.Sleep(time.Millisecond)
+			}
+			clock.fire()
+		}
+	}()
 	for range 10 {
 		if _, err := e.client.UAR(ctx(t), uar()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if n := len(a.requests()); n > 1 {
+	if n := len(a.requests()); n != 1 {
 		t.Errorf("the hung task got %d attempts, want only the one that timed out", n)
-	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("10 requests took %s with one hung task", elapsed)
 	}
 	if e.metrics.count("cxclient.peer.excluded") != 1 {
 		t.Error("the exclusion was not counted")
