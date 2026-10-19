@@ -447,3 +447,43 @@ func TestNewUDPSourceIsCheapWhenTheTableIsFull(t *testing.T) {
 		t.Fatalf("stats = %+v", s)
 	}
 }
+
+func TestOnFlowClosedRunsOffTheClosingGoroutineAndInOrder(t *testing.T) {
+	// The closing goroutine holds a lock the callback needs, as a transaction
+	// holds its own lock while it sends; a synchronous callback would deadlock.
+	// UDP flows have no reader goroutine, so CloseFlow's caller is the one that
+	// removes them.
+	var mu sync.Mutex
+	order := make(chan FlowID, 4)
+	server, rec := newTransport(t, Config{OnFlowClosed: func(id FlowID, _ FlowInfo) {
+		mu.Lock()
+		defer mu.Unlock()
+		order <- id
+	}})
+	addr := listen(t, server, ListenerConfig{Network: UDP})
+	var ids []FlowID
+	for i := range 3 {
+		u, err := net.Dial("udp", addr.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer u.Close()
+		u.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/UDP a.example.com;branch=z9hG4bKo"+string(rune('a'+i)))))
+		ids = append(ids, rec.next(t).Source.Flow)
+	}
+	mu.Lock()
+	for _, id := range ids {
+		within(t, func() error { server.CloseFlow(id); return nil })
+	}
+	mu.Unlock()
+	for _, want := range ids {
+		select {
+		case got := <-order:
+			if got != want {
+				t.Fatalf("closures out of order")
+			}
+		case <-time.After(waitFor):
+			t.Fatal("OnFlowClosed was not called")
+		}
+	}
+}

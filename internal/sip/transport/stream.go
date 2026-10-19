@@ -209,12 +209,18 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 	}
 	r := f.q.push(b, wait, t.cfg.WriteTimeout)
 	if r == overBudget {
-		// Every queue together is at Config.MaxQueuedBytes. The peer holding the
-		// most is the one not reading; closing it frees the most memory, and is
-		// fair to a connection that only wants room for one more message.
-		t.stats.budgetSheds.Add(1)
-		t.shedLargestQueue()
-		r = f.q.push(b, false, 0)
+		// Every queue together is at Config.MaxQueuedBytes. Make room by closing
+		// a connection whose peer has stopped reading, if there is one, and try
+		// once more; otherwise only this send fails. f's own connection is
+		// never closed for the budget: it may be perfectly healthy.
+		if t.shedStalledQueue(f) {
+			t.stats.budgetSheds.Add(1)
+			r = f.q.push(b, wait, t.cfg.WriteTimeout)
+		}
+		if r == overBudget {
+			t.stats.budgetRefusals.Add(1)
+			return ErrQueueFull
+		}
 	}
 	switch r {
 	case pushed:
@@ -225,24 +231,68 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 		t.stats.queueWaitTimeouts.Add(1)
 		return ErrQueueFull
 	}
+	// A NoWait message did not fit even in the reserve: the reading goroutine
+	// cannot wait, and the peer is not taking what we send.
 	t.stats.queueOverflows.Add(1)
 	t.closeFlow(f)
-	return ErrQueueFull
+	return errQueueOverflow
 }
 
-// shedLargestQueue closes the stream flow with the most queued output. It looks
-// at every stream flow, which is fine for the rare moment the budget runs out.
-func (t *Transport) shedLargestQueue() {
+// errQueueOverflow reports that the transport closed a connection whose send
+// queue overflowed, so callers that test for ErrNoFlow (and answer 430) see it.
+var errQueueOverflow = fmt.Errorf("%w: send queue overflowed; connection closed", ErrNoFlow)
+
+// shedGrace is how recently a writer must have made progress for its connection
+// to be safe from shedding: its peer is reading.
+func (t *Transport) shedGrace() time.Duration { return min(time.Second, t.cfg.WriteTimeout/2) }
+
+// shedRank orders shedding candidates: a client-facing connection before a core
+// one, then the queue fullest relative to its own limit, then the one stalled
+// longest. Raw bytes would always pick a core connection, whose limit is 64
+// times a client's, although its peer is the one most likely to be reading.
+type shedRank struct {
+	client  bool
+	share   float64
+	stalled time.Duration
+}
+
+func (a shedRank) before(b shedRank) bool {
+	if a.client != b.client {
+		return a.client
+	}
+	if a.share != b.share {
+		return a.share > b.share
+	}
+	return a.stalled > b.stalled
+}
+
+// shedStalledQueue closes the best candidate for shedding other than except and
+// reports whether there was one. A connection with nothing queued, or whose
+// writer made progress within shedGrace, is never a candidate. It looks at
+// every stream flow, which is fine for the rare moment the budget runs out.
+func (t *Transport) shedStalledQueue(except *flow) bool {
+	now := time.Now()
+	grace := t.shedGrace()
 	var victim *flow
-	most := 0
+	var best shedRank
 	for _, f := range t.flows.streams() {
-		if n := f.q.size(); n > most {
-			victim, most = f, n
+		if f == except {
+			continue
+		}
+		queued, idle := f.q.stall(now)
+		if queued == 0 || idle < grace {
+			continue
+		}
+		r := shedRank{client: f.lis != nil && f.lis.clientFacing, share: float64(queued) / float64(f.q.limit), stalled: idle}
+		if victim == nil || r.before(best) {
+			victim, best = f, r
 		}
 	}
-	if victim != nil {
-		t.closeFlow(victim)
+	if victim == nil {
+		return false
 	}
+	t.closeFlow(victim)
+	return true
 }
 
 // startWriter gives a stream flow its send queue and writer goroutine. It is

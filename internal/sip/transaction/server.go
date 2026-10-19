@@ -127,9 +127,15 @@ func (tx *ServerTransaction) failed(err error) func() {
 // a final response after the first non-2xx one is discarded (§17.2.1, §17.2.2).
 //
 // If the transport fails, the transaction terminates and the error is returned.
-// Respond sends synchronously and can block for up to the transport's
-// WriteTimeout, plus DialTimeout if the request's connection must be reopened
-// (see TU).
+// Respond queues the response for the connection's writer, waiting for room for
+// up to the transport's WriteTimeout, plus DialTimeout if the request's
+// connection must be reopened (see TU).
+//
+// transport.ErrQueueFull means nothing was sent and the connection is still
+// open. On a client-facing flow the transport then closes the flow itself and
+// returns transport.ErrNoFlow, so the client learns of the failure at once; on
+// a core flow the peer's transaction times out. Either way this transaction
+// has ended.
 func (tx *ServerTransaction) Respond(res *sip.Response) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()

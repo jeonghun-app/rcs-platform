@@ -57,8 +57,13 @@
 // same connection, never waits. Two peers that both
 // send faster than they read therefore cannot deadlock each other, and a peer
 // that stops reading loses its connection without slowing anyone else. When all
-// queues together reach MaxQueuedBytes, the connection holding the most is
-// closed.
+// queues together reach MaxQueuedBytes, a connection whose writer has stopped
+// making progress is closed to make room, a client-facing one first and the
+// fullest relative to its own limit first; a connection that is making progress
+// is never closed for this, and if no connection qualifies only the send that
+// found the budget full fails, with ErrQueueFull. ErrQueueFull always means the
+// connection is still open; whenever the transport closes one, the send fails
+// with an error that satisfies errors.Is(err, ErrNoFlow).
 //
 // Memory, per stream connection: a 4 KiB read buffer; while a message is being
 // read, up to Limits.MaxHeaderBytes plus the body bytes that have arrived (at
