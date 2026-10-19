@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -48,4 +49,45 @@ func TestChildRelayOnATakenPort(t *testing.T) {
 		t.Errorf("startRelay = %v, want EADDRINUSE, which StartRelay retries", err)
 	}
 	t.Fatalf("msrp-relay stopped: %v", err)
+}
+
+// StartRelay tries again with fresh ports when the first ones are taken,
+// and only then (QA on #127): a relay whose first public port is taken still
+// starts and answers.
+func TestStartRelayTriesAgainWhenItsPortIsTaken(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	taken, calls := ln.Addr().(*net.TCPAddr).Port, 0
+	freePorts = func(t testing.TB, n int) []int {
+		if calls++; calls == 1 {
+			return append([]int{taken}, FreePorts(t, n-1)...)
+		}
+		return FreePorts(t, n)
+	}
+	defer func() { freePorts = FreePorts }()
+	r := StartRelay(t)
+	resp, err := http.Post(r.Control.JoinPath("/v1/bindings").String(), "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized || calls != 2 {
+		t.Fatalf("control = %d after %d port picks, want 401 after 2", resp.StatusCode, calls)
+	}
+}
+
+func TestFreePortsAreDifferent(t *testing.T) {
+	for range 200 {
+		ps := FreePorts(t, 6)
+		seen := map[int]bool{}
+		for _, p := range ps {
+			if seen[p] {
+				t.Fatalf("FreePorts gave %d twice: %v", p, ps)
+			}
+			seen[p] = true
+		}
+	}
 }
