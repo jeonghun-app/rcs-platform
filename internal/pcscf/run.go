@@ -28,6 +28,8 @@ type deps struct {
 	listening func(bound)
 	// router, if set, replaces pcscf's.
 	router proxy.Router
+	// now is the clock of the drain's schedule; nil is time.Now.
+	now func() time.Time
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -42,6 +44,9 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if d.sleep == nil {
 		d.sleep = sleepCtx
+	}
+	if d.now == nil {
+		d.now = time.Now
 	}
 	if d.router == nil {
 		d.router = router{}
@@ -126,7 +131,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer cancel()
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
-	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep)
+	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
 	return nil
 }
 

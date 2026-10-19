@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -292,15 +293,26 @@ func TestTheLimitCountsTheClientInTheProxyHeader(t *testing.T) {
 
 // recordSleep records the gaps a drain waits, and runs during, if set, at
 // the first.
+// recordSleep is the drain's sleep and clock: a sleep records how long it
+// was asked to wait and moves the clock on by that and late.
 type recordSleep struct {
 	mu     sync.Mutex
 	gaps   []time.Duration
 	during func()
+	t      time.Time
+	late   time.Duration
+}
+
+func (r *recordSleep) now() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.t
 }
 
 func (r *recordSleep) sleep(_ context.Context, d time.Duration) error {
 	r.mu.Lock()
 	r.gaps = append(r.gaps, d)
+	r.t = r.t.Add(d + r.late)
 	f := r.during
 	r.during = nil
 	r.mu.Unlock()
@@ -316,7 +328,7 @@ func TestAStopClosesTheClientFlowsOneByOne(t *testing.T) {
 	cfg := testConfig()
 	cfg.DrainTimeout = 90 * time.Second
 	rec := &recordSleep{}
-	s := start(t, cfg, deps{sleep: rec.sleep})
+	s := start(t, cfg, deps{sleep: rec.sleep, now: rec.now})
 	var peers []*peer
 	for range 3 {
 		p := dial(t, s.client, nil)
@@ -367,7 +379,7 @@ func TestAStopClosesTheClientFlowsOneByOne(t *testing.T) {
 func TestAFlowThatAlreadyEndedTakesNoTimeOfTheDrain(t *testing.T) {
 	rec := &recordSleep{}
 	gone := map[transport.FlowID]bool{"b": true, "c": true}
-	drain(context.Background(), []transport.FlowID{"a", "b", "c", "d"}, 8*time.Second, func(id transport.FlowID) bool { return !gone[id] }, rec.sleep)
+	drain(context.Background(), []transport.FlowID{"a", "b", "c", "d"}, 8*time.Second, func(id transport.FlowID) bool { return !gone[id] }, rec.sleep, rec.now)
 	if len(rec.gaps) != 1 {
 		t.Fatalf("gaps %v, want one, after a", rec.gaps)
 	}
@@ -377,18 +389,58 @@ func TestDrainSpreadsTheClosesAndStopsWaitingWhenItsTimeRunsOut(t *testing.T) {
 	var closed []string
 	closeFlow := func(id transport.FlowID) bool { closed = append(closed, string(id)); return true }
 	rec := &recordSleep{}
-	drain(context.Background(), []transport.FlowID{"a", "b", "c", "d"}, 8*time.Second, closeFlow, rec.sleep)
+	drain(context.Background(), []transport.FlowID{"a", "b", "c", "d"}, 8*time.Second, closeFlow, rec.sleep, rec.now)
 	if len(closed) != 4 || len(rec.gaps) != 3 || rec.gaps[0] != 2*time.Second {
 		t.Fatalf("closed %v, gaps %v", closed, rec.gaps)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	closed, rec.gaps = nil, nil
-	drain(ctx, []transport.FlowID{"a", "b", "c"}, time.Hour, closeFlow, rec.sleep)
+	drain(ctx, []transport.FlowID{"a", "b", "c"}, time.Hour, closeFlow, rec.sleep, rec.now)
 	if len(closed) != 3 || len(rec.gaps) != 0 {
 		t.Fatalf("after its time: closed %v, gaps %v", closed, rec.gaps)
 	}
-	drain(context.Background(), nil, time.Hour, closeFlow, rec.sleep)
+	drain(context.Background(), nil, time.Hour, closeFlow, rec.sleep, rec.now)
+}
+
+// A sleep that wakes late does not push the later closes back: they keep to
+// the schedule fixed at the start, so the flows left do not all close at
+// the deadline (QA of #188).
+func TestALateWakeUpIsMadeUpByTheNextWaits(t *testing.T) {
+	rec := &recordSleep{late: 3 * time.Second}
+	ids := []transport.FlowID{"a", "b", "c", "d", "e"}
+	drain(context.Background(), ids, 10*time.Second, func(transport.FlowID) bool { return true }, rec.sleep, rec.now)
+	// Closes are due at 0, 2, 4, 6 and 8 s and every wake-up is 3 s late:
+	// a wakes at 5 s, so b closes at once, c waits for 6 s and wakes at
+	// 9 s, so d and e close at once.
+	want := []time.Duration{2 * time.Second, time.Second}
+	if !slices.Equal(rec.gaps, want) {
+		t.Fatalf("waits %v, want %v", rec.gaps, want)
+	}
+}
+
+// The drain ends at DrainTimeout whatever its spacing does: the sleep it is
+// given carries that deadline, so a slow clock cannot push Run past the
+// runtime's stop deadline (QA of #188).
+func TestTheDrainEndsAtTheDrainTimeout(t *testing.T) {
+	cfg := testConfig()
+	cfg.DrainTimeout = 90 * time.Second
+	var left time.Duration
+	var ok bool
+	sleep := func(ctx context.Context, d time.Duration) error {
+		var dl time.Time
+		dl, ok = ctx.Deadline()
+		left = time.Until(dl)
+		return nil
+	}
+	s := start(t, cfg, deps{sleep: sleep})
+	for range 2 {
+		dial(t, s.client, nil).request()
+	}
+	s.stop()
+	if !ok || left > cfg.DrainTimeout || left < cfg.DrainTimeout-10*time.Second {
+		t.Fatalf("drain ctx deadline in %v (set %v), want about %v", left, ok, cfg.DrainTimeout)
+	}
 }
 
 // UDP clients, in dev and test, are clients as well.
