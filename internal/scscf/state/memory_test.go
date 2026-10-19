@@ -73,3 +73,20 @@ func TestMemoryForgetsExpiredChallengesNobodyTook(t *testing.T) {
 		t.Errorf("%d challenges held after the purge, want 1", n)
 	}
 }
+
+func TestAProfileIsKeptAgainOnlyWithinTheMarginOfItsKeepUntil(t *testing.T) {
+	p := &state.Profile{KeepUntil: statetest.T0.Add(state.ProfileGrace)}
+	for _, tc := range []struct {
+		now  time.Time
+		want bool
+	}{
+		{statetest.T0, false},
+		{p.KeepUntil.Add(-state.ProfileKeepMargin), false},
+		{p.KeepUntil.Add(-state.ProfileKeepMargin + time.Second), true},
+		{p.KeepUntil.Add(time.Hour), true},
+	} {
+		if got := p.KeepDue(tc.now); got != tc.want {
+			t.Errorf("KeepDue %v before KeepUntil = %v, want %v", p.KeepUntil.Sub(tc.now), got, tc.want)
+		}
+	}
+}

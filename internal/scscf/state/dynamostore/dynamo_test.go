@@ -112,6 +112,60 @@ func TestAResentNextNotifyReturnsTheFirstAttemptsValues(t *testing.T) {
 	}
 }
 
+func TestAResentKeepProfileSucceeds(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	if err := d.SaveProfile(bg(), statetest.Profile(statetest.Set1, []byte("x"), statetest.T0)); err != nil {
+		t.Fatal(err)
+	}
+	until := statetest.T0.Add(72 * time.Hour)
+	f.resendNext = true
+	if err := d.KeepProfile(bg(), statetest.Set1, until, statetest.T0); err != nil {
+		t.Fatalf("resent KeepProfile: %v", err)
+	}
+	if p, err := d.Profile(bg(), statetest.Set1, statetest.T0); err != nil || !p.KeepUntil.Equal(until) {
+		t.Fatalf("after the resend: %v, %v", p, err)
+	}
+}
+
+// TestOnlyProfilesCarryTheTTLAttribute: DynamoDB deletes items by the table's
+// TTL attribute, ttl, in Unix seconds. A profile has it, so one a failed
+// deregistration left behind goes; a registration, unregistered or not, must
+// not, since only a sweep sends the SAR that tells the HSS.
+func TestOnlyProfilesCarryTheTTLAttribute(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	for _, r := range []*state.Registration{
+		statetest.Registration(statetest.IMPI1, statetest.IMPU1, time.Hour),
+		statetest.Unregistered(statetest.IMPI1, statetest.IMPU2, statetest.T0.Add(time.Hour)),
+	} {
+		if _, err := d.SaveRegistration(bg(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := statetest.Profile(statetest.Set1, []byte("x"), statetest.T0)
+	if err := d.SaveProfile(bg(), p); err != nil {
+		t.Fatal(err)
+	}
+	tbl := f.tables[DefaultRegistrationsTable]
+	for _, impu := range []string{statetest.IMPU1, statetest.IMPU2} {
+		if _, ok := tbl[itemKey(key(impu))][attrTTL]; ok {
+			t.Errorf("the registration of %s has a TTL", impu)
+		}
+	}
+	item := tbl[itemKey(profileKey(statetest.Set1))]
+	if got := number(item[attrTTL]); got != p.KeepUntil.Unix() {
+		t.Errorf("profile ttl %d, want KeepUntil in Unix seconds %d", got, p.KeepUntil.Unix())
+	}
+	later := p.KeepUntil.Add(time.Hour)
+	if err := d.KeepProfile(bg(), statetest.Set1, later, statetest.T0); err != nil {
+		t.Fatal(err)
+	}
+	if got := number(tbl[itemKey(profileKey(statetest.Set1))][attrTTL]); got != later.Unix() {
+		t.Errorf("after KeepProfile ttl %d, want %d", got, later.Unix())
+	}
+}
+
 // TestAResentTakeLosesTheChallenge documents the one write that is not
 // idempotent: the challenge is gone after the first attempt, so the caller
 // sees ErrNotFound and challenges the client again. A response is never

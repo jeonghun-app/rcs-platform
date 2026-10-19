@@ -36,6 +36,11 @@ var (
 	Set2 = state.ProfileKey{IMPI: IMPI1, IMPU: IMPU2}
 )
 
+// Profile returns a profile of k kept until two days after T0.
+func Profile(k state.ProfileKey, userData []byte, received time.Time) *state.Profile {
+	return &state.Profile{Key: k, UserData: userData, Received: received, KeepUntil: T0.Add(48 * time.Hour)}
+}
+
 // T0 is the time the checks run at. It lies in the future so that DynamoDB's
 // TTL never removes a test item early.
 var T0 = time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -85,6 +90,10 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"EachImplicitRegistrationSetHasItsOwnProfile", testProfilesPerSet},
 		{"APPRForOneSetLeavesTheOtherSetsProfile", testPPRForOneSet},
 		{"ARegistrationNamesTheProfileOfItsSet", testRegistrationProfileKey},
+		{"AProfileIsNotFoundOnceItsKeepUntilHasCome", testProfileKeepUntil},
+		{"KeepProfileOnlyMovesKeepUntilLater", testKeepProfile},
+		{"AnUnregisteredUsersRecordLivesUntilItsStateEnds", testUnregisteredLifeCycle},
+		{"ARegisterTurnsAnUnregisteredRecordIntoARegistration", testRegisterEndsUnregistered},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

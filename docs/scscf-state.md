@@ -10,7 +10,7 @@ them.
 
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
-| `registrations` | `pk` (S): canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only | the bindings of each IMPU, and the User-Data of each implicit registration set |
+| `registrations` | `pk` (S): canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only; TTL on `ttl` | the bindings of each IMPU, the records of unregistered users, and the User-Data of each implicit registration set |
 | `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions and their NOTIFY counters |
 
@@ -31,6 +31,13 @@ additionally sealed (below).
   contacts, leased or not, is handled as an initial registration: SAR
   REGISTRATION, and a save conditional on the version read, which makes the
   sweep's later delete fail harmlessly (#14).
+- **Unregistered users.** A terminating request to an IMPU without a
+  registration sends SAR UNREGISTERED_USER, then stores a record without
+  contacts whose `Unregistered` is when that state ends (now plus
+  `SCSCF_UNREGISTERED_TTL`, default one hour) and the set's profile, which
+  later requests reuse. A sweep then claims the record like an expired
+  registration and sends SAR TIMEOUT_DEREGISTRATION; a REGISTER before that
+  turns it into a registration. PPR and RTR apply to it as to a registration.
 - **One profile per implicit registration set.** The HSS sends User-Data per
   set: an SAA for the set of the IMPU in the request, a PPR for one set at a
   time. A profile is therefore keyed by the IMPI and the set's default IMPU
@@ -42,6 +49,16 @@ additionally sealed (below).
   cannot undo the PPR that followed it; a refused save (`ErrConflict`) is not
   an error to report. A profile is deleted when the HSS no longer assigns its
   set to this S-CSCF, never by a sweep.
+- **A profile outlives its set by a day at most.** Every deregistration path
+  (user, sweep, RTR, administrative) deletes the profile. As a safety net for
+  one that fails to, a profile carries `KeepUntil`, stored as the TTL attribute
+  `ttl`: the last contact expiry of the set plus one day
+  (`state.ProfileGrace`). A re-registration extends it only once less than 12
+  hours are left (`KeepDue`, `KeepProfile`), about twice a day. From
+  `KeepUntil` on the profile is not found, whether or not DynamoDB has removed
+  it yet. Registrations have no `ttl`: only a sweep, which sends the SAR, may
+  remove one, so the infrastructure must enable TTL on `ttl`, never on
+  `expires`.
 - **A permanent SAR failure ends the deregistration.** The sweep's handler
   returns an error only for failures that may pass (the HSS unreachable, a
   busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
@@ -73,16 +90,16 @@ client one more 401, not a failed registration.
 
 A re-registration is one strongly consistent read and one put of the IMPU's
 registration item (a few KB), plus two writes to `expiry-index`; the profile is
-written only on SAR and PPR. Every terminating request reads the IMPU's
-registration and its set's profile, two strongly consistent reads: about 1
-read request unit for the registration and 1 per 4 KB of profile (2 for a
-typical 5 KB IMSSubscription, 32 for the 128 KiB maximum), so 3 RRU per
-terminating request, $0.4 per million at the same prices. With 1 M users of
-two IMPUs re-registering every
-600 s that is about 8.6 G saves and 30 G write request units a month, some
-$20k at ap-northeast-2 on-demand prices (October 2026); 3600 s registrations
-cost a sixth of that. Authentication adds a put and a conditional delete per
-challenge. Sweeps read each expiring item once.
+written only on SAR and PPR, plus about two updates of its `ttl` a day. Every
+terminating request reads the IMPU's registration and its set's profile, two
+strongly consistent reads: about 1 read request unit for the registration and 1
+per 4 KB of profile (2 for a typical 5 KB IMSSubscription, 32 for the 128 KiB
+maximum), so 3 RRU per terminating request, $0.4 per million at the same
+prices. With 1 M users of two IMPUs re-registering every 600 s that is about
+8.6 G saves and 30 G write request units a month, some $20k at ap-northeast-2
+on-demand prices (October 2026); 3600 s registrations cost a sixth of that.
+Authentication adds a put and a conditional delete per challenge. Sweeps read
+each expiring item once.
 
 `expiry-index` is spread over 16 shards, which carry about 8000 saves per
 second, some 4.8 M IMPUs at 600 s re-registrations. The shard of an item is

@@ -145,8 +145,9 @@ func (d *Dynamo) ExpiringRegistrations(ctx context.Context, now time.Time, limit
 	return out, decodeErr
 }
 
-// Profile implements state.Profiles.
-func (d *Dynamo) Profile(ctx context.Context, k state.ProfileKey) ([]byte, error) {
+// Profile implements state.Profiles. It checks KeepUntil itself, because TTL
+// deletion can lag by days.
+func (d *Dynamo) Profile(ctx context.Context, k state.ProfileKey, now time.Time) (*state.Profile, error) {
 	if !possibleProfile(k) {
 		return nil, fmt.Errorf("dynamostore: get profile: %w", state.ErrNotFound)
 	}
@@ -154,31 +155,87 @@ func (d *Dynamo) Profile(ctx context.Context, k state.ProfileKey) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	return docOf(item)
+	p, err := decodeProfile(k, item)
+	if err != nil {
+		return nil, err
+	}
+	if !p.KeepUntil.After(now) {
+		return nil, fmt.Errorf("dynamostore: get profile: %w", state.ErrNotFound)
+	}
+	return p, nil
+}
+
+func decodeProfile(k state.ProfileKey, item map[string]types.AttributeValue) (*state.Profile, error) {
+	doc, err := docOf(item)
+	if err != nil {
+		return nil, err
+	}
+	rcv, err := nv(item, attrReceived)
+	if err != nil {
+		return nil, err
+	}
+	ttl, err := nv(item, attrTTL)
+	if err != nil {
+		return nil, err
+	}
+	return &state.Profile{Key: k, UserData: doc, Received: time.Unix(0, rcv).UTC(), KeepUntil: time.Unix(ttl, 0).UTC()}, nil
 }
 
 // SaveProfile implements state.Profiles with a PutItem conditional on no
 // later profile of the set being stored. A resend carries the same time and
 // passes.
-func (d *Dynamo) SaveProfile(ctx context.Context, k state.ProfileKey, userData []byte, received time.Time) error {
-	if err := state.ValidProfile(k, userData, received); err != nil {
+func (d *Dynamo) SaveProfile(ctx context.Context, p *state.Profile) error {
+	if err := state.ValidProfile(p); err != nil {
 		return err
 	}
-	item := profileKey(k)
-	item[attrDoc] = bin(userData)
-	item[attrReceived] = num(received.UnixNano())
+	item := profileKey(p.Key)
+	item[attrDoc] = bin(p.UserData)
+	item[attrReceived] = num(p.Received.UnixNano())
+	item[attrTTL] = num(p.KeepUntil.Unix())
 	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                 aws.String(d.registrations),
 		Item:                      item,
 		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #rcv <= :rcv"),
 		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#rcv": attrReceived},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(received.UnixNano())},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(p.Received.UnixNano())},
 	})
 	switch {
 	case ccf(err):
 		return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
 	case err != nil:
 		return sanitize("save profile", err)
+	}
+	return nil
+}
+
+// KeepProfile implements state.Profiles with an UpdateItem of ttl alone,
+// conditional on the profile being there and ttl moving later. A resend, or a
+// profile already kept as long, fails the condition and is read back.
+func (d *Dynamo) KeepProfile(ctx context.Context, k state.ProfileKey, until, now time.Time) error {
+	if !possibleProfile(k) {
+		return fmt.Errorf("dynamostore: keep profile: %w", state.ErrNotFound)
+	}
+	_, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(d.registrations),
+		Key:                       profileKey(k),
+		UpdateExpression:          aws.String("SET #ttl = :until"),
+		ConditionExpression:       aws.String("attribute_exists(#pk) AND #ttl > :now AND #ttl < :until"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrTTL},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":until": num(until.Unix()), ":now": num(now.Unix())},
+	})
+	switch {
+	case ccf(err):
+		p, err := d.Profile(ctx, k, now)
+		if err != nil {
+			return err
+		}
+		if p.KeepUntil.Unix() < until.Unix() {
+			// Only if the profile went and came back between the two
+			// requests; the caller reads it again.
+			return fmt.Errorf("dynamostore: keep profile: %w", state.ErrConflict)
+		}
+	case err != nil:
+		return sanitize("keep profile", err)
 	}
 	return nil
 }

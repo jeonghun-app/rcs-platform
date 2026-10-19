@@ -118,6 +118,14 @@ type Registration struct {
 	// deregistration (SAR, NOTIFY), after it any sweep retries it. A
 	// registration without contacts is deleted once that has succeeded.
 	Deregistering time.Time
+	// Unregistered is set on the record of an unregistered user, which the
+	// S-CSCF stores after SAR UNREGISTERED_USER (TS 29.228 §6.1.2) so that
+	// later terminating requests reuse the set's profile instead of asking
+	// again: it is when that state ends, the time the record was stored plus
+	// the configured TTL. Such a record has no contacts. A REGISTER makes it
+	// a registration, with contacts and Unregistered zero; at Unregistered a
+	// sweep claims it as it claims a registration whose last contact expired.
+	Unregistered time.Time
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). It is opaque: a new item
 	// starts at a random value (FirstVersion).
@@ -169,12 +177,17 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or, without contacts, when its deregistration may be retried.
+// contact expiry, or, without contacts, when its deregistration may be
+// retried, or else when its unregistered state ends. A registration with none
+// of these is due at once.
 func (r *Registration) SweepAt() time.Time {
-	if len(r.Contacts) == 0 {
+	switch {
+	case len(r.Contacts) > 0:
+		return r.NextExpiry()
+	case !r.Deregistering.IsZero():
 		return r.Deregistering
 	}
-	return r.NextExpiry()
+	return r.Unregistered
 }
 
 // Prune removes the contacts that have expired at now and returns them.
@@ -221,6 +234,9 @@ func (r *Registration) Validate() error {
 	}
 	if !r.Deregistering.IsZero() && !validTime(r.Deregistering) {
 		return fmt.Errorf("%w: Deregistering out of range", ErrInvalid)
+	}
+	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
+		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
 	}
 	for _, c := range r.Contacts {
 		if c.URI == "" || !validTime(c.Expires) {
@@ -292,19 +308,22 @@ type Registrations interface {
 // (ProfileKey): one private identity with two sets has two, and saving one
 // leaves the other. Profiles are kept apart from the registrations so a
 // re-registration, which changes only contacts, does not rewrite them, and so
-// that an unregistered user's profile (SAR UNREGISTERED_USER) stays as long as
-// the HSS has the user assigned: the S-CSCF deletes it with the assignment,
-// no sweep does.
+// that an unregistered user's profile stays as long as the HSS has the user
+// assigned: the S-CSCF deletes it with the assignment, no sweep does.
+// KeepUntil is only a safety net for a deregistration that failed to.
 type Profiles interface {
-	// Profile returns the User-Data stored for k.
-	Profile(ctx context.Context, k ProfileKey) ([]byte, error)
-	// SaveProfile stores userData for k, received at received: the time the
-	// SAA or PPR that carried it arrived, which orders the profiles of one
-	// set across instances. A profile received earlier than the one stored
-	// for k is not stored (ErrConflict): an SAA that took longer to arrive
-	// must not undo the PPR that followed it. Saving the same one again
-	// succeeds. Other sets of the same IMPI are not touched.
-	SaveProfile(ctx context.Context, k ProfileKey, userData []byte, received time.Time) error
+	// Profile returns the profile stored for k, ErrNotFound if there is none
+	// or its KeepUntil has come at now.
+	Profile(ctx context.Context, k ProfileKey, now time.Time) (*Profile, error)
+	// SaveProfile stores p. A profile received earlier than the one stored
+	// for its key is not stored (ErrConflict): an SAA that took longer to
+	// arrive must not undo the PPR that followed it. Saving the same one
+	// again succeeds. Other sets of the same IMPI are not touched.
+	SaveProfile(ctx context.Context, p *Profile) error
+	// KeepProfile moves the KeepUntil of k's profile to until, if that is
+	// later; it never brings it closer. It returns ErrNotFound if Profile
+	// would at now.
+	KeepProfile(ctx context.Context, k ProfileKey, until, now time.Time) error
 	// DeleteProfile deletes the profile of k; deleting none is no error.
 	DeleteProfile(ctx context.Context, k ProfileKey) error
 }
@@ -318,19 +337,54 @@ type ProfileKey struct {
 	IMPU string
 }
 
+// ProfileGrace is how long a profile outlives the last contact expiry of its
+// set, or the end of its unregistered state (Registration.Unregistered): the
+// S-CSCF sets KeepUntil to that time plus ProfileGrace. Within
+// ProfileKeepMargin of KeepUntil a re-registration extends it (KeepDue), so
+// it does so about twice a day rather than at every re-registration.
+const (
+	ProfileGrace      = 24 * time.Hour
+	ProfileKeepMargin = 12 * time.Hour
+)
+
+// Profile is the User-Data of one implicit registration set.
+type Profile struct {
+	Key      ProfileKey
+	UserData []byte
+	// Received is when the SAA or PPR that carried UserData arrived, which
+	// orders the profiles of one set across instances.
+	Received time.Time
+	// KeepUntil is when the profile is deleted if no deregistration did it:
+	// from then on it is not found, and DynamoDB removes it (TTL), so a
+	// profile a failed deregistration left behind does not stay for ever.
+	// Backends keep it to the second.
+	KeepUntil time.Time
+}
+
+// KeepDue reports whether p's KeepUntil is within ProfileKeepMargin of now,
+// so that the next registration should extend it with KeepProfile.
+func (p *Profile) KeepDue(now time.Time) bool { return p.KeepUntil.Sub(now) < ProfileKeepMargin }
+
+// Clone returns a copy of p that shares no memory with it.
+func (p *Profile) Clone() *Profile {
+	c := *p
+	c.UserData = slices.Clone(p.UserData)
+	return &c
+}
+
 // ValidProfile checks a profile against the limits of this package; the
 // backends apply it in SaveProfile.
-func ValidProfile(k ProfileKey, userData []byte, received time.Time) error {
-	if err := identity.ValidIMPI(k.IMPI); err != nil {
+func ValidProfile(p *Profile) error {
+	if err := identity.ValidIMPI(p.Key.IMPI); err != nil {
 		return fmt.Errorf("%w: profile IMPI: %w", ErrInvalid, err)
 	}
-	if !canonicalIMPU(k.IMPU) {
+	if !canonicalIMPU(p.Key.IMPU) {
 		return fmt.Errorf("%w: profile IMPU is not a canonical public identity", ErrInvalid)
 	}
-	if !validTime(received) {
-		return fmt.Errorf("%w: a profile needs the time it was received", ErrInvalid)
+	if !validTime(p.Received) || !validTime(p.KeepUntil) {
+		return fmt.Errorf("%w: a profile needs the time it was received and a KeepUntil", ErrInvalid)
 	}
-	if len(userData) == 0 || len(userData) > MaxUserData {
+	if len(p.UserData) == 0 || len(p.UserData) > MaxUserData {
 		return fmt.Errorf("%w: User-Data empty or larger than %d bytes", ErrInvalid, MaxUserData)
 	}
 	return nil

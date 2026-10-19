@@ -21,9 +21,10 @@ func FuzzDecodeDocuments(f *testing.F) {
 	r.Contacts[0].Q = 700
 	r.Deregistering = statetest.T0
 	reg, _ := encodeRegistration(r)
+	unreg, _ := encodeRegistration(statetest.Unregistered(statetest.IMPI1, statetest.IMPU1, statetest.T0))
 	ch, _ := encodeChallenge(statetest.Challenge(statetest.IMPI1, "n", time.Minute))
 	sub, _ := encodeSubscription(statetest.Subscription("s1", statetest.IMPU1, time.Hour))
-	for _, seed := range [][]byte{reg, ch, sub, []byte("{}"), []byte(`{"contacts":[{}]}`), []byte("null"),
+	for _, seed := range [][]byte{reg, unreg, ch, sub, []byte("{}"), []byte(`{"contacts":[{}]}`), []byte("null"),
 		[]byte(`{"impu":"sip:a@example.com","impi":"a@example.com","default_impu":"sip:a@example.com","contacts":[{"uri":"sip:x","expires":"2031-01-01T00:00:00+09:00","path":[],"feature_tags":[]}]}`)} {
 		f.Add(seed)
 	}

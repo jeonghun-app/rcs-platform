@@ -22,18 +22,13 @@ type Memory struct {
 
 	mu            sync.Mutex
 	registrations map[string]*Registration
-	profiles      map[ProfileKey]storedProfile
+	profiles      map[ProfileKey]*Profile
 	challenges    map[challengeKey]*Challenge
 	added         int
 	subscriptions map[string]*Subscription
 }
 
 type challengeKey struct{ impi, nonce string }
-
-type storedProfile struct {
-	userData []byte
-	received time.Time
-}
 
 var _ Store = (*Memory)(nil)
 
@@ -42,7 +37,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		rand:          randReader,
 		registrations: map[string]*Registration{},
-		profiles:      map[ProfileKey]storedProfile{},
+		profiles:      map[ProfileKey]*Profile{},
 		challenges:    map[challengeKey]*Challenge{},
 		subscriptions: map[string]*Subscription{},
 	}
@@ -151,28 +146,45 @@ func (m *Memory) ExpiringRegistrations(_ context.Context, now time.Time, limit i
 	return out[:min(len(out), max(limit, 0))], nil
 }
 
-// Profile implements Profiles.
-func (m *Memory) Profile(_ context.Context, k ProfileKey) ([]byte, error) {
+// Profile implements Profiles. A profile past its KeepUntil stays until it is
+// deleted or saved again, as in DynamoDB before TTL removes it.
+func (m *Memory) Profile(_ context.Context, k ProfileKey, now time.Time) (*Profile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.profiles[k]
-	if !ok {
+	if !ok || !p.KeepUntil.After(now) {
 		return nil, fmt.Errorf("state: profile: %w", ErrNotFound)
 	}
-	return slices.Clone(p.userData), nil
+	return p.Clone(), nil
 }
 
 // SaveProfile implements Profiles.
-func (m *Memory) SaveProfile(_ context.Context, k ProfileKey, userData []byte, received time.Time) error {
-	if err := ValidProfile(k, userData, received); err != nil {
+func (m *Memory) SaveProfile(_ context.Context, p *Profile) error {
+	if err := ValidProfile(p); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur, ok := m.profiles[k]; ok && cur.received.After(received) {
+	if cur, ok := m.profiles[p.Key]; ok && cur.Received.After(p.Received) {
 		return fmt.Errorf("state: save profile: %w", ErrConflict)
 	}
-	m.profiles[k] = storedProfile{userData: slices.Clone(userData), received: received}
+	c := p.Clone()
+	c.KeepUntil = c.KeepUntil.Truncate(time.Second)
+	m.profiles[p.Key] = c
+	return nil
+}
+
+// KeepProfile implements Profiles.
+func (m *Memory) KeepProfile(_ context.Context, k ProfileKey, until, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[k]
+	if !ok || !p.KeepUntil.After(now) {
+		return fmt.Errorf("state: keep profile: %w", ErrNotFound)
+	}
+	if until = until.Truncate(time.Second); until.After(p.KeepUntil) {
+		p.KeepUntil = until
+	}
 	return nil
 }
 

@@ -21,7 +21,9 @@ const TerminatedGrace = time.Minute
 // limit registrations, and calls handle for each registration it changed, with
 // the registration before and after. after has no contacts when the last one
 // expired, and the S-CSCF then deregisters the user (SAR TIMEOUT_DEREGISTRATION,
-// TS 29.228 §6.1.2) as well as sending the reg event NOTIFY.
+// TS 29.228 §6.1.2) as well as sending the reg event NOTIFY. The record of an
+// unregistered user is handled the same way once its Unregistered has come:
+// before.Unregistered is set, and the S-CSCF ends that state with the HSS.
 //
 // Every instance may sweep at the same time. A registration is claimed by a
 // save conditional on the version read, so only one instance wins it and calls

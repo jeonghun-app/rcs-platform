@@ -55,6 +55,9 @@ const (
 	attrNToken  = "ntoken"
 	// attrReceived orders profiles: when the SAA or PPR arrived, Unix ns.
 	attrReceived = "received"
+	// attrTTL is the registrations table's TTL attribute, on profiles only:
+	// a registration must be swept, which sends the SAR, not just vanish.
+	attrTTL = "ttl"
 
 	IMPIIndex   = "impi-index"
 	IMPUIndex   = "impu-index"

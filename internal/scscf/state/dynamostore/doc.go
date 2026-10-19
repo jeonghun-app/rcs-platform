@@ -16,13 +16,16 @@
 //	impi     string   key of impi-index (keys only): RegistrationsOf
 //	shard    string   0 to 15, from the key
 //	expires  number   SweepAt in Unix seconds: the earliest contact expiry, or
-//	                  without contacts the end of the deregistration lease
+//	                  without contacts the end of the deregistration lease, or
+//	                  else the end of an unregistered user's state
 //
 // The doc names the IMPU's implicit registration set by its default IMPU.
 // The same table holds the profiles, one per set, partition key
-// profile#<IMPI>#<default IMPU>, with the User-Data in doc and received
-// (number, Unix ns) ordering them, and no index attribute, so no index lists
-// them.
+// profile#<IMPI>#<default IMPU>, with the User-Data in doc, received
+// (number, Unix ns) ordering them, and ttl (number, Unix seconds), the table's
+// TTL attribute, holding KeepUntil. They have no index attribute, so no index
+// lists them. Registrations have no ttl: DynamoDB must never delete one, only
+// a sweep, which sends the SAR.
 //
 // with global secondary indexes impi-index (partition impi) and expiry-index
 // (partition shard, sort expires), both keys only. The shard spreads the
