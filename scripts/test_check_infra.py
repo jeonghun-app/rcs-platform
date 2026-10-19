@@ -126,6 +126,33 @@ class PlatformTemplate(unittest.TestCase):
         attrs[:] = [a for a in attrs if a["Key"] != "preserve_client_ip.enabled"]
         self.assertProblem(t, "RelayMsrpTargetGroup: NLB target group must not preserve client addresses")
 
+    def test_an_nlb_target_group_resetting_connections_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for a in t["Resources"]["RelayMsrpTargetGroup"]["Properties"]["TargetGroupAttributes"]:
+            if a["Key"] == "deregistration_delay.connection_termination.enabled":
+                a["Value"] = "true"
+        self.assertProblem(t, "RelayMsrpTargetGroup: NLB target group must keep connections at deregistration")
+
+    def test_a_plain_listener_outside_dev_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["MsrpTcpListener"]["Condition"]
+        self.assertProblem(t, "MsrpTcpListener: a plain TCP listener outside dev (ADR 0003)")
+
+    def test_a_plain_sip_listener_with_pcscf_alone_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["SipTcpListener"]["Condition"] = "WithPcscf"
+        self.assertProblem(t, "SipTcpListener: a plain TCP listener outside dev")
+
+    def test_a_plain_port_open_outside_dev_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["NlbSecurityGroup"]["Properties"]["SecurityGroupIngress"].append(
+            {"IpProtocol": "tcp", "FromPort": 2855, "ToPort": 2855, "CidrIp": "0.0.0.0/0"})
+        self.assertProblem(t, "NlbSecurityGroup: plain port 2855 open outside dev (ADR 0003)")
+
+    def test_the_tls_listeners_are_not_dev_only(self):
+        listeners = check_infra.resources(self.template, "AWS::ElasticLoadBalancingV2::Listener")
+        self.assertFalse(check_infra.dev_only(self.template, listeners["MsrpTlsListener"].get("Condition")))
+
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)
         self.assertProblem(t, "Alb: internet-facing ALB without an AWS WAF web ACL")

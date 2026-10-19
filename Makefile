@@ -83,8 +83,9 @@ race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
 # cfn-lint and the platform policy checks (scripts/check_infra.py) in a pinned
-# tools image, built once per change of its Dockerfile like the Go toolchain.
-INFRAIMAGE ?= rcs-platform-infra:$(shell cat deploy/infra-tools.Dockerfile 2>/dev/null | sha256sum | cut -c1-12)
+# tools image, built once per change of its Dockerfile or requirements, like
+# the Go toolchain.
+INFRAIMAGE ?= rcs-platform-infra:$(shell cat deploy/infra-tools.Dockerfile deploy/infra-tools.requirements.txt 2>/dev/null | sha256sum | cut -c1-12)
 
 .PHONY: infra-tools
 infra-tools:

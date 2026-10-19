@@ -21,6 +21,7 @@ Metadata:
           - FtDeregistrationDelay
           - PcscfEnabled
           - WafRateLimit
+          - WafRateAction
       - Label: { default: Observability }
         Parameters: [ContainerInsights, LogRetentionDays]
 
@@ -109,13 +110,24 @@ Parameters:
 
   WafRateLimit:
     Type: Number
-    Default: 1000
+    Default: 10000
     MinValue: 100
     MaxValue: 2000000000
     Description: >
-      Requests per client address per 5 minutes the ALB's WAF rule allows
-      before it blocks that address. A deployment prerequisite of ft-server
+      Requests per client address per 5 minutes above which the ALB's WAF
+      rule acts on that address. A deployment prerequisite of ft-server
       (docs/ft-server.md, Operations notes): its own limits are per task.
+      Handsets reach the stack through carrier-grade NAT, thousands behind
+      one address, so size it to the busiest such address, not to a device.
+
+  WafRateAction:
+    Type: String
+    Default: count
+    AllowedValues: [count, block]
+    Description: >
+      What the rate rule does above WafRateLimit. count only counts (and
+      alarms), to measure real per-address peaks first; block refuses
+      (docs/runbook.md#wafratelimited says when to switch).
 
   ContainerInsights:
     Type: String
@@ -146,11 +158,13 @@ Conditions:
   IsProduction: !Not [!Condition IsDev]
   NatPerAz: !Equals [!Ref NatGateways, per-az]
   HasAlbCertificate: !Not [!Equals [!Ref AlbCertificateArn, '']]
-  NoAlbCertificate: !Equals [!Ref AlbCertificateArn, '']
   HasNlbCertificate: !Not [!Equals [!Ref NlbCertificateArn, '']]
   HasFtHostName: !Not [!Equals [!Ref FtHostName, '']]
   WithPcscf: !Equals [!Ref PcscfEnabled, 'true']
   WithPcscfTls: !And [!Condition WithPcscf, !Condition HasNlbCertificate]
+  # ADR 0003: plain SIP and MSRP are refused outside dev.
+  WithPcscfPlain: !And [!Condition WithPcscf, !Condition IsDev]
+  WafBlocks: !Equals [!Ref WafRateAction, block]
 
 Resources:
   # ---------------------------------------------------------------- network
@@ -507,9 +521,16 @@ Resources:
       GroupDescription: NLB - SIP and MSRP from clients
       VpcId: !Ref Vpc
       SecurityGroupIngress:
-        - { IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TCP' }
+        # The plain ports exist in dev only (ADR 0003), like their listeners.
+        - !If
+          - IsDev
+          - { IpProtocol: tcp, FromPort: 5060, ToPort: 5060, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TCP (dev)' }
+          - !Ref AWS::NoValue
         - { IpProtocol: tcp, FromPort: 5061, ToPort: 5061, CidrIp: !Ref PublicIngressCidr, Description: 'SIP over TLS' }
-        - { IpProtocol: tcp, FromPort: 2855, ToPort: 2855, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TCP' }
+        - !If
+          - IsDev
+          - { IpProtocol: tcp, FromPort: 2855, ToPort: 2855, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TCP (dev)' }
+          - !Ref AWS::NoValue
         - { IpProtocol: tcp, FromPort: 2856, ToPort: 2856, CidrIp: !Ref PublicIngressCidr, Description: 'MSRP over TLS' }
       # Only the target rules below leave the NLB; this unroutable entry
       # replaces the default allow-all.
@@ -724,6 +745,10 @@ Resources:
         # holds; the client address arrives in the PPv2 header instead.
         - { Key: preserve_client_ip.enabled, Value: 'false' }
         - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+        # Stated, not left to the default: on, the NLB would reset every
+        # client connection 30 s after deregistration, all at once, before
+        # the service's own staggered drain (ADR 0003).
+        - { Key: deregistration_delay.connection_termination.enabled, Value: 'false' }
 
   RelayMsrpTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -743,12 +768,15 @@ Resources:
         # holds; the client address arrives in the PPv2 header instead.
         - { Key: preserve_client_ip.enabled, Value: 'false' }
         - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+        - { Key: deregistration_delay.connection_termination.enabled, Value: 'false' }
 
   # The idle timeout is configurable on TCP listeners only; TLS listeners keep
-  # a fixed 350 s, which the keep-alives are sized for (ADR 0003).
+  # a fixed 350 s, which the keep-alives are sized for (ADR 0003). The plain
+  # listeners exist in dev only: ADR 0003 refuses unencrypted SIP and MSRP in
+  # staging and prod, and the target port cannot tell the two apart.
   SipTcpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: WithPcscf
+    Condition: WithPcscfPlain
     Properties:
       LoadBalancerArn: !Ref Nlb
       Protocol: TCP
@@ -770,6 +798,7 @@ Resources:
 
   MsrpTcpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: IsDev
     Properties:
       LoadBalancerArn: !Ref Nlb
       Protocol: TCP
@@ -850,26 +879,23 @@ Resources:
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
       DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
 
-  HttpRedirectListener:
+  # One listener on port 80 whatever the certificate: with one it redirects
+  # to HTTPS, without one (dev only, see Rules) it serves plain HTTP. Two
+  # conditional listeners on the same port would collide when a certificate
+  # is added to a running stack, since CloudFormation creates the new one
+  # before it deletes the old.
+  HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: HasAlbCertificate
     Properties:
       LoadBalancerArn: !Ref Alb
       Protocol: HTTP
       Port: 80
       DefaultActions:
-        - Type: redirect
-          RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
-
-  # dev only (see Rules): no certificate, so the ALB serves plain HTTP.
-  HttpListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: NoAlbCertificate
-    Properties:
-      LoadBalancerArn: !Ref Alb
-      Protocol: HTTP
-      Port: 80
-      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+        - !If
+          - HasAlbCertificate
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+          - { Type: forward, TargetGroupArn: !Ref AcsTargetGroup }
 
   # ft-server answers on its upload (/ft) and download (/dl) paths
   # (FT_UPLOAD_URI, FT_DOWNLOAD_URI); everything else goes to acs.
@@ -903,7 +929,7 @@ Resources:
       Rules:
         - Name: rate-per-address
           Priority: 0
-          Action: { Block: {} }
+          Action: !If [WafBlocks, { Block: {} }, { Count: {} }]
           Statement:
             RateBasedStatement:
               Limit: !Ref WafRateLimit
