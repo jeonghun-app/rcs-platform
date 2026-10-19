@@ -2,9 +2,11 @@ package registrar
 
 import (
 	"errors"
+	"slices"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -33,6 +35,10 @@ type register struct {
 	cseq       uint32
 	// path is the Path header field, topmost first (RFC 3327).
 	path []string
+	// supportsOutbound is "outbound" in Supported, and outbound whether the
+	// registrar applies it to a contact: one with +sip.instance and reg-id
+	// over an edge proxy whose Path entry has "ob" (RFC 5626 §6).
+	supportsOutbound, outbound bool
 }
 
 // parseRegister reads req, or returns the response a malformed one gets.
@@ -61,7 +67,7 @@ func parseRegister(req *sip.Request, realm string) (*register, *failure) {
 		return nil, f
 	}
 	if r.impi == "" {
-		// TS 24.229 §5.4.1.2.1: without credentials the private identity is
+		// TS 24.229 §5.4.1.1 3): without credentials the private identity is
 		// the public one without its scheme, which needs a SIP URI.
 		if !strings.HasPrefix(impu, "sip:") {
 			return nil, refuse(403, "No private identity")
@@ -88,6 +94,10 @@ func parseRegister(req *sip.Request, realm string) (*register, *failure) {
 		}
 		r.hasExpires = true
 	}
+	if len(r.contacts) > state.MaxContacts {
+		// Before any work for them: the binding rules are quadratic.
+		return nil, refuse(403, "Too many contacts")
+	}
 	// RFC 3261 §10.3 step 6: "*" only alone, and only to remove.
 	if r.star && (len(r.contacts) > 0 || !r.hasExpires || r.expires != 0) {
 		return nil, refuse(400, "Contact * needs Expires 0")
@@ -98,6 +108,17 @@ func parseRegister(req *sip.Request, realm string) (*register, *failure) {
 	}
 	for _, p := range path {
 		r.path = append(r.path, p.String())
+	}
+	supported, err := req.Header.Supported()
+	if err != nil {
+		return nil, refuse(400, "Bad Supported")
+	}
+	r.supportsOutbound = slices.Contains(supported, "outbound")
+	if ob, _ := outboundPath(r.path); ob {
+		r.outbound = slices.ContainsFunc(r.contacts, func(c sip.Contact) bool {
+			_, instance := c.Instance()
+			return instance && c.Params.Has("reg-id")
+		})
 	}
 	return r, nil
 }

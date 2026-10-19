@@ -8,9 +8,18 @@
 // Any scscf instance can serve any step: the challenge of a 401 is stored
 // (ADR 0005) and taken by the instance the answer reaches, which deletes it
 // on that first use, so a response is never checked twice. Digest nonces are
-// authenticated with a key every instance shares. Bindings are saved
-// conditional on the version read; a REGISTER that loses to another
-// instance's reads the registration again and applies itself to that.
+// authenticated with a key every instance shares.
+//
+// Each identity of an implicit registration set has a record of its own, and
+// a REGISTER applies only its own change (its contacts added, refreshed or
+// removed) to each record's current bindings, under that record's version,
+// reading it again when it lost to another instance. So REGISTERs of several
+// devices, or of several identities of one set, landing at once all take
+// effect everywhere, and a deregistration never deletes a record, or the
+// set's profile, that another device saved since it read them. A contact
+// with +sip.instance replaces the bindings of its instance but for its other
+// outbound flows; one without replaces the IMPI's earlier bindings without
+// an instance (TS 24.229 §5.4.1.2.2 4A).
 //
 // Every REGISTER is authenticated unless Config.TrustIntegrityProtected lets
 // a re-registration over a P-CSCF's protected connection go unchallenged.

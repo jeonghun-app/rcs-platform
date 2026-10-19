@@ -10,36 +10,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
-var set2 = state.ProfileKey{IMPI: impi1, IMPU: impu2}
-
-// twoSets registers impi1's two implicit registration sets, {impu1, tel1}
-// and {impu2, impu3}, from two devices.
-func twoSets(t *testing.T, e *env, g *Registrar) {
-	t.Helper()
-	u := e.akaUser(impi1, impu1, tel1)
-	wantStatus(t, u.registerWith(g, 600), 200)
-	other := e.akaUser(impi2, impu2, impu3)
-	// The second set belongs to impi1 too; the fake HSS keys by IMPI.
-	e.hss.mu.Lock()
-	s := e.hss.subs[impi2]
-	delete(e.hss.subs, impi2)
-	e.hss.subs[impi1].set = append(e.hss.subs[impi1].set, s.set...)
-	e.hss.mu.Unlock()
-	other.impi = impi1
-	other.callID = "set-2"
-	wantStatus(t, other.registerWith(g, 600), 200)
-	// The fake HSS answered both with one document; split them as the HSS
-	// does, one set per profile.
-	for k, ids := range map[state.ProfileKey][]string{set1: {impu1, tel1}, set2: {impu2, impu3}} {
-		must(0, e.store.SaveProfile(bg, &state.Profile{Key: k, UserData: userDataOf(impi1, nil, ids...), Received: e.clock.Now(), KeepUntil: t0.Add(25 * time.Hour)}))(t)
-		for _, impu := range ids {
-			r := must(e.store.Registration(bg, impu))(t)
-			r.DefaultIMPU = k.IMPU
-			must(e.store.SaveRegistration(bg, r))(t)
-		}
-	}
-}
-
 func wantResult(t *testing.T, got, want cx.Result) {
 	t.Helper()
 	if got != want {

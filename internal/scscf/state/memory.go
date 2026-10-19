@@ -188,6 +188,21 @@ func (m *Memory) KeepProfile(_ context.Context, k ProfileKey, until, now time.Ti
 	return nil
 }
 
+// DeleteProfileIf implements Profiles.
+func (m *Memory) DeleteProfileIf(_ context.Context, k ProfileKey, received time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[k]
+	if !ok {
+		return nil
+	}
+	if !p.Received.Equal(received) {
+		return fmt.Errorf("state: delete profile: %w", ErrConflict)
+	}
+	delete(m.profiles, k)
+	return nil
+}
+
 // DeleteProfile implements Profiles.
 func (m *Memory) DeleteProfile(_ context.Context, k ProfileKey) error {
 	m.mu.Lock()

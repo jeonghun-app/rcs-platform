@@ -249,7 +249,9 @@ func TestReRegistrationsExtendTheProfileOnlyWhenItIsDue(t *testing.T) {
 		wantStatus(t, u.registerWith(g, 3600), 200)
 		now := e.clock.Now()
 		got := must(e.store.Profile(bg, key, now))(t).KeepUntil
-		if first.Sub(now) >= state.ProfileKeepMargin {
+		// Due once the new expiry is ProfileKeepMargin past what KeepUntil
+		// covers (state.Profile.KeepDue).
+		if first.Sub(now.Add(time.Hour)) >= state.ProfileGrace-state.ProfileKeepMargin {
 			if !got.Equal(first) {
 				t.Fatalf("KeepUntil moved to %v at %v, before it was due", got, now)
 			}

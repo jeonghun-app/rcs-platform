@@ -48,8 +48,9 @@ func (d *Dynamo) registrationItem(r *state.Registration, version int64) (map[str
 		attrWriter:  str(d.token()),
 		attrIMPI:    str(r.IMPI),
 		attrShard:   str(shardOf(r.IMPU)),
-		// 0 without contacts and lease lists the registration as expiring at
-		// once, so a sweep deletes one that an instance left empty.
+		// 0 without contacts, lease or unregistered state lists the
+		// registration as expiring at once, so a sweep deletes one that an
+		// instance left empty.
 		attrExpires: num(sweepAt),
 	}
 	return item, checkSize(item, "registration")
@@ -210,32 +211,60 @@ func (d *Dynamo) SaveProfile(ctx context.Context, p *state.Profile) error {
 
 // KeepProfile implements state.Profiles with an UpdateItem of ttl alone,
 // conditional on the profile being there and ttl moving later. A resend, or a
-// profile already kept as long, fails the condition and is read back.
+// profile already kept as long, fails the condition and is read back; one
+// that a save replaced with an earlier ttl meanwhile gets a second attempt.
 func (d *Dynamo) KeepProfile(ctx context.Context, k state.ProfileKey, until, now time.Time) error {
 	if !possibleProfile(k) {
 		return fmt.Errorf("dynamostore: keep profile: %w", state.ErrNotFound)
 	}
-	_, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(d.registrations),
-		Key:                       profileKey(k),
-		UpdateExpression:          aws.String("SET #ttl = :until"),
-		ConditionExpression:       aws.String("attribute_exists(#pk) AND #ttl > :now AND #ttl < :until"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrTTL},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":until": num(until.Unix()), ":now": num(now.Unix())},
-	})
-	switch {
-	case ccf(err):
+	for range 2 {
+		_, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(d.registrations),
+			Key:                       profileKey(k),
+			UpdateExpression:          aws.String("SET #ttl = :until"),
+			ConditionExpression:       aws.String("attribute_exists(#pk) AND #ttl > :now AND #ttl < :until"),
+			ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrTTL},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":until": num(until.Unix()), ":now": num(now.Unix())},
+		})
+		switch {
+		case err == nil:
+			return nil
+		case !ccf(err):
+			return sanitize("keep profile", err)
+		}
 		p, err := d.Profile(ctx, k, now)
 		if err != nil {
 			return err
 		}
-		if p.KeepUntil.Unix() < until.Unix() {
-			// Only if the profile went and came back between the two
-			// requests; the caller reads it again.
-			return fmt.Errorf("dynamostore: keep profile: %w", state.ErrConflict)
+		if p.KeepUntil.Unix() >= until.Unix() {
+			return nil
 		}
+		// Saved again between the update and the read, with an earlier
+		// KeepUntil: try once more.
+	}
+	// Saved again during the second attempt too: that profile was just
+	// written, and the next registration extends it (state.Profiles).
+	return nil
+}
+
+// DeleteProfileIf implements state.Profiles with a DeleteItem conditional on
+// received. A resend finds nothing and succeeds.
+func (d *Dynamo) DeleteProfileIf(ctx context.Context, k state.ProfileKey, received time.Time) error {
+	if !possibleProfile(k) {
+		return nil
+	}
+	_, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:                 aws.String(d.registrations),
+		Key:                       profileKey(k),
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #rcv = :rcv"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#rcv": attrReceived},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":rcv": num(received.UnixNano())},
+	})
+	switch {
+	case ccf(err):
+		return fmt.Errorf("dynamostore: delete profile: %w", state.ErrConflict)
 	case err != nil:
-		return sanitize("keep profile", err)
+		return sanitize("delete profile", err)
 	}
 	return nil
 }

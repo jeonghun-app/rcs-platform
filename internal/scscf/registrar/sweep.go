@@ -78,17 +78,6 @@ func (g *Registrar) dropProfileIfIdle(ctx context.Context, gone *state.Registrat
 	return g.cfg.Store.DeleteProfile(ctx, gone.ProfileKey())
 }
 
-// live reports whether r still serves terminating requests at now: a
-// binding that has not expired, or an unregistered state that has not ended.
-func live(r *state.Registration, now time.Time) bool {
-	for _, c := range r.Contacts {
-		if !c.Expired(now) {
-			return true
-		}
-	}
-	return r.Unregistered.After(now)
-}
-
 // RunSweeps sweeps every interval, as many times as it takes to find fewer
 // than limit registrations due, until ctx ends. Every instance runs it; the
 // store lets one instance handle each registration.

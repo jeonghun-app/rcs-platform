@@ -10,22 +10,11 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
-var set1 = state.ProfileKey{IMPI: impi1, IMPU: impu1}
-
 func registered(t *testing.T, e *env, g *Registrar, expires int, set ...string) *ue {
 	t.Helper()
 	u := e.akaUser(impi1, set...)
 	wantStatus(t, u.registerWith(g, expires), 200)
 	return u
-}
-
-func gone(t *testing.T, e *env, impus ...string) {
-	t.Helper()
-	for _, impu := range impus {
-		if r, err := e.store.Registration(bg, impu); err == nil {
-			t.Errorf("%s is still stored: %+v", impu, r)
-		}
-	}
 }
 
 func TestAnExpiredRegistrationIsDeregisteredWithTheHSSAndItsProfileGoes(t *testing.T) {
@@ -50,9 +39,10 @@ func TestAnExpiredRegistrationIsDeregisteredWithTheHSSAndItsProfileGoes(t *testi
 func TestAnExpiredBindingAmongOthersGoesWithoutAnSAR(t *testing.T) {
 	e := newEnv(t)
 	g := e.instance(1)
-	u := registered(t, e, g, 600, impu1)
-	other := *u
-	other.callID, other.contact = "device-2", "sip:ue2@192.0.2.20:5060;transport=tcp"
+	u := e.akaUser(impi1, impu1)
+	u.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+	wantStatus(t, u.registerWith(g, 600), 200)
+	other := device(u, 2)
 	wantStatus(t, other.registerWith(g, 1200), 200)
 	sars := len(e.hss.sarsOf())
 	e.clock.advance(601 * time.Second)
