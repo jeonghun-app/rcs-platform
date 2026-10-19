@@ -32,7 +32,7 @@ var (
 func stack(t *testing.T) scenario.Config {
 	t.Helper()
 	f := simtest.StartFT(t, part)
-	corePort := simtest.FreePort(t)
+	corePort := simtest.StandInPort(t)
 	r := simtest.StartRelay(t, corePort)
 	// IdleWait is six keep-alive intervals, so a slow scheduler still sees
 	// one go out.

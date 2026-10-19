@@ -74,7 +74,7 @@ func TestListAndVersionAndHelp(t *testing.T) {
 
 func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 	f := simtest.StartFT(t, 64<<10)
-	corePort := simtest.FreePort(t)
+	corePort := simtest.StandInPort(t)
 	r := simtest.StartRelay(t, corePort)
 	lookup := env("RCS_SIM_FT_USER", simtest.FTUser, "RCS_SIM_FT_PASSWORD", simtest.FTPassword, "RCS_SIM_RELAY_TOKEN", simtest.RelayToken)
 	args := []string{
