@@ -86,7 +86,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		DrainTimeout:   runtime.DefaultShutdownTimeout - stopMargin,
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
-		Namespace: "rcs.internal", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
+		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 	}
 	if !reflect.DeepEqual(c, want) {
@@ -114,6 +114,10 @@ func TestTheVisitedNetworkIsTheHomeDomainUnlessSet(t *testing.T) {
 	c, err := configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "", "PCSCF_ICSCF_URI", "sip:10.0.3.7;transport=tcp;lr", "PCSCF_VISITED_NETWORK_ID", "visited.example.net"))
 	if err != nil || c.Namespace != "" || c.VisitedNetworkID != "visited.example.net" {
 		t.Errorf("without a namespace: %+v, %v", c, err)
+	}
+	c, err = configure(with(devEnv, "RCS_IMS_DOMAIN", "IMS.mnc001.mcc001.3gppnetwork.org."))
+	if want := "ims.mnc001.mcc001.3gppnetwork.org"; err != nil || c.HomeDomain != want || c.VisitedNetworkID != want {
+		t.Errorf("home domain %q, visited network %q, %v", c.HomeDomain, c.VisitedNetworkID, err)
 	}
 }
 
@@ -214,7 +218,8 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=udp;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.example.net;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.evil-rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
-		{[]string{"RCS_IMS_DOMAIN", ""}, "PCSCF_VISITED_NETWORK_ID: required when RCS_IMS_DOMAIN is unset"},
+		{[]string{"RCS_IMS_DOMAIN", ""}, "RCS_IMS_DOMAIN: required"},
+		{[]string{"RCS_IMS_DOMAIN", "ims_1.example.net"}, "RCS_IMS_DOMAIN: not a host name"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "a, b"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "\"open"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"PCSCF_VISITED_NETWORK_ID", "a\r\nRoute: <sip:x>"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},

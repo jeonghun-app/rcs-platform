@@ -91,8 +91,13 @@ type Config struct {
 	// Namespace is RCS_SERVICE_NAMESPACE, the only names a core hop is
 	// looked up in (ADR 0007 §5).
 	Namespace string
+	// HomeDomain is RCS_IMS_DOMAIN, the operator's IMS domain: the type 1
+	// orig-ioi of P-Charging-Vector, naming the network that sends a
+	// request (TS 24.229 §5.2.2.1 4), §5.2.6.3.3 7)), and the visited
+	// network by default.
+	HomeDomain string
 	// VisitedNetworkID is the P-Visited-Network-ID of REGISTERs (TS 24.229
-	// §5.2.2.1, RFC 7315 §4.3), RCS_IMS_DOMAIN by default: icscf takes the
+	// §5.2.2.1, RFC 7315 §4.3), HomeDomain by default: icscf takes the
 	// Visited-Network-Identifier of its UAR from it.
 	VisitedNetworkID string
 	// AllowLoopback lets a core hop resolve to a loopback address, for a
@@ -134,13 +139,14 @@ func Configure(s *runtime.Settings) Config {
 		RegisterRate:      e.Int("REGISTER_RATE", DefaultRegisterRate),
 		RegisterBurst:     e.Int("REGISTER_BURST", DefaultRegisterBurst),
 		Namespace:         s.ServiceNamespace(),
-		VisitedNetworkID:  e.String("VISITED_NETWORK_ID", s.Shared.String("IMS_DOMAIN", "")),
+		HomeDomain:        strings.TrimSuffix(strings.ToLower(s.Shared.RequiredString("IMS_DOMAIN")), "."),
 	}
+	c.VisitedNetworkID = e.String("VISITED_NETWORK_ID", c.HomeDomain)
 	c.ICSCF = icscfURI(s)
-	switch {
-	case c.VisitedNetworkID == "":
-		e.Invalid("VISITED_NETWORK_ID", "required when RCS_IMS_DOMAIN is unset")
-	case !validVisitedNetwork(c.VisitedNetworkID):
+	if c.HomeDomain != "" && !validHostName(c.HomeDomain) {
+		s.Shared.Invalid("IMS_DOMAIN", "not a host name")
+	}
+	if c.VisitedNetworkID != "" && !validVisitedNetwork(c.VisitedNetworkID) {
 		e.Invalid("VISITED_NETWORK_ID", "not one network identifier (RFC 7315 §4.3)")
 	}
 	if c.PublicHost != "" && !validHostName(c.PublicHost) {

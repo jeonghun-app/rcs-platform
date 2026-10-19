@@ -84,7 +84,8 @@ listener (TS 24.229 §5.2.2.1):
 - **Network headers.** `pcscf` adds `P-Visited-Network-ID`
   (`PCSCF_VISITED_NETWORK_ID`, the home domain by default), from which
   `icscf` takes the Visited-Network-Identifier of its UAR, and
-  `P-Charging-Vector` with a new `icid-value` for each REGISTER.
+  `P-Charging-Vector` with a new `icid-value` for each REGISTER and
+  `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.2.1 4)).
 - **Failover.** `pcscf` tries `icscf`'s addresses in a random order. An
   address it cannot connect to, that does not answer within 8 s, or that
   answers 3xx, 480 or 503 gives way to the next, up to three (§5.2.2.1 7)).
@@ -151,7 +152,8 @@ start with that value.
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client (IPv4 address or IPv6 /64) |
 | `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | the Route of a REGISTER: a `sip` URI with `transport=tcp` and `lr`, of an address or a name inside `RCS_SERVICE_NAMESPACE`; required without a namespace |
-| `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3); required without `RCS_IMS_DOMAIN` |
+| `RCS_IMS_DOMAIN` | required | the operator's IMS domain, a host name: the `orig-ioi` of `P-Charging-Vector` |
+| `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3) |
 | `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |

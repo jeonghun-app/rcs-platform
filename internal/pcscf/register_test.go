@@ -135,7 +135,9 @@ func prepared(t *testing.T, d proxy.Decision, r *proxy.Request) *sip.Request {
 	return req
 }
 
-var icidValue = regexp.MustCompile(`^icid-value=[0-9a-f]{32}$`)
+// icidValue is pcscf's P-Charging-Vector: a new icid, and the home domain
+// as the type 1 orig-ioi.
+var icidValue = regexp.MustCompile(`^icid-value=[0-9a-f]{32};orig-ioi=ims\.mnc001\.mcc001\.3gppnetwork\.org$`)
 
 const outboundContact = `<sip:alice@192.0.2.10:40000;transport=tcp>;+sip.instance="<urn:uuid:00000000-0000-1000-8000-000000000001>";reg-id=1`
 
