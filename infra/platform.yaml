@@ -25,7 +25,7 @@ Metadata:
           - WafRateLimit
           - WafRateAction
       - Label: { default: Release }
-        Parameters: [EcrStackName, ImageTag, AcsImageTag]
+        Parameters: [EcrStackName, ImageTag, ImageDigest, AcsImageTag, AcsImageDigest]
       - Label: { default: Identity }
         Parameters: [ImsDomain, FtRealm, AcsHostName, RelayPublicHost]
       - Label: { default: Services }
@@ -198,10 +198,22 @@ Parameters:
       Tag of the platform image (git describe; immutable). No default:
       deploy.sh passes it on every deployment, so a rollback names it.
 
+  ImageDigest:
+    Type: String
+    AllowedPattern: '^sha256:[0-9a-f]{64}$'
+    Description: >
+      Digest of ImageTag in ECR, which the task definitions run, so a task
+      always starts from the bytes deploy.sh checked (deploy.sh sets it).
+
   AcsImageTag:
     Type: String
     AllowedPattern: '^[0-9A-Za-z._-]{1,128}$'
     Description: Tag of the acs image, the pinned acs release (ADR 0006).
+
+  AcsImageDigest:
+    Type: String
+    AllowedPattern: '^sha256:[0-9a-f]{64}$'
+    Description: Digest of the acs image in ECR (deploy.sh sets it to the pinned ACS_DIGEST).
 
   ImsDomain:
     Type: String
@@ -487,7 +499,9 @@ Conditions:
   HasDailyBudget: !Not [!Equals [!Ref DailyBudgetUsd, '0']]
   HasRelayPublicHost: !Not [!Equals [!Ref RelayPublicHost, '']]
   HasAcsHostName: !Not [!Equals [!Ref AcsHostName, '']]
-  UseAcsAwsSms: !Not [!Equals [!Ref AcsSmsProvider, mock]]
+  UseAcsEum: !Equals [!Ref AcsSmsProvider, eum]
+  UseAcsSns: !Equals [!Ref AcsSmsProvider, sns]
+  InUsEast1: !Equals [!Ref AWS::Region, us-east-1]
 
 Resources:
   # ---------------------------------------------------------------- network
@@ -1200,7 +1214,7 @@ Resources:
       Port: 443
       Certificates: [{ CertificateArn: !Ref AlbCertificateArn }]
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
-      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+      DefaultActions: [{ Type: fixed-response, FixedResponseConfig: { StatusCode: '404', ContentType: text/plain } }]
 
   # One listener on port 80 whatever the certificate: with one it redirects
   # to HTTPS, without one (dev only, see Rules) it serves plain HTTP. Two
@@ -1218,10 +1232,13 @@ Resources:
           - HasAlbCertificate
           - Type: redirect
             RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
-          - { Type: forward, TargetGroupArn: !Ref AcsTargetGroup }
+          - { Type: fixed-response, FixedResponseConfig: { StatusCode: '404', ContentType: text/plain } }
 
-  # ft-server answers on its upload (/ft) and download (/dl) paths
-  # (FT_UPLOAD_URI, FT_DOWNLOAD_URI); everything else goes to acs.
+  # Only the client-facing paths reach a service; everything else, acs's
+  # /admin API and console included, gets the listeners' fixed 404 (ADR 0007
+  # §5: operator APIs are never on the public ALB). acs's admin is reached
+  # from inside the VPC. ft-server answers on its upload (/ft) and download
+  # (/dl) paths (FT_UPLOAD_URI, FT_DOWNLOAD_URI).
   FtServerRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
     Properties:
@@ -1236,6 +1253,29 @@ Resources:
             HostHeaderConfig: { Values: [!Ref FtHostName] }
           - !Ref AWS::NoValue
       Actions: [{ Type: forward, TargetGroupArn: !Ref FtServerTargetGroup }]
+
+  # acs's configuration paths (ACS_CONFIG_PATHS, RCC.14), OMA-DM, and the
+  # MSISDN entry flow, as acs's pinned release serves them. A rule takes at
+  # most five values, hence two.
+  AcsConfigRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasAlbCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: [/, /config, /rcs/config] }
+      Actions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
+
+  AcsDeviceRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [HasAlbCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 21
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: [/dm, /dm/mo, /msisdn, /msisdn/verify] }
+      Actions: [{ Type: forward, TargetGroupArn: !Ref AcsTargetGroup }]
 
   # A rate-based rule per client address: ft-server's and acs's own limits are
   # per task, so only this limits one client across tasks.
@@ -1261,6 +1301,30 @@ Resources:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
             MetricName: rate-per-address
+
+  # WAF logs record every request the ALB receives, for audit. The query
+  # string and the identity and credential headers are redacted: acs's
+  # configuration queries carry IMSI and MSISDN, and ft-server's download ids
+  # are capabilities. (ALB access logs are off for the same reason: they
+  # cannot redact the query string.)
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # WAF requires the aws-waf-logs- prefix.
+      LogGroupName: !Sub 'aws-waf-logs-${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WafLogGroup}'
+      RedactedFields:
+        - QueryString: {}
+        - SingleHeader: { Name: authorization }
+        - SingleHeader: { Name: cookie }
+        - SingleHeader: { Name: x-3gpp-intended-identity }
 
   WebAclAssociation:
     Type: AWS::WAFv2::WebACLAssociation
@@ -1609,7 +1673,7 @@ Resources:
             Effect: Allow
             Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
             Action:
-              - kms:Create*
+              - kms:CreateAlias
               - kms:Describe*
               - kms:Enable*
               - kms:List*
@@ -2053,16 +2117,31 @@ Resources:
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:DescribeTable]
                 Resource: [!GetAtt AcsTable.Arn, !Sub '${AcsTable.Arn}/index/gsi1']
-        # Sending an SMS to a number has no resource to scope to.
+        # Only the chosen provider's send action. Sending an SMS to a number
+        # has no resource to scope to, so Resource is '*' as the APIs require;
+        # for SNS a Deny keeps it to phone numbers, never a topic.
         - !If
-          - UseAcsAwsSms
+          - UseAcsEum
           - PolicyName: sms
             PolicyDocument:
               Version: '2012-10-17'
               Statement:
                 - Effect: Allow
-                  Action: [sms-voice:SendTextMessage, sns:Publish]
+                  Action: sms-voice:SendTextMessage
                   Resource: '*'
+          - !Ref AWS::NoValue
+        - !If
+          - UseAcsSns
+          - PolicyName: sms
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: '*'
+                - Effect: Deny
+                  Action: sns:Publish
+                  Resource: !Sub 'arn:${AWS::Partition}:sns:*:*:*'
           - !Ref AWS::NoValue
 
   # ---------------------------------------------------- service discovery
@@ -2118,7 +2197,7 @@ Resources:
       ContainerDefinitions:
         - Name: hss
           Image: !Sub
-            - '${Repository}:${ImageTag}'
+            - '${Repository}@${ImageDigest}'
             - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryUri' }
           Command: [hss]
           Essential: true
@@ -2180,7 +2259,7 @@ Resources:
       ContainerDefinitions:
         - Name: ft-server
           Image: !Sub
-            - '${Repository}:${ImageTag}'
+            - '${Repository}@${ImageDigest}'
             - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryUri' }
           Command: [ft-server]
           Essential: true
@@ -2241,7 +2320,7 @@ Resources:
       ContainerDefinitions:
         - Name: msrp-relay
           Image: !Sub
-            - '${Repository}:${ImageTag}'
+            - '${Repository}@${ImageDigest}'
             - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryUri' }
           Command: [msrp-relay]
           Essential: true
@@ -2301,7 +2380,7 @@ Resources:
       ContainerDefinitions:
         - Name: acs
           Image: !Sub
-            - '${Repository}:${AcsImageTag}'
+            - '${Repository}@${AcsImageDigest}'
             - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-AcsRepositoryUri' }
           Essential: true
           ReadonlyRootFilesystem: true
@@ -2456,13 +2535,55 @@ Resources:
   # section of the same name in docs/runbook.md. Service metrics are EMF in
   # the RCS/<stack> namespace with the Service dimension only.
 
+  # Encrypts the alarm topic. CloudWatch, EventBridge and AWS Budgets cannot
+  # use the AWS managed aws/sns key, so the topic has its own, which only they
+  # may use, and only for this account.
+  AlarmKey:
+    Type: AWS::KMS::Key
+    Condition: CreateAlarmTopic
+    Properties:
+      Description: !Sub 'Encrypts the alarm topic of ${AWS::StackName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AdministerWithoutUsing
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
+            Action:
+              - kms:CreateAlias
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: PublishersEncrypt
+            Effect: Allow
+            Principal: { Service: [cloudwatch.amazonaws.com, events.amazonaws.com, budgets.amazonaws.com] }
+            Action: ['kms:GenerateDataKey*', kms:Decrypt]
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+
   AlarmTopic:
     Type: AWS::SNS::Topic
     Condition: CreateAlarmTopic
     Properties:
       TopicName: !Sub '${AWS::StackName}-alarms'
+      KmsMasterKeyId: !Ref AlarmKey
 
-  # EventBridge publishes the security change events here.
+  # A topic policy replaces the default one, so it names every publisher:
+  # CloudWatch (alarms), EventBridge (security and service events) and,
+  # with the budgets, AWS Budgets (checked).
   AlarmTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Condition: CreateAlarmTopic
@@ -2472,7 +2593,7 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: { Service: [events.amazonaws.com, budgets.amazonaws.com] }
+            Principal: { Service: [cloudwatch.amazonaws.com, events.amazonaws.com, budgets.amazonaws.com] }
             Action: sns:Publish
             Resource: !Ref AlarmTopic
             Condition:
@@ -4123,6 +4244,58 @@ Resources:
           eventName: [SERVICE_TASK_START_IMPAIRED, SERVICE_DEPLOYMENT_FAILED]
       Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
 
+  # Key policy and key state changes (threat model T7). Also fires on every
+  # deployment that changes a key policy.
+  KmsKeyChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: KMS key policy and key state changes, reported to the alarm topic.
+      EventPattern:
+        source: [aws.kms]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [kms.amazonaws.com]
+          eventName: [PutKeyPolicy, ScheduleKeyDeletion, DisableKey, CreateGrant, RevokeGrant]
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  # Task definitions decide what runs with which role (T7). Deployments
+  # register new ones, so every deployment reports here too.
+  TaskDefinitionChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ECS task definition registrations and service updates, reported to the alarm topic.
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ecs.amazonaws.com]
+          eventName: [RegisterTaskDefinition, DeregisterTaskDefinition, UpdateService, CreateService, DeleteService]
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  # IAM is global: CloudTrail delivers its events to EventBridge in
+  # us-east-1 only, so this rule exists only in a us-east-1 stack; elsewhere
+  # see docs/aws-deployment.md (Prerequisites).
+  IamPolicyChanges:
+    Type: AWS::Events::Rule
+    Condition: InUsEast1
+    Properties:
+      Description: IAM policy and trust changes, reported to the alarm topic.
+      EventPattern:
+        source: [aws.iam]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [iam.amazonaws.com]
+          eventName:
+            - PutRolePolicy
+            - AttachRolePolicy
+            - DetachRolePolicy
+            - DeleteRolePolicy
+            - UpdateAssumeRolePolicy
+            - PutUserPolicy
+            - AttachUserPolicy
+            - CreatePolicyVersion
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
   # Cost alarms (handbook: 80% and 100% of a daily and a monthly budget).
   # Each has a section in docs/runbook.md. The budgets see the whole account:
   # filtering on a tag needs a cost allocation tag activated by hand, and a
@@ -4230,3 +4403,9 @@ Outputs:
   AcsAdminTokenSecret:
     Description: Secret holding the acs admin token.
     Value: !Ref AcsAdminToken
+  ImageTag:
+    Description: The platform image this stack runs (by digest ImageDigest).
+    Value: !Ref ImageTag
+  AcsImageTag:
+    Description: The acs release this stack runs (by digest AcsImageDigest).
+    Value: !Ref AcsImageTag
