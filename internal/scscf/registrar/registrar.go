@@ -69,8 +69,11 @@ type Config struct {
 	ChallengeLifetime time.Duration
 	// TrustIntegrityProtected lets a re-registration whose Authorization
 	// carries integrity-protected="tls-yes" go without a challenge (TS 24.229
-	// §5.4.1.2.1). Only for a P-CSCF that removes the parameter from what
-	// clients send.
+	// §5.4.1.2.1). It needs a P-CSCF that sets the parameter itself, for a
+	// connection it has authenticated, and removes it from what clients
+	// send. This platform's pcscf removes it and sets none (#198), so no such
+	// mode exists yet: cmd/scscf must not tie this to its environment or
+	// configuration, and every REGISTER is challenged.
 	TrustIntegrityProtected bool
 
 	Now     func() time.Time
