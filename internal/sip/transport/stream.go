@@ -296,16 +296,16 @@ const shedScanInterval = 100 * time.Millisecond
 // refused and the shedding scan, where other goroutines may free room.
 var testHookBeforeShed func()
 
-// shedHeadroom is the share of MaxQueuedBytes a scan tries to free beyond the
-// send that triggered it, by closing stalled client-facing connections.
-// Freeing only that send's shortfall would leave the budget full again for the
-// next send, and scans run at most once per shedScanInterval, so a burst after
-// a mass stall would be refused for many intervals while stalled clients
-// remained to be shed. It is best effort: when every stalled client together
-// cannot make it, because healthy queues hold most of the budget, closing them
-// all would gain little, so only the real shortfall is covered. Core
-// connections are never closed for headroom: losing one fails every
-// transaction on it, so one is shed only while the send itself does not fit.
+// shedHeadroom is the share of MaxQueuedBytes a scan frees beyond the shortfall
+// of the send that triggered it, by closing stalled client-facing connections.
+// Freeing only the shortfall would leave the budget full again for the next
+// send, and scans run at most once per shedScanInterval, so a burst after a
+// mass stall would be refused for many intervals while stalled clients
+// remained to be shed. The amount is fixed, not a level to reach: however much
+// healthy queues hold, one scan frees at most the shortfall plus this share,
+// and fewer if there are fewer stalled clients. Core connections are never
+// closed for headroom: losing one fails every transaction on it, so one is
+// shed only while the send itself does not fit.
 const shedHeadroom = 0.10
 
 // shedCandidate is a connection a scan may close, with what closing it frees.
@@ -330,9 +330,8 @@ func sortCandidates(cands []shedCandidate) {
 }
 
 // shedStalledQueues closes stalled connections other than except, in shedRank
-// order: client-facing ones until all queues together, plus need more bytes,
-// fit in all but shedHeadroom of the budget if they can get it there, and to
-// cover the real shortfall otherwise; core ones only while that shortfall
+// order: client-facing ones until they have freed the shortfall of need more
+// bytes plus shedHeadroom of the budget, core ones only while the shortfall
 // remains. It returns how many it closed.
 //
 // Scans are serialized: a sender that finds the budget full while another
@@ -365,19 +364,8 @@ func (t *Transport) shedStalledQueues(except *flow, need int) (closed int) {
 			share: float64(queued) / float64(f.q.limit), stalled: idle}, queued})
 	}
 	sortCandidates(cands)
-	wanted := t.budget.used.Load() + int64(need)
-	overBudget := wanted - t.budget.max
-	clientGoal := wanted - int64(float64(t.budget.max)*(1-shedHeadroom))
-	var clientBytes int64
-	for _, c := range cands {
-		if c.rank.client {
-			clientBytes += int64(c.queued)
-		}
-	}
-	if clientBytes < clientGoal {
-		// The headroom is out of reach; cover the shortfall only.
-		clientGoal = overBudget
-	}
+	overBudget := t.budget.used.Load() + int64(need) - t.budget.max
+	clientGoal := overBudget + int64(float64(t.budget.max)*shedHeadroom)
 	for _, c := range cands {
 		// Clients sort first. A client is worth closing while the client goal
 		// is unmet, a core connection while the send does not fit at all; the

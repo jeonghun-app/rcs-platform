@@ -72,10 +72,13 @@ func TestConcurrentBurstAfterAMassStallIsNotRefused(t *testing.T) {
 	}
 }
 
-// QA (PR #153, finding 2): when healthy queues hold so much that every stalled
-// client together cannot reach the headroom, only the shortfall is covered;
-// closing all eight here would gain almost nothing.
-func TestUnreachableHeadroomShedsOnlyTheShortfall(t *testing.T) {
+// QA (PR #153, finding 2), with the tech lead's final rule: healthy queues hold
+// so much of the budget that no headroom level is reachable, and a scan frees
+// a fixed amount rather than everything it can: the shortfall plus 10% of the
+// budget, overshooting by at most one client. Here that is all eight stalled
+// clients, about 11 KiB, which QA's version of this test called too many;
+// the bound is what the tech lead chose to keep a burst moving.
+func TestOneScanFreesAtMostTheShortfallPlusTheHeadroom(t *testing.T) {
 	const budget = 100 << 10
 	server := shedRig(t, budget, sip.Limits{MaxHeaderBytes: 4 << 10, MaxBodyBytes: 64 << 10})
 	busy := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
@@ -99,14 +102,18 @@ func TestUnreachableHeadroomShedsOnlyTheShortfall(t *testing.T) {
 	if _, err := server.SendRequest(shedMsg(t, 1700), other); err != nil {
 		t.Fatal(err)
 	}
-	closed := 0
+	freed := 0
 	for _, f := range clients {
 		if f.closed.Load() {
-			closed++
+			freed += 1100 + 300 // body plus about the header of each
 		}
 	}
-	if closed != 1 {
-		t.Fatalf("%d stalled clients shed; one covered the shortfall (%+v)", closed, server.Stats())
+	shortfall := 1940 - (budget - 101300) // QA's figures: the shortfall was 814 B
+	if limit := shortfall + budget/10 + 1400; freed > limit {
+		t.Fatalf("one scan freed about %d B, past the shortfall plus the headroom (%d B)", freed, limit)
+	}
+	if freed == 0 {
+		t.Fatal("nothing was shed")
 	}
 }
 
@@ -151,5 +158,100 @@ func TestSheddingSeveralFollowsTheRankOrder(t *testing.T) {
 		if want := i >= 4; f.closed.Load() != want {
 			t.Errorf("client %d KiB: closed=%v, want %v", i+1, f.closed.Load(), want)
 		}
+	}
+}
+
+// With more stalled clients than the shortfall plus the headroom needs, a scan
+// closes only as many as that takes, not all of them.
+func TestOneScanLeavesTheStalledClientsItDoesNotNeed(t *testing.T) {
+	const budget = 100 << 10
+	server := shedRig(t, budget, sip.Limits{MaxHeaderBytes: 4 << 10, MaxBodyBytes: 64 << 10})
+	busy := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
+	if _, err := server.SendRequest(shedMsg(t, 40<<10), busy); err != nil {
+		t.Fatal(err)
+	}
+	var clients []*flow
+	for i := range 20 {
+		f := pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.80"), uint16(40000+i)))
+		if _, err := server.SendRequest(shedMsg(t, 1100), Destination{Flow: f.id}, NoWait); err != nil {
+			t.Fatal(err)
+		}
+		stalled(f)
+		clients = append(clients, f)
+	}
+	server.flows.peer(reuseKey{network: TCP, remote: busy.Addr}).q.progress.Store(time.Now().UnixNano())
+	// A fresh, healthy client fills the budget to within 1 KiB.
+	fill := pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.81"), 42000))
+	if _, err := server.SendRequest(shedMsg(t, budget-int(server.budget.used.Load())-1300), Destination{Flow: fill.id}, NoWait); err != nil {
+		t.Fatal(err)
+	}
+	other := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.51:5060")}
+	if _, err := server.SendRequest(shedMsg(t, 1700), other); err != nil {
+		t.Fatal(err)
+	}
+	closed := 0
+	for _, f := range clients {
+		if f.closed.Load() {
+			closed++
+		}
+	}
+	// About 1 KiB short plus 10 KiB of headroom is eight 1.4 KiB clients; nine
+	// allows for the estimate. Twenty would be every stalled client.
+	if closed == 0 || closed > 9 {
+		t.Fatalf("%d of 20 stalled clients shed (%+v)", closed, server.Stats())
+	}
+}
+
+// QA (PR #153, round 2): once the clients have covered the shortfall, a stalled core connection
+// behind them stays open, even when the headroom is out of reach.
+func TestStalledCoreStaysOnceClientsCoverTheShortfall(t *testing.T) {
+	const budget = 100 << 10
+	server := shedRig(t, budget, sip.Limits{MaxHeaderBytes: 4 << 10, MaxBodyBytes: 64 << 10})
+	busy := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
+	for range 2 {
+		if _, err := server.SendRequest(shedMsg(t, 44<<10), busy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stalledCore := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.60:5060")}
+	if _, err := server.SendRequest(shedMsg(t, 5<<10), stalledCore); err != nil {
+		t.Fatal(err)
+	}
+	core := server.flows.peer(reuseKey{network: TCP, remote: stalledCore.Addr})
+	stalled(core)
+	client := pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.80"), 40000))
+	if _, err := server.SendRequest(shedMsg(t, 2500), Destination{Flow: client.id}, NoWait); err != nil {
+		t.Fatal(err)
+	}
+	stalled(client)
+	server.flows.peer(reuseKey{network: TCP, remote: busy.Addr}).q.progress.Store(time.Now().UnixNano())
+	free := budget - int(server.budget.used.Load())
+	other := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.51:5060")}
+	if _, err := server.SendRequest(shedMsg(t, free+500-300), other); err != nil {
+		t.Fatalf("send: %v (%+v)", err, server.Stats())
+	}
+	if !client.closed.Load() || core.closed.Load() {
+		t.Fatalf("client closed=%v (want true), stalled core closed=%v (want false); %+v", client.closed.Load(), core.closed.Load(), server.Stats())
+	}
+}
+
+// QA (PR #153, round 2): a scan records its time itself, so a second scan within the interval
+// closes nothing even though candidates remain.
+func TestAScanStartsTheIntervalItself(t *testing.T) {
+	r := newBudgetRig(t)
+	for _, h := range []string{"192.0.2.1", "192.0.2.2"} {
+		if err := r.send(h, 600); err != nil {
+			t.Fatal(err)
+		}
+		stalled(r.flow(h))
+	}
+	a, b := r.flow("192.0.2.1"), r.flow("192.0.2.2")
+	need := 3000 - int(r.tr.budget.used.Load()) + 1
+	if n := r.tr.shedStalledQueues(nil, need); n != 1 {
+		t.Fatalf("first scan closed %d, want 1", n)
+	}
+	need = 3000 - int(r.tr.budget.used.Load()) + 3000
+	if n := r.tr.shedStalledQueues(nil, need); n != 0 || (a.closed.Load() && b.closed.Load()) {
+		t.Fatalf("a second scan within the interval closed %d", n)
 	}
 }

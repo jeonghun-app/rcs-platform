@@ -595,9 +595,9 @@ func TestHeadroomNeverClosesAStalledCoreConnection(t *testing.T) {
 		coreShed   bool // whether the stalled core connection must go
 		wantClosed int
 	}{
-		// Two clients cannot reach the headroom, so only the shortfall is
-		// covered, by one of them; the stalled core connection stays.
-		{"clients cover the shortfall", 2, false, 1},
+		// The two clients hold less than the shortfall plus the headroom, so
+		// both go; they cover the shortfall, so the stalled core stays.
+		{"clients cover the shortfall", 2, false, 2},
 		// No clients: the send does not fit, so the core connection goes.
 		{"only the core can make room", 0, true, 1},
 	} {
@@ -693,5 +693,42 @@ func TestCandidatesAreClosedClientsFirstThenFullestThenLongestStalled(t *testing
 	want := []string{"client-full-old", "client-full-recent", "client-light", "core-full", "core-light"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("order = %v, want %v", got, want)
+	}
+}
+
+// #153 review probe: healthy core queues hold about 92% of the budget, so a
+// "down to 90%" target was out of reach and only the shortfall was freed, and
+// a burst was refused one send per scan. Freeing the shortfall plus 10% of the
+// budget instead lets the burst in after one scan.
+func TestBurstFitsAfterOneScanEvenWhenHealthyQueuesHoldMostOfTheBudget(t *testing.T) {
+	const budget = 100 << 10
+	server := shedRig(t, budget, sip.Limits{MaxHeaderBytes: 4 << 10, MaxBodyBytes: 64 << 10})
+	busy := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.50:5060")}
+	for range 2 {
+		if _, err := server.SendRequest(shedMsg(t, 46<<10), busy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	busyFlow := server.flows.peer(reuseKey{network: TCP, remote: busy.Addr})
+	for i := range 10 {
+		f := pipeFlow(t, server, "edge", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.80"), uint16(40000+i)))
+		if _, err := server.SendRequest(shedMsg(t, 500), Destination{Flow: f.id}, NoWait); err != nil {
+			t.Fatal(err)
+		}
+		stalled(f)
+	}
+	// The busy core peer is reading: never a candidate.
+	busyFlow.q.progress.Store(time.Now().UnixNano())
+	other := Destination{Network: TCP, Addr: netip.MustParseAddrPort("192.0.2.51:5060")}
+	for i := range 4 {
+		if _, err := server.SendRequest(shedMsg(t, 1200-300), other); err != nil {
+			t.Fatalf("send %d of the burst refused: %v (%+v)", i, err, server.Stats())
+		}
+	}
+	if busyFlow.closed.Load() {
+		t.Fatal("the busy core connection was closed")
+	}
+	if s := server.Stats(); s.BudgetRefusals != 0 {
+		t.Fatalf("stats = %+v", s)
 	}
 }
