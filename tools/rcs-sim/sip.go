@@ -18,7 +18,7 @@ import (
 // sipFlags are the settings of the SIP client (#135). Identities and
 // addresses come from flags, credentials from the environment only.
 type sipFlags struct {
-	proxy, transport, serverName, domain, impi, auth, instance string
+	proxy, transport, serverName, domain, realm, impi, auth, instance string
 }
 
 // envIMPI is where the IMPI comes from when -sip-impi is not given. It is
@@ -65,6 +65,7 @@ func sipConfig(ctx context.Context, f sipFlags, self string, lookup func(string)
 	if cfg.Domain == "" {
 		cfg.Domain = cfg.IMPU.Host
 	}
+	cfg.Realm = f.realm
 	cfg.InstanceID = f.instance
 	if cfg.InstanceID == "" {
 		if cfg.InstanceID, err = newInstanceID(); err != nil {

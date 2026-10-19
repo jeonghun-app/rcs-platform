@@ -111,6 +111,11 @@ type Config struct {
 	// Domain is the home network domain, the Request-URI of REGISTER (TS
 	// 24.229 §5.1.1.2.1).
 	Domain string
+	// Realm is the S-CSCF's Digest realm: the only one whose challenges
+	// are answered, and the realm of the unchallenged Authorization. Empty
+	// is Domain, which it is unless the HSS's realm (HSS_IMS_REALM) was
+	// set apart.
+	Realm string
 	// IMPU is the public user identity registered, and the From of every
 	// request. It is a SIP URI: the From and To of REGISTER must be one (TS
 	// 24.229 §5.1.1.2.1), and a tel URI comes only in the implicit set.
@@ -250,6 +255,9 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 	}
 	if cfg.Expires <= 0 {
 		cfg.Expires = DefaultExpires
+	}
+	if cfg.Realm == "" {
+		cfg.Realm = cfg.Domain
 	}
 	if cfg.PongTimeout <= 0 {
 		cfg.PongTimeout = DefaultPongTimeout
