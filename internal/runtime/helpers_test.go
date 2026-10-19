@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -106,16 +105,30 @@ func (f *fakeTimers) After(d time.Duration) <-chan time.Time {
 }
 
 // WaitFor blocks until a timer of duration d has been made.
-func (f *fakeTimers) WaitFor(d time.Duration) {
+func (f *fakeTimers) WaitFor(d time.Duration) { f.WaitForN(d, 1) }
+
+// WaitForN blocks until n timers of duration d have been made, such as the
+// next timer of a loop that makes one after doing its work.
+func (f *fakeTimers) WaitForN(d time.Duration, n int) {
 	for {
 		f.mu.Lock()
-		made, changed := slices.Contains(f.made, d), f.changed
+		made, changed := countOf(f.made, d), f.changed
 		f.mu.Unlock()
-		if made {
+		if made >= n {
 			return
 		}
 		<-changed
 	}
+}
+
+func countOf[T comparable](s []T, v T) int {
+	n := 0
+	for _, x := range s {
+		if x == v {
+			n++
+		}
+	}
+	return n
 }
 
 // Fire fires every timer of duration d created so far.

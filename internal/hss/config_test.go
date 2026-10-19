@@ -75,6 +75,12 @@ func TestNamespaceDefaultsToTheSharedServiceNamespace(t *testing.T) {
 	if c.Namespace != "prod.internal" || c.SCSCFPattern != "scscf-*.prod.internal" || c.RCSASURI != "sip:rcs-as.prod.internal" {
 		t.Errorf("config = %+v", c)
 	}
+	// The shared value is used as the runtime normalises it, as the other
+	// services use it.
+	c, err = configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "Prod.Internal."))
+	if err != nil || c.Namespace != "prod.internal" || c.SCSCFPattern != "scscf-*.prod.internal" {
+		t.Fatalf("normalised namespace: %+v, %v", c, err)
+	}
 	c, err = configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "prod.internal", "HSS_NAMESPACE", "hss.internal"))
 	if err != nil || c.Namespace != "hss.internal" {
 		t.Errorf("HSS_NAMESPACE does not win: %v %+v", err, c)

@@ -170,21 +170,23 @@ func TestProductionRefusesAShortHSSToken(t *testing.T) {
 }
 
 func TestPlainHTTPToTheHSSIsAllowedOnlyForPrivateHosts(t *testing.T) {
-	for host, want := range map[string]bool{
-		"10.0.3.7": true, "172.16.0.1": true, "192.168.1.1": true, "fd00::1": true,
-		"hss.rcs.local": true, "HSS.RCS.LOCAL.": true,
-		"8.8.8.8": false, "172.32.0.1": false, "hss.example.com": false, "rcs.local": false, "evilrcs.local": false,
-	} {
-		if got := privateHost(host, "rcs.local"); got != want {
-			t.Errorf("privateHost(%q) = %v", host, got)
-		}
-	}
-	if privateHost("hss.rcs.local", "") {
-		t.Error("a name is private without a namespace")
-	}
 	prod := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCS_SERVICE_NAMESPACE", "rcs.local",
-		"FT_CREDENTIALS", "hss", "FT_HSS_URL", "http://hss.rcs.local:8081", "FT_HSS_TOKEN", strings.Repeat("t", 43), "FT_STATIC_USERS", "")
-	if _, out := runService(t, prod); strings.Contains(out, "FT_HSS_URL") {
-		t.Fatalf("http to the Cloud Map name was refused:\n%s", out)
+		"FT_CREDENTIALS", "hss", "FT_HSS_TOKEN", strings.Repeat("t", 43), "FT_STATIC_USERS", "")
+	// The rule is runtime.IsPrivateInternalURL's (ADR 0007 §5); these show
+	// ft-server applies it to FT_HSS_URL.
+	for url, allowed := range map[string]bool{
+		"http://hss.rcs.local:8081":     true,
+		"http://10.0.3.7:8081":          true,
+		"http://[fd00::7]:8081":         true,
+		"https://hss.example.com":       true,
+		"http://hss.example.com":        false,
+		"http://169.254.169.254/":       false,
+		"http://127.0.0.1:8081":         false,
+		"http://hss.evilrcs.local:8081": false,
+	} {
+		_, out := runService(t, with(prod, "FT_HSS_URL", url))
+		if refused := strings.Contains(out, "FT_HSS_URL"); refused == allowed {
+			t.Errorf("FT_HSS_URL=%s: refused %t, want %t:\n%s", url, refused, !allowed, out)
+		}
 	}
 }

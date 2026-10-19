@@ -2,7 +2,6 @@ package ftserver
 
 import (
 	"net"
-	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -205,8 +204,7 @@ func Configure(s *runtime.Settings) Config {
 		// ADR 0007: plain http to an internal API only for a private host
 		// (an RFC 1918 or ULA address, or a name in the Cloud Map
 		// namespace), always with the service's own bearer token.
-		namespace := s.Shared.String("SERVICE_NAMESPACE", "")
-		s.ForbidInProduction(c.HSSURL != nil && c.HSSURL.Scheme != "https" && !privateHost(c.HSSURL.Hostname(), namespace),
+		s.ForbidInProduction(c.HSSURL != nil && c.HSSURL.Scheme != "https" && !runtime.IsPrivateInternalURL(c.HSSURL, s.ServiceNamespace()),
 			"FT_HSS_URL is http to a host that is not private (RFC 1918/ULA address or a name in RCS_SERVICE_NAMESPACE): the bearer token and HA1 would cross a network outside the VPC in the clear")
 	default:
 		e.Invalid("CREDENTIALS", "not one of static, hss")
@@ -331,18 +329,6 @@ func absoluteURL(e *runtime.Env, name string, required bool) *url.URL {
 
 // minTokenLength is the shortest FT_HSS_TOKEN accepted in staging and prod.
 const minTokenLength = 43
-
-// privateHost reports whether host is a private address (RFC 1918, or an
-// IPv6 unique local address) or a name inside the Cloud Map namespace
-// (ADR 0007).
-func privateHost(host, namespace string) bool {
-	if ip, err := netip.ParseAddr(host); err == nil {
-		return ip.IsPrivate()
-	}
-	namespace = strings.TrimSuffix(strings.ToLower(namespace), ".")
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	return namespace != "" && strings.HasSuffix(host, "."+namespace)
-}
 
 // staticUsers reads FT_STATIC_USERS: comma-separated user=password pairs.
 func staticUsers(e *runtime.Env) map[string]secret {
