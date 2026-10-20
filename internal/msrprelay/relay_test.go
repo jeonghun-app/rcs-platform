@@ -760,7 +760,10 @@ func TestARefusedConnectionIsCountedOnce(t *testing.T) {
 		idle  time.Duration
 		after func(r *rig)
 	}{
-		"idle during the flush": {idle: 300 * time.Millisecond},
+		// 1 s: the idle timer also covers the client's pause between
+		// connecting and writing, which a loaded host can make long (QA on
+		// #237).
+		"idle during the flush": {idle: time.Second},
 		"first-bind timer during the flush": {idle: time.Minute, after: func(r *rig) {
 			r.clock.Advance(time.Hour)
 		}},

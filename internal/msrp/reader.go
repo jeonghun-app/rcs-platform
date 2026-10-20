@@ -71,15 +71,18 @@ func framing(format string, args ...any) error {
 }
 
 // truncated is the framing error of a stream that ended inside a message,
-// where: it is ErrFraming, and io.ErrUnexpectedEOF too, so that a reader of
-// the connection can tell that the peer has stopped sending (#240).
+// where. It is ErrFraming, and only that: a body cut off must stay an error
+// to whoever reads it (a relay forwarding chunks would otherwise take the
+// cut for the message's end). The connection's reader tells it apart with
+// errors.As, to let the peer, which has stopped sending, read what it is
+// owed (#240).
 type truncated string
 
 func (where truncated) Error() string {
 	return ErrFraming.Error() + ": stream ended inside " + string(where)
 }
 
-func (truncated) Is(target error) bool { return target == ErrFraming || target == io.ErrUnexpectedEOF }
+func (truncated) Is(target error) bool { return target == ErrFraming }
 
 // ReadHeader reads the start line and header section of the next message,
 // first skipping whatever is left of the previous body. For a message with

@@ -554,7 +554,8 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			var me *MessageError
 			if !errors.As(err, &me) {
-				if c.passive && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+				var cut truncated
+				if c.passive && (errors.Is(err, io.EOF) || errors.As(err, &cut)) {
 					c.writeQueuedForPeer(err)
 				}
 				c.fail(err)

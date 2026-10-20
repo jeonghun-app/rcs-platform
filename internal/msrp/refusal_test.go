@@ -525,3 +525,71 @@ func TestTheHalfCloseFlushHasTheRefusalFlushsBound(t *testing.T) {
 		t.Fatalf("bound started %d times, for %v; want once, for the documented 2 s", n, d)
 	}
 }
+
+// refusingOverTCP is a passive connection over TCP with cfg, and its
+// client (QA's qaServe on #237).
+func refusingOverTCP(t *testing.T, cfg Config) (<-chan *Conn, net.Conn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	conns := make(chan *Conn, 1)
+	go func() {
+		nc, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c, err := NewPassiveConn(nc, &Registry{}, cfg)
+		if err != nil {
+			_ = nc.Close()
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		conns <- c
+	}()
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return conns, client
+}
+
+// QA on #237: without a test's hook the bound is real time, of the
+// configured length, so a client that reads its answers but never closes
+// is cut by it. Only liveness is checked, not how long it took.
+func TestTheFlushBoundRunsInRealTimeByDefault(t *testing.T) {
+	conns, client := refusingOverTCP(t, Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalFlush: 50 * time.Millisecond})
+	if _, err := client.Write(unknownSends(3)); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	if _, err := io.ReadAll(client); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, (<-conns).Done(), "connection")
+}
+
+// QA on #237: the bound is started with the configured length.
+func TestTheFlushBoundIsStartedWithItsConfiguredLength(t *testing.T) {
+	var got atomic.Int64
+	fire := make(chan time.Time)
+	after := func(d time.Duration) <-chan time.Time { got.Store(int64(d)); return fire }
+	conns, client := refusingOverTCP(t, Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalFlush: 1234 * time.Millisecond, refusalAfter: after})
+	if _, err := client.Write(unknownSends(3)); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	_, _ = io.ReadAll(client)
+	select {
+	case fire <- time.Time{}:
+	case <-time.After(hangGuard):
+		t.Fatal("the flush is not waiting on its bound")
+	}
+	waitDone(t, (<-conns).Done(), "connection")
+	if d := time.Duration(got.Load()); d != 1234*time.Millisecond {
+		t.Fatalf("bound started with %v, want the configured 1.234s", d)
+	}
+}
