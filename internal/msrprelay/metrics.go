@@ -140,6 +140,7 @@ var eventErrNames = []struct {
 	{msrp.ErrReassemblyTimeout, "ReassemblyTimeout"},
 	{msrp.ErrMalformedResponse, "MalformedResponse"},
 	{msrp.ErrTooManyUnknownSessions, "TooManyUnknownSessions"},
+	{msrp.ErrKeepAliveNotSent, "KeepAliveNotSent"},
 	{msrp.ErrPeerNotReading, "PeerNotReading"},
 	{msrp.ErrKeepAliveTimeout, "KeepAliveTimeout"},
 	{msrp.ErrUnbound, "Unbound"},

@@ -254,7 +254,7 @@ not multiply them. Names come from fixed sets and never carry an identifier.
 | `LookupBudgetUntracked` | count | lookups let through uncounted because the budget's table of sources was full |
 | `Refused.<reason>` | count | `ConnectionLimit`, `SourceLimit`, `ProxyHeader`, `SourceLookupBudget`, `BindOverload`, `UnknownSession`, `EndedSession`, `IncompleteBinding`, `AlreadyClaimed`, `CoreUnreachable`, `StoreUnavailable`, `Draining`, `ControlUnauthorized`, `ControlForbidden`, `ControlInvalid` |
 | `Client.Refused.<code>`, `Core.Refused.<code>` | count | MSRP requests refused on client connections or toward `rcs-as` (`internal/msrp` events) |
-| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, …) |
+| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
 
 Alarm candidates for Phase 7, each to get a runbook section:
 
