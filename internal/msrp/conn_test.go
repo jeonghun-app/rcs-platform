@@ -2,8 +2,11 @@ package msrp
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1195,5 +1198,130 @@ func TestABoundPassiveSessionSendsKeepAlives(t *testing.T) {
 	ka := p.next(t)
 	if ka.Method != MethodSend || ka.HasBody() || *ka.ByteRange != (ByteRange{1, 0, 0}) || ka.FromPath[0].String() != asURI {
 		t.Fatalf("keep-alive %+v", ka)
+	}
+}
+
+func TestASessionHasOneKeepAliveOutAtATime(t *testing.T) {
+	// #218: with an interval shorter than the transaction timeout, the
+	// ticks while a keep-alive waits for its answer send nothing more,
+	// and that keep-alive's timeout closes the connection.
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	clock.Advance(time.Second)
+	if ka := p.next(t); ka.HasBody() {
+		t.Fatalf("keep-alive %+v", ka)
+	}
+	for range 5 {
+		clock.Advance(time.Second)
+	}
+	// Its answer comes next only if no other keep-alive went out.
+	p.sendMessage(t, &Message{TransactionID: "syncsync", Method: MethodSend, ToPath: []URI{mustURI(t, clientURI)},
+		FromPath: []URI{mustURI(t, asURI)}, MessageID: "syncsync"})
+	expectResponse(t, p, "syncsync", StatusOK)
+	clock.Advance(DefaultTransactionTimeout - 5*time.Second)
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), ErrKeepAliveTimeout) {
+		t.Fatalf("connection %v, want the keep-alive timeout", c.Err())
+	}
+	for m := range p.msgs {
+		if m.IsRequest() {
+			t.Fatalf("sent %s %s after the first keep-alive", m.TransactionID, m.Method)
+		}
+	}
+}
+
+func TestAnAnsweredKeepAliveLetsTheNextGoOnTime(t *testing.T) {
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	for i, sync := range []string{"syncsyn0", "syncsyn1", "syncsyn2"} {
+		clock.Advance(time.Second)
+		ka := p.next(t)
+		if ka.HasBody() || *ka.ByteRange != (ByteRange{1, 0, 0}) {
+			t.Fatalf("keep-alive %d %+v", i, ka)
+		}
+		p.respond(t, ka, StatusOK)
+		// Answered before the clock moves on: a request from the peer
+		// is answered only after the response before it is handled.
+		p.sendMessage(t, &Message{TransactionID: sync, Method: MethodSend, ToPath: []URI{mustURI(t, clientURI)},
+			FromPath: []URI{mustURI(t, asURI)}, MessageID: sync})
+		expectResponse(t, p, sync, StatusOK)
+	}
+	if s.Err() != nil || c.Err() != nil {
+		t.Fatalf("session %v, connection %v", s.Err(), c.Err())
+	}
+}
+
+func TestAKeepAliveAnsweredLateLetsTheNextGo(t *testing.T) {
+	// QA on #222: ticks skipped while one is out still re-arm, so a late
+	// answer does not end the keep-alives.
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	clock.Advance(time.Second)
+	ka := p.next(t)
+	for range 3 {
+		clock.Advance(time.Second) // skipped, one interval at a time
+	}
+	clock.Advance(500 * time.Millisecond)
+	p.respond(t, ka, StatusOK)
+	// Handled before the clock moves on: the peer's request is answered
+	// only after the response before it.
+	p.sendMessage(t, &Message{TransactionID: "syncsync", Method: MethodSend, ToPath: []URI{mustURI(t, clientURI)},
+		FromPath: []URI{mustURI(t, asURI)}, MessageID: "syncsync"})
+	expectResponse(t, p, "syncsync", StatusOK)
+	clock.Advance(time.Second)
+	if next := p.next(t); !next.IsRequest() || next.HasBody() || *next.ByteRange != (ByteRange{1, 0, 0}) {
+		t.Fatalf("keep-alive %+v", next)
+	}
+	if s.Err() != nil || c.Err() != nil {
+		t.Fatalf("session %v, connection %v", s.Err(), c.Err())
+	}
+}
+
+// failingRand fails while fail is set, as a broken random source would.
+type failingRand struct{ fail atomic.Bool }
+
+func (r *failingRand) Read(p []byte) (int, error) {
+	if r.fail.Load() {
+		return 0, errors.New("no entropy")
+	}
+	return rand.Read(p)
+}
+
+func TestAKeepAliveThatCannotBeBuiltIsSaidAndTriedAgain(t *testing.T) {
+	// Code review and QA on #222: without random bytes for its ids the
+	// keep-alive is not sent. That is an event, and the next interval
+	// tries again, with nothing left marked as out.
+	clock := newFakeClock()
+	rnd := &failingRand{}
+	var mu sync.Mutex
+	var events []Event
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second, Rand: rnd, OnEvent: func(e Event) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	rnd.fail.Store(true)
+	clock.Advance(time.Second)
+	mu.Lock()
+	got := slices.Clone(events)
+	mu.Unlock()
+	if len(got) != 1 || got[0].Kind != EventDropped || got[0].Err != ErrKeepAliveNotSent || got[0].Method != MethodSend {
+		t.Fatalf("events %+v", got)
+	}
+	rnd.fail.Store(false)
+	clock.Advance(time.Second)
+	if ka := p.next(t); !ka.IsRequest() || ka.HasBody() || *ka.ByteRange != (ByteRange{1, 0, 0}) {
+		t.Fatalf("keep-alive %+v", ka)
+	}
+	if s.Err() != nil || c.Err() != nil {
+		t.Fatalf("session %v, connection %v", s.Err(), c.Err())
 	}
 }
