@@ -158,7 +158,9 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
     before gains identities added since. The PUT resets every provisioned
     field to the seed's: the identities, the service profile (back to
     `hss`'s default, `rcs-default`), the charging information (none) and
-    `acs_managed`. The Cx state, the credentials and the SQN stay;
+    `acs_managed`, so edits made to the two test subscriptions through the
+    provisioning API do not survive a `make up`. The Cx state, the
+    credentials and the SQN stay;
   - `acs`: the subscriber, with the overrides in [acs](#acs).
 
   The keys are `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC` for the client and
