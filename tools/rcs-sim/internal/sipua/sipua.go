@@ -151,7 +151,11 @@ type Config struct {
 	// OnRequest receives each request the network sends over the flow, a
 	// MESSAGE or a NOTIFY say, and answers it with tx.Respond. It runs on
 	// the connection's reading goroutine, so it must not block (see
-	// transaction.TU). Nil answers every request 501.
+	// transaction.TU). Nil answers every request 501. A request outside a
+	// dialog that has a Require is answered 420 by the UA before it gets
+	// here, whatever its method: the UA supports no extension a request
+	// may require, and RFC 3261 §8.2.2.3 applies to every method but ACK
+	// and CANCEL.
 	OnRequest func(tx *transaction.ServerTransaction)
 
 	// Rand supplies tags, Call-IDs, branches and the keep-alive jitter, from
@@ -237,11 +241,17 @@ type UA struct {
 	// the incoming INVITEs not yet answered, by their transaction.
 	dialogs map[string]*Dialog
 	calls   map[*transaction.ServerTransaction]*IncomingCall
+	// answeredCalls are the merge keys of incoming INVITEs answered in the
+	// last 64*T1 (see answered).
+	answeredCalls map[string]struct{}
 	// subs are the reg event subscriptions, by subscriptionKey.
 	subs map[string]*Subscription
 	// invites are the INVITEs sent in the last 64*T1, by Call-ID and From
 	// tag, for 2xx that arrive after their transaction.
 	invites map[string]*invite
+	// byes counts the BYEs sent in the background to end dialogs nobody
+	// holds, so that a test can tell when none is left to come.
+	byes sync.WaitGroup
 }
 
 // Dial opens the connection to the P-CSCF and returns a UA that has not yet
@@ -280,15 +290,16 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		return nil, fmt.Errorf("sipua: connecting: %w", safeerr.Reason(err))
 	}
 	ua := &UA{
-		cfg:     cfg,
-		ids:     sip.IDGenerator{Rand: cfg.Rand},
-		dialer:  &oneConn{c: c},
-		done:    make(chan struct{}),
-		dialogs: map[string]*Dialog{},
-		calls:   map[*transaction.ServerTransaction]*IncomingCall{},
-		subs:    map[string]*Subscription{},
-		invites: map[string]*invite{},
-		dst:     transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
+		cfg:           cfg,
+		ids:           sip.IDGenerator{Rand: cfg.Rand},
+		dialer:        &oneConn{c: c},
+		done:          make(chan struct{}),
+		dialogs:       map[string]*Dialog{},
+		calls:         map[*transaction.ServerTransaction]*IncomingCall{},
+		answeredCalls: map[string]struct{}{},
+		subs:          map[string]*Subscription{},
+		invites:       map[string]*invite{},
+		dst:           transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
 	if la, ok := c.LocalAddr().(*net.TCPAddr); ok {
 		ap := la.AddrPort()
@@ -923,7 +934,11 @@ func (t tu) Request(tx *transaction.ServerTransaction) {
 	if unsupported := unsupportedExtensions(req); len(unsupported) > 0 {
 		// RFC 3261 §8.2.2.3: this UA supports no extension a request may
 		// require, 100rel and precondition among them.
-		if res, err := sip.NewResponse(req, 420, "", "rcs-sim"); err == nil {
+		tag, err := t.ua.ids.Tag()
+		if err != nil {
+			return
+		}
+		if res, err := sip.NewResponse(req, 420, "", tag); err == nil {
 			if res.Header.Add("Unsupported", strings.Join(unsupported, ", ")) == nil {
 				_ = tx.Respond(res)
 			}

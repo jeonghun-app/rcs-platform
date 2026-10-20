@@ -354,14 +354,17 @@ func TestA2xxFromAnotherBranchIsACKedAndEnded(t *testing.T) {
 	}
 	c.acceptVia(t, tx, "other-branch", otherContact, otherRR)
 	s.nextACK(t)
-	// A MESSAGE after it: a second BYE sent meanwhile would arrive first.
-	req, _ := ua.NewRequest("MESSAGE", mustURI(t, testPeer))
-	if _, err := ua.Send(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	for r := s.next(t); r.req.Method != "MESSAGE"; r = s.next(t) {
-		if r.req.Method == "BYE" {
-			t.Fatal("a second BYE for one forked branch")
+	// Every background BYE has been answered once byes is done, so a
+	// second one would already be in the stand-in's queue (QA on #194).
+	ua.byes.Wait()
+	for {
+		select {
+		case r := <-s.got:
+			if r.req.Method == "BYE" {
+				t.Fatal("a second BYE for one forked branch")
+			}
+		default:
+			return
 		}
 	}
 }
@@ -707,24 +710,88 @@ func TestACancelledInviteWithoutAFinalResponseEndsAfter64T1(t *testing.T) {
 	go func() { _, _, err := ua.Invite(ctx, req, nil); done <- err }()
 	inv := r.expect(t, "INVITE")
 	r.respond(t, inv, 180)
+	// 64*T1 timers so far: the REGISTER's and the INVITE's transactions.
+	// After the CANCEL, two more: its transaction's and the give-up. The
+	// clock has not moved, so all of them count from now.
+	const giveUp = 64 * transaction.DefaultT1
+	for range 2 {
+		clock.armedFor(t, giveUp)
+	}
 	cancel()
 	c := r.expect(t, "CANCEL")
 	r.respond(t, c, 200) // and never a 487
-	// The timer is armed as the CANCEL goes, maybe just after it reached
-	// the far end: the clock is moved on until Invite returns, a few
-	// times at most. Without the timer it never does.
-	for range 5 {
-		clock.advance(64 * transaction.DefaultT1)
-		select {
-		case err := <-done:
-			if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "64*T1") {
-				t.Fatalf("Invite = %v, want the timeout wrapping context.Canceled", err)
-			}
-			return
-		case <-time.After(200 * time.Millisecond):
-		}
+	for range 2 {
+		clock.armedFor(t, giveUp)
 	}
-	t.Fatal("Invite still waits 64*T1 after its CANCEL")
+	clock.advance(giveUp - time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("Invite returned before 64*T1: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	clock.advance(time.Millisecond)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "64*T1") {
+			t.Fatalf("Invite = %v, want the timeout wrapping context.Canceled", err)
+		}
+	case <-time.After(waitFor):
+		t.Fatal("Invite still waits 64*T1 after its CANCEL")
+	}
+}
+
+func TestA2xxAfterInviteGaveUpIsACKedAndEnded(t *testing.T) {
+	// Code review and QA on #194: once Invite has given up, 64*T1 after
+	// its CANCEL or at Timer B, a 200 that comes later has nobody to take
+	// its dialog. It is ACKed and ended, and leaves no dialog behind.
+	for name, cancelled := range map[string]bool{"after its CANCEL": true, "at Timer B": false} {
+		t.Run(name, func(t *testing.T) {
+			r := newRawUAS(t)
+			cfg := r.config(t)
+			clock := newFakeClock()
+			cfg.Clock = clock
+			ua := dial(t, cfg)
+			r.register(t, ua)
+			req, _ := ua.NewInvite(mustURI(t, testPeer), []byte(testOffer))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { _, _, err := ua.Invite(ctx, req, nil); done <- err }()
+			inv := r.expect(t, "INVITE")
+			if cancelled {
+				r.respond(t, inv, 180)
+				cancel()
+				r.respond(t, r.expect(t, "CANCEL"), 200) // never a 487
+			}
+			gaveUp := false
+			for i := 0; i < 5 && !gaveUp; i++ {
+				clock.advance(64 * transaction.DefaultT1)
+				select {
+				case <-done:
+					gaveUp = true
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+			if !gaveUp {
+				t.Fatal("Invite did not give up")
+			}
+			ok := mustResponse(t, inv, 200, "late")
+			ok.Header.Add("Contact", calleeContact)
+			r.write(t, ok)
+			for _, method := range []string{"ACK", "BYE"} {
+				m := r.expect(t, method)
+				if to, _ := m.Header.To(); to.Tag() != "late" {
+					t.Fatalf("%s To tag %q", method, to.Tag())
+				}
+			}
+			ua.mu.Lock()
+			n := len(ua.dialogs)
+			ua.mu.Unlock()
+			if n != 0 {
+				t.Fatalf("%d dialogs nobody holds", n)
+			}
+		})
+	}
 }
 
 func TestA2xxAfterAFailureResponseIsACKedAndEnded(t *testing.T) {
