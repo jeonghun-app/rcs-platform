@@ -57,6 +57,7 @@ a maintainer; behaviour built on it is listed as unverified in
 | 4028 | Session timers |
 | 4566, 8866, 3264 | SDP and offer/answer |
 | 4575, 6665 | Conference event package, SIP events |
+| 3680 | Registration event package (reg event): `internal/sip/reginfo`, `pcscf`, `scscf` |
 | 4975, 4976, 6135 | MSRP, MSRP relays, MSRP connection model (`a=setup`) |
 | 3862 | Common Presence and Instant Messaging (CPIM) message format |
 | 5438 | Instant Message Disposition Notification (IMDN) |
