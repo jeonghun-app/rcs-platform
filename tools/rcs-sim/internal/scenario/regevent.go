@@ -194,19 +194,25 @@ func (w *regWatch) next(ctx context.Context) (sipua.Notification, reginfo.Contac
 	return n, own, nil
 }
 
-// own is the client's contact in reg: the one at its URI, or, if a URI is
-// bound more than once (RFC 5626 §6), the one with its +sip.instance.
+// own is the client's contact in reg: at its URI, with its +sip.instance
+// (a URI may be bound more than once, RFC 5626 §6), or else with no
+// instance at all. A contact with another instance is another device's
+// binding, never the client's (RFC 5626 §4.1, as sipua's isOurs has it).
 func (w *regWatch) own(reg reginfo.Registration) (reginfo.Contact, bool) {
-	cs := reg.ByURI(w.contact)
-	for _, c := range cs {
-		if inst, ok := c.Param("+sip.instance"); ok && inst == w.instance {
+	var plain *reginfo.Contact
+	for _, c := range reg.ByURI(w.contact) {
+		inst, ok := c.Param("+sip.instance")
+		switch {
+		case ok && inst == w.instance:
 			return c, true
+		case !ok && plain == nil:
+			plain = &c
 		}
 	}
-	if len(cs) == 0 {
+	if plain == nil {
 		return reginfo.Contact{}, false
 	}
-	return cs[0], true
+	return *plain, true
 }
 
 // ended checks the subscription after the client's contact has terminated.

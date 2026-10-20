@@ -84,6 +84,20 @@ func TestARegEventPassesWhatTheRFCsAllow(t *testing.T) {
 			req.Body = []byte(strings.Replace(body, `</uri></contact></registration>`,
 				`</uri><unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000001&gt;"</unknown-param></contact></registration>`, 1))
 		},
+		// Code review on #253: the same, but the client's contact carries no
+		// instance, so it is the one without; the other device's, ahead of
+		// it and still active, is never taken for it.
+		"another instance ahead of the client's without one": func(req *sip.Request) {
+			if req.Header.Get("CSeq") != "3 NOTIFY" {
+				return
+			}
+			_ = req.Header.Set("Subscription-State", "active;expires=600")
+			body := strings.Replace(string(req.Body), `id="r1" state="terminated"`, `id="r1" state="active"`, 1)
+			uri := regexp.MustCompile(`<uri>[^<]*</uri>`).FindString(body)
+			req.Body = []byte(strings.Replace(body, `<contact id="c1"`,
+				`<contact id="c0" state="active" event="registered" expires="600">`+uri+
+					`<unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact><contact id="c1"`, 1))
+		},
 		// A terminated subscription without a reason (RFC 6665 §4.1.3).
 		"unregister with timeout": func(req *sip.Request) {
 			if req.Header.Get("CSeq") == "3 NOTIFY" {
@@ -149,6 +163,13 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 		step    string
 		err     string
 	}{
+		// Code review on #253: the only contact at the client's URI carries
+		// another device's +sip.instance, so it is not the client's (RFC
+		// 5626 §4.1).
+		"only another instance at the URI": {"1 NOTIFY", func(req *sip.Request) {
+			req.Body = []byte(strings.Replace(string(req.Body), `</uri></contact>`,
+				`</uri><unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact>`, 1))
+		}, "subscribe", "the reginfo does not list the client's contact"},
 		"contact not active": {"1 NOTIFY", func(req *sip.Request) {
 			req.Body = []byte(strings.Replace(string(req.Body), `<contact id="c1" state="active"`, `<contact id="c1" state="terminated"`, 1))
 		}, "subscribe", "the client's contact is not active"},
