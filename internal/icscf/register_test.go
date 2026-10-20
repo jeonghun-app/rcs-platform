@@ -46,7 +46,7 @@ func TestRegisterAnswersFollowTheMappingTable(t *testing.T) {
 		{"capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, forward("sip:scscf-b.rcs.local;transport=tcp"), "icscf.register.forwarded"},
 		{"no capabilities means any", uaa(experimental(cx.FirstRegistration), "", nil), nil, forward(scscfURI), "icscf.register.forwarded"},
 		// §5.3.1.3: no S-CSCF has the mandatory capabilities.
-		{"no S-CSCF qualifies", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{9}}), nil, outcome{status: 600}, "icscf.register.600"},
+		{"no S-CSCF qualifies", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{9}}), nil, outcome{status: 600}, "icscf.scscf.no_capable"},
 		// §5.3.1.3: a negative answer is 403.
 		{"5001 user unknown", uaa(experimental(cx.ErrorUserUnknown), "", nil), nil, outcome{status: 403}, "icscf.register.403"},
 		{"5002 identities do not match", uaa(experimental(cx.ErrorIdentitiesDontMatch), "", nil), nil, outcome{status: 403}, "icscf.register.403"},

@@ -48,7 +48,8 @@
 //	REGISTER     (To is not an IMPU, or a bad username)    403, no UAR               §5.3.1.3
 //	terminating  success, Server-Name                      forward, Route = name     §5.3.2.1
 //	terminating  success, capabilities or none             forward, Route = chosen   §5.3.2.1
-//	terminating  success, no S-CSCF has the mandatory ones 480                       local choice
+//	terminating  success, no S-CSCF has the mandatory ones 480, counted              decided on #274
+//	terminating  (the S-CSCF cannot be reached)            503 + Retry-After         decided on #274
 //	terminating  5001, other negatives                     404                       §5.3.2.1, §5.3.2.2
 //	terminating  5003                                      480                       §5.3.2.1
 //	terminating  could not be completed                    480 + Retry-After         §5.3.1.3 by analogy
@@ -61,8 +62,11 @@
 // neither Server-Name nor Server-Capabilities means any S-CSCF will do
 // (TS 29.228 §6.7), and the first configured one is chosen. Server-Name
 // values inside Server-Capabilities are not used. Retry-After is
-// Config.RetryAfter; the I-CSCF's own overload, the transaction layer's
-// cap, is answered 503 instead.
+// Config.RetryAfter, also on the 503 the proxy answers a terminating
+// request with when the S-CSCF cannot be reached: the S-CSCF the user needs
+// exists and will be back, unlike one no configured S-CSCF can stand for.
+// The I-CSCF's own overload, the transaction layer's cap, is answered 503
+// with the layer's Retry-After.
 //
 // P-Profile-Key is removed from every request forwarded and every response
 // passed back (§5.3.2.1): this I-CSCF does not set it from a wildcarded
@@ -100,6 +104,11 @@
 //	icscf.hss.unavailable       HSS queries that could not be completed
 //	icscf.hss.bad_server_name   answers naming an S-CSCF that is not a SIP
 //	                            URI
+//	icscf.scscf.no_capable      answers whose capabilities no configured
+//	                            S-CSCF has (600 or 480): a provisioning
+//	                            problem, to alarm on
+//	icscf.scscf.unreachable     terminating requests answered 503 because
+//	                            the proxy could not reach the S-CSCF
 //
 // cxclient counts the Cx answers by result code, and the proxy and the
 // transaction layer the SIP side, the 504 to a REGISTER included.

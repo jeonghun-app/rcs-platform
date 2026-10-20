@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -102,6 +103,7 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	case errors.Is(err, errBadServerName):
 		return r.hssUnavailable(kindRegister, m)
 	case err != nil:
+		r.metrics.Count("icscf.scscf.no_capable", 1)
 		return r.reject(kindRegister, 600) // §5.3.1.3
 	}
 	r.count(kindRegister, "forwarded")
@@ -145,17 +147,58 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 		return r.hssUnavailable(kindTerminating, m)
 	case err != nil:
 		// TS 24.229 names no response for a terminating request no
-		// configured S-CSCF can take; to the caller the user is
-		// unavailable, and retrying will not change that.
+		// configured S-CSCF can take. It is a provisioning problem, so
+		// retrying will not help; it is counted apart so it can be
+		// alarmed (decided on #274).
+		r.metrics.Count("icscf.scscf.no_capable", 1)
 		return r.reject(kindTerminating, 480)
 	}
 	r.count(kindTerminating, "forwarded")
 	// §5.3.2.1: the S-CSCF becomes the topmost Route, and the Request-URI
 	// stays, in tel form when it named a telephone number.
-	return forwarding(proxy.Decision{Targets: []proxy.Target{{
+	d := forwarding(proxy.Decision{Targets: []proxy.Target{{
 		URI:    uri,
 		Routes: []sip.Address{{URI: looseRoute(scscf)}},
 	}}})
+	r.answerUnreachable(&d)
+	return d
+}
+
+// answerUnreachable makes a terminating request whose S-CSCF cannot be
+// reached end in 503 with Retry-After, as the HSS's failures do, since the
+// S-CSCF a user needs exists and will be back (decided on #274). The proxy
+// counts a branch it could not send as a 503 of its own (RFC 3261 §16.9),
+// but turns a final 503 into 500 (§16.7 step 6), as it must for one from
+// downstream; so the branch failure marks the request and the 500 it ends
+// in is turned back. The proxy's overload 503 keeps its own Retry-After.
+func (r *Router) answerUnreachable(d *proxy.Decision) {
+	var unreachable atomic.Bool
+	d.OnBranchFailure = func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
+		if f.Err != nil && f.Response != nil && f.Response.StatusCode == 503 {
+			unreachable.Store(true)
+		}
+		return nil
+	}
+	d.OnFinal = func(_ context.Context, res *sip.Response) {
+		switch {
+		case res.StatusCode == 500 && unreachable.Load():
+			res.StatusCode, res.Reason = 503, sip.DefaultReason(503)
+		case res.StatusCode == 430:
+			// What the proxy does without OnFinal (RFC 5626 §11.5).
+			res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
+		}
+	}
+	strip := d.OnResponse
+	d.OnResponse = func(ctx context.Context, res *sip.Response) {
+		strip(ctx, res)
+		if res.StatusCode != 503 {
+			return
+		}
+		r.metrics.Count("icscf.scscf.unreachable", 1)
+		if !res.Header.Has("Retry-After") {
+			_ = res.Header.Add("Retry-After", r.retryAfter)
+		}
+	}
 }
 
 var (

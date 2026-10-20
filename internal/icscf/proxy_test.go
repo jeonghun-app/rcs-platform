@@ -2,6 +2,7 @@ package icscf
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -84,11 +85,16 @@ type fakeNet struct {
 	mu       sync.Mutex
 	requests []*sip.Request
 	upstream []*sip.Response
+	// fail, if set, is what sending a request downstream returns.
+	fail error
 }
 
 func (n *fakeNet) SendRequest(req *sip.Request, dst transport.Destination, _ ...transport.SendOption) (transport.Network, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.fail != nil {
+		return "", n.fail
+	}
 	n.requests = append(n.requests, req.Clone())
 	return transport.TCP, nil
 }
@@ -282,4 +288,18 @@ func (l *lockedReader) Read(b []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.r.Read(b)
+}
+
+// Decided on #274: a terminating request whose S-CSCF cannot be reached
+// reaches the caller as 503 with Retry-After.
+func TestTerminatingRequestToAnUnreachableSCSCFGets503WithRetryAfter(t *testing.T) {
+	g := newProxied(t)
+	g.net.mu.Lock()
+	g.net.fail = errors.New("connection refused")
+	g.net.mu.Unlock()
+	g.receive(request(t, "MESSAGE", impu1))
+	waitFor(t, "the 503", func() bool { return slices.Contains(g.net.responses(), "503 MESSAGE") })
+	if got := g.net.response(t, 503).Header.Get("Retry-After"); got != "10" {
+		t.Errorf("Retry-After = %q, want 10", got)
+	}
 }

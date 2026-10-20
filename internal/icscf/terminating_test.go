@@ -34,8 +34,8 @@ func TestTerminatingAnswersFollowTheMappingTable(t *testing.T) {
 		// §5.3.2.1: chosen by capability.
 		{"unregistered service with capabilities", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, via("sip:scscf-b.rcs.local;transport=tcp;lr"), "icscf.terminating.forwarded"},
 		{"unregistered service, any S-CSCF", lia(experimental(cx.UnregisteredService), "", nil), nil, via(scscfURI + ";lr"), "icscf.terminating.forwarded"},
-		// Local choice: TS 24.229 names no response for this.
-		{"no S-CSCF qualifies", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}}), nil, outcome{status: 480}, "icscf.terminating.480"},
+		// TS 24.229 names no response for this; decided on #274.
+		{"no S-CSCF qualifies", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}}), nil, outcome{status: 480}, "icscf.scscf.no_capable"},
 		// §5.3.2.1, §5.3.2.2.
 		{"5001 user unknown", lia(experimental(cx.ErrorUserUnknown), "", nil), nil, outcome{status: 404}, "icscf.terminating.404"},
 		{"5003 not registered", lia(experimental(cx.ErrorIdentityNotRegistered), "", nil), nil, outcome{status: 480}, "icscf.terminating.480"},
@@ -221,5 +221,71 @@ func TestTerminatingCancelledWhileTheHSSIsAskedIsCountedAsCancelled(t *testing.T
 	}
 	if names := g.metrics.names(); !slices.Equal(names, []string{"icscf.terminating.cancelled"}) {
 		t.Errorf("metrics = %v, want only the cancellation", names)
+	}
+}
+
+// Decided on #274: a branch the proxy could not send to the S-CSCF turns
+// the 500 the proxy ends it in back into 503, with a Retry-After; other
+// endings pass as they are, and 430 still becomes 480.
+func TestAnUnreachableSCSCFIsAnswered503WithRetryAfter(t *testing.T) {
+	req := invite(t, impu1)
+	answer := func(t *testing.T, d proxy.Decision, code int, failed *sip.Response, sendErr error) *sip.Response {
+		t.Helper()
+		if failed != nil {
+			if more := d.OnBranchFailure(context.Background(), proxy.BranchFailure{Target: d.Targets[0], Response: failed, Err: sendErr}); more != nil {
+				t.Fatalf("retargeted to %v", more)
+			}
+		}
+		res, err := sip.NewResponse(req, code, "", "t1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.OnFinal(context.Background(), res)
+		d.OnResponse(context.Background(), res)
+		return res
+	}
+	made503, err := sip.NewResponse(req, 503, "", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	downstream486, err := sip.NewResponse(req, 486, "", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		final      int
+		failed     *sip.Response
+		sendErr    error
+		want       int
+		retryAfter string
+	}{
+		{"send failed", 500, made503, errors.New("connection refused"), 503, "10"},
+		{"a 500 from downstream", 500, nil, nil, 500, ""},
+		// The S-CSCF answered 503 itself: it was reached, and §16.7 step 6
+		// stands.
+		{"a 503 from the S-CSCF", 500, made503, nil, 500, ""},
+		{"a failure response from downstream", 486, downstream486, nil, 486, ""},
+		{"430", 430, nil, nil, 480, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newRig(t)
+			res := answer(t, g.route(invite(t, impu1)), tc.final, tc.failed, tc.sendErr)
+			if res.StatusCode != tc.want || res.Header.Get("Retry-After") != tc.retryAfter {
+				t.Errorf("%d, Retry-After %q; want %d, %q", res.StatusCode, res.Header.Get("Retry-After"), tc.want, tc.retryAfter)
+			}
+			if got, want := g.metrics.counts["icscf.scscf.unreachable"], int64(0); tc.want == 503 && got != 1 || tc.want != 503 && got != want {
+				t.Errorf("unreachable counted %d", got)
+			}
+		})
+	}
+	// The proxy's overload 503 keeps its own Retry-After.
+	g := newRig(t)
+	d := g.route(invite(t, impu1))
+	res, _ := sip.NewResponse(req, 503, "", "t1")
+	_ = res.Header.Add("Retry-After", "120")
+	d.OnResponse(context.Background(), res)
+	if got := res.Header.Get("Retry-After"); got != "120" {
+		t.Errorf("overload Retry-After became %q", got)
 	}
 }
