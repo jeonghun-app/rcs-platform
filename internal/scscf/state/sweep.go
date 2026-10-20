@@ -21,7 +21,9 @@ const TerminatedGrace = time.Minute
 // limit registrations, and calls handle for each registration it changed, with
 // the registration before and after. after has no contacts when the last one
 // expired, and the S-CSCF then deregisters the user (SAR TIMEOUT_DEREGISTRATION,
-// TS 29.228 §6.1.2) as well as sending the reg event NOTIFY.
+// TS 29.228 §6.1.2) as well as sending the reg event NOTIFY. The record of an
+// unregistered user is handled the same way once its Unregistered has come:
+// before.Unregistered is set, and the S-CSCF ends that state with the HSS.
 //
 // Every instance may sweep at the same time. A registration is claimed by a
 // save conditional on the version read, so only one instance wins it and calls
@@ -36,6 +38,20 @@ const TerminatedGrace = time.Minute
 // DIAMETER_ERROR_USER_UNKNOWN (5001, TS 29.229 §6.2.2): the HSS will not
 // answer differently, and an error would retry the SAR every lease. The
 // errors of handle are returned together with the number handled.
+//
+// The order is what makes that retry complete: handle deletes the set's
+// identities (DeleteIdentity) and its profile, and only then is the record
+// deleted. Cut short between the two, the record still holds its lease, so
+// the next sweep after it calls handle again, which finds what is left; an
+// identity it never reaches still goes at its KeepUntil.
+//
+// A live registration whose Reassert is due is claimed the same way, Reassert
+// moved one lease ahead, and handed to handle, whose before.ReassertDue tells
+// it to tell the HSS again. The sweep does no more for it: handle saves after
+// under its version, with Reassert and ReassertAttempts cleared once the HSS
+// has taken the SAR, or else with the failure counted and Reassert moved on
+// by a backoff, stopping by MaxReassertAttempts. A handle that only returns
+// nil leaves Reassert one lease ahead, and the set is claimed again then.
 func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, limit int, handle func(before, after *Registration) error) (int, error) {
 	// A listing error that comes with registrations (an item that does not
 	// decode) does not stop the others from being swept.
@@ -47,11 +63,18 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 			continue
 		}
 		next := before.Clone()
-		if len(next.Prune(now)) == 0 && len(next.Contacts) > 0 {
+		reassert := before.ReassertDue(now)
+		if len(next.Prune(now)) == 0 && len(next.Contacts) > 0 && !reassert {
 			continue
 		}
 		if len(next.Contacts) == 0 {
 			next.Deregistering = now.Add(SweepLease)
+			// Nothing is left to reassert: the set ends.
+			next.Reassert, next.ReassertAttempts = time.Time{}, 0
+		} else if reassert {
+			// Claimed as a deregistration is: another sweep tries after the
+			// lease if this one's handle does not move it.
+			next.Reassert = now.Add(SweepLease)
 		}
 		after, err := s.SaveRegistration(ctx, next)
 		if lost(err) {

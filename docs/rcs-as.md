@@ -351,7 +351,7 @@ What the last pass over a queue found decides what reads it again:
 |---|---|---|
 | Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
 | Messages wait for a session | is tried on its own | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer |
-| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits | any registration, a leg, the retry timer |
+| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits; one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
 `RCSAS_MAX_RETRY_INTERVAL` while the queue stays held. A recipient that never
