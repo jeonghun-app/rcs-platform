@@ -120,12 +120,17 @@ additionally sealed (below).
   so the NOTIFY with the highest reginfo version carries the newest state.
   A subscription's last NOTIFY is numbered with `FinalNotify`, after which
   nothing is, so it goes once whichever instances end the subscription.
-- **The end of a set is never lost.** When a set ends, each of its
-  subscriptions is saved Terminated, with the reason and an expiry five
-  seconds ahead, before its final NOTIFY is queued; a sweep sends a final
-  NOTIFY nobody numbered, and deletes the subscription once one is. The
-  subscription sweep must therefore run every few seconds to a minute, as
-  the registration sweep does.
+- **The end of a set is never lost.** Before a deregistration, a sweep or
+  an RTR deletes a set's record, each of the set's subscriptions is saved
+  Terminated, with the reason and an expiry five seconds ahead, and its
+  final NOTIFY is queued (`regevent.Notifier.Ended`); a listing that fails
+  is tried again, and one that keeps failing keeps the record for the
+  deregistration's own retry (the sweep after its lease, the HSS's next
+  RTR) and counts `regevent.end_failed`. A store failure or a stop at any
+  point thus leaves either the record or the saved ends, and a sweep sends
+  a final NOTIFY nobody numbered, and deletes the subscription once one is.
+  The subscription sweep must therefore run every few seconds to a minute,
+  as the registration sweep does.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
   document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
   store's limits, 32 identities (`MaxIdentities`) each listing up to 32
@@ -151,10 +156,12 @@ The reg event notifier counts, without dimensions:
 `regevent.subscribed`, `refused`, `refused_full`, `replaced`,
 `no_subscription`, `refresh_conflict`, `notified`, `notify_refused`,
 `notify_failed`, `notify_merged`, `notify_dropped`, `notify_deferred`,
-`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large` and
-`internal_errors`. Alarm on `regevent.notify_dropped` and
+`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`
+and `internal_errors`. Alarm on `regevent.notify_dropped` and
 `regevent.notify_deferred` (any sustained rate): NOTIFYs are queuing faster
-than subscribers answer (below), and ends are waiting for the sweep.
+than subscribers answer (below), and ends are waiting for the sweep. Alarm
+on any `regevent.end_failed`: a set's end could not be saved, and its
+deregistration waits for a retry.
 
 ## HSS discovery
 
@@ -215,9 +222,11 @@ hop (`HopConcurrency`, 32). A P-CSCF task, the next hop of its users' UE
 subscriptions too, therefore takes about `HopConcurrency` / round trip: a UE
 behind a radio link answers in some 300 ms, which gives about 100 NOTIFYs a
 second, enough for 20 000 users re-registering every 600 s with two
-subscriptions each (67 a second), and a P-CSCF task that does not answer
-holds back its own users' NOTIFYs only. What waits beyond `Queue` (4096), or
-a quarter of it for one next hop, is dropped (`regevent.notify_dropped`), or
-for an end left to the sweep (`regevent.notify_deferred`). Raise
-`HopConcurrency` for P-CSCF tasks with more users, and `Workers` if the store
-is slow.
+subscriptions each (67 a second). A P-CSCF task that does not answer holds
+its users' NOTIFYs back, and those waiting for it take a quarter of `Queue`
+(4096) at most; what waits beyond that, or beyond `Queue`, is dropped
+(`regevent.notify_dropped`), or for an end left to the sweep
+(`regevent.notify_deferred`). Four stalled P-CSCF tasks therefore fill the
+queue, and every other NOTIFY but an end is dropped until they answer or
+time out: alarm on `regevent.notify_dropped`. Raise `HopConcurrency` for
+P-CSCF tasks with more users, and `Workers` if the store is slow.

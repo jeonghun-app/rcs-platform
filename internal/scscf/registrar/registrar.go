@@ -115,16 +115,22 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Events receives the changes of a set: before became after, nil once the
-// set has ended, because of cause. regevent.Notifier implements it; it must
-// return at once, as the request that changed the set is answered after it.
+// Events receives the changes of a set: before became after because of
+// cause (Changed), or before ended (Ended). regevent.Notifier implements
+// it. Changed must return at once, as the request that changed the set is
+// answered after it. Ended is called before the set's record is deleted,
+// and saves the end of its subscriptions: on an error the record is kept,
+// and whatever retries the deregistration (the sweep after its lease, the
+// HSS's next RTR) calls it again, so that the end is never lost (#256).
 type Events interface {
 	Changed(ctx context.Context, before, after *state.Registration, cause regevent.Cause)
+	Ended(ctx context.Context, before *state.Registration, cause regevent.Cause) error
 }
 
 type noEvents struct{}
 
 func (noEvents) Changed(context.Context, *state.Registration, *state.Registration, regevent.Cause) {}
+func (noEvents) Ended(context.Context, *state.Registration, regevent.Cause) error                  { return nil }
 
 // Registrar handles REGISTER requests (TS 24.229 §5.4.1).
 type Registrar struct {

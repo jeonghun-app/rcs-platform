@@ -89,7 +89,7 @@ func idOf(parts ...string) string {
 // A live contact is refreshed if before had it with another expiry or
 // CSeq, and registered otherwise: the notifier keeps no event per contact,
 // so one unchanged gets the event it had when it was first listed.
-func document(version uint32, before, set *state.Registration, cause Cause, now time.Time, st reginfo.State) *reginfo.Info {
+func document(version uint32, before, set *state.Registration, cause Cause, ends map[string]Cause, now time.Time, st reginfo.State) *reginfo.Info {
 	info := &reginfo.Info{Version: version, State: st}
 	var live []state.Contact
 	if set != nil {
@@ -130,7 +130,11 @@ func document(version uint32, before, set *state.Registration, cause Cause, now 
 			gone = was
 		}
 		for _, c := range gone {
-			reg.Contacts = append(reg.Contacts, contactOf(id.IMPU, c, reginfo.ContactTerminated, cause.endEvent(), nil))
+			why := cause
+			if e, ok := ends[bindingKey(c)]; ok {
+				why = e
+			}
+			reg.Contacts = append(reg.Contacts, contactOf(id.IMPU, c, reginfo.ContactTerminated, why.endEvent(), nil))
 		}
 		if st == reginfo.Partial && len(reg.Contacts) == 0 && id.current == id.before {
 			continue
@@ -188,8 +192,8 @@ func hasIdentity(set *state.Registration, impu string) bool {
 // hears of the end whatever the size (#256 code review). A set within the
 // store's limits can make a full document too large: 32 identities of 32
 // contacts with long URIs. It fails with reginfo.ErrTooLarge if nothing fits.
-func body(version uint32, before, set *state.Registration, cause Cause, now time.Time) ([]byte, error) {
-	b, err := document(version, before, set, cause, now, reginfo.Full).Marshal()
+func body(version uint32, before, set *state.Registration, cause Cause, ends map[string]Cause, now time.Time) ([]byte, error) {
+	b, err := document(version, before, set, cause, ends, now, reginfo.Full).Marshal()
 	if !errors.Is(err, reginfo.ErrTooLarge) {
 		return b, err
 	}
@@ -201,7 +205,7 @@ func body(version uint32, before, set *state.Registration, cause Cause, now time
 		}
 		return ends.Marshal()
 	case before != nil:
-		return document(version, before, set, cause, now, reginfo.Partial).Marshal()
+		return document(version, before, set, cause, ends, now, reginfo.Partial).Marshal()
 	}
 	return nil, err
 }

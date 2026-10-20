@@ -2,6 +2,7 @@ package registrar
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -21,6 +22,8 @@ type change struct {
 type recordedEvents struct {
 	mu   sync.Mutex
 	seen []change
+	// failEnds makes Ended fail, as a notifier whose store does.
+	failEnds bool
 }
 
 func (r *recordedEvents) Changed(_ context.Context, before, after *state.Registration, cause regevent.Cause) {
@@ -32,6 +35,23 @@ func (r *recordedEvents) Changed(_ context.Context, before, after *state.Registr
 	}
 	r.mu.Lock()
 	r.seen = append(r.seen, change{n(before), n(after), cause})
+	r.mu.Unlock()
+}
+
+func (r *recordedEvents) Ended(ctx context.Context, before *state.Registration, cause regevent.Cause) error {
+	r.mu.Lock()
+	fail := r.failEnds
+	r.mu.Unlock()
+	if fail {
+		return errors.New("the subscriptions could not be listed")
+	}
+	r.Changed(ctx, before, nil, cause)
+	return nil
+}
+
+func (r *recordedEvents) setFailEnds(fail bool) {
+	r.mu.Lock()
+	r.failEnds = fail
 	r.mu.Unlock()
 }
 
@@ -120,4 +140,53 @@ func TestAPPRThatChangesTheIdentitiesTellsOfIt(t *testing.T) {
 	if got := ev.got(); len(got) != 2 {
 		t.Errorf("changes %+v after a PPR that changed nothing", got)
 	}
+}
+
+// TestASetWhoseEndCannotBeSavedKeepsItsRecord: a deregistration, a sweep
+// and an RTR all keep the record while the subscriptions' end cannot be
+// saved, and finish once it can (#256 code review).
+func TestASetWhoseEndCannotBeSavedKeepsItsRecord(t *testing.T) {
+	t.Run("deregistration and sweep", func(t *testing.T) {
+		e := newEnv(t)
+		ev := &recordedEvents{}
+		g := e.instance(1, withEvents(ev))
+		u := registered(t, e, g, 600, impu1)
+		ev.setFailEnds(true)
+		wantStatus(t, u.registerWith(g, 0), 200)
+		if _, err := regOf(e, impu1); err != nil {
+			t.Fatalf("the record went with its subscriptions' end unsaved: %v", err)
+		}
+		// The sweep after the lease tries again, and fails again.
+		e.clock.advance(2 * time.Minute)
+		if _, err := g.Sweep(bg, 10); err == nil {
+			t.Error("a sweep whose end failed reported no error")
+		}
+		if _, err := regOf(e, impu1); err != nil {
+			t.Fatalf("the sweep deleted the record with its subscriptions' end unsaved: %v", err)
+		}
+		ev.setFailEnds(false)
+		e.clock.advance(2 * time.Minute)
+		if _, err := g.Sweep(bg, 10); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := regOf(e, impu1); err == nil {
+			t.Error("the record outlived a sweep that could save the end")
+		}
+	})
+	t.Run("RTR", func(t *testing.T) {
+		e := newEnv(t)
+		ev := &recordedEvents{}
+		g := e.instance(1, withEvents(ev))
+		registered(t, e, g, 600, impu1)
+		ev.setFailEnds(true)
+		rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}
+		if res := g.HandleRTR(bg, rtr); res == resultSuccess {
+			t.Error("an RTR whose end failed succeeded")
+		}
+		if _, err := regOf(e, impu1); err != nil {
+			t.Fatalf("the RTR deleted the record with its subscriptions' end unsaved: %v", err)
+		}
+		ev.setFailEnds(false)
+		wantResult(t, g.HandleRTR(bg, rtr), resultSuccess)
+	})
 }

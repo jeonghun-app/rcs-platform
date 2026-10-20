@@ -52,9 +52,10 @@
 // subscription that has one waiting already merges into it. Beyond
 // Config.Queue waiting, or a quarter of it for one next hop, a NOTIFY is
 // dropped and counted; the next carries the state. The end of a set is
-// never lost so: its subscriptions are saved Terminated, with the reason,
-// before their final NOTIFYs are queued, and a sweep sends a final NOTIFY
-// nobody sent (state.SweepSubscriptions).
+// never lost so: the registrar calls Ended before it deletes the set's
+// record, which saves its subscriptions Terminated, with the reason, before
+// their final NOTIFYs are queued, and a sweep sends a final NOTIFY nobody
+// sent (state.SweepSubscriptions).
 //
 // The package sends nothing itself: Sender carries a request to the next
 // hop of its dialog in a client transaction, which cmd/scscf provides.

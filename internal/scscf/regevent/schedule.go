@@ -2,6 +2,7 @@ package regevent
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,7 +27,9 @@ type task struct {
 	set, hop string
 	sub      string
 	final    bool
-	run      func(context.Context) func()
+	// job is a NOTIFY task's, which a later one merged into it updates.
+	job *job
+	run func(context.Context) func()
 	// done, if set, is called once the task has run or was dropped.
 	done func()
 }
@@ -68,6 +71,13 @@ func (n *Notifier) enqueue(t *task) bool {
 	if t.sub != "" {
 		if old := sc.byQueuedSub[t.sub]; old != nil {
 			if !t.final {
+				// What the later change ended, it tells of (#256 QA).
+				merged := maps.Clone(old.job.ends)
+				if merged == nil {
+					merged = map[string]Cause{}
+				}
+				maps.Copy(merged, t.job.ends)
+				old.job.ends = merged
 				n.count("regevent.notify_merged")
 				finish(t)
 				return true
@@ -163,10 +173,9 @@ func (n *Notifier) runTask(t *task) {
 // enqueueNotify queues the NOTIFY j to sub, calling done, if set, once it
 // has been sent or dropped.
 func (n *Notifier) enqueueNotify(ctx context.Context, sub *state.Subscription, j job, done func()) {
-	n.enqueue(&task{
-		ctx: ctx, set: sub.Set.IMPI + "\x00" + sub.Set.IMPU, hop: hopOf(sub), sub: sub.ID, final: j.final, done: done,
-		run: func(ctx context.Context) func() { return n.prepare(ctx, sub, j) },
-	})
+	t := &task{ctx: ctx, set: sub.Set.IMPI + "\x00" + sub.Set.IMPU, hop: hopOf(sub), sub: sub.ID, final: j.final, done: done, job: &j}
+	t.run = func(ctx context.Context) func() { return n.prepare(ctx, sub, *t.job) }
+	n.enqueue(t)
 }
 
 // hopOf names the next hop of sub's NOTIFYs: the first route of its dialog,

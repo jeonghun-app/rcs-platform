@@ -3,6 +3,8 @@ package regevent
 import (
 	"context"
 	"errors"
+	"fmt"
+	mathrand "math/rand/v2"
 	"strconv"
 	"sync"
 	"time"
@@ -32,9 +34,11 @@ func terminated(reason string) sip.SubscriptionState {
 // when it is sent.
 type job struct {
 	// before is the set before a change and cause the change: what before
-	// had and the set has no more is listed as ended with cause's event.
+	// had and the set has no more is listed as ended with cause's event, or
+	// for a contact in ends, with the event of the cause there.
 	before *state.Registration
 	cause  Cause
+	ends   map[string]Cause
 	// ended says the registrar ended the set: the NOTIFY tells of before's
 	// end, whatever the store still has of a record being deleted.
 	ended bool
@@ -54,35 +58,32 @@ type job struct {
 // returns at once: the NOTIFYs go out on the workers (schedule.go), so that
 // the request that changed the set is answered first. The subscriptions of
 // every identity before or after has are told, so that one to an identity
-// that left the set ends (#256 security review).
-//
-// When the set has ended, its subscriptions end with it: each is first
-// saved Terminated, with its reason and an expiry pendingEnd ahead, and
-// then its final NOTIFY, which says terminated, deactivated or rejected
-// (RFC 6665 §4.1.3), is queued. If the queue drops that NOTIFY, or the
-// instance stops, a sweep sends it within seconds, so the end of a set is
-// never lost (#256 security, code and QA reviews).
+// that left the set ends (#256 security review). With after nil it does
+// what Ended does, in the background; the registrar calls Ended itself,
+// before the record goes.
 func (n *Notifier) Changed(ctx context.Context, before, after *state.Registration, cause Cause) {
-	changed := after
-	if changed == nil {
-		changed = before
-	}
-	if changed == nil {
+	if before == nil && after == nil {
 		return
 	}
 	n.enqueue(&task{ctx: ctx, run: func(ctx context.Context) func() {
-		n.fanOut(ctx, before, after, changed, cause)
+		if after == nil {
+			if err := n.Ended(ctx, before, cause); err != nil {
+				n.internalLog("ending a set's subscriptions", err)
+			}
+			return nil
+		}
+		n.fanOut(ctx, before, after, cause)
 		return nil
 	}})
 }
 
-// fanOut queues the NOTIFYs of Changed.
-func (n *Notifier) fanOut(ctx context.Context, before, after, changed *state.Registration, cause Cause) {
+// fanOut queues the NOTIFYs of a change that left the set.
+func (n *Notifier) fanOut(ctx context.Context, before, after *state.Registration, cause Cause) {
+	ends := endsOf(before, after, cause, n.cfg.Now())
 	seen := map[string]bool{}
 	for _, impu := range identitiesBoth(before, after) {
-		subs, err := n.cfg.Store.SubscriptionsOf(ctx, impu)
+		subs, err := n.listing(ctx, impu)
 		if err != nil {
-			n.internalLog("listing subscriptions", err)
 			continue
 		}
 		for _, sub := range subs {
@@ -93,27 +94,110 @@ func (n *Notifier) fanOut(ctx context.Context, before, after, changed *state.Reg
 			j := job{}
 			// A subscription to another set, or to an earlier record of
 			// this one, is only checked: it ends if it has lapsed.
-			if sub.Set == changed.Key && sub.Incarnation == changed.Incarnation {
-				j = job{before: before, cause: cause}
-				if after == nil {
-					j.ended, j.final, j.reason = true, true, cause.reason()
-					ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(pendingEnd), j.reason, true)
-					switch {
-					case err != nil:
-						// Its NOTIFY goes all the same, if the store lets
-						// it be numbered.
-						n.internalLog("terminating a subscription", err)
-					case ended == nil:
-						// Gone, or ending already.
-						continue
-					default:
-						sub = ended
-					}
-				}
+			if sub.Set == after.Key && sub.Incarnation == after.Incarnation {
+				j = job{before: before, cause: cause, ends: ends}
 			}
 			n.enqueueNotify(ctx, sub, j, nil)
 		}
 	}
+}
+
+// Ended ends the subscriptions of before, a set that has ended because of
+// cause: each is saved Terminated, with its reason, SetEnded and an expiry
+// pendingEnd ahead, and then its final NOTIFY, which says terminated,
+// deactivated or rejected (RFC 6665 §4.1.3), is queued. The registrar calls
+// it before it deletes the set's record, and on an error keeps the record
+// to try again later: a store failure, or an instance that stops, at any
+// point leaves either the record or the saved ends, whose final NOTIFYs a
+// sweep sends if the instance does not (#256 code review). The
+// subscriptions of the set's identities to another set are only checked,
+// as by Changed. The error, after retries, is counted in
+// regevent.end_failed.
+func (n *Notifier) Ended(ctx context.Context, before *state.Registration, cause Cause) error {
+	j := job{before: before, cause: cause, ends: endsOf(before, nil, cause, n.cfg.Now()), ended: true, final: true, reason: cause.reason()}
+	var errs error
+	seen := map[string]bool{}
+	for _, impu := range identitiesBoth(before, nil) {
+		subs, err := n.listing(ctx, impu)
+		if err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		for _, sub := range subs {
+			if seen[sub.ID] || sub.Terminated {
+				continue
+			}
+			seen[sub.ID] = true
+			if sub.Set != before.Key || sub.Incarnation != before.Incarnation {
+				n.enqueueNotify(ctx, sub, job{}, nil)
+				continue
+			}
+			ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(pendingEnd), j.reason, true)
+			if err != nil {
+				errs = errors.Join(errs, err)
+				continue
+			}
+			if ended != nil {
+				n.enqueueNotify(ctx, ended, j, nil)
+			}
+		}
+	}
+	if errs != nil {
+		n.count("regevent.end_failed")
+		return fmt.Errorf("regevent: ending a set's subscriptions: %w", errs)
+	}
+	return nil
+}
+
+// listAttempts bounds how often listing an identity's subscriptions is
+// tried: a DynamoDB Query that failed once, its SDK retries spent, often
+// succeeds a moment later.
+const listAttempts = 3
+
+// listing lists impu's subscriptions, trying again with a short, jittered
+// backoff, and logs the failure that remains.
+func (n *Notifier) listing(ctx context.Context, impu string) ([]*state.Subscription, error) {
+	var err error
+	for attempt := range listAttempts {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(10<<attempt+mathrand.IntN(10)) * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		var subs []*state.Subscription
+		if subs, err = n.cfg.Store.SubscriptionsOf(ctx, impu); err == nil {
+			return subs, nil
+		}
+	}
+	n.internalLog("listing subscriptions", err)
+	return nil, err
+}
+
+// endsOf is what a change from before to after ended, by binding key, with
+// cause: the contacts of before not live in after, every one if after is
+// nil. A NOTIFY merged from several changes tells each contact's end by
+// the latest change that ended it (#256 QA review).
+func endsOf(before, after *state.Registration, cause Cause, now time.Time) map[string]Cause {
+	if before == nil {
+		return nil
+	}
+	var live []state.Contact
+	if after != nil {
+		for _, c := range after.Contacts {
+			if !c.Expired(now) {
+				live = append(live, c)
+			}
+		}
+	}
+	ends := map[string]Cause{}
+	for _, c := range before.Contacts {
+		if !hasBinding(live, c) {
+			ends[bindingKey(c)] = cause
+		}
+	}
+	return ends
 }
 
 // identitiesBoth are the identities of before and after, each once.
@@ -154,7 +238,7 @@ func (n *Notifier) check(sub *state.Subscription, set *state.Registration, now t
 		return lapsedIdentity
 	case !anyLive(set, now):
 		return lapsedSet
-	case sub.Kind == state.SubscriberUE && sub.Binding != "" && !ueLive(set, sub.Binding, now):
+	case sub.Kind == state.SubscriberUE && namesABinding(sub.Binding) && !ueLive(set, sub.Binding, now):
 		return lapsedUE
 	case sub.Kind == state.SubscriberPCSCF:
 		u, err := sip.ParseURI(sub.Subscriber)
@@ -291,7 +375,7 @@ func (n *Notifier) build(sub *state.Subscription, cseq, version uint32, before, 
 		if set == nil && before == nil {
 			b, err = endOf(version, sub.IMPU, j.reason).Marshal()
 		} else {
-			b, err = body(version, before, set, j.cause, now)
+			b, err = body(version, before, set, j.cause, j.ends, now)
 		}
 		switch {
 		case errors.Is(err, reginfo.ErrTooLarge):

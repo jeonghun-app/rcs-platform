@@ -1006,11 +1006,12 @@ func mustReg(t *testing.T, e *env, k state.SetKey) *state.Registration {
 	return r
 }
 
-// flakyStore fails the next reads of a registration or an identity.
+// flakyStore fails the next reads of a registration, an identity or a
+// listing of subscriptions.
 type flakyStore struct {
 	*state.Memory
-	mu                     sync.Mutex
-	registration, identity int
+	mu                              sync.Mutex
+	registration, identity, listing int
 }
 
 var errThrottled = errors.New("throttled")
@@ -1030,6 +1031,13 @@ func (f *flakyStore) Registration(ctx context.Context, k state.SetKey) (*state.R
 		return nil, errThrottled
 	}
 	return f.Memory.Registration(ctx, k)
+}
+
+func (f *flakyStore) SubscriptionsOf(ctx context.Context, impu string) ([]*state.Subscription, error) {
+	if f.failing(&f.listing) {
+		return nil, errThrottled
+	}
+	return f.Memory.SubscriptionsOf(ctx, impu)
 }
 
 func (f *flakyStore) Identity(ctx context.Context, impu string, now time.Time) (*state.Identity, error) {
@@ -1722,5 +1730,129 @@ func TestAnEndTakesTheWaitingNotifysPlace(t *testing.T) {
 	}
 	if g.sent != 3 {
 		t.Errorf("%d NOTIFYs, want the first change's one under way and two ends", g.sent)
+	}
+}
+
+// TestAnEndListsTheSubscriptionsAgainAfterAFailure: a listing that fails
+// once is tried again, and every subscriber gets its end (#256 code
+// review); one that keeps failing is an error, which the registrar keeps
+// the record for, and is counted.
+func TestAnEndListsTheSubscriptionsAgainAfterAFailure(t *testing.T) {
+	for _, fails := range []int{1, listAttempts} {
+		t.Run(fmt.Sprintf("%d failures", fails), func(t *testing.T) {
+			e := newEnv(t)
+			before := e.registered(binding(1, time.Hour))
+			e.subscribedMany(2)
+			fs := &flakyStore{Memory: e.store, listing: fails}
+			m := &counts{}
+			n := newNotifierWith(t, e, fs, e.send, func(c *Config) { c.Metrics = m })
+			err := n.Ended(bg, before, Rejected)
+			n.Wait()
+			ends := 0
+			for _, req := range e.send.notifies() {
+				if ss, _ := req.Header.SubscriptionState(); ss.State == "terminated" {
+					ends++
+				}
+			}
+			if fails < listAttempts {
+				if err != nil || ends != 2 {
+					t.Errorf("Ended = %v, %d ends sent; want nil and 2", err, ends)
+				}
+				return
+			}
+			if err == nil || m.get("regevent.end_failed") != 1 || ends != 0 {
+				t.Errorf("Ended = %v, end_failed %d, %d ends sent; want an error, 1, 0", err, m.get("regevent.end_failed"), ends)
+			}
+		})
+	}
+}
+
+// TestDevicesWhoseContactMatchesNoBindingKeepTheirShares: the SUBSCRIBE
+// Contact of each of three devices is written unlike its REGISTER's
+// (without ;transport=tcp, RFC 3261 §19.1.4), so it matches no binding;
+// the Contact itself tells the devices apart (QA's R1 on #256).
+func TestDevicesWhoseContactMatchesNoBindingKeepTheirShares(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, time.Hour), binding(2, time.Hour), binding(3, time.Hour))
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
+	for k := 1; k <= 3; k++ {
+		req := subscribe(t, impu1, impu1, 600000)
+		_ = req.Header.Set("Call-ID", fmt.Sprintf("nb-%d", k))
+		_ = req.Header.Set("Contact", "<"+strings.TrimSuffix(binding(k, 0).URI, ";transport=tcp")+">")
+		res, after := n.Subscribe(bg, req)
+		wantStatus(t, res, 200)
+		after(bg)
+	}
+	n.Wait()
+	if r := m.get("regevent.replaced"); r != 0 {
+		t.Errorf("replaced %d", r)
+	}
+	// Each ends with the set, not with a binding it was never matched to.
+	if subs := e.subscriptions(impu1); len(subs) != 3 || subs[0].Binding == "" {
+		t.Errorf("%d subscriptions, the first with Binding %q", len(subs), subs[0].Binding)
+	}
+}
+
+// recGate holds each NOTIFY until released and records it.
+type recGate struct {
+	mu      sync.Mutex
+	sent    []*sip.Request
+	release chan struct{}
+}
+
+func (g *recGate) Send(_ context.Context, req *sip.Request) (*sip.Response, error) {
+	g.mu.Lock()
+	g.sent = append(g.sent, req)
+	g.mu.Unlock()
+	<-g.release
+	return sip.NewResponse(req, 200, "", "s")
+}
+
+// TestAMergedNotifyTellsOfEachContactByTheChangeThatEndedIt: a REGISTER
+// removes binding 2 and its NOTIFY waits for the set's one slot; a sweep
+// then expires binding 3, and its NOTIFY merges into the waiting one. Every
+// NOTIFY tells of binding 2 as unregistered and of binding 3 as expired
+// (QA's R2 on #256).
+func TestAMergedNotifyTellsOfEachContactByTheChangeThatEndedIt(t *testing.T) {
+	e := newEnv(t)
+	s0 := e.registered(binding(1, time.Hour), binding(2, time.Hour), binding(3, time.Hour))
+	e.subscribedMany(2)
+	g := &recGate{release: make(chan struct{})}
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.SetConcurrency, c.Metrics = 1, m })
+	s1 := s0.Clone()
+	s1.Contacts = []state.Contact{s0.Contacts[0], s0.Contacts[2]}
+	s1 = e.saved(s1)
+	n.Changed(bg, s0, s1, Registered)
+	settled(t, n, 1)
+	s2 := s1.Clone()
+	s2.Contacts = s2.Contacts[:1]
+	s2 = e.saved(s2)
+	n.Changed(bg, s1, s2, Expired)
+	settled(t, n, 2)
+	close(g.release)
+	n.Wait()
+	if m.get("regevent.notify_merged") != 1 {
+		t.Fatalf("%d merged, want 1", m.get("regevent.notify_merged"))
+	}
+	want := map[string]reginfo.Event{binding(2, 0).URI: reginfo.Unregistered, binding(3, 0).URI: reginfo.Expired}
+	told := map[string]bool{}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, r := range g.sent {
+		doc, _, _ := info(t, r)
+		reg, _ := doc.ByAOR(sip.URI{Scheme: "sip", User: "+15550100001", Host: realm})
+		for _, c := range reg.Contacts {
+			if ev, ok := want[c.URI]; ok && !c.Active() {
+				told[r.Header.Get("Call-ID")+c.URI] = true
+				if c.Event != ev {
+					t.Errorf("%s: %s ended as %s, want %s", r.Header.Get("Call-ID"), c.URI, c.Event, ev)
+				}
+			}
+		}
+	}
+	if len(told) != 4 {
+		t.Errorf("each subscriber told of the two ends %d times in all, want 4", len(told))
 	}
 }

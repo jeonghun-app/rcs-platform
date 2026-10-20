@@ -503,8 +503,12 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 	}
 	g.count("registrar.deregistered")
 	// The HSS has the deregistration: the subscribers learn of it whatever
-	// is left to clean up (TS 24.229 §5.4.2.1.2).
-	g.cfg.Events.Changed(ctx, cur, nil, regevent.Unregistered)
+	// is left to clean up (TS 24.229 §5.4.2.1.2), before the record goes.
+	if err := g.cfg.Events.Ended(ctx, cur, regevent.Unregistered); err != nil {
+		g.internal("ending a deregistered set's subscriptions", err)
+		g.count("registrar.deregistration_left_to_sweep")
+		return nil
+	}
 	if err := g.endSet(ctx, claimed, profile); err != nil {
 		// The HSS has taken the deregistration, so the client's is done:
 		// what is left of the set holds the lease, and the sweep after it

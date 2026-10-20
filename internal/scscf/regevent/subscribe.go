@@ -7,6 +7,7 @@ import (
 	mathrand "math/rand/v2"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -185,8 +186,11 @@ func ueKey(c state.Contact) string {
 }
 
 // ueBinding is the ueKey of the live binding of set that req's Contact is,
-// by +sip.instance or URI, or "" if none is: such a subscription ends with
-// the set, not with a binding.
+// by +sip.instance or URI. If none is, it is the Contact URI's key, which
+// names the device for MaxPerSubscriber, but no binding, so such a
+// subscription ends with the set and not with a binding (#256 QA review: a
+// device whose SUBSCRIBE Contact is written unlike its REGISTER's must
+// still keep its own share).
 func ueBinding(set *state.Registration, req *sip.Request, now time.Time) string {
 	cs, err := req.Header.Contact()
 	if err != nil || len(cs) == 0 || cs[0].Star {
@@ -204,7 +208,16 @@ func ueBinding(set *state.Registration, req *sip.Request, now time.Time) string 
 			return ueKey(c)
 		}
 	}
-	return ""
+	return contactKeyPrefix + cs[0].URI.String()
+}
+
+// contactKeyPrefix starts the key of a device that no binding matched.
+const contactKeyPrefix = "c|"
+
+// namesABinding reports whether a UE subscription's Binding is a binding's
+// ueKey, which the subscription ends with.
+func namesABinding(key string) bool {
+	return key != "" && !strings.HasPrefix(key, contactKeyPrefix)
 }
 
 // ueLive reports whether a live binding of set has the ueKey key.

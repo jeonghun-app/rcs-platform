@@ -117,6 +117,12 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			return false, err
 		}
 		touched = true
+		// The subscriptions end before the record does, so that an error
+		// here or a stop later leaves the record for the HSS's retry, or
+		// their saved ends for the sweep.
+		if err := g.cfg.Events.Ended(ctx, reg, cause); err != nil {
+			return false, err
+		}
 		if err := g.unpoint(ctx, reg); err != nil {
 			return false, err
 		}
@@ -132,7 +138,6 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		case errors.Is(err, state.ErrConflict):
 			continue
 		case errors.Is(err, state.ErrNotFound), err == nil:
-			g.cfg.Events.Changed(ctx, reg, nil, cause)
 			return true, nil
 		}
 		return false, err
