@@ -203,7 +203,7 @@ func (w *regWatch) own(reg reginfo.Registration) (reginfo.Contact, bool) {
 	for _, c := range reg.ByURI(w.contact) {
 		inst, ok := c.Param("+sip.instance")
 		switch {
-		case ok && inst == w.instance:
+		case ok && sipua.SameInstance(inst, w.instance):
 			return c, true
 		case !ok && plain == nil:
 			plain = &c

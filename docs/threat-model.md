@@ -156,6 +156,14 @@ metric dimension (architecture §8).
 **Control:** every listener and parser has size, count, time and per-source limits;
 reviews check maximum-size inputs (architecture §8).
 **Status:** implemented for merged libraries; each service adds its own.
+`rcs-as` bounds its SIP sessions, each with its MSRP leg, per task
+(`RCSAS_MAX_SESSIONS`, invitations waiting for an answer included) and per
+user each way (`RCSAS_MAX_OUTGOING_SESSIONS_PER_USER`,
+`RCSAS_MAX_INCOMING_SESSIONS_PER_USER`), so other users' messages cannot take a
+user's own room; one sender has one large-mode session at a time with one
+recipient. In time, a leg that no msrp-relay connection binds within
+`RCSAS_ANSWER_TIMEOUT` is closed and its session ended, so a client that
+answers or offers and never connects cannot hold a place.
 
 ## T10 — Forged receipts, routes and floods through `rcs-as`
 

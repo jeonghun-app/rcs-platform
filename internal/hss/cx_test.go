@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -535,11 +536,14 @@ func TestUpdateGivesUpUnderEndlessContention(t *testing.T) {
 	e := newEnv(t)
 	e.provision(impi1, impu1)
 	h := e.newHSS(func(o *Options) { o.Store = &conflictingStore{Store: e.store} })
-	_, err := h.update(context.Background(), impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+	// Every caller has a deadline, which is what stops the retries.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
 	if !errors.Is(err, errContention) {
 		t.Fatalf("update = %v, want errContention", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(context.Background())
 	cancel()
 	if _, err := h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("update with a cancelled context = %v", err)

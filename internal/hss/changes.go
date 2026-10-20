@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
@@ -178,7 +179,14 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	default:
 		return
 	}
-	_, err := h.update(ctx, s.IMPI, func(cur *store.Subscription) error {
+	// The update gets half of the time left, so that one that wins only at
+	// its deadline, behind another task's writes, still leaves the RTR some.
+	uctx, cancel := ctx, context.CancelFunc(func() {})
+	if d, ok := ctx.Deadline(); ok {
+		uctx, cancel = context.WithDeadline(ctx, time.Now().Add(time.Until(d)/2))
+	}
+	defer cancel()
+	_, err := h.update(uctx, s.IMPI, func(cur *store.Subscription) error {
 		if !served(cur) && !cur.AuthPending && cur.ServerName == "" {
 			return errUnchanged
 		}
