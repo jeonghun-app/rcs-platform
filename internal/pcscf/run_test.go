@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/proxyproto"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -54,7 +56,12 @@ type service struct {
 // start runs pcscf with cfg and d until the test ends.
 func start(t *testing.T, cfg Config, d deps) *service {
 	t.Helper()
-	h := runtimetest.New(t, "pcscf")
+	return startWith(t, runtimetest.New(t, "pcscf"), cfg, d)
+}
+
+// startWith is start on the runtime of h.
+func startWith(t *testing.T, h *runtimetest.Harness, cfg Config, d deps) *service {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &service{h: h, done: make(chan error, 1)}
 	listening := make(chan struct{})
@@ -581,15 +588,93 @@ func TestClientFlowsLeaveRoomForTheCore(t *testing.T) {
 	}
 }
 
-// The transport accepts at most MaxConnections connections in all.
-func TestTheTransportTakesMaxConnections(t *testing.T) {
+// The client listener takes at most PCSCF_MAX_CLIENT_FLOWS connections,
+// counted from accept, and the core listener PCSCF_CORE_CONNECTIONS: the
+// client listener at its limit leaves the core its room (#193).
+func TestTheClientListenerAtItsLimitLeavesTheCoreItsRoom(t *testing.T) {
 	cfg := testConfig()
-	cfg.MaxConnections, cfg.MaxClientFlows, cfg.CoreConnections = 2, 1, 1
-	s := start(t, cfg, deps{})
-	dial(t, s.core, nil).request()
+	cfg.MaxConnections, cfg.MaxClientFlows, cfg.CoreConnections = 4, 2, 1
+	var pc *pcscf
+	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
+	// Connections that have sent nothing yet hold their slots.
+	dial(t, s.client, nil)
+	dial(t, s.client, nil)
+	if res, err := dial(t, s.client, nil).try(); err == nil {
+		t.Fatalf("a client connection past its listener's limit was answered %d", res.StatusCode)
+	}
 	dial(t, s.core, nil).request()
 	if res, err := dial(t, s.core, nil).try(); err == nil {
-		t.Fatalf("a connection past MaxConnections was answered %d", res.StatusCode)
+		t.Fatalf("a core connection past its listener's limit was answered %d", res.StatusCode)
+	}
+	st := pc.flows.(*transport.Transport).Stats()
+	if st.ClientListenerRejected != 1 || st.CoreListenerRejected != 1 || st.Rejected != 0 {
+		t.Errorf("stats %+v", st)
+	}
+}
+
+// pcscf opens no listener without a connection limit, nor listeners whose
+// limits together exceed the transport's (#193); a UDP listener holds no
+// connections.
+func TestListenerLimitsAreChecked(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClientUDPAddr = "127.0.0.1:0"
+	ls := []transport.ListenerConfig{coreListenerConfig(cfg), clientListenerConfig(cfg), udpListenerConfig(cfg)}
+	if err := checkListenerLimits(cfg.MaxConnections, ls); err != nil {
+		t.Fatalf("the defaults: %v", err)
+	}
+	if ls[0].MaxConnections != DefaultCoreConnections || ls[1].MaxConnections != DefaultMaxClientFlows || ls[2].MaxConnections != 0 {
+		t.Errorf("limits %d, %d, %d", ls[0].MaxConnections, ls[1].MaxConnections, ls[2].MaxConnections)
+	}
+	if err := checkListenerLimits(DefaultMaxClientFlows+DefaultCoreConnections-1, ls); err == nil {
+		t.Error("limits past the total were taken")
+	}
+	for i := range 2 {
+		bad := slices.Clone(ls)
+		bad[i].MaxConnections = 0
+		if err := checkListenerLimits(cfg.MaxConnections, bad); err == nil {
+			t.Errorf("listener %s without a limit was taken", bad[i].Name)
+		}
+	}
+	cfg.MaxClientFlows = cfg.MaxConnections
+	if err := run(context.Background(), runtimetest.New(t, "pcscf").Runtime, cfg, deps{}); err == nil || !strings.Contains(err.Error(), "exceed") {
+		t.Errorf("run with limits past the total: %v", err)
+	}
+}
+
+// The sweep exports the listeners' connections, and the PROXY headers that
+// timed out, were malformed or never started since the last sweep, as EMF
+// metrics; a UDP listener has no gauge (#193).
+func TestTheTransportsListenerMetricsAreExported(t *testing.T) {
+	var out strings.Builder
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	m := runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, slog.New(slog.DiscardHandler))
+	var tm transportMetrics
+	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 7, "core": 2}, ProxyHeaderTimeouts: 3, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5})
+	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 9, "core": 2}, ProxyHeaderTimeouts: 4, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5})
+	m.Flush()
+	for _, want := range []string{`"transport.listener_connections.client":9`, `"transport.listener_connections.core":2`,
+		`"transport.proxy_header_timeouts":4`, `"transport.proxy_header_errors":1`, `"transport.proxy_header_empty":5`} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("metrics lack %s:\n%s", want, out.String())
+		}
+	}
+	tm.record(nil, transport.Stats{})
+
+	// run exports the transport's own on its sweep.
+	h := runtimetest.New(t, "pcscf")
+	cfg := testConfig()
+	cfg.ClientUDPAddr = "127.0.0.1:0"
+	s := startWith(t, h, cfg, deps{sweep: 5 * time.Millisecond})
+	dial(t, s.client, nil)
+	deadline := time.Now().Add(waitFor)
+	for !slices.Contains(h.MetricValues("transport.listener_connections.client"), 1) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no listener gauge:\n%s", h.Output())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.Contains(h.Output(), "client-udp") {
+		t.Errorf("a UDP listener has a gauge:\n%s", h.Output())
 	}
 }
 

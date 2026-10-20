@@ -182,7 +182,7 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 		return err
 	}
 	e.countDeviations(m.CPIM.Deviations())
-	if !namesSender(m.From.URI, o.Sender, o.Identities) {
+	if !namesSender(m.From.URI, o.Sender, o.Identities, e.cfg.HomeDomain) {
 		return reject(ReasonFromMismatch, nil)
 	}
 	now := e.clock.Now()
@@ -388,7 +388,7 @@ func (e *Engine) submitGroupNotification(ctx context.Context, h GroupHandler, o 
 	switch {
 	case !slices.Contains(sent.Recipients, o.Sender):
 		return reject(ReasonIMDNForged, nil)
-	case n.RecipientURI != "" && !namesSender(n.RecipientURI, o.Sender, o.Identities):
+	case n.RecipientURI != "" && !namesSender(n.RecipientURI, o.Sender, o.Identities, e.cfg.HomeDomain):
 		return reject(ReasonIMDNForged, nil)
 	case !sent.Dispositions.Wants(n.Kind, n.Status):
 		return reject(ReasonIMDNNotRequested, nil)

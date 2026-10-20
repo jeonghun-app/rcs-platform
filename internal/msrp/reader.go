@@ -70,6 +70,20 @@ func framing(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrFraming, fmt.Sprintf(format, args...))
 }
 
+// truncated is the framing error of a stream that ended inside a message,
+// where. It is ErrFraming, and only that: a body cut off must stay an error
+// to whoever reads it (a relay forwarding chunks would otherwise take the
+// cut for the message's end). The connection's reader tells it apart with
+// errors.As, to let the peer, which has stopped sending, read what it is
+// owed (#240).
+type truncated string
+
+func (where truncated) Error() string {
+	return ErrFraming.Error() + ": stream ended inside " + string(where)
+}
+
+func (truncated) Is(target error) bool { return target == ErrFraming }
+
 // ReadHeader reads the start line and header section of the next message,
 // first skipping whatever is left of the previous body. For a message with
 // a body it stops before the body, which is then read through Body or
@@ -98,7 +112,7 @@ func (r *Reader) ReadHeader() (*Message, error) {
 	for {
 		line, err := r.readLine(&budget)
 		if errors.Is(err, io.EOF) {
-			return nil, framing("stream ended inside the header section")
+			return nil, truncated("the header section")
 		}
 		if err != nil {
 			return nil, err
@@ -252,7 +266,7 @@ func (r *Reader) readLine(budget *int) (string, error) {
 			if len(line) == 0 {
 				return "", io.EOF
 			}
-			return "", framing("stream ended inside a line")
+			return "", truncated("a line")
 		}
 		return "", err
 	}
@@ -538,7 +552,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 
 func (b *bodyReader) fail(err error) {
 	if errors.Is(err, io.EOF) {
-		err = framing("stream ended inside a body")
+		err = truncated("a body")
 	}
 	b.err = err
 }

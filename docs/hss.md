@@ -227,6 +227,12 @@ triggers until an operator updates it through the API. No deployment had one.
 
 ### Writing iFC
 
+Every trigger that sends requests to `rcs-as` needs the condition that the
+request has no `P-Served-User`, in a group of its own, as in the default
+profile. Without it, the requests `rcs-as` sends for its users come back to it:
+`rcs-as` refuses them with 482 and counts `sip.loop`, and those users' messages
+are not delivered.
+
 Criteria are JSON in the provisioning API (field names follow the TS 29.228 XML
 schema). Patterns are POSIX extended regular expressions (TS 29.228 Annex F). A
 header *name* pattern must match the whole header name, in any case (`Contact`

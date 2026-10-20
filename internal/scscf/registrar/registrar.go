@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -39,6 +40,17 @@ const (
 	DefaultMinExpires        = 5 * time.Minute
 	DefaultMaxExpires        = 2 * time.Hour
 	DefaultChallengeLifetime = 4 * time.Minute
+	DefaultChallengeLimit    = 10
+	DefaultChallengeWindow   = time.Minute
+	// A flow's budget is small: a UE's first registration needs one
+	// challenge, or two with a stale nonce; an AUTS over the same flow
+	// costs it nothing more, and a challenge whose MAR never reached the
+	// HSS is given back. A registered UE's flow, while
+	// it stays on it, gets more, for the refreshes it shares with no one; a
+	// reconnection comes over a new flow and counts as any other.
+	DefaultFlowChallengeLimit           = 3
+	DefaultRegisteredFlowChallengeLimit = 6
+	DefaultResyncLimit                  = 3
 )
 
 // Config configures a Registrar.
@@ -68,6 +80,20 @@ type Config struct {
 	// ChallengeLifetime is how long a 401's challenge can be answered; at most
 	// state.MaxChallengeLifetime.
 	ChallengeLifetime time.Duration
+	// ChallengeLimit bounds the challenges that one IMPI gets in a
+	// ChallengeWindow, counted by every instance together, over every flow
+	// but its registered UE's; FlowChallengeLimit bounds those of one P-CSCF
+	// flow, and RegisteredFlowChallengeLimit those of a flow a live binding
+	// came over, which count in nothing else. Past a limit a REGISTER is
+	// answered 500 with Retry-After, without a MAR, so that a flood of
+	// REGISTERs for one subscriber cannot starve the subscriber's own MAR
+	// behind the HSS's lock on it, nor use up its registered UE's budget
+	// (#201, limits.go).
+	ChallengeLimit, FlowChallengeLimit, RegisteredFlowChallengeLimit int
+	ChallengeWindow                                                  time.Duration
+	// ResyncLimit bounds the resynchronisations of one IMPI in a
+	// ChallengeLifetime, those of its registered UE's flow apart.
+	ResyncLimit int
 	// TrustIntegrityProtected lets a re-registration whose Authorization
 	// carries integrity-protected="tls-yes" go without a challenge (TS 24.229
 	// §5.4.1.2.1). It needs a P-CSCF that sets the parameter itself, for a
@@ -91,6 +117,10 @@ type Registrar struct {
 	digest *digest.Server
 	ids    sip.IDGenerator
 	log    *slog.Logger
+	// notes are the attempt counts this instance saw over their limit.
+	notes limitNotes
+	// countLogged is when quietInternal last logged, in Unix ns.
+	countLogged atomic.Int64
 }
 
 // New validates cfg and returns a Registrar.
@@ -124,6 +154,21 @@ func New(cfg Config) (*Registrar, error) {
 	}
 	if cfg.ChallengeLifetime == 0 {
 		cfg.ChallengeLifetime = DefaultChallengeLifetime
+	}
+	if cfg.ChallengeLimit <= 0 {
+		cfg.ChallengeLimit = DefaultChallengeLimit
+	}
+	if cfg.ChallengeWindow <= 0 {
+		cfg.ChallengeWindow = DefaultChallengeWindow
+	}
+	if cfg.FlowChallengeLimit <= 0 {
+		cfg.FlowChallengeLimit = DefaultFlowChallengeLimit
+	}
+	if cfg.RegisteredFlowChallengeLimit <= 0 {
+		cfg.RegisteredFlowChallengeLimit = DefaultRegisteredFlowChallengeLimit
+	}
+	if cfg.ResyncLimit <= 0 {
+		cfg.ResyncLimit = DefaultResyncLimit
 	}
 	switch {
 	case cfg.MinExpires > cfg.MaxExpires || cfg.DefaultExpires < cfg.MinExpires || cfg.DefaultExpires > cfg.MaxExpires:
