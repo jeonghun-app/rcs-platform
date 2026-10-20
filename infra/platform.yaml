@@ -13,7 +13,7 @@ Metadata:
       - Label: { default: Stage }
         Parameters: [Environment]
       - Label: { default: Network }
-        Parameters: [VpcCidr, NatGateways, ServiceNamespace, PublicIngressCidr]
+        Parameters: [VpcCidr, NatGateways, InterfaceEndpoints, ServiceNamespace, PublicIngressCidr]
       - Label: { default: Load balancers }
         Parameters:
           - AlbCertificateArn
@@ -22,10 +22,21 @@ Metadata:
           - FtDeregistrationDelay
           - PcscfEnabled
           - ScscfEnabled
+          - IcscfEnabled
           - WafRateLimit
           - WafRateAction
       - Label: { default: Release }
-        Parameters: [EcrStackName, ImageTag, ImageDigest, AcsImageTag, AcsImageDigest]
+        Parameters:
+          - EcrStackName
+          - ImageTag
+          - ImageDigest
+          - AcsImageTag
+          - AcsImageDigest
+          - S3PrefixListId
+          - DynamoDbPrefixListId
+          - TemplateRevision
+          - PreviousImageTag
+          - DeployPrincipalArn
       - Label: { default: Identity }
         Parameters: [ImsDomain, FtRealm, AcsHostName, RelayPublicHost]
       - Label: { default: Services }
@@ -87,6 +98,17 @@ Parameters:
       per-az keeps task egress (image pulls, AWS APIs) up when one AZ fails;
       single saves one NAT gateway's hourly charge for dev and test stacks.
 
+  InterfaceEndpoints:
+    Type: String
+    Default: auto
+    AllowedValues: [auto, 'true', 'false']
+    Description: >
+      Interface endpoints for the AWS APIs tasks call (logs, ECR, Secrets
+      Manager, KMS, Cloud Map), so they work without the NAT gateways and
+      ft-server can be held to its own few destinations. auto means true
+      outside dev; false (dev only) sends them through NAT, and ft-server
+      then also needs HTTPS to the internet.
+
   ServiceNamespace:
     Type: String
     Default: rcs.local
@@ -135,6 +157,12 @@ Parameters:
       Seconds a stopping ft-server task keeps receiving in-flight requests
       from the ALB: long enough for most uploads to finish in place
       (docs/ft-server.md, Operations notes).
+
+  IcscfEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Creates what needs icscf to exist, for now its alarms.
 
   ScscfEnabled:
     Type: String
@@ -214,6 +242,36 @@ Parameters:
     Type: String
     AllowedPattern: '^sha256:[0-9a-f]{64}$'
     Description: Digest of the acs image in ECR (deploy.sh sets it to the pinned ACS_DIGEST).
+
+  # Set by deploy.sh: CloudFormation cannot look up the regional prefix
+  # lists of the gateway endpoints.
+  S3PrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    Description: Managed prefix list com.amazonaws.<region>.s3 (deploy.sh looks it up).
+  DynamoDbPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    Description: Managed prefix list com.amazonaws.<region>.dynamodb (deploy.sh looks it up).
+
+  # Recorded by deploy.sh in the outputs, for rollback and audit; they change
+  # no resource.
+  TemplateRevision:
+    Type: String
+    Default: unknown
+    Description: git describe of the commit the template was deployed from.
+  DeployPrincipalArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:(iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+$'
+    Description: >
+      The IAM role or user deploying the stack (deploy.sh sets it from the
+      caller's identity); the S-CSCF key lets it create and restore the
+      tables, and nothing else.
+
+  PreviousImageTag:
+    Type: String
+    Default: none
+    Description: The platform image tag the stack ran before this deployment's ImageTag.
 
   ImsDomain:
     Type: String
@@ -325,12 +383,13 @@ Parameters:
     Description: >
       Warm read throughput of the subscribers table (units per second), for
       the re-registration burst after an outage (docs/runbook.md, Re-registration
-      burst sizing). Raising it is charged once.
+      burst sizing). Raising it is charged once and cannot be undone: never
+      lower it in the config, or the deployment fails.
   SubscribersWarmWriteUnits:
     Type: Number
     Default: 4000
     MinValue: 4000
-    Description: Warm write throughput of the subscribers table (units per second).
+    Description: Warm write throughput of the subscribers table (units per second). It can be raised, never lowered.
 
   MsrpWarmReadUnits:
     Type: Number
@@ -338,12 +397,13 @@ Parameters:
     MinValue: 12000
     Description: >
       Warm read throughput of msrp-bindings (units per second), so the burst
-      of re-INVITEs after relay tasks stop is not throttled (#54).
+      of re-INVITEs after relay tasks stop is not throttled (#54). It can be
+      raised, never lowered.
   MsrpWarmWriteUnits:
     Type: Number
     Default: 4000
     MinValue: 4000
-    Description: Warm write throughput of msrp-bindings (units per second).
+    Description: Warm write throughput of msrp-bindings (units per second). It can be raised, never lowered.
   MsrpReadBudget:
     Type: Number
     Default: 1000
@@ -386,15 +446,16 @@ Parameters:
 
   MonthlyBudgetUsd:
     Type: Number
-    Default: 600
+    Default: 800
     MinValue: 0
     Description: >
       Cost budget of the account per month, in USD; notifications at 80% and
       100% go to the alarm topic. 0 creates no budget. It covers the whole
-      account, so deploy into an account of its own (docs/aws-deployment.md#cost).
+      account: one stack per account (docs/aws-deployment.md#cost), and if
+      several share one anyway, only one of them sets a budget.
   DailyBudgetUsd:
     Type: Number
-    Default: 25
+    Default: 35
     MinValue: 0
     Description: Cost budget of the account per day, in USD, notified like the monthly one. 0 creates none.
 
@@ -436,6 +497,14 @@ Mappings:
     2048x4096: { Cpu: '2048', Memory: '4096', GoMemLimit: 3480MiB }
 
 Rules:
+  EndpointsOutsideDev:
+    RuleCondition: !Not [!Equals [!Ref Environment, dev]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref InterfaceEndpoints, 'false']]
+        AssertDescription: >
+          staging and prod need the interface endpoints: without them
+          ft-server needs HTTPS to the internet (#105).
+
   ProductionNeedsTls:
     RuleCondition: !Not [!Equals [!Ref Environment, dev]]
     Assertions:
@@ -489,12 +558,19 @@ Conditions:
   HasFtHostName: !Not [!Equals [!Ref FtHostName, '']]
   WithPcscf: !Equals [!Ref PcscfEnabled, 'true']
   WithScscf: !Equals [!Ref ScscfEnabled, 'true']
+  WithIcscf: !Equals [!Ref IcscfEnabled, 'true']
   WithPcscfTls: !And [!Condition WithPcscf, !Condition HasNlbCertificate]
   # ADR 0003: plain SIP and MSRP are refused outside dev.
   WithPcscfPlain: !And [!Condition WithPcscf, !Condition IsDev]
   WafBlocks: !Equals [!Ref WafRateAction, block]
 
   CreateAlarmTopic: !Equals [!Ref AlarmTopicArn, '']
+  WithInterfaceEndpoints: !Or
+    - !Equals [!Ref InterfaceEndpoints, 'true']
+    - !And [!Equals [!Ref InterfaceEndpoints, auto], !Condition IsProduction]
+  NoInterfaceEndpoints: !Not [!Condition WithInterfaceEndpoints]
+  WithEumEndpoint: !And [!Condition WithInterfaceEndpoints, !Condition UseAcsEum]
+  WithSnsEndpoint: !And [!Condition WithInterfaceEndpoints, !Condition UseAcsSns]
   HasMonthlyBudget: !Not [!Equals [!Ref MonthlyBudgetUsd, '0']]
   HasDailyBudget: !Not [!Equals [!Ref DailyBudgetUsd, '0']]
   HasRelayPublicHost: !Not [!Equals [!Ref RelayPublicHost, '']]
@@ -683,6 +759,145 @@ Resources:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
       RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
 
+  # Interface endpoints (InterfaceEndpoints): the APIs tasks call, kept off
+  # the NAT gateways, so they keep working when NAT or an AZ's egress fails
+  # (data-servicediscovery is how the CSCFs find the HSS, #89), and so
+  # ft-server's egress can be held to the HSS, S3, DynamoDB and these (#105).
+  # Private DNS sends every task's calls here, so every task group may reach
+  # them.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: WithInterfaceEndpoints
+    Properties:
+      GroupDescription: Interface endpoints - HTTPS from the platform tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: 'no default egress' }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-endpoints' }]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.kms'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  ServiceDiscoveryEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.servicediscovery'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  DataServiceDiscoveryEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithInterfaceEndpoints
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.data-servicediscovery'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # acs's SMS provider, so that acs too needs no internet egress: End User
+  # Messaging SMS (pinpoint-sms-voice-v2) or SNS, whichever it uses.
+  SmsVoiceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithEumEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.pinpoint-sms-voice-v2'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SnsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: WithSnsEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # The public subnets' network ACL: allow everything at rule 1000, and keep
+  # rules 1-999 free for the deny entries docs/runbook.md#blocking-a-source
+  # adds by hand. Security groups cannot deny, and AWS WAF cannot sit on an
+  # NLB, so this is the one place to turn a source away from SIP and MSRP.
+  PublicNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public' }]
+  PublicAclInbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref PublicNetworkAcl, RuleNumber: 1000, Protocol: -1, RuleAction: allow, Egress: false, CidrBlock: 0.0.0.0/0 }
+  PublicAclOutbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref PublicNetworkAcl, RuleNumber: 1000, Protocol: -1, RuleAction: allow, Egress: true, CidrBlock: 0.0.0.0/0 }
+  PublicSubnetAAcl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, NetworkAclId: !Ref PublicNetworkAcl }
+  PublicSubnetBAcl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, NetworkAclId: !Ref PublicNetworkAcl }
+
   # ADR 0007 §9: VPC Flow Logs in production, so that an investigation can
   # see which task talked to what.
   FlowLogGroup:
@@ -775,7 +990,15 @@ Resources:
       GroupDescription: pcscf - client SIP from the NLB, core SIP from scscf
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-pcscf' }]
 
   IcscfSecurityGroup:
@@ -784,7 +1007,15 @@ Resources:
       GroupDescription: icscf - SIP from pcscf, rcs-as and scscf
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-icscf' }]
 
   ScscfSecurityGroup:
@@ -793,7 +1024,15 @@ Resources:
       GroupDescription: scscf - SIP from pcscf, rcs-as and icscf
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-scscf' }]
 
   RcsAsSecurityGroup:
@@ -802,7 +1041,15 @@ Resources:
       GroupDescription: rcs-as - SIP from scscf and icscf, MSRP from msrp-relay
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rcs-as' }]
 
   HssSecurityGroup:
@@ -811,7 +1058,15 @@ Resources:
       GroupDescription: hss - Cx from icscf and scscf, API from ft-server, acs and operators
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, KMS)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, KMS) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-hss' }]
 
   MsrpRelaySecurityGroup:
@@ -820,7 +1075,15 @@ Resources:
       GroupDescription: msrp-relay - MSRP from the NLB, control API from pcscf
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, DynamoDB)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, DynamoDB) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-msrp-relay' }]
 
   FtServerSecurityGroup:
@@ -828,8 +1091,18 @@ Resources:
     Properties:
       GroupDescription: ft-server - HTTP and health checks from the ALB
       VpcId: !Ref Vpc
+      # Only the HSS API (FtServerToHssApiOut), S3 and DynamoDB through their
+      # gateway endpoints, and the interface endpoints (FtServerToEndpointsOut):
+      # a wrong FT_HSS_URL or a compromised task cannot send FT_HSS_TOKEN or
+      # files anywhere else (#105, checked). Without interface endpoints
+      # (dev only) the other AWS APIs go through NAT.
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets, S3, DynamoDB)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-ft-server' }]
 
   AcsSecurityGroup:
@@ -838,7 +1111,15 @@ Resources:
       GroupDescription: acs - HTTP from the ALB
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs and SMS providers' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs and SMS providers through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-acs' }]
 
   # The operator path to the HSS API (ADR 0007 §5): attach this group to a
@@ -849,7 +1130,15 @@ Resources:
       GroupDescription: operator - may call the hss provisioning API
       VpcId: !Ref Vpc
       SecurityGroupEgress:
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets)' }
+        # With interface endpoints (staging, prod) the AWS APIs are reached
+        # only through them and the gateway endpoints; HTTPS to the internet
+        # through NAT is the dev-only fallback without them.
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: 'S3 (gateway endpoint)' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoDbPrefixListId, Description: 'DynamoDB (gateway endpoint)' }
+        - !If
+          - NoInterfaceEndpoints
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'AWS APIs (ECR, logs, secrets) through NAT (dev without interface endpoints)' }
+          - !Ref AWS::NoValue
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-operator' }]
 
   NlbSecurityGroup:
@@ -955,6 +1244,80 @@ Resources:
   AcsToHssApiOut:
     Type: AWS::EC2::SecurityGroupEgress
     Properties: { GroupId: !Ref AcsSecurityGroup, DestinationSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 8081, ToPort: 8081, Description: 'credential issue' }
+
+  # Every task group to the interface endpoints (HTTPS).
+  PcscfToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  PcscfToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref PcscfSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  IcscfToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref IcscfSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  IcscfToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref IcscfSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  ScscfToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref ScscfSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  ScscfToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref ScscfSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  RcsAsToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  RcsAsToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  HssToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref HssSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  HssToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref HssSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  MsrpRelayToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref MsrpRelaySecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  MsrpRelayToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref MsrpRelaySecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  FtServerToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref FtServerSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  FtServerToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref FtServerSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  AcsToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref AcsSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  AcsToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref AcsSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  OperatorToEndpoints:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref EndpointSecurityGroup, SourceSecurityGroupId: !Ref OperatorSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
+  OperatorToEndpointsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithInterfaceEndpoints
+    Properties: { GroupId: !Ref OperatorSecurityGroup, DestinationSecurityGroupId: !Ref EndpointSecurityGroup, IpProtocol: tcp, FromPort: 443, ToPort: 443, Description: 'AWS APIs' }
 
   OperatorToHssApi:
     Type: AWS::EC2::SecurityGroupIngress
@@ -1484,7 +1847,7 @@ Resources:
   # Contact URIs, instance ids (IMEI URNs) and IMPIs that embed IMSIs, so
   # the document asks for: a customer-managed key, point-in-time recovery
   # for a stated 35 days, and the tables granted to scscf's task role only,
-  # with no Scan for anyone (check_infra.py).
+  # with no Scan for anyone (check_infra.py, SCAN_ALLOWED).
   RegistrationsTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -1509,6 +1872,9 @@ Resources:
             - { AttributeName: shard, KeyType: HASH }
             - { AttributeName: expires, KeyType: RANGE }
           Projection: { ProjectionType: KEYS_ONLY }
+      # TTL on ttl, a backstop after the expiry the sweeps act on; expires is
+      # the expiry index's sort key (#14).
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
       PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true, RecoveryPeriodInDays: 35 }
       DeletionProtectionEnabled: !If [IsProduction, true, false]
       SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref ScscfStateKey }
@@ -1562,10 +1928,11 @@ Resources:
       SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref ScscfStateKey }
       Tags: [{ Key: Service, Value: scscf }]
 
-  # Encrypts the S-CSCF tables. The account administers it; data keys are
-  # used only through DynamoDB, by principals whose IAM policies allow it
-  # (CloudFormation creating the tables, and scscf's task role), so a role
-  # that gained read access to a table would still need this key.
+  # Encrypts the S-CSCF tables. The account administers it; only two
+  # principals may use it, both only through DynamoDB: scscf's task role,
+  # named here, and the principal deploying the stack (DeployPrincipalArn,
+  # set by deploy.sh), which creates and restores the tables. A role that
+  # gained read access to a table would still be refused its data.
   ScscfStateKey:
     Type: AWS::KMS::Key
     DeletionPolicy: Retain
@@ -1580,7 +1947,7 @@ Resources:
             Effect: Allow
             Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
             Action:
-              - kms:Create*
+              - kms:CreateAlias
               - kms:Describe*
               - kms:Enable*
               - kms:List*
@@ -1595,13 +1962,24 @@ Resources:
               - kms:ScheduleKeyDeletion
               - kms:CancelKeyDeletion
             Resource: '*'
-          - Sid: UseThroughDynamoDbWhereIamAllows
+          - Sid: ScscfReadsThroughDynamoDb
+            Effect: Allow
+            Principal: { AWS: !GetAtt ScscfTaskRole.Arn }
+            Action: [kms:Encrypt, kms:Decrypt, 'kms:ReEncrypt*', 'kms:GenerateDataKey*', kms:DescribeKey]
+            Resource: '*'
+            Condition:
+              StringLike: { 'kms:ViaService': 'dynamodb.*.amazonaws.com' }
+          # Creating a table under a key needs the creator to hold these
+          # (DynamoDB developer guide, Authorizing use of your KMS key).
+          - Sid: DeployerCreatesTablesThroughDynamoDb
             Effect: Allow
             Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
             Action: [kms:Encrypt, kms:Decrypt, 'kms:ReEncrypt*', 'kms:GenerateDataKey*', kms:DescribeKey, kms:CreateGrant]
             Resource: '*'
             Condition:
-              StringEquals: { 'kms:CallerAccount': !Ref AWS::AccountId }
+              StringEquals:
+                'aws:PrincipalArn': !Ref DeployPrincipalArn
+                'kms:CallerAccount': !Ref AWS::AccountId
               StringLike: { 'kms:ViaService': 'dynamodb.*.amazonaws.com' }
           - Sid: DynamoDbDescribesTheKey
             Effect: Allow
@@ -2031,7 +2409,7 @@ Resources:
   ScscfTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: scscf tasks - the S-CSCF state tables and their key.
+      Description: scscf tasks - the S-CSCF state tables (ScscfStatePolicy) and HSS discovery.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -2041,32 +2419,77 @@ Resources:
             Condition:
               StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
       Policies:
-        - PolicyName: state
+        - PolicyName: discovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The HSS's Cx peers come from Cloud Map, every one of them
+              # (ADR 0005; a DNS answer stops at 8). The action has no
+              # resource, so the condition holds it to the hss service.
+              - Effect: Allow
+                Action: servicediscovery:DiscoverInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'servicediscovery:NamespaceName': !Ref ServiceNamespace
+                    'servicediscovery:ServiceName': hss
+
+  # A policy of its own, not inline: the tables' key names ScscfTaskRole, and
+  # the tables need the key, so a role that named the tables would close a
+  # dependency cycle. The key's policy grants the role its use; nothing here
+  # needs to.
+  ScscfStatePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref ScscfTaskRole
+      PolicyName: state
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:DescribeTable
+            Resource:
+              - !GetAtt RegistrationsTable.Arn
+              - !GetAtt AuthChallengesTable.Arn
+              - !GetAtt RegSubscriptionsTable.Arn
+          - Effect: Allow
+            Action: dynamodb:Query
+            Resource:
+              - !Sub '${RegistrationsTable.Arn}/index/impi-index'
+              - !Sub '${RegistrationsTable.Arn}/index/expiry-index'
+              - !Sub '${RegSubscriptionsTable.Arn}/index/impu-index'
+              - !Sub '${RegSubscriptionsTable.Arn}/index/expiry-index'
+
+  # icscf tasks, ready for their service block: they find the HSS like scscf.
+  IcscfTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: icscf tasks - finding the HSS's Cx peers in Cloud Map.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: discovery
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Query
-                  - dynamodb:DescribeTable
-                Resource:
-                  - !GetAtt RegistrationsTable.Arn
-                  - !GetAtt AuthChallengesTable.Arn
-                  - !GetAtt RegSubscriptionsTable.Arn
-              - Effect: Allow
-                Action: dynamodb:Query
-                Resource:
-                  - !Sub '${RegistrationsTable.Arn}/index/*'
-                  - !Sub '${RegSubscriptionsTable.Arn}/index/*'
-              - Effect: Allow
-                Action: [kms:Encrypt, kms:Decrypt, 'kms:ReEncrypt*', 'kms:GenerateDataKey*', kms:DescribeKey]
-                Resource: !GetAtt ScscfStateKey.Arn
+                Action: servicediscovery:DiscoverInstances
+                Resource: '*'
                 Condition:
-                  StringLike: { 'kms:ViaService': 'dynamodb.*.amazonaws.com' }
+                  StringEquals:
+                    'servicediscovery:NamespaceName': !Ref ServiceNamespace
+                    'servicediscovery:ServiceName': hss
 
   # rcs-as tasks, ready for the service block of #69: the actions
   # docs/rcs-as.md lists. A transaction has no IAM action of its own; each
@@ -2095,6 +2518,10 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
+                  # Group receipt summaries check a condition inside a
+                  # transaction (#182); the groupchats table gets it too
+                  # when it is added (#118).
+                  - dynamodb:ConditionCheckItem
                   - dynamodb:Query
                   - dynamodb:DescribeTable
                 Resource: !GetAtt MessagesTable.Arn
@@ -2610,6 +3037,16 @@ Resources:
             Resource: '*'
             Condition:
               StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+
+  # One dashboard per stack: the golden signals of each service (traffic,
+  # errors, latency, saturation) beside the load balancers and tables, so the
+  # runbook's checks start from one page (operations review). Three are free
+  # per account, then $3 a month each.
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}'
+      DashboardBody: !Sub '{"widgets":[{"type":"metric","x":0,"y":0,"width":8,"height":6,"properties":{"title":"ALB requests and 5xx","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Alb.LoadBalancerFullName}"],[".","HTTPCode_ELB_5XX_Count",".","."],[".","HTTPCode_Target_5XX_Count",".","."]]}},{"type":"metric","x":8,"y":0,"width":8,"height":6,"properties":{"title":"ALB target response time (p99)","region":"${AWS::Region}","stat":"p99","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","TargetResponseTime","TargetGroup","${AcsTargetGroup.TargetGroupFullName}","LoadBalancer","${Alb.LoadBalancerFullName}"],["...","${FtServerTargetGroup.TargetGroupFullName}",".","."]]}},{"type":"metric","x":16,"y":0,"width":8,"height":6,"properties":{"title":"Healthy targets","region":"${AWS::Region}","stat":"Minimum","period":60,"view":"timeSeries","metrics":[["AWS/ApplicationELB","HealthyHostCount","TargetGroup","${AcsTargetGroup.TargetGroupFullName}","LoadBalancer","${Alb.LoadBalancerFullName}"],["...","${FtServerTargetGroup.TargetGroupFullName}",".","."],["AWS/NetworkELB","HealthyHostCount","TargetGroup","${RelayMsrpTargetGroup.TargetGroupFullName}","LoadBalancer","${Nlb.LoadBalancerFullName}"]]}},{"type":"metric","x":0,"y":6,"width":8,"height":6,"properties":{"title":"ECS CPU (%)","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["AWS/ECS","CPUUtilization","ClusterName","${Cluster}","ServiceName","hss"],["AWS/ECS","CPUUtilization","ClusterName","${Cluster}","ServiceName","ft-server"],["AWS/ECS","CPUUtilization","ClusterName","${Cluster}","ServiceName","msrp-relay"],["AWS/ECS","CPUUtilization","ClusterName","${Cluster}","ServiceName","acs"]]}},{"type":"metric","x":8,"y":6,"width":8,"height":6,"properties":{"title":"ECS memory (%)","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["AWS/ECS","MemoryUtilization","ClusterName","${Cluster}","ServiceName","hss"],["AWS/ECS","MemoryUtilization","ClusterName","${Cluster}","ServiceName","ft-server"],["AWS/ECS","MemoryUtilization","ClusterName","${Cluster}","ServiceName","msrp-relay"],["AWS/ECS","MemoryUtilization","ClusterName","${Cluster}","ServiceName","acs"]]}},{"type":"metric","x":16,"y":6,"width":8,"height":6,"properties":{"title":"NLB flows","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/NetworkELB","ActiveFlowCount","LoadBalancer","${Nlb.LoadBalancerFullName}"],[".","NewFlowCount",".","."],[".","TCP_Client_Reset_Count",".","."]]}},{"type":"metric","x":0,"y":12,"width":8,"height":6,"properties":{"title":"hss Cx latency (max, ms)","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","cx.mar","Service","hss"],[".","cx.sar",".","."]]}},{"type":"metric","x":8,"y":12,"width":8,"height":6,"properties":{"title":"hss errors","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","cx.mar.error","Service","hss"],["RCS/${AWS::StackName}","cx.sar.error","Service","hss"],["RCS/${AWS::StackName}","api.store_failure","Service","hss"],["RCS/${AWS::StackName}","lock.busy","Service","hss"]]}},{"type":"metric","x":16,"y":12,"width":8,"height":6,"properties":{"title":"ft-server traffic and refusals","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","upload.completed","Service","ft-server"],["RCS/${AWS::StackName}","download.served","Service","ft-server"],["RCS/${AWS::StackName}","upload.failed.busy","Service","ft-server"],["RCS/${AWS::StackName}","download.failed.busy","Service","ft-server"],["RCS/${AWS::StackName}","auth.backend_error","Service","ft-server"]]}},{"type":"metric","x":0,"y":18,"width":8,"height":6,"properties":{"title":"msrp-relay connections (max)","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","ClientConnections","Service","msrp-relay"],[".","ActiveBridges",".","."]]}},{"type":"metric","x":8,"y":18,"width":8,"height":6,"properties":{"title":"msrp-relay errors and refusals","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","StoreErrors","Service","msrp-relay"],["RCS/${AWS::StackName}","Refused.BindOverload","Service","msrp-relay"],["RCS/${AWS::StackName}","Refused.CoreUnreachable","Service","msrp-relay"],["RCS/${AWS::StackName}","Refused.AlreadyClaimed","Service","msrp-relay"]]}},{"type":"metric","x":16,"y":18,"width":8,"height":6,"properties":{"title":"DynamoDB throttles","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/DynamoDB","ThrottledRequests","TableName","${SubscribersTable}","Operation","GetItem"],["AWS/DynamoDB","ThrottledRequests","TableName","${MsrpBindingsTable}","Operation","GetItem"],["AWS/DynamoDB","ThrottledRequests","TableName","${FilesTable}","Operation","PutItem"],["AWS/DynamoDB","ThrottledRequests","TableName","${AcsTable}","Operation","Query"]]}},{"type":"metric","x":0,"y":24,"width":8,"height":6,"properties":{"title":"SIP server transactions rejected","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","ServerTransactionsRejected","Service","pcscf"],["RCS/${AWS::StackName}","ServerTransactionsRejected","Service","icscf"],["RCS/${AWS::StackName}","ServerTransactionsRejected","Service","scscf"]]}},{"type":"metric","x":8,"y":24,"width":8,"height":6,"properties":{"title":"SIP server transaction bytes (max)","region":"${AWS::Region}","stat":"Maximum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","ServerTransactionBytes","Service","pcscf"],["RCS/${AWS::StackName}","ServerTransactionBytes","Service","icscf"],["RCS/${AWS::StackName}","ServerTransactionBytes","Service","scscf"]]}},{"type":"metric","x":16,"y":24,"width":8,"height":6,"properties":{"title":"SIP refusal ACKs absorbed","region":"${AWS::Region}","stat":"Sum","period":60,"view":"timeSeries","metrics":[["RCS/${AWS::StackName}","RefusalAcksAbsorbed","Service","pcscf"],["RCS/${AWS::StackName}","RefusalAcksAbsorbed","Service","icscf"],["RCS/${AWS::StackName}","RefusalAcksAbsorbed","Service","scscf"]]}}]}'
 
   AlarmTopic:
     Type: AWS::SNS::Topic
@@ -3343,12 +3780,13 @@ Resources:
             Period: 3600
             Stat: Sum
   # A line CloudWatch cannot extract loses a whole minute of that metric,
-  # and every alarm on it goes quiet (docs/architecture.md §8).
-  EmfErrors:
+  # and every alarm on it goes quiet (docs/architecture.md §8). One alarm per
+  # log group: a metric math alarm takes at most 10 metrics.
+  EmfErrorsHss:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub '${AWS::StackName}-EmfErrors'
-      AlarmDescription: 'CloudWatch could not extract metrics from service log lines. See docs/runbook.md#emferrors.'
+      AlarmName: !Sub '${AWS::StackName}-EmfErrorsHss'
+      AlarmDescription: 'CloudWatch could not extract metrics from hss log lines. See docs/runbook.md#emferrorshss.'
       AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       ComparisonOperator: GreaterThanThreshold
@@ -3357,7 +3795,7 @@ Resources:
       DatapointsToAlarm: 1
       TreatMissingData: notBreaching
       Metrics:
-        - Id: hssv
+        - Id: invalid
           ReturnData: false
           MetricStat:
             Metric:
@@ -3366,7 +3804,7 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref HssLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: hssp
+        - Id: unparsed
           ReturnData: false
           MetricStat:
             Metric:
@@ -3375,7 +3813,24 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref HssLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: ftv
+        - Id: total
+          Expression: 'FILL(invalid, 0) + FILL(unparsed, 0)'
+          Label: EmfErrorsHss
+          ReturnData: true
+  EmfErrorsFtServer:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-EmfErrorsFtServer'
+      AlarmDescription: 'CloudWatch could not extract metrics from ft-server log lines. See docs/runbook.md#emferrorsftserver.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: invalid
           ReturnData: false
           MetricStat:
             Metric:
@@ -3384,7 +3839,7 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref FtServerLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: ftp
+        - Id: unparsed
           ReturnData: false
           MetricStat:
             Metric:
@@ -3393,7 +3848,24 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref FtServerLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: relayv
+        - Id: total
+          Expression: 'FILL(invalid, 0) + FILL(unparsed, 0)'
+          Label: EmfErrorsFtServer
+          ReturnData: true
+  EmfErrorsRelay:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-EmfErrorsRelay'
+      AlarmDescription: 'CloudWatch could not extract metrics from msrp-relay log lines. See docs/runbook.md#emferrorsrelay.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: invalid
           ReturnData: false
           MetricStat:
             Metric:
@@ -3402,7 +3874,7 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref RelayLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: relayp
+        - Id: unparsed
           ReturnData: false
           MetricStat:
             Metric:
@@ -3411,7 +3883,24 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref RelayLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: acsv
+        - Id: total
+          Expression: 'FILL(invalid, 0) + FILL(unparsed, 0)'
+          Label: EmfErrorsRelay
+          ReturnData: true
+  EmfErrorsAcs:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-EmfErrorsAcs'
+      AlarmDescription: 'CloudWatch could not extract metrics from acs log lines. See docs/runbook.md#emferrorsacs.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: invalid
           ReturnData: false
           MetricStat:
             Metric:
@@ -3420,7 +3909,7 @@ Resources:
               Dimensions: [{ Name: LogGroupName, Value: !Ref AcsLogGroup }]
             Period: 300
             Stat: Sum
-        - Id: acsp
+        - Id: unparsed
           ReturnData: false
           MetricStat:
             Metric:
@@ -3430,8 +3919,8 @@ Resources:
             Period: 300
             Stat: Sum
         - Id: total
-          Expression: 'FILL(hssv, 0) + FILL(hssp, 0) + FILL(ftv, 0) + FILL(ftp, 0) + FILL(relayv, 0) + FILL(relayp, 0) + FILL(acsv, 0) + FILL(acsp, 0)'
-          Label: EmfErrors
+          Expression: 'FILL(invalid, 0) + FILL(unparsed, 0)'
+          Label: EmfErrorsAcs
           ReturnData: true
   AcsTarget5xx:
     Type: AWS::CloudWatch::Alarm
@@ -4057,8 +4546,52 @@ Resources:
               Dimensions: [{ Name: TableName, Value: !Ref RegistrationsTable }]
             Period: 60
             Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegistrationsTable }
+                - { Name: GlobalSecondaryIndexName, Value: impi-index }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegistrationsTable }
+                - { Name: GlobalSecondaryIndexName, Value: impi-index }
+            Period: 60
+            Stat: Sum
+        - Id: gr1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegistrationsTable }
+                - { Name: GlobalSecondaryIndexName, Value: expiry-index }
+            Period: 60
+            Stat: Sum
+        - Id: gw1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegistrationsTable }
+                - { Name: GlobalSecondaryIndexName, Value: expiry-index }
+            Period: 60
+            Stat: Sum
         - Id: total
-          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0) + FILL(gr1, 0) + FILL(gw1, 0)'
           Label: RegistrationsThrottled
           ReturnData: true
   AuthChallengesThrottled:
@@ -4127,8 +4660,52 @@ Resources:
               Dimensions: [{ Name: TableName, Value: !Ref RegSubscriptionsTable }]
             Period: 60
             Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegSubscriptionsTable }
+                - { Name: GlobalSecondaryIndexName, Value: impu-index }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegSubscriptionsTable }
+                - { Name: GlobalSecondaryIndexName, Value: impu-index }
+            Period: 60
+            Stat: Sum
+        - Id: gr1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegSubscriptionsTable }
+                - { Name: GlobalSecondaryIndexName, Value: expiry-index }
+            Period: 60
+            Stat: Sum
+        - Id: gw1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref RegSubscriptionsTable }
+                - { Name: GlobalSecondaryIndexName, Value: expiry-index }
+            Period: 60
+            Stat: Sum
         - Id: total
-          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0) + FILL(gr1, 0) + FILL(gw1, 0)'
           Label: RegSubscriptionsThrottled
           ReturnData: true
   MessagesThrottled:
@@ -4162,8 +4739,30 @@ Resources:
               Dimensions: [{ Name: TableName, Value: !Ref MessagesTable }]
             Period: 60
             Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref MessagesTable }
+                - { Name: GlobalSecondaryIndexName, Value: expiry }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref MessagesTable }
+                - { Name: GlobalSecondaryIndexName, Value: expiry }
+            Period: 60
+            Stat: Sum
         - Id: total
-          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0)'
           Label: MessagesThrottled
           ReturnData: true
   # pcscf (#16) on internal/sip/transport (#35): the queued output of all
@@ -4208,8 +4807,142 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # The SIP transaction layer (#37): the server-transaction cap was hit, so
+  # requests were answered 503 instead of being processed.
+  PcscfTransactionsRejected:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithPcscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-PcscfTransactionsRejected'
+      AlarmDescription: 'pcscf refused requests at its server-transaction cap. See docs/runbook.md#pcscftransactionsrejected.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ServerTransactionsRejected
+      Dimensions: [{ Name: Service, Value: pcscf }]
+      Statistic: Sum
+      Period: 60
+  IcscfTransactionsRejected:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithIcscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-IcscfTransactionsRejected'
+      AlarmDescription: 'icscf refused requests at its server-transaction cap. See docs/runbook.md#icscftransactionsrejected.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ServerTransactionsRejected
+      Dimensions: [{ Name: Service, Value: icscf }]
+      Statistic: Sum
+      Period: 60
+  ScscfTransactionsRejected:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithScscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ScscfTransactionsRejected'
+      AlarmDescription: 'scscf refused requests at its server-transaction cap. See docs/runbook.md#scscftransactionsrejected.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ServerTransactionsRejected
+      Dimensions: [{ Name: Service, Value: scscf }]
+      Statistic: Sum
+      Period: 60
+  # ServerTransactionBytes is a gauge of the memory live server transactions
+  # hold (#170); above 80% of MaxServerTransactionBytes (256 MiB by default)
+  # the cap is near.
+  PcscfTransactionBytes:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithPcscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-PcscfTransactionBytes'
+      AlarmDescription: 'pcscf server transactions hold over 80% of MaxServerTransactionBytes. See docs/runbook.md#pcscftransactionbytes.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 214748365
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: missing
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ServerTransactionBytes
+      Dimensions: [{ Name: Service, Value: pcscf }]
+      Statistic: Maximum
+      Period: 60
+  IcscfTransactionBytes:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithIcscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-IcscfTransactionBytes'
+      AlarmDescription: 'icscf server transactions hold over 80% of MaxServerTransactionBytes. See docs/runbook.md#icscftransactionbytes.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 214748365
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: missing
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ServerTransactionBytes
+      Dimensions: [{ Name: Service, Value: icscf }]
+      Statistic: Maximum
+      Period: 60
+  ScscfTransactionBytes:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithScscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ScscfTransactionBytes'
+      AlarmDescription: 'scscf server transactions hold over 80% of MaxServerTransactionBytes. See docs/runbook.md#scscftransactionbytes.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 214748365
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: missing
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ServerTransactionBytes
+      Dimensions: [{ Name: Service, Value: scscf }]
+      Statistic: Maximum
+      Period: 60
+  # An operator profile whose iFC evaluation exceeds its work budget (#14).
+  ScscfIfcBudgetExceeded:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithScscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ScscfIfcBudgetExceeded'
+      AlarmDescription: 'An iFC profile is too expensive to evaluate within budget. See docs/runbook.md#scscfifcbudgetexceeded.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ifc.budget_exceeded
+      Dimensions: [{ Name: Service, Value: scscf }]
+      Statistic: Sum
+      Period: 300
+
   # ClientConnections is a gauge the relay writes every interval; use its
-  # Maximum. Its name may change with the gauge support of #82.
+  # Maximum. No FILL: with every relay task gone the alarm must see missing
+  # data, not a filled zero.
   RelayConnectionsNearLimit:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -4233,7 +4966,7 @@ Resources:
             Period: 300
             Stat: Maximum
         - Id: share
-          Expression: !Sub 'FILL(conns, 0) / ${RelayMaxConnections}'
+          Expression: !Sub 'conns / ${RelayMaxConnections}'
           Label: RelayConnectionsNearLimit
           ReturnData: true
 
@@ -4334,6 +5067,8 @@ Resources:
       Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
 
   # Cost alarms (handbook: 80% and 100% of a daily and a monthly budget).
+  # No BudgetName: a change of subscribers replaces a budget, and a fixed
+  # name would make the new one collide with the old.
   # Each has a section in docs/runbook.md. The budgets see the whole account:
   # filtering on a tag needs a cost allocation tag activated by hand, and a
   # budget that silently sees nothing is worse than one that sees too much.
@@ -4342,7 +5077,6 @@ Resources:
     Condition: HasMonthlyBudget
     Properties:
       Budget:
-        BudgetName: !Sub '${AWS::StackName}-monthly'
         BudgetType: COST
         TimeUnit: MONTHLY
         BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
@@ -4356,7 +5090,6 @@ Resources:
     Condition: HasDailyBudget
     Properties:
       Budget:
-        BudgetName: !Sub '${AWS::StackName}-daily'
         BudgetType: COST
         TimeUnit: DAILY
         BudgetLimit: { Amount: !Ref DailyBudgetUsd, Unit: USD }
@@ -4434,6 +5167,9 @@ Outputs:
     Value: !Ref OperatorSecurityGroup
   FilesBucketName:
     Value: !Ref FilesBucket
+  DashboardUrl:
+    Description: The stack's CloudWatch dashboard.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}'
   AlarmTopic:
     Description: Subscribe the on-call address here (when the stack created the topic).
     Value: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
@@ -4449,3 +5185,10 @@ Outputs:
   AcsImageTag:
     Description: The acs release this stack runs (by digest AcsImageDigest).
     Value: !Ref AcsImageTag
+
+  PreviousImageTag:
+    Description: The platform image it ran before; deploy.sh offers it as the rollback.
+    Value: !Ref PreviousImageTag
+  TemplateRevision:
+    Description: git describe of the commit the template was deployed from.
+    Value: !Ref TemplateRevision

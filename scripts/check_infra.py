@@ -27,7 +27,11 @@ platform the ADRs describe:
 * every task role is granted each action its service's code calls
   (infra/task-role-actions.yaml);
 * alarms follow the EMF rules of docs/architecture.md §8: periods of 60 s or
-  more, N >= 2, explicit treatMissingData, no sampled timing statistics;
+  more, N >= 2, explicit treatMissingData, no sampled timing statistics, and
+  at most 10 metrics each;
+* with the interface endpoints on, no group sends to an address range, and
+  ft-server's egress is only the HSS API, the S3 and DynamoDB prefix lists
+  and the endpoints (#105);
 * with --runbook, every alarm links the runbook section named after it, and
   that section exists, so whoever is paged lands on what to do.
 
@@ -62,6 +66,31 @@ EXPECTED_INGRESS: dict[tuple[str, int], set[str]] = {
     ("FtServerSecurityGroup", 8081): {"AlbSecurityGroup"},
     ("FtServerSecurityGroup", 8080): {"AlbSecurityGroup"},
     ("AcsSecurityGroup", 8080): {"AlbSecurityGroup"},
+    # The interface endpoints (with InterfaceEndpoints): private DNS sends
+    # every task's AWS API calls there.
+    ("EndpointSecurityGroup", 443): {
+        "PcscfSecurityGroup", "IcscfSecurityGroup", "ScscfSecurityGroup", "RcsAsSecurityGroup", "HssSecurityGroup",
+        "MsrpRelaySecurityGroup", "FtServerSecurityGroup", "AcsSecurityGroup", "OperatorSecurityGroup",
+    },
+}
+
+# Egress to the gateway endpoints' prefix lists: ft-server's only way to S3
+# and DynamoDB, held to them (#105).
+SERVICE_GROUPS_ALL = (
+    "PcscfSecurityGroup", "IcscfSecurityGroup", "ScscfSecurityGroup", "RcsAsSecurityGroup", "HssSecurityGroup",
+    "MsrpRelaySecurityGroup", "FtServerSecurityGroup", "AcsSecurityGroup", "OperatorSecurityGroup",
+)
+ALLOWED_PREFIX_EGRESS = {
+    (group, prefix, 443) for group in SERVICE_GROUPS_ALL for prefix in ("S3PrefixListId", "DynamoDbPrefixListId")
+}
+
+# Everything ft-server may send to with the interface endpoints on (#105):
+# (kind, peer, port), kind "sg" for a group, "pl" for a prefix list.
+FT_SERVER_EGRESS = {
+    ("sg", "HssSecurityGroup", 8081),
+    ("sg", "EndpointSecurityGroup", 443),
+    ("pl", "S3PrefixListId", 443),
+    ("pl", "DynamoDbPrefixListId", 443),
 }
 
 # Internet-facing groups and the TCP ports they may admit from an address
@@ -90,6 +119,7 @@ class Rule:
     peer_group: str | None
     cidr: str | None
     other: str | None  # prefix lists, IPv6 ranges: never expected
+    prefix: str | None = None  # the prefix list parameter, for DestinationPrefixListId
 
 
 def load(path: str) -> dict:
@@ -134,6 +164,7 @@ def _rule(group: str, props: dict, peer_key: str) -> Rule:
         peer_group=logical_id(props.get(peer_key)),
         cidr=cidr,
         other=other,
+        prefix=logical_id(props.get("DestinationPrefixListId")),
     )
 
 
@@ -204,6 +235,8 @@ def check_security_groups(template: dict) -> list[str]:
     seen_egress = set()
     for r in egress:
         where = f"{r.group} egress {r.protocol} {r.from_port}-{r.to_port}"
+        if r.other == "DestinationPrefixListId" and (r.group, r.prefix, r.from_port) in ALLOWED_PREFIX_EGRESS:
+            continue
         if r.other:
             problems.append(f"{where}: {r.other} egress is not expected")
         elif r.cidr is not None:
@@ -220,6 +253,57 @@ def check_security_groups(template: dict) -> list[str]:
         problems.append(f"{src} egress to {dst} port {port} has no matching matrix entry")
     for src, dst, port in sorted(expected_egress - seen_egress):
         problems.append(f"{src} egress to {dst} port {port} is missing: the matrix entry cannot be used")
+    return problems
+
+
+def check_ft_server_egress(template: dict) -> list[str]:
+    """With the interface endpoints on, ft-server reaches only the HSS API,
+    S3 and DynamoDB through their gateway endpoints, and the endpoints (#105).
+
+    Rules that exist only without them (dev) are left out: that is the case
+    staging and prod run, which the Rules enforce.
+    """
+    group = "FtServerSecurityGroup"
+    found = set()
+    sg = resources(template, "AWS::EC2::SecurityGroup").get(group, {})
+    rules = [(p, c) for p, c in inline_rules(sg.get("Properties", {}).get("SecurityGroupEgress", []))]
+    for res in resources(template, "AWS::EC2::SecurityGroupEgress").values():
+        props = res.get("Properties", {})
+        if logical_id(props.get("GroupId")) == group:
+            rules.append((props, res.get("Condition")))
+    for props, condition in rules:
+        if condition == "NoInterfaceEndpoints":
+            continue
+        r = _rule(group, props, "DestinationSecurityGroupId")
+        if r.prefix:
+            found.add(("pl", r.prefix, r.from_port))
+        elif r.peer_group:
+            found.add(("sg", r.peer_group, r.from_port))
+        else:
+            found.add(("cidr", str(r.cidr), r.from_port))
+    problems = [f"{group}: may send to {kind} {peer} port {port}; with interface endpoints ft-server reaches only "
+                "the HSS API, S3, DynamoDB and the endpoints (#105)" for kind, peer, port in sorted(found - FT_SERVER_EGRESS)]
+    problems += [f"{group}: cannot reach {kind} {peer} port {port}" for kind, peer, port in sorted(FT_SERVER_EGRESS - found)]
+    return problems
+
+
+def check_egress_with_endpoints(template: dict) -> list[str]:
+    """With the interface endpoints on, no group sends to an address range:
+    the AWS APIs go through the endpoints and the prefix lists, everything
+    else to the peers of the matrix (lead decision on #56)."""
+    problems = []
+    groups = resources(template, "AWS::EC2::SecurityGroup")
+    for name, sg in groups.items():
+        for props, condition in inline_rules(sg.get("Properties", {}).get("SecurityGroupEgress", [])):
+            if condition == "NoInterfaceEndpoints":
+                continue
+            r = _rule(name, props, "DestinationSecurityGroupId")
+            if r.cidr is not None and (r.protocol, r.cidr) != ("icmp", "127.0.0.1/32"):
+                problems.append(f"{name}: sends to {r.cidr} port {r.from_port} even with interface endpoints")
+    for res in resources(template, "AWS::EC2::SecurityGroupEgress").values():
+        props = res.get("Properties", {})
+        if res.get("Condition") != "NoInterfaceEndpoints" and "CidrIp" in props:
+            problems.append(f"{logical_id(props.get('GroupId'))}: sends to {props['CidrIp']} even with interface endpoints")
     return problems
 
 
@@ -403,6 +487,8 @@ def check_alarm_rules(template: dict) -> list[str]:
         stats = [m["MetricStat"] for m in props.get("Metrics", []) if "MetricStat" in m]
         if "MetricName" in props:
             stats.append({"Metric": props, "Period": props.get("Period"), "Stat": props.get("Statistic")})
+        if len(stats) > 10:
+            problems.append(f"{name}: {len(stats)} metrics; a metric math alarm takes at most 10")
         if not isinstance(props.get("EvaluationPeriods"), int) or props["EvaluationPeriods"] < 2:
             problems.append(f"{name}: EvaluationPeriods must be 2 or more")
         missing = props.get("TreatMissingData")
@@ -745,10 +831,9 @@ def check_required_actions(template: dict, required: dict | None = None) -> list
             problems.append(f"{role}: in task-role-actions.yaml but not in the template")
             continue
         grants = []
-        for policy in _policies(roles[role]):
-            for st in policy.get("PolicyDocument", {}).get("Statement", []):
-                if st.get("Effect") == "Allow":
-                    grants.append(([a.lower() for a in _actions(st) if isinstance(a, str)], _resource_keys(st.get("Resource"))))
+        for _, attached, st in _statements(template):
+            if role in attached and st.get("Effect") == "Allow":
+                grants.append(([a.lower() for a in _actions(st) if isinstance(a, str)], _resource_keys(st.get("Resource"))))
         for resource, actions in needs.items():
             for action in actions:
                 if not any(any(fnmatch.fnmatchcase(action.lower(), a) for a in acts) and
@@ -939,6 +1024,8 @@ def check_services(template: dict) -> list[str]:
 
 CHECKS = (
     check_security_groups,
+    check_ft_server_egress,
+    check_egress_with_endpoints,
     check_target_groups,
     check_plain_listeners,
     check_load_balancers,

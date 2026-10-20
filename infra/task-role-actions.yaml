@@ -32,3 +32,23 @@ MsrpRelayTaskRole:
 AcsTaskRole:
   AcsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:DescribeTable]
   AcsTable/index/gsi1: [dynamodb:Query]
+
+RcsAsTaskRole:
+  MessagesTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem, dynamodb:Query, dynamodb:DescribeTable]
+  MessagesTable/index/expiry: [dynamodb:Query]
+
+# From docs/scscf-state.md and internal/scscf/state/dynamostore (#89), and
+# the Cloud Map discovery of the HSS's Cx peers (ADR 0005).
+ScscfTaskRole:
+  # In ScscfStatePolicy, a policy attached to the role (see the template).
+  RegistrationsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
+  RegistrationsTable/index/impi-index: [dynamodb:Query]
+  RegistrationsTable/index/expiry-index: [dynamodb:Query]
+  AuthChallengesTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
+  RegSubscriptionsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
+  RegSubscriptionsTable/index/impu-index: [dynamodb:Query]
+  RegSubscriptionsTable/index/expiry-index: [dynamodb:Query]
+  "*": [servicediscovery:DiscoverInstances]
+
+IcscfTaskRole:
+  "*": [servicediscovery:DiscoverInstances]

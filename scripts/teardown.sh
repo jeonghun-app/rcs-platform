@@ -71,6 +71,9 @@ done
 [[ "$REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || usage_error "not a region: $REGION"
 ECR_STACK="$STACK-ecr"
 
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
 # Logical ids a template keeps on stack deletion (DeletionPolicy: Retain).
 retained_resources() {
   awk '/^Resources:/ { p = 1; next }
@@ -102,9 +105,35 @@ stack_status() {
 }
 
 # Logical id, type and physical id of each resource, one per line.
+# Logical id, type, physical id and status of each resource, one per line.
+# A stack whose creation rolled back still lists the resources it deleted,
+# as DELETE_COMPLETE.
 stack_resources() {
   aws cloudformation list-stack-resources --region "$REGION" --stack-name "$1" \
-    --query 'StackResourceSummaries[].[LogicalResourceId,ResourceType,PhysicalResourceId]' --output text
+    --query 'StackResourceSummaries[].[LogicalResourceId,ResourceType,PhysicalResourceId,ResourceStatus]' --output text
+}
+
+# The template the stack was deployed with, which is what decides what it
+# retains; a checkout of another commit may differ.
+deployed_template() {
+  local file="$WORK/$1.template"
+  aws cloudformation get-template --region "$REGION" --stack-name "$1" --template-stage Original \
+    --query TemplateBody --output text >"$file"
+  echo "$file"
+}
+
+# Turns a load balancer's deletion protection on or off. One already gone
+# (a rolled-back creation deleted it) is skipped.
+set_protection() {
+  local arn="$1" value="$2" out
+  if out="$(aws elbv2 modify-load-balancer-attributes --region "$REGION" --load-balancer-arn "$arn" \
+    --attributes "Key=deletion_protection.enabled,Value=$value" 2>&1 >/dev/null)"; then
+    return 0
+  elif [[ "$out" == *LoadBalancerNotFound* ]]; then
+    echo "  $arn no longer exists"
+    return 1
+  fi
+  fail "cannot change deletion protection of $arn: $out"
 }
 
 # Prints the retained resources of a stack from its resource list.
@@ -116,7 +145,7 @@ report_retained() {
       found=true
       continue
     fi
-    line="$(awk -v id="$id" '$1 == id { print "  " $1 "  " $2 "  " $3 }' <<<"$resources")"
+    line="$(awk -v id="$id" '$1 == id && $4 != "DELETE_COMPLETE" { print "  " $1 "  " $2 "  " $3 }' <<<"$resources")"
     if [[ -n "$line" ]]; then
       echo "$line"
       found=true
@@ -128,15 +157,18 @@ report_retained() {
 # Deletes a stack and waits; a stack that does not exist is skipped. The
 # retained resources are listed afterwards.
 delete_stack() {
-  local stack="$1" template="$2" status resources="" arn
+  local stack="$1" template="$2" status resources="" arn lifted=()
   if [[ "$DRY_RUN" == false ]]; then
     status="$(stack_status "$stack")"
     case "$status" in
       "") echo "  $stack does not exist"; return 0 ;;
       DELETE_COMPLETE) echo "  $stack is already deleted"; return 0 ;;
+      # The empty shell a first change set left: nothing in it to keep.
+      REVIEW_IN_PROGRESS) ;;
       *_IN_PROGRESS) fail "stack $stack is $status: wait for it to finish" ;;
     esac
     resources="$(stack_resources "$stack")"
+    [[ "$status" == REVIEW_IN_PROGRESS ]] || template="$(deployed_template "$stack")"
   fi
 
   # Load balancers have deletion protection in prod, which would fail the
@@ -150,14 +182,20 @@ delete_stack() {
   else
     while IFS= read -r arn; do
       [[ -n "$arn" ]] || continue
-      echo "  deletion protection off: $arn"
-      aws elbv2 modify-load-balancer-attributes --region "$REGION" --load-balancer-arn "$arn" \
-        --attributes Key=deletion_protection.enabled,Value=false >/dev/null
-    done < <(awk '$2 == "AWS::ElasticLoadBalancingV2::LoadBalancer" { print $3 }' <<<"$resources")
+      if set_protection "$arn" false; then
+        echo "  deletion protection off: $arn"
+        lifted+=("$arn")
+      fi
+    done < <(awk '$2 == "AWS::ElasticLoadBalancingV2::LoadBalancer" && $4 != "DELETE_COMPLETE" { print $3 }' <<<"$resources")
   fi
 
   run aws cloudformation delete-stack --region "$REGION" --stack-name "$stack"
   if ! run aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$stack"; then
+    # The stack stays, so its load balancers get their protection back:
+    # a later deployment would not restore it (the template did not change).
+    for arn in ${lifted[@]+"${lifted[@]}"}; do
+      if set_protection "$arn" true; then echo "  deletion protection back on: $arn"; fi
+    done
     fail "deleting $stack failed; see its events: aws cloudformation describe-stack-events --region $REGION --stack-name $stack (docs/runbook.md#teardown-failed)"
   fi
   if [[ "$DRY_RUN" == true ]]; then

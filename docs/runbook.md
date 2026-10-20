@@ -13,8 +13,10 @@ from incidents yet. After an incident, add what you learned to the section.
 ## Conventions
 
 - An alarm `<stack>-<Name>` is in the section `<Name>`. Alarms and the
-  security and cost notifications go to the stack's alarm topic (the
-  `AlarmTopic` output).
+  security, service and cost notifications go to the stack's alarm topic
+  (the `AlarmTopic` output). The `DashboardUrl` output opens the stack's
+  dashboard: each service's traffic, errors, latency and saturation beside
+  the load balancers and tables, the first place to look.
 - Service metrics are CloudWatch EMF in the namespace `RCS/<stack>`, with
   `Service` as the only dimension. Metric names are those of the service
   documents: [ft-server](ft-server.md#metrics-and-logs), and
@@ -29,8 +31,10 @@ from incidents yet. After an incident, add what you learned to the section.
 - **Commands that change something are marked "changes the stack".** Run
   them only with the approval [aws-deployment.md](aws-deployment.md#approval)
   asks for. Configuration changes go through `scripts/deploy.sh` and its
-  config file, never the console: the next deployment would undo a console
-  edit.
+  config file, never the console. CloudFormation does not undo a console
+  edit: a deployment whose template and parameters did not change does
+  nothing. To find and revert one, see
+  [Undoing a change made outside CloudFormation](#undoing-a-change-made-outside-cloudformation).
 
 ```sh
 STACK=rcs-platform REGION=ap-northeast-2
@@ -47,11 +51,15 @@ aws logs tail "/rcs/$STACK/ft-server" --region "$REGION" --since 30m \
 aws cloudwatch get-metric-statistics --region "$REGION" --namespace "RCS/$STACK" \
   --metric-name auth.backend_error --dimensions Name=Service,Value=ft-server \
   --statistics Sum --period 300 \
-  --start-time "$(date -u -d '-3 hours' +%FT%TZ)" --end-time "$(date -u +%FT%TZ)"
+  --start-time "$(date -u -d '-3 hours' +%FT%TZ 2>/dev/null || date -u -v-3H +%FT%TZ)" \
+  --end-time "$(date -u +%FT%TZ)"     # GNU date, or BSD date on macOS
 ```
 
 Scaling out means raising the service's `...DesiredCount` in the config file
-and deploying (changes the stack). In prod each rolling step adds one task
+and deploying it **from the commit the stack runs** (changes the stack):
+check out the stack's `TemplateRevision` output first, or the deployment
+ships whatever the checkout's template and image are. deploy.sh shows the
+change set and asks before it runs. In prod each rolling step adds one task
 first (ADR 0003), so a deployment never lowers capacity.
 
 ## ft-server
@@ -92,9 +100,10 @@ each task already runs `FT_MAX_CONCURRENT_LOOKUPS` (16).
 a flood of unauthenticated requests: WAF `BlockedRequests` on the ALB's web
 ACL, request counts on the ft-server target group?
 
-**Act.** Slow HSS: as [FtAuthBackendError](#ftauthbackenderror). A flood:
-lower `WafRateLimit` and deploy. Scale ft-server only when the traffic is
-real.
+**Act.** Slow HSS: as [FtAuthBackendError](#ftauthbackenderror). A flood
+from a few addresses: see [WafRateLimited](#wafratelimited) before lowering
+the limit, since one carrier-grade NAT address carries thousands of
+handsets. Scale ft-server only when the traffic is real.
 
 ### FtStorageErrors
 
@@ -119,8 +128,10 @@ days. Both come from the one parameter, so a mismatch means someone edited
 the bucket by hand. Look at CloudTrail for `PutBucketLifecycleConfiguration`
 and `DeleteObject` outside ft-server's role.
 
-**Act.** Deploy again to restore the template's lifecycle. Deleted objects
-come back only if they still exist elsewhere: the bucket has no versioning.
+**Act.** Put the template's lifecycle back by hand (see [Undoing a change
+made outside CloudFormation](#undoing-a-change-made-outside-cloudformation)):
+a deployment alone does not. Deleted objects come back only if they still
+exist elsewhere: the bucket has no versioning.
 
 ### FtUploadsBusy
 
@@ -201,8 +212,8 @@ floor is too high for some client networks.
 
 ### FtServerTarget5xx
 
-**Symptom.** ft-server answered more than ten 5xx a minute through the ALB
-for 3 minutes.
+**Symptom.** Over 5% of ft-server's requests through the ALB (once there
+were 20 in 5 minutes) were answered 5xx, in 2 of 3 periods.
 
 **Check.** Which ft-server alarms fire with it? `503` from busy slots is
 counted here too. Is a deployment in progress?
@@ -221,6 +232,19 @@ up here too.
 
 **Act.** Out of memory: a larger `FtServerTaskSize`. A deployment: [roll
 back](#rollback). Otherwise as [FtStorageErrors](#ftstorageerrors).
+
+### FtServerNoHealthyTargets
+
+**Symptom.** The ft-server target group has had no healthy target for 2 of 3
+minutes: file transfer is down for every client.
+
+**Check.** The service events (`describe-services`): tasks failing to start
+(image, secrets, `/readyz` never ready)? `ServiceImpaired` usually arrives
+with it.
+
+**Act.** A deployment: [roll back](#rollback). Tasks that cannot start: fix
+what the events name (often secrets or an image that ECR no longer has),
+then force a new deployment (changes the stack).
 
 ## msrp-relay
 
@@ -261,8 +285,8 @@ address. Keep the budget.
 Security group changes (`SecurityGroupChanges`) between the relay and
 `rcs-as` on port 2855?
 
-**Act.** Restore `rcs-as` or the security group rule. Deploy again to put
-the template's rules back.
+**Act.** Restore `rcs-as`. A security group rule removed by hand: put it back
+as in [Undoing a change made outside CloudFormation](#undoing-a-change-made-outside-cloudformation).
 
 ### RelayAlreadyClaimedRatio
 
@@ -285,7 +309,10 @@ for 3 minutes.
 
 **Check.** Service events, and whether the task is at
 `RELAY_MAX_CONNECTIONS`. The NLB checks the MSRP port over TCP, because AWS
-sends a PROXY header on health checks too.
+sends a PROXY header on health checks too and the admin port cannot read
+one yet (#230). A TCP check passes a task that accepts connections but is
+not ready (its store unreachable, say), so `RelayStoreErrors` is what shows
+that case.
 
 **Act.** Out of memory or connections: a larger `RelayTaskSize`, with
 `RelayMaxConnections` to match, or more tasks. A deployment: [roll
@@ -314,9 +341,21 @@ consistent read.
 `LookupBudgetUntracked` rise? A scan from many sources defeats the
 per-source budget.
 
-**Act.** A scan: block the sources in the WAF or with an NLB-facing
-security group change (changes the stack). Legitimate growth: raise the
-budget in the config and deploy.
+**Act.** A scan from a few sources: deny them in the public subnets' network
+ACL, see [Blocking a source](#blocking-a-source) (the WAF sits only on the
+ALB, and security groups cannot deny). Legitimate growth: raise the budget
+in the config and deploy.
+
+### RelayNoHealthyTargets
+
+**Symptom.** The relay target group behind the NLB has had no healthy target
+for 2 of 3 minutes: no client can start an MSRP session (chat and file
+transfer by MSRP).
+
+**Check.** As [FtServerNoHealthyTargets](#ftservernohealthytargets), for
+`msrp-relay`.
+
+**Act.** As [FtServerNoHealthyTargets](#ftservernohealthytargets).
 
 ## pcscf
 
@@ -347,6 +386,32 @@ traffic.
 
 **Act.** Add pcscf tasks. Do not raise the budget beyond what the task's
 memory holds.
+
+### PcscfTransactionsRejected
+
+**Symptom.** pcscf answered requests 503 because its server-transaction cap
+(`MaxServerTransactions`) was full (`ServerTransactionsRejected` in 2 of 3
+minutes).
+
+**Check.** A request flood (many transactions from few sources, the NLB's
+new flows), or a slow transaction user holding transactions open (latency
+toward the core, `HssCxLatency`)?
+
+**Act.** Scale out pcscf. If tasks have memory to spare, raise
+`MaxServerTransactions`. A flood from few sources: [Blocking a
+source](#blocking-a-source).
+
+### PcscfTransactionBytes
+
+**Symptom.** pcscf's live server transactions held over 80% of
+`MaxServerTransactionBytes` (256 MiB by default) in 2 of 3 minutes
+(`ServerTransactionBytes`, Maximum). At the cap, requests get 503.
+
+**Check.** As [PcscfTransactionsRejected](#pcscftransactionsrejected); large
+requests (big SDP or bodies) raise bytes faster than counts.
+
+**Act.** As [PcscfTransactionsRejected](#pcscftransactionsrejected), or raise
+`MaxServerTransactionBytes` with the task's memory.
 
 ## hss
 
@@ -438,12 +503,76 @@ deploy with `HssKeyringBootstrap=true`?
 bootstrap](#keyring-bootstrap): the secrets sealed under the old key no
 longer open, and the flag must go back to `false`.
 
+### HssCxLatency
+
+**Symptom.** A MAR or SAR took over 2 s (Maximum) in 3 of 5 minutes, near the
+3 s `HSS_CX_TIMEOUT`. The CSCFs time out first, and registrations fail while
+`cx.*.error` stays at zero.
+
+**Check.** DynamoDB latency and `SubscribersThrottled`; `HssLockBusy`; hss CPU
+on the dashboard.
+
+**Act.** Throttling: as [SubscribersThrottled](#subscribersthrottled). CPU:
+add hss tasks (at most 7, see `HssDesiredCount`).
+
+## icscf and scscf
+
+These alarms exist once `IcscfEnabled` or `ScscfEnabled` is `true`.
+
+### IcscfTransactionsRejected
+
+**Symptom.** icscf answered requests 503 at its server-transaction cap.
+
+**Check.** As [PcscfTransactionsRejected](#pcscftransactionsrejected): a
+request flood or a slow transaction user (the HSS's `HssCxLatency`).
+
+**Act.** Scale out icscf, or raise `MaxServerTransactions`.
+
+### IcscfTransactionBytes
+
+**Symptom.** icscf's live server transactions held over 80% of
+`MaxServerTransactionBytes`.
+
+**Check.** As [PcscfTransactionBytes](#pcscftransactionbytes).
+
+**Act.** As [PcscfTransactionBytes](#pcscftransactionbytes), for icscf.
+
+### ScscfTransactionsRejected
+
+**Symptom.** scscf answered requests 503 at its server-transaction cap.
+
+**Check.** As [PcscfTransactionsRejected](#pcscftransactionsrejected); slow
+iFC evaluation or a slow HSS holds transactions too.
+
+**Act.** Scale out scscf, or raise `MaxServerTransactions`.
+
+### ScscfTransactionBytes
+
+**Symptom.** scscf's live server transactions held over 80% of
+`MaxServerTransactionBytes`.
+
+**Check.** As [PcscfTransactionBytes](#pcscftransactionbytes).
+
+**Act.** As [PcscfTransactionBytes](#pcscftransactionbytes), for scscf.
+
+### ScscfIfcBudgetExceeded
+
+**Symptom.** scscf stopped evaluating a profile's iFC because it exceeded its
+work budget (`ifc.budget_exceeded` in 2 of 3 five-minute periods). Those
+users' sessions do not reach their application servers as the profile says.
+
+**Check.** An operator profile is too expensive: look for the iFC cost
+warnings (`profile.costly`) in the HSS log, which name the profile.
+
+**Act.** Simplify the profile's conditions (docs/hss.md, Writing iFC) and
+apply it again. Do not raise the budget to fit one profile.
+
 ## acs
 
 ### AcsTarget5xx
 
-**Symptom.** acs answered more than ten 5xx a minute through the ALB for 3
-minutes.
+**Symptom.** Over 5% of acs's requests through the ALB (once there were 20 in
+5 minutes) were answered 5xx, in 2 of 3 periods.
 
 **Check.** The acs log, and `AcsThrottled`. acs's own runbook (in the
 auto-configuration-server repository) has the details of each path.
@@ -469,9 +598,53 @@ SMS the operator pays for, so this can be SMS pumping.
 **Check.** The acs log: are the requests spread over many MSISDNs from few
 client addresses? WAF metrics for the ALB.
 
-**Act.** A pumping attack: lower `WafRateLimit`, or narrow
-`PublicIngressCidr` while you investigate, and deploy. Escalate to
-security. Real growth: raise the threshold in the template.
+**Act.** A pumping attack from a few addresses: switch the WAF to block (see
+[WafRateLimited](#wafratelimited)) or deny the sources in the network ACL
+([Blocking a source](#blocking-a-source)). Narrowing `PublicIngressCidr` is
+a full stop: it shuts every client out of the NLB and the ALB, SIP and MSRP
+included. Escalate to security. Real growth: raise the threshold in the
+template.
+
+### AcsNoHealthyTargets
+
+**Symptom.** The acs target group has had no healthy target for 2 of 3
+minutes: no device can be configured.
+
+**Check.** As [FtServerNoHealthyTargets](#ftservernohealthytargets), for
+`acs`.
+
+**Act.** As [FtServerNoHealthyTargets](#ftservernohealthytargets).
+
+## The ALB and its WAF
+
+### AlbElb5xx
+
+**Symptom.** Over 5% of the ALB's requests were answered 5xx by the ALB
+itself (502, 503, 504), in 2 of 3 periods: it found no target to take them.
+
+**Check.** The `*NoHealthyTargets` alarms, and target timeouts on the
+dashboard.
+
+**Act.** As the target group alarm that fires with it.
+
+### WafRateLimited
+
+**Symptom.** Client addresses went over `WafRateLimit` requests in 5 minutes
+(the rule's `CountedRequests` with `WafRateAction=count`, or
+`BlockedRequests` with `block`).
+
+**Check.** The WAF log group (`aws-waf-logs-<stack>`) shows which addresses,
+and the paths they hit (query strings are redacted). One address with many
+distinct devices behind it is carrier-grade NAT; one client looping, or a
+scan, is something else.
+
+**Act.** Stay on `count` until a week of normal traffic has shown the peak
+per address of the operators' NAT addresses. Then set `WafRateLimit` above
+that peak with headroom, and `WafRateAction=block` (changes the stack). In
+`block` mode, a legitimate NAT address over the limit means raising the
+limit, not lowering it.
+
+
 
 ## Tables
 
@@ -488,6 +661,8 @@ progress, after an outage or a pcscf restart?
 
 **Act.** Raise `SubscribersWarmReadUnits` and `SubscribersWarmWriteUnits`
 and deploy. Raising warm throughput takes some minutes and is charged once.
+It cannot be lowered: keep the raised values in the config file for good,
+or the next deployment fails and rolls back.
 
 ### ServiceProfilesThrottled
 
@@ -519,7 +694,8 @@ minutes.
 clients come back at once, each with about three writes and one read. See
 [Re-registration burst sizing](#re-registration-burst-sizing).
 
-**Act.** Raise `MsrpWarmReadUnits` and `MsrpWarmWriteUnits` and deploy.
+**Act.** Raise `MsrpWarmReadUnits` and `MsrpWarmWriteUnits` and deploy. Like
+all warm throughput, they cannot be lowered again.
 
 ### RegistrationsThrottled
 
@@ -575,19 +751,47 @@ that clears.
 
 ## Metrics pipeline
 
-### EmfErrors
+One alarm per service log group; the sections below share the same steps.
 
-**Symptom.** CloudWatch could not extract metrics from a service's log lines
+### EmfErrorsHss
+
+**Symptom.** CloudWatch could not extract metrics from hss's log lines
 (`EMFValidationErrors`, `EMFParsingErrors` in `AWS/Logs`). Each such line
 loses a minute of a metric, and the alarms on it go quiet.
 
-**Check.** Which log group (the alarm's metrics are per group)? Did it start
-with a deployment? The service log has the line; CloudWatch's error says
-what it refused (a name, a value array over 100 values, a unit).
+**Check.** Did it start with a deployment? The service log has the line;
+CloudWatch's error says what it refused (a name, a value array over 100
+values, a unit).
 
 **Act.** Roll back if a deployment caused it, and open an issue: every
 service writes EMF through `internal/runtime`, which should never produce
 such a line.
+
+### EmfErrorsFtServer
+
+**Symptom.** As [EmfErrorsHss](#emferrorshss), for ft-server.
+
+**Check.** As [EmfErrorsHss](#emferrorshss).
+
+**Act.** As [EmfErrorsHss](#emferrorshss).
+
+### EmfErrorsRelay
+
+**Symptom.** As [EmfErrorsHss](#emferrorshss), for msrp-relay.
+
+**Check.** As [EmfErrorsHss](#emferrorshss).
+
+**Act.** As [EmfErrorsHss](#emferrorshss).
+
+### EmfErrorsAcs
+
+**Symptom.** As [EmfErrorsHss](#emferrorshss), for acs (its own EMF, under
+`RCS/<stack>/acs`).
+
+**Check.** As [EmfErrorsHss](#emferrorshss).
+
+**Act.** As [EmfErrorsHss](#emferrorshss); acs's fix belongs in acs's
+repository.
 
 ## Security and cost notifications
 
@@ -603,8 +807,9 @@ CloudWatch alarms.
 **Check.** Every deployment that changes groups sends these too. Compare
 the time with deployments. Otherwise look at `userIdentity` in the event.
 
-**Act.** An unexplained change to a platform group: deploy again to restore
-the ADR 0007 matrix, and escalate to security.
+**Act.** An unexplained change to a platform group: revert it as in [Undoing
+a change made outside CloudFormation](#undoing-a-change-made-outside-cloudformation)
+(a deployment alone does not), and escalate to security.
 
 ### SecretChanges
 
@@ -615,6 +820,53 @@ look at `userIdentity`.
 
 **Act.** An unexplained change: rotate the token concerned, and escalate to
 security.
+
+### ServiceImpaired
+
+**Symptom.** ECS reports that a service cannot start tasks
+(`SERVICE_TASK_START_IMPAIRED`) or that a deployment failed and the circuit
+breaker rolled it back (`SERVICE_DEPLOYMENT_FAILED`). hss has no load
+balancer, so this is how its outage shows.
+
+**Check.** The event names the service. Its events in `describe-services`
+say why: an image ECR no longer has, a secret it cannot read, a start-up
+the service refused (its log: a setting, the keyring).
+
+**Act.** Fix the cause; for a failed deployment, the old tasks still run.
+For hss's keyring refusal see [Keyring bootstrap](#keyring-bootstrap).
+
+### KmsKeyChanges
+
+**Symptom.** A key policy or key state changed (`PutKeyPolicy`,
+`ScheduleKeyDeletion`, `DisableKey`, grants).
+
+**Check.** Deployments that change a key policy send it too, and DynamoDB
+creates grants for its tables. Otherwise look at `userIdentity`.
+
+**Act.** An unexplained change: cancel a scheduled deletion at once (`aws
+kms cancel-key-deletion`, changes the stack), revert the policy, and
+escalate to security. A deleted HSS or S-CSCF key loses every secret or
+item under it.
+
+### TaskDefinitionChanges
+
+**Symptom.** A task definition was registered or a service changed.
+
+**Check.** Every deployment and restart sends these. Outside one, look at
+`userIdentity` and what the new revision changed (image, role, commands).
+
+**Act.** An unexplained change: deploy the stack's current revision again
+from its commit (deploy.sh registers the template's definitions) and
+escalate to security.
+
+### IamPolicyChanges
+
+**Symptom.** An IAM policy or trust relationship changed. This rule exists
+only in a stack in us-east-1, where CloudTrail delivers IAM events.
+
+**Check.** As [TaskDefinitionChanges](#taskdefinitionchanges).
+
+**Act.** As [TaskDefinitionChanges](#taskdefinitionchanges).
 
 ### MonthlyBudget
 
@@ -651,11 +903,20 @@ scripts/deploy.sh --config <your config> --stack-name "$STACK" --region "$REGION
   --skip-build --image-tag <previous tag>       # changes the stack
 ```
 
-The previous tag is in the stack's parameters history (CloudFormation
-events) or in ECR (`aws ecr describe-images --repository-name "$STACK"`).
-If the template change is the fault, check out the previous release's commit
-and run the same command from there. Its template and its config file must
-match: a parameter added since then is refused as unknown.
+The previous tag is the stack's `PreviousImageTag` output, which deploy.sh
+records at every deployment that changes the image, and which it prints
+at the end of each run. Every image a service ran is also in its task
+definition revisions (`aws ecs describe-task-definition --task-definition
+"$STACK-hss:<revision>"`). The tags in ECR alone do not say which ran: some
+were pushed by deployments that rolled back.
+
+deploy.sh ships the checkout's template with any deployment, rollbacks
+included, and refuses a working tree with changes. Run the rollback from
+the commit the stack runs (its `TemplateRevision` output), so only the
+image changes. If the template change is the fault, check out the
+previous release's commit and run the same command from there. Its template
+and its config file must match: a parameter added since then is refused as
+unknown.
 
 A stack left in `UPDATE_ROLLBACK_FAILED` needs `aws cloudformation
 continue-update-rollback` (changes the stack) after fixing what blocked the
@@ -666,25 +927,76 @@ rollback (read the stack events).
 A stack whose first creation failed is `ROLLBACK_COMPLETE` and cannot be
 updated. `deploy.sh` refuses it. Read the events for the first
 `CREATE_FAILED`, fix the cause, delete the stack with
-`scripts/teardown.sh` (changes the stack) and deploy again. Tables, the
-bucket or the key created before the failure may have been retained: the
-teardown lists them. Delete them by hand while they are still empty, or the
-new stack cannot create its tables under the same names.
+`scripts/teardown.sh` (changes the stack; it skips load balancers the
+rollback already deleted) and deploy again. Tables, the bucket, the keys or
+the NLB's addresses created before the failure may have been retained: the
+teardown lists them, and deploy.sh refuses a first creation while their
+names are taken. Delete them by hand while they are still empty.
+
+A stack in `REVIEW_IN_PROGRESS` is the empty shell of a first change set
+that never ran (an interrupted or `--plan` run). deploy.sh creates it
+afresh, and teardown.sh deletes it.
 
 ### Teardown failed
 
-`scripts/teardown.sh` stops when the stack deletion fails. Read the events
-for `DELETE_FAILED`. Usual causes are a security group still attached to an
-interface outside the stack, or a non-empty bucket in the registry stack.
-Fix it and run teardown again.
+`scripts/teardown.sh` stops when the stack deletion fails, and turns the load
+balancers' deletion protection back on, since a later deployment would not.
+Read the events for `DELETE_FAILED`. Usual causes are a security group still
+attached to an interface outside the stack, or a non-empty bucket in the
+registry stack. Fix it and run teardown again.
+
+### Undoing a change made outside CloudFormation
+
+CloudFormation does not revert a change made in the console or the CLI: a
+deployment with the same template and parameters has nothing to do. Find
+the drift first (read-only):
+
+```sh
+aws cloudformation detect-stack-drift --region "$REGION" --stack-name "$STACK"
+aws cloudformation describe-stack-resource-drifts --region "$REGION" --stack-name "$STACK" \
+  --stack-resource-drift-status-filters MODIFIED DELETED \
+  --query 'StackResourceDrifts[].[LogicalResourceId,StackResourceDriftStatus,PropertyDifferences]'
+# Security group rules the matrix does not have:
+aws ec2 describe-security-group-rules --region "$REGION" \
+  --filters Name=group-id,Values=<group id> --query 'SecurityGroupRules[].[IsEgress,IpProtocol,FromPort,CidrIpv4,ReferencedGroupInfo.GroupId]'
+```
+
+Then revert each difference by hand to the template's value (changes the
+stack): `revoke-security-group-ingress` for an added rule,
+`put-bucket-lifecycle-configuration` with the template's rule, and so on.
+Drift detection does not see every property, and not separate rule
+resources added outside the stack: compare security groups with the
+ADR 0007 matrix in `scripts/check_infra.py` as well.
+
+### Blocking a source
+
+Security groups cannot deny, and AWS WAF sits only on the ALB, so a source
+is turned away from the NLB (SIP, MSRP) in the public subnets' network ACL.
+The template keeps rules 1 to 999 free for this; rule 1000 allows the rest.
+
+```sh
+ACL=$(aws ec2 describe-network-acls --region "$REGION" \
+  --filters Name=tag:Name,Values="$STACK-public" --query 'NetworkAcls[0].NetworkAclId' --output text)
+# Deny one range inbound (changes the stack). Use a free number under 1000.
+aws ec2 create-network-acl-entry --region "$REGION" --network-acl-id "$ACL" \
+  --rule-number 100 --protocol -1 --rule-action deny --ingress --cidr-block 198.51.100.0/24
+# And remove it when done.
+aws ec2 delete-network-acl-entry --region "$REGION" --network-acl-id "$ACL" --rule-number 100 --ingress
+```
+
+Blast radius: the ACL covers everything in the public subnets: the NLB, the
+ALB and the NAT gateways. A denied range also loses replies to the
+platform's own outbound calls to it, and a carrier-grade NAT address takes
+every handset behind it with it. An ACL takes at most 20 entries a
+direction by default. Entries added this way are outside CloudFormation: a
+deployment keeps them, and they must be removed by hand.
 
 ### Token rotation
 
 Each internal token (ADR 0007 §4) has two secrets: `<stack>/<receiver>/<caller>-token`
 and `...-token-next`. The receiver accepts both. The caller presents the
 current one. Secrets reach tasks only when the tasks start, so each step
-ends with a restart. The order below never leaves a starting task without
-the value its peers present:
+ends with a restart:
 
 | Token | Receiver (reads both) | Caller (reads current) |
 |---|---|---|
@@ -693,42 +1005,35 @@ the value its peers present:
 | `hss/acs-token` | hss | acs (not wired yet) |
 | `msrp-relay/pcscf-token` | msrp-relay | pcscf (not deployed yet) |
 
-Every command here changes the stack. Values stay in shell variables and,
-for a moment, in a file only you can read; they never reach the screen or a
-command line, where other users of the host could see them:
+`scripts/rotate-token.sh` does it (changes the stack):
 
 ```sh
-STACK=rcs-platform REGION=ap-northeast-2 TOKEN=hss/ft-server-token RECEIVER=hss CALLER=ft-server
-get() { aws secretsmanager get-secret-value --region "$REGION" --secret-id "$STACK/$1" --query SecretString --output text; }
-put() (
-  umask 077; f="$(mktemp)"; trap 'rm -f "$f"' EXIT
-  printf '%s' "$2" >"$f"
-  aws secretsmanager put-secret-value --region "$REGION" --secret-id "$STACK/$1" --secret-string "file://$f" >/dev/null
-)
-restart() {
-  aws ecs update-service --region "$REGION" --cluster "$STACK" --service "$1" --force-new-deployment >/dev/null
-  aws ecs wait services-stable --region "$REGION" --cluster "$STACK" --services "$1"
-}
-random() { aws secretsmanager get-random-password --region "$REGION" --password-length 64 --exclude-punctuation --query RandomPassword --output text; }
-
-# 1. The new value goes into next; the receiver accepts old and new.
-put "$TOKEN-next" "$(random)"; restart "$RECEIVER"
-# 2. Old into next, then new into current: a receiver task starting now
-#    accepts both. The caller restarts with the new value.
-old="$(get "$TOKEN")"; new="$(get "$TOKEN-next")"
-put "$TOKEN-next" "$old"; put "$TOKEN" "$new"; unset old new
-restart "$CALLER"
-# 3. A fresh, unused value replaces old in next; the receiver drops old.
-put "$TOKEN-next" "$(random)"; restart "$RECEIVER"
+scripts/rotate-token.sh --stack-name "$STACK" --region "$REGION" --token hss/ft-server-token
 ```
 
-If `services-stable` gives up (it waits ten minutes; ft-server's 300 s
-deregistration delay makes its deployments long), check the service with
-`describe-services` and run the wait again before the next step. For the
-admin token, step 2's "caller" is whoever calls the provisioning
-API: give them the new value from the current secret, then do step 3. In
-staging and prod, a token shorter than 43 characters stops the receiver
-from starting, and the generated ones have 64.
+1. A new value goes into next; the receiver restarts and accepts old and new.
+2. Old goes into next, then new into current. The receiver restarts, so
+   that no task that started between the two writes keeps a wrong pair, and
+   then the caller restarts and presents new.
+3. A fresh, unused value replaces old in next; the receiver restarts and no
+   longer accepts old.
+
+Each restart waits until the service is steady (one deployment, completed,
+all tasks running), up to 45 minutes, since ft-server's deregistration
+delay makes its rollouts long. Any failure stops the rotation where it is;
+`--step <n>` resumes it. For a token whose caller is outside the stack (the
+operator, or a service not wired yet), the script stops after step 2: give
+the callers the value of the current secret, then run `--step 3`. Values
+pass only through shell variables and a file only the user can read; they
+never reach the screen or a command line.
+
+For about a second in step 2, the two secrets hold the same value. A
+receiver task starting in that second would see equal values; msrp-relay
+refuses to start then (ECS starts another), hss accepts only that value.
+The restart that follows the writes replaces any such task (#231 removes the
+window). In staging and
+prod, a token shorter than 43 characters stops the receiver from starting;
+the generated ones have 64.
 
 ### Keyring bootstrap
 

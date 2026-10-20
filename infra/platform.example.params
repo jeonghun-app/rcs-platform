@@ -7,8 +7,9 @@
 # ImageTag and AcsImageTag itself. What each parameter means is in its
 # Description in infra/platform.yaml and in docs/aws-deployment.md#parameters.
 #
-# These values are a dev stack: one task per service, one NAT gateway, plain
-# HTTP on the ALB, no msrp-relay (it needs NlbCertificateArn) and mock SMS.
+# These values are a dev stack: one task per service, one NAT gateway, no
+# interface endpoints, plain HTTP on the ALB and plain MSRP on the NLB (dev
+# only), and mock SMS.
 # Copy the file, keep your copy out of the repository if it names real
 # accounts or hosts, and read docs/aws-deployment.md before a staging or prod
 # stack: those need both certificates, the three host names, a real SMS
@@ -20,6 +21,9 @@ Environment=dev
 # Network
 VpcCidr=10.30.0.0/16
 NatGateways=single
+# Interface endpoints cost about $9.50 a month each per AZ; dev may go
+# without them (auto: off in dev, on in staging and prod).
+InterfaceEndpoints=auto
 ServiceNamespace=rcs.local
 # Narrow to your own address while the stack is not for real clients.
 PublicIngressCidr=203.0.113.10/32
@@ -30,7 +34,10 @@ NlbCertificateArn=
 FtHostName=
 FtDeregistrationDelay=300
 PcscfEnabled=false
-WafRateLimit=1000
+IcscfEnabled=false
+ScscfEnabled=false
+WafRateLimit=10000
+WafRateAction=count
 
 # Identity (MCC 001 / MNC 01 is the test network)
 ImsDomain=ims.mnc001.mcc001.3gppnetwork.org
@@ -62,8 +69,8 @@ MsrpWarmReadUnits=12000
 MsrpWarmWriteUnits=4000
 MsrpReadBudget=1000
 AlarmTopicArn=
-MonthlyBudgetUsd=300
-DailyBudgetUsd=15
+MonthlyBudgetUsd=400
+DailyBudgetUsd=20
 
 # Observability
 ContainerInsights=disabled

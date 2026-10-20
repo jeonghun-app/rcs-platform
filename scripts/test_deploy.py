@@ -1,4 +1,5 @@
-"""Tests of scripts/deploy.sh and scripts/teardown.sh against stand-ins.
+"""Tests of scripts/deploy.sh, scripts/teardown.sh and scripts/rotate-token.sh
+against stand-ins.
 
 aws, docker, git and make are replaced by a stub on PATH that records every
 call and answers from a small state file, so the scripts run end to end
@@ -21,68 +22,139 @@ import check_infra
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEPLOY = ROOT / "scripts" / "deploy.sh"
 TEARDOWN = ROOT / "scripts" / "teardown.sh"
+ROTATE = ROOT / "scripts" / "rotate-token.sh"
 EXAMPLE = ROOT / "infra" / "platform.example.params"
 PLATFORM = ROOT / "infra" / "platform.yaml"
 ECR = ROOT / "infra" / "ecr.yaml"
 
-MANAGED = {"EcrStackName", "ImageTag", "AcsImageTag"}
+MANAGED = {"EcrStackName", "ImageTag", "ImageDigest", "AcsImageTag", "AcsImageDigest", "S3PrefixListId",
+           "DynamoDbPrefixListId", "TemplateRevision", "PreviousImageTag", "DeployPrincipalArn"}
 REGISTRY = "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com"
 PLATFORM_URI = f"{REGISTRY}/rcs-platform"
 ACS_URI = f"{REGISTRY}/rcs-platform-acs"
 BUCKET = "rcs-platform-ecr-templatebucket-example"
 ACS_DIGEST = "sha256:00956e9fe4d5865cf5e39292122ec1df78e34993f5c9d07928fff836af5f33b2"
 ACS_SOURCE = "ghcr.io/jeonghun-app/auto-configuration-server"
+PUSHED = "sha256:" + "ab" * 32
+OLD = "sha256:" + "cd" * 32
+TAG = "v0.1.0-3-gabcdef0"
 
 STUB = r'''#!/usr/bin/env python3
 import json, os, sys
 
 tool = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
-with open(os.environ["STUB_STATE"]) as f:
+path = os.environ["STUB_STATE"]
+with open(path) as f:
     state = json.load(f)
-with open(os.environ["STUB_LOG"], "a") as f:
-    f.write(json.dumps([tool, args, os.environ.get("DOCKER_DEFAULT_PLATFORM", "")]) + "\n")
+
+def save():
+    with open(path, "w") as f:
+        json.dump(state, f)
 
 def flag(name):
     return args[args.index(name) + 1] if name in args else None
 
-def missing(message):
+def fail(message, code=254):
     sys.stderr.write(message + "\n")
-    sys.exit(254)
+    sys.exit(code)
 
-def save():
-    with open(os.environ["STUB_STATE"], "w") as f:
-        json.dump(state, f)
+record = [tool, args]
+if tool == "aws" and "--parameters" in args:
+    record.append(json.load(open(flag("--parameters")[len("file://"):])))
+if tool == "aws" and args[:2] == ["secretsmanager", "put-secret-value"]:
+    record.append("<value>")
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(json.dumps(record + [os.environ.get("DOCKER_DEFAULT_PLATFORM", "")]) + "\n")
 
+stack = flag("--stack-name")
+query = flag("--query") or ""
+cmd = args[:2]
 if tool == "aws":
-    command = args[:2]
-    stack = flag("--stack-name")
-    query = flag("--query") or ""
-    if command == ["sts", "get-caller-identity"]:
-        print("arn:aws:iam::123456789012:user/test")
-    elif command == ["cloudformation", "describe-stacks"]:
+    if cmd == ["sts", "get-caller-identity"]:
+        if state.get("sts_fails"):
+            fail("Unable to locate credentials", 255)
+        print(state["identity"])
+    elif cmd == ["iam", "get-role"]:
+        print("arn:aws:iam::123456789012:role/" + flag("--role-name"))
+    elif cmd == ["service-quotas", "get-service-quota"]:
+        if state["quota"] is None:
+            fail("AccessDenied")
+        print(state["quota"])
+    elif cmd == ["dynamodb", "describe-table"]:
+        if "table " + flag("--table-name") not in state["taken"]:
+            fail("ResourceNotFoundException")
+    elif cmd == ["secretsmanager", "describe-secret"]:
+        if "secret " + flag("--secret-id") not in state["taken"]:
+            fail("ResourceNotFoundException")
+    elif cmd == ["logs", "describe-log-groups"]:
+        print(1 if "log group " + flag("--log-group-name-prefix") in state["taken"] else 0)
+    elif cmd == ["ecr", "describe-repositories"]:
+        if "repository " + flag("--repository-names") not in state["taken"]:
+            fail("RepositoryNotFoundException")
+    elif cmd == ["ec2", "describe-managed-prefix-lists"]:
+        print("pl-0a1b2c3d" if flag("--filters").endswith(".s3") else "pl-1a2b3c4d")
+    elif cmd == ["cloudformation", "describe-stacks"]:
         if stack not in state["stacks"]:
-            missing(f"An error occurred (ValidationError): Stack with id {stack} does not exist")
+            fail(f"An error occurred (ValidationError): Stack with id {stack} does not exist")
         if "StackStatus" in query:
             print(state["stacks"][stack])
         elif "OutputKey==" in query:
             key = query.split("OutputKey=='")[1].split("'")[0]
-            print(state["outputs"].get(key, "None"))
+            print(state["outputs"].get(stack, {}).get(key, "None"))
         else:
             print("outputs table")
-    elif command == ["cloudformation", "deploy"]:
-        state["stacks"].setdefault(stack, "CREATE_COMPLETE")
+    elif cmd == ["cloudformation", "create-change-set"]:
+        if stack not in state["stacks"]:
+            state["stacks"][stack] = "REVIEW_IN_PROGRESS"
+        state["changeset_type"][stack] = flag("--change-set-type")
         save()
-    elif command == ["cloudformation", "list-stack-resources"]:
+    elif cmd == ["cloudformation", "wait"] and args[2] == "change-set-create-complete":
+        if stack in state["empty"]:
+            sys.exit(255)
+    elif cmd == ["cloudformation", "describe-change-set"]:
+        if query == "StatusReason":
+            print("The submitted information didn't contain changes. Submit different information to create a change set.")
+        elif query == "NextToken":
+            print("None")
+        else:
+            for line in state["changes"].get(stack, [["Add", "Thing", "AWS::X::Y", ""]]):
+                print("\t".join(line))
+    elif cmd == ["cloudformation", "execute-change-set"]:
+        state["stacks"][stack] = "UPDATE_COMPLETE" if state["changeset_type"][stack] == "UPDATE" else "CREATE_COMPLETE"
+        save()
+    elif cmd == ["cloudformation", "wait"] and args[2] == "stack-delete-complete":
+        if state.get("delete_fails"):
+            sys.exit(255)
+    elif cmd == ["cloudformation", "list-stack-resources"]:
         for line in state["resources"].get(stack, []):
             print("\t".join(line))
-    elif command == ["ecr", "describe-images"]:
+    elif cmd == ["cloudformation", "get-template"]:
+        sys.stdout.write(open(state["deployed_templates"][stack]).read())
+    elif cmd == ["ecr", "describe-images"]:
         image = flag("--repository-name") + ":" + flag("--image-ids").split("=", 1)[1]
         if image not in state["images"]:
-            missing("An error occurred (ImageNotFoundException): no such image")
+            fail("An error occurred (ImageNotFoundException): no such image")
         print(state["images"][image])
-    elif command == ["ecr", "get-login-password"]:
+    elif cmd == ["ecr", "get-login-password"]:
         print("password")
+    elif cmd == ["elbv2", "modify-load-balancer-attributes"]:
+        if flag("--load-balancer-arn") in state["gone"]:
+            fail("An error occurred (LoadBalancerNotFound): not found")
+    elif cmd == ["secretsmanager", "get-secret-value"]:
+        print(state["secrets"][flag("--secret-id")])
+    elif cmd == ["secretsmanager", "put-secret-value"]:
+        state["secrets"][flag("--secret-id")] = open(flag("--secret-string")[len("file://"):]).read()
+        save()
+    elif cmd == ["secretsmanager", "get-random-password"]:
+        state["random"] += 1
+        save()
+        print(("R%d" % state["random"]).ljust(64, "x"))
+    elif cmd == ["ecs", "describe-services"]:
+        queue = state["rollouts"].get(flag("--services"), [])
+        line = queue.pop(0) if queue else "1\tCOMPLETED\t2\t2"
+        save()
+        print(line)
 elif tool == "git":
     while args and args[0] in ("-C", "-c"):
         args = args[2:]
@@ -93,7 +165,7 @@ elif tool == "git":
 elif tool == "docker" and args[:1] == ["login"]:
     sys.stdin.read()
 elif tool == "docker" and args[:1] == ["push"]:
-    state["images"][args[1].split("/", 1)[1]] = "sha256:1111"
+    state["images"][args[1].split("/", 1)[1]] = state["pushed_digest"]
     save()
 elif tool == "docker" and args[:3] == ["buildx", "imagetools", "create"]:
     state["images"][flag("--tag").split("/", 1)[1]] = state["copied_digest"]
@@ -116,70 +188,87 @@ class Stubbed(unittest.TestCase):
         self.log.touch()
         self.state_file = self.dir / "state.json"
         self.state = {
+            "identity": "arn:aws:sts::123456789012:assumed-role/Deployer/someone",
+            "quota": "6.0",
+            "taken": [],
             "stacks": {},
-            "outputs": {
-                "PlatformRepositoryUri": PLATFORM_URI,
-                "AcsRepositoryUri": ACS_URI,
-                "TemplateBucketName": BUCKET,
-            },
+            "changeset_type": {},
+            "empty": [],
+            "changes": {},
+            "outputs": {"rcs-platform-ecr": {
+                "PlatformRepositoryUri": PLATFORM_URI, "AcsRepositoryUri": ACS_URI, "TemplateBucketName": BUCKET}},
             "resources": {},
+            "deployed_templates": {"rcs-platform": str(PLATFORM), "rcs-platform-ecr": str(ECR)},
+            "gone": [],
             "images": {},
+            "pushed_digest": PUSHED,
             "copied_digest": ACS_DIGEST,
+            "secrets": {},
+            "random": 0,
+            "rollouts": {},
             "dirty": "",
-            "describe": "v0.1.0-3-gabcdef0",
+            "describe": TAG,
         }
         self.env = {
             "PATH": f"{bin_dir}:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(self.dir),
             "STUB_LOG": str(self.log),
             "STUB_STATE": str(self.state_file),
+            "ROTATE_POLL_SECONDS": "0",
         }
 
     def tearDown(self):
         subprocess.run(["rm", "-rf", str(self.dir)], check=True)
 
-    def run_script(self, script, *args, stdin=subprocess.DEVNULL) -> subprocess.CompletedProcess:
+    def run_script(self, script, *args, env=None) -> subprocess.CompletedProcess:
         self.state_file.write_text(json.dumps(self.state))
-        return subprocess.run(["bash", str(script), *args], env=self.env, cwd=self.dir,
-                              stdin=stdin, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(["bash", str(script), *args], env={**self.env, **(env or {})}, cwd=self.dir,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.state = json.loads(self.state_file.read_text())
+        return result
 
-    def sequence(self) -> list[tuple[str, list[str]]]:
-        return [(name, args) for name, args, _ in map(json.loads, self.log.read_text().splitlines())]
-
-    def position(self, tool, *prefix) -> int:
-        [index] = [i for i, (name, args) in enumerate(self.sequence())
-                   if name == tool and args[:len(prefix)] == list(prefix)]
-        return index
+    def records(self) -> list[list]:
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def calls(self, tool=None) -> list[list[str]]:
         """Calls of a tool, without the check that docker has buildx."""
-        found = [json.loads(line) for line in self.log.read_text().splitlines()]
-        return [args for name, args, _ in found
-                if (tool is None or name == tool) and args != ["buildx", "version"]]
+        return [r[1] for r in self.records()
+                if (tool is None or r[0] == tool) and r[1] != ["buildx", "version"]]
 
     def call(self, tool, *prefix) -> list[str]:
-        matches = [args for args in self.calls(tool) if args[:len(prefix)] == list(prefix)]
+        matches = [a for a in self.calls(tool) if a[:len(prefix)] == list(prefix)]
         self.assertEqual(len(matches), 1, f"{tool} {' '.join(prefix)}: {matches}")
         return matches[0]
 
-    def deploys(self, stack) -> list[list[str]]:
-        return [a for a in self.calls("aws")
-                if a[:2] == ["cloudformation", "deploy"] and a[a.index("--stack-name") + 1] == stack]
+    def position(self, tool, *prefix) -> int:
+        [index] = [i for i, r in enumerate(self.records()) if r[0] == tool and r[1][:len(prefix)] == list(prefix)]
+        return index
 
-    def config(self, *extra: str, drop: tuple[str, ...] = ()) -> pathlib.Path:
-        lines = [line for line in EXAMPLE.read_text().splitlines()
-                 if line.split("=", 1)[0] not in drop]
+    def aws(self, *prefix, stack=None) -> list[list[str]]:
+        return [a for a in self.calls("aws") if a[:len(prefix)] == list(prefix)
+                and (stack is None or a[a.index("--stack-name") + 1] == stack)]
+
+    def change_set(self, stack) -> dict:
+        """The parameters of the one change set created for a stack."""
+        found = [r[2] for r in self.records() if r[0] == "aws" and r[1][:2] == ["cloudformation", "create-change-set"]
+                 and r[1][r[1].index("--stack-name") + 1] == stack]
+        self.assertEqual(len(found), 1, f"change sets of {stack}: {found}")
+        pairs = [(p["ParameterKey"], p["ParameterValue"]) for p in found[0]]
+        values = dict(pairs)
+        self.assertEqual(len(values), len(pairs), "a parameter is passed twice")
+        return values
+
+    def config(self, *extra: str, drop: tuple[str, ...] = (), replace: dict | None = None) -> pathlib.Path:
+        replace = replace or {}
+        lines = []
+        for line in EXAMPLE.read_text().splitlines():
+            key = line.split("=", 1)[0]
+            if key in drop:
+                continue
+            lines.append(f"{key}={replace[key]}" if key in replace else line)
         path = self.dir / "test.params"
         path.write_text("\n".join(lines + list(extra)) + "\n")
         return path
-
-
-def overrides(args: list[str]) -> dict[str, str]:
-    values = args[args.index("--parameter-overrides") + 1:]
-    pairs = [value.split("=", 1) for value in values]
-    result = dict(pairs)
-    assert len(result) == len(pairs), "a parameter is passed twice"
-    return result
 
 
 def example_values() -> dict[str, str]:
@@ -191,12 +280,21 @@ def example_values() -> dict[str, str]:
     return values
 
 
+def deploy(*args):
+    return ("--config", str(EXAMPLE), "--yes", *args)
+
+
 class DeployConfig(Stubbed):
     """The config names every parameter; mistakes stop before any call."""
 
     def test_the_example_names_every_parameter_the_script_does_not_set(self):
         parameters = set(check_infra.load(str(PLATFORM))["Parameters"])
         self.assertEqual(set(example_values()), parameters - MANAGED)
+
+    def test_the_script_sets_exactly_the_managed_parameters(self):
+        script = DEPLOY.read_text()
+        listed = re.search(r"MANAGED_PARAMETERS=\(([^)]*)\)", script, re.S)[1].split()
+        self.assertEqual(set(listed), MANAGED)
 
     def test_a_dry_run_calls_neither_aws_nor_docker(self):
         result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--dry-run")
@@ -207,12 +305,9 @@ class DeployConfig(Stubbed):
 
     def test_a_dry_run_shows_every_parameter_once(self):
         result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--dry-run")
-        line = next(line for line in result.stdout.splitlines()
-                    if "--stack-name rcs-platform " in line and "cloudformation deploy" in line)
-        passed = overrides(line.split())
-        parameters = set(check_infra.load(str(PLATFORM))["Parameters"])
-        self.assertEqual(set(passed), parameters)
-        self.assertEqual(passed["ImageTag"], "v0.1.0-3-gabcdef0")
+        listing = result.stdout.split("[4/4]")[1].split("  parameters:")[1].split("+ (describe")[0]
+        passed = [line.strip().split("=", 1)[0] for line in listing.splitlines() if line.strip()]
+        self.assertEqual(sorted(passed), sorted(check_infra.load(str(PLATFORM))["Parameters"]))
 
     def test_a_missing_parameter_is_refused(self):
         result = self.run_script(DEPLOY, "--config", str(self.config(drop=("FtRealm",))), "--dry-run")
@@ -221,154 +316,281 @@ class DeployConfig(Stubbed):
         self.assertEqual(self.calls(), [])
 
     def test_every_mistake_is_reported_at_once(self):
-        path = self.config("Colour=blue", "Environment=prod", "ImageTag=v9", "WafRateLimit=\"2000\"",
-                           "not a line")
+        path = self.config("Colour=blue", "Environment=prod", "ImageTag=v9", "ImageDigest=x",
+                           "WafRateLimit=\"2000\"", "not a line", replace={"FtHostName": "ft.example.com # the FT name"})
         result = self.run_script(DEPLOY, "--config", str(path), "--dry-run")
         self.assertEqual(result.returncode, 2)
         for fragment in ("Colour is not a parameter", "Environment is set twice",
-                         "ImageTag is set by deploy.sh", "WafRateLimit: values are literal",
-                         "expected Key=Value"):
+                         "ImageTag is set by deploy.sh", "ImageDigest is set by deploy.sh",
+                         "WafRateLimit: values are literal", "expected Key=Value",
+                         "FtHostName: comments go on their own line"):
             self.assertIn(fragment, result.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_an_image_tag_without_skip_build_is_refused(self):
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--image-tag", "v1")
+        result = self.run_script(DEPLOY, *deploy("--image-tag", "v1"))
         self.assertEqual(result.returncode, 2)
         self.assertIn("use them with --skip-build", result.stderr)
 
-    def test_a_dirty_tree_is_not_built(self):
-        self.state["dirty"] = " M internal/hss/hss.go\n"
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("uncommitted or untracked files", result.stderr)
-        self.assertEqual(self.calls("aws"), [])
+    def test_an_invalid_image_tag_is_refused(self):
+        for tag in ("bad tag", "-v1", ".v1", "v1/2"):
+            with self.subTest(tag=tag):
+                result = self.run_script(DEPLOY, *deploy("--skip-build", "--image-tag", tag))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("not an image tag", result.stderr)
+
+    def test_a_dirty_tree_is_refused_for_builds_and_rollbacks(self):
+        for dirty in (" M infra/platform.yaml\n", "?? notes.txt\n"):
+            for args in ((), ("--skip-build", "--image-tag", "v0.0.9")):
+                with self.subTest(dirty=dirty, args=args):
+                    self.state["dirty"] = dirty
+                    result = self.run_script(DEPLOY, *deploy(*args))
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("uncommitted or untracked files", result.stderr)
+                    self.assertEqual(self.calls("aws"), [])
+
+    def test_a_failed_identity_call_stops_everything(self):
+        self.state["sts_fails"] = True
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([a[:2] for a in self.calls("aws")], [["sts", "get-caller-identity"]])
 
 
 class Deploy(Stubbed):
     """A deployment against the stubs, from an empty account to a rollback."""
 
+    def existing(self, image_tag="v0.0.9", previous="none"):
+        self.state["stacks"] = {"rcs-platform-ecr": "UPDATE_COMPLETE", "rcs-platform": "UPDATE_COMPLETE"}
+        self.state["outputs"]["rcs-platform"] = {"ImageTag": image_tag, "PreviousImageTag": previous}
+
     def test_a_first_deployment_builds_pushes_and_passes_every_parameter(self):
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE))
+        result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 0, result.stderr)
 
-        [ecr] = self.deploys("rcs-platform-ecr")
-        self.assertEqual(overrides(ecr), {
+        self.assertEqual(self.change_set("rcs-platform-ecr"), {
             "PlatformRepositoryName": "rcs-platform", "AcsRepositoryName": "rcs-platform-acs",
             "UntaggedImageExpiryDays": "7", "MaxTaggedImages": "30"})
-        self.assertEqual(set(overrides(ecr)), set(check_infra.load(str(ECR))["Parameters"]))
-
         make = self.call("make")
         self.assertIn(f"IMAGE={PLATFORM_URI}", make)
-        self.assertIn("VERSION=v0.1.0-3-gabcdef0", make)
-        [[_, _, platform]] = [c for c in map(json.loads, self.log.read_text().splitlines()) if c[0] == "make"]
+        self.assertIn(f"VERSION={TAG}", make)
+        [platform] = [r[2] for r in self.records() if r[0] == "make"]
         self.assertEqual(platform, "linux/amd64")
-        # acs is copied by digest from its release, not built.
         copy = self.call("docker", "buildx", "imagetools", "create")
         self.assertEqual(copy[3:], ["--tag", f"{ACS_URI}:1.4.0", f"{ACS_SOURCE}@{ACS_DIGEST}"])
-        self.assertEqual([a[1] for a in self.calls("docker") if a[0] == "push"],
-                         [f"{PLATFORM_URI}:v0.1.0-3-gabcdef0"])
 
-        [platform_deploy] = self.deploys("rcs-platform")
-        self.assertEqual(platform_deploy[platform_deploy.index("--s3-bucket") + 1], BUCKET)
-        expected = example_values() | {
-            "EcrStackName": "rcs-platform-ecr", "ImageTag": "v0.1.0-3-gabcdef0", "AcsImageTag": "1.4.0"}
-        self.assertEqual(overrides(platform_deploy), expected)
-        # Registry first, then both images, then the platform stack.
+        values = self.change_set("rcs-platform")
+        self.assertEqual(set(values), set(check_infra.load(str(PLATFORM))["Parameters"]))
+        self.assertEqual({k: values[k] for k in example_values()}, example_values())
+        self.assertEqual({k: values[k] for k in MANAGED}, {
+            "EcrStackName": "rcs-platform-ecr", "ImageTag": TAG, "ImageDigest": PUSHED,
+            "AcsImageTag": "1.4.0", "AcsImageDigest": ACS_DIGEST,
+            "S3PrefixListId": "pl-0a1b2c3d", "DynamoDbPrefixListId": "pl-1a2b3c4d",
+            "TemplateRevision": TAG, "PreviousImageTag": "none",
+            "DeployPrincipalArn": "arn:aws:iam::123456789012:role/Deployer"})
+        create = self.aws("cloudformation", "create-change-set", stack="rcs-platform")[0]
+        self.assertEqual(create[create.index("--change-set-type") + 1], "CREATE")
+        url = create[create.index("--template-url") + 1]
+        self.assertTrue(url.startswith(f"https://{BUCKET}.s3.ap-northeast-2.amazonaws.com/rcs-platform/platform-"), url)
+        self.assertIn("Key=rcs:stack,Value=rcs-platform", create)
+        # Registry first, then both images, then the template and the stack.
         steps = [
-            self.position("aws", "cloudformation", "deploy", "--region", "ap-northeast-2", "--stack-name", "rcs-platform-ecr"),
+            self.position("aws", "cloudformation", "execute-change-set", "--region", "ap-northeast-2", "--stack-name", "rcs-platform-ecr"),
             self.position("make"),
-            self.position("docker", "push", f"{PLATFORM_URI}:v0.1.0-3-gabcdef0"),
+            self.position("docker", "push", f"{PLATFORM_URI}:{TAG}"),
             self.position("docker", "buildx", "imagetools", "create"),
-            self.position("aws", "cloudformation", "deploy", "--region", "ap-northeast-2", "--stack-name", "rcs-platform"),
+            self.position("aws", "s3", "cp"),
+            self.position("aws", "cloudformation", "execute-change-set", "--region", "ap-northeast-2", "--stack-name", "rcs-platform"),
         ]
         self.assertEqual(steps, sorted(steps))
 
-    def test_images_already_in_ecr_are_not_built_again(self):
-        self.state["images"] = {"rcs-platform:v0.1.0-3-gabcdef0": "sha256:1111", "rcs-platform-acs:1.4.0": ACS_DIGEST}
+    def test_replacements_are_shown_prominently(self):
+        self.existing()
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        self.state["changes"]["rcs-platform"] = [["Modify", "SubscribersTable", "AWS::DynamoDB::Table", "True"],
+                                                 ["Modify", "HssService", "AWS::ECS::Service", "False"],
+                                                 ["Remove", "OldThing", "AWS::X::Y", ""]]
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"!! Modify +SubscribersTable +AWS::DynamoDB::Table  REPLACED")
+        self.assertRegex(result.stdout, r"!! Remove +OldThing")
+        self.assertIn("1 resources replaced or possibly replaced, 1 removed", result.stdout)
+
+    def test_without_yes_and_without_a_terminal_nothing_runs(self):
+        self.existing()
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
         result = self.run_script(DEPLOY, "--config", str(EXAMPLE))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no terminal to confirm on", result.stderr)
+        self.assertEqual(self.aws("cloudformation", "execute-change-set"), [])
+
+    def test_a_plan_creates_change_sets_and_runs_none(self):
+        self.existing()
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.aws("cloudformation", "execute-change-set"), [])
+        self.assertEqual(len(self.aws("cloudformation", "delete-change-set")), 2)
+        self.assertIn("Plan only", result.stdout)
+
+    def test_a_change_set_without_changes_is_not_run(self):
+        self.existing()
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        self.state["empty"] = ["rcs-platform", "rcs-platform-ecr"]
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.aws("cloudformation", "execute-change-set"), [])
+        self.assertEqual(result.stdout.count("no changes"), 2)
+
+    def test_images_already_in_ecr_are_not_built_again(self):
+        self.state["images"] = {f"rcs-platform:{TAG}": OLD, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls("make") + self.calls("docker"), [])
-        self.assertEqual(len(self.deploys("rcs-platform")), 1)
+        self.assertEqual(self.change_set("rcs-platform")["ImageDigest"], OLD)
 
-    def test_a_rollback_deploys_the_named_images_and_changes_nothing_else(self):
-        self.state["stacks"] = {"rcs-platform-ecr": "UPDATE_COMPLETE", "rcs-platform": "UPDATE_COMPLETE"}
-        self.state["images"] = {"rcs-platform:v0.0.9": "sha256:1111", "rcs-platform-acs:1.4.0": ACS_DIGEST}
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--skip-build", "--image-tag", "v0.0.9")
+    def test_a_rollback_deploys_the_named_image_and_records_what_ran(self):
+        self.existing(image_tag=TAG)
+        self.state["describe"] = TAG
+        self.state["images"] = {"rcs-platform:v0.0.9": OLD, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        result = self.run_script(DEPLOY, *deploy("--skip-build", "--image-tag", "v0.0.9"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.deploys("rcs-platform-ecr"), [])
-        self.assertEqual(self.calls("make") + self.calls("docker") + self.calls("git"), [])
-        [platform_deploy] = self.deploys("rcs-platform")
-        self.assertEqual(overrides(platform_deploy)["ImageTag"], "v0.0.9")
-        self.assertEqual(overrides(platform_deploy)["Environment"], "dev")
+        self.assertEqual(self.aws("cloudformation", "create-change-set", stack="rcs-platform-ecr"), [])
+        self.assertEqual(self.calls("make") + self.calls("docker"), [])
+        values = self.change_set("rcs-platform")
+        self.assertEqual((values["ImageTag"], values["ImageDigest"], values["PreviousImageTag"]), ("v0.0.9", OLD, TAG))
+        self.assertIn("the template comes from v0.1.0-3-gabcdef0, the image from v0.0.9", result.stdout)
+        self.assertIn(f"--skip-build --image-tag {TAG}", result.stdout)
+
+    def test_a_configuration_change_keeps_the_recorded_rollback_target(self):
+        self.existing(image_tag=TAG, previous="v0.0.8")
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.change_set("rcs-platform")["PreviousImageTag"], "v0.0.8")
 
     def test_a_rollback_to_an_image_not_in_ecr_deploys_nothing(self):
-        self.state["stacks"] = {"rcs-platform-ecr": "UPDATE_COMPLETE", "rcs-platform": "UPDATE_COMPLETE"}
+        self.existing()
         self.state["images"] = {"rcs-platform-acs:1.4.0": ACS_DIGEST}
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--skip-build", "--image-tag", "v0.0.9")
+        result = self.run_script(DEPLOY, *deploy("--skip-build", "--image-tag", "v0.0.9"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("rcs-platform:v0.0.9 is not in ECR", result.stderr)
-        self.assertEqual(self.deploys("rcs-platform"), [])
+        self.assertEqual(self.aws("cloudformation", "create-change-set"), [])
 
     def test_a_rollback_needs_an_earlier_deployment(self):
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--skip-build", "--image-tag", "v0.0.9")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("rcs-platform-ecr does not exist", result.stderr)
+        for status in (None, "REVIEW_IN_PROGRESS"):
+            with self.subTest(status=status):
+                self.state["stacks"] = {"rcs-platform-ecr": status} if status else {}
+                result = self.run_script(DEPLOY, *deploy("--skip-build", "--image-tag", "v0.0.9"))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("rcs-platform-ecr does not exist", result.stderr)
 
     def test_a_copy_that_changed_the_bytes_deploys_nothing(self):
-        self.state["copied_digest"] = "sha256:2222"
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE))
+        self.state["copied_digest"] = "sha256:" + "ee" * 32
+        result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 1)
         self.assertIn("after the copy, not " + ACS_DIGEST, result.stderr)
-        self.assertEqual(self.deploys("rcs-platform"), [])
+        self.assertEqual(self.aws("cloudformation", "create-change-set", stack="rcs-platform"), [])
 
     def test_the_pinned_acs_tag_must_hold_the_pinned_bytes(self):
-        self.state["images"] = {"rcs-platform-acs:1.4.0": "sha256:3333"}
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE))
+        self.state["images"] = {"rcs-platform-acs:1.4.0": "sha256:" + "ff" * 32}
+        result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 1)
         self.assertIn("not the pinned " + ACS_DIGEST, result.stderr)
-        self.assertEqual(self.deploys("rcs-platform"), [])
 
     def test_the_acs_pin_is_the_local_stacks(self):
         script = DEPLOY.read_text()
         pinned = {name: re.search(rf'^{name}="([^"]+)"', script, re.M)[1] for name in ("ACS_VERSION", "ACS_DIGEST")}
-        self.assertEqual(pinned, {"ACS_VERSION": "1.4.0", "ACS_DIGEST": ACS_DIGEST})
         makefile = (ROOT / "Makefile").read_text()
-        local = {name: m[1] for name in pinned if (m := re.search(rf"^{name}\s*\?=\s*(\S+)", makefile, re.M))}
-        if not local:
-            self.skipTest("the Makefile pins no acs image yet (#83)")
+        local = {name: re.search(rf"^{name}\s*\?=\s*(\S+)", makefile, re.M)[1] for name in pinned}
         self.assertEqual(local, pinned)
 
-    def test_a_stack_whose_creation_rolled_back_is_refused_before_any_change(self):
-        self.state["stacks"] = {"rcs-platform-ecr": "CREATE_COMPLETE", "rcs-platform": "ROLLBACK_COMPLETE"}
-        result = self.run_script(DEPLOY, "--config", str(EXAMPLE))
+    def test_stacks_that_cannot_be_updated_are_refused_before_any_change(self):
+        cases = [
+            ("rcs-platform", "ROLLBACK_COMPLETE", "ROLLBACK_COMPLETE"),
+            ("rcs-platform", "UPDATE_IN_PROGRESS", "wait for it to finish"),
+            ("rcs-platform-ecr", "ROLLBACK_COMPLETE", "ROLLBACK_COMPLETE"),
+            ("rcs-platform-ecr", "UPDATE_ROLLBACK_IN_PROGRESS", "wait for it to finish"),
+            ("rcs-platform", "UPDATE_ROLLBACK_FAILED", "resolve that first"),
+        ]
+        for stack, status, message in cases:
+            with self.subTest(stack=stack, status=status):
+                self.state["stacks"] = {"rcs-platform-ecr": "CREATE_COMPLETE", "rcs-platform": "CREATE_COMPLETE", stack: status}
+                result = self.run_script(DEPLOY, *deploy())
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+                self.assertIn(stack, result.stderr)
+                self.assertEqual(self.aws("cloudformation", "create-change-set"), [])
+                self.assertEqual(self.calls("make") + self.calls("docker"), [])
+
+    def test_an_empty_review_stack_is_created_afresh(self):
+        self.state["stacks"] = {"rcs-platform": "REVIEW_IN_PROGRESS"}
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        create = self.aws("cloudformation", "create-change-set", stack="rcs-platform")[0]
+        self.assertEqual(create[create.index("--change-set-type") + 1], "CREATE")
+
+    def test_names_retained_by_an_earlier_stack_are_found_first(self):
+        self.state["taken"] = ["table rcs-platform-subscribers", "secret rcs-platform/hss/admin-token"]
+        result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 1)
-        self.assertIn("ROLLBACK_COMPLETE", result.stderr)
-        self.assertEqual([a for a in self.calls("aws") if a[:2] == ["cloudformation", "deploy"]], [])
-        self.assertEqual(self.calls("make") + self.calls("docker"), [])
+        self.assertIn("table rcs-platform-subscribers", result.stderr)
+        self.assertIn("secret rcs-platform/hss/admin-token", result.stderr)
+        self.assertEqual(self.aws("cloudformation", "create-change-set"), [])
+
+    def test_a_retained_repository_is_found_before_the_registry_stack(self):
+        self.state["taken"] = ["repository rcs-platform-acs"]
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("repository rcs-platform-acs exists", result.stderr)
+
+    def test_a_quota_too_small_for_a_rolling_update_is_refused(self):
+        # The example: three services of 0.5 vCPU, one task each, two while
+        # rolling (the relay runs too): 4 x 2 x 0.5 = 4 vCPU.
+        self.state["quota"] = "3.0"
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("needs up to 4.00 Fargate vCPU but the quota is 3.0", result.stderr)
+        self.state["quota"] = None
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cannot read the Fargate vCPU quota", result.stderr)
+
+    def test_values_reach_cloudformation_unchanged(self):
+        value = 'a"b\\c,d=e'
+        result = self.run_script(DEPLOY, "--config", str(self.config(replace={"AcsSmsOriginationIdentity": value})), "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.change_set("rcs-platform")["AcsSmsOriginationIdentity"], value)
 
 
 class Teardown(Stubbed):
     """Deletion only after confirmation; retained resources are listed."""
+
+    LB_ALB = "arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/app/alb/1"
+    LB_NLB = "arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/net/nlb/2"
 
     def setUp(self):
         super().setUp()
         self.state["stacks"] = {"rcs-platform-ecr": "CREATE_COMPLETE", "rcs-platform": "UPDATE_COMPLETE"}
         self.state["resources"] = {
             "rcs-platform": [
-                ["Alb", "AWS::ElasticLoadBalancingV2::LoadBalancer", "arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/app/alb/1"],
-                ["Nlb", "AWS::ElasticLoadBalancingV2::LoadBalancer", "arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/net/nlb/2"],
-                ["SubscribersTable", "AWS::DynamoDB::Table", "rcs-platform-subscribers"],
-                ["HssKey", "AWS::KMS::Key", "key-example"],
-                ["HssAdminToken", "AWS::SecretsManager::Secret", "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:x"],
+                ["Alb", "AWS::ElasticLoadBalancingV2::LoadBalancer", self.LB_ALB, "CREATE_COMPLETE"],
+                ["Nlb", "AWS::ElasticLoadBalancingV2::LoadBalancer", self.LB_NLB, "CREATE_COMPLETE"],
+                ["SubscribersTable", "AWS::DynamoDB::Table", "rcs-platform-subscribers", "CREATE_COMPLETE"],
+                ["HssKey", "AWS::KMS::Key", "key-example", "CREATE_COMPLETE"],
+                ["HssAdminToken", "AWS::SecretsManager::Secret", "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:x", "CREATE_COMPLETE"],
             ],
             "rcs-platform-ecr": [
-                ["PlatformRepository", "AWS::ECR::Repository", "rcs-platform"],
-                ["TemplateBucket", "AWS::S3::Bucket", BUCKET],
+                ["PlatformRepository", "AWS::ECR::Repository", "rcs-platform", "CREATE_COMPLETE"],
+                ["TemplateBucket", "AWS::S3::Bucket", BUCKET, "CREATE_COMPLETE"],
             ],
         }
 
     def deletes(self) -> list[str]:
-        return [a[a.index("--stack-name") + 1] for a in self.calls("aws") if a[:2] == ["cloudformation", "delete-stack"]]
+        return [a[a.index("--stack-name") + 1] for a in self.aws("cloudformation", "delete-stack")]
+
+    def protections(self) -> list[tuple[str, str]]:
+        return [(a[a.index("--load-balancer-arn") + 1], a[a.index("--attributes") + 1].rsplit("=", 1)[1])
+                for a in self.aws("elbv2")]
 
     def test_a_dry_run_calls_nothing_and_lists_what_the_template_retains(self):
         result = self.run_script(TEARDOWN, "--dry-run", "--with-registry")
@@ -394,13 +616,58 @@ class Teardown(Stubbed):
     def test_teardown_lifts_protection_deletes_and_lists_retained_data(self):
         result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
         self.assertEqual(result.returncode, 0, result.stderr)
-        lifted = [a[a.index("--load-balancer-arn") + 1] for a in self.calls("aws") if a[:1] == ["elbv2"]]
-        self.assertEqual(len(lifted), 2)
+        self.assertEqual(self.protections(), [(self.LB_ALB, "false"), (self.LB_NLB, "false")])
         self.assertEqual(self.deletes(), ["rcs-platform"])
+        self.assertEqual(len(self.aws("cloudformation", "get-template")), 1)
         self.assertIn("SubscribersTable  AWS::DynamoDB::Table  rcs-platform-subscribers", result.stdout)
         self.assertIn("HssKey  AWS::KMS::Key  key-example", result.stdout)
         self.assertNotIn("HssAdminToken", result.stdout)
         self.assertIn("kept (pass --with-registry", result.stdout)
+
+    def test_the_retained_list_comes_from_the_deployed_template(self):
+        older = self.dir / "older.yaml"
+        older.write_text(PLATFORM.read_text().replace("  HssKey:\n    Type: AWS::KMS::Key\n    DeletionPolicy: Retain\n",
+                                                      "  HssKey:\n    Type: AWS::KMS::Key\n"))
+        self.state["deployed_templates"]["rcs-platform"] = str(older)
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("HssKey", result.stdout)
+        self.assertIn("SubscribersTable", result.stdout)
+
+    def test_a_rolled_back_creation_with_deleted_load_balancers_is_deleted(self):
+        self.state["stacks"]["rcs-platform"] = "ROLLBACK_COMPLETE"
+        self.state["resources"]["rcs-platform"][0][3] = "DELETE_COMPLETE"
+        self.state["resources"]["rcs-platform"][2][3] = "DELETE_COMPLETE"
+        self.state["gone"] = [self.LB_NLB]
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([arn for arn, _ in self.protections()], [self.LB_NLB])
+        self.assertIn("no longer exists", result.stdout)
+        self.assertEqual(self.deletes(), ["rcs-platform"])
+        self.assertNotIn("rcs-platform-subscribers", result.stdout)
+
+    def test_a_failed_deletion_puts_the_protection_back(self):
+        self.state["delete_fails"] = True
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.protections(), [(self.LB_ALB, "false"), (self.LB_NLB, "false"),
+                                              (self.LB_ALB, "true"), (self.LB_NLB, "true")])
+        self.assertIn("docs/runbook.md#teardown-failed", result.stderr)
+
+    def test_an_empty_review_stack_is_deleted(self):
+        self.state["stacks"]["rcs-platform"] = "REVIEW_IN_PROGRESS"
+        self.state["resources"]["rcs-platform"] = []
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.deletes(), ["rcs-platform"])
+        self.assertEqual(self.aws("cloudformation", "get-template"), [])
+
+    def test_a_stack_in_progress_is_left_alone(self):
+        self.state["stacks"]["rcs-platform"] = "UPDATE_IN_PROGRESS"
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("wait for it to finish", result.stderr)
+        self.assertEqual(self.deletes(), [])
 
     def test_the_registry_goes_after_the_platform_with_its_bucket_emptied(self):
         result = self.run_script(TEARDOWN, "--confirm", "rcs-platform", "--with-registry")
@@ -411,6 +678,77 @@ class Teardown(Stubbed):
                                       "--stack-name", "rcs-platform-ecr"))
         self.assertIn(f"s3://{BUCKET}", self.call("aws", "s3", "rm"))
         self.assertIn("PlatformRepository  AWS::ECR::Repository  rcs-platform", result.stdout)
+
+
+class RotateToken(Stubbed):
+    """The rotation order, the waits between steps, and stopping on failure."""
+
+    def setUp(self):
+        super().setUp()
+        self.state["secrets"] = {"rcs-platform/hss/ft-server-token": "O" * 64,
+                                 "rcs-platform/hss/ft-server-token-next": "S" * 64,
+                                 "rcs-platform/hss/admin-token": "A" * 64,
+                                 "rcs-platform/hss/admin-token-next": "B" * 64}
+
+    def steps(self) -> list[str]:
+        out = []
+        for args in self.calls("aws"):
+            if args[:2] == ["secretsmanager", "put-secret-value"]:
+                out.append("put " + args[args.index("--secret-id") + 1].split("/", 1)[1])
+            elif args[:2] == ["ecs", "update-service"]:
+                out.append("restart " + args[args.index("--service") + 1])
+        return out
+
+    def test_a_rotation_runs_in_an_order_no_restart_can_break(self):
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.steps(), [
+            "put hss/ft-server-token-next", "restart hss",
+            "put hss/ft-server-token-next", "put hss/ft-server-token", "restart hss", "restart ft-server",
+            "put hss/ft-server-token-next", "restart hss"])
+        current = self.state["secrets"]["rcs-platform/hss/ft-server-token"]
+        following = self.state["secrets"]["rcs-platform/hss/ft-server-token-next"]
+        self.assertTrue(current.startswith("R1") and following.startswith("R2"))
+        for value in ("O" * 64, current, following):
+            self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_each_step_waits_for_a_steady_service(self):
+        self.state["rollouts"] = {"hss": ["2\tIN_PROGRESS\t3\t2", "1\tIN_PROGRESS\t2\t2", "1\tCOMPLETED\t1\t2"]}
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.aws("ecs", "describe-services")), 4)
+
+    def test_a_failed_rollout_stops_the_rotation(self):
+        self.state["rollouts"] = {"hss": ["1\tFAILED\t1\t2"]}
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the rotation stops here", result.stderr)
+        self.assertEqual(self.steps(), ["put hss/ft-server-token-next", "restart hss"])
+
+    def test_a_service_that_never_settles_times_out(self):
+        self.state["rollouts"] = {"hss": ["2\tIN_PROGRESS\t3\t2"] * 50}
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", env={"ROTATE_WAIT_SECONDS": "0"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("is not steady after 0 s", result.stderr)
+
+    def test_a_caller_outside_the_stack_stops_after_step_two(self):
+        result = self.run_script(ROTATE, "--token", "hss/admin-token")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.steps(), ["put hss/admin-token-next", "restart hss",
+                                        "put hss/admin-token-next", "put hss/admin-token", "restart hss"])
+        self.assertIn("--step 3", result.stdout)
+
+    def test_step_two_refuses_equal_slots(self):
+        self.state["secrets"]["rcs-platform/hss/ft-server-token-next"] = "O" * 64
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run step 1 first", result.stderr)
+        self.assertEqual(self.steps(), [])
+
+    def test_an_unknown_token_is_refused(self):
+        result = self.run_script(ROTATE, "--token", "hss/other")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.calls(), [])
 
 
 if __name__ == "__main__":

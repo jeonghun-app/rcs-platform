@@ -95,7 +95,7 @@ infra-tools:
 
 .PHONY: infra-lint
 infra-lint: infra-tools ## cfn-lint, the policy checks and the deploy script tests (no AWS access)
-	$(DOCKER) run --rm -v $(CURDIR):/mnt:ro -w /mnt $(SHELLCHECK_IMAGE) scripts/deploy.sh scripts/teardown.sh
+	$(DOCKER) run --rm -v $(CURDIR):/mnt:ro -w /mnt $(SHELLCHECK_IMAGE) scripts/deploy.sh scripts/teardown.sh scripts/rotate-token.sh
 	$(DOCKER) run --rm -u $(shell id -u):$(shell id -g) -v $(CURDIR):/src:ro -w /src \
 	  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 $(INFRAIMAGE) sh -c '\
 	    set -e; cfn-lint infra/ecr.yaml infra/platform.yaml; \

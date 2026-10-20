@@ -471,6 +471,60 @@ class TableKeys(TemplateCase):
         self.assertProblem(t, "HssTaskRole: may read RegistrationsTable; only ScscfTaskRole may")
 
 
+class StackAdditions(TemplateCase):
+    """Bad copies of what #126 adds: endpoints, S-CSCF state, top-level alarms."""
+
+    def test_https_to_the_internet_with_endpoints_on_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssSecurityGroup"]["Properties"]["SecurityGroupEgress"].append(
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0"})
+        self.assertProblem(t, "HssSecurityGroup: sends to 0.0.0.0/0 port 443 even with interface endpoints")
+
+    def test_ft_server_reaching_anything_else_is_refused(self):
+        t = self.changed(Extra={"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {
+            "GroupId": {"Ref": "FtServerSecurityGroup"}, "DestinationSecurityGroupId": {"Ref": "AcsSecurityGroup"},
+            "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080}})
+        self.assertProblem(t, "FtServerSecurityGroup: may send to sg AcsSecurityGroup port 8080")
+
+    def test_a_scan_on_the_scscf_tables_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["ScscfStatePolicy"]["Properties"]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Scan", "Resource": {"Fn::GetAtt": ["RegistrationsTable", "Arn"]}})
+        self.assertProblem(t, "ScscfStatePolicy: may Scan RegistrationsTable")
+
+    def test_the_scscf_key_used_by_the_account_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["ScscfStateKey"]["Properties"]["KeyPolicy"]["Statement"]:
+            if st.get("Sid") == "DeployerCreatesTablesThroughDynamoDb":
+                del st["Condition"]["StringEquals"]["aws:PrincipalArn"]
+        self.assertProblem(t, "ScscfStateKey: root may use the key")
+
+    def test_an_scscf_table_under_another_key_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["RegistrationsTable"]["Properties"]["SSESpecification"]["KMSMasterKeyId"] = "alias/aws/dynamodb"
+        self.assertProblem(t, "RegistrationsTable: not encrypted with a customer-managed key of the stack")
+
+    def test_top_level_metric_alarms_follow_the_rules_too(self):
+        t = copy.deepcopy(self.template)
+        props = t["Resources"]["AcsOtpVolume"]["Properties"]
+        props["Period"], props["Statistic"] = 30, "Average"
+        self.assertProblem(t, "AcsOtpVolume: a period is under 60 s")
+        self.assertProblem(t, "AcsOtpVolume: statistic Average on a service metric")
+
+    def test_a_gauge_alarm_filling_missing_data_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["PcscfTransactionBytes"]["Properties"]["TreatMissingData"] = "notBreaching"
+        self.assertProblem(t, "PcscfTransactionBytes: a gauge or latency treats missing data as notBreaching")
+
+    def test_rcs_as_may_check_conditions_on_its_messages(self):
+        required = {"RcsAsTaskRole": {"MessagesTable": ["dynamodb:ConditionCheckItem"]}}
+        self.assertEqual(check_infra.check_required_actions(self.template, required), [])
+
+    def test_registrations_expire_on_ttl_not_on_the_index_key(self):
+        spec = self.template["Resources"]["RegistrationsTable"]["Properties"]["TimeToLiveSpecification"]
+        self.assertEqual(spec, {"AttributeName": "ttl", "Enabled": True})
+
+
 RUNBOOK = TEMPLATE.parent.parent / "docs" / "runbook.md"
 
 
