@@ -283,8 +283,14 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings}
 	if cur != nil && cur.Key == key {
 		n.Incarnation, n.Version = cur.Incarnation, cur.Version
-	} else if n.Incarnation, err = g.incarnation(); err != nil {
-		return nil, err
+	}
+	if cur == nil || cur.Key != key || !cur.Deregistering.IsZero() {
+		// A record taken over from a deregistration's lease is a new
+		// incarnation (state.Registration.Incarnation): the deregistration
+		// deletes the identities that name the one it claimed.
+		if n.Incarnation, err = g.incarnation(); err != nil {
+			return nil, err
+		}
 	}
 	saved, err := g.cfg.Store.SaveRegistration(ctx, n)
 	if errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrExists) {
@@ -362,7 +368,7 @@ func (g *Registrar) pointOne(ctx context.Context, want state.Identity) error {
 				want.KeepUntil = cur.KeepUntil
 			}
 		}
-		_, err = g.cfg.Store.SaveIdentity(ctx, &want)
+		_, err = g.cfg.Store.SaveIdentity(ctx, &want, now)
 		if !errors.Is(err, state.ErrConflict) && !errors.Is(err, state.ErrExists) && !errors.Is(err, state.ErrNotFound) {
 			return err
 		}
@@ -468,11 +474,7 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 		res = saa.Result
 	}
 	if f := g.cxFailure("SAR", res, err); f != nil {
-		back := claimed.Clone()
-		back.Contacts, back.Deregistering = cur.Contacts, time.Time{}
-		if _, err := g.cfg.Store.SaveRegistration(ctx, back); err != nil {
-			g.count("registrar.deregistration_left_to_sweep")
-		}
+		g.putBack(ctx, claimed, cur.Contacts)
 		return f
 	}
 	g.count("registrar.deregistered")
@@ -484,6 +486,30 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 		g.count("registrar.deregistration_left_to_sweep")
 	}
 	return nil
+}
+
+// putBack gives a set claimed for a deregistration that the HSS could not be
+// told of its bindings back, under a new incarnation, as any record brought
+// back from a lease (state.Registration.Incarnation), and points its
+// identities at it again. Failing that, the lease stands and the sweep after
+// it tells the HSS.
+func (g *Registrar) putBack(ctx context.Context, claimed *state.Registration, bindings []state.Contact) {
+	back := claimed.Clone()
+	back.Contacts, back.Deregistering = bindings, time.Time{}
+	inc, err := g.incarnation()
+	if err != nil {
+		g.count("registrar.deregistration_left_to_sweep")
+		return
+	}
+	back.Incarnation = inc
+	saved, err := g.cfg.Store.SaveRegistration(ctx, back)
+	if err != nil {
+		g.count("registrar.deregistration_left_to_sweep")
+		return
+	}
+	if err := g.point(ctx, saved, latestExpiry(saved.Contacts).Add(state.ProfileGrace)); err != nil {
+		g.internal("pointing the identities at a set put back", err)
+	}
 }
 
 // leasedBy reports whether reg is the record lease was saved as: the same

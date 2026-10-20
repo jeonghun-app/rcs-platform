@@ -47,7 +47,11 @@ const TerminatedGrace = time.Minute
 //
 // A live registration whose Reassert is due is claimed the same way, Reassert
 // moved one lease ahead, and handed to handle, whose before.ReassertDue tells
-// it to tell the HSS again.
+// it to tell the HSS again. The sweep does no more for it: handle saves after
+// under its version, with Reassert and ReassertAttempts cleared once the HSS
+// has taken the SAR, or else with the failure counted and Reassert moved on
+// by a backoff, stopping by MaxReassertAttempts. A handle that only returns
+// nil leaves Reassert one lease ahead, and the set is claimed again then.
 func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, limit int, handle func(before, after *Registration) error) (int, error) {
 	// A listing error that comes with registrations (an item that does not
 	// decode) does not stop the others from being swept.
@@ -65,6 +69,8 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 		}
 		if len(next.Contacts) == 0 {
 			next.Deregistering = now.Add(SweepLease)
+			// Nothing is left to reassert: the set ends.
+			next.Reassert, next.ReassertAttempts = time.Time{}, 0
 		} else if reassert {
 			// Claimed as a deregistration is: another sweep tries after the
 			// lease if this one's handle does not move it.

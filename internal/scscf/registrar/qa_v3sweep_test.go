@@ -221,9 +221,9 @@ func (s *countingStore) KeepIdentity(ctx context.Context, impu string, until, no
 	s.steps.step("KeepIdentity")
 	return s.Store.KeepIdentity(ctx, impu, until, now)
 }
-func (s *countingStore) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
+func (s *countingStore) SaveIdentity(ctx context.Context, i *state.Identity, now time.Time) (*state.Identity, error) {
 	s.steps.step("SaveIdentity")
-	return s.Store.SaveIdentity(ctx, i)
+	return s.Store.SaveIdentity(ctx, i, now)
 }
 func (s *countingStore) DeleteIdentity(ctx context.Context, i *state.Identity) error {
 	s.steps.step("DeleteIdentity")

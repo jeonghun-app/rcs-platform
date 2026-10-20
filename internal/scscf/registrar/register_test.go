@@ -312,6 +312,26 @@ func TestADeregistrationTheHSSCannotBeToldOfKeepsTheBindings(t *testing.T) {
 	if r, err := regOf(e, impu1); err != nil || len(r.Contacts) != 1 {
 		t.Errorf("after the failed deregistration: %+v, %v", r, err)
 	}
+	// Put back from its lease, the record is a new incarnation, and the
+	// identity names it.
+	wantPointed(t, e, impu1)
+}
+
+// wantPointed checks that each of impus names its set's record as it is
+// now, incarnation included.
+func wantPointed(t *testing.T, e *env, impus ...string) {
+	t.Helper()
+	for _, impu := range impus {
+		id, err := e.store.Identity(bg, impu, e.clock.Now())
+		if err != nil {
+			t.Errorf("%s names no set: %v", impu, err)
+			continue
+		}
+		r, err := e.store.Registration(bg, id.Set)
+		if err != nil || r.Incarnation != id.Incarnation {
+			t.Errorf("%s names incarnation %d of %v: %+v, %v", impu, id.Incarnation, id.Set, r, err)
+		}
+	}
 }
 
 func must[T any](v T, err error) func(*testing.T) T {

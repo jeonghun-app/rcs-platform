@@ -45,8 +45,8 @@ func (s *lostStore) DeleteRegistration(ctx context.Context, r *state.Registratio
 	}
 	return err
 }
-func (s *lostStore) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
-	out, err := s.Store.SaveIdentity(ctx, i)
+func (s *lostStore) SaveIdentity(ctx context.Context, i *state.Identity, now time.Time) (*state.Identity, error) {
+	out, err := s.Store.SaveIdentity(ctx, i, now)
 	if err == nil && s.lose("SaveIdentity") {
 		return nil, fmt.Errorf("lost: %w", state.ErrConflict)
 	}

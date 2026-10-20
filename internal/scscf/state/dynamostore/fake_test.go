@@ -78,6 +78,8 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return true
 	case "attribute_not_exists(#pk)":
 		return cur == nil
+	case "attribute_not_exists(#pk) OR #ttl <= :now":
+		return cur == nil || number(cur[names["#ttl"]]) <= number(values[":now"])
 	case "attribute_not_exists(#pk) OR #rcv = :rcv":
 		return cur == nil || number(cur[names["#rcv"]]) == number(values[":rcv"])
 	case "attribute_not_exists(#pk) OR (#rcv <= :rcv AND #ttl <= :ttl)":
@@ -86,6 +88,9 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return cur == nil || number(cur[names["#rcv"]]) <= number(values[":rcv"])
 	case "#v = :v":
 		return cur != nil && sv(cur[names["#v"]]) == sv(values[":v"])
+	case "#v = :v AND (attribute_not_exists(#leased) OR #leased <> :inc)":
+		leased, ok := cur[names["#leased"]]
+		return cur != nil && sv(cur[names["#v"]]) == sv(values[":v"]) && (!ok || number(leased) != number(values[":inc"]))
 	case "attribute_exists(#pk) AND #ttl > :now AND #ttl < :until":
 		return cur != nil && number(cur[names["#ttl"]]) > number(values[":now"]) && number(cur[names["#ttl"]]) < number(values[":until"])
 	case "attribute_exists(#pk) AND #exp > :now":
@@ -226,10 +231,14 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 			}
 			return next
 		}
-	case "SET #ttl = :until":
+	case "SET #ttl = :until", "SET #ttl = :until, #v = #v + :one":
+		bump := aws.ToString(in.UpdateExpression) != "SET #ttl = :until"
 		update = func(cur map[string]types.AttributeValue) map[string]types.AttributeValue {
 			next := maps.Clone(cur)
 			next[n["#ttl"]] = v[":until"]
+			if bump {
+				next[n["#v"]] = num(number(cur[n["#v"]]) + number(v[":one"]))
+			}
 			return next
 		}
 	default:
