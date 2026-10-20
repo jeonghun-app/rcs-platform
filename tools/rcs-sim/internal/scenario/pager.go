@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -17,7 +18,9 @@ import (
 // queueLength bounds the messages a SIP client holds unread.
 const queueLength = 16
 
-// pagerText is what the pager-message scenario sends.
+// pagerText is what the pager-message scenario sends, followed by a token
+// of the run, which tells its messages from those an earlier run left in
+// the network.
 const pagerText = "rcs-sim pager-mode message"
 
 // errNoSIP fails a SIP scenario that has no client configuration, and
@@ -102,6 +105,29 @@ func (c *sipClient) answer(req *sip.Request, ids sip.IDGenerator) *sip.Response 
 	return res
 }
 
+// await waits for the MESSAGE whose CPIM message has the IMDN Message-ID
+// id, and returns it with its CPIM and how many it skipped. A store-and-
+// forward network may first deliver what an earlier run left: a CPIM
+// message with another Message-ID that does not carry token cannot be this
+// run's, so it is skipped. Anything else is returned for the step to judge:
+// one that is not CPIM, or this run's (token) with another Message-ID.
+func (c *sipClient) await(ctx context.Context, id, token string) (*sip.Request, *cpim.Message, int, error) {
+	for skipped := 0; ; skipped++ {
+		m, err := c.next(ctx)
+		if err != nil {
+			return nil, nil, skipped, err
+		}
+		cm, err := readCPIM(m)
+		if err != nil {
+			return m, nil, skipped, err
+		}
+		h, _ := cm.Get(imdn.Namespace, imdn.HeaderMessageID)
+		if h.Value == id || (token != "" && strings.Contains(string(cm.Body), token)) {
+			return m, cm, skipped, nil
+		}
+	}
+}
+
 // next waits for the next MESSAGE the network sends c.
 func (c *sipClient) next(ctx context.Context) (*sip.Request, error) {
 	select {
@@ -139,9 +165,14 @@ func pagerMessage(r *run) error {
 	}); err != nil {
 		return err
 	}
+	token, err := imdn.NewMessageID(r.cfg.Rand)
+	if err != nil {
+		return err
+	}
+	text := pagerText + " " + token
 	var id string
 	if err := r.step("message", func(ctx context.Context) (map[string]int64, error) {
-		body, msgID, err := r.pagerBody(a.self, b.self)
+		body, msgID, err := r.pagerBody(a.self, b.self, text)
 		if err != nil {
 			return nil, err
 		}
@@ -166,36 +197,33 @@ func pagerMessage(r *run) error {
 	var from cpim.Address
 	var sender sip.URI
 	if err := r.step("receive", func(ctx context.Context) (map[string]int64, error) {
-		m, err := b.next(ctx)
+		m, c, skipped, err := b.await(ctx, id, token)
 		if err != nil {
 			return nil, sipError(err)
 		}
+		detail := map[string]int64{"bytes": int64(len(m.Body)), "skipped": int64(skipped)}
 		f, err := m.Header.From()
 		if err != nil {
-			return nil, errors.New("the message has no From")
+			return detail, errors.New("the message has no From")
 		}
 		sender = f.URI
-		c, err := readCPIM(m)
-		if err != nil {
-			return nil, err
-		}
 		if request, err = imdn.ParseRequest(c); err != nil {
-			return nil, errors.New("the message carries no IMDN request")
+			return detail, errors.New("the message carries no IMDN request")
 		}
 		from, _ = c.From()
 		switch {
 		case request.MessageID != id:
-			return nil, errors.New("the message received is not the one sent")
-		case string(c.Body) != pagerText:
-			return nil, errors.New("the message's text changed on the way")
+			return detail, errors.New("the message received is not the one sent")
+		case string(c.Body) != text:
+			return detail, errors.New("the message's text changed on the way")
 		case !request.Dispositions.Wants(imdn.DeliveryNotification, imdn.Delivered):
-			return nil, errors.New("the delivery notification request was lost")
+			return detail, errors.New("the delivery notification request was lost")
 		}
-		return map[string]int64{"bytes": int64(len(m.Body))}, nil
+		return detail, nil
 	}); err != nil {
 		return err
 	}
-	return r.step("delivery-notification", func(ctx context.Context) (map[string]int64, error) {
+	if err := r.step("delivery-notification", func(ctx context.Context) (map[string]int64, error) {
 		n, err := request.Notification(imdn.DeliveryNotification, imdn.Delivered, b.self.URI)
 		if err != nil {
 			return nil, err
@@ -226,31 +254,75 @@ func pagerMessage(r *run) error {
 		if res.StatusCode != 200 && res.StatusCode != 202 {
 			return map[string]int64{"status": int64(res.StatusCode)}, fmt.Errorf("the notification's MESSAGE answered %d", res.StatusCode)
 		}
-		got, err := a.next(ctx)
+		// The notification is told by its own Message-ID, which no
+		// earlier run's can have.
+		got, c, skipped, err := a.await(ctx, nid, "")
 		if err != nil {
 			return nil, sipError(err)
 		}
-		c, err := readCPIM(got)
-		if err != nil {
-			return nil, err
-		}
+		detail := map[string]int64{"bytes": int64(len(got.Body)), "skipped": int64(skipped)}
 		if !imdn.IsNotification(c) {
-			return nil, errors.New("the sender received something other than a notification")
+			return detail, errors.New("the sender received something other than a notification")
 		}
 		back, err := imdn.ParseNotificationMessage(c)
 		switch {
 		case err != nil:
-			return nil, errors.New("the notification does not parse")
+			return detail, errors.New("the notification does not parse")
 		case back.MessageID != id || back.Kind != imdn.DeliveryNotification || back.Status != imdn.Delivered:
-			return nil, errors.New("the notification is not the delivery of the message sent")
+			return detail, errors.New("the notification is not the delivery of the message sent")
 		}
-		return map[string]int64{"bytes": int64(len(got.Body))}, nil
+		return detail, nil
+	}); err != nil {
+		return err
+	}
+	return r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
+		// #135 AC 5: B is not registered. Today the platform answers 480
+		// (TS 24.229 §5.4.3.3): pager mode has no store-and-forward yet,
+		// which comes with rcs-as's SIP side. A network that stores the
+		// message instead (200 or 202) passes only if it delivers it once
+		// B registers again; one that accepts it and drops it fails.
+		if _, err := b.ua.Unregister(ctx); err != nil {
+			return nil, fmt.Errorf("peer: %w", sipError(err))
+		}
+		body, msgID, err := r.pagerBody(a.self, b.self, text)
+		if err != nil {
+			return nil, err
+		}
+		req, err := a.ua.NewMessage(r.cfg.SIPPeer.IMPU, cpim.ContentType, body)
+		if err != nil {
+			return nil, err
+		}
+		res, err := a.ua.Send(ctx, req)
+		if err != nil {
+			return nil, sipError(err)
+		}
+		detail := map[string]int64{"status": int64(res.StatusCode)}
+		switch res.StatusCode {
+		case 480:
+			return detail, nil
+		case 200, 202:
+		default:
+			return detail, fmt.Errorf("MESSAGE to the unregistered peer answered %d, want 480 or store-and-forward", res.StatusCode)
+		}
+		if _, err := b.ua.Register(ctx); err != nil {
+			return detail, fmt.Errorf("peer: %w", sipError(err))
+		}
+		_, c, skipped, err := b.await(ctx, msgID, "")
+		detail["skipped"] = int64(skipped)
+		if err != nil {
+			return detail, fmt.Errorf("MESSAGE to the unregistered peer answered %d, and it never arrived after the peer registered again", res.StatusCode)
+		}
+		if got, err := imdn.ParseRequest(c); err != nil || got.MessageID != msgID || string(c.Body) != text {
+			return detail, errors.New("the stored message changed on the way")
+		}
+		detail["stored"] = 1
+		return detail, nil
 	})
 }
 
-// pagerBody is the CPIM message from self to peer with a delivery
+// pagerBody is the CPIM message from self to peer with text and a delivery
 // notification request (RFC 5438 §6.3), and its IMDN Message-ID.
-func (r *run) pagerBody(self, peer cpim.Address) ([]byte, string, error) {
+func (r *run) pagerBody(self, peer cpim.Address, text string) ([]byte, string, error) {
 	m := &cpim.Message{}
 	for _, h := range [][2]string{
 		{cpim.HeaderFrom, self.String()},
@@ -269,7 +341,7 @@ func (r *run) pagerBody(self, peer cpim.Address) ([]byte, string, error) {
 		return nil, "", err
 	}
 	m.ContentHeaders = []cpim.Field{{Name: "Content-Type", Value: "text/plain;charset=utf-8"}}
-	m.Body = []byte(pagerText)
+	m.Body = []byte(text)
 	body, err := m.Marshal()
 	return body, id, err
 }

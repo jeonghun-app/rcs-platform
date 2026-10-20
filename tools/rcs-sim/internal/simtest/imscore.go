@@ -3,10 +3,13 @@ package simtest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
@@ -26,8 +29,12 @@ type IMSCore struct {
 	// Domain is the home domain, the Digest realm.
 	Domain string
 	// Rewrite, when set before any request, changes each request the core
-	// forwards, as a faulty network element would.
+	// forwards, as a faulty network element would. It runs on the reading
+	// goroutine of the sender's connection, so it must not block.
 	Rewrite func(*sip.Request)
+	// Offline, when set before any request, is what the core does with a
+	// request to an IMPU that has no binding.
+	Offline Offline
 
 	t     testing.TB
 	tr    *transport.Transport
@@ -38,11 +45,45 @@ type IMSCore struct {
 
 	mu       sync.Mutex
 	bindings map[string]transport.FlowID
+	// instances are each IMPU's last registered +sip.instance, and stored
+	// the requests StoreAndForward holds for it, by aorKey.
+	instances map[string]string
+	stored    map[string][]*sip.Request
+}
+
+// Offline is what IMSCore does with a request to an unregistered IMPU.
+type Offline int
+
+const (
+	// Refuse answers 480 (TS 24.229 §5.4.3.3), what the platform does
+	// today.
+	Refuse Offline = iota
+	// StoreAndForward answers 202 and delivers the request when the IMPU
+	// registers again, as rcs-as's store-and-forward will.
+	StoreAndForward
+	// Drop answers 200 and loses the request, as a faulty element would.
+	Drop
+)
+
+// aorKey is how bindings are keyed: scheme, user and host (case folded),
+// without parameters, for registration and routing alike.
+func aorKey(u sip.URI) string {
+	return sip.URI{Scheme: strings.ToLower(u.Scheme), User: u.User, Host: strings.ToLower(u.Host)}.String()
+}
+
+// keyOf is aorKey for an IMPU written out; "" if it does not parse.
+func keyOf(impu string) string {
+	u, err := sip.ParseURI(impu)
+	if err != nil {
+		return ""
+	}
+	return aorKey(u)
 }
 
 // StartIMSCore starts an IMSCore for domain whose users are IMPI to Digest
-// password.
-func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore {
+// password. t1, if given, is its transactions' T1 instead of RFC 3261's
+// 500 ms, for tests that wait out a timer.
+func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...time.Duration) *IMSCore {
 	t.Helper()
 	ds, err := digest.NewServer(digest.ServerConfig{
 		Realm: domain, NonceKey: bytes.Repeat([]byte("i"), digest.MinNonceKeySize),
@@ -51,13 +92,20 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &IMSCore{Domain: domain, t: t, ds: ds, users: users, bindings: map[string]transport.FlowID{}}
+	c := &IMSCore{
+		Domain: domain, t: t, ds: ds, users: users,
+		bindings: map[string]transport.FlowID{}, instances: map[string]string{}, stored: map[string][]*sip.Request{},
+	}
 	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) { c.layer.Receive(in) })
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.tr = tr
-	c.layer = transaction.New(tr, c, transaction.Config{})
+	var cfg transaction.Config
+	if len(t1) > 0 {
+		cfg.T1 = t1[0]
+	}
+	c.layer = transaction.New(tr, c, cfg)
 	t.Cleanup(func() { c.layer.Close(); tr.Close() })
 	if c.Addr, err = tr.Listen(transport.ListenerConfig{
 		Network: transport.TCP, Addr: "127.0.0.1:0", ClientFacing: true,
@@ -72,15 +120,23 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore
 func (c *IMSCore) Registered(impu string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.bindings[impu]
+	_, ok := c.bindings[keyOf(impu)]
 	return ok
 }
 
+// Instance is the +sip.instance impu last registered with, kept after it
+// unregisters; "" if it never did.
+func (c *IMSCore) Instance(impu string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.instances[keyOf(impu)]
+}
+
 // Expire drops impu's binding, as its expiry would: requests to it then
-// get 480 until it registers again.
+// get what Offline says until it registers again.
 func (c *IMSCore) Expire(impu string) {
 	c.mu.Lock()
-	delete(c.bindings, impu)
+	delete(c.bindings, keyOf(impu))
 	c.mu.Unlock()
 }
 
@@ -141,15 +197,32 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) *sip.Response {
 		return res
 	}
 	expires, _ := req.Header.Expires()
-	impu := to.URI.String()
+	impu, key := to.URI.String(), aorKey(to.URI)
 	res, _ := sip.NewResponse(req, 200, "", tag)
+	var held []*sip.Request
 	c.mu.Lock()
 	if expires == 0 {
-		delete(c.bindings, impu)
+		delete(c.bindings, key)
 	} else {
-		c.bindings[impu] = tx.Source().Flow
+		c.bindings[key] = tx.Source().Flow
+		if contacts, err := req.Header.Contact(); err == nil && len(contacts) > 0 {
+			if inst, ok := contacts[0].Instance(); ok {
+				c.instances[key] = inst
+			}
+		}
+		held = c.stored[key]
+		delete(c.stored, key)
 	}
 	c.mu.Unlock()
+	if len(held) > 0 {
+		// After the 2xx has gone, so the client knows it is registered.
+		flow := tx.Source().Flow
+		go func() {
+			for _, fwd := range held {
+				_, _ = c.layer.Request(fwd, transport.Destination{Flow: flow}, func(*sip.Response, error) {})
+			}
+		}()
+	}
 	if expires > 0 {
 		if contacts, err := req.Header.Contact(); err == nil {
 			for _, ct := range contacts {
@@ -165,30 +238,40 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) *sip.Response {
 }
 
 func (c *IMSCore) flowFor(uri sip.URI) (transport.FlowID, bool) {
-	key := sip.URI{Scheme: uri.Scheme, User: uri.User, Host: uri.Host}.String()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	flow, ok := c.bindings[key]
+	flow, ok := c.bindings[aorKey(uri)]
 	return flow, ok
 }
 
 // route forwards a request to the flow its Request-URI is registered on,
 // statefully: the answers come back through tx. An IMPU that is not
-// registered gets 480 (TS 24.229 §5.4.3.3).
+// registered gets what Offline says.
 func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	req := tx.Request()
-	flow, ok := c.flowFor(req.URI)
-	if !ok {
+	answer := func(code int) {
 		tag, _ := c.ids.Tag()
-		res, _ := sip.NewResponse(req, 480, "", tag)
-		c.respond(tx, res)
-		return
+		if res, err := sip.NewResponse(req, code, "", tag); err == nil {
+			c.respond(tx, res)
+		}
 	}
+	flow, ok := c.flowFor(req.URI)
 	fwd, err := c.forwarded(req)
-	if err != nil {
-		tag, _ := c.ids.Tag()
-		res, _ := sip.NewResponse(req, 500, "", tag)
-		c.respond(tx, res)
+	switch {
+	case err != nil:
+		answer(500)
+		return
+	case !ok && c.Offline == StoreAndForward && req.Method == "MESSAGE":
+		c.mu.Lock()
+		c.stored[aorKey(req.URI)] = append(c.stored[aorKey(req.URI)], fwd)
+		c.mu.Unlock()
+		answer(202)
+		return
+	case !ok && c.Offline == Drop:
+		answer(200)
+		return
+	case !ok:
+		answer(480)
 		return
 	}
 	if c.Rewrite != nil {
@@ -197,7 +280,17 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	// Off the reading goroutine: Request waits for room on the other flow.
 	go func() {
 		_, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
-			if err != nil || res.StatusCode == 100 {
+			if err != nil {
+				// The far end never answered, or its flow went: the
+				// originator hears it (RFC 3261 §16.7, §16.8).
+				code := 500
+				if errors.Is(err, transaction.ErrTimeout) {
+					code = 408
+				}
+				answer(code)
+				return
+			}
+			if res.StatusCode == 100 {
 				return
 			}
 			back := res.Clone()

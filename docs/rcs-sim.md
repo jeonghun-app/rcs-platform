@@ -27,7 +27,7 @@ MESSAGE through pcscf) replaces both parts.
 | `ft-resume` | pre-check, interrupted-upload, get_upload_info, resume (or upload-again), get_download_info, download | the server keeps whole leading parts of a broken upload; the PUT with `Content-Range` completes it; the file comes back whole by SHA-256 |
 | `chat-client-originated` | listen-core, allocate (client path), answer (core path), connect, client-to-core, core-to-client, chunked-message, keep-alive, clean, release | ADR 0004's first row: messages both ways with CPIM and IMDN, delivered and displayed notifications, the success report of each message by its Message-ID, a 100 KiB message in 2 KiB chunks, keep-alives on a quiet session; after the release, the client path is refused with 481 |
 | `chat-core-originated` | listen-core, allocate (core path), connect-then-answer, core-sends-first, then as above | ADR 0004's second row: the client connects as soon as it has answered, before pcscf records its path (the PATCH goes 300 ms later, so the relay must wait, `RELAY_PATH_WAIT`), and the network speaks first |
-| `pager-message` | register (both clients), message, receive, delivery-notification | RCC.07 standalone messaging, pager mode (#135): a MESSAGE with CPIM and an IMDN delivery request from the client to the peer's IMPU, answered 200 and received on the peer's flow, its text and Message-ID intact; the delivery notification back to the client as a MESSAGE of its own, to the message's SIP From (RFC 5438 §7.2.1, §12.1.3.1), matched by Message-ID. Both clients unregister at the end. A peer that is not registered makes the message step fail with the core's 480. Needs `-sip-proxy` and a peer IMPI |
+| `pager-message` | register (both clients), message, receive, delivery-notification, peer-offline | RCC.07 standalone messaging, pager mode (#135): a MESSAGE with CPIM and an IMDN delivery request from the client to the peer's IMPU, answered 200 and received on the peer's flow, its text and Message-ID intact; the delivery notification back to the client as a MESSAGE of its own, to the message's SIP From (RFC 5438 §7.2.1, §12.1.3.1), matched by Message-ID. Messages an earlier run left in a store-and-forward network are told by the run's Message-IDs and a token in the text, skipped and counted (`skipped`). Then the peer unregisters and the client sends it another message: today the platform answers 480, which passes; a network that stores it (200 or 202) passes only if it delivers it once the peer registers again (`stored`), and one that accepts it and loses it fails. Both clients unregister at the end. Needs `-sip-proxy` and a peer IMPI |
 
 `all` runs every scenario. It leaves the SIP ones out when no SIP client is configured (no `-sip-proxy`), since a stack without pcscf cannot run them. With `-sip-proxy` they all run, and one that needs a setting not given, such as the peer, fails at its first step with a line that says which. A scenario stops at its first failed step.
 
@@ -227,7 +227,11 @@ first scenario that uses them; the others of #135 come with pcscf and scscf.
 Until then the scenario tests run it against `simtest.IMSCore`, an in-process
 stand-in for the IMS core: a registrar that authenticates with SIP Digest and
 a proxy that routes each request to the flow its Request-URI is registered
-on.
+on (bindings keyed by scheme, user and host, without parameters). A request
+to an IMPU without a binding gets 480, or, as a test chooses, is stored and
+delivered at the next registration, or answered 200 and lost. A request the
+far end never answers is answered 408 to its sender, and one its flow
+cannot take 500.
 
 ## Running it
 
