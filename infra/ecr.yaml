@@ -1,9 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Container registries of the RCS platform (ADR 0003): the platform image, which
-  holds every service binary, and the pinned acs release image (ADR 0006). Kept
-  in a stack of its own so that tearing the platform down never deletes the
-  images its tasks may still need to start from.
+  What the RCS platform stack is deployed from: the container registries of the
+  platform image, which holds every service binary, and of the pinned acs
+  release image (ADR 0006), and the bucket deploy.sh uploads infra/platform.yaml
+  to (it is larger than CloudFormation accepts inline). Kept in a stack of its
+  own so that tearing the platform down never deletes the images its tasks may
+  still need to start from.
 
 Parameters:
   PlatformRepositoryName:
@@ -130,7 +132,45 @@ Resources:
       Tags:
         - { Key: Application, Value: rcs-platform }
 
+  # deploy.sh uploads infra/platform.yaml here for each deployment;
+  # templates are small and keep no secrets, so old ones simply expire.
+  TemplateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-templates, Status: Enabled, ExpirationInDays: 90 }
+      Tags:
+        - { Key: Application, Value: rcs-platform }
+
+  TemplateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TemplateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt TemplateBucket.Arn, !Sub '${TemplateBucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
 Outputs:
+  TemplateBucketName:
+    Description: Where deploy.sh uploads infra/platform.yaml.
+    Value: !Ref TemplateBucket
   PlatformRepositoryUri:
     Description: Where deploy.sh pushes the platform image.
     Value: !GetAtt PlatformRepository.RepositoryUri

@@ -2,9 +2,10 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   RCS platform on AWS (ADR 0003): VPC across two AZs, ECS Fargate cluster, Cloud
   Map namespace, one security group per service in the ADR 0007 matrix, a public
-  NLB for SIP and MSRP and a public ALB with AWS WAF for acs and ft-server. Data
-  stores, task definitions, services and alarms are added to this stack by the
-  service blocks (#56 part 2). Deployed by scripts/deploy.sh, never by hand.
+  NLB for SIP and MSRP, a public ALB with AWS WAF for acs and ft-server, the
+  tables, bucket, key and secrets, and the task definitions, services and
+  alarms of hss, ft-server, msrp-relay and acs; the CSCFs and rcs-as attach to
+  their security groups later. Deployed by scripts/deploy.sh, never by hand.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -20,12 +21,35 @@ Metadata:
           - FtHostName
           - FtDeregistrationDelay
           - PcscfEnabled
+          - ScscfEnabled
           - WafRateLimit
           - WafRateAction
           - NlbAllocationIdA
           - NlbAllocationIdB
           - NlbReusedAddressA
           - NlbReusedAddressB
+      - Label: { default: Release }
+        Parameters: [EcrStackName, ImageTag, ImageDigest, AcsImageTag, AcsImageDigest]
+      - Label: { default: Identity }
+        Parameters: [ImsDomain, FtRealm, AcsHostName, RelayPublicHost]
+      - Label: { default: Services }
+        Parameters:
+          - HssDesiredCount
+          - HssTaskSize
+          - FtServerDesiredCount
+          - FtServerTaskSize
+          - FtValidityDays
+          - FileEncryption
+          - RelayDesiredCount
+          - RelayTaskSize
+          - RelayMaxConnections
+          - AcsDesiredCount
+          - AcsTaskSize
+          - AcsSmsProvider
+          - AcsSmsOriginationIdentity
+          - AcsDefaultRcsProfile
+      - Label: { default: Capacity and alarms }
+        Parameters: [MsrpWarmReadUnits, MsrpWarmWriteUnits, MsrpReadBudget, AlarmTopicArn]
       - Label: { default: Observability }
         Parameters: [ContainerInsights, LogRetentionDays]
 
@@ -89,6 +113,9 @@ Parameters:
   FtHostName:
     Type: String
     Default: ''
+    # Empty, or a lower-case DNS name: a typo fails here, not at the ALB rule
+    # or the service's start.
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       Host name of the FT HTTP content server (the host of ftHTTPCSURI). When
       set, ft-server's routes also match on it, so acs and ft-server can share
@@ -103,6 +130,14 @@ Parameters:
       Seconds a stopping ft-server task keeps receiving in-flight requests
       from the ALB: long enough for most uploads to finish in place
       (docs/ft-server.md, Operations notes).
+
+  ScscfEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Creates what needs scscf to exist (#89): for now the alarm on failed
+      HSS pushes, which until then fail for want of a peer every time.
 
   PcscfEnabled:
     Type: String
@@ -170,6 +205,223 @@ Parameters:
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
     Description: Retention of the VPC Flow Logs and, later, the service log groups.
 
+  # ------------------------------------------------- images, service blocks
+
+  EcrStackName:
+    Type: String
+    Default: rcs-platform-ecr
+    Description: Stack of infra/ecr.yaml, whose repository exports the task definitions use.
+
+  ImageTag:
+    Type: String
+    AllowedPattern: '^[0-9A-Za-z._-]{1,128}$'
+    Description: >
+      Tag of the platform image (git describe; immutable). No default:
+      deploy.sh passes it on every deployment, so a rollback names it.
+
+  ImageDigest:
+    Type: String
+    AllowedPattern: '^sha256:[0-9a-f]{64}$'
+    Description: >
+      Digest of ImageTag in ECR, which the task definitions run, so a task
+      always starts from the bytes deploy.sh checked (deploy.sh sets it).
+
+  AcsImageTag:
+    Type: String
+    AllowedPattern: '^[0-9A-Za-z._-]{1,128}$'
+    Description: Tag of the acs image, the pinned acs release (ADR 0006).
+
+  AcsImageDigest:
+    Type: String
+    AllowedPattern: '^sha256:[0-9a-f]{64}$'
+    Description: Digest of the acs image in ECR (deploy.sh sets it to the pinned ACS_DIGEST).
+
+  ImsDomain:
+    Type: String
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    Description: >
+      Home network domain (RCS_IMS_DOMAIN), e.g. ims.mnc001.mcc001.3gppnetwork.org.
+      Also the IMS Digest realm.
+
+  FtRealm:
+    Type: String
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    Description: >
+      Digest realm of the FT credentials (FT_REALM, HSS_FT_REALM). Must
+      differ from ImsDomain (ADR 0007 §8), so an FT credential can never
+      register in IMS.
+
+  FtValidityDays:
+    Type: String
+    Default: '7'
+    AllowedValues: ['1', '2', '3', '5', '7', '10', '14', '30']
+    Description: >
+      FT_VALIDITY in days. The files bucket's lifecycle expiry (2 x validity
+      + 1 day) and multipart abort are derived from it here, so the two cannot
+      drift apart (docs/ft-server.md, Storage).
+
+  FileEncryption:
+    Type: String
+    Default: AES256
+    AllowedValues: [AES256, 'aws:kms']
+    Description: >
+      FT_SSE: SSE-S3, or SSE-KMS with the account's aws/s3 key. Both encrypt
+      every object; SSE-KMS adds per-request KMS calls and charges.
+
+  HssDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    # A rolling update runs one task more, and a Cloud Map DNS answer lists
+    # at most 8 addresses: a ninth hss task would get no Cx connection from
+    # a CSCF that finds the HSS by DNS (ADR 0005).
+    MaxValue: 7
+  FtServerDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
+  RelayDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
+  AcsDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
+
+  HssTaskSize:
+    Type: String
+    Default: 512x1024
+    AllowedValues: [256x512, 512x1024, 1024x2048, 2048x4096]
+    Description: CPU units x memory MiB of an hss task.
+  FtServerTaskSize:
+    Type: String
+    Default: 512x1024
+    AllowedValues: [512x1024, 1024x2048, 2048x4096]
+    Description: >
+      CPU units x memory MiB of an ft-server task. 1024 MiB holds
+      FT_MAX_CONCURRENT_UPLOADS 32 at 8 MiB parts (docs/ft-server.md, Memory).
+  RelayTaskSize:
+    Type: String
+    Default: 512x1024
+    AllowedValues: [256x512, 512x1024, 1024x2048, 2048x4096]
+    Description: CPU units x memory MiB of an msrp-relay task.
+  AcsTaskSize:
+    Type: String
+    Default: 512x1024
+    AllowedValues: [256x512, 512x1024, 1024x2048]
+    Description: CPU units x memory MiB of an acs task.
+
+  RelayPublicHost:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    Description: >
+      RELAY_PUBLIC_HOST, the host of every client_path: an operator FQDN that
+      names the NLB, or empty for the NLB's own DNS name.
+
+  RelayMaxConnections:
+    Type: Number
+    Default: 5000
+    MinValue: 100
+    MaxValue: 100000
+    Description: >
+      RELAY_MAX_CONNECTIONS per task; size it to the task, not to the worst
+      case (docs/msrp-relay.md, Limits and robustness).
+
+  MsrpWarmReadUnits:
+    Type: Number
+    Default: 12000
+    MinValue: 12000
+    Description: >
+      Warm read throughput of msrp-bindings (units per second), so the burst
+      of re-INVITEs after relay tasks stop is not throttled (#54).
+  MsrpWarmWriteUnits:
+    Type: Number
+    Default: 4000
+    MinValue: 4000
+    Description: Warm write throughput of msrp-bindings (units per second).
+  MsrpReadBudget:
+    Type: Number
+    Default: 1000
+    MinValue: 1
+    Description: >
+      Average read units per second on msrp-bindings above which an alarm
+      fires: lookups of unknown sessions cost one strongly consistent read each.
+
+  AcsHostName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    Description: >
+      Host name of acs on the ALB (the operator's configuration server name),
+      used in the URIs acs hands out. Required outside dev: clients check the
+      ALB certificate against it. Empty in dev uses the ALB's DNS name.
+
+  AcsSmsProvider:
+    Type: String
+    Default: eum
+    AllowedValues: [eum, sns, mock]
+    Description: >
+      ACS_SMS_PROVIDER. mock (dev only) sends nothing. The operator SMSC
+      (smpp) is not wired in this template yet: it needs an egress rule to
+      the SMSC.
+  AcsSmsOriginationIdentity:
+    Type: String
+    Default: ''
+    Description: ACS_SMS_ORIGINATION_IDENTITY for End User Messaging.
+  AcsDefaultRcsProfile:
+    Type: String
+    Default: UP_2.4
+    AllowedValues: [UP_2.4, UP_1.0, joyn_blackbird]
+
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: >
+      SNS topic for alarm and security notifications; empty creates one, to
+      which you subscribe the on-call address after deployment.
+
+Mappings:
+  # CloudFormation has no arithmetic, so values derived from a parameter are
+  # tabulated: the lifecycle of the files bucket from FT_VALIDITY, and the
+  # rolling-update ceiling from a desired count.
+  FtValidity:
+    '1': { Duration: 24h, LifecycleDays: 3, AbortDays: 2 }
+    '2': { Duration: 48h, LifecycleDays: 5, AbortDays: 3 }
+    '3': { Duration: 72h, LifecycleDays: 7, AbortDays: 4 }
+    '5': { Duration: 120h, LifecycleDays: 11, AbortDays: 6 }
+    '7': { Duration: 168h, LifecycleDays: 15, AbortDays: 8 }
+    '10': { Duration: 240h, LifecycleDays: 21, AbortDays: 11 }
+    '14': { Duration: 336h, LifecycleDays: 29, AbortDays: 15 }
+    '30': { Duration: 720h, LifecycleDays: 61, AbortDays: 31 }
+
+  # ADR 0003: maximumPercent 100 + 100/N rounded up, so a rolling update adds
+  # one task and retires one per step and never cuts every connection at once.
+  RollingUpdate:
+    '0': { MaximumPercent: 200 }
+    '1': { MaximumPercent: 200 }
+    '2': { MaximumPercent: 150 }
+    '3': { MaximumPercent: 134 }
+    '4': { MaximumPercent: 125 }
+    '5': { MaximumPercent: 120 }
+    '6': { MaximumPercent: 117 }
+    '7': { MaximumPercent: 115 }
+    '8': { MaximumPercent: 113 }
+    '9': { MaximumPercent: 112 }
+    '10': { MaximumPercent: 110 }
+
+  # CPU units, memory and GOMEMLIMIT (85% of the task memory, so the Go
+  # collector works harder before ECS stops the task for memory) per size.
+  TaskSize:
+    256x512: { Cpu: '256', Memory: '512', GoMemLimit: 435MiB }
+    512x1024: { Cpu: '512', Memory: '1024', GoMemLimit: 870MiB }
+    1024x2048: { Cpu: '1024', Memory: '2048', GoMemLimit: 1740MiB }
+    2048x4096: { Cpu: '2048', Memory: '4096', GoMemLimit: 3480MiB }
+
 Rules:
   ProductionNeedsTls:
     RuleCondition: !Not [!Equals [!Ref Environment, dev]]
@@ -183,6 +435,38 @@ Rules:
           staging and prod need NlbCertificateArn: clients use SIP and MSRP over
           TLS, and msrp-relay refuses to offer plain MSRP.
 
+  ProductionRunsTwoTasks:
+    RuleCondition: !Equals [!Ref Environment, prod]
+    Assertions:
+      - Assert: !And
+          - !Not [!Contains [['0', '1'], !Ref HssDesiredCount]]
+          - !Not [!Contains [['0', '1'], !Ref FtServerDesiredCount]]
+          - !Not [!Contains [['0', '1'], !Ref RelayDesiredCount]]
+          - !Not [!Contains [['0', '1'], !Ref AcsDesiredCount]]
+        AssertDescription: prod runs at least two tasks of every service, across two AZs (architecture §7).
+  SeparateRealms:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref FtRealm, !Ref ImsDomain]]
+        AssertDescription: FtRealm must differ from ImsDomain (ADR 0007 §8).
+  ClientFacingNames:
+    RuleCondition: !Not [!Equals [!Ref Environment, dev]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref FtHostName, '']]
+        AssertDescription: >
+          staging and prod need FtHostName: the FT URIs must name the host the
+          ALB certificate is for, not the ALB's own DNS name.
+      - Assert: !Not [!Equals [!Ref AcsHostName, '']]
+        AssertDescription: staging and prod need AcsHostName, for the same reason.
+      - Assert: !Not [!Equals [!Ref RelayPublicHost, '']]
+        AssertDescription: >
+          staging and prod need RelayPublicHost: clients check the NLB
+          certificate against the host of every client_path.
+  NoMockSmsOutsideDev:
+    RuleCondition: !Not [!Equals [!Ref Environment, dev]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AcsSmsProvider, mock]]
+        AssertDescription: the mock SMS provider sends nothing; dev only.
+
 Conditions:
   IsDev: !Equals [!Ref Environment, dev]
   IsProduction: !Not [!Condition IsDev]
@@ -191,12 +475,23 @@ Conditions:
   HasNlbCertificate: !Not [!Equals [!Ref NlbCertificateArn, '']]
   HasFtHostName: !Not [!Equals [!Ref FtHostName, '']]
   WithPcscf: !Equals [!Ref PcscfEnabled, 'true']
+  WithScscf: !Equals [!Ref ScscfEnabled, 'true']
   WithPcscfTls: !And [!Condition WithPcscf, !Condition HasNlbCertificate]
   # ADR 0003: plain SIP and MSRP are refused outside dev.
   WithPcscfPlain: !And [!Condition WithPcscf, !Condition IsDev]
   WafBlocks: !Equals [!Ref WafRateAction, block]
   NewNlbAddressA: !Equals [!Ref NlbAllocationIdA, '']
   NewNlbAddressB: !Equals [!Ref NlbAllocationIdB, '']
+
+  CreateAlarmTopic: !Equals [!Ref AlarmTopicArn, '']
+  HasRelayPublicHost: !Not [!Equals [!Ref RelayPublicHost, '']]
+  HasAcsHostName: !Not [!Equals [!Ref AcsHostName, '']]
+  AcsRuns: !Not [!Equals [!Ref AcsDesiredCount, '0']]
+  FtServerRuns: !Not [!Equals [!Ref FtServerDesiredCount, '0']]
+  RelayRuns: !Not [!Equals [!Ref RelayDesiredCount, '0']]
+  UseAcsEum: !Equals [!Ref AcsSmsProvider, eum]
+  UseAcsSns: !Equals [!Ref AcsSmsProvider, sns]
+  InUsEast1: !Equals [!Ref AWS::Region, us-east-1]
 
 Resources:
   # ---------------------------------------------------------------- network
@@ -1045,11 +1340,2475 @@ Resources:
             CloudWatchMetricsEnabled: true
             MetricName: rate-per-address
 
+  # WAF logs record every request the ALB receives, for audit. The query
+  # string and the identity and credential headers are redacted: acs's
+  # configuration queries carry IMSI and MSISDN, and ft-server's download ids
+  # are capabilities. (ALB access logs are off for the same reason: they
+  # cannot redact the query string.)
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # WAF requires the aws-waf-logs- prefix.
+      LogGroupName: !Sub 'aws-waf-logs-${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WafLogGroup}'
+      RedactedFields:
+        - QueryString: {}
+        - SingleHeader: { Name: authorization }
+        - SingleHeader: { Name: cookie }
+        - SingleHeader: { Name: x-3gpp-intended-identity }
+
   WebAclAssociation:
     Type: AWS::WAFv2::WebACLAssociation
     Properties:
       ResourceArn: !Ref Alb
       WebACLArn: !GetAtt WebAcl.Arn
+
+  # ------------------------------------------------------------------ data
+  #
+  # Every table: on demand, point-in-time recovery (scripts/check_infra.py
+  # checks it), encryption at rest, deletion protection and Retain outside dev
+  # so that deleting the stack or a mistaken replacement never drops state.
+
+  SubscribersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-subscribers'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: profile, AttributeType: S }
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - IndexName: profile-index
+          KeySchema: [{ AttributeName: profile, KeyType: HASH }]
+          Projection: { ProjectionType: KEYS_ONLY }
+      # The keyring item lives here: losing it loses every stored secret
+      # (docs/hss.md, Secrets).
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      SSESpecification: { SSEEnabled: true }
+      Tags: [{ Key: Service, Value: hss }]
+
+  ServiceProfilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-service-profiles'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      SSESpecification: { SSEEnabled: true }
+      Tags: [{ Key: Service, Value: hss }]
+
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-files'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      SSESpecification: { SSEEnabled: true }
+      Tags: [{ Key: Service, Value: ft-server }]
+
+  # core_path holds rcs-as session ids, which are capabilities (threat model
+  # T3): only the relay's task role reads this table (checked), and nothing
+  # exports it.
+  MsrpBindingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-msrp-bindings'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      WarmThroughput:
+        ReadUnitsPerSecond: !Ref MsrpWarmReadUnits
+        WriteUnitsPerSecond: !Ref MsrpWarmWriteUnits
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      SSESpecification: { SSEEnabled: true }
+      Tags: [{ Key: Service, Value: msrp-relay }]
+
+  AcsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-acs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      # The layout of acs's own infra/app.yaml: OTP challenges and DM sessions
+      # expire themselves.
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      SSESpecification: { SSEEnabled: true }
+      Tags: [{ Key: Service, Value: acs }]
+
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: !Ref FileEncryption }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          # Twice the validity plus a day: S3 dates a multipart object from
+          # the start of its upload, which may complete up to one validity
+          # later (docs/ft-server.md, S3). Downloads refuse expired files
+          # whatever is still here.
+          - Id: expire-files
+            Status: Enabled
+            ExpirationInDays: !FindInMap [FtValidity, !Ref FtValidityDays, LifecycleDays]
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: !FindInMap [FtValidity, !Ref FtValidityDays, AbortDays]
+      Tags: [{ Key: Service, Value: ft-server }]
+
+  FilesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FilesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt FilesBucket.Arn, !Sub '${FilesBucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # The HSS keyring key (docs/hss.md, Secrets). The account administers it,
+  # but only the hss task role may use it, and only with the encryption
+  # context the HSS sets, so no other principal can unwrap the data key.
+  HssKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub 'Wraps the HSS data key of ${AWS::StackName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AdministerWithoutUsing
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
+            Action:
+              - kms:CreateAlias
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: HssWrapsAndUnwraps
+            Effect: Allow
+            Principal: { AWS: !GetAtt HssTaskRole.Arn }
+            Action: [kms:GenerateDataKey, kms:Decrypt]
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:EncryptionContext:service': hss
+                'kms:EncryptionContext:purpose': subscriber-secrets
+
+  HssKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}/hss-keyring'
+      TargetKeyId: !Ref HssKey
+
+  # --------------------------------------------------------------- secrets
+  #
+  # Every token of ADR 0007 §4, current and next, generated here: 64
+  # characters from [A-Za-z0-9] carry about 380 bits. Each is readable only by
+  # the execution roles of the services that hold it (scripts/check_infra.py
+  # refuses a task role that could read one). Tokens rotate by moving the next
+  # value into current (docs/runbook.md).
+
+  HssAdminToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/hss/admin-token'
+      Description: Operator token of the HSS provisioning API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  HssAdminTokenNext:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/hss/admin-token-next'
+      Description: Next operator token of the HSS provisioning API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  AcsHssToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/hss/acs-token'
+      Description: Token acs presents to the HSS provisioning API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  AcsHssTokenNext:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/hss/acs-token-next'
+      Description: Next token acs presents to the HSS provisioning API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  FtHssToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/hss/ft-server-token'
+      Description: Token ft-server presents to the HSS provisioning API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  FtHssTokenNext:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/hss/ft-server-token-next'
+      Description: Next token ft-server presents to the HSS provisioning API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  PcscfRelayToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/msrp-relay/pcscf-token'
+      Description: Token pcscf presents to the msrp-relay control API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  PcscfRelayTokenNext:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/msrp-relay/pcscf-token-next'
+      Description: Next token pcscf presents to the msrp-relay control API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  # One key for every platform service, so that a subscriber's log hints
+  # correlate across services (internal/pii).
+  PiiHmacKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/rcs/pii-hmac-key'
+      Description: RCS_PII_HMAC_KEY, keying the log hints of internal/pii.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  FtNonceKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/ft-server/nonce-key'
+      Description: FT_NONCE_KEY, shared by every ft-server task.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  AcsAdminToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/acs/admin-token'
+      Description: ACS_ADMIN_TOKEN of the acs admin API.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+  AcsPiiHashSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/acs/pii-hash-secret'
+      Description: ACS_PII_HASH_SECRET of acs's log hashing.
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true, IncludeSpace: false }
+
+  # ------------------------------------------------------------------ logs
+
+  HssLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/rcs/${AWS::StackName}/hss', RetentionInDays: !Ref LogRetentionDays }
+  FtServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/rcs/${AWS::StackName}/ft-server', RetentionInDays: !Ref LogRetentionDays }
+  RelayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/rcs/${AWS::StackName}/msrp-relay', RetentionInDays: !Ref LogRetentionDays }
+  AcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/rcs/${AWS::StackName}/acs', RetentionInDays: !Ref LogRetentionDays }
+
+  # ------------------------------------------------------------------- IAM
+  #
+  # Execution roles pull the image, write the log group and read the
+  # service's own secrets; task roles reach the service's own tables, bucket
+  # and key, and no secret (ADR 0007 §4).
+
+  HssExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Starts hss tasks - image, logs, hss's secrets.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryArn' }
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt HssLogGroup.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref PiiHmacKey
+                  - !Ref HssAdminToken
+                  - !Ref HssAdminTokenNext
+                  - !Ref AcsHssToken
+                  - !Ref AcsHssTokenNext
+                  - !Ref FtHssToken
+                  - !Ref FtHssTokenNext
+
+  HssTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: hss tasks - the subscriber and profile tables. The keyring key's policy grants its use.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: tables
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt SubscribersTable.Arn
+                  - !GetAtt ServiceProfilesTable.Arn
+              # Scan with Limit 1 at every start tells an empty table from a
+              # lost keyring (docs/hss.md, Secrets); a task without it exits.
+              # Scoped to the keys-only index, never the table.
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:Scan]
+                Resource: !Sub '${SubscribersTable.Arn}/index/profile-index'
+
+  FtServerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Starts ft-server tasks - image, logs, ft-server's secrets.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryArn' }
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt FtServerLogGroup.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref PiiHmacKey, !Ref FtHssToken, !Ref FtNonceKey]
+
+  FtServerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: ft-server tasks - the files bucket and table (docs/ft-server.md, IAM).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: files
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
+                Resource: !Sub '${FilesBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt FilesBucket.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan, dynamodb:DescribeTable]
+                Resource: !GetAtt FilesTable.Arn
+
+  RelayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Starts msrp-relay tasks - image, logs, the relay's secrets.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryArn' }
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt RelayLogGroup.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref PiiHmacKey, !Ref PcscfRelayToken, !Ref PcscfRelayTokenNext]
+
+  # The only reader of msrp-bindings (#54, threat model T3).
+  MsrpRelayTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: msrp-relay tasks - the bindings table, nothing else.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: bindings
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
+                Resource: !GetAtt MsrpBindingsTable.Arn
+
+  AcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Starts acs tasks - image, logs, acs's secrets.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: { 'Fn::ImportValue': !Sub '${EcrStackName}-AcsRepositoryArn' }
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt AcsLogGroup.Arn
+              # AcsHssToken is added here when acs calls the HSS (ADR 0006: an
+              # acs release); until then acs holds no HSS token.
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref AcsAdminToken, !Ref AcsPiiHashSecret]
+
+  AcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: acs tasks - acs's table and, for OTP, sending SMS.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: table
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:DescribeTable]
+                Resource: !GetAtt AcsTable.Arn
+              # The index is only queried.
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub '${AcsTable.Arn}/index/gsi1'
+        # Only the chosen provider's send action. Sending an SMS to a number
+        # has no resource to scope to, so Resource is '*' as the APIs require;
+        # for SNS a Deny keeps it to phone numbers, never a topic. Whether
+        # End User Messaging's SendTextMessage can be held to the origination
+        # identity's ARN is open (the Service Authorization Reference was not
+        # reachable from the review host); verify before narrowing, since a
+        # wrong resource would stop every OTP.
+        - !If
+          - UseAcsEum
+          - PolicyName: sms
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: sms-voice:SendTextMessage
+                  Resource: '*'
+          - !Ref AWS::NoValue
+        - !If
+          - UseAcsSns
+          - PolicyName: sms
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: '*'
+                - Effect: Deny
+                  Action: sns:Publish
+                  Resource: !Sub 'arn:${AWS::Partition}:sns:*:*:*'
+          - !Ref AWS::NoValue
+
+  # ---------------------------------------------------- service discovery
+
+  HssDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: hss
+      NamespaceId: !Ref Namespace
+      DnsConfig: { DnsRecords: [{ Type: A, TTL: 10 }], RoutingPolicy: MULTIVALUE }
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+  FtServerDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: ft-server
+      NamespaceId: !Ref Namespace
+      DnsConfig: { DnsRecords: [{ Type: A, TTL: 10 }], RoutingPolicy: MULTIVALUE }
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+  RelayDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: msrp-relay
+      NamespaceId: !Ref Namespace
+      DnsConfig: { DnsRecords: [{ Type: A, TTL: 10 }], RoutingPolicy: MULTIVALUE }
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+  AcsDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: acs
+      NamespaceId: !Ref Namespace
+      DnsConfig: { DnsRecords: [{ Type: A, TTL: 10 }], RoutingPolicy: MULTIVALUE }
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  # ------------------------------------------------------ task definitions
+  #
+  # Every container: read-only root file system, all capabilities dropped,
+  # not privileged (scripts/check_infra.py), the image's non-root user, a
+  # health check through -healthcheck (distroless has no shell or curl), and
+  # 120 s to stop, the most Fargate allows, which the services' shutdown
+  # settings use.
+
+  HssTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-hss'
+      Cpu: !FindInMap [TaskSize, !Ref HssTaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref HssTaskSize, Memory]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt HssExecutionRole.Arn
+      TaskRoleArn: !GetAtt HssTaskRole.Arn
+      ContainerDefinitions:
+        - Name: hss
+          Image: !Sub
+            - '${Repository}@${ImageDigest}'
+            - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryUri' }
+          Command: [hss]
+          Essential: true
+          ReadonlyRootFilesystem: true
+          LinuxParameters: { Capabilities: { Drop: [ALL] } }
+          StopTimeout: 120
+          PortMappings:
+            - { ContainerPort: 3868, Protocol: tcp }
+            - { ContainerPort: 8081, Protocol: tcp }
+          HealthCheck: { Command: [CMD, hss, -healthcheck], Interval: 15, Timeout: 5, Retries: 3, StartPeriod: 60 }
+          Environment:
+            - { Name: RCS_ENV, Value: !Ref Environment }
+            - { Name: RCS_IMS_DOMAIN, Value: !Ref ImsDomain }
+            - { Name: RCS_SERVICE_NAMESPACE, Value: !Ref ServiceNamespace }
+            - { Name: RCS_METRICS_NAMESPACE, Value: !Sub 'RCS/${AWS::StackName}' }
+            - { Name: GOMEMLIMIT, Value: !FindInMap [TaskSize, !Ref HssTaskSize, GoMemLimit] }
+            - { Name: HSS_STORE, Value: dynamodb }
+            - { Name: HSS_SUBSCRIBERS_TABLE, Value: !Ref SubscribersTable }
+            - { Name: HSS_PROFILES_TABLE, Value: !Ref ServiceProfilesTable }
+            - { Name: HSS_KMS_KEY_ID, Value: !GetAtt HssKey.Arn }
+            - { Name: HSS_FT_REALM, Value: !Ref FtRealm }
+            # Only the private subnets hold CSCF tasks (ADR 0007 §6).
+            - Name: HSS_DIAMETER_PEER_NETWORKS
+              Value: !Join [',', [!Select [2, !Cidr [!Ref VpcCidr, 4, 12]], !Select [3, !Cidr [!Ref VpcCidr, 4, 12]]]]
+            - { Name: HSS_SCSCF_NAMES, Value: !Sub 'sip:scscf.${ServiceNamespace}' }
+          Secrets:
+            - { Name: RCS_PII_HMAC_KEY, ValueFrom: !Ref PiiHmacKey }
+            - { Name: HSS_ADMIN_TOKEN, ValueFrom: !Ref HssAdminToken }
+            - { Name: HSS_ADMIN_TOKEN_NEXT, ValueFrom: !Ref HssAdminTokenNext }
+            - { Name: HSS_ACS_TOKEN, ValueFrom: !Ref AcsHssToken }
+            - { Name: HSS_ACS_TOKEN_NEXT, ValueFrom: !Ref AcsHssTokenNext }
+            - { Name: HSS_FT_TOKEN, ValueFrom: !Ref FtHssToken }
+            - { Name: HSS_FT_TOKEN_NEXT, ValueFrom: !Ref FtHssTokenNext }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref HssLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: hss
+
+  FtServerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-ft-server'
+      Cpu: !FindInMap [TaskSize, !Ref FtServerTaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref FtServerTaskSize, Memory]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt FtServerExecutionRole.Arn
+      TaskRoleArn: !GetAtt FtServerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: ft-server
+          Image: !Sub
+            - '${Repository}@${ImageDigest}'
+            - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryUri' }
+          Command: [ft-server]
+          Essential: true
+          ReadonlyRootFilesystem: true
+          LinuxParameters: { Capabilities: { Drop: [ALL] } }
+          StopTimeout: 120
+          PortMappings:
+            - { ContainerPort: 8081, Protocol: tcp }
+            - { ContainerPort: 8080, Protocol: tcp }
+          HealthCheck: { Command: [CMD, ft-server, -healthcheck], Interval: 15, Timeout: 5, Retries: 3, StartPeriod: 30 }
+          Environment:
+            - { Name: RCS_ENV, Value: !Ref Environment }
+            - { Name: RCS_SERVICE_NAMESPACE, Value: !Ref ServiceNamespace }
+            - { Name: RCS_METRICS_NAMESPACE, Value: !Sub 'RCS/${AWS::StackName}' }
+            # The ALB has already drained the task (FtDeregistrationDelay)
+            # before SIGTERM; uploads still running get FT_DRAIN_TIMEOUT, and
+            # their leases are released within the stop timeout.
+            - { Name: RCS_SHUTDOWN_TIMEOUT, Value: 115s }
+            - { Name: FT_DRAIN_TIMEOUT, Value: 100s }
+            - { Name: GOMEMLIMIT, Value: !FindInMap [TaskSize, !Ref FtServerTaskSize, GoMemLimit] }
+            - { Name: FT_LISTEN_ADDR, Value: ':8081' }
+            - Name: FT_UPLOAD_URI
+              Value: !Join ['', [!If [HasAlbCertificate, 'https://', 'http://'], !If [HasFtHostName, !Ref FtHostName, !GetAtt Alb.DNSName], /ft]]
+            - Name: FT_DOWNLOAD_URI
+              Value: !Join ['', [!If [HasAlbCertificate, 'https://', 'http://'], !If [HasFtHostName, !Ref FtHostName, !GetAtt Alb.DNSName], /dl]]
+            - { Name: FT_REALM, Value: !Ref FtRealm }
+            - { Name: FT_CREDENTIALS, Value: hss }
+            # Plain http inside the VPC to a Cloud Map name, with the service
+            # token (ADR 0007 §5).
+            - { Name: FT_HSS_URL, Value: !Sub 'http://hss.${ServiceNamespace}:8081' }
+            - { Name: FT_STORE, Value: aws }
+            - { Name: FT_S3_BUCKET, Value: !Ref FilesBucket }
+            - { Name: FT_SSE, Value: !Ref FileEncryption }
+            - { Name: FT_DYNAMODB_TABLE, Value: !Ref FilesTable }
+            - { Name: FT_VALIDITY, Value: !FindInMap [FtValidity, !Ref FtValidityDays, Duration] }
+          Secrets:
+            - { Name: RCS_PII_HMAC_KEY, ValueFrom: !Ref PiiHmacKey }
+            - { Name: FT_HSS_TOKEN, ValueFrom: !Ref FtHssToken }
+            - { Name: FT_NONCE_KEY, ValueFrom: !Ref FtNonceKey }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FtServerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ft-server
+
+  RelayTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-msrp-relay'
+      Cpu: !FindInMap [TaskSize, !Ref RelayTaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref RelayTaskSize, Memory]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt RelayExecutionRole.Arn
+      TaskRoleArn: !GetAtt MsrpRelayTaskRole.Arn
+      ContainerDefinitions:
+        - Name: msrp-relay
+          Image: !Sub
+            - '${Repository}@${ImageDigest}'
+            - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-PlatformRepositoryUri' }
+          Command: [msrp-relay]
+          Essential: true
+          ReadonlyRootFilesystem: true
+          LinuxParameters: { Capabilities: { Drop: [ALL] } }
+          StopTimeout: 120
+          # Connections are file descriptors: room for RelayMaxConnections,
+          # the core side and the store.
+          Ulimits: [{ Name: nofile, SoftLimit: 131072, HardLimit: 131072 }]
+          PortMappings:
+            - { ContainerPort: 2855, Protocol: tcp }
+            - { ContainerPort: 8082, Protocol: tcp }
+          HealthCheck: { Command: [CMD, msrp-relay, -healthcheck], Interval: 15, Timeout: 5, Retries: 3, StartPeriod: 30 }
+          Environment:
+            - { Name: RCS_ENV, Value: !Ref Environment }
+            - { Name: RCS_SERVICE_NAMESPACE, Value: !Ref ServiceNamespace }
+            - { Name: RCS_METRICS_NAMESPACE, Value: !Sub 'RCS/${AWS::StackName}' }
+            - { Name: RCS_PROXY_PROTOCOL, Value: 'true' }
+            # #54: most of the 120 s stop timeout, so clients are not all cut
+            # at once on a rolling update (docs/msrp-relay.md, Settings).
+            - { Name: RCS_SHUTDOWN_TIMEOUT, Value: 115s }
+            - { Name: RELAY_DRAIN_TIMEOUT, Value: 100s }
+            - { Name: GOMEMLIMIT, Value: !FindInMap [TaskSize, !Ref RelayTaskSize, GoMemLimit] }
+            - { Name: RELAY_PUBLIC_HOST, Value: !If [HasRelayPublicHost, !Ref RelayPublicHost, !GetAtt Nlb.DNSName] }
+            # msrps on the NLB's TLS listener; plain msrp on 2855 only in a dev
+            # stack without a certificate, which the relay refuses outside dev.
+            - { Name: RELAY_PUBLIC_PORT, Value: !If [HasNlbCertificate, '2856', '2855'] }
+            - { Name: RELAY_PUBLIC_TLS, Value: !If [HasNlbCertificate, 'true', 'false'] }
+            - { Name: RELAY_CORE_PORTS, Value: '2855' }
+            - { Name: RELAY_DYNAMODB_TABLE, Value: !Ref MsrpBindingsTable }
+            - { Name: RELAY_MAX_CONNECTIONS, Value: !Ref RelayMaxConnections }
+          Secrets:
+            - { Name: RCS_PII_HMAC_KEY, ValueFrom: !Ref PiiHmacKey }
+            - { Name: RELAY_PCSCF_TOKEN, ValueFrom: !Ref PcscfRelayToken }
+            - { Name: RELAY_PCSCF_TOKEN_NEXT, ValueFrom: !Ref PcscfRelayTokenNext }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RelayLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: msrp-relay
+
+  # acs is a Python service from its own repository (ADR 0006), configured as
+  # in that repository's infra/app.yaml. It has no -healthcheck mode; the ALB
+  # checks it.
+  AcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-acs'
+      Cpu: !FindInMap [TaskSize, !Ref AcsTaskSize, Cpu]
+      Memory: !FindInMap [TaskSize, !Ref AcsTaskSize, Memory]
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt AcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt AcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: acs
+          Image: !Sub
+            - '${Repository}@${AcsImageDigest}'
+            - Repository: { 'Fn::ImportValue': !Sub '${EcrStackName}-AcsRepositoryUri' }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          LinuxParameters: { Capabilities: { Drop: [ALL] } }
+          StopTimeout: 30
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: ACS_ENV, Value: !Ref Environment }
+            - { Name: ACS_AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: ACS_STORE_BACKEND, Value: dynamodb }
+            - { Name: ACS_TABLE_NAME, Value: !Ref AcsTable }
+            - { Name: ACS_SMS_PROVIDER, Value: !Ref AcsSmsProvider }
+            - { Name: ACS_SMS_ORIGINATION_IDENTITY, Value: !Ref AcsSmsOriginationIdentity }
+            - { Name: ACS_DEFAULT_RCS_PROFILE, Value: !Ref AcsDefaultRcsProfile }
+            # Empty, acs's default: header enrichment off. acs trusts an
+            # identity header (X-3GPP-Intended-Identity) from clients whose
+            # address, as the ALB saw it, is in these ranges: operator
+            # gateways on the data path, not the ALB. No range of this VPC
+            # (the ALB's subnets included) is ever such a client, so any
+            # value here would only add a way to forge an identity later.
+            - { Name: ACS_TRUSTED_PROXY_CIDRS, Value: '' }
+            - { Name: ACS_DEV_ENDPOINTS_ENABLED, Value: 'false' }
+            - { Name: ACS_METRICS_NAMESPACE, Value: !Sub 'RCS/${AWS::StackName}/acs' }
+            - Name: ACS_DM_ACCOUNT_URI
+              Value: !Join ['', [!If [HasAlbCertificate, 'https://', 'http://'], !If [HasAcsHostName, !Ref AcsHostName, !GetAtt Alb.DNSName], /dm]]
+          Secrets:
+            - { Name: ACS_ADMIN_TOKEN, ValueFrom: !Ref AcsAdminToken }
+            - { Name: ACS_PII_HASH_SECRET, ValueFrom: !Ref AcsPiiHashSecret }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AcsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: acs
+
+  # -------------------------------------------------------------- services
+  #
+  # Two tasks or more in prod (Rules), one task added and one retired per
+  # rolling-update step (ADR 0003), a circuit breaker that rolls back a
+  # deployment whose tasks do not become healthy, no ECS Exec (checked).
+
+  HssService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: hss
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref HssTaskDefinition
+      DesiredCount: !Ref HssDesiredCount
+      CapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+      EnableExecuteCommand: false
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: !FindInMap [RollingUpdate, !Ref HssDesiredCount, MaximumPercent]
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref HssSecurityGroup]
+          AssignPublicIp: DISABLED
+      ServiceRegistries: [{ RegistryArn: !GetAtt HssDiscovery.Arn }]
+
+  FtServerService:
+    Type: AWS::ECS::Service
+    DependsOn: FtServerRule
+    Properties:
+      ServiceName: ft-server
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref FtServerTaskDefinition
+      DesiredCount: !Ref FtServerDesiredCount
+      CapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+      EnableExecuteCommand: false
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: !FindInMap [RollingUpdate, !Ref FtServerDesiredCount, MaximumPercent]
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref FtServerSecurityGroup]
+          AssignPublicIp: DISABLED
+      LoadBalancers: [{ ContainerName: ft-server, ContainerPort: 8081, TargetGroupArn: !Ref FtServerTargetGroup }]
+      ServiceRegistries: [{ RegistryArn: !GetAtt FtServerDiscovery.Arn }]
+
+  # ECS needs the target group on a listener before the service starts. The
+  # listener the relay hands out is the TLS one when there is a certificate,
+  # and in a dev stack without one the plain one (the Rules require a
+  # certificate outside dev); this handle depends on whichever applies.
+  RelayListenerReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      Listener: !If [HasNlbCertificate, !Ref MsrpTlsListener, !Ref MsrpTcpListener]
+
+  RelayService:
+    Type: AWS::ECS::Service
+    DependsOn: RelayListenerReady
+    Properties:
+      ServiceName: msrp-relay
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref RelayTaskDefinition
+      DesiredCount: !Ref RelayDesiredCount
+      CapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+      EnableExecuteCommand: false
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: !FindInMap [RollingUpdate, !Ref RelayDesiredCount, MaximumPercent]
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref MsrpRelaySecurityGroup]
+          AssignPublicIp: DISABLED
+      LoadBalancers: [{ ContainerName: msrp-relay, ContainerPort: 2855, TargetGroupArn: !Ref RelayMsrpTargetGroup }]
+      ServiceRegistries: [{ RegistryArn: !GetAtt RelayDiscovery.Arn }]
+
+  AcsService:
+    Type: AWS::ECS::Service
+    DependsOn: FtServerRule
+    Properties:
+      ServiceName: acs
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref AcsTaskDefinition
+      DesiredCount: !Ref AcsDesiredCount
+      CapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+      EnableExecuteCommand: false
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: !FindInMap [RollingUpdate, !Ref AcsDesiredCount, MaximumPercent]
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref AcsSecurityGroup]
+          AssignPublicIp: DISABLED
+      LoadBalancers: [{ ContainerName: acs, ContainerPort: 8080, TargetGroupArn: !Ref AcsTargetGroup }]
+      ServiceRegistries: [{ RegistryArn: !GetAtt AcsDiscovery.Arn }]
+
+  # ---------------------------------------------------------------- alarms
+  #
+  # From each service's alarm list (docs/ft-server.md, docs/msrp-relay.md,
+  # docs/hss.md) and the load balancers and tables. Every alarm has a
+  # section of the same name in docs/runbook.md. Service metrics are EMF in
+  # the RCS/<stack> namespace with the Service dimension only.
+
+  # Encrypts the alarm topic. CloudWatch, EventBridge and AWS Budgets cannot
+  # use the AWS managed aws/sns key, so the topic has its own, which only they
+  # may use, and only for this account.
+  AlarmKey:
+    Type: AWS::KMS::Key
+    Condition: CreateAlarmTopic
+    Properties:
+      Description: !Sub 'Encrypts the alarm topic of ${AWS::StackName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AdministerWithoutUsing
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root' }
+            Action:
+              - kms:CreateAlias
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: PublishersEncrypt
+            Effect: Allow
+            Principal: { Service: [cloudwatch.amazonaws.com, events.amazonaws.com, budgets.amazonaws.com] }
+            Action: ['kms:GenerateDataKey*', kms:Decrypt]
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlarmTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+      KmsMasterKeyId: !Ref AlarmKey
+
+  # A topic policy replaces the default one, so it names every publisher:
+  # CloudWatch (alarms), EventBridge (security and service events) and,
+  # with the budgets, AWS Budgets (checked).
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateAlarmTopic
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [cloudwatch.amazonaws.com, events.amazonaws.com] }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+
+  FtAuthBackendError:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtAuthBackendError'
+      AlarmDescription: 'The HSS credential lookup fails; uploads get 503. See docs/runbook.md#ftauthbackenderror.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: auth.backend_error
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtAuthBackendError
+          ReturnData: true
+  FtBadCredentialRecord:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtBadCredentialRecord'
+      AlarmDescription: 'A subscriber''s FT credential record in the HSS is unusable. See docs/runbook.md#ftbadcredentialrecord.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: auth.bad_credential_record
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtBadCredentialRecord
+          ReturnData: true
+  FtLookupBusy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtLookupBusy'
+      AlarmDescription: 'Credential lookups pile up: a slow HSS or an unauthenticated flood. See docs/runbook.md#ftlookupbusy.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: auth.lookup_busy
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtLookupBusy
+          ReturnData: true
+  FtStorageErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtStorageErrors'
+      AlarmDescription: 'S3 or DynamoDB fails under ft-server. See docs/runbook.md#ftstorageerrors.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: upload.failed.storage
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.failed.storage
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0) + FILL(m1, 0)'
+          Label: FtStorageErrors
+          ReturnData: true
+  FtMissingObject:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtMissingObject'
+      AlarmDescription: 'A valid file''s object is gone: the lifecycle rule is shorter than the validity. See docs/runbook.md#ftmissingobject.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.failed.missing_object
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtMissingObject
+          ReturnData: true
+  FtUploadsBusy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtUploadsBusy'
+      AlarmDescription: 'ft-server tasks'' upload slots are full; scale out. See docs/runbook.md#ftuploadsbusy.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: upload.failed.busy
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtUploadsBusy
+          ReturnData: true
+  FtDownloadsBusy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtDownloadsBusy'
+      AlarmDescription: 'ft-server tasks'' download slots are full; scale out. See docs/runbook.md#ftdownloadsbusy.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.failed.busy
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtDownloadsBusy
+          ReturnData: true
+  FtLinksBusy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtLinksBusy'
+      AlarmDescription: 'One link or one uploader''s links hit their limit (group fan-out or abuse). See docs/runbook.md#ftlinksbusy.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.failed.file_busy
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.failed.uploader_busy
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0) + FILL(m1, 0)'
+          Label: FtLinksBusy
+          ReturnData: true
+  FtSweepFailed:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtSweepFailed'
+      AlarmDescription: 'The ft-server sweeper fails. See docs/runbook.md#ftsweepfailed.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: sweep.failed
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: FtSweepFailed
+          ReturnData: true
+  RelayStoreErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayStoreErrors'
+      AlarmDescription: 'msrp-relay store calls fail or time out. See docs/runbook.md#relaystoreerrors.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: StoreErrors
+              Dimensions: [{ Name: Service, Value: msrp-relay }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: RelayStoreErrors
+          ReturnData: true
+  RelayLookupPressure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayLookupPressure'
+      AlarmDescription: 'Binds refused for overload or the per-source lookup budget. See docs/runbook.md#relaylookuppressure.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: Refused.BindOverload
+              Dimensions: [{ Name: Service, Value: msrp-relay }]
+            Period: 300
+            Stat: Sum
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: Refused.SourceLookupBudget
+              Dimensions: [{ Name: Service, Value: msrp-relay }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0) + FILL(m1, 0)'
+          Label: RelayLookupPressure
+          ReturnData: true
+  RelayCoreUnreachable:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayCoreUnreachable'
+      AlarmDescription: 'msrp-relay cannot reach rcs-as. See docs/runbook.md#relaycoreunreachable.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: Refused.CoreUnreachable
+              Dimensions: [{ Name: Service, Value: msrp-relay }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: RelayCoreUnreachable
+          ReturnData: true
+  HssCxErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssCxErrors'
+      AlarmDescription: 'Cx requests answered UNABLE_TO_COMPLY for store or keyring failures. See docs/runbook.md#hsscxerrors.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.mar.error
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.sar.error
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: m2
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.uar.error
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: m3
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.lir.error
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0) + FILL(m1, 0) + FILL(m2, 0) + FILL(m3, 0)'
+          Label: HssCxErrors
+          ReturnData: true
+  HssLockBusy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssLockBusy'
+      AlarmDescription: 'Requests time out waiting for a subscriber''s lock. See docs/runbook.md#hsslockbusy.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: lock.busy
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: HssLockBusy
+          ReturnData: true
+  HssApiStoreFailure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssApiStoreFailure'
+      AlarmDescription: 'The provisioning API fails on the store (503 to callers). See docs/runbook.md#hssapistorefailure.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: api.store_failure
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: HssApiStoreFailure
+          ReturnData: true
+  HssApiDataError:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssApiDataError'
+      AlarmDescription: 'Stored HSS data cannot be used (does not decode or open). See docs/runbook.md#hssapidataerror.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: api.data_error
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: HssApiDataError
+          ReturnData: true
+  HssPushFailed:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithScscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssPushFailed'
+      AlarmDescription: 'RTR or PPR pushes find no S-CSCF peer or fail. See docs/runbook.md#hsspushfailed.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: push.rtr.no_peer
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: push.ppr.no_peer
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: m2
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: push.rtr.failed
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: m3
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: push.ppr.failed
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0) + FILL(m1, 0) + FILL(m2, 0) + FILL(m3, 0)'
+          Label: HssPushFailed
+          ReturnData: true
+  HssSqnExhausted:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssSqnExhausted'
+      AlarmDescription: 'A subscriber''s AKA sequence numbers are exhausted. See docs/runbook.md#hsssqnexhausted.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: aka.sqn_exhausted
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: HssSqnExhausted
+          ReturnData: true
+  HssProfileMissing:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssProfileMissing'
+      AlarmDescription: 'Subscriptions refer to a deleted service profile. See docs/runbook.md#hssprofilemissing.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: profile.missing
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: HssProfileMissing
+          ReturnData: true
+  HssKeyringCreated:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssKeyringCreated'
+      AlarmDescription: 'The HSS created a new data key: expected once per new stack only. See docs/runbook.md#hsskeyringcreated.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: keyring.created
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(m0, 0)'
+          Label: HssKeyringCreated
+          ReturnData: true
+  FtTooSlowRatio:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtTooSlowRatio'
+      AlarmDescription: 'Downloads cut off by the rate floor exceed 5% (without slot pressure the 4 KiB/s floor is too high). See docs/runbook.md#fttooslowratio.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0.05
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: num0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.failed.too_slow
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: den0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.served
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: den1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: download.partial
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
+        - Id: ratio
+          Expression: 'IF((FILL(den0, 0) + FILL(den1, 0)) > 20, (FILL(num0, 0)) / (FILL(den0, 0) + FILL(den1, 0)), 0)'
+          Label: FtTooSlowRatio
+          ReturnData: true
+  RelayAlreadyClaimedRatio:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayAlreadyClaimedRatio'
+      AlarmDescription: 'Claims refused as already claimed exceed 5% of claims outside deploy windows: session ids reused or leaked. See docs/runbook.md#relayalreadyclaimedratio.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0.05
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: num0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: Refused.AlreadyClaimed
+              Dimensions: [{ Name: Service, Value: msrp-relay }]
+            Period: 300
+            Stat: Sum
+        - Id: den0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: BindingsClaimed
+              Dimensions: [{ Name: Service, Value: msrp-relay }]
+            Period: 300
+            Stat: Sum
+        - Id: ratio
+          Expression: 'IF((FILL(den0, 0)) > 20, (FILL(num0, 0)) / (FILL(den0, 0)), 0)'
+          Label: RelayAlreadyClaimedRatio
+          ReturnData: true
+  FtSweepStalled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtSweepStalled'
+      AlarmDescription: 'ft-server sweeps stopped reporting their duration: the sweeper is stuck. See docs/runbook.md#ftsweepstalled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: breaching
+      Metrics:
+        - Id: sweeps
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: sweep.duration
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 3600
+            Stat: SampleCount
+  AcsTarget5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AcsTarget5xx'
+      AlarmDescription: 'Over 5% of acs requests through the ALB answer 5xx. See docs/runbook.md#acstarget5xx.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # A ratio, guarded by at least 20 requests in 5 minutes: a count would
+      # miss a full outage at night and fire on 1% at peak.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0.05
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_Target_5XX_Count
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
+            Period: 300
+            Stat: Sum
+        - Id: share
+          Expression: 'IF(FILL(requests, 0) > 20, FILL(errors, 0) / FILL(requests, 0), 0)'
+          Label: AcsTarget5xx
+          ReturnData: true
+  AcsNoHealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: AcsRuns
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AcsNoHealthyTargets'
+      AlarmDescription: 'acs has no healthy target: the service is down for clients. See docs/runbook.md#acsnohealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # Missing data is a breach: with every task gone the target group may
+      # report nothing at all.
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      Metrics:
+        - Id: healthy
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Minimum
+  FtServerNoHealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: FtServerRuns
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtServerNoHealthyTargets'
+      AlarmDescription: 'ft-server has no healthy target: the service is down for clients. See docs/runbook.md#ftservernohealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # Missing data is a breach: with every task gone the target group may
+      # report nothing at all.
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      Metrics:
+        - Id: healthy
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Minimum
+  RelayNoHealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: RelayRuns
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayNoHealthyTargets'
+      AlarmDescription: 'msrp-relay has no healthy target: the service is down for clients. See docs/runbook.md#relaynohealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # Missing data is a breach: with every task gone the target group may
+      # report nothing at all.
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: breaching
+      Metrics:
+        - Id: healthy
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Nlb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt RelayMsrpTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Minimum
+  # The ALB answering by itself: 502/503/504 when no target can take the
+  # request, which no target metric shows.
+  AlbElb5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AlbElb5xx'
+      AlarmDescription: 'Over 5% of ALB requests are answered 5xx by the ALB itself. See docs/runbook.md#albelb5xx.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0.05
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_ELB_5XX_Count
+              Dimensions: [{ Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }]
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions: [{ Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }]
+            Period: 300
+            Stat: Sum
+        - Id: share
+          Expression: 'IF(FILL(requests, 0) > 20, FILL(errors, 0) / FILL(requests, 0), 0)'
+          Label: AlbElb5xx
+          ReturnData: true
+  # Addresses over WafRateLimit: counted (WafRateAction count) or blocked.
+  # Counted ones measure real per-address peaks before blocking; see the
+  # runbook on when to switch.
+  WafRateLimited:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-WafRateLimited'
+      AlarmDescription: 'Client addresses exceed the WAF rate limit (counted or blocked). See docs/runbook.md#wafratelimited.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: counted
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/WAFV2
+              MetricName: CountedRequests
+              Dimensions:
+                - { Name: WebACL, Value: !Sub '${AWS::StackName}-alb' }
+                - { Name: Region, Value: !Ref AWS::Region }
+                - { Name: Rule, Value: rate-per-address }
+            Period: 300
+            Stat: Sum
+        - Id: blocked
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/WAFV2
+              MetricName: BlockedRequests
+              Dimensions:
+                - { Name: WebACL, Value: !Sub '${AWS::StackName}-alb' }
+                - { Name: Region, Value: !Ref AWS::Region }
+                - { Name: Rule, Value: rate-per-address }
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(counted, 0) + FILL(blocked, 0)'
+          Label: WafRateLimited
+          ReturnData: true
+  # docs/hss.md: MAR and SAR latency against HSS_CX_TIMEOUT (3 s). Above 2 s
+  # the CSCFs come close to timing out while cx.*.error, which counts store
+  # failures only, stays at zero. Maximum is exact for a timing (§8).
+  HssCxLatency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HssCxLatency'
+      AlarmDescription: 'MAR or SAR took over 2 s, near the 3 s HSS_CX_TIMEOUT. See docs/runbook.md#hsscxlatency.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 2000
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      TreatMissingData: missing
+      Metrics:
+        - Id: mar
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.mar
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 60
+            Stat: Maximum
+        - Id: sar
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: cx.sar
+              Dimensions: [{ Name: Service, Value: hss }]
+            Period: 60
+            Stat: Maximum
+        - Id: slowest
+          Expression: 'MAX([mar, sar])'
+          Label: HssCxLatency
+          ReturnData: true
+  AcsUnhealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AcsUnhealthyTargets'
+      AlarmDescription: 'Acs has unhealthy targets behind the ALB. See docs/runbook.md#acsunhealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: UnHealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt AcsTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Maximum
+  FtServerTarget5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtServerTarget5xx'
+      AlarmDescription: 'Over 5% of ft-server requests through the ALB answer 5xx. See docs/runbook.md#ftservertarget5xx.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      # A ratio, guarded by at least 20 requests in 5 minutes: a count would
+      # miss a full outage at night and fire on 1% at peak.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0.05
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_Target_5XX_Count
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
+            Period: 300
+            Stat: Sum
+        - Id: share
+          Expression: 'IF(FILL(requests, 0) > 20, FILL(errors, 0) / FILL(requests, 0), 0)'
+          Label: FtServerTarget5xx
+          ReturnData: true
+  FtServerUnhealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FtServerUnhealthyTargets'
+      AlarmDescription: 'FtServer has unhealthy targets behind the ALB. See docs/runbook.md#ftserverunhealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: UnHealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt FtServerTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Maximum
+  RelayUnhealthyTargets:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-RelayUnhealthyTargets'
+      AlarmDescription: 'msrp-relay has unhealthy targets behind the NLB. See docs/runbook.md#relayunhealthytargets.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: UnHealthyHostCount
+              Dimensions:
+                - { Name: LoadBalancer, Value: !GetAtt Nlb.LoadBalancerFullName }
+                - { Name: TargetGroup, Value: !GetAtt RelayMsrpTargetGroup.TargetGroupFullName }
+            Period: 60
+            Stat: Maximum
+  SubscribersThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-SubscribersThrottled'
+      AlarmDescription: 'Requests to the SubscribersTable table are throttled. See docs/runbook.md#subscribersthrottled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: r
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref SubscribersTable }]
+            Period: 60
+            Stat: Sum
+        - Id: w
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref SubscribersTable }]
+            Period: 60
+            Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref SubscribersTable }
+                - { Name: GlobalSecondaryIndexName, Value: profile-index }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref SubscribersTable }
+                - { Name: GlobalSecondaryIndexName, Value: profile-index }
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0)'
+          Label: SubscribersThrottled
+          ReturnData: true
+  ServiceProfilesThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ServiceProfilesThrottled'
+      AlarmDescription: 'Requests to the ServiceProfilesTable table are throttled. See docs/runbook.md#serviceprofilesthrottled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: r
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref ServiceProfilesTable }]
+            Period: 60
+            Stat: Sum
+        - Id: w
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref ServiceProfilesTable }]
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Label: ServiceProfilesThrottled
+          ReturnData: true
+  FilesThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FilesThrottled'
+      AlarmDescription: 'Requests to the FilesTable table are throttled. See docs/runbook.md#filesthrottled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: r
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref FilesTable }]
+            Period: 60
+            Stat: Sum
+        - Id: w
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref FilesTable }]
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Label: FilesThrottled
+          ReturnData: true
+  MsrpBindingsThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-MsrpBindingsThrottled'
+      AlarmDescription: 'Requests to the MsrpBindingsTable table are throttled. See docs/runbook.md#msrpbindingsthrottled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: r
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref MsrpBindingsTable }]
+            Period: 60
+            Stat: Sum
+        - Id: w
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref MsrpBindingsTable }]
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Label: MsrpBindingsThrottled
+          ReturnData: true
+  AcsThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-AcsThrottled'
+      AlarmDescription: 'Requests to the AcsTable table are throttled. See docs/runbook.md#acsthrottled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: r
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref AcsTable }]
+            Period: 60
+            Stat: Sum
+        - Id: w
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref AcsTable }]
+            Period: 60
+            Stat: Sum
+        - Id: gr0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref AcsTable }
+                - { Name: GlobalSecondaryIndexName, Value: gsi1 }
+            Period: 60
+            Stat: Sum
+        - Id: gw0
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - { Name: TableName, Value: !Ref AcsTable }
+                - { Name: GlobalSecondaryIndexName, Value: gsi1 }
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(r, 0) + FILL(w, 0) + FILL(gr0, 0) + FILL(gw0, 0)'
+          Label: AcsThrottled
+          ReturnData: true
+  MsrpBindingsReadBudget:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-MsrpBindingsReadBudget'
+      AlarmDescription: 'Reads on msrp-bindings exceed the budget: lookups of unknown sessions, each one strongly consistent read. See docs/runbook.md#msrpbindingsreadbudget.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref MsrpReadBudget
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: rcu
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ConsumedReadCapacityUnits
+              Dimensions: [{ Name: TableName, Value: !Ref MsrpBindingsTable }]
+            Period: 300
+            Stat: Sum
+        - Id: perSecond
+          Expression: 'FILL(rcu, 0) / 300'
+          Label: MsrpBindingsReadBudget
+          ReturnData: true
+  # Security changes, from CloudTrail management events (a trail must record
+  # them in this account and region): any security group or secret change is
+  # reported, including those a deployment makes.
+  # A service that cannot start tasks (image, secrets, start-up refused) or a
+  # deployment the circuit breaker failed: hss has no load balancer, so no
+  # target metric would show it down.
+  ServiceImpaired:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ECS services of the stack that cannot place, configure or start tasks, or failed a deployment, reported to the alarm topic.
+      # The stack's services by their ARNs: Deployment State Change events
+      # carry no clusterArn in their detail, but both kinds name the service
+      # in resources.
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Service Action, ECS Deployment State Change]
+        resources: [{ prefix: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${Cluster}/' }]
+        detail:
+          eventName:
+            - SERVICE_TASK_START_IMPAIRED
+            - SERVICE_TASK_PLACEMENT_FAILURE
+            - SERVICE_TASK_CONFIGURATION_FAILURE
+            - SERVICE_DEPLOYMENT_FAILED
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  # Key policy and key state changes (threat model T7). Also fires on every
+  # deployment that changes a key policy.
+  KmsKeyChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: KMS key policy and key state changes, reported to the alarm topic.
+      EventPattern:
+        source: [aws.kms]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [kms.amazonaws.com]
+          eventName: [PutKeyPolicy, ScheduleKeyDeletion, DisableKey, CreateGrant, RevokeGrant]
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  # Task definitions decide what runs with which role (T7). Deployments
+  # register new ones, so every deployment reports here too.
+  TaskDefinitionChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ECS task definition registrations and service updates, reported to the alarm topic.
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ecs.amazonaws.com]
+          eventName: [RegisterTaskDefinition, DeregisterTaskDefinition, UpdateService, CreateService, DeleteService]
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  # IAM is global: CloudTrail delivers its events to EventBridge in
+  # us-east-1 only, so this rule exists only in a us-east-1 stack; elsewhere
+  # see docs/aws-deployment.md (Prerequisites).
+  IamPolicyChanges:
+    Type: AWS::Events::Rule
+    Condition: InUsEast1
+    Properties:
+      Description: IAM policy and trust changes, reported to the alarm topic.
+      EventPattern:
+        source: [aws.iam]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [iam.amazonaws.com]
+          eventName:
+            - PutRolePolicy
+            - AttachRolePolicy
+            - DetachRolePolicy
+            - DeleteRolePolicy
+            - UpdateAssumeRolePolicy
+            - PutUserPolicy
+            - AttachUserPolicy
+            - CreatePolicyVersion
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  SecurityGroupChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Security group changes, reported to the alarm topic.
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ec2.amazonaws.com]
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - RevokeSecurityGroupEgress
+            - ModifySecurityGroupRules
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
+
+  SecretChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Secrets Manager changes, reported to the alarm topic.
+      EventPattern:
+        source: [aws.secretsmanager]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [secretsmanager.amazonaws.com]
+          eventName:
+            - PutSecretValue
+            - UpdateSecret
+            - UpdateSecretVersionStage
+            - DeleteSecret
+            - RestoreSecret
+            - RotateSecret
+            - PutResourcePolicy
+            - DeleteResourcePolicy
+      Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
 
 Outputs:
   VpcId:
@@ -1087,3 +3846,20 @@ Outputs:
   OperatorSecurityGroupId:
     Description: Attach to a task or internal load balancer that may call the hss provisioning API.
     Value: !Ref OperatorSecurityGroup
+  FilesBucketName:
+    Value: !Ref FilesBucket
+  AlarmTopic:
+    Description: Subscribe the on-call address here (when the stack created the topic).
+    Value: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+  HssAdminTokenSecret:
+    Description: Secret holding the operator token of the HSS provisioning API.
+    Value: !Ref HssAdminToken
+  AcsAdminTokenSecret:
+    Description: Secret holding the acs admin token.
+    Value: !Ref AcsAdminToken
+  ImageTag:
+    Description: The platform image this stack runs (by digest ImageDigest).
+    Value: !Ref ImageTag
+  AcsImageTag:
+    Description: The acs release this stack runs (by digest AcsImageDigest).
+    Value: !Ref AcsImageTag
