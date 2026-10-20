@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
@@ -76,6 +77,10 @@ func TestListAndVersionAndHelp(t *testing.T) {
 
 func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 	f := simtest.StartFT(t, 64<<10)
+	// ft-server notices the broken upload 4 s late, so get_upload_info
+	// waits longer than the default 3 s settle time: without -upload-settle
+	// reaching the scenario, this run fails (QA on #185).
+	f.SetBrokenUploadDelay(4 * time.Second)
 	corePort := simtest.StandInPort(t)
 	r := simtest.StartRelay(t, corePort)
 	lookup := env("RCS_SIM_FT_USER", simtest.FTUser, "RCS_SIM_FT_PASSWORD", simtest.FTPassword, "RCS_SIM_RELAY_TOKEN", simtest.RelayToken)
