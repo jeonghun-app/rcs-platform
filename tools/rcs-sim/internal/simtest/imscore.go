@@ -112,11 +112,18 @@ func (c *IMSCore) Registered(impu string) bool {
 }
 
 // Expire drops impu's binding, as its expiry would: requests to it then
-// get 480 until it registers again.
+// get 480 until it registers again, and its reg event subscribers are told
+// the contact expired (RFC 3680 §5.3.2), which ends their subscriptions.
 func (c *IMSCore) Expire(impu string) {
 	c.mu.Lock()
+	_, bound := c.bindings[impu]
+	contact := c.contacts[impu]
 	delete(c.bindings, impu)
+	delete(c.contacts, impu)
 	c.mu.Unlock()
+	if bound {
+		c.registrationChanged(regChange{impu: impu, contact: contact, event: "expired"})
+	}
 }
 
 // Request implements transaction.TU.
@@ -223,7 +230,7 @@ type regChange struct {
 // registrationChanged notifies every subscriber of the IMPU's reg event
 // (RFC 3680 §5.2); a de-registration ends the subscriptions.
 func (c *IMSCore) registrationChanged(ch regChange) {
-	gone := ch.event == "unregistered"
+	gone := ch.event == "unregistered" || ch.event == "expired"
 	c.mu.Lock()
 	subs := c.subs[ch.impu]
 	if gone {
