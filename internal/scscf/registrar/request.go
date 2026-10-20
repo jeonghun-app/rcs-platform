@@ -39,6 +39,9 @@ type register struct {
 	// registrar applies it to a contact: one with +sip.instance and reg-id
 	// over an edge proxy whose Path entry has "ob" (RFC 5626 §6).
 	supportsOutbound, outbound bool
+	// pointedAhead is set once an attempt of this REGISTER pointed the
+	// set's identities ahead of saving its record (assign).
+	pointedAhead bool
 }
 
 // parseRegister reads req, or returns the response a malformed one gets.
