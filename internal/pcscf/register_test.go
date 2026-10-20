@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	mrand "math/rand/v2"
+	"net"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -118,10 +119,24 @@ func newTestPcscf(clock *testClock) (*pcscf, idleSet) {
 		registry:     newRegistry(cfg.MaxRegistrations, clock.now),
 		registers:    newLimiter(cfg.RegisterRate, cfg.RegisterBurst, clock.now),
 		allRegisters: newTaskLimit(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, clock.now),
+		initials:     newLimiter(cfg.InitialRate, cfg.InitialBurst, clock.now),
 		icscfFirst:   icscfFirstTimeout, icscfTotal: icscfTotalTimeout,
-		icscfs: icscfAt{"10.0.3.7:5060", "10.0.3.8:5060", "10.0.3.9:5060", "10.0.3.10:5060"}, rand: seededRand(),
-		flows: idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolve: coreResolver{dns: &proxy.DNSResolver{Namespace: cfg.Namespace, Allow: allowCore(cfg), Lookup: scscfAt("10.0.4.4")}},
+		icscfs:  icscfAt{"10.0.3.7:5060", "10.0.3.8:5060", "10.0.3.9:5060", "10.0.3.10:5060"}, rand: seededRand(),
+		dialogKey: []byte("test dialog key"),
+		flows:     idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, idle
+}
+
+// scscfAt answers a lookup of scscf's name with addr, and of any other with
+// no such host.
+func scscfAt(addr string) func(context.Context, string, string) ([]netip.Addr, error) {
+	return func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if host != "scscf.rcs.internal" {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		return []netip.Addr{netip.MustParseAddr(addr)}, nil
+	}
 }
 
 func seededRand() io.Reader { return mrand.NewChaCha8([32]byte{16}) }

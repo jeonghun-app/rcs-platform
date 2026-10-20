@@ -113,7 +113,8 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 504, Reason: "No I-CSCF"}
 	}
 	tries := &icscfTries{left: dsts[1:min(len(dsts), maxICSCFAttempts)], deadline: p.now().Add(p.icscfTotal)}
-	reg := &registration{flow: src.Flow, aor: aor, outbound: usesOutbound(r.Message, contacts), viaKeep: viaKeep(r.Message)}
+	outbound := usesOutbound(r.Message, contacts)
+	reg := &registration{flow: src.Flow, uri: to.URI, aor: aor, outbound: outbound, pathOB: outbound, viaKeep: viaKeep(r.Message)}
 	return proxy.Decision{
 		Targets: []proxy.Target{icscfTarget(r.Message.URI, dsts[0], p.icscfFirst)},
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
@@ -252,13 +253,7 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string
 	if err := req.Header.Add("Route", sip.Address{URI: p.cfg.ICSCF}.String()); err != nil {
 		return err
 	}
-	path := sip.URI{Scheme: "sip", User: string(reg.flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
-	path.Params.Set("transport", "tcp")
-	path.Params.SetFlag("lr")
-	if reg.outbound {
-		path.Params.SetFlag("ob")
-	}
-	if err := req.Header.Prepend("Path", sip.Address{URI: path}.String()); err != nil {
+	if err := req.Header.Prepend("Path", sip.Address{URI: p.pathURI(reg)}.String()); err != nil {
 		return err
 	}
 	if !hasOption(req.Header.Require, "path") {
@@ -290,11 +285,26 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string
 	return nil
 }
 
+// pathURI is the Path pcscf writes for reg's REGISTER: this task's core
+// listener and the flow, with ob when the client uses outbound.
+func (p *pcscf) pathURI(reg *registration) sip.URI {
+	path := sip.URI{Scheme: "sip", User: string(reg.flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
+	path.Params.Set("transport", "tcp")
+	path.Params.SetFlag("lr")
+	if reg.pathOB {
+		path.Params.SetFlag("ob")
+	}
+	return path
+}
+
 // chargingVector is the P-Charging-Vector of a request pcscf sends for a
 // client: the request's charging identifier, and this network as the type 1
 // orig-ioi (TS 24.229 §5.2.2.1 3), §5.2.6.3.3 7); no term-ioi).
 func (p *pcscf) chargingVector(icid string) string {
-	return "icid-value=" + icid + ";orig-ioi=" + p.cfg.HomeDomain
+	var cv sip.ChargingVector
+	cv.Params.Set("icid-value", icid)
+	cv.Params.Set("orig-ioi", p.cfg.HomeDomain)
+	return cv.String()
 }
 
 // icid is a new IMS charging identifier (RFC 7315 §4.6): 128 random bits.
@@ -405,8 +415,10 @@ func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contac
 	saved.expires = p.now().Add(time.Duration(least) * time.Second)
 	saved.serviceRoute, _ = res.Header.ServiceRoute()
 	saved.associated, _ = res.Header.PAssociatedURI()
+	kept := true
 	if err := p.registry.save(&saved); err != nil {
 		p.log.Warn("registration not kept", slog.String("error", err.Error()))
+		kept = false
 	}
 
 	if outbound {
@@ -428,6 +440,10 @@ func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contac
 		// second, this or OnFlowClosed, removes the registration (QA of
 		// #198).
 		p.registry.remove(reg.flow, reg.aor)
+		return
+	}
+	if kept {
+		p.subscribeFor(&saved)
 	}
 }
 

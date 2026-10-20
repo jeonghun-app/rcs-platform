@@ -19,12 +19,14 @@ import (
 
 // fakeCoreNode is icscf or scscf: it accepts pcscf's core connections and
 // answers each request with what answer returns, nothing if that is empty,
-// after passing it to got. Each answer is written once it is ready, so one
-// that waits holds up no other.
+// after passing it to got, or a SUBSCRIBE, which pcscf sends of its own
+// accord after a registration, to subscribes. Each answer is written once
+// it is ready, so one that waits holds up no other.
 type fakeCoreNode struct {
-	ln     net.Listener
-	got    chan *sip.Request
-	answer func(req *sip.Request) string
+	ln         net.Listener
+	got        chan *sip.Request
+	subscribes chan *sip.Request
+	answer     func(req *sip.Request) string
 }
 
 func startCoreNode(t *testing.T, answer func(*sip.Request) string) *fakeCoreNode {
@@ -34,7 +36,7 @@ func startCoreNode(t *testing.T, answer func(*sip.Request) string) *fakeCoreNode
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	f := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), answer: answer}
+	f := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), subscribes: make(chan *sip.Request, 16), answer: answer}
 	go func() {
 		for {
 			nc, err := ln.Accept()
@@ -60,7 +62,14 @@ func (f *fakeCoreNode) serve(t *testing.T, nc net.Conn) {
 		if !ok {
 			continue
 		}
-		f.got <- req
+		if req.Method == "SUBSCRIBE" {
+			select {
+			case f.subscribes <- req:
+			default:
+			}
+		} else {
+			f.got <- req
+		}
 		go func() {
 			if a := f.answer(req); a != "" {
 				mu.Lock()
@@ -174,7 +183,7 @@ func TestARegisterCrossesPcscfAndItsFlowsClosureEndsIt(t *testing.T) {
 	if err != nil || len(paths) != 1 {
 		t.Fatalf("Path %q, %v", got.Header.Get("Path"), err)
 	}
-	if want := fmt.Sprintf("127.0.0.1:%d", s.core.Port()); fmt.Sprintf("%s:%d", paths[0].URI.Host, paths[0].URI.Port) != want {
+	if want := fmt.Sprintf("127.0.0.2:%d", s.core.Port()); fmt.Sprintf("%s:%d", paths[0].URI.Host, paths[0].URI.Port) != want {
 		t.Errorf("Path %q names %s:%d, want the core listener %s", got.Header.Get("Path"), paths[0].URI.Host, paths[0].URI.Port, want)
 	}
 	if vias, _ := got.Header.Via(); len(vias) == 0 || vias[0].Port != int(s.core.Port()) {
@@ -240,8 +249,8 @@ func TestARegisterFailsOverToAnotherICSCF(t *testing.T) {
 	port := icscf.ln.Addr().(*net.TCPAddr).Port
 	cfg := testConfig()
 	cfg.ICSCF = mustURI(t, fmt.Sprintf("sip:icscf.rcs.internal:%d;transport=tcp;lr", port))
-	// Nothing listens on 127.0.0.2 at icscf's port: connecting is refused.
-	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.2", "127.0.0.1")})
+	// Nothing listens on 127.0.0.3 at icscf's port: connecting is refused.
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.3", "127.0.0.1")})
 	c := dial(t, s.client, nil)
 	for i := range 20 {
 		if res := registerOver(t, c); res.StatusCode != 200 {
@@ -250,7 +259,7 @@ func TestARegisterFailsOverToAnotherICSCF(t *testing.T) {
 		<-icscf.got
 	}
 
-	dead := start(t, cfg, deps{lookup: icscfLookup("127.0.0.2", "127.0.0.3")})
+	dead := start(t, cfg, deps{lookup: icscfLookup("127.0.0.3", "127.0.0.4")})
 	if res := registerOver(t, dial(t, dead.client, nil)); res.StatusCode != 504 {
 		t.Errorf("every icscf dead: %d, want 504", res.StatusCode)
 	}

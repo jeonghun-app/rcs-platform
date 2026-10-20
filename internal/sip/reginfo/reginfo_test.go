@@ -2,11 +2,13 @@ package reginfo
 
 import (
 	"errors"
+	"math/rand/v2"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -385,8 +387,15 @@ func TestAParamIsReadWithoutCaseAndUnquoted(t *testing.T) {
 
 // docs/architecture.md §8: a parser is linear on a maximum-size adversarial
 // input. Times are compared, not bounded, so a loaded host slows both
-// alike; the best of three runs smooths out the rest.
+// alike; the two sizes are timed in turn and the best of five runs of each
+// is compared, so a burst of load costs one run, not one size. Under the
+// race detector the test is skipped: it times its own instrumentation as
+// much as the parser, and failed so on a loaded host (#223 QA); the run
+// without it is the one that catches a quadratic parser.
 func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
+	if raceEnabled {
+		t.Skip("timing under the race detector says little about the parser")
+	}
 	for name, build := range map[string]func(n int) string{
 		"attributes on the root": func(n int) string {
 			var b strings.Builder
@@ -442,20 +451,21 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 				_, _ = Parse([]byte(text))
 				return time.Since(start)
 			}
-			best := func(n int) time.Duration {
+			input := func(n int) string {
 				text := build(n)
 				if len(text) > MaxDocumentSize {
 					t.Fatalf("input of %d bytes", len(text))
 				}
-				d := parse(text)
-				for range 2 {
-					d = min(d, parse(text))
-				}
-				return d
+				return text
+			}
+			smallText, largeText := input(MaxDocumentSize/64), input(MaxDocumentSize)
+			small, large := time.Duration(1<<62), time.Duration(1<<62)
+			for range 5 {
+				small = min(small, parse(smallText))
+				large = min(large, parse(largeText))
 			}
 			// 64 times the input: about 64 times the time if linear, 4096
 			// if quadratic; the bound between needs no absolute slack.
-			small, large := best(MaxDocumentSize/64), best(MaxDocumentSize)
 			if large > 512*small {
 				t.Fatalf("64× the input took %v against %v: not linear", large, small)
 			}
@@ -597,5 +607,156 @@ func TestASenderOnlyRefusalIsNotWritable(t *testing.T) {
 	}
 	if _, err := (&Info{State: "x"}).Marshal(); errors.Is(err, ErrNotWritable) {
 		t.Errorf("a document Parse refuses too: %v", err)
+	}
+}
+
+// An address-of-record with no canonical IMPU form compares as
+// sip.URI.Equal does (RFC 3261 §19.1.4, RFC 3966 §4): two spellings of one
+// are a repeated AOR in Parse and Marshal, and ByAOR finds it from either
+// (#247).
+func TestAnAORWithoutACanonicalFormComparesAsURIsDo(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"sip:%61lice@h.example:5070", "sip:alice@h.example:5070"},
+		{"sip:alice@h.example:5070;transport=TCP", "sip:alice@h.example:5070;transport=tcp"},
+		{"sip:alice@h.example:5070;foo=bar", "sip:alice@h.example:5070"},
+		{"tel:12-34;phone-context=example.com", "tel:1234;phone-context=example.com"},
+		{"sip:example.com", "sip:EXAMPLE.com;foo=bar"},
+	} {
+		a, b := uri(t, pair[0]), uri(t, pair[1])
+		if !a.Equal(b) {
+			t.Fatalf("%s and %s are not Equal", pair[0], pair[1])
+		}
+		two := doc(`<registration aor="` + pair[0] + `" id="a" state="active"/><registration aor="` + pair[1] + `" id="b" state="active"/>`)
+		if _, err := Parse([]byte(two)); !errors.Is(err, ErrMalformed) {
+			t.Errorf("Parse %s, %s: %v", pair[0], pair[1], err)
+		}
+		info := &Info{State: Full, Registrations: []Registration{{AOR: pair[0], ID: "a", State: Active}, {AOR: pair[1], ID: "b", State: Active}}}
+		if _, err := info.Marshal(); !errors.Is(err, ErrMalformed) {
+			t.Errorf("Marshal %s, %s: %v", pair[0], pair[1], err)
+		}
+		one := &Info{State: Full, Registrations: []Registration{{AOR: pair[0], ID: "a", State: Active}}}
+		if _, ok := one.ByAOR(b); !ok {
+			t.Errorf("ByAOR(%s) in a document of %s", pair[1], pair[0])
+		}
+		one.Registrations[0].AOR = pair[1]
+		if _, ok := one.ByAOR(a); !ok {
+			t.Errorf("ByAOR(%s) in a document of %s", pair[0], pair[1])
+		}
+	}
+	// ByAOR does not take a URI that shares the key but is not Equal.
+	diff := &Info{State: Full, Registrations: []Registration{{AOR: "sip:alice@h.example:5070;foo=bar", ID: "a", State: Active}}}
+	if _, ok := diff.ByAOR(uri(t, "sip:alice@h.example:5070;foo=baz")); ok {
+		t.Error("ByAOR took another parameter value")
+	}
+	// What Equal tells apart stays apart.
+	for _, pair := range [][2]string{
+		{"sip:alice@h.example:5070", "sip:alice@h.example:5071"},
+		{"sip:alice@h.example:5070;transport=tcp", "sip:alice@h.example:5070;transport=tls"},
+		{"sip:Alice@h.example:5070", "sip:alice@h.example:5070"},
+		{"tel:1234;phone-context=example.com", "tel:1234;phone-context=example.net"},
+	} {
+		two := doc(`<registration aor="` + pair[0] + `" id="a" state="active"/><registration aor="` + pair[1] + `" id="b" state="active"/>`)
+		if _, err := Parse([]byte(two)); err != nil {
+			t.Errorf("Parse %s, %s: %v", pair[0], pair[1], err)
+		}
+	}
+}
+
+// For AORs with no canonical form, the key and sameAOR together say what
+// sip.URI.Equal says, for every pair of a varied set of spellings.
+func TestTheAORKeyAgreesWithEqual(t *testing.T) {
+	var us []string
+	for _, user := range []string{"alice", "%61lice", "Alice", "a%2Fb", "a/b"} {
+		for _, host := range []string{"h.example", "H.Example"} {
+			for _, rest := range []string{":5070", ":5070;transport=tcp", ":5070;transport=TCP", ":5070;transport=tls", ":5070;foo=bar", ":5070;foo=BAZ", ":5070;foo=%62ar", ":5070;foo=a%2Fb", ":5070;foo=a/b", ":5071", ":5070;user=phone;foo=bar", ":5070?subject=x"} {
+				us = append(us, "sip:"+user+"@"+host+rest)
+			}
+		}
+	}
+	us = append(us,
+		// IPv6 hosts compare as addresses, escaped parameter names as
+		// names, values by ASCII case alone (review of #250).
+		"sip:alice@[2001:db8::1]:5060", "sip:alice@[2001:DB8:0::1]:5060", "sip:alice@[2001:db8:0:0:0:0:0:1]:5060", "sip:alice@[2001:db8::2]:5060",
+		"sip:alice@h.example:5060;%74ransport=tcp", "sip:alice@h.example:5060;transport=tcp", "sip:alice@h.example:5060;%75ser=phone", "sip:alice@h.example:5060;user=phone",
+		"sip:alice@h.example:5060;%66oo=1", "sip:alice@h.example:5060;foo=2",
+		"sip:alice@h.example:5060;foo=%E2%84%AA", "sip:alice@h.example:5060;foo=k", "sip:alice@h.example:5060;transport=%E2%84%AA", "sip:alice@h.example:5060;transport=k")
+	us = append(us, "sip:example.com", "sip:EXAMPLE.com;foo=bar", "sip:example.com;maddr=10.0.0.1", "tel:12-34;phone-context=example.com", "tel:1234;phone-context=EXAMPLE.com", "tel:1234;phone-context=example.net")
+	for _, x := range us {
+		for _, y := range us {
+			a, b := uri(t, x), uri(t, y)
+			got := aorKey(a) == aorKey(b) && sameAOR(aorKey(a), entryOf(a), entryOf(b))
+			if want := a.Equal(b); got != want {
+				t.Errorf("%s, %s: %v, Equal %v", x, y, got, want)
+			}
+		}
+	}
+}
+
+// For AORs with no canonical form, key and sameAOR answer as sip.URI.Equal
+// does over a wide product of spellings (QA of #250): users with escapes
+// and passwords, host case and IPv6 spellings, ports, parameters with
+// escaped names and values, reserved escapes and non-ASCII case, headers,
+// and tel numbers.
+func TestTheAORKeyAgreesWithEqualOnAWideSet(t *testing.T) {
+	users := []string{"alice", "%61lice", "Alice", "a%2Fb", "a%2fb", "a/b", "alice:pw", "alice:%70w", "a%25b", ""}
+	hosts := []string{"h.example", "H.EXAMPLE", "[2001:db8::1]", "[2001:DB8::1]", "[2001:db8:0::1]", "192.0.2.1"}
+	ports := []string{"", ":5070"}
+	params := []string{"", ";transport=tcp", ";tr%61nsport=tcp", ";TRANSPORT=TCP", ";transport=%74cp", ";user=phone", ";maddr=10.0.0.1", ";ttl=1", ";method=INVITE",
+		";foo=bar", ";foo=%62ar", ";foo=%C3%84", ";foo=%C3%A4", ";foo=%E2%84%AA", ";foo=k", ";lr", ";f%6Fo=bar", ";foo=a%3Bb", ";foo=a%3bb", ";foo=a%25b"}
+	headers := []string{"", "?subject=x", "?Subject=X", "?subject=%78"}
+	type entry struct {
+		u   sip.URI
+		key string
+		e   aorEntry
+	}
+	var es []entry
+	add := func(s string) {
+		u, err := sip.ParseURI(s)
+		if err != nil {
+			return
+		}
+		if _, canonical := identity.CanonicalIMPU(u.String()); canonical {
+			return
+		}
+		es = append(es, entry{u, aorKey(u), entryOf(u)})
+	}
+	at := func(u string) string {
+		if u == "" {
+			return ""
+		}
+		return u + "@"
+	}
+	for _, u := range users {
+		for _, h := range hosts {
+			for _, p := range ports {
+				for _, q := range params {
+					add("sip:" + at(u) + h + p + q)
+				}
+			}
+		}
+	}
+	rnd := rand.New(rand.NewPCG(1, 2))
+	for range 400 {
+		add("sip:" + at(users[rnd.IntN(len(users))]) + hosts[rnd.IntN(len(hosts))] + ports[rnd.IntN(len(ports))] +
+			params[rnd.IntN(len(params))] + params[rnd.IntN(len(params))] + headers[rnd.IntN(len(headers))])
+	}
+	for _, s := range []string{"tel:12-34", "tel:1234", "tel:12AB;phone-context=example.com", "tel:12ab;phone-context=example.com", "tel:1234;phone-context=+1-555", "tel:1234;phone-context=+1555",
+		"tel:1234;Phone-Context=example.com", "tel:1234;phone-context=example.com", "tel:1234;phone-context=EXAMPLE.com",
+		"tel:1234;ext=1;phone-context=example.com", "tel:1234;phone-context=example.com;ext=1", "tel:12(34);phone-context=example.com"} {
+		add(s)
+	}
+	bad := 0
+	for _, a := range es {
+		for _, b := range es {
+			got := a.key == b.key && sameAOR(a.key, a.e, b.e)
+			if want := a.u.Equal(b.u); got != want {
+				if bad++; bad <= 20 {
+					t.Errorf("%s, %s: %v, Equal %v", a.u, b.u, got, want)
+				}
+			}
+		}
+	}
+	if bad > 0 {
+		t.Errorf("%d of %d pairs disagree with Equal", bad, len(es)*len(es))
 	}
 }

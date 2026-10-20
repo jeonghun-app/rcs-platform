@@ -153,8 +153,11 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
   `001010000000001`, MSISDN `+15550100001`) and the peer (`001010000000002`,
   `+15550100002`), each the same way:
   - `hss`: the subscription of IMPI `<IMSI>@ims.mnc001.mcc001.3gppnetwork.org`,
-    IMPU `sip:<MSISDN>@…`, managed by `acs`, with its own AKA keys (`PUT
-    /aka`), which keeps the SQN on a re-run;
+    IMPUs `sip:<MSISDN>@…` (the default identity) and `tel:<MSISDN>` in one
+    implicit registration set ([architecture](architecture.md#4-identities-and-the-home-domain)),
+    managed by `acs`, with its own AKA keys (`PUT /aka`), which keeps the SQN
+    on a re-run. A subscription that exists is put again, so a stack seeded
+    before gains identities added since;
   - `acs`: the subscriber, with the overrides in [acs](#acs).
 
   The keys are `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC` for the client and

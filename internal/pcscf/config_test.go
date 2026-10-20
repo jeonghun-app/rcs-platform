@@ -86,8 +86,10 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		DrainTimeout:   runtime.DefaultShutdownTimeout - stopMargin,
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
+		SCSCFHost: "scscf.rcs.internal", SCSCFPort: DefaultSCSCFPort,
 		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
+		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
 		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
 	}
 	if !reflect.DeepEqual(c, want) {
@@ -112,11 +114,7 @@ func TestTheVisitedNetworkIsTheHomeDomainUnlessSet(t *testing.T) {
 			t.Errorf("%q: %q, %v", v, c.VisitedNetworkID, err)
 		}
 	}
-	c, err := configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "", "PCSCF_ICSCF_URI", "sip:10.0.3.7;transport=tcp;lr", "PCSCF_VISITED_NETWORK_ID", "visited.example.net"))
-	if err != nil || c.Namespace != "" || c.VisitedNetworkID != "visited.example.net" {
-		t.Errorf("without a namespace: %+v, %v", c, err)
-	}
-	c, err = configure(with(devEnv, "RCS_IMS_DOMAIN", "IMS.mnc001.mcc001.3gppnetwork.org."))
+	c, err := configure(with(devEnv, "RCS_IMS_DOMAIN", "IMS.mnc001.mcc001.3gppnetwork.org."))
 	if want := "ims.mnc001.mcc001.3gppnetwork.org"; err != nil || c.HomeDomain != want || c.VisitedNetworkID != want {
 		t.Errorf("home domain %q, visited network %q, %v", c.HomeDomain, c.VisitedNetworkID, err)
 	}
@@ -207,6 +205,8 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_MAX_REGISTRATIONS", "0"}, "PCSCF_MAX_REGISTRATIONS: must be positive"},
 		{[]string{"PCSCF_REGISTER_RATE", "-1"}, "PCSCF_REGISTER_RATE: must be positive"},
 		{[]string{"PCSCF_REGISTER_BURST", "0"}, "PCSCF_REGISTER_BURST: must be positive"},
+		{[]string{"PCSCF_INITIAL_RATE", "0"}, "PCSCF_INITIAL_RATE: must be positive"},
+		{[]string{"PCSCF_INITIAL_BURST", "-1"}, "PCSCF_INITIAL_BURST: must be positive"},
 		{[]string{"RCS_SERVICE_NAMESPACE", ""}, "PCSCF_ICSCF_URI: required when RCS_SERVICE_NAMESPACE is unset"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=tcp"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp and lr"},
 		{[]string{"PCSCF_ICSCF_URI", "tel:+15550100001"}, "PCSCF_ICSCF_URI: not a sip URI"},
@@ -220,6 +220,13 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.example.net;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.evil-rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
 		{[]string{"RCS_IMS_DOMAIN", ""}, "RCS_IMS_DOMAIN: required"},
+		// The only next hop of a request inside a dialog (review of #208).
+		{[]string{"RCS_SERVICE_NAMESPACE", "", "PCSCF_ICSCF_URI", "sip:10.0.3.7;transport=tcp;lr"}, "PCSCF_SCSCF_HOST: required when RCS_SERVICE_NAMESPACE is unset"},
+		{[]string{"PCSCF_SCSCF_HOST", "10.0.4.4"}, "PCSCF_SCSCF_HOST: not a name inside RCS_SERVICE_NAMESPACE"},
+		{[]string{"PCSCF_SCSCF_HOST", "scscf.example.net"}, "PCSCF_SCSCF_HOST: not a name inside RCS_SERVICE_NAMESPACE"},
+		{[]string{"PCSCF_SCSCF_HOST", "pcscf.rcs.internal"}, "PCSCF_SCSCF_HOST: names pcscf itself"},
+		{[]string{"PCSCF_SCSCF_HOST", "edge.rcs.internal", "PCSCF_PUBLIC_HOST", "edge.rcs.internal"}, "PCSCF_SCSCF_HOST: names pcscf itself"},
+		{[]string{"PCSCF_SCSCF_PORT", "0"}, "PCSCF_SCSCF_PORT: not a port"},
 		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "0"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
 		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "1025"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
 		{[]string{"RCS_IMS_DOMAIN", "ims_1.example.net"}, "RCS_IMS_DOMAIN: not a host name"},

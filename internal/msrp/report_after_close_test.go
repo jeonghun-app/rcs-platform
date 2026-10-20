@@ -112,13 +112,20 @@ func TestAReportAfterTheDrainStillReachesTheHandler(t *testing.T) {
 		}
 	}})
 	// Another session's drainer, stuck in its handler for the whole test.
+	// It runs under a label of its own, so that the cleanup can wait for it
+	// to return as well, and the test leaves no goroutine behind.
 	stuck := &gatedHandler{gate: make(chan struct{})}
-	t.Cleanup(func() { close(stuck.gate) })
 	other := newTestSession(t, asURI, clientURI, stuck)
+	t.Cleanup(func() {
+		close(stuck.gate)
+		waitProgress(t, "the other session's drainer to exit", func() bool {
+			return !isDelivering(other) && labelledGoroutines(t, other) == 0
+		}, func() int64 { return 0 }, nil)
+	})
 	if err := other.Close(); err != nil {
 		t.Fatal(err)
 	}
-	other.reportOwn(ownReport(1, 1), nil)
+	labelled(other, func() { other.reportOwn(ownReport(1, 1), nil) })
 
 	h := &gatedHandler{delay: 100 * time.Microsecond}
 	s := newTestSession(t, clientURI, asURI, h)
