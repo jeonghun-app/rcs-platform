@@ -64,6 +64,8 @@ internal/
                             behind the NLB (ADR 0003)
   sip/                      RFC 3261 message model, parser, serializer, URIs, headers
   sip/digest/               SIP/HTTP Digest (RFC 7616, RFC 8760) and AKA (RFC 3310)
+  sip/dialog/               one side of a dialog as plain data: in-dialog requests,
+                            subscriptions and notifications (RFC 3261 §12, RFC 6665)
   milenage/                 TS 35.206 f1–f5*, AUTN/RES/CK/IK/AK, resync (AUTS)
   sdp/                      RFC 8866 parser and serializer, MSRP media attributes,
                             offer/answer and relay rewrite
