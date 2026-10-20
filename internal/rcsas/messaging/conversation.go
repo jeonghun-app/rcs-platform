@@ -67,6 +67,12 @@ func ParseConversationHeaders(conversationID, contributionID, inReplyTo string) 
 // can carry around it (RFC 3261 §25.1, LWS).
 func trimSpace(s string) string { return strings.Trim(s, " \t") }
 
+// ValidID reports whether s is a conversation identifier the engine takes
+// (Conversation-ID, Contribution-ID, InReplyTo-Contribution-ID): one
+// RFC 3261 token of at most MaxIDLength characters, as received or
+// generated elsewhere in rcs-as.
+func ValidID(s string) bool { return isID(s) }
+
 func isID(s string) bool {
 	if s == "" || len(s) > MaxIDLength {
 		return false

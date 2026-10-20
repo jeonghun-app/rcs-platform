@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -43,8 +44,17 @@ const (
 	// recipient's queue, so that no single sender can fill it and lock the
 	// others out (threat model T10).
 	DefaultQueueSenderShare = 8
-	DefaultDeliveryTimeout  = 30 * time.Second
-	DefaultInviteTimeout    = 2 * time.Minute
+	// GroupNotificationsShare: all group notifications in a queue, from
+	// every group, hold at most a quarter of it together, beside each
+	// group's sender share of them: an author in many groups is not locked
+	// out of 1-to-1 messages by receipts (threat model T10, T11).
+	GroupNotificationsShare = 4
+	// GroupSummariesShare: the summaries of group notifications in a
+	// queue (#166) hold at most an eighth of it, beside the notifications'
+	// quarter, so that the two together never lock out 1-to-1 messages.
+	GroupSummariesShare    = 8
+	DefaultDeliveryTimeout = 30 * time.Second
+	DefaultInviteTimeout   = 2 * time.Minute
 	// DefaultAnswerTimeout is how long an offered leg waits for its
 	// answer: the INVITE client transaction's limit (RFC 3261 §17.1.1.2,
 	// 64 × T1).
@@ -52,10 +62,14 @@ const (
 	DefaultRetryInterval    = time.Minute
 	DefaultMaxRetryInterval = time.Hour
 	DefaultStoreTimeout     = 5 * time.Second
-	DefaultSweepInterval    = time.Minute
-	DefaultBatch            = 50
-	DefaultWorkers          = 32
-	DefaultMaxTracked       = 100_000
+	// DefaultFanoutTimeout leaves a group message's sender its answer well
+	// within the 30 s an MSRP client waits for one (rcsjta's transaction
+	// timeout).
+	DefaultFanoutTimeout = 20 * time.Second
+	DefaultSweepInterval = time.Minute
+	DefaultBatch         = 50
+	DefaultWorkers       = 32
+	DefaultMaxTracked    = 100_000
 )
 
 // Bounds on identifiers that become store keys: DynamoDB keys hold at
@@ -83,6 +97,10 @@ type Config struct {
 	// (ADR 0005), the authority of every local MSRP URI.
 	MSRPHost string
 	MSRPPort int
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
+	// a SIP URI whose user part is a global number names that number
+	// (UserOf), in the addresses a client writes for itself.
+	HomeDomain string
 	// Self are the URIs by which notifications are routed through rcs-as
 	// (IMDN-Route, RFC 5438 §8).
 	Self []string
@@ -116,21 +134,29 @@ type Config struct {
 	// InviteTimeout is how long a terminating session asked for is waited
 	// for before another may be asked for.
 	InviteTimeout time.Duration
-	// AnswerTimeout is how long a leg from Offer waits for Answer.
+	// AnswerTimeout is how long a leg from Offer waits for Answer, and
+	// how long a leg waits for msrp-relay's connection once its peer's
+	// path is known (OpenLeg, Answer), after which it is closed.
 	AnswerTimeout time.Duration
 	// RetryInterval is the first wait before a queue that could not be
 	// delivered is tried again; it doubles up to MaxRetryInterval.
 	RetryInterval    time.Duration
 	MaxRetryInterval time.Duration
 	// StoreTimeout bounds each store call.
-	StoreTimeout  time.Duration
+	StoreTimeout time.Duration
+	// FanoutTimeout bounds the queueing of one group message for all its
+	// recipients, one store call after another; those not reached by then
+	// are not queued, and the sender is answered as for a store failure,
+	// after which its user may send the message again.
+	FanoutTimeout time.Duration
 	SweepInterval time.Duration
 	// Batch is how many queued messages one store read returns.
 	Batch int
 	// Workers bounds the recipients whose queues are delivered at once.
 	Workers int
 	// MaxTracked bounds the senders and recipients whose state is kept in
-	// memory: rate buckets, pager-only markers, pending invitations.
+	// memory: rate buckets, pager-only markers, pending invitations, marks
+	// of participants that left a group.
 	MaxTracked int
 
 	// MSRP tunes the MSRP connections; its Clock and Rand are replaced by
@@ -163,6 +189,9 @@ type Engine struct {
 	limit     store.Limit
 
 	senders, notifiers *limiter
+	// composing bounds the is-composing indications one participant
+	// sends in one group.
+	composing *limiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -176,8 +205,17 @@ type Engine struct {
 	legs       map[legKey][]*Leg
 	invites    map[inviteKey]time.Time
 	pagerOnly  map[string]struct{}
-	lastID     int64
-	sweepAt    string
+	groups     GroupHandler
+	// departed marks the participants that left a group on this task
+	// (ParticipantLeft), until when their copies could still be queued.
+	departed map[legKey]time.Time
+	// groupLegs counts the open group legs of each group on this task.
+	groupLegs map[string]int
+	// summaries remembers group notification summaries between their
+	// deliveries (sendSummary), up to MaxTracked.
+	summaries map[legKey]*summaryState
+	lastID    int64
+	sweepAt   string
 }
 
 // legKey names the chat legs a queued message may be delivered on: those
@@ -207,10 +245,14 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		limit:      queueLimit(cfg),
 		senders:    newLimiter(cfg.SenderRate, cfg.MaxTracked),
 		notifiers:  newLimiter(cfg.NotificationRate, cfg.MaxTracked),
+		composing:  newLimiter(IsComposingRate, cfg.MaxTracked),
 		recipients: map[string]*recipient{},
 		legs:       map[legKey][]*Leg{},
 		invites:    map[inviteKey]time.Time{},
 		pagerOnly:  map[string]struct{}{},
+		departed:   map[legKey]time.Time{},
+		groupLegs:  map[string]int{},
+		summaries:  map[legKey]*summaryState{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {
@@ -234,7 +276,13 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 // queueLimit is the bound of each recipient's queue and of each sender's
 // share of it.
 func queueLimit(c Config) store.Limit {
-	l := store.Limit{Count: c.MaxQueueMessages, Bytes: c.MaxQueueBytes}
+	l := store.Limit{
+		Count: c.MaxQueueMessages, Bytes: c.MaxQueueBytes,
+		GroupCount:   (c.MaxQueueMessages + GroupNotificationsShare - 1) / GroupNotificationsShare,
+		GroupBytes:   c.MaxQueueBytes / GroupNotificationsShare,
+		SummaryCount: (c.MaxQueueMessages + GroupSummariesShare - 1) / GroupSummariesShare,
+		SummaryBytes: c.MaxQueueBytes / GroupSummariesShare,
+	}
 	if c.QueueSenderShare > 1 {
 		l.SenderCount = (c.MaxQueueMessages + c.QueueSenderShare - 1) / c.QueueSenderShare
 		l.SenderBytes = c.MaxQueueBytes / int64(c.QueueSenderShare)
@@ -256,6 +304,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.RetryInterval, DefaultRetryInterval)
 	setDefault(&c.MaxRetryInterval, DefaultMaxRetryInterval)
 	setDefault(&c.StoreTimeout, DefaultStoreTimeout)
+	setDefault(&c.FanoutTimeout, DefaultFanoutTimeout)
 	setDefault(&c.SweepInterval, DefaultSweepInterval)
 	setDefault(&c.Batch, DefaultBatch)
 	setDefault(&c.Workers, DefaultWorkers)
@@ -393,7 +442,7 @@ func (e *Engine) submit(ctx context.Context, o Origin) error {
 	if !limit.allow(o.Sender, now) {
 		return reject(ReasonRateLimited, nil)
 	}
-	if m.From.URI != AnonymousURI && m.From.URI != o.Sender && !slices.Contains(o.Identities, m.From.URI) {
+	if !namesSender(m.From.URI, o.Sender, o.Identities, e.cfg.HomeDomain) {
 		return reject(ReasonFromMismatch, nil)
 	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
@@ -422,7 +471,7 @@ func (e *Engine) submitMessage(ctx context.Context, o Origin, m *Message, now ti
 			if err != nil {
 				return err
 			}
-			if !slices.Contains(s.Recipients, o.Recipient) {
+			if s.Group != "" || !slices.Contains(s.Recipients, o.Recipient) {
 				return reject(ReasonMessageIDReused, nil)
 			}
 			e.metrics.Count("message.resent", 1)
@@ -615,6 +664,18 @@ func (e *Engine) newID(now time.Time) (string, error) {
 	e.lastID = n
 	e.mu.Unlock()
 	return fmt.Sprintf("%016x", uint64(n)) + r, nil
+}
+
+// randomIndex returns a random index into a list of n, 0 when n is 0.
+func (e *Engine) randomIndex(n int) (int, error) {
+	if n <= 1 {
+		return 0, nil
+	}
+	var b [4]byte
+	if _, err := io.ReadFull(e.rand, b[:]); err != nil {
+		return 0, fmt.Errorf("messaging: random source: %w", err)
+	}
+	return int(binary.BigEndian.Uint32(b[:]) % uint32(n)), nil
 }
 
 func (e *Engine) randomHex(n int) (string, error) {

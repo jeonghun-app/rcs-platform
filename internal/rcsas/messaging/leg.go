@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -30,11 +31,26 @@ var IsComposingRate = Rate{PerMinute: 60, Burst: 5}
 // clients report the message as failed and the user can send it again.
 const StatusTryAgain = 500
 
+// StatusBusy answers a message rcs-as could not store because another
+// write held what it needed past the store's retries (store.ErrBusy): a
+// moment later it will go through. Like StatusTryAgain it is no verdict
+// on the message.
+const StatusBusy = 503
+
+// notStored is the answer to a message the store could not take: err is
+// the store's error, not a Rejection.
+func notStored(err error) *msrp.StatusError {
+	if errors.Is(err, store.ErrBusy) {
+		return &msrp.StatusError{Code: StatusBusy, Comment: "Busy, try again"}
+	}
+	return &msrp.StatusError{Code: StatusTryAgain, Comment: "Try again later"}
+}
+
 // AcceptTypes is the a=accept-types of a leg in mode: CPIM, plus
 // is-composing indications in a chat session. The SIP layer offers and
 // answers with it.
 func AcceptTypes(mode store.Mode) []string {
-	if mode == store.Chat {
+	if mode == store.Chat || mode == store.Group {
 		return []string{cpim.ContentType, IsComposingType}
 	}
 	return []string{cpim.ContentType}
@@ -58,7 +74,8 @@ type LegParams struct {
 	// for Offer, which learns it in Leg.Answer.
 	Remote []msrp.URI
 	// User is the asserted identity of the client on this leg, and
-	// Identities the others it may name in the CPIM From.
+	// Identities the others it may name in the CPIM From. A group leg puts
+	// User in canonical form (identity.CanonicalIMPU), as the group does.
 	User       string
 	Identities []string
 	// Peer is the other party of the conversation.
@@ -89,13 +106,17 @@ type Leg struct {
 	answered bool
 	expired  bool
 	pending  msrp.Timer
+	// unbound closes the leg if no connection binds it in time.
+	unbound  msrp.Timer
 	finished chan struct{}
 	finish   sync.Once
 
 	// composing is set while an is-composing indication is being
 	// forwarded to this leg; others meanwhile are dropped. composingRate
 	// bounds those this leg's user sends.
-	composing     atomic.Bool
+	composing atomic.Bool
+	// carried is set once a message has gone either way on the leg.
+	carried       atomic.Bool
 	composingRate *limiter
 }
 
@@ -110,7 +131,7 @@ func (p LegParams) check() error {
 	switch {
 	case p.User == "" || p.Peer == "":
 		return errors.New("messaging: a leg needs a user and a peer")
-	case p.Mode != store.Chat && p.Mode != store.Standalone:
+	case p.Mode != store.Chat && p.Mode != store.Standalone && p.Mode != store.Group:
 		return errors.New("messaging: a leg needs a mode")
 	case p.Direction != Originating && p.Direction != Terminating:
 		return errors.New("messaging: a leg needs a direction")
@@ -131,8 +152,27 @@ func (e *Engine) OpenLeg(p LegParams) (*Leg, error) {
 	if err != nil {
 		return nil, err
 	}
+	l.awaitBind()
 	l.activate()
 	return l, nil
+}
+
+// awaitBind closes the leg unless a connection binds it within
+// AnswerTimeout. msrp-relay connects for a client that has connected to
+// it, and a client that never does, having answered or offered all the
+// same, would otherwise hold the leg and its SIP session, under the SIP
+// layer's bounds, until the task stops (threat model T9).
+func (l *Leg) awaitBind() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.unbound = l.e.clock.AfterFunc(l.e.cfg.AnswerTimeout, func() {
+		select {
+		case <-l.session.Bound():
+		default:
+			l.e.metrics.Count("leg.unbound", 1)
+			_ = l.Close()
+		}
+	})
 }
 
 // Offer creates the leg for an offer rcs-as is about to send (Deliverer.
@@ -169,6 +209,16 @@ func (e *Engine) Offer(p LegParams) (*Leg, error) {
 func (e *Engine) newLeg(p LegParams) (*Leg, error) {
 	if err := p.check(); err != nil {
 		return nil, err
+	}
+	if p.Mode == store.Group {
+		// The group stores and names its participants in canonical form
+		// (the group package), and their copies are queued under it; a
+		// leg keyed otherwise would never be found for them.
+		user, ok := identity.CanonicalIMPU(p.User)
+		if !ok {
+			return nil, errors.New("messaging: a group leg's user must be a SIP or tel URI")
+		}
+		p.User = user
 	}
 	id, err := msrp.NewSessionID(e.rand)
 	if err != nil {
@@ -217,6 +267,7 @@ func (l *Leg) Answer(remote []msrp.URI) error {
 	}
 	l.answered = true
 	l.mu.Unlock()
+	l.awaitBind()
 	l.activate()
 	return nil
 }
@@ -228,16 +279,27 @@ func (l *Leg) activate() {
 	l.answered = true
 	l.mu.Unlock()
 	switch {
-	case l.p.Mode == store.Chat:
+	case l.p.Mode == store.Chat || l.p.Mode == store.Group:
+		// A group session is a chat session whose peer is the group's
+		// conference URI.
 		key := legKey{l.p.User, l.p.Peer}
+		group := l.p.Mode == store.Group
 		e.mu.Lock()
 		e.legs[key] = append(e.legs[key], l)
-		delete(e.invites, inviteKey{l.p.User, l.p.Peer, store.Chat, ""})
+		if group {
+			e.groupLegs[l.p.Peer]++
+		}
+		delete(e.invites, inviteKey{l.p.User, l.p.Peer, l.p.Mode, ""})
 		e.mu.Unlock()
 		go func() {
 			<-l.session.Done()
 			e.mu.Lock()
 			defer e.mu.Unlock()
+			if group {
+				if e.groupLegs[l.p.Peer]--; e.groupLegs[l.p.Peer] == 0 {
+					delete(e.groupLegs, l.p.Peer)
+				}
+			}
 			legs := e.legs[key]
 			for i, x := range legs {
 				if x == l {
@@ -295,6 +357,11 @@ func (l *Leg) Finished() <-chan struct{} { return l.finished }
 // Local is the leg's MSRP URI, for a=path.
 func (l *Leg) Local() msrp.URI { return l.session.Local() }
 
+// Carried reports whether a message has gone either way on the leg: the
+// SIP layer reads a BYE that says the client takes no sessions (ADR 0004)
+// only from a session that never carried one.
+func (l *Leg) Carried() bool { return l.carried.Load() }
+
 // Done is closed when the leg has ended.
 func (l *Leg) Done() <-chan struct{} { return l.session.Done() }
 
@@ -304,6 +371,9 @@ func (l *Leg) Close() error {
 	if l.pending != nil {
 		l.pending.Stop()
 	}
+	if l.unbound != nil {
+		l.unbound.Stop()
+	}
 	l.mu.Unlock()
 	return l.session.Close()
 }
@@ -312,6 +382,10 @@ func (l *Leg) Close() error {
 // its peer. It returns once the message is stored, so a success report
 // tells the client rcs-as has it.
 func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
+	l.carried.Store(true)
+	if l.p.Mode == store.Group {
+		return l.e.groupReceived(l, m)
+	}
 	switch m.MediaType() {
 	case cpim.ContentType:
 	case IsComposingType:
@@ -335,7 +409,7 @@ func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	case errors.As(err, &r):
 		return &msrp.StatusError{Code: r.MSRPStatus()}
 	case err != nil:
-		return &msrp.StatusError{Code: StatusTryAgain, Comment: "Try again later"}
+		return notStored(err)
 	}
 	return nil
 }
@@ -356,6 +430,7 @@ func (e *Engine) forwardComposing(from *Leg, body []byte) {
 	body = append([]byte(nil), body...)
 	go func() {
 		ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
+		to.carried.Store(true)
 		_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: IsComposingType, Body: body, FailureReport: msrp.ReportNo})
 		cancel()
 		to.composing.Store(false)
@@ -415,6 +490,7 @@ func (l *Leg) send(ctx context.Context, body []byte) (int, error) {
 		delete(l.waiting, id)
 		l.mu.Unlock()
 	}()
+	l.carried.Store(true)
 	_, err = l.session.Send(ctx, msrp.Outgoing{MessageID: id, ContentType: cpim.ContentType, Body: body, SuccessReport: true})
 	var se *msrp.StatusError
 	if errors.As(err, &se) {

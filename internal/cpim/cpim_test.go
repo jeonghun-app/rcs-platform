@@ -73,7 +73,7 @@ func TestParseReadsEveryPartOfAChatMessage(t *testing.T) {
 		t.Errorf("From() = %+v, %v", from, err)
 	}
 	to, err := m.To()
-	if err != nil || !reflect.DeepEqual(to, []Address{{URI: bob}}) {
+	if err != nil || !reflect.DeepEqual(to, Addresses{{URI: bob}}) {
 		t.Errorf("To() = %+v, %v", to, err)
 	}
 	dt, err := m.DateTime()
@@ -717,11 +717,11 @@ func TestAddressAccessorsReportMissingAndInvalidHeaders(t *testing.T) {
 func TestEveryRecipientIsReturnedInOrder(t *testing.T) {
 	m := mustParse(t, crlf("To: <"+alice+">\nTo: Bob <"+bob+">\ncc: <"+carol+">\n\nContent-Type: text/plain\n\n"))
 	to, err := m.To()
-	if err != nil || !reflect.DeepEqual(to, []Address{{URI: alice}, {Name: "Bob", URI: bob}}) {
+	if err != nil || !reflect.DeepEqual(to, Addresses{{URI: alice}, {Name: "Bob", URI: bob}}) {
 		t.Errorf("To() = %+v, %v", to, err)
 	}
 	cc, err := m.Cc()
-	if err != nil || !reflect.DeepEqual(cc, []Address{{URI: carol}}) {
+	if err != nil || !reflect.DeepEqual(cc, Addresses{{URI: carol}}) {
 		t.Errorf("Cc() = %+v, %v", cc, err)
 	}
 }

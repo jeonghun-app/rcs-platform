@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,8 +44,10 @@ type fakeClock struct {
 }
 
 type fakeTimer struct {
-	c        *fakeClock
-	when     time.Time
+	c    *fakeClock
+	when time.Time
+	// d is the duration the timer was set with, which armed and fire go by.
+	d        time.Duration
 	f        func()
 	inactive bool
 }
@@ -62,7 +65,7 @@ func (c *fakeClock) Now() time.Time {
 func (c *fakeClock) AfterFunc(d time.Duration, f func()) msrp.Timer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	t := &fakeTimer{c: c, when: c.now.Add(d), f: f}
+	t := &fakeTimer{c: c, when: c.now.Add(d), d: d, f: f}
 	c.timers = append(c.timers, t)
 	return t
 }
@@ -73,6 +76,39 @@ func (t *fakeTimer) Stop() bool {
 	active := !t.inactive
 	t.inactive = true
 	return active
+}
+
+// armed reports whether a live timer set with AfterFunc(d, …) exists. A
+// test that advances the clock to fire a timer must first see it armed:
+// advancing earlier moves the clock past a timer that does not exist yet,
+// which then never fires (#143, #149).
+func (c *fakeClock) armed(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.timers {
+		if !t.inactive && t.d == d {
+			return true
+		}
+	}
+	return false
+}
+
+// fire runs every live timer set with AfterFunc(d, …) without moving the
+// clock, so a test can fire one timer before others that would come due
+// first.
+func (c *fakeClock) fire(d time.Duration) {
+	c.mu.Lock()
+	var due []*fakeTimer
+	for _, t := range c.timers {
+		if !t.inactive && t.d == d {
+			t.inactive = true
+			due = append(due, t)
+		}
+	}
+	c.mu.Unlock()
+	for _, t := range due {
+		t.f()
+	}
 }
 
 // Advance moves the clock and runs every timer that has come due.
@@ -130,7 +166,10 @@ func (c *counter) get(name string) int64 {
 }
 
 // fakeDeliverer stands in for the SIP layer. pager and invite decide the
-// outcome of each attempt; every attempt is also sent on a channel.
+// outcome of each attempt; every attempt is also sent on a channel. A
+// full channel counts the attempt in overflow rather than block: an
+// engine that loops on attempts then fails its test (newRigWith) instead
+// of hanging it, workers and Close included.
 type fakeDeliverer struct {
 	mu       sync.Mutex
 	pagerCtx func(context.Context, Delivery) error
@@ -138,6 +177,11 @@ type fakeDeliverer struct {
 	invite   func(Invitation) error
 	pagers   chan Delivery
 	invites  chan Invitation
+	overflow atomic.Int64
+	// discardInvites, set by drainInvites, keeps invitations off the
+	// channel for a test that does not look at them: a channel drained
+	// alongside can fall behind a burst and count as overflow.
+	discardInvites atomic.Bool
 }
 
 func newFakeDeliverer() *fakeDeliverer {
@@ -155,7 +199,11 @@ func (f *fakeDeliverer) Pager(ctx context.Context, d Delivery) error {
 	case h != nil:
 		err = h(d)
 	}
-	f.pagers <- d
+	select {
+	case f.pagers <- d:
+	default:
+		f.overflow.Add(1)
+	}
 	return err
 }
 
@@ -167,7 +215,14 @@ func (f *fakeDeliverer) Invite(_ context.Context, inv Invitation) error {
 	if h != nil {
 		err = h(inv)
 	}
-	f.invites <- inv
+	if f.discardInvites.Load() {
+		return err
+	}
+	select {
+	case f.invites <- inv:
+	default:
+		f.overflow.Add(1)
+	}
 	return err
 }
 
@@ -244,7 +299,12 @@ func newRigWith(t *testing.T, cfg Config, st store.Store, clock *fakeClock) *rig
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(r.e.Close)
+	t.Cleanup(func() {
+		r.e.Close()
+		if n := r.d.overflow.Load(); n > 0 {
+			t.Errorf("%d delivery attempts beyond the fake's channels: the engine looped", n)
+		}
+	})
 	return r
 }
 
@@ -346,10 +406,18 @@ type client struct {
 	got     chan *msrp.Message
 	reports chan msrp.Report
 	refuse  error
+	// answer, when set, is what HandleMessage returns instead of refuse;
+	// one that blocks is a client that takes the bytes and processes
+	// nothing.
+	answer func(*msrp.Message) error
+	conn   *msrp.Conn
 }
 
 func (c *client) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	c.got <- m
+	if c.answer != nil {
+		return c.answer(m)
+	}
 	return c.refuse
 }
 
@@ -397,6 +465,13 @@ var clientSeq int
 // as msrp-relay would.
 func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client) {
 	t.Helper()
+	return r.connectAnswering(t, l, p, nil)
+}
+
+// connectAnswering is connect with a client whose answers are answer's
+// (client.answer).
+func (r *rig) connectAnswering(t *testing.T, l net.Listener, p LegParams, answer func(*msrp.Message) error) (*Leg, *client) {
+	t.Helper()
 	local := clientURI()
 	p.Remote = []msrp.URI{local}
 	if p.Direction == 0 {
@@ -407,7 +482,7 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = leg.Close() })
-	c := r.dial(t, l, local, leg.Local())
+	c := r.dialAnswering(t, l, local, leg.Local(), answer)
 	return leg, c
 }
 
@@ -415,8 +490,13 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 // msrp-relay does once the client has connected to it.
 func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client {
 	t.Helper()
+	return r.dialAnswering(t, l, local, remote, nil)
+}
+
+func (r *rig) dialAnswering(t *testing.T, l net.Listener, local, remote msrp.URI, answer func(*msrp.Message) error) *client {
+	t.Helper()
 	var err error
-	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64)}
+	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64), answer: answer}
 	c.session, err = msrp.NewSession(msrp.SessionConfig{Local: local, Remote: []msrp.URI{remote}, Handler: c})
 	if err != nil {
 		t.Fatal(err)
@@ -430,8 +510,13 @@ func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := conn.Open(context.Background(), c.session); err != nil {
-		t.Fatal(err)
+	c.conn = conn
+	// Bounded, so a rig that never accepts fails here rather than at go
+	// test's timeout (#143).
+	ctx, cancel := context.WithTimeout(context.Background(), hangGuard)
+	defer cancel()
+	if err := conn.Open(ctx, c.session); err != nil {
+		t.Fatalf("open the client session: %v", err)
 	}
 	return c
 }
@@ -507,4 +592,24 @@ func (r *rig) largeMode(t *testing.T, l net.Listener, inv Invitation) (*client, 
 		t.Fatal(err)
 	}
 	return c, leg
+}
+
+func TestArmedMeansSetWithThatDuration(t *testing.T) {
+	// QA on #147: a timer set for 10 ms with 5 ms left is not armed(5 ms).
+	c := newFakeClock()
+	c.AfterFunc(10*time.Millisecond, func() {})
+	c.Advance(5 * time.Millisecond)
+	if c.armed(5 * time.Millisecond) {
+		t.Error("after Advance(5 ms), a timer set by AfterFunc(10 ms) is reported as armed(5 ms)")
+	}
+	if !c.armed(10 * time.Millisecond) {
+		t.Error("a timer set by AfterFunc(10 ms) is not armed(10 ms)")
+	}
+	fired := 0
+	c.AfterFunc(time.Hour, func() { fired++ })
+	c.fire(time.Hour)
+	c.fire(time.Hour)
+	if fired != 1 || c.armed(time.Hour) {
+		t.Errorf("fire ran the timer %d times, armed after %v", fired, c.armed(time.Hour))
+	}
 }

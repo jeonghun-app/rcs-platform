@@ -43,9 +43,13 @@ type queuedReport struct {
 // Config.MaxHandlerQueue waiting messages, the session's messages are
 // refused with 413, and REPORTs the peer sends are dropped (EventDropped
 // with ErrHandlerBusy). Reports about the session's own sends are never
-// dropped: while Config.SendWindow of them wait, Send waits too. For that
-// reason HandleReport must not wait for a Send on its own session to
-// finish; a retry belongs on another goroutine.
+// dropped while the session is open: while Config.SendWindow of them wait,
+// Send waits too. For that reason HandleReport must not wait for a Send on
+// its own session to finish; a retry belongs on another goroutine. Once
+// the session has closed, nothing holds sending back: what is left of
+// those reports goes to the handler on one goroutine, in order, and beyond
+// Config.MaxHandlerQueue waiting the rest are dropped (EventDropped with
+// ErrHandlerBusy). A handler that never returns holds that goroutine.
 type Handler interface {
 	// HandleMessage gets each complete message. Returning nil confirms it
 	// with a success REPORT when the sender asked for one (§7.1.3). An
@@ -138,20 +142,29 @@ type Session struct {
 	expiry     Timer
 	peer       *Session
 	edge       bool // the client side of a bridge
+	// keepAliveOut is set while a keep-alive waits for its answer.
+	keepAliveOut bool
 	// events feeds the handler's goroutine; nil for a bridged session.
 	events chan event
 	// reports wait for HandleReport, on a goroutine of their own. Those
-	// about this session's own sends are never dropped: SendWindow bounds
-	// them (Send waits while as many are undelivered), as do the
-	// connection's in-flight slots. Those the peer sends are dropped
-	// beyond MaxHandlerQueue. reportWake tells the goroutine about new
-	// ones; reportRoom tells Send that one was delivered. rmu keeps
+	// about this session's own sends are never dropped while it is open:
+	// SendWindow bounds them (Send waits while as many are undelivered),
+	// as do the connection's in-flight slots. Those the peer sends are
+	// dropped beyond MaxHandlerQueue. reportWake tells the goroutine about
+	// new ones; reportRoom tells Send that one was delivered. rmu keeps
 	// HandleReport calls one at a time even after the session closed.
+	// delivering is set while a goroutine delivers reports: the session's
+	// report goroutine from the bind until it has drained what is left
+	// after the close, or, for a session closed before any bind or after
+	// that, one started for the reports that came after. So there is never
+	// more than one, they go one at a time, in order, and at most
+	// MaxHandlerQueue wait after the close (#258).
 	reports    []queuedReport
 	ownCount   int
 	reportWake chan struct{}
 	reportRoom chan struct{}
 	rmu        sync.Mutex
+	delivering bool
 	// window holds a token per chunk Send has awaiting its answer.
 	window chan struct{}
 	// backlog counts octets queued toward the client of a bridged edge
@@ -251,6 +264,10 @@ func (s *Session) waitRemote(ctx context.Context) error {
 // Done is closed when the session has ended.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
+// Bound is closed once the session is bound to a connection: the peer's
+// connection named it, or Conn.Open bound it.
+func (s *Session) Bound() <-chan struct{} { return s.bound }
+
 // Err returns why the session ended, or nil while it is open.
 func (s *Session) Err() error {
 	s.mu.Lock()
@@ -337,6 +354,8 @@ func (s *Session) attach(c *Conn) error {
 	s.flushing = flush
 	if s.handler != nil {
 		s.events = make(chan event, c.cfg.MaxHandlerQueue)
+		// workReports delivers until it has drained.
+		s.delivering = true
 		go s.work(c)
 		go s.workReports(c)
 	}
@@ -347,7 +366,12 @@ func (s *Session) attach(c *Conn) error {
 		s.closeWith(err)
 		return err
 	}
-	s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	// An active session's binding SEND is its traffic until it is
+	// answered, so Open starts the keep-alives then. Sent before, each
+	// would name a session the peer has not accepted yet (#204).
+	if c.passive {
+		s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	}
 	if flush {
 		s.flushHeld(c)
 	}
@@ -556,13 +580,21 @@ func (s *Session) armKeepAlive(c *Conn, after time.Duration) {
 // keepAliveDue sends a bodiless SEND if the session has been quiet for a
 // whole interval (ADR 0003). An unanswered one means the path is dead, so
 // the connection is closed; a refusal such as 481 ends just this session.
+// One keep-alive at a time: while one waits for its answer, the next is
+// skipped (#218).
 func (s *Session) keepAliveDue(c *Conn) {
 	interval := c.cfg.KeepAliveInterval
 	s.mu.Lock()
-	closed := s.closed
+	closed, out := s.closed, s.keepAliveOut
 	idle := c.cfg.Clock.Now().Sub(s.lastActive)
 	s.mu.Unlock()
 	if closed {
+		return
+	}
+	if out {
+		// The one in flight ends at its answer, or at its
+		// TransactionTimeout, which closes the connection.
+		s.armKeepAlive(c, interval)
 		return
 	}
 	select {
@@ -576,7 +608,13 @@ func (s *Session) keepAliveDue(c *Conn) {
 		s.armKeepAlive(c, interval-idle)
 		return
 	}
+	s.mu.Lock()
+	s.keepAliveOut = true
+	s.mu.Unlock()
 	err := s.sendEmpty(context.Background(), c, func(code int, comment string) {
+		s.mu.Lock()
+		s.keepAliveOut = false
+		s.mu.Unlock()
 		switch code {
 		case StatusOK:
 		case StatusRequestTimeout:
@@ -586,6 +624,17 @@ func (s *Session) keepAliveDue(c *Conn) {
 		}
 	})
 	if err != nil {
+		s.mu.Lock()
+		s.keepAliveOut = false
+		s.mu.Unlock()
+		if c.isClosed() {
+			return
+		}
+		// Not sent while the connection is up: its ids could not be made
+		// (the random source failed). Said, and tried again at the next
+		// interval, rather than leave the session without keep-alives.
+		c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrKeepAliveNotSent})
+		s.armKeepAlive(c, interval)
 		return
 	}
 	s.armKeepAlive(c, interval)
@@ -662,16 +711,41 @@ func (s *Session) work(c *Conn) {
 
 // workReports delivers reports in order, apart from messages so that a
 // HandleMessage that sends on its own session cannot hold up the reports
-// that sending waits for. On close it delivers what is left about this
-// session's own sends.
+// that sending waits for. On close it drains what is left about this
+// session's own sends; delivering, set at the bind, keeps any other
+// goroutine from delivering meanwhile.
 func (s *Session) workReports(c *Conn) {
 	for {
 		select {
 		case <-s.reportWake:
-			s.deliverReports(false)
+			s.deliverReports()
 		case <-s.done:
-			s.deliverReports(true)
+			s.drain()
 			return
+		}
+	}
+}
+
+// drain delivers, one at a time and in order, the reports about this
+// session's own sends that are left after it closed, and drops the rest,
+// until none is left, and then clears delivering in the same lock. Only
+// the goroutine delivering runs it.
+func (s *Session) drain() {
+	for {
+		s.mu.Lock()
+		if len(s.reports) == 0 {
+			s.delivering = false
+			s.mu.Unlock()
+			return
+		}
+		next := s.reports[0]
+		s.reports = s.reports[1:]
+		if next.own {
+			s.ownCount--
+		}
+		s.mu.Unlock()
+		if next.own {
+			s.hand(next)
 		}
 	}
 }
@@ -683,8 +757,11 @@ func (s *Session) undeliveredReports() int {
 }
 
 // reportOwn hands the handler the outcome of a chunk this session sent.
-// After the session has closed, its report goroutine may be gone, so the
-// report is delivered on a goroutine of its own.
+// After the session has closed, nothing holds the sending back any more, so
+// the reports are bounded instead (#258): one goroutine delivers them in
+// order, and beyond MaxHandlerQueue waiting the rest are dropped and
+// counted (EventDropped, ErrHandlerBusy), so a handler that blocks holds
+// one goroutine, not one per report.
 func (s *Session) reportOwn(r Report, after func()) {
 	if s.handler == nil {
 		if after != nil {
@@ -701,8 +778,29 @@ func (s *Session) reportOwn(r Report, after func()) {
 		s.wakeReports()
 		return
 	}
+	c := s.conn
+	limit := DefaultMaxHandlerQueue
+	if c != nil {
+		limit = c.cfg.MaxHandlerQueue
+	}
+	if len(s.reports) >= limit {
+		s.mu.Unlock()
+		if c != nil {
+			c.emit(Event{Kind: EventDropped, Method: MethodReport, Err: ErrHandlerBusy})
+		}
+		if after != nil {
+			after()
+		}
+		return
+	}
+	s.reports = append(s.reports, q)
+	s.ownCount++
+	start := !s.delivering
+	s.delivering = true
 	s.mu.Unlock()
-	go s.hand(q)
+	if start {
+		go s.drain()
+	}
 }
 
 func (s *Session) wakeReports() {
@@ -712,7 +810,7 @@ func (s *Session) wakeReports() {
 	}
 }
 
-func (s *Session) deliverReports(onlyOwn bool) {
+func (s *Session) deliverReports() {
 	for {
 		s.mu.Lock()
 		if len(s.reports) == 0 {
@@ -725,9 +823,7 @@ func (s *Session) deliverReports(onlyOwn bool) {
 			s.ownCount--
 		}
 		s.mu.Unlock()
-		if !onlyOwn || next.own {
-			s.hand(next)
-		}
+		s.hand(next)
 	}
 }
 

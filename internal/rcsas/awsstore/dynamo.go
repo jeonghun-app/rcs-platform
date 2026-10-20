@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +41,8 @@ const (
 	attrTTL          = "ttl"
 	attrBucket       = "xb"
 	attrSender       = "sender"
+	attrAuthor       = "author"
+	attrGroup        = "group"
 	attrConversation = "conversation"
 	attrContribution = "contribution"
 	attrInReplyTo    = "in_reply_to"
@@ -53,10 +57,17 @@ const (
 	attrRecipients   = "recipients"
 	attrDispositions = "dispositions"
 	attrSeen         = "seen"
-	attrCount        = "count"
-	attrSize         = "size"
-	attrRecounted    = "recounted_at"
-	attrBytes        = "bytes"
+	attrMarkCount    = "marks"
+	attrDateTime     = "datetime"
+	attrSummary      = "summary"
+	// The two fields of a seen entry: the token of the attempt that set
+	// it, and the status the notification reported.
+	attrMarkToken  = "t"
+	attrMarkStatus = "s"
+	attrCount      = "count"
+	attrSize       = "size"
+	attrRecounted  = "recounted_at"
+	attrBytes      = "bytes"
 )
 
 // MaxCPIMSize is the largest message body the table takes. A DynamoDB item
@@ -123,6 +134,52 @@ func canceled(err error) (failed []bool, ok bool) {
 		failed = append(failed, aws.ToString(r.Code) == "ConditionalCheckFailed")
 	}
 	return failed, true
+}
+
+// conflicted reports whether a write lost to a concurrent transaction on
+// one of its items: an UpdateItem that met a transaction, or a transaction
+// cancelled for another one. The SDK retries neither.
+func conflicted(err error) bool {
+	var conflict *types.TransactionConflictException
+	if errors.As(err, &conflict) {
+		return true
+	}
+	var tce *types.TransactionCanceledException
+	if errors.As(err, &tce) {
+		for _, r := range tce.CancellationReasons {
+			if aws.ToString(r.Code) == "TransactionConflict" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// conflictAttempts bounds the tries of a write to a group's sent record,
+// which a summary's removal (a transaction) and notifiers' marks (single
+// updates) may hit at once.
+const conflictAttempts = 3
+
+// retryConflicts runs write until it does not lose to a concurrent
+// transaction, conflictAttempts times at most with a short jittered pause
+// between, and then reports store.ErrBusy.
+func retryConflicts(ctx context.Context, op string, write func() error) error {
+	for i := range conflictAttempts {
+		err := write()
+		if !conflicted(err) {
+			return err
+		}
+		if i == conflictAttempts-1 {
+			break
+		}
+		pause := time.Duration(10<<i)*time.Millisecond + rand.N(time.Duration(10<<i)*time.Millisecond)
+		select {
+		case <-time.After(pause):
+		case <-ctx.Done():
+			return sanitize(op, ctx.Err())
+		}
+	}
+	return fmt.Errorf("awsstore: %s: %w", op, store.ErrBusy)
 }
 
 // sizeUpdate adds count and bytes to a size item, conditional on the
@@ -192,7 +249,17 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if !s.mayRecount(ctx, m.Recipient, m.Enqueued) {
 		return err
 	}
-	fixed, cerr := s.recount(ctx, m.Recipient, m.Sender)
+	var shares []string
+	if share, ok := m.ShareKey(); ok {
+		shares = append(shares, share)
+	}
+	if m.InGroupTotal() {
+		shares = append(shares, store.GroupNotifications)
+	}
+	if m.InSummaryTotal() {
+		shares = append(shares, store.GroupSummaries)
+	}
+	fixed, cerr := s.recount(ctx, m.Recipient, shares...)
 	if cerr != nil || !fixed {
 		return err
 	}
@@ -217,15 +284,19 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		attrSender:       str(m.Sender),
 		attrMode:         num(int64(m.Mode)),
 		attrNotification: &types.AttributeValueMemberBOOL{Value: m.Notification},
-		attrCPIM:         &types.AttributeValueMemberB{Value: m.CPIM},
+		attrSummary:      &types.AttributeValueMemberBOOL{Value: m.Summary},
 		attrSize:         num(m.Size()),
 		attrEnqueued:     stamp(m.Enqueued),
 		attrExpires:      stamp(m.Expires),
 		attrTTL:          ttlOf(ttl),
 	}
+	if !m.Summary {
+		// A summary has no body of its own.
+		item[attrCPIM] = &types.AttributeValueMemberB{Value: m.CPIM}
+	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
-		attrInReplyTo: m.InReplyTo, attrMessageID: m.MessageID,
+		attrInReplyTo: m.InReplyTo, attrMessageID: m.MessageID, attrAuthor: m.Author,
 	} {
 		if v != "" {
 			item[name] = str(v)
@@ -240,8 +311,14 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		}},
 		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), 1, m.Size(), l.Count, l.Bytes, ttl)},
 	}
-	if !m.Notification {
-		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, m.Sender), 1, m.Size(), l.SenderCount, l.SenderBytes, ttl)})
+	if share, ok := m.ShareKey(); ok {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, share), 1, m.Size(), l.SenderCount, l.SenderBytes, ttl)})
+	}
+	if m.InGroupTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupNotifications), 1, m.Size(), l.GroupCount, l.GroupBytes, ttl)})
+	}
+	if m.InSummaryTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), 1, m.Size(), l.SummaryCount, l.SummaryBytes, ttl)})
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok {
@@ -250,7 +327,7 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
 		case len(failed) > 1 && failed[1]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
-		case len(failed) > 2 && failed[2]:
+		case slices.Contains(failed[min(2, len(failed)):], true):
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
 		}
 	}
@@ -280,12 +357,47 @@ func (s *Store) mayRecount(ctx context.Context, recipient string, now time.Time)
 	return err == nil
 }
 
-// recount counts recipient's queue, and what sender has in it, and sets
-// any size item that says more to what is there. It reports whether it
-// corrected one. Each correction is conditional on the size item being
-// unchanged since it was read, before the queue was: a size that moved
-// meanwhile reflects an enqueue or removal the count may have missed.
-func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, error) {
+// sharesOf are the shares a projected queue item counts against: its
+// Message.ShareKey, and GroupNotifications for a group notification.
+func sharesOf(item map[string]types.AttributeValue) []string {
+	m := projected(item)
+	var out []string
+	if k, ok := m.ShareKey(); ok {
+		out = append(out, k)
+	}
+	if m.InGroupTotal() {
+		out = append(out, store.GroupNotifications)
+	}
+	if m.InSummaryTotal() {
+		out = append(out, store.GroupSummaries)
+	}
+	return out
+}
+
+// projected is what a recount projects of a queue item.
+func projected(item map[string]types.AttributeValue) store.Message {
+	var m store.Message
+	var mode int64
+	_ = getString(item, attrSender, &m.Sender, false)
+	_ = getString(item, attrAuthor, &m.Author, false)
+	_ = getNum(item, attrMode, &mode)
+	if b, ok := item[attrNotification].(*types.AttributeValueMemberBOOL); ok {
+		m.Notification = b.Value
+	}
+	if b, ok := item[attrSummary].(*types.AttributeValueMemberBOOL); ok {
+		m.Summary = b.Value
+	}
+	m.Mode = store.Mode(mode)
+	return m
+}
+
+// recount counts recipient's queue, and what each of shares holds of it
+// (Message.ShareKey, store.GroupNotifications), and sets any size item that
+// says more to what is there. It reports whether it corrected one. Each
+// correction is conditional on the size item being unchanged since it was
+// read, before the queue was: a size that moved meanwhile reflects an
+// enqueue or removal the count may have missed.
+func (s *Store) recount(ctx context.Context, recipient string, shares ...string) (bool, error) {
 	type size struct{ count, bytes int64 }
 	read := func(k map[string]types.AttributeValue) (size, error) {
 		out, err := s.api.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(s.table), Key: k, ConsistentRead: aws.Bool(true)})
@@ -297,22 +409,32 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 		_ = getNum(out.Item, attrBytes, &z.bytes)
 		return z, nil
 	}
-	queueKey, senderKey := queueSizeKey(recipient), senderSizeKey(recipient, sender)
-	queueWas, err := read(queueKey)
-	if err != nil {
-		return false, err
+	type counted struct {
+		k        map[string]types.AttributeValue
+		was, now size
 	}
-	senderWas, err := read(senderKey)
-	if err != nil {
-		return false, err
+	all := []*counted{{k: queueSizeKey(recipient)}}
+	byShare := map[string]*counted{}
+	for _, share := range shares {
+		c := &counted{k: senderSizeKey(recipient, share)}
+		all, byShare[share] = append(all, c), c
 	}
-	var queueIs, senderIs size
+	for _, c := range all {
+		was, err := read(c.k)
+		if err != nil {
+			return false, err
+		}
+		c.was = was
+	}
 	in := &dynamodb.QueryInput{
-		TableName:                 aws.String(s.table),
-		ConsistentRead:            aws.Bool(true),
-		KeyConditionExpression:    aws.String("#pk = :pk"),
-		ProjectionExpression:      aws.String("#sender, #size, #notification"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#sender": attrSender, "#size": attrSize, "#notification": attrNotification},
+		TableName:              aws.String(s.table),
+		ConsistentRead:         aws.Bool(true),
+		KeyConditionExpression: aws.String("#pk = :pk"),
+		ProjectionExpression:   aws.String("#sender, #author, #mode, #size, #notification, #summary"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": attrPK, "#sender": attrSender, "#author": attrAuthor, "#mode": attrMode, "#size": attrSize, "#notification": attrNotification,
+			"#summary": attrSummary,
+		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(queuePrefix, recipient))},
 	}
 	for {
@@ -323,10 +445,11 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 		for _, item := range page.Items {
 			var n int64
 			_ = getNum(item, attrSize, &n)
-			queueIs.count, queueIs.bytes = queueIs.count+1, queueIs.bytes+n
-			note, _ := item[attrNotification].(*types.AttributeValueMemberBOOL)
-			if sv, _ := item[attrSender].(*types.AttributeValueMemberS); sv != nil && sv.Value == sender && (note == nil || !note.Value) {
-				senderIs.count, senderIs.bytes = senderIs.count+1, senderIs.bytes+n
+			all[0].now.count, all[0].now.bytes = all[0].now.count+1, all[0].now.bytes+n
+			for _, k := range sharesOf(item) {
+				if c := byShare[k]; c != nil {
+					c.now.count, c.now.bytes = c.now.count+1, c.now.bytes+n
+				}
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {
@@ -335,10 +458,7 @@ func (s *Store) recount(ctx context.Context, recipient, sender string) (bool, er
 		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}
 	fixed := false
-	for _, c := range []struct {
-		k        map[string]types.AttributeValue
-		was, now size
-	}{{queueKey, queueWas, queueIs}, {senderKey, senderWas, senderIs}} {
+	for _, c := range all {
 		if c.now.count >= c.was.count && c.now.bytes >= c.was.bytes {
 			continue
 		}
@@ -496,8 +616,14 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 		}},
 		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), -1, -m.Size(), 0, 0, time.Time{})},
 	}
-	if !m.Notification {
-		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, m.Sender), -1, -m.Size(), 0, 0, time.Time{})})
+	if share, ok := m.ShareKey(); ok {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, share), -1, -m.Size(), 0, 0, time.Time{})})
+	}
+	if m.InGroupTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupNotifications), -1, -m.Size(), 0, 0, time.Time{})})
+	}
+	if m.InSummaryTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), -1, -m.Size(), 0, 0, time.Time{})})
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
@@ -512,6 +638,58 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 	}
 	if err != nil {
 		return sanitize("remove", err)
+	}
+	return nil
+}
+
+// RemoveSummary implements store.Store: Remove's transaction with a
+// condition check that the sent record's mark count is unchanged, or the
+// record gone.
+func (s *Store) RemoveSummary(ctx context.Context, m store.Message, owner string, marks int64) error {
+	return retryConflicts(ctx, "remove summary", func() error { return s.removeSummary(ctx, m, owner, marks) })
+}
+
+func (s *Store) removeSummary(ctx context.Context, m store.Message, owner string, marks int64) error {
+	k := key(identityKey(queuePrefix, m.Recipient), m.ID)
+	items := []types.TransactWriteItem{
+		{Delete: &types.Delete{
+			TableName:                 aws.String(s.table),
+			Key:                       k,
+			ConditionExpression:       aws.String("#owner = :owner"),
+			ExpressionAttributeNames:  map[string]string{"#owner": attrOwner},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
+		}},
+		{Update: s.sizeUpdate(queueSizeKey(m.Recipient), -1, -m.Size(), 0, 0, time.Time{})},
+		{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), -1, -m.Size(), 0, 0, time.Time{})},
+		{ConditionCheck: &types.ConditionCheck{
+			TableName:                 aws.String(s.table),
+			Key:                       key(identityKey(sentPrefix, m.Sender), m.MessageID),
+			ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #marks = :marks"),
+			ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#marks": attrMarkCount},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":marks": num(marks)},
+		}},
+	}
+	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
+	if conflicted(err) {
+		return err
+	}
+	if failed, ok := canceled(err); ok {
+		switch {
+		case len(failed) > 0 && failed[0]:
+			_, err := s.current(ctx, "remove summary", k)
+			if errors.Is(err, store.ErrNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("awsstore: remove summary: %w", store.ErrConflict)
+		case len(failed) > 3 && failed[3]:
+			return fmt.Errorf("awsstore: remove summary: %w", store.ErrMarksChanged)
+		}
+	}
+	if err != nil {
+		return sanitize("remove summary", err)
 	}
 	return nil
 }
@@ -643,17 +821,28 @@ func (s *Store) RecordSent(ctx context.Context, r store.Sent, now time.Time) err
 	for i, v := range r.Recipients {
 		recipients[i] = str(v)
 	}
+	item := map[string]types.AttributeValue{
+		attrPK:           str(identityKey(sentPrefix, r.Sender)),
+		attrSK:           str(r.MessageID),
+		attrRecipients:   &types.AttributeValueMemberL{Value: recipients},
+		attrDispositions: num(int64(r.Dispositions)),
+		attrExpires:      stamp(r.Expires),
+		attrTTL:          ttlOf(r.Expires),
+		attrSeen:         &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}},
+		attrMarkCount:    num(0),
+	}
+	if r.DateTime != "" {
+		item[attrDateTime] = str(r.DateTime)
+	}
+	if r.Author != "" {
+		item[attrAuthor] = str(r.Author)
+	}
+	if r.Group != "" {
+		item[attrGroup] = str(r.Group)
+	}
 	_, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(s.table),
-		Item: map[string]types.AttributeValue{
-			attrPK:           str(identityKey(sentPrefix, r.Sender)),
-			attrSK:           str(r.MessageID),
-			attrRecipients:   &types.AttributeValueMemberL{Value: recipients},
-			attrDispositions: num(int64(r.Dispositions)),
-			attrExpires:      stamp(r.Expires),
-			attrTTL:          ttlOf(r.Expires),
-			attrSeen:         &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}},
-		},
+		TableName:                 aws.String(s.table),
+		Item:                      item,
 		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #expires <= :now"),
 		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#expires": attrExpires},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":now": stamp(now)},
@@ -684,7 +873,23 @@ func (s *Store) Sent(ctx context.Context, sender, messageID string, now time.Tim
 	err = errors.Join(
 		getNum(out.Item, attrDispositions, &dispositions),
 		getTime(out.Item, attrExpires, &expires),
+		getString(out.Item, attrAuthor, &r.Author, false),
+		getString(out.Item, attrGroup, &r.Group, false),
+		getString(out.Item, attrDateTime, &r.DateTime, false),
+		getNum(out.Item, attrMarkCount, &r.MarkCount),
 	)
+	if seen, ok := out.Item[attrSeen].(*types.AttributeValueMemberM); ok {
+		r.Marks = make(map[string]string, len(seen.Value))
+		for k, v := range seen.Value {
+			var status string
+			if e, ok := v.(*types.AttributeValueMemberM); ok {
+				err = errors.Join(err, getString(e.Value, attrMarkStatus, &status, false))
+			} else {
+				err = errors.Join(err, errors.New("seen entry is not a map"))
+			}
+			r.Marks[k] = status
+		}
+	}
 	if l, ok := out.Item[attrRecipients].(*types.AttributeValueMemberL); ok {
 		for _, v := range l.Value {
 			sv, ok := v.(*types.AttributeValueMemberS)
@@ -708,16 +913,27 @@ func (s *Store) Sent(ctx context.Context, sender, messageID string, now time.Tim
 }
 
 // MarkNotified implements store.Store with an entry of the record's seen
-// map, set only when absent or set by the same attempt.
-func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, token string, now time.Time) error {
+// map, set only when absent, and a count of the entries ever set. The
+// count makes a repeat unsafe to apply again, so a refusal reads the entry
+// back: the same token is the attempt's own, landed already.
+func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, status, token string, now time.Time) error {
+	return retryConflicts(ctx, "mark notified", func() error { return s.markNotified(ctx, sender, messageID, mark, status, token, now) })
+}
+
+func (s *Store) markNotified(ctx context.Context, sender, messageID, mark, status, token string, now time.Time) error {
 	k := key(identityKey(sentPrefix, sender), messageID)
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(s.table),
-		Key:                       k,
-		UpdateExpression:          aws.String("SET #seen.#k = :token"),
-		ConditionExpression:       aws.String("#expires > :now AND (attribute_not_exists(#seen.#k) OR #seen.#k = :token)"),
-		ExpressionAttributeNames:  map[string]string{"#seen": attrSeen, "#k": mark, "#expires": attrExpires},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":token": str(token), ":now": stamp(now)},
+		TableName:           aws.String(s.table),
+		Key:                 k,
+		UpdateExpression:    aws.String("SET #seen.#k = :entry ADD #marks :one"),
+		ConditionExpression: aws.String("#expires > :now AND attribute_not_exists(#seen.#k)"),
+		ExpressionAttributeNames: map[string]string{
+			"#seen": attrSeen, "#k": mark, "#expires": attrExpires, "#marks": attrMarkCount,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":entry": &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{attrMarkToken: str(token), attrMarkStatus: str(status)}},
+			":one":   num(1), ":now": stamp(now),
+		},
 	})
 	if errorCode(err) == conditionFailed {
 		item, err := s.current(ctx, "mark notified", k)
@@ -728,7 +944,18 @@ func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, token
 		if err := getTime(item, attrExpires, &expires); err != nil || !expires.After(now) {
 			return fmt.Errorf("awsstore: mark notified: %w", store.ErrNotFound)
 		}
+		if seen, ok := item[attrSeen].(*types.AttributeValueMemberM); ok {
+			if e, ok := seen.Value[mark].(*types.AttributeValueMemberM); ok {
+				var t string
+				if getString(e.Value, attrMarkToken, &t, true) == nil && t == token {
+					return nil
+				}
+			}
+		}
 		return fmt.Errorf("awsstore: mark notified: %w", store.ErrExists)
+	}
+	if conflicted(err) {
+		return err
 	}
 	if err != nil {
 		return sanitize("mark notified", err)
@@ -736,14 +963,15 @@ func (s *Store) MarkNotified(ctx context.Context, sender, messageID, mark, token
 	return nil
 }
 
-// UnmarkNotified implements store.Store.
+// UnmarkNotified implements store.Store. It leaves the count, which only
+// grows.
 func (s *Store) UnmarkNotified(ctx context.Context, sender, messageID, mark, token string) error {
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(s.table),
 		Key:                       key(identityKey(sentPrefix, sender), messageID),
 		UpdateExpression:          aws.String("REMOVE #seen.#k"),
-		ConditionExpression:       aws.String("#seen.#k = :token"),
-		ExpressionAttributeNames:  map[string]string{"#seen": attrSeen, "#k": mark},
+		ConditionExpression:       aws.String("#seen.#k.#t = :token"),
+		ExpressionAttributeNames:  map[string]string{"#seen": attrSeen, "#k": mark, "#t": attrMarkToken},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":token": str(token)},
 	})
 	if err != nil && errorCode(err) != conditionFailed {
@@ -772,6 +1000,7 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 		getString(item, attrPK, &pk, true),
 		getString(item, attrSK, &m.ID, true),
 		getString(item, attrSender, &m.Sender, true),
+		getString(item, attrAuthor, &m.Author, false),
 		getString(item, attrConversation, &m.Conversation, false),
 		getString(item, attrContribution, &m.Contribution, false),
 		getString(item, attrInReplyTo, &m.InReplyTo, false),
@@ -784,13 +1013,16 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 	if _, ok := item[attrLease]; ok {
 		err = errors.Join(err, getTime(item, attrLease, &m.LeaseUntil))
 	}
-	if b, ok := item[attrCPIM].(*types.AttributeValueMemberB); ok {
-		m.CPIM = b.Value
-	} else {
-		err = errors.Join(err, errors.New("cpim missing"))
-	}
 	if b, ok := item[attrNotification].(*types.AttributeValueMemberBOOL); ok {
 		m.Notification = b.Value
+	}
+	if b, ok := item[attrSummary].(*types.AttributeValueMemberBOOL); ok {
+		m.Summary = b.Value
+	}
+	if b, ok := item[attrCPIM].(*types.AttributeValueMemberB); ok {
+		m.CPIM = b.Value
+	} else if !m.Summary {
+		err = errors.Join(err, errors.New("cpim missing"))
 	}
 	recipient, ok := queueRecipient(pk)
 	if !ok {

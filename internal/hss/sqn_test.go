@@ -21,8 +21,14 @@ func TestConcurrentMARsOnTwoTasksNeverShareASequenceNumber(t *testing.T) {
 // concurrentMARs runs the check with two HSS tasks over e's store.
 func concurrentMARs(t *testing.T, e *env, a, b *HSS) {
 	e.provision(impi1, impu1)
-	taskA := serveHSS(t, a, "hss-a.rcs.local")
-	taskB := serveHSS(t, b, "hss-b.rcs.local")
+	// A MAR's Cx timeout covers its wait for the subscriber's lock, behind
+	// the other clients' MARs on the same task, as well as its own reads
+	// and writes, and the retries of a write that lost to the other task,
+	// which run until that deadline (#200). On a loaded host DynamoDB Local
+	// takes more than DefaultCxTimeout for that. The property here is the
+	// sequence numbers, so the bound is only the hang guard.
+	taskA := serveHSSWith(t, a, "hss-a.rcs.local", realWait)
+	taskB := serveHSSWith(t, b, "hss-b.rcs.local", realWait)
 	clients := []*cscf{
 		connectCSCF(t, taskA, "scscf-1.rcs.local"),
 		connectCSCF(t, taskB, "scscf-2.rcs.local"),

@@ -2,6 +2,7 @@ package ifc
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"regexp/syntax"
 	"runtime"
@@ -723,6 +724,38 @@ func TestAnEvaluationFailsWhenItsWorkBudgetIsSpent(t *testing.T) {
 	}
 }
 
+// A realistic RCS trigger ends with a negated "P-Served-User present"
+// SPT: a request rcs-as sends itself, which carries the header, is not sent
+// back to it in any session case, while the same request without it is
+// (#137). The header name compares without regard to case.
+func TestARealisticRCSProfileSkipsTheASForARequestWithPServedUser(t *testing.T) {
+	var cs []FilterCriteria
+	for i, method := range []string{"INVITE", "MESSAGE"} {
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+			{Groups: []int{0}, Condition: Method(method)},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `3gpp-service\.ims\.icsi\.oma\.cpm\.`}},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Contact", Content: `3gpp-service\.ims\.icsi\.oma\.cpm\.`}},
+			{ConditionNegated: true, Groups: []int{2}, Condition: SIPHeader{Header: "P-Served-User"}},
+		}}))
+	}
+	s := compile(t, cs...)
+	tags := `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`
+	for _, method := range []string{"INVITE", "MESSAGE"} {
+		for _, sc := range []SessionCase{Originating, TerminatingRegistered, TerminatingUnregistered, OriginatingUnregistered} {
+			plain := req(method, impu, HeaderField{"Accept-Contact", tags})
+			if !matches(t, s, plain, Context{Case: sc}) {
+				t.Errorf("%s in case %d without P-Served-User skips the AS", method, sc)
+			}
+			for _, name := range []string{"P-Served-User", "p-served-user"} {
+				served := req(method, impu, HeaderField{"Accept-Contact", tags}, HeaderField{name, "<" + impu + ">;sescase=term;regstate=reg"})
+				if matches(t, s, served, Context{Case: sc}) {
+					t.Errorf("%s in case %d with %s goes to the AS", method, sc, name)
+				}
+			}
+		}
+	}
+}
+
 // TestAnOrdinaryProfileSpendsLittleOfTheBudget evaluates the kind of RCS
 // profile an HSS provisions against a realistic chat INVITE: the error path
 // is for abuse, so ordinary traffic must stay far from it.
@@ -916,4 +949,267 @@ func TestOneSetServesConcurrentRequests(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// A set compiled once can be evaluated under another work budget, without
+// compiling it again and without changing the original (#120).
+func TestWithLimitsEvaluatesTheSameSetUnderAnotherBudget(t *testing.T) {
+	s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: SIPHeader{Header: "Subject", Content: "x[ab]{20}y"}}}}))
+	r := req("MESSAGE", impu, HeaderField{"Subject", strings.Repeat("z", 1000)})
+	if _, err := s.Match(r, Context{}); err != nil {
+		t.Fatalf("default budget: %v", err)
+	}
+	var le *LimitError
+	if _, err := s.WithLimits(Limits{MaxWork: 10}).Match(r, Context{}); !errors.As(err, &le) {
+		t.Fatalf("budget of 10: %v, want a LimitError", err)
+	}
+	if _, err := s.Match(r, Context{}); err != nil {
+		t.Fatalf("the original set changed: %v", err)
+	}
+	// A derived set reads the same compiled part, so every accessor
+	// reports the same as the original's.
+	d := s.WithLimits(Limits{MaxWork: 10})
+	if d.Len() != s.Len() || d.CompileCost() != s.CompileCost() || d.CompileCost() == 0 {
+		t.Fatalf("derived set: %d criteria, cost %d; original %d, %d", d.Len(), d.CompileCost(), s.Len(), s.CompileCost())
+	}
+}
+
+// negatedClasses is a case-folded Request-URI pattern of 1024 negated
+// classes, the costliest shape per byte found in the review of #104.
+func negatedClasses(priority int) FilterCriteria {
+	return criteria(priority, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
+		Condition: RequestURI(strings.Repeat("[^a]", MaxPatternBytes/4))}}})
+}
+
+// Forty-seven patterns near MaxPatternBytes fit the instruction budget and
+// took about half a second to compile (#111). The cost budget refuses the
+// set at the first pattern that crosses it, so no more than one pattern's
+// work is done past MaxSetCompileCost, on any host.
+func TestASetCostlierThanMaxSetCompileCostIsRefusedAtThePatternThatCrossesIt(t *testing.T) {
+	one := compile(t, negatedClasses(0)).CompileCost()
+	if one <= 0 || one > MaxSetCompileCost/4 {
+		t.Fatalf("one pattern costs %d units", one)
+	}
+	var cs []FilterCriteria
+	for i := range 47 {
+		cs = append(cs, negatedClasses(i))
+	}
+	_, err := Compile(cs)
+	// Every pattern costs the same, so the one at index MaxSetCompileCost/one
+	// is the first that does not fit.
+	crossing := MaxSetCompileCost / one
+	want := fmt.Sprintf("filter criteria with priority %d: SPT 1: the criteria cost more than MaxSetCompileCost (%d units)", crossing, MaxSetCompileCost)
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Compile = %v, want %q", err, want)
+	}
+	// As many as fit are accepted, and their cost is the sum of theirs.
+	s, err := Compile(cs[:crossing])
+	if err != nil || s.CompileCost() != crossing*one {
+		t.Fatalf("%d patterns: cost %d, %v, want %d", crossing, s.CompileCost(), err, crossing*one)
+	}
+}
+
+// A pattern whose source alone exceeds what is left of the budget is not
+// parsed: an invalid one gets the cost error, not a syntax error.
+func TestAPatternTheCostBudgetCannotPayForIsRefusedBeforeItIsParsed(t *testing.T) {
+	b := setBudget{insts: MaxSetInstructions, cost: 1000}
+	_, err := b.compile("Content", "("+strings.Repeat("a", 500), 0)
+	if err == nil || !strings.Contains(err.Error(), "MaxSetCompileCost") || b.cost != 1000 {
+		t.Fatalf("err %v, %d units left, want the cost error and nothing charged", err, b.cost)
+	}
+	if _, err := b.compile("Content", "(a", 0); err == nil || !strings.Contains(err.Error(), "not a POSIX") {
+		t.Fatalf("a short invalid pattern: %v, want the syntax error", err)
+	}
+	p, err := b.compile("Content", "abc", 0)
+	if err != nil || p.cost < patternCost(3, len("abc"), p.insts) || b.cost != 1000-p.cost {
+		t.Fatalf("abc: %v, cost %d, %d left", err, p.cost, b.cost)
+	}
+	// So is a Content that would match every value.
+	b = setBudget{insts: MaxSetInstructions, cost: 1000}
+	if _, err := b.compileContent("Content", strings.Repeat("|", 500)); err == nil || b.cost != 1000 {
+		t.Fatalf("a Content matching everything: %v, %d left", err, b.cost)
+	}
+}
+
+// A Content that matches every value is not compiled, but it is parsed to
+// find that out, which for 4 KiB of "|" takes about a millisecond; the parse
+// is work the cost budget must pay for (QA's test from the review of #115).
+func TestAContentParsedToSeeItMatchesEverythingIsCharged(t *testing.T) {
+	content := strings.Repeat("|", MaxPatternBytes)
+	for _, cond := range []Condition{
+		SIPHeader{Header: "S", Content: content},
+		SessionDescription{Line: "m", Content: content},
+	} {
+		s := compile(t, criteria(0, &TriggerPoint{SPTs: []SPT{{Groups: []int{0}, Condition: cond}}}))
+		if s.CompileCost() < len(content) {
+			t.Errorf("%T: CompileCost %d, want at least the %d bytes parsed", cond, s.CompileCost(), len(content))
+		}
+	}
+	// Enough of them are refused like any other costly pattern, where
+	// 64×64 of them were accepted at 45% of the bound and took 6.9 s.
+	var cs []FilterCriteria
+	for i := range 64 {
+		var spts []SPT
+		for range 64 {
+			spts = append(spts, SPT{Groups: []int{0}, Condition: SIPHeader{Header: "S", Content: content}})
+		}
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: spts}))
+	}
+	if _, err := Compile(cs); err == nil || !strings.Contains(err.Error(), "MaxSetCompileCost") {
+		t.Fatalf("64×64 Contents matching everything: %v, want a refusal naming MaxSetCompileCost", err)
+	}
+}
+
+// Every kind of condition charges each of its patterns, and charges exactly
+// what compiling it costs.
+func TestEveryConditionChargesEachOfItsPatterns(t *testing.T) {
+	const fold, whole = patternFoldCase, patternFoldCase | patternWhole
+	type part struct {
+		source string
+		mode   patternMode
+		any    bool // a Content matching every value: only parsed
+	}
+	for _, tc := range []struct {
+		cond  Condition
+		parts []part
+	}{
+		{RequestURI("sip:[^@]+@ims"), []part{{"sip:[^@]+@ims", fold, false}}},
+		{SIPHeader{Header: "Subj[a-z]ct"}, []part{{"Subj[a-z]ct", whole, false}, {"", 0, true}}},
+		{SIPHeader{Header: "S", Content: "a[0-9]+b"}, []part{{"S", whole, false}, {"a[0-9]+b", 0, false}}},
+		{SIPHeader{Header: "S", Content: ".*"}, []part{{"S", whole, false}, {".*", 0, true}}},
+		{SessionDescription{Line: "m[a-z]"}, []part{{"m[a-z]", 0, false}, {"", 0, true}}},
+		{SessionDescription{Line: "m", Content: "aud[a-z]o"}, []part{{"m", 0, false}, {"aud[a-z]o", 0, false}}},
+	} {
+		want := 0
+		for _, p := range tc.parts {
+			if p.any {
+				want += sourceCost(len(p.source))
+				continue
+			}
+			budget := MaxSetInstructions
+			cp, err := compilePattern("P", p.source, p.mode, &budget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want += cp.cost
+		}
+		s := compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: tc.cond}}}))
+		if s.CompileCost() != want {
+			t.Errorf("%#v: CompileCost %d, want %d", tc.cond, s.CompileCost(), want)
+		}
+	}
+}
+
+// The cost of the baseline shape is pinned, so a change of weight is a
+// decision, not an accident; parse-dominated shapes, whose programs are
+// small, are charged at least the share of the baseline's cost that their
+// compile time took of the baseline's in review (#115), so that a set of
+// them at the bound takes no longer than a set of the baseline shape.
+func TestTheCostModelChargesEveryShapeAtLeastItsShareOfTheWork(t *testing.T) {
+	cost := func(c Condition) int {
+		return compile(t, criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0}, Condition: c}}})).CompileCost()
+	}
+	base := cost(negatedClasses(0).TriggerPoint.SPTs[0].Condition)
+	if base != 108608 {
+		t.Fatalf("1024 case-folded negated classes cost %d units, want 108608", base)
+	}
+	alternatives := func(word func(int) string) string {
+		var b strings.Builder
+		for i := 0; ; i++ {
+			w := word(i)
+			if b.Len()+len(w)+1 > MaxPatternBytes {
+				return b.String()
+			}
+			if i > 0 {
+				b.WriteByte('|')
+			}
+			b.WriteString(w)
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		content string
+		share   float64 // the most compile time it took, as a share of the baseline's
+	}{
+		{"0.|00| repeated", strings.Repeat("0.|00|", (MaxPatternBytes-3)/6) + "0.0", 0.33},
+		{"unclosed [: in brackets", "([" + strings.Repeat("[:", (MaxPatternBytes-8)/2) + "a]){0}", 0.32},
+		{"short literal alternatives", alternatives(func(i int) string { return "x" + strings.Repeat("y", i%40) + "z" }), 0.39},
+		{"| matching everything", strings.Repeat("|", MaxPatternBytes), 0.24},
+		{". repeated", strings.Repeat(".", 1900), 0.76},
+	} {
+		got := cost(SIPHeader{Header: "S", Content: tc.content})
+		if float64(got) < tc.share*float64(base) {
+			t.Errorf("%s: %d units, %.2f of the baseline's %d, want at least %.2f", tc.name, got, float64(got)/float64(base), base, tc.share)
+		}
+	}
+}
+
+// A profile of MaxCriteria (64) ordinary RCS criteria, each with six short
+// patterns, fits every other limit (MaxSPTs, MaxSetInstructions, and the
+// HSS's MaxDocumentSize at 65 KB of JSON) and must compile (QA's test from
+// the review of #115; it costs about 921 000 units).
+func TestAnOrdinaryProfileOfSixtyFourCriteriaCompiles(t *testing.T) {
+	var cs []FilterCriteria
+	for i := range 64 {
+		icsi := strings.ReplaceAll(rcsICSIs[i%len(rcsICSIs)], ".", `\.`)
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+			{Groups: []int{0}, Condition: Method("INVITE")},
+			{Groups: []int{0}, Condition: Method("MESSAGE")},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Contact", Content: `.*\+g\.3gpp\.icsi-ref="urn%3Aurn-7%3A3gpp-service\.ims\.icsi\.` + icsi + `".*`}},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `.*` + icsi + `.*`}},
+			{ConditionNegated: true, Groups: []int{2}, Condition: SIPHeader{Header: "P-Served-User"}},
+			{Groups: []int{3}, Condition: RequestURI(`^(sip|tel):\+?[0-9]{6,15}(@ims\.mnc001\.mcc001\.3gppnetwork\.org)?(;.*)?$`)},
+			{Groups: []int{3}, Condition: SIPHeader{Header: "(Accept|Reject)-Contact", Content: `.*\+g\.3gpp\.icsi-ref="[^"]*(oma\.cpm\.(msg|largemsg|session|filetransfer)|gsma\.rcs\.(chatbot|botversion))[^"]*".*`}},
+			{Groups: []int{4}, Condition: SessionDescription{Line: "m", Content: `^(message|audio|video) [0-9]+ (TCP|TCP/TLS)/MSRP \*`}},
+		}}))
+	}
+	if _, err := Compile(cs); err != nil {
+		t.Fatalf("64 ordinary criteria refused: %v", err)
+	}
+}
+
+// A set that costs exactly what is left fits: the bound refuses only what
+// costs more, both before the parse and after the compile.
+func TestAPatternThatCostsExactlyWhatIsLeftFits(t *testing.T) {
+	budget := MaxSetInstructions
+	p, err := compilePattern("Content", "abc", 0, &budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for left, fits := range map[int]bool{p.cost: true, p.cost - 1: false} {
+		b := setBudget{insts: MaxSetInstructions, cost: left}
+		_, err := b.compile("Content", "abc", 0)
+		if fits && (err != nil || b.cost != 0) || !fits && err == nil {
+			t.Errorf("abc (%d units) with %d left: %v, %d left after", p.cost, left, err, b.cost)
+		}
+	}
+	// A Content matching every value costs its source alone, which the
+	// check before the parse compares.
+	any := strings.Repeat("|", 100)
+	for left, fits := range map[int]bool{sourceCost(len(any)): true, sourceCost(len(any)) - 1: false} {
+		b := setBudget{insts: MaxSetInstructions, cost: left}
+		_, err := b.compileContent("Content", any)
+		if fits && (err != nil || b.cost != 0) || !fits && err == nil {
+			t.Errorf("100 bars (%d units) with %d left: %v, %d left after", sourceCost(len(any)), left, err, b.cost)
+		}
+	}
+}
+
+// A Set that Compile did not build, such as a zero Set or new(Set), is an
+// empty set: it matches nothing and costs nothing, rather than panicking on
+// its missing compiled part (review of #125, #142).
+func TestTheZeroSetIsEmpty(t *testing.T) {
+	r := req("MESSAGE", "sip:bob@example.net")
+	for name, s := range map[string]*Set{"Set{}": {}, "new(Set)": new(Set), "WithLimits of Set{}": (&Set{}).WithLimits(Limits{MaxWork: 10})} {
+		if s.Len() != 0 || s.CompileCost() != 0 {
+			t.Errorf("%s: %d criteria, cost %d", name, s.Len(), s.CompileCost())
+		}
+		if got, err := s.Match(r, Context{}); got != nil || err != nil {
+			t.Errorf("%s: Match = %v, %v", name, got, err)
+		}
+		if _, ok, err := s.Next(r, Context{}, -1); ok || err != nil {
+			t.Errorf("%s: Next = %v, %v", name, ok, err)
+		}
+	}
 }

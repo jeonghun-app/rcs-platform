@@ -211,13 +211,15 @@ func TestAnOfferWithoutAnAnswerExpires(t *testing.T) {
 	if r.m.get("leg.unanswered") != 1 {
 		t.Fatalf("metrics %v", r.m)
 	}
-	// An answered offer does not expire.
+	// An answered offer, whose relay connected, does not expire.
 	leg, err = r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer leg.Close()
-	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+	u := clientURI()
+	r.dial(t, r.listen(t), u, leg.Local())
+	if err := leg.Answer([]msrp.URI{u}); err != nil {
 		t.Fatal(err)
 	}
 	r.clock.Advance(time.Minute)
@@ -225,6 +227,39 @@ func TestAnOfferWithoutAnAnswerExpires(t *testing.T) {
 	case <-leg.Done():
 		t.Fatal("an answered leg expired")
 	default:
+	}
+}
+
+// A leg whose peer's path is known but that no connection binds is closed
+// after AnswerTimeout, whether it was opened on an offer (OpenLeg) or
+// answered (security review on #252): a client that never connects to
+// msrp-relay would otherwise hold it, and its SIP session, until the task
+// stops (threat model T9).
+func TestALegNoConnectionBindsIsClosed(t *testing.T) {
+	r := newRig(t, Config{AnswerTimeout: 10 * time.Second})
+	opened, err := r.e.OpenLeg(LegParams{Remote: []msrp.URI{clientURI()}, User: alice, Peer: bob, Mode: store.Chat, Direction: Originating})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered, err := r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(5 * time.Second)
+	if err := answered.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(5 * time.Second) // the opened leg's deadline
+	waitDone(t, opened.Done())
+	select {
+	case <-answered.Done():
+		t.Fatal("the answered leg closed before its own deadline")
+	default:
+	}
+	r.clock.Advance(5 * time.Second)
+	waitDone(t, answered.Done())
+	if r.m.get("leg.unbound") != 2 || r.m.get("leg.unanswered") != 0 {
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -346,7 +381,10 @@ func TestAnAnswerAtTheTimeoutEitherWinsOrIsRefused(t *testing.T) {
 		err = <-answered
 		select {
 		case <-leg.Done():
-			if err == nil {
+			// An answer just before the clock moved also starts the bind
+			// deadline, which the same Advance may reach: that close is
+			// the bind deadline's, not the answer timeout's.
+			if err == nil && r.m.get("leg.unbound") == 0 {
 				t.Fatal("an answered leg was closed by the timeout")
 			}
 		default:

@@ -306,41 +306,9 @@ func corePorts(e *runtime.Env) []uint16 {
 }
 
 // coreHost reads RELAY_CORE_HOST, or finds this task's one private IPv4
-// address: on Fargate the task definition cannot know the address, and
-// rcs-as and pcscf see the relay by it (ADR 0005).
+// address: rcs-as and pcscf see the relay by it (ADR 0005).
 func coreHost(e *runtime.Env) netip.Addr {
-	if v := e.String("CORE_HOST", ""); v != "" {
-		a, err := netip.ParseAddr(v)
-		if err != nil || a.Zone() != "" {
-			e.Invalid("CORE_HOST", "not an IP address")
-			return netip.Addr{}
-		}
-		return a.Unmap()
-	}
-	addrs, err := interfaceAddrs()
-	if err != nil {
-		e.Invalid("CORE_HOST", "unset, and the interface addresses could not be read")
-		return netip.Addr{}
-	}
-	var found []netip.Addr
-	for _, a := range addrs {
-		ipn, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip, ok := netip.AddrFromSlice(ipn.IP)
-		if !ok {
-			continue
-		}
-		if ip = ip.Unmap(); ip.Is4() && ip.IsPrivate() {
-			found = append(found, ip)
-		}
-	}
-	if len(found) != 1 {
-		e.Invalid("CORE_HOST", "unset, and this host has "+strconv.Itoa(len(found))+" private IPv4 addresses rather than one")
-		return netip.Addr{}
-	}
-	return found[0]
+	return runtime.InstanceAddr(e, "CORE_HOST", interfaceAddrs)
 }
 
 // tokens reads pcscf's two tokens (ADR 0007 §4: current and next, so a token

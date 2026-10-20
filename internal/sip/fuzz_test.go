@@ -193,7 +193,7 @@ func FuzzHeaderValues(f *testing.F) {
 		}},
 		{"Accept-Contact", func(h *Header) (any, error) { return h.AcceptContact() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]AcceptContact) {
+			for _, x := range v.(AcceptContacts) {
 				out = append(out, x.String())
 			}
 			return join(out)
@@ -204,7 +204,7 @@ func FuzzHeaderValues(f *testing.F) {
 		{"Min-SE", func(h *Header) (any, error) { return h.MinSE() }, func(v any) []string { return []string{v.(MinSE).String()} }},
 		{"Reason", func(h *Header) (any, error) { return h.Reason() }, func(v any) []string {
 			var out []string
-			for _, x := range v.([]Reason) {
+			for _, x := range v.(Reasons) {
 				out = append(out, x.String())
 			}
 			return join(out)

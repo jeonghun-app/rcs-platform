@@ -83,11 +83,10 @@ const loadStall = 30 * time.Second
 // deadlocks both.
 //
 // The test waits on progress, the bytes either node reads, not on a time
-// (#113). Each node admits at least MaxInFlight of the other's requests to
-// its handlers and answers the others DIAMETER_TOO_BUSY at once, and an
-// admitted request's answer queues behind the node's own backlog of
-// requests, about 64 MB here: the admitted requests are answered only once
-// both backlogs have been written, which on a loaded host can take minutes
+// (#113). Each node admits at most MaxInFlight of the other's requests to
+// its handlers at once and answers the others DIAMETER_TOO_BUSY, and the
+// node's own backlog of requests, about 64 MB here, can take minutes to
+// write on a loaded host; admitted requests' answers go ahead of it
 // (#117). RequestTimeout is beyond the test's own timeout, and the
 // watchdog, whose messages would count as progress, is held off for as
 // long, so only a stall of the nodes fails the test.

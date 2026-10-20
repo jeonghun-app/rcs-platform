@@ -20,6 +20,21 @@ not authenticated without TLS.
 requirement and security groups planned (#12, Phase 7 infrastructure); per-peer
 command restrictions open.
 
+The other direction: whoever answers on the Cx port at an address the CSCFs
+discover for `hss` (by adding an instance to the Cloud Map service, T7, or
+running a task the security groups admit) receives every UAR, MAR and SAR, with
+IMPIs and AUTS, and can send RTR (deregister any user) and PPR (push User-Data
+whose iFC route a user's sessions to an application server it controls).
+**Control:** the CSCFs connect only to addresses Cloud Map lists for `hss` and
+only reach them through the security group from `icscf`/`scscf` to the `hss`
+port; the CEA must name the HSS realm; `cxclient` sends no request to, and
+refuses RTR and PPR from, a peer whose Origin-Host does not match
+`HSSHostPattern` (`hss-*.<namespace>`, ADR 0005). Origin-Host is still not
+authenticated without TLS, so the pattern guards against a misdirected peer,
+and Cloud Map and IAM integrity (T7) against a planted one.
+**Status:** Origin-Host pattern implemented (`internal/ims/cxclient`, #76);
+security groups planned (Phase 7 infrastructure).
+
 ## T2 — SIP trust domain (RFC 3325)
 
 Anything that reaches a core SIP port can send as any subscriber by setting
@@ -27,7 +42,9 @@ Anything that reaches a core SIP port can send as any subscriber by setting
 **Control:** only `pcscf` faces clients and strips client-supplied
 `P-Asserted-Identity` and the other network-only headers, on a client listener
 separate from its core listener; core SIP ports admit only platform services
-(ADR 0007 §2, §7).
+(ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
+default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
+messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
 **Status:** planned (#16, Phase 7 infrastructure).
 
 ## T3 — MSRP session access on `rcs-as`
@@ -76,7 +93,7 @@ compromised, its reach is what its security group and tokens allow:
 
 | Service | Implemented in the service | Planned |
 |---|---|---|
-| `pcscf` | nothing yet: the service is not built | the service (#16), security groups (#56) |
+| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, with connections kept for the core listener ([pcscf](pcscf.md)) | registration and routing (#16), per-listener handshake limits (#193), security groups (#56) |
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |
@@ -124,6 +141,14 @@ metric dimension (architecture §8).
 **Control:** every listener and parser has size, count, time and per-source limits;
 reviews check maximum-size inputs (architecture §8).
 **Status:** implemented for merged libraries; each service adds its own.
+`rcs-as` bounds its SIP sessions, each with its MSRP leg, per task
+(`RCSAS_MAX_SESSIONS`, invitations waiting for an answer included) and per
+user each way (`RCSAS_MAX_OUTGOING_SESSIONS_PER_USER`,
+`RCSAS_MAX_INCOMING_SESSIONS_PER_USER`), so other users' messages cannot take a
+user's own room; one sender has one large-mode session at a time with one
+recipient. In time, a leg that no msrp-relay connection binds within
+`RCSAS_ANSWER_TIMEOUT` is closed and its session ended, so a client that
+answers or offers and never connects cannot hold a place.
 
 ## T10 — Forged receipts, routes and floods through `rcs-as`
 
@@ -157,8 +182,10 @@ metadata.
 - **Floods.** These are bounded:
   - per-recipient queues, by count and bytes, across tasks;
   - each sender's share of a queue (an eighth by default), so that no sender
-    can lock the others out; notifications are bounded by the sent records and
-    by being accepted once instead;
+    can lock the others out, whether it writes 1-to-1 or in groups; 1-to-1
+    notifications are bounded by the sent records and by being accepted once
+    instead, group notifications by one share per group and a quarter of the
+    queue for all groups together, and their summaries by an eighth (T11);
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
@@ -173,3 +200,171 @@ metadata.
 
 **Status:** implemented in `internal/rcsas` (#59). The SIP-layer contracts
 (`Delivery.Route`, `Delivery.SenderName`) apply when the SIP layer is built.
+
+## T11 — Forged roster changes and mass-add spam in group chats
+
+`rcs-as` runs group chats ([rcs-as](rcs-as.md#group-chat)). A subscriber could:
+
+- remove or add others in a group it is not in, or as an ordinary participant
+  remove others;
+- read a group's roster without being in it;
+- write as someone else in a group;
+- put strangers in groups (spam), or flood a group so that every participant's
+  device and queue fills.
+
+**Control:**
+
+- **Authorisation.** Every operation is checked against the stored roster:
+  - only joined participants add, and only the chairman removes;
+  - someone who left or was removed returns only when added again, and
+    someone removed only when the chairman adds them back, so that no
+    participant can undo the chairman's removal. A removed identity is kept
+    after the roster forgets its entry (up to 200 a group), and the roster
+    forgets those who left first;
+  - only current participants read the roster;
+  - only joined participants write.
+
+  Who asks is the identity the network asserted (T2). Every change is a
+  conditional write on the revision it was computed from, so no concurrent
+  change is lost or reordered.
+- **Authorship.** A group message's CPIM header block is rebuilt with one
+  `From`, the writer's asserted identity under its roster name, and one `To`,
+  the group. No other header that any receiver could read as a `From` or `To`
+  survives, whatever its case, prefix or namespace, so nobody writes as
+  someone else by address: the `From` address is the asserted identity
+  and cannot be forged. A name is weaker. It is first come, first served
+  and unverified: whoever takes a name first in a group keeps it, and
+  nothing checks that it is the person's. A later name that another
+  participant, current or former, goes by (compared without case, extra
+  space and characters that show as nothing) is dropped. Its owner keeps
+  the name it had, or joins under its identity alone; nobody is kept out
+  for a name. A 1-to-1 message, forwarded unchanged, is refused if it has
+  such a header.
+  Residual risk: names are not normalized (NFC), so canonically equivalent
+  spellings (an é composed or decomposed) compare different. Look-alike
+  letters of other scripts are not folded, nor are visible symbols that
+  look blank (U+2800 BRAILLE PATTERN BLANK, and the like), which are not
+  default-ignorable. Such a name can still look like another's, next to a
+  different identity.
+- **Notifications.** They are matched by the group's own record of the
+  message, in the group or sent to the author outside it, accepted only from
+  participants it went to, for themselves (`recipient-uri`), once per kind.
+- **Floods and spam.** These are bounded:
+  - group size (`RCSAS_GROUP_MAX_PARTICIPANTS`);
+  - per user, groups created and participants added per minute;
+  - per participant and group, messages and renames per minute;
+  - per group, a fan-out budget of deliveries per minute, of which one
+    sender may use at most a quarter, so that no participant can silence a
+    group by writing at its own full rate. The burst lets one sender send 10
+    messages in a row to a full group. Residual risk: four accounts in one
+    group, each writing at its full share, use up the whole budget, and a
+    fifth participant then has about a quarter of its messages refused;
+  - each recipient's queue as in 1-to-1 chat, where a group message counts
+    against its author's share, the one its 1-to-1 messages use; each
+    group's notifications hold one share, and all groups' together a quarter
+    of the queue; beyond that they are summarized as one queue item per
+    message, at most an eighth of the queue in all, sent from the marks of
+    notifications already accepted, so the summary adds nothing a participant
+    did not report. A participant who sends receipts for many of the author's
+    messages fills at most that eighth, and the author's 1-to-1 messages keep
+    the rest;
+  - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
+    be SIP or tel URIs, compared in canonical form, and names XML-safe text,
+    so that one bad value cannot make the stored roster unwritable;
+  - the roster's size: the limits are such that the largest roster they
+    allow stays within what `internal/conference` reads back (256 KiB),
+    checked when the service starts, so no combination of allowed values
+    makes it unreadable either, and no Leave or Remove is ever refused for
+    size;
+  - former participants, at most as many as the size limit and as the
+    roster bound leaves room for; adding and removing stranger after
+    stranger cannot grow a group's stored item past DynamoDB's limit and
+    break the group.
+- **Metrics.** None names a group or a participant.
+- **Roster privacy.** The roster keeps former participants (up to the size
+  limit), so a participant who joins later sees who was in the group before.
+  This is accepted: it is how RFC 4575 rosters and RCS clients show who left.
+  Only current participants read the roster.
+
+**Status:** implemented in `internal/rcsas/group` (#108). The SIP layer must:
+
+- pass asserted identities;
+- send roster NOTIFYs only to subscriptions `Roster` accepted;
+- map a 603 Decline of the focus's INVITE to `Leave`, so that someone who
+  declines a group of strangers leaves it rather than being invited again;
+- end the session and the conference subscriptions of a participant who
+  leaves or is removed, so that it receives no later message or roster
+  change.
+
+The engine asks the group whether someone is still a participant before it
+invites them back to deliver a queued copy, and gives up the copies of
+anyone who left.
+
+## T12 — Authentication floods against one subscriber
+
+Every REGISTER without credentials costs the S-CSCF a MAR, and the HSS
+answers it under that subscriber's lock, updating the AKA sequence number. A
+distributed flood of REGISTERs for one (IMPI, IMPU) pair, from addresses
+the P-CSCF's per-source limits each let through, would starve the
+subscriber's own MAR; a forged AUTS, which anyone holding a challenge can
+send (`digest.SyncFailure`), would do the same through resynchronisation. A
+limit on that must not itself become the cheap way to lock the subscriber
+out.
+
+**Control:** the registrar counts the challenges of each IMPI in fixed
+windows shared by every `scscf` instance (DynamoDB atomic counters beside the
+challenges, with TTL), split by the P-CSCF flow token in the REGISTER's Path,
+which only the P-CSCF writes: #198 removes any Path a client sends
+(`networkOnlyHeaders`) and puts its own on top (`prepareRegister`), and the
+token, an HMAC of the connection, cannot be guessed. A REGISTER over the flow
+of a live binding, the registered UE refreshing while it stays on that flow,
+counts in a budget of that flow alone, so a flood from elsewhere cannot use
+it up. Any other REGISTER counts in a small
+per-flow budget and in the IMPI's shared one. Over a budget the answer is
+500 with Retry-After (RFC 3261 §21.5.1), without a MAR: not 503, which an
+upstream proxy would read as the whole S-CSCF being out of service (§21.5.4)
+and the P-CSCF would retry at other I-CSCFs. A challenge allows one
+resynchronisation; an IMPI three per challenge lifetime, the registered UE's
+flow apart. An AUTS that answers a challenge over the flow it was issued to
+counts in the shared budget only, the flow having paid for the challenge. A
+challenge or resynchronisation whose MAR never reached the HSS (no HSS task
+connected) gives its counts and slot back; one the HSS
+answered DIAMETER_TOO_BUSY, or that timed out, keeps them, so that the limit
+does not loosen while the HSS is loaded. An
+instance that saw a count over its limit refuses the rest of the window from
+memory, without a write. Metrics `registrar.challenge_limited` and
+`registrar.resync_limited` carry no identifier; the first is to be alarmed
+on (`docs/scscf-state.md`).
+
+**Risk left:**
+- A subscriber with no live binding, registering for the first time or
+  after its registration expired, has no flow of its own yet: a flood of
+  some ten first registrations a minute from other flows, by anyone who
+  knows its IMPI, holds that registration back until the flood stops. The
+  alarm is the answer to it.
+- So does a registered UE that reconnects: a switch between Wi-Fi and
+  cellular, a NAT rebinding, or a P-CSCF drained on a deploy gives it a new
+  connection and so a new flow token, which matches no live binding. Until
+  the flood stops it cannot refresh, its old flow being gone, and its
+  binding runs out. Before authentication the S-CSCF cannot tell it from
+  the flood (a better signal is #246); hence the alarm, and no
+  P-CSCF deploy or drain while it is raised.
+- Likewise, forged AUTSs from other flows can use up the IMPI's three
+  resynchronisations a lifetime, so a UE with no live binding whose SQN is
+  out of step is refused until the flood stops; a registered UE on its flow
+  resyncs on its own budget.
+- While the HSS is slow (busy answers, timeouts), a UE's MARs keep their
+  counts, so its flow's three a minute can run out sooner.
+- Windows are fixed: twice a budget gets through across an edge.
+- The shared count is observable: a client that probes it near a window's
+  end learns from where it is refused whether others were challenged in that
+  window, that is, roughly whether the subscriber's UE registered then. It
+  learns nothing about the registered UE's own flow, which counts apart.
+- The flow token is trusted as the P-CSCF wrote it, which rests on #198
+  removing the client's Path and putting its own on top. A P-CSCF that let
+  a client choose its Path, or anyone with access to the core listeners,
+  could spend the registered UE's budget.
+
+**Status:** implemented in `internal/scscf/registrar` (#201); wired to a
+listener with `cmd/scscf` (#14 PR F).
+
