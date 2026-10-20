@@ -124,6 +124,12 @@ deployed_template() {
 
 # Turns a load balancer's deletion protection on or off. One already gone
 # (a rolled-back creation deleted it) is skipped.
+# A load balancer's deletion protection now: true or false.
+protection_of() {
+  aws elbv2 describe-load-balancer-attributes --region "$REGION" --load-balancer-arn "$1" \
+    --query "Attributes[?Key=='deletion_protection.enabled'].Value | [0]" --output text 2>/dev/null || echo gone
+}
+
 set_protection() {
   local arn="$1" value="$2" out
   if out="$(aws elbv2 modify-load-balancer-attributes --region "$REGION" --load-balancer-arn "$arn" \
@@ -157,7 +163,7 @@ report_retained() {
 # Deletes a stack and waits; a stack that does not exist is skipped. The
 # retained resources are listed afterwards.
 delete_stack() {
-  local stack="$1" template="$2" status resources="" arn lifted=()
+  local stack="$1" template="$2" status resources="" arn lifted=() reused=""
   if [[ "$DRY_RUN" == false ]]; then
     status="$(stack_status "$stack")"
     case "$status" in
@@ -169,6 +175,11 @@ delete_stack() {
     esac
     resources="$(stack_resources "$stack")"
     [[ "$status" == REVIEW_IN_PROGRESS ]] || template="$(deployed_template "$stack")"
+    # Elastic IPs the stack was given (NlbAllocationIdA/B) are not its own:
+    # they stay as they are, and are listed with what is left behind.
+    reused="$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$stack" \
+      --query "Stacks[0].Parameters[?ParameterKey=='NlbAllocationIdA' || ParameterKey=='NlbAllocationIdB'].ParameterValue" \
+      --output text 2>/dev/null || true)"
   fi
 
   # Load balancers have deletion protection in prod, which would fail the
@@ -180,8 +191,14 @@ delete_stack() {
         --attributes Key=deletion_protection.enabled,Value=false
     fi
   else
+    # Only protection that is on is lifted, and only that is put back.
     while IFS= read -r arn; do
       [[ -n "$arn" ]] || continue
+      case "$(protection_of "$arn")" in
+        true) ;;
+        gone) echo "  $arn no longer exists"; continue ;;
+        *) continue ;;
+      esac
       if set_protection "$arn" false; then
         echo "  deletion protection off: $arn"
         lifted+=("$arn")
@@ -191,12 +208,20 @@ delete_stack() {
 
   run aws cloudformation delete-stack --region "$REGION" --stack-name "$stack"
   if ! run aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$stack"; then
-    # The stack stays, so its load balancers get their protection back:
-    # a later deployment would not restore it (the template did not change).
-    for arn in ${lifted[@]+"${lifted[@]}"}; do
-      if set_protection "$arn" true; then echo "  deletion protection back on: $arn"; fi
-    done
-    fail "deleting $stack failed; see its events: aws cloudformation describe-stack-events --region $REGION --stack-name $stack (docs/runbook.md#teardown-failed)"
+    status="$(stack_status "$stack")"
+    if [[ "$status" == *_IN_PROGRESS ]]; then
+      # The waiter gave up, the deletion did not: putting protection back
+      # now would make it fail.
+      fail "$stack is still $status; the waiter gave up. Wait for it, then run teardown again (docs/runbook.md#teardown-failed)"
+    fi
+    if [[ "$status" == DELETE_FAILED ]]; then
+      # The stack stays, so the load balancers get their protection back as
+      # it was: a later deployment would not restore it.
+      for arn in ${lifted[@]+"${lifted[@]}"}; do
+        if set_protection "$arn" true; then echo "  deletion protection back on: $arn"; fi
+      done
+    fi
+    fail "deleting $stack failed ($status); see its events: aws cloudformation describe-stack-events --region $REGION --stack-name $stack (docs/runbook.md#teardown-failed)"
   fi
   if [[ "$DRY_RUN" == true ]]; then
     echo "  would retain, with their data, those of these that exist:"
@@ -204,6 +229,9 @@ delete_stack() {
     echo "  deleted $stack. Retained, still billed and still holding data:"
   fi
   report_retained "$template" "$resources"
+  if [[ -n "${reused// /}" && "$reused" != None ]]; then
+    echo "  NLB Elastic IPs the stack was given, kept as they were: $reused"
+  fi
 }
 
 echo "stack       $STACK$([[ "$WITH_REGISTRY" == true ]] && echo " and $ECR_STACK")"
@@ -212,7 +240,10 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "dry run     no AWS call is made"
 else
   command -v aws >/dev/null || fail "the aws CLI is not installed"
-  echo "identity    $(aws sts get-caller-identity --region "$REGION" --query Arn --output text)"
+  # An assignment, so a failed call stops the script before anything else.
+  IDENTITY="$(aws sts get-caller-identity --region "$REGION" --query Arn --output text)"
+  [[ -n "$IDENTITY" && "$IDENTITY" != None ]] || fail "cannot tell who the credentials belong to"
+  echo "identity    $IDENTITY"
   if [[ -z "$CONFIRM" ]]; then
     [[ -t 0 ]] || fail "no terminal to confirm on: pass --confirm $STACK"
     read -r -p "This deletes the stack and every service in it. Type the stack name to go on: " CONFIRM

@@ -109,6 +109,8 @@ if tool == "aws":
             fail(f"An error occurred (ValidationError): Stack with id {stack} does not exist")
         if "StackStatus" in query:
             print(state["stacks"][stack])
+        elif "ParameterKey==" in query:
+            print("\t".join(v for v in state.get("parameters", {}).get(stack, []) if v) or "None")
         elif "OutputKey==" in query:
             key = query.split("OutputKey=='")[1].split("'")[0]
             print(state["outputs"].get(stack, {}).get(key, "None"))
@@ -135,6 +137,8 @@ if tool == "aws":
         save()
     elif cmd == ["cloudformation", "wait"] and args[2] == "stack-delete-complete":
         if state.get("delete_fails"):
+            state["stacks"][stack] = state["delete_fails"]
+            save()
             sys.exit(255)
     elif cmd == ["cloudformation", "list-stack-resources"]:
         for line in state["resources"].get(stack, []):
@@ -151,6 +155,10 @@ if tool == "aws":
     elif cmd == ["elbv2", "modify-load-balancer-attributes"]:
         if flag("--load-balancer-arn") in state["gone"]:
             fail("An error occurred (LoadBalancerNotFound): not found")
+    elif cmd == ["elbv2", "describe-load-balancer-attributes"]:
+        if flag("--load-balancer-arn") in state["gone"]:
+            fail("An error occurred (LoadBalancerNotFound): not found")
+        print(state.get("protection", {}).get(flag("--load-balancer-arn"), "true"))
     elif cmd == ["secretsmanager", "get-secret-value"]:
         print(state["secrets"][flag("--secret-id")])
     elif cmd == ["secretsmanager", "put-secret-value"]:
@@ -667,7 +675,7 @@ class Teardown(Stubbed):
 
     def protections(self) -> list[tuple[str, str]]:
         return [(a[a.index("--load-balancer-arn") + 1], a[a.index("--attributes") + 1].rsplit("=", 1)[1])
-                for a in self.aws("elbv2")]
+                for a in self.aws("elbv2", "modify-load-balancer-attributes")]
 
     def test_a_dry_run_calls_nothing_and_lists_what_the_template_retains(self):
         result = self.run_script(TEARDOWN, "--dry-run", "--with-registry")
@@ -718,18 +726,46 @@ class Teardown(Stubbed):
         self.state["gone"] = [self.LB_NLB]
         result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([arn for arn, _ in self.protections()], [self.LB_NLB])
-        self.assertIn("no longer exists", result.stdout)
+        self.assertEqual(self.protections(), [])
+        self.assertIn(f"{self.LB_NLB} no longer exists", result.stdout)
         self.assertEqual(self.deletes(), ["rcs-platform"])
         self.assertNotIn("rcs-platform-subscribers", result.stdout)
 
     def test_a_failed_deletion_puts_the_protection_back(self):
-        self.state["delete_fails"] = True
+        self.state["delete_fails"] = "DELETE_FAILED"
         result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.protections(), [(self.LB_ALB, "false"), (self.LB_NLB, "false"),
                                               (self.LB_ALB, "true"), (self.LB_NLB, "true")])
         self.assertIn("docs/runbook.md#teardown-failed", result.stderr)
+
+    def test_protection_that_was_off_stays_off(self):
+        # A dev stack: its load balancers were never protected.
+        self.state["protection"] = {self.LB_ALB: "false", self.LB_NLB: "false"}
+        self.state["delete_fails"] = "DELETE_FAILED"
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.protections(), [])
+
+    def test_a_waiter_that_gives_up_leaves_protection_off(self):
+        self.state["delete_fails"] = "DELETE_IN_PROGRESS"
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("still DELETE_IN_PROGRESS; the waiter gave up", result.stderr)
+        self.assertEqual([v for _, v in self.protections()], ["false", "false"])
+
+    def test_a_failed_identity_call_stops_teardown(self):
+        self.state["sts_fails"] = True
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.deletes(), [])
+        self.assertEqual([a[:2] for a in self.calls("aws")], [["sts", "get-caller-identity"]])
+
+    def test_reused_addresses_are_listed_as_kept(self):
+        self.state["parameters"] = {"rcs-platform": ["eipalloc-0a1", ""]}
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NLB Elastic IPs the stack was given, kept as they were: eipalloc-0a1", result.stdout)
 
     def test_an_empty_review_stack_is_deleted(self):
         self.state["stacks"]["rcs-platform"] = "REVIEW_IN_PROGRESS"
