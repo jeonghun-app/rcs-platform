@@ -5,7 +5,10 @@
 // 24.229 §5.2.3, §5.4.2.1).
 //
 // A Dialog is plain data, so a service can keep it in memory or store it
-// and carry on from another instance. It sends nothing itself: Request and
+// and carry on from another instance. It is not a storage format, though:
+// its sip types write themselves redacted, for logs, so a JSON round trip
+// fails. A service that stores one defines a record of its own, with each
+// field's String and the matching sip parser, as scscf does. It sends nothing itself: Request and
 // the subscription helpers build requests the caller sends in a client
 // transaction (transaction.Layer.Request) to NextHop, and Accept checks a
 // request the caller received through its UAS before it answers. Route
@@ -85,11 +88,17 @@ func UAC(req *sip.Request, res *sip.Response) (*Dialog, error) {
 // set is the NOTIFY's, not the 2xx's (RFC 6665 §4.4.1). The subscriber takes
 // it as a UAS takes a request: the route set is the NOTIFY's Record-Route in
 // order and the remote target its Contact. The NOTIFY's CSeq is taken as
-// the remote one.
+// the remote one. A NOTIFY of another subscription, with another Call-ID,
+// compared exactly, or a To tag other than the SUBSCRIBE's From tag,
+// compared without case, is ErrNotInDialog.
 func FromNotify(subscribe, notify *sip.Request) (*Dialog, error) {
 	d, err := sent(subscribe)
 	if err != nil {
 		return nil, err
+	}
+	to, err := notify.Header.To()
+	if err != nil || notify.Header.Get("Call-ID") != d.CallID || !strings.EqualFold(to.Tag(), d.LocalTag()) {
+		return nil, ErrNotInDialog
 	}
 	if d.Remote, err = notify.Header.From(); err != nil || d.Remote.Tag() == "" {
 		return nil, fmt.Errorf("%w: From without a tag", ErrNoDialog)
@@ -199,8 +208,11 @@ func targetRefresh(method string) bool {
 
 // Accept checks that req, received from the other side, belongs to this
 // dialog and is in order (RFC 3261 §12.2.2), and takes its CSeq and, for a
-// target refresh request, its Contact. On an error d is unchanged:
-// ErrNotInDialog is answered 481, ErrOutOfOrder 500 and ErrNoDialog 400.
+// target refresh request, its Contact. Only a CSeq lower than the last is
+// out of order: one equal to it is the ACK of an INVITE, and catching a
+// retransmission is the transaction layer's job. On an error d is
+// unchanged: ErrNotInDialog is answered 481, ErrOutOfOrder 500 and
+// ErrNoDialog 400.
 func (d *Dialog) Accept(req *sip.Request) error {
 	from, err1 := req.Header.From()
 	to, err2 := req.Header.To()
@@ -214,7 +226,7 @@ func (d *Dialog) Accept(req *sip.Request) error {
 	if err != nil {
 		return fmt.Errorf("%w: malformed CSeq", ErrNoDialog)
 	}
-	if d.HasRemoteSeq && cseq.Seq <= d.RemoteSeq {
+	if d.HasRemoteSeq && cseq.Seq < d.RemoteSeq {
 		return ErrOutOfOrder
 	}
 	target := d.RemoteTarget
@@ -227,6 +239,17 @@ func (d *Dialog) Accept(req *sip.Request) error {
 	return nil
 }
 
+// requestURI is u as a Request-URI: without URI headers and the method
+// parameter, which RFC 3261 §19.1.1 does not allow there.
+func requestURI(u sip.URI) sip.URI {
+	u.Headers = nil
+	if u.Params.Has("method") {
+		u.Params = slices.Clone(u.Params)
+		u.Params.Del("method")
+	}
+	return u
+}
+
 // NextHop is where this side's requests in the dialog go first: the first
 // route, or the remote target when there is none (RFC 3261 §12.2.1.1).
 func (d *Dialog) NextHop() sip.URI {
@@ -236,28 +259,41 @@ func (d *Dialog) NextHop() sip.URI {
 	return d.RemoteTarget
 }
 
+// maxSeq is the largest CSeq: RFC 3261 §8.1.1.5 keeps it below 2^31, as
+// the platform's parser does.
+const maxSeq = 1<<31 - 1
+
 // Request builds this side's next request in the dialog (RFC 3261
-// §12.2.1.1), with the next CSeq, which d keeps. Its top Via names the
-// transport placeholder host "invalid" with a new branch; the transport
-// writes its own sent-by when it sends it (RFC 3261 §18.1.1). A target
-// refresh request carries LocalTarget as its Contact.
+// §12.2.1.1), with the next CSeq, which d keeps; an ACK takes the CSeq of
+// the INVITE it acknowledges, this side's last request, and keeps it (RFC
+// 3261 §13.2.2.4). Its top Via names the transport placeholder host
+// "invalid" with a new branch; the transport writes its own sent-by when
+// it sends it (RFC 3261 §18.1.1). A target refresh request carries
+// LocalTarget as its Contact. The Request-URI is the remote target without
+// the parts a Request-URI may not have, URI headers and method (RFC 3261
+// §19.1.1).
 func (d *Dialog) Request(method string, ids sip.IDGenerator) (*sip.Request, error) {
-	if d.LocalSeq == 1<<32-1 {
+	seq := d.LocalSeq + 1
+	switch {
+	case method == "ACK" && d.LocalSeq == 0:
+		return nil, errors.New("dialog: no INVITE to acknowledge")
+	case method == "ACK":
+		seq = d.LocalSeq
+	case d.LocalSeq >= maxSeq:
 		return nil, errors.New("dialog: CSeq exhausted")
 	}
 	branch, err := ids.Branch()
 	if err != nil {
 		return nil, err
 	}
-	req := &sip.Request{Method: method, URI: d.RemoteTarget}
+	req := &sip.Request{Method: method, URI: requestURI(d.RemoteTarget)}
 	routes := d.RouteSet
 	// A strict router in the first route takes the Request-URI, and the
 	// remote target goes last (§12.2.1.1).
 	if len(routes) > 0 && !routes[0].URI.Params.Has("lr") {
-		req.URI = routes[0].URI
+		req.URI = requestURI(routes[0].URI)
 		routes = append(slices.Clone(routes[1:]), sip.Address{URI: d.RemoteTarget})
 	}
-	seq := d.LocalSeq + 1
 	fields := [][2]string{
 		{"Via", "SIP/2.0/TCP invalid;branch=" + branch},
 		{"Max-Forwards", "70"},
