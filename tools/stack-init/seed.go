@@ -80,13 +80,19 @@ func readSeedConfig(e environment) (seedConfig, error) {
 		}
 	}
 	a, b := c.subscribers[0], c.subscribers[1]
-	switch {
-	case a.imsi == b.imsi || a.msisdn == b.msisdn:
+	if a.imsi == b.imsi || a.msisdn == b.msisdn {
 		errs = append(errs, &configError{msg: "the two test subscribers need their own IMSI and MSISDN"})
-	case a.k != "" && (a.k == b.k || a.opc == b.opc):
-		// One secret shared by two subscribers would hide a client that
-		// answers with the other's (#236).
-		errs = append(errs, &configError{msg: "the two test subscribers need their own K and OPc"})
+	}
+	// No key value twice anywhere, a subscriber's K and OPc included: one
+	// secret shared by two subscribers would hide a client that answers
+	// with the other's (#236).
+	seen := map[string]bool{}
+	for _, v := range []string{a.k, a.opc, b.k, b.opc} {
+		if v != "" && seen[v] {
+			errs = append(errs, &configError{msg: "the test subscribers' four AKA keys must all differ"})
+			break
+		}
+		seen[v] = true
 	}
 	for _, r := range []struct {
 		name string

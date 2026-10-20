@@ -177,7 +177,7 @@ func TestSeedProvisionsBothSubscribersInBothServices(t *testing.T) {
 			t.Fatalf("acs got %v for %s", acs, want.imsi)
 		}
 	}
-	for _, secret := range []string{hssToken, acsToken, clientK, clientOPc, peerK, peerOPc, "001010000000001", "+15550100002"} {
+	for _, secret := range []string{hssToken, acsToken, clientK, clientOPc, peerK, peerOPc, "001010000000001", "001010000000002", "+15550100001", "+15550100002"} {
 		if strings.Contains(out.String(), secret) {
 			t.Fatalf("the output carries %q: %s", secret, out.String())
 		}
@@ -193,10 +193,14 @@ func TestSeedNeedsEachSubscribersOwnKeys(t *testing.T) {
 		keys []string
 		want string
 	}{
-		"peer's K missing": {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "RCS_SIM_PEER_AKA_K is required"},
-		"not hex":          {[]string{"RCS_SIM_AKA_K", "zz" + clientK[2:], "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "RCS_SIM_AKA_K is not 32 hexadecimal digits"},
-		"shared K":         {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", strings.ToUpper(clientK), "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the two test subscribers need their own K and OPc"},
-		"shared OPc":       {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", clientOPc}, "the two test subscribers need their own K and OPc"},
+		"peer's K missing":            {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "RCS_SIM_PEER_AKA_K is required"},
+		"not hex":                     {[]string{"RCS_SIM_AKA_K", "zz" + clientK[2:], "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "RCS_SIM_AKA_K is not 32 hexadecimal digits"},
+		"shared K":                    {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", strings.ToUpper(clientK), "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the test subscribers' four AKA keys must all differ"},
+		"shared OPc":                  {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", clientOPc}, "the test subscribers' four AKA keys must all differ"},
+		"a K that is another's OPc":   {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", clientOPc, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the test subscribers' four AKA keys must all differ"},
+		"a subscriber's K is its OPc": {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientK, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the test subscribers' four AKA keys must all differ"},
+		"same IMSI":                   {append([]string{"STACK_PEER_IMSI", "001010000000001"}, keyEnv...), "the two test subscribers need their own IMSI and MSISDN"},
+		"same MSISDN":                 {append([]string{"STACK_PEER_MSISDN", "+15550100001"}, keyEnv...), "the two test subscribers need their own IMSI and MSISDN"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := readSeedConfig(environment{lookup: env(append(append([]string{}, base...), tc.keys...)...)})
@@ -209,6 +213,20 @@ func TestSeedNeedsEachSubscribersOwnKeys(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSeedSetsTheKeysOfASubscriptionThatExists(t *testing.T) {
+	// A re-run, or keys changed in deploy/compose.env: the subscription
+	// exists (409), and its keys are set all the same.
+	f := newFakes(t, []int{http.StatusConflict}, http.StatusOK)
+	if err := seed(context.Background(), f.config(t), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	for impi, want := range map[string][2]string{"001010000000001@" + domain: {clientK, clientOPc}, "001010000000002@" + domain: {peerK, peerOPc}} {
+		if aka := f.akaBodies["/v1/subscriptions/"+impi+"/aka"]; aka["k"] != want[0] || aka["opc"] != want[1] {
+			t.Fatalf("AKA for %s: %v", impi, aka)
+		}
 	}
 }
 
