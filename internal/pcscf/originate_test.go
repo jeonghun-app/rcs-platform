@@ -84,7 +84,7 @@ func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing
 	}
 	// The core-facing value carries the icid for the dialog's later
 	// requests (§5.2.6.3.5 7)).
-	if want := []string{"<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + icidOf(t, first) + ">", "<sip:" + publicHost + ":5060;transport=tcp;lr>"}; !slices.Equal(rr, want) {
+	if want := []string{"<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + icidOf(t, first) + ";dlg=" + p.dialogMAC("FLOW-A", "orig-1", icidOf(t, first)) + ">", "<sip:" + publicHost + ":5060;transport=tcp;lr>"}; !slices.Equal(rr, want) {
 		t.Errorf("Record-Route %q, want %q", rr, want)
 	}
 	if got := req.Header.Values("Route"); !slices.Equal(got, []string{scscfRoute, "<sip:term@10.0.4.5;lr>"}) {
@@ -315,7 +315,7 @@ func TestTheClientFacingRecordRouteNamesTheClientTransport(t *testing.T) {
 	for transport, want := range map[string]string{ClientTLS: "tls", ClientNLBTLS: "tls", ClientTCP: "tcp"} {
 		p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
 		p.cfg.ClientTransport, p.cfg.PublicPort = transport, 5061
-		rr := p.recordRoute("FLOW-A", false, "0123456789abcdef0123456789abcdef")
+		rr := p.recordRoute("FLOW-A", false, "0123456789abcdef0123456789abcdef", "call-1")
 		if got := rr[1].String(); got != "<sip:"+publicHost+":5061;transport="+want+";lr>" {
 			t.Errorf("%s: client-facing Record-Route %q", transport, got)
 		}
@@ -330,14 +330,26 @@ const (
 )
 
 // inDialogFrom is a BYE over FLOW-A whose consumed Route values were routed,
-// with Request-URI uri and extra fields.
+// with Request-URI uri and extra fields. A routed value with a flow token
+// and no dlg gets the MAC newTestPcscf's pcscf writes for it in the BYE's
+// dialog, orig-1.
 func inDialogFrom(t *testing.T, routed []string, uri string, extra ...string) *proxy.Request {
 	r := clientRequest(t, inDialogText("BYE", extra...), "FLOW-A")
 	r.Message.URI = mustURI(t, uri)
-	for _, u := range routed {
-		r.Routed = append(r.Routed, sip.Address{URI: mustURI(t, u)})
+	for _, s := range routed {
+		u := mustURI(t, s)
+		if u.User != "" && !u.Params.Has(dialogParam) {
+			icid, _ := routeICID(u)
+			u.Params.Set(dialogParam, testPcscfMAC(transport.FlowID(u.User), "orig-1", icid))
+		}
+		r.Routed = append(r.Routed, sip.Address{URI: u})
 	}
 	return r
+}
+
+// testPcscfMAC is dialogMAC under newTestPcscf's key.
+func testPcscfMAC(flow transport.FlowID, callID, icid string) string {
+	return (&pcscf{dialogKey: []byte("test dialog key")}).dialogMAC(flow, callID, icid)
 }
 
 // A request inside a dialog is forwarded only along a route set this pcscf
@@ -401,13 +413,60 @@ func TestAnInDialogRequestMustFollowThisPcscfsRouteForItsFlow(t *testing.T) {
 	}
 }
 
-// A dialog whose route lost its icid gets a new one rather than none.
+// A dialog whose route was written without an icid gets a new one rather
+// than none; a client that changes the icid of its copy of the route,
+// which the MAC covers, gets 403 (review of #221).
 func TestAnInDialogRequestWithoutTheDialogsICIDGetsANewOne(t *testing.T) {
 	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
-	for _, core := range []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr", "sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=1"} {
+	base := "sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr"
+	r := inDialogFrom(t, []string{clientEnt, base}, "sip:bob@198.51.100.20", "Route: "+scscfRoute)
+	if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); !icidValue.MatchString(got) {
+		t.Errorf("P-Charging-Vector %q, want a new icid", got)
+	}
+	signed := ";dlg=" + testPcscfMAC("FLOW-A", "orig-1", dialogICID)
+	if d := p.Route(context.Background(), inDialogFrom(t, []string{clientEnt, coreEntry + signed}, "sip:bob@198.51.100.20", "Route: "+scscfRoute)); len(d.Targets) != 1 {
+		t.Fatalf("the route as written: %+v", d)
+	}
+	for _, core := range []string{
+		base + signed,
+		base + ";icid" + signed,
+		base + ";icid=a%01b" + signed,
+		base + ";icid=" + strings.Repeat("a", maxICID+1) + signed,
+		base + ";icid=fedcba9876543210fedcba9876543210" + signed,
+		base + ";icid=" + strings.ToUpper(dialogICID) + signed,
+		// One the route was written without, made up.
+		base + ";icid;dlg=" + testPcscfMAC("FLOW-A", "orig-1", ""),
+		base + ";icid=%01;dlg=" + testPcscfMAC("FLOW-A", "orig-1", ""),
+	} {
 		r := inDialogFrom(t, []string{clientEnt, core}, "sip:bob@198.51.100.20", "Route: "+scscfRoute)
-		if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); icidOf(t, got) == "1" {
-			t.Errorf("%s: P-Charging-Vector %q", core, got)
+		if d := p.Route(context.Background(), r); d.Status != 403 {
+			t.Errorf("%s: %+v, want 403", core, d)
+		}
+	}
+}
+
+// An icid from the core can be any value, a quoted string with ";" or a
+// quote in it too: the core-facing Record-Route value carries it escaped,
+// and the dialog's requests get it back as it was (review of #221).
+func TestADialogKeepsTheCoresICIDWhateverItHolds(t *testing.T) {
+	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
+	for _, icid := range []string{"plain-token.1", `a b;c=d\"e`, "%41é"} {
+		rr := p.recordRoute("FLOW-A", false, icid, "orig-1")
+		core := rr[0]
+		back, err := sip.ParseAddress(core.String())
+		if err != nil {
+			t.Fatalf("%q: the Record-Route %s does not parse: %v", icid, core, err)
+		}
+		got, ok := routeICID(back.URI)
+		if !ok || got != icid {
+			t.Errorf("%q: read back %q, %v from %s", icid, got, ok, core)
+		}
+		r := inDialogFrom(t, []string{clientEnt, back.URI.String()}, "sip:bob@198.51.100.20", "Route: "+scscfRoute)
+		pcv := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector")
+		var h sip.Header
+		_ = h.Set("P-Charging-Vector", pcv)
+		if cv, err := h.PChargingVector(); err != nil || cv.ICID() != icid {
+			t.Errorf("%q: P-Charging-Vector %q (%v)", icid, pcv, err)
 		}
 	}
 }

@@ -189,8 +189,8 @@ func (p *peer) closed() bool {
 
 // Until it registers, a client's request outside a dialog is discarded and
 // counted (TS 24.229 §5.2.6.3.2A), and one inside a dialog pcscf did not
-// record is refused with 403; the core gets 430 until terminating routing
-// lands.
+// record is refused with 403; a request from the core that names no client
+// flow gets 430.
 func TestUntilRegistrationClientsGet403AndTheCore430(t *testing.T) {
 	s := start(t, testConfig(), deps{})
 	c := dial(t, s.client, nil)
@@ -526,10 +526,19 @@ func TestAQuietClientConnectionIsClosed(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClientIdleTimeout = time.Second
 	s := start(t, cfg, deps{})
+	began := time.Now()
 	c := dial(t, s.client, nil)
-	c.request()
+	// The request makes the connection a flow. On a loaded host the second
+	// may pass before it is answered, so the answer is not required; that
+	// the close waited for the idle timeout is, which load cannot break.
+	if res, err := c.try(); err == nil && res.StatusCode != 403 {
+		t.Errorf("OPTIONS answered %d", res.StatusCode)
+	}
 	if !c.closed() {
 		t.Fatal("a quiet client connection was kept open")
+	}
+	if waited := time.Since(began); waited < cfg.ClientIdleTimeout {
+		t.Errorf("closed after %v, before the idle timeout", waited)
 	}
 }
 

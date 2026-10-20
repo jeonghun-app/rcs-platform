@@ -294,7 +294,10 @@ func (p *pcscf) prepareRegister(req *sip.Request, reg *registration, icid string
 // client: the request's charging identifier, and this network as the type 1
 // orig-ioi (TS 24.229 §5.2.2.1 3), §5.2.6.3.3 7); no term-ioi).
 func (p *pcscf) chargingVector(icid string) string {
-	return "icid-value=" + icid + ";orig-ioi=" + p.cfg.HomeDomain
+	var cv sip.ChargingVector
+	cv.Params.Set("icid-value", icid)
+	cv.Params.Set("orig-ioi", p.cfg.HomeDomain)
+	return cv.String()
 }
 
 // icid is a new IMS charging identifier (RFC 7315 §4.6): 128 random bits.
