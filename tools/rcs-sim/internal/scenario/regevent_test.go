@@ -55,10 +55,7 @@ func TestARegEventPassesWhatTheRFCsAllow(t *testing.T) {
 				return
 			}
 			_ = req.Header.Set("Subscription-State", "active;expires=600")
-			req.Body = []byte(strings.Replace(string(req.Body), `</registration>`, `</registration>`+
-				`<registration aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org" id="r9" state="active">`+
-				`<contact id="c9" state="active" event="registered" expires="600"><uri>sip:192.0.2.9:5060;transport=tcp</uri></contact>`+
-				`</registration>`, 1))
+			req.Body = []byte(staleContact(string(req.Body)))
 		},
 		// TS 24.229 §5.4.1.5: the network's deregistration ends the
 		// subscription with "terminated" and no reason, and the contact
@@ -70,6 +67,36 @@ func TestARegEventPassesWhatTheRFCsAllow(t *testing.T) {
 		},
 		"deregistered as unregistered": func(req *sip.Request) {
 			req.Body = []byte(strings.Replace(string(req.Body), `event="deactivated"`, `event="unregistered"`, 1))
+		},
+		// The client's contact URI bound twice (RFC 5626 §6): the other
+		// binding, an earlier run's with another +sip.instance and still
+		// active, comes first; the client's is told by its instance.
+		"the contact URI bound twice": func(req *sip.Request) {
+			if req.Header.Get("CSeq") != "3 NOTIFY" {
+				return
+			}
+			_ = req.Header.Set("Subscription-State", "active;expires=600")
+			body := strings.Replace(string(req.Body), `id="r1" state="terminated"`, `id="r1" state="active"`, 1)
+			uri := regexp.MustCompile(`<uri>[^<]*</uri>`).FindString(body)
+			body = strings.Replace(body, `<contact id="c1"`,
+				`<contact id="c0" state="active" event="registered" expires="600">`+uri+
+					`<unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact><contact id="c1"`, 1)
+			req.Body = []byte(strings.Replace(body, `</uri></contact></registration>`,
+				`</uri><unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000001&gt;"</unknown-param></contact></registration>`, 1))
+		},
+		// Code review on #253: the same, but the client's contact carries no
+		// instance, so it is the one without; the other device's, ahead of
+		// it and still active, is never taken for it.
+		"another instance ahead of the client's without one": func(req *sip.Request) {
+			if req.Header.Get("CSeq") != "3 NOTIFY" {
+				return
+			}
+			_ = req.Header.Set("Subscription-State", "active;expires=600")
+			body := strings.Replace(string(req.Body), `id="r1" state="terminated"`, `id="r1" state="active"`, 1)
+			uri := regexp.MustCompile(`<uri>[^<]*</uri>`).FindString(body)
+			req.Body = []byte(strings.Replace(body, `<contact id="c1"`,
+				`<contact id="c0" state="active" event="registered" expires="600">`+uri+
+					`<unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact><contact id="c1"`, 1))
 		},
 		// A terminated subscription without a reason (RFC 6665 §4.1.3).
 		"unregister with timeout": func(req *sip.Request) {
@@ -136,6 +163,13 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 		step    string
 		err     string
 	}{
+		// Code review on #253: the only contact at the client's URI carries
+		// another device's +sip.instance, so it is not the client's (RFC
+		// 5626 §4.1).
+		"only another instance at the URI": {"1 NOTIFY", func(req *sip.Request) {
+			req.Body = []byte(strings.Replace(string(req.Body), `</uri></contact>`,
+				`</uri><unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact>`, 1))
+		}, "subscribe", "the reginfo does not list the client's contact"},
 		"contact not active": {"1 NOTIFY", func(req *sip.Request) {
 			req.Body = []byte(strings.Replace(string(req.Body), `<contact id="c1" state="active"`, `<contact id="c1" state="terminated"`, 1))
 		}, "subscribe", "the client's contact is not active"},
@@ -157,7 +191,7 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 		}, "subscribe", "the first reginfo version is not 0"},
 		"version beyond 32 bits": {"1 NOTIFY", func(req *sip.Request) {
 			req.Body = []byte(strings.Replace(string(req.Body), `version="0"`, `version="4294967296"`, 1))
-		}, "subscribe", "the reginfo version is not 32 bits"},
+		}, "subscribe", "reginfo: malformed document: version is not a 32-bit unsigned integer"},
 		// RFC 3680 §4.7.1: a registration with a contact bound is active.
 		"registration terminated, contact active": {"1 NOTIFY", func(req *sip.Request) {
 			req.Body = []byte(strings.Replace(string(req.Body), `id="r1" state="active"`, `id="r1" state="terminated"`, 1))
@@ -174,7 +208,7 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 		}, "re-register", "the reginfo version did not rise by one"},
 		"body not reginfo": {"2 NOTIFY", func(req *sip.Request) {
 			req.Body = []byte("<reginfo")
-		}, "re-register", "sipua: the reginfo body is not RFC 3680 XML"},
+		}, "re-register", "reginfo: malformed document: XML syntax error on line 1"},
 		"no NOTIFY (another dialog's Call-ID)": {"2 NOTIFY", func(req *sip.Request) {
 			_ = req.Header.Set("Call-ID", "qa-another-dialog")
 		}, "re-register", "no NOTIFY came"},
@@ -194,10 +228,7 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 			_ = req.Header.Set("Subscription-State", "terminated;reason=probation;retry-after=10")
 		}, "unregister", "the subscription ended for a reason it should not"},
 		"subscription ended with a registration left": {"3 NOTIFY", func(req *sip.Request) {
-			req.Body = []byte(strings.Replace(string(req.Body), `</registration>`, `</registration>`+
-				`<registration aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org" id="r9" state="active">`+
-				`<contact id="c9" state="active" event="registered" expires="600"><uri>sip:192.0.2.9:5060;transport=tcp</uri></contact>`+
-				`</registration>`, 1))
+			req.Body = []byte(staleContact(string(req.Body)))
 		}, "unregister", "the subscription ended while a registration is still active"},
 		"deregistered as expired": {"", func(req *sip.Request) {
 			req.Body = []byte(strings.Replace(string(req.Body), `event="deactivated"`, `event="expired"`, 1))
@@ -281,22 +312,32 @@ func TestRegEventChecksQARound2Pins(t *testing.T) {
 func TestRegEventContactUnderANonIMPUAorIsNotTheClients(t *testing.T) {
 	// QA on #216: the client's contact listed only under an aor that is
 	// not a public identity is not the client's registration.
-	for name, aor := range map[string]string{
-		"empty aor":     `aor=""`,
-		"aor with port": `aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org:5060"`,
+	for name, tc := range map[string]struct{ aor, err string }{
+		// internal/sip/reginfo refuses a document whose aor is no URI.
+		"empty aor":     {`aor=""`, "reginfo: malformed document: aor is not a SIP or tel URI"},
+		"aor with port": {`aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org:5060"`, "the reginfo does not list the client's contact"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg, core := sipStack(t)
 			core.Rewrite = func(req *sip.Request) {
 				if req.Method == "NOTIFY" && req.Header.Get("CSeq") == "1 NOTIFY" {
-					req.Body = []byte(strings.Replace(string(req.Body), `aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org"`, aor, 1))
+					req.Body = []byte(strings.Replace(string(req.Body), `aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org"`, tc.aor, 1))
 				}
 			}
 			ok, results := runAll(t, cfg, "reg-event")
 			last := results[len(results)-1]
-			if ok || last.Step != "subscribe" || last.Error != "the reginfo does not list the client's contact" {
+			if ok || last.Step != "subscribe" || last.Error != tc.err {
 				t.Fatalf("results %+v", results)
 			}
 		})
 	}
+}
+
+// staleContact adds to a reginfo body's registration a contact an earlier
+// run left, still active, so the registration is active too (RFC 3680
+// §4.7.1): one registration per AOR, as internal/sip/reginfo requires.
+func staleContact(body string) string {
+	body = strings.Replace(body, `id="r1" state="terminated"`, `id="r1" state="active"`, 1)
+	return strings.Replace(body, `</registration>`,
+		`<contact id="c9" state="active" event="registered" expires="600"><uri>sip:192.0.2.9:5060;transport=tcp</uri></contact></registration>`, 1)
 }

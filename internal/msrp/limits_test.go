@@ -791,7 +791,11 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	chunks := bindOnlyPeer(t, theirs)
 	open := func(i int) *Session {
-		s := newTestSession(t, fmt.Sprintf("msrp://relay.internal:2855/st%05d;tcp", i), fmt.Sprintf("msrp://as.example.org:9000/st%05d;tcp", i), newRecorder())
+		// No handler: when the connection closes at cleanup, each chunk
+		// still in flight is reported, thousands of them. A recorder,
+		// which nobody reads after the test, would hold a goroutine for
+		// each for the rest of the process (#251).
+		s := newTestSession(t, fmt.Sprintf("msrp://relay.internal:2855/st%05d;tcp", i), fmt.Sprintf("msrp://as.example.org:9000/st%05d;tcp", i), nil)
 		if err := c.Open(context.Background(), s); err != nil {
 			t.Fatal(err)
 		}
