@@ -208,6 +208,23 @@ class PlatformTemplate(TemplateCase):
             self.assertIn("fixed-response", actions)
             self.assertNotIn("AcsTargetGroup", actions)
 
+    def test_rcs_as_reaches_rcs_as_on_sip(self):
+        # The group owner's forwarding (#121) is in the matrix, both ways.
+        self.assertIn("RcsAsSecurityGroup", check_infra.EXPECTED_INGRESS[("RcsAsSecurityGroup", 5060)])
+        t = self.changed(RcsAsToRcsAs=None)
+        self.assertProblem(t, "RcsAsSecurityGroup port 5060: RcsAsSecurityGroup is missing")
+
+    def test_the_nlb_reaches_pcscf_on_5061_only(self):
+        t = self.changed(Old=ingress("PcscfSecurityGroup", 5060, SourceSecurityGroupId={"Ref": "NlbSecurityGroup"}))
+        self.assertProblem(t, "PcscfSecurityGroup port 5060: NlbSecurityGroup is not in the ADR 0007 matrix")
+
+    def test_the_nlb_addresses_are_fixed_and_retained(self):
+        mappings = self.template["Resources"]["Nlb"]["Properties"]["SubnetMappings"]
+        self.assertEqual(len(mappings), 2)
+        for m in mappings:
+            eip = m["AllocationId"]["Fn::GetAtt"][0]
+            self.assertEqual(self.template["Resources"][eip].get("DeletionPolicy"), "Retain")
+
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)
         self.assertProblem(t, "Alb: internet-facing ALB without an AWS WAF web ACL")

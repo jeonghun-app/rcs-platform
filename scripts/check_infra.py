@@ -41,11 +41,11 @@ from dataclasses import dataclass
 # (destination group, port) -> source groups. ADR 0007 §2; ports as listed at
 # the security groups in infra/platform.yaml.
 EXPECTED_INGRESS: dict[tuple[str, int], set[str]] = {
-    ("PcscfSecurityGroup", 5060): {"NlbSecurityGroup"},
+    ("PcscfSecurityGroup", 5061): {"NlbSecurityGroup"},
     ("PcscfSecurityGroup", 5070): {"ScscfSecurityGroup"},
     ("IcscfSecurityGroup", 5060): {"PcscfSecurityGroup", "RcsAsSecurityGroup", "ScscfSecurityGroup"},
     ("ScscfSecurityGroup", 5060): {"PcscfSecurityGroup", "RcsAsSecurityGroup", "IcscfSecurityGroup"},
-    ("RcsAsSecurityGroup", 5060): {"ScscfSecurityGroup", "IcscfSecurityGroup"},
+    ("RcsAsSecurityGroup", 5060): {"ScscfSecurityGroup", "IcscfSecurityGroup", "RcsAsSecurityGroup"},
     ("RcsAsSecurityGroup", 2855): {"MsrpRelaySecurityGroup"},
     ("HssSecurityGroup", 3868): {"IcscfSecurityGroup", "ScscfSecurityGroup"},
     ("HssSecurityGroup", 8081): {"FtServerSecurityGroup", "AcsSecurityGroup", "OperatorSecurityGroup"},

@@ -709,7 +709,7 @@ Resources:
   # service blocks only attach them.
   #
   # Ports (the service blocks bind these):
-  #   pcscf      5060 client SIP (NLB), 5070 core SIP
+  #   pcscf      5061 client SIP (NLB, TLS ended there), 5070 core SIP
   #   icscf      5060 SIP          scscf    5060 SIP
   #   rcs-as     5060 SIP, 2855 MSRP
   #   hss        3868 Diameter Cx, 8081 provisioning API
@@ -840,12 +840,15 @@ Resources:
   # Each matrix entry is an ingress rule on the destination and the matching
   # egress rule on the source.
 
+  # pcscf's client listener is 5061 (PCSCF_CLIENT_ADDR, nlb-tls mode): the
+  # NLB ends TLS and forwards there, from its TLS listener and, in dev, its
+  # plain 5060 one. Only the NLB reaches it.
   NlbToPcscfSip:
     Type: AWS::EC2::SecurityGroupIngress
-    Properties: { GroupId: !Ref PcscfSecurityGroup, SourceSecurityGroupId: !Ref NlbSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'client SIP and health checks' }
+    Properties: { GroupId: !Ref PcscfSecurityGroup, SourceSecurityGroupId: !Ref NlbSecurityGroup, IpProtocol: tcp, FromPort: 5061, ToPort: 5061, Description: 'client SIP and health checks' }
   NlbToPcscfSipOut:
     Type: AWS::EC2::SecurityGroupEgress
-    Properties: { GroupId: !Ref NlbSecurityGroup, DestinationSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'client SIP and health checks' }
+    Properties: { GroupId: !Ref NlbSecurityGroup, DestinationSecurityGroupId: !Ref PcscfSecurityGroup, IpProtocol: tcp, FromPort: 5061, ToPort: 5061, Description: 'client SIP and health checks' }
 
   NlbToRelayMsrp:
     Type: AWS::EC2::SecurityGroupIngress
@@ -977,6 +980,15 @@ Resources:
     Type: AWS::EC2::SecurityGroupEgress
     Properties: { GroupId: !Ref IcscfSecurityGroup, DestinationSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP to PSIs' }
 
+  # rcs-as tasks forward a group chat's requests to the task that owns the
+  # group (#121): rcs-as reaches rcs-as on its internal SIP port.
+  RcsAsToRcsAs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, SourceSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP to the group owner' }
+  RcsAsToRcsAsOut:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties: { GroupId: !Ref RcsAsSecurityGroup, DestinationSecurityGroupId: !Ref RcsAsSecurityGroup, IpProtocol: tcp, FromPort: 5060, ToPort: 5060, Description: 'SIP to the group owner' }
+
   # threat model T3: only the relay reaches rcs-as's MSRP port.
   RelayToRcsAsMsrp:
     Type: AWS::EC2::SecurityGroupIngress
@@ -1006,12 +1018,37 @@ Resources:
     Properties:
       Type: network
       Scheme: internet-facing
-      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      # Fixed addresses: clients put the NLB's address in their first Route
+      # (TS 24.229, NOTE 15), so pcscf must know it (PCSCF_PUBLIC_ADDRS), and
+      # it must not change under clients that cached it.
+      SubnetMappings:
+        - { SubnetId: !Ref PublicSubnetA, AllocationId: !GetAtt NlbAddressA.AllocationId }
+        - { SubnetId: !Ref PublicSubnetB, AllocationId: !GetAtt NlbAddressB.AllocationId }
       SecurityGroups: [!Ref NlbSecurityGroup]
       LoadBalancerAttributes:
         - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
         - { Key: deletion_protection.enabled, Value: !If [IsProduction, 'true', 'false'] }
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb' }]
+
+  # The NLB's public addresses, one per public subnet. Retained: a
+  # replacement of the NLB or of the stack keeps them, so clients' cached
+  # addresses still work after a redeployment.
+  NlbAddressA:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb-a' }]
+  NlbAddressB:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb-b' }]
 
   PcscfSipTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -1020,7 +1057,7 @@ Resources:
       VpcId: !Ref Vpc
       TargetType: ip
       Protocol: TCP
-      Port: 5060
+      Port: 5061
       HealthCheckProtocol: TCP
       HealthCheckPort: traffic-port
       HealthCheckIntervalSeconds: 10
@@ -3714,6 +3751,9 @@ Outputs:
   NamespaceId:
     Value: !Ref Namespace
     Export: { Name: !Sub '${AWS::StackName}-NamespaceId' }
+  NlbPublicAddresses:
+    Description: The NLB's fixed public addresses, comma-separated; pcscf's PCSCF_PUBLIC_ADDRS.
+    Value: !Join [',', [!Ref NlbAddressA, !Ref NlbAddressB]]
   NlbDnsName:
     Description: >
       Where clients reach SIP and MSRP: point the operator's names at it, or
