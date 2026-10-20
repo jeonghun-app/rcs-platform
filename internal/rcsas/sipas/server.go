@@ -118,6 +118,12 @@ type Server struct {
 	mu       sync.Mutex
 	closed   bool
 	sessions map[string]*session
+	// subs are the subscriptions to the conference event package by
+	// dialog, groupSubs those of each group, and subsOf how many each
+	// participant holds to each group (subscription.key).
+	subs      map[string]*subscription
+	groupSubs map[string]map[*subscription]bool
+	subsOf    map[string]int
 	// perUser counts each user's sessions each way (session.budget),
 	// those still waiting for an answer included; pending counts those for
 	// all users. large holds the user and peer of each large-mode session
@@ -179,6 +185,7 @@ func New(cfg Config) (*Server, error) {
 		cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand},
 		sessions: map[string]*session{}, perUser: map[string]int{}, large: map[string]bool{},
 		registered: map[string]time.Time{},
+		subs:       map[string]*subscription{}, groupSubs: map[string]map[*subscription]bool{}, subsOf: map[string]int{},
 	}, nil
 }
 

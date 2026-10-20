@@ -41,7 +41,7 @@ func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
 	}
 	ss := &session{s: s, user: inv.Recipient, mode: inv.Mode, inv: inv}
 	if inv.Mode == store.Group {
-		ss.group = inv.Peer
+		ss.group, ss.conversation = inv.Peer, inv.Conversation
 	}
 	if err := s.reserve(ss); err != nil {
 		return fmt.Errorf("%w: %w", err, messaging.ErrOffline)

@@ -7,8 +7,8 @@ stored, delivered and answered with disposition notifications (IMDN, RFC
 5438), and how group chats are run ([Group chat](#group-chat)). Of the SIP
 side ([The SIP layer](#the-sip-layer)), pager-mode MESSAGE, 1-to-1 and
 large-mode sessions, the third-party REGISTER from `scscf` and the group chat
-focus's sessions are served; the conference event package and REFER come in a
-later part of #137. The core is driven through interfaces so
+focus (sessions, the conference event package and REFER) are served. The core
+is driven through interfaces so
 that it can be built and tested first.
 
 The code:
@@ -92,11 +92,11 @@ only the core reaches ([ADR 0007](adr/0007-internal-transport.md) §2). Its
 | Request | What rcs-as does |
 |---|---|
 | `MESSAGE` outside a dialog (pager mode, RFC 3428) | `Submit` with `Pager: true`, `Mode: Standalone`; answered as below |
-| any request to the conference factory or a conference URI, outside a dialog | a group chat's, told apart before anything else: an `INVITE` creates or joins the group ([Group chat](#group-chat)), any other method is 405 with `Allow` |
+| any request to the conference factory or a conference URI, outside a dialog | a group chat's, told apart before anything else: an `INVITE` creates or joins the group, a `SUBSCRIBE` subscribes to its roster ([Group chat](#group-chat)), any other method is 405 with `Allow` |
 | `INVITE` outside a dialog | a chat or large-mode session, answered as in [Sessions](#sessions) |
 | `REGISTER` (scscf's third-party registration) | 200, and `UserRegistered` (see [Sessions](#sessions)) |
 | `OPTIONS` outside a dialog | forwarded along its `Route`, back to `scscf`: the default profile hands it to `rcs-as` with SESSION_CONTINUED, and capability discovery must not stop there |
-| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`; any other method 405); 481 when there is no such session, as for a `MESSAGE` in a dialog, since pager mode has none |
+| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`, and `REFER` in a session with a group; any other method 405), or in its subscription to a group's roster (`SUBSCRIBE`); 481 when there is no such session, as for a `MESSAGE` in a dialog, since pager mode has none |
 | `ACK` | the ACK of a 2xx rcs-as sent is taken by its UAS; any other is dropped |
 | anything else | 405 with `Allow` |
 
@@ -569,6 +569,44 @@ How the SIP layer serves it:
 - **Join.** An INVITE to a conference URI, with only an SDP body, is `Join`:
   404 for a group that has ended, which rcsjta takes as the end of the group,
   and 403 for someone who is not a participant.
+- **Leave.** A BYE with `Reason: SIP;cause=200`, which rcsjta sends when its
+  user closes the chat, is `Leave`; any other BYE, as for a session idle too
+  long, ends the session only, and the participant rejoins or is invited back
+  for the next message (the lead's decision on #137). A 603 to the focus's
+  INVITE is `Leave` too.
+- **The roster.** A participant's SUBSCRIBE to the conference URI with
+  `Event: conference` (RFC 4575) is answered 200 with `Expires` and the
+  conference URI as `Contact`, and its first NOTIFY carries the full roster
+  (`Roster`); each change then comes as the partial document `RosterChanged`
+  gives, one version up. A subscription that would see a gap in the versions,
+  as when two changes race to it, gets the full roster instead. A refresh in
+  the subscription's dialog gets the full roster too; `Expires: 0` ends the
+  subscription, and an initial SUBSCRIBE with `Expires: 0` fetches the roster
+  once (RFC 6665 §4.1.2). A subscription lasts at most 3600 s, the default,
+  and at least 60 s (423 with `Min-Expires` below). Only a current participant
+  may subscribe (403), to a group that exists (404); another event package is
+  489 with `Allow-Events: conference`, and an `Accept` without
+  `application/conference-info+xml` 406. A participant holds at most 4
+  subscriptions to one group (486 beyond), and a task at most
+  `RCSAS_MAX_SESSIONS` (500 with `Retry-After`). A NOTIFY that is refused or
+  not answered ends the subscription without another (RFC 6665 §4.2.2). On
+  shutdown each subscription ends with `reason=deactivated`, so that the
+  subscriber may subscribe again at once, to another task. Subscriptions are
+  kept in the task's memory only, as groups are single-task.
+- **REFER.** A participant adds someone by a REFER in its session with the
+  group (RFC 4579 §5.5, rcsjta's `GroupChatSession.inviteParticipants`):
+  `Refer-To` naming them, or a `cid:` URI with `Require: multiple-refer` and a
+  resource list as the body (RFC 5368), read no further than
+  `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 entries. It is `Add`, answered 202, and
+  the focus invites each one the group now holds invited (`Engine.Invite`).
+  `Refer-To` naming a participant with `method=BYE` is `Remove` (RFC 4579
+  §5.11), which only the chairman may: the removed participant's sessions with
+  the group get a BYE and its subscriptions end. With `Refer-Sub: false` (RFC
+  4488), as rcsjta sends, the 202 says so and there is no implicit
+  subscription; without it, one NOTIFY (`Event: refer`, terminated,
+  `message/sipfrag`) ends it at once, as rcs-as does not follow each
+  invitation for the referrer, who sees it in the roster. A REFER outside a
+  session, or in a 1-to-1 one, is 405.
 - Other answers: 403 for a rate limit or a group too large, 400 for a request
   the group cannot take (nobody else in the list), 500 with `Retry-After: 1`
   when the group kept changing under the request or the store was busy.
@@ -589,7 +627,7 @@ limitations](#assumptions-and-limitations)).
 | A 603 Decline to the focus's INVITE | `Leave`, not `InviteFailed`. The reference client declines the first INVITE of a group it left while offline (RCC.07 6.3.3.1; rcsjta `isGroupChatNextInviteRejected`), and accepts later ones as a new addition. Other failures stay `InviteFailed` |
 | A REFER adding someone | `Add`. A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 is refused unread, as for `Create` |
 | A REFER with `method=BYE` removing someone | `Remove`, then a BYE on the removed participant's session and `Leg.Close` |
-| `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated`), so that it learns no later roster change |
+| `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated;reason=rejected`, without a document), so that it learns no later roster change; no NOTIFY follows it |
 | A SUBSCRIBE to the conference event package | `Roster`: the full document for the first NOTIFY |
 | `Notifier.RosterChanged` | a NOTIFY with the document to each subscription |
 | `Deliverer.Invite` with `Mode: store.Group` | an INVITE that brings the participant back into the group. The engine asks `Member` first, so it is only ever for a current participant |
@@ -1047,6 +1085,9 @@ identifier ever appears in a metric name.
 | `sip.loop` | Requests rcs-as originated that came back to it, answered 482: by their `rcsas-` tag, or from a conference URI |
 | `sip.group.created`, `sip.group.joined`, `sip.group.refused`, `sip.group.offer_refused`, `sip.group.service_refused`, `sip.group.list_too_long`, `sip.group.list_refused` | Clients' INVITEs to a group: groups created, joins, refusals by the group, and refusals for the offer (488), the service (403), a resource list too long (403) or unreadable (400) |
 | `sip.group.declined`, `sip.group.left`, `sip.group.leave_failed`, `sip.group.join_refused` | Participants who left by a 603 to the focus's INVITE or by a BYE that says so, Leaves that failed, and 2xx answers to the focus whose Join the group refused |
+| `sip.group.added`, `sip.group.removed`, `sip.group.invite_failed` | REFERs that added or removed, and additions whose invitations could not be sent for want of the group |
+| `sip.subscription.started`, `sip.subscription.refreshed`, `sip.subscription.fetched`, `sip.subscription.expired`, `sip.subscription.ended.<reason>`, `sip.subscription.bad_event`, `sip.subscription.task_limit`, `sip.subscription.user_limit` | Subscriptions to the conference event package, by what became of them |
+| `sip.subscription.notified`, `sip.subscription.notify_failed`, `sip.subscription.notify_unsent`, `sip.subscription.resynced`, `sip.subscription.roster_failed` | NOTIFYs sent, refused or unanswered (which end their subscription), not built, full rosters sent for a gap, and rosters that could not be read for one |
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
 | `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |

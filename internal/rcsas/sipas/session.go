@@ -58,8 +58,10 @@ type session struct {
 	// inv is the invitation of a session rcs-as started; zero otherwise.
 	inv messaging.Invitation
 	// group is the conference URI of a session with a group chat, which
-	// rcs-as is the focus of; empty otherwise.
-	group string
+	// rcs-as is the focus of; empty otherwise. conversation is the
+	// session's, whose Contribution-ID names the group chat to its clients.
+	group        string
+	conversation messaging.Conversation
 
 	mu sync.Mutex
 	d  *dialog.Dialog
@@ -255,16 +257,20 @@ func (s *Server) sessionOf(req *sip.Request) *session {
 // closeWait bounds how long Close waits for the answers to its BYEs.
 const closeWait = 2 * time.Second
 
-// Close ends every session with a BYE, before the transport closes, and
-// takes no new one. It waits for the BYEs' answers, up to closeWait: the
-// transport writes a request after SendRequest returns, and closing it at
-// once could drop the BYE.
+// Close ends every session with a BYE and every subscription with a last
+// NOTIFY, before the transport closes, and takes no new one. It waits for
+// their answers, up to closeWait: the transport writes a request after
+// SendRequest returns, and closing it at once could drop it.
 func (s *Server) Close() {
 	s.mu.Lock()
 	s.closed = true
 	all := make([]*session, 0, len(s.sessions))
 	for _, ss := range s.sessions {
 		all = append(all, ss)
+	}
+	subs := make([]*subscription, 0, len(s.subs))
+	for _, sub := range s.subs {
+		subs = append(subs, sub)
 	}
 	s.mu.Unlock()
 	wait := s.cfg.closeWait
@@ -279,6 +285,22 @@ func (s *Server) Close() {
 		wg.Go(func() {
 			select {
 			case <-ss.bye(""):
+			case <-ctx.Done():
+			}
+		})
+	}
+	// A subscriber may subscribe again at once, which reaches another
+	// task (RFC 6665 §4.1.3, deactivated).
+	for _, sub := range subs {
+		wg.Go(func() {
+			sub.mu.Lock()
+			var done <-chan struct{} = closedChan
+			if !sub.ended {
+				done = sub.end(reasonDeactivated)
+			}
+			sub.mu.Unlock()
+			select {
+			case <-done:
 			case <-ctx.Done():
 			}
 		})
@@ -600,11 +622,22 @@ var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); retu
 // to do with its answer; what it returns is closed when the answer, or the
 // transaction's end, comes, or at once if the request was not sent.
 func (s *Server) sendInDialog(req *sip.Request, next sip.URI) <-chan struct{} {
+	return s.sendInDialogThen(req, next, nil)
+}
+
+// sendInDialogThen is sendInDialog, with then, if not nil, called with the
+// final answer or the transaction's error, once; or with an error if the
+// request was not sent.
+func (s *Server) sendInDialogThen(req *sip.Request, next sip.URI, then func(*sip.Response, error)) <-chan struct{} {
 	ctx, cancel := context.WithTimeout(context.Background(), dialogTimeout)
 	defer cancel()
+	if then == nil {
+		then = func(*sip.Response, error) {}
+	}
 	dst, err := s.cfg.Resolver.Resolve(ctx, next)
 	if err != nil {
 		s.cfg.Metrics.Count("sip.dialog.unresolved", 1)
+		then(nil, err)
 		return closedChan
 	}
 	dst.Listener = s.cfg.Listener
@@ -612,10 +645,14 @@ func (s *Server) sendInDialog(req *sip.Request, next sip.URI) <-chan struct{} {
 	var once sync.Once
 	if _, err := s.layer.Request(req, dst, func(res *sip.Response, err error) {
 		if err != nil || res.StatusCode >= 200 {
-			once.Do(func() { close(done) })
+			once.Do(func() {
+				then(res, err)
+				close(done)
+			})
 		}
 	}); err != nil {
 		s.cfg.Metrics.Count("sip.dialog.unsent", 1)
+		then(nil, err)
 		return closedChan
 	}
 	return done
@@ -645,6 +682,10 @@ func (s *Server) inDialog(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
 	ss := s.sessionOf(req)
 	if ss == nil {
+		if sub := s.subscriptionOf(req); sub != nil {
+			s.inSubscription(ctx, u, sub, req)
+			return
+		}
 		s.respond(u, req, 481)
 		return
 	}
@@ -685,8 +726,36 @@ func (s *Server) inDialog(ctx context.Context, u *proxy.UAS) {
 		s.refresh(u, ss, req)
 	case "OPTIONS":
 		s.respond(u, req, 200)
+	case "REFER":
+		if ss.group == "" {
+			// A 1-to-1 chat has nobody to add.
+			s.respondWith(u, req, 405, [2]string{"Allow", allowed})
+			return
+		}
+		s.refer(ctx, u, ss, req)
 	default:
 		s.respond(u, req, 405)
+	}
+}
+
+// inSubscription serves a request in a subscription's dialog: a SUBSCRIBE
+// that refreshes or ends it; nothing else is taken there.
+func (s *Server) inSubscription(ctx context.Context, u *proxy.UAS, sub *subscription, req *sip.Request) {
+	sub.mu.Lock()
+	err := sub.d.Accept(req)
+	ended := sub.ended
+	sub.mu.Unlock()
+	switch {
+	case ended || errors.Is(err, dialog.ErrNotInDialog):
+		s.respond(u, req, 481)
+	case errors.Is(err, dialog.ErrOutOfOrder):
+		s.respond(u, req, 500)
+	case err != nil:
+		s.respond(u, req, 400)
+	case req.Method != "SUBSCRIBE":
+		s.respondWith(u, req, 405, [2]string{"Allow", "SUBSCRIBE"})
+	default:
+		s.resubscribe(ctx, u, sub, req)
 	}
 }
 

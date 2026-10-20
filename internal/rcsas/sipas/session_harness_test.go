@@ -37,6 +37,8 @@ type chatRig struct {
 	// groups is the group chat focus, on groupStore.
 	groups     *group.Service
 	groupStore *groupstore.Memory
+	// skipRoster drops that many roster updates (notifier).
+	skipRoster atomic.Int32
 }
 
 // recordingEngine is the engine, with the failed invitations recorded.
@@ -95,7 +97,7 @@ func newChatRigOn(t *testing.T, mc messaging.Config, cfg Config, tc transport.Co
 	r.e = &recordingEngine{Engine: e, failed: make(chan error, 16)}
 	r.groupStore = groupstore.NewMemory()
 	if r.groups, err = group.New(group.Config{ConferenceHost: confHost, HomeDomain: domain, Clock: r.clock},
-		r.groupStore, e, notifier{&a}, r.metrics); err != nil {
+		r.groupStore, e, notifier{a: &a, skip: &r.skipRoster}, r.metrics); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.closeWait == 0 {

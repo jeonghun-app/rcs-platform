@@ -24,11 +24,15 @@ type Groups interface {
 	Create(ctx context.Context, r group.CreateRequest) (groupstore.Group, error)
 	Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error)
 	Leave(ctx context.Context, uri, who string) error
+	Add(ctx context.Context, uri, by string, who []group.Invitee) error
+	Remove(ctx context.Context, uri, by, who string) error
+	Roster(ctx context.Context, uri, who string) ([]byte, uint32, error)
+	Get(ctx context.Context, uri string) (groupstore.Group, error)
 }
 
-// groupAllowed are the methods a conference URI or the factory takes
-// outside a session.
-const groupAllowed = "INVITE, ACK, CANCEL, BYE, UPDATE"
+// groupAllowed are the methods of a group chat's requests (RFC 3261
+// §20.5): INVITE and SUBSCRIBE outside a dialog, the others in one.
+const groupAllowed = "INVITE, ACK, CANCEL, BYE, UPDATE, SUBSCRIBE, REFER"
 
 // groupTimeout bounds a group operation the SIP layer makes outside the
 // request it serves: the Join of a 2xx to the focus's INVITE, the Leave of
@@ -75,12 +79,15 @@ func (s *Server) conferenceURI(u sip.URI) (string, bool) {
 	return "sip:" + u.User + "@" + s.cfg.ConferenceHost, true
 }
 
-// routeGroup serves a group chat's request outside a session: an INVITE
-// that creates the group or joins it. The conference event package and
-// REFER come in a later part of #137.
+// routeGroup serves a group chat's request outside a dialog: an INVITE
+// that creates the group or joins it, or a SUBSCRIBE to its conference
+// event package. A REFER is taken in the referrer's session (refer).
 func (s *Server) routeGroup(r *proxy.Request) proxy.Decision {
-	if r.Message.Method == "INVITE" {
+	switch r.Message.Method {
+	case "INVITE":
 		return proxy.Decision{Serve: s.groupInvite}
+	case "SUBSCRIBE":
+		return proxy.Decision{Serve: s.groupSubscribe}
 	}
 	return s.refuseMethod(r, groupAllowed)
 }
@@ -225,6 +232,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	}
 	ss.group = g.URI
 	conv.ID = g.Conversation
+	ss.conversation = conv
 	if d.LocalTarget, err = sip.ParseURI(g.URI); err != nil {
 		s.respond(u, req, 500)
 		return
@@ -263,7 +271,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	}
 	if factory {
 		s.cfg.Metrics.Count("sip.group.created", 1)
-		go s.inviteAll(g, conv)
+		go s.inviteInvited(g, conv, nil)
 	} else {
 		s.cfg.Metrics.Count("sip.group.joined", 1)
 	}
@@ -322,13 +330,14 @@ func (s *Server) refuseGroup(u *proxy.UAS, req *sip.Request, err error) {
 	s.respond(u, req, code)
 }
 
-// inviteAll has the focus invite each participant g holds invited, once
-// its creator's session is set up: through the engine, which counts the
+// inviteInvited has the focus invite each participant g holds invited, of
+// those in only unless it is nil: once its creator's session is set up, or
+// once a REFER added them. It goes through the engine, which counts the
 // invitation, so that a message queued meanwhile waits for that session
 // rather than ringing the participant again.
-func (s *Server) inviteAll(g groupstore.Group, conv messaging.Conversation) {
+func (s *Server) inviteInvited(g groupstore.Group, conv messaging.Conversation, only map[string]bool) {
 	for _, p := range g.Participants {
-		if p.State != groupstore.Invited {
+		if p.State != groupstore.Invited || only != nil && !only[p.Identity] {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
@@ -353,6 +362,7 @@ func (ss *session) declined() {
 		ss.s.cfg.Metrics.Count("sip.group.leave_failed", 1)
 	} else {
 		ss.s.cfg.Metrics.Count("sip.group.declined", 1)
+		ss.s.endSubscriptions(ss.group, ss.user, reasonRejected)
 	}
 	ss.end()
 }
@@ -366,13 +376,15 @@ func (ss *session) declined() {
 // (RCC.07 Group Chat): a participant that left could do neither.
 func leaves(req *sip.Request) bool { return sipCause(req, 200) }
 
-// left records that a participant left its group by its BYE (Leave).
+// left records that a participant left its group by its BYE (Leave), and
+// ends its subscriptions, so that it learns no later change.
 func (s *Server) left(ctx context.Context, ss *session) {
 	if err := s.groups.Leave(ctx, ss.group, ss.user); err != nil {
 		s.cfg.Metrics.Count("sip.group.leave_failed", 1)
 		return
 	}
 	s.cfg.Metrics.Count("sip.group.left", 1)
+	s.endSubscriptions(ss.group, ss.user, reasonRejected)
 }
 
 // joined records that the participant answered the focus's INVITE with a
@@ -384,8 +396,3 @@ func (ss *session) joined() error {
 	_, err := ss.s.groups.Join(ctx, ss.group, ss.user, "")
 	return err
 }
-
-// RosterChanged implements group.Notifier. Subscriptions to the conference
-// event package (RFC 4575) come in a later part of #137; until then a
-// roster change is sent to no one.
-func (s *Server) RosterChanged(context.Context, group.RosterUpdate) {}
