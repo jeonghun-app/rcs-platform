@@ -608,19 +608,23 @@ func TestListenerLimitsAreChecked(t *testing.T) {
 	}
 }
 
-// The sweep exports the listeners' connections, and the PROXY headers that
-// timed out, were malformed or never started since the last sweep, as EMF
-// metrics; a UDP listener has no gauge (#193).
+// The sweep exports the listeners' connections, and, since the last sweep,
+// the connections each limit refused and the PROXY headers that timed out,
+// failed or never began, as EMF metrics; a UDP listener has no gauge
+// (#193).
 func TestTheTransportsListenerMetricsAreExported(t *testing.T) {
 	var out strings.Builder
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
 	m := runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, slog.New(slog.DiscardHandler))
 	var tm transportMetrics
-	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 7, "core": 2}, ProxyHeaderTimeouts: 3, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5})
-	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 9, "core": 2}, ProxyHeaderTimeouts: 4, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5})
+	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 7, "core": 2}, ProxyHeaderTimeouts: 3, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5,
+		ClientListenerRejected: 6, CoreListenerRejected: 1, Rejected: 2})
+	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 9, "core": 2}, ProxyHeaderTimeouts: 4, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5,
+		ClientListenerRejected: 8, CoreListenerRejected: 1, Rejected: 3})
 	m.Flush()
 	for _, want := range []string{`"transport.listener_connections.client":9`, `"transport.listener_connections.core":2`,
-		`"transport.proxy_header_timeouts":4`, `"transport.proxy_header_errors":1`, `"transport.proxy_header_empty":5`} {
+		`"transport.proxy_header_timeouts":4`, `"transport.proxy_header_errors":1`, `"transport.proxy_header_empty":5`,
+		`"transport.client_listener_rejected":8`, `"transport.core_listener_rejected":1`, `"transport.rejected":3`} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("metrics lack %s:\n%s", want, out.String())
 		}
