@@ -232,6 +232,7 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	if ended {
 		// A BYE ended the session meanwhile, and told the engine what
 		// it had to (inDialog): nothing more reaches it.
+		s.cfg.Metrics.Count("sip.invite.ended_early", 1)
 		return
 	}
 	if err == nil {

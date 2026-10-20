@@ -80,12 +80,12 @@ func newChatRigOn(t *testing.T, mc messaging.Config, cfg Config, tc transport.Co
 	mc.SenderRate = messaging.Rate{PerMinute: -1}
 	mc.Logger = slog.New(slog.DiscardHandler)
 	var a *as
-	e, err := messaging.New(mc, store.NewMemory(), deliverer{&a}, noMetrics{})
+	r.metrics = &counter{n: map[string]int64{}}
+	e, err := messaging.New(mc, store.NewMemory(), deliverer{&a}, r.metrics)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.e = &recordingEngine{Engine: e, failed: make(chan error, 16)}
-	r.metrics = &counter{n: map[string]int64{}}
 	if cfg.closeWait == 0 {
 		// Most fake cores leave a BYE unanswered: the test's end need not
 		// wait the 2 s Close gives a real one.

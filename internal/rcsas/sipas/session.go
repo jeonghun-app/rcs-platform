@@ -256,13 +256,15 @@ func (s *Server) Close() {
 	if wait <= 0 {
 		wait = closeWait
 	}
+	// One bound for all of them: a closed Done reaches every waiter.
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
 	var wg sync.WaitGroup
-	deadline := time.After(wait)
 	for _, ss := range all {
 		wg.Go(func() {
 			select {
 			case <-ss.bye(""):
-			case <-deadline:
+			case <-ctx.Done():
 			}
 		})
 	}

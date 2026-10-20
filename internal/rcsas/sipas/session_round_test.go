@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -433,7 +435,7 @@ func TestASendTheTransportHasNoRoomForIsAPassingFailure(t *testing.T) {
 // take the user's own room; and one sender has one large-mode session at a
 // time with one recipient.
 func TestTheBoundsOfAUserAreKeptApartByDirection(t *testing.T) {
-	r := newChatRigWith(t, messaging.Config{}, Config{MaxOutgoingPerUser: 1, MaxIncomingPerUser: 1})
+	r := newChatRigWith(t, messaging.Config{}, Config{MaxOutgoingPerUser: 2, MaxIncomingPerUser: 1})
 	r.core.setReply(func(req *sip.Request) []*sip.Response {
 		if req.Method == "INVITE" { // bob's client rings and rings
 			ringing, _ := sip.NewResponse(req, 180, "", "bob1")
@@ -455,10 +457,12 @@ func TestTheBoundsOfAUserAreKeptApartByDirection(t *testing.T) {
 	m.uri = alice
 	m.fields[0] = "P-Asserted-Identity: <" + bob + ">"
 	p := r.a.dial(t)
-	s := answeredBy(t, p.send(m))
-	p.ack(s)
+	for range 2 {
+		s := answeredBy(t, p.send(m))
+		p.ack(s)
+	}
 	if res := p.send(m); res.StatusCode != 486 {
-		t.Fatalf("bob's second session answered %d", res.StatusCode)
+		t.Fatalf("bob's third session answered %d", res.StatusCode)
 	}
 }
 
@@ -514,5 +518,75 @@ func TestAChatInviteWithTheOMAIMTagIsAChat(t *testing.T) {
 	s := answeredBy(t, r.a.dial(t).send(m))
 	if types, _ := s.answer.Media[0].AcceptTypes(); len(types) != 2 || types[1] != messaging.IsComposingType {
 		t.Fatalf("accept-types %v, want a chat's", types)
+	}
+}
+
+// blockingResolver resolves numerically, but holds a lookup of host until
+// release is closed.
+type blockingResolver struct {
+	host    string
+	held    chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingResolver) Resolve(ctx context.Context, u sip.URI) (transport.Destination, error) {
+	if u.Host == b.host {
+		b.held <- struct{}{}
+		<-b.release
+	}
+	return proxy.NumericResolver{}.Resolve(ctx, u)
+}
+
+// QA's nit 2 on #252: a BYE that ends a session rcs-as started while its
+// ACK is still on the way leaves the engine told once, by the BYE.
+func TestAnEarlyBYELeavesTheEngineToldOnce(t *testing.T) {
+	block := &blockingResolver{host: "127.0.0.2", held: make(chan struct{}, 1), release: make(chan struct{})}
+	r := newChatRigWith(t, messaging.Config{}, Config{Resolver: block})
+	t.Cleanup(func() {
+		select {
+		case <-block.release:
+		default:
+			close(block.release)
+		}
+	})
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method != "INVITE" {
+			return nil
+		}
+		// The 2xx's Contact, where its ACK goes, is one the resolver holds.
+		res := r.answerInvite(t, req, relayPath(), "active")
+		_ = res.Header.Set("Contact", "<sip:127.0.0.2:5060;transport=tcp>")
+		return []*sip.Response{res}
+	})
+	if err := r.a.srv.Invite(t.Context(), invitation()); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.core.nextOf(t, "INVITE")
+	select {
+	case <-block.held:
+	case <-time.After(waitFor):
+		t.Fatal("the ACK's lookup did not start")
+	}
+	from, _ := inv.Header.From()
+	bye := msg{method: "BYE", uri: alice, callID: inv.Header.Get("Call-ID"), cseq: 1,
+		from: "<" + bob + ">;tag=bob1", to: "<" + alice + ">;tag=" + from.Tag(), fields: []string{"Reason: " + directionRefused}}
+	if res := r.a.dial(t).send(bye); res.StatusCode != 200 {
+		t.Fatalf("BYE answered %d", res.StatusCode)
+	}
+	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrNoSessions) {
+		t.Fatalf("failed with %v", err)
+	}
+	close(block.release)
+	deadline := time.Now().Add(waitFor)
+	for r.metrics.get("sip.invite.ended_early") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the session went on after its BYE")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-r.e.failed:
+		t.Fatalf("the engine was told again: %v", err)
+	default:
 	}
 }

@@ -381,7 +381,10 @@ func TestAnAnswerAtTheTimeoutEitherWinsOrIsRefused(t *testing.T) {
 		err = <-answered
 		select {
 		case <-leg.Done():
-			if err == nil {
+			// An answer just before the clock moved also starts the bind
+			// deadline, which the same Advance may reach: that close is
+			// the bind deadline's, not the answer timeout's.
+			if err == nil && r.m.get("leg.unbound") == 0 {
 				t.Fatal("an answered leg was closed by the timeout")
 			}
 		default:
