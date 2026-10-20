@@ -64,9 +64,11 @@ func (r *RegInfo) Contact(aor, uri string) (RegInfoContact, bool) {
 // parameter order and case, so URIs compare as RFC 3261 §19.1.4 has it.
 // AORs compare in the form every service compares a public identity in
 // (identity.CanonicalIMPU): a notifier's aor without user=phone, or with its
-// host in another case, is still the client's. A document whose aor is not
-// a public identity at all, empty say, has no registration of the client:
-// Own finds nothing under it, and FuzzParseRegInfo holds it to that.
+// host in another case, is still the client's. A registration whose aor is
+// not a public identity at all, empty or with a port say, is not the
+// client's even if it lists the client's contact: Own skips it (the
+// scenario's TestRegEventContactUnderANonIMPUAorIsNotTheClients). Asked
+// for an aor that is not one, Own finds nothing (FuzzParseRegInfo).
 func (r *RegInfo) Own(aor, uri string) (RegInfoRegistration, RegInfoContact, bool) {
 	want, err := sip.ParseURI(uri)
 	if err != nil {

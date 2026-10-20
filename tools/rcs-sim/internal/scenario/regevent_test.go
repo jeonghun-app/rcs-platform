@@ -277,3 +277,26 @@ func TestRegEventChecksQARound2Pins(t *testing.T) {
 		})
 	}
 }
+
+func TestRegEventContactUnderANonIMPUAorIsNotTheClients(t *testing.T) {
+	// QA on #216: the client's contact listed only under an aor that is
+	// not a public identity is not the client's registration.
+	for name, aor := range map[string]string{
+		"empty aor":     `aor=""`,
+		"aor with port": `aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org:5060"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			core.Rewrite = func(req *sip.Request) {
+				if req.Method == "NOTIFY" && req.Header.Get("CSeq") == "1 NOTIFY" {
+					req.Body = []byte(strings.Replace(string(req.Body), `aor="sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org"`, aor, 1))
+				}
+			}
+			ok, results := runAll(t, cfg, "reg-event")
+			last := results[len(results)-1]
+			if ok || last.Step != "subscribe" || last.Error != "the reginfo does not list the client's contact" {
+				t.Fatalf("results %+v", results)
+			}
+		})
+	}
+}
