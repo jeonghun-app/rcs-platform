@@ -54,10 +54,23 @@ const (
 	MaxRetryAfter     = time.Hour
 )
 
-// DefaultTimerC is the smallest Timer C RFC 3261 §16.8 allows a proxy for an
-// INVITE branch. The safety timer of a server INVITE transaction outlasts it, so
-// a proxy TU always ends a silent branch itself before the layer would.
-const DefaultTimerC = 3 * time.Minute
+// DefaultTimerC is the Timer C a proxy TU uses unless configured otherwise
+// (proxy.DefaultTimerC): just over the 3 minutes RFC 3261 §16.6 step 11 sets as
+// the least Timer C may be.
+const DefaultTimerC = 3*time.Minute + time.Second
+
+// FinalTimeoutMargin is how much later than a proxy TU's own last deadline its
+// layer's safety timer fires, so the proxy's final response, or its silence,
+// always comes first.
+const FinalTimeoutMargin = 5 * time.Second
+
+// InviteFinalTimeoutFor is the least InviteFinalTimeout under a proxy TU whose
+// Timer C is timerC: the proxy cancels a branch when Timer C fires, then waits
+// 64*T1 for the 487 to its CANCEL before it answers itself (RFC 3261 §16.8,
+// §9.1).
+func InviteFinalTimeoutFor(timerC, t1 time.Duration) time.Duration {
+	return timerC + 64*t1 + FinalTimeoutMargin
+}
 
 // minTimerD is the lower bound RFC 3261 §17.1.1.2 sets for Timer D over an
 // unreliable transport.
@@ -121,7 +134,9 @@ type TU interface {
 	// its final response: Timer H fired before the ACK (ErrTimeout, RFC 3261
 	// §17.2.1), or the transport failed on a retransmission or on a delayed 100
 	// Trying the transaction sent itself (§17.2.4). Failures of a send the TU asked for
-	// are returned by Respond instead.
+	// are returned by Respond instead. It is not called for the 500 the
+	// layer sent for a TU that did not answer in time (Config.InviteFinalTimeout):
+	// the TU never sent that response, and the Context has told it already.
 	ServerFailed(tx *ServerTransaction, err error)
 }
 
@@ -215,8 +230,10 @@ type Config struct {
 	// 4320 §4.2), must come first; the safety net is for a TU that is stuck,
 	// not slow (decided on #156). INVITE: every
 	// provisional response the TU sends starts the timeout again, since a
-	// ringing call may last minutes, and zero takes DefaultTimerC + 64*T1, so
-	// a proxy's own Timer C always fires first.
+	// ringing call may last minutes, and zero takes
+	// InviteFinalTimeoutFor(DefaultTimerC, T1), so a proxy with the default
+	// Timer C has ended its branches first; proxy.New sets it from its own
+	// Timer C. ServerTransaction.Progress starts either timeout again.
 	NonInviteFinalTimeout time.Duration
 	InviteFinalTimeout    time.Duration
 }
@@ -337,7 +354,7 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 		l.nonInviteFinal = 128 * l.t1
 	}
 	if l.inviteFinal == 0 {
-		l.inviteFinal = DefaultTimerC + 64*l.t1
+		l.inviteFinal = InviteFinalTimeoutFor(DefaultTimerC, l.t1)
 	}
 	return l, nil
 }

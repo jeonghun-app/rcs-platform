@@ -26,10 +26,11 @@
 //
 // A server transaction whose TU sends no final response in time is answered 500
 // by the layer, and its Context is cancelled so the TU can stop: after 128*T1
-// for non-INVITE, later than a proxy TU's own Timer F after routing, and for
-// INVITE after Timer C plus 64*T1 since the TU's last
+// for non-INVITE, later than a proxy TU's own Timer F, and for INVITE after
+// Timer C, 64*T1 for the answer to a CANCEL and a margin since the TU's last
 // provisional response, since a ringing call may last minutes
-// (Config.InviteFinalTimeout).
+// (Config.InviteFinalTimeout). A TU that starts new work on the request, such
+// as a proxy's next fork group, starts the timer again (Progress).
 //
 // Every timer runs on an injected Clock, so tests drive T1 to T4 without
 // sleeping. Retransmission timers (A, E, G) run only over unreliable transports.

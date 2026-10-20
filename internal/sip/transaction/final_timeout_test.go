@@ -2,7 +2,10 @@ package transaction
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,7 +64,9 @@ func TestInviteSafetyTimerOutlastsTimerCAndRestartsOnEveryProvisional(t *testing
 	h.receive(req)
 	tx := h.tu.lastTx()
 	check(t, "sent", h.sender.take(), []string{"100"})
-	limit := DefaultTimerC + 64*DefaultT1
+	// Timer C of a default proxy, 64*T1 for the 487 to its CANCEL, and the
+	// margin.
+	limit := 3*time.Minute + time.Second + 64*DefaultT1 + 5*time.Second
 
 	// Ringing: a 180 every minute keeps the transaction alive well past the
 	// limit, as a UAS does for proxies (RFC 3261 §13.3.1.1).
@@ -170,7 +175,7 @@ func TestFinalTimeoutsAreConfigurable(t *testing.T) {
 		t.Fatalf("sent %d", res.StatusCode)
 	}
 	l := mustNew(t, &fakeSender{}, &tuRecorder{}, Config{T1: 100 * time.Millisecond})
-	if l.nonInviteFinal != 128*100*time.Millisecond || l.inviteFinal != DefaultTimerC+64*100*time.Millisecond {
+	if l.nonInviteFinal != 128*100*time.Millisecond || l.inviteFinal != 3*time.Minute+time.Second+6400*time.Millisecond+5*time.Second {
 		t.Fatalf("defaults = %v, %v", l.nonInviteFinal, l.inviteFinal)
 	}
 	// Under 64*T1, of the configured T1 or the default, it would answer
@@ -202,4 +207,179 @@ func TestClosingTheLayerCancelsTheContextOfItsServerTransactions(t *testing.T) {
 	if tx.Context().Err() == nil {
 		t.Fatal("Context still live after Close")
 	}
+}
+
+// The safety-net path gives back the transaction's slot and bytes (#170): held
+// while the 500 is in Completed, as for any final response, and returned when
+// the transaction ends, by Timer I after the ACK or by Timer H without one. A
+// 500 the client never acknowledges is the layer's, not the TU's, so Timer H
+// does not report it through ServerFailed.
+func TestTheSafetyNetGivesBackTheSlotAndItsBytes(t *testing.T) {
+	for _, tc := range []struct {
+		method  string
+		network transport.Network
+		ack     bool
+	}{
+		{"MESSAGE", transport.UDP, false},
+		{"MESSAGE", transport.TCP, false},
+		{"INVITE", transport.UDP, true},
+		{"INVITE", transport.TCP, true},
+		{"INVITE", transport.UDP, false},
+		{"INVITE", transport.TCP, false},
+	} {
+		t.Run(tc.method+"/"+string(tc.network)+"/ack="+strconv.FormatBool(tc.ack), func(t *testing.T) {
+			h := newHarness(t, tc.network, Config{NonInviteFinalTimeout: time.Minute, InviteFinalTimeout: time.Minute})
+			req := request(t, tc.method, "z9hG4bKsafe-release")
+			h.receive(req)
+			tx := h.tu.lastTx()
+			h.tu.take()
+			h.clock.advance(time.Minute)
+			if res := lastResponse(t, h); res.StatusCode != 500 {
+				t.Fatalf("sent %d, want 500", res.StatusCode)
+			}
+			if s := h.layer.Stats(); tx.State() == Completed && (s.ServerTransactions != 1 || s.ServerTransactionBytes <= 0) {
+				t.Fatalf("a Completed transaction gave back its slot early: %+v", s)
+			}
+			if tc.ack {
+				ack(h, req)
+			}
+			h.clock.advance(time.Hour)
+			s := h.layer.Stats()
+			if tx.State() != Terminated || s.ServerTransactions != 0 || s.ServerTransactionBytes != 0 {
+				t.Fatalf("state %s, stats %+v", tx.State(), s)
+			}
+			if ev := h.tu.take(); len(ev) != 0 {
+				t.Fatalf("the TU was told %q", ev)
+			}
+		})
+	}
+}
+
+// Nor is a transport failure on a retransmission of the layer's 500 the TU's.
+func TestARetransmissionOfTheLayers500ThatFailsIsNotReported(t *testing.T) {
+	h := newHarness(t, transport.UDP, Config{InviteFinalTimeout: time.Minute})
+	h.receive(request(t, "INVITE", "z9hG4bKsafe-g"))
+	tx := h.tu.lastTx()
+	h.tu.take()
+	h.clock.advance(time.Minute)
+	h.sender.failWith(errNetwork)
+	h.clock.advance(DefaultT1)
+	if tx.State() != Terminated {
+		t.Fatalf("state %s, want Terminated after Timer G failed", tx.State())
+	}
+	if ev := h.tu.take(); len(ev) != 0 {
+		t.Fatalf("the TU was told %q", ev)
+	}
+}
+
+// A final response stops the safety timer, and one that fires anyway changes
+// nothing: with a short timeout the transaction is still in Accepted or
+// Completed when it would fall due.
+func TestAFinalResponseStopsTheSafetyTimer(t *testing.T) {
+	const (
+		inviteTimeout    = time.Second + 7*time.Millisecond
+		nonInviteTimeout = 32*time.Second + 7*time.Millisecond
+	)
+	for _, tc := range []struct {
+		name, method string
+		code         int
+		due          time.Duration
+	}{
+		{"INVITE 2xx", "INVITE", 200, inviteTimeout},
+		{"INVITE 486", "INVITE", 486, inviteTimeout},
+		{"MESSAGE 200", "MESSAGE", 200, nonInviteTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, transport.UDP, Config{InviteFinalTimeout: inviteTimeout, NonInviteFinalTimeout: nonInviteTimeout})
+			req := request(t, tc.method, "z9hG4bKsafe-stop")
+			h.receive(req)
+			tx := h.tu.lastTx()
+			if !h.clock.pendingAt(tc.due) {
+				t.Fatal("no safety timer armed at the request")
+			}
+			h.clock.advance(500 * time.Millisecond)
+			if err := tx.Respond(response(t, req, tc.code)); err != nil {
+				t.Fatal(err)
+			}
+			if h.clock.pendingAt(tc.due) {
+				t.Error("the safety timer is still armed after the final response")
+			}
+			h.sender.take()
+			h.clock.advance(tc.due)
+			if got := h.sender.take(); slices.Contains(got, "500") {
+				t.Fatalf("sent %q after the TU's %d", got, tc.code)
+			}
+			if s := h.layer.Stats(); s.ServerTransactionsTimedOut != 0 || errors.Is(context.Cause(tx.Context()), ErrNoFinalResponse) {
+				t.Fatalf("answered for the TU after its %d: %+v, cause %v", tc.code, s, context.Cause(tx.Context()))
+			}
+		})
+	}
+}
+
+// Progress starts the safety timer again, so it measures a stalled TU, not the
+// whole request: a proxy forwarding to its next fork group calls it. Once a
+// final response was sent it does nothing.
+func TestProgressStartsTheSafetyTimerAgain(t *testing.T) {
+	for _, method := range []string{"MESSAGE", "INVITE"} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, transport.TCP, Config{NonInviteFinalTimeout: 40 * time.Second, InviteFinalTimeout: 40 * time.Second})
+			req := request(t, method, "z9hG4bKsafe-progress")
+			h.receive(req)
+			tx := h.tu.lastTx()
+			h.sender.take()
+			h.clock.advance(30 * time.Second)
+			tx.Progress()
+			h.clock.advance(40*time.Second - time.Millisecond)
+			if got := h.sender.take(); len(got) != 0 || tx.Context().Err() != nil {
+				t.Fatalf("answered before 40 s since Progress: %q", got)
+			}
+			h.clock.advance(time.Millisecond)
+			if res := lastResponse(t, h); res.StatusCode != 500 {
+				t.Fatalf("sent %d, want 500", res.StatusCode)
+			}
+			// Completed now: Progress arms nothing.
+			tx.Progress()
+			if h.clock.pendingAt(h.clock.elapsed() + 40*time.Second) {
+				t.Fatal("Progress re-armed the safety timer after the 500")
+			}
+		})
+	}
+}
+
+// A 500 that cannot get a To tag is not sent: the transaction ends quietly, its
+// slot and bytes come back, and the TU still learns why from its Context.
+func TestASafetyTimerThatCannotDrawATagEndsTheTransactionQuietly(t *testing.T) {
+	h := newHarness(t, transport.TCP, Config{InviteFinalTimeout: time.Minute,
+		IDs: sip.IDGenerator{Rand: &keyOnly{}}})
+	h.receive(request(t, "INVITE", "z9hG4bKsafe-notag"))
+	tx := h.tu.lastTx()
+	h.sender.take()
+	h.tu.take()
+	h.clock.advance(time.Minute)
+	if got := h.sender.take(); len(got) != 0 {
+		t.Fatalf("sent %q", got)
+	}
+	s := h.layer.Stats()
+	if tx.State() != Terminated || s.ServerTransactions != 0 || s.ServerTransactionBytes != 0 || s.ServerTransactionsTimedOut != 1 {
+		t.Fatalf("state %s, stats %+v", tx.State(), s)
+	}
+	if !errors.Is(context.Cause(tx.Context()), ErrNoFinalResponse) {
+		t.Fatalf("cause %v", context.Cause(tx.Context()))
+	}
+	if ev := h.tu.take(); len(ev) != 0 {
+		t.Fatalf("the TU was told %q", ev)
+	}
+}
+
+// keyOnly yields the layer's key in New, then fails, as a broken source of
+// randomness would.
+type keyOnly struct{ n int }
+
+func (k *keyOnly) Read(p []byte) (int, error) {
+	if k.n >= sha256.Size {
+		return 0, errors.New("randomness unavailable")
+	}
+	n := min(len(p), sha256.Size-k.n)
+	k.n += n
+	return n, nil
 }

@@ -103,6 +103,19 @@ func (tx *ServerTransaction) armFinal() {
 	}
 }
 
+// Progress tells the transaction that its TU has started new work on the
+// request, as a proxy does when it forwards to its next fork group or to a
+// replacement target, so the safety timer starts again: it measures how long
+// the TU has been stalled, not how long the request takes. It does nothing once
+// a final response was sent.
+func (tx *ServerTransaction) Progress() {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.state == Trying || tx.state == Proceeding {
+		tx.armFinal()
+	}
+}
+
 // Context is cancelled when the transaction ends, so a TU still working on the
 // request can stop. If the TU sent no final response in time and the layer
 // answered 500 instead, it is cancelled at that moment and context.Cause
@@ -163,6 +176,10 @@ func (tx *ServerTransaction) send(res *sip.Response, opts ...transport.SendOptio
 // directly. mu must be held.
 func (tx *ServerTransaction) failed(err error) func() {
 	tx.terminate()
+	if tx.timedOut {
+		// The response that failed is the layer's 500, not the TU's.
+		return nil
+	}
 	return func() { tx.l.tu.ServerFailed(tx, err) }
 }
 
