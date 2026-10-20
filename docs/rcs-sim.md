@@ -196,11 +196,18 @@ It follows its own registration state (RFC 3680, TS 24.229 §5.1.1.3):
 - Each NOTIFY is answered 200 and delivered in order, with its
   `Subscription-State`, reason, and `reginfo` body: version, state, and each
   contact's state and event. The scenario checks the versions.
-- A NOTIFY for another event package gets 489, a lower CSeq 500, and one
-  after the subscription ended 481. A body that is not `reginfo` is answered
-  200 and flagged in the notification.
-- `Unsubscribe` sends SUBSCRIBE with `Expires: 0` in the dialog. A terminated
-  NOTIFY ends the subscription.
+- The NOTIFY sets up the dialog (RFC 6665 §4.4.1): the first one's
+  Record-Route is the route set, and each one's Contact the remote target.
+  Before any NOTIFY, the 2xx's stand in.
+- A NOTIFY without a readable `Subscription-State` or `Event` gets 400, one
+  for another event package 489, one with an event id this subscription
+  does not have 481, a lower CSeq 500, and one after the subscription ended
+  481. A body that is not `reginfo` is answered 200 and flagged in the
+  notification. `reginfo` with a document type declaration, or anything
+  after its root element, is refused.
+- `Unsubscribe` sends SUBSCRIBE with `Expires: 0` in the dialog, with the
+  UA's Contact. A terminated NOTIFY ends the subscription, and so does an
+  answer that says it no longer exists, 481 among them (§4.1.2.2).
 
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an

@@ -42,6 +42,9 @@ type notifier struct {
 	// before, when set, is sent as a NOTIFY before the 2xx to SUBSCRIBE.
 	before string
 	refuse int
+	// contact and recordRoute, when set, go in the NOTIFYs instead of
+	// notifierContact and no Record-Route.
+	contact, recordRoute string
 }
 
 func newNotifier(t *testing.T, s *standIn) *notifier {
@@ -110,7 +113,11 @@ func (n *notifier) request(t *testing.T, state, body, event string) *sip.Request
 	sub := n.sub
 	n.cseq++
 	cseq := n.cseq
+	contact, recordRoute := n.contact, n.recordRoute
 	n.mu.Unlock()
+	if contact == "" {
+		contact = notifierContact
+	}
 	contacts, _ := sub.Header.Contact()
 	branch, _ := n.s.ids.Branch()
 	if event == "" {
@@ -124,13 +131,16 @@ func (n *notifier) request(t *testing.T, state, body, event string) *sip.Request
 		{"To", sub.Header.Get("From")},
 		{"Call-ID", sub.Header.Get("Call-ID")},
 		{"CSeq", fmt.Sprintf("%d NOTIFY", cseq)},
-		{"Contact", notifierContact},
+		{"Contact", contact},
 		{"Event", event},
 		{"Subscription-State", state},
 	} {
 		if err := req.Header.Add(f[0], f[1]); err != nil {
 			t.Errorf("notifier: %v", err)
 		}
+	}
+	if recordRoute != "" {
+		req.Header.Add("Record-Route", recordRoute)
 	}
 	if body != "" {
 		req.Header.Add("Content-Type", "application/reginfo+xml")
@@ -236,8 +246,20 @@ func TestANotifyBeforeTheTwoHundredSetsUpTheSubscription(t *testing.T) {
 }
 
 func TestUnsubscribeSendsExpiresZeroInTheDialog(t *testing.T) {
-	s, n, _, sub := subscribed(t)
+	// The NOTIFY sets up the dialog (RFC 6665 §4.4.1, TS 24.229
+	// §5.1.1.3): the first one's Record-Route is the route set, not the
+	// 2xx's, and each one's Contact the remote target (§3.2, code review
+	// on #205).
+	s, n, ua, sub := subscribed(t)
 	first := s.nextMethod(t, "SUBSCRIBE").req
+	n.mu.Lock()
+	n.contact, n.recordRoute = "<sip:scscf2.example.com:5060;transport=tcp>", "<sip:pcscf-notify.example.com;lr>"
+	n.mu.Unlock()
+	n.notify(t, "active;expires=600000", "")
+	nextNotification(t, sub)
+	n.mu.Lock()
+	n.contact, n.recordRoute = "<sip:scscf3.example.com:5060;transport=tcp>", "<sip:elsewhere.example.com;lr>"
+	n.mu.Unlock()
 	n.notify(t, "active;expires=600000", "")
 	nextNotification(t, sub)
 	if res, err := sub.Unsubscribe(context.Background()); err != nil || res.StatusCode != 200 {
@@ -248,8 +270,13 @@ func TestUnsubscribeSendsExpiresZeroInTheDialog(t *testing.T) {
 	fc, _ := first.Header.CSeq()
 	uc, _ := un.Header.CSeq()
 	if un.Header.Get("Expires") != "0" || un.Header.Get("Event") != "reg" || to.Tag() != n.tag || uc.Seq != fc.Seq+1 ||
-		un.URI.String() != mustURI(t, "sip:scscf.example.com:5060;transport=tcp").String() || routeHosts(t, un) != "pcscf.example.com scscf.example.com" {
+		un.URI.String() != mustURI(t, "sip:scscf3.example.com:5060;transport=tcp").String() || routeHosts(t, un) != "pcscf-notify.example.com" {
 		t.Fatalf("unsubscribe %s Expires %q To tag %q CSeq %v Route %s", un.URI, un.Header.Get("Expires"), to.Tag(), uc, routeHosts(t, un))
+	}
+	// A target refresh request carries the UA's Contact (RFC 3261
+	// §12.2.1.1).
+	if cs, err := un.Header.Contact(); err != nil || len(cs) != 1 || cs[0].URI.Host != ua.contact.URI.Host {
+		t.Fatalf("unsubscribe Contact %q", un.Header.Get("Contact"))
 	}
 	n.notify(t, "terminated;reason=timeout", "")
 	select {
@@ -259,6 +286,66 @@ func TestUnsubscribeSendsExpiresZeroInTheDialog(t *testing.T) {
 	}
 	if _, err := sub.Unsubscribe(context.Background()); !errors.Is(err, ErrDialogEnded) {
 		t.Fatalf("Unsubscribe after the end = %v", err)
+	}
+}
+
+func TestUnsubscribeBeforeAnyNotifyGoesInTheDialogOfThe2xx(t *testing.T) {
+	s, _, _, sub := subscribed(t)
+	s.nextMethod(t, "SUBSCRIBE")
+	if res, err := sub.Unsubscribe(context.Background()); err != nil || res.StatusCode != 200 {
+		t.Fatalf("Unsubscribe = %v, %v", res, err)
+	}
+	un := s.nextMethod(t, "SUBSCRIBE").req
+	if un.URI.String() != mustURI(t, "sip:scscf.example.com:5060;transport=tcp").String() || routeHosts(t, un) != "pcscf.example.com scscf.example.com" {
+		t.Fatalf("unsubscribe %s Route %s, want the 2xx's", un.URI, routeHosts(t, un))
+	}
+}
+
+func TestAnUnsubscribeTheNotifierNoLongerKnowsEndsTheSubscription(t *testing.T) {
+	// RFC 6665 §4.1.2.2: a 481 to a SUBSCRIBE in the dialog means the
+	// subscription is gone (code review on #205).
+	s, n, _, sub := subscribed(t)
+	s.nextMethod(t, "SUBSCRIBE")
+	n.mu.Lock()
+	n.refuse = 481
+	n.mu.Unlock()
+	if res, err := sub.Unsubscribe(context.Background()); err != nil || res.StatusCode != 481 {
+		t.Fatalf("Unsubscribe = %v, %v", res, err)
+	}
+	select {
+	case <-sub.Done():
+	default:
+		t.Fatal("a 481 left the subscription up")
+	}
+	if _, err := sub.Unsubscribe(context.Background()); !errors.Is(err, ErrDialogEnded) {
+		t.Fatalf("Unsubscribe after the 481 = %v, want ErrDialogEnded", err)
+	}
+}
+
+func TestNotifyHeadersAreReadByTheirGrammar(t *testing.T) {
+	// Code review on #205: Event and Subscription-State are read with
+	// internal/sip's accessors.
+	s, n, _, sub := subscribed(t)
+	// EQUAL is SWS "=" SWS (RFC 3261 §25.1).
+	n.notify(t, "terminated;reason = deactivated", "")
+	if got := nextNotification(t, sub); got.State != "terminated" || got.Reason != "deactivated" {
+		t.Fatalf("notification %+v, want terminated, deactivated", got)
+	}
+
+	s, n, _, sub = subscribed(t)
+	missing := n.request(t, "active", "", "")
+	missing.Header.Del("Subscription-State")
+	if res := s.sendRequest(t, missing, n.flow); res.StatusCode != 400 {
+		t.Errorf("NOTIFY without Subscription-State answered %d, want 400", res.StatusCode)
+	}
+	// Another id is another event (RFC 6665 §8.2.1): this subscription
+	// has none.
+	if res := s.sendRequest(t, n.request(t, "active", "", "reg;id=7"), n.flow); res.StatusCode != 481 {
+		t.Errorf("NOTIFY for event id 7 answered %d, want 481", res.StatusCode)
+	}
+	n.notify(t, "active", "")
+	if got := nextNotification(t, sub); got.State != "active" {
+		t.Fatalf("the first notification delivered is %+v, want the valid NOTIFY's", got)
 	}
 }
 
@@ -325,9 +412,31 @@ func TestParseRegInfoReadsRFC3680sExample(t *testing.T) {
 	if r.Version != 1 || r.State != "partial" || !ok || c.ID != "76" || c.Event != "registered" || c.Expires != 3600 {
 		t.Fatalf("ParseRegInfo = %+v, contact %+v", r, c)
 	}
-	for _, bad := range []string{`<reginfo version="1" state="full"/>`, `<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="whole"/>`, `not xml`} {
+	// The notifier writes the URI back in its own parameter order and
+	// case (RFC 3261 §19.1.4).
+	if _, ok := r.Contact("sip:user@example.com", "SIP:user@PC887.example.com"); !ok {
+		t.Error("Contact did not find an equal URI written differently")
+	}
+	if _, ok := r.Contact("sip:user@example.com", "sip:other@pc887.example.com"); ok {
+		t.Error("Contact found another user's URI")
+	}
+	const root = `<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="full"/>`
+	for _, bad := range []string{
+		`<reginfo version="1" state="full"/>`,
+		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="whole"/>`,
+		`not xml`,
+		// No document type declaration, and nothing after the root
+		// (code review on #205; as ft's decode).
+		`<?xml version="1.0"?><!DOCTYPE reginfo [<!ELEMENT reginfo ANY>]>` + root,
+		root + `<trailing garbage`,
+		root + root,
+		root + `text`,
+	} {
 		if _, err := ParseRegInfo([]byte(bad)); err == nil {
 			t.Errorf("ParseRegInfo(%q) accepted it", bad)
 		}
+	}
+	if _, err := ParseRegInfo([]byte(root + "\n<!-- end -->\n")); err != nil {
+		t.Errorf("ParseRegInfo refused white space and a comment after the root: %v", err)
 	}
 }
