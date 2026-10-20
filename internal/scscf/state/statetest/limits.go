@@ -375,7 +375,7 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 	r.Incarnation = 42
 	must(a.SaveRegistration(ctx(t), r))(t)
 	for _, id := range r.Identities {
-		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: id.IMPU, Set: Set1, Incarnation: 42, Barred: id.Barred, KeepUntil: T0.Add(48 * time.Hour)}))(t)
+		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: id.IMPU, Set: Set1, Incarnation: 42, Barred: id.Barred, KeepUntil: T0.Add(48 * time.Hour)}, T0))(t)
 	}
 	for _, id := range r.Identities {
 		got := must(b.Identity(ctx(t), id.IMPU, T0))(t)
@@ -404,11 +404,11 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 		t.Errorf("RegistrationsOf lists %d, want the one set", len(regs))
 	}
 	tel := must(a.Identity(ctx(t), TEL1, T0))(t)
-	_, err := b.SaveIdentity(ctx(t), &state.Identity{IMPU: TEL1, Set: Set1, Incarnation: 42, KeepUntil: T0.Add(48 * time.Hour)})
+	_, err := b.SaveIdentity(ctx(t), &state.Identity{IMPU: TEL1, Set: Set1, Incarnation: 42, KeepUntil: T0.Add(48 * time.Hour)}, T0)
 	wantErr(t, err, state.ErrExists)
 	moved := *tel
 	moved.Set, moved.Incarnation = Set2, 7
-	must(b.SaveIdentity(ctx(t), &moved))(t)
+	must(b.SaveIdentity(ctx(t), &moved, T0))(t)
 	wantErr(t, a.DeleteIdentity(ctx(t), tel), state.ErrConflict)
 	if got := must(a.Identity(ctx(t), TEL1, T0))(t); got.Set != Set2 {
 		t.Errorf("a stale delete changed %+v", got)
@@ -426,7 +426,7 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 		{IMPU: TEL1, Set: Set1, KeepUntil: T0.Add(time.Hour)},
 		{IMPU: TEL1, Set: Set1, Incarnation: 1},
 	} {
-		_, err := a.SaveIdentity(ctx(t), bad)
+		_, err := a.SaveIdentity(ctx(t), bad, T0)
 		wantErr(t, err, state.ErrInvalid)
 	}
 	for _, impu := range []string{"", strings.Repeat("u", 3000), "set#" + IMPI1 + "#" + IMPU1, "profile#" + IMPI1 + "#" + IMPU1} {
@@ -454,7 +454,7 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 // its KeepUntil, which KeepIdentity only moves later.
 func testIdentityKeepUntil(t *testing.T, a, b state.Store, _ Options) {
 	i := &state.Identity{IMPU: IMPU1, Set: Set1, Incarnation: 1, KeepUntil: T0.Add(time.Hour + 500*time.Millisecond)}
-	must(a.SaveIdentity(ctx(t), i))(t)
+	must(a.SaveIdentity(ctx(t), i, T0))(t)
 	got := must(b.Identity(ctx(t), IMPU1, T0))(t)
 	if !got.KeepUntil.Equal(T0.Add(time.Hour)) {
 		t.Errorf("kept until %v, want it to the second", got.KeepUntil)
@@ -467,11 +467,50 @@ func testIdentityKeepUntil(t *testing.T, a, b state.Store, _ Options) {
 	if err := a.KeepIdentity(ctx(t), IMPU1, T0.Add(2*time.Hour), T0); err != nil {
 		t.Fatal(err)
 	}
-	if got := must(a.Identity(ctx(t), IMPU1, T0.Add(24*time.Hour)))(t); !got.KeepUntil.Equal(T0.Add(25*time.Hour)) || got.Version != must(a.Identity(ctx(t), IMPU1, T0))(t).Version {
+	if got := must(a.Identity(ctx(t), IMPU1, T0.Add(24*time.Hour)))(t); !got.KeepUntil.Equal(T0.Add(25 * time.Hour)) {
 		t.Errorf("after KeepIdentity: %+v", got)
 	}
 	wantErr(t, a.KeepIdentity(ctx(t), IMPU2, T0.Add(time.Hour), T0), state.ErrNotFound)
 	wantErr(t, a.KeepIdentity(ctx(t), IMPU1, T0.Add(50*time.Hour), T0.Add(25*time.Hour)), state.ErrNotFound)
+
+	// Past its KeepUntil the item may still be stored, as DynamoDB's TTL
+	// lags, but nobody can name it by its version: a create takes its place,
+	// at any second from KeepUntil on and not before.
+	other := state.Identity{IMPU: IMPU1, Set: Set2, Incarnation: 7, KeepUntil: T0.Add(72 * time.Hour)}
+	_, err = b.SaveIdentity(ctx(t), &other, T0.Add(25*time.Hour-time.Second))
+	wantErr(t, err, state.ErrExists)
+	saved := must(b.SaveIdentity(ctx(t), &other, T0.Add(25*time.Hour)))(t)
+	if got := must(a.Identity(ctx(t), IMPU1, T0.Add(25*time.Hour)))(t); got.Set != Set2 || got.Incarnation != 7 || got.Version != saved.Version {
+		t.Errorf("the identity created over an expired one: %+v", got)
+	}
+}
+
+// testIdentityKeepNeverUndone: a save from a read made before a KeepIdentity
+// would bring KeepUntil back; the KeepIdentity changed the version, so the
+// save gets ErrConflict, reads again and keeps the later KeepUntil.
+func testIdentityKeepNeverUndone(t *testing.T, a, b state.Store, _ Options) {
+	must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: TEL1, Set: Set1, Incarnation: 3, KeepUntil: T0.Add(30 * time.Hour)}, T0))(t)
+	read := must(a.Identity(ctx(t), TEL1, T0))(t)
+	if err := b.KeepIdentity(ctx(t), TEL1, T0.Add(200*time.Hour), T0); err != nil {
+		t.Fatal(err)
+	}
+	barred := *read
+	barred.Barred = true
+	_, err := a.SaveIdentity(ctx(t), &barred, T0)
+	wantErr(t, err, state.ErrConflict)
+	again := must(a.Identity(ctx(t), TEL1, T0))(t)
+	if !again.KeepUntil.Equal(T0.Add(200 * time.Hour)) {
+		t.Fatalf("kept until %v after the refused save, want the KeepIdentity's", again.KeepUntil)
+	}
+	// A KeepIdentity that moves nothing leaves the version, so the reader's
+	// save goes through.
+	if err := b.KeepIdentity(ctx(t), TEL1, T0.Add(100*time.Hour), T0); err != nil {
+		t.Fatal(err)
+	}
+	again.Barred = true
+	if got := must(a.SaveIdentity(ctx(t), again, T0))(t); !got.Barred || !got.KeepUntil.Equal(T0.Add(200*time.Hour)) {
+		t.Errorf("saved from the second read: %+v", got)
+	}
 }
 
 // testInterruptedDeregistration: a sweep's handler deletes the set's
@@ -483,7 +522,7 @@ func testInterruptedDeregistration(t *testing.T, a, b state.Store, o Options) {
 	r.Identities = append(r.Identities, state.SetIdentity{IMPU: TEL1})
 	must(a.SaveRegistration(ctx(t), r))(t)
 	for _, impu := range []string{IMPU1, TEL1} {
-		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: impu, Set: Set1, Incarnation: 1, KeepUntil: T0.Add(24 * time.Hour)}))(t)
+		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: impu, Set: Set1, Incarnation: 1, KeepUntil: T0.Add(24 * time.Hour)}, T0))(t)
 	}
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(a.ExpiringRegistrations(ctx(t), T0, 10))(t)) == 1
@@ -817,4 +856,84 @@ func testReassertSweep(t *testing.T, a, b state.Store, o Options) {
 	bad.ReassertAttempts = state.MaxReassertAttempts + 1
 	_, err := a.SaveRegistration(ctx(t), bad)
 	wantErr(t, err, state.ErrInvalid)
+}
+
+// testReviveTakesANewIncarnation: a record claimed for a deregistration that
+// a save brings back, with bindings or as an unregistered user's record, must
+// carry a new incarnation, or the deregistration would delete the identities
+// of the registration that took it over (#184 QA). Claiming it again keeps
+// the incarnation, as does any save of a record not claimed.
+func testReviveTakesANewIncarnation(t *testing.T, a, b state.Store, _ Options) {
+	live := must(a.SaveRegistration(ctx(t), Registration(IMPI1, IMPU1, time.Hour)))(t)
+	lease := live.Clone()
+	lease.Contacts, lease.Deregistering = nil, T0.Add(state.SweepLease)
+	leased := must(b.SaveRegistration(ctx(t), lease))(t)
+
+	back := leased.Clone()
+	back.Contacts, back.Deregistering = live.Contacts, time.Time{}
+	_, err := a.SaveRegistration(ctx(t), back)
+	wantErr(t, err, state.ErrInvalid)
+	unregistered := leased.Clone()
+	unregistered.Deregistering, unregistered.Unregistered = time.Time{}, T0.Add(time.Hour)
+	_, err = b.SaveRegistration(ctx(t), unregistered)
+	wantErr(t, err, state.ErrInvalid)
+	// A stale version is a conflict whatever it carries.
+	stale := back.Clone()
+	stale.Version = live.Version
+	_, err = a.SaveRegistration(ctx(t), stale)
+	wantErr(t, err, state.ErrConflict)
+
+	again := leased.Clone()
+	again.Deregistering = T0.Add(2 * state.SweepLease)
+	reclaimed := must(a.SaveRegistration(ctx(t), again))(t)
+	back.Version, back.Incarnation = reclaimed.Version, leased.Incarnation+1
+	revived := must(b.SaveRegistration(ctx(t), back))(t)
+	refreshed := revived.Clone()
+	refreshed.Contacts[0].Expires = T0.Add(2 * time.Hour)
+	must(a.SaveRegistration(ctx(t), refreshed))(t)
+	if got := must(b.Registration(ctx(t), Set1))(t); got.Incarnation != leased.Incarnation+1 || len(got.Contacts) != 1 {
+		t.Errorf("after the revival: %+v", got)
+	}
+}
+
+// testReassertGoesWithTheSet: a set whose Reassert is due and whose last
+// binding has expired too is claimed for its deregistration with Reassert
+// cleared, so that no handler tells the HSS a dead set is registered here.
+func testReassertGoesWithTheSet(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1, time.Minute)
+	r.Reassert, r.ReassertAttempts = T0.Add(time.Minute), 2
+	must(a.SaveRegistration(ctx(t), r))(t)
+	at := T0.Add(time.Minute)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), at, 10))(t)) == 1
+	})
+	handled := 0
+	if _, err := state.SweepRegistrations(ctx(t), b, at, 10, func(_, after *state.Registration) error {
+		handled++
+		if len(after.Contacts) != 0 || !after.Reassert.IsZero() || after.ReassertAttempts != 0 || after.ReassertDue(at) {
+			t.Errorf("claimed as %+v", after)
+		}
+		return errors.New("the HSS is out of reach")
+	}); err == nil || handled != 1 {
+		t.Fatalf("handled %d, %v", handled, err)
+	}
+	if got := must(a.Registration(ctx(t), Set1))(t); !got.Reassert.IsZero() || got.ReassertDue(at.Add(state.SweepLease)) {
+		t.Errorf("stored as %+v", got)
+	}
+}
+
+// testRefusedSaveKeepsAGoneProfileGone: a save refused for a later profile
+// raises KeepUntil only of a profile still there at the save's Received, as
+// KeepProfile would; one already gone stays gone.
+func testRefusedSaveKeepsAGoneProfileGone(t *testing.T, a, b state.Store, _ Options) {
+	p := Profile(Set1, []byte("<IMSSubscription>later</IMSSubscription>"), T0.Add(2*time.Hour))
+	p.KeepUntil = T0.Add(time.Hour)
+	if err := a.SaveProfile(ctx(t), p); err != nil {
+		t.Fatal(err)
+	}
+	late := Profile(Set1, []byte("<IMSSubscription>earlier</IMSSubscription>"), T0.Add(90*time.Minute))
+	late.KeepUntil = T0.Add(50 * time.Hour)
+	wantErr(t, b.SaveProfile(ctx(t), late), state.ErrConflict)
+	_, err := a.Profile(ctx(t), Set1, T0.Add(3*time.Hour))
+	wantErr(t, err, state.ErrNotFound)
 }

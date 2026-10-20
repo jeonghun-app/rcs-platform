@@ -19,6 +19,9 @@
 //	expires  number   SweepAt in Unix seconds: the earliest contact expiry, or
 //	                  without contacts the end of the deregistration lease, or
 //	                  else the end of an unregistered user's state
+//	leased   number   the incarnation, only while claimed for a
+//	                  deregistration: a save that brings the record back is
+//	                  conditional on carrying another
 //
 // An identity, pk = the canonical IMPU, holds version, writer, a doc naming
 // its set and the set's incarnation, and ttl (number, Unix seconds), the
