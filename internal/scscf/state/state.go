@@ -329,8 +329,11 @@ func (r *Registration) Validate() error {
 	if len(r.Contacts) > MaxContacts {
 		return fmt.Errorf("%w: more than %d contacts", ErrInvalid, MaxContacts)
 	}
-	if !r.Deregistering.IsZero() && !validTime(r.Deregistering) {
-		return fmt.Errorf("%w: Deregistering out of range", ErrInvalid)
+	if !r.Deregistering.IsZero() && (!validTime(r.Deregistering) || len(r.Contacts) > 0) {
+		// A record claimed for a deregistration has no bindings: one saved
+		// with them would be brought back under the claimed incarnation
+		// without counting as a revival (Incarnation).
+		return fmt.Errorf("%w: a record claimed for a deregistration has contacts, or Deregistering is out of range", ErrInvalid)
 	}
 	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
 		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)

@@ -877,6 +877,12 @@ func testReviveTakesANewIncarnation(t *testing.T, a, b state.Store, _ Options) {
 	unregistered.Deregistering, unregistered.Unregistered = time.Time{}, T0.Add(time.Hour)
 	_, err = b.SaveRegistration(ctx(t), unregistered)
 	wantErr(t, err, state.ErrInvalid)
+	// Nor can a binding come back with the lease kept, which would revive
+	// the record without its Deregistering going.
+	bound := leased.Clone()
+	bound.Contacts = live.Contacts
+	_, err = a.SaveRegistration(ctx(t), bound)
+	wantErr(t, err, state.ErrInvalid)
 	// A stale version is a conflict whatever it carries.
 	stale := back.Clone()
 	stale.Version = live.Version
