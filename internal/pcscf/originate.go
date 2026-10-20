@@ -88,9 +88,10 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 // registration.
 //
 // Without an alternative identity, a SIP identity is joined by a tel URI of
-// the same registration: the one of the same number for a user=phone SIP
-// URI, or none if the registration has no such one, so no other number is
-// asserted beside it; the first one otherwise. RFC 3325 §9.1 allows one SIP
+// the same registration: for one whose user part is a "+" number, with
+// user=phone or not, the tel URI of the same number, or none if the
+// registration has no such one, so no other number is asserted beside it;
+// the first one otherwise. RFC 3325 §9.1 allows one SIP
 // or SIPS and one tel URI, so an alternative of the identity's own kind is
 // not used. The values asserted are the registration's, without parameters
 // other than user; the P-Associated-URI lists no barred identity (TS 24.229
@@ -133,7 +134,7 @@ func assertedIdentity(regs []*registration, req *sip.Request) (*registration, []
 	}
 	if len(ids) == 1 && ids[0].IsSIP() {
 		tel := func(a sip.Address) bool { return a.URI.Scheme == "tel" }
-		if number, ok := phoneNumber(ids[0]); ok {
+		if number, ok := sipNumber(ids[0]); ok {
 			key := identityKey(sip.URI{Scheme: "tel", User: number})
 			tel = func(a sip.Address) bool { return identityKey(a.URI) == key }
 		}
@@ -178,6 +179,19 @@ func phoneNumber(u sip.URI) (string, bool) {
 		return "", false
 	}
 	if v, ok := u.Params.Get("user"); !ok || !strings.EqualFold(v, "phone") {
+		return "", false
+	}
+	number, _, _ := strings.Cut(unescape(u.User), ";")
+	if !strings.HasPrefix(number, "+") {
+		return "", false
+	}
+	return withoutSeparators(number), true
+}
+
+// sipNumber is the global number of a SIP URI whose user part starts with
+// "+", user=phone or not, as phoneNumber writes it.
+func sipNumber(u sip.URI) (string, bool) {
+	if !u.IsSIP() {
 		return "", false
 	}
 	number, _, _ := strings.Cut(unescape(u.User), ";")

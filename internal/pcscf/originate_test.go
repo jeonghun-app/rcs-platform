@@ -138,6 +138,8 @@ func TestTheAssertedIdentityIsAPreferredOneTheFlowRegistered(t *testing.T) {
 		associated: addrs(t, aliceIMPUPhone, aliceTel, daveIMPUPhone, daveTel)}
 	// frank's number has no tel URI of its own.
 	frank := &registration{uri: mustURI(t, aliceIMPU), seq: 7, associated: addrs(t, daveIMPUPhone, aliceTel)}
+	// grace has two numbers, as SIP URIs without user=phone and as tel URIs.
+	grace := &registration{uri: mustURI(t, aliceIMPU), seq: 8, associated: addrs(t, aliceIMPU, aliceTel, bobIMPU, "tel:+15550100002")}
 	// erin has a second number as a tel URI only.
 	erin := &registration{uri: mustURI(t, aliceIMPU), seq: 6, associated: addrs(t, aliceIMPU, aliceTel, daveTel)}
 	regs := []*registration{alice, bob, carol}
@@ -161,6 +163,8 @@ func TestTheAssertedIdentityIsAPreferredOneTheFlowRegistered(t *testing.T) {
 		{"the first listed", regs, []string{"<sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>", "<" + bobIMPU + ">", "<" + aliceTel + ">"}, bob, []string{"<" + bobIMPU + ">"}},
 		{"an alternative of the chosen registration", []*registration{dave}, []string{"<" + daveIMPUPhone + ">", "<" + aliceTel + ">"}, dave, []string{"<" + daveIMPUPhone + ">", "<" + aliceTel + ">"}},
 		{"a number without its tel URI", []*registration{frank}, nil, frank, []string{"<" + daveIMPUPhone + ">"}},
+		// A "+" number without user=phone is still a number (QA of #208).
+		{"a number without user=phone", []*registration{grace}, []string{"<" + bobIMPU + ">"}, grace, []string{"<" + bobIMPU + ">", "<tel:+15550100002>"}},
 		{"an alternative of the same kind", regs, []string{"<" + bobIMPU + ">", "<" + aliceIMPU + ">"}, bob, []string{"<" + bobIMPU + ">"}},
 		{"the same one twice", regs, []string{"<" + aliceTel + ">", "<" + aliceTel + ">"}, alice, []string{"<" + aliceTel + ">"}},
 		// A number written as a SIP URI matches its tel URI (§5.2.6.3.1).
