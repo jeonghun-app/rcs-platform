@@ -603,14 +603,18 @@ func TestTheCountsOfBindingsCreatedGo(t *testing.T) {
 
 // A message whose body has two Content-Type fields cannot be read in one
 // way only, so it is refused as an offer pcscf cannot read, inside a dialog
-// too, and an answer with two reaches the client without its body.
+// and from the core too, and an answer or a late offer with two reaches
+// the client without its body. text/plain comes first, as the field a
+// reader of the first alone would take.
 func TestTwoContentTypesAreRefused(t *testing.T) {
-	two := func(first, second string) string {
-		return "Content-Type: " + first + "\r\nContent-Type: " + second
+	twoTypes := func(h *sip.Header) {
+		h.Del("Content-Type")
+		_ = h.Add("Content-Type", "text/plain")
+		_ = h.Add("Content-Type", "application/sdp")
 	}
 	for _, order := range [][2]string{{"text/plain", "application/sdp"}, {"application/sdp", "text/plain"}} {
 		a := newAnchoring(t, 16, 100)
-		text := strings.Replace(inviteWith("chat-1", "application/sdp", clientChatOffer), "Content-Type: application/sdp", two(order[0], order[1]), 1)
+		text := strings.Replace(inviteWith("chat-1", "application/sdp", clientChatOffer), "Content-Type: application/sdp", "Content-Type: "+order[0]+"\r\nContent-Type: "+order[1], 1)
 		if d := a.p.Route(context.Background(), clientRequest(t, text, "FLOW-A")); d.Status != 488 || len(a.relay.log()) != 0 {
 			t.Errorf("INVITE %v: %+v, relay %q", order, d, a.relay.log())
 		}
@@ -618,14 +622,31 @@ func TestTwoContentTypesAreRefused(t *testing.T) {
 	a := newAnchoring(t, 16, 100)
 	c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
 	update := inCall(t, c, "UPDATE", "b1", 2, clientChatOffer)
-	_ = update.Message.Header.Add("Content-Type", "text/plain")
+	twoTypes(&update.Message.Header)
 	if d := a.p.Route(context.Background(), update); d.Status != 488 {
 		t.Errorf("UPDATE: %+v", d)
 	}
+	core := fromCore(t, "INVITE", false, []string{pathEntry})
+	core.Message.Body = []byte(clientChatOffer)
+	twoTypes(&core.Message.Header)
+	if d := a.p.Route(context.Background(), core); d.Status != 488 {
+		t.Errorf("an INVITE from the core: %+v", d)
+	}
 	res := answered(t, c.req, 200, "b1", rcsAsAnswer)
-	_ = res.Header.Add("Content-Type", "text/plain")
+	twoTypes(&res.Header)
 	ok := c.respond(res)
 	if len(ok.Body) != 0 || a.relay.count(http.MethodPatch) != 0 {
 		t.Errorf("an answer with two Content-Types:\n%s", ok.Body)
 	}
+
+	a = newAnchoring(t, 16, 100)
+	late := a.invite(t, "chat-2", "", "")
+	res = answered(t, late.req, 200, "b1", strings.Replace(rcsAsAnswer, "a=setup:passive", "a=setup:actpass", 1))
+	twoTypes(&res.Header)
+	ok = late.respond(res)
+	if len(ok.Body) != 0 {
+		t.Errorf("a late offer with two Content-Types:\n%s", ok.Body)
+	}
+	a.p.Route(context.Background(), ackFor(t, late, ok))
+	checkEnd(t, a, "b1", reasonLateOffer)
 }
