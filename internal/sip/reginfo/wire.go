@@ -1,8 +1,10 @@
 package reginfo
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -58,6 +60,22 @@ func required(attrs []xml.Attr, element, name string) (string, error) {
 	return v, nil
 }
 
+// collapse trims what XML Schema's white space collapse removes at the
+// ends of a value: space, tab, CR and LF, never other Unicode spaces (XML
+// Schema Part 2 §4.3.6).
+func collapse(v string) string { return strings.Trim(v, " \t\r\n") }
+
+// parseUnsigned reads an xs:unsignedLong or xs:unsignedInt of bits bits,
+// whose lexical space allows a leading "+" (XML Schema Part 2 §3.3.13).
+func parseUnsigned(v string, bits int) (uint64, error) {
+	v = collapse(v)
+	// ParseUint itself takes no sign, so "++5" and "+-5" still fail.
+	if rest, ok := strings.CutPrefix(v, "+"); ok {
+		v = rest
+	}
+	return strconv.ParseUint(v, 10, bits)
+}
+
 // unsignedLong reads an xs:unsignedLong attribute, if present. Its white
 // space collapses (XML Schema Part 2 §3.3.21), so it is trimmed.
 func unsignedLong(attrs []xml.Attr, name string) (*uint64, error) {
@@ -65,7 +83,7 @@ func unsignedLong(attrs []xml.Attr, name string) (*uint64, error) {
 	if !ok {
 		return nil, nil
 	}
-	n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+	n, err := parseUnsigned(v, 64)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s is not an unsigned long", ErrMalformed, name)
 	}
@@ -77,7 +95,7 @@ func (w *wireInfo) info() (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	version, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+	version, err := parseUnsigned(v, 32)
 	if err != nil {
 		return nil, fmt.Errorf("%w: version is not a 32-bit unsigned integer", ErrMalformed)
 	}
@@ -105,7 +123,7 @@ func (w *wireRegistration) registration() (Registration, error) {
 		return Registration{}, err
 	}
 	// xs:anyURI collapses white space.
-	reg.AOR = strings.TrimSpace(reg.AOR)
+	reg.AOR = collapse(reg.AOR)
 	if reg.ID, err = required(w.Attrs, "registration", "id"); err != nil {
 		return Registration{}, err
 	}
@@ -152,7 +170,7 @@ func (w *wireContact) contact() (Contact, error) {
 	if len(w.URI) != 1 {
 		return Contact{}, fmt.Errorf("%w: contact without exactly one uri", ErrMalformed)
 	}
-	c.URI = strings.TrimSpace(w.URI[0])
+	c.URI = collapse(w.URI[0])
 	switch len(w.DisplayName) {
 	case 0:
 	case 1:
@@ -173,4 +191,57 @@ func (w *wireContact) contact() (Contact, error) {
 		c.Params = append(c.Params, Param{Name: name, Value: p.Text})
 	}
 	return c, nil
+}
+
+// parents says where each RFC 3680 element may stand (§5.4): under which
+// element of the namespace. The root has none.
+var parents = map[string]string{
+	"reginfo":       "",
+	"registration":  "reginfo",
+	"contact":       "registration",
+	"uri":           "contact",
+	"display-name":  "contact",
+	"unknown-param": "contact",
+}
+
+// checkElements refuses what the decoder would let pass silently: an
+// element of the reginfo namespace where the schema has none, such as a
+// contact straight under reginfo, or one it does not define, which
+// encoding/xml would drop (§5.1 lets only other namespaces extend a
+// document), and an XML declaration anywhere but at the start (XML 1.0
+// §2.8). Elements inside an extension element are the extension's.
+func checkElements(data []byte) error {
+	d := xml.NewDecoder(bytes.NewReader(withoutBOM(data)))
+	var stack []xml.Name
+	for first := true; ; first = false {
+		tok, err := d.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return decodeError(err)
+		}
+		switch t := tok.(type) {
+		case xml.ProcInst:
+			if strings.EqualFold(t.Target, "xml") && !first {
+				return fmt.Errorf("%w: XML declaration after the start", ErrMalformed)
+			}
+		case xml.StartElement:
+			if t.Name.Space == Namespace {
+				parent := ""
+				if len(stack) > 0 {
+					parent = stack[len(stack)-1].Local
+					if stack[len(stack)-1].Space != Namespace {
+						parent = "\x00" // inside an extension: not ours to check
+					}
+				}
+				if want, ok := parents[t.Name.Local]; parent != "\x00" && (!ok || want != parent) {
+					return fmt.Errorf("%w: element out of place", ErrMalformed)
+				}
+			}
+			stack = append(stack, t.Name)
+		case xml.EndElement:
+			stack = stack[:len(stack)-1]
+		}
+	}
 }
