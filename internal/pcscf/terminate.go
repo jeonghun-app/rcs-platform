@@ -21,12 +21,13 @@ import (
 // 430 Flow Failed, which scscf takes as a sign to try the client's other
 // flows (RFC 5626 §5.3), and so is one whose flow fails while it is sent.
 //
-// A request outside a dialog gets pcscf's two Record-Route values, the
-// client-facing one on top, so that the dialog's requests come back through
-// this task on both sides; the core-facing one keeps the Path's ob and the
-// request's icid (§5.2.6.4.4 3)), and binds the flow to the dialog. A
-// request inside a dialog must name the flow by that value, written for
-// its Call-ID, or it is 430 like one naming no flow. P-Asserted-Identity is removed when the
+// A request outside a dialog that sets up one gets pcscf's two Record-Route
+// values, the client-facing one on top, so that the dialog's requests come
+// back through this task on both sides; a standalone one, such as MESSAGE,
+// gets none. The core-facing one keeps the Path's ob and the request's icid
+// (§5.2.6.4.4 3)), and binds the flow to the dialog. A request inside a
+// dialog must name the flow by that value, written for its Call-ID, or it
+// is 430 like one naming no flow. P-Asserted-Identity is removed when the
 // request asks for privacy of the identity (RFC 3323 §4.2, RFC 3325 §9.3).
 // The request reaches the client without the network's charging data. The
 // client's responses carry the request's charging identifiers and this
@@ -77,7 +78,7 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		// scscf, the authoritative proxy, needs the 430 (RFC 5626 §11.5).
 		OnFinal: func(context.Context, *sip.Response) {},
 	}
-	if initial {
+	if initial && dialogForming(r.Message.Method) {
 		rr := p.recordRoute(flow, entry.Params.Has("ob"), icidOfVector(charging), r.Message.Header.Get("Call-ID"))
 		d.RecordRoute = []sip.Address{rr[1], rr[0]}
 	}

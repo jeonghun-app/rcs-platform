@@ -31,8 +31,9 @@ const (
 // registration of times out and registers again (§5.2.6.3.2A). pcscf asserts
 // an identity the registration allows, sends the request along the
 // Service-Route the registration received in place of whatever Route the
-// client wrote, and records two Record-Route values, so that the dialog's
-// requests come back through it on either side (RFC 5658).
+// client wrote, and, for a request that sets up a dialog, records two
+// Record-Route values, so that the dialog's requests come back through it
+// on either side (RFC 5658).
 func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	src := r.Source
 	if !p.initials.allow(clientKey(src.Addr)) {
@@ -56,9 +57,13 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 500}
 	}
 	routes := slices.Clone(reg.serviceRoute)
+	var rr []sip.Address
+	if dialogForming(r.Message.Method) {
+		rr = p.recordRoute(src.Flow, contactHasOb(r.Message), icid, r.Message.Header.Get("Call-ID"))
+	}
 	return proxy.Decision{
 		Targets:     []proxy.Target{{URI: r.Message.URI}},
-		RecordRoute: p.recordRoute(src.Flow, contactHasOb(r.Message), icid, r.Message.Header.Get("Call-ID")),
+		RecordRoute: rr,
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 			// The Service-Route replaces the Route (§5.2.6.3.3): what the
 			// client wrote below pcscf's own entry is not where it
@@ -78,6 +83,18 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 		},
 	}
+}
+
+// dialogForming reports whether a request of method sets up a dialog, and so
+// gets pcscf's Record-Route values: a standalone request such as MESSAGE or
+// OPTIONS does not (TS 24.229 §5.2.6.3.7), which keeps the flow token off
+// capability discovery and pager messages.
+func dialogForming(method string) bool {
+	switch method {
+	case "INVITE", "SUBSCRIBE", "REFER":
+		return true
+	}
+	return false
 }
 
 // assertedIdentity chooses the registration a request is sent under and the

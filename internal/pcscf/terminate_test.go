@@ -319,3 +319,14 @@ func TestPrivacyIDHidesTheAssertedIdentityOfAResponse(t *testing.T) {
 		}
 	}
 }
+
+// Only a request from the core that sets up a dialog is recorded: a
+// standalone MESSAGE or OPTIONS carries no flow token to the client.
+func TestOnlyATerminatingRequestThatSetsUpADialogIsRecorded(t *testing.T) {
+	p := newTerminatingPcscf(t, "FLOW-A")
+	for method, recorded := range map[string]bool{"MESSAGE": false, "OPTIONS": false, "INVITE": true, "SUBSCRIBE": true, "REFER": true} {
+		if d := p.Route(context.Background(), fromCore(t, method, false, []string{pathEntry})); (d.RecordRoute != nil) != recorded || len(d.Targets) != 1 {
+			t.Errorf("%s: %+v", method, d)
+		}
+	}
+}
