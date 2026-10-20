@@ -68,7 +68,8 @@ type Config struct {
 
 	TransactionTimeout time.Duration
 	// KeepAliveInterval is the idle time after which a session sends a
-	// bodiless SEND. Negative disables keep-alives.
+	// bodiless SEND; a session Open binds counts it from the answer to its
+	// binding SEND. Negative disables keep-alives.
 	KeepAliveInterval time.Duration
 	UnboundTimeout    time.Duration
 	// WriteTimeout is how long one message may take to write. A peer that
@@ -407,6 +408,9 @@ func (c *Conn) Open(ctx context.Context, s *Session) error {
 			s.closeWith(err)
 			return err
 		}
+		// Armed now, the first keep-alive is a whole interval after the
+		// answer.
+		s.armKeepAlive(c, c.cfg.KeepAliveInterval)
 		return nil
 	case <-ctx.Done():
 		s.closeWith(ctx.Err())

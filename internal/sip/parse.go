@@ -121,6 +121,12 @@ type Reader struct {
 	// §3.5.1). It runs on the reading goroutine and must not block. A lone CRLF,
 	// such as a pong, is skipped without a call.
 	OnKeepAlive func()
+	// OnCRLF, if set, is called for every CRLF read between messages, before
+	// OnKeepAlive for the second of a pair. The end of a connection that sends
+	// the pings uses it to see each pong as it arrives: a lone CRLF cannot be
+	// told from half of a ping until more bytes come, and none may (RFC 5626
+	// §4.4.1). It runs on the reading goroutine and must not block.
+	OnCRLF func()
 }
 
 // NewReader returns a Reader that reads messages from r within lim.
@@ -168,6 +174,9 @@ func (r *Reader) skipKeepAlives() error {
 		p, err := r.r.Peek(2)
 		if len(p) == 2 && p[0] == '\r' && p[1] == '\n' {
 			r.r.Discard(2) // cannot fail: Peek buffered both bytes
+			if r.OnCRLF != nil {
+				r.OnCRLF()
+			}
 			if crlfs++; crlfs == 2 {
 				crlfs = 0
 				if r.OnKeepAlive != nil {

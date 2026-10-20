@@ -25,6 +25,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // Config is what the scenarios run against.
@@ -48,6 +49,10 @@ type Config struct {
 	MSRP msrp.Config
 	// TLS configures the client's connection to an msrps relay path.
 	TLS *tls.Config
+	// UploadSettle is how long ft-resume asks get_upload_info again for a
+	// broken upload to show (ft.Client.SettledUploadInfo); zero is 3 s.
+	UploadSettle time.Duration
+
 	// IdleWait is how long the chat scenarios stay quiet to see keep-alives
 	// go out (it should exceed MSRP.KeepAliveInterval); zero skips the step.
 	IdleWait time.Duration
@@ -55,8 +60,18 @@ type Config struct {
 	// Self is the simulated client and Peer the far end of its chats.
 	Self, Peer cpim.Address
 
+	// SIP configures the SIP client the scenarios of #135 register with;
+	// none uses it yet, as they need pcscf and scscf.
+	SIP *sipua.Config
+
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
+	// KeepAliveTimeout bounds the keep-alive step alone, the IdleWait
+	// included, so it must be longer than IdleWait; zero is StepTimeout. A
+	// short one makes a client that sends no keep-alive fail soon without
+	// holding every other step, a 100 KiB chunked message say, to the same
+	// bound (#178).
+	KeepAliveTimeout time.Duration
 	// Rand supplies ids and content; crypto/rand when nil.
 	Rand io.Reader
 }
@@ -143,7 +158,12 @@ var errStepFailed = errors.New("step failed")
 // step runs f as the step called name and reports it. A failure ends the
 // scenario: the error returned is errStepFailed.
 func (r *run) step(name string, f func(ctx context.Context) (map[string]int64, error)) error {
-	ctx, cancel := context.WithTimeout(r.ctx, r.cfg.StepTimeout)
+	return r.stepWithin(name, r.cfg.StepTimeout, f)
+}
+
+// stepWithin is step with its own timeout.
+func (r *run) stepWithin(name string, timeout time.Duration, f func(ctx context.Context) (map[string]int64, error)) error {
+	ctx, cancel := context.WithTimeout(r.ctx, timeout)
 	defer cancel()
 	start := time.Now()
 	detail, err := f(ctx)
