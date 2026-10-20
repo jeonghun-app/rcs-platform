@@ -72,6 +72,17 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			// client wrote below pcscf's own entry is not where it
 			// registered.
 			req.Header.Del("Route")
+			// A client records no route: only pcscf's values, which the
+			// proxy put on top, go on, so that the route set of the
+			// dialog's core side is what pcscf and the core recorded, and
+			// a request pcscf sends in it goes nowhere the client chose
+			// (#248 security review).
+			req.Header.Del("Record-Route")
+			for _, a := range rr {
+				if err := req.Header.Add("Record-Route", a.String()); err != nil {
+					return err
+				}
+			}
 			for _, a := range routes {
 				if err := req.Header.Add("Route", a.String()); err != nil {
 					return err

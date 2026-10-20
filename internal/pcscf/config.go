@@ -67,6 +67,10 @@ const (
 	// and a few file transfers at once fit a flow's share.
 	DefaultMaxBindingsPerFlow = 16
 	DefaultMaxBindings        = 20_000
+	// DefaultBindingsPerMinute bounds the bindings one client flow creates
+	// in a minute, whatever it holds (#248 security review): a chat or a
+	// file transfer every two seconds is far past what a person does.
+	DefaultBindingsPerMinute = 32
 	// DefaultRelayTimeout bounds one call to msrp-relay's control API.
 	DefaultRelayTimeout = 2 * time.Second
 	// minRelayTokenLength is the shortest relay token accepted in staging
@@ -158,8 +162,9 @@ type Config struct {
 	RelayToken   relayToken
 	RelayTimeout time.Duration
 	// MaxBindingsPerFlow and MaxBindings bound the relay bindings of one
-	// flow and of the task.
-	MaxBindingsPerFlow, MaxBindings int
+	// flow and of the task, and BindingsPerMinute those one flow creates
+	// in a minute.
+	MaxBindingsPerFlow, MaxBindings, BindingsPerMinute int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -203,6 +208,7 @@ func Configure(s *runtime.Settings) Config {
 	c.RelayTimeout = e.Duration("RELAY_TIMEOUT", DefaultRelayTimeout)
 	c.MaxBindingsPerFlow = e.Int("MAX_BINDINGS_PER_FLOW", DefaultMaxBindingsPerFlow)
 	c.MaxBindings = e.Int("MAX_BINDINGS", DefaultMaxBindings)
+	c.BindingsPerMinute = e.Int("BINDINGS_PER_MINUTE", DefaultBindingsPerMinute)
 	if c.RelayTimeout <= 0 {
 		e.Invalid("RELAY_TIMEOUT", "must be greater than zero")
 	}
@@ -269,6 +275,7 @@ func Configure(s *runtime.Settings) Config {
 		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
 		{"MAX_BINDINGS_PER_FLOW", c.MaxBindingsPerFlow}, {"MAX_BINDINGS", c.MaxBindings},
+		{"BINDINGS_PER_MINUTE", c.BindingsPerMinute},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")

@@ -75,8 +75,9 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	// MSRP sessions rcs-as sets up are anchored by #136's second change;
-	// until then their offers are refused, never passed on unanchored.
-	if initial && p.msrp != nil && offersMSRP(r.Message) || !initial && !p.msrpInDialog(flow, r.Message, false) {
+	// until then their offers are refused, never passed on unanchored, and
+	// so is an INVITE without an offer, whose 2xx would carry the client's.
+	if initial && p.msrp != nil && (offersMSRP(r.Message) || offerless(r.Message)) || !initial && !p.msrpInDialog(flow, r.Message, false) {
 		return p.refuseOffer()
 	}
 	fallback := ""

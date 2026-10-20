@@ -94,7 +94,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
 		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
 		RelayURL: &url.URL{Scheme: "http", Host: "msrp-relay.rcs.internal:8082"}, RelayTimeout: DefaultRelayTimeout,
-		MaxBindingsPerFlow: DefaultMaxBindingsPerFlow, MaxBindings: DefaultMaxBindings,
+		MaxBindingsPerFlow: DefaultMaxBindingsPerFlow, MaxBindings: DefaultMaxBindings, BindingsPerMinute: 32,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -255,6 +255,7 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_RELAY_TIMEOUT", "0s"}, "PCSCF_RELAY_TIMEOUT: must be greater than zero"},
 		{[]string{"PCSCF_MAX_BINDINGS_PER_FLOW", "0"}, "PCSCF_MAX_BINDINGS_PER_FLOW: must be positive"},
 		{[]string{"PCSCF_MAX_BINDINGS", "-1"}, "PCSCF_MAX_BINDINGS: must be positive"},
+		{[]string{"PCSCF_BINDINGS_PER_MINUTE", "0"}, "PCSCF_BINDINGS_PER_MINUTE: must be positive"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			_, err := configure(with(devEnv, tt.kv...))

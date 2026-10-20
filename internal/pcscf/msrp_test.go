@@ -91,6 +91,7 @@ type anchoring struct {
 	p     *pcscf
 	clock *testClock
 	relay *scriptedRelay
+	base  *url.URL
 	sent  *fakeSender
 	alive map[transport.FlowID]bool
 }
@@ -103,8 +104,8 @@ func newAnchoring(t *testing.T, perFlow, total int) *anchoring {
 	srv := httptest.NewServer(relay)
 	t.Cleanup(srv.Close)
 	base, _ := url.Parse(srv.URL)
-	a := &anchoring{p: p, clock: clock, relay: relay, sent: &fakeSender{}, alive: map[transport.FlowID]bool{"FLOW-A": true}}
-	p.msrp = newMSRPAnchor(context.Background(), newRelayClient(base, testRelayToken, time.Second, nil), newBindingLimit(perFlow, total))
+	a := &anchoring{p: p, clock: clock, relay: relay, base: base, sent: &fakeSender{}, alive: map[transport.FlowID]bool{"FLOW-A": true}}
+	p.msrp = newMSRPAnchor(context.Background(), newRelayClient(base, testRelayToken, time.Second, nil), newBindingLimit(perFlow, total, DefaultBindingsPerMinute, clock.now))
 	p.send = a.sent.send
 	var mu sync.Mutex
 	p.clientFlow = func(id transport.FlowID) bool { mu.Lock(); defer mu.Unlock(); return a.alive[id] }
@@ -302,37 +303,66 @@ func TestAnOfferPcscfWillNotAnchorIsRefused(t *testing.T) {
 	}
 }
 
-// Past the flow's or the task's binding limit, or when the relay fails,
-// the INVITE is answered 503 with Retry-After: 1 and holds nothing: a
-// binding already made for it is released (#136 decisions 4 and 5).
+// Past the flow's or the task's binding limit, past the bindings a flow
+// may create in a minute, or when the relay fails, the INVITE is answered
+// 503 with Retry-After and holds nothing: a binding already made for it is
+// released (#136 decisions 4 and 5). A path the relay refuses, which
+// waiting will not change, is 488.
 func TestAnUnanchoredOfferIs503(t *testing.T) {
 	twoLines := clientChatOffer + lines("m=message 9 TCP/TLS/MSRP *", "a=setup:active", "a=path:msrps://192.0.2.10:9/second;tcp")
 	for _, tt := range []struct {
-		name           string
-		perFlow, total int
-		fail           func(method string, n int) int
-		deletes        int
+		name       string
+		setup      func(a *anchoring)
+		fail       func(method string, n int) int
+		status     int
+		retryAfter string
+		deletes    int
 	}{
-		{"past the flow's limit", 1, 100, nil, 0},
-		{"past the task's limit", 16, 1, nil, 0},
-		{"the relay refusing", 16, 100, func(m string, _ int) int {
+		{"past the flow's limit", func(a *anchoring) {
+			a.p.msrp.limit = newBindingLimit(2, 100, 32, a.clock.now)
+			_, _ = a.p.msrp.limit.take("FLOW-A", 1)
+		}, nil, 503, "1", 0},
+		{"past the task's limit", func(a *anchoring) {
+			a.p.msrp.limit = newBindingLimit(16, 2, 32, a.clock.now)
+			_, _ = a.p.msrp.limit.take("FLOW-B", 1)
+		}, nil, 503, "1", 0},
+		// Two a minute: the one taken comes back in 30 s.
+		{"past the flow's rate", func(a *anchoring) {
+			a.p.msrp.limit = newBindingLimit(16, 100, 2, a.clock.now)
+			_, _ = a.p.msrp.limit.take("FLOW-A", 1)
+			a.p.msrp.limit.give("FLOW-A", 1)
+		}, nil, 503, "30", 0},
+		{"the relay refusing", nil, func(m string, _ int) int {
 			if m == http.MethodPost {
 				return 503
 			}
 			return 0
-		}, 0},
-		{"the relay failing the second", 16, 100, func(m string, n int) int {
+		}, 503, "1", 0},
+		{"the relay failing the second", nil, func(m string, n int) int {
 			if m == http.MethodPost && n == 2 {
 				return 500
 			}
 			return 0
-		}, 1},
+		}, 503, "1", 1},
+		{"the relay refusing the path", nil, func(m string, n int) int {
+			if m == http.MethodPost && n == 2 {
+				return 400
+			}
+			return 0
+		}, 488, "", 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			a := newAnchoring(t, tt.perFlow, tt.total)
+			a := newAnchoring(t, 16, 100)
+			if tt.setup != nil {
+				tt.setup(a)
+			}
+			held := a.p.msrp.limit.held()
 			a.relay.fail = tt.fail
 			r := clientRequest(t, inviteWith("chat-1", "application/sdp", twoLines), "FLOW-A")
 			d := a.p.Route(context.Background(), r)
+			if len(d.Targets) != 1 {
+				t.Fatalf("not forwarded: %+v", d)
+			}
 			req := r.Message.Clone()
 			if err := d.Prepare(context.Background(), d.Targets[0], req); err == nil {
 				t.Fatal("Prepare anchored it")
@@ -341,10 +371,10 @@ func TestAnUnanchoredOfferIs503(t *testing.T) {
 			d.OnFinal(context.Background(), res)
 			d.OnResponse(context.Background(), res)
 			a.settle()
-			if res.StatusCode != 503 || res.Header.Get("Retry-After") != "1" {
+			if res.StatusCode != tt.status || res.Header.Get("Retry-After") != tt.retryAfter {
 				t.Errorf("answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
 			}
-			if a.p.msrp.limit.held() != 0 || a.relay.count(http.MethodDelete) != tt.deletes {
+			if a.p.msrp.limit.held() != held || a.relay.count(http.MethodDelete) != tt.deletes || len(a.p.msrp.all()) != 0 {
 				t.Errorf("held %d, calls %q", a.p.msrp.limit.held(), a.relay.log())
 			}
 		})
@@ -487,14 +517,14 @@ func TestASecondAnswerIsEnded(t *testing.T) {
 	if len(a.p.msrp.all()) != 1 || a.relay.count(http.MethodDelete) != 0 {
 		t.Errorf("the first dialog lost its binding: %q", a.relay.log())
 	}
-	// Without its ACK, the sweep ends a dialog after endAfter.
+	// Without its ACK, the sweep ends a dialog after 64*T1, 32 s.
 	third := c.respond(answered(t, c.req, 200, "b3", strings.Replace(rcsAsAnswer, "as9f2c1", "third1", 1)))
 	_ = third
-	a.clock.t = a.clock.t.Add(endAfter - time.Second)
+	a.clock.t = a.clock.t.Add(32*time.Second - time.Second)
 	a.p.sweepMSRP()
 	a.settle()
 	if got := a.sent.take(a.p); len(got) != 0 {
-		t.Fatalf("ended before endAfter: %d", len(got))
+		t.Fatalf("ended before 32 s: %d", len(got))
 	}
 	a.clock.t = a.clock.t.Add(time.Second)
 	a.p.sweepMSRP()
@@ -534,13 +564,13 @@ func TestALateOfferIsEnded(t *testing.T) {
 	}
 }
 
-// A confirmed session's bindings are extended every bindingExtendEvery; a
+// A confirmed session's bindings are extended every 15 minutes; a
 // session whose flow has gone, or whose setup never ended, is released.
 func TestTheSweepKeepsLiveSessionsAndEndsTheRest(t *testing.T) {
 	a := newAnchoring(t, 16, 100)
 	c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
 	c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
-	a.clock.t = a.clock.t.Add(bindingExtendEvery - time.Second)
+	a.clock.t = a.clock.t.Add(15*time.Minute - time.Second)
 	a.p.sweepMSRP()
 	a.settle()
 	if a.relay.count(http.MethodPatch) != 1 {
@@ -556,7 +586,7 @@ func TestTheSweepKeepsLiveSessionsAndEndsTheRest(t *testing.T) {
 
 	stuck := a.invite(t, "chat-2", "application/sdp", clientChatOffer)
 	_ = stuck
-	a.clock.t = a.clock.t.Add(maxSetupTime)
+	a.clock.t = a.clock.t.Add(10 * time.Minute)
 	a.p.sweepMSRP()
 	a.settle()
 	if len(a.p.msrp.all()) != 1 || a.relay.count(http.MethodDelete) != 1 {
@@ -674,17 +704,42 @@ func TestADeclinedLineReleasesItsBinding(t *testing.T) {
 	}
 }
 
-// A 2xx of another fork after the first answer came in a 183 is ended, the
-// first dialog keeping its binding.
-func TestAnotherForksAnswerWithoutADescriptionIsEnded(t *testing.T) {
-	a := newAnchoring(t, 16, 100)
-	c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
-	c.respond(answered(t, c.req, 183, "b1", rcsAsAnswer))
-	other := c.respond(answered(t, c.req, 200, "b2", ""))
-	a.p.Route(context.Background(), ackFor(t, c, other))
-	checkEnd(t, a, "b2", reasonSecondAnswer)
-	if len(a.p.msrp.all()) != 1 {
-		t.Error("the first dialog's session went")
+// A 2xx of another fork after the first answer came in a 183 is ended, and
+// releases the bindings at once: they served the first fork's early dialog,
+// which that 2xx ends (RFC 3261 §13.2.2.4). A 2xx of the first fork after
+// it gets no path of theirs and is ended too.
+func TestAnotherForksAnswerReleasesTheFirstForksBindings(t *testing.T) {
+	for _, body := range []string{"", strings.Replace(rcsAsAnswer, "as9f2c1", "other1", 1)} {
+		a := newAnchoring(t, 16, 100)
+		c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
+		c.respond(answered(t, c.req, 183, "b1", rcsAsAnswer))
+		other := c.respond(answered(t, c.req, 200, "b2", body))
+		a.settle()
+		if a.relay.count(http.MethodDelete) != 1 || a.p.msrp.limit.held() != 0 {
+			t.Fatalf("not released: calls %q, held %d", a.relay.log(), a.p.msrp.limit.held())
+		}
+		if strings.Contains(string(other.Body), "a=path") {
+			t.Errorf("the other fork's 2xx has a path:\n%s", other.Body)
+		}
+		a.p.Route(context.Background(), ackFor(t, c, other))
+		checkEnd(t, a, "b2", reasonSecondAnswer)
+		if len(a.p.msrp.all()) != 0 {
+			t.Error("the session stayed")
+		}
+		late := c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
+		if strings.Contains(string(late.Body), clientPathFor(1)) || strings.Contains(string(late.Body), "10.0.1.20") {
+			t.Errorf("the first fork's late 2xx:\n%s", late.Body)
+		}
+		a.p.Route(context.Background(), ackFor(t, c, late))
+		checkEnd(t, a, "b1", reasonRelayUnavailable)
+		for range 4 * 60 * 2 { // two hours of sweeps
+			a.clock.t = a.clock.t.Add(30 * time.Second)
+			a.p.sweepMSRP()
+		}
+		a.settle()
+		if a.relay.count(http.MethodDelete) != 1 || len(a.relay.log()) != 3 || len(a.p.msrp.all()) != 0 || len(a.sent.take(a.p)) != 0 {
+			t.Errorf("after two hours: calls %q, %d sessions", a.relay.log(), len(a.p.msrp.all()))
+		}
 	}
 }
 

@@ -26,6 +26,9 @@ var (
 	errRelayConflict = errors.New("pcscf: relay binding has another path")
 	// errRelayGone is a 404: the binding expired or was released.
 	errRelayGone = errors.New("pcscf: relay binding gone")
+	// errRelayInvalid is a 400: the relay will not take a path pcscf sent,
+	// which waiting will not change.
+	errRelayInvalid = errors.New("pcscf: relay refused a path")
 )
 
 // maxRelayResponse bounds a control API answer read; one is a few hundred
@@ -147,6 +150,8 @@ func (c *relayClient) call(ctx context.Context, method, path string, body any, w
 		return errRelayConflict
 	case res.StatusCode == http.StatusNotFound:
 		return errRelayGone
+	case res.StatusCode == http.StatusBadRequest:
+		return errRelayInvalid
 	case res.StatusCode != want:
 		return fmt.Errorf("pcscf: relay %s answered %s", method, strconv.Itoa(res.StatusCode))
 	case err != nil:

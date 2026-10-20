@@ -56,6 +56,13 @@ func TestTheDescriptionIsFoundInTheBody(t *testing.T) {
 		{"multipart opening with the delimiter", "multipart/mixed;boundary=b1", strings.TrimPrefix(multipart, "preamble\r\n"), strings.TrimSuffix(clientChatOffer, "\r\n"), true},
 		{"a part without header fields", "multipart/mixed;boundary=b1", lines("--b1", "") + "plain\r\n--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n\r\n--b1--", "v=0\r\n", true},
 		{"multipart without SDP", "multipart/mixed;boundary=b1", lines("--b1", "Content-Type: message/cpim", "", "x", "--b1--"), "", false},
+		{"multipart/related", `multipart/related;type="application/sdp";boundary=b1`, strings.TrimPrefix(multipart, "preamble\r\n"), strings.TrimSuffix(clientChatOffer, "\r\n"), true},
+		{"multipart/alternative", "multipart/alternative;boundary=b1", strings.TrimPrefix(multipart, "preamble\r\n"), strings.TrimSuffix(clientChatOffer, "\r\n"), true},
+		// Transport padding after a delimiter (RFC 2046 §5.1.1).
+		{"padded delimiters", "multipart/mixed;boundary=b1", "--b1 \t\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1-- \r\n", "v=0", true},
+		{"the longest boundary", "multipart/mixed;boundary=" + strings.Repeat("b", 70),
+			"--" + strings.Repeat("b", 70) + "\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--" + strings.Repeat("b", 70) + "--", "v=0", true},
+		{"an identity encoding", "multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Transfer-Encoding: 8bit\r\n\r\nv=0\r\n--b1--", "v=0", true},
 		{"another type", "message/cpim", cpim, "", false},
 		{"no body", "application/sdp", "", "", false},
 	} {
@@ -93,11 +100,42 @@ func TestABodyPcscfCannotSplitIsRefused(t *testing.T) {
 		"a multipart inside":    {"multipart/mixed;boundary=b1", lines("--b1", "Content-Type: multipart/mixed;boundary=b2", "", "x", "--b1--")},
 		"a part without an end": {"multipart/mixed;boundary=b1", "--b1"},
 		"a part header unended": {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\n--b1--"},
-		"a boundary too long":   {"multipart/mixed;boundary=" + strings.Repeat("b", 71), sdpPart},
+		"a boundary too long": {"multipart/mixed;boundary=" + strings.Repeat("b", 71),
+			"--" + strings.Repeat("b", 71) + "\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--" + strings.Repeat("b", 71) + "--"},
+		"a folded header":                 {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type:\r\n application/sdp\r\n\r\nv=0\r\n--b1--"},
+		"a content type unreadable":       {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp; charset\r\n\r\nv=0\r\n--b1--"},
+		"two content types":               {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: text/plain\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--"},
+		"a header line ending in LF":      {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\n\r\nv=0\r\n--b1--"},
+		"a bare CR in a header":           {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\rX: y\r\n\r\nv=0\r\n--b1--"},
+		"a header without a colon":        {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type application/sdp\r\n\r\nv=0\r\n--b1--"},
+		"a delimiter ending in LF":        {"multipart/mixed;boundary=b1", "--b1\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--"},
+		"a delimiter preceded by LF":      {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: text/plain\r\n\r\nx\n--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--"},
+		"a line longer than a delimiter":  {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: text/plain\r\n\r\nx\r\n--b1x\r\n\r\n--b1--"},
+		"a delimiter after the close":     {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: text/plain\r\n\r\nx\r\n--b1--\r\n\r\ny\r\n--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--"},
+		"an encoded description":          {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nv=3D0\r\n--b1--"},
+		"a length that is not the part's": {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length: 4\r\n\r\nv=0\r\n--b1--"},
+		"an empty length":                 {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length:\r\n\r\nv=0\r\n--b1--"},
+		"two lengths":                     {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nv=0\r\n--b1--"},
 	} {
 		if _, _, err := findSDP(tt.ct, []byte(tt.body)); !errors.Is(err, errBodyUnreadable) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+// A rewritten description gets its part's Content-Length made its own, so
+// a reader that splits parts by it reads the whole of it (#248 code review
+// 7); the rest of the body is as it was.
+func TestARewrittenPartHasItsOwnLength(t *testing.T) {
+	body := "--b1\r\nContent-Type: application/sdp\r\ncontent-length:  3 \r\n\r\nv=0\r\n--b1\r\nContent-Type: message/cpim\r\nContent-Length: 2\r\n\r\nhi\r\n--b1--\r\n"
+	part, found, err := findSDP("multipart/mixed;boundary=b1", []byte(body))
+	if err != nil || !found {
+		t.Fatal(found, err)
+	}
+	got := string(part.with([]byte("v=0\r\nlonger")))
+	want := "--b1\r\nContent-Type: application/sdp\r\ncontent-length:  11 \r\n\r\nv=0\r\nlonger\r\n--b1\r\nContent-Type: message/cpim\r\nContent-Length: 2\r\n\r\nhi\r\n--b1--\r\n"
+	if got != want {
+		t.Errorf("rewritten:\n%q\nwant\n%q", got, want)
 	}
 }
 
