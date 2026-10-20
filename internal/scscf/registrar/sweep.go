@@ -8,6 +8,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
@@ -38,7 +39,9 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		if before.ReassertDue(g.cfg.Now()) {
 			return g.reassert(ctx, after)
 		}
-		// Some bindings expired, others remain: nothing to tell the HSS.
+		// Some bindings expired, others remain: nothing to tell the HSS,
+		// but the subscribers.
+		g.cfg.Events.Changed(ctx, before, after, regevent.Expired)
 		return nil
 	}
 	// The profile endSet may delete, and only if still this one
@@ -68,6 +71,7 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		g.count("registrar.expire_failed")
 		return errors.New("registrar: SAR TIMEOUT_DEREGISTRATION failed: " + o.String())
 	}
+	g.cfg.Events.Changed(ctx, before, nil, regevent.Expired)
 	return g.endSet(ctx, after, profile)
 }
 

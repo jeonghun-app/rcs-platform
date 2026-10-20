@@ -202,6 +202,7 @@ type dialogDoc struct {
 	RemoteURI    string   `json:"remote_uri,omitempty"`
 	RemoteTarget string   `json:"remote_target,omitempty"`
 	RouteSet     []string `json:"route_set,omitempty"`
+	RemoteSeq    uint32   `json:"remote_seq,omitempty"`
 }
 
 func encodeSubscription(s *state.Subscription) ([]byte, error) {
@@ -209,7 +210,7 @@ func encodeSubscription(s *state.Subscription) ([]byte, error) {
 	return json.Marshal(subscriptionDoc{
 		ID: s.ID, IMPU: s.IMPU, Subscriber: s.Subscriber, Expires: s.Expires.UTC(), Terminated: s.Terminated,
 		Dialog: dialogDoc{CallID: d.CallID, LocalTag: d.LocalTag, RemoteTag: d.RemoteTag, LocalURI: d.LocalURI,
-			RemoteURI: d.RemoteURI, RemoteTarget: d.RemoteTarget, RouteSet: d.RouteSet},
+			RemoteURI: d.RemoteURI, RemoteTarget: d.RemoteTarget, RouteSet: d.RouteSet, RemoteSeq: d.RemoteSeq},
 	})
 }
 
@@ -222,7 +223,7 @@ func decodeSubscription(b []byte, version int64, cseq, rver uint32) (*state.Subs
 	s := &state.Subscription{
 		ID: doc.ID, IMPU: doc.IMPU, Subscriber: doc.Subscriber, Expires: doc.Expires, Terminated: doc.Terminated,
 		Dialog: state.Dialog{CallID: d.CallID, LocalTag: d.LocalTag, RemoteTag: d.RemoteTag, LocalURI: d.LocalURI,
-			RemoteURI: d.RemoteURI, RemoteTarget: d.RemoteTarget, RouteSet: nilIfEmpty(d.RouteSet)},
+			RemoteURI: d.RemoteURI, RemoteTarget: d.RemoteTarget, RouteSet: nilIfEmpty(d.RouteSet), RemoteSeq: d.RemoteSeq},
 		CSeq: cseq, ReginfoVersion: rver, Version: version,
 	}
 	if err := s.Validate(); err != nil {

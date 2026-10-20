@@ -486,7 +486,7 @@ func Subscription(id, impu string, ttl time.Duration) *state.Subscription {
 		Dialog: state.Dialog{
 			CallID: "dialog-" + id, LocalTag: "local", RemoteTag: "remote",
 			LocalURI: impu, RemoteURI: "sip:pcscf.rcs.local", RemoteTarget: "sip:pcscf@192.0.2.20:5060",
-			RouteSet: []string{"<sip:pcscf.rcs.local;lr>"},
+			RouteSet: []string{"<sip:pcscf.rcs.local;lr>"}, RemoteSeq: 7,
 		},
 	}
 }

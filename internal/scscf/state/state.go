@@ -739,6 +739,9 @@ type Dialog struct {
 	RemoteURI    string
 	RemoteTarget string
 	RouteSet     []string
+	// RemoteSeq is the CSeq of the subscriber's last SUBSCRIBE, which a
+	// refresh must not go below (RFC 3261 §12.2.2).
+	RemoteSeq uint32
 }
 
 // Clone returns a deep copy.
