@@ -209,3 +209,23 @@ func TestRegistrySlotsAreReservedUntilReleasedOrLapsed(t *testing.T) {
 func (r *registry) tryReserve(flow transport.FlowID, aor string, until time.Time) bool {
 	return r.reserve(flow, aor, netip.MustParseAddr("192.0.2.10"), until) == nil
 }
+
+// A client address's reservations are given back as its REGISTERs end, so
+// one that registers often, as many clients behind a NAT address do, is
+// never held at its bound for what has ended (#198 QA).
+func TestAClientsReservationsAreGivenBack(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	r := newRegistry(100, clock.now)
+	r.perClient = 2
+	client := netip.MustParseAddr("192.0.2.10")
+	for i := range 5 {
+		flow := transport.FlowID("FLOW-" + string(rune('A'+i)))
+		if err := r.reserve(flow, "sip:a@example.net", client, clock.t.Add(time.Minute)); err != nil {
+			t.Fatalf("REGISTER %d refused: %v", i+1, err)
+		}
+		r.release(flow, "sip:a@example.net")
+	}
+	if len(r.pendingByClient) != 0 || len(r.pendingByFlow) != 0 {
+		t.Errorf("pending left: %v %v", r.pendingByClient, r.pendingByFlow)
+	}
+}

@@ -296,12 +296,14 @@ func checkListenerLimits(total int, listeners []transport.ListenerConfig) error 
 	return nil
 }
 
-// transportMetrics exports the transport's listener gauges and PROXY header
-// counters as EMF metrics (#193): the connections each stream listener holds,
-// to see one near its limit before it refuses, and the PROXY headers that
-// came too late, were malformed, or never started, of which only the
-// malformed say the NLB is misconfigured. last holds the counters as last
-// recorded, since Stats counts from the start.
+// transportMetrics exports the transport's listener gauges and counters as
+// EMF metrics (#193): the connections each stream listener holds, to see
+// one near its limit before it refuses; the connections refused at the
+// client listener's limit, the core listener's, and the transport's, to
+// alarm on; and the PROXY headers that came too late, failed once begun,
+// which says the NLB is misconfigured, or never began, a client or a
+// scanner that gave up. last holds the counters as last recorded, since
+// Stats counts from the start.
 type transportMetrics struct{ last transport.Stats }
 
 // record records s, the transport's Stats now.
@@ -312,6 +314,9 @@ func (tm *transportMetrics) record(m *runtime.Metrics, s transport.Stats) {
 	for name, n := range s.ListenerConnections {
 		m.Gauge("transport.listener_connections."+name, int64(n))
 	}
+	m.Count("transport.client_listener_rejected", int64(s.ClientListenerRejected-tm.last.ClientListenerRejected))
+	m.Count("transport.core_listener_rejected", int64(s.CoreListenerRejected-tm.last.CoreListenerRejected))
+	m.Count("transport.rejected", int64(s.Rejected-tm.last.Rejected))
 	m.Count("transport.proxy_header_timeouts", int64(s.ProxyHeaderTimeouts-tm.last.ProxyHeaderTimeouts))
 	m.Count("transport.proxy_header_errors", int64(s.ProxyHeaderErrors-tm.last.ProxyHeaderErrors))
 	m.Count("transport.proxy_header_empty", int64(s.ProxyHeaderEmpty-tm.last.ProxyHeaderEmpty))
