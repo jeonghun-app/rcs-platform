@@ -4920,6 +4920,26 @@ Resources:
       Dimensions: [{ Name: Service, Value: scscf }]
       Statistic: Maximum
       Period: 60
+  # A registration's state that scscf could not reassert at the HSS: the two
+  # disagree for that set until it re-registers or a sweep retries.
+  ScscfReassertFailed:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithScscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ScscfReassertFailed'
+      AlarmDescription: 'scscf could not reassert registrations at the HSS. See docs/runbook.md#scscfreassertfailed.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: registrar.reassert_failed
+      Dimensions: [{ Name: Service, Value: scscf }]
+      Statistic: Sum
+      Period: 60
   # An operator profile whose iFC evaluation exceeds its work budget (#14).
   ScscfIfcBudgetExceeded:
     Type: AWS::CloudWatch::Alarm

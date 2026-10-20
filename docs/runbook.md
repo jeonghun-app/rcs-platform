@@ -555,6 +555,19 @@ iFC evaluation or a slow HSS holds transactions too.
 
 **Act.** As [PcscfTransactionBytes](#pcscftransactionbytes), for scscf.
 
+### ScscfReassertFailed
+
+**Symptom.** scscf could not reassert a registration's state at the HSS
+(`registrar.reassert_failed` in 2 of 3 minutes). For those registration
+sets the HSS and scscf's store disagree until the user registers again or
+a sweep retries.
+
+**Check.** The HSS's health: `HssCxErrors`, `HssCxLatency`, `HssLockBusy`,
+and hss on the dashboard.
+
+**Act.** Restore the HSS; the retries then converge by themselves. If it
+persists with a healthy HSS, open an issue with the counts.
+
 ### ScscfIfcBudgetExceeded
 
 **Symptom.** scscf stopped evaluating a profile's iFC because it exceeded its
