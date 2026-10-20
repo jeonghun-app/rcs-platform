@@ -416,6 +416,72 @@ request is sent over that flow whatever its Route or Request-URI say below.
   whom the core reached. The client's own network-only headers are gone
   already, removed on arrival.
 
+## MSRP anchoring
+
+`pcscf` anchors every MSRP session of its clients through `msrp-relay`
+([ADR 0004](adr/0004-msrp-anchoring.md), #136), the way a P-CSCF controls an
+IMS access gateway: it rewrites the `m=message` lines of the session's
+offer and answer, so that the client connects to the relay and the relay
+to `rcs-as`, and holds the relay's binding while the session lives. A
+session it cannot anchor is refused or ended; it never runs end to end.
+This version anchors the sessions a client sets up (ADR 0004, first row);
+an MSRP offer from the core, or inside a dialog, is answered 488 until
+#136's second change anchors those too.
+
+- **The description.** It is the body of `application/sdp`, or the one
+  `application/sdp` part of a `multipart/mixed` body, as a chat INVITE
+  carrying its first message has. Only the MSRP lines with a port change;
+  every other line, and every other part, goes as it came. A body whose
+  description `pcscf` cannot locate for sure (two descriptions, a
+  multipart inside a part, broken boundaries) or cannot parse, an MSRP
+  line offering `a=setup:passive` (RFC 6135 §4.2.2) or a path through
+  relays (RFC 4976) is answered 488, and counted in
+  `msrp.refused.offer`.
+- **The offer.** Each MSRP line of the client's INVITE gets a binding
+  (`POST /v1/bindings` with the client's path, for 1800 s), and goes to
+  the core with the relay's core-side path, `a=setup:active` and port 9.
+- **The answer.** The first 1xx or 2xx with a description (#136 decision
+  3) completes each binding with `rcs-as`'s path (`PATCH`) and reaches
+  the client with the relay's client path, `a=setup:passive`, the relay's
+  host in `c=` and `o=`, and the relay's port and transport. A line
+  `rcs-as` declined (port 0) releases its binding. Retransmissions are
+  rewritten the same.
+- **Refusals.** Past a flow's or the task's bindings
+  (`PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_MAX_BINDINGS`), without a relay
+  token, or when the relay fails or does not answer within
+  `PCSCF_RELAY_TIMEOUT`, the INVITE is answered 503 with `Retry-After: 1`
+  (#136 decisions 4 to 6), counted in `msrp.refused.binding_limit` or
+  `msrp.refused.relay`; a binding already made for it is released.
+- **Ending a dialog.** A 2xx cannot be refused, so a dialog `pcscf` cannot
+  serve is forwarded and then ended: once the client's ACK passes, or
+  32 s after the 2xx, a BYE goes to the client over its flow, as from the
+  far end, and to the core along the dialog's route, as from the client,
+  both with a `Reason`:
+  - the relay failed at answer time, or the answer could not be read or
+    served (#136 decision 6): `cause=503`, after the binding is released;
+    the client's copy points at the relay, never at `rcs-as`;
+  - another answer, or a 2xx of another fork (decision 3): `cause=488`;
+    its MSRP lines reach the client declined;
+  - a late offer, an MSRP offer in the 2xx of an INVITE without one
+    (decision 2): `cause=488`, declined likewise.
+
+  Each is counted, in `msrp.ended.relay_failed`, `msrp.ended.second_answer`
+  and `msrp.ended.late_offer`.
+- **Releases.** A binding is released (`DELETE`) on a BYE from either
+  side, a final failure (a CANCEL's 487 included), the flow closing, a
+  setup no final response ended within 10 minutes, and the dialog being
+  ended as above. The sweep extends the bindings of a confirmed session
+  every 15 minutes (`PATCH` for 1800 s), so a session without a session
+  timer lives as long as its flow (decision 1). `msrp.bindings` is the
+  gauge of bindings held, which must come back to zero; `msrp.relay_errors`
+  counts the relay calls that failed.
+
+The control API is reached at `PCSCF_RELAY_URL`, a private host only
+(ADR 0007 §5: the dialer refuses any other address the name resolves to),
+with the bearer token `PCSCF_RELAY_TOKEN`, which in AWS comes from Secrets
+Manager. The token and `client_path`, the client's way into the session,
+never reach a log; errors name the operation and status alone.
+
 ## Settings
 
 Environment variables with the `PCSCF_` prefix, plus the shared ones of
@@ -449,6 +515,10 @@ start with that value.
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | client flows among them; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
 | `PCSCF_CORE_CONNECTIONS` | `256` | connections kept for the core listener |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
+| `PCSCF_RELAY_URL` | `http://msrp-relay.<RCS_SERVICE_NAMESPACE>:8082` | `msrp-relay`'s control API: `http` or `https` of a private host, without a path |
+| `PCSCF_RELAY_TOKEN` | none | `pcscf`'s bearer token for it, from Secrets Manager in AWS; unset or under 43 characters is refused; without one, MSRP sessions are refused |
+| `PCSCF_RELAY_TIMEOUT` | `2s` | one call to the control API |
+| `PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_MAX_BINDINGS` | `16`, `20000` | relay bindings one client flow, and the task, hold |
 | `PCSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop spreads the closing of client flows over; plus 5 s it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 
 For production, set `RCS_SHUTDOWN_TIMEOUT` to most of the ECS stop timeout,

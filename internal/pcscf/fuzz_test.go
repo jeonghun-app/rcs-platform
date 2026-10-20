@@ -1,11 +1,13 @@
 package pcscf
 
 import (
+	"fmt"
 	"net/netip"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -115,6 +117,75 @@ func FuzzRouteICID(f *testing.F) {
 			again, ok := routeICID(p.recordRoute("FLOW-A", false, got, "call-1")[0].URI)
 			if !ok || again != got {
 				t.Fatalf("%q read as %q, written again and read as %q, %v", raw, got, again, ok)
+			}
+		}
+	})
+}
+
+// FuzzAnchorSDP checks the SDP path of MSRP anchoring on any body (#136):
+// finding the description never loses the rest of the body, every MSRP line
+// it anchors ends up with the relay's path alone, the other lines stay as
+// they were, and a declined answer keeps no path.
+func FuzzAnchorSDP(f *testing.F) {
+	f.Add("application/sdp", []byte(clientChatOffer))
+	f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\nContent-Type: application/sdp\r\n\r\n"+clientChatOffer+"\r\n--b1\r\nContent-Type: message/cpim\r\n\r\nx\r\n--b1--\r\n"))
+	f.Add("application/sdp", []byte(rcsAsAnswer))
+	f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\n\r\n--b1--"))
+	f.Fuzz(func(t *testing.T, contentType string, body []byte) {
+		part, found, err := findSDP(contentType, body)
+		if err != nil || !found {
+			return
+		}
+		if string(part.with(part.description())) != string(body) {
+			t.Fatal("the body did not survive its description being put back")
+		}
+		s, ls, err := msrpLines(part.description(), true)
+		if err != nil {
+			return
+		}
+		before := len(s.Media)
+		var others []string
+		for i := range s.Media {
+			if !s.Media[i].IsMSRP() || s.Media[i].Port == 0 {
+				others = append(others, fmt.Sprint(s.Media[i]))
+			}
+		}
+		for _, l := range ls {
+			if err := anchorLine(s, l.index, corePathFor(1), sdp.SetupActive, false); err != nil {
+				t.Fatalf("anchoring line %d: %v", l.index, err)
+			}
+		}
+		out, err := s.Marshal()
+		if err != nil {
+			return
+		}
+		back, ls2, err := msrpLines(out, true)
+		if err != nil || len(back.Media) != before || len(ls2) != len(ls) {
+			t.Fatalf("the anchored description reads back as %d lines, %v", len(ls2), err)
+		}
+		for _, l := range ls2 {
+			if len(l.path) != 1 || l.path[0] != corePathFor(1) || l.setup != sdp.SetupActive {
+				t.Fatalf("line %d: path %q, setup %q", l.index, l.path, l.setup)
+			}
+		}
+		var others2 []string
+		for i := range back.Media {
+			if !back.Media[i].IsMSRP() || back.Media[i].Port == 0 {
+				others2 = append(others2, fmt.Sprint(back.Media[i]))
+			}
+		}
+		if strings.Join(others, "\x00") != strings.Join(others2, "\x00") {
+			t.Fatalf("other lines changed:\n%q\n%q", others, others2)
+		}
+		if d := declineMSRP(part.description()); d != nil {
+			if strings.Contains(string(d), "a=path") {
+				if ds, _, err := msrpLines(d, false); err == nil {
+					for _, m := range ds.Media {
+						if m.IsMSRP() && m.Attributes.Has("path") {
+							t.Fatal("a declined line kept its path")
+						}
+					}
+				}
 			}
 		}
 	})

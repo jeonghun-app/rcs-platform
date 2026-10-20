@@ -128,44 +128,15 @@ type subscriptions struct {
 	// have shown active; it outlives a subscription, so that the first
 	// full document of the next one can end what went meanwhile.
 	seen map[string]*seenState
-	// ctx ends, and wg waits for, the SUBSCRIBEs being sent; once closed
-	// no other is.
-	ctx    context.Context
-	wg     sync.WaitGroup
-	closed bool
+	// background sends the SUBSCRIBEs off the caller's goroutine: the
+	// caller is a REGISTER's response or the sweep, which must not wait for
+	// a lookup or a connection to scscf.
+	background
 }
 
 func newSubscriptions(ctx context.Context) *subscriptions {
-	return &subscriptions{ctx: ctx, byKey: map[string]*subscription{}, byID: map[string]*subscription{},
+	return &subscriptions{background: background{ctx: ctx}, byKey: map[string]*subscription{}, byID: map[string]*subscription{},
 		notBefore: map[string]time.Time{}, failures: map[string]int{}, seen: map[string]*seenState{}}
-}
-
-// goSend runs f, which sends a SUBSCRIBE, off the caller's goroutine: the
-// caller is a REGISTER's response or the sweep, which must not wait for a
-// lookup or a connection to scscf.
-func (s *subscriptions) goSend(f func(ctx context.Context)) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.wg.Add(1)
-	s.mu.Unlock()
-	go func() {
-		defer s.wg.Done()
-		f(s.ctx)
-	}()
-}
-
-// wait waits for the SUBSCRIBEs being sent. close stops any other: the
-// sweep may still be running when the service stops.
-func (s *subscriptions) wait() { s.wg.Wait() }
-
-func (s *subscriptions) close() {
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
-	s.wg.Wait()
 }
 
 // dropLocked forgets sub, and keeps a new subscription of its identity
@@ -286,7 +257,7 @@ func (p *pcscf) subscribeFor(reg *registration) bool {
 	p.subs.byKey[key], p.subs.byID[sub.id] = sub, sub
 	p.subs.notBefore[key] = now.Add(resubscribeAfter)
 	p.subs.mu.Unlock()
-	p.subs.goSend(func(ctx context.Context) { p.startSubscription(ctx, sub, reg) })
+	p.subs.goRun(func(ctx context.Context) { p.startSubscription(ctx, sub, reg) })
 	return true
 }
 
@@ -470,11 +441,11 @@ func (p *pcscf) reconcileSubscriptions() {
 	}
 	p.subs.mu.Unlock()
 	for _, sub := range end {
-		p.subs.goSend(func(ctx context.Context) { p.resubscribe(ctx, sub, nil) })
+		p.subs.goRun(func(ctx context.Context) { p.resubscribe(ctx, sub, nil) })
 	}
 	for _, sub := range refresh {
 		reg := live[sub.key]
-		p.subs.goSend(func(ctx context.Context) { p.resubscribe(ctx, sub, reg) })
+		p.subs.goRun(func(ctx context.Context) { p.resubscribe(ctx, sub, reg) })
 	}
 	started := 0
 	for _, reg := range live {

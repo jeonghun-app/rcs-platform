@@ -48,7 +48,12 @@ func (f *fakeSender) send(req *sip.Request, dst transport.Destination, h transac
 // take waits for the SUBSCRIBEs under way and returns what was sent since
 // the last take.
 func (f *fakeSender) take(p *pcscf) []sentRequest {
-	p.subs.wait()
+	if p.subs != nil {
+		p.subs.wait()
+	}
+	if p.msrp != nil {
+		p.msrp.wait()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := f.sent
