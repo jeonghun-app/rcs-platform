@@ -126,7 +126,8 @@ func TestAnRTRDeletesASetThatChangedSinceItWasRead(t *testing.T) {
 	registered(t, e, e.instance(1), 600, impu1)
 	cs := &changingStore{Memory: e.store}
 	cs.change = func() {
-		r := must(regOf(e, impu1))(t)
+		// Read by its key: the RTR has deleted the identities already.
+		r := must(e.store.Registration(bg, set1))(t)
 		r.Contacts[0].Expires = r.Contacts[0].Expires.Add(time.Minute)
 		must(e.store.SaveRegistration(bg, r))(t)
 	}
@@ -141,7 +142,7 @@ func TestAnRTRForASetAlreadyGoneSucceeds(t *testing.T) {
 	cs := &changingStore{Memory: e.store}
 	cs.change = func() {
 		// A sweep or a REGISTER ended it between the RTR's read and delete.
-		must(0, e.store.DeleteRegistration(bg, must(regOf(e, impu1))(t)))(t)
+		must(0, e.store.DeleteRegistration(bg, must(e.store.Registration(bg, set1))(t)))(t)
 	}
 	wantResult(t, e.instance(2, func(c *Config) { c.Store = cs }).HandleRTR(bg, &cx.RTR{UserName: impi1}), resultSuccess)
 }
@@ -290,4 +291,106 @@ func TestAPPRForAnExpiredSetOfAUserWithAnotherLiveIsNotUserUnknown(t *testing.T)
 		t.Fatal("set 2 should have expired")
 	}
 	wantResult(t, g.HandlePPR(bg, &cx.PPR{UserName: impi1, UserData: userDataOf(impi1, nil, impu2, impu3)}), resultUnableToComply)
+}
+
+// TestAnRTRLeavesNoIdentityOfTheSetsItEnds: the identity items go with
+// their set, before its record (QA's H5 on #210).
+func TestAnRTRLeavesNoIdentityOfTheSetsItEnds(t *testing.T) {
+	for name, rtr := range map[string]*cx.RTR{
+		"private identity": {UserName: impi1},
+		"named identity":   {UserName: impi1, PublicIdentities: []string{tel1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			twoSets(t, e, e.instance(1))
+			wantResult(t, e.instance(2).HandleRTR(bg, rtr), resultSuccess)
+			for _, impu := range []string{impu1, tel1} {
+				if id, err := e.store.Identity(bg, impu, e.clock.Now()); err == nil {
+					t.Errorf("%s still names %v", impu, id.Set)
+				}
+			}
+			if _, err := e.store.Registration(bg, set1); err == nil {
+				t.Error("set 1's record is still stored")
+			}
+		})
+	}
+}
+
+// TestAnRTRNamingAnotherUsersIdentityEndsNothing: an RTR ends the sets of its
+// User-Name and Associated-Identities only; a public identity of another
+// private identity it names is left alone (QA's H2 on #210).
+func TestAnRTRNamingAnotherUsersIdentityEndsNothing(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	registered(t, e, g, 600, impu1)
+	wantResult(t, g.HandleRTR(bg, &cx.RTR{UserName: impi2, PublicIdentities: []string{impu1}}), resultSuccess)
+	must(regOf(e, impu1))(t)
+	must(e.store.Profile(bg, set1, e.clock.Now()))(t)
+}
+
+// TestAPPRDuringOneSetsLeaseSparesTheUsersOtherSet: 5001 would make the HSS
+// mark every identity of the user not registered (TS 29.228 §6.2.2.1),
+// set 2's too, which is live here (QA's finding 1 on #210).
+func TestAPPRDuringOneSetsLeaseSparesTheUsersOtherSet(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	twoSets(t, e, g)
+	r := must(e.store.Registration(bg, set1))(t)
+	r.Contacts, r.Deregistering = nil, t0.Add(state.SweepLease)
+	must(e.store.SaveRegistration(bg, r))(t)
+	wantResult(t, g.HandlePPR(bg, &cx.PPR{UserName: impi1, UserData: userDataOf(impi1, nil, impu1, tel1)}), resultUnableToComply)
+}
+
+// raceStore runs race once, just before the PPR saves the set's record.
+type raceStore struct {
+	state.Store
+	once sync.Once
+	race func()
+}
+
+func (r *raceStore) SaveRegistration(ctx context.Context, reg *state.Registration) (*state.Registration, error) {
+	if len(reg.Identities) == 2 {
+		r.once.Do(r.race)
+	}
+	return r.Store.SaveRegistration(ctx, reg)
+}
+
+// TestAPPRRetriesWhenAReRegisterSavedTheSetFirst: the PPR's save of the set
+// loses to a re-REGISTER that read the old profile; it reads the set again
+// and applies itself to what the REGISTER left (QA's H10 on #210).
+func TestAPPRRetriesWhenAReRegisterSavedTheSetFirst(t *testing.T) {
+	e := newEnv(t)
+	registered(t, e, e.instance(1), 600, impu1)
+	rs := &raceStore{Store: e.store}
+	rs.race = func() {
+		r := must(e.store.Registration(bg, set1))(t)
+		r.Contacts[0].Expires = r.Contacts[0].Expires.Add(time.Minute)
+		must(e.store.SaveRegistration(bg, r))(t)
+	}
+	g := e.instance(2, func(c *Config) { c.Store = rs })
+	wantResult(t, g.HandlePPR(bg, &cx.PPR{UserName: impi1, UserData: userDataOf(impi1, nil, impu1, impu3)}), resultSuccess)
+	if r := must(regOf(e, impu3))(t); r.Key != set1 || !r.Contacts[0].Expires.Equal(t0.Add(660*time.Second)) {
+		t.Errorf("after the race: %+v", r)
+	}
+}
+
+// TestARemoveSCSCFThatARegisterOvertakesLeavesTheSetPointedAt: REMOVE_SCSCF
+// ends only unregistered users' records. One that a REGISTER turns into a
+// registration after the RTR deleted its identities, and before it deleted
+// the record, is a registration the RTR leaves, so its identities are
+// pointed at it again.
+func TestARemoveSCSCFThatARegisterOvertakesLeavesTheSetPointedAt(t *testing.T) {
+	e := newEnv(t)
+	seed(t, e, impi1, []string{impu1, tel1}, func(r *state.Registration) { r.Unregistered = t0.Add(time.Hour) })
+	cs := &changingStore{Memory: e.store}
+	cs.change = func() {
+		// The REGISTER pointed the identities before the RTR deleted them.
+		r := must(e.store.Registration(bg, set1))(t)
+		r.Unregistered = time.Time{}
+		r.Contacts = []state.Contact{{URI: "sip:ue1@192.0.2.10:5060;transport=tcp", CallID: "c", CSeq: 1, Expires: t0.Add(time.Hour)}}
+		must(e.store.SaveRegistration(bg, r))(t)
+	}
+	g := e.instance(1, func(c *Config) { c.Store = cs })
+	wantResult(t, g.HandleRTR(bg, &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.RemoveSCSCF}}), resultSuccess)
+	wantSameBindings(t, e, 1, impu1, tel1)
 }

@@ -45,7 +45,7 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 			if !ok {
 				continue
 			}
-			id, err := g.cfg.Store.Identity(ctx, impu)
+			id, err := g.cfg.Store.Identity(ctx, impu, g.cfg.Now())
 			switch {
 			case errors.Is(err, state.ErrNotFound):
 				continue
@@ -84,32 +84,52 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	return resultSuccess
 }
 
-// endSetNow ends set k at the HSS's request: its record, under the version
-// read, reading it again if it changed, then its identities and profile. With
-// unregisteredOnly it ends k only as an unregistered user's record. It
-// reports whether it ended one.
+// endSetNow ends set k at the HSS's request: its identities, its profile if
+// still the one read, and last its record, under the version read, as every
+// deregistration does (endSet); a record that changed meanwhile is read
+// again and ended too. With unregisteredOnly it ends k only as an
+// unregistered user's record, and one that a REGISTER turned into a
+// registration meanwhile has its identities pointed at it again. It reports
+// whether it ended one.
 func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool) (bool, error) {
+	touched := false
 	for range saveAttempts {
+		now := g.cfg.Now()
 		reg, f := g.set(ctx, k)
 		switch {
 		case f != nil:
 			return false, f
 		case reg == nil:
-			return false, nil
+			return touched, nil
 		case unregisteredOnly && (reg.Unregistered.IsZero() || len(reg.Contacts) > 0):
+			if touched {
+				return false, g.point(ctx, reg, keepUntil(reg).Add(state.ProfileGrace))
+			}
 			return false, nil
 		}
-		err := g.cfg.Store.DeleteRegistration(ctx, reg)
+		profile, err := g.cfg.Store.Profile(ctx, k, now)
+		if err != nil && !errors.Is(err, state.ErrNotFound) {
+			return false, err
+		}
+		touched = true
+		if err := g.unpoint(ctx, reg); err != nil {
+			return false, err
+		}
+		if profile != nil {
+			// Only the one read: a REGISTER that lands meanwhile saves its
+			// own, which this RTR then does not end.
+			if err := g.cfg.Store.DeleteProfileIf(ctx, k, profile.Received); err != nil && !errors.Is(err, state.ErrConflict) {
+				return false, err
+			}
+		}
+		err = g.cfg.Store.DeleteRegistration(ctx, reg)
 		switch {
 		case errors.Is(err, state.ErrConflict):
 			continue
 		case errors.Is(err, state.ErrNotFound):
-			return false, nil
-		case err != nil:
-			return false, err
+			return true, nil
 		}
-		g.unpoint(ctx, reg)
-		return true, g.cfg.Store.DeleteProfile(ctx, k)
+		return err == nil, err
 	}
 	return false, errors.New("registrar: the set kept changing")
 }
@@ -178,7 +198,7 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 			g.log.Error("registrar: PPR: saving the set", slog.String("error", err.Error()))
 			return resultUnableToComply
 		}
-		if err := g.point(ctx, saved); err != nil {
+		if err := g.point(ctx, saved, p.KeepUntil); err != nil {
 			g.log.Error("registrar: PPR: pointing the identities", slog.String("error", err.Error()))
 			return resultUnableToComply
 		}
@@ -186,7 +206,12 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 		left.Identities = slices.DeleteFunc(slices.Clone(reg.Identities), func(id state.SetIdentity) bool {
 			return slices.ContainsFunc(set.identities, func(n state.SetIdentity) bool { return n.IMPU == id.IMPU })
 		})
-		g.unpoint(ctx, &left)
+		if err := g.unpoint(ctx, &left); err != nil {
+			// The set is stored as the PPR says; an identity that left it
+			// and still names it goes at its KeepUntil.
+			g.log.Error("registrar: PPR: unpointing the identities that left", slog.String("error", err.Error()))
+			g.count("registrar.ppr_unpoint_failed")
+		}
 		g.count("registrar.ppr_stored")
 		return resultSuccess
 	}

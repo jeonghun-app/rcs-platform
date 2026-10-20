@@ -13,27 +13,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
-// countingMetrics records the registrar's counters.
-type countingMetrics struct {
-	mu sync.Mutex
-	n  map[string]int64
-}
-
-func (m *countingMetrics) Count(name string, v int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.n == nil {
-		m.n = map[string]int64{}
-	}
-	m.n[name] += v
-}
-
-func (m *countingMetrics) get(name string) int64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.n[name]
-}
-
 // TestAReassignTheHSSDoesNotTakeMarksTheSetForASweep: A's deregistration is
 // overtaken by B's registration, so the S-CSCF tells the HSS again that it
 // serves the set; when that SAR fails, the HSS may hold the set as
@@ -54,7 +33,7 @@ func TestAReassignTheHSSDoesNotTakeMarksTheSetForASweep(t *testing.T) {
 		}
 		return nil, nil
 	}
-	m := &countingMetrics{}
+	m := &counts{}
 	g := e.instance(3, func(c *Config) { c.HSS, c.Metrics = ch, m })
 	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
 	wantStatus(t, g.Register(bg, a.request(0, auth), upstream), 200)
@@ -130,7 +109,7 @@ func testDeregistrationLeftToTheSweep(t *testing.T, read bool) {
 	e := newEnv(t)
 	a := e.akaUser(impi1, impu1, tel1)
 	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
-	m := &countingMetrics{}
+	m := &counts{}
 	flaky := &flakyIdentities{Store: e.store, read: read, armed: !read}
 	e.hss.sarHook = func(r *cx.SAR) (*cx.SAA, error) {
 		if r.AssignmentType == cx.UserDeregistration {
