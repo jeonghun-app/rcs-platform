@@ -257,7 +257,7 @@ func newHarness(t *testing.T, network transport.Network, cfg Config) *harness {
 	clock := &fakeClock{}
 	h := &harness{t: t, clock: clock, sender: &fakeSender{clock: clock, network: network}, tu: &tuRecorder{}}
 	cfg.Clock = clock
-	h.layer = New(h.sender, h.tu, cfg)
+	h.layer = mustNew(t, h.sender, h.tu, cfg)
 	return h
 }
 
@@ -337,3 +337,13 @@ func check(t *testing.T, what string, got, want []string) {
 func ms(n int) time.Duration { return time.Duration(n) * time.Millisecond }
 
 func at(l string, d time.Duration) string { return fmt.Sprintf("%s@%s", l, d) }
+
+// mustNew is New for a configuration a test expects to be valid.
+func mustNew(t testing.TB, s Sender, tu TU, cfg Config) *Layer {
+	t.Helper()
+	l, err := New(s, tu, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}

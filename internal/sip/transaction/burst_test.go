@@ -80,7 +80,7 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				layer = New(tr, handoffTU{code}, Config{DelayTrying: v.delay, T1: burstT1})
+				layer = mustNew(t, tr, handoffTU{code}, Config{DelayTrying: v.delay, T1: burstT1})
 				a, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
 				if err != nil {
 					t.Fatal(err)
@@ -164,7 +164,7 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				layer = New(tr, tu, Config{T1: burstT1})
+				layer = mustNew(t, tr, tu, Config{T1: burstT1})
 				a, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
 				if err != nil {
 					t.Fatal(err)

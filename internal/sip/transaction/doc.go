@@ -17,6 +17,13 @@
 // responses, which are end to end (§17.1.1.3, §13.2.2.4), and responses that
 // match no client transaction, which a proxy forwards statelessly (§16.7, §16.11).
 //
+// The layer bounds its server transactions by count and by the memory their
+// requests and kept responses hold (Config.MaxServerTransactions and
+// MaxServerTransactionBytes), keeping a share of both for core traffic; a
+// request beyond them is answered with 503 and Retry-After without a
+// transaction (RFC 3261 §21.5.4, §8.2.7), and the ACK for that 503 goes no
+// further, so a flood of requests cannot grow memory without bound.
+//
 // A client transaction sent over a flow (Destination.Flow) ends at once, with
 // ErrFlowClosed, when that flow closes before its final response
 // (Layer.FlowClosed): Timer B or F would notice only 64*T1 later.
@@ -32,6 +39,6 @@
 //
 //	var layer *transaction.Layer
 //	tr, err := transport.New(tcfg, func(in transport.Inbound) { layer.Receive(in) })
-//	layer = transaction.New(tr, tu, transaction.Config{})
+//	layer, err = transaction.New(tr, tu, transaction.Config{})
 //	tr.Listen(...)
 package transaction

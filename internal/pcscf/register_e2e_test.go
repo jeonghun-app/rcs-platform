@@ -19,12 +19,14 @@ import (
 
 // fakeCoreNode is icscf or scscf: it accepts pcscf's core connections and
 // answers each request with what answer returns, nothing if that is empty,
-// after passing it to got. Each answer is written once it is ready, so one
-// that waits holds up no other.
+// after passing it to got, or a SUBSCRIBE, which pcscf sends of its own
+// accord after a registration, to subscribes. Each answer is written once
+// it is ready, so one that waits holds up no other.
 type fakeCoreNode struct {
-	ln     net.Listener
-	got    chan *sip.Request
-	answer func(req *sip.Request) string
+	ln         net.Listener
+	got        chan *sip.Request
+	subscribes chan *sip.Request
+	answer     func(req *sip.Request) string
 }
 
 func startCoreNode(t *testing.T, answer func(*sip.Request) string) *fakeCoreNode {
@@ -34,7 +36,7 @@ func startCoreNode(t *testing.T, answer func(*sip.Request) string) *fakeCoreNode
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	f := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), answer: answer}
+	f := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), subscribes: make(chan *sip.Request, 16), answer: answer}
 	go func() {
 		for {
 			nc, err := ln.Accept()
@@ -60,7 +62,14 @@ func (f *fakeCoreNode) serve(t *testing.T, nc net.Conn) {
 		if !ok {
 			continue
 		}
-		f.got <- req
+		if req.Method == "SUBSCRIBE" {
+			select {
+			case f.subscribes <- req:
+			default:
+			}
+		} else {
+			f.got <- req
+		}
 		go func() {
 			if a := f.answer(req); a != "" {
 				mu.Lock()

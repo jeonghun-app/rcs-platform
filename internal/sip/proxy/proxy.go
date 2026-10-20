@@ -218,7 +218,12 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	}
 	p.idle = sync.NewCond(&p.activeMu)
 	p.ctx, p.stop = context.WithCancel(context.Background())
-	p.layer = transaction.New(quietSender{s, p}, p, tcfg)
+	layer, err := transaction.New(quietSender{s, p}, p, tcfg)
+	if err != nil {
+		p.stop()
+		return nil, err
+	}
+	p.layer = layer
 	return p, nil
 }
 

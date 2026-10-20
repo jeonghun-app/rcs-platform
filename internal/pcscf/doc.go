@@ -21,6 +21,7 @@
 // A client's other requests go to the core along its Service-Route, or
 // inside a dialog along the route pcscf recorded, to scscf alone
 // (originate.go); a request from the core goes to the client flow its
-// Route names and nowhere else (terminate.go). The reg event follows in a
-// later change (#16).
+// Route names and nowhere else (terminate.go). pcscf subscribes to the reg
+// event of the users it serves and removes the registrations the network
+// ends (regevent.go, TS 24.229 §5.2.3, §5.2.5.2).
 package pcscf
