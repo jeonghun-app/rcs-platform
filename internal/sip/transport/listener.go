@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -325,11 +326,16 @@ func (l *listener) serveAccepted(raw net.Conn) {
 		raw.SetReadDeadline(time.Now().Add(l.proxyHeader))
 		h, err := ReadProxyHeader(raw)
 		if err != nil {
-			// A timeout is a slow or silent client; a malformed header, a
-			// peer that is not the NLB.
-			if ne := net.Error(nil); errors.As(err, &ne) && ne.Timeout() {
+			// A connection closed before its first byte is a TCP health
+			// check or a scan, a timeout a slow or silent client, and only
+			// a malformed header a peer that is not the NLB, which the NLB
+			// being misconfigured shows as.
+			switch ne := net.Error(nil); {
+			case errors.Is(err, io.EOF):
+				t.stats.proxyHeaderEmpty.Add(1)
+			case errors.As(err, &ne) && ne.Timeout():
 				t.stats.proxyHeaderTimeouts.Add(1)
-			} else {
+			default:
 				t.stats.proxyHeaderErrors.Add(1)
 			}
 			raw.Close()

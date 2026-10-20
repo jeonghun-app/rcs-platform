@@ -60,12 +60,21 @@ Flow Failed.
   an IPv4 address, or the /64 of an IPv6 one. A flow beyond that is refused
   when it is accepted. The default is high because mobile clients share
   public addresses behind carrier-grade NAT. Core flows are not counted.
-- **Flows in all.** Client flows take at most `PCSCF_MAX_CLIENT_FLOWS` of the
-  transport's `PCSCF_MAX_CONNECTIONS`. At least `PCSCF_CORE_CONNECTIONS` of
-  the rest stay for the core listener, so clients cannot keep `scscf` out.
-  A connection counts once its PROXY header is read, so its TLS handshake
-  is counted; connections still sending the PROXY header are not yet, and
-  per-listener limits for them are #193.
+- **Flows in all.** The client listener holds at most
+  `PCSCF_MAX_CLIENT_FLOWS` connections of the transport's
+  `PCSCF_MAX_CONNECTIONS`, and the core listener `PCSCF_CORE_CONNECTIONS`;
+  together they must fit under the total, so clients at their limit cannot
+  keep `scscf` out (#193). A connection counts from accept, while it is
+  still sending its PROXY header (at most 2 s) or in its TLS handshake, and
+  as a flow after. `pcscf` opens no stream listener without a limit.
+- **Listener metrics.** Every sweep (30 s) exports
+  `transport.listener_connections.client` and `.core`, the connections each
+  listener holds, to see one near its limit before it refuses; and the PROXY
+  headers since the last sweep that did not arrive in time
+  (`transport.proxy_header_timeouts`), were malformed or cut
+  (`transport.proxy_header_errors`, the sign of an NLB not sending them), or
+  never started, the connection closed before its first byte as a TCP
+  health check does (`transport.proxy_header_empty`).
 
 ## Registration
 
@@ -184,8 +193,8 @@ start with that value.
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_MAX_PENDING_REGISTERS_PER_IP` | `64` | identities one client address (IPv4 address or IPv6 /64) may have REGISTERs under way for at once, 1 to 1024 |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |
-| `PCSCF_MAX_CLIENT_FLOWS` | `9000` | client flows among them; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
-| `PCSCF_CORE_CONNECTIONS` | `256` | connections kept for the core listener |
+| `PCSCF_MAX_CLIENT_FLOWS` | `9000` | connections the client listener holds among them, counted from accept; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
+| `PCSCF_CORE_CONNECTIONS` | `256` | connections the core listener holds, kept for it |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
 | `PCSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop spreads the closing of client flows over; plus 5 s it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 

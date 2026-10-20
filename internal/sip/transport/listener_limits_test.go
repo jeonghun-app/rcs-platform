@@ -253,3 +253,40 @@ func TestAConnectionAcceptedAfterCloseIsRefusedAsTheTransports(t *testing.T) {
 		t.Fatal("a connection after Close was not refused as the transport's")
 	}
 }
+
+// A connection closed before it sends any byte of its PROXY header, as a TCP
+// health check or a port scan does, is counted apart from a malformed or cut
+// header, so that ProxyHeaderErrors still says the NLB is misconfigured
+// (#227 QA).
+func TestAConnectionClosedBeforeItsProxyHeaderIsNotAnError(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: TCP, ProxyProtocol: true, ProxyHeaderTimeout: time.Minute})
+	cut := dialRaw(t, addr)
+	cut.Write(proxySignature[:5])
+	cut.Close()
+	eventually(t, "the cut header to be counted", func() bool {
+		s := server.Stats()
+		return s.ProxyHeaderErrors == 1 && s.PendingAccepted == 0
+	})
+	dialRaw(t, addr).Close()
+	// The slot is given back after the close is counted.
+	eventually(t, "the empty connection to be counted", func() bool {
+		s := server.Stats()
+		return s.ProxyHeaderEmpty == 1 && s.PendingAccepted == 0
+	})
+	if s := server.Stats(); s.ProxyHeaderErrors != 1 || s.ProxyHeaderTimeouts != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	rec.none(t)
+}
+
+// A UDP listener holds no connections, so the per-listener gauge leaves it
+// out (#227 QA).
+func TestUDPListenersAreNotInTheConnectionGauge(t *testing.T) {
+	server, _ := newTransport(t, Config{})
+	listen(t, server, ListenerConfig{Name: "stream", Network: TCP})
+	listen(t, server, ListenerConfig{Name: "datagram", Network: UDP})
+	if got := server.Stats().ListenerConnections; len(got) != 1 || got["stream"] != 0 {
+		t.Fatalf("per-listener connections = %v, want stream alone", got)
+	}
+}
