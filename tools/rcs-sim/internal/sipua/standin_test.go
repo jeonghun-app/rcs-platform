@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,6 +59,12 @@ type standIn struct {
 	grant uint32
 	// rewrite, when set, changes each contact the 2xx to REGISTER lists.
 	rewrite func(*sip.Contact)
+	// auth, when set, authenticates every REGISTER as the S-CSCF does, and
+	// proxyAuth, before it, as a proxy on the way would.
+	auth, proxyAuth *authRegistrar
+	// hook, when set, answers REGISTERs in their place: a response, or nil
+	// for the stand-in's own 200.
+	hook func(req *sip.Request, tag string) *sip.Response
 	// noOutbound leaves Require: outbound out of the 2xx to REGISTER, as a
 	// registrar that did not use the reg-id does (RFC 5626 §6).
 	noOutbound bool
@@ -71,8 +78,23 @@ type standIn struct {
 	registers, open, overlaps int
 	// lastExpires is the Expires of the last REGISTER received.
 	lastExpires uint32
+	// holdBye, when set, keeps BYEs unanswered until it is closed.
+	holdBye chan struct{}
 
 	got chan received
+	// onInvite, when set, answers each INVITE, as the far end would; the
+	// stand-in answers CANCEL itself, with 487 to the INVITE (RFC 3261
+	// §9.2). acks hears the ACKs to 2xx, which reach the TU as strays.
+	onInvite func(tx *transaction.ServerTransaction)
+	// onCancel, when set, answers the INVITE a CANCEL names instead of
+	// the stand-in's 487.
+	onCancel func(inv *transaction.ServerTransaction)
+	acks     chan *sip.Request
+	// onSubscribe, when set, answers each SUBSCRIBE, as the notifier.
+	onSubscribe func(tx *transaction.ServerTransaction)
+	// closing is set as the test ends: a request it has already read may
+	// still be answered then, and fail to be, which is no fault.
+	closing atomic.Bool
 }
 
 type received struct {
@@ -82,7 +104,7 @@ type received struct {
 
 func newStandIn(t *testing.T, network transport.Network) *standIn {
 	t.Helper()
-	s := &standIn{t: t, got: make(chan received, 64)}
+	s := &standIn{t: t, got: make(chan received, 64), acks: make(chan *sip.Request, 16)}
 	var cfg transport.Config
 	if network == transport.TLS {
 		ts := httptest.NewTLSServer(http.NotFoundHandler()) // only for its certificate
@@ -96,7 +118,7 @@ func newStandIn(t *testing.T, network transport.Network) *standIn {
 	}
 	s.tr = tr
 	s.layer = transaction.New(tr, s, transaction.Config{})
-	t.Cleanup(func() { s.layer.Close(); tr.Close() })
+	t.Cleanup(func() { s.closing.Store(true); s.layer.Close(); tr.Close() })
 	s.addr, err = tr.Listen(transport.ListenerConfig{
 		Network: network, Addr: "127.0.0.1:0", ClientFacing: true,
 		AdvertisedHost: "pcscf.example.com", AdvertisedPort: 5060,
@@ -125,7 +147,40 @@ func (s *standIn) config() Config {
 func (s *standIn) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
 	s.got <- received{req.Clone(), tx.Source()}
+	switch {
+	case req.Method == "INVITE" && s.onInvite != nil:
+		s.onInvite(tx)
+		return
+	case req.Method == "SUBSCRIBE" && s.onSubscribe != nil:
+		s.onSubscribe(tx)
+		return
+	case req.Method == "CANCEL":
+		if res, err := sip.NewResponse(req, 200, "", "c1"); err == nil {
+			tx.Respond(res)
+		}
+		if inv, ok := s.layer.InviteFor(req); ok && s.onCancel != nil {
+			s.onCancel(inv)
+		} else if ok {
+			if res, err := sip.NewResponse(inv.Request(), 487, "", "callee"); err == nil {
+				// Refused once the INVITE has its final response.
+				_ = inv.Respond(res)
+			}
+		}
+		return
+	}
 	var wait time.Duration
+	s.mu.Lock()
+	hold := s.holdBye
+	s.mu.Unlock()
+	if req.Method == "BYE" && hold != nil {
+		go func() {
+			<-hold
+			if res := s.response(req); res != nil {
+				_ = tx.Respond(res)
+			}
+		}()
+		return
+	}
 	if req.Method == "REGISTER" {
 		s.mu.Lock()
 		s.registers++
@@ -149,7 +204,7 @@ func (s *standIn) Request(tx *transaction.ServerTransaction) {
 			s.open--
 			s.mu.Unlock()
 		}
-		if err := tx.Respond(res); err != nil {
+		if err := tx.Respond(res); err != nil && !s.closing.Load() {
 			s.t.Errorf("stand-in: answering %s: %v", req.Method, err)
 		}
 	}
@@ -168,6 +223,18 @@ func (s *standIn) response(req *sip.Request) *sip.Response {
 	code := 200
 	if req.Method == "REGISTER" && s.refuse != 0 {
 		code = s.refuse
+	}
+	if req.Method == "REGISTER" && code == 200 && s.hook != nil {
+		if res := s.hook(req, tag); res != nil {
+			return res
+		}
+	}
+	for _, a := range []*authRegistrar{s.proxyAuth, s.auth} {
+		if req.Method == "REGISTER" && code == 200 && a != nil {
+			if res := a.check(s.t, req, tag); res != nil {
+				return res
+			}
+		}
 	}
 	res, err := sip.NewResponse(req, code, "", tag)
 	if err != nil {
@@ -212,7 +279,18 @@ func (s *standIn) response(req *sip.Request) *sip.Response {
 	return res
 }
 
-func (s *standIn) Stray(transport.Inbound) {}
+// registerCount is how many REGISTERs the stand-in has received.
+func (s *standIn) registerCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registers
+}
+
+func (s *standIn) Stray(in transport.Inbound) {
+	if req, ok := in.Message.(*sip.Request); ok && req.Method == "ACK" {
+		s.acks <- req
+	}
+}
 
 func (s *standIn) ServerFailed(*transaction.ServerTransaction, error) {}
 
@@ -248,6 +326,13 @@ func (s *standIn) send(t *testing.T, method string, flow transport.FlowID) *sip.
 			t.Fatal(err)
 		}
 	}
+	return s.sendRequest(t, req, flow)
+}
+
+// sendRequest sends req over flow and returns its final response.
+func (s *standIn) sendRequest(t *testing.T, req *sip.Request, flow transport.FlowID) *sip.Response {
+	t.Helper()
+	method := req.Method
 	final := make(chan *sip.Response, 1)
 	_, err := s.layer.Request(req, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
 		if err != nil {

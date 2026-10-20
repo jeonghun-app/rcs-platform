@@ -42,7 +42,9 @@ Anything that reaches a core SIP port can send as any subscriber by setting
 **Control:** only `pcscf` faces clients and strips client-supplied
 `P-Asserted-Identity` and the other network-only headers, on a client listener
 separate from its core listener; core SIP ports admit only platform services
-(ADR 0007 §2, §7).
+(ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
+default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
+messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
 **Status:** planned (#16, Phase 7 infrastructure).
 **Residual risk (accepted, #208):** `pcscf` checks a client's in-dialog
 request against its own Record-Route values only, keeping no dialog state.
@@ -190,7 +192,7 @@ metadata.
     can lock the others out, whether it writes 1-to-1 or in groups; 1-to-1
     notifications are bounded by the sent records and by being accepted once
     instead, group notifications by one share per group and a quarter of the
-    queue for all groups together (T11);
+    queue for all groups together, and their summaries by an eighth (T11);
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
@@ -267,7 +269,12 @@ metadata.
   - each recipient's queue as in 1-to-1 chat, where a group message counts
     against its author's share, the one its 1-to-1 messages use; each
     group's notifications hold one share, and all groups' together a quarter
-    of the queue, beyond which they are dropped;
+    of the queue; beyond that they are summarized as one queue item per
+    message, at most an eighth of the queue in all, sent from the marks of
+    notifications already accepted, so the summary adds nothing a participant
+    did not report. A participant who sends receipts for many of the author's
+    messages fills at most that eighth, and the author's 1-to-1 messages keep
+    the rest;
   - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
     be SIP or tel URIs, compared in canonical form, and names XML-safe text,
     so that one bad value cannot make the stored roster unwritable;
