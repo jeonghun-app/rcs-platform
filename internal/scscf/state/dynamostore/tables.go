@@ -13,7 +13,7 @@ import (
 // CreateTables creates the three tables as the package documentation defines
 // them and waits until they are active. It is for DynamoDB Local (integration
 // tests, the compose stack); in AWS the tables come from CloudFormation, which
-// also turns on TTL on auth-challenges' expires.
+// also turns on TTL on auth-challenges' expires and registrations' ttl.
 func CreateTables(ctx context.Context, api *dynamodb.Client, c Config) error {
 	d, err := New(api, Config{
 		RegistrationsTable: c.RegistrationsTable, ChallengesTable: c.ChallengesTable,

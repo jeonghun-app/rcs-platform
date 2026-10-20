@@ -21,8 +21,9 @@ type Memory struct {
 	rand io.Reader
 
 	mu            sync.Mutex
-	registrations map[string]*Registration
-	profiles      map[ProfileKey]storedProfile
+	registrations map[SetKey]*Registration
+	identities    map[string]*Identity
+	profiles      map[SetKey]*Profile
 	challenges    map[challengeKey]*Challenge
 	added         int
 	subscriptions map[string]*Subscription
@@ -30,29 +31,25 @@ type Memory struct {
 
 type challengeKey struct{ impi, nonce string }
 
-type storedProfile struct {
-	userData []byte
-	received time.Time
-}
-
 var _ Store = (*Memory)(nil)
 
 // NewMemory returns an empty store.
 func NewMemory() *Memory {
 	return &Memory{
 		rand:          randReader,
-		registrations: map[string]*Registration{},
-		profiles:      map[ProfileKey]storedProfile{},
+		registrations: map[SetKey]*Registration{},
+		identities:    map[string]*Identity{},
+		profiles:      map[SetKey]*Profile{},
 		challenges:    map[challengeKey]*Challenge{},
 		subscriptions: map[string]*Subscription{},
 	}
 }
 
 // Registration implements Registrations.
-func (m *Memory) Registration(_ context.Context, impu string) (*Registration, error) {
+func (m *Memory) Registration(_ context.Context, k SetKey) (*Registration, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.registrations[impu]
+	r, ok := m.registrations[k]
 	if !ok {
 		return nil, fmt.Errorf("state: registration: %w", ErrNotFound)
 	}
@@ -65,11 +62,11 @@ func (m *Memory) RegistrationsOf(_ context.Context, impi string) ([]*Registratio
 	defer m.mu.Unlock()
 	var out []*Registration
 	for _, r := range m.registrations {
-		if r.IMPI == impi {
+		if r.Key.IMPI == impi {
 			out = append(out, r.Clone())
 		}
 	}
-	slices.SortFunc(out, func(a, b *Registration) int { return strings.Compare(a.IMPU, b.IMPU) })
+	slices.SortFunc(out, func(a, b *Registration) int { return strings.Compare(a.Key.IMPU, b.Key.IMPU) })
 	return out, nil
 }
 
@@ -80,7 +77,7 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cur, ok := m.registrations[r.IMPU]
+	cur, ok := m.registrations[r.Key]
 	var stored int64
 	if ok {
 		stored = cur.Version
@@ -89,10 +86,84 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 	if err != nil {
 		return nil, err
 	}
+	if ok && revivesIncarnation(cur, r) {
+		return nil, fmt.Errorf("%w: a record brought back from a deregistration needs a new incarnation", ErrInvalid)
+	}
 	saved := r.Clone()
 	saved.Version = version
-	m.registrations[r.IMPU] = saved
+	m.registrations[r.Key] = saved
 	return saved.Clone(), nil
+}
+
+// Identity implements Registrations.
+func (m *Memory) Identity(_ context.Context, impu string, now time.Time) (*Identity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.identities[impu]
+	if !ok || !i.KeepUntil.After(now) {
+		return nil, fmt.Errorf("state: identity: %w", ErrNotFound)
+	}
+	c := *i
+	return &c, nil
+}
+
+// KeepIdentity implements Registrations.
+func (m *Memory) KeepIdentity(_ context.Context, impu string, until, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.identities[impu]
+	if !ok || !i.KeepUntil.After(now) {
+		return fmt.Errorf("state: keep identity: %w", ErrNotFound)
+	}
+	if until = until.Truncate(time.Second); until.After(i.KeepUntil) {
+		i.KeepUntil = until
+		i.Version++
+	}
+	return nil
+}
+
+// SaveIdentity implements Registrations.
+func (m *Memory) SaveIdentity(_ context.Context, i *Identity, now time.Time) (*Identity, error) {
+	if err := i.Validate(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.identities[i.IMPU]
+	if ok && i.Version == 0 && !cur.KeepUntil.After(now) {
+		// Gone to Identity: a create takes its place.
+		ok = false
+	}
+	var stored int64
+	if ok {
+		stored = cur.Version
+	}
+	version, err := m.nextVersion("identity", ok, stored, i.Version)
+	if err != nil {
+		return nil, err
+	}
+	saved := *i
+	saved.Version = version
+	saved.KeepUntil = saved.KeepUntil.Truncate(time.Second)
+	m.identities[i.IMPU] = &saved
+	out := saved
+	return &out, nil
+}
+
+// DeleteIdentity implements Registrations.
+func (m *Memory) DeleteIdentity(_ context.Context, i *Identity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.identities[i.IMPU]
+	var stored int64
+	if ok {
+		stored = cur.Version
+	}
+	if err := checkDelete("identity", ok, stored, i.Version); err != nil {
+		return err
+	}
+	delete(m.identities, i.IMPU)
+	return nil
 }
 
 // nextVersion applies the optimistic concurrency rule of the Save methods and
@@ -115,7 +186,7 @@ func (m *Memory) nextVersion(what string, exists bool, stored, given int64) (int
 func (m *Memory) DeleteRegistration(_ context.Context, r *Registration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cur, ok := m.registrations[r.IMPU]
+	cur, ok := m.registrations[r.Key]
 	var stored int64
 	if ok {
 		stored = cur.Version
@@ -123,7 +194,7 @@ func (m *Memory) DeleteRegistration(_ context.Context, r *Registration) error {
 	if err := checkDelete("registration", ok, stored, r.Version); err != nil {
 		return err
 	}
-	delete(m.registrations, r.IMPU)
+	delete(m.registrations, r.Key)
 	return nil
 }
 
@@ -151,33 +222,74 @@ func (m *Memory) ExpiringRegistrations(_ context.Context, now time.Time, limit i
 	return out[:min(len(out), max(limit, 0))], nil
 }
 
-// Profile implements Profiles.
-func (m *Memory) Profile(_ context.Context, k ProfileKey) ([]byte, error) {
+// Profile implements Profiles. A profile past its KeepUntil stays until it is
+// deleted or saved again, as in DynamoDB before TTL removes it.
+func (m *Memory) Profile(_ context.Context, k SetKey, now time.Time) (*Profile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.profiles[k]
-	if !ok {
+	if !ok || !p.KeepUntil.After(now) {
 		return nil, fmt.Errorf("state: profile: %w", ErrNotFound)
 	}
-	return slices.Clone(p.userData), nil
+	return p.Clone(), nil
 }
 
 // SaveProfile implements Profiles.
-func (m *Memory) SaveProfile(_ context.Context, k ProfileKey, userData []byte, received time.Time) error {
-	if err := ValidProfile(k, userData, received); err != nil {
+func (m *Memory) SaveProfile(_ context.Context, p *Profile) error {
+	if err := ValidProfile(p); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur, ok := m.profiles[k]; ok && cur.received.After(received) {
+	if cur, ok := m.profiles[p.Key]; ok && cur.Received.After(p.Received) {
+		// The newer profile stays, kept as long as either needs, as
+		// KeepProfile would at p.Received.
+		if keep := p.KeepUntil.Truncate(time.Second); keep.After(cur.KeepUntil) && cur.KeepUntil.After(p.Received) {
+			cur.KeepUntil = keep
+		}
 		return fmt.Errorf("state: save profile: %w", ErrConflict)
 	}
-	m.profiles[k] = storedProfile{userData: slices.Clone(userData), received: received}
+	c := p.Clone()
+	c.KeepUntil = c.KeepUntil.Truncate(time.Second)
+	if cur, ok := m.profiles[p.Key]; ok && cur.KeepUntil.After(c.KeepUntil) {
+		// Never brought closer: a registration may have just extended it.
+		c.KeepUntil = cur.KeepUntil
+	}
+	m.profiles[p.Key] = c
+	return nil
+}
+
+// KeepProfile implements Profiles.
+func (m *Memory) KeepProfile(_ context.Context, k SetKey, until, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[k]
+	if !ok || !p.KeepUntil.After(now) {
+		return fmt.Errorf("state: keep profile: %w", ErrNotFound)
+	}
+	if until = until.Truncate(time.Second); until.After(p.KeepUntil) {
+		p.KeepUntil = until
+	}
+	return nil
+}
+
+// DeleteProfileIf implements Profiles.
+func (m *Memory) DeleteProfileIf(_ context.Context, k SetKey, received time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[k]
+	if !ok {
+		return nil
+	}
+	if !p.Received.Equal(received) {
+		return fmt.Errorf("state: delete profile: %w", ErrConflict)
+	}
+	delete(m.profiles, k)
 	return nil
 }
 
 // DeleteProfile implements Profiles.
-func (m *Memory) DeleteProfile(_ context.Context, k ProfileKey) error {
+func (m *Memory) DeleteProfile(_ context.Context, k SetKey) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.profiles, k)
@@ -327,4 +439,11 @@ func (m *Memory) ExpiringSubscriptions(_ context.Context, now time.Time, limit i
 	}
 	slices.SortFunc(out, func(a, b *Subscription) int { return a.Expires.Compare(b.Expires) })
 	return out[:min(len(out), max(limit, 0))], nil
+}
+
+// revivesIncarnation reports whether saving next over stored brings back a
+// record claimed for a deregistration under the incarnation it was claimed
+// with (Registration.Incarnation).
+func revivesIncarnation(stored, next *Registration) bool {
+	return !stored.Deregistering.IsZero() && next.Deregistering.IsZero() && next.Incarnation == stored.Incarnation
 }

@@ -7,7 +7,8 @@
 //
 // # Tables
 //
-// registrations, partition key pk (string = canonical IMPU):
+// registrations, partition key pk (string), holds three kinds of item. A
+// set's registration, pk set#<IMPI>#<default IMPU>:
 //
 //	version  number   optimistic concurrency; a new item starts at a random
 //	                  value, so a deleted and recreated one never repeats one
@@ -16,13 +17,19 @@
 //	impi     string   key of impi-index (keys only): RegistrationsOf
 //	shard    string   0 to 15, from the key
 //	expires  number   SweepAt in Unix seconds: the earliest contact expiry, or
-//	                  without contacts the end of the deregistration lease
+//	                  without contacts the end of the deregistration lease, or
+//	                  else the end of an unregistered user's state
+//	leased   number   the incarnation, only while claimed for a
+//	                  deregistration: a save that brings the record back is
+//	                  conditional on carrying another
 //
-// The doc names the IMPU's implicit registration set by its default IMPU.
-// The same table holds the profiles, one per set, partition key
-// profile#<IMPI>#<default IMPU>, with the User-Data in doc and received
-// (number, Unix ns) ordering them, and no index attribute, so no index lists
-// them.
+// An identity, pk = the canonical IMPU, holds version, writer, a doc naming
+// its set and the set's incarnation, and ttl (number, Unix seconds), the
+// table's TTL attribute, holding KeepUntil; it has no index attribute. The
+// profiles, one per set, pk profile#<IMPI>#<default IMPU>, hold the User-Data
+// in doc, received (number, Unix ns) ordering them, and ttl holding KeepUntil,
+// and no index attribute either, so no index lists them. Set records have no
+// ttl: DynamoDB must never delete one, only a sweep, which sends the SAR.
 //
 // with global secondary indexes impi-index (partition impi) and expiry-index
 // (partition shard, sort expires), both keys only. The shard spreads the
