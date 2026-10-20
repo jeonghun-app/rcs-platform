@@ -111,10 +111,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		registry:     newRegistry(cfg.MaxRegistrations, d.now),
 		registers:    newLimiter(cfg.RegisterRate, cfg.RegisterBurst, d.now),
 		allRegisters: newTaskLimit(cfg.MaxRegisterRate, cfg.MaxRegisterBurst, d.now),
+		initials:     newLimiter(cfg.InitialRate, cfg.InitialBurst, d.now),
 		icscfFirst:   cmp.Or(d.icscfFirst, icscfFirstTimeout), icscfTotal: cmp.Or(d.icscfTotal, icscfTotalTimeout),
-		metrics: rt.Metrics,
-		icscfs:  resolver, rand: rand.Reader,
-		flows: tr, now: d.now, log: rt.Logger,
+		resolve: resolver, icscfs: resolver, rand: rand.Reader,
+		flows: tr, now: d.now, log: rt.Logger, metrics: rt.Metrics,
 	}
 	pc.registry.perClient = cfg.MaxPendingRegistersPerIP
 	// A closed flow's registrations are gone (RFC 5626 §5.3).
@@ -231,9 +231,16 @@ type allResolver interface {
 }
 
 // allowCore is the addresses a core hop may resolve to: private ones (ADR
-// 0007 §5), and loopback for a stack on one host.
+// 0007 §5), and loopback for a stack on one host, but never this task's own
+// address, however it is written, so that no route sends a request back
+// into this pcscf's own listeners.
 func allowCore(cfg Config) func(netip.Addr) bool {
+	self := cfg.CoreHost.Unmap().WithZone("")
 	return func(a netip.Addr) bool {
+		a = a.Unmap().WithZone("")
+		if a == self {
+			return false
+		}
 		return runtime.IsPrivateAddr(a) || cfg.AllowLoopback && a.IsLoopback()
 	}
 }

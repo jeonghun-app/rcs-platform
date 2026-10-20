@@ -1,8 +1,10 @@
 package pcscf
 
 import (
+	"cmp"
 	"errors"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -34,8 +36,9 @@ const maxPendingPerFlow = 8
 // identities it may assert (P-Associated-URI, RFC 7315).
 type registration struct {
 	flow transport.FlowID
-	// aor is the registered public identity, the To of the REGISTER, as
-	// written by aorKey.
+	// uri is the registered public identity, the To of the REGISTER, and
+	// aor the same as aorKey writes it.
+	uri sip.URI
 	aor string
 	// contacts are the client's contacts on this flow, as the 200 listed
 	// them.
@@ -51,6 +54,10 @@ type registration struct {
 	// alive by either.
 	outbound, viaKeep, keepAlive bool
 	expires                      time.Time
+	// seq orders a flow's registrations by when they were first saved: the
+	// first is the default for a request that names none (TS 24.229
+	// §5.2.6.3.3).
+	seq uint64
 }
 
 // aorKey writes a public identity for comparison: scheme, user and host, the
@@ -95,6 +102,8 @@ type registry struct {
 	// count is the slots taken: identities with a registration, a
 	// reservation or both.
 	count int
+	// seq numbers the registrations in the order they were first saved.
+	seq uint64
 }
 
 type slotKey struct {
@@ -190,8 +199,8 @@ func (r *registry) dropReservationLocked(k slotKey) {
 }
 
 // save stores reg, replacing any registration of the same identity over the
-// same flow. It takes a slot if the identity has none, as when a
-// reservation lapsed.
+// same flow, whose place in the order it keeps. It takes a slot if the
+// identity has none, as when a reservation lapsed.
 func (r *registry) save(reg *registration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -206,6 +215,12 @@ func (r *registry) save(reg *registration) error {
 	if regs == nil {
 		regs = map[string]*registration{}
 		r.byFlow[reg.flow] = regs
+	}
+	if old, ok := regs[reg.aor]; ok {
+		reg.seq = old.seq
+	} else {
+		r.seq++
+		reg.seq = r.seq
 	}
 	regs[reg.aor] = reg
 	return nil
@@ -257,6 +272,24 @@ func (r *registry) lookup(flow transport.FlowID, aor string) (*registration, boo
 		return nil, false
 	}
 	return reg, true
+}
+
+// flowRegistrations returns the registrations of flow that have not
+// expired, the first saved first.
+func (r *registry) flowRegistrations(flow transport.FlowID) []*registration {
+	t := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*registration
+	for aor, reg := range r.byFlow[flow] {
+		if !t.Before(reg.expires) {
+			r.removeLocked(flow, aor)
+			continue
+		}
+		out = append(out, reg)
+	}
+	slices.SortFunc(out, func(a, b *registration) int { return cmp.Compare(a.seq, b.seq) })
+	return out
 }
 
 // sweep forgets every expired registration, and every reservation whose

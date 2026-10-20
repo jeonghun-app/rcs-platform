@@ -168,8 +168,11 @@ type pcscf struct {
 	cfg      Config
 	corePort int
 	registry *registry
-	// registers limits the REGISTERs of one client address.
-	registers *limiter
+	// registers and initials limit the REGISTERs and the requests outside a
+	// dialog of one client.
+	registers, initials *limiter
+	// resolve finds a core hop, as the proxy does.
+	resolve proxy.Resolver
 	// icscfs finds icscf's addresses, every one so that a REGISTER can try
 	// the next.
 	icscfs allResolver
@@ -189,18 +192,23 @@ type pcscf struct {
 	metrics *runtime.Metrics
 }
 
-// Route implements proxy.Router. A client's REGISTER goes to icscf. Until
-// originating and terminating routing land (#16), any other request from a
-// client is refused with 403, and one from the core with 430, since no flow
-// it could name is served yet (RFC 5626 §5.3).
+// Route implements proxy.Router. A client's REGISTER goes to icscf, its
+// other requests outside a dialog along its Service-Route, and those inside
+// one along their Route if pcscf is on it. Until terminating routing lands
+// (#16), a request from the core is refused with 430, since no flow it
+// could name is served yet (RFC 5626 §5.3).
 func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !fromClient(r.Source) {
 		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
 	}
-	if r.Message.Method == "REGISTER" {
+	switch {
+	case r.Message.Method == "REGISTER":
 		return p.register(ctx, r)
+	case r.Initial():
+		return p.originate(ctx, r)
+	default:
+		return p.inDialog(ctx, r)
 	}
-	return proxy.Decision{Status: 403, Reason: "Not Registered"}
 }
 
 // statusFlowFailed is 430 Flow Failed (RFC 5626 §11.5).

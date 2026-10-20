@@ -7,10 +7,9 @@ over `internal/sip/transport`; the service is `internal/pcscf`, and
 `cmd/pcscf` only wires it to `internal/runtime`.
 
 `pcscf` is built in steps (#16). This page describes what is in place: the
-listeners, the edge rules, registration and the shutdown. Originating and
-terminating routing and the reg event follow. Until they land, a client's
-request other than REGISTER is answered 403 and a request from the core 430
-Flow Failed.
+listeners, the edge rules, registration, a client's requests and the
+shutdown. Terminating routing and the reg event follow. Until they land, a
+request from the core is answered 430 Flow Failed.
 
 ## Listeners
 
@@ -170,6 +169,90 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 - A Cloud Map answer holds at most eight records, chosen at random when more
   instances are registered. That is enough for CSCF fleets of that size.
 
+## A client's requests
+
+**Outside a dialog** (no To tag, TS 24.229 §5.2.6.3.3):
+
+- **Registration.** A request needs a registration over the flow it comes
+  on. Without one it is discarded with no response at all, and counted in
+  the `requests.unregistered_discarded` metric. A client whose registration
+  `pcscf` lost then times out and registers again (§5.2.6.3.2A). An
+  INVITE's 100 Trying may already have gone if routing took over 200 ms.
+- **Route.** The request goes along the `Service-Route` its registration
+  received, which replaces whatever Route the client wrote below `pcscf`'s
+  own. A registration without a `Service-Route` is answered 500, since the
+  next hop would otherwise be a core address the client chose.
+- **Identity.** `pcscf` removes `P-Preferred-Identity` and asserts
+  `P-Asserted-Identity` (§5.2.6.3.1, #16 decision 5):
+  - the identity is the first `P-Preferred-Identity` value that a
+    registration over the flow lists in its `P-Associated-URI`, which holds
+    no barred identity; the request then goes along that registration's
+    `Service-Route`. A later value that same registration lists is the
+    alternative identity, asserted beside it if it is of the other kind
+    (RFC 3325 §9.1 allows one SIP or SIPS and one tel URI);
+  - with no match, the identity is the default public identity, the first
+    `P-Associated-URI` of the flow's first registration;
+  - values are matched without case in the host, with the user part
+    unescaped and a tel number without visual separators. A `user=phone`
+    SIP URI with a `+` number also matches the tel URI of that number;
+  - without an alternative, a SIP identity is joined by a tel URI of the
+    same registration: for a `user=phone` one, the tel URI of the same
+    number, or none if there is no such one, so no other number is asserted
+    beside it; otherwise the first tel URI (#16 decision 5);
+  - the values asserted are the registration's, with parameters other than
+    `user` dropped.
+- **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request
+  and `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.6.3.3 7)).
+- **Record-Route.** For a request that sets up a dialog, INVITE, SUBSCRIBE
+  or REFER, `pcscf` records two values (RFC 5658), topmost first:
+  `<sip:<flow token>@<task address>:<core port>;transport=tcp;lr;icid=<icid>>`,
+  with `ob` when the client's Contact has it, for the core, and
+  `<sip:<PCSCF_PUBLIC_HOST>:<PCSCF_PUBLIC_PORT>;transport=tls;lr>` (`tcp`
+  with `tcp`) for the client. The dialog's later requests come back through
+  this task on both sides. A standalone request, such as MESSAGE or
+  OPTIONS, is not recorded (§5.2.6.3.7), so capability discovery and pager
+  messages never carry the flow token.
+- **Limit.** A client address may send `PCSCF_INITIAL_RATE` requests a
+  second outside or inside a dialog, with a burst of `PCSCF_INITIAL_BURST`,
+  beside its REGISTERs. Past that it gets 503 with `Retry-After: 1`.
+
+**Inside a dialog** (#16 decision 6, narrowed in the review of #208):
+`pcscf` keeps no dialog state, so the route a request carries must show that
+the dialog was set up through this `pcscf` and this flow, and it may go only
+to `scscf`. It is forwarded as its Route says only if:
+
+- both of `pcscf`'s Record-Route values were among the Route values it
+  consumed: one naming the public host or an NLB address, and one naming
+  this task's core listener, its address written in any form;
+- the core one's flow token is the flow the request came on;
+- the next hop, the Route below them or else the Request-URI, is `scscf`'s
+  service name (`PCSCF_SCSCF_HOST`) on `PCSCF_SCSCF_PORT` with
+  `transport=tcp`: `scscf` records that name in every dialog `pcscf` is in
+  ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)). An address
+  is never accepted, and no other name is looked up;
+- that name resolves to a private address other than this task's own.
+
+Anything else is answered 403, so a client cannot aim a request at a core
+address of its choosing past `scscf`. A failed lookup of `scscf` is 503 with
+`Retry-After: 1`. Requests count against the client's initial-request limit; an ACK
+for a 2xx, which cannot be answered 503, is dropped past it and counted in
+`requests.ack_rate_discarded`, and follows the route rule too. No registration is needed, so a call can still be ended after the
+client deregisters.
+
+The forwarded request gets a `P-Charging-Vector` with the dialog's icid,
+read back from the core-facing Record-Route value in its route, and the
+`orig-ioi` (§5.2.6.3.5 7), §5.2.6.3.9 3)). The client holds that value, so
+it can choose the icid of its own dialog's requests; a missing or malformed
+one is replaced by a new icid. Nothing consumes charging yet; the value is
+to be signed, like the flow token, when charging (Rf/Ro) does (threat
+model T2).
+
+No core hop of any request, REGISTER and initial requests included, ever
+resolves to this task's own address, however it is written, and every form
+of that address in a Route is taken as `pcscf`'s own. The check is on the
+address, whatever the port, so on a dev stack on one host set
+`PCSCF_CORE_HOST` to an address distinct from `icscf`'s and `scscf`'s.
+
 ## Settings
 
 Environment variables with the `PCSCF_` prefix, plus the shared ones of
@@ -189,10 +272,13 @@ start with that value.
 | `PCSCF_CORE_HOST` | this task's one private IPv4 | the task address `pcscf` names itself by |
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client (IPv4 address or IPv6 /64) |
+| `PCSCF_SCSCF_HOST` | `scscf.<RCS_SERVICE_NAMESPACE>` | `scscf`'s service name, the only next hop of a client's request inside a dialog: a name inside the namespace, not `pcscf`'s own; required without a namespace |
+| `PCSCF_SCSCF_PORT` | `5060` | `scscf`'s SIP port |
 | `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | the Route of a REGISTER: a `sip` URI with `transport=tcp` and `lr`, of an address or a name inside `RCS_SERVICE_NAMESPACE`; required without a namespace |
 | `RCS_IMS_DOMAIN` | required | the operator's IMS domain, a host name: the `orig-ioi` of `P-Charging-Vector` |
 | `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3) |
 | `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
+| `PCSCF_INITIAL_RATE`, `PCSCF_INITIAL_BURST` | `50`, `200` | requests outside a dialog a second per client address, and the burst |
 | `PCSCF_MAX_REGISTER_RATE`, `PCSCF_MAX_REGISTER_BURST` | `2000`, `4000` | REGISTERs a second for all clients of a task together, and the burst |
 | `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
 | `PCSCF_MAX_PENDING_REGISTERS_PER_IP` | `64` | identities one client address (IPv4 address or IPv6 /64) may have REGISTERs under way for at once, 1 to 1024 |

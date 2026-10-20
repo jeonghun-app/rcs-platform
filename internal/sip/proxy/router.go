@@ -69,10 +69,10 @@ type RouterFunc func(ctx context.Context, r *Request) Decision
 // Route calls f.
 func (f RouterFunc) Route(ctx context.Context, r *Request) Decision { return f(ctx, r) }
 
-// Decision is a Router's answer. Exactly one of Serve, Response, Status and
-// Targets is used, in that order of precedence; an empty Decision is answered
-// with 480 Temporarily Unavailable, which §16.5 prescribes for an empty target
-// set.
+// Decision is a Router's answer. Exactly one of Serve, Discard, Response,
+// Status and Targets is used, in that order of precedence; an empty Decision
+// is answered with 480 Temporarily Unavailable, which §16.5 prescribes for an
+// empty target set.
 type Decision struct {
 	// Serve hands the request to the service, which answers it itself as a
 	// user agent server through the UAS: rcs-as, a B2BUA, takes INVITE and
@@ -82,6 +82,13 @@ type Decision struct {
 	// returns without a final response the proxy sends one, 487 after a
 	// CANCEL and 500 otherwise.
 	Serve func(ctx context.Context, u *UAS)
+	// Discard ends the request without any response: its transaction
+	// absorbs the retransmissions, and nothing is sent upstream or
+	// downstream. pcscf discards a request from a client it holds no
+	// registration for, so that the client's Timer B or F fires and it
+	// registers again (TS 24.229 §5.2.6.3.2A). An INVITE's 100 Trying has
+	// already gone if Route took longer than 200 ms (§17.2.1).
+	Discard bool
 	// Response answers the request with a response built for it with
 	// sip.NewResponse, for a service that answers some requests at once (the
 	// scscf registrar). It is sent once, so a 2xx to an INVITE, which must be

@@ -113,7 +113,7 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 504, Reason: "No I-CSCF"}
 	}
 	tries := &icscfTries{left: dsts[1:min(len(dsts), maxICSCFAttempts)], deadline: p.now().Add(p.icscfTotal)}
-	reg := &registration{flow: src.Flow, aor: aor, outbound: usesOutbound(r.Message, contacts), viaKeep: viaKeep(r.Message)}
+	reg := &registration{flow: src.Flow, uri: to.URI, aor: aor, outbound: usesOutbound(r.Message, contacts), viaKeep: viaKeep(r.Message)}
 	return proxy.Decision{
 		Targets: []proxy.Target{icscfTarget(r.Message.URI, dsts[0], p.icscfFirst)},
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {

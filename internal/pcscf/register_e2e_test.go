@@ -174,7 +174,7 @@ func TestARegisterCrossesPcscfAndItsFlowsClosureEndsIt(t *testing.T) {
 	if err != nil || len(paths) != 1 {
 		t.Fatalf("Path %q, %v", got.Header.Get("Path"), err)
 	}
-	if want := fmt.Sprintf("127.0.0.1:%d", s.core.Port()); fmt.Sprintf("%s:%d", paths[0].URI.Host, paths[0].URI.Port) != want {
+	if want := fmt.Sprintf("127.0.0.2:%d", s.core.Port()); fmt.Sprintf("%s:%d", paths[0].URI.Host, paths[0].URI.Port) != want {
 		t.Errorf("Path %q names %s:%d, want the core listener %s", got.Header.Get("Path"), paths[0].URI.Host, paths[0].URI.Port, want)
 	}
 	if vias, _ := got.Header.Via(); len(vias) == 0 || vias[0].Port != int(s.core.Port()) {
@@ -240,8 +240,8 @@ func TestARegisterFailsOverToAnotherICSCF(t *testing.T) {
 	port := icscf.ln.Addr().(*net.TCPAddr).Port
 	cfg := testConfig()
 	cfg.ICSCF = mustURI(t, fmt.Sprintf("sip:icscf.rcs.internal:%d;transport=tcp;lr", port))
-	// Nothing listens on 127.0.0.2 at icscf's port: connecting is refused.
-	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.2", "127.0.0.1")})
+	// Nothing listens on 127.0.0.3 at icscf's port: connecting is refused.
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.3", "127.0.0.1")})
 	c := dial(t, s.client, nil)
 	for i := range 20 {
 		if res := registerOver(t, c); res.StatusCode != 200 {
@@ -250,7 +250,7 @@ func TestARegisterFailsOverToAnotherICSCF(t *testing.T) {
 		<-icscf.got
 	}
 
-	dead := start(t, cfg, deps{lookup: icscfLookup("127.0.0.2", "127.0.0.3")})
+	dead := start(t, cfg, deps{lookup: icscfLookup("127.0.0.3", "127.0.0.4")})
 	if res := registerOver(t, dial(t, dead.client, nil)); res.StatusCode != 504 {
 		t.Errorf("every icscf dead: %d, want 504", res.StatusCode)
 	}
