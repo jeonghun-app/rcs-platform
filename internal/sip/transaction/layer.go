@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +36,7 @@ const (
 	DefaultMaxServerTransactions = 20000
 	// MaxMaxServerTransactions is the largest count Validate accepts.
 	MaxMaxServerTransactions = 1000000
-	// DefaultMaxServerTransactionBytes bounds how much those requests take. A
+	// DefaultMaxServerTransactionBytes bounds the memory they hold. A
 	// server transaction holds its request, body included, until it ends,
 	// which over UDP is 32 s after its final response (Timer J) and after a
 	// failure response to an INVITE up to 32 s more (Timer H); the transport
@@ -149,15 +150,23 @@ type Config struct {
 	DelayTrying bool
 
 	// MaxServerTransactions and MaxServerTransactionBytes bound the live
-	// server transactions, by count and by the size of the requests they hold.
+	// server transactions, by count and by the memory they hold: the request
+	// as received and the response kept for retransmission.
 	// A request that would take either past its bound is answered with 503
 	// Service Unavailable and a Retry-After, statelessly (RFC 3261 §8.2.7),
 	// and never reaches the TU: every transaction holds its request until it
 	// ends, so without a bound a flood of requests is a flood of memory. A
-	// CANCEL for a live INVITE transaction is exempt, since refusing it would
-	// leave that INVITE running; there is at most one per INVITE, so the live
-	// transactions are at most twice the count. Any other CANCEL counts like
-	// any request. ACK never starts a transaction.
+	// CANCEL for a live INVITE transaction is exempt from the count, since
+	// refusing it would leave that INVITE running; there is at most one per
+	// INVITE, so the live transactions are at most twice the count. It still
+	// counts against the whole byte bound, core share included, which an
+	// ordinary CANCEL of a few hundred bytes always finds room in. Any other
+	// CANCEL counts like any request. ACK never starts a transaction.
+	//
+	// Responses are charged once sent, never refused: a transaction admitted
+	// under the byte bound may still take one final response beyond it, held
+	// over UDP until Timer J or H ends and over TCP until the ACK. A 2xx to an
+	// INVITE is not held at all (RFC 6026 §7.1: the TU retransmits it).
 	//
 	// Zero takes DefaultMaxServerTransactions and
 	// DefaultMaxServerTransactionBytes; Validate accepts a count of 0 or 1 to
@@ -220,7 +229,8 @@ type Layer struct {
 	mu      sync.Mutex
 	clients map[string]*ClientTransaction
 	servers map[string]*ServerTransaction
-	// serverBytes is the request size the server transactions hold.
+	// serverBytes is what the server transactions hold: their requests and
+	// the responses kept for retransmission.
 	serverBytes int64
 	closed      bool
 }
@@ -254,8 +264,8 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 	l := &Layer{
 		maxServers:    cfg.MaxServerTransactions,
 		maxBytes:      cfg.MaxServerTransactionBytes,
-		clientServers: int64(float64(cfg.MaxServerTransactions) * cfg.ClientShare),
-		clientBytes:   int64(float64(cfg.MaxServerTransactionBytes) * cfg.ClientShare),
+		clientServers: clientShare(int64(cfg.MaxServerTransactions), cfg.ClientShare),
+		clientBytes:   clientShare(cfg.MaxServerTransactionBytes, cfg.ClientShare),
 		tagKey:        key,
 		retryAfter:    strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
 		ids:           cfg.IDs,
@@ -350,7 +360,7 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 			return
 		}
 		size := requestSize(req)
-		if !l.roomFor(size, in.Source) && !l.cancelsLiveInvite(req) {
+		if !l.roomFor(size, in.Source) && !(l.cancelsLiveInvite(req) && l.serverBytes+size <= l.maxBytes) {
 			l.mu.Unlock()
 			l.refuse(req, in.Source)
 			return
@@ -402,14 +412,40 @@ func (l *Layer) cancelsLiveInvite(req *sip.Request) bool {
 	return err == nil && l.servers[key] != nil
 }
 
-// requestSize is about what a server transaction holds for req: its header
-// fields, Request-URI and body.
+// Fixed costs of a held message beyond its bytes: the transaction, request
+// and parsed URI, and the parsed form of each header field. Measured with
+// TestCountedBytesTrackTheHeap; they matter for requests of many short
+// fields, which would otherwise take several times what they count.
+const (
+	txOverhead    = 1200
+	fieldOverhead = 80
+)
+
+// requestSize is what a server transaction holds for req: its header block as
+// received, whitespace included (sip.Header.WireSize), its body and the fixed
+// costs.
 func requestSize(req *sip.Request) int64 {
-	n := int64(len(req.Method) + len(req.URI.String()) + len(req.Body) + 16)
-	for _, f := range req.Header.Fields() {
-		n += int64(len(f.Name) + len(f.Value) + 4)
-	}
-	return n
+	return txOverhead + int64(len(req.URI.String())+req.Header.WireSize()+len(req.Body)+req.Header.Len()*fieldOverhead)
+}
+
+// responseSize is what a server transaction holds for a response it keeps.
+func responseSize(res *sip.Response) int64 {
+	return int64(len(res.Reason) + res.Header.WireSize() + len(res.Body) + res.Header.Len()*fieldOverhead)
+}
+
+// clientShare is share of bound, rounded up so that a bound of 1 still lets a
+// client request in.
+func clientShare(bound int64, share float64) int64 {
+	return int64(math.Ceil(float64(bound) * share))
+}
+
+// charge changes what tx holds of the byte bound by delta. tx.mu is held, and
+// l.mu is taken inside it, as remove does.
+func (l *Layer) charge(tx *ServerTransaction, delta int64) {
+	l.mu.Lock()
+	l.serverBytes += delta
+	tx.size += delta
+	l.mu.Unlock()
 }
 
 // refusalTag is the To tag of the 503 for req: a function of the transaction
@@ -462,7 +498,7 @@ func (l *Layer) refuse(req *sip.Request, src transport.Source) {
 type Stats struct {
 	ClientTransactions     int   // live
 	ServerTransactions     int   // live, against MaxServerTransactions
-	ServerTransactionBytes int64 // request bytes they hold, against MaxServerTransactionBytes
+	ServerTransactionBytes int64 // bytes they hold, requests and kept responses, against MaxServerTransactionBytes
 	// ServerTransactionsRejected counts requests refused at the caps,
 	// retransmissions of a refused request included, and including the rare
 	// refusal whose 503 could not be built and was not sent.

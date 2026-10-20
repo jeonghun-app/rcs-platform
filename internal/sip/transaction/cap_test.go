@@ -127,35 +127,41 @@ func TestNewFailsWithoutRandomnessForItsKey(t *testing.T) {
 
 // Code review (PR #170), finding 1: RFC 3261 §8.2.7 has a stateless UAS give
 // a request the same To tag every time and ignore the ACK for its response.
+// QA (second round): an RFC 2543 client, whose branch has no magic cookie and
+// whose ACK is matched on the To tag (§17.2.3), gets the same.
 func TestRefusedInviteGetsTheSameTagAndItsAckGoesNowhere(t *testing.T) {
-	h := newHarness(t, transport.UDP, Config{MaxServerTransactions: 1})
-	h.receive(request(t, "MESSAGE", "z9hG4bKfill"))
-	h.tu.take()
-	inv := request(t, "INVITE", "z9hG4bKinv")
-	tags := map[string]bool{}
-	var tag string
-	for range 2 { // the INVITE and a retransmission of it
-		h.receive(inv)
-		to, _ := lastResponse(t, h).Header.To()
-		tag = to.Tag()
-		tags[tag] = true
-	}
-	if len(tags) != 1 {
-		t.Fatalf("a retransmission got another To tag: %v", tags)
-	}
-	ack := request(t, "ACK", "z9hG4bKinv")
-	ack.Header.Set("To", "<sip:bob@example.com>;tag="+tag)
-	h.receive(ack)
-	if got := h.tu.take(); len(got) != 0 {
-		t.Fatalf("the ACK for the 503 reached the TU: %q", got)
-	}
-	// An ACK with another tag is not ours, and goes to the TU as before.
-	other := request(t, "ACK", "z9hG4bKinv")
-	other.Header.Set("To", "<sip:bob@example.com>;tag=someone-else")
-	h.receive(other)
-	check(t, "TU calls", h.tu.take(), []string{"stray ACK"})
-	if s := h.layer.Stats(); s.RefusalAcksAbsorbed != 1 {
-		t.Fatalf("stats = %+v", s)
+	for _, branch := range []string{"z9hG4bKinv", "oldstyle1"} {
+		t.Run(branch, func(t *testing.T) {
+			h := newHarness(t, transport.UDP, Config{MaxServerTransactions: 1})
+			h.receive(request(t, "MESSAGE", "z9hG4bKfill"))
+			h.tu.take()
+			inv := request(t, "INVITE", branch)
+			tags := map[string]bool{}
+			var tag string
+			for range 2 { // the INVITE and a retransmission of it
+				h.receive(inv)
+				to, _ := lastResponse(t, h).Header.To()
+				tag = to.Tag()
+				tags[tag] = true
+			}
+			if len(tags) != 1 {
+				t.Fatalf("a retransmission got another To tag: %v", tags)
+			}
+			ack := request(t, "ACK", branch)
+			ack.Header.Set("To", "<sip:bob@example.com>;tag="+tag)
+			h.receive(ack)
+			if got := h.tu.take(); len(got) != 0 {
+				t.Fatalf("the ACK for the 503 reached the TU: %q", got)
+			}
+			// An ACK with another tag is not ours, and goes to the TU as before.
+			other := request(t, "ACK", branch)
+			other.Header.Set("To", "<sip:bob@example.com>;tag=someone-else")
+			h.receive(other)
+			check(t, "TU calls", h.tu.take(), []string{"stray ACK"})
+			if s := h.layer.Stats(); s.RefusalAcksAbsorbed != 1 {
+				t.Fatalf("stats = %+v", s)
+			}
+		})
 	}
 }
 
@@ -185,7 +191,7 @@ func TestRequestBytesAreBoundedAsWellAsTheirNumber(t *testing.T) {
 	h := newHarness(t, transport.TCP, Config{MaxServerTransactionBytes: 64 << 10})
 	big := func(branch string) *sip.Request {
 		req := request(t, "MESSAGE", branch)
-		req.Body = make([]byte, 30<<10)
+		req.Body = make([]byte, 28<<10)
 		return req
 	}
 	first := big("z9hG4bKbig1")
@@ -197,7 +203,7 @@ func TestRequestBytesAreBoundedAsWellAsTheirNumber(t *testing.T) {
 		t.Fatalf("third request got %d, want 503", res.StatusCode)
 	}
 	s := h.layer.Stats()
-	if s.ServerTransactionBytes < 60<<10 || s.ServerTransactionBytes > 64<<10 || s.ServerTransactionsRejected != 1 {
+	if s.ServerTransactionBytes < 2*28<<10 || s.ServerTransactionBytes > 64<<10 || s.ServerTransactionsRejected != 1 {
 		t.Fatalf("stats = %+v", s)
 	}
 	// Ending a transaction gives its bytes back (Timer J is zero over TCP).

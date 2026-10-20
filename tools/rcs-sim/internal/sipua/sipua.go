@@ -324,7 +324,11 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		c.Close()
 		return nil, err
 	}
-	ua.layer = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock})
+	if ua.layer, err = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock}); err != nil {
+		ua.tr.Close()
+		c.Close()
+		return nil, err
+	}
 	return ua, nil
 }
 

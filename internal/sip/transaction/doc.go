@@ -17,8 +17,8 @@
 // responses, which are end to end (§17.1.1.3, §13.2.2.4), and responses that
 // match no client transaction, which a proxy forwards statelessly (§16.7, §16.11).
 //
-// The layer bounds its server transactions by count and by the size of the
-// requests they hold (Config.MaxServerTransactions and
+// The layer bounds its server transactions by count and by the memory their
+// requests and kept responses hold (Config.MaxServerTransactions and
 // MaxServerTransactionBytes), keeping a share of both for core traffic; a
 // request beyond them is answered with 503 and Retry-After without a
 // transaction (RFC 3261 §21.5.4, §8.2.7), and the ACK for that 503 goes no

@@ -115,7 +115,9 @@ func newStandIn(t *testing.T, network transport.Network) *standIn {
 		t.Fatal(err)
 	}
 	s.tr = tr
-	s.layer = transaction.New(tr, s, transaction.Config{})
+	if s.layer, err = transaction.New(tr, s, transaction.Config{}); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { s.closing.Store(true); s.layer.Close(); tr.Close() })
 	s.addr, err = tr.Listen(transport.ListenerConfig{
 		Network: network, Addr: "127.0.0.1:0", ClientFacing: true,
