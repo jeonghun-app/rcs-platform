@@ -387,8 +387,15 @@ func TestAParamIsReadWithoutCaseAndUnquoted(t *testing.T) {
 
 // docs/architecture.md §8: a parser is linear on a maximum-size adversarial
 // input. Times are compared, not bounded, so a loaded host slows both
-// alike; the best of three runs smooths out the rest.
+// alike; the two sizes are timed in turn and the best of five runs of each
+// is compared, so a burst of load costs one run, not one size. Under the
+// race detector the test is skipped: it times its own instrumentation as
+// much as the parser, and failed so on a loaded host (#223 QA); the run
+// without it is the one that catches a quadratic parser.
 func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
+	if raceEnabled {
+		t.Skip("timing under the race detector says little about the parser")
+	}
 	for name, build := range map[string]func(n int) string{
 		"attributes on the root": func(n int) string {
 			var b strings.Builder
@@ -444,20 +451,21 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 				_, _ = Parse([]byte(text))
 				return time.Since(start)
 			}
-			best := func(n int) time.Duration {
+			input := func(n int) string {
 				text := build(n)
 				if len(text) > MaxDocumentSize {
 					t.Fatalf("input of %d bytes", len(text))
 				}
-				d := parse(text)
-				for range 2 {
-					d = min(d, parse(text))
-				}
-				return d
+				return text
+			}
+			smallText, largeText := input(MaxDocumentSize/64), input(MaxDocumentSize)
+			small, large := time.Duration(1<<62), time.Duration(1<<62)
+			for range 5 {
+				small = min(small, parse(smallText))
+				large = min(large, parse(largeText))
 			}
 			// 64 times the input: about 64 times the time if linear, 4096
 			// if quadratic; the bound between needs no absolute slack.
-			small, large := best(MaxDocumentSize/64), best(MaxDocumentSize)
 			if large > 512*small {
 				t.Fatalf("64× the input took %v against %v: not linear", large, small)
 			}
