@@ -34,17 +34,22 @@ func TestTerminatingAnswersFollowTheMappingTable(t *testing.T) {
 		// §5.3.2.1: chosen by capability.
 		{"unregistered service with capabilities", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, via("sip:scscf-b.rcs.local;transport=tcp;lr"), "icscf.terminating.forwarded"},
 		{"unregistered service, any S-CSCF", lia(experimental(cx.UnregisteredService), "", nil), nil, via(scscfURI + ";lr"), "icscf.terminating.forwarded"},
+		// TS 29.228 §6.7.
+		{"a name inside the capabilities", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}, ServerNames: []string{"sip:scscf-0.rcs.local"}}), nil, via("sip:scscf-0.rcs.local;lr"), "icscf.terminating.forwarded"},
 		// TS 24.229 names no response for this; decided on #274.
 		{"no S-CSCF qualifies", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}}), nil, outcome{status: 480}, "icscf.scscf.no_capable"},
 		// §5.3.2.1, §5.3.2.2.
 		{"5001 user unknown", lia(experimental(cx.ErrorUserUnknown), "", nil), nil, outcome{status: 404}, "icscf.terminating.404"},
 		{"5003 not registered", lia(experimental(cx.ErrorIdentityNotRegistered), "", nil), nil, outcome{status: 480}, "icscf.terminating.480"},
 		{"another Cx error", lia(experimental(cx.ErrorFeatureUnsupported), "", nil), nil, outcome{status: 404}, "icscf.terminating.404"},
-		{"base 5001 is not the user", lia(base(diameter.ResultAVPUnsupported), "", nil), nil, outcome{status: 404}, "icscf.terminating.404"},
-		{"unable to comply", lia(base(diameter.ResultUnableToComply), "", nil), nil, outcome{status: 404}, "icscf.terminating.404"},
+
 		{"authorization rejected", lia(base(diameter.ResultAuthorizationRejected), "", nil), nil, outcome{status: 404}, "icscf.terminating.404"},
 		// Could not be completed: 480 with Retry-After (decision 3 on #15).
 		{"too busy", lia(base(diameter.ResultTooBusy), "", nil), nil, retry, "icscf.hss.unavailable"},
+		// A base 5xxx is the HSS failing, not the user missing (decided on
+		// #274): 5001 is the user only from 3GPP.
+		{"base 5001 is not the user", lia(base(diameter.ResultAVPUnsupported), "", nil), nil, retry, "icscf.hss.unavailable"},
+		{"unable to comply", lia(base(diameter.ResultUnableToComply), "", nil), nil, retry, "icscf.hss.unavailable"},
 		{"no HSS peer", nil, cxclient.ErrNoPeer, retry, "icscf.hss.unavailable"},
 		{"time-out", nil, context.DeadlineExceeded, retry, "icscf.hss.unavailable"},
 		{"malformed answer", nil, errors.New("cx: missing Result-Code"), retry, "icscf.hss.unavailable"},
@@ -224,68 +229,69 @@ func TestTerminatingCancelledWhileTheHSSIsAskedIsCountedAsCancelled(t *testing.T
 	}
 }
 
-// Decided on #274: a branch the proxy could not send to the S-CSCF turns
-// the 500 the proxy ends it in back into 503, with a Retry-After; other
-// endings pass as they are, and 430 still becomes 480.
-func TestAnUnreachableSCSCFIsAnswered503WithRetryAfter(t *testing.T) {
+// Decided on #274: the 500 the proxy ends a terminating request in when it
+// could not send it to the S-CSCF gets a Retry-After; other endings pass as
+// they are.
+func TestAnUnreachableSCSCFIsAnswered500WithRetryAfter(t *testing.T) {
 	req := invite(t, impu1)
-	answer := func(t *testing.T, d proxy.Decision, code int, failed *sip.Response, sendErr error) *sip.Response {
-		t.Helper()
-		if failed != nil {
-			if more := d.OnBranchFailure(context.Background(), proxy.BranchFailure{Target: d.Targets[0], Response: failed, Err: sendErr}); more != nil {
-				t.Fatalf("retargeted to %v", more)
-			}
-		}
+	response := func(code int) *sip.Response {
 		res, err := sip.NewResponse(req, code, "", "t1")
 		if err != nil {
 			t.Fatal(err)
 		}
-		d.OnFinal(context.Background(), res)
-		d.OnResponse(context.Background(), res)
 		return res
-	}
-	made503, err := sip.NewResponse(req, 503, "", "t1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	downstream486, err := sip.NewResponse(req, 486, "", "t1")
-	if err != nil {
-		t.Fatal(err)
 	}
 	for _, tc := range []struct {
 		name       string
 		final      int
 		failed     *sip.Response
 		sendErr    error
-		want       int
 		retryAfter string
 	}{
-		{"send failed", 500, made503, errors.New("connection refused"), 503, "10"},
-		{"a 500 from downstream", 500, nil, nil, 500, ""},
-		// The S-CSCF answered 503 itself: it was reached, and §16.7 step 6
-		// stands.
-		{"a 503 from the S-CSCF", 500, made503, nil, 500, ""},
-		{"a failure response from downstream", 486, downstream486, nil, 486, ""},
-		{"430", 430, nil, nil, 480, ""},
+		{"send failed", 500, response(503), errors.New("connection refused"), "10"},
+		{"a 500 from downstream", 500, nil, nil, ""},
+		// The S-CSCF answered 503 itself: it was reached.
+		{"a 503 from the S-CSCF", 500, response(503), nil, ""},
+		{"a failure response from downstream", 486, response(486), nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := newRig(t)
-			res := answer(t, g.route(invite(t, impu1)), tc.final, tc.failed, tc.sendErr)
-			if res.StatusCode != tc.want || res.Header.Get("Retry-After") != tc.retryAfter {
-				t.Errorf("%d, Retry-After %q; want %d, %q", res.StatusCode, res.Header.Get("Retry-After"), tc.want, tc.retryAfter)
+			d := g.route(invite(t, impu1))
+			if d.OnFinal != nil {
+				t.Fatal("OnFinal is set, which would take the proxy's 430 to 480 away")
 			}
-			if got, want := g.metrics.counts["icscf.scscf.unreachable"], int64(0); tc.want == 503 && got != 1 || tc.want != 503 && got != want {
-				t.Errorf("unreachable counted %d", got)
+			if tc.failed != nil {
+				if more := d.OnBranchFailure(context.Background(), proxy.BranchFailure{Target: d.Targets[0], Response: tc.failed, Err: tc.sendErr}); more != nil {
+					t.Fatalf("retargeted to %v", more)
+				}
+			}
+			res := response(tc.final)
+			d.OnResponse(context.Background(), res)
+			if res.StatusCode != tc.final || res.Header.Get("Retry-After") != tc.retryAfter {
+				t.Errorf("%d, Retry-After %q; want %d, %q", res.StatusCode, res.Header.Get("Retry-After"), tc.final, tc.retryAfter)
+			}
+			want := int64(0)
+			if tc.retryAfter != "" {
+				want = 1
+			}
+			if got := g.metrics.counts["icscf.scscf.unreachable"]; got != want {
+				t.Errorf("unreachable counted %d, want %d", got, want)
 			}
 		})
 	}
-	// The proxy's overload 503 keeps its own Retry-After.
+}
+
+// Decided on #274: an ACK without a To tag is dropped, with no LIR.
+func TestAnAckWithoutAToTagIsDropped(t *testing.T) {
 	g := newRig(t)
-	d := g.route(invite(t, impu1))
-	res, _ := sip.NewResponse(req, 503, "", "t1")
-	_ = res.Header.Add("Retry-After", "120")
-	d.OnResponse(context.Background(), res)
-	if got := res.Header.Get("Retry-After"); got != "120" {
-		t.Errorf("overload Retry-After became %q", got)
+	d := g.route(request(t, "ACK", impu1, "CSeq: 1 ACK"))
+	if len(d.Targets) != 0 || d.Status != 0 || d.Response != nil || d.Serve != nil {
+		t.Fatalf("decision = %+v, want none", d)
+	}
+	if n := g.hss.calls(); n != 0 {
+		t.Errorf("the HSS got %d requests", n)
+	}
+	if got := g.metrics.counts["icscf.routed.dropped_ack"]; got != 1 {
+		t.Errorf("dropped ACKs counted %d", got)
 	}
 }

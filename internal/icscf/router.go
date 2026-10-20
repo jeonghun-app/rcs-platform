@@ -59,6 +59,13 @@ func New(cfg Config) (*Router, error) {
 func (r *Router) Route(ctx context.Context, req *proxy.Request) proxy.Decision {
 	m := req.Message
 	switch {
+	case m.Method == "ACK" && req.Initial():
+		// An ACK belongs to a dialog or to a non-2xx the proxy absorbs
+		// itself; one without a To tag is for neither, and asking the HSS
+		// about it would cost an LIR per ACK (review of #274). It is
+		// dropped.
+		r.count(kindRouted, "dropped_ack")
+		return proxy.Decision{}
 	case m.Method == "REGISTER":
 		return r.register(ctx, m)
 	case !req.Initial() || m.Header.Has("Route"):
@@ -91,7 +98,7 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	if ctx.Err() != nil {
 		return r.cancelled(kindRegister)
 	}
-	if err != nil || cxclient.Classify(uaa.Result) == cxclient.Unavailable {
+	if err != nil || couldNotComplete(uaa.Result) {
 		return r.hssUnavailable(kindRegister, m)
 	}
 	if !uaa.Result.IsSuccess() {
@@ -128,7 +135,7 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 	if ctx.Err() != nil {
 		return r.cancelled(kindTerminating)
 	}
-	if err != nil || cxclient.Classify(lia.Result) == cxclient.Unavailable {
+	if err != nil || couldNotComplete(lia.Result) {
 		return r.hssUnavailable(kindTerminating, m)
 	}
 	switch cxclient.Classify(lia.Result) {
@@ -164,13 +171,14 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 	return d
 }
 
-// answerUnreachable makes a terminating request whose S-CSCF cannot be
-// reached end in 503 with Retry-After, as the HSS's failures do, since the
-// S-CSCF a user needs exists and will be back (decided on #274). The proxy
-// counts a branch it could not send as a 503 of its own (RFC 3261 §16.9),
-// but turns a final 503 into 500 (§16.7 step 6), as it must for one from
-// downstream; so the branch failure marks the request and the 500 it ends
-// in is turned back. The proxy's overload 503 keeps its own Retry-After.
+// answerUnreachable gives the 500 the proxy ends a terminating request in,
+// when it could not send it to the S-CSCF, a Retry-After, as the HSS's
+// failures get: the S-CSCF the user needs exists and will be back (decided
+// on #274). The proxy counts the branch as a 503 of its own (RFC 3261 §16.9)
+// and turns it into 500 (§16.7 step 6); a 503 would not reach the caller
+// either, since the proxy upstream turns it into a 500 and drops the
+// Retry-After, while it passes a 500's on. A 500 from the S-CSCF itself, or a
+// 503 it sent, gets none.
 func (r *Router) answerUnreachable(d *proxy.Decision) {
 	var unreachable atomic.Bool
 	d.OnBranchFailure = func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
@@ -179,19 +187,10 @@ func (r *Router) answerUnreachable(d *proxy.Decision) {
 		}
 		return nil
 	}
-	d.OnFinal = func(_ context.Context, res *sip.Response) {
-		switch {
-		case res.StatusCode == 500 && unreachable.Load():
-			res.StatusCode, res.Reason = 503, sip.DefaultReason(503)
-		case res.StatusCode == 430:
-			// What the proxy does without OnFinal (RFC 5626 §11.5).
-			res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
-		}
-	}
 	strip := d.OnResponse
 	d.OnResponse = func(ctx context.Context, res *sip.Response) {
 		strip(ctx, res)
-		if res.StatusCode != 503 {
+		if res.StatusCode != 500 || !unreachable.Load() {
 			return
 		}
 		r.metrics.Count("icscf.scscf.unreachable", 1)
@@ -201,14 +200,33 @@ func (r *Router) answerUnreachable(d *proxy.Decision) {
 	}
 }
 
+// couldNotComplete reports whether an answer says the HSS could not do what
+// was asked rather than that the user may not have it: a protocol error, a
+// transient 4xxx, or DIAMETER_UNABLE_TO_COMPLY, which TS 29.228 §6.1.1.1
+// gives for an HSS failure such as a database error. TS 24.229 §5.3.1.3 has
+// those answered as a query that could not be completed, not refused
+// (decided on #274).
+func couldNotComplete(r cx.Result) bool {
+	switch cxclient.Classify(r) {
+	case cxclient.Unavailable, cxclient.Failure:
+		return true
+	}
+	return false
+}
+
 var (
 	errBadServerName = errors.New("icscf: the HSS named an S-CSCF that is not a SIP URI")
 	errNoSCSCF       = errors.New("icscf: no configured S-CSCF has the mandatory capabilities")
 )
 
 // scscf is the S-CSCF a successful UAA or LIA names, or else the first one
-// its capabilities allow (rank).
+// its capabilities allow (rank). Server-Name values inside the capabilities
+// are the operator steering the choice, and TS 29.228 §6.7 has the I-CSCF
+// then disregard the capabilities: the first of them is taken as a name.
 func (r *Router) scscf(result cx.Result, name string, caps *cx.ServerCapabilities) (sip.URI, error) {
+	if name == "" && caps != nil && len(caps.ServerNames) > 0 {
+		name = caps.ServerNames[0]
+	}
 	if name != "" {
 		u, err := sip.ParseURI(name)
 		if err != nil || !u.IsSIP() || u.Host == "" {
