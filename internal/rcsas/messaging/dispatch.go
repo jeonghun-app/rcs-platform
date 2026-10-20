@@ -460,6 +460,11 @@ func (e *Engine) stillMember(ctx context.Context, m store.Message) (outcome, boo
 func (e *Engine) chatLeg(user, peer string) *Leg {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.chatLegLocked(user, peer)
+}
+
+// chatLegLocked is chatLeg for a caller holding e.mu.
+func (e *Engine) chatLegLocked(user, peer string) *Leg {
 	legs := e.legs[legKey{user, peer}]
 	for i := len(legs) - 1; i >= 0; i-- {
 		select {
@@ -596,6 +601,22 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 	now := e.clock.Now()
 	e.mu.Lock()
 	if until, ok := e.invites[key]; ok && now.Before(until) {
+		e.mu.Unlock()
+		return
+	}
+	// The pass that found no chat leg for m may have looked just before
+	// one opened: the session asked for earlier was answered, and its leg
+	// took the key out of e.invites (activate). Asking again would open a
+	// second session, and the newer leg, which the client may never bind,
+	// is the one chatLeg gives every delivery after (#260). The leg's
+	// activation has the queue read again, and m goes on it. The check
+	// stays under e.mu with the key's: activate adds the leg and deletes
+	// the key in one critical section, so no pass falls between the two
+	// at that handoff. (A key can also go without a leg, as on a
+	// registration on a new flow or past InviteTimeout; asking again is
+	// meant then.) It records nothing, so once the leg ends the next pass
+	// may ask again at once.
+	if (inv.Mode == store.Chat || inv.Mode == store.Group) && e.chatLegLocked(inv.Recipient, inv.Peer) != nil {
 		e.mu.Unlock()
 		return
 	}

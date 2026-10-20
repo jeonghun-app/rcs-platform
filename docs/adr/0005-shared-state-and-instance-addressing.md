@@ -54,9 +54,11 @@ follows `Via`, a terminating request follows `Path`, an in-dialog request follow
   - When every contact fails, `rcs-as` stores the message for later delivery
     instead of failing it.
   - The client-facing `Record-Route` (the one the client copies into its route
-    set) names the public `pcscf` address, so the client never sees or uses a
-    private IP; the core-facing entry names the instance (double Record-Route,
-    RFC 5658).
+    set) names the public `pcscf` address, and the core-facing entry names the
+    instance (double Record-Route, RFC 5658). The client sees that private
+    address in its route set but cannot use it: it reaches only the public
+    address, and `pcscf` forwards its in-dialog requests to `scscf` alone.
+    (Amended in #208: this said the client never sees a private IP.)
 - `rcs-as` advertises its instance address in `Record-Route`/`Contact` and in
   MSRP paths, because the MSRP session lives on that instance.
 

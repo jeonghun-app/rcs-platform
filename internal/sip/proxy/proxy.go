@@ -259,10 +259,11 @@ func (q quietSender) SendResponse(res *sip.Response, src transport.Source, opts 
 	return q.Sender.SendResponse(res, src, opts...)
 }
 
-// silence ends a non-INVITE server transaction without a response (RFC 4320
-// §4.2): the transaction is given res, which quietSender never sends, so it
-// completes and absorbs retransmissions as if it had answered. The mark is
-// removed once the transaction can no longer resend res (Timer J, 64*T1).
+// silence ends a server transaction without a response (RFC 4320 §4.2, and
+// Decision.Discard): the transaction is given res, which quietSender never
+// sends, so it completes and absorbs retransmissions as if it had answered.
+// The mark is removed once the transaction can no longer resend res: Timer J
+// of a non-INVITE one, Timer H of an INVITE one, both 64*T1.
 func (p *Proxy) silence(tx *transaction.ServerTransaction, res *sip.Response) {
 	p.stats.silenced.Add(1)
 	p.silent.Store(res, true)
