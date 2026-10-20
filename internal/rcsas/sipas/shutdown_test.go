@@ -258,3 +258,39 @@ func TestShutdownEndsASessionRCSASStartedAtOnce(t *testing.T) {
 	}
 	r.waitClosed(t)
 }
+
+// QA on #273 (the test that failed on 6a8c757): RFC 3261 §15, no BYE
+// after the 200 before the client's ACK, which it withholds for 500 ms.
+func TestQA273ByeWaitsForTheACK(t *testing.T) {
+	r := newShutdownRig(t, time.Hour)
+	answered := r.heldInvite(t)
+	r.close()
+	r.release()
+	res := answeredOK(t, answered)
+	s := answeredBy(t, res)
+	select {
+	case req := <-r.core.got:
+		t.Errorf("%s sent after the 200, before the client's ACK (RFC 3261 §15)", req.Method)
+	case <-time.After(500 * time.Millisecond):
+	}
+	r.p.ack(s)
+	r.byeFor(t, res)
+	r.waitClosed(t)
+}
+
+// QA on #273: past Close's bound, no BYE while the INVITE is unanswered;
+// its 200, and its BYE once the store write ends and the ACK is in.
+func TestQA273AnInviteAnsweredAfterCloseIsEndedAfterIts200(t *testing.T) {
+	r := newShutdownRig(t, 100*time.Millisecond)
+	answered := r.heldInvite(t)
+	r.a.srv.Close() // returns after its 100 ms bound
+	select {
+	case req := <-r.core.got:
+		t.Fatalf("%s sent before the INVITE was answered", req.Method)
+	case <-time.After(200 * time.Millisecond):
+	}
+	r.release()
+	res := answeredOK(t, answered)
+	r.ackOf(t, res)
+	r.byeFor(t, res)
+}
