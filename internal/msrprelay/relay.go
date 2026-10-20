@@ -117,6 +117,18 @@ type bridge struct {
 	ended bool
 }
 
+// logged passes each event to count, and logs the ones that say the relay
+// itself is failing, which no metric explains alone: a keep-alive it could
+// not build. side is "client" or "core"; an Event carries no identifier.
+func logged(log *slog.Logger, side string, count func(msrp.Event)) func(msrp.Event) {
+	return func(e msrp.Event) {
+		count(e)
+		if e.Err == msrp.ErrKeepAliveNotSent {
+			log.Error("an MSRP keep-alive could not be sent", slog.String("side", side))
+		}
+	}
+}
+
 func newRelay(o relayOptions) (*Relay, error) {
 	instance, err := msrp.NewMessageID(o.Rand)
 	if err != nil {
@@ -134,8 +146,8 @@ func newRelay(o relayOptions) (*Relay, error) {
 	// is a client whose bridge ended from the core side, the connection is
 	// kept like any other quiet one.
 	o.Edge.UnboundTimeout = o.IdleTimeout
-	o.Edge.Clock, o.Edge.Rand, o.Edge.OnEvent = o.Clock, o.Rand, o.Metrics.onEvent(mClientPrefix)
-	o.Core.Clock, o.Core.Rand, o.Core.OnEvent = o.Clock, o.Rand, o.Metrics.onEvent(mCorePrefix)
+	o.Edge.Clock, o.Edge.Rand, o.Edge.OnEvent = o.Clock, o.Rand, logged(o.Log, "client", o.Metrics.onEvent(mClientPrefix))
+	o.Core.Clock, o.Core.Rand, o.Core.OnEvent = o.Clock, o.Rand, logged(o.Log, "core", o.Metrics.onEvent(mCorePrefix))
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Relay{
 		o:        o,
@@ -288,9 +300,10 @@ func (r *Relay) handle(nc net.Conn) {
 	}
 	// The active side sends its first SEND at once (RFC 4975 §5.4); a
 	// connection that has named no session by now is not going to.
+	var unbound atomic.Bool
 	first := r.o.Clock.AfterFunc(r.o.FirstBindTimeout, func() {
 		if !b.everBound.Load() {
-			r.o.Metrics.add(mUnboundClosed, 1)
+			unbound.Store(true)
 			_ = c.Close()
 		}
 	})
@@ -298,7 +311,14 @@ func (r *Relay) handle(nc net.Conn) {
 	r.o.Metrics.conns.Add(1)
 	<-c.Done()
 	r.o.Metrics.conns.Add(-1)
-	if mc.idled.Load() {
+	// A connection is counted for the reason it ended with. One that a
+	// refusal was delivering answers for (internal/msrp, #219) ends with
+	// that reason whatever closed it meanwhile, and is counted there
+	// alone, not also as unbound or idle.
+	switch err := c.Err(); {
+	case unbound.Load() && errors.Is(err, msrp.ErrConnClosed):
+		r.o.Metrics.add(mUnboundClosed, 1)
+	case mc.idled.Load() && errors.Is(err, errIdle):
 		r.o.Metrics.add(mIdleClosed, 1)
 	}
 }
@@ -805,6 +825,15 @@ func (c *meteredConn) Read(p []byte) (int, error) {
 		return n, errIdle
 	}
 	return n, err
+}
+
+// CloseWrite half-closes the connection, which internal/msrp does to
+// deliver the answers it owes before it closes (#219).
+func (c *meteredConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
 }
 
 func (c *meteredConn) Write(p []byte) (int, error) {

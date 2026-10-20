@@ -385,10 +385,10 @@ func TestCredentialsNeverPrintTheirValues(t *testing.T) {
 
 func TestCredentialsFromTheEnvironment(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	if _, err := DigestCredentialsFromEnv(testIMPI, env(map[string]string{EnvSIPPassword: testPassword})); err != nil {
+	if _, err := DigestCredentialsFromEnv(testIMPI, SelfEnv, env(map[string]string{EnvSIPPassword: testPassword})); err != nil {
 		t.Fatal(err)
 	}
-	c, err := AKACredentialsFromEnv(testIMPI, env(map[string]string{EnvAKAK: testKHex, EnvAKAOPc: strings.ToUpper(testOPcHex)}))
+	c, err := AKACredentialsFromEnv(testIMPI, SelfEnv, env(map[string]string{EnvAKAK: testKHex, EnvAKAOPc: strings.ToUpper(testOPcHex)}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,9 +408,9 @@ func TestCredentialsFromTheEnvironment(t *testing.T) {
 	} {
 		var err error
 		if name == "no password" {
-			_, err = DigestCredentialsFromEnv(testIMPI, env(m))
+			_, err = DigestCredentialsFromEnv(testIMPI, SelfEnv, env(m))
 		} else {
-			_, err = AKACredentialsFromEnv(testIMPI, env(m))
+			_, err = AKACredentialsFromEnv(testIMPI, SelfEnv, env(m))
 		}
 		if err == nil {
 			t.Errorf("%s: accepted", name)

@@ -14,7 +14,8 @@ const (
 	// Failure-Report let the answer go out.
 	EventRefused EventKind = iota + 1
 	// EventDropped: something was dropped without an answer; Err says
-	// what (ErrMalformedResponse, ErrHandlerBusy, ErrReassemblyTimeout).
+	// what (ErrMalformedResponse, ErrHandlerBusy, ErrReassemblyTimeout),
+	// or a keep-alive that could not be sent (ErrKeepAliveNotSent).
 	EventDropped
 	// EventClosed: the connection ended; Err says why.
 	EventClosed
@@ -44,12 +45,15 @@ var (
 	ErrTooManyUnknownSessions = errors.New("msrp: too many requests for unknown sessions")
 	ErrWriteTimeout           = errors.New("msrp: write deadline passed")
 	ErrPeerGone               = errors.New("msrp: connection lost")
+	// ErrKeepAliveNotSent: a keep-alive could not be built, for want of
+	// random bytes for its ids; the next interval tries again.
+	ErrKeepAliveNotSent = errors.New("msrp: keep-alive could not be sent")
 )
 
 // eventErrs are the errors an Event may carry as they are, most specific
 // first.
 var eventErrs = []error{
-	ErrHandlerBusy, ErrReassemblyTimeout, ErrMalformedResponse, ErrTooManyUnknownSessions,
+	ErrHandlerBusy, ErrReassemblyTimeout, ErrMalformedResponse, ErrTooManyUnknownSessions, ErrKeepAliveNotSent,
 	ErrPeerNotReading, ErrKeepAliveTimeout, ErrUnbound, ErrFraming, ErrWriteTimeout, ErrConnClosed,
 }
 

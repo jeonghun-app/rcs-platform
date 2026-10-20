@@ -338,6 +338,31 @@ type Dialog struct {
 	remoteCSeq uint32
 	ended      bool
 	done       chan struct{}
+	// confirmed is closed when the ACK of the 2xx this UA sent arrives;
+	// nil for a dialog this UA made with Invite, confirmed by its own ACK.
+	// retransmitTimer sends that 2xx again meanwhile (uas.go).
+	confirmed       chan struct{}
+	retransmitTimer transaction.Timer
+	// ackGiveUp is closed when 64*T1 have passed without that ACK, by
+	// giveUpTimer.
+	ackGiveUp   chan struct{}
+	giveUpTimer transaction.Timer
+	// byeQueued is set once a Bye whose context ended has left the BYE to
+	// byeLater.
+	byeQueued bool
+}
+
+// closed is a channel that is always closed.
+var closed = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+// Confirmed is closed once the dialog is confirmed (RFC 3261 §12): at once
+// for a dialog Invite made, when the ACK of its 2xx arrives for one
+// IncomingCall.Accept made.
+func (d *Dialog) Confirmed() <-chan struct{} {
+	if d.confirmed == nil {
+		return closed
+	}
+	return d.confirmed
 }
 
 // newDialog makes the dialog of a 2xx to invite (RFC 3261 §12.1.2) and
@@ -487,7 +512,23 @@ func (d *Dialog) Done() <-chan struct{} { return d.done }
 
 // Bye ends the dialog and sends BYE, returning its final response. The
 // session is over as BYE goes out, whatever the answer (RFC 3261 §15.1.1).
+//
+// On the called side the BYE waits for the ACK of the 200, or for 64*T1
+// to have passed without it (§15): a BYE that overtook the ACK could reach
+// a caller that has not yet confirmed the dialog. If ctx ends during that
+// wait, Bye returns its error and the BYE still goes, in the background,
+// when the wait is over: the dialog never stays up.
 func (d *Dialog) Bye(ctx context.Context) (*sip.Response, error) {
+	if d.confirmed != nil {
+		select {
+		case <-d.confirmed:
+		case <-d.ackGiveUp:
+		case <-d.done:
+		case <-ctx.Done():
+			d.byeLater()
+			return nil, ctx.Err()
+		}
+	}
 	d.mu.Lock()
 	if d.ended {
 		d.mu.Unlock()
@@ -503,12 +544,40 @@ func (d *Dialog) Bye(ctx context.Context) (*sip.Response, error) {
 	return d.ua.Send(ctx, bye)
 }
 
+// byeLater sends, once, the BYE of a called-side Bye whose context ended
+// before the ACK came: when the ACK comes, or at 64*T1 without it.
+func (d *Dialog) byeLater() {
+	d.mu.Lock()
+	queued := d.byeQueued || d.ended
+	d.byeQueued = true
+	d.mu.Unlock()
+	if queued {
+		return
+	}
+	d.ua.byes.Go(func() {
+		select {
+		case <-d.confirmed:
+		case <-d.ackGiveUp:
+		case <-d.done:
+			return
+		case <-d.ua.done:
+			return
+		}
+		_, _ = d.Bye(context.Background())
+	})
+}
+
 func (d *Dialog) endLocked() {
 	if d.ended {
 		return
 	}
 	d.ended = true
 	close(d.done)
+	for _, t := range []transaction.Timer{d.retransmitTimer, d.giveUpTimer} {
+		if t != nil {
+			t.Stop()
+		}
+	}
 	d.ua.mu.Lock()
 	delete(d.ua.dialogs, d.key)
 	d.ua.mu.Unlock()
@@ -551,4 +620,27 @@ func (d *Dialog) receive(tx *transaction.ServerTransaction) {
 	if res, err := sip.NewResponse(req, code, "", ""); err == nil {
 		_ = tx.Respond(res)
 	}
+}
+
+// ICSI of standalone messaging, pager mode, unescaped as P-Preferred-Service
+// carries it (RCC.07, RFC 6050).
+const standaloneService = "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg"
+
+// NewMessage returns a pager-mode MESSAGE to target (RFC 3428, RCC.07
+// standalone messaging): NewRequest's fields, the standalone messaging ICSI
+// in Accept-Contact and P-Preferred-Service, and body of contentType,
+// normally message/cpim. Send sends it.
+func (ua *UA) NewMessage(target sip.URI, contentType string, body []byte) (*sip.Request, error) {
+	req, err := ua.NewRequest("MESSAGE", target)
+	if err != nil {
+		return nil, err
+	}
+	add(req, &err, "Accept-Contact", `*;+g.3gpp.icsi-ref="`+ICSIStandalone+`"`)
+	add(req, &err, "P-Preferred-Service", standaloneService)
+	add(req, &err, "Content-Type", contentType)
+	if err != nil {
+		return nil, err
+	}
+	req.Body = slices.Clone(body)
+	return req, nil
 }
