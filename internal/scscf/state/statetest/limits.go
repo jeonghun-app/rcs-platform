@@ -231,6 +231,7 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 			t.Error(err)
 		}
 		_, _, final = a.NextNotify(ctx(t), s.ID, state.FinalNotify)
+		finish(t, a, s.ID)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +242,7 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	wantErr(t, err, state.ErrNotFound)
 
 	// One the S-CSCF ended itself, with the grace ahead, its final NOTIFY
-	// sent, goes after it.
+	// sent without an answer, is handed over after it, to send it again.
 	ended := Subscription("s2", IMPU1, time.Hour)
 	ended.Terminated, ended.Expires, ended.NotifiedOf = true, T0.Add(state.TerminatedGrace), state.FinalNotify
 	must(a.SaveSubscription(ctx(t), ended))(t)
@@ -253,10 +254,15 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(b.ExpiringSubscriptions(ctx(t), later, 10))(t)) == 1
 	})
-	if _, err := state.SweepSubscriptions(ctx(t), b, later, 10, func(*state.Subscription) {
-		t.Error("a Terminated subscription was handled")
+	handled := 0
+	if _, err := state.SweepSubscriptions(ctx(t), b, later, 10, func(s *state.Subscription) {
+		handled++
+		finish(t, b, s.ID)
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if handled != 1 {
+		t.Errorf("handed over %d times after its grace", handled)
 	}
 	_, err = a.Subscription(ctx(t), "s2")
 	wantErr(t, err, state.ErrNotFound)

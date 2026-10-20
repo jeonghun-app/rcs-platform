@@ -1565,23 +1565,30 @@ func TestAnIdentityItsRecordNoLongerListsIsNotRegistered(t *testing.T) {
 	wantStatus(t, res, 403)
 }
 
-// TestASubscriptionWhoseLastNotifyWentIsDeletedWithoutAnother: its final
-// NOTIFY was numbered, and its delete failed; the next end deletes it and
-// sends nothing more.
-func TestASubscriptionWhoseLastNotifyWentIsDeletedWithoutAnother(t *testing.T) {
+// TestAFinalNotifyNumberedElsewhereIsSentAgainWithItsNumbers: a final
+// NOTIFY was numbered, and nothing says it was answered; the next end sends
+// it again with the CSeq and version it was numbered with, so that the
+// subscriber takes the two for one, and then deletes the subscription.
+func TestAFinalNotifyNumberedElsewhereIsSentAgainWithItsNumbers(t *testing.T) {
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
 	n := e.notifier(1)
 	e.subscribed(n)
 	sub := e.subscriptions(impu1)[0]
-	if _, _, err := e.store.NextNotify(bg, sub.ID, state.FinalNotify); err != nil {
+	cseq, version, err := e.store.NextNotify(bg, sub.ID, state.FinalNotify)
+	if err != nil {
 		t.Fatal(err)
 	}
 	k := len(e.send.notifies())
 	n.Changed(bg, before, nil, Deactivated)
 	n.Wait()
-	if got := len(e.send.notifies()) - k; got != 0 {
-		t.Errorf("%d NOTIFYs after the last", got)
+	got := e.send.notifies()[k:]
+	if len(got) != 1 {
+		t.Fatalf("%d NOTIFYs after the last was numbered", len(got))
+	}
+	doc, c, ss := info(t, got[0])
+	if c != cseq || doc.Version != version || ss.State != "terminated" {
+		t.Errorf("sent again as CSeq %d version %d %s, want %d and %d, terminated", c, doc.Version, ss.State, cseq, version)
 	}
 	if subs := e.subscriptions(impu1); len(subs) != 0 {
 		t.Errorf("%d subscriptions left", len(subs))

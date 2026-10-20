@@ -798,19 +798,21 @@ type Subscription struct {
 	Dialog  Dialog
 	// Expires is when the subscription ends. Whoever terminates a
 	// subscription sets it a little ahead, to send its final NOTIFY first;
-	// a sweep after it sends that NOTIFY if nobody has (SweepSubscriptions)
-	// and deletes the subscription.
+	// a sweep after it hands the subscription over again
+	// (SweepSubscriptions), to send that NOTIFY, or send it again.
 	Expires time.Time
-	// Terminated marks a subscription that has ended and is about to be
-	// deleted, once its final NOTIFY is numbered (NotifiedOf is
-	// FinalNotify); a sweep sets it to claim that NOTIFY.
+	// Terminated marks a subscription that has ended and is deleted once
+	// its final NOTIFY is answered, or given up; a sweep sets it to claim
+	// that NOTIFY.
 	Terminated bool
 	// EndReason is the Subscription-State reason of the final NOTIFY of a
 	// Terminated subscription, "" for none, and SetEnded says that its set
 	// ended: a sweep that sends the NOTIFY in place of whoever terminated
-	// it sends it so (regevent).
-	EndReason string
-	SetEnded  bool
+	// it sends it so (regevent). FinalAttempts counts the sends of that
+	// NOTIFY that got no answer.
+	EndReason     string
+	SetEnded      bool
+	FinalAttempts int
 	// CSeq is the last CSeq the notifier used in the dialog and
 	// ReginfoVersion the last reginfo version it sent. NextNotify advances
 	// both, so the subscription's first NOTIFY, version 0 (RFC 3680 §5.2), is
@@ -869,7 +871,7 @@ func (s *Subscription) Validate() error {
 	if err := validSetKey(s.Set); err != nil || s.Incarnation == 0 {
 		return fmt.Errorf("%w: a subscription names its set and its incarnation", ErrInvalid)
 	}
-	if s.Kind != SubscriberPCSCF && s.Kind != SubscriberUE || !textOK(s.Binding, s.EventID, s.EndReason) {
+	if s.Kind != SubscriberPCSCF && s.Kind != SubscriberUE || !textOK(s.Binding, s.EventID, s.EndReason) || s.FinalAttempts < 0 {
 		return fmt.Errorf("%w: unknown kind of subscriber", ErrInvalid)
 	}
 	d := s.Dialog

@@ -97,28 +97,21 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 	return n, errs
 }
 
-// SweepSubscriptions ends up to limit subscriptions that have expired at
-// now, and sends the final NOTIFY of those terminated whose NOTIFY nobody
-// numbered: the instance that terminated one may have dropped it from a full
-// queue, or stopped. Each is claimed by saving it as Terminated, with an
-// expiry TerminatedGrace ahead, conditional on the version read, so one
-// instance calls handle, which sends the final NOTIFY (RFC 6665 §4.2.2), at
-// once or later; one expired that was not Terminated gets EndReason
-// "timeout". A subscription whose final NOTIFY is numbered (NotifiedOf is
-// FinalNotify) is deleted, now or by a later sweep, and one a handle did
-// not get to is claimed again after the grace. It returns the number of
-// subscriptions handled.
+// SweepSubscriptions hands over up to limit subscriptions whose expiry has
+// passed at now: one that expired, to end it, and one terminated whose
+// final NOTIFY nobody has sent, or nobody has had an answer to. Each is
+// claimed by saving it as Terminated, with an expiry TerminatedGrace ahead,
+// conditional on the version read, so one instance calls handle; one that
+// was not Terminated gets EndReason "timeout". handle sends the final
+// NOTIFY (RFC 6665 §4.2.2), at once or later, and deletes the subscription
+// once that NOTIFY is answered or given up; until then a sweep after the
+// grace, or the later expiry handle saves, hands it over again. It returns
+// the number of subscriptions handled.
 func SweepSubscriptions(ctx context.Context, s Subscriptions, now time.Time, limit int, handle func(*Subscription)) (int, error) {
 	subs, errs := s.ExpiringSubscriptions(ctx, now, limit)
 	n := 0
 	for _, sub := range subs {
 		if sub.Expires.After(now) {
-			continue
-		}
-		if sub.Terminated && sub.NotifiedOf == FinalNotify {
-			if err := ignoreLost(s.DeleteSubscription(ctx, sub)); err != nil {
-				return n, errors.Join(errs, err)
-			}
 			continue
 		}
 		next := sub.Clone()
@@ -135,19 +128,6 @@ func SweepSubscriptions(ctx context.Context, s Subscriptions, now time.Time, lim
 		}
 		n++
 		handle(claimed)
-		// handle may have used NextNotify, which changes the version.
-		cur, err := s.Subscription(ctx, claimed.ID)
-		if lost(err) {
-			continue
-		}
-		if err != nil {
-			return n, errors.Join(errs, err)
-		}
-		if cur.NotifiedOf == FinalNotify {
-			if err := ignoreLost(s.DeleteSubscription(ctx, cur)); err != nil {
-				return n, errors.Join(errs, err)
-			}
-		}
 	}
 	return n, errs
 }

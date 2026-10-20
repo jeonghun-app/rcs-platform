@@ -128,7 +128,11 @@ additionally sealed (below).
   deregistration's own retry (the sweep after its lease, the HSS's next
   RTR) and counts `regevent.end_failed`. A store failure or a stop at any
   point thus leaves either the record or the saved ends, and a sweep sends
-  a final NOTIFY nobody numbered, and deletes the subscription once one is.
+  a final NOTIFY nobody sent. A subscription is deleted only once its final
+  NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or 430); one
+  without an answer is sent again by a sweep, with the CSeq and version it
+  was numbered with, 10 s later and twice as late each time, and given up
+  after five sends (`regevent.final_abandoned`).
   The subscription sweep must therefore run every few seconds to a minute,
   as the registration sweep does.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
@@ -156,12 +160,14 @@ The reg event notifier counts, without dimensions:
 `regevent.subscribed`, `refused`, `refused_full`, `replaced`,
 `no_subscription`, `refresh_conflict`, `notified`, `notify_refused`,
 `notify_failed`, `notify_merged`, `notify_dropped`, `notify_deferred`,
-`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`
-and `internal_errors`. Alarm on `regevent.notify_dropped` and
+`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`,
+`final_resent`, `final_retry`, `final_abandoned` and `internal_errors`. Alarm on `regevent.notify_dropped` and
 `regevent.notify_deferred` (any sustained rate): NOTIFYs are queuing faster
 than subscribers answer (below), and ends are waiting for the sweep. Alarm
 on any `regevent.end_failed`: a set's end could not be saved, and its
-deregistration waits for a retry.
+deregistration waits for a retry. Alarm on any `regevent.final_abandoned`:
+a subscriber, most likely a P-CSCF task, never heard that a set ended, and
+may still serve a user the network deregistered.
 
 ## HSS discovery
 

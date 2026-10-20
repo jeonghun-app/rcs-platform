@@ -55,7 +55,8 @@
 // never lost so: the registrar calls Ended before it deletes the set's
 // record, which saves its subscriptions Terminated, with the reason, before
 // their final NOTIFYs are queued, and a sweep sends a final NOTIFY nobody
-// sent (state.SweepSubscriptions).
+// sent (state.SweepSubscriptions). A final NOTIFY counts once answered: one
+// without an answer is sent again, with its numbers, up to five times.
 //
 // The package sends nothing itself: Sender carries a request to the next
 // hop of its dialog in a client transaction, which cmd/scscf provides.

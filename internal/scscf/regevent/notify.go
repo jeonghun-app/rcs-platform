@@ -317,8 +317,27 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		}
 		j.bare = j.bare || why == lapsedPCSCF || set == nil && before == nil
 	}
+	if j.final && !j.first && !sub.Terminated {
+		// Saved first, so that a stop from here on leaves the end to a
+		// sweep (SweepSubscriptions).
+		ended, err := n.terminate(ctx, sub, now.Add(pendingEnd), j.reason, j.ended)
+		if err != nil {
+			n.internalLog("terminating a subscription", err)
+			return nil
+		}
+		if ended == nil {
+			return nil
+		}
+		sub = ended
+	}
 	cseq, version := sub.CSeq, sub.ReginfoVersion
-	if !j.first {
+	switch {
+	case j.first:
+	case j.final && sub.NotifiedOf == state.FinalNotify:
+		// The final NOTIFY again, which had no answer: with the numbers
+		// it was sent with, so that the subscriber takes the two for one.
+		n.count("regevent.final_resent")
+	default:
 		var err error
 		of := int64(state.FinalNotify)
 		if !j.final {
@@ -330,11 +349,9 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 			return nil
 		case errors.Is(err, state.ErrStale):
 			// A NOTIFY of a later state, or the last, has its number: this
-			// one would tell less.
+			// one would tell less. A final one numbered elsewhere is sent,
+			// and sent again, from there or by a sweep.
 			n.count("regevent.notify_superseded")
-			if j.final {
-				n.end(ctx, sub)
-			}
 			return nil
 		case errors.Is(err, state.ErrExhausted):
 			// The counters ran out: the subscription ends, without a NOTIFY it
@@ -354,8 +371,63 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		return nil
 	}
 	return func() {
-		if n.deliver(ctx, req) || j.final {
+		switch o := n.deliver(ctx, req); {
+		case !j.final:
+			if o == gone || o == unanswered {
+				n.end(ctx, sub)
+			}
+		case o == delivered || o == gone:
 			n.end(ctx, sub)
+		default:
+			n.retryFinal(ctx, sub)
+		}
+	}
+}
+
+// maxFinalSends bounds how often a final NOTIFY is sent without an answer,
+// and finalBackoff is the wait before the second send, doubled for each
+// after it: about five minutes in all, the time a P-CSCF task takes to be
+// replaced.
+const (
+	maxFinalSends = 5
+	finalBackoff  = 10 * time.Second
+)
+
+// retryFinal keeps sub, whose final NOTIFY had no answer, for a sweep to
+// send it again, later each time; after maxFinalSends it gives up, deletes
+// the subscription and counts regevent.final_abandoned (#256 QA review: a
+// final NOTIFY sent once is not yet one the subscriber has).
+func (n *Notifier) retryFinal(ctx context.Context, sub *state.Subscription) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), n.cfg.NotifyTimeout)
+	defer cancel()
+	for range saveAttempts {
+		cur, err := n.cfg.Store.Subscription(ctx, sub.ID)
+		if err != nil {
+			if !errors.Is(err, state.ErrNotFound) {
+				n.internalLog("reading a subscription", err)
+			}
+			return
+		}
+		next := cur.Clone()
+		next.FinalAttempts++
+		if next.FinalAttempts >= maxFinalSends {
+			err = n.cfg.Store.DeleteSubscription(ctx, cur)
+			if errors.Is(err, state.ErrConflict) {
+				continue
+			}
+			n.count("regevent.final_abandoned")
+			n.log.Warn("regevent: a final NOTIFY had no answer and was given up", "sends", next.FinalAttempts)
+			return
+		}
+		next.Expires = n.cfg.Now().Add(finalBackoff << (next.FinalAttempts - 1))
+		_, err = n.cfg.Store.SaveSubscription(ctx, next)
+		switch {
+		case err == nil, errors.Is(err, state.ErrNotFound):
+			n.count("regevent.final_retry")
+			return
+		case !errors.Is(err, state.ErrConflict):
+			n.internalLog("keeping a subscription for its final NOTIFY", err)
+			return
 		}
 	}
 }
@@ -407,32 +479,48 @@ func (n *Notifier) build(sub *state.Subscription, cseq, version uint32, before, 
 	return req
 }
 
-// deliver sends req and reports whether its subscriber is gone: it
-// answered with a code after which the notifier must remove the
-// subscription (RFC 6665 §4.2.2), or 430, the edge's word for a flow that
-// is gone (RFC 5626 §5.3; a UE that reconnected subscribes again over its
-// new flow), or the transport has no flow to it, or it did not answer
-// within NotifyTimeout. Any other answer, or a full queue, keeps it: the
-// next NOTIFY carries the full state anyway.
-func (n *Notifier) deliver(ctx context.Context, req *sip.Request) bool {
+// outcome is what came of a NOTIFY.
+type outcome int
+
+const (
+	// delivered: a 2xx.
+	delivered outcome = iota
+	// gone: an answer after which the notifier must remove the
+	// subscription (RFC 6665 §4.2.2), or 430, the edge's word for a flow
+	// that is gone (RFC 5626 §5.3; a UE that reconnected subscribes again
+	// over its new flow).
+	gone
+	// unanswered: no flow to the subscriber, or no answer within
+	// NotifyTimeout.
+	unanswered
+	// kept: any other answer, or a full queue, which the next NOTIFY, with
+	// the full state, makes good.
+	kept
+)
+
+// deliver sends req and reports what came of it.
+func (n *Notifier) deliver(ctx context.Context, req *sip.Request) outcome {
 	sendCtx, cancel := context.WithTimeout(ctx, n.cfg.NotifyTimeout)
 	res, err := n.cfg.Sender.Send(sendCtx, req)
 	cancel()
 	switch {
 	case err == nil && res.StatusCode >= 200 && res.StatusCode < 300:
 		n.count("regevent.notified")
-		return false
-	case err == nil && !removes(res.StatusCode):
+		return delivered
+	case err == nil && removes(res.StatusCode):
+		n.count("regevent.subscriber_gone")
+		return gone
+	case err == nil:
 		n.count("regevent.notify_refused")
-		return false
-	case err != nil && !errors.Is(err, transport.ErrNoFlow) && !(errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil):
-		// The transport could not take it now (ErrQueueFull), or the
-		// notifier is stopping: the next NOTIFY makes good.
-		n.count("regevent.notify_failed")
-		return false
+		return kept
+	case errors.Is(err, transport.ErrNoFlow), errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
+		n.count("regevent.subscriber_gone")
+		return unanswered
 	}
-	n.count("regevent.subscriber_gone")
-	return true
+	// The transport could not take it now (ErrQueueFull), or the notifier
+	// is stopping.
+	n.count("regevent.notify_failed")
+	return kept
 }
 
 // endOf is the end of the registration of impu, terminated without its

@@ -78,7 +78,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"NextNotifyInvalidatesEarlierReads", testNotifyVersion},
 		{"NoOlderStateTakesALaterNotify", testNotifyOrder},
 		{"EverySaveRaisesARegistrationsVersion", testRegistrationVersionRises},
-		{"ASweepSendsTheFinalNotifyNobodySent", testPendingFinal},
+		{"ASweepHandsOverAFinalNotifyNotAnswered", testPendingFinal},
 		{"ConcurrentSweepsEndEverySubscriptionOnce", testSubscriptionSweep},
 		{"ASweepFromAStaleListingKeepsAFreshRegistration", testSweepFromAStaleListing},
 		{"ASaveFromBeforeADeleteDoesNotOverwriteANewRegistration", testStaleSaveAfterRecreate},
@@ -602,10 +602,7 @@ func testSubscriptionSweep(t *testing.T, a, b state.Store, o Options) {
 			go func() {
 				defer wg.Done()
 				_, err := state.SweepSubscriptions(ctx(t), s, T0, 10, func(sub *state.Subscription) {
-					// The final NOTIFY takes the next CSeq.
-					if _, _, err := s.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
-						t.Error(err)
-					}
+					finish(t, s, sub.ID)
 					mu.Lock()
 					handled[sub.ID]++
 					mu.Unlock()
@@ -675,10 +672,28 @@ func testRegistrationVersionRises(t *testing.T, a, b state.Store, _ Options) {
 	}
 }
 
+// finish is what a sweep's handle does once a subscription's final NOTIFY
+// is answered: the NOTIFY is numbered, once, and the subscription deleted.
+func finish(t *testing.T, s state.Store, id string) {
+	t.Helper()
+	if _, _, err := s.NextNotify(ctx(t), id, state.FinalNotify); err != nil && !errors.Is(err, state.ErrStale) {
+		t.Error(err)
+	}
+	cur, err := s.Subscription(ctx(t), id)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if err := s.DeleteSubscription(ctx(t), cur); err != nil {
+		t.Error(err)
+	}
+}
+
 // testPendingFinal: a subscription terminated by an instance that did not
-// send its final NOTIFY is handled by a sweep once its expiry has passed,
-// with its EndReason, and deleted once that NOTIFY is numbered; a handle
-// that numbers nothing leaves it for a sweep after the grace.
+// send its final NOTIFY, or had no answer to it, is handed over by a sweep
+// once its expiry has passed, with its EndReason, and again after the
+// grace until a handle deletes it; one that expired without being
+// terminated ends with "timeout".
 func testPendingFinal(t *testing.T, a, b state.Store, o Options) {
 	s := Subscription("s1", IMPU1, -time.Second)
 	s.Terminated, s.EndReason, s.SetEnded = true, "rejected", true
@@ -686,41 +701,44 @@ func testPendingFinal(t *testing.T, a, b state.Store, o Options) {
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(b.ExpiringSubscriptions(ctx(t), T0, 10))(t)) == 1
 	})
-	handled := 0
-	sweep := func(at time.Time, final bool) {
+	var seen []*state.Subscription
+	sweep := func(at time.Time, handle func(*state.Subscription)) {
 		t.Helper()
 		if _, err := state.SweepSubscriptions(ctx(t), b, at, 10, func(sub *state.Subscription) {
-			handled++
+			seen = append(seen, sub)
 			if sub.EndReason != "rejected" || !sub.SetEnded {
-				t.Errorf("handled with EndReason %q, SetEnded %v", sub.EndReason, sub.SetEnded)
+				t.Errorf("handed over with EndReason %q, SetEnded %v", sub.EndReason, sub.SetEnded)
 			}
-			if final {
-				if _, _, err := b.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
-					t.Error(err)
-				}
-			}
+			handle(sub)
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	sweep(T0, false)
-	if handled != 1 {
-		t.Fatalf("handled %d times", handled)
-	}
+	// Sent, but no answer: numbered, and kept.
+	sweep(T0, func(sub *state.Subscription) {
+		if _, _, err := b.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
+			t.Error(err)
+		}
+	})
 	must(a.Subscription(ctx(t), "s1"))(t)
-	sweep(T0.Add(time.Second), false) // within the grace: not again
+	sweep(T0.Add(time.Second), func(*state.Subscription) { t.Error("handed over again within the grace") })
 	later := T0.Add(state.TerminatedGrace + time.Second)
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(b.ExpiringSubscriptions(ctx(t), later, 10))(t)) == 1
 	})
-	sweep(later, true)
-	if handled != 2 {
-		t.Fatalf("handled %d times", handled)
+	// Sent again, with the numbers it has, and answered.
+	sweep(later, func(sub *state.Subscription) {
+		if sub.NotifiedOf != state.FinalNotify {
+			t.Errorf("handed over again with NotifiedOf %d", sub.NotifiedOf)
+		}
+		finish(t, b, sub.ID)
+	})
+	if len(seen) != 2 {
+		t.Fatalf("handed over %d times", len(seen))
 	}
 	_, err := a.Subscription(ctx(t), "s1")
 	wantErr(t, err, state.ErrNotFound)
 
-	// One that expired without being terminated ends with "timeout".
 	must(a.SaveSubscription(ctx(t), Subscription("s2", IMPU1, -time.Second)))(t)
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(b.ExpiringSubscriptions(ctx(t), T0, 10))(t)) == 1
@@ -729,9 +747,7 @@ func testPendingFinal(t *testing.T, a, b state.Store, o Options) {
 		if !sub.Terminated || sub.EndReason != "timeout" || sub.SetEnded {
 			t.Errorf("claimed %+v", sub)
 		}
-		if _, _, err := b.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
-			t.Error(err)
-		}
+		finish(t, b, sub.ID)
 	}); err != nil {
 		t.Fatal(err)
 	}
