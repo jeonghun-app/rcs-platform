@@ -43,9 +43,13 @@ type queuedReport struct {
 // Config.MaxHandlerQueue waiting messages, the session's messages are
 // refused with 413, and REPORTs the peer sends are dropped (EventDropped
 // with ErrHandlerBusy). Reports about the session's own sends are never
-// dropped: while Config.SendWindow of them wait, Send waits too. For that
-// reason HandleReport must not wait for a Send on its own session to
-// finish; a retry belongs on another goroutine.
+// dropped while the session is open: while Config.SendWindow of them wait,
+// Send waits too. For that reason HandleReport must not wait for a Send on
+// its own session to finish; a retry belongs on another goroutine. Once
+// the session has closed, nothing holds sending back: what is left of
+// those reports goes to the handler on one goroutine, in order, and beyond
+// Config.MaxHandlerQueue waiting the rest are dropped (EventDropped with
+// ErrHandlerBusy). A handler that never returns holds that goroutine.
 type Handler interface {
 	// HandleMessage gets each complete message. Returning nil confirms it
 	// with a success REPORT when the sender asked for one (§7.1.3). An
@@ -143,17 +147,21 @@ type Session struct {
 	// events feeds the handler's goroutine; nil for a bridged session.
 	events chan event
 	// reports wait for HandleReport, on a goroutine of their own. Those
-	// about this session's own sends are never dropped: SendWindow bounds
-	// them (Send waits while as many are undelivered), as do the
-	// connection's in-flight slots. Those the peer sends are dropped
-	// beyond MaxHandlerQueue. reportWake tells the goroutine about new
-	// ones; reportRoom tells Send that one was delivered. rmu keeps
+	// about this session's own sends are never dropped while it is open:
+	// SendWindow bounds them (Send waits while as many are undelivered),
+	// as do the connection's in-flight slots. Those the peer sends are
+	// dropped beyond MaxHandlerQueue. reportWake tells the goroutine about
+	// new ones; reportRoom tells Send that one was delivered. rmu keeps
 	// HandleReport calls one at a time even after the session closed.
+	// draining is set while one goroutine delivers what is left after the
+	// close: one at a time, in order, and at most MaxHandlerQueue waiting
+	// (#258).
 	reports    []queuedReport
 	ownCount   int
 	reportWake chan struct{}
 	reportRoom chan struct{}
 	rmu        sync.Mutex
+	draining   bool
 	// window holds a token per chunk Send has awaiting its answer.
 	window chan struct{}
 	// backlog counts octets queued toward the client of a bridged edge
@@ -694,16 +702,46 @@ func (s *Session) work(c *Conn) {
 
 // workReports delivers reports in order, apart from messages so that a
 // HandleMessage that sends on its own session cannot hold up the reports
-// that sending waits for. On close it delivers what is left about this
-// session's own sends.
+// that sending waits for. On close it becomes the drainer of what is left
+// about this session's own sends, unless one already runs.
 func (s *Session) workReports(c *Conn) {
 	for {
 		select {
 		case <-s.reportWake:
-			s.deliverReports(false)
+			s.deliverReports()
 		case <-s.done:
-			s.deliverReports(true)
+			s.mu.Lock()
+			if s.draining {
+				s.mu.Unlock()
+				return
+			}
+			s.draining = true
+			s.mu.Unlock()
+			s.drain()
 			return
+		}
+	}
+}
+
+// drain delivers, one at a time and in order, the reports about this
+// session's own sends that are left after it closed, and drops the rest,
+// until none is left. Only the goroutine that set draining runs it.
+func (s *Session) drain() {
+	for {
+		s.mu.Lock()
+		if len(s.reports) == 0 {
+			s.draining = false
+			s.mu.Unlock()
+			return
+		}
+		next := s.reports[0]
+		s.reports = s.reports[1:]
+		if next.own {
+			s.ownCount--
+		}
+		s.mu.Unlock()
+		if next.own {
+			s.hand(next)
 		}
 	}
 }
@@ -715,8 +753,11 @@ func (s *Session) undeliveredReports() int {
 }
 
 // reportOwn hands the handler the outcome of a chunk this session sent.
-// After the session has closed, its report goroutine may be gone, so the
-// report is delivered on a goroutine of its own.
+// After the session has closed, nothing holds the sending back any more, so
+// the reports are bounded instead (#258): one goroutine delivers them in
+// order, and beyond MaxHandlerQueue waiting the rest are dropped and
+// counted (EventDropped, ErrHandlerBusy), so a handler that blocks holds
+// one goroutine, not one per report.
 func (s *Session) reportOwn(r Report, after func()) {
 	if s.handler == nil {
 		if after != nil {
@@ -733,8 +774,29 @@ func (s *Session) reportOwn(r Report, after func()) {
 		s.wakeReports()
 		return
 	}
+	c := s.conn
+	limit := DefaultMaxHandlerQueue
+	if c != nil {
+		limit = c.cfg.MaxHandlerQueue
+	}
+	if len(s.reports) >= limit {
+		s.mu.Unlock()
+		if c != nil {
+			c.emit(Event{Kind: EventDropped, Method: MethodReport, Err: ErrHandlerBusy})
+		}
+		if after != nil {
+			after()
+		}
+		return
+	}
+	s.reports = append(s.reports, q)
+	s.ownCount++
+	start := !s.draining
+	s.draining = true
 	s.mu.Unlock()
-	go s.hand(q)
+	if start {
+		go s.drain()
+	}
 }
 
 func (s *Session) wakeReports() {
@@ -744,7 +806,7 @@ func (s *Session) wakeReports() {
 	}
 }
 
-func (s *Session) deliverReports(onlyOwn bool) {
+func (s *Session) deliverReports() {
 	for {
 		s.mu.Lock()
 		if len(s.reports) == 0 {
@@ -757,9 +819,7 @@ func (s *Session) deliverReports(onlyOwn bool) {
 			s.ownCount--
 		}
 		s.mu.Unlock()
-		if !onlyOwn || next.own {
-			s.hand(next)
-		}
+		s.hand(next)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -517,4 +518,73 @@ func TestAMaximumSizeMessageFitsInASessionsReserveWhenThePoolIsFull(t *testing.T
 	whole := strings.Repeat("w", 4096)
 	p.send(t, sendLines("fu11", "Message-ID: whole1", "Byte-Range: 1-4096/4096", "Content-Type: text/plain", "", whole, "-------fu11$")...)
 	expectResponse(t, p, "fu11", StatusOK)
+}
+
+// stuckReports is a handler whose HandleReport blocks until release closes,
+// and counts the reports it took.
+type stuckReports struct {
+	release chan struct{}
+	got     atomic.Int64
+}
+
+func (h *stuckReports) HandleMessage(*Session, *Message) error { return nil }
+func (h *stuckReports) HandleReport(*Session, Report) {
+	h.got.Add(1)
+	<-h.release
+}
+
+// #258: after a session closes, a handler that blocks holds one goroutine,
+// not one per report. 10000 reports later the goroutine count has barely
+// moved, every report beyond MaxHandlerQueue was dropped and counted, and
+// each one's after ran, so nothing is held for it.
+func TestReportsAfterACloseAreBoundedByOneGoroutine(t *testing.T) {
+	var dropped atomic.Int64
+	c, p := activeWithPeer(t, Config{Clock: newFakeClock(), OnEvent: func(e Event) {
+		if e.Kind == EventDropped && e.Err == ErrHandlerBusy {
+			dropped.Add(1)
+		}
+	}})
+	h := &stuckReports{release: make(chan struct{})}
+	t.Cleanup(func() { close(h.release) })
+	s := newTestSession(t, clientURI, asURI, h)
+	openWithPeer(t, c, p, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, s.Done(), "session")
+	before := runtime.NumGoroutine()
+	const n = 10000
+	var afters atomic.Int64
+	for i := range n {
+		s.reportOwn(Report{MessageID: "m", Range: ByteRange{Start: int64(i) + 1, End: int64(i) + 1, Total: n}, Code: StatusRequestTimeout}, func() { afters.Add(1) })
+	}
+	if grown := runtime.NumGoroutine() - before; grown > 2 {
+		t.Fatalf("%d more goroutines for %d reports after the close", grown, n)
+	}
+	// The drainer is in HandleReport with the first one; DefaultMaxHandlerQueue
+	// more wait behind it, at most.
+	if d := dropped.Load(); d < n-DefaultMaxHandlerQueue-1 || d != afters.Load() {
+		t.Fatalf("%d dropped, %d afters run, of %d", d, afters.Load(), n)
+	}
+}
+
+// What is left after the close, within the bound, is still delivered, in
+// order, on one goroutine.
+func TestReportsAfterACloseAreDeliveredInOrder(t *testing.T) {
+	c, p := activeWithPeer(t, Config{Clock: newFakeClock()})
+	h := newRecorder()
+	s := newTestSession(t, clientURI, asURI, h)
+	openWithPeer(t, c, p, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, s.Done(), "session")
+	for i := range 10 {
+		s.reportOwn(Report{MessageID: "m", Range: ByteRange{Start: int64(i) + 1, End: int64(i) + 1, Total: 10}, Code: StatusRequestTimeout}, nil)
+	}
+	for i := range 10 {
+		if r := h.report(t); r.Range.Start != int64(i)+1 {
+			t.Fatalf("report %d is for %v", i, r.Range)
+		}
+	}
 }
