@@ -610,6 +610,14 @@ func (s *Session) keepAliveDue(c *Conn) {
 		s.mu.Lock()
 		s.keepAliveOut = false
 		s.mu.Unlock()
+		if c.isClosed() {
+			return
+		}
+		// Not sent while the connection is up: its ids could not be made
+		// (the random source failed). Said, and tried again at the next
+		// interval, rather than leave the session without keep-alives.
+		c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrKeepAliveNotSent})
+		s.armKeepAlive(c, interval)
 		return
 	}
 	s.armKeepAlive(c, interval)
