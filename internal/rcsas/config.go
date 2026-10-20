@@ -17,6 +17,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/sipas"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -59,8 +60,14 @@ type Config struct {
 	// namespace its names are looked up in (ADR 0007 §5).
 	Core      sip.URI
 	Namespace string
-	Store     string
-	DynamoDB  awsstore.Config
+	// MaxSessions bounds the SIP sessions this task holds, and
+	// MaxOutgoingPerUser those one user opens, and MaxIncomingPerUser those
+	// rcs-as opens to one user (threat model T9).
+	MaxSessions        int
+	MaxOutgoingPerUser int
+	MaxIncomingPerUser int
+	Store              string
+	DynamoDB           awsstore.Config
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
 	// are left for the service to set.
 	Messaging messaging.Config
@@ -117,6 +124,12 @@ func Configure(s *runtime.Settings) Config {
 		},
 	}
 	c.SIPListenAddr = e.String("SIP_LISTEN_ADDR", DefaultSIPListenAddr)
+	c.MaxSessions = e.Int("MAX_SESSIONS", sipas.DefaultMaxSessions)
+	c.MaxOutgoingPerUser = e.Int("MAX_OUTGOING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
+	positive(e, "MAX_SESSIONS", c.MaxSessions)
+	positive(e, "MAX_OUTGOING_SESSIONS_PER_USER", c.MaxOutgoingPerUser)
+	c.MaxIncomingPerUser = e.Int("MAX_INCOMING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
+	positive(e, "MAX_INCOMING_SESSIONS_PER_USER", c.MaxIncomingPerUser)
 	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
 		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
 	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {

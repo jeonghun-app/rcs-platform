@@ -134,7 +134,9 @@ type Config struct {
 	// InviteTimeout is how long a terminating session asked for is waited
 	// for before another may be asked for.
 	InviteTimeout time.Duration
-	// AnswerTimeout is how long a leg from Offer waits for Answer.
+	// AnswerTimeout is how long a leg from Offer waits for Answer, and
+	// how long a leg waits for msrp-relay's connection once its peer's
+	// path is known (OpenLeg, Answer), after which it is closed.
 	AnswerTimeout time.Duration
 	// RetryInterval is the first wait before a queue that could not be
 	// delivered is tried again; it doubles up to MaxRetryInterval.

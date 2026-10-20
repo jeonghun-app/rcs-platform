@@ -191,6 +191,61 @@ func TestARelayConnectingBeforeTheAnswerIsServed(t *testing.T) {
 	}
 }
 
+// #260: a pass that found no open leg for a message and asks for a
+// session only once the one asked for earlier has opened asks for none. A
+// second session's leg would be the newer, which every delivery after
+// goes on, and the client may never bind it; the message goes on the leg
+// that is open instead.
+func TestNoSecondSessionIsAskedForOnceOneHasOpened(t *testing.T) {
+	for _, mode := range []store.Mode{store.Chat, store.Group} {
+		t.Run(mode.String(), func(t *testing.T) {
+			r := newRig(t, Config{})
+			body := chat(t, "m1", "for bob", 0)
+			peer := alice
+			if mode == store.Group {
+				r.e.SetGroupHandler(members{all: []string{alice, bob}})
+				peer = groupURI
+				if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, body)); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: mode, CPIM: body}); err != nil {
+				t.Fatal(err)
+			}
+			inv := r.d.nextInvite(t)
+			if inv.Recipient != bob || inv.Peer != peer || inv.Mode != mode {
+				t.Fatalf("invitation %+v", inv)
+			}
+			waitFor(t, "idle", r.idle)
+			// What the pass read before the session opened.
+			ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+			if err != nil || len(ms) != 1 {
+				t.Fatalf("Pending = %d, %v", len(ms), err)
+			}
+			l := r.listen(t)
+			leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation, Mode: inv.Mode, Direction: Terminating})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = leg.Close() })
+			bobURI := clientURI()
+			if err := leg.Answer([]msrp.URI{bobURI}); err != nil {
+				t.Fatal(err)
+			}
+			// That pass carries on to ask for the message's session.
+			r.e.invite(t.Context(), ms[0])
+			select {
+			case again := <-r.d.invites:
+				t.Fatalf("a second session was asked for: %+v", again)
+			default:
+			}
+			b := r.dial(t, l, bobURI, leg.Local())
+			if got := b.next(t); !bytes.Contains(got.Body, []byte("for bob")) {
+				t.Fatalf("bob got %q", got.Body)
+			}
+		})
+	}
+}
+
 func TestAnOfferWithoutAnAnswerExpires(t *testing.T) {
 	r := newRig(t, Config{AnswerTimeout: 10 * time.Second})
 	leg, err := r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
@@ -211,13 +266,15 @@ func TestAnOfferWithoutAnAnswerExpires(t *testing.T) {
 	if r.m.get("leg.unanswered") != 1 {
 		t.Fatalf("metrics %v", r.m)
 	}
-	// An answered offer does not expire.
+	// An answered offer, whose relay connected, does not expire.
 	leg, err = r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer leg.Close()
-	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+	u := clientURI()
+	r.dial(t, r.listen(t), u, leg.Local())
+	if err := leg.Answer([]msrp.URI{u}); err != nil {
 		t.Fatal(err)
 	}
 	r.clock.Advance(time.Minute)
@@ -225,6 +282,39 @@ func TestAnOfferWithoutAnAnswerExpires(t *testing.T) {
 	case <-leg.Done():
 		t.Fatal("an answered leg expired")
 	default:
+	}
+}
+
+// A leg whose peer's path is known but that no connection binds is closed
+// after AnswerTimeout, whether it was opened on an offer (OpenLeg) or
+// answered (security review on #252): a client that never connects to
+// msrp-relay would otherwise hold it, and its SIP session, until the task
+// stops (threat model T9).
+func TestALegNoConnectionBindsIsClosed(t *testing.T) {
+	r := newRig(t, Config{AnswerTimeout: 10 * time.Second})
+	opened, err := r.e.OpenLeg(LegParams{Remote: []msrp.URI{clientURI()}, User: alice, Peer: bob, Mode: store.Chat, Direction: Originating})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answered, err := r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(5 * time.Second)
+	if err := answered.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(5 * time.Second) // the opened leg's deadline
+	waitDone(t, opened.Done())
+	select {
+	case <-answered.Done():
+		t.Fatal("the answered leg closed before its own deadline")
+	default:
+	}
+	r.clock.Advance(5 * time.Second)
+	waitDone(t, answered.Done())
+	if r.m.get("leg.unbound") != 2 || r.m.get("leg.unanswered") != 0 {
+		t.Fatalf("metrics %v", r.m)
 	}
 }
 
@@ -346,7 +436,10 @@ func TestAnAnswerAtTheTimeoutEitherWinsOrIsRefused(t *testing.T) {
 		err = <-answered
 		select {
 		case <-leg.Done():
-			if err == nil {
+			// An answer just before the clock moved also starts the bind
+			// deadline, which the same Advance may reach: that close is
+			// the bind deadline's, not the answer timeout's.
+			if err == nil && r.m.get("leg.unbound") == 0 {
 				t.Fatal("an answered leg was closed by the timeout")
 			}
 		default:

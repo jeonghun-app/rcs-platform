@@ -106,13 +106,17 @@ type Leg struct {
 	answered bool
 	expired  bool
 	pending  msrp.Timer
+	// unbound closes the leg if no connection binds it in time.
+	unbound  msrp.Timer
 	finished chan struct{}
 	finish   sync.Once
 
 	// composing is set while an is-composing indication is being
 	// forwarded to this leg; others meanwhile are dropped. composingRate
 	// bounds those this leg's user sends.
-	composing     atomic.Bool
+	composing atomic.Bool
+	// carried is set once a message has gone either way on the leg.
+	carried       atomic.Bool
 	composingRate *limiter
 }
 
@@ -148,8 +152,27 @@ func (e *Engine) OpenLeg(p LegParams) (*Leg, error) {
 	if err != nil {
 		return nil, err
 	}
+	l.awaitBind()
 	l.activate()
 	return l, nil
+}
+
+// awaitBind closes the leg unless a connection binds it within
+// AnswerTimeout. msrp-relay connects for a client that has connected to
+// it, and a client that never does, having answered or offered all the
+// same, would otherwise hold the leg and its SIP session, under the SIP
+// layer's bounds, until the task stops (threat model T9).
+func (l *Leg) awaitBind() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.unbound = l.e.clock.AfterFunc(l.e.cfg.AnswerTimeout, func() {
+		select {
+		case <-l.session.Bound():
+		default:
+			l.e.metrics.Count("leg.unbound", 1)
+			_ = l.Close()
+		}
+	})
 }
 
 // Offer creates the leg for an offer rcs-as is about to send (Deliverer.
@@ -244,6 +267,7 @@ func (l *Leg) Answer(remote []msrp.URI) error {
 	}
 	l.answered = true
 	l.mu.Unlock()
+	l.awaitBind()
 	l.activate()
 	return nil
 }
@@ -333,6 +357,11 @@ func (l *Leg) Finished() <-chan struct{} { return l.finished }
 // Local is the leg's MSRP URI, for a=path.
 func (l *Leg) Local() msrp.URI { return l.session.Local() }
 
+// Carried reports whether a message has gone either way on the leg: the
+// SIP layer reads a BYE that says the client takes no sessions (ADR 0004)
+// only from a session that never carried one.
+func (l *Leg) Carried() bool { return l.carried.Load() }
+
 // Done is closed when the leg has ended.
 func (l *Leg) Done() <-chan struct{} { return l.session.Done() }
 
@@ -342,6 +371,9 @@ func (l *Leg) Close() error {
 	if l.pending != nil {
 		l.pending.Stop()
 	}
+	if l.unbound != nil {
+		l.unbound.Stop()
+	}
 	l.mu.Unlock()
 	return l.session.Close()
 }
@@ -350,6 +382,7 @@ func (l *Leg) Close() error {
 // its peer. It returns once the message is stored, so a success report
 // tells the client rcs-as has it.
 func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
+	l.carried.Store(true)
 	if l.p.Mode == store.Group {
 		return l.e.groupReceived(l, m)
 	}
@@ -397,6 +430,7 @@ func (e *Engine) forwardComposing(from *Leg, body []byte) {
 	body = append([]byte(nil), body...)
 	go func() {
 		ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
+		to.carried.Store(true)
 		_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: IsComposingType, Body: body, FailureReport: msrp.ReportNo})
 		cancel()
 		to.composing.Store(false)
@@ -456,6 +490,7 @@ func (l *Leg) send(ctx context.Context, body []byte) (int, error) {
 		delete(l.waiting, id)
 		l.mu.Unlock()
 	}()
+	l.carried.Store(true)
 	_, err = l.session.Send(ctx, msrp.Outgoing{MessageID: id, ContentType: cpim.ContentType, Body: body, SuccessReport: true})
 	var se *msrp.StatusError
 	if errors.As(err, &se) {

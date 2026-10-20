@@ -513,7 +513,11 @@ func (p *pcscf) ownURI(u sip.URI) bool {
 // subscription is forgotten, to be set up again by the sweep if the user
 // is still registered.
 func (p *pcscf) serveNotify(_ context.Context, u *proxy.UAS) {
-	req := u.Request().Message
+	p.answerNotify(u.Request().Message, u.Respond)
+}
+
+// answerNotify takes req, a NOTIFY, and answers it through respond.
+func (p *pcscf) answerNotify(req *sip.Request, respond func(*sip.Response) error) {
 	code, info := p.acceptNotify(req)
 	// A NOTIFY has a To tag, its dialog's; the tag given is for one
 	// without, which is answered all the same.
@@ -530,7 +534,7 @@ func (p *pcscf) serveNotify(_ context.Context, u *proxy.UAS) {
 	if info != nil {
 		p.deregistered(info.key, info.doc, info.seen)
 	}
-	_ = u.Respond(res)
+	_ = respond(res)
 }
 
 // mustTag is a To tag for a response to a request without one.
@@ -560,6 +564,20 @@ type notified struct {
 type seenState struct {
 	bindings map[string]reginfo.Contact
 	aors     map[string]bool
+	// index is the bindings as shown looks them up, made at its first
+	// call: a full document asks once for every contact of every
+	// registration of the user, and the record may hold maxSeenBindings
+	// (#239 review).
+	index *seenIndex
+}
+
+// seenIndex is a record's bindings ready for shown: the reg-ids of those
+// with a +sip.instance, by the instance in lower case, and the URIs,
+// parsed once, of those with an instance and of those without.
+type seenIndex struct {
+	byInstance   map[string][]seenRegID
+	withInstance []sip.URI
+	noInstance   []sip.URI
 }
 
 func newSeenState() *seenState {
@@ -621,13 +639,56 @@ func (s *seenState) update(doc *reginfo.Info) {
 	}
 }
 
-// shown reports whether c's binding is one s has seen active.
+// shown reports whether c's binding is one s has seen active, matching as
+// bindingsOf does. s must not change once asked: a record is read from a
+// clone (acceptNotify).
 func (s *seenState) shown(c sip.Contact) bool {
 	if s == nil {
 		return false
 	}
-	all := reginfo.Registration{Contacts: slices.Collect(maps.Values(s.bindings))}
-	return len(bindingsOf(all, c)) > 0
+	if s.index == nil {
+		s.index = indexBindings(s.bindings)
+	}
+	x := s.index
+	inst, hasInst := c.Instance()
+	if hasInst {
+		regID, hasRegID, err := c.RegID()
+		want := strconv.FormatUint(uint64(regID), 10)
+		for _, id := range x.byInstance[strings.ToLower(inst)] {
+			if !id.has || !hasRegID || err != nil || id.v == want {
+				return true
+			}
+		}
+	} else if slices.ContainsFunc(x.withInstance, c.URI.Equal) {
+		return true
+	}
+	return slices.ContainsFunc(x.noInstance, c.URI.Equal)
+}
+
+// seenRegID is a binding's reg-id, if it has one.
+type seenRegID struct {
+	v   string
+	has bool
+}
+
+func indexBindings(bindings map[string]reginfo.Contact) *seenIndex {
+	x := &seenIndex{byInstance: map[string][]seenRegID{}}
+	for _, rc := range bindings {
+		u, err := sip.ParseURI(rc.URI)
+		inst, ok := rc.Param("+sip.instance")
+		switch {
+		case ok:
+			id, has := rc.Param("reg-id")
+			key := strings.ToLower(inst)
+			x.byInstance[key] = append(x.byInstance[key], seenRegID{id, has})
+			if err == nil {
+				x.withInstance = append(x.withInstance, u)
+			}
+		case err == nil:
+			x.noInstance = append(x.noInstance, u)
+		}
+	}
+	return x
 }
 
 // shownAOR reports whether s has seen u active.
@@ -765,7 +826,23 @@ func (p *pcscf) deregistered(key string, doc *reginfo.Info, seen *seenState) {
 		}
 		if changed != nil {
 			p.registry.replace(reg, changed)
+			p.keepSeen(key, defaultKey(changed))
 		}
+	}
+}
+
+// keepSeen gives the user's record under key to newKey too, when a
+// registration's default identity, which keys it, changed: the document
+// ended the default identity and left another (#239 review). The sweep
+// forgets the record of a key no registration has.
+func (p *pcscf) keepSeen(key, newKey string) {
+	if p.subs == nil || key == newKey {
+		return
+	}
+	p.subs.mu.Lock()
+	defer p.subs.mu.Unlock()
+	if old := p.subs.seen[key]; old != nil && p.subs.seen[newKey] == nil {
+		p.subs.seen[newKey] = old.clone()
 	}
 }
 
