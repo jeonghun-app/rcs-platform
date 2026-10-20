@@ -33,6 +33,17 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	}
 	options := *reqs["INVITE"]
 	options.method = "OPTIONS"
+	// rcsjta asks for a chat with the OMA SIMPLE IM tag alone
+	// (ChatUtils.getSupportedFeatureTagsForChat), in OPTIONS too.
+	imInvite := *reqs["INVITE"]
+	imInvite.headers = slices.DeleteFunc(slices.Clone(imInvite.headers), func(h ifc.HeaderField) bool {
+		return h.Name == "Contact" || h.Name == "Accept-Contact" || h.Name == "P-Preferred-Service"
+	})
+	imInvite.headers = append(imInvite.headers,
+		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + ">;+g.oma.sip-im"},
+		ifc.HeaderField{Name: "Accept-Contact", Value: "*;+g.oma.sip-im"})
+	imOptions := imInvite
+	imOptions.method = "OPTIONS"
 	plainInvite := *reqs["INVITE"]
 	plainInvite.headers = slices.DeleteFunc(slices.Clone(plainInvite.headers), func(h ifc.HeaderField) bool {
 		return h.Name == "Contact" || h.Name == "Accept-Contact" || h.Name == "P-Preferred-Service"
@@ -41,11 +52,13 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 		req  ifc.Request
 		want []int
 	}{
-		"chat INVITE":      {reqs["INVITE"], []int{10}},
-		"MESSAGE":          {reqs["MESSAGE"], []int{20}},
-		"REGISTER":         {reqs["REGISTER"], []int{40}},
-		"RCS OPTIONS":      {&options, []int{30}},
-		"INVITE for voice": {&plainInvite, nil},
+		"chat INVITE":        {reqs["INVITE"], []int{10}},
+		"MESSAGE":            {reqs["MESSAGE"], []int{20}},
+		"REGISTER":           {reqs["REGISTER"], []int{40}},
+		"RCS OPTIONS":        {&options, []int{30}},
+		"rcsjta chat INVITE": {&imInvite, []int{10}},
+		"rcsjta OPTIONS":     {&imOptions, []int{30}},
+		"INVITE for voice":   {&plainInvite, nil},
 	} {
 		for _, ctx := range referenceContexts {
 			matched, err := set.Match(c.req, ctx)
