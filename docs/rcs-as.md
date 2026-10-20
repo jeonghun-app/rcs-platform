@@ -232,7 +232,7 @@ A client's INVITE (the originating session):
 | `Session-Expires` below 90 s | 422 with `Min-SE: 90` (RFC 4028 §6) |
 | no SDP offer (a late offer), no MSRP line, an offer of `passive` (RFC 6135 §4.2.2), or no type in common | 488 |
 | this task holds `RCSAS_MAX_SESSIONS` sessions | 500 with `Retry-After: 1`, as for a busy store: the client may try again, and another task may take it |
-| the user holds `RCSAS_MAX_SESSIONS_PER_USER` sessions | 403 |
+| the user holds `RCSAS_MAX_SESSIONS_PER_USER` sessions | 486 Busy Here |
 
 Otherwise rcs-as opens the leg with `OpenLeg` (the sender is the asserted
 identity, the peer the Request-URI, as for pager mode) and answers 200. The
@@ -248,9 +248,11 @@ In every session:
   for a timer and supports the extension, rcs-as takes it with the client as
   refresher (`Session-Expires: <n>;refresher=uac`, `Require: timer`). It ends a
   session left unrefreshed with a BYE, min(32 s, interval/3) before the
-  interval runs out (§10). A request for `refresher=uas`, or from a client
-  without `Supported: timer`, gets no timer, as from a UAS without the
-  extension; such a session ends with its MSRP connection or a BYE. In a
+  interval runs out (§10). A client that asks rcs-as to refresh
+  (`refresher=uas`) and supports the extension gets `refresher=uac` all the
+  same, which §9 lets the UAS choose. A client without `Supported: timer`
+  gets no timer, as from a UAS without the extension, since it would leave the
+  refreshing to rcs-as; such a session ends with its MSRP connection or a BYE. In a
   session rcs-as started, a timer the client's 2xx sets is kept the same way.
 - **Refreshes.** A re-INVITE or UPDATE whose offer keeps the MSRP path gets the
   same answer, with the same `o=` version unless the answer changed (RFC 3264
@@ -763,7 +765,7 @@ settings:
 | `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, an address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
-| `RCSAS_MAX_SESSIONS_PER_USER` | `64` | Sessions of one user on this task; an INVITE beyond it is answered 403 |
+| `RCSAS_MAX_SESSIONS_PER_USER` | `64` | Sessions of one user on this task; an INVITE beyond it is answered 486 |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
@@ -1069,9 +1071,9 @@ Signals to alarm on (Phase 7):
   expire.
 - **Group rates are per task**, like the 1-to-1 ones.
 - **rcs-as never refreshes a session.** A client that asks rcs-as to refresh
-  (`refresher=uas`) gets no session timer instead (see [Sessions](#sessions)).
-  rcsjta refreshes itself; another client may see its session last until its
-  MSRP connection or a BYE ends it.
+  (`refresher=uas`) is made the refresher (see [Sessions](#sessions)); one
+  without the extension gets no timer, and its session lasts until its MSRP
+  connection or a BYE ends it.
 - **A new flow is guessed.** The third-party REGISTER does not carry the
   client's REGISTER (the default profile does not ask for it), so a client
   that moves to a new flow before its registration runs out looks like one

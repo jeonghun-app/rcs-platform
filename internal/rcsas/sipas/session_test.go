@@ -169,7 +169,7 @@ func TestOffersRCSASCannotTakeAre488(t *testing.T) {
 
 // Sessions are bounded per task and per user (threat model T9): past the
 // task's bound the client may try again (500 with Retry-After, which scscf
-// passes on), past the user's it is refused (403), and a session rcs-as
+// passes on), past the user's it is answered 486, and a session rcs-as
 // would start waits.
 func TestSessionsAreBounded(t *testing.T) {
 	for name, c := range map[string]struct {
@@ -178,7 +178,7 @@ func TestSessionsAreBounded(t *testing.T) {
 		header [2]string
 	}{
 		"per task": {cfg: Config{MaxSessions: 1}, code: 500, header: [2]string{"Retry-After", "1"}},
-		"per user": {cfg: Config{MaxSessionsPerUser: 1}, code: 403},
+		"per user": {cfg: Config{MaxSessionsPerUser: 1}, code: 486},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newChatRigWith(t, messaging.Config{}, c.cfg)
@@ -300,21 +300,28 @@ func TestASessionTimerIsTakenRefreshedAndEndsTheSession(t *testing.T) {
 	}
 }
 
-func TestASessionTimerRCSASWouldRefreshIsNotTaken(t *testing.T) {
+// rcs-as never refreshes (RFC 4028 §9 lets the UAS choose): a client that
+// supports the extension gets refresher=uac, whatever it asked for, and
+// one that does not gets no timer.
+func TestASessionTimerIsTheClientsToRefresh(t *testing.T) {
 	r := newChatRig(t, messaging.Config{})
 	p := r.a.dial(t)
-	for name, fields := range map[string][]string{
-		"refresher=uas":     {"Supported: timer", "Session-Expires: 1800;refresher=uas"},
-		"timer unsupported": {"Session-Expires: 1800"},
-	} {
-		s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"), fields...)))
-		if s.res.Header.Has("Session-Expires") || s.res.Header.Has("Require") {
-			t.Errorf("%s: Session-Expires %q, Require %q", name, s.res.Header.Get("Session-Expires"), s.res.Header.Get("Require"))
-		}
+	// A client that supports the extension refreshes, even one that asked
+	// rcs-as to (the lead's decision on #252).
+	s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"), "Supported: timer", "Session-Expires: 1800;refresher=uas")))
+	if got := s.res.Header.Get("Session-Expires"); got != "1800;refresher=uac" || s.res.Header.Get("Require") != "timer" {
+		t.Fatalf("refresher=uas: Session-Expires %q, Require %q", got, s.res.Header.Get("Require"))
 	}
-	if armed := r.clock.armed(); len(armed) != 0 {
-		t.Fatalf("timers %v", armed)
+	p.ack(s)
+	r.clock.waitArmed(t, 1800*time.Second-32*time.Second)
+	// One that does not support it would leave refreshing to rcs-as,
+	// which never refreshes: no timer.
+	s = answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"), "Session-Expires: 1800")))
+	if s.res.Header.Has("Session-Expires") || s.res.Header.Has("Require") {
+		t.Fatalf("timer unsupported: Session-Expires %q, Require %q", s.res.Header.Get("Session-Expires"), s.res.Header.Get("Require"))
 	}
+	p.ack(s)
+	r.clock.waitArmed(t, 1800*time.Second-32*time.Second)
 }
 
 // A leg does not move: a re-INVITE with another path, or with no offer, is

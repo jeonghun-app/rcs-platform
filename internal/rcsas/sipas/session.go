@@ -151,8 +151,13 @@ func (s *Server) sessionOf(req *sip.Request) *session {
 	return s.sessions[id]
 }
 
+// closeWait bounds how long Close waits for the answers to its BYEs.
+const closeWait = 2 * time.Second
+
 // Close ends every session with a BYE, before the transport closes, and
-// takes no new one. Each BYE is sent, not waited for.
+// takes no new one. It waits for the BYEs' answers, up to closeWait: the
+// transport writes a request after SendRequest returns, and closing it at
+// once could drop the BYE.
 func (s *Server) Close() {
 	s.mu.Lock()
 	s.closed = true
@@ -162,8 +167,14 @@ func (s *Server) Close() {
 	}
 	s.mu.Unlock()
 	var wg sync.WaitGroup
+	deadline := time.After(closeWait)
 	for _, ss := range all {
-		wg.Go(func() { ss.bye("") })
+		wg.Go(func() {
+			select {
+			case <-ss.bye(""):
+			case <-deadline:
+			}
+		})
 	}
 	wg.Wait()
 }
@@ -319,10 +330,11 @@ func (s *Server) sessionHeaders(res *sip.Response, tag string, body []byte, inte
 // sessionInterval is the session timer a request asks for and rcs-as
 // takes, zero for none, or the status that refuses it: 422 below
 // minSessionExpires. rcs-as never refreshes a session itself. A UAC that
-// does not support the extension would leave that to it, and one that asks
-// for refresher=uas does so explicitly (RFC 4028 §9): for either it takes
-// no timer, as a UAS without the extension does, and the session ends with
-// its MSRP connection or a BYE.
+// supports the extension is the refresher, even when it asked rcs-as to be
+// (refresher=uas): the UAS may choose (RFC 4028 §9), and its 2xx says
+// refresher=uac. A UAC that does not support it would leave refreshing to
+// rcs-as: rcs-as then takes no timer, as a UAS without the extension does,
+// and the session ends with its MSRP connection or a BYE.
 func sessionInterval(req *sip.Request) (time.Duration, int) {
 	if !req.Header.Has("Session-Expires") {
 		return 0, 0
@@ -338,7 +350,7 @@ func sessionInterval(req *sip.Request) (time.Duration, int) {
 	if err != nil {
 		return 0, 400
 	}
-	if !containsFold(supported, "timer") || se.Refresher() == "uas" {
+	if !containsFold(supported, "timer") {
 		return 0, 0
 	}
 	return time.Duration(se.Delta) * time.Second, 0
@@ -405,10 +417,11 @@ func (ss *session) end() bool {
 }
 
 // bye ends the session from rcs-as's side with a BYE in its dialog,
-// carrying reason if it is not empty.
-func (ss *session) bye(reason string) {
+// carrying reason if it is not empty. What it returns is closed once the
+// BYE is answered, or was not sent.
+func (ss *session) bye(reason string) <-chan struct{} {
 	if !ss.end() {
-		return
+		return closedChan
 	}
 	ss.mu.Lock()
 	var req *sip.Request
@@ -420,29 +433,41 @@ func (ss *session) bye(reason string) {
 	}
 	ss.mu.Unlock()
 	if err != nil {
-		return
+		return closedChan
 	}
 	if reason != "" && req.Header.Add("Reason", reason) != nil {
-		return
+		return closedChan
 	}
 	ss.s.cfg.Metrics.Count("sip.bye.sent", 1)
-	ss.s.sendInDialog(req, next)
+	return ss.s.sendInDialog(req, next)
 }
 
-// sendInDialog sends rcs-as's request in a dialog to next, and does not
-// wait for its answer: there is nothing left to do with it.
-func (s *Server) sendInDialog(req *sip.Request, next sip.URI) {
+// closedChan is a channel closed already.
+var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+// sendInDialog sends rcs-as's request in a dialog to next. Nothing is left
+// to do with its answer; what it returns is closed when the answer, or the
+// transaction's end, comes, or at once if the request was not sent.
+func (s *Server) sendInDialog(req *sip.Request, next sip.URI) <-chan struct{} {
 	ctx, cancel := context.WithTimeout(context.Background(), dialogTimeout)
 	defer cancel()
 	dst, err := s.cfg.Resolver.Resolve(ctx, next)
 	if err != nil {
 		s.cfg.Metrics.Count("sip.dialog.unresolved", 1)
-		return
+		return closedChan
 	}
 	dst.Listener = s.cfg.Listener
-	if _, err := s.layer.Request(req, dst, func(*sip.Response, error) {}); err != nil {
+	done := make(chan struct{})
+	var once sync.Once
+	if _, err := s.layer.Request(req, dst, func(res *sip.Response, err error) {
+		if err != nil || res.StatusCode >= 200 {
+			once.Do(func() { close(done) })
+		}
+	}); err != nil {
 		s.cfg.Metrics.Count("sip.dialog.unsent", 1)
+		return closedChan
 	}
+	return done
 }
 
 // sendACK sends the ACK of a 2xx to next. It belongs to no transaction

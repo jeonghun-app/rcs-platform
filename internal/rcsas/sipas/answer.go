@@ -104,7 +104,9 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	if err := s.addSession(ss); err != nil {
 		_ = leg.Close()
 		if errors.Is(err, errUserSessions) {
-			s.respond(u, req, 403)
+			// The user's own sessions are what is busy (RFC 3261
+			// §21.4.24); the lead's decision on #252.
+			s.respond(u, req, 486)
 			return
 		}
 		// The client may try again in a moment, and another task may
