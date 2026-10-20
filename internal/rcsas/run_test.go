@@ -14,6 +14,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
 // waitFor bounds how long a test waits for rcs-as; a safety net, never a
@@ -69,24 +70,19 @@ func newCoreStub(t *testing.T) *coreStub {
 	return c
 }
 
-// rcs-as end to end, with the memory store: a pager-mode MESSAGE from the
-// core, with alice's asserted identity, is answered 202 and stored, and
-// delivered to bob as a MESSAGE of its own to the core, as a terminating
-// request that the default profile does not send back to rcs-as.
-func TestAStandaloneMessageIsStoredAndDeliveredThroughTheCore(t *testing.T) {
-	core := newCoreStub(t)
-	cfg, err := configure(with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "127.0.0.1:0", "RCSAS_SIP_HOST", "127.0.0.1",
-		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
-	if err != nil {
-		t.Fatal(err)
-	}
+// startRun runs rcs-as with cfg on any free SIP port, which the settings
+// refuse and deployments must not use, and the memory store, until the
+// test ends; it returns the SIP listener's address.
+func startRun(t *testing.T, cfg Config, d deps) netip.AddrPort {
+	t.Helper()
+	cfg.SIPListenAddr = "127.0.0.1:0"
 	h := runtimetest.New(t, "rcs-as")
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
 	done := make(chan error, 1)
-	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{store: store.NewMemory(), listening: func(a netip.AddrPort) { listening <- a }})
-	}()
+	d.store = store.NewMemory()
+	d.listening = func(a netip.AddrPort) { listening <- a }
+	go func() { done <- run(ctx, h.Runtime, cfg, d) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -98,15 +94,29 @@ func TestAStandaloneMessageIsStoredAndDeliveredThroughTheCore(t *testing.T) {
 			t.Error("rcs-as did not stop")
 		}
 	})
-	var addr netip.AddrPort
 	select {
-	case addr = <-listening:
+	case addr := <-listening:
+		return addr
 	case err := <-done:
 		t.Fatalf("run ended: %v", err)
 	case <-time.After(waitFor):
 		t.Fatal("rcs-as did not start")
 	}
+	return netip.AddrPort{}
+}
 
+// rcs-as end to end, with the memory store: a pager-mode MESSAGE from the
+// core, with alice's asserted identity, is answered 202 and stored, and
+// delivered to bob as a MESSAGE of its own to the core, as a terminating
+// request that the default profile does not send back to rcs-as.
+func TestAStandaloneMessageIsStoredAndDeliveredThroughTheCore(t *testing.T) {
+	core := newCoreStub(t)
+	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1",
+		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := startRun(t, cfg, deps{})
 	nc, err := net.Dial("tcp", addr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -147,5 +157,61 @@ func TestAStandaloneMessageIsStoredAndDeliveredThroughTheCore(t *testing.T) {
 		}
 	case <-time.After(waitFor):
 		t.Fatal("the message was not delivered")
+	}
+}
+
+// scscf hands rcs-as an OPTIONS with the AS URI of the default profile's
+// iFC on top of its Route (TS 24.229 §5.4.3.2), then its own entry: rcs-as
+// takes the first as its own, without looking it up, and the request goes
+// on to scscf rather than back to rcs-as.
+func TestAnOptionsFromTheCoreGoesBackToIt(t *testing.T) {
+	for _, top := range []string{"<sip:rcs-as.rcs.internal;lr>", "<sip:rcs-as.rcs.internal;transport=tcp;lr>", "<sip:127.0.0.1;lr>"} {
+		t.Run(top, func(t *testing.T) {
+			core := newCoreStub(t)
+			cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCS_SERVICE_NAMESPACE", "rcs.internal",
+				"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := startRun(t, cfg, deps{resolver: proxy.NumericResolver{}})
+			nc, err := net.Dial("tcp", addr.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = nc.Close() })
+			var b strings.Builder
+			b.WriteString("OPTIONS tel:+15550100002 SIP/2.0\r\n")
+			b.WriteString("Via: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-options\r\n")
+			b.WriteString("Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <tel:+15550100002>\r\n")
+			b.WriteString("Call-ID: rcsas-run-options\r\nCSeq: 1 OPTIONS\r\n")
+			b.WriteString("Route: " + top + ", <sip:" + core.l.Addr().String() + ";transport=tcp;lr>\r\n")
+			b.WriteString("Content-Length: 0\r\n\r\n")
+			_ = nc.SetDeadline(time.Now().Add(waitFor))
+			if _, err := io.WriteString(nc, b.String()); err != nil {
+				t.Fatal(err)
+			}
+			r := sip.NewReader(bufio.NewReader(nc), sip.Limits{})
+			for {
+				m, err := r.ReadMessage()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
+					if res.StatusCode != 200 {
+						t.Fatalf("answered %d", res.StatusCode)
+					}
+					break
+				}
+			}
+			select {
+			case req := <-core.got:
+				// rcs-as's own entry is gone; scscf's stays for scscf.
+				if req.Method != "OPTIONS" || req.Header.Get("Route") != "<sip:"+core.l.Addr().String()+";transport=tcp;lr>" {
+					t.Fatalf("the core got %s with Route %q", req.Method, req.Header.Get("Route"))
+				}
+			case <-time.After(waitFor):
+				t.Fatal("the OPTIONS did not reach the core")
+			}
+		})
 	}
 }

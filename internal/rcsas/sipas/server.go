@@ -16,9 +16,9 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
-// busyRetryAfter is the Retry-After, in seconds, of the 503 for a store that
-// stayed busy through its retries (store.ErrBusy): the conflicting write is
-// over within a moment.
+// busyRetryAfter is the Retry-After, in seconds, of the answer to a message
+// the store stayed busy for through its retries (store.ErrBusy): the
+// conflicting write is over within a moment.
 const busyRetryAfter = "1"
 
 // Engine is what Server needs from the messaging engine.
@@ -34,6 +34,10 @@ type Config struct {
 	// Host is this task's address (ADR 0005), the host of the Call-IDs it
 	// makes.
 	Host string
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
+	// a SIP URI whose user part is a global number names that number
+	// (UserOf).
+	HomeDomain string
 	// Listener names the transport listener rcs-as's own requests leave
 	// through, whose sent-by their Via carries.
 	Listener string
@@ -67,6 +71,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Host == "" {
 		return nil, errors.New("sipas: Host is required")
 	}
+	if cfg.HomeDomain == "" {
+		return nil, errors.New("sipas: HomeDomain is required")
+	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = proxy.NumericResolver{}
 	}
@@ -90,8 +97,35 @@ type noMetrics struct{}
 
 func (noMetrics) Count(string, int64) {}
 
+// ownTagPrefix starts the From tag of every request rcs-as originates, on
+// every task, so that one that comes back to it is known. It does when a
+// profile routes rcs-as's terminating requests to rcs-as again, lacking the
+// P-Served-User exclusion of the default one (docs/hss.md): rcs-as would
+// take its own delivery for a new message and send it once more, without
+// end. A client that writes such a tag only has its own request refused.
+const ownTagPrefix = "rcsas-"
+
+// ownTag is a From tag for a request rcs-as originates.
+func (s *Server) ownTag() (string, error) {
+	tag, err := s.ids.Tag()
+	return ownTagPrefix + tag, err
+}
+
+// looped reports a request rcs-as originated itself.
+func looped(req *sip.Request) bool {
+	from, err := req.Header.From()
+	return err == nil && strings.HasPrefix(from.Tag(), ownTagPrefix)
+}
+
 // Route implements proxy.Router.
 func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
+	if r.Initial() && r.Message.Method != "ACK" && looped(r.Message) {
+		// 482 Loop Detected (RFC 3261 §21.4.20); the sender of the
+		// request, rcs-as itself, takes it as a failure and tries again
+		// later, until the profile is put right.
+		s.cfg.Metrics.Count("sip.loop", 1)
+		return proxy.Decision{Status: 482}
+	}
 	switch m := r.Message.Method; {
 	case m == "MESSAGE" && r.Initial():
 		return proxy.Decision{Serve: s.message}
@@ -125,10 +159,15 @@ const allowed = "MESSAGE, OPTIONS"
 func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
 	o, code := s.origin(req)
+	busy := false
 	if code == 0 {
-		code = s.submit(ctx, o)
+		code, busy = s.submit(ctx, o)
 	}
 	s.cfg.Metrics.Count(fmt.Sprintf("sip.message.%d", code), 1)
+	if busy {
+		s.respondRetry(u, req, code)
+		return
+	}
 	s.respond(u, req, code)
 }
 
@@ -144,7 +183,7 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 	if err != nil || len(pai) == 0 {
 		return messaging.Origin{}, 403
 	}
-	sender, ok := UserOf(pai[0].URI.String())
+	sender, ok := UserOf(pai[0].URI.String(), s.cfg.HomeDomain)
 	if !ok {
 		return messaging.Origin{}, 403
 	}
@@ -152,11 +191,11 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 	for _, a := range pai {
 		raw := a.URI.String()
 		identities = append(identities, raw)
-		if c, ok := UserOf(raw); ok && c != sender {
+		if c, ok := UserOf(raw, s.cfg.HomeDomain); ok && c != sender {
 			identities = append(identities, c)
 		}
 	}
-	recipient, ok := UserOf(req.URI.String())
+	recipient, ok := UserOf(req.URI.String(), s.cfg.HomeDomain)
 	if !ok {
 		return messaging.Origin{}, 404
 	}
@@ -171,19 +210,23 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 	}, 0
 }
 
-// submit hands o to the engine and returns the status that answers it.
-func (s *Server) submit(ctx context.Context, o messaging.Origin) int {
+// submit hands o to the engine and returns the status that answers it,
+// and whether it is the store being busy, which says when to try again.
+// That answer is 500, not 503: scscf, a proxy, would turn a 503 from rcs-as
+// into a 500 of its own and drop its Retry-After (RFC 3261 §16.7 step 6),
+// and it passes a 500 on as it is, Retry-After included (§20.33).
+func (s *Server) submit(ctx context.Context, o messaging.Origin) (int, bool) {
 	err := s.engine.Submit(ctx, o)
 	var r *messaging.Rejection
 	switch {
 	case err == nil:
-		return 202
+		return 202, false
 	case errors.As(err, &r):
-		return refusalStatus(r.Reason)
+		return refusalStatus(r.Reason), false
 	case errors.Is(err, store.ErrBusy):
-		return 503
+		return 500, true
 	default:
-		return 500
+		return 500, false
 	}
 }
 
@@ -202,9 +245,23 @@ func refusalStatus(r messaging.Reason) int {
 	return 403
 }
 
-// respond answers req with code. A 503 says when to try again; a 415 what
-// to send (RFC 3261 §21.4.13); a 405 what is allowed.
+// respond answers req with code. A 415 says what to send (RFC 3261
+// §21.4.13).
 func (s *Server) respond(u *proxy.UAS, req *sip.Request, code int) {
+	var fields [][2]string
+	if code == 415 {
+		fields = append(fields, [2]string{"Accept", cpim.ContentType})
+	}
+	s.respondWith(u, req, code, fields...)
+}
+
+// respondRetry answers req with code and says when to try again: the
+// conflicting store write is over within a moment.
+func (s *Server) respondRetry(u *proxy.UAS, req *sip.Request, code int) {
+	s.respondWith(u, req, code, [2]string{"Retry-After", busyRetryAfter})
+}
+
+func (s *Server) respondWith(u *proxy.UAS, req *sip.Request, code int, fields ...[2]string) {
 	tag, err := s.ids.Tag()
 	if err != nil {
 		return // the proxy answers 500
@@ -213,14 +270,10 @@ func (s *Server) respond(u *proxy.UAS, req *sip.Request, code int) {
 	if err != nil {
 		return
 	}
-	switch code {
-	case 503:
-		err = res.Header.Set("Retry-After", busyRetryAfter)
-	case 415:
-		err = res.Header.Set("Accept", cpim.ContentType)
-	}
-	if err != nil {
-		return
+	for _, f := range fields {
+		if err := res.Header.Set(f[0], f[1]); err != nil {
+			return
+		}
 	}
 	if err := u.Respond(res); err != nil {
 		s.cfg.Metrics.Count("sip.respond_failed", 1)

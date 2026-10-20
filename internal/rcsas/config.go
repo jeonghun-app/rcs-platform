@@ -48,6 +48,8 @@ type Config struct {
 	// address, which its Via and Call-IDs name (ADR 0005).
 	SIPListenAddr string
 	SIPHost       netip.Addr
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN).
+	HomeDomain string
 	// Core is where rcs-as sends the requests it originates (scscf), a SIP
 	// URI of a host with transport=tcp and lr, and Namespace the Cloud Map
 	// namespace its names are looked up in (ADR 0007 §5).
@@ -113,10 +115,13 @@ func Configure(s *runtime.Settings) Config {
 	c.SIPListenAddr = e.String("SIP_LISTEN_ADDR", DefaultSIPListenAddr)
 	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
 		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
-	} else if p, err := strconv.Atoi(port); err != nil || p < 0 || p > 65535 {
+	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+		// Not 0 either: scscf reaches rcs-as on the port the HSS's AS URI
+		// names, which a port chosen at start would not be.
 		e.Invalid("SIP_LISTEN_ADDR", "needs a port")
 	}
 	c.SIPHost = runtime.InstanceAddr(e, "SIP_HOST", interfaceAddrs)
+	c.HomeDomain = s.Shared.RequiredString("IMS_DOMAIN")
 	c.Namespace = s.ServiceNamespace()
 	c.Core = coreURI(s)
 	if _, port, err := net.SplitHostPort(c.MSRPListenAddr); err != nil {

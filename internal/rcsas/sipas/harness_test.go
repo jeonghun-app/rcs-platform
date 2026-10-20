@@ -137,7 +137,7 @@ type as struct {
 // startAS serves e behind a Server whose core is core.
 func startAS(t *testing.T, e Engine, core *fakeCore) *as {
 	t.Helper()
-	srv, err := New(Config{Core: core.uri(), Host: "127.0.0.1", Listener: "core"})
+	srv, err := New(Config{Core: core.uri(), Host: "127.0.0.1", HomeDomain: domain, Listener: "core"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +255,28 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 			return nil, errors.New("got a request")
 		}
 		if res.StatusCode >= 200 {
+			return res, nil
+		}
+	}
+}
+
+// forward sends req as the core would, after its own processing, and
+// returns its final response.
+func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
+	b, err := req.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := p.nc.Write(b); err != nil {
+		return nil, err
+	}
+	for {
+		msg, err := p.r.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 {
 			return res, nil
 		}
 	}

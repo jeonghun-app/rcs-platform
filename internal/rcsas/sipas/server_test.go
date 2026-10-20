@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -17,20 +21,26 @@ func TestAUserIsNamedInOneForm(t *testing.T) {
 		"tel:+1-555-010-0001": alice,
 		"tel:+15550100001":    alice,
 		aliceSIP:              alice,
-		"sip:+1-555-010-0001@IMS.example.net;user=phone":    alice,
-		"sip:+15550100001@" + domain:                        "sip:+15550100001@" + domain,
+		"sip:+1-555-010-0001@IMS.example.net;user=phone": alice,
+		// The home domain's SIP form of a number is that number
+		// (architecture §4), elsewhere only with user=phone.
+		"sip:+15550100001@" + domain:                        alice,
+		"sip:+1-555-010-0001@" + strings.ToUpper(domain):    alice,
+		"sip:+15550100001@other.example.net":                "sip:+15550100001@other.example.net",
+		"sip:+15550100001@" + domain + ";user=ip":           "sip:+15550100001@" + domain,
+		"sip:+15550100001;ext=11@" + domain:                 "sip:+15550100001;ext=11@" + domain,
 		"sip:Bob@EXAMPLE.net":                               "sip:Bob@example.net",
 		"sip:Bob@example.net;user=phone":                    "sip:Bob@example.net",
 		"sip:%42ob@example.net":                             "sip:Bob@example.net",
 		"sips:+15550100002@" + domain + ";user=phone;lr":    bob,
 		"sip:+15550100002;ext=11@" + domain + ";user=phone": "sip:+15550100002;ext=11@" + domain,
 	} {
-		if got, ok := UserOf(in); !ok || got != want {
+		if got, ok := UserOf(in, domain); !ok || got != want {
 			t.Errorf("UserOf(%q) = %q, %t, want %q", in, got, ok, want)
 		}
 	}
 	for _, in := range []string{"", "not a URI", "tel:5550100", "sip:example.net", "http://example.net/"} {
-		if got, ok := UserOf(in); ok {
+		if got, ok := UserOf(in, domain); ok {
 			t.Errorf("UserOf(%q) = %q, want none", in, got)
 		}
 	}
@@ -92,7 +102,7 @@ func TestWhatRCSASCannotTakeIsRefusedWithItsStatus(t *testing.T) {
 		"forged IMDN":    {err: &messaging.Rejection{Reason: messaging.ReasonIMDNForged}, code: 403},
 		"queue full":     {err: &messaging.Rejection{Reason: messaging.ReasonQueueFull}, code: 403},
 		"rate":           {err: &messaging.Rejection{Reason: messaging.ReasonRateLimited}, code: 403},
-		"busy store":     {err: busy, code: 503, header: [2]string{"Retry-After", "1"}},
+		"busy store":     {err: busy, code: 500, header: [2]string{"Retry-After", "1"}},
 		"failed store":   {err: errors.New("fake: store down"), code: 500},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -142,17 +152,87 @@ func TestOtherRequestsAreAnsweredOrPassedOn(t *testing.T) {
 	}
 }
 
-// The lead's case on #137: alice arrives once as tel:+1-555-… and once as
-// sip:+1555…;user=phone, and holds one share of bob's queue, not two
-// (threat model T10).
-func TestAUserWrittenTwoWaysHoldsOneShare(t *testing.T) {
+// The lead's case on #137, and the code review's on #242: alice arrives in
+// every form pcscf may assert (#208) or a client may choose by its
+// P-Preferred-Identity, and holds one share of bob's queue, not one per
+// form (threat model T10).
+func TestAUserWrittenEveryWayHoldsOneShare(t *testing.T) {
 	core := newFakeCore(t)
 	core.setAnswer(func(*sip.Request) int { return 480 }) // bob is offline: what is queued stays
+	a, _ := startEngine(t, core, messaging.Config{MaxQueueMessages: 6, QueueSenderShare: 2})
+	p := a.dial(t)
+	// Three of six, alice's share, then a refusal, whichever form comes.
+	forms := []string{
+		"<tel:+1-555-010-0001>",
+		"<sip:+15550100001@" + domain + ">, <tel:+15550100001>",
+		"<" + aliceSIP + ">",
+		"<sip:+15550100001@" + strings.ToUpper(domain) + ">",
+	}
+	for i, id := range forms {
+		m := pager(cpimBody(fmt.Sprint("m", i), "hi"))
+		m.fields[0] = "P-Asserted-Identity: " + id
+		want := 202
+		if i == 3 {
+			want = 403
+		}
+		if res := p.send(m); res.StatusCode != want {
+			t.Fatalf("message %d as %s answered %d, want %d", i, id, res.StatusCode, want)
+		}
+	}
+}
+
+// The code review's case on #242: alice is asserted in SIP form first, as
+// pcscf does for a SIP identity, and writes to bob's number; bob's client
+// sends its delivery notification to alice's number, as rcsjta does
+// (ImdnManager), or to the SIP From rcs-as wrote, asserted in SIP form too.
+// Either way it finds the message, and goes on to alice.
+func TestADeliveryNotificationFindsItsMessageWhateverTheForms(t *testing.T) {
+	core := newFakeCore(t)
+	a, _ := startEngine(t, core, messaging.Config{})
+	p := a.dial(t)
+	for i, to := range []string{"tel:+15550100001", "sip:+15550100001@" + domain} {
+		id := fmt.Sprint("m", i)
+		m := pager(cpimBody(id, "hi"))
+		m.uri = "tel:+15550100002"
+		m.fields[0] = "P-Asserted-Identity: <sip:+15550100001@" + domain + ">, <tel:+15550100001>"
+		if res := p.send(m); res.StatusCode != 202 {
+			t.Fatalf("alice's message answered %d", res.StatusCode)
+		}
+		if got := core.next(t); got.URI.String() != bob {
+			t.Fatalf("delivered to %s", got.URI.String())
+		}
+		n := imdn.Notification{MessageID: id, DateTime: "2026-03-04T05:06:07.000Z", Kind: imdn.DeliveryNotification, Status: imdn.Delivered}
+		cm, err := n.Message(imdn.Envelope{
+			From: cpim.Address{URI: messaging.AnonymousURI}, To: cpim.Address{URI: messaging.AnonymousURI},
+			MessageID: "r" + id, DateTime: time.Date(2026, 3, 4, 5, 6, 8, 0, time.UTC),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := cm.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := pager(string(body))
+		r.uri = to
+		r.fields[0] = "P-Asserted-Identity: <sip:+15550100002@" + domain + ">, <tel:+15550100002>"
+		if res := p.send(r); res.StatusCode != 202 {
+			t.Fatalf("bob's notification to %s answered %d", to, res.StatusCode)
+		}
+		if got := core.next(t); got.URI.String() != alice || !strings.Contains(string(got.Body), "<delivered>") {
+			t.Fatalf("the notification went to %s: %q", got.URI.String(), got.Body)
+		}
+	}
+}
+
+// startEngine serves the real engine, on the memory store, behind a Server
+// whose core is core.
+func startEngine(t *testing.T, core *fakeCore, cfg messaging.Config) (*as, *messaging.Engine) {
+	t.Helper()
 	var a *as
-	e, err := messaging.New(messaging.Config{
-		MSRPHost: "127.0.0.1", MSRPPort: 2855, MaxQueueMessages: 4, QueueSenderShare: 2,
-		SenderRate: messaging.Rate{PerMinute: -1},
-	}, store.NewMemory(), deliverer{&a}, noMetrics{})
+	cfg.MSRPHost, cfg.MSRPPort = "127.0.0.1", 2855
+	cfg.SenderRate = messaging.Rate{PerMinute: -1}
+	e, err := messaging.New(cfg, store.NewMemory(), deliverer{&a}, noMetrics{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,18 +240,7 @@ func TestAUserWrittenTwoWaysHoldsOneShare(t *testing.T) {
 	// Closed before the transport, which carries the answers to the
 	// deliveries it waits for.
 	t.Cleanup(e.Close)
-	p := a.dial(t)
-	for i, id := range []string{"<tel:+1-555-010-0001>", "<" + aliceSIP + ">"} {
-		m := pager(cpimBody(fmt.Sprint("m", i), "hi"))
-		m.fields[0] = "P-Asserted-Identity: " + id
-		if res := p.send(m); res.StatusCode != 202 {
-			t.Fatalf("message %d as %s answered %d", i, id, res.StatusCode)
-		}
-	}
-	m := pager(cpimBody("m2", "hi"))
-	if res := p.send(m); res.StatusCode != 403 {
-		t.Fatalf("a third message, past alice's share, answered %d", res.StatusCode)
-	}
+	return a, e
 }
 
 // deliverer is the engine's Deliverer before the Server exists.

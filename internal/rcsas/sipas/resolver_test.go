@@ -35,6 +35,7 @@ func TestTheResolverLooksUpOnlyNamesInTheNamespaceAndUsesPrivateAddresses(t *tes
 		"sip:scscf.rcs.internal:5070;transport=tcp": {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.1.5:5070")},
 		"sips:scscf.rcs.internal":                   {Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.1.5:5061"), ServerName: "scscf.rcs.internal"},
 		"sip:10.0.2.7:5080;transport=tcp":           {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.2.7:5080")},
+		"sip:127.0.0.1:5080;transport=tcp":          {Network: transport.TCP, Addr: netip.MustParseAddrPort("127.0.0.1:5080")},
 	} {
 		got, err := resolve(in)
 		if err != nil || got != want {
@@ -45,6 +46,10 @@ func TestTheResolverLooksUpOnlyNamesInTheNamespaceAndUsesPrivateAddresses(t *tes
 	for _, in := range []string{
 		"sip:scscf.example.org;transport=tcp", // outside the namespace: not looked up
 		"tel:+15550100002",
+		// Addresses outside the platform (security review on #242).
+		"sip:203.0.113.9;transport=tcp",
+		"sip:169.254.169.254;transport=tcp",
+		"sip:[2001:db8::1];transport=tcp",
 	} {
 		if _, err := resolve(in); !errors.Is(err, proxy.ErrUnresolvable) {
 			t.Errorf("%s: %v", in, err)
