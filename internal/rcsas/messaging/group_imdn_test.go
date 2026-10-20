@@ -237,8 +237,8 @@ func TestReceiptsFromManyGroupsDoNotFillTheAuthorsQueue(t *testing.T) {
 		}
 	}
 	l := queueLimit(r.e.cfg)
-	if got := r.store.(*store.Memory).Len(alice); got != l.GroupCount || got != 250 {
-		t.Fatalf("%d receipts queued for alice, the total is %d", got, l.GroupCount)
+	if notes, sums := queuedReceipts(t, r, alice); notes != l.GroupCount || notes != 250 || sums != 9 {
+		t.Fatalf("%d receipts and %d summaries queued for alice, the total is %d", notes, sums, l.GroupCount)
 	}
 	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
 		t.Fatalf("a 1-to-1 message to alice: %v", err)

@@ -488,6 +488,9 @@ func (e *Engine) viaLeg(ctx context.Context, l *Leg, m store.Message) outcome {
 	if !ok {
 		return done
 	}
+	if c.Summary {
+		return e.sendSummary(ctx, l, c)
+	}
 	return e.sendClaimed(ctx, l, c)
 }
 
