@@ -472,3 +472,23 @@ func waitDone(t *testing.T, ua *UA) {
 		t.Fatal("the UA did not finish")
 	}
 }
+
+func TestOurBindingIsFoundWithItsInstanceInAnotherCase(t *testing.T) {
+	// QA on #253: +sip.instance values compare as URNs and UUIDs do,
+	// without regard to case (RFC 8141 §3.1, RFC 9562 §4), so a registrar
+	// that writes ours back in upper case still grants it.
+	s := newStandIn(t, transport.TCP)
+	s.rewrite = func(c *sip.Contact) {
+		if v, ok := c.Params.Get("+sip.instance"); ok {
+			c.Params.Set("+sip.instance", strings.ToUpper(v))
+		}
+	}
+	ua := dial(t, s.config())
+	if reg := register(t, ua); reg.Expires == 0 {
+		t.Fatal("the binding written back in upper case was not taken for ours")
+	}
+	if !SameInstance("<urn:uuid:00000000-0000-4000-8000-00000000000A>", "<URN:UUID:00000000-0000-4000-8000-00000000000a>") ||
+		SameInstance("<urn:uuid:00000000-0000-4000-8000-000000000001>", "<urn:uuid:00000000-0000-4000-8000-000000000002>") {
+		t.Fatal("SameInstance compares otherwise than without case")
+	}
+}

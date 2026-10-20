@@ -649,12 +649,19 @@ func (ua *UA) registration(res *sip.Response) (*Registration, error) {
 // binding: the same instance and reg-id (RFC 5626 §6).
 func (ua *UA) isOurs(c sip.Contact) bool {
 	inst, ok := c.Instance()
-	if !ok || inst != "<"+ua.cfg.InstanceID+">" {
+	if !ok || !SameInstance(inst, "<"+ua.cfg.InstanceID+">") {
 		return false
 	}
 	id, present, err := c.RegID()
 	return present && err == nil && id == ua.cfg.RegID
 }
+
+// SameInstance reports whether two +sip.instance values, written as RFC
+// 5626 §4.1 has them ("<urn:...>"), name the same instance. URNs compare
+// without regard to case in their "urn" and namespace parts (RFC 8141
+// §3.1), and the UUIDs instances are made of without regard to case at
+// all (RFC 9562 §4), so the comparison ignores case.
+func SameInstance(a, b string) bool { return strings.EqualFold(a, b) }
 
 // NewRequest returns a request outside any dialog, from the IMPU to target,
 // with the route set of TS 24.229 §5.1.2A.1.1: the P-CSCF, then the
