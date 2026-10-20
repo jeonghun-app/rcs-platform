@@ -657,11 +657,59 @@ func (ua *UA) isOurs(c sip.Contact) bool {
 }
 
 // SameInstance reports whether two +sip.instance values, written as RFC
-// 5626 §4.1 has them ("<urn:...>"), name the same instance. URNs compare
-// without regard to case in their "urn" and namespace parts (RFC 8141
-// §3.1), and the UUIDs instances are made of without regard to case at
-// all (RFC 9562 §4), so the comparison ignores case.
-func SameInstance(a, b string) bool { return strings.EqualFold(a, b) }
+// 5626 §4.1 has them ("<urn:...>"), name the same instance. §4.1 compares
+// them by the rules of their URN namespace, and lexically (RFC 8141 §3.1)
+// for one it does not know: case does not matter in "urn", in the
+// namespace ID or in percent-encoding hex, and does in the rest. The UUIDs
+// of urn:uuid, which RCS clients use, compare without case throughout (RFC
+// 9562 §4). A value that is not a URN in angle brackets must match exactly.
+func SameInstance(a, b string) bool {
+	ka, okA := instanceKey(a)
+	kb, okB := instanceKey(b)
+	if !okA || !okB {
+		return a == b
+	}
+	return ka == kb
+}
+
+// instanceKey is the form of a "<urn:NID:NSS>" value that equal instances
+// share: "urn" and the NID in lower case, and the NSS with its
+// percent-encoding hex in upper case, or wholly in lower case for uuid.
+func instanceKey(v string) (string, bool) {
+	urn, ok := strings.CutPrefix(v, "<")
+	if !ok {
+		return "", false
+	}
+	if urn, ok = strings.CutSuffix(urn, ">"); !ok {
+		return "", false
+	}
+	scheme, rest, ok := strings.Cut(urn, ":")
+	if !ok || !strings.EqualFold(scheme, "urn") {
+		return "", false
+	}
+	nid, nss, ok := strings.Cut(rest, ":")
+	if !ok || nid == "" {
+		return "", false
+	}
+	nid = strings.ToLower(nid)
+	if nid == "uuid" {
+		return "urn:uuid:" + strings.ToLower(nss), true
+	}
+	b := []byte(nss)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1], b[i+2] = upperHex(b[i+1]), upperHex(b[i+2])
+		}
+	}
+	return "urn:" + nid + ":" + string(b), true
+}
+
+func upperHex(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 'A'
+	}
+	return c
+}
 
 // NewRequest returns a request outside any dialog, from the IMPU to target,
 // with the route set of TS 24.229 §5.1.2A.1.1: the P-CSCF, then the

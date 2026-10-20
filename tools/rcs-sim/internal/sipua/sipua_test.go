@@ -492,3 +492,30 @@ func TestOurBindingIsFoundWithItsInstanceInAnotherCase(t *testing.T) {
 		t.Fatal("SameInstance compares otherwise than without case")
 	}
 }
+
+// Code review on #262: case is ignored only where RFC 8141 §3.1 ignores it
+// ("urn", the namespace ID and percent-encoding hex), and in the whole
+// value only for urn:uuid, whose UUIDs compare without case (RFC 9562 §4).
+// Anything else follows RFC 5626 §4.1's lexical equality.
+func TestSameInstanceFollowsTheURNRules(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		same bool
+	}{
+		{"<urn:example:Dev-A>", "<urn:example:dev-a>", false},
+		{"<URN:Example:Dev-A>", "<urn:example:Dev-A>", true},
+		{"<urn:uuid:00000000-0000-4000-8000-00000000AbCd>", "<URN:UUID:00000000-0000-4000-8000-00000000aBcD>", true},
+		{"<urn:example:a%2fb>", "<urn:example:a%2Fb>", true},
+		{"<urn:example:a%2fb>", "<urn:example:A%2fb>", false},
+		{"<urn:example:x>", "<urn:examplf:x>", false},
+		{"<tag:Example>", "<tag:example>", false},
+		{"<urn:uuid:1>", "urn:uuid:1", false},
+	} {
+		if got := SameInstance(c.a, c.b); got != c.same {
+			t.Errorf("SameInstance(%q, %q) = %v, want %v", c.a, c.b, got, c.same)
+		}
+		if got := SameInstance(c.b, c.a); got != c.same {
+			t.Errorf("SameInstance(%q, %q) = %v, want %v", c.b, c.a, got, c.same)
+		}
+	}
+}
