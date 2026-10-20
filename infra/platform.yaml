@@ -25,6 +25,10 @@ Metadata:
           - IcscfEnabled
           - WafRateLimit
           - WafRateAction
+          - NlbAllocationIdA
+          - NlbAllocationIdB
+          - NlbReusedAddressA
+          - NlbReusedAddressB
       - Label: { default: Release }
         Parameters:
           - EcrStackName
@@ -143,6 +147,9 @@ Parameters:
   FtHostName:
     Type: String
     Default: ''
+    # Empty, or a lower-case DNS name: a typo fails here, not at the ALB rule
+    # or the service's start.
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       Host name of the FT HTTP content server (the host of ftHTTPCSURI). When
       set, ft-server's routes also match on it, so acs and ft-server can share
@@ -191,6 +198,32 @@ Parameters:
       (docs/ft-server.md, Operations notes): its own limits are per task.
       Handsets reach the stack through carrier-grade NAT, thousands behind
       one address, so size it to the busiest such address, not to a device.
+
+  NlbAllocationIdA:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(eipalloc-[0-9a-f]+)?$'
+    Description: >
+      Allocation id of an Elastic IP to give the NLB in public subnet A, such
+      as one an earlier stack retained (docs/runbook.md#keeping-the-nlb-addresses);
+      empty allocates a new one. Clients cache the NLB's address.
+  NlbAllocationIdB:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(eipalloc-[0-9a-f]+)?$'
+    Description: As NlbAllocationIdA, for public subnet B.
+  # Set by deploy.sh from the allocations above: CloudFormation cannot read an
+  # Elastic IP's address from its allocation id.
+  NlbReusedAddressA:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^$'
+    Description: The public address of NlbAllocationIdA (deploy.sh sets it).
+  NlbReusedAddressB:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^$'
+    Description: The public address of NlbAllocationIdB (deploy.sh sets it).
 
   WafRateAction:
     Type: String
@@ -363,6 +396,7 @@ Parameters:
   RelayPublicHost:
     Type: String
     Default: ''
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       RELAY_PUBLIC_HOST, the host of every client_path: an operator FQDN that
       names the NLB, or empty for the NLB's own DNS name.
@@ -415,6 +449,7 @@ Parameters:
   AcsHostName:
     Type: String
     Default: ''
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       Host name of acs on the ALB (the operator's configuration server name),
       used in the URIs acs hands out. Required outside dev: clients check the
@@ -563,6 +598,8 @@ Conditions:
   # ADR 0003: plain SIP and MSRP are refused outside dev.
   WithPcscfPlain: !And [!Condition WithPcscf, !Condition IsDev]
   WafBlocks: !Equals [!Ref WafRateAction, block]
+  NewNlbAddressA: !Equals [!Ref NlbAllocationIdA, '']
+  NewNlbAddressB: !Equals [!Ref NlbAllocationIdB, '']
 
   CreateAlarmTopic: !Equals [!Ref AlarmTopicArn, '']
   WithInterfaceEndpoints: !Or
@@ -575,6 +612,9 @@ Conditions:
   HasDailyBudget: !Not [!Equals [!Ref DailyBudgetUsd, '0']]
   HasRelayPublicHost: !Not [!Equals [!Ref RelayPublicHost, '']]
   HasAcsHostName: !Not [!Equals [!Ref AcsHostName, '']]
+  AcsRuns: !Not [!Equals [!Ref AcsDesiredCount, '0']]
+  FtServerRuns: !Not [!Equals [!Ref FtServerDesiredCount, '0']]
+  RelayRuns: !Not [!Equals [!Ref RelayDesiredCount, '0']]
   UseAcsEum: !Equals [!Ref AcsSmsProvider, eum]
   UseAcsSns: !Equals [!Ref AcsSmsProvider, sns]
   InUsEast1: !Equals [!Ref AWS::Region, us-east-1]
@@ -1435,19 +1475,25 @@ Resources:
       # (TS 24.229, NOTE 15), so pcscf must know it (PCSCF_PUBLIC_ADDRS), and
       # it must not change under clients that cached it.
       SubnetMappings:
-        - { SubnetId: !Ref PublicSubnetA, AllocationId: !GetAtt NlbAddressA.AllocationId }
-        - { SubnetId: !Ref PublicSubnetB, AllocationId: !GetAtt NlbAddressB.AllocationId }
+        - SubnetId: !Ref PublicSubnetA
+          AllocationId: !If [NewNlbAddressA, !GetAtt NlbAddressA.AllocationId, !Ref NlbAllocationIdA]
+        - SubnetId: !Ref PublicSubnetB
+          AllocationId: !If [NewNlbAddressB, !GetAtt NlbAddressB.AllocationId, !Ref NlbAllocationIdB]
       SecurityGroups: [!Ref NlbSecurityGroup]
       LoadBalancerAttributes:
         - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
         - { Key: deletion_protection.enabled, Value: !If [IsProduction, 'true', 'false'] }
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb' }]
 
-  # The NLB's public addresses, one per public subnet. Retained: a
-  # replacement of the NLB or of the stack keeps them, so clients' cached
-  # addresses still work after a redeployment.
+  # The NLB's public addresses, one per public subnet, allocated unless
+  # NlbAllocationIdA/B name existing ones. Retained when the stack goes, so
+  # a new stack can take them back through those parameters and clients'
+  # cached addresses keep working. A change that replaces the NLB itself
+  # cannot be applied with fixed addresses: the new NLB is created while the
+  # old still holds them.
   NlbAddressA:
     Type: AWS::EC2::EIP
+    Condition: NewNlbAddressA
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     DependsOn: InternetGatewayAttachment
@@ -1456,6 +1502,7 @@ Resources:
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb-a' }]
   NlbAddressB:
     Type: AWS::EC2::EIP
+    Condition: NewNlbAddressB
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     DependsOn: InternetGatewayAttachment
@@ -1510,7 +1557,11 @@ Resources:
   # The idle timeout is configurable on TCP listeners only; TLS listeners keep
   # a fixed 350 s, which the keep-alives are sized for (ADR 0003). The plain
   # listeners exist in dev only: ADR 0003 refuses unencrypted SIP and MSRP in
-  # staging and prod, and the target port cannot tell the two apart.
+  # staging and prod, and the target port cannot tell the two apart. In dev,
+  # plain SIP on 5060 goes to the same target port 5061 as TLS: pcscf's
+  # nlb-tls listener, which takes every flow as TLS-protected (sips Path).
+  # That is a dev shortcut, not a supported mode (#16 decides whether dev
+  # pcscf gets a tcp-mode listener of its own).
   SipTcpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: WithPcscfPlain
@@ -2580,10 +2631,18 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:DescribeTable]
-                Resource: [!GetAtt AcsTable.Arn, !Sub '${AcsTable.Arn}/index/gsi1']
+                Resource: !GetAtt AcsTable.Arn
+              # The index is only queried.
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub '${AcsTable.Arn}/index/gsi1'
         # Only the chosen provider's send action. Sending an SMS to a number
         # has no resource to scope to, so Resource is '*' as the APIs require;
-        # for SNS a Deny keeps it to phone numbers, never a topic.
+        # for SNS a Deny keeps it to phone numbers, never a topic. Whether
+        # End User Messaging's SendTextMessage can be held to the origination
+        # identity's ARN is open (the Service Authorization Reference was not
+        # reachable from the review host); verify before narrowing, since a
+        # wrong resource would stop every OTP.
         - !If
           - UseAcsEum
           - PolicyName: sms
@@ -3965,6 +4024,8 @@ Resources:
           ReturnData: true
   AcsNoHealthyTargets:
     Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: AcsRuns
     Properties:
       AlarmName: !Sub '${AWS::StackName}-AcsNoHealthyTargets'
       AlarmDescription: 'acs has no healthy target: the service is down for clients. See docs/runbook.md#acsnohealthytargets.'
@@ -3991,6 +4052,8 @@ Resources:
             Stat: Minimum
   FtServerNoHealthyTargets:
     Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: FtServerRuns
     Properties:
       AlarmName: !Sub '${AWS::StackName}-FtServerNoHealthyTargets'
       AlarmDescription: 'ft-server has no healthy target: the service is down for clients. See docs/runbook.md#ftservernohealthytargets.'
@@ -4017,6 +4080,8 @@ Resources:
             Stat: Minimum
   RelayNoHealthyTargets:
     Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: RelayRuns
     Properties:
       AlarmName: !Sub '${AWS::StackName}-RelayNoHealthyTargets'
       AlarmDescription: 'msrp-relay has no healthy target: the service is down for clients. See docs/runbook.md#relaynohealthytargets.'
@@ -5025,13 +5090,20 @@ Resources:
   ServiceImpaired:
     Type: AWS::Events::Rule
     Properties:
-      Description: ECS services of the stack that cannot start tasks or failed a deployment, reported to the alarm topic.
+      Description: ECS services of the stack that cannot place, configure or start tasks, or failed a deployment, reported to the alarm topic.
+      # The stack's services by their ARNs: Deployment State Change events
+      # carry no clusterArn in their detail, but both kinds name the service
+      # in resources.
       EventPattern:
         source: [aws.ecs]
         detail-type: [ECS Service Action, ECS Deployment State Change]
+        resources: [{ prefix: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${Cluster}/' }]
         detail:
-          clusterArn: [!GetAtt Cluster.Arn]
-          eventName: [SERVICE_TASK_START_IMPAIRED, SERVICE_DEPLOYMENT_FAILED]
+          eventName:
+            - SERVICE_TASK_START_IMPAIRED
+            - SERVICE_TASK_PLACEMENT_FAILURE
+            - SERVICE_TASK_CONFIGURATION_FAILURE
+            - SERVICE_DEPLOYMENT_FAILED
       Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
 
   # Key policy and key state changes (threat model T7). Also fires on every
@@ -5173,7 +5245,16 @@ Outputs:
     Export: { Name: !Sub '${AWS::StackName}-NamespaceId' }
   NlbPublicAddresses:
     Description: The NLB's fixed public addresses, comma-separated; pcscf's PCSCF_PUBLIC_ADDRS.
-    Value: !Join [',', [!Ref NlbAddressA, !Ref NlbAddressB]]
+    Value: !Join
+      - ','
+      - - !If [NewNlbAddressA, !Ref NlbAddressA, !Ref NlbReusedAddressA]
+        - !If [NewNlbAddressB, !Ref NlbAddressB, !Ref NlbReusedAddressB]
+  NlbAllocationIds:
+    Description: The NLB's Elastic IP allocations; pass them as NlbAllocationIdA/B to a new stack to keep the addresses.
+    Value: !Join
+      - ','
+      - - !If [NewNlbAddressA, !GetAtt NlbAddressA.AllocationId, !Ref NlbAllocationIdA]
+        - !If [NewNlbAddressB, !GetAtt NlbAddressB.AllocationId, !Ref NlbAllocationIdB]
   NlbDnsName:
     Description: >
       Where clients reach SIP and MSRP: point the operator's names at it, or

@@ -344,8 +344,32 @@ def check_plain_listeners(template: dict) -> list[str]:
     problems = []
     for name, listener in resources(template, "AWS::ElasticLoadBalancingV2::Listener").items():
         protocol = listener.get("Properties", {}).get("Protocol")
+        if not isinstance(protocol, str):
+            problems.append(f"{name}: the protocol must be literal for this check to see it")
+            continue
         if protocol in PLAIN_PROTOCOLS and not dev_only(template, listener.get("Condition")):
             problems.append(f"{name}: a plain {protocol} listener outside dev (ADR 0003)")
+    # With a certificate, the ALB's HTTP listener only redirects, and no rule
+    # forwards on it; it forwards only without one (dev, see the Rules).
+    for name, listener in resources(template, "AWS::ElasticLoadBalancingV2::Listener").items():
+        props = listener.get("Properties", {})
+        if props.get("Protocol") != "HTTP":
+            continue
+        for action in props.get("DefaultActions", []):
+            if not (isinstance(action, dict) and "Fn::If" in action):
+                problems.append(f"{name}: the HTTP listener acts the same with a certificate; it must redirect then")
+                continue
+            condition, with_certificate, _ = action["Fn::If"]
+            if condition != "HasAlbCertificate" or with_certificate.get("Type") != "redirect":
+                problems.append(f"{name}: with a certificate the HTTP listener must redirect to HTTPS")
+        for rule_name, rule in resources(template, "AWS::ElasticLoadBalancingV2::ListenerRule").items():
+            arn = rule.get("Properties", {}).get("ListenerArn")
+            if logical_id(arn) == name:
+                problems.append(f"{rule_name}: forwards on the HTTP listener even with a certificate")
+            elif isinstance(arn, dict) and "Fn::If" in arn:
+                condition, with_certificate, _ = arn["Fn::If"]
+                if condition != "HasAlbCertificate" or logical_id(with_certificate) == name:
+                    problems.append(f"{rule_name}: forwards on the HTTP listener even with a certificate")
     nlb = resources(template, "AWS::EC2::SecurityGroup").get("NlbSecurityGroup", {})
     for rule, condition in inline_rules(nlb.get("Properties", {}).get("SecurityGroupIngress", [])):
         if rule.get("FromPort") in PLAIN_PORTS and not dev_only(template, condition):
@@ -386,6 +410,50 @@ def check_waf(template: dict) -> list[str]:
         rules = acl.get("Properties", {}).get("Rules", [])
         if not any("RateBasedStatement" in r.get("Statement", {}) for r in rules if isinstance(r, dict)):
             problems.append(f"{name}: no rate-based rule; per-task limits do not hold one client back across tasks")
+    return problems
+
+
+# What WAF logs must hide: acs's configuration queries carry IMSI and MSISDN,
+# ft-server's download ids are capabilities, and these headers carry
+# credentials or an identity.
+WAF_REDACTED_HEADERS = {"authorization", "cookie", "x-3gpp-intended-identity"}
+
+
+def check_waf_logging(template: dict) -> list[str]:
+    problems = []
+    configs = resources(template, "AWS::WAFv2::LoggingConfiguration").values()
+    for name in resources(template, "AWS::WAFv2::WebACL"):
+        mine = [c for c in configs if logical_id(c.get("Properties", {}).get("ResourceArn")) == name]
+        if not mine:
+            problems.append(f"{name}: no WAF logging configuration")
+            continue
+        fields = mine[0].get("Properties", {}).get("RedactedFields", [])
+        if not any("QueryString" in f for f in fields):
+            problems.append(f"{name}: WAF logs keep the query string")
+        headers = {f["SingleHeader"].get("Name", "").lower() for f in fields if "SingleHeader" in f}
+        for header in sorted(WAF_REDACTED_HEADERS - headers):
+            problems.append(f"{name}: WAF logs keep the {header} header")
+    return problems
+
+
+# Host names clients use: empty or a DNS name, so a typo fails at the
+# parameter.
+HOST_PARAMETERS = ("FtHostName", "AcsHostName", "RelayPublicHost")
+
+
+def check_host_parameters(template: dict) -> list[str]:
+    problems = []
+    for name in HOST_PARAMETERS:
+        pattern = template.get("Parameters", {}).get(name, {}).get("AllowedPattern")
+        if not pattern:
+            problems.append(f"parameter {name}: no AllowedPattern")
+            continue
+        for bad in ("a b", "Ft.Example.com", "-x.example.com", "x"):
+            if re.fullmatch(pattern, bad):
+                problems.append(f"parameter {name}: its pattern accepts {bad!r}")
+        for good in ("", "ft.example.com"):
+            if not re.fullmatch(pattern, good):
+                problems.append(f"parameter {name}: its pattern refuses {good!r}")
     return problems
 
 
@@ -569,8 +637,20 @@ def covers(granted: list[str], wanted) -> bool:
     return any(fnmatch.fnmatchcase(w, g.lower()) for g in granted if isinstance(g, str) for w in wanted)
 
 
+def expand_statements(statements) -> list[dict]:
+    """A policy's statements, both branches of a statement-level Fn::If
+    included (AWS::NoValue dropped)."""
+    found = []
+    for st in statements if isinstance(statements, list) else [statements]:
+        if isinstance(st, dict) and "Fn::If" in st:
+            found += [b for b in st["Fn::If"][1:] if isinstance(b, dict) and "Ref" not in b]
+        elif isinstance(st, dict):
+            found.append(st)
+    return found
+
+
 def _reads_secrets(document: dict) -> bool:
-    for statement in document.get("Statement", []):
+    for statement in expand_statements(document.get("Statement", [])):
         if statement.get("Effect") != "Allow":
             continue
         if "NotAction" in statement or covers(_actions(statement), SECRET_ACTIONS):
@@ -731,13 +811,13 @@ def _statements(template: dict):
     """(role or policy name, attached roles, statement) for every IAM statement."""
     for name, role in resources(template, "AWS::IAM::Role").items():
         for policy in _policies(role):
-            for st in policy.get("PolicyDocument", {}).get("Statement", []):
+            for st in expand_statements(policy.get("PolicyDocument", {}).get("Statement", [])):
                 yield name, {name}, st
     for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"):
         for name, policy in resources(template, kind).items():
             props = policy.get("Properties", {})
             attached = ({logical_id(r) for r in props.get("Roles", [])} | {logical_id(props.get("RoleName"))}) - {None}
-            for st in props.get("PolicyDocument", {}).get("Statement", []):
+            for st in expand_statements(props.get("PolicyDocument", {}).get("Statement", [])):
                 yield name, attached, st
 
 
@@ -826,6 +906,8 @@ def check_required_actions(template: dict, required: dict | None = None) -> list
         required = yaml.safe_load(REQUIRED_ACTIONS.read_text())
     roles = resources(template, "AWS::IAM::Role")
     problems = []
+    for role in sorted(task_roles(template) - set(required)):
+        problems.append(f"{role}: a task role missing from task-role-actions.yaml")
     for role, needs in sorted(required.items()):
         if role not in roles:
             problems.append(f"{role}: in task-role-actions.yaml but not in the template")
@@ -834,6 +916,16 @@ def check_required_actions(template: dict, required: dict | None = None) -> list
         for _, attached, st in _statements(template):
             if role in attached and st.get("Effect") == "Allow":
                 grants.append(([a.lower() for a in _actions(st) if isinstance(a, str)], _resource_keys(st.get("Resource"))))
+        # Nothing beyond the list: each granted action, on each resource, is
+        # one the code calls. A pattern grants more than any list can say.
+        listed = {(key, a.lower()) for key, actions in needs.items() for a in actions}
+        for actions, keys in grants:
+            for action in actions:
+                for key in keys:
+                    if "*" in action or "?" in action:
+                        problems.append(f"{role}: grants the pattern {action}; list the actions its code calls")
+                    elif (key, action) not in listed:
+                        problems.append(f"{role}: grants {action} on {key}, which task-role-actions.yaml does not list")
         for resource, actions in needs.items():
             for action in actions:
                 if not any(any(fnmatch.fnmatchcase(action.lower(), a) for a in acts) and
@@ -866,6 +958,13 @@ def check_iam_statements(template: dict) -> list[str]:
         for key in ("NotAction", "NotResource", "NotPrincipal"):
             if key in st:
                 problems.append(f"{name}: an Allow with {key} grants everything it does not name")
+        for key in _resource_keys(st.get("Resource")):
+            if key != "*" and ("*" in key or "?" in key) and (name, key) not in WILDCARD_ALLOWED:
+                problems.append(f"{name}: {key} is a wildcard ARN; name the resource")
+        if covers(_actions(st), "servicediscovery:discoverinstances"):
+            equals = st.get("Condition", {}).get("StringEquals", {})
+            if equals.get("servicediscovery:ServiceName") != "hss" or "servicediscovery:NamespaceName" not in equals:
+                problems.append(f"{name}: DiscoverInstances without the condition holding it to the hss service")
         resource = st.get("Resource")
         if resource == "*" or (isinstance(resource, list) and "*" in resource):
             for action in _actions(st):
@@ -875,6 +974,11 @@ def check_iam_statements(template: dict) -> list[str]:
                     covers(_actions(d), "sns:publish") and ":sns:*" in str(d.get("Resource")) for d in denies.get(name, [])):
                 problems.append(f"{name}: sns:Publish on '*' without a Deny on topics reaches every topic")
     return problems
+
+
+# Wildcards inside an ARN, only where the resource is a set by nature:
+# the objects of ft-server's bucket.
+WILDCARD_ALLOWED = {("FtServerTaskRole", "FilesBucket/*")}
 
 
 # Scan reads a whole table; only these may (role, resource as in
@@ -926,9 +1030,23 @@ def _key_principals(statement: dict) -> set[str]:
     return found
 
 
+# Conditions every use of a key must carry: the HSS keyring's data keys are
+# bound to their encryption context (internal/hss/awsstore), so the role
+# cannot use the key for anything else.
+KEY_CONDITIONS = {
+    "HssKey": {"kms:EncryptionContext:service": "hss", "kms:EncryptionContext:purpose": "subscriber-secrets"},
+}
+
+
 def check_key_policies(template: dict) -> list[str]:
     problems = []
     for name, key in resources(template, "AWS::KMS::Key").items():
+        for st in key.get("Properties", {}).get("KeyPolicy", {}).get("Statement", []):
+            if st.get("Effect") == "Allow" and covers(_actions(st), KEY_USE) and name in KEY_CONDITIONS:
+                equals = st.get("Condition", {}).get("StringEquals", {})
+                for cond, value in KEY_CONDITIONS[name].items():
+                    if equals.get(cond) != value:
+                        problems.append(f"{name}: a use of the key without {cond}={value}")
         users = KEY_USERS.get(name)
         if users is None:
             problems.append(f"{name}: not in KEY_USERS; say who may use it")
@@ -966,9 +1084,19 @@ def check_topics(template: dict) -> list[str]:
             services = st.get("Principal", {}).get("Service", []) if isinstance(st.get("Principal"), dict) else []
             for topic in props.get("Topics", []):
                 allowed.setdefault(logical_id(topic), set()).update([services] if isinstance(services, str) else services)
+    keys = resources(template, "AWS::KMS::Key")
     for name, topic in resources(template, "AWS::SNS::Topic").items():
         if not topic.get("Properties", {}).get("KmsMasterKeyId"):
             problems.append(f"{name}: not encrypted (KmsMasterKeyId)")
+        key = logical_id(topic.get("Properties", {}).get("KmsMasterKeyId"))
+        if key in keys:
+            # Publishing to an encrypted topic needs the key too.
+            usable = set()
+            for st in keys[key].get("Properties", {}).get("KeyPolicy", {}).get("Statement", []):
+                if st.get("Effect") == "Allow" and covers(_actions(st), ("kms:generatedatakey", "kms:decrypt")):
+                    usable |= {s[len("service:"):] for s in _key_principals(st) if s.startswith("service:")}
+            for service in sorted(publishers.get(name, set()) - usable):
+                problems.append(f"{name}: {service} publishes to it but cannot use its key {key}")
         for service in sorted(publishers.get(name, set()) - allowed.get(name, set())):
             problems.append(f"{name}: {service} publishes to it but its topic policy does not allow it")
     return problems
@@ -1030,6 +1158,8 @@ CHECKS = (
     check_plain_listeners,
     check_load_balancers,
     check_waf,
+    check_waf_logging,
+    check_host_parameters,
     check_tasks,
     check_start_period,
     check_tables,
