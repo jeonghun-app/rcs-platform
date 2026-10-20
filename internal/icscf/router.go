@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,6 +41,65 @@ type Router struct {
 	metrics         Metrics
 	log             *slog.Logger
 	unknownLog      everyMinute
+	failed          recentFailures
+}
+
+// failedFor is how long an S-CSCF address a request could not be sent to
+// goes to the back of the list: a stopped task's address stays in DNS
+// answers for their TTL after Cloud Map drops it.
+const failedFor = 30 * time.Second
+
+// maxFailedAddrs bounds the addresses remembered; past it a new failure is
+// not remembered until older ones expire.
+const maxFailedAddrs = 1024
+
+// recentFailures remembers the S-CSCF addresses a request could not be
+// sent to in the last failedFor.
+type recentFailures struct {
+	mu    sync.Mutex
+	until map[netip.AddrPort]time.Time
+}
+
+func (f *recentFailures) mark(a netip.AddrPort, now time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.until == nil {
+		f.until = make(map[netip.AddrPort]time.Time)
+	}
+	if len(f.until) >= maxFailedAddrs {
+		for k, t := range f.until {
+			if !now.Before(t) {
+				delete(f.until, k)
+			}
+		}
+		if len(f.until) >= maxFailedAddrs {
+			return
+		}
+	}
+	f.until[a] = now.Add(failedFor)
+}
+
+// order puts the addresses that failed lately after the others, each group
+// in the order it came in.
+func (f *recentFailures) order(dsts []transport.Destination, now time.Time) []transport.Destination {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	failed := func(d transport.Destination) bool {
+		t, ok := f.until[d.Addr]
+		return ok && now.Before(t)
+	}
+	out := make([]transport.Destination, 0, len(dsts))
+	for _, d := range dsts {
+		if !failed(d) {
+			out = append(out, d)
+		}
+	}
+	for _, d := range dsts {
+		if failed(d) {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // everyMinute allows one event a minute, for a log line that a fault can
@@ -232,6 +292,9 @@ func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transp
 		if f.Err == nil || f.Response == nil || f.Response.StatusCode != 503 {
 			return nil
 		}
+		if dst := f.Target.Destination; dst != nil && dst.Addr.IsValid() {
+			r.failed.mark(dst.Addr, time.Now())
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		if len(next) > 0 {
@@ -265,7 +328,10 @@ func (r *Router) destinations(ctx context.Context, u sip.URI) ([]transport.Desti
 		return nil, true
 	}
 	dsts, err := r.resolver.ResolveAll(ctx, u)
-	return dsts, err == nil && len(dsts) > 0
+	if err != nil || len(dsts) == 0 {
+		return nil, false
+	}
+	return r.failed.order(dsts, time.Now()), true
 }
 
 // first is the first destination, nil for none: the proxy resolves then.

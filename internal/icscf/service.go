@@ -31,6 +31,12 @@ const (
 	// waits for at most two, an attempt and its retry on another HSS task,
 	// before the S-CSCF's RegisterTimeout starts.
 	DefaultCxTimeout = cxclient.DefaultRequestTimeout
+	// coreDialTimeout bounds opening a connection to an S-CSCF. Everything
+	// is inside the VPC, where a connection opens in milliseconds, and the
+	// address of a stopped task drops the SYN rather than refusing it, so
+	// waiting the transport's 5 s default would spend that on every request
+	// sent to it (QA of #276).
+	coreDialTimeout = time.Second
 	// stopMargin is what Run needs after the drain to close the proxy, the
 	// transport and the Cx client, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
@@ -171,16 +177,16 @@ func Configure(s *runtime.Settings) ServiceConfig {
 		e.Invalid("CX_TIMEOUT", "must be greater than zero")
 	}
 	// A REGISTER waits for a UAR, an attempt and its retry on another HSS
-	// task, and then for the S-CSCF: all of it must end before the client's
-	// Timer F, 64*T1 = 32 s, or the 480 or 504 comes after it gave up
-	// (review of #276).
+	// task, then for a connection to the S-CSCF, and then for its answer:
+	// all of it must end before the client's Timer F, 64*T1 = 32 s, or the
+	// 480 or 504 comes after it gave up (reviews of #276).
 	// One Cx attempt alone must fit first, so the sum below cannot
 	// overflow and wrap below the limit (review of #276).
 	switch {
 	case c.CxTimeout >= MaxRegisterTimeout:
 		e.Invalid("CX_TIMEOUT", "must be under 32s, the client's Timer F")
-	case c.CxTimeout > 0 && c.RegisterTimeout > 0 && 2*c.CxTimeout+c.RegisterTimeout >= MaxRegisterTimeout:
-		e.Invalid("REGISTER_TIMEOUT", "plus twice ICSCF_CX_TIMEOUT must be under 32s, the client's Timer F")
+	case c.CxTimeout > 0 && c.RegisterTimeout > 0 && 2*c.CxTimeout+coreDialTimeout+c.RegisterTimeout >= MaxRegisterTimeout:
+		e.Invalid("REGISTER_TIMEOUT", "plus twice ICSCF_CX_TIMEOUT and the 1s connection setup must be under 32s, the client's Timer F")
 	}
 	s.ForbidInProduction(c.OriginHost != "",
 		"ICSCF_DIAMETER_HOST is set: every task would share one Origin-Host, and a task replacing a dead one would find the HSS holding its predecessor's connection in REOPEN (ADR 0005); leave it unset in ECS")

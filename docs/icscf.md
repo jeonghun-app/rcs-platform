@@ -40,7 +40,12 @@ the namespace (`proxy.DNSResolver`, #198): every private address of
 `scscf.<namespace>`, in a random order. A request goes to the first; when it
 cannot be sent to one (the task is gone, its connection refused), it goes to
 the next, counted as `icscf.scscf.next_address`. Once none is left, or when
-the name has no address, it is answered 500 with `Retry-After`. A REGISTER
+the name has no address, it is answered 500 with `Retry-After`. Opening a
+connection waits at most 1 s, since the address of a stopped task drops the
+connection attempt rather than refusing it, and an address that failed goes to
+the back of the list for 30 s, so it costs that second once, not on every
+request. That second is counted with the UAR and `ICSCF_REGISTER_TIMEOUT`
+against the client's 32 s. A REGISTER
 the S-CSCF does not answer in time is not sent to another address, since that
 S-CSCF may have taken it: it gets 504.
 
@@ -102,9 +107,8 @@ watchdog's REOPEN state (RFC 3539 §3.4.1) for about a minute first.
 
 On SIGTERM `icscf` keeps its listener open and waits, for at most
 `ICSCF_DRAIN_TIMEOUT`, until no request is in progress, so a REGISTER at the
-S-CSCF or a ringing INVITE still gets its final response. A context lingers
-32 s after a 2xx to an INVITE to pass its retransmissions on, so a stop soon
-after a call waits out the whole timeout.
+S-CSCF or a ringing INVITE still gets its final response. A call that has
+had its 2xx no longer counts, so a stop right after one returns at once.
 
 ## AWS permissions
 

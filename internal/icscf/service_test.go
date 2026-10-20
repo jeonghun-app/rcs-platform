@@ -61,7 +61,7 @@ func TestConfigureTakesTheDefaults(t *testing.T) {
 		c.CoreHost != netip.MustParseAddr("10.0.3.9") || c.OriginRealm != home || c.HSSRealm != home ||
 		c.HSSDiscovery != DiscoveryCloudMap || c.HSSHostPattern != "hss-*.rcs.local" ||
 		c.RetryAfter != DefaultRetryAfter || c.RegisterTimeout != DefaultRegisterTimeout ||
-		c.CxTimeout != DefaultCxTimeout || c.OriginHost != "" {
+		c.CxTimeout != DefaultCxTimeout || c.OriginHost != "" || c.DrainTimeout != 15*time.Second {
 		t.Errorf("defaults = %+v", c)
 	}
 	if len(c.SCSCFs) != 1 || c.SCSCFs[0].URI.String() != "sip:scscf.rcs.local:5060;transport=tcp" {
@@ -118,6 +118,14 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"Cx and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "8s"),
 		// 2 × 2562047h wraps int64 below zero; it must not pass for that.
 		"a Cx timeout that overflows": with(devEnv, "ICSCF_CX_TIMEOUT", "2562047h"),
+		// QA of #276: the guards of the last round, each with a row.
+		"a pattern that matches nothing":  with(devEnv, "ICSCF_HSS_HOST_PATTERN", "hss-**.rcs.local"),
+		"a one-label Diameter host":       with(devEnv, "ICSCF_DIAMETER_HOST", "x"),
+		"a core port past 65535":          with(devEnv, "ICSCF_CORE_ADDR", ":70000"),
+		"a drain past the stop deadline":  with(devEnv, "ICSCF_DRAIN_TIMEOUT", "16s"),
+		"a stop deadline the margin eats": with(devEnv, "RCS_SHUTDOWN_TIMEOUT", "5s"),
+		// 2 × 7.5 s + 1 s to connect + 16 s reaches Timer F.
+		"Cx, connection and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "7500ms"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
@@ -182,4 +190,11 @@ func startup(t *testing.T, env map[string]string) (int, string) {
 		Listen:    func(string, string) (net.Listener, error) { return nil, errors.New("must not start") },
 	})
 	return status, out.String()
+}
+
+// Just under Timer F, the connection setup counted, is accepted.
+func TestABudgetJustUnderTimerFIsAccepted(t *testing.T) {
+	if _, err := configure(with(devEnv, "ICSCF_CX_TIMEOUT", "7s")); err != nil {
+		t.Fatalf("2 × 7 s + 1 s + 16 s refused: %v", err)
+	}
 }

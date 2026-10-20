@@ -48,6 +48,8 @@ type deps struct {
 	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
 	allow   func(netip.Addr) bool
 	shuffle func(n int, swap func(i, j int))
+	// sipDialer, if set, opens the transport's connections to S-CSCFs.
+	sipDialer transport.Dialer
 	// hssResolver, if set, resolves hss.<namespace> for DNS discovery.
 	hssResolver cxclient.Resolver
 	// listening, if set, hears the core listener's bound address.
@@ -86,7 +88,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// Self needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, Logger: rt.Logger}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}
@@ -113,12 +115,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	defer px.Close()
 	p.Store(px)
-	if d.listening != nil {
-		d.listening(coreAddr)
-	}
 	rt.Logger.Info("serving SIP", slog.String("core_addr", coreAddr.String()),
 		slog.String("origin_host", host), slog.Int("scscfs", len(cfg.SCSCFs)))
 	rt.Ready()
+	// After Ready, so a test that reads /readyz once told sees the HSS's
+	// state rather than "starting" (QA of #276).
+	if d.listening != nil {
+		d.listening(coreAddr)
+	}
 	<-ctx.Done()
 	drain(px, cfg.DrainTimeout)
 	return nil
@@ -128,9 +132,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 // does not cut off a REGISTER waiting for the S-CSCF or a ringing INVITE:
 // their senders would get no final response (review of #276). The listener
 // stays open meanwhile, since Cloud Map's DNS answers name this task for
-// their TTL after it is deregistered. A context lingers 64*T1 after a 2xx
-// to an INVITE to pass its retransmissions on, so a stop soon after a call
-// waits out d. #281 tracks a drain shared by every proxy.
+// their TTL after it is deregistered. A context that lingers after a 2xx to
+// pass its retransmissions on no longer counts, so a stop right after a call
+// returns at once. #281 tracks a drain shared by every proxy.
 func drain(px *proxy.Proxy, d time.Duration) {
 	deadline := time.Now().Add(d)
 	for px.Stats().Contexts > 0 && time.Now().Before(deadline) {

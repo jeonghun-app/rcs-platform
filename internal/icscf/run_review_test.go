@@ -381,3 +381,82 @@ func TestAnSCSCFNameWithoutAddressesGets500WithRetryAfter(t *testing.T) {
 		t.Fatalf("answered %d with Retry-After %q, want 500 and 10", res.StatusCode, res.Header.Get("Retry-After"))
 	}
 }
+
+// QA of #276: the drain also waits for a single request in progress.
+func TestAStopLetsASingleRequestInFlightFinish(t *testing.T) {
+	scscf := startSlowSCSCF(t, 500*time.Millisecond)
+	hss := startHSS(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.DrainTimeout = 3 * time.Second
+	})
+	r.waitReady(t)
+	msg := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	<-scscf.got
+	go r.stop()
+	if got := <-msg; got != "200" {
+		t.Errorf("MESSAGE in flight at the stop: %s, want 200", got)
+	}
+}
+
+// QA of #276: past two refusing addresses, the third takes the request.
+func TestARequestGoesPastEveryRefusingAddress(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	port := scscf.ln.Addr().(*net.TCPAddr).Port
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "sip:scscf.rcs.local" }
+	lookup := func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.3"), netip.MustParseAddr("127.0.0.4"), netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(fmt.Sprintf("sip:scscf.rcs.local:%d;transport=tcp", port))}}, func(_ *ServiceConfig, d *deps) {
+		d.lookup = lookup
+		d.shuffle = func(int, func(i, j int)) {}
+	})
+	r.waitReady(t)
+	if res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">"); res.StatusCode != 200 {
+		t.Fatalf("MESSAGE answered %d, want 200 from the third address", res.StatusCode)
+	}
+}
+
+// blackholeDialer never completes a connection to hole, as the address of a
+// stopped task in a VPC drops the SYN, and dials anything else.
+type blackholeDialer struct{ hole string }
+
+func (b blackholeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if host, _, _ := net.SplitHostPort(address); host == b.hole {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, address)
+}
+
+// QA of #276: a blackholed address costs the 1 s connection timeout, not
+// the transport's 5 s, and only once: the next request goes to another
+// address first.
+func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	port := scscf.ln.Addr().(*net.TCPAddr).Port
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "sip:scscf.rcs.local" }
+	lookup := func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.9"), netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(fmt.Sprintf("sip:scscf.rcs.local:%d;transport=tcp", port))}}, func(_ *ServiceConfig, d *deps) {
+		d.lookup = lookup
+		d.shuffle = func(int, func(i, j int)) {}
+		d.sipDialer = blackholeDialer{hole: "127.0.0.9"}
+	})
+	r.waitReady(t)
+	send := func() (int, time.Duration) {
+		start := time.Now()
+		res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+		return res.StatusCode, time.Since(start)
+	}
+	if code, took := send(); code != 200 || took > 3*time.Second {
+		t.Fatalf("first: %d after %v, want 200 after about 1s", code, took)
+	}
+	if code, took := send(); code != 200 || took > 500*time.Millisecond {
+		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)
+	}
+}
