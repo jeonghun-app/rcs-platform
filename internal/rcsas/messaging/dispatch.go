@@ -404,6 +404,16 @@ func sessionBound(m store.Message) bool {
 // into a group they are not in.
 func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool) outcome {
 	key := legKey{m.Recipient, m.Sender}
+	if e.chatLeg(m.Recipient, m.Sender) == nil && e.marked(e.unreachable, key) {
+		// The group's invitation will never reach the recipient: an
+		// address that does not exist, or one that comes back to rcs-as
+		// (security review on #279). Its copies are given up, rather
+		// than kept, and retried, for StoreTTL.
+		if c, ok := e.claim(ctx, m); ok {
+			e.giveUp(c, "delivery.undeliverable")
+		}
+		return done
+	}
 	asked := false
 	if e.hasDeparted(key) {
 		if o, member := e.stillMember(ctx, m); !member {
@@ -572,8 +582,11 @@ func invitation(m store.Message) (Invitation, inviteKey) {
 		Recipient: m.Recipient, Peer: m.Sender, Mode: m.Mode,
 		Conversation: Conversation{ID: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo},
 	}
-	if m.Mode == store.Standalone {
+	switch m.Mode {
+	case store.Standalone:
 		inv.QueueID = m.ID
+	case store.Group:
+		inv.Referrer = m.Author
 	}
 	return inv, inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 }

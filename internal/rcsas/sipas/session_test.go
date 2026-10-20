@@ -68,9 +68,12 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 		"P-Asserted-Identity": "<" + alice + ">",
 		"P-Served-User":       "<" + bob + ">;sescase=term",
 		"P-Asserted-Service":  chatICSI,
-		"Accept-Contact":      "*;" + chatTag,
-		"Conversation-ID":     "c0nv1",
-		"Content-Type":        sdpType,
+		// Both the CPM ICSI and the OMA SIMPLE IM tag, by which rcsjta
+		// takes a chat (code review on #279).
+		"Accept-Contact":  "*;" + chatTag + ";" + omaIMTag,
+		"Contact":         "<sip:" + r.a.addr.String() + ";transport=tcp>;" + chatTag + ";" + omaIMTag,
+		"Conversation-ID": "c0nv1",
+		"Content-Type":    sdpType,
 	} {
 		if got := ih.Get(name); got != want {
 			t.Errorf("INVITE %s: %q, want %q", name, got, want)

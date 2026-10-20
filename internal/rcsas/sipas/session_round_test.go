@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -669,5 +670,22 @@ func TestAFileTransferInviteIsRefused(t *testing.T) {
 	// And an offer with no type in common is counted as refused.
 	if res := r.a.dial(t).send(r.chatInvite(offerSDP(relayPath(), "active", "image/jpeg"))); res.StatusCode != 488 || r.metrics.get("sip.invite.offer_refused") != 1 {
 		t.Fatalf("answered %d, offer_refused %d", res.StatusCode, r.metrics.get("sip.invite.offer_refused"))
+	}
+}
+
+// Code review on #279: rcsjta's chat INVITE carries a Contribution-ID and
+// no Conversation-ID, and is answered.
+func TestAChatInviteWithOnlyAContributionIDIsAnswered(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	m := r.chatInvite(offerSDP(relayPath(), "active"))
+	m.fields = slices.DeleteFunc(m.fields, func(f string) bool { return strings.HasPrefix(f, "Conversation-ID:") })
+	p := r.a.dial(t)
+	if res := p.send(m); res.StatusCode != 200 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	bad := r.chatInvite(offerSDP(relayPath(), "active"))
+	bad.fields = slices.DeleteFunc(bad.fields, func(f string) bool { return strings.HasPrefix(f, "Contribution-ID:") })
+	if res := p.send(bad); res.StatusCode != 400 {
+		t.Fatalf("a Conversation-ID without a Contribution-ID answered %d", res.StatusCode)
 	}
 }

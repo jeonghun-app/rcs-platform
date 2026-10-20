@@ -28,6 +28,7 @@ type Groups interface {
 	Remove(ctx context.Context, uri, by, who string) error
 	Roster(ctx context.Context, uri, who string) ([]byte, uint32, error)
 	Get(ctx context.Context, uri string) (groupstore.Group, error)
+	Established(ctx context.Context, uri string) error
 }
 
 // groupAllowed are the methods of a group chat's requests (RFC 3261
@@ -44,13 +45,21 @@ const groupTimeout = 5 * time.Second
 // case (RFC 3261 §19.1.4).
 func (s *Server) isFactory(u sip.URI) bool {
 	f := s.cfg.ConferenceFactory
-	return u.IsSIP() && u.User == f.User && strings.EqualFold(u.Host, f.Host)
+	return u.IsSIP() && u.User == f.User && sameHost(u.Host, f.Host)
 }
 
 // atConference reports whether u is at the conference host, where every
 // group's conference URI is.
 func (s *Server) atConference(u sip.URI) bool {
-	return u.IsSIP() && strings.EqualFold(u.Host, s.cfg.ConferenceHost)
+	return u.IsSIP() && sameHost(u.Host, s.cfg.ConferenceHost)
+}
+
+// sameHost compares two host names as DNS does: without case, and with or
+// without the trailing dot of a fully qualified name (RFC 3261 §25.1), so
+// that conf.<domain>. is the conference host too and cannot take a group's
+// request onto the 1-to-1 path (QA on #279).
+func sameHost(a, b string) bool {
+	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
 }
 
 // forGroup reports whether a request to u is a group chat's.
@@ -71,12 +80,62 @@ func (s *Server) fromFocus(req *sip.Request) bool {
 }
 
 // conferenceURI is the conference URI u names, as the group package
-// writes it: sip:<user>@ConferenceHost, without parameters.
+// writes it: sip:chat-<32 lower-case hex digits>@ConferenceHost, without
+// parameters. Any other user part names no group, and is refused before
+// the store is read: it could be too long for a DynamoDB key, and costs a
+// read either way (security review on #279).
 func (s *Server) conferenceURI(u sip.URI) (string, bool) {
-	if u.User == "" {
+	id, ok := strings.CutPrefix(u.User, "chat-")
+	if !ok || len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
 		return "", false
 	}
 	return "sip:" + u.User + "@" + s.cfg.ConferenceHost, true
+}
+
+// groupConversation reads the conversation headers of a group chat's
+// request, as sessionConversation does. Its Contribution-ID, which names
+// the chat to its clients (rcsjta's chat ID) and which every session with
+// the group carries, is required; without a Conversation-ID the group
+// makes one (group.CreateRequest.Conversation).
+func groupConversation(req *sip.Request) (messaging.Conversation, bool) {
+	c, ok := sessionConversation(req)
+	return c, ok && c.Contribution != ""
+}
+
+// sessionConversation reads the conversation headers of a session's
+// INVITE: each a token as in a pager MESSAGE (messaging.ValidID), but the
+// Conversation-ID optional, as rcsjta sends only a Contribution-ID with an
+// INVITE (code review on #279). One that names a Conversation-ID or a
+// reply without a Contribution-ID is refused, as by
+// messaging.ParseConversationHeaders; one without any is a session outside
+// a conversation, as before.
+func sessionConversation(req *sip.Request) (messaging.Conversation, bool) {
+	trim := func(name string) string { return strings.Trim(req.Header.Get(name), " \t") }
+	c := messaging.Conversation{
+		ID: trim(messaging.HeaderConversationID), Contribution: trim(messaging.HeaderContributionID),
+		InReplyTo: trim(messaging.HeaderInReplyTo),
+	}
+	valid := func(v string) bool { return v == "" || messaging.ValidID(v) }
+	ok := valid(c.ID) && valid(c.Contribution) && valid(c.InReplyTo) &&
+		(c.Contribution != "" || c.ID == "" && c.InReplyTo == "")
+	return c, ok
+}
+
+// invitees are the entries of a resource list as the group's invitees,
+// leaving out the conference factory and any URI at the conference host:
+// the focus's INVITE to one would come back to rcs-as and be refused as a
+// loop, again at every retry of a message for it (security review on
+// #279).
+func (s *Server) invitees(entries []resourcelists.Entry) []group.Invitee {
+	var out []group.Invitee
+	for _, e := range entries {
+		if u, err := sip.ParseURI(e.URI); err == nil && s.forGroup(u) {
+			s.cfg.Metrics.Count("sip.group.invitee_skipped", 1)
+			continue
+		}
+		out = append(out, group.Invitee{Identity: e.URI, DisplayName: e.DisplayName})
+	}
+	return out
 }
 
 // routeGroup serves a group chat's request outside a dialog: an INVITE
@@ -140,11 +199,8 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 			return
 		}
 	}
-	conv, err := messaging.ParseConversationHeaders(req.Header.Get("Conversation-ID"),
-		req.Header.Get("Contribution-ID"), req.Header.Get("InReplyTo-Contribution-ID"))
-	if err != nil || conv.Contribution == "" {
-		// The Contribution-ID names the group chat to its clients
-		// (rcsjta's chat ID): every session with the group carries it.
+	conv, ok := groupConversation(req)
+	if !ok {
 		s.respond(u, req, 400)
 		return
 	}
@@ -195,9 +251,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 			s.respond(u, req, 400)
 			return
 		}
-		for _, e := range entries {
-			invitees = append(invitees, group.Invitee{Identity: e.URI, DisplayName: e.DisplayName})
-		}
+		invitees = s.invitees(entries)
 	}
 	tag, err := s.ids.Tag()
 	if err != nil {
@@ -221,7 +275,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	if factory {
 		g, err = s.groups.Create(ctx, group.CreateRequest{
 			Creator: sender, CreatorName: from.DisplayName, Invitees: invitees,
-			Subject: req.Header.Get("Subject"), Conversation: conv.ID,
+			Subject: req.Header.Get("Subject"), Conversation: conv.ID, Contribution: conv.Contribution,
 		})
 	} else {
 		g, err = s.groups.Join(ctx, uri, sender, from.DisplayName)
@@ -271,7 +325,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	}
 	if factory {
 		s.cfg.Metrics.Count("sip.group.created", 1)
-		go s.inviteInvited(g, conv, nil)
+		go s.establish(g, conv)
 	} else {
 		s.cfg.Metrics.Count("sip.group.joined", 1)
 	}
@@ -315,7 +369,7 @@ func (s *Server) refuseGroup(u *proxy.UAS, req *sip.Request, err error) {
 	case errors.Is(err, group.ErrNoGroup):
 		code = 404
 	case errors.Is(err, group.ErrNotParticipant), errors.Is(err, group.ErrNotChairman),
-		errors.Is(err, group.ErrTooMany), errors.Is(err, group.ErrRateLimited):
+		errors.Is(err, group.ErrTooMany), errors.Is(err, group.ErrRateLimited), errors.Is(err, group.ErrTaken):
 		code = 403
 	case errors.Is(err, group.ErrInvalid):
 		code = 400
@@ -330,6 +384,21 @@ func (s *Server) refuseGroup(u *proxy.UAS, req *sip.Request, err error) {
 	s.respond(u, req, code)
 }
 
+// establish makes a new group last once its creator has its session
+// (group.Service.Established): until then a CANCEL, or a failure after
+// the group was stored, leaves a group that ends on its own, and that the
+// creator's next INVITE under the same Contribution-ID takes up again.
+// Then the focus invites the invitees.
+func (s *Server) establish(g groupstore.Group, conv messaging.Conversation) {
+	ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
+	err := s.groups.Established(ctx, g.URI)
+	cancel()
+	if err != nil {
+		s.cfg.Metrics.Count("sip.group.establish_failed", 1)
+	}
+	s.inviteInvited(g, conv, nil)
+}
+
 // inviteInvited has the focus invite each participant g holds invited, of
 // those in only unless it is nil: once its creator's session is set up, or
 // once a REFER added them. It goes through the engine, which counts the
@@ -342,7 +411,7 @@ func (s *Server) inviteInvited(g groupstore.Group, conv messaging.Conversation, 
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
 		s.engine.Invite(ctx, messaging.Invitation{
-			Recipient: p.Identity, Peer: g.URI, Mode: store.Group, Subject: g.Subject,
+			Recipient: p.Identity, Peer: g.URI, Mode: store.Group, Subject: g.Subject, Referrer: g.Creator,
 			Conversation: messaging.Conversation{ID: g.Conversation, Contribution: conv.Contribution},
 		})
 		cancel()

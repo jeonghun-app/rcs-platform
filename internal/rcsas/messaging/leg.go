@@ -288,6 +288,8 @@ func (l *Leg) activate() {
 		e.legs[key] = append(e.legs[key], l)
 		if group {
 			e.groupLegs[l.p.Peer]++
+			// A session with the group reaches the participant after all.
+			delete(e.unreachable, key)
 		}
 		delete(e.invites, inviteKey{l.p.User, l.p.Peer, l.p.Mode, ""})
 		e.mu.Unlock()

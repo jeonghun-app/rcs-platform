@@ -153,7 +153,9 @@ func New(cfg Config) (*Server, error) {
 	if !cfg.ConferenceFactory.IsSIP() || cfg.ConferenceFactory.User == "" || cfg.ConferenceHost == "" {
 		return nil, errors.New("sipas: ConferenceFactory must be a SIP URI with a user, and ConferenceHost is required")
 	}
-	if strings.EqualFold(cfg.ConferenceHost, cfg.HomeDomain) {
+	// The spelling the group writes conference URIs with (conferenceURI).
+	cfg.ConferenceHost = strings.ToLower(strings.TrimSuffix(cfg.ConferenceHost, "."))
+	if sameHost(cfg.ConferenceHost, cfg.HomeDomain) {
 		// Every user's request would be taken for a group's.
 		return nil, errors.New("sipas: ConferenceHost must not be the home domain")
 	}

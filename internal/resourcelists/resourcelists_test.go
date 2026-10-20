@@ -57,18 +57,23 @@ func TestWhatIsNotAResourceListIsRefused(t *testing.T) {
 		doc  string
 		want error
 	}{
-		"a DTD":         {`<!DOCTYPE x [<!ENTITY a "b">]><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrDTD},
-		"too large":     {strings.Repeat(" ", MaxDocumentSize+1), ErrTooLarge},
-		"another root":  {`<lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
-		"no namespace":  {`<resource-lists><list><entry uri="tel:+15550100002"/></list></resource-lists>`, ErrMalformed},
-		"two roots":     {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
-		"no root":       {` `, ErrMalformed},
-		"entry, no uri": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry/></list></resource-lists>`, ErrMalformed},
-		"repeated attr": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a" uri="b"/></list></resource-lists>`, ErrMalformed},
-		"text outside":  {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>x`, ErrMalformed},
-		"unclosed":      {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list>`, ErrMalformed},
-		"deep":          {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists">` + strings.Repeat("<list>", maxDepth) + strings.Repeat("</list>", maxDepth) + `</resource-lists>`, ErrMalformed},
-		"long name":     {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a"><display-name>` + strings.Repeat("n", maxNameBytes+1) + `</display-name></entry></list></resource-lists>`, ErrMalformed},
+		"a DTD":          {`<!DOCTYPE x [<!ENTITY a "b">]><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrDTD},
+		"too large":      {strings.Repeat(" ", MaxDocumentSize+1), ErrTooLarge},
+		"another root":   {`<lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
+		"no namespace":   {`<resource-lists><list><entry uri="tel:+15550100002"/></list></resource-lists>`, ErrMalformed},
+		"two roots":      {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
+		"no root":        {` `, ErrMalformed},
+		"entry, no uri":  {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry/></list></resource-lists>`, ErrMalformed},
+		"repeated attr":  {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a" uri="b"/></list></resource-lists>`, ErrMalformed},
+		"text outside":   {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>x`, ErrMalformed},
+		"unclosed":       {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list>`, ErrMalformed},
+		"deep":           {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists">` + strings.Repeat("<list>", maxDepth) + strings.Repeat("</list>", maxDepth) + `</resource-lists>`, ErrMalformed},
+		"CR LF in a uri": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a@b&#13;&#10;Via: x"/></list></resource-lists>`, ErrMalformed},
+		"space in a uri": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a b@c"/></list></resource-lists>`, ErrMalformed},
+		"DEL in a uri":   {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a&#x7f;@b"/></list></resource-lists>`, ErrMalformed},
+		"a surrogate":    {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a&#xD800;@b"/></list></resource-lists>`, ErrMalformed},
+		"surrogate name": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a@b"><display-name>&#xDFFF;</display-name></entry></list></resource-lists>`, ErrMalformed},
+		"long name":      {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a"><display-name>` + strings.Repeat("n", maxNameBytes+1) + `</display-name></entry></list></resource-lists>`, ErrMalformed},
 	} {
 		if _, err := Parse([]byte(c.doc), 10); !errors.Is(err, c.want) {
 			t.Errorf("%s: %v, want %v", name, err, c.want)

@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -109,7 +111,10 @@ func Parse(data []byte, limit int) ([]Entry, error) {
 			switch {
 			case t.Name.Local == "entry" && parent == (xml.Name{Space: Namespace, Local: "list"}):
 				uri := attr(t.Attr, "uri")
-				if uri == "" || !isText(uri) {
+				if uri == "" || !isText(uri) || strings.ContainsFunc(uri, unicode.IsSpace) || strings.ContainsFunc(uri, unicode.IsControl) {
+					// A URI has neither white space nor control
+					// characters (RFC 3986 §2), and one with a CR LF
+					// could become a header wherever it is written.
 					return nil, fmt.Errorf("%w: entry without a uri", ErrMalformed)
 				}
 				if len(out) == limit {
@@ -177,9 +182,11 @@ func repeatedAttr(attrs []xml.Attr) bool {
 	return false
 }
 
-// isText reports valid UTF-8, which encoding/xml would otherwise pass on
-// with U+FFFD in place of what it could not read.
-func isText(s string) bool { return utf8.ValidString(s) }
+// isText reports valid UTF-8 without U+FFFD: encoding/xml passes on what
+// it could not read as U+FFFD, a character reference to a surrogate
+// (&#xD800;) included, and no name or URI a client means has one (QA on
+// #279).
+func isText(s string) bool { return utf8.ValidString(s) && !strings.ContainsRune(s, utf8.RuneError) }
 
 // decodeError reduces an encoding/xml error to its line number: the
 // decoder's messages quote the input.

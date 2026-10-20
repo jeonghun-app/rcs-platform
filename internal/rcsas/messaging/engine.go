@@ -209,6 +209,10 @@ type Engine struct {
 	// departed marks the participants that left a group on this task
 	// (ParticipantLeft), until when their copies could still be queued.
 	departed map[legKey]time.Time
+	// unreachable marks the participants a group's invitation found
+	// unreachable for good (InviteFailed with ErrUndeliverable), until
+	// when their copies could still be queued: those are given up.
+	unreachable map[legKey]time.Time
 	// groupLegs counts the open group legs of each group on this task.
 	groupLegs map[string]int
 	// summaries remembers group notification summaries between their
@@ -250,9 +254,9 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		legs:       map[legKey][]*Leg{},
 		invites:    map[inviteKey]time.Time{},
 		pagerOnly:  map[string]struct{}{},
-		departed:   map[legKey]time.Time{},
-		groupLegs:  map[string]int{},
-		summaries:  map[legKey]*summaryState{},
+		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{},
+		groupLegs: map[string]int{},
+		summaries: map[legKey]*summaryState{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {
@@ -559,7 +563,10 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 // about. ErrNoSessions marks the recipient as reachable by pager mode only
 // until it registers on a new flow, and sends it what fits; for any other
 // error the next invitation waits for InviteTimeout or the next
-// registration on a new flow.
+// registration on a new flow. ErrUndeliverable for a group gives up what
+// is queued for the recipient from the group, unless it opens a session
+// with the group itself or is added again: the invitation will never
+// reach it.
 func (e *Engine) InviteFailed(inv Invitation, err error) {
 	key := inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 	e.mu.Lock()
@@ -572,8 +579,16 @@ func (e *Engine) InviteFailed(inv Invitation, err error) {
 		return
 	}
 	e.invites[key] = e.clock.Now().Add(e.cfg.InviteTimeout)
+	unreachable := inv.Mode == store.Group && errors.Is(err, ErrUndeliverable)
+	if unreachable {
+		e.mark(e.unreachable, legKey{inv.Recipient, inv.Peer})
+	}
 	e.mu.Unlock()
 	e.metrics.Count("invite.failed", 1)
+	if unreachable {
+		e.metrics.Count("invite.undeliverable", 1)
+		e.kickEvent(inv.Recipient)
+	}
 }
 
 // markPagerOnly needs e.mu.

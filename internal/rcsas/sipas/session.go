@@ -95,16 +95,33 @@ func (ss *session) contactTag() string {
 	return chatTag
 }
 
+// inviteTags are the feature tags of the INVITEs rcs-as sends for the
+// session's service, in Contact and Accept-Contact: for a chat, with a
+// group too, both the CPM chat ICSI and the OMA SIMPLE IM tag, by which
+// rcsjta takes a chat session (ImsServiceDispatcher, ChatUtils).
+func (ss *session) inviteTags() string {
+	if ss.mode == store.Standalone {
+		return largeTag
+	}
+	return chatTag + ";" + omaIMTag
+}
+
 // contact is the Contact of rcs-as's side of the session: this task, where
 // the requests in the dialog reach it, with the service's feature tag; or,
 // in a session with a group, the conference URI marked as a focus (RFC
 // 4579 §5.2), which is how rcsjta tells a group's INVITE from a 1-to-1
 // one (ChatUtils.isGroupChatInvitation) and what it rejoins the group at.
-func (ss *session) contact() string {
+func (ss *session) contact() string { return ss.contactWith(ss.contactTag()) }
+
+// inviteContact is contact with the feature tags of an INVITE
+// (inviteTags).
+func (ss *session) inviteContact() string { return ss.contactWith(ss.inviteTags()) }
+
+func (ss *session) contactWith(tags string) string {
 	if ss.group != "" {
-		return "<" + ss.group + ">;isfocus;" + chatTag
+		return "<" + ss.group + ">;isfocus;" + tags
 	}
-	return sip.Address{URI: ss.s.cfg.Contact}.String() + ";" + ss.contactTag()
+	return sip.Address{URI: ss.s.cfg.Contact}.String() + ";" + tags
 }
 
 // Why addSession did not add a session.

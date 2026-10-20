@@ -281,6 +281,17 @@ metadata.
     stranger cannot grow a group's stored item past DynamoDB's limit and
     break the group.
 - **Metrics.** None names a group or a participant.
+- **Chat identity.** RCS clients name a group chat by its Contribution-ID
+  (rcsjta's chat ID), which its creator chooses, and would take a new group
+  under a known ID for the old one. So a Contribution-ID names one live
+  group: the conference URI is made from it, and an INVITE to the factory
+  under an ID a live group has is refused (403) unless it is that group's
+  creator trying again before the group is established, which takes up the
+  same group (#279). A participant the chairman removed cannot make a group
+  that its former members' clients would merge into the one it was removed
+  from. An ended group frees its ID. The conference URI is no secret from
+  anyone who knows the ID, the group's participants; it grants nothing, as
+  every request to it is checked against the roster.
 - **Roster privacy.** The roster keeps former participants (up to the size
   limit), so a participant who joins later sees who was in the group before.
   This is accepted: it is how RFC 4575 rosters and RCS clients show who left.
