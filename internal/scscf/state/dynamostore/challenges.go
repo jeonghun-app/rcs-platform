@@ -107,24 +107,25 @@ func (d *Dynamo) TakeChallenge(ctx context.Context, impi, nonce string, now time
 	return d.decodeChallengeItem(out.Attributes, impi, nonce, now)
 }
 
-// attemptKey is the item of impi's count of kind for window, beside its
-// challenges: sort key #count#<kind>#<window in Unix seconds>.
-func attemptKey(impi, kind string, window time.Time) map[string]types.AttributeValue {
-	return challengeKey(impi, state.ReservedNoncePrefix+"count#"+kind+"#"+strconv.FormatInt(window.Unix(), 10))
+// attemptKey is the item of a's count, beside its IMPI's challenges: sort
+// key #count#<kind>#<scope>#<window in Unix seconds>, the scope empty for the
+// IMPI as a whole.
+func attemptKey(a state.Attempt) map[string]types.AttributeValue {
+	return challengeKey(a.IMPI, state.ReservedNoncePrefix+"count#"+a.Kind+"#"+a.Scope+"#"+strconv.FormatInt(a.Window.Unix(), 10))
 }
 
-// CountAttempt implements state.Challenges with one UpdateItem that adds 1.
+// CountAttempt implements state.Challenges with one UpdateItem that adds n.
 // expires is the table's TTL attribute, so DynamoDB removes old windows.
-func (d *Dynamo) CountAttempt(ctx context.Context, impi, kind string, window, expires time.Time) (int64, error) {
-	if err := state.ValidAttempt(impi, kind, window, expires); err != nil {
+func (d *Dynamo) CountAttempt(ctx context.Context, a state.Attempt, n int64, expires time.Time) (int64, error) {
+	if err := state.ValidAttempt(a, n, expires); err != nil {
 		return 0, err
 	}
 	out, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(d.challenges),
-		Key:                       attemptKey(impi, kind, window),
+		Key:                       attemptKey(a),
 		UpdateExpression:          aws.String("ADD #n :one SET #exp = :exp"),
 		ExpressionAttributeNames:  map[string]string{"#n": attrCount, "#exp": attrExpires},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":one": num(1), ":exp": num(expires.Unix())},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":one": num(n), ":exp": num(expires.Unix())},
 		ReturnValues:              types.ReturnValueUpdatedNew,
 	})
 	if err != nil {

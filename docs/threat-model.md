@@ -297,15 +297,45 @@ answers it under that subscriber's lock, updating the AKA sequence number. A
 distributed flood of REGISTERs for one (IMPI, IMPU) pair, from addresses
 the P-CSCF's per-source limits each let through, would starve the
 subscriber's own MAR; a forged AUTS, which anyone holding a challenge can
-send (`digest.SyncFailure`), would do the same through resynchronisation.
+send (`digest.SyncFailure`), would do the same through resynchronisation. A
+limit on that must not itself become the cheap way to lock the subscriber
+out.
 
-**Control:** the registrar counts the MARs of each IMPI in a window shared by
-every `scscf` instance (DynamoDB atomic counter beside the challenges, with
-TTL) and over the limit answers 503 with Retry-After, without a MAR; at
-most one resynchronisation per IMPI per challenge lifetime reaches the HSS.
-Metrics `registrar.challenge_limited` and `registrar.resync_limited` carry no
-identifier. The subscriber's own UE gets the same 503 during the flood and
-registers once its window ends; the flood cannot reach the HSS.
+**Control:** the registrar counts the challenges of each IMPI in fixed
+windows shared by every `scscf` instance (DynamoDB atomic counters beside the
+challenges, with TTL), split by the P-CSCF flow token in the REGISTER's Path,
+which only the P-CSCF writes. A REGISTER over the flow of a live binding,
+the registered UE refreshing, counts in a budget of that flow alone, so a
+flood from elsewhere cannot use it up. Any other REGISTER counts in a small
+per-flow budget and in the IMPI's shared one. Over a budget the answer is
+500 with Retry-After (RFC 3261 §21.5.1), without a MAR: not 503, which an
+upstream proxy would read as the whole S-CSCF being out of service (§21.5.4)
+and the P-CSCF would retry at other I-CSCFs. A challenge allows one
+resynchronisation; an IMPI three per challenge lifetime, the registered UE's
+flow apart, and an AUTS that never got a vector gives its slot back. An
+instance that saw a count over its limit refuses the rest of the window from
+memory, without a write. Metrics `registrar.challenge_limited` and
+`registrar.resync_limited` carry no identifier; the first is to be alarmed
+on (`docs/scscf-state.md`).
+
+**Risk left:**
+- A subscriber with no live binding, registering for the first time or
+  after its registration expired, has no flow of its own yet: a flood of
+  some ten first registrations a minute from other flows, by anyone who
+  knows its IMPI, holds that registration back until the flood stops. The
+  alarm is the answer to it.
+- Likewise, forged AUTSs from other flows can use up the IMPI's three
+  resynchronisations a lifetime, so a UE with no live binding whose SQN is
+  out of step registers once the lifetime ends; a registered UE resyncs on
+  its own budget.
+- Windows are fixed: twice a budget gets through across an edge.
+- The shared count is observable: a client that probes it near a window's
+  end learns from where it is refused whether others were challenged in that
+  window, that is, roughly whether the subscriber's UE registered then. It
+  learns nothing about the registered UE's own flow, which counts apart.
+- The flow token is trusted as the P-CSCF wrote it; a P-CSCF that let a
+  client choose its Path would let it spend the registered UE's budget.
+
 **Status:** implemented in `internal/scscf/registrar` (#201); wired to a
 listener with `cmd/scscf` (#14 PR F).
 

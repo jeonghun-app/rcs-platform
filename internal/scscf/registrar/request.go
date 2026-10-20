@@ -39,6 +39,11 @@ type register struct {
 	// registrar applies it to a contact: one with +sip.instance and reg-id
 	// over an edge proxy whose Path entry has "ob" (RFC 5626 §6).
 	supportsOutbound, outbound bool
+	// flow is the P-CSCF flow token of the topmost Path, and registeredFlow
+	// whether a live binding of the user's registration came over it
+	// (limits.go).
+	flow           string
+	registeredFlow bool
 }
 
 // parseRegister reads req, or returns the response a malformed one gets.

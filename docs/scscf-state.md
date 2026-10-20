@@ -82,17 +82,38 @@ additionally sealed (below).
   it yet. Set records have no
   `ttl`: only a sweep, which sends the SAR, may remove one, so the
   infrastructure must enable TTL on `ttl`, never on `expires`.
-- **Challenges are limited per IMPI.** Before each MAR the registrar adds one
-  to the IMPI's count for the current window (default 10 per minute,
-  `ChallengeLimit`, `ChallengeWindow`), and over the limit answers 503 with
-  Retry-After without asking the HSS; at most one resynchronisation per IMPI
-  per challenge lifetime reaches it. Every instance counts into the same
-  item, beside the IMPI's challenges, which the table's TTL removes. No nonce
-  starts with `#`, so no client can take a count as a challenge (#201).
+- **Challenges are limited per IMPI and P-CSCF flow.** Before each challenge
+  the registrar counts it for the flow in the REGISTER's Path and the
+  current window, and over a limit answers 500 with Retry-After without
+  asking the HSS. A flow a live binding of the user came over is the
+  registered UE's: it has a budget of its own (default 6 a minute,
+  `RegisteredFlowChallengeLimit`) and nothing else. Any other flow has a
+  small one (3, `FlowChallengeLimit`) and shares the IMPI's (10,
+  `ChallengeLimit`, per `ChallengeWindow`). The limits count challenges, not
+  MARs: a Digest subscriber's costs two MARs when the AKA one gets 5006. A
+  challenge allows one resynchronisation (#196), and an IMPI three per
+  challenge lifetime (`ResyncLimit`), the registered UE's flow apart; one the
+  HSS does not answer gives its slot back. Windows are fixed, so up to twice
+  a budget passes across an edge, and an instance whose clock is off counts
+  into its own idea of the window. Every instance counts into the same items,
+  beside the IMPI's challenges, which the table's TTL removes; an instance
+  that has seen a count over its limit refuses the rest of that window
+  without writing. No nonce starts with `#`, so no client can take a count as
+  a challenge (#201).
 - **A permanent SAR failure ends the deregistration.** The sweep's handler
   returns an error only for failures that may pass (the HSS unreachable, a
   busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
   (5001) it returns nil, or the SAR would be retried every minute.
+
+## Metrics and alarms
+
+`registrar.challenge_limited` and `registrar.resync_limited` count the
+REGISTERs refused over a budget; neither carries an identifier. Alarm on
+`registrar.challenge_limited` (Sum over 5 minutes above a few dozen, or any
+sustained rate): it is how a flood against one subscriber shows, and a
+first registration of that subscriber is held back while it lasts (T12).
+`registrar.internal_errors` with a store that cannot count says the counts
+are failing closed: every REGISTER that needs a challenge gets 500.
 
 ## HSS discovery
 

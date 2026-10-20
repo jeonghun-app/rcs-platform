@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
@@ -133,7 +131,7 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 	if !ok {
 		return refuse(403, "Unsupported algorithm")
 	}
-	if f := g.limitChallenges(ctx, r); f != nil {
+	if f := g.limitChallenges(ctx, r, g.cfg.Now()); f != nil {
 		return f
 	}
 	maa, err := g.cfg.HSS.Authenticate(ctx, &cx.MAR{UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1}, schemes)
@@ -142,20 +140,17 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 
 // resynchronise sends the client's AUTS to the HSS (TS 33.102 §6.3.5) and
 // challenges with the vector it returns, marked so that a further AUTS for it
-// is refused: one resynchronisation per challenge window.
+// is refused: one resynchronisation per challenge (Challenge.Resynchronised).
+// An AUTS is unauthenticated (digest.SyncFailure), so the IMPI also has a
+// budget of them (limitResyncs), used only by one that reaches the HSS and
+// gets a vector back.
 func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure) *failure {
-	// At most one resynchronisation per IMPI per challenge lifetime, across
-	// challenges: an AUTS is unauthenticated (digest.SyncFailure), and each
-	// costs the HSS a MAR under the subscriber's lock.
-	n, f := g.countAttempt(ctx, r, state.AttemptResync, g.cfg.ChallengeLifetime)
-	switch {
-	case f != nil:
+	now := g.cfg.Now()
+	if f := g.limitChallenges(ctx, r, now); f != nil {
 		return f
-	case n > 1:
-		g.count("registrar.resync_limited")
-		return refuse(403, "Authentication failed")
 	}
-	if f := g.limitChallenges(ctx, r); f != nil {
+	slot, f := g.limitResyncs(ctx, r, now)
+	if f != nil {
 		return f
 	}
 	g.count("registrar.resync")
@@ -165,36 +160,12 @@ func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest
 		UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1,
 		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: auth},
 	})
-	return g.challengeFrom(ctx, r, maa, err, false, true)
-}
-
-// limitChallenges counts a MAR for r.impi and refuses it over ChallengeLimit
-// with 503 and the seconds left in the window (RFC 3261 §21.5.4), so that
-// the subscriber's own UE comes back once the flood's window is over.
-func (g *Registrar) limitChallenges(ctx context.Context, r *register) *failure {
-	n, f := g.countAttempt(ctx, r, state.AttemptChallenge, g.cfg.ChallengeWindow)
-	if f != nil {
-		return f
+	f = g.challengeFrom(ctx, r, maa, err, false, true)
+	if f == nil || f.code != 401 {
+		// Nothing came of it: the slot is the UE's again.
+		g.giveBack(ctx, slot)
 	}
-	if n <= int64(g.cfg.ChallengeLimit) {
-		return nil
-	}
-	g.count("registrar.challenge_limited")
-	now := g.cfg.Now()
-	end := now.Truncate(g.cfg.ChallengeWindow).Add(g.cfg.ChallengeWindow)
-	retry := int64((end.Sub(now) + time.Second - 1) / time.Second)
-	return &failure{code: 503, reason: "Too many challenges", fields: [][2]string{{"Retry-After", strconv.FormatInt(retry, 10)}}}
-}
-
-// countAttempt adds one to r.impi's count of kind in the current window of
-// length window, shared by every instance.
-func (g *Registrar) countAttempt(ctx context.Context, r *register, kind string, window time.Duration) (int64, *failure) {
-	start := g.cfg.Now().Truncate(window)
-	n, err := g.cfg.Store.CountAttempt(ctx, r.impi, kind, start, start.Add(2*window))
-	if err != nil {
-		return 0, g.internal("counting an attempt", err)
-	}
-	return n, nil
+	return f
 }
 
 func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA, err error, stale, resynced bool) *failure {

@@ -3,7 +3,9 @@ package state
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -695,12 +697,11 @@ type Challenges interface {
 	// mean the challenge is unusable: the S-CSCF challenges again with a 401,
 	// rather than failing the REGISTER.
 	TakeChallenge(ctx context.Context, impi, nonce string, now time.Time) (*Challenge, error)
-	// CountAttempt adds one to impi's count of kind (AttemptChallenge,
-	// AttemptResync) for the window that starts at window, and returns the
-	// count after. Every instance counts into the same count, which is kept
-	// until expires. A resent request may count twice: that errs on the
-	// side of the limit.
-	CountAttempt(ctx context.Context, impi, kind string, window, expires time.Time) (int64, error)
+	// CountAttempt adds n, 1 or -1 to give back an attempt that came to
+	// nothing, to the count a names, and returns the count after. Every
+	// instance counts into the same count, which is kept until expires. A
+	// resent request may count twice: that errs on the side of the limit.
+	CountAttempt(ctx context.Context, a Attempt, n int64, expires time.Time) (int64, error)
 }
 
 // ReservedNoncePrefix starts no challenge's nonce: the backends keep their
@@ -708,22 +709,44 @@ type Challenges interface {
 // and AKA nonces are base64, which never contains it.
 const ReservedNoncePrefix = "#"
 
-// The kinds of CountAttempt: the challenges the S-CSCF asks the HSS for (a
-// MAR each), and the resynchronisations among them.
+// The kinds of CountAttempt: the challenges the S-CSCF issues, and the
+// resynchronisations among them.
 const (
 	AttemptChallenge = "challenge"
 	AttemptResync    = "resync"
 )
 
+// Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
+// window that starts at Window, for the IMPI as a whole (Scope "") or over
+// one P-CSCF flow (FlowScope).
+type Attempt struct {
+	IMPI, Kind, Scope string
+	Window            time.Time
+}
+
+// FlowScope is the Attempt scope of the P-CSCF flow whose token is in a
+// REGISTER's Path: a digest, so that what the store keeps is fixed in length
+// and alphabet whatever the token holds.
+func FlowScope(token string) string {
+	sum := sha256.Sum256([]byte("scscf/attempt-flow|" + token))
+	return hex.EncodeToString(sum[:16])
+}
+
 // ValidAttempt checks CountAttempt's arguments; the backends apply it.
-func ValidAttempt(impi, kind string, window, expires time.Time) error {
-	if err := identity.ValidIMPI(impi); err != nil {
+func ValidAttempt(a Attempt, n int64, expires time.Time) error {
+	if err := identity.ValidIMPI(a.IMPI); err != nil {
 		return fmt.Errorf("%w: attempt IMPI: %w", ErrInvalid, err)
 	}
-	if kind != AttemptChallenge && kind != AttemptResync {
+	if a.Kind != AttemptChallenge && a.Kind != AttemptResync {
 		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
 	}
-	if !validTime(window) || !expires.After(window) {
+	if a.Scope != "" && (len(a.Scope) != 32 || strings.Trim(a.Scope, "0123456789abcdef") != "") {
+		return fmt.Errorf("%w: an attempt scope is a FlowScope", ErrInvalid)
+	}
+	if n != 1 && n != -1 {
+		return fmt.Errorf("%w: an attempt counts 1 or -1", ErrInvalid)
+	}
+	if !validTime(a.Window) || !expires.After(a.Window) {
 		return fmt.Errorf("%w: an attempt window needs a start and a later expiry", ErrInvalid)
 	}
 	return nil

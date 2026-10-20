@@ -819,45 +819,63 @@ func testDeleteProfileIf(t *testing.T, a, b state.Store, _ Options) {
 	}
 }
 
-// testAttemptCounts: every instance counts into one count per IMPI, kind and
-// window, and concurrent counts are all counted.
+// testAttemptCounts: every instance counts into one count per IMPI, kind,
+// scope and window, concurrent counts are all counted, and an attempt can be
+// given back.
 func testAttemptCounts(t *testing.T, a, b state.Store, _ Options) {
 	w, exp := T0, T0.Add(2*time.Minute)
+	at := state.Attempt{IMPI: IMPI1, Kind: state.AttemptChallenge, Window: w}
 	for i, s := range []state.Store{a, b, a} {
-		if n := must(s.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, exp))(t); n != int64(i+1) {
+		if n := must(s.CountAttempt(ctx(t), at, 1, exp))(t); n != int64(i+1) {
 			t.Fatalf("count %d, want %d", n, i+1)
 		}
 	}
-	// Another IMPI, kind or window counts apart.
-	for _, c := range []struct {
-		impi, kind string
-		window     time.Time
-	}{{IMPI2, state.AttemptChallenge, w}, {IMPI1, state.AttemptResync, w}, {IMPI1, state.AttemptChallenge, w.Add(time.Minute)}} {
-		if n := must(b.CountAttempt(ctx(t), c.impi, c.kind, c.window, c.window.Add(2*time.Minute)))(t); n != 1 {
+	if n := must(b.CountAttempt(ctx(t), at, -1, exp))(t); n != 2 {
+		t.Errorf("after giving one back: %d, want 2", n)
+	}
+	flow := state.FlowScope("flow-token")
+	// Another IMPI, kind, scope or window counts apart.
+	for _, c := range []state.Attempt{
+		{IMPI: IMPI2, Kind: state.AttemptChallenge, Window: w},
+		{IMPI: IMPI1, Kind: state.AttemptResync, Window: w},
+		{IMPI: IMPI1, Kind: state.AttemptChallenge, Scope: flow, Window: w},
+		{IMPI: IMPI1, Kind: state.AttemptChallenge, Scope: state.FlowScope("another"), Window: w},
+		{IMPI: IMPI1, Kind: state.AttemptChallenge, Window: w.Add(time.Minute)},
+	} {
+		if n := must(b.CountAttempt(ctx(t), c, 1, c.Window.Add(2*time.Minute)))(t); n != 1 {
 			t.Errorf("%+v counted %d, want a count of its own", c, n)
 		}
 	}
+	resync := state.Attempt{IMPI: IMPI1, Kind: state.AttemptResync, Window: w}
 	var wg sync.WaitGroup
 	for range 8 {
 		for _, s := range []state.Store{a, b} {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if _, err := s.CountAttempt(ctx(t), IMPI1, state.AttemptResync, w, exp); err != nil {
+				if _, err := s.CountAttempt(ctx(t), resync, 1, exp); err != nil {
 					t.Error(err)
 				}
 			}()
 		}
 	}
 	wg.Wait()
-	if n := must(a.CountAttempt(ctx(t), IMPI1, state.AttemptResync, w, exp))(t); n != 18 {
+	if n := must(a.CountAttempt(ctx(t), resync, 1, exp))(t); n != 18 {
 		t.Errorf("after 16 concurrent counts and 2 others: %d", n)
 	}
 	for _, bad := range []struct {
-		impi, kind string
-		exp        time.Time
-	}{{"not an impi", state.AttemptChallenge, exp}, {IMPI1, "other", exp}, {IMPI1, state.AttemptChallenge, w}} {
-		_, err := a.CountAttempt(ctx(t), bad.impi, bad.kind, w, bad.exp)
+		at  state.Attempt
+		n   int64
+		exp time.Time
+	}{
+		{state.Attempt{IMPI: "not an impi", Kind: state.AttemptChallenge, Window: w}, 1, exp},
+		{state.Attempt{IMPI: IMPI1, Kind: "other", Window: w}, 1, exp},
+		{state.Attempt{IMPI: IMPI1, Kind: state.AttemptChallenge, Scope: "#flow", Window: w}, 1, exp},
+		{state.Attempt{IMPI: IMPI1, Kind: state.AttemptChallenge, Scope: strings.ToUpper(flow), Window: w}, 1, exp},
+		{at, 2, exp},
+		{at, 1, w},
+	} {
+		_, err := a.CountAttempt(ctx(t), bad.at, bad.n, bad.exp)
 		wantErr(t, err, state.ErrInvalid)
 	}
 }
@@ -867,14 +885,17 @@ func testAttemptCounts(t *testing.T, a, b state.Store, _ Options) {
 // and leaves the count.
 func testAttemptCountNotAChallenge(t *testing.T, a, _ state.Store, _ Options) {
 	w := T0
-	must(a.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, w.Add(time.Minute)))(t)
-	wantErr(t, a.AddChallenge(ctx(t), Challenge(IMPI1, state.ReservedNoncePrefix+"x", time.Minute)), state.ErrInvalid)
-	nonce := state.ReservedNoncePrefix + "count#" + state.AttemptChallenge + "#" + strconv.FormatInt(w.Unix(), 10)
-	_, err := a.TakeChallenge(ctx(t), IMPI1, nonce, T0)
-	wantErr(t, err, state.ErrNotFound)
-	if n := must(a.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, w.Add(time.Minute)))(t); n != 2 {
-		t.Errorf("count %d after a take of it, want 2", n)
+	for _, scope := range []string{"", state.FlowScope("flow-token")} {
+		at := state.Attempt{IMPI: IMPI1, Kind: state.AttemptChallenge, Scope: scope, Window: w}
+		must(a.CountAttempt(ctx(t), at, 1, w.Add(time.Minute)))(t)
+		nonce := state.ReservedNoncePrefix + "count#" + state.AttemptChallenge + "#" + scope + "#" + strconv.FormatInt(w.Unix(), 10)
+		_, err := a.TakeChallenge(ctx(t), IMPI1, nonce, T0)
+		wantErr(t, err, state.ErrNotFound)
+		if n := must(a.CountAttempt(ctx(t), at, 1, w.Add(time.Minute)))(t); n != 2 {
+			t.Errorf("count %d after a take of it, want 2", n)
+		}
 	}
+	wantErr(t, a.AddChallenge(ctx(t), Challenge(IMPI1, state.ReservedNoncePrefix+"x", time.Minute)), state.ErrInvalid)
 }
 
 // testReassertSweep: a live registration whose Reassert has come is handed to
