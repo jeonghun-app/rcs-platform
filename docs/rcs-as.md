@@ -302,8 +302,13 @@ In every session:
   a session still being answered (a client's INVITE whose first message is
   being stored, or rcs-as's ACK to a client's 2xx) send that answer first,
   so that no BYE ever comes before its dialog's 2xx (#270); then it ends every
-  session with a BYE. Both waits share one bound of 2 s; a session answered
-  after it is ended at once, from its own path.
+  session with a BYE, each once its dialog is confirmed: the client's ACK of
+  rcs-as's 2xx has come, or rcs-as has sent its own ACK, since a callee must
+  not send a BYE before the ACK (RFC 3261 §15). The answers and the ACKs share
+  one bound of 2 s, and a BYE is sent when it runs out, ACK or not; a session
+  answered after it ends itself the same way, from its own path. The BYEs'
+  answers then have a bound of 2 s of their own, so shutdown takes at most
+  4 s here.
 - **The MSRP direction.** A BYE with SIP cause 488 in its `Reason`, in a session
   rcs-as started that has carried no message yet, tells the engine
   `ErrNoSessions`: it is how pcscf ends a session whose client answered
