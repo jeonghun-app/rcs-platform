@@ -101,3 +101,30 @@ func TestACPIMFromInTheOtherFormOfTheSenderIsTheSender(t *testing.T) {
 		}
 	}
 }
+
+// The code review's case on #242 (round 2): pcscf asserts a non-numeric
+// SIP identity with the tel URI of its set (#208), and that is one user,
+// keyed by the tel URI. A message written to the SIP identity finds its
+// receipt from that user too.
+func TestANonNumericSIPIdentityAndItsTelURIAreOneUser(t *testing.T) {
+	core := newFakeCore(t)
+	a, _ := startEngine(t, core, messaging.Config{})
+	p := a.dial(t)
+	aliceName := "sip:alice@" + domain
+	pair := []string{"<" + aliceName + ">", "<" + alice + ">"}
+	for i, pai := range [][]string{pair, {"<" + aliceName + ">"}, {"<" + alice + ">"}} {
+		if res := p.send(pagerAs(bob, cpimFrom("<"+messaging.AnonymousURI+">", fmt.Sprint("m", i), 0, "hi"), pai...)); res.StatusCode != 202 {
+			t.Fatalf("asserted %v: answered %d", pai, res.StatusCode)
+		}
+		core.next(t)
+	}
+	// bob writes to alice's SIP identity; her receipt comes asserted as
+	// the pair.
+	if res := p.send(pagerAs(aliceName, cpimFrom("<"+messaging.AnonymousURI+">", "b1", imdn.PositiveDelivery, "hi"), "<"+bob+">")); res.StatusCode != 202 {
+		t.Fatalf("bob's message answered %d", res.StatusCode)
+	}
+	core.next(t)
+	if res := p.send(pagerAs(bob, deliveredBody(t, "b1"), pair...)); res.StatusCode != 202 {
+		t.Fatalf("alice's receipt answered %d", res.StatusCode)
+	}
+}

@@ -220,33 +220,48 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 
 // asserted reads the sender the network asserted (RFC 3325 §9.1), never a
 // header the client wrote, or the status that refuses the request: 403. It
-// takes what pcscf asserts, one identity or the SIP and tel pair of one
-// user (#208), and nothing more: at most two, at most one of each scheme,
-// all one user (messaging.UserOf). That user is the sender, and each
-// identity as asserted is one the sender may name itself by, as is any
-// other form of it (the engine compares them with UserOf).
+// takes what pcscf asserts (#208): one identity, or a SIP identity and the
+// tel URI of its implicit registration set (#16 decision 5), which are one
+// user. So at most one of each scheme, and a SIP identity that is itself a
+// number must be the tel URI's number; two different numbers are no pair
+// pcscf makes. The user is the tel URI when one is asserted, which every
+// SIP identity of the set is paired with, and the SIP identity's UserOf
+// otherwise. Each identity as asserted is one the sender may name itself
+// by, as is any other form of it (the engine compares them with UserOf).
 func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 	pai, err := req.Header.PAssertedIdentity()
 	if err != nil || len(pai) == 0 || len(pai) > 2 {
 		return s.refuseAsserted()
 	}
-	var sender string
+	var sipUser, telUser string
 	var identities []string
-	schemes := map[string]bool{}
 	for _, a := range pai {
 		raw := a.URI.String()
 		user, ok := messaging.UserOf(raw, s.cfg.HomeDomain)
-		scheme := a.URI.Scheme
-		if scheme == "sips" {
-			scheme = "sip"
-		}
-		if !ok || schemes[scheme] || sender != "" && user != sender {
+		if !ok {
 			return s.refuseAsserted()
 		}
-		schemes[scheme], sender = true, user
+		switch a.URI.Scheme {
+		case "tel":
+			if telUser != "" {
+				return s.refuseAsserted()
+			}
+			telUser = user
+		default: // sip or sips, as UserOf took it
+			if sipUser != "" {
+				return s.refuseAsserted()
+			}
+			sipUser = user
+		}
 		identities = append(identities, raw)
 	}
-	return sender, identities, 0
+	if telUser == "" {
+		return sipUser, identities, 0
+	}
+	if sipUser != "" && strings.HasPrefix(sipUser, "tel:") && sipUser != telUser {
+		return s.refuseAsserted()
+	}
+	return telUser, identities, 0
 }
 
 func (s *Server) refuseAsserted() (string, []string, int) {

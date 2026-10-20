@@ -165,11 +165,17 @@ func TestAStandaloneMessageIsStoredAndDeliveredThroughTheCore(t *testing.T) {
 // takes the first as its own, without looking it up, and the request goes
 // on to scscf rather than back to rcs-as.
 func TestAnOptionsFromTheCoreGoesBackToIt(t *testing.T) {
-	for _, top := range []string{"<sip:rcs-as.rcs.internal;lr>", "<sip:rcs-as.rcs.internal;transport=tcp;lr>", "<sip:127.0.0.1;lr>"} {
+	for top, service := range map[string]string{
+		"<sip:rcs-as.rcs.internal;lr>":               "",
+		"<sip:rcs-as.rcs.internal;transport=tcp;lr>": "",
+		"<sip:127.0.0.1;lr>":                         "",
+		// An operator's own AS URI (HSS_RCS_AS_URI), named alike here.
+		"<sip:chat-as.rcs.internal;lr>": "chat-as.rcs.internal",
+	} {
 		t.Run(top, func(t *testing.T) {
 			core := newCoreStub(t)
 			cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCS_SERVICE_NAMESPACE", "rcs.internal",
-				"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
+				"RCSAS_SERVICE_NAME", service, "RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
 			if err != nil {
 				t.Fatal(err)
 			}

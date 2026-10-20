@@ -207,8 +207,17 @@ func TestTheSIPSettingsAreRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Core.String() != "sip:scscf.rcs.internal;transport=tcp;lr" || c.Namespace != "rcs.internal" || c.SIPListenAddr != ":15060" {
-		t.Fatalf("namespace %v %q %q", c.Core, c.Namespace, c.SIPListenAddr)
+	if c.Core.String() != "sip:scscf.rcs.internal;transport=tcp;lr" || c.Namespace != "rcs.internal" || c.SIPListenAddr != ":15060" ||
+		c.ServiceName != "rcs-as.rcs.internal" {
+		t.Fatalf("namespace %v %q %q %q", c.Core, c.Namespace, c.SIPListenAddr, c.ServiceName)
+	}
+	// The service name follows HSS_RCS_AS_URI where an operator changed it;
+	// without a namespace there is none, and a loopback core is fine.
+	if c, err := configure(with(devEnv, "RCSAS_SERVICE_NAME", "as.rcs.internal", "RCSAS_CORE_URI", "sip:127.0.0.1:5060;transport=tcp;lr")); err != nil || c.ServiceName != "as.rcs.internal" {
+		t.Fatalf("service name %q, %v", c.ServiceName, err)
+	}
+	if c, err := configure(devEnv); err != nil || c.ServiceName != "" {
+		t.Fatalf("service name without a namespace %q, %v", c.ServiceName, err)
 	}
 	// Without RCSAS_SIP_HOST, the task's one private address.
 	old := interfaceAddrs
@@ -223,17 +232,21 @@ func TestTheSIPSettingsAreRead(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		"no core":            {with(devEnv, "RCSAS_CORE_URI", ""), "RCSAS_CORE_URI: required when RCS_SERVICE_NAMESPACE is unset"},
-		"core without lr":    {with(devEnv, "RCSAS_CORE_URI", "sip:10.0.1.5;transport=tcp"), "RCSAS_CORE_URI"},
-		"core over udp":      {with(devEnv, "RCSAS_CORE_URI", "sip:10.0.1.5;transport=udp;lr"), "RCSAS_CORE_URI"},
-		"core with a user":   {with(devEnv, "RCSAS_CORE_URI", "sip:scscf@10.0.1.5;transport=tcp;lr"), "RCSAS_CORE_URI"},
-		"core not sip":       {with(devEnv, "RCSAS_CORE_URI", "tel:+15550100001"), "RCSAS_CORE_URI"},
-		"core outside":       {with(devEnv, "RCSAS_CORE_URI", "sip:scscf.example.org;transport=tcp;lr", "RCS_SERVICE_NAMESPACE", "rcs.internal"), "outside RCS_SERVICE_NAMESPACE"},
-		"bad sip listen":     {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "5060"), "RCSAS_SIP_LISTEN_ADDR"},
-		"sip listen port":    {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", ":sip"), "RCSAS_SIP_LISTEN_ADDR"},
-		"sip listen port 0":  {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "127.0.0.1:0"), "RCSAS_SIP_LISTEN_ADDR"},
-		"no home domain":     {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
-		"sip host not an IP": {with(devEnv, "RCSAS_SIP_HOST", "rcs-as.internal"), "RCSAS_SIP_HOST"},
+		"no core":             {with(devEnv, "RCSAS_CORE_URI", ""), "RCSAS_CORE_URI: required when RCS_SERVICE_NAMESPACE is unset"},
+		"core without lr":     {with(devEnv, "RCSAS_CORE_URI", "sip:10.0.1.5;transport=tcp"), "RCSAS_CORE_URI"},
+		"core over udp":       {with(devEnv, "RCSAS_CORE_URI", "sip:10.0.1.5;transport=udp;lr"), "RCSAS_CORE_URI"},
+		"core with a user":    {with(devEnv, "RCSAS_CORE_URI", "sip:scscf@10.0.1.5;transport=tcp;lr"), "RCSAS_CORE_URI"},
+		"core not sip":        {with(devEnv, "RCSAS_CORE_URI", "tel:+15550100001"), "RCSAS_CORE_URI"},
+		"core outside":        {with(devEnv, "RCSAS_CORE_URI", "sip:scscf.example.org;transport=tcp;lr", "RCS_SERVICE_NAMESPACE", "rcs.internal"), "outside RCS_SERVICE_NAMESPACE"},
+		"core public address": {with(devEnv, "RCSAS_CORE_URI", "sip:203.0.113.5;transport=tcp;lr"), "neither private nor loopback"},
+		"core link-local":     {with(devEnv, "RCSAS_CORE_URI", "sip:169.254.169.254;transport=tcp;lr"), "neither private nor loopback"},
+		"service name a URI":  {with(devEnv, "RCSAS_SERVICE_NAME", "as@rcs.internal"), "RCSAS_SERVICE_NAME"},
+		"service name a port": {with(devEnv, "RCSAS_SERVICE_NAME", "as.rcs.internal:5070"), "RCSAS_SERVICE_NAME"},
+		"bad sip listen":      {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "5060"), "RCSAS_SIP_LISTEN_ADDR"},
+		"sip listen port":     {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", ":sip"), "RCSAS_SIP_LISTEN_ADDR"},
+		"sip listen port 0":   {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "127.0.0.1:0"), "RCSAS_SIP_LISTEN_ADDR"},
+		"no home domain":      {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
+		"sip host not an IP":  {with(devEnv, "RCSAS_SIP_HOST", "rcs-as.internal"), "RCSAS_SIP_HOST"},
 	} {
 		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v", name, err)
