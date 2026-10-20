@@ -4,10 +4,11 @@
 ([architecture](architecture.md) §2). This document describes its messaging
 core: how 1-to-1 chat, group chat and standalone messages are accepted,
 stored, delivered and answered with disposition notifications (IMDN, RFC
-5438), and how group chats are run ([Group chat](#group-chat)). The SIP side
-(INVITE and MESSAGE handling, SDP, the third-party REGISTER from `scscf`) is a
-later issue. The core is driven through interfaces so that it can be built and
-tested first.
+5438), and how group chats are run ([Group chat](#group-chat)). Of the SIP
+side, pager-mode MESSAGE is served ([The SIP layer](#the-sip-layer)); INVITE
+and SDP, the group chat focus over SIP and the third-party REGISTER from
+`scscf` come in later parts of #137. The core is driven through interfaces so
+that it can be built and tested first.
 
 The code:
 
@@ -19,7 +20,9 @@ The code:
 - `internal/rcsas/groupstore`: the groups' `Store` interface, memory backend
   and contract test.
 - `internal/rcsas/awsstore`: the DynamoDB backends of both.
-- `internal/rcsas`: the `RCSAS_` settings.
+- `internal/rcsas/sipas`: the SIP layer: the proxy's `Router`, which serves
+  what rcs-as terminates, and the engine's `Deliverer`.
+- `internal/rcsas`: the `RCSAS_` settings and the service (`cmd/rcs-as`).
 
 ## How the SIP layer drives the engine
 
@@ -77,6 +80,77 @@ answer has come back to rcs-as through the CSCFs.
   This uses the `msrp.SessionConfig.RemoteLater` option.
 - An offer that gets no answer within `RCSAS_ANSWER_TIMEOUT` closes its leg.
   The default is 32 s, the INVITE transaction's limit.
+
+## The SIP layer
+
+`rcs-as` is a `proxy.Proxy` (`internal/sip/proxy`) on one TCP listener, which
+only the core reaches ([ADR 0007](adr/0007-internal-transport.md) §2). Its
+`Router` (`sipas.Server`) decides per request:
+
+| Request | What rcs-as does |
+|---|---|
+| `MESSAGE` outside a dialog (pager mode, RFC 3428) | `Submit` with `Pager: true`, `Mode: Standalone`; answered as below |
+| `MESSAGE` in a dialog | 481: pager mode has no dialog |
+| `OPTIONS` | forwarded along its `Route`, back to `scscf`: the default profile hands it to `rcs-as` with SESSION_CONTINUED, and capability discovery must not stop there |
+| anything else | 405 with `Allow: MESSAGE, OPTIONS`; INVITE comes with the next part of #137 |
+
+### Who sends, and to whom
+
+The sender is the first `P-Asserted-Identity`, which the core inserted (RFC
+3325 §9.1); a MESSAGE without one is refused with 403. Every asserted identity,
+as asserted and in the canonical form below, is one the sender may name in its
+CPIM `From`. The recipient is the Request-URI.
+
+Each user is named in one form (`sipas.UserOf`), since the queues, a sender's
+share of them and the sent-message records are keyed by that string: a global
+telephone number, whether written as a tel URI or as a SIP URI with
+`user=phone`, is `tel:+` and its digits (RFC 3261 §19.1.6); any other identity
+is `identity.CanonicalIMPU`'s form. So `tel:+1-555-0100` and
+`sip:+15550100@host;user=phone` are one user, holding one share.
+
+### Answers
+
+| Outcome | Status |
+|---|---|
+| stored | 202 Accepted (RFC 3428 §7) |
+| not `message/cpim` | 415, with `Accept: message/cpim` |
+| no asserted identity, or one that names no user | 403 |
+| a Request-URI that names no user | 404 |
+| unreadable `Conversation-ID` or `Contribution-ID` | 400 |
+| refused for its size / type / syntax (`Rejection`) | 413 / 415 / 400 |
+| any other refusal (rates, queue full, forged or unrequested notification, ...) | 403 |
+| the store busy after its retries (`store.ErrBusy`) | 503 with `Retry-After: 1` |
+| any other store failure | 500 |
+
+### What rcs-as sends
+
+`Deliverer.Pager` sends a MESSAGE to `RCSAS_CORE_URI` (`scscf`), or through
+the trusted `Delivery.Route` of a notification, as a terminating request for
+the recipient: its `Route` has no `orig`, and it carries
+`P-Served-User: <recipient>;sescase=term`. Every trigger of the default
+profile excludes requests with that header ([HSS](hss.md)), so the request goes
+on to the recipient's contacts, not back to `rcs-as`, which would store it and
+send it again. It also carries:
+
+- `P-Asserted-Identity: <sender>`, without a display name;
+- `From` with the sender's CPIM name as its display name, escaped by the engine
+  (`EscapeDisplayName`) and written as a quoted string, its backslashes escaped
+  again;
+- `P-Asserted-Service` and `Accept-Contact` with the standalone messaging ICSI
+  (`urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg`);
+- the conversation headers when the message has them, and the CPIM body as
+  `message/cpim`.
+
+The final status tells the engine what became of it: a 2xx delivered it; 404
+or 604 is a recipient that does not exist (`ErrUndeliverable`); 408, 430, 480,
+503, a next hop that cannot be resolved or a request that cannot be sent is a
+recipient not reachable now (`ErrOffline`); any other status is a failure the
+engine tries again later. A name in `RCSAS_CORE_URI` is looked up only inside
+`RCS_SERVICE_NAMESPACE`, and only its private addresses are used ([ADR
+0007](adr/0007-internal-transport.md) §5).
+
+`Deliverer.Invite` fails until terminating sessions are served; the engine then
+waits for the next invitation as after any failed one.
 
 ## The pipeline
 
@@ -560,6 +634,9 @@ settings:
 |---|---|---|
 | `RCSAS_MSRP_HOST` | required | This task's address in MSRP paths ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_MSRP_LISTEN_ADDR` | `:2855` | MSRP listener for `msrp-relay`; its port is the advertised one |
+| `RCSAS_SIP_LISTEN_ADDR` | `0.0.0.0:5060` | SIP listener (TCP), which only the core reaches |
+| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
+| `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, an address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
@@ -740,6 +817,9 @@ identifier ever appears in a metric name.
 | Metric | Counts |
 |---|---|
 | `message.accepted`, `message.accepted.notification`, `message.resent` | Accepted messages, notifications, resends |
+| `sip.message.<status>` | Pager-mode MESSAGEs rcs-as answered, by status |
+| `sip.pager.<status>`, `sip.pager.timeout`, `sip.pager.unsent`, `sip.pager.unresolved` | MESSAGEs rcs-as sent, by final status, and those that got none, could not be sent or found no next hop |
+| `sip.refused.method`, `sip.respond_failed`, `sip.invite.unserved` | Requests of a method rcs-as does not take, answers the transport did not take, invitations not sent |
 | `message.rejected.<reason>` | Refusals: `too_large`, `rate_limited`, `content_type`, `malformed`, `from_mismatch`, `message_id_reused`, `queue_full`, `queue_share_full`, `imdn_malformed`, `imdn_unknown`, `imdn_forged`, `imdn_not_requested` |
 | `cpim.rejected.<reason>` | The CPIM parser's reason for `malformed` (`internal/cpim` `Reason`) |
 | `cpim.deviation.<name>` | Accepted layout deviations: `bare-lf`, `spacing`, `trailing-ws`, `empty-value` |

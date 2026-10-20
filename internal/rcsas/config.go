@@ -1,8 +1,7 @@
-// Package rcsas holds what the rcs-as service is configured with: the
-// RCSAS_ settings (docs/rcs-as.md), read into the messaging engine's
-// configuration and the store's. The service binary, which needs the SIP
-// layer, comes later; reading the settings now keeps their names, defaults
-// and production checks in one tested place from the start.
+// Package rcsas is the rcs-as service: the RCSAS_ settings
+// (docs/rcs-as.md), read into the messaging engine's configuration, the
+// store's and the SIP layer's, and Run, which puts the store, the engine
+// and the SIP layer (sipas) together.
 //
 // The prefix is RCSAS_, not RCS_AS_: the runtime reserves RCS_ for the
 // settings every service shares.
@@ -10,13 +9,16 @@ package rcsas
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // EnvPrefix is the prefix of rcs-as's own settings.
@@ -31,16 +33,28 @@ const (
 // Defaults of the settings without a messaging default.
 const (
 	DefaultMSRPListenAddr = ":2855"
-	DefaultTable          = "messages"
-	DefaultGroupsTable    = "groupchats"
+	// DefaultSIPListenAddr is the SIP listener, which only the core reaches
+	// (ADR 0007 §2).
+	DefaultSIPListenAddr = "0.0.0.0:5060"
+	DefaultTable         = "messages"
+	DefaultGroupsTable   = "groupchats"
 )
 
 // Config is rcs-as's configuration.
 type Config struct {
 	// MSRPListenAddr is where msrp-relay connects (ADR 0004).
 	MSRPListenAddr string
-	Store          string
-	DynamoDB       awsstore.Config
+	// SIPListenAddr is the SIP listener (TCP), and SIPHost this task's
+	// address, which its Via and Call-IDs name (ADR 0005).
+	SIPListenAddr string
+	SIPHost       netip.Addr
+	// Core is where rcs-as sends the requests it originates (scscf), a SIP
+	// URI of a host with transport=tcp and lr, and Namespace the Cloud Map
+	// namespace its names are looked up in (ADR 0007 §5).
+	Core      sip.URI
+	Namespace string
+	Store     string
+	DynamoDB  awsstore.Config
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
 	// are left for the service to set.
 	Messaging messaging.Config
@@ -96,6 +110,15 @@ func Configure(s *runtime.Settings) Config {
 			},
 		},
 	}
+	c.SIPListenAddr = e.String("SIP_LISTEN_ADDR", DefaultSIPListenAddr)
+	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
+		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
+	} else if p, err := strconv.Atoi(port); err != nil || p < 0 || p > 65535 {
+		e.Invalid("SIP_LISTEN_ADDR", "needs a port")
+	}
+	c.SIPHost = runtime.InstanceAddr(e, "SIP_HOST", interfaceAddrs)
+	c.Namespace = s.ServiceNamespace()
+	c.Core = coreURI(s)
 	if _, port, err := net.SplitHostPort(c.MSRPListenAddr); err != nil {
 		e.Invalid("MSRP_LISTEN_ADDR", "not host:port")
 	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
@@ -194,6 +217,37 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("GROUP_ADD_BURST", "smaller than a full group's invitees (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
 	}
 	return c
+}
+
+// interfaceAddrs lists this host's addresses; tests replace it.
+var interfaceAddrs = net.InterfaceAddrs
+
+// coreURI reads RCSAS_CORE_URI, or makes scscf's Cloud Map name in
+// RCS_SERVICE_NAMESPACE: where rcs-as sends the requests it originates,
+// as their first Route.
+func coreURI(s *runtime.Settings) sip.URI {
+	e := s.Env
+	v := e.String("CORE_URI", "")
+	if v == "" {
+		ns := s.ServiceNamespace()
+		if ns == "" {
+			e.Invalid("CORE_URI", "required when RCS_SERVICE_NAMESPACE is unset")
+			return sip.URI{}
+		}
+		v = "sip:scscf." + ns + ";transport=tcp;lr"
+	}
+	u, err := sip.ParseURI(v)
+	network, _ := u.Param("transport")
+	if err != nil || u.Scheme != "sip" || u.User != "" || !u.Params.Has("lr") || !strings.EqualFold(network, "tcp") {
+		e.Invalid("CORE_URI", "not a sip URI of a host with transport=tcp and lr")
+		return sip.URI{}
+	}
+	host := strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]")
+	if _, err := netip.ParseAddr(host); err != nil && !runtime.InServiceNamespace(host, s.ServiceNamespace()) {
+		e.Invalid("CORE_URI", "a host name outside RCS_SERVICE_NAMESPACE, which rcs-as does not look up (ADR 0007 §5)")
+		return sip.URI{}
+	}
+	return u
 }
 
 // readRate reads <prefix>RATE and <prefix>BURST; a rate of 0 turns the
