@@ -200,7 +200,7 @@ participating function and store messages for users who are offline
 
 | Priority | Trigger | Default handling |
 |---|---|---|
-| 10 | INVITE with an OMA CPM ICSI or RCS IARI in `Accept-Contact`/`Contact`, or a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service` | SESSION_TERMINATED |
+| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, or a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service` | SESSION_TERMINATED |
 | 20 | MESSAGE | SESSION_TERMINATED |
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
@@ -218,12 +218,14 @@ core SIP ports.
 Chat and messaging fail rather than bypass `rcs-as`, which anchors MSRP and keeps
 IMDN and store-and-forward; capability discovery and registration continue while it
 is down. Each service condition is its own trigger, with one header name and one
-literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.` or
-`3gpp-application\.ims\.iari\.rcs\.`), the ICSI and IARI text after `urn-7`,
-which is the same in percent-encoded feature tags and in the plain service headers.
+literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.`,
+`3gpp-application\.ims\.iari\.rcs\.` or `\+g\.oma\.sip-im`), the ICSI and IARI
+text after `urn-7`, which is the same in percent-encoded feature tags and in the
+plain service headers, or the OMA SIMPLE IM tag, with which rcsjta asks for a chat.
 The profile is created at start if missing; an operator's changes to it are kept.
-So a profile created before the `P-Served-User` check (#137) keeps its old
-triggers until an operator updates it through the API. No deployment had one.
+So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
+(#137) keeps its old triggers until an operator updates it through the API. No
+deployment had one.
 
 ### Writing iFC
 

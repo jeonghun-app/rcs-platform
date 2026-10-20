@@ -167,8 +167,14 @@ func startAS(t *testing.T, e Engine, core *fakeCore) *as {
 // sets, and with the proxy's configuration changed by each of tune.
 func startASWith(t *testing.T, e Engine, cfg Config, tune ...func(*proxy.Config)) *as {
 	t.Helper()
+	return startASOn(t, e, cfg, transport.Config{}, tune...)
+}
+
+// startASOn is startASWith on a transport configured by tc.
+func startASOn(t *testing.T, e Engine, cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *as {
+	t.Helper()
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) {
+	tr, err := transport.New(tc, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}

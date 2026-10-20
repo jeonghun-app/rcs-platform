@@ -31,7 +31,7 @@ const busyRetryAfter = "1"
 // client ends those it no longer uses.
 const (
 	DefaultMaxSessions        = 20_000
-	DefaultMaxSessionsPerUser = 64
+	DefaultMaxSessionsPerUser = 32
 )
 
 // Engine is what Server needs from the messaging engine, which
@@ -61,11 +61,14 @@ type Config struct {
 	Contact sip.URI
 	// MaxMessageSize is the a=max-size of its SDP; zero leaves it out.
 	MaxMessageSize int
-	// MaxSessions bounds the sessions this task holds, and
-	// MaxSessionsPerUser those of one user among them (threat model T9);
-	// zero takes DefaultMaxSessions and DefaultMaxSessionsPerUser.
+	// MaxSessions bounds the sessions this task holds (threat model T9).
+	// MaxOutgoingPerUser bounds those one user opens, and
+	// MaxIncomingPerUser those rcs-as opens to it, apart, so that other
+	// users' messages cannot take the user's own room (security review on
+	// #252). Zero takes DefaultMaxSessions and DefaultMaxSessionsPerUser.
 	MaxSessions        int
-	MaxSessionsPerUser int
+	MaxOutgoingPerUser int
+	MaxIncomingPerUser int
 	// Listener names the transport listener rcs-as's own requests leave
 	// through, whose sent-by their Via carries.
 	Listener string
@@ -101,7 +104,13 @@ type Server struct {
 	mu       sync.Mutex
 	closed   bool
 	sessions map[string]*session
-	perUser  map[string]int
+	// perUser counts each user's sessions each way (session.budget),
+	// those still waiting for an answer included; pending counts those for
+	// all users. large holds the user and peer of each large-mode session
+	// rcs-as opens (session.largeKey).
+	perUser map[string]int
+	pending int
+	large   map[string]bool
 	// registered is when each user's registration, as rcs-as last heard
 	// of it, runs out (register).
 	registered map[string]time.Time
@@ -136,12 +145,16 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxSessions <= 0 {
 		cfg.MaxSessions = DefaultMaxSessions
 	}
-	if cfg.MaxSessionsPerUser <= 0 {
-		cfg.MaxSessionsPerUser = DefaultMaxSessionsPerUser
+	if cfg.MaxOutgoingPerUser <= 0 {
+		cfg.MaxOutgoingPerUser = DefaultMaxSessionsPerUser
+	}
+	if cfg.MaxIncomingPerUser <= 0 {
+		cfg.MaxIncomingPerUser = DefaultMaxSessionsPerUser
 	}
 	return &Server{
 		cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand},
-		sessions: map[string]*session{}, perUser: map[string]int{}, registered: map[string]time.Time{},
+		sessions: map[string]*session{}, perUser: map[string]int{}, large: map[string]bool{},
+		registered: map[string]time.Time{},
 	}, nil
 }
 

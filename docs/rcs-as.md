@@ -225,14 +225,15 @@ A client's INVITE (the originating session):
 | Check | Refused with |
 |---|---|
 | a `Require` option tag other than `timer` | 420 with `Unsupported` (RFC 3261 §8.2.2.3) |
-| neither the chat ICSI nor the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service` (file transfer, for one, is not served here) | 403 |
-| no asserted identity, or one that names no user | 403 |
+| none of the chat ICSI, the OMA SIMPLE IM tag `+g.oma.sip-im` (with which rcsjta, the reference client, asks for a chat) or the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service` (file transfer, for one, is not served here) | 403 |
+| no asserted identity, or not as for MESSAGE | 403 |
 | a Request-URI that names no user | 404 |
 | unreadable `Conversation-ID` or `Contribution-ID` | 400 |
-| `Session-Expires` below 90 s | 422 with `Min-SE: 90` (RFC 4028 §6) |
-| no SDP offer (a late offer), no MSRP line, an offer of `passive` (RFC 6135 §4.2.2), or no type in common | 488 |
-| this task holds `RCSAS_MAX_SESSIONS` sessions | 500 with `Retry-After: 1`, as for a busy store: the client may try again, and another task may take it |
-| the user holds `RCSAS_MAX_SESSIONS_PER_USER` sessions | 486 Busy Here |
+| `Session-Expires` below 90 s from a client with `Supported: timer` | 422 with `Min-SE: 90` (RFC 4028 §6); a client without the extension, which could not act on a 422, gets no timer instead |
+| a body that is not an SDP offer, or a `multipart/mixed` one other than one SDP part and at most one `message/cpim` part (a group INVITE's resource list, two descriptions, a nested multipart); no offer (a late offer); no MSRP line; an offer of `passive` (RFC 6135 §4.2.2); no type in common; a first message in a large-mode INVITE | 488 |
+| a first message the engine refuses | as a pager MESSAGE's (413, 415, 400, 403, 500 with `Retry-After: 1`), and no session |
+| this task holds `RCSAS_MAX_SESSIONS` sessions, those still waiting for an answer included | 500 with `Retry-After: 1`, as for a busy store: the client may try again, and another task may take it |
+| the user has opened `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` sessions | 486 Busy Here |
 
 Otherwise rcs-as opens the leg with `OpenLeg` (the sender is the asserted
 identity, the peer the Request-URI, as for pager mode) and answers 200. The
@@ -242,39 +243,62 @@ this task's SIP address with the service's feature tag. Messages on the leg go
 through the pipeline, are stored and are delivered to the peer: on the peer's
 own leg if it has one, or in a session rcs-as starts (store-and-forward).
 
+A chat INVITE may carry the chat's first message (rcsjta does when the user
+starts a chat by writing): a `multipart/mixed` body with the SDP part and a
+`message/cpim` part (RFC 5621). rcs-as finds the SDP part as pcscf does, and
+submits the message as the session's first, before the 200.
+
 In every session:
 
-- **Session timers** (RFC 4028). rcs-as never refreshes. When the client asks
-  for a timer and supports the extension, rcs-as takes it with the client as
-  refresher (`Session-Expires: <n>;refresher=uac`, `Require: timer`). It ends a
-  session left unrefreshed with a BYE, min(32 s, interval/3) before the
-  interval runs out (§10). A client that asks rcs-as to refresh
-  (`refresher=uas`) and supports the extension gets `refresher=uac` all the
-  same, which §9 lets the UAS choose. A client without `Supported: timer`
-  gets no timer, as from a UAS without the extension, since it would leave the
-  refreshing to rcs-as; such a session ends with its MSRP connection or a BYE. In a
-  session rcs-as started, a timer the client's 2xx sets is kept the same way.
+- **Session timers** (RFC 4028). rcs-as never refreshes. When the client
+  supports the extension and asks for a timer, rcs-as takes it with the client
+  as refresher (`Session-Expires: <n>;refresher=uac`, `Require: timer`), or
+  chooses so itself when the client named no refresher. It ends a session left
+  unrefreshed with a BYE, min(32 s, interval/3) before the interval runs out
+  (§10). A client that asks rcs-as to refresh (`refresher=uas`), which the UAS
+  cannot change (§9, Table 2), or that does not support the extension, which
+  would leave refreshing to rcs-as, gets no timer, as from a UAS without the
+  extension. The INVITEs rcs-as sends ask for no timer (no `Supported: timer`,
+  no `Session-Expires`); a 2xx that sets one with the client refreshing
+  (`refresher=uas`) is kept the same way, and one that names rcs-as the
+  refresher (`refresher=uac`) gets no timer.
 - **Refreshes.** A re-INVITE or UPDATE whose offer keeps the MSRP path gets the
   same answer, with the same `o=` version unless the answer changed (RFC 3264
-  §8), and restarts the timer. An UPDATE without an offer is a plain refresh.
-  An offer with another path, or a re-INVITE without one, is refused with 488:
-  a leg does not move. The session goes on either way.
+  §8), and restarts the timer. A re-INVITE without an offer (rcsjta's refresh)
+  gets the session's last SDP as the offer in its 2xx, with the same version
+  (RFC 3261 §14.2, RFC 4028 §7.4); the answer in its ACK must keep the path, or
+  the session ends. An UPDATE without an offer is a plain refresh, its 2xx
+  without SDP (RFC 3311 §5.2). An offer with another path is refused with 488:
+  a leg does not move. The session goes on.
 - **Ending.** A BYE from the other side ends the session and closes its leg. A
-  leg that ends on its own (the relay dropped its connection), a 2xx without
-  an ACK (RFC 3261 §13.3.1.4), an unrefreshed timer and a terminating
-  large-mode leg that is `Finished` each end the session with a BYE from
-  rcs-as. So does shutdown, before the transport closes.
+  leg that ends on its own (the relay dropped its connection), a leg no
+  connection binds within `RCSAS_ANSWER_TIMEOUT` of its peer's path being known
+  (a client that never connects to the relay), a 2xx without an ACK (RFC 3261
+  §13.3.1.4), an unrefreshed timer and a terminating large-mode leg that is
+  `Finished` each end the session with a BYE from rcs-as. So does shutdown,
+  before the transport closes; it waits up to 2 s for the BYEs' answers.
 - **The MSRP direction.** A BYE with SIP cause 488 in its `Reason`, in a session
-  rcs-as started, tells the engine `ErrNoSessions`: it is how pcscf ends a
-  session whose client answered `passive` (ADR 0004).
+  rcs-as started that has carried no message yet, tells the engine
+  `ErrNoSessions`: it is how pcscf ends a session whose client answered
+  `passive` (ADR 0004). A session that carried messages was served, whatever
+  its BYE says.
+- **Bounds** (threat model T9). `RCSAS_MAX_SESSIONS` bounds a task's sessions,
+  those waiting for an answer included. A user's sessions are bounded each way
+  apart: those it opens (`RCSAS_MAX_OUTGOING_SESSIONS_PER_USER`, 486 past it),
+  and those rcs-as opens to it (`RCSAS_MAX_INCOMING_SESSIONS_PER_USER`), so
+  that other users' messages cannot take the user's own room. One sender has
+  at most one large-mode session open to one recipient at a time; the next
+  message waits for it. A session rcs-as cannot start for a bound waits as for
+  a recipient offline.
 
 A third-party REGISTER from scscf (TS 24.229 §5.4.1.7) names the user in
 `To` and the expiry in `Expires`; one without `Expires` is refused with 400.
 rcs-as answers 200 and calls `UserRegistered`. The REGISTER does not say which
-flow the client registered on, so rcs-as counts a registration as one on a
-new flow when it has not heard of a live one for that user (none, or one that
-has run out), and as a refresh otherwise. A de-registration (`Expires: 0`)
-only forgets the user.
+flow the client registered on: its `Contact` is scscf's, and the default
+profile does not ask for the client's REGISTER in its body. So rcs-as counts a
+registration as one on a new flow when it has not heard of a live one for that
+user (none, or one that has run out), and as a refresh otherwise. A
+de-registration (`Expires: 0`) only forgets the user.
 
 ## The pipeline
 
@@ -765,7 +789,8 @@ settings:
 | `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, an address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
-| `RCSAS_MAX_SESSIONS_PER_USER` | `64` | Sessions of one user on this task; an INVITE beyond it is answered 486 |
+| `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` | `32` | Sessions one user opens on this task; an INVITE beyond it is answered 486 |
+| `RCSAS_MAX_INCOMING_SESSIONS_PER_USER` | `32` | Sessions rcs-as opens to one user on this task; a delivery beyond it waits |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
@@ -784,7 +809,7 @@ settings:
 | `RCSAS_NOTIFICATION_RATE`, `RCSAS_NOTIFICATION_BURST` | `600`, `300` | The same for notifications. A client that comes back online answers each stored message with up to two |
 | `RCSAS_DELIVERY_TIMEOUT` | `30s` | One delivery attempt: a pager request, or an MSRP send and its success report |
 | `RCSAS_INVITE_TIMEOUT` | `2m` | How long an invitation is waited for before another may be sent |
-| `RCSAS_ANSWER_TIMEOUT` | `32s` | How long an offered leg waits for its answer |
+| `RCSAS_ANSWER_TIMEOUT` | `32s` | How long an offered leg waits for its answer, and how long a leg whose peer's path is known waits for msrp-relay's connection before it is closed and its session ended |
 | `RCSAS_RETRY_INTERVAL`, `RCSAS_MAX_RETRY_INTERVAL` | `1m`, `1h` | First and longest wait before a held queue is read again |
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
@@ -953,7 +978,9 @@ identifier ever appears in a metric name.
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
 | `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |
-| `sip.session.task_limit`, `sip.session.user_limit` | Sessions refused for `RCSAS_MAX_SESSIONS` and `RCSAS_MAX_SESSIONS_PER_USER` |
+| `sip.session.task_limit`, `sip.session.user_limit` | Sessions refused for `RCSAS_MAX_SESSIONS` and for a user's own bound, either way |
+| `sip.invite.first_message.<status>`, `sip.invite.answer_ignored` | First messages in a client's INVITE, by the status a pager MESSAGE would get; retransmitted 2xx responses that set up no dialog |
+| `leg.unbound` | Legs closed because no connection bound them in time |
 | `sip.session.expired`, `sip.session.no_ack` | Sessions rcs-as ended for an unrefreshed timer, and for a 2xx without an ACK |
 | `sip.bye.sent`, `sip.bye.received`, `sip.refresh.answered`, `sip.refresh.refused` | Session ends and refreshes |
 | `sip.dialog.unresolved`, `sip.dialog.unsent` | Requests in a dialog (ACK, BYE) without a next hop, or not sent |
@@ -1071,15 +1098,20 @@ Signals to alarm on (Phase 7):
   expire.
 - **Group rates are per task**, like the 1-to-1 ones.
 - **rcs-as never refreshes a session.** A client that asks rcs-as to refresh
-  (`refresher=uas`) is made the refresher (see [Sessions](#sessions)); one
-  without the extension gets no timer, and its session lasts until its MSRP
-  connection or a BYE ends it.
+  (`refresher=uas`), or that does not support session timers, gets no timer
+  (see [Sessions](#sessions)), and its session lasts until its MSRP connection
+  or a BYE ends it.
 - **A new flow is guessed.** The third-party REGISTER does not carry the
   client's REGISTER (the default profile does not ask for it), so a client
   that moves to a new flow before its registration runs out looks like one
-  refreshing, and keeps a pager-only marker until its registration lapses or
-  it opens a session itself. Registrations are remembered per task, up to
-  100 000 users.
+  refreshing. It keeps a pager-only marker until it de-registers, misses a
+  refresh, or opens a session itself; and what is queued for it after a
+  delivery on the old flow failed waits for the invitation's
+  `RCSAS_INVITE_TIMEOUT` (2 min) or the queue's retry interval (1 min and
+  growing) instead of going at once. Registrations are remembered per task, up
+  to 100 000 users.
+- **Large messages from one sender go one session at a time.** The next one to
+  the same recipient waits for the queue's next pass after the session ends.
 - **One user per registration.** `UserRegistered` gets the identity in the
   third-party REGISTER's `To`; queues kept under another identity of the
   same implicit registration set wait for their own retry.

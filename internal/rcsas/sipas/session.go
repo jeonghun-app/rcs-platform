@@ -49,9 +49,12 @@ type session struct {
 	s   *Server
 	leg *messaging.Leg
 	// user is the client's identity in the session, which
-	// Config.MaxSessionsPerUser bounds.
+	// Config.MaxOutgoingPerUser bounds.
 	user string
-	mode store.Mode
+	// reserved is set while a session rcs-as started holds its place
+	// before its 2xx (Server.reserve); guarded by the Server's mu.
+	reserved bool
+	mode     store.Mode
 	// inv is the invitation of a session rcs-as started; zero otherwise.
 	inv messaging.Invitation
 
@@ -71,9 +74,12 @@ type session struct {
 	// ack is the ACK of the 2xx rcs-as's INVITE got, sent again for each
 	// retransmission of it (RFC 3261 §13.2.2.4).
 	ack *sip.Request
-	// final is set once rcs-as's INVITE has a final answer.
-	final bool
-	ended bool
+	// final is set once rcs-as's INVITE has a final answer, and noDialog
+	// once a 2xx to it set up no dialog; dropped holds the To tags of the
+	// other forks rcs-as ended.
+	final, noDialog bool
+	dropped         map[string]bool
+	ended           bool
 }
 
 // contactTag is the feature tag of the session's service.
@@ -89,30 +95,112 @@ var (
 	errClosing         = errors.New("sipas: closing")
 	errTooManySessions = errors.New("sipas: too many sessions on this task")
 	errUserSessions    = errors.New("sipas: too many sessions for the user")
+	errLargeBusy       = errors.New("sipas: a large-mode session from the sender to the recipient is open")
 )
 
 // addSession makes ss reachable by the requests in its dialog, unless s
-// is closing or a bound on sessions is reached (threat model T9).
+// is closing or a bound on sessions is reached (threat model T9). A session
+// rcs-as started holds its place already (reserve), which it takes over.
 func (s *Server) addSession(ss *session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.roomFor(ss.user); err != nil {
-		return err
+	if ss.reserved {
+		ss.reserved = false
+		s.pending--
+		if s.closed {
+			s.dropUser(ss)
+			return errClosing
+		}
+	} else {
+		if err := s.roomFor(ss); err != nil {
+			return err
+		}
+		s.perUser[ss.budget()]++
 	}
 	s.sessions[ss.d.ID()] = ss
-	s.perUser[ss.user]++
 	return nil
 }
 
-// roomFor reports whether a session for user may be added; it needs s.mu.
-func (s *Server) roomFor(user string) error {
+// reserve holds a place for a session rcs-as is about to start for ss's
+// user, so that INVITEs still waiting for their answer count against the
+// bounds too; release gives it back if the session does not come about.
+func (s *Server) reserve(ss *session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.roomFor(ss); err != nil {
+		return err
+	}
+	if key := ss.largeKey(); key != "" {
+		if s.large[key] {
+			// One large-mode session at a time from one sender to one
+			// recipient (security review on #252): the next message
+			// waits for this one, rather than ringing the recipient's
+			// client once for each.
+			return errLargeBusy
+		}
+		s.large[key] = true
+	}
+	ss.reserved = true
+	s.pending++
+	s.perUser[ss.budget()]++
+	return nil
+}
+
+func (s *Server) release(ss *session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !ss.reserved {
+		return
+	}
+	ss.reserved = false
+	s.pending--
+	s.dropUser(ss)
+}
+
+// dropUser counts one session of ss's user fewer, and frees its sender and
+// recipient for another large-mode session; it needs s.mu.
+func (s *Server) dropUser(ss *session) {
+	if b := ss.budget(); s.perUser[b] <= 1 {
+		delete(s.perUser, b)
+	} else {
+		s.perUser[b]--
+	}
+	if key := ss.largeKey(); key != "" {
+		delete(s.large, key)
+	}
+}
+
+// budget names the count of ss's sessions that ss belongs to: those its
+// user opens, or those rcs-as opens to its user.
+func (ss *session) budget() string {
+	if ss.inv.Recipient != "" {
+		return ss.user + "\x00in"
+	}
+	return ss.user + "\x00out"
+}
+
+// largeKey names a large-mode session rcs-as opens by its recipient and
+// sender; empty for any other session.
+func (ss *session) largeKey() string {
+	if ss.inv.Recipient == "" || ss.mode != store.Standalone {
+		return ""
+	}
+	return ss.inv.Recipient + "\x00" + ss.inv.Peer
+}
+
+// roomFor reports whether ss may be added; it needs s.mu.
+func (s *Server) roomFor(ss *session) error {
+	limit := s.cfg.MaxOutgoingPerUser
+	if ss.inv.Recipient != "" {
+		limit = s.cfg.MaxIncomingPerUser
+	}
 	switch {
 	case s.closed:
 		return errClosing
-	case len(s.sessions) >= s.cfg.MaxSessions:
+	case len(s.sessions)+s.pending >= s.cfg.MaxSessions:
 		s.cfg.Metrics.Count("sip.session.task_limit", 1)
 		return errTooManySessions
-	case s.perUser[user] >= s.cfg.MaxSessionsPerUser:
+	case s.perUser[ss.budget()] >= limit:
 		s.cfg.Metrics.Count("sip.session.user_limit", 1)
 		return errUserSessions
 	}
@@ -132,9 +220,7 @@ func (s *Server) removeSession(ss *session) {
 		return
 	}
 	delete(s.sessions, d.ID())
-	if s.perUser[ss.user]--; s.perUser[ss.user] <= 0 {
-		delete(s.perUser, ss.user)
-	}
+	s.dropUser(ss)
 }
 
 // sessionOf finds the session of a request the other side sent in it, by
@@ -193,6 +279,11 @@ func msrpOffer(h *sip.Header, body []byte) (*sdp.Session, int, []msrp.URI, int) 
 	if err != nil {
 		return nil, 0, nil, 488
 	}
+	return msrpOfferIn(offer)
+}
+
+// msrpOfferIn is msrpOffer for a session description already parsed.
+func msrpOfferIn(offer *sdp.Session) (*sdp.Session, int, []msrp.URI, int) {
 	// An offer without a=setup is active (RFC 4145 §4).
 	i, path, setup, err := firstMSRP(offer, sdp.SetupActive)
 	if err != nil || setup == sdp.SetupPassive {
@@ -332,13 +423,15 @@ func (s *Server) sessionHeaders(res *sip.Response, tag string, body []byte, inte
 }
 
 // sessionInterval is the session timer a request asks for and rcs-as
-// takes, zero for none, or the status that refuses it: 422 below
-// minSessionExpires. rcs-as never refreshes a session itself. A UAC that
-// supports the extension is the refresher, even when it asked rcs-as to be
-// (refresher=uas): the UAS may choose (RFC 4028 §9), and its 2xx says
-// refresher=uac. A UAC that does not support it would leave refreshing to
-// rcs-as: rcs-as then takes no timer, as a UAS without the extension does,
-// and the session ends with its MSRP connection or a BYE.
+// takes, zero for none, or the status that refuses it. rcs-as never
+// refreshes a session itself. A UAC that supports the extension and lets
+// the UAS choose, or chooses itself, refreshes (RFC 4028 §9, Table 2), and
+// one asking for less than minSessionExpires gets 422. One that asks
+// rcs-as to refresh (refresher=uas), which the UAS cannot change, or that
+// does not support the extension, which leaves refreshing to the UAS,
+// gets no timer, as from a UAS without the extension, and no 422 either:
+// a UAC without the extension cannot act on one. Such a session ends with
+// its MSRP connection or a BYE.
 func sessionInterval(req *sip.Request) (time.Duration, int) {
 	if !req.Header.Has("Session-Expires") {
 		return 0, 0
@@ -347,15 +440,15 @@ func sessionInterval(req *sip.Request) (time.Duration, int) {
 	if err != nil {
 		return 0, 400
 	}
-	if se.Delta < minSessionExpires {
-		return 0, 422
-	}
 	supported, err := req.Header.Supported()
 	if err != nil {
 		return 0, 400
 	}
-	if !containsFold(supported, "timer") {
+	if !containsFold(supported, "timer") || se.Refresher() == "uas" {
 		return 0, 0
+	}
+	if se.Delta < minSessionExpires {
+		return 0, 422
 	}
 	return time.Duration(se.Delta) * time.Second, 0
 }
@@ -521,9 +614,12 @@ func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
 		s.cfg.Metrics.Count("sip.bye.received", 1)
 		// Ended before the 200 leaves, so that what the other side does
 		// next finds the session gone.
-		if ss.end() && ss.inv.Recipient != "" && directionRefusedBy(req) {
+		carried := ss.leg.Carried()
+		if ss.end() && ss.inv.Recipient != "" && !carried && directionRefusedBy(req) {
 			// The client answered passive and pcscf ended the session
-			// (ADR 0004): it takes no session from the network.
+			// before any MSRP traffic (ADR 0004): it takes no session
+			// from the network. A session that carried messages was
+			// served, whatever its BYE says.
 			s.engine.InviteFailed(ss.inv, messaging.ErrNoSessions)
 		}
 		s.respond(u, req, 200)
@@ -549,18 +645,26 @@ func directionRefusedBy(req *sip.Request) bool {
 	})
 }
 
-// refresh answers a re-INVITE or UPDATE in ss. One that keeps the MSRP
-// path refreshes the session timer; one that moves it is refused (488),
-// since a leg does not move. A re-INVITE without an offer would need one
-// from rcs-as in the 2xx (RFC 3261 §14.2), and is refused too; an UPDATE
-// without one is a plain refresh (RFC 3311 §5.2).
+// refresh answers a re-INVITE or UPDATE in ss. One whose offer keeps the
+// MSRP path refreshes the session timer; one that moves it is refused
+// (488), since a leg does not move. A re-INVITE without an offer gets the
+// session's last SDP as the offer in its 2xx, with the same o= version, as
+// nothing changed (RFC 3261 §14.2, RFC 3264 §8, RFC 4028 §7.4), and the
+// answer in its ACK must keep the path. An UPDATE without an offer is a
+// plain refresh, whose 2xx carries no SDP (RFC 3311 §5.2).
 func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
 	if bad := unsupported(req, "timer"); len(bad) > 0 {
 		s.refuseUnsupported(u, req, bad)
 		return
 	}
 	var body []byte
-	if len(req.Body) > 0 || req.Method == "INVITE" {
+	offerless := req.Method == "INVITE" && len(req.Body) == 0
+	switch {
+	case offerless:
+		ss.mu.Lock()
+		body = ss.sdp
+		ss.mu.Unlock()
+	case len(req.Body) > 0:
 		offer, i, path, code := msrpOffer(&req.Header, req.Body)
 		ss.mu.Lock()
 		moved := code == 0 && joinPath(path) != ss.remotePath
@@ -597,4 +701,31 @@ func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
 	}
 	s.cfg.Metrics.Count("sip.refresh.answered", 1)
 	ss.arm()
+	if offerless {
+		go ss.checkAnswer(u)
+	}
+}
+
+// checkAnswer takes the ACK of an offerless re-INVITE's 2xx, whose answer
+// must keep the session's MSRP path; a 2xx without its ACK, or an answer
+// that moves the leg, ends the session (RFC 3261 §13.3.1.4).
+func (ss *session) checkAnswer(u *proxy.UAS) {
+	ack, err := u.ACK(context.Background())
+	if err != nil {
+		ss.s.cfg.Metrics.Count("sip.session.no_ack", 1)
+		ss.bye("")
+		return
+	}
+	answer, err := sdpBody(&ack.Header, ack.Body)
+	if err != nil {
+		return // no answer: the session goes on as it was
+	}
+	_, path, _, err := firstMSRP(answer, sdp.SetupActive)
+	ss.mu.Lock()
+	moved := err != nil || joinPath(path) != ss.remotePath
+	ss.mu.Unlock()
+	if moved {
+		ss.s.cfg.Metrics.Count("sip.refresh.refused", 1)
+		ss.bye("")
+	}
 }

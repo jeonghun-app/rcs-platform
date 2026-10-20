@@ -57,9 +57,11 @@ type Config struct {
 	Core      sip.URI
 	Namespace string
 	// MaxSessions bounds the SIP sessions this task holds, and
-	// MaxSessionsPerUser those of one user (threat model T9).
+	// MaxOutgoingPerUser those one user opens, and MaxIncomingPerUser those
+	// rcs-as opens to one user (threat model T9).
 	MaxSessions        int
-	MaxSessionsPerUser int
+	MaxOutgoingPerUser int
+	MaxIncomingPerUser int
 	Store              string
 	DynamoDB           awsstore.Config
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
@@ -119,9 +121,11 @@ func Configure(s *runtime.Settings) Config {
 	}
 	c.SIPListenAddr = e.String("SIP_LISTEN_ADDR", DefaultSIPListenAddr)
 	c.MaxSessions = e.Int("MAX_SESSIONS", sipas.DefaultMaxSessions)
-	c.MaxSessionsPerUser = e.Int("MAX_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
+	c.MaxOutgoingPerUser = e.Int("MAX_OUTGOING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
 	positive(e, "MAX_SESSIONS", c.MaxSessions)
-	positive(e, "MAX_SESSIONS_PER_USER", c.MaxSessionsPerUser)
+	positive(e, "MAX_OUTGOING_SESSIONS_PER_USER", c.MaxOutgoingPerUser)
+	c.MaxIncomingPerUser = e.Int("MAX_INCOMING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
+	positive(e, "MAX_INCOMING_SESSIONS_PER_USER", c.MaxIncomingPerUser)
 	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
 		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
 	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {

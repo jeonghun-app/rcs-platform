@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -34,12 +35,20 @@ func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
 	if inv.Mode == store.Group {
 		return errGroupNotServed
 	}
-	s.mu.Lock()
-	err := s.roomFor(inv.Recipient)
-	s.mu.Unlock()
-	if err != nil {
+	ss := &session{s: s, user: inv.Recipient, mode: inv.Mode, inv: inv}
+	if err := s.reserve(ss); err != nil {
 		return fmt.Errorf("%w: %w", err, messaging.ErrOffline)
 	}
+	err := s.startInvite(ctx, ss)
+	if err != nil {
+		s.release(ss)
+	}
+	return err
+}
+
+// startInvite sends the INVITE of ss, which holds its place (reserve).
+func (s *Server) startInvite(ctx context.Context, ss *session) error {
+	inv := ss.inv
 	leg, err := s.engine.Offer(messaging.LegParams{
 		User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation, Mode: inv.Mode,
 		Direction: messaging.Terminating, QueueID: inv.QueueID,
@@ -47,7 +56,7 @@ func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
 	if err != nil {
 		return err
 	}
-	ss := &session{s: s, leg: leg, user: inv.Recipient, mode: inv.Mode, inv: inv}
+	ss.leg = leg
 	ss.origin = s.newOrigin(leg.Local().Host)
 	req, err := s.inviteRequest(ss)
 	if err != nil {
@@ -144,10 +153,19 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 			s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.%d", res.StatusCode), 1)
 			go ss.fail(pagerOutcome(res.StatusCode))
 		}
+	case ss.d == nil && ss.noDialog:
+		// A retransmission of the 2xx that set up no dialog: the engine
+		// heard of the invitation once already.
+		s.cfg.Metrics.Count("sip.invite.answer_ignored", 1)
+	case ss.d == nil && ss.final:
+		// A 2xx from another fork after the INVITE failed: it must be
+		// acknowledged and ended (RFC 3261 §13.2.2.4).
+		go s.dropFork(req, res, ss.firstDrop(res))
 	case ss.d == nil:
 		ss.final = true
 		d, err := dialog.UAC(req, res)
 		if err != nil {
+			ss.noDialog = true
 			// Without a dialog there is no ACK to send; the client's
 			// UAS gives up on its 2xx and ends the session.
 			s.cfg.Metrics.Count("sip.invite.no_dialog", 1)
@@ -166,12 +184,13 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 		ack, next := ss.ack, ss.d.NextHop()
 		go s.sendACK(ack, next)
 	default:
-		go s.dropFork(req, res)
+		go s.dropFork(req, res, ss.firstDrop(res))
 	}
 }
 
 // fail ends a session that did not come about, and tells the engine.
 func (ss *session) fail(err error) {
+	ss.s.release(ss)
 	ss.s.engine.InviteFailed(ss.inv, err)
 	ss.end()
 }
@@ -207,6 +226,14 @@ func (s *Server) established(ss *session, res *sip.Response) {
 		return
 	}
 	err := perr
+	ss.mu.Lock()
+	ended := ss.ended
+	ss.mu.Unlock()
+	if ended {
+		// A BYE ended the session meanwhile, and told the engine what
+		// it had to (inDialog): nothing more reaches it.
+		return
+	}
 	if err == nil {
 		err = ss.leg.Answer(path)
 	}
@@ -221,9 +248,33 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	ss.watch(nil)
 }
 
+// firstDrop reports whether res is the first 2xx of the fork it comes
+// from that rcs-as drops; its retransmissions are acknowledged again, and
+// the fork's dialog is ended once. It needs ss.mu.
+func (ss *session) firstDrop(res *sip.Response) bool {
+	to, err := res.Header.To()
+	if err != nil {
+		return false
+	}
+	tag := strings.ToLower(to.Tag())
+	if ss.dropped == nil {
+		ss.dropped = map[string]bool{}
+	}
+	if ss.dropped[tag] || len(ss.dropped) >= maxDroppedForks {
+		return false
+	}
+	ss.dropped[tag] = true
+	return true
+}
+
+// maxDroppedForks bounds the forks a session remembers ending; a fork
+// past it is acknowledged and not ended, as its UAS gives up on its own.
+const maxDroppedForks = 16
+
 // dropFork acknowledges a 2xx from a fork other than the one that set up
-// the session, and ends that dialog with a BYE (RFC 3261 §13.2.2.4).
-func (s *Server) dropFork(req *sip.Request, res *sip.Response) {
+// the session and, when bye says so, ends that dialog with a BYE (RFC 3261
+// §13.2.2.4).
+func (s *Server) dropFork(req *sip.Request, res *sip.Response, bye bool) {
 	d, err := dialog.UAC(req, res)
 	if err != nil {
 		return
@@ -233,23 +284,28 @@ func (s *Server) dropFork(req *sip.Request, res *sip.Response) {
 		return
 	}
 	s.sendACK(ack, d.NextHop())
-	bye, err := d.Request("BYE", s.ids)
+	if !bye {
+		return
+	}
+	r, err := d.Request("BYE", s.ids)
 	if err != nil {
 		return
 	}
 	s.cfg.Metrics.Count("sip.invite.fork_dropped", 1)
-	s.sendInDialog(bye, d.NextHop())
+	s.sendInDialog(r, d.NextHop())
 }
 
 // answeredInterval is the session timer of a 2xx, zero for none. rcs-as
-// does not offer the extension, so the client refreshes (RFC 4028 §9), and
-// rcs-as only ends a session left unrefreshed.
+// does not offer the extension, so the client refreshes (refresher=uas,
+// RFC 4028 §9), and rcs-as only ends a session left unrefreshed. A 2xx
+// that names rcs-as the refresher anyway (refresher=uac) gets no timer:
+// rcs-as never refreshes, and would only end the session it was to keep.
 func answeredInterval(res *sip.Response) time.Duration {
 	if !res.Header.Has("Session-Expires") {
 		return 0
 	}
 	se, err := res.Header.SessionExpires()
-	if err != nil || se.Delta == 0 {
+	if err != nil || se.Delta == 0 || se.Refresher() == "uac" {
 		return 0
 	}
 	return time.Duration(se.Delta) * time.Second

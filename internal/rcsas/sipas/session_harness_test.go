@@ -19,6 +19,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // chatRig is rcs-as with the real engine, on the memory store, and its
@@ -64,6 +65,12 @@ func newChatRig(t *testing.T, mc messaging.Config, tune ...func(*proxy.Config)) 
 // MaxMessageSize it sets.
 func newChatRigWith(t *testing.T, mc messaging.Config, cfg Config, tune ...func(*proxy.Config)) *chatRig {
 	t.Helper()
+	return newChatRigOn(t, mc, cfg, transport.Config{}, tune...)
+}
+
+// newChatRigOn is newChatRigWith on a transport configured by tc.
+func newChatRigOn(t *testing.T, mc messaging.Config, cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *chatRig {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -79,8 +86,13 @@ func newChatRigWith(t *testing.T, mc messaging.Config, cfg Config, tune ...func(
 	}
 	r.e = &recordingEngine{Engine: e, failed: make(chan error, 16)}
 	r.metrics = &counter{n: map[string]int64{}}
+	if cfg.closeWait == 0 {
+		// Most fake cores leave a BYE unanswered: the test's end need not
+		// wait the 2 s Close gives a real one.
+		cfg.closeWait = 50 * time.Millisecond
+	}
 	cfg.Core, cfg.Clock, cfg.MaxMessageSize, cfg.Metrics = r.core.uri(), r.clock, messaging.DefaultMaxMessageSize, r.metrics
-	a = startASWith(t, r.e, cfg, tune...)
+	a = startASOn(t, r.e, cfg, tc, tune...)
 	r.a = a
 	// Closed before the Server's BYEs and the transport, which carries the
 	// answers to the deliveries it waits for.

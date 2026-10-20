@@ -3,10 +3,13 @@ package sipas
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
+	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/dialog"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -30,7 +33,7 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	switch {
 	case names(req, "oma.cpm.largemsg"):
 		mode = store.Standalone
-	case names(req, "oma.cpm.session"):
+	case names(req, "oma.cpm.session"), names(req, omaIMTag):
 		mode = store.Chat
 	default:
 		s.cfg.Metrics.Count("sip.invite.service_refused", 1)
@@ -58,9 +61,11 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, code)
 		return
 	}
-	// A group chat's INVITE has a resource list beside its SDP, which
-	// msrpOffer does not take: group sessions are not served yet.
-	offer, i, path, code := msrpOffer(&req.Header, req.Body)
+	// A chat INVITE may carry the chat's first message beside its SDP; a
+	// group chat's has a resource list, which inviteBody does not take:
+	// group sessions are not served yet. Large mode carries its message
+	// in the session only.
+	offer, i, path, first, code := inviteOffer(&req.Header, req.Body, mode)
 	if code != 0 {
 		s.cfg.Metrics.Count("sip.invite.offer_refused", 1)
 		s.respond(u, req, code)
@@ -99,6 +104,25 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		_ = leg.Close()
 		return
 	}
+	if first != nil {
+		// The first message goes in as the session's would, stored
+		// before the 2xx; one the engine refuses fails the INVITE with
+		// the status a pager MESSAGE would get, and no session is left.
+		code, busy := s.submit(ctx, messaging.Origin{
+			Sender: sender, Identities: identities, Recipient: peer, Conversation: conv,
+			Mode: store.Chat, CPIM: first,
+		})
+		s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.first_message.%d", code), 1)
+		if code != 202 {
+			_ = leg.Close()
+			if busy {
+				s.respondRetry(u, req, code)
+			} else {
+				s.respond(u, req, code)
+			}
+			return
+		}
+	}
 	// Known before the 2xx leaves, so that a BYE right behind its ACK
 	// finds the session.
 	if err := s.addSession(ss); err != nil {
@@ -124,6 +148,27 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	ss.arm()
 	go ss.watch(u)
 }
+
+// inviteOffer reads a client's INVITE body (inviteBody): the MSRP offer as
+// msrpOffer does, and a first message, which only a chat INVITE carries;
+// or 488.
+func inviteOffer(h *sip.Header, body []byte, mode store.Mode) (*sdp.Session, int, []msrp.URI, []byte, int) {
+	desc, first, err := inviteBody(h, body)
+	if err != nil || first != nil && mode != store.Chat {
+		return nil, 0, nil, nil, 488
+	}
+	offer, err := sdp.Parse(desc)
+	if err != nil {
+		return nil, 0, nil, nil, 488
+	}
+	offer, i, path, code := msrpOfferIn(offer)
+	return offer, i, path, first, code
+}
+
+// omaIMTag is the OMA SIMPLE IM feature tag, with which rcsjta, the
+// reference client, asks for a 1-to-1 chat (ChatUtils) instead of the CPM
+// chat ICSI.
+const omaIMTag = "+g.oma.sip-im"
 
 // names reports whether req asks for the service whose ICSI ends in icsi:
 // in a feature tag of Accept-Contact or in a service header. Contact is

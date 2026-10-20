@@ -253,6 +253,10 @@ func (s *Session) waitRemote(ctx context.Context) error {
 // Done is closed when the session has ended.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
+// Bound is closed once the session is bound to a connection: the peer's
+// connection named it, or Conn.Open bound it.
+func (s *Session) Bound() <-chan struct{} { return s.bound }
+
 // Err returns why the session ended, or nil while it is open.
 func (s *Session) Err() error {
 	s.mu.Lock()

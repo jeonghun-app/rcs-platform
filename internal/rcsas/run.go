@@ -93,7 +93,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	srv, err := sipas.New(sipas.Config{
 		Core: cfg.Core, Host: cfg.SIPHost.String(), HomeDomain: cfg.HomeDomain, Contact: self, Listener: sipListener,
 		Resolver: resolver, MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions,
-		MaxSessionsPerUser: cfg.MaxSessionsPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
+		MaxOutgoingPerUser: cfg.MaxOutgoingPerUser, MaxIncomingPerUser: cfg.MaxIncomingPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
 	})
 	if err != nil {
 		return err
