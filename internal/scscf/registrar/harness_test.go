@@ -487,7 +487,7 @@ func seed(t *testing.T, e *env, impi string, set []string, change func(*state.Re
 	}
 	saved := must(e.store.SaveRegistration(bg, r))(t)
 	for _, impu := range set {
-		must(e.store.SaveIdentity(bg, &state.Identity{IMPU: impu, Set: r.Key, Incarnation: 77, KeepUntil: seedKeep(e, r)}))(t)
+		must(e.store.SaveIdentity(bg, &state.Identity{IMPU: impu, Set: r.Key, Incarnation: 77, KeepUntil: seedKeep(e, r)}, e.clock.Now()))(t)
 	}
 	return saved
 }

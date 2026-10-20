@@ -114,8 +114,13 @@ type Registration struct {
 	// Key is the private identity and the set's default public identity.
 	Key SetKey
 	// Incarnation is drawn when the record is created and kept by every save
-	// of it: the identities that point at the set name it, so that one
-	// pointing at an earlier record of the same key is told apart.
+	// of it but one: the identities that point at the set name it, so that
+	// one pointing at an earlier record of the same key is told apart. A save
+	// that brings back a record claimed for a deregistration (Deregistering
+	// set, and zero in the save) must draw a new one, or the deregistration,
+	// which deletes the identities naming the incarnation it claimed, would
+	// delete those of the registration that took the record over. Both
+	// backends refuse such a save that keeps it (ErrInvalid).
 	Incarnation int64
 	// Identities are the set's public identities, in canonical form, in the
 	// order of its User-Data; Key.IMPU is one of them.
@@ -137,9 +142,11 @@ type Registration struct {
 	Unregistered time.Time
 	// Reassert is set on a live registration whose assignment the HSS may
 	// have lost: a deregistration's SAR crossed a REGISTER's, and telling the
-	// HSS again (SAR REGISTRATION) failed. It is when a sweep tries again;
-	// ReassertAttempts counts the failures, so that the sweep backs off and
-	// gives up.
+	// HSS again (SAR REGISTRATION) failed. It is when a sweep hands the
+	// registration to its handler again (SweepRegistrations), which owns the
+	// retry: it clears both fields once the HSS has taken the SAR, and
+	// otherwise counts the failure in ReassertAttempts and moves Reassert on,
+	// backing off and giving up by MaxReassertAttempts at the latest.
 	Reassert         time.Time
 	ReassertAttempts int
 	// Version is the stored version, 0 before the first save. Saves are
@@ -390,11 +397,15 @@ type Registrations interface {
 	// or its KeepUntil has come at now.
 	Identity(ctx context.Context, impu string, now time.Time) (*Identity, error)
 	// SaveIdentity and DeleteIdentity are as SaveRegistration and
-	// DeleteRegistration, for an identity.
-	SaveIdentity(ctx context.Context, i *Identity) (*Identity, error)
+	// DeleteRegistration, for an identity. A create (Version 0) also
+	// replaces an item whose KeepUntil has come at now, which Identity no
+	// longer returns and so no caller could name by its version.
+	SaveIdentity(ctx context.Context, i *Identity, now time.Time) (*Identity, error)
 	DeleteIdentity(ctx context.Context, i *Identity) error
 	// KeepIdentity is KeepProfile for an identity: it moves KeepUntil to
-	// until if later, and leaves the version alone.
+	// until if later. A move changes the version, so that a save from an
+	// earlier read gets ErrConflict and reads again rather than bringing
+	// KeepUntil back.
 	KeepIdentity(ctx context.Context, impu string, until, now time.Time) error
 	// ExpiringRegistrations returns up to limit registrations whose SweepAt
 	// has come at now, for SweepRegistrations.

@@ -62,6 +62,9 @@ func (d *Dynamo) registrationItem(r *state.Registration, version int64) (map[str
 		// instance left empty.
 		attrExpires: num(sweepAt),
 	}
+	if !r.Deregistering.IsZero() {
+		item[attrLeased] = num(r.Incarnation)
+	}
 	return item, checkSize(item, "registration")
 }
 
@@ -116,12 +119,48 @@ func (d *Dynamo) SaveRegistration(ctx context.Context, r *state.Registration) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := d.putVersioned(ctx, d.registrations, setPK(r.Key), r.Version, item, "save registration"); err != nil {
+	if r.Version != 0 && r.Deregistering.IsZero() {
+		err = d.putRevival(ctx, r, item)
+	} else {
+		err = d.putVersioned(ctx, d.registrations, setPK(r.Key), r.Version, item, "save registration")
+	}
+	if err != nil {
 		return nil, err
 	}
 	saved := r.Clone()
 	saved.Version = version
 	return saved, nil
+}
+
+// putRevival is putVersioned for a save of r that may bring back a record
+// claimed for a deregistration: the stored item's leased attribute, present
+// while it is claimed, must not hold r's incarnation
+// (state.Registration.Incarnation). A refusal for that reason, rather than
+// the version, is ErrInvalid.
+func (d *Dynamo) putRevival(ctx context.Context, r *state.Registration, item map[string]types.AttributeValue) error {
+	pk := setPK(r.Key)
+	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                 aws.String(d.registrations),
+		Item:                      item,
+		ConditionExpression:       aws.String("#v = :v AND (attribute_not_exists(#leased) OR #leased <> :inc)"),
+		ExpressionAttributeNames:  map[string]string{"#v": attrVersion, "#leased": attrLeased},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": num(r.Version), ":inc": num(r.Incarnation)},
+	})
+	switch {
+	case ccf(err):
+	case err != nil:
+		return sanitize("save registration", err)
+	default:
+		return nil
+	}
+	err = d.explain(ctx, d.registrations, key(pk), item, false, "save registration")
+	if !errors.Is(err, state.ErrConflict) {
+		return err
+	}
+	if cur, gerr := d.get(ctx, d.registrations, key(pk), "save registration"); gerr == nil && sv(cur[attrVersion]) == sv(num(r.Version)) {
+		return fmt.Errorf("%w: a record brought back from a deregistration needs a new incarnation", state.ErrInvalid)
+	}
+	return err
 }
 
 // DeleteRegistration implements state.Registrations.
@@ -174,7 +213,7 @@ func (d *Dynamo) Identity(ctx context.Context, impu string, now time.Time) (*sta
 // SaveIdentity implements state.Registrations. An identity item has no index
 // attribute, so no listing or sweep sees it, and its ttl is the table's TTL
 // attribute, as a profile's is.
-func (d *Dynamo) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
+func (d *Dynamo) SaveIdentity(ctx context.Context, i *state.Identity, now time.Time) (*state.Identity, error) {
 	if err := i.Validate(); err != nil {
 		return nil, err
 	}
@@ -190,7 +229,10 @@ func (d *Dynamo) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Id
 		attrPK: str(i.IMPU), attrVersion: num(version), attrDoc: bin(doc), attrWriter: str(d.token()),
 		attrTTL: num(i.KeepUntil.Unix()),
 	}
-	if err := d.putVersioned(ctx, d.registrations, i.IMPU, i.Version, item, "save identity"); err != nil {
+	// A create replaces an item whose ttl has come, as Identity no longer
+	// returns it (state.Registrations).
+	expired := now.Unix()
+	if err := d.putVersionedOver(ctx, d.registrations, i.IMPU, i.Version, item, "save identity", &expired); err != nil {
 		return nil, err
 	}
 	saved := *i
@@ -204,7 +246,7 @@ func (d *Dynamo) KeepIdentity(ctx context.Context, impu string, until, now time.
 	if !possibleIdentity(impu) {
 		return fmt.Errorf("dynamostore: keep identity: %w", state.ErrNotFound)
 	}
-	return d.keep(ctx, key(impu), until, now, "keep identity", func() (time.Time, error) {
+	return d.keep(ctx, key(impu), until, now, true, "keep identity", func() (time.Time, error) {
 		i, err := d.Identity(ctx, impu, now)
 		if err != nil {
 			return time.Time{}, err
@@ -344,7 +386,7 @@ func (d *Dynamo) KeepProfile(ctx context.Context, k state.SetKey, until, now tim
 	if !possibleSet(k) {
 		return fmt.Errorf("dynamostore: keep profile: %w", state.ErrNotFound)
 	}
-	return d.keep(ctx, profileKey(k), until, now, "keep profile", func() (time.Time, error) {
+	return d.keep(ctx, profileKey(k), until, now, false, "keep profile", func() (time.Time, error) {
 		p, err := d.Profile(ctx, k, now)
 		if err != nil {
 			return time.Time{}, err
@@ -353,20 +395,29 @@ func (d *Dynamo) KeepProfile(ctx context.Context, k state.SetKey, until, now tim
 	})
 }
 
-// keep moves an item's ttl to until with an UpdateItem of ttl alone,
-// conditional on the item being there, alive at now, and ttl moving later. A
-// resend, or an item already kept as long, fails the condition and is read
-// back (current); one that a save replaced with an earlier ttl meanwhile gets
-// a second attempt, and if that is overtaken too, the save stands.
-func (d *Dynamo) keep(ctx context.Context, k map[string]types.AttributeValue, until, now time.Time, op string, current func() (time.Time, error)) error {
+// keep moves an item's ttl to until with an UpdateItem of ttl alone, and of
+// the version if versioned, conditional on the item being there, alive at
+// now, and ttl moving later. A resend, or an item already kept as long, fails
+// the condition and is read back (current); one that a save replaced with an
+// earlier ttl meanwhile gets a second attempt, and if that is overtaken too,
+// the save stands.
+func (d *Dynamo) keep(ctx context.Context, k map[string]types.AttributeValue, until, now time.Time, versioned bool, op string, current func() (time.Time, error)) error {
+	update := "SET #ttl = :until"
+	names := map[string]string{"#pk": attrPK, "#ttl": attrTTL}
+	values := map[string]types.AttributeValue{":now": num(now.Unix()), ":until": num(until.Unix())}
+	if versioned {
+		update += ", #v = #v + :one"
+		names["#v"] = attrVersion
+		values[":one"] = num(1)
+	}
 	for range 2 {
 		_, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(d.registrations),
 			Key:                       k,
-			UpdateExpression:          aws.String("SET #ttl = :until"),
+			UpdateExpression:          aws.String(update),
 			ConditionExpression:       aws.String("attribute_exists(#pk) AND #ttl > :now AND #ttl < :until"),
-			ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrTTL},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":until": num(until.Unix()), ":now": num(now.Unix())},
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
 		})
 		switch {
 		case err == nil:

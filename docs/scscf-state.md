@@ -30,7 +30,10 @@ additionally sealed (below).
   and deletes it afterwards. A REGISTER that finds a registration without
   contacts, leased or not, is handled as an initial registration: SAR
   REGISTRATION, and a save conditional on the version read, which makes the
-  sweep's later delete fail harmlessly (#14).
+  sweep's later delete fail harmlessly (#14). A record it takes over from a
+  lease gets a new incarnation, which both backends require: the sweep
+  deletes only the identity items naming the incarnation it claimed, so the
+  ones the REGISTER points at the record stay.
 - **Unregistered users.** A terminating request to an IMPU without a
   registration sends SAR UNREGISTERED_USER, then stores a record without
   contacts whose `Unregistered` is when that state ends (now plus

@@ -45,9 +45,9 @@ func (s *sweepStore) Identity(ctx context.Context, impu string, now time.Time) (
 	s.step("Identity")
 	return s.Store.Identity(ctx, impu, now)
 }
-func (s *sweepStore) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
+func (s *sweepStore) SaveIdentity(ctx context.Context, i *state.Identity, now time.Time) (*state.Identity, error) {
 	s.step("SaveIdentity")
-	return s.Store.SaveIdentity(ctx, i)
+	return s.Store.SaveIdentity(ctx, i, now)
 }
 func (s *sweepStore) DeleteIdentity(ctx context.Context, i *state.Identity) error {
 	s.step("DeleteIdentity")

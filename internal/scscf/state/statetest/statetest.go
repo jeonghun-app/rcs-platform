@@ -101,6 +101,10 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"NoClientCanTakeAnAttemptCount", testAttemptCountNotAChallenge},
 		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
 		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
+		{"ASaveFromBeforeAKeepIdentityCannotUndoIt", testIdentityKeepNeverUndone},
+		{"ARecordBroughtBackFromADeregistrationTakesANewIncarnation", testReviveTakesANewIncarnation},
+		{"AReassertGoesWithItsSetsLastBinding", testReassertGoesWithTheSet},
+		{"ARefusedSaveDoesNotBringBackAGoneProfile", testRefusedSaveKeepsAGoneProfileGone},
 		{"ADeregistrationCutShortIsFinishedByTheNextSweep", testInterruptedDeregistration},
 	}
 	for _, tc := range tests {
