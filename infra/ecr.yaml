@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Container registries of the RCS platform (ADR 0003): the platform image, which
+  holds every service binary, and the pinned acs release image (ADR 0006). Kept
+  in a stack of its own so that tearing the platform down never deletes the
+  images its tasks may still need to start from.
+
+Parameters:
+  PlatformRepositoryName:
+    Type: String
+    Default: rcs-platform
+    AllowedPattern: '^[a-z0-9][a-z0-9._/-]*$'
+    Description: ECR repository of the platform image.
+
+  AcsRepositoryName:
+    Type: String
+    Default: rcs-platform-acs
+    AllowedPattern: '^[a-z0-9][a-z0-9._/-]*$'
+    Description: ECR repository of the acs image, built from a pinned release tag.
+
+  UntaggedImageExpiryDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: Days after which untagged images are removed.
+
+  MaxTaggedImages:
+    Type: Number
+    Default: 30
+    MinValue: 2
+    MaxValue: 1000
+    Description: >
+      Tagged images kept per repository. Rollback needs the previous image, so
+      keep comfortably more than the releases deployed between clean-ups.
+
+Resources:
+  PlatformRepository:
+    Type: AWS::ECR::Repository
+    # Retained on stack deletion: a running service may still need to restart
+    # from these images.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref PlatformRepositoryName
+      # Immutable tags: a deployed tag cannot be repointed under a running task
+      # definition, so a rollback to a tag gets exactly what ran before.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Rule 1 expires untagged images, such as the platform and attestation
+      # manifests under the acs release index. ECR never expires an image an
+      # index still refers to ("If an image is referenced by a manifest list,
+      # it cannot be expired ... without the manifest list being deleted
+      # first", ECR User Guide, lifecycle policy evaluation rules), so only
+      # orphans go. Rule 2 counts tagged images only, so MaxTaggedImages is
+      # the number of releases a rollback can reach.
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${UntaggedImageExpiryDays}
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep a bounded number of tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPatternList": ["*"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${MaxTaggedImages}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Application, Value: rcs-platform }
+
+  AcsRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref AcsRepositoryName
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${UntaggedImageExpiryDays}
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep a bounded number of tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPatternList": ["*"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${MaxTaggedImages}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Application, Value: rcs-platform }
+
+Outputs:
+  PlatformRepositoryUri:
+    Description: Where deploy.sh pushes the platform image.
+    Value: !GetAtt PlatformRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-PlatformRepositoryUri'
+  PlatformRepositoryArn:
+    Value: !GetAtt PlatformRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PlatformRepositoryArn'
+  AcsRepositoryUri:
+    Description: Where deploy.sh pushes the acs image.
+    Value: !GetAtt AcsRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-AcsRepositoryUri'
+  AcsRepositoryArn:
+    Value: !GetAtt AcsRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AcsRepositoryArn'
