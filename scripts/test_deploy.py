@@ -184,7 +184,11 @@ elif tool == "git":
     while args and args[0] in ("-C", "-c"):
         args = args[2:]
     if args[:2] == ["status", "--porcelain"]:
-        sys.stdout.write(state["dirty"])
+        # As git: hiding untracked files drops their "??" lines.
+        dirty = state["dirty"]
+        if any(a in ("-uno", "--untracked-files=no") for a in args[2:]):
+            dirty = "".join(l for l in dirty.splitlines(True) if not l.startswith("??"))
+        sys.stdout.write(dirty)
     elif args[:1] == ["describe"]:
         print(state["describe"])
 elif tool == "docker" and args[:1] == ["login"]:

@@ -27,10 +27,14 @@ The platform stack:
 
 - **Network.**
   - A VPC across two AZs, with public subnets (NLB, ALB, NAT) and private
-    subnets (tasks). One NAT gateway per AZ, or one in all.
+    subnets (tasks). One NAT gateway per AZ, one in all, or none
+    (`NatGateways`).
   - Gateway endpoints for DynamoDB and S3, and, with `InterfaceEndpoints`
     (on outside dev), interface endpoints for CloudWatch Logs, ECR, Secrets
-    Manager, KMS, Cloud Map (both APIs) and acs's SMS provider.
+    Manager, KMS, Cloud Map (both APIs) and acs's SMS provider. Each
+    endpoint has a policy: the gateway endpoints reach only this account's
+    tables and buckets (and ECR's layer bucket), the interface endpoints
+    serve only this account's principals.
   - The public subnets' network ACL, with rules 1 to 999 kept free for
     [blocking a source](runbook.md#blocking-a-source).
   - VPC Flow Logs in prod.
@@ -55,8 +59,9 @@ The platform stack:
   - DynamoDB tables `subscribers` and `service-profiles` (hss), `files`
     (ft-server), `msrp-bindings` (msrp-relay) and acs's table. All are on
     demand, with point-in-time recovery and deletion protection in prod.
-  - Ahead of their services, with their task roles: `messages` (rcs-as),
-    and `registrations`, `auth-challenges` and `reg-subscriptions` (scscf),
+  - Ahead of their services, with their task roles: `messages` and
+    `groupchats` (rcs-as), and `registrations`, `auth-challenges` and
+    `reg-subscriptions` (scscf),
     the last three under a key of their own (docs/scscf-state.md).
   - The files bucket.
   - The KMS keys of the HSS keyring, the S-CSCF state and the alarm topic.
@@ -76,7 +81,9 @@ The platform stack:
 - **pcscf, icscf, scscf and rcs-as.** Their security groups exist, and so do
   the tables and task roles of rcs-as and scscf. Their task definitions
   come with their pull requests. `PcscfEnabled`, `IcscfEnabled` and
-  `ScscfEnabled` add their listeners and alarms once they exist. pcscf's
+  `ScscfEnabled` add their listeners and alarms once they exist. Several of
+  those alarms watch metrics no service emits yet
+  ([runbook](runbook.md#conventions)). pcscf's
   task needs `PCSCF_PUBLIC_ADDRS`: the `NlbPublicAddresses` output. Until
   then no client can register.
 - **acs's SMPP provider.** It needs an egress rule to the operator's SMSC.
@@ -121,10 +128,21 @@ The platform stack:
   deploy.sh refuses a deployment above the quota. Check it (read-only), and
   request an increase in time:
   `aws service-quotas get-service-quota --service-code fargate --quota-code L-3032A538`.
+- **Elastic IP quota.** A first creation allocates one address per NAT
+  gateway and one per NLB subnet not given a retained allocation
+  (`NlbAllocationIdA/B`): four in prod. The default quota is 5 per region,
+  and addresses an earlier stack retained still count. deploy.sh refuses a
+  first creation above it (`--quota-code L-0263D0A3`, service code `ec2`).
+  Reuse the retained NLB addresses
+  ([runbook](runbook.md#keeping-the-nlb-addresses)) or release them first.
 - **A CloudTrail trail** recording management events in that region.
   Without it the security change rules see nothing.
 - **In prod, GuardDuty Runtime Monitoring for Fargate** (ADR 0007 §9). It is
-  configured per account, not by this template.
+  configured per account, not by this template. Its agent sends through the
+  `guardduty-data` endpoint GuardDuty creates, which the tasks' security
+  groups do not reach when the interface endpoints are on; until #278
+  gives it a path, check the coverage after the first deployment
+  (`aws guardduty list-coverage`, read-only) and expect it unhealthy.
 - **Outside dev:**
   - ACM certificates in the region: `AlbCertificateArn` covering `FtHostName`
     and `AcsHostName`, and `NlbCertificateArn` covering `RelayPublicHost` and,
@@ -152,7 +170,10 @@ scripts/deploy.sh --config ~/rcs-dev.params          # needs approval
    stack is in a state CloudFormation cannot update, that the Fargate vCPU
    quota fits a rolling update, and, before a first creation, that no name
    the stack would take (tables, secrets, log groups, repositories) is
-   still held by an earlier stack's retained resources.
+   still held by an earlier stack's retained resources and that the Elastic
+   IPs fit the quota. Before an update, it warns when the stack runs the
+   template of another commit (`TemplateRevision`), which this run would
+   replace.
 4. Deploys the registry stack through a change set (below).
 5. Builds the platform image (`make image`) and pushes it, unless ECR
    already holds that tag. Tags are immutable.
@@ -164,8 +185,9 @@ scripts/deploy.sh --config ~/rcs-dev.params          # needs approval
    larger than CloudFormation takes inline) and deploys the platform stack
    through a change set. It passes **every** parameter explicitly: those it
    sets itself (the images by tag and digest, the S3 and DynamoDB prefix
-   lists, the deploying principal, `TemplateRevision`, and `PreviousImageTag`,
-   the image the stack ran before) and everything else from the config.
+   lists, the deploying principal, `TemplateRevision`, `PreviousImageTag`
+   (the image the stack ran before), and the addresses of the NLB
+   allocations the config names) and everything else from the config.
    Nothing silently takes a template default or the previous value.
 8. Prints the stack's outputs and the rollback command.
 
@@ -179,15 +201,25 @@ registry stack is `<name>-ecr`, and the repositories are `<name>` and
 ### Change sets
 
 Each stack changes through a change set. deploy.sh prints every resource it
-adds, modifies or removes, and marks with `!!` those CloudFormation removes
-or **replaces**. A replaced table, key or bucket starts empty, since the
-originals are retained, not moved. A replaced load balancer or namespace
-gets a new address. Changing `VpcCidr` or `ServiceNamespace` replaces almost
-everything. deploy.sh then asks for the stack name before it runs the
-change set.
+adds, modifies or removes. It marks with `!!` the resources that hold data
+or an address (tables, keys, buckets, secrets, log groups, repositories,
+load balancers, the VPC and its subnets, Elastic IPs, NAT gateways and the
+namespace) that CloudFormation removes or **replaces**. A replaced table,
+key or bucket starts empty, since the originals are retained, not moved. A
+replaced load balancer or namespace gets a new address. Changing `VpcCidr`
+or `ServiceNamespace` replaces almost everything. Other replacements, such
+as the task definitions every image deployment registers, are listed
+without a mark. deploy.sh then asks for the stack name before it runs the
+change set, or for `replace <stack>` when anything is marked.
+
+The NLB itself cannot be replaced while it holds the fixed addresses:
+CloudFormation creates the new one first, and the addresses are still
+taken, so such a change set fails. Change what forces the replacement
+(its name, scheme or type) only with a planned address change.
 
 - `--plan` prints the change sets and deletes them without running them.
-  The images are pushed. A first creation leaves an empty stack in
+  It builds and pushes nothing: an image tag not yet in ECR is planned with
+  a placeholder digest. A first creation leaves an empty stack in
   `REVIEW_IN_PROGRESS`, which the next run creates afresh.
 - `--yes` runs them without asking, for CI. Without it and without a
   terminal, deploy.sh refuses.
@@ -221,14 +253,15 @@ step with the template.
 |---|---|---|
 | `Environment` | `prod` | `RCS_ENV` of every service. `staging` and `prod` refuse unsafe settings and need both certificates, the three host names, a real SMS provider, the interface endpoints and (prod) two tasks of every service |
 | `VpcCidr` | `10.30.0.0/16` | A /16 of RFC 1918 space (10/8, 172.16/12 or 192.168/16); anything else is refused, because the services dial internal hosts only at private addresses. The subnets are its first four /20s |
-| `NatGateways` | `per-az` | `single` saves one gateway, but makes one AZ's outage cut the other's egress |
+| `NatGateways` | `per-az` | `single` saves one gateway, but makes one AZ's outage cut the other's egress. `none` needs the interface endpoints (a Rule refuses it otherwise): with them on, no security group sends to the internet, so the gateways carry nothing until acs's SMPP provider needs a path to an SMSC. Whether staging and prod use `none` is decided after the first verification deployment |
+| `NlbAllocationIdA`, `NlbAllocationIdB` | empty | Elastic IPs to give the NLB, such as those an earlier stack retained ([runbook](runbook.md#keeping-the-nlb-addresses)). Empty allocates new ones. The two must differ |
 | `InterfaceEndpoints` | `auto` | `auto` is on outside dev and off in dev. Off sends AWS API calls through NAT and gives every group HTTPS to the internet: a dev-only deviation |
 | `ServiceNamespace` | `rcs.local` | The Cloud Map namespace. Internal plain HTTP is allowed only to names in it (ADR 0007 §5) |
 | `PublicIngressCidr` | `0.0.0.0/0` | Who reaches the NLB and the ALB. Narrow it until real clients use the stack; narrowing it later shuts every client out |
 | `AlbCertificateArn`, `NlbCertificateArn` | empty | Empty means plain HTTP on the ALB and plain MSRP on the NLB, which only dev allows |
 | `FtHostName`, `AcsHostName`, `RelayPublicHost` | empty | The names clients use, which the certificates must cover. Empty (dev only) uses the load balancers' DNS names |
 | `FtDeregistrationDelay` | `300` | Seconds the ALB lets running uploads finish before an ft-server task stops |
-| `PcscfEnabled`, `IcscfEnabled`, `ScscfEnabled` | `false` | `true` once that service exists: its listeners (pcscf) and alarms |
+| `PcscfEnabled`, `IcscfEnabled`, `ScscfEnabled` | `false` | `true` once that service exists: its listeners (pcscf) and alarms. Set it only after that service's pull request has checked that the service emits the metric names its alarms watch |
 | `WafRateLimit`, `WafRateAction` | `10000`, `count` | Requests per client address per 5 minutes, and whether the WAF counts or blocks above it. Carrier-grade NAT puts thousands of handsets behind one address: measure first ([WafRateLimited](runbook.md#wafratelimited)) |
 | `ImsDomain`, `FtRealm` | required | The home domain (and IMS realm) and the FT realm. They must differ (ADR 0007 §8) |
 | `FtValidityDays` | `7` | `FT_VALIDITY`. The bucket's expiry follows from it |
@@ -248,8 +281,10 @@ step with the template.
 
 deploy.sh sets `EcrStackName`, `ImageTag`, `ImageDigest`, `AcsImageTag`,
 `AcsImageDigest`, `S3PrefixListId`, `DynamoDbPrefixListId`,
-`TemplateRevision`, `PreviousImageTag` and `DeployPrincipalArn`; the config
-may not.
+`TemplateRevision`, `PreviousImageTag`, `DeployPrincipalArn`,
+`NlbReusedAddressA` and `NlbReusedAddressB`; the config may not. The
+template's Rules refuse an allocation without its address or the other way
+round, which only a deployment outside deploy.sh could send.
 
 ### acs's header enrichment stays off
 
@@ -294,9 +329,10 @@ Costs that grow with use:
 - **CloudWatch Logs.** $0.76 per GB ingested and $0.0314 per GB-month
   stored, for the services, the VPC Flow Logs (prod), the WAF logs (one line
   per request) and Container Insights' performance logs.
-- **NAT data**, $0.059 per GB: with the interface endpoints, only what goes
-  to the internet (GHCR during a deployment runs from the workstation, not
-  the VPC); without them, image pulls and every AWS API call.
+- **NAT data**, $0.059 per GB: with the interface endpoints, nothing, since
+  no security group sends to the internet (GHCR during a deployment runs
+  from the workstation, not the VPC); without them, image pulls and every
+  AWS API call.
 - **Data between AZs** at $0.01 per GB each way: the NLB balances across
   zones, and tasks reach peers in the other AZ.
 - **S3** at $0.025 per GB-month for files, which expire after
@@ -308,7 +344,9 @@ Costs that grow with use:
   $1 per million, and KMS requests at $0.03 per 10,000 (the HSS makes one
   per task start).
 
-Cheaper choices outside prod: `NatGateways=single`, one task per service,
+With the interface endpoints on, `NatGateways=none` saves the gateways
+($86 in prod) and their two addresses ($7.30). Cheaper choices outside
+prod: `NatGateways=single`, one task per service,
 `InterfaceEndpoints=auto` (off in dev), `ContainerInsights=disabled`, and
 deleting dev stacks when not in use.
 
@@ -340,9 +378,11 @@ scripts/teardown.sh --stack-name rcs-dev             # needs approval; asks for 
 
 The script asks you to type the stack name, or takes `--confirm <name>`. It
 reads the template the stack was deployed with, turns off the load
-balancers' deletion protection (skipping those already gone), deletes the
-platform stack and waits. If the deletion fails, it turns the protection
-back on. `--with-registry` also empties the template bucket and deletes the
+balancers' deletion protection where it is on (skipping those already
+gone), deletes the platform stack and waits. If the deletion fails
+(`DELETE_FAILED`), it turns back on only the protection it turned off. If
+the waiter gives up while the deletion still runs, it changes nothing and
+says so. `--with-registry` also empties the template bucket and deletes the
 registry stack, after the platform stack.
 
 These are retained, still hold data and are still billed. The script lists
@@ -350,10 +390,10 @@ them with their names:
 
 | Resource | Why it is kept | To delete it |
 |---|---|---|
-| The nine DynamoDB tables | Subscriptions, the keyring item, files, bindings, acs data, messages, S-CSCF state | Turn off deletion protection (prod), then delete the table |
+| The ten DynamoDB tables | Subscriptions, the keyring item, files, bindings, acs data, messages, group chats, S-CSCF state | Turn off deletion protection (prod), then delete the table |
 | The files bucket | Users' files | Empty it, then delete it |
 | The HSS keyring and S-CSCF state KMS keys ($1 a month each) | The keyring item and the S-CSCF tables open only with them | Schedule its deletion (7 to 30 days); everything sealed under it is lost after that |
-| The NLB's two Elastic IPs ($3.65 a month each) | Clients cache the NLB's address | Release them |
+| The NLB's two Elastic IPs ($3.65 a month each) | Clients cache the NLB's address | Give them to the next stack ([runbook](runbook.md#keeping-the-nlb-addresses)), or release them |
 | The VPC flow log group (prod) | Audit | Delete the log group |
 | The ECR repositories (registry stack) | Images a stack may still start from | Delete the repository with its images |
 
@@ -367,6 +407,10 @@ A new stack of the same name cannot be created while these names are taken:
 
 deploy.sh checks these names before a first creation and lists those
 taken. Delete them, or deploy under another stack name.
+
+Elastic IPs the stack was given (`NlbAllocationIdA/B`) were never its own:
+the teardown lists them as kept as they were, neither released nor
+counted among the retained resources above.
 
 Dev stacks leave their keys behind at every teardown. Schedule their
 deletion with the shortest window when the data is not needed:
@@ -398,14 +442,19 @@ principal for the S-CSCF key.
   - `scripts/check_infra.py`, which checks:
     - the ADR 0007 matrix, egress held to the endpoints and prefix lists,
       and plain listeners in dev only;
+    - the endpoint policies, and the Rules that pair each NLB allocation
+      with its address;
     - load balancer ports, PPv2, and the WAF with its rate rule;
     - task hardening and images by digest;
     - table, bucket and topic encryption, and point-in-time recovery;
     - secrets through execution roles only, and only those injected;
-    - the readers of the bindings, messages and S-CSCF tables, scans,
-      `Resource: '*'` and `Not*` grants;
+    - the readers of the bindings, messages, group chats and S-CSCF
+      tables, scans, `Resource: '*'`, wildcard ARNs and `Not*` grants, and
+      it refuses an IAM statement it cannot read (a function other than
+      `Ref`, `GetAtt` and `Sub`, or an `If` inside an `If`);
     - who may use each key;
-    - every action each service's code calls (`infra/task-role-actions.yaml`);
+    - that each task role grants exactly the actions its service's code
+      calls (`infra/task-role-actions.yaml`);
     - hss's start timeout;
     - the alarm rules of docs/architecture.md §8, and a runbook section per
       alarm;

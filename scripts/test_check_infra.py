@@ -6,6 +6,7 @@ tools image (make infra-lint)."""
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import re
 import unittest
@@ -628,6 +629,20 @@ class StackAdditions(TemplateCase):
         t = self.changed(Wide={"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {
             "GroupId": {"Ref": "AcsSecurityGroup"}, "CidrIp": "0.0.0.0/0", "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443}})
         self.assertProblem(t, "AcsSecurityGroup: sends to 0.0.0.0/0 even with interface endpoints")
+
+    def test_the_dashboard_shows_throttles_of_every_table_and_task_counts(self):
+        body = json.loads(self.template["Resources"]["Dashboard"]["Properties"]["DashboardBody"]["Fn::Sub"])
+        lines = [m for w in body["widgets"] for m in w["properties"]["metrics"]]
+        reads = {m[3] for m in lines if m[:3] == ["AWS/DynamoDB", "ReadThrottleEvents", "TableName"]}
+        tables = {"${%s}" % name for name, r in self.template["Resources"].items()
+                  if r["Type"] == "AWS::DynamoDB::Table"}
+        self.assertEqual(reads, tables)
+        writes = [i for i, m in enumerate(lines) if m[:2] == [".", "WriteThrottleEvents"]]
+        self.assertEqual(len(writes), len(tables))
+        for i in writes:
+            self.assertEqual(lines[i - 1][1], "ReadThrottleEvents")
+        tasks = {m[5] for m in lines if m[:2] == ["ECS/ContainerInsights", "RunningTaskCount"]}
+        self.assertIn("hss", tasks)
 
     def test_registrations_expire_on_ttl_not_on_the_index_key(self):
         spec = self.template["Resources"]["RegistrationsTable"]["Properties"]["TimeToLiveSpecification"]

@@ -22,6 +22,14 @@ from incidents yet. After an incident, add what you learned to the section.
   documents: [ft-server](ft-server.md#metrics-and-logs), and
   `docs/msrp-relay.md` (Metrics) and `docs/hss.md` (Operations). acs writes
   to `RCS/<stack>/acs`.
+- Some alarms of the CSCFs watch metrics no service emits yet, and would
+  stay `INSUFFICIENT_DATA` or `OK` without proving anything:
+  `PcscfQueueUse`, `PcscfBudgetSheds`, `PcscfBudgetRefusals`,
+  `PcscfResponseFlowCloses`, the three `*TransactionsRejected` and
+  `*TransactionBytes`, and `ScscfIfcBudgetExceeded`. They exist only once
+  `PcscfEnabled`, `IcscfEnabled` or `ScscfEnabled` is set, which waits
+  until that service's pull request has checked the names
+  (aws-deployment.md, Parameters).
 - Logs are JSON lines in `/rcs/<stack>/<service>`. No log or metric holds an
   IMSI, MSISDN, token, key or message body. Do not paste values out of the
   tables or secrets into tickets or chat.
@@ -900,16 +908,31 @@ security.
 ### ServiceImpaired
 
 **Symptom.** ECS reports that a service cannot start tasks
-(`SERVICE_TASK_START_IMPAIRED`) or that a deployment failed and the circuit
-breaker rolled it back (`SERVICE_DEPLOYMENT_FAILED`). hss has no load
-balancer, so this is how its outage shows.
+(`SERVICE_TASK_START_IMPAIRED`), cannot place them
+(`SERVICE_TASK_PLACEMENT_FAILURE`), cannot configure them
+(`SERVICE_TASK_CONFIGURATION_FAILURE`), or that a deployment failed and the
+circuit breaker rolled it back (`SERVICE_DEPLOYMENT_FAILED`). hss has no
+load balancer, so this is how its outage shows.
 
-**Check.** The event names the service. Its events in `describe-services`
-say why: an image ECR no longer has, a secret it cannot read, a start-up
-the service refused (its log: a setting, the keyring).
+**Check.** The event names the service and, for the last three, the
+reason. Its events in `describe-services` say more: an image ECR no longer
+has, a secret it cannot read, a start-up the service refused (its log: a
+setting, the keyring).
 
 **Act.** Fix the cause; for a failed deployment, the old tasks still run.
-For hss's keyring refusal see [Keyring bootstrap](#keyring-bootstrap).
+
+- Placement: usually the Fargate vCPU quota, which a rolling update needs
+  one extra task of every service for. Check it (`aws service-quotas
+  get-service-quota --service-code fargate --quota-code L-3032A538`) and
+  request an increase, or lower a desired count in the config. A capacity
+  shortage in one AZ passes on its own.
+- Configuration: ECS could not apply what the task definition asks for,
+  most often a task or execution role it may not assume (its trust policy
+  names `ecs-tasks.amazonaws.com`) or a role, secret or log group changed
+  outside the stack. Look for drift ([Undoing a change made outside
+  CloudFormation](#undoing-a-change-made-outside-cloudformation)) and
+  deploy the stack's revision again.
+- hss's keyring refusal: see [Keyring bootstrap](#keyring-bootstrap).
 
 ### KmsKeyChanges
 
@@ -971,8 +994,8 @@ SMS, NAT data or a scaling loop.
 ### Rollback
 
 Roll forward with a fix when you can. When you cannot, deploy the previous
-image with the same config file. `--skip-build` builds nothing and changes
-nothing else:
+image with the same config file, from the commit the stack runs (below).
+`--skip-build` builds and pushes nothing:
 
 ```sh
 scripts/deploy.sh --config <your config> --stack-name "$STACK" --region "$REGION" \
@@ -1059,7 +1082,8 @@ aws cloudformation describe-stack-resource-drifts --region "$REGION" --stack-nam
   --query 'StackResourceDrifts[].[LogicalResourceId,StackResourceDriftStatus,PropertyDifferences]'
 # Security group rules the matrix does not have:
 aws ec2 describe-security-group-rules --region "$REGION" \
-  --filters Name=group-id,Values=<group id> --query 'SecurityGroupRules[].[IsEgress,IpProtocol,FromPort,CidrIpv4,ReferencedGroupInfo.GroupId]'
+  --filters Name=group-id,Values=<group id> \
+  --query 'SecurityGroupRules[].[IsEgress,IpProtocol,FromPort,ToPort,CidrIpv4,PrefixListId,ReferencedGroupInfo.GroupId]' --output text
 ```
 
 Then revert each difference by hand to the template's value (changes the
