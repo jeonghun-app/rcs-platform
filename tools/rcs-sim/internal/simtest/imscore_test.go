@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
@@ -97,8 +98,8 @@ func TestAnExpiredBindingEndsItsRegEventSubscription(t *testing.T) {
 	next()
 	core.Expire(impuA)
 	n := next()
-	c, ok := n.Info.Contact(impuA, ua.ContactURI().String())
-	if n.State != "terminated" || !ok || c.State != "terminated" || c.Event != "expired" {
+	c, ok := ownContact(t, n.Info, impuA, ua.ContactURI())
+	if n.State != "terminated" || !ok || c.Active() || c.Event != reginfo.Expired {
 		t.Fatalf("notification %+v, contact %+v", n, c)
 	}
 	if core.Registered(impuA) {
@@ -137,7 +138,7 @@ func TestAUserPhoneIMPUIsNotifiedOfItsRefresh(t *testing.T) {
 	}
 	if n := nextNotification(t, ctx, sub); n.Info == nil {
 		t.Fatalf("first notification %+v", n)
-	} else if c, ok := n.Info.Contact(impuA, ua.ContactURI().String()); !ok || c.State != "active" {
+	} else if c, ok := ownContact(t, n.Info, impuA, ua.ContactURI()); !ok || !c.Active() {
 		t.Fatalf("first notification %+v, contact %+v", n.Info, c)
 	}
 	if _, err := ua.Register(ctx); err != nil {
@@ -145,7 +146,7 @@ func TestAUserPhoneIMPUIsNotifiedOfItsRefresh(t *testing.T) {
 	}
 	if n := nextNotification(t, ctx, sub); n.Info == nil || n.Info.Version != 1 {
 		t.Fatalf("notification after the refresh %+v", n)
-	} else if c, ok := n.Info.Contact(impuA, ua.ContactURI().String()); !ok || c.State != "active" || c.Event != "refreshed" {
+	} else if c, ok := ownContact(t, n.Info, impuA, ua.ContactURI()); !ok || !c.Active() || c.Event != reginfo.Refreshed {
 		t.Fatalf("contact after the refresh %+v", c)
 	}
 }
@@ -166,8 +167,8 @@ func TestUnsubscribingWritesTheContactAsItStands(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := nextNotification(t, ctx, sub)
-	c, ok := n.Info.Contact(impuA, ua.ContactURI().String())
-	if n.State != "terminated" || n.Reason != "timeout" || !ok || c.State != "active" || c.Event != "registered" {
+	c, ok := ownContact(t, n.Info, impuA, ua.ContactURI())
+	if n.State != "terminated" || n.Reason != "timeout" || !ok || !c.Active() || c.Event != reginfo.Registered {
 		t.Fatalf("final notification %+v, contact %+v", n, c)
 	}
 }
@@ -282,4 +283,24 @@ func TestNotifiesGoOneAtATime(t *testing.T) {
 		_ = first.Respond(res)
 	}
 	n.next(t, ctx)
+}
+
+// ownContact is the contact at uri of impu's registration in info.
+func ownContact(t *testing.T, info *reginfo.Info, impu string, uri sip.URI) (reginfo.Contact, bool) {
+	t.Helper()
+	if info == nil {
+		return reginfo.Contact{}, false
+	}
+	u, err := sip.ParseURI(impu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, ok := info.ByAOR(u)
+	if !ok {
+		return reginfo.Contact{}, false
+	}
+	if cs := reg.ByURI(uri); len(cs) > 0 {
+		return cs[0], true
+	}
+	return reginfo.Contact{}, false
 }

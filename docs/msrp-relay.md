@@ -290,6 +290,18 @@ What a client can make one task hold, and what happens at each bound:
 \* On a connection that already carries a bridge, only the new session is
 refused, with 481, and the connection stays (see below).
 
+A client that half-closes its side still reads: what is already queued for
+it, the answers to the requests it completed included, is written first,
+for up to the same 2 s, and only then is the connection closed (#240). That
+holds when it stops inside a request too, which ends as a framing error.
+Once the relay has read the end of the client's stream, the end is the
+client's whatever fails meanwhile (`EOF`, or the framing error), even if the
+writes then meet a reset because the client closed altogether. If the reset
+comes before the end of the stream is read, the connection ends with the
+reset instead. Either way the event, and so the `Closed` metric, is
+`PeerGone`. Only client connections wait; the relay's connections toward
+rcs-as, which carry new sessions, close at once.
+
 Choices worth knowing:
 
 - **Overload and store failures close the connection rather than answer.**

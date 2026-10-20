@@ -338,11 +338,13 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 // header the client wrote, or the status that refuses the request: 403. It
 // takes what pcscf asserts (#208): one identity, or a SIP identity and a
 // tel URI of the same registration, which are one user (#16 decision 5).
-// So at most one of each scheme, and only a SIP identity at the home domain
-// whose user part is a number (a home-domain number, messaging.UserOf) must
-// be that tel URI's number; any other SIP identity, a name or a number at
-// another host, pairs with the tel URI as pcscf found it. The user is the
-// tel URI when one is asserted, and the SIP identity's UserOf otherwise.
+// So at most one of each scheme, and a SIP identity whose user part is a
+// telephone number, at any host, with user=phone or without a user
+// parameter, must be that tel URI's number: otherwise the client could
+// name itself, in a CPIM From or a notification, by a number it does not
+// hold (QA on #242, T10). A name, or a user=ip identity, pairs with the
+// tel URI as pcscf found it. The user is the tel URI when one is asserted,
+// and the SIP identity's UserOf otherwise.
 // Each identity as asserted is one the sender may name itself by, as is any
 // other form of it (the engine compares them with UserOf).
 func (s *Server) asserted(req *sip.Request) (string, []string, int) {
@@ -350,8 +352,7 @@ func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 	if err != nil || len(pai) == 0 || len(pai) > 2 {
 		return s.refuseAsserted()
 	}
-	var sipUser, telUser string
-	homeNumber := false
+	var sipUser, telUser, sipNumber string
 	var identities []string
 	for _, a := range pai {
 		raw := a.URI.String()
@@ -369,18 +370,31 @@ func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 			if sipUser != "" {
 				return s.refuseAsserted()
 			}
-			sipUser = user
-			homeNumber = strings.EqualFold(a.URI.Host, s.cfg.HomeDomain) && strings.HasPrefix(user, "tel:")
+			sipUser, sipNumber = user, numberOf(a.URI)
 		}
 		identities = append(identities, raw)
 	}
 	if telUser == "" {
 		return sipUser, identities, 0
 	}
-	if homeNumber && sipUser != telUser {
+	if sipNumber != "" && sipNumber != telUser {
 		return s.refuseAsserted()
 	}
 	return telUser, identities, 0
+}
+
+// numberOf is the tel URI of the number a SIP URI's user part is, at any
+// host: with user=phone (RFC 3261 §19.1.6) or with no user parameter; empty
+// for a name or a user parameter other than phone.
+func numberOf(u sip.URI) string {
+	if !u.Params.Has("user") {
+		u.Params = slices.Clone(u.Params)
+		u.Params.Set("user", "phone")
+	}
+	if e164, ok := u.E164(); ok {
+		return "tel:" + e164
+	}
+	return ""
 }
 
 func (s *Server) refuseAsserted() (string, []string, int) {

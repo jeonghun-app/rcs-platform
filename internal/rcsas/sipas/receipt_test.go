@@ -129,11 +129,11 @@ func TestANonNumericSIPIdentityAndItsTelURIAreOneUser(t *testing.T) {
 	}
 }
 
-// The pairs pcscf asserts (#208), from QA's second report on #242, with
-// the lead's rule: one SIP identity and one tel URI are one user, keyed by
-// the tel URI, unless the SIP identity is a home-domain number other than
-// the tel URI's. A number at another host, and a home-domain number marked
-// user=ip, count as names.
+// The pairs pcscf asserts (#208), from QA's reports on #242, with the
+// lead's rule: one SIP identity and one tel URI are one user, keyed by the
+// tel URI, unless the SIP identity is a telephone number, at any host,
+// other than the tel URI's. A name, and a number marked user=ip, pair
+// freely.
 func TestTheAssertedPairsPcscfMakesAreOneUser(t *testing.T) {
 	for name, c := range map[string]struct {
 		pai  []string
@@ -145,7 +145,8 @@ func TestTheAssertedPairsPcscfMakesAreOneUser(t *testing.T) {
 		"tel first then sip":                              {[]string{"<" + alice + ">", "<sip:+15550100001@" + domain + ">"}, 202},
 		"non-number sip + tel":                            {[]string{"<sip:alice@" + domain + ">", "<" + alice + ">"}, 202},
 		"number sip other host + tel":                     {[]string{"<sip:+15550100001@other.example.net>", "<" + alice + ">"}, 202},
-		"number at another host, user=phone, another tel": {[]string{"<sip:+15550100003@other.example.net;user=phone>", "<" + alice + ">"}, 202},
+		"number at another host, user=phone, another tel": {[]string{"<sip:+15550100003@other.example.net;user=phone>", "<" + alice + ">"}, 403},
+		"number at another host, another tel":             {[]string{"<sip:+15550100003@other.example.net>", "<" + alice + ">"}, 403},
 		"home number user=ip + tel":                       {[]string{"<sip:+15550100001@" + domain + ";user=ip>", "<" + alice + ">"}, 202},
 		"sip + tel different numbers":                     {[]string{"<sip:+15550100001@" + domain + ">", "<" + bob + ">"}, 403},
 		"two sip same user":                               {[]string{"<sip:+15550100001@" + domain + ">", "<" + aliceSIP + ">"}, 403},
@@ -164,5 +165,31 @@ func TestTheAssertedPairsPcscfMakesAreOneUser(t *testing.T) {
 				t.Fatalf("%v: origins %+v, want alice's tel URI as the sender", c.pai, o)
 			}
 		})
+	}
+}
+
+// QA's third report on #242: a pair whose SIP identity is another user's
+// number at another host is refused, so its holder can neither confirm a
+// message sent to that number nor name itself by it in a CPIM From.
+func TestAPairNamingAnotherNumberCannotForgeAReceipt(t *testing.T) {
+	core := newFakeCore(t)
+	a, _ := startEngine(t, core, messaging.Config{})
+	p := a.dial(t)
+	const carol = "tel:+15550100003"
+	if res := p.send(pagerAs(carol, cpimFrom("<"+messaging.AnonymousURI+">", "toCarol", imdn.PositiveDelivery, "hi carol"), "<"+bob+">")); res.StatusCode != 202 {
+		t.Fatalf("bob's message to carol answered %d", res.StatusCode)
+	}
+	core.next(t)
+	pair := []string{"<sip:+15550100003@other.example.net;user=phone>", "<" + alice + ">"}
+	if res := p.send(pagerAs(bob, deliveredBody(t, "toCarol"), pair...)); res.StatusCode != 403 {
+		t.Fatalf("a receipt for carol's message from alice, asserted with carol's number, answered %d", res.StatusCode)
+	}
+	if res := p.send(pagerAs(bob, cpimFrom("<"+carol+">", "fromCarol", 0, "I am carol"), pair...)); res.StatusCode != 403 {
+		t.Fatalf("a CPIM From naming carol's number answered %d", res.StatusCode)
+	}
+	select {
+	case got := <-core.got:
+		t.Fatalf("the core got %s %s", got.Method, got.URI.String())
+	default:
 	}
 }

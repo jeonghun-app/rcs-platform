@@ -58,7 +58,7 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 				g.count("registrar.auth_failed")
 				return refuse(403, "Authentication failed")
 			}
-			return g.resynchronise(ctx, r, sync)
+			return g.resynchronise(ctx, r, sync, ch)
 		}
 	} else {
 		err = g.verifyDigest(ctx, c, ch.Digest)
@@ -131,14 +131,41 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 	if !ok {
 		return refuse(403, "Unsupported algorithm")
 	}
+	counted, f := g.limitChallenges(ctx, r, g.cfg.Now())
+	if f != nil {
+		return f
+	}
 	maa, err := g.cfg.HSS.Authenticate(ctx, &cx.MAR{UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1}, schemes)
-	return g.challengeFrom(ctx, r, maa, err, stale, false)
+	f = g.challengeFrom(ctx, r, maa, err, stale, false)
+	if neverSent(err) {
+		// The MAR never reached the HSS: the challenge came to nothing.
+		g.giveBack(ctx, counted...)
+	}
+	return f
 }
 
 // resynchronise sends the client's AUTS to the HSS (TS 33.102 §6.3.5) and
 // challenges with the vector it returns, marked so that a further AUTS for it
-// is refused: one resynchronisation per challenge window.
-func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure) *failure {
+// is refused: one resynchronisation per challenge (Challenge.Resynchronised).
+// An AUTS is unauthenticated (digest.SyncFailure), so the IMPI also has a
+// budget of them (limitResyncs), used only by one that reaches the HSS and
+// gets a vector back.
+//
+// An AUTS over the flow its challenge was issued to is that client's own
+// next step, already paid for in the flow's budget by the challenge: it
+// counts in the IMPI's shared budget only, so that a resynchronisation does
+// not take two of a flow's three challenges a minute.
+func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure, ch *state.Challenge) *failure {
+	now := g.cfg.Now()
+	sameFlow := r.flow != "" && ch.Flow == state.FlowScope(r.flow)
+	counted, f := g.limitChallengesOf(ctx, r, now, !sameFlow)
+	if f != nil {
+		return f
+	}
+	slot, f := g.limitResyncs(ctx, r, now)
+	if f != nil {
+		return f
+	}
 	g.count("registrar.resync")
 	auth := make([]byte, 0, len(sync.RAND)+len(sync.AUTS))
 	auth = append(append(auth, sync.RAND[:]...), sync.AUTS[:]...)
@@ -146,7 +173,13 @@ func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest
 		UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1,
 		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: auth},
 	})
-	return g.challengeFrom(ctx, r, maa, err, false, true)
+	f = g.challengeFrom(ctx, r, maa, err, false, true)
+	if neverSent(err) {
+		// The MAR never reached the HSS: the slot and the challenge are
+		// the UE's again.
+		g.giveBack(ctx, append(counted, slot)...)
+	}
+	return f
 }
 
 func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA, err error, stale, resynced bool) *failure {
@@ -241,6 +274,9 @@ func (g *Registrar) digestChallenges(ctx context.Context, r *register, d *cx.Dig
 func (g *Registrar) store(ctx context.Context, r *register, nonce string, c *state.Challenge) error {
 	now := g.cfg.Now()
 	c.IMPI, c.Nonce, c.IMPU = r.impi, nonce, r.impu
+	if r.flow != "" {
+		c.Flow = state.FlowScope(r.flow)
+	}
 	c.Issued, c.Expires = now, now.Add(g.cfg.ChallengeLifetime)
 	return g.cfg.Store.AddChallenge(ctx, c)
 }

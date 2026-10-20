@@ -120,14 +120,23 @@ The sender is the user the core asserted in `P-Asserted-Identity` (RFC 3325
 §9.1), never a header the client wrote. rcs-as takes what pcscf asserts (#208):
 one identity, or a SIP identity with the tel URI of its implicit registration
 set (#16 decision 5), which are one user whether the SIP identity is a number
-(`sip:+...@<domain>`) or a name (`sip:alice@<domain>`). Only a home-domain
-number must be the tel URI's number; a number at another host, or one marked
-`user=ip`, counts as a name. The user is the tel URI when one is asserted, and
-the SIP identity otherwise. More than two identities, two of one scheme, or a
-home-domain number other than the tel URI's are refused with 403 and counted (`sip.asserted.refused`), as is a MESSAGE with
+(`sip:+...@<domain>`) or a name (`sip:alice@<domain>`). A SIP identity whose
+user part is a telephone number, at any host, with `user=phone` or without a
+`user` parameter, must be the tel URI's number: otherwise a client could name
+itself by a number it does not hold, in a CPIM `From` or a notification. A name,
+or a number marked `user=ip`, pairs freely. The user is the tel URI when one is
+asserted, and the SIP identity otherwise. More than two identities, two of one
+scheme, or a SIP number other than the tel URI's are refused with 403 and counted (`sip.asserted.refused`), as is a MESSAGE with
 none. Every asserted identity is one the sender may name in its CPIM `From`, in
 any of the forms below, and a notification from the user finds a message
 written to any of them. The recipient is the Request-URI.
+
+A notification is matched to its message by the identities asserted with it
+only. A sender that addressed the recipient by a name-form SIP URI
+(`sip:alice@<domain>`) keys the message by that name; if the recipient's
+notification asserts only its tel URI, rcs-as cannot tell that the two are
+one user without the asserted pair, and refuses the notification
+(`imdn_forged`).
 
 Each user is named in one form (`messaging.UserOf`), since the queues, a sender's
 share of them and the sent-message records are keyed by that string. A global
