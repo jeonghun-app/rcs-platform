@@ -148,11 +148,18 @@ func TestADeliveryWithoutAUsableAddressIsUndeliverable(t *testing.T) {
 	}
 }
 
-func TestSessionsAreNotServedYet(t *testing.T) {
-	a := startAS(t, &fakeEngine{}, newFakeCore(t))
-	if err := a.srv.Invite(t.Context(), messaging.Invitation{Recipient: bob, Peer: alice}); err == nil ||
-		errors.Is(err, messaging.ErrNoSessions) || errors.Is(err, messaging.ErrOffline) {
+// An invitation the engine gives no leg for fails with the engine's error,
+// and sends nothing.
+func TestAnInvitationWithoutALegFailsWithTheEnginesError(t *testing.T) {
+	core := newFakeCore(t)
+	a := startAS(t, &fakeEngine{}, core)
+	if err := a.srv.Invite(t.Context(), messaging.Invitation{Recipient: bob, Peer: alice, Mode: store.Chat}); !errors.Is(err, errFakeLeg) {
 		t.Fatalf("Invite = %v", err)
+	}
+	select {
+	case req := <-core.got:
+		t.Fatalf("the core got %s", req.Method)
+	default:
 	}
 }
 
