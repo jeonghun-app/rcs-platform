@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // The procedures, as metric names know them.
@@ -33,6 +35,7 @@ type Router struct {
 	home            []byte
 	retryAfter      string
 	registerTimeout time.Duration
+	resolver        AllResolver
 	ids             sip.IDGenerator
 	metrics         Metrics
 	log             *slog.Logger
@@ -50,6 +53,7 @@ func New(cfg Config) (*Router, error) {
 		home:            []byte(cfg.HomeDomain),
 		retryAfter:      strconv.FormatInt(int64(cfg.RetryAfter/time.Second), 10),
 		registerTimeout: cfg.RegisterTimeout,
+		resolver:        cfg.Resolver,
 		ids:             cfg.IDs,
 		metrics:         cfg.Metrics,
 		log:             cfg.Logger,
@@ -121,11 +125,19 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	// branch is bounded so that a silent S-CSCF is answered 504 while the
 	// client still waits (§5.3.1.3; re-selection is not done, see the
 	// package documentation).
-	d := forwarding(proxy.Decision{Targets: []proxy.Target{{URI: scscf, Timeout: r.registerTimeout}}})
+	dsts, ok := r.destinations(ctx, scscf)
+	if !ok {
+		return r.unreachableNow(kindRegister, m)
+	}
+	target := func(dst *transport.Destination) proxy.Target {
+		return proxy.Target{URI: scscf, Timeout: r.registerTimeout, Destination: dst}
+	}
+	d := forwarding(proxy.Decision{Targets: []proxy.Target{target(first(dsts))}})
 	// An S-CSCF that cannot be sent to gets the client a Retry-After, as
 	// for a terminating request (review of #276); one that does not answer
-	// in time still gets it 504.
-	r.answerUnreachable(&d, kindRegister)
+	// in time still gets it 504, and is not tried again, since it may have
+	// taken the REGISTER.
+	r.answerUnreachable(&d, kindRegister, rest(dsts), target)
 	return d
 }
 
@@ -173,11 +185,15 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 	r.count(kindTerminating, "forwarded")
 	// §5.3.2.1: the S-CSCF becomes the topmost Route, and the Request-URI
 	// stays, in tel form when it named a telephone number.
-	d := forwarding(proxy.Decision{Targets: []proxy.Target{{
-		URI:    uri,
-		Routes: []sip.Address{{URI: looseRoute(scscf)}},
-	}}})
-	r.answerUnreachable(&d, kindTerminating)
+	dsts, ok := r.destinations(ctx, scscf)
+	if !ok {
+		return r.unreachableNow(kindTerminating, m)
+	}
+	target := func(dst *transport.Destination) proxy.Target {
+		return proxy.Target{URI: uri, Routes: []sip.Address{{URI: looseRoute(scscf)}}, Destination: dst}
+	}
+	d := forwarding(proxy.Decision{Targets: []proxy.Target{target(first(dsts))}})
+	r.answerUnreachable(&d, kindTerminating, rest(dsts), target)
 	return d
 }
 
@@ -190,12 +206,28 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 // either, since the proxy upstream turns it into a 500 and drops the
 // Retry-After, while it passes a 500's on. A 500 from the S-CSCF itself, or a
 // 503 it sent, gets none.
-func (r *Router) answerUnreachable(d *proxy.Decision, kind string) {
-	var unreachable atomic.Bool
+//
+// Before that, each further address of the S-CSCF (next) is tried in turn
+// with target, so a task that is gone does not fail the request while
+// others serve the same name.
+func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transport.Destination, target func(*transport.Destination) proxy.Target) {
+	var (
+		unreachable atomic.Bool
+		mu          sync.Mutex
+	)
 	d.OnBranchFailure = func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
-		if f.Err != nil && f.Response != nil && f.Response.StatusCode == 503 {
-			unreachable.Store(true)
+		if f.Err == nil || f.Response == nil || f.Response.StatusCode != 503 {
+			return nil
 		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(next) > 0 {
+			dst := next[0]
+			next = next[1:]
+			r.metrics.Count("icscf.scscf.next_address", 1)
+			return []proxy.Target{target(&dst)}
+		}
+		unreachable.Store(true)
 		return nil
 	}
 	strip := d.OnResponse
@@ -210,6 +242,40 @@ func (r *Router) answerUnreachable(d *proxy.Decision, kind string) {
 			_ = res.Header.Add("Retry-After", r.retryAfter)
 		}
 	}
+}
+
+// destinations are the addresses of the S-CSCF at u, in the order to try
+// them, when there is a resolver; false when there is one and it finds
+// none, which leaves the S-CSCF as unreachable as a refused connection.
+func (r *Router) destinations(ctx context.Context, u sip.URI) ([]transport.Destination, bool) {
+	if r.resolver == nil {
+		return nil, true
+	}
+	dsts, err := r.resolver.ResolveAll(ctx, u)
+	return dsts, err == nil && len(dsts) > 0
+}
+
+// first is the first destination, nil for none: the proxy resolves then.
+func first(dsts []transport.Destination) *transport.Destination {
+	if len(dsts) == 0 {
+		return nil
+	}
+	return &dsts[0]
+}
+
+// rest is every destination after the first.
+func rest(dsts []transport.Destination) []transport.Destination {
+	if len(dsts) < 2 {
+		return nil
+	}
+	return dsts[1:]
+}
+
+// unreachableNow answers a request whose S-CSCF has no address: 500 with
+// Retry-After, as one whose every address refused it.
+func (r *Router) unreachableNow(kind string, m *sip.Request) proxy.Decision {
+	r.metrics.Count("icscf.scscf.unreachable", 1)
+	return r.withRetryAfter(kind, m, 500)
 }
 
 // couldNotComplete reports whether an answer says the HSS could not do what

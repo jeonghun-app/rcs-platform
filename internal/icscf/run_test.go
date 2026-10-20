@@ -212,6 +212,9 @@ func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF, opts ...func(*Se
 			return dl.DialContext(ctx, network, hss.addr)
 		},
 		listening: func(a netip.AddrPort) { listening <- a },
+		// The S-CSCFs of these tests listen on loopback, which production
+		// does not resolve to.
+		allow: func(a netip.Addr) bool { return a.IsLoopback() },
 	}
 	for _, o := range opts {
 		o(&cfg, &d)

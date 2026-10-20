@@ -3,6 +3,7 @@ package icscf
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -315,4 +316,68 @@ func (r *running) sendAsync(t *testing.T, method, uri string, fields ...string) 
 		}
 	}()
 	return out
+}
+
+// #198 is in: icscf resolves the S-CSCF's Cloud Map name, and the HSS's
+// production form of it (sip:scscf.<namespace>) reaches the S-CSCF.
+func TestTheSCSCFIsReachedByItsServiceName(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	port := scscf.ln.Addr().(*net.TCPAddr).Port
+	hss.answer = func(uint32) (cx.Result, string) {
+		return cx.ExperimentalResult(cx.SubsequentRegistration), "sip:scscf.rcs.local"
+	}
+	lookups := &recordingResolver{addr: netip.MustParseAddr("127.0.0.1")}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(fmt.Sprintf("sip:scscf.rcs.local:%d;transport=tcp", port))}}, func(_ *ServiceConfig, d *deps) {
+		d.lookup = lookups.LookupNetIP
+	})
+	r.waitReady(t)
+	res := r.send(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">")
+	if res.StatusCode != 200 {
+		t.Fatalf("REGISTER answered %d", res.StatusCode)
+	}
+	scscf.next(t)
+	if got := lookups.names(); len(got) == 0 || got[0] != "scscf.rcs.local" {
+		t.Errorf("looked up %v, want scscf.rcs.local", got)
+	}
+}
+
+// A task of the S-CSCF that is gone (its address refuses connections) does
+// not fail the request: the next address of the name takes it.
+func TestARequestGoesToTheNextAddressWhenOneRefuses(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	port := scscf.ln.Addr().(*net.TCPAddr).Port
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "sip:scscf.rcs.local" }
+	// Nothing listens on 127.0.0.3 at the S-CSCF's port: it refuses.
+	lookup := func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.3"), netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(fmt.Sprintf("sip:scscf.rcs.local:%d;transport=tcp", port))}}, func(_ *ServiceConfig, d *deps) {
+		d.lookup = lookup
+		d.shuffle = func(int, func(i, j int)) {} // the order as answered
+	})
+	r.waitReady(t)
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	if res.StatusCode != 200 {
+		t.Fatalf("MESSAGE answered %d, want 200 from the second address", res.StatusCode)
+	}
+	scscf.next(t)
+}
+
+// A name that resolves to nothing is an S-CSCF that cannot be reached: 500
+// with Retry-After.
+func TestAnSCSCFNameWithoutAddressesGets500WithRetryAfter(t *testing.T) {
+	hss := startHSS(t)
+	hss.answer = func(uint32) (cx.Result, string) {
+		return cx.ExperimentalResult(cx.SubsequentRegistration), "sip:scscf.rcs.local"
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local:5060;transport=tcp")}}, func(_ *ServiceConfig, d *deps) {
+		d.lookup = func(context.Context, string, string) ([]netip.Addr, error) { return nil, errors.New("no such host") }
+	})
+	r.waitReady(t)
+	res := r.send(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">")
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") != "10" {
+		t.Fatalf("answered %d with Retry-After %q, want 500 and 10", res.StatusCode, res.Header.Get("Retry-After"))
+	}
 }

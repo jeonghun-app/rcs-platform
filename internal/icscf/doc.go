@@ -124,6 +124,8 @@
 //	                            problem, to alarm on
 //	icscf.scscf.unreachable     requests answered 500 because the proxy
 //	                            could not reach the S-CSCF
+//	icscf.scscf.next_address    requests sent to the next address of the
+//	                            S-CSCF after one refused (Config.Resolver)
 //	icscf.routed.dropped_ack    ACKs without a To tag, dropped
 //
 // cxclient counts the Cx answers by result code, and the proxy and the

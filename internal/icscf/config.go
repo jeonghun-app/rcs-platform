@@ -13,6 +13,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 const (
@@ -43,6 +44,12 @@ const (
 type HSS interface {
 	UAR(ctx context.Context, r *cx.UAR) (*cx.UAA, error)
 	LIR(ctx context.Context, r *cx.LIR) (*cx.LIA, error)
+}
+
+// AllResolver finds every destination of a URI in the order to try them;
+// *proxy.DNSResolver implements it.
+type AllResolver interface {
+	ResolveAll(ctx context.Context, u sip.URI) ([]transport.Destination, error)
 }
 
 // Metrics receives the counters listed in the package documentation;
@@ -145,6 +152,11 @@ type Config struct {
 	// it is answered 504 (TS 24.229 §5.3.1.3); DefaultRegisterTimeout when
 	// 0, else at most MaxRegisterTimeout.
 	RegisterTimeout time.Duration
+	// Resolver, if set, finds every address of the S-CSCF: a request goes
+	// to the first, and to the next when it cannot be sent to one (a task
+	// gone, its connection refused). proxy.DNSResolver has it; without one
+	// the proxy's own Resolver picks a single next hop.
+	Resolver AllResolver
 	// IDs makes the To tags of the I-CSCF's own responses that carry a
 	// header field (the 480 with Retry-After); its zero value uses
 	// crypto/rand.

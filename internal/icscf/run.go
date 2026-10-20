@@ -42,9 +42,12 @@ type deps struct {
 	discovery cxclient.Discovery
 	// dial, if set, opens the Diameter connections to the HSS tasks.
 	dial func(ctx context.Context, network, address string) (net.Conn, error)
-	// resolver finds the next hop of a forwarded request; the proxy's
-	// NumericResolver when nil.
-	resolver proxy.Resolver
+	// lookup and allow are the S-CSCF resolver's (proxy.DNSResolver):
+	// net.DefaultResolver and private addresses when nil; tests resolve
+	// their names to loopback.
+	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	allow   func(netip.Addr) bool
+	shuffle func(n int, swap func(i, j int))
 	// hssResolver, if set, resolves hss.<namespace> for DNS discovery.
 	hssResolver cxclient.Resolver
 	// listening, if set, hears the core listener's bound address.
@@ -67,8 +70,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	defer func() { _ = hss.Close(context.Background()) }()
 	rt.Admin.AddReadinessCheck("hss", func(context.Context) error { return hss.Ready() })
 
+	// The S-CSCFs are found by their Cloud Map names, every address of one
+	// (#198), so a request can go to the next when a task is gone.
+	dns := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Shuffle: d.shuffle, Logger: rt.Logger}
 	router, err := New(Config{
-		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain,
+		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
 		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
 		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
 	})
@@ -99,7 +105,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	px, err := proxy.New(tr, proxy.Config{
 		Self:     selfURIs(cfg, int(coreAddr.Port())),
 		Router:   router,
-		Resolver: d.resolver,
+		Resolver: dns,
 		Logger:   rt.Logger,
 	})
 	if err != nil {

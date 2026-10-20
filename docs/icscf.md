@@ -33,6 +33,17 @@ optional ones first. With none, a REGISTER is answered 600 and a request for
 a user 480, counted as `icscf.scscf.no_capable`: a provisioning problem to
 alarm on.
 
+## Reaching the S-CSCF
+
+The S-CSCF's URI from `ICSCF_SCSCF` is resolved by its Cloud Map name inside
+the namespace (`proxy.DNSResolver`, #198): every private address of
+`scscf.<namespace>`, in a random order. A request goes to the first; when it
+cannot be sent to one (the task is gone, its connection refused), it goes to
+the next, counted as `icscf.scscf.next_address`. Once none is left, or when
+the name has no address, it is answered 500 with `Retry-After`. A REGISTER
+the S-CSCF does not answer in time is not sent to another address, since that
+S-CSCF may have taken it: it gets 504.
+
 ## Listener
 
 `icscf` has one SIP listener, `ICSCF_CORE_ADDR` (TCP), which `pcscf` and
@@ -71,8 +82,10 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | `icscf.<kind>.cancelled` | requests cancelled while the HSS was asked |
 | `icscf.hss.unavailable` | HSS queries that could not be completed; alarm on a rise |
 | `icscf.hss.bad_server_name` | HSS answers naming an S-CSCF that is not a SIP URI |
+| `icscf.scscf.unknown_name` | answers naming an S-CSCF no configured one matches: a configuration problem; alarm on any |
 | `icscf.scscf.no_capable` | answers no configured S-CSCF can take: a provisioning problem; alarm on any |
 | `icscf.scscf.unreachable` | requests answered 500 because the S-CSCF could not be reached |
+| `icscf.scscf.next_address` | requests sent to the next address of the S-CSCF after one refused |
 | `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
 
 `cxclient.*` counts the Cx answers by result code and their latency.
@@ -101,8 +114,6 @@ service as resources: the call names both. Infra adds it on #56.
 
 ## Not in place yet
 
-- S-CSCF names are resolved only when they are IP addresses; DNS resolution
-  of `scscf.<namespace>` comes with the shared resolver of #198.
 - The transaction caps of #37 are not configurable here until it lands.
 - S-CSCF re-selection, and the other parts of TS 24.229 §5.3 listed in the
   package documentation.
