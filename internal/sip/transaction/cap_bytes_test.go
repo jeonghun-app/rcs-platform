@@ -193,22 +193,28 @@ func TestCountedBytesTrackTheHeap(t *testing.T) {
 	}
 	for name, extra := range shapes {
 		t.Run(name, func(t *testing.T) {
-			tu := &tuRecorder{}
-			l := mustNew(t, nullSender{}, tu, Config{Clock: &fakeClock{}, MaxServerTransactions: MaxMaxServerTransactions, MaxServerTransactionBytes: 1 << 40})
-			// Parsed inside the measurement, so that what the layer keeps alive
-			// of each request is in it and the garbage of parsing is not.
-			before := heapAlloc()
-			for i := range 2000 {
-				l.Receive(inbound(request(t, "INVITE", fmt.Sprintf("z9hG4bKshape%d", i), extra...), transport.TCP))
+			// What the layer holds is the heap with it alive less the heap
+			// once it is dropped, measured back to back. A heap measured
+			// before and after filling it would also see memory freed in
+			// between, such as transactions of the integration tests whose
+			// real-clock timers fire meanwhile.
+			fill := func() (counted, alive int64) {
+				tu := &tuRecorder{}
+				l := mustNew(t, nullSender{}, tu, Config{Clock: &fakeClock{}, MaxServerTransactions: MaxMaxServerTransactions, MaxServerTransactionBytes: 1 << 40})
+				for i := range 2000 {
+					l.Receive(inbound(request(t, "INVITE", fmt.Sprintf("z9hG4bKshape%d", i), extra...), transport.TCP))
+				}
+				counted, alive = l.Stats().ServerTransactionBytes, heapAlloc()
+				runtime.KeepAlive(l)
+				runtime.KeepAlive(tu)
+				return counted, alive
 			}
-			held := heapAlloc() - before
-			counted := l.Stats().ServerTransactionBytes
+			counted, alive := fill()
+			held := alive - heapAlloc()
 			t.Logf("held %d bytes, counted %d (ratio %.2f)", held, counted, float64(held)/float64(counted))
 			if ratio := float64(held) / float64(counted); ratio > 1.5 || ratio < 0.5 {
 				t.Errorf("held %d bytes, counted %d (ratio %.2f)", held, counted, ratio)
 			}
-			runtime.KeepAlive(l)
-			runtime.KeepAlive(tu)
 		})
 	}
 }
