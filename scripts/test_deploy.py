@@ -160,9 +160,16 @@ if tool == "aws":
             fail("An error occurred (LoadBalancerNotFound): not found")
         print(state.get("protection", {}).get(flag("--load-balancer-arn"), "true"))
     elif cmd == ["secretsmanager", "get-secret-value"]:
-        print(state["secrets"][flag("--secret-id")])
+        if flag("--version-stage") == "AWSPREVIOUS":
+            if flag("--secret-id") not in state.setdefault("previous", {}):
+                fail("ResourceNotFoundException: no AWSPREVIOUS version")
+            print(state["previous"][flag("--secret-id")])
+        else:
+            print(state["secrets"][flag("--secret-id")])
     elif cmd == ["secretsmanager", "put-secret-value"]:
-        state["secrets"][flag("--secret-id")] = open(flag("--secret-string")[len("file://"):]).read()
+        sid = flag("--secret-id")
+        state.setdefault("previous", {})[sid] = state["secrets"][sid]
+        state["secrets"][sid] = open(flag("--secret-string")[len("file://"):]).read()
         save()
     elif cmd == ["secretsmanager", "get-random-password"]:
         state["random"] += 1
@@ -843,6 +850,63 @@ class RotateToken(Stubbed):
         result = self.run_script(ROTATE, "--token", "hss/ft-server-token", env={"ROTATE_WAIT_SECONDS": "0"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("is not steady after 0 s", result.stderr)
+
+    def current(self) -> tuple[str, str]:
+        s = self.state["secrets"]
+        return s["rcs-platform/hss/ft-server-token"], s["rcs-platform/hss/ft-server-token-next"]
+
+    def test_step_two_twice_then_step_three_finishes_the_rotation(self):
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1").returncode, 0)
+        new = self.current()[1]
+        for _ in range(2):
+            result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the writes are done already; restarting only", result.stdout)
+        self.assertEqual(self.current(), (new, "O" * 64))
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current, following = self.current()
+        self.assertEqual(current, new)
+        self.assertNotIn(following, ("O" * 64, new))
+
+    def test_resuming_after_a_failed_restart_never_swaps_back(self):
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1").returncode, 0)
+        new = self.current()[1]
+        self.state["rollouts"] = {"hss": ["1\tFAILED\t1\t2"]}
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2").returncode, 1)
+        self.assertEqual(self.current(), (new, "O" * 64))
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2").returncode, 0)
+        self.assertEqual(self.current(), (new, "O" * 64))
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "3").returncode, 0)
+        self.assertEqual(self.current()[0], new)
+        self.assertNotEqual(self.current()[1], "O" * 64)
+
+    def test_step_two_stopped_between_its_writes_is_finished(self):
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1").returncode, 0)
+        new = self.current()[1]
+        # As if only the first write landed.
+        self.state["previous"]["rcs-platform/hss/ft-server-token-next"] = new
+        self.state["secrets"]["rcs-platform/hss/ft-server-token-next"] = "O" * 64
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current(), (new, "O" * 64))
+
+    def test_step_one_after_step_two_is_refused(self):
+        self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2")
+        before = self.current()
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("step 2 already ran", result.stderr)
+        self.assertEqual(self.current(), before)
+
+    def test_step_three_before_step_two_is_refused(self):
+        self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        before = self.current()
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "3")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run --step 2 first", result.stderr)
+        self.assertEqual(self.current(), before)
 
     def test_a_caller_outside_the_stack_stops_after_step_two(self):
         result = self.run_script(ROTATE, "--token", "hss/admin-token")

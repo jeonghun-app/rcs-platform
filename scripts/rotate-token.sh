@@ -7,7 +7,10 @@
 # current one. Tasks read secrets when they start, so every step ends with a
 # rolling restart, and the next step starts only once the restarted service
 # is steady: one deployment, completed, all tasks running. Any failure stops
-# the rotation where it is; running it again from that step is safe.
+# the rotation where it is. Every step reads where the rotation stands before
+# it writes (each secret's current and previous version), so running a step
+# again, after a failed restart say, never undoes a write: it finishes what
+# is missing and restarts again.
 #
 #   1. a new value goes into next; the receiver restarts and accepts old and new;
 #   2. old goes into next, then new into current; the receiver restarts (so
@@ -95,6 +98,40 @@ get() {
   printf '%s' "$value"
 }
 
+# The value a secret held before its last write (its AWSPREVIOUS version),
+# or nothing when it was written once.
+previous() {
+  local value
+  if value="$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$STACK/$1" \
+    --version-stage AWSPREVIOUS --query SecretString --output text 2>/dev/null)"; then
+    [[ "$value" == None ]] || printf '%s' "$value"
+  fi
+}
+
+# Where the rotation stands, from both secrets' current and previous values:
+#   swapped  step 2 wrote both (current = new, next = old);
+#   half     step 2 wrote next only (both hold old, next's previous is new);
+#   retired  step 3 wrote next (both secrets' previous is old);
+#   ready    anything else with two different values: steps 1 or 2 may run.
+rotation_state() {
+  local cur nxt cur_prev nxt_prev
+  cur="$(get "$TOKEN")"
+  nxt="$(get "$TOKEN-next")"
+  cur_prev="$(previous "$TOKEN")"
+  nxt_prev="$(previous "$TOKEN-next")"
+  if [[ "$cur" != "$nxt" && "$cur_prev" == "$nxt" && "$nxt_prev" == "$cur" ]]; then
+    echo swapped
+  elif [[ "$cur" == "$nxt" && -n "$nxt_prev" && "$nxt_prev" != "$cur" ]]; then
+    echo half
+  elif [[ "$cur" != "$nxt" && -n "$cur_prev" && "$cur_prev" == "$nxt_prev" && "$nxt" != "$cur_prev" ]]; then
+    echo retired
+  elif [[ "$cur" != "$nxt" ]]; then
+    echo ready
+  else
+    echo equal
+  fi
+}
+
 put() {
   local file="$WORK/value"
   [[ -n "$2" ]] || fail "refusing to store an empty value in $STACK/$1"
@@ -139,6 +176,10 @@ restart() {
 
 step1() {
   echo "[1/3] new value into $TOKEN-next"
+  case "$(rotation_state)" in
+    swapped) fail "step 2 already ran: next holds the old value callers may still present; continue with --step 2 (restarts only) or --step 3" ;;
+    half) fail "step 2 stopped between its writes; finish it with --step 2" ;;
+  esac
   put "$TOKEN-next" "$(random_value)"
   restart "$RECEIVER"
 }
@@ -146,12 +187,21 @@ step1() {
 step2() {
   local old new
   echo "[2/3] new value into $TOKEN, old into $TOKEN-next"
-  old="$(get "$TOKEN")"
-  new="$(get "$TOKEN-next")"
-  [[ "$old" != "$new" ]] || fail "$TOKEN and $TOKEN-next hold the same value: run step 1 first"
-  put "$TOKEN-next" "$old"
-  put "$TOKEN" "$new"
-  unset old new
+  case "$(rotation_state)" in
+    swapped) echo "  the writes are done already; restarting only" ;;
+    half)
+      echo "  finishing the writes: the new value into $TOKEN"
+      put "$TOKEN" "$(previous "$TOKEN-next")"
+      ;;
+    ready | retired)
+      old="$(get "$TOKEN")"
+      new="$(get "$TOKEN-next")"
+      put "$TOKEN-next" "$old"
+      put "$TOKEN" "$new"
+      unset old new
+      ;;
+    *) fail "$TOKEN and $TOKEN-next hold the same value: run step 1 first" ;;
+  esac
   restart "$RECEIVER"
   if [[ -n "$CALLER" ]]; then
     restart "$CALLER"
@@ -163,7 +213,11 @@ step2() {
 
 step3() {
   echo "[3/3] a fresh value into $TOKEN-next; old is no longer accepted"
-  put "$TOKEN-next" "$(random_value)"
+  case "$(rotation_state)" in
+    swapped) put "$TOKEN-next" "$(random_value)" ;;
+    retired) echo "  the write is done already; restarting only" ;;
+    *) fail "step 2 has not run: next may hold the value callers are switching to; run --step 2 first" ;;
+  esac
   restart "$RECEIVER"
 }
 

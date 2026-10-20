@@ -1122,7 +1122,11 @@ scripts/rotate-token.sh --stack-name "$STACK" --region "$REGION" --token hss/ft-
 Each restart waits until the service is steady (one deployment, completed,
 all tasks running), up to 45 minutes, since ft-server's deregistration
 delay makes its rollouts long. Any failure stops the rotation where it is;
-`--step <n>` resumes it. For a token whose caller is outside the stack (the
+`--step <n>` resumes it. Each step first reads where the rotation stands
+(both secrets' current and previous versions): run again after a failed
+restart, step 2 finishes its writes or only restarts, and never swaps the
+values back; step 1 refuses once step 2 has written, and step 3 until it
+has. For a token whose caller is outside the stack (the
 operator, or a service not wired yet), the script stops after step 2: give
 the callers the value of the current secret, then run `--step 3`. Values
 pass only through shell variables and a file only the user can read; they
