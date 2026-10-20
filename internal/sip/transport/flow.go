@@ -79,7 +79,8 @@ func (f *flow) info() FlowInfo {
 
 func (f *flow) source() Source {
 	fi := f.info()
-	return Source{Flow: f.id, Network: fi.Network, Addr: fi.Addr, Listener: fi.Listener}
+	return Source{Flow: f.id, Network: fi.Network, Addr: fi.Addr, Listener: fi.Listener,
+		ClientFacing: f.lis != nil && f.lis.clientFacing}
 }
 
 // reuseKey identifies the flows a request "to this address" may use.

@@ -509,3 +509,16 @@ func TestOnFlowClosedRunsOffTheClosingGoroutineAndInOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceSaysWhetherTheListenerIsClientFacing(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	edge := listen(t, server, ListenerConfig{Network: TCP, ClientFacing: true})
+	core := listen(t, server, ListenerConfig{Network: TCP})
+	for addr, want := range map[netip.AddrPort]bool{edge: true, core: false} {
+		c := dialRaw(t, addr)
+		c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP a.example.com;branch=z9hG4bK1")))
+		if got := rec.next(t).Source.ClientFacing; got != want {
+			t.Errorf("listener %v: ClientFacing = %v, want %v", addr, got, want)
+		}
+	}
+}

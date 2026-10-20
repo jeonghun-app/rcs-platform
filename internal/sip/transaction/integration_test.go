@@ -42,7 +42,7 @@ func newEndpoint(t *testing.T, network transport.Network, cfg transport.Config) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	layer = New(tr, e, Config{})
+	layer = mustNew(t, tr, e, Config{})
 	e.tr, e.layer = tr, layer
 	e.addr, err = tr.Listen(transport.ListenerConfig{Network: network, Addr: "127.0.0.1:0"})
 	if err != nil {
@@ -250,7 +250,7 @@ func TestRetransmissionFromAnotherFlowDoesNotStallTheUDPReadLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	layer = New(tr, tu, Config{})
+	layer = mustNew(t, tr, tu, Config{})
 	t.Cleanup(func() { layer.Close(); tr.Close() })
 	tcpAddr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
 	if err != nil {

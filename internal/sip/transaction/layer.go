@@ -1,8 +1,13 @@
 package transaction
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,18 +29,27 @@ const (
 // provisional response before sending 100 Trying itself (RFC 3261 §17.2.1).
 const tryingDelay = 200 * time.Millisecond
 
-// Defaults and bounds for the server transaction cap.
+// Defaults and bounds for the server transaction caps.
 const (
-	// DefaultMaxServerTransactions bounds the requests a layer holds. A server
-	// transaction keeps its request until it ends, 32 s after its final
-	// response over UDP (Timer J), so at a few KiB per request 20000 of them
-	// is tens of MiB, comfortably inside a 1–2 GiB task.
+	// DefaultMaxServerTransactions bounds how many requests a layer holds.
 	DefaultMaxServerTransactions = 20000
-	// MaxMaxServerTransactions is the largest cap Validate accepts.
+	// MaxMaxServerTransactions is the largest count Validate accepts.
 	MaxMaxServerTransactions = 1000000
-	// DefaultRetryAfter is what the 503 for a request beyond the cap asks the
-	// client to wait (RFC 3261 §21.5.4, §20.33).
+	// DefaultMaxServerTransactionBytes bounds how much those requests take. A
+	// server transaction holds its request, body included, until it ends,
+	// which over UDP is 32 s after its final response (Timer J) and after a
+	// failure response to an INVITE up to 32 s more (Timer H); the transport
+	// lets a request carry a 1 MiB body by default, so the count alone would
+	// allow 20 GiB. 256 MiB fits a 1–2 GiB task beside everything else.
+	DefaultMaxServerTransactionBytes = 256 << 20
+	// DefaultClientShare is the share of both caps requests from client-facing
+	// listeners may use, so core traffic still gets in while clients press.
+	DefaultClientShare = 0.8
+	// DefaultRetryAfter is what the 503 for a request beyond the caps asks the
+	// client to wait (RFC 3261 §21.5.4, §20.33); MaxRetryAfter is the longest
+	// Validate accepts.
 	DefaultRetryAfter = 5 * time.Second
+	MaxRetryAfter     = time.Hour
 )
 
 // minTimerD is the lower bound RFC 3261 §17.1.1.2 sets for Timer D over an
@@ -134,30 +148,49 @@ type Config struct {
 	// core that does not know how long it will take.
 	DelayTrying bool
 
-	// MaxServerTransactions bounds the live server transactions. A request
-	// that would start one more is answered with 503 Service Unavailable and a
-	// Retry-After, statelessly, and never reaches the TU: every transaction
-	// holds its request until it ends, so without a bound a flood of requests
-	// is a flood of memory. CANCEL is exempt, since refusing one would leave
-	// the INVITE it cancels running; ACK never starts a transaction. Zero takes
-	// DefaultMaxServerTransactions; Validate accepts 1 to
-	// MaxMaxServerTransactions.
-	MaxServerTransactions int
-	// RetryAfter is the Retry-After of that 503, in whole seconds rounded up;
-	// zero takes DefaultRetryAfter.
+	// MaxServerTransactions and MaxServerTransactionBytes bound the live
+	// server transactions, by count and by the size of the requests they hold.
+	// A request that would take either past its bound is answered with 503
+	// Service Unavailable and a Retry-After, statelessly (RFC 3261 §8.2.7),
+	// and never reaches the TU: every transaction holds its request until it
+	// ends, so without a bound a flood of requests is a flood of memory. A
+	// CANCEL for a live INVITE transaction is exempt, since refusing it would
+	// leave that INVITE running; there is at most one per INVITE, so the live
+	// transactions are at most twice the count. Any other CANCEL counts like
+	// any request. ACK never starts a transaction.
+	//
+	// Zero takes DefaultMaxServerTransactions and
+	// DefaultMaxServerTransactionBytes; Validate accepts a count of 0 or 1 to
+	// MaxMaxServerTransactions and a non-negative byte bound.
+	MaxServerTransactions     int
+	MaxServerTransactionBytes int64
+	// ClientShare is the share of both bounds that requests from client-facing
+	// listeners (transport.Source.ClientFacing) may use; requests from core
+	// listeners may use all of them, so a flood of clients cannot turn away
+	// the core's terminating requests. Zero takes DefaultClientShare; Validate
+	// accepts 0 to 1.
+	ClientShare float64
+	// RetryAfter is the Retry-After of the 503, in whole seconds rounded up;
+	// zero takes DefaultRetryAfter, and Validate accepts up to MaxRetryAfter.
 	RetryAfter time.Duration
-	// IDs makes the To tag of that 503; the zero value draws from crypto/rand.
+	// IDs is the randomness of the layer: the key of the 503's To tags, drawn
+	// once in New, and the To tag of a response the layer makes up otherwise.
+	// The zero value draws from crypto/rand.
 	IDs sip.IDGenerator
 }
 
-// Validate reports a configuration New would refuse. A service calls it at
-// start, so a bad setting stops the service with a message instead of a panic.
+// Validate reports a configuration New refuses, so a service can check its
+// settings before it builds anything.
 func (c Config) Validate() error {
 	switch {
 	case c.MaxServerTransactions < 0 || c.MaxServerTransactions > MaxMaxServerTransactions:
-		return fmt.Errorf("transaction: MaxServerTransactions %d is outside 1..%d", c.MaxServerTransactions, MaxMaxServerTransactions)
-	case c.RetryAfter < 0:
-		return errors.New("transaction: negative RetryAfter")
+		return fmt.Errorf("transaction: MaxServerTransactions %d is not 0 (the default) or 1..%d", c.MaxServerTransactions, MaxMaxServerTransactions)
+	case c.MaxServerTransactionBytes < 0:
+		return errors.New("transaction: negative MaxServerTransactionBytes")
+	case c.ClientShare < 0 || c.ClientShare > 1:
+		return fmt.Errorf("transaction: ClientShare %v is outside 0..1", c.ClientShare)
+	case c.RetryAfter < 0 || c.RetryAfter > MaxRetryAfter:
+		return fmt.Errorf("transaction: RetryAfter %v is outside 0..%v", c.RetryAfter, MaxRetryAfter)
 	case c.T1 < 0 || c.T2 < 0 || c.T4 < 0:
 		return errors.New("transaction: negative timer base")
 	}
@@ -176,39 +209,65 @@ type Layer struct {
 	retryAfter  string
 	ids         sip.IDGenerator
 	rejected    atomic.Uint64
+	absorbed    atomic.Uint64
+	// maxBytes bounds the request bytes of the server transactions; the
+	// client limits are ClientShare of the bounds. tagKey keys the 503's To
+	// tags.
+	maxBytes                   int64
+	clientServers, clientBytes int64
+	tagKey                     []byte
 
 	mu      sync.Mutex
 	clients map[string]*ClientTransaction
 	servers map[string]*ServerTransaction
-	closed  bool
+	// serverBytes is the request size the server transactions hold.
+	serverBytes int64
+	closed      bool
 }
 
 // New returns a Layer that sends through s and passes requests and failures to tu.
-// It panics if cfg does not pass Validate, which a caller with configuration
-// from outside should call first.
-func New(s Sender, tu TU, cfg Config) *Layer {
+// It fails if cfg does not pass Validate or the layer's key cannot be drawn.
+func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 	if err := cfg.Validate(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	if cfg.MaxServerTransactions == 0 {
 		cfg.MaxServerTransactions = DefaultMaxServerTransactions
 	}
+	if cfg.MaxServerTransactionBytes == 0 {
+		cfg.MaxServerTransactionBytes = DefaultMaxServerTransactionBytes
+	}
+	if cfg.ClientShare == 0 {
+		cfg.ClientShare = DefaultClientShare
+	}
 	if cfg.RetryAfter == 0 {
 		cfg.RetryAfter = DefaultRetryAfter
 	}
+	src := cfg.IDs.Rand
+	if src == nil {
+		src = rand.Reader
+	}
+	key := make([]byte, sha256.Size)
+	if _, err := io.ReadFull(src, key); err != nil {
+		return nil, fmt.Errorf("transaction: drawing the layer key: %w", err)
+	}
 	l := &Layer{
-		maxServers:  cfg.MaxServerTransactions,
-		retryAfter:  strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
-		ids:         cfg.IDs,
-		sender:      s,
-		tu:          tu,
-		clock:       cfg.Clock,
-		t1:          cfg.T1,
-		t2:          cfg.T2,
-		t4:          cfg.T4,
-		delayTrying: cfg.DelayTrying,
-		clients:     make(map[string]*ClientTransaction),
-		servers:     make(map[string]*ServerTransaction),
+		maxServers:    cfg.MaxServerTransactions,
+		maxBytes:      cfg.MaxServerTransactionBytes,
+		clientServers: int64(float64(cfg.MaxServerTransactions) * cfg.ClientShare),
+		clientBytes:   int64(float64(cfg.MaxServerTransactionBytes) * cfg.ClientShare),
+		tagKey:        key,
+		retryAfter:    strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
+		ids:           cfg.IDs,
+		sender:        s,
+		tu:            tu,
+		clock:         cfg.Clock,
+		t1:            cfg.T1,
+		t2:            cfg.T2,
+		t4:            cfg.T4,
+		delayTrying:   cfg.DelayTrying,
+		clients:       make(map[string]*ClientTransaction),
+		servers:       make(map[string]*ServerTransaction),
 	}
 	if l.clock == nil {
 		l.clock = SystemClock
@@ -222,7 +281,7 @@ func New(s Sender, tu TU, cfg Config) *Layer {
 	if l.t4 <= 0 {
 		l.t4 = DefaultT4
 	}
-	return l
+	return l, nil
 }
 
 // Receive takes a message from the transport; it is the transport's Handler.
@@ -290,13 +349,16 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 			l.mu.Unlock()
 			return
 		}
-		if len(l.servers) >= l.maxServers && req.Method != "CANCEL" {
+		size := requestSize(req)
+		if !l.roomFor(size, in.Source) && !l.cancelsLiveInvite(req) {
 			l.mu.Unlock()
 			l.refuse(req, in.Source)
 			return
 		}
 		tx = newServerTransaction(l, key, req, in.Source)
+		tx.size = size
 		l.servers[key] = tx
+		l.serverBytes += size
 		l.mu.Unlock()
 		if tx.start() {
 			l.tu.Request(tx)
@@ -304,6 +366,13 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 		return
 	}
 	l.mu.Unlock()
+	if tx == nil && req.Method == "ACK" && l.acksRefusal(req) {
+		// The ACK for a 503 this layer sent statelessly: RFC 3261 §8.2.7 has a
+		// stateless UAS ignore it, and to the TU it would look like the ACK
+		// for a 2xx.
+		l.absorbed.Add(1)
+		return
+	}
 	if tx != nil && wantTag != "" && tx.responseToTag() != wantTag {
 		tx = nil
 	}
@@ -312,13 +381,70 @@ func (l *Layer) receiveRequest(req *sip.Request, in transport.Inbound) {
 	}
 }
 
-// refuse answers a request beyond MaxServerTransactions with 503 and
-// Retry-After, without a transaction (RFC 3261 §21.5.4). A retransmission of it
-// is refused again the same way, which costs no memory. It runs on the reading
-// goroutine, so it sends without waiting.
+// roomFor reports whether a new server transaction holding size bytes of
+// request fits the caps, the client share of them for a request from a
+// client-facing listener. l.mu must be held.
+func (l *Layer) roomFor(size int64, src transport.Source) bool {
+	maxCount, maxBytes := int64(l.maxServers), l.maxBytes
+	if src.ClientFacing {
+		maxCount, maxBytes = l.clientServers, l.clientBytes
+	}
+	return int64(len(l.servers)) < maxCount && l.serverBytes+size <= maxBytes
+}
+
+// cancelsLiveInvite reports whether req is a CANCEL for a live INVITE server
+// transaction (RFC 3261 §9.2). l.mu must be held.
+func (l *Layer) cancelsLiveInvite(req *sip.Request) bool {
+	if req.Method != "CANCEL" {
+		return false
+	}
+	key, err := serverKey(req, "INVITE", true)
+	return err == nil && l.servers[key] != nil
+}
+
+// requestSize is about what a server transaction holds for req: its header
+// fields, Request-URI and body.
+func requestSize(req *sip.Request) int64 {
+	n := int64(len(req.Method) + len(req.URI.String()) + len(req.Body) + 16)
+	for _, f := range req.Header.Fields() {
+		n += int64(len(f.Name) + len(f.Value) + 4)
+	}
+	return n
+}
+
+// refusalTag is the To tag of the 503 for req: a function of the transaction
+// req would have started, so a retransmission gets the same tag (RFC 3261
+// §8.2.7) and the ACK for it can be recognised without keeping any state. The
+// key ignores the To tag, which the ACK carries and the request did not.
+func (l *Layer) refusalTag(req *sip.Request) (string, error) {
+	key, err := serverKey(req, "", false)
+	if err != nil {
+		return "", err
+	}
+	m := hmac.New(sha256.New, l.tagKey)
+	m.Write([]byte(key))
+	return hex.EncodeToString(m.Sum(nil)[:8]), nil
+}
+
+// acksRefusal reports whether an ACK that matches no transaction acknowledges a
+// 503 this layer sent. A re-INVITE that was refused already had a To tag, which
+// its ACK carries instead, so its ACK is not recognised and goes to the TU.
+func (l *Layer) acksRefusal(ack *sip.Request) bool {
+	to, err := ack.Header.To()
+	if err != nil || to.Tag() == "" {
+		return false
+	}
+	tag, err := l.refusalTag(ack)
+	return err == nil && hmac.Equal([]byte(tag), []byte(to.Tag()))
+}
+
+// refuse answers a request beyond the caps with 503 and Retry-After, without a
+// transaction (RFC 3261 §21.5.4, §8.2.7). A retransmission of it is refused
+// again the same way, with the same To tag, which costs no memory. It runs on
+// the reading goroutine, so it sends without waiting.
 func (l *Layer) refuse(req *sip.Request, src transport.Source) {
 	l.rejected.Add(1)
-	tag, err := l.ids.Tag()
+	tag, err := l.refusalTag(req)
 	if err != nil {
 		return
 	}
@@ -334,17 +460,24 @@ func (l *Layer) refuse(req *sip.Request, src transport.Source) {
 
 // Stats is a snapshot of the layer's gauges and counters, for metrics.
 type Stats struct {
-	ClientTransactions int // live
-	ServerTransactions int // live, against MaxServerTransactions
-	// ServerTransactionsRejected counts requests answered with 503 because
-	// MaxServerTransactions server transactions were live.
+	ClientTransactions     int   // live
+	ServerTransactions     int   // live, against MaxServerTransactions
+	ServerTransactionBytes int64 // request bytes they hold, against MaxServerTransactionBytes
+	// ServerTransactionsRejected counts requests refused at the caps,
+	// retransmissions of a refused request included, and including the rare
+	// refusal whose 503 could not be built and was not sent.
 	ServerTransactionsRejected uint64
+	// RefusalAcksAbsorbed counts ACKs for those 503s, which go no further.
+	RefusalAcksAbsorbed uint64
 }
 
 // Stats returns the current gauges and counters.
 func (l *Layer) Stats() Stats {
-	c, s := l.Len()
-	return Stats{ClientTransactions: c, ServerTransactions: s, ServerTransactionsRejected: l.rejected.Load()}
+	l.mu.Lock()
+	c, s, b := len(l.clients), len(l.servers), l.serverBytes
+	l.mu.Unlock()
+	return Stats{ClientTransactions: c, ServerTransactions: s, ServerTransactionBytes: b,
+		ServerTransactionsRejected: l.rejected.Load(), RefusalAcksAbsorbed: l.absorbed.Load()}
 }
 
 // matchServer finds the server transaction a request belongs to (RFC 3261
@@ -399,6 +532,9 @@ func (l *Layer) remove(key string, server bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if server {
+		if tx := l.servers[key]; tx != nil {
+			l.serverBytes -= tx.size
+		}
 		delete(l.servers, key)
 	} else {
 		delete(l.clients, key)

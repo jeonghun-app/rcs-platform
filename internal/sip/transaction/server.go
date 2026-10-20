@@ -17,6 +17,8 @@ type ServerTransaction struct {
 	// last is the most recent response sent, which a retransmitted request is
 	// answered with.
 	last *sip.Response
+	// size is what the request counts against MaxServerTransactionBytes.
+	size int64
 }
 
 // sameFlow reports whether a retransmission arrived the way the request did, so
