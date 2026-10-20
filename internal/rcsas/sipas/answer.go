@@ -49,9 +49,8 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, 404)
 		return
 	}
-	conv, err := messaging.ParseConversationHeaders(req.Header.Get("Conversation-ID"),
-		req.Header.Get("Contribution-ID"), req.Header.Get("InReplyTo-Contribution-ID"))
-	if err != nil {
+	conv, ok := sessionConversation(req)
+	if !ok {
 		s.respond(u, req, 400)
 		return
 	}

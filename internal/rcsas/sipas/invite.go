@@ -162,7 +162,7 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 				go ss.declined()
 				return
 			}
-			go ss.fail(pagerOutcome(res.StatusCode))
+			go ss.fail(inviteOutcome(ss, res.StatusCode))
 		}
 	case ss.d == nil && ss.noDialog:
 		// A retransmission of the 2xx that set up no dialog: the engine
@@ -399,15 +399,15 @@ func (s *Server) inviteRequest(ss *session) (*sip.Request, error) {
 		{"To", "<" + inv.Recipient + ">"},
 		{"Call-ID", callID},
 		{"CSeq", "1 INVITE"},
-		{"Contact", ss.contact()},
+		{"Contact", ss.inviteContact()},
 		{"P-Asserted-Identity", "<" + inv.Peer + ">"},
 		{"P-Served-User", "<" + inv.Recipient + ">;sescase=term"},
 		{"P-Asserted-Service", icsi},
-		{"Accept-Contact", "*;" + ss.contactTag()},
+		{"Accept-Contact", "*;" + ss.inviteTags()},
 		{"Allow", allowed},
 	}
 	for _, h := range [][2]string{{"Conversation-ID", inv.Conversation.ID}, {"Contribution-ID", inv.Conversation.Contribution},
-		{"InReplyTo-Contribution-ID", inv.Conversation.InReplyTo}, {"Subject", inv.Subject}} {
+		{"InReplyTo-Contribution-ID", inv.Conversation.InReplyTo}, {"Subject", inv.Subject}, {"Referred-By", referredBy(inv)}} {
 		if h[1] != "" {
 			fields = append(fields, h)
 		}
@@ -447,4 +447,28 @@ func (s *Server) offerSDP(ss *session) ([]byte, error) {
 		Times: []sdp.Time{{}}, Media: []sdp.Media{m},
 	}
 	return offer.Marshal()
+}
+
+// referredBy is the Referred-By of a group's INVITE (RFC 3892): who brings
+// the recipient in. rcsjta takes the inviter from it, and failing that
+// from P-Asserted-Identity as a number, which a focus's is not
+// (ChatUtils.getReferredIdentityAsContactId); without either it declines
+// the INVITE (code review on #279).
+func referredBy(inv messaging.Invitation) string {
+	if inv.Mode != store.Group || inv.Referrer == "" {
+		return ""
+	}
+	return "<" + inv.Referrer + ">"
+}
+
+// inviteOutcome is what a final failure to rcs-as's INVITE says, as for a
+// pager MESSAGE (pagerOutcome); for a group's, a 482 too says it will never
+// reach the participant: the INVITE came back to rcs-as (fromFocus), as it
+// does for an invitee at the conference host, every time (security review
+// on #279).
+func inviteOutcome(ss *session, code int) error {
+	if ss.group != "" && code == 482 {
+		return fmt.Errorf("sipas: %d: %w", code, messaging.ErrUndeliverable)
+	}
+	return pagerOutcome(code)
 }

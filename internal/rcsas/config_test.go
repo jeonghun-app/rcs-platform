@@ -164,6 +164,11 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 		c.ConferenceFactory.String() != "sip:conf-factory@ims.mnc001.mcc001.3gppnetwork.org" {
 		t.Fatalf("defaults %+v, factory %v", c.Group, c.ConferenceFactory)
 	}
+	// One spelling of the conference host, as the group writes its URIs
+	// and the SIP layer compares them (QA on #279).
+	if c, err := configure(with(devEnv, "RCSAS_CONFERENCE_HOST", "Conf.IMS.example.net.")); err != nil || c.Group.ConferenceHost != "conf.ims.example.net" {
+		t.Fatalf("conference host %q, %v", c.Group.ConferenceHost, err)
+	}
 	// The largest groups take a larger add burst by default.
 	if c, err := configure(with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "200")); err != nil || c.Group.AddRate.Burst != 199 ||
 		c.Group.FanoutRate.Burst != 7960 {

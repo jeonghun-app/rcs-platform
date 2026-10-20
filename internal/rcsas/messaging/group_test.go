@@ -86,8 +86,9 @@ func TestAGroupMessageIsQueuedOncePerOtherParticipant(t *testing.T) {
 		t.Fatalf("Sent = %+v, %v", sent, err)
 	}
 	// Never pager mode: nobody has a session, so the engine asks for one.
+	// It names the author as who brings the recipient back (Referred-By).
 	inv := r.d.nextInvite(t)
-	if inv.Peer != groupURI || inv.Mode != store.Group {
+	if inv.Peer != groupURI || inv.Mode != store.Group || inv.Referrer != alice {
 		t.Fatalf("invitation %+v", inv)
 	}
 	waitFor(t, "idle", r.idle)
@@ -674,5 +675,38 @@ func TestInviteAsksOnceForAParticipantsSession(t *testing.T) {
 	waitFor(t, "idle", r.idle)
 	if n := len(r.d.invites); n != 0 {
 		t.Fatalf("%d invitations to a pager-only recipient", n)
+	}
+}
+
+// A group's invitation that will never reach its recipient
+// (ErrUndeliverable: an address that does not exist, or one that comes
+// back to rcs-as) gives up the copies queued for it from the group, rather
+// than keeping them, and inviting again, for StoreTTL (security review on
+// #279). Being added again lifts that.
+func TestAnUndeliverableGroupInvitationGivesTheCopiesUp(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.d.onInvite(func(inv Invitation) error {
+		if inv.Recipient == bob {
+			return ErrUndeliverable
+		}
+		return nil
+	})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "bob's copy given up", func() bool { return r.store.(*store.Memory).Len(bob) == 0 })
+	if n := r.m.get("delivery.undeliverable"); n != 1 {
+		t.Fatalf("%d given up", n)
+	}
+	r.e.ParticipantAdded(groupURI, bob)
+	r.d.onInvite(func(Invitation) error { return nil })
+	r.clock.Advance(r.e.cfg.InviteTimeout)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m2", "again", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := r.store.(*store.Memory).Len(bob); n != 1 {
+		t.Fatalf("bob's queue holds %d after he was added again", n)
 	}
 }

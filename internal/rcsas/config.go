@@ -234,7 +234,10 @@ func Configure(s *runtime.Settings) Config {
 		CreateRate: readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
 	}
 	c.Group.HomeDomain = c.HomeDomain
-	if c.Group.ConferenceHost != "" && strings.EqualFold(c.Group.ConferenceHost, c.HomeDomain) {
+	// One spelling, which the group writes its conference URIs with and
+	// the SIP layer compares with: lower case, without a trailing dot.
+	c.Group.ConferenceHost = strings.ToLower(strings.TrimSuffix(c.Group.ConferenceHost, "."))
+	if c.Group.ConferenceHost != "" && strings.EqualFold(c.Group.ConferenceHost, strings.TrimSuffix(c.HomeDomain, ".")) {
 		// Every user's request would be taken for a group's.
 		e.Invalid("CONFERENCE_HOST", "the IMS domain (RCS_IMS_DOMAIN), whose users are no conferences")
 	}

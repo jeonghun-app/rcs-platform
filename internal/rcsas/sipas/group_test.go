@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -10,8 +11,10 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/resourcelists"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -34,14 +37,16 @@ func groupList(uris ...string) string {
 
 // groupInvite is alice's INVITE to a group chat as scscf hands it to
 // rcs-as: to uri, with body as its multipart/mixed or SDP body (rcsjta's
-// OriginatingAdhocGroupChatSession and RejoinGroupChatSession).
+// OriginatingAdhocGroupChatSession and RejoinGroupChatSession), with the
+// headers rcsjta sends: a Contribution-ID, the chat's ID, and no
+// Conversation-ID (code review on #279).
 func (r *chatRig) groupInvite(uri, contentType, body string, fields ...string) msg {
 	return msg{method: "INVITE", uri: uri, body: body, from: `"Alice" <` + alice + ">;tag=a1", to: "<" + uri + ">",
 		fields: append([]string{
 			"P-Asserted-Identity: <" + alice + ">",
 			"Contact: <sip:" + r.core.l.Addr().String() + ";transport=tcp>;" + omaIMTag,
 			"Accept-Contact: *;" + omaIMTag,
-			"Conversation-ID: gc0nv1", "Contribution-ID: gch4t1",
+			"Contribution-ID: gch4t1",
 			"Content-Type: " + contentType,
 		}, fields...)}
 }
@@ -131,7 +136,7 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 		t.Fatal(err)
 	}
 	if a, _ := g.Participant(alice); a.State != groupstore.Joined || a.Role != groupstore.Chairman || a.DisplayName != "Alice" ||
-		g.Subject != "Lunch" || g.Conversation != "gc0nv1" || len(g.Participants) != 3 {
+		g.Subject != "Lunch" || !messaging.ValidID(g.Conversation) || len(g.Participants) != 3 {
 		t.Fatalf("group %+v", g)
 	}
 
@@ -142,9 +147,11 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 		for name, want := range map[string]string{
 			"P-Asserted-Identity": "<" + uri + ">",
 			"P-Served-User":       "<" + who + ">;sescase=term",
-			"Contact":             "<" + uri + ">;isfocus;" + chatTag,
+			"Contact":             "<" + uri + ">;isfocus;" + chatTag + ";" + omaIMTag,
+			"Accept-Contact":      "*;" + chatTag + ";" + omaIMTag,
+			"Referred-By":         "<" + alice + ">",
 			"Subject":             "Lunch",
-			"Conversation-ID":     "gc0nv1",
+			"Conversation-ID":     g.Conversation,
 			"Contribution-ID":     "gch4t1",
 		} {
 			if got := h.Get(name); got != want {
@@ -338,6 +345,11 @@ func TestAFocusInviteThatComesBackIsRefusedAsALoop(t *testing.T) {
 	if code := <-bounced; code != 482 {
 		t.Fatalf("the returning INVITE was answered %d", code)
 	}
+	// The 482 says the invitation will never reach bob: what is queued
+	// for him from the group is given up (security review on #279).
+	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrUndeliverable) {
+		t.Fatalf("the invitation failed with %v", err)
+	}
 	if n := r.metrics.get("sip.loop"); n != 1 {
 		t.Fatalf("%d loops", n)
 	}
@@ -376,9 +388,7 @@ func TestAFactoryInviteIsCheckedBeforeAGroupIsMade(t *testing.T) {
 	// The Contribution-ID names the chat to rcsjta; a group without one
 	// could not be told from the next.
 	anon := r.factoryInvite(relayPath(), bob)
-	anon.fields = slices.DeleteFunc(anon.fields, func(f string) bool {
-		return strings.HasPrefix(f, "Contribution-ID:") || strings.HasPrefix(f, "Conversation-ID:")
-	})
+	anon.fields = slices.DeleteFunc(anon.fields, func(f string) bool { return strings.HasPrefix(f, "Contribution-ID:") })
 	if res := p.send(anon); res.StatusCode != 400 {
 		t.Fatalf("a factory INVITE without a Contribution-ID answered %d", res.StatusCode)
 	}
@@ -404,5 +414,214 @@ func TestAFactoryInviteIsCheckedBeforeAGroupIsMade(t *testing.T) {
 	pager.uri, pager.from, pager.to = "sip:chat-0000@"+confHost, "<"+alice+">;tag=a1", "<sip:chat-0000@"+confHost+">"
 	if res := p.send(pager); res.StatusCode != 405 || res.Header.Get("Allow") != groupAllowed {
 		t.Fatalf("a MESSAGE to a conference URI answered %d, Allow %q", res.StatusCode, res.Header.Get("Allow"))
+	}
+}
+
+// A Contribution-ID names one group (security review on #279): bob's
+// INVITE to the factory under the ID of alice's group is refused, and so is
+// alice's own once her group is established, whose session she has; no
+// second group is made. A Conversation-ID, when a client sends one, is
+// the group's.
+func TestAContributionIDNamesOneGroup(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	m := r.factoryInvite(relayPath(), bob)
+	m.fields = append(m.fields, "Conversation-ID: given1")
+	s := answeredBy(t, p.send(m))
+	p.ack(s)
+	contact, _ := sip.ParseAddress(s.res.Header.Get("Contact"))
+	uri := contact.URI.String()
+	r.core.nextOf(t, "INVITE")
+	g, err := r.groups.Get(t.Context(), uri)
+	if err != nil || g.Conversation != "given1" {
+		t.Fatalf("group %+v, %v", g, err)
+	}
+	// Established once alice has her session: it lasts as any other.
+	waitUntil(t, "the group established", func() bool {
+		g, err := r.groups.Get(t.Context(), uri)
+		return err == nil && g.Expires.After(g.Created.Add(group.DefaultPendingTTL))
+	})
+	bobs := r.factoryInvite(relayPath(), carol)
+	bobs.from = "<" + bob + ">;tag=b1"
+	bobs.fields[0] = "P-Asserted-Identity: <" + bob + ">"
+	if res := p.send(bobs); res.StatusCode != 403 {
+		t.Fatalf("bob's create under alice's chat ID answered %d", res.StatusCode)
+	}
+	if res := p.send(r.factoryInvite(relayPath(), bob)); res.StatusCode != 403 {
+		t.Fatalf("alice's create under her established group's ID answered %d", res.StatusCode)
+	}
+	if n := r.metrics.get("group.created"); n != 1 {
+		t.Fatalf("%d groups made", n)
+	}
+}
+
+// The factory and URIs at the conference host are no invitees: the focus's
+// INVITE to one would come back as a loop, at every retry (security review
+// on #279).
+func TestInviteesAtTheConferenceHostAreSkipped(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	uri, _ := r.create(t, p, relayPath(), bob, "sip:chat-00000000000000000000000000000000@"+confHost, confFactory)
+	if inv := r.core.nextOf(t, "INVITE"); inv.URI.String() != bob {
+		t.Fatalf("INVITE to %s", inv.URI)
+	}
+	g, err := r.groups.Get(t.Context(), uri)
+	if err != nil || len(g.Participants) != 2 {
+		t.Fatalf("group %+v, %v", g, err)
+	}
+	if n := r.metrics.get("sip.group.invitee_skipped"); n != 2 {
+		t.Fatalf("%d skipped", n)
+	}
+}
+
+// A Request-URI at the conference host that is not of the form the group
+// allocates, chat- and 32 lower-case hex digits, names no group: 404
+// before the store is read (security review on #279).
+func TestOnlyAGroupsOwnFormOfURIIsLookedUp(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	p := r.a.dial(t)
+	for _, user := range []string{"chat-0000", "chat-" + strings.Repeat("A", 32), "chat-" + strings.Repeat("0", 33),
+		"x" + strings.Repeat("0", 36), strings.Repeat("a", 3000)} {
+		uri := "sip:" + user + "@" + confHost
+		if res := p.send(r.groupInvite(uri, sdpType, offerSDP(relayPath(), "active"))); res.StatusCode != 404 {
+			t.Fatalf("an INVITE to %.40s… answered %d", uri, res.StatusCode)
+		}
+	}
+	if n := r.groupReads.gets.Load(); n != 0 {
+		t.Fatalf("%d store reads", n)
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(waitFor)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// QA on #279: a request to a conference URI never becomes a 1-to-1 chat,
+// whatever the case of its host or a trailing dot on it (RFC 3261 §25.1);
+// the factory is found the same way.
+func TestAConferenceURIInAnotherSpellingIsNoOneToOneChat(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	uri, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	user := strings.TrimSuffix(strings.TrimPrefix(uri, "sip:"), "@"+confHost)
+	for _, target := range []string{uri + ".", "sip:" + user + "@" + strings.ToUpper(confHost)} {
+		m := r.groupInvite(target, sdpType, offerSDP(relayPath(), "active"))
+		m.from, m.fields[0] = "<"+carol+">;tag=c1", "P-Asserted-Identity: <"+carol+">" // not a participant
+		if res := p.send(m); res.StatusCode != 403 {
+			t.Fatalf("carol's INVITE to %s answered %d", target, res.StatusCode)
+		}
+	}
+	factory := r.factoryInvite(relayPath(), carol)
+	factory.uri = "sip:conf-factory@" + strings.ToUpper(domain) + "."
+	factory.fields[3] = "Contribution-ID: gch4t2"
+	if res := p.send(factory); res.StatusCode != 200 {
+		t.Fatalf("an INVITE to the factory spelled otherwise answered %d", res.StatusCode)
+	}
+}
+
+// QA on #279: only a 603 is the invitee leaving. Any other failure of the
+// focus's INVITE, another 6xx included, is a failure to try again later.
+func TestOnlyA603ToTheFocusIsLeaving(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	code := 600
+	r.core.setAnswer(func(req *sip.Request) int {
+		if req.Method == "INVITE" {
+			return code
+		}
+		return 200
+	})
+	p := r.a.dial(t)
+	uri, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	if err := r.e.nextFailure(t); err == nil {
+		t.Fatal("no failure")
+	}
+	for _, code = range []int{604, 606} {
+		inv := messaging.Invitation{Recipient: bob, Peer: uri, Mode: store.Group, Conversation: messaging.Conversation{Contribution: "gch4t1"}}
+		if err := r.a.srv.Invite(t.Context(), inv); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.e.nextFailure(t); err == nil {
+			t.Fatalf("%d: no failure", code)
+		}
+	}
+	r.stateOf(t, uri, bob, groupstore.Invited)
+	if n := r.metrics.get("sip.group.declined"); n != 0 {
+		t.Fatalf("%d declined", n)
+	}
+}
+
+// QA on #279: a 2xx to the focus's INVITE from someone the group no longer
+// holds, as one who left meanwhile, gets no session: the Join is refused,
+// and the session ended with a BYE.
+func TestA2xxFromSomeoneNoLongerInTheGroupIsEnded(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			return []*sip.Response{r.answerInvite(t, req, relayPath(), "active")}
+		}
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	p := r.a.dial(t)
+	// The focus's first INVITE to bob is answered: he joins. Then he
+	// leaves, and an INVITE still on its way is answered 2xx.
+	uri, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	r.stateOf(t, uri, bob, groupstore.Joined)
+	if err := r.groups.Leave(t.Context(), uri, bob); err != nil {
+		t.Fatal(err)
+	}
+	inv := messaging.Invitation{Recipient: bob, Peer: uri, Mode: store.Group, Conversation: messaging.Conversation{Contribution: "gch4t1"}}
+	if err := r.a.srv.Invite(t.Context(), inv); err != nil {
+		t.Fatal(err)
+	}
+	late := r.core.nextOf(t, "INVITE")
+	for {
+		req := r.core.next(t)
+		if req.Method == "BYE" && req.Header.Get("Call-ID") == late.Header.Get("Call-ID") {
+			break
+		}
+	}
+	r.stateOf(t, uri, bob, groupstore.Left)
+	if n := r.metrics.get("sip.group.join_refused"); n != 1 {
+		t.Fatalf("%d joins refused", n)
+	}
+}
+
+// QA on #279: a decline gives the invitee's place back, as any end of an
+// INVITE does: with room for one session rcs-as opens to bob, the next
+// invitation after a 603 can still go.
+func TestADeclineGivesThePlaceBack(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{MaxIncomingPerUser: 1})
+	r.core.setAnswer(func(req *sip.Request) int {
+		if req.Method == "INVITE" {
+			return 603
+		}
+		return 200
+	})
+	p := r.a.dial(t)
+	uri, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	r.stateOf(t, uri, bob, groupstore.Left)
+	waitUntil(t, "the place given back", func() bool {
+		r.a.srv.mu.Lock()
+		defer r.a.srv.mu.Unlock()
+		return r.a.srv.pending == 0
+	})
+	inv := messaging.Invitation{Recipient: bob, Peer: uri, Mode: store.Group, Conversation: messaging.Conversation{Contribution: "gch4t1"}}
+	if err := r.a.srv.Invite(t.Context(), inv); err != nil {
+		t.Fatalf("the next invitation: %v", err)
 	}
 }

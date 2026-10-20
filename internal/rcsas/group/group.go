@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,6 +30,11 @@ const (
 	// cost a write per message.
 	DefaultTouchInterval = time.Hour
 	DefaultMaxTracked    = 100_000
+	// DefaultPendingTTL is how long a new group lasts until its creator's
+	// session is set up (Established): long enough for the client to try
+	// its INVITE again after a CANCEL or a failure, short enough that a
+	// group no session came of does not linger.
+	DefaultPendingTTL = 2 * time.Minute
 	// maxAttempts bounds the rereads of a group whose update keeps meeting
 	// another writer's; each attempt loses only to a write that landed.
 	maxAttempts = 32
@@ -92,12 +98,15 @@ var (
 	ErrRateLimited = errors.New("group: rate limited")
 	// ErrBusy: the group kept changing under the update; try again.
 	ErrBusy = errors.New("group: too many concurrent changes")
+	// ErrTaken: a group already has the Contribution-ID a Create names,
+	// and is not one its creator may take up again.
+	ErrTaken = errors.New("group: the Contribution-ID names another group")
 )
 
 // Config configures a Service. Zero fields take the defaults.
 type Config struct {
 	// ConferenceHost is the host of the conference URIs the focus
-	// allocates, sip:chat-<random>@ConferenceHost; it must route to
+	// allocates, sip:chat-<32 hex digits>@ConferenceHost; it must route to
 	// rcs-as. Required.
 	ConferenceHost string
 	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
@@ -106,6 +115,8 @@ type Config struct {
 	HomeDomain      string
 	MaxParticipants int
 	IdleTTL         time.Duration
+	// PendingTTL is how long a group lasts until Established.
+	PendingTTL time.Duration
 	// SenderRate bounds the messages one participant writes in one group;
 	// FanoutRate the deliveries one group makes, a message counting once
 	// per recipient, of which one sender may use 1/FanoutSenderShare;
@@ -131,6 +142,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.IdleTTL <= 0 {
 		c.IdleTTL = DefaultIdleTTL
+	}
+	if c.PendingTTL <= 0 || c.PendingTTL >= c.IdleTTL {
+		c.PendingTTL = min(DefaultPendingTTL, c.IdleTTL/2)
 	}
 	if c.TouchInterval <= 0 {
 		c.TouchInterval = DefaultTouchInterval
@@ -196,6 +210,13 @@ type CreateRequest struct {
 	// Conversation is the Conversation-ID of the request, a token as in
 	// 1-to-1 chat (messaging.ValidID); empty means one is generated.
 	Conversation string
+	// Contribution is the request's Contribution-ID, which names the chat
+	// to its clients (rcsjta's chat ID), a token too. When set, the
+	// conference URI is made from it, so that a creator trying its INVITE
+	// again after a CANCEL or a failure finds the group it made rather
+	// than making another under the same chat ID; anyone else naming it
+	// is refused (ErrTaken). Empty means a random URI.
+	Contribution string
 }
 
 // Service runs groups. Its methods are safe for concurrent use.
@@ -262,10 +283,20 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 }
 
 // Create makes a group of the creator, its chairman and already joined
-// (its INVITE is what creates it), and the invitees, invited.
+// (its INVITE is what creates it), and the invitees, invited. The group
+// lasts PendingTTL until Established, so that one no session came of
+// ends on its own.
+//
+// A Create whose Contribution names a group that exists returns that
+// group if the same creator made it and it is not yet established: its
+// INVITE is being tried again, with the group as it was first made. Any
+// other is ErrTaken, so that nobody, a participant the chairman removed
+// say, makes a group that its members' clients would take for the first
+// one (security review on #279).
 func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group, error) {
 	creator, ok := s.canonical(r.Creator)
-	if !ok || !validText(r.Subject, MaxSubjectLength) || r.Conversation != "" && !messaging.ValidID(r.Conversation) {
+	if !ok || !validText(r.Subject, MaxSubjectLength) || r.Conversation != "" && !messaging.ValidID(r.Conversation) ||
+		r.Contribution != "" && !messaging.ValidID(r.Contribution) {
 		return groupstore.Group{}, ErrInvalid
 	}
 	r.Creator = creator
@@ -300,7 +331,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		s.metrics.Count("group.rejected.rate_limited", 1)
 		return groupstore.Group{}, ErrRateLimited
 	}
-	id, err := s.randomHex(16)
+	id, err := s.conferenceID(r.Contribution)
 	if err != nil {
 		return groupstore.Group{}, err
 	}
@@ -319,7 +350,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		Participants: []groupstore.Participant{{
 			Identity: r.Creator, DisplayName: r.CreatorName, Role: groupstore.Chairman, State: groupstore.Joined, Since: now,
 		}},
-		Version: 1, Created: now, Active: now, Expires: now.Add(s.cfg.IdleTTL),
+		Version: 1, Created: now, Active: now, Expires: now.Add(s.cfg.PendingTTL),
 	}
 	for _, in := range invitees {
 		g.Participants = append(g.Participants, groupstore.Participant{
@@ -330,7 +361,9 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	if err != nil {
 		return groupstore.Group{}, ErrInvalid
 	}
-	if err := s.store.Create(ctx, g, token, now); err != nil {
+	if err := s.store.Create(ctx, g, token, now); errors.Is(err, groupstore.ErrExists) && r.Contribution != "" {
+		return s.retried(ctx, g.URI, creator)
+	} else if err != nil {
 		return groupstore.Group{}, err
 	}
 	g.Rev = 1
@@ -338,6 +371,73 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	s.metrics.Count("group.name_dropped", int64(dropped))
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})
 	return g, nil
+}
+
+// conferenceID is the identifier of a new group's conference URI, 32
+// lower-case hex digits: made from contribution, when there is one, or
+// random. A Contribution-ID is no secret from the group's participants,
+// who know the conference URI anyway, and the URI grants nothing: every
+// request to it is checked against the roster.
+func (s *Service) conferenceID(contribution string) (string, error) {
+	if contribution == "" {
+		return s.randomHex(16)
+	}
+	sum := sha256.Sum256([]byte("rcs-as group chat\x00" + contribution))
+	return hex.EncodeToString(sum[:16]), nil
+}
+
+// retried is the group uri for its creator trying its INVITE again
+// (Create), or ErrTaken.
+func (s *Service) retried(ctx context.Context, uri, creator string) (groupstore.Group, error) {
+	g, err := s.get(ctx, uri)
+	switch {
+	case errors.Is(err, ErrNoGroup):
+		// It ended in between: the client tries again, and makes it.
+		return groupstore.Group{}, ErrBusy
+	case err != nil:
+		return groupstore.Group{}, err
+	case g.Creator != creator || !s.pending(g):
+		s.metrics.Count("group.rejected.taken", 1)
+		return groupstore.Group{}, ErrTaken
+	}
+	s.metrics.Count("group.create_retried", 1)
+	return g, nil
+}
+
+// pending reports a group not yet Established: it still expires
+// PendingTTL after it was made, which any later write moves on.
+func (s *Service) pending(g groupstore.Group) bool {
+	return !g.Expires.After(g.Created.Add(s.cfg.PendingTTL))
+}
+
+// Established records that the group's creator has its session, so that
+// the group lasts as any other, RCSAS_GROUP_IDLE_TTL from its last use,
+// and that a Create naming its Contribution-ID is no longer its creator
+// trying again. It changes no roster and sends no NOTIFY.
+func (s *Service) Established(ctx context.Context, uri string) error {
+	for range maxAttempts {
+		g, err := s.get(ctx, uri)
+		if err != nil {
+			return err
+		}
+		if !s.pending(g) {
+			return nil
+		}
+		g.Expires = s.cfg.Clock.Now().Add(s.cfg.IdleTTL)
+		token, err := s.randomHex(8)
+		if err != nil {
+			return err
+		}
+		err = s.store.Update(ctx, g, token)
+		switch {
+		case errors.Is(err, groupstore.ErrConflict):
+			continue
+		case errors.Is(err, groupstore.ErrNotFound):
+			return ErrNoGroup
+		}
+		return err
+	}
+	return ErrBusy
 }
 
 // canonicalInvitees puts the invitees' identities in canonical form,

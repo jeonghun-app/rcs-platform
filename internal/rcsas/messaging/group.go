@@ -83,40 +83,50 @@ func (e *Engine) groupHandler() GroupHandler {
 // if user is still not a participant. The mark is per task; elsewhere the
 // GroupHandler is asked before every invitation.
 func (e *Engine) ParticipantLeft(group, user string) {
-	now := e.clock.Now()
 	e.mu.Lock()
-	if len(e.departed) >= e.cfg.MaxTracked {
-		for k, until := range e.departed {
-			if !now.Before(until) {
-				delete(e.departed, k)
-			}
-		}
-		for k := range e.departed {
-			if len(e.departed) < e.cfg.MaxTracked {
-				break
-			}
-			delete(e.departed, k)
-		}
-	}
-	// Nothing queued outlives StoreTTL, so neither need the mark.
-	e.departed[legKey{user, group}] = now.Add(e.cfg.StoreTTL)
+	e.mark(e.departed, legKey{user, group})
 	delete(e.invites, inviteKey{user, group, store.Group, ""})
 	e.mu.Unlock()
 	e.kickEvent(user)
 }
 
+// mark records k in marks for as long as a copy could be queued for it,
+// within MaxTracked marks; it needs e.mu.
+func (e *Engine) mark(marks map[legKey]time.Time, k legKey) {
+	now := e.clock.Now()
+	if len(marks) >= e.cfg.MaxTracked {
+		for k, until := range marks {
+			if !now.Before(until) {
+				delete(marks, k)
+			}
+		}
+		for k := range marks {
+			if len(marks) < e.cfg.MaxTracked {
+				break
+			}
+			delete(marks, k)
+		}
+	}
+	// Nothing queued outlives StoreTTL, so neither need the mark.
+	marks[k] = now.Add(e.cfg.StoreTTL)
+}
+
 // ParticipantAdded tells the engine that user is a participant of group
-// again, after ParticipantLeft.
+// again, after ParticipantLeft, or one the group's invitation may reach
+// again after it found it unreachable.
 func (e *Engine) ParticipantAdded(group, user string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.departed, legKey{user, group})
+	delete(e.unreachable, legKey{user, group})
 }
 
-func (e *Engine) hasDeparted(k legKey) bool {
+func (e *Engine) hasDeparted(k legKey) bool { return e.marked(e.departed, k) }
+
+func (e *Engine) marked(marks map[legKey]time.Time, k legKey) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	until, ok := e.departed[k]
+	until, ok := marks[k]
 	return ok && e.clock.Now().Before(until)
 }
 
