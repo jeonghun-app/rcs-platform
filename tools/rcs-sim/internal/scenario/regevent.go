@@ -3,8 +3,9 @@ package scenario
 import (
 	"context"
 	"errors"
-	"math"
 
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
@@ -52,7 +53,7 @@ func regEvent(r *run) error {
 			return nil, err
 		case n.State != "active":
 			return nil, errors.New("the subscription is not active after the refresh")
-		case own.State != "active":
+		case !own.Active():
 			return nil, errors.New("the client's contact is not active after the refresh")
 		}
 		return map[string]int64{"version": int64(n.Info.Version)}, nil
@@ -67,7 +68,7 @@ func regEvent(r *run) error {
 		if err != nil {
 			return nil, err
 		}
-		if own.State != "terminated" || own.Event != "unregistered" {
+		if own.Active() || own.Event != reginfo.Unregistered {
 			return nil, errors.New("the client's contact did not end as unregistered")
 		}
 		// After the user's own de-registration the subscription ends as if
@@ -102,9 +103,9 @@ func regEvent(r *run) error {
 		// client may register again) or "rejected" (it may not; RFC 3680
 		// §4.7.1).
 		switch {
-		case own.State != "terminated":
+		case own.Active():
 			return nil, errors.New("the client's contact did not end with the network's deregistration")
-		case own.Event != "unregistered" && own.Event != "deactivated" && own.Event != "rejected":
+		case own.Event != reginfo.Unregistered && own.Event != reginfo.Deactivated && own.Event != reginfo.Rejected:
 			return nil, errors.New("the client's contact did not end as unregistered, deactivated or rejected")
 		}
 		// §5.4.1.5 sets the state to "terminated" and no reason; RFC 6665
@@ -127,7 +128,7 @@ func (r *run) subscribeRegEvent(ctx context.Context, c *sipClient) (*regWatch, m
 		defer cancel()
 		_, _ = sub.Unsubscribe(ctx)
 	})
-	w := &regWatch{impu: r.cfg.SIP.IMPU.String(), contact: c.ua.ContactURI().String(), sub: sub}
+	w := &regWatch{impu: r.cfg.SIP.IMPU, contact: c.ua.ContactURI(), instance: "<" + r.cfg.SIP.InstanceID + ">", sub: sub}
 	detail := map[string]int64{"status": int64(res.StatusCode)}
 	n, own, err := w.next(ctx)
 	switch {
@@ -135,56 +136,77 @@ func (r *run) subscribeRegEvent(ctx context.Context, c *sipClient) (*regWatch, m
 		return w, detail, err
 	case n.State != "active":
 		return w, detail, errors.New("the subscription is not active")
-	case n.Info.State != "full":
+	case n.Info.State != reginfo.Full:
 		return w, detail, errors.New("the first NOTIFY is not the full state")
-	case own.State != "active":
+	case !own.Active():
 		return w, detail, errors.New("the client's contact is not active")
 	}
 	detail["version"] = int64(n.Info.Version)
 	return w, detail, nil
 }
 
-// regWatch follows the NOTIFYs of one subscription.
+// regWatch follows the NOTIFYs of one subscription. instance is the
+// client's +sip.instance, as a contact parameter writes it.
 type regWatch struct {
-	impu, contact string
+	impu, contact sip.URI
+	instance      string
 	sub           *sipua.Subscription
-	version       uint64
+	version       uint32
 	seen          bool
 }
 
 // next waits for the next NOTIFY and returns it with the client's contact
-// in it. It checks what every NOTIFY must have: a reginfo body; a version
-// of 32 bits, 0 in the first and one more each time after (RFC 3680 §5.1,
-// §5.2); the client's contact; and, the contact active, its registration
-// active too, since a registration with a contact bound is active (§4.7.1).
-func (w *regWatch) next(ctx context.Context) (sipua.Notification, sipua.RegInfoContact, error) {
+// in it. internal/sip/reginfo has read the body, its version 32 bits. next
+// checks what every NOTIFY must have besides: a reginfo body; a version of
+// 0 in the first and one more each time after (RFC 3680 §5.1, §5.2); the
+// client's contact under its AOR, which ByAOR compares canonically; and,
+// the contact active, its registration active too, since a registration
+// with a contact bound is active (§4.7.1).
+func (w *regWatch) next(ctx context.Context) (sipua.Notification, reginfo.Contact, error) {
 	var n sipua.Notification
 	select {
 	case n = <-w.sub.Notifications():
 	case <-ctx.Done():
-		return n, sipua.RegInfoContact{}, errors.New("no NOTIFY came")
+		return n, reginfo.Contact{}, errors.New("no NOTIFY came")
 	}
 	switch {
 	case n.Err != nil:
-		return n, sipua.RegInfoContact{}, n.Err
+		return n, reginfo.Contact{}, n.Err
 	case n.Info == nil:
-		return n, sipua.RegInfoContact{}, errors.New("the NOTIFY has no reginfo")
-	case n.Info.Version > math.MaxUint32:
-		return n, sipua.RegInfoContact{}, errors.New("the reginfo version is not 32 bits")
+		return n, reginfo.Contact{}, errors.New("the NOTIFY has no reginfo")
 	case !w.seen && n.Info.Version != 0:
-		return n, sipua.RegInfoContact{}, errors.New("the first reginfo version is not 0")
+		return n, reginfo.Contact{}, errors.New("the first reginfo version is not 0")
 	case w.seen && n.Info.Version != w.version+1:
-		return n, sipua.RegInfoContact{}, errors.New("the reginfo version did not rise by one")
+		return n, reginfo.Contact{}, errors.New("the reginfo version did not rise by one")
 	}
 	w.version, w.seen = n.Info.Version, true
-	reg, own, ok := n.Info.Own(w.impu, w.contact)
+	reg, ok := n.Info.ByAOR(w.impu)
+	if !ok {
+		return n, reginfo.Contact{}, errors.New("the reginfo does not list the client's contact")
+	}
+	own, ok := w.own(reg)
 	switch {
 	case !ok:
 		return n, own, errors.New("the reginfo does not list the client's contact")
-	case own.State == "active" && reg.State != "active":
+	case own.Active() && reg.State != reginfo.Active:
 		return n, own, errors.New("the client's active contact is in a registration that is not active")
 	}
 	return n, own, nil
+}
+
+// own is the client's contact in reg: the one at its URI, or, if a URI is
+// bound more than once (RFC 5626 §6), the one with its +sip.instance.
+func (w *regWatch) own(reg reginfo.Registration) (reginfo.Contact, bool) {
+	cs := reg.ByURI(w.contact)
+	for _, c := range cs {
+		if inst, ok := c.Param("+sip.instance"); ok && inst == w.instance {
+			return c, true
+		}
+	}
+	if len(cs) == 0 {
+		return reginfo.Contact{}, false
+	}
+	return cs[0], true
 }
 
 // ended checks the subscription after the client's contact has terminated.
@@ -196,7 +218,7 @@ func (w *regWatch) ended(n sipua.Notification, reasons ...string) (map[string]in
 	detail := map[string]int64{"version": int64(n.Info.Version)}
 	others := 0
 	for _, reg := range n.Info.Registrations {
-		if reg.State != "terminated" {
+		if reg.State != reginfo.Terminated {
 			others++
 		}
 	}

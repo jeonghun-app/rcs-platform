@@ -198,8 +198,10 @@ It follows its own registration state (RFC 3680, TS 24.229 §5.1.1.3):
   `Accept: application/reginfo+xml` and an expiry of 600000 s. A NOTIFY that
   overtakes the 2xx sets up the subscription itself (RFC 6665 §4.1.2.4).
 - Each NOTIFY is answered 200 and delivered in order, with its
-  `Subscription-State`, reason, and `reginfo` body: version, state, and each
-  contact's state and event. The scenario checks the versions.
+  `Subscription-State`, reason, and `reginfo` body as
+  `internal/sip/reginfo` reads it, the parser scscf writes with and pcscf
+  reads with. The scenario checks the versions, and tells a contact's
+  registration by its state (`Contact.Active`), not its event.
 - The NOTIFY sets up the dialog (RFC 6665 §4.4.1): the first one's
   Record-Route is the route set, and each one's Contact the remote target.
   Before any NOTIFY, the 2xx's stand in.
@@ -208,9 +210,10 @@ It follows its own registration state (RFC 3680, TS 24.229 §5.1.1.3):
   does not have or from another dialog (another From tag: reg event
   subscriptions do not fork, RFC 3680 §4.9) 481, a CSeq not above the last
   500, and one after the subscription ended 481. A body that is not
-  `reginfo` is answered 200 and flagged in the notification. `reginfo`
-  without a version, with a document type declaration, or with anything
-  after its root element, is refused.
+  `reginfo`, or that `internal/sip/reginfo` refuses (a document type
+  declaration, a missing or 33-bit version, an AOR repeated or not a URI,
+  anything outside RFC 3680 §5.4), is answered 200 and flagged in the
+  notification.
 - `Unsubscribe` sends SUBSCRIBE with `Expires: 0` in the dialog, with the
   UA's Contact. A non-2xx comes back as a `StatusError`, as for
   `SubscribeRegEvent`. A terminated NOTIFY ends the subscription, and so

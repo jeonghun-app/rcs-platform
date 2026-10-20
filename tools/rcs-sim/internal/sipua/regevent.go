@@ -1,19 +1,16 @@
 package sipua
 
 import (
-	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
-	"io"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
@@ -24,138 +21,17 @@ const RegEventExpires = 600000
 // queueLength bounds the notifications a Subscription holds unread.
 const queueLength = 64
 
-// RegInfo is the body of a reg event NOTIFY (RFC 3680 §5).
-type RegInfo struct {
-	// Version starts at 0 and rises by one in each NOTIFY of a subscription
-	// (§5.1, §5.2).
-	Version uint64
-	// State is "full" or "partial".
-	State         string
-	Registrations []RegInfoRegistration
-}
-
-// RegInfoRegistration is one address-of-record's registration.
-type RegInfoRegistration struct {
-	AOR, ID string
-	// State is "init", "active" or "terminated".
-	State    string
-	Contacts []RegInfoContact
-}
-
-// RegInfoContact is one contact of a registration. Event says what changed
-// it: "registered", "created", "refreshed", "shortened", "expired",
-// "deactivated", "probation", "unregistered" or "rejected" (§4.7.1).
-type RegInfoContact struct {
-	ID, URI string
-	// State is "active" or "terminated".
-	State, Event string
-	Expires      uint64
-}
-
-// Contact returns the contact whose URI equals uri (RFC 3261 §19.1.4), if
-// the registration of aor lists it (see Own).
-func (r *RegInfo) Contact(aor, uri string) (RegInfoContact, bool) {
-	_, c, ok := r.Own(aor, uri)
-	return c, ok
-}
-
-// Own returns the registration of aor and its contact at uri, if the
-// document lists them. The notifier writes the contact URI back in its own
-// parameter order and case, so URIs compare as RFC 3261 §19.1.4 has it.
-// AORs compare in the form every service compares a public identity in
-// (identity.CanonicalIMPU): a notifier's aor without user=phone, or with its
-// host in another case, is still the client's. A registration whose aor is
-// not a public identity at all, empty or with a port say, is not the
-// client's even if it lists the client's contact: Own skips it (the
-// scenario's TestRegEventContactUnderANonIMPUAorIsNotTheClients). Asked
-// for an aor that is not one, Own finds nothing (FuzzParseRegInfo).
-func (r *RegInfo) Own(aor, uri string) (RegInfoRegistration, RegInfoContact, bool) {
-	want, err := sip.ParseURI(uri)
-	if err != nil {
-		return RegInfoRegistration{}, RegInfoContact{}, false
-	}
-	wantAOR, ok := identity.CanonicalIMPU(aor)
-	if !ok {
-		return RegInfoRegistration{}, RegInfoContact{}, false
-	}
-	for _, reg := range r.Registrations {
-		if got, ok := identity.CanonicalIMPU(reg.AOR); !ok || got != wantAOR {
-			continue
-		}
-		for _, c := range reg.Contacts {
-			if got, err := sip.ParseURI(c.URI); err == nil && got.Equal(want) {
-				return reg, c, true
-			}
-		}
-	}
-	return RegInfoRegistration{}, RegInfoContact{}, false
-}
-
-// xmlRegInfo is RegInfo as RFC 3680 §5.4 writes it.
-type xmlRegInfo struct {
-	XMLName       xml.Name `xml:"urn:ietf:params:xml:ns:reginfo reginfo"`
-	Version       string   `xml:"version,attr"`
-	State         string   `xml:"state,attr"`
-	Registrations []struct {
-		AOR      string `xml:"aor,attr"`
-		ID       string `xml:"id,attr"`
-		State    string `xml:"state,attr"`
-		Contacts []struct {
-			ID      string `xml:"id,attr"`
-			State   string `xml:"state,attr"`
-			Event   string `xml:"event,attr"`
-			Expires uint64 `xml:"expires,attr"`
-			URI     string `xml:"uri"`
-		} `xml:"contact"`
-	} `xml:"registration"`
-}
-
-// ParseRegInfo reads an application/reginfo+xml body.
-func ParseRegInfo(body []byte) (*RegInfo, error) {
-	// As the platform's parsers do (and ft's decode): no document type
-	// declaration, and nothing after the root element.
-	if bytes.Contains(body, []byte("<!DOCTYPE")) {
-		return nil, errors.New("sipua: the reginfo body has a document type declaration")
-	}
-	var x xmlRegInfo
-	dec := xml.NewDecoder(bytes.NewReader(body))
-	if err := dec.Decode(&x); err != nil {
-		return nil, errors.New("sipua: the reginfo body is not RFC 3680 XML")
-	}
-	if !onlyMiscAfter(dec) {
-		return nil, errors.New("sipua: the reginfo body goes on after its root element")
-	}
-	if x.State != "full" && x.State != "partial" {
-		return nil, errors.New("sipua: the reginfo state is neither full nor partial")
-	}
-	// The version is required (RFC 3680 §5.4): without it a notifier's
-	// first NOTIFY would pass for version 0.
-	version, err := strconv.ParseUint(x.Version, 10, 64)
-	if err != nil {
-		return nil, errors.New("sipua: the reginfo has no valid version")
-	}
-	r := &RegInfo{Version: version, State: x.State}
-	for _, xr := range x.Registrations {
-		reg := RegInfoRegistration{AOR: xr.AOR, ID: xr.ID, State: xr.State}
-		for _, xc := range xr.Contacts {
-			reg.Contacts = append(reg.Contacts, RegInfoContact{
-				ID: xc.ID, URI: strings.TrimSpace(xc.URI), State: xc.State, Event: xc.Event, Expires: xc.Expires,
-			})
-		}
-		r.Registrations = append(r.Registrations, reg)
-	}
-	return r, nil
-}
-
 // Notification is one NOTIFY of a subscription (RFC 6665 §4.1.3).
 type Notification struct {
 	// State is the Subscription-State: "active", "pending" or
 	// "terminated", with Reason for a terminated one ("deactivated",
 	// "rejected", "timeout", "noresource", ...).
 	State, Reason string
-	// Info is the body; nil without one. Err says why a body could not be
-	// read, for the scenario to fail on: the NOTIFY is answered 200 still.
-	Info *RegInfo
+	// Info is the body, read by internal/sip/reginfo, the parser scscf
+	// writes with and pcscf reads with; nil without one. Err says why a
+	// body could not be read, for the scenario to fail on: the NOTIFY is
+	// answered 200 still.
+	Info *reginfo.Info
 	Err  error
 }
 
@@ -213,7 +89,7 @@ func (ua *UA) SubscribeRegEvent(ctx context.Context) (*Subscription, *sip.Respon
 	contact.URI.Params.SetFlag("ob")
 	add(req, &err, "Contact", contact.String())
 	add(req, &err, "Event", "reg")
-	add(req, &err, "Accept", "application/reginfo+xml")
+	add(req, &err, "Accept", reginfo.ContentType)
 	add(req, &err, "Expires", strconv.Itoa(RegEventExpires))
 	if err != nil {
 		return nil, nil, err
@@ -427,41 +303,17 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	}
 }
 
-// onlyMiscAfter reports whether what dec has left after the root element
-// is only white space, comments and processing instructions, as XML's
-// Misc allows.
-func onlyMiscAfter(dec *xml.Decoder) bool {
-	for {
-		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) {
-			return true
-		}
-		if err != nil {
-			return false
-		}
-		switch t := tok.(type) {
-		case xml.Comment, xml.ProcInst:
-		case xml.CharData:
-			if len(bytes.TrimSpace(t)) != 0 {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-}
-
 // notification reads a NOTIFY's body, with its Subscription-State.
 func notification(req *sip.Request, state sip.SubscriptionState) Notification {
 	n := Notification{State: strings.ToLower(state.State), Reason: strings.ToLower(state.Reason())}
 	if len(req.Body) == 0 {
 		return n
 	}
-	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, "application/reginfo+xml") {
+	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, reginfo.ContentType) {
 		n.Err = errors.New("sipua: the NOTIFY's body is not application/reginfo+xml")
 		return n
 	}
-	n.Info, n.Err = ParseRegInfo(req.Body)
+	n.Info, n.Err = reginfo.Parse(req.Body)
 	return n
 }
 
