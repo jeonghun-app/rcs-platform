@@ -50,7 +50,7 @@ required.
 | `ICSCF_CORE_ADDR` | `0.0.0.0:5060` | the SIP listener |
 | `ICSCF_CORE_HOST` | the task's private IPv4 address | this task's address, in the Via of what it forwards |
 | `ICSCF_SCSCF` | `[{"uri":"sip:scscf.<namespace>:5060;transport=tcp"}]` | S-CSCFs to choose from, JSON: `uri`, and optional `mandatory` and `optional` capability numbers |
-| `ICSCF_RETRY_AFTER` | `10s` | `Retry-After` of the 480 and 503 above, whole seconds up to 1 h |
+| `ICSCF_RETRY_AFTER` | `10s` | `Retry-After` of the 480 and 500 above, whole seconds up to 1 h |
 | `ICSCF_REGISTER_TIMEOUT` | `16s` | how long a REGISTER waits for the S-CSCF; with twice `ICSCF_CX_TIMEOUT` (the UAR and its retry) under 32 s, the client's Timer F |
 | `ICSCF_DIAMETER_HOST` | `icscf-<random>.<namespace>` drawn at start ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) | this task's Diameter identity; leave unset in ECS (refused in staging and prod): every task needs its own, fresh at each start |
 | `ICSCF_DIAMETER_REALM` | `RCS_IMS_DOMAIN` | this task's Diameter realm |
@@ -58,6 +58,7 @@ required.
 | `ICSCF_HSS_DISCOVERY` | `cloudmap` | how the HSS tasks are found: `cloudmap` (DiscoverInstances, every task) or `dns` (`hss.<namespace>`, at most eight tasks; refused in staging and prod) |
 | `ICSCF_HSS_HOST_PATTERN` | `hss-*.<namespace>` | the Origin-Host every HSS task must have; a peer that claims another gets no request |
 | `ICSCF_CX_TIMEOUT` | `5s` | one Cx attempt; a failed or busy one is retried once on another HSS task |
+| `ICSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop waits for the requests in progress to get their final responses |
 
 ## Metrics
 
@@ -66,12 +67,12 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | Counter | Counts |
 |---|---|
 | `icscf.<kind>.forwarded` | requests forwarded; `kind` is `register`, `terminating`, or `routed` (a Route left, or inside a dialog) |
-| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 600) |
+| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 600), and 500 for an S-CSCF it could not reach |
 | `icscf.<kind>.cancelled` | requests cancelled while the HSS was asked |
 | `icscf.hss.unavailable` | HSS queries that could not be completed; alarm on a rise |
 | `icscf.hss.bad_server_name` | HSS answers naming an S-CSCF that is not a SIP URI |
 | `icscf.scscf.no_capable` | answers no configured S-CSCF can take: a provisioning problem; alarm on any |
-| `icscf.scscf.unreachable` | terminating requests answered 500 because the S-CSCF could not be reached |
+| `icscf.scscf.unreachable` | requests answered 500 because the S-CSCF could not be reached |
 | `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
 
 `cxclient.*` counts the Cx answers by result code and their latency.
@@ -79,7 +80,18 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 ## Health
 
 `/readyz` answers 503, naming `hss`, until a Diameter connection to an HSS
-task is up; requests that arrive meanwhile get the 480 above.
+task is up, and again while none is; requests that arrive meanwhile get the
+480 above. An HSS task that stops with a DPR is reconnected within a second
+of its return; one whose connection broke without a DPR is held in the
+watchdog's REOPEN state (RFC 3539 §3.4.1) for about a minute first.
+
+## Stop
+
+On SIGTERM `icscf` keeps its listener open and waits, for at most
+`ICSCF_DRAIN_TIMEOUT`, until no request is in progress, so a REGISTER at the
+S-CSCF or a ringing INVITE still gets its final response. A context lingers
+32 s after a 2xx to an INVITE to pass its retransmissions on, so a stop soon
+after a call waits out the whole timeout.
 
 ## AWS permissions
 
@@ -94,5 +106,4 @@ service as resources: the call names both. Infra adds it on #56.
 - The transaction caps of #37 are not configurable here until it lands.
 - S-CSCF re-selection, and the other parts of TS 24.229 §5.3 listed in the
   package documentation.
-- On stop, transactions in flight are not answered before the process ends
-  (a shared proxy drain, filed separately).
+- A drain shared by every proxy service (#281); icscf has its own until then.

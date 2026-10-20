@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,9 @@ const (
 	// waits for at most two, an attempt and its retry on another HSS task,
 	// before the S-CSCF's RegisterTimeout starts.
 	DefaultCxTimeout = cxclient.DefaultRequestTimeout
+	// stopMargin is what Run needs after the drain to close the proxy, the
+	// transport and the Cx client, inside RCS_SHUTDOWN_TIMEOUT.
+	stopMargin = 5 * time.Second
 )
 
 // ServiceConfig is icscf's configuration (docs/icscf.md), read by Configure
@@ -62,6 +66,37 @@ type ServiceConfig struct {
 	HSSHostPattern string
 	// CxTimeout bounds one Cx attempt.
 	CxTimeout time.Duration
+	// DrainTimeout bounds how long a stop waits for the requests in
+	// progress to get their final responses: by default RCS_SHUTDOWN_TIMEOUT
+	// less what the rest of the stop needs.
+	DrainTimeout time.Duration
+}
+
+// drainTimeout reads ICSCF_DRAIN_TIMEOUT, by default RCS_SHUTDOWN_TIMEOUT
+// less stopMargin, so Run returns inside the runtime's stop deadline. The
+// runtime reports a malformed RCS_SHUTDOWN_TIMEOUT itself, so the drain then
+// takes the default without a second, misleading problem.
+func drainTimeout(s *runtime.Settings) time.Duration {
+	e := s.Env
+	stop, known := runtime.DefaultShutdownTimeout, true
+	if v := s.Shared.String("SHUTDOWN_TIMEOUT", ""); v != "" {
+		d, err := time.ParseDuration(v)
+		if known = err == nil; known {
+			stop = d
+		}
+	}
+	def := runtime.DefaultShutdownTimeout - stopMargin
+	if known {
+		def = max(stop-stopMargin, 0)
+	}
+	d := e.Duration("DRAIN_TIMEOUT", def)
+	switch {
+	case d <= 0:
+		e.Invalid("DRAIN_TIMEOUT", "must be greater than zero, and RCS_SHUTDOWN_TIMEOUT longer than "+stopMargin.String())
+	case known && d+stopMargin > stop:
+		e.Invalid("DRAIN_TIMEOUT", "plus "+stopMargin.String()+" must not exceed RCS_SHUTDOWN_TIMEOUT ("+stop.String()+")")
+	}
+	return d
 }
 
 // prefixWildcard reports whether pattern is one label ending in '*' after a
@@ -109,8 +144,10 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	if !identity.IsDomainName(c.Namespace) {
 		e.Invalid("NAMESPACE", "not a domain name")
 	}
-	if _, _, err := net.SplitHostPort(c.CoreAddr); err != nil {
+	if _, port, err := net.SplitHostPort(c.CoreAddr); err != nil {
 		e.Invalid("CORE_ADDR", "not host:port")
+	} else if p, err := strconv.Atoi(port); err != nil || p < 0 || p > 65535 {
+		e.Invalid("CORE_ADDR", "the port is not a number from 0 to 65535")
 	}
 	for _, d := range []struct {
 		name string
@@ -119,6 +156,10 @@ func Configure(s *runtime.Settings) ServiceConfig {
 		if d.v != "" && !identity.IsDomainName(d.v) {
 			e.Invalid(d.name, "not a domain name")
 		}
+	}
+	// A Diameter identity is a fully qualified name (RFC 6733 §4.3.1).
+	if c.OriginHost != "" && !strings.Contains(c.OriginHost, ".") {
+		e.Invalid("DIAMETER_HOST", "needs two or more labels")
 	}
 	if c.RetryAfter < time.Second || c.RetryAfter > MaxRetryAfter || c.RetryAfter%time.Second != 0 {
 		e.Invalid("RETRY_AFTER", "must be whole seconds from 1s to 1h")
@@ -149,9 +190,12 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	// The pattern cannot be switched off: an empty value takes the default,
 	// so a peer that claims another identity is never trusted as the HSS
 	// (threat model T1).
-	if !identity.IsDomainName(strings.ReplaceAll(c.HSSHostPattern, "*", "x")) {
-		e.Invalid("HSS_HOST_PATTERN", "not a domain name with '*' in its labels")
+	// "**" matches no host at all, so icscf would stay unready for no
+	// reason it could tell (review of #276).
+	if !identity.IsDomainName(strings.ReplaceAll(c.HSSHostPattern, "*", "x")) || strings.Contains(c.HSSHostPattern, "**") {
+		e.Invalid("HSS_HOST_PATTERN", "not a domain name with one '*' at most in a label")
 	}
+	c.DrainTimeout = drainTimeout(s)
 	s.ForbidInProduction(!prefixWildcard(c.HSSHostPattern, c.Namespace),
 		"ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>: a wider pattern trusts as the HSS peers that are not HSS tasks (threat model T1)")
 	return c

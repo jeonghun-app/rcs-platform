@@ -47,6 +47,7 @@
 //	REGISTER     5001, 5002, 5003, 5004, other negatives   403                       §5.3.1.3
 //	REGISTER     could not be completed                    480 + Retry-After         §5.3.1.3
 //	REGISTER     (S-CSCF silent for RegisterTimeout)       504                       §5.3.1.3
+//	REGISTER     (the S-CSCF cannot be reached)            500 + Retry-After         review of #276
 //	REGISTER     (To is not an IMPU, or a bad username)    403, no UAR               local choice: the HSS would answer 5001
 //	terminating  success, Server-Name (or one in the caps) forward, Route = name     §5.3.2.1, TS 29.228 §6.7
 //	terminating  success, capabilities or none             forward, Route = chosen   §5.3.2.1
@@ -67,8 +68,7 @@
 // values inside Server-Capabilities are the operator steering the choice:
 // §6.7 has the capabilities disregarded then, and the first name is used as
 // a Server-Name would be. Retry-After is Config.RetryAfter, also on the 500
-// the proxy ends a terminating request in when it cannot send it to the
-// S-CSCF: the S-CSCF the user needs exists and will be back, unlike one no
+// the proxy ends a request in when it cannot send it to the S-CSCF: the S-CSCF the user needs exists and will be back, unlike one no
 // configured S-CSCF can stand for. It is a 500 and not a 503 because the
 // proxy upstream turns a 503 into a 500 and drops its Retry-After (RFC 3261
 // §16.7 step 6), and passes a 500's on.
@@ -104,7 +104,8 @@
 //	icscf.<kind>.forwarded      requests forwarded, kind register,
 //	                            terminating or routed (Route or dialog)
 //	icscf.<kind>.<code>         requests answered with code (403, 404,
-//	                            480, 600) by the I-CSCF
+//	                            480, 600) by the I-CSCF, and 500 for an
+//	                            S-CSCF it could not reach
 //	icscf.<kind>.cancelled      requests cancelled while the HSS was asked
 //	icscf.hss.unavailable       HSS queries that could not be completed
 //	icscf.hss.bad_server_name   answers naming an S-CSCF that is not a SIP
@@ -112,8 +113,8 @@
 //	icscf.scscf.no_capable      answers whose capabilities no configured
 //	                            S-CSCF has (600 or 480): a provisioning
 //	                            problem, to alarm on
-//	icscf.scscf.unreachable     terminating requests answered 500 because
-//	                            the proxy could not reach the S-CSCF
+//	icscf.scscf.unreachable     requests answered 500 because the proxy
+//	                            could not reach the S-CSCF
 //	icscf.routed.dropped_ack    ACKs without a To tag, dropped
 //
 // cxclient counts the Cx answers by result code, and the proxy and the

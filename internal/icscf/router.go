@@ -118,7 +118,12 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	// branch is bounded so that a silent S-CSCF is answered 504 while the
 	// client still waits (§5.3.1.3; re-selection is not done, see the
 	// package documentation).
-	return forwarding(proxy.Decision{Targets: []proxy.Target{{URI: scscf, Timeout: r.registerTimeout}}})
+	d := forwarding(proxy.Decision{Targets: []proxy.Target{{URI: scscf, Timeout: r.registerTimeout}}})
+	// An S-CSCF that cannot be sent to gets the client a Retry-After, as
+	// for a terminating request (review of #276); one that does not answer
+	// in time still gets it 504.
+	r.answerUnreachable(&d, kindRegister)
+	return d
 }
 
 // terminating applies TS 24.229 §5.3.2.1 and §5.3.2.2 to an initial request
@@ -167,19 +172,20 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 		URI:    uri,
 		Routes: []sip.Address{{URI: looseRoute(scscf)}},
 	}}})
-	r.answerUnreachable(&d)
+	r.answerUnreachable(&d, kindTerminating)
 	return d
 }
 
-// answerUnreachable gives the 500 the proxy ends a terminating request in,
-// when it could not send it to the S-CSCF, a Retry-After, as the HSS's
+// answerUnreachable gives the 500 the proxy ends a request in, a REGISTER or
+// a terminating one, when it could not send it to the S-CSCF, a
+// Retry-After, as the HSS's
 // failures get: the S-CSCF the user needs exists and will be back (decided
 // on #274). The proxy counts the branch as a 503 of its own (RFC 3261 §16.9)
 // and turns it into 500 (§16.7 step 6); a 503 would not reach the caller
 // either, since the proxy upstream turns it into a 500 and drops the
 // Retry-After, while it passes a 500's on. A 500 from the S-CSCF itself, or a
 // 503 it sent, gets none.
-func (r *Router) answerUnreachable(d *proxy.Decision) {
+func (r *Router) answerUnreachable(d *proxy.Decision, kind string) {
 	var unreachable atomic.Bool
 	d.OnBranchFailure = func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
 		if f.Err != nil && f.Response != nil && f.Response.StatusCode == 503 {
@@ -194,6 +200,7 @@ func (r *Router) answerUnreachable(d *proxy.Decision) {
 			return
 		}
 		r.metrics.Count("icscf.scscf.unreachable", 1)
+		r.count(kind, "500")
 		if !res.Header.Has("Retry-After") {
 			_ = res.Header.Add("Retry-After", r.retryAfter)
 		}

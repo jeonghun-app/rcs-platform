@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
@@ -44,6 +45,8 @@ type deps struct {
 	// resolver finds the next hop of a forwarded request; the proxy's
 	// NumericResolver when nil.
 	resolver proxy.Resolver
+	// hssResolver, if set, resolves hss.<namespace> for DNS discovery.
+	hssResolver cxclient.Resolver
 	// listening, if set, hears the core listener's bound address.
 	listening func(netip.AddrPort)
 }
@@ -111,7 +114,22 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		slog.String("origin_host", host), slog.Int("scscfs", len(cfg.SCSCFs)))
 	rt.Ready()
 	<-ctx.Done()
+	drain(px, cfg.DrainTimeout)
 	return nil
+}
+
+// drain waits, for at most d, until no request is in progress, so a stop
+// does not cut off a REGISTER waiting for the S-CSCF or a ringing INVITE:
+// their senders would get no final response (review of #276). The listener
+// stays open meanwhile, since Cloud Map's DNS answers name this task for
+// their TTL after it is deregistered. A context lingers 64*T1 after a 2xx
+// to an INVITE to pass its retransmissions on, so a stop soon after a call
+// waits out d. #281 tracks a drain shared by every proxy.
+func drain(px *proxy.Proxy, d time.Duration) {
+	deadline := time.Now().Add(d)
+	for px.Stats().Contexts > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own
@@ -141,7 +159,7 @@ func newCxClient(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d 
 	}
 	c, err := cxclient.New(cxclient.Config{
 		OriginHost: host, OriginRealm: cfg.OriginRealm, DestinationRealm: cfg.HSSRealm,
-		Discovery: disc, HSS: "hss." + cfg.Namespace, HSSHostPattern: cfg.HSSHostPattern,
+		Discovery: disc, HSS: "hss." + cfg.Namespace, Resolver: d.hssResolver, HSSHostPattern: cfg.HSSHostPattern,
 		RequestTimeout: cfg.CxTimeout, Node: diameter.Config{Dial: d.dial},
 		Metrics: rt.Metrics, Logger: rt.Logger,
 	})

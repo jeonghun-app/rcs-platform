@@ -40,6 +40,13 @@ func startHSS(t *testing.T) *diameterHSS { return startHSSAs(t, "hss-0a1b2c.rcs.
 // startHSSAs starts an HSS task whose Origin-Host is host.
 func startHSSAs(t *testing.T, host string) *diameterHSS {
 	t.Helper()
+	return startHSSAt(t, host, "127.0.0.1:0")
+}
+
+// startHSSAt starts an HSS task listening on addr, such as the address of
+// one that stopped.
+func startHSSAt(t *testing.T, host, addr string) *diameterHSS {
+	t.Helper()
 	dict, err := diameter.NewDictionary(cx.AVPs...)
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +64,7 @@ func startHSSAs(t *testing.T, host string) *diameterHSS {
 		t.Fatal(err)
 	}
 	n.SetErrorAVPs(cx.ApplicationID, cx.ErrorAVPs)
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,16 +184,20 @@ func (s *sipPeer) next(t *testing.T) *sip.Request {
 type running struct {
 	core netip.AddrPort
 	h    *runtimetest.Harness
+	// stop does what runtime.Run does on SIGTERM and waits for Run to
+	// return.
+	stop func()
 }
 
 // startICSCF runs icscf until the test ends, with its HSS at hss and the
 // S-CSCF list scscfs.
-func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF) *running {
+func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF, opts ...func(*ServiceConfig, *deps)) *running {
 	t.Helper()
 	h := runtimetest.New(t, "icscf")
 	cfg := ServiceConfig{
 		HomeDomain: home, Namespace: "rcs.local",
-		CoreAddr: "127.0.0.1:0", CoreHost: netip.MustParseAddr("127.0.0.1"),
+		// Not the bound address, so a test sees the advertised one in Via.
+		CoreAddr: "127.0.0.1:0", CoreHost: netip.MustParseAddr("127.0.0.2"),
 		SCSCFs: scscfs, RetryAfter: DefaultRetryAfter, RegisterTimeout: DefaultRegisterTimeout,
 		OriginRealm: home, HSSRealm: home, HSSDiscovery: DiscoveryDNS,
 		HSSHostPattern: "hss-*.rcs.local", CxTimeout: 2 * time.Second,
@@ -202,6 +213,9 @@ func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF) *running {
 		},
 		listening: func(a netip.AddrPort) { listening <- a },
 	}
+	for _, o := range opts {
+		o(&cfg, &d)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- run(ctx, h.Runtime, cfg, d) }()
@@ -215,17 +229,21 @@ func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF) *running {
 		cancel()
 		t.Fatal("icscf did not start")
 	}
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("run: %v", err)
+	var once sync.Once
+	r.stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("run: %v", err)
+				}
+			case <-time.After(realWait):
+				t.Error("icscf did not stop")
 			}
-		case <-time.After(realWait):
-			t.Error("icscf did not stop")
-		}
-	})
+		})
+	}
+	t.Cleanup(r.stop)
 	return r
 }
 
