@@ -675,6 +675,12 @@ class FailClosed(TemplateCase):
     def test_the_registry_imports_stay_allowed_in_execution_roles(self):
         self.assertEqual([p for p in check_infra.check_iam_shapes(self.template)], [])
 
+    def test_the_registry_import_is_refused_in_a_task_role(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "HssTaskRole").append({"Effect": "Allow", "Action": "ecr:BatchGetImage", "Resource": {
+            "Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-PlatformRepositoryArn"}}})
+        self.assertProblem(t, "HssTaskRole: Resource written with a function the checks cannot read")
+
     def test_the_sns_deny_must_cover_every_topic_exactly(self):
         t = copy.deepcopy(self.template)
         for p in t["Resources"]["AcsTaskRole"]["Properties"]["Policies"]:

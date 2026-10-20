@@ -1074,6 +1074,14 @@ def _documents(template: dict):
 
 
 def check_iam_shapes(template: dict) -> list[str]:
+    """Fail closed: every IAM statement is written so the other checks can
+    read it. Action and Resource are literals, Ref, GetAtt or Sub; no
+    statement or policy sits in an If inside another If.
+
+    One exception, accepted on #126: an execution role may name the registry
+    stack's repository by its export (ECR_IMPORTS), since the platform stack
+    does not create the repositories. A task role may not import anything.
+    """
     problems = []
     for name, document, imports_allowed in _documents(template):
         if document is None:
