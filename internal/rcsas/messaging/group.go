@@ -528,6 +528,7 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 	for i, n := range send {
 		dctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 		if i < len(send)-1 {
+			l.carried.Store(true)
 			_, err = l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: n.body, FailureReport: msrp.ReportNo})
 			cancel()
 			if err != nil {
@@ -760,6 +761,7 @@ func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrig
 		}
 		go func() {
 			ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
+			to.carried.Store(true)
 			_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, FailureReport: msrp.ReportNo})
 			cancel()
 			to.composing.Store(false)

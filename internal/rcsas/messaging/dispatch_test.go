@@ -365,6 +365,21 @@ func TestALargeModeSessionCarriesItsOneMessage(t *testing.T) {
 	waitDone(t, leg3.Finished())
 }
 
+// An open chat leg with the sender is no session for a large-mode
+// message, which still gets one of its own: invite looks for an open leg
+// only for the modes that go on one (#260).
+func TestALargeModeSessionIsAskedForBesideAnOpenChatLeg(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600})
+	l := r.listen(t)
+	r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Mode != store.Standalone || inv.QueueID == "" {
+		t.Fatalf("invitation %+v", inv)
+	}
+}
+
 // alice's own large-mode session to bob only carries what she sends: a
 // message from bob to her waits for a session of its own.
 func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {

@@ -7,9 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -22,9 +26,22 @@ import (
 // conflicting write is over within a moment.
 const busyRetryAfter = "1"
 
-// Engine is what Server needs from the messaging engine.
+// The default bounds on sessions. A session holds a leg and its MSRP
+// state, a few KiB; a user has one per conversation it has open, and its
+// client ends those it no longer uses.
+const (
+	DefaultMaxSessions        = 20_000
+	DefaultMaxSessionsPerUser = 32
+)
+
+// Engine is what Server needs from the messaging engine, which
+// *messaging.Engine is.
 type Engine interface {
 	Submit(ctx context.Context, o messaging.Origin) error
+	OpenLeg(p messaging.LegParams) (*messaging.Leg, error)
+	Offer(p messaging.LegParams) (*messaging.Leg, error)
+	InviteFailed(inv messaging.Invitation, err error)
+	UserRegistered(user string, newFlow bool)
 }
 
 // Config configures a Server.
@@ -39,6 +56,19 @@ type Config struct {
 	// a SIP URI whose user part is a global number names that number
 	// (UserOf).
 	HomeDomain string
+	// Contact is this task's SIP URI, the Contact of its sessions, where
+	// the requests in their dialogs reach it.
+	Contact sip.URI
+	// MaxMessageSize is the a=max-size of its SDP; zero leaves it out.
+	MaxMessageSize int
+	// MaxSessions bounds the sessions this task holds (threat model T9).
+	// MaxOutgoingPerUser bounds those one user opens, and
+	// MaxIncomingPerUser those rcs-as opens to it, apart, so that other
+	// users' messages cannot take the user's own room (security review on
+	// #252). Zero takes DefaultMaxSessions and DefaultMaxSessionsPerUser.
+	MaxSessions        int
+	MaxOutgoingPerUser int
+	MaxIncomingPerUser int
 	// Listener names the transport listener rcs-as's own requests leave
 	// through, whose sent-by their Via carries.
 	Listener string
@@ -47,6 +77,11 @@ type Config struct {
 	Resolver proxy.Resolver
 	// Rand draws tags, branches and Call-IDs; nil is crypto/rand.
 	Rand io.Reader
+	// Clock runs the session timers; nil is the system clock.
+	Clock msrp.Clock
+
+	// closeWait is closeWait unless a test sets it.
+	closeWait time.Duration
 	// Metrics counts events, without identifiers; nil counts nothing.
 	Metrics messaging.Counter
 	// Logger receives operational events, never identities or content; nil
@@ -62,6 +97,23 @@ type Server struct {
 	ids    sip.IDGenerator
 	engine Engine
 	layer  *transaction.Layer
+	// sender sends the ACKs of 2xx responses, which belong to no
+	// transaction (RFC 3261 §13.2.2.4).
+	sender transaction.Sender
+
+	mu       sync.Mutex
+	closed   bool
+	sessions map[string]*session
+	// perUser counts each user's sessions each way (session.budget),
+	// those still waiting for an answer included; pending counts those for
+	// all users. large holds the user and peer of each large-mode session
+	// rcs-as opens (session.largeKey).
+	perUser map[string]int
+	pending int
+	large   map[string]bool
+	// registered is when each user's registration, as rcs-as last heard
+	// of it, runs out (register).
+	registered map[string]time.Time
 }
 
 // New returns a Server for cfg.
@@ -75,6 +127,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.HomeDomain == "" {
 		return nil, errors.New("sipas: HomeDomain is required")
 	}
+	if !cfg.Contact.IsSIP() {
+		return nil, errors.New("sipas: Contact must be a SIP URI")
+	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = proxy.NumericResolver{}
 	}
@@ -84,19 +139,42 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Server{cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand}}, nil
+	if cfg.Clock == nil {
+		cfg.Clock = systemClock{}
+	}
+	if cfg.MaxSessions <= 0 {
+		cfg.MaxSessions = DefaultMaxSessions
+	}
+	if cfg.MaxOutgoingPerUser <= 0 {
+		cfg.MaxOutgoingPerUser = DefaultMaxSessionsPerUser
+	}
+	if cfg.MaxIncomingPerUser <= 0 {
+		cfg.MaxIncomingPerUser = DefaultMaxSessionsPerUser
+	}
+	return &Server{
+		cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand},
+		sessions: map[string]*session{}, perUser: map[string]int{}, large: map[string]bool{},
+		registered: map[string]time.Time{},
+	}, nil
 }
 
-// Bind gives s the engine it submits to and the transaction layer it sends
-// through, which is the proxy's (proxy.Proxy.Layer). It must be called
-// before the transport takes requests and before the engine delivers.
-func (s *Server) Bind(e Engine, l *transaction.Layer) {
-	s.engine, s.layer = e, l
+// Bind gives s the engine it submits to, the transaction layer it sends
+// through, which is the proxy's (proxy.Proxy.Layer), and the transport
+// under it. It must be called before the transport takes requests and
+// before the engine delivers.
+func (s *Server) Bind(e Engine, l *transaction.Layer, tr transaction.Sender) {
+	s.engine, s.layer, s.sender = e, l, tr
 }
 
 type noMetrics struct{}
 
 func (noMetrics) Count(string, int64) {}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+func (systemClock) AfterFunc(d time.Duration, f func()) msrp.Timer { return time.AfterFunc(d, f) }
 
 // ownTagPrefix starts the From tag of every request rcs-as originates, on
 // every task, so that one that comes back to it is known. It does when a
@@ -128,11 +206,18 @@ func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 482}
 	}
 	switch m := r.Message.Method; {
-	case m == "MESSAGE" && r.Initial():
-		return proxy.Decision{Serve: s.message}
-	case m == "MESSAGE":
-		// Pager mode has no dialog (RFC 3428 §4).
+	case m == "ACK":
+		// The ACK of a 2xx rcs-as sent went to its UAS (proxy.UAS.ACK);
+		// any other is dropped, as nothing answers an ACK.
 		return proxy.Decision{Status: 481}
+	case !r.Initial():
+		return proxy.Decision{Serve: s.inDialog}
+	case m == "MESSAGE":
+		return proxy.Decision{Serve: s.message}
+	case m == "INVITE":
+		return proxy.Decision{Serve: s.invite}
+	case m == "REGISTER":
+		return proxy.Decision{Serve: s.register}
 	case m == "OPTIONS":
 		// SESSION_CONTINUED: the chain goes on along the Route scscf put
 		// below its own entry, back to scscf.
@@ -152,8 +237,8 @@ func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
 	}
 }
 
-// allowed are the methods rcs-as takes today.
-const allowed = "MESSAGE, OPTIONS"
+// allowed are the methods rcs-as takes.
+const allowed = "INVITE, ACK, CANCEL, BYE, UPDATE, MESSAGE, OPTIONS, REGISTER"
 
 // message serves a pager-mode MESSAGE: the engine stores it, and 202 says
 // so (RFC 3428 §7).
@@ -194,11 +279,38 @@ func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	s.respond(u, req, code)
 }
 
-// unsupported are the option tags of req's Require, none of which rcs-as
-// supports for a MESSAGE; an error for a Require that is empty or does not
-// parse.
-func unsupported(req *sip.Request) ([]string, error) {
-	return req.Header.Require()
+// unsupported are the option tags of req's Require that are not among
+// supported, the ones rcs-as supports for its method: none for a MESSAGE,
+// timer for a session (RFC 4028); an error for a Require that is empty or
+// does not parse.
+func unsupported(req *sip.Request, supported ...string) ([]string, error) {
+	tags, err := req.Header.Require()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, t := range tags {
+		if !slices.ContainsFunc(supported, func(x string) bool { return strings.EqualFold(x, t) }) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// refuseUnsupported answers 420 with the option tags rcs-as lacks, or 400
+// for a Require it cannot read, which names none (RFC 3261 §20.32); it
+// reports whether it answered.
+func (s *Server) refuseUnsupported(u *proxy.UAS, req *sip.Request, supported ...string) bool {
+	bad, err := unsupported(req, supported...)
+	switch {
+	case err != nil:
+		s.respond(u, req, 400)
+	case len(bad) > 0:
+		s.respondWith(u, req, 420, [2]string{"Unsupported", strings.Join(bad, ", ")})
+	default:
+		return false
+	}
+	return true
 }
 
 // origin reads the engine's Origin from req, or the status that refuses it.
@@ -325,9 +437,18 @@ func refusalStatus(r messaging.Reason) int {
 	return 403
 }
 
-// respond answers req with code.
+// respond answers req with code. A 405 says what is allowed (RFC 3261
+// §21.4.6), a 422 the shortest session interval rcs-as takes (RFC 4028
+// §6).
 func (s *Server) respond(u *proxy.UAS, req *sip.Request, code int) {
-	s.respondWith(u, req, code)
+	switch code {
+	case 405:
+		s.respondWith(u, req, code, [2]string{"Allow", allowed})
+	case 422:
+		s.respondWith(u, req, code, [2]string{"Min-SE", strconv.Itoa(minSessionExpires)})
+	default:
+		s.respondWith(u, req, code)
+	}
 }
 
 // respondRetry answers req with code and says when to try again: the
