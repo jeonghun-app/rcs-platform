@@ -64,6 +64,15 @@ type ServiceConfig struct {
 	CxTimeout time.Duration
 }
 
+// prefixWildcard reports whether pattern is one label ending in '*' after a
+// prefix, followed by exactly the namespace, as hss-*.rcs.local is: the
+// shape that names the HSS tasks and nothing else (review of #276).
+func prefixWildcard(pattern, namespace string) bool {
+	label, rest, ok := strings.Cut(pattern, ".")
+	return ok && rest == namespace && strings.Count(pattern, "*") == 1 &&
+		strings.HasSuffix(label, "*") && len(label) > 1
+}
+
 // interfaceAddrs finds this task's addresses; tests replace it.
 var interfaceAddrs = net.InterfaceAddrs
 
@@ -143,5 +152,7 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	if !identity.IsDomainName(strings.ReplaceAll(c.HSSHostPattern, "*", "x")) {
 		e.Invalid("HSS_HOST_PATTERN", "not a domain name with '*' in its labels")
 	}
+	s.ForbidInProduction(!prefixWildcard(c.HSSHostPattern, c.Namespace),
+		"ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>: a wider pattern trusts as the HSS peers that are not HSS tasks (threat model T1)")
 	return c
 }

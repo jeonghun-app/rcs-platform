@@ -134,6 +134,12 @@ func TestProductionRefusesDNSDiscoveryAndAFixedOriginHost(t *testing.T) {
 	}{
 		{[]string{"ICSCF_HSS_DISCOVERY", "dns"}, "ICSCF_HSS_DISCOVERY=dns sees at most eight HSS tasks"},
 		{[]string{"ICSCF_DIAMETER_HOST", "icscf-a.rcs.local"}, "ICSCF_DIAMETER_HOST is set"},
+		// Review of #276: only <prefix>*.<namespace> names the HSS tasks.
+		{[]string{"ICSCF_HSS_HOST_PATTERN", "*.rcs.local"}, "ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>"},
+		{[]string{"ICSCF_HSS_HOST_PATTERN", "hss-*.*.local"}, "ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>"},
+		{[]string{"ICSCF_HSS_HOST_PATTERN", "hss-*.other.example"}, "ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>"},
+		{[]string{"ICSCF_HSS_HOST_PATTERN", "hss-*"}, "ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>"},
+		{[]string{"ICSCF_HSS_HOST_PATTERN", "*hss.rcs.local"}, "ICSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			status, out := startup(t, with(prodEnv, tt.kv...))
@@ -142,8 +148,13 @@ func TestProductionRefusesDNSDiscoveryAndAFixedOriginHost(t *testing.T) {
 			}
 		})
 	}
-	if _, err := configure(with(devEnv, "ICSCF_DIAMETER_HOST", "icscf-a.rcs.local")); err != nil {
-		t.Fatalf("dev refused a fixed Origin-Host: %v", err)
+	if _, err := configure(with(devEnv, "ICSCF_DIAMETER_HOST", "icscf-a.rcs.local", "ICSCF_HSS_HOST_PATTERN", "*.rcs.local")); err != nil {
+		t.Fatalf("dev refused a fixed Origin-Host or a wide pattern: %v", err)
+	}
+	for _, p := range []string{"hss-*.rcs.local", "h*.rcs.local"} {
+		if !prefixWildcard(p, "rcs.local") {
+			t.Errorf("%q refused", p)
+		}
 	}
 	if c, err := configure(with(devEnv, "ICSCF_HSS_HOST_PATTERN", "")); err != nil || c.HSSHostPattern != "hss-*.rcs.local" {
 		t.Errorf("an empty pattern gave %q (%v), want the default", c.HSSHostPattern, err)

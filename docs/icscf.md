@@ -84,7 +84,8 @@ task is up; requests that arrive meanwhile get the 480 above.
 ## AWS permissions
 
 With `ICSCF_HSS_DISCOVERY=cloudmap` the task role needs
-`servicediscovery:DiscoverInstances` on the namespace's `hss` service.
+`servicediscovery:DiscoverInstances` with both the namespace and its `hss`
+service as resources: the call names both. Infra adds it on #56.
 
 ## Not in place yet
 
