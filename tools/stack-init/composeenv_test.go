@@ -37,7 +37,10 @@ func readEnv(t *testing.T, path string) map[string]string {
 	return m
 }
 
-var secret = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var (
+	secret = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	key    = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
 
 func TestComposeEnvGeneratesEverySecretOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "compose.env")
@@ -58,6 +61,18 @@ func TestComposeEnvGeneratesEverySecretOnce(t *testing.T) {
 	}
 	if first["HSS_ADMIN_TOKEN"] == first["HSS_FT_TOKEN"] {
 		t.Error("two secrets are equal")
+	}
+	// Each test subscriber's own AKA keys, 128 bits each, never shared
+	// (#236).
+	keys := map[string]bool{}
+	for _, k := range []string{"RCS_SIM_AKA_K", "RCS_SIM_AKA_OPC", "RCS_SIM_PEER_AKA_K", "RCS_SIM_PEER_AKA_OPC"} {
+		if !key.MatchString(first[k]) {
+			t.Errorf("%s = %q, want 32 hex digits", k, first[k])
+		}
+		keys[first[k]] = true
+	}
+	if len(keys) != 4 {
+		t.Error("two AKA keys are equal")
 	}
 	// A second run keeps the file.
 	if out, err := composeEnv(t, path); err != nil || !strings.Contains(out, "keeping it") {
@@ -116,6 +131,21 @@ func TestComposeEnvRefusesAFileWithAnEmptySecret(t *testing.T) {
 	}
 	out, err := composeEnv(t, path)
 	if err == nil || !strings.Contains(out, "ACS_ADMIN_TOKEN") || !strings.Contains(out, "-f") {
+		t.Fatalf("%v: %s", err, out)
+	}
+}
+
+func TestComposeEnvRefusesAFileWithAnEmptyAKAKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compose.env")
+	if out, err := composeEnv(t, path); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	b, _ := os.ReadFile(path)
+	cleared := regexp.MustCompile(`(?m)^RCS_SIM_PEER_AKA_OPC=.*$`).ReplaceAll(b, []byte("RCS_SIM_PEER_AKA_OPC="))
+	if err := os.WriteFile(path, cleared, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := composeEnv(t, path); err == nil || !strings.Contains(out, "RCS_SIM_PEER_AKA_OPC") {
 		t.Fatalf("%v: %s", err, out)
 	}
 }

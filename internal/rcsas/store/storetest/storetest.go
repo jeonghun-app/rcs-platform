@@ -57,6 +57,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("RemovingAGroupNotificationFreesTheTotal", func(t *testing.T) { groupTotalFreed(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
+	t.Run("ASummaryGoesOnlyOnceItsMarksAreSent", func(t *testing.T) { summaries(t, newStore(t)) })
 }
 
 func pendingOrder(t *testing.T, s store.Store) {
@@ -517,7 +518,7 @@ func longKeys(t *testing.T, s store.Store) {
 	if err := s.RecordSent(ctx, r, t0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkNotified(ctx, who, id, "display-notification "+who, "t1", t0); err != nil {
+	if err := s.MarkNotified(ctx, who, id, "display-notification "+who, "displayed", "t1", t0); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := s.Sent(ctx, who, id, t0); err != nil || got.Recipients[0] != who {
@@ -527,44 +528,164 @@ func longKeys(t *testing.T, s store.Store) {
 
 func marks(t *testing.T, s store.Store) {
 	ctx := context.Background()
-	if err := s.MarkNotified(ctx, alice, "m-1", "k", "t1", t0); !errors.Is(err, store.ErrNotFound) {
+	if err := s.MarkNotified(ctx, alice, "m-1", "k", "displayed", "t1", t0); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("MarkNotified without a record = %v", err)
 	}
 	r := store.Sent{Sender: alice, MessageID: "m-1", Recipients: []string{bob}, Dispositions: imdn.Display, Expires: t0.Add(time.Hour)}
 	if err := s.RecordSent(ctx, r, t0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t1", t0); err != nil {
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "displayed", "t1", t0); err != nil {
 		t.Fatal(err)
 	}
 	// The same attempt again succeeds; another attempt is a duplicate.
-	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t1", t0); err != nil {
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "displayed", "t1", t0); err != nil {
 		t.Fatalf("repeated MarkNotified = %v", err)
 	}
-	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t2", t0); !errors.Is(err, store.ErrExists) {
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "displayed", "t2", t0); !errors.Is(err, store.ErrExists) {
 		t.Fatalf("a second notification = %v", err)
 	}
-	if err := s.MarkNotified(ctx, alice, "m-1", "delivery "+bob, "t2", t0); err != nil {
+	if err := s.MarkNotified(ctx, alice, "m-1", "delivery "+bob, "displayed", "t2", t0); err != nil {
 		t.Fatalf("another kind = %v", err)
 	}
 	// Undone by another attempt: nothing happens; by its own: free again.
 	if err := s.UnmarkNotified(ctx, alice, "m-1", "display "+bob, "t2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t3", t0); !errors.Is(err, store.ErrExists) {
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "displayed", "t3", t0); !errors.Is(err, store.ErrExists) {
 		t.Fatalf("after another attempt's unmark = %v", err)
 	}
 	if err := s.UnmarkNotified(ctx, alice, "m-1", "display "+bob, "t1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "t3", t0); err != nil {
+	if err := s.MarkNotified(ctx, alice, "m-1", "display "+bob, "displayed", "t3", t0); err != nil {
 		t.Fatalf("after its own unmark = %v", err)
 	}
 	if err := s.UnmarkNotified(ctx, carol, "m-9", "k", "t1"); err != nil {
 		t.Fatalf("UnmarkNotified without a record = %v", err)
 	}
-	if err := s.MarkNotified(ctx, alice, "m-1", "processing", "t4", t0.Add(time.Hour)); !errors.Is(err, store.ErrNotFound) {
+	// The record reads back each mark with its status, and how many were
+	// ever marked: the repeat of t1 counted nothing, the unmark took
+	// nothing off.
+	got, err := s.Sent(ctx, alice, "m-1", t0)
+	if err != nil || got.MarkCount != 3 || len(got.Marks) != 2 || got.Marks["display "+bob] != "displayed" {
+		t.Fatalf("Sent = %+v, %v", got, err)
+	}
+	if err := s.MarkNotified(ctx, alice, "m-1", "processing", "displayed", "t4", t0.Add(time.Hour)); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("MarkNotified after expiry = %v", err)
+	}
+}
+
+// A summary (#166) counts toward its queue only, comes back as one, and is
+// removed only while the sent record it summarizes has the mark count its
+// expansion read, or is gone.
+func summaries(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	const group = "sip:chat-1@conf.example.net"
+	r := store.Sent{Sender: group, MessageID: "g-1", Author: alice, Recipients: []string{bob, carol}, Dispositions: imdn.Display,
+		DateTime: "2026-03-04T05:06:07Z", Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, r, t0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Sent(ctx, group, "g-1", t0); err != nil || got.DateTime != r.DateTime || got.MarkCount != 0 {
+		t.Fatalf("Sent = %+v, %v", got, err)
+	}
+	if err := s.MarkNotified(ctx, group, "g-1", "display-notification "+bob, "displayed", "t1", t0); err != nil {
+		t.Fatal(err)
+	}
+	// alice's share, the group's share and the total are full: the
+	// summary still goes in.
+	l := store.Limit{Count: 10, SenderCount: 1, GroupCount: 1}
+	n := message(alice, "n1", t0)
+	n.Sender, n.Author, n.Mode, n.Notification = group, bob, store.Group, true
+	if err := s.Enqueue(ctx, n, l); err != nil {
+		t.Fatal(err)
+	}
+	sum := store.Message{Recipient: alice, ID: "r-g-1", Sender: group, Mode: store.Group, Notification: true, Summary: true,
+		MessageID: "g-1", Enqueued: t0, Expires: t0.Add(time.Hour)}
+	if err := s.Enqueue(ctx, sum, l); err != nil {
+		t.Fatalf("a summary beside full shares = %v", err)
+	}
+	if err := s.Enqueue(ctx, sum, l); !errors.Is(err, store.ErrExists) {
+		t.Fatalf("a second summary = %v", err)
+	}
+	held, err := s.Claim(ctx, alice, "r-g-1", "task-a", t0, t0.Add(time.Minute))
+	if err != nil || !held.Summary || held.MessageID != "g-1" || held.Sender != group {
+		t.Fatalf("Claim = %+v, %v", held, err)
+	}
+	if err := s.RemoveSummary(ctx, held, "task-b", 1); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("RemoveSummary by another owner = %v", err)
+	}
+	// A notification marked since the expansion read the record: it stays.
+	if err := s.MarkNotified(ctx, group, "g-1", "display-notification "+carol, "displayed", "t2", t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveSummary(ctx, held, "task-a", 1); !errors.Is(err, store.ErrMarksChanged) {
+		t.Fatalf("RemoveSummary after a new mark = %v", err)
+	}
+	if err := s.RemoveSummary(ctx, held, "task-a", 2); err != nil {
+		t.Fatalf("RemoveSummary = %v", err)
+	}
+	if ms, _ := s.Pending(ctx, alice, "", t0, 10); len(ms) != 1 || ms[0].ID != n.ID {
+		t.Fatalf("queue after the summary %+v", ms)
+	}
+	if err := s.RemoveSummary(ctx, held, "task-a", 2); err != nil {
+		t.Fatalf("RemoveSummary of one gone = %v", err)
+	}
+	// Removing the summary freed its room in the queue, not in a share.
+	full := store.Limit{Count: 2, SenderCount: 1, GroupCount: 1}
+	if err := s.Enqueue(ctx, store.Message{Recipient: alice, ID: "r-g-2", Sender: group, Mode: store.Group, Notification: true,
+		Summary: true, MessageID: "g-2", Enqueued: t0, Expires: t0.Add(time.Hour)}, full); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, store.Message{Recipient: alice, ID: "r-g-3", Sender: group, Mode: store.Group, Notification: true,
+		Summary: true, MessageID: "g-3", Enqueued: t0, Expires: t0.Add(time.Hour)}, full); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("a summary beyond the queue = %v", err)
+	}
+	// Without a record, there is nothing to summarize: it goes.
+	h2, err := s.Claim(ctx, alice, "r-g-2", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveSummary(ctx, h2, "task-a", 0); err != nil {
+		t.Fatalf("RemoveSummary without a record = %v", err)
+	}
+	// Summaries have a total of their own, which a removal frees.
+	capped := store.Limit{Count: 10, SummaryCount: 1}
+	summary := func(id string) store.Message {
+		return store.Message{Recipient: alice, ID: "r-" + id, Sender: group, Mode: store.Group, Notification: true,
+			Summary: true, MessageID: id, Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	if err := s.Enqueue(ctx, summary("g-4"), capped); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, summary("g-5"), capped); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("a summary beyond the summaries' total = %v", err)
+	}
+	n2 := message(alice, "n2", t0)
+	n2.Sender, n2.Author, n2.Mode, n2.Notification = group, carol, store.Group, true
+	if err := s.Enqueue(ctx, n2, capped); err != nil {
+		t.Fatalf("a notification beside a full summaries' total = %v", err)
+	}
+	h4, err := s.Claim(ctx, alice, "r-g-4", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveSummary(ctx, h4, "task-a", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, summary("g-5"), capped); err != nil {
+		t.Fatalf("a summary after RemoveSummary freed the total = %v", err)
+	}
+	h5, err := s.Claim(ctx, alice, "r-g-5", "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, h5, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, summary("g-6"), capped); err != nil {
+		t.Fatalf("a summary after Remove freed the total = %v", err)
 	}
 }
 

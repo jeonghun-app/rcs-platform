@@ -205,6 +205,16 @@ participating function and store messages for users who are offline
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
 
+Every trigger also requires that the request has no `P-Served-User`. `rcs-as`
+sends requests of its own: stored messages it delivers later, notifications the
+network generates, and the terminating legs of chat sessions. It sends them to
+`scscf` as terminating requests with `P-Served-User: <user>;sescase=term`, so
+that they go on to the user's contacts. Without that check they would come back
+to `rcs-as`, which would store them and send them again, in a loop. A client
+cannot set the header: `pcscf` removes it from every client request ([ADR
+0007](adr/0007-internal-transport.md) §7), and only platform services reach the
+core SIP ports.
+
 Chat and messaging fail rather than bypass `rcs-as`, which anchors MSRP and keeps
 IMDN and store-and-forward; capability discovery and registration continue while it
 is down. Each service condition is its own trigger, with one header name and one
@@ -212,8 +222,16 @@ literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.` or
 `3gpp-application\.ims\.iari\.rcs\.`), the ICSI and IARI text after `urn-7`,
 which is the same in percent-encoded feature tags and in the plain service headers.
 The profile is created at start if missing; an operator's changes to it are kept.
+So a profile created before the `P-Served-User` check (#137) keeps its old
+triggers until an operator updates it through the API. No deployment had one.
 
 ### Writing iFC
+
+Every trigger that sends requests to `rcs-as` needs the condition that the
+request has no `P-Served-User`, in a group of its own, as in the default
+profile. Without it, the requests `rcs-as` sends for its users come back to it:
+`rcs-as` refuses them with 482 and counts `sip.loop`, and those users' messages
+are not delivered.
 
 Criteria are JSON in the provisioning API (field names follow the TS 29.228 XML
 schema). Patterns are POSIX extended regular expressions (TS 29.228 Annex F). A

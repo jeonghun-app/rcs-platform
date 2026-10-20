@@ -27,7 +27,9 @@ import (
 //     pager mode the way, or the retry timer.
 //   - The recipient could not be reached (holdBlocked): a new message
 //     waits too. Any registration, a leg, or the retry timer reads the
-//     queue.
+//     queue. A message that comes in while such a pass runs is noted:
+//     should the pass get through, the queue is read again for it, since
+//     the pass may have read past where it sorts (#214).
 //
 // The retry timer starts at RetryInterval and doubles up to
 // MaxRetryInterval while a queue stays held, so a recipient that never
@@ -61,6 +63,9 @@ type recipient struct {
 	// last passes left waiting for a session: a new message from one of
 	// them must not go ahead of those, from anyone else it may.
 	waiting map[string]bool
+	// arrived notes a message queued while a pass ran with the queue
+	// blocked (see hold).
+	arrived bool
 }
 
 // state needs e.mu.
@@ -125,6 +130,9 @@ func (e *Engine) kickNew(m store.Message) {
 			r.waiting[m.Sender] = true
 		}
 	case holdBlocked:
+		if r.run == running {
+			r.arrived = true
+		}
 		return
 	}
 	e.schedule(m.Recipient, r)
@@ -186,6 +194,24 @@ func (e *Engine) work() {
 				}
 			}
 			e.settle(user, r, res, full)
+			if r.arrived {
+				// A pass that stopped leaves it to wait like the rest. One
+				// that got through, full or of single messages, has the
+				// queue read again for it: a pass of singles leaves the
+				// hold as it was, so the hold cannot tell.
+				r.arrived = false
+				if !res.stopped {
+					r.full = true
+				}
+			}
+			if !full && !res.stopped && r.hold == holdBlocked {
+				// A pass of singles got through to a queue an earlier
+				// pass left blocked: the recipient is reachable, and only
+				// a pass over the whole queue says what holds it now.
+				// Left blocked, a message that comes in after this run
+				// would wait for the retry timer, up to MaxRetryInterval.
+				r.full = true
+			}
 			if e.closed {
 				break
 			}
@@ -469,6 +495,9 @@ func (e *Engine) viaLeg(ctx context.Context, l *Leg, m store.Message) outcome {
 	c, ok := e.claim(ctx, m)
 	if !ok {
 		return done
+	}
+	if c.Summary {
+		return e.sendSummary(ctx, l, c)
 	}
 	return e.sendClaimed(ctx, l, c)
 }

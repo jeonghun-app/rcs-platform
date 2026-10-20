@@ -146,11 +146,23 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
 
   The key names come from the store packages. `make test-integration` checks
   that each store accepts what this creates.
-- `stack-init seed` (`stack-seed`) runs once `hss` and `acs` are healthy:
-  - `hss`: the subscription of IMPI `001010000000001@ims.mnc001.mcc001.3gppnetwork.org`,
-    IMPU `sip:+15550100001@…`, managed by `acs`;
-  - `acs`: subscriber IMSI `001010000000001`, MSISDN `+15550100001`, with the
-    overrides in [acs](#acs).
+- `stack-init seed` (`stack-seed`) runs once `hss` and `acs` are healthy. It
+  provisions rcs-sim's two test subscribers, the client (IMSI
+  `001010000000001`, MSISDN `+15550100001`) and the peer (`001010000000002`,
+  `+15550100002`), each the same way:
+  - `hss`: the subscription of IMPI `<IMSI>@ims.mnc001.mcc001.3gppnetwork.org`,
+    IMPU `sip:<MSISDN>@…`, managed by `acs`, with its own AKA keys (`PUT
+    /aka`), which keeps the SQN on a re-run;
+  - `acs`: the subscriber, with the overrides in [acs](#acs).
+
+  The keys are `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC` for the client and
+  `RCS_SIM_PEER_AKA_K` and `RCS_SIM_PEER_AKA_OPC` for the peer, the names
+  rcs-sim reads, in `deploy/compose.env`: `make up` generates 128 random bits
+  for each, so they are made up for the stack, never a SIM's, and never
+  shared by the two subscribers (seed refuses a shared one, #236). The output
+  says "client" and "peer", never an identity or a key. Digest passwords are
+  not seeded: `hss` issues them, and whoever needs one asks for it, as `make
+  e2e-compose` does for FT.
 
   It is in the compose profile `seed`, and `make up` runs it with
   `docker compose run`. `up --wait` would count a finished one-shot that

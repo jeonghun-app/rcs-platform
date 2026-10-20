@@ -27,8 +27,10 @@ MESSAGE through pcscf) replaces both parts.
 | `ft-resume` | pre-check, interrupted-upload, get_upload_info, resume (or upload-again), get_download_info, download | the server keeps whole leading parts of a broken upload; the PUT with `Content-Range` completes it; the file comes back whole by SHA-256 |
 | `chat-client-originated` | listen-core, allocate (client path), answer (core path), connect, client-to-core, core-to-client, chunked-message, keep-alive, clean, release | ADR 0004's first row: messages both ways with CPIM and IMDN, delivered and displayed notifications, the success report of each message by its Message-ID, a 100 KiB message in 2 KiB chunks, keep-alives on a quiet session; after the release, the client path is refused with 481 |
 | `chat-core-originated` | listen-core, allocate (core path), connect-then-answer, core-sends-first, then as above | ADR 0004's second row: the client connects as soon as it has answered, before pcscf records its path (the PATCH goes 300 ms later, so the relay must wait, `RELAY_PATH_WAIT`), and the network speaks first |
+| `pager-message` | register (both clients), message, receive, delivery-notification, peer-offline | RCC.07 standalone messaging, pager mode (#135): a MESSAGE with CPIM and an IMDN delivery request from the client to the peer's IMPU, answered 200 and received on the peer's flow, its text and Message-ID intact; the delivery notification back to the client as a MESSAGE of its own, to the message's SIP From (RFC 5438 §7.2.1, §12.1.3.1), matched by Message-ID. Messages an earlier run left in a store-and-forward network are told by the run's Message-IDs and a token in the text, skipped and counted (`skipped`). Then the peer unregisters and the client sends it another message: today the platform answers 480, which passes; a network that stores it (200 or 202) passes only if it delivers it once the peer registers again (`stored`), and one that accepts it and loses it fails. Both clients unregister at the end. Needs `-sip-proxy` and a peer IMPI |
+| `reg-event` | register, subscribe, re-register, unregister, network-deregister | the reg event of the client's own IMPU (RFC 3680, TS 24.229 §5.1.1.3, #135): the SUBSCRIBE is answered 2xx and the first NOTIFY is active, the full state, version 0, with the client's contact active; a refresh REGISTER brings a NOTIFY with the contact still active; the de-registration brings one with the client's contact terminated by `unregistered`. The subscription must then end (no reason, `timeout` or `deactivated`) unless another registration is still active, a binding an earlier run left say, which `others` counts. Then the client registers and subscribes again, the network deregisters it (`scenario.Config.Deregister`, as an operator's DELETE through the HSS API would), and its contact must end by `unregistered`, `deactivated` or `rejected` (TS 24.229 §5.4.1.5), with the subscription ending with no reason or one RFC 6665 §4.1.3 allows. After the user's own de-registration `noresource` fails: it says the registration went away without the user. In each subscription the versions start at 0 and rise by one (RFC 3680 §5.1, §5.2), an active contact must be in an active registration (§4.7.1), and AORs compare in canonical form (`user=phone` and the host's case do not matter). Errors are fixed texts. Needs `-sip-proxy`. network-deregister also needs a deregistration hook, which rcs-sim has no flag for until the HSS API's DELETE and scscf's RTR exist (#14): until then it is skipped, and `-require-all` makes that a failure |
 
-`all` runs every scenario. A scenario stops at its first failed step.
+`all` runs every scenario. It leaves the SIP ones out when no SIP client is configured (no `-sip-proxy`), since a stack without pcscf cannot run them. With `-sip-proxy` they all run, and one that needs a setting not given, such as the peer, fails at its first step with a line that says which. A scenario stops at its first failed step.
 
 ### What the clients do
 
@@ -147,8 +149,10 @@ It answers the registrar's challenge:
 
 The credentials come from the environment only: K and OPc as 32 hex digits in
 `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`, the Digest password in
-`RCS_SIM_SIP_PASSWORD`. Only made-up keys or the TS 35.208 test sets belong
-there. They print as a placeholder in every form.
+`RCS_SIM_SIP_PASSWORD`. The peer has its own, in `RCS_SIM_PEER_AKA_K`,
+`RCS_SIM_PEER_AKA_OPC` and `RCS_SIM_SIP_PEER_PASSWORD`: one secret shared by
+two subscribers would hide a client that answers with the other's. Only
+made-up keys or the TS 35.208 test sets belong there. They print as a placeholder in every form.
 
 It sets up 1-to-1 chats as the caller (RFC 3261 §12–15):
 
@@ -188,14 +192,55 @@ As the called party, it hands each INVITE from the network to the scenario
 - A CANCEL before the answer gets 200, and the INVITE 487 (§9.2). After the
   answer it gets 200 and changes nothing. A CANCEL for no INVITE gets 481.
 
+It follows its own registration state (RFC 3680, TS 24.229 §5.1.1.3):
+
+- `SubscribeRegEvent` sends SUBSCRIBE for the reg event of the IMPU, with
+  `Accept: application/reginfo+xml` and an expiry of 600000 s. A NOTIFY that
+  overtakes the 2xx sets up the subscription itself (RFC 6665 §4.1.2.4).
+- Each NOTIFY is answered 200 and delivered in order, with its
+  `Subscription-State`, reason, and `reginfo` body as
+  `internal/sip/reginfo` reads it, the parser scscf writes with and pcscf
+  reads with. The scenario checks the versions, and tells a contact's
+  registration by its state (`Contact.Active`), not its event.
+- The NOTIFY sets up the dialog (RFC 6665 §4.4.1): the first one's
+  Record-Route is the route set, and each one's Contact the remote target.
+  Before any NOTIFY, the 2xx's stand in.
+- A NOTIFY without a readable `Subscription-State` or `Event` gets 400, one
+  for another event package 489, one with an event id this subscription
+  does not have or from another dialog (another From tag: reg event
+  subscriptions do not fork, RFC 3680 §4.9) 481, a CSeq not above the last
+  500, and one after the subscription ended 481. A body that is not
+  `reginfo`, or that `internal/sip/reginfo` refuses (a document type
+  declaration, a missing or 33-bit version, an AOR repeated or not a URI,
+  anything outside RFC 3680 §5.4), is answered 200 and flagged in the
+  notification.
+- `Unsubscribe` sends SUBSCRIBE with `Expires: 0` in the dialog, with the
+  UA's Contact. A non-2xx comes back as a `StatusError`, as for
+  `SubscribeRegEvent`. A terminated NOTIFY ends the subscription, and so
+  does an answer that says it no longer exists, 481 among them (§4.1.2.2).
+
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an
-in-process stand-in for pcscf, the registrar and the far end, which also
-calls it. The registrar
+in-process stand-in for pcscf, the registrar, the notifier and the far end,
+which also calls it. The registrar
 authenticates with `internal/sip/digest`'s server side and Milenage vectors.
 
-`-sip-proxy` turns the client's configuration on (see [Running it](#running-it)).
-The SIP scenarios will use it once pcscf and scscf exist.
+`-sip-proxy` turns the client's configuration on (see [Running it](#running-it)),
+and `-sip-peer-impi` a second client for the far end. `pager-message` and
+`reg-event` use them; the others of #135 come with pcscf and scscf.
+Until then the scenario tests run it against `simtest.IMSCore`, an in-process
+stand-in for the IMS core: a registrar that authenticates with SIP Digest, a
+notifier for the reg event of each IMPU, and a proxy that routes each request
+to the flow its Request-URI is registered on (bindings, contacts and
+subscriptions keyed by scheme, user and host, without parameters). Its
+NOTIFYs say what is left of each subscription, never more than was granted
+(3761 s without Expires), go out one at a time, and write a contact with the
+event that last changed it. `Deregister` ends an IMPU's registration from
+the network side, with `deactivated` or `rejected`. A request to an IMPU without a binding gets
+480, or, as a test chooses, is stored and delivered at the next
+registration (or stored with its text changed), answered 200 and lost, or
+refused with 404. A request the far end never answers
+is answered 408 to its sender, and one its flow cannot take 500.
 
 ## Running it
 
@@ -223,6 +268,7 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-idle-wait` | 0 (skip) | stay quiet this long in the chat scenarios, to see keep-alives go out; set it above `-msrp-keepalive`. If no keep-alive has gone out by then, the step waits for one until `-step-timeout`, since a loaded host can run the timer late. Only a SEND the client starts counts; the step's `bytes_while_quiet` (reported on failure too) is everything it wrote meanwhile |
 | `-self`, `-peer` | `+15550100001`, `+15550100002` in the MCC 001 test domain | the CPIM addresses of the two ends |
 | `-step-timeout` | 30s | bound on each step; must be longer than `-idle-wait`, which the keep-alive step spends within it |
+| `-require-all` | false | fail a step that would be skipped for want of something the stack does not offer yet, such as reg-event's network-deregister; for CI once the stack offers it |
 | `-sip-proxy` | none | pcscf's `host:port`; configures the SIP client. A host name is resolved at start |
 | `-sip-transport` | `tcp` | `tcp` or `tls` to pcscf |
 | `-sip-server-name` | `-sip-proxy`'s host | the name pcscf's certificate is verified for, and the host of the first Route; TLS to an address needs it |
@@ -231,13 +277,15 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-sip-impi` | `RCS_SIM_SIP_IMPI` | private user identity, the Digest username |
 | `-sip-auth` | `aka` | `aka` takes K and OPc from `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`; `digest` takes the password from `RCS_SIM_SIP_PASSWORD` |
 | `-sip-instance` | a new `urn:uuid` | `+sip.instance` (RFC 5626 §4.1) |
+| `-sip-peer-impi` | `RCS_SIM_SIP_PEER_IMPI` | the far end's private user identity. The peer registers as `-peer` with the same other settings, its own credentials (`RCS_SIM_PEER_AKA_K` and `RCS_SIM_PEER_AKA_OPC`, or `RCS_SIM_SIP_PEER_PASSWORD`) and its own new instance. Without it, the scenarios with two clients fail at their first step |
 | `-list`, `-version` | | print the scenarios or the version |
 
 Secrets are read from the environment only, never from flags, because flags
 are visible in process listings: `RCS_SIM_FT_PASSWORD`,
-`RCS_SIM_RELAY_TOKEN`, `RCS_SIM_AKA_K`, `RCS_SIM_AKA_OPC` and
-`RCS_SIM_SIP_PASSWORD`. The FT user name may also come from
-`RCS_SIM_FT_USER`, and the IMPI from `RCS_SIM_SIP_IMPI`. A usage error names
+`RCS_SIM_RELAY_TOKEN`, `RCS_SIM_AKA_K`, `RCS_SIM_AKA_OPC`,
+`RCS_SIM_SIP_PASSWORD`, and the peer's `RCS_SIM_PEER_AKA_K`,
+`RCS_SIM_PEER_AKA_OPC` and `RCS_SIM_SIP_PEER_PASSWORD`. The FT user name may also come from
+`RCS_SIM_FT_USER`, and the IMPIs from `RCS_SIM_SIP_IMPI` and `RCS_SIM_SIP_PEER_IMPI`. A usage error names
 the flag or variable, never its value.
 
 ### Output
@@ -250,7 +298,11 @@ One JSON line per step on standard output:
 ```
 
 A failed step has `"ok":false` and an `error` naming the operation and the
-status or cause. Results never carry a URL, a session id, a user name, a
+status or cause. A step the stack cannot run yet has `"ok":true` and a
+fixed `skipped` reason, such as `"skipped":"network deregistration not
+configured"`; `-require-all` turns it into a failure with that reason as its
+`error`. When the run ends, standard error gets a summary,
+`rcs-sim: 12 steps, 0 failed, 1 skipped`. Results never carry a URL, a session id, a user name, a
 password, a token or an address: download URLs and MSRP session ids are
 capabilities, and the run's output goes to CI logs. Network failures are
 reduced to a fixed reason ("connection refused", "host name not resolved"),
