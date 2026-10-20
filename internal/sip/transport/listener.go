@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -35,6 +37,12 @@ type listener struct {
 
 	stopOnce sync.Once
 	stopErr  error
+
+	// maxConns is ListenerConfig.MaxConnections, 0 for no limit of its own;
+	// accepted counts this listener's connections against it, under t.mu.
+	maxConns    int
+	accepted    int
+	proxyHeader time.Duration
 }
 
 // stop closes the socket; later calls do nothing.
@@ -67,6 +75,12 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 	if cfg.AdvertisedPort < 0 || cfg.AdvertisedPort > 65535 {
 		return netip.AddrPort{}, errors.New("transport: advertised port out of range")
 	}
+	if cfg.MaxConnections < 0 || cfg.MaxConnections > 0 && cfg.Network == UDP {
+		return netip.AddrPort{}, errors.New("transport: listener MaxConnections must be positive and is for TCP and TLS")
+	}
+	if cfg.ProxyHeaderTimeout < 0 || cfg.ProxyHeaderTimeout > 0 && !cfg.ProxyProtocol {
+		return netip.AddrPort{}, errors.New("transport: ProxyHeaderTimeout must be positive and needs ProxyProtocol")
+	}
 
 	l := &listener{
 		t:            t,
@@ -74,6 +88,11 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 		proxy:        cfg.ProxyProtocol,
 		clientFacing: cfg.ClientFacing || cfg.ProxyProtocol,
 		idle:         cfg.IdleTimeout,
+		maxConns:     cfg.MaxConnections,
+		proxyHeader:  cfg.ProxyHeaderTimeout,
+	}
+	if l.proxyHeader == 0 {
+		l.proxyHeader = DefaultProxyHeaderTimeout
 	}
 	if l.idle <= 0 {
 		l.idle = t.cfg.IdleTimeout
@@ -239,8 +258,8 @@ func (l *listener) acceptLoop() {
 			continue
 		}
 		backoff = 0
-		if !t.reserveAccepted(c) {
-			t.stats.rejected.Add(1)
+		if refused := t.reserveAccepted(l, c); refused != nil {
+			refused.Add(1)
 			c.Close()
 			continue
 		}
@@ -254,20 +273,32 @@ func nextBackoff(d time.Duration) time.Duration {
 	return min(max(2*d, 5*time.Millisecond), time.Second)
 }
 
-func (t *Transport) reserveAccepted(c net.Conn) bool {
+// reserveAccepted takes a slot for a connection accepted on l, or returns
+// the counter of the refusal: the listener's own limit, checked first since
+// it is what a client flood reaches, or the transport's.
+func (t *Transport) reserveAccepted(l *listener, c net.Conn) *atomic.Uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed || t.accepted >= t.cfg.MaxConnections {
-		return false
+	switch {
+	case t.closed:
+		return &t.stats.rejected
+	case l.maxConns > 0 && l.accepted >= l.maxConns && l.clientFacing:
+		return &t.stats.clientListenerRejected
+	case l.maxConns > 0 && l.accepted >= l.maxConns:
+		return &t.stats.coreListenerRejected
+	case t.accepted >= t.cfg.MaxConnections:
+		return &t.stats.rejected
 	}
 	t.accepted++
+	l.accepted++
 	t.pending[c] = struct{}{}
-	return true
+	return nil
 }
 
-func (t *Transport) releaseAccepted(c net.Conn) {
+func (t *Transport) releaseAccepted(l *listener, c net.Conn) {
 	t.mu.Lock()
 	t.accepted--
+	l.accepted--
 	delete(t.pending, c)
 	t.mu.Unlock()
 }
@@ -287,15 +318,26 @@ func (t *Transport) unpend(c net.Conn) bool {
 func (l *listener) serveAccepted(raw net.Conn) {
 	t := l.t
 	defer t.wg.Done()
-	defer t.releaseAccepted(raw)
+	defer t.releaseAccepted(l, raw)
 	capSendBuffer(raw)
 
 	remote := addrPortOf(raw.RemoteAddr())
 	if l.proxy {
-		raw.SetReadDeadline(time.Now().Add(t.cfg.ReadTimeout))
+		raw.SetReadDeadline(time.Now().Add(l.proxyHeader))
 		h, err := ReadProxyHeader(raw)
 		if err != nil {
-			t.stats.proxyHeaderErrors.Add(1)
+			// A connection closed before its first byte is a TCP health
+			// check or a scan, a timeout a slow or silent client, and only
+			// a malformed header a peer that is not the NLB, which the NLB
+			// being misconfigured shows as.
+			switch ne := net.Error(nil); {
+			case errors.Is(err, io.EOF):
+				t.stats.proxyHeaderEmpty.Add(1)
+			case errors.As(err, &ne) && ne.Timeout():
+				t.stats.proxyHeaderTimeouts.Add(1)
+			default:
+				t.stats.proxyHeaderErrors.Add(1)
+			}
 			raw.Close()
 			return
 		}
@@ -307,6 +349,8 @@ func (l *listener) serveAccepted(raw net.Conn) {
 			return
 		}
 		remote = h.Source
+		// The TLS handshake and the first message have bounds of their own.
+		raw.SetReadDeadline(time.Time{})
 	}
 	f := t.flows.newFlow(l.network, l, remote)
 	if !t.admit(f) {
