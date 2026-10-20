@@ -76,6 +76,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"SubscriptionsReadBackAndAreListedByIMPU", testSubscriptionRoundTrip},
 		{"NotifyCountersNeverRepeatAcrossInstances", testNotifyCounters},
 		{"NextNotifyInvalidatesEarlierReads", testNotifyVersion},
+		{"NoOlderStateTakesALaterNotify", testNotifyOrder},
 		{"ConcurrentSweepsEndEverySubscriptionOnce", testSubscriptionSweep},
 		{"ASweepFromAStaleListingKeepsAFreshRegistration", testSweepFromAStaleListing},
 		{"ASaveFromBeforeADeleteDoesNotOverwriteANewRegistration", testStaleSaveAfterRecreate},
@@ -483,6 +484,7 @@ func testChallengeExpiry(t *testing.T, a, b state.Store, _ Options) {
 func Subscription(id, impu string, ttl time.Duration) *state.Subscription {
 	return &state.Subscription{
 		ID: id, IMPU: impu, Subscriber: "sip:pcscf.rcs.local", Expires: T0.Add(ttl),
+		Set: Key1(impu), Incarnation: 1, Kind: state.SubscriberPCSCF, EventID: "7",
 		Dialog: state.Dialog{
 			CallID: "dialog-" + id, LocalTag: "local", RemoteTag: "remote",
 			LocalURI: impu, RemoteURI: "sip:pcscf.rcs.local", RemoteTarget: "sip:pcscf@192.0.2.20:5060",
@@ -517,7 +519,7 @@ func testSubscriptionRoundTrip(t *testing.T, a, b state.Store, o Options) {
 	}
 	_, err = a.Subscription(ctx(t), "s1")
 	wantErr(t, err, state.ErrNotFound)
-	_, _, err = a.NextNotify(ctx(t), "s1")
+	_, _, err = a.NextNotify(ctx(t), "s1", 0)
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -535,7 +537,7 @@ func testNotifyCounters(t *testing.T, a, b state.Store, _ Options) {
 			go func() {
 				defer wg.Done()
 				for range each {
-					c, v, err := s.NextNotify(ctx(t), "s1")
+					c, v, err := s.NextNotify(ctx(t), "s1", 0)
 					if err != nil {
 						t.Error(err)
 						return
@@ -564,7 +566,7 @@ func testNotifyCounters(t *testing.T, a, b state.Store, _ Options) {
 
 func testNotifyVersion(t *testing.T, a, b state.Store, _ Options) {
 	read := must(a.SaveSubscription(ctx(t), Subscription("s1", IMPU1, time.Hour)))(t)
-	if _, _, err := b.NextNotify(ctx(t), "s1"); err != nil {
+	if _, _, err := b.NextNotify(ctx(t), "s1", 0); err != nil {
 		t.Fatal(err)
 	}
 	refresh := read.Clone()
@@ -574,7 +576,7 @@ func testNotifyVersion(t *testing.T, a, b state.Store, _ Options) {
 	fresh := must(a.Subscription(ctx(t), "s1"))(t)
 	fresh.Expires = T0.Add(2 * time.Hour)
 	must(a.SaveSubscription(ctx(t), fresh))(t)
-	if c, v, err := b.NextNotify(ctx(t), "s1"); err != nil || c != 2 || v != 2 {
+	if c, v, err := b.NextNotify(ctx(t), "s1", 0); err != nil || c != 2 || v != 2 {
 		t.Errorf("after a refresh NextNotify = %d, %d, %v; want the counters kept", c, v, err)
 	}
 }
@@ -596,7 +598,7 @@ func testSubscriptionSweep(t *testing.T, a, b state.Store, o Options) {
 				defer wg.Done()
 				_, err := state.SweepSubscriptions(ctx(t), s, T0, 10, func(sub *state.Subscription) {
 					// The final NOTIFY takes the next CSeq.
-					if _, _, err := s.NextNotify(ctx(t), sub.ID); err != nil {
+					if _, _, err := s.NextNotify(ctx(t), sub.ID, 0); err != nil {
 						t.Error(err)
 					}
 					mu.Lock()
@@ -618,4 +620,33 @@ func testSubscriptionSweep(t *testing.T, a, b state.Store, o Options) {
 		wantErr(t, err, state.ErrNotFound)
 	}
 	must(a.Subscription(ctx(t), "s3"))(t)
+}
+
+// testNotifyOrder: NextNotify numbers the state of a set's record at a
+// version, and refuses a version below the last one numbered (ErrStale), so
+// that the NOTIFY a subscriber keeps, the one with the highest reginfo
+// version, never carries an older state (#256).
+func testNotifyOrder(t *testing.T, a, b state.Store, _ Options) {
+	must(a.SaveSubscription(ctx(t), Subscription("s1", IMPU1, time.Hour)))(t)
+	c, v, err := a.NextNotify(ctx(t), "s1", 10)
+	if err != nil || c != 1 || v != 1 {
+		t.Fatalf("NextNotify(10) = %d, %d, %v", c, v, err)
+	}
+	_, _, err = b.NextNotify(ctx(t), "s1", 9)
+	wantErr(t, err, state.ErrStale)
+	if c, v, err := b.NextNotify(ctx(t), "s1", 10); err != nil || c != 2 || v != 2 {
+		t.Errorf("the same version again: %d, %d, %v", c, v, err)
+	}
+	if c, _, err := a.NextNotify(ctx(t), "s1", 11); err != nil || c != 3 {
+		t.Errorf("a later version: %d, %v", c, err)
+	}
+	if got := must(b.Subscription(ctx(t), "s1"))(t); got.NotifiedOf != 11 {
+		t.Errorf("NotifiedOf = %d, want 11", got.NotifiedOf)
+	}
+	// The last NOTIFY is numbered once, whoever asks.
+	if c, _, err := b.NextNotify(ctx(t), "s1", state.FinalNotify); err != nil || c != 4 {
+		t.Errorf("the last: %d, %v", c, err)
+	}
+	_, _, err = a.NextNotify(ctx(t), "s1", state.FinalNotify)
+	wantErr(t, err, state.ErrStale)
 }

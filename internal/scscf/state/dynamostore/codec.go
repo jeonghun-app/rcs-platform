@@ -186,12 +186,18 @@ func decodeChallenge(b []byte, impi, nonce string) (*state.Challenge, error) {
 // subscriptionDoc leaves out the counters, which are attributes of their own
 // so that NextNotify can advance them in place.
 type subscriptionDoc struct {
-	ID         string    `json:"id"`
-	IMPU       string    `json:"impu"`
-	Subscriber string    `json:"subscriber,omitempty"`
-	Dialog     dialogDoc `json:"dialog"`
-	Expires    time.Time `json:"expires"`
-	Terminated bool      `json:"terminated,omitempty"`
+	ID          string    `json:"id"`
+	IMPU        string    `json:"impu"`
+	Subscriber  string    `json:"subscriber,omitempty"`
+	SetIMPI     string    `json:"set_impi"`
+	SetIMPU     string    `json:"set_impu"`
+	Incarnation int64     `json:"incarnation"`
+	Kind        string    `json:"kind"`
+	Binding     string    `json:"binding,omitempty"`
+	EventID     string    `json:"event_id,omitempty"`
+	Dialog      dialogDoc `json:"dialog"`
+	Expires     time.Time `json:"expires"`
+	Terminated  bool      `json:"terminated,omitempty"`
 }
 
 type dialogDoc struct {
@@ -209,6 +215,7 @@ func encodeSubscription(s *state.Subscription) ([]byte, error) {
 	d := s.Dialog
 	return json.Marshal(subscriptionDoc{
 		ID: s.ID, IMPU: s.IMPU, Subscriber: s.Subscriber, Expires: s.Expires.UTC(), Terminated: s.Terminated,
+		SetIMPI: s.Set.IMPI, SetIMPU: s.Set.IMPU, Incarnation: s.Incarnation, Kind: s.Kind, Binding: s.Binding, EventID: s.EventID,
 		Dialog: dialogDoc{CallID: d.CallID, LocalTag: d.LocalTag, RemoteTag: d.RemoteTag, LocalURI: d.LocalURI,
 			RemoteURI: d.RemoteURI, RemoteTarget: d.RemoteTarget, RouteSet: d.RouteSet, RemoteSeq: d.RemoteSeq},
 	})
@@ -222,6 +229,7 @@ func decodeSubscription(b []byte, version int64, cseq, rver uint32) (*state.Subs
 	d := doc.Dialog
 	s := &state.Subscription{
 		ID: doc.ID, IMPU: doc.IMPU, Subscriber: doc.Subscriber, Expires: doc.Expires, Terminated: doc.Terminated,
+		Set: state.SetKey{IMPI: doc.SetIMPI, IMPU: doc.SetIMPU}, Incarnation: doc.Incarnation, Kind: doc.Kind, Binding: doc.Binding, EventID: doc.EventID,
 		Dialog: state.Dialog{CallID: d.CallID, LocalTag: d.LocalTag, RemoteTag: d.RemoteTag, LocalURI: d.LocalURI,
 			RemoteURI: d.RemoteURI, RemoteTarget: d.RemoteTarget, RouteSet: nilIfEmpty(d.RouteSet), RemoteSeq: d.RemoteSeq},
 		CSeq: cseq, ReginfoVersion: rver, Version: version,

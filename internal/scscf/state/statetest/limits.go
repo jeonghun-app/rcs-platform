@@ -94,7 +94,7 @@ func testImpossibleKeys(t *testing.T, a, _ state.Store, _ Options) {
 		wantErr(t, err, state.ErrNotFound)
 		_, err = a.Subscription(ctx(t), impu)
 		wantErr(t, err, state.ErrNotFound)
-		_, _, err = a.NextNotify(ctx(t), impu)
+		_, _, err = a.NextNotify(ctx(t), impu, 0)
 		wantErr(t, err, state.ErrNotFound)
 		for _, k := range []state.SetKey{{IMPI: IMPI1, IMPU: impu}, {IMPI: impu, IMPU: IMPU1}} {
 			_, err = a.Profile(ctx(t), k, T0)
@@ -228,7 +228,7 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 		}); err != nil {
 			t.Error(err)
 		}
-		_, _, final = a.NextNotify(ctx(t), s.ID)
+		_, _, final = a.NextNotify(ctx(t), s.ID, 0)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -263,10 +263,10 @@ func testCounterLimit(t *testing.T, a, b state.Store, _ Options) {
 	s := Subscription("s1", IMPU1, time.Hour)
 	s.CSeq = state.MaxCounter - 1
 	must(a.SaveSubscription(ctx(t), s))(t)
-	if c, _, err := b.NextNotify(ctx(t), "s1"); err != nil || c != state.MaxCounter {
+	if c, _, err := b.NextNotify(ctx(t), "s1", 0); err != nil || c != state.MaxCounter {
 		t.Fatalf("NextNotify below the limit = %d, %v", c, err)
 	}
-	_, _, err := b.NextNotify(ctx(t), "s1")
+	_, _, err := b.NextNotify(ctx(t), "s1", 0)
 	wantErr(t, err, state.ErrExhausted)
 	if got := must(a.Subscription(ctx(t), "s1"))(t); got.CSeq != state.MaxCounter {
 		t.Errorf("stored CSeq %d", got.CSeq)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"slices"
 	"time"
 
@@ -32,6 +33,9 @@ var (
 	// ErrExhausted means a subscription's NOTIFY counters have reached their
 	// limit; the subscription must be ended.
 	ErrExhausted = errors.New("state: NOTIFY counters exhausted")
+	// ErrStale means a NOTIFY would number an older state than one already
+	// numbered, or follow the subscription's last; it is not sent.
+	ErrStale = errors.New("state: a later state was notified")
 	// ErrContended means a write lost to other writers on every attempt; the
 	// caller may try again later. It is not ErrConflict, which says what won.
 	ErrContended = errors.New("state: changed by others on every attempt")
@@ -709,9 +713,24 @@ type Subscription struct {
 	ID string
 	// IMPU is the watched registration, in canonical form.
 	IMPU string
-	// Subscriber is the identity of the watcher.
+	// Set and Incarnation are the record of the set IMPU belonged to when
+	// the subscription was made: it watches that set alone, and ends when
+	// IMPU leaves it or the record goes, so that it never reports another
+	// set's state (#256 security review).
+	Set         SetKey
+	Incarnation int64
+	// Subscriber is the identity of the watcher, and Kind what it is: the
+	// P-CSCF (SubscriberPCSCF), whose identity is the Path of a binding of
+	// the set, or the UE (SubscriberUE), one of the set's identities.
 	Subscriber string
-	Dialog     Dialog
+	Kind       string
+	// Binding is, for a UE, the binding key of the UE's own binding
+	// (regevent), "" if none matched: the subscription ends with it.
+	Binding string
+	// EventID is the id parameter of the SUBSCRIBE's Event, which every
+	// NOTIFY carries back (RFC 6665 §4.5.2).
+	EventID string
+	Dialog  Dialog
 	// Expires is when the subscription ends. A Terminated one is deleted by
 	// the first sweep after it; whoever terminates a subscription sets it a
 	// little ahead (TerminatedGrace) to send its final NOTIFY first.
@@ -726,9 +745,24 @@ type Subscription struct {
 	// NextNotify's.
 	CSeq           uint32
 	ReginfoVersion uint32
+	// NotifiedOf is the version of the set's record whose state the last
+	// NOTIFY numbered by NextNotify carried, so that no older state takes a
+	// later reginfo version.
+	NotifiedOf int64
 	// Version is the stored version, as for Registration.
 	Version int64
 }
+
+// FinalNotify is the of of a subscription's last NOTIFY (NextNotify): no
+// state is later, and no call after it numbers another, so that two
+// instances ending one subscription send one terminated NOTIFY.
+const FinalNotify = math.MaxInt64
+
+// The kinds of subscriber (Subscription.Kind).
+const (
+	SubscriberPCSCF = "pcscf"
+	SubscriberUE    = "ue"
+)
 
 // Dialog is the notifier's side of the subscription dialog (RFC 3261 §12).
 type Dialog struct {
@@ -758,6 +792,12 @@ func (s *Subscription) Validate() error {
 	}
 	if canon, ok := identity.CanonicalIMPU(s.IMPU); !ok || canon != s.IMPU {
 		return fmt.Errorf("%w: subscription IMPU is not a canonical public identity", ErrInvalid)
+	}
+	if err := validSetKey(s.Set); err != nil || s.Incarnation == 0 {
+		return fmt.Errorf("%w: a subscription names its set and its incarnation", ErrInvalid)
+	}
+	if s.Kind != SubscriberPCSCF && s.Kind != SubscriberUE || !textOK(s.Binding, s.EventID) {
+		return fmt.Errorf("%w: unknown kind of subscriber", ErrInvalid)
 	}
 	d := s.Dialog
 	if d.CallID == "" || !textOK(d.CallID, d.LocalTag, d.RemoteTag, d.LocalURI, d.RemoteURI, d.RemoteTarget) {
@@ -791,11 +831,15 @@ type Subscriptions interface {
 	// DeleteSubscription deletes s if its version is still the stored one.
 	DeleteSubscription(ctx context.Context, s *Subscription) error
 	// NextNotify advances the CSeq and reginfo version of a subscription in
-	// one atomic step and returns the new values, for the next NOTIFY. Two
-	// calls, on any instances, never return the same values. It changes the
-	// item's version, so a save based on an earlier read fails. At MaxCounter
-	// it fails with ErrExhausted and the subscription must be ended.
-	NextNotify(ctx context.Context, id string) (cseq, reginfoVersion uint32, err error)
+	// one atomic step and returns the new values, for a NOTIFY of the state
+	// of the set's record at version of. Two calls, on any instances, never
+	// return the same values, and a call with an of below the last one's
+	// fails with ErrStale: a later state has the later number already, as
+	// does any call after one with FinalNotify. It
+	// changes the item's version, so a save based on an earlier read fails.
+	// At MaxCounter it fails with ErrExhausted and the subscription must be
+	// ended.
+	NextNotify(ctx context.Context, id string, of int64) (cseq, reginfoVersion uint32, err error)
 	// ExpiringSubscriptions returns up to limit subscriptions whose expiry has
 	// passed at now, Terminated ones included, for SweepSubscriptions.
 	ExpiringSubscriptions(ctx context.Context, now time.Time, limit int) ([]*Subscription, error)

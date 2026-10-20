@@ -130,6 +130,16 @@ func (e *env) registered(contacts ...state.Contact) *state.Registration {
 	return saved
 }
 
+// saved saves set, a change of a stored record, and returns it as stored.
+func (e *env) saved(set *state.Registration) *state.Registration {
+	e.t.Helper()
+	s, err := e.store.SaveRegistration(bg, set)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return s
+}
+
 // subscribe is an initial SUBSCRIBE for target from pai.
 func subscribe(t *testing.T, target, pai string, expires int, extra ...string) *sip.Request {
 	t.Helper()

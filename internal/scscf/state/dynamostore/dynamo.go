@@ -53,6 +53,9 @@ const (
 	attrCSeq    = "cseq"
 	attrRver    = "rver"
 	attrNToken  = "ntoken"
+	// attrNotifiedOf is the version of the set's record the last NOTIFY
+	// numbered carried (state.Subscription.NotifiedOf).
+	attrNotifiedOf = "nof"
 	// attrReceived orders profiles: when the SAA or PPR arrived, Unix ns.
 	attrReceived = "received"
 	// attrTTL is the registrations table's TTL attribute, on profiles and

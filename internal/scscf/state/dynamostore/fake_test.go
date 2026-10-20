@@ -95,13 +95,15 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return cur != nil && number(cur[names["#ttl"]]) > number(values[":now"]) && number(cur[names["#ttl"]]) < number(values[":until"])
 	case "attribute_exists(#pk) AND #exp > :now":
 		return cur != nil && number(cur[names["#exp"]]) > number(values[":now"])
-	case "attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max":
+	case "attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max AND (attribute_not_exists(#of) OR (#of <= :of AND #of < :final))":
 		if cur == nil {
 			return false
 		}
 		tok, ok := cur[names["#tok"]]
+		of, hasOf := cur[names["#of"]]
 		max := number(values[":max"])
-		return (!ok || sv(tok) != sv(values[":tok"])) && number(cur[names["#cseq"]]) < max && number(cur[names["#rver"]]) < max
+		return (!ok || sv(tok) != sv(values[":tok"])) && number(cur[names["#cseq"]]) < max && number(cur[names["#rver"]]) < max &&
+			(!hasOf || number(of) <= number(values[":of"]) && number(of) < number(values[":final"]))
 	}
 	f.t.Fatalf("fakeDynamo: unknown condition %q", aws.ToString(expr))
 	return false
@@ -219,13 +221,14 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 	n, v := in.ExpressionAttributeNames, in.ExpressionAttributeValues
 	var update func(cur map[string]types.AttributeValue) map[string]types.AttributeValue
 	switch aws.ToString(in.UpdateExpression) {
-	case "SET #tok = :tok, #v = #v + :one ADD #cseq :one, #rver :one":
+	case "SET #tok = :tok, #v = #v + :one, #of = :of ADD #cseq :one, #rver :one":
 		if in.ReturnValues != types.ReturnValueAllNew {
 			f.t.Fatal("fakeDynamo: NextNotify must ask for the new values")
 		}
 		update = func(cur map[string]types.AttributeValue) map[string]types.AttributeValue {
 			next := maps.Clone(cur)
 			next[n["#tok"]] = v[":tok"]
+			next[n["#of"]] = v[":of"]
 			for _, a := range []string{"#v", "#cseq", "#rver"} {
 				next[n[a]] = num(number(cur[n[a]]) + 1)
 			}

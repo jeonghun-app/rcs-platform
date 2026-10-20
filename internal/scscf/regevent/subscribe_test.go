@@ -3,6 +3,7 @@ package regevent
 import (
 	"context"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -135,8 +136,11 @@ func TestARefreshMustMatchTheDialogItsOrderAndItsSubscriber(t *testing.T) {
 	if exp, _ := ss.Expires(); cseq != 2 || doc.Version != 1 || exp != 7200 {
 		t.Errorf("after the refresh: CSeq %d, version %d, expires %d", cseq, doc.Version, exp)
 	}
-	// The same CSeq again is in order (RFC 3261 §12.2.2); a lower one is not.
+	// Neither a lower CSeq (RFC 3261 §12.2.2) nor the same again, which a
+	// repeat reaching another instance has (the lead's contract on #14).
 	r, _ = n.Subscribe(bg, inDialog(t, res, impu1, pcscfPath, 1, 600))
+	wantStatus(t, r, 500)
+	r, _ = n.Subscribe(bg, inDialog(t, res, impu1, pcscfPath, 2, 600))
 	wantStatus(t, r, 500)
 }
 
@@ -191,6 +195,8 @@ func TestAChangeIsNotifiedWithTheFullStateAndStableIDs(t *testing.T) {
 	firstDoc, _, _ := info(t, first)
 	after := before.Clone()
 	after.Contacts = []state.Contact{binding(1, 2*time.Hour), binding(3, time.Hour)}
+	// As the registrar does: save, then tell.
+	after = e.saved(after)
 	n.Changed(bg, before, after, Registered)
 	n.Wait()
 	got := e.send.notifies()
@@ -259,21 +265,27 @@ func TestAnEndedSetEndsItsSubscriptions(t *testing.T) {
 	}
 }
 
-// TestASubscriberThatIsGoneEndsItsSubscription: 481, 408, no flow or no
-// answer end it (RFC 6665 §4.2.2); a refusal or a full queue does not.
+// TestASubscriberThatIsGoneEndsItsSubscription: the codes of RFC 6665
+// §4.2.2, 408, 430 (a flow the edge no longer has), no flow or no answer
+// end it; any other refusal, or a full queue, does not.
 func TestASubscriberThatIsGoneEndsItsSubscription(t *testing.T) {
-	for name, c := range map[string]struct {
+	type outcome struct {
 		status int
 		err    error
 		ends   bool
-	}{
-		"481":        {status: 481, ends: true},
-		"408":        {status: 408, ends: true},
+	}
+	cases := map[string]outcome{
 		"no flow":    {err: transport.ErrNoFlow, ends: true},
 		"timeout":    {err: context.DeadlineExceeded, ends: true},
-		"500":        {status: 500},
 		"queue full": {err: transport.ErrQueueFull},
-	} {
+	}
+	for _, code := range []int{404, 405, 408, 410, 416, 430, 480, 481, 482, 483, 484, 485, 489, 501, 604} {
+		cases[strconv.Itoa(code)] = outcome{status: code, ends: true}
+	}
+	for _, code := range []int{400, 403, 415, 486, 487, 488, 500, 503, 603} {
+		cases[strconv.Itoa(code)] = outcome{status: code}
+	}
+	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
 			before := e.registered(binding(1, time.Hour))
@@ -362,7 +374,7 @@ func TestASubscriptionLastsAtMostMaxExpires(t *testing.T) {
 	_ = req.Header.Set("Call-ID", "sub-call-2")
 	res, _ = n.Subscribe(bg, req)
 	if res.Header.Get("Expires") != "3761" {
-		t.Errorf("Expires %q without one asked for, want 3761 (RFC 3680 §6.1)", res.Header.Get("Expires"))
+		t.Errorf("Expires %q without one asked for, want 3761 (RFC 3680 §4.4)", res.Header.Get("Expires"))
 	}
 }
 
