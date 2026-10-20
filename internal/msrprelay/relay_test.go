@@ -729,6 +729,10 @@ func TestAClientOverTheUnknownSessionLimitStillReadsItsAnswers(t *testing.T) {
 		reqs.WriteString("MSRP " + tid + " SEND\r\nTo-Path: msrps://" + publicHost + ":2856/gu3ss" + tid + ";tcp\r\n" +
 			"From-Path: " + clientURI + "\r\nMessage-ID: " + tid + "\r\n-------" + tid + "$\r\n")
 	}
+	// Unread input past the reader's buffer, in the same Write: closing
+	// with it unread would reset the connection, so only the half-close
+	// through meteredConn delivers the 481s (QA on #237).
+	reqs.WriteString(strings.Repeat("z", 256<<10))
 	if _, err := nc.Write([]byte(reqs.String())); err != nil {
 		t.Fatal(err)
 	}
@@ -746,6 +750,53 @@ func TestAClientOverTheUnknownSessionLimitStillReadsItsAnswers(t *testing.T) {
 	eventually(t, "the close to be counted", func() bool {
 		return r.metrics.count(mClientPrefix+"Closed.TooManyUnknownSessions") == 1
 	})
+}
+
+// A connection the relay refuses for too many unknown sessions is counted
+// for that alone, whatever ends its wait for the client meanwhile: the
+// idle timeout, or the first-bind timer (#237).
+func TestARefusedConnectionIsCountedOnce(t *testing.T) {
+	for name, c := range map[string]struct {
+		idle  time.Duration
+		after func(r *rig)
+	}{
+		"idle during the flush": {idle: 300 * time.Millisecond},
+		"first-bind timer during the flush": {idle: time.Minute, after: func(r *rig) {
+			r.clock.Advance(time.Hour)
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t, 1, func(o *relayOptions) { o.Edge.MaxFailedBinds = 2; o.IdleTimeout = c.idle })
+			nc, err := net.Dial("tcp", r.addrs[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = nc.Close() })
+			var reqs strings.Builder
+			for _, tid := range []string{"once1", "once2", "once3"} {
+				reqs.WriteString("MSRP " + tid + " SEND\r\nTo-Path: msrps://" + publicHost + ":2856/gu3ss" + tid + ";tcp\r\n" +
+					"From-Path: " + clientURI + "\r\nMessage-ID: " + tid + "\r\n-------" + tid + "$\r\n")
+			}
+			if _, err := nc.Write([]byte(reqs.String())); err != nil {
+				t.Fatal(err)
+			}
+			// The client reads to the end of the stream and never closes
+			// its side, so the relay waits for it.
+			_ = nc.SetReadDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.ReadAll(nc); err != nil {
+				t.Fatal(err)
+			}
+			if c.after != nil {
+				c.after(r)
+			}
+			eventually(t, "the close to be counted", func() bool {
+				return r.metrics.count(mClientPrefix+"Closed.TooManyUnknownSessions") == 1 && r.metrics.conns.Load() == 0
+			})
+			if idle, unbound := r.metrics.count(mIdleClosed), r.metrics.count(mUnboundClosed); idle != 0 || unbound != 0 {
+				t.Fatalf("also counted idle %d, unbound %d", idle, unbound)
+			}
+		})
+	}
 }
 
 func TestIdleClientConnectionIsClosed(t *testing.T) {
