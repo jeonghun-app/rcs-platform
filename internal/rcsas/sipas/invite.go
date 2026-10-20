@@ -218,6 +218,9 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	// the session.
 	added := s.addSession(ss)
 	s.sendACK(ack, next)
+	if added == nil {
+		s.settle(ss)
+	}
 	if added != nil {
 		// The session cannot be kept: it is ended, and the message waits
 		// for the next one.

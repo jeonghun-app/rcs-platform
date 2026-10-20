@@ -54,7 +54,12 @@ type session struct {
 	// reserved is set while a session rcs-as started holds its place
 	// before its 2xx (Server.reserve); guarded by the Server's mu.
 	reserved bool
-	mode     store.Mode
+	// live is set once the session's first answer is on its way: rcs-as's
+	// 2xx to a client's INVITE, or its ACK to the client's 2xx. A BYE
+	// before it would end a dialog the other side does not have yet
+	// (#270). Guarded by the Server's mu.
+	live bool
+	mode store.Mode
 	// inv is the invitation of a session rcs-as started; zero otherwise.
 	inv messaging.Invitation
 
@@ -118,7 +123,24 @@ func (s *Server) addSession(ss *session) error {
 		s.perUser[ss.budget()]++
 	}
 	s.sessions[ss.d.ID()] = ss
+	s.answering.Add(1)
 	return nil
+}
+
+// settle marks a session that addSession took as live, once its first
+// answer has gone, or as done with if it ended before (settle must follow
+// every addSession that succeeded). A session that becomes live while s
+// is closing is ended now: Close waited for it, up to its bound, and
+// leaves the BYE of one it did not see live to this.
+func (s *Server) settle(ss *session) {
+	s.mu.Lock()
+	ss.live = true
+	closed := s.closed
+	s.mu.Unlock()
+	s.answering.Done()
+	if closed {
+		ss.bye("")
+	}
 }
 
 // reserve holds a place for a session rcs-as is about to start for ss's
@@ -241,16 +263,13 @@ func (s *Server) sessionOf(req *sip.Request) *session {
 const closeWait = 2 * time.Second
 
 // Close ends every session with a BYE, before the transport closes, and
-// takes no new one. It waits for the BYEs' answers, up to closeWait: the
-// transport writes a request after SendRequest returns, and closing it at
-// once could drop the BYE.
+// takes no new one. A session still being answered is answered first. It
+// waits for the BYEs' answers, up to closeWait: the transport writes a
+// request after SendRequest returns, and closing it at once could drop
+// the BYE.
 func (s *Server) Close() {
 	s.mu.Lock()
 	s.closed = true
-	all := make([]*session, 0, len(s.sessions))
-	for _, ss := range s.sessions {
-		all = append(all, ss)
-	}
 	s.mu.Unlock()
 	wait := s.cfg.closeWait
 	if wait <= 0 {
@@ -259,6 +278,23 @@ func (s *Server) Close() {
 	// One bound for all of them: a closed Done reaches every waiter.
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
+	// A session whose first answer has not gone yet, as one whose first
+	// message is being stored, gets it first: its BYE follows its 2xx
+	// (#270), from settle if it comes too late for this.
+	answered := make(chan struct{})
+	go func() { s.answering.Wait(); close(answered) }()
+	select {
+	case <-answered:
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	all := make([]*session, 0, len(s.sessions))
+	for _, ss := range s.sessions {
+		if ss.live {
+			all = append(all, ss)
+		}
+	}
+	s.mu.Unlock()
 	var wg sync.WaitGroup
 	for _, ss := range all {
 		wg.Go(func() {

@@ -298,7 +298,12 @@ In every session:
   (a client that never connects to the relay), a 2xx without an ACK (RFC 3261
   §13.3.1.4), an unrefreshed timer and a terminating large-mode leg that is
   `Finished` each end the session with a BYE from rcs-as. So does shutdown,
-  before the transport closes; it waits up to 2 s for the BYEs' answers.
+  before the transport closes, in this order: it takes no new session; it lets
+  a session still being answered (a client's INVITE whose first message is
+  being stored, or rcs-as's ACK to a client's 2xx) send that answer first,
+  so that no BYE ever comes before its dialog's 2xx (#270); then it ends every
+  session with a BYE. Both waits share one bound of 2 s; a session answered
+  after it is ended at once, from its own path.
 - **The MSRP direction.** A BYE with SIP cause 488 in its `Reason`, in a session
   rcs-as started that has carried no message yet, tells the engine
   `ErrNoSessions`: it is how pcscf ends a session whose client answered

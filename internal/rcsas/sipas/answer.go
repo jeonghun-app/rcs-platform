@@ -129,6 +129,7 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respondRetry(u, req, 500)
 		return
 	}
+	defer s.settle(ss)
 	if first != nil {
 		// The first message goes in as the session's would, stored
 		// before the 2xx; one the engine refuses fails the INVITE with
