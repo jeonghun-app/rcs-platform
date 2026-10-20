@@ -61,7 +61,7 @@ func (e *Engine) submitNotification(ctx context.Context, o Origin, m *Message, n
 		return err
 	}
 	mark := string(n.Kind) + " " + o.Sender
-	err = e.store.MarkNotified(ctx, o.Recipient, n.MessageID, mark, id, now)
+	err = e.store.MarkNotified(ctx, o.Recipient, n.MessageID, mark, string(n.Status), id, now)
 	switch {
 	case errors.Is(err, store.ErrExists):
 		e.metrics.Count("imdn.duplicate", 1)

@@ -19,6 +19,7 @@ package store
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"time"
 
@@ -43,6 +44,13 @@ var (
 	// ErrSenderShareFull means Enqueue would take the sender's share of the
 	// recipient's queue past its Limit.
 	ErrSenderShareFull = errors.New("store: sender's share of the queue is full")
+	// ErrMarksChanged means RemoveSummary found more marks on the sent
+	// record than the summary was expanded from.
+	ErrMarksChanged = errors.New("store: notifications were marked since")
+	// ErrBusy means a write kept meeting a concurrent one on the same item
+	// (a DynamoDB transaction conflict) and gave up; the caller may try
+	// again shortly.
+	ErrBusy = errors.New("store: item busy with a concurrent write")
 )
 
 // Limit bounds one recipient's queue, and the share of it one sender may
@@ -63,6 +71,12 @@ type Limit struct {
 	SenderBytes int64
 	GroupCount  int
 	GroupBytes  int64
+	// SummaryCount and SummaryBytes bound the group notification summaries
+	// in a queue together (Message.InSummaryTotal, GroupSummaries): beside
+	// the group notifications' total, so that the two together still leave
+	// most of a queue to everyone else.
+	SummaryCount int
+	SummaryBytes int64
 }
 
 // Mode is how a message was sent, which decides how it may be delivered.
@@ -119,6 +133,11 @@ type Message struct {
 	Notification bool
 	// MessageID is the IMDN Message-ID of the CPIM message, or empty.
 	MessageID string
+	// Summary marks a group notification summary: no CPIM of its own, it
+	// stands for the notifications about the group message MessageID
+	// (Sender the group) that the author's queue had no room for, which
+	// the group's sent record holds as marks. Delivering it sends them.
+	Summary bool
 	// CPIM is the message/cpim body exactly as received: rcs-as forwards
 	// content byte for byte (docs/architecture.md §8).
 	CPIM []byte
@@ -141,9 +160,17 @@ type Message struct {
 // Neither is an identity, which is a URI.
 const GroupNotifications = "#group-notifications"
 
+// GroupSummaries names the total of a queue's group notification
+// summaries (Limit.SummaryCount). It is not an identity, which is a URI.
+const GroupSummaries = "#group-summaries"
+
+// InSummaryTotal reports whether m counts toward GroupSummaries: it is a
+// summary.
+func (m Message) InSummaryTotal() bool { return m.Summary }
+
 // InGroupTotal reports whether m counts toward the total of a queue's
 // group notifications, GroupNotifications: it is a group notification.
-func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification }
+func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification && !m.Summary }
 
 // ShareKey returns whose share of the recipient's queue m counts against,
 // and false when it counts against none:
@@ -159,8 +186,14 @@ func (m Message) InGroupTotal() bool { return m.Mode == Group && m.Notification 
 //     to a large group would fill the author's queue. A share per group
 //     keeps one busy group from crowding out the receipts of the others;
 //   - a 1-to-1 notification counts against none.
+//
+// A summary counts against none, nor toward the group total, since it is
+// there because those were full; summaries have a total of their own
+// (InSummaryTotal).
 func (m Message) ShareKey() (string, bool) {
 	switch {
+	case m.Summary:
+		return "", false
 	case m.Mode == Group && m.Notification:
 		return GroupNotifications + " " + m.Sender, true
 	case m.Mode == Group && m.Author != "":
@@ -208,12 +241,23 @@ type Sent struct {
 	Recipients []string
 	// Dispositions are the notifications the sender asked for.
 	Dispositions imdn.Disposition
-	Expires      time.Time
+	// DateTime is the message's DateTime header as sent, which a
+	// notification about it echoes (RFC 5438 §11.1.2).
+	DateTime string
+	Expires  time.Time
+
+	// Marks are the notifications accepted about the message, by key
+	// (MarkNotified) to the status each reported, and MarkCount how many
+	// were ever marked: it only grows, so that an unchanged count means no
+	// new mark. Sent returns them; RecordSent ignores them.
+	Marks     map[string]string
+	MarkCount int64
 }
 
 // Clone returns a copy of s that shares no memory with it.
 func (s Sent) Clone() Sent {
 	s.Recipients = slices.Clone(s.Recipients)
+	s.Marks = maps.Clone(s.Marks)
 	return s
 }
 
@@ -229,7 +273,8 @@ type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
 	// beyond l, ErrSenderShareFull if what counts against m's share
-	// (Message.ShareKey), or the total of group notifications for one, would.
+	// (Message.ShareKey), or the total of group notifications or of
+	// summaries for one, would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID
@@ -246,6 +291,11 @@ type Store interface {
 	// Remove deletes m, which owner holds: delivered, or given up on. m is
 	// the message as Claim returned it; its size is taken off the queue's.
 	Remove(ctx context.Context, m Message, owner string) error
+	// RemoveSummary is Remove of a summary m, on the condition that the
+	// sent record of m.MessageID by m.Sender still has marks, the count
+	// its expansion read: ErrMarksChanged otherwise (a notification came in
+	// meanwhile, so the summary must be sent again), and m stays.
+	RemoveSummary(ctx context.Context, m Message, owner string, marks int64) error
 	// Expired returns up to limit messages, of any recipient, whose expiry
 	// is at or before now and that are free at now, starting at cursor
 	// ("" for the start), and the cursor to go on from: "" once the end is
@@ -261,10 +311,12 @@ type Store interface {
 	// none or it has expired at now.
 	Sent(ctx context.Context, sender, messageID string, now time.Time) (Sent, error)
 	// MarkNotified records on sender's record of messageID that the
-	// notification named key has been accepted, so that it is accepted
-	// once. token identifies the attempt: ErrExists if key is marked with
-	// another token, ErrNotFound if there is no live record.
-	MarkNotified(ctx context.Context, sender, messageID, key, token string, now time.Time) error
+	// notification named key, which reported status, has been accepted, so
+	// that it is accepted once, and counts the mark (Sent.MarkCount). token
+	// identifies the attempt: a repeat with the same token succeeds and
+	// counts nothing; ErrExists if key is marked with another token,
+	// ErrNotFound if there is no live record.
+	MarkNotified(ctx context.Context, sender, messageID, key, status, token string, now time.Time) error
 	// UnmarkNotified undoes MarkNotified with the same token, when what the
 	// mark stood for could not be done. Without such a mark it does
 	// nothing.
