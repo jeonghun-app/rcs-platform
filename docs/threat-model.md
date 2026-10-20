@@ -42,7 +42,9 @@ Anything that reaches a core SIP port can send as any subscriber by setting
 **Control:** only `pcscf` faces clients and strips client-supplied
 `P-Asserted-Identity` and the other network-only headers, on a client listener
 separate from its core listener; core SIP ports admit only platform services
-(ADR 0007 §2, §7).
+(ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
+default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
+messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
 **Status:** planned (#16, Phase 7 infrastructure).
 
 ## T3 — MSRP session access on `rcs-as`

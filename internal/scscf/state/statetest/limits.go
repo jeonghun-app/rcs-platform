@@ -370,7 +370,9 @@ func testPPRForOneSet(t *testing.T, a, b state.Store, _ Options) {
 }
 
 // testIdentities: a set's identities point at its one record, through items
-// of their own, with the same optimistic concurrency as registrations.
+// of their own, with the same optimistic concurrency as registrations. The
+// store does not tie the two: the S-CSCF writes the items before the record
+// that commits them (Identity).
 func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour)
 	r.Identities = append(r.Identities, state.SetIdentity{IMPU: TEL1}, state.SetIdentity{IMPU: IMPU2, Barred: true})
@@ -450,6 +452,14 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 	if again := must(a.Identity(ctx(t), IMPU2, T0))(t); !again.Barred {
 		t.Error("changing a read identity changed the stored one")
 	}
+	// An item may name a record not saved yet: the store takes it, and the
+	// record is simply not found.
+	ahead := must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: IMPU3, Set: Set2, Incarnation: 9, KeepUntil: T0.Add(time.Hour)}, T0))(t)
+	if got := must(b.Identity(ctx(t), IMPU3, T0))(t); got.Set != Set2 || got.Version != ahead.Version {
+		t.Errorf("an item ahead of its record: %+v", got)
+	}
+	_, err = b.Registration(ctx(t), Set2)
+	wantErr(t, err, state.ErrNotFound)
 }
 
 // testIdentityKeepUntil: an identity a failed deregistration left is gone at
@@ -957,6 +967,12 @@ func testReviveTakesANewIncarnation(t *testing.T, a, b state.Store, _ Options) {
 	unregistered := leased.Clone()
 	unregistered.Deregistering, unregistered.Unregistered = time.Time{}, T0.Add(time.Hour)
 	_, err = b.SaveRegistration(ctx(t), unregistered)
+	wantErr(t, err, state.ErrInvalid)
+	// Nor can a binding come back with the lease kept, which would revive
+	// the record without its Deregistering going.
+	bound := leased.Clone()
+	bound.Contacts = live.Contacts
+	_, err = a.SaveRegistration(ctx(t), bound)
 	wantErr(t, err, state.ErrInvalid)
 	// A stale version is a conflict whatever it carries.
 	stale := back.Clone()

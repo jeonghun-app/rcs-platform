@@ -169,12 +169,14 @@ type SetIdentity struct {
 }
 
 // Identity is what one public identity names: the implicit registration set
-// it belongs to. It is written when the S-CSCF is assigned the set (SAR) or
-// the set changes (PPR), and deleted with the set, before its record, so that
-// a deregistration cut short is done again by a sweep; never by a
-// re-registration. An IMPU names one set: an IMPU shared by several private
-// identities (TS 23.228 §4.3.3.4) is out of scope: the last set saved for it
-// takes it.
+// it belongs to. Identities go before their record both ways. They are
+// written before a record with a new incarnation or new identities is saved,
+// the save being the commit point: one naming a record not saved (yet) is
+// as good as none, and its KeepUntil ends it. They are deleted with the set
+// before its record, so that a deregistration cut short is done again by a
+// sweep. A re-registration only keeps them (KeepIdentity), or repairs them.
+// An IMPU names one set: an IMPU shared by several private identities (TS
+// 23.228 §4.3.3.4) is out of scope: the last set saved for it takes it.
 type Identity struct {
 	// IMPU is the public identity in canonical form.
 	IMPU string
@@ -332,8 +334,11 @@ func (r *Registration) Validate() error {
 	if len(r.Contacts) > MaxContacts {
 		return fmt.Errorf("%w: more than %d contacts", ErrInvalid, MaxContacts)
 	}
-	if !r.Deregistering.IsZero() && !validTime(r.Deregistering) {
-		return fmt.Errorf("%w: Deregistering out of range", ErrInvalid)
+	if !r.Deregistering.IsZero() && (!validTime(r.Deregistering) || len(r.Contacts) > 0) {
+		// A record claimed for a deregistration has no bindings: one saved
+		// with them would be brought back under the claimed incarnation
+		// without counting as a revival (Incarnation).
+		return fmt.Errorf("%w: a record claimed for a deregistration has contacts, or Deregistering is out of range", ErrInvalid)
 	}
 	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
 		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)

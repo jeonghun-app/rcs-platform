@@ -294,6 +294,19 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 			return nil, err
 		}
 	}
+	// A record with a new incarnation or new identities is committed by its
+	// save, so its identities are pointed at it first: a failure in between
+	// leaves no record, and the retry, an initial registration again, points
+	// them all. An item naming a record never saved is as good as none.
+	ahead := cur == nil || n.Incarnation != cur.Incarnation || !slices.Equal(cur.Identities, n.Identities)
+	if ahead {
+		// Another REGISTER of the set may commit first; the attempt that
+		// follows then repairs what this one pointed elsewhere.
+		r.pointedAhead = true
+		if err := g.point(ctx, n, keep); err != nil {
+			return nil, err
+		}
+	}
 	saved, err := g.cfg.Store.SaveRegistration(ctx, n)
 	if errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrExists) {
 		if again, f := g.set(ctx, key); f == nil && applied(again, r) {
@@ -308,8 +321,11 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 	if err != nil {
 		return nil, err
 	}
-	if !registered || cur.Incarnation != saved.Incarnation || !slices.Equal(cur.Identities, saved.Identities) ||
-		id == nil || id.Set != saved.Key || id.KeepDue(last) {
+	// Otherwise every identity of the set is pointed again, repaired or
+	// kept longer, when an earlier attempt of this request pointed them at
+	// a record that lost, or when r.impu's own item shows the need: missing,
+	// naming another record or incarnation, or due to be kept (KeepDue).
+	if !ahead && (r.pointedAhead || !registered || id == nil || id.Set != saved.Key || id.Incarnation != saved.Incarnation || id.KeepDue(last)) {
 		if err := g.point(ctx, saved, keep); err != nil {
 			return nil, err
 		}
@@ -492,9 +508,13 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 
 // putBack gives a set claimed for a deregistration that the HSS could not be
 // told of its bindings back, under a new incarnation, as any record brought
-// back from a lease (state.Registration.Incarnation), and points its
-// identities at it again. Failing that, the lease stands and the sweep after
-// it tells the HSS.
+// back from a lease (state.Registration.Incarnation), and points every
+// identity at it. The record goes first here, unlike a registration's: only
+// a save under the claimed version shows that no REGISTER took the set over
+// meanwhile, whose identities pointing first would undo. If an identity then
+// cannot be pointed, the record is claimed again, for the sweep after the
+// lease to finish the deregistration the client asked for; failing the save,
+// the lease stands for it already.
 func (g *Registrar) putBack(ctx context.Context, claimed *state.Registration, bindings []state.Contact) {
 	back := claimed.Clone()
 	back.Contacts, back.Deregistering = bindings, time.Time{}
@@ -509,8 +529,14 @@ func (g *Registrar) putBack(ctx context.Context, claimed *state.Registration, bi
 		g.count("registrar.deregistration_left_to_sweep")
 		return
 	}
-	if err := g.point(ctx, saved, latestExpiry(saved.Contacts).Add(state.ProfileGrace)); err != nil {
-		g.internal("pointing the identities at a set put back", err)
+	if err := g.point(ctx, saved, latestExpiry(bindings).Add(state.ProfileGrace)); err == nil {
+		return
+	}
+	g.count("registrar.deregistration_left_to_sweep")
+	lease := saved.Clone()
+	lease.Contacts, lease.Deregistering = nil, g.cfg.Now().Add(state.SweepLease)
+	if _, err := g.cfg.Store.SaveRegistration(ctx, lease); err != nil {
+		g.internal("claiming a set put back half-pointed", err)
 	}
 }
 

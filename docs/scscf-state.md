@@ -50,9 +50,11 @@ additionally sealed (below).
   are one item, so a REGISTER, a deregistration or a sweep is one
   conditional save, whichever identity it came for; each IMPU's item only
   names its set and the set's incarnation (`state.Identity`), written when
-  the S-CSCF is assigned the set or the set changes, never by a
-  re-registration. A terminating request reads the IMPU's item, the set and
-  the profile. An IMPU names one set: a public identity shared by several
+  the S-CSCF is assigned the set or the set changes, before the record that
+  names them: the record's save is the commit point, and an item naming a
+  record not saved is as good as none. A re-registration only keeps the
+  items, or repairs a missing one. A terminating request reads the IMPU's
+  item, the set and the profile. An IMPU names one set: a public identity shared by several
   IMPIs (TS 23.228 §4.3.3.4) is out of scope, and the second IMPI to
   register it takes the IMPU's item.
 - **Identities go before their set.** Every deregistration deletes the IMPU
