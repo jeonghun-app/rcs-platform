@@ -88,6 +88,8 @@ type fakeSender struct {
 	sent []sent
 	// fail, when set, is returned by every send.
 	fail error
+	// onSend, if set, runs inside every request send, before it returns.
+	onSend func()
 }
 
 type sent struct {
@@ -110,6 +112,12 @@ func label(m sip.Message) string {
 }
 
 func (s *fakeSender) SendRequest(req *sip.Request, dst transport.Destination, opts ...transport.SendOption) (transport.Network, error) {
+	s.mu.Lock()
+	onSend := s.onSend
+	s.mu.Unlock()
+	if onSend != nil {
+		onSend()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {

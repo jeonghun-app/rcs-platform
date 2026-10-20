@@ -81,8 +81,11 @@
 // ErrTooManyConnections), counts as a 503 with Retry-After that is passed on
 // as such, so the client backs off. Other transport failures count as a 503
 // from the next hop (§16.9), which becomes a 500 if chosen, and a vanished
-// flow as 430 (RFC 5626 §5.3.1). In every case the next fork group, or a
-// replacement target from OnBranchFailure, may still succeed.
+// flow as 430 (RFC 5626 §5.3.1). So does a flow that closes after the
+// request was written onto it but before a final response, once the service
+// passes the transport's OnFlowClosed to FlowClosed: the branch ends then,
+// not at Timer B or F. In every case the next fork group, or a replacement
+// target from OnBranchFailure, may still succeed.
 //
 // Max-Breadth (RFC 5393 §5) is not implemented; MaxBranches bounds forking
 // meanwhile (#75).

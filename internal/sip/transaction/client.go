@@ -120,6 +120,14 @@ func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseH
 		return nil, ErrDuplicate
 	}
 	l.clients[key] = tx
+	if dst.Flow != "" {
+		// Recorded before the send, so a close that comes right after it
+		// is not missed; FlowClosed waits on tx.mu until the send is done.
+		if l.byFlow[dst.Flow] == nil {
+			l.byFlow[dst.Flow] = make(map[*ClientTransaction]struct{})
+		}
+		l.byFlow[dst.Flow][tx] = struct{}{}
+	}
 	l.mu.Unlock()
 
 	tx.mu.Lock()
@@ -177,6 +185,20 @@ func (tx *ClientTransaction) Terminate() {
 	tx.mu.Unlock()
 	if live {
 		tx.out.deliver(nil, ErrTerminated)
+	}
+}
+
+// flowClosed ends the transaction with ErrFlowClosed if it still awaits a
+// final response.
+func (tx *ClientTransaction) flowClosed() {
+	tx.mu.Lock()
+	pending := tx.state == Calling || tx.state == Proceeding || !tx.invite && tx.state == Trying
+	if pending {
+		tx.terminate()
+	}
+	tx.mu.Unlock()
+	if pending {
+		tx.out.deliver(nil, ErrFlowClosed)
 	}
 }
 

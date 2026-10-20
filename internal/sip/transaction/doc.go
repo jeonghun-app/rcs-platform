@@ -17,6 +17,10 @@
 // responses, which are end to end (§17.1.1.3, §13.2.2.4), and responses that
 // match no client transaction, which a proxy forwards statelessly (§16.7, §16.11).
 //
+// A client transaction sent over a flow (Destination.Flow) ends at once, with
+// ErrFlowClosed, when that flow closes before its final response
+// (Layer.FlowClosed): Timer B or F would notice only 64*T1 later.
+//
 // Every timer runs on an injected Clock, so tests drive T1 to T4 without
 // sleeping. Retransmission timers (A, E, G) run only over unreliable transports.
 //

@@ -81,8 +81,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
-		OnFlowClosed:   fl.closed,
-		Logger:         rt.Logger,
+		OnFlowClosed: func(id transport.FlowID, info transport.FlowInfo) {
+			fl.closed(id, info)
+			// A request the core sent the client over this flow gets 430
+			// now rather than waiting for Timer B or F (#234).
+			if px := p.Load(); px != nil {
+				px.FlowClosed(id)
+			}
+		},
+		Logger: rt.Logger,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
