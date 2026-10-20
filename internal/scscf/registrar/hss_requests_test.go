@@ -275,3 +275,19 @@ func TestAnIdentityMovingBetweenTwoSetsEndsInTheNewOneWhicheverPPRComesFirst(t *
 		})
 	}
 }
+
+func TestAPPRForAnExpiredSetOfAUserWithAnotherLiveIsNotUserUnknown(t *testing.T) {
+	// From the #210 re-review: set 2 has expired but no sweep has run; 5001
+	// would make the HSS mark the whole user not registered while set 1
+	// lives.
+	e := newEnv(t)
+	g := e.instance(1)
+	u, _ := twoSets(t, e, g)
+	e.clock.advance(5 * time.Minute)
+	wantStatus(t, u.registerWith(g, 600), 200)
+	e.clock.advance(6 * time.Minute)
+	if live(must(regOf(e, impu2))(t), e.clock.Now()) {
+		t.Fatal("set 2 should have expired")
+	}
+	wantResult(t, g.HandlePPR(bg, &cx.PPR{UserName: impi1, UserData: userDataOf(impi1, nil, impu2, impu3)}), resultUnableToComply)
+}

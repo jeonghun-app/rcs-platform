@@ -123,10 +123,10 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 // another set is pointed at this one, and one that left is unpointed if it
 // still names this set; the set it moved to points it on its own PPR.
 //
-// A PPR for a private identity with no record here is answered
-// DIAMETER_ERROR_USER_UNKNOWN, which tells the HSS this S-CSCF lost the user
-// (TS 29.228 §6.2.2.1), as is one for a set being deregistered; one for a set
-// not served here, of a user who has others, UNABLE_TO_COMPLY. User-Data the
+// A PPR for a set without a live record here, of a private identity with no
+// live record here at all, is answered DIAMETER_ERROR_USER_UNKNOWN, which
+// tells the HSS this S-CSCF lost the user (TS 29.228 §6.2.2.1); one of a
+// user who has another set live here, UNABLE_TO_COMPLY. User-Data the
 // S-CSCF cannot read is DIAMETER_ERROR_NOT_SUPPORTED_USER_DATA and too much
 // of it DIAMETER_ERROR_TOO_MUCH_DATA, after which the HSS deregisters the
 // user.
@@ -153,7 +153,7 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 			return resultUnableToComply
 		}
 		if reg == nil || !live(reg, received) {
-			return g.notServed(ctx, r.UserName, reg != nil)
+			return g.notServed(ctx, r.UserName, received)
 		}
 		p := &state.Profile{Key: key, UserData: r.UserData, Received: received, KeepUntil: keepUntil(reg).Add(state.ProfileGrace)}
 		if err := g.cfg.Store.SaveProfile(ctx, p); err != nil && !errors.Is(err, state.ErrConflict) {
@@ -193,13 +193,15 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 	return resultUnableToComply
 }
 
-// notServed answers a PPR for a set without a live record here.
-func (g *Registrar) notServed(ctx context.Context, impi string, ending bool) cx.Result {
+// notServed answers a PPR for a set without a live record here: 5001, which
+// makes the HSS mark the user not registered (TS 29.228 §6.2.2.1), only if
+// no set of the user is live here either.
+func (g *Registrar) notServed(ctx context.Context, impi string, now time.Time) cx.Result {
 	regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
 	if err != nil {
 		return resultUnableToComply
 	}
-	if ending || len(regs) == 0 {
+	if !slices.ContainsFunc(regs, func(r *state.Registration) bool { return live(r, now) }) {
 		g.count("registrar.ppr_unknown")
 		return cx.ExperimentalResult(cx.ErrorUserUnknown)
 	}
