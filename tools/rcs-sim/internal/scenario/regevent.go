@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
@@ -26,7 +27,7 @@ func regEvent(r *run) error {
 	}); err != nil {
 		return err
 	}
-	w := &regWatch{impu: r.cfg.SIP.IMPU.String(), contact: c.ua.ContactURI()}
+	w := &regWatch{impu: r.cfg.SIP.IMPU, contact: c.ua.ContactURI()}
 	if err := r.step("subscribe", func(ctx context.Context) (map[string]int64, error) {
 		sub, res, err := c.ua.SubscribeRegEvent(ctx)
 		if err != nil {
@@ -38,12 +39,12 @@ func regEvent(r *run) error {
 			defer cancel()
 			_, _ = sub.Unsubscribe(ctx)
 		})
-		n, err := w.next(ctx, "active", "active")
+		n, err := w.next(ctx, "active", reginfo.ContactActive)
 		detail := map[string]int64{"status": int64(res.StatusCode)}
 		if err != nil {
 			return detail, err
 		}
-		if n.Info.State != "full" {
+		if n.Info.State != reginfo.Full {
 			return detail, errors.New("the first NOTIFY is not the full state")
 		}
 		detail["version"] = int64(n.Info.Version)
@@ -55,7 +56,7 @@ func regEvent(r *run) error {
 		if _, err := c.ua.Register(ctx); err != nil {
 			return nil, sipError(err)
 		}
-		n, err := w.next(ctx, "active", "active")
+		n, err := w.next(ctx, "active", reginfo.ContactActive)
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +70,7 @@ func regEvent(r *run) error {
 		}
 		// A terminated Subscription-State ends the subscription with the
 		// registration.
-		n, err := w.next(ctx, "terminated", "terminated")
+		n, err := w.next(ctx, "terminated", reginfo.ContactTerminated)
 		if err != nil {
 			return nil, err
 		}
@@ -79,17 +80,16 @@ func regEvent(r *run) error {
 
 // regWatch follows the NOTIFYs of one subscription.
 type regWatch struct {
-	impu    string
-	contact sip.URI
-	sub     *sipua.Subscription
-	version uint64
-	seen    bool
+	impu, contact sip.URI
+	sub           *sipua.Subscription
+	version       uint32
+	seen          bool
 }
 
 // next waits for the next NOTIFY and checks it: the Subscription-State
 // wanted, the client's contact in the state wanted, and a version one above
 // the last (RFC 3680 §5.3.1).
-func (w *regWatch) next(ctx context.Context, subState, contactState string) (sipua.Notification, error) {
+func (w *regWatch) next(ctx context.Context, subState string, contactState reginfo.ContactState) (sipua.Notification, error) {
 	var n sipua.Notification
 	select {
 	case n = <-w.sub.Notifications():
@@ -108,16 +108,11 @@ func (w *regWatch) next(ctx context.Context, subState, contactState string) (sip
 	}
 	w.version, w.seen = n.Info.Version, true
 	found := false
-	for _, reg := range n.Info.Registrations {
-		if reg.AOR != w.impu {
-			continue
-		}
-		for _, ct := range reg.Contacts {
-			if u, err := sip.ParseURI(ct.URI); err == nil && u.Equal(w.contact) {
-				found = true
-				if ct.State != contactState {
-					return n, fmt.Errorf("the client's contact is %q, want %q", ct.State, contactState)
-				}
+	for _, reg := range n.Info.ByAOR(w.impu) {
+		for _, ct := range reg.ByURI(w.contact) {
+			found = true
+			if ct.State != contactState {
+				return n, fmt.Errorf("the client's contact is %q, want %q", ct.State, contactState)
 			}
 		}
 	}

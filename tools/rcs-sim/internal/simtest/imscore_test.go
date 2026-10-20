@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
@@ -52,8 +53,14 @@ func TestAnExpiredBindingEndsItsRegEventSubscription(t *testing.T) {
 	next()
 	core.Expire(impu)
 	n := next()
-	c, ok := n.Info.Contact(impu, ua.ContactURI().String())
-	if n.State != "terminated" || !ok || c.State != "terminated" || c.Event != "expired" {
+	var c reginfo.Contact
+	ok := false
+	for _, reg := range n.Info.ByAOR(u) {
+		if cs := reg.ByURI(ua.ContactURI()); len(cs) == 1 {
+			c, ok = cs[0], true
+		}
+	}
+	if n.State != "terminated" || !ok || c.State != reginfo.ContactTerminated || c.Event != reginfo.Expired {
 		t.Fatalf("notification %+v, contact %+v", n, c)
 	}
 	if core.Registered(impu) {

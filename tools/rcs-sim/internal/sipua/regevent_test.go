@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -21,8 +22,8 @@ const (
 	notifierRecordRoute = "<sip:scscf.example.com;lr>, <sip:pcscf.example.com;lr>"
 )
 
-// reginfo is a reg event body: the IMPU's registration with one contact.
-func reginfo(version int, state, contactState, event string, uri string) string {
+// regInfoBody is a reg event body: the IMPU's registration with one contact.
+func regInfoBody(version int, state, contactState, event string, uri string) string {
 	return `<?xml version="1.0"?>` +
 		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="` + strconv.Itoa(version) + `" state="` + state + `">` +
 		`<registration aor="` + testIMPU + `" id="r1" state="active">` +
@@ -199,23 +200,23 @@ func TestNotificationsCarryTheRegistrationStateInOrder(t *testing.T) {
 	_ = s
 	contact := ua.contact.URI.String()
 	for v, body := range []string{
-		reginfo(0, "full", "active", "registered", contact),
-		reginfo(1, "full", "active", "refreshed", contact),
+		regInfoBody(0, "full", "active", "registered", contact),
+		regInfoBody(1, "full", "active", "refreshed", contact),
 	} {
 		if res := n.notify(t, "active;expires=600000", body); res.StatusCode != 200 {
 			t.Fatalf("NOTIFY %d answered %d", v, res.StatusCode)
 		}
 		got := nextNotification(t, sub)
-		c, ok := got.Info.Contact(testIMPU, contact)
-		if got.Err != nil || got.State != "active" || got.Info.Version != uint64(v) || !ok || c.State != "active" {
+		c, ok := contactIn(t, got.Info, testIMPU, contact)
+		if got.Err != nil || got.State != "active" || got.Info.Version != uint32(v) || !ok || c.State != reginfo.ContactActive {
 			t.Fatalf("notification %d = %+v, contact %+v", v, got, c)
 		}
 	}
 	// A network-initiated de-registration (RFC 3680 §5.3.2).
-	n.notify(t, "terminated;reason=deactivated", reginfo(2, "full", "terminated", "deactivated", contact))
+	n.notify(t, "terminated;reason=deactivated", regInfoBody(2, "full", "terminated", "deactivated", contact))
 	got := nextNotification(t, sub)
-	c, _ := got.Info.Contact(testIMPU, contact)
-	if got.State != "terminated" || got.Reason != "deactivated" || c.State != "terminated" || c.Event != "deactivated" || got.Info.Version != 2 {
+	c, _ := contactIn(t, got.Info, testIMPU, contact)
+	if got.State != "terminated" || got.Reason != "deactivated" || c.State != reginfo.ContactTerminated || c.Event != reginfo.Deactivated || got.Info.Version != 2 {
 		t.Fatalf("final notification = %+v, contact %+v", got, c)
 	}
 	select {
@@ -235,7 +236,7 @@ func TestANotifyBeforeTheTwoHundredSetsUpTheSubscription(t *testing.T) {
 	n := newNotifier(t, s)
 	ua := dial(t, s.config())
 	register(t, ua)
-	n.before = reginfo(0, "full", "active", "registered", ua.contact.URI.String())
+	n.before = regInfoBody(0, "full", "active", "registered", ua.contact.URI.String())
 	sub, res, err := ua.SubscribeRegEvent(context.Background())
 	if err != nil || res.StatusCode != 200 {
 		t.Fatalf("SubscribeRegEvent = %v, %v", res, err)
@@ -356,12 +357,12 @@ func TestANotifyFromAnotherDialogIsRefused(t *testing.T) {
 	// dialog's gets 481 and changes nothing.
 	_, n, ua, sub := subscribed(t)
 	contact := ua.contact.URI.String()
-	n.notify(t, "active", reginfo(0, "full", "active", "registered", contact))
+	n.notify(t, "active", regInfoBody(0, "full", "active", "registered", contact))
 	nextNotification(t, sub)
 	n.mu.Lock()
 	n.tag = "another-notifier"
 	n.mu.Unlock()
-	if res := n.notify(t, "terminated;reason=rejected", reginfo(1, "full", "terminated", "rejected", contact)); res.StatusCode != 481 {
+	if res := n.notify(t, "terminated;reason=rejected", regInfoBody(1, "full", "terminated", "rejected", contact)); res.StatusCode != 481 {
 		t.Errorf("NOTIFY from another dialog answered %d, want 481", res.StatusCode)
 	}
 	select {
@@ -392,7 +393,7 @@ func TestANotifyBeforeThe2xxSetsUpTheDialog(t *testing.T) {
 			return
 		}
 		go func() {
-			nt := n.request(t, "active;expires=600000", reginfo(0, "full", "active", "registered", ua.contact.URI.String()), "")
+			nt := n.request(t, "active;expires=600000", regInfoBody(0, "full", "active", "registered", ua.contact.URI.String()), "")
 			nt.Header.Set("Contact", "<sip:notify-contact.example.com:5070;transport=tcp>")
 			nt.Header.Add("Record-Route", "<sip:pcscf.example.com;lr>, <sip:mid.example.com;lr>")
 			done := make(chan struct{})
@@ -473,7 +474,7 @@ func TestNotifiesOutsideTheRulesAreRefusedOrFlagged(t *testing.T) {
 	bad := n.request(t, "active", "", "")
 	// Valid reginfo, under another type.
 	bad.Header.Add("Content-Type", "text/plain")
-	bad.Body = []byte(reginfo(2, "full", "active", "registered", "sip:x@192.0.2.9"))
+	bad.Body = []byte(regInfoBody(2, "full", "active", "registered", "sip:x@192.0.2.9"))
 	n.s.sendRequest(t, bad, n.flow)
 	if got := nextNotification(t, sub); got.Err == nil {
 		t.Error("a text/plain body raised no error")
@@ -496,52 +497,44 @@ func TestARefusedSubscribeLeavesNoSubscription(t *testing.T) {
 	}
 }
 
-func TestParseRegInfoReadsRFC3680sExample(t *testing.T) {
-	// RFC 3680 §6, the example after a registration, shortened.
-	body := `<?xml version="1.0"?>
-<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="partial">
-  <registration aor="sip:user@example.com" id="as9" state="active">
-    <contact id="76" state="active" event="registered" duration-registered="0" expires="3600">
-      <uri>sip:user@pc887.example.com</uri>
-    </contact>
-  </registration>
-</reginfo>`
-	r, err := ParseRegInfo([]byte(body))
+func TestANotifyBodyIsReadByTheSharedParser(t *testing.T) {
+	// internal/sip/reginfo reads the body, with its rules: a document type
+	// declaration, or a document without a version, is flagged on a
+	// NOTIFY still answered 200 (RFC 3680 §5.4).
+	_, n, ua, sub := subscribed(t)
+	contact := ua.contact.URI.String()
+	for name, tc := range map[string]struct {
+		body string
+		err  error
+	}{
+		"doctype":    {`<?xml version="1.0"?><!DOCTYPE reginfo [<!ELEMENT reginfo ANY>]>` + regInfoBody(0, "full", "active", "registered", contact)[len(`<?xml version="1.0"?>`):], reginfo.ErrDTD},
+		"no version": {`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" state="full"/>`, reginfo.ErrMalformed},
+	} {
+		if res := n.notify(t, "active", tc.body); res.StatusCode != 200 {
+			t.Fatalf("%s: answered %d", name, res.StatusCode)
+		}
+		if got := nextNotification(t, sub); got.Info != nil || !errors.Is(got.Err, tc.err) {
+			t.Fatalf("%s: notification %+v, want %v", name, got, tc.err)
+		}
+	}
+}
+
+// contactIn is the contact at uri of aor's registration in info, as the
+// scenario looks it up.
+func contactIn(t *testing.T, info *reginfo.Info, aor, uri string) (reginfo.Contact, bool) {
+	t.Helper()
+	a, err := sip.ParseURI(aor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, ok := r.Contact("sip:user@example.com", "sip:user@pc887.example.com")
-	if r.Version != 1 || r.State != "partial" || !ok || c.ID != "76" || c.Event != "registered" || c.Expires != 3600 {
-		t.Fatalf("ParseRegInfo = %+v, contact %+v", r, c)
+	u, err := sip.ParseURI(uri)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The notifier writes the URI back in its own parameter order and
-	// case (RFC 3261 §19.1.4).
-	if _, ok := r.Contact("sip:user@example.com", "SIP:user@PC887.example.com"); !ok {
-		t.Error("Contact did not find an equal URI written differently")
-	}
-	if _, ok := r.Contact("sip:user@example.com", "sip:other@pc887.example.com"); ok {
-		t.Error("Contact found another user's URI")
-	}
-	const root = `<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="full"/>`
-	for _, bad := range []string{
-		`<reginfo version="1" state="full"/>`,
-		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="whole"/>`,
-		`not xml`,
-		// No document type declaration, and nothing after the root
-		// (code review on #205; as ft's decode).
-		`<?xml version="1.0"?><!DOCTYPE reginfo [<!ELEMENT reginfo ANY>]>` + root,
-		root + `<trailing garbage`,
-		root + root,
-		root + `text`,
-		// The version is required (RFC 3680 §5.4; QA on #205).
-		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" state="full"/>`,
-		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="-1" state="full"/>`,
-	} {
-		if _, err := ParseRegInfo([]byte(bad)); err == nil {
-			t.Errorf("ParseRegInfo(%q) accepted it", bad)
+	for _, reg := range info.ByAOR(a) {
+		if cs := reg.ByURI(u); len(cs) > 0 {
+			return cs[0], true
 		}
 	}
-	if _, err := ParseRegInfo([]byte(root + "\n<!-- end -->\n")); err != nil {
-		t.Errorf("ParseRegInfo refused white space and a comment after the root: %v", err)
-	}
+	return reginfo.Contact{}, false
 }
