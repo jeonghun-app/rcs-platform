@@ -73,6 +73,10 @@ type Config struct {
 	Messaging messaging.Config
 	// GroupsTable is the groupchats table, with RCSAS_STORE=dynamodb.
 	GroupsTable string
+	// ConferenceFactory is the URI clients create group chats at
+	// (RCSAS_CONFERENCE_FACTORY_URI): by default the ConfFctyURI ACS
+	// provisions, sip:conf-factory@<RCS_IMS_DOMAIN>.
+	ConferenceFactory sip.URI
 	// Group is the group chat focus's configuration; its Clock and Rand
 	// are left for the service to set.
 	Group group.Config
@@ -228,6 +232,17 @@ func Configure(s *runtime.Settings) Config {
 			messaging.Rate{PerMinute: group.DefaultFanoutRate.PerMinute, Burst: group.DefaultFanoutBurst(maxParticipants)}),
 		AddRate:    readRate(e, "GROUP_ADD", addRate),
 		CreateRate: readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
+	}
+	c.Group.HomeDomain = c.HomeDomain
+	if c.Group.ConferenceHost != "" && strings.EqualFold(c.Group.ConferenceHost, c.HomeDomain) {
+		// Every user's request would be taken for a group's.
+		e.Invalid("CONFERENCE_HOST", "the IMS domain (RCS_IMS_DOMAIN), whose users are no conferences")
+	}
+	factory := e.String("CONFERENCE_FACTORY_URI", "sip:conf-factory@"+c.HomeDomain)
+	if u, err := sip.ParseURI(factory); err != nil || !u.IsSIP() || u.User == "" || u.Host == "" {
+		e.Invalid("CONFERENCE_FACTORY_URI", "not a SIP URI with a user")
+	} else {
+		c.ConferenceFactory = u
 	}
 	positive(e, "GROUP_MAX_PARTICIPANTS", c.Group.MaxParticipants)
 	if c.Group.MaxParticipants > group.LimitParticipants {

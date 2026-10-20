@@ -60,10 +60,8 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, code)
 		return
 	}
-	// A chat INVITE may carry the chat's first message beside its SDP; a
-	// group chat's has a resource list, which inviteBody does not take:
-	// group sessions are not served yet. Large mode carries its message
-	// in the session only.
+	// A chat INVITE may carry the chat's first message beside its SDP;
+	// large mode carries its message in the session only.
 	offer, i, path, first, code := inviteOffer(&req.Header, req.Body, mode)
 	if code != 0 {
 		s.cfg.Metrics.Count("sip.invite.offer_refused", 1)
@@ -105,7 +103,7 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	}
 	res, err := sip.NewResponse(req, 200, "", tag)
 	if err == nil {
-		err = s.sessionHeaders(res, ss.contactTag(), ss.sdp, interval)
+		err = s.sessionHeaders(res, ss.contact(), ss.sdp, interval)
 	}
 	// A CANCEL that came meanwhile has the proxy answer 487 (proxy.Router).
 	if err != nil || ctx.Err() != nil {

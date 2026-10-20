@@ -57,6 +57,9 @@ type session struct {
 	mode     store.Mode
 	// inv is the invitation of a session rcs-as started; zero otherwise.
 	inv messaging.Invitation
+	// group is the conference URI of a session with a group chat, which
+	// rcs-as is the focus of; empty otherwise.
+	group string
 
 	mu sync.Mutex
 	d  *dialog.Dialog
@@ -88,6 +91,18 @@ func (ss *session) contactTag() string {
 		return largeTag
 	}
 	return chatTag
+}
+
+// contact is the Contact of rcs-as's side of the session: this task, where
+// the requests in the dialog reach it, with the service's feature tag; or,
+// in a session with a group, the conference URI marked as a focus (RFC
+// 4579 §5.2), which is how rcsjta tells a group's INVITE from a 1-to-1
+// one (ChatUtils.isGroupChatInvitation) and what it rejoins the group at.
+func (ss *session) contact() string {
+	if ss.group != "" {
+		return "<" + ss.group + ">;isfocus;" + chatTag
+	}
+	return sip.Address{URI: ss.s.cfg.Contact}.String() + ";" + ss.contactTag()
 }
 
 // Why addSession did not add a session.
@@ -436,12 +451,12 @@ func (ss *session) offerAgain() ([]byte, error) {
 	return body, nil
 }
 
-// sessionHeaders adds the header fields of a 2xx in a session: Contact with
-// the service's feature tag, Allow, the SDP if any and, with a timer, the
-// Session-Expires the UAC refreshes (RFC 4028 §9).
-func (s *Server) sessionHeaders(res *sip.Response, tag string, body []byte, interval time.Duration) error {
+// sessionHeaders adds the header fields of a 2xx in a session: contact,
+// Allow, the SDP if any and, with a timer, the Session-Expires the UAC
+// refreshes (RFC 4028 §9).
+func (s *Server) sessionHeaders(res *sip.Response, contact string, body []byte, interval time.Duration) error {
 	fields := [][2]string{
-		{"Contact", sip.Address{URI: s.cfg.Contact}.String() + ";" + tag},
+		{"Contact", contact},
 		{"Allow", allowed},
 		{"Supported", "timer"},
 	}
@@ -626,7 +641,7 @@ func (s *Server) sendACK(ack *sip.Request, next sip.URI) {
 // inDialog serves a request the other side sent in a session: BYE ends
 // it, a re-INVITE or UPDATE refreshes it (RFC 4028 §7), OPTIONS is
 // answered, and nothing else is taken.
-func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
+func (s *Server) inDialog(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
 	ss := s.sessionOf(req)
 	if ss == nil {
@@ -654,12 +669,16 @@ func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
 		// Ended before the 200 leaves, so that what the other side does
 		// next finds the session gone.
 		carried := ss.leg.Carried()
-		if ss.end() && ss.inv.Recipient != "" && !carried && directionRefusedBy(req) {
+		switch {
+		case !ss.end():
+		case ss.inv.Recipient != "" && !carried && directionRefusedBy(req):
 			// The client answered passive and pcscf ended the session
 			// before any MSRP traffic (ADR 0004): it takes no session
 			// from the network. A session that carried messages was
 			// served, whatever its BYE says.
 			s.engine.InviteFailed(ss.inv, messaging.ErrNoSessions)
+		case ss.group != "" && leaves(req):
+			s.left(ctx, ss)
 		}
 		s.respond(u, req, 200)
 	case "INVITE", "UPDATE":
@@ -673,14 +692,17 @@ func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
 
 // directionRefusedBy reports a BYE whose Reason is SIP cause 488, with
 // which pcscf ends a session whose client answered passive (ADR 0004).
-func directionRefusedBy(req *sip.Request) bool {
+func directionRefusedBy(req *sip.Request) bool { return sipCause(req, 488) }
+
+// sipCause reports a request whose Reason names SIP cause code (RFC 3326).
+func sipCause(req *sip.Request, code int) bool {
 	reasons, err := req.Header.Reason()
 	if err != nil {
 		return false
 	}
 	return slices.ContainsFunc(reasons, func(r sip.Reason) bool {
 		cause, ok := r.Cause()
-		return ok && cause == 488 && strings.EqualFold(r.Protocol, "SIP")
+		return ok && cause == code && strings.EqualFold(r.Protocol, "SIP")
 	})
 }
 
@@ -729,7 +751,7 @@ func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
 	tag := ss.d.LocalTag()
 	ss.mu.Unlock()
 	res, err := sip.NewResponse(req, 200, "", tag)
-	if err != nil || s.sessionHeaders(res, ss.contactTag(), body, interval) != nil {
+	if err != nil || s.sessionHeaders(res, ss.contact(), body, interval) != nil {
 		return // the proxy answers 500
 	}
 	ss.mu.Lock()

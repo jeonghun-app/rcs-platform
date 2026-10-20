@@ -712,15 +712,6 @@ func TestCloseWaitsForTheAnswersToItsBYEs(t *testing.T) {
 	}
 }
 
-func TestGroupSessionsAreNotServedYet(t *testing.T) {
-	r := newChatRig(t, messaging.Config{})
-	inv := invitation()
-	inv.Mode = store.Group
-	if err := r.a.srv.Invite(t.Context(), inv); !errors.Is(err, errGroupNotServed) {
-		t.Fatalf("Invite: %v", err)
-	}
-}
-
 // scscf's third-party REGISTER (TS 24.229 §5.4.1.7) tells the engine the
 // user registered: anew when rcs-as had not heard of a live registration.
 func TestAThirdPartyRegisterTellsTheEngine(t *testing.T) {

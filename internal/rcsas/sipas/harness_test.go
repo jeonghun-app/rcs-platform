@@ -167,11 +167,19 @@ func startAS(t *testing.T, e Engine, core *fakeCore) *as {
 // sets, and with the proxy's configuration changed by each of tune.
 func startASWith(t *testing.T, e Engine, cfg Config, tune ...func(*proxy.Config)) *as {
 	t.Helper()
-	return startASOn(t, e, cfg, transport.Config{}, tune...)
+	return startASOn(t, e, nil, cfg, transport.Config{}, tune...)
 }
 
-// startASOn is startASWith on a transport configured by tc.
-func startASOn(t *testing.T, e Engine, cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *as {
+// The conference factory and host of the tests (ACS provisions the
+// factory at the home domain).
+const (
+	confHost    = "conf." + domain
+	confFactory = "sip:conf-factory@" + domain
+)
+
+// startASOn is startASWith with groups, on a transport configured by tc. A
+// cfg without a conference factory or host gets the tests' own.
+func startASOn(t *testing.T, e Engine, groups Groups, cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *as {
 	t.Helper()
 	var p atomic.Pointer[proxy.Proxy]
 	tr, err := transport.New(tc, func(in transport.Inbound) {
@@ -192,6 +200,14 @@ func startASOn(t *testing.T, e Engine, cfg Config, tc transport.Config, tune ...
 		t.Fatal(err)
 	}
 	cfg.Host, cfg.Listener, cfg.Contact, cfg.HomeDomain = "127.0.0.1", "core", self, domain
+	if cfg.ConferenceHost == "" {
+		cfg.ConferenceHost = confHost
+	}
+	if cfg.ConferenceFactory.Host == "" {
+		if cfg.ConferenceFactory, err = sip.ParseURI(confFactory); err != nil {
+			t.Fatal(err)
+		}
+	}
 	srv, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +221,7 @@ func startASOn(t *testing.T, e Engine, cfg Config, tc transport.Config, tune ...
 		t.Fatal(err)
 	}
 	t.Cleanup(px.Close)
-	srv.Bind(e, px.Layer(), tr)
+	srv.Bind(e, groups, px.Layer(), tr)
 	// Before the proxy and the transport, which carry its BYEs.
 	t.Cleanup(srv.Close)
 	p.Store(px)
@@ -361,6 +377,7 @@ var errFakeLeg = errors.New("fake: no legs")
 func (e *fakeEngine) OpenLeg(messaging.LegParams) (*messaging.Leg, error) { return nil, errFakeLeg }
 func (e *fakeEngine) Offer(messaging.LegParams) (*messaging.Leg, error)   { return nil, errFakeLeg }
 func (e *fakeEngine) InviteFailed(messaging.Invitation, error)            {}
+func (e *fakeEngine) Invite(context.Context, messaging.Invitation)        {}
 
 func (e *fakeEngine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
