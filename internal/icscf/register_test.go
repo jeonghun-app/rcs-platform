@@ -14,20 +14,26 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
-// twoSCSCFs configures an S-CSCF without capabilities and, after it, one
-// with capability 1 and optional 2.
+// twoSCSCFs configures an S-CSCF without capabilities, after it one with
+// capability 1 and optional 2, and last scscf-0, which the HSS names in
+// these tests.
 func twoSCSCFs(c *Config) {
 	c.SCSCFs = []SCSCF{
 		{URI: mustURI(scscfURI)},
 		{URI: mustURI("sip:scscf-b.rcs.local;transport=tcp"), Mandatory: []uint32{1}, Optional: []uint32{2}},
+		{URI: mustURI(scscf0)},
 	}
 }
+
+// scscf0 is the configured URI of the S-CSCF the HSS calls scscf-0.
+const scscf0 = "sip:scscf-0.rcs.local;transport=tcp"
 
 // Every row of the REGISTER part of the package's mapping table, with its
 // clause (TS 24.229 §5.3.1.2, §5.3.1.3; results of TS 29.229 §6.2).
 func TestRegisterAnswersFollowTheMappingTable(t *testing.T) {
 	forward := func(uri string) outcome { return outcome{uri: uri, timeout: true} }
 	retry := outcome{status: 480, retryAfter: "10"}
+	unknown := outcome{status: 500, retryAfter: "10"}
 	named := "sip:scscf-0.rcs.local"
 	cases := []struct {
 		name   string
@@ -36,15 +42,24 @@ func TestRegisterAnswersFollowTheMappingTable(t *testing.T) {
 		want   outcome
 		metric string
 	}{
-		// §5.3.1.2: the Server-Name becomes the Request-URI.
-		{"first registration with a name", uaa(experimental(cx.FirstRegistration), named, nil), nil, forward(named), "icscf.register.forwarded"},
-		{"subsequent registration", uaa(experimental(cx.SubsequentRegistration), named, nil), nil, forward(named), "icscf.register.forwarded"},
-		{"unregistered service", uaa(experimental(cx.UnregisteredService), named, nil), nil, forward(named), "icscf.register.forwarded"},
-		{"base success", uaa(base(diameter.ResultSuccess), named, nil), nil, forward(named), "icscf.register.forwarded"},
-		{"a name wins over capabilities", uaa(experimental(cx.FirstRegistration), named, &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, forward(named), "icscf.register.forwarded"},
+		// §5.3.1.2: the Server-Name's configured URI becomes the
+		// Request-URI, with the transport the configuration gives.
+		{"first registration with a name", uaa(experimental(cx.FirstRegistration), named, nil), nil, forward(scscf0), "icscf.register.forwarded"},
+		{"subsequent registration", uaa(experimental(cx.SubsequentRegistration), named, nil), nil, forward(scscf0), "icscf.register.forwarded"},
+		{"unregistered service", uaa(experimental(cx.UnregisteredService), named, nil), nil, forward(scscf0), "icscf.register.forwarded"},
+		{"base success", uaa(base(diameter.ResultSuccess), named, nil), nil, forward(scscf0), "icscf.register.forwarded"},
+		{"a name wins over capabilities", uaa(experimental(cx.FirstRegistration), named, &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, forward(scscf0), "icscf.register.forwarded"},
+		// Review of #274: the name is matched by scheme, host (any case)
+		// and a port if it gives one; the HSS's production form,
+		// sip:scscf.<namespace>, finds the configured TCP URI.
+		{"the production form of a name", uaa(experimental(cx.FirstRegistration), "sip:scscf.rcs.local", nil), nil, forward(scscfURI), "icscf.register.forwarded"},
+		{"a name with its default port", uaa(experimental(cx.FirstRegistration), "sip:SCSCF.rcs.local:5060", nil), nil, forward(scscfURI), "icscf.register.forwarded"},
+		{"a name with another port", uaa(experimental(cx.FirstRegistration), "sip:scscf.rcs.local:5070", nil), nil, unknown, "icscf.scscf.unknown_name"},
+		{"a name of another scheme", uaa(experimental(cx.FirstRegistration), "sips:scscf.rcs.local", nil), nil, unknown, "icscf.scscf.unknown_name"},
+		{"a name not configured", uaa(experimental(cx.FirstRegistration), "sip:scscf-9.rcs.local", nil), nil, unknown, "icscf.scscf.unknown_name"},
 		// TS 29.228 §6.7: a name inside the capabilities steers the choice,
 		// and the capabilities, which no S-CSCF has here, are disregarded.
-		{"a name inside the capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{9}, ServerNames: []string{named, scscfURI}}), nil, forward(named), "icscf.register.forwarded"},
+		{"a name inside the capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{9}, ServerNames: []string{named, scscfURI}}), nil, forward(scscf0), "icscf.register.forwarded"},
 		{"a bad name inside the capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{ServerNames: []string{"scscf"}}), nil, retry, "icscf.hss.bad_server_name"},
 		// §5.3.1.2 step 1: chosen by capability.
 		{"capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, forward("sip:scscf-b.rcs.local;transport=tcp"), "icscf.register.forwarded"},

@@ -84,6 +84,8 @@ func (c *fakeClock) advance(d time.Duration) {
 type fakeNet struct {
 	mu       sync.Mutex
 	requests []*sip.Request
+	// networks are the networks the requests were sent over, in order.
+	networks []transport.Network
 	upstream []*sip.Response
 	// fail, if set, is what sending a request downstream returns.
 	fail error
@@ -99,7 +101,12 @@ func (n *fakeNet) SendRequest(req *sip.Request, dst transport.Destination, _ ...
 		return "", n.fail
 	}
 	n.requests = append(n.requests, req.Clone())
-	return transport.TCP, nil
+	network := dst.Network
+	if network == "" {
+		network = transport.TCP
+	}
+	n.networks = append(n.networks, network)
+	return network, nil
 }
 
 func (n *fakeNet) SendResponse(res *sip.Response, _ transport.Source, _ ...transport.SendOption) error {
@@ -160,11 +167,17 @@ type proxied struct {
 
 func newProxied(t *testing.T, mutate ...func(*Config)) *proxied {
 	t.Helper()
+	return newProxiedWith(t, resolver{}, mutate...)
+}
+
+// newProxiedWith is newProxied with the proxy's Resolver res.
+func newProxiedWith(t *testing.T, res proxy.Resolver, mutate ...func(*Config)) *proxied {
+	t.Helper()
 	g := &proxied{rig: newRig(t, mutate...), clock: &fakeClock{}, net: &fakeNet{}}
 	p, err := proxy.New(g.net, proxy.Config{
 		Self:        []sip.URI{mustURI("sip:icscf.rcs.local;lr")},
 		Router:      g.r,
-		Resolver:    resolver{},
+		Resolver:    res,
 		Transaction: transaction.Config{Clock: g.clock},
 		Rand:        &lockedReader{r: rand.NewChaCha8([32]byte{1})},
 	})
@@ -343,5 +356,24 @@ func TestTerminatingRequestToAnUnreachableSCSCFReachesTheCallerAs500WithRetryAft
 	}
 	if got := g.metrics.counts["icscf.scscf.unreachable"]; got != 1 {
 		t.Errorf("unreachable counted %d", got)
+	}
+}
+
+// Review of #274: the HSS names the S-CSCF as sip:scscf.<namespace>,
+// without the transport; the REGISTER still leaves over the configured
+// TCP, which the resolver reads from the configured URI. Routed as the HSS
+// wrote it, it would have left over UDP, which icscf has no listener for.
+func TestARegisterToTheProductionFormOfANameLeavesOverTCP(t *testing.T) {
+	g := newProxiedWith(t, proxy.NumericResolver{}, func(c *Config) {
+		c.SCSCFs = []SCSCF{{URI: mustURI("sip:192.0.2.30:5060;transport=tcp")}}
+	})
+	g.hss.uaa = uaa(experimental(cx.SubsequentRegistration), "sip:192.0.2.30", nil)
+	g.receive(register(t))
+	waitFor(t, "the REGISTER downstream", func() bool { return len(g.net.sent()) == 1 })
+	g.net.mu.Lock()
+	network := g.net.networks[0]
+	g.net.mu.Unlock()
+	if fwd := g.net.sent()[0]; network != transport.TCP || fwd.URI.String() != "sip:192.0.2.30:5060;transport=tcp" {
+		t.Errorf("the REGISTER left over %s to %s, want TCP to the configured URI", network, fwd.URI.String())
 	}
 }
