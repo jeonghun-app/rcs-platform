@@ -62,9 +62,13 @@ const (
 	DefaultMaxQueuedBytes = 256 << 20
 
 	// DefaultProxyHeaderTimeout bounds the PROXY header on a listener behind
-	// the NLB, which sends it as soon as it has connected (ADR 0003). A
-	// connection still without one after this is not the NLB's, and until the
-	// header arrives its slot cannot be charged to any client by Admit.
+	// the NLB. The NLB prepends the header to the client's data (AWS, Network
+	// Load Balancers, target group attributes: Proxy protocol), and a SIP or
+	// TLS client speaks first, so this bounds the time to the client's first
+	// bytes. 2 s lets a first segment lost on a mobile link be resent once
+	// after the initial 1 s retransmission timeout (RFC 6298 §2). Until the
+	// header arrives the connection's slot cannot be charged to any client by
+	// Admit.
 	DefaultProxyHeaderTimeout = 2 * time.Second
 )
 
@@ -639,7 +643,7 @@ type Stats struct {
 
 	// Counters since New.
 	Accepted           uint64 // TCP and TLS connections accepted
-	Rejected           uint64 // connections refused at MaxConnections
+	Rejected           uint64 // connections refused at Config.MaxConnections or after Close
 	Refused            uint64 // flows Config.Admit refused
 	Dialed             uint64 // outbound connections opened
 	DialErrors         uint64
@@ -667,6 +671,14 @@ type Stats struct {
 	// the class of the listener.
 	ClientListenerRejected uint64
 	CoreListenerRejected   uint64
+	// ListenerConnections is the gauge of the connections each stream
+	// listener holds against its ListenerConfig.MaxConnections, counted from
+	// accept to close, by listener name.
+	ListenerConnections map[string]int
+	// ProxyHeaderTimeouts counts connections closed because their PROXY
+	// header did not arrive within ListenerConfig.ProxyHeaderTimeout; a
+	// malformed header counts in ProxyHeaderErrors instead.
+	ProxyHeaderTimeouts uint64
 }
 
 type counters struct {
@@ -674,7 +686,7 @@ type counters struct {
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
 	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses,
-	clientListenerRejected, coreListenerRejected atomic.Uint64
+	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -683,6 +695,12 @@ func (t *Transport) Stats() Stats {
 	ts := t.flows.stats()
 	t.mu.Lock()
 	pending := len(t.pending)
+	perListener := make(map[string]int)
+	for _, l := range t.listeners {
+		if l.ln != nil {
+			perListener[l.name] = l.accepted
+		}
+	}
 	t.mu.Unlock()
 	return Stats{
 		OpenInbound:        ts.inbound,
@@ -717,6 +735,8 @@ func (t *Transport) Stats() Stats {
 
 		ClientListenerRejected: c.clientListenerRejected.Load(),
 		CoreListenerRejected:   c.coreListenerRejected.Load(),
+		ListenerConnections:    perListener,
+		ProxyHeaderTimeouts:    c.proxyHeaderTimeouts.Load(),
 	}
 }
 

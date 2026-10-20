@@ -74,8 +74,8 @@ func (t *Transport) Listen(cfg ListenerConfig) (netip.AddrPort, error) {
 	if cfg.AdvertisedPort < 0 || cfg.AdvertisedPort > 65535 {
 		return netip.AddrPort{}, errors.New("transport: advertised port out of range")
 	}
-	if cfg.MaxConnections < 0 {
-		return netip.AddrPort{}, errors.New("transport: negative listener MaxConnections")
+	if cfg.MaxConnections < 0 || cfg.MaxConnections > 0 && cfg.Network == UDP {
+		return netip.AddrPort{}, errors.New("transport: listener MaxConnections must be positive and is for TCP and TLS")
 	}
 	if cfg.ProxyHeaderTimeout < 0 || cfg.ProxyHeaderTimeout > 0 && !cfg.ProxyProtocol {
 		return netip.AddrPort{}, errors.New("transport: ProxyHeaderTimeout must be positive and needs ProxyProtocol")
@@ -325,7 +325,13 @@ func (l *listener) serveAccepted(raw net.Conn) {
 		raw.SetReadDeadline(time.Now().Add(l.proxyHeader))
 		h, err := ReadProxyHeader(raw)
 		if err != nil {
-			t.stats.proxyHeaderErrors.Add(1)
+			// A timeout is a slow or silent client; a malformed header, a
+			// peer that is not the NLB.
+			if ne := net.Error(nil); errors.As(err, &ne) && ne.Timeout() {
+				t.stats.proxyHeaderTimeouts.Add(1)
+			} else {
+				t.stats.proxyHeaderErrors.Add(1)
+			}
 			raw.Close()
 			return
 		}
