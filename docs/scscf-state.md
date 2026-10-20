@@ -24,8 +24,8 @@ additionally sealed (below).
 
 ## Rules for scscf
 
-- **A REGISTER during a deregistration.** When the last contact of an IMPU
-  expires, a sweep claims the registration for a lease (`Deregistering`, one
+- **A REGISTER during a deregistration.** When the last contact of a set
+  expires, a sweep claims the set's record for a lease (`Deregistering`, one
   minute) while it sends SAR TIMEOUT_DEREGISTRATION and the reg event NOTIFY,
   and deletes it afterwards. A REGISTER that finds a registration without
   contacts, leased or not, is handled as an initial registration: SAR
@@ -49,7 +49,15 @@ additionally sealed (below).
   names its set and the set's incarnation (`state.Identity`), written when
   the S-CSCF is assigned the set or the set changes, never by a
   re-registration. A terminating request reads the IMPU's item, the set and
-  the profile.
+  the profile. An IMPU names one set: a public identity shared by several
+  IMPIs (TS 23.228 §4.3.3.4) is out of scope, and the second IMPI to
+  register it takes the IMPU's item.
+- **Identities go before their set.** Every deregistration deletes the IMPU
+  items and the profile first and the set's record last, while the record
+  still holds the deregistration's lease: an instance that stops in between
+  leaves the record, and the next sweep does the rest. As a safety net for an
+  item no path reaches, each carries `KeepUntil` in `ttl`, kept like the
+  profile's (below), and is not found from then on.
 - **Profiles are ordered by arrival, per set.** `SaveProfile` takes the time
   the SAA or PPR arrived and keeps the later one, so an SAA answered slowly
   cannot undo the PPR that followed it; a refused save (`ErrConflict`) is not
@@ -58,17 +66,19 @@ additionally sealed (below).
 - **A profile outlives its set by a day at most.** Every deregistration path
   (user, sweep, RTR, administrative) deletes the profile; a user's own
   deregistration deletes only the one it read (`DeleteProfileIf`), so a
-  registration that another instance saved meanwhile keeps its profile. As a safety net for
-  one that fails to, a profile carries `KeepUntil`, stored as the TTL attribute
-  `ttl`: the last contact expiry of the set, or the end of an unregistered
-  user's state, plus one day (`state.ProfileGrace`). A registration extends it
-  only when the new expiry is 12 hours or more past what `KeepUntil` covers
-  (`KeepDue`, `KeepProfile`): about twice a day for hourly re-registrations,
-  and at every one for registrations longer than half a day, so the profile
-  never runs out while a binding lives. From `KeepUntil` on the profile is not
-  found, whether or not DynamoDB has removed it yet. Registrations have no `ttl`: only a sweep, which sends the SAR, may
-  remove one, so the infrastructure must enable TTL on `ttl`, never on
-  `expires`.
+  registration that another instance saved meanwhile keeps its profile. As a
+  safety net for one that fails to, a profile carries `KeepUntil`, stored as
+  the TTL attribute `ttl`: the last contact expiry of the set, or the end of an
+  unregistered user's state, plus one day (`state.ProfileGrace`). A save never
+  brings it closer, not even one refused because a later profile is stored.
+  A registration extends it only when the new expiry is 12 hours or more past
+  what `KeepUntil` covers (`KeepDue`, `KeepProfile`): about twice a day for
+  hourly re-registrations, and at every one for registrations longer than half
+  a day, so the profile never runs out while a binding lives. From
+  `KeepUntil` on the profile is not found, whether or not DynamoDB has removed
+  it yet. Set records have no
+  `ttl`: only a sweep, which sends the SAR, may remove one, so the
+  infrastructure must enable TTL on `ttl`, never on `expires`.
 - **A permanent SAR failure ends the deregistration.** The sweep's handler
   returns an error only for failures that may pass (the HSS unreachable, a
   busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
@@ -103,7 +113,8 @@ A re-registration is three strongly consistent reads, of the IMPU's item (under
 tells whether `KeepUntil` is due), and one put of the set's registration, plus
 two writes to `expiry-index`, whatever the size of the set; the profile is
 written only on SAR and PPR, plus about two updates of its `ttl` a day, and the
-IMPU items only when the S-CSCF is assigned the set. The reads are about 1 + 1
+IMPU items only when the S-CSCF is assigned the set, plus as many updates of
+their `ttl`. The reads are about 1 + 1
 + 2 RRU for a typical 5 KB IMSSubscription (1 + 1 + 32 for the 128 KiB
 maximum). Every terminating request reads the IMPU's item, the set's
 registration and its profile: about 4 RRU, $0.55 per million at the prices

@@ -24,6 +24,8 @@ type registrationDoc struct {
 	Contacts      []contactDoc  `json:"contacts,omitempty"`
 	Deregistering *time.Time    `json:"deregistering,omitempty"`
 	Unregistered  *time.Time    `json:"unregistered,omitempty"`
+	Reassert      *time.Time    `json:"reassert,omitempty"`
+	Attempts      int           `json:"reassert_attempts,omitempty"`
 }
 
 type identityRef struct {
@@ -43,12 +45,12 @@ func encodeIdentity(i *state.Identity) ([]byte, error) {
 	return json.Marshal(identityDoc{IMPI: i.Set.IMPI, DefaultIMPU: i.Set.IMPU, Incarnation: i.Incarnation, Barred: i.Barred})
 }
 
-func decodeIdentity(b []byte, impu string, version int64) (*state.Identity, error) {
+func decodeIdentity(b []byte, impu string, version int64, keepUntil time.Time) (*state.Identity, error) {
 	var doc identityDoc
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: identity document does not decode", state.ErrInvalid)
 	}
-	i := &state.Identity{IMPU: impu, Set: state.SetKey{IMPI: doc.IMPI, IMPU: doc.DefaultIMPU}, Incarnation: doc.Incarnation, Barred: doc.Barred, Version: version}
+	i := &state.Identity{IMPU: impu, Set: state.SetKey{IMPI: doc.IMPI, IMPU: doc.DefaultIMPU}, Incarnation: doc.Incarnation, Barred: doc.Barred, KeepUntil: keepUntil, Version: version}
 	if err := i.Validate(); err != nil {
 		return nil, err
 	}
@@ -82,6 +84,11 @@ func encodeRegistration(r *state.Registration) ([]byte, error) {
 		t := r.Unregistered.UTC()
 		doc.Unregistered = &t
 	}
+	if !r.Reassert.IsZero() {
+		t := r.Reassert.UTC()
+		doc.Reassert = &t
+	}
+	doc.Attempts = r.ReassertAttempts
 	for _, c := range r.Contacts {
 		doc.Contacts = append(doc.Contacts, contactDoc{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: c.Path, Expires: c.Expires.UTC(),
@@ -106,6 +113,10 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	if doc.Unregistered != nil {
 		r.Unregistered = *doc.Unregistered
 	}
+	if doc.Reassert != nil {
+		r.Reassert = *doc.Reassert
+	}
+	r.ReassertAttempts = doc.Attempts
 	for _, c := range doc.Contacts {
 		r.Contacts = append(r.Contacts, state.Contact{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: nilIfEmpty(c.Path), Expires: c.Expires,

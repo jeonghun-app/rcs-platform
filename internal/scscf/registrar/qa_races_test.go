@@ -38,9 +38,9 @@ func (s *stepStore) Registration(ctx context.Context, k state.SetKey) (*state.Re
 	s.before("Registration")
 	return s.Store.Registration(ctx, k)
 }
-func (s *stepStore) Identity(ctx context.Context, impu string) (*state.Identity, error) {
+func (s *stepStore) Identity(ctx context.Context, impu string, now time.Time) (*state.Identity, error) {
 	s.before("Identity")
-	return s.Store.Identity(ctx, impu)
+	return s.Store.Identity(ctx, impu, now)
 }
 func (s *stepStore) SaveRegistration(ctx context.Context, r *state.Registration) (*state.Registration, error) {
 	s.before("SaveRegistration")

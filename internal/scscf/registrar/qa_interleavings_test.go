@@ -41,9 +41,9 @@ func (s *sweepStore) Registration(ctx context.Context, k state.SetKey) (*state.R
 	s.step("Registration")
 	return s.Store.Registration(ctx, k)
 }
-func (s *sweepStore) Identity(ctx context.Context, impu string) (*state.Identity, error) {
+func (s *sweepStore) Identity(ctx context.Context, impu string, now time.Time) (*state.Identity, error) {
 	s.step("Identity")
-	return s.Store.Identity(ctx, impu)
+	return s.Store.Identity(ctx, impu, now)
 }
 func (s *sweepStore) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
 	s.step("SaveIdentity")

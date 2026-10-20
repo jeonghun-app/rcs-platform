@@ -38,6 +38,16 @@ const TerminatedGrace = time.Minute
 // DIAMETER_ERROR_USER_UNKNOWN (5001, TS 29.229 §6.2.2): the HSS will not
 // answer differently, and an error would retry the SAR every lease. The
 // errors of handle are returned together with the number handled.
+//
+// The order is what makes that retry complete: handle deletes the set's
+// identities (DeleteIdentity) and its profile, and only then is the record
+// deleted. Cut short between the two, the record still holds its lease, so
+// the next sweep after it calls handle again, which finds what is left; an
+// identity it never reaches still goes at its KeepUntil.
+//
+// A live registration whose Reassert is due is claimed the same way, Reassert
+// moved one lease ahead, and handed to handle, whose before.ReassertDue tells
+// it to tell the HSS again.
 func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, limit int, handle func(before, after *Registration) error) (int, error) {
 	// A listing error that comes with registrations (an item that does not
 	// decode) does not stop the others from being swept.
@@ -49,11 +59,16 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 			continue
 		}
 		next := before.Clone()
-		if len(next.Prune(now)) == 0 && len(next.Contacts) > 0 {
+		reassert := before.ReassertDue(now)
+		if len(next.Prune(now)) == 0 && len(next.Contacts) > 0 && !reassert {
 			continue
 		}
 		if len(next.Contacts) == 0 {
 			next.Deregistering = now.Add(SweepLease)
+		} else if reassert {
+			// Claimed as a deregistration is: another sweep tries after the
+			// lease if this one's handle does not move it.
+			next.Reassert = now.Add(SweepLease)
 		}
 		after, err := s.SaveRegistration(ctx, next)
 		if lost(err) {

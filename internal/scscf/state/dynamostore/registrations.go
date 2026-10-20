@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
@@ -131,9 +132,17 @@ func (d *Dynamo) DeleteRegistration(ctx context.Context, r *state.Registration) 
 	return d.deleteVersioned(ctx, d.registrations, setPK(r.Key), r.Version, "delete registration")
 }
 
-// Identity implements state.Registrations.
-func (d *Dynamo) Identity(ctx context.Context, impu string) (*state.Identity, error) {
-	if !state.KeyOK(impu, state.MaxKey) {
+// possibleIdentity reports whether impu could name an identity item: a
+// canonical IMPU, never another kind of item's key.
+func possibleIdentity(impu string) bool {
+	canon, ok := identity.CanonicalIMPU(impu)
+	return ok && canon == impu && state.KeyOK(impu, state.MaxKey)
+}
+
+// Identity implements state.Registrations. It checks KeepUntil itself, as
+// Profile does.
+func (d *Dynamo) Identity(ctx context.Context, impu string, now time.Time) (*state.Identity, error) {
+	if !possibleIdentity(impu) {
 		return nil, fmt.Errorf("dynamostore: get identity: %w", state.ErrNotFound)
 	}
 	item, err := d.get(ctx, d.registrations, key(impu), "get identity")
@@ -148,11 +157,23 @@ func (d *Dynamo) Identity(ctx context.Context, impu string) (*state.Identity, er
 	if err != nil {
 		return nil, err
 	}
-	return decodeIdentity(doc, impu, version)
+	ttl, err := nv(item, attrTTL)
+	if err != nil {
+		return nil, err
+	}
+	i, err := decodeIdentity(doc, impu, version, time.Unix(ttl, 0).UTC())
+	if err != nil {
+		return nil, err
+	}
+	if !i.KeepUntil.After(now) {
+		return nil, fmt.Errorf("dynamostore: get identity: %w", state.ErrNotFound)
+	}
+	return i, nil
 }
 
 // SaveIdentity implements state.Registrations. An identity item has no index
-// attribute: no listing or sweep sees it.
+// attribute, so no listing or sweep sees it, and its ttl is the table's TTL
+// attribute, as a profile's is.
 func (d *Dynamo) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Identity, error) {
 	if err := i.Validate(); err != nil {
 		return nil, err
@@ -167,18 +188,34 @@ func (d *Dynamo) SaveIdentity(ctx context.Context, i *state.Identity) (*state.Id
 	}
 	item := map[string]types.AttributeValue{
 		attrPK: str(i.IMPU), attrVersion: num(version), attrDoc: bin(doc), attrWriter: str(d.token()),
+		attrTTL: num(i.KeepUntil.Unix()),
 	}
 	if err := d.putVersioned(ctx, d.registrations, i.IMPU, i.Version, item, "save identity"); err != nil {
 		return nil, err
 	}
 	saved := *i
 	saved.Version = version
+	saved.KeepUntil = time.Unix(i.KeepUntil.Unix(), 0).UTC()
 	return &saved, nil
+}
+
+// KeepIdentity implements state.Registrations, as KeepProfile.
+func (d *Dynamo) KeepIdentity(ctx context.Context, impu string, until, now time.Time) error {
+	if !possibleIdentity(impu) {
+		return fmt.Errorf("dynamostore: keep identity: %w", state.ErrNotFound)
+	}
+	return d.keep(ctx, key(impu), until, now, "keep identity", func() (time.Time, error) {
+		i, err := d.Identity(ctx, impu, now)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return i.KeepUntil, nil
+	})
 }
 
 // DeleteIdentity implements state.Registrations.
 func (d *Dynamo) DeleteIdentity(ctx context.Context, i *state.Identity) error {
-	if !state.KeyOK(i.IMPU, state.MaxKey) {
+	if !possibleIdentity(i.IMPU) {
 		return fmt.Errorf("dynamostore: delete identity: %w", state.ErrNotFound)
 	}
 	return d.deleteVersioned(ctx, d.registrations, i.IMPU, i.Version, "delete identity")
@@ -267,6 +304,10 @@ func (d *Dynamo) SaveProfile(ctx context.Context, p *state.Profile) error {
 				return err
 			}
 			if stored.Received.After(p.Received) {
+				// The newer profile stays, kept as long as either needs.
+				if err := d.KeepProfile(ctx, p.Key, p.KeepUntil, p.Received); err != nil && !errors.Is(err, state.ErrNotFound) {
+					return err
+				}
 				return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
 			}
 			ttl = max(ttl, stored.KeepUntil.Unix())
@@ -291,25 +332,37 @@ func (d *Dynamo) SaveProfile(ctx context.Context, p *state.Profile) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("dynamostore: save profile: %w", state.ErrConflict)
+	return fmt.Errorf("dynamostore: save profile: %w", state.ErrContended)
 }
 
 // saveProfileAttempts bounds how often SaveProfile reads again a profile that
 // changed under it.
 const saveProfileAttempts = 3
 
-// KeepProfile implements state.Profiles with an UpdateItem of ttl alone,
-// conditional on the profile being there and ttl moving later. A resend, or a
-// profile already kept as long, fails the condition and is read back; one
-// that a save replaced with an earlier ttl meanwhile gets a second attempt.
+// KeepProfile implements state.Profiles with keep.
 func (d *Dynamo) KeepProfile(ctx context.Context, k state.SetKey, until, now time.Time) error {
 	if !possibleSet(k) {
 		return fmt.Errorf("dynamostore: keep profile: %w", state.ErrNotFound)
 	}
+	return d.keep(ctx, profileKey(k), until, now, "keep profile", func() (time.Time, error) {
+		p, err := d.Profile(ctx, k, now)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return p.KeepUntil, nil
+	})
+}
+
+// keep moves an item's ttl to until with an UpdateItem of ttl alone,
+// conditional on the item being there, alive at now, and ttl moving later. A
+// resend, or an item already kept as long, fails the condition and is read
+// back (current); one that a save replaced with an earlier ttl meanwhile gets
+// a second attempt, and if that is overtaken too, the save stands.
+func (d *Dynamo) keep(ctx context.Context, k map[string]types.AttributeValue, until, now time.Time, op string, current func() (time.Time, error)) error {
 	for range 2 {
 		_, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(d.registrations),
-			Key:                       profileKey(k),
+			Key:                       k,
 			UpdateExpression:          aws.String("SET #ttl = :until"),
 			ConditionExpression:       aws.String("attribute_exists(#pk) AND #ttl > :now AND #ttl < :until"),
 			ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrTTL},
@@ -319,20 +372,16 @@ func (d *Dynamo) KeepProfile(ctx context.Context, k state.SetKey, until, now tim
 		case err == nil:
 			return nil
 		case !ccf(err):
-			return sanitize("keep profile", err)
+			return sanitize(op, err)
 		}
-		p, err := d.Profile(ctx, k, now)
+		kept, err := current()
 		if err != nil {
 			return err
 		}
-		if p.KeepUntil.Unix() >= until.Unix() {
+		if kept.Unix() >= until.Unix() {
 			return nil
 		}
-		// Saved again between the update and the read, with an earlier
-		// KeepUntil: try once more.
 	}
-	// Saved again during the second attempt too: that profile was just
-	// written, and the next registration extends it (state.Profiles).
 	return nil
 }
 

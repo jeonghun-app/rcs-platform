@@ -93,15 +93,29 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 }
 
 // Identity implements Registrations.
-func (m *Memory) Identity(_ context.Context, impu string) (*Identity, error) {
+func (m *Memory) Identity(_ context.Context, impu string, now time.Time) (*Identity, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	i, ok := m.identities[impu]
-	if !ok {
+	if !ok || !i.KeepUntil.After(now) {
 		return nil, fmt.Errorf("state: identity: %w", ErrNotFound)
 	}
 	c := *i
 	return &c, nil
+}
+
+// KeepIdentity implements Registrations.
+func (m *Memory) KeepIdentity(_ context.Context, impu string, until, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.identities[impu]
+	if !ok || !i.KeepUntil.After(now) {
+		return fmt.Errorf("state: keep identity: %w", ErrNotFound)
+	}
+	if until = until.Truncate(time.Second); until.After(i.KeepUntil) {
+		i.KeepUntil = until
+	}
+	return nil
 }
 
 // SaveIdentity implements Registrations.
@@ -122,6 +136,7 @@ func (m *Memory) SaveIdentity(_ context.Context, i *Identity) (*Identity, error)
 	}
 	saved := *i
 	saved.Version = version
+	saved.KeepUntil = saved.KeepUntil.Truncate(time.Second)
 	m.identities[i.IMPU] = &saved
 	out := saved
 	return &out, nil
@@ -219,6 +234,11 @@ func (m *Memory) SaveProfile(_ context.Context, p *Profile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if cur, ok := m.profiles[p.Key]; ok && cur.Received.After(p.Received) {
+		// The newer profile stays, kept as long as either needs, as
+		// KeepProfile would at p.Received.
+		if keep := p.KeepUntil.Truncate(time.Second); keep.After(cur.KeepUntil) && cur.KeepUntil.After(p.Received) {
+			cur.KeepUntil = keep
+		}
 		return fmt.Errorf("state: save profile: %w", ErrConflict)
 	}
 	c := p.Clone()
