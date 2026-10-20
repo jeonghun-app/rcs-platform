@@ -240,6 +240,45 @@ func TestRelayKeepsAnInterruptedChunkInterrupted(t *testing.T) {
 	}
 }
 
+// Code review on #243: a client that stops inside a body, closing its
+// connection after 3000 of 5000 octets, does not have the cut part
+// forwarded as a finished message. rcs-as gets the first 2048 octets, as
+// they arrived, and never an end ('$').
+func TestRelayDoesNotFinishAMessageTheClientCutOff(t *testing.T) {
+	for name, total := range map[string]string{"size unknown": "*", "size given": "5000"} {
+		t.Run(name, func(t *testing.T) {
+			r := newRelayRig(t, Config{})
+			head := wire(clientSend("cutoff1", "Message-ID: cut1", "Byte-Range: 1-*/"+total, "Content-Type: text/plain", "")...)
+			if _, err := r.client.nc.Write([]byte(head + strings.Repeat("x", 3000))); err != nil {
+				t.Fatal(err)
+			}
+			_ = r.client.nc.Close()
+			// The client's side ends on the cut; whatever the relay made of
+			// the body has been handed on by then.
+			select {
+			case <-r.a.Done():
+			case <-time.After(hangGuard):
+				t.Fatal("the client's session outlived its connection")
+			}
+			for {
+				select {
+				case m, ok := <-r.as.msgs:
+					if !ok {
+						return
+					}
+					if m.IsRequest() && m.Continuation == FlagEnd {
+						t.Fatalf("rcs-as got %v ending the message the client cut off", m.ByteRange)
+					}
+				case <-time.After(time.Second):
+					// Nothing more on its way: what came was only the
+					// first piece, not an end.
+					return
+				}
+			}
+		})
+	}
+}
+
 func TestRelayAnswersBodilessSendsItself(t *testing.T) {
 	r := newRelayRig(t, Config{})
 	r.client.send(t, clientSend("k33p", "Message-ID: k33p", "Byte-Range: 1-0/0", "-------k33p$")...)

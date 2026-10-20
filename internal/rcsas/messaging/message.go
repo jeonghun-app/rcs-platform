@@ -86,22 +86,29 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 
 // namesSender reports whether uri, written by a client to name itself (a
 // CPIM From, an IMDN recipient-uri), is the anonymous URI or one of the
-// sender's identities: equal, or equal in canonical form
-// (identity.CanonicalIMPU) where both have one. A client writes its
-// provisioned public URI as it was given, ;user=phone and a host's case
-// included, and the group path names senders in canonical form; neither
-// is a reason to refuse its own address.
-func namesSender(uri, sender string, identities []string) bool {
+// sender's identities: equal, or the same user (UserOf at homeDomain), or
+// equal in canonical form (identity.CanonicalIMPU) where both have one. A
+// client writes its provisioned public URI as it was given, a number as a
+// tel URI or a SIP one, ;user=phone and a host's case included, and the
+// group path names senders in canonical form; none of these is a reason to
+// refuse its own address.
+func namesSender(uri, sender string, identities []string, homeDomain string) bool {
 	if uri == AnonymousURI {
 		return true
 	}
 	c, canon := identity.CanonicalIMPU(uri)
+	u, user := UserOf(uri, homeDomain)
 	for _, id := range append([]string{sender}, identities...) {
 		if id == uri {
 			return true
 		}
 		if canon {
 			if cid, ok := identity.CanonicalIMPU(id); ok && cid == c {
+				return true
+			}
+		}
+		if user {
+			if uid, ok := UserOf(id, homeDomain); ok && uid == u {
 				return true
 			}
 		}
@@ -160,9 +167,11 @@ func singleAddresses(c *cpim.Message) bool {
 // characters that would end or corrupt a header line; each becomes a \uXXXX
 // escape, as do quote, backslash and the Unicode line and paragraph
 // separators, so the result can sit inside a quoted string (RFC 3261 §25.1)
-// as it is. So do the bidirectional controls and zero-width characters
-// (U+061C, U+200B-U+200F, U+202A-U+202E, U+2066-U+2069), with which a name
-// can be made to display as another. Invalid UTF-8 becomes U+FFFD.
+// without ending it. So do the bidirectional controls and zero-width
+// characters (U+061C, U+200B-U+200F, U+202A-U+202E, U+2066-U+2069), with
+// which a name can be made to display as another. Invalid UTF-8 becomes
+// U+FFFD. Whoever writes the quoted string still escapes the result's
+// backslashes as quoted pairs, so that its \uXXXX escapes stand as text.
 func EscapeDisplayName(name string) string {
 	var b strings.Builder
 	for _, r := range name {

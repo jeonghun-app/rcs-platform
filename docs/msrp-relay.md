@@ -281,7 +281,7 @@ What a client can make one task hold, and what happens at each bound:
 | PROXY header within 5 s, at most 1 KiB of address and TLVs | the connection is closed |
 | session id not in the issued form (32 lower-case base32 characters) | 481, no store call |
 | `RELAY_FAILED_LOOKUPS_PER_SOURCE` per source per minute, across connections | the connection is closed without a store call* |
-| `RELAY_MAX_UNKNOWN_SESSIONS` per connection per minute | `internal/msrp` closes the connection |
+| `RELAY_MAX_UNKNOWN_SESSIONS` per connection per minute | `internal/msrp` closes the connection, after the 481s already owed: it writes them, half-closes, and waits up to 2 s for the client to close its side, so that they are not lost to a reset |
 | `RELAY_MAX_CONCURRENT_BINDS` binds in their store calls, after a 250 ms wait | the connection is closed* |
 | `RELAY_STORE_TIMEOUT` per store call | the connection is closed*, `StoreErrors` |
 | `RELAY_CORE_CONNECT_TIMEOUT` | 481 |
@@ -289,6 +289,18 @@ What a client can make one task hold, and what happens at each bound:
 
 \* On a connection that already carries a bridge, only the new session is
 refused, with 481, and the connection stays (see below).
+
+A client that half-closes its side still reads: what is already queued for
+it, the answers to the requests it completed included, is written first,
+for up to the same 2 s, and only then is the connection closed (#240). That
+holds when it stops inside a request too, which ends as a framing error.
+Once the relay has read the end of the client's stream, the end is the
+client's whatever fails meanwhile (`EOF`, or the framing error), even if the
+writes then meet a reset because the client closed altogether. If the reset
+comes before the end of the stream is read, the connection ends with the
+reset instead. Either way the event, and so the `Closed` metric, is
+`PeerGone`. Only client connections wait; the relay's connections toward
+rcs-as, which carry new sessions, close at once.
 
 Choices worth knowing:
 

@@ -97,6 +97,10 @@ type Config struct {
 	// (ADR 0005), the authority of every local MSRP URI.
 	MSRPHost string
 	MSRPPort int
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
+	// a SIP URI whose user part is a global number names that number
+	// (UserOf), in the addresses a client writes for itself.
+	HomeDomain string
 	// Self are the URIs by which notifications are routed through rcs-as
 	// (IMDN-Route, RFC 5438 §8).
 	Self []string
@@ -436,7 +440,7 @@ func (e *Engine) submit(ctx context.Context, o Origin) error {
 	if !limit.allow(o.Sender, now) {
 		return reject(ReasonRateLimited, nil)
 	}
-	if !namesSender(m.From.URI, o.Sender, o.Identities) {
+	if !namesSender(m.From.URI, o.Sender, o.Identities, e.cfg.HomeDomain) {
 		return reject(ReasonFromMismatch, nil)
 	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)

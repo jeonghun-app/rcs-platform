@@ -11,7 +11,7 @@ them.
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
 | `registrations` | `pk` (S): `set#<IMPI>#<default IMPU>`, a canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only, of sets only; TTL on `ttl` | per implicit registration set its bindings (or an unregistered user's record) and its User-Data, and per IMPU the set it belongs to |
-| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed |
+| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions and their NOTIFY counters |
 
 Data at rest: registration items hold Contact URIs (device addresses),
@@ -84,10 +84,44 @@ additionally sealed (below).
   it yet. Set records have no
   `ttl`: only a sweep, which sends the SAR, may remove one, so the
   infrastructure must enable TTL on `ttl`, never on `expires`.
+- **Challenges are limited per IMPI and P-CSCF flow.** Before each challenge
+  the registrar counts it for the flow in the REGISTER's Path and the
+  current window, and over a limit answers 500 with Retry-After without
+  asking the HSS. A flow a live binding of the user came over is the
+  registered UE's while it stays on it: it has a budget of its own (default
+  6 a minute, `RegisteredFlowChallengeLimit`) and nothing else; a UE that
+  reconnects comes over a new flow. Any other flow has a
+  small one (3, `FlowChallengeLimit`) and shares the IMPI's (10,
+  `ChallengeLimit`, per `ChallengeWindow`). The limits count challenges, not
+  MARs: a Digest subscriber's costs two MARs when the AKA one gets 5006. A
+  challenge allows one resynchronisation (#196), and an IMPI three per
+  challenge lifetime (`ResyncLimit`), the registered UE's flow apart; one the
+  MAR never reaches the HSS gives its slot back, and its challenge counts
+  as such a challenge does; a busy answer or a timeout keeps them. An AUTS
+  over the flow its challenge was issued to counts in the shared budget
+  only. Windows are fixed, so up to twice
+  a budget passes across an edge, and an instance whose clock is off counts
+  into its own idea of the window. Every instance counts into the same items,
+  beside the IMPI's challenges, which the table's TTL removes; an instance
+  that has seen a count over its limit refuses the rest of that window
+  without writing. No nonce starts with `#`, so no client can take a count as
+  a challenge (#201).
 - **A permanent SAR failure ends the deregistration.** The sweep's handler
   returns an error only for failures that may pass (the HSS unreachable, a
   busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
   (5001) it returns nil, or the SAR would be retried every minute.
+
+## Metrics and alarms
+
+`registrar.challenge_limited` and `registrar.resync_limited` count the
+REGISTERs refused over a budget; neither carries an identifier. Alarm on
+`registrar.challenge_limited` (Sum over 5 minutes above a few dozen, or any
+sustained rate): it is how a flood against one subscriber shows, and a
+first registration of that subscriber, or a registration over a new
+connection, is held back while it lasts (T12). While it is raised, postpone
+P-CSCF deploys and drains: each moves its clients to new connections.
+`registrar.internal_errors` with a store that cannot count says the counts
+are failing closed: every REGISTER that needs a challenge gets 500.
 
 ## HSS discovery
 
@@ -127,8 +161,8 @@ below. With 1 M users of two IMPUs re-registering every 600 s that is about 4.3
 G saves a month, some 15 G write request units and $10k at ap-northeast-2
 on-demand prices (October 2026), half what one item per IMPU cost, plus some 17
 G RRU and $2.2k for the reads; 3600 s registrations cost a sixth of that.
-Authentication adds a put and a conditional delete per challenge. Sweeps read
-each expiring set once.
+Authentication adds a put and a conditional delete per challenge, and one
+update of the IMPI's count before each MAR. Sweeps read each expiring set once.
 
 `expiry-index` is spread over 16 shards, which carry about 8000 saves per
 second, some 4.8 M IMPUs at 600 s re-registrations. The shard of an item is
