@@ -22,6 +22,15 @@ import (
 // logged.
 type FlowID string
 
+// WellFormed reports whether id has the form every FlowID has, URL-safe
+// base64 of flowTokenBytes: what a service that did not make it, such as
+// scscf checking the next hop of a request, can tell of a flow token. It
+// says nothing of whether the flow is live.
+func (id FlowID) WellFormed() bool {
+	b, err := base64.RawURLEncoding.Strict().DecodeString(string(id))
+	return err == nil && len(b) == flowTokenBytes
+}
+
 // flowTokenBytes is how much of the HMAC-SHA256 output a FlowID keeps. 128 bits
 // is the truncation RFC 2104 §5 allows for SHA-256 and leaves no chance of
 // guessing a live flow.
