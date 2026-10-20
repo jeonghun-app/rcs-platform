@@ -89,7 +89,7 @@ scripts/                    fuzz, privacy and docs-link checks, compose-env.sh
 tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
 tools/stack-init/           creates the local stack's tables and seeds its test subscriber
 docs/                       this file, ADRs, threat model, service docs
-                            (ft-server.md, msrp-relay.md), api/ (OpenAPI)
+                            (ft-server.md, msrp-relay.md, pcscf.md), api/ (OpenAPI)
 ```
 
 Planned, not on `main` yet:
