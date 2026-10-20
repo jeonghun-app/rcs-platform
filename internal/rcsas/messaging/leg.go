@@ -326,9 +326,11 @@ func (l *Leg) activate() {
 		// find no key and ask for a second session for it (#264); marked
 		// afresh, in case the mark from the invite has run out meanwhile.
 		// Once the attempt is over the message is gone or back in the
-		// queue, and its next invitation may go at once.
+		// queue, and its next invitation may go at once, unless a newer
+		// one was asked for meanwhile (after a registration on a new flow
+		// cleared the marks): that one keeps its mark.
 		key := inviteKey{l.p.User, l.p.Peer, store.Standalone, l.p.QueueID}
-		e.invites[key] = e.clock.Now().Add(e.cfg.InviteTimeout)
+		e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout), by: l}
 		e.wg.Add(1)
 		e.mu.Unlock()
 		go func() {
@@ -336,7 +338,9 @@ func (l *Leg) activate() {
 			defer l.done()
 			e.deliverLarge(l)
 			e.mu.Lock()
-			delete(e.invites, key)
+			if e.invites[key].by == l {
+				delete(e.invites, key)
+			}
 			e.mu.Unlock()
 		}()
 	}

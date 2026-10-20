@@ -571,6 +571,15 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 	return stop
 }
 
+// inviteMark is an invitation asked for, waited for until until. by is
+// the terminating large-mode leg that marked it while it makes its attempt
+// (activate), so that it deletes its own mark and never a newer one;
+// nil for the invitations invite asks for.
+type inviteMark struct {
+	until time.Time
+	by    *Leg
+}
+
 // invitation is the session m waits for, and its key in e.invites.
 func invitation(m store.Message) (Invitation, inviteKey) {
 	inv := Invitation{
@@ -589,8 +598,8 @@ func (e *Engine) inviteDue(m store.Message) bool {
 	_, key := invitation(m)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	until, ok := e.invites[key]
-	return !ok || !e.clock.Now().Before(until)
+	mark, ok := e.invites[key]
+	return !ok || !e.clock.Now().Before(mark.until)
 }
 
 // invite asks for a session to deliver m on, unless one was asked for
@@ -600,7 +609,7 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 	inv, key := invitation(m)
 	now := e.clock.Now()
 	e.mu.Lock()
-	if until, ok := e.invites[key]; ok && now.Before(until) {
+	if mark, ok := e.invites[key]; ok && now.Before(mark.until) {
 		e.mu.Unlock()
 		return
 	}
@@ -615,8 +624,8 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 		return
 	}
 	if len(e.invites) >= e.cfg.MaxTracked {
-		for k, until := range e.invites {
-			if !now.Before(until) {
+		for k, mark := range e.invites {
+			if !now.Before(mark.until) {
 				delete(e.invites, k)
 			}
 		}
@@ -626,7 +635,7 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 		e.metrics.Count("invite.untracked", 1)
 		return
 	}
-	e.invites[key] = now.Add(e.cfg.InviteTimeout)
+	e.invites[key] = inviteMark{until: now.Add(e.cfg.InviteTimeout)}
 	e.mu.Unlock()
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	err := e.deliverer.Invite(ctx, inv)

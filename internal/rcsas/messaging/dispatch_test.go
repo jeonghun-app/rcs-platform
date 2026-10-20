@@ -414,6 +414,46 @@ func TestNoSecondLargeModeSessionIsAskedForWhileOneDelivers(t *testing.T) {
 	}
 }
 
+// Code review on #284: the leg deletes the mark it wrote, not a newer one.
+// A registration on a new flow clears the invitations while the leg makes
+// its attempt, and the message is asked for again; the attempt's end must
+// leave that newer invitation's mark, or yet another session is asked for.
+func TestALargeModeLegsEndLeavesANewerInvitationsMark(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600, RetryInterval: time.Hour})
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("Pending = %+v, %v", ms, err)
+	}
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() }) // before the engine closes, which waits for the attempt
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	r.e.UserRegistered(bob, true)
+	r.e.invite(t.Context(), ms[0])
+	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+		t.Fatalf("invitation %+v", got)
+	}
+	waitFor(t, "idle", r.idle)
+	_ = leg.Close()
+	waitDone(t, leg.Finished())
+	r.e.invite(t.Context(), ms[0])
+	select {
+	case again := <-r.d.invites:
+		t.Fatalf("the newer invitation's mark went with the leg: %+v", again)
+	default:
+	}
+}
+
 // An open chat leg with the sender is no session for a large-mode
 // message, which still gets one of its own: invite looks for an open leg
 // only for the modes that go on one (#260).
