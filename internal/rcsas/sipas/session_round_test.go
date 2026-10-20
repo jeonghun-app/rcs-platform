@@ -355,7 +355,8 @@ func TestAChunkRefusalDuringASendDoesNotStallTheLeg(t *testing.T) {
 	br := bufio.NewReader(nc)
 	me, them := toBob.String(), toLeg.String()
 	fmt.Fprintf(nc, "MSRP open1 SEND\r\nTo-Path: %s\r\nFrom-Path: %s\r\nMessage-ID: open\r\nByte-Range: 1-0/0\r\n-------open1$\r\n", them, me)
-	readRawFrame(t, br) // its 200
+	// Its 200 and the leg's first chunk may come in either order: the loop
+	// below skips everything but SENDs (QA on #252, #260).
 	refused := false
 	for {
 		f := readRawFrame(t, br)
