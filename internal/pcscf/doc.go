@@ -17,7 +17,10 @@
 // one client and in all, routes REGISTER to icscf with a Path naming the
 // flow and keeps the 200 in instance memory (§5.2.2.1), and drains client
 // flows gradually on shutdown while the core listener stays open.
-// Originating and terminating routing follow in later changes (#16); until
-// then any other request from a client is refused with 403 and one from the
-// core with 430.
+//
+// A client's other requests go to the core along its Service-Route, or
+// inside a dialog along the route pcscf recorded, to scscf alone
+// (originate.go); a request from the core goes to the client flow its
+// Route names and nowhere else (terminate.go). The reg event follows in a
+// later change (#16).
 package pcscf

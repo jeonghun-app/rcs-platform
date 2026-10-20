@@ -123,7 +123,8 @@ func newTestPcscf(clock *testClock) (*pcscf, idleSet) {
 		icscfFirst:   icscfFirstTimeout, icscfTotal: icscfTotalTimeout,
 		resolve: coreResolver{dns: &proxy.DNSResolver{Namespace: cfg.Namespace, Allow: allowCore(cfg), Lookup: scscfAt("10.0.4.4")}},
 		icscfs:  icscfAt{"10.0.3.7:5060", "10.0.3.8:5060", "10.0.3.9:5060", "10.0.3.10:5060"}, rand: seededRand(),
-		flows: idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dialogKey: []byte("test dialog key"),
+		flows:     idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, idle
 }
 

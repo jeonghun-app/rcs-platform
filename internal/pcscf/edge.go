@@ -178,6 +178,8 @@ type pcscf struct {
 	icscfs allResolver
 	// rand draws charging identifiers.
 	rand io.Reader
+	// dialogKey is the key of dialogMAC, drawn at every start.
+	dialogKey []byte
 	// flows sets a flow's idle timeout; nil in tests that need none.
 	flows flowSetter
 	ids   sip.IDGenerator
@@ -188,27 +190,63 @@ type pcscf struct {
 	// icscfFirst and icscfTotal bound a REGISTER's first attempt at icscf
 	// and all of them.
 	icscfFirst, icscfTotal time.Duration
+	// clientFlow reports whether a flow token names a live client flow of
+	// this task.
+	clientFlow func(transport.FlowID) bool
 	// metrics counts what is worth an alarm; nil in tests that need none.
 	metrics *runtime.Metrics
 }
 
 // Route implements proxy.Router. A client's REGISTER goes to icscf, its
 // other requests outside a dialog along its Service-Route, and those inside
-// one along their Route if pcscf is on it. Until terminating routing lands
-// (#16), a request from the core is refused with 430, since no flow it
-// could name is served yet (RFC 5626 §5.3).
+// one along their Route if pcscf is on it; a request from the core goes to
+// the client flow its Route names.
 func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !fromClient(r.Source) {
-		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
+		return p.terminate(ctx, r)
 	}
+	var d proxy.Decision
 	switch {
 	case r.Message.Method == "REGISTER":
-		return p.register(ctx, r)
+		d = p.register(ctx, r)
 	case r.Initial():
-		return p.originate(ctx, r)
+		d = p.originate(ctx, r)
 	default:
-		return p.inDialog(ctx, r)
+		d = p.inDialog(ctx, r)
 	}
+	return toClient(d)
+}
+
+// chargingHeaders are the charging data of the network, which never goes to
+// a client (TS 24.229 §5.2.1): requests to it lose them in
+// terminate, responses to it in toClient.
+var chargingHeaders = []string{"P-Charging-Vector", "P-Charging-Function-Addresses"}
+
+func stripCharging(h *sip.Header) {
+	for _, name := range chargingHeaders {
+		h.Del(name)
+	}
+}
+
+// toClient makes every response d forwards to the client lose the
+// network's charging data and any P-Preferred-Identity, and its
+// P-Asserted-Identity when it asks for privacy of the identity (RFC 3325
+// §9.3), after d's own OnResponse.
+func toClient(d proxy.Decision) proxy.Decision {
+	next := d.OnResponse
+	d.OnResponse = func(ctx context.Context, res *sip.Response) {
+		if next != nil {
+			next(ctx, res)
+		}
+		stripCharging(&res.Header)
+		// A preference is the client's to state in its own requests (RFC
+		// 3325 §9.2), never the network's to a client.
+		res.Header.Del("P-Preferred-Identity")
+		if privacyID(&res.Header) {
+			res.Header.Del("P-Asserted-Identity")
+		}
+	}
+	return d
 }
 
 // statusFlowFailed is 430 Flow Failed (RFC 5626 §11.5).

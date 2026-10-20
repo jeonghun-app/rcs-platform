@@ -1,6 +1,7 @@
 package pcscf
 
 import (
+	"net/netip"
 	"regexp"
 	"strings"
 	"testing"
@@ -68,6 +69,53 @@ func FuzzStripNetworkHeaders(f *testing.F) {
 		}
 		if strings.Join(left, "\x00") != strings.Join(want, "\x00") {
 			t.Fatalf("P-Access-Network-Info %q, want %q", left, want)
+		}
+	})
+}
+
+// FuzzRouteICID checks the icid a core-facing Record-Route value carries,
+// which a client's copy of the route brings back and so is the client's to
+// write (review of #221): recordRoute writes an icid only if routeICID reads
+// it back unchanged, and whatever value the client puts in its place,
+// routeICID returns only an icid recordRoute would write, or none.
+func FuzzRouteICID(f *testing.F) {
+	for _, seed := range []struct{ icid, raw string }{
+		{"fedcba9876543210fedcba9876543210", "fedcba9876543210fedcba9876543210"},
+		{`a b;c=d\"e`, "a%20b%3Bc"},
+		{"%41é", "%2541%C3%A9"},
+		{"", "%"},
+		{strings.Repeat("x", maxICID+1), "%01"},
+		{"\x7f", "%ZZ"},
+		{"\xff", "%FF"},
+	} {
+		f.Add(seed.icid, seed.raw)
+	}
+	p := &pcscf{cfg: Config{CoreHost: netip.MustParseAddr("10.0.2.9"), PublicHost: "pcscf.rcs.example.net"}, corePort: 5070, dialogKey: []byte("fuzz key")}
+	f.Fuzz(func(t *testing.T, icid, raw string) {
+		written := p.recordRoute("FLOW-A", false, icid, "call-1")[0]
+		back, err := sip.ParseAddress(written.String())
+		if err != nil {
+			t.Fatalf("the Record-Route %s does not parse: %v", written, err)
+		}
+		got, ok := routeICID(back.URI)
+		if validICID(icid) != ok || ok && got != icid {
+			t.Fatalf("icid %q written as %s, read back %q, %v", icid, written, got, ok)
+		}
+		if !p.inDialogWith(back.URI, "call-1") {
+			t.Fatalf("the route %s fails its own MAC", written)
+		}
+		u, err := sip.ParseURI("sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + raw)
+		if err != nil {
+			return
+		}
+		if got, ok := routeICID(u); ok {
+			if !validICID(got) {
+				t.Fatalf("%q read as %q, which recordRoute would not write", raw, got)
+			}
+			again, ok := routeICID(p.recordRoute("FLOW-A", false, got, "call-1")[0].URI)
+			if !ok || again != got {
+				t.Fatalf("%q read as %q, written again and read as %q, %v", raw, got, again, ok)
+			}
 		}
 	})
 }
