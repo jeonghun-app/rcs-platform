@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // TS 35.208 test set 1, not a SIM's; the IMPI's IMSI is on
@@ -77,9 +78,15 @@ func TestSIPUsageErrorsNameNoValue(t *testing.T) {
 	}
 }
 
+// A made-up K and OPc for the peer, its own (code review on #209).
+const (
+	testPeerK   = "00112233445566778899aabbccddeeff"
+	testPeerOPc = "ffeeddccbbaa99887766554433221100"
+)
+
 func TestThePeersClientIsConfiguredLikeTheSelfsWithItsOwnIdentity(t *testing.T) {
 	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
-		"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+		"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc, "RCS_SIM_PEER_AKA_K", testPeerK, "RCS_SIM_PEER_AKA_OPC", testPeerOPc)
 	// A usage error about the peer names it, never its value.
 	code, _, errOut := call(env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "x", "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc),
 		"-sip-proxy", "127.0.0.1:5060", "-peer", "tel:+15550100002", "all")
@@ -90,12 +97,32 @@ func TestThePeersClientIsConfiguredLikeTheSelfsWithItsOwnIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", impi: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org"}, defaultPeer, lookup)
+	peer, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", impi: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", credEnv: sipua.PeerEnv}, defaultPeer, lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if peer.IMPU.String() != defaultPeer || peer.InstanceID == self.InstanceID || peer.Proxy != self.Proxy {
 		t.Fatalf("peer %+v, self %+v", peer, self)
+	}
+}
+
+func TestThePeerTakesCredentialsOfItsOwn(t *testing.T) {
+	// The client's variables alone do not configure the peer: each
+	// subscriber has its own K and OPc, or password (code review on #209).
+	for auth, missing := range map[string]string{"aka": "RCS_SIM_PEER_AKA_K", "digest": "RCS_SIM_SIP_PEER_PASSWORD"} {
+		t.Run(auth, func(t *testing.T) {
+			lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
+				"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc, "RCS_SIM_SIP_PASSWORD", "self-password")
+			code, _, errOut := call(lookup, "-sip-proxy", "127.0.0.1:5060", "-sip-auth", auth, "all")
+			if code != exitUsage || !strings.Contains(errOut, "peer: sipua: "+missing+" is not set") {
+				t.Fatalf("exit %d, stderr %q", code, errOut)
+			}
+			for _, v := range []string{testK, testOPc, "self-password"} {
+				if strings.Contains(errOut, v) {
+					t.Fatalf("stderr %q repeats %q", errOut, v)
+				}
+			}
+		})
 	}
 }
 

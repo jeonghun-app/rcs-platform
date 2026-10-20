@@ -102,8 +102,10 @@ var scenarios = map[string]func(*run) error{
 	"pager-message":          pagerMessage,
 }
 
-// sipScenarios need the SIP clients; "all" runs them only when they are
-// configured, as a stack without pcscf cannot (#135).
+// sipScenarios need the SIP clients; "all" leaves them out of a run with no
+// SIP configuration at all, as a stack without pcscf cannot run them
+// (#135). With SIP configured they run, and one that lacks a setting it
+// needs, such as the peer, fails at its first step rather than vanish.
 var sipScenarios = map[string]bool{"pager-message": true}
 
 // Names lists the built-in scenarios, sorted.
@@ -120,11 +122,11 @@ func Names() []string {
 var ErrUnknown = errors.New("scenario: unknown scenario")
 
 // Run runs the named scenarios in order and reports every step; "all" runs
-// every built-in one, the SIP ones only with SIP and SIPPeer set. It returns whether every step succeeded, or ErrUnknown
-// before running anything.
+// every built-in one, the SIP ones only with SIP set. It returns whether
+// every step succeeded, or ErrUnknown before running anything.
 func Run(ctx context.Context, cfg Config, names []string, report Report) (bool, error) {
 	if slices.Contains(names, "all") {
-		names = slices.DeleteFunc(Names(), func(n string) bool { return sipScenarios[n] && (cfg.SIP == nil || cfg.SIPPeer == nil) })
+		names = slices.DeleteFunc(Names(), func(n string) bool { return sipScenarios[n] && cfg.SIP == nil })
 	}
 	for _, n := range names {
 		if scenarios[n] == nil {

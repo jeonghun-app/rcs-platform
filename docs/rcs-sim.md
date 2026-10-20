@@ -27,9 +27,9 @@ MESSAGE through pcscf) replaces both parts.
 | `ft-resume` | pre-check, interrupted-upload, get_upload_info, resume (or upload-again), get_download_info, download | the server keeps whole leading parts of a broken upload; the PUT with `Content-Range` completes it; the file comes back whole by SHA-256 |
 | `chat-client-originated` | listen-core, allocate (client path), answer (core path), connect, client-to-core, core-to-client, chunked-message, keep-alive, clean, release | ADR 0004's first row: messages both ways with CPIM and IMDN, delivered and displayed notifications, the success report of each message by its Message-ID, a 100 KiB message in 2 KiB chunks, keep-alives on a quiet session; after the release, the client path is refused with 481 |
 | `chat-core-originated` | listen-core, allocate (core path), connect-then-answer, core-sends-first, then as above | ADR 0004's second row: the client connects as soon as it has answered, before pcscf records its path (the PATCH goes 300 ms later, so the relay must wait, `RELAY_PATH_WAIT`), and the network speaks first |
-| `pager-message` | register (both clients), message, receive, delivery-notification | RCC.07 standalone messaging, pager mode (#135): a MESSAGE with CPIM and an IMDN delivery request from the client to the peer's IMPU, answered 200 and received on the peer's flow, its text and Message-ID intact; the delivery notification back to the client as a MESSAGE of its own (RFC 5438 §7.1.1), matched by Message-ID. Both clients unregister at the end. Needs `-sip-proxy` and a peer IMPI |
+| `pager-message` | register (both clients), message, receive, delivery-notification | RCC.07 standalone messaging, pager mode (#135): a MESSAGE with CPIM and an IMDN delivery request from the client to the peer's IMPU, answered 200 and received on the peer's flow, its text and Message-ID intact; the delivery notification back to the client as a MESSAGE of its own, to the message's SIP From (RFC 5438 §7.2.1, §12.1.3.1), matched by Message-ID. Both clients unregister at the end. A peer that is not registered makes the message step fail with the core's 480. Needs `-sip-proxy` and a peer IMPI |
 
-`all` runs every scenario. It leaves the SIP ones out unless both SIP clients are configured, since a stack without pcscf cannot run them. A scenario stops at its first failed step.
+`all` runs every scenario. It leaves the SIP ones out when no SIP client is configured (no `-sip-proxy`), since a stack without pcscf cannot run them. With `-sip-proxy` they all run, and one that needs a setting not given, such as the peer, fails at its first step with a line that says which. A scenario stops at its first failed step.
 
 ### What the clients do
 
@@ -148,8 +148,10 @@ It answers the registrar's challenge:
 
 The credentials come from the environment only: K and OPc as 32 hex digits in
 `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`, the Digest password in
-`RCS_SIM_SIP_PASSWORD`. Only made-up keys or the TS 35.208 test sets belong
-there. They print as a placeholder in every form.
+`RCS_SIM_SIP_PASSWORD`. The peer has its own, in `RCS_SIM_PEER_AKA_K`,
+`RCS_SIM_PEER_AKA_OPC` and `RCS_SIM_SIP_PEER_PASSWORD`: one secret shared by
+two subscribers would hide a client that answers with the other's. Only
+made-up keys or the TS 35.208 test sets belong there. They print as a placeholder in every form.
 
 It sets up 1-to-1 chats as the caller (RFC 3261 §12–15):
 
@@ -258,13 +260,14 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-sip-impi` | `RCS_SIM_SIP_IMPI` | private user identity, the Digest username |
 | `-sip-auth` | `aka` | `aka` takes K and OPc from `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`; `digest` takes the password from `RCS_SIM_SIP_PASSWORD` |
 | `-sip-instance` | a new `urn:uuid` | `+sip.instance` (RFC 5626 §4.1) |
-| `-sip-peer-impi` | `RCS_SIM_SIP_PEER_IMPI` | the far end's private user identity. The peer registers as `-peer` with the same other settings and credentials, and its own new instance. Without it, the scenarios with two clients are left out |
+| `-sip-peer-impi` | `RCS_SIM_SIP_PEER_IMPI` | the far end's private user identity. The peer registers as `-peer` with the same other settings, its own credentials (`RCS_SIM_PEER_AKA_K` and `RCS_SIM_PEER_AKA_OPC`, or `RCS_SIM_SIP_PEER_PASSWORD`) and its own new instance. Without it, the scenarios with two clients fail at their first step |
 | `-list`, `-version` | | print the scenarios or the version |
 
 Secrets are read from the environment only, never from flags, because flags
 are visible in process listings: `RCS_SIM_FT_PASSWORD`,
-`RCS_SIM_RELAY_TOKEN`, `RCS_SIM_AKA_K`, `RCS_SIM_AKA_OPC` and
-`RCS_SIM_SIP_PASSWORD`. The FT user name may also come from
+`RCS_SIM_RELAY_TOKEN`, `RCS_SIM_AKA_K`, `RCS_SIM_AKA_OPC`,
+`RCS_SIM_SIP_PASSWORD`, and the peer's `RCS_SIM_PEER_AKA_K`,
+`RCS_SIM_PEER_AKA_OPC` and `RCS_SIM_SIP_PEER_PASSWORD`. The FT user name may also come from
 `RCS_SIM_FT_USER`, and the IMPIs from `RCS_SIM_SIP_IMPI` and `RCS_SIM_SIP_PEER_IMPI`. A usage error names
 the flag or variable, never its value.
 

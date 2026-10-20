@@ -20,8 +20,12 @@ const queueLength = 16
 // pagerText is what the pager-message scenario sends.
 const pagerText = "rcs-sim pager-mode message"
 
-// errNoSIP fails a SIP scenario that has no client configuration.
-var errNoSIP = errors.New("no SIP client configured (-sip-proxy)")
+// errNoSIP fails a SIP scenario that has no client configuration, and
+// errNoPeer one with two clients that has no peer.
+var (
+	errNoSIP  = errors.New("no SIP client configured (-sip-proxy)")
+	errNoPeer = errors.New("no SIP peer configured (-sip-peer-impi)")
+)
 
 // sipClient is one simulated client in a SIP scenario: its UA and what the
 // network sends it.
@@ -36,19 +40,9 @@ type sipClient struct {
 // device's messaging stack accepts a message before the user sees it.
 func (r *run) newSIPClient(ctx context.Context, cfg sipua.Config, self cpim.Address) (*sipClient, error) {
 	c := &sipClient{self: self, messages: make(chan *sip.Request, queueLength)}
+	ids := sip.IDGenerator{Rand: r.cfg.Rand}
 	cfg.OnRequest = func(tx *transaction.ServerTransaction) {
-		req := tx.Request()
-		code := 200
-		if req.Method != "MESSAGE" {
-			code = 405
-		} else {
-			select {
-			case c.messages <- req:
-			default:
-				code = 486
-			}
-		}
-		if res, err := sip.NewResponse(req, code, "", "rcs-sim"); err == nil {
+		if res := c.answer(tx.Request(), ids); res != nil {
 			_ = tx.Respond(res)
 		}
 	}
@@ -73,6 +67,41 @@ func (r *run) newSIPClient(ctx context.Context, cfg sipua.Config, self cpim.Addr
 	return c, nil
 }
 
+// answer answers a request outside any dialog sipua knows: a MESSAGE with
+// 200, once queued (486 when the queue is full); one with a To tag, in a
+// dialog the client does not have, with 481 (RFC 3261 §12.2.2); any other
+// with 405 and the Allow it requires (§8.2.1).
+func (c *sipClient) answer(req *sip.Request, ids sip.IDGenerator) *sip.Response {
+	code := 200
+	to, err := req.Header.To()
+	switch {
+	case err != nil:
+		code = 400
+	case to.Tag() != "":
+		code = 481
+	case req.Method != "MESSAGE":
+		code = 405
+	default:
+		select {
+		case c.messages <- req:
+		default:
+			code = 486
+		}
+	}
+	tag, err := ids.Tag()
+	if err != nil {
+		return nil
+	}
+	res, err := sip.NewResponse(req, code, "", tag)
+	if err != nil {
+		return nil
+	}
+	if code == 405 && res.Header.Add("Allow", "MESSAGE") != nil {
+		return nil
+	}
+	return res
+}
+
 // next waits for the next MESSAGE the network sends c.
 func (c *sipClient) next(ctx context.Context) (*sip.Request, error) {
 	select {
@@ -91,8 +120,11 @@ func (c *sipClient) next(ctx context.Context) (*sip.Request, error) {
 // 200, and the delivery notification comes back as a MESSAGE carrying
 // message/imdn+xml.
 func pagerMessage(r *run) error {
-	if r.cfg.SIP == nil || r.cfg.SIPPeer == nil {
+	switch {
+	case r.cfg.SIP == nil:
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoSIP })
+	case r.cfg.SIPPeer == nil:
+		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoPeer })
 	}
 	var a, b *sipClient
 	if err := r.step("register", func(ctx context.Context) (map[string]int64, error) {
@@ -132,11 +164,17 @@ func pagerMessage(r *run) error {
 	}
 	var request imdn.Request
 	var from cpim.Address
+	var sender sip.URI
 	if err := r.step("receive", func(ctx context.Context) (map[string]int64, error) {
 		m, err := b.next(ctx)
 		if err != nil {
 			return nil, sipError(err)
 		}
+		f, err := m.Header.From()
+		if err != nil {
+			return nil, errors.New("the message has no From")
+		}
+		sender = f.URI
 		c, err := readCPIM(m)
 		if err != nil {
 			return nil, err
@@ -174,9 +212,10 @@ func pagerMessage(r *run) error {
 		if err != nil {
 			return nil, err
 		}
-		// RFC 5438 §7.1.1: in pager mode the notification is a MESSAGE of
-		// its own, to the sender.
-		req, err := b.ua.NewMessage(r.cfg.SIP.IMPU, cpim.ContentType, body)
+		// In pager mode the notification is a MESSAGE of its own (RFC 5438
+		// §12.1.3.1), to the SIP From of the message, and its CPIM To is the
+		// message's IMDN-Record-Route or else its CPIM From (§7.2.1).
+		req, err := b.ua.NewMessage(sender, cpim.ContentType, body)
 		if err != nil {
 			return nil, err
 		}

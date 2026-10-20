@@ -16,12 +16,28 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
-// The environment variables the credentials come from (#135). They are read
-// nowhere else, and their values reach no result line, log or error.
+// The environment variables the credentials come from (#135), the client's
+// and the peer's. They are read nowhere else, and their values reach no
+// result line, log or error.
 const (
 	EnvAKAK        = "RCS_SIM_AKA_K"
 	EnvAKAOPc      = "RCS_SIM_AKA_OPC"
 	EnvSIPPassword = "RCS_SIM_SIP_PASSWORD"
+
+	EnvPeerAKAK        = "RCS_SIM_PEER_AKA_K"
+	EnvPeerAKAOPc      = "RCS_SIM_PEER_AKA_OPC"
+	EnvPeerSIPPassword = "RCS_SIM_SIP_PEER_PASSWORD"
+)
+
+// CredentialEnv names the variables one subscriber's credentials come
+// from. Each simulated subscriber has its own: one secret shared by two
+// would hide a client that answers with the other's.
+type CredentialEnv struct{ K, OPc, Password string }
+
+// SelfEnv and PeerEnv are the client's variables and the peer's.
+var (
+	SelfEnv = CredentialEnv{K: EnvAKAK, OPc: EnvAKAOPc, Password: EnvSIPPassword}
+	PeerEnv = CredentialEnv{K: EnvPeerAKAK, OPc: EnvPeerAKAOPc, Password: EnvPeerSIPPassword}
 )
 
 // Authentication errors.
@@ -85,23 +101,23 @@ func AKACredentials(impi string, k, opc [milenage.KeySize]byte) (Credentials, er
 }
 
 // DigestCredentialsFromEnv is DigestCredentials with the password from
-// RCS_SIM_SIP_PASSWORD. getenv is os.Getenv outside tests.
-func DigestCredentialsFromEnv(impi string, getenv func(string) string) (Credentials, error) {
-	p := getenv(EnvSIPPassword)
+// vars.Password. getenv is os.Getenv outside tests.
+func DigestCredentialsFromEnv(impi string, vars CredentialEnv, getenv func(string) string) (Credentials, error) {
+	p := getenv(vars.Password)
 	if p == "" {
-		return Credentials{}, errors.New("sipua: " + EnvSIPPassword + " is not set")
+		return Credentials{}, errors.New("sipua: " + vars.Password + " is not set")
 	}
 	return DigestCredentials(impi, []byte(p))
 }
 
-// AKACredentialsFromEnv is AKACredentials with K and OPc from RCS_SIM_AKA_K
-// and RCS_SIM_AKA_OPC, 32 hex digits each. getenv is os.Getenv outside tests.
-func AKACredentialsFromEnv(impi string, getenv func(string) string) (Credentials, error) {
-	k, err := hexKey(getenv, EnvAKAK)
+// AKACredentialsFromEnv is AKACredentials with K and OPc from vars.K and
+// vars.OPc, 32 hex digits each. getenv is os.Getenv outside tests.
+func AKACredentialsFromEnv(impi string, vars CredentialEnv, getenv func(string) string) (Credentials, error) {
+	k, err := hexKey(getenv, vars.K)
 	if err != nil {
 		return Credentials{}, err
 	}
-	opc, err := hexKey(getenv, EnvAKAOPc)
+	opc, err := hexKey(getenv, vars.OPc)
 	if err != nil {
 		return Credentials{}, err
 	}
