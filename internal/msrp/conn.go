@@ -551,10 +551,8 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			var me *MessageError
 			if !errors.As(err, &me) {
-				if errors.Is(err, io.EOF) {
-					// The peer half-closed, between messages: it may
-					// still read what it is owed (#240).
-					c.writeQueued(time.After(c.cfg.refusalFlush))
+				if c.passive && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+					c.writeQueuedForPeer(err)
 				}
 				c.fail(err)
 				return
@@ -611,6 +609,21 @@ func (c *Conn) flush(reason error) {
 	case <-read:
 	case <-deadline:
 	}
+}
+
+// writeQueuedForPeer lets a peer that has stopped sending, between
+// messages or inside one (reason), read what it is owed for the requests
+// it completed before the connection ends (#240), for up to the refusal
+// flush's bound. reason is the end whatever fails meanwhile, as in flush:
+// a peer that closed altogether resets the writes, and the end is still
+// its close. Only passive connections wait: an active one, which a Pool
+// shares, would take new sessions while it waits, and its peer, the side
+// that half-closed in a refusal flush, discards what it reads.
+func (c *Conn) writeQueuedForPeer(reason error) {
+	c.mu.Lock()
+	c.closing = reason
+	c.mu.Unlock()
+	c.writeQueued(time.After(c.cfg.refusalFlush))
 }
 
 // writeQueued waits until everything queued has been written, and reports

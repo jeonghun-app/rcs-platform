@@ -291,8 +291,13 @@ What a client can make one task hold, and what happens at each bound:
 refused, with 481, and the connection stays (see below).
 
 A client that half-closes its side still reads: what is already queued for
-it, answers included, is written first, for up to the same 2 s, and only
-then is the connection closed (#240). The close is the client's, `EOF`.
+it, the answers to the requests it completed included, is written first,
+for up to the same 2 s, and only then is the connection closed (#240). That
+holds when it stops inside a request too, which ends as a framing error. The
+end is the client's whatever fails meanwhile: `EOF` (or the framing error)
+even when the client closed altogether and the writes meet a reset. Only
+client connections wait; the relay's connections toward rcs-as, which carry
+new sessions, close at once.
 
 Choices worth knowing:
 
