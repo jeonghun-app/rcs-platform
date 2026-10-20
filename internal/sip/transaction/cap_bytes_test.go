@@ -249,32 +249,32 @@ func branchOf(t *testing.T, req *sip.Request) string {
 	return b
 }
 
-// QA (third round): a response is kept only while it fits under the byte
-// bound. Before, 200 INVITEs answered 486 with 1 MiB bodies held 200 MiB
-// against a 1 MiB bound until Timer H.
-func TestFailureResponsesBeyondTheByteBoundAreSentButNotKept(t *testing.T) {
-	h := newHarness(t, transport.TCP, Config{MaxServerTransactions: 200, MaxServerTransactionBytes: 1 << 20})
-	for i := range 200 {
-		inv := request(t, "INVITE", fmt.Sprintf("z9hG4bKbusy%d", i))
-		h.receive(inv)
-		busy := response(t, inv, 486)
-		busy.Body = make([]byte, 1<<20)
-		if err := h.tu.lastTx().Respond(busy); err != nil {
-			t.Fatal(err)
+// QA and code review (third round): a response is kept only while it fits
+// under the byte bound, a provisional one as well as a final one. Before, 200
+// INVITEs answered 486 with 1 MiB bodies held 200 MiB against a 1 MiB bound
+// until Timer H, and 183s held it until the final response.
+func TestResponsesBeyondTheByteBoundAreSentButNotKept(t *testing.T) {
+	for _, code := range []int{183, 486} {
+		h := newHarness(t, transport.TCP, Config{MaxServerTransactions: 200, MaxServerTransactionBytes: 1 << 20})
+		for i := range 200 {
+			inv := request(t, "INVITE", fmt.Sprintf("z9hG4bKbig%d", i))
+			h.receive(inv)
+			res := response(t, inv, code)
+			res.Body = make([]byte, 1<<20)
+			if err := h.tu.lastTx().Respond(res); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	if s := h.layer.Stats(); s.ServerTransactions != 200 || s.ServerTransactionBytes > 1<<20 {
-		t.Fatalf("stats = %+v", s)
-	}
-	for _, tx := range h.tu.txs {
-		if tx.State() != Completed || tx.responseToTag() != "b1" {
-			t.Fatalf("state %v, To tag %q", tx.State(), tx.responseToTag())
+		if s := h.layer.Stats(); s.ServerTransactions != 200 || s.ServerTransactionBytes > 1<<20 {
+			t.Fatalf("%d: stats = %+v", code, s)
 		}
-		tx.mu.Lock()
-		kept := tx.last != nil
-		tx.mu.Unlock()
-		if kept {
-			t.Fatal("a 1 MiB 486 was kept under a 1 MiB bound")
+		for _, tx := range h.tu.txs {
+			tx.mu.Lock()
+			kept, tag := tx.last != nil, tx.toTag
+			tx.mu.Unlock()
+			if kept || tag != "b1" {
+				t.Fatalf("%d: a 1 MiB response was kept (%t) under a 1 MiB bound, To tag %q", code, kept, tag)
+			}
 		}
 	}
 }

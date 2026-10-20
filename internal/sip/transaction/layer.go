@@ -165,11 +165,13 @@ type Config struct {
 	//
 	// A response is always sent, but kept for retransmission only while it
 	// fits under the byte bound its request was admitted under (the client
-	// share for a client-facing listener); one that does not is sent once and only
-	// its To tag kept, so under that pressure a UDP client that loses it gets
-	// no retransmission (Timer G is skipped) and its retransmitted request no
-	// answer. A 2xx to an INVITE is never kept (RFC 6026 §7.1: the TU
-	// retransmits it).
+	// share for a client-facing listener). That covers the latest provisional
+	// response, kept until the final one (Timer C in a proxy, minutes), and a
+	// final non-2xx, kept until its ACK or Timer H or J. One that does not fit
+	// is sent once and only its To tag kept, so under that pressure a UDP
+	// client that loses it gets no retransmission (Timer G is skipped) and its
+	// retransmitted request no answer. A 2xx to an INVITE is never kept (RFC
+	// 6026 §7.1: the TU retransmits it).
 	//
 	// Zero takes DefaultMaxServerTransactions and
 	// DefaultMaxServerTransactionBytes; Validate accepts a count of 0 or 1 to
