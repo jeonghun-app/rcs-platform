@@ -437,6 +437,18 @@ func (rig *relayRigTCP) openClient(t *testing.T, local, relayPub URI, h Handler)
 		local.SessionID, took, err, wait, early, rig.report(relayPub))
 }
 
+// allStacks is every goroutine's stack, whole: the buffer grows until the
+// dump fits, so goroutines other tests left behind cannot push out the
+// ones a report is read for (#251).
+func allStacks() []byte {
+	for size := 1 << 20; ; size *= 2 {
+		buf := make([]byte, size)
+		if n := runtime.Stack(buf, true); n < size {
+			return buf[:n]
+		}
+	}
+}
+
 // report is how far relayPub's bind got, the state of every connection the
 // rig knows and the latest events, then every goroutine's stack.
 func (rig *relayRigTCP) report(relayPub URI) string {
@@ -468,9 +480,8 @@ func (rig *relayRigTCP) report(relayPub URI) string {
 	for _, e := range events {
 		b.WriteString("  " + e + "\n")
 	}
-	buf := make([]byte, 16<<20)
 	b.WriteString("goroutines:\n")
-	b.Write(buf[:runtime.Stack(buf, true)])
+	b.Write(allStacks())
 	return b.String()
 }
 
