@@ -52,6 +52,10 @@ const (
 // ErrMalformed reports a document outside RFC 3680.
 var ErrMalformed = errors.New("reginfo: malformed document")
 
+// ErrNotWritable reports, from Marshal only, a document Parse would read
+// but a sender must not write (validateStrict): it wraps ErrMalformed.
+var ErrNotWritable = fmt.Errorf("%w: not to be sent", ErrMalformed)
+
 // State says whether a document carries the whole registration state of the
 // subscription or only what changed (RFC 3680 §5.1).
 type State string
@@ -124,10 +128,14 @@ type Registration struct {
 
 // Contact is one contact of a registration (RFC 3680 §5.1).
 type Contact struct {
-	// ID names the contact within the subscription. scscf makes one per
-	// binding, from its +sip.instance and reg-id, or from the contact URI
-	// and the flow without them, not one per URI: the same URI bound over
-	// two flows (RFC 5626) is two contacts with two ids (#233).
+	// ID names the contact within the subscription (RFC 3680 §5.1). scscf
+	// makes one per binding and address-of-record, from the binding's
+	// +sip.instance and reg-id, or its URI and flow without them, and the
+	// AOR: the same URI bound over two flows (RFC 5626) is two contacts,
+	// and one binding under the sip and tel identities of an implicit set
+	// has two ids (#233). Marshal requires them unique in the document;
+	// Parse, lenient, only within a registration, and subscribers match
+	// bindings by their parameters and URI, never by id.
 	ID string
 	// State says whether the contact is registered, and Event what put it
 	// in that state. A document may pair them in a way RFC 3680 §4.7.1
@@ -158,16 +166,38 @@ type Contact struct {
 func (c Contact) Active() bool { return c.State == ContactActive }
 
 // Param returns the value of the unknown parameter called name, its name
-// compared without case as a contact parameter's is (RFC 3261 §7.3.1), and
-// a quoted-string value unquoted, as +sip.instance's is (RFC 5626 §4.1):
-// so `"<urn:uuid:…>"` is `<urn:uuid:…>`. A flag has the value "".
+// compared without ASCII case as a contact parameter's is (RFC 3261
+// §7.3.1), and a quoted-string value unquoted, as +sip.instance's is (RFC
+// 5626 §4.1): so `"<urn:uuid:…>"` is `<urn:uuid:…>`. A flag has the value
+// "". With the name twice, which Marshal refuses, the first counts.
 func (c Contact) Param(name string) (string, bool) {
 	for _, p := range c.Params {
-		if strings.EqualFold(p.Name, name) {
+		if asciiEqualFold(p.Name, name) {
 			return unquote(p.Value), true
 		}
 	}
 	return "", false
+}
+
+// asciiEqualFold reports whether a and b are equal but for the case of
+// ASCII letters: a token's case, not Unicode's folding (RFC 3261 §7.3.1).
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 // unquote returns the content of a quoted-string, its escapes undone
@@ -296,7 +326,8 @@ func attr(name, value string) xml.Attr {
 // validate checks r against the schema and §5.1, for Parse and Marshal
 // alike, so that a document Marshal writes is one Parse reads. An
 // address-of-record appears in one registration only (§5.1), compared as
-// URIs, so no subscriber finds it both active and terminated.
+// aorKey, so no subscriber finds it both active and terminated. Contact
+// ids are unique within a registration.
 func (r *Info) validate() error {
 	if r.State != Full && r.State != Partial {
 		return fmt.Errorf("%w: invalid reginfo state", ErrMalformed)
@@ -304,31 +335,24 @@ func (r *Info) validate() error {
 	if len(r.Registrations) > maxRegistrations {
 		return fmt.Errorf("%w: more than %d registrations", ErrMalformed, maxRegistrations)
 	}
-	var ids []string
-	aors := make([]aorForm, 0, len(r.Registrations))
-	// Contact ids are unique in the whole document, as RFC 3680 §5.1 has
-	// them within a subscription, and so within each registration too.
-	contacts := map[string]bool{}
+	// One key each, looked up in a map, so the checks stay linear in the
+	// document (docs/architecture.md §8).
+	ids := make(map[string]bool, len(r.Registrations))
+	aors := make(map[string]bool, len(r.Registrations))
 	for _, reg := range r.Registrations {
 		if err := reg.validate(); err != nil {
 			return err
 		}
-		if slices.Contains(ids, reg.ID) {
+		if ids[reg.ID] {
 			return fmt.Errorf("%w: repeated registration id", ErrMalformed)
 		}
-		ids = append(ids, reg.ID)
+		ids[reg.ID] = true
 		u, _ := sip.ParseURI(reg.AOR) // validate parsed it
-		aor := aorOf(u)
-		if slices.ContainsFunc(aors, aor.same) {
+		key := aorKey(u)
+		if aors[key] {
 			return fmt.Errorf("%w: repeated address-of-record", ErrMalformed)
 		}
-		aors = append(aors, aor)
-		for _, c := range reg.Contacts {
-			if contacts[c.ID] {
-				return fmt.Errorf("%w: repeated contact id", ErrMalformed)
-			}
-			contacts[c.ID] = true
-		}
+		aors[key] = true
 	}
 	return nil
 }
@@ -337,18 +361,30 @@ func (r *Info) validate() error {
 // it (RFC 3680 §4.7.1).
 var activeEvents = []Event{Registered, Created, Refreshed, Shortened}
 
-// validateStrict checks what only a sender is held to.
+// validateStrict checks what only a sender is held to: besides the state
+// machine, contact ids unique in the whole document (RFC 3680 §5.1) and a
+// contact's parameter names unique, so Param has one reading.
 func (r *Info) validateStrict() error {
+	contacts := map[string]bool{}
 	for _, reg := range r.Registrations {
 		for _, c := range reg.Contacts {
+			if contacts[c.ID] {
+				return fmt.Errorf("%w: contact id repeated in the document", ErrNotWritable)
+			}
+			contacts[c.ID] = true
+			for i, p := range c.Params {
+				if slices.ContainsFunc(c.Params[:i], func(q Param) bool { return asciiEqualFold(q.Name, p.Name) }) {
+					return fmt.Errorf("%w: contact parameter repeated", ErrNotWritable)
+				}
+			}
 			if slices.Contains(activeEvents, c.Event) != c.Active() {
-				return fmt.Errorf("%w: contact state and event disagree", ErrMalformed)
+				return fmt.Errorf("%w: contact state and event disagree", ErrNotWritable)
 			}
 			if c.Expires != nil && !c.Active() {
-				return fmt.Errorf("%w: expires on a contact not active", ErrMalformed)
+				return fmt.Errorf("%w: expires on a contact not active", ErrNotWritable)
 			}
 			if c.Active() && reg.State != Active {
-				return fmt.Errorf("%w: active contact under a registration not active", ErrMalformed)
+				return fmt.Errorf("%w: active contact under a registration not active", ErrNotWritable)
 			}
 		}
 	}
@@ -370,10 +406,18 @@ func (reg Registration) validate() error {
 	if len(reg.Contacts) > maxContacts {
 		return fmt.Errorf("%w: more than %d contacts in a registration", ErrMalformed, maxContacts)
 	}
+	// Contact ids are unique within a registration, whose table they key
+	// (§5.2); the same binding under the identities of an implicit set
+	// keeps its one id in each.
+	ids := make(map[string]bool, len(reg.Contacts))
 	for _, c := range reg.Contacts {
 		if err := c.validate(); err != nil {
 			return err
 		}
+		if ids[c.ID] {
+			return fmt.Errorf("%w: repeated contact id", ErrMalformed)
+		}
+		ids[c.ID] = true
 	}
 	return nil
 }
@@ -419,33 +463,30 @@ func (c Contact) validate() error {
 // document Parse returned has at most one: it refuses an address-of-record
 // repeated.
 func (r *Info) ByAOR(aor sip.URI) (Registration, bool) {
-	want := aorOf(aor)
+	want := aorKey(aor)
 	for _, reg := range r.Registrations {
 		u, err := sip.ParseURI(reg.AOR)
-		if err == nil && aorOf(u).same(want) {
+		if err == nil && aorKey(u) == want {
 			return reg, true
 		}
 	}
 	return Registration{}, false
 }
 
-// aorForm is an address-of-record as it compares: its canonical form, or
-// the URI when it has none.
-type aorForm struct {
-	canonical string
-	uri       sip.URI
-}
-
-func aorOf(u sip.URI) aorForm {
-	c, _ := identity.CanonicalIMPU(u.String())
-	return aorForm{canonical: c, uri: u}
-}
-
-func (a aorForm) same(b aorForm) bool {
-	if a.canonical != "" && b.canonical != "" {
-		return a.canonical == b.canonical
+// aorKey is the form an address-of-record compares in: its canonical IMPU,
+// or, for one without, such as a URI with a port, the URI with its scheme
+// and host in lower case and its parameters sorted, which two spellings of
+// one URI share.
+func aorKey(u sip.URI) string {
+	if c, ok := identity.CanonicalIMPU(u.String()); ok {
+		return "c\x00" + c
 	}
-	return a.uri.Equal(b.uri)
+	ps := make([]string, 0, len(u.Params))
+	for _, p := range u.Params {
+		ps = append(ps, strings.ToLower(p.Name)+"="+p.Value)
+	}
+	slices.Sort(ps)
+	return "u\x00" + strings.ToLower(u.Scheme) + ":" + u.User + "@" + strings.ToLower(u.Host) + ":" + strconv.Itoa(u.Port) + ";" + strings.Join(ps, ";")
 }
 
 // ByURI is the contacts of reg at uri, compared as URIs (RFC 3261 §19.1.4). There

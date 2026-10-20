@@ -212,7 +212,10 @@ var parents = map[string]string{
 // §2.8). Elements inside an extension element are the extension's.
 func checkElements(data []byte) error {
 	d := xml.NewDecoder(bytes.NewReader(withoutBOM(data)))
-	var stack []xml.Name
+	// stack holds, for each open element, whether it is an extension's:
+	// outside the namespace, or anywhere inside such an element.
+	var stack []bool
+	var names []string
 	for first := true; ; first = false {
 		tok, err := d.Token()
 		if err == io.EOF {
@@ -227,21 +230,21 @@ func checkElements(data []byte) error {
 				return fmt.Errorf("%w: XML declaration after the start", ErrMalformed)
 			}
 		case xml.StartElement:
-			if t.Name.Space == Namespace {
+			inExtension := len(stack) > 0 && stack[len(stack)-1]
+			extension := inExtension || t.Name.Space != Namespace
+			if !extension {
 				parent := ""
-				if len(stack) > 0 {
-					parent = stack[len(stack)-1].Local
-					if stack[len(stack)-1].Space != Namespace {
-						parent = "\x00" // inside an extension: not ours to check
-					}
+				if len(names) > 0 {
+					parent = names[len(names)-1]
 				}
-				if want, ok := parents[t.Name.Local]; parent != "\x00" && (!ok || want != parent) {
+				if want, ok := parents[t.Name.Local]; !ok || want != parent {
 					return fmt.Errorf("%w: element out of place", ErrMalformed)
 				}
 			}
-			stack = append(stack, t.Name)
+			stack = append(stack, extension)
+			names = append(names, t.Name.Local)
 		case xml.EndElement:
-			stack = stack[:len(stack)-1]
+			stack, names = stack[:len(stack)-1], names[:len(names)-1]
 		}
 	}
 }
