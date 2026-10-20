@@ -856,18 +856,21 @@ func TestANotifyWaitingIsNotQueuedTwice(t *testing.T) {
 	g := newGate(10)
 	m := &counts{}
 	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.Workers, c.SetConcurrency, c.Metrics = 1, 1, m })
-	// The one worker lists the first change's three subscriptions, which
-	// wait, then the second's, which merge into them; then one NOTIFY at a
-	// time goes out.
+	// Each change has a NOTIFY for each of the three subscriptions. With one
+	// NOTIFY of the set under way at a time, the second change's for a
+	// subscription whose first is still waiting merges into it: all three,
+	// if the second change is listed before the first NOTIFY starts, or the
+	// two others if it is listed after.
 	n.Changed(bg, before, before, Registered)
 	n.Changed(bg, before, before, Registered)
-	settled(t, n, 2)
+	waitQuiet(t, n)
 	for range 10 {
 		g.release <- struct{}{}
 	}
 	n.Wait()
-	if got := m.get("regevent.notify_merged"); got != 3 || g.sent != 3 {
-		t.Errorf("%d merged, %d sent; want 3 and 3", got, g.sent)
+	merged := int(m.get("regevent.notify_merged"))
+	if merged < 2 || merged+g.sent != 6 {
+		t.Errorf("%d merged, %d sent; want 2 or 3 merged and the rest sent, 6 in all", merged, g.sent)
 	}
 }
 
