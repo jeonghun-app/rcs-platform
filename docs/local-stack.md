@@ -77,6 +77,7 @@ DynamoDB Local or S3Mock.
 | `hss` | platform image | subscribers, Cx on 3868, provisioning API | `hss -healthcheck` |
 | `ft-server` | platform image | FT via HTTP; credentials from `hss` | `ft-server -healthcheck` |
 | `msrp-relay` | platform image | MSRP anchor; plain MSRP, no PROXY header | `msrp-relay -healthcheck` |
+| `icscf` | platform image | I-CSCF; finds `hss` as `hss.rcs.local` by DNS ([icscf](icscf.md#settings)), SIP on 5060 | `icscf -healthcheck` |
 | `acs` | `ACS_IMAGE` (Makefile) | auto-configuration, memory store, mock SMS | the image's own `/healthz` check |
 | `stack-seed` | `deploy/stack-init.Dockerfile` | one-shot, after the services are healthy: the test subscriber ([Bootstrap](#bootstrap)) | exits 0 |
 
@@ -86,8 +87,9 @@ shell or curl. `make up` waits until every service is healthy (up to 300 s). The
 test of `make e2e-compose` also waits for each `/readyz`, which checks the
 stores.
 
-`pcscf`, `icscf`, `scscf` and `rcs-as` are commented placeholders in the compose
-file. The pull request that adds a service enables it ([Adding a service](#adding-a-service)).
+`pcscf`, `scscf` and `rcs-as` are commented placeholders in the compose file.
+Until `scscf` is there, `icscf` connects to `hss` but has no S-CSCF to forward
+to. The pull request that adds a service enables it ([Adding a service](#adding-a-service)).
 
 ### Ports
 
@@ -105,8 +107,8 @@ Published on `127.0.0.1` only. The defaults are in `deploy/compose.env`.
 
 The admin ports (8080) and Diameter (3868) are reachable on the compose network
 only. On the network every service has its compose name: `hss:8081`,
-`ft-server:8081`, `msrp-relay:2855` and `:8082`, `acs:8080`, `dynamodb:8000`,
-`s3:9090`.
+`ft-server:8081`, `msrp-relay:2855` and `:8082`, `icscf:5060`, `acs:8080`,
+`dynamodb:8000`, `s3:9090`; `hss` is also `hss.rcs.local`.
 
 For example, to read the test subscription with the operator token:
 
@@ -231,7 +233,7 @@ The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
 container on the stack's network (`<COMPOSE_PROJECT>_default`), with
 `deploy/compose.env` as its environment. It:
 
-1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay` and `acs`;
+1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf` and `acs`;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim all`:
