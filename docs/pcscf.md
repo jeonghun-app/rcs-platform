@@ -267,8 +267,8 @@ request is sent over that flow whatever its Route or Request-URI say below.
 - **430.** A request whose Route names no flow, or a flow that is not a live
   client flow of this task (closed, from an earlier start, or a core
   connection), is answered 430 Flow Failed, and so is one whose flow is
-  already gone when it is to be sent. One whose flow closes while it is
-  under way may not get 430 yet
+  already gone when it is to be sent, or closes while it is under way, before
+  its final response: the branch ends when the flow does, not at Timer B or F
   ([#234](https://github.com/jeonghun-app/rcs-platform/issues/234)). The
   430 reaches `scscf` as it is, so that it tries the client's other flows
   (RFC 5626 §5.3). Flow tokens are an HMAC under a key
