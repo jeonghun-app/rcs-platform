@@ -174,7 +174,12 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	// task, and then for the S-CSCF: all of it must end before the client's
 	// Timer F, 64*T1 = 32 s, or the 480 or 504 comes after it gave up
 	// (review of #276).
-	if c.CxTimeout > 0 && c.RegisterTimeout > 0 && 2*c.CxTimeout+c.RegisterTimeout >= MaxRegisterTimeout {
+	// One Cx attempt alone must fit first, so the sum below cannot
+	// overflow and wrap below the limit (review of #276).
+	switch {
+	case c.CxTimeout >= MaxRegisterTimeout:
+		e.Invalid("CX_TIMEOUT", "must be under 32s, the client's Timer F")
+	case c.CxTimeout > 0 && c.RegisterTimeout > 0 && 2*c.CxTimeout+c.RegisterTimeout >= MaxRegisterTimeout:
 		e.Invalid("REGISTER_TIMEOUT", "plus twice ICSCF_CX_TIMEOUT must be under 32s, the client's Timer F")
 	}
 	s.ForbidInProduction(c.OriginHost != "",

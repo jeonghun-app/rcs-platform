@@ -116,6 +116,8 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"bad HSS host pattern":     with(devEnv, "ICSCF_HSS_HOST_PATTERN", "hss *.x"),
 		// 2 × 8 s + 16 s reaches the client's Timer F (review of #276).
 		"Cx and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "8s"),
+		// 2 × 2562047h wraps int64 below zero; it must not pass for that.
+		"a Cx timeout that overflows": with(devEnv, "ICSCF_CX_TIMEOUT", "2562047h"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
