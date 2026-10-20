@@ -48,9 +48,12 @@ var (
 // only once, and auts counts are kept apart from RES counts so that a forged
 // auts cannot block the genuine answer. Only milenage.VerifyAUTS at hss
 // (MAC-S under K) authenticates AUTS. Until that check passes the caller must
-// change no state (keep the pending vector, keep any registration), and it
-// must rate-limit resynchronisation per IMPI, because each attempt costs a Cx
-// round trip.
+// change no registration. The pending vector is another matter: a caller
+// that takes a challenge on its first use, as the S-CSCF does, has used it up
+// before it can tell, so a forged auts costs the client one more challenge,
+// and forging one needs the challenge's nonce and opaque. The caller must
+// also rate-limit resynchronisation per IMPI, because each attempt costs a
+// Cx round trip.
 type SyncFailure struct {
 	RAND [16]byte
 	AUTS [14]byte

@@ -3,13 +3,16 @@ package state
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -32,6 +35,9 @@ var (
 	// ErrExhausted means a subscription's NOTIFY counters have reached their
 	// limit; the subscription must be ended.
 	ErrExhausted = errors.New("state: NOTIFY counters exhausted")
+	// ErrContended means a write lost to other writers on every attempt; the
+	// caller may try again later. It is not ErrConflict, which says what won.
+	ErrContended = errors.New("state: changed by others on every attempt")
 )
 
 // Limits on what one item holds. Both backends apply them the same way, so a
@@ -99,30 +105,114 @@ func FirstVersion(r io.Reader) (int64, error) {
 // randReader is the default source of FirstVersion.
 var randReader io.Reader = rand.Reader
 
-// Registration is the registration state of one public identity: the bindings
-// of RFC 3261 §10.3 with the RFC 5626 additions. The user profile is a Profile
-// of its own, written only when it changes.
+// Registration is the registration state of one implicit registration set
+// (TS 23.228 §5.2.1a): the bindings of RFC 3261 §10.3, with the RFC 5626
+// additions, that every identity of the set shares. The set is one record, so
+// that a REGISTER, a deregistration or a sweep is one conditional save of it,
+// whichever identity of the set it came for; each identity points at it
+// (Identity). The user profile is a Profile of its own under the same key,
+// written only when it changes.
 type Registration struct {
-	// IMPU is the public identity in canonical form (identity.CanonicalIMPU).
-	IMPU string
-	// IMPI is the private identity that registered it.
-	IMPI string
-	// DefaultIMPU is the default public identity of the implicit
-	// registration set IMPU belongs to, in canonical form: with IMPI it
-	// names the set's profile (ProfileKey), which a terminating request to
-	// IMPU reads.
-	DefaultIMPU string
-	Contacts    []Contact
+	// Key is the private identity and the set's default public identity.
+	Key SetKey
+	// Incarnation is drawn when the record is created and kept by every save
+	// of it but one: the identities that point at the set name it, so that
+	// one pointing at an earlier record of the same key is told apart. A save
+	// that brings back a record claimed for a deregistration (Deregistering
+	// set, and zero in the save) must draw a new one, or the deregistration,
+	// which deletes the identities naming the incarnation it claimed, would
+	// delete those of the registration that took the record over. Both
+	// backends refuse such a save that keeps it (ErrInvalid).
+	Incarnation int64
+	// Identities are the set's public identities, in canonical form, in the
+	// order of its User-Data; Key.IMPU is one of them.
+	Identities []SetIdentity
+	Contacts   []Contact
 	// Deregistering is set on a registration left without contacts by the
-	// sweep that claimed it: until then that instance handles the
-	// deregistration (SAR, NOTIFY), after it any sweep retries it. A
-	// registration without contacts is deleted once that has succeeded.
+	// instance that is deregistering it, a sweep or a user's REGISTER: until
+	// then that instance handles the deregistration (SAR, NOTIFY), after it
+	// any sweep retries it. A registration without contacts is deleted once
+	// that has succeeded.
 	Deregistering time.Time
+	// Unregistered is set on the record of an unregistered user, which the
+	// S-CSCF stores after SAR UNREGISTERED_USER (TS 29.228 §6.1.2) so that
+	// later terminating requests reuse the set's profile instead of asking
+	// again: it is when that state ends, the time the record was stored plus
+	// the configured TTL. Such a record has no contacts. A REGISTER makes it
+	// a registration, with contacts and Unregistered zero; at Unregistered a
+	// sweep claims it as it claims a registration whose last contact expired.
+	Unregistered time.Time
+	// Reassert is set on a live registration whose assignment the HSS may
+	// have lost: a deregistration's SAR crossed a REGISTER's, and telling the
+	// HSS again (SAR REGISTRATION) failed. It is when a sweep hands the
+	// registration to its handler again (SweepRegistrations), which owns the
+	// retry: it clears both fields once the HSS has taken the SAR, and
+	// otherwise counts the failure in ReassertAttempts and moves Reassert on,
+	// backing off and giving up by MaxReassertAttempts at the latest.
+	Reassert         time.Time
+	ReassertAttempts int
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). It is opaque: a new item
 	// starts at a random value (FirstVersion).
 	Version int64
 }
+
+// MaxReassertAttempts bounds Registration.ReassertAttempts.
+const MaxReassertAttempts = 16
+
+// SetIdentity is one public identity of an implicit registration set.
+type SetIdentity struct {
+	IMPU string
+	// Barred bars the identity from every communication but registration
+	// (TS 29.228 Annex B.2.1).
+	Barred bool
+}
+
+// Identity is what one public identity names: the implicit registration set
+// it belongs to. Identities go before their record both ways. They are
+// written before a record with a new incarnation or new identities is saved,
+// the save being the commit point: one naming a record not saved (yet) is
+// as good as none, and its KeepUntil ends it. They are deleted with the set
+// before its record, so that a deregistration cut short is done again by a
+// sweep. A re-registration only keeps them (KeepIdentity), or repairs them.
+// An IMPU names one set: an IMPU shared by several private identities (TS
+// 23.228 §4.3.3.4) is out of scope: the last set saved for it takes it.
+type Identity struct {
+	// IMPU is the public identity in canonical form.
+	IMPU string
+	// Set and Incarnation name the set's record.
+	Set         SetKey
+	Incarnation int64
+	Barred      bool
+	// KeepUntil is the safety net Profile.KeepUntil is, for an identity a
+	// failed deregistration left: from then on it is not found, and DynamoDB
+	// removes it (TTL). The S-CSCF sets and extends it with the set's
+	// profile. Backends keep it to the second.
+	KeepUntil time.Time
+	// Version is as for Registration.
+	Version int64
+}
+
+// Validate checks i against the limits of this package.
+func (i *Identity) Validate() error {
+	if !canonicalIMPU(i.IMPU) {
+		return fmt.Errorf("%w: identity IMPU is not a canonical public identity", ErrInvalid)
+	}
+	if err := validSetKey(i.Set); err != nil {
+		return err
+	}
+	if i.Incarnation == 0 {
+		return fmt.Errorf("%w: an identity names its set's incarnation", ErrInvalid)
+	}
+	if !validTime(i.KeepUntil) {
+		return fmt.Errorf("%w: an identity needs a KeepUntil", ErrInvalid)
+	}
+	return nil
+}
+
+// MaxIdentities bounds the public identities of one implicit registration
+// set.
+const MaxIdentities = 32
 
 // Contact is one binding.
 type Contact struct {
@@ -169,12 +259,26 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or, without contacts, when its deregistration may be retried.
+// contact expiry, or a due Reassert if earlier, or, without contacts, when its
+// deregistration may be retried, or else when its unregistered state ends. A
+// registration with none of these is due at once.
 func (r *Registration) SweepAt() time.Time {
-	if len(r.Contacts) == 0 {
+	switch {
+	case len(r.Contacts) > 0:
+		if next := r.NextExpiry(); r.Reassert.IsZero() || next.Before(r.Reassert) {
+			return next
+		}
+		return r.Reassert
+	case !r.Deregistering.IsZero():
 		return r.Deregistering
 	}
-	return r.NextExpiry()
+	return r.Unregistered
+}
+
+// ReassertDue reports whether a sweep at now should tell the HSS again that
+// this S-CSCF serves r's set (Reassert).
+func (r *Registration) ReassertDue(now time.Time) bool {
+	return !r.Reassert.IsZero() && !r.Reassert.After(now)
 }
 
 // Prune removes the contacts that have expired at now and returns them.
@@ -193,6 +297,7 @@ func (r *Registration) Prune(now time.Time) []Contact {
 // Clone returns a deep copy.
 func (r *Registration) Clone() *Registration {
 	c := *r
+	c.Identities = slices.Clone(r.Identities)
 	c.Contacts = make([]Contact, len(r.Contacts))
 	for i, ct := range r.Contacts {
 		ct.Path = slices.Clone(ct.Path)
@@ -207,20 +312,39 @@ func (r *Registration) Clone() *Registration {
 
 // Validate checks r against the limits of this package.
 func (r *Registration) Validate() error {
-	if !canonicalIMPU(r.IMPU) {
-		return fmt.Errorf("%w: registration IMPU is not a canonical public identity", ErrInvalid)
+	if err := validSetKey(r.Key); err != nil {
+		return err
 	}
-	if err := identity.ValidIMPI(r.IMPI); err != nil {
-		return fmt.Errorf("%w: registration IMPI: %w", ErrInvalid, err)
+	if r.Incarnation == 0 {
+		return fmt.Errorf("%w: a registration needs an incarnation", ErrInvalid)
 	}
-	if !canonicalIMPU(r.DefaultIMPU) {
-		return fmt.Errorf("%w: registration DefaultIMPU is not a canonical public identity", ErrInvalid)
+	if len(r.Identities) == 0 || len(r.Identities) > MaxIdentities {
+		return fmt.Errorf("%w: a set has 1 to %d identities", ErrInvalid, MaxIdentities)
+	}
+	found := false
+	for _, id := range r.Identities {
+		if !canonicalIMPU(id.IMPU) {
+			return fmt.Errorf("%w: a set identity is not a canonical public identity", ErrInvalid)
+		}
+		found = found || id.IMPU == r.Key.IMPU
+	}
+	if !found {
+		return fmt.Errorf("%w: the set's default identity is not among its identities", ErrInvalid)
 	}
 	if len(r.Contacts) > MaxContacts {
 		return fmt.Errorf("%w: more than %d contacts", ErrInvalid, MaxContacts)
 	}
-	if !r.Deregistering.IsZero() && !validTime(r.Deregistering) {
-		return fmt.Errorf("%w: Deregistering out of range", ErrInvalid)
+	if !r.Deregistering.IsZero() && (!validTime(r.Deregistering) || len(r.Contacts) > 0) {
+		// A record claimed for a deregistration has no bindings: one saved
+		// with them would be brought back under the claimed incarnation
+		// without counting as a revival (Incarnation).
+		return fmt.Errorf("%w: a record claimed for a deregistration has contacts, or Deregistering is out of range", ErrInvalid)
+	}
+	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
+		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)
+	}
+	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
+		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
 	}
 	for _, c := range r.Contacts {
 		if c.URI == "" || !validTime(c.Expires) {
@@ -244,11 +368,6 @@ func canonicalIMPU(impu string) bool {
 	return ok && canon == impu && KeyOK(impu, MaxKey)
 }
 
-// ProfileKey returns the key of the profile that applies to r's IMPU.
-func (r *Registration) ProfileKey() ProfileKey {
-	return ProfileKey{IMPI: r.IMPI, IMPU: r.DefaultIMPU}
-}
-
 // sizeOK refuses an item whose JSON form exceeds MaxItemBytes. The backends'
 // own encodings are no larger, so a registration this accepts fits everywhere.
 func sizeOK(what string, v any) error {
@@ -262,13 +381,15 @@ func sizeOK(what string, v any) error {
 	return nil
 }
 
-// Registrations stores the registration state, one item per public identity.
+// Registrations stores the registration state: one record per implicit
+// registration set, and per public identity the set it belongs to.
 type Registrations interface {
-	// Registration returns the registration of a canonical IMPU.
-	Registration(ctx context.Context, impu string) (*Registration, error)
+	// Registration returns the registration of a set.
+	Registration(ctx context.Context, k SetKey) (*Registration, error)
 	// RegistrationsOf returns every registration of a private identity, which
 	// a Registration-Termination-Request without public identities ends (TS
-	// 29.228 §6.1.3).
+	// 29.228 §6.1.3). It is read through an index, which may miss one saved
+	// moments ago.
 	RegistrationsOf(ctx context.Context, impi string) ([]*Registration, error)
 	// SaveRegistration stores r and returns it with its new version. A
 	// Version of 0 creates it and fails with ErrExists if it exists; any
@@ -279,6 +400,20 @@ type Registrations interface {
 	// DeleteRegistration deletes r if its version is still the stored one
 	// (ErrConflict otherwise, ErrNotFound if gone).
 	DeleteRegistration(ctx context.Context, r *Registration) error
+	// Identity returns what a canonical IMPU names, ErrNotFound if nothing
+	// or its KeepUntil has come at now.
+	Identity(ctx context.Context, impu string, now time.Time) (*Identity, error)
+	// SaveIdentity and DeleteIdentity are as SaveRegistration and
+	// DeleteRegistration, for an identity. A create (Version 0) also
+	// replaces an item whose KeepUntil has come at now, which Identity no
+	// longer returns and so no caller could name by its version.
+	SaveIdentity(ctx context.Context, i *Identity, now time.Time) (*Identity, error)
+	DeleteIdentity(ctx context.Context, i *Identity) error
+	// KeepIdentity is KeepProfile for an identity: it moves KeepUntil to
+	// until if later. A move changes the version, so that a save from an
+	// earlier read gets ErrConflict and reads again rather than bringing
+	// KeepUntil back.
+	KeepIdentity(ctx context.Context, impu string, until, now time.Time) error
 	// ExpiringRegistrations returns up to limit registrations whose SweepAt
 	// has come at now, for SweepRegistrations.
 	ExpiringRegistrations(ctx context.Context, now time.Time, limit int) ([]*Registration, error)
@@ -289,48 +424,125 @@ type Registrations interface {
 // initial filter criteria. The HSS sends User-Data per implicit registration
 // set, an SAA only the set of the identity it was asked about and a PPR one
 // set at a time (TS 29.228 §6.1.2, §6.2.2), so a profile is stored per set
-// (ProfileKey): one private identity with two sets has two, and saving one
+// (SetKey): one private identity with two sets has two, and saving one
 // leaves the other. Profiles are kept apart from the registrations so a
 // re-registration, which changes only contacts, does not rewrite them, and so
-// that an unregistered user's profile (SAR UNREGISTERED_USER) stays as long as
-// the HSS has the user assigned: the S-CSCF deletes it with the assignment,
-// no sweep does.
+// that an unregistered user's profile stays as long as the HSS has the user
+// assigned: the S-CSCF deletes it with the assignment, no sweep does.
+// KeepUntil is only a safety net for a deregistration that failed to.
 type Profiles interface {
-	// Profile returns the User-Data stored for k.
-	Profile(ctx context.Context, k ProfileKey) ([]byte, error)
-	// SaveProfile stores userData for k, received at received: the time the
-	// SAA or PPR that carried it arrived, which orders the profiles of one
-	// set across instances. A profile received earlier than the one stored
-	// for k is not stored (ErrConflict): an SAA that took longer to arrive
-	// must not undo the PPR that followed it. Saving the same one again
-	// succeeds. Other sets of the same IMPI are not touched.
-	SaveProfile(ctx context.Context, k ProfileKey, userData []byte, received time.Time) error
+	// Profile returns the profile stored for k, ErrNotFound if there is none
+	// or its KeepUntil has come at now.
+	Profile(ctx context.Context, k SetKey, now time.Time) (*Profile, error)
+	// SaveProfile stores p. A profile received earlier than the one stored
+	// for its key is not stored (ErrConflict): an SAA that took longer to
+	// arrive must not undo the PPR that followed it; its KeepUntil still
+	// counts, the stored one moving to it if later. A save never brings
+	// KeepUntil closer, which a registration may have just extended.
+	// Saving the same one again succeeds. Other sets of the same IMPI are not
+	// touched. ErrContended means the profile kept changing under it.
+	SaveProfile(ctx context.Context, p *Profile) error
+	// KeepProfile moves the KeepUntil of k's profile to until, if that is
+	// later; it never brings it closer. It returns ErrNotFound if Profile
+	// would at now. A profile saved again while it runs, with an earlier
+	// KeepUntil, is extended in a second attempt; if it is saved again
+	// during that one too, KeepProfile returns nil and the saved KeepUntil
+	// stands: that profile was just written, and the next registration
+	// extends it (KeepDue). It never returns ErrConflict.
+	KeepProfile(ctx context.Context, k SetKey, until, now time.Time) error
 	// DeleteProfile deletes the profile of k; deleting none is no error.
-	DeleteProfile(ctx context.Context, k ProfileKey) error
+	DeleteProfile(ctx context.Context, k SetKey) error
+	// DeleteProfileIf deletes the profile of k only if it is still the one
+	// received at received (Profile.Received): one another instance saved
+	// since, for a registration of its own, stays and gives ErrConflict.
+	// Deleting none is no error.
+	DeleteProfileIf(ctx context.Context, k SetKey, received time.Time) error
 }
 
-// ProfileKey names the profile of one implicit registration set.
-type ProfileKey struct {
+// SetKey names one implicit registration set: its registration and its
+// profile.
+type SetKey struct {
 	// IMPI is the private identity the set belongs to.
 	IMPI string
-	// IMPU is the set's default public identity in canonical form, the one
-	// its registrations name in DefaultIMPU.
+	// IMPU is the set's default public identity in canonical form: the first
+	// of its identities that is not barred (TS 24.229 §5.4.1.2.2F). Every
+	// identity of the set names it (Identity.Set).
 	IMPU string
+}
+
+func validSetKey(k SetKey) error {
+	if err := identity.ValidIMPI(k.IMPI); err != nil {
+		return fmt.Errorf("%w: set IMPI: %w", ErrInvalid, err)
+	}
+	if !canonicalIMPU(k.IMPU) {
+		return fmt.Errorf("%w: set IMPU is not a canonical public identity", ErrInvalid)
+	}
+	return nil
+}
+
+// ProfileGrace is how long a profile outlives the last contact expiry of its
+// set, or the end of its unregistered state (Registration.Unregistered): the
+// S-CSCF sets KeepUntil to that time plus ProfileGrace. A registration
+// extends it only when it has moved that time ProfileKeepMargin or more past
+// what KeepUntil covers (KeepDue), so a set re-registering every hour writes
+// it about twice a day, and KeepUntil stays at least ProfileGrace -
+// ProfileKeepMargin past every live binding, however long registrations
+// last.
+const (
+	ProfileGrace      = 24 * time.Hour
+	ProfileKeepMargin = 12 * time.Hour
+)
+
+// Profile is the User-Data of one implicit registration set.
+type Profile struct {
+	Key      SetKey
+	UserData []byte
+	// Received is when the SAA or PPR that carried UserData arrived, which
+	// orders the profiles of one set across instances.
+	Received time.Time
+	// KeepUntil is when the profile is deleted if no deregistration did it:
+	// from then on it is not found, and DynamoDB removes it (TTL), so a
+	// profile a failed deregistration left behind does not stay for ever.
+	// Backends keep it to the second.
+	KeepUntil time.Time
+}
+
+// KeepDue reports whether a registration whose last binding of the set now
+// expires at lastExpiry should extend p with KeepProfile(lastExpiry +
+// ProfileGrace): when KeepUntil is less than ProfileGrace - ProfileKeepMargin
+// past lastExpiry. Measured from the expiry rather than the time left, a
+// registration longer than ProfileGrace still extends it before it runs out.
+func (p *Profile) KeepDue(lastExpiry time.Time) bool {
+	return keepDue(p.KeepUntil, lastExpiry)
+}
+
+// KeepDue is Profile.KeepDue for an identity, with KeepIdentity. Each has its
+// own: a PPR or a refused save may move the profile's alone.
+func (i *Identity) KeepDue(lastExpiry time.Time) bool {
+	return keepDue(i.KeepUntil, lastExpiry)
+}
+
+func keepDue(keepUntil, lastExpiry time.Time) bool {
+	return keepUntil.Sub(lastExpiry) < ProfileGrace-ProfileKeepMargin
+}
+
+// Clone returns a copy of p that shares no memory with it.
+func (p *Profile) Clone() *Profile {
+	c := *p
+	c.UserData = slices.Clone(p.UserData)
+	return &c
 }
 
 // ValidProfile checks a profile against the limits of this package; the
 // backends apply it in SaveProfile.
-func ValidProfile(k ProfileKey, userData []byte, received time.Time) error {
-	if err := identity.ValidIMPI(k.IMPI); err != nil {
-		return fmt.Errorf("%w: profile IMPI: %w", ErrInvalid, err)
+func ValidProfile(p *Profile) error {
+	if err := validSetKey(p.Key); err != nil {
+		return err
 	}
-	if !canonicalIMPU(k.IMPU) {
-		return fmt.Errorf("%w: profile IMPU is not a canonical public identity", ErrInvalid)
+	if !validTime(p.Received) || !validTime(p.KeepUntil) {
+		return fmt.Errorf("%w: a profile needs the time it was received and a KeepUntil", ErrInvalid)
 	}
-	if !validTime(received) {
-		return fmt.Errorf("%w: a profile needs the time it was received", ErrInvalid)
-	}
-	if len(userData) == 0 || len(userData) > MaxUserData {
+	if len(p.UserData) == 0 || len(p.UserData) > MaxUserData {
 		return fmt.Errorf("%w: User-Data empty or larger than %d bytes", ErrInvalid, MaxUserData)
 	}
 	return nil
@@ -354,6 +566,14 @@ type Challenge struct {
 	// Exactly one of AKA and Digest is set.
 	AKA    *AKAVector
 	Digest *DigestChallenge
+	// Resynchronised marks an AKA challenge whose vector the HSS issued
+	// after a resynchronisation (TS 33.102 §6.3.5): a further synchronisation
+	// failure for it is not sent to the HSS again.
+	Resynchronised bool
+	// Flow is the FlowScope of the P-CSCF flow the challenged REGISTER came
+	// over, "" without one: an AUTS that answers the challenge over the same
+	// flow is the same client's (registrar limits).
+	Flow string
 }
 
 // challengeRedacted is what a Challenge prints and logs.
@@ -436,7 +656,7 @@ func (c *Challenge) Validate() error {
 	if err := identity.ValidIMPI(c.IMPI); err != nil {
 		return fmt.Errorf("%w: challenge IMPI: %w", ErrInvalid, err)
 	}
-	if !KeyOK(c.Nonce, MaxNonce) || !textOK(c.IMPU) {
+	if !KeyOK(c.Nonce, MaxNonce) || !textOK(c.IMPU) || strings.HasPrefix(c.Nonce, ReservedNoncePrefix) {
 		return fmt.Errorf("%w: a challenge needs a nonce of 1 to %d bytes", ErrInvalid, MaxNonce)
 	}
 	if !validTime(c.Issued) || !c.Expires.After(c.Issued) || c.Expires.Sub(c.Issued) > MaxChallengeLifetime {
@@ -444,6 +664,12 @@ func (c *Challenge) Validate() error {
 	}
 	if (c.AKA == nil) == (c.Digest == nil) {
 		return fmt.Errorf("%w: a challenge holds exactly one of an AKA vector and Digest state", ErrInvalid)
+	}
+	if c.Resynchronised && c.AKA == nil {
+		return fmt.Errorf("%w: only an AKA challenge is resynchronised", ErrInvalid)
+	}
+	if c.Flow != "" && !validScope(c.Flow) {
+		return fmt.Errorf("%w: a challenge's flow is a FlowScope", ErrInvalid)
 	}
 	return nil
 }
@@ -483,6 +709,59 @@ type Challenges interface {
 	// mean the challenge is unusable: the S-CSCF challenges again with a 401,
 	// rather than failing the REGISTER.
 	TakeChallenge(ctx context.Context, impi, nonce string, now time.Time) (*Challenge, error)
+	// CountAttempt adds n, 1 or -1 to give back an attempt that came to
+	// nothing, to the count a names, and returns the count after. Every
+	// instance counts into the same count, which is kept until expires. A
+	// resent request may count twice: that errs on the side of the limit.
+	CountAttempt(ctx context.Context, a Attempt, n int64, expires time.Time) (int64, error)
+}
+
+// ReservedNoncePrefix starts no challenge's nonce: the backends keep their
+// attempt counts beside the challenges, under keys that start with it. Digest
+// and AKA nonces are base64, which never contains it.
+const ReservedNoncePrefix = "#"
+
+// The kinds of CountAttempt: the challenges the S-CSCF issues, and the
+// resynchronisations among them.
+const (
+	AttemptChallenge = "challenge"
+	AttemptResync    = "resync"
+)
+
+// Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
+// window that starts at Window, for the IMPI as a whole (Scope "") or over
+// one P-CSCF flow (FlowScope).
+type Attempt struct {
+	IMPI, Kind, Scope string
+	Window            time.Time
+}
+
+// FlowScope is the Attempt scope of the P-CSCF flow whose token is in a
+// REGISTER's Path: a digest, so that what the store keeps is fixed in length
+// and alphabet whatever the token holds.
+func FlowScope(token string) string {
+	sum := sha256.Sum256([]byte("scscf/attempt-flow|" + token))
+	return hex.EncodeToString(sum[:16])
+}
+
+// ValidAttempt checks CountAttempt's arguments; the backends apply it.
+func ValidAttempt(a Attempt, n int64, expires time.Time) error {
+	if err := identity.ValidIMPI(a.IMPI); err != nil {
+		return fmt.Errorf("%w: attempt IMPI: %w", ErrInvalid, err)
+	}
+	if a.Kind != AttemptChallenge && a.Kind != AttemptResync {
+		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
+	}
+	if a.Scope != "" && !validScope(a.Scope) {
+		return fmt.Errorf("%w: an attempt scope is a FlowScope", ErrInvalid)
+	}
+	if n != 1 && n != -1 {
+		return fmt.Errorf("%w: an attempt counts 1 or -1", ErrInvalid)
+	}
+	if !validTime(a.Window) || !expires.After(a.Window) {
+		return fmt.Errorf("%w: an attempt window needs a start and a later expiry", ErrInvalid)
+	}
+	return nil
 }
 
 // Subscription is a subscription to the reg event package (RFC 3680) that the
@@ -597,4 +876,9 @@ func textOK(vs ...string) bool {
 		}
 	}
 	return true
+}
+
+// validScope reports whether s is what FlowScope returns.
+func validScope(s string) bool {
+	return len(s) == 32 && strings.Trim(s, "0123456789abcdef") == ""
 }

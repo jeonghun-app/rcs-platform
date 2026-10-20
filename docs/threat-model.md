@@ -42,7 +42,9 @@ Anything that reaches a core SIP port can send as any subscriber by setting
 **Control:** only `pcscf` faces clients and strips client-supplied
 `P-Asserted-Identity` and the other network-only headers, on a client listener
 separate from its core listener; core SIP ports admit only platform services
-(ADR 0007 §2, §7).
+(ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
+default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
+messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
 **Status:** planned (#16, Phase 7 infrastructure).
 
 ## T3 — MSRP session access on `rcs-as`
@@ -289,3 +291,72 @@ metadata.
 The engine asks the group whether someone is still a participant before it
 invites them back to deliver a queued copy, and gives up the copies of
 anyone who left.
+
+## T12 — Authentication floods against one subscriber
+
+Every REGISTER without credentials costs the S-CSCF a MAR, and the HSS
+answers it under that subscriber's lock, updating the AKA sequence number. A
+distributed flood of REGISTERs for one (IMPI, IMPU) pair, from addresses
+the P-CSCF's per-source limits each let through, would starve the
+subscriber's own MAR; a forged AUTS, which anyone holding a challenge can
+send (`digest.SyncFailure`), would do the same through resynchronisation. A
+limit on that must not itself become the cheap way to lock the subscriber
+out.
+
+**Control:** the registrar counts the challenges of each IMPI in fixed
+windows shared by every `scscf` instance (DynamoDB atomic counters beside the
+challenges, with TTL), split by the P-CSCF flow token in the REGISTER's Path,
+which only the P-CSCF writes: #198 removes any Path a client sends
+(`networkOnlyHeaders`) and puts its own on top (`prepareRegister`), and the
+token, an HMAC of the connection, cannot be guessed. A REGISTER over the flow
+of a live binding, the registered UE refreshing while it stays on that flow,
+counts in a budget of that flow alone, so a flood from elsewhere cannot use
+it up. Any other REGISTER counts in a small
+per-flow budget and in the IMPI's shared one. Over a budget the answer is
+500 with Retry-After (RFC 3261 §21.5.1), without a MAR: not 503, which an
+upstream proxy would read as the whole S-CSCF being out of service (§21.5.4)
+and the P-CSCF would retry at other I-CSCFs. A challenge allows one
+resynchronisation; an IMPI three per challenge lifetime, the registered UE's
+flow apart. An AUTS that answers a challenge over the flow it was issued to
+counts in the shared budget only, the flow having paid for the challenge. A
+challenge or resynchronisation whose MAR never reached the HSS (no HSS task
+connected) gives its counts and slot back; one the HSS
+answered DIAMETER_TOO_BUSY, or that timed out, keeps them, so that the limit
+does not loosen while the HSS is loaded. An
+instance that saw a count over its limit refuses the rest of the window from
+memory, without a write. Metrics `registrar.challenge_limited` and
+`registrar.resync_limited` carry no identifier; the first is to be alarmed
+on (`docs/scscf-state.md`).
+
+**Risk left:**
+- A subscriber with no live binding, registering for the first time or
+  after its registration expired, has no flow of its own yet: a flood of
+  some ten first registrations a minute from other flows, by anyone who
+  knows its IMPI, holds that registration back until the flood stops. The
+  alarm is the answer to it.
+- So does a registered UE that reconnects: a switch between Wi-Fi and
+  cellular, a NAT rebinding, or a P-CSCF drained on a deploy gives it a new
+  connection and so a new flow token, which matches no live binding. Until
+  the flood stops it cannot refresh, its old flow being gone, and its
+  binding runs out. Before authentication the S-CSCF cannot tell it from
+  the flood (a better signal is #246); hence the alarm, and no
+  P-CSCF deploy or drain while it is raised.
+- Likewise, forged AUTSs from other flows can use up the IMPI's three
+  resynchronisations a lifetime, so a UE with no live binding whose SQN is
+  out of step is refused until the flood stops; a registered UE on its flow
+  resyncs on its own budget.
+- While the HSS is slow (busy answers, timeouts), a UE's MARs keep their
+  counts, so its flow's three a minute can run out sooner.
+- Windows are fixed: twice a budget gets through across an edge.
+- The shared count is observable: a client that probes it near a window's
+  end learns from where it is refused whether others were challenged in that
+  window, that is, roughly whether the subscriber's UE registered then. It
+  learns nothing about the registered UE's own flow, which counts apart.
+- The flow token is trusted as the P-CSCF wrote it, which rests on #198
+  removing the client's Path and putting its own on top. A P-CSCF that let
+  a client choose its Path, or anyone with access to the core listeners,
+  could spend the registered UE's budget.
+
+**Status:** implemented in `internal/scscf/registrar` (#201); wired to a
+listener with `cmd/scscf` (#14 PR F).
+
