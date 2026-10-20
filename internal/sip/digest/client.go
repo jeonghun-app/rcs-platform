@@ -36,19 +36,25 @@ type ClientParams struct {
 // Respond computes the credentials that answer ch for p (RFC 7616 §3.4.1).
 // It fails for algorithms and qop values this package does not implement,
 // leaving the caller to try another challenge.
+//
+// An AKAv1-MD5 challenge without qop is answered in the form without qop,
+// KD(HA1, nonce:H(method:uri)) with no cnonce or nonce-count (RFC 3310
+// §3.3, RFC 2617 §3.2.2.1): TS 24.229 §5.4.1.2.1A does not have the S-CSCF
+// send qop. Every other challenge must offer qop=auth.
 func Respond(ch Challenge, p ClientParams) (Credentials, error) {
 	alg := ch.Algorithm
 	if alg == "" {
 		alg = MD5
 	}
+	noQOP := alg == AKAv1MD5 && len(ch.QOP) == 0
 	switch {
 	case !alg.supported():
 		return Credentials{}, ErrUnsupportedAlgorithm
-	case !ch.offersAuth():
+	case !ch.offersAuth() && !noQOP:
 		return Credentials{}, ErrUnsupportedQOP
-	case p.NC == 0:
+	case p.NC == 0 && !noQOP:
 		return Credentials{}, errors.New("digest: nonce count starts at 1")
-	case p.CNonce == "":
+	case p.CNonce == "" && !noQOP:
 		return Credentials{}, errors.New("digest: cnonce is required with qop=auth")
 	case len(p.AUTS) > 0 && alg != AKAv1MD5:
 		return Credentials{}, errors.New("digest: auts is only defined for Digest AKA")
@@ -65,6 +71,18 @@ func Respond(ch Challenge, p ClientParams) (Credentials, error) {
 		password = nil
 	}
 	h := ha1(alg, p.Username, ch.Realm, password)
+	if noQOP {
+		return Credentials{
+			Username:  p.Username,
+			Realm:     ch.Realm,
+			Nonce:     ch.Nonce,
+			URI:       p.URI,
+			Response:  alg.h([]byte(h), []byte(ch.Nonce), []byte(alg.h([]byte(p.Method), []byte(p.URI)))),
+			Algorithm: alg,
+			Opaque:    ch.Opaque,
+			AUTS:      append([]byte(nil), p.AUTS...),
+		}, nil
+	}
 	return Credentials{
 		Username:  p.Username,
 		Realm:     ch.Realm,

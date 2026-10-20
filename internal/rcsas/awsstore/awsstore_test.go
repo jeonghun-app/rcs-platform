@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
@@ -61,7 +62,7 @@ func TestEveryOperationReportsAFailedRequest(t *testing.T) {
 		"Expired":        func() error { _, _, err := s.Expired(ctx, t0, "", 1); return err },
 		"RecordSent":     func() error { return s.RecordSent(ctx, store.Sent{Sender: "s", MessageID: "m"}, t0) },
 		"Sent":           func() error { _, err := s.Sent(ctx, "s", "m", t0); return err },
-		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "t", t0) },
+		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "displayed", "t", t0) },
 		"UnmarkNotified": func() error { return s.UnmarkNotified(ctx, "s", "m", "k", "t") },
 	} {
 		if err := op(); err == nil || !strings.Contains(err.Error(), "ProvisionedThroughputExceededException") {
@@ -206,7 +207,7 @@ func TestARepeatedWriteThatTookEffectIsNotAConflict(t *testing.T) {
 	if err := s.RecordSent(ctx, r, t0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkNotified(ctx, "s", "m", "k", "t1", t0); err != nil {
+	if err := s.MarkNotified(ctx, "s", "m", "k", "displayed", "t1", t0); err != nil {
 		t.Fatalf("MarkNotified = %v", err)
 	}
 }
@@ -326,6 +327,47 @@ func TestADriftedGroupNotificationTotalIsCorrected(t *testing.T) {
 	}
 }
 
+// A recount tells summaries from group notifications: neither total
+// counts the other's items.
+func TestARecountCountsSummariesApartFromNotifications(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 10, SenderCount: 10, GroupCount: 2, SummaryCount: 2}
+	notice := func(id string) store.Message {
+		return store.Message{Recipient: "r", ID: id, Sender: "sip:g" + id, Author: "sip:p@example.net", Mode: store.Group, Notification: true,
+			CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	summary := func(id string) store.Message {
+		return store.Message{Recipient: "r", ID: "r-" + id, Sender: "sip:g" + id, Mode: store.Group, Notification: true, Summary: true,
+			MessageID: id, Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	for _, m := range []store.Message{notice("1"), notice("2"), summary("1"), summary("2")} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	total := func(name string) int64 {
+		return nOf(f.rows["c#1#r\x00s#"+fmt.Sprint(len(name))+"#"+name][attrCount])
+	}
+	delete(f.rows, "q#1#r\x001") // the TTL took notice 1
+	if err := s.Enqueue(ctx, notice("3"), l); err != nil {
+		t.Fatalf("a notification after drift = %v", err)
+	}
+	if n, sums := total(store.GroupNotifications), total(store.GroupSummaries); n != 2 || sums != 2 {
+		t.Fatalf("totals after the notifications' recount: %d notifications, %d summaries", n, sums)
+	}
+	delete(f.rows, "q#1#r\x00r-1") // and summary 1
+	later := summary("3")
+	later.Enqueued = t0.Add(RecountInterval) // the queue may be counted again
+	if err := s.Enqueue(ctx, later, l); err != nil {
+		t.Fatalf("a summary after drift = %v", err)
+	}
+	if n, sums := total(store.GroupNotifications), total(store.GroupSummaries); n != 2 || sums != 2 {
+		t.Fatalf("totals after the summaries' recount: %d notifications, %d summaries", n, sums)
+	}
+}
+
 // A count reads the whole partition: a queue refused again and again is
 // counted at most once per RecountInterval, by whichever task wins.
 func TestAFullQueueIsRecountedAtMostOncePerInterval(t *testing.T) {
@@ -383,5 +425,98 @@ func TestARemovalLeavesTheQueueSizeTTLAlone(t *testing.T) {
 		if got := nOf(f.rows[k][attrTTL]); got != want {
 			t.Errorf("%q ttl %d, want %d", k, got, want)
 		}
+	}
+}
+
+// conflicting refuses its first updates conditional writes and its first
+// transactions transactions as DynamoDB does one that meets a transaction
+// in progress on the same item: an UpdateItem with
+// TransactionConflictException, a transaction cancelled for a
+// TransactionConflict. The SDK retries neither.
+type conflicting struct {
+	*fakeDynamo
+	updates, transactions int
+}
+
+func (c *conflicting) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if c.updates > 0 {
+		c.updates--
+		return nil, &dtypes.TransactionConflictException{Message: aws.String("Transaction is ongoing for the item")}
+	}
+	return c.fakeDynamo.UpdateItem(ctx, in, o...)
+}
+
+func (c *conflicting) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if c.transactions > 0 {
+		c.transactions--
+		reasons := make([]dtypes.CancellationReason, len(in.TransactItems))
+		for i := range reasons {
+			reasons[i] = dtypes.CancellationReason{Code: aws.String("None")}
+		}
+		reasons[len(reasons)-1].Code = aws.String("TransactionConflict")
+		return nil, &dtypes.TransactionCanceledException{Message: aws.String("Transaction cancelled"), CancellationReasons: reasons}
+	}
+	return c.fakeDynamo.TransactWriteItems(ctx, in, o...)
+}
+
+// A group's sent record is in a summary's removal, a transaction, and in
+// every notifier's mark, a single update: one that meets the other is
+// tried again, and past conflictAttempts reported as busy, with nothing
+// written.
+func TestAWriteThatMeetsATransactionIsTriedAgain(t *testing.T) {
+	c := &conflicting{fakeDynamo: newFakeDynamo(t)}
+	s := NewWithClient("messages", c)
+	ctx := context.Background()
+	const group = "sip:chat-1@conf.example.net"
+	r := store.Sent{Sender: group, MessageID: "g-1", Author: "sip:a@example.net", Recipients: []string{"sip:b@example.net", "sip:c@example.net"},
+		Expires: t0.Add(time.Hour)}
+	if err := s.RecordSent(ctx, r, t0); err != nil {
+		t.Fatal(err)
+	}
+	marks := func() int64 {
+		t.Helper()
+		got, err := s.Sent(ctx, group, "g-1", t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.MarkCount
+	}
+	c.updates = conflictAttempts - 1
+	if err := s.MarkNotified(ctx, group, "g-1", "display-notification sip:b@example.net", "displayed", "t1", t0); err != nil || c.updates != 0 {
+		t.Fatalf("MarkNotified after %d conflicts = %v", conflictAttempts-1, err)
+	}
+	c.updates = conflictAttempts
+	if err := s.MarkNotified(ctx, group, "g-1", "display-notification sip:c@example.net", "displayed", "t2", t0); !errors.Is(err, store.ErrBusy) || c.updates != 0 {
+		t.Fatalf("MarkNotified after %d conflicts = %v, %d left", conflictAttempts, err, c.updates)
+	}
+	if got := marks(); got != 1 {
+		t.Fatalf("%d marks", got)
+	}
+	sum := store.Message{Recipient: r.Author, ID: "r-g-1", Sender: group, Mode: store.Group, Notification: true, Summary: true,
+		MessageID: "g-1", Enqueued: t0, Expires: t0.Add(time.Hour)}
+	if err := s.Enqueue(ctx, sum, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := s.Claim(ctx, r.Author, sum.ID, "task-a", t0, t0.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.transactions = conflictAttempts
+	if err := s.RemoveSummary(ctx, held, "task-a", 1); !errors.Is(err, store.ErrBusy) || c.transactions != 0 {
+		t.Fatalf("RemoveSummary after %d conflicts = %v, %d left", conflictAttempts, err, c.transactions)
+	}
+	queued := func() bool { _, ok := c.rows[rowKey(key(identityKey(queuePrefix, r.Author), sum.ID))]; return ok }
+	if !queued() {
+		t.Fatal("a busy removal removed the summary")
+	}
+	c.transactions = conflictAttempts - 1
+	if err := s.RemoveSummary(ctx, held, "task-a", 1); err != nil || c.transactions != 0 {
+		t.Fatalf("RemoveSummary after %d conflicts = %v", conflictAttempts-1, err)
+	}
+	if queued() {
+		t.Fatal("the summary is still queued")
+	}
+	if got := nOf(c.rows[rowKey(senderSizeKey(r.Author, store.GroupSummaries))][attrCount]); got != 0 {
+		t.Fatalf("summaries' total after the removal = %d", got)
 	}
 }

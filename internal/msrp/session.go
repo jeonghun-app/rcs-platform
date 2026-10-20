@@ -138,6 +138,8 @@ type Session struct {
 	expiry     Timer
 	peer       *Session
 	edge       bool // the client side of a bridge
+	// keepAliveOut is set while a keep-alive waits for its answer.
+	keepAliveOut bool
 	// events feeds the handler's goroutine; nil for a bridged session.
 	events chan event
 	// reports wait for HandleReport, on a goroutine of their own. Those
@@ -347,7 +349,12 @@ func (s *Session) attach(c *Conn) error {
 		s.closeWith(err)
 		return err
 	}
-	s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	// An active session's binding SEND is its traffic until it is
+	// answered, so Open starts the keep-alives then. Sent before, each
+	// would name a session the peer has not accepted yet (#204).
+	if c.passive {
+		s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	}
 	if flush {
 		s.flushHeld(c)
 	}
@@ -556,13 +563,21 @@ func (s *Session) armKeepAlive(c *Conn, after time.Duration) {
 // keepAliveDue sends a bodiless SEND if the session has been quiet for a
 // whole interval (ADR 0003). An unanswered one means the path is dead, so
 // the connection is closed; a refusal such as 481 ends just this session.
+// One keep-alive at a time: while one waits for its answer, the next is
+// skipped (#218).
 func (s *Session) keepAliveDue(c *Conn) {
 	interval := c.cfg.KeepAliveInterval
 	s.mu.Lock()
-	closed := s.closed
+	closed, out := s.closed, s.keepAliveOut
 	idle := c.cfg.Clock.Now().Sub(s.lastActive)
 	s.mu.Unlock()
 	if closed {
+		return
+	}
+	if out {
+		// The one in flight ends at its answer, or at its
+		// TransactionTimeout, which closes the connection.
+		s.armKeepAlive(c, interval)
 		return
 	}
 	select {
@@ -576,7 +591,13 @@ func (s *Session) keepAliveDue(c *Conn) {
 		s.armKeepAlive(c, interval-idle)
 		return
 	}
+	s.mu.Lock()
+	s.keepAliveOut = true
+	s.mu.Unlock()
 	err := s.sendEmpty(context.Background(), c, func(code int, comment string) {
+		s.mu.Lock()
+		s.keepAliveOut = false
+		s.mu.Unlock()
 		switch code {
 		case StatusOK:
 		case StatusRequestTimeout:
@@ -586,6 +607,17 @@ func (s *Session) keepAliveDue(c *Conn) {
 		}
 	})
 	if err != nil {
+		s.mu.Lock()
+		s.keepAliveOut = false
+		s.mu.Unlock()
+		if c.isClosed() {
+			return
+		}
+		// Not sent while the connection is up: its ids could not be made
+		// (the random source failed). Said, and tried again at the next
+		// interval, rather than leave the session without keep-alives.
+		c.emit(Event{Kind: EventDropped, Method: MethodSend, Err: ErrKeepAliveNotSent})
+		s.armKeepAlive(c, interval)
 		return
 	}
 	s.armKeepAlive(c, interval)

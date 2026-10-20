@@ -363,12 +363,11 @@ func TestAnAuthorHoldsOneShareOfAQueueInGroupsAnd1To1(t *testing.T) {
 		_ = r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, fmt.Sprint("g", i), "in the group", 0)))
 		_ = r.e.Submit(t.Context(), standalone(alice, bob, chat(t, fmt.Sprint("d", i), "directly", 0)))
 	}
-	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ms) != 10 {
-		t.Fatalf("alice holds %d of bob's queue, one share is 10", len(ms))
+	// Every item counts, claimed or not: the engine keeps trying bob's
+	// standalone messages, and one it holds at this moment is not Pending
+	// (#207).
+	if n := r.store.(*store.Memory).Len(bob); n != 10 {
+		t.Fatalf("alice holds %d of bob's queue, one share is 10", n)
 	}
 	if r.m.get("group.fanout.queue_full") == 0 || r.m.get("message.rejected.queue_share_full") == 0 {
 		t.Fatalf("metrics %v", r.m)
@@ -410,11 +409,12 @@ func TestReceiptsFromALargeGroupDoNotFillTheAuthorsQueue(t *testing.T) {
 		}
 	}
 	share := queueLimit(r.e.cfg).SenderCount
-	if got := r.store.(*store.Memory).Len(alice); got != share {
-		t.Fatalf("%d receipts queued for alice, one share is %d", got, share)
+	// The rest are summarized: one summary per message (#166).
+	if notes, sums := queuedReceipts(t, r, alice); notes != share || sums != 6 {
+		t.Fatalf("%d receipts and %d summaries queued for alice, one share is %d", notes, sums, share)
 	}
-	if got := r.m.get("group.notification.dropped"); got != 99*12-int64(share) {
-		t.Fatalf("dropped %d; metrics %v", got, r.m)
+	if got := r.m.get("group.notification.summarized"); got != 99*12-int64(share) || r.m.get("group.notification.dropped") != 0 {
+		t.Fatalf("summarized %d; metrics %v", got, r.m)
 	}
 	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
 		t.Fatalf("a 1-to-1 message to alice: %v", err)
