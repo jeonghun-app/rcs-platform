@@ -74,7 +74,7 @@ func TestMemoryForgetsExpiredChallengesNobodyTook(t *testing.T) {
 	}
 }
 
-func TestAProfileIsKeptAgainOnceTheNewExpiryPassesItsMargin(t *testing.T) {
+func TestAProfileOrIdentityIsKeptAgainOnceTheNewExpiryPassesItsMargin(t *testing.T) {
 	p := &state.Profile{KeepUntil: statetest.T0.Add(state.ProfileGrace)}
 	for _, tc := range []struct {
 		lastExpiry time.Time
@@ -89,6 +89,9 @@ func TestAProfileIsKeptAgainOnceTheNewExpiryPassesItsMargin(t *testing.T) {
 	} {
 		if got := p.KeepDue(tc.lastExpiry); got != tc.want {
 			t.Errorf("KeepDue(KeepUntil - %v) = %v, want %v", p.KeepUntil.Sub(tc.lastExpiry), got, tc.want)
+		}
+		if got := (&state.Identity{KeepUntil: p.KeepUntil}).KeepDue(tc.lastExpiry); got != tc.want {
+			t.Errorf("identity KeepDue(KeepUntil - %v) = %v, want %v", p.KeepUntil.Sub(tc.lastExpiry), got, tc.want)
 		}
 	}
 }

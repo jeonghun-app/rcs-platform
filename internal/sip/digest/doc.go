@@ -43,11 +43,14 @@
 // qop=auth-int, the -sess algorithms, SHA-512-256 and the RFC 2069 form
 // without qop are rejected: every challenge this package issues asks for
 // qop=auth (RFC 8760 §2.6 makes qop mandatory for SIP), and nonce-count replay
-// protection needs it. Other parameters are ignored, as RFC 7616 §3.3 and
-// §3.4 require of unknown ones: userhash is not implemented, so a hashed
-// username simply fails to verify, and the security agreement parameters (ck,
-// ik, integrity-protected, which P-CSCF adds per TS 24.229 §5.2.2) are left
-// to that feature.
+// protection needs it. The one exception is on the client side: Respond
+// answers an AKAv1-MD5 challenge that offers no qop in that form, since TS
+// 24.229 §5.4.1.2.1A does not have an S-CSCF send qop. The server side still
+// refuses that form. Other parameters are ignored, as RFC 7616 §3.3 and §3.4
+// require of unknown ones: userhash is not implemented, so a hashed username
+// simply fails to verify, and the security agreement parameters (ck, ik,
+// integrity-protected, which P-CSCF adds per TS 24.229 §5.2.2) are left to
+// that feature.
 //
 // Passwords, HA1 values, RES and the nonce key are secrets: no error carries
 // one and every type that holds one formats as a redacted placeholder.

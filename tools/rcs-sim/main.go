@@ -11,8 +11,9 @@
 //
 // Each step prints one JSON line to standard output. The exit status is 0
 // when every step succeeded, 1 when one failed, and 2 for a usage error.
-// Secrets come only from the environment: RCS_SIM_FT_PASSWORD and
-// RCS_SIM_RELAY_TOKEN. Neither is ever printed, and neither are session ids.
+// Secrets come only from the environment: RCS_SIM_FT_PASSWORD,
+// RCS_SIM_RELAY_TOKEN, and for SIP RCS_SIM_AKA_K and RCS_SIM_AKA_OPC or
+// RCS_SIM_SIP_PASSWORD. None is ever printed, and neither are session ids.
 // docs/rcs-sim.md has the details.
 package main
 
@@ -27,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/buildinfo"
@@ -74,6 +76,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		ftUser        = fs.String("ft-user", envOr(lookup, "RCS_SIM_FT_USER", ""), "FT user name (ftHTTPCSUser); also RCS_SIM_FT_USER")
 		fileSize      = fs.Int("file-size", 256<<10, "size of the file the ft scenario sends")
 		resumeSize    = fs.Int("resume-size", 12<<20, "size of the file ft-resume sends; must exceed FT_PART_SIZE")
+		uploadSettle  = fs.Duration("upload-settle", 3*time.Second, "how long ft-resume asks get_upload_info again for a broken upload to show")
 		control       = fs.String("relay-control", "", "msrp-relay control API base URL")
 		coreListen    = fs.String("core-listen", "127.0.0.1:0", "where the rcs-as stand-in listens")
 		coreAdvertise = fs.String("core-advertise", "", "host the relay connects to for the stand-in (default: the listener's)")
@@ -82,7 +85,16 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		self          = fs.String("self", defaultSelf, "the simulated client's address")
 		peer          = fs.String("peer", defaultPeer, "the far end's address")
 		stepTimeout   = fs.Duration("step-timeout", 30*time.Second, "bound on each step")
+		sf            sipFlags
 	)
+	fs.StringVar(&sf.proxy, "sip-proxy", "", "pcscf's host:port; enables the SIP client")
+	fs.StringVar(&sf.transport, "sip-transport", "tcp", "tcp or tls, to pcscf")
+	fs.StringVar(&sf.serverName, "sip-server-name", "", "name pcscf's certificate is verified for (default: -sip-proxy's host)")
+	fs.StringVar(&sf.domain, "sip-domain", "", "home network domain, REGISTER's Request-URI (default: -self's host)")
+	fs.StringVar(&sf.realm, "sip-realm", "", "the S-CSCF's Digest realm, the only one answered (default: -sip-domain)")
+	fs.StringVar(&sf.impi, "sip-impi", "", "private user identity (default: "+envIMPI+")")
+	fs.StringVar(&sf.auth, "sip-auth", "aka", "aka (RCS_SIM_AKA_K, RCS_SIM_AKA_OPC) or digest (RCS_SIM_SIP_PASSWORD)")
+	fs.StringVar(&sf.instance, "sip-instance", "", "+sip.instance URN (default: a new urn:uuid)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -113,6 +125,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	cfg := scenario.Config{
 		FileSize:      *fileSize,
 		ResumeSize:    *resumeSize,
+		UploadSettle:  *uploadSettle,
 		CoreListen:    *coreListen,
 		CoreAdvertise: *coreAdvertise,
 		MSRP:          msrp.Config{KeepAliveInterval: *keepAlive},
@@ -128,6 +141,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	}
 	if *fileSize < 1 || *resumeSize < 1 {
 		return usage("-file-size and -resume-size must be positive")
+	}
+	if *uploadSettle <= 0 {
+		return usage("-upload-settle must be positive")
 	}
 	if *idleWait > 0 && *stepTimeout <= *idleWait {
 		return usage("-step-timeout must be longer than -idle-wait: the keep-alive step waits -idle-wait within it")
@@ -153,6 +169,25 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 			return usage("the relay control API needs RCS_SIM_RELAY_TOKEN")
 		}
 		cfg.Control = &anchor.Control{HTTP: httpClient, URL: u, Token: anchor.NewToken(token)}
+	}
+
+	if sf.proxy == "" {
+		// The other -sip-* flags mean nothing without it; better said
+		// than ignored.
+		var stray string
+		fs.Visit(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Name, "sip-") && stray == "" {
+				stray = f.Name
+			}
+		})
+		if stray != "" {
+			return usage("-" + stray + " needs -sip-proxy")
+		}
+	}
+	if sf.proxy != "" {
+		if cfg.SIP, err = sipConfig(ctx, sf, *self, lookup); err != nil {
+			return usage(err.Error())
+		}
 	}
 
 	enc := json.NewEncoder(stdout)

@@ -32,6 +32,9 @@ var (
 	// ErrExhausted means a subscription's NOTIFY counters have reached their
 	// limit; the subscription must be ended.
 	ErrExhausted = errors.New("state: NOTIFY counters exhausted")
+	// ErrContended means a write lost to other writers on every attempt; the
+	// caller may try again later. It is not ErrConflict, which says what won.
+	ErrContended = errors.New("state: changed by others on every attempt")
 )
 
 // Limits on what one item holds. Both backends apply them the same way, so a
@@ -131,11 +134,21 @@ type Registration struct {
 	// a registration, with contacts and Unregistered zero; at Unregistered a
 	// sweep claims it as it claims a registration whose last contact expired.
 	Unregistered time.Time
+	// Reassert is set on a live registration whose assignment the HSS may
+	// have lost: a deregistration's SAR crossed a REGISTER's, and telling the
+	// HSS again (SAR REGISTRATION) failed. It is when a sweep tries again;
+	// ReassertAttempts counts the failures, so that the sweep backs off and
+	// gives up.
+	Reassert         time.Time
+	ReassertAttempts int
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). It is opaque: a new item
 	// starts at a random value (FirstVersion).
 	Version int64
 }
+
+// MaxReassertAttempts bounds Registration.ReassertAttempts.
+const MaxReassertAttempts = 16
 
 // SetIdentity is one public identity of an implicit registration set.
 type SetIdentity struct {
@@ -147,7 +160,11 @@ type SetIdentity struct {
 
 // Identity is what one public identity names: the implicit registration set
 // it belongs to. It is written when the S-CSCF is assigned the set (SAR) or
-// the set changes (PPR), and deleted with the set, never by a re-registration.
+// the set changes (PPR), and deleted with the set, before its record, so that
+// a deregistration cut short is done again by a sweep; never by a
+// re-registration. An IMPU names one set: an IMPU shared by several private
+// identities (TS 23.228 §4.3.3.4) is out of scope: the last set saved for it
+// takes it.
 type Identity struct {
 	// IMPU is the public identity in canonical form.
 	IMPU string
@@ -155,6 +172,11 @@ type Identity struct {
 	Set         SetKey
 	Incarnation int64
 	Barred      bool
+	// KeepUntil is the safety net Profile.KeepUntil is, for an identity a
+	// failed deregistration left: from then on it is not found, and DynamoDB
+	// removes it (TTL). The S-CSCF sets and extends it with the set's
+	// profile. Backends keep it to the second.
+	KeepUntil time.Time
 	// Version is as for Registration.
 	Version int64
 }
@@ -169,6 +191,9 @@ func (i *Identity) Validate() error {
 	}
 	if i.Incarnation == 0 {
 		return fmt.Errorf("%w: an identity names its set's incarnation", ErrInvalid)
+	}
+	if !validTime(i.KeepUntil) {
+		return fmt.Errorf("%w: an identity needs a KeepUntil", ErrInvalid)
 	}
 	return nil
 }
@@ -222,17 +247,26 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or, without contacts, when its deregistration may be
-// retried, or else when its unregistered state ends. A registration with none
-// of these is due at once.
+// contact expiry, or a due Reassert if earlier, or, without contacts, when its
+// deregistration may be retried, or else when its unregistered state ends. A
+// registration with none of these is due at once.
 func (r *Registration) SweepAt() time.Time {
 	switch {
 	case len(r.Contacts) > 0:
-		return r.NextExpiry()
+		if next := r.NextExpiry(); r.Reassert.IsZero() || next.Before(r.Reassert) {
+			return next
+		}
+		return r.Reassert
 	case !r.Deregistering.IsZero():
 		return r.Deregistering
 	}
 	return r.Unregistered
+}
+
+// ReassertDue reports whether a sweep at now should tell the HSS again that
+// this S-CSCF serves r's set (Reassert).
+func (r *Registration) ReassertDue(now time.Time) bool {
+	return !r.Reassert.IsZero() && !r.Reassert.After(now)
 }
 
 // Prune removes the contacts that have expired at now and returns them.
@@ -291,6 +325,9 @@ func (r *Registration) Validate() error {
 	if !r.Deregistering.IsZero() && !validTime(r.Deregistering) {
 		return fmt.Errorf("%w: Deregistering out of range", ErrInvalid)
 	}
+	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
+		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)
+	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
 	}
@@ -348,12 +385,16 @@ type Registrations interface {
 	// DeleteRegistration deletes r if its version is still the stored one
 	// (ErrConflict otherwise, ErrNotFound if gone).
 	DeleteRegistration(ctx context.Context, r *Registration) error
-	// Identity returns what a canonical IMPU names.
-	Identity(ctx context.Context, impu string) (*Identity, error)
+	// Identity returns what a canonical IMPU names, ErrNotFound if nothing
+	// or its KeepUntil has come at now.
+	Identity(ctx context.Context, impu string, now time.Time) (*Identity, error)
 	// SaveIdentity and DeleteIdentity are as SaveRegistration and
 	// DeleteRegistration, for an identity.
 	SaveIdentity(ctx context.Context, i *Identity) (*Identity, error)
 	DeleteIdentity(ctx context.Context, i *Identity) error
+	// KeepIdentity is KeepProfile for an identity: it moves KeepUntil to
+	// until if later, and leaves the version alone.
+	KeepIdentity(ctx context.Context, impu string, until, now time.Time) error
 	// ExpiringRegistrations returns up to limit registrations whose SweepAt
 	// has come at now, for SweepRegistrations.
 	ExpiringRegistrations(ctx context.Context, now time.Time, limit int) ([]*Registration, error)
@@ -376,8 +417,11 @@ type Profiles interface {
 	Profile(ctx context.Context, k SetKey, now time.Time) (*Profile, error)
 	// SaveProfile stores p. A profile received earlier than the one stored
 	// for its key is not stored (ErrConflict): an SAA that took longer to
-	// arrive must not undo the PPR that followed it. Saving the same one
-	// again succeeds. Other sets of the same IMPI are not touched.
+	// arrive must not undo the PPR that followed it; its KeepUntil still
+	// counts, the stored one moving to it if later. A save never brings
+	// KeepUntil closer, which a registration may have just extended.
+	// Saving the same one again succeeds. Other sets of the same IMPI are not
+	// touched. ErrContended means the profile kept changing under it.
 	SaveProfile(ctx context.Context, p *Profile) error
 	// KeepProfile moves the KeepUntil of k's profile to until, if that is
 	// later; it never brings it closer. It returns ErrNotFound if Profile
@@ -450,7 +494,17 @@ type Profile struct {
 // past lastExpiry. Measured from the expiry rather than the time left, a
 // registration longer than ProfileGrace still extends it before it runs out.
 func (p *Profile) KeepDue(lastExpiry time.Time) bool {
-	return p.KeepUntil.Sub(lastExpiry) < ProfileGrace-ProfileKeepMargin
+	return keepDue(p.KeepUntil, lastExpiry)
+}
+
+// KeepDue is Profile.KeepDue for an identity, with KeepIdentity. Each has its
+// own: a PPR or a refused save may move the profile's alone.
+func (i *Identity) KeepDue(lastExpiry time.Time) bool {
+	return keepDue(i.KeepUntil, lastExpiry)
+}
+
+func keepDue(keepUntil, lastExpiry time.Time) bool {
+	return keepUntil.Sub(lastExpiry) < ProfileGrace-ProfileKeepMargin
 }
 
 // Clone returns a copy of p that shares no memory with it.

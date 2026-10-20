@@ -168,6 +168,69 @@ func TestAKeepProfileThatRacesASaveStillExtendsTheProfile(t *testing.T) {
 	}
 }
 
+// TestASaveProfileReadsAgainWhenAKeepProfileLandsBeforeItsPut: another
+// instance's KeepProfile between SaveProfile's read and its put fails the
+// put's condition. A PPR's save that gave up there would read as "a newer
+// profile is stored" to the registrar, which drops it, so the save reads again
+// and puts, keeping the later KeepUntil; only a set changed under every one of
+// its attempts reports ErrContended (#184 QA).
+func TestASaveProfileReadsAgainWhenAKeepProfileLandsBeforeItsPut(t *testing.T) {
+	for _, tc := range []struct {
+		raced int
+		want  error
+	}{
+		{0, nil},
+		{1, nil},
+		{saveProfileAttempts - 1, nil},
+		{saveProfileAttempts, state.ErrContended},
+	} {
+		f := newFake(t)
+		d := newTestStore(t, f)
+		p := statetest.Profile(statetest.Set1, []byte("old"), statetest.T0)
+		p.KeepUntil = statetest.T0.Add(time.Hour)
+		if err := d.SaveProfile(bg(), p); err != nil {
+			t.Fatal(err)
+		}
+		gets, raced, inside := 0, 0, false
+		f.afterGet = func() {
+			if inside {
+				return
+			}
+			gets++
+			if raced == tc.raced {
+				return
+			}
+			raced++
+			inside = true
+			defer func() { inside = false }()
+			if err := d.KeepProfile(bg(), statetest.Set1, statetest.T0.Add(time.Duration(raced+1)*time.Hour), statetest.T0); err != nil {
+				t.Error(err)
+			}
+		}
+		ppr := statetest.Profile(statetest.Set1, []byte("ppr"), statetest.T0.Add(time.Second))
+		ppr.KeepUntil = statetest.T0.Add(30 * time.Minute)
+		err := d.SaveProfile(bg(), ppr)
+		f.afterGet = nil
+		if !errors.Is(err, tc.want) || (tc.want == nil) != (err == nil) {
+			t.Fatalf("raced %d times: %v, want %v", tc.raced, err, tc.want)
+		}
+		if gets != min(tc.raced+1, saveProfileAttempts) {
+			t.Errorf("raced %d times: read %d times", tc.raced, gets)
+		}
+		got, err := d.Profile(bg(), statetest.Set1, statetest.T0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantData, wantKeep := "ppr", statetest.T0.Add(time.Duration(tc.raced+1)*time.Hour)
+		if tc.want != nil {
+			wantData = "old"
+		}
+		if string(got.UserData) != wantData || !got.KeepUntil.Equal(wantKeep) {
+			t.Errorf("raced %d times: %q kept until %v, want %q kept until %v", tc.raced, got.UserData, got.KeepUntil, wantData, wantKeep)
+		}
+	}
+}
+
 // TestOnlyProfilesCarryTheTTLAttribute: DynamoDB deletes items by the table's
 // TTL attribute, ttl, in Unix seconds. A profile has it, so one a failed
 // deregistration left behind goes; a registration, unregistered or not, must

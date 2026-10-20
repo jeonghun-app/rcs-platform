@@ -97,6 +97,9 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"ARegisterTurnsAnUnregisteredRecordIntoARegistration", testRegisterEndsUnregistered},
 		{"AFailedEndOfAnUnregisteredStateIsRetriedAfterTheLease", testUnregisteredRetry},
 		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
+		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
+		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
+		{"ADeregistrationCutShortIsFinishedByTheNextSweep", testInterruptedDeregistration},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
