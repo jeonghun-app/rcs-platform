@@ -807,6 +807,15 @@ func (c *meteredConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite half-closes the connection, which internal/msrp does to
+// deliver the answers it owes before it closes (#219).
+func (c *meteredConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
+}
+
 func (c *meteredConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	c.out.Add(int64(n))

@@ -711,6 +711,41 @@ func TestRequestsForUnknownSessionsEndTheConnectionAtTheLimit(t *testing.T) {
 	})
 }
 
+// A client that pipelines requests for unknown sessions past the limit
+// reads the 481s the relay owed it before an end of stream, not a reset,
+// though the relay had not read everything it sent (#219, from QA on
+// #217).
+func TestAClientOverTheUnknownSessionLimitStillReadsItsAnswers(t *testing.T) {
+	r := newRig(t, 1, func(o *relayOptions) { o.Edge.MaxFailedBinds = 2 })
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+	var reqs strings.Builder
+	for _, tid := range []string{"gues1", "gues2", "gues3", "gues4", "gues5", "gues6"} {
+		reqs.WriteString("MSRP " + tid + " SEND\r\nTo-Path: msrps://" + publicHost + ":2856/gu3ss" + tid + ";tcp\r\n" +
+			"From-Path: " + clientURI + "\r\nMessage-ID: " + tid + "\r\n-------" + tid + "$\r\n")
+	}
+	if _, err := nc.Write([]byte(reqs.String())); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, err := io.ReadAll(nc)
+	if err != nil {
+		t.Fatalf("after %q: %v, want the end of the stream", got, err)
+	}
+	for _, tid := range []string{"gues1", "gues2"} {
+		if !strings.Contains(string(got), "MSRP "+tid+" 481") {
+			t.Errorf("no 481 for %s in %q", tid, got)
+		}
+	}
+	_ = nc.(*net.TCPConn).CloseWrite()
+	eventually(t, "the close to be counted", func() bool {
+		return r.metrics.count(mClientPrefix+"Closed.TooManyUnknownSessions") == 1
+	})
+}
+
 func TestIdleClientConnectionIsClosed(t *testing.T) {
 	r := newRig(t, 1, func(o *relayOptions) { o.IdleTimeout = 20 * time.Millisecond })
 	c := r.dial(0, nil)
@@ -792,5 +827,43 @@ func TestServeReportsAListenerClosedUnderIt(t *testing.T) {
 	_ = ln.Close()
 	if err := <-served; !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Serve = %v, want net.ErrClosed", err)
+	}
+}
+
+// A client connection passes a half-close through, which internal/msrp
+// uses to deliver the answers it owes before closing (#219), and says so
+// when the connection underneath cannot.
+func TestAClientConnectionHalfClosesWhenItsSocketCan(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		nc, err := l.Accept()
+		if err == nil {
+			accepted <- nc
+		}
+	}()
+	peer, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	nc := <-accepted
+	t.Cleanup(func() { _ = nc.Close() })
+	mc := &meteredConn{Conn: nc, in: &atomic.Int64{}, out: &atomic.Int64{}}
+	if err := mc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite = %v", err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := peer.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("the peer read %d, %v, want the end of the stream", n, err)
+	}
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	if err := (&meteredConn{Conn: a}).CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CloseWrite on a pipe = %v", err)
 	}
 }
