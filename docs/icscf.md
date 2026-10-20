@@ -19,11 +19,15 @@ the mapping of every HSS answer to a SIP response with its clause;
 - **A request with a Route left, or inside a dialog**: forwarded where it
   says, without the HSS. `icscf` inserts no Record-Route, so dialogs do not
   pass it.
-- **When the HSS cannot be asked**: 480 with `Retry-After`
-  (`ICSCF_RETRY_AFTER`). When the S-CSCF cannot be reached: 503 with the same
-  `Retry-After`.
+- **When the HSS cannot be asked**, or answers that it could not do it
+  (`DIAMETER_UNABLE_TO_COMPLY`, a store failure): 480 with `Retry-After`
+  (`ICSCF_RETRY_AFTER`). When the S-CSCF cannot be reached: 500 with the same
+  `Retry-After`, which the originating S-CSCF passes on (a 503 it would turn
+  into a 500 without one).
+- **An ACK without a To tag**: dropped.
 
-The S-CSCF is the one the HSS names, or else the first in `ICSCF_SCSCF` that
+The S-CSCF is the one the HSS names (as Server-Name, or first among the names
+in its capabilities, TS 29.228 §6.7), or else the first in `ICSCF_SCSCF` that
 has every mandatory capability the HSS asks for, the one with the most
 optional ones first. With none, a REGISTER is answered 600 and a request for
 a user 480, counted as `icscf.scscf.no_capable`: a provisioning problem to
@@ -54,6 +58,23 @@ required.
 | `ICSCF_HSS_DISCOVERY` | `cloudmap` | how the HSS tasks are found: `cloudmap` (DiscoverInstances, every task) or `dns` (`hss.<namespace>`, at most eight tasks; refused in staging and prod) |
 | `ICSCF_HSS_HOST_PATTERN` | `hss-*.<namespace>` | the Origin-Host every HSS task must have; a peer that claims another gets no request |
 | `ICSCF_CX_TIMEOUT` | `5s` | one Cx attempt; a failed or busy one is retried once on another HSS task |
+
+## Metrics
+
+Counters, by the names `internal/icscf`'s package documentation lists:
+
+| Counter | Counts |
+|---|---|
+| `icscf.<kind>.forwarded` | requests forwarded; `kind` is `register`, `terminating`, or `routed` (a Route left, or inside a dialog) |
+| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 600) |
+| `icscf.<kind>.cancelled` | requests cancelled while the HSS was asked |
+| `icscf.hss.unavailable` | HSS queries that could not be completed; alarm on a rise |
+| `icscf.hss.bad_server_name` | HSS answers naming an S-CSCF that is not a SIP URI |
+| `icscf.scscf.no_capable` | answers no configured S-CSCF can take: a provisioning problem; alarm on any |
+| `icscf.scscf.unreachable` | terminating requests answered 500 because the S-CSCF could not be reached |
+| `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
+
+`cxclient.*` counts the Cx answers by result code and their latency.
 
 ## Health
 

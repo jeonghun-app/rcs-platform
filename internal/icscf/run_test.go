@@ -403,3 +403,40 @@ func TestAPeerThatIsNotAnHSSTaskIsNotAsked(t *testing.T) {
 		t.Errorf("/readyz = %d with only an impostor, want 503", code)
 	}
 }
+
+// Review of #274, for this PR: a Route naming icscf by its Cloud Map name,
+// as pcscf (PCSCF_ICSCF_URI, sip:icscf.<namespace>;transport=tcp;lr) and
+// scscf put it, is icscf's own, so it is consumed and the request looked up,
+// not forwarded back to icscf itself (482 Loop Detected).
+func TestARouteNamingIcscfByItsServiceNameIsItsOwn(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
+	r.waitReady(t)
+	route := fmt.Sprintf("Route: <sip:icscf.rcs.local:%d;transport=tcp;lr>", r.core.Port())
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">", route)
+	if res.StatusCode != 200 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	got := scscf.next(t)
+	routes, err := got.Header.Route()
+	if err != nil || len(routes) != 1 || !strings.HasPrefix(routes[0].URI.String(), scscf.uri()) {
+		t.Fatalf("the S-CSCF got Route %v (%v), want only its own", routes, err)
+	}
+	if cmds := hss.commands(); len(cmds) != 1 || cmds[0] != cx.CodeLocationInfo {
+		t.Errorf("the HSS got %v, want one LIR", cmds)
+	}
+}
+
+// selfURIs names icscf by its address and its Cloud Map name, on its port.
+func TestIcscfKnowsItselfByItsAddressAndItsServiceName(t *testing.T) {
+	cfg := ServiceConfig{Namespace: "rcs.local", CoreHost: netip.MustParseAddr("10.0.3.9")}
+	var got []string
+	for _, u := range selfURIs(cfg, 5060) {
+		got = append(got, u.String())
+	}
+	if want := []string{"sip:10.0.3.9:5060;lr", "sip:icscf.rcs.local:5060;lr"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("Self = %v, want %v", got, want)
+	}
+}
