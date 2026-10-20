@@ -30,6 +30,8 @@ func TestAClientThatReconnectsWithANewAddressKeepsOneBinding(t *testing.T) {
 		u.callID = fmt.Sprintf("connection-%d", i)
 		u.contact = fmt.Sprintf("sip:ue@192.0.2.%d:%d;transport=tcp", 10+i%200, 5060+i)
 		u.cseq = 0
+		// Reconnections a few seconds apart, within the challenge limit.
+		e.clock.advance(10 * time.Second)
 		wantStatus(t, u.registerWith(g, 600), 200)
 		if n := contactCount(t, e, impu1); n != 1 {
 			t.Fatalf("after %d reconnections: %d bindings", i+1, n)

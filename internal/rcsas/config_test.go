@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"maps"
+	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -13,9 +15,12 @@ import (
 
 var devEnv = map[string]string{
 	"RCS_ENV":               "dev",
+	"RCS_IMS_DOMAIN":        "ims.mnc001.mcc001.3gppnetwork.org",
 	"RCSAS_MSRP_HOST":       "10.0.0.7",
 	"RCSAS_STORE":           "memory",
 	"RCSAS_CONFERENCE_HOST": "conf.ims.example.net",
+	"RCSAS_SIP_HOST":        "10.0.0.7",
+	"RCSAS_CORE_URI":        "sip:10.0.1.5:5060;transport=tcp;lr",
 }
 
 func with(base map[string]string, kv ...string) map[string]string {
@@ -181,6 +186,67 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 		"a small add burst":     {with(devEnv, "RCSAS_GROUP_ADD_BURST", "98"), "RCSAS_GROUP_ADD_BURST"},
 		"a negative rate":       {with(devEnv, "RCSAS_GROUP_ADD_RATE", "-1"), "RCSAS_GROUP_ADD_RATE"},
 		"a negative burst":      {with(devEnv, "RCSAS_GROUP_CREATE_BURST", "-1"), "RCSAS_GROUP_CREATE_BURST"},
+	} {
+		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestTheSIPSettingsAreRead(t *testing.T) {
+	c, err := configure(devEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SIPListenAddr != "0.0.0.0:5060" || c.SIPHost != netip.MustParseAddr("10.0.0.7") || c.Core.String() != "sip:10.0.1.5:5060;transport=tcp;lr" ||
+		c.HomeDomain != "ims.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("defaults %q %v %v %q", c.SIPListenAddr, c.SIPHost, c.Core, c.HomeDomain)
+	}
+	// In the namespace, the core is scscf's Cloud Map name by default.
+	c, err = configure(with(devEnv, "RCSAS_CORE_URI", "", "RCS_SERVICE_NAMESPACE", "rcs.internal", "RCSAS_SIP_LISTEN_ADDR", ":15060"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Core.String() != "sip:scscf.rcs.internal;transport=tcp;lr" || c.Namespace != "rcs.internal" || c.SIPListenAddr != ":15060" ||
+		c.ServiceName != "rcs-as.rcs.internal" {
+		t.Fatalf("namespace %v %q %q %q", c.Core, c.Namespace, c.SIPListenAddr, c.ServiceName)
+	}
+	// The service name follows HSS_RCS_AS_URI where an operator changed it;
+	// without a namespace there is none, and a loopback core is fine.
+	if c, err := configure(with(devEnv, "RCSAS_SERVICE_NAME", "as.rcs.internal", "RCSAS_CORE_URI", "sip:127.0.0.1:5060;transport=tcp;lr")); err != nil || c.ServiceName != "as.rcs.internal" {
+		t.Fatalf("service name %q, %v", c.ServiceName, err)
+	}
+	if c, err := configure(devEnv); err != nil || c.ServiceName != "" {
+		t.Fatalf("service name without a namespace %q, %v", c.ServiceName, err)
+	}
+	// Without RCSAS_SIP_HOST, the task's one private address.
+	old := interfaceAddrs
+	t.Cleanup(func() { interfaceAddrs = old })
+	interfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)}, &net.IPNet{IP: net.ParseIP("10.0.4.9"), Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	if c, err := configure(with(devEnv, "RCSAS_SIP_HOST", "")); err != nil || c.SIPHost != netip.MustParseAddr("10.0.4.9") {
+		t.Fatalf("found %v, %v", c.SIPHost, err)
+	}
+	for name, c := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"no core":             {with(devEnv, "RCSAS_CORE_URI", ""), "RCSAS_CORE_URI: required when RCS_SERVICE_NAMESPACE is unset"},
+		"core without lr":     {with(devEnv, "RCSAS_CORE_URI", "sip:10.0.1.5;transport=tcp"), "RCSAS_CORE_URI"},
+		"core over udp":       {with(devEnv, "RCSAS_CORE_URI", "sip:10.0.1.5;transport=udp;lr"), "RCSAS_CORE_URI"},
+		"core with a user":    {with(devEnv, "RCSAS_CORE_URI", "sip:scscf@10.0.1.5;transport=tcp;lr"), "RCSAS_CORE_URI"},
+		"core not sip":        {with(devEnv, "RCSAS_CORE_URI", "tel:+15550100001"), "RCSAS_CORE_URI"},
+		"core outside":        {with(devEnv, "RCSAS_CORE_URI", "sip:scscf.example.org;transport=tcp;lr", "RCS_SERVICE_NAMESPACE", "rcs.internal"), "outside RCS_SERVICE_NAMESPACE"},
+		"core public address": {with(devEnv, "RCSAS_CORE_URI", "sip:203.0.113.5;transport=tcp;lr"), "neither private nor loopback"},
+		"core link-local":     {with(devEnv, "RCSAS_CORE_URI", "sip:169.254.169.254;transport=tcp;lr"), "neither private nor loopback"},
+		"service name a URI":  {with(devEnv, "RCSAS_SERVICE_NAME", "as@rcs.internal"), "RCSAS_SERVICE_NAME"},
+		"service name a port": {with(devEnv, "RCSAS_SERVICE_NAME", "as.rcs.internal:5070"), "RCSAS_SERVICE_NAME"},
+		"bad sip listen":      {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "5060"), "RCSAS_SIP_LISTEN_ADDR"},
+		"sip listen port":     {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", ":sip"), "RCSAS_SIP_LISTEN_ADDR"},
+		"sip listen port 0":   {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "127.0.0.1:0"), "RCSAS_SIP_LISTEN_ADDR"},
+		"no home domain":      {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
+		"sip host not an IP":  {with(devEnv, "RCSAS_SIP_HOST", "rcs-as.internal"), "RCSAS_SIP_HOST"},
 	} {
 		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v", name, err)

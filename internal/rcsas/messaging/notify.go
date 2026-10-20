@@ -26,9 +26,12 @@ var failedDelivery = disposition{imdn.DeliveryNotification, imdn.Failed}
 // tell a sender that its message was read or failed (threat model T10;
 // RFC 5438 §6.3 makes the Message-ID unguessable for the same reason).
 //
-// Who sent the notification is o.Sender, the identity the network asserted;
-// the CPIM From has already been checked against it, or is the anonymous
-// URI clients use in 1-to-1 chat.
+// Who sent the notification is o.Sender, the identity the network asserted,
+// or one of o.Identities, asserted with it: a message written to a user's
+// non-numeric SIP identity names that identity as its recipient, while the
+// SIP layer keys the user by its tel URI. The CPIM From has already been
+// checked against them, or is the anonymous URI clients use in 1-to-1
+// chat.
 func (e *Engine) submitNotification(ctx context.Context, o Origin, m *Message, now time.Time) error {
 	n := m.Notification
 	sent, err := e.store.Sent(ctx, o.Recipient, n.MessageID, now)
@@ -44,7 +47,7 @@ func (e *Engine) submitNotification(ctx context.Context, o Origin, m *Message, n
 		return e.submitGroupNotification(ctx, nil, g, m, o.Recipient, now)
 	}
 	switch {
-	case slices.Contains(sent.Recipients, o.Sender):
+	case slices.Contains(sent.Recipients, o.Sender), e.addressedAs(sent.Recipients, o.Identities):
 	case slices.Contains(e.cfg.Intermediaries, o.Sender) && intermediaryMay(n.Kind, n.Status):
 	default:
 		return reject(ReasonIMDNForged, nil)
@@ -251,4 +254,15 @@ func (e *Engine) enqueueNotification(ctx context.Context, n store.Message, s imd
 		e.kickNew(n)
 	}
 	return nil
+}
+
+// addressedAs reports whether a message was sent to one of identities, in
+// the form the engine keys users by (UserOf).
+func (e *Engine) addressedAs(recipients, identities []string) bool {
+	for _, id := range identities {
+		if u, ok := UserOf(id, e.cfg.HomeDomain); ok && slices.Contains(recipients, u) {
+			return true
+		}
+	}
+	return false
 }

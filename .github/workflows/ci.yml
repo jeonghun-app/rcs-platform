@@ -123,6 +123,19 @@ jobs:
         if: always()
         run: make down
 
+  # CloudFormation templates: cfn-lint, and the policy checks of
+  # scripts/check_infra.py (ADR 0007 security group matrix, Proxy Protocol v2,
+  # locked-down tasks, PITR, no secrets for task roles). No AWS access.
+  infra:
+    name: infrastructure templates and policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make infra-lint
+
   vuln:
     name: modules and vulnerabilities
     runs-on: ubuntu-latest

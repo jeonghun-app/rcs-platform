@@ -3,6 +3,8 @@ package dynamostore
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -77,9 +79,10 @@ func (d *Dynamo) decodeChallengeItem(item map[string]types.AttributeValue, impi,
 // returns the deleted item: DynamoDB applies it to the item once, so of two
 // instances taking the same challenge only one gets it back.
 func (d *Dynamo) TakeChallenge(ctx context.Context, impi, nonce string, now time.Time) (*state.Challenge, error) {
-	if !state.KeyOK(impi, state.MaxKey) || !state.KeyOK(nonce, state.MaxNonce) {
+	if !state.KeyOK(impi, state.MaxKey) || !state.KeyOK(nonce, state.MaxNonce) || strings.HasPrefix(nonce, state.ReservedNoncePrefix) {
 		// A key DynamoDB would refuse names no challenge, such as the empty
-		// nonce of a first REGISTER (TS 24.229 §5.1.1.2.1).
+		// nonce of a first REGISTER (TS 24.229 §5.1.1.2.1), and neither does
+		// an attempt count's: a client must not take, and so reset, one.
 		return nil, fmt.Errorf("dynamostore: take challenge: %w", state.ErrNotFound)
 	}
 	out, err := d.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
@@ -102,4 +105,31 @@ func (d *Dynamo) TakeChallenge(ctx context.Context, impi, nonce string, now time
 		return nil, fmt.Errorf("dynamostore: take challenge: %w", state.ErrNotFound)
 	}
 	return d.decodeChallengeItem(out.Attributes, impi, nonce, now)
+}
+
+// attemptKey is the item of a's count, beside its IMPI's challenges: sort
+// key #count#<kind>#<scope>#<window in Unix seconds>, the scope empty for the
+// IMPI as a whole.
+func attemptKey(a state.Attempt) map[string]types.AttributeValue {
+	return challengeKey(a.IMPI, state.ReservedNoncePrefix+"count#"+a.Kind+"#"+a.Scope+"#"+strconv.FormatInt(a.Window.Unix(), 10))
+}
+
+// CountAttempt implements state.Challenges with one UpdateItem that adds n.
+// expires is the table's TTL attribute, so DynamoDB removes old windows.
+func (d *Dynamo) CountAttempt(ctx context.Context, a state.Attempt, n int64, expires time.Time) (int64, error) {
+	if err := state.ValidAttempt(a, n, expires); err != nil {
+		return 0, err
+	}
+	out, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(d.challenges),
+		Key:                       attemptKey(a),
+		UpdateExpression:          aws.String("ADD #n :one SET #exp = :exp"),
+		ExpressionAttributeNames:  map[string]string{"#n": attrCount, "#exp": attrExpires},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":one": num(n), ":exp": num(expires.Unix())},
+		ReturnValues:              types.ReturnValueUpdatedNew,
+	})
+	if err != nil {
+		return 0, sanitize("count attempt", err)
+	}
+	return nv(out.Attributes, attrCount)
 }

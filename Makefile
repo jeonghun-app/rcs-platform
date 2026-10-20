@@ -82,6 +82,24 @@ test: volumes ## Unit tests with coverage summary
 race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
+# cfn-lint and the platform policy checks (scripts/check_infra.py) in a pinned
+# tools image, built once per change of its Dockerfile or requirements, like
+# the Go toolchain.
+INFRAIMAGE ?= rcs-platform-infra:$(shell cat deploy/infra-tools.Dockerfile deploy/infra-tools.requirements.txt 2>/dev/null | sha256sum | cut -c1-12)
+
+.PHONY: infra-tools
+infra-tools:
+	@$(DOCKER) image inspect $(INFRAIMAGE) >/dev/null 2>&1 || \
+	  $(DOCKER) build -q -f deploy/infra-tools.Dockerfile -t $(INFRAIMAGE) deploy >/dev/null
+
+.PHONY: infra-lint
+infra-lint: infra-tools ## cfn-lint and the policy checks on infra/*.yaml (no AWS access)
+	$(DOCKER) run --rm -u $(shell id -u):$(shell id -g) -v $(CURDIR):/src:ro -w /src \
+	  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 $(INFRAIMAGE) sh -c '\
+	    set -e; cfn-lint infra/ecr.yaml infra/platform.yaml; \
+	    python3 -m unittest discover -s scripts -p "test_check_infra.py"; \
+	    python3 scripts/check_infra.py infra/platform.yaml'
+
 # The storage backends against an S3-compatible container and DynamoDB Local
 # on a private network: ft-server's (internal/ftserver/awsstore), msrp-relay's
 # (internal/msrprelay/dynamostore), the HSS's (internal/hss/awsstore, and
