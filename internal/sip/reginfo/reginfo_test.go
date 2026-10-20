@@ -599,3 +599,78 @@ func TestASenderOnlyRefusalIsNotWritable(t *testing.T) {
 		t.Errorf("a document Parse refuses too: %v", err)
 	}
 }
+
+// An address-of-record with no canonical IMPU form compares as
+// sip.URI.Equal does (RFC 3261 §19.1.4, RFC 3966 §4): two spellings of one
+// are a repeated AOR in Parse and Marshal, and ByAOR finds it from either
+// (#247).
+func TestAnAORWithoutACanonicalFormComparesAsURIsDo(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"sip:%61lice@h.example:5070", "sip:alice@h.example:5070"},
+		{"sip:alice@h.example:5070;transport=TCP", "sip:alice@h.example:5070;transport=tcp"},
+		{"sip:alice@h.example:5070;foo=bar", "sip:alice@h.example:5070"},
+		{"tel:12-34;phone-context=example.com", "tel:1234;phone-context=example.com"},
+		{"sip:example.com", "sip:EXAMPLE.com;foo=bar"},
+	} {
+		a, b := uri(t, pair[0]), uri(t, pair[1])
+		if !a.Equal(b) {
+			t.Fatalf("%s and %s are not Equal", pair[0], pair[1])
+		}
+		two := doc(`<registration aor="` + pair[0] + `" id="a" state="active"/><registration aor="` + pair[1] + `" id="b" state="active"/>`)
+		if _, err := Parse([]byte(two)); !errors.Is(err, ErrMalformed) {
+			t.Errorf("Parse %s, %s: %v", pair[0], pair[1], err)
+		}
+		info := &Info{State: Full, Registrations: []Registration{{AOR: pair[0], ID: "a", State: Active}, {AOR: pair[1], ID: "b", State: Active}}}
+		if _, err := info.Marshal(); !errors.Is(err, ErrMalformed) {
+			t.Errorf("Marshal %s, %s: %v", pair[0], pair[1], err)
+		}
+		one := &Info{State: Full, Registrations: []Registration{{AOR: pair[0], ID: "a", State: Active}}}
+		if _, ok := one.ByAOR(b); !ok {
+			t.Errorf("ByAOR(%s) in a document of %s", pair[1], pair[0])
+		}
+		one.Registrations[0].AOR = pair[1]
+		if _, ok := one.ByAOR(a); !ok {
+			t.Errorf("ByAOR(%s) in a document of %s", pair[0], pair[1])
+		}
+	}
+	// ByAOR does not take a URI that shares the key but is not Equal.
+	diff := &Info{State: Full, Registrations: []Registration{{AOR: "sip:alice@h.example:5070;foo=bar", ID: "a", State: Active}}}
+	if _, ok := diff.ByAOR(uri(t, "sip:alice@h.example:5070;foo=baz")); ok {
+		t.Error("ByAOR took another parameter value")
+	}
+	// What Equal tells apart stays apart.
+	for _, pair := range [][2]string{
+		{"sip:alice@h.example:5070", "sip:alice@h.example:5071"},
+		{"sip:alice@h.example:5070;transport=tcp", "sip:alice@h.example:5070;transport=tls"},
+		{"sip:Alice@h.example:5070", "sip:alice@h.example:5070"},
+		{"tel:1234;phone-context=example.com", "tel:1234;phone-context=example.net"},
+	} {
+		two := doc(`<registration aor="` + pair[0] + `" id="a" state="active"/><registration aor="` + pair[1] + `" id="b" state="active"/>`)
+		if _, err := Parse([]byte(two)); err != nil {
+			t.Errorf("Parse %s, %s: %v", pair[0], pair[1], err)
+		}
+	}
+}
+
+// For AORs with no canonical form, the key and sameAOR together say what
+// sip.URI.Equal says, for every pair of a varied set of spellings.
+func TestTheAORKeyAgreesWithEqual(t *testing.T) {
+	var us []string
+	for _, user := range []string{"alice", "%61lice", "Alice", "a%2Fb", "a/b"} {
+		for _, host := range []string{"h.example", "H.Example"} {
+			for _, rest := range []string{":5070", ":5070;transport=tcp", ":5070;transport=TCP", ":5070;transport=tls", ":5070;foo=bar", ":5070;foo=BAZ", ":5070;foo=%62ar", ":5070;foo=a%2Fb", ":5070;foo=a/b", ":5071", ":5070;user=phone;foo=bar", ":5070?subject=x"} {
+				us = append(us, "sip:"+user+"@"+host+rest)
+			}
+		}
+	}
+	us = append(us, "sip:example.com", "sip:EXAMPLE.com;foo=bar", "sip:example.com;maddr=10.0.0.1", "tel:12-34;phone-context=example.com", "tel:1234;phone-context=EXAMPLE.com", "tel:1234;phone-context=example.net")
+	for _, x := range us {
+		for _, y := range us {
+			a, b := uri(t, x), uri(t, y)
+			got := aorKey(a) == aorKey(b) && sameAOR(aorKey(a), entryOf(a), entryOf(b))
+			if want := a.Equal(b); got != want {
+				t.Errorf("%s, %s: %v, Equal %v", x, y, got, want)
+			}
+		}
+	}
+}
