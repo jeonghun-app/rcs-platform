@@ -22,6 +22,10 @@ Metadata:
           - PcscfEnabled
           - WafRateLimit
           - WafRateAction
+          - NlbAllocationIdA
+          - NlbAllocationIdB
+          - NlbReusedAddressA
+          - NlbReusedAddressB
       - Label: { default: Observability }
         Parameters: [ContainerInsights, LogRetentionDays]
 
@@ -120,6 +124,32 @@ Parameters:
       Handsets reach the stack through carrier-grade NAT, thousands behind
       one address, so size it to the busiest such address, not to a device.
 
+  NlbAllocationIdA:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(eipalloc-[0-9a-f]+)?$'
+    Description: >
+      Allocation id of an Elastic IP to give the NLB in public subnet A, such
+      as one an earlier stack retained (docs/runbook.md#keeping-the-nlb-addresses);
+      empty allocates a new one. Clients cache the NLB's address.
+  NlbAllocationIdB:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(eipalloc-[0-9a-f]+)?$'
+    Description: As NlbAllocationIdA, for public subnet B.
+  # Set by deploy.sh from the allocations above: CloudFormation cannot read an
+  # Elastic IP's address from its allocation id.
+  NlbReusedAddressA:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^$'
+    Description: The public address of NlbAllocationIdA (deploy.sh sets it).
+  NlbReusedAddressB:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^$'
+    Description: The public address of NlbAllocationIdB (deploy.sh sets it).
+
   WafRateAction:
     Type: String
     Default: count
@@ -165,6 +195,8 @@ Conditions:
   # ADR 0003: plain SIP and MSRP are refused outside dev.
   WithPcscfPlain: !And [!Condition WithPcscf, !Condition IsDev]
   WafBlocks: !Equals [!Ref WafRateAction, block]
+  NewNlbAddressA: !Equals [!Ref NlbAllocationIdA, '']
+  NewNlbAddressB: !Equals [!Ref NlbAllocationIdB, '']
 
 Resources:
   # ---------------------------------------------------------------- network
@@ -735,19 +767,25 @@ Resources:
       # (TS 24.229, NOTE 15), so pcscf must know it (PCSCF_PUBLIC_ADDRS), and
       # it must not change under clients that cached it.
       SubnetMappings:
-        - { SubnetId: !Ref PublicSubnetA, AllocationId: !GetAtt NlbAddressA.AllocationId }
-        - { SubnetId: !Ref PublicSubnetB, AllocationId: !GetAtt NlbAddressB.AllocationId }
+        - SubnetId: !Ref PublicSubnetA
+          AllocationId: !If [NewNlbAddressA, !GetAtt NlbAddressA.AllocationId, !Ref NlbAllocationIdA]
+        - SubnetId: !Ref PublicSubnetB
+          AllocationId: !If [NewNlbAddressB, !GetAtt NlbAddressB.AllocationId, !Ref NlbAllocationIdB]
       SecurityGroups: [!Ref NlbSecurityGroup]
       LoadBalancerAttributes:
         - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
         - { Key: deletion_protection.enabled, Value: !If [IsProduction, 'true', 'false'] }
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb' }]
 
-  # The NLB's public addresses, one per public subnet. Retained: a
-  # replacement of the NLB or of the stack keeps them, so clients' cached
-  # addresses still work after a redeployment.
+  # The NLB's public addresses, one per public subnet, allocated unless
+  # NlbAllocationIdA/B name existing ones. Retained when the stack goes, so
+  # a new stack can take them back through those parameters and clients'
+  # cached addresses keep working. A change that replaces the NLB itself
+  # cannot be applied with fixed addresses: the new NLB is created while the
+  # old still holds them.
   NlbAddressA:
     Type: AWS::EC2::EIP
+    Condition: NewNlbAddressA
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     DependsOn: InternetGatewayAttachment
@@ -756,6 +794,7 @@ Resources:
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nlb-a' }]
   NlbAddressB:
     Type: AWS::EC2::EIP
+    Condition: NewNlbAddressB
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     DependsOn: InternetGatewayAttachment
@@ -810,7 +849,11 @@ Resources:
   # The idle timeout is configurable on TCP listeners only; TLS listeners keep
   # a fixed 350 s, which the keep-alives are sized for (ADR 0003). The plain
   # listeners exist in dev only: ADR 0003 refuses unencrypted SIP and MSRP in
-  # staging and prod, and the target port cannot tell the two apart.
+  # staging and prod, and the target port cannot tell the two apart. In dev,
+  # plain SIP on 5060 goes to the same target port 5061 as TLS: pcscf's
+  # nlb-tls listener, which takes every flow as TLS-protected (sips Path).
+  # That is a dev shortcut, not a supported mode (#16 decides whether dev
+  # pcscf gets a tcp-mode listener of its own).
   SipTcpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: WithPcscfPlain
@@ -1023,7 +1066,16 @@ Outputs:
     Export: { Name: !Sub '${AWS::StackName}-NamespaceId' }
   NlbPublicAddresses:
     Description: The NLB's fixed public addresses, comma-separated; pcscf's PCSCF_PUBLIC_ADDRS.
-    Value: !Join [',', [!Ref NlbAddressA, !Ref NlbAddressB]]
+    Value: !Join
+      - ','
+      - - !If [NewNlbAddressA, !Ref NlbAddressA, !Ref NlbReusedAddressA]
+        - !If [NewNlbAddressB, !Ref NlbAddressB, !Ref NlbReusedAddressB]
+  NlbAllocationIds:
+    Description: The NLB's Elastic IP allocations; pass them as NlbAllocationIdA/B to a new stack to keep the addresses.
+    Value: !Join
+      - ','
+      - - !If [NewNlbAddressA, !GetAtt NlbAddressA.AllocationId, !Ref NlbAllocationIdA]
+        - !If [NewNlbAddressB, !GetAtt NlbAddressB.AllocationId, !Ref NlbAllocationIdB]
   NlbDnsName:
     Description: >
       Where clients reach SIP and MSRP: point the operator's names at it, or
