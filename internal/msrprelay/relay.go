@@ -117,6 +117,18 @@ type bridge struct {
 	ended bool
 }
 
+// logged passes each event to count, and logs the ones that say the relay
+// itself is failing, which no metric explains alone: a keep-alive it could
+// not build. side is "client" or "core"; an Event carries no identifier.
+func logged(log *slog.Logger, side string, count func(msrp.Event)) func(msrp.Event) {
+	return func(e msrp.Event) {
+		count(e)
+		if e.Err == msrp.ErrKeepAliveNotSent {
+			log.Error("an MSRP keep-alive could not be sent", slog.String("side", side))
+		}
+	}
+}
+
 func newRelay(o relayOptions) (*Relay, error) {
 	instance, err := msrp.NewMessageID(o.Rand)
 	if err != nil {
@@ -134,8 +146,8 @@ func newRelay(o relayOptions) (*Relay, error) {
 	// is a client whose bridge ended from the core side, the connection is
 	// kept like any other quiet one.
 	o.Edge.UnboundTimeout = o.IdleTimeout
-	o.Edge.Clock, o.Edge.Rand, o.Edge.OnEvent = o.Clock, o.Rand, o.Metrics.onEvent(mClientPrefix)
-	o.Core.Clock, o.Core.Rand, o.Core.OnEvent = o.Clock, o.Rand, o.Metrics.onEvent(mCorePrefix)
+	o.Edge.Clock, o.Edge.Rand, o.Edge.OnEvent = o.Clock, o.Rand, logged(o.Log, "client", o.Metrics.onEvent(mClientPrefix))
+	o.Core.Clock, o.Core.Rand, o.Core.OnEvent = o.Clock, o.Rand, logged(o.Log, "core", o.Metrics.onEvent(mCorePrefix))
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Relay{
 		o:        o,

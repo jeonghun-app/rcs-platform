@@ -1,9 +1,11 @@
 package msrprelay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -865,5 +867,21 @@ func TestAClientConnectionHalfClosesWhenItsSocketCan(t *testing.T) {
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 	if err := (&meteredConn{Conn: a}).CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("CloseWrite on a pipe = %v", err)
+	}
+}
+
+func TestAKeepAliveTheRelayCouldNotBuildIsCountedAndLogged(t *testing.T) {
+	// Code review on #222: the relay failing to build a keep-alive is
+	// counted and logged, with the side and nothing else.
+	var buf bytes.Buffer
+	m := newCounters()
+	on := logged(slog.New(slog.NewJSONHandler(&buf, nil)), "client", m.onEvent(mClientPrefix))
+	on(msrp.Event{Kind: msrp.EventDropped, Method: msrp.MethodSend, Err: msrp.ErrKeepAliveNotSent})
+	on(msrp.Event{Kind: msrp.EventDropped, Method: msrp.MethodSend, Err: msrp.ErrHandlerBusy})
+	if got := m.count(mClientPrefix + "Dropped.KeepAliveNotSent"); got != 1 {
+		t.Fatalf("Client.Dropped.KeepAliveNotSent = %d", got)
+	}
+	if lines := strings.Count(buf.String(), "\n"); lines != 1 || !strings.Contains(buf.String(), `"side":"client"`) {
+		t.Fatalf("log %q, want one line with the side", buf.String())
 	}
 }
