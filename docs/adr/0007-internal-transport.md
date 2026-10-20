@@ -91,12 +91,16 @@ traffic within an AZ is not assumed to be.
    what keep non-CSCF tasks off the Cx port. Restricting which command codes a
    peer may use (for example UAR/LIR only for `icscf`) is a follow-up.
 7. SIP trust domain (RFC 3325): only `pcscf` accepts requests from clients, and it
-   removes the headers only the network may set (TS 24.229 §5.2):
+   removes the headers only the network may set from every request and response
+   a client sends (TS 24.229 §5.2.1, §5.2.6.3.3):
    `P-Asserted-Identity`, `P-Served-User`, `P-Asserted-Service`,
    `P-Charging-Vector`, `P-Charging-Function-Addresses`, `P-Visited-Network-ID`,
-   `P-Associated-URI`, `P-Called-Party-ID`. The core SIP ports trust
+   `P-Associated-URI`, `P-Called-Party-ID`, `P-Media-Authorization`,
+   `Feature-Caps`, `P-Private-Network-Indication` and `P-Profile-Key`, and any
+   `P-Access-Network-Info` value with the `network-provided` parameter (a client
+   may describe its access, not vouch for it). The core SIP ports trust
    `P-Asserted-Identity` because security groups admit only platform services
-   there.
+   there. (Amended in #188: the list was the first eight, for requests only.)
 8. The FT digest realm must differ from the IMS digest realm (startup refuses
    equal realms), so an FT credential can never authenticate a SIP registration.
 9. Task definitions use `readonlyRootFilesystem: true`, `enableExecuteCommand:

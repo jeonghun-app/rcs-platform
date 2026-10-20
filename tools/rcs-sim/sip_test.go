@@ -1,0 +1,190 @@
+package main
+
+import (
+	"context"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
+)
+
+// TS 35.208 test set 1, not a SIM's; the IMPI's IMSI is on
+// .github/allowed-test-identifiers.txt.
+const (
+	testK    = "465b5ce8b199b49faa5f0a2ee238a6bc"
+	testOPc  = "cd63cb71954a9f4e48a5994e37a02baf"
+	testIMPI = "001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
+)
+
+func TestSIPFlagsAndEnvironmentMakeTheClientConfig(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+	cfg, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka"}, defaultSelf, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Network != transport.TCP || cfg.Proxy.String() != "127.0.0.1:5060" || cfg.ServerName != "" ||
+		cfg.Domain != "ims.mnc001.mcc001.3gppnetwork.org" || cfg.IMPU.String() != defaultSelf {
+		t.Fatalf("config = %+v", cfg)
+	}
+	if !regexp.MustCompile(`^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(cfg.InstanceID) {
+		t.Fatalf("instance %q is not a version 4 UUID URN", cfg.InstanceID)
+	}
+	// A host name is resolved, and is the name TLS verifies.
+	cfg, err = sipConfig(context.Background(), sipFlags{proxy: "localhost:5061", transport: "tls", auth: "digest", impi: testIMPI, domain: "ims.example.com"}, defaultSelf,
+		env("RCS_SIM_SIP_PASSWORD", "sim-test-sip-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Network != transport.TLS || cfg.ServerName != "localhost" || !cfg.Proxy.Addr().IsLoopback() || cfg.Domain != "ims.example.com" || cfg.Realm != "" {
+		t.Fatalf("config = %+v", cfg)
+	}
+}
+
+func TestSIPUsageErrorsNameNoValue(t *testing.T) {
+	aka := []string{"RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc}
+	for _, tt := range []struct {
+		name string
+		env  []string
+		args []string
+		want string
+	}{
+		{"no IMPI", []string{"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc}, nil, "RCS_SIM_SIP_IMPI"},
+		{"no K", []string{"RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_OPC", testOPc}, nil, "RCS_SIM_AKA_K"},
+		{"K not hex", []string{"RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", strings.Repeat("z", 32), "RCS_SIM_AKA_OPC", testOPc}, nil, "RCS_SIM_AKA_K"},
+		{"no password", []string{"RCS_SIM_SIP_IMPI", testIMPI}, []string{"-sip-auth", "digest"}, "RCS_SIM_SIP_PASSWORD"},
+		{"bad auth", aka, []string{"-sip-auth", "none"}, "-sip-auth"},
+		{"bad transport", aka, []string{"-sip-transport", "udp"}, "-sip-transport"},
+		{"tel self", aka, []string{"-self", "tel:+15550100001"}, "-self"},
+		{"TLS to an address without a name", aka, []string{"-sip-transport", "tls"}, "-sip-server-name"},
+		{"domain not a host", aka, []string{"-sip-domain", "a b"}, "-sip-domain"},
+		{"server name not a host", aka, []string{"-sip-server-name", "a;b"}, "-sip-server-name"},
+		{"no port", aka, []string{"-sip-proxy", "pcscf.operator-host.invalid"}, "-sip-proxy"},
+		{"host that does not resolve", aka, []string{"-sip-proxy", "pcscf.operator-host.invalid:5060"}, "-sip-proxy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string{"-sip-proxy", "127.0.0.1:5060"}, tt.args...)
+			code, _, errOut := call(env(tt.env...), append(args, "all")...)
+			if code != exitUsage || !strings.Contains(errOut, tt.want) {
+				t.Fatalf("exit %d, stderr %q; want 2 and %q", code, errOut, tt.want)
+			}
+			for _, v := range []string{testK, testOPc, "001010000000001", "operator-host", strings.Repeat("z", 32)} {
+				if strings.Contains(errOut, v) {
+					t.Fatalf("stderr %q repeats %q", errOut, v)
+				}
+			}
+		})
+	}
+}
+
+// A made-up K and OPc for the peer, its own (code review on #209).
+const (
+	testPeerK   = "00112233445566778899aabbccddeeff"
+	testPeerOPc = "ffeeddccbbaa99887766554433221100"
+)
+
+func TestThePeersClientIsConfiguredLikeTheSelfsWithItsOwnIdentity(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
+		"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc, "RCS_SIM_PEER_AKA_K", testPeerK, "RCS_SIM_PEER_AKA_OPC", testPeerOPc)
+	// A usage error about the peer names it, never its value.
+	code, _, errOut := call(env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "x", "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc),
+		"-sip-proxy", "127.0.0.1:5060", "-peer", "tel:+15550100002", "all")
+	if code != exitUsage || !strings.Contains(errOut, "peer: -self and -peer must be SIP URIs") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	self, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka"}, defaultSelf, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", impi: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", credEnv: sipua.PeerEnv}, defaultPeer, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peer.IMPU.String() != defaultPeer || peer.InstanceID == self.InstanceID || peer.Proxy != self.Proxy {
+		t.Fatalf("peer %+v, self %+v", peer, self)
+	}
+}
+
+func TestThePeerTakesCredentialsOfItsOwn(t *testing.T) {
+	// The client's variables alone do not configure the peer: each
+	// subscriber has its own K and OPc, or password (code review on #209).
+	for auth, missing := range map[string]string{"aka": "RCS_SIM_PEER_AKA_K", "digest": "RCS_SIM_SIP_PEER_PASSWORD"} {
+		t.Run(auth, func(t *testing.T) {
+			lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
+				"RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc, "RCS_SIM_SIP_PASSWORD", "self-password")
+			code, _, errOut := call(lookup, "-sip-proxy", "127.0.0.1:5060", "-sip-auth", auth, "all")
+			if code != exitUsage || !strings.Contains(errOut, "peer: sipua: "+missing+" is not set") {
+				t.Fatalf("exit %d, stderr %q", code, errOut)
+			}
+			for _, v := range []string{testK, testOPc, "self-password"} {
+				if strings.Contains(errOut, v) {
+					t.Fatalf("stderr %q repeats %q", errOut, v)
+				}
+			}
+		})
+	}
+}
+
+func TestTheSIPRealmFlagReachesTheClient(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+	cfg, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "aka", realm: "realm.example.net"}, defaultSelf, lookup)
+	if err != nil || cfg.Realm != "realm.example.net" {
+		t.Fatalf("config %+v, %v", cfg, err)
+	}
+}
+
+func TestSIPFlagsWithoutAProxyAreAUsageError(t *testing.T) {
+	code, _, errOut := call(env(), "-sip-impi", testIMPI, "all")
+	if code != exitUsage || !strings.Contains(errOut, "-sip-impi needs -sip-proxy") || strings.Contains(errOut, "001010000000001") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestSIPAuthIsCaseInsensitive(t *testing.T) {
+	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
+	if _, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "AKA"}, defaultSelf, lookup); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTheRunRegistersThePeerWithItsOwnIMPIAndInstance(t *testing.T) {
+	// QA on #209: run wires -sip-peer-impi and a new instance into the
+	// peer's client. The core knows each IMPI's own password only, so a
+	// peer that registered with the client's IMPI would be refused.
+	const domain = "ims.mnc001.mcc001.3gppnetwork.org"
+	core := simtest.StartIMSCore(t, domain, map[string]string{
+		"001010000000001@" + domain: "self-password",
+		"001010000000002@" + domain: "peer-password",
+	})
+	const instance = "urn:uuid:00000000-0000-4000-8000-000000000009"
+	lookup := env("RCS_SIM_SIP_IMPI", "001010000000001@"+domain, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@"+domain,
+		"RCS_SIM_SIP_PASSWORD", "self-password", "RCS_SIM_SIP_PEER_PASSWORD", "peer-password")
+	code, out, errOut := call(lookup, "-sip-proxy", core.Addr.String(), "-sip-auth", "digest", "-sip-instance", instance, "pager-message")
+	if code != exitOK {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	self, peer := core.Instance(defaultSelf), core.Instance(defaultPeer)
+	if self != "<"+instance+">" || peer == "" || peer == self {
+		t.Fatalf("instances: client %q, peer %q", self, peer)
+	}
+}
+
+func TestASkippedStepIsCountedAndRequireAllFailsIt(t *testing.T) {
+	// rcs-sim has no way yet to have the network deregister the client, so
+	// reg-event's network-deregister step is skipped: the run passes, and
+	// the summary on standard error counts it. -require-all fails it.
+	const domain = "ims.mnc001.mcc001.3gppnetwork.org"
+	core := simtest.StartIMSCore(t, domain, map[string]string{"001010000000001@" + domain: "self-password"})
+	lookup := env("RCS_SIM_SIP_IMPI", "001010000000001@"+domain, "RCS_SIM_SIP_PASSWORD", "self-password")
+	code, out, errOut := call(lookup, "-sip-proxy", core.Addr.String(), "-sip-auth", "digest", "reg-event")
+	if code != exitOK || !strings.Contains(out, `"step":"network-deregister","ok":true,"ms":0,"skipped":"network deregistration not configured"`) ||
+		!strings.Contains(errOut, "rcs-sim: 5 steps, 0 failed, 1 skipped") {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	code, out, errOut = call(lookup, "-sip-proxy", core.Addr.String(), "-sip-auth", "digest", "-require-all", "reg-event")
+	if code != exitFailed || !strings.Contains(errOut, "rcs-sim: 5 steps, 1 failed, 0 skipped") {
+		t.Fatalf("with -require-all: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -299,6 +300,27 @@ func TestReaderReadsBackToBackMessagesAndSkipsKeepAlives(t *testing.T) {
 	// half of nothing), one at the end.
 	if pings != 3 {
 		t.Errorf("OnKeepAlive called %d times, want 3", pings)
+	}
+}
+
+func TestReaderReportsEveryCRLFBetweenMessages(t *testing.T) {
+	// A pong before the message, a ping and a pong after it. Only the ping
+	// is a keep-alive; every CRLF is reported, the pong at the end too,
+	// before the stream ends.
+	stream := "\r\n" + basicInvite + "\r\n\r\n\r\n"
+	var events []string
+	r := NewReader(bufio.NewReader(strings.NewReader(stream)), Limits{})
+	r.OnCRLF = func() { events = append(events, "crlf") }
+	r.OnKeepAlive = func() { events = append(events, "ping") }
+	if _, err := r.ReadMessage(); err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if _, err := r.ReadMessage(); err != io.EOF {
+		t.Fatalf("end of stream: %v, want io.EOF", err)
+	}
+	want := []string{"crlf", "crlf", "crlf", "ping", "crlf"}
+	if !slices.Equal(events, want) {
+		t.Errorf("events = %v, want %v", events, want)
 	}
 }
 

@@ -35,6 +35,11 @@ const (
 	// queue as one sender may (Config.QueueSenderShare); others still get
 	// through.
 	ReasonQueueShareFull Reason = "queue_share_full"
+	// ReasonNoGroup: the group does not exist, or has ended.
+	ReasonNoGroup Reason = "no_group"
+	// ReasonNotParticipant: the sender is not a participant of the group,
+	// or may not do what it asked there.
+	ReasonNotParticipant Reason = "not_participant"
 	// ReasonIMDNMalformed: a notification whose document cannot be read.
 	ReasonIMDNMalformed Reason = "imdn_malformed"
 	// ReasonIMDNUnknown: a notification about a message the recipient of
@@ -57,6 +62,10 @@ type Rejection struct {
 }
 
 func reject(r Reason, err error) *Rejection { return &Rejection{Reason: r, err: err} }
+
+// Reject returns the Rejection for reason r, for a GroupHandler to refuse
+// a message with.
+func Reject(r Reason) *Rejection { return reject(r, nil) }
 
 func (r *Rejection) Error() string {
 	if r.err != nil {

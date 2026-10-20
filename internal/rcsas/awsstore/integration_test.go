@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
+	groupstoretest "github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore/storetest"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store/storetest"
@@ -196,5 +199,131 @@ func TestIntegrationADriftedQueueSizeIsCorrectedOnce(t *testing.T) {
 		if err := s.Enqueue(ctx, at(fmt.Sprint("x", i), t1.Add(time.Duration(2+i)*time.Second)), l); !errors.Is(err, store.ErrQueueFull) {
 			t.Fatalf("Enqueue to a full queue = %v", err)
 		}
+	}
+}
+
+// integrationGroups creates a groupchats table as docs/rcs-as.md
+// describes it and returns the store over it, except that TTL is not
+// turned on. The contract runs on a fixed clock (storetest's t0, in 2026),
+// so every item's ttl is in the past by the wall clock, and DynamoDB
+// Local's TTL would delete items in the middle of a test: the flake
+// msrp-relay's tests saw on #52. TTL is only the backstop that keeps the
+// table small; every read checks the expiry itself, which the contract
+// covers.
+func integrationGroups(t *testing.T) *Groups {
+	t.Helper()
+	endpoint := os.Getenv("RCSAS_IT_DYNAMODB_ENDPOINT")
+	if endpoint == "" {
+		t.Fatal("RCSAS_IT_DYNAMODB_ENDPOINT must name the test container")
+	}
+	ctx := t.Context()
+	table := "groupchats-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	awsCfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
+	if _, err := ddb.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: dtypes.BillingModePayPerRequest,
+		AttributeDefinitions: []dtypes.AttributeDefinition{
+			{AttributeName: aws.String(attrPK), AttributeType: dtypes.ScalarAttributeTypeS},
+			{AttributeName: aws.String(attrSK), AttributeType: dtypes.ScalarAttributeTypeS},
+		},
+		KeySchema: []dtypes.KeySchemaElement{
+			{AttributeName: aws.String(attrPK), KeyType: dtypes.KeyTypeHash},
+			{AttributeName: aws.String(attrSK), KeyType: dtypes.KeyTypeRange},
+		},
+	}); err != nil {
+		t.Fatalf("creating the table: %v", err)
+	}
+	g, err := NewGroups(ctx, Config{Table: table, Endpoint: endpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Ready(ctx); err != nil {
+		t.Fatalf("Ready = %v", err)
+	}
+	return g
+}
+
+func TestIntegrationGroupsStoreMeetsTheContract(t *testing.T) {
+	groups := integrationGroups(t)
+	groupstoretest.Run(t, func(*testing.T) groupstore.Store { return groups })
+}
+
+// Two tasks raising one group's roster version at once, each from what it
+// read: every version is written once and none is lost.
+// DynamoDB itself takes and returns the largest group rcs-as keeps.
+func TestIntegrationTheLargestGroupIsStoredWhole(t *testing.T) {
+	groups := integrationGroups(t)
+	ctx := t.Context()
+	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	g := largestGroup(t1)
+	if err := groups.Create(ctx, g, "c", t1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := groups.Get(ctx, g.URI, t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Participants) != groupstore.MaxEntries {
+		t.Fatalf("read back %d participants", len(got.Participants))
+	}
+	last, want := got.Participants[groupstore.MaxEntries-1], g.Participants[groupstore.MaxEntries-1]
+	if last.Identity != want.Identity || last.DisplayName != want.DisplayName || last.AddedBy != want.AddedBy {
+		t.Fatalf("last participant %+v", last)
+	}
+}
+
+func TestIntegrationGroupVersionsCountAcrossWriters(t *testing.T) {
+	groups := integrationGroups(t)
+	ctx := t.Context()
+	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	g := groupstore.Group{URI: "sip:chat-v@conf.example.net", Version: 1, Created: t1, Active: t1, Expires: t1.Add(time.Hour),
+		Participants: []groupstore.Participant{{Identity: "sip:a@example.net", Role: groupstore.Chairman, State: groupstore.Joined, Since: t1}}}
+	if err := groups.Create(ctx, g, "c", t1); err != nil {
+		t.Fatal(err)
+	}
+	const each = 15
+	var mu sync.Mutex
+	var written []uint32
+	var wg sync.WaitGroup
+	for w := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < each; {
+				cur, err := groups.Get(ctx, g.URI, t1)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				cur.Version++
+				err = groups.Update(ctx, cur, fmt.Sprintf("w%d-%d", w, i))
+				if errors.Is(err, groupstore.ErrConflict) {
+					continue
+				}
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				mu.Lock()
+				written = append(written, cur.Version)
+				mu.Unlock()
+				i++
+			}
+		}()
+	}
+	wg.Wait()
+	slices.Sort(written)
+	for i, v := range written {
+		if v != uint32(i+2) {
+			t.Fatalf("versions written %v", written)
+		}
+	}
+	final, err := groups.Get(ctx, g.URI, t1)
+	if err != nil || final.Version != 1+2*each || final.Rev != 1+2*each {
+		t.Fatalf("final %+v, %v", final, err)
 	}
 }

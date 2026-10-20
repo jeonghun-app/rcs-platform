@@ -1,9 +1,11 @@
 package msrprelay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -138,6 +140,105 @@ func TestClientPathThatNeverArrivesIsRefused(t *testing.T) {
 	}
 	if got := r.metrics.count(mRefusedPrefix + reasonIncomplete); got != 1 {
 		t.Fatalf("Refused.IncompleteBinding = %d", got)
+	}
+}
+
+func TestAClientRefusedAfterThePathWaitKeepsItsConnection(t *testing.T) {
+	// The client's keep-alive interval is shorter than the wait, but while
+	// its binding SEND is unanswered it sends nothing more. Each keep-alive
+	// would name the session again: another lookup and another wait, or,
+	// for a binding already gone, another unknown session toward
+	// MaxFailedBinds, which closes the connection before the client reads
+	// its 481 (#204).
+	r := newRig(t, 1, func(o *relayOptions) { o.PathWait = 30 * time.Millisecond })
+	b := r.allocate(map[string]any{"core_path": []string{r.as.uri("ask33p")}})
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := msrp.NewActiveConn(nc, msrp.Config{Clock: r.clock, KeepAliveInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := &client{conn: conn, nc: nc}
+	opened := make(chan error, 1)
+	go func() {
+		_, err := c.open(t, b.clientPath, newRecorder())
+		opened <- err
+	}()
+	r.clock.waitTimer(t, 25*time.Millisecond)
+	r.clock.Advance(25 * time.Millisecond)
+	r.clock.waitTimer(t, 5*time.Millisecond)
+	r.clock.Advance(5 * time.Millisecond)
+	if err := <-opened; statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("client Open = %v, want 481", err)
+	}
+	// Answered after anything sent before it.
+	if _, err := c.openAs(t, "msrp://client.invalid:7777/an0th3rse55ion;tcp", "msrps://"+publicHost+":2856/n0such5e55ion;tcp", newRecorder()); statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("second Open = %v, want 481", err)
+	}
+	if got := r.metrics.count(mClientPrefix + "Refused.481"); got != 2 {
+		t.Fatalf("Client.Refused.481 = %d, want 2", got)
+	}
+	if c.conn.Err() != nil {
+		t.Fatalf("connection ended: %v", c.conn.Err())
+	}
+}
+
+func TestAClientNamingAReleasedBindingReads481AndKeepsItsConnection(t *testing.T) {
+	// QA on #217, the release step of #204: the lookup of a released
+	// binding is slow, and the client's keep-alive interval is short.
+	// The client sends its binding SEND alone, so the relay counts one
+	// unknown session, not four, and does not close the connection
+	// (MaxFailedBinds) with the 481 still queued.
+	slow := &flakyStore{block: make(chan struct{}), blocked: make(chan struct{}, 16)}
+	r := newRig(t, 1, wrapStore(slow))
+	b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{r.as.uri("asrel")}})
+	if code, _ := r.call("DELETE", "/v1/bindings/"+b.id, nil); code != 204 {
+		t.Fatalf("DELETE = %d", code)
+	}
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := msrp.NewActiveConn(nc, msrp.Config{Clock: r.clock, KeepAliveInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := &client{conn: conn, nc: nc}
+	opened := make(chan error, 1)
+	go func() {
+		_, err := c.open(t, b.clientPath, newRecorder())
+		opened <- err
+	}()
+	<-slow.blocked // the relay is looking the released binding up
+	// Six keep-alive intervals pass meanwhile. The pauses only give a
+	// keep-alive, if one were sent, time to reach the relay; the test
+	// passes without them.
+	for range 6 {
+		r.clock.Advance(5 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Later lookups, if any, are not held.
+	slow.mu.Lock()
+	block := slow.block
+	slow.block = nil
+	slow.mu.Unlock()
+	close(block)
+	if err := <-opened; statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("client Open = %v, want 481", err)
+	}
+	// Answered after anything sent before it.
+	if _, err := c.openAs(t, "msrp://client.invalid:7777/an0th3rse55ion;tcp", "msrps://"+publicHost+":2856/n0such5e55ion;tcp", newRecorder()); statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("second Open = %v, want 481", err)
+	}
+	if got := r.metrics.count(mClientPrefix + "Refused.481"); got != 2 {
+		t.Fatalf("Client.Refused.481 = %d, want 2", got)
+	}
+	if c.conn.Err() != nil {
+		t.Fatalf("connection ended: %v", c.conn.Err())
 	}
 }
 
@@ -612,6 +713,95 @@ func TestRequestsForUnknownSessionsEndTheConnectionAtTheLimit(t *testing.T) {
 	})
 }
 
+// A client that pipelines requests for unknown sessions past the limit
+// reads the 481s the relay owed it before an end of stream, not a reset,
+// though the relay had not read everything it sent (#219, from QA on
+// #217).
+func TestAClientOverTheUnknownSessionLimitStillReadsItsAnswers(t *testing.T) {
+	r := newRig(t, 1, func(o *relayOptions) { o.Edge.MaxFailedBinds = 2 })
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+	var reqs strings.Builder
+	for _, tid := range []string{"gues1", "gues2", "gues3", "gues4", "gues5", "gues6"} {
+		reqs.WriteString("MSRP " + tid + " SEND\r\nTo-Path: msrps://" + publicHost + ":2856/gu3ss" + tid + ";tcp\r\n" +
+			"From-Path: " + clientURI + "\r\nMessage-ID: " + tid + "\r\n-------" + tid + "$\r\n")
+	}
+	// Unread input past the reader's buffer, in the same Write: closing
+	// with it unread would reset the connection, so only the half-close
+	// through meteredConn delivers the 481s (QA on #237).
+	reqs.WriteString(strings.Repeat("z", 256<<10))
+	if _, err := nc.Write([]byte(reqs.String())); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, err := io.ReadAll(nc)
+	if err != nil {
+		t.Fatalf("after %q: %v, want the end of the stream", got, err)
+	}
+	for _, tid := range []string{"gues1", "gues2"} {
+		if !strings.Contains(string(got), "MSRP "+tid+" 481") {
+			t.Errorf("no 481 for %s in %q", tid, got)
+		}
+	}
+	_ = nc.(*net.TCPConn).CloseWrite()
+	eventually(t, "the close to be counted", func() bool {
+		return r.metrics.count(mClientPrefix+"Closed.TooManyUnknownSessions") == 1
+	})
+}
+
+// A connection the relay refuses for too many unknown sessions is counted
+// for that alone, whatever ends its wait for the client meanwhile: the
+// idle timeout, or the first-bind timer (#237).
+func TestARefusedConnectionIsCountedOnce(t *testing.T) {
+	for name, c := range map[string]struct {
+		idle  time.Duration
+		after func(r *rig)
+	}{
+		// 1 s: the idle timer also covers the client's pause between
+		// connecting and writing, which a loaded host can make long (QA on
+		// #237).
+		"idle during the flush": {idle: time.Second},
+		"first-bind timer during the flush": {idle: time.Minute, after: func(r *rig) {
+			r.clock.Advance(time.Hour)
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t, 1, func(o *relayOptions) { o.Edge.MaxFailedBinds = 2; o.IdleTimeout = c.idle })
+			nc, err := net.Dial("tcp", r.addrs[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = nc.Close() })
+			var reqs strings.Builder
+			for _, tid := range []string{"once1", "once2", "once3"} {
+				reqs.WriteString("MSRP " + tid + " SEND\r\nTo-Path: msrps://" + publicHost + ":2856/gu3ss" + tid + ";tcp\r\n" +
+					"From-Path: " + clientURI + "\r\nMessage-ID: " + tid + "\r\n-------" + tid + "$\r\n")
+			}
+			if _, err := nc.Write([]byte(reqs.String())); err != nil {
+				t.Fatal(err)
+			}
+			// The client reads to the end of the stream and never closes
+			// its side, so the relay waits for it.
+			_ = nc.SetReadDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.ReadAll(nc); err != nil {
+				t.Fatal(err)
+			}
+			if c.after != nil {
+				c.after(r)
+			}
+			eventually(t, "the close to be counted", func() bool {
+				return r.metrics.count(mClientPrefix+"Closed.TooManyUnknownSessions") == 1 && r.metrics.conns.Load() == 0
+			})
+			if idle, unbound := r.metrics.count(mIdleClosed), r.metrics.count(mUnboundClosed); idle != 0 || unbound != 0 {
+				t.Fatalf("also counted idle %d, unbound %d", idle, unbound)
+			}
+		})
+	}
+}
+
 func TestIdleClientConnectionIsClosed(t *testing.T) {
 	r := newRig(t, 1, func(o *relayOptions) { o.IdleTimeout = 20 * time.Millisecond })
 	c := r.dial(0, nil)
@@ -693,5 +883,59 @@ func TestServeReportsAListenerClosedUnderIt(t *testing.T) {
 	_ = ln.Close()
 	if err := <-served; !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Serve = %v, want net.ErrClosed", err)
+	}
+}
+
+// A client connection passes a half-close through, which internal/msrp
+// uses to deliver the answers it owes before closing (#219), and says so
+// when the connection underneath cannot.
+func TestAClientConnectionHalfClosesWhenItsSocketCan(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		nc, err := l.Accept()
+		if err == nil {
+			accepted <- nc
+		}
+	}()
+	peer, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	nc := <-accepted
+	t.Cleanup(func() { _ = nc.Close() })
+	mc := &meteredConn{Conn: nc, in: &atomic.Int64{}, out: &atomic.Int64{}}
+	if err := mc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite = %v", err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := peer.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("the peer read %d, %v, want the end of the stream", n, err)
+	}
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	if err := (&meteredConn{Conn: a}).CloseWrite(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CloseWrite on a pipe = %v", err)
+	}
+}
+
+func TestAKeepAliveTheRelayCouldNotBuildIsCountedAndLogged(t *testing.T) {
+	// Code review on #222: the relay failing to build a keep-alive is
+	// counted and logged, with the side and nothing else.
+	var buf bytes.Buffer
+	m := newCounters()
+	on := logged(slog.New(slog.NewJSONHandler(&buf, nil)), "client", m.onEvent(mClientPrefix))
+	on(msrp.Event{Kind: msrp.EventDropped, Method: msrp.MethodSend, Err: msrp.ErrKeepAliveNotSent})
+	on(msrp.Event{Kind: msrp.EventDropped, Method: msrp.MethodSend, Err: msrp.ErrHandlerBusy})
+	if got := m.count(mClientPrefix + "Dropped.KeepAliveNotSent"); got != 1 {
+		t.Fatalf("Client.Dropped.KeepAliveNotSent = %d", got)
+	}
+	if lines := strings.Count(buf.String(), "\n"); lines != 1 || !strings.Contains(buf.String(), `"side":"client"`) {
+		t.Fatalf("log %q, want one line with the side", buf.String())
 	}
 }

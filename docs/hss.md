@@ -205,6 +205,16 @@ participating function and store messages for users who are offline
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
 
+Every trigger also requires that the request has no `P-Served-User`. `rcs-as`
+sends requests of its own: stored messages it delivers later, notifications the
+network generates, and the terminating legs of chat sessions. It sends them to
+`scscf` as terminating requests with `P-Served-User: <user>;sescase=term`, so
+that they go on to the user's contacts. Without that check they would come back
+to `rcs-as`, which would store them and send them again, in a loop. A client
+cannot set the header: `pcscf` removes it from every client request ([ADR
+0007](adr/0007-internal-transport.md) §7), and only platform services reach the
+core SIP ports.
+
 Chat and messaging fail rather than bypass `rcs-as`, which anchors MSRP and keeps
 IMDN and store-and-forward; capability discovery and registration continue while it
 is down. Each service condition is its own trigger, with one header name and one
@@ -212,8 +222,16 @@ literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.` or
 `3gpp-application\.ims\.iari\.rcs\.`), the ICSI and IARI text after `urn-7`,
 which is the same in percent-encoded feature tags and in the plain service headers.
 The profile is created at start if missing; an operator's changes to it are kept.
+So a profile created before the `P-Served-User` check (#137) keeps its old
+triggers until an operator updates it through the API. No deployment had one.
 
 ### Writing iFC
+
+Every trigger that sends requests to `rcs-as` needs the condition that the
+request has no `P-Served-User`, in a group of its own, as in the default
+profile. Without it, the requests `rcs-as` sends for its users come back to it:
+`rcs-as` refuses them with 482 and counts `sip.loop`, and those users' messages
+are not delivered.
 
 Criteria are JSON in the provisioning API (field names follow the TS 29.228 XML
 schema). Patterns are POSIX extended regular expressions (TS 29.228 Annex F). A
@@ -243,7 +261,16 @@ the POSIX locale: `[[:alpha:]]` does not match `ä`, and `[^[:upper:]]` does.
 
 A pattern is at most 4 KiB (`MaxPatternBytes`); a longer one is refused with
 400 naming the limit. The limit bounds the time to parse a pattern, which for
-some inputs grows with the square of their length.
+some inputs grows with the square of their length. A profile's patterns
+together may cost at most `MaxSetCompileCost` (1 000 000 units) to compile,
+counted in bytes and instructions processed rather than timed. A profile of
+64 ordinary RCS criteria uses about 92% of it and the default RCS profile
+about 2%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
+development host at load 140 to 230, a profile at the limit took 39 to 48 ms
+of CPU (33 to 70 ms wall) to compile when made of 4 KiB patterns, and about
+2 to 2.3 times as long when made of hundreds of short ones; other hosts and
+loads differ, and the HSS compiles a profile once on each write. A profile
+over it is refused with 400 naming the limit.
 
 The API checks patterns when a profile is written. A profile stored before
 this rule keeps working as it is, and needs these constructs removed when it

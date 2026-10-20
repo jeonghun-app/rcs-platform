@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
@@ -46,6 +47,8 @@ func TestUsageErrorsExitWithTwo(t *testing.T) {
 		{"self not a URI", nil, []string{"-self", "nobody", "all"}, "-self"},
 		{"peer not a URI", nil, []string{"-peer", "nobody", "all"}, "-peer"},
 		{"no file size", nil, []string{"-file-size", "0", "all"}, "-file-size"},
+		{"no settle time", nil, []string{"-upload-settle", "0s", "all"}, "-upload-settle"},
+		{"step timeout within the idle wait", nil, []string{"-idle-wait", "30s", "-step-timeout", "30s", "all"}, "-step-timeout must be longer than -idle-wait"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			code, _, errOut := call(env(tt.env...), tt.args...)
@@ -74,7 +77,11 @@ func TestListAndVersionAndHelp(t *testing.T) {
 
 func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 	f := simtest.StartFT(t, 64<<10)
-	corePort := simtest.FreePort(t)
+	// ft-server notices the broken upload 4 s late, so get_upload_info
+	// waits longer than the default 3 s settle time: without -upload-settle
+	// reaching the scenario, this run fails (QA on #185).
+	f.SetBrokenUploadDelay(4 * time.Second)
+	corePort := simtest.StandInPort(t)
 	r := simtest.StartRelay(t, corePort)
 	lookup := env("RCS_SIM_FT_USER", simtest.FTUser, "RCS_SIM_FT_PASSWORD", simtest.FTPassword, "RCS_SIM_RELAY_TOKEN", simtest.RelayToken)
 	args := []string{
@@ -83,6 +90,9 @@ func TestARunPrintsOneJSONLinePerStepAndExitsWithItsOutcome(t *testing.T) {
 		// Quiet for six keep-alive intervals, so a slow scheduler still
 		// sees one go out.
 		"-msrp-keepalive", "100ms", "-idle-wait", "600ms",
+		// Only the step timeout bounds get_upload_info: one slow answer
+		// on a loaded host must not end it (#176).
+		"-upload-settle", "1h",
 		"all",
 	}
 	code, out, errOut := call(lookup, args...)

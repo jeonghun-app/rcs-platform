@@ -24,9 +24,11 @@
 //
 // A connection is read by one goroutine that never waits for a peer to
 // read: answers it produces are queued for the connection's writer, each
-// session's Handler runs on a goroutine of its own, and a relay never makes
-// its shared connection toward rcs-as wait for one client. What waits is
-// whoever produces content: Send, and a relay forwarding toward rcs-as.
+// session's Handler runs on a goroutine of its own (see Handler for what a
+// slow one holds up, before and after its session closes), and a relay
+// never makes its shared connection toward rcs-as wait for one client. What
+// waits is whoever produces content: Send, and a relay forwarding toward
+// rcs-as.
 // Everything a peer can make this side hold is bounded (Config): header
 // and message size, octets held per session (a guaranteed reserve plus a
 // share of a per-connection pool) and per connection, incomplete messages
