@@ -231,7 +231,8 @@ notifier for the reg event of each IMPU, and a proxy that routes each request
 to the flow its Request-URI is registered on (bindings keyed by scheme, user
 and host, without parameters). A request to an IMPU without a binding gets
 480, or, as a test chooses, is stored and delivered at the next
-registration, or answered 200 and lost. A request the far end never answers
+registration (or stored with its text changed), answered 200 and lost, or
+refused with 404. A request the far end never answers
 is answered 408 to its sender, and one its flow cannot take 500.
 
 ## Running it

@@ -185,6 +185,26 @@ func TestPeerOfflineTakesStoreAndForwardButNotALostMessage(t *testing.T) {
 			t.Fatalf("results %+v", results)
 		}
 	})
+	t.Run("refused otherwise", func(t *testing.T) {
+		// QA on #209: 404 is not the platform's answer, nor a store.
+		cfg, core := sipStack(t)
+		core.Offline = simtest.RefuseNotFound
+		ok, results := runAll(t, cfg, "pager-message")
+		last := results[len(results)-1]
+		if ok || last.Step != "peer-offline" || last.Detail["status"] != 404 ||
+			last.Error != "MESSAGE to the unregistered peer answered 404, want 480 or store-and-forward" {
+			t.Fatalf("results %+v", results)
+		}
+	})
+	t.Run("changed in store", func(t *testing.T) {
+		cfg, core := sipStack(t)
+		core.Offline = simtest.StoreAndChange
+		ok, results := runAll(t, cfg, "pager-message")
+		last := results[len(results)-1]
+		if ok || last.Step != "peer-offline" || last.Error != "the stored message changed on the way" {
+			t.Fatalf("results %+v", results)
+		}
+	})
 	t.Run("lost", func(t *testing.T) {
 		cfg, core := sipStack(t)
 		cfg.StepTimeout = 2 * time.Second
@@ -293,5 +313,38 @@ func TestEveryPagerCheckFailsItsStep(t *testing.T) {
 				t.Fatalf("results %+v", results)
 			}
 		})
+	}
+}
+
+func TestThisRunsMessageWithAnotherIDIsNamedNotSkipped(t *testing.T) {
+	// QA on #209: this run's message with a rewritten Message-ID is still
+	// this run's (the token in its text): the step names it at once, and
+	// does not skip it until the step times out.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	core.Rewrite = func(r *sip.Request) {
+		r.Body = []byte(regexp.MustCompile(`imdn\.Message-ID: \S+`).ReplaceAllString(string(r.Body), "imdn.Message-ID: another0message0id"))
+	}
+	ok, results := runAll(t, cfg, "pager-message")
+	last := results[len(results)-1]
+	if ok || last.Step != "receive" || last.Error != "the message received is not the one sent" || last.Detail["skipped"] != 0 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAWaitThatTimesOutReportsWhatItSkipped(t *testing.T) {
+	// QA on #209: a stale store and a message that never came read
+	// differently. Every MESSAGE to the peer here looks like an earlier
+	// run's, so receive skips it and times out.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 2 * time.Second
+	core.Rewrite = func(r *sip.Request) {
+		body := regexp.MustCompile(`imdn\.Message-ID: \S+`).ReplaceAllString(string(r.Body), "imdn.Message-ID: 0ld0message0id")
+		r.Body = []byte(regexp.MustCompile(`rcs-sim pager-mode message \S+`).ReplaceAllString(body, "rcs-sim pager-mode message"))
+	}
+	ok, results := runAll(t, cfg, "pager-message")
+	last := results[len(results)-1]
+	if ok || last.Step != "receive" || last.Detail["skipped"] != 1 {
+		t.Fatalf("results %+v", results)
 	}
 }

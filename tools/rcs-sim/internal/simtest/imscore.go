@@ -83,6 +83,11 @@ const (
 	StoreAndForward
 	// Drop answers 200 and loses the request, as a faulty element would.
 	Drop
+	// RefuseNotFound answers 404, a refusal other than the platform's.
+	RefuseNotFound
+	// StoreAndChange is StoreAndForward with the stored message's text
+	// changed, as a faulty store would.
+	StoreAndChange
 )
 
 // aorKey is how bindings are keyed: scheme, user and host (case folded),
@@ -186,8 +191,11 @@ func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
 	switch {
 	case req.Method == "REGISTER":
-		res, change := c.register(tx)
+		res, change, deliver := c.register(tx)
 		c.respond(tx, res)
+		if deliver != nil {
+			go deliver()
+		}
 		if change != nil {
 			c.registrationChanged(*change)
 		}
@@ -222,8 +230,10 @@ func (c *IMSCore) respond(tx *transaction.ServerTransaction, res *sip.Response) 
 
 // register answers a REGISTER: 401 until it has Digest credentials that
 // verify, then 200 with the binding, Require: outbound and a Service-Route.
-// Expires: 0 removes the binding.
-func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *regChange) {
+// Expires: 0 removes the binding. deliver, when not nil, sends what
+// StoreAndForward held for the IMPU; the caller runs it once the 200 has
+// gone, so the client is registered when the requests come.
+func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *regChange, func()) {
 	req := tx.Request()
 	tag, _ := c.ids.Tag()
 	creds, err := digest.ParseCredentials(req.Header.Get("Authorization"))
@@ -231,17 +241,17 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		res, _ := sip.NewResponse(req, 401, "", tag)
 		ch, _ := c.ds.Challenge(digest.SHA256, false)
 		res.Header.Add("WWW-Authenticate", ch.Header())
-		return res, nil
+		return res, nil, nil
 	}
 	password, known := c.users[creds.Username]
 	if !known || c.ds.Verify(context.Background(), "REGISTER", creds, digest.Password([]byte(password))) != nil {
 		res, _ := sip.NewResponse(req, 403, "", tag)
-		return res, nil
+		return res, nil, nil
 	}
 	to, err := req.Header.To()
 	if err != nil {
 		res, _ := sip.NewResponse(req, 400, "", tag)
-		return res, nil
+		return res, nil, nil
 	}
 	expires, _ := req.Header.Expires()
 	impu, key := to.URI.String(), aorKey(to.URI)
@@ -269,14 +279,14 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		delete(c.stored, key)
 	}
 	c.mu.Unlock()
+	var deliver func()
 	if len(held) > 0 {
-		// After the 2xx has gone, so the client knows it is registered.
 		flow := tx.Source().Flow
-		go func() {
+		deliver = func() {
 			for _, fwd := range held {
 				_, _ = c.layer.Request(fwd, transport.Destination{Flow: flow}, func(*sip.Response, error) {})
 			}
-		}()
+		}
 	}
 	if expires > 0 {
 		if contacts, err := req.Header.Contact(); err == nil {
@@ -289,7 +299,7 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		res.Header.Add("Service-Route", "<sip:orig@scscf.core.invalid;lr>")
 		res.Header.Add("P-Associated-URI", "<"+impu+">")
 	}
-	return res, change
+	return res, change, deliver
 }
 
 // regChange is what a REGISTER changed in an IMPU's registration.
@@ -475,7 +485,10 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	case err != nil:
 		answer(500)
 		return
-	case !ok && c.Offline == StoreAndForward && req.Method == "MESSAGE":
+	case !ok && (c.Offline == StoreAndForward || c.Offline == StoreAndChange) && req.Method == "MESSAGE":
+		if c.Offline == StoreAndChange {
+			fwd.Body = bytes.Replace(fwd.Body, []byte("pager-mode message"), []byte("pager-mode messagf"), 1)
+		}
 		c.mu.Lock()
 		c.stored[aorKey(req.URI)] = append(c.stored[aorKey(req.URI)], fwd)
 		c.mu.Unlock()
@@ -483,6 +496,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 		return
 	case !ok && c.Offline == Drop:
 		answer(200)
+		return
+	case !ok && c.Offline == RefuseNotFound:
+		answer(404)
 		return
 	case !ok:
 		answer(480)

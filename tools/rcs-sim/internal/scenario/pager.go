@@ -199,7 +199,9 @@ func pagerMessage(r *run) error {
 	if err := r.step("receive", func(ctx context.Context) (map[string]int64, error) {
 		m, c, skipped, err := b.await(ctx, id, token)
 		if err != nil {
-			return nil, sipError(err)
+			// What it skipped while waiting tells a stale store from a
+			// message that never came.
+			return map[string]int64{"skipped": int64(skipped)}, sipError(err)
 		}
 		detail := map[string]int64{"bytes": int64(len(m.Body)), "skipped": int64(skipped)}
 		f, err := m.Header.From()
@@ -258,7 +260,7 @@ func pagerMessage(r *run) error {
 		// earlier run's can have.
 		got, c, skipped, err := a.await(ctx, nid, "")
 		if err != nil {
-			return nil, sipError(err)
+			return map[string]int64{"skipped": int64(skipped)}, sipError(err)
 		}
 		detail := map[string]int64{"bytes": int64(len(got.Body)), "skipped": int64(skipped)}
 		if !imdn.IsNotification(c) {

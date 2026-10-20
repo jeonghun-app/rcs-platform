@@ -13,7 +13,9 @@
 // when every step succeeded, 1 when one failed, and 2 for a usage error.
 // Secrets come only from the environment: RCS_SIM_FT_PASSWORD,
 // RCS_SIM_RELAY_TOKEN, and for SIP RCS_SIM_AKA_K and RCS_SIM_AKA_OPC or
-// RCS_SIM_SIP_PASSWORD. None is ever printed, and neither are session ids.
+// RCS_SIM_SIP_PASSWORD, with the peer's own in RCS_SIM_PEER_AKA_K and
+// RCS_SIM_PEER_AKA_OPC or RCS_SIM_SIP_PEER_PASSWORD. None is ever printed,
+// and neither are session ids.
 // docs/rcs-sim.md has the details.
 package main
 
