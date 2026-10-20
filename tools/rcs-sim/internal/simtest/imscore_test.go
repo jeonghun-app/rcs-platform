@@ -163,13 +163,17 @@ func TestAChangeIsToldOnlyToThoseSubscribedWhenItHappened(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
-	held, release := make(chan struct{}), make(chan struct{})
+	held, gate := make(chan struct{}), make(chan struct{})
+	// Released on every way out, so that a failed check ends the test
+	// rather than leaving A's goroutine, and the core's Close, waiting.
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
 	var once sync.Once
 	simtest.SetAnswered(core, func(req *sip.Request) {
 		if exp, err := req.Header.Expires(); err == nil && exp == 0 {
 			once.Do(func() {
 				close(held)
-				<-release
+				<-gate
 			})
 		}
 	})
@@ -187,7 +191,7 @@ func TestAChangeIsToldOnlyToThoseSubscribedWhenItHappened(t *testing.T) {
 	} else if c, ok := ownContact(t, n.Info, impuA, b.ContactURI()); !ok || !c.Active() {
 		t.Fatalf("first notification %+v, contact %+v", n.Info, c)
 	}
-	close(release)
+	release()
 	// B's own changes, and nothing of A's, in order.
 	if _, err := b.Register(ctx); err != nil {
 		t.Fatal(err)
