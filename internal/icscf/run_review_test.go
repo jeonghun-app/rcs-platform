@@ -431,7 +431,7 @@ func (b blackholeDialer) DialContext(ctx context.Context, network, address strin
 	return d.DialContext(ctx, network, address)
 }
 
-// QA of #276: a blackholed address costs the 1 s connection timeout, not
+// QA of #276: a blackholed address costs the 2 s connection timeout, not
 // the transport's 5 s, and only once: the next request goes to another
 // address first.
 func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
@@ -453,8 +453,8 @@ func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 		res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
 		return res.StatusCode, time.Since(start)
 	}
-	if code, took := send(); code != 200 || took > 3*time.Second {
-		t.Fatalf("first: %d after %v, want 200 after about 1s", code, took)
+	if code, took := send(); code != 200 || took > 4*time.Second {
+		t.Fatalf("first: %d after %v, want 200 after about 2s", code, took)
 	}
 	if code, took := send(); code != 200 || took > 500*time.Millisecond {
 		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)

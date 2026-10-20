@@ -41,11 +41,12 @@ the namespace (`proxy.DNSResolver`, #198): every private address of
 cannot be sent to one (the task is gone, its connection refused), it goes to
 the next, counted as `icscf.scscf.next_address`. Once none is left, or when
 the name has no address, it is answered 500 with `Retry-After`. Opening a
-connection waits at most 1 s, since the address of a stopped task drops the
+connection waits at most 2 s, since the address of a stopped task drops the
 connection attempt rather than refusing it, and an address that failed goes to
-the back of the list for 30 s, so it costs that second once, not on every
-request. That second is counted with the UAR and `ICSCF_REGISTER_TIMEOUT`
-against the client's 32 s. A REGISTER
+the back of the list for 30 s, so it costs that wait once, not on every
+request. 2 s leaves room for one lost connection attempt, which Linux sends
+again after 1 s, so a healthy address is not sent to the back. The 2 s are
+counted with the UAR and `ICSCF_REGISTER_TIMEOUT` against the client's 32 s. A REGISTER
 the S-CSCF does not answer in time is not sent to another address, since that
 S-CSCF may have taken it: it gets 504.
 

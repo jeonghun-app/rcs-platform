@@ -35,8 +35,10 @@ const (
 	// is inside the VPC, where a connection opens in milliseconds, and the
 	// address of a stopped task drops the SYN rather than refusing it, so
 	// waiting the transport's 5 s default would spend that on every request
-	// sent to it (QA of #276).
-	coreDialTimeout = time.Second
+	// sent to it (QA of #276). 2 s leaves room for one lost SYN, which
+	// Linux sends again after 1 s, so a healthy address is not taken for a
+	// dead one.
+	coreDialTimeout = 2 * time.Second
 	// stopMargin is what Run needs after the drain to close the proxy, the
 	// transport and the Cx client, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
@@ -186,7 +188,7 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	case c.CxTimeout >= MaxRegisterTimeout:
 		e.Invalid("CX_TIMEOUT", "must be under 32s, the client's Timer F")
 	case c.CxTimeout > 0 && c.RegisterTimeout > 0 && 2*c.CxTimeout+coreDialTimeout+c.RegisterTimeout >= MaxRegisterTimeout:
-		e.Invalid("REGISTER_TIMEOUT", "plus twice ICSCF_CX_TIMEOUT and the 1s connection setup must be under 32s, the client's Timer F")
+		e.Invalid("REGISTER_TIMEOUT", "plus twice ICSCF_CX_TIMEOUT and the "+coreDialTimeout.String()+" connection setup must be under 32s, the client's Timer F")
 	}
 	s.ForbidInProduction(c.OriginHost != "",
 		"ICSCF_DIAMETER_HOST is set: every task would share one Origin-Host, and a task replacing a dead one would find the HSS holding its predecessor's connection in REOPEN (ADR 0005); leave it unset in ECS")

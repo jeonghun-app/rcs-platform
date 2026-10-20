@@ -166,6 +166,10 @@ type Config struct {
 	// Logger, if set, receives warnings about answers the HSS should not
 	// have sent. Nothing logged names a user.
 	Logger *slog.Logger
+	// Now, if set, is the clock behind the 30 s an address that failed
+	// stays at the back of the list, and behind the rate of a warning;
+	// nil is time.Now.
+	Now func() time.Time
 }
 
 func (c *Config) setDefaults() {
@@ -180,6 +184,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	if c.Now == nil {
+		c.Now = time.Now
 	}
 }
 

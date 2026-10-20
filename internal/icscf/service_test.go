@@ -124,8 +124,8 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"a core port past 65535":          with(devEnv, "ICSCF_CORE_ADDR", ":70000"),
 		"a drain past the stop deadline":  with(devEnv, "ICSCF_DRAIN_TIMEOUT", "16s"),
 		"a stop deadline the margin eats": with(devEnv, "RCS_SHUTDOWN_TIMEOUT", "5s"),
-		// 2 × 7.5 s + 1 s to connect + 16 s reaches Timer F.
-		"Cx, connection and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "7500ms"),
+		// 2 × 7 s + 2 s to connect + 16 s reaches Timer F.
+		"Cx, connection and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "7s"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
@@ -194,7 +194,7 @@ func startup(t *testing.T, env map[string]string) (int, string) {
 
 // Just under Timer F, the connection setup counted, is accepted.
 func TestABudgetJustUnderTimerFIsAccepted(t *testing.T) {
-	if _, err := configure(with(devEnv, "ICSCF_CX_TIMEOUT", "7s")); err != nil {
-		t.Fatalf("2 × 7 s + 1 s + 16 s refused: %v", err)
+	if _, err := configure(with(devEnv, "ICSCF_CX_TIMEOUT", "6999ms")); err != nil {
+		t.Fatalf("2 × 6.999 s + 2 s + 16 s refused: %v", err)
 	}
 }

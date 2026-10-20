@@ -40,6 +40,7 @@ type Router struct {
 	ids             sip.IDGenerator
 	metrics         Metrics
 	log             *slog.Logger
+	now             func() time.Time
 	unknownLog      everyMinute
 	failed          recentFailures
 }
@@ -130,6 +131,7 @@ func New(cfg Config) (*Router, error) {
 		ids:             cfg.IDs,
 		metrics:         cfg.Metrics,
 		log:             cfg.Logger,
+		now:             cfg.Now,
 	}, nil
 }
 
@@ -293,7 +295,7 @@ func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transp
 			return nil
 		}
 		if dst := f.Target.Destination; dst != nil && dst.Addr.IsValid() {
-			r.failed.mark(dst.Addr, time.Now())
+			r.failed.mark(dst.Addr, r.now())
 		}
 		mu.Lock()
 		defer mu.Unlock()
@@ -331,7 +333,7 @@ func (r *Router) destinations(ctx context.Context, u sip.URI) ([]transport.Desti
 	if err != nil || len(dsts) == 0 {
 		return nil, false
 	}
-	return r.failed.order(dsts, time.Now()), true
+	return r.failed.order(dsts, r.now()), true
 }
 
 // first is the first destination, nil for none: the proxy resolves then.
@@ -405,7 +407,7 @@ func (r *Router) scscf(result cx.Result, name string, caps *cx.ServerCapabilitie
 		r.metrics.Count("icscf.scscf.unknown_name", 1)
 		// The counter carries the volume; one line a minute says why,
 		// with the result code only (review of #274).
-		if r.unknownLog.allow(time.Now()) {
+		if r.unknownLog.allow(r.now()) {
 			r.log.Warn("icscf: the HSS named an S-CSCF that is not configured", slog.String("result", result.String()))
 		}
 		return sip.URI{}, errUnknownName

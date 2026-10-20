@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -359,4 +360,45 @@ func TestEachAddressOfTheSCSCFIsTriedInTurn(t *testing.T) {
 			t.Fatalf("decision = %+v, want 500 with Retry-After", got)
 		}
 	})
+}
+
+// An address a request could not be sent to goes to the back of the list
+// for 30 s, then takes its place again (QA of #276).
+func TestAFailedAddressStaysAtTheBackFor30s(t *testing.T) {
+	a := transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.1:5060")}
+	b := transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.2:5060")}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	g := newRig(t, func(c *Config) {
+		c.Resolver = stubResolver{dsts: []transport.Destination{a, b}}
+		c.Now = func() time.Time { return now }
+	})
+	firstOf := func() transport.Destination {
+		t.Helper()
+		d := g.route(invite(t, impu1))
+		if len(d.Targets) != 1 || d.Targets[0].Destination == nil {
+			t.Fatalf("targets = %+v", d.Targets)
+		}
+		return *d.Targets[0].Destination
+	}
+	d := g.route(invite(t, impu1))
+	refused, err := sip.NewResponse(invite(t, impu1), 503, "", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnBranchFailure(context.Background(), proxy.BranchFailure{Target: d.Targets[0], Response: refused, Err: errors.New("connection refused")})
+	now = now.Add(30*time.Second - time.Millisecond)
+	if got := firstOf(); got != b {
+		t.Fatalf("just before 30 s the first address is %v, want the other one", got.Addr)
+	}
+	now = now.Add(2 * time.Millisecond)
+	if got := firstOf(); got != a {
+		t.Fatalf("just after 30 s the first address is %v, want the one that failed", got.Addr)
+	}
+}
+
+// Without Config.Now the 30 s are on the wall clock.
+func TestTheRouterClockIsTheWallClockByDefault(t *testing.T) {
+	if d := time.Since(newRig(t).r.now()); d < 0 || d > time.Minute {
+		t.Fatalf("the default clock is %v off the wall clock", d)
+	}
 }
