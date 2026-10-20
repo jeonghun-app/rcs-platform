@@ -1,7 +1,11 @@
 package msrp
 
 import (
-	"runtime"
+	"bytes"
+	"context"
+	"fmt"
+	"runtime/pprof"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,15 +62,48 @@ func isDelivering(s *Session) bool {
 	return s.delivering
 }
 
+// labelled runs f with the pprof label session=<s>. Goroutines inherit the
+// labels of the goroutine that starts them, so a drainer that reportOwn
+// starts within f carries the label from its creation on, before it has
+// run at all, and no other session's does (#265).
+func labelled(s *Session, f func()) {
+	pprof.Do(context.Background(), pprof.Labels("session", fmt.Sprintf("%p", s)), func(context.Context) { f() })
+}
+
+// labelledGoroutines counts the goroutines carrying s's label, from the
+// goroutine profile: each record starts "N @ ..." and has a "# labels:"
+// line. Called outside labelled, it does not count the caller.
+func labelledGoroutines(t *testing.T, s *Session) int {
+	t.Helper()
+	var b bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&b, 1); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(fmt.Sprintf(`# labels: {"session":"%p"}`, s))
+	n, count := 0, 0
+	for _, line := range bytes.Split(b.Bytes(), []byte("\n")) {
+		if c, _, ok := bytes.Cut(line, []byte(" @ ")); ok {
+			var err error
+			if count, err = strconv.Atoi(string(c)); err != nil {
+				t.Fatalf("goroutine profile line %q", line)
+			}
+		} else if bytes.Equal(line, want) {
+			n += count
+		}
+	}
+	return n
+}
+
 // QA on #259: a slow handler that eventually drains. 10000 reports after the close;
 // the drainer exits once done, the goroutine count returns, and a later
 // report is still delivered (a new drainer).
 //
-// #265: every wait is for an event of this session's (its reports all
-// handled, its drainer done), and fails only once nothing has moved for
-// hangGuard, so a loaded host slows the test without failing it. Another
-// session draining meanwhile, as one an earlier test can leave behind,
-// changes none of it.
+// #265: every wait is for this session's own events: its reports all
+// handled, which fails only once the count has not moved for hangGuard,
+// and single steps (a drainer gone, one report handled), each bounded by
+// hangGuard. The goroutines counted are those carrying the session's
+// label, so another session draining meanwhile, as one an earlier test can
+// leave behind, changes none of it.
 func TestAReportAfterTheDrainStillReachesTheHandler(t *testing.T) {
 	var dropped atomic.Int64
 	c, p := activeWithPeer(t, Config{Clock: newFakeClock(), OnEvent: func(e Event) {
@@ -91,27 +128,33 @@ func TestAReportAfterTheDrainStillReachesTheHandler(t *testing.T) {
 	}
 	waitDone(t, s.Done(), "session")
 	still := func() int64 { return 0 }
-	idle := func() bool { return !isDelivering(s) }
 	// The report goroutine drains what the close left, possibly nothing,
-	// once it is scheduled; until then it is the one that delivers.
-	waitProgress(t, "the report goroutine to drain on close", idle, still, nil)
-	before := runtime.NumGoroutine()
+	// once it is scheduled; until then it is the one that delivers. It was
+	// started at the bind, without the label.
+	waitProgress(t, "the report goroutine to drain on close", func() bool { return !isDelivering(s) }, still, nil)
+	// Gone: the drainer cleared delivering and has returned.
+	gone := func() bool { return !isDelivering(s) && labelledGoroutines(t, s) == 0 }
 	const n = 10000
 	var afters atomic.Int64
 	all := make(chan struct{})
 	maxG := 0
-	for i := 1; i <= n; i++ {
-		s.reportOwn(ownReport(i, n), func() {
-			if afters.Add(1) == n {
-				close(all)
-			}
-		})
-		if i%500 == 0 {
-			if g := runtime.NumGoroutine() - before; g > maxG {
-				maxG = g
+	labelled(s, func() {
+		for i := 1; i <= n; i++ {
+			s.reportOwn(ownReport(i, n), func() {
+				if afters.Add(1) == n {
+					close(all)
+				}
+			})
+			if i%500 == 0 {
+				// A report was just queued, or dropped for a full queue,
+				// so a drainer is running. The count includes this
+				// goroutine, which runs with the label; a drainer that has
+				// let go of delivering may not have returned yet when the
+				// next one starts, so two at a time can be seen.
+				maxG = max(maxG, labelledGoroutines(t, s)-1)
 			}
 		}
-	}
+	})
 	closed := func(ch chan struct{}) func() bool {
 		return func() bool {
 			select {
@@ -123,28 +166,21 @@ func TestAReportAfterTheDrainStillReachesTheHandler(t *testing.T) {
 		}
 	}
 	waitProgress(t, "every report delivered or dropped", closed(all), afters.Load, nil)
-	waitProgress(t, "the drainer to exit", idle, still, nil)
-	after := runtime.NumGoroutine()
-	// The count is the whole binary's, which goroutines of earlier tests
-	// ending late move by one or two (#265); one per report would move it
-	// by thousands. This session's drainer is known to be done above.
-	if g := after - before; g > maxG {
-		maxG = g
-	}
+	waitProgress(t, "the drainer to exit", gone, still, nil)
 	got := h.got.Load()
-	t.Logf("delivered=%d dropped=%d afters=%d maxGrowth=%d goroutines before=%d after=%d", got, dropped.Load(), afters.Load(), maxG, before, after)
-	if got+dropped.Load() != n || maxG > 2 {
-		t.Errorf("delivered %d + dropped %d != %d, or the goroutines grew by %d (%d before, %d after)", got, dropped.Load(), n, maxG, before, after)
+	t.Logf("delivered=%d dropped=%d afters=%d drainers at most %d", got, dropped.Load(), afters.Load(), maxG)
+	if got+dropped.Load() != n || maxG < 1 || maxG > 2 {
+		t.Errorf("delivered %d + dropped %d != %d, or %d drainers at most, want one or two", got, dropped.Load(), n, maxG)
 	}
 	last := make(chan struct{})
-	s.reportOwn(ownReport(n+1, n+1), func() { close(last) })
+	labelled(s, func() { s.reportOwn(ownReport(n+1, n+1), func() { close(last) }) })
 	waitProgress(t, "a report after the drain", closed(last), still, nil)
 	if h.got.Load() != got+1 {
 		t.Fatalf("the handler got %d reports, want %d", h.got.Load(), got+1)
 	}
 	// Its drainer is done before the test ends, so that none of this
 	// test's is left running into the next one.
-	waitProgress(t, "the second drainer to exit", idle, still, nil)
+	waitProgress(t, "the second drainer to exit", gone, still, nil)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for i := 1; i < len(h.order); i++ {
