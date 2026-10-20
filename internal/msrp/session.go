@@ -153,15 +153,18 @@ type Session struct {
 	// dropped beyond MaxHandlerQueue. reportWake tells the goroutine about
 	// new ones; reportRoom tells Send that one was delivered. rmu keeps
 	// HandleReport calls one at a time even after the session closed.
-	// draining is set while one goroutine delivers what is left after the
-	// close: one at a time, in order, and at most MaxHandlerQueue waiting
-	// (#258).
+	// delivering is set while a goroutine delivers reports: the session's
+	// report goroutine from the bind until it has drained what is left
+	// after the close, or, for a session closed before any bind or after
+	// that, one started for the reports that came after. So there is never
+	// more than one, they go one at a time, in order, and at most
+	// MaxHandlerQueue wait after the close (#258).
 	reports    []queuedReport
 	ownCount   int
 	reportWake chan struct{}
 	reportRoom chan struct{}
 	rmu        sync.Mutex
-	draining   bool
+	delivering bool
 	// window holds a token per chunk Send has awaiting its answer.
 	window chan struct{}
 	// backlog counts octets queued toward the client of a bridged edge
@@ -347,6 +350,8 @@ func (s *Session) attach(c *Conn) error {
 	s.flushing = flush
 	if s.handler != nil {
 		s.events = make(chan event, c.cfg.MaxHandlerQueue)
+		// workReports delivers until it has drained.
+		s.delivering = true
 		go s.work(c)
 		go s.workReports(c)
 	}
@@ -702,21 +707,15 @@ func (s *Session) work(c *Conn) {
 
 // workReports delivers reports in order, apart from messages so that a
 // HandleMessage that sends on its own session cannot hold up the reports
-// that sending waits for. On close it becomes the drainer of what is left
-// about this session's own sends, unless one already runs.
+// that sending waits for. On close it drains what is left about this
+// session's own sends; delivering, set at the bind, keeps any other
+// goroutine from delivering meanwhile.
 func (s *Session) workReports(c *Conn) {
 	for {
 		select {
 		case <-s.reportWake:
 			s.deliverReports()
 		case <-s.done:
-			s.mu.Lock()
-			if s.draining {
-				s.mu.Unlock()
-				return
-			}
-			s.draining = true
-			s.mu.Unlock()
 			s.drain()
 			return
 		}
@@ -725,12 +724,13 @@ func (s *Session) workReports(c *Conn) {
 
 // drain delivers, one at a time and in order, the reports about this
 // session's own sends that are left after it closed, and drops the rest,
-// until none is left. Only the goroutine that set draining runs it.
+// until none is left, and then clears delivering in the same lock. Only
+// the goroutine delivering runs it.
 func (s *Session) drain() {
 	for {
 		s.mu.Lock()
 		if len(s.reports) == 0 {
-			s.draining = false
+			s.delivering = false
 			s.mu.Unlock()
 			return
 		}
@@ -791,8 +791,8 @@ func (s *Session) reportOwn(r Report, after func()) {
 	}
 	s.reports = append(s.reports, q)
 	s.ownCount++
-	start := !s.draining
-	s.draining = true
+	start := !s.delivering
+	s.delivering = true
 	s.mu.Unlock()
 	if start {
 		go s.drain()

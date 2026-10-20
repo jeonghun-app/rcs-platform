@@ -588,3 +588,70 @@ func TestReportsAfterACloseAreDeliveredInOrder(t *testing.T) {
 		}
 	}
 }
+
+// gatedReports blocks HandleReport on report 1 until release closes, and
+// records the order reports came in and the goroutines they came on.
+type gatedReports struct {
+	release chan struct{}
+	mu      sync.Mutex
+	starts  []int64
+	callers map[string]bool
+	n       chan struct{}
+}
+
+func (h *gatedReports) HandleMessage(*Session, *Message) error { return nil }
+func (h *gatedReports) HandleReport(_ *Session, r Report) {
+	if r.Range.Start == 1 {
+		<-h.release
+	}
+	buf := make([]byte, 64)
+	id := strings.Fields(string(buf[:runtime.Stack(buf, false)]))[1]
+	h.mu.Lock()
+	h.starts = append(h.starts, r.Range.Start)
+	h.callers[id] = true
+	h.mu.Unlock()
+	h.n <- struct{}{}
+}
+
+// Code review on #259: a handler stuck on the first report while the
+// session is open, 9 more queued behind it, then the close, then 10 more:
+// all 20 still come in order, on one goroutine.
+func TestReportsQueuedAcrossTheCloseKeepTheirOrder(t *testing.T) {
+	for range 50 {
+		c, p := activeWithPeer(t, Config{Clock: newFakeClock()})
+		h := &gatedReports{release: make(chan struct{}), callers: map[string]bool{}, n: make(chan struct{}, 32)}
+		s := newTestSession(t, clientURI, asURI, h)
+		openWithPeer(t, c, p, s)
+		report := func(i int) {
+			s.reportOwn(Report{MessageID: "m", Range: ByteRange{Start: int64(i), End: int64(i), Total: 20}, Code: StatusRequestTimeout}, nil)
+		}
+		for i := 1; i <= 10; i++ {
+			report(i)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		waitDone(t, s.Done(), "session")
+		for i := 11; i <= 20; i++ {
+			report(i)
+		}
+		close(h.release)
+		for range 20 {
+			select {
+			case <-h.n:
+			case <-time.After(hangGuard):
+				t.Fatal("not every report came")
+			}
+		}
+		h.mu.Lock()
+		for i, got := range h.starts {
+			if got != int64(i)+1 {
+				t.Fatalf("reports came as %v", h.starts)
+			}
+		}
+		if len(h.callers) != 1 {
+			t.Fatalf("reports came on %d goroutines", len(h.callers))
+		}
+		h.mu.Unlock()
+	}
+}
