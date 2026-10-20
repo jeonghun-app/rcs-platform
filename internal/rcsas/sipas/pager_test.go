@@ -3,6 +3,7 @@ package sipas
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 func delivery() messaging.Delivery {
@@ -146,11 +148,18 @@ func TestADeliveryWithoutAUsableAddressIsUndeliverable(t *testing.T) {
 	}
 }
 
-func TestSessionsAreNotServedYet(t *testing.T) {
-	a := startAS(t, &fakeEngine{}, newFakeCore(t))
-	if err := a.srv.Invite(t.Context(), messaging.Invitation{Recipient: bob, Peer: alice}); err == nil ||
-		errors.Is(err, messaging.ErrNoSessions) || errors.Is(err, messaging.ErrOffline) {
+// An invitation the engine gives no leg for fails with the engine's error,
+// and sends nothing.
+func TestAnInvitationWithoutALegFailsWithTheEnginesError(t *testing.T) {
+	core := newFakeCore(t)
+	a := startAS(t, &fakeEngine{}, core)
+	if err := a.srv.Invite(t.Context(), messaging.Invitation{Recipient: bob, Peer: alice, Mode: store.Chat}); !errors.Is(err, errFakeLeg) {
 		t.Fatalf("Invite = %v", err)
+	}
+	select {
+	case req := <-core.got:
+		t.Fatalf("the core got %s", req.Method)
+	default:
 	}
 }
 
@@ -190,5 +199,28 @@ func TestADeliveryThatComesBackIsRefusedAsALoop(t *testing.T) {
 	// A client's own MESSAGE goes through as before.
 	if res := p.send(pager(cpimBody("m2", "hi"))); res.StatusCode != 202 {
 		t.Fatalf("a client's MESSAGE answered %d", res.StatusCode)
+	}
+}
+
+// The transport's contract (#35) for what rcs-as sends, as the proxy
+// follows it for what it forwards: a vanished flow is a recipient offline
+// (430), a next hop without room a passing failure (503 with Retry-After),
+// and the transport's error, which can name an address, stays out.
+func TestASendFailureSaysWhatTheTransportReported(t *testing.T) {
+	for err, want := range map[error]error{
+		transport.ErrNoFlow:                            messaging.ErrOffline,
+		fmt.Errorf("wrapped: %w", transport.ErrNoFlow): messaging.ErrOffline,
+		transport.ErrQueueFull:                         errNextHopBusy,
+		transport.ErrTooManyConnections:                errNextHopBusy,
+		transport.ErrClosed:                            messaging.ErrOffline,
+		errors.New("dial 192.0.2.9:5060: refused"):     messaging.ErrOffline,
+	} {
+		got := sendError(err)
+		if !errors.Is(got, want) || errors.Is(got, err) {
+			t.Errorf("sendError(%v) = %v, want %v without the transport's error", err, got, want)
+		}
+		if want == errNextHopBusy && errors.Is(got, messaging.ErrOffline) {
+			t.Errorf("sendError(%v) is ErrOffline", err)
+		}
 	}
 }
