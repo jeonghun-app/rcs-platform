@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/proxyproto"
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -26,17 +28,26 @@ import (
 // never a protocol timer.
 const waitFor = 10 * time.Second
 
-// testConfig serves plain TCP on loopback, with the task address 127.0.0.1.
+// testConfig serves plain TCP on loopback, with the task address 127.0.0.2:
+// a core hop never resolves to the task's own address, and the fake core
+// nodes listen on 127.0.0.1.
 func testConfig() Config {
 	return Config{
 		PublicHost: publicHost, PublicPort: 5060, ClientTransport: ClientTCP, ClientAddr: "127.0.0.1:0",
-		CoreAddr: "127.0.0.1:0", CoreHost: netip.MustParseAddr("127.0.0.1"),
+		CoreAddr: "127.0.0.2:0", CoreHost: netip.MustParseAddr("127.0.0.2"),
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout, DrainTimeout: time.Second,
+		ICSCF:         sip.URI{Scheme: "sip", Host: "icscf.rcs.internal", Params: sip.Params{{Name: "transport", Value: "tcp"}, {Name: "lr"}}},
+		AllowLoopback: true, MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
+		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
+		SCSCFHost: "scscf.rcs.internal", SCSCFPort: DefaultSCSCFPort,
+		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
+		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 	}
 }
 
 type service struct {
+	h                 *runtimetest.Harness
 	client, udp, core netip.AddrPort
 	stop              func()
 	done              chan error
@@ -45,9 +56,14 @@ type service struct {
 // start runs pcscf with cfg and d until the test ends.
 func start(t *testing.T, cfg Config, d deps) *service {
 	t.Helper()
-	h := runtimetest.New(t, "pcscf")
+	return startWith(t, runtimetest.New(t, "pcscf"), cfg, d)
+}
+
+// startWith is start on the runtime of h.
+func startWith(t *testing.T, h *runtimetest.Harness, cfg Config, d deps) *service {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &service{done: make(chan error, 1)}
+	s := &service{h: h, done: make(chan error, 1)}
 	listening := make(chan struct{})
 	d.listening = func(b bound) {
 		s.client, s.udp, s.core = b.client, b.udp, b.core
@@ -128,8 +144,10 @@ func (p *peer) try(routes ...string) (*sip.Response, error) {
 	return p.tryWith(fields...)
 }
 
-// tryWith sends an OPTIONS with extra header fields and returns the
-// response.
+// tryWith sends an OPTIONS inside a made-up dialog, with extra header fields,
+// and returns the response: without a route this pcscf recorded it is
+// answered 403 (an OPTIONS outside a dialog from a flow without a
+// registration would be discarded).
 func (p *peer) tryWith(fields ...string) (*sip.Response, error) {
 	n := requests.Add(1)
 	var b strings.Builder
@@ -137,7 +155,7 @@ func (p *peer) tryWith(fields ...string) (*sip.Response, error) {
 	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.10:40000;branch=z9hG4bK-pcscf-%d\r\n", n)
 	b.WriteString("Max-Forwards: 70\r\n")
 	b.WriteString("From: <sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org>;tag=a1\r\n")
-	b.WriteString("To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>\r\n")
+	b.WriteString("To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>;tag=b1\r\n")
 	fmt.Fprintf(&b, "Call-ID: pcscf-test-%d\r\n", n)
 	fmt.Fprintf(&b, "CSeq: %d OPTIONS\r\n", n)
 	for _, f := range fields {
@@ -169,10 +187,33 @@ func (p *peer) closed() bool {
 	return err != nil && !(errors.As(err, &ne) && ne.Timeout())
 }
 
+// Until it registers, a client's request outside a dialog is discarded and
+// counted (TS 24.229 §5.2.6.3.2A), and one inside a dialog pcscf did not
+// record is refused with 403; a request from the core that names no client
+// flow gets 430.
 func TestUntilRegistrationClientsGet403AndTheCore430(t *testing.T) {
 	s := start(t, testConfig(), deps{})
-	if res := dial(t, s.client, nil).request(); res.StatusCode != 403 {
-		t.Fatalf("client OPTIONS answered %d, want 403", res.StatusCode)
+	c := dial(t, s.client, nil)
+	discarded := strings.Replace(registerText(""), "REGISTER", "OPTIONS", -1)
+	_ = c.nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := io.WriteString(c.nc, discarded); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(waitFor)
+	for {
+		if v, ok := s.h.Metric(metricUnregistered); ok && v == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the discard was not counted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The first response is the in-dialog request's: the discarded one had
+	// none.
+	res := c.request()
+	if res.StatusCode != 403 || res.Header.Get("Call-ID") == "reg-1" {
+		t.Fatalf("client OPTIONS answered %d (Call-ID %s), want 403 to the in-dialog one", res.StatusCode, res.Header.Get("Call-ID"))
 	}
 	if res := dial(t, s.core, nil).request(); res.StatusCode != 430 {
 		t.Fatalf("core OPTIONS answered %d, want 430", res.StatusCode)
@@ -211,9 +252,12 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 		// The NLB's address, as rcsjta writes its first Route (review of #188).
 		"sip:203.0.113.10:5061;transport=tls;lr",
 		"sip:203.0.113.10;lr",
-		"sip:127.0.0.1;lr",
-		"sip:127.0.0.1:5061;lr",
-		"sip:127.0.0.1:" + fmt.Sprint(s.core.Port()) + ";lr",
+		"sip:127.0.0.2;lr",
+		"sip:127.0.0.2:5061;lr",
+		"sip:127.0.0.2:" + fmt.Sprint(s.core.Port()) + ";lr",
+		// Its address written another way (review of #208).
+		"sip:[::ffff:127.0.0.2]:" + fmt.Sprint(s.core.Port()) + ";transport=tcp;lr",
+		"sip:PCSCF.rcs.example.net.:5060;lr",
 	} {
 		rec.seen = nil
 		c.request(r, "sip:scscf.example.net;lr")
@@ -221,7 +265,7 @@ func TestPcscfRecognisesItselfByItsPublicNameOrItsAddress(t *testing.T) {
 			t.Errorf("Route %s: router saw %q, want it taken as pcscf's own", r, rec.seen)
 		}
 	}
-	for _, r := range []string{"sip:other.rcs.example.net;lr", "sip:127.0.0.2;lr", "sip:" + publicHost + ":5070;lr", "sip:203.0.113.11:5061;lr"} {
+	for _, r := range []string{"sip:other.rcs.example.net;lr", "sip:127.0.0.3;lr", "sip:" + publicHost + ":5070;lr", "sip:203.0.113.11:5061;lr"} {
 		rec.seen = nil
 		c.request(r)
 		if len(rec.seen) != 1 || !strings.HasPrefix(rec.seen[0], "0 ") {
@@ -457,7 +501,7 @@ func TestAUDPClientIsAClient(t *testing.T) {
 		"Via: SIP/2.0/UDP 192.0.2.10:40000;rport;branch=z9hG4bK-pcscf-udp\r\n" +
 		"Max-Forwards: 70\r\n" +
 		"From: <sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org>;tag=a1\r\n" +
-		"To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>\r\n" +
+		"To: <sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org>;tag=b1\r\n" +
 		"Call-ID: pcscf-test-udp\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n"
 	_ = nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(nc, req); err != nil {
@@ -482,10 +526,19 @@ func TestAQuietClientConnectionIsClosed(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClientIdleTimeout = time.Second
 	s := start(t, cfg, deps{})
+	began := time.Now()
 	c := dial(t, s.client, nil)
-	c.request()
+	// The request makes the connection a flow. On a loaded host the second
+	// may pass before it is answered, so the answer is not required; that
+	// the close waited for the idle timeout is, which load cannot break.
+	if res, err := c.try(); err == nil && res.StatusCode != 403 {
+		t.Errorf("OPTIONS answered %d", res.StatusCode)
+	}
 	if !c.closed() {
 		t.Fatal("a quiet client connection was kept open")
+	}
+	if waited := time.Since(began); waited < cfg.ClientIdleTimeout {
+		t.Errorf("closed after %v, before the idle timeout", waited)
 	}
 }
 
@@ -516,27 +569,125 @@ func TestTheClientListenersAreClientFacing(t *testing.T) {
 // the core listener always has room for scscf (review of #188).
 func TestClientFlowsLeaveRoomForTheCore(t *testing.T) {
 	cfg := testConfig()
-	cfg.MaxClientFlows = 2
+	// At the boundary the configuration allows: the transport's last
+	// connection is the core's (review of #188).
+	cfg.MaxClientFlows, cfg.CoreConnections = 2, 1
+	cfg.MaxConnections = cfg.MaxClientFlows + cfg.CoreConnections
 	s := start(t, cfg, deps{})
 	dial(t, s.client, nil).request()
 	dial(t, s.client, nil).request()
 	if !dial(t, s.client, nil).closed() {
 		t.Fatal("a client flow past MaxClientFlows was admitted")
 	}
-	if res := dial(t, s.core, nil).request(); res.StatusCode != 430 {
-		t.Fatalf("the core answered %d", res.StatusCode)
+	// The refused connection gives its transport slot back just after it
+	// is closed, so the core may have to try again.
+	deadline := time.Now().Add(waitFor)
+	for {
+		res, err := dial(t, s.core, nil).try()
+		if err == nil {
+			if res.StatusCode != 430 {
+				t.Fatalf("the core answered %d", res.StatusCode)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the core was kept out: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// The transport accepts at most MaxConnections connections in all.
-func TestTheTransportTakesMaxConnections(t *testing.T) {
+// The client listener takes at most PCSCF_MAX_CLIENT_FLOWS connections,
+// counted from accept, and the core listener PCSCF_CORE_CONNECTIONS: the
+// client listener at its limit leaves the core its room (#193).
+func TestTheClientListenerAtItsLimitLeavesTheCoreItsRoom(t *testing.T) {
 	cfg := testConfig()
-	cfg.MaxConnections, cfg.MaxClientFlows, cfg.CoreConnections = 2, 1, 1
-	s := start(t, cfg, deps{})
-	dial(t, s.core, nil).request()
+	cfg.MaxConnections, cfg.MaxClientFlows, cfg.CoreConnections = 4, 2, 1
+	var pc *pcscf
+	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
+	// Connections that have sent nothing yet hold their slots.
+	dial(t, s.client, nil)
+	dial(t, s.client, nil)
+	if res, err := dial(t, s.client, nil).try(); err == nil {
+		t.Fatalf("a client connection past its listener's limit was answered %d", res.StatusCode)
+	}
 	dial(t, s.core, nil).request()
 	if res, err := dial(t, s.core, nil).try(); err == nil {
-		t.Fatalf("a connection past MaxConnections was answered %d", res.StatusCode)
+		t.Fatalf("a core connection past its listener's limit was answered %d", res.StatusCode)
+	}
+	st := pc.flows.(*transport.Transport).Stats()
+	if st.ClientListenerRejected != 1 || st.CoreListenerRejected != 1 || st.Rejected != 0 {
+		t.Errorf("stats %+v", st)
+	}
+}
+
+// pcscf opens no listener without a connection limit, nor listeners whose
+// limits together exceed the transport's (#193); a UDP listener holds no
+// connections.
+func TestListenerLimitsAreChecked(t *testing.T) {
+	cfg := testConfig()
+	cfg.ClientUDPAddr = "127.0.0.1:0"
+	ls := []transport.ListenerConfig{coreListenerConfig(cfg), clientListenerConfig(cfg), udpListenerConfig(cfg)}
+	if err := checkListenerLimits(cfg.MaxConnections, ls); err != nil {
+		t.Fatalf("the defaults: %v", err)
+	}
+	if ls[0].MaxConnections != DefaultCoreConnections || ls[1].MaxConnections != DefaultMaxClientFlows || ls[2].MaxConnections != 0 {
+		t.Errorf("limits %d, %d, %d", ls[0].MaxConnections, ls[1].MaxConnections, ls[2].MaxConnections)
+	}
+	if err := checkListenerLimits(DefaultMaxClientFlows+DefaultCoreConnections-1, ls); err == nil {
+		t.Error("limits past the total were taken")
+	}
+	for i := range 2 {
+		bad := slices.Clone(ls)
+		bad[i].MaxConnections = 0
+		if err := checkListenerLimits(cfg.MaxConnections, bad); err == nil {
+			t.Errorf("listener %s without a limit was taken", bad[i].Name)
+		}
+	}
+	cfg.MaxClientFlows = cfg.MaxConnections
+	if err := run(context.Background(), runtimetest.New(t, "pcscf").Runtime, cfg, deps{}); err == nil || !strings.Contains(err.Error(), "exceed") {
+		t.Errorf("run with limits past the total: %v", err)
+	}
+}
+
+// The sweep exports the listeners' connections, and, since the last sweep,
+// the connections each limit refused and the PROXY headers that timed out,
+// failed or never began, as EMF metrics; a UDP listener has no gauge
+// (#193).
+func TestTheTransportsListenerMetricsAreExported(t *testing.T) {
+	var out strings.Builder
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	m := runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, slog.New(slog.DiscardHandler))
+	var tm transportMetrics
+	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 7, "core": 2}, ProxyHeaderTimeouts: 3, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5,
+		ClientListenerRejected: 6, CoreListenerRejected: 1, Rejected: 2})
+	tm.record(m, transport.Stats{ListenerConnections: map[string]int{"client": 9, "core": 2}, ProxyHeaderTimeouts: 4, ProxyHeaderErrors: 1, ProxyHeaderEmpty: 5,
+		ClientListenerRejected: 8, CoreListenerRejected: 1, Rejected: 3})
+	m.Flush()
+	for _, want := range []string{`"transport.listener_connections.client":9`, `"transport.listener_connections.core":2`,
+		`"transport.proxy_header_timeouts":4`, `"transport.proxy_header_errors":1`, `"transport.proxy_header_empty":5`,
+		`"transport.client_listener_rejected":8`, `"transport.core_listener_rejected":1`, `"transport.rejected":3`} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("metrics lack %s:\n%s", want, out.String())
+		}
+	}
+	tm.record(nil, transport.Stats{})
+
+	// run exports the transport's own on its sweep.
+	h := runtimetest.New(t, "pcscf")
+	cfg := testConfig()
+	cfg.ClientUDPAddr = "127.0.0.1:0"
+	s := startWith(t, h, cfg, deps{sweep: 5 * time.Millisecond})
+	dial(t, s.client, nil)
+	deadline := time.Now().Add(waitFor)
+	for !slices.Contains(h.MetricValues("transport.listener_connections.client"), 1) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no listener gauge:\n%s", h.Output())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.Contains(h.Output(), "client-udp") {
+		t.Errorf("a UDP listener has a gauge:\n%s", h.Output())
 	}
 }
 

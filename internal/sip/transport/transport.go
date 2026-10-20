@@ -648,7 +648,7 @@ type Stats struct {
 	Dialed             uint64 // outbound connections opened
 	DialErrors         uint64
 	DialLimited        uint64 // dials refused at MaxDialedConnections
-	ProxyHeaderErrors  uint64 // connections closed for a missing or invalid PROXY header
+	ProxyHeaderErrors  uint64 // connections closed for a PROXY header begun and invalid or cut
 	HealthChecks       uint64 // PROXY LOCAL connections, closed without a flow
 	TLSHandshakeErrors uint64
 	FramingErrors      uint64 // stream connections closed because a message did not parse
@@ -679,6 +679,12 @@ type Stats struct {
 	// header did not arrive within ListenerConfig.ProxyHeaderTimeout; a
 	// malformed header counts in ProxyHeaderErrors instead.
 	ProxyHeaderTimeouts uint64
+	// ProxyHeaderEmpty counts connections closed or reset before sending
+	// any byte of their PROXY header: clients or scanners that gave up,
+	// never the NLB, whose health checks send a LOCAL header (ADR 0003).
+	// ProxyHeaderErrors counts every other failure of a header begun, so
+	// that it says the NLB is not sending the header.
+	ProxyHeaderEmpty uint64
 }
 
 type counters struct {
@@ -686,7 +692,7 @@ type counters struct {
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
 	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses,
-	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts atomic.Uint64
+	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -737,6 +743,7 @@ func (t *Transport) Stats() Stats {
 		CoreListenerRejected:   c.coreListenerRejected.Load(),
 		ListenerConnections:    perListener,
 		ProxyHeaderTimeouts:    c.proxyHeaderTimeouts.Load(),
+		ProxyHeaderEmpty:       c.proxyHeaderEmpty.Load(),
 	}
 }
 

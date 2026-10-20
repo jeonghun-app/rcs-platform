@@ -2,9 +2,13 @@ package pcscf
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net/netip"
 	"strings"
+	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -28,8 +32,9 @@ func fromClient(src transport.Source) bool {
 // 24.229 §5.2.1, §5.2.6.3.3, RFC 3325, ADR 0007 §7). pcscf removes them from
 // every request and response a client sends, so a client cannot assert an
 // identity, a served user, a service, charging or media authorisation data,
-// network feature capabilities, a private network or a profile key, or
-// claim a visited network; the core trusts them because only pcscf admits
+// network feature capabilities, a private network or a profile key, claim
+// a visited network, or write the Path a registrar keeps (RFC 3327 §5.1:
+// proxies insert it); the core trusts them because only pcscf admits
 // clients.
 var networkOnlyHeaders = []string{
 	"P-Asserted-Identity",
@@ -44,6 +49,7 @@ var networkOnlyHeaders = []string{
 	"Feature-Caps",
 	"P-Private-Network-Indication",
 	"P-Profile-Key",
+	"Path",
 }
 
 // stripNetworkHeaders removes networkOnlyHeaders from h, and every
@@ -156,17 +162,99 @@ func hostOf(a netip.Addr) string {
 	return a.String()
 }
 
-// router is pcscf's location service. Until registration lands it serves no
-// one: a client's request is refused with 403, since no flow is registered,
-// and the core's with 430, since no flow it could name exists (RFC 5626
-// §5.3).
-type router struct{}
+// pcscf is the location service of the proxy (proxy.Router) and the state
+// behind it.
+type pcscf struct {
+	cfg      Config
+	corePort int
+	registry *registry
+	// registers and initials limit the REGISTERs and the requests outside a
+	// dialog of one client.
+	registers, initials *limiter
+	// resolve finds a core hop, as the proxy does.
+	resolve proxy.Resolver
+	// icscfs finds icscf's addresses, every one so that a REGISTER can try
+	// the next.
+	icscfs allResolver
+	// rand draws charging identifiers.
+	rand io.Reader
+	// dialogKey is the key of dialogMAC, drawn at every start.
+	dialogKey []byte
+	// flows sets a flow's idle timeout; nil in tests that need none.
+	flows flowSetter
+	ids   sip.IDGenerator
+	now   func() time.Time
+	log   *slog.Logger
+	// allRegisters limits the REGISTERs of all clients together.
+	allRegisters taskLimit
+	// icscfFirst and icscfTotal bound a REGISTER's first attempt at icscf
+	// and all of them.
+	icscfFirst, icscfTotal time.Duration
+	// clientFlow reports whether a flow token names a live client flow of
+	// this task.
+	clientFlow func(transport.FlowID) bool
+	// metrics counts what is worth an alarm; nil in tests that need none.
+	metrics *runtime.Metrics
+	// subs are the reg event subscriptions, and send starts the client
+	// transaction of a SUBSCRIBE; nil in tests that need none.
+	subs *subscriptions
+	send sender
+}
 
-func (router) Route(_ context.Context, r *proxy.Request) proxy.Decision {
-	if fromClient(r.Source) {
-		return proxy.Decision{Status: 403, Reason: "Not Registered"}
+// Route implements proxy.Router. A client's REGISTER goes to icscf, its
+// other requests outside a dialog along its Service-Route, and those inside
+// one along their Route if pcscf is on it; a request from the core goes to
+// the client flow its Route names, unless it is addressed to one of
+// pcscf's own reg event subscriptions.
+func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
+	if !fromClient(r.Source) {
+		if p.subs != nil && p.ownURI(r.Message.URI) {
+			return proxy.Decision{Serve: p.serveNotify}
+		}
+		return p.terminate(ctx, r)
 	}
-	return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
+	var d proxy.Decision
+	switch {
+	case r.Message.Method == "REGISTER":
+		d = p.register(ctx, r)
+	case r.Initial():
+		d = p.originate(ctx, r)
+	default:
+		d = p.inDialog(ctx, r)
+	}
+	return toClient(d)
+}
+
+// chargingHeaders are the charging data of the network, which never goes to
+// a client (TS 24.229 §5.2.1): requests to it lose them in
+// terminate, responses to it in toClient.
+var chargingHeaders = []string{"P-Charging-Vector", "P-Charging-Function-Addresses"}
+
+func stripCharging(h *sip.Header) {
+	for _, name := range chargingHeaders {
+		h.Del(name)
+	}
+}
+
+// toClient makes every response d forwards to the client lose the
+// network's charging data and any P-Preferred-Identity, and its
+// P-Asserted-Identity when it asks for privacy of the identity (RFC 3325
+// §9.3), after d's own OnResponse.
+func toClient(d proxy.Decision) proxy.Decision {
+	next := d.OnResponse
+	d.OnResponse = func(ctx context.Context, res *sip.Response) {
+		if next != nil {
+			next(ctx, res)
+		}
+		stripCharging(&res.Header)
+		// A preference is the client's to state in its own requests (RFC
+		// 3325 §9.2), never the network's to a client.
+		res.Header.Del("P-Preferred-Identity")
+		if privacyID(&res.Header) {
+			res.Header.Del("P-Asserted-Identity")
+		}
+	}
+	return d
 }
 
 // statusFlowFailed is 430 Flow Failed (RFC 5626 §11.5).

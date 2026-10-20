@@ -10,12 +10,18 @@
 // at every start, so a token from an earlier task on a recycled address is
 // unknown and answered 430 Flow Failed (RFC 5626 §5.3).
 //
-// This version serves the edge only: it opens the listeners, recognises
-// itself in Route by its public FQDN, the NLB's addresses or its own, removes
-// the headers only the network may set from every message a client sends
-// (TS 24.229 §5.2.1, ADR 0007 §7), limits the client flows of one client and
-// in all, and drains client flows gradually on shutdown while the core
-// listener stays open. Registration, originating and terminating routing
-// follow in later changes (#16); until then a client's request is refused
-// with 403 and one from the core with 430.
+// This version serves the edge and registration: it opens the listeners,
+// recognises itself in Route by its public FQDN, the NLB's addresses or its
+// own, removes the headers only the network may set from every message a
+// client sends (TS 24.229 §5.2.1, ADR 0007 §7), limits the client flows of
+// one client and in all, routes REGISTER to icscf with a Path naming the
+// flow and keeps the 200 in instance memory (§5.2.2.1), and drains client
+// flows gradually on shutdown while the core listener stays open.
+//
+// A client's other requests go to the core along its Service-Route, or
+// inside a dialog along the route pcscf recorded, to scscf alone
+// (originate.go); a request from the core goes to the client flow its
+// Route names and nowhere else (terminate.go). pcscf subscribes to the reg
+// event of the users it serves and removes the registrations the network
+// ends (regevent.go, TS 24.229 §5.2.3, §5.2.5.2).
 package pcscf

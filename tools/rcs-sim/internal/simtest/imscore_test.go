@@ -2,6 +2,7 @@ package simtest_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,6 +149,59 @@ func TestAUserPhoneIMPUIsNotifiedOfItsRefresh(t *testing.T) {
 		t.Fatalf("notification after the refresh %+v", n)
 	} else if c, ok := ownContact(t, n.Info, impuA, ua.ContactURI()); !ok || !c.Active() || c.Event != reginfo.Refreshed {
 		t.Fatalf("contact after the refresh %+v", c)
+	}
+}
+
+func TestAChangeIsToldOnlyToThoseSubscribedWhenItHappened(t *testing.T) {
+	// #272: client A's de-registration was answered, and only then were
+	// the subscribers it changed read. The reading goroutine of A's
+	// connection, held up after the 200, could come to it after client B
+	// on the same IMPU had registered and subscribed: B's subscription got
+	// A's ending, a terminated NOTIFY without B's contact, and lost its
+	// own. The hook holds A's goroutine just there.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password"})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	simtest.SetAnswered(core, func(req *sip.Request) {
+		if exp, err := req.Header.Expires(); err == nil && exp == 0 {
+			once.Do(func() {
+				close(held)
+				<-release
+			})
+		}
+	})
+	if _, err := a.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-held
+	b := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000002", nil)
+	sub, _, err := b.SubscribeRegEvent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := nextNotification(t, ctx, sub); n.Info == nil {
+		t.Fatalf("first notification %+v", n)
+	} else if c, ok := ownContact(t, n.Info, impuA, b.ContactURI()); !ok || !c.Active() {
+		t.Fatalf("first notification %+v, contact %+v", n.Info, c)
+	}
+	close(release)
+	// B's own changes, and nothing of A's, in order.
+	if _, err := b.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n := nextNotification(t, ctx, sub)
+	if c, ok := ownContact(t, n.Info, impuA, b.ContactURI()); n.State != "active" || !ok || !c.Active() || c.Event != reginfo.Refreshed {
+		t.Fatalf("notification after B's refresh %+v, contact %+v", n, c)
+	}
+	if _, err := b.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n = nextNotification(t, ctx, sub)
+	if c, ok := ownContact(t, n.Info, impuA, b.ContactURI()); n.State != "terminated" || !ok || c.Active() || c.Event != reginfo.Unregistered {
+		t.Fatalf("notification after B's de-registration %+v, contact %+v", n, c)
 	}
 }
 

@@ -86,17 +86,19 @@ type fakes struct {
 	mu        sync.Mutex
 	hssStatus []int // answered in turn to POST /v1/subscriptions; the last repeats
 	akaStatus int
+	putStatus int // answered to PUT /v1/subscriptions/{impi}
 	acsStatus int
 	hssCalls  int
 	hssBodies []map[string]any
+	putBodies map[string]map[string]any
 	akaBodies map[string]map[string]any
 	acsBodies map[string]map[string]any
 	hss, acs  *httptest.Server
 }
 
 func newFakes(t *testing.T, hssStatus []int, acsStatus int) *fakes {
-	f := &fakes{hssStatus: hssStatus, akaStatus: http.StatusNoContent, acsStatus: acsStatus,
-		akaBodies: map[string]map[string]any{}, acsBodies: map[string]map[string]any{}}
+	f := &fakes{hssStatus: hssStatus, akaStatus: http.StatusNoContent, putStatus: http.StatusOK, acsStatus: acsStatus,
+		putBodies: map[string]map[string]any{}, akaBodies: map[string]map[string]any{}, acsBodies: map[string]map[string]any{}}
 	f.hss = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -114,6 +116,10 @@ func newFakes(t *testing.T, hssStatus []int, acsStatus int) *fakes {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.akaBodies[r.URL.Path] = body
 			w.WriteHeader(f.akaStatus)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/subscriptions/"):
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.putBodies[r.URL.Path] = body
+			w.WriteHeader(f.putStatus)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -160,11 +166,10 @@ func TestSeedProvisionsBothSubscribersInBothServices(t *testing.T) {
 	} {
 		impi := want.imsi + "@" + domain
 		body := f.hssBodies[i]
-		ids, _ := body["public_identities"].([]any)
-		first, _ := ids[0].(map[string]any)
-		if body["impi"] != impi || body["imsi"] != want.imsi || first["impu"] != "sip:"+want.msisdn+"@"+domain || body["acs_managed"] != true {
+		if body["impi"] != impi || body["imsi"] != want.imsi || body["acs_managed"] != true {
 			t.Fatalf("hss got %v", body)
 		}
+		checkIdentities(t, body, want.msisdn)
 		// Each subscriber its own keys (#236).
 		if aka := f.akaBodies["/v1/subscriptions/"+impi+"/aka"]; aka["k"] != want.k || aka["opc"] != want.opc {
 			t.Fatalf("hss AKA for %s got %v", want.imsi, aka)
@@ -181,6 +186,26 @@ func TestSeedProvisionsBothSubscribersInBothServices(t *testing.T) {
 		if strings.Contains(out.String(), secret) {
 			t.Fatalf("the output carries %q: %s", secret, out.String())
 		}
+	}
+}
+
+// checkIdentities checks a subscription body's public identities: the SIP
+// IMPU first, the default identity acs hands out, and the tel IMPU of the
+// same number, in one implicit registration set (docs/architecture.md §4,
+// #282).
+func checkIdentities(t *testing.T, body map[string]any, msisdn string) {
+	t.Helper()
+	ids, _ := body["public_identities"].([]any)
+	if len(ids) != 2 {
+		t.Fatalf("public identities %v", body["public_identities"])
+	}
+	sip, _ := ids[0].(map[string]any)
+	tel, _ := ids[1].(map[string]any)
+	if sip["impu"] != "sip:"+msisdn+"@"+domain || tel["impu"] != "tel:"+msisdn {
+		t.Fatalf("public identities %v", ids)
+	}
+	if set, ok := sip["implicit_set"].(float64); !ok || tel["implicit_set"] != set {
+		t.Fatalf("not one implicit set: %v", ids)
 	}
 }
 
@@ -230,6 +255,31 @@ func TestSeedSetsTheKeysOfASubscriptionThatExists(t *testing.T) {
 	}
 }
 
+func TestSeedBringsTheIdentitiesOfASubscriptionThatExistsUpToDate(t *testing.T) {
+	// #282: a stack seeded before the tel IMPUs keeps its subscriptions
+	// (409); the re-run puts the same subscription, so it gains them.
+	f := newFakes(t, []int{http.StatusConflict}, http.StatusOK)
+	var out bytes.Buffer
+	if err := seed(context.Background(), f.config(t), &out); err != nil {
+		t.Fatal(err)
+	}
+	for imsi, msisdn := range map[string]string{"001010000000001": "+15550100001", "001010000000002": "+15550100002"} {
+		impi := imsi + "@" + domain
+		body := f.putBodies["/v1/subscriptions/"+impi]
+		if body == nil || body["impi"] != impi || body["acs_managed"] != true {
+			t.Fatalf("hss PUT for %s got %v", imsi, body)
+		}
+		checkIdentities(t, body, msisdn)
+	}
+	if !strings.Contains(out.String(), "hss: client test subscription exists, brought up to date") {
+		t.Fatalf("output %q", out.String())
+	}
+	f.putStatus = http.StatusBadRequest
+	if err := seed(context.Background(), f.config(t), &bytes.Buffer{}); err == nil || err.Error() != "client: hss: update subscription: HTTP 400" {
+		t.Fatalf("seed = %v", err)
+	}
+}
+
 func TestSeedNamesTheSubscriberWhoseKeysAreRefused(t *testing.T) {
 	f := newFakes(t, []int{http.StatusCreated}, http.StatusOK)
 	f.akaStatus = http.StatusBadRequest
@@ -246,7 +296,7 @@ func TestSeedIsIdempotentAndWaitsForABusyService(t *testing.T) {
 	if err := seed(context.Background(), f.config(t), &out); err != nil {
 		t.Fatal(err)
 	}
-	if f.hssCalls != 4 || !strings.Contains(out.String(), "hss: client test subscription exists") || !strings.Contains(out.String(), "hss: peer test subscription exists") {
+	if f.hssCalls != 4 || !strings.Contains(out.String(), "hss: client test subscription exists, brought up to date") || !strings.Contains(out.String(), "hss: peer test subscription exists, brought up to date") {
 		t.Fatalf("%d calls, output %q", f.hssCalls, out.String())
 	}
 }

@@ -36,6 +36,9 @@ type IMSCore struct {
 	// goroutine for a NOTIFY, so two calls may run at once and a Rewrite
 	// that keeps state must lock it.
 	Rewrite func(*sip.Request)
+	// answered, if set (export_test.go), runs once a REGISTER that changed
+	// a registration has been answered.
+	answered func(*sip.Request)
 	// Offline, when set before any request, is what the core does with a
 	// request to an IMPU that has no binding.
 	Offline Offline
@@ -207,24 +210,37 @@ func (c *IMSCore) end(impu, event string) {
 	delete(c.bindings, key)
 	delete(c.contacts, key)
 	delete(c.events, key)
-	c.mu.Unlock()
 	if bound {
-		c.registrationChanged(regChange{key: key, contact: contact, event: event})
+		c.queueChangeLocked(regChange{key: key, contact: contact, event: event}, closedGate)
 	}
+	c.mu.Unlock()
 }
+
+// closedGate lets a NOTIFY go at once: one that answers no request.
+var closedGate = func() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
 
 // Request implements transaction.TU.
 func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
 	switch {
 	case req.Method == "REGISTER":
-		res, change, deliver := c.register(tx)
+		res, answered, deliver := c.register(tx)
 		c.respond(tx, res)
+		if answered != nil {
+			answered()
+		}
 		if deliver != nil {
 			go deliver()
 		}
-		if change != nil {
-			c.registrationChanged(*change)
+		c.mu.Lock()
+		hook := c.answered
+		c.mu.Unlock()
+		if hook != nil && answered != nil {
+			hook(req)
 		}
 	case req.Method == "SUBSCRIBE" && strings.EqualFold(eventPackage(req), "reg"):
 		c.subscribe(tx)
@@ -257,10 +273,13 @@ func (c *IMSCore) respond(tx *transaction.ServerTransaction, res *sip.Response) 
 
 // register answers a REGISTER: 401 until it has Digest credentials that
 // verify, then 200 with the binding, Require: outbound and a Service-Route.
-// Expires: 0 removes the binding. deliver, when not nil, sends what
-// StoreAndForward held for the IMPU; the caller runs it once the 200 has
-// gone, so the client is registered when the requests come.
-func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *regChange, func()) {
+// Expires: 0 removes the binding. The NOTIFYs of the change are queued
+// with it, for the subscribers there are when it is made (#272), and go
+// once the caller has sent the 200 and called answered. deliver, when not
+// nil, sends what StoreAndForward held for the IMPU; the caller runs it
+// once the 200 has gone, so the client is registered when the requests
+// come.
+func (c *IMSCore) register(tx *transaction.ServerTransaction) (res *sip.Response, answered, deliver func()) {
 	req := tx.Request()
 	tag, _ := c.ids.Tag()
 	creds, err := digest.ParseCredentials(req.Header.Get("Authorization"))
@@ -282,7 +301,7 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 	}
 	expires, _ := req.Header.Expires()
 	impu, key := to.URI.String(), aorKey(to.URI)
-	res, _ := sip.NewResponse(req, 200, "", tag)
+	res, _ = sip.NewResponse(req, 200, "", tag)
 	change := &regChange{key: key, event: "registered"}
 	var held []*sip.Request
 	c.mu.Lock()
@@ -307,8 +326,10 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		held = c.stored[key]
 		delete(c.stored, key)
 	}
+	gate := make(chan struct{})
+	c.queueChangeLocked(*change, gate)
 	c.mu.Unlock()
-	var deliver func()
+	answered = func() { close(gate) }
 	if len(held) > 0 {
 		flow := tx.Source().Flow
 		deliver = func() {
@@ -328,7 +349,7 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		res.Header.Add("Service-Route", "<sip:orig@scscf.core.invalid;lr>")
 		res.Header.Add("P-Associated-URI", "<"+impu+">")
 	}
-	return res, change, deliver
+	return res, answered, deliver
 }
 
 // regChange is what changed an IMPU's registration, by its aorKey: its
@@ -337,12 +358,15 @@ type regChange struct {
 	key, contact, event string
 }
 
-// registrationChanged notifies every subscriber of the IMPU's reg event
-// (RFC 3680 §4.7). One that ends the registration, the IMPU's only one
-// here, ends the subscriptions (TS 24.229 §5.4.2.1.2): with no reason after
-// the user's de-registration, "noresource" after an expiry, and as the
-// network ended it, "deactivated" or "rejected" (RFC 6665 §4.1.3).
-func (c *IMSCore) registrationChanged(ch regChange) {
+// queueChangeLocked queues a NOTIFY for every subscriber of the IMPU's reg
+// event (RFC 3680 §4.7), to go once gate is closed; c.mu is held, so the
+// subscribers are those there are when the change is made, and the
+// NOTIFYs are queued in the order of the changes. One that ends the
+// registration, the IMPU's only one here, ends the subscriptions (TS
+// 24.229 §5.4.2.1.2): with no reason after the user's de-registration,
+// "noresource" after an expiry, and as the network ended it, "deactivated"
+// or "rejected" (RFC 6665 §4.1.3).
+func (c *IMSCore) queueChangeLocked(ch regChange, gate <-chan struct{}) {
 	gone, terminated := true, "terminated"
 	switch ch.event {
 	case "unregistered":
@@ -353,21 +377,15 @@ func (c *IMSCore) registrationChanged(ch regChange) {
 	default:
 		gone = false
 	}
-	c.mu.Lock()
-	subs := c.subs[ch.key]
-	states := make([]string, len(subs))
-	for i, s := range subs {
-		states[i] = "active;expires=" + strconv.FormatUint(s.left(), 10)
+	for _, s := range c.subs[ch.key] {
+		state := "active;expires=" + strconv.FormatUint(s.left(), 10)
 		if gone {
-			states[i] = terminated
+			state = terminated
 		}
+		c.notifyLocked(s, state, ch.contact, ch.event, !gone, gate)
 	}
 	if gone {
 		delete(c.subs, ch.key)
-	}
-	c.mu.Unlock()
-	for i, s := range subs {
-		c.notify(s, states[i], ch.contact, ch.event, !gone)
 	}
 }
 
@@ -414,33 +432,45 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 		}
 		c.subs[key] = subs
 	}
-	contact, registered := c.contacts[key]
-	event := c.events[key]
-	c.mu.Unlock()
 	if s == nil {
+		c.mu.Unlock()
 		res, _ := sip.NewResponse(req, 481, "", tag)
 		c.respond(tx, res)
 		return
 	}
+	// The contact as it stands, with the event that made it so (RFC 3680
+	// §4.7.1, TS 24.229 §5.4.2.1.2 NOTE 10): the subscription's end does
+	// not change the registration. Queued with the subscription, ahead of
+	// any change after it, and sent after the 200.
+	contact, registered := c.contacts[key]
+	event := c.events[key]
+	gate := make(chan struct{})
+	switch {
+	case expires == 0:
+		c.notifyLocked(s, "terminated;reason=timeout", contact, event, registered, gate)
+	default:
+		c.notifyLocked(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered, gate)
+	}
+	c.mu.Unlock()
 	res, _ := sip.NewResponse(req, 200, "", s.tag)
 	res.Header.Add("Contact", "<sip:core.invalid:5060;transport=tcp>")
 	res.Header.Add("Expires", strconv.FormatUint(uint64(expires), 10))
 	c.respond(tx, res)
-	// The contact as it stands, with the event that made it so (RFC 3680
-	// §4.7.1, TS 24.229 §5.4.2.1.2 NOTE 10): the subscription's end does
-	// not change the registration.
-	switch {
-	case expires == 0:
-		c.notify(s, "terminated;reason=timeout", contact, event, registered)
-	default:
-		c.notify(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered)
-	}
+	close(gate)
 }
 
-// notify queues a NOTIFY of s's next version: the IMPU's one contact,
-// active with event, or terminated.
-func (c *IMSCore) notify(s *regSub, state, contact, event string, active bool) {
+// notifyLocked queues a NOTIFY of s's next version: the IMPU's one
+// contact, active with event, or terminated. It goes once gate is closed,
+// after the 200 of the request that made it. c.mu is held, so NOTIFYs are
+// queued in the order of the changes; the queue is long enough that this
+// does not wait, and the notifier's goroutine never takes c.mu.
+func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active bool, gate <-chan struct{}) {
 	send := func() {
+		select {
+		case <-gate:
+		case <-c.stop:
+			return
+		}
 		branch, _ := c.ids.Branch()
 		req := &sip.Request{Method: "NOTIFY", URI: s.target}
 		s.cseq++
