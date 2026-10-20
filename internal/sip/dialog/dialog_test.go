@@ -1,6 +1,7 @@
 package dialog
 
 import (
+	"encoding/json"
 	"errors"
 	"math/rand/v2"
 	"reflect"
@@ -223,7 +224,6 @@ func TestAcceptChecksTheDialogAndTheOrder(t *testing.T) {
 		req  *sip.Request
 		want error
 	}{
-		"the same CSeq":    {next("4"), ErrOutOfOrder},
 		"a lower CSeq":     {next("3"), ErrOutOfOrder},
 		"another Call-ID":  {next("5", "Call-ID: sub-1", "Call-ID: sub-2"), ErrNotInDialog},
 		"another From tag": {next("5", "tag=n1", "tag=n2"), ErrNotInDialog},
@@ -352,5 +352,128 @@ func TestTagsCompareWithoutCase(t *testing.T) {
 	callID := request(t, strings.NewReplacer("Call-ID: sub-1", "Call-ID: SUB-1", "CSeq: 4 NOTIFY", "CSeq: 6 NOTIFY").Replace(firstNotify))
 	if err := d.Accept(callID); !errors.Is(err, ErrNotInDialog) {
 		t.Errorf("a Call-ID in another case: %v", err)
+	}
+}
+
+// Only a lower CSeq is out of order (RFC 3261 §12.2.2): the ACK of an
+// INVITE has the INVITE's, and a target refresh without a Contact keeps
+// the target.
+func TestAnEqualCSeqIsInOrder(t *testing.T) {
+	d, err := UAC(request(t, invite), response(t, ok200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reinvite := strings.NewReplacer("INVITE "+bob, "INVITE sip:alice@192.0.2.10:40000;transport=tcp", "From: <"+alice+">;tag=a1", "From: <"+bob+">;tag=b1",
+		"To: <"+bob+">", "To: <"+alice+">;tag=a1", "CSeq: 7 INVITE", "CSeq: 3 INVITE").Replace(invite)
+	if err := d.Accept(request(t, reinvite)); err != nil {
+		t.Fatal(err)
+	}
+	ack := strings.NewReplacer("INVITE sip:", "ACK sip:", "CSeq: 3 INVITE", "CSeq: 3 ACK").Replace(reinvite)
+	if err := d.Accept(request(t, ack)); err != nil || d.RemoteSeq != 3 {
+		t.Errorf("the ACK of the re-INVITE: %v, %d", err, d.RemoteSeq)
+	}
+	target := d.RemoteTarget
+	noContact := request(t, strings.NewReplacer("CSeq: 3 INVITE", "CSeq: 4 INVITE", "Contact: <sip:alice@192.0.2.10:40000;transport=tcp>\n", "").Replace(reinvite))
+	if noContact.Header.Has("Contact") {
+		t.Fatal("the test request has a Contact")
+	}
+	if err := d.Accept(noContact); err != nil || d.RemoteTarget.String() != target.String() {
+		t.Errorf("a refresh without a Contact: %v, target %s", err, d.RemoteTarget)
+	}
+}
+
+// An ACK takes the CSeq of the INVITE it acknowledges and leaves the next
+// request's alone (RFC 3261 §13.2.2.4).
+func TestAnACKTakesItsINVITEsCSeq(t *testing.T) {
+	d, err := UAC(request(t, invite), response(t, ok200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reinvite, _ := d.Request("INVITE", ids())
+	ack, err := d.Request("ACK", ids())
+	if err != nil || reinvite.Header.Get("CSeq") != "8 INVITE" || ack.Header.Get("CSeq") != "8 ACK" {
+		t.Fatalf("%q, %q, %v", reinvite.Header.Get("CSeq"), ack.Header.Get("CSeq"), err)
+	}
+	if bye, _ := d.Request("BYE", ids()); bye.Header.Get("CSeq") != "9 BYE" {
+		t.Errorf("after the ACK: %q", bye.Header.Get("CSeq"))
+	}
+	fresh := &Dialog{CallID: "c", Local: mustAddr(t, "<"+alice+">;tag=a"), Remote: mustAddr(t, "<"+bob+">;tag=b"), RemoteTarget: mustURI(t, bob)}
+	if _, err := fresh.Request("ACK", ids()); err == nil {
+		t.Error("an ACK without an INVITE")
+	}
+}
+
+// The first NOTIFY sets up a dialog only for the SUBSCRIBE it answers:
+// the same Call-ID, exactly, and the SUBSCRIBE's From tag as its To tag,
+// in any case.
+func TestTheFirstNotifyMustAnswerTheSubscribe(t *testing.T) {
+	for name, n := range map[string]string{
+		"another Call-ID":           strings.Replace(firstNotify, "Call-ID: sub-1", "Call-ID: someone-else", 1),
+		"the Call-ID in upper case": strings.Replace(firstNotify, "Call-ID: sub-1", "Call-ID: SUB-1", 1),
+		"another To tag":            strings.Replace(firstNotify, "To: <sip:pcscf.rcs.internal>;tag=p1", "To: <sip:pcscf.rcs.internal>;tag=zz", 1),
+		"no To tag":                 strings.Replace(firstNotify, "To: <sip:pcscf.rcs.internal>;tag=p1", "To: <sip:pcscf.rcs.internal>", 1),
+	} {
+		if _, err := FromNotify(request(t, subscribe), request(t, n)); !errors.Is(err, ErrNotInDialog) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	upper := strings.Replace(firstNotify, "To: <sip:pcscf.rcs.internal>;tag=p1", "To: <sip:pcscf.rcs.internal>;tag=P1", 1)
+	if _, err := FromNotify(request(t, subscribe), request(t, upper)); err != nil {
+		t.Errorf("the To tag in upper case: %v", err)
+	}
+}
+
+// CSeq stays below 2^31, as RFC 3261 §8.1.1.5 and the platform's parser
+// have it.
+func TestCSeqStaysBelowTwoToThe31(t *testing.T) {
+	d := &Dialog{CallID: "c", LocalSeq: 1<<31 - 2, Local: mustAddr(t, "<"+alice+">;tag=a"), Remote: mustAddr(t, "<"+bob+">;tag=b"), RemoteTarget: mustURI(t, bob)}
+	req, err := d.Request("BYE", ids())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := req.Header.CSeq(); err != nil || req.Header.Get("CSeq") != "2147483647 BYE" {
+		t.Fatalf("%q: %v", req.Header.Get("CSeq"), err)
+	}
+	if _, err := d.Request("BYE", ids()); err == nil {
+		t.Error("a CSeq of 2^31")
+	}
+}
+
+// A remote target's URI headers and method parameter, which a Request-URI
+// may not carry (RFC 3261 §19.1.1), are left out of it, a strict router's
+// too.
+func TestTheRequestURIHasNoHeadersOrMethod(t *testing.T) {
+	d := &Dialog{CallID: "c", Local: mustAddr(t, "<"+alice+">;tag=a"), Remote: mustAddr(t, "<"+bob+">;tag=b"),
+		RemoteTarget: mustURI(t, "sip:scscf.rcs.internal;transport=tcp;method=INVITE?Route=%3Csip:x%3E"), LocalTarget: mustURI(t, "sip:p@10.0.2.9")}
+	req, err := d.Request("SUBSCRIBE", ids())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URI.String() != "sip:scscf.rcs.internal;transport=tcp" || req.Validate() != nil {
+		t.Fatalf("%s, %v", req.URI, req.Validate())
+	}
+	if d.RemoteTarget.String() != "sip:scscf.rcs.internal;transport=tcp;method=INVITE?Route=%3Csip:x%3E" {
+		t.Errorf("the dialog's target changed: %s", d.RemoteTarget)
+	}
+	d.RouteSet = []sip.Address{mustAddr(t, "<sip:strict.rcs.internal;method=BYE?X=1>")}
+	if req, _ := d.Request("BYE", ids()); req.URI.String() != "sip:strict.rcs.internal" {
+		t.Errorf("a strict router's Request-URI %s", req.URI)
+	}
+}
+
+// A Dialog is no storage format: its sip types write themselves redacted,
+// so a JSON round trip fails rather than restoring another dialog.
+func TestADialogIsNoJSONStorageFormat(t *testing.T) {
+	d, err := FromNotify(request(t, subscribe), request(t, firstNotify))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Dialog
+	if err := json.Unmarshal(b, &back); err == nil {
+		t.Errorf("a JSON round trip worked:\n%s", b)
 	}
 }
