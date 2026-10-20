@@ -1197,3 +1197,57 @@ func TestABoundPassiveSessionSendsKeepAlives(t *testing.T) {
 		t.Fatalf("keep-alive %+v", ka)
 	}
 }
+
+func TestASessionHasOneKeepAliveOutAtATime(t *testing.T) {
+	// #218: with an interval shorter than the transaction timeout, the
+	// ticks while a keep-alive waits for its answer send nothing more,
+	// and that keep-alive's timeout closes the connection.
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	clock.Advance(time.Second)
+	if ka := p.next(t); ka.HasBody() {
+		t.Fatalf("keep-alive %+v", ka)
+	}
+	for range 5 {
+		clock.Advance(time.Second)
+	}
+	// Its answer comes next only if no other keep-alive went out.
+	p.sendMessage(t, &Message{TransactionID: "syncsync", Method: MethodSend, ToPath: []URI{mustURI(t, clientURI)},
+		FromPath: []URI{mustURI(t, asURI)}, MessageID: "syncsync"})
+	expectResponse(t, p, "syncsync", StatusOK)
+	clock.Advance(DefaultTransactionTimeout - 5*time.Second)
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), ErrKeepAliveTimeout) {
+		t.Fatalf("connection %v, want the keep-alive timeout", c.Err())
+	}
+	for m := range p.msgs {
+		if m.IsRequest() {
+			t.Fatalf("sent %s %s after the first keep-alive", m.TransactionID, m.Method)
+		}
+	}
+}
+
+func TestAnAnsweredKeepAliveLetsTheNextGoOnTime(t *testing.T) {
+	clock := newFakeClock()
+	c, p := activeWithPeer(t, Config{Clock: clock, KeepAliveInterval: time.Second})
+	s := newTestSession(t, clientURI, asURI, newRecorder())
+	openWithPeer(t, c, p, s)
+	for i, sync := range []string{"syncsyn0", "syncsyn1", "syncsyn2"} {
+		clock.Advance(time.Second)
+		ka := p.next(t)
+		if ka.HasBody() || *ka.ByteRange != (ByteRange{1, 0, 0}) {
+			t.Fatalf("keep-alive %d %+v", i, ka)
+		}
+		p.respond(t, ka, StatusOK)
+		// Answered before the clock moves on: a request from the peer
+		// is answered only after the response before it is handled.
+		p.sendMessage(t, &Message{TransactionID: sync, Method: MethodSend, ToPath: []URI{mustURI(t, clientURI)},
+			FromPath: []URI{mustURI(t, asURI)}, MessageID: sync})
+		expectResponse(t, p, sync, StatusOK)
+	}
+	if s.Err() != nil || c.Err() != nil {
+		t.Fatalf("session %v, connection %v", s.Err(), c.Err())
+	}
+}

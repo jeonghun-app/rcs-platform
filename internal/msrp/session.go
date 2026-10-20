@@ -138,6 +138,8 @@ type Session struct {
 	expiry     Timer
 	peer       *Session
 	edge       bool // the client side of a bridge
+	// keepAliveOut is set while a keep-alive waits for its answer.
+	keepAliveOut bool
 	// events feeds the handler's goroutine; nil for a bridged session.
 	events chan event
 	// reports wait for HandleReport, on a goroutine of their own. Those
@@ -561,13 +563,21 @@ func (s *Session) armKeepAlive(c *Conn, after time.Duration) {
 // keepAliveDue sends a bodiless SEND if the session has been quiet for a
 // whole interval (ADR 0003). An unanswered one means the path is dead, so
 // the connection is closed; a refusal such as 481 ends just this session.
+// One keep-alive at a time: while one waits for its answer, the next is
+// skipped (#218).
 func (s *Session) keepAliveDue(c *Conn) {
 	interval := c.cfg.KeepAliveInterval
 	s.mu.Lock()
-	closed := s.closed
+	closed, out := s.closed, s.keepAliveOut
 	idle := c.cfg.Clock.Now().Sub(s.lastActive)
 	s.mu.Unlock()
 	if closed {
+		return
+	}
+	if out {
+		// The one in flight ends at its answer, or at its
+		// TransactionTimeout, which closes the connection.
+		s.armKeepAlive(c, interval)
 		return
 	}
 	select {
@@ -581,7 +591,13 @@ func (s *Session) keepAliveDue(c *Conn) {
 		s.armKeepAlive(c, interval-idle)
 		return
 	}
+	s.mu.Lock()
+	s.keepAliveOut = true
+	s.mu.Unlock()
 	err := s.sendEmpty(context.Background(), c, func(code int, comment string) {
+		s.mu.Lock()
+		s.keepAliveOut = false
+		s.mu.Unlock()
 		switch code {
 		case StatusOK:
 		case StatusRequestTimeout:
@@ -591,6 +607,9 @@ func (s *Session) keepAliveDue(c *Conn) {
 		}
 	})
 	if err != nil {
+		s.mu.Lock()
+		s.keepAliveOut = false
+		s.mu.Unlock()
 		return
 	}
 	s.armKeepAlive(c, interval)
