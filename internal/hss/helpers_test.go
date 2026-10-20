@@ -387,7 +387,9 @@ func (c *cscf) send(m *diameter.Message, err error) *diameter.Message {
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), realWait)
+	// Twice the servers' Cx timeout in the tests, so that a request the
+	// HSS retries until its own deadline fails by its answer, not by this.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*realWait)
 	defer cancel()
 	ans, err := c.peer.Send(ctx, m)
 	if err != nil {

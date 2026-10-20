@@ -3,6 +3,9 @@ package hss
 import (
 	"context"
 	"errors"
+	"fmt"
+	"hash/fnv"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -99,9 +102,8 @@ func (c *losingStore) UpdateSubscription(ctx context.Context, old, s *store.Subs
 }
 
 // A request that read the subscription and then waited for its lock reads
-// it again: the request that held the lock wrote it, so the first read is
-// stale for certain, and writing from it cost every queued MAR a lost write
-// (#200).
+// it again: the request that held the lock most likely wrote it, and writing
+// from the first read cost every queued MAR a lost write (#200).
 func TestAnUpdateThatWaitedForTheLockReadsTheSubscriptionAgain(t *testing.T) {
 	e := newEnv(t)
 	e.provision(impi1, impu1)
@@ -175,23 +177,129 @@ func TestAWriteLosingToAnotherTaskIsRetriedUntilItsDeadline(t *testing.T) {
 	}
 }
 
-// TestAnAPIWriteThatKeepsLosingIsAnsweredBusy: contention that runs to the
-// store timeout is answered as contention, 503 "busy", not as a store
-// failure: api.store_failure stays 0 and nothing is logged as an error
-// (#244 review).
-func TestAnAPIWriteThatKeepsLosingIsAnsweredBusy(t *testing.T) {
-	a := newAPIEnv(t, func(o *APIOptions) { o.StoreTimeout = 300 * time.Millisecond })
+// A provisioning write that keeps losing to another task is answered as a
+// busy subscription, not as a store outage, also when its retries run into
+// the request's deadline (#200 made them run until it): api.store_failure
+// stays 0 and nothing is logged as an error. From QA and code review on
+// #244.
+func TestContentionUntilTheAPIDeadlineIsBusyNotAStoreFailure(t *testing.T) {
+	cs := &losingStore{Store: store.NewMemory()}
+	e := newEnvWith(t, cs)
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
+		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		DefaultProfile: DefaultProfileID, StoreTimeout: 500 * time.Millisecond,
+	})}
 	a.create(impi1, true, impu1)
-	a.h.store = &losingStore{Store: a.h.store, n: 1 << 30}
-	code, body, h := a.do("POST", subPath(impi1, "/digest-credential"), adminToken, "")
-	if msg, _ := body["error"].(string); code != http.StatusServiceUnavailable || !strings.Contains(msg, "busy") || h.Get("Retry-After") == "" {
-		t.Fatalf("%d %q", code, body)
+	cs.mu.Lock()
+	cs.n = 1 << 30
+	cs.mu.Unlock()
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscription is busy; retry" {
+		t.Errorf("answer = %d %v", code, body)
 	}
-	if a.metrics.get("api.store_failure") != 0 {
-		t.Error("contention was counted as a store failure")
+	if n := e.metrics.get("api.store_failure"); n != 0 {
+		t.Errorf("api.store_failure = %d: contention was counted as a store outage", n)
 	}
-	if strings.Contains(a.logs.String(), `"level":"ERROR"`) {
-		t.Errorf("contention was logged as an error: %s", a.logs.String())
+	if strings.Contains(e.logs.String(), `"level":"ERROR"`) {
+		t.Errorf("contention was logged as an error: %s", e.logs.String())
+	}
+}
+
+// losingFor loses every write of one subscription, and reports the first.
+type losingFor struct {
+	store.Store
+	impi string
+	once sync.Once
+	lost chan struct{}
+}
+
+func (l *losingFor) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	if s.IMPI == l.impi {
+		l.once.Do(func() { close(l.lost) })
+		return nil, store.ErrConflict
+	}
+	return l.Store.UpdateSubscription(ctx, old, s)
+}
+
+// sameStripe is an IMPI whose lock is impi's.
+func sameStripe(t *testing.T, impi string) string {
+	stripe := func(s string) uint32 {
+		f := fnv.New32a()
+		_, _ = io.WriteString(f, s)
+		return f.Sum32() % lockStripes
+	}
+	for i := range 100000 {
+		if other := fmt.Sprintf("neighbour-%d@%s", i, domain); stripe(other) == stripe(impi) {
+			return other
+		}
+	}
+	t.Fatal("no IMPI shares the stripe")
+	return ""
+}
+
+// TestAContendedSubscriberDoesNotHoldItsStripeThroughItsRetries: the lock is
+// let go between attempts, so another subscriber of the same stripe gets it
+// at once, not after the contended request's whole deadline (QA's minor 3 on
+// #244).
+func TestAContendedSubscriberDoesNotHoldItsStripeThroughItsRetries(t *testing.T) {
+	lf := &losingFor{Store: store.NewMemory(), impi: impi1, lost: make(chan struct{})}
+	e := newEnvWith(t, lf)
+	e.provision(impi1, impu1)
+	neighbour := sameStripe(t, impi1)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+		done <- err
+	}()
+	<-lf.lost
+	start := time.Now()
+	unlock, err := e.h.lock(ctx, neighbour)
+	if err != nil {
+		t.Fatalf("the neighbour did not get the lock: %v", err)
+	}
+	unlock()
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Errorf("the neighbour waited %v for the stripe", took)
+	}
+	if err := <-done; !errors.Is(err, errContention) {
+		t.Errorf("the contended update: %v", err)
+	}
+}
+
+// readCounting counts subscription reads.
+type readCounting struct {
+	store.Store
+	mu    sync.Mutex
+	reads int
+}
+
+func (r *readCounting) Subscription(ctx context.Context, impi string) (*store.Subscription, error) {
+	r.mu.Lock()
+	r.reads++
+	r.mu.Unlock()
+	return r.Store.Subscription(ctx, impi)
+}
+
+// TestAnUncontendedMARReadsTheSubscriptionOnce: the Cx path writes from the
+// read it made before the lock when the lock was free, saving a read (QA's
+// nit 4 on #244).
+func TestAnUncontendedMARReadsTheSubscriptionOnce(t *testing.T) {
+	rc := &readCounting{Store: store.NewMemory()}
+	e := newEnvWith(t, rc)
+	e.provision(impi1, impu1)
+	c := connectCSCF(t, serveHSSWith(t, e.h, "hss-a.rcs.local", realWait), "scscf-1.rcs.local")
+	rc.mu.Lock()
+	rc.reads = 0
+	rc.mu.Unlock()
+	if maa := c.mar(impi1, impu1, cx.SchemeDigestAKAv1MD5, 1, scscfName, nil); maa.Result != resSuccess {
+		t.Fatalf("MAA %v", maa.Result)
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.reads != 1 {
+		t.Errorf("%d reads for one uncontended MAR, want 1", rc.reads)
 	}
 }
 

@@ -179,15 +179,11 @@ func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscrip
 // behind a holder that wrote nothing, pays one read more.
 //
 // The retries run until ctx's deadline, at most maxRacedAttempts: see there.
+// The lock is let go between them, so that the other subscribers of its
+// stripe, and the subscriber's other requests in this task, are not held up
+// for the whole of a contended request's deadline; each attempt takes it
+// again and reads afresh.
 func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
-	unlock, waited, err := h.acquire(ctx, impi)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	if waited {
-		read = nil
-	}
 	for attempt := 0; attempt < maxRacedAttempts; attempt++ {
 		if attempt > 0 {
 			h.metrics.Count("store.conflict", 1)
@@ -199,34 +195,44 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 				return nil, contended(ctx)
 			}
 		}
-		cur := read
+		saved, err := h.attempt(ctx, impi, read, fn)
 		read = nil
-		if cur == nil {
-			var err error
-			if cur, err = h.store.Subscription(ctx, impi); err != nil {
-				if attempt > 0 && ctx.Err() != nil {
-					return nil, contended(ctx)
-				}
-				return nil, err
-			}
-		}
-		next := clone(cur)
-		if err := fn(next); err != nil {
-			if errors.Is(err, errUnchanged) {
-				return cur, nil
-			}
-			return nil, err
-		}
-		saved, err := h.store.UpdateSubscription(ctx, cur, next)
-		if errors.Is(err, store.ErrConflict) {
+		switch {
+		case errors.Is(err, store.ErrConflict):
 			continue
-		}
-		if err != nil && attempt > 0 && ctx.Err() != nil {
+		case err != nil && attempt > 0 && ctx.Err() != nil:
+			// The deadline ended an attempt after a lost one: still
+			// contention, though DynamoDB reported it as a context error.
 			return nil, contended(ctx)
 		}
 		return saved, err
 	}
 	return nil, errContention
+}
+
+// attempt is one try of updateFrom under the lock: read, unless read is
+// given and the lock was free, apply fn and write. It returns
+// store.ErrConflict when another writer was first.
+func (h *HSS) attempt(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
+	unlock, waited, err := h.acquire(ctx, impi)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	cur := read
+	if cur == nil || waited {
+		if cur, err = h.store.Subscription(ctx, impi); err != nil {
+			return nil, err
+		}
+	}
+	next := clone(cur)
+	if err := fn(next); err != nil {
+		if errors.Is(err, errUnchanged) {
+			return cur, nil
+		}
+		return nil, err
+	}
+	return h.store.UpdateSubscription(ctx, cur, next)
 }
 
 // contended is the error of an update whose deadline ended while it was
