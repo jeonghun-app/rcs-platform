@@ -279,3 +279,53 @@ func TestOneFlushBoundCoversBothWaitsOverTCP(t *testing.T) {
 		t.Fatalf("took %v, bound 1 s for both waits", took)
 	}
 }
+
+// QA on #237 (#240): a client under the unknown-session limit sends two
+// SENDs and half-closes. The two 481s already queued still reach it, and
+// the connection's end is the peer's close, EOF, as before.
+func TestAnswersQueuedWhenThePeerHalfClosesAreDelivered(t *testing.T) {
+	conns, client := slowRefusal(t, 0, time.Hour)
+	if _, err := client.Write(unknownSends(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	got, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("after %q: %v", got, err)
+	}
+	for _, want := range []string{"MSRP unkna 481", "MSRP unknb 481"} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("got %q, want %q in it", got, want)
+		}
+	}
+	c := <-conns
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), io.EOF) {
+		t.Fatalf("connection ended with %v, want the peer's EOF", c.Err())
+	}
+}
+
+// The wait for what is owed after a half-close has the refusal flush's
+// bound: a peer that half-closes and then reads nothing, behind a write
+// that takes 2 s, holds the connection for the bound, not for the write.
+func TestTheHalfCloseFlushIsBounded(t *testing.T) {
+	conns, client := slowRefusal(t, 2*time.Second, 300*time.Millisecond)
+	if _, err := client.Write(unknownSends(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	c := <-conns
+	start := time.Now()
+	waitDone(t, c.Done(), "connection")
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("closed after %v, bound 300 ms", took)
+	}
+	if !errors.Is(c.Err(), io.EOF) {
+		t.Fatalf("connection ended with %v, want the peer's EOF", c.Err())
+	}
+}

@@ -290,6 +290,10 @@ What a client can make one task hold, and what happens at each bound:
 \* On a connection that already carries a bridge, only the new session is
 refused, with 481, and the connection stays (see below).
 
+A client that half-closes its side still reads: what is already queued for
+it, answers included, is written first, for up to the same 2 s, and only
+then is the connection closed (#240). The close is the client's, `EOF`.
+
 Choices worth knowing:
 
 - **Overload and store failures close the connection rather than answer.**

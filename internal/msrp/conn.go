@@ -551,6 +551,11 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			var me *MessageError
 			if !errors.As(err, &me) {
+				if errors.Is(err, io.EOF) {
+					// The peer half-closed, between messages: it may
+					// still read what it is owed (#240).
+					c.writeQueued(time.After(c.cfg.refusalFlush))
+				}
 				c.fail(err)
 				return
 			}
@@ -574,8 +579,8 @@ func (c *Conn) readLoop() {
 }
 
 // refusalFlushTimeout bounds how long a connection closed for too many
-// unknown sessions goes on to deliver the answers it already owes. It is
-// real time, like the write deadline.
+// unknown sessions, or by the peer's half-close, goes on to deliver what it
+// already owes. It is real time, like the write deadline.
 const refusalFlushTimeout = 2 * time.Second
 
 // flush lets the answers already queued reach the peer before the
@@ -590,21 +595,8 @@ func (c *Conn) flush(reason error) {
 	c.closing = reason
 	c.mu.Unlock()
 	deadline := time.After(c.cfg.refusalFlush)
-	c.qmu.Lock()
-	var written chan struct{}
-	if len(c.queue) > 0 || c.writing {
-		written = make(chan struct{})
-		c.written = written
-	}
-	c.qmu.Unlock()
-	if written != nil {
-		select {
-		case <-written:
-		case <-c.done:
-			return
-		case <-deadline:
-			return
-		}
+	if !c.writeQueued(deadline) {
+		return
 	}
 	cw, ok := c.nc.(interface{ CloseWrite() error })
 	if !ok || cw.CloseWrite() != nil {
@@ -619,6 +611,29 @@ func (c *Conn) flush(reason error) {
 	case <-read:
 	case <-deadline:
 	}
+}
+
+// writeQueued waits until everything queued has been written, and reports
+// whether it was before the connection ended or deadline came. writeLoop
+// goes on writing meanwhile: a peer that has half-closed still reads.
+func (c *Conn) writeQueued(deadline <-chan time.Time) bool {
+	c.qmu.Lock()
+	var written chan struct{}
+	if len(c.queue) > 0 || c.writing {
+		written = make(chan struct{})
+		c.written = written
+	}
+	c.qmu.Unlock()
+	if written == nil {
+		return true
+	}
+	select {
+	case <-written:
+		return true
+	case <-c.done:
+	case <-deadline:
+	}
+	return false
 }
 
 func (c *Conn) handleResponse(m *Message) {
