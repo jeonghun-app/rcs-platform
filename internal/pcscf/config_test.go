@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 const publicHost = "pcscf.rcs.example.net"
@@ -22,6 +23,8 @@ var devEnv = map[string]string{
 	"PCSCF_PUBLIC_HOST":      publicHost,
 	"PCSCF_CORE_HOST":        "10.0.2.9",
 	"PCSCF_CLIENT_TRANSPORT": "tcp",
+	"RCS_SERVICE_NAMESPACE":  "rcs.internal",
+	"RCS_IMS_DOMAIN":         "ims.mnc001.mcc001.3gppnetwork.org",
 }
 
 // prodEnv is a valid production configuration, so every reason a test sees
@@ -82,9 +85,59 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		MaxFlowsPerIP: DefaultMaxFlowsPerIP, ClientIdleTimeout: DefaultClientIdleTimeout,
 		DrainTimeout:   runtime.DefaultShutdownTimeout - stopMargin,
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
+		ICSCF: mustURI(t, "sip:icscf.rcs.internal;transport=tcp;lr"), AllowLoopback: true,
+		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
+		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
+		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
+	}
+}
+
+func mustURI(t *testing.T, s string) sip.URI {
+	t.Helper()
+	u, err := sip.ParseURI(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+// The visited network is the home domain unless set (TS 24.229 §5.2.2.1).
+func TestTheVisitedNetworkIsTheHomeDomainUnlessSet(t *testing.T) {
+	for _, v := range []string{"ims.mnc001.mcc002.3gppnetwork.org", `"Visited network number 1";x=1`} {
+		c, err := configure(with(devEnv, "PCSCF_VISITED_NETWORK_ID", v))
+		if err != nil || c.VisitedNetworkID != v {
+			t.Errorf("%q: %q, %v", v, c.VisitedNetworkID, err)
+		}
+	}
+	c, err := configure(with(devEnv, "RCS_SERVICE_NAMESPACE", "", "PCSCF_ICSCF_URI", "sip:10.0.3.7;transport=tcp;lr", "PCSCF_VISITED_NETWORK_ID", "visited.example.net"))
+	if err != nil || c.Namespace != "" || c.VisitedNetworkID != "visited.example.net" {
+		t.Errorf("without a namespace: %+v, %v", c, err)
+	}
+	c, err = configure(with(devEnv, "RCS_IMS_DOMAIN", "IMS.mnc001.mcc001.3gppnetwork.org."))
+	if want := "ims.mnc001.mcc001.3gppnetwork.org"; err != nil || c.HomeDomain != want || c.VisitedNetworkID != want {
+		t.Errorf("home domain %q, visited network %q, %v", c.HomeDomain, c.VisitedNetworkID, err)
+	}
+}
+
+// Each problem is reported once (QA of #198).
+func TestAProblemIsReportedOnce(t *testing.T) {
+	_, err := configure(with(devEnv, "PCSCF_MAX_FLOWS_PER_IP", "0"))
+	if err == nil || strings.Count(err.Error(), "PCSCF_MAX_FLOWS_PER_IP") != 1 {
+		t.Fatalf("error %v", err)
+	}
+}
+
+func TestTheICSCFURIAndLoopbackFollowTheSettings(t *testing.T) {
+	c, err := configure(with(devEnv, "PCSCF_ICSCF_URI", "sip:10.0.3.7:5070;transport=tcp;lr"))
+	if err != nil || c.ICSCF.String() != "sip:10.0.3.7:5070;transport=tcp;lr" {
+		t.Fatalf("ICSCF %v, %v", c.ICSCF, err)
+	}
+	p, err := configure(prodEnv)
+	if err != nil || p.AllowLoopback {
+		t.Fatalf("production allows loopback core hops: %v", err)
 	}
 }
 
@@ -151,6 +204,28 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_CLIENT_UDP_ADDR", "udp"}, "PCSCF_CLIENT_UDP_ADDR: not host:port"},
 		{[]string{"PCSCF_CORE_HOST", "task"}, "PCSCF_CORE_HOST: not an IP address"},
 		{[]string{"PCSCF_MAX_FLOWS_PER_IP", "0"}, "PCSCF_MAX_FLOWS_PER_IP: must be positive"},
+		{[]string{"PCSCF_MAX_REGISTRATIONS", "0"}, "PCSCF_MAX_REGISTRATIONS: must be positive"},
+		{[]string{"PCSCF_REGISTER_RATE", "-1"}, "PCSCF_REGISTER_RATE: must be positive"},
+		{[]string{"PCSCF_REGISTER_BURST", "0"}, "PCSCF_REGISTER_BURST: must be positive"},
+		{[]string{"RCS_SERVICE_NAMESPACE", ""}, "PCSCF_ICSCF_URI: required when RCS_SERVICE_NAMESPACE is unset"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=tcp"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp and lr"},
+		{[]string{"PCSCF_ICSCF_URI", "tel:+15550100001"}, "PCSCF_ICSCF_URI: not a sip URI"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf@rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: not a sip URI"},
+		{[]string{"PCSCF_ICSCF_URI", "::"}, "PCSCF_ICSCF_URI: not a sip URI"},
+		// It is reached over TCP through the core listener (QA of #198).
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sips:icscf.rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=tls;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=udp;lr"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.example.net;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
+		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.evil-rcs.internal;transport=tcp;lr"}, "PCSCF_ICSCF_URI: a host name outside RCS_SERVICE_NAMESPACE"},
+		{[]string{"RCS_IMS_DOMAIN", ""}, "RCS_IMS_DOMAIN: required"},
+		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "0"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
+		{[]string{"PCSCF_MAX_PENDING_REGISTERS_PER_IP", "1025"}, "PCSCF_MAX_PENDING_REGISTERS_PER_IP: not from 1 to 1024"},
+		{[]string{"RCS_IMS_DOMAIN", "ims_1.example.net"}, "RCS_IMS_DOMAIN: not a host name"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "a, b"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "\"open"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
+		{[]string{"PCSCF_VISITED_NETWORK_ID", "a\r\nRoute: <sip:x>"}, "PCSCF_VISITED_NETWORK_ID: not one network identifier"},
 		{[]string{"PCSCF_CLIENT_IDLE_TIMEOUT", "0s"}, "PCSCF_CLIENT_IDLE_TIMEOUT: must be greater than zero"},
 		{[]string{"PCSCF_DRAIN_TIMEOUT", "16s"}, "PCSCF_DRAIN_TIMEOUT: plus 5s must not exceed RCS_SHUTDOWN_TIMEOUT (20s)"},
 		{[]string{"PCSCF_DRAIN_TIMEOUT", "0s"}, "PCSCF_DRAIN_TIMEOUT: must be greater than zero"},

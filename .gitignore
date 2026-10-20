@@ -10,3 +10,5 @@ coverage.*
 # The local compose stack's secrets (scripts/compose-env.sh).
 /deploy/compose.env
 /deploy/compose.env.tmp.*
+# Local test and gate logs.
+*.log
