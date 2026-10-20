@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -178,9 +179,11 @@ func contact(h *sip.Header) (sip.URI, error) {
 func (d *Dialog) LocalTag() string  { return d.Local.Tag() }
 func (d *Dialog) RemoteTag() string { return d.Remote.Tag() }
 
-// ID is the dialog identifier (RFC 3261 §12): Call-ID and the two tags.
+// ID is the dialog identifier (RFC 3261 §12): Call-ID and the two tags, in
+// lower case since tags compare without it (§7.3.1), so that it can key a
+// table.
 func (d *Dialog) ID() string {
-	return d.CallID + "\x00" + d.LocalTag() + "\x00" + d.RemoteTag()
+	return d.CallID + "\x00" + strings.ToLower(d.LocalTag()) + "\x00" + strings.ToLower(d.RemoteTag())
 }
 
 // targetRefresh reports whether method refreshes the remote target: INVITE
@@ -201,7 +204,10 @@ func targetRefresh(method string) bool {
 func (d *Dialog) Accept(req *sip.Request) error {
 	from, err1 := req.Header.From()
 	to, err2 := req.Header.To()
-	if err1 != nil || err2 != nil || req.Header.Get("Call-ID") != d.CallID || to.Tag() != d.LocalTag() || from.Tag() != d.RemoteTag() {
+	// Call-IDs compare exactly (RFC 3261 §8.1.1.4), tags, tokens, without
+	// case (§7.3.1).
+	if err1 != nil || err2 != nil || req.Header.Get("Call-ID") != d.CallID ||
+		!strings.EqualFold(to.Tag(), d.LocalTag()) || !strings.EqualFold(from.Tag(), d.RemoteTag()) {
 		return ErrNotInDialog
 	}
 	cseq, err := req.Header.CSeq()
