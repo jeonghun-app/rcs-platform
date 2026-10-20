@@ -111,6 +111,11 @@ services:
       HSS_ADMIN_TOKEN: ${HSS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
       STACK_ACS_URL: http://acs:8080
       ACS_ADMIN_TOKEN: ${ACS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+      # Each test subscriber's own AKA keys (#236).
+      RCS_SIM_AKA_K: ${RCS_SIM_AKA_K:?not in deploy/compose.env; make up adds new settings to it}
+      RCS_SIM_AKA_OPC: ${RCS_SIM_AKA_OPC:?not in deploy/compose.env; make up adds new settings to it}
+      RCS_SIM_PEER_AKA_K: ${RCS_SIM_PEER_AKA_K:?not in deploy/compose.env; make up adds new settings to it}
+      RCS_SIM_PEER_AKA_OPC: ${RCS_SIM_PEER_AKA_OPC:?not in deploy/compose.env; make up adds new settings to it}
       STACK_PCSCF_ADDRESS: ${PCSCF_PUBLIC_HOST:-pcscf}
       FT_UPLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/ft
       FT_DOWNLOAD_URI: ${FT_PUBLIC_BASE:-http://ft-server:8081}/dl

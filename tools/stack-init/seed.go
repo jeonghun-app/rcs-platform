@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,12 +14,14 @@ import (
 	"time"
 )
 
-// seedConfig is the test subscriber and where to provision it.
+// seedConfig is the test subscribers and where to provision them.
 type seedConfig struct {
 	hssAPI, hssToken string
 	acsURL, acsToken string
-	imsi, msisdn     string
-	imsDomain        string
+	// subscribers are rcs-sim's client and its peer (#135, #236), each
+	// with its own AKA keys.
+	subscribers []subscriber
+	imsDomain   string
 	// overrides are acs per-subscriber parameter overrides: acs 1.4.0 has
 	// no deployment-wide setting for these values (docs/local-stack.md).
 	overrides map[string]string
@@ -37,17 +40,54 @@ const (
 	keyConfFactory = "APPLICATION:ap2002/MESSAGING/CHAT/ConfFctyURI"
 )
 
+// subscriber is one test subscriber: its identities, and the K and OPc,
+// 32 hex digits each, that hss gets for it. name is what the output calls
+// it, never an identity.
+type subscriber struct {
+	name, imsi, msisdn string
+	k, opc             string
+}
+
+// The variables the subscribers' keys come from: the ones rcs-sim reads,
+// so deploy/compose.env gives both the same values (scripts/compose-env.sh
+// generates them).
+var keyVars = [2][2]string{
+	{"RCS_SIM_AKA_K", "RCS_SIM_AKA_OPC"},
+	{"RCS_SIM_PEER_AKA_K", "RCS_SIM_PEER_AKA_OPC"},
+}
+
 func readSeedConfig(e environment) (seedConfig, error) {
 	c := seedConfig{
-		hssAPI:    e.get("STACK_HSS_API", "http://hss:8081"),
-		acsURL:    e.get("STACK_ACS_URL", "http://acs:8080"),
-		imsi:      e.get("STACK_IMSI", "001010000000001"),
-		msisdn:    e.get("STACK_MSISDN", "+15550100001"),
+		hssAPI: e.get("STACK_HSS_API", "http://hss:8081"),
+		acsURL: e.get("STACK_ACS_URL", "http://acs:8080"),
+		subscribers: []subscriber{
+			{name: "client", imsi: e.get("STACK_IMSI", "001010000000001"), msisdn: e.get("STACK_MSISDN", "+15550100001")},
+			{name: "peer", imsi: e.get("STACK_PEER_IMSI", "001010000000002"), msisdn: e.get("STACK_PEER_MSISDN", "+15550100002")},
+		},
 		retryFor:  time.Minute,
 		poll:      time.Second,
 		overrides: map[string]string{},
 	}
 	var errs []error
+	for i := range c.subscribers {
+		for j, dst := range []*string{&c.subscribers[i].k, &c.subscribers[i].opc} {
+			v, err := e.required(keyVars[i][j])
+			if err == nil && !isKey(v) {
+				err = &configError{msg: keyVars[i][j] + " is not 32 hexadecimal digits"}
+			}
+			errs = append(errs, err)
+			*dst = strings.ToLower(v)
+		}
+	}
+	a, b := c.subscribers[0], c.subscribers[1]
+	switch {
+	case a.imsi == b.imsi || a.msisdn == b.msisdn:
+		errs = append(errs, &configError{msg: "the two test subscribers need their own IMSI and MSISDN"})
+	case a.k != "" && (a.k == b.k || a.opc == b.opc):
+		// One secret shared by two subscribers would hide a client that
+		// answers with the other's (#236).
+		errs = append(errs, &configError{msg: "the two test subscribers need their own K and OPc"})
+	}
 	for _, r := range []struct {
 		name string
 		dst  *string
@@ -78,24 +118,41 @@ func readSeedConfig(e environment) (seedConfig, error) {
 	return c, nil
 }
 
-// impi and impu are the test subscriber's identities, as acs derives them
-// from the IMSI and MSISDN.
-func (c seedConfig) impi() string { return c.imsi + "@" + c.imsDomain }
-func (c seedConfig) impu() string { return "sip:" + c.msisdn + "@" + c.imsDomain }
+// isKey reports whether v is 32 hexadecimal digits, a 128-bit K or OPc.
+func isKey(v string) bool {
+	b, err := hex.DecodeString(v)
+	return err == nil && len(b) == 16
+}
 
-// seed provisions the test subscriber: the subscription in hss, managed by
-// acs as ADR 0006 has it, and the subscriber in acs with the overrides that
-// point its configuration at the local stack. Credentials are not issued
-// here; whoever needs one (make e2e-compose) issues a fresh one.
+// impi and impu are a test subscriber's identities, as acs derives them
+// from the IMSI and MSISDN.
+func (c seedConfig) impi(s subscriber) string { return s.imsi + "@" + c.imsDomain }
+func (c seedConfig) impu(s subscriber) string { return "sip:" + s.msisdn + "@" + c.imsDomain }
+
+// seed provisions each test subscriber: the subscription in hss, managed
+// by acs as ADR 0006 has it, with its own AKA keys, and the subscriber in
+// acs with the overrides that point its configuration at the local stack.
+// Passwords are not issued here; whoever needs one (make e2e-compose)
+// issues a fresh one. The output names the subscribers "client" and
+// "peer", never by an identity, and never shows a key.
 func seed(ctx context.Context, c seedConfig, out io.Writer) error {
 	client := &http.Client{
 		Timeout:       10 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+	for _, s := range c.subscribers {
+		if err := seedOne(ctx, client, c, s, out); err != nil {
+			return fmt.Errorf("%s: %w", s.name, err)
+		}
+	}
+	return nil
+}
+
+func seedOne(ctx context.Context, client *http.Client, c seedConfig, s subscriber, out io.Writer) error {
 	sub := map[string]any{
-		"impi":              c.impi(),
-		"imsi":              c.imsi,
-		"public_identities": []map[string]any{{"impu": c.impu()}},
+		"impi":              c.impi(s),
+		"imsi":              s.imsi,
+		"public_identities": []map[string]any{{"impu": c.impu(s)}},
 		"acs_managed":       true,
 	}
 	status, err := call(ctx, client, c, http.MethodPost, c.hssAPI+"/v1/subscriptions", c.hssToken, sub)
@@ -103,26 +160,37 @@ func seed(ctx context.Context, c seedConfig, out io.Writer) error {
 	case err != nil:
 		return fmt.Errorf("hss: create subscription: %w", err)
 	case status == http.StatusCreated:
-		fmt.Fprintln(out, "hss: test subscription created")
+		fmt.Fprintf(out, "hss: %s test subscription created\n", s.name)
 	case status == http.StatusConflict:
-		fmt.Fprintln(out, "hss: test subscription exists")
+		fmt.Fprintf(out, "hss: %s test subscription exists\n", s.name)
 	default:
 		return fmt.Errorf("hss: create subscription: HTTP %d", status)
 	}
+	// Set every time: a run with new keys in deploy/compose.env re-keys
+	// the subscription, and hss keeps its SQN (PUT /aka).
+	aka := map[string]any{"k": s.k, "opc": s.opc}
+	status, err = call(ctx, client, c, http.MethodPut, c.hssAPI+"/v1/subscriptions/"+url.PathEscape(c.impi(s))+"/aka", c.hssToken, aka)
+	switch {
+	case err != nil:
+		return fmt.Errorf("hss: set AKA keys: %w", err)
+	case status != http.StatusNoContent:
+		return fmt.Errorf("hss: set AKA keys: HTTP %d", status)
+	}
+	fmt.Fprintf(out, "hss: %s AKA keys set\n", s.name)
 	subscriber := map[string]any{
-		"msisdn":      c.msisdn,
+		"msisdn":      s.msisdn,
 		"entitled":    true,
 		"rcs_profile": "UP_2.4",
 		"overrides":   c.overrides,
 	}
-	status, err = call(ctx, client, c, http.MethodPut, c.acsURL+"/admin/subscribers/"+url.PathEscape(c.imsi), c.acsToken, subscriber)
+	status, err = call(ctx, client, c, http.MethodPut, c.acsURL+"/admin/subscribers/"+url.PathEscape(s.imsi), c.acsToken, subscriber)
 	switch {
 	case err != nil:
 		return fmt.Errorf("acs: put subscriber: %w", err)
 	case status != http.StatusOK:
 		return fmt.Errorf("acs: put subscriber: HTTP %d", status)
 	}
-	fmt.Fprintln(out, "acs: test subscriber provisioned with the local stack's addresses")
+	fmt.Fprintf(out, "acs: %s test subscriber provisioned with the local stack's addresses\n", s.name)
 	return nil
 }
 
