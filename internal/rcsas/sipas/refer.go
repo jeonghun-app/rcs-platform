@@ -63,9 +63,7 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 			s.respond(u, req, 400)
 			return
 		}
-		for _, e := range entries {
-			who = append(who, group.Invitee{Identity: e.URI, DisplayName: e.DisplayName})
-		}
+		who = s.invitees(entries)
 	default:
 		method, _ := target.URI.Param("method")
 		remove = strings.EqualFold(method, "BYE")
@@ -74,6 +72,11 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 		id := target.URI
 		id.Headers = nil
 		who = []group.Invitee{{Identity: id.String(), DisplayName: target.DisplayName}}
+		if !remove {
+			// Nobody at the factory or the conference host is added
+			// (invitees); a list with none left is refused by Add.
+			who = s.invitees([]resourcelists.Entry{{URI: who[0].Identity, DisplayName: who[0].DisplayName}})
+		}
 	}
 	if remove {
 		err = s.groups.Remove(ctx, ss.group, ss.user, who[0].Identity)
@@ -93,7 +96,7 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 		return
 	}
 	s.cfg.Metrics.Count("sip.group.added", 1)
-	go s.inviteAdded(ss.group, who, ss.conversation)
+	go s.inviteAdded(ss.group, who, ss.conversation, ss.user)
 }
 
 // respondReferred answers a REFER 202 and, unless it asked for no implicit
@@ -154,7 +157,7 @@ func (s *Server) removed(uri, user string) {
 // inviteAdded has the focus invite those of who that the group now holds
 // invited, as inviteAll does for a new group: someone already joined is
 // left alone.
-func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Conversation) {
+func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Conversation, referrer string) {
 	ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
 	g, err := s.groups.Get(ctx, uri)
 	cancel()
@@ -168,5 +171,5 @@ func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Con
 			invited[id] = true
 		}
 	}
-	s.inviteInvited(g, conv, invited)
+	s.inviteInvited(g, conv, invited, referrer)
 }

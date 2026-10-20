@@ -429,13 +429,19 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	if res.StatusCode != 202 || res.Header.Get("Refer-Sub") != "false" {
 		t.Fatalf("REFER answered %d, Refer-Sub %q", res.StatusCode, res.Header.Get("Refer-Sub"))
 	}
+	// Referred-By names alice, who added carol.
 	if inv := g.core.nextOf(t, "INVITE"); inv.URI.String() != carol || inv.Header.Get("Subject") != "Lunch" ||
-		inv.Header.Get("Contribution-ID") != "gch4t1" {
-		t.Fatalf("INVITE %s, Subject %q, Contribution-ID %q", inv.URI, inv.Header.Get("Subject"), inv.Header.Get("Contribution-ID"))
+		inv.Header.Get("Contribution-ID") != "gch4t1" || inv.Header.Get("Referred-By") != "<"+alice+">" {
+		t.Fatalf("INVITE %s, Subject %q, Contribution-ID %q, Referred-By %q", inv.URI, inv.Header.Get("Subject"),
+			inv.Header.Get("Contribution-ID"), inv.Header.Get("Referred-By"))
+	}
+	// The factory is nobody to add (security review on #279).
+	if res := g.inSession(t, alice, "a1", g.s, 3, "REFER", []string{"Refer-To: <" + confFactory + ">", "Refer-Sub: false"}, ""); res.StatusCode != 400 {
+		t.Fatalf("a REFER adding the factory answered %d", res.StatusCode)
 	}
 	g.stateOf(t, g.uri, carol, groupstore.Invited)
 
-	res = g.inSession(t, alice, "a1", g.s, 3, "REFER", []string{"Refer-To: <cid:list1@" + domain + ">",
+	res = g.inSession(t, alice, "a1", g.s, 4, "REFER", []string{"Refer-To: <cid:list1@" + domain + ">",
 		"Require: multiple-refer, norefersub", "Content-Type: " + resourcelists.ContentType}, groupList(dave, "sip:+15550100005@"+domain))
 	if res.StatusCode != 202 {
 		t.Fatalf("a REFER with a list answered %d", res.StatusCode)
@@ -452,11 +458,11 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	// Without Refer-Sub: false, rcs-as ends the implicit subscription at
 	// once.
 	grp, _ := g.groups.Get(t.Context(), g.uri)
-	if res := g.inSession(t, alice, "a1", g.s, 4, "REFER", []string{"Refer-To: <" + bob + ">"}, ""); res.StatusCode != 202 {
+	if res := g.inSession(t, alice, "a1", g.s, 5, "REFER", []string{"Refer-To: <" + bob + ">"}, ""); res.StatusCode != 202 {
 		t.Fatalf("a REFER for bob answered %d", res.StatusCode)
 	}
 	n := g.core.nextOf(t, "NOTIFY")
-	if n.Header.Get("Event") != "refer;id=4" || !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") ||
+	if n.Header.Get("Event") != "refer;id=5" || !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") ||
 		n.Header.Get("Content-Type") != "message/sipfrag" {
 		t.Fatalf("refer NOTIFY Event %q, State %q, Content-Type %q", n.Header.Get("Event"), n.Header.Get("Subscription-State"), n.Header.Get("Content-Type"))
 	}

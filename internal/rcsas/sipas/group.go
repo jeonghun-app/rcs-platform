@@ -396,22 +396,23 @@ func (s *Server) establish(g groupstore.Group, conv messaging.Conversation) {
 	if err != nil {
 		s.cfg.Metrics.Count("sip.group.establish_failed", 1)
 	}
-	s.inviteInvited(g, conv, nil)
+	s.inviteInvited(g, conv, nil, g.Creator)
 }
 
 // inviteInvited has the focus invite each participant g holds invited, of
-// those in only unless it is nil: once its creator's session is set up, or
-// once a REFER added them. It goes through the engine, which counts the
+// those in only unless it is nil, on behalf of referrer (Referred-By): once
+// its creator's session is set up, or once a REFER added them. It goes
+// through the engine, which counts the
 // invitation, so that a message queued meanwhile waits for that session
 // rather than ringing the participant again.
-func (s *Server) inviteInvited(g groupstore.Group, conv messaging.Conversation, only map[string]bool) {
+func (s *Server) inviteInvited(g groupstore.Group, conv messaging.Conversation, only map[string]bool, referrer string) {
 	for _, p := range g.Participants {
 		if p.State != groupstore.Invited || only != nil && !only[p.Identity] {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
 		s.engine.Invite(ctx, messaging.Invitation{
-			Recipient: p.Identity, Peer: g.URI, Mode: store.Group, Subject: g.Subject, Referrer: g.Creator,
+			Recipient: p.Identity, Peer: g.URI, Mode: store.Group, Subject: g.Subject, Referrer: referrer,
 			Conversation: messaging.Conversation{ID: g.Conversation, Contribution: conv.Contribution},
 		})
 		cancel()
