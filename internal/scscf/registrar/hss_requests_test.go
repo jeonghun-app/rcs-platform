@@ -394,3 +394,43 @@ func TestARemoveSCSCFThatARegisterOvertakesLeavesTheSetPointedAt(t *testing.T) {
 	wantResult(t, g.HandleRTR(bg, &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.RemoveSCSCF}}), resultSuccess)
 	wantSameBindings(t, e, 1, impu1, tel1)
 }
+
+// idHookStore runs hook once, after the first identity delete.
+type idHookStore struct {
+	state.Store
+	once sync.Once
+	hook func()
+}
+
+func (s *idHookStore) DeleteIdentity(ctx context.Context, id *state.Identity) error {
+	err := s.Store.DeleteIdentity(ctx, id)
+	s.once.Do(s.hook)
+	return err
+}
+
+// TestARemoveSCSCFThatARegisterOvertakesKeepsTheRegistersProfile: the RTR
+// deletes only the profile it read (DeleteProfileIf); a REGISTER that stored
+// its own after the RTR's read, and turned the record into a registration,
+// keeps it (QA's finding 2 on #210).
+func TestARemoveSCSCFThatARegisterOvertakesKeepsTheRegistersProfile(t *testing.T) {
+	e := newEnv(t)
+	seed(t, e, impi1, []string{impu1, tel1}, func(r *state.Registration) { r.Unregistered = t0.Add(time.Hour) })
+	must(0, e.store.SaveProfile(bg, &state.Profile{Key: set1, UserData: userDataOf(impi1, nil, impu1, tel1), Received: t0, KeepUntil: t0.Add(25 * time.Hour)}))(t)
+	e.clock.advance(time.Second)
+	hs := &idHookStore{Store: e.store}
+	hs.hook = func() {
+		// A REGISTER stores its SAA's profile and turns the record into a
+		// registration.
+		must(0, e.store.SaveProfile(bg, &state.Profile{Key: set1, UserData: userDataOf(impi1, nil, impu1, tel1), Received: e.clock.Now(), KeepUntil: t0.Add(26 * time.Hour)}))(t)
+		r := must(e.store.Registration(bg, set1))(t)
+		r.Unregistered = time.Time{}
+		r.Contacts = []state.Contact{{URI: "sip:ue1@192.0.2.10:5060;transport=tcp", CallID: "c", CSeq: 1, Expires: t0.Add(time.Hour)}}
+		must(e.store.SaveRegistration(bg, r))(t)
+	}
+	g := e.instance(1, func(c *Config) { c.Store = hs })
+	wantResult(t, g.HandleRTR(bg, &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.RemoveSCSCF}}), resultSuccess)
+	wantSameBindings(t, e, 1, impu1, tel1)
+	if _, err := e.store.Profile(bg, set1, e.clock.Now()); err != nil {
+		t.Errorf("the registered set lost its profile: %v", err)
+	}
+}
