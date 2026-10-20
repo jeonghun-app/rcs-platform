@@ -36,6 +36,14 @@ const DefaultMaxAuthItems = 4
 // means another task wrote the same subscription at the same moment.
 const maxUpdateAttempts = 8
 
+// maxRacedAttempts bounds updateFrom's retries for a request with a
+// deadline, which normally stops them first. A write that lost to another
+// task loses again about as often however long it waits, as long as that
+// task keeps writing (#200: some 45% of retries under two tasks' MARs for one
+// subscriber, on DynamoDB Local), so maxUpdateAttempts gave up while the
+// request still had time. A request without a deadline keeps that count.
+const maxRacedAttempts = 64
+
 // errUnchanged, returned by an update function, skips the write.
 var errUnchanged = errors.New("hss: nothing to write")
 
@@ -78,6 +86,9 @@ type HSS struct {
 	// locks are semaphores of one, so a writer waits for a subscription
 	// only as long as its context allows.
 	locks [lockStripes]chan struct{}
+	// onLockWait, if set, runs when a request starts waiting for a lock
+	// another holds: a test hook.
+	onLockWait func()
 }
 
 // lockStripes is the number of subscriber locks of a task. A slow write
@@ -120,20 +131,30 @@ func New(o Options) (*HSS, error) {
 // version conflicts, and the retries they cost, arise only between tasks.
 // It gives up with errBusy when ctx ends first.
 func (h *HSS) lock(ctx context.Context, impi string) (unlock func(), err error) {
+	unlock, _, err = h.acquire(ctx, impi)
+	return unlock, err
+}
+
+// acquire is lock, and reports whether the lock was held by another request
+// when asked for.
+func (h *HSS) acquire(ctx context.Context, impi string) (unlock func(), waited bool, err error) {
 	f := fnv.New32a()
 	_, _ = io.WriteString(f, impi)
 	sem := h.locks[f.Sum32()%lockStripes]
 	select {
 	case sem <- struct{}{}: // free: taken whatever the context's state
-		return func() { <-sem }, nil
+		return func() { <-sem }, false, nil
 	default:
+	}
+	if h.onLockWait != nil {
+		h.onLockWait()
 	}
 	select {
 	case sem <- struct{}{}:
-		return func() { <-sem }, nil
+		return func() { <-sem }, true, nil
 	case <-ctx.Done():
 		h.metrics.Count("lock.busy", 1)
-		return nil, errBusy
+		return nil, true, errBusy
 	}
 }
 
@@ -149,19 +170,32 @@ func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscrip
 // updateFrom is update with read, the subscription the caller has just read,
 // as the first attempt's starting point, which saves a read on the Cx path.
 // If read is stale the conditional write fails and the next attempt reads.
+// A read taken before waiting for the lock is stale for certain, as the
+// request that held the lock wrote the subscription, so it is dropped: kept,
+// it cost every queued request a failed write (#200).
+//
+// With a deadline in ctx the retries run until it, or maxRacedAttempts,
+// rather than maxUpdateAttempts: see maxRacedAttempts.
 func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
-	unlock, err := h.lock(ctx, impi)
+	unlock, waited, err := h.acquire(ctx, impi)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
-	for attempt := 0; attempt < maxUpdateAttempts; attempt++ {
+	if waited {
+		read = nil
+	}
+	attempts := maxUpdateAttempts
+	if _, ok := ctx.Deadline(); ok {
+		attempts = maxRacedAttempts
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			h.metrics.Count("store.conflict", 1)
 			// Jitter so that two tasks retrying the same write do not
-			// collide again.
+			// collide again, at most 320 ms however many attempts.
 			select {
-			case <-time.After(time.Duration(mathrand.IntN(5<<attempt)) * time.Millisecond):
+			case <-time.After(time.Duration(mathrand.IntN(5<<min(attempt, 6))) * time.Millisecond):
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
