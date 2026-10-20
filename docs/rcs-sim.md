@@ -188,10 +188,34 @@ As the called party, it hands each INVITE from the network to the scenario
 - A CANCEL before the answer gets 200, and the INVITE 487 (§9.2). After the
   answer it gets 200 and changes nothing. A CANCEL for no INVITE gets 481.
 
+It follows its own registration state (RFC 3680, TS 24.229 §5.1.1.3):
+
+- `SubscribeRegEvent` sends SUBSCRIBE for the reg event of the IMPU, with
+  `Accept: application/reginfo+xml` and an expiry of 600000 s. A NOTIFY that
+  overtakes the 2xx sets up the subscription itself (RFC 6665 §4.1.2.4).
+- Each NOTIFY is answered 200 and delivered in order, with its
+  `Subscription-State`, reason, and `reginfo` body: version, state, and each
+  contact's state and event. The scenario checks the versions.
+- The NOTIFY sets up the dialog (RFC 6665 §4.4.1): the first one's
+  Record-Route is the route set, and each one's Contact the remote target.
+  Before any NOTIFY, the 2xx's stand in.
+- A NOTIFY without a readable `Subscription-State` or `Event` gets 400, one
+  for another event package 489, one with an event id this subscription
+  does not have or from another dialog (another From tag: reg event
+  subscriptions do not fork, RFC 3680 §4.9) 481, a CSeq not above the last
+  500, and one after the subscription ended 481. A body that is not
+  `reginfo` is answered 200 and flagged in the notification. `reginfo`
+  without a version, with a document type declaration, or with anything
+  after its root element, is refused.
+- `Unsubscribe` sends SUBSCRIBE with `Expires: 0` in the dialog, with the
+  UA's Contact. A non-2xx comes back as a `StatusError`, as for
+  `SubscribeRegEvent`. A terminated NOTIFY ends the subscription, and so
+  does an answer that says it no longer exists, 481 among them (§4.1.2.2).
+
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an
-in-process stand-in for pcscf, the registrar and the far end, which also
-calls it. The registrar
+in-process stand-in for pcscf, the registrar, the notifier and the far end,
+which also calls it. The registrar
 authenticates with `internal/sip/digest`'s server side and Milenage vectors.
 
 `-sip-proxy` turns the client's configuration on (see [Running it](#running-it)).
