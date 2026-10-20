@@ -33,8 +33,9 @@ type IncomingCall struct {
 // Request is the INVITE; its body is the SDP offer.
 func (c *IncomingCall) Request() *sip.Request { return c.req }
 
-// Cancelled is closed when a CANCEL ended the call before it was answered:
-// the INVITE has then been answered 487 (§9.2).
+// Cancelled is closed when a CANCEL ended the call before it was answered,
+// before the INVITE is answered 487 (§9.2): whoever sees the 487 can rely
+// on the call having ended here.
 func (c *IncomingCall) Cancelled() <-chan struct{} { return c.cancelled }
 
 // Ring answers 180 Ringing.
@@ -218,10 +219,12 @@ func (ua *UA) cancel(tx *transaction.ServerTransaction) {
 	}
 	c.final = true
 	ua.answered(c)
+	// Closed first: the 487 is what the caller sees of the cancellation,
+	// so this side has to know it before it goes out (#249).
+	close(c.cancelled)
 	if res, err := sip.NewResponse(c.req, 487, "", c.tag); err == nil {
 		_ = c.tx.Respond(res)
 	}
-	close(c.cancelled)
 }
 
 // newUASDialog makes the called party's dialog of invite and its 2xx res
