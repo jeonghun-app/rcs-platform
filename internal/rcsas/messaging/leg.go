@@ -321,13 +321,23 @@ func (l *Leg) activate() {
 			l.done()
 			return
 		}
-		delete(e.invites, inviteKey{l.p.User, l.p.Peer, store.Standalone, l.p.QueueID})
+		// The invitation stays marked until the attempt is over. A pass that
+		// read the message before deliverLarge claims it would otherwise
+		// find no key and ask for a second session for it (#264); marked
+		// afresh, in case the mark from the invite has run out meanwhile.
+		// Once the attempt is over the message is gone or back in the
+		// queue, and its next invitation may go at once.
+		key := inviteKey{l.p.User, l.p.Peer, store.Standalone, l.p.QueueID}
+		e.invites[key] = e.clock.Now().Add(e.cfg.InviteTimeout)
 		e.wg.Add(1)
 		e.mu.Unlock()
 		go func() {
 			defer e.wg.Done()
 			defer l.done()
 			e.deliverLarge(l)
+			e.mu.Lock()
+			delete(e.invites, key)
+			e.mu.Unlock()
 		}()
 	}
 }

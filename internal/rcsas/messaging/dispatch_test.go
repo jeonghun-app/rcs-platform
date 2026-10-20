@@ -365,6 +365,55 @@ func TestALargeModeSessionCarriesItsOneMessage(t *testing.T) {
 	waitDone(t, leg3.Finished())
 }
 
+// #264: a pass that read a large message before its session's leg
+// activated, and asks for its session after, asks for none while the leg
+// makes its attempt, even when the mark the invitation left has run out
+// meanwhile; once the attempt is over and the message is back in the
+// queue, it may ask again at once.
+func TestNoSecondLargeModeSessionIsAskedForWhileOneDelivers(t *testing.T) {
+	const mark = time.Minute
+	for name, wait := range map[string]time.Duration{"within the invitation's mark": 0, "after it ran out": mark} {
+		t.Run(name, func(t *testing.T) {
+			// Retries stay far off, so that only this test asks for sessions.
+			r := newRig(t, Config{PagerLimit: 600, InviteTimeout: mark, RetryInterval: time.Hour})
+			if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+				t.Fatal(err)
+			}
+			inv := r.d.nextInvite(t)
+			waitFor(t, "idle", r.idle)
+			// What the pass read before the leg activated and claimed the
+			// message.
+			ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+			if err != nil || len(ms) != 1 || ms[0].ID != inv.QueueID {
+				t.Fatalf("Pending = %+v, %v", ms, err)
+			}
+			r.clock.Advance(wait)
+			leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+				Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = leg.Close() }) // before the engine closes, which waits for the attempt
+			// Nobody binds the leg, so its attempt waits until the leg closes.
+			if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+				t.Fatal(err)
+			}
+			r.e.invite(t.Context(), ms[0])
+			select {
+			case again := <-r.d.invites:
+				t.Fatalf("a second session was asked for: %+v", again)
+			default:
+			}
+			_ = leg.Close()
+			waitDone(t, leg.Finished())
+			r.e.invite(t.Context(), ms[0])
+			if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+				t.Fatalf("invitation %+v", got)
+			}
+		})
+	}
+}
+
 // An open chat leg with the sender is no session for a large-mode
 // message, which still gets one of its own: invite looks for an open leg
 // only for the modes that go on one (#260).
