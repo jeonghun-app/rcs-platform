@@ -311,7 +311,9 @@ func TestASubscriberThatIsGoneEndsItsSubscription(t *testing.T) {
 func TestTwoInstancesNeverNumberTwoNotifiesAlike(t *testing.T) {
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
-	a, b := e.notifier(1), e.notifier(2)
+	m := &counts{}
+	a := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
+	b := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
 	e.subscribed(a)
 	var wg sync.WaitGroup
 	for i := range 20 {
@@ -335,8 +337,9 @@ func TestTwoInstancesNeverNumberTwoNotifiesAlike(t *testing.T) {
 		}
 		seen[k] = true
 	}
-	if len(seen) != 21 {
-		t.Errorf("%d distinct NOTIFYs, want 21", len(seen))
+	// A change whose NOTIFY was waiting already merges into it.
+	if got := len(seen) + int(m.get("regevent.notify_merged")); got != 21 {
+		t.Errorf("%d distinct NOTIFYs and %d merged, want 21 in all", len(seen), m.get("regevent.notify_merged"))
 	}
 }
 

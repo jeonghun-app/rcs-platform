@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -26,18 +25,34 @@ const (
 	DefaultMaxExpires = 600000 * time.Second
 	// DefaultNotifyTimeout bounds one NOTIFY's transaction.
 	DefaultNotifyTimeout = 10 * time.Second
-	// DefaultWorkers NOTIFYs are sent at a time, and DefaultQueue more wait
-	// for a worker; beyond that a change's NOTIFYs are dropped and counted.
+	// DefaultWorkers prepare NOTIFYs at a time (the store's reads and
+	// writes), and DefaultQueue more wait; the wait for an answer is not a
+	// worker's.
 	DefaultWorkers = 8
-	DefaultQueue   = 1024
+	DefaultQueue   = 4096
+	// DefaultSetConcurrency NOTIFYs of one set, and DefaultHopConcurrency to
+	// one next hop, are under way at a time, so that a subscriber or a
+	// P-CSCF task that is slow to answer holds back its own NOTIFYs only.
+	// A UE's NOTIFYs go through its P-CSCF too, so a hop takes more than a
+	// set: a few slow UEs must not hold back everyone behind their P-CSCF.
+	DefaultSetConcurrency = 2
+	DefaultHopConcurrency = 32
 	// DefaultMaxPerSubscriber is how many subscriptions one subscriber
 	// keeps to one identity: the UE and the P-CSCF need one, and a second
 	// covers a new one set up before the old one is gone.
 	DefaultMaxPerSubscriber = 2
 	// DefaultMaxPerSet is how many subscriptions all subscribers keep to a
-	// set: the UE's devices and their P-CSCFs, with room to spare.
+	// set: the UE's devices and their P-CSCFs, with room to spare. The UE's
+	// may take three quarters (MaxUEPerSet), so that the P-CSCF always has
+	// room.
 	DefaultMaxPerSet = 16
 )
+
+// pendingEnd is how far ahead the expiry of a subscription is set when it is
+// terminated before its final NOTIFY is queued: if the queue drops the
+// NOTIFY, or the instance stops, the next sweep after it sends it
+// (state.SweepSubscriptions), within seconds of the subscription's end.
+const pendingEnd = 5 * time.Second
 
 // storeRetryAfter is the Retry-After of a 500 for a store failure, in
 // seconds: DynamoDB throttling and timeouts pass within seconds.
@@ -70,18 +85,26 @@ type Config struct {
 	DefaultExpires, MaxExpires time.Duration
 	// NotifyTimeout bounds each NOTIFY sent for a change.
 	NotifyTimeout time.Duration
-	// Workers bounds the NOTIFYs being sent at a time for changes and
-	// sweeps, and Queue those waiting for a worker (#256 security review:
-	// the request that changed a set must not wait for its subscribers, and
-	// a slow subscriber must not pile up goroutines).
-	Workers, Queue int
+	// Workers bounds the NOTIFYs of changes and sweeps being prepared at a
+	// time, Queue those waiting, and SetConcurrency and HopConcurrency those
+	// under way, from the store's first read to the subscriber's answer, per
+	// set and per next hop (#256 security and code reviews: the request that
+	// changed a set must not wait for its subscribers, and a slow subscriber
+	// or P-CSCF task must not hold back anyone else's NOTIFYs). A quarter of
+	// Queue at most waits for one next hop.
+	Workers, Queue                 int
+	SetConcurrency, HopConcurrency int
 	// MaxPerSubscriber bounds the subscriptions of one subscriber to one
-	// identity: one more replaces the subscriber's oldest. MaxPerSet bounds
-	// the subscriptions to a set's identities: one more is refused with 403
-	// (RFC 6665 §4.2.1.1 lets the notifier refuse). Both keep what a
-	// subscriber can store, and what a change of the set costs, small.
-	MaxPerSubscriber, MaxPerSet int
-	Now                         func() time.Time
+	// identity: one more replaces the subscriber's oldest. MaxUEPerSet
+	// bounds the UE's subscriptions to a set's identities: one more replaces
+	// the oldest of them. MaxPerSet bounds all subscriptions to the set: a
+	// P-CSCF's replaces the oldest of the UE's, and once the set has only
+	// P-CSCF subscriptions one more is refused with 403 (RFC 6665 §4.2.1.1
+	// lets the notifier refuse), so a P-CSCF is never refused for the UE's.
+	// They keep what a subscriber can store, and what a change of the set
+	// costs, small. MaxUEPerSet is three quarters of MaxPerSet when 0.
+	MaxPerSubscriber, MaxUEPerSet, MaxPerSet int
+	Now                                      func() time.Time
 	// Rand makes tags and branches; crypto/rand when nil.
 	Rand    io.Reader
 	Logger  *slog.Logger
@@ -93,11 +116,9 @@ type Notifier struct {
 	cfg Config
 	ids sip.IDGenerator
 	log *slog.Logger
-	// wg counts the jobs started; slots holds one token per job running,
-	// and pending is the jobs started and not done, at most Queue+Workers.
-	wg      sync.WaitGroup
-	slots   chan struct{}
-	pending atomic.Int64
+	// wg counts the tasks queued and not done (schedule.go).
+	wg sync.WaitGroup
+	sc scheduler
 }
 
 // New validates cfg and returns a Notifier.
@@ -130,11 +151,23 @@ func New(cfg Config) (*Notifier, error) {
 	if cfg.Queue <= 0 {
 		cfg.Queue = DefaultQueue
 	}
+	if cfg.SetConcurrency <= 0 {
+		cfg.SetConcurrency = DefaultSetConcurrency
+	}
+	if cfg.HopConcurrency <= 0 {
+		cfg.HopConcurrency = DefaultHopConcurrency
+	}
 	if cfg.MaxPerSubscriber <= 0 {
 		cfg.MaxPerSubscriber = DefaultMaxPerSubscriber
 	}
 	if cfg.MaxPerSet <= 0 {
 		cfg.MaxPerSet = DefaultMaxPerSet
+	}
+	if cfg.MaxUEPerSet <= 0 {
+		cfg.MaxUEPerSet = max(cfg.MaxPerSet*3/4, 1)
+	}
+	if cfg.MaxUEPerSet > cfg.MaxPerSet {
+		return nil, errors.New("regevent: MaxUEPerSet above MaxPerSet")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -149,7 +182,7 @@ func New(cfg Config) (*Notifier, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Notifier{cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand}, log: log, slots: make(chan struct{}, cfg.Workers)}, nil
+	return &Notifier{cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand}, log: log, sc: newScheduler()}, nil
 }
 
 type noMetrics struct{}
@@ -158,31 +191,9 @@ func (noMetrics) Count(string, int64) {}
 
 func (n *Notifier) count(name string) { n.cfg.Metrics.Count(name, 1) }
 
-// Wait returns once every NOTIFY that Changed, Sweep or a replaced
-// subscription started has been sent: for a shutdown, and for tests.
+// Wait returns once every task queued by Changed, Sweep or a replaced
+// subscription has run, its NOTIFY answered: for a shutdown, and for tests.
 func (n *Notifier) Wait() { n.wg.Wait() }
-
-// start runs job on a worker, once one is free, and returns at once. With
-// Queue jobs already waiting it drops job, which counts
-// regevent.notify_dropped: the subscriber misses that change, and the next
-// NOTIFY, which carries the full state, makes good. The goroutines waiting
-// are bounded by Queue.
-func (n *Notifier) start(ctx context.Context, job func(context.Context)) {
-	if n.pending.Add(1) > int64(n.cfg.Queue+n.cfg.Workers) {
-		n.pending.Add(-1)
-		n.count("regevent.notify_dropped")
-		return
-	}
-	ctx = context.WithoutCancel(ctx)
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
-		defer n.pending.Add(-1)
-		n.slots <- struct{}{}
-		defer func() { <-n.slots }()
-		job(ctx)
-	}()
-}
 
 // subscriptionID is the store key of the subscription of a dialog: a digest
 // of its identifier (dialog.Dialog.ID), so that any instance finds it from

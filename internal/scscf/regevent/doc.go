@@ -14,9 +14,11 @@
 // Who may subscribe (TS 24.229 §5.4.2.1.1): the P-CSCF, whose
 // P-Asserted-Identity is the Path URI it put on a live binding of the
 // registration (§5.2.3), or the UE, whose P-Asserted-Identity is one of the
-// set's identities not barred. Anyone else gets 403, as does a SUBSCRIBE
-// beyond Config.MaxPerSet; one beyond Config.MaxPerSubscriber replaces the
-// subscriber's oldest. A subscription watches the set, by its key and
+// set's identities not barred. Anyone else gets 403, as does a SUBSCRIBE to
+// a barred identity, or beyond Config.MaxPerSet once the set has only the
+// P-CSCF's; one beyond Config.MaxPerSubscriber (per device for a UE)
+// replaces the subscriber's oldest, one beyond Config.MaxUEPerSet the UE's
+// oldest, and a P-CSCF's in a full set the UE's oldest. A subscription watches the set, by its key and
 // incarnation, that the identity was in when it was made, and ends, with a
 // NOTIFY that says terminated, deactivated, when that set's record goes,
 // the identity leaves it, it has no live binding, the UE's own binding
@@ -41,9 +43,18 @@
 // same in every NOTIFY. A read of the store that fails sends no NOTIFY:
 // the next carries the state.
 //
-// The NOTIFYs of a change go out on Config.Workers workers, so that the
-// request that changed the set is answered first; beyond Config.Queue
-// waiting, they are dropped and counted.
+// The NOTIFYs of changes and sweeps go out in the background, so that the
+// request that changed the set is answered first: Config.Workers prepare
+// them (the store's part), and the wait for each answer is not a worker's.
+// At most Config.SetConcurrency NOTIFYs of one set, and
+// Config.HopConcurrency to one next hop, are under way at a time, so a slow
+// subscriber or P-CSCF task holds back its own only. A NOTIFY waiting for a
+// subscription that has one waiting already merges into it. Beyond
+// Config.Queue waiting, or a quarter of it for one next hop, a NOTIFY is
+// dropped and counted; the next carries the state. The end of a set is
+// never lost so: its subscriptions are saved Terminated, with the reason,
+// before their final NOTIFYs are queued, and a sweep sends a final NOTIFY
+// nobody sent (state.SweepSubscriptions).
 //
 // The package sends nothing itself: Sender carries a request to the next
 // hop of its dialog in a client transaction, which cmd/scscf provides.

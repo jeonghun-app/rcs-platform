@@ -77,7 +77,9 @@ func (n *Notifier) subscribe(ctx context.Context, req *sip.Request, ev sip.Event
 		return n.unavailable(req, "reading a registration", err), nil
 	}
 	kind := kindOf(set, subscriber, now)
-	if kind == "" {
+	if kind == "" || barred(set, impu) {
+		// A barred identity has no state to watch: no NOTIFY lists it
+		// (TS 24.229 §5.4.1.2.2).
 		return n.refused(req), nil
 	}
 	tag, err := n.ids.Tag()
@@ -218,61 +220,109 @@ func ueLive(set *state.Registration, key string, now time.Time) bool {
 // errFull refuses a subscription to a set that has MaxPerSet.
 var errFull = errors.New("regevent: the set has as many subscriptions as it may")
 
-// makeRoom makes room for sub among the subscriptions to its set: if its
-// subscriber has MaxPerSubscriber to its identity already, the oldest of
-// those, by expiry, are terminated at once and ended on a worker (their
-// NOTIFY says terminated, deactivated, without a body), and if the set has
-// MaxPerSet it fails with errFull. Two SUBSCRIBEs at once
-// may each find the room, so the bounds hold within a few, which is what
-// they are for.
+// barred reports whether set has impu barred.
+func barred(set *state.Registration, impu string) bool {
+	for _, id := range set.Identities {
+		if id.IMPU == impu {
+			return id.Barred
+		}
+	}
+	return false
+}
+
+// makeRoom makes room for sub among the live subscriptions to its set,
+// ending the oldest, by expiry, that it pushes out: they are terminated at
+// once and their NOTIFY, terminated, deactivated, without a body, goes on a
+// worker.
+//   - A subscriber keeps MaxPerSubscriber to an identity; a UE that many per
+//     device, its binding (Binding), as every device of a user asserts the
+//     same identity (#256 QA review).
+//   - The UE's subscriptions to the set are at most MaxUEPerSet.
+//   - All are at most MaxPerSet: a P-CSCF's pushes out the UE's, and with
+//     none left it fails with errFull, so a P-CSCF is refused for its own
+//     subscriptions only (#256 security and code reviews).
+//
+// The bounds are counted from a listing, without a transaction: SUBSCRIBEs
+// handled at the same moment may each find the same room, so the bounds
+// can be passed by as many as arrive together, and the next SUBSCRIBE of
+// that subscriber, or to that set, brings them back. Their NOTIFYs stay
+// bounded per set (SetConcurrency).
 func (n *Notifier) makeRoom(ctx context.Context, sub *state.Subscription, set *state.Registration, now time.Time) error {
-	var mine []*state.Subscription
-	total := 0
+	var all []*state.Subscription
 	for _, id := range set.Identities {
 		subs, err := n.cfg.Store.SubscriptionsOf(ctx, id.IMPU)
 		if err != nil {
 			return err
 		}
 		for _, s := range subs {
-			if s.Terminated || s.Set != sub.Set || s.Incarnation != sub.Incarnation || s.Expires.Before(now) {
-				continue
-			}
-			total++
-			if s.IMPU == sub.IMPU && s.Subscriber == sub.Subscriber {
-				mine = append(mine, s)
+			if !s.Terminated && s.Set == sub.Set && s.Incarnation == sub.Incarnation && !s.Expires.Before(now) {
+				all = append(all, s)
 			}
 		}
 	}
-	slices.SortFunc(mine, func(a, b *state.Subscription) int {
+	slices.SortFunc(all, func(a, b *state.Subscription) int {
 		return cmp.Or(a.Expires.Compare(b.Expires), cmp.Compare(a.ID, b.ID))
 	})
-	for len(mine) >= n.cfg.MaxPerSubscriber {
-		old, err := n.terminate(ctx, mine[0], now)
-		if err != nil {
-			return err
-		}
-		mine = mine[1:]
-		total--
-		if old == nil {
-			continue
-		}
-		n.count("regevent.replaced")
-		n.start(ctx, func(ctx context.Context) { n.notifySub(ctx, old, job{final: true, reason: "deactivated", bare: true}) })
+	mine := func(s *state.Subscription) bool {
+		return s.IMPU == sub.IMPU && s.Subscriber == sub.Subscriber && s.Kind == sub.Kind &&
+			(sub.Kind != state.SubscriberUE || s.Binding == sub.Binding)
 	}
-	if total >= n.cfg.MaxPerSet {
+	ue := func(s *state.Subscription) bool { return s.Kind == state.SubscriberUE }
+	// pushOut ends the oldest that is, while there are more than keep.
+	pushOut := func(is func(*state.Subscription) bool, keep int) error {
+		for k := countOf(all, is); k > keep; k-- {
+			i := slices.IndexFunc(all, is)
+			old, err := n.terminate(ctx, all[i], now.Add(pendingEnd), "deactivated", false)
+			if err != nil {
+				return err
+			}
+			all = slices.Delete(all, i, i+1)
+			if old != nil {
+				n.count("regevent.replaced")
+				n.enqueueNotify(ctx, old, job{final: true, reason: "deactivated", bare: true}, nil)
+			}
+		}
+		return nil
+	}
+	if err := pushOut(mine, n.cfg.MaxPerSubscriber-1); err != nil {
+		return err
+	}
+	var err error
+	if sub.Kind == state.SubscriberUE {
+		err = pushOut(ue, n.cfg.MaxUEPerSet-1)
+	} else {
+		// The UE's make room for a P-CSCF's, down to none.
+		pcscf := len(all) - countOf(all, ue)
+		err = pushOut(ue, max(n.cfg.MaxPerSet-1-pcscf, 0))
+	}
+	if err != nil {
+		return err
+	}
+	if len(all) >= n.cfg.MaxPerSet {
 		return errFull
 	}
 	return nil
 }
 
-// terminate marks sub Terminated, so that nothing but its final NOTIFY is
-// sent to it and it is deleted after that, or by a sweep after
-// TerminatedGrace, and returns it as saved: nil if it is gone or ending
-// already.
-func (n *Notifier) terminate(ctx context.Context, sub *state.Subscription, now time.Time) (*state.Subscription, error) {
+func countOf(subs []*state.Subscription, is func(*state.Subscription) bool) int {
+	k := 0
+	for _, s := range subs {
+		if is(s) {
+			k++
+		}
+	}
+	return k
+}
+
+// terminate marks sub Terminated, with reason as its final NOTIFY's and
+// expires as its expiry, so that nothing but that NOTIFY is sent to it and
+// it is deleted after it, or the first sweep after expires sends it, and
+// returns it as saved: nil if it is gone or ending already. setEnded says
+// that its set ended (state.Subscription).
+func (n *Notifier) terminate(ctx context.Context, sub *state.Subscription, expires time.Time, reason string, setEnded bool) (*state.Subscription, error) {
 	for range saveAttempts {
 		next := sub.Clone()
-		next.Terminated, next.Expires = true, now.Add(state.TerminatedGrace)
+		next.Terminated, next.Expires, next.EndReason, next.SetEnded = true, expires, reason, setEnded
 		saved, err := n.cfg.Store.SaveSubscription(ctx, next)
 		switch {
 		case errors.Is(err, state.ErrNotFound):
@@ -371,7 +421,7 @@ func (n *Notifier) refresh(ctx context.Context, req *sip.Request, ev sip.Event) 
 		next.Expires = now.Add(exp)
 		j := job{}
 		if exp == 0 {
-			next.Terminated, next.Expires = true, now.Add(state.TerminatedGrace)
+			next.Terminated, next.Expires, next.EndReason = true, now.Add(pendingEnd), ""
 			j = job{final: true}
 		}
 		saved, err := n.cfg.Store.SaveSubscription(ctx, next)

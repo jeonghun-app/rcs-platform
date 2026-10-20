@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -488,20 +489,118 @@ func TestOneSubscriberKeepsAtMostTwoSubscriptionsToAnIdentity(t *testing.T) {
 	}
 }
 
-// TestASetKeepsAtMostMaxPerSetSubscriptions: one more is refused with 403.
-func TestASetKeepsAtMostMaxPerSetSubscriptions(t *testing.T) {
+// TestAPCSCFIsNeverRefusedForTheUEsSubscriptions: the UE's subscriptions
+// take MaxUEPerSet at most, and a P-CSCF's pushes out the oldest of them
+// when the set is full; the set refuses only once it is all the P-CSCF's
+// (#256 security and code reviews).
+func TestAPCSCFIsNeverRefusedForTheUEsSubscriptions(t *testing.T) {
 	e := newEnv(t)
-	e.registered(binding(1, time.Hour))
-	n := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.MaxPerSet = 3 })
-	for i, s := range [][2]string{{impu1, pcscfPath}, {impu1, tel1}, {tel1, impu1}, {tel1, tel1}} {
-		req := subscribe(t, s[0], s[1], 3600)
-		_ = req.Header.Set("Call-ID", fmt.Sprintf("sub-%d", i))
-		res, _ := n.Subscribe(bg, req)
-		want := 200
-		if i == 3 {
-			want = 403
+	e.registered(binding(1, time.Hour), binding(2, time.Hour), binding(3, time.Hour))
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.MaxPerSet, c.Metrics = 6, m })
+	calls := 0
+	try := func(target, pai, contact string) int {
+		t.Helper()
+		calls++
+		req := subscribe(t, target, pai, 3600+calls)
+		_ = req.Header.Set("Call-ID", fmt.Sprintf("sub-%d", calls))
+		if contact != "" {
+			_ = req.Header.Set("Contact", "<"+contact+">")
 		}
-		wantStatus(t, res, want)
+		res, _ := n.Subscribe(bg, req)
+		return res.StatusCode
+	}
+	kinds := func() (ue, pcscf int) {
+		for _, impu := range []string{impu1, tel1} {
+			for _, s := range e.subscriptions(impu) {
+				switch {
+				case s.Terminated:
+				case s.Kind == state.SubscriberUE:
+					ue++
+				default:
+					pcscf++
+				}
+			}
+		}
+		return ue, pcscf
+	}
+	// Five devices' worth of the UE's: three devices, two identities.
+	for _, s := range [][2]string{{impu1, binding(1, 0).URI}, {tel1, binding(1, 0).URI}, {impu1, binding(2, 0).URI}, {tel1, binding(2, 0).URI}, {impu1, binding(3, 0).URI}} {
+		if code := try(s[0], impu1, s[1]); code != 200 {
+			t.Fatalf("UE SUBSCRIBE: %d", code)
+		}
+	}
+	if ue, _ := kinds(); ue != 4 || m.get("regevent.replaced") != 1 {
+		t.Fatalf("%d UE subscriptions, %d replaced; want MaxUEPerSet 4 and 1", ue, m.get("regevent.replaced"))
+	}
+	// The P-CSCF's four (two to each identity) all get in.
+	for _, target := range []string{impu1, impu1, tel1, tel1} {
+		if code := try(target, pcscfPath, ""); code != 200 {
+			t.Fatalf("P-CSCF SUBSCRIBE: %d", code)
+		}
+	}
+	if ue, pcscf := kinds(); ue != 2 || pcscf != 4 {
+		t.Errorf("%d UE and %d P-CSCF subscriptions, want 2 and 4", ue, pcscf)
+	}
+	// The set is full and the UE's are within MaxUEPerSet: the UE is refused.
+	if code := try(tel1, impu1, binding(3, 0).URI); code != 403 {
+		t.Errorf("UE SUBSCRIBE to a full set: %d, want 403", code)
+	}
+}
+
+// TestThreeDevicesOfOneUserKeepTheirSubscriptions: every device of a user
+// asserts the same identity, so MaxPerSubscriber counts a UE's per device;
+// each answers a terminated;reason=deactivated by subscribing again at once
+// (RFC 6665 §4.1.3), which must not push out another device (QA's N1 on
+// #256).
+func TestThreeDevicesOfOneUserKeepTheirSubscriptions(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, time.Hour), binding(2, time.Hour), binding(3, time.Hour))
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
+	device := map[string]int{}
+	next := 0
+	sub := func(k int) {
+		next++
+		cid := fmt.Sprintf("dev%d-%d", k, next)
+		device[cid] = k
+		req := subscribe(t, impu1, impu1, 600000)
+		_ = req.Header.Set("Call-ID", cid)
+		c := binding(k, 0)
+		_ = req.Header.Set("Contact", fmt.Sprintf(`<%s>;+sip.instance="%s"`, c.URI, c.InstanceID))
+		res, after := n.Subscribe(bg, req)
+		wantStatus(t, res, 200)
+		after(bg)
+	}
+	for k := 1; k <= 3; k++ {
+		sub(k)
+	}
+	n.Wait()
+	seen := 0
+	for range 10 {
+		got := e.send.notifies()
+		progressed := false
+		for _, req := range got[seen:] {
+			ss, _ := req.Header.SubscriptionState()
+			if r, _ := ss.Params.Get("reason"); ss.State == "terminated" && r == "deactivated" {
+				sub(device[req.Header.Get("Call-ID")])
+				progressed = true
+			}
+		}
+		seen = len(got)
+		n.Wait()
+		if !progressed {
+			break
+		}
+	}
+	live := map[int]bool{}
+	for _, s := range e.subscriptions(impu1) {
+		if !s.Terminated {
+			live[device[s.Dialog.CallID]] = true
+		}
+	}
+	if m.get("regevent.replaced") != 0 || len(live) != 3 {
+		t.Errorf("a device's SUBSCRIBE ended another device's subscription %d times; devices with one %v", m.get("regevent.replaced"), live)
 	}
 }
 
@@ -530,6 +629,16 @@ func (g *gatedSender) Send(ctx context.Context, req *sip.Request) (*sip.Response
 	return sip.NewResponse(req, 200, "", "subscriber")
 }
 
+func (g *gatedSender) inFlightNow() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.inFlight
+}
+
+func newGate(k int) *gatedSender {
+	return &gatedSender{entered: make(chan struct{}, k), release: make(chan struct{}, k)}
+}
+
 // subscribedMany has k P-CSCF subscriptions to impu1, made on a notifier of
 // their own.
 func (e *env) subscribedMany(k int) {
@@ -543,60 +652,358 @@ func (e *env) subscribedMany(k int) {
 	}
 }
 
-// TestAChangeSendsAtMostWorkersNotifiesAtOnce (#256 security review): once
-// the change has queued all its NOTIFYs, Workers are in flight, holding the
-// workers' slots, and the others wait for one.
-func TestAChangeSendsAtMostWorkersNotifiesAtOnce(t *testing.T) {
-	const subs, workers = 12, 3
+// otherSets stores k sets of other users, each with a binding and a
+// P-CSCF subscription with the Call-ID prefix and its index, made on a
+// notifier of their own.
+func (e *env) otherSets(k int, prefix string) []*state.Registration {
+	e.t.Helper()
+	n := newNotifierWith(e.t, e, e.store, e.send)
+	var out []*state.Registration
+	for i := range k {
+		key := state.SetKey{IMPI: fmt.Sprintf("%s%04d@%s", prefix, i, realm), IMPU: fmt.Sprintf("sip:%s%04d@%s", prefix, i, realm)}
+		out = append(out, e.saved(&state.Registration{Key: key, Incarnation: 1, Contacts: []state.Contact{binding(1, time.Hour)},
+			Identities: []state.SetIdentity{{IMPU: key.IMPU}}}))
+		if _, err := e.store.SaveIdentity(bg, &state.Identity{IMPU: key.IMPU, Set: key, Incarnation: 1, KeepUntil: t0.Add(48 * time.Hour)}, t0); err != nil {
+			e.t.Fatal(err)
+		}
+		req := subscribe(e.t, key.IMPU, pcscfPath, 3600)
+		_ = req.Header.Set("Call-ID", fmt.Sprintf("%s-%d", prefix, i))
+		res, _ := n.Subscribe(bg, req)
+		wantStatus(e.t, res, 200)
+	}
+	return out
+}
+
+// settled waits until n is quiet (waitQuiet) and fails unless waiting
+// tasks are left waiting.
+func settled(t *testing.T, n *Notifier, waiting int) {
+	t.Helper()
+	waitQuiet(t, n)
+	n.sc.mu.Lock()
+	got := len(n.sc.waiting)
+	n.sc.mu.Unlock()
+	if got != waiting {
+		t.Fatalf("%d tasks waiting, want %d", got, waiting)
+	}
+}
+
+// waitQuiet waits until no task of n is on a worker and every task waiting
+// waits for room in its set or next hop.
+func waitQuiet(t *testing.T, n *Notifier) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		sc := &n.sc
+		sc.mu.Lock()
+		quiet := sc.working == 0
+		for _, w := range sc.waiting {
+			if w.sub == "" || sc.inSet[w.set] < n.cfg.SetConcurrency && sc.inHop[w.hop] < n.cfg.HopConcurrency {
+				quiet = false
+			}
+		}
+		sc.mu.Unlock()
+		if quiet {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the scheduler never settled")
+		}
+		runtime.Gosched()
+	}
+}
+
+// TestASetHasAtMostSetConcurrencyNotifiesUnderWay (#256 security review):
+// once the change has queued all its NOTIFYs, SetConcurrency are under way
+// and the others wait, whatever the workers.
+func TestASetHasAtMostSetConcurrencyNotifiesUnderWay(t *testing.T) {
+	const subs = 12
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
 	e.subscribedMany(subs)
-	g := &gatedSender{entered: make(chan struct{}, subs), release: make(chan struct{}, subs)}
-	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.Workers = workers })
+	g := newGate(subs)
+	n := newNotifierWith(t, e, e.store, g)
 	n.Changed(bg, before, before, Registered)
-	for range workers {
+	for range DefaultSetConcurrency {
 		<-g.entered
 	}
-	// The job that lists the subscriptions is done once only theirs are
-	// pending.
-	for n.pending.Load() != subs {
-		runtime.Gosched()
-	}
-	g.mu.Lock()
-	inFlight := g.inFlight
-	g.mu.Unlock()
-	if inFlight != workers || len(n.slots) != workers {
-		t.Errorf("%d NOTIFYs in flight, %d slots taken; want %d", inFlight, len(n.slots), workers)
+	settled(t, n, subs-DefaultSetConcurrency)
+	if got := g.inFlightNow(); got != DefaultSetConcurrency {
+		t.Errorf("%d NOTIFYs of one set in flight, want %d", got, DefaultSetConcurrency)
 	}
 	for range subs {
 		g.release <- struct{}{}
 	}
 	n.Wait()
-	if g.most != workers || g.sent != subs {
-		t.Errorf("%d NOTIFYs in flight at most, %d sent; want %d and %d", g.most, g.sent, workers, subs)
+	if g.most != DefaultSetConcurrency || g.sent != subs {
+		t.Errorf("%d in flight at most, %d sent", g.most, g.sent)
 	}
 }
 
-// TestNotifiesBeyondTheQueueAreDroppedAndCounted: with one worker busy and
-// the queue full, the rest of a change's NOTIFYs are dropped, not queued
-// as goroutines.
+// TestANextHopHasAtMostHopConcurrencyNotifiesUnderWay (#256 code review):
+// a P-CSCF task that does not answer holds back only what goes to it.
+func TestANextHopHasAtMostHopConcurrencyNotifiesUnderWay(t *testing.T) {
+	const sets, hop = 6, 3
+	e := newEnv(t)
+	others := e.otherSets(sets, "other")
+	g := newGate(sets)
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.HopConcurrency = hop })
+	for _, r := range others {
+		n.Changed(bg, r, r, Registered)
+	}
+	for range hop {
+		<-g.entered
+	}
+	settled(t, n, sets-hop)
+	if got := g.inFlightNow(); got != hop {
+		t.Errorf("%d NOTIFYs to one next hop in flight, want %d", got, hop)
+	}
+	for range sets {
+		g.release <- struct{}{}
+	}
+	n.Wait()
+	if g.most != hop || g.sent != sets {
+		t.Errorf("%d in flight at most, %d sent", g.most, g.sent)
+	}
+}
+
+// slowSender holds NOTIFYs whose Call-ID starts "slow" until release is
+// closed, and those starting "held" until held is, and answers the others
+// at once, telling of each on fast.
+type slowSender struct {
+	release, held chan struct{}
+	mu            sync.Mutex
+	sent          []*sip.Request
+	fast          chan *sip.Request
+}
+
+func (s *slowSender) Send(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	s.mu.Lock()
+	s.sent = append(s.sent, req)
+	s.mu.Unlock()
+	var wait chan struct{}
+	switch cid := req.Header.Get("Call-ID"); {
+	case strings.HasPrefix(cid, "slow"):
+		wait = s.release
+	case strings.HasPrefix(cid, "held"):
+		wait = s.held
+	case s.fast != nil:
+		s.fast <- req
+	}
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return sip.NewResponse(req, 200, "", "subscriber")
+}
+
+func (s *slowSender) notifies() []*sip.Request {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.sent)
+}
+
+// TestASlowSubscriberHoldsNoWorker: the wait for an answer is not a
+// worker's, so with one worker and one set's NOTIFYs waiting for a slow
+// subscriber, another set's still go out (#256 security review).
+func TestASlowSubscriberHoldsNoWorker(t *testing.T) {
+	e := newEnv(t)
+	slowSet := e.otherSets(1, "slow")[0]
+	other := e.otherSets(1, "fast")
+	s := &slowSender{release: make(chan struct{}), fast: make(chan *sip.Request, 1)}
+	n := newNotifierWith(t, e, e.store, s, func(c *Config) { c.Workers, c.NotifyTimeout = 1, time.Minute })
+	n.Changed(bg, slowSet, slowSet, Registered)
+	n.Changed(bg, other[0], other[0], Registered)
+	select {
+	case <-s.fast:
+	case <-time.After(10 * time.Second):
+		t.Fatal("another set's NOTIFY waited for a slow subscriber")
+	}
+	close(s.release)
+	n.Wait()
+}
+
+// TestNotifiesBeyondTheQueueAreDroppedAndCounted: beyond what a next hop may
+// have waiting (a quarter of Queue), a change's NOTIFYs are dropped, not
+// held.
 func TestNotifiesBeyondTheQueueAreDroppedAndCounted(t *testing.T) {
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
 	e.subscribedMany(10)
-	g := &gatedSender{entered: make(chan struct{}, 10), release: make(chan struct{}, 10)}
+	g := newGate(10)
 	m := &counts{}
-	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.Workers, c.Queue, c.Metrics = 1, 2, m })
-	// The listing job holds the worker while it queues the NOTIFYs, so two
-	// fit and eight do not.
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.Queue, c.Metrics = 8, m })
+	// Two are under way, two wait (8/4 for the hop), six are dropped.
 	n.Changed(bg, before, before, Registered)
+	settled(t, n, 2)
 	for range 10 {
 		g.release <- struct{}{}
 	}
 	n.Wait()
-	if got := m.get("regevent.notify_dropped"); got != 8 || g.sent != 2 {
-		t.Errorf("%d dropped, %d sent; want 8 and 2", got, g.sent)
+	if got := m.get("regevent.notify_dropped"); got != 6 || g.sent != 4 {
+		t.Errorf("%d dropped, %d sent; want 6 and 4", got, g.sent)
 	}
+}
+
+// TestANotifyWaitingIsNotQueuedTwice: it reads the state when it runs, so a
+// second change merges into it.
+func TestANotifyWaitingIsNotQueuedTwice(t *testing.T) {
+	e := newEnv(t)
+	before := e.registered(binding(1, time.Hour))
+	e.subscribedMany(3)
+	g := newGate(10)
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.Workers, c.SetConcurrency, c.Metrics = 1, 1, m })
+	// The one worker lists the first change's three subscriptions, which
+	// wait, then the second's, which merge into them; then one NOTIFY at a
+	// time goes out.
+	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, before, Registered)
+	settled(t, n, 2)
+	for range 10 {
+		g.release <- struct{}{}
+	}
+	n.Wait()
+	if got := m.get("regevent.notify_merged"); got != 3 || g.sent != 3 {
+		t.Errorf("%d merged, %d sent; want 3 and 3", got, g.sent)
+	}
+}
+
+// TestTheEndsOfOtherSetsAreDeliveredWhileOneSubscriberIsSlow: one set's
+// subscriber is slow to answer, and 1100 other sets behind the same P-CSCF
+// end at once (an RTR each), their NOTIFYs held until all are queued. The
+// slow set holds two of the hop's NOTIFYs under way; beyond the hop's share
+// of the queue the ends are deferred, and every subscriber gets its
+// terminated NOTIFY, at once or from the next sweep (#256 security review).
+func TestTheEndsOfOtherSetsAreDeliveredWhileOneSubscriberIsSlow(t *testing.T) {
+	const ended, slow = 1100, 8
+	e := newEnv(t)
+	slowSet := e.registered(binding(1, time.Hour))
+	n0 := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.MaxPerSubscriber = slow })
+	for i := range slow {
+		req := subscribe(t, impu1, pcscfPath, 3600)
+		_ = req.Header.Set("Call-ID", fmt.Sprintf("slow-%d", i))
+		res, _ := n0.Subscribe(bg, req)
+		wantStatus(t, res, 200)
+	}
+	others := e.otherSets(ended, "held")
+	s := &slowSender{release: make(chan struct{}), held: make(chan struct{})}
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, s, func(c *Config) { c.NotifyTimeout, c.Metrics = time.Minute, m })
+	n.Changed(bg, slowSet, slowSet, Registered)
+	for _, r := range others {
+		if err := e.store.DeleteRegistration(bg, r); err != nil {
+			t.Fatal(err)
+		}
+		n.Changed(bg, r, nil, Rejected)
+	}
+	// Under way: the slow set's two and the rest of the hop's. Waiting: the
+	// slow set's six and the ends, up to the hop's quarter of the queue;
+	// how many reach it depends on how soon the workers take them.
+	waitQuiet(t, n)
+	if m.get("regevent.notify_deferred") == 0 {
+		t.Fatal("no end was deferred: the test does not fill the hop's share of the queue")
+	}
+	close(s.held)
+	finals := func() map[string]int {
+		got := map[string]int{}
+		for _, req := range s.notifies() {
+			ss, _ := req.Header.SubscriptionState()
+			if r, _ := ss.Params.Get("reason"); strings.HasPrefix(req.Header.Get("Call-ID"), "held") && ss.State == "terminated" && r == "rejected" {
+				// Sent at once or by the sweep, it ends the identity.
+				doc, err := reginfo.Parse(req.Body)
+				if err != nil || len(doc.Registrations) != 1 || doc.Registrations[0].State != reginfo.Terminated {
+					t.Errorf("%s: terminated NOTIFY without the identity's end: %v", req.Header.Get("Call-ID"), err)
+				}
+				got[req.Header.Get("Call-ID")]++
+			}
+		}
+		return got
+	}
+	// Only the slow set's are left: two under way, six waiting.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n.sc.mu.Lock()
+		done := n.sc.working == 0 && n.sc.queued == slow-DefaultSetConcurrency && len(n.sc.inHop) == 1 && len(n.sc.inSet) == 1
+		n.sc.mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the ends were never all sent")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	e.clock.advance(pendingEnd + time.Second)
+	if _, err := n.Sweep(bg, 2*ended); err != nil {
+		t.Fatal(err)
+	}
+	got := finals()
+	for i := range ended {
+		if k := got[fmt.Sprintf("held-%d", i)]; k != 1 {
+			t.Errorf("held-%d: %d terminated NOTIFYs", i, k)
+		}
+	}
+	for _, r := range others {
+		if left := e.subscriptions(r.Key.IMPU); len(left) != 0 {
+			t.Errorf("%s: %d subscriptions left", r.Key.IMPU, len(left))
+		}
+	}
+	close(s.release)
+	n.Wait()
+}
+
+// TestAnRTRsNotifyIsNotLostBehindADeadPCSCF: users of a P-CSCF task that
+// died register again elsewhere, and each change sends a NOTIFY to the dead
+// task, which takes NotifyTimeout. Meanwhile an RTR ends another user's
+// set, and its subscriber gets the terminated NOTIFY, at once or from the
+// sweep (QA's N2 on #256, with the next hop bounded to two so that the end
+// waits).
+func TestAnRTRsNotifyIsNotLostBehindADeadPCSCF(t *testing.T) {
+	e := newEnv(t)
+	live := e.registered(binding(1, time.Hour))
+	s := &slowSender{release: make(chan struct{})}
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, s, func(c *Config) {
+		c.Workers, c.Queue, c.HopConcurrency, c.NotifyTimeout, c.Metrics = 2, 8, 2, 200*time.Millisecond, m
+	})
+	res, after := n.Subscribe(bg, subscribe(t, impu1, pcscfPath, 3600))
+	wantStatus(t, res, 200)
+	after(bg)
+	for _, r := range e.otherSets(20, "slow") {
+		next := r.Clone()
+		next.Contacts[0].Expires = t0.Add(2 * time.Hour)
+		n.Changed(bg, r, e.saved(next), Registered)
+	}
+	if err := e.store.DeleteRegistration(bg, mustReg(t, e, set1)); err != nil {
+		t.Fatal(err)
+	}
+	n.Changed(bg, live, nil, Rejected)
+	n.Wait()
+	e.clock.advance(pendingEnd + time.Second)
+	if _, err := n.Sweep(bg, 100); err != nil {
+		t.Fatal(err)
+	}
+	finals := 0
+	for _, req := range s.notifies() {
+		if ss, _ := req.Header.SubscriptionState(); req.Header.Get("Call-ID") == "sub-call-1" && ss.State == "terminated" {
+			finals++
+		}
+	}
+	if left := e.subscriptions(impu1); finals != 1 || len(left) != 0 {
+		t.Errorf("%d terminated NOTIFYs for the RTR, %d subscriptions left (%d deferred)", finals, len(left), m.get("regevent.notify_deferred"))
+	}
+}
+
+func mustReg(t *testing.T, e *env, k state.SetKey) *state.Registration {
+	t.Helper()
+	r, err := e.store.Registration(bg, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 // flakyStore fails the next reads of a registration or an identity.
@@ -1167,5 +1574,153 @@ func TestASubscriptionWhoseLastNotifyWentIsDeletedWithoutAnother(t *testing.T) {
 	}
 	if subs := e.subscriptions(impu1); len(subs) != 0 {
 		t.Errorf("%d subscriptions left", len(subs))
+	}
+}
+
+// TestTheEndOfANewerRecordEndsAnOlderSubscriptionWithoutABody: a
+// subscription to an earlier incarnation of the set hears nothing of the
+// later one's end but that its own has gone.
+func TestTheEndOfANewerRecordEndsAnOlderSubscriptionWithoutABody(t *testing.T) {
+	e := newEnv(t)
+	old := e.registered(binding(1, time.Hour))
+	n := e.notifier(1)
+	e.subscribed(n)
+	k := len(e.send.notifies())
+	if err := e.store.DeleteRegistration(bg, old); err != nil {
+		t.Fatal(err)
+	}
+	newer := old.Clone()
+	newer.Incarnation, newer.Version = 8, 0
+	n.Changed(bg, newer, nil, Deactivated)
+	n.Wait()
+	got := e.send.notifies()[k:]
+	if len(got) != 1 || len(got[0].Body) != 0 {
+		t.Fatalf("%d NOTIFYs, the last with %d bytes of body", len(got), len(got[len(got)-1].Body))
+	}
+}
+
+// TestARefreshAfterTheLastNotifyIs481: the final NOTIFY of a subscription
+// that lapsed is numbered, and the delete has not landed yet.
+func TestARefreshAfterTheLastNotifyIs481(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, time.Hour))
+	n := e.notifier(1)
+	res, _ := e.subscribed(n)
+	sub := e.subscriptions(impu1)[0]
+	if _, _, err := e.store.NextNotify(bg, sub.ID, state.FinalNotify); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := e.notifier(2).Subscribe(bg, inDialog(t, res, impu1, pcscfPath, 2, 3600))
+	wantStatus(t, r, 481)
+}
+
+// TestABarredIdentityMayNotBeWatched: no NOTIFY would list it.
+func TestABarredIdentityMayNotBeWatched(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, time.Hour))
+	for _, pai := range []string{impu1, pcscfPath} {
+		res, _ := e.notifier(1).Subscribe(bg, subscribe(t, impu2, pai, 3600))
+		wantStatus(t, res, 403)
+	}
+}
+
+// hopSets stores, for each of hops next hops, one set of another user with
+// perHop P-CSCF subscriptions whose NOTIFYs go to that hop, made on a
+// notifier of their own.
+func (e *env) hopSets(hops, perHop int) []*state.Registration {
+	e.t.Helper()
+	n := newNotifierWith(e.t, e, e.store, e.send, func(c *Config) { c.MaxPerSubscriber = perHop })
+	var out []*state.Registration
+	for h := range hops {
+		key := state.SetKey{IMPI: fmt.Sprintf("hop%d@%s", h, realm), IMPU: fmt.Sprintf("sip:hop%d@%s", h, realm)}
+		out = append(out, e.saved(&state.Registration{Key: key, Incarnation: 1, Contacts: []state.Contact{binding(1, time.Hour)},
+			Identities: []state.SetIdentity{{IMPU: key.IMPU}}}))
+		if _, err := e.store.SaveIdentity(bg, &state.Identity{IMPU: key.IMPU, Set: key, Incarnation: 1, KeepUntil: t0.Add(48 * time.Hour)}, t0); err != nil {
+			e.t.Fatal(err)
+		}
+		for i := range perHop {
+			req := subscribe(e.t, key.IMPU, pcscfPath, 3600)
+			_ = req.Header.Set("Call-ID", fmt.Sprintf("hop%d-%d", h, i))
+			_ = req.Header.Set("Contact", fmt.Sprintf("<sip:pcscf-%d.%s:5060;transport=tcp>", h, realm))
+			res, _ := n.Subscribe(bg, req)
+			wantStatus(e.t, res, 200)
+		}
+	}
+	return out
+}
+
+// TestNextHopsAreBoundedApart: each next hop has its own HopConcurrency.
+func TestNextHopsAreBoundedApart(t *testing.T) {
+	e := newEnv(t)
+	sets := e.hopSets(2, 2)
+	g := newGate(4)
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.HopConcurrency = 1 })
+	for _, r := range sets {
+		n.Changed(bg, r, r, Registered)
+	}
+	for range 2 {
+		select {
+		case <-g.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("one hop's NOTIFY waited for the other's")
+		}
+	}
+	settled(t, n, 2)
+	if got := g.inFlightNow(); got != 2 {
+		t.Errorf("%d NOTIFYs in flight, want one to each of the two hops", got)
+	}
+	for range 4 {
+		g.release <- struct{}{}
+	}
+	n.Wait()
+}
+
+// TestTheQueueBoundsWhatWaitsForEveryHop: each hop takes its quarter of the
+// queue, and all of them no more than the queue.
+func TestTheQueueBoundsWhatWaitsForEveryHop(t *testing.T) {
+	const hops, perHop, queue = 6, 3, 8
+	e := newEnv(t)
+	sets := e.hopSets(hops, perHop)
+	g := newGate(hops * perHop)
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.HopConcurrency, c.Queue, c.Metrics = 1, queue, m })
+	for _, r := range sets {
+		n.Changed(bg, r, r, Registered)
+	}
+	waitQuiet(t, n)
+	n.sc.mu.Lock()
+	waiting := len(n.sc.waiting)
+	n.sc.mu.Unlock()
+	if waiting > queue || m.get("regevent.notify_dropped") == 0 {
+		t.Errorf("%d waiting, %d dropped; want at most %d waiting", waiting, m.get("regevent.notify_dropped"), queue)
+	}
+	for range hops * perHop {
+		g.release <- struct{}{}
+	}
+	n.Wait()
+}
+
+// TestAnEndTakesTheWaitingNotifysPlace: a set ends while a NOTIFY of the
+// change before is waiting for one of its subscriptions; the end must not
+// merge into it, or that subscription is never ended.
+func TestAnEndTakesTheWaitingNotifysPlace(t *testing.T) {
+	e := newEnv(t)
+	before := e.registered(binding(1, time.Hour))
+	e.subscribedMany(2)
+	g := newGate(4)
+	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.SetConcurrency = 1 })
+	n.Changed(bg, before, before, Registered)
+	settled(t, n, 1)
+	n.Changed(bg, before, nil, Rejected)
+	settled(t, n, 2)
+	for range 4 {
+		g.release <- struct{}{}
+	}
+	n.Wait()
+	if subs := e.subscriptions(impu1); len(subs) != 0 {
+		t.Errorf("%d subscriptions left after the set ended", len(subs))
+	}
+	if g.sent != 3 {
+		t.Errorf("%d NOTIFYs, want the first change's one under way and two ends", g.sent)
 	}
 }

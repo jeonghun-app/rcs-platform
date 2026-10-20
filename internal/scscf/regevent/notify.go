@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -50,13 +51,17 @@ type job struct {
 
 // Changed notifies the subscribers of a set that before became after, nil
 // once the set has ended, because of cause (TS 24.229 §5.4.2.1.2). It
-// returns at once: the NOTIFYs go out on the workers, each within
-// NotifyTimeout, so that the request that changed the set is answered
-// first. The subscriptions of every identity before or after has are told,
-// so that one to an identity that left the set ends (#256 security review).
-// When the set has ended, its subscriptions end with it: their NOTIFY says
-// terminated, deactivated or rejected (RFC 6665 §4.1.3), and they are
-// deleted.
+// returns at once: the NOTIFYs go out on the workers (schedule.go), so that
+// the request that changed the set is answered first. The subscriptions of
+// every identity before or after has are told, so that one to an identity
+// that left the set ends (#256 security review).
+//
+// When the set has ended, its subscriptions end with it: each is first
+// saved Terminated, with its reason and an expiry pendingEnd ahead, and
+// then its final NOTIFY, which says terminated, deactivated or rejected
+// (RFC 6665 §4.1.3), is queued. If the queue drops that NOTIFY, or the
+// instance stops, a sweep sends it within seconds, so the end of a set is
+// never lost (#256 security, code and QA reviews).
 func (n *Notifier) Changed(ctx context.Context, before, after *state.Registration, cause Cause) {
 	changed := after
 	if changed == nil {
@@ -65,32 +70,50 @@ func (n *Notifier) Changed(ctx context.Context, before, after *state.Registratio
 	if changed == nil {
 		return
 	}
-	n.start(ctx, func(ctx context.Context) {
-		seen := map[string]bool{}
-		for _, impu := range identitiesBoth(before, after) {
-			subs, err := n.cfg.Store.SubscriptionsOf(ctx, impu)
-			if err != nil {
-				n.internalLog("listing subscriptions", err)
+	n.enqueue(&task{ctx: ctx, run: func(ctx context.Context) func() {
+		n.fanOut(ctx, before, after, changed, cause)
+		return nil
+	}})
+}
+
+// fanOut queues the NOTIFYs of Changed.
+func (n *Notifier) fanOut(ctx context.Context, before, after, changed *state.Registration, cause Cause) {
+	seen := map[string]bool{}
+	for _, impu := range identitiesBoth(before, after) {
+		subs, err := n.cfg.Store.SubscriptionsOf(ctx, impu)
+		if err != nil {
+			n.internalLog("listing subscriptions", err)
+			continue
+		}
+		for _, sub := range subs {
+			if seen[sub.ID] || sub.Terminated {
 				continue
 			}
-			for _, sub := range subs {
-				if seen[sub.ID] || sub.Terminated {
-					continue
-				}
-				seen[sub.ID] = true
-				j := job{}
-				// A subscription to another set, or to an earlier record of
-				// this one, is only checked: it ends if it has lapsed.
-				if sub.Set == changed.Key && sub.Incarnation == changed.Incarnation {
-					j = job{before: before, cause: cause}
-					if after == nil {
-						j.ended, j.final, j.reason = true, true, cause.reason()
+			seen[sub.ID] = true
+			j := job{}
+			// A subscription to another set, or to an earlier record of
+			// this one, is only checked: it ends if it has lapsed.
+			if sub.Set == changed.Key && sub.Incarnation == changed.Incarnation {
+				j = job{before: before, cause: cause}
+				if after == nil {
+					j.ended, j.final, j.reason = true, true, cause.reason()
+					ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(pendingEnd), j.reason, true)
+					switch {
+					case err != nil:
+						// Its NOTIFY goes all the same, if the store lets
+						// it be numbered.
+						n.internalLog("terminating a subscription", err)
+					case ended == nil:
+						// Gone, or ending already.
+						continue
+					default:
+						sub = ended
 					}
 				}
-				n.start(ctx, func(ctx context.Context) { n.notifySub(ctx, sub, j) })
 			}
+			n.enqueueNotify(ctx, sub, j, nil)
 		}
-	})
+	}
 }
 
 // identitiesBoth are the identities of before and after, each once.
@@ -151,20 +174,32 @@ func anyLive(set *state.Registration, now time.Time) bool {
 	return false
 }
 
-// notifySub sends sub a NOTIFY of its set as the store has it now, and so
-// never a state older than one a NOTIFY with a lower number carried: the
-// number is taken by NextNotify for the record's version read, which a
-// later number's read cannot be below (#256 QA and code review). A read
-// that fails sends nothing, rather than a document without the set, which a
-// subscriber takes for its end (#256 code review); the next change or
-// refresh brings the full state.
+// notifySub sends sub a NOTIFY of its set as the store has it now and
+// waits for the answer (prepare).
+func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job) {
+	if rest := n.prepare(ctx, sub, j); rest != nil {
+		rest()
+	}
+}
+
+// prepare makes the NOTIFY j to sub of its set as the store has it now, and
+// returns what sends it and acts on the answer, or nil if there is nothing
+// to send. It never carries a state older than one a NOTIFY with a lower
+// number carried: the number is taken by NextNotify for the record's
+// version read, which a later number's read cannot be below (#256 QA and
+// code review). A read that fails sends nothing, rather than a document
+// without the set, which a subscriber takes for its end (#256 code review);
+// the next change or refresh brings the full state, and the next sweep an
+// end.
 //
 // The NOTIFY is the subscription's last if j says so or the subscription no
 // longer holds: its record is gone or another incarnation, or check fails.
 // Then it says terminated, deactivated, and has no body if it would tell
 // the subscriber of a set that is not the one it was allowed to watch, or
-// of bindings its P-CSCF is not on any more.
-func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job) {
+// of bindings its P-CSCF is not on any more. The end of a set read from a
+// sweep, without the set before it, lists the watched identity alone,
+// terminated.
+func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) func() {
 	now := n.cfg.Now()
 	var set *state.Registration
 	if !j.ended {
@@ -175,23 +210,22 @@ func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job
 			set = nil
 		case err != nil:
 			n.internalLog("reading a registration", err)
-			return
+			return nil
 		}
 		if set != nil && set.Incarnation != sub.Incarnation {
 			set = nil
 		}
 	}
+	// Changed gives a before only to the subscriptions of its record.
 	before := j.before
-	if before != nil && (before.Key != sub.Set || before.Incarnation != sub.Incarnation) {
-		before = nil
-	}
 	why := lapsedSet
 	if set != nil {
 		why = n.check(sub, set, now)
 	}
 	switch {
 	case j.ended:
-		// Changed told of the end of this very set, which before is.
+		// The registrar told of the end of this very set, which before is,
+		// or a sweep sends that end in place of whoever saved it.
 	case why != "":
 		n.count("regevent.lapsed")
 		if !j.final {
@@ -209,7 +243,7 @@ func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job
 		cseq, version, err = n.cfg.Store.NextNotify(ctx, sub.ID, of)
 		switch {
 		case errors.Is(err, state.ErrNotFound):
-			return
+			return nil
 		case errors.Is(err, state.ErrStale):
 			// A NOTIFY of a later state, or the last, has its number: this
 			// one would tell less.
@@ -217,49 +251,57 @@ func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job
 			if j.final {
 				n.end(ctx, sub)
 			}
-			return
+			return nil
 		case errors.Is(err, state.ErrExhausted):
 			// The counters ran out: the subscription ends, without a NOTIFY it
 			// could not number.
 			n.end(ctx, sub)
-			return
+			return nil
 		case err != nil:
 			n.internalLog("counting a NOTIFY", err)
-			return
+			return nil
 		}
 	}
-	if n.send(ctx, sub, cseq, version, before, set, j, now) || j.final {
-		n.end(ctx, sub)
+	req := n.build(sub, cseq, version, before, set, j, now)
+	if req == nil {
+		if j.final {
+			n.end(ctx, sub)
+		}
+		return nil
+	}
+	return func() {
+		if n.deliver(ctx, req) || j.final {
+			n.end(ctx, sub)
+		}
 	}
 }
 
-// send sends sub the NOTIFY numbered cseq of set's state at version, and
-// reports whether the subscriber is gone: it answered with a code after
-// which the notifier must remove the subscription (RFC 6665 §4.2.2), or
-// 430, the edge's word for a flow that is gone (RFC 5626 §5.3; a UE that
-// reconnected subscribes again over its new flow), or the transport has no
-// flow to it, or it did not answer within NotifyTimeout. Any other answer,
-// or a full queue, keeps it: the next NOTIFY carries the full state anyway.
-func (n *Notifier) send(ctx context.Context, sub *state.Subscription, cseq, version uint32, before, set *state.Registration, j job, now time.Time) bool {
+// build makes sub's NOTIFY numbered cseq of set's state at version, nil if
+// it cannot be made.
+func (n *Notifier) build(sub *state.Subscription, cseq, version uint32, before, set *state.Registration, j job, now time.Time) *sip.Request {
 	d, err := n.dialogOf(sub)
 	if err != nil {
 		n.internalLog("reading a subscription's dialog", err)
-		return false
+		return nil
 	}
 	d.LocalSeq = cseq - 1
 	var b []byte
 	ct := ""
 	if !j.bare {
-		b, err = body(version, before, set, j.cause, now)
+		if set == nil && before == nil {
+			b, err = endOf(version, sub.IMPU, j.reason).Marshal()
+		} else {
+			b, err = body(version, before, set, j.cause, now)
+		}
 		switch {
 		case errors.Is(err, reginfo.ErrTooLarge):
 			// Neither the full state nor what changed fits: the subscriber
 			// misses this change.
 			n.count("regevent.too_large")
-			return false
+			return nil
 		case err != nil:
 			n.internalLog("writing reginfo", err)
-			return false
+			return nil
 		}
 		ct = reginfo.ContentType
 	}
@@ -276,8 +318,19 @@ func (n *Notifier) send(ctx context.Context, sub *state.Subscription, cseq, vers
 	req, err := d.Notify(ev, ss, ct, b, n.ids)
 	if err != nil {
 		n.internalLog("building a NOTIFY", err)
-		return false
+		return nil
 	}
+	return req
+}
+
+// deliver sends req and reports whether its subscriber is gone: it
+// answered with a code after which the notifier must remove the
+// subscription (RFC 6665 §4.2.2), or 430, the edge's word for a flow that
+// is gone (RFC 5626 §5.3; a UE that reconnected subscribes again over its
+// new flow), or the transport has no flow to it, or it did not answer
+// within NotifyTimeout. Any other answer, or a full queue, keeps it: the
+// next NOTIFY carries the full state anyway.
+func (n *Notifier) deliver(ctx context.Context, req *sip.Request) bool {
 	sendCtx, cancel := context.WithTimeout(ctx, n.cfg.NotifyTimeout)
 	res, err := n.cfg.Sender.Send(sendCtx, req)
 	cancel()
@@ -296,6 +349,15 @@ func (n *Notifier) send(ctx context.Context, sub *state.Subscription, cseq, vers
 	}
 	n.count("regevent.subscriber_gone")
 	return true
+}
+
+// endOf is the end of the registration of impu, terminated without its
+// contacts, for a set that ended and is no longer there to read: what a
+// sweep sends in place of the instance that ended it.
+func endOf(version uint32, impu, reason string) *reginfo.Info {
+	return &reginfo.Info{Version: version, State: reginfo.Full, Registrations: []reginfo.Registration{
+		{AOR: impu, ID: idOf("reg", impu), State: reginfo.Terminated},
+	}}
 }
 
 // removes reports whether a NOTIFY answered code ends its subscription:
@@ -334,11 +396,19 @@ func (n *Notifier) end(ctx context.Context, sub *state.Subscription) {
 	}
 }
 
-// Sweep ends up to limit subscriptions that have expired
-// (state.SweepSubscriptions), each with a NOTIFY that says terminated,
-// timeout (RFC 6665 §4.2.2), and returns how many it ended.
+// Sweep ends up to limit subscriptions that have expired, each with a
+// NOTIFY that says terminated, timeout (RFC 6665 §4.2.2), and sends the
+// final NOTIFY of those terminated whose NOTIFY nobody sent
+// (state.SweepSubscriptions), with their reason. The NOTIFYs go on the
+// workers, under the same bounds as any other; Sweep returns once they are
+// answered, with how many it handled. One the queue drops is sent by a
+// sweep after state.TerminatedGrace.
 func (n *Notifier) Sweep(ctx context.Context, limit int) (int, error) {
-	return state.SweepSubscriptions(ctx, n.cfg.Store, n.cfg.Now(), limit, func(sub *state.Subscription) {
-		n.notifySub(ctx, sub, job{final: true, reason: "timeout"})
+	var wg sync.WaitGroup
+	k, err := state.SweepSubscriptions(ctx, n.cfg.Store, n.cfg.Now(), limit, func(sub *state.Subscription) {
+		wg.Add(1)
+		n.enqueueNotify(ctx, sub, job{final: true, reason: sub.EndReason, ended: sub.SetEnded}, wg.Done)
 	})
+	wg.Wait()
+	return k, err
 }
