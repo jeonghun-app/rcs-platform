@@ -15,9 +15,10 @@ type ServerTransaction struct {
 	req    *sip.Request
 	src    transport.Source
 	// last is the most recent response sent, which a retransmitted request is
-	// answered with; nil after a 2xx to an INVITE, which is not retransmitted
-	// from here (RFC 6026 §7.1). toTag is the To tag of the last response
-	// sent, kept separately so the 2xx's need not be.
+	// answered with. It is nil after a 2xx to an INVITE, which is not
+	// retransmitted from here (RFC 6026 §7.1), and after a response that did
+	// not fit under the byte bound. toTag is the To tag of the last response
+	// sent, kept separately so that neither needs to be.
 	last  *sip.Response
 	toTag string
 	// size is what the request and last count against
@@ -124,8 +125,11 @@ func (tx *ServerTransaction) send(res *sip.Response, opts ...transport.SendOptio
 	} else {
 		after = responseSize(res)
 	}
-	if after != before {
-		tx.l.charge(tx, after-before)
+	if !tx.l.keep(tx, before, after) {
+		// Sent once, not kept: a response cannot be refused, and keeping
+		// every one an admitted transaction gets would let the responses
+		// alone pass the bound.
+		tx.last = nil
 	}
 	return nil
 }
@@ -232,8 +236,8 @@ func (tx *ServerTransaction) onTimer(id timerID) func() {
 			}
 		}
 	case timerRetransmit:
-		// Timer G (§17.2.1).
-		if tx.state != Completed {
+		// Timer G (§17.2.1), unless the response was not kept.
+		if tx.state != Completed || tx.last == nil {
 			return nil
 		}
 		if err := tx.l.sender.SendResponse(tx.last, tx.src); err != nil {

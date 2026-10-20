@@ -2,6 +2,8 @@ package transaction
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -185,6 +187,19 @@ func TestClientShareRoundsUp(t *testing.T) {
 // shape of the header: padded fields, many short ones, a large value. Before,
 // padding counted 3% of what it held.
 func TestCountedBytesTrackTheHeap(t *testing.T) {
+	// QA (third round): measured in a child process, so the heap holds
+	// nothing another test left behind or frees meanwhile, such as the
+	// transactions of a real-clock TCP test run just before.
+	if os.Getenv("TX_HEAP_CHILD") == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestCountedBytesTrackTheHeap$", "-test.v")
+		cmd.Env = append(os.Environ(), "TX_HEAP_CHILD=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("child: %v\n%s", err, out)
+		}
+		t.Logf("child:\n%s", out)
+		return
+	}
 	shapes := map[string][]string{
 		"plain":           nil,
 		"padded fields":   repeatField(60, "X-Pad: v"+strings.Repeat(" ", 240)),
@@ -193,11 +208,8 @@ func TestCountedBytesTrackTheHeap(t *testing.T) {
 	}
 	for name, extra := range shapes {
 		t.Run(name, func(t *testing.T) {
-			// What the layer holds is the heap with it alive less the heap
-			// once it is dropped, measured back to back. A heap measured
-			// before and after filling it would also see memory freed in
-			// between, such as transactions of the integration tests whose
-			// real-clock timers fire meanwhile.
+			// The heap with the layer alive less the heap once it is dropped,
+			// measured back to back.
 			fill := func() (counted, alive int64) {
 				tu := &tuRecorder{}
 				l := mustNew(t, nullSender{}, tu, Config{Clock: &fakeClock{}, MaxServerTransactions: MaxMaxServerTransactions, MaxServerTransactionBytes: 1 << 40})
@@ -235,4 +247,141 @@ func branchOf(t *testing.T, req *sip.Request) string {
 	}
 	b, _ := vias[0].Params.Get("branch")
 	return b
+}
+
+// QA (third round): a response is kept only while it fits under the byte
+// bound. Before, 200 INVITEs answered 486 with 1 MiB bodies held 200 MiB
+// against a 1 MiB bound until Timer H.
+func TestFailureResponsesBeyondTheByteBoundAreSentButNotKept(t *testing.T) {
+	h := newHarness(t, transport.TCP, Config{MaxServerTransactions: 200, MaxServerTransactionBytes: 1 << 20})
+	for i := range 200 {
+		inv := request(t, "INVITE", fmt.Sprintf("z9hG4bKbusy%d", i))
+		h.receive(inv)
+		busy := response(t, inv, 486)
+		busy.Body = make([]byte, 1<<20)
+		if err := h.tu.lastTx().Respond(busy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s := h.layer.Stats(); s.ServerTransactions != 200 || s.ServerTransactionBytes > 1<<20 {
+		t.Fatalf("stats = %+v", s)
+	}
+	for _, tx := range h.tu.txs {
+		if tx.State() != Completed || tx.responseToTag() != "b1" {
+			t.Fatalf("state %v, To tag %q", tx.State(), tx.responseToTag())
+		}
+		tx.mu.Lock()
+		kept := tx.last != nil
+		tx.mu.Unlock()
+		if kept {
+			t.Fatal("a 1 MiB 486 was kept under a 1 MiB bound")
+		}
+	}
+}
+
+// A final response not kept is not retransmitted by Timer G, and its ACK
+// still completes the transaction.
+func TestAResponseNotKeptIsNotRetransmitted(t *testing.T) {
+	h := newHarness(t, transport.UDP, Config{MaxServerTransactionBytes: 64 << 10})
+	inv := request(t, "INVITE", "z9hG4bKnokeep")
+	h.receive(inv)
+	busy := response(t, inv, 486)
+	busy.Body = make([]byte, 100<<10)
+	if err := h.tu.lastTx().Respond(busy); err != nil {
+		t.Fatal(err)
+	}
+	h.sender.take()
+	h.clock.advance(4 * DefaultT1)
+	if got := h.sender.take(); len(got) != 0 {
+		t.Fatalf("retransmitted %v", got)
+	}
+	ack := request(t, "ACK", "z9hG4bKnokeep")
+	ack.Header.Set("To", "<sip:bob@example.com>;tag=b1")
+	h.receive(ack)
+	if st := h.tu.lastTx().State(); st != Confirmed {
+		t.Fatalf("state after the ACK = %v, want Confirmed", st)
+	}
+	if got := h.tu.take(); len(got) != 1 {
+		t.Fatalf("TU calls %q, want only the INVITE", got)
+	}
+}
+
+// QA (third round): an RFC 2543 ACK is matched on the To tag of the last
+// response, the final one, not of a provisional with another tag, as a
+// proxy's forked branches have.
+func TestAnRFC2543AckMatchesTheTagOfTheLastResponse(t *testing.T) {
+	h := newHarness(t, transport.UDP, Config{})
+	inv := request(t, "INVITE", "oldstyle2")
+	h.receive(inv)
+	tx := h.tu.lastTx()
+	for _, r := range []struct {
+		code int
+		tag  string
+	}{{180, "branch-a"}, {486, "branch-b"}} {
+		res, err := sip.NewResponse(inv, r.code, "", r.tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Respond(res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.tu.take()
+	stale := request(t, "ACK", "oldstyle2")
+	stale.Header.Set("To", "<sip:bob@example.com>;tag=branch-a")
+	h.receive(stale)
+	check(t, "TU calls for an ACK with the provisional's tag", h.tu.take(), []string{"stray ACK"})
+	ack := request(t, "ACK", "oldstyle2")
+	ack.Header.Set("To", "<sip:bob@example.com>;tag=branch-b")
+	h.receive(ack)
+	if st := tx.State(); st != Confirmed {
+		t.Fatalf("state after the ACK = %v, want Confirmed", st)
+	}
+}
+
+// A response is kept under the bound its request was admitted under: a
+// client's may not use the core's headroom, a core peer's may.
+func TestAResponseIsKeptUnderTheShareOfItsRequest(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		h := newHarness(t, transport.UDP, Config{MaxServerTransactionBytes: 100 << 10, ClientShare: 0.8})
+		inv := request(t, "INVITE", "z9hG4bKshare")
+		h.layer.Receive(transport.Inbound{Message: inv, Source: transport.Source{Flow: "f", Network: transport.UDP, ClientFacing: client}})
+		busy := response(t, inv, 486)
+		busy.Body = make([]byte, 85<<10) // past 80 KiB, within 100 KiB
+		tx := h.tu.lastTx()
+		if err := tx.Respond(busy); err != nil {
+			t.Fatal(err)
+		}
+		tx.mu.Lock()
+		kept := tx.last != nil
+		tx.mu.Unlock()
+		if kept == client {
+			t.Errorf("client-facing %t: kept %t", client, kept)
+		}
+	}
+}
+
+// A final response that is not kept gives back what the provisional before
+// it held.
+func TestAResponseNotKeptGivesBackTheOneBefore(t *testing.T) {
+	h := newHarness(t, transport.UDP, Config{MaxServerTransactionBytes: 1 << 20})
+	inv := request(t, "INVITE", "z9hG4bKgiveback")
+	h.receive(inv)
+	tx := h.tu.lastTx()
+	// The 100 Trying sent at once is replaced too, so only the request is
+	// left.
+	base := requestSize(inv)
+	ringing := response(t, inv, 183)
+	ringing.Body = make([]byte, 100<<10)
+	if err := tx.Respond(ringing); err != nil {
+		t.Fatal(err)
+	}
+	busy := response(t, inv, 486)
+	busy.Body = make([]byte, 2<<20)
+	if err := tx.Respond(busy); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.layer.Stats().ServerTransactionBytes; got != base {
+		t.Fatalf("holding %d bytes after a 486 not kept, want the request's %d", got, base)
+	}
 }

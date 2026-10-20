@@ -163,10 +163,13 @@ type Config struct {
 	// ordinary CANCEL of a few hundred bytes always finds room in. Any other
 	// CANCEL counts like any request. ACK never starts a transaction.
 	//
-	// Responses are charged once sent, never refused: a transaction admitted
-	// under the byte bound may still take one final response beyond it, held
-	// over UDP until Timer J or H ends and over TCP until the ACK. A 2xx to an
-	// INVITE is not held at all (RFC 6026 §7.1: the TU retransmits it).
+	// A response is always sent, but kept for retransmission only while it
+	// fits under the byte bound its request was admitted under (the client
+	// share for a client-facing listener); one that does not is sent once and only
+	// its To tag kept, so under that pressure a UDP client that loses it gets
+	// no retransmission (Timer G is skipped) and its retransmitted request no
+	// answer. A 2xx to an INVITE is never kept (RFC 6026 §7.1: the TU
+	// retransmits it).
 	//
 	// Zero takes DefaultMaxServerTransactions and
 	// DefaultMaxServerTransactionBytes; Validate accepts a count of 0 or 1 to
@@ -439,13 +442,27 @@ func clientShare(bound int64, share float64) int64 {
 	return int64(math.Ceil(float64(bound) * share))
 }
 
-// charge changes what tx holds of the byte bound by delta. tx.mu is held, and
-// l.mu is taken inside it, as remove does.
-func (l *Layer) charge(tx *ServerTransaction, delta int64) {
+// keep charges tx for a response of size after kept in place of one of size
+// before, and reports true, unless the new one would take the byte bound
+// past what tx's request could use, the client share for one from a
+// client-facing listener, so that responses to clients cannot use up the
+// core's headroom either: then only before is given back, and it reports
+// false. tx.mu is held, and l.mu is taken inside it, as remove does.
+func (l *Layer) keep(tx *ServerTransaction, before, after int64) bool {
 	l.mu.Lock()
-	l.serverBytes += delta
-	tx.size += delta
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	limit := l.maxBytes
+	if tx.src.ClientFacing {
+		limit = l.clientBytes
+	}
+	if after > before && l.serverBytes-before+after > limit {
+		l.serverBytes -= before
+		tx.size -= before
+		return false
+	}
+	l.serverBytes += after - before
+	tx.size += after - before
+	return true
 }
 
 // refusalTag is the To tag of the 503 for req: a function of the transaction
