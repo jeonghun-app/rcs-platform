@@ -298,3 +298,31 @@ func TestASinglesPassThatGetsThroughUnblocksTheQueue(t *testing.T) {
 	}
 	waitFor(t, "s3 delivered", func() bool { return third.Load() == 1 })
 }
+
+// A pass of singles that stops reads nothing more: the recipient could not
+// be reached, so the queue waits for an event or the retry timer.
+func TestASinglesPassThatStopsReadsNothingMore(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour, MaxRetryInterval: time.Hour})
+	drainInvites(t, r.d)
+	var tries atomic.Int32
+	r.d.onPager(func(d Delivery) error {
+		if bytes.Contains(d.CPIM, []byte("text-first")) {
+			tries.Add(1)
+			return errors.New("480 Temporarily Unavailable")
+		}
+		return nil
+	})
+	// carol's chat message waits for a session: holdWaiting, so s1 is
+	// tried on its own.
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "text-chat", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s1", "text-first", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the attempt", func() bool { return tries.Load() >= 1 && r.idle() })
+	if got := tries.Load(); got != 1 {
+		t.Fatalf("s1 tried %d times: a pass that stopped read the queue again", got)
+	}
+}
