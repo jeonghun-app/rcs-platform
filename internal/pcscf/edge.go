@@ -229,8 +229,9 @@ func stripCharging(h *sip.Header) {
 }
 
 // toClient makes every response d forwards to the client lose the
-// network's charging data, and its P-Asserted-Identity when it asks for
-// privacy of the identity (RFC 3325 §9.3), after d's own OnResponse.
+// network's charging data and any P-Preferred-Identity, and its
+// P-Asserted-Identity when it asks for privacy of the identity (RFC 3325
+// §9.3), after d's own OnResponse.
 func toClient(d proxy.Decision) proxy.Decision {
 	next := d.OnResponse
 	d.OnResponse = func(ctx context.Context, res *sip.Response) {
@@ -238,6 +239,9 @@ func toClient(d proxy.Decision) proxy.Decision {
 			next(ctx, res)
 		}
 		stripCharging(&res.Header)
+		// A preference is the client's to state in its own requests (RFC
+		// 3325 §9.2), never the network's to a client.
+		res.Header.Del("P-Preferred-Identity")
 		if privacyID(&res.Header) {
 			res.Header.Del("P-Asserted-Identity")
 		}

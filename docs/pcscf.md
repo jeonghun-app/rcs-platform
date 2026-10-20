@@ -210,7 +210,9 @@ to `scscf`. It is forwarded as its Route says only if:
 - both of `pcscf`'s Record-Route values were among the Route values it
   consumed: one naming the public host or an NLB address, and one naming
   this task's core listener, its address written in any form;
-- the core one's flow token is the flow the request came on;
+- the core one's flow token is the flow the request came on, and its `dlg`
+  MAC is the one written for that flow, the request's Call-ID and the icid
+  the value carries;
 - the next hop, the Route below them or else the Request-URI, is `scscf`'s
   service name (`PCSCF_SCSCF_HOST`) on `PCSCF_SCSCF_PORT` with
   `transport=tcp`: `scscf` records that name in every dialog `pcscf` is in
@@ -227,11 +229,12 @@ client deregisters.
 
 The forwarded request gets a `P-Charging-Vector` with the dialog's icid,
 read back from the core-facing Record-Route value in its route, and the
-`orig-ioi` (§5.2.6.3.5 7), §5.2.6.3.9 3)). The client holds that value, so
-it can choose the icid of its own dialog's requests; a missing or malformed
-one is replaced by a new icid. Nothing consumes charging yet; the value is
-to be signed, like the flow token, when charging (Rf/Ro) does (threat
-model T2).
+`orig-ioi` (§5.2.6.3.5 7), §5.2.6.3.9 3)). The client holds that value, but
+the MAC covers the icid, so a copy with the icid changed, added or removed
+is 403. A value written without an icid gets a new one: `pcscf` writes none
+it could not read back (more than 256 bytes, or control characters), and a
+core icid like that is replaced by a new one in the route and in every
+answer alike.
 
 No core hop of any request, REGISTER and initial requests included, ever
 resolves to this task's own address, however it is written, and every form
@@ -267,10 +270,14 @@ request is sent over that flow whatever its Route or Request-URI say below.
   token, so any icid the core chose survives in the route. A 1xx or 2xx
   from the client that does not return the request's Record-Route values,
   `pcscf`'s and the core's, as they were has them put back (§5.2.6.4.4 3)
-  b)), so the client cannot change the route the core keeps.
+  b)), so the client cannot change the route the core keeps. When the
+  core's own Record-Route does not parse, nothing is put back: the
+  answer's goes up as the client wrote it, counted in
+  `terminating.record_route_malformed`.
 - **Dialogs.** The core-facing Record-Route value, of a dialog either side
-  set up, binds the flow to the dialog: `dlg` is a MAC over the flow token
-  and the Call-ID, under a key drawn at every start. A request from the
+  set up, binds the flow to the dialog: `dlg` is a MAC over the flow token,
+  the Call-ID and the icid, each after its length, under a key drawn at
+  every start. A request from the
   core inside a dialog reaches the flow only with the value written for its
   Call-ID. The `Path`, another dialog's value or a changed one is 403 when
   the flow is alive, and 430 only when it is not, so `scscf` does not take
@@ -294,7 +301,10 @@ request is sent over that flow whatever its Route or Request-URI say below.
   The identity the request was for, its `P-Called-Party-ID`, is asserted in
   place of any `P-Preferred-Identity` in a 1xx or 2xx to a request that sets
   up a dialog (§5.2.6.4.4 1)) and in every response, 1xx to 6xx, to a
-  standalone request outside a dialog such as MESSAGE (§5.2.6.4.8 2)). A
+  standalone request outside a dialog such as MESSAGE (§5.2.6.4.8 2)).
+  `P-Preferred-Identity` is removed from every response, toward the core
+  and toward the client alike: it is a client's preference for its own
+  requests (RFC 3325 §9.2). A
   request without `P-Called-Party-ID` gets no asserted identity in its
   responses, and is counted in `terminating.pai_omitted`: the
   Request-URI or the flow's registration is not the network's assertion of

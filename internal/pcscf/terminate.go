@@ -11,8 +11,13 @@ import (
 )
 
 // metricPAIOmitted counts the requests from the core outside a dialog whose
-// responses assert no identity, since the request named none.
-const metricPAIOmitted = "terminating.pai_omitted"
+// responses assert no identity, since the request named none, and
+// metricRecordRouteMalformed those whose Record-Route did not parse, so
+// that their answers' Record-Route goes upstream as the client wrote it.
+const (
+	metricPAIOmitted           = "terminating.pai_omitted"
+	metricRecordRouteMalformed = "terminating.record_route_malformed"
+)
 
 // toClientOnly are the network's headers a request from the core loses
 // before it reaches a client, beside the charging data (TS 24.229 §5.2.1):
@@ -99,23 +104,30 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		// scscf, the authoritative proxy, needs the 430 (RFC 5626 §11.5).
 		OnFinal: func(context.Context, *sip.Response) {},
 	}
+	// routes is the Record-Route a 1xx or 2xx must return, nil when it
+	// cannot be known: the core's did not parse, so a rewrite would lose it.
 	var routes []sip.Address
 	if forming {
 		rr := p.recordRoute(flow, entry.Params.Has("ob"), icidOfVector(charging), callID)
 		d.RecordRoute = []sip.Address{rr[1], rr[0]}
-		received, _ := r.Message.Header.RecordRoute()
-		routes = append(slices.Clone(d.RecordRoute), received...)
+		if received, err := r.Message.Header.RecordRoute(); err == nil {
+			routes = append(slices.Clone(d.RecordRoute), received...)
+		} else if p.metrics != nil {
+			p.metrics.Count(metricRecordRouteMalformed, 1)
+		}
 	}
 	d.OnResponse = func(_ context.Context, res *sip.Response) {
 		if res.StatusCode == 100 {
 			return
 		}
 		_ = res.Header.Set("P-Charging-Vector", charging)
-		if forming && res.StatusCode < 300 {
+		// The client's preference is for its own requests (RFC 3325
+		// §9.2); the network never sees it in a response.
+		res.Header.Del("P-Preferred-Identity")
+		if routes != nil && res.StatusCode < 300 {
 			keepRecordRoute(&res.Header, routes)
 		}
 		if initial && (!forming || res.StatusCode < 300) {
-			res.Header.Del("P-Preferred-Identity")
 			res.Header.Del("P-Asserted-Identity")
 			if asserted != nil {
 				_ = res.Header.Set("P-Asserted-Identity", asserted.String())
@@ -139,21 +151,33 @@ func keepRecordRoute(h *sip.Header, routes []sip.Address) {
 }
 
 // terminatingCharging is the P-Charging-Vector of the client's responses to
-// req: its icid-value, or else fallback, the dialog's, or else a new one;
+// req: its icid-value, or else fallback, the dialog's, or else a new one,
+// an icid-value a route could not carry (validICID) counting as none, so
+// that the dialog's route and its answers carry the same one;
 // its orig-ioi if any; and this network as the type 1 term-ioi (§5.2.6.4.4
 // 6)). Values keep the quoting they came with.
 func (p *pcscf) terminatingCharging(req *sip.Request, fallback string) string {
 	var cv sip.ChargingVector
-	if got, err := req.Header.PChargingVector(); err == nil && got.ICID() != "" {
-		for _, name := range []string{"icid-value", "orig-ioi"} {
-			if i := slices.IndexFunc(got.Params, func(p sip.Param) bool { return strings.EqualFold(p.Name, name) }); i >= 0 {
-				cv.Params = append(cv.Params, got.Params[i])
-			}
+	got, err := req.Header.PChargingVector()
+	param := func(name string) (sip.Param, bool) {
+		if err != nil {
+			return sip.Param{}, false
 		}
+		i := slices.IndexFunc(got.Params, func(p sip.Param) bool { return strings.EqualFold(p.Name, name) })
+		if i < 0 {
+			return sip.Param{}, false
+		}
+		return got.Params[i], true
+	}
+	if v, ok := param("icid-value"); ok && validICID(got.ICID()) {
+		cv.Params = append(cv.Params, v)
 	} else if fallback != "" {
 		cv.Params.Set("icid-value", fallback)
 	} else if icid, err := p.icid(); err == nil {
 		cv.Params.Set("icid-value", icid)
+	}
+	if v, ok := param("orig-ioi"); ok {
+		cv.Params = append(cv.Params, v)
 	}
 	cv.Params.Set("term-ioi", p.cfg.HomeDomain)
 	return cv.String()

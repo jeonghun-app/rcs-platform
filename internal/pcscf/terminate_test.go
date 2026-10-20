@@ -91,12 +91,12 @@ func TestATerminatingRequestGoesOverTheFlowItsPathNames(t *testing.T) {
 	for _, a := range d.RecordRoute {
 		rr = append(rr, a.String())
 	}
-	want := []string{"<sip:" + publicHost + ":5060;transport=tcp;lr>", "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1") + ">"}
+	want := []string{"<sip:" + publicHost + ":5060;transport=tcp;lr>", "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1", coreICID) + ">"}
 	if !slices.Equal(rr, want) {
 		t.Errorf("Record-Route %q, want %q", rr, want)
 	}
 	// Inside a dialog: the flow of the core-facing value, no Record-Route.
-	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@[::ffff:10.0.2.9]:5070;transport=tcp;lr;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1"), "sip:" + publicHost + ":5060;transport=tcp;lr"})
+	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@[::ffff:10.0.2.9]:5070;transport=tcp;lr;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1", coreICID), "sip:" + publicHost + ":5060;transport=tcp;lr"})
 	d = p.Route(context.Background(), in)
 	if len(d.Targets) != 1 || d.Targets[0].Destination.Flow != "FLOW-A" || d.RecordRoute != nil {
 		t.Fatalf("in-dialog decision %+v", d)
@@ -178,7 +178,7 @@ func TestTheClientsResponsesCarryChargingAndTheCalledIdentity(t *testing.T) {
 		t.Error("a 100 was rewritten")
 	}
 	// Inside a dialog only the charging vector.
-	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-A", "term-1"), "sip:" + publicHost + ":5060;transport=tcp;lr"},
+	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-A", "term-1", ""), "sip:" + publicHost + ":5060;transport=tcp;lr"},
 		"P-Charging-Vector: icid-value="+coreICID)
 	d = p.Route(context.Background(), in)
 	ok := answer(t, in.Message, 200)
@@ -248,21 +248,25 @@ func TestACoreRequestInsideADialogNeedsThatDialogsRecordRoute(t *testing.T) {
 	entry := func(mac string) []string {
 		return []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + mac, client}
 	}
-	if d := p.Route(context.Background(), fromCore(t, "BYE", true, entry(p.dialogMAC("FLOW-A", "term-1")))); len(d.Targets) != 1 {
+	if d := p.Route(context.Background(), fromCore(t, "BYE", true, entry(p.dialogMAC("FLOW-A", "term-1", "")))); len(d.Targets) != 1 {
 		t.Fatalf("this dialog's value: %+v", d)
 	}
 	for name, routed := range map[string][]string{
 		"the Path":            {pathEntry, client},
-		"another dialog's":    entry(p.dialogMAC("FLOW-A", "term-2")),
-		"another flow's":      entry(p.dialogMAC("FLOW-B", "term-1")),
+		"another dialog's":    entry(p.dialogMAC("FLOW-A", "term-2", "")),
+		"another flow's":      entry(p.dialogMAC("FLOW-B", "term-1", "")),
 		"a changed MAC":       entry(strings.Repeat("0", 32)),
-		"another start's key": entry((&pcscf{dialogKey: []byte("another key")}).dialogMAC("FLOW-A", "term-1")),
+		"another start's key": entry((&pcscf{dialogKey: []byte("another key")}).dialogMAC("FLOW-A", "term-1", "")),
+		// The MAC covers the icid too (review of #221).
+		"an icid added":  {"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1", ""), client},
+		"a changed icid": {"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + strings.ToUpper(coreICID) + ";dlg=" + p.dialogMAC("FLOW-A", "term-1", coreICID), client},
+		"an icid gone":   {"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-A", "term-1", coreICID), client},
 	} {
 		if d := p.Route(context.Background(), fromCore(t, "BYE", true, routed)); d.Status != 403 {
 			t.Errorf("%s: %+v, want 403", name, d)
 		}
 	}
-	gone := []string{"sip:FLOW-B@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-B", "term-1"), client}
+	gone := []string{"sip:FLOW-B@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-B", "term-1", ""), client}
 	if d := p.Route(context.Background(), fromCore(t, "BYE", true, gone)); d.Status != statusFlowFailed {
 		t.Errorf("a dead flow with its dialog's value: %+v, want 430", d)
 	}
@@ -382,6 +386,91 @@ func TestAClientCannotChangeTheRecordRouteOfItsAnswer(t *testing.T) {
 	busy := answer(t, r.Message, 486, "Record-Route: <sip:10.0.7.7;lr>")
 	if d.OnResponse(context.Background(), busy); busy.Header.Get("Record-Route") != "<sip:10.0.7.7;lr>" {
 		t.Errorf("486: %q", busy.Header.Values("Record-Route"))
+	}
+}
+
+// A request from the core whose Record-Route does not parse cannot have
+// it put back: the answer's goes upstream as the client wrote it, and the
+// request is counted (review of #221).
+func TestAMalformedCoreRecordRouteIsPassedThrough(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	p := newTerminatingPcscf(t, "FLOW-A")
+	var out strings.Builder
+	p.metrics = runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, p.log)
+	r := fromCore(t, "INVITE", false, []string{pathEntry}, "Record-Route: sip:scscf.rcs.internal;lr")
+	d := p.Route(context.Background(), r)
+	if len(d.RecordRoute) != 2 {
+		t.Fatalf("Record-Route %+v", d.RecordRoute)
+	}
+	res := answer(t, r.Message, 200, "Record-Route: <sip:10.0.7.7;lr>", "Record-Route: sip:scscf.rcs.internal;lr")
+	d.OnResponse(context.Background(), res)
+	if got := res.Header.Values("Record-Route"); !slices.Equal(got, []string{"<sip:10.0.7.7;lr>", "sip:scscf.rcs.internal;lr"}) {
+		t.Errorf("Record-Route %q", got)
+	}
+	p.metrics.Flush()
+	if !strings.Contains(out.String(), `"`+metricRecordRouteMalformed+`":1`) {
+		t.Errorf("metrics %s", out.String())
+	}
+}
+
+// An icid from the core that no route can carry, longer than maxICID, is
+// replaced by a new one everywhere: in the core-facing Record-Route and in
+// every answer, the 200 that sets up the dialog included, so the dialog's
+// requests and its answers carry the same one (review of #221).
+func TestAnICIDTooLongForARouteIsReplacedEverywhere(t *testing.T) {
+	p := newTerminatingPcscf(t, "FLOW-A")
+	long := strings.Repeat("a", maxICID+1)
+	r := fromCore(t, "INVITE", false, []string{pathEntry}, "P-Charging-Vector: icid-value="+long+";orig-ioi=home.example.net")
+	d := p.Route(context.Background(), r)
+	icid, ok := routeICID(d.RecordRoute[1].URI)
+	if !ok || icid == long || len(icid) != 32 {
+		t.Fatalf("Record-Route %s", d.RecordRoute[1].URI)
+	}
+	for _, code := range []int{180, 200, 486} {
+		res := answer(t, r.Message, code)
+		d.OnResponse(context.Background(), res)
+		if got := res.Header.Get("P-Charging-Vector"); got != "icid-value="+icid+";orig-ioi=home.example.net;term-ioi=ims.mnc001.mcc001.3gppnetwork.org" {
+			t.Errorf("%d: P-Charging-Vector %q", code, got)
+		}
+	}
+	if !p.inDialogWith(d.RecordRoute[1].URI, "term-1") {
+		t.Error("the route's MAC does not take its icid")
+	}
+	// recordRoute itself writes no icid it could not read back.
+	if u := p.recordRoute("FLOW-A", false, long, "term-1")[0].URI; u.Params.Has(icidParam) || !p.inDialogWith(u, "term-1") {
+		t.Errorf("recordRoute with a long icid: %s", u)
+	}
+}
+
+// A client's P-Preferred-Identity never reaches the core in a response,
+// whatever the response, and none reaches the client in one (RFC 3325
+// §9.2; QA of #221).
+func TestNoResponseCarriesAPreferredIdentity(t *testing.T) {
+	p := newTerminatingPcscf(t, "FLOW-A")
+	ppi := "P-Preferred-Identity: <sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>"
+	for _, tt := range []struct {
+		method   string
+		inDialog bool
+		code     int
+	}{
+		{"INVITE", false, 180}, {"INVITE", false, 486}, {"INVITE", false, 302}, {"MESSAGE", false, 603}, {"BYE", true, 200}, {"INFO", true, 500},
+	} {
+		routed := []string{pathEntry}
+		if tt.inDialog {
+			routed = []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-A", "term-1", ""), "sip:" + publicHost + ":5060;transport=tcp;lr"}
+		}
+		r := fromCore(t, tt.method, tt.inDialog, routed)
+		d := p.Route(context.Background(), r)
+		res := answer(t, r.Message, tt.code, ppi)
+		d.OnResponse(context.Background(), res)
+		if res.Header.Has("P-Preferred-Identity") {
+			t.Errorf("%d to %s: P-Preferred-Identity %q", tt.code, tt.method, res.Header.Get("P-Preferred-Identity"))
+		}
+	}
+	d := toClient(proxy.Decision{})
+	res := answer(t, fromCore(t, "MESSAGE", false, nil).Message, 200, ppi)
+	if d.OnResponse(context.Background(), res); res.Header.Has("P-Preferred-Identity") {
+		t.Errorf("toward the client: P-Preferred-Identity %q", res.Header.Get("P-Preferred-Identity"))
 	}
 }
 

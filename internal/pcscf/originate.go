@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -267,9 +268,9 @@ func bare(u sip.URI) sip.URI {
 // dials. The core-facing value also carries the dialog's icid, which the
 // dialog's later requests from the client bring back for their charging
 // vector (§5.2.6.3.5 7), §5.2.6.3.9 3)) since pcscf keeps no dialog state,
-// and binds the flow to the dialog with a MAC over the token and its
-// Call-ID (dialogMAC), so that the core's requests reach the flow only in
-// that dialog.
+// and binds the flow to the dialog with a MAC over the token, its Call-ID
+// and that icid (dialogMAC), so that the core's requests reach the flow
+// only in that dialog and the client's carry that icid alone.
 func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid, callID string) []sip.Address {
 	core := sip.URI{Scheme: "sip", User: string(flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
 	core.Params.Set("transport", "tcp")
@@ -277,8 +278,12 @@ func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid, callID string)
 	if ob {
 		core.Params.SetFlag("ob")
 	}
-	core.Params.Set(icidParam, escapeParam(icid))
-	core.Params.Set(dialogParam, p.dialogMAC(flow, callID))
+	if validICID(icid) {
+		core.Params.Set(icidParam, escapeParam(icid))
+	} else {
+		icid = ""
+	}
+	core.Params.Set(dialogParam, p.dialogMAC(flow, callID, icid))
 	client := sip.URI{Scheme: "sip", Host: p.cfg.PublicHost, Port: p.cfg.PublicPort}
 	if p.cfg.ClientTransport == ClientTCP {
 		client.Params.Set("transport", "tcp")
@@ -297,22 +302,38 @@ const (
 	dialogParam = "dlg"
 )
 
-// dialogMAC binds a flow token to a dialog's Call-ID: 128 bits of
-// HMAC-SHA256 under a key drawn at every start, as the flow token is, so a
-// peer that saw the token in one dialog cannot reach the flow in another.
-func (p *pcscf) dialogMAC(flow transport.FlowID, callID string) string {
+// dialogMAC binds a flow token to a dialog's Call-ID and its icid, "" for
+// none: 128 bits of HMAC-SHA256 under a key drawn at every start, as the
+// flow token is, so a peer that saw the token in one dialog cannot reach
+// the flow in another, and a client cannot change the icid its dialog's
+// requests are charged to (review of #221). Each field is written after its
+// length, so no two sets of fields hash alike.
+func (p *pcscf) dialogMAC(flow transport.FlowID, callID, icid string) string {
 	m := hmac.New(sha256.New, p.dialogKey)
-	m.Write([]byte(flow))
-	m.Write([]byte{0})
-	m.Write([]byte(callID))
+	for _, f := range []string{string(flow), callID, icid} {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(f)))
+		m.Write(n[:])
+		m.Write([]byte(f))
+	}
 	return hex.EncodeToString(m.Sum(nil)[:16])
 }
 
 // inDialogWith reports whether u, a consumed core-facing Record-Route value,
-// was written for the flow it names in the dialog of callID.
+// was written for the flow it names in the dialog of callID, with the icid
+// it carries.
 func (p *pcscf) inDialogWith(u sip.URI, callID string) bool {
 	mac, ok := u.Param(dialogParam)
-	return ok && hmac.Equal([]byte(mac), []byte(p.dialogMAC(transport.FlowID(u.User), callID)))
+	if !ok {
+		return false
+	}
+	icid := ""
+	if u.Params.Has(icidParam) {
+		if icid, ok = routeICID(u); !ok {
+			return false
+		}
+	}
+	return hmac.Equal([]byte(mac), []byte(p.dialogMAC(transport.FlowID(u.User), callID, icid)))
 }
 
 // contactHasOb reports whether the request's Contact has the ob parameter:
@@ -327,7 +348,8 @@ func contactHasOb(req *sip.Request) bool {
 // as its Route says only along a route set this pcscf recorded for this
 // flow, and only to scscf:
 //   - both of pcscf's Record-Route values were consumed, and the core-facing
-//     one names the flow the request came on;
+//     one names the flow the request came on, with the MAC written for it
+//     in this dialog (dialogMAC);
 //   - the next hop is scscf's service name (PCSCF_SCSCF_HOST) on its port
 //     over TCP, as scscf records itself in every dialog pcscf is in (ADR
 //     0005), and resolves to a private address other than this task's.
@@ -338,8 +360,7 @@ func contactHasOb(req *sip.Request) bool {
 // bucket, so a To tag does not lift its rate; an ACK past it, which cannot
 // be answered 503, is dropped. The forwarded request carries the dialog's
 // icid, from the core-facing value, in a P-Charging-Vector of its own; the
-// client holds that value, so it can choose its own dialog's icid (threat
-// model T2).
+// MAC covers it, so the client cannot change it.
 func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !p.initials.allow(clientKey(r.Source.Addr)) {
 		if r.Message.Method == "ACK" {
@@ -362,7 +383,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 			client = true
 		}
 	}
-	if core == nil || !client {
+	if core == nil || !client || !p.inDialogWith(*core, r.Message.Header.Get("Call-ID")) {
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	next := r.Message.URI
@@ -380,7 +401,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 	}
 	icid, ok := routeICID(*core)
 	if !ok {
-		// The client's copy of the route lost or changed it.
+		// The route was written without one (validICID).
 		var err error
 		if icid, err = p.icid(); err != nil {
 			return proxy.Decision{Status: 500}
@@ -421,15 +442,25 @@ func routeICID(u sip.URI) (string, bool) {
 		return "", false
 	}
 	icid, err := url.PathUnescape(v)
-	if err != nil || icid == "" || len(icid) > maxICID {
+	if err != nil || !validICID(icid) {
 		return "", false
+	}
+	return icid, true
+}
+
+// validICID reports whether icid is one a route may carry: not empty, at
+// most maxICID bytes, and text without control characters. recordRoute
+// writes no other, so routeICID reads back only what it would write.
+func validICID(icid string) bool {
+	if icid == "" || len(icid) > maxICID {
+		return false
 	}
 	for _, r := range icid {
 		if r < 0x20 || r == 0x7f || !utf8.ValidRune(r) || r == utf8.RuneError {
-			return "", false
+			return false
 		}
 	}
-	return icid, true
+	return true
 }
 
 // escapeParam writes v as a URI parameter value (RFC 3261 §25.1 paramchar):

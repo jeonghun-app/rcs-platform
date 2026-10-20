@@ -134,7 +134,7 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	}
 	wantRR := []string{
 		fmt.Sprintf("<sip:%s:5060;transport=tcp;lr>", publicHost),
-		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s;dlg=%s>", token, s.core.Port(), coreICID, pc.dialogMAC(transportFlow(token), call)),
+		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s;dlg=%s>", token, s.core.Port(), coreICID, pc.dialogMAC(transportFlow(token), call, coreICID)),
 		scscfRR,
 	}
 	if got := invite.Header.Values("Record-Route"); !slices.Equal(got, wantRR) {
@@ -183,11 +183,14 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	if info.Method != "INFO" {
 		t.Fatalf("the client got %s", info.Method)
 	}
-	c.write(respondTo(info, 200, "a1", forged...))
+	c.write(respondTo(info, 200, "a1", append([]string{preferred}, forged...)...))
 	if res := core.final(); res.StatusCode != 200 {
 		t.Errorf("INFO: %d", res.StatusCode)
 	} else {
 		noForgedIn(t, "the 200 to INFO", &res.Header)
+		if res.Header.Has("P-Preferred-Identity") {
+			t.Errorf("the 200 to INFO reached the core with P-Preferred-Identity %q", res.Header.Get("P-Preferred-Identity"))
+		}
 	}
 	// The same route in another dialog reaches no one (security review of
 	// #221).
@@ -207,6 +210,15 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 		t.Errorf("MESSAGE: %d", res.StatusCode)
 	} else {
 		noForgedIn(t, "the 200 to MESSAGE", &res.Header)
+	}
+
+	// A call the client turns down: its 486 brings no preference of the
+	// client's to the core (QA of #221).
+	core.write(coreRequest("INVITE", contact, "term-busy", "", 1, "Route: <"+path+">", "P-Called-Party-ID: <"+aliceIMPU+">"))
+	busy := c.nextRequest()
+	c.write(respondTo(busy, 486, "a2", preferred))
+	if res := core.final(); res.StatusCode != 486 || res.Header.Has("P-Preferred-Identity") {
+		t.Errorf("486: %d, P-Preferred-Identity %q", res.StatusCode, res.Header.Get("P-Preferred-Identity"))
 	}
 }
 

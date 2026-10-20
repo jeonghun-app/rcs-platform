@@ -112,7 +112,11 @@ func noForgedIn(t *testing.T, what string, h *sip.Header) {
 // 6). A BYE whose route names another flow, or whose next hop is not scscf's
 // name, is refused, and in-dialog requests carry the dialog's icid.
 func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
-	scscf := startCoreNode(t, answerAsUAS)
+	// scscf's answers carry a P-Preferred-Identity, which no client gets
+	// (QA of #221).
+	scscf := startCoreNode(t, func(req *sip.Request) string {
+		return strings.Replace(answerAsUAS(req), "Content-Length: 0", preferred+"\r\nContent-Length: 0", 1)
+	})
 	scscfPort := scscf.ln.Addr().(*net.TCPAddr).Port
 	scscfURI := fmt.Sprintf("sip:orig@scscf.rcs.internal:%d;transport=tcp;lr", scscfPort)
 	icscf := startCoreNode(t, func(req *sip.Request) string {
@@ -152,7 +156,7 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	pcv := invite.Header.Get("P-Charging-Vector")
 	icid := strings.TrimSuffix(strings.TrimPrefix(pcv, "icid-value="), ";orig-ioi=ims.mnc001.mcc001.3gppnetwork.org")
 	wantRR := []string{
-		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s;dlg=%s>", token, s.core.Port(), icid, pc.dialogMAC(transportFlow(token), call)),
+		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s;dlg=%s>", token, s.core.Port(), icid, pc.dialogMAC(transportFlow(token), call, icid)),
 		fmt.Sprintf("<sip:%s:5060;transport=tcp;lr>", publicHost),
 	}
 	if got := invite.Header.Values("Record-Route"); !slices.Equal(got, wantRR) {
@@ -172,6 +176,9 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	ok := c.final()
 	if ok.StatusCode != 200 {
 		t.Fatalf("INVITE: %d", ok.StatusCode)
+	}
+	if ok.Header.Has("P-Preferred-Identity") {
+		t.Errorf("the 200 reached the client with P-Preferred-Identity %q", ok.Header.Get("P-Preferred-Identity"))
 	}
 	// The client's route set is the 200's Record-Route reversed (RFC 3261
 	// §12.1.2).
@@ -234,10 +241,13 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	if got := bye.Header.Get("P-Charging-Vector"); got != pcv {
 		t.Errorf("BYE P-Charging-Vector %q, want the INVITE's %q", got, pcv)
 	}
-	if res := c.final(); res.StatusCode != 200 {
-		t.Errorf("BYE: %d", res.StatusCode)
+	if res := c.final(); res.StatusCode != 200 || res.Header.Has("P-Preferred-Identity") {
+		t.Errorf("BYE: %d, P-Preferred-Identity %q", res.StatusCode, res.Header.Get("P-Preferred-Identity"))
 	}
 }
+
+// preferred is a P-Preferred-Identity no response may carry.
+const preferred = "P-Preferred-Identity: <sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>"
 
 // A route back into this task's own core listener, its address written
 // another way, is taken as pcscf's own and so is no next hop: the request

@@ -46,10 +46,10 @@ separate from its core listener; core SIP ports admit only platform services
 **Status:** planned (#16, Phase 7 infrastructure).
 **Residual risk (accepted, #208, narrowed in #221):** `pcscf` checks
 in-dialog requests against its own Record-Route values only, keeping no
-dialog state. The core-facing value binds the flow token to the Call-ID with
-a MAC under a key drawn at every start, and a request from the core inside
-a dialog reaches the flow only with the value written for its Call-ID, and
-is answered 403 with any other while the flow is alive. The MAC is checked
+dialog state. The core-facing value binds the flow token to the Call-ID and
+the dialog's icid with a MAC under a key drawn at every start, and a request
+from the core inside a dialog reaches the flow only with the value written
+for its Call-ID, and is answered 403 with any other while the flow is alive. The MAC is checked
 only on requests inside a dialog (with a To tag): an initial request comes
 along the client's `Path` and is not bound to a dialog. The binding covers
 the Call-ID and not the tags: `pcscf` writes the value into
@@ -64,10 +64,9 @@ checks it as an acceptance criterion of
 [#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
 mitigation is a dialog-state check in `scscf`, such as a signed
 Record-Route parameter it verifies.
-**Residual risk (accepted, #208):** a client can choose the icid of its own
-dialog's in-dialog requests, since `pcscf` reads it back from the
-Record-Route value the client holds. Nothing consumes charging yet; the
-value is to be signed, like the flow token, when charging (Rf/Ro) does.
+The client's in-dialog requests are checked against the same MAC, so a
+client cannot change the icid its dialog's requests are charged to (review
+of #221; this closes the #208 residual risk that it could).
 
 ## T3 — MSRP session access on `rcs-as`
 
