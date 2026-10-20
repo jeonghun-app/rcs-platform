@@ -195,14 +195,22 @@ type pcscf struct {
 	clientFlow func(transport.FlowID) bool
 	// metrics counts what is worth an alarm; nil in tests that need none.
 	metrics *runtime.Metrics
+	// subs are the reg event subscriptions, and send starts the client
+	// transaction of a SUBSCRIBE; nil in tests that need none.
+	subs *subscriptions
+	send sender
 }
 
 // Route implements proxy.Router. A client's REGISTER goes to icscf, its
 // other requests outside a dialog along its Service-Route, and those inside
 // one along their Route if pcscf is on it; a request from the core goes to
-// the client flow its Route names.
+// the client flow its Route names, unless it is addressed to one of
+// pcscf's own reg event subscriptions.
 func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !fromClient(r.Source) {
+		if p.subs != nil && p.ownURI(r.Message.URI) {
+			return proxy.Decision{Serve: p.serveNotify}
+		}
 		return p.terminate(ctx, r)
 	}
 	var d proxy.Decision
