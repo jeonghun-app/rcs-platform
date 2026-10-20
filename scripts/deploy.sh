@@ -45,7 +45,8 @@ ECR_TEMPLATE="$ROOT/infra/ecr.yaml"
 
 # Platform parameters this script sets itself; the config file may not.
 MANAGED_PARAMETERS=(EcrStackName ImageTag ImageDigest AcsImageTag AcsImageDigest
-  S3PrefixListId DynamoDbPrefixListId TemplateRevision PreviousImageTag DeployPrincipalArn)
+  S3PrefixListId DynamoDbPrefixListId TemplateRevision PreviousImageTag DeployPrincipalArn
+  NlbReusedAddressA NlbReusedAddressB)
 
 CONFIG=""
 STACK="rcs-platform"
@@ -591,6 +592,17 @@ check_quota() {
   echo "  Fargate vCPU: up to $needed needed, quota $quota"
 }
 
+# The public address of an Elastic IP allocation the config names, which
+# the template cannot read itself; nothing for an empty one.
+reused_address() {
+  local id="$1" ip
+  [[ -n "$id" ]] || return 0
+  ip="$(aws ec2 describe-addresses --region "$REGION" --allocation-ids "$id" \
+    --query 'Addresses[0].PublicIp' --output text)"
+  [[ "$ip" =~ ^[0-9.]+$ ]] || fail "no Elastic IP $id in $REGION"
+  echo "$ip"
+}
+
 # The IAM ARN of the caller, as aws:PrincipalArn sees it: an assumed role is
 # its role (with its path), a user is itself.
 deploy_principal() {
@@ -709,7 +721,11 @@ if [[ "$DRY_RUN" == true ]]; then
   S3_PREFIX_LIST="<pl of com.amazonaws.$REGION.s3>"
   DYNAMODB_PREFIX_LIST="<pl of com.amazonaws.$REGION.dynamodb>"
   PREVIOUS_IMAGE_TAG="<the ImageTag the stack runs now>"
+  NLB_ADDRESS_A="<address of NlbAllocationIdA, if set>"
+  NLB_ADDRESS_B="<address of NlbAllocationIdB, if set>"
 else
+  NLB_ADDRESS_A="$(reused_address "$(config_value NlbAllocationIdA)")"
+  NLB_ADDRESS_B="$(reused_address "$(config_value NlbAllocationIdB)")"
   S3_PREFIX_LIST="$(prefix_list s3)"
   DYNAMODB_PREFIX_LIST="$(prefix_list dynamodb)"
   # What runs now becomes the rollback target, unless this deployment keeps
@@ -733,6 +749,7 @@ PAIRS=(
   "S3PrefixListId=$S3_PREFIX_LIST" "DynamoDbPrefixListId=$DYNAMODB_PREFIX_LIST"
   "TemplateRevision=$TEMPLATE_REVISION" "PreviousImageTag=$PREVIOUS_IMAGE_TAG"
   "DeployPrincipalArn=$DEPLOY_PRINCIPAL"
+  "NlbReusedAddressA=$NLB_ADDRESS_A" "NlbReusedAddressB=$NLB_ADDRESS_B"
 )
 for ((i = 0; i < ${#CONFIG_KEYS[@]}; i++)); do
   PAIRS+=("${CONFIG_KEYS[$i]}=${CONFIG_VALUES[$i]}")

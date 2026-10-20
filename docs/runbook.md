@@ -380,12 +380,64 @@ connections.
 **Symptom.** pcscf closed stalled connections to keep its output queues
 within budget (`BudgetSheds`). Those clients reconnect and register again.
 
+**How the transport recovers by itself** (internal/sip/transport, #153). At
+most every 100 ms a scan looks for connections that made no progress for 1 s
+(or half of `WriteTimeout`), client-facing ones first, then the fullest
+against their own limit. It closes stalled client connections until the
+shortfall plus 10% of the budget is free, so the queues fit in 90% of
+`MaxQueuedBytes` (each close is a `BudgetSheds`). One scan frees no more
+than that, even when healthy queues hold over 90%; with too few stalled
+clients it closes what there is. Senders waiting on a full budget wait for
+the running scan and try again in the space it freed. Stalled core
+connections are closed only while a send still does not fit at all, since
+closing one ends every transaction on it with 408. When the scan closes
+nothing, the send is tried once more. With enough stalled clients, refusals
+stop within about 100 ms; a burst larger than one scan frees may see some
+refused until the next. Without candidates (every peer slow but reading),
+refusals go on until output drains; a stalled writer closes itself after
+`WriteTimeout` (10 s by default).
+
 **Check.** As [PcscfQueueUse](#pcscfqueueuse). A few sheds under load are
 the budget doing its job; many mean the tasks are short of memory for the
-traffic.
+traffic, or a client-side network stopped reading.
 
 **Act.** Add pcscf tasks. Do not raise the budget beyond what the task's
 memory holds.
+
+### PcscfBudgetRefusals
+
+**Symptom.** pcscf refused sends because the queued output of all its
+connections reached `MaxQueuedBytes` (256 MiB by default) (`BudgetRefusals`).
+The connection stays open; a request refused this way gets 503.
+
+The recovery is as under [PcscfBudgetSheds](#pcscfbudgetsheds).
+
+**Check.** Does `QueuedBytes` stay near the budget ([PcscfQueueUse](#pcscfqueueuse))?
+Does `BudgetSheds` rise with it? If it does not, the scan found no stalled
+connection. Look at `QueueWaitTimeouts` and `WriteErrors` too.
+
+**Act.**
+- `BudgetSheds` rises and the refusals stop within seconds: many clients
+  stopped reading at once (a radio network outage) and were shed. Nothing to
+  do.
+- Refusals go on without `BudgetSheds`: a core peer (scscf) reads slowly.
+  Look at its load and health.
+- Refusals never stop: the budget is too small for the traffic. Raise
+  `MaxQueuedBytes` together with the task's memory, or add pcscf tasks.
+
+### PcscfResponseFlowCloses
+
+**Symptom.** pcscf closed client flows because a response did not fit in the
+flow's own send queue (`ResponseFlowCloses`). The client sees its connection
+drop and registers again.
+
+**Check.** Are those clients reading slowly (a client-side network
+problem), or is output toward them piling up behind the core
+([PcscfQueueUse](#pcscfqueueuse), `QueueWaitTimeouts`)?
+
+**Act.** Client networks: nothing to do on the platform, and watch that it
+stays local. Broad: add pcscf tasks; if the queues are too small for the
+traffic, raise the per-connection send queue with the task's memory.
 
 ### PcscfTransactionsRejected
 
@@ -742,6 +794,17 @@ minutes. reg event subscriptions and NOTIFYs slow down.
 
 **Act.** As [RegistrationsThrottled](#registrationsthrottled).
 
+### GroupChatsThrottled
+
+**Symptom.** Reads or writes to rcs-as's groupchats table were throttled for
+3 minutes (once rcs-as runs). Group messages and roster changes slow down.
+
+**Check.** Every group message reads the group's item once; a busy group,
+or many groups at once, reads it often. Changes rewrite the whole item.
+
+**Act.** A burst clears by itself. One hot group: open an issue with the
+counts, never the conference URI.
+
 ### MessagesThrottled
 
 **Symptom.** Reads or writes to rcs-as's messages table were throttled for
@@ -957,6 +1020,31 @@ balancers' deletion protection back on, since a later deployment would not.
 Read the events for `DELETE_FAILED`. Usual causes are a security group still
 attached to an interface outside the stack, or a non-empty bucket in the
 registry stack. Fix it and run teardown again.
+
+### Keeping the NLB addresses
+
+The NLB's two Elastic IPs are retained when the stack is deleted, because
+clients cache the NLB's address and pcscf announces it
+(`PCSCF_PUBLIC_ADDRS`). A new stack takes them back only when told to:
+
+```sh
+# Before the teardown, or from the old stack's output (read-only):
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='NlbAllocationIds'].OutputValue" --output text
+# After it, find them by their Name tag (read-only):
+aws ec2 describe-addresses --region "$REGION" \
+  --filters Name=tag:Name,Values="$STACK-nlb-a","$STACK-nlb-b" \
+  --query 'Addresses[].[Tags[?Key==`Name`].Value | [0],AllocationId,PublicIp,AssociationId]' --output text
+```
+
+Put the allocation ids into the new stack's config as `NlbAllocationIdA`
+(the `-nlb-a` one) and `NlbAllocationIdB`, then deploy. deploy.sh looks up
+their addresses for `NlbPublicAddresses`. An empty value allocates a new
+address, and the retained one stays allocated and billed (about $3.65 a
+month) until it is released (`aws ec2 release-address`, changes the
+stack). A change that would replace the NLB itself cannot be applied while
+it holds fixed addresses: CloudFormation creates the new NLB first, and the
+addresses are still taken.
 
 ### Undoing a change made outside CloudFormation
 

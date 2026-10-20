@@ -571,8 +571,52 @@ class StackAdditions(TemplateCase):
         self.assertProblem(t, "PcscfTransactionBytes: a gauge or latency treats missing data as notBreaching")
 
     def test_rcs_as_may_check_conditions_on_its_messages(self):
-        required = {"RcsAsTaskRole": {"MessagesTable": ["dynamodb:ConditionCheckItem"]}}
-        self.assertEqual(check_infra.check_required_actions(self.template, required), [])
+        self.assertEqual(check_infra.check_required_actions(self.template), [])
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["RcsAsTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]:
+            if isinstance(st.get("Action"), list) and "dynamodb:ConditionCheckItem" in st["Action"] and \
+                    st["Resource"] == {"Fn::GetAtt": ["MessagesTable", "Arn"]}:
+                st["Action"].remove("dynamodb:ConditionCheckItem")
+        self.assertProblem(t, "RcsAsTaskRole: lacks dynamodb:ConditionCheckItem on MessagesTable")
+
+    def test_only_rcs_as_reads_the_groups(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AcsTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {"Fn::GetAtt": ["GroupChatsTable", "Arn"]}})
+        self.assertProblem(t, "AcsTaskRole: may read GroupChatsTable; only RcsAsTaskRole may")
+
+    def test_every_endpoint_is_held_to_this_account(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["DynamoDbEndpoint"]["Properties"]["PolicyDocument"]
+        self.assertProblem(t, "DynamoDbEndpoint: no endpoint policy")
+        t = copy.deepcopy(self.template)
+        st = t["Resources"]["LogsEndpoint"]["Properties"]["PolicyDocument"]["Statement"][0]
+        del st["Condition"]
+        self.assertProblem(t, "LogsEndpoint: an endpoint policy statement not held to this account")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["S3Endpoint"]["Properties"]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::someone-else/*"})
+        self.assertProblem(t, "S3Endpoint: an endpoint policy statement not held to this account")
+
+    def test_services_wait_for_the_endpoints(self):
+        for name in ("HssService", "FtServerService", "RelayService", "AcsService"):
+            depends = self.template["Resources"][name]["DependsOn"]
+            self.assertIn("EndpointsReady", [depends] if isinstance(depends, str) else depends, name)
+
+    def test_without_nat_the_endpoints_are_required(self):
+        rule = self.template["Rules"]["NoNatNeedsEndpoints"]
+        self.assertEqual(rule["RuleCondition"], {"Fn::Equals": [{"Ref": "NatGateways"}, "none"]})
+        for name in ("NatGatewayA", "NatAddressA", "PrivateDefaultRouteA", "PrivateDefaultRouteB"):
+            self.assertEqual(self.template["Resources"][name].get("Condition"), "HasNat")
+
+    def test_ft_server_must_reach_the_hss(self):
+        t = self.changed(FtServerToHssApiOut=None)
+        self.assertProblem(t, "FtServerSecurityGroup: cannot reach sg HssSecurityGroup port 8081")
+
+    def test_a_separate_egress_to_the_internet_is_refused(self):
+        t = self.changed(Wide={"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {
+            "GroupId": {"Ref": "AcsSecurityGroup"}, "CidrIp": "0.0.0.0/0", "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443}})
+        self.assertProblem(t, "AcsSecurityGroup: sends to 0.0.0.0/0 even with interface endpoints")
 
     def test_registrations_expire_on_ttl_not_on_the_index_key(self):
         spec = self.template["Resources"]["RegistrationsTable"]["Properties"]["TimeToLiveSpecification"]

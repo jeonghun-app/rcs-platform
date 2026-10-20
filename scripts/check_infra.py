@@ -29,6 +29,7 @@ platform the ADRs describe:
 * alarms follow the EMF rules of docs/architecture.md §8: periods of 60 s or
   more, N >= 2, explicit treatMissingData, no sampled timing statistics, and
   at most 10 metrics each;
+* every VPC endpoint has a policy holding it to this account;
 * with the interface endpoints on, no group sends to an address range, and
   ft-server's egress is only the HSS API, the S3 and DynamoDB prefix lists
   and the endpoints (#105);
@@ -284,6 +285,29 @@ def check_ft_server_egress(template: dict) -> list[str]:
     problems = [f"{group}: may send to {kind} {peer} port {port}; with interface endpoints ft-server reaches only "
                 "the HSS API, S3, DynamoDB and the endpoints (#105)" for kind, peer, port in sorted(found - FT_SERVER_EGRESS)]
     problems += [f"{group}: cannot reach {kind} {peer} port {port}" for kind, peer, port in sorted(FT_SERVER_EGRESS - found)]
+    return problems
+
+
+def check_endpoint_policies(template: dict) -> list[str]:
+    """Every VPC endpoint is held to this account: resources of the account
+    for the gateway endpoints, principals of the account for the interface
+    ones. The only exception is ECR's layer bucket on the S3 endpoint, which
+    image pulls need. Without it, the prefix-list egress would reach any
+    bucket or table in the region."""
+    problems = []
+    for name, ep in resources(template, "AWS::EC2::VPCEndpoint").items():
+        doc = ep.get("Properties", {}).get("PolicyDocument")
+        if not doc:
+            problems.append(f"{name}: no endpoint policy, so it reaches every account")
+            continue
+        for st in expand_statements(doc.get("Statement", [])):
+            if st.get("Effect") != "Allow":
+                continue
+            equals = st.get("Condition", {}).get("StringEquals", {})
+            account = equals.get("aws:ResourceAccount") or equals.get("aws:PrincipalAccount")
+            layer = ("starport-layer-bucket" in str(st.get("Resource")) and _actions(st) == ["s3:GetObject"])
+            if logical_id(account) != "AWS::AccountId" and not layer:
+                problems.append(f"{name}: an endpoint policy statement not held to this account")
     return problems
 
 
@@ -742,6 +766,7 @@ def check_secret_access(template: dict) -> list[str]:
 TABLE_READERS: dict[str, set[str]] = {
     "MsrpBindingsTable": {"MsrpRelayTaskRole"},
     "MessagesTable": {"RcsAsTaskRole"},
+    "GroupChatsTable": {"RcsAsTaskRole"},
     "RegistrationsTable": {"ScscfTaskRole"},
     "AuthChallengesTable": {"ScscfTaskRole"},
     "RegSubscriptionsTable": {"ScscfTaskRole"},
@@ -1154,6 +1179,7 @@ CHECKS = (
     check_security_groups,
     check_ft_server_egress,
     check_egress_with_endpoints,
+    check_endpoint_policies,
     check_target_groups,
     check_plain_listeners,
     check_load_balancers,

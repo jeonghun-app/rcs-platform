@@ -28,7 +28,8 @@ PLATFORM = ROOT / "infra" / "platform.yaml"
 ECR = ROOT / "infra" / "ecr.yaml"
 
 MANAGED = {"EcrStackName", "ImageTag", "ImageDigest", "AcsImageTag", "AcsImageDigest", "S3PrefixListId",
-           "DynamoDbPrefixListId", "TemplateRevision", "PreviousImageTag", "DeployPrincipalArn"}
+           "DynamoDbPrefixListId", "TemplateRevision", "PreviousImageTag", "DeployPrincipalArn",
+           "NlbReusedAddressA", "NlbReusedAddressB"}
 REGISTRY = "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com"
 PLATFORM_URI = f"{REGISTRY}/rcs-platform"
 ACS_URI = f"{REGISTRY}/rcs-platform-acs"
@@ -92,6 +93,14 @@ if tool == "aws":
     elif cmd == ["ecr", "describe-repositories"]:
         if "repository " + flag("--repository-names") not in state["taken"]:
             fail("RepositoryNotFoundException")
+    elif cmd == ["ec2", "describe-addresses"]:
+        ids = flag("--allocation-ids")
+        if ids is None:
+            print(len(state.get("addresses", {})))
+        elif ids not in state.get("addresses", {}):
+            fail("InvalidAllocationID.NotFound")
+        else:
+            print(state["addresses"][ids])
     elif cmd == ["ec2", "describe-managed-prefix-lists"]:
         print("pl-0a1b2c3d" if flag("--filters").endswith(".s3") else "pl-1a2b3c4d")
     elif cmd == ["cloudformation", "describe-stacks"]:
@@ -386,7 +395,8 @@ class Deploy(Stubbed):
             "AcsImageTag": "1.4.0", "AcsImageDigest": ACS_DIGEST,
             "S3PrefixListId": "pl-0a1b2c3d", "DynamoDbPrefixListId": "pl-1a2b3c4d",
             "TemplateRevision": TAG, "PreviousImageTag": "none",
-            "DeployPrincipalArn": "arn:aws:iam::123456789012:role/Deployer"})
+            "DeployPrincipalArn": "arn:aws:iam::123456789012:role/Deployer",
+            "NlbReusedAddressA": "", "NlbReusedAddressB": ""})
         create = self.aws("cloudformation", "create-change-set", stack="rcs-platform")[0]
         self.assertEqual(create[create.index("--change-set-type") + 1], "CREATE")
         url = create[create.index("--template-url") + 1]
@@ -554,6 +564,22 @@ class Deploy(Stubbed):
         result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cannot read the Fargate vCPU quota", result.stderr)
+
+    def test_retained_nlb_addresses_are_passed_on(self):
+        self.state["addresses"] = {"eipalloc-0a1": "198.51.100.7"}
+        path = self.config(replace={"NlbAllocationIdA": "eipalloc-0a1"})
+        result = self.run_script(DEPLOY, "--config", str(path), "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = self.change_set("rcs-platform")
+        self.assertEqual((values["NlbAllocationIdA"], values["NlbReusedAddressA"], values["NlbReusedAddressB"]),
+                         ("eipalloc-0a1", "198.51.100.7", ""))
+
+    def test_an_unknown_allocation_stops_the_deployment(self):
+        path = self.config(replace={"NlbAllocationIdB": "eipalloc-0ff"})
+        result = self.run_script(DEPLOY, "--config", str(path), "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no Elastic IP eipalloc-0ff", result.stderr)
+        self.assertEqual(self.aws("cloudformation", "create-change-set", stack="rcs-platform"), [])
 
     def test_values_reach_cloudformation_unchanged(self):
         value = 'a"b\\c,d=e'

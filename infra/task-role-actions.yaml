@@ -41,12 +41,14 @@ AcsTaskRole:
 RcsAsTaskRole:
   MessagesTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem, dynamodb:Query, dynamodb:DescribeTable]
   MessagesTable/index/expiry: [dynamodb:Query]
+  # docs/rcs-as.md (DynamoDB groupchats table), and the owner-epoch checks of #121.
+  GroupChatsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:ConditionCheckItem, dynamodb:DescribeTable]
 
 # From docs/scscf-state.md and internal/scscf/state/dynamostore (#89), and
 # the Cloud Map discovery of the HSS's Cx peers (ADR 0005).
 ScscfTaskRole:
   # In ScscfStatePolicy, a policy attached to the role (see the template).
-  RegistrationsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
+  RegistrationsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
   RegistrationsTable/index/impi-index: [dynamodb:Query]
   RegistrationsTable/index/expiry-index: [dynamodb:Query]
   AuthChallengesTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:DescribeTable]

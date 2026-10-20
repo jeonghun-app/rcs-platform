@@ -38,6 +38,10 @@ IcscfEnabled=false
 ScscfEnabled=false
 WafRateLimit=10000
 WafRateAction=count
+# Elastic IP allocations an earlier stack retained, to keep the NLB's
+# addresses (docs/runbook.md#keeping-the-nlb-addresses); empty allocates.
+NlbAllocationIdA=
+NlbAllocationIdB=
 
 # Identity (MCC 001 / MNC 01 is the test network)
 ImsDomain=ims.mnc001.mcc001.3gppnetwork.org

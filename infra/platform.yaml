@@ -97,10 +97,13 @@ Parameters:
   NatGateways:
     Type: String
     Default: per-az
-    AllowedValues: [per-az, single]
+    AllowedValues: [per-az, single, none]
     Description: >
-      per-az keeps task egress (image pulls, AWS APIs) up when one AZ fails;
-      single saves one NAT gateway's hourly charge for dev and test stacks.
+      per-az keeps task egress up when one AZ fails; single saves one NAT
+      gateway's hourly charge for dev and test stacks; none (only with the
+      interface endpoints, when nothing leaves for the internet) saves both
+      and their Elastic IPs. Whether staging and prod go to none is decided
+      after the first verification deployment (docs/aws-deployment.md#cost).
 
   InterfaceEndpoints:
     Type: String
@@ -532,6 +535,16 @@ Mappings:
     2048x4096: { Cpu: '2048', Memory: '4096', GoMemLimit: 3480MiB }
 
 Rules:
+  NoNatNeedsEndpoints:
+    RuleCondition: !Equals [!Ref NatGateways, none]
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref InterfaceEndpoints, 'true']
+          - !And [!Equals [!Ref InterfaceEndpoints, auto], !Not [!Equals [!Ref Environment, dev]]]
+        AssertDescription: >
+          NatGateways none needs the interface endpoints: without NAT, they
+          are the only way to ECR, CloudWatch Logs and Secrets Manager.
+
   EndpointsOutsideDev:
     RuleCondition: !Not [!Equals [!Ref Environment, dev]]
     Assertions:
@@ -588,6 +601,7 @@ Conditions:
   IsDev: !Equals [!Ref Environment, dev]
   IsProduction: !Not [!Condition IsDev]
   NatPerAz: !Equals [!Ref NatGateways, per-az]
+  HasNat: !Not [!Equals [!Ref NatGateways, none]]
   HasAlbCertificate: !Not [!Equals [!Ref AlbCertificateArn, '']]
   HasNlbCertificate: !Not [!Equals [!Ref NlbCertificateArn, '']]
   HasFtHostName: !Not [!Equals [!Ref FtHostName, '']]
@@ -711,12 +725,14 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
 
   NatAddressA:
+    Condition: HasNat
     Type: AWS::EC2::EIP
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
 
   NatGatewayA:
+    Condition: HasNat
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NatAddressA.AllocationId
@@ -755,6 +771,7 @@ Resources:
         - { Key: Name, Value: !Sub '${AWS::StackName}-private-b' }
 
   PrivateDefaultRouteA:
+    Condition: HasNat
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRouteTableA
@@ -763,6 +780,7 @@ Resources:
 
   # With a single NAT gateway both AZs leave through AZ a.
   PrivateDefaultRouteB:
+    Condition: HasNat
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRouteTableB
@@ -790,6 +808,17 @@ Resources:
       VpcEndpointType: Gateway
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
       RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+      # Only resources of this account, so the route to the endpoint is not a
+      # way out to another account's tables or buckets (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'dynamodb:*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:ResourceAccount': !Ref AWS::AccountId }
 
   S3Endpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -798,6 +827,23 @@ Resources:
       VpcEndpointType: Gateway
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
       RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+      # Only resources of this account, so the route to the endpoint is not a
+      # way out to another account's tables or buckets (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:ResourceAccount': !Ref AWS::AccountId }
+          # ECR keeps image layers in a bucket of its own (ECR User Guide,
+          # Amazon S3 gateway endpoint): image pulls need it.
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*'
 
   # Interface endpoints (InterfaceEndpoints): the APIs tasks call, kept off
   # the NAT gateways, so they keep working when NAT or an AZ's egress fails
@@ -825,6 +871,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   EcrApiEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -836,6 +892,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   EcrDkrEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -847,6 +913,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   SecretsManagerEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -858,6 +934,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   KmsEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -869,6 +955,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   ServiceDiscoveryEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -880,6 +976,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   DataServiceDiscoveryEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -891,6 +997,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   # acs's SMS provider, so that acs too needs no internet egress: End User
   # Messaging SMS (pinpoint-sms-voice-v2) or SNS, whichever it uses.
@@ -904,6 +1020,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   SnsEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -915,6 +1041,16 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      # Only principals of this account may use the endpoint (checked).
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:PrincipalAccount': !Ref AWS::AccountId }
 
   # The public subnets' network ACL: allow everything at rule 1000, and keep
   # rules 1-999 free for the deny entries docs/runbook.md#blocking-a-source
@@ -2048,6 +2184,28 @@ Resources:
   # docs/rcs-as.md, DynamoDB messages table). Created before rcs-as runs so
   # its pull request only adds the service. Queue items hold message
   # content: only rcs-as's task role may read it (check_infra.py).
+  # rcs-as's groups (#118, docs/rcs-as.md, DynamoDB groupchats table): one
+  # item per group, the roster with participants' identities, so only
+  # rcs-as reads it (check_infra.py). The rcs-as service block owns it.
+  GroupChatsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-groupchats'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      SSESpecification: { SSEEnabled: true }
+      Tags: [{ Key: Service, Value: rcs-as }]
+
   MessagesTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -2497,17 +2655,17 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
+          # Only reg-subscriptions is updated in place (NOTIFY counters);
+          # registrations and challenges are put and deleted whole.
           - Effect: Allow
-            Action:
-              - dynamodb:GetItem
-              - dynamodb:PutItem
-              - dynamodb:UpdateItem
-              - dynamodb:DeleteItem
-              - dynamodb:DescribeTable
+            Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
             Resource:
               - !GetAtt RegistrationsTable.Arn
               - !GetAtt AuthChallengesTable.Arn
               - !GetAtt RegSubscriptionsTable.Arn
+          - Effect: Allow
+            Action: dynamodb:UpdateItem
+            Resource: !GetAtt RegSubscriptionsTable.Arn
           - Effect: Allow
             Action: dynamodb:Query
             Resource:
@@ -2549,7 +2707,7 @@ Resources:
   RcsAsTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: rcs-as tasks - the messages table and its expiry index.
+      Description: rcs-as tasks - the messages and groupchats tables.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -2570,8 +2728,7 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
                   # Group receipt summaries check a condition inside a
-                  # transaction (#182); the groupchats table gets it too
-                  # when it is added (#118).
+                  # transaction (#182).
                   - dynamodb:ConditionCheckItem
                   - dynamodb:Query
                   - dynamodb:DescribeTable
@@ -2579,6 +2736,11 @@ Resources:
               - Effect: Allow
                 Action: dynamodb:Query
                 Resource: !Sub '${MessagesTable.Arn}/index/expiry'
+              # Groups: each change a conditional rewrite of the group's item;
+              # ConditionCheckItem for the owner-epoch checks of #121.
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:ConditionCheckItem, dynamodb:DescribeTable]
+                Resource: !GetAtt GroupChatsTable.Arn
 
   AcsExecutionRole:
     Type: AWS::IAM::Role
@@ -2945,8 +3107,37 @@ Resources:
   # rolling-update step (ADR 0003), a circuit breaker that rolls back a
   # deployment whose tasks do not become healthy, no ECS Exec (checked).
 
+  # Tasks of a new stack reach their images, secrets and logs only through
+  # the interface endpoints: every service waits for them and for its
+  # group's egress to them (ECS starts tasks as soon as a service exists).
+  EndpointsReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      Endpoints: !If
+        - WithInterfaceEndpoints
+        - - !Ref S3Endpoint
+          - !Ref DynamoDbEndpoint
+          - !Ref LogsEndpoint
+          - !Ref EcrApiEndpoint
+          - !Ref EcrDkrEndpoint
+          - !Ref SecretsManagerEndpoint
+          - !Ref KmsEndpoint
+          - !Ref ServiceDiscoveryEndpoint
+          - !Ref DataServiceDiscoveryEndpoint
+          - !Ref PcscfToEndpointsOut
+          - !Ref IcscfToEndpointsOut
+          - !Ref ScscfToEndpointsOut
+          - !Ref RcsAsToEndpointsOut
+          - !Ref HssToEndpointsOut
+          - !Ref MsrpRelayToEndpointsOut
+          - !Ref FtServerToEndpointsOut
+          - !Ref AcsToEndpointsOut
+          - !Ref OperatorToEndpointsOut
+        - [!Ref S3Endpoint, !Ref DynamoDbEndpoint]
+
   HssService:
     Type: AWS::ECS::Service
+    DependsOn: EndpointsReady
     Properties:
       ServiceName: hss
       Cluster: !Ref Cluster
@@ -2969,7 +3160,7 @@ Resources:
 
   FtServerService:
     Type: AWS::ECS::Service
-    DependsOn: FtServerRule
+    DependsOn: [FtServerRule, EndpointsReady]
     Properties:
       ServiceName: ft-server
       Cluster: !Ref Cluster
@@ -3003,7 +3194,7 @@ Resources:
 
   RelayService:
     Type: AWS::ECS::Service
-    DependsOn: RelayListenerReady
+    DependsOn: [RelayListenerReady, EndpointsReady]
     Properties:
       ServiceName: msrp-relay
       Cluster: !Ref Cluster
@@ -3028,7 +3219,7 @@ Resources:
 
   AcsService:
     Type: AWS::ECS::Service
-    DependsOn: FtServerRule
+    DependsOn: [FtServerRule, EndpointsReady]
     Properties:
       ServiceName: acs
       Cluster: !Ref Cluster
@@ -4835,6 +5026,46 @@ Resources:
   # connections closed to stay within it. Created with the SIP listeners;
   # the metric names are the transport's Stats fields and are confirmed by
   # pcscf's pull request.
+  GroupChatsThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-GroupChatsThrottled'
+      AlarmDescription: 'Requests to the GroupChatsTable table are throttled. See docs/runbook.md#groupchatsthrottled.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: r
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref GroupChatsTable }]
+            Period: 60
+            Stat: Sum
+        - Id: w
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions: [{ Name: TableName, Value: !Ref GroupChatsTable }]
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: 'FILL(r, 0) + FILL(w, 0)'
+          Label: GroupChatsThrottled
+          ReturnData: true
+  # pcscf (#16) on internal/sip/transport (#35): the queued output of all
+  # connections against MaxQueuedBytes (256 MiB), and the stalled
+  # connections closed to stay within it. Created with the SIP listeners;
+  # the metric names are the transport's Stats fields and are confirmed by
+  # pcscf's pull request.
   PcscfQueueUse:
     Type: AWS::CloudWatch::Alarm
     Condition: WithPcscf
@@ -4863,6 +5094,42 @@ Resources:
       OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       Namespace: !Sub 'RCS/${AWS::StackName}'
       MetricName: BudgetSheds
+      Dimensions: [{ Name: Service, Value: pcscf }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  PcscfBudgetRefusals:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithPcscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-PcscfBudgetRefusals'
+      AlarmDescription: 'pcscf refused sends because the transport-wide queue budget is full. See docs/runbook.md#pcscfbudgetrefusals.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: BudgetRefusals
+      Dimensions: [{ Name: Service, Value: pcscf }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  PcscfResponseFlowCloses:
+    Type: AWS::CloudWatch::Alarm
+    Condition: WithPcscf
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-PcscfResponseFlowCloses'
+      AlarmDescription: 'pcscf closed client flows whose own queue could not take a response. See docs/runbook.md#pcscfresponseflowcloses.'
+      AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+      Namespace: !Sub 'RCS/${AWS::StackName}'
+      MetricName: ResponseFlowCloses
       Dimensions: [{ Name: Service, Value: pcscf }]
       Statistic: Sum
       Period: 300
