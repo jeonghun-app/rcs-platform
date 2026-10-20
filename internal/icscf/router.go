@@ -39,6 +39,19 @@ type Router struct {
 	ids             sip.IDGenerator
 	metrics         Metrics
 	log             *slog.Logger
+	unknownLog      everyMinute
+}
+
+// everyMinute allows one event a minute, for a log line that a fault can
+// repeat for every request.
+type everyMinute struct{ last atomic.Int64 }
+
+func (e *everyMinute) allow(now time.Time) bool {
+	last := e.last.Load()
+	if last != 0 && now.UnixNano()-last < int64(time.Minute) {
+		return false
+	}
+	return e.last.CompareAndSwap(last, now.UnixNano())
 }
 
 // New returns a Router for cfg, or an error naming the first invalid setting.
@@ -324,7 +337,11 @@ func (r *Router) scscf(result cx.Result, name string, caps *cx.ServerCapabilitie
 			return c, nil
 		}
 		r.metrics.Count("icscf.scscf.unknown_name", 1)
-		r.log.Warn("icscf: the HSS named an S-CSCF that is not configured", slog.String("name", u.String()))
+		// The counter carries the volume; one line a minute says why,
+		// with the result code only (review of #274).
+		if r.unknownLog.allow(time.Now()) {
+			r.log.Warn("icscf: the HSS named an S-CSCF that is not configured", slog.String("result", result.String()))
+		}
 		return sip.URI{}, errUnknownName
 	}
 	ranked := rank(r.scscfs, caps)
