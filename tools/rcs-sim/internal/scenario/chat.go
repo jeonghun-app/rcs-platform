@@ -26,7 +26,8 @@ const largeMessage = 100 << 10
 
 // answerLag is how long after the client starts connecting chat-core-
 // originated sends pcscf's PATCH: well inside msrp-relay's RELAY_PATH_WAIT
-// (2 s by default), so the relay must wait for the path to bind.
+// (2 s by default; 10 s in simtest's stack, the e2e harness and
+// deploy/docker-compose.yml), so the relay must wait for the path to bind.
 const answerLag = 300 * time.Millisecond
 
 var errNoControl = errors.New("no relay control API configured (-relay-control, RCS_SIM_RELAY_TOKEN)")
@@ -214,7 +215,11 @@ func (r *run) converse(cs *chatSession) error {
 		return err
 	}
 	if r.cfg.IdleWait > 0 {
-		if err := r.step("keep-alive", func(ctx context.Context) (map[string]int64, error) {
+		timeout := r.cfg.KeepAliveTimeout
+		if timeout <= 0 {
+			timeout = r.cfg.StepTimeout
+		}
+		if err := r.stepWithin("keep-alive", timeout, func(ctx context.Context) (map[string]int64, error) {
 			before, sends := cs.traffic.written.Load(), cs.traffic.sends.Load()
 			// What the client wrote while quiet goes into the result whether
 			// the step passes or fails: a failure with bytes written means

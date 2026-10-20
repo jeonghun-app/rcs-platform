@@ -62,6 +62,10 @@ func TestE2ESimulatorAgainstTheServiceBinaries(t *testing.T) {
 		"RELAY_CORE_PORTS":    core,
 		"RELAY_STORE":         "memory",
 		"RELAY_PCSCF_TOKEN":   relayToken,
+		// chat-core-originated's PATCH goes 300 ms after the client
+		// connects; on a loaded runner that has taken over the default
+		// 2 s (#204).
+		"RELAY_PATH_WAIT": "10s",
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)

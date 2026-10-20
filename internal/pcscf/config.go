@@ -1,0 +1,210 @@
+package pcscf
+
+import (
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+)
+
+// Client transports: what the client's connection to the NLB is, which
+// decides the listener pcscf opens for it and the default public port.
+const (
+	// ClientTLS terminates TLS in pcscf, with PCSCF_TLS_CERT_FILE.
+	ClientTLS = "tls"
+	// ClientNLBTLS is a plain TCP listener behind an NLB TLS listener that
+	// terminates TLS: the client used TLS, pcscf sees TCP (ADR 0003).
+	ClientNLBTLS = "nlb-tls"
+	// ClientTCP is plain TCP end to end, for dev and test.
+	ClientTCP = "tcp"
+)
+
+// Defaults of the settings in docs/pcscf.md.
+const (
+	DefaultCoreAddr = "0.0.0.0:5070"
+	// DefaultMaxClientFlows and DefaultCoreConnections split the transport's
+	// DefaultMaxConnections: client flows may take no more than their share,
+	// so the core listener always has room for scscf (review of #188).
+	DefaultMaxConnections  = 10_000
+	DefaultMaxClientFlows  = 9_000
+	DefaultCoreConnections = 256
+	// DefaultMaxFlowsPerIP is generous because mobile clients share public
+	// addresses behind carrier-grade NAT (#16 plan, question 1).
+	DefaultMaxFlowsPerIP = 1024
+	// DefaultClientIdleTimeout closes a client connection that has said
+	// nothing for 340 s, just under the NLB TLS listener's fixed 350 s, so the
+	// client sees a clean close rather than a later reset (ADR 0003).
+	DefaultClientIdleTimeout = 340 * time.Second
+	// stopMargin is what Run needs after the drain to close the proxy and
+	// the transport and flush the last metrics, inside RCS_SHUTDOWN_TIMEOUT.
+	stopMargin = 5 * time.Second
+)
+
+// Config is pcscf's configuration (docs/pcscf.md).
+type Config struct {
+	// PublicHost is the name clients dial, the NLB's or an operator FQDN,
+	// PublicAddrs the NLB's public addresses it resolves to, and PublicPort
+	// their port: pcscf recognises itself in Route by them.
+	PublicHost  string
+	PublicAddrs []netip.Addr
+	PublicPort  int
+	// ClientTransport is one of ClientTLS, ClientNLBTLS and ClientTCP, and
+	// ClientAddr the address its listener binds.
+	ClientTransport string
+	ClientAddr      string
+	// TLSCertFile and TLSKeyFile are the certificate of ClientTLS.
+	TLSCertFile, TLSKeyFile string
+	// ClientUDPAddr, if set, opens a UDP client listener (dev and test only,
+	// ADR 0003).
+	ClientUDPAddr string
+	// CoreAddr is the core listener, which only scscf reaches (ADR 0007), and
+	// CoreHost this task's address on it, which Path and the core-facing
+	// Record-Route name (ADR 0005).
+	CoreAddr string
+	CoreHost netip.Addr
+	// ProxyProtocol requires the PROXY protocol v2 header on the client
+	// stream listener (RCS_PROXY_PROTOCOL, ADR 0003).
+	ProxyProtocol bool
+	// MaxFlowsPerIP bounds the client flows of one client address.
+	MaxFlowsPerIP int
+	// MaxConnections bounds the connections the transport accepts, and
+	// MaxClientFlows the client flows among them; CoreConnections of the
+	// rest are kept for the core listener.
+	MaxConnections, MaxClientFlows, CoreConnections int
+	// ClientIdleTimeout closes a quiet client connection.
+	ClientIdleTimeout time.Duration
+	// DrainTimeout is how long a stop spreads the closing of client flows
+	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
+	// the stop needs.
+	DrainTimeout time.Duration
+}
+
+// interfaceAddrs finds this task's addresses; tests replace it.
+var interfaceAddrs = net.InterfaceAddrs
+
+// Configure reads the PCSCF_ settings (docs/pcscf.md) and refuses, in staging
+// and prod, those that would let clients past the edge's rules.
+func Configure(s *runtime.Settings) Config {
+	e := s.Env
+	c := Config{
+		PublicHost:        strings.TrimSuffix(strings.ToLower(e.RequiredString("PUBLIC_HOST")), "."),
+		ClientTransport:   e.String("CLIENT_TRANSPORT", ClientTLS),
+		TLSCertFile:       e.String("TLS_CERT_FILE", ""),
+		TLSKeyFile:        e.String("TLS_KEY_FILE", ""),
+		ClientUDPAddr:     e.String("CLIENT_UDP_ADDR", ""),
+		CoreAddr:          e.String("CORE_ADDR", DefaultCoreAddr),
+		ProxyProtocol:     s.Shared.Bool("PROXY_PROTOCOL", false),
+		MaxFlowsPerIP:     e.Int("MAX_FLOWS_PER_IP", DefaultMaxFlowsPerIP),
+		MaxConnections:    e.Int("MAX_CONNECTIONS", DefaultMaxConnections),
+		MaxClientFlows:    e.Int("MAX_CLIENT_FLOWS", DefaultMaxClientFlows),
+		CoreConnections:   e.Int("CORE_CONNECTIONS", DefaultCoreConnections),
+		ClientIdleTimeout: e.Duration("CLIENT_IDLE_TIMEOUT", DefaultClientIdleTimeout),
+	}
+	if c.PublicHost != "" && !validHostName(c.PublicHost) {
+		e.Invalid("PUBLIC_HOST", "not a host name")
+	}
+	for i, v := range e.List("PUBLIC_ADDRS", nil) {
+		a, err := netip.ParseAddr(v)
+		if err != nil || a.Zone() != "" {
+			e.Invalid("PUBLIC_ADDRS", "item "+strconv.Itoa(i+1)+" is not an IP address")
+			continue
+		}
+		c.PublicAddrs = append(c.PublicAddrs, a.Unmap())
+	}
+	s.ForbidInProduction(len(c.PublicAddrs) == 0,
+		"PCSCF_PUBLIC_ADDRS is unset: clients put the NLB's address in their first Route (TS 24.229 §5.1.2A.1.1), which pcscf would not take as its own")
+	defaultPort := 5061
+	switch c.ClientTransport {
+	case ClientTLS:
+		if c.TLSCertFile == "" || c.TLSKeyFile == "" {
+			e.Invalid("TLS_CERT_FILE", "PCSCF_TLS_CERT_FILE and PCSCF_TLS_KEY_FILE are required with PCSCF_CLIENT_TRANSPORT=tls")
+		}
+	case ClientNLBTLS:
+	case ClientTCP:
+		defaultPort = 5060
+		s.ForbidInProduction(true, "PCSCF_CLIENT_TRANSPORT=tcp leaves client signalling unencrypted; use tls, or nlb-tls when the NLB terminates TLS (ADR 0003)")
+	default:
+		e.Invalid("CLIENT_TRANSPORT", "not one of tls, nlb-tls, tcp")
+	}
+	c.ClientAddr = e.String("CLIENT_ADDR", "0.0.0.0:"+strconv.Itoa(defaultPort))
+	c.PublicPort = e.Int("PUBLIC_PORT", defaultPort)
+	if c.PublicPort < 1 || c.PublicPort > 65535 {
+		e.Invalid("PUBLIC_PORT", "not a port from 1 to 65535")
+	}
+	for _, a := range []struct{ name, v string }{{"CLIENT_ADDR", c.ClientAddr}, {"CORE_ADDR", c.CoreAddr}, {"CLIENT_UDP_ADDR", c.ClientUDPAddr}} {
+		if a.v == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(a.v); err != nil {
+			e.Invalid(a.name, "not host:port")
+		}
+	}
+	c.CoreHost = runtime.InstanceAddr(e, "CORE_HOST", interfaceAddrs)
+	s.ForbidInProduction(c.ClientUDPAddr != "",
+		"PCSCF_CLIENT_UDP_ADDR is set: the NLB's fixed 120 s UDP flow timeout would send a client's packets to another task (ADR 0003)")
+	s.ForbidInProduction(!c.ProxyProtocol,
+		"RCS_PROXY_PROTOCOL is false: every client would appear as the load balancer, so flows and per-client limits could not work (ADR 0003)")
+	for _, n := range []struct {
+		name string
+		v    int
+	}{
+		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
+		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
+	} {
+		if n.v <= 0 {
+			e.Invalid(n.name, "must be positive")
+		}
+	}
+	if c.MaxClientFlows+c.CoreConnections > c.MaxConnections {
+		e.Invalid("MAX_CLIENT_FLOWS", "plus PCSCF_CORE_CONNECTIONS must not exceed PCSCF_MAX_CONNECTIONS")
+	}
+	if c.ClientIdleTimeout <= 0 {
+		e.Invalid("CLIENT_IDLE_TIMEOUT", "must be greater than zero")
+	}
+
+	// Run must return inside the runtime's stop deadline. The runtime
+	// reports a malformed RCS_SHUTDOWN_TIMEOUT itself, so the drain then
+	// takes the default without a second, misleading problem.
+	stop, known := runtime.DefaultShutdownTimeout, true
+	if v := s.Shared.String("SHUTDOWN_TIMEOUT", ""); v != "" {
+		d, err := time.ParseDuration(v)
+		if known = err == nil; known {
+			stop = d
+		}
+	}
+	def := runtime.DefaultShutdownTimeout - stopMargin
+	if known {
+		def = max(stop-stopMargin, 0)
+	}
+	c.DrainTimeout = e.Duration("DRAIN_TIMEOUT", def)
+	switch {
+	case c.DrainTimeout <= 0:
+		e.Invalid("DRAIN_TIMEOUT", "must be greater than zero, and RCS_SHUTDOWN_TIMEOUT longer than "+stopMargin.String())
+	case known && c.DrainTimeout+stopMargin > stop:
+		e.Invalid("DRAIN_TIMEOUT", "plus "+stopMargin.String()+" must not exceed RCS_SHUTDOWN_TIMEOUT ("+stop.String()+")")
+	}
+	return c
+}
+
+// validHostName reports whether h is a DNS name pcscf can be dialled by:
+// dot-separated labels of letters, digits and inner hyphens.
+func validHostName(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	for label := range strings.SplitSeq(h, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}

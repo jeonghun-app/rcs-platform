@@ -273,6 +273,28 @@ func TestStopListeningKeepsFlowsButRefusesNewConnections(t *testing.T) {
 	}
 }
 
+// Naming listeners stops only those: pcscf drains its client listeners and
+// keeps the core listener open, so scscf can still reach the clients not yet
+// closed (review of #188).
+func TestStopListeningByNameLeavesTheOtherListenersOpen(t *testing.T) {
+	server, _ := newTransport(t, Config{})
+	client := listen(t, server, ListenerConfig{Name: "client", Network: TCP})
+	core := listen(t, server, ListenerConfig{Name: "core", Network: TCP})
+	server.StopListening("client", "no such listener")
+	if _, err := net.DialTimeout("tcp", client.String(), time.Second); err == nil {
+		t.Fatal("the named listener still accepts")
+	}
+	c, err := net.DialTimeout("tcp", core.String(), time.Second)
+	if err != nil {
+		t.Fatalf("the other listener stopped too: %v", err)
+	}
+	_ = c.Close()
+	server.StopListening()
+	if _, err := net.DialTimeout("tcp", core.String(), time.Second); err == nil {
+		t.Fatal("StopListening without names left a listener open")
+	}
+}
+
 func TestCloseDoesNotWaitForConnectionsInTheirHandshake(t *testing.T) {
 	server, err := New(Config{ReadTimeout: time.Hour}, func(Inbound) {})
 	if err != nil {
