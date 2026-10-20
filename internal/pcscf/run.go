@@ -95,10 +95,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	defer func() { _ = tr.Close() }()
 
-	coreAddr, err := tr.Listen(transport.ListenerConfig{
-		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr,
-		AdvertisedHost: hostOf(cfg.CoreHost),
-	})
+	listeners := []transport.ListenerConfig{coreListenerConfig(cfg), clientListenerConfig(cfg)}
+	if cfg.ClientUDPAddr != "" {
+		listeners = append(listeners, udpListenerConfig(cfg))
+	}
+	if err := checkListenerLimits(cfg.MaxConnections, listeners); err != nil {
+		return err
+	}
+	coreAddr, err := tr.Listen(listeners[0])
 	if err != nil {
 		return fmt.Errorf("pcscf: core listener: %w", err)
 	}
@@ -138,13 +142,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer px.Close()
 	p.Store(px)
 
-	clientAddr, err := tr.Listen(clientListenerConfig(cfg))
+	clientAddr, err := tr.Listen(listeners[1])
 	if err != nil {
 		return fmt.Errorf("pcscf: client listener: %w", err)
 	}
 	var udpAddr netip.AddrPort
 	if cfg.ClientUDPAddr != "" {
-		if udpAddr, err = tr.Listen(udpListenerConfig(cfg)); err != nil {
+		if udpAddr, err = tr.Listen(listeners[2]); err != nil {
 			return fmt.Errorf("pcscf: client UDP listener: %w", err)
 		}
 	}
@@ -163,7 +167,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if d.sweep == 0 {
 		d.sweep = sweepInterval
 	}
-	stopSweep := every(d.sweep, pc.registry.sweep)
+	var tm transportMetrics
+	stopSweep := every(d.sweep, func() {
+		pc.registry.sweep()
+		tm.record(rt.Metrics, tr.Stats())
+	})
 	defer stopSweep()
 
 	<-ctx.Done()
@@ -243,9 +251,66 @@ func allowCore(cfg Config) func(netip.Addr) bool {
 	}
 }
 
+// coreListenerConfig is the core listener, which holds at most
+// PCSCF_CORE_CONNECTIONS, the room kept for the core.
+func coreListenerConfig(cfg Config) transport.ListenerConfig {
+	return transport.ListenerConfig{
+		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr,
+		AdvertisedHost: hostOf(cfg.CoreHost), MaxConnections: cfg.CoreConnections,
+	}
+}
+
+// checkListenerLimits checks the listeners pcscf opens against the
+// transport's total (#193): every stream listener has a limit, counted from
+// accept so that connections still in their PROXY header or TLS handshake
+// count, and the limits fit under the total together, so that the client
+// listener at its limit leaves the core listener its room. A UDP listener
+// holds no connections.
+func checkListenerLimits(total int, listeners []transport.ListenerConfig) error {
+	sum := 0
+	for _, l := range listeners {
+		if l.Network == transport.UDP {
+			continue
+		}
+		if l.MaxConnections <= 0 {
+			return fmt.Errorf("pcscf: listener %s has no connection limit", l.Name)
+		}
+		sum += l.MaxConnections
+	}
+	if sum > total {
+		return fmt.Errorf("pcscf: the listeners' connection limits, %d in all, exceed the transport's %d", sum, total)
+	}
+	return nil
+}
+
+// transportMetrics exports the transport's listener gauges and PROXY header
+// counters as EMF metrics (#193): the connections each stream listener holds,
+// to see one near its limit before it refuses, and the PROXY headers that
+// came too late, were malformed, or never started, of which only the
+// malformed say the NLB is misconfigured. last holds the counters as last
+// recorded, since Stats counts from the start.
+type transportMetrics struct{ last transport.Stats }
+
+// record records s, the transport's Stats now.
+func (tm *transportMetrics) record(m *runtime.Metrics, s transport.Stats) {
+	if m == nil {
+		return
+	}
+	for name, n := range s.ListenerConnections {
+		m.Gauge("transport.listener_connections."+name, int64(n))
+	}
+	m.Count("transport.proxy_header_timeouts", int64(s.ProxyHeaderTimeouts-tm.last.ProxyHeaderTimeouts))
+	m.Count("transport.proxy_header_errors", int64(s.ProxyHeaderErrors-tm.last.ProxyHeaderErrors))
+	m.Count("transport.proxy_header_empty", int64(s.ProxyHeaderEmpty-tm.last.ProxyHeaderEmpty))
+	tm.last = s
+}
+
 // clientListenerConfig is the client stream listener: behind the NLB,
 // client-facing, so no kernel keep-alive and no connection to a client's Via
 // (ADR 0003), with the PROXY header required when RCS_PROXY_PROTOCOL is set.
+// It holds at most PCSCF_MAX_CLIENT_FLOWS connections, from accept, so a
+// client still sending its PROXY header or in its TLS handshake takes a
+// client slot, never the core's (#193).
 func clientListenerConfig(cfg Config) transport.ListenerConfig {
 	network := transport.TCP
 	if cfg.ClientTransport == ClientTLS {
@@ -255,7 +320,7 @@ func clientListenerConfig(cfg Config) transport.ListenerConfig {
 		Name: clientListener, Network: network, Addr: cfg.ClientAddr,
 		AdvertisedHost: cfg.PublicHost, AdvertisedPort: cfg.PublicPort,
 		ProxyProtocol: cfg.ProxyProtocol, ClientFacing: true,
-		IdleTimeout: cfg.ClientIdleTimeout,
+		IdleTimeout: cfg.ClientIdleTimeout, MaxConnections: cfg.MaxClientFlows,
 	}
 }
 
