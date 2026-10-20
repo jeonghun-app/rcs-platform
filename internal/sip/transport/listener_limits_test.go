@@ -254,28 +254,48 @@ func TestAConnectionAcceptedAfterCloseIsRefusedAsTheTransports(t *testing.T) {
 	}
 }
 
-// A connection closed before it sends any byte of its PROXY header, as a TCP
-// health check or a port scan does, is counted apart from a malformed or cut
-// header, so that ProxyHeaderErrors still says the NLB is misconfigured
-// (#227 QA).
-func TestAConnectionClosedBeforeItsProxyHeaderIsNotAnError(t *testing.T) {
+// A connection that fails its PROXY header is counted by the bytes it
+// sent: none, closed or reset, as a client or a scanner that gave up does
+// (the NLB's health checks send a LOCAL header, ADR 0003), in
+// ProxyHeaderEmpty; some, however few or many, in ProxyHeaderErrors, which
+// says the NLB is misconfigured (#227 QA, #198 QA).
+func TestAProxyHeaderFailureIsCountedByTheBytesSent(t *testing.T) {
 	server, rec := newTransport(t, Config{})
 	addr := listen(t, server, ListenerConfig{Network: TCP, ProxyProtocol: true, ProxyHeaderTimeout: time.Minute})
-	cut := dialRaw(t, addr)
-	cut.Write(proxySignature[:5])
-	cut.Close()
-	eventually(t, "the cut header to be counted", func() bool {
-		s := server.Stats()
-		return s.ProxyHeaderErrors == 1 && s.PendingAccepted == 0
-	})
-	dialRaw(t, addr).Close()
-	// The slot is given back after the close is counted.
-	eventually(t, "the empty connection to be counted", func() bool {
-		s := server.Stats()
-		return s.ProxyHeaderEmpty == 1 && s.PendingAccepted == 0
-	})
-	if s := server.Stats(); s.ProxyHeaderErrors != 1 || s.ProxyHeaderTimeouts != 0 {
-		t.Fatalf("stats = %+v", s)
+	full := proxyHeaderFor(netip.MustParseAddrPort("192.0.2.10:40000"), netip.MustParseAddrPort("198.51.100.1:5060"), nil)
+	for _, tt := range []struct {
+		name         string
+		send         []byte
+		reset        bool
+		empty, error uint64
+	}{
+		{"nothing", nil, false, 1, 0},
+		{"nothing, reset", nil, true, 1, 0},
+		{"5 bytes", full[:5], false, 0, 1},
+		{"the fixed part alone", full[:16], false, 0, 1},
+		{"the fixed part and 3 more", full[:19], false, 0, 1},
+		{"no signature", []byte("GET / HTTP/1.1\r\n"), false, 0, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := server.Stats()
+			c := dialRaw(t, addr)
+			if len(tt.send) > 0 {
+				c.Write(tt.send)
+			}
+			if tt.reset {
+				c.(*net.TCPConn).SetLinger(0)
+			}
+			c.Close()
+			// The slot is given back after the failure is counted.
+			eventually(t, "the failure to be counted", func() bool {
+				s := server.Stats()
+				return s.ProxyHeaderEmpty+s.ProxyHeaderErrors > before.ProxyHeaderEmpty+before.ProxyHeaderErrors && s.PendingAccepted == 0
+			})
+			s := server.Stats()
+			if s.ProxyHeaderEmpty-before.ProxyHeaderEmpty != tt.empty || s.ProxyHeaderErrors-before.ProxyHeaderErrors != tt.error || s.ProxyHeaderTimeouts != 0 {
+				t.Fatalf("empty +%d, errors +%d, timeouts %d", s.ProxyHeaderEmpty-before.ProxyHeaderEmpty, s.ProxyHeaderErrors-before.ProxyHeaderErrors, s.ProxyHeaderTimeouts)
+			}
+		})
 	}
 	rec.none(t)
 }
