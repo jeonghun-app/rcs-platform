@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -583,6 +584,83 @@ func TestAnInviteThatComesBackIsRefusedAsALoop(t *testing.T) {
 	}
 	if err := r.e.nextFailure(t); err == nil {
 		t.Fatal("no failure")
+	}
+}
+
+// In a session rcs-as started, a timer the client's 2xx sets is kept: the
+// client refreshes (RFC 4028 §9, rcs-as offered no timer), and rcs-as
+// ends a session left unrefreshed.
+func TestATimerTheClientsAnswerSetsIsKept(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			return []*sip.Response{r.answerInvite(t, req, relayPath(), "active", "Session-Expires: 600;refresher=uas", "Require: timer")}
+		}
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	if err := r.a.srv.Invite(t.Context(), invitation()); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.core.nextOf(t, "INVITE")
+	r.core.nextOf(t, "ACK")
+	const expiry = 600*time.Second - 32*time.Second
+	r.clock.waitArmed(t, expiry)
+	r.clock.fire(expiry)
+	if bye := r.core.nextOf(t, "BYE"); bye.Header.Get("Call-ID") != inv.Header.Get("Call-ID") {
+		t.Fatalf("BYE for %q", bye.Header.Get("Call-ID"))
+	}
+}
+
+// A refresh of a session rcs-as started is answered from its offer's o=
+// line: the answer is new, so its version is the next (RFC 3264 §8), and
+// the same refresh again keeps it.
+func TestARefreshOfASessionRCSASStartedTakesTheNextVersion(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	toBob := relayPath()
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			return []*sip.Response{r.answerInvite(t, req, toBob, "active")}
+		}
+		return nil
+	})
+	if err := r.a.srv.Invite(t.Context(), invitation()); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.core.nextOf(t, "INVITE")
+	r.core.nextOf(t, "ACK")
+	offer, err := sdp.Parse(inv.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := strconv.ParseUint(offer.Origin.SessionVersion, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, _ := inv.Header.From()
+	p := r.a.dial(t)
+	for cseq := 1; cseq <= 2; cseq++ {
+		reinvite := msg{method: "INVITE", uri: alice, callID: inv.Header.Get("Call-ID"), cseq: cseq,
+			from: "<" + bob + ">;tag=bob1", to: "<" + alice + ">;tag=" + from.Tag(),
+			body: offerSDP(toBob, "active"), fields: []string{"Content-Type: application/sdp"}}
+		res := p.send(reinvite)
+		if res.StatusCode != 200 {
+			t.Fatalf("re-INVITE %d answered %d", cseq, res.StatusCode)
+		}
+		answer, err := sdp.Parse(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if answer.Origin.SessionID != offer.Origin.SessionID || answer.Origin.SessionVersion != strconv.FormatUint(version+1, 10) {
+			t.Fatalf("re-INVITE %d answered o=%+v after the offer's %+v", cseq, answer.Origin, offer.Origin)
+		}
+		if setup, _ := answer.MediaSetup(0); setup != sdp.SetupPassive {
+			t.Fatalf("answered setup %q", setup)
+		}
+		if _, err := p.try(msg{method: "ACK", uri: alice, callID: inv.Header.Get("Call-ID"), cseq: cseq,
+			from: "<" + bob + ">;tag=bob1", to: "<" + alice + ">;tag=" + from.Tag()}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
