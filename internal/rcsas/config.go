@@ -1,8 +1,7 @@
-// Package rcsas holds what the rcs-as service is configured with: the
-// RCSAS_ settings (docs/rcs-as.md), read into the messaging engine's
-// configuration and the store's. The service binary, which needs the SIP
-// layer, comes later; reading the settings now keeps their names, defaults
-// and production checks in one tested place from the start.
+// Package rcsas is the rcs-as service: the RCSAS_ settings
+// (docs/rcs-as.md), read into the messaging engine's configuration, the
+// store's and the SIP layer's, and Run, which puts the store, the engine
+// and the SIP layer (sipas) together.
 //
 // The prefix is RCSAS_, not RCS_AS_: the runtime reserves RCS_ for the
 // settings every service shares.
@@ -10,13 +9,17 @@ package rcsas
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/sipas"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // EnvPrefix is the prefix of rcs-as's own settings.
@@ -31,16 +34,40 @@ const (
 // Defaults of the settings without a messaging default.
 const (
 	DefaultMSRPListenAddr = ":2855"
-	DefaultTable          = "messages"
-	DefaultGroupsTable    = "groupchats"
+	// DefaultSIPListenAddr is the SIP listener, which only the core reaches
+	// (ADR 0007 §2).
+	DefaultSIPListenAddr = "0.0.0.0:5060"
+	DefaultTable         = "messages"
+	DefaultGroupsTable   = "groupchats"
 )
 
 // Config is rcs-as's configuration.
 type Config struct {
 	// MSRPListenAddr is where msrp-relay connects (ADR 0004).
 	MSRPListenAddr string
-	Store          string
-	DynamoDB       awsstore.Config
+	// SIPListenAddr is the SIP listener (TCP), and SIPHost this task's
+	// address, which its Via and Call-IDs name (ADR 0005).
+	SIPListenAddr string
+	SIPHost       netip.Addr
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN).
+	HomeDomain string
+	// ServiceName is the host of the AS URI the iFC name rcs-as by
+	// (HSS_RCS_AS_URI), which scscf puts on top of the Route of what it
+	// hands rcs-as; empty for none.
+	ServiceName string
+	// Core is where rcs-as sends the requests it originates (scscf), a SIP
+	// URI of a host with transport=tcp and lr, and Namespace the Cloud Map
+	// namespace its names are looked up in (ADR 0007 §5).
+	Core      sip.URI
+	Namespace string
+	// MaxSessions bounds the SIP sessions this task holds, and
+	// MaxOutgoingPerUser those one user opens, and MaxIncomingPerUser those
+	// rcs-as opens to one user (threat model T9).
+	MaxSessions        int
+	MaxOutgoingPerUser int
+	MaxIncomingPerUser int
+	Store              string
+	DynamoDB           awsstore.Config
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
 	// are left for the service to set.
 	Messaging messaging.Config
@@ -95,6 +122,32 @@ func Configure(s *runtime.Settings) Config {
 				KeepAliveInterval: e.Duration("MSRP_KEEPALIVE", msrp.DefaultKeepAliveInterval),
 			},
 		},
+	}
+	c.SIPListenAddr = e.String("SIP_LISTEN_ADDR", DefaultSIPListenAddr)
+	c.MaxSessions = e.Int("MAX_SESSIONS", sipas.DefaultMaxSessions)
+	c.MaxOutgoingPerUser = e.Int("MAX_OUTGOING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
+	positive(e, "MAX_SESSIONS", c.MaxSessions)
+	positive(e, "MAX_OUTGOING_SESSIONS_PER_USER", c.MaxOutgoingPerUser)
+	c.MaxIncomingPerUser = e.Int("MAX_INCOMING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
+	positive(e, "MAX_INCOMING_SESSIONS_PER_USER", c.MaxIncomingPerUser)
+	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
+		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
+	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+		// Not 0 either: scscf reaches rcs-as on the port the HSS's AS URI
+		// names, which a port chosen at start would not be.
+		e.Invalid("SIP_LISTEN_ADDR", "needs a port")
+	}
+	c.SIPHost = runtime.InstanceAddr(e, "SIP_HOST", interfaceAddrs)
+	c.HomeDomain = s.Shared.RequiredString("IMS_DOMAIN")
+	c.Namespace = s.ServiceNamespace()
+	c.Core = coreURI(s)
+	service := ""
+	if c.Namespace != "" {
+		service = "rcs-as." + c.Namespace
+	}
+	c.ServiceName = e.String("SERVICE_NAME", service)
+	if u, err := sip.ParseURI("sip:" + c.ServiceName); c.ServiceName != "" && (err != nil || u.User != "" || u.Port != 0 || len(u.Params) > 0 || u.Host != c.ServiceName) {
+		e.Invalid("SERVICE_NAME", "not a host name")
 	}
 	if _, port, err := net.SplitHostPort(c.MSRPListenAddr); err != nil {
 		e.Invalid("MSRP_LISTEN_ADDR", "not host:port")
@@ -194,6 +247,43 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("GROUP_ADD_BURST", "smaller than a full group's invitees (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
 	}
 	return c
+}
+
+// interfaceAddrs lists this host's addresses; tests replace it.
+var interfaceAddrs = net.InterfaceAddrs
+
+// coreURI reads RCSAS_CORE_URI, or makes scscf's Cloud Map name in
+// RCS_SERVICE_NAMESPACE: where rcs-as sends the requests it originates,
+// as their first Route.
+func coreURI(s *runtime.Settings) sip.URI {
+	e := s.Env
+	v := e.String("CORE_URI", "")
+	if v == "" {
+		ns := s.ServiceNamespace()
+		if ns == "" {
+			e.Invalid("CORE_URI", "required when RCS_SERVICE_NAMESPACE is unset")
+			return sip.URI{}
+		}
+		v = "sip:scscf." + ns + ";transport=tcp;lr"
+	}
+	u, err := sip.ParseURI(v)
+	network, _ := u.Param("transport")
+	if err != nil || u.Scheme != "sip" || u.User != "" || !u.Params.Has("lr") || !strings.EqualFold(network, "tcp") {
+		e.Invalid("CORE_URI", "not a sip URI of a host with transport=tcp and lr")
+		return sip.URI{}
+	}
+	host := strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]")
+	a, err := netip.ParseAddr(host)
+	switch {
+	case err != nil && !runtime.InServiceNamespace(host, s.ServiceNamespace()):
+		e.Invalid("CORE_URI", "a host name outside RCS_SERVICE_NAMESPACE, which rcs-as does not look up (ADR 0007 §5)")
+		return sip.URI{}
+	case err == nil && !runtime.IsPrivateAddr(a.Unmap()) && !a.Unmap().IsLoopback():
+		// The resolver would refuse it at every send (sipas.Resolver).
+		e.Invalid("CORE_URI", "an address that is neither private nor loopback (ADR 0007 §5)")
+		return sip.URI{}
+	}
+	return u
 }
 
 // readRate reads <prefix>RATE and <prefix>BURST; a rate of 0 turns the

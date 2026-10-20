@@ -140,9 +140,14 @@ rule comes from. A request the HSS cannot serve because the store or the keyring
 fails is answered `DIAMETER_UNABLE_TO_COMPLY`, as the procedures say, and counted
 (`cx.<command>.error`): every task shares the store, so another task would fail
 too. A request that waited past `HSS_CX_TIMEOUT` for its subscriber's lock in
-this task, because another request for that subscriber (or one sharing its lock
-stripe) is slow, is answered `DIAMETER_TOO_BUSY` and counted (`lock.busy`): the
-condition is local to the task, and the S-CSCF may retry on another one.
+this task, because another request for that subscriber is slow, is answered
+`DIAMETER_TOO_BUSY` and counted (`lock.busy`): the condition is local to the
+task, and the S-CSCF may retry on another one. Each subscriber has a lock of
+its own, so no other subscriber waits for it. A
+write that keeps losing to another task's writes of the same subscriber, as
+two tasks' MARs for one user do, is retried until `HSS_CX_TIMEOUT` (each lost
+write counted, `store.conflict`) and then answered `DIAMETER_UNABLE_TO_COMPLY`,
+logged as contention rather than a store failure (#200).
 
 | Request | Behaviour |
 |---|---|
@@ -200,7 +205,7 @@ participating function and store messages for users who are offline
 
 | Priority | Trigger | Default handling |
 |---|---|---|
-| 10 | INVITE with an OMA CPM ICSI or RCS IARI in `Accept-Contact`/`Contact`, or a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service` | SESSION_TERMINATED |
+| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, or a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service` | SESSION_TERMINATED |
 | 20 | MESSAGE | SESSION_TERMINATED |
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
@@ -218,14 +223,22 @@ core SIP ports.
 Chat and messaging fail rather than bypass `rcs-as`, which anchors MSRP and keeps
 IMDN and store-and-forward; capability discovery and registration continue while it
 is down. Each service condition is its own trigger, with one header name and one
-literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.` or
-`3gpp-application\.ims\.iari\.rcs\.`), the ICSI and IARI text after `urn-7`,
-which is the same in percent-encoded feature tags and in the plain service headers.
+literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.`,
+`3gpp-application\.ims\.iari\.rcs\.` or `\+g\.oma\.sip-im`), the ICSI and IARI
+text after `urn-7`, which is the same in percent-encoded feature tags and in the
+plain service headers, or the OMA SIMPLE IM tag, with which rcsjta asks for a chat.
 The profile is created at start if missing; an operator's changes to it are kept.
-So a profile created before the `P-Served-User` check (#137) keeps its old
-triggers until an operator updates it through the API. No deployment had one.
+So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
+(#137) keeps its old triggers until an operator updates it through the API. No
+deployment had one.
 
 ### Writing iFC
+
+Every trigger that sends requests to `rcs-as` needs the condition that the
+request has no `P-Served-User`, in a group of its own, as in the default
+profile. Without it, the requests `rcs-as` sends for its users come back to it:
+`rcs-as` refuses them with 482 and counts `sip.loop`, and those users' messages
+are not delivered.
 
 Criteria are JSON in the provisioning API (field names follow the TS 29.228 XML
 schema). Patterns are POSIX extended regular expressions (TS 29.228 Annex F). A
