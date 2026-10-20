@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	mathrand "math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
@@ -85,23 +85,28 @@ type HSS struct {
 	rand        io.Reader
 	log         *slog.Logger
 	metrics     Metrics
-	// locks are semaphores of one, so a writer waits for a subscription
-	// only as long as its context allows.
-	locks [lockStripes]chan struct{}
+	// locks has a semaphore of one per subscription that a request holds
+	// or waits for, so that a writer waits for its subscription only as
+	// long as its context allows, and never for another's. An entry goes
+	// when the last request lets go of it.
+	locksMu sync.Mutex
+	locks   map[string]*subscriptionLock
 	// onLockWait, if set, runs when a request starts waiting for a lock
 	// another holds: a test hook.
 	onLockWait func()
 }
 
-// lockStripes is the number of subscriber locks of a task. A slow write
-// holds up the subscribers sharing its stripe, so there are enough that a
-// stalled one delays few others.
-const lockStripes = 256
+// subscriptionLock is one subscription's lock and the requests that hold it
+// or wait for it.
+type subscriptionLock struct {
+	sem  chan struct{}
+	refs int
+}
 
 // errBusy means a subscription's lock in this task was not free before the
-// request's deadline: another request for it, or for a subscriber sharing
-// its stripe, is slow. It is local to this task, so Cx answers it with
-// DIAMETER_TOO_BUSY and the client may try another HSS task.
+// request's deadline: another request for it is slow. It is local to this
+// task, so Cx answers it with DIAMETER_TOO_BUSY and the client may try
+// another HSS task.
 var errBusy = errors.New("hss: subscription is busy in this task")
 
 // New returns an HSS.
@@ -123,9 +128,7 @@ func New(o Options) (*HSS, error) {
 	if h.metrics == nil {
 		h.metrics = noMetrics{}
 	}
-	for i := range h.locks {
-		h.locks[i] = make(chan struct{}, 1)
-	}
+	h.locks = map[string]*subscriptionLock{}
 	return h, nil
 }
 
@@ -140,21 +143,38 @@ func (h *HSS) lock(ctx context.Context, impi string) (unlock func(), err error) 
 // acquire is lock, and reports whether the lock was held by another request
 // when asked for.
 func (h *HSS) acquire(ctx context.Context, impi string) (unlock func(), waited bool, err error) {
-	f := fnv.New32a()
-	_, _ = io.WriteString(f, impi)
-	sem := h.locks[f.Sum32()%lockStripes]
+	h.locksMu.Lock()
+	l := h.locks[impi]
+	if l == nil {
+		l = &subscriptionLock{sem: make(chan struct{}, 1)}
+		h.locks[impi] = l
+	}
+	l.refs++
+	h.locksMu.Unlock()
+	done := func() {
+		h.locksMu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(h.locks, impi)
+		}
+		h.locksMu.Unlock()
+	}
+	unlock = func() {
+		<-l.sem
+		done()
+	}
 	select {
-	case sem <- struct{}{}: // free: taken whatever the context's state
-		return func() { <-sem }, false, nil
+	case l.sem <- struct{}{}: // free: taken whatever the context's state
+		return unlock, false, nil
 	default:
 	}
 	if h.onLockWait != nil {
 		h.onLockWait()
 	}
 	select {
-	case sem <- struct{}{}:
-		return func() { <-sem }, true, nil
+	case l.sem <- struct{}{}:
+		return unlock, true, nil
 	case <-ctx.Done():
+		done()
 		h.metrics.Count("lock.busy", 1)
 		return nil, true, errBusy
 	}
@@ -174,16 +194,21 @@ func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscrip
 // If read is stale the conditional write fails and the next attempt reads.
 // A read taken before waiting for the lock is most likely stale, as the
 // request that held it most likely wrote the subscription, so it is dropped:
-// kept, it cost every queued request a failed write (#200). The lock is per
-// stripe (lockStripes), so one that waited behind another subscriber, or
-// behind a holder that wrote nothing, pays one read more.
+// kept, it cost every queued request a failed write (#200).
 //
-// The retries run until ctx's deadline, at most maxRacedAttempts: see there.
-// The lock is let go between them, so that the other subscribers of its
-// stripe, and the subscriber's other requests in this task, are not held up
-// for the whole of a contended request's deadline; each attempt takes it
-// again and reads afresh.
+// The lock is the subscription's own and is held through the retries, which
+// run until ctx's deadline, at most maxRacedAttempts (see there): the
+// subscription's other requests in this task wait, as they must for their
+// writes, and no other subscription's do.
 func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
+	unlock, waited, err := h.acquire(ctx, impi)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if waited {
+		read = nil
+	}
 	for attempt := 0; attempt < maxRacedAttempts; attempt++ {
 		if attempt > 0 {
 			h.metrics.Count("store.conflict", 1)
@@ -203,9 +228,6 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 		case attempt > 0 && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)):
 			// The deadline ended an attempt after a lost one: still
 			// contention, though DynamoDB reported it as a context error.
-			// errBusy, a wait for the lock that ran out, is not: it is local
-			// to this task, and Cx answers it DIAMETER_TOO_BUSY so that the
-			// S-CSCF tries another (busy).
 			return nil, contended(ctx)
 		}
 		return saved, err
@@ -213,17 +235,12 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 	return nil, errContention
 }
 
-// attempt is one try of updateFrom under the lock: read, unless read is
-// given and the lock was free, apply fn and write. It returns
-// store.ErrConflict when another writer was first.
+// attempt is one try of updateFrom: read, unless read is given, apply fn
+// and write. It returns store.ErrConflict when another writer was first.
 func (h *HSS) attempt(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
-	unlock, waited, err := h.acquire(ctx, impi)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
 	cur := read
-	if cur == nil || waited {
+	if cur == nil {
+		var err error
 		if cur, err = h.store.Subscription(ctx, impi); err != nil {
 			return nil, err
 		}

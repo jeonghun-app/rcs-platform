@@ -140,9 +140,10 @@ rule comes from. A request the HSS cannot serve because the store or the keyring
 fails is answered `DIAMETER_UNABLE_TO_COMPLY`, as the procedures say, and counted
 (`cx.<command>.error`): every task shares the store, so another task would fail
 too. A request that waited past `HSS_CX_TIMEOUT` for its subscriber's lock in
-this task, because another request for that subscriber (or one sharing its lock
-stripe) is slow, is answered `DIAMETER_TOO_BUSY` and counted (`lock.busy`): the
-condition is local to the task, and the S-CSCF may retry on another one. A
+this task, because another request for that subscriber is slow, is answered
+`DIAMETER_TOO_BUSY` and counted (`lock.busy`): the condition is local to the
+task, and the S-CSCF may retry on another one. Each subscriber has a lock of
+its own, so no other subscriber waits for it. A
 write that keeps losing to another task's writes of the same subscriber, as
 two tasks' MARs for one user do, is retried until `HSS_CX_TIMEOUT` (each lost
 write counted, `store.conflict`) and then answered `DIAMETER_UNABLE_TO_COMPLY`,

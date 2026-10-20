@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -221,31 +219,14 @@ func (l *losingFor) UpdateSubscription(ctx context.Context, old, s *store.Subscr
 	return l.Store.UpdateSubscription(ctx, old, s)
 }
 
-// sameStripe is an IMPI whose lock is impi's.
-func sameStripe(t *testing.T, impi string) string {
-	stripe := func(s string) uint32 {
-		f := fnv.New32a()
-		_, _ = io.WriteString(f, s)
-		return f.Sum32() % lockStripes
-	}
-	for i := range 100000 {
-		if other := fmt.Sprintf("neighbour-%d@%s", i, domain); stripe(other) == stripe(impi) {
-			return other
-		}
-	}
-	t.Fatal("no IMPI shares the stripe")
-	return ""
-}
-
-// TestAContendedSubscriberDoesNotHoldItsStripeThroughItsRetries: the lock is
-// let go between attempts, so another subscriber of the same stripe gets it
-// at once, not after the contended request's whole deadline (QA's minor 3 on
-// #244).
-func TestAContendedSubscriberDoesNotHoldItsStripeThroughItsRetries(t *testing.T) {
+// TestTwoSubscriptionsNeverWaitOnEachOther: each subscription has a lock
+// of its own, so a request that holds one through a contended update's
+// retries holds up no other subscription (QA's minor 3 on #244).
+func TestTwoSubscriptionsNeverWaitOnEachOther(t *testing.T) {
 	lf := &losingFor{Store: store.NewMemory(), impi: impi1, lost: make(chan struct{})}
 	e := newEnvWith(t, lf)
 	e.provision(impi1, impu1)
-	neighbour := sameStripe(t, impi1)
+	e.provision(impi2, impu2)
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	done := make(chan error, 1)
@@ -255,16 +236,41 @@ func TestAContendedSubscriberDoesNotHoldItsStripeThroughItsRetries(t *testing.T)
 	}()
 	<-lf.lost
 	start := time.Now()
-	unlock, err := e.h.lock(ctx, neighbour)
-	if err != nil {
-		t.Fatalf("the neighbour did not get the lock: %v", err)
+	short, cancelShort := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelShort()
+	if _, err := e.h.update(short, impi2, func(s *store.Subscription) error { s.AuthPending = true; return nil }); err != nil {
+		t.Fatalf("the other subscription's update: %v", err)
 	}
-	unlock()
-	if took := time.Since(start); took > 500*time.Millisecond {
-		t.Errorf("the neighbour waited %v for the stripe", took)
+	if took := time.Since(start); took > 150*time.Millisecond {
+		t.Errorf("the other subscription waited %v", took)
 	}
 	if err := <-done; !errors.Is(err, errContention) {
 		t.Errorf("the contended update: %v", err)
+	}
+}
+
+// TestALockGoesWhenNoRequestHoldsIt: the locks of a task are as many as the
+// subscriptions being written, not every subscription ever written.
+func TestALockGoesWhenNoRequestHoldsIt(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	unlock, err := e.h.lock(context.Background(), impi1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := e.h.lock(short, impi1); !errors.Is(err, errBusy) {
+		t.Fatalf("a held lock: %v", err)
+	}
+	unlock()
+	if _, err := e.h.update(context.Background(), impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	e.h.locksMu.Lock()
+	defer e.h.locksMu.Unlock()
+	if len(e.h.locks) != 0 {
+		t.Errorf("%d locks left with no request", len(e.h.locks))
 	}
 }
 
@@ -353,57 +359,6 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	}
 }
 
-// holdingStore loses its first write and, before answering, has another
-// request of the task wait for the subscriber's lock, which it then holds
-// for good.
-type holdingStore struct {
-	store.Store
-	h       *HSS
-	once    sync.Once
-	waiting chan struct{}
-}
-
-func (s *holdingStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
-	lost := false
-	s.once.Do(func() {
-		lost = true
-		go func() {
-			if _, err := s.h.lock(context.Background(), n.IMPI); err != nil {
-				panic(err)
-			}
-		}()
-		<-s.waiting
-	})
-	if lost {
-		return nil, store.ErrConflict
-	}
-	return s.Store.UpdateSubscription(ctx, old, n)
-}
-
-// TestARetryThatCannotGetTheLockIsTooBusy: a MAR whose write lost, and whose
-// retry then finds the lock held by another request of the task until the Cx
-// timeout, is answered DIAMETER_TOO_BUSY, which the S-CSCF retries on another
-// task, and not counted as an error (#244 review). Only a context error after
-// a lost write is contention.
-func TestARetryThatCannotGetTheLockIsTooBusy(t *testing.T) {
-	e := newEnv(t)
-	e.provision(impi1, impu1)
-	hs := &holdingStore{Store: e.store, waiting: make(chan struct{}, 4)}
-	h := e.newHSS(func(o *Options) { o.Store = hs })
-	hs.h = h
-	h.onLockWait = func() { hs.waiting <- struct{}{} }
-	c := connectCSCF(t, serveHSSWith(t, h, "hss-a.rcs.local", 300*time.Millisecond), "scscf-1.rcs.local")
-	r := &cx.MAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentity: impu1,
-		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5}, NumberAuthItems: 1, ServerName: scscfName}
-	ans := c.send(r.Message(c.node))
-	if rc, _ := ans.ResultCode(); rc != diameter.ResultTooBusy {
-		t.Fatalf("Result-Code = %d, want DIAMETER_TOO_BUSY", rc)
-	}
-	if e.metrics.get("cx.mar.error") != 0 {
-		t.Error("a busy lock was counted as a Cx error")
-	}
-}
-
 // stallingStore loses its first write and blocks the next one until the
 // context ends, then fails as DynamoDB does, with the context's error
 // wrapped.
@@ -437,5 +392,70 @@ func TestAWriteTheDeadlineCutsShortAfterALossIsContention(t *testing.T) {
 	_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
 	if !errors.Is(err, errContention) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("update = %v, want contention at the deadline", err)
+	}
+}
+
+// qaInflight loses the first write, then behaves like DynamoDB on a slow
+// call: the next write is still in flight at the deadline and fails with the
+// SDK's wrapped context error (mode "deadline"), or fails at once with a
+// store error unrelated to the deadline (mode "outage"). From QA on #244.
+type qaInflight struct {
+	store.Store
+	mode string
+	mu   sync.Mutex
+	arm  bool
+	n    int
+}
+
+func (q *qaInflight) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	q.mu.Lock()
+	arm := q.arm
+	q.n++
+	n := q.n
+	q.mu.Unlock()
+	if !arm {
+		return q.Store.UpdateSubscription(ctx, old, s)
+	}
+	if n == 1 {
+		return nil, store.ErrConflict
+	}
+	if q.mode == "outage" {
+		return nil, errors.New("operation error DynamoDB: PutItem, https response error StatusCode: 500, InternalServerError")
+	}
+	<-ctx.Done()
+	return nil, fmt.Errorf("operation error DynamoDB: PutItem, %w", ctx.Err())
+}
+
+func inflightAPI(t *testing.T, mode string) *apiEnv {
+	q := &qaInflight{Store: store.NewMemory(), mode: mode}
+	e := newEnvWith(t, q)
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
+		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		DefaultProfile: DefaultProfileID, StoreTimeout: 500 * time.Millisecond,
+	})}
+	a.create(impi1, true, impu1)
+	q.mu.Lock()
+	q.arm, q.n = true, 0
+	q.mu.Unlock()
+	return a
+}
+
+// TestAWriteCutOffInFlightAfterALostOneIsBusy: contention, not a store
+// failure (QA on #244).
+func TestAWriteCutOffInFlightAfterALostOneIsBusy(t *testing.T) {
+	a := inflightAPI(t, "deadline")
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscription is busy; retry" || a.metrics.get("api.store_failure") != 0 {
+		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
+	}
+}
+
+// TestAStoreOutageAfterALostWriteIsAStoreFailure: only a context error is
+// contention; a store that fails is still one (QA on #244).
+func TestAStoreOutageAfterALostWriteIsAStoreFailure(t *testing.T) {
+	a := inflightAPI(t, "outage")
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscriber store is unavailable; retry" || a.metrics.get("api.store_failure") != 1 {
+		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
 	}
 }

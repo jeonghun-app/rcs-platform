@@ -248,7 +248,10 @@ func nodeConfig(t *testing.T, host string, dial func(context.Context, string, st
 		Dictionary:         dict,
 		Accept:             []diameter.PeerRule{{Realm: domain}},
 		Dial:               dial,
-		Logger:             slog.New(slog.DiscardHandler),
+		// Above every server timeout in the tests, so that a client's wait
+		// never ends with the server's (cscf.send).
+		RequestTimeout: 2 * realWait,
+		Logger:         slog.New(slog.DiscardHandler),
 	}
 }
 
