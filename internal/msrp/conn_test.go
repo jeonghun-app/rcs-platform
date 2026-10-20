@@ -1185,3 +1185,15 @@ func TestKeepAlivesStartWhenTheBindingSendIsAnswered(t *testing.T) {
 		t.Fatalf("keep-alive %+v", ka)
 	}
 }
+
+func TestABoundPassiveSessionSendsKeepAlives(t *testing.T) {
+	// QA on #217: the passive side, the relay toward clients and rcs-as,
+	// starts its keep-alives at the bind (ADR 0003).
+	clock := newFakeClock()
+	_, p := boundPassive(t, newRecorder(), Config{Clock: clock, KeepAliveInterval: time.Second})
+	clock.Advance(time.Second)
+	ka := p.next(t)
+	if ka.Method != MethodSend || ka.HasBody() || *ka.ByteRange != (ByteRange{1, 0, 0}) || ka.FromPath[0].String() != asURI {
+		t.Fatalf("keep-alive %+v", ka)
+	}
+}
