@@ -16,7 +16,8 @@
 // against the schema and §5.1: the required attributes, the enumerations,
 // the expires a shortened contact needs and the retry-after a contact on
 // probation needs, and ids unique where a subscriber keys its tables on
-// them (§5.2).
+// them (§5.2). ByAOR and ByURI find a subscriber's identity and contact
+// in a document by URI comparison, never by text.
 package reginfo
 
 import (
@@ -315,6 +316,39 @@ func (c Contact) validate() error {
 		}
 	}
 	return nil
+}
+
+// ByAOR is the registrations whose address-of-record is aor, compared as
+// URIs (RFC 3261 §19.1.4, RFC 3966 §4) since a notifier may write the same
+// identity with other escaping, case or parameters than the subscriber
+// knows it by.
+func (r *Info) ByAOR(aor sip.URI) []Registration {
+	var out []Registration
+	for _, reg := range r.Registrations {
+		if equalURI(reg.AOR, aor) {
+			out = append(out, reg)
+		}
+	}
+	return out
+}
+
+// ByURI is the contacts of reg at uri, compared as ByAOR compares. There
+// may be more than one: a contact URI can be bound once per flow (RFC 5626
+// §6), the bindings told apart by their parameters.
+func (reg Registration) ByURI(uri sip.URI) []Contact {
+	var out []Contact
+	for _, c := range reg.Contacts {
+		if equalURI(c.URI, uri) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// equalURI reports whether the URI text s is u.
+func equalURI(s string, u sip.URI) bool {
+	v, err := sip.ParseURI(s)
+	return err == nil && v.Equal(u)
 }
 
 // validURI reports whether s is a SIP, SIPS or tel URI, which is what a

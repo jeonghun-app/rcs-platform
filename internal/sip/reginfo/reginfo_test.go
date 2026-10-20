@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 const (
@@ -125,6 +127,10 @@ func TestDocumentsOutsideRFC3680AreRefused(t *testing.T) {
 		"a repeated attribute":    `<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" version="2" state="full"/>`,
 		"two roots":               doc("") + doc(""),
 		"text outside":            doc("") + "x",
+		"a NUL after the root":    doc("") + "\x00",
+		"a tag cut short after":   doc("") + "<",
+		"another element after":   doc("") + "<reginfo/>",
+		"a DOCTYPE after":         doc("") + "<!DOCTYPE r>",
 		"syntax":                  doc("<registration"),
 		"too large":               doc(strings.Repeat(" ", MaxDocumentSize)),
 		"too deep":                doc(reg(strings.Repeat("<x:a xmlns:x='urn:x'>", maxDepth) + strings.Repeat("</x:a>", maxDepth))),
@@ -134,6 +140,10 @@ func TestDocumentsOutsideRFC3680AreRefused(t *testing.T) {
 		if _, err := Parse([]byte(text)); !errors.Is(err, ErrMalformed) && !errors.Is(err, ErrDTD) && !errors.Is(err, ErrTooLarge) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	// XML allows comments and white space after the root (XML 1.0 §2.1).
+	if _, err := Parse([]byte(doc("") + "\n<!-- end -->\n")); err != nil {
+		t.Errorf("a comment after the root: %v", err)
 	}
 	if _, err := Parse([]byte(doc(manyRegistrations(maxRegistrations)))); err != nil {
 		t.Errorf("at the limit of registrations: %v", err)
@@ -194,6 +204,62 @@ func TestMarshalRefusesWhatParseWould(t *testing.T) {
 	} {
 		if _, err := info.Marshal(); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func uri(t *testing.T, s string) sip.URI {
+	t.Helper()
+	u, err := sip.ParseURI(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+// A subscriber finds its identity and its contact as URIs, not as text
+// (RFC 3261 §19.1.4, RFC 3966 §4): the case of the host, an escaped user
+// part, a parameter one side lacks or a tel URI's separators do not hide
+// them, and a different transport or port does. Every contact at the URI
+// is returned, since one contact URI may be bound more than once (RFC
+// 5626 §6).
+func TestASubscriberFindsItsRegistrationAndContactAsURIs(t *testing.T) {
+	info := &Info{State: Full, Registrations: []Registration{
+		{AOR: alice, ID: "a", State: Active, Contacts: []Contact{
+			{ID: "c1", State: ContactActive, Event: Registered, URI: contact},
+			{ID: "c2", State: ContactTerminated, Event: Deactivated, URI: "sip:alice@192.0.2.10:40000;transport=TCP;reg-id=2"},
+			{ID: "c3", State: ContactActive, Event: Registered, URI: "sip:alice@192.0.2.10:40001;transport=tcp"},
+		}},
+		{AOR: aliceTel, ID: "t", State: Terminated},
+	}}
+	for _, aor := range []string{
+		"sip:+%3155501000%301@IMS.mnc001.mcc001.3gppnetwork.org",
+		"sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org;x=1",
+	} {
+		if got := info.ByAOR(uri(t, aor)); len(got) != 1 || got[0].ID != "a" {
+			t.Errorf("%s: %+v", aor, got)
+		}
+	}
+	if got := info.ByAOR(uri(t, "tel:+1-555-010-0001")); len(got) != 1 || got[0].ID != "t" {
+		t.Errorf("tel: %+v", got)
+	}
+	for _, other := range []string{"sip:+15550100002@ims.mnc001.mcc001.3gppnetwork.org", "sips:+15550100001@ims.mnc001.mcc001.3gppnetwork.org", "tel:+15550100002"} {
+		if got := info.ByAOR(uri(t, other)); len(got) != 0 {
+			t.Errorf("%s: %+v", other, got)
+		}
+	}
+
+	reg := info.Registrations[0]
+	var ids []string
+	for _, c := range reg.ByURI(uri(t, "sip:alice@192.0.2.10:40000;transport=tcp")) {
+		ids = append(ids, c.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"c1", "c2"}) {
+		t.Errorf("contacts %q", ids)
+	}
+	for _, other := range []string{"sip:alice@192.0.2.10:40000;transport=tls", "sip:alice@192.0.2.10:40002;transport=tcp", "sip:Alice@192.0.2.10:40000;transport=tcp"} {
+		if got := reg.ByURI(uri(t, other)); len(got) != 0 {
+			t.Errorf("%s: %+v", other, got)
 		}
 	}
 }
