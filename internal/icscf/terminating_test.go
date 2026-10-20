@@ -27,15 +27,18 @@ func TestTerminatingAnswersFollowTheMappingTable(t *testing.T) {
 		metric string
 	}{
 		// §5.3.2.1: the Server-Name becomes the topmost Route, with lr.
-		{"registered", lia(base(diameter.ResultSuccess), "sip:scscf-0.rcs.local", nil), nil, via("sip:scscf-0.rcs.local;lr"), "icscf.terminating.forwarded"},
-		{"name already with lr", lia(base(diameter.ResultSuccess), "sip:scscf-0.rcs.local;lr", nil), nil, via("sip:scscf-0.rcs.local;lr"), "icscf.terminating.forwarded"},
-		{"unregistered service with a name", lia(experimental(cx.UnregisteredService), "sip:scscf-0.rcs.local", nil), nil, via("sip:scscf-0.rcs.local;lr"), "icscf.terminating.forwarded"},
-		{"server name not stored", lia(experimental(cx.SuccessServerNameNotStored), "sip:scscf-0.rcs.local", nil), nil, via("sip:scscf-0.rcs.local;lr"), "icscf.terminating.forwarded"},
+		{"registered", lia(base(diameter.ResultSuccess), "sip:scscf-0.rcs.local", nil), nil, via(scscf0 + ";lr"), "icscf.terminating.forwarded"},
+		{"name with lr", lia(base(diameter.ResultSuccess), "sip:scscf-0.rcs.local;lr", nil), nil, via(scscf0 + ";lr"), "icscf.terminating.forwarded"},
+		{"unregistered service with a name", lia(experimental(cx.UnregisteredService), "sip:scscf-0.rcs.local", nil), nil, via(scscf0 + ";lr"), "icscf.terminating.forwarded"},
+		{"server name not stored", lia(experimental(cx.SuccessServerNameNotStored), "sip:scscf-0.rcs.local", nil), nil, via(scscf0 + ";lr"), "icscf.terminating.forwarded"},
+		// Review of #274: a name no configured S-CSCF matches is never
+		// routed as written.
+		{"a name not configured", lia(base(diameter.ResultSuccess), "sip:scscf-9.rcs.local", nil), nil, outcome{status: 500, retryAfter: "10"}, "icscf.scscf.unknown_name"},
 		// §5.3.2.1: chosen by capability.
 		{"unregistered service with capabilities", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, via("sip:scscf-b.rcs.local;transport=tcp;lr"), "icscf.terminating.forwarded"},
 		{"unregistered service, any S-CSCF", lia(experimental(cx.UnregisteredService), "", nil), nil, via(scscfURI + ";lr"), "icscf.terminating.forwarded"},
 		// TS 29.228 §6.7.
-		{"a name inside the capabilities", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}, ServerNames: []string{"sip:scscf-0.rcs.local"}}), nil, via("sip:scscf-0.rcs.local;lr"), "icscf.terminating.forwarded"},
+		{"a name inside the capabilities", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}, ServerNames: []string{"sip:scscf-0.rcs.local"}}), nil, via(scscf0 + ";lr"), "icscf.terminating.forwarded"},
 		// TS 24.229 names no response for this; decided on #274.
 		{"no S-CSCF qualifies", lia(experimental(cx.UnregisteredService), "", &cx.ServerCapabilities{Mandatory: []uint32{9}}), nil, outcome{status: 480}, "icscf.scscf.no_capable"},
 		// §5.3.2.1, §5.3.2.2.

@@ -41,14 +41,16 @@
 // an S-CSCF that is not a SIP URI. "Negatives" are the other answers.
 //
 //	request      HSS answer                                SIP                       clause
-//	REGISTER     success, Server-Name (or one in the caps) forward, R-URI = name     TS 24.229 §5.3.1.2, TS 29.228 §6.7
+//	REGISTER     success, Server-Name (or one in the caps) forward, R-URI = its URI  TS 24.229 §5.3.1.2, TS 29.228 §6.7
+//	REGISTER     success, a name no S-CSCF configured      500 + Retry-After         decided on #274
 //	REGISTER     success, capabilities or none             forward, R-URI = chosen   §5.3.1.2
 //	REGISTER     success, no S-CSCF has the mandatory ones 600                       §5.3.1.3
 //	REGISTER     5001, 5002, 5003, 5004, other negatives   403                       §5.3.1.3
 //	REGISTER     could not be completed                    480 + Retry-After         §5.3.1.3
 //	REGISTER     (S-CSCF silent for RegisterTimeout)       504                       §5.3.1.3
 //	REGISTER     (To is not an IMPU, or a bad username)    403, no UAR               local choice: the HSS would answer 5001
-//	terminating  success, Server-Name (or one in the caps) forward, Route = name     §5.3.2.1, TS 29.228 §6.7
+//	terminating  success, Server-Name (or one in the caps) forward, Route = its URI   §5.3.2.1, TS 29.228 §6.7
+//	terminating  success, a name no S-CSCF configured      500 + Retry-After         decided on #274
 //	terminating  success, capabilities or none             forward, Route = chosen   §5.3.2.1
 //	terminating  success, no S-CSCF has the mandatory ones 480, counted              decided on #274
 //	terminating  (the S-CSCF cannot be reached)            500 + Retry-After         decided on #274
@@ -66,7 +68,11 @@
 // (TS 29.228 §6.7), and the first configured one is chosen. Server-Name
 // values inside Server-Capabilities are the operator steering the choice:
 // §6.7 has the capabilities disregarded then, and the first name is used as
-// a Server-Name would be. Retry-After is Config.RetryAfter, also on the 500
+// a Server-Name would be. A name is matched to Config.SCSCFs by scheme, host
+// (any case) and its port if it has one, and the configured URI is used,
+// with its transport: the HSS stores names as sip:scscf.<namespace>, which
+// routed as written would leave over UDP. A name nothing configured matches
+// is never routed; it is answered 500 with Retry-After. Retry-After is Config.RetryAfter, also on the 500
 // the proxy ends a terminating request in when it cannot send it to the
 // S-CSCF: the S-CSCF the user needs exists and will be back, unlike one no
 // configured S-CSCF can stand for. It is a 500 and not a 503 because the
@@ -109,6 +115,8 @@
 //	icscf.hss.unavailable       HSS queries that could not be completed
 //	icscf.hss.bad_server_name   answers naming an S-CSCF that is not a SIP
 //	                            URI
+//	icscf.scscf.unknown_name    answers naming an S-CSCF no configured one
+//	                            matches: a configuration problem
 //	icscf.scscf.no_capable      answers whose capabilities no configured
 //	                            S-CSCF has (600 or 480): a provisioning
 //	                            problem, to alarm on

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -109,6 +110,8 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	switch {
 	case errors.Is(err, errBadServerName):
 		return r.hssUnavailable(kindRegister, m)
+	case errors.Is(err, errUnknownName):
+		return r.withRetryAfter(kindRegister, m, 500)
 	case err != nil:
 		r.metrics.Count("icscf.scscf.no_capable", 1)
 		return r.reject(kindRegister, 600) // §5.3.1.3
@@ -152,6 +155,8 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 	switch {
 	case errors.Is(err, errBadServerName):
 		return r.hssUnavailable(kindTerminating, m)
+	case errors.Is(err, errUnknownName):
+		return r.withRetryAfter(kindTerminating, m, 500)
 	case err != nil:
 		// TS 24.229 names no response for a terminating request no
 		// configured S-CSCF can take. It is a provisioning problem, so
@@ -217,12 +222,18 @@ func couldNotComplete(r cx.Result) bool {
 var (
 	errBadServerName = errors.New("icscf: the HSS named an S-CSCF that is not a SIP URI")
 	errNoSCSCF       = errors.New("icscf: no configured S-CSCF has the mandatory capabilities")
+	errUnknownName   = errors.New("icscf: the HSS named an S-CSCF that is not configured")
 )
 
 // scscf is the S-CSCF a successful UAA or LIA names, or else the first one
 // its capabilities allow (rank). Server-Name values inside the capabilities
 // are the operator steering the choice, and TS 29.228 §6.7 has the I-CSCF
 // then disregard the capabilities: the first of them is taken as a name.
+//
+// A name is the configured S-CSCF it matches (configured), never the name
+// as written: the HSS stores names as sip:scscf.<namespace>, without the
+// transport and port the configuration gives, and routed raw it would
+// leave over UDP, which icscf has no listener for (review of #274).
 func (r *Router) scscf(result cx.Result, name string, caps *cx.ServerCapabilities) (sip.URI, error) {
 	if name == "" && caps != nil && len(caps.ServerNames) > 0 {
 		name = caps.ServerNames[0]
@@ -236,13 +247,40 @@ func (r *Router) scscf(result cx.Result, name string, caps *cx.ServerCapabilitie
 			r.log.Warn("icscf: the HSS named an S-CSCF that is not a SIP URI", slog.String("result", result.String()))
 			return sip.URI{}, errBadServerName
 		}
-		return u, nil
+		if c, ok := r.configured(u); ok {
+			return c, nil
+		}
+		r.metrics.Count("icscf.scscf.unknown_name", 1)
+		r.log.Warn("icscf: the HSS named an S-CSCF that is not configured", slog.String("name", u.String()))
+		return sip.URI{}, errUnknownName
 	}
 	ranked := rank(r.scscfs, caps)
 	if len(ranked) == 0 {
 		return sip.URI{}, errNoSCSCF
 	}
 	return ranked[0], nil
+}
+
+// configured is the configured S-CSCF whose URI has u's scheme and host,
+// and its port if u gives one: the configuration says how to reach it.
+func (r *Router) configured(u sip.URI) (sip.URI, bool) {
+	for _, c := range r.scscfs {
+		if c.uri.Scheme == u.Scheme && strings.EqualFold(c.uri.Host, u.Host) && (u.Port == 0 || u.Port == port(c.uri)) {
+			return c.uri, true
+		}
+	}
+	return sip.URI{}, false
+}
+
+// port is u's port, or its transport's default (RFC 3261 §19.1.2).
+func port(u sip.URI) int {
+	if u.Port != 0 {
+		return u.Port
+	}
+	if t, _ := u.Param("transport"); u.Scheme == "sips" || strings.EqualFold(t, "tls") {
+		return 5061
+	}
+	return 5060
 }
 
 // looseRoute returns u with lr: the S-CSCF is a loose router, and the
@@ -286,17 +324,23 @@ func (r *Router) reject(kind string, code int) proxy.Decision {
 // layer's cap), so the two can be told apart.
 func (r *Router) hssUnavailable(kind string, m *sip.Request) proxy.Decision {
 	r.metrics.Count("icscf.hss.unavailable", 1)
-	r.count(kind, "480")
+	return r.withRetryAfter(kind, m, 480)
+}
+
+// withRetryAfter answers with code and Retry-After, or with code alone when
+// the response cannot be built.
+func (r *Router) withRetryAfter(kind string, m *sip.Request, code int) proxy.Decision {
+	r.count(kind, strconv.Itoa(code))
 	tag, err := r.ids.Tag()
 	if err != nil {
-		return proxy.Decision{Status: 480}
+		return proxy.Decision{Status: code}
 	}
-	res, err := sip.NewResponse(m, 480, "", tag)
+	res, err := sip.NewResponse(m, code, "", tag)
 	if err != nil {
-		return proxy.Decision{Status: 480}
+		return proxy.Decision{Status: code}
 	}
 	if err := res.Header.Add("Retry-After", r.retryAfter); err != nil {
-		return proxy.Decision{Status: 480}
+		return proxy.Decision{Status: code}
 	}
 	return proxy.Decision{Response: res}
 }
