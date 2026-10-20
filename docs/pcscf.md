@@ -230,7 +230,9 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
     state, so what it does not list is ended too, after a lost
     subscription or a missed document alike, but only if an earlier
     document of the user, on this subscription or one before it, showed
-    it active. A binding whose 200 overtook a full document made before
+    it active (the record goes with the user when a document ends the
+    default identity and another identity becomes the key). A binding
+    whose 200 overtook a full document made before
     it is not ended for being left out; a document that lists it ended,
     or its expiry, ends it. A registered identity no document has listed,
     such as a barred one scscf leaves out of reginfo, is judged by its

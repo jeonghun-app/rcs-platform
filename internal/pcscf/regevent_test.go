@@ -1495,3 +1495,96 @@ func TestOnlyActiveRegistrationsVouchForABinding(t *testing.T) {
 		t.Error("a binding under a terminated registration kept the registration")
 	}
 }
+
+// The registrations a NOTIFY ends are gone before its 200 is sent, so the
+// notifier, and anything it does next, finds them gone (QA of #239): the
+// registry is read at the moment the 200 is given.
+func TestANotifysRegistrationsGoBeforeIts200(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	r := notifyFor(t, sub, 2, "active", aliceDoc(1, reginfo.Partial, reginfo.ContactTerminated, reginfo.Deactivated))
+	answered := false
+	p.answerNotify(r.Message, func(res *sip.Response) error {
+		answered = true
+		if res.StatusCode != 200 || aliceRegistered(t, p, "FLOW-A") {
+			t.Errorf("%d with alice still registered: %v", res.StatusCode, aliceRegistered(t, p, "FLOW-A"))
+		}
+		return nil
+	})
+	if !answered {
+		t.Fatal("no response")
+	}
+}
+
+// shown finds a binding as bindingsOf would among the record's: by
+// instance and reg-id when both sides have an instance, by URI otherwise.
+func TestTheRecordFindsBindingsAsTheDocumentDoes(t *testing.T) {
+	inst := `"<urn:uuid:00000000-0000-1000-8000-000000000001>"`
+	rec := []reginfo.Contact{
+		{ID: "c1", URI: "sip:alice@192.0.2.10:40000;transport=tcp", Params: []reginfo.Param{{Name: "+sip.instance", Value: inst}, {Name: "reg-id", Value: "1"}}},
+		{ID: "c2", URI: "sip:alice@192.0.2.11:40001;transport=tcp", Params: []reginfo.Param{{Name: "+sip.instance", Value: `"<urn:uuid:00000000-0000-1000-8000-000000000002>"`}}},
+		{ID: "c3", URI: "sip:alice-tablet@192.0.2.77:41000;transport=tcp"},
+		{ID: "c4", URI: "not a uri"},
+		{ID: "c5", URI: "sip:alice@192.0.2.12:40002;transport=tcp", Params: []reginfo.Param{{Name: "+sip.instance", Value: `"<urn:uuid:abcdef00-0000-1000-8000-000000000003>"`}}},
+	}
+	seen := newSeenState()
+	for _, c := range rec {
+		seen.bindings[bindingKey(c)] = c
+	}
+	all := reginfo.Registration{Contacts: rec}
+	for _, contact := range []string{
+		"<sip:alice@192.0.2.10:40000;transport=tcp>;+sip.instance=" + inst + ";reg-id=1",
+		"<sip:alice@192.0.2.10:40000;transport=tcp>;+sip.instance=" + inst + ";reg-id=2",
+		"<sip:alice@192.0.2.99:40000;transport=tcp>;+sip.instance=" + inst,
+		"<sip:other@192.0.2.10:40000;transport=tcp>;+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-000000000002>\";reg-id=7",
+		"<sip:alice@192.0.2.10:40000;transport=tcp>",
+		"<sip:ALICE@192.0.2.11:40001;transport=TCP>",
+		"<sip:alice-tablet@192.0.2.77:41000;transport=tcp>",
+		"<sip:alice-tablet@192.0.2.77:41000;transport=tcp>;+sip.instance=" + inst + ";reg-id=9",
+		"<sip:nobody@192.0.2.1:5060>",
+		"<sip:elsewhere@192.0.2.13:40003;transport=tcp>;+sip.instance=\"<urn:uuid:ABCDEF00-0000-1000-8000-000000000003>\"",
+	} {
+		var h sip.Header
+		_ = h.Set("Contact", contact)
+		cs, err := h.Contact()
+		if err != nil || len(cs) != 1 {
+			t.Fatalf("%s: %v", contact, err)
+		}
+		if got, want := seen.shown(cs[0]), len(bindingsOf(all, cs[0])) > 0; got != want {
+			t.Errorf("%s: shown %v, bindingsOf %v", contact, got, want)
+		}
+	}
+}
+
+// A document that ends a registration's default identity and leaves
+// another moves it to a new key; the record goes with it, so a full
+// document of the new key's subscription ends a binding shown before
+// (#239 review).
+func TestTheRecordFollowsANewDefaultIdentity(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute, "P-Associated-URI: <"+aliceTel+">, <"+aliceIMPU+">", "Require: outbound")
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 7200")
+	if code := notify(t, p, notifyFor(t, s.req, 1, "active;expires=7200", aliceDoc(0, reginfo.Full, reginfo.ContactActive, reginfo.Registered))); code != 200 {
+		t.Fatal(code)
+	}
+	reg, _ := p.registry.lookup("FLOW-A", aorKey(mustURI(t, aliceIMPU)))
+	oldKey := defaultKey(reg)
+	doc := &reginfo.Info{Version: 1, State: reginfo.Partial, Registrations: []reginfo.Registration{{AOR: aliceTel, ID: "r2", State: reginfo.Terminated}}}
+	if code := notify(t, p, notifyFor(t, s.req, 2, "active", doc)); code != 200 {
+		t.Fatal(code)
+	}
+	reg, ok := p.registry.lookup("FLOW-A", aorKey(mustURI(t, aliceIMPU)))
+	if !ok || defaultKey(reg) == oldKey {
+		t.Fatalf("the default identity did not change: %v %+v", ok, reg)
+	}
+	p.subs.mu.Lock()
+	moved := p.subs.seen[defaultKey(reg)]
+	p.subs.mu.Unlock()
+	var c sip.Header
+	_ = c.Set("Contact", "<sip:alice@192.0.2.10:40000;transport=tcp>;+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-000000000001>\";reg-id=1")
+	cs, _ := c.Contact()
+	if moved == nil || !moved.shown(cs[0]) {
+		t.Errorf("the record stayed under the old key: %v", moved)
+	}
+}
