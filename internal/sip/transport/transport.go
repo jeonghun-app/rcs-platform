@@ -174,14 +174,18 @@ type Config struct {
 	// overrides it per listener.
 	SendQueueBytes int
 	// MaxQueuedBytes bounds the output every send queue holds together. When a
-	// message would take the total past it, one connection whose peer has
-	// stopped reading is closed to make room: never the sender's own, never one
-	// whose writer made progress in the last second (or half WriteTimeout, if
-	// shorter), and client-facing ones before core ones, fullest relative to
-	// their own limit first. If there is none, that send fails with
-	// ErrQueueFull. It must hold at least one message of the largest size
-	// Limits allow. Size it, with the limits above, against the task's memory
-	// (see the package documentation).
+	// message would take the total past it, connections whose peers have
+	// stopped reading are closed to make room: never the sender's own, never
+	// one whose writer made progress in the last second (or half WriteTimeout,
+	// if shorter), and client-facing ones before core ones, fullest relative to
+	// their own limit first. Client-facing ones are closed until they have
+	// freed the shortfall plus 10% of the budget, best effort, since there may
+	// be fewer stalled clients than that; core ones only while the total, with
+	// the message, is still above the budget. This happens at most every 100 ms; a send that finds the
+	// budget full in between, or no candidate, fails with ErrQueueFull. It
+	// must hold at least one message of the largest size Limits allow. Size
+	// it, with the limits above, against the task's memory (see the package
+	// documentation).
 	MaxQueuedBytes int
 	// DialTimeout bounds opening an outbound connection, TLS handshake
 	// included.
@@ -325,8 +329,9 @@ type Transport struct {
 	budget  queueBudget
 	// closures delivers OnFlowClosed; nil when there is none.
 	closures *closureQueue
-	// lastShedScan is when shedStalledQueue last looked at every flow, in Unix
-	// nanoseconds.
+	// shedMu serializes shedding scans; lastShedScan is when the last one
+	// looked at every flow, in Unix nanoseconds.
+	shedMu       sync.Mutex
 	lastShedScan atomic.Int64
 
 	mu        sync.Mutex

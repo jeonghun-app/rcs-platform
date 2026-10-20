@@ -77,6 +77,9 @@ type Client struct {
 	Password Secret
 	// Random supplies client nonces; crypto/rand when nil.
 	Random io.Reader
+	// Now is the clock SettledUploadInfo measures its quiet time and its
+	// deadline by; time.Now when nil. The waits between requests are real.
+	Now func() time.Time
 
 	mu        sync.Mutex
 	challenge *digest.Challenge
@@ -481,11 +484,15 @@ type Settled struct {
 // device's reconnection gives the server anyway.
 func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll, quiet time.Duration) (ResumeDocument, Settled, error) {
 	var st Settled
-	deadline := time.Now().Add(within)
+	now := c.Now
+	if now == nil {
+		now = time.Now
+	}
+	deadline := now().Add(within)
 	last := int64(-1)
 	var since time.Time
 	for {
-		asked := time.Now()
+		asked := now()
 		info, err := c.UploadInfo(ctx, tid)
 		held := int64(-1)
 		switch {
@@ -502,7 +509,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 		if held != last {
 			last, since = held, asked
 		}
-		if time.Now().After(deadline) {
+		if now().After(deadline) {
 			if err == nil {
 				err = ErrNotSettled
 			}
