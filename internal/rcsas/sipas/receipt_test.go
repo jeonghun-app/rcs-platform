@@ -89,12 +89,15 @@ func TestAReceiptFromARecipientAssertedInSIPFormFindsItsMessage(t *testing.T) {
 	}
 }
 
-// alice is asserted by her tel URI and names herself in CPIM by its SIP
-// form with user=phone.
+// alice is asserted by her tel URI and names herself in CPIM by a SIP
+// form of it: with user=phone, or at the home domain without.
 func TestACPIMFromInTheOtherFormOfTheSenderIsTheSender(t *testing.T) {
 	core := newFakeCore(t)
 	a, _ := startEngine(t, core, messaging.Config{})
-	if res := a.dial(t).send(pagerAs(bob, cpimFrom("<"+aliceSIP+">", "m1", 0, "hi"), "<"+alice+">")); res.StatusCode != 202 {
-		t.Fatalf("answered %d", res.StatusCode)
+	p := a.dial(t)
+	for i, from := range []string{aliceSIP, "sip:+15550100001@" + domain} {
+		if res := p.send(pagerAs(bob, cpimFrom("<"+from+">", fmt.Sprint("m", i), 0, "hi"), "<"+alice+">")); res.StatusCode != 202 {
+			t.Fatalf("CPIM From %s answered %d", from, res.StatusCode)
+		}
 	}
 }

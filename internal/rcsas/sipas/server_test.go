@@ -73,6 +73,7 @@ func TestWhatRCSASCannotTakeIsRefusedWithItsStatus(t *testing.T) {
 		"three asserted": {m: asserting("<tel:+15550100001>, <sip:+15550100001@" + domain + ">, <" + aliceSIP + ">"), code: 403},
 		"two tel URIs":   {m: asserting("<tel:+15550100001>, <tel:+1-555-010-0001>"), code: 403},
 		"two SIP URIs":   {m: asserting("<sip:+15550100001@" + domain + ">, <" + aliceSIP + ">"), code: 403},
+		"SIP and SIPS":   {m: asserting("<sips:+15550100001@" + domain + ">, <" + aliceSIP + ">"), code: 403},
 		"two users":      {m: asserting("<sip:+15550100001@" + domain + ">, <tel:+15550100003>"), code: 403},
 		"one a non-user": {m: asserting("<tel:+15550100001>, <sip:example.net>"), code: 403},
 		"an extension rcs-as lacks": {m: func(m msg) msg { m.fields = append(m.fields, "Require: x-qa-unknown"); return m }, code: 420,

@@ -215,3 +215,45 @@ func TestAnOptionsFromTheCoreGoesBackToIt(t *testing.T) {
 		})
 	}
 }
+
+// The engine gets the home domain too: a sender asserted by its number
+// may name itself in CPIM by the home domain's SIP form of it.
+func TestTheEngineComparesAddressesAtTheHomeDomain(t *testing.T) {
+	core := newCoreStub(t)
+	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1",
+		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := startRun(t, cfg, deps{})
+	nc, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+	body := "From: <sip:+15550100001@" + devEnv["RCS_IMS_DOMAIN"] + ">\r\nTo: <sip:anonymous@anonymous.invalid>\r\n\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n\r\nhello"
+	var b strings.Builder
+	b.WriteString("MESSAGE tel:+15550100002 SIP/2.0\r\n")
+	b.WriteString("Via: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-home\r\n")
+	b.WriteString("Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <tel:+15550100002>\r\n")
+	b.WriteString("Call-ID: rcsas-run-home\r\nCSeq: 1 MESSAGE\r\nP-Asserted-Identity: <tel:+15550100001>\r\n")
+	fmt.Fprintf(&b, "Content-Type: message/cpim\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	_ = nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := io.WriteString(nc, b.String()); err != nil {
+		t.Fatal(err)
+	}
+	r := sip.NewReader(bufio.NewReader(nc), sip.Limits{})
+	for {
+		m, err := r.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
+			if res.StatusCode != 202 {
+				t.Fatalf("answered %d", res.StatusCode)
+			}
+			return
+		}
+	}
+}
