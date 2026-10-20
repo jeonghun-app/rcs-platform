@@ -106,8 +106,7 @@ type APIOptions struct {
 
 // DefaultAPIStoreTimeout bounds the store work of one API request. Without
 // it a request whose store calls are slow would hold its subscriber's lock,
-// and so delay Cx for every subscriber of the stripe, for as long as the
-// SDK retries.
+// and so delay Cx for that subscriber, for as long as the SDK retries.
 const DefaultAPIStoreTimeout = 5 * time.Second
 
 // Defaults of the acs rate limit: provisioning a subscriber takes a few
