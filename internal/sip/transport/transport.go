@@ -60,6 +60,12 @@ const (
 	DefaultClientSendQueueBytes = 64 << 10
 	// DefaultMaxQueuedBytes bounds the output all send queues hold together.
 	DefaultMaxQueuedBytes = 256 << 20
+
+	// DefaultProxyHeaderTimeout bounds the PROXY header on a listener behind
+	// the NLB, which sends it as soon as it has connected (ADR 0003). A
+	// connection still without one after this is not the NLB's, and until the
+	// header arrives its slot cannot be charged to any client by Admit.
+	DefaultProxyHeaderTimeout = 2 * time.Second
 )
 
 // Errors returned by the send methods. Errors from the network are returned
@@ -141,6 +147,7 @@ type Config struct {
 
 	// MaxConnections bounds the TCP and TLS connections accepted from peers,
 	// counted from accept, so it also bounds handshakes in progress.
+	// ListenerConfig.MaxConnections bounds one listener's within it.
 	MaxConnections int
 	// MaxDialedConnections bounds the connections this transport opens,
 	// separately, so a flood of clients cannot stop a proxy from reaching the
@@ -317,6 +324,19 @@ type ListenerConfig struct {
 	// on this listener. Zero takes DefaultClientSendQueueBytes on a
 	// client-facing listener and Config.SendQueueBytes otherwise.
 	SendQueueBytes int
+	// MaxConnections, if set, bounds the connections accepted on this
+	// listener, counted from accept to close like Config.MaxConnections,
+	// which still bounds all listeners together. A listener at its limit
+	// closes new connections at once and leaves the others alone. Client-facing
+	// limits that add up to less than Config.MaxConnections keep the rest for
+	// the core listeners, so a flood of clients cannot stop core peers from
+	// reconnecting; a client still in its PROXY header or TLS handshake holds
+	// its slot before Admit can tell whose it is.
+	MaxConnections int
+	// ProxyHeaderTimeout bounds reading the PROXY header on a ProxyProtocol
+	// listener, from accept; zero takes DefaultProxyHeaderTimeout. It is set
+	// only together with ProxyProtocol.
+	ProxyHeaderTimeout time.Duration
 }
 
 // Transport sends and receives SIP messages and owns the flow table. Its methods
@@ -339,7 +359,7 @@ type Transport struct {
 	dialing   map[reuseKey]*dialCall
 	closed    bool
 	// accepted counts accepted connections, from accept to close, against
-	// MaxConnections.
+	// MaxConnections; each listener counts its own as well.
 	accepted int
 	// pending holds accepted connections that are not flows yet (PROXY header
 	// or TLS handshake in progress), so Close can close them at once.
@@ -642,13 +662,19 @@ type Stats struct {
 	InvalidMessages    uint64 // framed but refused by Validate; dropped
 	StrayResponses     uint64 // responses whose top Via is not ours (RFC 3261 §18.1.2); dropped
 	UDPFlowsEvicted    uint64 // UDP flows displaced at MaxUDPFlows or MaxUDPFlowsPerIP
+
+	// Connections refused at a listener's ListenerConfig.MaxConnections, by
+	// the class of the listener.
+	ClientListenerRejected uint64
+	CoreListenerRejected   uint64
 }
 
 type counters struct {
 	accepted, rejected, refused, dialed, dialErrors, dialLimited,
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
 	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
-	malformedDatagrams, invalidMessages, strayResponses atomic.Uint64
+	malformedDatagrams, invalidMessages, strayResponses,
+	clientListenerRejected, coreListenerRejected atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -688,6 +714,9 @@ func (t *Transport) Stats() Stats {
 		InvalidMessages:    c.invalidMessages.Load(),
 		StrayResponses:     c.strayResponses.Load(),
 		UDPFlowsEvicted:    ts.evicted,
+
+		ClientListenerRejected: c.clientListenerRejected.Load(),
+		CoreListenerRejected:   c.coreListenerRejected.Load(),
 	}
 }
 
