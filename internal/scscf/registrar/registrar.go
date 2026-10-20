@@ -120,8 +120,9 @@ type Config struct {
 // it. Changed must return at once, as the request that changed the set is
 // answered after it. Ended is called before the set's record is deleted,
 // and saves the end of its subscriptions: on an error the record is kept,
-// and whatever retries the deregistration (the sweep after its lease, the
-// HSS's next RTR) calls it again, so that the end is never lost (#256).
+// under a deregistration's lease, and the sweep after the lease calls it
+// again, so that the end is never lost (#256). The HSS does not send an
+// RTR again, so an RTR whose Ended fails leaves the lease too.
 type Events interface {
 	Changed(ctx context.Context, before, after *state.Registration, cause regevent.Cause)
 	Ended(ctx context.Context, before *state.Registration, cause regevent.Cause) error

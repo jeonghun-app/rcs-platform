@@ -309,7 +309,13 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 	switch {
 	case j.ended:
 		// The registrar told of the end of this very set, which before is,
-		// or a sweep sends that end in place of whoever saved it.
+		// or a sweep sends that end in place of whoever saved it. If the
+		// set was registered again meanwhile, a new record, the end tells
+		// nothing of the identities, which are the new record's now: a
+		// P-CSCF would end the registration just made (#256 code review).
+		if n.registeredAgain(ctx, sub, now) {
+			j.bare = true
+		}
 	case why != "":
 		n.count("regevent.lapsed")
 		if !j.final {
@@ -430,6 +436,14 @@ func (n *Notifier) retryFinal(ctx context.Context, sub *state.Subscription) {
 			return
 		}
 	}
+}
+
+// registeredAgain reports whether sub's set has a live record of another
+// incarnation than sub's, which a REGISTER made after the set sub watched
+// ended. A read that fails says no: the end then lists the identities.
+func (n *Notifier) registeredAgain(ctx context.Context, sub *state.Subscription, now time.Time) bool {
+	set, err := n.cfg.Store.Registration(ctx, sub.Set)
+	return err == nil && set.Incarnation != sub.Incarnation && set.Deregistering.IsZero() && anyLive(set, now)
 }
 
 // build makes sub's NOTIFY numbered cseq of set's state at version, nil if

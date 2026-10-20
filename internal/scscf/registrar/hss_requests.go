@@ -118,10 +118,24 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		}
 		touched = true
 		// The subscriptions end before the record does, so that an error
-		// here or a stop later leaves the record for the HSS's retry, or
-		// their saved ends for the sweep.
+		// here or a stop later leaves the record, or their saved ends, for
+		// the sweep. The HSS does not send the RTR again (its pushes are
+		// logged, not retried), so the record is claimed for a lease, as a
+		// user's deregistration leaves it: the sweep after it tells the HSS
+		// (which refuses, as it ended the set), calls Ended again and
+		// deletes the set (#256 code review).
 		if err := g.cfg.Events.Ended(ctx, reg, cause); err != nil {
-			return false, err
+			g.internal("ending a set's subscriptions for an RTR", err)
+			lease := reg.Clone()
+			lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
+			if _, err := g.cfg.Store.SaveRegistration(ctx, lease); err != nil {
+				if errors.Is(err, state.ErrConflict) {
+					continue
+				}
+				return false, err
+			}
+			g.count("registrar.rtr_left_to_sweep")
+			return true, nil
 		}
 		if err := g.unpoint(ctx, reg); err != nil {
 			return false, err

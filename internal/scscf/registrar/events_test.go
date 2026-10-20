@@ -174,19 +174,29 @@ func TestASetWhoseEndCannotBeSavedKeepsItsRecord(t *testing.T) {
 		}
 	})
 	t.Run("RTR", func(t *testing.T) {
+		// The HSS does not send an RTR again: the record is left under a
+		// lease, for the sweep after it to end.
 		e := newEnv(t)
 		ev := &recordedEvents{}
 		g := e.instance(1, withEvents(ev))
 		registered(t, e, g, 600, impu1)
 		ev.setFailEnds(true)
 		rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}
-		if res := g.HandleRTR(bg, rtr); res == resultSuccess {
-			t.Error("an RTR whose end failed succeeded")
-		}
-		if _, err := regOf(e, impu1); err != nil {
-			t.Fatalf("the RTR deleted the record with its subscriptions' end unsaved: %v", err)
+		wantResult(t, g.HandleRTR(bg, rtr), resultSuccess)
+		reg, err := regOf(e, impu1)
+		if err != nil || len(reg.Contacts) != 0 || reg.Deregistering.IsZero() {
+			t.Fatalf("record after an RTR whose end failed: %+v, %v; want it leased without bindings", reg, err)
 		}
 		ev.setFailEnds(false)
-		wantResult(t, g.HandleRTR(bg, rtr), resultSuccess)
+		e.clock.advance(2 * time.Minute)
+		if _, err := g.Sweep(bg, 10); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := regOf(e, impu1); err == nil {
+			t.Error("the record outlived the sweep after the lease")
+		}
+		if got := ev.got(); len(got) == 0 || got[len(got)-1].after != -1 {
+			t.Errorf("changes %+v: the sweep did not end the subscriptions", got)
+		}
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -163,5 +164,32 @@ func TestALapsedSubscriptionsFinalIsSavedBeforeItIsSent(t *testing.T) {
 	}
 	if len(e.subscriptions(impu1)) != 0 {
 		t.Error("the subscription is left")
+	}
+}
+
+// TestAnEndOfASetRegisteredAgainHasNoBody: the set ended, and a device
+// registered it again, a new record, before the end's NOTIFY went; the
+// NOTIFY says terminated, deactivated, and lists no identity, which the new
+// registration owns (#256 code review).
+func TestAnEndOfASetRegisteredAgainHasNoBody(t *testing.T) {
+	e := newEnv(t)
+	old := e.registered(binding(1, time.Hour))
+	n := e.notifier(1)
+	e.subscribed(n)
+	k := len(e.send.notifies())
+	if err := e.store.DeleteRegistration(bg, old); err != nil {
+		t.Fatal(err)
+	}
+	e.saved(&state.Registration{Key: set1, Incarnation: 8, Contacts: []state.Contact{binding(2, time.Hour)}, Identities: old.Identities})
+	if err := n.Ended(bg, old, Deactivated); err != nil {
+		t.Fatal(err)
+	}
+	n.Wait()
+	got := e.send.notifies()[k:]
+	if len(got) != 1 {
+		t.Fatalf("%d NOTIFYs", len(got))
+	}
+	if ss, _ := got[0].Header.SubscriptionState(); ss.State != "terminated" || ss.Reason() != "deactivated" || len(got[0].Body) != 0 {
+		t.Errorf("the end: %+v with %d bytes of body", ss, len(got[0].Body))
 	}
 }

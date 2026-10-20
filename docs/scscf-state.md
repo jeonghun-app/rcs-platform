@@ -124,15 +124,18 @@ additionally sealed (below).
   an RTR deletes a set's record, each of the set's subscriptions is saved
   Terminated, with the reason and an expiry five seconds ahead, and its
   final NOTIFY is queued (`regevent.Notifier.Ended`); a listing that fails
-  is tried again, and one that keeps failing keeps the record for the
-  deregistration's own retry (the sweep after its lease, the HSS's next
-  RTR) and counts `regevent.end_failed`. A store failure or a stop at any
+  is tried again, and one that keeps failing keeps the record under a
+  deregistration's lease for the sweep after it, an RTR's too, since the
+  HSS does not send an RTR again (`registrar.rtr_left_to_sweep`), and
+  counts `regevent.end_failed`. A store failure or a stop at any
   point thus leaves either the record or the saved ends, and a sweep sends
   a final NOTIFY nobody sent. A subscription is deleted only once its final
   NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or 430); one
   without an answer is sent again by a sweep, with the CSeq and version it
   was numbered with, 10 s later and twice as late each time, and given up
-  after five sends (`regevent.final_abandoned`).
+  after five sends (`regevent.final_abandoned`). An end whose set was
+  registered again meanwhile, a new record, says terminated without a
+  body, so that it ends nothing of the new registration.
   The subscription sweep must therefore run every few seconds to a minute,
   as the registration sweep does.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
