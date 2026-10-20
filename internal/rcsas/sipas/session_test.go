@@ -2,12 +2,14 @@ package sipas
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
@@ -105,6 +107,40 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 	case err := <-r.e.failed:
 		t.Fatalf("an invitation failed: %v", err)
 	default:
+	}
+}
+
+// #137 AC 7, the MSRP Handler contract: the leg takes the reports about
+// its own sends while it is sending (HandleReport never waits on Send of
+// its session). With a send window of one, a leg that waited would stop
+// at the first chunk; bob's gets every message, chunked, in turn.
+func TestReportsAreTakenWhileTheLegSends(t *testing.T) {
+	r := newChatRig(t, messaging.Config{MSRP: msrp.Config{SendWindow: 1}})
+	toBob := relayPath()
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			return []*sip.Response{r.answerInvite(t, req, toBob, "active")}
+		}
+		return nil
+	})
+	p := r.a.dial(t)
+	fromAlice := relayPath()
+	s := answeredBy(t, p.send(r.chatInvite(offerSDP(fromAlice, "active"))))
+	p.ack(s)
+	relayA := r.connect(t, fromAlice, s.path)
+	const n = 3
+	for i := range n {
+		if code := relayA.send(t, chatCPIM(fmt.Sprint("m", i), strings.Repeat("x", 10_000))); code != 200 {
+			t.Fatalf("message %d reported %d", i, code)
+		}
+	}
+	inv := r.core.nextOf(t, "INVITE")
+	toLeg, _ := offered(t, inv)
+	relayB := r.connect(t, toBob, toLeg)
+	for i := range n {
+		if m := relayB.next(t); !strings.Contains(string(m.Body), "imdn.Message-ID: m") || len(m.Body) < 10_000 {
+			t.Fatalf("message %d: %d bytes", i, len(m.Body))
+		}
 	}
 }
 

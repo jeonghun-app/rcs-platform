@@ -79,7 +79,7 @@ func (s *Server) Pager(ctx context.Context, d messaging.Delivery) error {
 	})
 	if err != nil {
 		s.cfg.Metrics.Count("sip.pager.unsent", 1)
-		return fmt.Errorf("sipas: send: %w", messaging.ErrOffline)
+		return sendError(err)
 	}
 	select {
 	case r := <-answered:
@@ -94,6 +94,26 @@ func (s *Server) Pager(ctx context.Context, d messaging.Delivery) error {
 		return ctx.Err()
 	}
 }
+
+// sendError is what a request rcs-as could not send says to the engine,
+// following the transport's contract (#35) as the proxy does for what it
+// forwards: a flow that is gone (transport.ErrNoFlow) is a recipient not
+// reachable now, as the 430 a proxy would answer (RFC 5626 §5.3.1), so
+// messaging.ErrOffline; a next hop with no room now (ErrQueueFull,
+// ErrTooManyConnections) is a passing failure, as the proxy's 503 with
+// Retry-After, which the engine tries again after its retry wait; any
+// other is ErrOffline. The transport's error is not kept: it can name the
+// next hop's address.
+func sendError(err error) error {
+	switch {
+	case errors.Is(err, transport.ErrQueueFull), errors.Is(err, transport.ErrTooManyConnections):
+		return errNextHopBusy
+	default:
+		return fmt.Errorf("sipas: send: %w", messaging.ErrOffline)
+	}
+}
+
+var errNextHopBusy = errors.New("sipas: the next hop has no room now")
 
 func networkOf(dst transport.Destination) transport.Network {
 	if dst.Network == "" {

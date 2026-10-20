@@ -72,7 +72,7 @@ func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
 	if err != nil {
 		_ = leg.Close()
 		s.cfg.Metrics.Count("sip.invite.unsent", 1)
-		return fmt.Errorf("sipas: send: %w", messaging.ErrOffline)
+		return sendError(err)
 	}
 	s.cfg.Metrics.Count("sip.invite.sent", 1)
 	go ss.ring(tx, cancel, dst)
