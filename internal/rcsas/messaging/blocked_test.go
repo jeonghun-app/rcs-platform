@@ -245,3 +245,56 @@ func TestASinglesPassThatStartsBlockedAndGetsThroughReadsTheQueueAgain(t *testin
 	waitFor(t, "s3 delivered", func() bool { return third.Load() == 1 })
 	waitFor(t, "s1 delivered on the same read", func() bool { return firstTries.Load() == 2 && r.idle() })
 }
+
+// The code review's case: the same singles pass gets through, and s3 comes
+// in only once the engine is idle. The queue must not be left blocked, or s3
+// and s1 wait for the retry timer, up to an hour.
+func TestASinglesPassThatGetsThroughUnblocksTheQueue(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour, MaxRetryInterval: time.Hour})
+	drainInvites(t, r.d)
+	g1, g2 := newGate(), newGate()
+	var third, firstTries atomic.Int32
+	r.d.onPager(func(d Delivery) error {
+		switch {
+		case bytes.Contains(d.CPIM, []byte("text-first")):
+			if firstTries.Add(1) > 1 {
+				return nil
+			}
+			g1.entered <- struct{}{}
+			<-g1.release
+			return errors.New("480 Temporarily Unavailable")
+		case bytes.Contains(d.CPIM, []byte("text-second")):
+			g2.entered <- struct{}{}
+			<-g2.release
+			return nil
+		case bytes.Contains(d.CPIM, []byte("text-third")):
+			third.Add(1)
+		}
+		return nil
+	})
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "text-chat", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s1", "text-first", 0))); err != nil {
+		t.Fatal(err)
+	}
+	<-g1.entered
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s2", "text-second", 0))); err != nil {
+		t.Fatal(err)
+	}
+	close(g1.release) // s1 fails: stop, holdBlocked; the run goes on with s2
+	<-g2.entered
+	close(g2.release) // s2 goes: bob is reachable
+	waitFor(t, "s1 delivered on the read that follows", func() bool { return firstTries.Load() == 2 && r.idle() })
+	r.e.mu.Lock()
+	h := r.e.recipients[bob].hold
+	r.e.mu.Unlock()
+	if h == holdBlocked {
+		t.Fatal("the queue is left blocked after a pass that got through")
+	}
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s3", "text-third", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "s3 delivered", func() bool { return third.Load() == 1 })
+}

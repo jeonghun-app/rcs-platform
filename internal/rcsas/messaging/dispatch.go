@@ -204,6 +204,14 @@ func (e *Engine) work() {
 					r.full = true
 				}
 			}
+			if !full && !res.stopped && r.hold == holdBlocked {
+				// A pass of singles got through to a queue an earlier
+				// pass left blocked: the recipient is reachable, and only
+				// a pass over the whole queue says what holds it now.
+				// Left blocked, a message that comes in after this run
+				// would wait for the retry timer, up to MaxRetryInterval.
+				r.full = true
+			}
 			if e.closed {
 				break
 			}
