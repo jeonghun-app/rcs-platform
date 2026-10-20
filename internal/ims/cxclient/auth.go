@@ -54,8 +54,13 @@ func (c *Client) Authenticate(ctx context.Context, r *cx.MAR, schemes []string) 
 		req.AuthDataItem.Scheme = s
 		req.Request.SessionID = ""
 		var err error
+		answered := maa != nil
 		maa, err = c.MAR(ctx, &req)
 		if err != nil {
+			if answered && NeverSent(err) {
+				// The MAR of the scheme before reached the HSS.
+				err = &SentError{Err: err}
+			}
 			return nil, err
 		}
 		if Classify(maa.Result) != SchemeNotSupported {
