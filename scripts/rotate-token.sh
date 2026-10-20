@@ -31,6 +31,7 @@ STACK="rcs-platform"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-northeast-2}}"
 TOKEN=""
 STEP="all"
+CURRENT_STEP=""
 # How long one restart may take: ft-server's 300 s deregistration delay and
 # 100 s drain per task make its rollouts long.
 WAIT_SECONDS="${ROTATE_WAIT_SECONDS:-2700}"
@@ -99,26 +100,32 @@ get() {
 }
 
 # The value a secret held before its last write (its AWSPREVIOUS version),
-# or nothing when it was written once.
+# or nothing when it was written once. Only "no such version" means that:
+# any other error (throttling, access denied) stops the rotation, since
+# reading it as "never written" would make step 2 swap the values back.
 previous() {
-  local value
+  local value err="$WORK/previous.err"
   if value="$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$STACK/$1" \
-    --version-stage AWSPREVIOUS --query SecretString --output text 2>/dev/null)"; then
+    --version-stage AWSPREVIOUS --query SecretString --output text 2>"$err")"; then
     [[ "$value" == None ]] || printf '%s' "$value"
+  elif ! grep -q ResourceNotFoundException "$err"; then
+    fail "cannot read the previous version of $STACK/$1, so where the rotation stands is unknown; nothing was changed: $(head -n 1 "$err")"
   fi
 }
 
-# Where the rotation stands, from both secrets' current and previous values:
+# Where the rotation stands, from both secrets' current and previous values.
+# It runs in a command substitution, where set -e does not apply: each read
+# that fails ends it, and its caller stops on that (read_state).
 #   swapped  step 2 wrote both (current = new, next = old);
 #   half     step 2 wrote next only (both hold old, next's previous is new);
 #   retired  step 3 wrote next (both secrets' previous is old);
 #   ready    anything else with two different values: steps 1 or 2 may run.
 rotation_state() {
   local cur nxt cur_prev nxt_prev
-  cur="$(get "$TOKEN")"
-  nxt="$(get "$TOKEN-next")"
-  cur_prev="$(previous "$TOKEN")"
-  nxt_prev="$(previous "$TOKEN-next")"
+  cur="$(get "$TOKEN")" || exit 1
+  nxt="$(get "$TOKEN-next")" || exit 1
+  cur_prev="$(previous "$TOKEN")" || exit 1
+  nxt_prev="$(previous "$TOKEN-next")" || exit 1
   if [[ "$cur" != "$nxt" && "$cur_prev" == "$nxt" && "$nxt_prev" == "$cur" ]]; then
     echo swapped
   elif [[ "$cur" == "$nxt" && -n "$nxt_prev" && "$nxt_prev" != "$cur" ]]; then
@@ -130,6 +137,13 @@ rotation_state() {
   else
     echo equal
   fi
+}
+
+# Sets STATE to where the rotation stands, or stops the script when a read
+# failed (rotation_state's own exit ends only its subshell).
+STATE=""
+read_state() {
+  STATE="$(rotation_state)" || exit 1
 }
 
 put() {
@@ -152,7 +166,10 @@ random_value() {
 # Restarts a service and waits until it is steady: one deployment, its
 # rollout completed, as many tasks running as desired.
 restart() {
-  local service="$1" deadline state
+  local service="$1" deadline state resume
+  # Never "go on with the next step": a step whose restart failed has not
+  # yet put every task on the values it wrote.
+  resume="once $service is healthy again, run --step $CURRENT_STEP again"
   echo "  restarting $service"
   aws ecs update-service --region "$REGION" --cluster "$STACK" --service "$service" \
     --force-new-deployment >/dev/null
@@ -163,21 +180,25 @@ restart() {
       --output text)"
     read -r count rollout running desired <<<"$state"
     if [[ "$rollout" == FAILED ]]; then
-      fail "$service: the deployment failed (the circuit breaker rolls it back); the rotation stops here"
+      fail "$service: the deployment failed (the circuit breaker rolls it back); the rotation stops here: $resume"
     fi
     if [[ "$count" == 1 && "$rollout" == COMPLETED && "$running" == "$desired" ]]; then
       echo "  $service steady: $running of $desired tasks"
       return 0
     fi
-    [[ $SECONDS -lt $deadline ]] || fail "$service is not steady after $WAIT_SECONDS s ($state); the rotation stops here"
+    [[ $SECONDS -lt $deadline ]] || fail "$service is not steady after $WAIT_SECONDS s ($state); the rotation stops here: $resume"
     sleep "$POLL_SECONDS"
   done
 }
 
 step1() {
+  CURRENT_STEP=1
   echo "[1/3] new value into $TOKEN-next"
-  case "$(rotation_state)" in
-    swapped) fail "step 2 already ran: next holds the old value callers may still present; continue with --step 2 (restarts only) or --step 3" ;;
+  read_state
+  case "$STATE" in
+    # Not step 3: whether every caller presents the new value yet is known
+    # only once step 2's restarts have finished, which step 2 does again.
+    swapped) fail "step 2 already ran: next holds the old value callers may still present; finish it with --step 2 (restarts only)" ;;
     half) fail "step 2 stopped between its writes; finish it with --step 2" ;;
   esac
   put "$TOKEN-next" "$(random_value)"
@@ -186,12 +207,16 @@ step1() {
 
 step2() {
   local old new
+  CURRENT_STEP=2
   echo "[2/3] new value into $TOKEN, old into $TOKEN-next"
-  case "$(rotation_state)" in
+  read_state
+  case "$STATE" in
     swapped) echo "  the writes are done already; restarting only" ;;
     half)
       echo "  finishing the writes: the new value into $TOKEN"
-      put "$TOKEN" "$(previous "$TOKEN-next")"
+      new="$(previous "$TOKEN-next")" || exit 1
+      put "$TOKEN" "$new"
+      unset new
       ;;
     ready | retired)
       old="$(get "$TOKEN")"
@@ -212,8 +237,10 @@ step2() {
 }
 
 step3() {
+  CURRENT_STEP=3
   echo "[3/3] a fresh value into $TOKEN-next; old is no longer accepted"
-  case "$(rotation_state)" in
+  read_state
+  case "$STATE" in
     swapped) put "$TOKEN-next" "$(random_value)" ;;
     retired) echo "  the write is done already; restarting only" ;;
     *) fail "step 2 has not run: next may hold the value callers are switching to; run --step 2 first" ;;

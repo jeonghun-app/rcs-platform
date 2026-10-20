@@ -41,12 +41,15 @@ MAX_TAGGED_IMAGES=30
 FARGATE_VCPU_QUOTA="L-3032A538"
 EIP_QUOTA="L-0263D0A3"
 
-# Resource types whose replacement or removal loses data or an address
-# clients know. Only their changes are marked !! and need "replace" typed:
-# task definitions and alarms are replaced on every image deployment.
+# Resource types whose replacement or removal loses data, an address clients
+# know, or what operators added by hand (the network ACL's deny entries, the
+# alarm topic's subscriptions). Only their changes are marked !! and need
+# "replace" typed: task definitions and alarms are replaced on every image
+# deployment.
 STATEFUL_TYPES="AWS::DynamoDB::Table AWS::KMS::Key AWS::S3::Bucket AWS::ElasticLoadBalancingV2::LoadBalancer
-AWS::EC2::VPC AWS::EC2::Subnet AWS::EC2::EIP AWS::EC2::NatGateway AWS::ServiceDiscovery::PrivateDnsNamespace
-AWS::SecretsManager::Secret AWS::Logs::LogGroup AWS::ECR::Repository"
+AWS::EC2::VPC AWS::EC2::Subnet AWS::EC2::EIP AWS::EC2::NatGateway AWS::EC2::NetworkAcl
+AWS::ServiceDiscovery::PrivateDnsNamespace AWS::SecretsManager::Secret AWS::Logs::LogGroup AWS::ECR::Repository
+AWS::SNS::Topic"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLATFORM_TEMPLATE="$ROOT/infra/platform.yaml"
@@ -610,36 +613,73 @@ check_quota() {
   echo "  Fargate vCPU: up to $needed needed, quota $quota"
 }
 
-# Elastic IPs a first creation allocates: one per NAT gateway, and one per
-# NLB subnet not given a retained allocation. Addresses the account holds
-# already count against the same quota.
+# A parameter of the deployed stack; nothing when it has none.
+stack_parameter() {
+  local value
+  value="$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$1" \
+    --query "Stacks[0].Parameters[?ParameterKey=='$2'].ParameterValue" --output text)"
+  [[ "$value" == None ]] && value=""
+  echo "$value"
+}
+
+nat_count() {
+  case "$1" in per-az) echo 2 ;; single) echo 1 ;; *) echo 0 ;; esac
+}
+
+# Elastic IPs a deployment allocates: one per NAT gateway it adds, and one
+# per NLB subnet that takes a new address instead of a retained one (in a
+# first creation, every subnet not given one). Addresses the account holds
+# already count against the same quota. An update that allocates nothing
+# is not checked.
 check_eip_quota() {
-  local nat new quota held
-  case "$(config_value NatGateways)" in per-az) nat=2 ;; single) nat=1 ;; *) nat=0 ;; esac
-  new=$nat
-  [[ -n "$(config_value NlbAllocationIdA)" ]] || new=$((new + 1))
-  [[ -n "$(config_value NlbAllocationIdB)" ]] || new=$((new + 1))
+  local new old quota held side
+  new="$(nat_count "$(config_value NatGateways)")"
+  if stack_exists "$STACK"; then
+    old="$(stack_parameter "$STACK" NatGateways)"
+    new=$((new - $(nat_count "$old")))
+    [[ $new -gt 0 ]] || new=0
+    for side in A B; do
+      old="$(stack_parameter "$STACK" "NlbAllocationId$side")"
+      if [[ -z "$(config_value "NlbAllocationId$side")" && -n "$old" ]]; then
+        new=$((new + 1))
+      fi
+    done
+    [[ $new -gt 0 ]] || return 0
+  else
+    for side in A B; do
+      [[ -n "$(config_value "NlbAllocationId$side")" ]] || new=$((new + 1))
+    done
+  fi
   held="$(aws ec2 describe-addresses --region "$REGION" --query 'length(Addresses)' --output text)"
   if ! quota="$(aws service-quotas get-service-quota --region "$REGION" --service-code ec2 \
     --quota-code "$EIP_QUOTA" --query Quota.Value --output text 2>/dev/null)"; then
-    echo "  warning: cannot read the Elastic IP quota; this creation allocates $new, $held are held" >&2
+    echo "  warning: cannot read the Elastic IP quota; this deployment allocates $new, $held are held" >&2
     return 0
   fi
   [[ "$quota" =~ ^[0-9]+(\.[0-9]+)?$ && "$held" =~ ^[0-9]+$ ]] || fail "unexpected Elastic IP quota or count: $quota, $held"
   if awk -v q="$quota" -v n=$((held + new)) 'BEGIN { exit !(n > q) }'; then
-    fail "this creation allocates $new Elastic IPs and the account holds $held, over the quota of $quota: reuse the retained NLB addresses (docs/runbook.md#keeping-the-nlb-addresses), release unused ones, or request an increase of $EIP_QUOTA"
+    fail "this deployment allocates $new Elastic IPs and the account holds $held, over the quota of $quota: reuse the retained NLB addresses (docs/runbook.md#keeping-the-nlb-addresses), release unused ones, or request an increase of $EIP_QUOTA"
   fi
   echo "  Elastic IPs: $new to allocate, $held held, quota $quota"
 }
 
-# The public address of an Elastic IP allocation the config names, which
-# the template cannot read itself; nothing for an empty one.
+# The public address of an Elastic IP allocation the config names for NLB
+# subnet A or B, which the template cannot read itself; nothing for an empty
+# one. An address attached to anything but this stack's NLB is refused: the
+# NLB could not take it, and CloudFormation would find out halfway.
 reused_address() {
-  local id="$1" ip
+  local id="$1" side="$2" out ip assoc
   [[ -n "$id" ]] || return 0
-  ip="$(aws ec2 describe-addresses --region "$REGION" --allocation-ids "$id" \
-    --query 'Addresses[0].PublicIp' --output text)"
+  out="$(aws ec2 describe-addresses --region "$REGION" --allocation-ids "$id" \
+    --query 'Addresses[0].[PublicIp,AssociationId]' --output text)" || fail "cannot read Elastic IP $id in $REGION"
+  read -r ip assoc <<<"$out"
   [[ "$ip" =~ ^[0-9.]+$ ]] || fail "no Elastic IP $id in $REGION"
+  if [[ -n "$assoc" && "$assoc" != None ]]; then
+    # In an update that keeps it, it is attached to this stack's NLB.
+    if ! stack_exists "$STACK" || [[ "$(stack_parameter "$STACK" "NlbAllocationId$side")" != "$id" ]]; then
+      fail "Elastic IP $id ($ip) is attached to something else ($assoc): give the NLB one that is free (docs/runbook.md#keeping-the-nlb-addresses)"
+    fi
+  fi
   echo "$ip"
 }
 
@@ -694,9 +734,9 @@ check_updatable "$ECR_STACK"
 check_updatable "$STACK"
 if [[ "$DRY_RUN" == false ]]; then
   check_quota
+  check_eip_quota
   if ! stack_exists "$STACK"; then
     check_names_free
-    check_eip_quota
   else
     # A deployment from another commit than the one running ships that
     # commit's template too: say so before anything happens.
@@ -781,8 +821,8 @@ if [[ "$DRY_RUN" == true ]]; then
   NLB_ADDRESS_A="<address of NlbAllocationIdA, if set>"
   NLB_ADDRESS_B="<address of NlbAllocationIdB, if set>"
 else
-  NLB_ADDRESS_A="$(reused_address "$(config_value NlbAllocationIdA)")"
-  NLB_ADDRESS_B="$(reused_address "$(config_value NlbAllocationIdB)")"
+  NLB_ADDRESS_A="$(reused_address "$(config_value NlbAllocationIdA)" A)"
+  NLB_ADDRESS_B="$(reused_address "$(config_value NlbAllocationIdB)" B)"
   S3_PREFIX_LIST="$(prefix_list s3)"
   DYNAMODB_PREFIX_LIST="$(prefix_list dynamodb)"
   # What runs now becomes the rollback target, unless this deployment keeps

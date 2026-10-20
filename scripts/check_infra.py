@@ -288,6 +288,11 @@ def check_ft_server_egress(template: dict) -> list[str]:
     return problems
 
 
+# The one statement not held to this account: image layers, which ECR
+# serves from a bucket of its own, on the S3 endpoint only.
+ECR_LAYER_BUCKET = {"Fn::Sub": "arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*"}
+
+
 def check_endpoint_policies(template: dict) -> list[str]:
     """Every VPC endpoint is held to this account: resources of the account
     for the gateway endpoints, principals of the account for the interface
@@ -305,9 +310,46 @@ def check_endpoint_policies(template: dict) -> list[str]:
                 continue
             equals = st.get("Condition", {}).get("StringEquals", {})
             account = equals.get("aws:ResourceAccount") or equals.get("aws:PrincipalAccount")
-            layer = ("starport-layer-bucket" in str(st.get("Resource")) and _actions(st) == ["s3:GetObject"])
+            layer = (name == "S3Endpoint" and st.get("Resource") == ECR_LAYER_BUCKET
+                     and _actions(st) == ["s3:GetObject"] and "NotAction" not in st and "NotResource" not in st)
             if logical_id(account) != "AWS::AccountId" and not layer:
                 problems.append(f"{name}: an endpoint policy statement not held to this account")
+    return problems
+
+
+def _refs(value) -> set[str]:
+    """Every resource a value names with Ref or GetAtt, at any depth."""
+    if isinstance(value, list):
+        return set().union(*(_refs(v) for v in value)) if value else set()
+    if isinstance(value, dict):
+        name = logical_id(value)
+        found = {name} if name else set()
+        return found.union(*(_refs(v) for v in value.values()))
+    return set()
+
+
+def check_endpoints_ready(template: dict) -> list[str]:
+    """Every ECS service waits for EndpointsReady, and EndpointsReady for
+    every VPC endpoint and every rule of the path to the endpoints' group
+    (both directions): a task started before them finds no image, secret or
+    log group."""
+    res = template.get("Resources", {})
+    ready = res.get("EndpointsReady")
+    if ready is None:
+        return ["EndpointsReady: missing, so services may start before the endpoints exist"]
+    listed = _refs(ready.get("Metadata", {}))
+    wanted = set(resources(template, "AWS::EC2::VPCEndpoint"))
+    for kind in ("AWS::EC2::SecurityGroupIngress", "AWS::EC2::SecurityGroupEgress"):
+        for name, rule in resources(template, kind).items():
+            props = rule.get("Properties", {})
+            peers = {logical_id(props.get(k)) for k in ("GroupId", "SourceSecurityGroupId", "DestinationSecurityGroupId")}
+            if "EndpointSecurityGroup" in peers:
+                wanted.add(name)
+    problems = [f"EndpointsReady: does not wait for {name}" for name in sorted(wanted - listed)]
+    for name, service in resources(template, "AWS::ECS::Service").items():
+        depends = service.get("DependsOn", [])
+        if "EndpointsReady" not in ([depends] if isinstance(depends, str) else depends):
+            problems.append(f"{name}: does not wait for EndpointsReady")
     return problems
 
 
@@ -335,6 +377,9 @@ def check_target_groups(template: dict) -> list[str]:
     problems = []
     for name, tg in resources(template, "AWS::ElasticLoadBalancingV2::TargetGroup").items():
         props = tg.get("Properties", {})
+        if not isinstance(props.get("Protocol", ""), str):
+            problems.append(f"{name}: Protocol written with a function, which the checks cannot read")
+            continue
         if props.get("Protocol") not in NETWORK_PROTOCOLS:
             continue
         attrs = {a.get("Key"): str(a.get("Value")).lower() for a in props.get("TargetGroupAttributes", [])}
@@ -695,8 +740,21 @@ def expand_statements(statements) -> list[dict]:
     return found
 
 
+def _document_statements(document) -> list[dict]:
+    """A policy document's statements as expand_statements gives them; none
+    for a document or statement list written with a function, which
+    check_iam_shapes refuses (so no other check crashes on it)."""
+    if not isinstance(document, dict) or "Fn::If" in document:
+        return []
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict) and "Fn::If" in statements and any(
+            isinstance(b, list) for b in statements["Fn::If"][1:]):
+        return []
+    return expand_statements(statements)
+
+
 def _reads_secrets(document: dict) -> bool:
-    for statement in expand_statements(document.get("Statement", [])):
+    for statement in _document_statements(document):
         if statement.get("Effect") != "Allow":
             continue
         if "NotAction" in statement or covers(_actions(statement), SECRET_ACTIONS):
@@ -707,7 +765,8 @@ def _reads_secrets(document: dict) -> bool:
 def _policies(role: dict) -> list[dict]:
     """A role's inline policies, both branches of an Fn::If included."""
     found = []
-    for policy in role.get("Properties", {}).get("Policies", []):
+    policies = role.get("Properties", {}).get("Policies", [])
+    for policy in policies if isinstance(policies, list) else []:
         if isinstance(policy, dict) and "Fn::If" in policy:
             found += [b for b in policy["Fn::If"][1:] if isinstance(b, dict) and "PolicyDocument" in b]
         elif isinstance(policy, dict):
@@ -774,7 +833,7 @@ def check_secret_access(template: dict) -> list[str]:
         allowed.setdefault(role, set()).update(refs - {None})
     for role, secrets in sorted(allowed.items()):
         for policy in _policies(roles.get(role, {})):
-            for st in policy.get("PolicyDocument", {}).get("Statement", []):
+            for st in _document_statements(policy.get("PolicyDocument")):
                 if st.get("Effect") == "Allow" and covers(_actions(st), SECRET_ACTIONS):
                     targets = _names(st.get("Resource"))
                     if "*" in targets or not targets <= secrets:
@@ -858,13 +917,13 @@ def _statements(template: dict):
     """(role or policy name, attached roles, statement) for every IAM statement."""
     for name, role in resources(template, "AWS::IAM::Role").items():
         for policy in _policies(role):
-            for st in expand_statements(policy.get("PolicyDocument", {}).get("Statement", [])):
+            for st in _document_statements(policy.get("PolicyDocument")):
                 yield name, {name}, st
     for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"):
         for name, policy in resources(template, kind).items():
             props = policy.get("Properties", {})
             attached = ({logical_id(r) for r in props.get("Roles", [])} | {logical_id(props.get("RoleName"))}) - {None}
-            for st in expand_statements(props.get("PolicyDocument", {}).get("Statement", [])):
+            for st in _document_statements(props.get("PolicyDocument")):
                 yield name, attached, st
 
 
@@ -1061,7 +1120,13 @@ def _documents(template: dict):
     execution = {logical_id(td.get("Properties", {}).get("ExecutionRoleArn"))
                  for td in resources(template, "AWS::ECS::TaskDefinition").values()}
     for name, role in resources(template, "AWS::IAM::Role").items():
-        for policy in role.get("Properties", {}).get("Policies", []):
+        policies = role.get("Properties", {}).get("Policies", [])
+        if not isinstance(policies, list):
+            # The whole list in an If (or any function): no check could
+            # read a statement of it.
+            yield name, None, False
+            continue
+        for policy in policies:
             branches = policy["Fn::If"][1:] if isinstance(policy, dict) and "Fn::If" in policy else [policy]
             for branch in branches:
                 if isinstance(branch, dict) and "Fn::If" in branch:
@@ -1075,19 +1140,33 @@ def _documents(template: dict):
 
 def check_iam_shapes(template: dict) -> list[str]:
     """Fail closed: every IAM statement is written so the other checks can
-    read it. Action and Resource are literals, Ref, GetAtt or Sub; no
-    statement or policy sits in an If inside another If.
+    read it. A role's Policies, each PolicyDocument and its Statement are
+    written out, not produced by a function; Action and Resource are
+    literals, Ref, GetAtt or Sub; no statement or policy sits in an If
+    inside another If. No role has managed policies, whose statements no
+    check can see.
 
     One exception, accepted on #126: an execution role may name the registry
     stack's repository by its export (ECR_IMPORTS), since the platform stack
     does not create the repositories. A task role may not import anything.
     """
     problems = []
+    for name, role in resources(template, "AWS::IAM::Role").items():
+        if "ManagedPolicyArns" in role.get("Properties", {}):
+            problems.append(f"{name}: managed policies, which the checks cannot see into; write the statements inline")
     for name, document, imports_allowed in _documents(template):
         if document is None:
-            problems.append(f"{name}: a policy inside a nested Fn::If, which the checks cannot read")
+            problems.append(f"{name}: policies inside a nested or list-wide Fn::If, which the checks cannot read")
             continue
-        for st in document.get("Statement", []) if isinstance(document.get("Statement"), list) else [document.get("Statement")]:
+        if not isinstance(document, dict) or "Fn::If" in document:
+            problems.append(f"{name}: a PolicyDocument written with a function, which the checks cannot read")
+            continue
+        statements = document.get("Statement", [])
+        if isinstance(statements, dict) and "Fn::If" in statements and any(
+                isinstance(b, list) for b in statements["Fn::If"][1:]):
+            problems.append(f"{name}: a Statement list inside an Fn::If, which the checks cannot read")
+            continue
+        for st in statements if isinstance(statements, list) else [statements]:
             if isinstance(st, dict) and "Fn::If" in st:
                 inner = [b for b in st["Fn::If"][1:] if isinstance(b, dict) and "Ref" not in b]
                 if any("Fn::If" in b for b in inner):
@@ -1100,6 +1179,74 @@ def check_iam_shapes(template: dict) -> list[str]:
                 for key in ("Action", "NotAction", "Resource", "NotResource"):
                     if key in s and not _readable(s[key], imports_allowed):
                         problems.append(f"{name}: {key} written with a function the checks cannot read (use Ref, GetAtt or Sub)")
+    return problems
+
+
+ECR_PULL = ("ecr:batchchecklayeravailability", "ecr:getdownloadurlforlayer", "ecr:batchgetimage")
+
+
+def _execution_key(value) -> str | None:
+    """A resource of an execution role's statement: "*", a logical id, or
+    the registry export it imports."""
+    if value == "*":
+        return "*"
+    if value in ECR_IMPORTS:
+        return "import " + value["Fn::ImportValue"]["Fn::Sub"]
+    return logical_id(value)
+
+
+def _repository_import(image) -> str | None:
+    """The registry export of the repository ARN a container image is pulled
+    from: its Sub's Repository is the repository URI's export."""
+    if not (isinstance(image, dict) and isinstance(image.get("Fn::Sub"), list) and len(image["Fn::Sub"]) == 2):
+        return None
+    uri = image["Fn::Sub"][1].get("Repository", {})
+    sub = uri.get("Fn::ImportValue", {}).get("Fn::Sub") if isinstance(uri, dict) else None
+    if not isinstance(sub, str) or not sub.endswith("RepositoryUri"):
+        return None
+    return "import " + sub[: -len("Uri")] + "Arn"
+
+
+def check_execution_roles(template: dict) -> list[str]:
+    """Each execution role grants exactly what starting its tasks needs
+    (ADR 0007 §4): the ECR token, pulling from the repository its images
+    come from, writing to its own log group, and reading the secrets its
+    task definition injects. Nothing more, and nothing of that missing."""
+    needs: dict[str, set[tuple[str, str]]] = {}
+    for name, td in resources(template, "AWS::ECS::TaskDefinition").items():
+        props = td.get("Properties", {})
+        role = logical_id(props.get("ExecutionRoleArn"))
+        if role is None:
+            continue
+        need = needs.setdefault(role, {("*", "ecr:getauthorizationtoken")})
+        for c in props.get("ContainerDefinitions", []):
+            repository = _repository_import(c.get("Image"))
+            if repository is not None:
+                need.update((repository, a) for a in ECR_PULL)
+            group = logical_id(c.get("LogConfiguration", {}).get("Options", {}).get("awslogs-group"))
+            if group is not None:
+                need.update({(group, "logs:createlogstream"), (group, "logs:putlogevents")})
+            for secret in c.get("Secrets", []):
+                ref = logical_id(secret.get("ValueFrom"))
+                if ref is not None:
+                    need.add((ref, "secretsmanager:getsecretvalue"))
+    problems = []
+    roles = resources(template, "AWS::IAM::Role")
+    for role, need in sorted(needs.items()):
+        if role not in roles:
+            continue  # not a role of this template
+        granted = set()
+        for _, attached, st in _statements(template):
+            if role not in attached or st.get("Effect") != "Allow":
+                continue
+            resources_ = st.get("Resource", [])
+            for value in resources_ if isinstance(resources_, list) else [resources_]:
+                key = _execution_key(value) or "?"
+                granted.update((key, a.lower()) for a in _actions(st) if isinstance(a, str))
+        for key, action in sorted(granted - need):
+            problems.append(f"{role}: grants {action} on {key}, which starting its tasks does not need")
+        for key, action in sorted(need - granted):
+            problems.append(f"{role}: lacks {action} on {key}, which starting its tasks needs")
     return problems
 
 
@@ -1293,6 +1440,7 @@ CHECKS = (
     check_ft_server_egress,
     check_egress_with_endpoints,
     check_endpoint_policies,
+    check_endpoints_ready,
     check_target_groups,
     check_plain_listeners,
     check_load_balancers,
@@ -1307,6 +1455,7 @@ CHECKS = (
     check_table_keys,
     check_alarm_rules,
     check_secret_access,
+    check_execution_roles,
     check_iam_shapes,
     check_iam_statements,
     check_scans,

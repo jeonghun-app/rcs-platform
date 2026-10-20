@@ -104,7 +104,6 @@ stack_status() {
   fi
 }
 
-# Logical id, type and physical id of each resource, one per line.
 # Logical id, type, physical id and status of each resource, one per line.
 # A stack whose creation rolled back still lists the resources it deleted,
 # as DELETE_COMPLETE.
@@ -122,14 +121,24 @@ deployed_template() {
   echo "$file"
 }
 
-# Turns a load balancer's deletion protection on or off. One already gone
-# (a rolled-back creation deleted it) is skipped.
-# A load balancer's deletion protection now: true or false.
+# A load balancer's deletion protection now: true or false, or "gone" for
+# one a rolled-back creation already deleted. Any other error stops the
+# teardown with its cause: a missing permission or expired credentials are
+# not a deleted load balancer.
 protection_of() {
-  aws elbv2 describe-load-balancer-attributes --region "$REGION" --load-balancer-arn "$1" \
-    --query "Attributes[?Key=='deletion_protection.enabled'].Value | [0]" --output text 2>/dev/null || echo gone
+  local out err="$WORK/protection.err"
+  if out="$(aws elbv2 describe-load-balancer-attributes --region "$REGION" --load-balancer-arn "$1" \
+    --query "Attributes[?Key=='deletion_protection.enabled'].Value | [0]" --output text 2>"$err")"; then
+    echo "$out"
+  elif grep -q LoadBalancerNotFound "$err"; then
+    echo gone
+  else
+    fail "cannot read deletion protection of $1, nothing was changed: $(head -n 1 "$err")"
+  fi
 }
 
+# Turns a load balancer's deletion protection on or off. One already gone
+# (a rolled-back creation deleted it) is skipped.
 set_protection() {
   local arn="$1" value="$2" out
   if out="$(aws elbv2 modify-load-balancer-attributes --region "$REGION" --load-balancer-arn "$arn" \
@@ -163,7 +172,7 @@ report_retained() {
 # Deletes a stack and waits; a stack that does not exist is skipped. The
 # retained resources are listed afterwards.
 delete_stack() {
-  local stack="$1" template="$2" status resources="" arn lifted=() reused=""
+  local stack="$1" template="$2" status resources="" arn protection protected=() lifted=() reused=()
   if [[ "$DRY_RUN" == false ]]; then
     status="$(stack_status "$stack")"
     case "$status" in
@@ -177,9 +186,11 @@ delete_stack() {
     [[ "$status" == REVIEW_IN_PROGRESS ]] || template="$(deployed_template "$stack")"
     # Elastic IPs the stack was given (NlbAllocationIdA/B) are not its own:
     # they stay as they are, and are listed with what is left behind.
-    reused="$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$stack" \
+    # deploy.sh passes empty values too, which text output prints as tabs:
+    # word splitting keeps only the allocation ids.
+    read -r -a reused <<<"$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$stack" \
       --query "Stacks[0].Parameters[?ParameterKey=='NlbAllocationIdA' || ParameterKey=='NlbAllocationIdB'].ParameterValue" \
-      --output text 2>/dev/null || true)"
+      --output text 2>/dev/null | sed 's/None//g' || true)"
   fi
 
   # Load balancers have deletion protection in prod, which would fail the
@@ -191,19 +202,22 @@ delete_stack() {
         --attributes Key=deletion_protection.enabled,Value=false
     fi
   else
-    # Only protection that is on is lifted, and only that is put back.
+    # Only protection that is on is lifted, and only that is put back. All
+    # are read first, so a read that fails leaves every one as it was.
     while IFS= read -r arn; do
       [[ -n "$arn" ]] || continue
-      case "$(protection_of "$arn")" in
-        true) ;;
-        gone) echo "  $arn no longer exists"; continue ;;
-        *) continue ;;
+      protection="$(protection_of "$arn")" || exit 1
+      case "$protection" in
+        true) protected+=("$arn") ;;
+        gone) echo "  $arn no longer exists" ;;
       esac
+    done < <(awk '$2 == "AWS::ElasticLoadBalancingV2::LoadBalancer" && $4 != "DELETE_COMPLETE" { print $3 }' <<<"$resources")
+    for arn in ${protected[@]+"${protected[@]}"}; do
       if set_protection "$arn" false; then
         echo "  deletion protection off: $arn"
         lifted+=("$arn")
       fi
-    done < <(awk '$2 == "AWS::ElasticLoadBalancingV2::LoadBalancer" && $4 != "DELETE_COMPLETE" { print $3 }' <<<"$resources")
+    done
   fi
 
   run aws cloudformation delete-stack --region "$REGION" --stack-name "$stack"
@@ -229,8 +243,8 @@ delete_stack() {
     echo "  deleted $stack. Retained, still billed and still holding data:"
   fi
   report_retained "$template" "$resources"
-  if [[ -n "${reused// /}" && "$reused" != None ]]; then
-    echo "  NLB Elastic IPs the stack was given, kept as they were: $reused"
+  if [[ ${#reused[@]} -gt 0 ]]; then
+    echo "  NLB Elastic IPs the stack was given, kept as they were: ${reused[*]}"
   fi
 }
 

@@ -41,7 +41,7 @@ OLD = "sha256:" + "cd" * 32
 TAG = "v0.1.0-3-gabcdef0"
 
 STUB = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 
 tool = os.path.basename(sys.argv[0])
 args = sys.argv[1:]
@@ -100,6 +100,8 @@ if tool == "aws":
             print(len(state.get("addresses", {})))
         elif ids not in state.get("addresses", {}):
             fail("InvalidAllocationID.NotFound")
+        elif "AssociationId" in query:
+            print(state["addresses"][ids] + "\t" + state.get("associations", {}).get(ids, "None"))
         else:
             print(state["addresses"][ids])
     elif cmd == ["ec2", "describe-managed-prefix-lists"]:
@@ -110,7 +112,11 @@ if tool == "aws":
         if "StackStatus" in query:
             print(state["stacks"][stack])
         elif "ParameterKey==" in query:
-            print("\t".join(v for v in state.get("parameters", {}).get(stack, []) if v) or "None")
+            # As the CLI's text output: the values asked for, empty ones
+            # included, tab-separated.
+            wanted = re.findall(r"ParameterKey=='(\w+)'", query)
+            given = state.get("parameters", {}).get(stack, {})
+            print("\t".join(given[k] for k in given if k in wanted))
         elif "OutputKey==" in query:
             key = query.split("OutputKey=='")[1].split("'")[0]
             print(state["outputs"].get(stack, {}).get(key, "None"))
@@ -158,8 +164,15 @@ if tool == "aws":
     elif cmd == ["elbv2", "describe-load-balancer-attributes"]:
         if flag("--load-balancer-arn") in state["gone"]:
             fail("An error occurred (LoadBalancerNotFound): not found")
+        if flag("--load-balancer-arn") in state.get("attribute_errors", {}):
+            fail(state["attribute_errors"][flag("--load-balancer-arn")])
         print(state.get("protection", {}).get(flag("--load-balancer-arn"), "true"))
     elif cmd == ["secretsmanager", "get-secret-value"]:
+        errors = state.get("secret_errors", {}).get(f'{flag("--secret-id")} {flag("--version-stage") or "AWSCURRENT"}')
+        if errors:
+            message = errors.pop(0)
+            save()
+            fail(message)
         if flag("--version-stage") == "AWSPREVIOUS":
             if flag("--secret-id") not in state.setdefault("previous", {}):
                 fail("ResourceNotFoundException: no AWSPREVIOUS version")
@@ -388,9 +401,15 @@ class DeployConfig(Stubbed):
 class Deploy(Stubbed):
     """A deployment against the stubs, from an empty account to a rollback."""
 
-    def existing(self, image_tag="v0.0.9", previous="none"):
+    def existing(self, image_tag="v0.0.9", previous="none", **parameters):
         self.state["stacks"] = {"rcs-platform-ecr": "UPDATE_COMPLETE", "rcs-platform": "UPDATE_COMPLETE"}
         self.state["outputs"]["rcs-platform"] = {"ImageTag": image_tag, "PreviousImageTag": previous}
+        # As the example config deployed them.
+        given = {"NatGateways": "single", "NlbAllocationIdA": "", "NlbAllocationIdB": ""}
+        self.state.setdefault("parameters", {})["rcs-platform"] = {**given, **parameters}
+
+    def eip_checks(self) -> int:
+        return len([a for a in self.aws("service-quotas", "get-service-quota") if "L-0263D0A3" in a])
 
     def test_a_first_deployment_builds_pushes_and_passes_every_parameter(self):
         result = self.run_script(DEPLOY, *deploy())
@@ -488,6 +507,53 @@ class Deploy(Stubbed):
         result = self.run_script(DEPLOY, "--config", str(path), "--yes")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Elastic IPs: 1 to allocate, 3 held, quota 5.0", result.stdout)
+
+    def test_an_update_that_adds_nat_gateways_checks_the_elastic_ip_quota(self):
+        # QA's P6: single to per-az with every address of the quota held.
+        self.existing(image_tag=TAG)
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        self.state["quotas"] = {"L-0263D0A3": "5.0"}
+        self.state["addresses"] = {f"eipalloc-{i}": f"198.51.100.{i}" for i in range(1, 6)}
+        path = self.config(replace={"NatGateways": "per-az"})
+        result = self.run_script(DEPLOY, "--config", str(path), "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("allocates 1 Elastic IPs and the account holds 5, over the quota of 5.0", result.stderr)
+        self.assertEqual(self.aws("cloudformation", "create-change-set", stack="rcs-platform"), [])
+
+    def test_an_update_that_gives_up_a_retained_address_checks_the_quota(self):
+        self.existing(image_tag=TAG, NlbAllocationIdA="eipalloc-1")
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        self.state["quotas"] = {"L-0263D0A3": "5.0"}
+        self.state["addresses"] = {f"eipalloc-{i}": f"198.51.100.{i}" for i in range(1, 6)}
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("allocates 1 Elastic IPs and the account holds 5", result.stderr)
+
+    def test_an_update_that_allocates_nothing_skips_the_elastic_ip_check(self):
+        self.existing(image_tag=TAG)
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.eip_checks(), 0)
+
+    def test_a_reused_address_attached_elsewhere_is_refused(self):
+        self.state["addresses"] = {"eipalloc-0a1": "198.51.100.7"}
+        self.state["associations"] = {"eipalloc-0a1": "eipassoc-0b2"}
+        path = self.config(replace={"NlbAllocationIdA": "eipalloc-0a1"})
+        result = self.run_script(DEPLOY, "--config", str(path), "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Elastic IP eipalloc-0a1 (198.51.100.7) is attached to something else (eipassoc-0b2)", result.stderr)
+        self.assertEqual(self.aws("cloudformation", "create-change-set", stack="rcs-platform"), [])
+
+    def test_a_reused_address_on_this_stacks_nlb_is_kept(self):
+        self.existing(image_tag=TAG, NlbAllocationIdA="eipalloc-0a1")
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        self.state["addresses"] = {"eipalloc-0a1": "198.51.100.7"}
+        self.state["associations"] = {"eipalloc-0a1": "eipassoc-0b2"}
+        path = self.config(replace={"NlbAllocationIdA": "eipalloc-0a1"})
+        result = self.run_script(DEPLOY, "--config", str(path), "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.change_set("rcs-platform")["NlbReusedAddressA"], "198.51.100.7")
 
     def test_a_different_template_revision_is_warned_about(self):
         self.existing(image_tag=TAG)
@@ -648,7 +714,8 @@ class Deploy(Stubbed):
         path = self.config(replace={"NlbAllocationIdB": "eipalloc-0ff"})
         result = self.run_script(DEPLOY, "--config", str(path), "--yes")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("no Elastic IP eipalloc-0ff", result.stderr)
+        self.assertIn("cannot read Elastic IP eipalloc-0ff", result.stderr)
+        self.assertIn("InvalidAllocationID.NotFound", result.stderr)
         self.assertEqual(self.aws("cloudformation", "create-change-set", stack="rcs-platform"), [])
 
     def test_values_reach_cloudformation_unchanged(self):
@@ -773,10 +840,30 @@ class Teardown(Stubbed):
         self.assertEqual([a[:2] for a in self.calls("aws")], [["sts", "get-caller-identity"]])
 
     def test_reused_addresses_are_listed_as_kept(self):
-        self.state["parameters"] = {"rcs-platform": ["eipalloc-0a1", ""]}
+        self.state["parameters"] = {"rcs-platform": {"NlbAllocationIdA": "eipalloc-0a1", "NlbAllocationIdB": ""}}
         result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("NLB Elastic IPs the stack was given, kept as they were: eipalloc-0a1", result.stdout)
+        self.assertIn("NLB Elastic IPs the stack was given, kept as they were: eipalloc-0a1\n", result.stdout)
+
+    def test_no_reused_addresses_print_no_line(self):
+        # deploy.sh passes both, empty: the CLI prints a lone tab.
+        self.state["parameters"] = {"rcs-platform": {"NlbAllocationIdA": "", "NlbAllocationIdB": ""}}
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("kept as they were", result.stdout)
+
+    def test_an_unreadable_protection_stops_before_the_deletion(self):
+        arn = self.LB_NLB
+        self.state["attribute_errors"] = {arn: "An error occurred (AccessDenied) when calling the "
+                                                "DescribeLoadBalancerAttributes operation: not authorized"}
+        result = self.run_script(TEARDOWN, "--confirm", "rcs-platform")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"cannot read deletion protection of {arn}", result.stderr)
+        self.assertIn("AccessDenied", result.stderr)
+        self.assertNotIn("no longer exists", result.stdout)
+        # Read before anything is lifted: the ALB keeps its protection.
+        self.assertEqual(self.protections(), [])
+        self.assertEqual(self.deletes(), [])
 
     def test_an_empty_review_stack_is_deleted(self):
         self.state["stacks"]["rcs-platform"] = "REVIEW_IN_PROGRESS"
@@ -902,6 +989,61 @@ class RotateToken(Stubbed):
         result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
         self.assertEqual(result.returncode, 1)
         self.assertIn("step 2 already ran", result.stderr)
+        self.assertIn("finish it with --step 2", result.stderr)
+        self.assertNotIn("--step 3", result.stderr)
+        self.assertEqual(self.current(), before)
+
+    def test_step_one_while_step_two_is_half_done_is_refused(self):
+        self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        new = self.current()[1]
+        # As if only step 2's first write landed.
+        self.state["previous"]["rcs-platform/hss/ft-server-token-next"] = new
+        self.state["secrets"]["rcs-platform/hss/ft-server-token-next"] = "O" * 64
+        before = self.current()
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("step 2 stopped between its writes", result.stderr)
+        self.assertEqual(self.current(), before)
+
+    def throttle_previous(self, secret: str):
+        self.state["secret_errors"] = {f"rcs-platform/{secret} AWSPREVIOUS": [
+            "An error occurred (ThrottlingException) when calling the GetSecretValue operation: Rate exceeded"]}
+
+    def test_a_failed_previous_read_on_a_rerun_of_step_two_swaps_nothing(self):
+        # QA's R2: the caller's restart fails, and the rerun's read of a
+        # previous version is throttled.
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1").returncode, 0)
+        new = self.current()[1]
+        self.state["rollouts"] = {"ft-server": ["1\tFAILED\t1\t2"]}
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run --step 2 again", result.stderr)
+        self.assertNotIn("--step 3", result.stderr)
+        self.assertEqual(self.current(), (new, "O" * 64))
+        self.throttle_previous("hss/ft-server-token")
+        self.log.write_text("")
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("cannot read the previous version of rcs-platform/hss/ft-server-token", result.stderr)
+        self.assertIn("ThrottlingException", result.stderr)
+        self.assertEqual(self.steps(), [])
+        self.assertEqual(self.current(), (new, "O" * 64))
+        # Once the read works again, the rerun only restarts, and step 3
+        # retires the old value.
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "2").returncode, 0)
+        self.assertEqual(self.current(), (new, "O" * 64))
+        self.assertEqual(self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "3").returncode, 0)
+        self.assertEqual(self.current()[0], new)
+        self.assertNotIn(self.current()[1], ("O" * 64, new))
+
+    def test_a_failed_previous_read_stops_step_one_before_it_writes(self):
+        self.state["secret_errors"] = {"rcs-platform/hss/ft-server-token-next AWSPREVIOUS": [
+            "An error occurred (AccessDeniedException) when calling the GetSecretValue operation: denied"]}
+        before = self.current()
+        result = self.run_script(ROTATE, "--token", "hss/ft-server-token", "--step", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("AccessDeniedException", result.stderr)
+        self.assertEqual(self.steps(), [])
         self.assertEqual(self.current(), before)
 
     def test_step_three_before_step_two_is_refused(self):

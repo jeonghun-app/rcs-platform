@@ -132,9 +132,12 @@ The platform stack:
   gateway and one per NLB subnet not given a retained allocation
   (`NlbAllocationIdA/B`): four in prod. The default quota is 5 per region,
   and addresses an earlier stack retained still count. deploy.sh refuses a
-  first creation above it (`--quota-code L-0263D0A3`, service code `ec2`).
-  Reuse the retained NLB addresses
+  deployment above it (`--quota-code L-0263D0A3`, service code `ec2`): a
+  first creation, or an update that adds NAT gateways or gives up a reused
+  NLB address. Reuse the retained NLB addresses
   ([runbook](runbook.md#keeping-the-nlb-addresses)) or release them first.
+  A reused address must be free: deploy.sh refuses one attached to anything
+  but this stack's NLB.
 - **A CloudTrail trail** recording management events in that region.
   Without it the security change rules see nothing.
 - **In prod, GuardDuty Runtime Monitoring for Fargate** (ADR 0007 §9). It is
@@ -170,8 +173,9 @@ scripts/deploy.sh --config ~/rcs-dev.params          # needs approval
    stack is in a state CloudFormation cannot update, that the Fargate vCPU
    quota fits a rolling update, and, before a first creation, that no name
    the stack would take (tables, secrets, log groups, repositories) is
-   still held by an earlier stack's retained resources and that the Elastic
-   IPs fit the quota. Before an update, it warns when the stack runs the
+   still held by an earlier stack's retained resources. Before a first
+   creation, and an update that allocates Elastic IPs, it checks that they
+   fit the quota. Before an update, it warns when the stack runs the
    template of another commit (`TemplateRevision`), which this run would
    replace.
 4. Deploys the registry stack through a change set (below).
@@ -202,9 +206,11 @@ registry stack is `<name>-ecr`, and the repositories are `<name>` and
 
 Each stack changes through a change set. deploy.sh prints every resource it
 adds, modifies or removes. It marks with `!!` the resources that hold data
-or an address (tables, keys, buckets, secrets, log groups, repositories,
-load balancers, the VPC and its subnets, Elastic IPs, NAT gateways and the
-namespace) that CloudFormation removes or **replaces**. A replaced table,
+or an address, or what operators added by hand (tables, keys, buckets,
+secrets, log groups, repositories, load balancers, the VPC and its subnets,
+Elastic IPs, NAT gateways, the namespace, the network ACL with its deny
+entries and the alarm topic with its subscriptions) that CloudFormation
+removes or **replaces**. A replaced table,
 key or bucket starts empty, since the originals are retained, not moved. A
 replaced load balancer or namespace gets a new address. Changing `VpcCidr`
 or `ServiceNamespace` replaces almost everything. Other replacements, such
@@ -379,7 +385,8 @@ scripts/teardown.sh --stack-name rcs-dev             # needs approval; asks for 
 The script asks you to type the stack name, or takes `--confirm <name>`. It
 reads the template the stack was deployed with, turns off the load
 balancers' deletion protection where it is on (skipping those already
-gone), deletes the platform stack and waits. If the deletion fails
+gone; one whose protection cannot be read stops the teardown before
+anything changes), deletes the platform stack and waits. If the deletion fails
 (`DELETE_FAILED`), it turns back on only the protection it turned off. If
 the waiter gives up while the deletion still runs, it changes nothing and
 says so. `--with-registry` also empties the template bucket and deletes the

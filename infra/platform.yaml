@@ -3130,8 +3130,10 @@ Resources:
   # deployment whose tasks do not become healthy, no ECS Exec (checked).
 
   # Tasks of a new stack reach their images, secrets and logs only through
-  # the interface endpoints: every service waits for them and for its
-  # group's egress to them (ECS starts tasks as soon as a service exists).
+  # the interface endpoints: every service waits for them and for both sides
+  # of its group's path to them, its egress and the endpoints' ingress (ECS
+  # starts tasks as soon as a service exists). make infra-lint checks that
+  # every endpoint and endpoint rule is listed.
   EndpointsReady:
     Type: AWS::CloudFormation::WaitConditionHandle
     Metadata:
@@ -3146,6 +3148,17 @@ Resources:
           - !Ref KmsEndpoint
           - !Ref ServiceDiscoveryEndpoint
           - !Ref DataServiceDiscoveryEndpoint
+          - !If [WithEumEndpoint, !Ref SmsVoiceEndpoint, '']
+          - !If [WithSnsEndpoint, !Ref SnsEndpoint, '']
+          - !Ref PcscfToEndpoints
+          - !Ref IcscfToEndpoints
+          - !Ref ScscfToEndpoints
+          - !Ref RcsAsToEndpoints
+          - !Ref HssToEndpoints
+          - !Ref MsrpRelayToEndpoints
+          - !Ref FtServerToEndpoints
+          - !Ref AcsToEndpoints
+          - !Ref OperatorToEndpoints
           - !Ref PcscfToEndpointsOut
           - !Ref IcscfToEndpointsOut
           - !Ref ScscfToEndpointsOut

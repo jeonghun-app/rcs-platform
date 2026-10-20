@@ -747,6 +747,121 @@ class FailClosed(TemplateCase):
         self.assertFalse(re.fullmatch(pattern, "a" * 64 + ".example.com"))
 
 
+
+class FailClosedRound4(TemplateCase):
+    """Bad copies from the fourth reviews (#126 at 6c07ae0)."""
+
+    def role_policies(self, t: dict, role: str) -> list:
+        return t["Resources"][role]["Properties"]["Policies"]
+
+    def wide_secret_read(self) -> dict:
+        return {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "*"}
+
+    def test_a_policies_list_inside_an_if_is_refused(self):
+        # The code review's copy: the whole list in an If, one branch adding
+        # a read of every secret.
+        t = copy.deepcopy(self.template)
+        original = self.role_policies(t, "HssExecutionRole")
+        wider = copy.deepcopy(original)
+        wider[0]["PolicyDocument"]["Statement"].append(self.wide_secret_read())
+        t["Resources"]["HssExecutionRole"]["Properties"]["Policies"] = {"Fn::If": ["IsDev", wider, original]}
+        self.assertProblem(t, "HssExecutionRole: policies inside a nested or list-wide Fn::If")
+
+    def test_a_policy_document_inside_an_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        policy = self.role_policies(t, "FtServerTaskRole")[0]
+        document = policy["PolicyDocument"]
+        policy["PolicyDocument"] = {"Fn::If": ["IsDev", document, document]}
+        self.assertProblem(t, "FtServerTaskRole: a PolicyDocument written with a function")
+
+    def test_a_statement_list_inside_an_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        document = self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]
+        statements = document["Statement"]
+        document["Statement"] = {"Fn::If": ["IsDev", statements + [self.wide_secret_read()], statements]}
+        self.assertProblem(t, "HssExecutionRole: a Statement list inside an Fn::If")
+
+    def test_managed_policies_are_refused_on_every_role(self):
+        for role in ("HssExecutionRole", "HssTaskRole"):
+            with self.subTest(role=role):
+                t = copy.deepcopy(self.template)
+                t["Resources"][role]["Properties"]["ManagedPolicyArns"] = [
+                    "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+                self.assertProblem(t, f"{role}: managed policies, which the checks cannot see into")
+
+    def test_an_execution_role_grants_only_what_starting_tasks_needs(self):
+        t = copy.deepcopy(self.template)
+        self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {"Fn::GetAtt": ["SubscribersTable", "Arn"]}})
+        self.assertProblem(t, "HssExecutionRole: grants dynamodb:getitem on SubscribersTable, which starting its tasks does not need")
+
+    def test_an_execution_role_pulls_only_from_its_images_repository(self):
+        t = copy.deepcopy(self.template)
+        for st in self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]["Statement"]:
+            if "ecr:BatchGetImage" in st["Action"]:
+                st["Resource"] = {"Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-AcsRepositoryArn"}}
+        found = check_infra.problems(t)
+        self.assertIn("HssExecutionRole: grants ecr:batchgetimage on import ${EcrStackName}-AcsRepositoryArn, "
+                      "which starting its tasks does not need", found)
+        self.assertIn("HssExecutionRole: lacks ecr:batchgetimage on import ${EcrStackName}-PlatformRepositoryArn, "
+                      "which starting its tasks needs", found)
+
+    def test_an_execution_role_writes_only_its_own_log_group(self):
+        t = copy.deepcopy(self.template)
+        for st in self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]["Statement"]:
+            if "logs:PutLogEvents" in st["Action"]:
+                st["Resource"] = {"Fn::GetAtt": ["FtServerLogGroup", "Arn"]}
+        self.assertProblem(t, "HssExecutionRole: grants logs:putlogevents on FtServerLogGroup")
+        self.assertProblem(t, "HssExecutionRole: lacks logs:putlogevents on HssLogGroup")
+
+    def test_an_execution_role_in_an_attached_policy_is_held_too(self):
+        t = self.changed(ExtraPolicy={"Type": "AWS::IAM::Policy", "Properties": {
+            "PolicyName": "extra", "Roles": [{"Ref": "AcsExecutionRole"}],
+            "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                                              "Resource": {"Fn::Sub": "${FilesBucket.Arn}/*"}}]}}})
+        self.assertProblem(t, "AcsExecutionRole: grants s3:getobject on ?, which starting its tasks does not need")
+
+    def test_the_layer_bucket_exception_matches_exactly(self):
+        def layer(t):
+            for st in t["Resources"]["S3Endpoint"]["Properties"]["PolicyDocument"]["Statement"]:
+                if "starport" in str(st.get("Resource")):
+                    return st
+        cases = {
+            "another arn beside it": lambda st: st.update(Resource=[st["Resource"], "arn:aws:s3:::someone-else/*"]),
+            "a wildcard bucket": lambda st: st.update(Resource={"Fn::Sub": "arn:${AWS::Partition}:s3:::*-starport-layer-bucket/*"}),
+            "another action": lambda st: st.update(Action=["s3:GetObject", "s3:PutObject"]),
+        }
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                t = copy.deepcopy(self.template)
+                change(layer(t))
+                self.assertProblem(t, "S3Endpoint: an endpoint policy statement not held to this account")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["LogsEndpoint"]["Properties"]["PolicyDocument"]["Statement"].append(copy.deepcopy(layer(t)))
+        self.assertProblem(t, "LogsEndpoint: an endpoint policy statement not held to this account")
+
+    def endpoints_listed(self, t: dict) -> list:
+        return t["Resources"]["EndpointsReady"]["Metadata"]["Endpoints"]["Fn::If"][1]
+
+    def test_endpoints_ready_waits_for_every_endpoint_and_rule(self):
+        for name in ("HssToEndpoints", "HssToEndpointsOut", "SmsVoiceEndpoint", "SnsEndpoint", "KmsEndpoint"):
+            with self.subTest(name=name):
+                t = copy.deepcopy(self.template)
+                listed = self.endpoints_listed(t)
+                listed[:] = [v for v in listed if name not in check_infra._refs(v)]
+                self.assertProblem(t, f"EndpointsReady: does not wait for {name}")
+
+    def test_every_service_waits_for_the_endpoints(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["AcsService"]["DependsOn"]
+        self.assertProblem(t, "AcsService: does not wait for EndpointsReady")
+
+    def test_a_target_group_protocol_in_an_if_is_reported(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["RelayMsrpTargetGroup"]["Properties"]["Protocol"] = {"Fn::If": ["IsDev", "TCP", "TLS"]}
+        self.assertProblem(t, "RelayMsrpTargetGroup: Protocol written with a function")
+
+
 RUNBOOK = TEMPLATE.parent.parent / "docs" / "runbook.md"
 
 
