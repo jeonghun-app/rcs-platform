@@ -339,8 +339,15 @@ func TestADeregistrationOvertakenByARegistrationGivesTheSetBackToTheHSS(t *testi
 	ch.hook = func() { wantStatus(t, b.registerWith(plain(2), 600), 200) }
 	g := plain(3)
 	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
+	before := must(e.store.Registration(bg, set1))(t)
 	wantStatus(t, g.Register(bg, a.request(0, auth), upstream), 200)
 	wantSameBindings(t, e, 1, impu1, tel1)
+	// B took the record over from A's lease: a new incarnation, which A's
+	// deregistration did not unpoint.
+	if after := must(e.store.Registration(bg, set1))(t); after.Incarnation == before.Incarnation {
+		t.Error("the record B took over from the lease kept its incarnation")
+	}
+	wantPointed(t, e, impu1, tel1)
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	if ch.last != cx.Registration {
