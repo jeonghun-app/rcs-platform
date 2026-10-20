@@ -279,7 +279,7 @@ func (p *pcscf) anchorOriginating(r *proxy.Request, d proxy.Decision) proxy.Deci
 	if r.Message.Method != "INVITE" || p.msrp == nil {
 		return d
 	}
-	part, found, err := findSDP(r.Message.Header.Get("Content-Type"), r.Message.Body)
+	part, found, err := messageSDP(&r.Message.Header, r.Message.Body)
 	if err != nil {
 		return p.refuseOffer()
 	}
@@ -419,7 +419,7 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, req *sip.Request) 
 		return fail(err)
 	}
 	s.host = u.Host
-	part, _, err := findSDP(req.Header.Get("Content-Type"), req.Body)
+	part, _, err := messageSDP(&req.Header, req.Body)
 	if err != nil {
 		return fail(err)
 	}
@@ -495,7 +495,7 @@ func (p *pcscf) originatingResponse(ctx context.Context, s *msrpSession, res *si
 	to, _ := res.Header.To()
 	tag := strings.ToLower(to.Tag())
 	received := res.Clone()
-	part, found, err := findSDP(res.Header.Get("Content-Type"), res.Body)
+	part, found, err := messageSDP(&res.Header, res.Body)
 	var d []byte
 	if err == nil && found {
 		d = part.description()
@@ -699,7 +699,7 @@ func (p *pcscf) watchLateOffer(r *proxy.Request, d proxy.Decision) proxy.Decisio
 		if res.StatusCode < 101 || res.StatusCode >= 300 {
 			return
 		}
-		part, found, err := findSDP(res.Header.Get("Content-Type"), res.Body)
+		part, found, err := messageSDP(&res.Header, res.Body)
 		if err != nil {
 			dropBody(res)
 		} else if !found {
@@ -821,7 +821,7 @@ func (p *pcscf) msrpInDialog(flow transport.FlowID, req *sip.Request, fromClient
 	ok := true
 	switch req.Method {
 	case "INVITE", "UPDATE", "PRACK", "ACK":
-		part, found, err := findSDP(req.Header.Get("Content-Type"), req.Body)
+		part, found, err := messageSDP(&req.Header, req.Body)
 		switch {
 		case err != nil:
 			ok = false
@@ -1019,7 +1019,7 @@ func (p *pcscf) ownRoute(u sip.URI) bool {
 // offersMSRP reports whether req carries an MSRP offer, or a body pcscf
 // cannot read for one.
 func offersMSRP(req *sip.Request) bool {
-	part, found, err := findSDP(req.Header.Get("Content-Type"), req.Body)
+	part, found, err := messageSDP(&req.Header, req.Body)
 	if err != nil {
 		return true
 	}
@@ -1036,7 +1036,7 @@ func offerless(req *sip.Request) bool {
 	if req.Method != "INVITE" {
 		return false
 	}
-	_, found, err := findSDP(req.Header.Get("Content-Type"), req.Body)
+	_, found, err := messageSDP(&req.Header, req.Body)
 	return err == nil && !found
 }
 

@@ -442,7 +442,8 @@ offer; an ACK with an MSRP description is not passed on.
   line ends, one space between fields).
 - **What is refused.** A body `pcscf` cannot split in one way only is
   answered 488 rather than passed on, since another reader might find a
-  description in it that `pcscf` did not: two descriptions, a multipart
+  description in it that `pcscf` did not: a message with two
+  `Content-Type` fields, two descriptions, a multipart
   inside a part, a part header folded or with a `Content-Type` that does
   not parse or comes twice, a line that starts like a delimiter but is
   not one, bare LF line ends, a description in a transfer encoding, or

@@ -11,6 +11,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // The SDP side of MSRP anchoring (ADR 0004, #136): finding the session
@@ -56,6 +57,20 @@ func (p sdpPart) with(d []byte) []byte {
 	}
 	out = append(out, d...)
 	return append(out, p.body[p.end:]...)
+}
+
+// messageSDP is findSDP for the body of a SIP message with header h. A
+// message with more than one Content-Type field, or one that does not
+// parse, has a body pcscf cannot read: another reader might take the field
+// pcscf did not, and find a description in it (QA of #248).
+func messageSDP(h *sip.Header, body []byte) (sdpPart, bool, error) {
+	if len(body) == 0 {
+		return sdpPart{}, false, nil
+	}
+	if _, err := h.ContentType(); err != nil {
+		return sdpPart{}, false, errBodyUnreadable
+	}
+	return findSDP(h.Get("Content-Type"), body)
 }
 
 // findSDP finds the session description of a body of contentType: the
