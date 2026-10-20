@@ -55,6 +55,9 @@ type Dialog struct {
 	LocalSeq     uint32
 	RemoteSeq    uint32
 	HasRemoteSeq bool
+	// InviteSeq is the CSeq of this side's last INVITE, which its ACK
+	// carries (RFC 3261 §13.2.2.4); zero before one.
+	InviteSeq uint32
 }
 
 // UAC is the dialog that a response with a To tag sets up for the request
@@ -151,6 +154,9 @@ func sent(req *sip.Request) (*Dialog, error) {
 		return nil, fmt.Errorf("%w: malformed CSeq or no Call-ID", ErrNoDialog)
 	}
 	d.LocalSeq = cseq.Seq
+	if req.Method == "INVITE" {
+		d.InviteSeq = cseq.Seq
+	}
 	return d, nil
 }
 
@@ -265,8 +271,8 @@ const maxSeq = 1<<31 - 1
 
 // Request builds this side's next request in the dialog (RFC 3261
 // §12.2.1.1), with the next CSeq, which d keeps; an ACK takes the CSeq of
-// the INVITE it acknowledges, this side's last request, and keeps it (RFC
-// 3261 §13.2.2.4). Its top Via names the transport placeholder host
+// this side's last INVITE, the one it acknowledges, whatever came between,
+// and moves no CSeq (RFC 3261 §13.2.2.4). Its top Via names the transport placeholder host
 // "invalid" with a new branch; the transport writes its own sent-by when
 // it sends it (RFC 3261 §18.1.1). A target refresh request carries
 // LocalTarget as its Contact. The Request-URI is the remote target without
@@ -275,10 +281,10 @@ const maxSeq = 1<<31 - 1
 func (d *Dialog) Request(method string, ids sip.IDGenerator) (*sip.Request, error) {
 	seq := d.LocalSeq + 1
 	switch {
-	case method == "ACK" && d.LocalSeq == 0:
+	case method == "ACK" && d.InviteSeq == 0:
 		return nil, errors.New("dialog: no INVITE to acknowledge")
 	case method == "ACK":
-		seq = d.LocalSeq
+		seq = d.InviteSeq
 	case d.LocalSeq >= maxSeq:
 		return nil, errors.New("dialog: CSeq exhausted")
 	}
@@ -292,7 +298,7 @@ func (d *Dialog) Request(method string, ids sip.IDGenerator) (*sip.Request, erro
 	// remote target goes last (§12.2.1.1).
 	if len(routes) > 0 && !routes[0].URI.Params.Has("lr") {
 		req.URI = requestURI(routes[0].URI)
-		routes = append(slices.Clone(routes[1:]), sip.Address{URI: d.RemoteTarget})
+		routes = append(slices.Clone(routes[1:]), sip.Address{URI: requestURI(d.RemoteTarget)})
 	}
 	fields := [][2]string{
 		{"Via", "SIP/2.0/TCP invalid;branch=" + branch},
@@ -313,6 +319,12 @@ func (d *Dialog) Request(method string, ids sip.IDGenerator) (*sip.Request, erro
 			return nil, err
 		}
 	}
-	d.LocalSeq = seq
+	switch method {
+	case "ACK":
+	case "INVITE":
+		d.LocalSeq, d.InviteSeq = seq, seq
+	default:
+		d.LocalSeq = seq
+	}
 	return req, nil
 }
