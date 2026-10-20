@@ -1008,13 +1008,18 @@ var _ Metrics = (*runtime.Metrics)(nil)
 
 // unavailableFrom makes every send from the k-th on (1-based) fail as one
 // to a task that became unavailable after it was picked, the race #261 is
-// about, and counts the sends.
-func unavailableFrom(c *Client, k int) *atomic.Int32 {
+// about, and counts the sends; the first fails with first instead, if set,
+// rather than going to its task.
+func unavailableFrom(c *Client, k int, first ...error) *atomic.Int32 {
 	var n atomic.Int32
 	real := c.send
 	c.send = func(ctx context.Context, p *diameter.Peer, m *diameter.Message) (*diameter.Message, error) {
-		if int(n.Add(1)) >= k {
+		i := int(n.Add(1))
+		switch {
+		case i >= k:
 			return nil, diameter.ErrPeerUnavailable
+		case i == 1 && len(first) > 0:
+			return nil, first[0]
 		}
 		return real(ctx, p, m)
 	}
@@ -1022,17 +1027,22 @@ func unavailableFrom(c *Client, k int) *atomic.Int32 {
 }
 
 // TestAnErrorSaysWhetherAnyAttemptWasSent: a first attempt answered busy,
-// whose retry then found its task unavailable, may have been served, though
-// the error is the retry's; only one whose every attempt never left is
-// NeverSent (#261).
+// or that timed out or lost its connection, may have been served, though
+// its retry then found its task unavailable and the error is the retry's;
+// only one whose every attempt never left is NeverSent (#261).
 func TestAnErrorSaysWhetherAnyAttemptWasSent(t *testing.T) {
 	for _, c := range []struct {
 		name      string
 		from      int
+		first     []error
 		neverSent bool
 	}{
-		{"first busy, retry unavailable", 2, false},
-		{"both unavailable", 1, true},
+		{"first busy, retry unavailable", 2, nil, false},
+		{"first timed out, retry unavailable", 2, []error{diameter.ErrTimeout}, false},
+		{"first's deadline passed, retry unavailable", 2, []error{context.DeadlineExceeded}, false},
+		{"first's connection closed, retry unavailable", 2, []error{diameter.ErrConnectionClosed}, false},
+		{"first not negotiated, retry unavailable", 2, []error{diameter.ErrApplicationNotNegotiated}, true},
+		{"both unavailable", 1, nil, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			e := newEnv(t, nil)
@@ -1041,7 +1051,7 @@ func TestAnErrorSaysWhetherAnyAttemptWasSent(t *testing.T) {
 			a.setAnswer(busy)
 			b.setAnswer(busy)
 			e.refresh("192.0.2.1", "192.0.2.2")
-			sends := unavailableFrom(e.client, c.from)
+			sends := unavailableFrom(e.client, c.from, c.first...)
 			_, err := e.client.MAR(ctx(t), &cx.MAR{UserName: impi1, PublicIdentity: impu1, NumberAuthItems: 1})
 			if sends.Load() != 2 || !errors.Is(err, diameter.ErrPeerUnavailable) {
 				t.Fatalf("%d sends, error %v; want the retry's unavailable peer", sends.Load(), err)
@@ -1051,8 +1061,15 @@ func TestAnErrorSaysWhetherAnyAttemptWasSent(t *testing.T) {
 			}
 		})
 	}
-	if !NeverSent(ErrNoPeer) || NeverSent(diameter.ErrTimeout) || NeverSent(diameter.ErrConnectionClosed) {
-		t.Error("NeverSent of a single error")
+	for _, err := range []error{ErrNoPeer, diameter.ErrPeerUnavailable, diameter.ErrApplicationNotNegotiated} {
+		if !NeverSent(err) {
+			t.Errorf("NeverSent(%v) is false", err)
+		}
+	}
+	for _, err := range []error{diameter.ErrTimeout, diameter.ErrConnectionClosed, context.DeadlineExceeded} {
+		if NeverSent(err) {
+			t.Errorf("NeverSent(%v) is true", err)
+		}
 	}
 }
 
