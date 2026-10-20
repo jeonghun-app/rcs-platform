@@ -671,6 +671,44 @@ func TestARefreshOfASessionRCSASStartedTakesTheNextVersion(t *testing.T) {
 	}
 }
 
+// Close returns once its BYEs are answered, not once they are queued: the
+// transport closes right after it, and would drop a BYE it has not
+// written yet.
+func TestCloseWaitsForTheAnswersToItsBYEs(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{closeWait: time.Hour})
+	got, release := make(chan struct{}, 1), make(chan struct{})
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method != "BYE" {
+			return nil
+		}
+		got <- struct{}{}
+		<-release
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	p := r.a.dial(t)
+	s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
+	p.ack(s)
+	closed := make(chan struct{})
+	go func() { r.a.srv.Close(); close(closed) }()
+	select {
+	case <-got:
+	case <-time.After(waitFor):
+		t.Fatal("no BYE")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before its BYE was answered")
+	default:
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(waitFor):
+		t.Fatal("Close did not return after the answer")
+	}
+}
+
 func TestGroupSessionsAreNotServedYet(t *testing.T) {
 	r := newChatRig(t, messaging.Config{})
 	inv := invitation()

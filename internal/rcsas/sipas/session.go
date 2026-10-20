@@ -166,8 +166,12 @@ func (s *Server) Close() {
 		all = append(all, ss)
 	}
 	s.mu.Unlock()
+	wait := s.cfg.closeWait
+	if wait <= 0 {
+		wait = closeWait
+	}
 	var wg sync.WaitGroup
-	deadline := time.After(closeWait)
+	deadline := time.After(wait)
 	for _, ss := range all {
 		wg.Go(func() {
 			select {

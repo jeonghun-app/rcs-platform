@@ -76,6 +76,9 @@ type Config struct {
 	Rand io.Reader
 	// Clock runs the session timers; nil is the system clock.
 	Clock msrp.Clock
+
+	// closeWait is closeWait unless a test sets it.
+	closeWait time.Duration
 	// Metrics counts events, without identifiers; nil counts nothing.
 	Metrics messaging.Counter
 	// Logger receives operational events, never identities or content; nil
