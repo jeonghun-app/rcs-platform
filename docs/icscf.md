@@ -51,8 +51,8 @@ required.
 | `ICSCF_CORE_HOST` | the task's private IPv4 address | this task's address, in the Via of what it forwards |
 | `ICSCF_SCSCF` | `[{"uri":"sip:scscf.<namespace>:5060;transport=tcp"}]` | S-CSCFs to choose from, JSON: `uri`, and optional `mandatory` and `optional` capability numbers |
 | `ICSCF_RETRY_AFTER` | `10s` | `Retry-After` of the 480 and 503 above, whole seconds up to 1 h |
-| `ICSCF_REGISTER_TIMEOUT` | `16s` | how long a REGISTER waits for the S-CSCF, at most 32 s (the client's Timer F) |
-| `ICSCF_DIAMETER_HOST` | `icscf-<random>.<namespace>` drawn at start ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) | this task's Diameter identity |
+| `ICSCF_REGISTER_TIMEOUT` | `16s` | how long a REGISTER waits for the S-CSCF; with twice `ICSCF_CX_TIMEOUT` (the UAR and its retry) under 32 s, the client's Timer F |
+| `ICSCF_DIAMETER_HOST` | `icscf-<random>.<namespace>` drawn at start ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) | this task's Diameter identity; leave unset in ECS (refused in staging and prod): every task needs its own, fresh at each start |
 | `ICSCF_DIAMETER_REALM` | `RCS_IMS_DOMAIN` | this task's Diameter realm |
 | `ICSCF_HSS_REALM` | `ICSCF_DIAMETER_REALM` | the HSS's realm, every Cx request's Destination-Realm |
 | `ICSCF_HSS_DISCOVERY` | `cloudmap` | how the HSS tasks are found: `cloudmap` (DiscoverInstances, every task) or `dns` (`hss.<namespace>`, at most eight tasks; refused in staging and prod) |
@@ -93,3 +93,5 @@ With `ICSCF_HSS_DISCOVERY=cloudmap` the task role needs
 - The transaction caps of #37 are not configurable here until it lands.
 - S-CSCF re-selection, and the other parts of TS 24.229 §5.3 listed in the
   package documentation.
+- On stop, transactions in flight are not answered before the process ends
+  (a shared proxy drain, filed separately).

@@ -114,6 +114,8 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"unknown discovery":        with(devEnv, "ICSCF_HSS_DISCOVERY", "consul"),
 		"bad core host":            with(devEnv, "ICSCF_CORE_HOST", "here"),
 		"bad HSS host pattern":     with(devEnv, "ICSCF_HSS_HOST_PATTERN", "hss *.x"),
+		// 2 × 8 s + 16 s reaches the client's Timer F (review of #276).
+		"Cx and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "8s"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
@@ -122,12 +124,26 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 	}
 }
 
-// Production refuses DNS discovery, which sees at most eight HSS tasks; dev
-// takes it. The HSS host pattern cannot be emptied: it keeps its default.
-func TestProductionRefusesDNSDiscovery(t *testing.T) {
-	status, out := startup(t, with(prodEnv, "ICSCF_HSS_DISCOVERY", "dns"))
-	if want := "ICSCF_HSS_DISCOVERY=dns sees at most eight HSS tasks"; status != runtime.ExitFailure || !strings.Contains(out, want) {
-		t.Fatalf("status %d, want %q refused:\n%s", status, want, out)
+// Production refuses DNS discovery, which sees at most eight HSS tasks, and
+// a fixed Origin-Host (review of #276); dev takes both. The HSS host pattern
+// cannot be emptied: it keeps its default.
+func TestProductionRefusesDNSDiscoveryAndAFixedOriginHost(t *testing.T) {
+	for _, tt := range []struct {
+		kv   []string
+		want string
+	}{
+		{[]string{"ICSCF_HSS_DISCOVERY", "dns"}, "ICSCF_HSS_DISCOVERY=dns sees at most eight HSS tasks"},
+		{[]string{"ICSCF_DIAMETER_HOST", "icscf-a.rcs.local"}, "ICSCF_DIAMETER_HOST is set"},
+	} {
+		t.Run(tt.want, func(t *testing.T) {
+			status, out := startup(t, with(prodEnv, tt.kv...))
+			if status != runtime.ExitFailure || !strings.Contains(out, tt.want) {
+				t.Fatalf("status %d, want %q refused:\n%s", status, tt.want, out)
+			}
+		})
+	}
+	if _, err := configure(with(devEnv, "ICSCF_DIAMETER_HOST", "icscf-a.rcs.local")); err != nil {
+		t.Fatalf("dev refused a fixed Origin-Host: %v", err)
 	}
 	if c, err := configure(with(devEnv, "ICSCF_HSS_HOST_PATTERN", "")); err != nil || c.HSSHostPattern != "hss-*.rcs.local" {
 		t.Errorf("an empty pattern gave %q (%v), want the default", c.HSSHostPattern, err)

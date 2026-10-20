@@ -120,6 +120,15 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	if c.CxTimeout <= 0 {
 		e.Invalid("CX_TIMEOUT", "must be greater than zero")
 	}
+	// A REGISTER waits for a UAR, an attempt and its retry on another HSS
+	// task, and then for the S-CSCF: all of it must end before the client's
+	// Timer F, 64*T1 = 32 s, or the 480 or 504 comes after it gave up
+	// (review of #276).
+	if c.CxTimeout > 0 && c.RegisterTimeout > 0 && 2*c.CxTimeout+c.RegisterTimeout >= MaxRegisterTimeout {
+		e.Invalid("REGISTER_TIMEOUT", "plus twice ICSCF_CX_TIMEOUT must be under 32s, the client's Timer F")
+	}
+	s.ForbidInProduction(c.OriginHost != "",
+		"ICSCF_DIAMETER_HOST is set: every task would share one Origin-Host, and a task replacing a dead one would find the HSS holding its predecessor's connection in REOPEN (ADR 0005); leave it unset in ECS")
 	switch c.HSSDiscovery {
 	case DiscoveryCloudMap:
 	case DiscoveryDNS:

@@ -230,7 +230,7 @@ The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
 container on the stack's network (`<COMPOSE_PROJECT>_default`), with
 `deploy/compose.env` as its environment. It:
 
-1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay` and `acs`;
+1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf` and `acs`;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim all`:

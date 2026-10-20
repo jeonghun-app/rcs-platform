@@ -28,6 +28,7 @@ import (
 type diameterHSS struct {
 	node *diameter.Node
 	addr string
+	ln   *countingListener
 	mu   sync.Mutex
 	// answer decides the result and Server-Name of each answer.
 	answer func(code uint32) (cx.Result, string)
@@ -56,11 +57,12 @@ func startHSSAs(t *testing.T, host string) *diameterHSS {
 		t.Fatal(err)
 	}
 	n.SetErrorAVPs(cx.ApplicationID, cx.ErrorAVPs)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &diameterHSS{node: n, addr: ln.Addr().String()}
+	ln := &countingListener{Listener: l}
+	h := &diameterHSS{node: n, addr: ln.Addr().String(), ln: ln}
 	for _, code := range []uint32{cx.CodeUserAuthorization, cx.CodeLocationInfo} {
 		n.HandleFunc(cx.ApplicationID, code, func(_ context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
 			h.mu.Lock()
@@ -82,6 +84,20 @@ func startHSSAs(t *testing.T, host string) *diameterHSS {
 		_ = n.Shutdown(ctx)
 	})
 	return h
+}
+
+// countingListener counts the connections it accepts.
+type countingListener struct {
+	net.Listener
+	accepted atomic.Int64
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return c, err
 }
 
 func (h *diameterHSS) commands() []uint32 {
@@ -387,8 +403,13 @@ func TestAPeerThatIsNotAnHSSTaskIsNotAsked(t *testing.T) {
 	impostor := startHSSAs(t, "impostor.rcs.local")
 	impostor.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "sip:192.0.2.66" }
 	r := startICSCF(t, impostor, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && len(impostor.node.Peers()) == 0 {
+	// icscf must have connected and seen the CEA, or the test would pass
+	// for a peer it never reached (review of #276).
+	deadline := time.Now().Add(realWait)
+	for impostor.ln.accepted.Load() == 0 || len(impostor.node.Peers()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("icscf never connected to the peer")
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
