@@ -352,3 +352,90 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 		t.Errorf("RTRs with time left %v, want one with a good share of the push's", n.left)
 	}
 }
+
+// holdingStore loses its first write and, before answering, has another
+// request of the task wait for the subscriber's lock, which it then holds
+// for good.
+type holdingStore struct {
+	store.Store
+	h       *HSS
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (s *holdingStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	lost := false
+	s.once.Do(func() {
+		lost = true
+		go func() {
+			if _, err := s.h.lock(context.Background(), n.IMPI); err != nil {
+				panic(err)
+			}
+		}()
+		<-s.waiting
+	})
+	if lost {
+		return nil, store.ErrConflict
+	}
+	return s.Store.UpdateSubscription(ctx, old, n)
+}
+
+// TestARetryThatCannotGetTheLockIsTooBusy: a MAR whose write lost, and whose
+// retry then finds the lock held by another request of the task until the Cx
+// timeout, is answered DIAMETER_TOO_BUSY, which the S-CSCF retries on another
+// task, and not counted as an error (#244 review). Only a context error after
+// a lost write is contention.
+func TestARetryThatCannotGetTheLockIsTooBusy(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	hs := &holdingStore{Store: e.store, waiting: make(chan struct{}, 4)}
+	h := e.newHSS(func(o *Options) { o.Store = hs })
+	hs.h = h
+	h.onLockWait = func() { hs.waiting <- struct{}{} }
+	c := connectCSCF(t, serveHSSWith(t, h, "hss-a.rcs.local", 300*time.Millisecond), "scscf-1.rcs.local")
+	r := &cx.MAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentity: impu1,
+		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5}, NumberAuthItems: 1, ServerName: scscfName}
+	ans := c.send(r.Message(c.node))
+	if rc, _ := ans.ResultCode(); rc != diameter.ResultTooBusy {
+		t.Fatalf("Result-Code = %d, want DIAMETER_TOO_BUSY", rc)
+	}
+	if e.metrics.get("cx.mar.error") != 0 {
+		t.Error("a busy lock was counted as a Cx error")
+	}
+}
+
+// stallingStore loses its first write and blocks the next one until the
+// context ends, then fails as DynamoDB does, with the context's error
+// wrapped.
+type stallingStore struct {
+	store.Store
+	mu     sync.Mutex
+	writes int
+}
+
+func (s *stallingStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	s.mu.Lock()
+	s.writes++
+	first := s.writes == 1
+	s.mu.Unlock()
+	if first {
+		return nil, store.ErrConflict
+	}
+	<-ctx.Done()
+	return nil, fmt.Errorf("update subscription: %w", ctx.Err())
+}
+
+// TestAWriteTheDeadlineCutsShortAfterALossIsContention: the DynamoDB path,
+// where the deadline ends a store call in flight rather than the backoff
+// (#244 review).
+func TestAWriteTheDeadlineCutsShortAfterALossIsContention(t *testing.T) {
+	ss := &stallingStore{Store: store.NewMemory()}
+	e := newEnvWith(t, ss)
+	e.provision(impi1, impu1)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+	if !errors.Is(err, errContention) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("update = %v, want contention at the deadline", err)
+	}
+}

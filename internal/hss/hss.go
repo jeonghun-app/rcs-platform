@@ -200,9 +200,12 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 		switch {
 		case errors.Is(err, store.ErrConflict):
 			continue
-		case err != nil && attempt > 0 && ctx.Err() != nil:
+		case attempt > 0 && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)):
 			// The deadline ended an attempt after a lost one: still
 			// contention, though DynamoDB reported it as a context error.
+			// errBusy, a wait for the lock that ran out, is not: it is local
+			// to this task, and Cx answers it DIAMETER_TOO_BUSY so that the
+			// S-CSCF tries another (busy).
 			return nil, contended(ctx)
 		}
 		return saved, err
