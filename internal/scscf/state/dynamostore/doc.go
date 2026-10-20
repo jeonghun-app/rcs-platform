@@ -20,14 +20,13 @@
 //	                  without contacts the end of the deregistration lease, or
 //	                  else the end of an unregistered user's state
 //
-// An identity, pk = the canonical IMPU, holds version, writer and a doc
-// naming its set and the set's incarnation, and no index attribute. The
-// profiles, one per set, pk profile#<IMPI>#<default IMPU>, hold the
-// User-Data in doc, received
-// (number, Unix ns) ordering them, and ttl (number, Unix seconds), the table's
-// TTL attribute, holding KeepUntil. They have no index attribute, so no index
-// lists them. Registrations have no ttl: DynamoDB must never delete one, only
-// a sweep, which sends the SAR.
+// An identity, pk = the canonical IMPU, holds version, writer, a doc naming
+// its set and the set's incarnation, and ttl (number, Unix seconds), the
+// table's TTL attribute, holding KeepUntil; it has no index attribute. The
+// profiles, one per set, pk profile#<IMPI>#<default IMPU>, hold the User-Data
+// in doc, received (number, Unix ns) ordering them, and ttl holding KeepUntil,
+// and no index attribute either, so no index lists them. Set records have no
+// ttl: DynamoDB must never delete one, only a sweep, which sends the SAR.
 //
 // with global secondary indexes impi-index (partition impi) and expiry-index
 // (partition shard, sort expires), both keys only. The shard spreads the

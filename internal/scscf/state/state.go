@@ -494,7 +494,17 @@ type Profile struct {
 // past lastExpiry. Measured from the expiry rather than the time left, a
 // registration longer than ProfileGrace still extends it before it runs out.
 func (p *Profile) KeepDue(lastExpiry time.Time) bool {
-	return p.KeepUntil.Sub(lastExpiry) < ProfileGrace-ProfileKeepMargin
+	return keepDue(p.KeepUntil, lastExpiry)
+}
+
+// KeepDue is Profile.KeepDue for an identity, with KeepIdentity. Each has its
+// own: a PPR or a refused save may move the profile's alone.
+func (i *Identity) KeepDue(lastExpiry time.Time) bool {
+	return keepDue(i.KeepUntil, lastExpiry)
+}
+
+func keepDue(keepUntil, lastExpiry time.Time) bool {
+	return keepUntil.Sub(lastExpiry) < ProfileGrace-ProfileKeepMargin
 }
 
 // Clone returns a copy of p that shares no memory with it.
