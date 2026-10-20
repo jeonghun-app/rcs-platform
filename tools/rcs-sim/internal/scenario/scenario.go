@@ -74,6 +74,11 @@ type Config struct {
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
+
+	// RequireAll makes a step that would be skipped, for want of
+	// something the stack does not offer yet, a failure instead, so CI can
+	// require it once the stack does.
+	RequireAll bool
 	// KeepAliveTimeout bounds the keep-alive step alone, the IdleWait
 	// included, so it must be longer than IdleWait; zero is StepTimeout. A
 	// short one makes a client that sends no keep-alive fail soon without
@@ -92,6 +97,9 @@ type Result struct {
 	Millis   int64  `json:"ms"`
 	// Error says what failed, without identifiers.
 	Error string `json:"error,omitempty"`
+	// Skipped, on a step that did not run but did not fail either, says
+	// why, in a fixed text. Config.RequireAll makes it a failure.
+	Skipped string `json:"skipped,omitempty"`
 	// Detail holds sizes and counts.
 	Detail map[string]int64 `json:"detail,omitempty"`
 }
@@ -151,7 +159,7 @@ func Run(ctx context.Context, cfg Config, names []string, report Report) (bool, 
 		r := &run{ctx: ctx, cfg: cfg, name: n, report: report}
 		err := scenarios[n](r)
 		r.cleanup()
-		if err != nil || r.failed {
+		if err != nil && !errors.Is(err, errStepFailed) || r.failed {
 			ok = false
 		}
 	}
@@ -168,7 +176,8 @@ type run struct {
 	cleanups []func()
 }
 
-// errStepFailed stops a scenario after a failed step has been reported.
+// errStepFailed stops a scenario after a failed or skipped step has been
+// reported.
 var errStepFailed = errors.New("step failed")
 
 // step runs f as the step called name and reports it. A failure ends the
@@ -193,6 +202,18 @@ func (r *run) stepWithin(name string, timeout time.Duration, f func(ctx context.
 		return errStepFailed
 	}
 	return nil
+}
+
+// skip reports the step called name as not run, for reason, a fixed text,
+// and ends the scenario. With Config.RequireAll it is a failure.
+func (r *run) skip(name, reason string) error {
+	res := Result{Scenario: r.name, Step: name, OK: true, Skipped: reason}
+	if r.cfg.RequireAll {
+		res = Result{Scenario: r.name, Step: name, Error: reason}
+		r.failed = true
+	}
+	r.report(res)
+	return errStepFailed
 }
 
 // onEnd registers f to run when the scenario ends, last first.

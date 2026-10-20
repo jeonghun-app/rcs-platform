@@ -95,13 +95,22 @@ func TestARejectedDeregistrationEndsTheContactAsRejected(t *testing.T) {
 	}
 }
 
-func TestNetworkDeregisterNeedsAWayToAskTheNetwork(t *testing.T) {
+func TestNetworkDeregisterIsSkippedWithoutAWayToAskTheNetwork(t *testing.T) {
+	// Until the HSS API's DELETE and scscf's RTR exist (#14), a stack gives
+	// no Deregister: the step is skipped, said in a fixed text, and the run
+	// passes; with RequireAll it fails instead.
 	cfg, _ := sipStack(t)
 	cfg.Deregister = nil
 	ok, results := runAll(t, cfg, "reg-event")
 	last := results[len(results)-1]
-	if ok || last.Step != "network-deregister" || last.Error != "no network deregistration configured" {
+	if !ok || last.Step != "network-deregister" || !last.OK || last.Skipped != "network deregistration not configured" || last.Error != "" {
 		t.Fatalf("results %+v", results)
+	}
+	cfg.RequireAll = true
+	ok, results = runAll(t, cfg, "reg-event")
+	last = results[len(results)-1]
+	if ok || last.Step != "network-deregister" || last.OK || last.Skipped != "" || last.Error != "network deregistration not configured" {
+		t.Fatalf("with RequireAll: results %+v", results)
 	}
 }
 

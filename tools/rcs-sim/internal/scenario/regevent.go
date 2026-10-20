@@ -8,9 +8,10 @@ import (
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
-// errNoDeregister fails reg-event's network-deregister step on a stack
-// that has given the scenario no way to deregister the client.
-var errNoDeregister = errors.New("no network deregistration configured")
+// noDeregister is why reg-event's network-deregister step is skipped on a
+// stack that has given the scenario no way to deregister the client: until
+// the HSS API's DELETE and scscf's RTR exist (#14), none has.
+const noDeregister = "network deregistration not configured"
 
 // regEvent is the reg-event scenario (#135 AC 3, RFC 3680, TS 24.229
 // §5.1.1.3). The client subscribes to the reg event of its own IMPU, sees
@@ -75,10 +76,10 @@ func regEvent(r *run) error {
 	}); err != nil {
 		return err
 	}
+	if r.cfg.Deregister == nil {
+		return r.skip("network-deregister", noDeregister)
+	}
 	return r.step("network-deregister", func(ctx context.Context) (map[string]int64, error) {
-		if r.cfg.Deregister == nil {
-			return nil, errNoDeregister
-		}
 		if _, err := c.ua.Register(ctx); err != nil {
 			return nil, sipError(err)
 		}
