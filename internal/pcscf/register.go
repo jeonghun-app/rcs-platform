@@ -415,8 +415,10 @@ func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contac
 	saved.expires = p.now().Add(time.Duration(least) * time.Second)
 	saved.serviceRoute, _ = res.Header.ServiceRoute()
 	saved.associated, _ = res.Header.PAssociatedURI()
+	kept := true
 	if err := p.registry.save(&saved); err != nil {
 		p.log.Warn("registration not kept", slog.String("error", err.Error()))
+		kept = false
 	}
 
 	if outbound {
@@ -440,7 +442,9 @@ func (p *pcscf) registered(res *sip.Response, reg *registration, sent sip.Contac
 		p.registry.remove(reg.flow, reg.aor)
 		return
 	}
-	p.subscribeFor(&saved)
+	if kept {
+		p.subscribeFor(&saved)
+	}
 }
 
 // viaKeepFlag reports whether the client's Via, the top one of a response

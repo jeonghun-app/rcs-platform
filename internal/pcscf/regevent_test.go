@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -219,15 +220,23 @@ func notify(t *testing.T, p *pcscf, r *proxy.Request) int {
 // aliceDoc is registration information for alice's two identities, with
 // her contact over FLOW-A in the given state.
 func aliceDoc(version uint32, state reginfo.State, contact reginfo.ContactState, event reginfo.Event) *reginfo.Info {
-	c := []reginfo.Contact{{ID: "c1", State: contact, Event: event, URI: "sip:alice@192.0.2.10:40000;transport=tcp"}}
+	c := func(id string) []reginfo.Contact {
+		return []reginfo.Contact{{ID: id, State: contact, Event: event, URI: "sip:alice@192.0.2.10:40000;transport=tcp", Params: aliceBinding(1)}}
+	}
 	regState := reginfo.Active
 	if contact == reginfo.ContactTerminated {
 		regState = reginfo.Terminated
 	}
 	return &reginfo.Info{Version: version, State: state, Registrations: []reginfo.Registration{
-		{AOR: aliceIMPU, ID: "r1", State: regState, Contacts: c},
-		{AOR: aliceTel, ID: "r2", State: regState, Contacts: c},
+		{AOR: aliceIMPU, ID: "r1", State: regState, Contacts: c("c1")},
+		{AOR: aliceTel, ID: "r2", State: regState, Contacts: c("c2")},
 	}}
+}
+
+// aliceBinding is how scscf names alice's binding of reg-id regID in
+// reginfo: the +sip.instance and reg-id of outboundContact (RFC 5626).
+func aliceBinding(regID int) []reginfo.Param {
+	return []reginfo.Param{{Name: "+sip.instance", Value: `"<urn:uuid:00000000-0000-1000-8000-000000000001>"`}, {Name: "reg-id", Value: strconv.Itoa(regID)}}
 }
 
 // subscribedAlice registers alice over FLOW-A, and answers the SUBSCRIBE
@@ -255,7 +264,9 @@ func TestANotifyEndingAContactRemovesItsRegistration(t *testing.T) {
 	p, _, f := newSubscribingPcscf(t)
 	h := runtimeHarnessMetrics(t, p)
 	sub := subscribedAlice(t, p, f)
-	registerKept(t, p, "FLOW-B")
+	// The same device over a second flow: the same contact URI and
+	// instance, reg-id 2 (RFC 5626).
+	registerWith(t, p, "FLOW-B", outboundContactOf(2), "reg-flow-2", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound")
 	if !aliceRegistered(t, p, "FLOW-A") {
 		t.Fatal("an active contact ended the registration")
 	}
@@ -265,15 +276,46 @@ func TestANotifyEndingAContactRemovesItsRegistration(t *testing.T) {
 		t.Fatalf("NOTIFY: %d", code)
 	}
 	if aliceRegistered(t, p, "FLOW-A") {
-		t.Error("the ended contact's registration stayed")
+		t.Error("the ended binding's registration stayed")
 	}
-	// FLOW-B's registration has the same contact URI in this test, so it
-	// ends too: a contact URI is all reginfo names a binding by.
-	if aliceRegistered(t, p, "FLOW-B") {
-		t.Error("a registration with the ended contact stayed")
+	// The binding of reg-id 2 is another one: matched by +sip.instance and
+	// reg-id, not by the URI the two share (QA of #239).
+	if !aliceRegistered(t, p, "FLOW-B") {
+		t.Error("ending reg-id 1 ended the reg-id 2 registration")
 	}
-	if !h.count(metricDeregistered, 2) {
+	if !h.count(metricDeregistered, 1) {
 		t.Errorf("metrics %s", h.out.String())
+	}
+	// Bindings without an instance are matched by their URI.
+	p2, _, f2 := newSubscribingPcscf(t)
+	plain := "<sip:alice@192.0.2.10:40000;transport=tcp>"
+	registerWith(t, p2, "FLOW-A", plain, "reg-plain", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound")
+	s := f2.one(t, p2)
+	noInstance := aliceDoc(0, reginfo.Partial, reginfo.ContactTerminated, reginfo.Deactivated)
+	for i := range noInstance.Registrations {
+		noInstance.Registrations[i].State = reginfo.Active
+		noInstance.Registrations[i].Contacts[0].Params = nil
+	}
+	if code := notify(t, p2, notifyFor(t, s.req, 1, "active", noInstance)); code != 200 || aliceRegistered(t, p2, "FLOW-A") {
+		t.Errorf("a binding without an instance: %d, registered %v", code, aliceRegistered(t, p2, "FLOW-A"))
+	}
+}
+
+// outboundContactOf is outboundContact with reg-id regID.
+func outboundContactOf(regID int) string {
+	return strings.Replace(outboundContact, ";reg-id=1", ";reg-id="+strconv.Itoa(regID), 1)
+}
+
+// registerWith registers alice over flow with contact, as a REGISTER with
+// Call-ID callID, whose 200 has extra.
+func registerWith(t *testing.T, p *pcscf, flow transport.FlowID, contact, callID string, extra ...string) {
+	t.Helper()
+	req := strings.Replace(registerText(contact, "Supported: outbound"), "Call-ID: reg-1", "Call-ID: "+callID, 1)
+	d := p.Route(context.Background(), clientRequest(t, req, flow))
+	ok := strings.Replace(okText(contact+";expires=3600", extra...), "Call-ID: reg-1", "Call-ID: "+callID, 1)
+	d.OnResponse(context.Background(), parseResponse(t, ok))
+	if !aliceRegistered(t, p, flow) {
+		t.Fatal("not registered")
 	}
 }
 
@@ -328,7 +370,7 @@ func TestOnlyTheSubscriptionsNotifiesAreTaken(t *testing.T) {
 		{"another subscription", func(r *proxy.Request) { r.Message.URI.User = subscriptionPrefix + "0" }, 481},
 		{"another dialog's tag", func(r *proxy.Request) { replaceTag(t, r, "From", "n2") }, 481},
 		{"another Call-ID", func(r *proxy.Request) { _ = r.Message.Header.Set("Call-ID", "other") }, 481},
-		{"out of order", func(r *proxy.Request) { _ = r.Message.Header.Set("CSeq", "1 NOTIFY") }, 500},
+		{"out of order", func(r *proxy.Request) { _ = r.Message.Header.Set("CSeq", "0 NOTIFY") }, 500},
 		{"another event", func(r *proxy.Request) { _ = r.Message.Header.Set("Event", "presence") }, 489},
 		{"an event id", func(r *proxy.Request) { _ = r.Message.Header.Set("Event", "reg;id=2") }, 489},
 		{"no state", func(r *proxy.Request) { r.Message.Header.Del("Subscription-State") }, 400},
@@ -509,7 +551,8 @@ func TestTheLastRegistrationsEndEndsTheSubscription(t *testing.T) {
 	p.registry.removeFlow("FLOW-B")
 	p.reconcileSubscriptions()
 	s := f.one(t, p)
-	if s.req.Header.Get("Expires") != "0" || s.req.Header.Get("CSeq") != "2 SUBSCRIBE" || s.req.Header.Has("P-Asserted-Identity") {
+	// Every SUBSCRIBE asserts a Path, the one that ends it too (#239).
+	if s.req.Header.Get("Expires") != "0" || s.req.Header.Get("CSeq") != "2 SUBSCRIBE" || s.req.Header.Get("P-Asserted-Identity") != "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob>" {
 		t.Errorf("end: Expires %q, CSeq %q, PAI %q", s.req.Header.Get("Expires"), s.req.Header.Get("CSeq"), s.req.Header.Get("P-Asserted-Identity"))
 	}
 	if code := notify(t, p, notifyFor(t, sub, 2, "terminated;reason=timeout", nil)); code != 481 {
@@ -625,20 +668,32 @@ func TestASubscribeThatCannotBeSentIsTriedAgain(t *testing.T) {
 	}
 }
 
-// A subscription whose dialog no NOTIFY set up is forgotten once it
-// expires, and set up again.
+// A subscription whose dialog no NOTIFY set up within Timer N has failed
+// (RFC 6665 §4.1.2.4): it is forgotten, counted, and set up again after a
+// backoff, without deregistering anyone.
 func TestASubscriptionWithoutANotifyIsSetUpAgain(t *testing.T) {
 	p, clock, f := newSubscribingPcscf(t)
+	m := runtimeHarnessMetrics(t, p)
 	registerKept(t, p, "FLOW-A")
-	respond(t, f.one(t, p), 200, "Expires: 1200")
-	clock.t = clock.t.Add(1200*time.Second - time.Second)
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 7200")
+	clock.t = clock.t.Add(timerN - time.Second)
 	p.reconcileSubscriptions()
 	if got := f.take(p); len(got) != 0 {
-		t.Fatalf("%d sent before it expired", len(got))
+		t.Fatalf("%d sent before Timer N", len(got))
 	}
 	clock.t = clock.t.Add(time.Second)
 	p.reconcileSubscriptions()
+	if code := notify(t, p, notifyFor(t, s.req, 1, "active", nil)); code != 481 {
+		t.Errorf("a NOTIFY after Timer N: %d", code)
+	}
+	// Set up again after the backoff, the registration untouched.
+	clock.t = clock.t.Add(resubscribeAfter)
+	p.reconcileSubscriptions()
 	f.one(t, p)
+	if !aliceRegistered(t, p, "FLOW-A") || !m.count(metricSubscribeFailed, 1) {
+		t.Errorf("registered %v, metrics %s", aliceRegistered(t, p, "FLOW-A"), m.out.String())
+	}
 }
 
 // A refresh that the notifier answers 481 ends the subscription, which it
@@ -727,7 +782,6 @@ func TestIdentitiesCompareWithoutTheirParameters(t *testing.T) {
 	}{
 		{aliceIMPU, aliceIMPU + ";user=phone", true},
 		{aliceIMPU + ";user=phone", aliceIMPU, true},
-		{aliceIMPU + "?subject=x", aliceIMPU, true},
 		{aliceIMPU, "sip:+%315550100001@IMS.mnc001.mcc001.3gppnetwork.org", true},
 		{aliceIMPU, bobIMPU, false},
 		{aliceTel, "tel:+1-555-010-0001", true},
@@ -797,4 +851,319 @@ type metricReader struct {
 func (m *metricReader) count(name string, n int) bool {
 	m.p.metrics.Flush()
 	return strings.Contains(m.out.String(), fmt.Sprintf(`"%s":%d`, name, n))
+}
+
+// tabletDoc is a full document of alice's identities listing another
+// device's binding alone.
+func tabletDoc(version uint32) *reginfo.Info {
+	tablet := func(id string) []reginfo.Contact {
+		return []reginfo.Contact{{ID: id, State: reginfo.ContactActive, Event: reginfo.Registered, URI: "sip:alice-tablet@192.0.2.77:41000;transport=tcp"}}
+	}
+	return &reginfo.Info{Version: version, State: reginfo.Full, Registrations: []reginfo.Registration{
+		{AOR: aliceIMPU, ID: "r1", State: reginfo.Active, Contacts: tablet("c8")},
+		{AOR: aliceTel, ID: "r2", State: reginfo.Active, Contacts: tablet("c9")},
+	}}
+}
+
+// A full document is the whole state (RFC 3680 §5.2): a binding it does
+// not list is ended, even after a version gap.
+func TestAFullDocumentEndsWhatItDoesNotList(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	if code := notify(t, p, notifyFor(t, sub, 2, "active;expires=7000", tabletDoc(5))); code != 200 {
+		t.Fatalf("NOTIFY %d", code)
+	}
+	if aliceRegistered(t, p, "FLOW-A") {
+		t.Error("a full document without FLOW-A's binding left its registration")
+	}
+	// A full document without the identity at all ends it too.
+	p, _, f = newSubscribingPcscf(t)
+	sub = subscribedAlice(t, p, f)
+	other := &reginfo.Info{Version: 1, State: reginfo.Full}
+	if code := notify(t, p, notifyFor(t, sub, 2, "active", other)); code != 200 || aliceRegistered(t, p, "FLOW-A") {
+		t.Errorf("an empty full document: %d, registered %v", code, aliceRegistered(t, p, "FLOW-A"))
+	}
+}
+
+// scscf restarts and loses the subscription while the network ends
+// FLOW-A's binding: the refresh gets 481, a new subscription is set up,
+// and its first full document, without the binding, ends the registration
+// (QA of #239).
+func TestAResubscriptionAfterTheNotifierRestartedCatchesUp(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 1800")
+	if code := notify(t, p, notifyFor(t, s.req, 1, "active;expires=1800", aliceDoc(0, reginfo.Full, reginfo.ContactActive, reginfo.Registered))); code != 200 {
+		t.Fatal(code)
+	}
+	clock.t = clock.t.Add(1800*time.Second - refreshLead)
+	p.reconcileSubscriptions()
+	respond(t, f.one(t, p), 481)
+	clock.t = clock.t.Add(resubscribeAfter)
+	p.reconcileSubscriptions()
+	s2 := f.one(t, p)
+	respond(t, s2, 200, "Expires: 1800")
+	if code := notify(t, p, notifyFor(t, s2.req, 1, "active;expires=1800", tabletDoc(0))); code != 200 {
+		t.Fatal(code)
+	}
+	if aliceRegistered(t, p, "FLOW-A") {
+		t.Error("the new subscription's full document left the registration the network no longer has")
+	}
+}
+
+// A partial document that skips a version asks for a refresh at the next
+// sweep, which brings a full document (RFC 3680 §5.2).
+func TestAMissedPartialDocumentRefreshesTheSubscription(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	active := aliceDoc(3, reginfo.Partial, reginfo.ContactActive, reginfo.Refreshed)
+	if code := notify(t, p, notifyFor(t, sub, 2, "active;expires=7000", active)); code != 200 {
+		t.Fatal(code)
+	}
+	p.reconcileSubscriptions()
+	if got := f.one(t, p).req; got.Header.Get("CSeq") != "2 SUBSCRIBE" || got.Header.Get("Expires") == "0" {
+		t.Errorf("refresh %q %q", got.Header.Get("CSeq"), got.Header.Get("Expires"))
+	}
+	// The next one in sequence asks for none.
+	p.subs.mu.Lock()
+	for _, s := range p.subs.byKey {
+		s.busy = false
+	}
+	p.subs.mu.Unlock()
+	next := aliceDoc(4, reginfo.Partial, reginfo.ContactActive, reginfo.Refreshed)
+	notify(t, p, notifyFor(t, sub, 3, "active;expires=7000", next))
+	p.reconcileSubscriptions()
+	if got := f.take(p); len(got) != 0 {
+		t.Errorf("%d refreshes after a document in sequence", len(got))
+	}
+}
+
+// A refresh that fails other than with a code that ends the subscription
+// leaves it valid (TS 24.229 §5.2.3, RFC 6665 §4.1.2.2): a NOTIFY in its
+// dialog still deregisters, and the sweep tries again (review of #239).
+func TestAFailedRefreshKeepsTheSubscription(t *testing.T) {
+	for name, answer := range map[string]func(t *testing.T, s sentRequest){
+		"503":     func(t *testing.T, s sentRequest) { respond(t, s, 503, "Retry-After: 5") },
+		"500":     func(t *testing.T, s sentRequest) { respond(t, s, 500) },
+		"timeout": func(_ *testing.T, s sentRequest) { s.h(nil, transaction.ErrTimeout) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, clock, f := newSubscribingPcscf(t)
+			registerKept(t, p, "FLOW-A")
+			s := f.one(t, p)
+			respond(t, s, 200, "Expires: 1800")
+			notify(t, p, notifyFor(t, s.req, 1, "active;expires=1800", nil))
+			clock.t = clock.t.Add(1800*time.Second - refreshLead)
+			p.reconcileSubscriptions()
+			answer(t, f.one(t, p))
+			// The next sweep tries again.
+			clock.t = clock.t.Add(sweepInterval)
+			p.reconcileSubscriptions()
+			if got := f.one(t, p).req; got.Header.Get("CSeq") != "3 SUBSCRIBE" {
+				t.Errorf("retry CSeq %q", got.Header.Get("CSeq"))
+			}
+			doc := aliceDoc(1, reginfo.Partial, reginfo.ContactTerminated, reginfo.Deactivated)
+			if code := notify(t, p, notifyFor(t, s.req, 2, "active", doc)); code != 200 || aliceRegistered(t, p, "FLOW-A") {
+				t.Errorf("a deregistration in the still valid dialog: %d, registered %v", code, aliceRegistered(t, p, "FLOW-A"))
+			}
+		})
+	}
+}
+
+// A refresh that keeps failing lets the subscription lapse at its expiry,
+// after which it is set up again.
+func TestASubscriptionWhoseRefreshesFailLapses(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 1200")
+	notify(t, p, notifyFor(t, s.req, 1, "active;expires=1200", nil))
+	end := clock.t.Add(1200 * time.Second)
+	for clock.t.Before(end) {
+		clock.t = clock.t.Add(sweepInterval)
+		registerKept(t, p, "FLOW-A")
+		p.reconcileSubscriptions()
+		for _, r := range f.take(p) {
+			respond(t, r, 503)
+		}
+	}
+	clock.t = clock.t.Add(resubscribeAfter)
+	p.reconcileSubscriptions()
+	if got := f.take(p); len(got) != 1 || got[0].req.Header.Get("CSeq") != "1 SUBSCRIBE" {
+		t.Fatalf("%d sent after the subscription lapsed", len(got))
+	}
+}
+
+// A first SUBSCRIBE that fails is tried again after a backoff that doubles
+// with each failure in a row, and after its Retry-After if longer; one
+// refused for good after an hour (review of #239).
+func TestAFailingSubscribeBacksOff(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	respond(t, f.one(t, p), 503, "Retry-After: 100")
+	clock.t = clock.t.Add(100*time.Second - time.Second)
+	registerKept(t, p, "FLOW-A")
+	if got := f.take(p); len(got) != 0 {
+		t.Fatal("before the Retry-After")
+	}
+	clock.t = clock.t.Add(time.Second)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	s.h(nil, transaction.ErrTimeout)
+	// The second failure in a row waits twice resubscribeAfter.
+	clock.t = clock.t.Add(2*resubscribeAfter - time.Second)
+	registerKept(t, p, "FLOW-A")
+	if got := f.take(p); len(got) != 0 {
+		t.Fatal("before the doubled backoff")
+	}
+	clock.t = clock.t.Add(time.Second)
+	registerKept(t, p, "FLOW-A")
+	s = f.one(t, p)
+	// A NOTIFY resets the backoff: the next failure waits resubscribeAfter
+	// again, not four times it.
+	notify(t, p, notifyFor(t, s.req, 1, "terminated;reason=deactivated", nil))
+	clock.t = clock.t.Add(resubscribeAfter)
+	registerKept(t, p, "FLOW-A")
+	f.one(t, p).h(nil, transaction.ErrTimeout)
+	clock.t = clock.t.Add(resubscribeAfter)
+	registerKept(t, p, "FLOW-A")
+	f.one(t, p)
+}
+
+// A refresh's 2xx without an Expires keeps the subscription for what the
+// refresh asked for.
+func TestARefreshAnsweredWithoutExpiresKeepsTheSubscription(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	m := runtimeHarnessMetrics(t, p)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 1800")
+	notify(t, p, notifyFor(t, s.req, 1, "active;expires=1800", nil))
+	clock.t = clock.t.Add(1800*time.Second - refreshLead)
+	registerKept(t, p, "FLOW-A")
+	p.reconcileSubscriptions()
+	refresh := f.one(t, p)
+	respond(t, refresh, 200)
+	asked, _ := strconv.Atoi(refresh.req.Header.Get("Expires"))
+	// The client keeps registering meanwhile.
+	clock.t = clock.t.Add(time.Duration(asked)*time.Second - refreshLead - time.Second)
+	registerKept(t, p, "FLOW-A")
+	p.reconcileSubscriptions()
+	if got := f.take(p); len(got) != 0 {
+		t.Fatalf("%d sent early", len(got))
+	}
+	clock.t = clock.t.Add(time.Second)
+	p.reconcileSubscriptions()
+	if got := f.one(t, p).req.Header.Get("CSeq"); got != "3 SUBSCRIBE" {
+		t.Errorf("CSeq %q", got)
+	}
+	if m.count(metricSubscribeFailed, 1) {
+		t.Error("counted as a failure")
+	}
+}
+
+// An active NOTIFY without an expires, before the 2xx, gets the requested
+// time, so the subscription is refreshed or lapses rather than stays.
+func TestANotifyWithoutExpiresStillExpires(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	if code := notify(t, p, notifyFor(t, s.req, 1, "active", nil)); code != 200 {
+		t.Fatal(code)
+	}
+	s.h(nil, transaction.ErrTimeout)
+	clock.t = clock.t.Add(7200*time.Second - refreshLead)
+	registerKept(t, p, "FLOW-A")
+	p.reconcileSubscriptions()
+	if got := f.one(t, p).req; got.Header.Get("CSeq") != "2 SUBSCRIBE" {
+		t.Errorf("CSeq %q", got.Header.Get("CSeq"))
+	}
+}
+
+// A registration all of whose associated identities the network ended is
+// ended, so it cannot assert its registered identity the network never
+// listed (security review of #239).
+func TestEndingEveryAssociatedIdentityEndsTheRegistration(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	barred := "sip:barred@ims.mnc001.mcc001.3gppnetwork.org"
+	req := strings.ReplaceAll(registerText(outboundContact, "Supported: outbound"), aliceIMPU+">", barred+">")
+	d := p.Route(context.Background(), clientRequest(t, req, "FLOW-A"))
+	ok := strings.ReplaceAll(okText(outboundContact+";expires=3600", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound"), "To: <"+aliceIMPU+">", "To: <"+barred+">")
+	d.OnResponse(context.Background(), parseResponse(t, ok))
+	key := aorKey(mustURI(t, barred))
+	if _, ok := p.registry.lookup("FLOW-A", key); !ok {
+		t.Fatal("not registered")
+	}
+	s := f.one(t, p)
+	ended := &reginfo.Info{Version: 0, State: reginfo.Partial, Registrations: []reginfo.Registration{
+		{AOR: aliceIMPU, ID: "r1", State: reginfo.Terminated}, {AOR: aliceTel, ID: "r2", State: reginfo.Terminated},
+	}}
+	notify(t, p, notifyFor(t, s.req, 1, "active", ended))
+	if _, ok := p.registry.lookup("FLOW-A", key); ok {
+		t.Error("a registration without an associated identity left stayed")
+	}
+}
+
+// deregistered removes only the registration it read: one a REGISTER's
+// 200 saved meanwhile stays (QA of #239).
+func TestADeregistrationLeavesANewerRegistration(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	r := newRegistry(10, clock.now)
+	u := mustURI(t, aliceIMPU)
+	old := &registration{flow: "FLOW-A", uri: u, aor: aorKey(u), expires: clock.t.Add(time.Hour)}
+	newer := &registration{flow: "FLOW-A", uri: u, aor: aorKey(u), expires: clock.t.Add(2 * time.Hour)}
+	_ = r.save(old)
+	_ = r.save(newer)
+	if r.removeIf(old) {
+		t.Error("the old registration was removed in place of the newer")
+	}
+	if got, _ := r.lookup("FLOW-A", aorKey(u)); got != newer {
+		t.Fatal("the newer registration went")
+	}
+	if !r.removeIf(newer) || r.size() != 0 {
+		t.Error("the current registration stayed")
+	}
+}
+
+// A NOTIFY for no subscription is 481 before its body is read, even one
+// that would not parse.
+func TestANotifyForNoSubscriptionIsNotParsed(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	r := notifyFor(t, sub, 2, "active", aliceDoc(1, reginfo.Full, reginfo.ContactActive, reginfo.Registered))
+	r.Message.URI.User = subscriptionPrefix + "unknown"
+	r.Message.Body = []byte("<not xml")
+	if code := notify(t, p, r); code != 481 {
+		t.Errorf("code %d", code)
+	}
+}
+
+// A retry-after beyond refusedResubscribeAfter waits no longer than it.
+func TestARetryAfterIsCapped(t *testing.T) {
+	var h sip.Header
+	_ = h.Set("Subscription-State", "terminated;reason=giveup;retry-after=100000")
+	state, err := h.SubscriptionState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resubscribeDelay(state); got != refusedResubscribeAfter {
+		t.Errorf("%v", got)
+	}
+}
+
+// A registration pcscf could not keep subscribes to nothing.
+func TestARegistrationNotKeptSubscribesToNothing(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	p.registry.max = 0
+	u := mustURI(t, aliceIMPU)
+	reg := &registration{flow: "FLOW-A", uri: u, aor: aorKey(u), outbound: true, pathOB: true}
+	sent, err := sip.ParseContacts(outboundContact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.registered(parseResponse(t, okText(outboundContact+";expires=3600", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound")), reg, sent)
+	if got := f.take(p); len(got) != 0 {
+		t.Errorf("%d SUBSCRIBEs for a registration not kept", len(got))
+	}
 }

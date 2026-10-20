@@ -305,6 +305,18 @@ func (r *registry) defaults() map[string]*registration {
 	return out
 }
 
+// removeIf forgets reg if it is still the registration of its identity
+// over its flow, and reports whether it did.
+func (r *registry) removeIf(reg *registration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byFlow[reg.flow][reg.aor] != reg {
+		return false
+	}
+	r.removeLocked(reg.flow, reg.aor)
+	return true
+}
+
 // remove forgets the registration of aor over flow.
 func (r *registry) remove(flow transport.FlowID, aor string) {
 	r.mu.Lock()

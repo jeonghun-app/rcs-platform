@@ -183,42 +183,69 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
   before it expires, or half way when granted for less than 1200 s, in its
   dialog, with the `Path` of the user's registration that expires last. A
   subscription whose user has no registration left on the task is ended
-  with `Expires: 0`, and forgotten at once.
+  with `Expires: 0`, and forgotten at once. Every SUBSCRIBE asserts a
+  `Path`, the refreshes and the end too (the last one asserted). An active
+  NOTIFY without `expires` (RFC 6665 §4.2.2 requires one) leaves the
+  subscription for what was granted, or asked for, so a refresh is always
+  due.
 - **NOTIFY.** A request from the core whose Request-URI is a subscription's
   `Contact` is answered by `pcscf` itself; a client never reaches it, and
   any other request from the core goes to the client flow its Route names.
   The first NOTIFY sets up the dialog (RFC 6665 §4.4.1) only with the
   SUBSCRIBE's Call-ID, compared exactly, and its `From` tag as `To` tag,
   compared without case; later ones must be in that dialog and in order
-  (RFC 3261 §12.2.2). Another subscription, dialog or Call-ID is 481, a
-  NOTIFY out of order 500, another event or an event `id` 489, a body other
+  (RFC 3261 §12.2.2), a lower CSeq refused. A NOTIFY for no subscription is
+  481 before its body is read. Another dialog or Call-ID is 481, a NOTIFY
+  out of order 500, another event or an event `id` 489, a body other
   than `application/reginfo+xml` 415, and a missing `Subscription-State` or
   a document that does not parse 400; none of them changes anything. Other
   methods are 405. The 200 carries a `P-Charging-Vector` with the
   NOTIFY's icid and `RCS_IMS_DOMAIN` as `term-ioi`.
 - **Deregistration** (#16 plan E, decision 5). A document newer than the
   last one (RFC 3680 §5.2) acts on the registrations of the subscription's
-  user on this task, identities and contacts compared as URIs (RFC 3261
-  §19.1.4) without their parameters:
-  - a `terminated` registration of the registered identity, or one whose
-    contacts on that flow are all terminated, ends that registration;
-  - a terminated contact alone is removed from it;
-  - a terminated registration of one of the user's other identities makes
-    it one the registration may no longer assert.
+  user on this task. Identities are found as `reginfo` finds them, in the
+  canonical IMPU form; a contact of a registration is its binding in the
+  document: the contact with its `+sip.instance` and, when both have one,
+  its `reg-id`, or without an instance the contact at its URI (RFC 5626 §6;
+  scscf writes one contact per binding, #14):
+  - an identity not active, or a contact whose binding is not active,
+    ends; a registration whose identity or every contact ended is ended;
+  - an associated identity not active, or none of whose bindings with the
+    registration's contacts is active, may no longer be asserted, and a
+    registration with none of its associated identities left is ended;
+  - a partial document ends only what it lists; a full one is the whole
+    state, so what it does not list is ended too, after a lost
+    subscription or a missed document alike. A partial document that
+    skips a version makes the next sweep refresh the subscription, which
+    brings a full one.
 
   Each registration ended is counted in `regevent.deregistered`. The flow
   stays open, so the client, which learns of it from its own subscription,
-  can register again over it. A contact URI is all reginfo names a binding
-  by, so two flows of one client that registered the same contact URI are
-  both ended.
-- **Retries.** A subscription that fails (no answer, 408, a 2xx without
-  `Expires`) or that the notifier ends is set up again by the sweep after
-  30 s, or after its `retry-after` if longer; one refused with another 4xx,
-  5xx or 6xx, or ended as `rejected`, `noresource` or `invariant`, after an
-  hour (RFC 6665 §4.1.3). A 481 to a refresh is a lost subscription, set
-  up again after 30 s. One sweep sets up at most 500, so the task does not
-  send one SUBSCRIBE per user at once after an outage of `scscf`. A
-  subscription whose dialog no NOTIFY set up is forgotten once it expires.
+  can register again over it. Ending reg-id 1 of a device leaves the
+  registration of its reg-id 2 flow. A registration is removed only if it
+  is still the one the document was read against, so a REGISTER's 200
+  saved meanwhile stays.
+- **Failures.** None of them deregisters anyone; each SUBSCRIBE that
+  fails is counted in `regevent.subscribe_failed`, the alarm that network
+  deregistration has stopped working.
+  - A first SUBSCRIBE that fails, is refused, gets a 2xx without
+    `Expires`, or gets no NOTIFY within Timer N (64×T1, 32 s, RFC 6665
+    §4.1.2.4) ends the subscription. It is set up again after a backoff of
+    30 s, doubling with each failure in a row up to an hour, or after its
+    `Retry-After` if longer. A refusal that will not change (403, 404, 405,
+    410, 416, 489, 501, 603, 604) waits an hour. A NOTIFY resets the
+    backoff.
+  - A refresh that fails leaves the subscription valid until it expires
+    (TS 24.229 §5.2.3, RFC 6665 §4.1.2.2): its NOTIFYs are still taken, and
+    each sweep tries again. Only the codes that end a subscription (404,
+    405, 410, 416, 480 to 485, 489, 501, 604) end it, 481 included, and it
+    is set up again as above. One whose refreshes kept failing lapses at
+    its expiry.
+  - One the notifier ends is set up again after 30 s, or its
+    `retry-after` if longer, and after an hour if ended as `rejected`,
+    `noresource` or `invariant` (RFC 6665 §4.1.3).
+  - One sweep sets up at most 500, so the task does not send one SUBSCRIBE
+    per user at once after an outage of `scscf`.
 
 Subscriptions live in instance memory, as registrations do. When a task
 stops, `scscf`'s next NOTIFY fails, and `scscf` ends the subscription.

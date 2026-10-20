@@ -1,6 +1,7 @@
 package pcscf
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"slices"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/dialog"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -46,11 +48,15 @@ const (
 	// ends them at once cannot make pcscf send them in a loop. A failed or
 	// ended subscription is set up again by the sweep once it has passed.
 	resubscribeAfter = sweepInterval
-	// refusedResubscribeAfter replaces it after a refusal that will not
-	// change soon: a 4xx, 5xx or 6xx other than 408 and 481, or a
-	// subscription ended as rejected, noresource or invariant (RFC 6665
-	// §4.1.3).
+	// refusedResubscribeAfter replaces it, and the backoff of failures
+	// stops there, after a refusal that will not change soon (refusedFor),
+	// or a subscription ended as rejected, noresource or invariant (RFC
+	// 6665 §4.1.3).
 	refusedResubscribeAfter = time.Hour
+	// timerN is how long after its SUBSCRIBE a subscription waits for the
+	// NOTIFY that sets up its dialog before it has failed (RFC 6665
+	// §4.1.2.4: 64*T1).
+	timerN = 64 * transaction.DefaultT1
 	// maxSubscribesPerSweep bounds the subscriptions one sweep sets up, so
 	// that after an outage of scscf the task does not send one SUBSCRIBE per
 	// user at once.
@@ -58,8 +64,12 @@ const (
 	// subscriptionPrefix starts the user part of a subscription's Contact.
 	// A flow token is base64url, which has no dot, so the two never meet.
 	subscriptionPrefix = "reg."
-	// metricDeregistered counts the registrations a reg event NOTIFY ended.
-	metricDeregistered = "regevent.deregistered"
+	// metricDeregistered counts the registrations a reg event NOTIFY ended,
+	// and metricSubscribeFailed the SUBSCRIBEs that failed, were refused
+	// or got no NOTIFY: while they fail, the network cannot deregister
+	// anyone through pcscf (security review of #239).
+	metricDeregistered    = "regevent.deregistered"
+	metricSubscribeFailed = "regevent.subscribe_failed"
 )
 
 // subscription is pcscf's subscription to the reg event of one user.
@@ -77,8 +87,20 @@ type subscription struct {
 	dialog    *dialog.Dialog
 	// expires is when the subscription ends unless refreshed, and length
 	// how long it was last granted for; zero until a 2xx or a NOTIFY says.
-	expires time.Time
-	length  time.Duration
+	// requested is what its last SUBSCRIBE asked for.
+	expires   time.Time
+	length    time.Duration
+	requested time.Duration
+	// sent is when the SUBSCRIBE that set it up went, from which a NOTIFY
+	// must come within timerN.
+	sent time.Time
+	// path is the Path URI its last SUBSCRIBE asserted, which the one that
+	// ends it asserts again (§5.2.3).
+	path sip.URI
+	// refreshNow asks the next sweep to refresh it whatever its expiry: a
+	// partial document skipped a version, and a refresh brings a full one
+	// (RFC 3680 §5.2).
+	refreshNow bool
 	// version is the version of the last registration information
 	// document, or -1 before the first (RFC 3680 §5.2).
 	version int64
@@ -92,8 +114,11 @@ type subscriptions struct {
 	mu    sync.Mutex
 	byKey map[string]*subscription
 	byID  map[string]*subscription
-	// notBefore is when an identity may next get a new subscription.
+	// notBefore is when an identity may next get a new subscription, and
+	// failures how many of its SUBSCRIBEs in a row failed, which sets the
+	// backoff of the next.
 	notBefore map[string]time.Time
+	failures  map[string]int
 	// ctx ends, and wg waits for, the SUBSCRIBEs being sent; once closed
 	// no other is.
 	ctx    context.Context
@@ -102,7 +127,8 @@ type subscriptions struct {
 }
 
 func newSubscriptions(ctx context.Context) *subscriptions {
-	return &subscriptions{ctx: ctx, byKey: map[string]*subscription{}, byID: map[string]*subscription{}, notBefore: map[string]time.Time{}}
+	return &subscriptions{ctx: ctx, byKey: map[string]*subscription{}, byID: map[string]*subscription{},
+		notBefore: map[string]time.Time{}, failures: map[string]int{}}
 }
 
 // goSend runs f, which sends a SUBSCRIBE, off the caller's goroutine: the
@@ -149,6 +175,58 @@ func (s *subscriptions) drop(sub *subscription, after time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropLocked(sub, after)
+}
+
+// failLocked forgets sub, which failed, and keeps a new subscription of its
+// identity back by a backoff that doubles with each failure in a row from
+// resubscribeAfter to refusedResubscribeAfter, or by at least wait. The
+// registrations stay: a failed subscription deregisters no one. mu must be
+// held.
+func (p *pcscf) failLocked(sub *subscription, now time.Time, wait time.Duration) {
+	n := p.subs.failures[sub.key]
+	p.subs.failures[sub.key] = n + 1
+	backoff := refusedResubscribeAfter
+	if n < 8 {
+		backoff = min(resubscribeAfter<<n, refusedResubscribeAfter)
+	}
+	p.subs.dropLocked(sub, now.Add(max(backoff, min(wait, refusedResubscribeAfter))))
+	if p.metrics != nil {
+		p.metrics.Count(metricSubscribeFailed, 1)
+	}
+}
+
+// refusedFor reports whether a SUBSCRIBE refused with code will be refused
+// again soon: a 4xx or 6xx that says the request, the event or the user is
+// wrong, not that the notifier is busy or lost the subscription.
+func refusedFor(code int) bool {
+	switch code {
+	case 403, 404, 405, 410, 416, 489, 501, 603, 604:
+		return true
+	}
+	return false
+}
+
+// endsSubscription reports whether a refresh refused with code ends the
+// subscription (RFC 6665 §4.1.2.2); any other failure leaves it valid
+// until it expires, and the sweep tries again.
+func endsSubscription(code int) bool {
+	switch {
+	case code == 404 || code == 405 || code == 410 || code == 416 || code == 489 || code == 501 || code == 604:
+		return true
+	case code >= 480 && code <= 485:
+		return true
+	}
+	return false
+}
+
+// retryAfterOf is a response's Retry-After, or zero.
+func retryAfterOf(res *sip.Response) time.Duration {
+	v := strings.TrimSpace(strings.SplitN(res.Header.Get("Retry-After"), ";", 2)[0])
+	secs, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // defaultIdentity is the default public identity of reg (RFC 7315 §4.1):
@@ -206,34 +284,41 @@ func (p *pcscf) startSubscription(ctx context.Context, sub *subscription, reg *r
 	expires := p.subscriptionExpires(reg)
 	req, err := dialog.Initial("SUBSCRIBE", sub.impu, from, sip.Address{URI: sub.impu}, reg.serviceRoute, contact, hostOf(p.cfg.CoreHost), p.ids)
 	if err == nil {
-		err = p.prepareSubscribe(req, reg, expires)
+		err = p.prepareSubscribe(req, reg, sip.URI{}, expires)
 	}
 	var dst transport.Destination
 	if err == nil {
 		dst, err = p.resolve.Resolve(ctx, reg.serviceRoute[0].URI)
 	}
+	now := p.now()
+	p.subs.mu.Lock()
+	defer p.subs.mu.Unlock()
 	if err != nil {
-		p.subs.drop(sub, time.Time{})
+		p.failLocked(sub, now, 0)
 		return
 	}
-	p.subs.mu.Lock()
-	sub.subscribe = req
+	sub.subscribe, sub.sent, sub.requested, sub.path = req, now, expires, p.pathURI(reg)
+	// The send is synchronous; its handler takes mu, after this returns.
 	p.subs.mu.Unlock()
 	err = p.send(req, dst, func(res *sip.Response, err error) { p.subscribed(sub, res, err, true) })
+	p.subs.mu.Lock()
 	if err != nil {
-		p.subs.drop(sub, time.Time{})
+		p.failLocked(sub, now, 0)
 	}
 }
 
-// prepareSubscribe adds what every SUBSCRIBE of pcscf carries: the event,
-// Expires, the document type it reads, the Path URI of reg as
-// P-Asserted-Identity (§5.2.3 1) f)) and a P-Charging-Vector.
-func (p *pcscf) prepareSubscribe(req *sip.Request, reg *registration, expires time.Duration) error {
+// prepareSubscribe adds what every SUBSCRIBE of pcscf carries, a refresh
+// and the one that ends the subscription included: the event, Expires, the
+// document type it reads, the Path URI of reg as P-Asserted-Identity
+// (§5.2.3 1) f)), or path when reg is nil, and a P-Charging-Vector.
+func (p *pcscf) prepareSubscribe(req *sip.Request, reg *registration, path sip.URI, expires time.Duration) error {
 	icid, err := p.icid()
 	if err != nil {
 		return err
 	}
-	path := p.pathURI(reg)
+	if reg != nil {
+		path = p.pathURI(reg)
+	}
 	for _, f := range [][2]string{
 		{"Event", regEvent},
 		{"Expires", strconv.Itoa(int(expires / time.Second))},
@@ -248,10 +333,13 @@ func (p *pcscf) prepareSubscribe(req *sip.Request, reg *registration, expires ti
 	return nil
 }
 
-// subscribed takes the response to a SUBSCRIBE of sub, or its failure: a
-// 2xx grants it for its Expires; a refusal or a failure ends it, unless the
-// failure is of a SUBSCRIBE that set it up and a NOTIFY has set up its
-// dialog already, which then stands (RFC 6665 §4.1.2.4).
+// subscribed takes the response to a SUBSCRIBE of sub, or its failure. A
+// 2xx grants it for its Expires. A SUBSCRIBE that set it up and failed, or
+// was refused, ends it, unless a NOTIFY has set up its dialog already,
+// which then stands (RFC 6665 §4.1.2.4): it is set up again after a
+// backoff, or after an hour if refusedFor says it would be refused again.
+// A refresh that failed leaves it valid until it expires, the sweep trying
+// again, unless the code ends it (RFC 6665 §4.1.2.2, TS 24.229 §5.2.3).
 func (p *pcscf) subscribed(sub *subscription, res *sip.Response, err error, initial bool) {
 	if err == nil && res.StatusCode < 200 {
 		return
@@ -262,21 +350,30 @@ func (p *pcscf) subscribed(sub *subscription, res *sip.Response, err error, init
 	sub.busy = false
 	switch {
 	case err != nil:
-		if !initial || sub.dialog == nil {
-			p.subs.dropLocked(sub, now.Add(resubscribeAfter))
+		if initial && sub.dialog == nil {
+			p.failLocked(sub, now, 0)
+		} else if p.metrics != nil {
+			p.metrics.Count(metricSubscribeFailed, 1)
 		}
 	case res.StatusCode >= 300:
-		// 408 is a failure, and 481 to a refresh says the notifier lost
-		// the subscription, which a new one recovers (RFC 6665 §4.1.2.2).
-		after := now.Add(resubscribeAfter)
-		if res.StatusCode != 408 && res.StatusCode != 481 {
-			after = now.Add(refusedResubscribeAfter)
+		switch {
+		case initial && refusedFor(res.StatusCode), !initial && endsSubscription(res.StatusCode) && refusedFor(res.StatusCode):
+			p.failLocked(sub, now, refusedResubscribeAfter)
+		case initial, endsSubscription(res.StatusCode):
+			p.failLocked(sub, now, retryAfterOf(res))
+		default:
+			if p.metrics != nil {
+				p.metrics.Count(metricSubscribeFailed, 1)
+			}
 		}
-		p.subs.dropLocked(sub, after)
 	default:
 		secs, err := res.Header.Expires()
+		if err != nil && !initial {
+			// A refresh's 2xx without Expires: what was asked for.
+			secs, err = uint32(sub.requested/time.Second), nil
+		}
 		if err != nil || secs == 0 {
-			p.subs.dropLocked(sub, now.Add(resubscribeAfter))
+			p.failLocked(sub, now, 0)
 			return
 		}
 		sub.length = time.Duration(secs) * time.Second
@@ -286,13 +383,13 @@ func (p *pcscf) subscribed(sub *subscription, res *sip.Response, err error, init
 
 // refreshDue reports whether sub is to be refreshed at now.
 func refreshDue(sub *subscription, now time.Time) bool {
-	return !sub.expires.IsZero() && !now.Before(sub.expires.Add(-min(refreshLead, sub.length/2)))
+	return sub.refreshNow || !sub.expires.IsZero() && !now.Before(sub.expires.Add(-min(refreshLead, sub.length/2)))
 }
 
 // reconcileSubscriptions brings the subscriptions in line with the
 // registrations, on every sweep: it sets up the missing ones, refreshes the
-// ones about to expire, and ends those of users with no registration left
-// on this task, or forgets them if no NOTIFY ever set up their dialog.
+// ones about to expire, ends those of users with no registration left on
+// this task, and fails those no NOTIFY set up within timerN or that lapsed.
 func (p *pcscf) reconcileSubscriptions() {
 	if p.subs == nil {
 		return
@@ -316,11 +413,15 @@ func (p *pcscf) reconcileSubscriptions() {
 				end = append(end, sub)
 			}
 		case sub.dialog == nil:
-			if !sub.expires.IsZero() && !now.Before(sub.expires) {
-				p.subs.dropLocked(sub, time.Time{})
+			// No NOTIFY within Timer N: the subscription failed.
+			if !sub.sent.IsZero() && !now.Before(sub.sent.Add(timerN)) {
+				p.failLocked(sub, now, 0)
 			}
+		case !sub.expires.IsZero() && !now.Before(sub.expires):
+			// Its refreshes kept failing, and it has lapsed.
+			p.failLocked(sub, now, 0)
 		case refreshDue(sub, now):
-			sub.busy = true
+			sub.busy, sub.refreshNow = true, false
 			refresh = append(refresh, sub)
 		}
 	}
@@ -346,20 +447,22 @@ func (p *pcscf) reconcileSubscriptions() {
 // resubscribe sends a SUBSCRIBE in sub's dialog: a refresh for reg's user,
 // or with reg nil the end of the subscription (RFC 6665 §4.1.2.2,
 // §4.1.2.3), whose NOTIFY is then answered 481, since sub is forgotten.
+// Both assert a Path (§5.2.3): the refresh reg's, the end the last one
+// asserted. A refresh that cannot be sent leaves sub as it was, for the
+// sweep to try again.
 func (p *pcscf) resubscribe(ctx context.Context, sub *subscription, reg *registration) {
 	p.subs.mu.Lock()
 	expires := time.Duration(0)
-	var path *registration
 	if reg != nil {
-		expires, path = p.subscriptionExpires(reg), reg
+		expires = p.subscriptionExpires(reg)
+		sub.requested, sub.path = expires, p.pathURI(reg)
 	}
+	path := sub.path
 	req, err := sub.dialog.Subscribe(sip.Event{Type: regEvent}, uint32(expires/time.Second), p.ids)
 	next := sub.dialog.NextHop()
 	p.subs.mu.Unlock()
-	if err == nil && path != nil {
-		err = p.prepareSubscribe(req, path, expires)
-	} else if err == nil {
-		err = p.prepareEnd(req)
+	if err == nil {
+		err = p.prepareSubscribe(req, reg, path, expires)
 	}
 	var dst transport.Destination
 	if err == nil {
@@ -373,19 +476,8 @@ func (p *pcscf) resubscribe(ctx context.Context, sub *subscription, reg *registr
 		})
 	}
 	if err != nil && reg != nil {
-		p.subs.drop(sub, p.now().Add(resubscribeAfter))
+		p.subscribed(sub, nil, err, false)
 	}
-}
-
-// prepareEnd readies the SUBSCRIBE that ends a subscription: Expires: 0
-// already, and a charging vector. Its user has no registration left, so it
-// asserts no Path.
-func (p *pcscf) prepareEnd(req *sip.Request) error {
-	icid, err := p.icid()
-	if err != nil {
-		return err
-	}
-	return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 }
 
 // ownURI reports whether u names this task's core listener: the
@@ -440,10 +532,18 @@ type notified struct {
 // acceptNotify checks req against the subscription it names and takes it:
 // its CSeq and target into the dialog, the document's version, and the end
 // of the subscription. It returns the response code and the document to
-// act on, if any. Nothing changes unless the code is 200.
+// act on, if any. Nothing changes unless the code is 200. The subscription
+// is looked up before the body is read, so a NOTIFY for none costs no
+// parse.
 func (p *pcscf) acceptNotify(req *sip.Request) (int, *notified) {
 	if req.Method != "NOTIFY" {
 		return 405, nil
+	}
+	p.subs.mu.Lock()
+	known := p.subs.byID[req.URI.User] != nil
+	p.subs.mu.Unlock()
+	if !known {
+		return 481, nil
 	}
 	if ev, err := req.Header.Event(); err != nil || !strings.EqualFold(ev.Type, regEvent) || ev.ID() != "" {
 		return 489, nil
@@ -471,12 +571,16 @@ func (p *pcscf) acceptNotify(req *sip.Request) (int, *notified) {
 	}
 	var d *dialog.Dialog
 	if sub.dialog == nil {
-		if sub.subscribe == nil || !sameSubscription(sub.subscribe, req) {
+		if sub.subscribe == nil {
 			return 481, nil
 		}
-		if d, err = dialog.FromNotify(sub.subscribe, req); err != nil {
+		switch d, err = dialog.FromNotify(sub.subscribe, req); {
+		case errors.Is(err, dialog.ErrNotInDialog):
+			return 481, nil
+		case err != nil:
 			return 400, nil
 		}
+		delete(p.subs.failures, sub.key)
 	} else {
 		c := *sub.dialog
 		switch err := c.Accept(req); {
@@ -490,32 +594,31 @@ func (p *pcscf) acceptNotify(req *sip.Request) (int, *notified) {
 		d = &c
 	}
 	sub.dialog = d
-	if secs, ok := state.Expires(); ok && !strings.EqualFold(state.State, "terminated") {
-		sub.expires = now.Add(time.Duration(secs) * time.Second)
-		if sub.length == 0 {
-			sub.length = time.Duration(secs) * time.Second
-		}
+	terminated := strings.EqualFold(state.State, "terminated")
+	if secs, ok := state.Expires(); ok && !terminated {
+		sub.length = time.Duration(secs) * time.Second
+		sub.expires = now.Add(sub.length)
+	} else if !terminated && sub.expires.IsZero() {
+		// An active NOTIFY must say when it ends (RFC 6665 §4.2.2); one
+		// that does not gets what was granted or asked for, so that a
+		// refresh is always due some time.
+		sub.length = cmp.Or(sub.length, sub.requested, minSubscriptionExpires)
+		sub.expires = now.Add(sub.length)
 	}
 	var out *notified
 	if doc != nil && int64(doc.Version) > sub.version {
+		if doc.State == reginfo.Partial && sub.version >= 0 && int64(doc.Version) > sub.version+1 {
+			// A partial document was missed: a refresh brings a full one
+			// (RFC 3680 §5.2).
+			sub.refreshNow = true
+		}
 		sub.version = int64(doc.Version)
 		out = &notified{key: sub.key, doc: doc}
 	}
-	if strings.EqualFold(state.State, "terminated") {
+	if terminated {
 		p.subs.dropLocked(sub, now.Add(resubscribeDelay(state)))
 	}
 	return 200, out
-}
-
-// sameSubscription reports whether notify is in the subscription subscribe
-// asked for: the same Call-ID, compared exactly, and its To tag the
-// SUBSCRIBE's From tag, compared without case (RFC 6665 §4.4.1, RFC 3261
-// §8.1.1.4, §7.3.1).
-func sameSubscription(subscribe, notify *sip.Request) bool {
-	from, err1 := subscribe.Header.From()
-	to, err2 := notify.Header.To()
-	return err1 == nil && err2 == nil && notify.Header.Get("Call-ID") == subscribe.Header.Get("Call-ID") &&
-		to.Tag() != "" && strings.EqualFold(to.Tag(), from.Tag())
 }
 
 // resubscribeDelay is how long after a subscription ended a new one may be
@@ -535,16 +638,15 @@ func resubscribeDelay(state sip.SubscriptionState) time.Duration {
 }
 
 // deregistered acts on a registration information document of the
-// subscription of key (§5.2.5.2): a registration of this task whose
-// identity the document ends, or all of whose contacts it ends, is removed,
-// and an identity it ends is no longer one the registrations of that user
-// may assert. The flows stay open (#16 plan E, decision 5).
+// subscription of key (§5.2.5.2), on the registrations of that user on
+// this task alone (endedBy). A registration ended is removed only if it is
+// still the one read, so a REGISTER's 200 saved meanwhile stays. The flows
+// stay open (#16 plan E, decision 5).
 func (p *pcscf) deregistered(key string, doc *reginfo.Info) {
 	for _, reg := range p.registry.ofDefault(key) {
 		ended, changed := endedBy(reg, doc)
 		if ended {
-			p.registry.remove(reg.flow, reg.aor)
-			if p.metrics != nil {
+			if p.registry.removeIf(reg) && p.metrics != nil {
 				p.metrics.Count(metricDeregistered, 1)
 			}
 			continue
@@ -557,31 +659,50 @@ func (p *pcscf) deregistered(key string, doc *reginfo.Info) {
 
 // endedBy reports what doc ends of reg: all of it, or else, in changed, a
 // copy without the contacts and associated identities it ends; changed is
-// nil when doc ends nothing.
+// nil when doc ends nothing. Identities are found in doc as ByAOR finds
+// them, and a contact of reg is its binding in doc (bindingsOf).
+//
+//   - A partial document ends what it lists as ended: the registered
+//     identity not active, or every binding of reg's contacts terminated;
+//     a contact whose binding it terminates; an associated identity not
+//     active, or none of whose bindings with reg's contacts is active.
+//   - A full document is the whole state (RFC 3680 §5.2): what it does not
+//     list, or lists not active, is ended too.
+//   - A registration with associated identities none of which is left is
+//     ended as well, so its flow cannot fall back to asserting an identity
+//     the network never listed (security review of #239).
 func endedBy(reg *registration, doc *reginfo.Info) (ended bool, changed *registration) {
+	full := doc.State == reginfo.Full
+	// gone reports whether doc ends the binding of c under el.
+	gone := func(el reginfo.Registration, c sip.Contact) bool {
+		found := bindingsOf(el, c)
+		active := slices.ContainsFunc(found, reginfo.Contact.Active)
+		return !active && (full || len(found) > 0)
+	}
 	contacts := slices.Clone(reg.contacts)
-	associated := slices.Clone(reg.associated)
-	for _, el := range doc.Registrations {
-		aor, err := sip.ParseURI(el.AOR)
-		if err != nil {
-			continue
-		}
-		gone := func(c sip.Contact) bool {
-			found := el.ByURI(c.URI)
-			return len(found) > 0 && !slices.ContainsFunc(found, func(f reginfo.Contact) bool { return f.State == reginfo.ContactActive })
-		}
-		if sameIdentity(reg.uri, aor) {
-			if el.State == reginfo.Terminated {
-				return true, nil
-			}
-			contacts = slices.DeleteFunc(contacts, gone)
-			continue
-		}
-		if el.State == reginfo.Terminated || len(reg.contacts) > 0 && !slices.ContainsFunc(reg.contacts, func(c sip.Contact) bool { return !gone(c) }) {
-			associated = slices.DeleteFunc(associated, func(a sip.Address) bool { return sameIdentity(a.URI, aor) })
-		}
+	switch el, ok := doc.ByAOR(reg.uri); {
+	case ok && el.State != reginfo.Active, !ok && full:
+		return true, nil
+	case ok:
+		contacts = slices.DeleteFunc(contacts, func(c sip.Contact) bool { return gone(el, c) })
 	}
 	if len(contacts) == 0 {
+		return true, nil
+	}
+	associated := slices.DeleteFunc(slices.Clone(reg.associated), func(a sip.Address) bool {
+		if sameIdentity(a.URI, reg.uri) {
+			return false // it stands or falls with the registration
+		}
+		el, ok := doc.ByAOR(a.URI)
+		switch {
+		case !ok:
+			return full
+		case el.State != reginfo.Active:
+			return true
+		}
+		return !slices.ContainsFunc(reg.contacts, func(c sip.Contact) bool { return !gone(el, c) })
+	})
+	if len(reg.associated) > 0 && len(associated) == 0 {
 		return true, nil
 	}
 	if len(contacts) == len(reg.contacts) && len(associated) == len(reg.associated) {
@@ -592,18 +713,43 @@ func endedBy(reg *registration, doc *reginfo.Info) (ended bool, changed *registr
 	return false, &c
 }
 
-// sameIdentity reports whether a and b are the same public identity: the
-// same URI without its parameters, compared as URIs (RFC 3261 §19.1.4, RFC
-// 3966 §4), so that user=phone or another parameter one side writes does
-// not tell them apart.
+// bindingsOf is the contacts of el that are c's binding: those with c's
+// +sip.instance, and its reg-id when both have one, matched with
+// reginfo.Contact.Param, since one URI may be bound once per flow (RFC
+// 5626 §6); or, when either has no instance, those at c's URI (RFC 3261
+// §19.1.4).
+func bindingsOf(el reginfo.Registration, c sip.Contact) []reginfo.Contact {
+	inst, hasInst := c.Instance()
+	regID, hasRegID, err := c.RegID()
+	hasRegID = hasRegID && err == nil
+	var out []reginfo.Contact
+	for _, rc := range el.Contacts {
+		if ri, ok := rc.Param("+sip.instance"); ok && hasInst {
+			if !strings.EqualFold(ri, inst) {
+				continue
+			}
+			if rr, ok := rc.Param("reg-id"); ok && hasRegID && rr != strconv.FormatUint(uint64(regID), 10) {
+				continue
+			}
+			out = append(out, rc)
+			continue
+		}
+		if u, err := sip.ParseURI(rc.URI); err == nil && u.Equal(c.URI) {
+			out = append(out, rc)
+		}
+	}
+	return out
+}
+
+// sameIdentity reports whether a and b are the same public identity, in
+// the form the HSS keeps one in (identity.CanonicalIMPU), as reginfo's
+// ByAOR compares them; without such a form, as URIs.
 func sameIdentity(a, b sip.URI) bool {
-	if a.Scheme != "tel" {
-		a.Params = nil
+	ca, okA := identity.CanonicalIMPU(a.String())
+	cb, okB := identity.CanonicalIMPU(b.String())
+	if okA && okB {
+		return ca == cb
 	}
-	if b.Scheme != "tel" {
-		b.Params = nil
-	}
-	a.Headers, b.Headers = nil, nil
 	return a.Equal(b)
 }
 
