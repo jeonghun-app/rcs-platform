@@ -333,3 +333,24 @@ func text(req *sip.Request) string {
 	}
 	return string(b)
 }
+
+// Tags are tokens, compared without case (RFC 3261 §7.3.1), and so are they
+// in the dialog's ID; the Call-ID is compared exactly (§8.1.1.4).
+func TestTagsCompareWithoutCase(t *testing.T) {
+	d, err := FromNotify(request(t, subscribe), request(t, firstNotify))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notify := request(t, strings.NewReplacer("tag=n1", "tag=N1", "tag=p1", "tag=P1", "CSeq: 4 NOTIFY", "CSeq: 5 NOTIFY").Replace(firstNotify))
+	if err := d.Accept(notify); err != nil {
+		t.Errorf("tags in another case: %v", err)
+	}
+	other, err := FromNotify(request(t, strings.Replace(subscribe, "tag=p1", "tag=P1", 1)), request(t, strings.Replace(firstNotify, "tag=n1", "tag=N1", 1)))
+	if err != nil || other.ID() != d.ID() {
+		t.Errorf("IDs %q and %q, %v", d.ID(), other.ID(), err)
+	}
+	callID := request(t, strings.NewReplacer("Call-ID: sub-1", "Call-ID: SUB-1", "CSeq: 4 NOTIFY", "CSeq: 6 NOTIFY").Replace(firstNotify))
+	if err := d.Accept(callID); !errors.Is(err, ErrNotInDialog) {
+		t.Errorf("a Call-ID in another case: %v", err)
+	}
+}
