@@ -117,10 +117,11 @@ The sender is the user the core asserted in `P-Asserted-Identity` (RFC 3325
 §9.1), never a header the client wrote. rcs-as takes what pcscf asserts (#208):
 one identity, or a SIP identity with the tel URI of its implicit registration
 set (#16 decision 5), which are one user whether the SIP identity is a number
-(`sip:+...@<domain>`) or a name (`sip:alice@<domain>`). The user is the tel URI
-when one is asserted, and the SIP identity otherwise. More than two
-identities, two of one scheme, or a SIP number other than the tel URI's are
-refused with 403 and counted (`sip.asserted.refused`), as is a MESSAGE with
+(`sip:+...@<domain>`) or a name (`sip:alice@<domain>`). Only a home-domain
+number must be the tel URI's number; a number at another host, or one marked
+`user=ip`, counts as a name. The user is the tel URI when one is asserted, and
+the SIP identity otherwise. More than two identities, two of one scheme, or a
+home-domain number other than the tel URI's are refused with 403 and counted (`sip.asserted.refused`), as is a MESSAGE with
 none. Every asserted identity is one the sender may name in its CPIM `From`, in
 any of the forms below, and a notification from the user finds a message
 written to any of them. The recipient is the Request-URI.
@@ -147,6 +148,7 @@ set.
 |---|---|
 | stored | 202 Accepted (RFC 3428 §7) |
 | a `Require` option tag (rcs-as supports none for MESSAGE) | 420, with `Unsupported` (RFC 3261 §8.2.2.3) |
+| an empty or unreadable `Require` | 400 |
 | not `message/cpim` | 415, with `Accept: message/cpim` |
 | no asserted identity, or not as above | 403 |
 | a Request-URI that names no user | 404 |

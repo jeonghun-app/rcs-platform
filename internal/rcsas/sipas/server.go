@@ -158,7 +158,14 @@ const allowed = "MESSAGE, OPTIONS"
 // so (RFC 3428 §7).
 func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
-	if bad := unsupported(req); len(bad) > 0 {
+	bad, err := unsupported(req)
+	switch {
+	case err != nil:
+		// No option tag to name in an Unsupported (RFC 3261 §20.32).
+		s.cfg.Metrics.Count("sip.message.400", 1)
+		s.respond(u, req, 400)
+		return
+	case len(bad) > 0:
 		// RFC 3261 §8.2.2.3: a client that requires an extension rcs-as
 		// lacks must not have its request served without it.
 		s.cfg.Metrics.Count("sip.message.420", 1)
@@ -187,14 +194,10 @@ func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 }
 
 // unsupported are the option tags of req's Require, none of which rcs-as
-// supports for a MESSAGE.
-func unsupported(req *sip.Request) []string {
-	tags, err := req.Header.Require()
-	if err != nil {
-		// Unreadable: what it requires is not known to be supported.
-		return []string{"(malformed)"}
-	}
-	return tags
+// supports for a MESSAGE; an error for a Require that is empty or does not
+// parse.
+func unsupported(req *sip.Request) ([]string, error) {
+	return req.Header.Require()
 }
 
 // origin reads the engine's Origin from req, or the status that refuses it.
@@ -220,20 +223,22 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 
 // asserted reads the sender the network asserted (RFC 3325 §9.1), never a
 // header the client wrote, or the status that refuses the request: 403. It
-// takes what pcscf asserts (#208): one identity, or a SIP identity and the
-// tel URI of its implicit registration set (#16 decision 5), which are one
-// user. So at most one of each scheme, and a SIP identity that is itself a
-// number must be the tel URI's number; two different numbers are no pair
-// pcscf makes. The user is the tel URI when one is asserted, which every
-// SIP identity of the set is paired with, and the SIP identity's UserOf
-// otherwise. Each identity as asserted is one the sender may name itself
-// by, as is any other form of it (the engine compares them with UserOf).
+// takes what pcscf asserts (#208): one identity, or a SIP identity and a
+// tel URI of the same registration, which are one user (#16 decision 5).
+// So at most one of each scheme, and only a SIP identity at the home domain
+// whose user part is a number (a home-domain number, messaging.UserOf) must
+// be that tel URI's number; any other SIP identity, a name or a number at
+// another host, pairs with the tel URI as pcscf found it. The user is the
+// tel URI when one is asserted, and the SIP identity's UserOf otherwise.
+// Each identity as asserted is one the sender may name itself by, as is any
+// other form of it (the engine compares them with UserOf).
 func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 	pai, err := req.Header.PAssertedIdentity()
 	if err != nil || len(pai) == 0 || len(pai) > 2 {
 		return s.refuseAsserted()
 	}
 	var sipUser, telUser string
+	homeNumber := false
 	var identities []string
 	for _, a := range pai {
 		raw := a.URI.String()
@@ -252,13 +257,14 @@ func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 				return s.refuseAsserted()
 			}
 			sipUser = user
+			homeNumber = strings.EqualFold(a.URI.Host, s.cfg.HomeDomain) && strings.HasPrefix(user, "tel:")
 		}
 		identities = append(identities, raw)
 	}
 	if telUser == "" {
 		return sipUser, identities, 0
 	}
-	if sipUser != "" && strings.HasPrefix(sipUser, "tel:") && sipUser != telUser {
+	if homeNumber && sipUser != telUser {
 		return s.refuseAsserted()
 	}
 	return telUser, identities, 0
