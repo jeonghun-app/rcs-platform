@@ -26,6 +26,9 @@ type fakeDynamo struct {
 	// afterUpdate, if set, runs after every UpdateItem, outside the lock, as
 	// another instance's write between that request and the next would.
 	afterUpdate func()
+	// afterGet, if set, runs after every GetItem, outside the lock, as
+	// another instance's write between a read and the write it decides would.
+	afterGet func()
 	// resendNext applies the next write twice, as the SDK does when the
 	// response to the first attempt is lost, and answers with the second
 	// attempt's outcome.
@@ -142,6 +145,10 @@ func (f *fakeDynamo) write(op func() error) error {
 }
 
 func (f *fakeDynamo) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if f.afterGet != nil {
+		// Deferred first, so it runs after the unlock.
+		defer f.afterGet()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {

@@ -268,9 +268,10 @@ func quoted(v string) string {
 }
 
 // hasControl reports whether v has a control character, which no quoted
-// string written back can carry.
+// string written back can carry. HTAB is not one: a quoted string carries it
+// as it is (RFC 3261 §25.1, qdtext includes LWS).
 func hasControl(v string) bool {
-	return strings.ContainsFunc(v, func(c rune) bool { return c < 0x20 || c == 0x7f })
+	return strings.ContainsFunc(v, func(c rune) bool { return c < 0x20 && c != '\t' || c == 0x7f })
 }
 
 // roundTrips reports whether b, written as the 200 lists it, can be added to

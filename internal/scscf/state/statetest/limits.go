@@ -377,10 +377,10 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 	r.Incarnation = 42
 	must(a.SaveRegistration(ctx(t), r))(t)
 	for _, id := range r.Identities {
-		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: id.IMPU, Set: Set1, Incarnation: 42, Barred: id.Barred}))(t)
+		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: id.IMPU, Set: Set1, Incarnation: 42, Barred: id.Barred, KeepUntil: T0.Add(48 * time.Hour)}))(t)
 	}
 	for _, id := range r.Identities {
-		got := must(b.Identity(ctx(t), id.IMPU))(t)
+		got := must(b.Identity(ctx(t), id.IMPU, T0))(t)
 		if got.Set != Set1 || got.Incarnation != 42 || got.Barred != id.Barred {
 			t.Errorf("%s points at %+v", id.IMPU, got)
 		}
@@ -389,8 +389,9 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 			t.Errorf("the set read back as %+v", reg)
 		}
 	}
-	// Two private identities' sets with the same default identity (a shared
-	// public identity, TS 23.228 §4.3.3.4) are two records.
+	// Two private identities' sets with the same default identity are two
+	// records. (One IMPU naming both, a shared public identity of TS 23.228
+	// §4.3.3.4, is out of scope: an Identity names one set.)
 	other := Registration(IMPI2, IMPU1, 2*time.Hour)
 	other.Incarnation = 43
 	must(b.SaveRegistration(ctx(t), other))(t)
@@ -404,33 +405,120 @@ func testIdentities(t *testing.T, a, b state.Store, _ Options) {
 	if regs := must(b.RegistrationsOf(ctx(t), IMPI1))(t); len(regs) != 1 {
 		t.Errorf("RegistrationsOf lists %d, want the one set", len(regs))
 	}
-	tel := must(a.Identity(ctx(t), TEL1))(t)
-	_, err := b.SaveIdentity(ctx(t), &state.Identity{IMPU: TEL1, Set: Set1, Incarnation: 42})
+	tel := must(a.Identity(ctx(t), TEL1, T0))(t)
+	_, err := b.SaveIdentity(ctx(t), &state.Identity{IMPU: TEL1, Set: Set1, Incarnation: 42, KeepUntil: T0.Add(48 * time.Hour)})
 	wantErr(t, err, state.ErrExists)
 	moved := *tel
 	moved.Set, moved.Incarnation = Set2, 7
 	must(b.SaveIdentity(ctx(t), &moved))(t)
 	wantErr(t, a.DeleteIdentity(ctx(t), tel), state.ErrConflict)
-	if got := must(a.Identity(ctx(t), TEL1))(t); got.Set != Set2 {
+	if got := must(a.Identity(ctx(t), TEL1, T0))(t); got.Set != Set2 {
 		t.Errorf("a stale delete changed %+v", got)
 	}
-	again := must(a.Identity(ctx(t), TEL1))(t)
+	again := must(a.Identity(ctx(t), TEL1, T0))(t)
 	if err := a.DeleteIdentity(ctx(t), again); err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.Identity(ctx(t), TEL1)
+	_, err = b.Identity(ctx(t), TEL1, T0)
 	wantErr(t, err, state.ErrNotFound)
 	wantErr(t, b.DeleteIdentity(ctx(t), again), state.ErrNotFound)
 	for _, bad := range []*state.Identity{
-		{IMPU: "not an impu", Set: Set1, Incarnation: 1},
-		{IMPU: TEL1, Set: state.SetKey{IMPI: IMPI1}, Incarnation: 1},
-		{IMPU: TEL1, Set: Set1},
+		{IMPU: "not an impu", Set: Set1, Incarnation: 1, KeepUntil: T0.Add(time.Hour)},
+		{IMPU: TEL1, Set: state.SetKey{IMPI: IMPI1}, Incarnation: 1, KeepUntil: T0.Add(time.Hour)},
+		{IMPU: TEL1, Set: Set1, KeepUntil: T0.Add(time.Hour)},
+		{IMPU: TEL1, Set: Set1, Incarnation: 1},
 	} {
 		_, err := a.SaveIdentity(ctx(t), bad)
 		wantErr(t, err, state.ErrInvalid)
 	}
-	for _, impu := range []string{"", strings.Repeat("u", 3000)} {
-		_, err := a.Identity(ctx(t), impu)
+	for _, impu := range []string{"", strings.Repeat("u", 3000), "set#" + IMPI1 + "#" + IMPU1, "profile#" + IMPI1 + "#" + IMPU1} {
+		_, err := a.Identity(ctx(t), impu, T0)
+		wantErr(t, err, state.ErrNotFound)
+		wantErr(t, a.DeleteIdentity(ctx(t), &state.Identity{IMPU: impu, Version: 1}), state.ErrNotFound)
+	}
+	// Barred is kept, and nothing read aliases what is stored.
+	got := must(a.Registration(ctx(t), Set1))(t)
+	if !got.Identities[2].Barred {
+		t.Error("a barred identity read back as not barred")
+	}
+	got.Identities[0].IMPU = "sip:changed@" + Domain
+	if again := must(a.Registration(ctx(t), Set1))(t); again.Identities[0].IMPU != IMPU1 {
+		t.Error("changing a read registration's Identities changed the stored one")
+	}
+	id := must(a.Identity(ctx(t), IMPU2, T0))(t)
+	id.Barred = false
+	if again := must(a.Identity(ctx(t), IMPU2, T0))(t); !again.Barred {
+		t.Error("changing a read identity changed the stored one")
+	}
+}
+
+// testIdentityKeepUntil: an identity a failed deregistration left is gone at
+// its KeepUntil, which KeepIdentity only moves later.
+func testIdentityKeepUntil(t *testing.T, a, b state.Store, _ Options) {
+	i := &state.Identity{IMPU: IMPU1, Set: Set1, Incarnation: 1, KeepUntil: T0.Add(time.Hour + 500*time.Millisecond)}
+	must(a.SaveIdentity(ctx(t), i))(t)
+	got := must(b.Identity(ctx(t), IMPU1, T0))(t)
+	if !got.KeepUntil.Equal(T0.Add(time.Hour)) {
+		t.Errorf("kept until %v, want it to the second", got.KeepUntil)
+	}
+	_, err := b.Identity(ctx(t), IMPU1, T0.Add(time.Hour))
+	wantErr(t, err, state.ErrNotFound)
+	if err := b.KeepIdentity(ctx(t), IMPU1, T0.Add(25*time.Hour), T0); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.KeepIdentity(ctx(t), IMPU1, T0.Add(2*time.Hour), T0); err != nil {
+		t.Fatal(err)
+	}
+	if got := must(a.Identity(ctx(t), IMPU1, T0.Add(24*time.Hour)))(t); !got.KeepUntil.Equal(T0.Add(25*time.Hour)) || got.Version != must(a.Identity(ctx(t), IMPU1, T0))(t).Version {
+		t.Errorf("after KeepIdentity: %+v", got)
+	}
+	wantErr(t, a.KeepIdentity(ctx(t), IMPU2, T0.Add(time.Hour), T0), state.ErrNotFound)
+	wantErr(t, a.KeepIdentity(ctx(t), IMPU1, T0.Add(50*time.Hour), T0.Add(25*time.Hour)), state.ErrNotFound)
+}
+
+// testInterruptedDeregistration: a sweep's handler deletes the set's
+// identities before SweepRegistrations deletes the record; cut short in
+// between, the record keeps its lease, and the next sweep after it does the
+// rest, so nothing of the set remains.
+func testInterruptedDeregistration(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1, -time.Minute)
+	r.Identities = append(r.Identities, state.SetIdentity{IMPU: TEL1})
+	must(a.SaveRegistration(ctx(t), r))(t)
+	for _, impu := range []string{IMPU1, TEL1} {
+		must(a.SaveIdentity(ctx(t), &state.Identity{IMPU: impu, Set: Set1, Incarnation: 1, KeepUntil: T0.Add(24 * time.Hour)}))(t)
+	}
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(a.ExpiringRegistrations(ctx(t), T0, 10))(t)) == 1
+	})
+	handle := func(s state.Store, fail bool) func(before, after *state.Registration) error {
+		return func(_, after *state.Registration) error {
+			for _, id := range after.Identities {
+				if i, err := s.Identity(ctx(t), id.IMPU, T0); err == nil {
+					if err := s.DeleteIdentity(ctx(t), i); err != nil {
+						return err
+					}
+				}
+			}
+			if fail {
+				return errors.New("the instance stopped")
+			}
+			return nil
+		}
+	}
+	if _, err := state.SweepRegistrations(ctx(t), a, T0, 10, handle(a, true)); err == nil {
+		t.Fatal("the cut-short sweep reported no error")
+	}
+	later := T0.Add(state.SweepLease + time.Second)
+	eventually(t, o, "the index to list it again", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), later, 10))(t)) == 1
+	})
+	if _, err := state.SweepRegistrations(ctx(t), b, later, 10, handle(b, false)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := a.Registration(ctx(t), Set1)
+	wantErr(t, err, state.ErrNotFound)
+	for _, impu := range []string{IMPU1, TEL1} {
+		_, err := a.Identity(ctx(t), impu, T0)
 		wantErr(t, err, state.ErrNotFound)
 	}
 }
@@ -455,6 +543,21 @@ func testSaveProfileKeepsKeepUntil(t *testing.T, a, b state.Store, _ Options) {
 	got := must(a.Profile(ctx(t), Set1, T0.Add(100*time.Hour)))(t)
 	if string(got.UserData) != "<IMSSubscription>2</IMSSubscription>" || !got.KeepUntil.Equal(long) {
 		t.Errorf("after the PPR: %q kept until %v, want the PPR's data kept until %v", got.UserData, got.KeepUntil, long)
+	}
+	// A save refused because a later profile is stored still raises
+	// KeepUntil to its own: the SAA of a long registration that lost to a
+	// PPR must not leave the profile kept only as long as the PPR said
+	// (#184 QA).
+	ppr2 := Profile(Set2, []byte("<IMSSubscription>ppr</IMSSubscription>"), T0.Add(time.Millisecond))
+	ppr2.KeepUntil = T0.Add(state.ProfileGrace)
+	if err := a.SaveProfile(ctx(t), ppr2); err != nil {
+		t.Fatal(err)
+	}
+	saa := Profile(Set2, []byte("<IMSSubscription>saa</IMSSubscription>"), T0)
+	saa.KeepUntil = T0.Add(600000*time.Second + state.ProfileGrace)
+	wantErr(t, b.SaveProfile(ctx(t), saa), state.ErrConflict)
+	if got := must(a.Profile(ctx(t), Set2, T0.Add(48*time.Hour)))(t); string(got.UserData) != "<IMSSubscription>ppr</IMSSubscription>" || !got.KeepUntil.Equal(saa.KeepUntil) {
+		t.Errorf("after the refused SAA: %q kept until %v, want the PPR's kept until %v", got.UserData, got.KeepUntil, saa.KeepUntil)
 	}
 	// A later KeepUntil from the save does count.
 	later := Profile(Set1, []byte("<IMSSubscription>3</IMSSubscription>"), T0.Add(2*time.Minute))
@@ -503,7 +606,9 @@ func testKeepProfile(t *testing.T, a, b state.Store, _ Options) {
 	if !got.KeepUntil.Equal(T0.Add(25*time.Hour)) || string(got.UserData) != string(p.UserData) || !got.Received.Equal(T0) {
 		t.Errorf("after KeepProfile: kept until %v, %q received %v", got.KeepUntil, got.UserData, got.Received)
 	}
-	wantErr(t, a.SaveProfile(ctx(t), Profile(Set1, []byte("<IMSSubscription>0</IMSSubscription>"), T0.Add(-time.Second))), state.ErrConflict)
+	older := Profile(Set1, []byte("<IMSSubscription>0</IMSSubscription>"), T0.Add(-time.Second))
+	older.KeepUntil = T0.Add(time.Hour)
+	wantErr(t, a.SaveProfile(ctx(t), older), state.ErrConflict)
 	wantErr(t, b.KeepProfile(ctx(t), Set2, T0.Add(25*time.Hour), T0), state.ErrNotFound)
 	// Past KeepUntil the profile is gone for KeepProfile as for Profile.
 	wantErr(t, b.KeepProfile(ctx(t), Set1, T0.Add(50*time.Hour), T0.Add(25*time.Hour)), state.ErrNotFound)
@@ -731,4 +836,45 @@ func testAttemptCountNotAChallenge(t *testing.T, a, _ state.Store, _ Options) {
 	if n := must(a.CountAttempt(ctx(t), IMPI1, state.AttemptChallenge, w, w.Add(time.Minute)))(t); n != 2 {
 		t.Errorf("count %d after a take of it, want 2", n)
 	}
+}
+
+// testReassertSweep: a live registration whose Reassert has come is handed to
+// one sweep, which claims it for a lease, and is due again only when that
+// lease ends or the handler moves Reassert.
+func testReassertSweep(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1, time.Hour)
+	r.Reassert, r.ReassertAttempts = T0.Add(time.Minute), 1
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if regs := must(b.ExpiringRegistrations(ctx(t), T0, 10))(t); len(regs) != 0 {
+		t.Error("listed before its Reassert")
+	}
+	at := T0.Add(time.Minute)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), at, 10))(t)) == 1
+	})
+	called := 0
+	sweep := func(s state.Store, now time.Time) {
+		t.Helper()
+		if _, err := state.SweepRegistrations(ctx(t), s, now, 10, func(before, after *state.Registration) error {
+			called++
+			if !before.ReassertDue(now) || len(after.Contacts) != 1 || !after.Reassert.Equal(now.Add(state.SweepLease)) {
+				t.Errorf("handled %+v then %+v", before, after)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweep(a, at)
+	sweep(b, at.Add(state.SweepLease/2))
+	if called != 1 {
+		t.Fatalf("handled %d times within the lease", called)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); len(got.Contacts) != 1 || got.ReassertAttempts != 1 {
+		t.Errorf("after the sweep: %+v", got)
+	}
+	bad := Registration(IMPI1, IMPU2, time.Hour)
+	bad.ReassertAttempts = state.MaxReassertAttempts + 1
+	_, err := a.SaveRegistration(ctx(t), bad)
+	wantErr(t, err, state.ErrInvalid)
 }

@@ -57,7 +57,7 @@ func TestAnExpiredSetIsDeregisteredOnceWithTheHSSAndEverythingOfItGoes(t *testin
 	}
 	gone(t, e, impu1, tel1)
 	for _, impu := range []string{impu1, tel1} {
-		if _, err := e.store.Identity(bg, impu); err == nil {
+		if _, err := e.store.Identity(bg, impu, e.clock.Now()); err == nil {
 			t.Errorf("%s still names the set", impu)
 		}
 	}
@@ -275,5 +275,123 @@ func TestRunSweepsSweepsUntilItsContextEnds(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("RunSweeps did not return once cancelled")
+	}
+}
+
+// reassertDue registers impu1 and marks its set as a failed reassign does,
+// due now.
+func reassertDue(t *testing.T, e *env, g *Registrar) *ue {
+	t.Helper()
+	u := registered(t, e, g, 3600, impu1, tel1)
+	r := must(e.store.Registration(bg, set1))(t)
+	r.Reassert, r.ReassertAttempts = e.clock.Now().Add(reassertBackoff), 1
+	must(e.store.SaveRegistration(bg, r))(t)
+	e.clock.advance(reassertBackoff)
+	return u
+}
+
+// TestASweepTellsTheHSSAgainThatItServesASetWhoseReassertIsDue: the
+// registrar's own SAR after a crossed deregistration failed; the sweep's
+// succeeds, and the mark goes.
+func TestASweepTellsTheHSSAgainThatItServesASetWhoseReassertIsDue(t *testing.T) {
+	e := newEnv(t)
+	m := &counts{}
+	g := e.instance(1, func(c *Config) { c.Metrics = m })
+	reassertDue(t, e, g)
+	sars := len(e.hss.sarsOf())
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	if got := e.hss.sarsOf()[sars:]; !slices.Equal(got, []cx.ServerAssignmentType{cx.Registration}) {
+		t.Errorf("SARs %v", got)
+	}
+	r := must(e.store.Registration(bg, set1))(t)
+	if !r.Reassert.IsZero() || r.ReassertAttempts != 0 || len(r.Contacts) != 1 {
+		t.Errorf("after the reassert: Reassert %v, %d attempts, %d contacts", r.Reassert, r.ReassertAttempts, len(r.Contacts))
+	}
+	if got := m.get("registrar.reasserted"); got != 1 {
+		t.Errorf("reasserted = %d", got)
+	}
+	if n, _ := g.Sweep(bg, 10); n != 0 {
+		t.Errorf("a second sweep handled %d", n)
+	}
+}
+
+// TestAReassertTheHSSKeepsRefusingBacksOffAndGivesUp: an HSS out of reach
+// is tried again after 2, 4, 8 and 16 minutes, five sweep attempts in all,
+// and then left to the set's next re-registration; the bindings stay.
+func TestAReassertTheHSSKeepsRefusingBacksOffAndGivesUp(t *testing.T) {
+	e := newEnv(t)
+	m := &counts{}
+	g := e.instance(1, func(c *Config) { c.Metrics = m })
+	reassertDue(t, e, g)
+	e.hss.mu.Lock()
+	e.hss.unavailable = true
+	e.hss.mu.Unlock()
+	sars := len(e.hss.sarsOf())
+	for try, wait := range []time.Duration{2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute} {
+		if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+			t.Fatalf("try %d: swept %d, %v", try+1, n, err)
+		}
+		r := must(e.store.Registration(bg, set1))(t)
+		if !r.Reassert.Equal(e.clock.Now().Add(wait)) || r.ReassertAttempts != try+2 {
+			t.Fatalf("after try %d: Reassert in %v, %d attempts; want %v", try+1, r.Reassert.Sub(e.clock.Now()), r.ReassertAttempts, wait)
+		}
+		e.clock.advance(wait - time.Second)
+		if n, _ := g.Sweep(bg, 10); n != 0 {
+			t.Fatalf("after try %d: swept a second early", try+1)
+		}
+		e.clock.advance(time.Second)
+	}
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("the last try: swept %d, %v", n, err)
+	}
+	r := must(e.store.Registration(bg, set1))(t)
+	if !r.Reassert.IsZero() || r.ReassertAttempts != 0 || len(r.Contacts) != 1 {
+		t.Errorf("after giving up: Reassert %v, %d attempts, %d contacts", r.Reassert, r.ReassertAttempts, len(r.Contacts))
+	}
+	if got := len(e.hss.sarsOf()) - sars; got != maxReassertTries {
+		t.Errorf("%d SARs, want %d", got, maxReassertTries)
+	}
+	if m.get("registrar.reassert_failed") != maxReassertTries-1 || m.get("registrar.reassert_abandoned") != 1 {
+		t.Errorf("reassert_failed = %d, reassert_abandoned = %d", m.get("registrar.reassert_failed"), m.get("registrar.reassert_abandoned"))
+	}
+}
+
+// TestAReassertTheHSSRefusesForGoodIsNotRetried: 5001 and the like will not
+// change, so the mark goes at once.
+func TestAReassertTheHSSRefusesForGoodIsNotRetried(t *testing.T) {
+	e := newEnv(t)
+	m := &counts{}
+	g := e.instance(1, func(c *Config) { c.Metrics = m })
+	reassertDue(t, e, g)
+	unknown := cx.ExperimentalResult(cx.ErrorUserUnknown)
+	e.hss.mu.Lock()
+	e.hss.sarResult = &unknown
+	e.hss.mu.Unlock()
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	r := must(e.store.Registration(bg, set1))(t)
+	if !r.Reassert.IsZero() || m.get("registrar.reassert_abandoned") != 1 {
+		t.Errorf("after 5001: Reassert %v, abandoned %d", r.Reassert, m.get("registrar.reassert_abandoned"))
+	}
+}
+
+// TestAReassertSweepLosingToARegisterLeavesTheRegistersSave: the REGISTER
+// told the HSS itself, and its save carries no Reassert.
+func TestAReassertSweepLosingToARegisterLeavesTheRegistersSave(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	// The re-REGISTER lands while the sweep's SAR is on its way.
+	ch := &crossingHSS{HSS: e.hss, kind: cx.Registration}
+	ch.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 3600), 200) }
+	g := e.instance(3, func(c *Config) { c.HSS = ch })
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	r := must(e.store.Registration(bg, set1))(t)
+	if !r.Reassert.IsZero() || len(r.Contacts) != 1 || !r.Contacts[0].Expires.Equal(e.clock.Now().Add(time.Hour)) {
+		t.Errorf("after the race: Reassert %v, %+v", r.Reassert, r.Contacts)
 	}
 }

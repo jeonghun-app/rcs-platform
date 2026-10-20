@@ -311,7 +311,7 @@ func TestNoIdentityOrCredentialIsLogged(t *testing.T) {
 
 type failingStore struct{ *state.Memory }
 
-func (failingStore) Identity(context.Context, string) (*state.Identity, error) {
+func (failingStore) Identity(context.Context, string, time.Time) (*state.Identity, error) {
 	return nil, fmt.Errorf("store: unavailable")
 }
 

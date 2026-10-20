@@ -91,7 +91,7 @@ compromised, its reach is what its security group and tokens allow:
 
 | Service | Implemented in the service | Planned |
 |---|---|---|
-| `pcscf` | nothing yet: the service is not built | the service (#16), security groups (#56) |
+| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, with connections kept for the core listener ([pcscf](pcscf.md)) | registration and routing (#16), per-listener handshake limits (#193), security groups (#56) |
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |
@@ -175,7 +175,7 @@ metadata.
     can lock the others out, whether it writes 1-to-1 or in groups; 1-to-1
     notifications are bounded by the sent records and by being accepted once
     instead, group notifications by one share per group and a quarter of the
-    queue for all groups together (T11);
+    queue for all groups together, and their summaries by an eighth (T11);
   - is-composing forwarding, per leg;
   - per-sender rates for messages and notifications;
   - the size of notifications;
@@ -252,7 +252,12 @@ metadata.
   - each recipient's queue as in 1-to-1 chat, where a group message counts
     against its author's share, the one its 1-to-1 messages use; each
     group's notifications hold one share, and all groups' together a quarter
-    of the queue, beyond which they are dropped;
+    of the queue; beyond that they are summarized as one queue item per
+    message, at most an eighth of the queue in all, sent from the marks of
+    notifications already accepted, so the summary adds nothing a participant
+    did not report. A participant who sends receipts for many of the author's
+    messages fills at most that eighth, and the author's 1-to-1 messages keep
+    the rest;
   - names 100 bytes, subject and Conversation-ID 256 bytes; identities must
     be SIP or tel URIs, compared in canonical form, and names XML-safe text,
     so that one bad value cannot make the stored roster unwritable;

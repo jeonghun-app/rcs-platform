@@ -99,6 +99,9 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
 		{"AttemptsAreCountedOnceAcrossInstances", testAttemptCounts},
 		{"NoClientCanTakeAnAttemptCount", testAttemptCountNotAChallenge},
+		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
+		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
+		{"ADeregistrationCutShortIsFinishedByTheNextSweep", testInterruptedDeregistration},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

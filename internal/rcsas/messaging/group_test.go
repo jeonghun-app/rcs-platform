@@ -410,11 +410,12 @@ func TestReceiptsFromALargeGroupDoNotFillTheAuthorsQueue(t *testing.T) {
 		}
 	}
 	share := queueLimit(r.e.cfg).SenderCount
-	if got := r.store.(*store.Memory).Len(alice); got != share {
-		t.Fatalf("%d receipts queued for alice, one share is %d", got, share)
+	// The rest are summarized: one summary per message (#166).
+	if notes, sums := queuedReceipts(t, r, alice); notes != share || sums != 6 {
+		t.Fatalf("%d receipts and %d summaries queued for alice, one share is %d", notes, sums, share)
 	}
-	if got := r.m.get("group.notification.dropped"); got != 99*12-int64(share) {
-		t.Fatalf("dropped %d; metrics %v", got, r.m)
+	if got := r.m.get("group.notification.summarized"); got != 99*12-int64(share) || r.m.get("group.notification.dropped") != 0 {
+		t.Fatalf("summarized %d; metrics %v", got, r.m)
 	}
 	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
 		t.Fatalf("a 1-to-1 message to alice: %v", err)

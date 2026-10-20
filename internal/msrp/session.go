@@ -347,7 +347,12 @@ func (s *Session) attach(c *Conn) error {
 		s.closeWith(err)
 		return err
 	}
-	s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	// An active session's binding SEND is its traffic until it is
+	// answered, so Open starts the keep-alives then. Sent before, each
+	// would name a session the peer has not accepted yet (#204).
+	if c.passive {
+		s.armKeepAlive(c, c.cfg.KeepAliveInterval)
+	}
 	if flush {
 		s.flushHeld(c)
 	}

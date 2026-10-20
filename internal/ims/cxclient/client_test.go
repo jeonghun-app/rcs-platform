@@ -3,11 +3,13 @@ package cxclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -259,17 +261,26 @@ func TestATaskShuttingDownIsRetriedOnAnother(t *testing.T) {
 }
 
 func TestALostTaskIsFailedOverAndDroppedFromTheRotation(t *testing.T) {
-	e := newEnv(t, nil)
+	// The hung task's requests fail over when their timer runs out, which
+	// the test fires once they have arrived: no wall-clock bound applies
+	// to the healthy task's answers (#195).
+	clock := newHeldTimers(heldTimeout)
+	e := newEnv(t, func(c *Config) { c.Node.Clock, c.Node.RequestTimeout = clock, heldTimeout })
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
 	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
 	e.refresh("192.0.2.1", "192.0.2.2")
 	// The task hangs: its requests time out, and each is retried on the other.
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
+	arrived := make(chan struct{}, 16)
 	a.setAnswer(func(uint32, *diameter.Message) (*diameter.Message, error) {
+		arrived <- struct{}{}
 		<-hang
 		return nil, errors.New("gone")
 	})
+	var allowed atomic.Int32
+	allowed.Store(3)
+	timeOutArrivals(t, clock, arrived, &allowed)
 	for range 3 {
 		if _, err := e.client.UAR(ctx(t), uar()); err != nil {
 			t.Fatalf("with a hung task: %v", err)
@@ -292,6 +303,56 @@ func TestALostTaskIsFailedOverAndDroppedFromTheRotation(t *testing.T) {
 	}
 }
 
+// expiring is a caller's context that runs out of time when the test says
+// so, rather than after a fixed delay: its Err is then
+// context.DeadlineExceeded, as a deadline's is, which is what the client
+// must tell apart from an attempt's own RequestTimeout. Deadline reports a
+// time already past once it has expired, as a real deadline would.
+type expiring struct {
+	context.Context
+	done    chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	expired time.Time
+}
+
+func newExpiring(parent context.Context) *expiring {
+	return &expiring{Context: parent, done: make(chan struct{})}
+}
+
+func (e *expiring) Done() <-chan struct{} { return e.done }
+
+func (e *expiring) Err() error {
+	select {
+	case <-e.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (e *expiring) Deadline() (time.Time, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.expired.IsZero() {
+		return e.expired, true
+	}
+	return e.Context.Deadline()
+}
+
+func (e *expiring) expire() {
+	e.once.Do(func() {
+		e.mu.Lock()
+		e.expired = time.Now()
+		e.mu.Unlock()
+		close(e.done)
+	})
+}
+
+// Once the caller's deadline has passed, a request that has not been
+// answered is not tried on another task. The deadline passes as soon as the
+// first attempt has reached its task: a fixed 100 ms could pass, on a loaded
+// host, before the first request was even written (#167).
 func TestNoRetryOnceTheCallerHasGivenUp(t *testing.T) {
 	e := newEnv(t, func(c *Config) { c.RequestTimeout = time.Minute })
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
@@ -299,19 +360,36 @@ func TestNoRetryOnceTheCallerHasGivenUp(t *testing.T) {
 	e.refresh("192.0.2.1", "192.0.2.2")
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
+	arrived := make(chan struct{}, 2)
 	hung := func(uint32, *diameter.Message) (*diameter.Message, error) {
+		arrived <- struct{}{}
 		<-hang
 		return nil, errors.New("gone")
 	}
 	a.setAnswer(hung)
 	b.setAnswer(hung)
-	c, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+	c := newExpiring(ctx(t))
+	go func() {
+		select {
+		case <-arrived:
+		case <-time.After(realWait):
+			// Nothing arrived: the count below fails the test.
+		}
+		c.expire()
+	}()
 	if _, err := e.client.UAR(c, uar()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want the caller's deadline", err)
 	}
-	if n := len(a.requests()) + len(b.requests()); n != 1 {
-		t.Errorf("%d attempts after the caller gave up, want 1", n)
+	// A retry with the caller's context gone may never leave the node, so
+	// the tasks' count alone would not show one; the client's own count
+	// does.
+	if n := len(a.requests()) + len(b.requests()); n != 1 || e.metrics.count("cxclient.UAR.retry") != 0 {
+		t.Errorf("%d attempts, %d retries after the caller gave up, want 1 and 0", n, e.metrics.count("cxclient.UAR.retry"))
+	}
+	// Nor is the task that was still answering taken out of the rotation:
+	// the caller ran out of time, not the task (QA, #175).
+	if n := e.metrics.count("cxclient.peer.excluded"); n != 0 {
+		t.Errorf("peer.excluded = %d after the caller's own deadline, want 0", n)
 	}
 }
 
@@ -560,31 +638,254 @@ func TestABusyTaskGetsOnlyItsShareOfFirstAttempts(t *testing.T) {
 	}
 }
 
+// heldTimeout is the node's request timeout where a test holds it
+// (heldTimers): a duration no other timer has.
+const heldTimeout = 777 * time.Millisecond
+
+// heldTimers is a diameter.Clock that holds the timers of one duration,
+// the node's request timeout, until the test fires them; every other
+// timer runs on real time. It lets a request to a hung task time out
+// exactly when the test says, without a short timeout that a slow but
+// healthy answer could also run out of (#189). Its Now stands still
+// unless the test advances it, so that a test can put the client just
+// before or just after a TimeoutExclusion ends.
+type heldTimers struct {
+	d    time.Duration
+	mu   sync.Mutex
+	now  time.Time
+	held []*heldTimer
+}
+
+func newHeldTimers(d time.Duration) *heldTimers {
+	return &heldTimers{d: d, now: time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)}
+}
+
+type heldTimer struct {
+	c    *heldTimers
+	f    func()
+	done bool
+}
+
+func (c *heldTimers) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// advance moves Now on by d; it fires no timer.
+func (c *heldTimers) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func (c *heldTimers) AfterFunc(d time.Duration, f func()) diameter.Timer {
+	if d != c.d {
+		return time.AfterFunc(d, f)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &heldTimer{c: c, f: f}
+	c.held = append(c.held, t)
+	return t
+}
+
+func (t *heldTimer) Stop() bool {
+	t.c.mu.Lock()
+	defer t.c.mu.Unlock()
+	was := !t.done
+	t.done = true
+	return was
+}
+
+// pending reports whether a held timer is still to fire.
+func (c *heldTimers) pending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.held {
+		if !t.done {
+			return true
+		}
+	}
+	return false
+}
+
+// fire runs the held timers not yet stopped or fired, and reports how
+// many it ran.
+func (c *heldTimers) fire() int {
+	c.mu.Lock()
+	var due []func()
+	for _, t := range c.held {
+		if !t.done {
+			t.done = true
+			due = append(due, t.f)
+		}
+	}
+	c.held = nil
+	c.mu.Unlock()
+	for _, f := range due {
+		f()
+	}
+	return len(due)
+}
+
+// timeOutArrivals times out every request that reaches a hung task, as
+// its arrivals say: it fires the request's held timer, and only that one.
+// A request that arrives beyond allowed is an error, and so is one whose
+// timer is never held, which is not fired by real time instead.
+func timeOutArrivals(t *testing.T, clock *heldTimers, arrived <-chan struct{}, allowed *atomic.Int32) {
+	stop, done := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(stop); <-done })
+	go func() {
+		defer close(done)
+		for n := int32(1); ; n++ {
+			select {
+			case <-arrived:
+			case <-stop:
+				return
+			}
+			if most := allowed.Load(); n > most {
+				t.Errorf("the hung task got attempt %d, want %d at most", n, most)
+			}
+			// The client sets the timer before it writes the request, so
+			// it is held by now; the wait only guards against a hang.
+			held := false
+			for deadline := time.Now().Add(realWait); !held && time.Now().Before(deadline); {
+				if held = clock.pending(); !held {
+					time.Sleep(time.Millisecond)
+				}
+			}
+			if !held {
+				t.Errorf("no request timer was held for attempt %d", n)
+				continue
+			}
+			if fired := clock.fire(); fired != 1 {
+				t.Errorf("attempt %d fired %d request timers, want 1", n, fired)
+			}
+		}
+	}()
+}
+
+// A task whose attempt timed out gets no first attempts for
+// TimeoutExclusion: of ten requests, the hung task sees only the one that
+// timed out, and every request is answered by the other. Just before the
+// exclusion ends it still gets none; just after, it gets a first attempt
+// again. The hung request times out when the test fires its timer, once
+// it has arrived, and the client's clock moves only when the test moves
+// it: no wall-clock bound is involved, so neither a slow healthy answer
+// nor a slow test can fail it (#189).
 func TestATaskThatTimedOutGetsNoFirstAttemptsForAWhile(t *testing.T) {
-	e := newEnv(t, func(c *Config) { c.RequestTimeout = 200 * time.Millisecond })
+	const exclusion = time.Minute
+	clock := newHeldTimers(heldTimeout)
+	e := newEnv(t, func(c *Config) {
+		c.Node.Clock, c.Node.RequestTimeout, c.TimeoutExclusion = clock, heldTimeout, exclusion
+	})
 	a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
 	startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
 	e.refresh("192.0.2.1", "192.0.2.2")
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
+	arrived := make(chan struct{}, 16)
 	a.setAnswer(func(uint32, *diameter.Message) (*diameter.Message, error) {
+		arrived <- struct{}{}
 		<-hang
 		return nil, errors.New("gone")
 	})
-	start := time.Now()
-	for range 10 {
-		if _, err := e.client.UAR(ctx(t), uar()); err != nil {
-			t.Fatal(err)
+	// The first request to reach the hung task times out; any later one
+	// is a first attempt it should not have had.
+	var allowed atomic.Int32
+	allowed.Store(1)
+	timeOutArrivals(t, clock, arrived, &allowed)
+	uars := func(n int) {
+		t.Helper()
+		for range n {
+			if _, err := e.client.UAR(ctx(t), uar()); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	if n := len(a.requests()); n > 1 {
+	uars(10)
+	if n := len(a.requests()); n != 1 {
 		t.Errorf("the hung task got %d attempts, want only the one that timed out", n)
-	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("10 requests took %s with one hung task", elapsed)
 	}
 	if e.metrics.count("cxclient.peer.excluded") != 1 {
 		t.Error("the exclusion was not counted")
+	}
+	clock.advance(exclusion - time.Millisecond)
+	uars(4)
+	if n := len(a.requests()); n != 1 {
+		t.Errorf("the hung task got %d attempts before its exclusion ended", n)
+	}
+	// Two requests in turn: one is the hung task's first attempt again.
+	clock.advance(2 * time.Millisecond)
+	allowed.Store(2)
+	uars(2)
+	if n := len(a.requests()); n != 2 {
+		t.Errorf("the hung task got %d attempts after its exclusion ended, want 2", n)
+	}
+	if e.metrics.count("cxclient.peer.excluded") != 2 {
+		t.Error("the second exclusion was not counted")
+	}
+}
+
+// An attempt that ran out of time counts as the task's timeout whichever
+// timer ended it: the node's (ErrTimeout) or the attempt context's
+// (DeadlineExceeded), which with the default wiring, both RequestTimeout,
+// is about a third of them. Once the caller has given up, neither does.
+func TestAnAttemptTimesOutByEitherTimerWhileTheCallerWaits(t *testing.T) {
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tt := range []struct {
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{context.Background(), diameter.ErrTimeout, true},
+		{context.Background(), fmt.Errorf("send: %w", context.DeadlineExceeded), true},
+		{context.Background(), diameter.ErrConnectionClosed, false},
+		{context.Background(), nil, false},
+		{gone, diameter.ErrTimeout, false},
+		{gone, context.DeadlineExceeded, false},
+	} {
+		if got := timedOut(tt.ctx, tt.err); got != tt.want {
+			t.Errorf("timedOut(caller err %v, %v) = %v, want %v", tt.ctx.Err(), tt.err, got, tt.want)
+		}
+	}
+}
+
+// A failed attempt is repeated on another task when the task was busy or
+// shutting down or the request did not get through, by either timer, and
+// only while the caller still waits.
+func TestWhatIsRetriedOnAnotherTask(t *testing.T) {
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	answer := func(rc uint32) *diameter.Message {
+		m := &diameter.Message{}
+		m.Add(diameter.NewAVP(diameter.AVPResultCode, diameter.FlagMandatory, 0, diameter.Unsigned32(rc)))
+		return m
+	}
+	for _, tt := range []struct {
+		ctx  context.Context
+		ans  *diameter.Message
+		err  error
+		want bool
+	}{
+		{context.Background(), nil, diameter.ErrPeerUnavailable, true},
+		{context.Background(), nil, diameter.ErrConnectionClosed, true},
+		{context.Background(), nil, diameter.ErrTimeout, true},
+		{context.Background(), nil, fmt.Errorf("send: %w", context.DeadlineExceeded), true},
+		{context.Background(), nil, diameter.ErrApplicationNotNegotiated, true},
+		{context.Background(), nil, errors.New("other"), false},
+		{context.Background(), answer(diameter.ResultTooBusy), nil, true},
+		{context.Background(), answer(diameter.ResultUnableToDeliver), nil, true},
+		{context.Background(), answer(diameter.ResultSuccess), nil, false},
+		{context.Background(), &diameter.Message{}, nil, false},
+		{gone, nil, diameter.ErrTimeout, false},
+		{gone, answer(diameter.ResultTooBusy), nil, false},
+	} {
+		if got := retryable(tt.ctx, tt.ans, tt.err); got != tt.want {
+			t.Errorf("retryable(caller err %v, answer %v, %v) = %v, want %v", tt.ctx.Err(), tt.ans, tt.err, got, tt.want)
+		}
 	}
 }
 
