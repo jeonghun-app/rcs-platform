@@ -152,7 +152,7 @@ Parameters:
     Default: ''
     # Empty, or a lower-case DNS name: a typo fails here, not at the ALB rule
     # or the service's start.
-    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
     Description: >
       Host name of the FT HTTP content server (the host of ftHTTPCSURI). When
       set, ft-server's routes also match on it, so acs and ft-server can share
@@ -399,7 +399,7 @@ Parameters:
   RelayPublicHost:
     Type: String
     Default: ''
-    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
     Description: >
       RELAY_PUBLIC_HOST, the host of every client_path: an operator FQDN that
       names the NLB, or empty for the NLB's own DNS name.
@@ -452,7 +452,7 @@ Parameters:
   AcsHostName:
     Type: String
     Default: ''
-    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
     Description: >
       Host name of acs on the ALB (the operator's configuration server name),
       used in the URIs acs hands out. Required outside dev: clients check the
@@ -552,6 +552,28 @@ Rules:
         AssertDescription: >
           staging and prod need the interface endpoints: without them
           ft-server needs HTTPS to the internet (#105).
+
+  # An allocation and its address come together (deploy.sh sets the address
+  # from the allocation), so NlbPublicAddresses, and pcscf's
+  # PCSCF_PUBLIC_ADDRS with it, never gets an empty entry.
+  NlbAddressPairA:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref NlbAllocationIdA, ''], !Equals [!Ref NlbReusedAddressA, '']]
+          - !And [!Not [!Equals [!Ref NlbAllocationIdA, '']], !Not [!Equals [!Ref NlbReusedAddressA, '']]]
+        AssertDescription: NlbAllocationIdA and NlbReusedAddressA are given together or not at all.
+  NlbAddressPairB:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref NlbAllocationIdB, ''], !Equals [!Ref NlbReusedAddressB, '']]
+          - !And [!Not [!Equals [!Ref NlbAllocationIdB, '']], !Not [!Equals [!Ref NlbReusedAddressB, '']]]
+        AssertDescription: NlbAllocationIdB and NlbReusedAddressB are given together or not at all.
+  # Two subnets, two addresses: one allocation cannot serve both.
+  NlbAllocationsDistinct:
+    RuleCondition: !Not [!Equals [!Ref NlbAllocationIdA, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref NlbAllocationIdA, !Ref NlbAllocationIdB]]
+        AssertDescription: NlbAllocationIdA and NlbAllocationIdB must differ.
 
   ProductionNeedsTls:
     RuleCondition: !Not [!Equals [!Ref Environment, dev]]

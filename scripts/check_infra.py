@@ -405,6 +405,28 @@ def check_plain_listeners(template: dict) -> list[str]:
 LISTENER_PORTS = {"Nlb": {5060, 5061, 2855, 2856}, "Alb": {80, 443}}
 
 
+# Parameters that must be given together: a reused NLB allocation and its
+# address (an empty address would leave a hole in PCSCF_PUBLIC_ADDRS).
+PARAMETER_PAIRS = (("NlbAllocationIdA", "NlbReusedAddressA"), ("NlbAllocationIdB", "NlbReusedAddressB"))
+
+
+def check_parameter_pairs(template: dict) -> list[str]:
+    """A Rule asserts each pair is given together: both empty or both set."""
+    problems = []
+    for first, second in PARAMETER_PAIRS:
+        both_empty = {"Fn::And": [{"Fn::Equals": [{"Ref": first}, ""]}, {"Fn::Equals": [{"Ref": second}, ""]}]}
+        both_set = {"Fn::And": [{"Fn::Not": [{"Fn::Equals": [{"Ref": first}, ""]}]},
+                                {"Fn::Not": [{"Fn::Equals": [{"Ref": second}, ""]}]}]}
+        found = any(a.get("Assert") == {"Fn::Or": [both_empty, both_set]} and "RuleCondition" not in rule
+                    for rule in template.get("Rules", {}).values() for a in rule.get("Assertions", []))
+        if not found:
+            problems.append(f"Rules: nothing asserts {first} and {second} come together")
+    distinct = {"Fn::Not": [{"Fn::Equals": [{"Ref": "NlbAllocationIdA"}, {"Ref": "NlbAllocationIdB"}]}]}
+    if not any(a.get("Assert") == distinct for rule in template.get("Rules", {}).values() for a in rule.get("Assertions", [])):
+        problems.append("Rules: nothing asserts NlbAllocationIdA and NlbAllocationIdB differ")
+    return problems
+
+
 def check_load_balancers(template: dict) -> list[str]:
     """Only Nlb and Alb face the internet, on their listed ports only."""
     problems = []
@@ -472,7 +494,7 @@ def check_host_parameters(template: dict) -> list[str]:
         if not pattern:
             problems.append(f"parameter {name}: no AllowedPattern")
             continue
-        for bad in ("a b", "Ft.Example.com", "-x.example.com", "x"):
+        for bad in ("a b", "Ft.Example.com", "-x.example.com", "x", "a" * 64 + ".example.com"):
             if re.fullmatch(pattern, bad):
                 problems.append(f"parameter {name}: its pattern accepts {bad!r}")
         for good in ("", "ft.example.com"):
@@ -996,9 +1018,85 @@ def check_iam_statements(template: dict) -> list[str]:
                 if not isinstance(action, str) or action.lower() not in STAR_ACTIONS:
                     problems.append(f"{name}: {action} on Resource '*'; name the resource")
             if covers(_actions(st), "sns:publish") and not any(
-                    covers(_actions(d), "sns:publish") and ":sns:*" in str(d.get("Resource")) for d in denies.get(name, [])):
+                    _actions(d) == ["sns:Publish"] and d.get("Resource") == SNS_EVERY_TOPIC for d in denies.get(name, [])):
                 problems.append(f"{name}: sns:Publish on '*' without a Deny on topics reaches every topic")
     return problems
+
+
+# Values the IAM checks can read: literals, Ref, GetAtt and Sub (whose
+# variables are literals or the same). The registry stack's repository ARNs
+# arrive by import, in execution roles only. Anything else (an If inside a
+# Resource, Join, a nested If around statements) could hide what is granted,
+# so the checks fail closed on it.
+ECR_IMPORTS = (
+    {"Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-PlatformRepositoryArn"}},
+    {"Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-AcsRepositoryArn"}},
+)
+
+
+def _readable(value, imports_allowed: bool) -> bool:
+    if isinstance(value, str):
+        return True
+    if isinstance(value, list):
+        return all(_readable(v, imports_allowed) for v in value)
+    if isinstance(value, dict):
+        if imports_allowed and value in ECR_IMPORTS:
+            return True
+        if set(value) == {"Ref"} and isinstance(value["Ref"], str):
+            return True
+        if set(value) == {"Fn::GetAtt"}:
+            return True
+        if set(value) == {"Fn::Sub"}:
+            sub = value["Fn::Sub"]
+            if isinstance(sub, str):
+                return True
+            return (isinstance(sub, list) and len(sub) == 2 and isinstance(sub[0], str)
+                    and all(_readable(v, imports_allowed) for v in sub[1].values()))
+    return False
+
+
+def _documents(template: dict):
+    """(owner, policy document, is an execution role) for every IAM policy,
+    as written: a policy-level If's branches, unexpanded statements."""
+    execution = {logical_id(td.get("Properties", {}).get("ExecutionRoleArn"))
+                 for td in resources(template, "AWS::ECS::TaskDefinition").values()}
+    for name, role in resources(template, "AWS::IAM::Role").items():
+        for policy in role.get("Properties", {}).get("Policies", []):
+            branches = policy["Fn::If"][1:] if isinstance(policy, dict) and "Fn::If" in policy else [policy]
+            for branch in branches:
+                if isinstance(branch, dict) and "Fn::If" in branch:
+                    yield name, None, False
+                elif isinstance(branch, dict) and "PolicyDocument" in branch:
+                    yield name, branch["PolicyDocument"], name in execution
+    for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"):
+        for name, policy in resources(template, kind).items():
+            yield name, policy.get("Properties", {}).get("PolicyDocument", {}), False
+
+
+def check_iam_shapes(template: dict) -> list[str]:
+    problems = []
+    for name, document, imports_allowed in _documents(template):
+        if document is None:
+            problems.append(f"{name}: a policy inside a nested Fn::If, which the checks cannot read")
+            continue
+        for st in document.get("Statement", []) if isinstance(document.get("Statement"), list) else [document.get("Statement")]:
+            if isinstance(st, dict) and "Fn::If" in st:
+                inner = [b for b in st["Fn::If"][1:] if isinstance(b, dict) and "Ref" not in b]
+                if any("Fn::If" in b for b in inner):
+                    problems.append(f"{name}: a statement inside a nested Fn::If, which the checks cannot read")
+                    continue
+                statements = inner
+            else:
+                statements = [st]
+            for s in statements:
+                for key in ("Action", "NotAction", "Resource", "NotResource"):
+                    if key in s and not _readable(s[key], imports_allowed):
+                        problems.append(f"{name}: {key} written with a function the checks cannot read (use Ref, GetAtt or Sub)")
+    return problems
+
+
+# The Deny that holds sns:Publish on '*' to phone numbers: every topic.
+SNS_EVERY_TOPIC = {"Fn::Sub": "arn:${AWS::Partition}:sns:*:*:*"}
 
 
 # Wildcards inside an ARN, only where the resource is a set by nature:
@@ -1116,10 +1214,17 @@ def check_topics(template: dict) -> list[str]:
         key = logical_id(topic.get("Properties", {}).get("KmsMasterKeyId"))
         if key in keys:
             # Publishing to an encrypted topic needs the key too.
-            usable = set()
+            # SNS needs both: GenerateDataKey to encrypt a message, Decrypt to
+            # deliver it.
+            granted: dict[str, set[str]] = {}
             for st in keys[key].get("Properties", {}).get("KeyPolicy", {}).get("Statement", []):
-                if st.get("Effect") == "Allow" and covers(_actions(st), ("kms:generatedatakey", "kms:decrypt")):
-                    usable |= {s[len("service:"):] for s in _key_principals(st) if s.startswith("service:")}
+                if st.get("Effect") != "Allow":
+                    continue
+                for s in _key_principals(st):
+                    if s.startswith("service:"):
+                        granted.setdefault(s[len("service:"):], set()).update(
+                            a for a in ("kms:generatedatakey", "kms:decrypt") if covers(_actions(st), a))
+            usable = {s for s, actions in granted.items() if actions == {"kms:generatedatakey", "kms:decrypt"}}
             for service in sorted(publishers.get(name, set()) - usable):
                 problems.append(f"{name}: {service} publishes to it but cannot use its key {key}")
         for service in sorted(publishers.get(name, set()) - allowed.get(name, set())):
@@ -1183,6 +1288,7 @@ CHECKS = (
     check_target_groups,
     check_plain_listeners,
     check_load_balancers,
+    check_parameter_pairs,
     check_waf,
     check_waf_logging,
     check_host_parameters,
@@ -1193,6 +1299,7 @@ CHECKS = (
     check_table_keys,
     check_alarm_rules,
     check_secret_access,
+    check_iam_shapes,
     check_iam_statements,
     check_scans,
     check_key_policies,

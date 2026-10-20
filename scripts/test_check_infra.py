@@ -264,6 +264,17 @@ class PlatformTemplate(TemplateCase):
         self.assertTrue(re.fullmatch(pattern, ""))
         self.assertFalse(re.fullmatch(pattern, "203.0.113.7"))
 
+    def test_an_nlb_allocation_without_its_address_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Rules"]["NlbAddressPairB"]
+        self.assertProblem(t, "Rules: nothing asserts NlbAllocationIdB and NlbReusedAddressB come together")
+        t = copy.deepcopy(self.template)
+        t["Rules"]["NlbAddressPairA"]["Assertions"][0]["Assert"]["Fn::Or"].pop()
+        self.assertProblem(t, "Rules: nothing asserts NlbAllocationIdA and NlbReusedAddressA come together")
+        t = copy.deepcopy(self.template)
+        del t["Rules"]["NlbAllocationsDistinct"]
+        self.assertProblem(t, "Rules: nothing asserts NlbAllocationIdA and NlbAllocationIdB differ")
+
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)
         self.assertProblem(t, "Alb: internet-facing ALB without an AWS WAF web ACL")
@@ -621,6 +632,98 @@ class StackAdditions(TemplateCase):
     def test_registrations_expire_on_ttl_not_on_the_index_key(self):
         spec = self.template["Resources"]["RegistrationsTable"]["Properties"]["TimeToLiveSpecification"]
         self.assertEqual(spec, {"AttributeName": "ttl", "Enabled": True})
+
+
+
+class FailClosed(TemplateCase):
+    """The five bypass copies of the second reviews, and QA's minors."""
+
+    def statements(self, t: dict, role: str) -> list:
+        return t["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+
+    def test_an_extra_action_on_a_resource_written_with_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "FtServerTaskRole").append({"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": {
+            "Fn::If": ["IsDev", {"Fn::Sub": "${FilesBucket.Arn}/*"}, {"Ref": "AWS::NoValue"}]}})
+        self.assertProblem(t, "FtServerTaskRole: Resource written with a function the checks cannot read")
+
+    def test_an_extra_action_on_a_resource_written_with_join_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "FtServerTaskRole").append({"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": {
+            "Fn::Join": ["", [{"Fn::GetAtt": ["FilesBucket", "Arn"]}, "/*"]]}})
+        self.assertProblem(t, "FtServerTaskRole: Resource written with a function the checks cannot read")
+
+    def test_a_secret_read_inside_a_nested_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "HssTaskRole").append({"Fn::If": ["IsDev", {"Fn::If": ["IsProduction", {
+            "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "HssAdminToken"}},
+            {"Ref": "AWS::NoValue"}]}, {"Ref": "AWS::NoValue"}]})
+        self.assertProblem(t, "HssTaskRole: a statement inside a nested Fn::If")
+
+    def test_an_if_in_a_resource_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "MsrpRelayTaskRole")[0]["Resource"] = {
+            "Fn::If": ["IsDev", {"Fn::GetAtt": ["MsrpBindingsTable", "Arn"]}, "*"]}
+        self.assertProblem(t, "MsrpRelayTaskRole: Resource written with a function the checks cannot read")
+
+    def test_an_import_on_a_task_role_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "AcsTaskRole").append({"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {
+            "Fn::ImportValue": "someone-elses-table-arn"}})
+        self.assertProblem(t, "AcsTaskRole: Resource written with a function the checks cannot read")
+
+    def test_the_registry_imports_stay_allowed_in_execution_roles(self):
+        self.assertEqual([p for p in check_infra.check_iam_shapes(self.template)], [])
+
+    def test_the_sns_deny_must_cover_every_topic_exactly(self):
+        t = copy.deepcopy(self.template)
+        for p in t["Resources"]["AcsTaskRole"]["Properties"]["Policies"]:
+            if isinstance(p, dict) and "Fn::If" in p and p["Fn::If"][0] == "UseAcsSns":
+                p["Fn::If"][1]["PolicyDocument"]["Statement"][1]["Resource"] = {
+                    "Fn::Sub": "arn:${AWS::Partition}:sns:*:*:*-not-every-topic"}
+        self.assertProblem(t, "AcsTaskRole: sns:Publish on '*' without a Deny on topics")
+
+    def http_rules(self, t: dict):
+        return t["Resources"]["HttpListener"]["Properties"]["DefaultActions"][0]["Fn::If"]
+
+    def test_the_http_listener_condition_must_be_the_certificate(self):
+        t = copy.deepcopy(self.template)
+        self.http_rules(t)[0] = "IsDev"
+        self.assertProblem(t, "HttpListener: with a certificate the HTTP listener must redirect to HTTPS")
+        t = copy.deepcopy(self.template)
+        self.http_rules(t)[1] = {"Type": "forward", "TargetGroupArn": {"Ref": "AcsTargetGroup"}}
+        self.assertProblem(t, "HttpListener: with a certificate the HTTP listener must redirect to HTTPS")
+
+    def test_a_rule_whose_if_picks_the_http_listener_with_a_certificate_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerRule"]["Properties"]["ListenerArn"] = {
+            "Fn::If": ["HasAlbCertificate", {"Ref": "HttpListener"}, {"Ref": "HttpsListener"}]}
+        self.assertProblem(t, "FtServerRule: forwards on the HTTP listener even with a certificate")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerRule"]["Properties"]["ListenerArn"] = {
+            "Fn::If": ["IsDev", {"Ref": "HttpsListener"}, {"Ref": "HttpListener"}]}
+        self.assertProblem(t, "FtServerRule: forwards on the HTTP listener even with a certificate")
+
+    def test_a_topic_key_needs_both_generate_and_decrypt(self):
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["AlarmKey"]["Properties"]["KeyPolicy"]["Statement"]:
+            if st.get("Sid") == "PublishersEncrypt":
+                st["Action"] = ["kms:GenerateDataKey*"]
+        self.assertProblem(t, "AlarmTopic: cloudwatch.amazonaws.com publishes to it but cannot use its key AlarmKey")
+
+    def test_discover_instances_needs_both_halves_of_its_condition(self):
+        for half in ("servicediscovery:ServiceName", "servicediscovery:NamespaceName"):
+            with self.subTest(half=half):
+                t = copy.deepcopy(self.template)
+                st = [s for s in t["Resources"]["IcscfTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+                      if s.get("Action") == "servicediscovery:DiscoverInstances"][0]
+                del st["Condition"]["StringEquals"][half]
+                self.assertProblem(t, "IcscfTaskRole: DiscoverInstances without the condition")
+
+    def test_a_dns_label_over_63_characters_is_refused(self):
+        pattern = self.template["Parameters"]["FtHostName"]["AllowedPattern"]
+        self.assertTrue(re.fullmatch(pattern, "a" * 63 + ".example.com"))
+        self.assertFalse(re.fullmatch(pattern, "a" * 64 + ".example.com"))
 
 
 RUNBOOK = TEMPLATE.parent.parent / "docs" / "runbook.md"
