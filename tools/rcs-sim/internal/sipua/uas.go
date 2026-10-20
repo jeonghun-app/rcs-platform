@@ -62,7 +62,7 @@ func (c *IncomingCall) Reject(code int) error {
 		return ErrCallEnded
 	}
 	c.final = true
-	c.ua.forgetCall(c.tx)
+	c.ua.answered(c)
 	res, err := sip.NewResponse(c.req, code, "", c.tag)
 	if err != nil {
 		return err
@@ -89,7 +89,7 @@ func (c *IncomingCall) Accept(answer []byte) (*Dialog, error) {
 		return nil, err
 	}
 	c.final = true
-	c.ua.forgetCall(c.tx)
+	c.ua.answered(c)
 	if err := c.tx.Respond(res); err != nil {
 		d.mu.Lock()
 		d.endLocked()
@@ -143,7 +143,7 @@ func (ua *UA) incoming(tx *transaction.ServerTransaction) {
 	key := mergeKey(req)
 	c := &IncomingCall{ua: ua, tx: tx, req: req, tag: tag, cancelled: make(chan struct{})}
 	ua.mu.Lock()
-	merged := false
+	_, merged := ua.answeredCalls[key]
 	for _, other := range ua.calls {
 		merged = merged || mergeKey(other.req) == key
 	}
@@ -167,6 +167,23 @@ func (ua *UA) incoming(tx *transaction.ServerTransaction) {
 func mergeKey(req *sip.Request) string {
 	from, _ := req.Header.From()
 	return req.Header.Get("Call-ID") + "\x00" + from.Tag() + "\x00" + req.Header.Get("CSeq")
+}
+
+// answered forgets an incoming INVITE that has its final response, but
+// keeps its merge key for 64*T1, as long as its server transaction lives
+// (Timer L, RFC 6026; Timer H): the same INVITE by another way meanwhile
+// is still a merged request (§8.2.2.2).
+func (ua *UA) answered(c *IncomingCall) {
+	key := mergeKey(c.req)
+	ua.mu.Lock()
+	delete(ua.calls, c.tx)
+	ua.answeredCalls[key] = struct{}{}
+	ua.mu.Unlock()
+	ua.cfg.Clock.AfterFunc(64*transaction.DefaultT1, func() {
+		ua.mu.Lock()
+		delete(ua.answeredCalls, key)
+		ua.mu.Unlock()
+	})
 }
 
 func (ua *UA) forgetCall(tx *transaction.ServerTransaction) {
@@ -200,7 +217,7 @@ func (ua *UA) cancel(tx *transaction.ServerTransaction) {
 		return
 	}
 	c.final = true
-	ua.forgetCall(c.tx)
+	ua.answered(c)
 	if res, err := sip.NewResponse(c.req, 487, "", c.tag); err == nil {
 		_ = c.tx.Respond(res)
 	}
@@ -286,7 +303,10 @@ func (d *Dialog) retransmit(tx *transaction.ServerTransaction, res *sip.Response
 		default:
 		}
 		close(d.ackGiveUp)
-		_, _ = d.Bye(context.Background())
+		// Off the timer's goroutine: the BYE may wait up to Timer F
+		// for its answer, and a clock that runs callbacks in turn would
+		// wait with it.
+		d.ua.byes.Go(func() { _, _ = d.Bye(context.Background()) })
 	})
 	d.mu.Unlock()
 }
