@@ -395,3 +395,47 @@ func TestAReassertSweepLosingToARegisterLeavesTheRegistersSave(t *testing.T) {
 		t.Errorf("after the race: Reassert %v, %+v", r.Reassert, r.Contacts)
 	}
 }
+
+// TestADeregistrationLeftAsALeaseIsFinishedByTheNextSweep: the HSS cannot be
+// told of a deregistration and the bindings cannot be put back either, so the
+// lease stands. The first sweep after the lease tells the HSS and leaves
+// nothing of the set (QA's minor 2 on #196).
+func TestADeregistrationLeftAsALeaseIsFinishedByTheNextSweep(t *testing.T) {
+	e := newEnv(t)
+	u := e.akaUser(impi1, impu1, tel1)
+	wantStatus(t, u.registerWith(e.instance(1), 600), 200)
+	e.hss.mu.Lock()
+	e.hss.sarHook = func(r *cx.SAR) (*cx.SAA, error) {
+		if r.AssignmentType == cx.UserDeregistration {
+			return nil, errUnreachable
+		}
+		return nil, nil
+	}
+	e.hss.mu.Unlock()
+	// The writes are the lease, then the record put back, which fails.
+	fs := &faultStore{Store: e.store, at: 1, kind: "error"}
+	wantStatus(t, u.registerWith(e.instance(2, func(c *Config) { c.Store = fs }), 0), 480)
+	if r := must(e.store.Registration(bg, set1))(t); len(r.Contacts) != 0 || r.Deregistering.IsZero() {
+		t.Fatalf("not left as a lease: %+v", r)
+	}
+	e.hss.mu.Lock()
+	e.hss.sarHook = nil
+	e.hss.mu.Unlock()
+	sars := len(e.hss.sarsOf())
+	e.clock.advance(state.SweepLease + time.Second)
+	if n, err := e.instance(3).Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	if got := e.hss.sarsOf()[sars:]; !slices.Equal(got, []cx.ServerAssignmentType{cx.TimeoutDeregistration}) {
+		t.Errorf("SARs %v", got)
+	}
+	gone(t, e, impu1, tel1)
+	for _, impu := range []string{impu1, tel1} {
+		if _, err := e.store.Identity(bg, impu, e.clock.Now()); err == nil {
+			t.Errorf("%s still names the set", impu)
+		}
+	}
+	if _, err := e.store.Profile(bg, set1, e.clock.Now()); err == nil {
+		t.Error("the profile is still stored")
+	}
+}

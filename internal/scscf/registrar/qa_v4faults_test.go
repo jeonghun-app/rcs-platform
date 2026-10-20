@@ -148,7 +148,7 @@ func TestAPutBackThatCannotPointEveryIdentityLeavesTheSetToTheSweep(t *testing.T
 	// The deregistration writes the lease, the record put back, then the
 	// identities: the fourth write is the second identity's.
 	fs := &faultStore{Store: e.store, at: 3, kind: "error"}
-	m := &countingMetrics{}
+	m := &counts{}
 	wantStatus(t, u.registerWith(e.instance(2, func(c *Config) { c.Store, c.Metrics = fs, m }), 0), 480)
 	fs.mu.Lock()
 	if len(fs.names) < 4 || fs.names[3] != "SaveIdentity" {
