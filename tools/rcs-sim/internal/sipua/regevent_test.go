@@ -417,6 +417,18 @@ func TestANotifyBeforeThe2xxSetsUpTheDialog(t *testing.T) {
 	}
 	nextNotification(t, sub)
 	s.nextMethod(t, "SUBSCRIBE")
+	// The first NOTIFY fixed the notifier's tag: one from another dialog is
+	// refused here too (QA on #205).
+	n.mu.Lock()
+	tag := n.tag
+	n.tag = "another-notifier"
+	n.mu.Unlock()
+	if res := n.notify(t, "terminated;reason=rejected", ""); res.StatusCode != 481 {
+		t.Errorf("NOTIFY from another dialog answered %d, want 481", res.StatusCode)
+	}
+	n.mu.Lock()
+	n.tag = tag
+	n.mu.Unlock()
 	if _, err := sub.Unsubscribe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -437,6 +449,35 @@ func TestACSeqOfZeroIsANotifysCSeqLikeAnyOther(t *testing.T) {
 		if res := s.sendRequest(t, req, n.flow); res.StatusCode != want {
 			t.Fatalf("NOTIFY %d with CSeq 0 answered %d, want %d", i+1, res.StatusCode, want)
 		}
+	}
+	nextNotification(t, sub)
+}
+
+func TestTheFirstNotifyMayCarryAnotherTagThanThe2xx(t *testing.T) {
+	// QA on #205: the NOTIFY creates the dialog (RFC 6665 §4.4.1); the
+	// 2xx "might not correlate" (RFC 3265 §4.4.9).
+	s := newStandIn(t, transport.TCP)
+	n := newNotifier(t, s)
+	ua := dial(t, s.config())
+	register(t, ua)
+	s.onSubscribe = func(tx *transaction.ServerTransaction) {
+		req := tx.Request()
+		n.mu.Lock()
+		if n.sub == nil {
+			n.sub, n.flow = req.Clone(), tx.Source().Flow
+		}
+		n.mu.Unlock()
+		res := mustResponse(t, req, 200, "two-hundred")
+		res.Header.Add("Contact", notifierContact)
+		res.Header.Add("Expires", strconv.Itoa(RegEventExpires))
+		_ = tx.Respond(res)
+	}
+	sub, res, err := ua.SubscribeRegEvent(context.Background())
+	if err != nil || res.StatusCode != 200 {
+		t.Fatal(res, err)
+	}
+	if r := n.notify(t, "active;expires=600000", reginfo(0, "full", "active", "registered", ua.contact.URI.String())); r.StatusCode != 200 {
+		t.Fatalf("the first NOTIFY, tagged %q after a 2xx tagged two-hundred, answered %d", n.tag, r.StatusCode)
 	}
 	nextNotification(t, sub)
 }

@@ -162,8 +162,10 @@ type Subscription struct {
 	notified     bool
 	cseq         uint32
 	remoteCSeq   uint32
-	// remoteTag is the notifier's tag once the 2xx or a NOTIFY has given
-	// it; seenCSeq says remoteCSeq holds a NOTIFY's, which may be 0.
+	// remoteTag is the notifier's tag, from the first NOTIFY: the NOTIFY
+	// makes the dialog, and the 2xx's To tag need not match it (RFC 6665
+	// §4.4.1, RFC 3265 §4.4.9). seenCSeq says remoteCSeq holds a
+	// NOTIFY's, which may be 0.
 	remoteTag string
 	seenCSeq  bool
 	ended     bool
@@ -231,9 +233,6 @@ func (ua *UA) SubscribeRegEvent(ctx context.Context) (*Subscription, *sip.Respon
 	s.mu.Lock()
 	if !s.notified {
 		s.remote, s.routes, s.remoteTarget = res.Header.Get("To"), routes, contactOr(res, ua.cfg.IMPU)
-		if to, err := res.Header.To(); err == nil {
-			s.remoteTag = to.Tag()
-		}
 	}
 	s.mu.Unlock()
 	return s, res, nil
