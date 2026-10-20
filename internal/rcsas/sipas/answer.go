@@ -20,8 +20,8 @@ import (
 // the engine like pager-mode ones: stored, then delivered to the peer.
 func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
-	if len(unsupported(req)) > 0 {
-		s.respond(u, req, 420)
+	if bad := unsupported(req, "timer"); len(bad) > 0 {
+		s.refuseUnsupported(u, req, bad)
 		return
 	}
 	// The service is what the client asks for: a chat session, or one for
@@ -37,12 +37,12 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, 403)
 		return
 	}
-	sender, identities, code := asserted(req)
+	sender, identities, code := s.asserted(req)
 	if code != 0 {
 		s.respond(u, req, code)
 		return
 	}
-	peer, ok := UserOf(req.URI.String())
+	peer, ok := messaging.UserOf(req.URI.String(), s.cfg.HomeDomain)
 	if !ok {
 		s.respond(u, req, 404)
 		return
@@ -103,11 +103,14 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	// finds the session.
 	if err := s.addSession(ss); err != nil {
 		_ = leg.Close()
-		code := 503 // another task may take it
 		if errors.Is(err, errUserSessions) {
-			code = 403
+			s.respond(u, req, 403)
+			return
 		}
-		s.respond(u, req, code)
+		// The client may try again in a moment, and another task may
+		// take it. A 500, not a 503, which scscf would turn into a 500
+		// of its own without Retry-After (RFC 3261 §16.7 step 6).
+		s.respondRetry(u, req, 500)
 		return
 	}
 	if err := u.Respond(res); err != nil {
@@ -118,31 +121,6 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	s.cfg.Metrics.Count("sip.invite.answered", 1)
 	ss.arm()
 	go ss.watch(u)
-}
-
-// asserted reads the sender of a request from the core: the network
-// asserts it (RFC 3325 §9.1). The first identity is the one the engine
-// keys by, and every one of them, as asserted and in canonical form, is
-// one the sender may name in its CPIM From. Without one, the request is
-// refused (403).
-func asserted(req *sip.Request) (string, []string, int) {
-	pai, err := req.Header.PAssertedIdentity()
-	if err != nil || len(pai) == 0 {
-		return "", nil, 403
-	}
-	sender, ok := UserOf(pai[0].URI.String())
-	if !ok {
-		return "", nil, 403
-	}
-	var identities []string
-	for _, a := range pai {
-		raw := a.URI.String()
-		identities = append(identities, raw)
-		if c, ok := UserOf(raw); ok && c != sender {
-			identities = append(identities, c)
-		}
-	}
-	return sender, identities, 0
 }
 
 // names reports whether req asks for the service whose ICSI ends in icsi:

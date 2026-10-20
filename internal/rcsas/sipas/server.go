@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,9 +21,9 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
-// busyRetryAfter is the Retry-After, in seconds, of the 503 for a store that
-// stayed busy through its retries (store.ErrBusy): the conflicting write is
-// over within a moment.
+// busyRetryAfter is the Retry-After, in seconds, of the answer to a message
+// the store stayed busy for through its retries (store.ErrBusy): the
+// conflicting write is over within a moment.
 const busyRetryAfter = "1"
 
 // The default bounds on sessions. A session holds a leg and its MSRP
@@ -51,6 +52,10 @@ type Config struct {
 	// Host is this task's address (ADR 0005), the host of the Call-IDs it
 	// makes.
 	Host string
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
+	// a SIP URI whose user part is a global number names that number
+	// (UserOf).
+	HomeDomain string
 	// Contact is this task's SIP URI, the Contact of its sessions, where
 	// the requests in their dialogs reach it.
 	Contact sip.URI
@@ -107,6 +112,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Host == "" {
 		return nil, errors.New("sipas: Host is required")
 	}
+	if cfg.HomeDomain == "" {
+		return nil, errors.New("sipas: HomeDomain is required")
+	}
 	if !cfg.Contact.IsSIP() {
 		return nil, errors.New("sipas: Contact must be a SIP URI")
 	}
@@ -152,8 +160,35 @@ func (systemClock) Now() time.Time { return time.Now() }
 
 func (systemClock) AfterFunc(d time.Duration, f func()) msrp.Timer { return time.AfterFunc(d, f) }
 
+// ownTagPrefix starts the From tag of every request rcs-as originates, on
+// every task, so that one that comes back to it is known. It does when a
+// profile routes rcs-as's terminating requests to rcs-as again, lacking the
+// P-Served-User exclusion of the default one (docs/hss.md): rcs-as would
+// take its own delivery for a new message and send it once more, without
+// end. A client that writes such a tag only has its own request refused.
+const ownTagPrefix = "rcsas-"
+
+// ownTag is a From tag for a request rcs-as originates.
+func (s *Server) ownTag() (string, error) {
+	tag, err := s.ids.Tag()
+	return ownTagPrefix + tag, err
+}
+
+// looped reports a request rcs-as originated itself.
+func looped(req *sip.Request) bool {
+	from, err := req.Header.From()
+	return err == nil && strings.HasPrefix(from.Tag(), ownTagPrefix)
+}
+
 // Route implements proxy.Router.
 func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
+	if r.Initial() && r.Message.Method != "ACK" && looped(r.Message) {
+		// 482 Loop Detected (RFC 3261 §21.4.20); the sender of the
+		// request, rcs-as itself, takes it as a failure and tries again
+		// later, until the profile is put right.
+		s.cfg.Metrics.Count("sip.loop", 1)
+		return proxy.Decision{Status: 482}
+	}
 	switch m := r.Message.Method; {
 	case m == "ACK":
 		// The ACK of a 2xx rcs-as sent went to its UAS (proxy.UAS.ACK);
@@ -193,24 +228,64 @@ const allowed = "INVITE, ACK, CANCEL, BYE, UPDATE, MESSAGE, OPTIONS, REGISTER"
 // so (RFC 3428 §7).
 func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
+	if bad := unsupported(req); len(bad) > 0 {
+		// RFC 3261 §8.2.2.3: a client that requires an extension rcs-as
+		// lacks must not have its request served without it.
+		s.cfg.Metrics.Count("sip.message.420", 1)
+		s.refuseUnsupported(u, req, bad)
+		return
+	}
+	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, cpim.ContentType) {
+		// What to send instead (RFC 3261 §21.4.13). A CPIM body whose
+		// content the engine refuses is answered 415 without it: it is
+		// the type the client sent already.
+		s.cfg.Metrics.Count("sip.message.415", 1)
+		s.respondWith(u, req, 415, [2]string{"Accept", cpim.ContentType})
+		return
+	}
 	o, code := s.origin(req)
+	busy := false
 	if code == 0 {
-		code = s.submit(ctx, o)
+		code, busy = s.submit(ctx, o)
 	}
 	s.cfg.Metrics.Count(fmt.Sprintf("sip.message.%d", code), 1)
+	if busy {
+		s.respondRetry(u, req, code)
+		return
+	}
 	s.respond(u, req, code)
+}
+
+// unsupported are the option tags of req's Require that are not among
+// supported, the ones rcs-as supports for its method: none for a MESSAGE,
+// timer for a session (RFC 4028).
+func unsupported(req *sip.Request, supported ...string) []string {
+	tags, err := req.Header.Require()
+	if err != nil {
+		// Unreadable: what it requires is not known to be supported.
+		return []string{"(malformed)"}
+	}
+	var out []string
+	for _, t := range tags {
+		if !slices.ContainsFunc(supported, func(x string) bool { return strings.EqualFold(x, t) }) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// refuseUnsupported answers 420 with the option tags rcs-as lacks.
+func (s *Server) refuseUnsupported(u *proxy.UAS, req *sip.Request, bad []string) {
+	s.respondWith(u, req, 420, [2]string{"Unsupported", strings.Join(bad, ", ")})
 }
 
 // origin reads the engine's Origin from req, or the status that refuses it.
 func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
-	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, cpim.ContentType) {
-		return messaging.Origin{}, 415
-	}
-	sender, identities, code := asserted(req)
+	sender, identities, code := s.asserted(req)
 	if code != 0 {
 		return messaging.Origin{}, code
 	}
-	recipient, ok := UserOf(req.URI.String())
+	recipient, ok := messaging.UserOf(req.URI.String(), s.cfg.HomeDomain)
 	if !ok {
 		return messaging.Origin{}, 404
 	}
@@ -225,19 +300,59 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 	}, 0
 }
 
-// submit hands o to the engine and returns the status that answers it.
-func (s *Server) submit(ctx context.Context, o messaging.Origin) int {
+// asserted reads the sender the network asserted (RFC 3325 §9.1), never a
+// header the client wrote, or the status that refuses the request: 403. It
+// takes what pcscf asserts, one identity or the SIP and tel pair of one
+// user (#208), and nothing more: at most two, at most one of each scheme,
+// all one user (messaging.UserOf). That user is the sender, and each
+// identity as asserted is one the sender may name itself by, as is any
+// other form of it (the engine compares them with UserOf).
+func (s *Server) asserted(req *sip.Request) (string, []string, int) {
+	pai, err := req.Header.PAssertedIdentity()
+	if err != nil || len(pai) == 0 || len(pai) > 2 {
+		return s.refuseAsserted()
+	}
+	var sender string
+	var identities []string
+	schemes := map[string]bool{}
+	for _, a := range pai {
+		raw := a.URI.String()
+		user, ok := messaging.UserOf(raw, s.cfg.HomeDomain)
+		scheme := a.URI.Scheme
+		if scheme == "sips" {
+			scheme = "sip"
+		}
+		if !ok || schemes[scheme] || sender != "" && user != sender {
+			return s.refuseAsserted()
+		}
+		schemes[scheme], sender = true, user
+		identities = append(identities, raw)
+	}
+	return sender, identities, 0
+}
+
+func (s *Server) refuseAsserted() (string, []string, int) {
+	s.cfg.Metrics.Count("sip.asserted.refused", 1)
+	return "", nil, 403
+}
+
+// submit hands o to the engine and returns the status that answers it,
+// and whether it is the store being busy, which says when to try again.
+// That answer is 500, not 503: scscf, a proxy, would turn a 503 from rcs-as
+// into a 500 of its own and drop its Retry-After (RFC 3261 §16.7 step 6),
+// and it passes a 500 on as it is, Retry-After included (§20.33).
+func (s *Server) submit(ctx context.Context, o messaging.Origin) (int, bool) {
 	err := s.engine.Submit(ctx, o)
 	var r *messaging.Rejection
 	switch {
 	case err == nil:
-		return 202
+		return 202, false
 	case errors.As(err, &r):
-		return refusalStatus(r.Reason)
+		return refusalStatus(r.Reason), false
 	case errors.Is(err, store.ErrBusy):
-		return 503
+		return 500, true
 	default:
-		return 500
+		return 500, false
 	}
 }
 
@@ -256,11 +371,27 @@ func refusalStatus(r messaging.Reason) int {
 	return 403
 }
 
-// respond answers req with code. A 503 says when to try again; a 415 what
-// to send (RFC 3261 §21.4.13); a 405 what is allowed; a 420 what is not
-// supported (§21.4.15); a 422 the shortest session interval taken (RFC
-// 4028 §6).
+// respond answers req with code. A 405 says what is allowed (RFC 3261
+// §21.4.6), a 422 the shortest session interval rcs-as takes (RFC 4028
+// §6).
 func (s *Server) respond(u *proxy.UAS, req *sip.Request, code int) {
+	switch code {
+	case 405:
+		s.respondWith(u, req, code, [2]string{"Allow", allowed})
+	case 422:
+		s.respondWith(u, req, code, [2]string{"Min-SE", strconv.Itoa(minSessionExpires)})
+	default:
+		s.respondWith(u, req, code)
+	}
+}
+
+// respondRetry answers req with code and says when to try again: the
+// conflicting store write is over within a moment.
+func (s *Server) respondRetry(u *proxy.UAS, req *sip.Request, code int) {
+	s.respondWith(u, req, code, [2]string{"Retry-After", busyRetryAfter})
+}
+
+func (s *Server) respondWith(u *proxy.UAS, req *sip.Request, code int, fields ...[2]string) {
 	tag, err := s.ids.Tag()
 	if err != nil {
 		return // the proxy answers 500
@@ -269,24 +400,10 @@ func (s *Server) respond(u *proxy.UAS, req *sip.Request, code int) {
 	if err != nil {
 		return
 	}
-	switch code {
-	case 503:
-		err = res.Header.Set("Retry-After", busyRetryAfter)
-	case 415:
-		accept := cpim.ContentType
-		if req.Method == "INVITE" || req.Method == "UPDATE" {
-			accept = sdpType
+	for _, f := range fields {
+		if err := res.Header.Set(f[0], f[1]); err != nil {
+			return
 		}
-		err = res.Header.Set("Accept", accept)
-	case 405:
-		err = res.Header.Set("Allow", allowed)
-	case 420:
-		err = res.Header.Set("Unsupported", strings.Join(unsupported(req), ", "))
-	case 422:
-		err = res.Header.Set("Min-SE", strconv.Itoa(minSessionExpires))
-	}
-	if err != nil {
-		return
 	}
 	if err := u.Respond(res); err != nil {
 		s.cfg.Metrics.Count("sip.respond_failed", 1)

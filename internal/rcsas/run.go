@@ -84,25 +84,27 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if err != nil {
 		return fmt.Errorf("rcs-as: SIP listener: %w", err)
 	}
+	// The Contact of rcs-as's sessions is this task's address, where the
+	// requests in their dialogs come back to it (ADR 0005).
 	self, err := sip.ParseURI("sip:" + hostPort(cfg.SIPHost, addr.Port()) + ";transport=tcp")
 	if err != nil {
 		return err
 	}
 	srv, err := sipas.New(sipas.Config{
-		Core: cfg.Core, Host: cfg.SIPHost.String(), Contact: self, Listener: sipListener, Resolver: resolver,
-		MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions, MaxSessionsPerUser: cfg.MaxSessionsPerUser,
-		Metrics: rt.Metrics, Logger: rt.Logger,
+		Core: cfg.Core, Host: cfg.SIPHost.String(), HomeDomain: cfg.HomeDomain, Contact: self, Listener: sipListener,
+		Resolver: resolver, MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions,
+		MaxSessionsPerUser: cfg.MaxSessionsPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
 	})
 	if err != nil {
 		return err
 	}
-	px, err := proxy.New(tr, proxy.Config{Self: []sip.URI{self}, Router: srv, Resolver: resolver, Logger: rt.Logger})
+	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger})
 	if err != nil {
 		return err
 	}
 	defer px.Close()
 	mc := cfg.Messaging
-	mc.Logger = rt.Logger
+	mc.Logger, mc.HomeDomain = rt.Logger, cfg.HomeDomain
 	engine, err := messaging.New(mc, st, srv, rt.Metrics)
 	if err != nil {
 		return err
@@ -149,6 +151,33 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		served <- err // for the deferred wait
 		return fmt.Errorf("rcs-as: MSRP listener: %w", err)
 	}
+}
+
+// selfURIs are the URIs by which a Route names this task: its instance
+// address, and its service name in the namespace, which is the AS URI the
+// default profile's iFC give scscf (hss RCS_AS_URI), on the listener's port
+// and on 5060, the default a URI without a port means. The proxy compares
+// them as written, never through DNS, as pcscf does.
+func selfURIs(cfg Config, port uint16) []sip.URI {
+	host := cfg.SIPHost.String()
+	if cfg.SIPHost.Is6() {
+		host = "[" + host + "]"
+	}
+	hosts := []string{host}
+	if cfg.Namespace != "" {
+		hosts = append(hosts, "rcs-as."+cfg.Namespace)
+	}
+	ports := []int{int(port)}
+	if port != 5060 {
+		ports = append(ports, 5060)
+	}
+	var out []sip.URI
+	for _, h := range hosts {
+		for _, p := range ports {
+			out = append(out, sip.URI{Scheme: "sip", Host: h, Port: p})
+		}
+	}
+	return out
 }
 
 func hostPort(a netip.Addr, port uint16) string {

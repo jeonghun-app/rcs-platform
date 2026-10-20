@@ -344,25 +344,6 @@ func sessionInterval(req *sip.Request) (time.Duration, int) {
 	return time.Duration(se.Delta) * time.Second, 0
 }
 
-// supportedTags are the option tags rcs-as supports in a Require.
-var supportedTags = []string{"timer"}
-
-// unsupported are the option tags of req's Require that rcs-as does not
-// support, which a UAS refuses with 420 (RFC 3261 §8.2.2.3).
-func unsupported(req *sip.Request) []string {
-	tags, err := req.Header.Require()
-	if err != nil {
-		return []string{"(malformed)"}
-	}
-	var out []string
-	for _, t := range tags {
-		if !containsFold(supportedTags, t) {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
 func containsFold(list []string, v string) bool {
 	return slices.ContainsFunc(list, func(x string) bool { return strings.EqualFold(x, v) })
 }
@@ -545,8 +526,8 @@ func directionRefusedBy(req *sip.Request) bool {
 // from rcs-as in the 2xx (RFC 3261 §14.2), and is refused too; an UPDATE
 // without one is a plain refresh (RFC 3311 §5.2).
 func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
-	if len(unsupported(req)) > 0 {
-		s.respond(u, req, 420)
+	if bad := unsupported(req, "timer"); len(bad) > 0 {
+		s.refuseUnsupported(u, req, bad)
 		return
 	}
 	var body []byte

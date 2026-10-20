@@ -129,7 +129,7 @@ func (s *Server) pagerRequest(d messaging.Delivery, next sip.URI) (*sip.Request,
 	if err != nil {
 		return nil, fmt.Errorf("sipas: sender: %w", messaging.ErrUndeliverable)
 	}
-	tag, err := s.ids.Tag()
+	tag, err := s.ownTag()
 	if err != nil {
 		return nil, err
 	}

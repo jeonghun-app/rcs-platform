@@ -73,3 +73,75 @@ func TestMemoryForgetsExpiredChallengesNobodyTook(t *testing.T) {
 		t.Errorf("%d challenges held after the purge, want 1", n)
 	}
 }
+
+func TestAProfileOrIdentityIsKeptAgainOnceTheNewExpiryPassesItsMargin(t *testing.T) {
+	p := &state.Profile{KeepUntil: statetest.T0.Add(state.ProfileGrace)}
+	for _, tc := range []struct {
+		lastExpiry time.Time
+		want       bool
+	}{
+		{statetest.T0, false},
+		{statetest.T0.Add(state.ProfileKeepMargin), false},
+		{statetest.T0.Add(state.ProfileKeepMargin + time.Second), true},
+		// A registration longer than ProfileGrace is due whatever the time
+		// left on KeepUntil.
+		{statetest.T0.Add(48 * time.Hour), true},
+	} {
+		if got := p.KeepDue(tc.lastExpiry); got != tc.want {
+			t.Errorf("KeepDue(KeepUntil - %v) = %v, want %v", p.KeepUntil.Sub(tc.lastExpiry), got, tc.want)
+		}
+		if got := (&state.Identity{KeepUntil: p.KeepUntil}).KeepDue(tc.lastExpiry); got != tc.want {
+			t.Errorf("identity KeepDue(KeepUntil - %v) = %v, want %v", p.KeepUntil.Sub(tc.lastExpiry), got, tc.want)
+		}
+	}
+}
+
+// TestAProfileIsFoundWhileItsSetIsRegisteredWhateverTheExpiry follows the
+// rule a registrar applies (KeepUntil = last binding expiry + ProfileGrace
+// at SAR, then KeepProfile on a re-registration when KeepDue) with a UE that
+// refreshes 600 s before expiry (TS 24.229 §5.1.1.4.1), and checks the
+// profile every hour of 30 days. From QA's review of #184: with the time
+// left as the measure, registrations over a day lost their profile for
+// hours.
+func TestAProfileIsFoundWhileItsSetIsRegisteredWhateverTheExpiry(t *testing.T) {
+	for _, x := range []time.Duration{time.Hour, 2 * time.Hour, 13 * time.Hour, 24 * time.Hour, 25 * time.Hour, 36 * time.Hour, 48 * time.Hour, 600000 * time.Second} {
+		t.Run(x.String(), func(t *testing.T) {
+			ctx := context.Background()
+			m := state.NewMemory()
+			now := statetest.T0
+			expiry := now.Add(x)
+			p := statetest.Profile(statetest.Set1, []byte("<IMSSubscription/>"), now)
+			p.KeepUntil = expiry.Add(state.ProfileGrace)
+			if err := m.SaveProfile(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			end := statetest.T0.Add(30 * 24 * time.Hour)
+			keeps := 0
+			for now.Before(end) {
+				refresh := expiry.Add(-600 * time.Second)
+				for c := now; c.Before(expiry); c = c.Add(time.Hour) {
+					if _, err := m.Profile(ctx, statetest.Set1, c); err != nil {
+						t.Fatalf("not found at %v while registered until %v: %v", c.Sub(statetest.T0), expiry.Sub(statetest.T0), err)
+					}
+				}
+				now = refresh
+				cur, err := m.Profile(ctx, statetest.Set1, now)
+				if err != nil {
+					t.Fatalf("gone at the re-registration at %v: %v", now.Sub(statetest.T0), err)
+				}
+				expiry = now.Add(x)
+				if cur.KeepDue(expiry) {
+					keeps++
+					if err := m.KeepProfile(ctx, statetest.Set1, expiry.Add(state.ProfileGrace), now); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// The point of KeepDue: hourly registrations write the profile
+			// about twice a day, not at every re-registration.
+			if days := 30; keeps > 3*days {
+				t.Errorf("%d writes of KeepUntil in %d days", keeps, days)
+			}
+		})
+	}
+}

@@ -23,6 +23,12 @@ type fakeDynamo struct {
 	t      *testing.T
 	mu     sync.Mutex
 	tables map[string]map[string]map[string]types.AttributeValue
+	// afterUpdate, if set, runs after every UpdateItem, outside the lock, as
+	// another instance's write between that request and the next would.
+	afterUpdate func()
+	// afterGet, if set, runs after every GetItem, outside the lock, as
+	// another instance's write between a read and the write it decides would.
+	afterGet func()
 	// resendNext applies the next write twice, as the SDK does when the
 	// response to the first attempt is lost, and answers with the second
 	// attempt's outcome.
@@ -72,10 +78,21 @@ func (f *fakeDynamo) holds(expr *string, names map[string]string, values map[str
 		return true
 	case "attribute_not_exists(#pk)":
 		return cur == nil
+	case "attribute_not_exists(#pk) OR #ttl <= :now":
+		return cur == nil || number(cur[names["#ttl"]]) <= number(values[":now"])
+	case "attribute_not_exists(#pk) OR #rcv = :rcv":
+		return cur == nil || number(cur[names["#rcv"]]) == number(values[":rcv"])
+	case "attribute_not_exists(#pk) OR (#rcv <= :rcv AND #ttl <= :ttl)":
+		return cur == nil || number(cur[names["#rcv"]]) <= number(values[":rcv"]) && number(cur[names["#ttl"]]) <= number(values[":ttl"])
 	case "attribute_not_exists(#pk) OR #rcv <= :rcv":
 		return cur == nil || number(cur[names["#rcv"]]) <= number(values[":rcv"])
 	case "#v = :v":
 		return cur != nil && sv(cur[names["#v"]]) == sv(values[":v"])
+	case "#v = :v AND (attribute_not_exists(#leased) OR #leased <> :inc)":
+		leased, ok := cur[names["#leased"]]
+		return cur != nil && sv(cur[names["#v"]]) == sv(values[":v"]) && (!ok || number(leased) != number(values[":inc"]))
+	case "attribute_exists(#pk) AND #ttl > :now AND #ttl < :until":
+		return cur != nil && number(cur[names["#ttl"]]) > number(values[":now"]) && number(cur[names["#ttl"]]) < number(values[":until"])
 	case "attribute_exists(#pk) AND #exp > :now":
 		return cur != nil && number(cur[names["#exp"]]) > number(values[":now"])
 	case "attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max":
@@ -133,6 +150,10 @@ func (f *fakeDynamo) write(op func() error) error {
 }
 
 func (f *fakeDynamo) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if f.afterGet != nil {
+		// Deferred first, so it runs after the unlock.
+		defer f.afterGet()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {
@@ -195,26 +216,49 @@ func (f *fakeDynamo) DeleteItem(_ context.Context, in *dynamodb.DeleteItemInput,
 }
 
 func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
-	if aws.ToString(in.UpdateExpression) != "SET #tok = :tok, #v = #v + :one ADD #cseq :one, #rver :one" {
+	n, v := in.ExpressionAttributeNames, in.ExpressionAttributeValues
+	var update func(cur map[string]types.AttributeValue) map[string]types.AttributeValue
+	switch aws.ToString(in.UpdateExpression) {
+	case "SET #tok = :tok, #v = #v + :one ADD #cseq :one, #rver :one":
+		if in.ReturnValues != types.ReturnValueAllNew {
+			f.t.Fatal("fakeDynamo: NextNotify must ask for the new values")
+		}
+		update = func(cur map[string]types.AttributeValue) map[string]types.AttributeValue {
+			next := maps.Clone(cur)
+			next[n["#tok"]] = v[":tok"]
+			for _, a := range []string{"#v", "#cseq", "#rver"} {
+				next[n[a]] = num(number(cur[n[a]]) + 1)
+			}
+			return next
+		}
+	case "SET #ttl = :until", "SET #ttl = :until, #v = #v + :one":
+		bump := aws.ToString(in.UpdateExpression) != "SET #ttl = :until"
+		update = func(cur map[string]types.AttributeValue) map[string]types.AttributeValue {
+			next := maps.Clone(cur)
+			next[n["#ttl"]] = v[":until"]
+			if bump {
+				next[n["#v"]] = num(number(cur[n["#v"]]) + number(v[":one"]))
+			}
+			return next
+		}
+	default:
 		f.t.Fatalf("fakeDynamo: unknown update %q", aws.ToString(in.UpdateExpression))
 	}
 	if err := checkKey(in.Key); err != nil {
 		return nil, err
+	}
+	if f.afterUpdate != nil {
+		defer f.afterUpdate()
 	}
 	var updated map[string]types.AttributeValue
 	err := f.write(func() error {
 		tbl := f.table(in.TableName)
 		k := itemKey(in.Key)
 		cur := tbl[k]
-		if !f.holds(in.ConditionExpression, in.ExpressionAttributeNames, in.ExpressionAttributeValues, cur) {
+		if !f.holds(in.ConditionExpression, n, v, cur) {
 			return conditionFailed()
 		}
-		n := in.ExpressionAttributeNames
-		next := maps.Clone(cur)
-		next[n["#tok"]] = in.ExpressionAttributeValues[":tok"]
-		for _, a := range []string{"#v", "#cseq", "#rver"} {
-			next[n[a]] = num(number(cur[n[a]]) + 1)
-		}
+		next := update(cur)
 		tbl[k] = next
 		updated = maps.Clone(next)
 		return nil
@@ -223,7 +267,7 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 		return nil, err
 	}
 	if in.ReturnValues != types.ReturnValueAllNew {
-		f.t.Fatal("fakeDynamo: NextNotify must ask for the new values")
+		return &dynamodb.UpdateItemOutput{}, nil
 	}
 	return &dynamodb.UpdateItemOutput{Attributes: updated}, nil
 }

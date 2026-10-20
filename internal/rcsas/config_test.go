@@ -15,6 +15,7 @@ import (
 
 var devEnv = map[string]string{
 	"RCS_ENV":               "dev",
+	"RCS_IMS_DOMAIN":        "ims.mnc001.mcc001.3gppnetwork.org",
 	"RCSAS_MSRP_HOST":       "10.0.0.7",
 	"RCSAS_STORE":           "memory",
 	"RCSAS_CONFERENCE_HOST": "conf.ims.example.net",
@@ -202,8 +203,9 @@ func TestTheSIPSettingsAreRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.SIPListenAddr != "0.0.0.0:5060" || c.SIPHost != netip.MustParseAddr("10.0.0.7") || c.Core.String() != "sip:10.0.1.5:5060;transport=tcp;lr" {
-		t.Fatalf("defaults %q %v %v", c.SIPListenAddr, c.SIPHost, c.Core)
+	if c.SIPListenAddr != "0.0.0.0:5060" || c.SIPHost != netip.MustParseAddr("10.0.0.7") || c.Core.String() != "sip:10.0.1.5:5060;transport=tcp;lr" ||
+		c.HomeDomain != "ims.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("defaults %q %v %v %q", c.SIPListenAddr, c.SIPHost, c.Core, c.HomeDomain)
 	}
 	// In the namespace, the core is scscf's Cloud Map name by default.
 	c, err = configure(with(devEnv, "RCSAS_CORE_URI", "", "RCS_SERVICE_NAMESPACE", "rcs.internal", "RCSAS_SIP_LISTEN_ADDR", ":15060"))
@@ -234,6 +236,8 @@ func TestTheSIPSettingsAreRead(t *testing.T) {
 		"core outside":       {with(devEnv, "RCSAS_CORE_URI", "sip:scscf.example.org;transport=tcp;lr", "RCS_SERVICE_NAMESPACE", "rcs.internal"), "outside RCS_SERVICE_NAMESPACE"},
 		"bad sip listen":     {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "5060"), "RCSAS_SIP_LISTEN_ADDR"},
 		"sip listen port":    {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", ":sip"), "RCSAS_SIP_LISTEN_ADDR"},
+		"sip listen port 0":  {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "127.0.0.1:0"), "RCSAS_SIP_LISTEN_ADDR"},
+		"no home domain":     {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
 		"sip host not an IP": {with(devEnv, "RCSAS_SIP_HOST", "rcs-as.internal"), "RCSAS_SIP_HOST"},
 	} {
 		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {

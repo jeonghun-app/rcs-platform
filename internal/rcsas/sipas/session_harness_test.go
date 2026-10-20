@@ -68,7 +68,7 @@ func newChatRigWith(t *testing.T, mc messaging.Config, cfg Config, tune ...func(
 		t.Fatal(err)
 	}
 	r := &chatRig{core: newFakeCore(t), clock: newFakeClock(), msrp: l}
-	mc.MSRPHost, mc.MSRPPort = "127.0.0.1", l.Addr().(*net.TCPAddr).Port
+	mc.MSRPHost, mc.MSRPPort, mc.HomeDomain = "127.0.0.1", l.Addr().(*net.TCPAddr).Port, domain
 	mc.SenderRate = messaging.Rate{PerMinute: -1}
 	mc.Logger = slog.New(slog.DiscardHandler)
 	var a *as

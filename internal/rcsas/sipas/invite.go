@@ -283,7 +283,9 @@ func (s *Server) inviteRequest(ss *session) (*sip.Request, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sipas: peer: %w", messaging.ErrUndeliverable)
 	}
-	tag, err := s.ids.Tag()
+	// Marked as rcs-as's own, as a pager MESSAGE is, so that one that
+	// comes back is refused (looped).
+	tag, err := s.ownTag()
 	if err != nil {
 		return nil, err
 	}

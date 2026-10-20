@@ -15,7 +15,8 @@ import (
 )
 
 // Resolver finds the next hop of a SIP URI inside the platform: a host that
-// is an address goes as proxy.NumericResolver says, and a name is looked up
+// is a private or loopback address goes as proxy.NumericResolver says, any
+// other address is refused, and a name is looked up
 // only inside Namespace (the Cloud Map namespace, ADR 0007 §5), its private
 // addresses only, one of them at random, so that requests spread over the
 // tasks behind it. It looks the name up at every call; the core has a
@@ -29,7 +30,14 @@ type Resolver struct {
 // Resolve implements proxy.Resolver.
 func (r Resolver) Resolve(ctx context.Context, u sip.URI) (transport.Destination, error) {
 	host := strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]")
-	if _, err := netip.ParseAddr(host); err == nil {
+	if a, err := netip.ParseAddr(host); err == nil {
+		// An address is used as it is if it is inside the platform too: a
+		// Route that names another, should one ever survive the core, does
+		// not take rcs-as out of the VPC (ADR 0007 §5). Loopback stays on
+		// the task, as in a local stack.
+		if a = a.Unmap(); !runtime.IsPrivateAddr(a) && !a.IsLoopback() {
+			return transport.Destination{}, fmt.Errorf("%w: not a private address", proxy.ErrUnresolvable)
+		}
 		return proxy.NumericResolver{}.Resolve(ctx, u)
 	}
 	if !u.IsSIP() || !runtime.InServiceNamespace(host, r.Namespace) {

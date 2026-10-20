@@ -7,9 +7,10 @@
 //
 //   - A pager-mode MESSAGE (RFC 3428) is the engine's Submit with
 //     Origin.Pager set, answered 202 Accepted once stored (RFC 3428 §7).
-//     The sender is the first P-Asserted-Identity the core inserted, never a
-//     header the client wrote; the core SIP port admits only platform
-//     services (ADR 0007 §2, §7).
+//     The sender is the user the core asserted in P-Asserted-Identity, one
+//     identity or one user's SIP and tel pair, never a header the client
+//     wrote; the core SIP port admits only platform services (ADR 0007 §2,
+//     §7).
 //   - OPTIONS, which the default profile hands to rcs-as with
 //     SESSION_CONTINUED, goes on along its Route, so capability discovery
 //     does not stop at rcs-as.
@@ -33,8 +34,8 @@
 // an actpass offer of a leg from Engine.Offer, and gives the leg the path of
 // the 2xx's answer.
 //
-// Users are named in one form throughout (UserOf): the engine keys queues,
-// shares and sent-message records by that string.
+// Users are named in one form throughout (messaging.UserOf): the engine
+// keys queues, shares and sent-message records by that string.
 //
 // Logs and metrics carry no identity, URI or message content.
 package sipas

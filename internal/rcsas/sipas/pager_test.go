@@ -153,3 +153,42 @@ func TestSessionsAreNotServedYet(t *testing.T) {
 		t.Fatalf("Invite = %v", err)
 	}
 }
+
+// The security review's case on #242: a profile without the default one's
+// P-Served-User exclusion sends rcs-as's own delivery back to it. rcs-as
+// knows it by its From tag and refuses it with 482, instead of taking it
+// for a new message and sending it again without end.
+func TestADeliveryThatComesBackIsRefusedAsALoop(t *testing.T) {
+	core := newFakeCore(t)
+	e := &fakeEngine{}
+	a := startAS(t, e, core)
+	p := a.dial(t)
+	bounced := make(chan int, 1)
+	core.setAnswer(func(req *sip.Request) int {
+		// What scscf would send on: rcs-as's AS URI and its own entry as
+		// the Route, its Via on top.
+		fwd := req.Clone()
+		_ = fwd.Header.Set("Route", "<sip:"+a.addr.String()+";transport=tcp;lr>, <"+core.uri().String()+">")
+		_ = fwd.Header.Prepend("Via", "SIP/2.0/TCP 192.0.2.30:5060;branch=z9hG4bK-scscf-loop")
+		code := 0
+		if res, err := p.forward(fwd); err == nil {
+			code = res.StatusCode
+		}
+		bounced <- code
+		return 482 // scscf passes rcs-as's answer back to it
+	})
+	err := a.srv.Pager(t.Context(), delivery())
+	if code := <-bounced; code != 482 {
+		t.Fatalf("the returning MESSAGE was answered %d", code)
+	}
+	if err == nil {
+		t.Fatal("the looped delivery counts as delivered")
+	}
+	if got := e.origins(); len(got) != 0 {
+		t.Fatalf("rcs-as took its own delivery as %d new messages", len(got))
+	}
+	// A client's own MESSAGE goes through as before.
+	if res := p.send(pager(cpimBody("m2", "hi"))); res.StatusCode != 202 {
+		t.Fatalf("a client's MESSAGE answered %d", res.StatusCode)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
@@ -29,7 +30,7 @@ func (s *Server) register(_ context.Context, u *proxy.UAS) {
 		s.respond(u, req, 400)
 		return
 	}
-	user, ok := UserOf(to.URI.String())
+	user, ok := messaging.UserOf(to.URI.String(), s.cfg.HomeDomain)
 	if !ok {
 		s.respond(u, req, 400)
 		return

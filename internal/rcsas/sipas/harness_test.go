@@ -185,7 +185,7 @@ func startASWith(t *testing.T, e Engine, cfg Config, tune ...func(*proxy.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.Host, cfg.Listener, cfg.Contact = "127.0.0.1", "core", self
+	cfg.Host, cfg.Listener, cfg.Contact, cfg.HomeDomain = "127.0.0.1", "core", self, domain
 	srv, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -307,6 +307,28 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 			return nil, errors.New("got a request")
 		}
 		if res.StatusCode >= 200 {
+			return res, nil
+		}
+	}
+}
+
+// forward sends req as the core would, after its own processing, and
+// returns its final response.
+func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
+	b, err := req.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := p.nc.Write(b); err != nil {
+		return nil, err
+	}
+	for {
+		msg, err := p.r.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 {
 			return res, nil
 		}
 	}

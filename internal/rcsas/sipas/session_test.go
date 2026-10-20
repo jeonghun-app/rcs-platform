@@ -131,15 +131,16 @@ func TestOffersRCSASCannotTakeAre488(t *testing.T) {
 }
 
 // Sessions are bounded per task and per user (threat model T9): past the
-// task's bound another task may take the INVITE (503), past the user's it
-// is refused (403), and a session rcs-as would start waits.
+// task's bound the client may try again (500 with Retry-After, which scscf
+// passes on), past the user's it is refused (403), and a session rcs-as
+// would start waits.
 func TestSessionsAreBounded(t *testing.T) {
 	for name, c := range map[string]struct {
 		cfg    Config
 		code   int
 		header [2]string
 	}{
-		"per task": {cfg: Config{MaxSessions: 1}, code: 503, header: [2]string{"Retry-After", "1"}},
+		"per task": {cfg: Config{MaxSessions: 1}, code: 500, header: [2]string{"Retry-After", "1"}},
 		"per user": {cfg: Config{MaxSessionsPerUser: 1}, code: 403},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -500,7 +501,7 @@ func TestCloseEndsTheSessions(t *testing.T) {
 	if bye := r.core.nextOf(t, "BYE"); bye.Header.Get("Call-ID") != s.callID {
 		t.Fatalf("BYE for %q", bye.Header.Get("Call-ID"))
 	}
-	if res := p.send(r.chatInvite(offerSDP(relayPath(), "active"))); res.StatusCode != 503 {
+	if res := p.send(r.chatInvite(offerSDP(relayPath(), "active"))); res.StatusCode != 500 {
 		t.Fatalf("an INVITE after Close answered %d", res.StatusCode)
 	}
 }
