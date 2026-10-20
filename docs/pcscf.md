@@ -7,10 +7,10 @@ over `internal/sip/transport`; the service is `internal/pcscf`, and
 `cmd/pcscf` only wires it to `internal/runtime`.
 
 `pcscf` is built in steps (#16). This page describes what is in place: the
-listeners, the edge rules and the shutdown. Registration, originating and
-terminating routing, and the reg event follow. Until registration lands,
-`pcscf` serves no one: a client's request is answered 403 and a request from
-the core 430 Flow Failed, since no flow is registered.
+listeners, the edge rules, registration and the shutdown. Originating and
+terminating routing and the reg event follow. Until they land, a client's
+request other than REGISTER is answered 403 and a request from the core 430
+Flow Failed.
 
 ## Listeners
 
@@ -52,20 +52,123 @@ the core 430 Flow Failed, since no flow is registered.
   `P-Asserted-Identity`, `P-Served-User`, `P-Asserted-Service`,
   `P-Charging-Vector`, `P-Charging-Function-Addresses`,
   `P-Visited-Network-ID`, `P-Associated-URI`, `P-Called-Party-ID`,
-  `P-Media-Authorization`, `Feature-Caps`, `P-Private-Network-Indication` and
-  `P-Profile-Key`. It also loses every `P-Access-Network-Info` value with the
-  `network-provided` parameter.
+  `P-Media-Authorization`, `Feature-Caps`, `P-Private-Network-Indication`,
+  `P-Profile-Key` and `Path`, which a registrar would keep. It also loses
+  every `P-Access-Network-Info` value with the `network-provided` parameter.
 - **Flows per client.** One client holds at most `PCSCF_MAX_FLOWS_PER_IP`
   client flows. A client is the address in the PROXY header behind the NLB:
   an IPv4 address, or the /64 of an IPv6 one. A flow beyond that is refused
   when it is accepted. The default is high because mobile clients share
   public addresses behind carrier-grade NAT. Core flows are not counted.
-- **Flows in all.** Client flows take at most `PCSCF_MAX_CLIENT_FLOWS` of the
-  transport's `PCSCF_MAX_CONNECTIONS`. At least `PCSCF_CORE_CONNECTIONS` of
-  the rest stay for the core listener, so clients cannot keep `scscf` out.
-  A connection counts once its PROXY header is read, so its TLS handshake
-  is counted; connections still sending the PROXY header are not yet, and
-  per-listener limits for them are #193.
+- **Flows in all.** The client listener holds at most
+  `PCSCF_MAX_CLIENT_FLOWS` connections of the transport's
+  `PCSCF_MAX_CONNECTIONS`, and the core listener `PCSCF_CORE_CONNECTIONS`;
+  together they must fit under the total, so clients at their limit cannot
+  keep `scscf` out (#193). A connection counts from accept, while it is
+  still sending its PROXY header (at most 2 s) or in its TLS handshake, and
+  as a flow after. `pcscf` opens no stream listener without a limit.
+- **Listener metrics.** Every sweep (30 s) exports what the transport
+  counts, the counts as the change since the last sweep:
+
+  | Metric | Kind | What it counts |
+  |---|---|---|
+  | `transport.listener_connections.client`, `.core` | gauge | connections each listener holds, to see one near its limit before it refuses |
+  | `transport.client_listener_rejected` | count | connections refused at `PCSCF_MAX_CLIENT_FLOWS` |
+  | `transport.core_listener_rejected` | count | connections refused at `PCSCF_CORE_CONNECTIONS`: `scscf` kept out, to alarm on |
+  | `transport.rejected` | count | connections refused at `PCSCF_MAX_CONNECTIONS` |
+  | `transport.proxy_header_timeouts` | count | PROXY headers that did not arrive within 2 s |
+  | `transport.proxy_header_errors` | count | PROXY headers begun and then malformed or cut: a peer that is not the NLB, or an NLB not sending them |
+  | `transport.proxy_header_empty` | count | connections closed or reset before any byte: clients or scanners that gave up, never the NLB, whose health checks send a LOCAL header (ADR 0003) |
+
+## Registration
+
+A client's REGISTER goes to `icscf` (`PCSCF_ICSCF_URI`, by default
+`sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr`), out of the core
+listener (TS 24.229 §5.2.2.1):
+
+- **Route.** `icscf` is the only Route. `pcscf` chooses the I-CSCF, so a
+  Route the client wrote below `pcscf`'s own is dropped.
+- **Path.** `pcscf` adds `Path: <sip:<flow token>@<task address>:<core
+  port>;transport=tcp;lr>`, with `ob` when the client uses outbound (RFC 5626
+  §5.1), and `Require: path`. The flow token is the transport's flow ID,
+  an HMAC under a key drawn at every start
+  ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)). A `Path`
+  the client wrote is gone already, with the other network-only headers.
+- **Network headers.** `pcscf` adds `P-Visited-Network-ID`
+  (`PCSCF_VISITED_NETWORK_ID`, the home domain by default), from which
+  `icscf` takes the Visited-Network-Identifier of its UAR, and
+  `P-Charging-Vector` with a new `icid-value` for each REGISTER and
+  `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.2.1 3)).
+- **Credentials.** `pcscf` owns the `integrity-protected` parameter of
+  `Authorization` (§5.2.2.1). It sets none, so `scscf` always challenges,
+  and removes whatever value a client wrote. A REGISTER whose
+  `Authorization` cannot be parsed is answered 400.
+- **Failover.** `pcscf` tries `icscf`'s addresses in a random order. An
+  address it cannot connect to, that does not answer in time, or that
+  answers 3xx, 480 or 503 gives way to the next, up to three (§5.2.2.1 7)).
+  The first attempt may take 12 s, longer than the core's own retry of an
+  HSS (two attempts of 5 s), so a slow but working core is not taken for a
+  dead one; the next ones share what is left of 30 s, which is usually one
+  more. The client gets 504 when all of them have failed, or when the lookup
+  failed, before its own 32 s timeout. A 200 that arrives after its attempt
+  was cut short is dropped, and the client's next REGISTER recovers.
+- **The 200.** `pcscf` keeps the following in instance memory, for each
+  public identity registered over each flow:
+  - the client's contacts on that flow that the 200 lists;
+  - the expiry, the shortest of those contacts' expiries;
+  - `Service-Route` (RFC 3608);
+  - `P-Associated-URI`, whose first URI is the default public identity
+    (RFC 7315).
+
+  A 200 that lists none of those contacts, after a removal, forgets the
+  registration. So does the flow closing (RFC 5626 §5.3), even when it
+  closes before the 200 arrives. A REGISTER without `Contact` only fetches
+  the bindings and changes nothing.
+- **Keep-alive** ([ADR 0003](adr/0003-aws-topology.md)):
+
+  | The client | It gets | Flow idle timeout |
+  |---|---|---|
+  | uses outbound: `Supported: outbound` or `Require: outbound`, and `+sip.instance` and `reg-id` on every contact, and the registrar's 200 has `Require: outbound` (RFC 5626 §5.4) | `Flow-Timer: 120` in the 200 | 180 s with TLS to the NLB, 1740 s with `tcp` |
+  | asks with the Via `keep` parameter (RFC 6223) | `keep=120` in its Via of the 200 | the same |
+  | does neither | its expiries capped to 600 s, in the REGISTER and in the 200 | `PCSCF_CLIENT_IDLE_TIMEOUT` (340 s) |
+- **Limits.** A client address may send `PCSCF_REGISTER_RATE` REGISTERs a
+  second, with a burst of `PCSCF_REGISTER_BURST`. A task keeps at most
+  `PCSCF_MAX_REGISTRATIONS` registrations. A REGISTER takes its slot before
+  it is forwarded and gives it back if it ends unregistered, so a new one
+  past the limit is refused at once rather than after a 200 `pcscf` could not
+  keep. One flow may have REGISTERs under way for at most eight
+  identities, and one client address (or IPv6 /64) for at most
+  `PCSCF_MAX_PENDING_REGISTERS_PER_IP` over all its flows, so a client
+  cannot hold slots by writing new To values while the core is slow. The
+  address bound is higher because carrier-grade NAT puts many phones behind
+  one address. Every REGISTER the core will see costs it
+  a UAR and an authentication vector, so once it has parsed the task as a
+  whole takes at most `PCSCF_MAX_REGISTER_RATE` a second, with a burst of
+  `PCSCF_MAX_REGISTER_BURST`, and counts the ones it refuses in
+  `register.refused_task_rate`. New registrations may use three quarters of
+  that; the rest is kept for refreshes of registrations the flow holds, so
+  a flood of new ones does not make clients lose theirs. Refusals are 503
+  with `Retry-After: 1`.
+
+Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
+
+- It looks up only names inside `RCS_SERVICE_NAMESPACE`, whole labels
+  compared ([ADR 0007](adr/0007-internal-transport.md) §5), so a name a
+  client wrote costs no lookup.
+- It looks up A and AAAA records, keeps each answer for 10 s, and gives every
+  address, in a new random order each time.
+- A name is looked up by one lookup at a time, which no request waits on
+  while there is an answer to use: past its TTL the last answer is used at
+  once while it is refreshed, for up to 5 minutes. After a failed refresh
+  the next waits 5 s, doubling to a minute while they keep failing. A name
+  with no answer at all is looked up again every 5 s, so a new stack or a
+  recovering service is found soon, and gets the last error in between. A failed lookup is logged once,
+  then at most once a minute while it keeps failing, with its class: `not
+  found` (a missing record, so a configuration error), `timeout` or
+  `error`.
+- It uses only private addresses. Dev and test also accept loopback.
+- A Cloud Map answer holds at most eight records, chosen at random when more
+  instances are registered. That is enough for CSCF fleets of that size.
 
 ## Settings
 
@@ -86,9 +189,16 @@ start with that value.
 | `PCSCF_CORE_HOST` | this task's one private IPv4 | the task address `pcscf` names itself by |
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client (IPv4 address or IPv6 /64) |
+| `PCSCF_ICSCF_URI` | `sip:icscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | the Route of a REGISTER: a `sip` URI with `transport=tcp` and `lr`, of an address or a name inside `RCS_SERVICE_NAMESPACE`; required without a namespace |
+| `RCS_IMS_DOMAIN` | required | the operator's IMS domain, a host name: the `orig-ioi` of `P-Charging-Vector` |
+| `PCSCF_VISITED_NETWORK_ID` | `RCS_IMS_DOMAIN` | `P-Visited-Network-ID` of REGISTERs, one network identifier (RFC 7315 §4.3) |
+| `PCSCF_REGISTER_RATE`, `PCSCF_REGISTER_BURST` | `50`, `200` | REGISTERs a second per client address, and the burst |
+| `PCSCF_MAX_REGISTER_RATE`, `PCSCF_MAX_REGISTER_BURST` | `2000`, `4000` | REGISTERs a second for all clients of a task together, and the burst |
+| `PCSCF_MAX_REGISTRATIONS` | `100000` | registrations kept by one task |
+| `PCSCF_MAX_PENDING_REGISTERS_PER_IP` | `64` | identities one client address (IPv4 address or IPv6 /64) may have REGISTERs under way for at once, 1 to 1024 |
 | `PCSCF_MAX_CONNECTIONS` | `10000` | connections the transport accepts |
-| `PCSCF_MAX_CLIENT_FLOWS` | `9000` | client flows among them; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
-| `PCSCF_CORE_CONNECTIONS` | `256` | connections kept for the core listener |
+| `PCSCF_MAX_CLIENT_FLOWS` | `9000` | connections the client listener holds among them, counted from accept; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
+| `PCSCF_CORE_CONNECTIONS` | `256` | connections the core listener holds, kept for it |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
 | `PCSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop spreads the closing of client flows over; plus 5 s it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 

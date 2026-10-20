@@ -253,3 +253,60 @@ func TestAConnectionAcceptedAfterCloseIsRefusedAsTheTransports(t *testing.T) {
 		t.Fatal("a connection after Close was not refused as the transport's")
 	}
 }
+
+// A connection that fails its PROXY header is counted by the bytes it
+// sent: none, closed or reset, as a client or a scanner that gave up does
+// (the NLB's health checks send a LOCAL header, ADR 0003), in
+// ProxyHeaderEmpty; some, however few or many, in ProxyHeaderErrors, which
+// says the NLB is misconfigured (#227 QA, #198 QA).
+func TestAProxyHeaderFailureIsCountedByTheBytesSent(t *testing.T) {
+	server, rec := newTransport(t, Config{})
+	addr := listen(t, server, ListenerConfig{Network: TCP, ProxyProtocol: true, ProxyHeaderTimeout: time.Minute})
+	full := proxyHeaderFor(netip.MustParseAddrPort("192.0.2.10:40000"), netip.MustParseAddrPort("198.51.100.1:5060"), nil)
+	for _, tt := range []struct {
+		name         string
+		send         []byte
+		reset        bool
+		empty, error uint64
+	}{
+		{"nothing", nil, false, 1, 0},
+		{"nothing, reset", nil, true, 1, 0},
+		{"5 bytes", full[:5], false, 0, 1},
+		{"the fixed part alone", full[:16], false, 0, 1},
+		{"the fixed part and 3 more", full[:19], false, 0, 1},
+		{"no signature", []byte("GET / HTTP/1.1\r\n"), false, 0, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := server.Stats()
+			c := dialRaw(t, addr)
+			if len(tt.send) > 0 {
+				c.Write(tt.send)
+			}
+			if tt.reset {
+				c.(*net.TCPConn).SetLinger(0)
+			}
+			c.Close()
+			// The slot is given back after the failure is counted.
+			eventually(t, "the failure to be counted", func() bool {
+				s := server.Stats()
+				return s.ProxyHeaderEmpty+s.ProxyHeaderErrors > before.ProxyHeaderEmpty+before.ProxyHeaderErrors && s.PendingAccepted == 0
+			})
+			s := server.Stats()
+			if s.ProxyHeaderEmpty-before.ProxyHeaderEmpty != tt.empty || s.ProxyHeaderErrors-before.ProxyHeaderErrors != tt.error || s.ProxyHeaderTimeouts != 0 {
+				t.Fatalf("empty +%d, errors +%d, timeouts %d", s.ProxyHeaderEmpty-before.ProxyHeaderEmpty, s.ProxyHeaderErrors-before.ProxyHeaderErrors, s.ProxyHeaderTimeouts)
+			}
+		})
+	}
+	rec.none(t)
+}
+
+// A UDP listener holds no connections, so the per-listener gauge leaves it
+// out (#227 QA).
+func TestUDPListenersAreNotInTheConnectionGauge(t *testing.T) {
+	server, _ := newTransport(t, Config{})
+	listen(t, server, ListenerConfig{Name: "stream", Network: TCP})
+	listen(t, server, ListenerConfig{Name: "datagram", Network: UDP})
+	if got := server.Stats().ListenerConnections; len(got) != 1 || got["stream"] != 0 {
+		t.Fatalf("per-listener connections = %v, want stream alone", got)
+	}
+}
