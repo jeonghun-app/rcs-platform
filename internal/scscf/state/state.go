@@ -166,12 +166,14 @@ type SetIdentity struct {
 }
 
 // Identity is what one public identity names: the implicit registration set
-// it belongs to. It is written when the S-CSCF is assigned the set (SAR) or
-// the set changes (PPR), and deleted with the set, before its record, so that
-// a deregistration cut short is done again by a sweep; never by a
-// re-registration. An IMPU names one set: an IMPU shared by several private
-// identities (TS 23.228 §4.3.3.4) is out of scope: the last set saved for it
-// takes it.
+// it belongs to. Identities go before their record both ways. They are
+// written before a record with a new incarnation or new identities is saved,
+// the save being the commit point: one naming a record not saved (yet) is
+// as good as none, and its KeepUntil ends it. They are deleted with the set
+// before its record, so that a deregistration cut short is done again by a
+// sweep. A re-registration only keeps them (KeepIdentity), or repairs them.
+// An IMPU names one set: an IMPU shared by several private identities (TS
+// 23.228 §4.3.3.4) is out of scope: the last set saved for it takes it.
 type Identity struct {
 	// IMPU is the public identity in canonical form.
 	IMPU string
