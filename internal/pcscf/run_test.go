@@ -519,12 +519,19 @@ func TestAQuietClientConnectionIsClosed(t *testing.T) {
 	cfg := testConfig()
 	cfg.ClientIdleTimeout = time.Second
 	s := start(t, cfg, deps{})
+	began := time.Now()
 	c := dial(t, s.client, nil)
 	// The request makes the connection a flow. On a loaded host the second
-	// may pass before it is answered, and the close is what is checked.
-	_, _ = c.try()
+	// may pass before it is answered, so the answer is not required; that
+	// the close waited for the idle timeout is, which load cannot break.
+	if res, err := c.try(); err == nil && res.StatusCode != 403 {
+		t.Errorf("OPTIONS answered %d", res.StatusCode)
+	}
 	if !c.closed() {
 		t.Fatal("a quiet client connection was kept open")
+	}
+	if waited := time.Since(began); waited < cfg.ClientIdleTimeout {
+		t.Errorf("closed after %v, before the idle timeout", waited)
 	}
 }
 
