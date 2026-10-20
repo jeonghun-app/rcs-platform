@@ -64,6 +64,12 @@ func FuzzEvaluateTrigger(f *testing.F) {
 	f.Add(uint8(3), "", "", "OPTIONS", "", "", "", "")
 	f.Add(uint8(2), "Subject", `[\.]com|\x41`, "MESSAGE", "sip:a@b", "Subject", `\com`, "")
 	f.Add(uint8(4), "[]^[:alpha:]]", "[[.a.]]|[[=a=]]|[^]a[]", "INVITE", "", "", "", "m=]")
+	// Case pairs on adjacent code points, which the parser merges into
+	// one range (#206 review).
+	f.Add(uint8(2), "Subject", "|Ā|ā", "MESSAGE", "sip:a@b", "Subject", "ā", "")
+	f.Add(uint8(2), "Subject", "|ā|[Ā]", "MESSAGE", "sip:a@b", "Subject", "Ā", "")
+	f.Add(uint8(0), "[Ā]|[ā]|", "", "INVITE", "sip:ā@b", "", "", "")
+	f.Add(uint8(2), "Subject", "x-Ā|[K]", "MESSAGE", "sip:a@b", "Subject", "X-ā", "")
 	f.Fuzz(func(t *testing.T, kind uint8, p1, p2, method, uri, name, value, line string) {
 		var c Condition
 		switch kind % 5 {
@@ -123,6 +129,15 @@ func FuzzEvaluateTrigger(f *testing.F) {
 					t.Fatalf("%q on %q: compiled %t, POSIX %t", p2, value, got.re.MatchString(value), ref.MatchString(value))
 				}
 			}
+			// Case-insensitive, it means what Go's Perl reading with (?i)
+			// means, which is the POSIX one for a pattern without escapes
+			// or a "+?" that Perl syntax reads as lazy (#206 review).
+			budget = MaxSetInstructions
+			if got, err := compilePattern("Content", p2, patternFoldCase, &budget); err == nil && !perlReadsDifferently(p2) {
+				if ref, err := regexp.Compile("(?si:" + p2 + ")"); err == nil && got.re.MatchString(value) != ref.MatchString(value) {
+					t.Fatalf("%q ignoring case on %q: compiled %t, (?i) %t", p2, value, got.re.MatchString(value), ref.MatchString(value))
+				}
+			}
 		}
 		// An ERE is refused only for its size or for a construct Go reads
 		// differently from IEEE 1003.1, which the refusal names (#67), in
@@ -144,4 +159,19 @@ func FuzzEvaluateTrigger(f *testing.F) {
 			}
 		}
 	})
+}
+
+// perlReadsDifferently reports whether Go's Perl syntax may read the ERE p
+// otherwise than its POSIX parse: an escape, or a quantifier followed by
+// "?", which is lazy in Perl and (x+)? in an ERE.
+func perlReadsDifferently(p string) bool {
+	if strings.Contains(p, `\`) {
+		return true
+	}
+	for _, q := range []string{"+?", "*?", "??", "}?"} {
+		if strings.Contains(p, q) {
+			return true
+		}
+	}
+	return false
 }
