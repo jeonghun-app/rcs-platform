@@ -24,11 +24,12 @@ import (
 // chatRig is rcs-as with the real engine, on the memory store, and its
 // MSRP listener on loopback, between the fake core and a fake msrp-relay.
 type chatRig struct {
-	a     *as
-	e     *recordingEngine
-	core  *fakeCore
-	clock *fakeClock
-	msrp  net.Listener
+	a       *as
+	metrics *counter
+	e       *recordingEngine
+	core    *fakeCore
+	clock   *fakeClock
+	msrp    net.Listener
 }
 
 // recordingEngine is the engine, with the failed invitations recorded.
@@ -77,7 +78,8 @@ func newChatRigWith(t *testing.T, mc messaging.Config, cfg Config, tune ...func(
 		t.Fatal(err)
 	}
 	r.e = &recordingEngine{Engine: e, failed: make(chan error, 16)}
-	cfg.Core, cfg.Clock, cfg.MaxMessageSize = r.core.uri(), r.clock, messaging.DefaultMaxMessageSize
+	r.metrics = &counter{n: map[string]int64{}}
+	cfg.Core, cfg.Clock, cfg.MaxMessageSize, cfg.Metrics = r.core.uri(), r.clock, messaging.DefaultMaxMessageSize, r.metrics
 	a = startASWith(t, r.e, cfg, tune...)
 	r.a = a
 	// Closed before the Server's BYEs and the transport, which carries the
@@ -268,6 +270,24 @@ func offered(t *testing.T, req *sip.Request) (msrp.URI, sdp.Setup) {
 		t.Fatalf("path %v, %v", path, err)
 	}
 	return path[0], setup
+}
+
+// counter counts the Server's metrics.
+type counter struct {
+	mu sync.Mutex
+	n  map[string]int64
+}
+
+func (c *counter) Count(name string, n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n[name] += n
+}
+
+func (c *counter) get(name string) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n[name]
 }
 
 // fakeClock runs the session timers when a test says so.

@@ -483,6 +483,17 @@ func TestA2xxFromAnotherForkIsEnded(t *testing.T) {
 	if want := []string{"ACK bob1", "ACK bob1", "ACK bob2", "BYE bob2"}; !slices.Equal(tags, want) {
 		t.Fatalf("sent %v, want %v", tags, want)
 	}
+	// The first session stands until rcs-as ends it: its BYE is the next
+	// one, and only one fork was dropped.
+	r.a.srv.Close()
+	if bye := r.core.nextOf(t, "BYE"); bye.Header.Get("Call-ID") == "" {
+		t.Fatal("no BYE")
+	} else if to, _ := bye.Header.To(); to.Tag() != "bob1" {
+		t.Fatalf("BYE to %q, want the session's", to.Tag())
+	}
+	if n := r.metrics.get("sip.invite.fork_dropped"); n != 1 {
+		t.Fatalf("%d forks dropped, want 1", n)
+	}
 	select {
 	case err := <-r.e.failed:
 		t.Fatalf("an invitation failed: %v", err)
@@ -503,6 +514,39 @@ func TestCloseEndsTheSessions(t *testing.T) {
 	}
 	if res := p.send(r.chatInvite(offerSDP(relayPath(), "active"))); res.StatusCode != 500 {
 		t.Fatalf("an INVITE after Close answered %d", res.StatusCode)
+	}
+}
+
+// rcs-as's INVITE carries its loop marker, as a pager MESSAGE does: one
+// that a profile without the P-Served-User exclusion sends back to rcs-as
+// is refused with 482, and the invitation fails.
+func TestAnInviteThatComesBackIsRefusedAsALoop(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	p := r.a.dial(t)
+	bounced := make(chan int, 1)
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method != "INVITE" {
+			return nil
+		}
+		fwd := req.Clone()
+		_ = fwd.Header.Set("Route", "<sip:"+r.a.addr.String()+";transport=tcp;lr>")
+		_ = fwd.Header.Prepend("Via", "SIP/2.0/TCP 192.0.2.30:5060;branch=z9hG4bK-scscf-loop-invite")
+		code := 0
+		if res, err := p.forward(fwd); err == nil {
+			code = res.StatusCode
+		}
+		bounced <- code
+		res, _ := sip.NewResponse(req, 482, "", "core1")
+		return []*sip.Response{res}
+	})
+	if err := r.a.srv.Invite(t.Context(), invitation()); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-bounced; code != 482 {
+		t.Fatalf("the returning INVITE was answered %d", code)
+	}
+	if err := r.e.nextFailure(t); err == nil {
+		t.Fatal("no failure")
 	}
 }
 
