@@ -32,9 +32,14 @@ const (
 
 // Two implicit registration sets of IMPI1, by their default IMPUs.
 var (
-	Set1 = state.ProfileKey{IMPI: IMPI1, IMPU: IMPU1}
-	Set2 = state.ProfileKey{IMPI: IMPI1, IMPU: IMPU2}
+	Set1 = state.SetKey{IMPI: IMPI1, IMPU: IMPU1}
+	Set2 = state.SetKey{IMPI: IMPI1, IMPU: IMPU2}
 )
+
+// Profile returns a profile of k kept until two days after T0.
+func Profile(k state.SetKey, userData []byte, received time.Time) *state.Profile {
+	return &state.Profile{Key: k, UserData: userData, Received: received, KeepUntil: T0.Add(48 * time.Hour)}
+}
 
 // T0 is the time the checks run at. It lies in the future so that DynamoDB's
 // TTL never removes a test item early.
@@ -84,7 +89,21 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"ProfilesAreKeptApartFromRegistrations", testProfiles},
 		{"EachImplicitRegistrationSetHasItsOwnProfile", testProfilesPerSet},
 		{"APPRForOneSetLeavesTheOtherSetsProfile", testPPRForOneSet},
-		{"ARegistrationNamesTheProfileOfItsSet", testRegistrationProfileKey},
+		{"EveryIdentityOfASetPointsAtItsOneRecord", testIdentities},
+		{"AProfileSaveNeverBringsKeepUntilCloser", testSaveProfileKeepsKeepUntil},
+		{"AProfileIsNotFoundOnceItsKeepUntilHasCome", testProfileKeepUntil},
+		{"KeepProfileOnlyMovesKeepUntilLater", testKeepProfile},
+		{"AnUnregisteredUsersRecordLivesUntilItsStateEnds", testUnregisteredLifeCycle},
+		{"ARegisterTurnsAnUnregisteredRecordIntoARegistration", testRegisterEndsUnregistered},
+		{"AFailedEndOfAnUnregisteredStateIsRetriedAfterTheLease", testUnregisteredRetry},
+		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
+		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
+		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
+		{"ASaveFromBeforeAKeepIdentityCannotUndoIt", testIdentityKeepNeverUndone},
+		{"ARecordBroughtBackFromADeregistrationTakesANewIncarnation", testReviveTakesANewIncarnation},
+		{"AReassertGoesWithItsSetsLastBinding", testReassertGoesWithTheSet},
+		{"ARefusedSaveDoesNotBringBackAGoneProfile", testRefusedSaveKeepsAGoneProfileGone},
+		{"ADeregistrationCutShortIsFinishedByTheNextSweep", testInterruptedDeregistration},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,10 +150,14 @@ func eventually(t *testing.T, o Options, what string, check func() bool) {
 	}
 }
 
-// Registration returns a valid registration of impu with one contact per
-// expiry, each relative to T0. impu is the default IMPU of its set.
+// Key1 is the key of IMPI1's set whose default identity is impu.
+func Key1(impu string) state.SetKey { return state.SetKey{IMPI: IMPI1, IMPU: impu} }
+
+// Registration returns a valid registration of the set of impi whose only
+// identity, and so its default, is impu, with one contact per expiry, each
+// relative to T0.
 func Registration(impi, impu string, expiries ...time.Duration) *state.Registration {
-	r := &state.Registration{IMPU: impu, IMPI: impi, DefaultIMPU: impu}
+	r := &state.Registration{Key: state.SetKey{IMPI: impi, IMPU: impu}, Incarnation: 1, Identities: []state.SetIdentity{{IMPU: impu}}}
 	for i, e := range expiries {
 		r.Contacts = append(r.Contacts, state.Contact{
 			URI:        fmt.Sprintf("sip:ue%d@192.0.2.%d:5060;transport=tcp", i, 10+i),
@@ -163,7 +186,7 @@ func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	}
 	r.Version = saved.Version
 	for _, s := range []state.Store{a, b} {
-		got := must(s.Registration(ctx(t), IMPU1))(t)
+		got := must(s.Registration(ctx(t), Key1(IMPU1)))(t)
 		if !reflect.DeepEqual(got, r) {
 			t.Errorf("read %+v, want %+v", got, r)
 		}
@@ -171,7 +194,7 @@ func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	again := Registration(IMPI1, IMPU1, time.Hour)
 	_, err := b.SaveRegistration(ctx(t), again)
 	wantErr(t, err, state.ErrExists)
-	_, err = a.Registration(ctx(t), IMPU2)
+	_, err = a.Registration(ctx(t), Key1(IMPU2))
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -189,7 +212,7 @@ func testRegistrationVersion(t *testing.T, a, b state.Store, _ Options) {
 	missing.Version = 3
 	_, err = a.SaveRegistration(ctx(t), missing)
 	wantErr(t, err, state.ErrNotFound)
-	if got := must(a.Registration(ctx(t), IMPU1))(t); got.Contacts[0].CSeq != next.Contacts[0].CSeq {
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].CSeq != next.Contacts[0].CSeq {
 		t.Error("a refused save changed the registration")
 	}
 }
@@ -232,7 +255,7 @@ func testRegistrationsOf(t *testing.T, a, b state.Store, o Options) {
 	eventually(t, o, "listing every IMPU of IMPI1", func() bool {
 		got = nil
 		for _, r := range must(b.RegistrationsOf(ctx(t), IMPI1))(t) {
-			got = append(got, r.IMPU)
+			got = append(got, r.Key.IMPU)
 		}
 		return slices.Equal(got, want)
 	})
@@ -248,7 +271,7 @@ func testRegistrationDelete(t *testing.T, a, b state.Store, _ Options) {
 	if err := b.DeleteRegistration(ctx(t), v2); err != nil {
 		t.Fatal(err)
 	}
-	_, err := a.Registration(ctx(t), IMPU1)
+	_, err := a.Registration(ctx(t), Key1(IMPU1))
 	wantErr(t, err, state.ErrNotFound)
 	wantErr(t, a.DeleteRegistration(ctx(t), v2), state.ErrNotFound)
 }
@@ -263,7 +286,7 @@ func testExpiringRegistrations(t *testing.T, a, b state.Store, o Options) {
 	eventually(t, o, "listing the expired and empty registrations", func() bool {
 		var got []string
 		for _, r := range must(b.ExpiringRegistrations(ctx(t), T0, 10))(t) {
-			got = append(got, r.IMPU)
+			got = append(got, r.Key.IMPU)
 		}
 		slices.Sort(got)
 		return slices.Equal(got, want)
@@ -295,8 +318,8 @@ func testRegistrationSweep(t *testing.T, a, b state.Store, o Options) {
 				_, err := state.SweepRegistrations(ctx(t), s, T0, 10, func(before, after *state.Registration) error {
 					mu.Lock()
 					defer mu.Unlock()
-					handled[before.IMPU]++
-					left[before.IMPU] = len(after.Contacts)
+					handled[before.Key.IMPU]++
+					left[before.Key.IMPU] = len(after.Contacts)
 					return nil
 				})
 				if err != nil {
@@ -313,11 +336,11 @@ func testRegistrationSweep(t *testing.T, a, b state.Store, o Options) {
 	if !reflect.DeepEqual(left, map[string]int{IMPU1: 1, IMPU2: 0, IMPU3: 0}) {
 		t.Errorf("contacts left %v", left)
 	}
-	if got := must(a.Registration(ctx(t), IMPU1))(t); len(got.Contacts) != 1 || got.Contacts[0].Expired(T0) {
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); len(got.Contacts) != 1 || got.Contacts[0].Expired(T0) {
 		t.Errorf("the registration with a live contact kept %+v", got.Contacts)
 	}
 	for _, impu := range []string{IMPU2, IMPU3} {
-		_, err := a.Registration(ctx(t), impu)
+		_, err := a.Registration(ctx(t), Key1(impu))
 		wantErr(t, err, state.ErrNotFound)
 	}
 }
@@ -329,12 +352,27 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 		tooMany.Contacts = append(tooMany.Contacts, Registration(IMPI1, IMPU1, time.Hour).Contacts[0])
 	}
 	badIMPI := Registration("not an impi", IMPU1, time.Hour)
-	noSet := Registration(IMPI1, IMPU1, time.Hour)
-	noSet.DefaultIMPU = ""
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noSet} {
+	noDefault := Registration(IMPI1, IMPU1, time.Hour)
+	noDefault.Identities = []state.SetIdentity{{IMPU: IMPU2}}
+	noIncarnation := Registration(IMPI1, IMPU1, time.Hour)
+	noIncarnation.Incarnation = 0
+	tooManyIdentities := Registration(IMPI1, IMPU1, time.Hour)
+	for i := range state.MaxIdentities {
+		tooManyIdentities.Identities = append(tooManyIdentities.Identities, state.SetIdentity{IMPU: fmt.Sprintf("sip:id%d@%s", i, Domain)})
+	}
+	before1970 := Registration(IMPI1, IMPU1)
+	before1970.Unregistered = time.Date(1969, 12, 31, 0, 0, 0, 0, time.UTC)
+	after9999 := Registration(IMPI1, IMPU1)
+	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}
+	resyncDigest := &state.Challenge{
+		IMPI: IMPI1, Nonce: "n", IMPU: IMPU1, Issued: T0, Expires: T0.Add(time.Minute), Resynchronised: true,
+		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", HA1: "0123456789abcdef0123456789abcdef"},
+	}
+	wantErr(t, a.AddChallenge(ctx(t), resyncDigest), state.ErrInvalid)
 	both := Challenge(IMPI1, "n", time.Minute)
 	both.Digest = &state.DigestChallenge{Realm: Domain, HA1: "00"}
 	wantErr(t, a.AddChallenge(ctx(t), both), state.ErrInvalid)
@@ -349,9 +387,9 @@ func testNoAliasing(t *testing.T, a, _ state.Store, _ Options) {
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
 	r.Contacts[0].Path[0] = "changed"
 	saved.Contacts[0].Path[0] = "changed"
-	read := must(a.Registration(ctx(t), IMPU1))(t)
+	read := must(a.Registration(ctx(t), Key1(IMPU1)))(t)
 	read.Contacts[0].Path[0] = "changed"
-	if got := must(a.Registration(ctx(t), IMPU1))(t); got.Contacts[0].Path[0] == "changed" {
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" {
 		t.Error("a caller's change reached the stored registration")
 	}
 }
@@ -379,8 +417,13 @@ func testChallengeRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	if err := a.AddChallenge(ctx(t), digest); err != nil {
 		t.Fatal(err)
 	}
+	resync := Challenge(IMPI1, "nonce-resync", time.Minute)
+	resync.Resynchronised = true
+	if err := a.AddChallenge(ctx(t), resync); err != nil {
+		t.Fatal(err)
+	}
 	wantErr(t, b.AddChallenge(ctx(t), Challenge(IMPI1, "nonce-aka", time.Minute)), state.ErrExists)
-	for _, want := range []*state.Challenge{aka, digest} {
+	for _, want := range []*state.Challenge{aka, digest, resync} {
 		got := must(b.TakeChallenge(ctx(t), want.IMPI, want.Nonce, T0))(t)
 		if !sameChallenge(got, want) {
 			t.Errorf("the second instance took %#v, want %#v", got, want)
