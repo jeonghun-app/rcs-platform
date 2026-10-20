@@ -186,8 +186,14 @@ func sameDialog(d *dialog.Dialog, res *sip.Response) bool {
 // the client is passive, which msrp-relay never dials, says it takes no
 // session from the network (messaging.ErrNoSessions, ADR 0004).
 func (s *Server) established(ss *session, res *sip.Response) {
+	path, reason, perr := answeredPath(res)
 	ss.mu.Lock()
 	ack, next := ss.ack, ss.d.NextHop()
+	if perr == nil {
+		// Known before the ACK leaves too: the client may refresh at
+		// once, and a refresh must keep this path.
+		ss.remotePath = joinPath(path)
+	}
 	ss.mu.Unlock()
 	// Known before the ACK leaves, so that a BYE right behind it finds
 	// the session.
@@ -200,7 +206,7 @@ func (s *Server) established(ss *session, res *sip.Response) {
 		ss.bye("")
 		return
 	}
-	path, reason, err := answeredPath(res)
+	err := perr
 	if err == nil {
 		err = ss.leg.Answer(path)
 	}
@@ -210,9 +216,6 @@ func (s *Server) established(ss *session, res *sip.Response) {
 		ss.bye(reason)
 		return
 	}
-	ss.mu.Lock()
-	ss.remotePath = joinPath(path)
-	ss.mu.Unlock()
 	s.cfg.Metrics.Count("sip.invite.accepted", 1)
 	ss.arm()
 	ss.watch(nil)

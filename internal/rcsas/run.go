@@ -149,6 +149,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		return err
 	case err := <-served:
 		served <- err // for the deferred wait
+		if ctx.Err() != nil {
+			// The listener stopped for the shutdown, which may be seen
+			// here before ctx.Done is.
+			return nil
+		}
 		return fmt.Errorf("rcs-as: MSRP listener: %w", err)
 	}
 }

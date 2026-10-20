@@ -42,7 +42,8 @@ func (s *Server) register(_ context.Context, u *proxy.UAS) {
 		s.respond(u, req, 400)
 		return
 	}
-	s.respond(u, req, 200)
+	// Taken before the 200 leaves, so that the next REGISTER for the user
+	// finds this one.
 	now := s.cfg.Clock.Now()
 	s.mu.Lock()
 	until, known := s.registered[user]
@@ -61,8 +62,9 @@ func (s *Server) register(_ context.Context, u *proxy.UAS) {
 	s.mu.Unlock()
 	if expires == 0 {
 		s.cfg.Metrics.Count("sip.register.ended", 1)
-		return
+	} else {
+		s.cfg.Metrics.Count("sip.register.taken", 1)
+		s.engine.UserRegistered(user, fresh)
 	}
-	s.cfg.Metrics.Count("sip.register.taken", 1)
-	s.engine.UserRegistered(user, fresh)
+	s.respond(u, req, 200)
 }
