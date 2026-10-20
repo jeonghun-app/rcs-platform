@@ -27,7 +27,9 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -122,8 +124,15 @@ type Registration struct {
 
 // Contact is one contact of a registration (RFC 3680 §5.1).
 type Contact struct {
-	// ID names the contact within the subscription.
-	ID    string
+	// ID names the contact within the subscription. scscf makes one per
+	// binding, from its +sip.instance and reg-id, or from the contact URI
+	// and the flow without them, not one per URI: the same URI bound over
+	// two flows (RFC 5626) is two contacts with two ids (#233).
+	ID string
+	// State says whether the contact is registered, and Event what put it
+	// in that state. A document may pair them in a way RFC 3680 §4.7.1
+	// does not, which Parse accepts and Marshal refuses; State decides, so
+	// use Active rather than Event to tell whether it is registered.
 	State ContactState
 	Event Event
 	// URI is the contact address.
@@ -144,6 +153,40 @@ type Contact struct {
 	Params []Param
 }
 
+// Active reports whether c is registered: its state is active, whatever
+// its event says (RFC 3680 §5.1, #233).
+func (c Contact) Active() bool { return c.State == ContactActive }
+
+// Param returns the value of the unknown parameter called name, its name
+// compared without case as a contact parameter's is (RFC 3261 §7.3.1), and
+// a quoted-string value unquoted, as +sip.instance's is (RFC 5626 §4.1):
+// so `"<urn:uuid:…>"` is `<urn:uuid:…>`. A flag has the value "".
+func (c Contact) Param(name string) (string, bool) {
+	for _, p := range c.Params {
+		if strings.EqualFold(p.Name, name) {
+			return unquote(p.Value), true
+		}
+	}
+	return "", false
+}
+
+// unquote returns the content of a quoted-string, its escapes undone
+// (RFC 3261 §25.1), or v as it is when it is not one.
+func unquote(v string) string {
+	if len(v) < 2 || v[0] != '"' || v[len(v)-1] != '"' {
+		return v
+	}
+	var b strings.Builder
+	in := v[1 : len(v)-1]
+	for i := 0; i < len(in); i++ {
+		if in[i] == '\\' && i+1 < len(in) {
+			i++
+		}
+		b.WriteByte(in[i])
+	}
+	return b.String()
+}
+
 // Param is an <unknown-param>: a contact parameter RFC 3261 does not
 // define, with its value, empty for a flag.
 type Param struct {
@@ -153,6 +196,9 @@ type Param struct {
 // Parse reads a registration information document.
 func Parse(data []byte) (*Info, error) {
 	if err := checkDocument(data); err != nil {
+		return nil, err
+	}
+	if err := checkElements(data); err != nil {
 		return nil, err
 	}
 	var w wireInfo
@@ -170,8 +216,15 @@ func Parse(data []byte) (*Info, error) {
 }
 
 // Marshal serializes r in the element order of the RFC 3680 §5.4 schema.
+// It refuses what Parse would, and also a contact whose state and event
+// RFC 3680 §4.7.1 does not pair, an expires on one not active, and an
+// active contact under a registration in init or terminated, so a
+// notifier sends no document its subscribers could read two ways.
 func (r *Info) Marshal() ([]byte, error) {
 	if err := r.validate(); err != nil {
+		return nil, err
+	}
+	if err := r.validateStrict(); err != nil {
 		return nil, err
 	}
 	var b bytes.Buffer
@@ -193,6 +246,10 @@ func (r *Info) Marshal() ([]byte, error) {
 	w.end("reginfo")
 	if err := w.close(); err != nil {
 		return nil, err
+	}
+	// The counts allow more than MaxDocumentSize, which Parse refuses.
+	if b.Len() > MaxDocumentSize {
+		return nil, ErrTooLarge
 	}
 	return b.Bytes(), nil
 }
@@ -237,7 +294,9 @@ func attr(name, value string) xml.Attr {
 }
 
 // validate checks r against the schema and §5.1, for Parse and Marshal
-// alike, so that a document Marshal writes is one Parse reads.
+// alike, so that a document Marshal writes is one Parse reads. An
+// address-of-record appears in one registration only (§5.1), compared as
+// URIs, so no subscriber finds it both active and terminated.
 func (r *Info) validate() error {
 	if r.State != Full && r.State != Partial {
 		return fmt.Errorf("%w: invalid reginfo state", ErrMalformed)
@@ -246,6 +305,10 @@ func (r *Info) validate() error {
 		return fmt.Errorf("%w: more than %d registrations", ErrMalformed, maxRegistrations)
 	}
 	var ids []string
+	aors := make([]aorForm, 0, len(r.Registrations))
+	// Contact ids are unique in the whole document, as RFC 3680 §5.1 has
+	// them within a subscription, and so within each registration too.
+	contacts := map[string]bool{}
 	for _, reg := range r.Registrations {
 		if err := reg.validate(); err != nil {
 			return err
@@ -254,6 +317,40 @@ func (r *Info) validate() error {
 			return fmt.Errorf("%w: repeated registration id", ErrMalformed)
 		}
 		ids = append(ids, reg.ID)
+		u, _ := sip.ParseURI(reg.AOR) // validate parsed it
+		aor := aorOf(u)
+		if slices.ContainsFunc(aors, aor.same) {
+			return fmt.Errorf("%w: repeated address-of-record", ErrMalformed)
+		}
+		aors = append(aors, aor)
+		for _, c := range reg.Contacts {
+			if contacts[c.ID] {
+				return fmt.Errorf("%w: repeated contact id", ErrMalformed)
+			}
+			contacts[c.ID] = true
+		}
+	}
+	return nil
+}
+
+// activeEvents are the events that leave a contact active; the others end
+// it (RFC 3680 §4.7.1).
+var activeEvents = []Event{Registered, Created, Refreshed, Shortened}
+
+// validateStrict checks what only a sender is held to.
+func (r *Info) validateStrict() error {
+	for _, reg := range r.Registrations {
+		for _, c := range reg.Contacts {
+			if slices.Contains(activeEvents, c.Event) != c.Active() {
+				return fmt.Errorf("%w: contact state and event disagree", ErrMalformed)
+			}
+			if c.Expires != nil && !c.Active() {
+				return fmt.Errorf("%w: expires on a contact not active", ErrMalformed)
+			}
+			if c.Active() && reg.State != Active {
+				return fmt.Errorf("%w: active contact under a registration not active", ErrMalformed)
+			}
+		}
 	}
 	return nil
 }
@@ -273,15 +370,10 @@ func (reg Registration) validate() error {
 	if len(reg.Contacts) > maxContacts {
 		return fmt.Errorf("%w: more than %d contacts in a registration", ErrMalformed, maxContacts)
 	}
-	var ids []string
 	for _, c := range reg.Contacts {
 		if err := c.validate(); err != nil {
 			return err
 		}
-		if slices.Contains(ids, c.ID) {
-			return fmt.Errorf("%w: repeated contact id", ErrMalformed)
-		}
-		ids = append(ids, c.ID)
 	}
 	return nil
 }
@@ -318,21 +410,45 @@ func (c Contact) validate() error {
 	return nil
 }
 
-// ByAOR is the registrations whose address-of-record is aor, compared as
-// URIs (RFC 3261 §19.1.4, RFC 3966 §4) since a notifier may write the same
-// identity with other escaping, case or parameters than the subscriber
-// knows it by.
-func (r *Info) ByAOR(aor sip.URI) []Registration {
-	var out []Registration
+// ByAOR is the registration whose address-of-record is aor, if there is
+// one. Addresses-of-record compare in the form the HSS keeps a public
+// identity in (identity.CanonicalIMPU: parameters dropped, escapes undone,
+// the host in lower case, a tel URI's separators removed), since a
+// notifier may write the identity otherwise than the subscriber knows it
+// by; one that has no such form compares as a URI (RFC 3261 §19.1.4). A
+// document Parse returned has at most one: it refuses an address-of-record
+// repeated.
+func (r *Info) ByAOR(aor sip.URI) (Registration, bool) {
+	want := aorOf(aor)
 	for _, reg := range r.Registrations {
-		if equalURI(reg.AOR, aor) {
-			out = append(out, reg)
+		u, err := sip.ParseURI(reg.AOR)
+		if err == nil && aorOf(u).same(want) {
+			return reg, true
 		}
 	}
-	return out
+	return Registration{}, false
 }
 
-// ByURI is the contacts of reg at uri, compared as ByAOR compares. There
+// aorForm is an address-of-record as it compares: its canonical form, or
+// the URI when it has none.
+type aorForm struct {
+	canonical string
+	uri       sip.URI
+}
+
+func aorOf(u sip.URI) aorForm {
+	c, _ := identity.CanonicalIMPU(u.String())
+	return aorForm{canonical: c, uri: u}
+}
+
+func (a aorForm) same(b aorForm) bool {
+	if a.canonical != "" && b.canonical != "" {
+		return a.canonical == b.canonical
+	}
+	return a.uri.Equal(b.uri)
+}
+
+// ByURI is the contacts of reg at uri, compared as URIs (RFC 3261 §19.1.4). There
 // may be more than one: a contact URI can be bound once per flow (RFC 5626
 // §6), the bindings told apart by their parameters.
 func (reg Registration) ByURI(uri sip.URI) []Contact {
