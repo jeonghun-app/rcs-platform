@@ -1,0 +1,253 @@
+package icscf
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"slices"
+	"strconv"
+	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+)
+
+// The procedures, as metric names know them.
+const (
+	kindRegister    = "register"
+	kindTerminating = "terminating"
+	kindRouted      = "routed"
+)
+
+// Router is the I-CSCF's proxy.Router. It keeps nothing about users between
+// requests: every REGISTER asks the HSS with a UAR and every terminating
+// initial request with an LIR, so any instance can take any request.
+type Router struct {
+	hss             HSS
+	scscfs          []candidate
+	home            []byte
+	retryAfter      string
+	registerTimeout time.Duration
+	ids             sip.IDGenerator
+	metrics         Metrics
+	log             *slog.Logger
+}
+
+// New returns a Router for cfg, or an error naming the first invalid setting.
+func New(cfg Config) (*Router, error) {
+	cfg.setDefaults()
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &Router{
+		hss:             cfg.HSS,
+		scscfs:          newCandidates(cfg.SCSCFs),
+		home:            []byte(cfg.HomeDomain),
+		retryAfter:      strconv.FormatInt(int64(cfg.RetryAfter/time.Second), 10),
+		registerTimeout: cfg.RegisterTimeout,
+		ids:             cfg.IDs,
+		metrics:         cfg.Metrics,
+		log:             cfg.Logger,
+	}, nil
+}
+
+// Route implements proxy.Router.
+func (r *Router) Route(ctx context.Context, req *proxy.Request) proxy.Decision {
+	m := req.Message
+	switch {
+	case m.Method == "REGISTER":
+		return r.register(ctx, m)
+	case !req.Initial() || m.Header.Has("Route"):
+		// A request inside a dialog goes where its Route or Request-URI
+		// says (RFC 3261 §16.12), and so does one whose Route continues
+		// past this I-CSCF (TS 24.229 §5.3.2.1): neither needs the HSS.
+		r.count(kindRouted, "forwarded")
+		return forwarding(proxy.Forward(req))
+	}
+	return r.terminating(ctx, m)
+}
+
+// register applies TS 24.229 §5.3.1.2 and §5.3.1.3.
+func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
+	impu, ok := publicIdentity(m)
+	if !ok {
+		// No HSS knows an identity that is not one; it would answer 5001.
+		return r.reject(kindRegister, 403)
+	}
+	impi, ok := privateIdentity(m, impu)
+	if !ok {
+		return r.reject(kindRegister, 403)
+	}
+	uaa, err := r.hss.UAR(ctx, &cx.UAR{
+		UserName:                 impi,
+		PublicIdentity:           impu,
+		VisitedNetworkIdentifier: r.visitedNetwork(m),
+		AuthorizationType:        authorizationType(m),
+	})
+	if ctx.Err() != nil {
+		return r.cancelled(kindRegister)
+	}
+	if err != nil || cxclient.Classify(uaa.Result) == cxclient.Unavailable {
+		return r.hssUnavailable(kindRegister, m)
+	}
+	if !uaa.Result.IsSuccess() {
+		// §5.3.1.3: every negative answer is 403.
+		return r.reject(kindRegister, 403)
+	}
+	scscf, err := r.scscf(uaa.Result, uaa.ServerName, uaa.ServerCapabilities)
+	switch {
+	case errors.Is(err, errBadServerName):
+		return r.hssUnavailable(kindRegister, m)
+	case err != nil:
+		return r.reject(kindRegister, 600) // §5.3.1.3
+	}
+	r.count(kindRegister, "forwarded")
+	// §5.3.1.2: the REGISTER's Request-URI becomes the S-CSCF's. The
+	// branch is bounded so that a silent S-CSCF is answered 504 while the
+	// client still waits (§5.3.1.3; re-selection is not done, see the
+	// package documentation).
+	return forwarding(proxy.Decision{Targets: []proxy.Target{{URI: scscf, Timeout: r.registerTimeout}}})
+}
+
+// terminating applies TS 24.229 §5.3.2.1 and §5.3.2.2 to an initial request
+// for a user of the home network.
+func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision {
+	uri := telForm(m.URI)
+	impu, ok := identity.CanonicalIMPU(uri.String())
+	if !ok {
+		// No user of the network has such an identity; the HSS would
+		// answer 5001.
+		return r.reject(kindTerminating, 404)
+	}
+	lia, err := r.hss.LIR(ctx, &cx.LIR{PublicIdentity: impu})
+	if ctx.Err() != nil {
+		return r.cancelled(kindTerminating)
+	}
+	if err != nil || cxclient.Classify(lia.Result) == cxclient.Unavailable {
+		return r.hssUnavailable(kindTerminating, m)
+	}
+	switch cxclient.Classify(lia.Result) {
+	case cxclient.Success:
+	case cxclient.NotRegistered:
+		// §5.3.2.1: known, not registered, and no services for an
+		// unregistered user.
+		return r.reject(kindTerminating, 480)
+	default:
+		// §5.3.2.2: 5001 and every other negative answer.
+		return r.reject(kindTerminating, 404)
+	}
+	scscf, err := r.scscf(lia.Result, lia.ServerName, lia.ServerCapabilities)
+	switch {
+	case errors.Is(err, errBadServerName):
+		return r.hssUnavailable(kindTerminating, m)
+	case err != nil:
+		// TS 24.229 names no response for a terminating request no
+		// configured S-CSCF can take; to the caller the user is
+		// unavailable, and retrying will not change that.
+		return r.reject(kindTerminating, 480)
+	}
+	r.count(kindTerminating, "forwarded")
+	// §5.3.2.1: the S-CSCF becomes the topmost Route, and the Request-URI
+	// stays, in tel form when it named a telephone number.
+	return forwarding(proxy.Decision{Targets: []proxy.Target{{
+		URI:    uri,
+		Routes: []sip.Address{{URI: looseRoute(scscf)}},
+	}}})
+}
+
+var (
+	errBadServerName = errors.New("icscf: the HSS named an S-CSCF that is not a SIP URI")
+	errNoSCSCF       = errors.New("icscf: no configured S-CSCF has the mandatory capabilities")
+)
+
+// scscf is the S-CSCF a successful UAA or LIA names, or else the first one
+// its capabilities allow (rank).
+func (r *Router) scscf(result cx.Result, name string, caps *cx.ServerCapabilities) (sip.URI, error) {
+	if name != "" {
+		u, err := sip.ParseURI(name)
+		if err != nil || !u.IsSIP() || u.Host == "" {
+			// §5.3.1.3 counts incorrect information from the HSS as a
+			// query that could not be completed.
+			r.metrics.Count("icscf.hss.bad_server_name", 1)
+			r.log.Warn("icscf: the HSS named an S-CSCF that is not a SIP URI", slog.String("result", result.String()))
+			return sip.URI{}, errBadServerName
+		}
+		return u, nil
+	}
+	ranked := rank(r.scscfs, caps)
+	if len(ranked) == 0 {
+		return sip.URI{}, errNoSCSCF
+	}
+	return ranked[0], nil
+}
+
+// looseRoute returns u with lr: the S-CSCF is a loose router, and the
+// proxy would treat a Route without lr as a strict router's and move the
+// Request-URI into the Route (RFC 3261 §16.6 step 6). The HSS's name may
+// lack it, since a name is not a route.
+func looseRoute(u sip.URI) sip.URI {
+	if _, ok := u.Param("lr"); ok {
+		return u
+	}
+	u.Params = slices.Clone(u.Params)
+	u.Params.SetFlag("lr")
+	return u
+}
+
+// forwarding adds to d what every forwarded request and its responses need:
+// TS 24.229 §5.3.2.1 has the I-CSCF discard P-Profile-Key wherever it
+// appears, which only an I-CSCF that sets it from the HSS's wildcarded
+// identity may send, and this one does not.
+func forwarding(d proxy.Decision) proxy.Decision {
+	d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
+		req.Header.Del("P-Profile-Key")
+		return nil
+	}
+	d.OnResponse = func(_ context.Context, res *sip.Response) {
+		res.Header.Del("P-Profile-Key")
+	}
+	return d
+}
+
+// reject answers with code, which needs no header field beyond the
+// mandatory ones.
+func (r *Router) reject(kind string, code int) proxy.Decision {
+	r.count(kind, strconv.Itoa(code))
+	return proxy.Decision{Status: code}
+}
+
+// hssUnavailable answers a request the HSS could not be asked about: 480
+// (TS 24.229 §5.3.1.3) with Retry-After, which tells a client when to try
+// again. 503 is kept for the I-CSCF's own overload (the transaction
+// layer's cap), so the two can be told apart.
+func (r *Router) hssUnavailable(kind string, m *sip.Request) proxy.Decision {
+	r.metrics.Count("icscf.hss.unavailable", 1)
+	r.count(kind, "480")
+	tag, err := r.ids.Tag()
+	if err != nil {
+		return proxy.Decision{Status: 480}
+	}
+	res, err := sip.NewResponse(m, 480, "", tag)
+	if err != nil {
+		return proxy.Decision{Status: 480}
+	}
+	if err := res.Header.Add("Retry-After", r.retryAfter); err != nil {
+		return proxy.Decision{Status: 480}
+	}
+	return proxy.Decision{Response: res}
+}
+
+// cancelled is the Decision for a request cancelled while the HSS was
+// asked: the proxy answers it 487 and its CANCEL 200 (TS 24.229 §5.3.2.2),
+// whatever the Decision, and the answer, if one comes, is dropped.
+func (r *Router) cancelled(kind string) proxy.Decision {
+	r.count(kind, "cancelled")
+	return proxy.Decision{Status: 487}
+}
+
+func (r *Router) count(kind, what string) {
+	r.metrics.Count("icscf."+kind+"."+what, 1)
+}
