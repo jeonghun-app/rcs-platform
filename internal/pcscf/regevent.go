@@ -191,10 +191,14 @@ func (p *pcscf) deferRefreshLocked(sub *subscription, now time.Time, wait time.D
 
 // refusedFor reports whether a SUBSCRIBE refused with code will be refused
 // again soon: a 4xx or 6xx that says the request, the event or the user is
-// wrong, not that the notifier is busy or lost the subscription.
+// wrong, not that the notifier is busy or lost the subscription. A 403 is
+// not one: scscf answers it whenever the identity is not registered there,
+// so that a subscriber cannot learn who is (#256), and so to a SUBSCRIBE
+// that comes before the registration it follows is stored; it backs off
+// like any failure.
 func refusedFor(code int) bool {
 	switch code {
-	case 403, 404, 405, 410, 416, 489, 501, 603, 604:
+	case 404, 405, 410, 416, 489, 501, 603, 604:
 		return true
 	}
 	return false

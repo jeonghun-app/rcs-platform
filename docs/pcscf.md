@@ -239,9 +239,11 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
     `Expires`, or gets no NOTIFY within Timer N (64×T1, 32 s, RFC 6665
     §4.1.2.4) ends the subscription. It is set up again after a backoff of
     30 s, doubling with each failure in a row up to an hour, or after its
-    `Retry-After` if longer. A refusal that will not change (403, 404, 405,
-    410, 416, 489, 501, 603, 604) waits an hour. A NOTIFY resets the
-    backoff.
+    `Retry-After` if longer. A refusal that will not change (404, 405,
+    410, 416, 489, 501, 603, 604) waits an hour. A 403 backs off like a
+    failure: `scscf` answers it to any SUBSCRIBE for an identity it has no
+    registration of, which a SUBSCRIBE sent before the registration is
+    stored is too (#256). A NOTIFY resets the backoff.
   - A refresh that fails leaves the subscription valid until it expires
     (TS 24.229 §5.2.3, RFC 6665 §4.1.2.2): its NOTIFYs are still taken, and
     the refresh is tried again after the same backoff and no sooner than
