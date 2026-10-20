@@ -65,7 +65,12 @@ client's in-dialog request, to `scscf`; whether such requests then reach
 checks it as an acceptance criterion of
 [#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
 mitigation is a dialog-state check in `scscf`, such as a signed
-Record-Route parameter it verifies.
+Record-Route parameter it verifies. `scscf` sends a request inside a dialog
+on only to an application server or to a `pcscf` core listener naming a
+flow, never to itself, the I-CSCF or any other core address
+(`internal/scscf/routing`, #14); it keeps no dialog state, so a client can
+still drop an application server's entry from its route set, which the
+signed parameter would also close.
 The client's in-dialog requests are checked against the same MAC, so a
 client cannot change the icid its dialog's requests are charged to (review
 of #221; this closes the #208 residual risk that it could).
