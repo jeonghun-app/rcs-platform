@@ -79,9 +79,10 @@ if tool == "aws":
     elif cmd == ["iam", "get-role"]:
         print("arn:aws:iam::123456789012:role/" + flag("--role-name"))
     elif cmd == ["service-quotas", "get-service-quota"]:
-        if state["quota"] is None:
+        quota = state.get("quotas", {}).get(flag("--quota-code"), state["quota"])
+        if quota is None:
             fail("AccessDenied")
-        print(state["quota"])
+        print(quota)
     elif cmd == ["dynamodb", "describe-table"]:
         if "table " + flag("--table-name") not in state["taken"]:
             fail("ResourceNotFoundException")
@@ -232,7 +233,7 @@ class Stubbed(unittest.TestCase):
     def run_script(self, script, *args, env=None) -> subprocess.CompletedProcess:
         self.state_file.write_text(json.dumps(self.state))
         result = subprocess.run(["bash", str(script), *args], env={**self.env, **(env or {})}, cwd=self.dir,
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
         self.state = json.loads(self.state_file.read_text())
         return result
 
@@ -418,12 +419,26 @@ class Deploy(Stubbed):
         self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
         self.state["changes"]["rcs-platform"] = [["Modify", "SubscribersTable", "AWS::DynamoDB::Table", "True"],
                                                  ["Modify", "HssService", "AWS::ECS::Service", "False"],
-                                                 ["Remove", "OldThing", "AWS::X::Y", ""]]
+                                                 ["Modify", "HssTaskDefinition", "AWS::ECS::TaskDefinition", "True"],
+                                                 ["Remove", "OldTable", "AWS::DynamoDB::Table", ""],
+                                                 ["Remove", "OldAlarm", "AWS::CloudWatch::Alarm", ""]]
         result = self.run_script(DEPLOY, *deploy())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"!! Modify +SubscribersTable +AWS::DynamoDB::Table  REPLACED")
-        self.assertRegex(result.stdout, r"!! Remove +OldThing")
-        self.assertIn("1 resources replaced or possibly replaced, 1 removed", result.stdout)
+        self.assertRegex(result.stdout, r"!! Remove +OldTable")
+        # A task definition is replaced on every image deployment, an alarm
+        # holds nothing: listed, not marked.
+        self.assertRegex(result.stdout, r"\n     Modify +HssTaskDefinition +AWS::ECS::TaskDefinition  REPLACED")
+        self.assertRegex(result.stdout, r"\n     Remove +OldAlarm")
+        self.assertIn("1 stateful resources replaced or possibly replaced, 1 removed", result.stdout)
+
+    def test_an_image_deployment_replacing_only_task_definitions_has_no_warning(self):
+        self.existing()
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        self.state["changes"]["rcs-platform"] = [["Modify", "HssTaskDefinition", "AWS::ECS::TaskDefinition", "True"]]
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("!!", result.stdout)
 
     def test_without_yes_and_without_a_terminal_nothing_runs(self):
         self.existing()
@@ -432,6 +447,42 @@ class Deploy(Stubbed):
         self.assertEqual(result.returncode, 1)
         self.assertIn("no terminal to confirm on", result.stderr)
         self.assertEqual(self.aws("cloudformation", "execute-change-set"), [])
+
+    def test_a_plan_builds_and_pushes_nothing(self):
+        self.existing()
+        result = self.run_script(DEPLOY, "--config", str(EXAMPLE), "--plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls("make") + self.calls("docker"), [])
+        self.assertEqual(self.change_set("rcs-platform")["ImageDigest"], "sha256:" + "0" * 64)
+        self.assertIn("nothing was built or pushed", result.stdout)
+
+    def test_a_first_creation_over_the_elastic_ip_quota_is_refused(self):
+        # The example has one NAT gateway and two new NLB addresses: 3.
+        self.state["quotas"] = {"L-0263D0A3": "5.0"}
+        self.state["addresses"] = {"eipalloc-1": "198.51.100.1", "eipalloc-2": "198.51.100.2", "eipalloc-3": "198.51.100.3"}
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("allocates 3 Elastic IPs and the account holds 3, over the quota of 5.0", result.stderr)
+        self.assertEqual(self.aws("cloudformation", "create-change-set"), [])
+        # Reusing two retained addresses leaves one to allocate.
+        path = self.config(replace={"NlbAllocationIdA": "eipalloc-1", "NlbAllocationIdB": "eipalloc-2"})
+        result = self.run_script(DEPLOY, "--config", str(path), "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Elastic IPs: 1 to allocate, 3 held, quota 5.0", result.stdout)
+
+    def test_a_different_template_revision_is_warned_about(self):
+        self.existing(image_tag=TAG)
+        self.state["outputs"]["rcs-platform"]["TemplateRevision"] = "v0.0.9"
+        self.state["images"] = {f"rcs-platform:{TAG}": PUSHED, "rcs-platform-acs:1.4.0": ACS_DIGEST}
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"runs the template of v0.0.9; this run ships {TAG}'s", result.stderr)
+
+    def test_a_first_image_has_nothing_to_roll_back_to(self):
+        result = self.run_script(DEPLOY, *deploy())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("there is no earlier one to roll back to", result.stdout)
+        self.assertNotIn("--image-tag none", result.stdout)
 
     def test_a_plan_creates_change_sets_and_runs_none(self):
         self.existing()

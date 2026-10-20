@@ -36,8 +36,17 @@ ACS_SOURCE="ghcr.io/jeonghun-app/auto-configuration-server"
 UNTAGGED_IMAGE_EXPIRY_DAYS=7
 MAX_TAGGED_IMAGES=30
 
-# Fargate On-Demand vCPU, the quota a rolling update must fit in.
+# Fargate On-Demand vCPU, the quota a rolling update must fit in, and
+# EC2-VPC Elastic IPs, which the NAT gateways and the NLB take.
 FARGATE_VCPU_QUOTA="L-3032A538"
+EIP_QUOTA="L-0263D0A3"
+
+# Resource types whose replacement or removal loses data or an address
+# clients know. Only their changes are marked !! and need "replace" typed:
+# task definitions and alarms are replaced on every image deployment.
+STATEFUL_TYPES="AWS::DynamoDB::Table AWS::KMS::Key AWS::S3::Bucket AWS::ElasticLoadBalancingV2::LoadBalancer
+AWS::EC2::VPC AWS::EC2::Subnet AWS::EC2::EIP AWS::EC2::NatGateway AWS::ServiceDiscovery::PrivateDnsNamespace
+AWS::SecretsManager::Secret AWS::Logs::LogGroup AWS::ECR::Repository"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLATFORM_TEMPLATE="$ROOT/infra/platform.yaml"
@@ -74,8 +83,8 @@ Usage: scripts/deploy.sh --config FILE [options]
                         Without it the tag is `git describe` of a clean tree.
   --acs-image-tag TAG   acs image to deploy; only with --skip-build. Default
                         the pinned ACS_VERSION, copied from GHCR by digest.
-  --plan                Build, push and create the change sets, print them,
-                        and stop without changing a stack
+  --plan                Create the change sets, print them, and stop: no
+                        stack changes, and no image is built or pushed
   --yes                 Run the change sets without asking (CI)
   --dry-run             Check the config and print the commands, calling
                         neither AWS nor Docker
@@ -438,6 +447,19 @@ parameters_file() {
   } >"$file"
 }
 
+# Prints a change set's lines (Action, LogicalId, Type, Replacement, tab
+# separated), marking with !! a stateful resource that is replaced, may be,
+# or is removed.
+classify_changes() {
+  awk -F'\t' -v types="$STATEFUL_TYPES" '
+    BEGIN { n = split(types, list, /[ \n]+/); for (i = 1; i <= n; i++) stateful[list[i]] = 1 }
+    NF {
+      note = ($4 == "True" ? "  REPLACED" : ($4 == "Conditional" ? "  may be replaced" : ""))
+      mark = (($3 in stateful) && ($4 == "True" || $4 == "Conditional" || $1 == "Remove")) ? "!!" : "  "
+      printf "  %s %-7s %-40s %s%s\n", mark, $1, $2, $3, note
+    }'
+}
+
 # Creates a change set, prints what it changes, and runs it after the stack
 # name is typed (or --yes); --plan stops after printing. Arguments: stack,
 # then the template option (--template-body file://... or --template-url
@@ -491,21 +513,15 @@ apply_change_set() {
       token="$(aws cloudformation describe-change-set --region "$REGION" --stack-name "$stack" --change-set-name "$name" \
         --query NextToken --output text)"
     fi
-    changes="$(awk -F'\t' 'NF {
-        mark = "  "
-        if ($4 == "True") mark = "!!"
-        else if ($4 == "Conditional") mark = "! "
-        if ($1 == "Remove") mark = "!!"
-        printf "  %s %-7s %-40s %s%s\n", mark, $1, $2, $3, ($4 == "True" ? "  REPLACED" : ($4 == "Conditional" ? "  may be replaced" : ""))
-      }' <<<"$page")"
+    changes="$(classify_changes <<<"$page")"
     [[ -z "$changes" ]] || echo "$changes"
-    replace=$((replace + $(grep -c -e '  REPLACED' -e 'may be replaced' <<<"$changes" || true)))
-    remove=$((remove + $(grep -c ' Remove ' <<<"$changes" || true)))
+    replace=$((replace + $(grep -c -e '^  !! .*REPLACED' -e '^  !! .*may be replaced' <<<"$changes" || true)))
+    remove=$((remove + $(grep -c '^  !! Remove ' <<<"$changes" || true)))
     [[ -n "$token" && "$token" != None ]] || break
   done
   if [[ $((replace + remove)) -gt 0 ]]; then
-    echo "  !! $replace resources replaced or possibly replaced, $remove removed: a replaced table, key, bucket,"
-    echo "  !! load balancer or namespace loses its data or its address (docs/aws-deployment.md#change-sets)"
+    echo "  !! $replace stateful resources replaced or possibly replaced, $remove removed: they lose their"
+    echo "  !! data or their address (docs/aws-deployment.md#change-sets)"
   fi
 
   if [[ "$PLAN" == true ]]; then
@@ -515,8 +531,10 @@ apply_change_set() {
   fi
   if [[ "$YES" == false ]]; then
     [[ -t 0 ]] || fail "no terminal to confirm on: review with --plan, then pass --yes"
-    read -r -p "  Type $stack to run this change set: " answer
-    if [[ "$answer" != "$stack" ]]; then
+    local expected="$stack"
+    [[ $((replace + remove)) -eq 0 ]] || expected="replace $stack"
+    read -r -p "  Type '$expected' to run this change set: " answer
+    if [[ "$answer" != "$expected" ]]; then
       aws cloudformation delete-change-set --region "$REGION" --stack-name "$stack" --change-set-name "$name" >/dev/null
       fail "not confirmed; $stack not changed"
     fi
@@ -592,6 +610,28 @@ check_quota() {
   echo "  Fargate vCPU: up to $needed needed, quota $quota"
 }
 
+# Elastic IPs a first creation allocates: one per NAT gateway, and one per
+# NLB subnet not given a retained allocation. Addresses the account holds
+# already count against the same quota.
+check_eip_quota() {
+  local nat new quota held
+  case "$(config_value NatGateways)" in per-az) nat=2 ;; single) nat=1 ;; *) nat=0 ;; esac
+  new=$nat
+  [[ -n "$(config_value NlbAllocationIdA)" ]] || new=$((new + 1))
+  [[ -n "$(config_value NlbAllocationIdB)" ]] || new=$((new + 1))
+  held="$(aws ec2 describe-addresses --region "$REGION" --query 'length(Addresses)' --output text)"
+  if ! quota="$(aws service-quotas get-service-quota --region "$REGION" --service-code ec2 \
+    --quota-code "$EIP_QUOTA" --query Quota.Value --output text 2>/dev/null)"; then
+    echo "  warning: cannot read the Elastic IP quota; this creation allocates $new, $held are held" >&2
+    return 0
+  fi
+  [[ "$quota" =~ ^[0-9]+(\.[0-9]+)?$ && "$held" =~ ^[0-9]+$ ]] || fail "unexpected Elastic IP quota or count: $quota, $held"
+  if awk -v q="$quota" -v n=$((held + new)) 'BEGIN { exit !(n > q) }'; then
+    fail "this creation allocates $new Elastic IPs and the account holds $held, over the quota of $quota: reuse the retained NLB addresses (docs/runbook.md#keeping-the-nlb-addresses), release unused ones, or request an increase of $EIP_QUOTA"
+  fi
+  echo "  Elastic IPs: $new to allocate, $held held, quota $quota"
+}
+
 # The public address of an Elastic IP allocation the config names, which
 # the template cannot read itself; nothing for an empty one.
 reused_address() {
@@ -656,6 +696,15 @@ if [[ "$DRY_RUN" == false ]]; then
   check_quota
   if ! stack_exists "$STACK"; then
     check_names_free
+    check_eip_quota
+  else
+    # A deployment from another commit than the one running ships that
+    # commit's template too: say so before anything happens.
+    deployed="$(optional_output "$STACK" TemplateRevision)"
+    if [[ -n "$deployed" && "$deployed" != "$TEMPLATE_REVISION" ]]; then
+      echo "  warning: $STACK runs the template of $deployed; this run ships $TEMPLATE_REVISION's." >&2
+      echo "  warning: to change only the configuration or the image, check out $deployed first." >&2
+    fi
   fi
 fi
 
@@ -692,6 +741,11 @@ if image_exists "$PLATFORM_URI" "$IMAGE_TAG"; then
   [[ "$DRY_RUN" == true ]] || echo "  already in ECR"
 elif [[ "$SKIP_BUILD" == true ]]; then
   fail "$PLATFORM_URI:$IMAGE_TAG is not in ECR: a rollback deploys only images pushed before"
+elif [[ "$PLAN" == true ]]; then
+  # A plan pushes nothing: an immutable tag in ECR would outlive it. The
+  # change set shows the task definitions changing all the same.
+  echo "  not in ECR; a plan does not build it (a placeholder digest in the change set)"
+  DIGEST="sha256:$(printf '%064d' 0)"
 else
   build_platform "$PLATFORM_URI"
 fi
@@ -708,6 +762,9 @@ if image_exists "$ACS_URI" "$ACS_IMAGE_TAG"; then
   [[ "$DRY_RUN" == true ]] || echo "  already in ECR"
 elif [[ "$SKIP_BUILD" == true ]]; then
   fail "$ACS_URI:$ACS_IMAGE_TAG is not in ECR: a rollback deploys only images pushed before"
+elif [[ "$PLAN" == true ]]; then
+  echo "  not in ECR; a plan does not copy it"
+  DIGEST="$ACS_DIGEST"
 else
   copy_acs "$ACS_URI"
 fi
@@ -772,7 +829,7 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 if [[ "$PLAN" == true ]]; then
   echo
-  echo "Plan only: the images are in ECR; no stack was changed."
+  echo "Plan only: no stack was changed, and nothing was built or pushed."
   exit 0
 fi
 
@@ -786,6 +843,10 @@ Deployed $STACK: template $TEMPLATE_REVISION, platform $IMAGE_TAG, acs $ACS_IMAG
 Next (docs/aws-deployment.md#after-the-first-deployment): point the
 operator's names at NlbDnsName and AlbDnsName, and subscribe the on-call
 address to AlarmTopic.
-Roll back the image with the same --config:
-  scripts/deploy.sh --config $CONFIG --stack-name $STACK --region $REGION --skip-build --image-tag $PREVIOUS_IMAGE_TAG
 DONE
+if [[ "$PREVIOUS_IMAGE_TAG" == none ]]; then
+  echo "This is the stack's first image: there is no earlier one to roll back to."
+else
+  echo "Roll back the image with the same --config, from this commit:"
+  echo "  scripts/deploy.sh --config $CONFIG --stack-name $STACK --region $REGION --skip-build --image-tag $PREVIOUS_IMAGE_TAG"
+fi
