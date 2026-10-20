@@ -62,3 +62,17 @@ func TestSelectionTakesTheFirstRankedSCSCFAndLeavesTheAnswerAlone(t *testing.T) 
 		t.Errorf("the answer's capabilities became %v", caps.Optional)
 	}
 }
+
+// An optional capability the HSS lists three times counts once, so an
+// S-CSCF with two of the asked ones still ranks above one with a single
+// repeated one.
+func TestRepeatedOptionalCapabilitiesCountOnce(t *testing.T) {
+	list := newCandidates([]SCSCF{
+		{URI: mustURI("sip:x.rcs.local"), Optional: []uint32{2}},
+		{URI: mustURI("sip:y.rcs.local"), Optional: []uint32{4, 5}},
+	})
+	got := rank(list, &cx.ServerCapabilities{Optional: []uint32{2, 2, 2, 4, 5}})
+	if len(got) != 2 || got[0].Host != "y.rcs.local" {
+		t.Fatalf("rank = %v, want y first", got)
+	}
+}
