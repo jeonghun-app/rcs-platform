@@ -99,7 +99,11 @@ type Config struct {
 	// ConferenceHost is the host of the conference URIs the focus
 	// allocates, sip:chat-<random>@ConferenceHost; it must route to
 	// rcs-as. Required.
-	ConferenceHost  string
+	ConferenceHost string
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
+	// a SIP URI whose user part is a global number names that number, as
+	// the SIP layer and the engine take it (messaging.UserOf).
+	HomeDomain      string
 	MaxParticipants int
 	IdleTTL         time.Duration
 	// SenderRate bounds the messages one participant writes in one group;
@@ -260,7 +264,7 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 // Create makes a group of the creator, its chairman and already joined
 // (its INVITE is what creates it), and the invitees, invited.
 func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group, error) {
-	creator, ok := canonical(r.Creator)
+	creator, ok := s.canonical(r.Creator)
 	if !ok || !validText(r.Subject, MaxSubjectLength) || r.Conversation != "" && !messaging.ValidID(r.Conversation) {
 		return groupstore.Group{}, ErrInvalid
 	}
@@ -348,7 +352,7 @@ func (s *Service) canonicalInvitees(in []Invitee) ([]Invitee, int) {
 	seen := make(map[string]bool, len(in))
 	skipped, dropped := 0, 0
 	for _, x := range in {
-		id, ok := canonical(x.Identity)
+		id, ok := s.canonical(x.Identity)
 		if !ok {
 			skipped++
 			continue
@@ -374,7 +378,7 @@ func (s *Service) canonicalInvitees(in []Invitee) ([]Invitee, int) {
 // group (messaging.Engine.ParticipantLeft): a copy queued before it left
 // or was removed is then given up, not kept to invite it again.
 func (s *Service) Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
-	who, ok := canonical(who)
+	who, ok := s.canonical(who)
 	if !ok {
 		return groupstore.Group{}, ErrInvalid
 	}
@@ -429,7 +433,7 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 // left, the group ends. What is still queued for who from the group is
 // given up (messaging.Engine.ParticipantLeft).
 func (s *Service) Leave(ctx context.Context, uri, who string) error {
-	who, ok := canonical(who)
+	who, ok := s.canonical(who)
 	if !ok {
 		return ErrInvalid
 	}
@@ -485,7 +489,7 @@ func successor(g *groupstore.Group) int {
 // (messaging.Engine.ParticipantAdded). Only the chairman adds back someone
 // who was removed.
 func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error {
-	by, ok := canonical(by)
+	by, ok := s.canonical(by)
 	if !ok {
 		return ErrInvalid
 	}
@@ -560,8 +564,8 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 
 // Remove removes who from the group on behalf of by, its chairman.
 func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
-	by, ok := canonical(by)
-	who, ok2 := canonical(who)
+	by, ok := s.canonical(by)
+	who, ok2 := s.canonical(who)
 	if !ok || !ok2 {
 		return ErrInvalid
 	}
@@ -593,7 +597,7 @@ func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
 // first NOTIFY of a subscription by who, a current participant (RFC 4575
 // §4.6). Others get ErrNotParticipant: the roster says who talks to whom.
 func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, error) {
-	who, ok := canonical(who)
+	who, ok := s.canonical(who)
 	if !ok {
 		return nil, 0, ErrInvalid
 	}
@@ -749,7 +753,7 @@ func activeCount(g *groupstore.Group) int {
 // is-composing indication only to the joined ones, which have a session to
 // show it on. The sender's name is the one the roster holds.
 func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messaging.GroupKind) (messaging.Audience, error) {
-	sender, ok := canonical(sender)
+	sender, ok := s.canonical(sender)
 	if !ok {
 		return messaging.Audience{}, messaging.Reject(messaging.ReasonNotParticipant)
 	}
@@ -795,7 +799,7 @@ func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messa
 // Member implements messaging.GroupHandler: whether user is a current
 // participant, invited or joined.
 func (s *Service) Member(ctx context.Context, uri, user string) (bool, error) {
-	user, ok := canonical(user)
+	user, ok := s.canonical(user)
 	if !ok {
 		return false, nil
 	}

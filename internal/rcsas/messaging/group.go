@@ -11,7 +11,6 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
-	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -171,11 +170,14 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 		}
 	}
 	// The author is named as the group names it, so that its share, its
-	// sent records and the notifications for it meet its own legs.
-	sender, ok := identity.CanonicalIMPU(o.Sender)
+	// sent records and the notifications for it meet its own legs. The
+	// identity as asserted stays one the client may name itself by, as it
+	// was provisioned (namesSender).
+	sender, ok := UserOf(o.Sender, e.cfg.HomeDomain)
 	if !ok {
 		return reject(ReasonNotParticipant, nil)
 	}
+	o.Identities = append(slices.Clip(o.Identities), o.Sender)
 	o.Sender = sender
 	m, err := ParseMessage(o.CPIM, e.cfg.MaxMessageSize)
 	if err != nil {
