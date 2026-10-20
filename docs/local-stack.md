@@ -155,7 +155,10 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
     implicit registration set ([architecture](architecture.md#4-identities-and-the-home-domain)),
     managed by `acs`, with its own AKA keys (`PUT /aka`), which keeps the SQN
     on a re-run. A subscription that exists is put again, so a stack seeded
-    before gains identities added since;
+    before gains identities added since. The PUT resets every provisioned
+    field to the seed's: the identities, the service profile (back to
+    `hss`'s default, `rcs-default`), the charging information (none) and
+    `acs_managed`. The Cx state, the credentials and the SQN stay;
   - `acs`: the subscriber, with the overrides in [acs](#acs).
 
   The keys are `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC` for the client and
