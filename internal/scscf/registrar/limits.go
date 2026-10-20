@@ -2,10 +2,13 @@ package registrar
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/diameter"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -37,10 +40,16 @@ import (
 // It returns what it counted, which the caller gives back if the HSS does
 // not answer the challenge's MAR.
 func (g *Registrar) limitChallenges(ctx context.Context, r *register, now time.Time) ([]state.Attempt, *failure) {
+	return g.limitChallengesOf(ctx, r, now, true)
+}
+
+// limitChallengesOf is limitChallenges, counting in the flow's budget only
+// with byFlow.
+func (g *Registrar) limitChallengesOf(ctx context.Context, r *register, now time.Time, byFlow bool) ([]state.Attempt, *failure) {
 	window := g.cfg.ChallengeWindow
 	start := now.Truncate(window)
 	var counted []state.Attempt
-	if r.flow != "" {
+	if r.flow != "" && byFlow {
 		limit := g.cfg.FlowChallengeLimit
 		if r.registeredFlow {
 			limit = g.cfg.RegisteredFlowChallengeLimit
@@ -216,4 +225,14 @@ func overRegisteredFlow(reg *state.Registration, flow string, now time.Time) boo
 		}
 	}
 	return false
+}
+
+// neverSent reports whether a MAR certainly did not reach the HSS: no HSS
+// task was connected, or the connection was gone before the send. Only
+// then are its counts given back. A DIAMETER_TOO_BUSY, an HSS that waited
+// for the subscriber's lock, or an attempt that timed out, which the HSS
+// may have served, keeps them: giving those back would loosen the limit
+// exactly while the HSS is under the load it guards against (T12).
+func neverSent(err error) bool {
+	return errors.Is(err, cxclient.ErrNoPeer) || errors.Is(err, diameter.ErrPeerUnavailable)
 }

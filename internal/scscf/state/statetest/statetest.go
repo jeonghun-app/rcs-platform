@@ -400,6 +400,7 @@ func testNoAliasing(t *testing.T, a, _ state.Store, _ Options) {
 func Challenge(impi, nonce string, ttl time.Duration) *state.Challenge {
 	return &state.Challenge{
 		IMPI: impi, Nonce: nonce, IMPU: IMPU1, Issued: T0.Add(ttl - time.Minute), Expires: T0.Add(ttl),
+		Flow: state.FlowScope("flow-token"),
 		AKA: &state.AKAVector{
 			RAND: []byte("0123456789abcdef"), AUTN: []byte("fedcba9876543210"),
 			XRES: []byte("xres0123"), CK: []byte("ck-0123456789abc"), IK: []byte("ik-0123456789abc"),

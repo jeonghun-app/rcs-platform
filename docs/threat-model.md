@@ -317,9 +317,12 @@ per-flow budget and in the IMPI's shared one. Over a budget the answer is
 upstream proxy would read as the whole S-CSCF being out of service (§21.5.4)
 and the P-CSCF would retry at other I-CSCFs. A challenge allows one
 resynchronisation; an IMPI three per challenge lifetime, the registered UE's
-flow apart, and an AUTS that never got a vector gives its slot back; a
-challenge or resynchronisation the HSS did not answer gives back its
-challenge counts too. An
+flow apart. An AUTS that answers a challenge over the flow it was issued to
+counts in the shared budget only, the flow having paid for the challenge. A
+challenge or resynchronisation whose MAR never reached the HSS (no HSS task
+connected) gives its counts and slot back; one the HSS
+answered DIAMETER_TOO_BUSY, or that timed out, keeps them, so that the limit
+does not loosen while the HSS is loaded. An
 instance that saw a count over its limit refuses the rest of the window from
 memory, without a write. Metrics `registrar.challenge_limited` and
 `registrar.resync_limited` carry no identifier; the first is to be alarmed
@@ -336,12 +339,14 @@ on (`docs/scscf-state.md`).
   connection and so a new flow token, which matches no live binding. Until
   the flood stops it cannot refresh, its old flow being gone, and its
   binding runs out. Before authentication the S-CSCF cannot tell it from
-  the flood (a better signal is a follow-up issue); hence the alarm, and no
+  the flood (a better signal is #246); hence the alarm, and no
   P-CSCF deploy or drain while it is raised.
 - Likewise, forged AUTSs from other flows can use up the IMPI's three
   resynchronisations a lifetime, so a UE with no live binding whose SQN is
   out of step is refused until the flood stops; a registered UE on its flow
   resyncs on its own budget.
+- While the HSS is slow (busy answers, timeouts), a UE's MARs keep their
+  counts, so its flow's three a minute can run out sooner.
 - Windows are fixed: twice a budget gets through across an edge.
 - The shared count is observable: a client that probes it near a window's
   end learns from where it is refused whether others were challenged in that

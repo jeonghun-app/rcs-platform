@@ -136,6 +136,7 @@ type challengeDoc struct {
 	AKA     *akaDoc    `json:"aka,omitempty"`
 	Digest  *digestDoc `json:"digest,omitempty"`
 	Resync  bool       `json:"resync,omitempty"`
+	Flow    string     `json:"flow,omitempty"`
 }
 
 type akaDoc struct {
@@ -155,7 +156,7 @@ type digestDoc struct {
 }
 
 func encodeChallenge(c *state.Challenge) ([]byte, error) {
-	doc := challengeDoc{IMPU: c.IMPU, Issued: c.Issued.UTC(), Expires: c.Expires.UTC(), Resync: c.Resynchronised}
+	doc := challengeDoc{IMPU: c.IMPU, Issued: c.Issued.UTC(), Expires: c.Expires.UTC(), Resync: c.Resynchronised, Flow: c.Flow}
 	if v := c.AKA; v != nil {
 		doc.AKA = &akaDoc{RAND: v.RAND, AUTN: v.AUTN, XRES: v.XRES, CK: v.CK, IK: v.IK}
 	}
@@ -170,7 +171,7 @@ func decodeChallenge(b []byte, impi, nonce string) (*state.Challenge, error) {
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: challenge document does not decode", state.ErrInvalid)
 	}
-	c := &state.Challenge{IMPI: impi, Nonce: nonce, IMPU: doc.IMPU, Issued: doc.Issued, Expires: doc.Expires, Resynchronised: doc.Resync}
+	c := &state.Challenge{IMPI: impi, Nonce: nonce, IMPU: doc.IMPU, Issued: doc.Issued, Expires: doc.Expires, Resynchronised: doc.Resync, Flow: doc.Flow}
 	if v := doc.AKA; v != nil {
 		c.AKA = &state.AKAVector{RAND: v.RAND, AUTN: v.AUTN, XRES: v.XRES, CK: v.CK, IK: v.IK}
 	}

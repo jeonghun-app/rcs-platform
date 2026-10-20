@@ -58,7 +58,7 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 				g.count("registrar.auth_failed")
 				return refuse(403, "Authentication failed")
 			}
-			return g.resynchronise(ctx, r, sync)
+			return g.resynchronise(ctx, r, sync, ch)
 		}
 	} else {
 		err = g.verifyDigest(ctx, c, ch.Digest)
@@ -137,8 +137,8 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 	}
 	maa, err := g.cfg.HSS.Authenticate(ctx, &cx.MAR{UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1}, schemes)
 	f = g.challengeFrom(ctx, r, maa, err, stale, false)
-	if f.code == 480 {
-		// The HSS did not answer: the challenge came to nothing.
+	if neverSent(err) {
+		// The MAR never reached the HSS: the challenge came to nothing.
 		g.giveBack(ctx, counted...)
 	}
 	return f
@@ -150,9 +150,15 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 // An AUTS is unauthenticated (digest.SyncFailure), so the IMPI also has a
 // budget of them (limitResyncs), used only by one that reaches the HSS and
 // gets a vector back.
-func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure) *failure {
+//
+// An AUTS over the flow its challenge was issued to is that client's own
+// next step, already paid for in the flow's budget by the challenge: it
+// counts in the IMPI's shared budget only, so that a resynchronisation does
+// not take two of a flow's three challenges a minute.
+func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure, ch *state.Challenge) *failure {
 	now := g.cfg.Now()
-	counted, f := g.limitChallenges(ctx, r, now)
+	sameFlow := r.flow != "" && ch.Flow == state.FlowScope(r.flow)
+	counted, f := g.limitChallengesOf(ctx, r, now, !sameFlow)
 	if f != nil {
 		return f
 	}
@@ -168,13 +174,10 @@ func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest
 		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: auth},
 	})
 	f = g.challengeFrom(ctx, r, maa, err, false, true)
-	if f.code != 401 {
-		// Nothing came of it: the slot is the UE's again, and the
-		// challenge too if the HSS did not answer.
-		g.giveBack(ctx, slot)
-		if f.code == 480 {
-			g.giveBack(ctx, counted...)
-		}
+	if neverSent(err) {
+		// The MAR never reached the HSS: the slot and the challenge are
+		// the UE's again.
+		g.giveBack(ctx, append(counted, slot)...)
 	}
 	return f
 }
@@ -271,6 +274,9 @@ func (g *Registrar) digestChallenges(ctx context.Context, r *register, d *cx.Dig
 func (g *Registrar) store(ctx context.Context, r *register, nonce string, c *state.Challenge) error {
 	now := g.cfg.Now()
 	c.IMPI, c.Nonce, c.IMPU = r.impi, nonce, r.impu
+	if r.flow != "" {
+		c.Flow = state.FlowScope(r.flow)
+	}
 	c.Issued, c.Expires = now, now.Add(g.cfg.ChallengeLifetime)
 	return g.cfg.Store.AddChallenge(ctx, c)
 }

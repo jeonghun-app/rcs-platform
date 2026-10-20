@@ -43,8 +43,9 @@ const (
 	DefaultChallengeLimit    = 10
 	DefaultChallengeWindow   = time.Minute
 	// A flow's budget is small: a UE's first registration needs one
-	// challenge, two with a stale nonce or a resynchronisation, and one
-	// the HSS did not answer is given back. A registered UE's flow, while
+	// challenge, or two with a stale nonce; an AUTS over the same flow
+	// costs it nothing more, and a challenge whose MAR never reached the
+	// HSS is given back. A registered UE's flow, while
 	// it stays on it, gets more, for the refreshes it shares with no one; a
 	// reconnection comes over a new flow and counts as any other.
 	DefaultFlowChallengeLimit           = 3

@@ -570,6 +570,10 @@ type Challenge struct {
 	// after a resynchronisation (TS 33.102 §6.3.5): a further synchronisation
 	// failure for it is not sent to the HSS again.
 	Resynchronised bool
+	// Flow is the FlowScope of the P-CSCF flow the challenged REGISTER came
+	// over, "" without one: an AUTS that answers the challenge over the same
+	// flow is the same client's (registrar limits).
+	Flow string
 }
 
 // challengeRedacted is what a Challenge prints and logs.
@@ -664,6 +668,9 @@ func (c *Challenge) Validate() error {
 	if c.Resynchronised && c.AKA == nil {
 		return fmt.Errorf("%w: only an AKA challenge is resynchronised", ErrInvalid)
 	}
+	if c.Flow != "" && !validScope(c.Flow) {
+		return fmt.Errorf("%w: a challenge's flow is a FlowScope", ErrInvalid)
+	}
 	return nil
 }
 
@@ -745,7 +752,7 @@ func ValidAttempt(a Attempt, n int64, expires time.Time) error {
 	if a.Kind != AttemptChallenge && a.Kind != AttemptResync {
 		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
 	}
-	if a.Scope != "" && (len(a.Scope) != 32 || strings.Trim(a.Scope, "0123456789abcdef") != "") {
+	if a.Scope != "" && !validScope(a.Scope) {
 		return fmt.Errorf("%w: an attempt scope is a FlowScope", ErrInvalid)
 	}
 	if n != 1 && n != -1 {
@@ -869,4 +876,9 @@ func textOK(vs ...string) bool {
 		}
 	}
 	return true
+}
+
+// validScope reports whether s is what FlowScope returns.
+func validScope(s string) bool {
+	return len(s) == 32 && strings.Trim(s, "0123456789abcdef") == ""
 }

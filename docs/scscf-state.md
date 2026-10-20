@@ -96,8 +96,10 @@ additionally sealed (below).
   MARs: a Digest subscriber's costs two MARs when the AKA one gets 5006. A
   challenge allows one resynchronisation (#196), and an IMPI three per
   challenge lifetime (`ResyncLimit`), the registered UE's flow apart; one the
-  HSS does not answer gives its slot back, and its challenge counts as a
-  challenge the HSS did not answer does. Windows are fixed, so up to twice
+  MAR never reaches the HSS gives its slot back, and its challenge counts
+  as such a challenge does; a busy answer or a timeout keeps them. An AUTS
+  over the flow its challenge was issued to counts in the shared budget
+  only. Windows are fixed, so up to twice
   a budget passes across an edge, and an instance whose clock is off counts
   into its own idea of the window. Every instance counts into the same items,
   beside the IMPI's challenges, which the table's TTL removes; an instance

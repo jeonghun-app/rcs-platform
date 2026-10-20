@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
@@ -554,4 +556,161 @@ func TestAChallengeTheHSSDidNotAnswerGivesItsCountsBack(t *testing.T) {
 	e.hss.unavailable = false
 	e.hss.mu.Unlock()
 	wantStatus(t, g.Register(bg, u.request(600, ""), upstream), 401)
+}
+
+// busyHSS answers every MAR DIAMETER_TOO_BUSY, as an HSS whose subscriber
+// lock stayed busy until the deadline does.
+type busyHSS struct{ *fakeHSS }
+
+func (b busyHSS) answer() *cx.MAA {
+	return &cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(diameter.ResultTooBusy)}}
+}
+
+func (b busyHSS) MAR(context.Context, *cx.MAR) (*cx.MAA, error) { return b.answer(), nil }
+
+func (b busyHSS) Authenticate(context.Context, *cx.MAR, []string) (*cx.MAA, error) {
+	return b.answer(), nil
+}
+
+// TestAChallengeABusyHSSAnsweredKeepsItsCounts: the MAR reached the HSS,
+// which served it as far as its lock let it; giving the counts back would
+// turn "ten a window" into "ten at a time" exactly while the HSS is loaded
+// (code review on #223). Only a MAR that never left gives them back.
+func TestAChallengeABusyHSSAnsweredKeepsItsCounts(t *testing.T) {
+	e := newEnv(t)
+	busy := busyHSS{e.hss}
+	g := e.instance(1, func(c *Config) { c.HSS = busy })
+	e.akaUser(impi1, impu1)
+	for i := range DefaultChallengeLimit {
+		wantStatus(t, g.Register(bg, attacker(t, impi1, impu1, i).request(600, ""), upstream), 480)
+	}
+	healthy := e.instance(2)
+	wantStatus(t, healthy.Register(bg, attacker(t, impi1, impu1, 99).request(600, ""), upstream), 500)
+}
+
+// overloadedHSS is the HSS under a flood for one subscriber: every MAR
+// reaches it, and the answer is DIAMETER_TOO_BUSY (it waited too long for
+// the subscriber's lock) or a timeout (it did the work, the answer came too
+// late). From QA's probes on #223.
+type overloadedHSS struct {
+	*fakeHSS
+	mu      sync.Mutex
+	mode    string // "busy", "timeout", "resync-timeout", "resync-refused", ""
+	reached int
+}
+
+func (o *overloadedHSS) fail(ctx context.Context, r *cx.MAR) (*cx.MAA, error, bool) {
+	o.mu.Lock()
+	mode := o.mode
+	resync := len(r.AuthDataItem.Authorization) > 0
+	switch {
+	case mode == "resync-timeout" && resync:
+		o.mode = ""
+		mode = "timeout"
+	case mode == "resync-refused" && resync:
+		mode = "refused"
+	case mode == "resync-timeout", mode == "resync-refused":
+		mode = ""
+	}
+	if mode != "" {
+		o.reached++
+	}
+	o.mu.Unlock()
+	switch mode {
+	case "busy":
+		return nil, &cxclient.ProtocolError{Command: "MAR", Result: cx.Result{Code: diameter.ResultTooBusy}}, true
+	case "timeout":
+		_, _ = o.fakeHSS.MAR(ctx, r)
+		return nil, diameter.ErrTimeout, true
+	case "refused":
+		return &cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(diameter.ResultAuthorizationRejected)}}, nil, true
+	}
+	return nil, nil, false
+}
+
+func (o *overloadedHSS) MAR(ctx context.Context, r *cx.MAR) (*cx.MAA, error) {
+	if maa, err, done := o.fail(ctx, r); done {
+		return maa, err
+	}
+	return o.fakeHSS.MAR(ctx, r)
+}
+
+func (o *overloadedHSS) Authenticate(ctx context.Context, r *cx.MAR, schemes []string) (*cx.MAA, error) {
+	m := *r
+	m.AuthDataItem.Scheme = cx.SchemeDigestAKAv1MD5
+	if maa, err, done := o.fail(ctx, &m); done {
+		return maa, err
+	}
+	return o.fakeHSS.Authenticate(ctx, r, schemes)
+}
+
+// TestAFloodOnAnOverloadedHSSStillGetsOnlyItsBudget: while the HSS answers
+// TOO_BUSY or times out, every MAR has reached it, so none gives its counts
+// back, and a window still lets ChallengeLimit through (QA's block on
+// #223).
+func TestAFloodOnAnOverloadedHSSStillGetsOnlyItsBudget(t *testing.T) {
+	for _, mode := range []string{"busy", "timeout"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newEnv(t)
+			o := &overloadedHSS{fakeHSS: e.hss, mode: mode}
+			gs := []*Registrar{e.instance(1, func(c *Config) { c.HSS = o }), e.instance(2, func(c *Config) { c.HSS = o })}
+			e.akaUser(impi1, impu1)
+			for i := range 200 {
+				gs[i%2].Register(bg, attacker(t, impi1, impu1, i).request(600, ""), upstream)
+			}
+			if o.reached != DefaultChallengeLimit {
+				t.Errorf("%d MARs reached the HSS in one window, want %d", o.reached, DefaultChallengeLimit)
+			}
+		})
+	}
+}
+
+// TestAChallengeTheHSSRefusedKeepsItsCounts: a refusal is an answer, so the
+// challenge was spent (QA's surviving mutant on #223).
+func TestAChallengeTheHSSRefusedKeepsItsCounts(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	ev := attacker(t, impi1, impu1, 1) // impi1 is not provisioned: user unknown
+	for range DefaultFlowChallengeLimit {
+		wantStatus(t, g.Register(bg, ev.request(600, ""), upstream), 403)
+	}
+	wantStatus(t, g.Register(bg, ev.request(600, ""), upstream), 500)
+}
+
+// TestAResyncTheHSSRefusedKeepsItsSlot: the HSS answered the AUTS's MAR
+// with a refusal; the slot stays used (QA's surviving mutant on #223).
+func TestAResyncTheHSSRefusedKeepsItsSlot(t *testing.T) {
+	e := newEnv(t)
+	o := &overloadedHSS{fakeHSS: e.hss, mode: "resync-refused"}
+	m := &counts{}
+	g := e.instance(1, roomForResyncs, func(c *Config) { c.HSS, c.Metrics = o, m })
+	u := e.akaUser(impi1, impu1)
+	for i := range DefaultResyncLimit {
+		ch := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+		if code := g.Register(bg, u.request(600, resyncOf(u, ch)), upstream).StatusCode; code != 403 {
+			t.Fatalf("refused resync %d: %d", i+1, code)
+		}
+	}
+	reached := o.reached
+	ch := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, u.request(600, resyncOf(u, ch)), upstream), 403)
+	if o.reached != reached || m.get("registrar.resync_limited") != 1 {
+		t.Errorf("the fourth resync reached the HSS (%d) or was not limited (%d)", o.reached-reached, m.get("registrar.resync_limited"))
+	}
+}
+
+// TestAResyncOverTheChallengesFlowCostsTheFlowNothing: an AUTS answering a
+// challenge issued to the same flow counts only in the shared budget, so a
+// UE whose resynchronisation timed out at the HSS, which keeps its counts,
+// still fits the flow's three a minute when it tries again.
+func TestAResyncOverTheChallengesFlowCostsTheFlowNothing(t *testing.T) {
+	e := newEnv(t)
+	o := &overloadedHSS{fakeHSS: e.hss, mode: "resync-timeout"}
+	g := e.instance(1, func(c *Config) { c.HSS = o })
+	u := e.akaUser(impi1, impu1)
+	first := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	g.Register(bg, u.request(600, resyncOf(u, first)), upstream)
+	e.clock.advance(30 * time.Second)
+	second := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, u.request(600, resyncOf(u, second)), upstream), 401)
 }
