@@ -159,7 +159,9 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	if len(t1) > 0 {
 		cfg.T1 = t1[0]
 	}
-	c.layer = transaction.New(tr, c, cfg)
+	if c.layer, err = transaction.New(tr, c, cfg); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { c.layer.Close(); tr.Close() })
 	if c.Addr, err = tr.Listen(transport.ListenerConfig{
 		Network: transport.TCP, Addr: "127.0.0.1:0", ClientFacing: true,
