@@ -141,6 +141,105 @@ func TestClientPathThatNeverArrivesIsRefused(t *testing.T) {
 	}
 }
 
+func TestAClientRefusedAfterThePathWaitKeepsItsConnection(t *testing.T) {
+	// The client's keep-alive interval is shorter than the wait, but while
+	// its binding SEND is unanswered it sends nothing more. Each keep-alive
+	// would name the session again: another lookup and another wait, or,
+	// for a binding already gone, another unknown session toward
+	// MaxFailedBinds, which closes the connection before the client reads
+	// its 481 (#204).
+	r := newRig(t, 1, func(o *relayOptions) { o.PathWait = 30 * time.Millisecond })
+	b := r.allocate(map[string]any{"core_path": []string{r.as.uri("ask33p")}})
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := msrp.NewActiveConn(nc, msrp.Config{Clock: r.clock, KeepAliveInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := &client{conn: conn, nc: nc}
+	opened := make(chan error, 1)
+	go func() {
+		_, err := c.open(t, b.clientPath, newRecorder())
+		opened <- err
+	}()
+	r.clock.waitTimer(t, 25*time.Millisecond)
+	r.clock.Advance(25 * time.Millisecond)
+	r.clock.waitTimer(t, 5*time.Millisecond)
+	r.clock.Advance(5 * time.Millisecond)
+	if err := <-opened; statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("client Open = %v, want 481", err)
+	}
+	// Answered after anything sent before it.
+	if _, err := c.openAs(t, "msrp://client.invalid:7777/an0th3rse55ion;tcp", "msrps://"+publicHost+":2856/n0such5e55ion;tcp", newRecorder()); statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("second Open = %v, want 481", err)
+	}
+	if got := r.metrics.count(mClientPrefix + "Refused.481"); got != 2 {
+		t.Fatalf("Client.Refused.481 = %d, want 2", got)
+	}
+	if c.conn.Err() != nil {
+		t.Fatalf("connection ended: %v", c.conn.Err())
+	}
+}
+
+func TestAClientNamingAReleasedBindingReads481AndKeepsItsConnection(t *testing.T) {
+	// QA on #217, the release step of #204: the lookup of a released
+	// binding is slow, and the client's keep-alive interval is short.
+	// The client sends its binding SEND alone, so the relay counts one
+	// unknown session, not four, and does not close the connection
+	// (MaxFailedBinds) with the 481 still queued.
+	slow := &flakyStore{block: make(chan struct{}), blocked: make(chan struct{}, 16)}
+	r := newRig(t, 1, wrapStore(slow))
+	b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{r.as.uri("asrel")}})
+	if code, _ := r.call("DELETE", "/v1/bindings/"+b.id, nil); code != 204 {
+		t.Fatalf("DELETE = %d", code)
+	}
+	nc, err := net.Dial("tcp", r.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := msrp.NewActiveConn(nc, msrp.Config{Clock: r.clock, KeepAliveInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	c := &client{conn: conn, nc: nc}
+	opened := make(chan error, 1)
+	go func() {
+		_, err := c.open(t, b.clientPath, newRecorder())
+		opened <- err
+	}()
+	<-slow.blocked // the relay is looking the released binding up
+	// Six keep-alive intervals pass meanwhile. The pauses only give a
+	// keep-alive, if one were sent, time to reach the relay; the test
+	// passes without them.
+	for range 6 {
+		r.clock.Advance(5 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Later lookups, if any, are not held.
+	slow.mu.Lock()
+	block := slow.block
+	slow.block = nil
+	slow.mu.Unlock()
+	close(block)
+	if err := <-opened; statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("client Open = %v, want 481", err)
+	}
+	// Answered after anything sent before it.
+	if _, err := c.openAs(t, "msrp://client.invalid:7777/an0th3rse55ion;tcp", "msrps://"+publicHost+":2856/n0such5e55ion;tcp", newRecorder()); statusOf(err) != msrp.StatusNoSession {
+		t.Fatalf("second Open = %v, want 481", err)
+	}
+	if got := r.metrics.count(mClientPrefix + "Refused.481"); got != 2 {
+		t.Fatalf("Client.Refused.481 = %d, want 2", got)
+	}
+	if c.conn.Err() != nil {
+		t.Fatalf("connection ended: %v", c.conn.Err())
+	}
+}
+
 func TestSecondConnectionForAClaimedBindingIsRefusedWith403(t *testing.T) {
 	r := newRig(t, 1)
 	b, client, _, _, asH := r.bridged(0, 60)
