@@ -19,12 +19,22 @@ import (
 // addresses come from flags, credentials from the environment only.
 type sipFlags struct {
 	proxy, transport, serverName, domain, realm, impi, auth, instance string
+	// peerIMPI is the far end's private identity, for the scenarios with
+	// two clients; without it they fail at their first step.
+	peerIMPI string
+	// credEnv names the variables the credentials come from: the
+	// client's, or for the peer its own (sipua.PeerEnv).
+	credEnv sipua.CredentialEnv
 }
 
 // envIMPI is where the IMPI comes from when -sip-impi is not given. It is
 // an identity, not a secret, but it is the IMSI-based one, so a deployment
 // keeps it with the credentials.
 const envIMPI = "RCS_SIM_SIP_IMPI"
+
+// envPeerIMPI is the far end's, for the scenarios with two clients. The
+// peer has credentials of its own, in sipua.PeerEnv's variables.
+const envPeerIMPI = "RCS_SIM_SIP_PEER_IMPI"
 
 // sipConfig builds the SIP client's configuration, with self as the IMPU.
 // The errors name flags and variables, never their values: an IMPI is an
@@ -59,7 +69,7 @@ func sipConfig(ctx context.Context, f sipFlags, self string, lookup func(string)
 		}
 	}
 	if cfg.IMPU, err = sip.ParseURI(self); err != nil || !cfg.IMPU.IsSIP() {
-		return nil, errors.New("-self must be a SIP URI to register")
+		return nil, errors.New("-self and -peer must be SIP URIs to register")
 	}
 	cfg.Domain = f.domain
 	if cfg.Domain == "" {
@@ -91,11 +101,15 @@ func sipConfig(ctx context.Context, f sipFlags, self string, lookup func(string)
 		return nil, errors.New("SIP needs -sip-impi or " + envIMPI)
 	}
 	getenv := func(k string) string { v, _ := lookup(k); return v }
+	vars := f.credEnv
+	if vars == (sipua.CredentialEnv{}) {
+		vars = sipua.SelfEnv
+	}
 	switch strings.ToLower(f.auth) {
 	case "aka":
-		cfg.Credentials, err = sipua.AKACredentialsFromEnv(impi, getenv)
+		cfg.Credentials, err = sipua.AKACredentialsFromEnv(impi, vars, getenv)
 	case "digest":
-		cfg.Credentials, err = sipua.DigestCredentialsFromEnv(impi, getenv)
+		cfg.Credentials, err = sipua.DigestCredentialsFromEnv(impi, vars, getenv)
 	default:
 		return nil, errors.New("-sip-auth must be aka or digest")
 	}

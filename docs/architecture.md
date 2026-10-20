@@ -153,6 +153,11 @@ a library package under `internal/`.
   the exact `pcscf` instance and flow holding the client's connection.
 - Unregistered terminating user: `scscf` evaluates unregistered-state iFC so the
   `rcs-as` can store-and-forward; without a matching AS it answers 480.
+- Requests `rcs-as` sends itself (stored messages delivered later, network
+  notifications, terminating chat legs): `rcs-as` → `scscf` as terminating
+  requests, without `orig` and with `P-Served-User: <user>;sescase=term`, which
+  the default profile's triggers exclude (docs/hss.md), so they reach the
+  user's contacts rather than `rcs-as` again (#137).
 
 ### 5.3 Capability discovery
 

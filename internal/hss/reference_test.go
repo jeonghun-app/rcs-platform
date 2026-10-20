@@ -66,6 +66,49 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	}
 }
 
+// A request rcs-as sends itself carries a P-Served-User (servedUserHeader),
+// and no trigger sends it back to rcs-as, in any session case; without the
+// header the same request still goes there. A delivery that came back to
+// rcs-as would be stored and sent again for ever (#137).
+func TestDefaultProfileSkipsRCSASForARequestItServed(t *testing.T) {
+	set, err := ifc.Compile(DefaultRCSProfile(DefaultProfileID, asURI).Criteria)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := *referenceByMethod(t, "INVITE")
+	options.method = "OPTIONS"
+	for _, r := range []*refRequest{referenceByMethod(t, "INVITE"), referenceByMethod(t, "MESSAGE"), referenceByMethod(t, "REGISTER"), &options} {
+		for _, name := range []string{"P-Served-User", "p-served-user"} {
+			served := *r
+			served.headers = append(slices.Clone(r.headers),
+				ifc.HeaderField{Name: name, Value: "<" + refPeer + ">;sescase=term;regstate=reg"})
+			for _, ctx := range referenceContexts {
+				matched, err := set.Match(&served, ctx)
+				if err != nil {
+					t.Fatalf("%s: %v", r.method, err)
+				}
+				if len(matched) != 0 {
+					t.Errorf("%s with %s in case %d goes to %s", r.method, name, ctx.Case, matched[0].ApplicationServer.ServerName)
+				}
+				if plain, err := set.Match(r, ctx); err != nil || len(plain) != 1 {
+					t.Errorf("%s without it in case %d: %d criteria, %v", r.method, ctx.Case, len(plain), err)
+				}
+			}
+		}
+	}
+}
+
+func referenceByMethod(t *testing.T, method string) *refRequest {
+	t.Helper()
+	for _, r := range referenceRequests() {
+		if r.method == method {
+			return r
+		}
+	}
+	t.Fatalf("no reference %s", method)
+	return nil
+}
+
 func TestReferenceRegisterHasA2KBContact(t *testing.T) {
 	for _, r := range referenceRequests() {
 		if r.method != "REGISTER" {
