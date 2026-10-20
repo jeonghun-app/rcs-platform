@@ -31,8 +31,10 @@ type IMSCore struct {
 	Domain string
 	// Rewrite, when set before any request, changes each request the core
 	// forwards or sends, NOTIFYs included, as a faulty network element
-	// would. It runs on the reading goroutine of the sender's connection,
-	// so it must not block.
+	// would. It must not block: it runs on the reading goroutine of the
+	// sender's connection for a request it forwards, and on the notifier's
+	// goroutine for a NOTIFY, so two calls may run at once and a Rewrite
+	// that keeps state must lock it.
 	Rewrite func(*sip.Request)
 	// Offline, when set before any request, is what the core does with a
 	// request to an IMPU that has no binding.
@@ -54,7 +56,10 @@ type IMSCore struct {
 	// contacts are each IMPU's registered Contact URI, and subs the reg
 	// event subscriptions to it (RFC 3680), by aorKey.
 	contacts map[string]string
-	subs     map[string][]*regSub
+	// events are the event that last changed each IMPU's contact, which a
+	// NOTIFY that does not change it writes again (RFC 3680 §4.7.1).
+	events map[string]string
+	subs   map[string][]*regSub
 	// notifies sends NOTIFYs one at a time, in the order they were made,
 	// off the reading goroutine.
 	notifies chan func()
@@ -69,6 +74,18 @@ type regSub struct {
 	flow                    transport.FlowID
 	cseq                    uint32
 	version                 uint64
+	// until is when the subscription expires, as granted: a NOTIFY says
+	// what is left of it and never more (RFC 6665 §4.1.3).
+	until time.Time
+}
+
+// left is what remains of s, in whole seconds, rounded up; c.mu is held.
+func (s *regSub) left() uint64 {
+	d := time.Until(s.until)
+	if d <= 0 {
+		return 0
+	}
+	return uint64((d + time.Second - 1) / time.Second)
 }
 
 // Offline is what IMSCore does with a request to an unregistered IMPU.
@@ -120,7 +137,7 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	c := &IMSCore{
 		Domain: domain, t: t, ds: ds, users: users,
 		bindings: map[string]transport.FlowID{}, instances: map[string]string{}, stored: map[string][]*sip.Request{},
-		contacts: map[string]string{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
+		contacts: map[string]string{}, events: map[string]string{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
 	}
 	go func() {
 		for {
@@ -171,18 +188,28 @@ func (c *IMSCore) Instance(impu string) string {
 
 // Expire drops impu's binding, as its expiry would: requests to it then
 // get what Offline says until it registers again, and its reg event
-// subscribers are told the contact expired (RFC 3680 §5.3.2), which ends
+// subscribers are told the contact expired (RFC 3680 §4.7.1), which ends
 // their subscriptions.
-func (c *IMSCore) Expire(impu string) {
+func (c *IMSCore) Expire(impu string) { c.end(impu, "expired") }
+
+// Deregister ends impu's registration from the network side, as the
+// S-CSCF does on the HSS's Registration-Termination-Request (TS 24.229
+// §5.4.1.5): its contact terminates with event, "deactivated" (the client
+// may register again) or "rejected" (it may not), and so do the
+// subscriptions to its reg event.
+func (c *IMSCore) Deregister(impu, event string) { c.end(impu, event) }
+
+func (c *IMSCore) end(impu, event string) {
 	key := keyOf(impu)
 	c.mu.Lock()
 	_, bound := c.bindings[key]
 	contact := c.contacts[key]
 	delete(c.bindings, key)
 	delete(c.contacts, key)
+	delete(c.events, key)
 	c.mu.Unlock()
 	if bound {
-		c.registrationChanged(regChange{impu: impu, key: key, contact: contact, event: "expired"})
+		c.registrationChanged(regChange{key: key, contact: contact, event: event})
 	}
 }
 
@@ -256,7 +283,7 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 	expires, _ := req.Header.Expires()
 	impu, key := to.URI.String(), aorKey(to.URI)
 	res, _ := sip.NewResponse(req, 200, "", tag)
-	change := &regChange{impu: impu, key: key, event: "registered"}
+	change := &regChange{key: key, event: "registered"}
 	var held []*sip.Request
 	c.mu.Lock()
 	if _, was := c.bindings[key]; was {
@@ -266,7 +293,9 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		delete(c.bindings, key)
 		change.contact, change.event = c.contacts[key], "unregistered"
 		delete(c.contacts, key)
+		delete(c.events, key)
 	} else {
+		c.events[key] = change.event
 		c.bindings[key] = tx.Source().Flow
 		if contacts, err := req.Header.Contact(); err == nil && len(contacts) > 0 {
 			c.contacts[key] = contacts[0].URI.String()
@@ -302,27 +331,43 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 	return res, change, deliver
 }
 
-// regChange is what a REGISTER changed in an IMPU's registration.
+// regChange is what changed an IMPU's registration, by its aorKey: its
+// contact, and the event that changed it (RFC 3680 §4.7.1).
 type regChange struct {
-	impu, key, contact, event string
+	key, contact, event string
 }
 
 // registrationChanged notifies every subscriber of the IMPU's reg event
-// (RFC 3680 §5.2); a de-registration ends the subscriptions.
+// (RFC 3680 §4.7). One that ends the registration, the IMPU's only one
+// here, ends the subscriptions (TS 24.229 §5.4.2.1.2): with no reason after
+// the user's de-registration, "noresource" after an expiry, and as the
+// network ended it, "deactivated" or "rejected" (RFC 6665 §4.1.3).
 func (c *IMSCore) registrationChanged(ch regChange) {
-	gone := ch.event == "unregistered" || ch.event == "expired"
+	gone, terminated := true, "terminated"
+	switch ch.event {
+	case "unregistered":
+	case "expired":
+		terminated += ";reason=noresource"
+	case "deactivated", "rejected":
+		terminated += ";reason=" + ch.event
+	default:
+		gone = false
+	}
 	c.mu.Lock()
 	subs := c.subs[ch.key]
+	states := make([]string, len(subs))
+	for i, s := range subs {
+		states[i] = "active;expires=" + strconv.FormatUint(s.left(), 10)
+		if gone {
+			states[i] = terminated
+		}
+	}
 	if gone {
 		delete(c.subs, ch.key)
 	}
 	c.mu.Unlock()
-	state := "active;expires=600000"
-	if gone {
-		state = "terminated;reason=noresource"
-	}
-	for _, s := range subs {
-		c.notify(s, state, ch.contact, ch.event, !gone)
+	for i, s := range subs {
+		c.notify(s, states[i], ch.contact, ch.event, !gone)
 	}
 }
 
@@ -343,7 +388,7 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 	callID := req.Header.Get("Call-ID")
 	expires, err := req.Header.Expires()
 	if err != nil {
-		// RFC 3680 §6.4's default.
+		// RFC 3680 §4.4's default.
 		expires = 3761
 	}
 	c.mu.Lock()
@@ -357,6 +402,9 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 		s = &regSub{impu: impu, callID: callID, from: req.Header.Get("From"), tag: tag, target: contacts[0].URI, flow: tx.Source().Flow}
 		c.subs[key] = append(c.subs[key], s)
 	}
+	if s != nil {
+		s.until = time.Now().Add(time.Duration(expires) * time.Second)
+	}
 	if s != nil && expires == 0 {
 		subs := c.subs[key][:0]
 		for _, old := range c.subs[key] {
@@ -367,6 +415,7 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 		c.subs[key] = subs
 	}
 	contact, registered := c.contacts[key]
+	event := c.events[key]
 	c.mu.Unlock()
 	if s == nil {
 		res, _ := sip.NewResponse(req, 481, "", tag)
@@ -377,11 +426,14 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 	res.Header.Add("Contact", "<sip:core.invalid:5060;transport=tcp>")
 	res.Header.Add("Expires", strconv.FormatUint(uint64(expires), 10))
 	c.respond(tx, res)
+	// The contact as it stands, with the event that made it so (RFC 3680
+	// §4.7.1, TS 24.229 §5.4.2.1.2 NOTE 10): the subscription's end does
+	// not change the registration.
 	switch {
 	case expires == 0:
-		c.notify(s, "terminated;reason=timeout", contact, "unregistered", registered)
+		c.notify(s, "terminated;reason=timeout", contact, event, registered)
 	default:
-		c.notify(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, "registered", registered)
+		c.notify(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered)
 	}
 }
 

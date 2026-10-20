@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
@@ -23,9 +24,10 @@ const RegEventExpires = 600000
 // queueLength bounds the notifications a Subscription holds unread.
 const queueLength = 64
 
-// RegInfo is the body of a reg event NOTIFY (RFC 3680 §5.3).
+// RegInfo is the body of a reg event NOTIFY (RFC 3680 §5).
 type RegInfo struct {
-	// Version rises by one in each NOTIFY of a subscription (§5.3.1).
+	// Version starts at 0 and rises by one in each NOTIFY of a subscription
+	// (§5.1, §5.2).
 	Version uint64
 	// State is "full" or "partial".
 	State         string
@@ -42,7 +44,7 @@ type RegInfoRegistration struct {
 
 // RegInfoContact is one contact of a registration. Event says what changed
 // it: "registered", "created", "refreshed", "shortened", "expired",
-// "deactivated", "probation", "unregistered" or "rejected" (§5.3.2).
+// "deactivated", "probation", "unregistered" or "rejected" (§4.7.1).
 type RegInfoContact struct {
 	ID, URI string
 	// State is "active" or "terminated".
@@ -51,24 +53,38 @@ type RegInfoContact struct {
 }
 
 // Contact returns the contact whose URI equals uri (RFC 3261 §19.1.4), if
-// the registration of aor lists it: the notifier writes the URI back, in
-// its own parameter order and case.
+// the registration of aor lists it (see Own).
 func (r *RegInfo) Contact(aor, uri string) (RegInfoContact, bool) {
+	_, c, ok := r.Own(aor, uri)
+	return c, ok
+}
+
+// Own returns the registration of aor and its contact at uri, if the
+// document lists them. The notifier writes the contact URI back in its own
+// parameter order and case, so URIs compare as RFC 3261 §19.1.4 has it.
+// AORs compare in the form every service compares a public identity in
+// (identity.CanonicalIMPU): a notifier's aor without user=phone, or with its
+// host in another case, is still the client's.
+func (r *RegInfo) Own(aor, uri string) (RegInfoRegistration, RegInfoContact, bool) {
 	want, err := sip.ParseURI(uri)
 	if err != nil {
-		return RegInfoContact{}, false
+		return RegInfoRegistration{}, RegInfoContact{}, false
+	}
+	wantAOR, ok := identity.CanonicalIMPU(aor)
+	if !ok {
+		return RegInfoRegistration{}, RegInfoContact{}, false
 	}
 	for _, reg := range r.Registrations {
-		if reg.AOR != aor {
+		if got, ok := identity.CanonicalIMPU(reg.AOR); !ok || got != wantAOR {
 			continue
 		}
 		for _, c := range reg.Contacts {
 			if got, err := sip.ParseURI(c.URI); err == nil && got.Equal(want) {
-				return c, true
+				return reg, c, true
 			}
 		}
 	}
-	return RegInfoContact{}, false
+	return RegInfoRegistration{}, RegInfoContact{}, false
 }
 
 // xmlRegInfo is RegInfo as RFC 3680 §5.4 writes it.

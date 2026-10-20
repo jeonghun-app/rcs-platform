@@ -48,6 +48,11 @@ func sipStack(t *testing.T) (scenario.Config, *simtest.IMSCore) {
 	}
 	cfg.SIP = client(self.URI, selfIMPI, "self-password", "urn:uuid:00000000-0000-4000-8000-000000000001")
 	cfg.SIPPeer = client(peer.URI, peerIMPI, "peer-password", "urn:uuid:00000000-0000-4000-8000-000000000002")
+	// As an operator's DELETE through the HSS API would (#135 AC 3).
+	cfg.Deregister = func(_ context.Context, impu sip.URI) error {
+		core.Deregister(impu.String(), "deactivated")
+		return nil
+	}
 	return cfg, core
 }
 
@@ -345,6 +350,24 @@ func TestAWaitThatTimesOutReportsWhatItSkipped(t *testing.T) {
 	ok, results := runAll(t, cfg, "pager-message")
 	last := results[len(results)-1]
 	if ok || last.Step != "receive" || last.Detail["skipped"] != 1 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestANotificationWaitThatTimesOutReportsWhatItSkipped(t *testing.T) {
+	// QA on #216: the delivery notification's wait says what it skipped
+	// too. Its own Message-ID rewritten, the notification looks like an
+	// earlier run's and is skipped.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 2 * time.Second
+	core.Rewrite = func(r *sip.Request) {
+		if strings.Contains(string(r.Body), "imdn+xml") {
+			r.Body = []byte(regexp.MustCompile(`imdn\.Message-ID: \S+`).ReplaceAllString(string(r.Body), "imdn.Message-ID: 0ld0notification"))
+		}
+	}
+	ok, results := runAll(t, cfg, "pager-message")
+	last := results[len(results)-1]
+	if ok || last.Step != "delivery-notification" || last.Detail["skipped"] != 1 {
 		t.Fatalf("results %+v", results)
 	}
 }

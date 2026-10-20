@@ -23,6 +23,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
@@ -65,6 +66,11 @@ type Config struct {
 	// leaves the SIP scenarios out, and naming one fails it at its first
 	// step.
 	SIP, SIPPeer *sipua.Config
+	// Deregister has the network end the registration of impu, as an
+	// operator's DELETE through the HSS API does (an RTR to the S-CSCF, TS
+	// 24.229 §5.4.1.5), for reg-event's network-deregister step. Nil fails
+	// that step.
+	Deregister func(ctx context.Context, impu sip.URI) error
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
