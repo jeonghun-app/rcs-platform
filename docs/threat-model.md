@@ -46,12 +46,15 @@ separate from its core listener; core SIP ports admit only platform services
 **Status:** planned (#16, Phase 7 infrastructure).
 **Residual risk (accepted, #208, narrowed in #221):** `pcscf` checks
 in-dialog requests against its own Record-Route values only, keeping no
-dialog state. The core-facing value binds the flow token to the dialog with
-a MAC over the token and the Call-ID, under a key drawn at every start, and
-a request from the core inside a dialog reaches the flow only with the
-value of that dialog. The peer of a call has seen that value, so it can go
-on sending requests in the same dialog after the call has ended, for as
-long as the flow lives, but not reach the client in any other. `pcscf` fixes only the first hop of a
+dialog state. The core-facing value binds the flow token to the Call-ID with
+a MAC under a key drawn at every start, and a request from the core inside
+a dialog reaches the flow only with the value written for its Call-ID. The
+binding covers the Call-ID and not the tags: `pcscf` writes the value into
+the request that sets up the dialog, before the callee has chosen its tag,
+and a value it rewrote in the response would differ between the two route
+sets unless it kept state. The peer of a call has seen that value, so it can
+go on sending requests with the same Call-ID after the call has ended, for
+as long as the flow lives, but not reach the client with any other. `pcscf` fixes only the first hop of a
 client's in-dialog request, to `scscf`; whether such requests then reach
 `rcs-as`, which records itself in the dialog, depends on `scscf`, which
 checks it as an acceptance criterion of
