@@ -109,10 +109,16 @@ func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing
 	if got := ob.RecordRoute[0].String(); !strings.HasPrefix(got, "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob;icid=") || ob.RecordRoute[1].URI.Params.Has("ob") {
 		t.Errorf("Record-Route %q, %q with an ob Contact", got, ob.RecordRoute[1].String())
 	}
-	// Each request is charged on its own.
+	// Each request is charged on its own. A standalone one sets up no
+	// dialog, so it is not recorded (§5.2.6.3.7).
 	r = clientRequest(t, initialText("MESSAGE"), "FLOW-A")
 	if again := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); again == first || !icidValue.MatchString(again) {
 		t.Errorf("second P-Charging-Vector %q after %q", again, first)
+	}
+	for method, recorded := range map[string]bool{"MESSAGE": false, "OPTIONS": false, "PUBLISH": false, "INVITE": true, "SUBSCRIBE": true, "REFER": true} {
+		if d := p.Route(context.Background(), clientRequest(t, initialText(method), "FLOW-A")); (d.RecordRoute != nil) != recorded {
+			t.Errorf("%s: Record-Route %v", method, d.RecordRoute)
+		}
 	}
 }
 

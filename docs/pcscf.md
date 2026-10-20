@@ -190,12 +190,15 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
     `user` dropped.
 - **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request
   and `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.6.3.3 7)).
-- **Record-Route.** `pcscf` records two values (RFC 5658), topmost first:
+- **Record-Route.** For a request that sets up a dialog, INVITE, SUBSCRIBE
+  or REFER, `pcscf` records two values (RFC 5658), topmost first:
   `<sip:<flow token>@<task address>:<core port>;transport=tcp;lr;icid=<icid>>`,
   with `ob` when the client's Contact has it, for the core, and
   `<sip:<PCSCF_PUBLIC_HOST>:<PCSCF_PUBLIC_PORT>;transport=tls;lr>` (`tcp`
   with `tcp`) for the client. The dialog's later requests come back through
-  this task on both sides.
+  this task on both sides. A standalone request, such as MESSAGE or
+  OPTIONS, is not recorded (§5.2.6.3.7), so capability discovery and pager
+  messages never carry the flow token.
 - **Limit.** A client address may send `PCSCF_INITIAL_RATE` requests a
   second outside or inside a dialog, with a burst of `PCSCF_INITIAL_BURST`,
   beside its REGISTERs. Past that it gets 503 with `Retry-After: 1`.
@@ -233,7 +236,9 @@ model T2).
 
 No core hop of any request, REGISTER and initial requests included, ever
 resolves to this task's own address, however it is written, and every form
-of that address in a Route is taken as `pcscf`'s own.
+of that address in a Route is taken as `pcscf`'s own. The check is on the
+address, whatever the port, so on a dev stack on one host set
+`PCSCF_CORE_HOST` to an address distinct from `icscf`'s and `scscf`'s.
 
 ## Settings
 
