@@ -724,6 +724,38 @@ func TestAnEvaluationFailsWhenItsWorkBudgetIsSpent(t *testing.T) {
 	}
 }
 
+// A realistic RCS trigger ends with a negated "P-Served-User present"
+// SPT: a request rcs-as sends itself, which carries the header, is not sent
+// back to it in any session case, while the same request without it is
+// (#137). The header name compares without regard to case.
+func TestARealisticRCSProfileSkipsTheASForARequestWithPServedUser(t *testing.T) {
+	var cs []FilterCriteria
+	for i, method := range []string{"INVITE", "MESSAGE"} {
+		cs = append(cs, criteria(i, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{
+			{Groups: []int{0}, Condition: Method(method)},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Accept-Contact", Content: `3gpp-service\.ims\.icsi\.oma\.cpm\.`}},
+			{Groups: []int{1}, Condition: SIPHeader{Header: "Contact", Content: `3gpp-service\.ims\.icsi\.oma\.cpm\.`}},
+			{ConditionNegated: true, Groups: []int{2}, Condition: SIPHeader{Header: "P-Served-User"}},
+		}}))
+	}
+	s := compile(t, cs...)
+	tags := `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`
+	for _, method := range []string{"INVITE", "MESSAGE"} {
+		for _, sc := range []SessionCase{Originating, TerminatingRegistered, TerminatingUnregistered, OriginatingUnregistered} {
+			plain := req(method, impu, HeaderField{"Accept-Contact", tags})
+			if !matches(t, s, plain, Context{Case: sc}) {
+				t.Errorf("%s in case %d without P-Served-User skips the AS", method, sc)
+			}
+			for _, name := range []string{"P-Served-User", "p-served-user"} {
+				served := req(method, impu, HeaderField{"Accept-Contact", tags}, HeaderField{name, "<" + impu + ">;sescase=term;regstate=reg"})
+				if matches(t, s, served, Context{Case: sc}) {
+					t.Errorf("%s in case %d with %s goes to the AS", method, sc, name)
+				}
+			}
+		}
+	}
+}
+
 // TestAnOrdinaryProfileSpendsLittleOfTheBudget evaluates the kind of RCS
 // profile an HSS provisions against a realistic chat INVITE: the error path
 // is for abuse, so ordinary traffic must stay far from it.
