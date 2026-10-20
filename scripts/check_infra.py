@@ -252,8 +252,32 @@ def check_plain_listeners(template: dict) -> list[str]:
     problems = []
     for name, listener in resources(template, "AWS::ElasticLoadBalancingV2::Listener").items():
         protocol = listener.get("Properties", {}).get("Protocol")
+        if not isinstance(protocol, str):
+            problems.append(f"{name}: the protocol must be literal for this check to see it")
+            continue
         if protocol in PLAIN_PROTOCOLS and not dev_only(template, listener.get("Condition")):
             problems.append(f"{name}: a plain {protocol} listener outside dev (ADR 0003)")
+    # With a certificate, the ALB's HTTP listener only redirects, and no rule
+    # forwards on it; it forwards only without one (dev, see the Rules).
+    for name, listener in resources(template, "AWS::ElasticLoadBalancingV2::Listener").items():
+        props = listener.get("Properties", {})
+        if props.get("Protocol") != "HTTP":
+            continue
+        for action in props.get("DefaultActions", []):
+            if not (isinstance(action, dict) and "Fn::If" in action):
+                problems.append(f"{name}: the HTTP listener acts the same with a certificate; it must redirect then")
+                continue
+            condition, with_certificate, _ = action["Fn::If"]
+            if condition != "HasAlbCertificate" or with_certificate.get("Type") != "redirect":
+                problems.append(f"{name}: with a certificate the HTTP listener must redirect to HTTPS")
+        for rule_name, rule in resources(template, "AWS::ElasticLoadBalancingV2::ListenerRule").items():
+            arn = rule.get("Properties", {}).get("ListenerArn")
+            if logical_id(arn) == name:
+                problems.append(f"{rule_name}: forwards on the HTTP listener even with a certificate")
+            elif isinstance(arn, dict) and "Fn::If" in arn:
+                condition, with_certificate, _ = arn["Fn::If"]
+                if condition != "HasAlbCertificate" or logical_id(with_certificate) == name:
+                    problems.append(f"{rule_name}: forwards on the HTTP listener even with a certificate")
     nlb = resources(template, "AWS::EC2::SecurityGroup").get("NlbSecurityGroup", {})
     for rule, condition in inline_rules(nlb.get("Properties", {}).get("SecurityGroupIngress", [])):
         if rule.get("FromPort") in PLAIN_PORTS and not dev_only(template, condition):

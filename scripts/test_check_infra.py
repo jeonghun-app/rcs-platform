@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import pathlib
+import re
 import unittest
 
 import check_infra
@@ -222,8 +223,40 @@ class PlatformTemplate(TemplateCase):
         mappings = self.template["Resources"]["Nlb"]["Properties"]["SubnetMappings"]
         self.assertEqual(len(mappings), 2)
         for m in mappings:
-            eip = m["AllocationId"]["Fn::GetAtt"][0]
+            eip = m["AllocationId"]["Fn::If"][1]["Fn::GetAtt"][0]
             self.assertEqual(self.template["Resources"][eip].get("DeletionPolicy"), "Retain")
+
+    def test_the_http_listener_forwarding_with_a_certificate_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HttpListener"]["Properties"]["DefaultActions"] = [
+            {"Type": "forward", "TargetGroupArn": {"Ref": "AcsTargetGroup"}}]
+        self.assertProblem(t, "HttpListener: the HTTP listener acts the same with a certificate")
+
+    def test_a_rule_on_the_http_listener_with_a_certificate_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AcsConfigRule"]["Properties"]["ListenerArn"] = {"Ref": "HttpListener"}
+        self.assertProblem(t, "AcsConfigRule: forwards on the HTTP listener even with a certificate")
+
+    def test_a_conditional_listener_protocol_is_refused_not_crashed(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["MsrpTlsListener"]["Properties"]["Protocol"] = {"Fn::If": ["IsDev", "TCP", "TLS"]}
+        self.assertProblem(t, "MsrpTlsListener: the protocol must be literal")
+
+    def test_a_task_role_with_managed_policies_is_refused(self):
+        t = self.changed(SvcTask=task_definition(), SvcTaskRole=role("dynamodb:GetItem"))
+        t["Resources"]["SvcTaskRole"]["Properties"]["ManagedPolicyArns"] = ["arn:aws:iam::aws:policy/SecretsManagerReadWrite"]
+        self.assertProblem(t, "SvcTaskRole: a task role has managed policies")
+
+    def test_new_nlb_addresses_are_retained_and_given_ones_reused(self):
+        for name in ("NlbAddressA", "NlbAddressB"):
+            self.assertEqual(self.template["Resources"][name].get("DeletionPolicy"), "Retain")
+        mapping = self.template["Resources"]["Nlb"]["Properties"]["SubnetMappings"][0]["AllocationId"]
+        self.assertEqual(mapping, {"Fn::If": ["NewNlbAddressA", {"Fn::GetAtt": ["NlbAddressA", "AllocationId"]},
+                                              {"Ref": "NlbAllocationIdA"}]})
+        pattern = self.template["Parameters"]["NlbAllocationIdA"]["AllowedPattern"]
+        self.assertTrue(re.fullmatch(pattern, "eipalloc-0abc123"))
+        self.assertTrue(re.fullmatch(pattern, ""))
+        self.assertFalse(re.fullmatch(pattern, "203.0.113.7"))
 
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)

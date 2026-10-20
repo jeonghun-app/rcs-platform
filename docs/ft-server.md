@@ -459,7 +459,9 @@ an alarm with a runbook section of the same name (handbook 06 §5):
   task: lookups, uploads per user, downloads. Only an AWS WAF rate-based rule in
   front of the ALB limits requests per client across tasks. That covers
   unauthenticated requests, which can cause credential lookups, and downloads,
-  which need no authentication by default.
+  which need no authentication by default. The stack starts the rule in count
+  mode (`WafRateAction=count`, docs/aws-deployment.md): until it is switched to
+  block, only the per-task limits hold a client back.
 - **Shutdown.** On SIGTERM, running requests get `FT_DRAIN_TIMEOUT` to finish.
   Uploads still running then have their connections closed. Their handlers keep
   the durable parts, release their leases and return before the process exits,
