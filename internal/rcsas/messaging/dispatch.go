@@ -509,9 +509,19 @@ func (e *Engine) viaLeg(ctx context.Context, l *Leg, m store.Message) outcome {
 
 // sendClaimed delivers a claimed message on l and records the outcome.
 func (e *Engine) sendClaimed(ctx context.Context, l *Leg, m store.Message) outcome {
+	return e.sendClaimedThen(ctx, l, m, nil)
+}
+
+// sendClaimedThen is sendClaimed with over, when not nil, run as soon as
+// the attempt is over and before its outcome is recorded: m is still
+// claimed then, so no pass sees it in between.
+func (e *Engine) sendClaimedThen(ctx context.Context, l *Leg, m store.Message, over func()) outcome {
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	code, err := l.send(ctx, m.CPIM)
 	cancel()
+	if over != nil {
+		over()
+	}
 	switch {
 	case err == nil && code == msrp.StatusOK:
 		e.metrics.Count("delivery.msrp", 1)

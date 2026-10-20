@@ -398,6 +398,9 @@ func TestNoSecondLargeModeSessionIsAskedForWhileOneDelivers(t *testing.T) {
 			if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
 				t.Fatal(err)
 			}
+			// QA on #284: once the attempt is under way, so that a mark
+			// deleted as it starts is caught too.
+			waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
 			r.e.invite(t.Context(), ms[0])
 			select {
 			case again := <-r.d.invites:
@@ -451,6 +454,91 @@ func TestALargeModeLegsEndLeavesANewerInvitationsMark(t *testing.T) {
 	case again := <-r.d.invites:
 		t.Fatalf("the newer invitation's mark went with the leg: %+v", again)
 	default:
+	}
+}
+
+// releaseSpy is a store that calls onRelease as a message is released.
+type releaseSpy struct {
+	store.Store
+	onRelease func(id string)
+}
+
+func (s releaseSpy) Release(ctx context.Context, recipient, id, owner string) error {
+	s.onRelease(id)
+	return s.Store.Release(ctx, recipient, id, owner)
+}
+
+// QA on #284: a failed attempt's mark goes before its message is back in
+// the queue, so a pass that reads it there asks for its next session at
+// once, rather than finding the mark and waiting for the retry timer.
+func TestAFailedLargeModeAttemptsMarkGoesBeforeItsRelease(t *testing.T) {
+	var r *rig
+	var marked atomic.Int32
+	spy := releaseSpy{Store: store.NewMemory(), onRelease: func(id string) {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		for k := range r.e.invites {
+			if k.id == id {
+				marked.Add(1)
+			}
+		}
+	}}
+	r = newRigWith(t, Config{PagerLimit: 600}, spy, newFakeClock())
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	_ = leg.Close() // the client never binds: the attempt fails
+	waitDone(t, leg.Finished())
+	if r.queued(t, bob) != 1 || marked.Load() != 0 {
+		t.Fatalf("queued %d, the mark still there at the release %d times", r.queued(t, bob), marked.Load())
+	}
+}
+
+// #294 (QA's reproduction): a full pass during a large-mode attempt finds
+// the message claimed, the queue empty, and lets the recipient go with no
+// retry timer. The attempt then fails and releases the message, which
+// must still get its next session: on the retry timer, not only on the
+// next event for the recipient.
+func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600, InviteTimeout: time.Minute})
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	r.e.kickEvent(bob) // any full pass during the attempt
+	waitFor(t, "idle", r.idle)
+	_ = leg.Close() // the client never binds
+	waitDone(t, leg.Finished())
+	if n := r.queued(t, bob); n != 1 {
+		t.Fatalf("queued = %d, want the released message", n)
+	}
+	waitFor(t, "the retry timer", func() bool { return r.clock.armed(DefaultRetryInterval) })
+	r.clock.Advance(DefaultRetryInterval)
+	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+		t.Fatalf("invitation %+v", got)
 	}
 }
 
