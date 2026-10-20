@@ -244,6 +244,8 @@ type UA struct {
 	// answeredCalls are the merge keys of incoming INVITEs answered in the
 	// last 64*T1 (see answered).
 	answeredCalls map[string]struct{}
+	// subs are the reg event subscriptions, by subscriptionKey.
+	subs map[string]*Subscription
 	// invites are the INVITEs sent in the last 64*T1, by Call-ID and From
 	// tag, for 2xx that arrive after their transaction.
 	invites map[string]*invite
@@ -295,6 +297,7 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		dialogs:       map[string]*Dialog{},
 		calls:         map[*transaction.ServerTransaction]*IncomingCall{},
 		answeredCalls: map[string]struct{}{},
+		subs:          map[string]*Subscription{},
 		invites:       map[string]*invite{},
 		dst:           transport.Destination{Network: cfg.Network, Addr: cfg.Proxy, ServerName: cfg.ServerName},
 	}
@@ -920,6 +923,10 @@ type tu struct{ ua *UA }
 
 func (t tu) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
+	if s := t.ua.subscriptionOf(req); s != nil {
+		s.receive(tx)
+		return
+	}
 	if d := t.ua.dialogOf(req); d != nil {
 		d.receive(tx)
 		return
