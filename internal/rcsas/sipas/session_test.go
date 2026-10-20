@@ -496,8 +496,9 @@ func TestAnInviteLeftRingingIsCancelled(t *testing.T) {
 	}
 }
 
-// Each 2xx is acknowledged, a retransmission too, and one from a second
-// fork is ended (RFC 3261 §13.2.2.4); the first one's session stands.
+// Each 2xx is acknowledged, a retransmission too, and a second fork's
+// dialog is ended once, however often its 2xx comes (RFC 3261 §13.2.2.4);
+// the first one's session stands.
 func TestA2xxFromAnotherForkIsEnded(t *testing.T) {
 	r := newChatRig(t, messaging.Config{})
 	r.core.setReply(func(req *sip.Request) []*sip.Response {
@@ -510,14 +511,14 @@ func TestA2xxFromAnotherForkIsEnded(t *testing.T) {
 		to, _ := second.Header.To()
 		to.Params.Set("tag", "bob2")
 		_ = second.Header.Set("To", to.String())
-		// The first 2xx comes twice: its ACK was taken as lost.
-		return []*sip.Response{first, first, second}
+		// Each 2xx comes twice: its ACK was taken as lost.
+		return []*sip.Response{first, first, second, second}
 	})
 	if err := r.a.srv.Invite(t.Context(), invitation()); err != nil {
 		t.Fatal(err)
 	}
 	var tags []string
-	for len(tags) < 4 {
+	for len(tags) < 5 {
 		req := r.core.next(t)
 		if req.Method == "INVITE" {
 			continue
@@ -526,7 +527,7 @@ func TestA2xxFromAnotherForkIsEnded(t *testing.T) {
 		tags = append(tags, req.Method+" "+to.Tag())
 	}
 	slices.Sort(tags)
-	if want := []string{"ACK bob1", "ACK bob1", "ACK bob2", "BYE bob2"}; !slices.Equal(tags, want) {
+	if want := []string{"ACK bob1", "ACK bob1", "ACK bob2", "ACK bob2", "BYE bob2"}; !slices.Equal(tags, want) {
 		t.Fatalf("sent %v, want %v", tags, want)
 	}
 	// The first session stands until rcs-as ends it: its BYE is the next
