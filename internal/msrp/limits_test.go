@@ -783,6 +783,7 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	// One more stalled session than the connection has slots for at the
 	// default window, so the windows alone would use up every slot.
 	stalled := DefaultMaxInFlight/DefaultSendWindow + 1
+	before := runtime.NumGoroutine()
 	ours, theirs := net.Pipe()
 	c, err := NewActiveConn(ours, Config{Clock: newFakeClock()})
 	if err != nil {
@@ -791,10 +792,10 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 	chunks := bindOnlyPeer(t, theirs)
 	open := func(i int) *Session {
-		// No handler: when the connection closes at cleanup, each chunk
-		// still in flight is reported, thousands of them. A recorder,
-		// which nobody reads after the test, would hold a goroutine for
-		// each for the rest of the process (#251).
+		// No handler: when the connection closes, each chunk still in
+		// flight is reported, thousands of them. A recorder, which nobody
+		// reads after the test, would hold a goroutine per session for the
+		// rest of the process (#251, #258).
 		s := newTestSession(t, fmt.Sprintf("msrp://relay.internal:2855/st%05d;tcp", i), fmt.Sprintf("msrp://as.example.org:9000/st%05d;tcp", i), nil)
 		if err := c.Open(context.Background(), s); err != nil {
 			t.Fatal(err)
@@ -827,6 +828,16 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 		}
 	case <-time.After(hangGuard):
 		t.Fatal("a session with an empty window waited for the stalled ones")
+	}
+	// QA on #257: the connection closed, the test leaves no goroutine
+	// behind, so a leak cannot hide behind a larger stack dump.
+	_ = c.Close()
+	deadline = time.Now().Add(hangGuard)
+	for runtime.NumGoroutine() > before+2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if left := runtime.NumGoroutine() - before; left > 2 {
+		t.Fatalf("%d goroutines left behind after the connection closed", left)
 	}
 }
 
