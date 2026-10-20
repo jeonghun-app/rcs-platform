@@ -113,6 +113,11 @@ behaves as a device behind NAT does:
 - Requests from the network arrive over that same connection.
 - After registration, every request carries the route set of TS 24.229
   §5.1.2A.1.1: pcscf, then the `Service-Route` of the last 2xx to REGISTER.
+  It also carries the IMPU as `P-Preferred-Identity`, for pcscf to check and
+  assert (RFC 3325 §9.2).
+- The REGISTER Contact names the RCS services the client registers for
+  (RCC.07): the ICSIs of 1-to-1 chat and of standalone messaging, and the IARI
+  of file transfer over HTTP.
 
 It answers the registrar's challenge:
 
@@ -145,11 +150,32 @@ The credentials come from the environment only: K and OPc as 32 hex digits in
 `RCS_SIM_SIP_PASSWORD`. Only made-up keys or the TS 35.208 test sets belong
 there. They print as a placeholder in every form.
 
+It sets up 1-to-1 chats as the caller (RFC 3261 §12–15):
+
+- The INVITE has a Contact with the chat ICSI and `ob`, so the dialog's
+  requests come back over the flow (RFC 5626 §4.3). The same ICSI is in
+  `Accept-Contact` and `P-Preferred-Service`, and the SDP offer is the body.
+- A 2xx makes the dialog. The client ACKs it along the route set, which is the
+  2xx's `Record-Route` reversed. A 2xx sent again is ACKed again, also after
+  the transaction has ended. A 2xx from another branch of a fork is ACKed and
+  ended with BYE.
+- Other final responses (486, 480, ...) are the result, with no dialog.
+- Giving up on a pending INVITE sends CANCEL, but only after a provisional
+  response (RFC 3261 §9.1). A 2xx that crosses the CANCEL is ACKed and ended
+  with BYE.
+- In the dialog, the client sends BYE. It answers the network's BYE with 200
+  and refuses a re-INVITE with 488, since a chat needs no other session. A
+  request with a lower CSeq gets 500. Without `OnRequest`, a request for a
+  dialog it does not know, or no longer knows, gets 481; with it, such a
+  request goes to `OnRequest`.
+
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an
-in-process stand-in for pcscf and the registrar, which authenticates with
-`internal/sip/digest`'s server side and Milenage vectors. INVITE dialogs come
-next.
+in-process stand-in for pcscf, the registrar and the far end. The registrar
+authenticates with `internal/sip/digest`'s server side and Milenage vectors.
+
+`-sip-proxy` turns the client's configuration on (see [Running it](#running-it)).
+The SIP scenarios will use it once pcscf and scscf exist.
 
 ## Running it
 
@@ -177,11 +203,22 @@ rcs-sim -ft-upload-url http://127.0.0.1:8081/ft \
 | `-idle-wait` | 0 (skip) | stay quiet this long in the chat scenarios, to see keep-alives go out; set it above `-msrp-keepalive`. If no keep-alive has gone out by then, the step waits for one until `-step-timeout`, since a loaded host can run the timer late. Only a SEND the client starts counts; the step's `bytes_while_quiet` (reported on failure too) is everything it wrote meanwhile |
 | `-self`, `-peer` | `+15550100001`, `+15550100002` in the MCC 001 test domain | the CPIM addresses of the two ends |
 | `-step-timeout` | 30s | bound on each step; must be longer than `-idle-wait`, which the keep-alive step spends within it |
+| `-sip-proxy` | none | pcscf's `host:port`; configures the SIP client. A host name is resolved at start |
+| `-sip-transport` | `tcp` | `tcp` or `tls` to pcscf |
+| `-sip-server-name` | `-sip-proxy`'s host | the name pcscf's certificate is verified for, and the host of the first Route; TLS to an address needs it |
+| `-sip-domain` | `-self`'s host | home network domain, REGISTER's Request-URI |
+| `-sip-realm` | `-sip-domain` | the S-CSCF's Digest realm, the only one whose challenges are answered; set it when the HSS's `HSS_IMS_REALM` differs from the domain |
+| `-sip-impi` | `RCS_SIM_SIP_IMPI` | private user identity, the Digest username |
+| `-sip-auth` | `aka` | `aka` takes K and OPc from `RCS_SIM_AKA_K` and `RCS_SIM_AKA_OPC`; `digest` takes the password from `RCS_SIM_SIP_PASSWORD` |
+| `-sip-instance` | a new `urn:uuid` | `+sip.instance` (RFC 5626 §4.1) |
 | `-list`, `-version` | | print the scenarios or the version |
 
 Secrets are read from the environment only, never from flags, because flags
-are visible in process listings: `RCS_SIM_FT_PASSWORD` and
-`RCS_SIM_RELAY_TOKEN`. The user name may also come from `RCS_SIM_FT_USER`.
+are visible in process listings: `RCS_SIM_FT_PASSWORD`,
+`RCS_SIM_RELAY_TOKEN`, `RCS_SIM_AKA_K`, `RCS_SIM_AKA_OPC` and
+`RCS_SIM_SIP_PASSWORD`. The FT user name may also come from
+`RCS_SIM_FT_USER`, and the IMPI from `RCS_SIM_SIP_IMPI`. A usage error names
+the flag or variable, never its value.
 
 ### Output
 
