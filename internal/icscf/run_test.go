@@ -314,7 +314,7 @@ func TestARegisterGoesToTheSCSCFTheHSSNames(t *testing.T) {
 	hss.answer = func(uint32) (cx.Result, string) {
 		return cx.ExperimentalResult(cx.SubsequentRegistration), scscf.uri()
 	}
-	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
 	r.waitReady(t)
 	res := r.send(t, "REGISTER", "sip:"+home,
 		"From: <"+impu1+">;tag=f1", "To: <"+impu1+">",
@@ -334,7 +334,7 @@ func TestATerminatingRequestGoesToTheSCSCFAsItsRoute(t *testing.T) {
 	hss := startHSS(t)
 	scscf := startSCSCF(t)
 	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
-	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
 	r.waitReady(t)
 	res := r.send(t, "MESSAGE", tel1,
 		"From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
@@ -451,7 +451,7 @@ func TestARouteNamingIcscfByItsServiceNameIsItsOwn(t *testing.T) {
 	hss := startHSS(t)
 	scscf := startSCSCF(t)
 	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
-	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
 	r.waitReady(t)
 	route := fmt.Sprintf("Route: <sip:icscf.rcs.local:%d;transport=tcp;lr>", r.core.Port())
 	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">", route)
@@ -477,5 +477,25 @@ func TestIcscfKnowsItselfByItsAddressAndItsServiceName(t *testing.T) {
 	}
 	if want := []string{"sip:10.0.3.9:5060;lr", "sip:icscf.rcs.local:5060;lr"}; strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("Self = %v, want %v", got, want)
+	}
+}
+
+// Review of #274: the HSS names the S-CSCF without the transport and port
+// ICSCF_SCSCF gives (sip:scscf.<namespace> in production); the request
+// still reaches it on the configured TCP port.
+func TestANameWithoutTransportOrPortReachesTheConfiguredSCSCF(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	hss.answer = func(uint32) (cx.Result, string) {
+		return cx.ExperimentalResult(cx.SubsequentRegistration), "sip:127.0.0.1"
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
+	r.waitReady(t)
+	res := r.send(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">")
+	if res.StatusCode != 200 {
+		t.Fatalf("REGISTER answered %d", res.StatusCode)
+	}
+	if got := scscf.next(t); got.URI.String() != scscf.uri() {
+		t.Errorf("the S-CSCF got %s, want the configured %s", got.URI.String(), scscf.uri())
 	}
 }
