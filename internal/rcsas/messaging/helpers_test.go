@@ -178,6 +178,10 @@ type fakeDeliverer struct {
 	pagers   chan Delivery
 	invites  chan Invitation
 	overflow atomic.Int64
+	// discardInvites, set by drainInvites, keeps invitations off the
+	// channel for a test that does not look at them: a channel drained
+	// alongside can fall behind a burst and count as overflow.
+	discardInvites atomic.Bool
 }
 
 func newFakeDeliverer() *fakeDeliverer {
@@ -210,6 +214,9 @@ func (f *fakeDeliverer) Invite(_ context.Context, inv Invitation) error {
 	var err error
 	if h != nil {
 		err = h(inv)
+	}
+	if f.discardInvites.Load() {
+		return err
 	}
 	select {
 	case f.invites <- inv:
@@ -399,10 +406,18 @@ type client struct {
 	got     chan *msrp.Message
 	reports chan msrp.Report
 	refuse  error
+	// answer, when set, is what HandleMessage returns instead of refuse;
+	// one that blocks is a client that takes the bytes and processes
+	// nothing.
+	answer func(*msrp.Message) error
+	conn   *msrp.Conn
 }
 
 func (c *client) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	c.got <- m
+	if c.answer != nil {
+		return c.answer(m)
+	}
 	return c.refuse
 }
 
@@ -450,6 +465,13 @@ var clientSeq int
 // as msrp-relay would.
 func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client) {
 	t.Helper()
+	return r.connectAnswering(t, l, p, nil)
+}
+
+// connectAnswering is connect with a client whose answers are answer's
+// (client.answer).
+func (r *rig) connectAnswering(t *testing.T, l net.Listener, p LegParams, answer func(*msrp.Message) error) (*Leg, *client) {
+	t.Helper()
 	local := clientURI()
 	p.Remote = []msrp.URI{local}
 	if p.Direction == 0 {
@@ -460,7 +482,7 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = leg.Close() })
-	c := r.dial(t, l, local, leg.Local())
+	c := r.dialAnswering(t, l, local, leg.Local(), answer)
 	return leg, c
 }
 
@@ -468,8 +490,13 @@ func (r *rig) connect(t *testing.T, l net.Listener, p LegParams) (*Leg, *client)
 // msrp-relay does once the client has connected to it.
 func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client {
 	t.Helper()
+	return r.dialAnswering(t, l, local, remote, nil)
+}
+
+func (r *rig) dialAnswering(t *testing.T, l net.Listener, local, remote msrp.URI, answer func(*msrp.Message) error) *client {
+	t.Helper()
 	var err error
-	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64)}
+	c := &client{got: make(chan *msrp.Message, 64), reports: make(chan msrp.Report, 64), answer: answer}
 	c.session, err = msrp.NewSession(msrp.SessionConfig{Local: local, Remote: []msrp.URI{remote}, Handler: c})
 	if err != nil {
 		t.Fatal(err)
@@ -483,6 +510,7 @@ func (r *rig) dial(t *testing.T, l net.Listener, local, remote msrp.URI) *client
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
+	c.conn = conn
 	// Bounded, so a rig that never accepts fails here rather than at go
 	// test's timeout (#143).
 	ctx, cancel := context.WithTimeout(context.Background(), hangGuard)
