@@ -114,9 +114,9 @@ func TestDocumentsOutsideRFC3680AreRefused(t *testing.T) {
 		"a repeated registration":         doc(reg("") + reg("")),
 		"a repeated aor":                  doc(reg("") + `<registration aor="sip:+15550100001@IMS.mnc001.mcc001.3gppnetwork.org;x=1" id="b" state="terminated"/>`),
 		"a repeated tel aor":              doc(`<registration aor="tel:+15550100001" id="a" state="active"/><registration aor="tel:+1-555-010-0001" id="b" state="active"/>`),
-		"a contact id twice":              doc(reg(ok) + `<registration aor="` + aliceTel + `" id="b" state="active">` + ok + `</registration>`),
 		"a negative zero":                 `<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="-0" state="full"/>`,
 		"a second declaration":            doc("") + `<?xml version="1.0"?>`,
+		"a declaration in capitals after": doc("") + `<?XML version="1.0"?>`,
 		"a contact out of place":          doc(`<contact id="c" state="active" event="registered"><uri>` + contact + `</uri></contact>`),
 		"a uri out of place":              doc(`<registration aor="` + alice + `" id="a" state="active"><uri>` + contact + `</uri></registration>`),
 		"an unknown element":              doc(reg(`<foo/>`)),
@@ -407,6 +407,25 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 			b.WriteString(`</contact></registration></reginfo>`)
 			return b.String()
 		},
+		// Addresses-of-record with no canonical form, each with many
+		// parameters: QA of #233 found the duplicate check quadratic.
+		"aors with parameters": func(n int) string {
+			var b strings.Builder
+			b.WriteString(`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="full">`)
+			params := ""
+			for i := range 63 {
+				params += ";p" + itoa(i) + "=%41bcdefgh"
+			}
+			for i := 0; ; i++ {
+				r := `<registration aor="sip:u@h.example:5070` + params + `;z=` + itoa(i) + `" id="r` + itoa(i) + `" state="active"/>`
+				if b.Len()+len(r) > n-16 || i == maxRegistrations {
+					break
+				}
+				b.WriteString(r)
+			}
+			b.WriteString(`</reginfo>`)
+			return b.String()
+		},
 		"foreign elements": func(n int) string {
 			var b strings.Builder
 			b.WriteString(`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" xmlns:x="urn:x" version="1" state="full">`)
@@ -434,9 +453,11 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 				}
 				return d
 			}
-			small, large := best(MaxDocumentSize/8), best(MaxDocumentSize)
-			if large > 16*small+time.Second {
-				t.Fatalf("8× the input took %v against %v: not linear", large, small)
+			// 64 times the input: about 64 times the time if linear, 4096
+			// if quadratic; the bound between needs no absolute slack.
+			small, large := best(MaxDocumentSize/64), best(MaxDocumentSize)
+			if large > 512*small {
+				t.Fatalf("64× the input took %v against %v: not linear", large, small)
 			}
 		})
 	}
@@ -486,5 +507,95 @@ func TestMarshalRefusesTextXMLCannotCarryAndDocumentsTooLarge(t *testing.T) {
 	info := &Info{State: Full, Registrations: []Registration{{AOR: alice, ID: "a", State: Active, Contacts: []Contact{big}}}}
 	if _, err := info.Marshal(); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("a document too large: %v", err)
+	}
+}
+
+// The same binding under the sip and tel identities of an implicit set
+// has two ids, made from the binding and the AOR (#233): the document is
+// written and read back. A writer must keep ids unique in the whole
+// document (RFC 3680 §5.1); a reader takes one with an id repeated across
+// registrations, and refuses one repeated within a registration.
+func TestOneBindingUnderTwoIdentitiesHasTwoIDs(t *testing.T) {
+	binding := Contact{ID: "binding-1-sip", State: ContactActive, Event: Registered, URI: contact,
+		Params: []Param{{Name: "+sip.instance", Value: `"<urn:uuid:00000000-0000-1000-8000-000000000001>"`}, {Name: "reg-id", Value: "1"}}}
+	tel := binding
+	tel.ID = "binding-1-tel"
+	info := &Info{Version: 3, State: Full, Registrations: []Registration{
+		{AOR: alice, ID: "a", State: Active, Contacts: []Contact{binding}},
+		{AOR: aliceTel, ID: "t", State: Active, Contacts: []Contact{tel}},
+	}}
+	out, err := info.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := Parse(out)
+	if err != nil || !reflect.DeepEqual(back, info) {
+		t.Fatalf("%+v, %v", back, err)
+	}
+	info.Registrations[1].Contacts[0].ID = binding.ID
+	if _, err := info.Marshal(); !errors.Is(err, ErrNotWritable) {
+		t.Errorf("one id in two registrations, written: %v", err)
+	}
+	shared := doc(reg(`<contact id="c" state="active" event="registered"><uri>`+contact+`</uri></contact>`) +
+		`<registration aor="` + aliceTel + `" id="t" state="active"><contact id="c" state="active" event="registered"><uri>` + contact + `</uri></contact></registration>`)
+	if _, err := Parse([]byte(shared)); err != nil {
+		t.Errorf("one id in two registrations, read: %v", err)
+	}
+	twice := doc(reg(`<contact id="c" state="active" event="registered"><uri>` + contact + `</uri></contact><contact id="c" state="active" event="registered"><uri>` + contact + `;x</uri></contact>`))
+	if _, err := Parse([]byte(twice)); !errors.Is(err, ErrMalformed) {
+		t.Errorf("an id twice in one registration: %v", err)
+	}
+}
+
+// A contact's parameter names compare without ASCII case alone, and a
+// writer may not repeat one.
+func TestParamNamesCompareByASCIICase(t *testing.T) {
+	c := Contact{Params: []Param{{Name: "+\u017fip.instance", Value: "x"}}}
+	if _, ok := c.Param("+sip.instance"); ok {
+		t.Error("a Unicode fold matched")
+	}
+	dup := &Info{State: Full, Registrations: []Registration{{AOR: alice, ID: "a", State: Active, Contacts: []Contact{
+		{ID: "c", State: ContactActive, Event: Registered, URI: contact, Params: []Param{{Name: "+sip.instance", Value: "a"}, {Name: "+SIP.INSTANCE", Value: "b"}}}}}}}
+	if _, err := dup.Marshal(); !errors.Is(err, ErrNotWritable) {
+		t.Errorf("a parameter twice: %v", err)
+	}
+}
+
+// An address-of-record without a canonical form, one with a port, is
+// found by its scheme and host in any case and its parameters in any
+// order, and two such spellings are one AOR.
+func TestAnAORWithoutACanonicalFormIsFoundAsWritten(t *testing.T) {
+	info := &Info{State: Full, Registrations: []Registration{{AOR: "sip:u@h.example:5070;b=2;a=1", ID: "a", State: Active}}}
+	if _, ok := info.ByAOR(uri(t, "SIP:u@H.EXAMPLE:5070;a=1;b=2")); !ok {
+		t.Error("not found")
+	}
+	if _, ok := info.ByAOR(uri(t, "sip:u@h.example:5071;a=1;b=2")); ok {
+		t.Error("another port found")
+	}
+	two := doc(`<registration aor="sip:u@h.example:5070;b=2;a=1" id="a" state="active"/><registration aor="sip:u@H.example:5070;a=1;b=2" id="b" state="active"/>`)
+	if _, err := Parse([]byte(two)); !errors.Is(err, ErrMalformed) {
+		t.Errorf("one AOR twice: %v", err)
+	}
+}
+
+// Everything inside an extension element is the extension's, reginfo
+// elements nested in it at any depth included.
+func TestAnExtensionHoldsWhatIsInsideIt(t *testing.T) {
+	text := `<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" xmlns:x="urn:x" version="1" state="full">` +
+		`<x:e><registration aor="x" id="x" state="x"><bogus/><contact/></registration></x:e></reginfo>`
+	if _, err := Parse([]byte(text)); err != nil {
+		t.Errorf("%v", err)
+	}
+}
+
+// What Marshal alone refuses is ErrNotWritable, which is ErrMalformed too.
+func TestASenderOnlyRefusalIsNotWritable(t *testing.T) {
+	info := &Info{State: Full, Registrations: []Registration{{AOR: alice, ID: "a", State: Active, Contacts: []Contact{
+		{ID: "c", State: ContactActive, Event: Expired, URI: contact}}}}}
+	if _, err := info.Marshal(); !errors.Is(err, ErrNotWritable) || !errors.Is(err, ErrMalformed) {
+		t.Errorf("%v", err)
+	}
+	if _, err := (&Info{State: "x"}).Marshal(); errors.Is(err, ErrNotWritable) {
+		t.Errorf("a document Parse refuses too: %v", err)
 	}
 }
