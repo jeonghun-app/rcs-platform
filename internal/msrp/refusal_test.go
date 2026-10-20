@@ -20,11 +20,12 @@ func unknownSends(n int) []byte {
 	return []byte(b.String())
 }
 
-// A client over TCP that names unknown sessions more often than
-// MaxFailedBinds allows still reads the 481s it was owed before the
-// connection ends, with an end of stream rather than a reset, though it
-// sent more than the relay read (#219).
-func TestTheAnswersOwedAreDeliveredBeforeTooManyUnknownSessionsCloses(t *testing.T) {
+// refusedOverTCP has a client over TCP name unknown sessions more often
+// than MaxFailedBinds (2) allows, pipelining six requests, and read until
+// the end of the stream. It returns the connection, which waits without
+// bound for the client's end, and the client.
+func refusedOverTCP(t *testing.T) (*Conn, net.Conn) {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -36,13 +37,12 @@ func TestTheAnswersOwedAreDeliveredBeforeTooManyUnknownSessionsCloses(t *testing
 		if err != nil {
 			return
 		}
-		// No bound on the wait for the client's end, so that only the
-		// client ends it.
 		c, err := NewPassiveConn(nc, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalFlush: time.Hour})
 		if err != nil {
 			_ = nc.Close()
 			return
 		}
+		t.Cleanup(func() { _ = c.Close() })
 		conns <- c
 	}()
 	client, err := net.Dial("tcp", l.Addr().String())
@@ -68,10 +68,16 @@ func TestTheAnswersOwedAreDeliveredBeforeTooManyUnknownSessionsCloses(t *testing
 	if strings.Contains(string(got), "unknc") {
 		t.Errorf("the request over the limit was answered: %q", got)
 	}
-	// The end of the stream was a half-close: the connection waits, still
-	// reading, for the client to close its side in turn, so that closing
-	// does not reset it while answers may still be on the way.
-	c := <-conns
+	return <-conns, client
+}
+
+// A client that names unknown sessions more often than MaxFailedBinds
+// allows still reads the 481s it was owed before the connection ends,
+// with an end of stream rather than a reset, though it sent more than
+// was read (#219). The end of the stream is a half-close: the connection
+// waits, still reading, for the client to close its side in turn.
+func TestTheAnswersOwedAreDeliveredBeforeTooManyUnknownSessionsCloses(t *testing.T) {
+	c, client := refusedOverTCP(t)
 	select {
 	case <-c.Done():
 		t.Fatalf("closed before the client's end of the stream: %v", c.Err())
@@ -82,6 +88,48 @@ func TestTheAnswersOwedAreDeliveredBeforeTooManyUnknownSessionsCloses(t *testing
 	if !errors.Is(c.Err(), ErrTooManyUnknownSessions) {
 		t.Fatalf("Err = %v", c.Err())
 	}
+}
+
+// Whatever ends the connection while it delivers what it owed, it ends
+// for the refusal, which is what its metrics count.
+func TestAConnectionClosedWhileItDeliversItsAnswersEndsForTheRefusal(t *testing.T) {
+	c, _ := refusedOverTCP(t)
+	_ = c.Close()
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), ErrTooManyUnknownSessions) {
+		t.Fatalf("Err = %v", c.Err())
+	}
+}
+
+// An answer the connection is still writing when the limit is reached is
+// delivered too: the peer reads it only after the refusal.
+func TestAnAnswerBeingWrittenAtTheLimitIsDelivered(t *testing.T) {
+	ours, theirs := net.Pipe()
+	c, err := NewPassiveConn(ours, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(); _ = theirs.Close() })
+	// The first 481's write waits for a reader that comes only once the
+	// second request, over the limit, has been read. The pauses let the
+	// write start first, and the refusal start while it waits; a stall
+	// can only make the test pass without proving it, not fail.
+	sends := unknownSends(2)
+	half := len(sends) / 2
+	if _, err := theirs.Write(sends[:half]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := theirs.Write(sends[half:]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	_ = theirs.SetReadDeadline(time.Now().Add(hangGuard))
+	got, _ := io.ReadAll(theirs)
+	if !strings.Contains(string(got), "MSRP unkna 481") {
+		t.Fatalf("the answer being written was lost: %q", got)
+	}
+	waitDone(t, c.Done(), "connection")
 }
 
 // A peer that takes none of the answers does not hold the connection
