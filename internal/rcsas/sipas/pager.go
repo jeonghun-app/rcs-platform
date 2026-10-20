@@ -25,8 +25,6 @@ const (
 // resolves).
 const viaPlaceholderHost = "invalid"
 
-var errSessionsNotServed = errors.New("sipas: terminating sessions are not served yet")
-
 // Pager implements messaging.Deliverer: it sends d as a pager-mode MESSAGE
 // and returns once it is answered. It goes to Config.Core, or through
 // d.Route, which the engine took from the trusted routes, as a terminating
@@ -169,12 +167,4 @@ func (s *Server) pagerRequest(d messaging.Delivery, next sip.URI) (*sip.Request,
 		}
 	}
 	return req, nil
-}
-
-// Invite implements messaging.Deliverer. Terminating sessions come with
-// the INVITE B2BUA (#137 PR B); until then the engine waits for the next
-// invitation as after any failed one.
-func (s *Server) Invite(context.Context, messaging.Invitation) error {
-	s.cfg.Metrics.Count("sip.invite.unserved", 1)
-	return errSessionsNotServed
 }

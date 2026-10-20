@@ -139,6 +139,8 @@ metric dimension (architecture §8).
 **Control:** every listener and parser has size, count, time and per-source limits;
 reviews check maximum-size inputs (architecture §8).
 **Status:** implemented for merged libraries; each service adds its own.
+`rcs-as` bounds its SIP sessions per task and per user
+(`RCSAS_MAX_SESSIONS`, `RCSAS_MAX_SESSIONS_PER_USER`), each with its MSRP leg.
 
 ## T10 — Forged receipts, routes and floods through `rcs-as`
 

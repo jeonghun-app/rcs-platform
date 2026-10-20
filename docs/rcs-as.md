@@ -32,7 +32,7 @@ The code:
 | `Deliverer.Invite` asks for a terminating session | `Offer` (`Direction: Terminating`, and the invitation's `QueueID` for large mode) for the `actpass` offer's `a=path`; then `Leg.Answer` with the answer's path, or `InviteFailed` and `Leg.Close` |
 | `msrp-relay` connects to the MSRP listener | `Serve` / `ServeConn` binds the connection to the leg named in the To-Path |
 | A pager-mode MESSAGE arrives (RFC 3428) | `Submit` with `Pager: true` and the `message/cpim` body |
-| A registration | `UserRegistered`, saying whether it is on a new flow |
+| A registration (scscf's third-party REGISTER) | `UserRegistered`, saying whether it is on a new flow, as far as rcs-as can tell ([Sessions](#sessions)) |
 | The BYE with `Reason: SIP;cause=488;text="MSRP direction not supported"` before any MSRP traffic (ADR 0004) | `InviteFailed` with `ErrNoSessions` |
 | A terminating large-mode leg is `Finished` | a BYE |
 | The SIP session ends | `Leg.Close` |
@@ -90,9 +90,12 @@ only the core reaches ([ADR 0007](adr/0007-internal-transport.md) §2). Its
 | Request | What rcs-as does |
 |---|---|
 | `MESSAGE` outside a dialog (pager mode, RFC 3428) | `Submit` with `Pager: true`, `Mode: Standalone`; answered as below |
-| `MESSAGE` in a dialog | 481: pager mode has no dialog |
-| `OPTIONS` | forwarded along its `Route`, back to `scscf`: the default profile hands it to `rcs-as` with SESSION_CONTINUED, and capability discovery must not stop there |
-| anything else | 405 with `Allow: MESSAGE, OPTIONS`; INVITE comes with the next part of #137 |
+| `INVITE` outside a dialog | a chat or large-mode session, answered as in [Sessions](#sessions) |
+| `REGISTER` (scscf's third-party registration) | 200, and `UserRegistered` (see [Sessions](#sessions)) |
+| `OPTIONS` outside a dialog | forwarded along its `Route`, back to `scscf`: the default profile hands it to `rcs-as` with SESSION_CONTINUED, and capability discovery must not stop there |
+| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`); 481 when there is no such session, which includes every `MESSAGE` in a dialog, since pager mode has none |
+| `ACK` | the ACK of a 2xx rcs-as sent is taken by its UAS; any other is dropped |
+| anything else | 405 with `Allow` |
 
 ### Who sends, and to whom
 
@@ -149,8 +152,91 @@ engine tries again later. A name in `RCSAS_CORE_URI` is looked up only inside
 `RCS_SERVICE_NAMESPACE`, and only its private addresses are used ([ADR
 0007](adr/0007-internal-transport.md) §5).
 
-`Deliverer.Invite` fails until terminating sessions are served; the engine then
-waits for the next invitation as after any failed one.
+`Deliverer.Invite` sends an INVITE the same way: to `RCSAS_CORE_URI`, with
+`P-Served-User: <recipient>;sescase=term` and `P-Asserted-Identity: <peer>`,
+`From` the peer. `Accept-Contact`, `P-Asserted-Service` and the `Contact`
+feature tag name the chat ICSI (`...icsi.oma.cpm.session`) or, for a
+large-mode session, `...icsi.oma.cpm.largemsg`. Its SDP offers `actpass` with
+the leg's path at this task's `RCSAS_MSRP_HOST` ([ADR
+0004](adr/0004-msrp-anchoring.md)). It carries no `Supported: timer`, so
+rcs-as is never asked to refresh. `Invite` returns once the INVITE is sent;
+then:
+
+| What the INVITE gets | What rcs-as does |
+|---|---|
+| a 2xx | ACK (again for each retransmission), and `Leg.Answer` with the answer's `a=path`; the relay connects for the client, which answered through `pcscf` as `active` |
+| a 2xx whose answer is `passive`, or has no `a=setup` (RFC 4145 §4: passive) | ACK, then BYE with `Reason: SIP;cause=488;text="MSRP direction not supported"`, and `InviteFailed` with `ErrNoSessions`: the relay never dials a client |
+| a 2xx with an answer rcs-as cannot use otherwise | ACK, BYE, `InviteFailed` |
+| a 2xx from a second fork | ACK and BYE in that dialog (RFC 3261 §13.2.2.4); the first session stands |
+| a final failure | `InviteFailed`: 404 and 604 with `ErrUndeliverable`, 408, 430, 480 and 503 with `ErrOffline`, any other with an error of its own |
+| no final answer before the leg's `RCSAS_ANSWER_TIMEOUT` | CANCEL; the 487 is the failure; without one, the transaction is ended 32 s later (RFC 3261 §9.1) and the failure is `ErrOffline` |
+
+A group invitation is refused (`Invite` returns an error); group sessions come
+with the group focus's SIP layer (#137).
+
+### Sessions
+
+`rcs-as` is a B2BUA: each client has its own SIP session with rcs-as, and its
+own MSRP leg on the engine. In every session pcscf has anchored the client's
+MSRP on `msrp-relay`, which offers or answers rcs-as `active` with the
+relay's core path ([ADR 0004](adr/0004-msrp-anchoring.md)). rcs-as therefore
+always answers `passive` and listens: `msrp-relay` connects to
+`RCSAS_MSRP_LISTEN_ADDR`, where the engine's `Serve` binds the connection to
+the leg its To-Path names.
+
+A client's INVITE (the originating session):
+
+| Check | Refused with |
+|---|---|
+| a `Require` option tag other than `timer` | 420 with `Unsupported` (RFC 3261 §8.2.2.3) |
+| neither the chat ICSI nor the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service` (file transfer, for one, is not served here) | 403 |
+| no asserted identity, or one that names no user | 403 |
+| a Request-URI that names no user | 404 |
+| unreadable `Conversation-ID` or `Contribution-ID` | 400 |
+| `Session-Expires` below 90 s | 422 with `Min-SE: 90` (RFC 4028 §6) |
+| no SDP offer (a late offer), no MSRP line, an offer of `passive` (RFC 6135 §4.2.2), or no type in common | 488 |
+| this task holds `RCSAS_MAX_SESSIONS` sessions | 503 with `Retry-After: 1`: another task may take it |
+| the user holds `RCSAS_MAX_SESSIONS_PER_USER` sessions | 403 |
+
+Otherwise rcs-as opens the leg with `OpenLeg` (the sender is the asserted
+identity, the peer the Request-URI, as for pager mode) and answers 200. The
+answer is `passive`, with the leg's path, `c=` at `RCSAS_MSRP_HOST`, the leg's
+`AcceptTypes` and `a=max-size` of `RCSAS_MAX_MESSAGE_SIZE`; its `Contact` is
+this task's SIP address with the service's feature tag. Messages on the leg go
+through the pipeline, are stored and are delivered to the peer: on the peer's
+own leg if it has one, or in a session rcs-as starts (store-and-forward).
+
+In every session:
+
+- **Session timers** (RFC 4028). rcs-as never refreshes. When the client asks
+  for a timer and supports the extension, rcs-as takes it with the client as
+  refresher (`Session-Expires: <n>;refresher=uac`, `Require: timer`). It ends a
+  session left unrefreshed with a BYE, min(32 s, interval/3) before the
+  interval runs out (§10). A request for `refresher=uas`, or from a client
+  without `Supported: timer`, gets no timer, as from a UAS without the
+  extension; such a session ends with its MSRP connection or a BYE. In a
+  session rcs-as started, a timer the client's 2xx sets is kept the same way.
+- **Refreshes.** A re-INVITE or UPDATE whose offer keeps the MSRP path gets the
+  same answer, with the same `o=` version unless the answer changed (RFC 3264
+  §8), and restarts the timer. An UPDATE without an offer is a plain refresh.
+  An offer with another path, or a re-INVITE without one, is refused with 488:
+  a leg does not move. The session goes on either way.
+- **Ending.** A BYE from the other side ends the session and closes its leg. A
+  leg that ends on its own (the relay dropped its connection), a 2xx without
+  an ACK (RFC 3261 §13.3.1.4), an unrefreshed timer and a terminating
+  large-mode leg that is `Finished` each end the session with a BYE from
+  rcs-as. So does shutdown, before the transport closes.
+- **The MSRP direction.** A BYE with SIP cause 488 in its `Reason`, in a session
+  rcs-as started, tells the engine `ErrNoSessions`: it is how pcscf ends a
+  session whose client answered `passive` (ADR 0004).
+
+A third-party REGISTER from scscf (TS 24.229 §5.4.1.7) names the user in
+`To` and the expiry in `Expires`; one without `Expires` is refused with 400.
+rcs-as answers 200 and calls `UserRegistered`. The REGISTER does not say which
+flow the client registered on, so rcs-as counts a registration as one on a
+new flow when it has not heard of a live one for that user (none, or one that
+has run out), and as a refresh otherwise. A de-registration (`Expires: 0`)
+only forgets the user.
 
 ## The pipeline
 
@@ -637,6 +723,8 @@ settings:
 | `RCSAS_SIP_LISTEN_ADDR` | `0.0.0.0:5060` | SIP listener (TCP), which only the core reaches |
 | `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, an address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
+| `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 503 ([threat model](threat-model.md) T9) |
+| `RCSAS_MAX_SESSIONS_PER_USER` | `64` | Sessions of one user on this task; an INVITE beyond it is answered 403 |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
@@ -819,7 +907,14 @@ identifier ever appears in a metric name.
 | `message.accepted`, `message.accepted.notification`, `message.resent` | Accepted messages, notifications, resends |
 | `sip.message.<status>` | Pager-mode MESSAGEs rcs-as answered, by status |
 | `sip.pager.<status>`, `sip.pager.timeout`, `sip.pager.unsent`, `sip.pager.unresolved` | MESSAGEs rcs-as sent, by final status, and those that got none, could not be sent or found no next hop |
-| `sip.refused.method`, `sip.respond_failed`, `sip.invite.unserved` | Requests of a method rcs-as does not take, answers the transport did not take, invitations not sent |
+| `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
+| `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
+| `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |
+| `sip.session.task_limit`, `sip.session.user_limit` | Sessions refused for `RCSAS_MAX_SESSIONS` and `RCSAS_MAX_SESSIONS_PER_USER` |
+| `sip.session.expired`, `sip.session.no_ack` | Sessions rcs-as ended for an unrefreshed timer, and for a 2xx without an ACK |
+| `sip.bye.sent`, `sip.bye.received`, `sip.refresh.answered`, `sip.refresh.refused` | Session ends and refreshes |
+| `sip.dialog.unresolved`, `sip.dialog.unsent` | Requests in a dialog (ACK, BYE) without a next hop, or not sent |
+| `sip.register.taken`, `sip.register.ended` | Third-party registrations and de-registrations |
 | `message.rejected.<reason>` | Refusals: `too_large`, `rate_limited`, `content_type`, `malformed`, `from_mismatch`, `message_id_reused`, `queue_full`, `queue_share_full`, `imdn_malformed`, `imdn_unknown`, `imdn_forged`, `imdn_not_requested` |
 | `cpim.rejected.<reason>` | The CPIM parser's reason for `malformed` (`internal/cpim` `Reason`) |
 | `cpim.deviation.<name>` | Accepted layout deviations: `bare-lf`, `spacing`, `trailing-ws`, `empty-value` |
@@ -857,6 +952,8 @@ Signals to alarm on (Phase 7):
 | `invite.no_sessions` sustained | Clients answering `passive`; their large content waits (ADR 0004) |
 | `message.expired` rising | Recipients unreachable for `RCSAS_STORE_TTL` |
 | `msrp.accept_failed` > 0 | The MSRP listener ran out of file descriptors or the like |
+| `sip.session.task_limit` > 0 | A task holds `RCSAS_MAX_SESSIONS`: scale out, or a flood of sessions |
+| `sip.session.no_ack`, `sip.dialog.unsent` sustained | Requests in a dialog do not get through the core |
 | `invite.untracked` > 0 | More pending invitations than a task tracks (100 000); messages wait for the retry timer instead of an invitation |
 | `group.fanout_budget_exceeded` sustained | A group writing beyond its budget: a flood, or the budget is too small for real groups |
 | `group.fanout_share_exceeded` sustained | One participant writing to a large group as fast as it may: a flood |
@@ -929,6 +1026,19 @@ Signals to alarm on (Phase 7):
   has its copies given up when it registers on a new flow, or when they
   expire.
 - **Group rates are per task**, like the 1-to-1 ones.
+- **rcs-as never refreshes a session.** A client that asks rcs-as to refresh
+  (`refresher=uas`) gets no session timer instead (see [Sessions](#sessions)).
+  rcsjta refreshes itself; another client may see its session last until its
+  MSRP connection or a BYE ends it.
+- **A new flow is guessed.** The third-party REGISTER does not carry the
+  client's REGISTER (the default profile does not ask for it), so a client
+  that moves to a new flow before its registration runs out looks like one
+  refreshing, and keeps a pager-only marker until its registration lapses or
+  it opens a session itself. Registrations are remembered per task, up to
+  100 000 users.
+- **One user per registration.** `UserRegistered` gets the identity in the
+  third-party REGISTER's `To`; queues kept under another identity of the
+  same implicit registration set wait for their own retry.
 - **Group mode runs on one task until
   [#121](https://github.com/jeonghun-app/rcs-platform/issues/121).** Every
   participant's session with a group, its deliveries and its roster

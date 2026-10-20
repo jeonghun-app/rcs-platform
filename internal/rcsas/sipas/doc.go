@@ -13,14 +13,25 @@
 //   - OPTIONS, which the default profile hands to rcs-as with
 //     SESSION_CONTINUED, goes on along its Route, so capability discovery
 //     does not stop at rcs-as.
-//   - Every other method is refused with 405 for now; sessions (INVITE) and
-//     the group chat focus come in later parts of #137.
+//   - An INVITE for a chat session or a large-mode message opens a leg on
+//     the engine (OpenLeg) and is answered a=setup:passive with the leg's
+//     path: msrp-relay, which pcscf put in the media path, offers active
+//     and connects to rcs-as's MSRP listener (ADR 0004). rcs-as is a B2BUA,
+//     with one SIP session and one leg per client.
+//   - The requests in a session (BYE, re-INVITE, UPDATE, OPTIONS) are
+//     served in it: session timers as RFC 4028 has a UAS that never
+//     refreshes, and a leg that never moves.
+//   - scscf's third-party REGISTER tells the engine a user registered.
+//   - Every other method is refused with 405; the group chat focus comes in
+//     a later part of #137.
 //
 // Server is also the engine's Deliverer. Pager sends a MESSAGE to scscf
 // (Config.Core) as a terminating request: without the orig parameter, and
 // with P-Served-User naming the recipient, which the default profile's
 // triggers exclude, so it goes on to the recipient's contacts rather than
-// back to rcs-as (docs/hss.md).
+// back to rcs-as (docs/hss.md). Invite sends an INVITE the same way, with
+// an actpass offer of a leg from Engine.Offer, and gives the leg the path of
+// the 2xx's answer.
 //
 // Users are named in one form throughout (UserOf): the engine keys queues,
 // shares and sent-message records by that string.

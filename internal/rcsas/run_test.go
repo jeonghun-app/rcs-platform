@@ -80,12 +80,17 @@ func TestAStandaloneMessageIsStoredAndDeliveredThroughTheCore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ml, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Messaging.MSRPPort = ml.Addr().(*net.TCPAddr).Port
 	h := runtimetest.New(t, "rcs-as")
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{store: store.NewMemory(), listening: func(a netip.AddrPort) { listening <- a }})
+		done <- run(ctx, h.Runtime, cfg, deps{store: store.NewMemory(), listening: func(a netip.AddrPort) { listening <- a }, msrp: ml})
 	}()
 	t.Cleanup(func() {
 		cancel()
