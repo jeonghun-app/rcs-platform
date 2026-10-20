@@ -77,6 +77,8 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"NotifyCountersNeverRepeatAcrossInstances", testNotifyCounters},
 		{"NextNotifyInvalidatesEarlierReads", testNotifyVersion},
 		{"NoOlderStateTakesALaterNotify", testNotifyOrder},
+		{"EverySaveRaisesARegistrationsVersion", testRegistrationVersionRises},
+		{"ASweepSendsTheFinalNotifyNobodySent", testPendingFinal},
 		{"ConcurrentSweepsEndEverySubscriptionOnce", testSubscriptionSweep},
 		{"ASweepFromAStaleListingKeepsAFreshRegistration", testSweepFromAStaleListing},
 		{"ASaveFromBeforeADeleteDoesNotOverwriteANewRegistration", testStaleSaveAfterRecreate},
@@ -601,7 +603,7 @@ func testSubscriptionSweep(t *testing.T, a, b state.Store, o Options) {
 				defer wg.Done()
 				_, err := state.SweepSubscriptions(ctx(t), s, T0, 10, func(sub *state.Subscription) {
 					// The final NOTIFY takes the next CSeq.
-					if _, _, err := s.NextNotify(ctx(t), sub.ID, 0); err != nil {
+					if _, _, err := s.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
 						t.Error(err)
 					}
 					mu.Lock()
@@ -652,4 +654,87 @@ func testNotifyOrder(t *testing.T, a, b state.Store, _ Options) {
 	}
 	_, _, err = a.NextNotify(ctx(t), "s1", state.FinalNotify)
 	wantErr(t, err, state.ErrStale)
+}
+
+// testRegistrationVersionRises: NextNotify orders NOTIFYs by the version of
+// the record they were read from, so every save must raise it, whichever
+// instance saves.
+func testRegistrationVersionRises(t *testing.T, a, b state.Store, _ Options) {
+	r := must(a.SaveRegistration(ctx(t), Registration(IMPI1, IMPU1, time.Hour)))(t)
+	for i, s := range []state.Store{a, b, a, b} {
+		next := r.Clone()
+		next.Contacts[0].CSeq++
+		saved := must(s.SaveRegistration(ctx(t), next))(t)
+		if saved.Version <= r.Version {
+			t.Fatalf("save %d: version %d after %d", i, saved.Version, r.Version)
+		}
+		if got := must(b.Registration(ctx(t), r.Key))(t); got.Version != saved.Version {
+			t.Fatalf("save %d: read back version %d, saved %d", i, got.Version, saved.Version)
+		}
+		r = saved
+	}
+}
+
+// testPendingFinal: a subscription terminated by an instance that did not
+// send its final NOTIFY is handled by a sweep once its expiry has passed,
+// with its EndReason, and deleted once that NOTIFY is numbered; a handle
+// that numbers nothing leaves it for a sweep after the grace.
+func testPendingFinal(t *testing.T, a, b state.Store, o Options) {
+	s := Subscription("s1", IMPU1, -time.Second)
+	s.Terminated, s.EndReason, s.SetEnded = true, "rejected", true
+	must(a.SaveSubscription(ctx(t), s))(t)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringSubscriptions(ctx(t), T0, 10))(t)) == 1
+	})
+	handled := 0
+	sweep := func(at time.Time, final bool) {
+		t.Helper()
+		if _, err := state.SweepSubscriptions(ctx(t), b, at, 10, func(sub *state.Subscription) {
+			handled++
+			if sub.EndReason != "rejected" || !sub.SetEnded {
+				t.Errorf("handled with EndReason %q, SetEnded %v", sub.EndReason, sub.SetEnded)
+			}
+			if final {
+				if _, _, err := b.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
+					t.Error(err)
+				}
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweep(T0, false)
+	if handled != 1 {
+		t.Fatalf("handled %d times", handled)
+	}
+	must(a.Subscription(ctx(t), "s1"))(t)
+	sweep(T0.Add(time.Second), false) // within the grace: not again
+	later := T0.Add(state.TerminatedGrace + time.Second)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringSubscriptions(ctx(t), later, 10))(t)) == 1
+	})
+	sweep(later, true)
+	if handled != 2 {
+		t.Fatalf("handled %d times", handled)
+	}
+	_, err := a.Subscription(ctx(t), "s1")
+	wantErr(t, err, state.ErrNotFound)
+
+	// One that expired without being terminated ends with "timeout".
+	must(a.SaveSubscription(ctx(t), Subscription("s2", IMPU1, -time.Second)))(t)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringSubscriptions(ctx(t), T0, 10))(t)) == 1
+	})
+	if _, err := state.SweepSubscriptions(ctx(t), b, T0, 10, func(sub *state.Subscription) {
+		if !sub.Terminated || sub.EndReason != "timeout" || sub.SetEnded {
+			t.Errorf("claimed %+v", sub)
+		}
+		if _, _, err := b.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
+			t.Error(err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Subscription(ctx(t), "s2")
+	wantErr(t, err, state.ErrNotFound)
 }

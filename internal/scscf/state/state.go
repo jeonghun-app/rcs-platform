@@ -156,8 +156,10 @@ type Registration struct {
 	Reassert         time.Time
 	ReassertAttempts int
 	// Version is the stored version, 0 before the first save. Saves are
-	// conditional on it (optimistic concurrency). It is opaque: a new item
-	// starts at a random value (FirstVersion).
+	// conditional on it (optimistic concurrency). A new item starts at a
+	// random value (FirstVersion), and every save raises it, so of two reads
+	// of one record the later never has the lower version: NextNotify orders
+	// NOTIFYs by it.
 	Version int64
 }
 
@@ -395,11 +397,11 @@ type Registrations interface {
 	// 29.228 §6.1.3). It is read through an index, which may miss one saved
 	// moments ago.
 	RegistrationsOf(ctx context.Context, impi string) ([]*Registration, error)
-	// SaveRegistration stores r and returns it with its new version. A
-	// Version of 0 creates it and fails with ErrExists if it exists; any
-	// other is conditional on that version and fails with ErrConflict if the
-	// stored one differs, which includes an item deleted and created again
-	// since r was read, or ErrNotFound if it is gone.
+	// SaveRegistration stores r and returns it with its new version, above
+	// r's. A Version of 0 creates it and fails with ErrExists if it exists;
+	// any other is conditional on that version and fails with ErrConflict if
+	// the stored one differs, which includes an item deleted and created
+	// again since r was read, or ErrNotFound if it is gone.
 	SaveRegistration(ctx context.Context, r *Registration) (*Registration, error)
 	// DeleteRegistration deletes r if its version is still the stored one
 	// (ErrConflict otherwise, ErrNotFound if gone).
@@ -794,13 +796,21 @@ type Subscription struct {
 	// NOTIFY carries back (RFC 6665 §4.5.2).
 	EventID string
 	Dialog  Dialog
-	// Expires is when the subscription ends. A Terminated one is deleted by
-	// the first sweep after it; whoever terminates a subscription sets it a
-	// little ahead (TerminatedGrace) to send its final NOTIFY first.
+	// Expires is when the subscription ends. Whoever terminates a
+	// subscription sets it a little ahead, to send its final NOTIFY first;
+	// a sweep after it sends that NOTIFY if nobody has (SweepSubscriptions)
+	// and deletes the subscription.
 	Expires time.Time
 	// Terminated marks a subscription that has ended and is about to be
-	// deleted; a sweep sets it to claim the subscription's final NOTIFY.
+	// deleted, once its final NOTIFY is numbered (NotifiedOf is
+	// FinalNotify); a sweep sets it to claim that NOTIFY.
 	Terminated bool
+	// EndReason is the Subscription-State reason of the final NOTIFY of a
+	// Terminated subscription, "" for none, and SetEnded says that its set
+	// ended: a sweep that sends the NOTIFY in place of whoever terminated
+	// it sends it so (regevent).
+	EndReason string
+	SetEnded  bool
 	// CSeq is the last CSeq the notifier used in the dialog and
 	// ReginfoVersion the last reginfo version it sent. NextNotify advances
 	// both, so the subscription's first NOTIFY, version 0 (RFC 3680 §5.2), is
@@ -859,7 +869,7 @@ func (s *Subscription) Validate() error {
 	if err := validSetKey(s.Set); err != nil || s.Incarnation == 0 {
 		return fmt.Errorf("%w: a subscription names its set and its incarnation", ErrInvalid)
 	}
-	if s.Kind != SubscriberPCSCF && s.Kind != SubscriberUE || !textOK(s.Binding, s.EventID) {
+	if s.Kind != SubscriberPCSCF && s.Kind != SubscriberUE || !textOK(s.Binding, s.EventID, s.EndReason) {
 		return fmt.Errorf("%w: unknown kind of subscriber", ErrInvalid)
 	}
 	d := s.Dialog

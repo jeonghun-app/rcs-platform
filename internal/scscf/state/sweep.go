@@ -12,9 +12,9 @@ import (
 // or an instance that stops midway, is retried soon.
 const SweepLease = time.Minute
 
-// TerminatedGrace is how long a subscription claimed by a sweep, or ended by
-// the S-CSCF (Terminated), stays before a sweep deletes it: the time to send
-// its final NOTIFY with NextNotify. It counts from the claim.
+// TerminatedGrace is how long a subscription claimed by a sweep stays before
+// another sweep sends its final NOTIFY in its place: the time for the
+// claimer to send it with NextNotify. It counts from the claim.
 const TerminatedGrace = time.Minute
 
 // SweepRegistrations removes the contacts that have expired at now from up to
@@ -97,12 +97,17 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 	return n, errs
 }
 
-// SweepSubscriptions ends up to limit subscriptions that have expired at now:
-// each is claimed by saving it as Terminated, with an expiry TerminatedGrace
-// ahead, conditional on the version read, so exactly one instance calls handle,
-// which sends the final NOTIFY (RFC 6665 §4.2.2), and then deleted. A
-// Terminated subscription whose expiry has passed, its grace over, is deleted
-// without handle. It returns the number of subscriptions handled.
+// SweepSubscriptions ends up to limit subscriptions that have expired at
+// now, and sends the final NOTIFY of those terminated whose NOTIFY nobody
+// numbered: the instance that terminated one may have dropped it from a full
+// queue, or stopped. Each is claimed by saving it as Terminated, with an
+// expiry TerminatedGrace ahead, conditional on the version read, so one
+// instance calls handle, which sends the final NOTIFY (RFC 6665 §4.2.2), at
+// once or later; one expired that was not Terminated gets EndReason
+// "timeout". A subscription whose final NOTIFY is numbered (NotifiedOf is
+// FinalNotify) is deleted, now or by a later sweep, and one a handle did
+// not get to is claimed again after the grace. It returns the number of
+// subscriptions handled.
 func SweepSubscriptions(ctx context.Context, s Subscriptions, now time.Time, limit int, handle func(*Subscription)) (int, error) {
 	subs, errs := s.ExpiringSubscriptions(ctx, now, limit)
 	n := 0
@@ -110,14 +115,16 @@ func SweepSubscriptions(ctx context.Context, s Subscriptions, now time.Time, lim
 		if sub.Expires.After(now) {
 			continue
 		}
-		if sub.Terminated {
+		if sub.Terminated && sub.NotifiedOf == FinalNotify {
 			if err := ignoreLost(s.DeleteSubscription(ctx, sub)); err != nil {
 				return n, errors.Join(errs, err)
 			}
 			continue
 		}
 		next := sub.Clone()
-		next.Terminated = true
+		if !sub.Terminated {
+			next.Terminated, next.EndReason = true, "timeout"
+		}
 		next.Expires = now.Add(TerminatedGrace)
 		claimed, err := s.SaveSubscription(ctx, next)
 		if lost(err) {
@@ -136,7 +143,7 @@ func SweepSubscriptions(ctx context.Context, s Subscriptions, now time.Time, lim
 		if err != nil {
 			return n, errors.Join(errs, err)
 		}
-		if cur.Terminated {
+		if cur.NotifiedOf == FinalNotify {
 			if err := ignoreLost(s.DeleteSubscription(ctx, cur)); err != nil {
 				return n, errors.Join(errs, err)
 			}

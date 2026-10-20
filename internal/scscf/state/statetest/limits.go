@@ -230,7 +230,7 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 		}); err != nil {
 			t.Error(err)
 		}
-		_, _, final = a.NextNotify(ctx(t), s.ID, 0)
+		_, _, final = a.NextNotify(ctx(t), s.ID, state.FinalNotify)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -240,9 +240,10 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	_, err := a.Subscription(ctx(t), "s1")
 	wantErr(t, err, state.ErrNotFound)
 
-	// One the S-CSCF ended itself, with the grace ahead, goes after it.
+	// One the S-CSCF ended itself, with the grace ahead, its final NOTIFY
+	// sent, goes after it.
 	ended := Subscription("s2", IMPU1, time.Hour)
-	ended.Terminated, ended.Expires = true, T0.Add(state.TerminatedGrace)
+	ended.Terminated, ended.Expires, ended.NotifiedOf = true, T0.Add(state.TerminatedGrace), state.FinalNotify
 	must(a.SaveSubscription(ctx(t), ended))(t)
 	if _, err := state.SweepSubscriptions(ctx(t), b, T0, 10, func(*state.Subscription) {}); err != nil {
 		t.Fatal(err)
