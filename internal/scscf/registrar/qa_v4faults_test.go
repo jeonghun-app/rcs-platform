@@ -182,3 +182,42 @@ func TestAReRegistrationRepairsAnIdentityNamingAnOldIncarnation(t *testing.T) {
 	wantStatus(t, u.registerWith(g, 600), 200)
 	wantPointed(t, e, impu1, tel1)
 }
+
+// TestAnIdentityThatMovedToASetNotSavedIsRepairedByItsNextRegister: the HSS
+// moves tel1 from set A to a set of its own, B. A REGISTER for tel1 points
+// it at B first, then fails to save B's record, so tel1 names a record that
+// does not exist and is found nowhere. Its next REGISTER finds no set, so it
+// registers B afresh and points tel1 at it; A keeps its own identity.
+func TestAnIdentityThatMovedToASetNotSavedIsRepairedByItsNextRegister(t *testing.T) {
+	e := newEnv(t)
+	u := e.akaUser(impi1, impu1, tel1)
+	wantStatus(t, u.registerWith(e.instance(1), 600), 200)
+	e.hss.mu.Lock()
+	e.hss.subs[impi1].set = []string{impu1}
+	e.hss.subs[impi1].more = [][]string{{tel1}}
+	e.hss.mu.Unlock()
+	// A REGISTER asks the HSS for User-Data, and so learns of the move,
+	// when the set's profile is gone.
+	if err := e.store.DeleteProfile(bg, set1); err != nil {
+		t.Fatal(err)
+	}
+	v := device(u, 2)
+	v.impu = tel1
+	// The writes are B's profile, tel1's item, then B's record.
+	fs := &faultStore{Store: e.store, at: 2, kind: "error"}
+	wantStatus(t, v.registerWith(e.instance(2, func(c *Config) { c.Store = fs }), 600), 500)
+	fs.mu.Lock()
+	if len(fs.names) < 3 || fs.names[2] != "SaveRegistration" {
+		t.Fatalf("the fault did not hit B's record: %v", fs.names)
+	}
+	fs.mu.Unlock()
+	if _, err := regOf(e, tel1); err == nil {
+		t.Fatal("tel1 resolves although B's record was never saved")
+	}
+	wantStatus(t, v.registerWith(e.instance(3), 600), 200)
+	b := state.SetKey{IMPI: impi1, IMPU: tel1}
+	if r, err := regOf(e, tel1); err != nil || r.Key != b {
+		t.Errorf("tel1 after its next REGISTER: %+v, %v", r, err)
+	}
+	wantPointed(t, e, impu1, tel1)
+}
