@@ -66,14 +66,18 @@ request from the core is answered 430 Flow Failed.
   keep `scscf` out (#193). A connection counts from accept, while it is
   still sending its PROXY header (at most 2 s) or in its TLS handshake, and
   as a flow after. `pcscf` opens no stream listener without a limit.
-- **Listener metrics.** Every sweep (30 s) exports
-  `transport.listener_connections.client` and `.core`, the connections each
-  listener holds, to see one near its limit before it refuses; and the PROXY
-  headers since the last sweep that did not arrive in time
-  (`transport.proxy_header_timeouts`), were malformed or cut
-  (`transport.proxy_header_errors`, the sign of an NLB not sending them), or
-  never started, the connection closed before its first byte as a TCP
-  health check does (`transport.proxy_header_empty`).
+- **Listener metrics.** Every sweep (30 s) exports what the transport
+  counts, the counts as the change since the last sweep:
+
+  | Metric | Kind | What it counts |
+  |---|---|---|
+  | `transport.listener_connections.client`, `.core` | gauge | connections each listener holds, to see one near its limit before it refuses |
+  | `transport.client_listener_rejected` | count | connections refused at `PCSCF_MAX_CLIENT_FLOWS` |
+  | `transport.core_listener_rejected` | count | connections refused at `PCSCF_CORE_CONNECTIONS`: `scscf` kept out, to alarm on |
+  | `transport.rejected` | count | connections refused at `PCSCF_MAX_CONNECTIONS` |
+  | `transport.proxy_header_timeouts` | count | PROXY headers that did not arrive within 2 s |
+  | `transport.proxy_header_errors` | count | PROXY headers begun and then malformed or cut: a peer that is not the NLB, or an NLB not sending them |
+  | `transport.proxy_header_empty` | count | connections closed or reset before any byte: clients or scanners that gave up, never the NLB, whose health checks send a LOCAL header (ADR 0003) |
 
 ## Registration
 
