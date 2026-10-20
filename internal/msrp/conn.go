@@ -164,6 +164,9 @@ type Config struct {
 
 	// refusalFlush is refusalFlushTimeout unless a test sets it.
 	refusalFlush time.Duration
+	// refusalAfter starts the flush's bound; time.After unless a test
+	// sets it, to end the bound when it says rather than in real time.
+	refusalAfter func(time.Duration) <-chan time.Time
 }
 
 func (cfg Config) withDefaults() (Config, error) {
@@ -592,7 +595,8 @@ func (c *Conn) flush(reason error) {
 	c.mu.Lock()
 	c.closing = reason
 	c.mu.Unlock()
-	deadline := time.After(c.cfg.refusalFlush)
+	// One bound for both waits.
+	deadline := c.flushDeadline()
 	if !c.writeQueued(deadline) {
 		return
 	}
@@ -623,7 +627,17 @@ func (c *Conn) writeQueuedForPeer(reason error) {
 	c.mu.Lock()
 	c.closing = reason
 	c.mu.Unlock()
-	c.writeQueued(time.After(c.cfg.refusalFlush))
+	c.writeQueued(c.flushDeadline())
+}
+
+// flushDeadline starts the bound of a flush: refusalFlush, in real time
+// unless a test has set refusalAfter.
+func (c *Conn) flushDeadline() <-chan time.Time {
+	after := c.cfg.refusalAfter
+	if after == nil {
+		after = time.After
+	}
+	return after(c.cfg.refusalFlush)
 }
 
 // writeQueued waits until everything queued has been written, and reports

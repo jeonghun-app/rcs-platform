@@ -60,9 +60,11 @@ type Config struct {
 	// Self is the simulated client and Peer the far end of its chats.
 	Self, Peer cpim.Address
 
-	// SIP configures the SIP client the scenarios of #135 register with;
-	// none uses it yet, as they need pcscf and scscf.
-	SIP *sipua.Config
+	// SIP configures the SIP client the scenarios of #135 register with,
+	// as Self, and SIPPeer the far end's, as Peer. Without them "all"
+	// leaves the SIP scenarios out, and naming one fails it at its first
+	// step.
+	SIP, SIPPeer *sipua.Config
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
@@ -97,7 +99,14 @@ var scenarios = map[string]func(*run) error{
 	"ft-resume":              fileTransferResumed,
 	"chat-client-originated": chatClientOriginated,
 	"chat-core-originated":   chatCoreOriginated,
+	"pager-message":          pagerMessage,
 }
+
+// sipScenarios need the SIP clients; "all" leaves them out of a run with no
+// SIP configuration at all, as a stack without pcscf cannot run them
+// (#135). With SIP configured they run, and one that lacks a setting it
+// needs, such as the peer, fails at its first step rather than vanish.
+var sipScenarios = map[string]bool{"pager-message": true}
 
 // Names lists the built-in scenarios, sorted.
 func Names() []string {
@@ -113,11 +122,11 @@ func Names() []string {
 var ErrUnknown = errors.New("scenario: unknown scenario")
 
 // Run runs the named scenarios in order and reports every step; "all" runs
-// every built-in one. It returns whether every step succeeded, or ErrUnknown
-// before running anything.
+// every built-in one, the SIP ones only with SIP set. It returns whether
+// every step succeeded, or ErrUnknown before running anything.
 func Run(ctx context.Context, cfg Config, names []string, report Report) (bool, error) {
 	if slices.Contains(names, "all") {
-		names = Names()
+		names = slices.DeleteFunc(Names(), func(n string) bool { return sipScenarios[n] && cfg.SIP == nil })
 	}
 	for _, n := range names {
 		if scenarios[n] == nil {
