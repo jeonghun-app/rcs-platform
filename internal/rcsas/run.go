@@ -93,7 +93,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	defer px.Close()
 	mc := cfg.Messaging
-	mc.Logger = rt.Logger
+	mc.Logger, mc.HomeDomain = rt.Logger, cfg.HomeDomain
 	engine, err := messaging.New(mc, st, srv, rt.Metrics)
 	if err != nil {
 		return err

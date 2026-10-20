@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -158,6 +159,21 @@ const allowed = "MESSAGE, OPTIONS"
 // so (RFC 3428 §7).
 func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
+	if bad := unsupported(req); len(bad) > 0 {
+		// RFC 3261 §8.2.2.3: a client that requires an extension rcs-as
+		// lacks must not have its request served without it.
+		s.cfg.Metrics.Count("sip.message.420", 1)
+		s.respondWith(u, req, 420, [2]string{"Unsupported", strings.Join(bad, ", ")})
+		return
+	}
+	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, cpim.ContentType) {
+		// What to send instead (RFC 3261 §21.4.13). A CPIM body whose
+		// content the engine refuses is answered 415 without it: it is
+		// the type the client sent already.
+		s.cfg.Metrics.Count("sip.message.415", 1)
+		s.respondWith(u, req, 415, [2]string{"Accept", cpim.ContentType})
+		return
+	}
 	o, code := s.origin(req)
 	busy := false
 	if code == 0 {
@@ -171,31 +187,24 @@ func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	s.respond(u, req, code)
 }
 
+// unsupported are the option tags of req's Require, none of which rcs-as
+// supports for a MESSAGE.
+func unsupported(req *sip.Request) []string {
+	tags, err := req.Header.Require()
+	if err != nil {
+		// Unreadable: what it requires is not known to be supported.
+		return []string{"(malformed)"}
+	}
+	return tags
+}
+
 // origin reads the engine's Origin from req, or the status that refuses it.
 func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
-	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, cpim.ContentType) {
-		return messaging.Origin{}, 415
+	sender, identities, code := s.asserted(req)
+	if code != 0 {
+		return messaging.Origin{}, code
 	}
-	// The network asserts the sender (RFC 3325 §9.1): the first identity
-	// is the one the engine keys by, and every one of them, as asserted
-	// and in canonical form, is one the sender may name in its CPIM From.
-	pai, err := req.Header.PAssertedIdentity()
-	if err != nil || len(pai) == 0 {
-		return messaging.Origin{}, 403
-	}
-	sender, ok := UserOf(pai[0].URI.String(), s.cfg.HomeDomain)
-	if !ok {
-		return messaging.Origin{}, 403
-	}
-	var identities []string
-	for _, a := range pai {
-		raw := a.URI.String()
-		identities = append(identities, raw)
-		if c, ok := UserOf(raw, s.cfg.HomeDomain); ok && c != sender {
-			identities = append(identities, c)
-		}
-	}
-	recipient, ok := UserOf(req.URI.String(), s.cfg.HomeDomain)
+	recipient, ok := messaging.UserOf(req.URI.String(), s.cfg.HomeDomain)
 	if !ok {
 		return messaging.Origin{}, 404
 	}
@@ -208,6 +217,44 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 		Sender: sender, Identities: identities, Recipient: recipient, Conversation: conv,
 		Mode: store.Standalone, Pager: true, CPIM: req.Body,
 	}, 0
+}
+
+// asserted reads the sender the network asserted (RFC 3325 §9.1), never a
+// header the client wrote, or the status that refuses the request: 403. It
+// takes what pcscf asserts, one identity or the SIP and tel pair of one
+// user (#208), and nothing more: at most two, at most one of each scheme,
+// all one user (messaging.UserOf). That user is the sender, and every
+// identity as asserted is one the sender may name itself by.
+func (s *Server) asserted(req *sip.Request) (string, []string, int) {
+	pai, err := req.Header.PAssertedIdentity()
+	if err != nil || len(pai) == 0 || len(pai) > 2 {
+		return s.refuseAsserted()
+	}
+	var sender string
+	var identities []string
+	schemes := map[string]bool{}
+	for _, a := range pai {
+		raw := a.URI.String()
+		user, ok := messaging.UserOf(raw, s.cfg.HomeDomain)
+		scheme := a.URI.Scheme
+		if scheme == "sips" {
+			scheme = "sip"
+		}
+		if !ok || schemes[scheme] || sender != "" && user != sender {
+			return s.refuseAsserted()
+		}
+		schemes[scheme], sender = true, user
+		identities = append(identities, raw)
+	}
+	if !slices.Contains(identities, sender) {
+		identities = append(identities, sender)
+	}
+	return sender, identities, 0
+}
+
+func (s *Server) refuseAsserted() (string, []string, int) {
+	s.cfg.Metrics.Count("sip.asserted.refused", 1)
+	return "", nil, 403
 }
 
 // submit hands o to the engine and returns the status that answers it,
@@ -245,14 +292,9 @@ func refusalStatus(r messaging.Reason) int {
 	return 403
 }
 
-// respond answers req with code. A 415 says what to send (RFC 3261
-// §21.4.13).
+// respond answers req with code.
 func (s *Server) respond(u *proxy.UAS, req *sip.Request, code int) {
-	var fields [][2]string
-	if code == 415 {
-		fields = append(fields, [2]string{"Accept", cpim.ContentType})
-	}
-	s.respondWith(u, req, code, fields...)
+	s.respondWith(u, req, code)
 }
 
 // respondRetry answers req with code and says when to try again: the

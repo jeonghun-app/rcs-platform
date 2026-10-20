@@ -1,4 +1,4 @@
-package sipas
+package messaging
 
 import (
 	"slices"
@@ -19,8 +19,10 @@ import (
 //
 // The engine keys queues, a sender's share of them and sent-message records
 // by this string, so the same person arriving in any of these forms holds
-// one share, and its notifications find the messages sent to it. It is
-// rcs-as's key only: scscf keeps the SIP and tel URIs as two identities.
+// one share, and its notifications find the messages sent to it; the SIP
+// layer names users so (Origin), and the engine compares the addresses a
+// client writes for itself the same way (Config.HomeDomain). It is rcs-as's
+// key only: scscf keeps the SIP and tel URIs as two identities.
 func UserOf(uri, homeDomain string) (string, bool) {
 	u, err := sip.ParseURI(uri)
 	if err != nil {

@@ -16,36 +16,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
-func TestAUserIsNamedInOneForm(t *testing.T) {
-	for in, want := range map[string]string{
-		"tel:+1-555-010-0001": alice,
-		"tel:+15550100001":    alice,
-		aliceSIP:              alice,
-		"sip:+1-555-010-0001@IMS.example.net;user=phone": alice,
-		// The home domain's SIP form of a number is that number
-		// (architecture §4), elsewhere only with user=phone.
-		"sip:+15550100001@" + domain:                        alice,
-		"sip:+1-555-010-0001@" + strings.ToUpper(domain):    alice,
-		"sip:+15550100001@other.example.net":                "sip:+15550100001@other.example.net",
-		"sip:+15550100001@" + domain + ";user=ip":           "sip:+15550100001@" + domain,
-		"sip:+15550100001;ext=11@" + domain:                 "sip:+15550100001;ext=11@" + domain,
-		"sip:Bob@EXAMPLE.net":                               "sip:Bob@example.net",
-		"sip:Bob@example.net;user=phone":                    "sip:Bob@example.net",
-		"sip:%42ob@example.net":                             "sip:Bob@example.net",
-		"sips:+15550100002@" + domain + ";user=phone;lr":    bob,
-		"sip:+15550100002;ext=11@" + domain + ";user=phone": "sip:+15550100002;ext=11@" + domain,
-	} {
-		if got, ok := UserOf(in, domain); !ok || got != want {
-			t.Errorf("UserOf(%q) = %q, %t, want %q", in, got, ok, want)
-		}
-	}
-	for _, in := range []string{"", "not a URI", "tel:5550100", "sip:example.net", "http://example.net/"} {
-		if got, ok := UserOf(in, domain); ok {
-			t.Errorf("UserOf(%q) = %q, want none", in, got)
-		}
-	}
-}
-
 // A pager-mode MESSAGE from the core goes into the engine as a standalone
 // message from the asserted sender, both users named in one form, and is
 // answered 202 Accepted (RFC 3428 §7).
@@ -78,6 +48,14 @@ func TestAPagerMessageIsSubmittedFromTheAssertedSender(t *testing.T) {
 	}
 }
 
+// asserting replaces a request's P-Asserted-Identity with pai.
+func asserting(pai string) func(msg) msg {
+	return func(m msg) msg {
+		m.fields[0] = "P-Asserted-Identity: " + pai
+		return m
+	}
+}
+
 func TestWhatRCSASCannotTakeIsRefusedWithItsStatus(t *testing.T) {
 	busy := fmt.Errorf("fake: %w", store.ErrBusy)
 	for name, c := range map[string]struct {
@@ -90,13 +68,23 @@ func TestWhatRCSASCannotTakeIsRefusedWithItsStatus(t *testing.T) {
 			header: [2]string{"Accept", "message/cpim"}},
 		"no asserted identity": {m: func(m msg) msg { m.fields = m.fields[1:]; return m }, code: 403},
 		"asserted non-user":    {m: func(m msg) msg { m.fields[0] = "P-Asserted-Identity: <sip:example.net>"; return m }, code: 403},
-		"recipient no user":    {m: func(m msg) msg { m.uri = "sip:" + domain; return m }, code: 404},
+		// What pcscf asserts is one identity or one user's SIP and tel
+		// pair (#208), nothing else (QA on #242).
+		"three asserted": {m: asserting("<tel:+15550100001>, <sip:+15550100001@" + domain + ">, <" + aliceSIP + ">"), code: 403},
+		"two tel URIs":   {m: asserting("<tel:+15550100001>, <tel:+1-555-010-0001>"), code: 403},
+		"two SIP URIs":   {m: asserting("<sip:+15550100001@" + domain + ">, <" + aliceSIP + ">"), code: 403},
+		"two users":      {m: asserting("<sip:+15550100001@" + domain + ">, <tel:+15550100003>"), code: 403},
+		"one a non-user": {m: asserting("<tel:+15550100001>, <sip:example.net>"), code: 403},
+		"an extension rcs-as lacks": {m: func(m msg) msg { m.fields = append(m.fields, "Require: x-qa-unknown"); return m }, code: 420,
+			header: [2]string{"Unsupported", "x-qa-unknown"}},
+		"recipient no user": {m: func(m msg) msg { m.uri = "sip:" + domain; return m }, code: 404},
 		"bad conversation": {m: func(m msg) msg {
 			m.fields = append(m.fields, "Conversation-ID: <bad id>")
 			return m
 		}, code: 400},
-		"too large":      {err: &messaging.Rejection{Reason: messaging.ReasonTooLarge}, code: 413},
-		"wrong type":     {err: &messaging.Rejection{Reason: messaging.ReasonContentType}, code: 415},
+		"too large": {err: &messaging.Rejection{Reason: messaging.ReasonTooLarge}, code: 413},
+		// The client sent message/cpim already: no Accept (QA on #242).
+		"wrong type":     {err: &messaging.Rejection{Reason: messaging.ReasonContentType}, code: 415, header: [2]string{"Accept", ""}},
 		"malformed":      {err: &messaging.Rejection{Reason: messaging.ReasonMalformed}, code: 400},
 		"malformed IMDN": {err: &messaging.Rejection{Reason: messaging.ReasonIMDNMalformed}, code: 400},
 		"forged IMDN":    {err: &messaging.Rejection{Reason: messaging.ReasonIMDNForged}, code: 403},
@@ -230,7 +218,7 @@ func TestADeliveryNotificationFindsItsMessageWhateverTheForms(t *testing.T) {
 func startEngine(t *testing.T, core *fakeCore, cfg messaging.Config) (*as, *messaging.Engine) {
 	t.Helper()
 	var a *as
-	cfg.MSRPHost, cfg.MSRPPort = "127.0.0.1", 2855
+	cfg.MSRPHost, cfg.MSRPPort, cfg.HomeDomain = "127.0.0.1", 2855, domain
 	cfg.SenderRate = messaging.Rate{PerMinute: -1}
 	e, err := messaging.New(cfg, store.NewMemory(), deliverer{&a}, noMetrics{})
 	if err != nil {

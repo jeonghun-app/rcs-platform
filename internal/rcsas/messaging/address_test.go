@@ -248,8 +248,21 @@ func TestASendersOwnAddressInAnotherFormIsItsOwn(t *testing.T) {
 		asserted: true, "sip:+15550100002@IMS.example.net": true, AnonymousURI: true,
 		"sip:+15550100003@ims.example.net": false, "not a URI": false,
 	} {
-		if got := namesSender(uri, "sip:+15550100002@ims.example.net", nil); got != want {
+		if got := namesSender(uri, "sip:+15550100002@ims.example.net", nil, ""); got != want {
 			t.Errorf("namesSender(%q) = %v", uri, got)
 		}
+	}
+	// One number, written as a tel URI or a SIP one, is one user (UserOf,
+	// QA on #242): with user=phone anywhere, without it at the home domain.
+	for uri, want := range map[string]bool{
+		"tel:+15550100002": true, "tel:+1-555-010-0002": true, "sip:+15550100002@other.example.net;user=phone": true,
+		"sip:+15550100002@other.example.net": false, "tel:+15550100003": false,
+	} {
+		if got := namesSender(uri, "sip:+15550100002@ims.example.net", nil, "ims.example.net"); got != want {
+			t.Errorf("namesSender(%q) at the home domain = %v", uri, got)
+		}
+	}
+	if !namesSender("sip:+15550100002@ims.example.net;user=phone", "tel:+15550100002", nil, "") {
+		t.Error("a tel sender does not name itself as sip:...;user=phone")
 	}
 }

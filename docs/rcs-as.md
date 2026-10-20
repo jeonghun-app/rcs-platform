@@ -112,12 +112,15 @@ it forwards then goes on to `scscf` rather than to rcs-as again.
 
 ### Who sends, and to whom
 
-The sender is the first `P-Asserted-Identity`, which the core inserted (RFC
-3325 §9.1); a MESSAGE without one is refused with 403. Every asserted identity,
-as asserted and in the canonical form below, is one the sender may name in its
-CPIM `From`. The recipient is the Request-URI.
+The sender is the user the core asserted in `P-Asserted-Identity` (RFC 3325
+§9.1), never a header the client wrote. rcs-as takes what pcscf asserts (#208):
+one identity, or one user's SIP and tel identities together. More than two, two
+of one scheme, or identities of two users are refused with 403 and counted
+(`sip.asserted.refused`), as is a MESSAGE with none. Every asserted identity is
+one the sender may name in its CPIM `From`, in any of the forms below. The
+recipient is the Request-URI.
 
-Each user is named in one form (`sipas.UserOf`), since the queues, a sender's
+Each user is named in one form (`messaging.UserOf`), since the queues, a sender's
 share of them and the sent-message records are keyed by that string. A global
 telephone number is `tel:+` and its digits (RFC 3261 §19.1.6), whether written
 as a tel URI, as a SIP URI with `user=phone`, or as a SIP URI at the home
@@ -128,19 +131,22 @@ domain (`RCS_IMS_DOMAIN`) whose user part is the number, with or without
 as `sip:...;user=phone`. Any other identity is `identity.CanonicalIMPU`'s form.
 So `tel:+1-555-0100`, `sip:+15550100@host;user=phone` and
 `sip:+15550100@<domain>` are one user, holding one share, and a notification
-sent to any of them finds the message. This is rcs-as's key only: `scscf`
-keeps the SIP and tel URIs as two identities of the set.
+sent to any of them finds the message. The engine compares the address a client
+writes for itself, a CPIM `From` or an IMDN recipient, the same way. This is
+rcs-as's key only: `scscf` keeps the SIP and tel URIs as two identities of the
+set.
 
 ### Answers
 
 | Outcome | Status |
 |---|---|
 | stored | 202 Accepted (RFC 3428 §7) |
+| a `Require` option tag (rcs-as supports none for MESSAGE) | 420, with `Unsupported` (RFC 3261 §8.2.2.3) |
 | not `message/cpim` | 415, with `Accept: message/cpim` |
-| no asserted identity, or one that names no user | 403 |
+| no asserted identity, or not as above | 403 |
 | a Request-URI that names no user | 404 |
 | unreadable `Conversation-ID` or `Contribution-ID` | 400 |
-| refused for its size / type / syntax (`Rejection`) | 413 / 415 / 400 |
+| refused for its size / type / syntax (`Rejection`) | 413 / 415 / 400; the 415 without `Accept`, since the client sent `message/cpim` already |
 | any other refusal (rates, queue full, forged or unrequested notification, ...) | 403 |
 | the store busy after its retries (`store.ErrBusy`) | 500 with `Retry-After: 1` |
 | any other store failure | 500 |
@@ -851,6 +857,7 @@ identifier ever appears in a metric name.
 |---|---|
 | `message.accepted`, `message.accepted.notification`, `message.resent` | Accepted messages, notifications, resends |
 | `sip.message.<status>` | Pager-mode MESSAGEs rcs-as answered, by status |
+| `sip.asserted.refused` | Requests whose `P-Asserted-Identity` is not one user's, as pcscf asserts it, refused with 403 |
 | `sip.pager.<status>`, `sip.pager.timeout`, `sip.pager.unsent`, `sip.pager.unresolved` | MESSAGEs rcs-as sent, by final status, and those that got none, could not be sent or found no next hop |
 | `sip.loop` | Requests rcs-as originated that came back to it, answered 482 |
 | `sip.refused.method`, `sip.respond_failed`, `sip.invite.unserved` | Requests of a method rcs-as does not take, answers the transport did not take, invitations not sent |
