@@ -1,11 +1,13 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -139,4 +141,107 @@ func TestMessagesQueuedWhileABlockedPassStaysBlockedWait(t *testing.T) {
 		t.Fatal("a message to a recipient that stayed unreachable started another pass")
 	default:
 	}
+}
+
+// The code review's case: the pass that gets through ends with messages
+// waiting for a session (holdWaiting, carol's chat message), not with an
+// empty queue. bob's message still goes.
+func TestAMessageQueuedWhileABlockedPassEndsWaitingIsDelivered(t *testing.T) {
+	r := newRigWith(t, Config{}, store.NewMemory(), newFakeClock())
+	r.e.SetGroupHandler(members{all: []string{alice, bob, carol}})
+	drainInvites(t, r.d)
+	r.d.onInvite(func(Invitation) error { return ErrOffline })
+	var delivered atomic.Int32
+	r.d.onPager(func(d Delivery) error {
+		if d.Recipient == alice && !d.Notification {
+			delivered.Add(1)
+		}
+		return nil
+	})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", imdn.Display))); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(bob, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "chat", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first passes", r.idle)
+	l := r.listen(t)
+	first, c1 := r.connectScripted(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group}, func(*msrp.Message) error {
+		return &msrp.StatusError{Code: msrp.StatusRequestTimeout}
+	})
+	waitFor(t, "the failed attempt", func() bool { return c1.got.Load() == 1 && r.idle() })
+	_ = first.Close()
+	waitFor(t, "idle", r.idle)
+	_, _ = r.connectScripted(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group}, func(*msrp.Message) error {
+		if err := r.e.Submit(context.Background(), standalone(bob, alice, chat(t, "d1", "are you there?", 0))); err != nil {
+			t.Errorf("bob: %v", err)
+		}
+		return nil
+	})
+	waitFor(t, "bob's message delivered", func() bool { return delivered.Load() == 1 })
+	waitFor(t, "idle", r.idle)
+	r.e.mu.Lock()
+	h := r.e.recipients[alice].hold
+	r.e.mu.Unlock()
+	if h != holdWaiting {
+		t.Fatalf("hold %d, want waiting: carol's chat message waits for a session", h)
+	}
+}
+
+type gate struct{ entered, release chan struct{} }
+
+func newGate() gate { return gate{make(chan struct{}, 1), make(chan struct{})} }
+
+// QA's case: a pass of single messages that starts with the queue blocked
+// (by the previous pass of the same run) and gets through. A message that
+// came in during it goes too, not at the retry timer.
+func TestASinglesPassThatStartsBlockedAndGetsThroughReadsTheQueueAgain(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}, RetryInterval: time.Hour, MaxRetryInterval: time.Hour})
+	drainInvites(t, r.d)
+	g1, g2 := newGate(), newGate()
+	var third, firstTries atomic.Int32
+	r.d.onPager(func(d Delivery) error {
+		switch {
+		case bytes.Contains(d.CPIM, []byte("text-first")):
+			if firstTries.Add(1) > 1 {
+				return nil
+			}
+			g1.entered <- struct{}{}
+			<-g1.release
+			return errors.New("480 Temporarily Unavailable")
+		case bytes.Contains(d.CPIM, []byte("text-second")):
+			g2.entered <- struct{}{}
+			<-g2.release
+			return nil
+		case bytes.Contains(d.CPIM, []byte("text-third")):
+			third.Add(1)
+		}
+		return nil
+	})
+	// carol's chat message waits for a session: holdWaiting.
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "text-chat", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	// s1 is tried on its own and blocks in the pager.
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s1", "text-first", 0))); err != nil {
+		t.Fatal(err)
+	}
+	<-g1.entered
+	// s2 comes in while the queue is still holdWaiting: a single too.
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s2", "text-second", 0))); err != nil {
+		t.Fatal(err)
+	}
+	close(g1.release) // s1 fails: stop, holdBlocked; the run goes on with s2
+	<-g2.entered
+	// s3 comes in while a pass runs with the queue blocked.
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "s3", "text-third", 0))); err != nil {
+		t.Fatal(err)
+	}
+	close(g2.release) // s2 goes: bob is reachable
+	waitFor(t, "s3 delivered", func() bool { return third.Load() == 1 })
+	waitFor(t, "s1 delivered on the same read", func() bool { return firstTries.Load() == 2 && r.idle() })
 }

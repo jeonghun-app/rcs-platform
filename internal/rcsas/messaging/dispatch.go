@@ -195,10 +195,12 @@ func (e *Engine) work() {
 			}
 			e.settle(user, r, res, full)
 			if r.arrived {
-				// Blocked still, it waits like the rest; otherwise the
-				// queue is read again for it.
+				// A pass that stopped leaves it to wait like the rest. One
+				// that got through, full or of single messages, has the
+				// queue read again for it: a pass of singles leaves the
+				// hold as it was, so the hold cannot tell.
 				r.arrived = false
-				if r.hold != holdBlocked {
+				if !res.stopped {
 					r.full = true
 				}
 			}
