@@ -300,7 +300,8 @@ func TestCloseDoesNotWaitForConnectionsInTheirHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, err := server.Listen(ListenerConfig{Network: TCP, Addr: "127.0.0.1:0", ProxyProtocol: true})
+	// Both deadlines out of reach, so only Close can end the connection.
+	addr, err := server.Listen(ListenerConfig{Network: TCP, Addr: "127.0.0.1:0", ProxyProtocol: true, ProxyHeaderTimeout: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

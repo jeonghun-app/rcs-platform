@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
@@ -35,6 +37,8 @@ type deps struct {
 	resolver proxy.Resolver
 	// listening, if set, hears the SIP listener's bound address.
 	listening func(netip.AddrPort)
+	// msrp, if set, replaces the MSRP listener.
+	msrp net.Listener
 }
 
 // Run serves cfg until ctx ends.
@@ -61,13 +65,6 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if resolver == nil {
 		resolver = sipas.Resolver{Namespace: cfg.Namespace}
 	}
-	srv, err := sipas.New(sipas.Config{
-		Core: cfg.Core, Host: cfg.SIPHost.String(), HomeDomain: cfg.HomeDomain, Listener: sipListener, Resolver: resolver,
-		Metrics: rt.Metrics, Logger: rt.Logger,
-	})
-	if err != nil {
-		return err
-	}
 	// The proxy is made once the listener's port is known, which its Self
 	// needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
@@ -87,6 +84,20 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if err != nil {
 		return fmt.Errorf("rcs-as: SIP listener: %w", err)
 	}
+	// The Contact of rcs-as's sessions is this task's address, where the
+	// requests in their dialogs come back to it (ADR 0005).
+	self, err := sip.ParseURI("sip:" + hostPort(cfg.SIPHost, addr.Port()) + ";transport=tcp")
+	if err != nil {
+		return err
+	}
+	srv, err := sipas.New(sipas.Config{
+		Core: cfg.Core, Host: cfg.SIPHost.String(), HomeDomain: cfg.HomeDomain, Contact: self, Listener: sipListener,
+		Resolver: resolver, MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions,
+		MaxOutgoingPerUser: cfg.MaxOutgoingPerUser, MaxIncomingPerUser: cfg.MaxIncomingPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
+	})
+	if err != nil {
+		return err
+	}
 	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger})
 	if err != nil {
 		return err
@@ -102,15 +113,31 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// answers to the deliveries in flight that it waits for (bounded by
 	// RCSAS_DELIVERY_TIMEOUT).
 	defer engine.Close()
-	srv.Bind(engine, px.Layer())
+	srv.Bind(engine, px.Layer(), tr)
+	// Run first of the deferred calls: the sessions end with a BYE while
+	// the transport still carries it.
+	defer srv.Close()
 	p.Store(px)
+
+	// msrp-relay connects here for every leg (ADR 0004).
+	ml := d.msrp
+	if ml == nil {
+		if ml, err = net.Listen("tcp", cfg.MSRPListenAddr); err != nil {
+			return fmt.Errorf("rcs-as: MSRP listener: %w", err)
+		}
+	}
+	serveCtx, stopServing := context.WithCancel(ctx)
+	served := make(chan error, 1)
+	go func() { served <- engine.Serve(serveCtx, ml) }()
+	defer func() { stopServing(); <-served }()
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- engine.Run(ctx) }()
 	if d.listening != nil {
 		d.listening(addr)
 	}
-	rt.Logger.Info("serving SIP", slog.String("sip_addr", addr.String()), slog.String("store", cfg.Store))
+	rt.Logger.Info("serving SIP and MSRP", slog.String("sip_addr", addr.String()),
+		slog.String("msrp_addr", ml.Addr().String()), slog.String("store", cfg.Store))
 	rt.Ready()
 	select {
 	case <-ctx.Done():
@@ -120,6 +147,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 			return nil
 		}
 		return err
+	case err := <-served:
+		served <- err // for the deferred wait
+		if ctx.Err() != nil {
+			// The listener stopped for the shutdown, which may be seen
+			// here before ctx.Done is.
+			return nil
+		}
+		return fmt.Errorf("rcs-as: MSRP listener: %w", err)
 	}
 }
 
@@ -148,4 +183,12 @@ func selfURIs(cfg Config, port uint16) []sip.URI {
 		}
 	}
 	return out
+}
+
+func hostPort(a netip.Addr, port uint16) string {
+	host := a.String()
+	if a.Is6() {
+		host = "[" + host + "]"
+	}
+	return host + ":" + strconv.Itoa(int(port))
 }
