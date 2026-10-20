@@ -647,3 +647,32 @@ func TestAGroupSenderIsNamedInCanonicalForm(t *testing.T) {
 		t.Fatalf("a sender that is no URI: %q", got)
 	}
 }
+
+// The SIP layer invites a new group's participants through Invite, which
+// keeps the engine's own count: once for each, and a message queued for
+// one meanwhile waits for that session rather than ringing its client a
+// second time (#137).
+func TestInviteAsksOnceForAParticipantsSession(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	inv := Invitation{Recipient: bob, Peer: groupURI, Conversation: conv, Mode: store.Group}
+	r.e.Invite(t.Context(), inv)
+	r.e.Invite(t.Context(), inv)
+	if got := r.d.nextInvite(t); got != inv {
+		t.Fatalf("invitation %+v", got)
+	}
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 {
+		t.Fatalf("%d more invitations", n)
+	}
+	// A recipient that takes no sessions from the network is not rung.
+	r.e.InviteFailed(Invitation{Recipient: alice, Peer: bob, Mode: store.Chat}, ErrNoSessions)
+	r.e.Invite(t.Context(), Invitation{Recipient: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 {
+		t.Fatalf("%d invitations to a pager-only recipient", n)
+	}
+}

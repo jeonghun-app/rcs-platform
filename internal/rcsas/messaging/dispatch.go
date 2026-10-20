@@ -593,6 +593,26 @@ func (e *Engine) inviteDue(m store.Message) bool {
 // session for this message alone for a standalone one.
 func (e *Engine) invite(ctx context.Context, m store.Message) {
 	inv, key := invitation(m)
+	e.ask(ctx, inv, key)
+}
+
+// Invite asks the Deliverer for inv's session as the engine asks for the
+// sessions of what it queues, unless one was asked for within
+// InviteTimeout or the recipient takes no sessions from the network: the
+// SIP layer's way to invite a group's new participants, for whom nothing
+// is queued yet. A message queued for one meanwhile then waits for that
+// session rather than ringing its client a second time.
+func (e *Engine) Invite(ctx context.Context, inv Invitation) {
+	e.mu.Lock()
+	_, pagerOnly := e.pagerOnly[inv.Recipient]
+	e.mu.Unlock()
+	if pagerOnly {
+		return
+	}
+	e.ask(ctx, inv, inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID})
+}
+
+func (e *Engine) ask(ctx context.Context, inv Invitation, key inviteKey) {
 	now := e.clock.Now()
 	e.mu.Lock()
 	if until, ok := e.invites[key]; ok && now.Before(until) {
