@@ -131,11 +131,21 @@ type Registration struct {
 	// a registration, with contacts and Unregistered zero; at Unregistered a
 	// sweep claims it as it claims a registration whose last contact expired.
 	Unregistered time.Time
+	// Reassert is set on a live registration whose assignment the HSS may
+	// have lost: a deregistration's SAR crossed a REGISTER's, and telling the
+	// HSS again (SAR REGISTRATION) failed. It is when a sweep tries again;
+	// ReassertAttempts counts the failures, so that the sweep backs off and
+	// gives up.
+	Reassert         time.Time
+	ReassertAttempts int
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). It is opaque: a new item
 	// starts at a random value (FirstVersion).
 	Version int64
 }
+
+// MaxReassertAttempts bounds Registration.ReassertAttempts.
+const MaxReassertAttempts = 16
 
 // SetIdentity is one public identity of an implicit registration set.
 type SetIdentity struct {
@@ -222,17 +232,26 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or, without contacts, when its deregistration may be
-// retried, or else when its unregistered state ends. A registration with none
-// of these is due at once.
+// contact expiry, or a due Reassert if earlier, or, without contacts, when its
+// deregistration may be retried, or else when its unregistered state ends. A
+// registration with none of these is due at once.
 func (r *Registration) SweepAt() time.Time {
 	switch {
 	case len(r.Contacts) > 0:
-		return r.NextExpiry()
+		if next := r.NextExpiry(); r.Reassert.IsZero() || next.Before(r.Reassert) {
+			return next
+		}
+		return r.Reassert
 	case !r.Deregistering.IsZero():
 		return r.Deregistering
 	}
 	return r.Unregistered
+}
+
+// ReassertDue reports whether a sweep at now should tell the HSS again that
+// this S-CSCF serves r's set (Reassert).
+func (r *Registration) ReassertDue(now time.Time) bool {
+	return !r.Reassert.IsZero() && !r.Reassert.After(now)
 }
 
 // Prune removes the contacts that have expired at now and returns them.
@@ -290,6 +309,9 @@ func (r *Registration) Validate() error {
 	}
 	if !r.Deregistering.IsZero() && !validTime(r.Deregistering) {
 		return fmt.Errorf("%w: Deregistering out of range", ErrInvalid)
+	}
+	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
+		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)
 	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)

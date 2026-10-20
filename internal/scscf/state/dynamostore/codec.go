@@ -24,6 +24,8 @@ type registrationDoc struct {
 	Contacts      []contactDoc  `json:"contacts,omitempty"`
 	Deregistering *time.Time    `json:"deregistering,omitempty"`
 	Unregistered  *time.Time    `json:"unregistered,omitempty"`
+	Reassert      *time.Time    `json:"reassert,omitempty"`
+	Attempts      int           `json:"reassert_attempts,omitempty"`
 }
 
 type identityRef struct {
@@ -82,6 +84,11 @@ func encodeRegistration(r *state.Registration) ([]byte, error) {
 		t := r.Unregistered.UTC()
 		doc.Unregistered = &t
 	}
+	if !r.Reassert.IsZero() {
+		t := r.Reassert.UTC()
+		doc.Reassert = &t
+	}
+	doc.Attempts = r.ReassertAttempts
 	for _, c := range r.Contacts {
 		doc.Contacts = append(doc.Contacts, contactDoc{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: c.Path, Expires: c.Expires.UTC(),
@@ -106,6 +113,10 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	if doc.Unregistered != nil {
 		r.Unregistered = *doc.Unregistered
 	}
+	if doc.Reassert != nil {
+		r.Reassert = *doc.Reassert
+	}
+	r.ReassertAttempts = doc.Attempts
 	for _, c := range doc.Contacts {
 		r.Contacts = append(r.Contacts, state.Contact{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: nilIfEmpty(c.Path), Expires: c.Expires,

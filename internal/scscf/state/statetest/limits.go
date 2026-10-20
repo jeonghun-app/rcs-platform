@@ -672,3 +672,44 @@ func testDeleteProfileIf(t *testing.T, a, b state.Store, _ Options) {
 		t.Errorf("deleting an impossible profile: %v", err)
 	}
 }
+
+// testReassertSweep: a live registration whose Reassert has come is handed to
+// one sweep, which claims it for a lease, and is due again only when that
+// lease ends or the handler moves Reassert.
+func testReassertSweep(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1, time.Hour)
+	r.Reassert, r.ReassertAttempts = T0.Add(time.Minute), 1
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if regs := must(b.ExpiringRegistrations(ctx(t), T0, 10))(t); len(regs) != 0 {
+		t.Error("listed before its Reassert")
+	}
+	at := T0.Add(time.Minute)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), at, 10))(t)) == 1
+	})
+	called := 0
+	sweep := func(s state.Store, now time.Time) {
+		t.Helper()
+		if _, err := state.SweepRegistrations(ctx(t), s, now, 10, func(before, after *state.Registration) error {
+			called++
+			if !before.ReassertDue(now) || len(after.Contacts) != 1 || !after.Reassert.Equal(now.Add(state.SweepLease)) {
+				t.Errorf("handled %+v then %+v", before, after)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweep(a, at)
+	sweep(b, at.Add(state.SweepLease/2))
+	if called != 1 {
+		t.Fatalf("handled %d times within the lease", called)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); len(got.Contacts) != 1 || got.ReassertAttempts != 1 {
+		t.Errorf("after the sweep: %+v", got)
+	}
+	bad := Registration(IMPI1, IMPU2, time.Hour)
+	bad.ReassertAttempts = state.MaxReassertAttempts + 1
+	_, err := a.SaveRegistration(ctx(t), bad)
+	wantErr(t, err, state.ErrInvalid)
+}
