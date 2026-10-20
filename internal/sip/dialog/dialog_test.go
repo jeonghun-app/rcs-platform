@@ -397,6 +397,18 @@ func TestAnACKTakesItsINVITEsCSeq(t *testing.T) {
 	if bye, _ := d.Request("BYE", ids()); bye.Header.Get("CSeq") != "9 BYE" {
 		t.Errorf("after the ACK: %q", bye.Header.Get("CSeq"))
 	}
+	// Whatever came between, the ACK is the INVITE's.
+	if again, _ := d.Request("ACK", ids()); again.Header.Get("CSeq") != "8 ACK" {
+		t.Errorf("an ACK after a BYE: %q", again.Header.Get("CSeq"))
+	}
+	if next, _ := d.Request("INFO", ids()); next.Header.Get("CSeq") != "10 INFO" {
+		t.Errorf("after that ACK: %q", next.Header.Get("CSeq"))
+	}
+	// The dialog the INVITE set up acknowledges that INVITE.
+	first, _ := UAC(request(t, invite), response(t, ok200))
+	if ack, err := first.Request("ACK", ids()); err != nil || ack.Header.Get("CSeq") != "7 ACK" {
+		t.Errorf("the first ACK: %q, %v", ack.Header.Get("CSeq"), err)
+	}
 	fresh := &Dialog{CallID: "c", Local: mustAddr(t, "<"+alice+">;tag=a"), Remote: mustAddr(t, "<"+bob+">;tag=b"), RemoteTarget: mustURI(t, bob)}
 	if _, err := fresh.Request("ACK", ids()); err == nil {
 		t.Error("an ACK without an INVITE")
@@ -456,8 +468,13 @@ func TestTheRequestURIHasNoHeadersOrMethod(t *testing.T) {
 		t.Errorf("the dialog's target changed: %s", d.RemoteTarget)
 	}
 	d.RouteSet = []sip.Address{mustAddr(t, "<sip:strict.rcs.internal;method=BYE?X=1>")}
-	if req, _ := d.Request("BYE", ids()); req.URI.String() != "sip:strict.rcs.internal" {
+	req, _ = d.Request("BYE", ids())
+	if req.URI.String() != "sip:strict.rcs.internal" {
 		t.Errorf("a strict router's Request-URI %s", req.URI)
+	}
+	// The remote target goes last in the Route, without them too.
+	if routes := req.Header.Values("Route"); len(routes) != 1 || routes[0] != "<sip:scscf.rcs.internal;transport=tcp>" || req.Validate() != nil {
+		t.Errorf("Route %q, %v", routes, req.Validate())
 	}
 }
 
