@@ -2,7 +2,7 @@
 // (deploy/docker-compose.yml, docs/local-stack.md).
 //
 //	stack-init tables   create the DynamoDB tables and the S3 bucket
-//	stack-init seed     provision the test subscriber in hss and acs
+//	stack-init seed     provision the two test subscribers in hss and acs
 //
 // Both are idempotent: what exists is left as it is, so `make up` can run
 // them again on a stack that is already up. It is a development tool. In

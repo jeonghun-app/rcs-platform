@@ -9,11 +9,16 @@
 //
 //	rcs-sim [flags] scenario...   (or "all"; -list names them)
 //
-// Each step prints one JSON line to standard output. The exit status is 0
-// when every step succeeded, 1 when one failed, and 2 for a usage error.
+// Each step prints one JSON line to standard output, and a summary of the
+// steps run, failed and skipped goes to standard error. A step the stack
+// cannot run yet is skipped, with a fixed reason; -require-all makes that a
+// failure. The exit status is 0 when no step failed, 1 when one did, and 2
+// for a usage error.
 // Secrets come only from the environment: RCS_SIM_FT_PASSWORD,
 // RCS_SIM_RELAY_TOKEN, and for SIP RCS_SIM_AKA_K and RCS_SIM_AKA_OPC or
-// RCS_SIM_SIP_PASSWORD. None is ever printed, and neither are session ids.
+// RCS_SIM_SIP_PASSWORD, with the peer's own in RCS_SIM_PEER_AKA_K and
+// RCS_SIM_PEER_AKA_OPC or RCS_SIM_SIP_PEER_PASSWORD. None is ever printed,
+// and neither are session ids.
 // docs/rcs-sim.md has the details.
 package main
 
@@ -37,6 +42,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // Exit statuses.
@@ -85,6 +91,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		self          = fs.String("self", defaultSelf, "the simulated client's address")
 		peer          = fs.String("peer", defaultPeer, "the far end's address")
 		stepTimeout   = fs.Duration("step-timeout", 30*time.Second, "bound on each step")
+		requireAll    = fs.Bool("require-all", false, "fail a step that would be skipped for want of something the stack does not offer yet")
 		sf            sipFlags
 	)
 	fs.StringVar(&sf.proxy, "sip-proxy", "", "pcscf's host:port; enables the SIP client")
@@ -95,6 +102,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	fs.StringVar(&sf.impi, "sip-impi", "", "private user identity (default: "+envIMPI+")")
 	fs.StringVar(&sf.auth, "sip-auth", "aka", "aka (RCS_SIM_AKA_K, RCS_SIM_AKA_OPC) or digest (RCS_SIM_SIP_PASSWORD)")
 	fs.StringVar(&sf.instance, "sip-instance", "", "+sip.instance URN (default: a new urn:uuid)")
+	fs.StringVar(&sf.peerIMPI, "sip-peer-impi", "", "the far end's private user identity, for pager-message (default: "+envPeerIMPI+"); its credentials are "+sipua.EnvPeerAKAK+", "+sipua.EnvPeerAKAOPc+" or "+sipua.EnvPeerSIPPassword)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -131,6 +139,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		MSRP:          msrp.Config{KeepAliveInterval: *keepAlive},
 		IdleWait:      *idleWait,
 		StepTimeout:   *stepTimeout,
+		RequireAll:    *requireAll,
 	}
 	var err error
 	if cfg.Self, err = cpim.ParseAddress("<" + *self + ">"); err != nil {
@@ -188,13 +197,36 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		if cfg.SIP, err = sipConfig(ctx, sf, *self, lookup); err != nil {
 			return usage(err.Error())
 		}
+		if sf.peerIMPI == "" {
+			sf.peerIMPI = envOr(lookup, envPeerIMPI, "")
+		}
+		if sf.peerIMPI != "" {
+			peerFlags := sf
+			peerFlags.impi, peerFlags.instance, peerFlags.credEnv = sf.peerIMPI, "", sipua.PeerEnv
+			if cfg.SIPPeer, err = sipConfig(ctx, peerFlags, *peer, lookup); err != nil {
+				return usage("peer: " + err.Error())
+			}
+		}
 	}
 
 	enc := json.NewEncoder(stdout)
-	ok, err := scenario.Run(ctx, cfg, fs.Args(), func(r scenario.Result) { _ = enc.Encode(r) })
+	var steps, failed, skipped int
+	ok, err := scenario.Run(ctx, cfg, fs.Args(), func(r scenario.Result) {
+		steps++
+		switch {
+		case !r.OK:
+			failed++
+		case r.Skipped != "":
+			skipped++
+		}
+		_ = enc.Encode(r)
+	})
 	if err != nil {
 		return usage(err.Error())
 	}
+	// The summary goes to standard error, so standard output stays one
+	// JSON line per step.
+	fmt.Fprintf(stderr, "rcs-sim: %d steps, %d failed, %d skipped\n", steps, failed, skipped)
 	if !ok {
 		return exitFailed
 	}

@@ -31,6 +31,21 @@ var IsComposingRate = Rate{PerMinute: 60, Burst: 5}
 // clients report the message as failed and the user can send it again.
 const StatusTryAgain = 500
 
+// StatusBusy answers a message rcs-as could not store because another
+// write held what it needed past the store's retries (store.ErrBusy): a
+// moment later it will go through. Like StatusTryAgain it is no verdict
+// on the message.
+const StatusBusy = 503
+
+// notStored is the answer to a message the store could not take: err is
+// the store's error, not a Rejection.
+func notStored(err error) *msrp.StatusError {
+	if errors.Is(err, store.ErrBusy) {
+		return &msrp.StatusError{Code: StatusBusy, Comment: "Busy, try again"}
+	}
+	return &msrp.StatusError{Code: StatusTryAgain, Comment: "Try again later"}
+}
+
 // AcceptTypes is the a=accept-types of a leg in mode: CPIM, plus
 // is-composing indications in a chat session. The SIP layer offers and
 // answers with it.
@@ -361,7 +376,7 @@ func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	case errors.As(err, &r):
 		return &msrp.StatusError{Code: r.MSRPStatus()}
 	case err != nil:
-		return &msrp.StatusError{Code: StatusTryAgain, Comment: "Try again later"}
+		return notStored(err)
 	}
 	return nil
 }
