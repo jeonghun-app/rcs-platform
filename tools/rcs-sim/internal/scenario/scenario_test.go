@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -160,6 +161,11 @@ func TestAResumeWaitsForTheServerToStoreTheBrokenUpload(t *testing.T) {
 	ok, results := runAll(t, cfg, "ft-resume")
 	if !ok || !byStep(results)["resume"].OK {
 		t.Fatalf("results %+v", results)
+	}
+	// The wait happened: get_upload_info was answered only after the
+	// server had noticed the break (QA on #185).
+	if info := byStep(results)["get_upload_info"]; info.Millis < 900 {
+		t.Fatalf("get_upload_info took %d ms, under the 1 s the server took to notice the break", info.Millis)
 	}
 }
 
@@ -321,6 +327,47 @@ func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
 	if !ok || time.Duration(info.Millis)*time.Millisecond < quiet {
 		// Every result, so a failure says which step it was.
 		t.Fatalf("ok %v, get_upload_info took %d ms, want at least %v\nall results: %+v", ok, info.Millis, quiet, results)
+	}
+}
+
+func TestTheResumeQuietTimeIsCountedOnTheClock(t *testing.T) {
+	// The same 300 ms as above, without depending on how fast a loaded host
+	// asks (#197). The clock moves only when the stand-in answers a signed
+	// get_upload_info, so the count does not depend on how often the code
+	// reads it: the requests are asked at 0, 299 ms and 300 ms, and a
+	// quiet time of exactly 300 ms, counted from a request, resumes at the
+	// third. 0, 250 or 299 ms would stop at the second, 301 ms or a quiet
+	// time counted from an answer would need a fourth (QA on #203).
+	cfg := stack(t)
+	var mu sync.Mutex
+	clock := time.Unix(0, 0)
+	k := 0
+	at := []time.Duration{299 * time.Millisecond, 300 * time.Millisecond}
+	cfg.FT.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	a := &answering{match: func(r *http.Request) bool {
+		if !strings.Contains(r.URL.RawQuery, "get_upload_info") || r.Header.Get("Authorization") == "" {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if k < len(at) {
+			clock = time.Unix(0, 0).Add(at[k])
+		} else {
+			clock = clock.Add(time.Millisecond)
+		}
+		k++
+		return true
+	}, status: http.StatusOK, body: `<?xml version="1.0"?><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp">` +
+		`<file-range start="0" end="65535"/><data url="/ft/x"/></file-resume-info>`}
+	cfg.FT.HTTP = intercept(cfg.FT.HTTP, a)
+	_, results := runAll(t, cfg, "ft-resume")
+	if info := byStep(results)["get_upload_info"]; !info.OK || info.Detail["held"] != 65536 {
+		t.Fatalf("get_upload_info %+v", info)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if k != 3 {
+		t.Fatalf("%d signed get_upload_info, want 3 for a quiet time of exactly 300 ms", k)
 	}
 }
 
