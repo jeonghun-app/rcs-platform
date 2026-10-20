@@ -39,6 +39,12 @@ def task_definition(**container) -> dict:
     }
 
 
+def not_listing(problems: list[str]) -> list[str]:
+    """Problems other than a fixture's task role missing from
+    task-role-actions.yaml, which a synthetic role always is."""
+    return [p for p in problems if "task-role-actions.yaml" not in p]
+
+
 def role(*actions: str) -> dict:
     return {
         "Type": "AWS::IAM::Role",
@@ -273,7 +279,7 @@ class PlatformTemplate(TemplateCase):
                 t = self.changed(SvcTask=task_definition(**container), SvcTaskRole=role("dynamodb:GetItem"))
                 self.assertProblem(t, fragment)
         t = self.changed(SvcTask=task_definition(), SvcTaskRole=role("dynamodb:GetItem"))
-        self.assertEqual(check_infra.problems(t), [])
+        self.assertEqual(not_listing(check_infra.problems(t)), [])
 
     def test_ecs_exec_is_refused(self):
         t = self.changed(Svc={"Type": "AWS::ECS::Service", "Properties": {"EnableExecuteCommand": True}})
@@ -288,7 +294,7 @@ class PlatformTemplate(TemplateCase):
         t = self.changed(Files={"Type": "AWS::DynamoDB::Table", "Properties": {
             "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": True},
             "SSESpecification": {"SSEEnabled": True}}})
-        self.assertEqual(check_infra.problems(t), [])
+        self.assertEqual(not_listing(check_infra.problems(t)), [])
 
     def test_task_roles_cannot_read_secrets(self):
         for actions in [("secretsmanager:GetSecretValue",), ("SecretsManager:*",), ("*",)]:
@@ -368,16 +374,32 @@ class PlatformServices(TemplateCase):
 
     def test_a_grant_on_the_wrong_resource_does_not_count(self):
         required = {"FtServerTaskRole": {"FilesBucket": ["s3:GetObject"]}}
-        self.assertEqual(check_infra.check_required_actions(self.template, required),
-                         ["FtServerTaskRole: lacks s3:GetObject on FilesBucket, which its code calls"])
+        self.assertIn("FtServerTaskRole: lacks s3:GetObject on FilesBucket, which its code calls",
+                      check_infra.check_required_actions(self.template, required))
 
-    def test_a_wildcard_grant_counts(self):
-        required = {"HssTaskRole": {"SubscribersTable/index/profile-index": ["dynamodb:Query"]}}
+    def test_a_wildcard_grant_is_refused_even_where_it_covers_the_need(self):
         t = copy.deepcopy(self.template)
         for st in t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]:
             if st["Resource"] == {"Fn::Sub": "${SubscribersTable.Arn}/index/profile-index"}:
-                st["Resource"], st["Action"] = {"Fn::Sub": "${SubscribersTable.Arn}/index/*"}, ["dynamodb:*"]
-        self.assertEqual(check_infra.check_required_actions(t, required), [])
+                st["Action"] = ["dynamodb:*"]
+        found = check_infra.check_required_actions(t)
+        self.assertIn("HssTaskRole: grants the pattern dynamodb:*; list the actions its code calls", found)
+        self.assertNotIn("HssTaskRole: lacks dynamodb:Query on SubscribersTable/index/profile-index, which its code calls", found)
+
+    def test_an_action_the_code_does_not_call_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:DeleteTable", "Resource": {"Fn::GetAtt": ["SubscribersTable", "Arn"]}})
+        self.assertProblem(t, "HssTaskRole: grants dynamodb:deletetable on SubscribersTable, which task-role-actions.yaml does not list")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "s3:PutBucketPolicy", "Resource": {"Fn::GetAtt": ["FilesBucket", "Arn"]}})
+        self.assertProblem(t, "FtServerTaskRole: grants s3:putbucketpolicy on FilesBucket")
+
+    def test_a_task_role_missing_from_the_table_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["SpareTaskRole"] = copy.deepcopy(t["Resources"]["MsrpRelayTaskRole"])
+        self.assertProblem(t, "SpareTaskRole: a task role missing from task-role-actions.yaml")
 
     def test_a_task_role_without_a_task_definition_is_still_checked(self):
         t = copy.deepcopy(self.template)
@@ -527,6 +549,84 @@ class SecurityChecklist(TemplateCase):
         self.assertProblem(t, "AcsService: runs in ['AcsSecurityGroup', 'HssSecurityGroup']")
         self.assertProblem(t, "AcsService: tasks get a public address")
         self.assertProblem(t, "AcsService: tasks outside the private subnets")
+
+
+
+class SecurityChecklistRound3(TemplateCase):
+    """Bad copies from the second security and QA reviews."""
+
+    def statements(self, t: dict, role: str) -> list:
+        return t["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+
+    def test_a_statement_level_condition_is_seen(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "FtServerTaskRole").append({"Fn::If": ["IsDev", {
+            "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "FtNonceKey"}},
+            {"Ref": "AWS::NoValue"}]})
+        self.assertProblem(t, "FtServerTaskRole: a task role may read secrets")
+
+    def test_a_wildcard_arn_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "MsrpRelayTaskRole").append(
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::*/*"})
+        self.assertProblem(t, "MsrpRelayTaskRole: arn:aws:s3:::*/* is a wildcard ARN")
+
+    def test_the_bucket_objects_wildcard_is_the_one_allowed(self):
+        self.assertEqual(check_infra.WILDCARD_ALLOWED, {("FtServerTaskRole", "FilesBucket/*")})
+
+    def test_waf_logs_must_redact(self):
+        for field, message in ((0, "WebAcl: WAF logs keep the query string"),
+                               (1, "WebAcl: WAF logs keep the authorization header"),
+                               (3, "WebAcl: WAF logs keep the x-3gpp-intended-identity header")):
+            with self.subTest(field=field):
+                t = copy.deepcopy(self.template)
+                del t["Resources"]["WafLogging"]["Properties"]["RedactedFields"][field]
+                self.assertProblem(t, message)
+        t = self.changed(WafLogging=None)
+        self.assertProblem(t, "WebAcl: no WAF logging configuration")
+
+    def test_a_publisher_shut_out_of_the_topic_key_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["AlarmKey"]["Properties"]["KeyPolicy"]["Statement"]:
+            if st.get("Sid") == "PublishersEncrypt":
+                st["Principal"]["Service"] = ["events.amazonaws.com", "budgets.amazonaws.com"]
+        self.assertProblem(t, "AlarmTopic: cloudwatch.amazonaws.com publishes to it but cannot use its key AlarmKey")
+
+    def test_the_hss_key_keeps_its_encryption_context(self):
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["HssKey"]["Properties"]["KeyPolicy"]["Statement"]:
+            st.pop("Condition", None) if st.get("Sid") == "HssWrapsAndUnwraps" else None
+        self.assertProblem(t, "HssKey: a use of the key without kms:EncryptionContext:service=hss")
+
+    def test_discover_instances_must_name_the_hss_service(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "AcsTaskRole").append({"Effect": "Allow", "Action": "servicediscovery:DiscoverInstances",
+                                                   "Resource": "*"})
+        self.assertProblem(t, "AcsTaskRole: DiscoverInstances without the condition holding it to the hss service")
+
+    def test_host_names_are_checked_at_the_parameter(self):
+        t = copy.deepcopy(self.template)
+        del t["Parameters"]["AcsHostName"]["AllowedPattern"]
+        self.assertProblem(t, "parameter AcsHostName: no AllowedPattern")
+        t = copy.deepcopy(self.template)
+        t["Parameters"]["FtHostName"]["AllowedPattern"] = ".*"
+        self.assertProblem(t, "parameter FtHostName: its pattern accepts 'a b'")
+
+    def test_every_read_action_reaches_the_bindings(self):
+        for action in ("dynamodb:BatchGetItem", "dynamodb:PartiQLSelect", "dynamodb:GetRecords"):
+            with self.subTest(action=action):
+                t = copy.deepcopy(self.template)
+                self.statements(t, "HssTaskRole").append(
+                    {"Effect": "Allow", "Action": action, "Resource": {"Fn::GetAtt": ["MsrpBindingsTable", "Arn"]}})
+                self.assertProblem(t, "HssTaskRole: may read MsrpBindingsTable")
+
+    def test_service_impaired_hears_every_failure_of_this_cluster(self):
+        pattern = self.template["Resources"]["ServiceImpaired"]["Properties"]["EventPattern"]
+        self.assertNotIn("clusterArn", pattern["detail"])
+        self.assertIn("prefix", pattern["resources"][0])
+        self.assertEqual(set(pattern["detail"]["eventName"]), {
+            "SERVICE_TASK_START_IMPAIRED", "SERVICE_TASK_PLACEMENT_FAILURE",
+            "SERVICE_TASK_CONFIGURATION_FAILURE", "SERVICE_DEPLOYMENT_FAILED"})
 
 
 if __name__ == "__main__":

@@ -113,6 +113,9 @@ Parameters:
   FtHostName:
     Type: String
     Default: ''
+    # Empty, or a lower-case DNS name: a typo fails here, not at the ALB rule
+    # or the service's start.
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       Host name of the FT HTTP content server (the host of ftHTTPCSURI). When
       set, ft-server's routes also match on it, so acs and ft-server can share
@@ -315,6 +318,7 @@ Parameters:
   RelayPublicHost:
     Type: String
     Default: ''
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       RELAY_PUBLIC_HOST, the host of every client_path: an operator FQDN that
       names the NLB, or empty for the NLB's own DNS name.
@@ -351,6 +355,7 @@ Parameters:
   AcsHostName:
     Type: String
     Default: ''
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
     Description: >
       Host name of acs on the ALB (the operator's configuration server name),
       used in the URIs acs hands out. Required outside dev: clients check the
@@ -481,6 +486,9 @@ Conditions:
   CreateAlarmTopic: !Equals [!Ref AlarmTopicArn, '']
   HasRelayPublicHost: !Not [!Equals [!Ref RelayPublicHost, '']]
   HasAcsHostName: !Not [!Equals [!Ref AcsHostName, '']]
+  AcsRuns: !Not [!Equals [!Ref AcsDesiredCount, '0']]
+  FtServerRuns: !Not [!Equals [!Ref FtServerDesiredCount, '0']]
+  RelayRuns: !Not [!Equals [!Ref RelayDesiredCount, '0']]
   UseAcsEum: !Equals [!Ref AcsSmsProvider, eum]
   UseAcsSns: !Equals [!Ref AcsSmsProvider, sns]
   InUsEast1: !Equals [!Ref AWS::Region, us-east-1]
@@ -1897,10 +1905,18 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:DescribeTable]
-                Resource: [!GetAtt AcsTable.Arn, !Sub '${AcsTable.Arn}/index/gsi1']
+                Resource: !GetAtt AcsTable.Arn
+              # The index is only queried.
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub '${AcsTable.Arn}/index/gsi1'
         # Only the chosen provider's send action. Sending an SMS to a number
         # has no resource to scope to, so Resource is '*' as the APIs require;
-        # for SNS a Deny keeps it to phone numbers, never a topic.
+        # for SNS a Deny keeps it to phone numbers, never a topic. Whether
+        # End User Messaging's SendTextMessage can be held to the origination
+        # identity's ARN is open (the Service Authorization Reference was not
+        # reachable from the review host); verify before narrowing, since a
+        # wrong resource would stop every OTP.
         - !If
           - UseAcsEum
           - PolicyName: sms
@@ -3119,6 +3135,8 @@ Resources:
           ReturnData: true
   AcsNoHealthyTargets:
     Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: AcsRuns
     Properties:
       AlarmName: !Sub '${AWS::StackName}-AcsNoHealthyTargets'
       AlarmDescription: 'acs has no healthy target: the service is down for clients. See docs/runbook.md#acsnohealthytargets.'
@@ -3145,6 +3163,8 @@ Resources:
             Stat: Minimum
   FtServerNoHealthyTargets:
     Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: FtServerRuns
     Properties:
       AlarmName: !Sub '${AWS::StackName}-FtServerNoHealthyTargets'
       AlarmDescription: 'ft-server has no healthy target: the service is down for clients. See docs/runbook.md#ftservernohealthytargets.'
@@ -3171,6 +3191,8 @@ Resources:
             Stat: Minimum
   RelayNoHealthyTargets:
     Type: AWS::CloudWatch::Alarm
+    # A service scaled to 0 has no targets on purpose.
+    Condition: RelayRuns
     Properties:
       AlarmName: !Sub '${AWS::StackName}-RelayNoHealthyTargets'
       AlarmDescription: 'msrp-relay has no healthy target: the service is down for clients. See docs/runbook.md#relaynohealthytargets.'
@@ -3681,13 +3703,20 @@ Resources:
   ServiceImpaired:
     Type: AWS::Events::Rule
     Properties:
-      Description: ECS services of the stack that cannot start tasks or failed a deployment, reported to the alarm topic.
+      Description: ECS services of the stack that cannot place, configure or start tasks, or failed a deployment, reported to the alarm topic.
+      # The stack's services by their ARNs: Deployment State Change events
+      # carry no clusterArn in their detail, but both kinds name the service
+      # in resources.
       EventPattern:
         source: [aws.ecs]
         detail-type: [ECS Service Action, ECS Deployment State Change]
+        resources: [{ prefix: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${Cluster}/' }]
         detail:
-          clusterArn: [!GetAtt Cluster.Arn]
-          eventName: [SERVICE_TASK_START_IMPAIRED, SERVICE_DEPLOYMENT_FAILED]
+          eventName:
+            - SERVICE_TASK_START_IMPAIRED
+            - SERVICE_TASK_PLACEMENT_FAILURE
+            - SERVICE_TASK_CONFIGURATION_FAILURE
+            - SERVICE_DEPLOYMENT_FAILED
       Targets: [{ Id: alarm-topic, Arn: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn] }]
 
   # Key policy and key state changes (threat model T7). Also fires on every
