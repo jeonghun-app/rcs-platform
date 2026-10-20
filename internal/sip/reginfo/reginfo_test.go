@@ -2,11 +2,13 @@ package reginfo
 
 import (
 	"errors"
+	"math/rand/v2"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -663,6 +665,13 @@ func TestTheAORKeyAgreesWithEqual(t *testing.T) {
 			}
 		}
 	}
+	us = append(us,
+		// IPv6 hosts compare as addresses, escaped parameter names as
+		// names, values by ASCII case alone (review of #250).
+		"sip:alice@[2001:db8::1]:5060", "sip:alice@[2001:DB8:0::1]:5060", "sip:alice@[2001:db8:0:0:0:0:0:1]:5060", "sip:alice@[2001:db8::2]:5060",
+		"sip:alice@h.example:5060;%74ransport=tcp", "sip:alice@h.example:5060;transport=tcp", "sip:alice@h.example:5060;%75ser=phone", "sip:alice@h.example:5060;user=phone",
+		"sip:alice@h.example:5060;%66oo=1", "sip:alice@h.example:5060;foo=2",
+		"sip:alice@h.example:5060;foo=%E2%84%AA", "sip:alice@h.example:5060;foo=k", "sip:alice@h.example:5060;transport=%E2%84%AA", "sip:alice@h.example:5060;transport=k")
 	us = append(us, "sip:example.com", "sip:EXAMPLE.com;foo=bar", "sip:example.com;maddr=10.0.0.1", "tel:12-34;phone-context=example.com", "tel:1234;phone-context=EXAMPLE.com", "tel:1234;phone-context=example.net")
 	for _, x := range us {
 		for _, y := range us {
@@ -672,5 +681,74 @@ func TestTheAORKeyAgreesWithEqual(t *testing.T) {
 				t.Errorf("%s, %s: %v, Equal %v", x, y, got, want)
 			}
 		}
+	}
+}
+
+// For AORs with no canonical form, key and sameAOR answer as sip.URI.Equal
+// does over a wide product of spellings (QA of #250): users with escapes
+// and passwords, host case and IPv6 spellings, ports, parameters with
+// escaped names and values, reserved escapes and non-ASCII case, headers,
+// and tel numbers.
+func TestTheAORKeyAgreesWithEqualOnAWideSet(t *testing.T) {
+	users := []string{"alice", "%61lice", "Alice", "a%2Fb", "a%2fb", "a/b", "alice:pw", "alice:%70w", "a%25b", ""}
+	hosts := []string{"h.example", "H.EXAMPLE", "[2001:db8::1]", "[2001:DB8::1]", "[2001:db8:0::1]", "192.0.2.1"}
+	ports := []string{"", ":5070"}
+	params := []string{"", ";transport=tcp", ";tr%61nsport=tcp", ";TRANSPORT=TCP", ";transport=%74cp", ";user=phone", ";maddr=10.0.0.1", ";ttl=1", ";method=INVITE",
+		";foo=bar", ";foo=%62ar", ";foo=%C3%84", ";foo=%C3%A4", ";foo=%E2%84%AA", ";foo=k", ";lr", ";f%6Fo=bar", ";foo=a%3Bb", ";foo=a%3bb", ";foo=a%25b"}
+	headers := []string{"", "?subject=x", "?Subject=X", "?subject=%78"}
+	type entry struct {
+		u   sip.URI
+		key string
+		e   aorEntry
+	}
+	var es []entry
+	add := func(s string) {
+		u, err := sip.ParseURI(s)
+		if err != nil {
+			return
+		}
+		if _, canonical := identity.CanonicalIMPU(u.String()); canonical {
+			return
+		}
+		es = append(es, entry{u, aorKey(u), entryOf(u)})
+	}
+	at := func(u string) string {
+		if u == "" {
+			return ""
+		}
+		return u + "@"
+	}
+	for _, u := range users {
+		for _, h := range hosts {
+			for _, p := range ports {
+				for _, q := range params {
+					add("sip:" + at(u) + h + p + q)
+				}
+			}
+		}
+	}
+	rnd := rand.New(rand.NewPCG(1, 2))
+	for range 400 {
+		add("sip:" + at(users[rnd.IntN(len(users))]) + hosts[rnd.IntN(len(hosts))] + ports[rnd.IntN(len(ports))] +
+			params[rnd.IntN(len(params))] + params[rnd.IntN(len(params))] + headers[rnd.IntN(len(headers))])
+	}
+	for _, s := range []string{"tel:12-34", "tel:1234", "tel:12AB;phone-context=example.com", "tel:12ab;phone-context=example.com", "tel:1234;phone-context=+1-555", "tel:1234;phone-context=+1555",
+		"tel:1234;Phone-Context=example.com", "tel:1234;phone-context=example.com", "tel:1234;phone-context=EXAMPLE.com",
+		"tel:1234;ext=1;phone-context=example.com", "tel:1234;phone-context=example.com;ext=1", "tel:12(34);phone-context=example.com"} {
+		add(s)
+	}
+	bad := 0
+	for _, a := range es {
+		for _, b := range es {
+			got := a.key == b.key && sameAOR(a.key, a.e, b.e)
+			if want := a.u.Equal(b.u); got != want {
+				if bad++; bad <= 20 {
+					t.Errorf("%s, %s: %v, Equal %v", a.u, b.u, got, want)
+				}
+			}
+		}
+	}
+	if bad > 0 {
+		t.Errorf("%d of %d pairs disagree with Equal", bad, len(es)*len(es))
 	}
 }

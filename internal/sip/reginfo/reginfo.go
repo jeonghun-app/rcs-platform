@@ -25,6 +25,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -328,8 +329,7 @@ func attr(name, value string) xml.Attr {
 // alike, so that a document Marshal writes is one Parse reads. An
 // address-of-record appears in one registration only (§5.1), compared as
 // aorKey and sameAOR, so no subscriber finds it both active and
-// terminated. Contact
-// ids are unique within a registration.
+// terminated. Contact ids are unique within a registration.
 func (r *Info) validate() error {
 	if r.State != Full && r.State != Partial {
 		return fmt.Errorf("%w: invalid reginfo state", ErrMalformed)
@@ -479,9 +479,11 @@ func (r *Info) ByAOR(aor sip.URI) (Registration, bool) {
 // IMPU, which decides alone, or, for one without (a port, a password,
 // headers, no user part, a local number), a key two URIs share whenever
 // sip.URI.Equal says they are one (RFC 3261 §19.1.4, RFC 3966 §4): the
-// scheme, the user with its escapes undone, the host in lower case and the
-// port, and of the parameters only those §19.1.4 makes match, the rest
-// being sameAOR's to compare. One key per AOR keeps the duplicate check
+// scheme, the user with its escapes undone, the host in lower case, an
+// IPv6 address in one spelling, and the port, and of the parameters only
+// those §19.1.4 makes match, names and values unescaped and in lower case,
+// the rest being sameAOR's to compare. The key may join what Equal keeps
+// apart, never the other way round; sameAOR decides. One key per AOR keeps the duplicate check
 // linear (docs/architecture.md §8).
 func aorKey(u sip.URI) string {
 	if c, ok := identity.CanonicalIMPU(u.String()); ok {
@@ -502,7 +504,11 @@ func aorKey(u sip.URI) string {
 	}
 	var ps []string
 	for _, p := range u.Params {
-		switch name := strings.ToLower(p.Name); name {
+		name := p.Name
+		if d, err := url.PathUnescape(name); err == nil {
+			name = d
+		}
+		switch name = strings.ToLower(name); name {
 		case "user", "ttl", "method", "maddr", "transport":
 			v := p.Value
 			if d, err := url.PathUnescape(v); err == nil {
@@ -512,7 +518,12 @@ func aorKey(u sip.URI) string {
 		}
 	}
 	slices.Sort(ps)
-	return "u\x00" + scheme + ":" + user + "@" + strings.ToLower(u.Host) + ":" + strconv.Itoa(u.Port) + ";" + strings.Join(ps, ";")
+	host := strings.ToLower(u.Host)
+	if a, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil && strings.HasPrefix(host, "[") {
+		// Two spellings of one IPv6 address are one host.
+		host = "[" + a.String() + "]"
+	}
+	return "u\x00" + scheme + ":" + user + "@" + host + ":" + strconv.Itoa(u.Port) + ";" + strings.Join(ps, ";")
 }
 
 // aorEntry is an AOR with what sameAOR compares made ready once: the URI
@@ -528,7 +539,7 @@ func entryOf(u sip.URI) aorEntry {
 	e := aorEntry{uri: u, bare: u, params: make(map[string]string, len(u.Params))}
 	e.bare.Params = nil
 	for _, p := range u.Params {
-		e.params[strings.ToLower(p.Name)] = strings.ToLower(normalizeEscapes(p.Value))
+		e.params[lowerASCII(normalizeEscapes(p.Name))] = lowerASCII(normalizeEscapes(p.Value))
 	}
 	return e
 }
@@ -580,6 +591,17 @@ func normalizeEscapes(s string) string {
 		i += 2
 	}
 	return b.String()
+}
+
+// lowerASCII lower-cases ASCII letters alone, as sip.URI.Equal does.
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func isHex(c byte) bool {
