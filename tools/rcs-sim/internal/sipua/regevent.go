@@ -1,9 +1,11 @@
 package sipua
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -48,15 +50,20 @@ type RegInfoContact struct {
 	Expires      uint64
 }
 
-// Contact returns the contact whose URI is uri, if the registration of aor
-// lists it.
+// Contact returns the contact whose URI equals uri (RFC 3261 §19.1.4), if
+// the registration of aor lists it: the notifier writes the URI back, in
+// its own parameter order and case.
 func (r *RegInfo) Contact(aor, uri string) (RegInfoContact, bool) {
+	want, err := sip.ParseURI(uri)
+	if err != nil {
+		return RegInfoContact{}, false
+	}
 	for _, reg := range r.Registrations {
 		if reg.AOR != aor {
 			continue
 		}
 		for _, c := range reg.Contacts {
-			if c.URI == uri {
+			if got, err := sip.ParseURI(c.URI); err == nil && got.Equal(want) {
 				return c, true
 			}
 		}
@@ -85,9 +92,18 @@ type xmlRegInfo struct {
 
 // ParseRegInfo reads an application/reginfo+xml body.
 func ParseRegInfo(body []byte) (*RegInfo, error) {
+	// As the platform's parsers do (and ft's decode): no document type
+	// declaration, and nothing after the root element.
+	if bytes.Contains(body, []byte("<!DOCTYPE")) {
+		return nil, errors.New("sipua: the reginfo body has a document type declaration")
+	}
 	var x xmlRegInfo
-	if err := xml.Unmarshal(body, &x); err != nil {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&x); err != nil {
 		return nil, errors.New("sipua: the reginfo body is not RFC 3680 XML")
+	}
+	if !onlyMiscAfter(dec) {
+		return nil, errors.New("sipua: the reginfo body goes on after its root element")
 	}
 	if x.State != "full" && x.State != "partial" {
 		return nil, errors.New("sipua: the reginfo state is neither full nor partial")
@@ -128,11 +144,16 @@ type Subscription struct {
 	Dropped atomic.Int64
 
 	mu sync.Mutex
-	// remote, remoteTarget and routes are the dialog's, from the 2xx or
-	// the first NOTIFY, whichever comes first (RFC 6665 §4.1.2.4).
+	// remote, remoteTarget and routes are the dialog's. The NOTIFY sets
+	// it up (RFC 6665 §4.4.1, TS 24.229 §5.1.1.3): the first one's
+	// Record-Route is the route set, and each one's Contact the remote
+	// target, as NOTIFY refreshes it (§3.2, RFC 3261 §12.2.2). Until a
+	// NOTIFY has come, they are the 2xx's, so that an Unsubscribe then
+	// still has a dialog to go in. notified is set at the first NOTIFY.
 	remote       string
 	remoteTarget sip.URI
 	routes       []string
+	notified     bool
 	cseq         uint32
 	remoteCSeq   uint32
 	ended        bool
@@ -142,7 +163,8 @@ type Subscription struct {
 // Notifications delivers each NOTIFY, in order.
 func (s *Subscription) Notifications() <-chan Notification { return s.notifications }
 
-// Done is closed once a NOTIFY has terminated the subscription.
+// Done is closed once the subscription has ended: by a terminated NOTIFY,
+// or by an answer to Unsubscribe that says it no longer exists.
 func (s *Subscription) Done() <-chan struct{} { return s.done }
 
 // SubscribeRegEvent subscribes to the reg event of the UA's own IMPU and
@@ -188,38 +210,66 @@ func (ua *UA) SubscribeRegEvent(ctx context.Context) (*Subscription, *sip.Respon
 		ua.forgetSubscription(s)
 		return nil, res, &StatusError{Method: "SUBSCRIBE", Code: res.StatusCode}
 	}
-	// The 2xx's Record-Route, reversed, is the route set (§12.1.2), unless
-	// a NOTIFY set up the dialog first.
+	// The 2xx's Record-Route, reversed (§12.1.2), stands in as the route
+	// set until a NOTIFY gives its own.
 	var routes []string
 	if rr, err := res.Header.RecordRoute(); err == nil {
 		for _, a := range slices.Backward(rr) {
 			routes = append(routes, a.String())
 		}
 	}
-	s.establish(res.Header.Get("To"), res, routes)
+	s.mu.Lock()
+	if !s.notified {
+		s.remote, s.routes, s.remoteTarget = res.Header.Get("To"), routes, contactOr(res, ua.cfg.IMPU)
+	}
+	s.mu.Unlock()
 	return s, res, nil
 }
 
 func subscriptionKey(callID, localTag string) string { return callID + "\x00" + localTag }
 
-// establish takes the dialog's remote side from m, a 2xx or a NOTIFY, if no
-// earlier message gave it.
-func (s *Subscription) establish(remote string, m sip.Message, routes []string) {
+// contactOr is the URI of m's Contact, or def without a usable one.
+func contactOr(m sip.Message, def sip.URI) sip.URI {
+	if cs, err := m.Headers().Contact(); err == nil && len(cs) > 0 && !cs[0].Star {
+		return cs[0].URI
+	}
+	return def
+}
+
+// fromNotify takes the dialog from a NOTIFY it accepted: all of it from
+// the first, the remote target from every one.
+func (s *Subscription) fromNotify(req *sip.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.remote != "" {
-		return
+	if !s.notified {
+		s.notified = true
+		s.remote, s.routes = req.Header.Get("From"), nil
+		if rr, err := req.Header.RecordRoute(); err == nil {
+			for _, a := range rr {
+				s.routes = append(s.routes, a.String())
+			}
+		}
+		s.remoteTarget = s.ua.cfg.IMPU
 	}
-	s.remote, s.routes = remote, routes
-	s.remoteTarget = s.ua.cfg.IMPU
-	if cs, err := m.Headers().Contact(); err == nil && len(cs) > 0 && !cs[0].Star {
-		s.remoteTarget = cs[0].URI
+	s.remoteTarget = contactOr(req, s.remoteTarget)
+}
+
+// end ends the subscription once.
+func (s *Subscription) end() {
+	s.mu.Lock()
+	if !s.ended {
+		s.ended = true
+		close(s.done)
 	}
+	s.mu.Unlock()
+	s.ua.forgetSubscription(s)
 }
 
 // Unsubscribe ends the subscription with a SUBSCRIBE of Expires: 0 in its
 // dialog (RFC 6665 §4.1.2.3), and returns its final response. The NOTIFY
-// that follows, terminated, closes Done.
+// that follows, terminated, closes Done. An answer that says the
+// subscription no longer exists, 481 among them (§4.1.2.2), ends it at
+// once. Before any NOTIFY it goes in the dialog the 2xx described.
 func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
 	s.mu.Lock()
 	if s.ended {
@@ -230,12 +280,32 @@ func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
 	d := &Dialog{ua: s.ua, callID: s.callID, local: s.local, remote: s.remote, remoteTarget: s.remoteTarget, routes: s.routes}
 	req, err := d.request("SUBSCRIBE", s.cseq)
 	s.mu.Unlock()
+	// A target refresh request carries a Contact (RFC 3261 §12.2.1.1).
+	contact := sip.Contact{Address: sip.Address{URI: s.ua.contact.URI}}
+	contact.URI.Params = slices.Clone(s.ua.contact.URI.Params)
+	contact.URI.Params.SetFlag("ob")
+	add(req, &err, "Contact", contact.String())
 	add(req, &err, "Event", "reg")
 	add(req, &err, "Expires", "0")
 	if err != nil {
 		return nil, err
 	}
-	return s.ua.Send(ctx, req)
+	res, err := s.ua.Send(ctx, req)
+	if err == nil && subscriptionGone(res.StatusCode) {
+		s.end()
+	}
+	return res, err
+}
+
+// subscriptionGone reports whether code, the answer to a SUBSCRIBE in the
+// subscription's dialog, means the subscription has ended (RFC 6665
+// §4.1.2.2).
+func subscriptionGone(code int) bool {
+	switch code {
+	case 404, 405, 410, 416, 480, 481, 482, 483, 484, 485, 489, 501, 604:
+		return true
+	}
+	return false
 }
 
 // subscriptionOf returns the subscription a NOTIFY belongs to: its Call-ID
@@ -259,21 +329,25 @@ func (ua *UA) forgetSubscription(s *Subscription) {
 	ua.mu.Unlock()
 }
 
-// receive answers a NOTIFY (RFC 6665 §4.1.3): 200, or 489 for another
-// event package, 500 for a CSeq lower than the last. The first one sets
-// up the dialog if the 2xx has not yet (§4.1.2.4), its Record-Route in
-// order being the route set.
+// receive answers a NOTIFY (RFC 6665 §4.1.3): 200, or 400 without a
+// Subscription-State it can read, 489 for another event package, 481 for
+// an event id the SUBSCRIBE did not have (§8.2.1), 500 for a CSeq lower
+// than the last. Each one it accepts updates the dialog (fromNotify).
 func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	req := tx.Request()
 	code := 200
 	cseq, err := req.Header.CSeq()
-	ev := strings.ToLower(strings.TrimSpace(strings.SplitN(req.Header.Get("Event"), ";", 2)[0]))
+	ev, evErr := req.Header.Event()
+	state, stateErr := req.Header.SubscriptionState()
 	s.mu.Lock()
 	switch {
-	case err != nil:
+	case err != nil || evErr != nil || stateErr != nil:
 		code = 400
-	case ev != "reg":
+	case !strings.EqualFold(ev.Type, "reg"):
 		code = 489
+	case ev.ID() != "":
+		// The SUBSCRIBE had no id, and an event is matched by id too.
+		code = 481
 	case s.remoteCSeq != 0 && cseq.Seq <= s.remoteCSeq:
 		code = 500
 	default:
@@ -281,13 +355,7 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	}
 	s.mu.Unlock()
 	if code == 200 {
-		var routes []string
-		if rr, err := req.Header.RecordRoute(); err == nil {
-			for _, a := range rr {
-				routes = append(routes, a.String())
-			}
-		}
-		s.establish(req.Header.Get("From"), req, routes)
+		s.fromNotify(req)
 	}
 	if res, err := sip.NewResponse(req, code, "", ""); err == nil {
 		_ = tx.Respond(res)
@@ -295,33 +363,44 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	if code != 200 {
 		return
 	}
-	n := notification(req)
+	n := notification(req, state)
 	select {
 	case s.notifications <- n:
 	default:
 		s.Dropped.Add(1)
 	}
 	if n.State == "terminated" {
-		s.mu.Lock()
-		if !s.ended {
-			s.ended = true
-			close(s.done)
-		}
-		s.mu.Unlock()
-		s.ua.forgetSubscription(s)
+		s.end()
 	}
 }
 
-// notification reads a NOTIFY's Subscription-State and body.
-func notification(req *sip.Request) Notification {
-	var n Notification
-	parts := strings.Split(req.Header.Get("Subscription-State"), ";")
-	n.State = strings.ToLower(strings.TrimSpace(parts[0]))
-	for _, p := range parts[1:] {
-		if k, v, ok := strings.Cut(strings.TrimSpace(p), "="); ok && strings.EqualFold(k, "reason") {
-			n.Reason = strings.ToLower(v)
+// onlyMiscAfter reports whether what dec has left after the root element
+// is only white space, comments and processing instructions, as XML's
+// Misc allows.
+func onlyMiscAfter(dec *xml.Decoder) bool {
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		switch t := tok.(type) {
+		case xml.Comment, xml.ProcInst:
+		case xml.CharData:
+			if len(bytes.TrimSpace(t)) != 0 {
+				return false
+			}
+		default:
+			return false
 		}
 	}
+}
+
+// notification reads a NOTIFY's body, with its Subscription-State.
+func notification(req *sip.Request, state sip.SubscriptionState) Notification {
+	n := Notification{State: strings.ToLower(state.State), Reason: strings.ToLower(state.Reason())}
 	if len(req.Body) == 0 {
 		return n
 	}

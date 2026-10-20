@@ -1,6 +1,7 @@
 package scenario_test
 
 import (
+	"context"
 	"regexp"
 	"testing"
 
@@ -78,6 +79,28 @@ func TestAPeerThatCannotRegisterFailsThePagerWithTheStatusOnly(t *testing.T) {
 	}
 }
 
+func TestAPagerMessageToAnUnregisteredPeerReports480(t *testing.T) {
+	// #135 AC 5: B is not registered when A's message comes, so the core
+	// answers 480 (RFC 3261 §21.4.18), and the message step says so.
+	cfg, core := sipStack(t)
+	var results []scenario.Result
+	ok, err := scenario.Run(context.Background(), cfg, []string{"pager-message"}, func(r scenario.Result) {
+		results = append(results, r)
+		if r.Step == "register" && r.OK {
+			// Reported before the next step starts: B's binding expires
+			// between the two.
+			core.Expire(peer.URI)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := results[len(results)-1]
+	if ok || last.Step != "message" || last.OK || last.Detail["status"] != 480 || last.Error != "MESSAGE answered 480" {
+		t.Fatalf("results %+v", results)
+	}
+}
+
 func TestSIPScenariosWaitForASIPConfiguration(t *testing.T) {
 	// "all" leaves them out without one; named, they fail at once.
 	cfg := stack(t)
@@ -93,6 +116,23 @@ func TestSIPScenariosWaitForASIPConfiguration(t *testing.T) {
 			t.Fatalf("%s: results %+v", name, results)
 		}
 	}
+}
+
+func TestAllRunsThePagerWithSIPButNoPeerAndFailsIt(t *testing.T) {
+	// Code review on #209: with SIP configured, a missing peer is said,
+	// not left out without a line.
+	cfg, _ := sipStack(t)
+	cfg.SIPPeer = nil
+	ok, results := runAll(t, cfg, "all")
+	for _, r := range results {
+		if r.Scenario == "pager-message" {
+			if ok || r.Step != "register" || r.OK || r.Error != "no SIP peer configured (-sip-peer-impi)" {
+				t.Fatalf("pager-message %+v, run ok %v", r, ok)
+			}
+			return
+		}
+	}
+	t.Fatalf("all left pager-message out: %+v", results)
 }
 
 func TestAPagerMessageOrNotificationChangedOnTheWayFails(t *testing.T) {

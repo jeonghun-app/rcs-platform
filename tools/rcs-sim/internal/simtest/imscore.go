@@ -111,6 +111,14 @@ func (c *IMSCore) Registered(impu string) bool {
 	return ok
 }
 
+// Expire drops impu's binding, as its expiry would: requests to it then
+// get 480 until it registers again.
+func (c *IMSCore) Expire(impu string) {
+	c.mu.Lock()
+	delete(c.bindings, impu)
+	c.mu.Unlock()
+}
+
 // Request implements transaction.TU.
 func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()

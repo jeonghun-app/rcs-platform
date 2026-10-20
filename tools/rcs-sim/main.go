@@ -37,6 +37,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // Exit statuses.
@@ -95,7 +96,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	fs.StringVar(&sf.impi, "sip-impi", "", "private user identity (default: "+envIMPI+")")
 	fs.StringVar(&sf.auth, "sip-auth", "aka", "aka (RCS_SIM_AKA_K, RCS_SIM_AKA_OPC) or digest (RCS_SIM_SIP_PASSWORD)")
 	fs.StringVar(&sf.instance, "sip-instance", "", "+sip.instance URN (default: a new urn:uuid)")
-	fs.StringVar(&sf.peerIMPI, "sip-peer-impi", "", "the far end's private user identity, for pager-message (default: "+envPeerIMPI+")")
+	fs.StringVar(&sf.peerIMPI, "sip-peer-impi", "", "the far end's private user identity, for pager-message (default: "+envPeerIMPI+"); its credentials are "+sipua.EnvPeerAKAK+", "+sipua.EnvPeerAKAOPc+" or "+sipua.EnvPeerSIPPassword)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -194,7 +195,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		}
 		if sf.peerIMPI != "" {
 			peerFlags := sf
-			peerFlags.impi, peerFlags.instance = sf.peerIMPI, ""
+			peerFlags.impi, peerFlags.instance, peerFlags.credEnv = sf.peerIMPI, "", sipua.PeerEnv
 			if cfg.SIPPeer, err = sipConfig(ctx, peerFlags, *peer, lookup); err != nil {
 				return usage("peer: " + err.Error())
 			}
