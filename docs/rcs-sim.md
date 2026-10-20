@@ -201,13 +201,16 @@ It follows its own registration state (RFC 3680, TS 24.229 §5.1.1.3):
   Before any NOTIFY, the 2xx's stand in.
 - A NOTIFY without a readable `Subscription-State` or `Event` gets 400, one
   for another event package 489, one with an event id this subscription
-  does not have 481, a lower CSeq 500, and one after the subscription ended
-  481. A body that is not `reginfo` is answered 200 and flagged in the
-  notification. `reginfo` with a document type declaration, or anything
+  does not have or from another dialog (another From tag: reg event
+  subscriptions do not fork, RFC 3680 §4.9) 481, a CSeq not above the last
+  500, and one after the subscription ended 481. A body that is not
+  `reginfo` is answered 200 and flagged in the notification. `reginfo`
+  without a version, with a document type declaration, or with anything
   after its root element, is refused.
 - `Unsubscribe` sends SUBSCRIBE with `Expires: 0` in the dialog, with the
-  UA's Contact. A terminated NOTIFY ends the subscription, and so does an
-  answer that says it no longer exists, 481 among them (§4.1.2.2).
+  UA's Contact. A non-2xx comes back as a `StatusError`, as for
+  `SubscribeRegEvent`. A terminated NOTIFY ends the subscription, and so
+  does an answer that says it no longer exists, 481 among them (§4.1.2.2).
 
 Errors carry methods, status codes and fixed reasons, never an identity, an
 address, a Call-ID, a nonce or a credential. Its tests run it against an
