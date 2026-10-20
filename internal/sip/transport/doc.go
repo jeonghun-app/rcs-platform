@@ -45,10 +45,14 @@
 // first byte of a message has arrived the whole message must arrive within
 // ReadTimeout, so a peer cannot hold a connection by trickling a header. An
 // accepted connection must also complete its first message within ReadTimeout.
-// The same ReadTimeout bounds the PROXY header and the TLS handshake. Writes have
-// their own deadline. Accepted connections, dialed connections and UDP flows (in
-// total and per source IP) are bounded; a full UDP table displaces its least
-// recently seen flow rather than refusing a new client.
+// The same ReadTimeout bounds the TLS handshake; the PROXY header, which the NLB
+// sends at once, has ListenerConfig.ProxyHeaderTimeout, 2 s by default. Writes
+// have their own deadline. Accepted connections (in total and per listener),
+// dialed connections and UDP flows (in total and per source IP) are bounded; a
+// full UDP table displaces its least recently seen flow rather than refusing a
+// new client. A listener's own limit counts from accept, like the total, so
+// connections still in their PROXY header or TLS handshake count against it;
+// client-facing limits below the total keep room for core peers.
 //
 // Writes never happen on the caller's goroutine. Each stream connection has a
 // send queue and a writer goroutine; a sender waits, for at most WriteTimeout,
