@@ -467,7 +467,7 @@ func gone(t *testing.T, e *env, impus ...string) {
 
 // regOf returns the record of the set impu belongs to.
 func regOf(e *env, impu string) (*state.Registration, error) {
-	id, err := e.store.Identity(bg, impu)
+	id, err := e.store.Identity(bg, impu, e.clock.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -487,9 +487,24 @@ func seed(t *testing.T, e *env, impi string, set []string, change func(*state.Re
 	}
 	saved := must(e.store.SaveRegistration(bg, r))(t)
 	for _, impu := range set {
-		must(e.store.SaveIdentity(bg, &state.Identity{IMPU: impu, Set: r.Key, Incarnation: 77}))(t)
+		must(e.store.SaveIdentity(bg, &state.Identity{IMPU: impu, Set: r.Key, Incarnation: 77, KeepUntil: seedKeep(e, r)}))(t)
 	}
 	return saved
+}
+
+// seedKeep is the KeepUntil the registrar gives r's identities: its last
+// binding's expiry, or its unregistered state's end, plus ProfileGrace.
+func seedKeep(e *env, r *state.Registration) time.Time {
+	last := e.clock.Now()
+	for _, c := range r.Contacts {
+		if c.Expires.After(last) {
+			last = c.Expires
+		}
+	}
+	if r.Unregistered.After(last) {
+		last = r.Unregistered
+	}
+	return last.Add(state.ProfileGrace)
 }
 
 // twoSets registers impi1's two implicit registration sets, {impu1, tel1}

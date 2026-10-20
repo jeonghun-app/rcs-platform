@@ -52,11 +52,11 @@ func (h *hookStore) RegistrationsOf(ctx context.Context, impi string) ([]*state.
 }
 
 // Identity runs the onRead hook of impu: a REGISTER for impu starts there.
-func (h *hookStore) Identity(ctx context.Context, impu string) (*state.Identity, error) {
+func (h *hookStore) Identity(ctx context.Context, impu string, now time.Time) (*state.Identity, error) {
 	if f := h.take(h.onRead, impu); f != nil {
 		f()
 	}
-	return h.Memory.Identity(ctx, impu)
+	return h.Memory.Identity(ctx, impu, now)
 }
 
 // DeleteRegistration runs the afterDelete hook of the set's default identity.
