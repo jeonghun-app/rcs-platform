@@ -78,6 +78,8 @@ type standIn struct {
 	registers, open, overlaps int
 	// lastExpires is the Expires of the last REGISTER received.
 	lastExpires uint32
+	// holdBye, when set, keeps BYEs unanswered until it is closed.
+	holdBye chan struct{}
 
 	got chan received
 	// onInvite, when set, answers each INVITE, as the far end would; the
@@ -162,6 +164,18 @@ func (s *standIn) Request(tx *transaction.ServerTransaction) {
 		return
 	}
 	var wait time.Duration
+	s.mu.Lock()
+	hold := s.holdBye
+	s.mu.Unlock()
+	if req.Method == "BYE" && hold != nil {
+		go func() {
+			<-hold
+			if res := s.response(req); res != nil {
+				_ = tx.Respond(res)
+			}
+		}()
+		return
+	}
 	if req.Method == "REGISTER" {
 		s.mu.Lock()
 		s.registers++
