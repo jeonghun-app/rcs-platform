@@ -188,18 +188,20 @@ type pcscf struct {
 	// icscfFirst and icscfTotal bound a REGISTER's first attempt at icscf
 	// and all of them.
 	icscfFirst, icscfTotal time.Duration
+	// clientFlow reports whether a flow token names a live client flow of
+	// this task.
+	clientFlow func(transport.FlowID) bool
 	// metrics counts what is worth an alarm; nil in tests that need none.
 	metrics *runtime.Metrics
 }
 
 // Route implements proxy.Router. A client's REGISTER goes to icscf, its
 // other requests outside a dialog along its Service-Route, and those inside
-// one along their Route if pcscf is on it. Until terminating routing lands
-// (#16), a request from the core is refused with 430, since no flow it
-// could name is served yet (RFC 5626 §5.3).
+// one along their Route if pcscf is on it; a request from the core goes to
+// the client flow its Route names.
 func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !fromClient(r.Source) {
-		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
+		return p.terminate(ctx, r)
 	}
 	switch {
 	case r.Message.Method == "REGISTER":

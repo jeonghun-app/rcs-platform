@@ -182,8 +182,8 @@ func (p *peer) closed() bool {
 
 // Until it registers, a client's request outside a dialog is discarded and
 // counted (TS 24.229 §5.2.6.3.2A), and one inside a dialog pcscf did not
-// record is refused with 403; the core gets 430 until terminating routing
-// lands.
+// record is refused with 403; a request from the core that names no client
+// flow gets 430.
 func TestUntilRegistrationClientsGet403AndTheCore430(t *testing.T) {
 	s := start(t, testConfig(), deps{})
 	c := dial(t, s.client, nil)

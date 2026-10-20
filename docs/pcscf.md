@@ -7,9 +7,8 @@ over `internal/sip/transport`; the service is `internal/pcscf`, and
 `cmd/pcscf` only wires it to `internal/runtime`.
 
 `pcscf` is built in steps (#16). This page describes what is in place: the
-listeners, the edge rules, registration, a client's requests and the
-shutdown. Terminating routing and the reg event follow. Until they land, a
-request from the core is answered 430 Flow Failed.
+listeners, the edge rules, registration, a client's requests, requests from
+the core and the shutdown. The reg event follows.
 
 ## Listeners
 
@@ -234,6 +233,37 @@ model T2).
 No core hop of any request, REGISTER and initial requests included, ever
 resolves to this task's own address, however it is written, and every form
 of that address in a Route is taken as `pcscf`'s own.
+
+## Requests from the core
+
+A request on the core listener goes to a client over one flow, and nowhere
+else (TS 24.229 §5.2.6.4, #16 plan D). `pcscf` keeps no dialog state: the
+flow is the token of a consumed Route naming this task's core listener. For
+a request outside a dialog that is the `Path` of the client's registration;
+for one inside, the core-facing Record-Route value `pcscf` wrote. The
+request is sent over that flow whatever its Route or Request-URI say below.
+
+- **430.** A request whose Route names no flow, or a flow that is not a live
+  client flow of this task (closed, from an earlier start, or a core
+  connection), is answered 430 Flow Failed, and so is one whose flow fails
+  as it is sent. The 430 reaches `scscf` as it is, so that it tries the
+  client's other flows (RFC 5626 §5.3). Flow tokens are an HMAC under a key
+  drawn at every start, so a token outlives neither its flow nor the task,
+  even when a new flow comes from the same address.
+- **Record-Route.** A request outside a dialog gets `pcscf`'s two values,
+  the client-facing one on top, so that the dialog's requests come back
+  through this task on both sides: the client's along the route rule above,
+  the core's to the flow. The core-facing one keeps the `Path`'s `ob` and
+  the request's icid (§5.2.6.4.4 3)).
+- **Privacy.** `P-Asserted-Identity` is removed toward the client when the
+  request's `Privacy` has `id` (RFC 3323 §4.2, RFC 3325 §9.3).
+- **Responses.** The client's responses get a `P-Charging-Vector` with the
+  request's `icid-value` and `orig-ioi`, a new icid if it had none, and
+  `RCS_IMS_DOMAIN` as the type 1 `term-ioi` (§5.2.6.4.4 6)). A 1xx or 2xx
+  to a request outside a dialog asserts the identity it was for, its
+  `P-Called-Party-ID`, or else the flow's default public identity, in place
+  of any `P-Preferred-Identity` (§5.2.6.4.4 1)). The client's own
+  network-only headers are gone already, removed on arrival.
 
 ## Settings
 
