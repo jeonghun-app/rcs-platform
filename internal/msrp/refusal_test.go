@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -132,35 +133,65 @@ func TestAnAnswerBeingWrittenAtTheLimitIsDelivered(t *testing.T) {
 	waitDone(t, c.Done(), "connection")
 }
 
+// flushBound is the refusal flush's bound for a test: it ends when the
+// test fires it, and counts how often it was started.
+type flushBound struct {
+	fire  chan time.Time
+	calls atomic.Int32
+}
+
+func newFlushBound() *flushBound { return &flushBound{fire: make(chan time.Time)} }
+
+func (b *flushBound) after(time.Duration) <-chan time.Time {
+	b.calls.Add(1)
+	return b.fire
+}
+
+// end fires the bound, which only a flush waiting on it takes.
+func (b *flushBound) end(t *testing.T) {
+	t.Helper()
+	select {
+	case b.fire <- time.Time{}:
+	case <-time.After(hangGuard):
+		t.Fatal("the flush is not waiting on its bound")
+	}
+}
+
+// The default bound is the documented 2 s.
+func TestTheRefusalFlushBoundDefaultsToTwoSeconds(t *testing.T) {
+	cfg, err := Config{}.withDefaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.refusalFlush != 2*time.Second {
+		t.Fatalf("refusalFlush = %v, documented 2 s", cfg.refusalFlush)
+	}
+}
+
 // A peer that takes none of the answers does not hold the connection
-// open: it ends within refusalFlushTimeout of the limit, the documented
-// 2 s, for the same reason. The write timeout is far longer, so only the
-// flush's bound can end it.
-func TestAPeerThatDoesNotReadItsAnswersIsClosedAfterTheFlushBound(t *testing.T) {
+// open: the flush's bound ends it, for the same reason. The write timeout
+// is far longer, so only the bound can.
+func TestAPeerThatDoesNotReadItsAnswersIsClosedAtTheFlushBound(t *testing.T) {
+	bound := newFlushBound()
 	ours, theirs := net.Pipe()
-	c, err := NewPassiveConn(ours, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 2, WriteTimeout: time.Hour})
+	c, err := NewPassiveConn(ours, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 2, WriteTimeout: time.Hour, refusalAfter: bound.after})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Close(); _ = theirs.Close() })
 	go func() { _, _ = theirs.Write(unknownSends(3)) }()
-	start := time.Now()
+	bound.end(t)
 	waitDone(t, c.Done(), "connection")
 	if !errors.Is(c.Err(), ErrTooManyUnknownSessions) {
 		t.Fatalf("Err = %v", c.Err())
 	}
-	took := time.Since(start)
-	if refusalFlushTimeout != 2*time.Second {
-		t.Fatalf("refusalFlushTimeout is %v, documented as 2 s", refusalFlushTimeout)
-	}
-	if took < refusalFlushTimeout/2 || took > refusalFlushTimeout+time.Second {
-		t.Fatalf("closed after %v, want the %v bound", took, refusalFlushTimeout)
-	}
 }
 
-// Over TCP, a client that reads its answers to the end of the stream but
-// never closes its side is cut at the default bound, with the refusal.
-func TestAClientThatNeverClosesIsCutAtTheDefaultBound(t *testing.T) {
+// One bound, started once, ends the wait for the client's end too: a
+// client over TCP that reads its answers to the end of the stream but
+// never closes its side is cut when the bound fires (QA on #237).
+func TestOneFlushBoundEndsTheWaitForTheClient(t *testing.T) {
+	bound := newFlushBound()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +203,7 @@ func TestAClientThatNeverClosesIsCutAtTheDefaultBound(t *testing.T) {
 		if err != nil {
 			return
 		}
-		c, err := NewPassiveConn(nc, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 2})
+		c, err := NewPassiveConn(nc, &Registry{}, Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalFlush: time.Hour, refusalAfter: bound.after})
 		if err != nil {
 			_ = nc.Close()
 			return
@@ -185,18 +216,24 @@ func TestAClientThatNeverClosesIsCutAtTheDefaultBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	start := time.Now()
 	if _, err := client.Write(unknownSends(3)); err != nil {
 		t.Fatal(err)
 	}
-	go func() { _, _ = io.Copy(io.Discard, client) }()
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	// The end of the stream is the half-close: the wait for the client's
+	// end has begun.
+	got, err := io.ReadAll(client)
+	if err != nil || !strings.Contains(string(got), "MSRP unknb 481") {
+		t.Fatalf("read %q, %v", got, err)
+	}
 	c := <-conns
+	bound.end(t)
 	waitDone(t, c.Done(), "connection")
 	if !errors.Is(c.Err(), ErrTooManyUnknownSessions) {
 		t.Fatalf("Err = %v", c.Err())
 	}
-	if took := time.Since(start); took > refusalFlushTimeout+time.Second {
-		t.Fatalf("closed after %v, want the %v bound", took, refusalFlushTimeout)
+	if n := bound.calls.Load(); n != 1 {
+		t.Fatalf("bound started %d times, want once for both waits", n)
 	}
 }
 
@@ -262,20 +299,4 @@ func TestEveryAnswerQueuedAtTheLimitIsWrittenBeforeTheHalfClose(t *testing.T) {
 	}
 	_ = client.CloseWrite()
 	waitDone(t, (<-conns).Done(), "connection")
-}
-
-// One bound covers the wait for the writes and the wait for the client's
-// end together: a client that reads everything but never closes is cut
-// at it, not at twice it.
-func TestOneFlushBoundCoversBothWaitsOverTCP(t *testing.T) {
-	conns, client := slowRefusal(t, 400*time.Millisecond, time.Second)
-	start := time.Now()
-	if _, err := client.Write(unknownSends(3)); err != nil {
-		t.Fatal(err)
-	}
-	go func() { _, _ = io.Copy(io.Discard, client) }()
-	waitDone(t, (<-conns).Done(), "connection")
-	if took := time.Since(start); took > 1500*time.Millisecond {
-		t.Fatalf("took %v, bound 1 s for both waits", took)
-	}
 }

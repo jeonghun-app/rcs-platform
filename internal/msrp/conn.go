@@ -164,6 +164,9 @@ type Config struct {
 
 	// refusalFlush is refusalFlushTimeout unless a test sets it.
 	refusalFlush time.Duration
+	// refusalAfter starts the flush's bound; time.After unless a test
+	// sets it, to end the bound when it says rather than in real time.
+	refusalAfter func(time.Duration) <-chan time.Time
 }
 
 func (cfg Config) withDefaults() (Config, error) {
@@ -589,7 +592,11 @@ func (c *Conn) flush(reason error) {
 	c.mu.Lock()
 	c.closing = reason
 	c.mu.Unlock()
-	deadline := time.After(c.cfg.refusalFlush)
+	after := c.cfg.refusalAfter
+	if after == nil {
+		after = time.After
+	}
+	deadline := after(c.cfg.refusalFlush)
 	c.qmu.Lock()
 	var written chan struct{}
 	if len(c.queue) > 0 || c.writing {
