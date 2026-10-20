@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
+	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -116,8 +118,20 @@ func TestAnOfferlessRefreshGetsTheLastSDP(t *testing.T) {
 	refresh := msg{method: "INVITE", uri: bob, toTag: s.tag, callID: s.callID, cseq: 2,
 		fields: []string{"Supported: timer", "Session-Expires: 1800"}}
 	res := p.send(refresh)
-	if res.StatusCode != 200 || string(res.Body) != string(s.res.Body) || res.Header.Get("Content-Type") != sdpType {
-		t.Fatalf("offerless re-INVITE answered %d with %q, want the last SDP %q", res.StatusCode, res.Body, s.res.Body)
+	if res.StatusCode != 200 || res.Header.Get("Content-Type") != sdpType {
+		t.Fatalf("offerless re-INVITE answered %d with %q", res.StatusCode, res.Body)
+	}
+	// The offer is the session's answer made actpass, never passive (RFC
+	// 6135 §4.2.2), at the next o= version (RFC 3264 §8), same path.
+	offer, err := sdp.Parse(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, path, setup, err := firstMSRP(offer, "")
+	answered, _ := strconv.Atoi(s.answer.Origin.SessionVersion)
+	if err != nil || setup != sdp.SetupActPass || len(path) != 1 || path[0].String() != s.path.String() ||
+		offer.Origin.SessionID != s.answer.Origin.SessionID || offer.Origin.SessionVersion != strconv.Itoa(answered+1) {
+		t.Fatalf("offer %q: setup %q, path %v, %v; answer was %+v", res.Body, setup, path, err, s.answer.Origin)
 	}
 	// The answer keeps the path: the session goes on.
 	ackWith := func(cseq int, path msrp.URI) {
@@ -133,10 +147,11 @@ func TestAnOfferlessRefreshGetsTheLastSDP(t *testing.T) {
 	if res := p.send(msg{method: "OPTIONS", uri: bob, toTag: s.tag, callID: s.callID, cseq: 3}); res.StatusCode != 200 {
 		t.Fatalf("OPTIONS after the refresh answered %d", res.StatusCode)
 	}
-	// An answer that moves the leg ends it.
+	// An answer that moves the leg ends it. Nothing changed: the same
+	// offer, at the same version.
 	refresh.cseq = 4
-	if res := p.send(refresh); res.StatusCode != 200 {
-		t.Fatalf("second offerless re-INVITE answered %d", res.StatusCode)
+	if again := p.send(refresh); again.StatusCode != 200 || string(again.Body) != string(res.Body) {
+		t.Fatalf("second offerless re-INVITE answered %d with %q, want %q", again.StatusCode, again.Body, res.Body)
 	}
 	ackWith(4, relayPath())
 	if bye := r.core.nextOf(t, "BYE"); bye.Header.Get("Call-ID") != s.callID {
@@ -588,5 +603,70 @@ func TestAnEarlyBYELeavesTheEngineToldOnce(t *testing.T) {
 	case err := <-r.e.failed:
 		t.Fatalf("the engine was told again: %v", err)
 	default:
+	}
+}
+
+// Code review's major on #252 (re-check): the bounds are taken before a
+// first message is stored. An INVITE past them is refused and stores
+// nothing, which its client, told it failed, would send again.
+func TestAFirstMessagePastABoundIsNotStored(t *testing.T) {
+	for name, c := range map[string]struct {
+		cfg  Config
+		code int
+	}{
+		"the user's bound": {Config{MaxOutgoingPerUser: 1}, 486},
+		"the task's bound": {Config{MaxSessions: 1}, 500},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newChatRigWith(t, messaging.Config{}, c.cfg)
+			p := r.a.dial(t)
+			s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
+			p.ack(s)
+			body := firstMessageBody([2]string{sdpType, offerSDP(relayPath(), "active")}, [2]string{cpim.ContentType, chatCPIM("first1", "refused")})
+			if res := p.send(r.withFirstMessage(body)); res.StatusCode != c.code {
+				t.Fatalf("answered %d, want %d", res.StatusCode, c.code)
+			}
+			queued, err := r.store.Pending(t.Context(), bob, "", time.Now().Add(time.Hour), 10)
+			if err != nil || len(queued) != 0 {
+				t.Fatalf("%d stored for bob, %v", len(queued), err)
+			}
+			// The room the refused INVITE did not take is still there for
+			// the first session's end: one more session fits after it.
+			if res := p.send(msg{method: "BYE", uri: bob, toTag: s.tag, callID: s.callID, cseq: 2}); res.StatusCode != 200 {
+				t.Fatalf("BYE answered %d", res.StatusCode)
+			}
+			answeredBy(t, p.send(r.withFirstMessage(firstMessageBody([2]string{sdpType, offerSDP(relayPath(), "active")}, [2]string{cpim.ContentType, chatCPIM("first2", "taken")}))))
+		})
+	}
+}
+
+// A first message the engine refuses gives its session's place back.
+func TestARefusedFirstMessageGivesItsPlaceBack(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{MaxOutgoingPerUser: 1})
+	p := r.a.dial(t)
+	bad := firstMessageBody([2]string{sdpType, offerSDP(relayPath(), "active")}, [2]string{cpim.ContentType, "not CPIM"})
+	if res := p.send(r.withFirstMessage(bad)); res.StatusCode != 400 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
+}
+
+// Code review's minor on #252 (re-check): rcsjta asks for a file transfer
+// over MSRP with the same +g.oma.sip-im tag as a chat; its offer carries
+// a=file-selector (RFC 5547 §6), and it is not served here.
+func TestAFileTransferInviteIsRefused(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	m := r.chatInvite(strings.Replace(offerSDP(relayPath(), "active"), "a=sendrecv\r\n",
+		"a=sendrecv\r\na=file-selector:name:\"a.jpg\" type:image/jpeg size:1000\r\n", 1))
+	m.fields[2] = "Accept-Contact: *;+g.oma.sip-im"
+	if res := r.a.dial(t).send(m); res.StatusCode != 403 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	if n := r.metrics.get("sip.invite.service_refused"); n != 1 {
+		t.Fatalf("service_refused %d", n)
+	}
+	// And an offer with no type in common is counted as refused.
+	if res := r.a.dial(t).send(r.chatInvite(offerSDP(relayPath(), "active", "image/jpeg"))); res.StatusCode != 488 || r.metrics.get("sip.invite.offer_refused") != 1 {
+		t.Fatalf("answered %d, offer_refused %d", res.StatusCode, r.metrics.get("sip.invite.offer_refused"))
 	}
 }

@@ -70,6 +70,13 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, code)
 		return
 	}
+	if offer.Media[i].Attributes.Has("file-selector") {
+		// A file transfer (RFC 5547 §6), which rcsjta asks for with the
+		// same +g.oma.sip-im tag as a chat: not served here.
+		s.cfg.Metrics.Count("sip.invite.service_refused", 1)
+		s.respond(u, req, 403)
+		return
+	}
 	tag, err := s.ids.Tag()
 	if err != nil {
 		return // the proxy answers 500
@@ -90,7 +97,9 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	ss := &session{s: s, leg: leg, user: sender, mode: mode, d: d, remotePath: joinPath(path), interval: interval}
 	ss.origin = s.newOrigin(leg.Local().Host)
 	if ss.sdp, err = s.answerSDP(offer, i, leg, mode, ss.origin); err != nil {
+		// No type in common, for one.
 		_ = leg.Close()
+		s.cfg.Metrics.Count("sip.invite.offer_refused", 1)
 		s.respond(u, req, 488)
 		return
 	}
@@ -103,27 +112,9 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		_ = leg.Close()
 		return
 	}
-	if first != nil {
-		// The first message goes in as the session's would, stored
-		// before the 2xx; one the engine refuses fails the INVITE with
-		// the status a pager MESSAGE would get, and no session is left.
-		code, busy := s.submit(ctx, messaging.Origin{
-			Sender: sender, Identities: identities, Recipient: peer, Conversation: conv,
-			Mode: store.Chat, CPIM: first,
-		})
-		s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.first_message.%d", code), 1)
-		if code != 202 {
-			_ = leg.Close()
-			if busy {
-				s.respondRetry(u, req, code)
-			} else {
-				s.respond(u, req, code)
-			}
-			return
-		}
-	}
 	// Known before the 2xx leaves, so that a BYE right behind its ACK
-	// finds the session.
+	// finds the session; and before a first message is stored, so that an
+	// INVITE past a bound stores nothing its client would send again.
 	if err := s.addSession(ss); err != nil {
 		_ = leg.Close()
 		if errors.Is(err, errUserSessions) {
@@ -137,6 +128,26 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		// of its own without Retry-After (RFC 3261 §16.7 step 6).
 		s.respondRetry(u, req, 500)
 		return
+	}
+	if first != nil {
+		// The first message goes in as the session's would, stored
+		// before the 2xx; one the engine refuses fails the INVITE with
+		// the status a pager MESSAGE would get, and gives the session's
+		// place back.
+		code, busy := s.submit(ctx, messaging.Origin{
+			Sender: sender, Identities: identities, Recipient: peer, Conversation: conv,
+			Mode: store.Chat, CPIM: first,
+		})
+		s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.first_message.%d", code), 1)
+		if code != 202 {
+			ss.end()
+			if busy {
+				s.respondRetry(u, req, code)
+			} else {
+				s.respond(u, req, code)
+			}
+			return
+		}
 	}
 	if err := u.Respond(res); err != nil {
 		s.cfg.Metrics.Count("sip.respond_failed", 1)

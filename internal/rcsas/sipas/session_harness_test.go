@@ -31,6 +31,7 @@ type chatRig struct {
 	core    *fakeCore
 	clock   *fakeClock
 	msrp    net.Listener
+	store   store.Store
 }
 
 // recordingEngine is the engine, with the failed invitations recorded.
@@ -81,7 +82,8 @@ func newChatRigOn(t *testing.T, mc messaging.Config, cfg Config, tc transport.Co
 	mc.Logger = slog.New(slog.DiscardHandler)
 	var a *as
 	r.metrics = &counter{n: map[string]int64{}}
-	e, err := messaging.New(mc, store.NewMemory(), deliverer{&a}, r.metrics)
+	r.store = store.NewMemory()
+	e, err := messaging.New(mc, r.store, deliverer{&a}, r.metrics)
 	if err != nil {
 		t.Fatal(err)
 	}

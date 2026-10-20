@@ -399,6 +399,43 @@ func (ss *session) answerRefresh(offer *sdp.Session, i int) ([]byte, error) {
 	return body, nil
 }
 
+// offerAgain is the offer in the 2xx to a re-INVITE without one: the
+// session's last SDP, with every MSRP line actpass, since an offer is
+// never passive (RFC 6135 §4.2.2) and rcs-as's last SDP in a session a
+// client started is its passive answer. That SDP is the same, and keeps
+// its o= version, unless the setup changed, which takes the next version
+// (RFC 3264 §8).
+func (ss *session) offerAgain() ([]byte, error) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	last, err := sdp.Parse(ss.sdp)
+	if err != nil {
+		return nil, err
+	}
+	for i := range last.Media {
+		if m := &last.Media[i]; m.IsMSRP() && m.Port != 0 {
+			if err := m.SetSetup(sdp.SetupActPass); err != nil {
+				return nil, err
+			}
+		}
+	}
+	body, err := last.Marshal()
+	if err != nil || slices.Equal(body, ss.sdp) {
+		return ss.sdp, err
+	}
+	n, err := strconv.ParseUint(ss.origin.SessionVersion, 10, 63)
+	if err != nil {
+		return nil, err
+	}
+	ss.origin.SessionVersion = strconv.FormatUint(n+1, 10)
+	last.Origin = ss.origin
+	if body, err = last.Marshal(); err != nil {
+		return nil, err
+	}
+	ss.sdp = body
+	return body, nil
+}
+
 // sessionHeaders adds the header fields of a 2xx in a session: Contact with
 // the service's feature tag, Allow, the SDP if any and, with a timer, the
 // Session-Expires the UAC refreshes (RFC 4028 §9).
@@ -662,9 +699,11 @@ func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
 	offerless := req.Method == "INVITE" && len(req.Body) == 0
 	switch {
 	case offerless:
-		ss.mu.Lock()
-		body = ss.sdp
-		ss.mu.Unlock()
+		var err error
+		if body, err = ss.offerAgain(); err != nil {
+			s.respond(u, req, 500)
+			return
+		}
 	case len(req.Body) > 0:
 		offer, i, path, code := msrpOffer(&req.Header, req.Body)
 		ss.mu.Lock()

@@ -232,13 +232,13 @@ A client's INVITE (the originating session):
 | Check | Refused with |
 |---|---|
 | a `Require` option tag other than `timer` | 420 with `Unsupported` (RFC 3261 §8.2.2.3) |
-| none of the chat ICSI, the OMA SIMPLE IM tag `+g.oma.sip-im` (with which rcsjta, the reference client, asks for a chat) or the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service` (file transfer, for one, is not served here) | 403 |
+| none of the chat ICSI, the OMA SIMPLE IM tag `+g.oma.sip-im` (with which rcsjta, the reference client, asks for a chat) or the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service`; or an offer with `a=file-selector` (RFC 5547 §6), a file transfer, which rcsjta asks for with the same `+g.oma.sip-im` tag. File transfer is not served here | 403 |
 | no asserted identity, or not as for MESSAGE | 403 |
 | a Request-URI that names no user | 404 |
 | unreadable `Conversation-ID` or `Contribution-ID` | 400 |
 | `Session-Expires` below 90 s from a client with `Supported: timer` | 422 with `Min-SE: 90` (RFC 4028 §6); a client without the extension, which could not act on a 422, gets no timer instead |
 | a body that is not an SDP offer, or a `multipart/mixed` one other than one SDP part and at most one `message/cpim` part (a group INVITE's resource list, two descriptions, a nested multipart); no offer (a late offer); no MSRP line; an offer of `passive` (RFC 6135 §4.2.2); no type in common; a first message in a large-mode INVITE | 488 |
-| a first message the engine refuses | as a pager MESSAGE's (413, 415, 400, 403, 500 with `Retry-After: 1`), and no session |
+| a first message the engine refuses | as a pager MESSAGE's (413, 415, 400, 403, 500 with `Retry-After: 1`), and no session; the session's place is given back |
 | this task holds `RCSAS_MAX_SESSIONS` sessions, those still waiting for an answer included | 500 with `Retry-After: 1`, as for a busy store: the client may try again, and another task may take it |
 | the user has opened `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` sessions | 486 Busy Here |
 
@@ -253,7 +253,10 @@ own leg if it has one, or in a session rcs-as starts (store-and-forward).
 A chat INVITE may carry the chat's first message (rcsjta does when the user
 starts a chat by writing): a `multipart/mixed` body with the SDP part and a
 `message/cpim` part (RFC 5621). rcs-as finds the SDP part as pcscf does, and
-submits the message as the session's first, before the 200.
+submits the message as the session's first, before the 200. The session takes
+its place under the bounds first: an INVITE past them is refused (486 or 500)
+with nothing stored, so a client that sends it again does not deliver it
+twice.
 
 In every session:
 
@@ -272,8 +275,11 @@ In every session:
 - **Refreshes.** A re-INVITE or UPDATE whose offer keeps the MSRP path gets the
   same answer, with the same `o=` version unless the answer changed (RFC 3264
   §8), and restarts the timer. A re-INVITE without an offer (rcsjta's refresh)
-  gets the session's last SDP as the offer in its 2xx, with the same version
-  (RFC 3261 §14.2, RFC 4028 §7.4); the answer in its ACK must keep the path, or
+  gets the session's last SDP as the offer in its 2xx (RFC 3261 §14.2, RFC 4028
+  §7.4), with every MSRP line `actpass`, since an offer is never `passive` (RFC
+  6135 §4.2.2): in a session the client started, rcs-as's last SDP is its
+  `passive` answer, so that offer takes the next `o=` version (RFC 3264 §8);
+  unchanged, it keeps the version. The answer in its ACK must keep the path, or
   the session ends. An UPDATE without an offer is a plain refresh, its 2xx
   without SDP (RFC 3311 §5.2). An offer with another path is refused with 488:
   a leg does not move. The session goes on.
