@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"slices"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -223,8 +222,9 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 // header the client wrote, or the status that refuses the request: 403. It
 // takes what pcscf asserts, one identity or the SIP and tel pair of one
 // user (#208), and nothing more: at most two, at most one of each scheme,
-// all one user (messaging.UserOf). That user is the sender, and every
-// identity as asserted is one the sender may name itself by.
+// all one user (messaging.UserOf). That user is the sender, and each
+// identity as asserted is one the sender may name itself by, as is any
+// other form of it (the engine compares them with UserOf).
 func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 	pai, err := req.Header.PAssertedIdentity()
 	if err != nil || len(pai) == 0 || len(pai) > 2 {
@@ -245,9 +245,6 @@ func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 		}
 		schemes[scheme], sender = true, user
 		identities = append(identities, raw)
-	}
-	if !slices.Contains(identities, sender) {
-		identities = append(identities, sender)
 	}
 	return sender, identities, 0
 }
