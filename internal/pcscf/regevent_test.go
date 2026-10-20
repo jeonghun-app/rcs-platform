@@ -604,8 +604,9 @@ func TestAnEndedSubscriptionIsSetUpAgainLater(t *testing.T) {
 
 // A SUBSCRIBE that fails or is refused leaves no subscription, and the
 // sweep sets one up again after resubscribeAfter, or after
-// refusedResubscribeAfter for a refusal other than 408; a 2xx without an
-// Expires, which RFC 6665 §4.1.2.1 requires, counts as a failure.
+// refusedResubscribeAfter for a refusal that will not change; a 403, which
+// scscf gives for an identity it has not registered (#256), is a failure,
+// and so is a 2xx without an Expires, which RFC 6665 §4.1.2.1 requires.
 func TestAFailedSubscribeIsTriedAgainLater(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
@@ -614,7 +615,7 @@ func TestAFailedSubscribeIsTriedAgainLater(t *testing.T) {
 	}{
 		{"timeout", func(_ *testing.T, s sentRequest) { s.h(nil, transaction.ErrTimeout) }, resubscribeAfter},
 		{"408", func(t *testing.T, s sentRequest) { respond(t, s, 408) }, resubscribeAfter},
-		{"403", func(t *testing.T, s sentRequest) { respond(t, s, 403) }, refusedResubscribeAfter},
+		{"403", func(t *testing.T, s sentRequest) { respond(t, s, 403) }, 30 * time.Second},
 		{"489", func(t *testing.T, s sentRequest) { respond(t, s, 489) }, refusedResubscribeAfter},
 		{"200 without Expires", func(t *testing.T, s sentRequest) { respond(t, s, 200) }, resubscribeAfter},
 		{"200 with Expires: 0", func(t *testing.T, s sentRequest) { respond(t, s, 200, "Expires: 0") }, resubscribeAfter},
@@ -1138,6 +1139,26 @@ func TestAFailingSubscribeBacksOff(t *testing.T) {
 	clock.t = clock.t.Add(resubscribeAfter)
 	registerKept(t, p, "FLOW-A")
 	f.one(t, p)
+}
+
+// A SUBSCRIBE refused 403 again and again, as scscf answers one for an
+// identity it has not registered (#256), waits 30 s, then twice as long
+// each time, up to an hour, never an hour at once.
+func TestASubscribeRefused403BacksOffToAnHour(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	respond(t, f.one(t, p), 403)
+	for _, wait := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute,
+		16 * time.Minute, 32 * time.Minute, time.Hour, time.Hour} {
+		clock.t = clock.t.Add(wait - time.Second)
+		registerKept(t, p, "FLOW-A")
+		if got := f.take(p); len(got) != 0 {
+			t.Fatalf("tried again before %v", wait)
+		}
+		clock.t = clock.t.Add(time.Second)
+		registerKept(t, p, "FLOW-A")
+		respond(t, f.one(t, p), 403)
+	}
 }
 
 // A refresh's 2xx without an Expires keeps the subscription for what the
