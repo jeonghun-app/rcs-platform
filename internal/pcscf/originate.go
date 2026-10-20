@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -275,7 +277,7 @@ func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid, callID string)
 	if ob {
 		core.Params.SetFlag("ob")
 	}
-	core.Params.Set(icidParam, icid)
+	core.Params.Set(icidParam, escapeParam(icid))
 	core.Params.Set(dialogParam, p.dialogMAC(flow, callID))
 	client := sip.URI{Scheme: "sip", Host: p.cfg.PublicHost, Port: p.cfg.PublicPort}
 	if p.cfg.ClientTransport == ClientTCP {
@@ -376,8 +378,8 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 		}
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
-	icid, _ := core.Param(icidParam)
-	if !validICID(icid) {
+	icid, ok := routeICID(*core)
+	if !ok {
 		// The client's copy of the route lost or changed it.
 		var err error
 		if icid, err = p.icid(); err != nil {
@@ -406,18 +408,43 @@ func (p *pcscf) scscfHop(u sip.URI) bool {
 	return port == p.cfg.SCSCFPort && strings.EqualFold(network, "tcp")
 }
 
-// validICID reports whether v is an icid pcscf writes: 32 lower-case hex
-// digits.
-func validICID(v string) bool {
-	if len(v) != 32 {
-		return false
+// maxICID bounds the icid read back from a route: pcscf writes 32 hex
+// digits, and the core's are of that order (TS 32.260).
+const maxICID = 256
+
+// routeICID is the icid a core-facing Record-Route value carries, as
+// recordRoute wrote it: escaped, since the core's icid may be a quoted
+// string with any character (RFC 7315 §4.6).
+func routeICID(u sip.URI) (string, bool) {
+	v, ok := u.Param(icidParam)
+	if !ok {
+		return "", false
 	}
-	for i := 0; i < len(v); i++ {
-		if c := v[i]; !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
-			return false
+	icid, err := url.PathUnescape(v)
+	if err != nil || icid == "" || len(icid) > maxICID {
+		return "", false
+	}
+	for _, r := range icid {
+		if r < 0x20 || r == 0x7f || !utf8.ValidRune(r) || r == utf8.RuneError {
+			return "", false
 		}
 	}
-	return true
+	return icid, true
+}
+
+// escapeParam writes v as a URI parameter value (RFC 3261 §25.1 paramchar):
+// unreserved and param-unreserved characters as they are, the rest %HH.
+func escapeParam(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("-_.!~*'()[]/:&+$", c) >= 0 {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 // publicHost reports whether host is a name the client-facing Record-Route

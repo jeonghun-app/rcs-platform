@@ -250,9 +250,12 @@ request is sent over that flow whatever its Route or Request-URI say below.
 
 - **430.** A request whose Route names no flow, or a flow that is not a live
   client flow of this task (closed, from an earlier start, or a core
-  connection), is answered 430 Flow Failed, and so is one whose flow fails
-  as it is sent. The 430 reaches `scscf` as it is, so that it tries the
-  client's other flows (RFC 5626 §5.3). Flow tokens are an HMAC under a key
+  connection), is answered 430 Flow Failed, and so is one whose flow is
+  already gone when it is to be sent. One whose flow closes while it is
+  under way may not get 430 yet
+  ([#234](https://github.com/jeonghun-app/rcs-platform/issues/234)). The
+  430 reaches `scscf` as it is, so that it tries the client's other flows
+  (RFC 5626 §5.3). Flow tokens are an HMAC under a key
   drawn at every start, so a token outlives neither its flow nor the task,
   even when a new flow comes from the same address.
 - **Record-Route.** A request outside a dialog that sets one up (INVITE,
@@ -260,13 +263,22 @@ request is sent over that flow whatever its Route or Request-URI say below.
   the client-facing one on top, so that the dialog's requests come back
   through this task on both sides: the client's along the route rule above,
   the core's to the flow. The core-facing one keeps the `Path`'s `ob` and
-  the request's icid (§5.2.6.4.4 3)).
+  the request's icid (§5.2.6.4.4 3)), percent-escaped where it is not a
+  token, so any icid the core chose survives in the route. A 1xx or 2xx
+  from the client that does not return the request's Record-Route values,
+  `pcscf`'s and the core's, as they were has them put back (§5.2.6.4.4 3)
+  b)), so the client cannot change the route the core keeps.
 - **Dialogs.** The core-facing Record-Route value, of a dialog either side
   set up, binds the flow to the dialog: `dlg` is a MAC over the flow token
   and the Call-ID, under a key drawn at every start. A request from the
   core inside a dialog reaches the flow only with the value written for its
-  Call-ID; the `Path`, another dialog's value or a changed one is 430, so a
-  peer that saw the token cannot reach the client outside its dialog.
+  Call-ID. The `Path`, another dialog's value or a changed one is 403 when
+  the flow is alive, and 430 only when it is not, so `scscf` does not take
+  a wrong route for a failed flow; a peer that saw the token cannot reach
+  the client outside its dialog. Only requests inside a dialog are checked:
+  an initial request comes along the `Path` and is not bound to a dialog.
+- **Network headers.** `P-Served-User` and `P-Profile-Key`, whom the core
+  served and the profile it chose, are removed toward the client.
 - **Privacy.** `P-Asserted-Identity` is removed toward the client when the
   request's `Privacy` has `id`, and so is it from a response to the client
   that asks so (RFC 3323 §4.2, RFC 3325 §9.3).
@@ -275,13 +287,19 @@ request is sent over that flow whatever its Route or Request-URI say below.
   from the core or a response to the client's own request (TS 24.229
   §5.2.1).
 - **Responses.** The client's responses get a `P-Charging-Vector` with the
-  request's `icid-value` and `orig-ioi`, a new icid if it had none, and
-  `RCS_IMS_DOMAIN` as the type 1 `term-ioi` (§5.2.6.4.4 6)). A 1xx or 2xx
-  to a request outside a dialog asserts the identity it was for, in place
-  of any `P-Preferred-Identity` (§5.2.6.4.4 1)): its `P-Called-Party-ID`;
-  without one, the Request-URI if the flow registered it, or else the
-  flow's default public identity. The client's own
-  network-only headers are gone already, removed on arrival.
+  request's `icid-value` and `orig-ioi`, quoted as they came; a request
+  inside a dialog without one takes the dialog's icid from the core-facing
+  Record-Route value, and any other request without one a new icid. The
+  vector names `RCS_IMS_DOMAIN` as the type 1 `term-ioi` (§5.2.6.4.4 6)).
+  The identity the request was for, its `P-Called-Party-ID`, is asserted in
+  place of any `P-Preferred-Identity` in a 1xx or 2xx to a request that sets
+  up a dialog (§5.2.6.4.4 1)) and in every response, 1xx to 6xx, to a
+  standalone request outside a dialog such as MESSAGE (§5.2.6.4.8 2)). A
+  request without `P-Called-Party-ID` gets no asserted identity in its
+  responses, and is counted in `terminating.pai_omitted`: the
+  Request-URI or the flow's registration is not the network's assertion of
+  whom the core reached. The client's own network-only headers are gone
+  already, removed on arrival.
 
 ## Settings
 

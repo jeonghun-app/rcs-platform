@@ -86,15 +86,22 @@ var forged = []string{
 // such a field is either absent or pcscf's own.
 func noForged(t *testing.T, req *sip.Request) {
 	t.Helper()
+	noForgedIn(t, req.Method+" "+req.Header.Get("CSeq"), &req.Header)
+}
+
+// noForgedIn is noForged for the header h of the message what names, a
+// request or a response.
+func noForgedIn(t *testing.T, what string, h *sip.Header) {
+	t.Helper()
 	for _, name := range networkOnlyHeaders {
-		for _, v := range req.Header.Values(name) {
+		for _, v := range h.Values(name) {
 			if v == "icid-value=1" || strings.Contains(v, "+15550100005") || strings.Contains(v, "forged") {
-				t.Errorf("%s %s reached the core with %s: %q", req.Method, req.Header.Get("CSeq"), name, v)
+				t.Errorf("%s reached the core with %s: %q", what, name, v)
 			}
 		}
 	}
-	if strings.Contains(strings.Join(req.Header.Values("P-Access-Network-Info"), ","), "network-provided") {
-		t.Errorf("%s reached the core with a network-provided P-Access-Network-Info", req.Method)
+	if strings.Contains(strings.Join(h.Values("P-Access-Network-Info"), ","), "network-provided") {
+		t.Errorf("%s reached the core with a network-provided P-Access-Network-Info", what)
 	}
 }
 

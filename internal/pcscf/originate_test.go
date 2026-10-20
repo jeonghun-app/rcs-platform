@@ -404,10 +404,37 @@ func TestAnInDialogRequestMustFollowThisPcscfsRouteForItsFlow(t *testing.T) {
 // A dialog whose route lost its icid gets a new one rather than none.
 func TestAnInDialogRequestWithoutTheDialogsICIDGetsANewOne(t *testing.T) {
 	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
-	for _, core := range []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr", "sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=1"} {
+	base := "sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr"
+	for _, core := range []string{base, base + ";icid", base + ";icid=a%01b", base + ";icid=" + strings.Repeat("a", maxICID+1)} {
 		r := inDialogFrom(t, []string{clientEnt, core}, "sip:bob@198.51.100.20", "Route: "+scscfRoute)
-		if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); icidOf(t, got) == "1" {
-			t.Errorf("%s: P-Charging-Vector %q", core, got)
+		if got := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector"); !icidValue.MatchString(got) {
+			t.Errorf("%s: P-Charging-Vector %q, want a new icid", core, got)
+		}
+	}
+}
+
+// An icid from the core can be any value, a quoted string with ";" or a
+// quote in it too: the core-facing Record-Route value carries it escaped,
+// and the dialog's requests get it back as it was (review of #221).
+func TestADialogKeepsTheCoresICIDWhateverItHolds(t *testing.T) {
+	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
+	for _, icid := range []string{"plain-token.1", `a b;c=d\"e`, "%41é"} {
+		rr := p.recordRoute("FLOW-A", false, icid, "call-1")
+		core := rr[0]
+		back, err := sip.ParseAddress(core.String())
+		if err != nil {
+			t.Fatalf("%q: the Record-Route %s does not parse: %v", icid, core, err)
+		}
+		got, ok := routeICID(back.URI)
+		if !ok || got != icid {
+			t.Errorf("%q: read back %q, %v from %s", icid, got, ok, core)
+		}
+		r := inDialogFrom(t, []string{clientEnt, back.URI.String()}, "sip:bob@198.51.100.20", "Route: "+scscfRoute)
+		pcv := prepared(t, p.Route(context.Background(), r), r).Header.Get("P-Charging-Vector")
+		var h sip.Header
+		_ = h.Set("P-Charging-Vector", pcv)
+		if cv, err := h.PChargingVector(); err != nil || cv.ICID() != icid {
+			t.Errorf("%q: P-Charging-Vector %q (%v)", icid, pcv, err)
 		}
 	}
 }

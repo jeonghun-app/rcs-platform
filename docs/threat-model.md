@@ -48,8 +48,11 @@ separate from its core listener; core SIP ports admit only platform services
 in-dialog requests against its own Record-Route values only, keeping no
 dialog state. The core-facing value binds the flow token to the Call-ID with
 a MAC under a key drawn at every start, and a request from the core inside
-a dialog reaches the flow only with the value written for its Call-ID. The
-binding covers the Call-ID and not the tags: `pcscf` writes the value into
+a dialog reaches the flow only with the value written for its Call-ID, and
+is answered 403 with any other while the flow is alive. The MAC is checked
+only on requests inside a dialog (with a To tag): an initial request comes
+along the client's `Path` and is not bound to a dialog. The binding covers
+the Call-ID and not the tags: `pcscf` writes the value into
 the request that sets up the dialog, before the callee has chosen its tag,
 and a value it rewrote in the response would differ between the two route
 sets unless it kept state. The peer of a call has seen that value, so it can

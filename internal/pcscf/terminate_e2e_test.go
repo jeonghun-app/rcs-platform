@@ -143,12 +143,15 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	if got := invite.Header.Get("P-Asserted-Identity"); got != "<"+bobIMPU+">" {
 		t.Errorf("P-Asserted-Identity at the client %q", got)
 	}
-	c.write(respondTo(invite, 200, "a1", "Contact: <"+contact+">", "P-Preferred-Identity: <sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>",
-		"P-Asserted-Identity: <sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>", "P-Charging-Vector: icid-value=1"))
+	// Nothing the client forges in its answers or its requests reaches the
+	// core (#188 plan): only pcscf's own identity and charging do.
+	c.write(respondTo(invite, 200, "a1", append([]string{"Contact: <" + contact + ">",
+		"P-Preferred-Identity: <sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org>"}, forged...)...))
 	ok := core.final()
 	if ok.StatusCode != 200 {
 		t.Fatalf("INVITE: %d", ok.StatusCode)
 	}
+	noForgedIn(t, "the 200 to INVITE", &ok.Header)
 	if got := ok.Header.Values("P-Asserted-Identity"); !slices.Equal(got, []string{"<" + aliceIMPU + ">"}) || ok.Header.Has("P-Preferred-Identity") {
 		t.Errorf("200 at the core: P-Asserted-Identity %q, P-Preferred-Identity %q", got, ok.Header.Get("P-Preferred-Identity"))
 	}
@@ -162,8 +165,9 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	for _, v := range invite.Header.Values("Record-Route") {
 		routeSet = append(routeSet, "Route: "+v)
 	}
-	c.send(call, fmt.Sprintf("BYE sip:bob@scscf.rcs.internal:%d;transport=tcp SIP/2.0", scscfPort), "a1", 2, "BYE", routeSet...)
+	c.send(call, fmt.Sprintf("BYE sip:bob@scscf.rcs.internal:%d;transport=tcp SIP/2.0", scscfPort), "a1", 2, "BYE", append(routeSet, forged...)...)
 	bye := scscf.receive(t)
+	noForged(t, bye)
 	if bye.Method != "BYE" || bye.Header.Get("P-Charging-Vector") != "icid-value="+coreICID+";orig-ioi=ims.mnc001.mcc001.3gppnetwork.org" {
 		t.Errorf("%s at scscf, P-Charging-Vector %q", bye.Method, bye.Header.Get("P-Charging-Vector"))
 	}
@@ -179,15 +183,17 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	if info.Method != "INFO" {
 		t.Fatalf("the client got %s", info.Method)
 	}
-	c.write(respondTo(info, 200, "a1"))
+	c.write(respondTo(info, 200, "a1", forged...))
 	if res := core.final(); res.StatusCode != 200 {
 		t.Errorf("INFO: %d", res.StatusCode)
+	} else {
+		noForgedIn(t, "the 200 to INFO", &res.Header)
 	}
 	// The same route in another dialog reaches no one (security review of
 	// #221).
 	core.write(coreRequest("INFO", contact, "another-call", "a1", 1, "Route: "+rr[1], "Route: "+rr[0]))
-	if res := core.final(); res.StatusCode != statusFlowFailed {
-		t.Errorf("another dialog's INFO: %d, want 430", res.StatusCode)
+	if res := core.final(); res.StatusCode != 403 {
+		t.Errorf("another dialog's INFO: %d, want 403", res.StatusCode)
 	}
 
 	// Privacy of the identity hides it from the client.
@@ -196,9 +202,11 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	if msg.Header.Has("P-Asserted-Identity") {
 		t.Errorf("P-Asserted-Identity reached the client with Privacy: id: %q", msg.Header.Get("P-Asserted-Identity"))
 	}
-	c.write(respondTo(msg, 200, "a1"))
+	c.write(respondTo(msg, 200, "a1", forged...))
 	if res := core.final(); res.StatusCode != 200 {
 		t.Errorf("MESSAGE: %d", res.StatusCode)
+	} else {
+		noForgedIn(t, "the 200 to MESSAGE", &res.Header)
 	}
 }
 
