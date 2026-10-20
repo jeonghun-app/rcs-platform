@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
@@ -145,5 +146,27 @@ func TestSIPAuthIsCaseInsensitive(t *testing.T) {
 	lookup := env("RCS_SIM_SIP_IMPI", testIMPI, "RCS_SIM_AKA_K", testK, "RCS_SIM_AKA_OPC", testOPc)
 	if _, err := sipConfig(context.Background(), sipFlags{proxy: "127.0.0.1:5060", transport: "tcp", auth: "AKA"}, defaultSelf, lookup); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTheRunRegistersThePeerWithItsOwnIMPIAndInstance(t *testing.T) {
+	// QA on #209: run wires -sip-peer-impi and a new instance into the
+	// peer's client. The core knows each IMPI's own password only, so a
+	// peer that registered with the client's IMPI would be refused.
+	const domain = "ims.mnc001.mcc001.3gppnetwork.org"
+	core := simtest.StartIMSCore(t, domain, map[string]string{
+		"001010000000001@" + domain: "self-password",
+		"001010000000002@" + domain: "peer-password",
+	})
+	const instance = "urn:uuid:00000000-0000-4000-8000-000000000009"
+	lookup := env("RCS_SIM_SIP_IMPI", "001010000000001@"+domain, "RCS_SIM_SIP_PEER_IMPI", "001010000000002@"+domain,
+		"RCS_SIM_SIP_PASSWORD", "self-password", "RCS_SIM_SIP_PEER_PASSWORD", "peer-password")
+	code, out, errOut := call(lookup, "-sip-proxy", core.Addr.String(), "-sip-auth", "digest", "-sip-instance", instance, "pager-message")
+	if code != exitOK {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	self, peer := core.Instance(defaultSelf), core.Instance(defaultPeer)
+	if self != "<"+instance+">" || peer == "" || peer == self {
+		t.Fatalf("instances: client %q, peer %q", self, peer)
 	}
 }

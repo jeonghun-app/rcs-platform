@@ -3,7 +3,9 @@ package scenario_test
 import (
 	"context"
 	"regexp"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -12,12 +14,16 @@ import (
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
-// Two test subscribers, on .github/allowed-test-identifiers.txt, with
-// made-up passwords.
+// Test subscribers, on .github/allowed-test-identifiers.txt, with made-up
+// passwords: the client, the peer, and a third that plays an earlier run's
+// leftovers.
 const (
-	imsDomain = "ims.mnc001.mcc001.3gppnetwork.org"
-	selfIMPI  = "001010000000001@" + imsDomain
-	peerIMPI  = "001010000000002@" + imsDomain
+	imsDomain  = "ims.mnc001.mcc001.3gppnetwork.org"
+	selfIMPI   = "001010000000001@" + imsDomain
+	peerIMPI   = "001010000000002@" + imsDomain
+	thirdIMPI  = "001010000000003@" + imsDomain
+	thirdIMPU  = "sip:+15550100003@" + imsDomain
+	thirdToken = "third-password"
 )
 
 // sipStack is stack with the two SIP clients registering at an in-process
@@ -25,7 +31,7 @@ const (
 func sipStack(t *testing.T) (scenario.Config, *simtest.IMSCore) {
 	t.Helper()
 	cfg := stack(t)
-	core := simtest.StartIMSCore(t, imsDomain, map[string]string{selfIMPI: "self-password", peerIMPI: "peer-password"})
+	core := simtest.StartIMSCore(t, imsDomain, map[string]string{selfIMPI: "self-password", peerIMPI: "peer-password", thirdIMPI: thirdToken})
 	client := func(impu, impi, password, instance string) *sipua.Config {
 		u, err := sip.ParseURI(impu)
 		if err != nil {
@@ -52,13 +58,17 @@ func TestAPagerMessageIsDeliveredAndItsNotificationComesBack(t *testing.T) {
 		t.Fatalf("results %+v", results)
 	}
 	steps := byStep(results)
-	for _, s := range []string{"register", "message", "receive", "delivery-notification"} {
+	for _, s := range []string{"register", "message", "receive", "delivery-notification", "peer-offline"} {
 		if !steps[s].OK {
 			t.Fatalf("%s: %+v", s, steps[s])
 		}
 	}
-	if steps["message"].Detail["status"] != 200 {
-		t.Fatalf("message %+v", steps["message"])
+	if steps["message"].Detail["status"] != 200 || steps["receive"].Detail["skipped"] != 0 {
+		t.Fatalf("message %+v, receive %+v", steps["message"], steps["receive"])
+	}
+	// What the platform does today for an unregistered IMPU.
+	if d := steps["peer-offline"].Detail; d["status"] != 480 || d["stored"] != 0 {
+		t.Fatalf("peer-offline %+v", steps["peer-offline"])
 	}
 	// The scenario leaves no binding behind.
 	if core.Registered(self.URI) || core.Registered(peer.URI) {
@@ -153,6 +163,129 @@ func TestAPagerMessageOrNotificationChangedOnTheWayFails(t *testing.T) {
 			cfg, core := sipStack(t)
 			core.Rewrite = func(req *sip.Request) {
 				req.Body = []byte(tc.rewrite(string(req.Body)))
+			}
+			ok, results := runAll(t, cfg, "pager-message")
+			last := results[len(results)-1]
+			if ok || last.Step != tc.step || last.OK {
+				t.Fatalf("results %+v", results)
+			}
+		})
+	}
+}
+
+func TestPeerOfflineTakesStoreAndForwardButNotALostMessage(t *testing.T) {
+	// QA on #209 (#135 AC 5): a core that stores the message for the
+	// unregistered peer and delivers it at its next registration passes;
+	// one that answers 200 and loses it fails.
+	t.Run("stored", func(t *testing.T) {
+		cfg, core := sipStack(t)
+		core.Offline = simtest.StoreAndForward
+		ok, results := runAll(t, cfg, "pager-message")
+		if d := byStep(results)["peer-offline"]; !ok || d.Detail["status"] != 202 || d.Detail["stored"] != 1 {
+			t.Fatalf("results %+v", results)
+		}
+	})
+	t.Run("lost", func(t *testing.T) {
+		cfg, core := sipStack(t)
+		cfg.StepTimeout = 2 * time.Second
+		core.Offline = simtest.Drop
+		ok, results := runAll(t, cfg, "pager-message")
+		last := results[len(results)-1]
+		if ok || last.Step != "peer-offline" || last.OK || last.Detail["status"] != 200 ||
+			last.Error != "MESSAGE to the unregistered peer answered 200, and it never arrived after the peer registered again" {
+			t.Fatalf("results %+v", results)
+		}
+	})
+}
+
+func TestMessagesAnEarlierRunLeftAreSkipped(t *testing.T) {
+	// QA on #209: a store-and-forward network may first deliver what an
+	// earlier run left. A third subscriber sends the peer such a message,
+	// same text but another Message-ID and no token of this run, as soon
+	// as the peer has registered: receive skips it.
+	cfg, core := sipStack(t)
+	u, _ := sip.ParseURI(thirdIMPU)
+	creds, err := sipua.DigestCredentials(thirdIMPI, []byte(thirdToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	third, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: imsDomain, IMPU: u,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000003", Credentials: creds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = third.Close() })
+	if _, err := third.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	leftover := "imdn.Message-ID: 0ld0message0id\r\nimdn.Disposition-Notification: positive-delivery\r\n"
+	body := "From: <" + thirdIMPU + ">\r\nTo: <" + peer.URI + ">\r\nNS: imdn <urn:ietf:params:imdn>\r\n" + leftover +
+		"\r\nContent-Type: text/plain;charset=utf-8\r\n\r\nrcs-sim pager-mode message"
+	var results []scenario.Result
+	ok, err := scenario.Run(context.Background(), cfg, []string{"pager-message"}, func(r scenario.Result) {
+		results = append(results, r)
+		if r.Step == "register" && r.OK {
+			pu, _ := sip.ParseURI(peer.URI)
+			req, err := third.NewMessage(pu, "message/cpim", []byte(body))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if res, err := third.Send(ctx, req); err != nil || res.StatusCode != 200 {
+				t.Errorf("leftover MESSAGE: %v, %v", res, err)
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := byStep(results)["receive"]; !ok || !d.OK || d.Detail["skipped"] != 1 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestEveryPagerCheckFailsItsStep(t *testing.T) {
+	// QA on #209: each check of the scenario fails its step.
+	isNotification := func(r *sip.Request) bool { return strings.Contains(string(r.Body), "imdn+xml") }
+	sub := func(re, to string) func(string) string {
+		return func(b string) string { return regexp.MustCompile(re).ReplaceAllString(b, to) }
+	}
+	refuse := func(r *sip.Request) { // the far end answers 420 (RFC 3261 §8.2.2.3)
+		r.Header.Add("Require", "x-qa-unknown")
+	}
+	for name, tc := range map[string]struct {
+		notification bool
+		rewrite      func(*sip.Request)
+		step         string
+	}{
+		"text changed": {false, func(r *sip.Request) {
+			r.Body = []byte(sub(`rcs-sim pager-mode message`, `rcs-sim pager-mode messagf`)(string(r.Body)))
+		}, "receive"},
+		"display requested only": {false, func(r *sip.Request) {
+			r.Body = []byte(sub(`imdn.Disposition-Notification: \S+`, `imdn.Disposition-Notification: display`)(string(r.Body)))
+		}, "receive"},
+		"message not cpim": {false, func(r *sip.Request) { _ = r.Header.Set("Content-Type", "text/plain") }, "receive"},
+		"message refused":  {false, refuse, "message"},
+		"notification failed": {true, func(r *sip.Request) {
+			r.Body = []byte(sub(`<delivered></delivered>`, `<failed/>`)(string(r.Body)))
+		}, "delivery-notification"},
+		"notification is display": {true, func(r *sip.Request) {
+			r.Body = []byte(sub(`<delivery-notification><status><delivered></delivered></status></delivery-notification>`,
+				`<display-notification><status><displayed/></status></display-notification>`)(string(r.Body)))
+		}, "delivery-notification"},
+		"notification no disposition": {true, func(r *sip.Request) {
+			r.Body = []byte(sub(`Content-Disposition: notification\r\n`, ``)(string(r.Body)))
+		}, "delivery-notification"},
+		"notification refused": {true, refuse, "delivery-notification"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			core.Rewrite = func(r *sip.Request) {
+				if r.Method == "MESSAGE" && isNotification(r) == tc.notification {
+					tc.rewrite(r)
+				}
 			}
 			ok, results := runAll(t, cfg, "pager-message")
 			last := results[len(results)-1]

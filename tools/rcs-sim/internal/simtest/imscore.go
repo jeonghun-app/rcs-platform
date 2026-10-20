@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
@@ -29,8 +31,12 @@ type IMSCore struct {
 	Domain string
 	// Rewrite, when set before any request, changes each request the core
 	// forwards or sends, NOTIFYs included, as a faulty network element
-	// would.
+	// would. It runs on the reading goroutine of the sender's connection,
+	// so it must not block.
 	Rewrite func(*sip.Request)
+	// Offline, when set before any request, is what the core does with a
+	// request to an IMPU that has no binding.
+	Offline Offline
 
 	t     testing.TB
 	tr    *transport.Transport
@@ -41,8 +47,12 @@ type IMSCore struct {
 
 	mu       sync.Mutex
 	bindings map[string]transport.FlowID
+	// instances are each IMPU's last registered +sip.instance, and stored
+	// the requests StoreAndForward holds for it, by aorKey.
+	instances map[string]string
+	stored    map[string][]*sip.Request
 	// contacts are each IMPU's registered Contact URI, and subs the reg
-	// event subscriptions to it (RFC 3680).
+	// event subscriptions to it (RFC 3680), by aorKey.
 	contacts map[string]string
 	subs     map[string][]*regSub
 	// notifies sends NOTIFYs one at a time, in the order they were made,
@@ -61,9 +71,39 @@ type regSub struct {
 	version                 uint64
 }
 
+// Offline is what IMSCore does with a request to an unregistered IMPU.
+type Offline int
+
+const (
+	// Refuse answers 480 (TS 24.229 §5.4.3.3), what the platform does
+	// today.
+	Refuse Offline = iota
+	// StoreAndForward answers 202 and delivers the request when the IMPU
+	// registers again, as rcs-as's store-and-forward will.
+	StoreAndForward
+	// Drop answers 200 and loses the request, as a faulty element would.
+	Drop
+)
+
+// aorKey is how bindings are keyed: scheme, user and host (case folded),
+// without parameters, for registration and routing alike.
+func aorKey(u sip.URI) string {
+	return sip.URI{Scheme: strings.ToLower(u.Scheme), User: u.User, Host: strings.ToLower(u.Host)}.String()
+}
+
+// keyOf is aorKey for an IMPU written out; "" if it does not parse.
+func keyOf(impu string) string {
+	u, err := sip.ParseURI(impu)
+	if err != nil {
+		return ""
+	}
+	return aorKey(u)
+}
+
 // StartIMSCore starts an IMSCore for domain whose users are IMPI to Digest
-// password.
-func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore {
+// password. t1, if given, is its transactions' T1 instead of RFC 3261's
+// 500 ms, for tests that wait out a timer.
+func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...time.Duration) *IMSCore {
 	t.Helper()
 	ds, err := digest.NewServer(digest.ServerConfig{
 		Realm: domain, NonceKey: bytes.Repeat([]byte("i"), digest.MinNonceKeySize),
@@ -73,7 +113,8 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore
 		t.Fatal(err)
 	}
 	c := &IMSCore{
-		Domain: domain, t: t, ds: ds, users: users, bindings: map[string]transport.FlowID{},
+		Domain: domain, t: t, ds: ds, users: users,
+		bindings: map[string]transport.FlowID{}, instances: map[string]string{}, stored: map[string][]*sip.Request{},
 		contacts: map[string]string{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
 	}
 	go func() {
@@ -92,7 +133,11 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore
 		t.Fatal(err)
 	}
 	c.tr = tr
-	c.layer = transaction.New(tr, c, transaction.Config{})
+	var cfg transaction.Config
+	if len(t1) > 0 {
+		cfg.T1 = t1[0]
+	}
+	c.layer = transaction.New(tr, c, cfg)
 	t.Cleanup(func() { c.layer.Close(); tr.Close() })
 	if c.Addr, err = tr.Listen(transport.ListenerConfig{
 		Network: transport.TCP, Addr: "127.0.0.1:0", ClientFacing: true,
@@ -107,22 +152,32 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string) *IMSCore
 func (c *IMSCore) Registered(impu string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.bindings[impu]
+	_, ok := c.bindings[keyOf(impu)]
 	return ok
 }
 
-// Expire drops impu's binding, as its expiry would: requests to it then
-// get 480 until it registers again, and its reg event subscribers are told
-// the contact expired (RFC 3680 §5.3.2), which ends their subscriptions.
-func (c *IMSCore) Expire(impu string) {
+// Instance is the +sip.instance impu last registered with, kept after it
+// unregisters; "" if it never did.
+func (c *IMSCore) Instance(impu string) string {
 	c.mu.Lock()
-	_, bound := c.bindings[impu]
-	contact := c.contacts[impu]
-	delete(c.bindings, impu)
-	delete(c.contacts, impu)
+	defer c.mu.Unlock()
+	return c.instances[keyOf(impu)]
+}
+
+// Expire drops impu's binding, as its expiry would: requests to it then
+// get what Offline says until it registers again, and its reg event
+// subscribers are told the contact expired (RFC 3680 §5.3.2), which ends
+// their subscriptions.
+func (c *IMSCore) Expire(impu string) {
+	key := keyOf(impu)
+	c.mu.Lock()
+	_, bound := c.bindings[key]
+	contact := c.contacts[key]
+	delete(c.bindings, key)
+	delete(c.contacts, key)
 	c.mu.Unlock()
 	if bound {
-		c.registrationChanged(regChange{impu: impu, contact: contact, event: "expired"})
+		c.registrationChanged(regChange{impu: impu, key: key, contact: contact, event: "expired"})
 	}
 }
 
@@ -189,25 +244,40 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 		return res, nil
 	}
 	expires, _ := req.Header.Expires()
-	impu := to.URI.String()
+	impu, key := to.URI.String(), aorKey(to.URI)
 	res, _ := sip.NewResponse(req, 200, "", tag)
-	change := &regChange{impu: impu, event: "registered"}
+	change := &regChange{impu: impu, key: key, event: "registered"}
+	var held []*sip.Request
 	c.mu.Lock()
-	if _, was := c.bindings[impu]; was {
+	if _, was := c.bindings[key]; was {
 		change.event = "refreshed"
 	}
 	if expires == 0 {
-		delete(c.bindings, impu)
-		change.contact, change.event = c.contacts[impu], "unregistered"
-		delete(c.contacts, impu)
+		delete(c.bindings, key)
+		change.contact, change.event = c.contacts[key], "unregistered"
+		delete(c.contacts, key)
 	} else {
-		c.bindings[impu] = tx.Source().Flow
+		c.bindings[key] = tx.Source().Flow
 		if contacts, err := req.Header.Contact(); err == nil && len(contacts) > 0 {
-			c.contacts[impu] = contacts[0].URI.String()
+			c.contacts[key] = contacts[0].URI.String()
+			if inst, ok := contacts[0].Instance(); ok {
+				c.instances[key] = inst
+			}
 		}
-		change.contact = c.contacts[impu]
+		change.contact = c.contacts[key]
+		held = c.stored[key]
+		delete(c.stored, key)
 	}
 	c.mu.Unlock()
+	if len(held) > 0 {
+		// After the 2xx has gone, so the client knows it is registered.
+		flow := tx.Source().Flow
+		go func() {
+			for _, fwd := range held {
+				_, _ = c.layer.Request(fwd, transport.Destination{Flow: flow}, func(*sip.Response, error) {})
+			}
+		}()
+	}
 	if expires > 0 {
 		if contacts, err := req.Header.Contact(); err == nil {
 			for _, ct := range contacts {
@@ -224,7 +294,7 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *r
 
 // regChange is what a REGISTER changed in an IMPU's registration.
 type regChange struct {
-	impu, contact, event string
+	impu, key, contact, event string
 }
 
 // registrationChanged notifies every subscriber of the IMPU's reg event
@@ -232,9 +302,9 @@ type regChange struct {
 func (c *IMSCore) registrationChanged(ch regChange) {
 	gone := ch.event == "unregistered" || ch.event == "expired"
 	c.mu.Lock()
-	subs := c.subs[ch.impu]
+	subs := c.subs[ch.key]
 	if gone {
-		delete(c.subs, ch.impu)
+		delete(c.subs, ch.key)
 	}
 	c.mu.Unlock()
 	state := "active;expires=600000"
@@ -259,7 +329,7 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 		c.respond(tx, res)
 		return
 	}
-	impu := sip.URI{Scheme: to.URI.Scheme, User: to.URI.User, Host: to.URI.Host}.String()
+	impu, key := sip.URI{Scheme: to.URI.Scheme, User: to.URI.User, Host: to.URI.Host}.String(), aorKey(to.URI)
 	callID := req.Header.Get("Call-ID")
 	expires, err := req.Header.Expires()
 	if err != nil {
@@ -268,25 +338,25 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 	}
 	c.mu.Lock()
 	var s *regSub
-	for _, old := range c.subs[impu] {
+	for _, old := range c.subs[key] {
 		if old.callID == callID {
 			s = old
 		}
 	}
 	if s == nil && expires > 0 {
 		s = &regSub{impu: impu, callID: callID, from: req.Header.Get("From"), tag: tag, target: contacts[0].URI, flow: tx.Source().Flow}
-		c.subs[impu] = append(c.subs[impu], s)
+		c.subs[key] = append(c.subs[key], s)
 	}
 	if s != nil && expires == 0 {
-		subs := c.subs[impu][:0]
-		for _, old := range c.subs[impu] {
+		subs := c.subs[key][:0]
+		for _, old := range c.subs[key] {
 			if old != s {
 				subs = append(subs, old)
 			}
 		}
-		c.subs[impu] = subs
+		c.subs[key] = subs
 	}
-	contact, registered := c.contacts[impu]
+	contact, registered := c.contacts[key]
 	c.mu.Unlock()
 	if s == nil {
 		res, _ := sip.NewResponse(req, 481, "", tag)
@@ -382,30 +452,40 @@ func xmlText(s string) string {
 }
 
 func (c *IMSCore) flowFor(uri sip.URI) (transport.FlowID, bool) {
-	key := sip.URI{Scheme: uri.Scheme, User: uri.User, Host: uri.Host}.String()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	flow, ok := c.bindings[key]
+	flow, ok := c.bindings[aorKey(uri)]
 	return flow, ok
 }
 
 // route forwards a request to the flow its Request-URI is registered on,
 // statefully: the answers come back through tx. An IMPU that is not
-// registered gets 480 (TS 24.229 §5.4.3.3).
+// registered gets what Offline says.
 func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	req := tx.Request()
-	flow, ok := c.flowFor(req.URI)
-	if !ok {
+	answer := func(code int) {
 		tag, _ := c.ids.Tag()
-		res, _ := sip.NewResponse(req, 480, "", tag)
-		c.respond(tx, res)
-		return
+		if res, err := sip.NewResponse(req, code, "", tag); err == nil {
+			c.respond(tx, res)
+		}
 	}
+	flow, ok := c.flowFor(req.URI)
 	fwd, err := c.forwarded(req)
-	if err != nil {
-		tag, _ := c.ids.Tag()
-		res, _ := sip.NewResponse(req, 500, "", tag)
-		c.respond(tx, res)
+	switch {
+	case err != nil:
+		answer(500)
+		return
+	case !ok && c.Offline == StoreAndForward && req.Method == "MESSAGE":
+		c.mu.Lock()
+		c.stored[aorKey(req.URI)] = append(c.stored[aorKey(req.URI)], fwd)
+		c.mu.Unlock()
+		answer(202)
+		return
+	case !ok && c.Offline == Drop:
+		answer(200)
+		return
+	case !ok:
+		answer(480)
 		return
 	}
 	if c.Rewrite != nil {
@@ -414,7 +494,17 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	// Off the reading goroutine: Request waits for room on the other flow.
 	go func() {
 		_, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
-			if err != nil || res.StatusCode == 100 {
+			if err != nil {
+				// The far end never answered, or its flow went: the
+				// originator hears it (RFC 3261 §16.7, §16.8).
+				code := 500
+				if errors.Is(err, transaction.ErrTimeout) {
+					code = 408
+				}
+				answer(code)
+				return
+			}
+			if res.StatusCode == 100 {
 				return
 			}
 			back := res.Clone()
