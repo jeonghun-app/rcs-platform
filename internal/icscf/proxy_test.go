@@ -87,6 +87,9 @@ type fakeNet struct {
 	upstream []*sip.Response
 	// fail, if set, is what sending a request downstream returns.
 	fail error
+	// up, if set, takes the responses sent upstream instead of recording
+	// them: the proxy before icscf in a chain.
+	up func(*sip.Response)
 }
 
 func (n *fakeNet) SendRequest(req *sip.Request, dst transport.Destination, _ ...transport.SendOption) (transport.Network, error) {
@@ -102,6 +105,10 @@ func (n *fakeNet) SendRequest(req *sip.Request, dst transport.Destination, _ ...
 func (n *fakeNet) SendResponse(res *sip.Response, _ transport.Source, _ ...transport.SendOption) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.up != nil {
+		go n.up(res.Clone())
+		return nil
+	}
 	n.upstream = append(n.upstream, res.Clone())
 	return nil
 }
@@ -290,16 +297,51 @@ func (l *lockedReader) Read(b []byte) (int, error) {
 	return l.r.Read(b)
 }
 
-// Decided on #274: a terminating request whose S-CSCF cannot be reached
-// reaches the caller as 503 with Retry-After.
-func TestTerminatingRequestToAnUnreachableSCSCFGets503WithRetryAfter(t *testing.T) {
+// upstreamNet links the proxy before icscf to it: its requests go to
+// icscf, its responses to the caller, which records them.
+type upstreamNet struct {
+	icscf *proxy.Proxy
+	fakeNet
+}
+
+func (n *upstreamNet) SendRequest(req *sip.Request, _ transport.Destination, _ ...transport.SendOption) (transport.Network, error) {
+	go n.icscf.Receive(transport.Inbound{Message: req.Clone(), Source: transport.Source{Flow: "scscf-orig", Network: transport.TCP, Listener: "core"}})
+	return transport.TCP, nil
+}
+
+// Decided on #274: a terminating request whose S-CSCF cannot be sent to
+// reaches the caller, through the proxy before icscf (the originating
+// S-CSCF, which runs the same proxy core), as 500 with Retry-After. A 503
+// would have been turned into a 500 there, its Retry-After dropped.
+func TestTerminatingRequestToAnUnreachableSCSCFReachesTheCallerAs500WithRetryAfter(t *testing.T) {
 	g := newProxied(t)
 	g.net.mu.Lock()
 	g.net.fail = errors.New("connection refused")
 	g.net.mu.Unlock()
-	g.receive(request(t, "MESSAGE", impu1))
-	waitFor(t, "the 503", func() bool { return slices.Contains(g.net.responses(), "503 MESSAGE") })
-	if got := g.net.response(t, 503).Header.Get("Retry-After"); got != "10" {
-		t.Errorf("Retry-After = %q, want 10", got)
+	un := &upstreamNet{icscf: g.p}
+	up, err := proxy.New(un, proxy.Config{
+		Self:        []sip.URI{mustURI("sip:scscf-orig.rcs.local;lr")},
+		Router:      proxy.RouterFunc(func(_ context.Context, r *proxy.Request) proxy.Decision { return proxy.Forward(r) }),
+		Resolver:    resolver{},
+		Transaction: transaction.Config{Clock: &fakeClock{}},
+		Rand:        &lockedReader{r: rand.NewChaCha8([32]byte{2})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(up.Close)
+	g.net.mu.Lock()
+	g.net.up = func(res *sip.Response) {
+		up.Receive(transport.Inbound{Message: res, Source: transport.Source{Flow: "icscf", Network: transport.TCP}})
+	}
+	g.net.mu.Unlock()
+	up.Receive(transport.Inbound{Message: request(t, "MESSAGE", impu1), Source: transport.Source{Flow: "caller", Network: transport.TCP}})
+	waitFor(t, "the caller's final response", func() bool { return len(un.responses()) > 0 })
+	res := un.response(t, 500)
+	if got := res.Header.Get("Retry-After"); got != "10" {
+		t.Errorf("the caller got 500 with Retry-After %q, want 10", got)
+	}
+	if got := g.metrics.counts["icscf.scscf.unreachable"]; got != 1 {
+		t.Errorf("unreachable counted %d", got)
 	}
 }

@@ -34,10 +34,9 @@ func newCandidates(list []SCSCF) []candidate {
 // want, which the HSS sends when any S-CSCF will do (TS 29.228 §6.7), keeps
 // them all in configuration order.
 //
-// Server-Name values inside want are not used: TS 24.229 selects by
-// capability, and comparing them with the configured URIs (RFC 3261
-// §19.1.4) would let a difference in port or transport between the HSS's
-// list and this one refuse every first registration.
+// Server-Name values inside want are not compared with the configured URIs
+// here: when there are any, the Router uses the first instead of ranking at
+// all (TS 29.228 §6.7).
 //
 // The Router forwards to the first. The rest are what a re-selection after
 // the first fails (§5.3.1.3, §5.3.2.2) would try in turn; it is not done

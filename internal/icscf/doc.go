@@ -36,37 +36,42 @@
 // included (TS 29.229 §6.2.1). "Could not be completed" is no answer at all
 // (time-out, transport failure, no HSS task connected, after cxclient's one
 // retry on another task), a protocol error or 4xxx such as
-// DIAMETER_TOO_BUSY, or an answer naming an S-CSCF that is not a SIP URI.
+// DIAMETER_TOO_BUSY, DIAMETER_UNABLE_TO_COMPLY (TS 29.228 §6.1.1.1: an HSS
+// failure such as a database error, decided on #274), or an answer naming
+// an S-CSCF that is not a SIP URI. "Negatives" are the other answers.
 //
 //	request      HSS answer                                SIP                       clause
-//	REGISTER     success, Server-Name                      forward, R-URI = name     TS 24.229 §5.3.1.2
+//	REGISTER     success, Server-Name (or one in the caps) forward, R-URI = name     TS 24.229 §5.3.1.2, TS 29.228 §6.7
 //	REGISTER     success, capabilities or none             forward, R-URI = chosen   §5.3.1.2
 //	REGISTER     success, no S-CSCF has the mandatory ones 600                       §5.3.1.3
 //	REGISTER     5001, 5002, 5003, 5004, other negatives   403                       §5.3.1.3
 //	REGISTER     could not be completed                    480 + Retry-After         §5.3.1.3
 //	REGISTER     (S-CSCF silent for RegisterTimeout)       504                       §5.3.1.3
-//	REGISTER     (To is not an IMPU, or a bad username)    403, no UAR               §5.3.1.3
-//	terminating  success, Server-Name                      forward, Route = name     §5.3.2.1
+//	REGISTER     (To is not an IMPU, or a bad username)    403, no UAR               local choice: the HSS would answer 5001
+//	terminating  success, Server-Name (or one in the caps) forward, Route = name     §5.3.2.1, TS 29.228 §6.7
 //	terminating  success, capabilities or none             forward, Route = chosen   §5.3.2.1
 //	terminating  success, no S-CSCF has the mandatory ones 480, counted              decided on #274
-//	terminating  (the S-CSCF cannot be reached)            503 + Retry-After         decided on #274
+//	terminating  (the S-CSCF cannot be reached)            500 + Retry-After         decided on #274
 //	terminating  5001, other negatives                     404                       §5.3.2.1, §5.3.2.2
 //	terminating  5003                                      480                       §5.3.2.1
 //	terminating  could not be completed                    480 + Retry-After         §5.3.1.3 by analogy
-//	terminating  (Request-URI is not an IMPU)              404, no LIR               §5.3.2.2
+//	terminating  (Request-URI is not an IMPU)              404, no LIR               local choice: the HSS would answer 5001
 //	any          (CANCEL while the HSS is asked)           487, CANCEL 200           §5.3.2.2
+//	ACK          (no To tag)                               dropped, no LIR           decided on #274
 //
 // An S-CSCF is chosen from Config.SCSCFs: those with every mandatory
 // capability of the answer, the one with the most optional ones first,
 // configuration order among equals (§5.3.1.2 step 1). An answer with
 // neither Server-Name nor Server-Capabilities means any S-CSCF will do
 // (TS 29.228 §6.7), and the first configured one is chosen. Server-Name
-// values inside Server-Capabilities are not used. Retry-After is
-// Config.RetryAfter, also on the 503 the proxy answers a terminating
-// request with when the S-CSCF cannot be reached: the S-CSCF the user needs
-// exists and will be back, unlike one no configured S-CSCF can stand for.
-// The I-CSCF's own overload, the transaction layer's cap, is answered 503
-// with the layer's Retry-After.
+// values inside Server-Capabilities are the operator steering the choice:
+// §6.7 has the capabilities disregarded then, and the first name is used as
+// a Server-Name would be. Retry-After is Config.RetryAfter, also on the 500
+// the proxy ends a terminating request in when it cannot send it to the
+// S-CSCF: the S-CSCF the user needs exists and will be back, unlike one no
+// configured S-CSCF can stand for. It is a 500 and not a 503 because the
+// proxy upstream turns a 503 into a 500 and drops its Retry-After (RFC 3261
+// §16.7 step 6), and passes a 500's on.
 //
 // P-Profile-Key is removed from every request forwarded and every response
 // passed back (§5.3.2.1): this I-CSCF does not set it from a wildcarded
@@ -107,8 +112,9 @@
 //	icscf.scscf.no_capable      answers whose capabilities no configured
 //	                            S-CSCF has (600 or 480): a provisioning
 //	                            problem, to alarm on
-//	icscf.scscf.unreachable     terminating requests answered 503 because
+//	icscf.scscf.unreachable     terminating requests answered 500 because
 //	                            the proxy could not reach the S-CSCF
+//	icscf.routed.dropped_ack    ACKs without a To tag, dropped
 //
 // cxclient counts the Cx answers by result code, and the proxy and the
 // transaction layer the SIP side, the 504 to a REGISTER included.

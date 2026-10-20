@@ -42,6 +42,10 @@ func TestRegisterAnswersFollowTheMappingTable(t *testing.T) {
 		{"unregistered service", uaa(experimental(cx.UnregisteredService), named, nil), nil, forward(named), "icscf.register.forwarded"},
 		{"base success", uaa(base(diameter.ResultSuccess), named, nil), nil, forward(named), "icscf.register.forwarded"},
 		{"a name wins over capabilities", uaa(experimental(cx.FirstRegistration), named, &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, forward(named), "icscf.register.forwarded"},
+		// TS 29.228 §6.7: a name inside the capabilities steers the choice,
+		// and the capabilities, which no S-CSCF has here, are disregarded.
+		{"a name inside the capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{9}, ServerNames: []string{named, scscfURI}}), nil, forward(named), "icscf.register.forwarded"},
+		{"a bad name inside the capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{ServerNames: []string{"scscf"}}), nil, retry, "icscf.hss.bad_server_name"},
 		// §5.3.1.2 step 1: chosen by capability.
 		{"capabilities", uaa(experimental(cx.FirstRegistration), "", &cx.ServerCapabilities{Mandatory: []uint32{1}}), nil, forward("sip:scscf-b.rcs.local;transport=tcp"), "icscf.register.forwarded"},
 		{"no capabilities means any", uaa(experimental(cx.FirstRegistration), "", nil), nil, forward(scscfURI), "icscf.register.forwarded"},
@@ -56,11 +60,14 @@ func TestRegisterAnswersFollowTheMappingTable(t *testing.T) {
 		{"another Cx error", uaa(experimental(cx.ErrorInAssignmentType), "", nil), nil, outcome{status: 403}, "icscf.register.403"},
 		{"authorization rejected", uaa(base(diameter.ResultAuthorizationRejected), "", nil), nil, outcome{status: 403}, "icscf.register.403"},
 		{"authentication rejected", uaa(base(diameter.ResultAuthenticationRejected), "", nil), nil, outcome{status: 403}, "icscf.register.403"},
-		{"unable to comply", uaa(base(diameter.ResultUnableToComply), "", nil), nil, outcome{status: 403}, "icscf.register.403"},
+
 		// §5.3.1.3: a query that could not be completed is 480, with
 		// Retry-After (decision 3 on #15).
 		{"too busy", uaa(base(diameter.ResultTooBusy), "", nil), nil, retry, "icscf.hss.unavailable"},
 		{"out of space", uaa(base(diameter.ResultOutOfSpace), "", nil), nil, retry, "icscf.hss.unavailable"},
+		// TS 29.228 §6.1.1.1: an HSS failure such as a database error
+		// (decided on #274).
+		{"unable to comply", uaa(base(diameter.ResultUnableToComply), "", nil), nil, retry, "icscf.hss.unavailable"},
 		{"no HSS peer", nil, cxclient.ErrNoPeer, retry, "icscf.hss.unavailable"},
 		{"protocol error", nil, &cxclient.ProtocolError{Command: "UAR", Result: base(diameter.ResultUnableToDeliver)}, retry, "icscf.hss.unavailable"},
 		{"time-out", nil, context.DeadlineExceeded, retry, "icscf.hss.unavailable"},
