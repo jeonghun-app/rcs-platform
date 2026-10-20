@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -504,8 +505,14 @@ func TestStalledProxyHeaderIsClosed(t *testing.T) {
 	if _, err := nc.Write([]byte("\r\n\r\n\x00")); err != nil {
 		t.Fatal(err)
 	}
+	// The relay closes the connection either way: with a FIN, read here
+	// as EOF, once it has read the five octets; with a RST when its wait
+	// for the header ran out before it read them, as on a loaded host,
+	// since a socket closed with octets it has not read is reset (RFC 1122
+	// §4.2.2.13; #295). A read that times out here is the relay not
+	// closing.
 	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := nc.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+	if _, err := nc.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("stalled header: read %v, want the relay to close", err)
 	}
 	eventually(t, "the refusal to be counted", func() bool { return r.metrics.count(mRefusedPrefix+reasonProxyHeader) == 1 })
