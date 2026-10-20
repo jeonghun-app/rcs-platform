@@ -309,7 +309,8 @@ func TestAnUnsubscribeTheNotifierNoLongerKnowsEndsTheSubscription(t *testing.T) 
 	n.mu.Lock()
 	n.refuse = 481
 	n.mu.Unlock()
-	if res, err := sub.Unsubscribe(context.Background()); err != nil || res.StatusCode != 481 {
+	var se *StatusError
+	if res, err := sub.Unsubscribe(context.Background()); res == nil || res.StatusCode != 481 || !errors.As(err, &se) || se.Code != 481 {
 		t.Fatalf("Unsubscribe = %v, %v", res, err)
 	}
 	select {
@@ -349,6 +350,97 @@ func TestNotifyHeadersAreReadByTheirGrammar(t *testing.T) {
 	}
 }
 
+func TestANotifyFromAnotherDialogIsRefused(t *testing.T) {
+	// QA on #205 (RFC 3680 §4.9, RFC 6665 §4.1.3): a reg event
+	// subscription does not fork; a NOTIFY whose From tag is not the
+	// dialog's gets 481 and changes nothing.
+	_, n, ua, sub := subscribed(t)
+	contact := ua.contact.URI.String()
+	n.notify(t, "active", reginfo(0, "full", "active", "registered", contact))
+	nextNotification(t, sub)
+	n.mu.Lock()
+	n.tag = "another-notifier"
+	n.mu.Unlock()
+	if res := n.notify(t, "terminated;reason=rejected", reginfo(1, "full", "terminated", "rejected", contact)); res.StatusCode != 481 {
+		t.Errorf("NOTIFY from another dialog answered %d, want 481", res.StatusCode)
+	}
+	select {
+	case <-sub.Done():
+		t.Error("a NOTIFY from another dialog ended the subscription")
+	case got := <-sub.Notifications():
+		t.Errorf("a NOTIFY from another dialog was delivered: %+v", got)
+	default:
+	}
+}
+
+func TestANotifyBeforeThe2xxSetsUpTheDialog(t *testing.T) {
+	// QA on #205: the NOTIFY comes first, with its own Contact and
+	// Record-Route; the 2xx after it, with others, changes nothing.
+	s := newStandIn(t, transport.TCP)
+	n := newNotifier(t, s)
+	ua := dial(t, s.config())
+	register(t, ua)
+	s.onSubscribe = func(tx *transaction.ServerTransaction) {
+		req := tx.Request()
+		n.mu.Lock()
+		if n.sub == nil {
+			n.sub, n.flow = req.Clone(), tx.Source().Flow
+		}
+		n.mu.Unlock()
+		if req.Header.Get("Expires") == "0" {
+			_ = tx.Respond(mustResponse(t, req, 200, n.tag))
+			return
+		}
+		go func() {
+			nt := n.request(t, "active;expires=600000", reginfo(0, "full", "active", "registered", ua.contact.URI.String()), "")
+			nt.Header.Set("Contact", "<sip:notify-contact.example.com:5070;transport=tcp>")
+			nt.Header.Add("Record-Route", "<sip:pcscf.example.com;lr>, <sip:mid.example.com;lr>")
+			done := make(chan struct{})
+			if _, err := n.s.layer.Request(nt, transport.Destination{Flow: n.flow}, func(res *sip.Response, err error) {
+				if err != nil || res.StatusCode >= 200 {
+					close(done)
+				}
+			}); err != nil {
+				t.Errorf("notifier: %v", err)
+				return
+			}
+			<-done
+			res := mustResponse(t, req, 200, n.tag)
+			res.Header.Add("Contact", notifierContact)
+			res.Header.Add("Record-Route", "<sip:x1.example.com;lr>, <sip:x2.example.com;lr>")
+			_ = tx.Respond(res)
+		}()
+	}
+	sub, res, err := ua.SubscribeRegEvent(context.Background())
+	if err != nil || res.StatusCode != 200 {
+		t.Fatal(res, err)
+	}
+	nextNotification(t, sub)
+	s.nextMethod(t, "SUBSCRIBE")
+	if _, err := sub.Unsubscribe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	un := s.nextMethod(t, "SUBSCRIBE").req
+	to, _ := un.Header.To()
+	if to.Tag() != n.tag || un.URI.String() != "sip:notify-contact.example.com:5070;transport=tcp" || routeHosts(t, un) != "pcscf.example.com mid.example.com" {
+		t.Errorf("route set not from the NOTIFY: URI %s Route %s", un.URI, routeHosts(t, un))
+	}
+}
+
+func TestACSeqOfZeroIsANotifysCSeqLikeAnyOther(t *testing.T) {
+	// QA on #205: 0 is a valid CSeq (RFC 3261 §8.1.1.5), so a second
+	// NOTIFY with 0 is not above the first.
+	s, n, _, sub := subscribed(t)
+	for i, want := range []int{200, 500} {
+		req := n.request(t, "active", "", "")
+		req.Header.Set("CSeq", "0 NOTIFY")
+		if res := s.sendRequest(t, req, n.flow); res.StatusCode != want {
+			t.Fatalf("NOTIFY %d with CSeq 0 answered %d, want %d", i+1, res.StatusCode, want)
+		}
+	}
+	nextNotification(t, sub)
+}
+
 func TestNotifiesOutsideTheRulesAreRefusedOrFlagged(t *testing.T) {
 	s, n, _, sub := subscribed(t)
 	if res := s.sendRequest(t, n.request(t, "active", "", "presence"), n.flow); res.StatusCode != 489 {
@@ -361,6 +453,16 @@ func TestNotifiesOutsideTheRulesAreRefusedOrFlagged(t *testing.T) {
 	stale.Header.Set("CSeq", "1 NOTIFY")
 	if res := s.sendRequest(t, stale, n.flow); res.StatusCode != 500 {
 		t.Errorf("NOTIFY with a lower CSeq answered %d, want 500", res.StatusCode)
+	}
+	// The same CSeq in a new transaction is not above the last either (QA
+	// on #205).
+	n.mu.Lock()
+	last := n.cseq - 1
+	n.mu.Unlock()
+	same := n.request(t, "active", "", "")
+	same.Header.Set("CSeq", strconv.Itoa(int(last))+" NOTIFY")
+	if res := s.sendRequest(t, same, n.flow); res.StatusCode != 500 {
+		t.Errorf("NOTIFY with the same CSeq answered %d, want 500", res.StatusCode)
 	}
 	if res := n.notify(t, "active", "<not-reginfo/>"); res.StatusCode != 200 {
 		t.Errorf("NOTIFY with a bad body answered %d", res.StatusCode)
@@ -431,6 +533,9 @@ func TestParseRegInfoReadsRFC3680sExample(t *testing.T) {
 		root + `<trailing garbage`,
 		root + root,
 		root + `text`,
+		// The version is required (RFC 3680 §5.4; QA on #205).
+		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" state="full"/>`,
+		`<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="-1" state="full"/>`,
 	} {
 		if _, err := ParseRegInfo([]byte(bad)); err == nil {
 			t.Errorf("ParseRegInfo(%q) accepted it", bad)

@@ -74,7 +74,7 @@ func (r *RegInfo) Contact(aor, uri string) (RegInfoContact, bool) {
 // xmlRegInfo is RegInfo as RFC 3680 §5.4 writes it.
 type xmlRegInfo struct {
 	XMLName       xml.Name `xml:"urn:ietf:params:xml:ns:reginfo reginfo"`
-	Version       uint64   `xml:"version,attr"`
+	Version       string   `xml:"version,attr"`
 	State         string   `xml:"state,attr"`
 	Registrations []struct {
 		AOR      string `xml:"aor,attr"`
@@ -108,7 +108,13 @@ func ParseRegInfo(body []byte) (*RegInfo, error) {
 	if x.State != "full" && x.State != "partial" {
 		return nil, errors.New("sipua: the reginfo state is neither full nor partial")
 	}
-	r := &RegInfo{Version: x.Version, State: x.State}
+	// The version is required (RFC 3680 §5.4): without it a notifier's
+	// first NOTIFY would pass for version 0.
+	version, err := strconv.ParseUint(x.Version, 10, 64)
+	if err != nil {
+		return nil, errors.New("sipua: the reginfo has no valid version")
+	}
+	r := &RegInfo{Version: version, State: x.State}
 	for _, xr := range x.Registrations {
 		reg := RegInfoRegistration{AOR: xr.AOR, ID: xr.ID, State: xr.State}
 		for _, xc := range xr.Contacts {
@@ -156,8 +162,12 @@ type Subscription struct {
 	notified     bool
 	cseq         uint32
 	remoteCSeq   uint32
-	ended        bool
-	done         chan struct{}
+	// remoteTag is the notifier's tag once the 2xx or a NOTIFY has given
+	// it; seenCSeq says remoteCSeq holds a NOTIFY's, which may be 0.
+	remoteTag string
+	seenCSeq  bool
+	ended     bool
+	done      chan struct{}
 }
 
 // Notifications delivers each NOTIFY, in order.
@@ -221,6 +231,9 @@ func (ua *UA) SubscribeRegEvent(ctx context.Context) (*Subscription, *sip.Respon
 	s.mu.Lock()
 	if !s.notified {
 		s.remote, s.routes, s.remoteTarget = res.Header.Get("To"), routes, contactOr(res, ua.cfg.IMPU)
+		if to, err := res.Header.To(); err == nil {
+			s.remoteTag = to.Tag()
+		}
 	}
 	s.mu.Unlock()
 	return s, res, nil
@@ -243,7 +256,7 @@ func (s *Subscription) fromNotify(req *sip.Request) {
 	defer s.mu.Unlock()
 	if !s.notified {
 		s.notified = true
-		s.remote, s.routes = req.Header.Get("From"), nil
+		s.remote, s.routes, s.remoteTag = req.Header.Get("From"), nil, fromTag(req)
 		if rr, err := req.Header.RecordRoute(); err == nil {
 			for _, a := range rr {
 				s.routes = append(s.routes, a.String())
@@ -252,6 +265,15 @@ func (s *Subscription) fromNotify(req *sip.Request) {
 		s.remoteTarget = s.ua.cfg.IMPU
 	}
 	s.remoteTarget = contactOr(req, s.remoteTarget)
+}
+
+// fromTag is the tag of req's From, or "".
+func fromTag(req *sip.Request) string {
+	from, err := req.Header.From()
+	if err != nil {
+		return ""
+	}
+	return from.Tag()
 }
 
 // end ends the subscription once.
@@ -267,9 +289,10 @@ func (s *Subscription) end() {
 
 // Unsubscribe ends the subscription with a SUBSCRIBE of Expires: 0 in its
 // dialog (RFC 6665 §4.1.2.3), and returns its final response. The NOTIFY
-// that follows, terminated, closes Done. An answer that says the
-// subscription no longer exists, 481 among them (§4.1.2.2), ends it at
-// once. Before any NOTIFY it goes in the dialog the 2xx described.
+// that follows, terminated, closes Done. A non-2xx returns a *StatusError
+// with it, as SubscribeRegEvent does; one that says the subscription no
+// longer exists, 481 among them (§4.1.2.2), ends it at once. Before any
+// NOTIFY it goes in the dialog the 2xx described.
 func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
 	s.mu.Lock()
 	if s.ended {
@@ -291,10 +314,16 @@ func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
 		return nil, err
 	}
 	res, err := s.ua.Send(ctx, req)
-	if err == nil && subscriptionGone(res.StatusCode) {
+	if err != nil {
+		return nil, err
+	}
+	if subscriptionGone(res.StatusCode) {
 		s.end()
 	}
-	return res, err
+	if res.StatusCode >= 300 {
+		return res, &StatusError{Method: "SUBSCRIBE", Code: res.StatusCode}
+	}
+	return res, nil
 }
 
 // subscriptionGone reports whether code, the answer to a SUBSCRIBE in the
@@ -331,8 +360,8 @@ func (ua *UA) forgetSubscription(s *Subscription) {
 
 // receive answers a NOTIFY (RFC 6665 §4.1.3): 200, or 400 without a
 // Subscription-State it can read, 489 for another event package, 481 for
-// an event id the SUBSCRIBE did not have (§8.2.1), 500 for a CSeq lower
-// than the last. Each one it accepts updates the dialog (fromNotify).
+// an event id the SUBSCRIBE did not have (§8.2.1) or a From tag that is
+// not the dialog's, 500 for a CSeq not above the last. Each one it accepts updates the dialog (fromNotify).
 func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	req := tx.Request()
 	code := 200
@@ -348,10 +377,15 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	case ev.ID() != "":
 		// The SUBSCRIBE had no id, and an event is matched by id too.
 		code = 481
-	case s.remoteCSeq != 0 && cseq.Seq <= s.remoteCSeq:
+	case s.remoteTag != "" && fromTag(req) != s.remoteTag:
+		// Another dialog: reg event subscriptions do not fork (RFC 3680
+		// §4.9), and a NOTIFY that matches no subscription is 481
+		// (RFC 6665 §4.1.3).
+		code = 481
+	case s.seenCSeq && cseq.Seq <= s.remoteCSeq:
 		code = 500
 	default:
-		s.remoteCSeq = cseq.Seq
+		s.remoteCSeq, s.seenCSeq = cseq.Seq, true
 	}
 	s.mu.Unlock()
 	if code == 200 {
