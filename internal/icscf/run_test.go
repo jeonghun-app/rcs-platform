@@ -34,14 +34,17 @@ type diameterHSS struct {
 	got    []uint32
 }
 
-func startHSS(t *testing.T) *diameterHSS {
+func startHSS(t *testing.T) *diameterHSS { return startHSSAs(t, "hss-0a1b2c.rcs.local") }
+
+// startHSSAs starts an HSS task whose Origin-Host is host.
+func startHSSAs(t *testing.T, host string) *diameterHSS {
 	t.Helper()
 	dict, err := diameter.NewDictionary(cx.AVPs...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	n, err := diameter.NewNode(diameter.Config{
-		OriginHost: "hss-0a1b2c.rcs.local", OriginRealm: home,
+		OriginHost: host, OriginRealm: home,
 		HostIPAddresses:    []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 		Applications:       []diameter.Application{cx.Application},
 		SupportedVendorIDs: []uint32{cx.Vendor3GPP, cx.VendorETSI},
@@ -374,5 +377,29 @@ func TestTheOriginHostIsDrawnAtStartOrConfigured(t *testing.T) {
 	}
 	if _, _, err := newCxClient(context.Background(), rt, ServiceConfig{Namespace: "rcs.local", HSSRealm: home}, deps{rand: failingReader{}}); err == nil {
 		t.Error("no error without randomness for the Origin-Host")
+	}
+}
+
+// Threat model T1: a Diameter peer on the HSS's address whose Origin-Host is
+// not hss-*.<namespace> gets no request, so icscf does not become ready and
+// answers as without an HSS.
+func TestAPeerThatIsNotAnHSSTaskIsNotAsked(t *testing.T) {
+	impostor := startHSSAs(t, "impostor.rcs.local")
+	impostor.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "sip:192.0.2.66" }
+	r := startICSCF(t, impostor, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && len(impostor.node.Peers()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	if res.StatusCode != 480 {
+		t.Fatalf("answered %d, want 480", res.StatusCode)
+	}
+	if got := impostor.commands(); len(got) != 0 {
+		t.Errorf("the impostor got %v", got)
+	}
+	r.h.Advance(2 * time.Second)
+	if code, _ := r.h.Get("/readyz"); code != 503 {
+		t.Errorf("/readyz = %d with only an impostor, want 503", code)
 	}
 }
