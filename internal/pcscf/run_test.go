@@ -520,7 +520,9 @@ func TestAQuietClientConnectionIsClosed(t *testing.T) {
 	cfg.ClientIdleTimeout = time.Second
 	s := start(t, cfg, deps{})
 	c := dial(t, s.client, nil)
-	c.request()
+	// The request makes the connection a flow. On a loaded host the second
+	// may pass before it is answered, and the close is what is checked.
+	_, _ = c.try()
 	if !c.closed() {
 		t.Fatal("a quiet client connection was kept open")
 	}
