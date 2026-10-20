@@ -1,0 +1,39 @@
+# What each service's code calls on AWS, and on what: check_infra.py fails
+# when a task role lacks one of these, because a missing action shows up only
+# when a real task starts (a hss task without Scan exits at start, #70).
+#
+# Keep it in step with the service's documentation and its store code: the
+# IAM lists in docs/hss.md (Tables), docs/ft-server.md (IAM),
+# docs/msrp-relay.md (The bindings table) and docs/rcs-as.md (DynamoDB
+# messages table), and acs's own infra/app.yaml at the pinned release.
+#
+# Keys are resources: a logical id (its ARN), or the logical id followed by a
+# path such as /* (objects of a bucket) or /index/<name>, or "*" for actions
+# that name no resource. A transaction needs the action of each write inside
+# it; there is no TransactWriteItems permission to grant.
+#
+# The match is exact both ways: a task role may grant nothing that is not
+# listed here (check_infra.py, check_required_actions).
+
+HssTaskRole:
+  SubscribersTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem, dynamodb:DescribeTable]
+  # Query by profile; Scan with Limit 1 at every start with a KMS key, to
+  # tell an empty table from a lost keyring (HasSubscriptions).
+  SubscribersTable/index/profile-index: [dynamodb:Query, dynamodb:Scan]
+  ServiceProfilesTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem, dynamodb:DescribeTable]
+
+FtServerTaskRole:
+  # PutObject also covers CreateMultipartUpload, UploadPart and
+  # CompleteMultipartUpload; ListBucket is what HeadBucket in /readyz needs.
+  FilesBucket/*: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
+  FilesBucket: [s3:ListBucket]
+  FilesTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan, dynamodb:DescribeTable]
+
+MsrpRelayTaskRole:
+  MsrpBindingsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:DescribeTable]
+
+AcsTaskRole:
+  AcsTable: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:DescribeTable]
+  AcsTable/index/gsi1: [dynamodb:Query]
+  # The SMS provider's send action (one of the two, by AcsSmsProvider).
+  "*": [sms-voice:SendTextMessage, sns:Publish]
