@@ -15,8 +15,15 @@ type ServerTransaction struct {
 	req    *sip.Request
 	src    transport.Source
 	// last is the most recent response sent, which a retransmitted request is
-	// answered with.
-	last *sip.Response
+	// answered with. It is nil after a 2xx to an INVITE, which is not
+	// retransmitted from here (RFC 6026 §7.1), and after a response that did
+	// not fit under the byte bound. toTag is the To tag of the last response
+	// sent, kept separately so that neither needs to be.
+	last  *sip.Response
+	toTag string
+	// size is what the request and last count against
+	// MaxServerTransactionBytes, under the layer's mu.
+	size int64
 }
 
 // sameFlow reports whether a retransmission arrived the way the request did, so
@@ -93,14 +100,7 @@ func (tx *ServerTransaction) State() State {
 func (tx *ServerTransaction) responseToTag() string {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	if tx.last == nil {
-		return ""
-	}
-	to, err := tx.last.Header.To()
-	if err != nil {
-		return ""
-	}
-	return to.Tag()
+	return tx.toTag
 }
 
 // send passes a response to the transport and remembers it for retransmission.
@@ -109,7 +109,28 @@ func (tx *ServerTransaction) send(res *sip.Response, opts ...transport.SendOptio
 	if err := tx.l.sender.SendResponse(res, tx.src, opts...); err != nil {
 		return err
 	}
+	tx.toTag = ""
+	if to, err := res.Header.To(); err == nil {
+		tx.toTag = to.Tag()
+	}
+	var before, after int64
+	if tx.last != nil {
+		before = responseSize(tx.last)
+	}
 	tx.last = res
+	if tx.invite && res.StatusCode >= 200 && res.StatusCode < 300 {
+		// Accepted keeps only the To tag: a large 2xx body held for Timer L
+		// would be memory the byte bound does not see.
+		tx.last = nil
+	} else {
+		after = responseSize(res)
+	}
+	if !tx.l.keep(tx, before, after) {
+		// Sent once, not kept: a response cannot be refused, and keeping
+		// every one an admitted transaction gets would let the responses
+		// alone pass the bound.
+		tx.last = nil
+	}
 	return nil
 }
 
@@ -215,8 +236,8 @@ func (tx *ServerTransaction) onTimer(id timerID) func() {
 			}
 		}
 	case timerRetransmit:
-		// Timer G (§17.2.1).
-		if tx.state != Completed {
+		// Timer G (§17.2.1), unless the response was not kept.
+		if tx.state != Completed || tx.last == nil {
 			return nil
 		}
 		if err := tx.l.sender.SendResponse(tx.last, tx.src); err != nil {

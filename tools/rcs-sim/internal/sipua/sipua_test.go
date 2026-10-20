@@ -510,6 +510,11 @@ func TestSameInstanceFollowsTheURNRules(t *testing.T) {
 		{"<urn:example:x>", "<urn:examplf:x>", false},
 		{"<tag:Example>", "<tag:example>", false},
 		{"<urn:uuid:1>", "urn:uuid:1", false},
+		// QA on #262: one row for each of the scheme check, the leading
+		// "<" and the last place the percent loop looks at.
+		{"<tag:x:Y>", "<foo:x:Y>", false},
+		{"urn:uuid:1>", "<urn:uuid:1>", false},
+		{"<urn:example:ab%2f>", "<urn:example:ab%2F>", true},
 	} {
 		if got := SameInstance(c.a, c.b); got != c.same {
 			t.Errorf("SameInstance(%q, %q) = %v, want %v", c.a, c.b, got, c.same)

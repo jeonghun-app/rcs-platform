@@ -131,6 +131,10 @@ type Source struct {
 	// Listener is the name of the listener the message arrived on, empty when
 	// it arrived on a connection this transport opened.
 	Listener string
+	// ClientFacing reports that the listener is one clients reach
+	// (ListenerConfig.ClientFacing), so a layer above can keep room for core
+	// traffic when clients press on a shared limit.
+	ClientFacing bool
 }
 
 // Dialer opens outbound connections; *net.Dialer implements it.

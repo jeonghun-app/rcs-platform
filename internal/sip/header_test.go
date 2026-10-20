@@ -306,3 +306,27 @@ func TestFirstElementEditsRefuseWhatTheyCannotDo(t *testing.T) {
 		t.Errorf("a refused edit changed the field: %q", got)
 	}
 }
+
+// WireSize counts a parsed field as it arrived, padding and folds included,
+// and a field added in code as Bytes writes it.
+func TestWireSizeIsTheHeaderBlockAsReceived(t *testing.T) {
+	head := "Via: SIP/2.0/TCP 192.0.2.1;branch=z9hG4bK1\r\n" +
+		"Subject:      padded" + strings.Repeat(" ", 200) + "\r\n" +
+		"Subject: folded\r\n  over\r\n\tthree lines\r\n" +
+		"To: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=1\r\n" +
+		"Call-ID: c1\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n"
+	m, err := ParseMessage([]byte("OPTIONS sip:bob@example.com SIP/2.0\r\n" + head + "\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &m.(*Request).Header
+	if got := h.WireSize(); got != len(head) {
+		t.Fatalf("WireSize = %d, want the %d bytes received", got, len(head))
+	}
+	if err := h.Add("Max-Forwards", "70"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.WireSize(); got != len(head)+len("Max-Forwards: 70\r\n") {
+		t.Fatalf("WireSize after Add = %d", got)
+	}
+}
