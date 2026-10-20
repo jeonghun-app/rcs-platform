@@ -39,6 +39,12 @@ const TerminatedGrace = time.Minute
 // answer differently, and an error would retry the SAR every lease. The
 // errors of handle are returned together with the number handled.
 //
+// The order is what makes that retry complete: handle deletes the set's
+// identities (DeleteIdentity) and its profile, and only then is the record
+// deleted. Cut short between the two, the record still holds its lease, so
+// the next sweep after it calls handle again, which finds what is left; an
+// identity it never reaches still goes at its KeepUntil.
+//
 // A live registration whose Reassert is due is claimed the same way, Reassert
 // moved one lease ahead, and handed to handle, whose before.ReassertDue tells
 // it to tell the HSS again.

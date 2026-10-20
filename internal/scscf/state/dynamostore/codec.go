@@ -45,12 +45,12 @@ func encodeIdentity(i *state.Identity) ([]byte, error) {
 	return json.Marshal(identityDoc{IMPI: i.Set.IMPI, DefaultIMPU: i.Set.IMPU, Incarnation: i.Incarnation, Barred: i.Barred})
 }
 
-func decodeIdentity(b []byte, impu string, version int64) (*state.Identity, error) {
+func decodeIdentity(b []byte, impu string, version int64, keepUntil time.Time) (*state.Identity, error) {
 	var doc identityDoc
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%w: identity document does not decode", state.ErrInvalid)
 	}
-	i := &state.Identity{IMPU: impu, Set: state.SetKey{IMPI: doc.IMPI, IMPU: doc.DefaultIMPU}, Incarnation: doc.Incarnation, Barred: doc.Barred, Version: version}
+	i := &state.Identity{IMPU: impu, Set: state.SetKey{IMPI: doc.IMPI, IMPU: doc.DefaultIMPU}, Incarnation: doc.Incarnation, Barred: doc.Barred, KeepUntil: keepUntil, Version: version}
 	if err := i.Validate(); err != nil {
 		return nil, err
 	}

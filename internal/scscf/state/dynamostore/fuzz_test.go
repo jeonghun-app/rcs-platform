@@ -24,7 +24,7 @@ func FuzzDecodeDocuments(f *testing.F) {
 	unreg, _ := encodeRegistration(statetest.Unregistered(statetest.IMPI1, statetest.IMPU1, statetest.T0))
 	ch, _ := encodeChallenge(statetest.Challenge(statetest.IMPI1, "n", time.Minute))
 	sub, _ := encodeSubscription(statetest.Subscription("s1", statetest.IMPU1, time.Hour))
-	id, _ := encodeIdentity(&state.Identity{IMPU: statetest.TEL1, Set: statetest.Set1, Incarnation: 9, Barred: true})
+	id, _ := encodeIdentity(&state.Identity{IMPU: statetest.TEL1, Set: statetest.Set1, Incarnation: 9, Barred: true, KeepUntil: statetest.T0})
 	for _, seed := range [][]byte{reg, unreg, ch, sub, id, []byte("{}"), []byte(`{"contacts":[{}]}`), []byte("null"),
 		[]byte(`{"impi":"a@example.com","default_impu":"sip:a@example.com","incarnation":1,"identities":[{"impu":"sip:a@example.com"}],"contacts":[{"uri":"sip:x","expires":"2031-01-01T00:00:00+09:00","path":[],"feature_tags":[]}]}`)} {
 		f.Add(seed)
@@ -49,12 +49,12 @@ func FuzzDecodeDocuments(f *testing.F) {
 		} else if !errors.Is(err, state.ErrInvalid) {
 			t.Fatalf("challenge refused with %v", err)
 		}
-		if i, err := decodeIdentity(b, statetest.TEL1, 1); err == nil {
+		if i, err := decodeIdentity(b, statetest.TEL1, 1, statetest.T0); err == nil {
 			again, err := encodeIdentity(i)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if back, err := decodeIdentity(again, statetest.TEL1, 1); err != nil || *back != *i {
+			if back, err := decodeIdentity(again, statetest.TEL1, 1, statetest.T0); err != nil || *back != *i {
 				t.Fatalf("identity does not round-trip: %v", err)
 			}
 		} else if !errors.Is(err, state.ErrInvalid) {
