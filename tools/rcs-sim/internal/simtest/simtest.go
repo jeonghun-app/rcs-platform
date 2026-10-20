@@ -256,6 +256,11 @@ func startRelay(t testing.TB, public, control int, corePorts []int, front *tlsFr
 		"RELAY_PCSCF_TOKEN":        RelayToken,
 		"RELAY_KEEPALIVE_INTERVAL": "10s",
 		"RELAY_IDLE_TIMEOUT":       "60s",
+		// chat-core-originated sends the PATCH 300 ms after the client
+		// connects, and checks that the relay waits for it, not for how
+		// long. On a loaded host those 300 ms have taken over 2 s, the
+		// default wait (#204).
+		"RELAY_PATH_WAIT": "10s",
 	}
 	lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
 	shared := runtime.NewEnv("RCS_", lookup)

@@ -721,8 +721,11 @@ func withoutCaptures(re *syntax.Regexp) *syntax.Regexp {
 
 // withoutFolding returns a copy of re in which every case-folded literal is a
 // sequence of plain literals and classes of all case variants
-// (unicode.SimpleFold), and no class carries the FoldCase flag: classes list
-// their runes, so the flag adds nothing to what they match.
+// (unicode.SimpleFold), adjacent ones in one range, and no class carries the FoldCase flag: classes list
+// their runes, so the flag adds nothing to what they match. A class of one
+// rune is that rune's plain literal, as Go's parser reads it back: a
+// case-insensitive "0|[0]" parses to the class [0], a rune without case
+// variants, and its text "[0]" to the literal 0 (#206).
 func withoutFolding(re *syntax.Regexp) *syntax.Regexp {
 	c := *re
 	c.Sub = make([]*syntax.Regexp, len(re.Sub))
@@ -732,6 +735,10 @@ func withoutFolding(re *syntax.Regexp) *syntax.Regexp {
 	switch re.Op {
 	case syntax.OpCharClass:
 		c.Flags &^= syntax.FoldCase
+		if len(re.Rune) == 2 && re.Rune[0] == re.Rune[1] {
+			c.Op, c.Rune = syntax.OpLiteral, []rune{re.Rune[0]}
+			return &c
+		}
 		c.Rune = slices.Clone(re.Rune)
 	case syntax.OpLiteral:
 		if re.Flags&syntax.FoldCase == 0 {
@@ -748,9 +755,15 @@ func withoutFolding(re *syntax.Regexp) *syntax.Regexp {
 				parts[i] = &syntax.Regexp{Op: syntax.OpLiteral, Flags: re.Flags &^ syntax.FoldCase, Rune: variants}
 				continue
 			}
+			// Adjacent variants make one range, as the parser merges
+			// them: Ā and ā (U+0100, U+0101) are [Ā-ā], not [ĀĀāā].
 			slices.Sort(variants)
 			ranges := make([]rune, 0, 2*len(variants))
 			for _, v := range variants {
+				if n := len(ranges); n > 0 && ranges[n-1]+1 == v {
+					ranges[n-1] = v
+					continue
+				}
 				ranges = append(ranges, v, v)
 			}
 			parts[i] = &syntax.Regexp{Op: syntax.OpCharClass, Rune: ranges}
