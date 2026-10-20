@@ -86,6 +86,9 @@ func (m *Memory) SaveRegistration(_ context.Context, r *Registration) (*Registra
 	if err != nil {
 		return nil, err
 	}
+	if ok && revivesIncarnation(cur, r) {
+		return nil, fmt.Errorf("%w: a record brought back from a deregistration needs a new incarnation", ErrInvalid)
+	}
 	saved := r.Clone()
 	saved.Version = version
 	m.registrations[r.Key] = saved
@@ -114,18 +117,23 @@ func (m *Memory) KeepIdentity(_ context.Context, impu string, until, now time.Ti
 	}
 	if until = until.Truncate(time.Second); until.After(i.KeepUntil) {
 		i.KeepUntil = until
+		i.Version++
 	}
 	return nil
 }
 
 // SaveIdentity implements Registrations.
-func (m *Memory) SaveIdentity(_ context.Context, i *Identity) (*Identity, error) {
+func (m *Memory) SaveIdentity(_ context.Context, i *Identity, now time.Time) (*Identity, error) {
 	if err := i.Validate(); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.identities[i.IMPU]
+	if ok && i.Version == 0 && !cur.KeepUntil.After(now) {
+		// Gone to Identity: a create takes its place.
+		ok = false
+	}
 	var stored int64
 	if ok {
 		stored = cur.Version
@@ -431,4 +439,11 @@ func (m *Memory) ExpiringSubscriptions(_ context.Context, now time.Time, limit i
 	}
 	slices.SortFunc(out, func(a, b *Subscription) int { return a.Expires.Compare(b.Expires) })
 	return out[:min(len(out), max(limit, 0))], nil
+}
+
+// revivesIncarnation reports whether saving next over stored brings back a
+// record claimed for a deregistration under the incarnation it was claimed
+// with (Registration.Incarnation).
+func revivesIncarnation(stored, next *Registration) bool {
+	return !stored.Deregistering.IsZero() && next.Deregistering.IsZero() && next.Incarnation == stored.Incarnation
 }

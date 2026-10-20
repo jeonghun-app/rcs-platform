@@ -55,9 +55,13 @@ const (
 	attrNToken  = "ntoken"
 	// attrReceived orders profiles: when the SAA or PPR arrived, Unix ns.
 	attrReceived = "received"
-	// attrTTL is the registrations table's TTL attribute, on profiles only:
-	// a registration must be swept, which sends the SAR, not just vanish.
+	// attrTTL is the registrations table's TTL attribute, on profiles and
+	// identities only: a set record must be swept, which sends the SAR, not
+	// just vanish.
 	attrTTL = "ttl"
+	// attrLeased holds a set record's incarnation while it is claimed for a
+	// deregistration (putRevival).
+	attrLeased = "leased"
 
 	IMPIIndex   = "impi-index"
 	IMPUIndex   = "impu-index"
@@ -281,11 +285,22 @@ func checkSize(item map[string]types.AttributeValue, what string) error {
 // putVersioned writes item, created when version is 0 and otherwise
 // conditional on that version (state.Registrations.SaveRegistration).
 func (d *Dynamo) putVersioned(ctx context.Context, table, pk string, version int64, item map[string]types.AttributeValue, op string) error {
+	return d.putVersionedOver(ctx, table, pk, version, item, op, nil)
+}
+
+// putVersionedOver is putVersioned whose create, with expired set, also
+// replaces an item whose ttl is at or before *expired (Unix seconds).
+func (d *Dynamo) putVersionedOver(ctx context.Context, table, pk string, version int64, item map[string]types.AttributeValue, op string, expired *int64) error {
 	in := &dynamodb.PutItemInput{TableName: aws.String(table), Item: item}
-	if version == 0 {
+	switch {
+	case version == 0 && expired != nil:
+		in.ConditionExpression = aws.String("attribute_not_exists(#pk) OR #ttl <= :now")
+		in.ExpressionAttributeNames = map[string]string{"#pk": attrPK, "#ttl": attrTTL}
+		in.ExpressionAttributeValues = map[string]types.AttributeValue{":now": num(*expired)}
+	case version == 0:
 		in.ConditionExpression = aws.String("attribute_not_exists(#pk)")
 		in.ExpressionAttributeNames = map[string]string{"#pk": attrPK}
-	} else {
+	default:
 		in.ConditionExpression = aws.String("#v = :v")
 		in.ExpressionAttributeNames = map[string]string{"#v": attrVersion}
 		in.ExpressionAttributeValues = map[string]types.AttributeValue{":v": num(version)}
