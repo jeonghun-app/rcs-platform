@@ -15,6 +15,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -119,6 +120,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		return fmt.Errorf("pcscf: dialog key: %w", err)
 	}
 	pc.clientFlow = func(id transport.FlowID) bool { return isClientFlow(tr, id) }
+	subCtx, stopSubs := context.WithCancel(context.Background())
+	pc.subs = newSubscriptions(subCtx)
+	// After the proxy closes, so that every SUBSCRIBE under way has ended.
+	defer pc.subs.close()
+	defer stopSubs()
 	// A closed flow's registrations are gone (RFC 5626 §5.3).
 	fl.onClosed = pc.registry.removeFlow
 	router := d.router
@@ -136,6 +142,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		return err
 	}
 	defer px.Close()
+	// A SUBSCRIBE goes through the proxy's transaction layer, which gets
+	// its responses.
+	pc.send = func(req *sip.Request, dst transport.Destination, h transaction.ResponseHandler) error {
+		_, err := px.Layer().Request(req, dst, h)
+		return err
+	}
 	p.Store(px)
 
 	clientAddr, err := tr.Listen(clientListenerConfig(cfg))
@@ -163,7 +175,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if d.sweep == 0 {
 		d.sweep = sweepInterval
 	}
-	stopSweep := every(d.sweep, pc.registry.sweep)
+	stopSweep := every(d.sweep, func() {
+		pc.registry.sweep()
+		pc.reconcileSubscriptions()
+	})
 	defer stopSweep()
 
 	<-ctx.Done()

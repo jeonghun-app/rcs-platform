@@ -155,6 +155,74 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 - A Cloud Map answer holds at most eight records, chosen at random when more
   instances are registered. That is enough for CSCF fleets of that size.
 
+## Reg event
+
+`pcscf` subscribes to the reg event of the users it serves (TS 24.229
+§5.2.3, RFC 3680), so that it learns when the network ends a registration
+(§5.2.5.2). The #16 plan E decisions shape it:
+
+- **One per user.** A task keeps one subscription for each default public
+  identity (the first `P-Associated-URI`, or the registered identity
+  without one) that a flow of the task has registered. The first 200 to a
+  REGISTER of that user sets it up; the others leave it alone.
+- **The SUBSCRIBE.** It goes along the registration's `Service-Route` to the
+  user's `scscf` (§5.2.3 1B)):
+  - Request-URI and `To` the default public identity, `From`
+    `sip:<PCSCF_PUBLIC_HOST>`;
+  - `Event: reg`, `Accept: application/reginfo+xml`, and `Expires` twice the
+    registration's time left, at least 1200 s;
+  - `P-Asserted-Identity` the `Path` URI `pcscf` wrote for that
+    registration, which `scscf` checks against the `Path` it keeps
+    (§5.2.3 1) f)), and a `P-Charging-Vector` with a new icid;
+  - `Contact: <sip:reg.<random id>@<task address>:<core port>;transport=tcp>`.
+    A flow token never has a dot, so the two never meet.
+
+  A registration without a `Service-Route` has no way to `scscf` and is not
+  subscribed for.
+- **Refresh and end.** Every sweep (30 s) refreshes a subscription 600 s
+  before it expires, or half way when granted for less than 1200 s, in its
+  dialog, with the `Path` of the user's registration that expires last. A
+  subscription whose user has no registration left on the task is ended
+  with `Expires: 0`, and forgotten at once.
+- **NOTIFY.** A request from the core whose Request-URI is a subscription's
+  `Contact` is answered by `pcscf` itself; a client never reaches it, and
+  any other request from the core goes to the client flow its Route names.
+  The first NOTIFY sets up the dialog (RFC 6665 §4.4.1) only with the
+  SUBSCRIBE's Call-ID, compared exactly, and its `From` tag as `To` tag,
+  compared without case; later ones must be in that dialog and in order
+  (RFC 3261 §12.2.2). Another subscription, dialog or Call-ID is 481, a
+  NOTIFY out of order 500, another event or an event `id` 489, a body other
+  than `application/reginfo+xml` 415, and a missing `Subscription-State` or
+  a document that does not parse 400; none of them changes anything. Other
+  methods are 405. The 200 carries a `P-Charging-Vector` with the
+  NOTIFY's icid and `RCS_IMS_DOMAIN` as `term-ioi`.
+- **Deregistration** (#16 plan E, decision 5). A document newer than the
+  last one (RFC 3680 §5.2) acts on the registrations of the subscription's
+  user on this task, identities and contacts compared as URIs (RFC 3261
+  §19.1.4) without their parameters:
+  - a `terminated` registration of the registered identity, or one whose
+    contacts on that flow are all terminated, ends that registration;
+  - a terminated contact alone is removed from it;
+  - a terminated registration of one of the user's other identities makes
+    it one the registration may no longer assert.
+
+  Each registration ended is counted in `regevent.deregistered`. The flow
+  stays open, so the client, which learns of it from its own subscription,
+  can register again over it. A contact URI is all reginfo names a binding
+  by, so two flows of one client that registered the same contact URI are
+  both ended.
+- **Retries.** A subscription that fails (no answer, 408, a 2xx without
+  `Expires`) or that the notifier ends is set up again by the sweep after
+  30 s, or after its `retry-after` if longer; one refused with another 4xx,
+  5xx or 6xx, or ended as `rejected`, `noresource` or `invariant`, after an
+  hour (RFC 6665 §4.1.3). A 481 to a refresh is a lost subscription, set
+  up again after 30 s. One sweep sets up at most 500, so the task does not
+  send one SUBSCRIBE per user at once after an outage of `scscf`. A
+  subscription whose dialog no NOTIFY set up is forgotten once it expires.
+
+Subscriptions live in instance memory, as registrations do. When a task
+stops, `scscf`'s next NOTIFY fails, and `scscf` ends the subscription.
+
 ## A client's requests
 
 **Outside a dialog** (no To tag, TS 24.229 §5.2.6.3.3):

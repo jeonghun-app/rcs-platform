@@ -53,7 +53,10 @@ type registration struct {
 	// its Via (RFC 6223); and keepAlive, once saved, that it keeps the flow
 	// alive by either.
 	outbound, viaKeep, keepAlive bool
-	expires                      time.Time
+	// pathOB says the Path pcscf wrote for the REGISTER has ob: the client
+	// asked for outbound, whatever the registrar did (RFC 5626 §5.1).
+	pathOB  bool
+	expires time.Time
 	// seq orders a flow's registrations by when they were first saved: the
 	// first is the default for a request that names none (TS 24.229
 	// §5.2.6.3.3).
@@ -91,9 +94,12 @@ type registry struct {
 	max int
 	now func() time.Time
 
-	mu      sync.Mutex
-	byFlow  map[transport.FlowID]map[string]*registration
-	pending map[slotKey]*reservation
+	mu     sync.Mutex
+	byFlow map[transport.FlowID]map[string]*registration
+	// byDefault indexes the registrations by the default public identity
+	// of their user (defaultKey), whose reg event subscription they keep.
+	byDefault map[string]map[slotKey]struct{}
+	pending   map[slotKey]*reservation
 	// pendingByFlow and pendingByClient count the reservations of each
 	// flow and each client, and perClient bounds the latter.
 	pendingByFlow   map[transport.FlowID]int
@@ -123,6 +129,7 @@ type reservation struct {
 func newRegistry(maxRegistrations int, now func() time.Time) *registry {
 	return &registry{max: maxRegistrations, now: now,
 		byFlow: map[transport.FlowID]map[string]*registration{}, pending: map[slotKey]*reservation{},
+		byDefault:     map[string]map[slotKey]struct{}{},
 		pendingByFlow: map[transport.FlowID]int{}, pendingByClient: map[netip.Addr]int{},
 		perClient: DefaultMaxPendingRegistersPerIP}
 }
@@ -218,12 +225,84 @@ func (r *registry) save(reg *registration) error {
 	}
 	if old, ok := regs[reg.aor]; ok {
 		reg.seq = old.seq
+		r.unindexLocked(old)
 	} else {
 		r.seq++
 		reg.seq = r.seq
 	}
 	regs[reg.aor] = reg
+	r.indexLocked(reg)
 	return nil
+}
+
+// replace puts changed in the place of old, if old is still the
+// registration of its identity over its flow: a REGISTER's 200 saved since
+// wins.
+func (r *registry) replace(old, changed *registration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byFlow[old.flow][old.aor] != old {
+		return
+	}
+	changed.seq = old.seq
+	r.unindexLocked(old)
+	r.byFlow[old.flow][old.aor] = changed
+	r.indexLocked(changed)
+}
+
+func (r *registry) indexLocked(reg *registration) {
+	key := defaultKey(reg)
+	set := r.byDefault[key]
+	if set == nil {
+		set = map[slotKey]struct{}{}
+		r.byDefault[key] = set
+	}
+	set[slotKey{reg.flow, reg.aor}] = struct{}{}
+}
+
+func (r *registry) unindexLocked(reg *registration) {
+	key := defaultKey(reg)
+	delete(r.byDefault[key], slotKey{reg.flow, reg.aor})
+	if len(r.byDefault[key]) == 0 {
+		delete(r.byDefault, key)
+	}
+}
+
+// ofDefault returns the registrations of the user whose default public
+// identity is key, as defaultKey writes it, that have not expired.
+func (r *registry) ofDefault(key string) []*registration {
+	t := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*registration
+	for k := range r.byDefault[key] {
+		if reg := r.byFlow[k.flow][k.aor]; reg != nil && t.Before(reg.expires) {
+			out = append(out, reg)
+		}
+	}
+	return out
+}
+
+// defaults returns, for every user with a registration that has not
+// expired, the one that expires last, keyed by defaultKey: the one whose
+// Path a reg event SUBSCRIBE for that user asserts.
+func (r *registry) defaults() map[string]*registration {
+	t := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]*registration, len(r.byDefault))
+	for key, set := range r.byDefault {
+		for k := range set {
+			reg := r.byFlow[k.flow][k.aor]
+			if reg == nil || !t.Before(reg.expires) {
+				continue
+			}
+			if best := out[key]; best == nil || reg.expires.After(best.expires) {
+				out[key] = reg
+			}
+		}
+	}
+	return out
 }
 
 // remove forgets the registration of aor over flow.
@@ -235,9 +314,11 @@ func (r *registry) remove(flow transport.FlowID, aor string) {
 
 func (r *registry) removeLocked(flow transport.FlowID, aor string) {
 	regs := r.byFlow[flow]
-	if _, ok := regs[aor]; !ok {
+	reg, ok := regs[aor]
+	if !ok {
 		return
 	}
+	r.unindexLocked(reg)
 	delete(regs, aor)
 	if len(regs) == 0 {
 		delete(r.byFlow, flow)
