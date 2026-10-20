@@ -24,6 +24,12 @@
 // one without replaces the IMPI's earlier bindings without an instance (TS
 // 24.229 §5.4.1.2.2 4A).
 //
+// The challenges of one IMPI are limited per window across every instance,
+// and so are its resynchronisations, so that a flood of REGISTERs for one
+// subscriber cannot starve its own MAR at the HSS. The budgets are split by
+// P-CSCF flow, so that the flood cannot use up the registered UE's either
+// (limits.go, docs/threat-model.md T12).
+//
 // Every REGISTER is authenticated unless Config.TrustIntegrityProtected lets
 // a re-registration over a P-CSCF's protected connection go unchallenged.
 // The CK and IK of an AKA vector are kept but not sent: the platform protects
