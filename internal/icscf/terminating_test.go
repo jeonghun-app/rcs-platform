@@ -76,7 +76,7 @@ func TestTerminatingRequestURIForATelephoneNumberBecomesATelURI(t *testing.T) {
 		{"user=phone", "sip:+15550100001@" + home + ";user=phone", tel1, tel1},
 		{"escaped plus", "sip:%2B15550100001@" + home + ";user=phone", tel1, tel1},
 		{"visual separators", "sip:+1-555-010-0001@" + home + ";user=phone", "tel:+1-555-010-0001", tel1},
-		{"tel parameters carried forward", "sip:+15550100001;npdi;rn=+15550100009@" + home + ";user=phone", "tel:+15550100001;npdi;rn=+15550100009", tel1},
+		{"tel parameters carried forward", "sip:+15550100001;npdi;rn=+15550100005@" + home + ";user=phone", "tel:+15550100001;npdi;rn=+15550100005", tel1},
 		{"tel URI as it is", tel1, tel1, tel1},
 		{"without user=phone", "sip:+15550100001@" + home, "sip:+15550100001@" + home, impu1},
 		// Step 1 b) is for global numbers; the HSS decides about the rest.
