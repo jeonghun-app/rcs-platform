@@ -234,3 +234,42 @@ func TestOnlyALiveClientListenerFlowIsAClientFlow(t *testing.T) {
 		}
 	}
 }
+
+// The network's charging data never reaches the client (TS 24.229 §5.2.1):
+// not in a request from the core, nor in a response to the client's own.
+func TestChargingDataNeverGoesToTheClient(t *testing.T) {
+	p := newTerminatingPcscf(t, "FLOW-A")
+	r := fromCore(t, "MESSAGE", false, []string{pathEntry}, "P-Charging-Vector: icid-value="+coreICID,
+		"P-Charging-Function-Addresses: ccf=192.0.2.200")
+	req := prepared(t, p.Route(context.Background(), r), r)
+	if req.Header.Has("P-Charging-Vector") || req.Header.Has("P-Charging-Function-Addresses") {
+		t.Errorf("to the client: %q, %q", req.Header.Get("P-Charging-Vector"), req.Header.Get("P-Charging-Function-Addresses"))
+	}
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
+	for name, r := range map[string]*proxy.Request{
+		"REGISTER":         clientRequest(t, registerText(outboundContact), "FLOW-A"),
+		"outside a dialog": clientRequest(t, initialText("MESSAGE"), "FLOW-A"),
+		"inside a dialog":  inDialogFrom(t, []string{clientEnt, coreEntry}, "sip:bob@198.51.100.20", "Route: "+scscfRoute),
+	} {
+		d := p.Route(context.Background(), r)
+		res := answer(t, r.Message, 200, "P-Charging-Vector: icid-value=1", "P-Charging-Function-Addresses: ccf=192.0.2.200")
+		d.OnResponse(context.Background(), res)
+		if res.Header.Has("P-Charging-Vector") || res.Header.Has("P-Charging-Function-Addresses") {
+			t.Errorf("%s: response to the client %q, %q", name, res.Header.Get("P-Charging-Vector"), res.Header.Get("P-Charging-Function-Addresses"))
+		}
+	}
+}
+
+// Without P-Called-Party-ID the response asserts the Request-URI if the
+// flow registered it.
+func TestAResponseAssertsARegisteredRequestURI(t *testing.T) {
+	p := newTerminatingPcscf(t, "FLOW-A")
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute, "P-Associated-URI: <"+aliceIMPU+">, <"+aliceTel+">")
+	r := fromCore(t, "MESSAGE", false, []string{pathEntry})
+	r.Message.URI = mustURI(t, aliceTel)
+	d := p.Route(context.Background(), r)
+	res := answer(t, r.Message, 200)
+	if d.OnResponse(context.Background(), res); res.Header.Get("P-Asserted-Identity") != "<"+aliceTel+">" {
+		t.Errorf("P-Asserted-Identity %q", res.Header.Get("P-Asserted-Identity"))
+	}
+}

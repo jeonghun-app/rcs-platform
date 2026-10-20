@@ -26,7 +26,8 @@ import (
 // this task on both sides; the core-facing one keeps the Path's ob and the
 // request's icid (§5.2.6.4.4 3)). P-Asserted-Identity is removed when the
 // request asks for privacy of the identity (RFC 3323 §4.2, RFC 3325 §9.3).
-// The client's responses carry the request's charging identifiers and this
+// The request reaches the client without the network's charging data. The
+// client's responses carry the request's charging identifiers and this
 // network as the type 1 term-ioi; a 1xx or 2xx to a request outside a
 // dialog asserts the identity the request was for (§5.2.6.4.4 1), 6)).
 func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
@@ -51,6 +52,7 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 			if private {
 				req.Header.Del("P-Asserted-Identity")
 			}
+			stripCharging(&req.Header)
 			return nil
 		},
 		OnResponse: func(_ context.Context, res *sip.Response) {
@@ -99,13 +101,21 @@ func icidOfVector(cv string) string {
 }
 
 // calledIdentity is the identity a client's response to req asserts: the
-// P-Called-Party-ID the core wrote (§5.2.6.4.4 1)), or else the default
-// public identity of the flow's first registration; nil if there is none.
+// P-Called-Party-ID the core wrote (§5.2.6.4.4 1)); without one, the
+// Request-URI if it is an identity the flow registered, or else the
+// default public identity of the flow's first registration; nil if there
+// is none.
 func (p *pcscf) calledIdentity(flow transport.FlowID, req *sip.Request) *sip.Address {
 	if called, err := req.Header.PCalledPartyID(); err == nil {
 		return &sip.Address{URI: bare(called.URI)}
 	}
 	regs := p.registry.flowRegistrations(flow)
+	key := identityKey(req.URI)
+	for _, reg := range regs {
+		if i := slices.IndexFunc(reg.associated, func(a sip.Address) bool { return identityKey(a.URI) == key }); i >= 0 {
+			return &sip.Address{URI: bare(reg.associated[i].URI)}
+		}
+	}
 	if len(regs) == 0 || len(regs[0].associated) == 0 {
 		return nil
 	}

@@ -257,12 +257,17 @@ request is sent over that flow whatever its Route or Request-URI say below.
   the request's icid (§5.2.6.4.4 3)).
 - **Privacy.** `P-Asserted-Identity` is removed toward the client when the
   request's `Privacy` has `id` (RFC 3323 §4.2, RFC 3325 §9.3).
+- **Charging.** The network's charging data, `P-Charging-Vector` and
+  `P-Charging-Function-Addresses`, never goes to a client, in a request
+  from the core or a response to the client's own request (TS 24.229
+  §5.2.1).
 - **Responses.** The client's responses get a `P-Charging-Vector` with the
   request's `icid-value` and `orig-ioi`, a new icid if it had none, and
   `RCS_IMS_DOMAIN` as the type 1 `term-ioi` (§5.2.6.4.4 6)). A 1xx or 2xx
-  to a request outside a dialog asserts the identity it was for, its
-  `P-Called-Party-ID`, or else the flow's default public identity, in place
-  of any `P-Preferred-Identity` (§5.2.6.4.4 1)). The client's own
+  to a request outside a dialog asserts the identity it was for, in place
+  of any `P-Preferred-Identity` (§5.2.6.4.4 1)): its `P-Called-Party-ID`;
+  without one, the Request-URI if the flow registered it, or else the
+  flow's default public identity. The client's own
   network-only headers are gone already, removed on arrival.
 
 ## Settings

@@ -122,8 +122,12 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	core.write(coreRequest("INVITE", contact, call, "", 1, "Route: <"+path+">", "Record-Route: "+scscfRR,
 		fmt.Sprintf("Contact: <sip:bob@scscf.rcs.internal:%d;transport=tcp>", scscfPort),
 		"P-Asserted-Identity: <"+bobIMPU+">", "P-Called-Party-ID: <"+aliceIMPU+">",
-		"P-Charging-Vector: icid-value="+coreICID+";orig-ioi=home.example.net"))
+		"P-Charging-Vector: icid-value="+coreICID+";orig-ioi=home.example.net", "P-Charging-Function-Addresses: ccf=192.0.2.200"))
 	invite := c.nextRequest()
+	// The network's charging data stays in the network (TS 24.229 §5.2.1).
+	if invite.Header.Has("P-Charging-Vector") || invite.Header.Has("P-Charging-Function-Addresses") {
+		t.Errorf("charging data reached the client: %q, %q", invite.Header.Get("P-Charging-Vector"), invite.Header.Get("P-Charging-Function-Addresses"))
+	}
 	if invite.Method != "INVITE" || invite.URI.String() != contact {
 		t.Fatalf("the client got %s %s", invite.Method, invite.URI)
 	}
@@ -234,5 +238,29 @@ func TestAStaleFlowTokenIs430(t *testing.T) {
 			t.Fatalf("a closed flow's token: %d, want 430", res.StatusCode)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The core's answer to a client's own request reaches it without the
+// network's charging data (TS 24.229 §5.2.1).
+func TestAResponseToTheClientCarriesNoChargingData(t *testing.T) {
+	scscf := startCoreNode(t, func(req *sip.Request) string {
+		return respondTo(req, 200, "b1", "P-Charging-Vector: icid-value=1;term-ioi=home.example.net", "P-Charging-Function-Addresses: ccf=192.0.2.200")
+	})
+	scscfPort := scscf.ln.Addr().(*net.TCPAddr).Port
+	icscf := startCoreNode(t, func(req *sip.Request) string {
+		return strings.Replace(echo200(req), "<sip:orig@10.0.4.4;lr>", fmt.Sprintf("<sip:orig@scscf.rcs.internal:%d;transport=tcp;lr>", scscfPort), 1)
+	})
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
+	cfg.SCSCFPort = scscfPort
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1")})
+	c, _ := registered(t, s, icscf)
+	c.send(fmt.Sprintf("charging-%d", requests.Add(1)), "MESSAGE "+bobIMPU+" SIP/2.0", "", 1, "MESSAGE",
+		fmt.Sprintf("Route: <sip:%s:5060;transport=tcp;lr>", publicHost))
+	_ = scscf.receive(t)
+	res := c.final()
+	if res.StatusCode != 200 || res.Header.Has("P-Charging-Vector") || res.Header.Has("P-Charging-Function-Addresses") {
+		t.Errorf("%d to the client with %q, %q", res.StatusCode, res.Header.Get("P-Charging-Vector"), res.Header.Get("P-Charging-Function-Addresses"))
 	}
 }

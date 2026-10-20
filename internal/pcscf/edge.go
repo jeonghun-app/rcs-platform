@@ -203,14 +203,40 @@ func (p *pcscf) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !fromClient(r.Source) {
 		return p.terminate(ctx, r)
 	}
+	var d proxy.Decision
 	switch {
 	case r.Message.Method == "REGISTER":
-		return p.register(ctx, r)
+		d = p.register(ctx, r)
 	case r.Initial():
-		return p.originate(ctx, r)
+		d = p.originate(ctx, r)
 	default:
-		return p.inDialog(ctx, r)
+		d = p.inDialog(ctx, r)
 	}
+	return toClient(d)
+}
+
+// chargingHeaders are the charging data of the network, which never goes to
+// a client (TS 24.229 §5.2.1): requests to it lose them in
+// terminate, responses to it in toClient.
+var chargingHeaders = []string{"P-Charging-Vector", "P-Charging-Function-Addresses"}
+
+func stripCharging(h *sip.Header) {
+	for _, name := range chargingHeaders {
+		h.Del(name)
+	}
+}
+
+// toClient makes every response d forwards to the client lose the
+// network's charging data, after d's own OnResponse.
+func toClient(d proxy.Decision) proxy.Decision {
+	next := d.OnResponse
+	d.OnResponse = func(ctx context.Context, res *sip.Response) {
+		if next != nil {
+			next(ctx, res)
+		}
+		stripCharging(&res.Header)
+	}
+	return d
 }
 
 // statusFlowFailed is 430 Flow Failed (RFC 5626 §11.5).
