@@ -31,23 +31,25 @@ func (noMetrics) Timing(string, time.Duration) {}
 // for: every vector advances SQN, and the S-CSCF uses one per challenge.
 const DefaultMaxAuthItems = 4
 
-// maxUpdateAttempts bounds the retries of a write that loses a version
-// race. Writers in one task are serialised by the IMPI lock, so a conflict
-// means another task wrote the same subscription at the same moment.
+// maxUpdateAttempts bounds the retries of the API's own read-modify-write
+// loops, which lose a version race only to another task's write of the same
+// item at the same moment.
 const maxUpdateAttempts = 8
 
-// maxRacedAttempts bounds updateFrom's retries for a request with a
-// deadline, which normally stops them first. A write that lost to another
-// task loses again about as often however long it waits, as long as that
-// task keeps writing (#200: some 45% of retries under two tasks' MARs for one
-// subscriber, on DynamoDB Local), so maxUpdateAttempts gave up while the
-// request still had time. A request without a deadline keeps that count.
+// maxRacedAttempts bounds updateFrom's retries, which the request's deadline
+// normally stops first; every caller has one (Cx, the API's store timeout,
+// the pushes). A write that lost to another task loses again about as often
+// however long it waits, as long as that task keeps writing (#200: some 45%
+// of retries under two tasks' MARs for one subscriber, on DynamoDB Local), so
+// a small count gave up while the request still had time.
 const maxRacedAttempts = 64
 
 // errUnchanged, returned by an update function, skips the write.
 var errUnchanged = errors.New("hss: nothing to write")
 
-// errContention means an update kept losing version races.
+// errContention means an update kept losing version races, until its count
+// or its deadline ran out; with the deadline, the error wraps ctx's too, so
+// that it reads as contention and not as a slow store.
 var errContention = errors.New("hss: subscription is being written by others; giving up")
 
 // Options configures an HSS.
@@ -170,12 +172,13 @@ func (h *HSS) update(ctx context.Context, impi string, fn func(s *store.Subscrip
 // updateFrom is update with read, the subscription the caller has just read,
 // as the first attempt's starting point, which saves a read on the Cx path.
 // If read is stale the conditional write fails and the next attempt reads.
-// A read taken before waiting for the lock is stale for certain, as the
-// request that held the lock wrote the subscription, so it is dropped: kept,
-// it cost every queued request a failed write (#200).
+// A read taken before waiting for the lock is most likely stale, as the
+// request that held it most likely wrote the subscription, so it is dropped:
+// kept, it cost every queued request a failed write (#200). The lock is per
+// stripe (lockStripes), so one that waited behind another subscriber, or
+// behind a holder that wrote nothing, pays one read more.
 //
-// With a deadline in ctx the retries run until it, or maxRacedAttempts,
-// rather than maxUpdateAttempts: see maxRacedAttempts.
+// The retries run until ctx's deadline, at most maxRacedAttempts: see there.
 func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscription, fn func(s *store.Subscription) error) (*store.Subscription, error) {
 	unlock, waited, err := h.acquire(ctx, impi)
 	if err != nil {
@@ -185,11 +188,7 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 	if waited {
 		read = nil
 	}
-	attempts := maxUpdateAttempts
-	if _, ok := ctx.Deadline(); ok {
-		attempts = maxRacedAttempts
-	}
-	for attempt := 0; attempt < attempts; attempt++ {
+	for attempt := 0; attempt < maxRacedAttempts; attempt++ {
 		if attempt > 0 {
 			h.metrics.Count("store.conflict", 1)
 			// Jitter so that two tasks retrying the same write do not
@@ -197,7 +196,7 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 			select {
 			case <-time.After(time.Duration(mathrand.IntN(5<<min(attempt, 6))) * time.Millisecond):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, contended(ctx)
 			}
 		}
 		cur := read
@@ -205,6 +204,9 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 		if cur == nil {
 			var err error
 			if cur, err = h.store.Subscription(ctx, impi); err != nil {
+				if attempt > 0 && ctx.Err() != nil {
+					return nil, contended(ctx)
+				}
 				return nil, err
 			}
 		}
@@ -219,9 +221,19 @@ func (h *HSS) updateFrom(ctx context.Context, impi string, read *store.Subscript
 		if errors.Is(err, store.ErrConflict) {
 			continue
 		}
+		if err != nil && attempt > 0 && ctx.Err() != nil {
+			return nil, contended(ctx)
+		}
 		return saved, err
 	}
 	return nil, errContention
+}
+
+// contended is the error of an update whose deadline ended while it was
+// losing to other writers: contention, which the API answers "busy" and
+// the store's health is not blamed for, as well as ctx's error.
+func contended(ctx context.Context) error {
+	return fmt.Errorf("%w: %w", errContention, ctx.Err())
 }
 
 // clone copies a subscription deeply enough that changing the copy leaves

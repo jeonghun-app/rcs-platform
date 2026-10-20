@@ -142,7 +142,11 @@ fails is answered `DIAMETER_UNABLE_TO_COMPLY`, as the procedures say, and counte
 too. A request that waited past `HSS_CX_TIMEOUT` for its subscriber's lock in
 this task, because another request for that subscriber (or one sharing its lock
 stripe) is slow, is answered `DIAMETER_TOO_BUSY` and counted (`lock.busy`): the
-condition is local to the task, and the S-CSCF may retry on another one.
+condition is local to the task, and the S-CSCF may retry on another one. A
+write that keeps losing to another task's writes of the same subscriber, as
+two tasks' MARs for one user do, is retried until `HSS_CX_TIMEOUT` (each lost
+write counted, `store.conflict`) and then answered `DIAMETER_UNABLE_TO_COMPLY`,
+logged as contention rather than a store failure (#200).
 
 | Request | Behaviour |
 |---|---|

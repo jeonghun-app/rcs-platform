@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,21 +165,82 @@ func TestAWriteLosingToAnotherTaskIsRetriedUntilItsDeadline(t *testing.T) {
 	short, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := e.h.update(short, impi1, set); err == nil {
-		t.Fatal("a write that never wins succeeded")
+	_, err := e.h.update(short, impi1, set)
+	// Still contention, not a slow store (#244 review).
+	if !errors.Is(err, errContention) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a write that never wins: %v, want contention at the deadline", err)
 	}
 	if took := time.Since(start); took > realWait/2 {
 		t.Errorf("gave up after %v; the deadline was 300ms", took)
 	}
+}
 
-	// Without a deadline, nothing but the count stops it.
-	cs.mu.Lock()
-	cs.written = 0
-	cs.mu.Unlock()
-	if _, err := e.h.update(context.Background(), impi1, set); !errors.Is(err, errContention) {
-		t.Fatalf("without a deadline: %v", err)
+// TestAnAPIWriteThatKeepsLosingIsAnsweredBusy: contention that runs to the
+// store timeout is answered as contention, 503 "busy", not as a store
+// failure: api.store_failure stays 0 and nothing is logged as an error
+// (#244 review).
+func TestAnAPIWriteThatKeepsLosingIsAnsweredBusy(t *testing.T) {
+	a := newAPIEnv(t, func(o *APIOptions) { o.StoreTimeout = 300 * time.Millisecond })
+	a.create(impi1, true, impu1)
+	a.h.store = &losingStore{Store: a.h.store, n: 1 << 30}
+	code, body, h := a.do("POST", subPath(impi1, "/digest-credential"), adminToken, "")
+	if msg, _ := body["error"].(string); code != http.StatusServiceUnavailable || !strings.Contains(msg, "busy") || h.Get("Retry-After") == "" {
+		t.Fatalf("%d %q", code, body)
 	}
-	if cs.written != maxUpdateAttempts {
-		t.Errorf("without a deadline: %d writes, want %d", cs.written, maxUpdateAttempts)
+	if a.metrics.get("api.store_failure") != 0 {
+		t.Error("contention was counted as a store failure")
+	}
+	if strings.Contains(a.logs.String(), `"level":"ERROR"`) {
+		t.Errorf("contention was logged as an error: %s", a.logs.String())
+	}
+}
+
+// slowWinStore lets the first write through only just before its context's
+// deadline, as one that keeps losing to another task until then would.
+type slowWinStore struct {
+	store.Store
+	margin time.Duration
+}
+
+func (s *slowWinStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	if d, ok := ctx.Deadline(); ok {
+		time.Sleep(time.Until(d) - s.margin)
+	}
+	return s.Store.UpdateSubscription(ctx, old, n)
+}
+
+// deadlineNotifier records how much time each RTR had left.
+type deadlineNotifier struct {
+	recordingNotifier
+	left []time.Duration
+}
+
+func (n *deadlineNotifier) Deregister(ctx context.Context, r *cx.RTR) error {
+	if d, ok := ctx.Deadline(); ok {
+		n.left = append(n.left, time.Until(d))
+	}
+	return n.recordingNotifier.Deregister(ctx, r)
+}
+
+// TestARefusedPPRsRTRKeepsTimeAfterALateUpdate: the S-CSCF refused new data,
+// so the HSS marks the user not registered and deregisters it with
+// SERVER_CHANGE. An update that wins only at its deadline, behind another
+// task's writes, must not leave the RTR none (#244 review).
+func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	e.modify(impi1, func(s *store.Subscription) {
+		s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+	})
+	h := e.newHSS(func(o *Options) { o.Store = &slowWinStore{Store: e.store, margin: 20 * time.Millisecond} })
+	n := &deadlineNotifier{recordingNotifier: *newRecorder()}
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	h.pprRejected(ctx, n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData))
+	if e.sub(impi1).Identity(impu1).State != store.NotRegistered {
+		t.Fatal("the user was not marked not registered")
+	}
+	if len(n.left) != 1 || n.left[0] < 200*time.Millisecond {
+		t.Errorf("RTRs with time left %v, want one with a good share of the push's", n.left)
 	}
 }
