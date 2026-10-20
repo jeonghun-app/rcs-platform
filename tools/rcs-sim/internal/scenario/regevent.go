@@ -70,8 +70,12 @@ func regEvent(r *run) error {
 		if own.State != "terminated" || own.Event != "unregistered" {
 			return nil, errors.New("the client's contact did not end as unregistered")
 		}
-		// After a de-registration by the user, a terminated subscription
-		// has no reason or says to subscribe again (RFC 6665 §4.1.3).
+		// After the user's own de-registration the subscription ends as if
+		// it had been refreshed with Expires 0 (TS 24.229 §5.4.1.4), so with
+		// no reason, "timeout", or "deactivated" (subscribe again, RFC 6665
+		// §4.1.3). "noresource" says the registration itself went away
+		// without the user, an expiry for one, which is not what happened
+		// here, so it fails: the team's decision on #216.
 		return w.ended(n, "", "timeout", "deactivated")
 	}); err != nil {
 		return err
@@ -94,14 +98,19 @@ func regEvent(r *run) error {
 		if err != nil {
 			return nil, err
 		}
-		// RFC 3680 §4.7.1: deactivated, the client may register again;
-		// rejected, it may not (TS 24.229 §5.1.1.6.1).
-		if own.State != "terminated" || own.Event != "deactivated" && own.Event != "rejected" {
-			return nil, errors.New("the client's contact did not end as deactivated or rejected")
+		// TS 24.229 §5.4.1.5 4) b): "unregistered", "deactivated" (the
+		// client may register again) or "rejected" (it may not; RFC 3680
+		// §4.7.1).
+		switch {
+		case own.State != "terminated":
+			return nil, errors.New("the client's contact did not end with the network's deregistration")
+		case own.Event != "unregistered" && own.Event != "deactivated" && own.Event != "rejected":
+			return nil, errors.New("the client's contact did not end as unregistered, deactivated or rejected")
 		}
-		// The reasons RFC 6665 §4.1.3 has for a subscription the notifier
-		// ended.
-		return w.ended(n, "deactivated", "probation", "rejected", "timeout", "giveup", "noresource")
+		// §5.4.1.5 sets the state to "terminated" and no reason; RFC 6665
+		// §4.1.3 makes the reason optional, and these are the ones it has
+		// for a subscription the notifier ended.
+		return w.ended(n, "", "deactivated", "probation", "rejected", "timeout", "giveup", "noresource")
 	})
 }
 

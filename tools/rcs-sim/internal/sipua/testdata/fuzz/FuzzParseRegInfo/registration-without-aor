@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("<reginfo xmlns=\"urn:ietf:params:xml:ns:reginfo\"version=\"0\"state=\"full\"><registration><contact><uri>A:0</uri></contact></registration></reginfo>")

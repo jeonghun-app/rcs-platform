@@ -68,8 +68,8 @@ type Config struct {
 	SIP, SIPPeer *sipua.Config
 	// Deregister has the network end the registration of impu, as an
 	// operator's DELETE through the HSS API does (an RTR to the S-CSCF, TS
-	// 24.229 §5.4.1.5), for reg-event's network-deregister step. Nil fails
-	// that step.
+	// 24.229 §5.4.1.5), for reg-event's network-deregister step. Nil skips
+	// that step, which RequireAll (-require-all) makes a failure.
 	Deregister func(ctx context.Context, impu sip.URI) error
 
 	// StepTimeout bounds each step.
