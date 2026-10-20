@@ -201,6 +201,9 @@ func (c *respContext) run() {
 	case c.uas != nil:
 		c.serve(in)
 		return
+	case dec.Discard:
+		c.discard()
+		return
 	case cancelled:
 		// §9.2: an INVITE cancelled before any branch was sent is answered
 		// 487, as a UAS would.
@@ -265,6 +268,17 @@ func (c *respContext) answer(res *sip.Response) {
 	acts = append(acts, c.progress()...)
 	c.mu.Unlock()
 	runAll(acts)
+}
+
+// discard ends the request with a final response the transport never sends
+// (silence), so its transaction completes, absorbs retransmissions and ends
+// on its timers without a word upstream.
+func (c *respContext) discard() {
+	res, err := c.p.response(c.tx.Request(), 500)
+	if err == nil {
+		c.p.silence(c.tx, res)
+	}
+	c.finish()
 }
 
 // finish ends a context that sends nothing more.

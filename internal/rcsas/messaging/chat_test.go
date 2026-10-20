@@ -246,6 +246,41 @@ func TestNoSecondSessionIsAskedForOnceOneHasOpened(t *testing.T) {
 	}
 }
 
+// QA on #269: the guard in invite records nothing. Had it left the key in
+// e.invites, a leg that ends before it carries the message would hold the
+// message's next invitation back for InviteTimeout.
+func TestAGuardedInviteLeavesNoKeyBehind(t *testing.T) {
+	r := newRig(t, Config{})
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "for bob", 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("Pending = %d, %v", len(ms), err)
+	}
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation, Mode: inv.Mode, Direction: Terminating})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	r.e.invite(t.Context(), ms[0])
+	select {
+	case again := <-r.d.invites:
+		t.Fatalf("a second session was asked for: %+v", again)
+	default:
+	}
+	_ = leg.Close()
+	waitFor(t, "the leg to be gone", func() bool { return r.e.chatLeg(bob, alice) == nil })
+	r.e.invite(t.Context(), ms[0])
+	if got := r.d.nextInvite(t); got.Recipient != bob || got.Mode != store.Chat {
+		t.Fatalf("invitation %+v", got)
+	}
+}
+
 func TestAnOfferWithoutAnAnswerExpires(t *testing.T) {
 	r := newRig(t, Config{AnswerTimeout: 10 * time.Second})
 	leg, err := r.e.Offer(LegParams{User: bob, Peer: alice, Mode: store.Chat, Direction: Terminating})

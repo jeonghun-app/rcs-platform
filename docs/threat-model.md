@@ -46,6 +46,29 @@ separate from its core listener; core SIP ports admit only platform services
 default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
 messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
 **Status:** planned (#16, Phase 7 infrastructure).
+**Residual risk (accepted, #208, narrowed in #221):** `pcscf` checks
+in-dialog requests against its own Record-Route values only, keeping no
+dialog state. The core-facing value binds the flow token to the Call-ID and
+the dialog's icid with a MAC under a key drawn at every start, and a request
+from the core inside a dialog reaches the flow only with the value written
+for its Call-ID, and is answered 403 with any other while the flow is alive. The MAC is checked
+only on requests inside a dialog (with a To tag): an initial request comes
+along the client's `Path` and is not bound to a dialog. The binding covers
+the Call-ID and not the tags: `pcscf` writes the value into
+the request that sets up the dialog, before the callee has chosen its tag,
+and a value it rewrote in the response would differ between the two route
+sets unless it kept state. The peer of a call has seen that value, so it can
+go on sending requests with the same Call-ID after the call has ended, for
+as long as the flow lives, but not reach the client with any other. `pcscf` fixes only the first hop of a
+client's in-dialog request, to `scscf`; whether such requests then reach
+`rcs-as`, which records itself in the dialog, depends on `scscf`, which
+checks it as an acceptance criterion of
+[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
+mitigation is a dialog-state check in `scscf`, such as a signed
+Record-Route parameter it verifies.
+The client's in-dialog requests are checked against the same MAC, so a
+client cannot change the icid its dialog's requests are charged to (review
+of #221; this closes the #208 residual risk that it could).
 
 ## T3 — MSRP session access on `rcs-as`
 
@@ -93,7 +116,7 @@ compromised, its reach is what its security group and tokens allow:
 
 | Service | Implemented in the service | Planned |
 |---|---|---|
-| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, with connections kept for the core listener ([pcscf](pcscf.md)) | registration and routing (#16), per-listener handshake limits (#193), security groups (#56) |
+| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, and each listener's connections limited from accept, the PROXY header and TLS handshake included, so the core listener keeps its room (#193); registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to `scscf`'s service name alone and never back into the task; a request from the core only over the client flow of this task its Route names, else 430; the reg event: a NOTIFY only from the core, to a subscription's random Contact and in its dialog, acting only on that user's registrations on the task ([pcscf](pcscf.md)) | security groups (#56), a dialog-state check in `scscf` (T2 residual risk) |
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |

@@ -327,7 +327,11 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		c.Close()
 		return nil, err
 	}
-	ua.layer = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock})
+	if ua.layer, err = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock}); err != nil {
+		ua.tr.Close()
+		c.Close()
+		return nil, err
+	}
 	return ua, nil
 }
 
@@ -659,10 +663,12 @@ func (ua *UA) isOurs(c sip.Contact) bool {
 // SameInstance reports whether two +sip.instance values, written as RFC
 // 5626 §4.1 has them ("<urn:...>"), name the same instance. §4.1 compares
 // them by the rules of their URN namespace, and lexically (RFC 8141 §3.1)
-// for one it does not know: case does not matter in "urn", in the
-// namespace ID or in percent-encoding hex, and does in the rest. The UUIDs
-// of urn:uuid, which RCS clients use, compare without case throughout (RFC
-// 9562 §4). A value that is not a URN in angle brackets must match exactly.
+// for one it does not know. Only urn:uuid is compared by its own rules:
+// its UUIDs compare without case throughout (RFC 9562 §4). Every other
+// namespace, urn:gsma:imei included, is compared lexically: case does not
+// matter in "urn", in the namespace ID or in percent-encoding hex, and
+// does in the rest. A value that is not a URN in angle brackets must match
+// exactly.
 func SameInstance(a, b string) bool {
 	ka, okA := instanceKey(a)
 	kb, okB := instanceKey(b)

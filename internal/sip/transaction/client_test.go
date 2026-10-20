@@ -242,7 +242,7 @@ func TestTimerBasesAreConfigurable(t *testing.T) {
 }
 
 func TestDefaultTimerBasesFollowRFC3261(t *testing.T) {
-	l := New(&fakeSender{}, &tuRecorder{}, Config{})
+	l := mustNew(t, &fakeSender{}, &tuRecorder{}, Config{})
 	if l.t1 != 500*time.Millisecond || l.t2 != 4*time.Second || l.t4 != 5*time.Second || l.clock != SystemClock {
 		t.Fatalf("defaults = %v %v %v", l.t1, l.t2, l.t4)
 	}
