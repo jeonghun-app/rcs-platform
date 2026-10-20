@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"errors"
+	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -90,4 +92,76 @@ func TestAFlowThatClosesAfterTheAnswerChangesNothing(t *testing.T) {
 	h.p.FlowClosed("client")
 	h.settle()
 	check(t, "upstream after the close", h.upstream(), nil)
+}
+
+// Review of #293: a branch already being cancelled whose flow then closes
+// counts as the 487 its CANCEL asked for, whether or not the CANCEL could be
+// sent yet; a flow that closes before the CANCEL leaves the 430.
+func TestACancelledBranchWhoseFlowClosesIs487(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		provisional bool
+		closeFirst  bool
+		want        []int
+	}{
+		{"CANCEL sent, then the flow closes", true, false, codes(200, 487)},
+		{"CANCEL waiting for a provisional, then the flow closes", false, false, codes(200, 487)},
+		{"the flow closes, then the CANCEL", true, true, codes(200, 430)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.decide(Decision{
+				Targets: []Target{{URI: mustURI("sip:alice@192.0.2.10"), Destination: &transport.Destination{Flow: "client"}}},
+				OnFinal: keep430,
+			})
+			req := invite(t)
+			h.receive(req)
+			fwd := h.one()
+			if tc.provisional {
+				h.reply(fwd, 180)
+			}
+			h.upstream()
+			closeFlow := func() {
+				h.p.FlowClosed("client")
+				h.settle()
+			}
+			if tc.closeFirst {
+				closeFlow()
+			}
+			h.receive(uacCancel(t, req))
+			if !tc.closeFirst {
+				closeFlow()
+			}
+			got := h.upstream()
+			slices.Sort(got)
+			check(t, "upstream", got, tc.want)
+		})
+	}
+}
+
+// BranchFailure.Provisional tells a service whether the target had the
+// request (noted on #14 for scscf).
+func TestABranchFailureSaysWhetherAProvisionalCame(t *testing.T) {
+	for _, code := range []int{0, 100, 180} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			h := newHarness(t, Config{})
+			var failures []BranchFailure
+			h.decide(Decision{
+				Targets: []Target{target("sip:alice@192.0.2.10")},
+				OnBranchFailure: func(_ contextT, f BranchFailure) []Target {
+					failures = append(failures, f)
+					return nil
+				},
+			})
+			h.receive(invite(t))
+			fwd := h.one()
+			if code != 0 {
+				h.reply(fwd, code)
+			}
+			h.reply(fwd, 486)
+			if len(failures) != 1 || failures[0].Provisional != (code != 0) {
+				t.Fatalf("failures = %+v, want one with Provisional %v", failures, code != 0)
+			}
+		})
+	}
 }

@@ -595,10 +595,11 @@ func (b *branch) failed(err error) []func() {
 	case timedOut && b.timedOut:
 		f = c.timeoutFinal()
 		err = ErrTargetTimeout
-	case timedOut && b.cancel != cancelNone:
+	case (timedOut || errors.Is(err, transaction.ErrFlowClosed)) && b.cancel != cancelNone:
 		// A branch being cancelled that ends without a final response, its
-		// CANCEL unanswered for 64*T1 (§9.1) or its timers expired, counts
-		// as the 487 the CANCEL asked for.
+		// CANCEL unanswered for 64*T1 (§9.1), its timers expired or its flow
+		// closed, counts as the 487 the CANCEL asked for: the request was
+		// cancelled, not failed for want of the flow.
 		f = c.made(487)
 	case timedOut:
 		// Timer B, F or C, or the target's Timeout, fired without a final
@@ -717,7 +718,7 @@ func (c *respContext) branchEnded(b *branch, f final, err error) []func() {
 	// service learns of every failed flow; the context waits for it, so its
 	// ctx stays valid while it runs.
 	c.pending++
-	failure := BranchFailure{Target: b.target, Response: f.res.Clone(), Err: err}
+	failure := BranchFailure{Target: b.target, Response: f.res.Clone(), Err: err, Provisional: b.provisional}
 	return []func(){func() {
 		c.p.spawn(func() {
 			targets := hook(c.ctx, failure)

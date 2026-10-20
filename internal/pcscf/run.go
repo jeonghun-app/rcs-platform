@@ -192,7 +192,17 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
+	awaitAnswers(px, answersWait)
 	return nil
+}
+
+// awaitAnswers returns once no request is in progress, or after d. It polls,
+// since a flow's close reaches the proxy on a goroutine of the transport's.
+// #281's Proxy.Drain replaces it.
+func awaitAnswers(px *proxy.Proxy, d time.Duration) {
+	for end := time.Now().Add(d); px.Stats().Contexts > 0 && time.Now().Before(end); {
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // sweepInterval is how often expired registrations, and reservations no

@@ -13,7 +13,9 @@ import (
 // ResponseHandler receives what a client transaction passes to the TU: each
 // response the TU must see, in order, or one error after which nothing follows.
 // The error is ErrTimeout when Timer B or F fires, ErrTerminated after
-// Terminate, or a transport error from a retransmission.
+// Terminate, ErrFlowClosed when the flow the request went over closed first
+// (Layer.FlowClosed, RFC 5626 §5.3.1), or a transport error from a
+// retransmission.
 //
 // Calls for one transaction never overlap and arrive in the order the
 // transaction produced them, though not always on the goroutine that produced
