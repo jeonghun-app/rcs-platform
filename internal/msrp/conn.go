@@ -161,6 +161,12 @@ type Config struct {
 	// this package writes every chunk whole. Cutting at 2048 is the other
 	// strategy §7.1.1 allows. Zero means DefaultChunkSize.
 	ChunkSize int
+
+	// refusalFlush is refusalFlushTimeout unless a test sets it.
+	refusalFlush time.Duration
+	// refusalAfter starts the flush's bound; time.After unless a test
+	// sets it, to end the bound when it says rather than in real time.
+	refusalAfter func(time.Duration) <-chan time.Time
 }
 
 func (cfg Config) withDefaults() (Config, error) {
@@ -223,6 +229,9 @@ func (cfg Config) withDefaults() (Config, error) {
 	if cfg.MaxFailedBinds <= 0 {
 		cfg.MaxFailedBinds = DefaultMaxFailedBinds
 	}
+	if cfg.refusalFlush <= 0 {
+		cfg.refusalFlush = refusalFlushTimeout
+	}
 	if cfg.MaxInFlight <= 0 {
 		cfg.MaxInFlight = DefaultMaxInFlight
 	}
@@ -284,6 +293,10 @@ type Conn struct {
 	queue  []outFrame
 	posted int
 	wake   chan struct{}
+	// writing is set while writeLoop writes a frame it took off queue;
+	// written, when set, is closed once neither is left (flush).
+	writing bool
+	written chan struct{}
 
 	// slots holds one token per request awaiting an answer.
 	slots  chan struct{}
@@ -301,7 +314,10 @@ type Conn struct {
 	unboundGen uint64
 	closed     bool
 	err        error
-	done       chan struct{}
+	// closing is the reason a flush before closing gave (flush): the
+	// connection ends with it whatever else fails meanwhile.
+	closing error
+	done    chan struct{}
 }
 
 // outFrame is one whole message waiting to be written. done is nil for an
@@ -437,6 +453,9 @@ func (c *Conn) fail(err error) {
 		c.mu.Unlock()
 		return
 	}
+	if c.closing != nil {
+		err = c.closing
+	}
 	c.closed = true
 	c.err = err
 	sessions := make([]*Session, 0, len(c.sessions))
@@ -535,6 +554,10 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			var me *MessageError
 			if !errors.As(err, &me) {
+				var cut truncated
+				if c.passive && (errors.Is(err, io.EOF) || errors.As(err, &cut)) {
+					c.writeQueuedForPeer(err)
+				}
 				c.fail(err)
 				return
 			}
@@ -548,10 +571,97 @@ func (c *Conn) readLoop() {
 			c.handleResponse(m)
 		}
 		if err != nil {
+			if errors.Is(err, ErrTooManyUnknownSessions) {
+				c.flush(err)
+			}
 			c.fail(err)
 			return
 		}
 	}
+}
+
+// refusalFlushTimeout bounds how long a connection closed for too many
+// unknown sessions, or by the peer's half-close, goes on to deliver what it
+// already owes. It is real time, like the write deadline.
+const refusalFlushTimeout = 2 * time.Second
+
+// flush lets the answers already queued reach the peer before the
+// connection ends for reason (#219): it waits until they are written,
+// then half-closes and reads what the peer still sends, so that closing
+// does not reset the connection and discard them on the peer's side
+// (RFC 1122 §4.2.2.13), until the peer closes too. Both waits together
+// take at most refusalFlushTimeout. Only readLoop calls it, and nothing else
+// reads the connection.
+func (c *Conn) flush(reason error) {
+	c.mu.Lock()
+	c.closing = reason
+	c.mu.Unlock()
+	// One bound for both waits.
+	deadline := c.flushDeadline()
+	if !c.writeQueued(deadline) {
+		return
+	}
+	cw, ok := c.nc.(interface{ CloseWrite() error })
+	if !ok || cw.CloseWrite() != nil {
+		return
+	}
+	read := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, c.nc)
+		close(read)
+	}()
+	select {
+	case <-read:
+	case <-deadline:
+	}
+}
+
+// writeQueuedForPeer lets a peer that has stopped sending, between
+// messages or inside one (reason), read what it is owed for the requests
+// it completed before the connection ends (#240), for up to the refusal
+// flush's bound. reason is the end whatever fails meanwhile, as in flush:
+// a peer that closed altogether resets the writes, and the end is still
+// its close. Only passive connections wait: an active one, which a Pool
+// shares, would take new sessions while it waits, and its peer, the side
+// that half-closed in a refusal flush, discards what it reads.
+func (c *Conn) writeQueuedForPeer(reason error) {
+	c.mu.Lock()
+	c.closing = reason
+	c.mu.Unlock()
+	c.writeQueued(c.flushDeadline())
+}
+
+// flushDeadline starts the bound of a flush: refusalFlush, in real time
+// unless a test has set refusalAfter.
+func (c *Conn) flushDeadline() <-chan time.Time {
+	after := c.cfg.refusalAfter
+	if after == nil {
+		after = time.After
+	}
+	return after(c.cfg.refusalFlush)
+}
+
+// writeQueued waits until everything queued has been written, and reports
+// whether it was before the connection ended or deadline came. writeLoop
+// goes on writing meanwhile: a peer that has half-closed still reads.
+func (c *Conn) writeQueued(deadline <-chan time.Time) bool {
+	c.qmu.Lock()
+	var written chan struct{}
+	if len(c.queue) > 0 || c.writing {
+		written = make(chan struct{})
+		c.written = written
+	}
+	c.qmu.Unlock()
+	if written == nil {
+		return true
+	}
+	select {
+	case <-written:
+		return true
+	case <-c.done:
+	case <-deadline:
+	}
+	return false
 }
 
 func (c *Conn) handleResponse(m *Message) {
@@ -925,6 +1035,7 @@ func (c *Conn) writeLoop() {
 			if f.done == nil {
 				c.posted -= len(f.b)
 			}
+			c.writing = true
 			c.qmu.Unlock()
 
 			_ = c.nc.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout))
@@ -944,6 +1055,13 @@ func (c *Conn) writeLoop() {
 			if f.done != nil {
 				f.done <- err
 			}
+			c.qmu.Lock()
+			c.writing = false
+			if len(c.queue) == 0 && c.written != nil {
+				close(c.written)
+				c.written = nil
+			}
+			c.qmu.Unlock()
 			if err != nil {
 				return
 			}

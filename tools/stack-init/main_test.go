@@ -18,6 +18,15 @@ const (
 	domain   = "ims.mnc001.mcc001.3gppnetwork.org"
 )
 
+// Made-up test keys, one pair per subscriber, not a SIM's.
+const (
+	clientK, clientOPc = "00112233445566778899aabbccddeeff", "ffeeddccbbaa99887766554433221100"
+	peerK, peerOPc     = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
+)
+
+// keyEnv is the four key variables, with the made-up keys.
+var keyEnv = []string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", peerOPc}
+
 func env(kv ...string) func(string) (string, bool) {
 	m := map[string]string{}
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -46,8 +55,10 @@ func TestUsageAndMissingSettingsExitWithTwo(t *testing.T) {
 		{"tables without endpoints", nil, []string{"tables"}, "STACK_DYNAMODB_ENDPOINT is required"},
 		{"tables without a bucket", []string{"STACK_DYNAMODB_ENDPOINT", "http://ddb:8000", "STACK_S3_ENDPOINT", "http://s3:9090"}, []string{"tables"}, "FT_S3_BUCKET is required"},
 		{"seed without tokens", []string{"RCS_IMS_DOMAIN", domain}, []string{"seed"}, "HSS_ADMIN_TOKEN is required"},
-		{"seed with a bad URL", []string{"HSS_ADMIN_TOKEN", "x", "ACS_ADMIN_TOKEN", "y", "RCS_IMS_DOMAIN", domain,
-			"FT_UPLOAD_URI", "u", "FT_DOWNLOAD_URI", "d", "STACK_ACS_URL", "acs:8080"}, []string{"seed"}, "http(s) URLs"},
+		{"seed with a bad URL", append([]string{"HSS_ADMIN_TOKEN", "x", "ACS_ADMIN_TOKEN", "y", "RCS_IMS_DOMAIN", domain,
+			"FT_UPLOAD_URI", "u", "FT_DOWNLOAD_URI", "d", "STACK_ACS_URL", "acs:8080"}, keyEnv...), []string{"seed"}, "http(s) URLs"},
+		{"seed without keys", []string{"HSS_ADMIN_TOKEN", "x", "ACS_ADMIN_TOKEN", "y", "RCS_IMS_DOMAIN", domain,
+			"FT_UPLOAD_URI", "u", "FT_DOWNLOAD_URI", "d"}, []string{"seed"}, "RCS_SIM_AKA_K is required"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			code, _, errOut := runCmd(t, env(tt.env...), tt.args...)
@@ -69,31 +80,43 @@ func TestTablesDefaultToTheServicesOwnNames(t *testing.T) {
 	}
 }
 
-// fakes is an hss and an acs that record what they were sent.
+// fakes is an hss and an acs that record what they were sent: the
+// subscriptions in order, and the AKA keys and acs subscribers by path.
 type fakes struct {
 	mu        sync.Mutex
-	hssStatus []int // answered in turn; the last repeats
+	hssStatus []int // answered in turn to POST /v1/subscriptions; the last repeats
+	akaStatus int
 	acsStatus int
 	hssCalls  int
-	hssBody   map[string]any
-	acsBody   map[string]any
-	acsPath   string
+	hssBodies []map[string]any
+	akaBodies map[string]map[string]any
+	acsBodies map[string]map[string]any
 	hss, acs  *httptest.Server
 }
 
 func newFakes(t *testing.T, hssStatus []int, acsStatus int) *fakes {
-	f := &fakes{hssStatus: hssStatus, acsStatus: acsStatus}
+	f := &fakes{hssStatus: hssStatus, akaStatus: http.StatusNoContent, acsStatus: acsStatus,
+		akaBodies: map[string]map[string]any{}, acsBodies: map[string]map[string]any{}}
 	f.hss = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if r.Header.Get("Authorization") != "Bearer "+hssToken || r.Method != http.MethodPost || r.URL.Path != "/v1/subscriptions" {
+		var body map[string]any
+		switch {
+		case r.Header.Get("Authorization") != "Bearer "+hssToken:
 			w.WriteHeader(http.StatusUnauthorized)
-			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/subscriptions":
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.hssBodies = append(f.hssBodies, body)
+			st := f.hssStatus[min(f.hssCalls, len(f.hssStatus)-1)]
+			f.hssCalls++
+			w.WriteHeader(st)
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/aka"):
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.akaBodies[r.URL.Path] = body
+			w.WriteHeader(f.akaStatus)
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		_ = json.NewDecoder(r.Body).Decode(&f.hssBody)
-		st := f.hssStatus[min(f.hssCalls, len(f.hssStatus)-1)]
-		f.hssCalls++
-		w.WriteHeader(st)
 	}))
 	f.acs = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -102,8 +125,9 @@ func newFakes(t *testing.T, hssStatus []int, acsStatus int) *fakes {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		f.acsPath = r.URL.Path
-		_ = json.NewDecoder(r.Body).Decode(&f.acsBody)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.acsBodies[r.URL.Path] = body
 		w.WriteHeader(f.acsStatus)
 	}))
 	t.Cleanup(f.hss.Close)
@@ -113,10 +137,10 @@ func newFakes(t *testing.T, hssStatus []int, acsStatus int) *fakes {
 
 func (f *fakes) config(t *testing.T) seedConfig {
 	t.Helper()
-	c, err := readSeedConfig(environment{lookup: env(
+	c, err := readSeedConfig(environment{lookup: env(append([]string{
 		"STACK_HSS_API", f.hss.URL, "STACK_ACS_URL", f.acs.URL,
 		"HSS_ADMIN_TOKEN", hssToken, "ACS_ADMIN_TOKEN", acsToken, "RCS_IMS_DOMAIN", domain,
-		"FT_UPLOAD_URI", "http://ft-server:8081/ft", "FT_DOWNLOAD_URI", "http://ft-server:8081/dl")})
+		"FT_UPLOAD_URI", "http://ft-server:8081/ft", "FT_DOWNLOAD_URI", "http://ft-server:8081/dl"}, keyEnv...)...)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,26 +148,94 @@ func (f *fakes) config(t *testing.T) seedConfig {
 	return c
 }
 
-func TestSeedProvisionsTheSubscriberInBothServices(t *testing.T) {
+func TestSeedProvisionsBothSubscribersInBothServices(t *testing.T) {
 	f := newFakes(t, []int{http.StatusCreated}, http.StatusOK)
 	var out bytes.Buffer
 	if err := seed(context.Background(), f.config(t), &out); err != nil {
 		t.Fatal(err)
 	}
-	ids, _ := f.hssBody["public_identities"].([]any)
-	first, _ := ids[0].(map[string]any)
-	if f.hssBody["impi"] != "001010000000001@"+domain || f.hssBody["imsi"] != "001010000000001" ||
-		first["impu"] != "sip:+15550100001@"+domain || f.hssBody["acs_managed"] != true {
-		t.Fatalf("hss got %v", f.hssBody)
+	for i, want := range []struct{ imsi, msisdn, k, opc string }{
+		{"001010000000001", "+15550100001", clientK, clientOPc},
+		{"001010000000002", "+15550100002", peerK, peerOPc},
+	} {
+		impi := want.imsi + "@" + domain
+		body := f.hssBodies[i]
+		ids, _ := body["public_identities"].([]any)
+		first, _ := ids[0].(map[string]any)
+		if body["impi"] != impi || body["imsi"] != want.imsi || first["impu"] != "sip:"+want.msisdn+"@"+domain || body["acs_managed"] != true {
+			t.Fatalf("hss got %v", body)
+		}
+		// Each subscriber its own keys (#236).
+		if aka := f.akaBodies["/v1/subscriptions/"+impi+"/aka"]; aka["k"] != want.k || aka["opc"] != want.opc {
+			t.Fatalf("hss AKA for %s got %v", want.imsi, aka)
+		}
+		acs := f.acsBodies["/admin/subscribers/"+want.imsi]
+		o, _ := acs["overrides"].(map[string]any)
+		if acs["msisdn"] != want.msisdn ||
+			o[keyFTUpload] != "http://ft-server:8081/ft" || o[keyFTDownload] != "http://ft-server:8081/dl" ||
+			o[keyPCSCF] != "pcscf" || o[keyPCSCFDM] != "pcscf" || o[keyConfFactory] != "sip:conf-factory@"+domain {
+			t.Fatalf("acs got %v for %s", acs, want.imsi)
+		}
 	}
-	o, _ := f.acsBody["overrides"].(map[string]any)
-	if f.acsPath != "/admin/subscribers/001010000000001" || f.acsBody["msisdn"] != "+15550100001" ||
-		o[keyFTUpload] != "http://ft-server:8081/ft" || o[keyFTDownload] != "http://ft-server:8081/dl" ||
-		o[keyPCSCF] != "pcscf" || o[keyPCSCFDM] != "pcscf" || o[keyConfFactory] != "sip:conf-factory@"+domain {
-		t.Fatalf("acs got %s %v", f.acsPath, f.acsBody)
+	for _, secret := range []string{hssToken, acsToken, clientK, clientOPc, peerK, peerOPc, "001010000000001", "001010000000002", "+15550100001", "+15550100002"} {
+		if strings.Contains(out.String(), secret) {
+			t.Fatalf("the output carries %q: %s", secret, out.String())
+		}
 	}
-	if strings.Contains(out.String(), hssToken) || strings.Contains(out.String(), acsToken) {
-		t.Fatal("the output carries a token")
+}
+
+func TestSeedNeedsEachSubscribersOwnKeys(t *testing.T) {
+	// Keys from the environment, 32 hex digits, and never one pair for
+	// both subscribers (#236). The error names variables, never values.
+	base := []string{"HSS_ADMIN_TOKEN", hssToken, "ACS_ADMIN_TOKEN", acsToken, "RCS_IMS_DOMAIN", domain,
+		"FT_UPLOAD_URI", "u", "FT_DOWNLOAD_URI", "d"}
+	for name, tc := range map[string]struct {
+		keys []string
+		want string
+	}{
+		"peer's K missing":            {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "RCS_SIM_PEER_AKA_K is required"},
+		"not hex":                     {[]string{"RCS_SIM_AKA_K", "zz" + clientK[2:], "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "RCS_SIM_AKA_K is not 32 hexadecimal digits"},
+		"shared K":                    {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", strings.ToUpper(clientK), "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the test subscribers' four AKA keys must all differ"},
+		"shared OPc":                  {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", clientOPc}, "the test subscribers' four AKA keys must all differ"},
+		"a K that is another's OPc":   {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientOPc, "RCS_SIM_PEER_AKA_K", clientOPc, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the test subscribers' four AKA keys must all differ"},
+		"a subscriber's K is its OPc": {[]string{"RCS_SIM_AKA_K", clientK, "RCS_SIM_AKA_OPC", clientK, "RCS_SIM_PEER_AKA_K", peerK, "RCS_SIM_PEER_AKA_OPC", peerOPc}, "the test subscribers' four AKA keys must all differ"},
+		"same IMSI":                   {append([]string{"STACK_PEER_IMSI", "001010000000001"}, keyEnv...), "the two test subscribers need their own IMSI and MSISDN"},
+		"same MSISDN":                 {append([]string{"STACK_PEER_MSISDN", "+15550100001"}, keyEnv...), "the two test subscribers need their own IMSI and MSISDN"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := readSeedConfig(environment{lookup: env(append(append([]string{}, base...), tc.keys...)...)})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("readSeedConfig = %v, want %q", err, tc.want)
+			}
+			for _, v := range []string{clientK, clientOPc, peerK, peerOPc} {
+				if strings.Contains(strings.ToLower(err.Error()), v) {
+					t.Fatalf("the error carries a key: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestSeedSetsTheKeysOfASubscriptionThatExists(t *testing.T) {
+	// A re-run, or keys changed in deploy/compose.env: the subscription
+	// exists (409), and its keys are set all the same.
+	f := newFakes(t, []int{http.StatusConflict}, http.StatusOK)
+	if err := seed(context.Background(), f.config(t), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	for impi, want := range map[string][2]string{"001010000000001@" + domain: {clientK, clientOPc}, "001010000000002@" + domain: {peerK, peerOPc}} {
+		if aka := f.akaBodies["/v1/subscriptions/"+impi+"/aka"]; aka["k"] != want[0] || aka["opc"] != want[1] {
+			t.Fatalf("AKA for %s: %v", impi, aka)
+		}
+	}
+}
+
+func TestSeedNamesTheSubscriberWhoseKeysAreRefused(t *testing.T) {
+	f := newFakes(t, []int{http.StatusCreated}, http.StatusOK)
+	f.akaStatus = http.StatusBadRequest
+	err := seed(context.Background(), f.config(t), &bytes.Buffer{})
+	if err == nil || err.Error() != "client: hss: set AKA keys: HTTP 400" {
+		t.Fatalf("seed = %v", err)
 	}
 }
 
@@ -154,7 +246,7 @@ func TestSeedIsIdempotentAndWaitsForABusyService(t *testing.T) {
 	if err := seed(context.Background(), f.config(t), &out); err != nil {
 		t.Fatal(err)
 	}
-	if f.hssCalls != 3 || !strings.Contains(out.String(), "exists") {
+	if f.hssCalls != 4 || !strings.Contains(out.String(), "hss: client test subscription exists") || !strings.Contains(out.String(), "hss: peer test subscription exists") {
 		t.Fatalf("%d calls, output %q", f.hssCalls, out.String())
 	}
 }
@@ -175,9 +267,9 @@ func TestSeedFailsOnARefusalWithoutNamingTheToken(t *testing.T) {
 
 func TestSeedRunsFromTheCommandLine(t *testing.T) {
 	f := newFakes(t, []int{http.StatusCreated}, http.StatusForbidden)
-	code, _, errOut := runCmd(t, env("STACK_HSS_API", f.hss.URL, "STACK_ACS_URL", f.acs.URL,
+	code, _, errOut := runCmd(t, env(append([]string{"STACK_HSS_API", f.hss.URL, "STACK_ACS_URL", f.acs.URL,
 		"HSS_ADMIN_TOKEN", hssToken, "ACS_ADMIN_TOKEN", acsToken, "RCS_IMS_DOMAIN", domain,
-		"FT_UPLOAD_URI", "u", "FT_DOWNLOAD_URI", "d"), "seed")
+		"FT_UPLOAD_URI", "u", "FT_DOWNLOAD_URI", "d"}, keyEnv...)...), "seed")
 	if code != exitFailed || !strings.Contains(errOut, "HTTP 403") {
 		t.Fatalf("exit %d, stderr %q", code, errOut)
 	}

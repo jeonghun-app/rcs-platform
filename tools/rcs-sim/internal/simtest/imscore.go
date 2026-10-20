@@ -3,6 +3,7 @@ package simtest
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"net/netip"
 	"strconv"
@@ -29,8 +30,11 @@ type IMSCore struct {
 	// Domain is the home domain, the Digest realm.
 	Domain string
 	// Rewrite, when set before any request, changes each request the core
-	// forwards, as a faulty network element would. It runs on the reading
-	// goroutine of the sender's connection, so it must not block.
+	// forwards or sends, NOTIFYs included, as a faulty network element
+	// would. It must not block: it runs on the reading goroutine of the
+	// sender's connection for a request it forwards, and on the notifier's
+	// goroutine for a NOTIFY, so two calls may run at once and a Rewrite
+	// that keeps state must lock it.
 	Rewrite func(*sip.Request)
 	// Offline, when set before any request, is what the core does with a
 	// request to an IMPU that has no binding.
@@ -49,6 +53,39 @@ type IMSCore struct {
 	// the requests StoreAndForward holds for it, by aorKey.
 	instances map[string]string
 	stored    map[string][]*sip.Request
+	// contacts are each IMPU's registered Contact URI, and subs the reg
+	// event subscriptions to it (RFC 3680), by aorKey.
+	contacts map[string]string
+	// events are the event that last changed each IMPU's contact, which a
+	// NOTIFY that does not change it writes again (RFC 3680 §4.7.1).
+	events map[string]string
+	subs   map[string][]*regSub
+	// notifies sends NOTIFYs one at a time, in the order they were made,
+	// off the reading goroutine.
+	notifies chan func()
+	stop     chan struct{}
+}
+
+// regSub is one subscription to an IMPU's reg event, from the notifier's
+// side.
+type regSub struct {
+	impu, callID, from, tag string
+	target                  sip.URI
+	flow                    transport.FlowID
+	cseq                    uint32
+	version                 uint64
+	// until is when the subscription expires, as granted: a NOTIFY says
+	// what is left of it and never more (RFC 6665 §4.1.3).
+	until time.Time
+}
+
+// left is what remains of s, in whole seconds, rounded up; c.mu is held.
+func (s *regSub) left() uint64 {
+	d := time.Until(s.until)
+	if d <= 0 {
+		return 0
+	}
+	return uint64((d + time.Second - 1) / time.Second)
 }
 
 // Offline is what IMSCore does with a request to an unregistered IMPU.
@@ -63,6 +100,11 @@ const (
 	StoreAndForward
 	// Drop answers 200 and loses the request, as a faulty element would.
 	Drop
+	// RefuseNotFound answers 404, a refusal other than the platform's.
+	RefuseNotFound
+	// StoreAndChange is StoreAndForward with the stored message's text
+	// changed, as a faulty store would.
+	StoreAndChange
 )
 
 // aorKey is how bindings are keyed: scheme, user and host (case folded),
@@ -95,7 +137,19 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	c := &IMSCore{
 		Domain: domain, t: t, ds: ds, users: users,
 		bindings: map[string]transport.FlowID{}, instances: map[string]string{}, stored: map[string][]*sip.Request{},
+		contacts: map[string]string{}, events: map[string]string{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
 	}
+	go func() {
+		for {
+			select {
+			case f := <-c.notifies:
+				f()
+			case <-c.stop:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { close(c.stop) })
 	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) { c.layer.Receive(in) })
 	if err != nil {
 		t.Fatal(err)
@@ -133,19 +187,47 @@ func (c *IMSCore) Instance(impu string) string {
 }
 
 // Expire drops impu's binding, as its expiry would: requests to it then
-// get what Offline says until it registers again.
-func (c *IMSCore) Expire(impu string) {
+// get what Offline says until it registers again, and its reg event
+// subscribers are told the contact expired (RFC 3680 §4.7.1), which ends
+// their subscriptions.
+func (c *IMSCore) Expire(impu string) { c.end(impu, "expired") }
+
+// Deregister ends impu's registration from the network side, as the
+// S-CSCF does on the HSS's Registration-Termination-Request (TS 24.229
+// §5.4.1.5): its contact terminates with event, "deactivated" (the client
+// may register again) or "rejected" (it may not), and so do the
+// subscriptions to its reg event.
+func (c *IMSCore) Deregister(impu, event string) { c.end(impu, event) }
+
+func (c *IMSCore) end(impu, event string) {
+	key := keyOf(impu)
 	c.mu.Lock()
-	delete(c.bindings, keyOf(impu))
+	_, bound := c.bindings[key]
+	contact := c.contacts[key]
+	delete(c.bindings, key)
+	delete(c.contacts, key)
+	delete(c.events, key)
 	c.mu.Unlock()
+	if bound {
+		c.registrationChanged(regChange{key: key, contact: contact, event: event})
+	}
 }
 
 // Request implements transaction.TU.
 func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 	req := tx.Request()
-	switch req.Method {
-	case "REGISTER":
-		c.respond(tx, c.register(tx))
+	switch {
+	case req.Method == "REGISTER":
+		res, change, deliver := c.register(tx)
+		c.respond(tx, res)
+		if deliver != nil {
+			go deliver()
+		}
+		if change != nil {
+			c.registrationChanged(*change)
+		}
+	case req.Method == "SUBSCRIBE" && strings.EqualFold(eventPackage(req), "reg"):
+		c.subscribe(tx)
 	default:
 		c.route(tx)
 	}
@@ -175,8 +257,10 @@ func (c *IMSCore) respond(tx *transaction.ServerTransaction, res *sip.Response) 
 
 // register answers a REGISTER: 401 until it has Digest credentials that
 // verify, then 200 with the binding, Require: outbound and a Service-Route.
-// Expires: 0 removes the binding.
-func (c *IMSCore) register(tx *transaction.ServerTransaction) *sip.Response {
+// Expires: 0 removes the binding. deliver, when not nil, sends what
+// StoreAndForward held for the IMPU; the caller runs it once the 200 has
+// gone, so the client is registered when the requests come.
+func (c *IMSCore) register(tx *transaction.ServerTransaction) (*sip.Response, *regChange, func()) {
 	req := tx.Request()
 	tag, _ := c.ids.Tag()
 	creds, err := digest.ParseCredentials(req.Header.Get("Authorization"))
@@ -184,44 +268,54 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) *sip.Response {
 		res, _ := sip.NewResponse(req, 401, "", tag)
 		ch, _ := c.ds.Challenge(digest.SHA256, false)
 		res.Header.Add("WWW-Authenticate", ch.Header())
-		return res
+		return res, nil, nil
 	}
 	password, known := c.users[creds.Username]
 	if !known || c.ds.Verify(context.Background(), "REGISTER", creds, digest.Password([]byte(password))) != nil {
 		res, _ := sip.NewResponse(req, 403, "", tag)
-		return res
+		return res, nil, nil
 	}
 	to, err := req.Header.To()
 	if err != nil {
 		res, _ := sip.NewResponse(req, 400, "", tag)
-		return res
+		return res, nil, nil
 	}
 	expires, _ := req.Header.Expires()
 	impu, key := to.URI.String(), aorKey(to.URI)
 	res, _ := sip.NewResponse(req, 200, "", tag)
+	change := &regChange{key: key, event: "registered"}
 	var held []*sip.Request
 	c.mu.Lock()
+	if _, was := c.bindings[key]; was {
+		change.event = "refreshed"
+	}
 	if expires == 0 {
 		delete(c.bindings, key)
+		change.contact, change.event = c.contacts[key], "unregistered"
+		delete(c.contacts, key)
+		delete(c.events, key)
 	} else {
+		c.events[key] = change.event
 		c.bindings[key] = tx.Source().Flow
 		if contacts, err := req.Header.Contact(); err == nil && len(contacts) > 0 {
+			c.contacts[key] = contacts[0].URI.String()
 			if inst, ok := contacts[0].Instance(); ok {
 				c.instances[key] = inst
 			}
 		}
+		change.contact = c.contacts[key]
 		held = c.stored[key]
 		delete(c.stored, key)
 	}
 	c.mu.Unlock()
+	var deliver func()
 	if len(held) > 0 {
-		// After the 2xx has gone, so the client knows it is registered.
 		flow := tx.Source().Flow
-		go func() {
+		deliver = func() {
 			for _, fwd := range held {
 				_, _ = c.layer.Request(fwd, transport.Destination{Flow: flow}, func(*sip.Response, error) {})
 			}
-		}()
+		}
 	}
 	if expires > 0 {
 		if contacts, err := req.Header.Contact(); err == nil {
@@ -234,7 +328,189 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) *sip.Response {
 		res.Header.Add("Service-Route", "<sip:orig@scscf.core.invalid;lr>")
 		res.Header.Add("P-Associated-URI", "<"+impu+">")
 	}
-	return res
+	return res, change, deliver
+}
+
+// regChange is what changed an IMPU's registration, by its aorKey: its
+// contact, and the event that changed it (RFC 3680 §4.7.1).
+type regChange struct {
+	key, contact, event string
+}
+
+// registrationChanged notifies every subscriber of the IMPU's reg event
+// (RFC 3680 §4.7). One that ends the registration, the IMPU's only one
+// here, ends the subscriptions (TS 24.229 §5.4.2.1.2): with no reason after
+// the user's de-registration, "noresource" after an expiry, and as the
+// network ended it, "deactivated" or "rejected" (RFC 6665 §4.1.3).
+func (c *IMSCore) registrationChanged(ch regChange) {
+	gone, terminated := true, "terminated"
+	switch ch.event {
+	case "unregistered":
+	case "expired":
+		terminated += ";reason=noresource"
+	case "deactivated", "rejected":
+		terminated += ";reason=" + ch.event
+	default:
+		gone = false
+	}
+	c.mu.Lock()
+	subs := c.subs[ch.key]
+	states := make([]string, len(subs))
+	for i, s := range subs {
+		states[i] = "active;expires=" + strconv.FormatUint(s.left(), 10)
+		if gone {
+			states[i] = terminated
+		}
+	}
+	if gone {
+		delete(c.subs, ch.key)
+	}
+	c.mu.Unlock()
+	for i, s := range subs {
+		c.notify(s, states[i], ch.contact, ch.event, !gone)
+	}
+}
+
+// subscribe answers a SUBSCRIBE to an IMPU's reg event (RFC 3680, TS
+// 24.229 §5.4.2.1): 200, then a NOTIFY with the full state. Expires: 0
+// ends the subscription with a final NOTIFY.
+func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
+	req := tx.Request()
+	tag, _ := c.ids.Tag()
+	to, err1 := req.Header.To()
+	contacts, err2 := req.Header.Contact()
+	if err1 != nil || err2 != nil || len(contacts) == 0 {
+		res, _ := sip.NewResponse(req, 400, "", tag)
+		c.respond(tx, res)
+		return
+	}
+	impu, key := sip.URI{Scheme: to.URI.Scheme, User: to.URI.User, Host: to.URI.Host}.String(), aorKey(to.URI)
+	callID := req.Header.Get("Call-ID")
+	expires, err := req.Header.Expires()
+	if err != nil {
+		// RFC 3680 §4.4's default.
+		expires = 3761
+	}
+	c.mu.Lock()
+	var s *regSub
+	for _, old := range c.subs[key] {
+		if old.callID == callID {
+			s = old
+		}
+	}
+	if s == nil && expires > 0 {
+		s = &regSub{impu: impu, callID: callID, from: req.Header.Get("From"), tag: tag, target: contacts[0].URI, flow: tx.Source().Flow}
+		c.subs[key] = append(c.subs[key], s)
+	}
+	if s != nil {
+		s.until = time.Now().Add(time.Duration(expires) * time.Second)
+	}
+	if s != nil && expires == 0 {
+		subs := c.subs[key][:0]
+		for _, old := range c.subs[key] {
+			if old != s {
+				subs = append(subs, old)
+			}
+		}
+		c.subs[key] = subs
+	}
+	contact, registered := c.contacts[key]
+	event := c.events[key]
+	c.mu.Unlock()
+	if s == nil {
+		res, _ := sip.NewResponse(req, 481, "", tag)
+		c.respond(tx, res)
+		return
+	}
+	res, _ := sip.NewResponse(req, 200, "", s.tag)
+	res.Header.Add("Contact", "<sip:core.invalid:5060;transport=tcp>")
+	res.Header.Add("Expires", strconv.FormatUint(uint64(expires), 10))
+	c.respond(tx, res)
+	// The contact as it stands, with the event that made it so (RFC 3680
+	// §4.7.1, TS 24.229 §5.4.2.1.2 NOTE 10): the subscription's end does
+	// not change the registration.
+	switch {
+	case expires == 0:
+		c.notify(s, "terminated;reason=timeout", contact, event, registered)
+	default:
+		c.notify(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered)
+	}
+}
+
+// notify queues a NOTIFY of s's next version: the IMPU's one contact,
+// active with event, or terminated.
+func (c *IMSCore) notify(s *regSub, state, contact, event string, active bool) {
+	send := func() {
+		branch, _ := c.ids.Branch()
+		req := &sip.Request{Method: "NOTIFY", URI: s.target}
+		s.cseq++
+		regState, contactState := "active", "active"
+		if !active {
+			regState, contactState = "terminated", "terminated"
+		}
+		body := `<?xml version="1.0"?><reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="` + strconv.FormatUint(s.version, 10) + `" state="full">` +
+			`<registration aor="` + xmlText(s.impu) + `" id="r1" state="` + regState + `">`
+		if contact != "" {
+			body += `<contact id="c1" state="` + contactState + `" event="` + event + `" expires="3600"><uri>` + xmlText(contact) + `</uri></contact>`
+		}
+		body += `</registration></reginfo>`
+		s.version++
+		for _, f := range [][2]string{
+			{"Via", "SIP/2.0/TCP core.invalid;branch=" + branch},
+			{"Max-Forwards", "70"},
+			{"From", "<" + s.impu + ">;tag=" + s.tag},
+			{"To", s.from},
+			{"Call-ID", s.callID},
+			{"CSeq", strconv.FormatUint(uint64(s.cseq), 10) + " NOTIFY"},
+			{"Contact", "<sip:core.invalid:5060;transport=tcp>"},
+			{"Event", "reg"},
+			{"Subscription-State", state},
+			{"Content-Type", "application/reginfo+xml"},
+		} {
+			if err := req.Header.Add(f[0], f[1]); err != nil {
+				return
+			}
+		}
+		req.Body = []byte(body)
+		if c.Rewrite != nil {
+			c.Rewrite(req)
+		}
+		done := make(chan struct{})
+		if _, err := c.layer.Request(req, transport.Destination{Flow: s.flow}, func(res *sip.Response, err error) {
+			if err != nil || res.StatusCode >= 200 {
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
+			}
+		}); err != nil {
+			return
+		}
+		// One at a time, so the versions reach the subscriber in order.
+		select {
+		case <-done:
+		case <-c.stop:
+		}
+	}
+	select {
+	case c.notifies <- send:
+	case <-c.stop:
+	}
+}
+
+// eventPackage is the package of req's Event header, without its
+// parameters (RFC 6665 §8.2.1).
+func eventPackage(req *sip.Request) string {
+	pkg, _, _ := strings.Cut(req.Header.Get("Event"), ";")
+	return strings.TrimSpace(pkg)
+}
+
+// xmlText escapes s for an XML attribute or text node.
+func xmlText(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
 }
 
 func (c *IMSCore) flowFor(uri sip.URI) (transport.FlowID, bool) {
@@ -261,7 +537,10 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	case err != nil:
 		answer(500)
 		return
-	case !ok && c.Offline == StoreAndForward && req.Method == "MESSAGE":
+	case !ok && (c.Offline == StoreAndForward || c.Offline == StoreAndChange) && req.Method == "MESSAGE":
+		if c.Offline == StoreAndChange {
+			fwd.Body = bytes.Replace(fwd.Body, []byte("pager-mode message"), []byte("pager-mode messagf"), 1)
+		}
 		c.mu.Lock()
 		c.stored[aorKey(req.URI)] = append(c.stored[aorKey(req.URI)], fwd)
 		c.mu.Unlock()
@@ -269,6 +548,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 		return
 	case !ok && c.Offline == Drop:
 		answer(200)
+		return
+	case !ok && c.Offline == RefuseNotFound:
+		answer(404)
 		return
 	case !ok:
 		answer(480)

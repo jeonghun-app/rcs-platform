@@ -3,7 +3,9 @@ package state
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -571,6 +574,10 @@ type Challenge struct {
 	// after a resynchronisation (TS 33.102 §6.3.5): a further synchronisation
 	// failure for it is not sent to the HSS again.
 	Resynchronised bool
+	// Flow is the FlowScope of the P-CSCF flow the challenged REGISTER came
+	// over, "" without one: an AUTS that answers the challenge over the same
+	// flow is the same client's (registrar limits).
+	Flow string
 }
 
 // challengeRedacted is what a Challenge prints and logs.
@@ -653,7 +660,7 @@ func (c *Challenge) Validate() error {
 	if err := identity.ValidIMPI(c.IMPI); err != nil {
 		return fmt.Errorf("%w: challenge IMPI: %w", ErrInvalid, err)
 	}
-	if !KeyOK(c.Nonce, MaxNonce) || !textOK(c.IMPU) {
+	if !KeyOK(c.Nonce, MaxNonce) || !textOK(c.IMPU) || strings.HasPrefix(c.Nonce, ReservedNoncePrefix) {
 		return fmt.Errorf("%w: a challenge needs a nonce of 1 to %d bytes", ErrInvalid, MaxNonce)
 	}
 	if !validTime(c.Issued) || !c.Expires.After(c.Issued) || c.Expires.Sub(c.Issued) > MaxChallengeLifetime {
@@ -664,6 +671,9 @@ func (c *Challenge) Validate() error {
 	}
 	if c.Resynchronised && c.AKA == nil {
 		return fmt.Errorf("%w: only an AKA challenge is resynchronised", ErrInvalid)
+	}
+	if c.Flow != "" && !validScope(c.Flow) {
+		return fmt.Errorf("%w: a challenge's flow is a FlowScope", ErrInvalid)
 	}
 	return nil
 }
@@ -703,6 +713,59 @@ type Challenges interface {
 	// mean the challenge is unusable: the S-CSCF challenges again with a 401,
 	// rather than failing the REGISTER.
 	TakeChallenge(ctx context.Context, impi, nonce string, now time.Time) (*Challenge, error)
+	// CountAttempt adds n, 1 or -1 to give back an attempt that came to
+	// nothing, to the count a names, and returns the count after. Every
+	// instance counts into the same count, which is kept until expires. A
+	// resent request may count twice: that errs on the side of the limit.
+	CountAttempt(ctx context.Context, a Attempt, n int64, expires time.Time) (int64, error)
+}
+
+// ReservedNoncePrefix starts no challenge's nonce: the backends keep their
+// attempt counts beside the challenges, under keys that start with it. Digest
+// and AKA nonces are base64, which never contains it.
+const ReservedNoncePrefix = "#"
+
+// The kinds of CountAttempt: the challenges the S-CSCF issues, and the
+// resynchronisations among them.
+const (
+	AttemptChallenge = "challenge"
+	AttemptResync    = "resync"
+)
+
+// Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
+// window that starts at Window, for the IMPI as a whole (Scope "") or over
+// one P-CSCF flow (FlowScope).
+type Attempt struct {
+	IMPI, Kind, Scope string
+	Window            time.Time
+}
+
+// FlowScope is the Attempt scope of the P-CSCF flow whose token is in a
+// REGISTER's Path: a digest, so that what the store keeps is fixed in length
+// and alphabet whatever the token holds.
+func FlowScope(token string) string {
+	sum := sha256.Sum256([]byte("scscf/attempt-flow|" + token))
+	return hex.EncodeToString(sum[:16])
+}
+
+// ValidAttempt checks CountAttempt's arguments; the backends apply it.
+func ValidAttempt(a Attempt, n int64, expires time.Time) error {
+	if err := identity.ValidIMPI(a.IMPI); err != nil {
+		return fmt.Errorf("%w: attempt IMPI: %w", ErrInvalid, err)
+	}
+	if a.Kind != AttemptChallenge && a.Kind != AttemptResync {
+		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
+	}
+	if a.Scope != "" && !validScope(a.Scope) {
+		return fmt.Errorf("%w: an attempt scope is a FlowScope", ErrInvalid)
+	}
+	if n != 1 && n != -1 {
+		return fmt.Errorf("%w: an attempt counts 1 or -1", ErrInvalid)
+	}
+	if !validTime(a.Window) || !expires.After(a.Window) {
+		return fmt.Errorf("%w: an attempt window needs a start and a later expiry", ErrInvalid)
+	}
+	return nil
 }
 
 // Subscription is a subscription to the reg event package (RFC 3680) that the
@@ -860,4 +923,9 @@ func textOK(vs ...string) bool {
 		}
 	}
 	return true
+}
+
+// validScope reports whether s is what FlowScope returns.
+func validScope(s string) bool {
+	return len(s) == 32 && strings.Trim(s, "0123456789abcdef") == ""
 }

@@ -32,6 +32,8 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 	}
 	registered := isRegistered(cur)
 	own := registered && cur.Key.IMPI == r.impi
+	r.flow = pathFlow(r.path)
+	r.registeredFlow = own && overRegisteredFlow(cur, r.flow, g.cfg.Now())
 	if f := g.authenticate(ctx, r, own); f != nil {
 		if f.code == 401 && r.outbound {
 			// TS 24.229 §5.4.1.2.1: the 401 already says outbound applies.

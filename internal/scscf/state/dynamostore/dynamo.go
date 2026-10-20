@@ -52,7 +52,9 @@ const (
 	attrExpires = "expires"
 	attrCSeq    = "cseq"
 	attrRver    = "rver"
-	attrNToken  = "ntoken"
+	// attrCount is an attempt count (state.Challenges.CountAttempt).
+	attrCount  = "n"
+	attrNToken = "ntoken"
 	// attrNotifiedOf is the version of the set's record the last NOTIFY
 	// numbered carried (state.Subscription.NotifiedOf).
 	attrNotifiedOf = "nof"
