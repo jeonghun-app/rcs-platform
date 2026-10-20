@@ -2,7 +2,11 @@ package hss
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,5 +73,389 @@ func TestUnusableStoredSecretsAre500WithoutRetry(t *testing.T) {
 	}
 	if a.metrics.get("api.data_error") != 1 || a.metrics.get("api.store_failure") != 0 {
 		t.Error("a data error was counted as a store failure")
+	}
+}
+
+// losingStore refuses the first n subscription writes as lost to
+// another task, and counts every write.
+type losingStore struct {
+	store.Store
+	mu      sync.Mutex
+	n       int
+	written int
+}
+
+func (c *losingStore) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	c.mu.Lock()
+	c.written++
+	lose := c.n > 0
+	if lose {
+		c.n--
+	}
+	c.mu.Unlock()
+	if lose {
+		return nil, store.ErrConflict
+	}
+	return c.Store.UpdateSubscription(ctx, old, s)
+}
+
+// A request that read the subscription and then waited for its lock reads
+// it again: the request that held the lock most likely wrote it, and writing
+// from the first read cost every queued MAR a lost write (#200).
+func TestAnUpdateThatWaitedForTheLockReadsTheSubscriptionAgain(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	read, err := e.store.Subscription(context.Background(), impi1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := e.h.lock(context.Background(), impi1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{})
+	e.h.onLockWait = func() { close(waiting) }
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.h.updateFrom(context.Background(), impi1, read, func(s *store.Subscription) error {
+			s.ServerName = "sip:scscf-2.rcs.local"
+			return nil
+		})
+		done <- err
+	}()
+	<-waiting
+	// What the lock's holder writes before it lets go.
+	e.modify(impi1, func(s *store.Subscription) { s.ServerName = "sip:scscf-1.rcs.local" })
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := e.metrics.get("store.conflict"); got != 0 {
+		t.Errorf("%d lost writes, want none: the stale read was written from", got)
+	}
+	if got := e.sub(impi1).ServerName; got != "sip:scscf-2.rcs.local" {
+		t.Errorf("ServerName = %q", got)
+	}
+}
+
+// A write that keeps losing to another task is retried for as long as the
+// request has time, not a fixed handful of times: losing again is about as
+// likely after any wait while that task keeps writing, so a count gave up
+// MARs that had seconds left (#200). Without time, it stops at the deadline.
+func TestAWriteLosingToAnotherTaskIsRetriedUntilItsDeadline(t *testing.T) {
+	cs := &losingStore{Store: store.NewMemory(), n: 12}
+	e := newEnvWith(t, cs)
+	e.provision(impi1, impu1)
+	set := func(s *store.Subscription) error {
+		s.ServerName = "sip:scscf-1.rcs.local"
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), realWait)
+	defer cancel()
+	if _, err := e.h.update(ctx, impi1, set); err != nil {
+		t.Fatalf("after 12 lost writes: %v", err)
+	}
+	if cs.written != 13 || e.sub(impi1).ServerName != "sip:scscf-1.rcs.local" {
+		t.Errorf("%d writes, ServerName %q", cs.written, e.sub(impi1).ServerName)
+	}
+
+	cs.mu.Lock()
+	cs.n = 1 << 30
+	cs.mu.Unlock()
+	short, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := e.h.update(short, impi1, set)
+	// Still contention, not a slow store (#244 review).
+	if !errors.Is(err, errContention) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a write that never wins: %v, want contention at the deadline", err)
+	}
+	if took := time.Since(start); took > realWait/2 {
+		t.Errorf("gave up after %v; the deadline was 300ms", took)
+	}
+}
+
+// A provisioning write that keeps losing to another task is answered as a
+// busy subscription, not as a store outage, also when its retries run into
+// the request's deadline (#200 made them run until it): api.store_failure
+// stays 0 and nothing is logged as an error. From QA and code review on
+// #244.
+func TestContentionUntilTheAPIDeadlineIsBusyNotAStoreFailure(t *testing.T) {
+	cs := &losingStore{Store: store.NewMemory()}
+	e := newEnvWith(t, cs)
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
+		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		DefaultProfile: DefaultProfileID, StoreTimeout: 500 * time.Millisecond,
+	})}
+	a.create(impi1, true, impu1)
+	cs.mu.Lock()
+	cs.n = 1 << 30
+	cs.mu.Unlock()
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscription is busy; retry" {
+		t.Errorf("answer = %d %v", code, body)
+	}
+	if n := e.metrics.get("api.store_failure"); n != 0 {
+		t.Errorf("api.store_failure = %d: contention was counted as a store outage", n)
+	}
+	if strings.Contains(e.logs.String(), `"level":"ERROR"`) {
+		t.Errorf("contention was logged as an error: %s", e.logs.String())
+	}
+}
+
+// losingFor loses every write of one subscription, and reports the first.
+type losingFor struct {
+	store.Store
+	impi string
+	once sync.Once
+	lost chan struct{}
+}
+
+func (l *losingFor) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	if s.IMPI == l.impi {
+		l.once.Do(func() { close(l.lost) })
+		return nil, store.ErrConflict
+	}
+	return l.Store.UpdateSubscription(ctx, old, s)
+}
+
+// TestTwoSubscriptionsNeverWaitOnEachOther: each subscription has a lock
+// of its own, so a request that holds one through a contended update's
+// retries holds up no other subscription (QA's minor 3 on #244).
+func TestTwoSubscriptionsNeverWaitOnEachOther(t *testing.T) {
+	lf := &losingFor{Store: store.NewMemory(), impi: impi1, lost: make(chan struct{})}
+	e := newEnvWith(t, lf)
+	e.provision(impi1, impu1)
+	e.provision(impi2, impu2)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+		done <- err
+	}()
+	<-lf.lost
+	start := time.Now()
+	short, cancelShort := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelShort()
+	if _, err := e.h.update(short, impi2, func(s *store.Subscription) error { s.AuthPending = true; return nil }); err != nil {
+		t.Fatalf("the other subscription's update: %v", err)
+	}
+	if took := time.Since(start); took > 150*time.Millisecond {
+		t.Errorf("the other subscription waited %v", took)
+	}
+	if err := <-done; !errors.Is(err, errContention) {
+		t.Errorf("the contended update: %v", err)
+	}
+}
+
+// TestALockGoesWhenNoRequestHoldsIt: the locks of a task are as many as the
+// subscriptions being written, not every subscription ever written.
+func TestALockGoesWhenNoRequestHoldsIt(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	unlock, err := e.h.lock(context.Background(), impi1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := e.h.lock(short, impi1); !errors.Is(err, errBusy) {
+		t.Fatalf("a held lock: %v", err)
+	}
+	unlock()
+	if _, err := e.h.update(context.Background(), impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	e.h.locksMu.Lock()
+	defer e.h.locksMu.Unlock()
+	if len(e.h.locks) != 0 {
+		t.Errorf("%d locks left with no request", len(e.h.locks))
+	}
+}
+
+// readCounting counts subscription reads.
+type readCounting struct {
+	store.Store
+	mu    sync.Mutex
+	reads int
+}
+
+func (r *readCounting) Subscription(ctx context.Context, impi string) (*store.Subscription, error) {
+	r.mu.Lock()
+	r.reads++
+	r.mu.Unlock()
+	return r.Store.Subscription(ctx, impi)
+}
+
+// TestAnUncontendedMARReadsTheSubscriptionOnce: the Cx path writes from the
+// read it made before the lock when the lock was free, saving a read (QA's
+// nit 4 on #244).
+func TestAnUncontendedMARReadsTheSubscriptionOnce(t *testing.T) {
+	rc := &readCounting{Store: store.NewMemory()}
+	e := newEnvWith(t, rc)
+	e.provision(impi1, impu1)
+	c := connectCSCF(t, serveHSSWith(t, e.h, "hss-a.rcs.local", realWait), "scscf-1.rcs.local")
+	rc.mu.Lock()
+	rc.reads = 0
+	rc.mu.Unlock()
+	if maa := c.mar(impi1, impu1, cx.SchemeDigestAKAv1MD5, 1, scscfName, nil); maa.Result != resSuccess {
+		t.Fatalf("MAA %v", maa.Result)
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.reads != 1 {
+		t.Errorf("%d reads for one uncontended MAR, want 1", rc.reads)
+	}
+}
+
+// slowWinStore lets the first write through only just before its context's
+// deadline, as one that keeps losing to another task until then would.
+type slowWinStore struct {
+	store.Store
+	margin time.Duration
+}
+
+func (s *slowWinStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	if d, ok := ctx.Deadline(); ok {
+		time.Sleep(time.Until(d) - s.margin)
+	}
+	return s.Store.UpdateSubscription(ctx, old, n)
+}
+
+// deadlineNotifier records how much time each RTR had left.
+type deadlineNotifier struct {
+	recordingNotifier
+	left []time.Duration
+}
+
+func (n *deadlineNotifier) Deregister(ctx context.Context, r *cx.RTR) error {
+	if d, ok := ctx.Deadline(); ok {
+		n.left = append(n.left, time.Until(d))
+	}
+	return n.recordingNotifier.Deregister(ctx, r)
+}
+
+// TestARefusedPPRsRTRKeepsTimeAfterALateUpdate: the S-CSCF refused new data,
+// so the HSS marks the user not registered and deregisters it with
+// SERVER_CHANGE. An update that wins only at its deadline, behind another
+// task's writes, must not leave the RTR none (#244 review).
+func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	e.modify(impi1, func(s *store.Subscription) {
+		s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+	})
+	h := e.newHSS(func(o *Options) { o.Store = &slowWinStore{Store: e.store, margin: 20 * time.Millisecond} })
+	n := &deadlineNotifier{recordingNotifier: *newRecorder()}
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	h.pprRejected(ctx, n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData))
+	if e.sub(impi1).Identity(impu1).State != store.NotRegistered {
+		t.Fatal("the user was not marked not registered")
+	}
+	if len(n.left) != 1 || n.left[0] < 200*time.Millisecond {
+		t.Errorf("RTRs with time left %v, want one with a good share of the push's", n.left)
+	}
+}
+
+// stallingStore loses its first write and blocks the next one until the
+// context ends, then fails as DynamoDB does, with the context's error
+// wrapped.
+type stallingStore struct {
+	store.Store
+	mu     sync.Mutex
+	writes int
+}
+
+func (s *stallingStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	s.mu.Lock()
+	s.writes++
+	first := s.writes == 1
+	s.mu.Unlock()
+	if first {
+		return nil, store.ErrConflict
+	}
+	<-ctx.Done()
+	return nil, fmt.Errorf("update subscription: %w", ctx.Err())
+}
+
+// TestAWriteTheDeadlineCutsShortAfterALossIsContention: the DynamoDB path,
+// where the deadline ends a store call in flight rather than the backoff
+// (#244 review).
+func TestAWriteTheDeadlineCutsShortAfterALossIsContention(t *testing.T) {
+	ss := &stallingStore{Store: store.NewMemory()}
+	e := newEnvWith(t, ss)
+	e.provision(impi1, impu1)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+	if !errors.Is(err, errContention) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("update = %v, want contention at the deadline", err)
+	}
+}
+
+// qaInflight loses the first write, then behaves like DynamoDB on a slow
+// call: the next write is still in flight at the deadline and fails with the
+// SDK's wrapped context error (mode "deadline"), or fails at once with a
+// store error unrelated to the deadline (mode "outage"). From QA on #244.
+type qaInflight struct {
+	store.Store
+	mode string
+	mu   sync.Mutex
+	arm  bool
+	n    int
+}
+
+func (q *qaInflight) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	q.mu.Lock()
+	arm := q.arm
+	q.n++
+	n := q.n
+	q.mu.Unlock()
+	if !arm {
+		return q.Store.UpdateSubscription(ctx, old, s)
+	}
+	if n == 1 {
+		return nil, store.ErrConflict
+	}
+	if q.mode == "outage" {
+		return nil, errors.New("operation error DynamoDB: PutItem, https response error StatusCode: 500, InternalServerError")
+	}
+	<-ctx.Done()
+	return nil, fmt.Errorf("operation error DynamoDB: PutItem, %w", ctx.Err())
+}
+
+func inflightAPI(t *testing.T, mode string) *apiEnv {
+	q := &qaInflight{Store: store.NewMemory(), mode: mode}
+	e := newEnvWith(t, q)
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
+		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		DefaultProfile: DefaultProfileID, StoreTimeout: 500 * time.Millisecond,
+	})}
+	a.create(impi1, true, impu1)
+	q.mu.Lock()
+	q.arm, q.n = true, 0
+	q.mu.Unlock()
+	return a
+}
+
+// TestAWriteCutOffInFlightAfterALostOneIsBusy: contention, not a store
+// failure (QA on #244).
+func TestAWriteCutOffInFlightAfterALostOneIsBusy(t *testing.T) {
+	a := inflightAPI(t, "deadline")
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscription is busy; retry" || a.metrics.get("api.store_failure") != 0 {
+		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
+	}
+}
+
+// TestAStoreOutageAfterALostWriteIsAStoreFailure: only a context error is
+// contention; a store that fails is still one (QA on #244).
+func TestAStoreOutageAfterALostWriteIsAStoreFailure(t *testing.T) {
+	a := inflightAPI(t, "outage")
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscriber store is unavailable; retry" || a.metrics.get("api.store_failure") != 1 {
+		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
 	}
 }

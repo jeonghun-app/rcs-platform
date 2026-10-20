@@ -98,6 +98,28 @@ func TestARegEventPassesWhatTheRFCsAllow(t *testing.T) {
 				`<contact id="c0" state="active" event="registered" expires="600">`+uri+
 					`<unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact><contact id="c1"`, 1))
 		},
+		// QA on #253: the client's own +sip.instance written back in upper
+		// case is still the client's, and still told from another's.
+		"the client's instance in upper case": func(req *sip.Request) {
+			if req.Header.Get("CSeq") != "3 NOTIFY" {
+				return
+			}
+			_ = req.Header.Set("Subscription-State", "active;expires=600")
+			body := strings.Replace(string(req.Body), `id="r1" state="terminated"`, `id="r1" state="active"`, 1)
+			uri := regexp.MustCompile(`<uri>[^<]*</uri>`).FindString(body)
+			body = strings.Replace(body, `<contact id="c1"`,
+				`<contact id="c0" state="active" event="registered" expires="600">`+uri+
+					`<unknown-param name="+sip.instance">"&lt;urn:uuid:00000000-0000-4000-8000-000000000009&gt;"</unknown-param></contact><contact id="c1"`, 1)
+			req.Body = []byte(strings.Replace(body, `</uri></contact></registration>`,
+				`</uri><unknown-param name="+sip.instance">"&lt;URN:UUID:00000000-0000-4000-8000-000000000001&gt;"</unknown-param></contact></registration>`, 1))
+		},
+		// QA on #253: a network deregistration may end the subscription
+		// with noresource (RFC 6665 §4.1.3), unlike the user's.
+		"deregistered for noresource": func(req *sip.Request) {
+			if strings.HasPrefix(req.Header.Get("Subscription-State"), "terminated;reason=deactivated") {
+				_ = req.Header.Set("Subscription-State", "terminated;reason=noresource")
+			}
+		},
 		// A terminated subscription without a reason (RFC 6665 §4.1.3).
 		"unregister with timeout": func(req *sip.Request) {
 			if req.Header.Get("CSeq") == "3 NOTIFY" {
