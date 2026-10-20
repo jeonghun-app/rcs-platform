@@ -88,14 +88,16 @@ additionally sealed (below).
   the registrar counts it for the flow in the REGISTER's Path and the
   current window, and over a limit answers 500 with Retry-After without
   asking the HSS. A flow a live binding of the user came over is the
-  registered UE's: it has a budget of its own (default 6 a minute,
-  `RegisteredFlowChallengeLimit`) and nothing else. Any other flow has a
+  registered UE's while it stays on it: it has a budget of its own (default
+  6 a minute, `RegisteredFlowChallengeLimit`) and nothing else; a UE that
+  reconnects comes over a new flow. Any other flow has a
   small one (3, `FlowChallengeLimit`) and shares the IMPI's (10,
   `ChallengeLimit`, per `ChallengeWindow`). The limits count challenges, not
   MARs: a Digest subscriber's costs two MARs when the AKA one gets 5006. A
   challenge allows one resynchronisation (#196), and an IMPI three per
   challenge lifetime (`ResyncLimit`), the registered UE's flow apart; one the
-  HSS does not answer gives its slot back. Windows are fixed, so up to twice
+  HSS does not answer gives its slot back, and its challenge counts as a
+  challenge the HSS did not answer does. Windows are fixed, so up to twice
   a budget passes across an edge, and an instance whose clock is off counts
   into its own idea of the window. Every instance counts into the same items,
   beside the IMPI's challenges, which the table's TTL removes; an instance
@@ -113,7 +115,9 @@ additionally sealed (below).
 REGISTERs refused over a budget; neither carries an identifier. Alarm on
 `registrar.challenge_limited` (Sum over 5 minutes above a few dozen, or any
 sustained rate): it is how a flood against one subscriber shows, and a
-first registration of that subscriber is held back while it lasts (T12).
+first registration of that subscriber, or a registration over a new
+connection, is held back while it lasts (T12). While it is raised, postpone
+P-CSCF deploys and drains: each moves its clients to new connections.
 `registrar.internal_errors` with a store that cannot count says the counts
 are failing closed: every REGISTER that needs a challenge gets 500.
 

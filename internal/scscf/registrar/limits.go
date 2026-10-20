@@ -18,11 +18,12 @@ import (
 // They are split by the P-CSCF flow a REGISTER came over, the flow token in
 // its Path that only the P-CSCF writes (RFC 5626 §5.2). A REGISTER over a
 // flow a live binding of the user's registration came over is the registered
-// UE refreshing: it has a budget of its own for that flow and nothing else,
-// so that no one elsewhere can use it up. Every other REGISTER counts in a
-// small budget for its flow and in the IMPI's shared one, which a flood of
-// first registrations, from any flows, still exhausts: that is the risk left
-// (T12).
+// UE refreshing while it stays on that flow: it has a budget of its own for
+// that flow and nothing else, so that no one elsewhere can use it up. Every
+// other REGISTER counts in a small budget for its flow and in the IMPI's
+// shared one, which a flood of first registrations, from any flows, still
+// exhausts: that is the risk left, for a first registration and for a
+// registered UE that reconnects, whose new flow matches no binding (T12).
 //
 // The limits count challenges, not MARs: a Digest subscriber's challenge
 // costs two when the HSS answers the AKA one with 5006.
@@ -32,27 +33,34 @@ import (
 // rather than 503 (RFC 3261 §21.5.1): a 503 says the whole server is out of
 // service (§21.5.4), which an upstream proxy then shuns for every user, and
 // the P-CSCF tries other I-CSCFs on, counting the REGISTER again each time.
-func (g *Registrar) limitChallenges(ctx context.Context, r *register, now time.Time) *failure {
+//
+// It returns what it counted, which the caller gives back if the HSS does
+// not answer the challenge's MAR.
+func (g *Registrar) limitChallenges(ctx context.Context, r *register, now time.Time) ([]state.Attempt, *failure) {
 	window := g.cfg.ChallengeWindow
 	start := now.Truncate(window)
+	var counted []state.Attempt
 	if r.flow != "" {
 		limit := g.cfg.FlowChallengeLimit
 		if r.registeredFlow {
 			limit = g.cfg.RegisteredFlowChallengeLimit
 		}
-		over, f := g.over(ctx, state.Attempt{IMPI: r.impi, Kind: state.AttemptChallenge, Scope: state.FlowScope(r.flow), Window: start}, window, limit, now)
+		a := state.Attempt{IMPI: r.impi, Kind: state.AttemptChallenge, Scope: state.FlowScope(r.flow), Window: start}
+		over, f := g.over(ctx, a, window, limit, now)
 		if f != nil || over {
-			return g.challengeRefused(f, start.Add(window), now)
+			return nil, g.challengeRefused(f, start.Add(window), now)
 		}
+		counted = append(counted, a)
 	}
 	if r.registeredFlow {
-		return nil
+		return counted, nil
 	}
-	over, f := g.over(ctx, state.Attempt{IMPI: r.impi, Kind: state.AttemptChallenge, Window: start}, window, g.cfg.ChallengeLimit, now)
+	a := state.Attempt{IMPI: r.impi, Kind: state.AttemptChallenge, Window: start}
+	over, f := g.over(ctx, a, window, g.cfg.ChallengeLimit, now)
 	if f != nil || over {
-		return g.challengeRefused(f, start.Add(window), now)
+		return nil, g.challengeRefused(f, start.Add(window), now)
 	}
-	return nil
+	return append(counted, a), nil
 }
 
 func (g *Registrar) challengeRefused(f *failure, end, now time.Time) *failure {
@@ -85,11 +93,16 @@ func (g *Registrar) limitResyncs(ctx context.Context, r *register, now time.Time
 	return a, nil
 }
 
-// giveBack returns a's slot; failing that, it stays used until its window
-// ends.
-func (g *Registrar) giveBack(ctx context.Context, a state.Attempt) {
-	if _, err := g.cfg.Store.CountAttempt(ctx, a, -1, a.Window.Add(2*g.windowOf(a.Kind))); err != nil {
-		g.count("registrar.internal_errors")
+// giveBack returns the slots of as; failing that, a slot stays used until
+// its window ends. This instance's note that a count was over its limit
+// goes too, so that it does not refuse what the count now allows, as an
+// instance without the note would not.
+func (g *Registrar) giveBack(ctx context.Context, as ...state.Attempt) {
+	for _, a := range as {
+		g.notes.forget(a)
+		if _, err := g.cfg.Store.CountAttempt(ctx, a, -1, a.Window.Add(2*g.windowOf(a.Kind))); err != nil {
+			g.count("registrar.internal_errors")
+		}
 	}
 }
 
@@ -151,6 +164,12 @@ func (l *limitNotes) over(a state.Attempt, now time.Time) bool {
 	defer l.mu.Unlock()
 	end, ok := l.until[a]
 	return ok && now.Before(end)
+}
+
+func (l *limitNotes) forget(a state.Attempt) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.until, a)
 }
 
 func (l *limitNotes) note(a state.Attempt, end, now time.Time) {

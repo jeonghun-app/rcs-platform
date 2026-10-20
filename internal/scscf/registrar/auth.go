@@ -131,11 +131,17 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 	if !ok {
 		return refuse(403, "Unsupported algorithm")
 	}
-	if f := g.limitChallenges(ctx, r, g.cfg.Now()); f != nil {
+	counted, f := g.limitChallenges(ctx, r, g.cfg.Now())
+	if f != nil {
 		return f
 	}
 	maa, err := g.cfg.HSS.Authenticate(ctx, &cx.MAR{UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1}, schemes)
-	return g.challengeFrom(ctx, r, maa, err, stale, false)
+	f = g.challengeFrom(ctx, r, maa, err, stale, false)
+	if f.code == 480 {
+		// The HSS did not answer: the challenge came to nothing.
+		g.giveBack(ctx, counted...)
+	}
+	return f
 }
 
 // resynchronise sends the client's AUTS to the HSS (TS 33.102 §6.3.5) and
@@ -146,7 +152,8 @@ func (g *Registrar) challenge(ctx context.Context, r *register, stale bool) *fai
 // gets a vector back.
 func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest.SyncFailure) *failure {
 	now := g.cfg.Now()
-	if f := g.limitChallenges(ctx, r, now); f != nil {
+	counted, f := g.limitChallenges(ctx, r, now)
+	if f != nil {
 		return f
 	}
 	slot, f := g.limitResyncs(ctx, r, now)
@@ -161,9 +168,13 @@ func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest
 		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: auth},
 	})
 	f = g.challengeFrom(ctx, r, maa, err, false, true)
-	if f == nil || f.code != 401 {
-		// Nothing came of it: the slot is the UE's again.
+	if f.code != 401 {
+		// Nothing came of it: the slot is the UE's again, and the
+		// challenge too if the HSS did not answer.
 		g.giveBack(ctx, slot)
+		if f.code == 480 {
+			g.giveBack(ctx, counted...)
+		}
 	}
 	return f
 }

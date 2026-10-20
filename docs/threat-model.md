@@ -306,15 +306,20 @@ out.
 **Control:** the registrar counts the challenges of each IMPI in fixed
 windows shared by every `scscf` instance (DynamoDB atomic counters beside the
 challenges, with TTL), split by the P-CSCF flow token in the REGISTER's Path,
-which only the P-CSCF writes. A REGISTER over the flow of a live binding,
-the registered UE refreshing, counts in a budget of that flow alone, so a
-flood from elsewhere cannot use it up. Any other REGISTER counts in a small
+which only the P-CSCF writes: #198 removes any Path a client sends
+(`networkOnlyHeaders`) and puts its own on top (`prepareRegister`), and the
+token, an HMAC of the connection, cannot be guessed. A REGISTER over the flow
+of a live binding, the registered UE refreshing while it stays on that flow,
+counts in a budget of that flow alone, so a flood from elsewhere cannot use
+it up. Any other REGISTER counts in a small
 per-flow budget and in the IMPI's shared one. Over a budget the answer is
 500 with Retry-After (RFC 3261 §21.5.1), without a MAR: not 503, which an
 upstream proxy would read as the whole S-CSCF being out of service (§21.5.4)
 and the P-CSCF would retry at other I-CSCFs. A challenge allows one
 resynchronisation; an IMPI three per challenge lifetime, the registered UE's
-flow apart, and an AUTS that never got a vector gives its slot back. An
+flow apart, and an AUTS that never got a vector gives its slot back; a
+challenge or resynchronisation the HSS did not answer gives back its
+challenge counts too. An
 instance that saw a count over its limit refuses the rest of the window from
 memory, without a write. Metrics `registrar.challenge_limited` and
 `registrar.resync_limited` carry no identifier; the first is to be alarmed
@@ -326,17 +331,26 @@ on (`docs/scscf-state.md`).
   some ten first registrations a minute from other flows, by anyone who
   knows its IMPI, holds that registration back until the flood stops. The
   alarm is the answer to it.
+- So does a registered UE that reconnects: a switch between Wi-Fi and
+  cellular, a NAT rebinding, or a P-CSCF drained on a deploy gives it a new
+  connection and so a new flow token, which matches no live binding. Until
+  the flood stops it cannot refresh, its old flow being gone, and its
+  binding runs out. Before authentication the S-CSCF cannot tell it from
+  the flood (a better signal is a follow-up issue); hence the alarm, and no
+  P-CSCF deploy or drain while it is raised.
 - Likewise, forged AUTSs from other flows can use up the IMPI's three
   resynchronisations a lifetime, so a UE with no live binding whose SQN is
-  out of step registers once the lifetime ends; a registered UE resyncs on
-  its own budget.
+  out of step is refused until the flood stops; a registered UE on its flow
+  resyncs on its own budget.
 - Windows are fixed: twice a budget gets through across an edge.
 - The shared count is observable: a client that probes it near a window's
   end learns from where it is refused whether others were challenged in that
   window, that is, roughly whether the subscriber's UE registered then. It
   learns nothing about the registered UE's own flow, which counts apart.
-- The flow token is trusted as the P-CSCF wrote it; a P-CSCF that let a
-  client choose its Path would let it spend the registered UE's budget.
+- The flow token is trusted as the P-CSCF wrote it, which rests on #198
+  removing the client's Path and putting its own on top. A P-CSCF that let
+  a client choose its Path, or anyone with access to the core listeners,
+  could spend the registered UE's budget.
 
 **Status:** implemented in `internal/scscf/registrar` (#201); wired to a
 listener with `cmd/scscf` (#14 PR F).

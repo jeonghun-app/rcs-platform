@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
@@ -445,4 +446,112 @@ func TestAWindowsEdgeLetsTwiceTheBudgetThrough(t *testing.T) {
 	if ok != 2*DefaultChallengeLimit {
 		t.Errorf("%d challenges across the edge, want twice the budget", ok)
 	}
+}
+
+// TestAResyncAfterAnHSSFailureFitsTheFlowsBudget: with the production
+// limits, a UE whose SQN is out of step gets its challenge, sends its AUTS
+// while the HSS is out of reach, and tries again; the failed MAR gave its
+// challenge back, so the retry fits the flow's three (QA's minor 2 on #223).
+func TestAResyncAfterAnHSSFailureFitsTheFlowsBudget(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	u := e.akaUser(impi1, impu1)
+	first := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	e.hss.mu.Lock()
+	e.hss.unavailable = true
+	e.hss.mu.Unlock()
+	wantStatus(t, g.Register(bg, u.request(600, resyncOf(u, first)), upstream), 480)
+	e.hss.mu.Lock()
+	e.hss.unavailable = false
+	e.hss.mu.Unlock()
+	e.clock.advance(30 * time.Second)
+	second := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, u.request(600, resyncOf(u, second)), upstream), 401)
+}
+
+// gatedHSS holds resynchronisation MARs until gate closes, and then fails
+// them if fail is set.
+type gatedHSS struct {
+	*fakeHSS
+	gate    chan struct{}
+	entered chan struct{}
+	fail    bool
+}
+
+func (g *gatedHSS) MAR(ctx context.Context, r *cx.MAR) (*cx.MAA, error) {
+	if len(r.AuthDataItem.Authorization) > 0 {
+		g.entered <- struct{}{}
+		<-g.gate
+		if g.fail {
+			return nil, errUnreachable
+		}
+	}
+	return g.fakeHSS.MAR(ctx, r)
+}
+
+// TestASlotGivenBackClearsTheInstancesNote: three AUTSs wait on the HSS, a
+// fourth is refused and noted over the limit; the three fail and give their
+// slots back. The instance that noted the fourth then agrees with the one
+// that did not (QA's minor 3 on #223).
+func TestASlotGivenBackClearsTheInstancesNote(t *testing.T) {
+	e := newEnv(t)
+	hss := &gatedHSS{fakeHSS: e.hss, gate: make(chan struct{}), entered: make(chan struct{}, 8)}
+	a := e.instance(1, roomForResyncs, func(c *Config) { c.HSS = hss })
+	b := e.instance(2, roomForResyncs)
+	u := e.akaUser(impi1, impu1)
+	var wg sync.WaitGroup
+	for i := range DefaultResyncLimit {
+		ev := attacker(t, impi1, impu1, 700+i)
+		ch := ev.challengeOf(b.Register(bg, ev.request(600, ""), upstream), 0)
+		req := ev.request(600, forgedAUTS(t, ev, ch))
+		wg.Add(1)
+		go func() { defer wg.Done(); a.Register(bg, req, upstream) }()
+		<-hss.entered
+	}
+	ch := u.challengeOf(b.Register(bg, u.request(600, ""), upstream), 0)
+	wantStatus(t, a.Register(bg, u.request(600, resyncOf(u, ch)), upstream), 403)
+	hss.fail = true
+	close(hss.gate)
+	wg.Wait()
+	hss.fail = false
+	e.clock.advance(10 * time.Second)
+	ch = u.challengeOf(b.Register(bg, u.request(600, ""), upstream), 0)
+	wantStatus(t, a.Register(bg, u.request(600, resyncOf(u, ch)), upstream), 401)
+}
+
+// TestTheBudgetFollowsTheTopmostPathEntry: the P-CSCF's Path entry is the
+// topmost (RFC 3327 §5.3); flows that share a lower entry are still apart,
+// and the registered UE keeps its own budget (QA's nit on #223).
+func TestTheBudgetFollowsTheTopmostPathEntry(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	u := e.akaUser(impi1, impu1)
+	below := "<sip:edge@proxy." + realm + ";lr>"
+	u.path = []string{"<sip:ue-flow@pcscf." + realm + ";lr;ob>", below}
+	wantStatus(t, u.registerWith(g, 600), 200)
+	for i := range 3 * DefaultChallengeLimit {
+		ev := attacker(t, impi1, impu1, i)
+		ev.path = append(ev.path, below)
+		g.Register(bg, ev.request(600, ""), upstream)
+	}
+	res := g.Register(bg, u.request(600, ""), upstream)
+	wantStatus(t, res, 401)
+}
+
+// TestAChallengeTheHSSDidNotAnswerGivesItsCountsBack: an HSS out of reach
+// does not use up a flow's budget, nor the IMPI's.
+func TestAChallengeTheHSSDidNotAnswerGivesItsCountsBack(t *testing.T) {
+	e := newEnv(t)
+	g := e.instance(1)
+	u := e.akaUser(impi1, impu1)
+	e.hss.mu.Lock()
+	e.hss.unavailable = true
+	e.hss.mu.Unlock()
+	for range DefaultChallengeLimit + 1 {
+		wantStatus(t, g.Register(bg, u.request(600, ""), upstream), 480)
+	}
+	e.hss.mu.Lock()
+	e.hss.unavailable = false
+	e.hss.mu.Unlock()
+	wantStatus(t, g.Register(bg, u.request(600, ""), upstream), 401)
 }
