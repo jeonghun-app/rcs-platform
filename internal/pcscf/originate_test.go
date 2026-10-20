@@ -84,7 +84,7 @@ func TestAnInitialRequestGoesAlongTheServiceRouteAsTheDefaultIdentity(t *testing
 	}
 	// The core-facing value carries the icid for the dialog's later
 	// requests (§5.2.6.3.5 7)).
-	if want := []string{"<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + icidOf(t, first) + ">", "<sip:" + publicHost + ":5060;transport=tcp;lr>"}; !slices.Equal(rr, want) {
+	if want := []string{"<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + icidOf(t, first) + ";dlg=" + p.dialogMAC("FLOW-A", "orig-1") + ">", "<sip:" + publicHost + ":5060;transport=tcp;lr>"}; !slices.Equal(rr, want) {
 		t.Errorf("Record-Route %q, want %q", rr, want)
 	}
 	if got := req.Header.Values("Route"); !slices.Equal(got, []string{scscfRoute, "<sip:term@10.0.4.5;lr>"}) {
@@ -309,7 +309,7 @@ func TestTheClientFacingRecordRouteNamesTheClientTransport(t *testing.T) {
 	for transport, want := range map[string]string{ClientTLS: "tls", ClientNLBTLS: "tls", ClientTCP: "tcp"} {
 		p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
 		p.cfg.ClientTransport, p.cfg.PublicPort = transport, 5061
-		rr := p.recordRoute("FLOW-A", false, "0123456789abcdef0123456789abcdef")
+		rr := p.recordRoute("FLOW-A", false, "0123456789abcdef0123456789abcdef", "call-1")
 		if got := rr[1].String(); got != "<sip:"+publicHost+":5061;transport="+want+";lr>" {
 			t.Errorf("%s: client-facing Record-Route %q", transport, got)
 		}

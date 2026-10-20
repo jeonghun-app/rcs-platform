@@ -116,7 +116,8 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	cfg.SCSCFPort = scscfPort
 	// scscf's service name resolves to the fake.
-	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1")})
+	var pc *pcscf
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1"), started: func(p *pcscf) { pc = p }})
 	c := dial(t, s.client, nil)
 	_ = c.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(c.nc, registerText(outboundContact, "Supported: outbound")); err != nil {
@@ -144,7 +145,7 @@ func TestADialogFromAClientCrossesPcscfWithNothingForged(t *testing.T) {
 	pcv := invite.Header.Get("P-Charging-Vector")
 	icid := strings.TrimSuffix(strings.TrimPrefix(pcv, "icid-value="), ";orig-ioi=ims.mnc001.mcc001.3gppnetwork.org")
 	wantRR := []string{
-		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s>", token, s.core.Port(), icid),
+		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s;dlg=%s>", token, s.core.Port(), icid, pc.dialogMAC(transportFlow(token), call)),
 		fmt.Sprintf("<sip:%s:5060;transport=tcp;lr>", publicHost),
 	}
 	if got := invite.Header.Values("Record-Route"); !slices.Equal(got, wantRR) {

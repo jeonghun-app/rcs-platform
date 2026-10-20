@@ -190,7 +190,7 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
 - **Charging.** `P-Charging-Vector` gets a new `icid-value` for each request
   and `RCS_IMS_DOMAIN` as the type 1 `orig-ioi` (§5.2.6.3.3 7)).
 - **Record-Route.** `pcscf` records two values (RFC 5658), topmost first:
-  `<sip:<flow token>@<task address>:<core port>;transport=tcp;lr;icid=<icid>>`,
+  `<sip:<flow token>@<task address>:<core port>;transport=tcp;lr;icid=<icid>;dlg=<MAC>>`,
   with `ob` when the client's Contact has it, for the core, and
   `<sip:<PCSCF_PUBLIC_HOST>:<PCSCF_PUBLIC_PORT>;transport=tls;lr>` (`tcp`
   with `tcp`) for the client. The dialog's later requests come back through
@@ -255,8 +255,15 @@ request is sent over that flow whatever its Route or Request-URI say below.
   through this task on both sides: the client's along the route rule above,
   the core's to the flow. The core-facing one keeps the `Path`'s `ob` and
   the request's icid (§5.2.6.4.4 3)).
+- **Dialogs.** The core-facing Record-Route value, of a dialog either side
+  set up, binds the flow to the dialog: `dlg` is a MAC over the flow token
+  and the Call-ID, under a key drawn at every start. A request from the
+  core inside a dialog reaches the flow only with the value written for its
+  Call-ID; the `Path`, another dialog's value or a changed one is 430, so a
+  peer that saw the token cannot reach the client outside its dialog.
 - **Privacy.** `P-Asserted-Identity` is removed toward the client when the
-  request's `Privacy` has `id` (RFC 3323 §4.2, RFC 3325 §9.3).
+  request's `Privacy` has `id`, and so is it from a response to the client
+  that asks so (RFC 3323 §4.2, RFC 3325 §9.3).
 - **Charging.** The network's charging data, `P-Charging-Vector` and
   `P-Charging-Function-Addresses`, never goes to a client, in a request
   from the core or a response to the client's own request (TS 24.229

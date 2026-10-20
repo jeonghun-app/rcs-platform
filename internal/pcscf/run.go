@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"sync/atomic"
@@ -113,6 +114,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		flows: tr, now: d.now, log: rt.Logger, metrics: rt.Metrics,
 	}
 	pc.registry.perClient = cfg.MaxPendingRegistersPerIP
+	pc.dialogKey = make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, pc.dialogKey); err != nil {
+		return fmt.Errorf("pcscf: dialog key: %w", err)
+	}
 	pc.clientFlow = func(id transport.FlowID) bool { return isClientFlow(tr, id) }
 	// A closed flow's registrations are gone (RFC 5626 §5.3).
 	fl.onClosed = pc.registry.removeFlow

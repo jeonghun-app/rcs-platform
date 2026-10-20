@@ -113,7 +113,8 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	cfg := testConfig()
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	cfg.SCSCFPort = scscfPort
-	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1")})
+	var pc *pcscf
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1"), started: func(p *pcscf) { pc = p }})
 	c, path := registered(t, s, icscf)
 	token := mustURI(t, path).User
 	core := dial(t, s.core, nil)
@@ -133,7 +134,7 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	}
 	wantRR := []string{
 		fmt.Sprintf("<sip:%s:5060;transport=tcp;lr>", publicHost),
-		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s>", token, s.core.Port(), coreICID),
+		fmt.Sprintf("<sip:%s@127.0.0.2:%d;transport=tcp;lr;ob;icid=%s;dlg=%s>", token, s.core.Port(), coreICID, pc.dialogMAC(transportFlow(token), call)),
 		scscfRR,
 	}
 	if got := invite.Header.Values("Record-Route"); !slices.Equal(got, wantRR) {
@@ -182,6 +183,12 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	if res := core.final(); res.StatusCode != 200 {
 		t.Errorf("INFO: %d", res.StatusCode)
 	}
+	// The same route in another dialog reaches no one (security review of
+	// #221).
+	core.write(coreRequest("INFO", contact, "another-call", "a1", 1, "Route: "+rr[1], "Route: "+rr[0]))
+	if res := core.final(); res.StatusCode != statusFlowFailed {
+		t.Errorf("another dialog's INFO: %d, want 430", res.StatusCode)
+	}
 
 	// Privacy of the identity hides it from the client.
 	core.write(coreRequest("MESSAGE", contact, "term-private", "", 1, "Route: <"+path+">", "P-Asserted-Identity: <"+bobIMPU+">", "Privacy: id"))
@@ -206,7 +213,8 @@ func TestAStaleFlowTokenIs430(t *testing.T) {
 	_, oldPath := registered(t, first, icscf)
 	first.stop()
 
-	s := start(t, cfg, deps{})
+	var pc *pcscf
+	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
 	c, path := registered(t, s, icscf)
 	if mustURI(t, path).User == mustURI(t, oldPath).User {
 		t.Fatal("a new start reused a flow token")
@@ -227,17 +235,19 @@ func TestAStaleFlowTokenIs430(t *testing.T) {
 	if mustURI(t, path2).User == mustURI(t, path).User {
 		t.Fatal("a new flow from the same address got the old token")
 	}
-	deadline := time.Now().Add(waitFor)
-	for {
-		core.write(coreRequest("MESSAGE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("stale-%d", requests.Add(1)), "", 1, "Route: <"+path+">"))
-		res := core.final()
-		if res.StatusCode == statusFlowFailed {
+	// Once pcscf has seen the flow close, which ends its registration.
+	closed := transportFlow(mustURI(t, path).User)
+	for deadline := time.Now().Add(waitFor); ; time.Sleep(10 * time.Millisecond) {
+		if _, ok := pc.registry.lookup(closed, aorKey(mustURI(t, aliceIMPU))); !ok {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("a closed flow's token: %d, want 430", res.StatusCode)
+			t.Fatal("the closed flow's registration stayed")
 		}
-		time.Sleep(10 * time.Millisecond)
+	}
+	core.write(coreRequest("MESSAGE", "sip:alice@192.0.2.10:40000;transport=tcp", "stale-2", "", 1, "Route: <"+path+">"))
+	if res := core.final(); res.StatusCode != statusFlowFailed {
+		t.Fatalf("a closed flow's token: %d, want 430", res.StatusCode)
 	}
 }
 

@@ -2,6 +2,9 @@ package pcscf
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/netip"
@@ -55,7 +58,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	routes := slices.Clone(reg.serviceRoute)
 	return proxy.Decision{
 		Targets:     []proxy.Target{{URI: r.Message.URI}},
-		RecordRoute: p.recordRoute(src.Flow, contactHasOb(r.Message), icid),
+		RecordRoute: p.recordRoute(src.Flow, contactHasOb(r.Message), icid, r.Message.Header.Get("Call-ID")),
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 			// The Service-Route replaces the Route (§5.2.6.3.3): what the
 			// client wrote below pcscf's own entry is not where it
@@ -244,8 +247,11 @@ func bare(u sip.URI) sip.URI {
 // 5), RFC 5626 §5.1), and the one the client sees, the public name it
 // dials. The core-facing value also carries the dialog's icid, which the
 // dialog's later requests from the client bring back for their charging
-// vector (§5.2.6.3.5 7), §5.2.6.3.9 3)) since pcscf keeps no dialog state.
-func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid string) []sip.Address {
+// vector (§5.2.6.3.5 7), §5.2.6.3.9 3)) since pcscf keeps no dialog state,
+// and binds the flow to the dialog with a MAC over the token and its
+// Call-ID (dialogMAC), so that the core's requests reach the flow only in
+// that dialog.
+func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid, callID string) []sip.Address {
 	core := sip.URI{Scheme: "sip", User: string(flow), Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
 	core.Params.Set("transport", "tcp")
 	core.Params.SetFlag("lr")
@@ -253,6 +259,7 @@ func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid string) []sip.A
 		core.Params.SetFlag("ob")
 	}
 	core.Params.Set(icidParam, icid)
+	core.Params.Set(dialogParam, p.dialogMAC(flow, callID))
 	client := sip.URI{Scheme: "sip", Host: p.cfg.PublicHost, Port: p.cfg.PublicPort}
 	if p.cfg.ClientTransport == ClientTCP {
 		client.Params.Set("transport", "tcp")
@@ -263,9 +270,31 @@ func (p *pcscf) recordRoute(flow transport.FlowID, ob bool, icid string) []sip.A
 	return []sip.Address{{URI: core}, {URI: client}}
 }
 
-// icidParam is the URI parameter of the core-facing Record-Route value that
-// carries the dialog's icid.
-const icidParam = "icid"
+// icidParam and dialogParam are the URI parameters of the core-facing
+// Record-Route value that carry the dialog's icid and the MAC binding the
+// flow token to the dialog.
+const (
+	icidParam   = "icid"
+	dialogParam = "dlg"
+)
+
+// dialogMAC binds a flow token to a dialog's Call-ID: 128 bits of
+// HMAC-SHA256 under a key drawn at every start, as the flow token is, so a
+// peer that saw the token in one dialog cannot reach the flow in another.
+func (p *pcscf) dialogMAC(flow transport.FlowID, callID string) string {
+	m := hmac.New(sha256.New, p.dialogKey)
+	m.Write([]byte(flow))
+	m.Write([]byte{0})
+	m.Write([]byte(callID))
+	return hex.EncodeToString(m.Sum(nil)[:16])
+}
+
+// inDialogWith reports whether u, a consumed core-facing Record-Route value,
+// was written for the flow it names in the dialog of callID.
+func (p *pcscf) inDialogWith(u sip.URI, callID string) bool {
+	mac, ok := u.Param(dialogParam)
+	return ok && hmac.Equal([]byte(mac), []byte(p.dialogMAC(transport.FlowID(u.User), callID)))
+}
 
 // contactHasOb reports whether the request's Contact has the ob parameter:
 // the client uses outbound for this dialog (RFC 5626 §4.3).

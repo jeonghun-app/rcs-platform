@@ -24,7 +24,9 @@ import (
 // A request outside a dialog gets pcscf's two Record-Route values, the
 // client-facing one on top, so that the dialog's requests come back through
 // this task on both sides; the core-facing one keeps the Path's ob and the
-// request's icid (§5.2.6.4.4 3)). P-Asserted-Identity is removed when the
+// request's icid (§5.2.6.4.4 3)), and binds the flow to the dialog. A
+// request inside a dialog must name the flow by that value, written for
+// its Call-ID, or it is 430 like one naming no flow. P-Asserted-Identity is removed when the
 // request asks for privacy of the identity (RFC 3323 §4.2, RFC 3325 §9.3).
 // The request reaches the client without the network's charging data. The
 // client's responses carry the request's charging identifiers and this
@@ -43,9 +45,14 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 	}
 	flow := transport.FlowID(entry.User)
 	initial := r.Initial()
+	// Inside a dialog only the Record-Route value pcscf wrote for it, not
+	// the Path or another dialog's, names the flow.
+	if !initial && !p.inDialogWith(*entry, r.Message.Header.Get("Call-ID")) {
+		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
+	}
 	charging := p.terminatingCharging(r.Message)
 	asserted := p.calledIdentity(flow, r.Message)
-	private := privacyID(r.Message)
+	private := privacyID(&r.Message.Header)
 	d := proxy.Decision{
 		Targets: []proxy.Target{{URI: r.Message.URI, Destination: &transport.Destination{Flow: flow}}},
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
@@ -71,7 +78,7 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		OnFinal: func(context.Context, *sip.Response) {},
 	}
 	if initial {
-		rr := p.recordRoute(flow, entry.Params.Has("ob"), icidOfVector(charging))
+		rr := p.recordRoute(flow, entry.Params.Has("ob"), icidOfVector(charging), r.Message.Header.Get("Call-ID"))
 		d.RecordRoute = []sip.Address{rr[1], rr[0]}
 	}
 	return d
@@ -122,10 +129,10 @@ func (p *pcscf) calledIdentity(flow transport.FlowID, req *sip.Request) *sip.Add
 	return &sip.Address{URI: bare(regs[0].associated[0].URI)}
 }
 
-// privacyID reports whether req asks for privacy of the identity: Privacy
-// has id (RFC 3323 §4.2, RFC 3325 §9.3).
-func privacyID(req *sip.Request) bool {
-	for _, v := range req.Header.Values("Privacy") {
+// privacyID reports whether a message asks for privacy of the identity:
+// Privacy has id (RFC 3323 §4.2, RFC 3325 §9.3).
+func privacyID(h *sip.Header) bool {
+	for _, v := range h.Values("Privacy") {
 		if slices.ContainsFunc(strings.FieldsFunc(v, func(r rune) bool { return r == ';' || r == ',' }), func(s string) bool {
 			return strings.EqualFold(strings.TrimSpace(s), "id")
 		}) {

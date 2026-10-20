@@ -178,6 +178,8 @@ type pcscf struct {
 	icscfs allResolver
 	// rand draws charging identifiers.
 	rand io.Reader
+	// dialogKey is the key of dialogMAC, drawn at every start.
+	dialogKey []byte
 	// flows sets a flow's idle timeout; nil in tests that need none.
 	flows flowSetter
 	ids   sip.IDGenerator
@@ -227,7 +229,8 @@ func stripCharging(h *sip.Header) {
 }
 
 // toClient makes every response d forwards to the client lose the
-// network's charging data, after d's own OnResponse.
+// network's charging data, and its P-Asserted-Identity when it asks for
+// privacy of the identity (RFC 3325 §9.3), after d's own OnResponse.
 func toClient(d proxy.Decision) proxy.Decision {
 	next := d.OnResponse
 	d.OnResponse = func(ctx context.Context, res *sip.Response) {
@@ -235,6 +238,9 @@ func toClient(d proxy.Decision) proxy.Decision {
 			next(ctx, res)
 		}
 		stripCharging(&res.Header)
+		if privacyID(&res.Header) {
+			res.Header.Del("P-Asserted-Identity")
+		}
 	}
 	return d
 }

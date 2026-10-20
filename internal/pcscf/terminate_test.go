@@ -90,12 +90,12 @@ func TestATerminatingRequestGoesOverTheFlowItsPathNames(t *testing.T) {
 	for _, a := range d.RecordRoute {
 		rr = append(rr, a.String())
 	}
-	want := []string{"<sip:" + publicHost + ":5060;transport=tcp;lr>", "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob;icid=" + coreICID + ">"}
+	want := []string{"<sip:" + publicHost + ":5060;transport=tcp;lr>", "<sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;ob;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1") + ">"}
 	if !slices.Equal(rr, want) {
 		t.Errorf("Record-Route %q, want %q", rr, want)
 	}
 	// Inside a dialog: the flow of the core-facing value, no Record-Route.
-	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@[::ffff:10.0.2.9]:5070;transport=tcp;lr;icid=" + coreICID, "sip:" + publicHost + ":5060;transport=tcp;lr"})
+	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@[::ffff:10.0.2.9]:5070;transport=tcp;lr;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1"), "sip:" + publicHost + ":5060;transport=tcp;lr"})
 	d = p.Route(context.Background(), in)
 	if len(d.Targets) != 1 || d.Targets[0].Destination.Flow != "FLOW-A" || d.RecordRoute != nil {
 		t.Fatalf("in-dialog decision %+v", d)
@@ -177,7 +177,7 @@ func TestTheClientsResponsesCarryChargingAndTheCalledIdentity(t *testing.T) {
 		t.Error("a 100 was rewritten")
 	}
 	// Inside a dialog only the charging vector.
-	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr", "sip:" + publicHost + ":5060;transport=tcp;lr"},
+	in := fromCore(t, "BYE", true, []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + p.dialogMAC("FLOW-A", "term-1"), "sip:" + publicHost + ":5060;transport=tcp;lr"},
 		"P-Charging-Vector: icid-value="+coreICID)
 	d = p.Route(context.Background(), in)
 	ok := answer(t, in.Message, 200)
@@ -271,5 +271,51 @@ func TestAResponseAssertsARegisteredRequestURI(t *testing.T) {
 	res := answer(t, r.Message, 200)
 	if d.OnResponse(context.Background(), res); res.Header.Get("P-Asserted-Identity") != "<"+aliceTel+">" {
 		t.Errorf("P-Asserted-Identity %q", res.Header.Get("P-Asserted-Identity"))
+	}
+}
+
+// A request of the core inside a dialog reaches the flow only by the
+// Record-Route value pcscf wrote for that dialog: not by the Path, not by
+// the value of another dialog, and not by one whose MAC was changed, so a
+// peer that saw the token cannot reach the client outside its own dialog
+// (security review of #221).
+func TestACoreRequestInsideADialogNeedsThatDialogsRecordRoute(t *testing.T) {
+	p := newTerminatingPcscf(t, "FLOW-A")
+	client := "sip:" + publicHost + ":5060;transport=tcp;lr"
+	entry := func(mac string) []string {
+		return []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + mac, client}
+	}
+	if d := p.Route(context.Background(), fromCore(t, "BYE", true, entry(p.dialogMAC("FLOW-A", "term-1")))); len(d.Targets) != 1 {
+		t.Fatalf("this dialog's value: %+v", d)
+	}
+	for name, routed := range map[string][]string{
+		"the Path":            {pathEntry, client},
+		"another dialog's":    entry(p.dialogMAC("FLOW-A", "term-2")),
+		"another flow's":      entry(p.dialogMAC("FLOW-B", "term-1")),
+		"a changed MAC":       entry(strings.Repeat("0", 32)),
+		"another start's key": entry((&pcscf{dialogKey: []byte("another key")}).dialogMAC("FLOW-A", "term-1")),
+	} {
+		if d := p.Route(context.Background(), fromCore(t, "BYE", true, routed)); d.Status != statusFlowFailed {
+			t.Errorf("%s: %+v", name, d)
+		}
+	}
+}
+
+// A response asking for privacy of the identity reaches the client without
+// P-Asserted-Identity (RFC 3325 §9.3).
+func TestPrivacyIDHidesTheAssertedIdentityOfAResponse(t *testing.T) {
+	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
+	registerAlice(t, p, "FLOW-A", "Service-Route: "+scscfRoute)
+	for privacy, kept := range map[string]bool{"": true, "Privacy: id": false, "Privacy: user;id": false, "Privacy: none": true} {
+		r := clientRequest(t, initialText("MESSAGE"), "FLOW-A")
+		d := p.Route(context.Background(), r)
+		extra := []string{"P-Asserted-Identity: <" + bobIMPU + ">"}
+		if privacy != "" {
+			extra = append(extra, privacy)
+		}
+		res := answer(t, r.Message, 200, extra...)
+		if d.OnResponse(context.Background(), res); res.Header.Has("P-Asserted-Identity") != kept {
+			t.Errorf("%q: P-Asserted-Identity %q", privacy, res.Header.Get("P-Asserted-Identity"))
+		}
 	}
 }
