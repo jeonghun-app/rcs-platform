@@ -13,6 +13,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/dialog"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -212,7 +213,7 @@ func notify(t *testing.T, p *pcscf, r *proxy.Request) int {
 	}
 	code, info := p.acceptNotify(r.Message)
 	if info != nil {
-		p.deregistered(info.key, info.doc)
+		p.deregistered(info.key, info.doc, info.seen)
 	}
 	return code
 }
@@ -782,6 +783,7 @@ func TestIdentitiesCompareWithoutTheirParameters(t *testing.T) {
 	}{
 		{aliceIMPU, aliceIMPU + ";user=phone", true},
 		{aliceIMPU + ";user=phone", aliceIMPU, true},
+		{aliceIMPU + "?subject=x", aliceIMPU, true},
 		{aliceIMPU, "sip:+%315550100001@IMS.mnc001.mcc001.3gppnetwork.org", true},
 		{aliceIMPU, bobIMPU, false},
 		{aliceTel, "tel:+1-555-010-0001", true},
@@ -971,8 +973,8 @@ func TestAFailedRefreshKeepsTheSubscription(t *testing.T) {
 	}
 }
 
-// A refresh that keeps failing lets the subscription lapse at its expiry,
-// after which it is set up again.
+// A refresh that keeps failing is tried again by a backoff, and lets the
+// subscription lapse at its expiry, after which a new one is set up.
 func TestASubscriptionWhoseRefreshesFailLapses(t *testing.T) {
 	p, clock, f := newSubscribingPcscf(t)
 	registerKept(t, p, "FLOW-A")
@@ -980,18 +982,125 @@ func TestASubscriptionWhoseRefreshesFailLapses(t *testing.T) {
 	respond(t, s, 200, "Expires: 1200")
 	notify(t, p, notifyFor(t, s.req, 1, "active;expires=1200", nil))
 	end := clock.t.Add(1200 * time.Second)
+	refreshes := 0
 	for clock.t.Before(end) {
 		clock.t = clock.t.Add(sweepInterval)
 		registerKept(t, p, "FLOW-A")
 		p.reconcileSubscriptions()
 		for _, r := range f.take(p) {
+			refreshes++
 			respond(t, r, 503)
 		}
 	}
-	clock.t = clock.t.Add(resubscribeAfter)
+	// From 600 s before the end, backing off 30, 60, 120 and 240 s.
+	if refreshes < 3 || refreshes > 5 {
+		t.Errorf("%d refreshes in the last 600 s", refreshes)
+	}
+	for limit := clock.t.Add(refusedResubscribeAfter); clock.t.Before(limit); {
+		clock.t = clock.t.Add(sweepInterval)
+		registerKept(t, p, "FLOW-A")
+		p.reconcileSubscriptions()
+		if got := f.take(p); len(got) > 0 {
+			if got[0].req.Header.Get("CSeq") != "1 SUBSCRIBE" {
+				t.Fatalf("CSeq %q", got[0].req.Header.Get("CSeq"))
+			}
+			return
+		}
+	}
+	t.Fatal("no new subscription after it lapsed")
+}
+
+// A failed refresh is tried again no sooner than its Retry-After, and the
+// backoff (QA of #239).
+func TestAFailedRefreshHonoursRetryAfter(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 1800")
+	notify(t, p, notifyFor(t, s.req, 1, "active;expires=1800", nil))
+	clock.t = clock.t.Add(1800*time.Second - refreshLead)
 	p.reconcileSubscriptions()
-	if got := f.take(p); len(got) != 1 || got[0].req.Header.Get("CSeq") != "1 SUBSCRIBE" {
-		t.Fatalf("%d sent after the subscription lapsed", len(got))
+	respond(t, f.one(t, p), 503, "Retry-After: 600")
+	for range 19 { // 570 s
+		clock.t = clock.t.Add(sweepInterval)
+		p.reconcileSubscriptions()
+		if got := f.take(p); len(got) != 0 {
+			t.Fatalf("a refresh before Retry-After: 600 passed")
+		}
+	}
+}
+
+// One sweep sends at most maxRefreshesPerSweep refreshes; the next goes on.
+func TestASweepRefreshesABoundedNumber(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	n := maxRefreshesPerSweep + 7
+	p.subs.mu.Lock()
+	for i := range n {
+		key := fmt.Sprintf("user-%d", i)
+		u := mustURI(t, "sip:"+key+"@ims.mnc001.mcc001.3gppnetwork.org")
+		sub := &subscription{key: aorKey(u), impu: u, id: subscriptionPrefix + key, version: -1,
+			dialog: &dialog.Dialog{CallID: key, Local: sip.Address{URI: u, Params: sip.Params{{Name: "tag", Value: "a"}}},
+				Remote: sip.Address{URI: u, Params: sip.Params{{Name: "tag", Value: "b"}}}, RemoteTarget: mustURI(t, "sip:scscf.rcs.internal;transport=tcp"), LocalTarget: u},
+			expires: clock.t, length: 1200 * time.Second}
+		p.subs.byKey[sub.key], p.subs.byID[sub.id] = sub, sub
+		_ = p.registry.save(&registration{flow: transport.FlowID(key), uri: u, aor: aorKey(u), expires: clock.t.Add(time.Hour),
+			serviceRoute: []sip.Address{{URI: mustURI(t, "sip:orig@scscf.rcs.internal;transport=tcp;lr")}}})
+	}
+	p.subs.mu.Unlock()
+	clock.t = clock.t.Add(-time.Second) // due, not yet lapsed
+	p.reconcileSubscriptions()
+	if got := len(f.take(p)); got != maxRefreshesPerSweep {
+		t.Errorf("first sweep: %d", got)
+	}
+	p.reconcileSubscriptions()
+	if got := len(f.take(p)); got != 7 {
+		t.Errorf("second sweep: %d", got)
+	}
+}
+
+// The count of a user's failures goes with the user's last registration
+// (QA of #239).
+func TestFailuresAreForgottenWithTheRegistration(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	respond(t, f.one(t, p), 500)
+	p.registry.removeFlow("FLOW-A")
+	clock.t = clock.t.Add(sweepInterval)
+	p.reconcileSubscriptions()
+	p.subs.mu.Lock()
+	n := len(p.subs.failures)
+	p.subs.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d counts kept", n)
+	}
+}
+
+// A registration made with a barred identity, which scscf leaves out of
+// reginfo, is not ended by a full document that lists the user's other
+// identities with its binding active, the first or a later one (QA of
+// #239).
+func TestABarredIdentityIsJudgedByItsBindings(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	barred := "sip:barred@ims.mnc001.mcc001.3gppnetwork.org"
+	req := strings.ReplaceAll(registerText(outboundContact, "Supported: outbound"), aliceIMPU+">", barred+">")
+	d := p.Route(context.Background(), clientRequest(t, req, "FLOW-A"))
+	ok := strings.ReplaceAll(okText(outboundContact+";expires=3600", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound"), "To: <"+aliceIMPU+">", "To: <"+barred+">")
+	d.OnResponse(context.Background(), parseResponse(t, ok))
+	key := aorKey(mustURI(t, barred))
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 7200")
+	for v := range uint32(3) {
+		if code := notify(t, p, notifyFor(t, s.req, int(v)+1, "active;expires=7200", aliceDoc(v, reginfo.Full, reginfo.ContactActive, reginfo.Registered))); code != 200 {
+			t.Fatal(code)
+		}
+		if _, ok := p.registry.lookup("FLOW-A", key); !ok {
+			t.Fatalf("full document v%d ended the registration made with the barred identity", v)
+		}
+	}
+	// Its binding gone from the document, it ends.
+	notify(t, p, notifyFor(t, s.req, 4, "active", tabletDoc(3)))
+	if _, ok := p.registry.lookup("FLOW-A", key); ok {
+		t.Error("the barred identity's registration outlived its binding")
 	}
 }
 
@@ -1165,5 +1274,203 @@ func TestARegistrationNotKeptSubscribesToNothing(t *testing.T) {
 	p.registered(parseResponse(t, okText(outboundContact+";expires=3600", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound")), reg, sent)
 	if got := f.take(p); len(got) != 0 {
 		t.Errorf("%d SUBSCRIBEs for a registration not kept", len(got))
+	}
+}
+
+// A full document made before a binding was registered may arrive after
+// the binding's 200: it does not list the binding, which no document has
+// shown yet, so the binding stays; the one the document did show and does
+// not list goes (security review of #239).
+func TestALateFullDocumentLeavesABindingNotYetReported(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f) // v0 shows FLOW-A's binding, reg-id 1
+	registerWith(t, p, "FLOW-B", outboundContactOf(2), "reg-flow-2", "Service-Route: "+scscfRoute, aliceAssociated, "Require: outbound")
+	// v1, made before FLOW-B registered, lists reg-id 1 alone.
+	if code := notify(t, p, notifyFor(t, sub, 2, "active", aliceDoc(1, reginfo.Full, reginfo.ContactActive, reginfo.Refreshed))); code != 200 {
+		t.Fatal(code)
+	}
+	if !aliceRegistered(t, p, "FLOW-A") || !aliceRegistered(t, p, "FLOW-B") {
+		t.Fatalf("FLOW-A %v, FLOW-B %v", aliceRegistered(t, p, "FLOW-A"), aliceRegistered(t, p, "FLOW-B"))
+	}
+	// v2 shows both; v3, a full document without reg-id 2, ends it.
+	both := aliceDoc(2, reginfo.Full, reginfo.ContactActive, reginfo.Refreshed)
+	for i := range both.Registrations {
+		c := both.Registrations[i].Contacts[0]
+		c.ID, c.Params = c.ID+"b", aliceBinding(2)
+		both.Registrations[i].Contacts = append(both.Registrations[i].Contacts, c)
+	}
+	notify(t, p, notifyFor(t, sub, 3, "active", both))
+	notify(t, p, notifyFor(t, sub, 4, "active", aliceDoc(3, reginfo.Full, reginfo.ContactActive, reginfo.Refreshed)))
+	if !aliceRegistered(t, p, "FLOW-A") || aliceRegistered(t, p, "FLOW-B") {
+		t.Errorf("after v3: FLOW-A %v, FLOW-B %v", aliceRegistered(t, p, "FLOW-A"), aliceRegistered(t, p, "FLOW-B"))
+	}
+}
+
+// A binding a document ended is no longer one seen active: registered
+// again, it is not ended by a later full document that does not list it
+// yet.
+func TestABindingEndedAndRegisteredAgainIsNotSeen(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	ended := aliceDoc(1, reginfo.Partial, reginfo.ContactTerminated, reginfo.Deactivated)
+	ended.Registrations[0].State, ended.Registrations[1].State = reginfo.Active, reginfo.Active
+	notify(t, p, notifyFor(t, sub, 2, "active", ended))
+	if aliceRegistered(t, p, "FLOW-A") {
+		t.Fatal("not ended")
+	}
+	registerKept(t, p, "FLOW-A")
+	notify(t, p, notifyFor(t, sub, 3, "active", tabletDoc(2)))
+	if !aliceRegistered(t, p, "FLOW-A") {
+		t.Error("a binding registered again was ended before any document showed it")
+	}
+}
+
+// The record of what was seen goes with the user's last registration on
+// the task.
+func TestTheSeenRecordGoesWithTheLastRegistration(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	subscribedAlice(t, p, f)
+	key := aorKey(mustURI(t, aliceIMPU))
+	p.subs.mu.Lock()
+	had := p.subs.seen[key] != nil
+	p.subs.mu.Unlock()
+	p.registry.removeFlow("FLOW-A")
+	p.reconcileSubscriptions()
+	p.subs.mu.Lock()
+	has := p.subs.seen[key] != nil
+	p.subs.mu.Unlock()
+	if !had || has {
+		t.Errorf("had %v, has %v", had, has)
+	}
+}
+
+// A full document is the whole record too: a binding it no longer lists is
+// no longer seen, so when registered again it waits for a document that
+// shows it.
+func TestAFullDocumentReplacesWhatWasSeen(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	notify(t, p, notifyFor(t, sub, 2, "active", tabletDoc(1)))
+	if aliceRegistered(t, p, "FLOW-A") {
+		t.Fatal("not ended")
+	}
+	registerKept(t, p, "FLOW-A")
+	notify(t, p, notifyFor(t, sub, 3, "active", tabletDoc(2)))
+	if !aliceRegistered(t, p, "FLOW-A") {
+		t.Error("a binding registered again was ended by a full document made before it")
+	}
+}
+
+// An associated identity a full document does not list is dropped only if
+// an earlier document showed it.
+func TestAnAssociatedIdentityNotYetReportedStays(t *testing.T) {
+	assertable := func(p *pcscf) int {
+		reg, _ := p.registry.lookup("FLOW-A", aorKey(mustURI(t, aliceIMPU)))
+		return len(reg.associated)
+	}
+	only := func(version uint32) *reginfo.Info {
+		d := aliceDoc(version, reginfo.Full, reginfo.ContactActive, reginfo.Registered)
+		d.Registrations = d.Registrations[:1]
+		return d
+	}
+	// Shown by v0, missing from v1: dropped.
+	p, _, f := newSubscribingPcscf(t)
+	sub := subscribedAlice(t, p, f)
+	notify(t, p, notifyFor(t, sub, 2, "active", only(1)))
+	if got := assertable(p); got != 1 {
+		t.Errorf("a number shown then left out: %d identities", got)
+	}
+	// Never shown: kept.
+	p, _, f = newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	notify(t, p, notifyFor(t, s.req, 1, "active", only(0)))
+	notify(t, p, notifyFor(t, s.req, 2, "active", only(1)))
+	if got := assertable(p); got != 2 {
+		t.Errorf("a number never shown: %d identities", got)
+	}
+}
+
+// Each failure in a row of a refresh doubles the wait for the next, and a
+// refresh that succeeds starts the count again.
+func TestRefreshFailuresBackOffAndReset(t *testing.T) {
+	p, clock, f := newSubscribingPcscf(t)
+	registerKept(t, p, "FLOW-A")
+	s := f.one(t, p)
+	respond(t, s, 200, "Expires: 3000")
+	notify(t, p, notifyFor(t, s.req, 1, "active;expires=3000", nil))
+	clock.t = clock.t.Add(3000*time.Second - refreshLead)
+	refresh := func() []sentRequest {
+		registerKept(t, p, "FLOW-A")
+		p.reconcileSubscriptions()
+		return f.take(p)
+	}
+	got := refresh()
+	if len(got) != 1 {
+		t.Fatalf("%d refreshes", len(got))
+	}
+	got[0].h(nil, transaction.ErrTimeout) // first failure: 30 s
+	clock.t = clock.t.Add(resubscribeAfter)
+	got = refresh()
+	if len(got) != 1 {
+		t.Fatalf("after 30 s: %d", len(got))
+	}
+	got[0].h(nil, transaction.ErrTimeout) // second: 60 s
+	clock.t = clock.t.Add(resubscribeAfter)
+	if got := refresh(); len(got) != 0 {
+		t.Fatal("30 s after a second failure")
+	}
+	clock.t = clock.t.Add(resubscribeAfter)
+	got = refresh()
+	if len(got) != 1 {
+		t.Fatalf("60 s after a second failure: %d", len(got))
+	}
+	respond(t, got[0], 200, "Expires: 1200") // success: the count starts again
+	clock.t = clock.t.Add(600 * time.Second)
+	got = refresh()
+	if len(got) != 1 {
+		t.Fatalf("the next refresh: %d", len(got))
+	}
+	got[0].h(nil, transaction.ErrTimeout)
+	clock.t = clock.t.Add(resubscribeAfter)
+	if got := refresh(); len(got) != 1 {
+		t.Errorf("30 s after the first failure since a success: %d", len(got))
+	}
+}
+
+// The bindings of an identity no document lists are judged wherever the
+// document lists them, so a barred identity's registration ends with its
+// binding even when an identity it may assert is left.
+func TestABarredIdentityEndsWithItsBinding(t *testing.T) {
+	p, _, f := newSubscribingPcscf(t)
+	barred := "sip:barred@ims.mnc001.mcc001.3gppnetwork.org"
+	other := "sip:other@ims.mnc001.mcc001.3gppnetwork.org"
+	req := strings.ReplaceAll(registerText(outboundContact, "Supported: outbound"), aliceIMPU+">", barred+">")
+	d := p.Route(context.Background(), clientRequest(t, req, "FLOW-A"))
+	ok := strings.ReplaceAll(okText(outboundContact+";expires=3600", "Service-Route: "+scscfRoute, aliceAssociated+", <"+other+">", "Require: outbound"), "To: <"+aliceIMPU+">", "To: <"+barred+">")
+	d.OnResponse(context.Background(), parseResponse(t, ok))
+	key := aorKey(mustURI(t, barred))
+	s := f.one(t, p)
+	notify(t, p, notifyFor(t, s.req, 1, "active", aliceDoc(0, reginfo.Full, reginfo.ContactActive, reginfo.Registered)))
+	notify(t, p, notifyFor(t, s.req, 2, "active", tabletDoc(1)))
+	if _, ok := p.registry.lookup("FLOW-A", key); ok {
+		t.Error("the barred identity's registration outlived its binding")
+	}
+}
+
+// The bindings counted for an identity no document lists are those of the
+// active registrations alone.
+func TestOnlyActiveRegistrationsVouchForABinding(t *testing.T) {
+	u := mustURI(t, "sip:barred@ims.mnc001.mcc001.3gppnetwork.org")
+	cs, _ := sip.ParseContacts(outboundContact)
+	reg := &registration{flow: "FLOW-A", uri: u, aor: aorKey(u), contacts: cs, associated: []sip.Address{{URI: mustURI(t, "sip:other@ims.mnc001.mcc001.3gppnetwork.org")}}}
+	seen := newSeenState()
+	seen.update(aliceDoc(0, reginfo.Full, reginfo.ContactActive, reginfo.Registered))
+	// Parse takes an active contact under a terminated registration.
+	doc := &reginfo.Info{Version: 1, State: reginfo.Full, Registrations: []reginfo.Registration{
+		{AOR: aliceIMPU, ID: "r1", State: reginfo.Terminated, Contacts: []reginfo.Contact{{ID: "c1", State: reginfo.ContactActive, Event: reginfo.Registered, URI: "sip:alice@192.0.2.10:40000;transport=tcp", Params: aliceBinding(1)}}},
+	}}
+	if ended, _ := endedBy(reg, doc, seen); !ended {
+		t.Error("a binding under a terminated registration kept the registration")
 	}
 }

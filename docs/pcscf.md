@@ -215,7 +215,14 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
     registration with none of its associated identities left is ended;
   - a partial document ends only what it lists; a full one is the whole
     state, so what it does not list is ended too, after a lost
-    subscription or a missed document alike. A partial document that
+    subscription or a missed document alike, but only if an earlier
+    document of the user, on this subscription or one before it, showed
+    it active. A binding whose 200 overtook a full document made before
+    it is not ended for being left out; a document that lists it ended,
+    or its expiry, ends it. A registered identity no document has listed,
+    such as a barred one scscf leaves out of reginfo, is judged by its
+    bindings wherever the document lists them under an active
+    registration. A partial document that
     skips a version makes the next sweep refresh the subscription, which
     brings a full one.
 
@@ -237,15 +244,18 @@ Core hops such as `icscf` are resolved by `proxy.DNSResolver`:
     backoff.
   - A refresh that fails leaves the subscription valid until it expires
     (TS 24.229 §5.2.3, RFC 6665 §4.1.2.2): its NOTIFYs are still taken, and
-    each sweep tries again. Only the codes that end a subscription (404,
-    405, 410, 416, 480 to 485, 489, 501, 604) end it, 481 included, and it
-    is set up again as above. One whose refreshes kept failing lapses at
-    its expiry.
+    the refresh is tried again after the same backoff and no sooner than
+    its `Retry-After`; a refresh that succeeds starts the count again.
+    Only the codes that end a subscription (404, 405, 410, 416, 480 to 485,
+    489, 501, 604) end it, 481 included, and it is set up again as above.
+    One whose refreshes kept failing lapses at its expiry. A user's count
+    of failures goes with its last registration on the task.
   - One the notifier ends is set up again after 30 s, or its
     `retry-after` if longer, and after an hour if ended as `rejected`,
     `noresource` or `invariant` (RFC 6665 §4.1.3).
-  - One sweep sets up at most 500, so the task does not send one SUBSCRIBE
-    per user at once after an outage of `scscf`.
+  - One sweep sets up at most 500 subscriptions and sends at most 500
+    refreshes, so the task does not send one SUBSCRIBE per user at once
+    after an outage of `scscf`.
 
 Subscriptions live in instance memory, as registrations do. When a task
 stops, `scscf`'s next NOTIFY fails, and `scscf` ends the subscription.

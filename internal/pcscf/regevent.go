@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -57,10 +58,11 @@ const (
 	// NOTIFY that sets up its dialog before it has failed (RFC 6665
 	// §4.1.2.4: 64*T1).
 	timerN = 64 * transaction.DefaultT1
-	// maxSubscribesPerSweep bounds the subscriptions one sweep sets up, so
-	// that after an outage of scscf the task does not send one SUBSCRIBE per
-	// user at once.
+	// maxSubscribesPerSweep bounds the subscriptions one sweep sets up, and
+	// maxRefreshesPerSweep the refreshes it sends, so that after an outage
+	// of scscf the task does not send one SUBSCRIBE per user at once.
 	maxSubscribesPerSweep = 500
+	maxRefreshesPerSweep  = 500
 	// subscriptionPrefix starts the user part of a subscription's Contact.
 	// A flow token is base64url, which has no dot, so the two never meet.
 	subscriptionPrefix = "reg."
@@ -101,6 +103,9 @@ type subscription struct {
 	// partial document skipped a version, and a refresh brings a full one
 	// (RFC 3680 §5.2).
 	refreshNow bool
+	// retryAt holds a refresh back after one failed, by the backoff of
+	// failLocked and the failure's Retry-After.
+	retryAt time.Time
 	// version is the version of the last registration information
 	// document, or -1 before the first (RFC 3680 §5.2).
 	version int64
@@ -119,6 +124,10 @@ type subscriptions struct {
 	// backoff of the next.
 	notBefore map[string]time.Time
 	failures  map[string]int
+	// seen is, by user, what the documents of the user's subscriptions
+	// have shown active; it outlives a subscription, so that the first
+	// full document of the next one can end what went meanwhile.
+	seen map[string]*seenState
 	// ctx ends, and wg waits for, the SUBSCRIBEs being sent; once closed
 	// no other is.
 	ctx    context.Context
@@ -128,7 +137,7 @@ type subscriptions struct {
 
 func newSubscriptions(ctx context.Context) *subscriptions {
 	return &subscriptions{ctx: ctx, byKey: map[string]*subscription{}, byID: map[string]*subscription{},
-		notBefore: map[string]time.Time{}, failures: map[string]int{}}
+		notBefore: map[string]time.Time{}, failures: map[string]int{}, seen: map[string]*seenState{}}
 }
 
 // goSend runs f, which sends a SUBSCRIBE, off the caller's goroutine: the
@@ -183,16 +192,30 @@ func (s *subscriptions) drop(sub *subscription, after time.Time) {
 // registrations stay: a failed subscription deregisters no one. mu must be
 // held.
 func (p *pcscf) failLocked(sub *subscription, now time.Time, wait time.Duration) {
-	n := p.subs.failures[sub.key]
-	p.subs.failures[sub.key] = n + 1
+	p.subs.dropLocked(sub, now.Add(p.backoffLocked(sub.key, wait)))
+}
+
+// backoffLocked counts a failure of key's SUBSCRIBEs and returns how long
+// the next waits: resubscribeAfter, doubling with each failure in a row up
+// to refusedResubscribeAfter, or wait if longer. mu must be held.
+func (p *pcscf) backoffLocked(key string, wait time.Duration) time.Duration {
+	n := p.subs.failures[key]
+	p.subs.failures[key] = n + 1
 	backoff := refusedResubscribeAfter
 	if n < 8 {
 		backoff = min(resubscribeAfter<<n, refusedResubscribeAfter)
 	}
-	p.subs.dropLocked(sub, now.Add(max(backoff, min(wait, refusedResubscribeAfter))))
 	if p.metrics != nil {
 		p.metrics.Count(metricSubscribeFailed, 1)
 	}
+	return max(backoff, min(wait, refusedResubscribeAfter))
+}
+
+// deferRefreshLocked holds sub's next refresh back after one failed that
+// leaves it valid, by the same backoff, so an overloaded scscf is not
+// asked again every sweep. mu must be held.
+func (p *pcscf) deferRefreshLocked(sub *subscription, now time.Time, wait time.Duration) {
+	sub.retryAt = now.Add(p.backoffLocked(sub.key, wait))
 }
 
 // refusedFor reports whether a SUBSCRIBE refused with code will be refused
@@ -350,9 +373,12 @@ func (p *pcscf) subscribed(sub *subscription, res *sip.Response, err error, init
 	sub.busy = false
 	switch {
 	case err != nil:
-		if initial && sub.dialog == nil {
+		switch {
+		case initial && sub.dialog == nil:
 			p.failLocked(sub, now, 0)
-		} else if p.metrics != nil {
+		case !initial:
+			p.deferRefreshLocked(sub, now, 0)
+		case p.metrics != nil:
 			p.metrics.Count(metricSubscribeFailed, 1)
 		}
 	case res.StatusCode >= 300:
@@ -362,9 +388,7 @@ func (p *pcscf) subscribed(sub *subscription, res *sip.Response, err error, init
 		case initial, endsSubscription(res.StatusCode):
 			p.failLocked(sub, now, retryAfterOf(res))
 		default:
-			if p.metrics != nil {
-				p.metrics.Count(metricSubscribeFailed, 1)
-			}
+			p.deferRefreshLocked(sub, now, retryAfterOf(res))
 		}
 	default:
 		secs, err := res.Header.Expires()
@@ -378,11 +402,18 @@ func (p *pcscf) subscribed(sub *subscription, res *sip.Response, err error, init
 		}
 		sub.length = time.Duration(secs) * time.Second
 		sub.expires = now.Add(sub.length)
+		if !initial {
+			delete(p.subs.failures, sub.key)
+			sub.retryAt = time.Time{}
+		}
 	}
 }
 
 // refreshDue reports whether sub is to be refreshed at now.
 func refreshDue(sub *subscription, now time.Time) bool {
+	if now.Before(sub.retryAt) {
+		return false
+	}
 	return sub.refreshNow || !sub.expires.IsZero() && !now.Before(sub.expires.Add(-min(refreshLead, sub.length/2)))
 }
 
@@ -403,6 +434,18 @@ func (p *pcscf) reconcileSubscriptions() {
 			delete(p.subs.notBefore, key)
 		}
 	}
+	// A user with no registration left on the task needs no record, nor
+	// a count of failures.
+	for key := range p.subs.seen {
+		if _, ok := live[key]; !ok {
+			delete(p.subs.seen, key)
+		}
+	}
+	for key := range p.subs.failures {
+		if _, ok := live[key]; !ok {
+			delete(p.subs.failures, key)
+		}
+	}
 	for key, sub := range p.subs.byKey {
 		_, registered := live[key]
 		switch {
@@ -420,7 +463,7 @@ func (p *pcscf) reconcileSubscriptions() {
 		case !sub.expires.IsZero() && !now.Before(sub.expires):
 			// Its refreshes kept failing, and it has lapsed.
 			p.failLocked(sub, now, 0)
-		case refreshDue(sub, now):
+		case refreshDue(sub, now) && len(refresh) < maxRefreshesPerSweep:
 			sub.busy, sub.refreshNow = true, false
 			refresh = append(refresh, sub)
 		}
@@ -507,10 +550,12 @@ func (p *pcscf) serveNotify(_ context.Context, u *proxy.UAS) {
 		_ = res.Header.Set("Allow", "NOTIFY")
 	}
 	_ = res.Header.Set("P-Charging-Vector", p.terminatingCharging(req, ""))
-	_ = u.Respond(res)
+	// The registrations go before the 200 does, so that the notifier, and
+	// anything it does next, finds them gone.
 	if info != nil {
-		p.deregistered(info.key, info.doc)
+		p.deregistered(info.key, info.doc, info.seen)
 	}
+	_ = u.Respond(res)
 }
 
 // mustTag is a To tag for a response to a request without one.
@@ -527,6 +572,92 @@ func (p *pcscf) mustTag() string {
 type notified struct {
 	key string
 	doc *reginfo.Info
+	// seen is what earlier documents showed active.
+	seen *seenState
+}
+
+// seenState is what the reg event documents of one user have shown
+// active: the bindings, by bindingKey, and the identities, canonical. A
+// full document ends, because it does not list it, only what this shows:
+// a binding pcscf stored but the notifier has not reported yet, whose 200
+// overtook the document, is ended only by a document that lists it ended,
+// or by its expiry (security review of #239).
+type seenState struct {
+	bindings map[string]reginfo.Contact
+	aors     map[string]bool
+}
+
+func newSeenState() *seenState {
+	return &seenState{bindings: map[string]reginfo.Contact{}, aors: map[string]bool{}}
+}
+
+// maxSeenBindings bounds what one user's record holds: the contacts of
+// one document.
+const maxSeenBindings = 256 * 64
+
+// bindingKey names a binding of a document: its +sip.instance and
+// reg-id, or its URI without an instance.
+func bindingKey(c reginfo.Contact) string {
+	if inst, ok := c.Param("+sip.instance"); ok {
+		id, _ := c.Param("reg-id")
+		return "i\x00" + strings.ToLower(inst) + "\x00" + id
+	}
+	return "u\x00" + c.URI
+}
+
+// aorOf is an identity as seenState keeps it.
+func aorOf(s string) string {
+	if c, ok := identity.CanonicalIMPU(s); ok {
+		return c
+	}
+	return s
+}
+
+func (s *seenState) clone() *seenState {
+	c := newSeenState()
+	maps.Copy(c.bindings, s.bindings)
+	maps.Copy(c.aors, s.aors)
+	return c
+}
+
+// update takes in doc: a full document is the whole state, so the record
+// becomes what it shows active; a partial one adds what it shows active
+// and drops what it shows ended.
+func (s *seenState) update(doc *reginfo.Info) {
+	if doc.State == reginfo.Full {
+		clear(s.bindings)
+		clear(s.aors)
+	}
+	for _, el := range doc.Registrations {
+		if el.State == reginfo.Active {
+			s.aors[aorOf(el.AOR)] = true
+		} else {
+			delete(s.aors, aorOf(el.AOR))
+		}
+		for _, c := range el.Contacts {
+			if c.Active() && el.State == reginfo.Active {
+				if len(s.bindings) < maxSeenBindings {
+					s.bindings[bindingKey(c)] = c
+				}
+			} else {
+				delete(s.bindings, bindingKey(c))
+			}
+		}
+	}
+}
+
+// shown reports whether c's binding is one s has seen active.
+func (s *seenState) shown(c sip.Contact) bool {
+	if s == nil {
+		return false
+	}
+	all := reginfo.Registration{Contacts: slices.Collect(maps.Values(s.bindings))}
+	return len(bindingsOf(all, c)) > 0
+}
+
+// shownAOR reports whether s has seen u active.
+func (s *seenState) shownAOR(u sip.URI) bool {
+	return s != nil && s.aors[aorOf(u.String())]
 }
 
 // acceptNotify checks req against the subscription it names and takes it:
@@ -613,7 +744,13 @@ func (p *pcscf) acceptNotify(req *sip.Request) (int, *notified) {
 			sub.refreshNow = true
 		}
 		sub.version = int64(doc.Version)
-		out = &notified{key: sub.key, doc: doc}
+		seen := p.subs.seen[sub.key]
+		if seen == nil {
+			seen = newSeenState()
+			p.subs.seen[sub.key] = seen
+		}
+		out = &notified{key: sub.key, doc: doc, seen: seen.clone()}
+		seen.update(doc)
 	}
 	if terminated {
 		p.subs.dropLocked(sub, now.Add(resubscribeDelay(state)))
@@ -642,9 +779,9 @@ func resubscribeDelay(state sip.SubscriptionState) time.Duration {
 // this task alone (endedBy). A registration ended is removed only if it is
 // still the one read, so a REGISTER's 200 saved meanwhile stays. The flows
 // stay open (#16 plan E, decision 5).
-func (p *pcscf) deregistered(key string, doc *reginfo.Info) {
+func (p *pcscf) deregistered(key string, doc *reginfo.Info, seen *seenState) {
 	for _, reg := range p.registry.ofDefault(key) {
-		ended, changed := endedBy(reg, doc)
+		ended, changed := endedBy(reg, doc, seen)
 		if ended {
 			if p.registry.removeIf(reg) && p.metrics != nil {
 				p.metrics.Count(metricDeregistered, 1)
@@ -666,23 +803,41 @@ func (p *pcscf) deregistered(key string, doc *reginfo.Info) {
 //     identity not active, or every binding of reg's contacts terminated;
 //     a contact whose binding it terminates; an associated identity not
 //     active, or none of whose bindings with reg's contacts is active.
-//   - A full document is the whole state (RFC 3680 §5.2): what it does not
-//     list, or lists not active, is ended too.
+//   - A full document is the whole state (RFC 3680 §5.2): what it lists
+//     not active is ended, and what it does not list is ended too if an
+//     earlier document showed it active (seen); one the notifier has not
+//     reported yet is left (security review of #239).
 //   - A registration with associated identities none of which is left is
 //     ended as well, so its flow cannot fall back to asserting an identity
 //     the network never listed (security review of #239).
-func endedBy(reg *registration, doc *reginfo.Info) (ended bool, changed *registration) {
+func endedBy(reg *registration, doc *reginfo.Info, seen *seenState) (ended bool, changed *registration) {
 	full := doc.State == reginfo.Full
 	// gone reports whether doc ends the binding of c under el.
 	gone := func(el reginfo.Registration, c sip.Contact) bool {
 		found := bindingsOf(el, c)
-		active := slices.ContainsFunc(found, reginfo.Contact.Active)
-		return !active && (full || len(found) > 0)
+		switch {
+		case slices.ContainsFunc(found, reginfo.Contact.Active):
+			return false
+		case len(found) > 0:
+			return true
+		}
+		return full && seen.shown(c)
 	}
 	contacts := slices.Clone(reg.contacts)
 	switch el, ok := doc.ByAOR(reg.uri); {
-	case ok && el.State != reginfo.Active, !ok && full:
+	case ok && el.State != reginfo.Active, !ok && full && seen.shownAOR(reg.uri):
 		return true, nil
+	case !ok && full:
+		// An identity no document has listed, such as a barred one a UE
+		// registered with, which scscf leaves out of reginfo: its bindings
+		// are judged wherever the document lists them.
+		var all reginfo.Registration
+		for _, r := range doc.Registrations {
+			if r.State == reginfo.Active {
+				all.Contacts = append(all.Contacts, r.Contacts...)
+			}
+		}
+		contacts = slices.DeleteFunc(contacts, func(c sip.Contact) bool { return gone(all, c) })
 	case ok:
 		contacts = slices.DeleteFunc(contacts, func(c sip.Contact) bool { return gone(el, c) })
 	}
@@ -696,7 +851,7 @@ func endedBy(reg *registration, doc *reginfo.Info) (ended bool, changed *registr
 		el, ok := doc.ByAOR(a.URI)
 		switch {
 		case !ok:
-			return full
+			return full && seen.shownAOR(a.URI)
 		case el.State != reginfo.Active:
 			return true
 		}
@@ -745,6 +900,8 @@ func bindingsOf(el reginfo.Registration, c sip.Contact) []reginfo.Contact {
 // the form the HSS keeps one in (identity.CanonicalIMPU), as reginfo's
 // ByAOR compares them; without such a form, as URIs.
 func sameIdentity(a, b sip.URI) bool {
+	// URI headers are no part of an identity.
+	a.Headers, b.Headers = nil, nil
 	ca, okA := identity.CanonicalIMPU(a.String())
 	cb, okB := identity.CanonicalIMPU(b.String())
 	if okA && okB {
