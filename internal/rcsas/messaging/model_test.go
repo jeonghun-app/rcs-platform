@@ -24,6 +24,17 @@ func TestConversationHeadersAreTrimmedTokens(t *testing.T) {
 	}
 }
 
+// rcsjta sends a Contribution-ID without a Conversation-ID (#298): the
+// request is in the contribution, with no Conversation-ID made up for it.
+func TestAContributionIDAloneIsTaken(t *testing.T) {
+	for _, h := range [][3]string{{"", "b", ""}, {" ", "b", "c"}} {
+		c, err := ParseConversationHeaders(h[0], h[1], h[2])
+		if err != nil || c != (Conversation{Contribution: "b", InReplyTo: h[2]}) {
+			t.Errorf("ParseConversationHeaders(%q) = %+v, %v", h, c, err)
+		}
+	}
+}
+
 func TestARequestWithoutConversationHeadersHasNoConversation(t *testing.T) {
 	// As rcsjta sends pager-mode notifications.
 	if c, err := ParseConversationHeaders("", " ", ""); err != nil || c != (Conversation{}) {
@@ -54,8 +65,8 @@ func TestQueueIDsKeepTheirOrderWithinATask(t *testing.T) {
 func TestConversationHeadersOutsideTheGrammarAreRefused(t *testing.T) {
 	long := strings.Repeat("a", MaxIDLength+1)
 	for _, h := range [][3]string{
-		{"", "b", ""},
 		{"a", "", ""},
+		{"", "", "c"},
 		{"a b", "c", ""},
 		{"a", "b;c", ""},
 		{"a", "b", "c\r\nVia: x"},

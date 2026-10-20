@@ -44,10 +44,13 @@ type Conversation struct {
 // taken as one RFC 3261 token, the form clients generate (hex strings and
 // UUIDs), of at most MaxIDLength characters, with surrounding white space
 // removed. A request with none of the three gives the zero Conversation:
-// pager-mode notifications come without them (rcsjta), and the engine
-// does not need them for a notification. Otherwise Conversation-ID and
-// Contribution-ID are required, since a message without them cannot be
-// put in any conversation; InReplyTo-Contribution-ID is optional.
+// rcsjta sends pager-mode messages and notifications without them, and the
+// engine does not need them. Otherwise Contribution-ID is required, since
+// a Conversation-ID or a reply means nothing without the contribution it
+// belongs to. Conversation-ID is optional: rcsjta sends a Contribution-ID
+// alone (#298). It stays empty then rather than being made up: one made
+// for each request would put every message of one conversation in a
+// different one. InReplyTo-Contribution-ID is optional.
 func ParseConversationHeaders(conversationID, contributionID, inReplyTo string) (Conversation, error) {
 	c := Conversation{
 		ID:           trimSpace(conversationID),
@@ -57,7 +60,7 @@ func ParseConversationHeaders(conversationID, contributionID, inReplyTo string) 
 	if c == (Conversation{}) {
 		return c, nil
 	}
-	if !isID(c.ID) || !isID(c.Contribution) || c.InReplyTo != "" && !isID(c.InReplyTo) {
+	if c.ID != "" && !isID(c.ID) || !isID(c.Contribution) || c.InReplyTo != "" && !isID(c.InReplyTo) {
 		return Conversation{}, ErrInvalidConversation
 	}
 	return c, nil

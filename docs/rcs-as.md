@@ -55,8 +55,12 @@ The SIP layer implements `Deliverer`:
 
 The SIP layer reads the `Conversation-ID`, `Contribution-ID` and
 `InReplyTo-Contribution-ID` headers with `ParseConversationHeaders`.
-Notifications in pager mode come without them (rcsjta), which gives an empty
-`Conversation`. The SIP layer must give `Origin.Sender` the identity the
+rcsjta sends pager-mode messages and notifications without them, which gives
+an empty `Conversation`, and a `Contribution-ID` without a `Conversation-ID`
+with an INVITE, which is taken as it is (#298): a `Conversation-ID` made up
+for each request would put the messages of one conversation in different
+ones. A `Conversation-ID` or an `InReplyTo-Contribution-ID` without a
+`Contribution-ID` is refused (400). The SIP layer must give `Origin.Sender` the identity the
 network asserted, never one the client chose. It must name each user in one
 canonical form, since the queue and the sent-message records are keyed by
 that string.
