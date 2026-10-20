@@ -1,6 +1,7 @@
 package msrp
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -138,12 +139,15 @@ func TestAnAnswerBeingWrittenAtTheLimitIsDelivered(t *testing.T) {
 type flushBound struct {
 	fire  chan time.Time
 	calls atomic.Int32
+	// started is the duration the bound was last started for.
+	started atomic.Int64
 }
 
 func newFlushBound() *flushBound { return &flushBound{fire: make(chan time.Time)} }
 
-func (b *flushBound) after(time.Duration) <-chan time.Time {
+func (b *flushBound) after(d time.Duration) <-chan time.Time {
 	b.calls.Add(1)
+	b.started.Store(int64(d))
 	return b.fire
 }
 
@@ -299,4 +303,293 @@ func TestEveryAnswerQueuedAtTheLimitIsWrittenBeforeTheHalfClose(t *testing.T) {
 	}
 	_ = client.CloseWrite()
 	waitDone(t, (<-conns).Done(), "connection")
+}
+
+// QA on #237 (#240): a client under the unknown-session limit sends two
+// SENDs and half-closes. The two 481s already queued still reach it, and
+// the connection's end is the peer's close, EOF, as before.
+func TestAnswersQueuedWhenThePeerHalfClosesAreDelivered(t *testing.T) {
+	conns, client := slowRefusal(t, 0, time.Hour)
+	if _, err := client.Write(unknownSends(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	got, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("after %q: %v", got, err)
+	}
+	for _, want := range []string{"MSRP unkna 481", "MSRP unknb 481"} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("got %q, want %q in it", got, want)
+		}
+	}
+	c := <-conns
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), io.EOF) {
+		t.Fatalf("connection ended with %v, want the peer's EOF", c.Err())
+	}
+}
+
+// QA on #243 (team lead's decision): a peer that half-closes inside a
+// request still gets the answers to the requests it completed before it,
+// and the connection ends with the framing error, as before.
+func TestAnswersQueuedBeforeAHalfCloseInsideARequestAreDelivered(t *testing.T) {
+	for name, tail := range map[string]string{
+		"inside a line":   "MSRP q99999 SEND\r\nTo-Pa",
+		"inside the body": "MSRP q99999 SEND\r\nTo-Path: msrp://as.example.org:9000/guessq;tcp\r\nFrom-Path: " + clientURI + "\r\nMessage-ID: q\r\nByte-Range: 1-*/*\r\nContent-Type: text/plain\r\n\r\nhal",
+	} {
+		t.Run(name, func(t *testing.T) {
+			conns, client := slowRefusal(t, 150*time.Millisecond, time.Hour)
+			if _, err := client.Write(append(unknownSends(2), tail...)); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+			got, _ := io.ReadAll(client)
+			for _, want := range []string{"MSRP unkna 481", "MSRP unknb 481"} {
+				if !strings.Contains(string(got), want) {
+					t.Fatalf("got %q, want %q in it", got, want)
+				}
+			}
+			c := <-conns
+			waitDone(t, c.Done(), "connection")
+			if !errors.Is(c.Err(), ErrFraming) {
+				t.Fatalf("connection ended with %v, want the framing error", c.Err())
+			}
+		})
+	}
+}
+
+// Code review on #243: a client that sends two unknown SENDs and closes
+// altogether, reading nothing, resets the 481s' writes; the connection
+// still ends with the client's close, EOF, not with the write's error.
+func TestAPeerThatClosesAltogetherEndsTheConnectionWithEOF(t *testing.T) {
+	// The writes wait, so the end of the stream is read before any of
+	// them meets the reset.
+	conns, client := slowRefusal(t, 100*time.Millisecond, time.Hour)
+	if _, err := client.Write(unknownSends(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c := <-conns
+	waitDone(t, c.Done(), "connection")
+	if !errors.Is(c.Err(), io.EOF) {
+		t.Fatalf("connection ended with %v, want the peer's EOF", c.Err())
+	}
+}
+
+// firstFastConn writes its first write at once and the others after
+// delay, so a binding goes out and what follows is slow.
+type firstFastConn struct {
+	net.Conn
+	delay  time.Duration
+	writes atomic.Int64
+}
+
+func (c *firstFastConn) Write(p []byte) (int, error) {
+	if c.writes.Add(1) > 1 {
+		time.Sleep(c.delay)
+	}
+	return c.Conn.Write(p)
+}
+
+// Code review on #243: an active connection whose peer half-closes ends at
+// once, with what it still has to write: waiting would leave it open to a
+// Pool, which would put a new session on it. Here the peer, rcs-as in the
+// relay's place, half-closes with a 481 owed to it that takes 10 s to
+// write, and a flush bound that never ends; the connection must end in
+// well under that, and the next Pool.Open must dial anew and succeed.
+func TestAPooledConnectionWhosePeerHalfClosesIsNotReused(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	accepted := make(chan *wirePeer, 2)
+	go func() {
+		for {
+			nc, err := l.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- newWirePeer(t, nc)
+		}
+	}()
+	never := newFlushBound()
+	pool := &Pool{Config: Config{Clock: newFakeClock(), KeepAliveInterval: -1, refusalAfter: never.after}, Dial: func(ctx context.Context, _ URI) (net.Conn, error) {
+		var d net.Dialer
+		nc, err := d.DialContext(ctx, "tcp", l.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		return &firstFastConn{Conn: nc, delay: 10 * time.Second}, nil
+	}}
+	open := func(local string) (*Session, chan error) {
+		s := newTestSession(t, local, asURI, newRecorder())
+		done := make(chan error, 1)
+		go func() { done <- pool.Open(context.Background(), s) }()
+		return s, done
+	}
+	first, opened := open(clientURI)
+	p := <-accepted
+	p.respond(t, p.next(t), StatusOK)
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+	// A request the client must refuse, then the peer half-closes.
+	p.sendMessage(t, &Message{TransactionID: "n0sess10n", Method: MethodSend,
+		ToPath: []URI{mustURI(t, "msrp://client.example.com:2855/n0such;tcp")}, FromPath: []URI{mustURI(t, asURI)}, MessageID: "n0sess10n"})
+	if err := p.nc.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-first.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the half-closed active connection is still up")
+	}
+	_, opened = open("msrp://client.example.com:2855/an0th3r;tcp")
+	select {
+	case p2 := <-accepted:
+		p2.respond(t, p2.next(t), StatusOK)
+	case <-time.After(hangGuard):
+		t.Fatal("the Pool did not dial a new connection")
+	}
+	if err := <-opened; err != nil {
+		t.Fatalf("Open on a new connection = %v", err)
+	}
+}
+
+// slowBoundRefusal is slowRefusal with the flush's bound in the test's
+// hands (#237's flushBound).
+func slowBoundRefusal(t *testing.T, delay time.Duration, bound *flushBound) (<-chan *Conn, *net.TCPConn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	conns := make(chan *Conn, 1)
+	go func() {
+		nc, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c, err := NewPassiveConn(slowWriteConn{nc.(*net.TCPConn), delay}, &Registry{},
+			Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalAfter: bound.after})
+		if err != nil {
+			_ = nc.Close()
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		conns <- c
+	}()
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return conns, client.(*net.TCPConn)
+}
+
+// The wait for what is owed after a half-close is the refusal flush's
+// bound, started once with its default of 2 s (QA on #243): a peer that
+// half-closes behind a write that takes 10 s is let go when the bound
+// ends, still with its EOF, not when the write does.
+func TestTheHalfCloseFlushHasTheRefusalFlushsBound(t *testing.T) {
+	bound := newFlushBound()
+	conns, client := slowBoundRefusal(t, 10*time.Second, bound)
+	if _, err := client.Write(unknownSends(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	c := <-conns
+	bound.end(t)
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection outlived its bound, waiting on the write")
+	}
+	if !errors.Is(c.Err(), io.EOF) {
+		t.Fatalf("connection ended with %v, want the peer's EOF", c.Err())
+	}
+	if n, d := bound.calls.Load(), time.Duration(bound.started.Load()); n != 1 || d != refusalFlushTimeout || refusalFlushTimeout != 2*time.Second {
+		t.Fatalf("bound started %d times, for %v; want once, for the documented 2 s", n, d)
+	}
+}
+
+// refusingOverTCP is a passive connection over TCP with cfg, and its
+// client (QA's qaServe on #237).
+func refusingOverTCP(t *testing.T, cfg Config) (<-chan *Conn, net.Conn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	conns := make(chan *Conn, 1)
+	go func() {
+		nc, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c, err := NewPassiveConn(nc, &Registry{}, cfg)
+		if err != nil {
+			_ = nc.Close()
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		conns <- c
+	}()
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return conns, client
+}
+
+// QA on #237: without a test's hook the bound is real time, of the
+// configured length, so a client that reads its answers but never closes
+// is cut by it. Only liveness is checked, not how long it took.
+func TestTheFlushBoundRunsInRealTimeByDefault(t *testing.T) {
+	conns, client := refusingOverTCP(t, Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalFlush: 50 * time.Millisecond})
+	if _, err := client.Write(unknownSends(3)); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	if _, err := io.ReadAll(client); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, (<-conns).Done(), "connection")
+}
+
+// QA on #237: the bound is started with the configured length.
+func TestTheFlushBoundIsStartedWithItsConfiguredLength(t *testing.T) {
+	var got atomic.Int64
+	fire := make(chan time.Time)
+	after := func(d time.Duration) <-chan time.Time { got.Store(int64(d)); return fire }
+	conns, client := refusingOverTCP(t, Config{Clock: newFakeClock(), MaxFailedBinds: 2, refusalFlush: 1234 * time.Millisecond, refusalAfter: after})
+	if _, err := client.Write(unknownSends(3)); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(hangGuard))
+	_, _ = io.ReadAll(client)
+	select {
+	case fire <- time.Time{}:
+	case <-time.After(hangGuard):
+		t.Fatal("the flush is not waiting on its bound")
+	}
+	waitDone(t, (<-conns).Done(), "connection")
+	if d := time.Duration(got.Load()); d != 1234*time.Millisecond {
+		t.Fatalf("bound started with %v, want the configured 1.234s", d)
+	}
 }
