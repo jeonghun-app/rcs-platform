@@ -23,8 +23,7 @@ import (
 // the engine like pager-mode ones: stored, then delivered to the peer.
 func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
-	if bad := unsupported(req, "timer"); len(bad) > 0 {
-		s.refuseUnsupported(u, req, bad)
+	if s.refuseUnsupported(u, req, "timer") {
 		return
 	}
 	// The service is what the client asks for: a chat session, or one for

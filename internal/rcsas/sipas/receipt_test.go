@@ -101,3 +101,68 @@ func TestACPIMFromInTheOtherFormOfTheSenderIsTheSender(t *testing.T) {
 		}
 	}
 }
+
+// The code review's case on #242 (round 2): pcscf asserts a non-numeric
+// SIP identity with the tel URI of its set (#208), and that is one user,
+// keyed by the tel URI. A message written to the SIP identity finds its
+// receipt from that user too.
+func TestANonNumericSIPIdentityAndItsTelURIAreOneUser(t *testing.T) {
+	core := newFakeCore(t)
+	a, _ := startEngine(t, core, messaging.Config{})
+	p := a.dial(t)
+	aliceName := "sip:alice@" + domain
+	pair := []string{"<" + aliceName + ">", "<" + alice + ">"}
+	for i, pai := range [][]string{pair, {"<" + aliceName + ">"}, {"<" + alice + ">"}} {
+		if res := p.send(pagerAs(bob, cpimFrom("<"+messaging.AnonymousURI+">", fmt.Sprint("m", i), 0, "hi"), pai...)); res.StatusCode != 202 {
+			t.Fatalf("asserted %v: answered %d", pai, res.StatusCode)
+		}
+		core.next(t)
+	}
+	// bob writes to alice's SIP identity; her receipt comes asserted as
+	// the pair.
+	if res := p.send(pagerAs(aliceName, cpimFrom("<"+messaging.AnonymousURI+">", "b1", imdn.PositiveDelivery, "hi"), "<"+bob+">")); res.StatusCode != 202 {
+		t.Fatalf("bob's message answered %d", res.StatusCode)
+	}
+	core.next(t)
+	if res := p.send(pagerAs(bob, deliveredBody(t, "b1"), pair...)); res.StatusCode != 202 {
+		t.Fatalf("alice's receipt answered %d", res.StatusCode)
+	}
+}
+
+// The pairs pcscf asserts (#208), from QA's second report on #242, with
+// the lead's rule: one SIP identity and one tel URI are one user, keyed by
+// the tel URI, unless the SIP identity is a home-domain number other than
+// the tel URI's. A number at another host, and a home-domain number marked
+// user=ip, count as names.
+func TestTheAssertedPairsPcscfMakesAreOneUser(t *testing.T) {
+	for name, c := range map[string]struct {
+		pai  []string
+		want int
+	}{
+		"home sip number + tel":                           {[]string{"<sip:+15550100001@" + domain + ">", "<" + alice + ">"}, 202},
+		"home sip number upper host + tel":                {[]string{"<sip:+15550100001@" + strings.ToUpper(domain) + ">", "<" + alice + ">"}, 202},
+		"sips number + tel":                               {[]string{"<sips:+15550100001@" + domain + ">", "<" + alice + ">"}, 202},
+		"tel first then sip":                              {[]string{"<" + alice + ">", "<sip:+15550100001@" + domain + ">"}, 202},
+		"non-number sip + tel":                            {[]string{"<sip:alice@" + domain + ">", "<" + alice + ">"}, 202},
+		"number sip other host + tel":                     {[]string{"<sip:+15550100001@other.example.net>", "<" + alice + ">"}, 202},
+		"number at another host, user=phone, another tel": {[]string{"<sip:+15550100003@other.example.net;user=phone>", "<" + alice + ">"}, 202},
+		"home number user=ip + tel":                       {[]string{"<sip:+15550100001@" + domain + ";user=ip>", "<" + alice + ">"}, 202},
+		"sip + tel different numbers":                     {[]string{"<sip:+15550100001@" + domain + ">", "<" + bob + ">"}, 403},
+		"two sip same user":                               {[]string{"<sip:+15550100001@" + domain + ">", "<" + aliceSIP + ">"}, 403},
+		"sip + sips same user":                            {[]string{"<sip:+15550100001@" + domain + ">", "<sips:+15550100001@" + domain + ">"}, 403},
+		"two tel same user":                               {[]string{"<" + alice + ">", "<tel:+1-555-010-0001>"}, 403},
+		"comma list of three":                             {[]string{"<" + alice + ">, <sip:+15550100001@" + domain + ">, <" + aliceSIP + ">"}, 403},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := &fakeEngine{}
+			a := startAS(t, e, newFakeCore(t))
+			res := a.dial(t).send(pagerAs(bob, cpimBody("m1", "hi"), c.pai...))
+			if res.StatusCode != c.want {
+				t.Fatalf("%v: %d, want %d", c.pai, res.StatusCode, c.want)
+			}
+			if o := e.origins(); c.want == 202 && (len(o) != 1 || o[0].Sender != alice) {
+				t.Fatalf("%v: origins %+v, want alice's tel URI as the sender", c.pai, o)
+			}
+		})
+	}
+}

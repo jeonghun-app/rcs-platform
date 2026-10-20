@@ -51,6 +51,10 @@ type Config struct {
 	SIPHost       netip.Addr
 	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN).
 	HomeDomain string
+	// ServiceName is the host of the AS URI the iFC name rcs-as by
+	// (HSS_RCS_AS_URI), which scscf puts on top of the Route of what it
+	// hands rcs-as; empty for none.
+	ServiceName string
 	// Core is where rcs-as sends the requests it originates (scscf), a SIP
 	// URI of a host with transport=tcp and lr, and Namespace the Cloud Map
 	// namespace its names are looked up in (ADR 0007 §5).
@@ -137,6 +141,14 @@ func Configure(s *runtime.Settings) Config {
 	c.HomeDomain = s.Shared.RequiredString("IMS_DOMAIN")
 	c.Namespace = s.ServiceNamespace()
 	c.Core = coreURI(s)
+	service := ""
+	if c.Namespace != "" {
+		service = "rcs-as." + c.Namespace
+	}
+	c.ServiceName = e.String("SERVICE_NAME", service)
+	if u, err := sip.ParseURI("sip:" + c.ServiceName); c.ServiceName != "" && (err != nil || u.User != "" || u.Port != 0 || len(u.Params) > 0 || u.Host != c.ServiceName) {
+		e.Invalid("SERVICE_NAME", "not a host name")
+	}
 	if _, port, err := net.SplitHostPort(c.MSRPListenAddr); err != nil {
 		e.Invalid("MSRP_LISTEN_ADDR", "not host:port")
 	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
@@ -261,8 +273,14 @@ func coreURI(s *runtime.Settings) sip.URI {
 		return sip.URI{}
 	}
 	host := strings.TrimSuffix(strings.TrimPrefix(u.Host, "["), "]")
-	if _, err := netip.ParseAddr(host); err != nil && !runtime.InServiceNamespace(host, s.ServiceNamespace()) {
+	a, err := netip.ParseAddr(host)
+	switch {
+	case err != nil && !runtime.InServiceNamespace(host, s.ServiceNamespace()):
 		e.Invalid("CORE_URI", "a host name outside RCS_SERVICE_NAMESPACE, which rcs-as does not look up (ADR 0007 §5)")
+		return sip.URI{}
+	case err == nil && !runtime.IsPrivateAddr(a.Unmap()) && !a.Unmap().IsLoopback():
+		// The resolver would refuse it at every send (sipas.Resolver).
+		e.Invalid("CORE_URI", "an address that is neither private nor loopback (ADR 0007 §5)")
 		return sip.URI{}
 	}
 	return u

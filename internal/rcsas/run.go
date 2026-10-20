@@ -159,8 +159,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 }
 
 // selfURIs are the URIs by which a Route names this task: its instance
-// address, and its service name in the namespace, which is the AS URI the
-// default profile's iFC give scscf (hss RCS_AS_URI), on the listener's port
+// address, and its service name (RCSAS_SERVICE_NAME), the host of the AS URI
+// the iFC give scscf (HSS_RCS_AS_URI), on the listener's port
 // and on 5060, the default a URI without a port means. The proxy compares
 // them as written, never through DNS, as pcscf does.
 func selfURIs(cfg Config, port uint16) []sip.URI {
@@ -169,8 +169,8 @@ func selfURIs(cfg Config, port uint16) []sip.URI {
 		host = "[" + host + "]"
 	}
 	hosts := []string{host}
-	if cfg.Namespace != "" {
-		hosts = append(hosts, "rcs-as."+cfg.Namespace)
+	if cfg.ServiceName != "" {
+		hosts = append(hosts, cfg.ServiceName)
 	}
 	ports := []int{int(port)}
 	if port != 5060 {

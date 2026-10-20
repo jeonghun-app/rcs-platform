@@ -107,9 +107,10 @@ delivery for a new message and send it once more without end. A client that
 writes such a tag only has its own request refused.
 
 scscf hands rcs-as a request with the AS URI of the iFC on top of its `Route`
-(TS 24.229 §5.4.3.2), `sip:rcs-as.<RCS_SERVICE_NAMESPACE>` in the default
-profile, and its own entry below. rcs-as takes as its own, and removes, a
-`Route` naming its service name or its instance address (`RCSAS_SIP_HOST`), on
+(TS 24.229 §5.4.3.2), `HSS_RCS_AS_URI` (`sip:rcs-as.<RCS_SERVICE_NAMESPACE>` by
+default), and its own entry below. rcs-as takes as its own, and removes, a
+`Route` naming its service name (`RCSAS_SERVICE_NAME`, which must be the host
+of `HSS_RCS_AS_URI`) or its instance address (`RCSAS_SIP_HOST`), on
 the listener's port or 5060, compared as written, before any DNS lookup. What
 it forwards then goes on to `scscf` rather than to rcs-as again.
 
@@ -117,11 +118,16 @@ it forwards then goes on to `scscf` rather than to rcs-as again.
 
 The sender is the user the core asserted in `P-Asserted-Identity` (RFC 3325
 §9.1), never a header the client wrote. rcs-as takes what pcscf asserts (#208):
-one identity, or one user's SIP and tel identities together. More than two, two
-of one scheme, or identities of two users are refused with 403 and counted
-(`sip.asserted.refused`), as is a MESSAGE with none. Every asserted identity is
-one the sender may name in its CPIM `From`, in any of the forms below. The
-recipient is the Request-URI.
+one identity, or a SIP identity with the tel URI of its implicit registration
+set (#16 decision 5), which are one user whether the SIP identity is a number
+(`sip:+...@<domain>`) or a name (`sip:alice@<domain>`). Only a home-domain
+number must be the tel URI's number; a number at another host, or one marked
+`user=ip`, counts as a name. The user is the tel URI when one is asserted, and
+the SIP identity otherwise. More than two identities, two of one scheme, or a
+home-domain number other than the tel URI's are refused with 403 and counted (`sip.asserted.refused`), as is a MESSAGE with
+none. Every asserted identity is one the sender may name in its CPIM `From`, in
+any of the forms below, and a notification from the user finds a message
+written to any of them. The recipient is the Request-URI.
 
 Each user is named in one form (`messaging.UserOf`), since the queues, a sender's
 share of them and the sent-message records are keyed by that string. A global
@@ -145,6 +151,7 @@ set.
 |---|---|
 | stored | 202 Accepted (RFC 3428 §7) |
 | a `Require` option tag (rcs-as supports none for MESSAGE) | 420, with `Unsupported` (RFC 3261 §8.2.2.3) |
+| an empty or unreadable `Require` | 400 |
 | not `message/cpim` | 415, with `Accept: message/cpim` |
 | no asserted identity, or not as above | 403 |
 | a Request-URI that names no user | 404 |
@@ -777,9 +784,7 @@ change and notifying it leaves exactly such a gap.
 
 Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 `RCS_IMS_DOMAIN`, the home domain at which a SIP URI names a telephone number
-([Who sends, and to whom](#who-sends-and-to-whom)), and takes its service name,
-`rcs-as.<RCS_SERVICE_NAMESPACE>`, as its own in a `Route` (below). The `RCSAS_`
-settings:
+([Who sends, and to whom](#who-sends-and-to-whom)). The `RCSAS_` settings:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -787,7 +792,8 @@ settings:
 | `RCSAS_MSRP_LISTEN_ADDR` | `:2855` | MSRP listener for `msrp-relay`; its port is the advertised one |
 | `RCSAS_SIP_LISTEN_ADDR` | `0.0.0.0:5060` | SIP listener (TCP), which only the core reaches; port 0 is refused, since the HSS's AS URI names a fixed port |
 | `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
-| `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, an address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
+| `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, a private or loopback address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
+| `RCSAS_SERVICE_NAME` | `rcs-as.<RCS_SERVICE_NAMESPACE>`, none without a namespace | The host of the AS URI the iFC name rcs-as by (`HSS_RCS_AS_URI`), which rcs-as takes as its own in a `Route`. Change both together, or an OPTIONS scscf hands rcs-as comes back to it (482) |
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
 | `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` | `32` | Sessions one user opens on this task; an INVITE beyond it is answered 486 |
 | `RCSAS_MAX_INCOMING_SESSIONS_PER_USER` | `32` | Sessions rcs-as opens to one user on this task; a delivery beyond it waits |

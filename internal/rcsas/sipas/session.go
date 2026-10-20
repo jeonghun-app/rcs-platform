@@ -653,8 +653,7 @@ func directionRefusedBy(req *sip.Request) bool {
 // answer in its ACK must keep the path. An UPDATE without an offer is a
 // plain refresh, whose 2xx carries no SDP (RFC 3311 §5.2).
 func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
-	if bad := unsupported(req, "timer"); len(bad) > 0 {
-		s.refuseUnsupported(u, req, bad)
+	if s.refuseUnsupported(u, req, "timer") {
 		return
 	}
 	var body []byte

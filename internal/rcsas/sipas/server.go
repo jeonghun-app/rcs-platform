@@ -244,11 +244,18 @@ const allowed = "INVITE, ACK, CANCEL, BYE, UPDATE, MESSAGE, OPTIONS, REGISTER"
 // so (RFC 3428 §7).
 func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
-	if bad := unsupported(req); len(bad) > 0 {
+	bad, err := unsupported(req)
+	switch {
+	case err != nil:
+		// No option tag to name in an Unsupported (RFC 3261 §20.32).
+		s.cfg.Metrics.Count("sip.message.400", 1)
+		s.respond(u, req, 400)
+		return
+	case len(bad) > 0:
 		// RFC 3261 §8.2.2.3: a client that requires an extension rcs-as
 		// lacks must not have its request served without it.
 		s.cfg.Metrics.Count("sip.message.420", 1)
-		s.refuseUnsupported(u, req, bad)
+		s.respondWith(u, req, 420, [2]string{"Unsupported", strings.Join(bad, ", ")})
 		return
 	}
 	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, cpim.ContentType) {
@@ -274,12 +281,12 @@ func (s *Server) message(ctx context.Context, u *proxy.UAS) {
 
 // unsupported are the option tags of req's Require that are not among
 // supported, the ones rcs-as supports for its method: none for a MESSAGE,
-// timer for a session (RFC 4028).
-func unsupported(req *sip.Request, supported ...string) []string {
+// timer for a session (RFC 4028); an error for a Require that is empty or
+// does not parse.
+func unsupported(req *sip.Request, supported ...string) ([]string, error) {
 	tags, err := req.Header.Require()
 	if err != nil {
-		// Unreadable: what it requires is not known to be supported.
-		return []string{"(malformed)"}
+		return nil, err
 	}
 	var out []string
 	for _, t := range tags {
@@ -287,12 +294,23 @@ func unsupported(req *sip.Request, supported ...string) []string {
 			out = append(out, t)
 		}
 	}
-	return out
+	return out, nil
 }
 
-// refuseUnsupported answers 420 with the option tags rcs-as lacks.
-func (s *Server) refuseUnsupported(u *proxy.UAS, req *sip.Request, bad []string) {
-	s.respondWith(u, req, 420, [2]string{"Unsupported", strings.Join(bad, ", ")})
+// refuseUnsupported answers 420 with the option tags rcs-as lacks, or 400
+// for a Require it cannot read, which names none (RFC 3261 §20.32); it
+// reports whether it answered.
+func (s *Server) refuseUnsupported(u *proxy.UAS, req *sip.Request, supported ...string) bool {
+	bad, err := unsupported(req, supported...)
+	switch {
+	case err != nil:
+		s.respond(u, req, 400)
+	case len(bad) > 0:
+		s.respondWith(u, req, 420, [2]string{"Unsupported", strings.Join(bad, ", ")})
+	default:
+		return false
+	}
+	return true
 }
 
 // origin reads the engine's Origin from req, or the status that refuses it.
@@ -318,33 +336,51 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 
 // asserted reads the sender the network asserted (RFC 3325 §9.1), never a
 // header the client wrote, or the status that refuses the request: 403. It
-// takes what pcscf asserts, one identity or the SIP and tel pair of one
-// user (#208), and nothing more: at most two, at most one of each scheme,
-// all one user (messaging.UserOf). That user is the sender, and each
-// identity as asserted is one the sender may name itself by, as is any
+// takes what pcscf asserts (#208): one identity, or a SIP identity and a
+// tel URI of the same registration, which are one user (#16 decision 5).
+// So at most one of each scheme, and only a SIP identity at the home domain
+// whose user part is a number (a home-domain number, messaging.UserOf) must
+// be that tel URI's number; any other SIP identity, a name or a number at
+// another host, pairs with the tel URI as pcscf found it. The user is the
+// tel URI when one is asserted, and the SIP identity's UserOf otherwise.
+// Each identity as asserted is one the sender may name itself by, as is any
 // other form of it (the engine compares them with UserOf).
 func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 	pai, err := req.Header.PAssertedIdentity()
 	if err != nil || len(pai) == 0 || len(pai) > 2 {
 		return s.refuseAsserted()
 	}
-	var sender string
+	var sipUser, telUser string
+	homeNumber := false
 	var identities []string
-	schemes := map[string]bool{}
 	for _, a := range pai {
 		raw := a.URI.String()
 		user, ok := messaging.UserOf(raw, s.cfg.HomeDomain)
-		scheme := a.URI.Scheme
-		if scheme == "sips" {
-			scheme = "sip"
-		}
-		if !ok || schemes[scheme] || sender != "" && user != sender {
+		if !ok {
 			return s.refuseAsserted()
 		}
-		schemes[scheme], sender = true, user
+		switch a.URI.Scheme {
+		case "tel":
+			if telUser != "" {
+				return s.refuseAsserted()
+			}
+			telUser = user
+		default: // sip or sips, as UserOf took it
+			if sipUser != "" {
+				return s.refuseAsserted()
+			}
+			sipUser = user
+			homeNumber = strings.EqualFold(a.URI.Host, s.cfg.HomeDomain) && strings.HasPrefix(user, "tel:")
+		}
 		identities = append(identities, raw)
 	}
-	return sender, identities, 0
+	if telUser == "" {
+		return sipUser, identities, 0
+	}
+	if homeNumber && sipUser != telUser {
+		return s.refuseAsserted()
+	}
+	return telUser, identities, 0
 }
 
 func (s *Server) refuseAsserted() (string, []string, int) {
