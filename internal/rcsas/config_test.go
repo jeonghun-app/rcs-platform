@@ -54,7 +54,8 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	}
 	if c.Store != StoreDynamoDB || c.DynamoDB.Table != "messages" || c.MSRPListenAddr != ":2855" || m.MSRPPort != 2855 ||
 		m.MSRPHost != "10.0.0.7" || m.StoreTTL != 7*24*time.Hour || m.SentTTL != 8*24*time.Hour || m.PagerLimit != 1300 ||
-		m.MaxMessageSize != 256<<10 || m.SenderRate.PerMinute != 60 || m.MSRP.KeepAliveInterval != 240*time.Second {
+		m.MaxMessageSize != 256<<10 || m.SenderRate.PerMinute != 60 || m.MSRP.KeepAliveInterval != 240*time.Second ||
+		c.MaxSessions != 20_000 || c.MaxOutgoingPerUser != 32 || c.MaxIncomingPerUser != 32 {
 		t.Fatalf("config %+v", c)
 	}
 }
@@ -68,7 +69,8 @@ func TestEverySettingIsRead(t *testing.T) {
 		"RCSAS_NOTIFICATION_RATE", "100", "RCSAS_NOTIFICATION_BURST", "50", "RCSAS_DELIVERY_TIMEOUT", "10s",
 		"RCSAS_INVITE_TIMEOUT", "1m", "RCSAS_STORE_TIMEOUT", "2s", "RCSAS_SWEEP_INTERVAL", "30s", "RCSAS_MSRP_KEEPALIVE", "100s",
 		"RCSAS_TRUSTED_ROUTES", "sip:as.ims.example.net;lr", "RCSAS_QUEUE_SENDER_SHARE", "4", "RCSAS_MAX_QUEUE_MESSAGES", "50", "RCSAS_MAX_QUEUE_BYTES", "1048576",
-		"RCSAS_ANSWER_TIMEOUT", "20s", "RCSAS_RETRY_INTERVAL", "30s", "RCSAS_MAX_RETRY_INTERVAL", "10m"))
+		"RCSAS_ANSWER_TIMEOUT", "20s", "RCSAS_RETRY_INTERVAL", "30s", "RCSAS_MAX_RETRY_INTERVAL", "10m",
+		"RCSAS_MAX_SESSIONS", "500", "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "8", "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "9"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +81,8 @@ func TestEverySettingIsRead(t *testing.T) {
 		m.DeliveryTimeout != 10*time.Second || m.InviteTimeout != time.Minute || m.StoreTimeout != 2*time.Second ||
 		m.SweepInterval != 30*time.Second || m.MSRP.KeepAliveInterval != 100*time.Second ||
 		m.TrustedRoutes[0] != "sip:as.ims.example.net;lr" || m.QueueSenderShare != 4 || m.MaxQueueMessages != 50 || m.MaxQueueBytes != 1<<20 ||
-		m.AnswerTimeout != 20*time.Second || m.RetryInterval != 30*time.Second || m.MaxRetryInterval != 10*time.Minute {
+		m.AnswerTimeout != 20*time.Second || m.RetryInterval != 30*time.Second || m.MaxRetryInterval != 10*time.Minute ||
+		c.MaxSessions != 500 || c.MaxOutgoingPerUser != 8 || c.MaxIncomingPerUser != 9 {
 		t.Fatalf("config %+v", c)
 	}
 }
@@ -109,6 +112,9 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"zero answer":     {with(devEnv, "RCSAS_ANSWER_TIMEOUT", "0s"), "RCSAS_ANSWER_TIMEOUT"},
 		"retry backwards": {with(devEnv, "RCSAS_RETRY_INTERVAL", "2h"), "RCSAS_MAX_RETRY_INTERVAL"},
 		"negative burst":  {with(devEnv, "RCSAS_NOTIFICATION_BURST", "-1"), "RCSAS_NOTIFICATION_BURST"},
+		"zero sessions":   {with(devEnv, "RCSAS_MAX_SESSIONS", "0"), "RCSAS_MAX_SESSIONS"},
+		"zero per user":   {with(devEnv, "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER"},
+		"zero incoming":   {with(devEnv, "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_INCOMING_SESSIONS_PER_USER"},
 	} {
 		_, err := configure(c.env)
 		if err == nil || !strings.Contains(err.Error(), c.want) {

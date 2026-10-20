@@ -23,10 +23,10 @@ func concurrentMARs(t *testing.T, e *env, a, b *HSS) {
 	e.provision(impi1, impu1)
 	// A MAR's Cx timeout covers its wait for the subscriber's lock, behind
 	// the other clients' MARs on the same task, as well as its own reads
-	// and writes. On a loaded host DynamoDB Local takes more than
-	// DefaultCxTimeout for that, and the MAR is answered 5012 (#200). The
-	// property here is the sequence numbers, so the bound is only the hang
-	// guard.
+	// and writes, and the retries of a write that lost to the other task,
+	// which run until that deadline (#200). On a loaded host DynamoDB Local
+	// takes more than DefaultCxTimeout for that. The property here is the
+	// sequence numbers, so the bound is only the hang guard.
 	taskA := serveHSSWith(t, a, "hss-a.rcs.local", realWait)
 	taskB := serveHSSWith(t, b, "hss-b.rcs.local", realWait)
 	clients := []*cscf{

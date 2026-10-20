@@ -19,6 +19,9 @@ const (
 	cpmICSI = `3gpp-service\.ims\.icsi\.oma\.cpm\.`
 	// The RCS IARIs, such as FT via HTTP and chatbots (RCC.07 Table 3).
 	rcsIARI = `3gpp-application\.ims\.iari\.rcs\.`
+	// The OMA SIMPLE IM feature tag, with which the reference client
+	// (rcsjta) asks for a 1-to-1 chat instead of the CPM chat ICSI.
+	omaIM = `\+g\.oma\.sip-im`
 )
 
 // featureTagHeaders carry the caller's and callee's feature tags;
@@ -45,7 +48,8 @@ const servedUserHeader = "P-Served-User"
 // terminating participating function and store messages for users who are
 // offline (docs/architecture.md §5):
 //
-//	10  INVITE for an RCS service (CPM ICSI or RCS IARI)   SESSION_TERMINATED
+//	10  INVITE for an RCS service (CPM ICSI, RCS IARI, or
+//	    OMA SIMPLE IM, rcsjta's chat)                        SESSION_TERMINATED
 //	20  MESSAGE                                             SESSION_TERMINATED
 //	30  OPTIONS for an RCS service (capability discovery)   SESSION_CONTINUED
 //	40  REGISTER (third-party registration)                 SESSION_CONTINUED
@@ -71,7 +75,7 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 	rcsRequest := func(method string) *ifc.TriggerPoint {
 		spts := []ifc.SPT{{Groups: []int{0}, Condition: ifc.Method(method)}}
 		for _, h := range featureTagHeaders {
-			for _, tag := range []string{cpmICSI, rcsIARI} {
+			for _, tag := range []string{cpmICSI, rcsIARI, omaIM} {
 				spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SIPHeader{Header: h, Content: tag}})
 			}
 		}

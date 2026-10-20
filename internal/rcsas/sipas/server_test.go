@@ -123,8 +123,8 @@ func TestOtherRequestsAreAnsweredOrPassedOn(t *testing.T) {
 	e := &fakeEngine{}
 	a := startAS(t, e, core)
 	p := a.dial(t)
-	if res := p.send(msg{method: "INVITE", uri: bob}); res.StatusCode != 405 || res.Header.Get("Allow") != allowed {
-		t.Fatalf("INVITE answered %d, Allow %q", res.StatusCode, res.Header.Get("Allow"))
+	if res := p.send(msg{method: "SUBSCRIBE", uri: bob}); res.StatusCode != 405 || res.Header.Get("Allow") != allowed {
+		t.Fatalf("SUBSCRIBE answered %d, Allow %q", res.StatusCode, res.Header.Get("Allow"))
 	}
 	inDialog := pager(cpimBody("m1", "hi"))
 	inDialog.toTag = "b1"
