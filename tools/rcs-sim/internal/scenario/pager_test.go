@@ -48,6 +48,11 @@ func sipStack(t *testing.T) (scenario.Config, *simtest.IMSCore) {
 	}
 	cfg.SIP = client(self.URI, selfIMPI, "self-password", "urn:uuid:00000000-0000-4000-8000-000000000001")
 	cfg.SIPPeer = client(peer.URI, peerIMPI, "peer-password", "urn:uuid:00000000-0000-4000-8000-000000000002")
+	// As an operator's DELETE through the HSS API would (#135 AC 3).
+	cfg.Deregister = func(_ context.Context, impu sip.URI) error {
+		core.Deregister(impu.String(), "deactivated")
+		return nil
+	}
 	return cfg, core
 }
 
@@ -116,13 +121,15 @@ func TestSIPScenariosWaitForASIPConfiguration(t *testing.T) {
 	cfg := stack(t)
 	_, results := runAll(t, cfg, "all")
 	for _, r := range results {
-		if r.Scenario == "pager-message" {
+		if r.Scenario == "pager-message" || r.Scenario == "reg-event" {
 			t.Fatalf("all ran %+v without SIP", r)
 		}
 	}
-	ok, results := runAll(t, cfg, "pager-message")
-	if ok || len(results) != 1 || results[0].OK {
-		t.Fatalf("results %+v", results)
+	for _, name := range []string{"pager-message", "reg-event"} {
+		ok, results := runAll(t, cfg, name)
+		if ok || len(results) != 1 || results[0].OK {
+			t.Fatalf("%s: results %+v", name, results)
+		}
 	}
 }
 
@@ -180,6 +187,26 @@ func TestPeerOfflineTakesStoreAndForwardButNotALostMessage(t *testing.T) {
 		core.Offline = simtest.StoreAndForward
 		ok, results := runAll(t, cfg, "pager-message")
 		if d := byStep(results)["peer-offline"]; !ok || d.Detail["status"] != 202 || d.Detail["stored"] != 1 {
+			t.Fatalf("results %+v", results)
+		}
+	})
+	t.Run("refused otherwise", func(t *testing.T) {
+		// QA on #209: 404 is not the platform's answer, nor a store.
+		cfg, core := sipStack(t)
+		core.Offline = simtest.RefuseNotFound
+		ok, results := runAll(t, cfg, "pager-message")
+		last := results[len(results)-1]
+		if ok || last.Step != "peer-offline" || last.Detail["status"] != 404 ||
+			last.Error != "MESSAGE to the unregistered peer answered 404, want 480 or store-and-forward" {
+			t.Fatalf("results %+v", results)
+		}
+	})
+	t.Run("changed in store", func(t *testing.T) {
+		cfg, core := sipStack(t)
+		core.Offline = simtest.StoreAndChange
+		ok, results := runAll(t, cfg, "pager-message")
+		last := results[len(results)-1]
+		if ok || last.Step != "peer-offline" || last.Error != "the stored message changed on the way" {
 			t.Fatalf("results %+v", results)
 		}
 	})
@@ -291,5 +318,56 @@ func TestEveryPagerCheckFailsItsStep(t *testing.T) {
 				t.Fatalf("results %+v", results)
 			}
 		})
+	}
+}
+
+func TestThisRunsMessageWithAnotherIDIsNamedNotSkipped(t *testing.T) {
+	// QA on #209: this run's message with a rewritten Message-ID is still
+	// this run's (the token in its text): the step names it at once, and
+	// does not skip it until the step times out.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	core.Rewrite = func(r *sip.Request) {
+		r.Body = []byte(regexp.MustCompile(`imdn\.Message-ID: \S+`).ReplaceAllString(string(r.Body), "imdn.Message-ID: another0message0id"))
+	}
+	ok, results := runAll(t, cfg, "pager-message")
+	last := results[len(results)-1]
+	if ok || last.Step != "receive" || last.Error != "the message received is not the one sent" || last.Detail["skipped"] != 0 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAWaitThatTimesOutReportsWhatItSkipped(t *testing.T) {
+	// QA on #209: a stale store and a message that never came read
+	// differently. Every MESSAGE to the peer here looks like an earlier
+	// run's, so receive skips it and times out.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 2 * time.Second
+	core.Rewrite = func(r *sip.Request) {
+		body := regexp.MustCompile(`imdn\.Message-ID: \S+`).ReplaceAllString(string(r.Body), "imdn.Message-ID: 0ld0message0id")
+		r.Body = []byte(regexp.MustCompile(`rcs-sim pager-mode message \S+`).ReplaceAllString(body, "rcs-sim pager-mode message"))
+	}
+	ok, results := runAll(t, cfg, "pager-message")
+	last := results[len(results)-1]
+	if ok || last.Step != "receive" || last.Detail["skipped"] != 1 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestANotificationWaitThatTimesOutReportsWhatItSkipped(t *testing.T) {
+	// QA on #216: the delivery notification's wait says what it skipped
+	// too. Its own Message-ID rewritten, the notification looks like an
+	// earlier run's and is skipped.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 2 * time.Second
+	core.Rewrite = func(r *sip.Request) {
+		if strings.Contains(string(r.Body), "imdn+xml") {
+			r.Body = []byte(regexp.MustCompile(`imdn\.Message-ID: \S+`).ReplaceAllString(string(r.Body), "imdn.Message-ID: 0ld0notification"))
+		}
+	}
+	ok, results := runAll(t, cfg, "pager-message")
+	last := results[len(results)-1]
+	if ok || last.Step != "delivery-notification" || last.Detail["skipped"] != 1 {
+		t.Fatalf("results %+v", results)
 	}
 }

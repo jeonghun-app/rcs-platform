@@ -23,6 +23,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
@@ -65,9 +66,19 @@ type Config struct {
 	// leaves the SIP scenarios out, and naming one fails it at its first
 	// step.
 	SIP, SIPPeer *sipua.Config
+	// Deregister has the network end the registration of impu, as an
+	// operator's DELETE through the HSS API does (an RTR to the S-CSCF, TS
+	// 24.229 §5.4.1.5), for reg-event's network-deregister step. Nil skips
+	// that step, which RequireAll (-require-all) makes a failure.
+	Deregister func(ctx context.Context, impu sip.URI) error
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
+
+	// RequireAll makes a step that would be skipped, for want of
+	// something the stack does not offer yet, a failure instead, so CI can
+	// require it once the stack does.
+	RequireAll bool
 	// KeepAliveTimeout bounds the keep-alive step alone, the IdleWait
 	// included, so it must be longer than IdleWait; zero is StepTimeout. A
 	// short one makes a client that sends no keep-alive fail soon without
@@ -86,6 +97,9 @@ type Result struct {
 	Millis   int64  `json:"ms"`
 	// Error says what failed, without identifiers.
 	Error string `json:"error,omitempty"`
+	// Skipped, on a step that did not run but did not fail either, says
+	// why, in a fixed text. Config.RequireAll makes it a failure.
+	Skipped string `json:"skipped,omitempty"`
 	// Detail holds sizes and counts.
 	Detail map[string]int64 `json:"detail,omitempty"`
 }
@@ -100,13 +114,14 @@ var scenarios = map[string]func(*run) error{
 	"chat-client-originated": chatClientOriginated,
 	"chat-core-originated":   chatCoreOriginated,
 	"pager-message":          pagerMessage,
+	"reg-event":              regEvent,
 }
 
 // sipScenarios need the SIP clients; "all" leaves them out of a run with no
 // SIP configuration at all, as a stack without pcscf cannot run them
 // (#135). With SIP configured they run, and one that lacks a setting it
 // needs, such as the peer, fails at its first step rather than vanish.
-var sipScenarios = map[string]bool{"pager-message": true}
+var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true}
 
 // Names lists the built-in scenarios, sorted.
 func Names() []string {
@@ -144,7 +159,7 @@ func Run(ctx context.Context, cfg Config, names []string, report Report) (bool, 
 		r := &run{ctx: ctx, cfg: cfg, name: n, report: report}
 		err := scenarios[n](r)
 		r.cleanup()
-		if err != nil || r.failed {
+		if err != nil && !errors.Is(err, errStepFailed) || r.failed {
 			ok = false
 		}
 	}
@@ -161,7 +176,8 @@ type run struct {
 	cleanups []func()
 }
 
-// errStepFailed stops a scenario after a failed step has been reported.
+// errStepFailed stops a scenario after a failed or skipped step has been
+// reported.
 var errStepFailed = errors.New("step failed")
 
 // step runs f as the step called name and reports it. A failure ends the
@@ -186,6 +202,18 @@ func (r *run) stepWithin(name string, timeout time.Duration, f func(ctx context.
 		return errStepFailed
 	}
 	return nil
+}
+
+// skip reports the step called name as not run, for reason, a fixed text,
+// and ends the scenario. With Config.RequireAll it is a failure.
+func (r *run) skip(name, reason string) error {
+	res := Result{Scenario: r.name, Step: name, OK: true, Skipped: reason}
+	if r.cfg.RequireAll {
+		res = Result{Scenario: r.name, Step: name, Error: reason}
+		r.failed = true
+	}
+	r.report(res)
+	return errStepFailed
 }
 
 // onEnd registers f to run when the scenario ends, last first.

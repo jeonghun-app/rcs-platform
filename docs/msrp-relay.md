@@ -281,7 +281,7 @@ What a client can make one task hold, and what happens at each bound:
 | PROXY header within 5 s, at most 1 KiB of address and TLVs | the connection is closed |
 | session id not in the issued form (32 lower-case base32 characters) | 481, no store call |
 | `RELAY_FAILED_LOOKUPS_PER_SOURCE` per source per minute, across connections | the connection is closed without a store call* |
-| `RELAY_MAX_UNKNOWN_SESSIONS` per connection per minute | `internal/msrp` closes the connection |
+| `RELAY_MAX_UNKNOWN_SESSIONS` per connection per minute | `internal/msrp` closes the connection, after the 481s already owed: it writes them, half-closes, and waits up to 2 s for the client to close its side, so that they are not lost to a reset |
 | `RELAY_MAX_CONCURRENT_BINDS` binds in their store calls, after a 250 ms wait | the connection is closed* |
 | `RELAY_STORE_TIMEOUT` per store call | the connection is closed*, `StoreErrors` |
 | `RELAY_CORE_CONNECT_TIMEOUT` | 481 |

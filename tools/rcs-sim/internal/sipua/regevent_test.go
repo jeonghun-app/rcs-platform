@@ -211,7 +211,7 @@ func TestNotificationsCarryTheRegistrationStateInOrder(t *testing.T) {
 			t.Fatalf("notification %d = %+v, contact %+v", v, got, c)
 		}
 	}
-	// A network-initiated de-registration (RFC 3680 §5.3.2).
+	// A network-initiated de-registration (RFC 3680 §4.7.1).
 	n.notify(t, "terminated;reason=deactivated", reginfo(2, "full", "terminated", "deactivated", contact))
 	got := nextNotification(t, sub)
 	c, _ := got.Info.Contact(testIMPU, contact)
@@ -557,6 +557,16 @@ func TestParseRegInfoReadsRFC3680sExample(t *testing.T) {
 	}
 	// The notifier writes the URI back in its own parameter order and
 	// case (RFC 3261 §19.1.4).
+	// The AOR compares canonically: user=phone and the host's case do not
+	// matter (code review on #216).
+	for _, aor := range []string{"sip:user@example.com;user=phone", "sip:user@EXAMPLE.com"} {
+		if _, ok := r.Contact(aor, "sip:user@pc887.example.com"); !ok {
+			t.Errorf("Contact did not find the contact for the AOR %s", aor)
+		}
+	}
+	if _, ok := r.Contact("sip:USER@example.com", "sip:user@pc887.example.com"); ok {
+		t.Error("Contact matched an AOR whose user differs in case")
+	}
 	if _, ok := r.Contact("sip:user@example.com", "SIP:user@PC887.example.com"); !ok {
 		t.Error("Contact did not find an equal URI written differently")
 	}
