@@ -143,6 +143,11 @@ services:
     ports:
       # The provisioning API, for an operator on this host.
       - "127.0.0.1:${HSS_API_HOST_PORT:-18082}:8081"
+    networks:
+      default:
+        # The name the CSCFs resolve to find the HSS tasks without Cloud
+        # Map (hss.<namespace>, docs/icscf.md).
+        aliases: ["hss.rcs.local"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/hss", "-healthcheck"]
       interval: 2s
@@ -201,6 +206,25 @@ services:
       timeout: 5s
       retries: 60
 
+  icscf:
+    <<: *platform
+    command: ["icscf"]
+    depends_on:
+      stack-tables:
+        condition: service_completed_successfully
+      hss:
+        condition: service_healthy
+    environment:
+      <<: *shared
+      # No Cloud Map here: the HSS tasks are found by resolving
+      # hss.rcs.local, hss's alias (dev only; staging and prod refuse dns).
+      ICSCF_HSS_DISCOVERY: dns
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/icscf", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
   # ---- Later services: enable each in the pull request that adds it,
   # with the environment its document gives (docs/local-stack.md, Adding a
   # service). Each takes the platform image, the shared settings and the
@@ -212,10 +236,6 @@ services:
   #   command: ["pcscf"]
   #   environment: { <<: *shared }
   #   healthcheck: { test: ["CMD", "/usr/local/bin/pcscf", "-healthcheck"], interval: 2s, timeout: 5s, retries: 60 }
-  #
-  # icscf:     Diameter Cx toward hss:3868.
-  #   <<: *platform
-  #   command: ["icscf"]
   #
   # scscf:     Diameter Cx toward hss:3868, iFC evaluation.
   #   <<: *platform

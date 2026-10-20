@@ -3,8 +3,10 @@ package icscf
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -296,5 +298,107 @@ func TestAnAckWithoutAToTagIsDropped(t *testing.T) {
 	}
 	if got := g.metrics.counts["icscf.routed.dropped_ack"]; got != 1 {
 		t.Errorf("dropped ACKs counted %d", got)
+	}
+}
+
+// stubResolver answers ResolveAll with dsts, or err.
+type stubResolver struct {
+	dsts []transport.Destination
+	err  error
+}
+
+func (s stubResolver) ResolveAll(context.Context, sip.URI) ([]transport.Destination, error) {
+	return s.dsts, s.err
+}
+
+// With a resolver, a request goes to the S-CSCF's first address, to the
+// next each time one cannot be sent to, and gets 500 with Retry-After once
+// none is left; a branch that failed otherwise is not tried again.
+func TestEachAddressOfTheSCSCFIsTriedInTurn(t *testing.T) {
+	a := transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.1:5060")}
+	b := transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.2:5060")}
+	for _, m := range []*sip.Request{invite(t, impu1), register(t)} {
+		t.Run(m.Method, func(t *testing.T) {
+			g := newRig(t, func(c *Config) { c.Resolver = stubResolver{dsts: []transport.Destination{a, b}} })
+			d := g.route(m)
+			if len(d.Targets) != 1 || d.Targets[0].Destination == nil || *d.Targets[0].Destination != a {
+				t.Fatalf("targets = %+v, want the first address", d.Targets)
+			}
+			refused, err := sip.NewResponse(m, 503, "", "t1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sendFailed := proxy.BranchFailure{Target: d.Targets[0], Response: refused, Err: errors.New("connection refused")}
+			next := d.OnBranchFailure(context.Background(), sendFailed)
+			if len(next) != 1 || next[0].Destination == nil || *next[0].Destination != b || next[0].URI.String() != d.Targets[0].URI.String() {
+				t.Fatalf("after the first refused: %+v, want the same request to the second address", next)
+			}
+			if more := d.OnBranchFailure(context.Background(), sendFailed); more != nil {
+				t.Fatalf("after the last refused: %+v, want none", more)
+			}
+			res, err := sip.NewResponse(m, 500, "", "t1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.OnResponse(context.Background(), res)
+			if res.Header.Get("Retry-After") != "10" || g.metrics.counts["icscf.scscf.next_address"] != 1 {
+				t.Errorf("Retry-After %q, next addresses %d", res.Header.Get("Retry-After"), g.metrics.counts["icscf.scscf.next_address"])
+			}
+		})
+	}
+	t.Run("not after a response", func(t *testing.T) {
+		g := newRig(t, func(c *Config) { c.Resolver = stubResolver{dsts: []transport.Destination{a, b}} })
+		d := g.route(invite(t, impu1))
+		busy, _ := sip.NewResponse(invite(t, impu1), 503, "", "t1")
+		if more := d.OnBranchFailure(context.Background(), proxy.BranchFailure{Target: d.Targets[0], Response: busy}); more != nil {
+			t.Fatalf("a 503 the S-CSCF sent was retried: %+v", more)
+		}
+	})
+	t.Run("no address", func(t *testing.T) {
+		g := newRig(t, func(c *Config) { c.Resolver = stubResolver{err: errors.New("no such host")} })
+		if got := describe(t, g.route(invite(t, impu1))); got != (outcome{status: 500, retryAfter: "10"}) {
+			t.Fatalf("decision = %+v, want 500 with Retry-After", got)
+		}
+	})
+}
+
+// An address a request could not be sent to goes to the back of the list
+// for 30 s, then takes its place again (QA of #276).
+func TestAFailedAddressStaysAtTheBackFor30s(t *testing.T) {
+	a := transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.1:5060")}
+	b := transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.2:5060")}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	g := newRig(t, func(c *Config) {
+		c.Resolver = stubResolver{dsts: []transport.Destination{a, b}}
+		c.Now = func() time.Time { return now }
+	})
+	firstOf := func() transport.Destination {
+		t.Helper()
+		d := g.route(invite(t, impu1))
+		if len(d.Targets) != 1 || d.Targets[0].Destination == nil {
+			t.Fatalf("targets = %+v", d.Targets)
+		}
+		return *d.Targets[0].Destination
+	}
+	d := g.route(invite(t, impu1))
+	refused, err := sip.NewResponse(invite(t, impu1), 503, "", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnBranchFailure(context.Background(), proxy.BranchFailure{Target: d.Targets[0], Response: refused, Err: errors.New("connection refused")})
+	now = now.Add(30*time.Second - time.Millisecond)
+	if got := firstOf(); got != b {
+		t.Fatalf("just before 30 s the first address is %v, want the other one", got.Addr)
+	}
+	now = now.Add(2 * time.Millisecond)
+	if got := firstOf(); got != a {
+		t.Fatalf("just after 30 s the first address is %v, want the one that failed", got.Addr)
+	}
+}
+
+// Without Config.Now the 30 s are on the wall clock.
+func TestTheRouterClockIsTheWallClockByDefault(t *testing.T) {
+	if d := time.Since(newRig(t).r.now()); d < 0 || d > time.Minute {
+		t.Fatalf("the default clock is %v off the wall clock", d)
 	}
 }
