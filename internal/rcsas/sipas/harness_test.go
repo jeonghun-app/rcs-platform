@@ -234,10 +234,10 @@ type peer struct {
 	r  *sip.Reader
 
 	mu sync.Mutex
-	// sent holds the branch of each request the peer sent, whose
-	// responses, such as a 2xx retransmitted before its ACK, may still come
-	// while a later request waits for its own (#327).
-	sent map[string]bool
+	// sent holds the CSeq of each request the peer sent, by branch: a 2xx
+	// retransmitted before its ACK may still come on that branch while a
+	// later request waits for its own (#327), and must have that CSeq.
+	sent map[string]sip.CSeq
 }
 
 // requests numbers every request a test sends, so no two share a branch
@@ -251,7 +251,7 @@ func (a *as) dial(t *testing.T) *peer {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = nc.Close() })
-	return &peer{t: t, nc: nc, r: sip.NewReader(bufio.NewReader(nc), sip.Limits{}), sent: map[string]bool{}}
+	return &peer{t: t, nc: nc, r: sip.NewReader(bufio.NewReader(nc), sip.Limits{}), sent: map[string]sip.CSeq{}}
 }
 
 // msg is a request the core sends rcs-as.
@@ -317,7 +317,8 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		b.WriteString(f + "\r\n")
 	}
 	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n%s", len(m.body), m.body)
-	p.sending(branch)
+	want := sip.CSeq{Seq: uint32(cseq), Method: m.method}
+	p.sending(branch, want)
 	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(p.nc, b.String()); err != nil {
 		return nil, err
@@ -325,14 +326,14 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 	if m.method == "ACK" {
 		return nil, nil
 	}
-	return p.finalFor(branch, sip.CSeq{Seq: uint32(cseq), Method: m.method})
+	return p.finalFor(branch, want)
 }
 
-// sending notes that a request with branch goes out.
-func (p *peer) sending(branch string) {
+// sending notes that a request with branch and cseq goes out.
+func (p *peer) sending(branch string, cseq sip.CSeq) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.sent[branch] = true
+	p.sent[branch] = cseq
 }
 
 // finalFor reads the final response to the request with branch and cseq.
@@ -360,13 +361,16 @@ func (p *peer) finalFor(branch string, cseq sip.CSeq) (*sip.Response, error) {
 		}
 		b := vias[0].Branch()
 		p.mu.Lock()
-		earlier := b != branch && p.sent[b]
+		prev, earlier := p.sent[b]
 		p.mu.Unlock()
+		earlier = earlier && b != branch
 		switch {
 		case b == branch && got == cseq:
 			if res.StatusCode >= 200 {
 				return res, nil
 			}
+		case earlier && got != prev:
+			return nil, fmt.Errorf("a %d on an earlier branch of this peer with CSeq %d %s, not the %d %s sent there", res.StatusCode, got.Seq, got.Method, prev.Seq, prev.Method)
 		case earlier && res.StatusCode/100 == 2 && got.Method == "INVITE":
 			// The one response sent again over TCP: a 2xx to an INVITE,
 			// until its ACK (RFC 3261 §13.3.1.4, §17.2.2).
@@ -393,7 +397,7 @@ func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.sending(vias[0].Branch())
+	p.sending(vias[0].Branch(), cseq)
 	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := p.nc.Write(b); err != nil {
 		return nil, err
@@ -454,7 +458,7 @@ func (e *fakeEngine) origins() []messaging.Origin {
 func TestAPeerTakesOnlyTheResponseToItsRequest(t *testing.T) {
 	here, there := net.Pipe()
 	t.Cleanup(func() { _ = here.Close(); _ = there.Close() })
-	p := &peer{t: t, nc: here, r: sip.NewReader(bufio.NewReader(here), sip.Limits{}), sent: map[string]bool{}}
+	p := &peer{t: t, nc: here, r: sip.NewReader(bufio.NewReader(here), sip.Limits{}), sent: map[string]sip.CSeq{}}
 	in := sip.NewReader(bufio.NewReader(there), sip.Limits{})
 	// The far end reads one request and writes what reply makes of it.
 	answer := func(reply func(req *sip.Request) []*sip.Response) {
@@ -504,6 +508,11 @@ func TestAPeerTakesOnlyTheResponseToItsRequest(t *testing.T) {
 	}
 	for name, stray := range map[string]func(req *sip.Request) *sip.Response{
 		"an earlier OPTIONS's 200": func(*sip.Request) *sip.Response { return optioned },
+		"the earlier INVITE's 200 with another CSeq": func(*sip.Request) *sip.Response {
+			res := invited.Clone()
+			_ = res.Header.Set("CSeq", "7 INVITE")
+			return res
+		},
 		"another branch": func(req *sip.Request) *sip.Response {
 			res := respond(req, 200, "stray")
 			_ = res.Header.Set("Via", "SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-sipas-elsewhere")
