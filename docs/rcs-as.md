@@ -561,11 +561,13 @@ How the SIP layer serves it:
   a resource list (RFC 5366, RFC 4826), which `internal/resourcelists` reads
   as a stream, stopping at the first entry beyond `RCSAS_GROUP_MAX_PARTICIPANTS`
   (403). An entry whose `uri` is missing or no URI a client means (not text,
-  or with white space or control characters) is left out, and so are entries
-  for the factory or at the conference host, whose focus INVITE would come
-  back as a loop (`sip.group.invitee_skipped`); a bad entry never refuses the
-  list, and every entry counts toward the bound. The subject is its `Subject`, the creator's name its `From`
-  display name, and its `Contribution-ID`, which every session with the group
+  or with white space or control characters) is left out
+  (`sip.group.invitee_skipped.malformed`), and so is an entry for the
+  factory or at the conference host, whose focus INVITE would come back as a
+  loop (`sip.group.invitee_skipped.loop`); a bad entry never refuses the
+  list, and every entry counts toward the bound. The subject is its
+  `Subject`, the creator's name its `From` display name, and its
+  `Contribution-ID`, which every session with the group
   carries, is required (400 without): rcsjta takes it as the chat's identity,
   and sends no `Conversation-ID`, which the group then makes. Every part of
   the request is read, and the session's place held, before the group is
@@ -575,15 +577,15 @@ How the SIP layer serves it:
   `Contribution-ID` (`chat-` and the first 32 hex digits of its SHA-256), so
   the same ID always names the same group. A new group lasts 2 minutes until
   its creator's session is set up (`group.Service.Established`, once the
-  200's ACK has come), then `RCSAS_GROUP_IDLE_TTL` from its last use. A 200
-  the client never got leaves the group to its creator's next INVITE under
-  that ID, which takes it up. A write of that
-  which fails is tried three more times, after 0.1, 0.4 and 1.6 s; if it
-  still fails, the creator's session ends with a BYE and nobody is invited,
-  so that the client makes the group again rather than keep a session with
-  one that ends within minutes (`sip.group.establish_abandoned`). Until then the
-  creator's INVITE tried again under that ID, after a CANCEL or a failure,
-  takes up the group it made; a group no session came of ends on its own.
+  200's ACK has come), then `RCSAS_GROUP_IDLE_TTL` from its last use. If
+  writing that fails, it is tried three more times, after 0.1, 0.4 and
+  1.6 s; if it still fails, the creator's session ends with a BYE and nobody
+  is invited, so that the client makes the group again rather than keep a
+  session with one that ends within minutes
+  (`sip.group.establish_abandoned`). Until the group is established, the
+  creator's INVITE tried again under that ID, after a CANCEL, a failure or
+  a 200 the client never got, takes up the group it made; a group no
+  session came of ends on its own.
   Any other INVITE to the factory naming an ID a live group has, from someone
   else or once the group is established, is 403, and no group is made: a
   participant the chairman removed could otherwise make a group its members'
@@ -1093,7 +1095,7 @@ identifier ever appears in a metric name.
 | `sip.asserted.refused` | Requests whose `P-Asserted-Identity` is not one user's, as pcscf asserts it, refused with 403 |
 | `sip.pager.<status>`, `sip.pager.timeout`, `sip.pager.unsent`, `sip.pager.unresolved` | MESSAGEs rcs-as sent, by final status, and those that got none, could not be sent or found no next hop |
 | `sip.loop` | Requests rcs-as originated that came back to it, answered 482: by their `rcsas-` tag, or from a conference URI |
-| `sip.group.invitee_skipped`, `sip.group.establish_failed`, `sip.group.establish_abandoned`, `group.create_retried`, `group.rejected.taken`, `invite.undeliverable` | Invitees at the factory or the conference host left out; writes of a new group's establishment that failed, and groups given up after four, whose creator's session ended; creators' INVITEs tried again that took up their group; INVITEs to the factory refused for another group's Contribution-ID; group invitations that will never reach the participant |
+| `sip.group.invitee_skipped.malformed`, `sip.group.invitee_skipped.loop`, `sip.group.establish_failed`, `sip.group.establish_abandoned`, `group.create_retried`, `group.rejected.taken`, `invite.undeliverable` | Resource-list entries left out for a uri no client means, and for one at the factory or the conference host; writes of a new group's establishment that failed, and groups given up after four, whose creator's session ended; creators' INVITEs tried again that took up their group; INVITEs to the factory refused for another group's Contribution-ID; group invitations that will never reach the participant |
 | `sip.group.created`, `sip.group.joined`, `sip.group.refused`, `sip.group.offer_refused`, `sip.group.service_refused`, `sip.group.list_too_long`, `sip.group.list_refused` | Clients' INVITEs to a group: groups created, joins, refusals by the group, and refusals for the offer (488), the service (403), a resource list too long (403) or unreadable (400) |
 | `sip.group.declined`, `sip.group.left`, `sip.group.leave_failed`, `sip.group.join_refused` | Participants who left by a 603 to the focus's INVITE or by a BYE that says so, Leaves that failed, and 2xx answers to the focus whose Join the group refused |
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |

@@ -126,7 +126,7 @@ func (s *Server) invitees(entries []resourcelists.Entry) []group.Invitee {
 	var out []group.Invitee
 	for _, e := range entries {
 		if u, err := sip.ParseURI(e.URI); err == nil && s.forGroup(u) {
-			s.cfg.Metrics.Count("sip.group.invitee_skipped", 1)
+			s.cfg.Metrics.Count("sip.group.invitee_skipped.loop", 1)
 			continue
 		}
 		out = append(out, group.Invitee{Identity: e.URI, DisplayName: e.DisplayName})
@@ -245,7 +245,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 			return
 		}
 		// A bad entry is left out, not a reason to refuse the list.
-		s.cfg.Metrics.Count("sip.group.invitee_skipped", int64(skipped))
+		s.cfg.Metrics.Count("sip.group.invitee_skipped.malformed", int64(skipped))
 		invitees = s.invitees(entries)
 	}
 	tag, err := s.ids.Tag()

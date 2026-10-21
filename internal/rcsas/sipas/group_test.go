@@ -476,7 +476,7 @@ func TestInviteesAtTheConferenceHostAreSkipped(t *testing.T) {
 	if err != nil || len(g.Participants) != 2 {
 		t.Fatalf("group %+v, %v", g, err)
 	}
-	if n := r.metrics.get("sip.group.invitee_skipped"); n != 2 {
+	if n := r.metrics.get("sip.group.invitee_skipped.loop"); n != 2 {
 		t.Fatalf("%d skipped", n)
 	}
 }
@@ -690,7 +690,7 @@ func TestABadEntryInTheListIsSkipped(t *testing.T) {
 	if inv := r.core.nextOf(t, "INVITE"); inv.URI.String() != bob {
 		t.Fatalf("INVITE to %s", inv.URI)
 	}
-	if n := r.metrics.get("sip.group.invitee_skipped"); n != 2 {
+	if n := r.metrics.get("sip.group.invitee_skipped.malformed"); n != 2 {
 		t.Fatalf("%d skipped", n)
 	}
 }

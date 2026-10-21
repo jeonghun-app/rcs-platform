@@ -302,13 +302,16 @@ func TestALateAnswerWithoutAnACKIsEndedWithinTheBound(t *testing.T) {
 	r := newShutdownRig(t, w)
 	answered := r.heldInvite(t)
 	r.a.srv.Close()
+	// Timed from just before the release (QA on #279): settle, and its
+	// bound, come after it, whereas the client may read the 200 late on a
+	// loaded host.
+	at := time.Now()
 	r.release()
 	<-answered
-	at := time.Now()
 	select {
 	case req := <-r.core.got:
-		if d := time.Since(at); req.Method != "BYE" || d < w-30*time.Millisecond {
-			t.Fatalf("%s %v after the 200", req.Method, d)
+		if d := time.Since(at); req.Method != "BYE" || d < w {
+			t.Fatalf("%s %v after the release", req.Method, d)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no BYE within 3 s of a 200 answered after Close, with no ACK")
