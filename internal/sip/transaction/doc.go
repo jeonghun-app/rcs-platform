@@ -32,6 +32,10 @@
 // (Config.InviteFinalTimeout). A TU that starts new work on the request, such
 // as a proxy's next fork group, starts the timer again (Progress).
 //
+// A client transaction sent over a flow (Destination.Flow) ends at once, with
+// ErrFlowClosed, when that flow closes before its final response
+// (Layer.FlowClosed): Timer B or F would notice only 64*T1 later.
+//
 // Every timer runs on an injected Clock, so tests drive T1 to T4 without
 // sleeping. Retransmission timers (A, E, G) run only over unreliable transports.
 //
