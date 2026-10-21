@@ -616,3 +616,53 @@ func TestAStopAnswersARegisterLeftInProgress503(t *testing.T) {
 		t.Errorf("REGISTER left at the stop: %v %v, want 503 with Retry-After 5", got.res, got.err)
 	}
 }
+
+// #337, through Run: a routed request goes on to the configured S-CSCF, one
+// for another next hop is refused 403, and one whose Route comes back to
+// this I-CSCF by its service name is refused 482.
+func TestARoutedRequestIsCheckedThroughRun(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
+	r.waitReady(t)
+	self := fmt.Sprintf("<sip:icscf.rcs.local:%d;lr>", r.core.Port())
+	from, to := "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">;tag=t1"
+	for _, tc := range []struct {
+		name, route string
+		want        int
+	}{
+		{"to the S-CSCF", "Route: <" + scscf.uri() + ";lr>", 200},
+		{"elsewhere", "Route: <sip:192.0.2.66:5060;transport=tcp;lr>", 403},
+		{"back to this I-CSCF", "Route: <" + scscf.uri() + ";lr>, " + self, 482},
+	} {
+		if res := r.send(t, "MESSAGE", tel1, from, to, tc.route); res.StatusCode != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, res.StatusCode, tc.want)
+		}
+	}
+	if n := len(hss.commands()); n != 0 {
+		t.Errorf("the HSS got %d requests, want none", n)
+	}
+}
+
+// #337: a Request-URI that names this I-CSCF brings the request back to it,
+// whether the S-CSCF routes loosely (to the Request-URI) or strictly (the
+// proxy moves the Request-URI to the end of the Route, RFC 3261 §16.6 step 6),
+// and when the proxy has put it back from the end of the Route (§16.4). From
+// QA of #350.
+func TestARoutedRequestWhoseRequestURINamesThisICSCFIsALoop(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
+	r.waitReady(t)
+	self := fmt.Sprintf("sip:icscf.rcs.local:%d", r.core.Port())
+	from, to := "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">;tag=t1"
+	for _, tc := range []struct{ name, ruri, route string }{
+		{"strict next hop", self, "Route: <" + scscf.uri() + ">"},
+		{"loose next hop", self, "Route: <" + scscf.uri() + ";lr>"},
+		{"this I-CSCF last in the Route", self + ";lr", "Route: <" + scscf.uri() + ";lr>, <" + self + ">"},
+	} {
+		if res := r.send(t, "MESSAGE", tc.ruri, from, to, tc.route); res.StatusCode != 482 {
+			t.Errorf("%s: %d, want 482", tc.name, res.StatusCode)
+		}
+	}
+}

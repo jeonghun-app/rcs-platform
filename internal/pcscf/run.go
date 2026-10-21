@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,6 +78,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 
 	fl := newFlows(cfg.MaxClientFlows, cfg.MaxFlowsPerIP)
+	if rt.Metrics != nil {
+		fl.refused = func(metric string) { rt.Metrics.Count(metric, 1) }
+	}
 	// The proxy is made once the core listener's port is known, which its
 	// Self needs. Only the core listener is open before it, scscf has no
 	// reason to reach a pcscf that is not ready, and a request that does
@@ -203,11 +207,21 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		d.sweep = sweepInterval
 	}
 	var tm transportMetrics
+	var lm layerMetrics
+	report := func() {
+		ts := tr.Stats()
+		tm.record(rt.Metrics, ts)
+		lm.record(rt.Metrics, ts, px.Layer().Stats())
+		if rt.Metrics != nil {
+			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
+			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
+		}
+	}
 	stopSweep := every(d.sweep, func() {
 		pc.registry.sweep()
 		pc.reconcileSubscriptions()
 		pc.sweepMSRP()
-		tm.record(rt.Metrics, tr.Stats())
+		report()
 	})
 	defer stopSweep()
 
@@ -239,6 +253,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// (#323); closing the connections releases them at once. A second Close
 	// does nothing.
 	_ = tr.Close()
+	// What the drain counted since the last sweep goes out with the
+	// runtime's last flush, the sweep stopped so that it does not record
+	// at the same time (#345 code review 4).
+	stopSweep()
+	report()
 	return nil
 }
 
@@ -258,11 +277,13 @@ func relayDialer(cfg Config) func(ctx context.Context, network, address string) 
 // itself, so this bounds memory and frees the slots.
 const sweepInterval = 30 * time.Second
 
-// every runs f every interval until the returned stop is called.
+// every runs f every interval until the returned stop is called, which
+// returns once f is not running, and may be called again.
 func every(interval time.Duration, f func()) (stop func()) {
 	t := time.NewTicker(interval)
-	done := make(chan struct{})
+	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-t.C:
@@ -272,7 +293,11 @@ func every(interval time.Duration, f func()) (stop func()) {
 			}
 		}
 	}()
-	return func() { t.Stop(); close(done) }
+	var once sync.Once
+	return func() {
+		once.Do(func() { t.Stop(); close(done) })
+		<-stopped
+	}
 }
 
 // coreResolver resolves a core hop and sends it through the core listener,
