@@ -70,6 +70,10 @@ func FuzzEvaluateTrigger(f *testing.F) {
 	f.Add(uint8(2), "Subject", "|ā|[Ā]", "MESSAGE", "sip:a@b", "Subject", "Ā", "")
 	f.Add(uint8(0), "[Ā]|[ā]|", "", "INVITE", "sip:ā@b", "", "", "")
 	f.Add(uint8(2), "Subject", "x-Ā|[K]", "MESSAGE", "sip:a@b", "Subject", "X-ā", "")
+	// A valid ERE past MaxPatternBytes, refused for its length (#348); a
+	// session case trigger, which reads only p1's length, so that the
+	// refusal check below sees it.
+	f.Add(uint8(3), "^"+strings.Repeat("k", MaxPatternBytes)+"*1", "", "INVITE", "sip:k@b", "", "", "")
 	f.Fuzz(func(t *testing.T, kind uint8, p1, p2, method, uri, name, value, line string) {
 		var c Condition
 		switch kind % 5 {
@@ -141,9 +145,20 @@ func FuzzEvaluateTrigger(f *testing.F) {
 		}
 		// An ERE is refused only for its size or for a construct Go reads
 		// differently from IEEE 1003.1, which the refusal names (#67), in
-		// every mode.
+		// every mode. Its size is its length past MaxPatternBytes, which is
+		// checked first and must be refused (#96, #348), or its
+		// instructions.
 		for _, p := range []string{p1, p2} {
 			if _, err := syntax.Parse(p, posixFlags); err != nil {
+				continue
+			}
+			if len(p) > MaxPatternBytes {
+				for _, mode := range []patternMode{0, patternFoldCase, patternFoldCase | patternWhole} {
+					budget := MaxSetInstructions
+					if _, err := compilePattern("Pattern", p, mode, &budget); err == nil || !strings.Contains(err.Error(), "MaxPatternBytes") {
+						t.Fatalf("%d bytes (mode %d) not refused for its length: %v", len(p), mode, err)
+					}
+				}
 				continue
 			}
 			departure := ereDeparture(p)
