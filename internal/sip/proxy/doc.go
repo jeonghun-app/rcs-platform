@@ -74,15 +74,24 @@
 // message limits. A context lives until every branch has ended. Timer C ends
 // a silent INVITE branch; one that receives a provisional response at least
 // every TimerC keeps its context, as ringing does, and holds a MaxContexts
-// slot as long.
+// slot as long. A Router, Resolver or hook that stalls is met by the
+// transaction layer's safety net (#156): the layer answers 500 once Timer C or
+// F, the wait for a CANCEL's answer and a margin have passed since the proxy
+// last made progress (a provisional response forwarded, a fork group or a
+// replacement started), and the context then stops: its hooks see their
+// context cancelled, no branch starts, and the INVITE branches still pending
+// are cancelled.
 //
 // A branch the transport cannot send because the next hop's connection has no
 // room, or no connection can be opened (transport.ErrQueueFull,
 // ErrTooManyConnections), counts as a 503 with Retry-After that is passed on
 // as such, so the client backs off. Other transport failures count as a 503
 // from the next hop (§16.9), which becomes a 500 if chosen, and a vanished
-// flow as 430 (RFC 5626 §5.3.1). In every case the next fork group, or a
-// replacement target from OnBranchFailure, may still succeed.
+// flow as 430 (RFC 5626 §5.3.1). So does a flow that closes after the
+// request was written onto it but before a final response, once the service
+// passes the transport's OnFlowClosed to FlowClosed: the branch ends then,
+// not at Timer B or F. In every case the next fork group, or a replacement
+// target from OnBranchFailure, may still succeed.
 //
 // Max-Breadth (RFC 5393 §5) is not implemented; MaxBranches bounds forking
 // meanwhile (#75).

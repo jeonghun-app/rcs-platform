@@ -21,7 +21,7 @@ import (
 const (
 	// DefaultTimerC is just over the 3 minutes RFC 3261 §16.6 step 11 sets as
 	// the least Timer C may be.
-	DefaultTimerC = 3*time.Minute + time.Second
+	DefaultTimerC = transaction.DefaultTimerC
 	// DefaultMaxContexts bounds the requests being forwarded at once. A context
 	// lives from the request until every branch has ended, which for an INVITE
 	// can be minutes of ringing, so it is sized for the calls a task carries,
@@ -62,7 +62,11 @@ type Config struct {
 	// Transaction configures the transaction layer the proxy runs on. Its
 	// Clock also runs Timer C, and its T1 times out an unanswered CANCEL (§9.1).
 	// DelayTrying is always set, since the proxy forwards provisional responses
-	// of its own (§17.2.1).
+	// of its own (§17.2.1). The layer's safety net for a request the proxy
+	// never answers must come after the proxy's own deadlines: zero
+	// InviteFinalTimeout takes transaction.InviteFinalTimeoutFor(TimerC, T1),
+	// and less is refused, as is a NonInviteFinalTimeout under 64*T1 (Timer F)
+	// plus transaction.FinalTimeoutMargin.
 	Transaction transaction.Config
 	// TimerC is how long an INVITE branch may go without a provisional
 	// response other than 100 (§16.6 step 11, §16.7 step 2). It must exceed 3
@@ -190,6 +194,20 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if tcfg.T2 <= 0 {
 		tcfg.T2 = transaction.DefaultT2
 	}
+	// The layer answers 500 for a request the proxy has not answered in
+	// time; the proxy's own 487 after Timer C and its CANCEL, and its
+	// silence after a branch's Timer F (RFC 4320 §4.2), must come first
+	// (decided on #156).
+	inviteFinal := transaction.InviteFinalTimeoutFor(cfg.TimerC, tcfg.T1)
+	if tcfg.InviteFinalTimeout == 0 {
+		tcfg.InviteFinalTimeout = inviteFinal
+	}
+	if tcfg.InviteFinalTimeout < inviteFinal {
+		return nil, fmt.Errorf("proxy: Transaction.InviteFinalTimeout %v is under Timer C, 64*T1 and the margin (%v)", tcfg.InviteFinalTimeout, inviteFinal)
+	}
+	if n := tcfg.NonInviteFinalTimeout; n != 0 && n < 64*tcfg.T1+transaction.FinalTimeoutMargin {
+		return nil, fmt.Errorf("proxy: Transaction.NonInviteFinalTimeout %v is under Timer F and the margin (%v)", n, 64*tcfg.T1+transaction.FinalTimeoutMargin)
+	}
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(cfg.Rand, key); err != nil {
 		return nil, fmt.Errorf("proxy: reading the hash key: %w", err)
@@ -282,6 +300,13 @@ func (p *Proxy) Receive(in transport.Inbound) { p.layer.Receive(in) }
 // Layer returns the transaction layer, through which a service sends requests
 // of its own as a UAC.
 func (p *Proxy) Layer() *transaction.Layer { return p.layer }
+
+// FlowClosed tells the proxy that a flow has closed, from the transport's
+// OnFlowClosed. A branch sent over it (Target.Destination with Flow) that
+// has no final response ends at once and counts as 430 Flow Failed, as a
+// send onto the closed flow would (RFC 5626 §5.3), instead of waiting 64*T1
+// for Timer B or F.
+func (p *Proxy) FlowClosed(id transport.FlowID) { p.layer.FlowClosed(id) }
 
 // Close stops the proxy: every transaction ends without a response, pending
 // timers are stopped, and Close returns once the proxy's goroutines have. A
@@ -416,6 +441,7 @@ func (p *Proxy) release(c *respContext, linger bool) {
 	p.mu.Lock()
 	delete(p.contexts, c.tx)
 	p.mu.Unlock()
+	c.unwatch()
 	c.mu.Lock()
 	n := c.reserved
 	c.reserved = 0

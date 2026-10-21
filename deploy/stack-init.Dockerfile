@@ -3,7 +3,7 @@
 # subscriber. It is not part of the service image, which ships what runs in
 # AWS only. The base images are the service image's (deploy/Dockerfile),
 # pinned by the same digests; update both together.
-FROM golang:1.26.9-alpine3.23@sha256:6750308561953d451210ed1a8086d36c8c8bdcbf672d38d9d0d424b8a7a0216c AS build
+FROM golang:1.26.10-alpine3.23@sha256:a07f231c19b03e6106cf442f02a5bcf262147e744d15b7b5e4b6d81d420c70a0 AS build
 ENV CGO_ENABLED=0 GOFLAGS=-buildvcs=false GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.su[m] ./
