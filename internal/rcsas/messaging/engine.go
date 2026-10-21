@@ -558,9 +558,10 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
 		if _, ok := e.flows[user]; !ok && len(e.flows) >= e.cfg.MaxTracked {
-			// One forgotten counts as a registration since for its
-			// invitations still out: their failures leave no mark, and
-			// the next pass may ask again.
+			// A user forgotten here is as one never registered: a late
+			// failure of its invitations still out is marked as before
+			// #384, which only one that registers again in that window
+			// notices.
 			for k := range e.flows {
 				delete(e.flows, k)
 				break
@@ -589,17 +590,22 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 // registration on a new flow. ErrUndeliverable for a group gives up what
 // is queued for the recipient from the group, unless it opens a session
 // with the group itself or is added again: the invitation will never
-// reach it. A failure of an invitation asked for before the recipient's
-// latest registration on a new flow, apart from that ErrUndeliverable,
-// is of the old flow, and is not marked.
+// reach it.
+//
+// A failure of an invitation asked for before the recipient's latest
+// registration on a new flow is of the old flow, and is not marked: the
+// registration cleared the marks and had the queue read (#384). That holds
+// for a group's 404 or 604 too, as the registration shows that the user
+// exists now; only ErrLooped, a 482, is marked whatever the registrations.
+// A recipient this engine has no registration number for (none, or one
+// forgotten past MaxTracked) is never overtaken.
 func (e *Engine) InviteFailed(inv Invitation, err error) {
 	key := inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 	e.mu.Lock()
-	if inv.flow != e.flows[inv.Recipient] && !(inv.Mode == store.Group && errors.Is(err, ErrUndeliverable)) {
+	if cur, ok := e.flows[inv.Recipient]; ok && cur != inv.flow && !errors.Is(err, ErrLooped) {
 		// The recipient registered on a new flow after the session was
-		// asked for, and that registration cleared the marks and had the
-		// queue read: the failure was of the old flow, and marking it now
-		// would hold the queue past the registration (#384).
+		// asked for: marking the failure now would hold the queue past
+		// the registration.
 		e.mu.Unlock()
 		e.metrics.Count("invite.failed_overtaken", 1)
 		return
