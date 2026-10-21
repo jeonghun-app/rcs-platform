@@ -184,6 +184,8 @@ func TestARoutedRequestGoesOnlyToAConfiguredSCSCF(t *testing.T) {
 		{"a Route to the S-CSCF over another transport", invite(t, impu1, "Route: <sip:scscf.rcs.local:5060;lr>"), 403},
 		{"a Route to the S-CSCF with another scheme", invite(t, impu1, "Route: <sips:scscf.rcs.local:5060;transport=tcp;lr>"), 403},
 		{"a Route that is not SIP", invite(t, impu1, "Route: <tel:+15550100001>"), 403},
+		{"a Route to the S-CSCF with a maddr", invite(t, impu1, "Route: <"+scscfURI+";maddr=192.0.2.66;lr>"), 403},
+		{"in a dialog to the S-CSCF with a maddr", invite(t, scscfURI+";maddr=192.0.2.66", "To: <"+impu1+">;tag=t1"), 403},
 		{"in a dialog to a client", invite(t, impu1, "To: <"+impu1+">;tag=t1"), 403},
 		{"ACK in a dialog to a client", request(t, "ACK", "sip:192.0.2.20", "To: <"+impu1+">;tag=t1", "CSeq: 1 ACK"), 403},
 		{"a Route back to this I-CSCF", invite(t, impu1, "Route: <"+self+">"), 482},

@@ -27,9 +27,10 @@
 // the Request-URI stays. A request with a Route left, or one inside a
 // dialog, is forwarded where it says without asking the HSS (§5.3.2.1,
 // RFC 3261 §16.12), but only to a configured S-CSCF, matched by scheme,
-// host, port and transport: another next hop is refused 403, and a request
-// whose Route or Request-URI names this I-CSCF again 482 (#337). A pres: or
-// im: Request-URI is refused 416 by the proxy before the Router sees it.
+// host, port and transport, without a maddr: another next hop is refused
+// 403, and a request whose Route or Request-URI names this I-CSCF again
+// 482 (#337). A pres: or im: Request-URI is refused 416 by the proxy before
+// the Router sees it.
 //
 // # Answers
 //

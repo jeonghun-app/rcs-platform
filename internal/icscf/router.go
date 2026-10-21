@@ -185,9 +185,12 @@ func (r *Router) routed(req *proxy.Request) proxy.Decision {
 }
 
 // scscfHop reports whether u names a configured S-CSCF exactly as it is
-// reached: the same scheme, host, port and transport, defaults applied.
+// reached: the same scheme, host, port and transport, defaults applied. A
+// maddr is refused: RFC 3263 §4 sends the request to it instead of the host,
+// so the host would vouch for an address it does not name once a resolver
+// honours it (security review of #350).
 func (r *Router) scscfHop(u sip.URI) bool {
-	if !u.IsSIP() {
+	if _, ok := u.Param("maddr"); ok || !u.IsSIP() {
 		return false
 	}
 	for _, c := range r.scscfs {

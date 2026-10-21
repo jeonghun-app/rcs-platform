@@ -81,6 +81,7 @@ func FuzzRoutedNextHop(f *testing.F) {
 		{"", scscfURI},
 		{"", "sip:icscf.rcs.local"},
 		{"<sip:[::ffff:192.0.2.1]:5060;lr>", "sip:x@[::1]"},
+		{"<" + scscfURI + ";maddr=192.0.2.66;lr>", "sip:+15550100001@" + home},
 		{"<" + scscfURI + ";lr>, <sip:[::ffff:192.0.2.31]:5060;lr>", "sip:icscf.rcs.local."},
 	} {
 		f.Add(tc[0], tc[1])
@@ -122,6 +123,9 @@ func FuzzRoutedNextHop(f *testing.F) {
 		next := req.URI
 		if len(routes) > 0 {
 			next = routes[0].URI
+		}
+		if _, ok := next.Param("maddr"); ok {
+			t.Fatalf("forwarded to %s, whose maddr a resolver may follow", next.String())
 		}
 		if got, ok := fuzzDestination(next); !ok || got != fuzzSCSCF {
 			t.Fatalf("forwarded to %s, which is %+v, not the S-CSCF at %+v", next.String(), got, fuzzSCSCF)
