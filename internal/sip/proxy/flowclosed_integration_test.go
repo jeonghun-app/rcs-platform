@@ -376,12 +376,14 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 		t.Fatal("the answers are already out, so Drain has nothing to wait for")
 	}
 	read := make(chan []byte, 1)
+	var progress atomic.Int64
 	go func() {
 		var got bytes.Buffer
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := peer.nc.Read(buf)
 			got.Write(buf[:n])
+			progress.Add(int64(n))
 			if err != nil {
 				read <- got.Bytes()
 				return
@@ -401,7 +403,7 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 	draining.Store(true)
 	p.Drain(ctx)
 	_ = tr.Close()
-	r := sip.NewReader(bufio.NewReader(bytes.NewReader(<-read)), sip.Limits{MaxBodyBytes: 1 << 20})
+	r := sip.NewReader(bufio.NewReader(bytes.NewReader(peerRead(t, read, &progress, peer, tr))), sip.Limits{MaxBodyBytes: 1 << 20})
 	var sizes []int
 	for {
 		m, err := r.ReadMessage()
@@ -474,12 +476,14 @@ func TestDrainDeliversAnswersStillWaitingForRoom(t *testing.T) {
 	}()
 	waitUntil(t, "every request to be routed", func() bool { return routed.Load() == requests }, routed.Load, tr)
 	read := make(chan []byte, 1)
+	var progress atomic.Int64
 	go func() {
 		var got bytes.Buffer
 		buf := make([]byte, 64<<10)
 		for {
 			n, err := peer.nc.Read(buf)
 			got.Write(buf[:n])
+			progress.Add(int64(n))
 			if err != nil {
 				read <- got.Bytes()
 				return
@@ -491,7 +495,7 @@ func TestDrainDeliversAnswersStillWaitingForRoom(t *testing.T) {
 	cancel()
 	p.Drain(ctx)
 	_ = tr.Close()
-	r := sip.NewReader(bufio.NewReader(bytes.NewReader(<-read)), sip.Limits{})
+	r := sip.NewReader(bufio.NewReader(bytes.NewReader(peerRead(t, read, &progress, peer, tr))), sip.Limits{})
 	answered := 0
 	for {
 		m, err := r.ReadMessage()
@@ -519,5 +523,28 @@ func waitUntil(t *testing.T, what string, cond func() bool, progress func() int6
 			t.Fatalf("waiting for %s, nothing moved for 30 s: %+v", what, tr.Stats())
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// peerRead waits for the peer's reader to end, the transport closed, and
+// returns what it read. A reader still going while it keeps getting bytes
+// is waited for; one that gets none for 30 s fails the test with how far it
+// got and the transport's stats, rather than hang until the package's
+// timeout (#441), and its connection is closed so it ends too.
+func peerRead(t *testing.T, read <-chan []byte, progress *atomic.Int64, peer *sipConn, tr *transport.Transport) []byte {
+	t.Helper()
+	last, lastAt := progress.Load(), time.Now()
+	for {
+		select {
+		case b := <-read:
+			return b
+		case <-time.After(100 * time.Millisecond):
+		}
+		if n := progress.Load(); n != last {
+			last, lastAt = n, time.Now()
+		} else if time.Since(lastAt) > 30*time.Second {
+			_ = peer.nc.Close()
+			t.Fatalf("the peer read nothing for 30 s after %d bytes, the transport closed: %+v", n, tr.Stats())
+		}
 	}
 }

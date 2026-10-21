@@ -172,6 +172,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Resolver:  resolver,
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
+		Metrics:   rt.Metrics,
 		// Clock alone: the other settings keep their defaults.
 		Transaction: transaction.Config{Clock: d.clock},
 	})
