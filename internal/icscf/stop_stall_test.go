@@ -37,9 +37,9 @@ func TestAStopDoesNotWaitOnACorePeerThatStoppedReading(t *testing.T) {
 	}
 	_ = nc.SetWriteDeadline(time.Now().Add(writeTimeout))
 	// A Route to a host that is no S-CSCF is refused 403 at once, without the
-	// HSS (#337); the 403 carries the request's long Via. The requests go on
-	// until the stop closes the connection, so the queue stays full.
+	// HSS (#337); the 403 carries the request's long Via.
 	pad := strings.Repeat("z", 3000)
+	writeErr := make(chan error, 1)
 	go func() {
 		for i := 0; ; i++ {
 			text := fmt.Sprintf("MESSAGE %s SIP/2.0\r\n"+
@@ -49,15 +49,32 @@ func TestAStopDoesNotWaitOnACorePeerThatStoppedReading(t *testing.T) {
 				"Call-ID: icscf-stall-%d\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n",
 				tel1, nc.LocalAddr(), i, pad, tel1, home, i)
 			if _, err := io.WriteString(nc, text); err != nil {
+				writeErr <- err
+				return
+			}
+			// Stop once the queue is full: the requests still on their
+			// way keep senders waiting for room in it, and more would
+			// pile up answers the transaction caps send without waiting,
+			// which overflow the queue and close the connection.
+			if tr.Stats().QueuedBytes >= transport.DefaultSendQueueBytes-64<<10 {
 				return
 			}
 		}
 	}()
-	// Full: no further 403 fits, whatever its size.
+	// Full: no further 403 fits, whatever its size. The fill is judged by
+	// progress, and a failure says what happened to the connection.
 	full := transport.DefaultSendQueueBytes - 64<<10
-	for deadline := time.Now().Add(writeTimeout / 2); tr.Stats().QueuedBytes < full; {
-		if time.Now().After(deadline) {
-			t.Fatalf("the core connection's send queue holds %d bytes, want %d", tr.Stats().QueuedBytes, full)
+	last, lastAt := 0, time.Now()
+	for tr.Stats().QueuedBytes < full {
+		select {
+		case err := <-writeErr:
+			t.Fatalf("the requests stopped going out with %d bytes queued: %v; %+v; logged %v", tr.Stats().QueuedBytes, err, tr.Stats(), r.h.Records())
+		default:
+		}
+		if n := tr.Stats().QueuedBytes; n != last {
+			last, lastAt = n, time.Now()
+		} else if time.Since(lastAt) > 30*time.Second {
+			t.Fatalf("the core connection's send queue holds %d bytes, want %d, and has not changed for 30 s; %+v", n, full, tr.Stats())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
