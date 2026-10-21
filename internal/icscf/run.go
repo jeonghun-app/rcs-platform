@@ -55,6 +55,10 @@ type deps struct {
 	hssResolver cxclient.Resolver
 	// listening, if set, hears the core listener's bound address.
 	listening func(netip.AddrPort)
+	// transport, if set, gets the SIP transport once it is made.
+	transport func(*transport.Transport)
+	// writeTimeout replaces the transport's WriteTimeout when set.
+	writeTimeout time.Duration
 }
 
 // Run serves cfg until ctx ends.
@@ -80,7 +84,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// Self needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, WriteTimeout: d.writeTimeout, Logger: rt.Logger}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}
@@ -89,6 +93,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		return err
 	}
 	defer func() { _ = tr.Close() }()
+	if d.transport != nil {
+		d.transport(tr)
+	}
 	coreAddr, err := tr.Listen(transport.ListenerConfig{
 		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr,
 		AdvertisedHost: hostOf(cfg.CoreHost),
@@ -140,6 +147,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if n := px.Drain(drainCtx); n > 0 {
 		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
 	}
+	// The transport closes before the proxy does (the deferred Close), once
+	// Drain has written its answers, as in pcscf (#323). A core peer that
+	// stopped reading leaves senders waiting for room in its connection's
+	// queue, and the proxy's Close waits for them, for up to WriteTimeout,
+	// past the stop margin (#338); closing the connections releases them at
+	// once. A second Close does nothing.
+	_ = tr.Close()
 	return nil
 }
 

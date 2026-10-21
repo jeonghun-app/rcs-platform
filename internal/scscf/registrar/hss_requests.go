@@ -57,7 +57,7 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 				continue
 			case err != nil:
 				g.log.Error("registrar: RTR: reading an identity", slog.String("error", err.Error()))
-				return resultUnableToComply
+				return readFailed(err)
 			}
 			if slices.Contains(impis, id.Set.IMPI) && !slices.Contains(keys, id.Set) {
 				keys = append(keys, id.Set)
@@ -68,7 +68,7 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 			regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
 			if err != nil {
 				g.log.Error("registrar: RTR: listing registrations", slog.String("error", err.Error()))
-				return resultUnableToComply
+				return readFailed(err)
 			}
 			for _, reg := range regs {
 				keys = append(keys, reg.Key)
@@ -85,7 +85,7 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		}
 		done, err := g.endSetNow(ctx, k, r.DeregistrationReason.Code == cx.RemoveSCSCF, cause)
 		switch {
-		case errors.Is(err, errClaimBusy):
+		case errors.Is(err, errClaimBusy), errors.Is(err, errReadBusy):
 			g.log.Error("registrar: RTR: ending a set", slog.String("error", err.Error()))
 			if result == resultSuccess {
 				result = resultTooBusy
@@ -99,6 +99,30 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	}
 	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
 	return result
+}
+
+// errReadBusy is a store read before an RTR's claim that failed for a reason
+// that may pass, as a throttled read whose SDK retries are spent: nothing has
+// been written, so the RTR is answered DIAMETER_TOO_BUSY, and the HSS sends
+// it again to another peer, rather than leave the set live (#422).
+var errReadBusy = errors.New("registrar: the store did not answer a read before an RTR's claim")
+
+// readBusy is the error of a store read before an RTR's claim: errReadBusy,
+// unless the store refused it as invalid, which no resend mends.
+func readBusy(err error) error {
+	if errors.Is(err, state.ErrInvalid) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errReadBusy, err)
+}
+
+// readFailed is the answer to an RTR whose read before any claim failed with
+// err: DIAMETER_TOO_BUSY, or DIAMETER_UNABLE_TO_COMPLY for an invalid one.
+func readFailed(err error) cx.Result {
+	if errors.Is(readBusy(err), errReadBusy) {
+		return resultTooBusy
+	}
+	return resultUnableToComply
 }
 
 // errClaimBusy is a claim of an RTR's lease that the store failed to save
@@ -115,19 +139,30 @@ var errClaimBusy = errors.New("registrar: the store did not save an RTR's claim"
 // Cut short after the claim, by a stop or a store failure, it leaves the
 // lease for the sweep to finish, and counts as done. A claim the store
 // fails to save is tried again with the record read again, and then is
-// errClaimBusy, unless the store refused it as invalid. With
+// errClaimBusy, unless the store refused it as invalid; a read before any
+// claim that fails is errReadBusy, unless it was refused as invalid. With
 // unregisteredOnly it ends k only as an unregistered user's record, and one
 // that a REGISTER turned into a registration meanwhile has its identities
 // pointed at it again. It reports whether it ended one.
 func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool, cause regevent.Cause) (bool, error) {
 	touched := false
+	// claimed is set once a claim was saved: a read that fails after it,
+	// with a write that conflicted, leaves the lease for the sweep.
+	claimed := false
 	var claimErr error
 	for attempt := range saveAttempts {
 		now := g.cfg.Now()
-		reg, f := g.set(ctx, k)
+		reg, err := g.cfg.Store.Registration(ctx, k)
 		switch {
-		case f != nil:
-			return false, f
+		case errors.Is(err, state.ErrNotFound):
+			reg = nil
+		case err != nil && claimed:
+			return g.leftToSweep("reading a set an RTR ends", err)
+		case err != nil:
+			g.internal("reading the registration", err)
+			return false, readBusy(err)
+		}
+		switch {
 		case reg == nil:
 			return touched, nil
 		case unregisteredOnly && (reg.Unregistered.IsZero() || len(reg.Contacts) > 0):
@@ -137,8 +172,12 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			return false, nil
 		}
 		profile, err := g.cfg.Store.Profile(ctx, k, now)
-		if err != nil && !errors.Is(err, state.ErrNotFound) {
-			return false, err
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+		case err != nil && claimed:
+			return g.leftToSweep("reading the profile of a set an RTR ends", err)
+		case err != nil:
+			return false, readBusy(err)
 		}
 		touched = true
 		// The record is claimed for a deregistration's lease first, as a
@@ -152,7 +191,7 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		lease := reg.Clone()
 		lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
 		lease.Rejected = reg.Rejected || cause == regevent.Rejected
-		claimed, err := g.cfg.Store.SaveRegistration(ctx, lease)
+		saved, err := g.cfg.Store.SaveRegistration(ctx, lease)
 		switch {
 		case errors.Is(err, state.ErrConflict):
 			continue
@@ -172,7 +211,7 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			}
 			continue
 		}
-		claimErr = nil
+		claimErr, claimed = nil, true
 		// The subscriptions end before the record does, told of the
 		// bindings it had.
 		if err := g.cfg.Events.Ended(ctx, reg, cause); err != nil {
@@ -188,7 +227,7 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 				return g.leftToSweep("removing the profile of a set an RTR ends", err)
 			}
 		}
-		err = g.cfg.Store.DeleteRegistration(ctx, claimed)
+		err = g.cfg.Store.DeleteRegistration(ctx, saved)
 		switch {
 		case errors.Is(err, state.ErrConflict):
 			continue
