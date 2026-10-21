@@ -1,6 +1,10 @@
-//go:build linux
+//go:build linux && !386
 
 package msrp
+
+// The kernel's view of the rig's sockets for the bind report (#140).
+// linux/386 has no getsockopt system call of its own (it goes through
+// socketcall), so it gets the stub with the other systems.
 
 import (
 	"bufio"
@@ -11,11 +15,36 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"testing"
 	"unsafe"
 )
 
-// kernelReportMarkers are lines a bind report has on this system.
-var kernelReportMarkers = []string{"kernel:", " outq ", " backoff ", "counters since the rig began:"}
+// checkKernelReport fails t unless the bind report has the kernel's view:
+// a socket line for each connection the report lists, with its queues and
+// backoff, and the counters, among them the rig's own connects.
+func checkKernelReport(t *testing.T, report string) {
+	t.Helper()
+	conns, sockets := 0, 0
+	inKernel := false
+	for _, line := range strings.Split(report, "\n") {
+		switch {
+		case strings.Contains(line, " frames queued ("):
+			conns++
+		case line == "kernel:" || strings.HasSuffix(line, " kernel:"):
+			inKernel = true
+		case inKernel && strings.Contains(line, "->") && strings.Contains(line, " outq ") && strings.Contains(line, " backoff "):
+			sockets++
+		case inKernel && strings.Contains(line, "counters since the rig began:"):
+			inKernel = false
+			if !strings.Contains(line, "Tcp.ActiveOpens+") {
+				t.Errorf("the kernel's counters lack the rig's connects: %s", line)
+			}
+		}
+	}
+	if conns == 0 || sockets != conns {
+		t.Errorf("the report has %d socket lines for %d connections:\n%s", sockets, conns, report)
+	}
+}
 
 // kernelCounters reads the TCP counters of /proc/net/netstat and
 // /proc/net/snmp, by "Table.Name". They count the whole network namespace,

@@ -533,11 +533,7 @@ func TestABindStuckOnTheCoreOpenIsReportedWhileItWaits(t *testing.T) {
 	}
 	// Where the kernel can say, the report says which end holds the
 	// octets of a stalled connection and whether TCP is backing off (#140).
-	for _, want := range kernelReportMarkers {
-		if !strings.Contains(waited, want) {
-			t.Errorf("the report lacks the kernel's %q:\n%s", want, waited)
-		}
-	}
+	checkKernelReport(t, waited)
 }
 
 // bindState says how far a client's bind got: whether the relay still

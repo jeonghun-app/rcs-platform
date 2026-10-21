@@ -1,10 +1,12 @@
-//go:build !linux
+//go:build !linux || 386
 
 package msrp
 
-// kernelReportMarkers are lines a bind report has on this system: none,
-// as the kernel's socket state is read only on Linux.
-var kernelReportMarkers []string
+import "testing"
+
+// checkKernelReport checks nothing here: the kernel's socket state is read
+// only on Linux, and not on linux/386.
+func checkKernelReport(*testing.T, string) {}
 
 func kernelCounters() map[string]int64 { return nil }
 
