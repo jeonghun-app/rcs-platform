@@ -338,7 +338,11 @@ func (p *Proxy) Drain(ctx context.Context) int {
 	defer tick.Stop()
 	for {
 		if p.inProgress() == 0 {
-			// The last answers may still sit in the transport's queues.
+			// From here on a request is answered as it arrives, as after
+			// the deadline: the Close that follows would drop it (QA of
+			// #310). The last answers may still sit in the transport's
+			// queues.
+			p.stopping.Store(true)
 			p.flushSender(time.Now().Add(DrainSendWait))
 			return 0
 		}
