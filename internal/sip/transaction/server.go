@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"context"
 	"errors"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -24,6 +25,11 @@ type ServerTransaction struct {
 	// size is what the request and last count against
 	// MaxServerTransactionBytes, under the layer's mu.
 	size int64
+	// ctx ends with the transaction (see Context).
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	// timedOut records that the layer answered 500 for a TU that did not.
+	timedOut bool
 }
 
 // sameFlow reports whether a retransmission arrived the way the request did, so
@@ -46,7 +52,9 @@ func sameFlow(a, b transport.Source) bool {
 
 func newServerTransaction(l *Layer, key string, req *sip.Request, src transport.Source) *ServerTransaction {
 	tx := &ServerTransaction{invite: req.Method == "INVITE", req: req, src: src}
-	tx.machine = machine{l: l, key: key, server: true, onTimer: tx.onTimer, reliable: src.Network.Reliable()}
+	tx.ctx, tx.cancel = context.WithCancelCause(context.Background())
+	tx.machine = machine{l: l, key: key, server: true, onTimer: tx.onTimer, reliable: src.Network.Reliable(),
+		onEnd: func() { tx.cancel(nil) }}
 	if tx.invite {
 		tx.state = Proceeding
 	} else {
@@ -59,11 +67,12 @@ func newServerTransaction(l *Layer, key string, req *sip.Request, src transport.
 // false if the 100 could not be sent, in which case the transaction has ended
 // quietly: the TU never saw it, and nothing it sent could reach the client.
 func (tx *ServerTransaction) start() bool {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	tx.armFinal()
 	if !tx.invite {
 		return true
 	}
-	tx.mu.Lock()
-	defer tx.mu.Unlock()
 	if tx.l.delayTrying {
 		tx.arm(timerTrying, tryingDelay)
 		return true
@@ -83,6 +92,35 @@ func (tx *ServerTransaction) sendTrying() error {
 	}
 	return tx.send(res, transport.NoWait)
 }
+
+// armFinal (re)starts the safety timer for the TU's final response. mu must be
+// held.
+func (tx *ServerTransaction) armFinal() {
+	if tx.invite {
+		tx.arm(timerFinal, tx.l.inviteFinal)
+	} else {
+		tx.arm(timerFinal, tx.l.nonInviteFinal)
+	}
+}
+
+// Progress tells the transaction that its TU has started new work on the
+// request, as a proxy does when it forwards to its next fork group or to a
+// replacement target, so the safety timer starts again: it measures how long
+// the TU has been stalled, not how long the request takes. It does nothing once
+// a final response was sent.
+func (tx *ServerTransaction) Progress() {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.state == Trying || tx.state == Proceeding {
+		tx.armFinal()
+	}
+}
+
+// Context is cancelled when the transaction ends, so a TU still working on the
+// request can stop. If the TU sent no final response in time and the layer
+// answered 500 instead, it is cancelled at that moment and context.Cause
+// reports ErrNoFinalResponse.
+func (tx *ServerTransaction) Context() context.Context { return tx.ctx }
 
 // Request returns the request that created the transaction.
 func (tx *ServerTransaction) Request() *sip.Request { return tx.req }
@@ -138,6 +176,10 @@ func (tx *ServerTransaction) send(res *sip.Response, opts ...transport.SendOptio
 // directly. mu must be held.
 func (tx *ServerTransaction) failed(err error) func() {
 	tx.terminate()
+	if tx.timedOut {
+		// The response that failed is the layer's 500, not the TU's.
+		return nil
+	}
 	return func() { tx.l.tu.ServerFailed(tx, err) }
 }
 
@@ -164,6 +206,18 @@ func (tx *ServerTransaction) Respond(res *sip.Response) error {
 	if res.StatusCode < 100 || res.StatusCode > 699 {
 		return errors.New("transaction: status code outside 100-699")
 	}
+	if tx.timedOut && res.StatusCode >= 200 {
+		// The layer has answered already; a second final response must not
+		// reach the client.
+		tx.l.lateFinals.Add(1)
+		return ErrNoFinalResponse
+	}
+	return tx.respond(res)
+}
+
+// respond runs the state machine for a response, the TU's or the layer's own.
+// mu must be held.
+func (tx *ServerTransaction) respond(res *sip.Response) error {
 	if tx.invite {
 		return tx.respondInvite(res)
 	}
@@ -186,13 +240,18 @@ func (tx *ServerTransaction) respondInvite(res *sip.Response) error {
 	tx.stop(timerTrying)
 	switch {
 	case code < 200:
+		// A provisional response shows the TU is still at work, as a ringing
+		// call is; the safety timer starts again.
+		tx.armFinal()
 	case code < 300:
 		// RFC 6026 §7.1: the 2xx no longer terminates the transaction. Timer L
 		// keeps absorbing INVITE retransmissions while the TU retransmits the
 		// 2xx itself until its ACK arrives.
 		tx.state = Accepted
+		tx.stop(timerFinal)
 		tx.arm(timerLinger, 64*l.t1)
 	default:
+		tx.stop(timerFinal)
 		tx.state = Completed
 		if !tx.reliable {
 			tx.interval = l.t1
@@ -214,6 +273,7 @@ func (tx *ServerTransaction) respondNonInvite(res *sip.Response) error {
 		tx.state = Proceeding
 		return nil
 	}
+	tx.stop(timerFinal)
 	tx.linger(Completed, tx.unlessReliable(64*tx.l.t1))
 	return nil
 }
@@ -253,8 +313,40 @@ func (tx *ServerTransaction) onTimer(id timerID) func() {
 	case timerLinger:
 		// Timer I, J or L.
 		tx.terminate()
+	case timerFinal:
+		tx.answerForTU()
 	}
 	return nil
+}
+
+// answerForTU sends the 500 for a TU that sent no final response in time, tells
+// the TU through the Context, and lets the transaction end as it does after any
+// final response. mu must be held.
+func (tx *ServerTransaction) answerForTU() {
+	if tx.state != Trying && tx.state != Proceeding {
+		return
+	}
+	tx.timedOut = true
+	tx.l.timedOut.Add(1)
+	tx.cancel(ErrNoFinalResponse)
+	// The To tag of a provisional the TU sent, which may have begun an early
+	// dialog, keeps the 500 in it, whether or not the provisional itself was
+	// kept; otherwise a new one.
+	tag := tx.toTag
+	if tag == "" {
+		var err error
+		if tag, err = tx.l.ids.Tag(); err != nil {
+			tx.terminate()
+			return
+		}
+	}
+	res, err := sip.NewResponse(tx.req, 500, "", tag)
+	if err != nil {
+		tx.terminate()
+		return
+	}
+	// A transport failure has terminated the transaction already.
+	tx.respond(res)
 }
 
 // receive runs the state machine for a request matched to this transaction: a

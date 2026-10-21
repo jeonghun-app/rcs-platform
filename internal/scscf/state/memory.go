@@ -449,7 +449,7 @@ func (m *Memory) DeleteSubscription(_ context.Context, s *Subscription) error {
 }
 
 // NextNotify implements Subscriptions.
-func (m *Memory) NextNotify(_ context.Context, id string) (uint32, uint32, error) {
+func (m *Memory) NextNotify(_ context.Context, id string, of int64) (uint32, uint32, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.subscriptions[id]
@@ -459,8 +459,12 @@ func (m *Memory) NextNotify(_ context.Context, id string) (uint32, uint32, error
 	if s.CSeq >= MaxCounter || s.ReginfoVersion >= MaxCounter {
 		return 0, 0, fmt.Errorf("state: next notify: %w", ErrExhausted)
 	}
+	if of < s.NotifiedOf || s.NotifiedOf == FinalNotify {
+		return 0, 0, fmt.Errorf("state: next notify: %w", ErrStale)
+	}
 	s.CSeq++
 	s.ReginfoVersion++
+	s.NotifiedOf = of
 	s.Version++
 	return s.CSeq, s.ReginfoVersion, nil
 }

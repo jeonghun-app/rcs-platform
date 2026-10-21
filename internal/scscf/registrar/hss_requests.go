@@ -10,6 +10,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
@@ -71,7 +72,11 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	}
 	ended := 0
 	for _, k := range keys {
-		done, err := g.endSetNow(ctx, k, r.DeregistrationReason.Code == cx.RemoveSCSCF)
+		cause := regevent.Deactivated
+		if r.DeregistrationReason.Code == cx.PermanentTermination {
+			cause = regevent.Rejected
+		}
+		done, err := g.endSetNow(ctx, k, r.DeregistrationReason.Code == cx.RemoveSCSCF, cause)
 		if err != nil {
 			g.log.Error("registrar: RTR: ending a set", slog.String("error", err.Error()))
 			return resultUnableToComply
@@ -91,7 +96,7 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 // unregistered user's record, and one that a REGISTER turned into a
 // registration meanwhile has its identities pointed at it again. It reports
 // whether it ended one.
-func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool) (bool, error) {
+func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool, cause regevent.Cause) (bool, error) {
 	touched := false
 	for range saveAttempts {
 		now := g.cfg.Now()
@@ -112,6 +117,26 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			return false, err
 		}
 		touched = true
+		// The subscriptions end before the record does, so that an error
+		// here or a stop later leaves the record, or their saved ends, for
+		// the sweep. The HSS does not send the RTR again (its pushes are
+		// logged, not retried), so the record is claimed for a lease, as a
+		// user's deregistration leaves it: the sweep after it tells the HSS
+		// (which refuses, as it ended the set), calls Ended again and
+		// deletes the set (#256 code review).
+		if err := g.cfg.Events.Ended(ctx, reg, cause); err != nil {
+			g.internal("ending a set's subscriptions for an RTR", err)
+			lease := reg.Clone()
+			lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
+			if _, err := g.cfg.Store.SaveRegistration(ctx, lease); err != nil {
+				if errors.Is(err, state.ErrConflict) {
+					continue
+				}
+				return false, err
+			}
+			g.count("registrar.rtr_left_to_sweep")
+			return true, nil
+		}
 		if err := g.unpoint(ctx, reg); err != nil {
 			return false, err
 		}
@@ -126,10 +151,10 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		switch {
 		case errors.Is(err, state.ErrConflict):
 			continue
-		case errors.Is(err, state.ErrNotFound):
+		case errors.Is(err, state.ErrNotFound), err == nil:
 			return true, nil
 		}
-		return err == nil, err
+		return false, err
 	}
 	return false, errors.New("registrar: the set kept changing")
 }
@@ -212,6 +237,7 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 			g.log.Error("registrar: PPR: unpointing the identities that left", slog.String("error", err.Error()))
 			g.count("registrar.ppr_unpoint_failed")
 		}
+		g.cfg.Events.Changed(ctx, reg, saved, regevent.Changed)
 		g.count("registrar.ppr_stored")
 		return resultSuccess
 	}

@@ -103,11 +103,11 @@ func TestAResentNextNotifyReturnsTheFirstAttemptsValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.resendNext = true
-	c, v, err := d.NextNotify(bg(), "s1")
+	c, v, err := d.NextNotify(bg(), "s1", 0)
 	if err != nil || c != 1 || v != 1 {
 		t.Fatalf("NextNotify = %d, %d, %v; want 1, 1", c, v, err)
 	}
-	if c, v, _ := d.NextNotify(bg(), "s1"); c != 2 || v != 2 {
+	if c, v, _ := d.NextNotify(bg(), "s1", 0); c != 2 || v != 2 {
 		t.Errorf("next NextNotify = %d, %d; the resend counted twice", c, v)
 	}
 }
@@ -393,7 +393,7 @@ func TestSDKErrorsCarryNoKey(t *testing.T) {
 		func() error { _, err := d.ExpiringRegistrations(bg(), statetest.T0, 1); return err }(),
 		d.AddChallenge(bg(), statetest.Challenge(statetest.IMPI1, "n", time.Minute)),
 		func() error { _, err := d.TakeChallenge(bg(), statetest.IMPI1, "n", statetest.T0); return err }(),
-		func() error { _, _, err := d.NextNotify(bg(), "s1"); return err }(),
+		func() error { _, _, err := d.NextNotify(bg(), "s1", 0); return err }(),
 		d.Ready(bg()),
 	}
 	for _, err := range checks {
