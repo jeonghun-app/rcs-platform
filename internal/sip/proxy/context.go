@@ -163,7 +163,7 @@ func newRespContext(p *Proxy, tx *transaction.ServerTransaction, cost, header in
 	c.ctx, c.cancelCtx = context.WithCancel(p.ctx)
 	c.reqCtx, c.cancelReq = context.WithCancel(c.ctx)
 	c.up.p = p
-	c.unwatch = context.AfterFunc(tx.Context(), c.layerAnswered)
+	c.unwatch = context.AfterFunc(tx.Context(), func() { p.counted(c.layerAnswered) })
 	return c
 }
 
@@ -197,7 +197,14 @@ func (c *respContext) layerAnswered() {
 	// Last, so that whoever sees the context cancelled finds the context
 	// stopped and its CANCELs under way.
 	c.cancelCtx()
+	if h := testHookLayerAnswered.Load(); h != nil {
+		(*h)()
+	}
 }
+
+// testHookLayerAnswered, when set by a test, runs at the end of a
+// layerAnswered that stopped a context.
+var testHookLayerAnswered atomic.Pointer[func()]
 
 // run validates, preprocesses and routes the request, then starts the first
 // fork group. It runs on a goroutine of its own.
