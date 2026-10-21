@@ -338,8 +338,12 @@ func (p *Proxy) Drain(ctx context.Context) int {
 	defer tick.Stop()
 	for {
 		if p.inProgress() == 0 {
-			// The last answers may still sit in the transport's queues.
-			p.flushSender(time.Now().Add(DrainSendWait))
+			// From here on a request is answered as it arrives, as after
+			// the deadline: the Close that follows would drop it (QA of
+			// #310). The last answers may still sit in the transport's
+			// queues.
+			p.stopping.Store(true)
+			p.flushSender(time.Now().Add(drainSendWait))
 			return 0
 		}
 		select {
@@ -378,6 +382,22 @@ func (p *Proxy) openContexts() []*respContext {
 // stop margin must leave room for it.
 const DrainSendWait = 2 * time.Second
 
+// drainSendWait is DrainSendWait, which a test lengthens to show that
+// something else ends the wait.
+var drainSendWait = DrainSendWait
+
+// drainFlushStall is how long flushSender waits for any connection with
+// output queued to make progress before it gives up on what the queues hold:
+// a peer that has stopped reading takes none of it before the Close drops it,
+// and would otherwise keep a stop waiting the whole DrainSendWait, most of
+// the stop margin (QA of #366). Progress is per connection and per chunk
+// written, so neither a long message nor another peer's traffic hides it. The
+// kernel takes a full socket's output in steps of about 160 KiB, so this
+// keeps waiting for a peer that reads 160 KiB a second or more, however long
+// its message; a slower one with that much queued loses the rest at the
+// Close, as it did at the end of DrainSendWait. A test lengthens it.
+var drainFlushStall = time.Second
+
 // answerForStop answers every request still without a final response, and
 // waits until the answers have gone out, so that a Close right after does
 // not drop them: handed to the sender, and with a *transport.Transport,
@@ -395,7 +415,7 @@ func (p *Proxy) answerForStop() int {
 			}
 		}
 	}
-	deadline := time.Now().Add(DrainSendWait)
+	deadline := time.Now().Add(drainSendWait)
 	for _, ch := range sent {
 		select {
 		case <-ch:
@@ -409,16 +429,19 @@ func (p *Proxy) answerForStop() int {
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
-// write what its send queues hold: its Close drops it.
+// write what its send queues hold: its Close drops it. It waits for each
+// connection's queue as it was then, the answers still waiting for room in
+// it included, and gives up on one whose writer makes no progress for
+// drainFlushStall (Transport.Flush).
 func (p *Proxy) flushSender(deadline time.Time) {
 	for p.cancelsSending.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if tr, ok := p.sender.(*transport.Transport); ok {
-		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
+	tr, ok := p.sender.(*transport.Transport)
+	if !ok {
+		return
 	}
+	tr.Flush(deadline, drainFlushStall)
 }
 
 // drainResponse is the final response Drain gives req (Config.DrainAnswer).
@@ -479,20 +502,37 @@ func (p *Proxy) isClosed() bool {
 
 // spawn runs f on a goroutine of its own, counted for Close.
 func (p *Proxy) spawn(f func()) {
+	p.begin()
+	go func() {
+		defer p.end()
+		f()
+	}()
+}
+
+// counted runs f on the calling goroutine, counted for Close as spawn's
+// goroutines are: for a callback on a goroutine the proxy did not start,
+// such as context.AfterFunc's (#319). It is counted from when it starts, so
+// a wait that returns before then still misses it; what it does checks
+// isClosed first.
+func (p *Proxy) counted(f func()) {
+	p.begin()
+	defer p.end()
+	f()
+}
+
+func (p *Proxy) begin() {
 	p.activeMu.Lock()
 	p.active++
 	p.activeMu.Unlock()
-	go func() {
-		defer func() {
-			p.activeMu.Lock()
-			p.active--
-			if p.active == 0 {
-				p.idle.Broadcast()
-			}
-			p.activeMu.Unlock()
-		}()
-		f()
-	}()
+}
+
+func (p *Proxy) end() {
+	p.activeMu.Lock()
+	p.active--
+	if p.active == 0 {
+		p.idle.Broadcast()
+	}
+	p.activeMu.Unlock()
 }
 
 // wait returns once no goroutine started by spawn is running.
@@ -613,12 +653,22 @@ func (p *Proxy) receiveCancel(tx *transaction.ServerTransaction) {
 		p.reply(tx, 481)
 		return
 	}
-	p.reply(tx, 200)
 	p.mu.Lock()
 	c := p.contexts[invite]
 	p.mu.Unlock()
+	// The request counts as cancelled before its CANCEL is answered, so
+	// that no branch whose Prepare or Resolver is still running is sent
+	// once the client has the 200 (#361). What the CANCEL sets going here
+	// follows the 200; but such a branch, ending unsent meanwhile, may
+	// have the INVITE's 487 written before the 200, which RFC 3261 leaves
+	// unordered, the two being different transactions.
+	var then func()
 	if c != nil {
-		c.cancelUpstream()
+		then = c.cancelUpstream()
+	}
+	p.reply(tx, 200)
+	if then != nil {
+		then()
 	}
 }
 

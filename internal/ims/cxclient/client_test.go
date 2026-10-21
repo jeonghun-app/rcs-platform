@@ -1123,3 +1123,36 @@ func TestAnAuthenticationWhoseFirstSchemeWasAnsweredWasSent(t *testing.T) {
 		t.Errorf("error %v, NeverSent %v; want the second MAR's unavailable peer, sent", err, NeverSent(err))
 	}
 }
+
+// TestAnRTROrPPRAnsweredTooBusyReachesTheHSSAsAProtocolError (#394 code
+// review): a callback's 3xxx goes out as the node answers a protocol error,
+// with the E bit (RFC 6733 §7.2), so the HSS sends the request to another
+// peer; cx.Answer would refuse it, and the HSS would get 5012 instead.
+func TestAnRTROrPPRAnsweredTooBusyReachesTheHSSAsAProtocolError(t *testing.T) {
+	busy := cx.ResultCode(diameter.ResultTooBusy)
+	e := newEnv(t, func(c *Config) {
+		c.OnRTR = func(context.Context, *cx.RTR) cx.Result { return busy }
+		c.OnPPR = func(context.Context, *cx.PPR) cx.Result { return busy }
+	})
+	h := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	e.refresh("192.0.2.1")
+	for name, build := range map[string]func(n *diameter.Node) (*diameter.Message, error){
+		"RTR": (&cx.RTR{
+			Request:              cx.Request{DestinationHost: thisHost, DestinationRealm: realm},
+			UserName:             impi1,
+			DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination},
+		}).Message,
+		"PPR": (&cx.PPR{
+			Request:  cx.Request{DestinationHost: thisHost, DestinationRealm: realm},
+			UserName: impi1, UserData: []byte("<IMSSubscription/>"),
+		}).Message,
+	} {
+		ans := pushTo(t, h, build)
+		if rc, _ := ans.ResultCode(); rc != diameter.ResultTooBusy || ans.Flags&diameter.FlagError == 0 {
+			t.Errorf("%s: the HSS got %d (E bit %v), want 3004 with the E bit", name, rc, ans.Flags&diameter.FlagError != 0)
+		}
+	}
+	if e.metrics.count("cxclient.RTR.3004") != 1 || e.metrics.count("cxclient.PPR.3004") != 1 {
+		t.Error("the answers were not counted")
+	}
+}

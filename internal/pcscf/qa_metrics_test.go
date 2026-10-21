@@ -150,7 +150,7 @@ func TestQAMergedAFlowClosingUnderARequestIsCounted(t *testing.T) {
 			_ = c.nextRequest()
 			before := qaCounts(t, h)
 			_ = c.nc.Close()
-			if code, _, err := finalWithin(core); err != nil || code != 430 {
+			if code, err := finalWithin(core); err != nil || code != 430 {
 				t.Fatalf("%d %v", code, err)
 			}
 			qaExpectOnly(t, h, before, metricTerminatingFlow)

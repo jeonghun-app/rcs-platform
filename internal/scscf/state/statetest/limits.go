@@ -915,6 +915,73 @@ func testAttemptCountNotAChallenge(t *testing.T, a, _ state.Store, _ Options) {
 	wantErr(t, a.AddChallenge(ctx(t), Challenge(IMPI1, state.ReservedNoncePrefix+"x", time.Minute)), state.ErrInvalid)
 }
 
+// testODIClaims: the first side to claim a position is recorded for every
+// instance, a claim of that side again goes on, as does a resend of the
+// first, the other side gets the first's, of concurrent claims one side is
+// recorded, and a claim that has expired is taken over.
+func testODIClaims(t *testing.T, a, b state.Store, _ Options) {
+	scope, exp := state.ODIScope("odi-1"), T0.Add(time.Minute)
+	if side := must(a.ClaimODI(ctx(t), scope, state.ODIReturned, T0, exp))(t); side != state.ODIReturned {
+		t.Fatalf("the first claim recorded %q", side)
+	}
+	for _, s := range []state.Store{a, b} {
+		for _, side := range []string{state.ODIReturned, state.ODIDefault} {
+			if got := must(s.ClaimODI(ctx(t), scope, side, T0, exp))(t); got != state.ODIReturned {
+				t.Errorf("a claim for %s found %q, want the first's", side, got)
+			}
+		}
+	}
+	other := state.ODIScope("odi-2")
+	if side := must(b.ClaimODI(ctx(t), other, state.ODIDefault, T0, exp))(t); side != state.ODIDefault {
+		t.Errorf("another position recorded %q", side)
+	}
+	race := state.ODIScope("odi-3")
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got := map[string]int{}
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, side := a, state.ODIReturned
+			if i%2 == 1 {
+				s, side = b, state.ODIDefault
+			}
+			recorded, err := s.ClaimODI(ctx(t), race, side, T0, exp)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			got[recorded]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(got) != 1 {
+		t.Errorf("concurrent claims recorded %v, want one side", got)
+	}
+	if side := must(b.ClaimODI(ctx(t), scope, state.ODIDefault, exp, exp.Add(time.Minute)))(t); side != state.ODIDefault {
+		t.Errorf("a claim after the first expired found %q", side)
+	}
+	for _, bad := range []struct {
+		scope, side string
+		now, exp    time.Time
+	}{
+		{"odi-1", state.ODIReturned, T0, exp},
+		{strings.ToUpper(scope), state.ODIReturned, T0, exp},
+		{scope, "both", T0, exp},
+		{scope, state.ODIReturned, T0, T0},
+		{scope, state.ODIReturned, time.Time{}, exp},
+	} {
+		_, err := a.ClaimODI(ctx(t), bad.scope, bad.side, bad.now, bad.exp)
+		wantErr(t, err, state.ErrInvalid)
+	}
+	// No challenge's key names a claim.
+	_, err := a.TakeChallenge(ctx(t), state.ReservedNoncePrefix+"odi#"+scope, state.ReservedNoncePrefix+"odi", T0)
+	wantErr(t, err, state.ErrNotFound)
+}
+
 // testReassertSweep: a live registration whose Reassert has come is handed to
 // one sweep, which claims it for a lease, and is due again only when that
 // lease ends or the handler moves Reassert.
@@ -1040,4 +1107,43 @@ func testRefusedSaveKeepsAGoneProfileGone(t *testing.T, a, b state.Store, _ Opti
 	wantErr(t, b.SaveProfile(ctx(t), late), state.ErrConflict)
 	_, err := a.Profile(ctx(t), Set1, T0.Add(3*time.Hour))
 	wantErr(t, err, state.ErrNotFound)
+}
+
+// testRejectedLease: a deregistration's lease marked Rejected reads back
+// with the mark, and keeps it through a sweep's claim, on every backend;
+// a record no deregistration holds, with bindings or an unregistered
+// user's without, cannot have it (#334).
+func testRejectedLease(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1)
+	r.Deregistering, r.Rejected = T0.Add(-time.Second), true
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if got := must(b.Registration(ctx(t), Key1(IMPU1)))(t); !got.Rejected {
+		t.Fatalf("read back %+v", got)
+	}
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), T0, 10))(t)) == 1
+	})
+	handled := 0
+	if _, err := state.SweepRegistrations(ctx(t), b, T0, 10, func(before, after *state.Registration) error {
+		handled++
+		if !before.Rejected || !after.Rejected {
+			t.Errorf("the claim lost the mark: before %v, after %v", before.Rejected, after.Rejected)
+		}
+		return errors.New("SAR failed")
+	}); handled != 1 {
+		t.Fatalf("handled %d, %v", handled, err)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); !got.Rejected {
+		t.Error("the claimed lease lost the mark")
+	}
+	live := Registration(IMPI2, IMPU2, time.Hour)
+	live.Rejected = true
+	_, err := a.SaveRegistration(ctx(t), live)
+	wantErr(t, err, state.ErrInvalid)
+	// Keyed on the lease, not on the bindings: an unregistered user's
+	// record has none, and no lease (QA on #351).
+	unreg := Registration(IMPI2, IMPU2)
+	unreg.Unregistered, unreg.Rejected = T0.Add(time.Hour), true
+	_, err = a.SaveRegistration(ctx(t), unreg)
+	wantErr(t, err, state.ErrInvalid)
 }

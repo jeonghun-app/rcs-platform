@@ -132,7 +132,7 @@ func (n *Notifier) Ended(ctx context.Context, before *state.Registration, cause 
 				n.enqueueNotify(ctx, sub, job{}, nil)
 				continue
 			}
-			ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(pendingEnd), j.reason, true)
+			ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(n.pendingEnd()), j.reason, true)
 			if err != nil {
 				errs = errors.Join(errs, err)
 				continue
@@ -323,10 +323,11 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		}
 		j.bare = j.bare || why == lapsedPCSCF || set == nil && before == nil
 	}
+	held := false
 	if j.final && !j.first && !sub.Terminated {
 		// Saved first, so that a stop from here on leaves the end to a
 		// sweep (SweepSubscriptions).
-		ended, err := n.terminate(ctx, sub, now.Add(pendingEnd), j.reason, j.ended)
+		ended, err := n.terminate(ctx, sub, now.Add(n.pendingEnd()), j.reason, j.ended)
 		if err != nil {
 			n.internalLog("terminating a subscription", err)
 			return nil
@@ -334,7 +335,7 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		if ended == nil {
 			return nil
 		}
-		sub = ended
+		sub, held = ended, true
 	}
 	cseq, version := sub.CSeq, sub.ReginfoVersion
 	switch {
@@ -344,6 +345,16 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		// it was sent with, so that the subscriber takes the two for one.
 		n.count("regevent.final_resent")
 	default:
+		if j.final && !held {
+			// Terminated when the set ended, the final may have waited its
+			// turn here since (SetConcurrency, HopConcurrency) while its
+			// expiry ran: it is held again from now, for as long as its
+			// send may wait for an answer, or a sweep could send it at the
+			// same time (#336). A sweep that took it over meanwhile has it.
+			if sub = n.hold(ctx, sub, now); sub == nil {
+				return nil
+			}
+		}
 		var err error
 		of := int64(state.FinalNotify)
 		if !j.final {
@@ -390,10 +401,51 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 	}
 }
 
+// hold saves sub's expiry pendingEnd from now, under the version read: nil
+// if another instance took the final over, a sweep's claim above all, or it
+// is gone. A save that loses to a write that left the final as it was, a
+// change's NOTIFY numbering itself, reads the subscription again and holds
+// that: only a write that moved the expiry, or numbered the final, took it
+// over (#346 code review).
+func (n *Notifier) hold(ctx context.Context, sub *state.Subscription, now time.Time) *state.Subscription {
+	expires := sub.Expires
+	for range saveAttempts {
+		next := sub.Clone()
+		next.Expires = now.Add(n.pendingEnd())
+		saved, err := n.cfg.Store.SaveSubscription(ctx, next)
+		switch {
+		case err == nil:
+			return saved
+		case errors.Is(err, state.ErrNotFound):
+			return nil
+		case !errors.Is(err, state.ErrConflict):
+			n.internalLog("holding a final NOTIFY", err)
+			return nil
+		}
+		cur, err := n.cfg.Store.Subscription(ctx, sub.ID)
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+			return nil
+		case err != nil:
+			n.internalLog("reading a subscription", err)
+			return nil
+		case !cur.Terminated || cur.NotifiedOf == state.FinalNotify || !cur.Expires.Equal(expires):
+			n.count("regevent.final_taken_over")
+			return nil
+		}
+		sub = cur
+	}
+	n.count("regevent.final_taken_over")
+	return nil
+}
+
 // maxFinalSends bounds how often a final NOTIFY is sent without an answer,
 // and finalBackoff is the wait before the second send, doubled for each
-// after it: about five minutes in all, the time a P-CSCF task takes to be
-// replaced.
+// after it, counted from when the send ended: the last send about 3 min 10 s
+// after the first for a subscriber that stays silent (0, 20, 50, 100 and
+// 190 s, each send waiting NotifyTimeout), 2 min 30 s when each fails at
+// once (0, 10 s, 30 s, 1 min 10 s, 2 min 30 s); about the time a P-CSCF
+// task takes to be replaced.
 const (
 	maxFinalSends = 5
 	finalBackoff  = 10 * time.Second

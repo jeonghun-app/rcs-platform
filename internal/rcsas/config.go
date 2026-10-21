@@ -66,13 +66,25 @@ type Config struct {
 	MaxSessions        int
 	MaxOutgoingPerUser int
 	MaxIncomingPerUser int
-	Store              string
-	DynamoDB           awsstore.Config
+	// GroupChat turns the conference factory and the conference URIs on
+	// (RCSAS_GROUP_CHAT_ENABLED); off, they answer 404. A group's
+	// subscriptions and sessions live in one task until #121, so it is
+	// turned on with one task only.
+	GroupChat bool
+	// MaxSubscriptionsPerUser bounds one user's conference subscriptions
+	// across all its groups (RCSAS_MAX_SUBSCRIPTIONS_PER_USER).
+	MaxSubscriptionsPerUser int
+	Store                   string
+	DynamoDB                awsstore.Config
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
 	// are left for the service to set.
 	Messaging messaging.Config
 	// GroupsTable is the groupchats table, with RCSAS_STORE=dynamodb.
 	GroupsTable string
+	// ConferenceFactory is the URI clients create group chats at
+	// (RCSAS_CONFERENCE_FACTORY_URI): by default the ConfFctyURI ACS
+	// provisions, sip:conf-factory@<RCS_IMS_DOMAIN>.
+	ConferenceFactory sip.URI
 	// Group is the group chat focus's configuration; its Clock and Rand
 	// are left for the service to set.
 	Group group.Config
@@ -130,6 +142,9 @@ func Configure(s *runtime.Settings) Config {
 	positive(e, "MAX_OUTGOING_SESSIONS_PER_USER", c.MaxOutgoingPerUser)
 	c.MaxIncomingPerUser = e.Int("MAX_INCOMING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
 	positive(e, "MAX_INCOMING_SESSIONS_PER_USER", c.MaxIncomingPerUser)
+	c.GroupChat = e.Bool("GROUP_CHAT_ENABLED", false)
+	c.MaxSubscriptionsPerUser = e.Int("MAX_SUBSCRIPTIONS_PER_USER", sipas.DefaultMaxSubscriptionsPerUser)
+	positive(e, "MAX_SUBSCRIPTIONS_PER_USER", c.MaxSubscriptionsPerUser)
 	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
 		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
 	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
@@ -228,6 +243,20 @@ func Configure(s *runtime.Settings) Config {
 			messaging.Rate{PerMinute: group.DefaultFanoutRate.PerMinute, Burst: group.DefaultFanoutBurst(maxParticipants)}),
 		AddRate:    readRate(e, "GROUP_ADD", addRate),
 		CreateRate: readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
+	}
+	c.Group.HomeDomain = c.HomeDomain
+	// One spelling, which the group writes its conference URIs with and
+	// the SIP layer compares with: lower case, without a trailing dot.
+	c.Group.ConferenceHost = strings.ToLower(strings.TrimSuffix(c.Group.ConferenceHost, "."))
+	if c.Group.ConferenceHost != "" && strings.EqualFold(c.Group.ConferenceHost, strings.TrimSuffix(c.HomeDomain, ".")) {
+		// Every user's request would be taken for a group's.
+		e.Invalid("CONFERENCE_HOST", "the IMS domain (RCS_IMS_DOMAIN), whose users are no conferences")
+	}
+	factory := e.String("CONFERENCE_FACTORY_URI", "sip:conf-factory@"+c.HomeDomain)
+	if u, err := sip.ParseURI(factory); err != nil || !u.IsSIP() || u.User == "" || u.Host == "" {
+		e.Invalid("CONFERENCE_FACTORY_URI", "not a SIP URI with a user")
+	} else {
+		c.ConferenceFactory = u
 	}
 	positive(e, "GROUP_MAX_PARTICIPANTS", c.Group.MaxParticipants)
 	if c.Group.MaxParticipants > group.LimitParticipants {

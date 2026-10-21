@@ -53,7 +53,10 @@ const (
 	attrCSeq    = "cseq"
 	attrRver    = "rver"
 	// attrCount is an attempt count (state.Challenges.CountAttempt).
-	attrCount  = "n"
+	attrCount = "n"
+	// attrSide is the side that took up an iFC position
+	// (state.Challenges.ClaimODI).
+	attrSide   = "side"
 	attrNToken = "ntoken"
 	// attrNotifiedOf is the version of the set's record the last NOTIFY
 	// numbered carried (state.Subscription.NotifiedOf).

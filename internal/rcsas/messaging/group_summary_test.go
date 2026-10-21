@@ -36,6 +36,22 @@ func queuedReceipts(t *testing.T, r *rig, user string) (notes, summaries int) {
 	return notes, summaries
 }
 
+// summaryID is the ID of the one summary queued for user.
+func summaryID(t *testing.T, r *rig, user string) string {
+	t.Helper()
+	ms, err := r.store.Pending(context.Background(), user, "", r.clock.Now(), 10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range ms {
+		if m.Summary {
+			return m.ID
+		}
+	}
+	t.Fatal("no summary queued")
+	return ""
+}
+
 // author is an author's client in a group as rcsjta reads notifications
 // there (GroupChatSession): only a CPIM message whose content is
 // message/imdn+xml and whose To is the author, one status for the
@@ -217,13 +233,34 @@ type interrupting struct {
 	once sync.Once
 	hook func()
 	sent func()
+	// settled counts the calls that end a claim on the message watched: a
+	// release, which puts it back in the queue, or a removal (#405).
+	watched atomic.Value // string
+	settled atomic.Int64
+}
+
+func (s *interrupting) settle(id string) {
+	if w, _ := s.watched.Load().(string); w != "" && w == id {
+		s.settled.Add(1)
+	}
 }
 
 func (s *interrupting) RemoveSummary(ctx context.Context, m store.Message, owner string, marks int64) error {
 	if s.hook != nil {
 		s.once.Do(s.hook)
 	}
+	defer s.settle(m.ID)
 	return s.Store.RemoveSummary(ctx, m, owner, marks)
+}
+
+func (s *interrupting) Release(ctx context.Context, recipient, id, owner string) error {
+	defer s.settle(id)
+	return s.Store.Release(ctx, recipient, id, owner)
+}
+
+func (s *interrupting) Remove(ctx context.Context, m store.Message, owner string) error {
+	defer s.settle(m.ID)
+	return s.Store.Remove(ctx, m, owner)
 }
 
 func (s *interrupting) Sent(ctx context.Context, sender, id string, now time.Time) (store.Sent, error) {
@@ -309,6 +346,7 @@ func TestASummaryCutShortIsSentAgain(t *testing.T) {
 	if _, sums := queuedReceipts(t, r, alice); sums != 1 {
 		t.Fatalf("%d summaries", sums)
 	}
+	st.watched.Store(summaryID(t, r, alice))
 	l := r.listen(t)
 	var first *Leg
 	var mu sync.Mutex
@@ -320,7 +358,10 @@ func TestASummaryCutShortIsSentAgain(t *testing.T) {
 	mu.Lock()
 	first, _ = r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
 	mu.Unlock()
-	waitFor(t, "the first attempt", func() bool { return r.m.get("delivery.msrp_failed") >= 1 })
+	// The failure is counted before the summary's claim is released, and
+	// while it is claimed the queue does not list it: wait for the attempt
+	// to end the summary's claim, whichever way, then look (#405).
+	waitFor(t, "the first attempt", func() bool { return r.m.get("delivery.msrp_failed") >= 1 && st.settled.Load() >= 1 })
 	if _, sums := queuedReceipts(t, r, alice); sums != 1 {
 		t.Fatalf("the summary is gone after a failed attempt: %d", sums)
 	}

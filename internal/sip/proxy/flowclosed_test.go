@@ -140,7 +140,8 @@ func TestACancelledBranchWhoseFlowClosesIs487(t *testing.T) {
 }
 
 // BranchFailure.Provisional tells a service whether the target had the
-// request (noted on #14 for scscf).
+// request (noted on #14 for scscf), and Progress whether the target, not
+// only the next hop with its 100, answered (#322).
 func TestABranchFailureSaysWhetherAProvisionalCame(t *testing.T) {
 	for _, code := range []int{0, 100, 180} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
@@ -159,8 +160,8 @@ func TestABranchFailureSaysWhetherAProvisionalCame(t *testing.T) {
 				h.reply(fwd, code)
 			}
 			h.reply(fwd, 486)
-			if len(failures) != 1 || failures[0].Provisional != (code != 0) {
-				t.Fatalf("failures = %+v, want one with Provisional %v", failures, code != 0)
+			if len(failures) != 1 || failures[0].Provisional != (code != 0) || failures[0].Progress != (code > 100) {
+				t.Fatalf("failures = %+v, want one with Provisional %v, Progress %v", failures, code != 0, code > 100)
 			}
 		})
 	}
