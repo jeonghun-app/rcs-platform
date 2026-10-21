@@ -140,7 +140,6 @@ after it ([docs/scscf-state.md](scscf-state.md)).
 
 ## Not in place yet
 
-- The compose stack and its end-to-end checks (#14 PR F2).
 - Deregistering a user whose SESSION_TERMINATED application server does not
   answer its third-party REGISTER (§5.4.1.7), and sending a re- or
   de-registration to the application server address the initial one reached

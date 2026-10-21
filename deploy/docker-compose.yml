@@ -34,6 +34,9 @@ x-shared: &shared
   RCS_IMS_DOMAIN: ims.mnc001.mcc001.3gppnetwork.org
   RCS_PII_HMAC_KEY: ${RCS_PII_HMAC_KEY:?not in deploy/compose.env; make up adds new settings to it}
   RCS_SHUTDOWN_TIMEOUT: 20s
+  # pcscf's core listener port, which scscf sends a dialog's requests to a
+  # P-CSCF on: one setting for both (docs/pcscf.md, docs/scscf.md).
+  RCS_PCSCF_CORE_PORT: "5070"
 
 # What the platform services share: the image, and starting once their
 # tables exist. Each one's health check runs its own binary with
@@ -197,6 +200,10 @@ services:
       # sends the client's path 300 ms after the client connects, and a
       # loaded laptop or CI runner has taken over 2 s (#204).
       RELAY_PATH_WAIT: 10s
+    networks:
+      default:
+        # The control API's name pcscf calls (msrp-relay.<namespace>).
+        aliases: ["msrp-relay.rcs.local"]
     ports:
       - "127.0.0.1:${RELAY_MSRP_HOST_PORT:-12855}:2855"
       - "127.0.0.1:${RELAY_CONTROL_HOST_PORT:-18083}:8082"
@@ -219,8 +226,69 @@ services:
       # No Cloud Map here: the HSS tasks are found by resolving
       # hss.rcs.local, hss's alias (dev only; staging and prod refuse dns).
       ICSCF_HSS_DISCOVERY: dns
+    networks:
+      default:
+        # The Cloud Map name pcscf and scscf send to (icscf.<namespace>).
+        aliases: ["icscf.rcs.local"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/icscf", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # The S-CSCF: the registrar, the reg event and iFC routing, its state in
+  # DynamoDB Local (docs/scscf.md). Without rcs-as in the stack, the
+  # default profile's criteria toward it fail over to their default
+  # handling: the REGISTER's and OPTIONS's go on, a chat INVITE's and a
+  # MESSAGE's end there (docs/local-stack.md).
+  scscf:
+    <<: *platform
+    command: ["scscf"]
+    depends_on:
+      stack-tables:
+        condition: service_completed_successfully
+      hss:
+        condition: service_healthy
+    environment:
+      <<: *shared
+      SCSCF_DYNAMODB_ENDPOINT: http://dynamodb:8000
+      # As icscf's: hss.rcs.local by DNS (dev only).
+      SCSCF_HSS_DISCOVERY: dns
+      SCSCF_NONCE_KEY: ${SCSCF_NONCE_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      SCSCF_DIALOG_KEYS: k1:${SCSCF_DIALOG_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      SCSCF_CHALLENGE_KEYS: c1:${SCSCF_CHALLENGE_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      # The name clients reach pcscf at, which ends a dialog's route set in
+      # rcsjta's session refreshes.
+      SCSCF_EDGE_PROXY_PUBLIC_HOSTS: ${PCSCF_PUBLIC_HOST:-pcscf}
+    networks:
+      default:
+        # The service name every task gives the HSS and icscf
+        # (scscf.<namespace>, docs/scscf.md).
+        aliases: ["scscf.rcs.local"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/scscf", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # The P-CSCF, the clients' SIP entry point (docs/pcscf.md): plain TCP on
+  # 5060 with no NLB in front (dev only; staging and prod refuse both).
+  pcscf:
+    <<: *platform
+    command: ["pcscf"]
+    environment:
+      <<: *shared
+      # Its default names for icscf, scscf and msrp-relay's control API are
+      # in the namespace, which the compose network has as aliases.
+      RCS_SERVICE_NAMESPACE: rcs.local
+      PCSCF_PUBLIC_HOST: ${PCSCF_PUBLIC_HOST:-pcscf}
+      PCSCF_CLIENT_TRANSPORT: tcp
+      PCSCF_RELAY_TOKEN: ${RELAY_PCSCF_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+    ports:
+      # The client listener, for a client on this host.
+      - "127.0.0.1:${PCSCF_SIP_HOST_PORT:-15060}:5060"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pcscf", "-healthcheck"]
       interval: 2s
       timeout: 5s
       retries: 60
@@ -229,17 +297,6 @@ services:
   # with the environment its document gives (docs/local-stack.md, Adding a
   # service). Each takes the platform image, the shared settings and the
   # -healthcheck health check, like the services above.
-  #
-  # pcscf:     the SIP edge. acs provisions its name (PCSCF_PUBLIC_HOST), and
-  #            it calls msrp-relay's control API with RELAY_PCSCF_TOKEN.
-  #   <<: *platform
-  #   command: ["pcscf"]
-  #   environment: { <<: *shared }
-  #   healthcheck: { test: ["CMD", "/usr/local/bin/pcscf", "-healthcheck"], interval: 2s, timeout: 5s, retries: 60 }
-  #
-  # scscf:     Diameter Cx toward hss:3868, iFC evaluation.
-  #   <<: *platform
-  #   command: ["scscf"]
   #
   # rcs-as:    chat and conferences; msrp-relay connects to it on
   #            RELAY_CORE_PORTS (2855).

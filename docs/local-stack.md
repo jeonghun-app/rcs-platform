@@ -71,13 +71,15 @@ DynamoDB Local or S3Mock.
 
 | Service | Image | Role here | Health |
 |---|---|---|---|
-| `dynamodb` | `DDBLOCAL_IMAGE` (Makefile) | DynamoDB for `hss`, `ft-server` and `msrp-relay`, in memory, one shared database | a bare `GET` answers 400 |
+| `dynamodb` | `DDBLOCAL_IMAGE` (Makefile) | DynamoDB for `hss`, `scscf`, `ft-server` and `msrp-relay`, in memory, one shared database | a bare `GET` answers 400 |
 | `s3` | `S3MOCK_IMAGE` (Makefile) | S3 for `ft-server`'s content | `GET /` |
 | `stack-tables` | `deploy/stack-init.Dockerfile` | one-shot: creates the tables and the bucket ([Bootstrap](#bootstrap)) | exits 0 |
 | `hss` | platform image | subscribers, Cx on 3868, provisioning API | `hss -healthcheck` |
 | `ft-server` | platform image | FT via HTTP; credentials from `hss` | `ft-server -healthcheck` |
 | `msrp-relay` | platform image | MSRP anchor; plain MSRP, no PROXY header | `msrp-relay -healthcheck` |
 | `icscf` | platform image | I-CSCF; finds `hss` as `hss.rcs.local` by DNS ([icscf](icscf.md#settings)), SIP on 5060 | `icscf -healthcheck` |
+| `scscf` | platform image | S-CSCF; its state in DynamoDB Local, `hss` by DNS as `icscf` finds it ([scscf](scscf.md)), SIP on 5060 | `scscf -healthcheck` |
+| `pcscf` | platform image | P-CSCF; clients' SIP on plain TCP 5060, the core listener on 5070 (`RCS_PCSCF_CORE_PORT`, [pcscf](pcscf.md)) | `pcscf -healthcheck` |
 | `acs` | `ACS_IMAGE` (Makefile) | auto-configuration, memory store, mock SMS | the image's own `/healthz` check |
 | `stack-seed` | `deploy/stack-init.Dockerfile` | one-shot, after the services are healthy: the test subscriber ([Bootstrap](#bootstrap)) | exits 0 |
 
@@ -87,9 +89,15 @@ shell or curl. `make up` waits until every service is healthy (up to 300 s). The
 test of `make e2e-compose` also waits for each `/readyz`, which checks the
 stores.
 
-`pcscf`, `scscf` and `rcs-as` are commented placeholders in the compose file.
-Until `scscf` is there, `icscf` connects to `hss` but has no S-CSCF to forward
-to. The pull request that adds a service enables it ([Adding a service](#adding-a-service)).
+`rcs-as` is a commented placeholder in the compose file; the pull request that
+adds it enables it ([Adding a service](#adding-a-service)). Until then the
+default service profile's criteria toward `rcs-as` meet no server, and their
+default handling applies ([hss](hss.md#default-service-profile)):
+
+- a REGISTER's third-party REGISTER and a capability query's OPTIONS go on,
+  `SESSION_CONTINUED`;
+- a chat INVITE and a MESSAGE end there, `SESSION_TERMINATED`, so rcs-sim's
+  `pager-message` cannot run on this stack yet.
 
 ### Ports
 
@@ -103,12 +111,15 @@ Published on `127.0.0.1` only. The defaults are in `deploy/compose.env`.
 | 18083 (`RELAY_CONTROL_HOST_PORT`) | `msrp-relay` | control API (pcscf's) |
 | 12855 (`RELAY_MSRP_HOST_PORT`) | `msrp-relay` | MSRP, plain TCP |
 | 18000 (`DYNAMODB_HOST_PORT`) | `dynamodb` | DynamoDB API (any credentials) |
+| 15060 (`PCSCF_SIP_HOST_PORT`) | `pcscf` | SIP for a client on the host, plain TCP |
 | 19090 (`S3_HOST_PORT`) | `s3` | S3 API |
 
 The admin ports (8080) and Diameter (3868) are reachable on the compose network
 only. On the network every service has its compose name: `hss:8081`,
-`ft-server:8081`, `msrp-relay:2855` and `:8082`, `icscf:5060`, `acs:8080`,
-`dynamodb:8000`, `s3:9090`; `hss` is also `hss.rcs.local`.
+`ft-server:8081`, `msrp-relay:2855` and `:8082`, `icscf:5060`, `scscf:5060`,
+`pcscf:5060` and `:5070`, `acs:8080`, `dynamodb:8000`, `s3:9090`. `hss`,
+`icscf`, `scscf` and `msrp-relay` also have their Cloud Map names in
+`rcs.local`, such as `hss.rcs.local`, which the CSCFs' defaults name.
 
 For example, to read the test subscription with the operator token:
 
@@ -142,6 +153,9 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
   creates what their documents describe for the infrastructure:
   - `subscribers` and `service-profiles` ([hss](hss.md#tables)), through
     `internal/hss/awsstore.CreateTables`;
+  - `registrations`, `auth-challenges` and `reg-subscriptions`
+    ([scscf state](scscf-state.md)), through
+    `internal/scscf/state/dynamostore.CreateTables`;
   - `files` with TTL on `ttl` and the bucket `ft-content`
     ([ft-server](ft-server.md#storage));
   - `msrp-bindings` with TTL on `ttl` ([msrp-relay](msrp-relay.md#the-bindings-table)).
@@ -238,7 +252,8 @@ The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
 container on the stack's network (`<COMPOSE_PROJECT>_default`), with
 `deploy/compose.env` as its environment. It:
 
-1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf` and `acs`;
+1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf`,
+   `scscf`, `pcscf` and `acs`;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim all`:
@@ -246,10 +261,21 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
      looks the credentials up in `hss` and keeps the content in S3Mock and
      DynamoDB Local.
    - the chat scenarios go through `msrp-relay` on DynamoDB Local. `rcs-sim`
-     stands in for `pcscf` (control API, `RELAY_PCSCF_TOKEN`) and `rcs-as` (on
-     the test container's address, port 2855) until those exist.
-5. checks the results by the same rules as `make e2e`: every step, the resume
-   bounds, no busy retries, nothing secret or identifying in the output.
+     stands in for `pcscf` toward the relay (control API,
+     `RELAY_PCSCF_TOKEN`) and for `rcs-as` (on the test container's address,
+     port 2855) until chat runs over SIP.
+5. runs `rcs-sim reg-event options` over SIP, at the P-CSCF `acs`
+   provisions. Both test subscribers register with IMS AKA, with the keys
+   `stack-seed` gave `hss`, through `pcscf`, `icscf` and `scscf`:
+   - `reg-event` subscribes to the client's own registration and follows it
+     through a refresh and the de-registration. Its network-deregister step
+     is skipped: rcs-sim has no way to ask for one yet.
+   - `options` sends the peer an OPTIONS to its tel URI and a capability
+     query to its SIP URI, through `scscf`'s originating and terminating
+     iFC chains.
+6. checks the results of both runs by the same rules as `make e2e`: every
+   step, the resume bounds, no busy retries, nothing secret or identifying
+   in the output.
 
 The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
 `make logs` on failure, and `make down`.
@@ -264,10 +290,12 @@ describe them. #56 provides the AWS values. Locally:
 | `RCS_ENV` | `dev` | `staging` or `prod` |
 | stop grace | `stop_grace_period: 25s`, above `RCS_SHUTDOWN_TIMEOUT` 20 s | the task definition's `stopTimeout` (at most 120 s), above `RCS_SHUTDOWN_TIMEOUT` ([msrp-relay](msrp-relay.md#settings)) |
 | `RCS_IMS_DOMAIN` | fixed, `ims.mnc001.mcc001.3gppnetwork.org` (see [acs](#acs)) | the operator's IMS domain |
-| `HSS_DYNAMODB_ENDPOINT`, `FT_DYNAMODB_ENDPOINT`, `FT_S3_ENDPOINT`, `RELAY_DYNAMODB_ENDPOINT` | `http://dynamodb:8000`, `http://s3:9090` | unset |
+| `HSS_DYNAMODB_ENDPOINT`, `SCSCF_DYNAMODB_ENDPOINT`, `FT_DYNAMODB_ENDPOINT`, `FT_S3_ENDPOINT`, `RELAY_DYNAMODB_ENDPOINT` | `http://dynamodb:8000`, `http://s3:9090` | unset |
 | `AWS_*` credentials | `local` | the task role |
 | hss data key | `HSS_DATA_KEY` (dev keyring path) | `HSS_KMS_KEY_ID` |
-| tokens, `FT_NONCE_KEY`, `RCS_PII_HMAC_KEY` | `deploy/compose.env` | Secrets Manager |
+| tokens, `FT_NONCE_KEY`, `RCS_PII_HMAC_KEY`, `scscf`'s keys | `deploy/compose.env` (`scscf`'s as `SCSCF_NONCE_KEY`, `SCSCF_DIALOG_KEY` and `SCSCF_CHALLENGE_KEY`, each given an ID in the compose file) | Secrets Manager |
+| `ICSCF_HSS_DISCOVERY`, `SCSCF_HSS_DISCOVERY` | `dns`, `hss.rcs.local` | `cloudmap` |
+| `PCSCF_CLIENT_TRANSPORT` | `tcp`, no TLS | `nlb-tls` or `tls` |
 | `RELAY_PUBLIC_TLS`, `RCS_PROXY_PROTOCOL` | `false`, `false` (no NLB) | `true`, `true` |
 | `FT_UPLOAD_URI`, `FT_DOWNLOAD_URI` | `http://ft-server:8081/…` | `https://` names on the ALB |
 | `FT_HSS_URL` | `http://hss:8081` | the Cloud Map name, `RCS_SERVICE_NAMESPACE` set |
