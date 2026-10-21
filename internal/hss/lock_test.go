@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 )
 
 // A request that holds a subscriber's lock for long, such as an API write
-// whose store calls are slow, delays Cx for that stripe only as long as the
+// whose store calls are slow, delays Cx for that subscriber only as long as the
 // Cx timeout: then the waiting request is answered DIAMETER_TOO_BUSY, which
 // the S-CSCF may retry on another HSS task.
 func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
@@ -309,53 +310,71 @@ func TestAnUncontendedMARReadsTheSubscriptionOnce(t *testing.T) {
 	}
 }
 
-// slowWinStore lets the first write through only just before its context's
-// deadline, as one that keeps losing to another task until then would.
-type slowWinStore struct {
+// deadlineStore records the deadline of each write's context.
+type deadlineStore struct {
 	store.Store
-	margin time.Duration
+	mu        sync.Mutex
+	deadlines []time.Time
 }
 
-func (s *slowWinStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
-	if d, ok := ctx.Deadline(); ok {
-		time.Sleep(time.Until(d) - s.margin)
-	}
+func (s *deadlineStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	d, _ := ctx.Deadline()
+	s.mu.Lock()
+	s.deadlines = append(s.deadlines, d)
+	s.mu.Unlock()
 	return s.Store.UpdateSubscription(ctx, old, n)
 }
 
-// deadlineNotifier records how much time each RTR had left.
+// deadlineNotifier records the deadline of each RTR's context.
 type deadlineNotifier struct {
 	recordingNotifier
-	left []time.Duration
+	deadlines []time.Time
 }
 
 func (n *deadlineNotifier) Deregister(ctx context.Context, r *cx.RTR) error {
-	if d, ok := ctx.Deadline(); ok {
-		n.left = append(n.left, time.Until(d))
-	}
+	d, _ := ctx.Deadline()
+	n.deadlines = append(n.deadlines, d)
 	return n.recordingNotifier.Deregister(ctx, r)
 }
 
 // TestARefusedPPRsRTRKeepsTimeAfterALateUpdate: the S-CSCF refused new data,
 // so the HSS marks the user not registered and deregisters it with
-// SERVER_CHANGE. An update that wins only at its deadline, behind another
-// task's writes, must not leave the RTR none (#244 review).
+// SERVER_CHANGE. The update must leave the RTR time even if it wins only at
+// its own deadline, behind another task's writes (#244 review): it gets half
+// of what the push has left, and the RTR the push's own deadline, not the
+// update's. The deadlines are compared rather than the time left, which a
+// loaded host eats into (#275).
 func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	e := newEnv(t)
 	e.provision(impi1, impu1)
 	e.modify(impi1, func(s *store.Subscription) {
 		s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
 	})
-	h := e.newHSS(func(o *Options) { o.Store = &slowWinStore{Store: e.store, margin: 20 * time.Millisecond} })
+	ds := &deadlineStore{Store: e.store}
+	h := e.newHSS(func(o *Options) { o.Store = ds })
 	n := &deadlineNotifier{recordingNotifier: *newRecorder()}
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	const push = time.Hour
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), push)
 	defer cancel()
+	pushEnd, _ := ctx.Deadline()
 	h.pprRejected(ctx, n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData))
 	if e.sub(impi1).Identity(impu1).State != store.NotRegistered {
 		t.Fatal("the user was not marked not registered")
 	}
-	if len(n.left) != 1 || n.left[0] < 200*time.Millisecond {
-		t.Errorf("RTRs with time left %v, want one with a good share of the push's", n.left)
+	if len(n.deadlines) != 1 || !n.deadlines[0].Equal(pushEnd) {
+		t.Fatalf("RTR deadlines %v, want the push's own %v", n.deadlines, pushEnd)
+	}
+	// The update's deadline is half of what was left when it started, so
+	// at least half of what was left when the push began less the time it
+	// took to start, and before the push's end by as much.
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if len(ds.deadlines) != 1 {
+		t.Fatalf("%d writes", len(ds.deadlines))
+	}
+	if left := pushEnd.Sub(ds.deadlines[0]); left < pushEnd.Sub(time.Now())/2 || left > push/2 {
+		t.Errorf("the update's deadline is %v before the push's end, want half of the %v the push had (started %v ago)", left, push, time.Since(start))
 	}
 }
 
@@ -378,6 +397,78 @@ func (s *stallingStore) UpdateSubscription(ctx context.Context, old, n *store.Su
 	}
 	<-ctx.Done()
 	return nil, fmt.Errorf("update subscription: %w", ctx.Err())
+}
+
+// cancelStore loses its first write; the next one cancels the request's
+// context, as a client that gives up does, and fails as DynamoDB does, with
+// the context's error wrapped.
+type cancelStore struct {
+	store.Store
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	writes int
+}
+
+func (s *cancelStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	s.mu.Lock()
+	s.writes++
+	first := s.writes == 1
+	s.mu.Unlock()
+	if first {
+		return nil, store.ErrConflict
+	}
+	s.cancel()
+	<-ctx.Done()
+	return nil, fmt.Errorf("update subscription: %w", ctx.Err())
+}
+
+// TestAWriteCanceledAfterALossIsContention: as at the deadline, a write the
+// caller's cancellation cuts short after a lost one reports contention,
+// not the store's failure (#244 review).
+func TestAWriteCanceledAfterALossIsContention(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &cancelStore{Store: store.NewMemory(), cancel: cancel}
+	e := newEnvWith(t, cs)
+	e.provision(impi1, impu1)
+	_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+	if !errors.Is(err, errContention) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("update = %v, want contention on the cancellation", err)
+	}
+}
+
+// slowFirstStore is a slow store without contention: once armed, every
+// write is still in flight at the deadline.
+type slowFirstStore struct {
+	store.Store
+	arm atomic.Bool
+}
+
+func (q *slowFirstStore) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	if q.arm.Load() {
+		<-ctx.Done()
+		return nil, fmt.Errorf("awsstore: update subscription: %w", ctx.Err())
+	}
+	return q.Store.UpdateSubscription(ctx, old, s)
+}
+
+// TestASlowStoreWithoutALostWriteIsAStoreFailure: a context error on the
+// first attempt, with no write lost, is the store's failure (503 "the
+// subscriber store is unavailable"), not contention (QA on #244: the
+// attempt > 0 guard).
+func TestASlowStoreWithoutALostWriteIsAStoreFailure(t *testing.T) {
+	q := &slowFirstStore{Store: store.NewMemory()}
+	e := newEnvWith(t, q)
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
+		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		DefaultProfile: DefaultProfileID, StoreTimeout: 300 * time.Millisecond,
+	})}
+	a.create(impi1, true, impu1)
+	q.arm.Store(true)
+	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
+	if code != http.StatusServiceUnavailable || body["error"] != "the subscriber store is unavailable; retry" || e.metrics.get("api.store_failure") != 1 {
+		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, e.metrics.get("api.store_failure"))
+	}
 }
 
 // TestAWriteTheDeadlineCutsShortAfterALossIsContention: the DynamoDB path,
