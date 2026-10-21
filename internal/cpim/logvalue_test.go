@@ -100,14 +100,11 @@ func TestAddressesLogTheirURIAsASIPURIIsLogged(t *testing.T) {
 	}
 }
 
-// A message logs its header names, its addresses as above, its media type
-// and its size; header values, which hold formal names and the sender's
-// text, and the body never (review of #132). The To and cc lists log their
-// addresses the same way through a text handler too.
-func TestMessagesLogTheirAddressesAndSizesButNoValuesOrBody(t *testing.T) {
-	m := mustParse(t, crlf(`From: "Alice Secret" <`+alice+`>
-To: Bob Secret <`+bob+`>
-cc: Carol <`+carol+`>
+// secretMessage has a formal name, a Subject, a header name and a body that
+// name people or numbers, none of which may be logged or printed.
+var secretMessage = crlf(`From: "Alice Secret" <` + alice + `>
+To: Bob Secret <` + bob + `>
+cc: Carol <` + carol + `>
 DateTime: 2026-10-18T09:30:00Z
 Subject: lunch with Dave Secret
 NS: x <urn:example:x>
@@ -115,7 +112,18 @@ x.Note15550100004: 1
 
 Content-Type: text/plain; name="Erin Secret.txt"
 
-meet me at 15550100005`))
+meet me at 15550100005`)
+
+// secrets are the parts of secretMessage that no log line or printed form
+// shows.
+var secrets = []string{"Secret", "1555010000", "lunch", "urn:example", "meet me", "Bob", "Carol"}
+
+// A message logs its header names, its addresses as above, its media type
+// and its size; header values, which hold formal names and the sender's
+// text, and the body never (review of #132). The To and cc lists log their
+// addresses the same way through a text handler too.
+func TestMessagesLogTheirAddressesAndSizesButNoValuesOrBody(t *testing.T) {
+	m := mustParse(t, secretMessage)
 	to, err1 := m.To()
 	cc, err2 := m.Cc()
 	if err1 != nil || err2 != nil {
@@ -133,7 +141,7 @@ meet me at 15550100005`))
 		if strings.Contains(out, "time=") || strings.Contains(out, `"time"`) {
 			t.Fatalf("%s: the line has a timestamp whose digits could match a secret:\n%s", name, out)
 		}
-		for _, secret := range []string{"Secret", "1555010000", "lunch", "urn:example", "meet me", "Bob", "Carol"} {
+		for _, secret := range secrets {
 			if strings.Contains(out, secret) {
 				t.Errorf("%s output contains %q:\n%s", name, secret, out)
 			}
@@ -174,5 +182,55 @@ func TestMessageLogValueMasksTheMediaTypeAndTakesANilMessage(t *testing.T) {
 	if strings.Contains(out, "panic") || strings.Contains(out, `"none"`) {
 		// slog drops an empty group.
 		t.Errorf("nil message logged as:\n%s", out)
+	}
+}
+
+// fmt, and slog's text handler, which formats a value that is not a
+// LogValuer with %+v, print a Message value in the form MarshalJSON writes
+// whatever the verb, also as a struct field or a slice element, rather
+// than its formal names, Subject and body (#171). A nil *Message prints as
+// fmt prints any nil pointer.
+func TestAMessagePrintsAsItsLogFormWithEveryVerb(t *testing.T) {
+	m := mustParse(t, secretMessage)
+	want, err := m.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text bytes.Buffer
+	_, textLog := untimedLoggers(io.Discard, &text)
+	textLog.Info("x", "value", *m)
+	quoted := fmt.Sprintf("value=%q", want)
+	if !strings.Contains(text.String(), quoted) {
+		t.Errorf("text log lacks %s:\n%s", quoted, text.String())
+	}
+	printed := map[string]string{"text handler": text.String()}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%d"} {
+		for name, arg := range map[string]any{"value": *m, "pointer": m} {
+			got := fmt.Sprintf(verb, arg)
+			printed[verb+" "+name] = got
+			if got != string(want) {
+				t.Errorf("%s of a %s = %s, want %s", verb, name, got, want)
+			}
+		}
+	}
+	for name, arg := range map[string]any{
+		"field":   struct{ M Message }{*m},
+		"element": []Message{*m},
+	} {
+		got := fmt.Sprintf("%+v", arg)
+		printed[name] = got
+		if !strings.Contains(got, string(want)) {
+			t.Errorf("%s prints as %s, want it to hold %s", name, got, want)
+		}
+	}
+	for name, out := range printed {
+		for _, secret := range secrets {
+			if strings.Contains(out, secret) {
+				t.Errorf("%s output contains %q:\n%s", name, secret, out)
+			}
+		}
+	}
+	if got := fmt.Sprintf("%v", (*Message)(nil)); got != "<nil>" {
+		t.Errorf("a nil *Message prints as %q", got)
 	}
 }
