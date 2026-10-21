@@ -342,7 +342,7 @@ func hintOf(t *testing.T, redacted string) string {
 // milliseconds, so a regression shows up as a test timeout, not a flaky timing.
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
-	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－", "1\u00a0", "1ー", "（１２", "(1", "tel:－", "１—\u202f", "1 \u2013", "＋"} {
+	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－", "1\u00a0", "1ー", "（１２", "(1", "tel:－", "１—\u202f", "1 \u2013", "＋", "1\u200b", "\u200b", "+\u200b", "1\u200b-", "sip:a\u00a01", "＋（", "\ufeff1"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
@@ -427,6 +427,26 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 		{"full-width hyphens in a tel URI", "tel:１２－－－３４５６", "tel:***56"},
 		{"a dash after a tel URI's scheme", "tel:\u2010123456", "tel:***56"},
 		{"a space after a tel URI's scheme", "tel:\u3000１２３４５６", "tel:***56"},
+		// Invisible format characters inside a number do not split it, as a
+		// log viewer shows the digits joined (#154).
+		{"a zero-width space", "call +1555\u200b0100001", "call +***01"},
+		{"a word joiner, a soft hyphen and a BOM", "+1\u2060555\u00ad010\ufeff0001", "+***01"},
+		{"a run of invisibles", "1555\u200b\u200c\u200d0100001", "***01"},
+		{"a variation selector", "1555\ufe0f0100001", "***01"},
+		{"an invisible after the plus", "+\u200b15550100001", "+***01"},
+		{"an invisible next to a separator", "010-\u200b0000\u2060-0001", "***01"},
+		{"an invisible in a tel URI", "tel:+1555\u200b0100001", "tel:+***01"},
+		{"an invisible in a sip user", "sip:+1555\u200b0100001@" + testDomain, "sip:***01@" + testDomain},
+		// A Unicode space inside a URI user is not a separator there: the
+		// user goes on to its "@" (#154).
+		{"a no-break space in a sip user", "sip:alice.smith1\u00a02@" + testDomain, "sip:***@" + testDomain},
+		{"a no-break space after a sip user", "sip:a@" + testDomain + " 010\u00a00000\u00a00001", "sip:***@" + testDomain + " ***01"},
+		// The full-width star and hash of a tel number, and the small plus.
+		{"a full-width star and hash in a tel URI", "tel:123456＊78＃9", "tel:***"},
+		{"a small plus sign", "call ﹢15550100001", "call +***01"},
+		// A country code in brackets after the plus starts a number.
+		{"a bracketed country code", "+(81)3 1234 5678", "+***78"},
+		{"a full-width bracketed country code", "＋（８１）３\u3000１２３４\u3000５６７８", "+***78"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := r.Redact(tt.in); got != tt.want {
@@ -451,6 +471,8 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 		"010-0000-0002":     "０１０ー００００\u2212０００２",
 		"+1 (555) 010-0001": "＋１\u3000（５５５）\u00a0０１０\u2013０００１",
 		"tel:(03)1234-5678": "tel:（０３）１２３４—５６７８",
+		"+1 555 010 0003":   "+1\u200b 555 010\u2060 0003",
+		"010-0000-0003":     "010\u00ad-0000-\ufeff0003",
 	} {
 		if a, b := k.Redact(ascii), k.Redact(wide); a != b || !strings.Contains(a, mark) {
 			t.Errorf("%q gives %q but %q gives %q", ascii, a, wide, b)
@@ -475,6 +497,15 @@ func TestRedactKeepsTheTextAroundANumber(t *testing.T) {
 		"1）",
 		"10\u00a0€",
 		"欄（）1",
+		// Invisibles outside a number, and the wave dashes of a range of
+		// hours, are text (#154).
+		"a\u200bb",
+		"-\u200b-",
+		"id\u200b 7",
+		"x\u200b1",
+		"1\u200bx",
+		"営業時間 0900〜1800",
+		"0900\u30301800",
 	} {
 		if got := r.Redact(in); got != in {
 			t.Errorf("Redact(%q) = %q, want it unchanged", in, got)
@@ -482,6 +513,8 @@ func TestRedactKeepsTheTextAroundANumber(t *testing.T) {
 	}
 	for in, want := range map[string]string{
 		"（１）":        "(1)",
+		"（１)":        "(1)",
+		"12\u200b34": "1234",
 		"(１）":        "(1)",
 		"（注１）２":      "（注1)2",
 		"10\u201320": "10-20",
@@ -566,8 +599,10 @@ func asciiNumberText(rng *rand.Rand) string {
 	return b.String()
 }
 
-// The forms anyFormOf writes for each ASCII character of a number.
+// The forms anyFormOf writes for each ASCII character of a number, and the
+// invisible characters it puts inside a number.
 var (
+	invisibles = []rune{'\u200b', '\u200c', '\u200d', '\u2060', '\u00ad', '\ufeff', '\ufe0f', '\u180e', '\u061c'}
 	digitZeros = []rune{'0', '０', '٠', '۰', '०', '০', '𝟎', '𝟘'}
 	otherForms = map[byte][]rune{
 		' ': {' ', '\u3000', '\u00a0', '\u202f', '\u2009', '\u2002', '\u205f'},
@@ -575,7 +610,7 @@ var (
 		'.': {'.', '．'},
 		'(': {'(', '（'},
 		')': {')', '）'},
-		'+': {'+', '＋'},
+		'+': {'+', '＋', '﹢'},
 	}
 )
 
@@ -598,6 +633,13 @@ func anyFormOf(rng *rand.Rand, s string) string {
 		switch {
 		case isDigit(c):
 			b.WriteRune(digitZeros[rng.IntN(len(digitZeros))] + rune(c-'0'))
+			// Invisible format characters a log viewer hides, between this
+			// digit and a number character after it (#154).
+			if i+1 < len(s) && (isDigit(s[i+1]) || otherForms[s[i+1]] != nil) && rng.IntN(4) == 0 {
+				for range 1 + rng.IntN(2) {
+					b.WriteRune(invisibles[rng.IntN(len(invisibles))])
+				}
+			}
 		case otherForms[c] != nil:
 			forms := otherForms[c]
 			b.WriteRune(forms[rng.IntN(len(forms))])

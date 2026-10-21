@@ -59,6 +59,7 @@ func FuzzRedact(f *testing.F) {
 		"SIPS:" + testMSISDN + ":pw@host",
 		"urn:gsma:imei:00101000-000003-1;svn=42",
 		"1234567.1234567",
+		"1234\u200b5678 +\u2060155501\u00ad00001 sip:a\u00a01@x",
 		"tel:12345678tel:12345678",
 		"+15550100sip:@1234567890",
 		"メッセージ 15550100002",
@@ -165,14 +166,18 @@ func FuzzRedactAnyForm(f *testing.F) {
 }
 
 // longestDigitRun counts decimal digits of every script, as Redact promises
-// to mask runs of any of them.
+// to mask runs of any of them, and reads past the invisible characters a log
+// viewer hides between them (#154). It names those characters itself, not
+// with the code under test.
 func longestDigitRun(s string) int {
 	longest, run := 0, 0
 	for _, r := range s {
-		if unicode.IsDigit(r) {
+		switch {
+		case unicode.IsDigit(r):
 			run++
 			longest = max(longest, run)
-		} else {
+		case unicode.In(r, unicode.Cf, unicode.Variation_Selector, unicode.Other_Default_Ignorable_Code_Point):
+		default:
 			run = 0
 		}
 	}
