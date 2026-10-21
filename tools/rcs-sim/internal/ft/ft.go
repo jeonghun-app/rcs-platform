@@ -472,14 +472,15 @@ type Settled struct {
 // stored what it keeps and released the upload. So this asks every poll
 // until the same bytes held have been reported for at least quiet: two
 // answers in a row can agree while the server still holds the upload, and
-// a resume then gets 503. The quiet time runs from the request that first
-// got the value to the request that gets it again, so it is time the server
-// held the value, however slowly the answers came. within bounds when the
-// requests are sent, likewise: a 404 is asked again until a request sent
-// after within has passed gets one too, and is then returned as
-// ErrNothingHeld. Bytes held that such a request is the first to report
-// are given one more quiet time; bytes held still changing after that are
-// returned with ErrNotSettled.
+// a resume then gets 503. The server reads what it holds somewhere between
+// a request and its answer, so the quiet time runs from the answer that
+// first named the value to a later request that gets it again: time the
+// server is known to have held the value, which a slow answer's wait is not
+// (#377). within bounds when the requests are sent: a 404 is asked again
+// until a request sent after within has passed gets one too, and is then
+// returned as ErrNothingHeld. Bytes held that such a request names are
+// given, once, the rest of their quiet time; bytes held still changing
+// after that are returned with ErrNotSettled.
 //
 // Nothing the server sends says the upload is released: its lease lasts
 // minutes when the process holding it dies, and ft-server's upload-info
@@ -498,6 +499,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 	for {
 		asked := now()
 		info, err := c.UploadInfo(ctx, tid)
+		answered := now()
 		held := int64(-1)
 		switch {
 		case errors.Is(err, ErrNothingHeld):
@@ -511,20 +513,20 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 			}
 		}
 		if held != last {
-			last, since = held, asked
+			last, since = held, answered
 		}
 		// within bounds when a request is sent, not when its answer comes:
 		// one slow answer on a loaded host says nothing about the server
 		// still storing, and the next request may confirm what it holds
 		// (#344). A request sent past the deadline that does not settle
-		// ends the wait, except that bytes held first seen by such a
-		// request get one quiet time more. The slow answer is most often
-		// the 404 to a request sent before the server noticed the break,
-		// and the server may well be done storing by now; ending here
-		// would fail the step on one slow answer after all.
+		// ends the wait, except that the bytes held it names get, once, the
+		// rest of their quiet time. The slow answer is most often the 404
+		// to a request sent before the server noticed the break, and the
+		// server may well be done storing by now; ending here would fail
+		// the step on one slow answer after all.
 		if asked.After(deadline) {
-			if err == nil && since.Equal(asked) && !extended {
-				deadline, extended = asked.Add(quiet), true
+			if err == nil && !extended {
+				deadline, extended = since.Add(quiet), true
 			} else {
 				if err == nil {
 					err = ErrNotSettled

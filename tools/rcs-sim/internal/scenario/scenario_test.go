@@ -331,17 +331,19 @@ func TestTheResumeWaitsOutTheQuietTime(t *testing.T) {
 
 func TestTheResumeQuietTimeIsCountedOnTheClock(t *testing.T) {
 	// The same 300 ms as above, without depending on how fast a loaded host
-	// asks (#197). The clock moves only when the stand-in answers a signed
+	// asks (#197). The clock moves only when the stand-in takes a signed
 	// get_upload_info, so the count does not depend on how often the code
-	// reads it: the requests are asked at 0, 299 ms and 300 ms, and a
-	// quiet time of exactly 300 ms, counted from a request, resumes at the
-	// third. 0, 250 or 299 ms would stop at the second, 301 ms or a quiet
-	// time counted from an answer would need a fourth (QA on #203).
+	// reads it: it reads 100 ms, 399 ms and 400 ms there, so the first
+	// answer comes at 100 ms and the requests are asked at 0, 100, 399 and
+	// 400 ms. A quiet time of exactly 300 ms, counted from the answer that
+	// first named the bytes held (#377), resumes at the fourth; one counted
+	// from a request would stop at the third, and 301 ms would need a
+	// fifth (QA on #203).
 	cfg := stack(t)
 	var mu sync.Mutex
 	clock := time.Unix(0, 0)
 	k := 0
-	at := []time.Duration{299 * time.Millisecond, 300 * time.Millisecond}
+	at := []time.Duration{100 * time.Millisecond, 399 * time.Millisecond, 400 * time.Millisecond}
 	cfg.FT.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
 	a := &answering{match: func(r *http.Request) bool {
 		if !strings.Contains(r.URL.RawQuery, "get_upload_info") || r.Header.Get("Authorization") == "" {
@@ -365,8 +367,8 @@ func TestTheResumeQuietTimeIsCountedOnTheClock(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if k != 3 {
-		t.Fatalf("%d signed get_upload_info, want 3 for a quiet time of exactly 300 ms", k)
+	if k != 4 {
+		t.Fatalf("%d signed get_upload_info, want 4 for a quiet time of exactly 300 ms", k)
 	}
 }
 
