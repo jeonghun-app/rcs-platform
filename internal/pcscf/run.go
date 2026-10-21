@@ -75,6 +75,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 
 	fl := newFlows(cfg.MaxClientFlows, cfg.MaxFlowsPerIP)
+	if rt.Metrics != nil {
+		fl.refused = func(metric string) { rt.Metrics.Count(metric, 1) }
+	}
 	// The proxy is made once the core listener's port is known, which its
 	// Self needs. Only the core listener is open before it, scscf has no
 	// reason to reach a pcscf that is not ready, and a request that does
@@ -193,11 +196,18 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		d.sweep = sweepInterval
 	}
 	var tm transportMetrics
+	var lm layerMetrics
 	stopSweep := every(d.sweep, func() {
 		pc.registry.sweep()
 		pc.reconcileSubscriptions()
 		pc.sweepMSRP()
-		tm.record(rt.Metrics, tr.Stats())
+		ts := tr.Stats()
+		tm.record(rt.Metrics, ts)
+		lm.record(rt.Metrics, ts, px.Layer().Stats())
+		if rt.Metrics != nil {
+			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
+			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
+		}
 	})
 	defer stopSweep()
 

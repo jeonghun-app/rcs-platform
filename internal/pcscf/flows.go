@@ -13,8 +13,10 @@ import (
 // transport's Admit and OnFlowClosed.
 type flows struct {
 	max, maxPerIP int
-	// onClosed, if set, hears about every client flow that closed.
+	// onClosed, if set, hears about every client flow that closed, and
+	// refused, if set, every flow refused, by its metric.
 	onClosed func(transport.FlowID)
+	refused  func(metric string)
 
 	mu    sync.Mutex
 	perIP map[netip.Addr]int
@@ -48,12 +50,30 @@ func (f *flows) admit(id transport.FlowID, info transport.FlowInfo) bool {
 	key := clientKey(info.Addr)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.all) >= f.max || f.perIP[key] >= f.maxPerIP {
+	switch {
+	case len(f.all) >= f.max:
+		f.refuse(metricFlowsRefusedTotal)
+		return false
+	case f.perIP[key] >= f.maxPerIP:
+		f.refuse(metricFlowsRefusedPerAddr)
 		return false
 	}
 	f.perIP[key]++
 	f.all[id] = key
 	return true
+}
+
+func (f *flows) refuse(metric string) {
+	if f.refused != nil {
+		f.refused(metric)
+	}
+}
+
+// size is the number of client flows.
+func (f *flows) size() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.all)
 }
 
 // closed forgets a flow that ended.

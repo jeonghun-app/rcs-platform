@@ -540,6 +540,50 @@ with the bearer token `PCSCF_RELAY_TOKEN`, which in AWS comes from Secrets
 Manager. The token and `client_path`, the client's way into the session,
 never reach a log; errors name the operation and status alone.
 
+## Metrics
+
+`pcscf` writes its metrics as CloudWatch EMF (docs/architecture.md §8).
+`Service=pcscf` is the only dimension: a reason is part of a metric's
+name, from the fixed set below, never an identity, an address or a flow
+(#16 AC 6). Counts are what happened since the last flush. Gauges and the
+counts taken from the transport and the transaction layer are written by
+the sweep, every 30 s.
+
+| Metric | Kind | What it counts |
+|---|---|---|
+| `flows.client` | gauge | client flows open |
+| `registrations` | gauge | registrations held, with the reservations of REGISTERs under way |
+| `flows.refused.total`, `flows.refused.per_client` | count | client flows refused at `PCSCF_MAX_CLIENT_FLOWS`, and at `PCSCF_MAX_FLOWS_PER_IP` for one client |
+| `register.refused.rate` | count | REGISTERs refused past one client's rate (503) |
+| `register.refused_task_rate` | count | REGISTERs refused past the task's rate (503) |
+| `register.refused.pending` | count | REGISTERs refused with too many of a flow's or a client's under way (503) |
+| `register.refused.registry_full` | count | REGISTERs refused at `PCSCF_MAX_REGISTRATIONS` (503) |
+| `register.refused.malformed` | count | REGISTERs whose To, Contact or Authorization does not parse (400) |
+| `register.refused.no_icscf` | count | REGISTERs with no I-CSCF address to go to (504) |
+| `requests.refused.rate` | count | a client's requests outside a dialog refused past its rate (503) |
+| `requests.refused.no_service_route` | count | requests of a registration without a Service-Route (500) |
+| `requests.unregistered_discarded` | count | requests over a flow with no registration, dropped |
+| `requests.ack_rate_discarded` | count | ACKs past a client's rate, dropped |
+| `indialog.refused.rate` | count | a client's requests inside a dialog refused past its rate (503) |
+| `indialog.refused.route` | count | requests inside a dialog on a route this `pcscf` did not record for the flow, or not to `scscf` (403) |
+| `indialog.refused.unresolved` | count | requests inside a dialog whose `scscf` did not resolve (503) |
+| `terminating.flow_failed` | count | requests from the core answered 430 Flow Failed, by `pcscf` or by the proxy when the flow failed as they went |
+| `terminating.refused.route` | count | requests from the core inside a dialog on another dialog's route (403) |
+| `terminating.pai_omitted`, `terminating.record_route_malformed` | count | as in [Requests from the core](#requests-from-the-core) |
+| `regevent.deregistered`, `regevent.subscribe_failed` | count | as in [Reg event](#reg-event) |
+| `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
+| `transport.listener_connections.*`, `transport.*` | gauge, count | as in [Edge rules](#edge-rules) |
+| `QueuedBytes` | gauge | bytes waiting in every send queue, against the transport's budget |
+| `BudgetSheds` | count | stalled connections closed to keep the queues in their budget |
+| `BudgetRefusals` | count | sends refused, the connection kept, with the budget full |
+| `ResponseFlowCloses` | count | client flows closed because a response could not be queued |
+| `ServerTransactionBytes` | gauge | bytes the server transactions hold, against their cap |
+| `ServerTransactionsRejected` | count | requests refused at the server transaction caps (503) |
+
+The last six keep the names of the transport's and the transaction
+layer's `Stats` fields, which the alarms of `infra/platform.yaml` read
+(#56, #170).
+
 ## Settings
 
 Environment variables with the `PCSCF_` prefix, plus the shared ones of
