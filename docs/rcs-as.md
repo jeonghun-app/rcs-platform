@@ -715,12 +715,12 @@ request (`invalid`); a bad invitee or name never does:
   in 1-to-1 chat. A group created without one gets one in the UUID form OMA
   CPM asks of a Conversation-ID (Conversation Functions, Appendix C.1.1):
   - with a `Contribution-ID`, as rcsjta sends, a name-based UUID (version 5,
-    in a namespace of rcs-as's groups, not the pairs') of the creator's
-    identity and the `Contribution-ID`. A group that ended and that rcsjta
-    starts again under its `Contribution-ID` gets the same conference URI and
-    the same Conversation-ID, so that it stays one thread; another creator
-    under the same `Contribution-ID` gets another. As the pair's ID, it is an
-    unsalted hash of an identity, and personal data wherever it is logged;
+    in a namespace of rcs-as's groups, not the pairs') of the
+    `Contribution-ID` alone, as the conference URI is made from it. rcsjta
+    starts a group that ended again under its `Contribution-ID`, from
+    whichever participant writes next; the new group gets the same
+    conference URI and the same Conversation-ID, so that it stays one
+    thread;
   - without one, a random UUID (version 4), which never equals a version 5
     one.
 

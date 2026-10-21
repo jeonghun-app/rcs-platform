@@ -342,7 +342,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	}
 	conv := r.Conversation
 	if conv == "" && r.Contribution != "" {
-		conv = groupConversationID(creator, r.Contribution)
+		conv = groupConversationID(r.Contribution)
 	} else if conv == "" {
 		if conv, err = s.randomUUID(); err != nil {
 			return groupstore.Group{}, err
@@ -956,22 +956,20 @@ func (s *Service) randomUUID() (string, error) {
 // messaging.PairConversationID's.
 var groupNamespace = [16]byte{0xe5, 0x1a, 0xd9, 0x37, 0x23, 0x61, 0x43, 0x3b, 0xa3, 0xe7, 0x28, 0x3a, 0x7e, 0xf6, 0x41, 0xae}
 
-// groupConversationID is the Conversation-ID of a group its creator made
-// with a Contribution-ID and no Conversation-ID: a name-based UUID (RFC
-// 9562 §5.5, version 5) of the creator's canonical identity and the
-// Contribution-ID. rcsjta restarts a group that ended (RestartGroupChat
-// Session) at the factory under the same Contribution-ID, which gives the
-// same conference URI (conferenceID); this keeps its Conversation-ID too,
-// so that a client that threads by it keeps one thread. Another creator
-// under the same Contribution-ID gets another ID. A version 5 UUID never
-// equals a version 4 one, the version digit differing.
-//
-// The ID is an unsalted hash of the creator's identity: it is personal
-// data wherever it is logged (internal/pii).
-func groupConversationID(creator, contribution string) string {
+// groupConversationID is the Conversation-ID of a group made with a
+// Contribution-ID and no Conversation-ID: a name-based UUID (RFC 9562
+// §5.5, version 5) of the Contribution-ID alone, as the conference URI is
+// (conferenceID). rcsjta restarts a group that ended
+// (RestartGroupChatSession) at the factory under the same Contribution-ID,
+// from whichever participant writes next, not only its creator; the
+// restarted group so gets the same conference URI and Conversation-ID, and
+// a client that threads by it keeps one thread (lead's decision on #381).
+// A version 5 UUID never equals a version 4 one, the version digit
+// differing.
+func groupConversationID(contribution string) string {
 	h := sha1.New()
 	h.Write(groupNamespace[:])
-	h.Write([]byte(creator + "\x00" + contribution))
+	h.Write([]byte(contribution))
 	return uuidString(h.Sum(nil)[:16], 5)
 }
 
