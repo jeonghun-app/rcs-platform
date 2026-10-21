@@ -2,11 +2,13 @@ package simtest
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStandInPortsLieOutsideTheEphemeralRange(t *testing.T) {
@@ -112,10 +114,34 @@ func atoi(t *testing.T, s string) int {
 	return n
 }
 
+// accept is ln.Accept with a bound, so that a stand-in listener that loses
+// or withholds a connection fails the test at once, with what was waited
+// for, instead of hanging it (code review on #358).
+func accept(t *testing.T, ln net.Listener, what string) (net.Conn, error) {
+	t.Helper()
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		c, err := ln.Accept()
+		got <- result{c, err}
+	}()
+	select {
+	case r := <-got:
+		return r.c, r.err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: Accept did not return", what)
+		return nil, nil
+	}
+}
+
 func TestTheStandInListenerHoldsItsPortBetweenScenarios(t *testing.T) {
 	// #186: the port the relay is told about stays taken by the test from
 	// the first scenario to the last, and each scenario's stand-in gets the
-	// connections made while it listens.
+	// connections made while it listens, including one made before its
+	// Accept is called.
 	s := ListenStandIn(t)
 	addr := "127.0.0.1:" + strconv.Itoa(s.Port())
 	for round := range 2 {
@@ -127,7 +153,7 @@ func TestTheStandInListenerHoldsItsPortBetweenScenarios(t *testing.T) {
 		if err != nil {
 			t.Fatalf("round %d: dial %v", round, err)
 		}
-		got, err := ln.Accept()
+		got, err := accept(t, ln, fmt.Sprintf("round %d: a connection made before Accept", round))
 		if err != nil {
 			t.Fatalf("round %d: accept %v", round, err)
 		}
@@ -136,7 +162,7 @@ func TestTheStandInListenerHoldsItsPortBetweenScenarios(t *testing.T) {
 		if err := ln.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ln.Accept(); !errors.Is(err, net.ErrClosed) {
+		if _, err := accept(t, ln, fmt.Sprintf("round %d: Accept after Close", round)); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("round %d: Accept after Close = %v", round, err)
 		}
 		// Between two scenarios nobody else can listen on it.
@@ -145,4 +171,46 @@ func TestTheStandInListenerHoldsItsPortBetweenScenarios(t *testing.T) {
 			t.Fatalf("round %d: the port was free between scenarios", round)
 		}
 	}
+}
+
+func TestClosingALentStandInListenerWakesItsAccept(t *testing.T) {
+	// chat.Core.Close closes its listener to end the Accept its goroutine
+	// is waiting in; a lent listener must end it too.
+	s := ListenStandIn(t)
+	ln, err := s.Lend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := ln.Accept()
+		done <- err
+	}()
+	time.Sleep(10 * time.Millisecond) // most likely waiting by now; if not, it finds the listener closed
+	_ = ln.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("the waiting Accept returned %v, want net.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not wake the waiting Accept")
+	}
+}
+
+func TestTheStandInListenerIsLentToOneStandInAtATime(t *testing.T) {
+	s := ListenStandIn(t)
+	ln, err := s.Lend()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Lend(); err == nil {
+		t.Fatal("lent twice at once")
+	}
+	_ = ln.Close()
+	again, err := s.Lend()
+	if err != nil {
+		t.Fatalf("Lend after Close = %v", err)
+	}
+	_ = again.Close()
 }

@@ -1,6 +1,7 @@
 package simtest
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -106,6 +107,8 @@ type StandInListener struct {
 	ln    net.Listener
 	conns chan net.Conn
 	done  chan struct{}
+	mu    sync.Mutex
+	out   bool // a lent listener is open
 }
 
 // ListenStandIn starts a StandInListener; the test's end closes it.
@@ -141,8 +144,15 @@ func ListenStandIn(t testing.TB) *StandInListener {
 func (s *StandInListener) Port() int { return s.ln.Addr().(*net.TCPAddr).Port }
 
 // Lend returns a listener that takes the connections until it is closed,
-// which leaves the port listening for the next.
+// which leaves the port listening for the next. One is lent at a time: two
+// open at once would take each other's connections.
 func (s *StandInListener) Lend() (net.Listener, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.out {
+		return nil, errors.New("simtest: the stand-in's listener is lent already")
+	}
+	s.out = true
 	return &lent{s: s, closed: make(chan struct{})}, nil
 }
 
@@ -164,7 +174,12 @@ func (l *lent) Accept() (net.Conn, error) {
 }
 
 func (l *lent) Close() error {
-	l.once.Do(func() { close(l.closed) })
+	l.once.Do(func() {
+		close(l.closed)
+		l.s.mu.Lock()
+		l.s.out = false
+		l.s.mu.Unlock()
+	})
 	return nil
 }
 
