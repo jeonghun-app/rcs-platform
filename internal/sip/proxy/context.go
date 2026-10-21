@@ -260,14 +260,56 @@ func (c *respContext) answerWith(code int, fields ...[2]string) {
 func (c *respContext) answer(res *sip.Response) {
 	c.mu.Lock()
 	c.routing = false
+	// A request Drain answered while its Router ran keeps that answer.
+	already := c.finalSent
 	c.finalSent = true
 	var acts []func()
-	if res != nil {
+	if res != nil && !already {
 		acts = append(acts, c.forward(res))
 	}
 	acts = append(acts, c.progress()...)
 	c.mu.Unlock()
 	runAll(acts)
+}
+
+// answerForStop answers a request still without a final response 500 with
+// Retry-After, and closes its branches: INVITE branches are cancelled
+// (§16.10 does the same for a CANCEL from upstream), and the others end on
+// their timers or when the proxy closes. A request whose Router is still
+// deciding is answered as well; the Router's decision then starts nothing.
+//
+// It returns a channel closed once the 500 has been handed to the
+// transport, or nil when the request needed no answer.
+func (c *respContext) answerForStop() <-chan struct{} {
+	c.mu.Lock()
+	if c.finalSent || c.done {
+		c.mu.Unlock()
+		return nil
+	}
+	res, err := c.p.response(c.tx.Request(), 500, [2]string{"Retry-After", overloadRetryAfter})
+	if err != nil {
+		c.mu.Unlock()
+		return nil
+	}
+	c.finalSent = true
+	acts := c.closeBranches()
+	sent := make(chan struct{})
+	hook := c.dec.OnResponse
+	acts = append(acts, func() {
+		c.up.do(func() {
+			defer close(sent)
+			if hook != nil {
+				hook(c.ctx, res)
+			}
+			if err := c.tx.Respond(res); err != nil {
+				c.p.stats.upstreamErrors.Add(1)
+			}
+		})
+	})
+	acts = append(acts, c.progress()...)
+	c.mu.Unlock()
+	runAll(acts)
+	return sent
 }
 
 // discard ends the request with a final response the transport never sends

@@ -283,6 +283,78 @@ func (p *Proxy) Receive(in transport.Inbound) { p.layer.Receive(in) }
 // of its own as a UAC.
 func (p *Proxy) Layer() *transaction.Layer { return p.layer }
 
+// Drain lets the requests in progress finish before a stop, as a service
+// does on SIGTERM: it waits until none is left, or until ctx ends, and then
+// answers each one still without a final response 500 with Retry-After,
+// so its sender tries another instance at once instead of waiting 64*T1
+// for its timers (#281). New requests are still served meanwhile: a
+// service's peers keep finding a task until its Cloud Map registration and
+// DNS answers age out, and pcscf still reaches the clients it has not yet
+// closed. It reports how many requests it answered so. Call Close after it.
+//
+// A context lingers 64*T1 after a 2xx to an INVITE to pass retransmissions
+// on, but holds no request then, so Drain does not wait for it.
+func (p *Proxy) Drain(ctx context.Context) int {
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if p.inProgress() == 0 {
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			return p.answerForStop()
+		case <-tick.C:
+		}
+	}
+}
+
+// inProgress is the number of requests whose context is still open.
+func (p *Proxy) inProgress() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.contexts)
+}
+
+// drainSendWait bounds how long Drain waits for its answers to be handed to
+// the transport, which waits at most its WriteTimeout for a slow peer, and
+// then written.
+const drainSendWait = 2 * time.Second
+
+// answerForStop answers every request still without a final response, and
+// waits until the answers have gone out, so that a Close right after does
+// not drop them: handed to the sender, and with a *transport.Transport,
+// whose Close drops what its send queues still hold, written as well.
+func (p *Proxy) answerForStop() int {
+	p.mu.Lock()
+	all := make([]*respContext, 0, len(p.contexts))
+	for _, c := range p.contexts {
+		all = append(all, c)
+	}
+	p.mu.Unlock()
+	var sent []<-chan struct{}
+	for _, c := range all {
+		if ch := c.answerForStop(); ch != nil {
+			sent = append(sent, ch)
+		}
+	}
+	p.stats.drained.Add(uint64(len(sent)))
+	deadline := time.Now().Add(drainSendWait)
+	for _, ch := range sent {
+		select {
+		case <-ch:
+		case <-time.After(time.Until(deadline)):
+			return len(sent)
+		}
+	}
+	if tr, ok := p.sender.(*transport.Transport); ok && len(sent) > 0 {
+		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	return len(sent)
+}
+
 // Close stops the proxy: every transaction ends without a response, pending
 // timers are stopped, and Close returns once the proxy's goroutines have. A
 // Router or hook still running sees its context cancelled, and Close waits for
@@ -519,12 +591,16 @@ type Stats struct {
 	ACKsMissing            uint64 // 2xx a Serve handler sent whose ACK never came
 	ACKsDropped            uint64 // ACKs that could not be forwarded
 	UpstreamErrors         uint64 // responses the upstream transaction could not send, dropped (§16.9)
+
+	// Drained counts requests Drain answered 500 because they had no final
+	// response when the stop's time ran out.
+	Drained uint64
 }
 
 type counters struct {
 	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
-	upstreamErrors atomic.Uint64
+	upstreamErrors, drained atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -552,5 +628,7 @@ func (p *Proxy) Stats() Stats {
 		ACKsMissing:            s.acksMissing.Load(),
 		ACKsDropped:            s.acksDropped.Load(),
 		UpstreamErrors:         s.upstreamErrors.Load(),
+
+		Drained: s.drained.Load(),
 	}
 }
