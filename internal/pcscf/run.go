@@ -169,6 +169,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Resolver:  resolver,
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
+		Metrics:   rt.Metrics,
 	})
 	if err != nil {
 		return err
