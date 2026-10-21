@@ -32,6 +32,7 @@ func privateIdentity(m *sip.Request, impu, realm string) (string, bool) {
 			if !strings.EqualFold(c.Scheme, "Digest") {
 				continue
 			}
+			// An exact match, as RFC 2617 compares realms and scscf does.
 			if v, _ := c.Param("realm"); v != realm {
 				continue
 			}
