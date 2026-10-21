@@ -374,7 +374,9 @@ func (e *Engine) deliverLarge(l *Leg, over func()) {
 // the recipient go with no retry timer; nothing else would read the queue
 // before the recipient's next event. While a pass runs, it reads the
 // queue once more when done; otherwise the retry timer is armed, with its
-// backoff, so a client that never binds is not asked again at once.
+// backoff, so a client that never binds is not asked again at once. The
+// queue waits rather than blocks: the failure says nothing about the
+// recipient's other messages, which still go as they come.
 func (e *Engine) retryReleased(user string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -386,7 +388,9 @@ func (e *Engine) retryReleased(user string) {
 		r.full = true
 		return
 	}
-	r.hold = holdBlocked
+	if r.hold == holdNone {
+		r.hold = holdWaiting
+	}
 	if r.retry == nil {
 		r.wait = min(max(2*r.wait, e.cfg.RetryInterval), e.cfg.MaxRetryInterval)
 		r.retry = e.clock.AfterFunc(r.wait, func() { e.kickRetry(user) })

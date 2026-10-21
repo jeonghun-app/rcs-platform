@@ -536,9 +536,69 @@ func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
 		t.Fatalf("queued = %d, want the released message", n)
 	}
 	waitFor(t, "the retry timer", func() bool { return r.clock.armed(DefaultRetryInterval) })
+	// Code review on #284: with the retry timer's backoff, not at once.
+	select {
+	case got := <-r.d.invites:
+		t.Fatalf("asked again before the retry timer: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
 	r.clock.Advance(DefaultRetryInterval)
 	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
 		t.Fatalf("invitation %+v", got)
+	}
+}
+
+// failLargeAttempt makes one large-mode attempt for bob that fails: the
+// client answers and never binds.
+func failLargeAttempt(t *testing.T, r *rig) {
+	t.Helper()
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	_ = leg.Close()
+	waitDone(t, leg.Finished())
+	waitFor(t, "idle", r.idle)
+}
+
+// Code review on #284: a failed large-mode attempt waits for the retry
+// timer itself, and holds up nothing else for the recipient: a message
+// within the pager limit goes at once (the fake clock stays where it is).
+func TestAPagerMessageGoesAtOnceAfterAFailedLargeModeAttempt(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600})
+	failLargeAttempt(t, r)
+	short := chat(t, "S1", "short", 0)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: short}); err != nil {
+		t.Fatal(err)
+	}
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, short) {
+		t.Fatalf("pager delivery %q", d.CPIM)
+	}
+}
+
+// The same with a chat leg open and bound: alice's chat message goes on it.
+func TestAChatMessageGoesOnItsLegAfterAFailedLargeModeAttempt(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600})
+	l := r.listen(t)
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	failLargeAttempt(t, r)
+	msg := chat(t, "C1", "on the open leg", 0)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: msg}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.next(t); !bytes.Equal(got.Body, msg) {
+		t.Fatalf("bob got %q", got.Body)
 	}
 }
 
