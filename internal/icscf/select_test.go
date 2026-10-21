@@ -1,10 +1,12 @@
 package icscf
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // TS 24.229 §5.3.1.2 step 1: every mandatory capability, then the most
@@ -74,5 +76,29 @@ func TestRepeatedOptionalCapabilitiesCountOnce(t *testing.T) {
 	got := rank(list, &cx.ServerCapabilities{Optional: []uint32{2, 2, 2, 4, 5}})
 	if len(got) != 2 || got[0].Host != "y.rcs.local" {
 		t.Fatalf("rank = %v, want y first", got)
+	}
+}
+
+// QA of #274: ties keep the configuration's order however many S-CSCFs
+// there are; past twelve, an unstable sort would reorder them.
+func TestTiesKeepConfigurationOrderPastTwelveSCSCFs(t *testing.T) {
+	var cfg []SCSCF
+	var first, rest []string
+	for i := range 40 {
+		s := SCSCF{URI: sip.URI{Scheme: "sip", Host: fmt.Sprintf("s%02d.rcs.local", i)}}
+		if i%3 == 0 {
+			s.Optional = []uint32{7}
+			first = append(first, s.URI.Host)
+		} else {
+			rest = append(rest, s.URI.Host)
+		}
+		cfg = append(cfg, s)
+	}
+	var got []string
+	for _, u := range rank(newCandidates(cfg), &cx.ServerCapabilities{Optional: []uint32{7}}) {
+		got = append(got, u.Host)
+	}
+	if want := append(first, rest...); !slices.Equal(got, want) {
+		t.Errorf("rank = %v\nwant   %v", got, want)
 	}
 }
