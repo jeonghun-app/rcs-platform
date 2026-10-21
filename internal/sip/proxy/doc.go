@@ -74,7 +74,13 @@
 // message limits. A context lives until every branch has ended. Timer C ends
 // a silent INVITE branch; one that receives a provisional response at least
 // every TimerC keeps its context, as ringing does, and holds a MaxContexts
-// slot as long.
+// slot as long. A Router, Resolver or hook that stalls is met by the
+// transaction layer's safety net (#156): the layer answers 500 once Timer C or
+// F, the wait for a CANCEL's answer and a margin have passed since the proxy
+// last made progress (a provisional response forwarded, a fork group or a
+// replacement started), and the context then stops: its hooks see their
+// context cancelled, no branch starts, and the INVITE branches still pending
+// are cancelled.
 //
 // A branch the transport cannot send because the next hop's connection has no
 // room, or no connection can be opened (transport.ErrQueueFull,
