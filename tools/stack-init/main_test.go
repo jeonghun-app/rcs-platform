@@ -271,7 +271,7 @@ func TestSeedBringsTheIdentitiesOfASubscriptionThatExistsUpToDate(t *testing.T) 
 		}
 		checkIdentities(t, body, msisdn)
 	}
-	if !strings.Contains(out.String(), "hss: client test subscription exists, brought up to date") {
+	if !strings.Contains(out.String(), "hss: client test subscription exists, put again: identities, default service profile, no charging information") {
 		t.Fatalf("output %q", out.String())
 	}
 	f.putStatus = http.StatusBadRequest
@@ -296,7 +296,7 @@ func TestSeedIsIdempotentAndWaitsForABusyService(t *testing.T) {
 	if err := seed(context.Background(), f.config(t), &out); err != nil {
 		t.Fatal(err)
 	}
-	if f.hssCalls != 4 || !strings.Contains(out.String(), "hss: client test subscription exists, brought up to date") || !strings.Contains(out.String(), "hss: peer test subscription exists, brought up to date") {
+	if f.hssCalls != 4 || !strings.Contains(out.String(), "hss: client test subscription exists, put again: identities, default service profile, no charging information") || !strings.Contains(out.String(), "hss: peer test subscription exists, put again: identities, default service profile, no charging information") {
 		t.Fatalf("%d calls, output %q", f.hssCalls, out.String())
 	}
 }

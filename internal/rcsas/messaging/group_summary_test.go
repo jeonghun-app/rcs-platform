@@ -495,7 +495,15 @@ func readByAllNext(t *testing.T, r *rig, l net.Listener) {
 // report, and a client that takes the bytes and processes none of them
 // leaves the summary queued.
 func TestASummaryStaysUntilTheClientConfirmsIt(t *testing.T) {
-	r, clock := offlineSummary(t, smallQueue, store.NewMemory())
+	// #291: a delivery timeout of its own. msrp's timers of 30 s, the
+	// default (each connection's UnboundTimeout, never stopped, and its
+	// transactions'), are armed before the last send, so armed(30 s) told
+	// nothing about it, and on a loaded host the clock could be advanced
+	// before the last send had set its timer, which then never fired.
+	const deliveryTimeout = 27 * time.Second
+	cfg := smallQueue
+	cfg.DeliveryTimeout = deliveryTimeout
+	r, clock := offlineSummary(t, cfg, store.NewMemory())
 	// The client answers bob's receipt, queued whole, and then hangs.
 	var taken atomic.Int32
 	stuck := make(chan struct{})
@@ -513,8 +521,8 @@ func TestASummaryStaysUntilTheClientConfirmsIt(t *testing.T) {
 		t.Fatalf("reports asked: queued %v/%v, summary's first %v/%v", queued.SuccessReport, queued.FailureReport,
 			first.SuccessReport, first.FailureReport)
 	}
-	waitFor(t, "the summary's last sent", func() bool { return r.m.get("group.summary.sent") == 1 && clock.armed(DefaultDeliveryTimeout) })
-	clock.Advance(DefaultDeliveryTimeout)
+	waitFor(t, "the summary's last sent", func() bool { return r.m.get("group.summary.sent") == 1 && clock.armed(deliveryTimeout) })
+	clock.Advance(deliveryTimeout)
 	waitFor(t, "the attempt given up", func() bool { return r.m.get("delivery.msrp_failed") == 1 && r.idle() })
 	if n := r.store.(*store.Memory).Len(alice); n != 1 || r.m.get("group.summary.expanded") != 0 {
 		t.Fatalf("%d queued, metrics %v", n, r.m)
