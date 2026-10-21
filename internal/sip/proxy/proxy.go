@@ -502,20 +502,37 @@ func (p *Proxy) isClosed() bool {
 
 // spawn runs f on a goroutine of its own, counted for Close.
 func (p *Proxy) spawn(f func()) {
+	p.begin()
+	go func() {
+		defer p.end()
+		f()
+	}()
+}
+
+// counted runs f on the calling goroutine, counted for Close as spawn's
+// goroutines are: for a callback on a goroutine the proxy did not start,
+// such as context.AfterFunc's (#319). It is counted from when it starts, so
+// a wait that returns before then still misses it; what it does checks
+// isClosed first.
+func (p *Proxy) counted(f func()) {
+	p.begin()
+	defer p.end()
+	f()
+}
+
+func (p *Proxy) begin() {
 	p.activeMu.Lock()
 	p.active++
 	p.activeMu.Unlock()
-	go func() {
-		defer func() {
-			p.activeMu.Lock()
-			p.active--
-			if p.active == 0 {
-				p.idle.Broadcast()
-			}
-			p.activeMu.Unlock()
-		}()
-		f()
-	}()
+}
+
+func (p *Proxy) end() {
+	p.activeMu.Lock()
+	p.active--
+	if p.active == 0 {
+		p.idle.Broadcast()
+	}
+	p.activeMu.Unlock()
 }
 
 // wait returns once no goroutine started by spawn is running.
