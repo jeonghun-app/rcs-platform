@@ -35,9 +35,19 @@ func TestPartialRosterUpdatesAddUpToTheFullRoster(t *testing.T) {
 	}
 	updates := r.n.all()
 	var state *conference.Info
+	// Who each change took out of the group, whose subscriptions the SIP
+	// layer ends with it (#340): after the creation and bob's and carol's
+	// joins, the steps.
+	departed := [][]string{nil, nil, nil, nil, nil, {carol}, {alice}, nil}
+	if len(updates) != len(departed) {
+		t.Fatalf("%d updates", len(updates))
+	}
 	for i, u := range updates {
 		if u.Version != uint32(i+1) || u.Full != (i == 0) {
 			t.Fatalf("update %d: version %d, full %v", i, u.Version, u.Full)
+		}
+		if !slices.Equal(u.Departed, departed[i]) {
+			t.Fatalf("update %d: departed %q, want %q", i, u.Departed, departed[i])
 		}
 		doc := roster(t, u.Document)
 		if doc.Version != u.Version || doc.Entity != g.URI {
@@ -58,6 +68,10 @@ func TestPartialRosterUpdatesAddUpToTheFullRoster(t *testing.T) {
 	}
 	if version != updates[len(updates)-1].Version || !bytes.Equal(merged, full) {
 		t.Fatalf("merged roster\n%s\nfull roster v%d\n%s", merged, version, full)
+	}
+	// FullRoster, for whoever checks who may read it, is the same roster.
+	if fg, doc, err := r.s.FullRoster(ctx, g.URI); err != nil || fg.Version != version || !bytes.Equal(doc, full) {
+		t.Fatalf("FullRoster v%d, %v\n%s", fg.Version, err, doc)
 	}
 	// What the roster says about each participant.
 	byEntity := map[string]conference.User{}
