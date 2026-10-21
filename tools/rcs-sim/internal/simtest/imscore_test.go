@@ -188,27 +188,84 @@ func TestACancelledInviteWhoseCalledPartysFlowGoesIsAnswered487(t *testing.T) {
 	// QA of #425: an INVITE the originator cancelled, whose callee's flow
 	// closes before the callee has answered it, gets the 487 its CANCEL
 	// asked for, as on the platform, not the 480 of a flow that went. The
-	// core answers the CANCEL and passes it on (RFC 3261 §16.10); B closes
-	// its connection when the CANCEL reaches it.
+	// core answers the CANCEL and passes it on (RFC 3261 §16.10), only
+	// after the INVITE, with the INVITE's top Via alone (§9.1): the core
+	// holds the INVITE's forward until it has taken the CANCEL (review of
+	// #425), so a CANCEL sent at once would reach B first. B closes its
+	// connection when the CANCEL reaches it.
 	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
+	hold, taken := make(chan struct{}), make(chan struct{})
+	release, took := sync.OnceFunc(func() { close(hold) }), sync.OnceFunc(func() { close(taken) })
+	t.Cleanup(release)
+	core.Forwarding = func(req *sip.Request) {
+		if req.Method == "INVITE" {
+			<-hold
+		}
+	}
+	core.CancelTaken = took
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
-	closingCallee(t, ctx, core, "CANCEL")
-	b, _ := sip.ParseURI(impuB)
-	req, err := a.NewInvite(b, []byte("v=0\r\n"))
+	var mu sync.Mutex
+	var got []string
+	vias := -1
+	var b *sipua.UA
+	var once sync.Once
+	b = registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(tx *transaction.ServerTransaction) {
+			req := tx.Request()
+			mu.Lock()
+			got = append(got, req.Method)
+			if req.Method == "CANCEL" {
+				if v, err := req.Header.Elements("Via"); err == nil {
+					vias = len(v)
+				}
+			}
+			mu.Unlock()
+			if req.Method == "CANCEL" {
+				once.Do(func() { go func() { _ = b.Close() }() })
+			}
+		})
+	bURI, _ := sip.ParseURI(impuB)
+	req, err := a.NewInvite(bURI, []byte("v=0\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ictx, stop := context.WithCancel(ctx)
 	defer stop()
-	var once sync.Once
-	d, res, err := a.Invite(ictx, req, func(*sip.Response) { once.Do(stop) })
-	if d != nil || res == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled INVITE = dialog %v, %v, %v; want the core's 487", d, res, err)
+	var progress sync.Once
+	type result struct {
+		res *sip.Response
+		err error
 	}
-	if res.StatusCode != 487 {
-		t.Fatalf("cancelled INVITE whose callee's flow closed = %d %s, want 487", res.StatusCode, res.Reason)
+	done := make(chan result, 1)
+	go func() {
+		d, res, err := a.Invite(ictx, req, func(*sip.Response) { progress.Do(stop) })
+		if d != nil {
+			err = errors.New("a dialog")
+		}
+		done <- result{res, err}
+	}()
+	select {
+	case <-taken:
+	case <-ctx.Done():
+		t.Fatal("the core never took the CANCEL")
+	}
+	release()
+	r := <-done
+	if r.res == nil || !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("cancelled INVITE = %v, %v; want the core's 487", r.res, r.err)
+	}
+	if r.res.StatusCode != 487 {
+		t.Fatalf("cancelled INVITE whose callee's flow closed = %d %s, want 487", r.res.StatusCode, r.res.Reason)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) < 2 || got[0] != "INVITE" || got[1] != "CANCEL" {
+		t.Fatalf("B got %v, want the INVITE and then its CANCEL", got)
+	}
+	if vias != 1 {
+		t.Fatalf("the CANCEL B got has %d Vias, want the INVITE's top one only", vias)
 	}
 }
 

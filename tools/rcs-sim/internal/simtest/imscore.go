@@ -43,6 +43,14 @@ type IMSCore struct {
 	// and must not block. A test waits on it for a subscriber that must
 	// drop a NOTIFY to have done so (#396).
 	NotifyAnswered func(req *sip.Request, res *sip.Response, err error)
+	// Forwarding, when set before any request, runs on the forwarding
+	// goroutine just before the core passes a request on, and may hold
+	// it there; CancelTaken runs once the core has answered a CANCEL and
+	// either passed it on, once it has gone, or kept it for its INVITE. A
+	// test pins with them that a CANCEL goes only after its INVITE (RFC
+	// 3261 §9.1).
+	Forwarding  func(*sip.Request)
+	CancelTaken func()
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
@@ -344,9 +352,14 @@ func (f *forwardedInvite) cancelNow() bool {
 	return false
 }
 
-func (c *IMSCore) sendCancel(f *forwardedInvite) {
+// sendCancel passes f's CANCEL on, off the calling goroutine, then calls
+// then if it is not nil.
+func (c *IMSCore) sendCancel(f *forwardedInvite, then func()) {
 	go func() {
 		_, _ = c.layer.Request(f.cancel, transport.Destination{Flow: f.flow}, func(*sip.Response, error) {})
+		if then != nil {
+			then()
+		}
 	}()
 }
 
@@ -373,20 +386,30 @@ func (c *IMSCore) cancel(tx *transaction.ServerTransaction) {
 	if res, err := sip.NewResponse(req, code, "", tag); err == nil {
 		c.respond(tx, res)
 	}
-	if send != nil {
-		c.sendCancel(send)
+	switch {
+	case send != nil:
+		c.sendCancel(send, c.CancelTaken)
+	case c.CancelTaken != nil:
+		c.CancelTaken()
 	}
 }
 
 // cancelOf is the CANCEL of a forwarded INVITE (RFC 3261 §9.1): its
-// Request-URI, Via, Route, From, To, Call-ID and CSeq number.
+// Request-URI, top Via only, Route, From, To, Call-ID and CSeq number.
 func cancelOf(invite *sip.Request) (*sip.Request, error) {
 	cseq, err := invite.Header.CSeq()
 	if err != nil {
 		return nil, err
 	}
+	vias, err := invite.Header.Elements("Via")
+	if err != nil || len(vias) == 0 {
+		return nil, errors.New("simtest: an INVITE without a Via")
+	}
 	c := &sip.Request{Method: "CANCEL", URI: invite.URI}
-	for _, name := range []string{"Via", "Route", "From", "To", "Call-ID"} {
+	if err := c.Header.Add("Via", vias[0]); err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"Route", "From", "To", "Call-ID"} {
 		for _, v := range invite.Header.Values(name) {
 			if err := c.Header.Add(name, v); err != nil {
 				return nil, err
@@ -791,6 +814,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	}
 	// Off the reading goroutine: Request waits for room on the other flow.
 	go func() {
+		if c.Forwarding != nil {
+			c.Forwarding(fwd)
+		}
 		_, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
 			if err != nil {
 				cancelled := ended()
@@ -846,7 +872,7 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			send := invite.cancelNow()
 			c.mu.Unlock()
 			if send {
-				c.sendCancel(invite)
+				c.sendCancel(invite, nil)
 			}
 		}
 	}()
