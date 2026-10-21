@@ -1079,9 +1079,12 @@ Signals to alarm on (Phase 7):
   so each must be one RFC 3261 token of at most 256 characters. Clients
   generate UUIDs or hex strings. A request with a `Contribution-ID` and no
   `Conversation-ID`, as rcsjta sends, is taken although OMA CPM Appendix
-  C.1.1 requires the latter, and gets the pair's (above). A group's
-  Conversation-ID, made when none is given, is 32 hex digits rather than
-  the UUID form C.1.1 asks for (#305).
+  C.1.1 requires the latter, and gets the pair's (above). Residual: a CPM
+  client that names its own Conversation-ID and an rcsjta client that
+  answers it without one see two threads, the CPM client's and the pair's;
+  joining them would need rcs-as to remember the ID a pair last used. A
+  group's Conversation-ID, made when none is given, is 32 hex digits rather
+  than the UUID form C.1.1 asks for (#305).
 - **Legs are per task.** A message is delivered on a leg of the task that
   works on its queue. That holds for the B2BUA model, where both legs of a
   chat live on the task whose instance address the SIP dialog names (ADR

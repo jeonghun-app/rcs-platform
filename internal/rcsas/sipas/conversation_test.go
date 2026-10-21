@@ -204,3 +204,85 @@ func TestChatInviteConversationShapes(t *testing.T) {
 		})
 	}
 }
+
+// pairSend sends a Contribution-only (or given) pager MESSAGE and returns the
+// Conversation-ID of what rcs-as delivered.
+func pairSend(t *testing.T, p *peer, core *fakeCore, uri string, pai []string, fields ...string) string {
+	t.Helper()
+	m := pagerAs(uri, cpimFrom("<"+messaging.AnonymousURI+">", fmt.Sprintf("q%p%d", &fields, len(fields)), 0, "hi"), pai...)
+	m.fields = append(m.fields, fields...)
+	if res := p.send(m); res.StatusCode != 202 {
+		t.Fatalf("%s %v answered %d", uri, pai, res.StatusCode)
+	}
+	return core.nextOf(t, "MESSAGE").Header.Get("Conversation-ID")
+}
+
+// QA on #302: the pair's ID is computed from the users' keys, not the
+// identities as asserted: whichever of a subscriber's number forms the
+// core asserts, in either direction, the ID is one; a client's own ID is
+// kept.
+func TestThePairsIDOverDirectionsAndForms(t *testing.T) {
+	core := newFakeCore(t)
+	a, _ := startEngine(t, core, messaging.Config{})
+	p := a.dial(t)
+	pair := messaging.PairConversationID(alice, bob)
+	upper := "IMS.MNC001.MCC001.3GPPNETWORK.ORG"
+	for i, c := range []struct {
+		name string
+		uri  string
+		pai  []string
+	}{
+		{"a->b tel/tel", bob, []string{"<" + alice + ">"}},
+		{"b->a tel/tel", alice, []string{"<" + bob + ">"}},
+		{"a->b sip user=phone R-URI, two PAI", "sip:+15550100002@" + domain + ";user=phone", []string{"<sip:+15550100001@" + domain + ">", "<" + alice + ">"}},
+		{"b->a visual separators", "tel:+1-555-010-0001", []string{"<tel:+1-555-010-0002>"}},
+		{"b->a SIP no user=phone, upper-case host", "sip:+15550100001@" + upper, []string{"<sip:+15550100002@" + domain + ">"}},
+		{"a->b sip numeric PAI only", "tel:+15550100002", []string{"<sip:+15550100001@" + upper + ";user=phone>"}},
+	} {
+		if got := pairSend(t, p, core, c.uri, c.pai, fmt.Sprintf("Contribution-ID: c-%d", i)); got != pair {
+			t.Errorf("%s: Conversation-ID %q, want the pair's %q", c.name, got, pair)
+		}
+	}
+	// A client-supplied ID wins, and the rcsjta reply then gets the pair's.
+	if got := pairSend(t, p, core, bob, []string{"<" + alice + ">"}, "Conversation-ID: own1", "Contribution-ID: c-own"); got != "own1" {
+		t.Errorf("own ID replaced by %q", got)
+	}
+	if got := pairSend(t, p, core, alice, []string{"<" + bob + ">"}, "Contribution-ID: c-rep", "InReplyTo-Contribution-ID: c-own"); got != pair {
+		t.Errorf("reply got %q", got)
+	}
+	// Non-numeric SIP identity with a tel in its set: alice's key is the tel;
+	// bob replying to her SIP name lands in another conversation.
+	aliceName := "sip:alice@" + domain
+	x := pairSend(t, p, core, bob, []string{"<" + aliceName + ">", "<" + alice + ">"}, "Contribution-ID: c-nm1")
+	y := pairSend(t, p, core, aliceName, []string{"<" + bob + ">"}, "Contribution-ID: c-nm2")
+	z := pairSend(t, p, core, bob, []string{"<" + aliceName + ">"}, "Contribution-ID: c-nm3")
+	// Her SIP name is a key of its own (docs/rcs-as.md, limitations):
+	// asserted with her tel she is the tel, and threads with the pair;
+	// named by it alone she is another key, and another thread.
+	if x != pair || y != z || y == pair {
+		t.Errorf("SIP-name alice: a(pair)->b %q, b->a's SIP name %q, a(SIP only)->b %q, pair %q", x, y, z, pair)
+	}
+}
+
+// QA on #302: a notification that names only its Contribution-ID gets the
+// pair's ID too
+// (the derivation sits before the notification branch in Engine.submit).
+func TestAContributionOnlyNotificationGetsThePairsID(t *testing.T) {
+	core := newFakeCore(t)
+	a, _ := startEngine(t, core, messaging.Config{})
+	p := a.dial(t)
+	m := pagerAs(bob, cpimFrom("<"+messaging.AnonymousURI+">", "n1", imdn.PositiveDelivery, "hi"), "<"+alice+">")
+	if res := p.send(m); res.StatusCode != 202 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	core.nextOf(t, "MESSAGE")
+	n := pagerAs(alice, deliveredBody(t, "n1"), "<"+bob+">")
+	n.fields = append(n.fields, "Contribution-ID: rcpt1")
+	if res := p.send(n); res.StatusCode != 202 {
+		t.Fatalf("receipt answered %d", res.StatusCode)
+	}
+	req := core.nextOf(t, "MESSAGE")
+	if got, want := req.Header.Get("Conversation-ID"), messaging.PairConversationID(alice, bob); got != want {
+		t.Fatalf("notification Conversation-ID %q, want %q", got, want)
+	}
+}
