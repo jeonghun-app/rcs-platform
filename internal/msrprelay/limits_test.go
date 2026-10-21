@@ -496,26 +496,45 @@ func TestPerSourceSlotIsReturnedWhenTheConnectionCloses(t *testing.T) {
 }
 
 func TestStalledProxyHeaderIsClosed(t *testing.T) {
-	r := newRig(t, 1, withProxyProtocol, func(o *relayOptions) { o.ProxyHeaderTimeout = 50 * time.Millisecond })
-	nc, err := net.Dial("tcp", r.addrs[0])
-	if err != nil {
-		t.Fatal(err)
+	const timeout = 50 * time.Millisecond
+	r := newRig(t, 1, withProxyProtocol, func(o *relayOptions) { o.ProxyHeaderTimeout = timeout })
+	// The test is of a connection that sent part of a header and stalled,
+	// so the octets must reach the relay before its wait ends. The wait
+	// starts after the accept, which comes after the dial starts: a write
+	// done within the timeout of the dial's start was in time. On a loaded
+	// host one that was not tests a connection that sent nothing; it is
+	// tried again, a bounded number of times (code review on #300).
+	const attempts = 10
+	for i := 1; ; i++ {
+		start := time.Now()
+		nc, err := net.Dial("tcp", r.addrs[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := nc.Write([]byte("\r\n\r\n\x00")); err != nil {
+			t.Fatal(err)
+		}
+		inTime := time.Since(start) < timeout
+		// The relay closes the connection either way: with a FIN, read
+		// here as EOF, once it has read the five octets; with a RST when
+		// its wait ran out before it read them, as on a loaded host, since
+		// a socket closed with octets it has not read is reset (RFC 1122
+		// §4.2.2.13; #295). A read that times out is the relay not closing.
+		_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err = nc.Read(make([]byte, 1))
+		_ = nc.Close()
+		if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("stalled header: read %v, want the relay to close", err)
+		}
+		// Each attempt is refused, in time or not.
+		eventually(t, "the refusal to be counted", func() bool { return r.metrics.count(mRefusedPrefix+reasonProxyHeader) == int64(i) })
+		if inTime {
+			return
+		}
+		if i == attempts {
+			t.Fatalf("no attempt in %d wrote its octets within %v of the dial", attempts, timeout)
+		}
 	}
-	defer nc.Close()
-	if _, err := nc.Write([]byte("\r\n\r\n\x00")); err != nil {
-		t.Fatal(err)
-	}
-	// The relay closes the connection either way: with a FIN, read here
-	// as EOF, once it has read the five octets; with a RST when its wait
-	// for the header ran out before it read them, as on a loaded host,
-	// since a socket closed with octets it has not read is reset (RFC 1122
-	// §4.2.2.13; #295). A read that times out here is the relay not
-	// closing.
-	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := nc.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("stalled header: read %v, want the relay to close", err)
-	}
-	eventually(t, "the refusal to be counted", func() bool { return r.metrics.count(mRefusedPrefix+reasonProxyHeader) == 1 })
 }
 
 func TestDrainClosesRemainingConnectionsOneByOne(t *testing.T) {
