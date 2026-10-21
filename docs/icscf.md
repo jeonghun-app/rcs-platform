@@ -82,6 +82,8 @@ required.
 | `ICSCF_HSS_HOST_PATTERN` | `hss-*.<namespace>` | the Origin-Host every HSS task must have; a peer that claims another gets no request |
 | `ICSCF_CX_TIMEOUT` | `5s` | one Cx attempt; a failed or busy one is retried once on another HSS task |
 | `ICSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop waits for the requests in progress to get their final responses |
+| `ICSCF_MAX_SERVER_TRANSACTIONS` | `20000` | the requests icscf holds at once, 1 to 1000000; one past it is answered 503 with `Retry-After: 5`, icscf's own overload. The proxy allows as many requests in progress, so this is the bound a burst meets |
+| `ICSCF_MAX_SERVER_TRANSACTION_BYTES` | `268435456` (256 MiB) | the memory those requests and the responses kept for them may hold, in bytes, at least 2 MiB (room for one request at the transport's limits, as either bound counts it); one that would pass it is answered the same. The proxy has its own bound of the same size on what it holds of the requests in progress, which it counts differently (a request's body, two copies of its header and two per branch), so a header-heavy REGISTER may be refused by that bound first. Both refusals are counted (see Metrics) |
 
 ## Metrics
 
@@ -116,6 +118,11 @@ On SIGTERM `icscf` keeps its listener open and waits, for at most
 `ICSCF_DRAIN_TIMEOUT`, until no request is in progress, so a REGISTER at the
 S-CSCF or a ringing INVITE still gets its final response. A call that has
 had its 2xx no longer counts, so a stop right after one returns at once.
+A request still in progress at the end is answered, and its INVITE branches
+are cancelled, so its sender tries another task at once instead of waiting
+for its own timers (`proxy.Drain`, #281): a REGISTER with 503 and
+`Retry-After`, which pcscf retries on another icscf at once, anything else
+with 500 and `Retry-After` (#310).
 
 ## AWS permissions
 
@@ -125,7 +132,9 @@ service as resources: the call names both. Infra adds it on #56.
 
 ## Not in place yet
 
-- The transaction caps of #37 are not configurable here until it lands.
+- A metric for the requests icscf refuses as overloaded. The transaction
+  layer counts its refusals (`transaction.Stats.ServerTransactionsRejected`)
+  and the proxy its own (`proxy.Stats.Overloaded`); the overload metric #56's
+  alarm reads is to count both, once a service exports those statistics.
 - S-CSCF re-selection, and the other parts of TS 24.229 §5.3 listed in the
   package documentation.
-- A drain shared by every proxy service (#281); icscf has its own until then.

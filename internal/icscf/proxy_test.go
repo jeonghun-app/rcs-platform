@@ -3,9 +3,11 @@ package icscf
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -378,6 +380,42 @@ func TestARegisterToTheProductionFormOfANameLeavesOverTCP(t *testing.T) {
 	}
 }
 
+// Code review of #311, scaled down: header-heavy requests, as REGISTERs
+// through pcscf are, cost the proxy more than the layer, so the proxy's own
+// byte bound, 1:1 with the layer's, refuses first. Its refusal is counted
+// (Overloaded), as the layer's would be, which is what the overload metric
+// adds up.
+func TestAHeaderHeavyBurstIsRefusedAtTheProxysBoundAndCounted(t *testing.T) {
+	g := &proxied{rig: newRig(t), clock: &fakeClock{}, net: &fakeNet{}}
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 20000, MaxServerTransactionBytes: 1 << 20})
+	tcfg.Clock = g.clock
+	p, err := proxy.New(g.net, proxy.Config{
+		Self:            []sip.URI{mustURI("sip:icscf.rcs.local;lr")},
+		Router:          g.r,
+		Resolver:        resolver{},
+		Transaction:     tcfg,
+		MaxContexts:     contexts,
+		MaxContextBytes: bytes,
+		Rand:            &lockedReader{r: rand.NewChaCha8([32]byte{1})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.p = p
+	t.Cleanup(p.Close)
+	pad := strings.Repeat("x", 12<<10)
+	for i := range 100 {
+		m := request(t, "MESSAGE", impu1, fmt.Sprintf("Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKhdr%d", i),
+			fmt.Sprintf("Call-ID: hdr-%d@192.0.2.10", i), "X-Pad: "+pad)
+		g.receive(m)
+	}
+	waitFor(t, "a refusal", func() bool { return slices.Contains(g.net.responses(), "503 MESSAGE") })
+	ls, ps := p.Layer().Stats(), p.Stats()
+	if ps.Overloaded == 0 {
+		t.Fatalf("layer %+v, proxy %+v: the proxy's refusal was not counted", ls, ps)
+	}
+}
+
 // QA of #274: a next hop out of room gets the proxy's own overload 503,
 // with its single Retry-After, and is not an unreachable S-CSCF.
 func TestAnOverloadedNextHopReachesTheCallerAs503WithOneRetryAfter(t *testing.T) {
@@ -392,5 +430,35 @@ func TestAnOverloadedNextHopReachesTheCallerAs503WithOneRetryAfter(t *testing.T)
 	}
 	if slices.Contains(g.metrics.names(), "icscf.scscf.unreachable") {
 		t.Error("an overloaded next hop was counted unreachable")
+	}
+}
+
+// Code review of #311: at the byte floor, a request at the transport's
+// limits, about 14 KiB of header and a 1 MiB body, still fits both the
+// layer's bound and the proxy's.
+func TestTheLargestRequestFitsAtTheByteFloor(t *testing.T) {
+	g := &proxied{rig: newRig(t), clock: &fakeClock{}, net: &fakeNet{}}
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 20000, MaxServerTransactionBytes: minServerTransactionBytes})
+	tcfg.Clock = g.clock
+	p, err := proxy.New(g.net, proxy.Config{
+		Self:            []sip.URI{mustURI("sip:icscf.rcs.local;lr")},
+		Router:          g.r,
+		Resolver:        resolver{},
+		Transaction:     tcfg,
+		MaxContexts:     contexts,
+		MaxContextBytes: bytes,
+		Rand:            &lockedReader{r: rand.NewChaCha8([32]byte{1})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.p = p
+	t.Cleanup(p.Close)
+	m := request(t, "MESSAGE", impu1, "X-Pad: "+strings.Repeat("x", 14<<10))
+	m.Body = make([]byte, sip.DefaultMaxBodyBytes)
+	g.receive(m)
+	waitFor(t, "the MESSAGE downstream", func() bool { return len(g.net.sent()) == 1 })
+	if ls, ps := p.Layer().Stats(), p.Stats(); ls.ServerTransactionsRejected != 0 || ps.Overloaded != 0 {
+		t.Fatalf("layer %+v, proxy %+v: refused at the floor", ls, ps)
 	}
 }
