@@ -108,22 +108,60 @@ func TestPingSendsADoubleCRLFAndReportsEachPong(t *testing.T) {
 	}
 }
 
+// Each pong starts the pinging flow's idle period again. The connection
+// records its read deadlines and applies none, so the test reads the idle
+// period from them rather than racing a real idle timeout against a loaded
+// host (#215).
 func TestPongsKeepAPingingFlowFromGoingIdle(t *testing.T) {
-	// Four pongs a second apart outlast an idle timeout of three seconds
-	// only if each one starts it again. The margin is two seconds of round
-	// trip, for a loaded host.
 	const idle = 3 * time.Second
-	r := newPingRig(t, Config{IdleTimeout: idle})
-	start := time.Now()
-	for range 4 {
-		r.pingAndPong(t)
-		time.Sleep(idle / 3)
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	_ = peer.SetDeadline(time.Now().Add(time.Minute))
+	conn := &readDeadlines{Conn: server}
+	pongs := make(chan FlowID, 16)
+	client, rec := newTransport(t, Config{
+		Dialer: pipeDialer{conn}, IdleTimeout: idle,
+		OnPong: func(id FlowID) { pongs <- id },
+	})
+	listen(t, client, ListenerConfig{Network: TCP})
+	if _, err := client.SendRequest(newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKpong"), pipeDst); err != nil {
+		t.Fatal(err)
 	}
-	if time.Since(start) <= idle {
-		t.Fatalf("the pongs took %v, not longer than the idle timeout", time.Since(start))
+	br := bufio.NewReader(peer)
+	req := readMessage(t, br).(*sip.Request)
+	b, err := respond(t, req, 200).Bytes()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := r.client.Flow(r.flow); !ok {
-		t.Fatalf("the flow went idle; stats = %+v", r.client.Stats())
+	if _, err := peer.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	flow := rec.next(t).Source.Flow
+	for round := range 3 {
+		// Past the idle period the last message started.
+		time.Sleep(time.Millisecond)
+		before := time.Now()
+		if err := client.Ping(flow); err != nil {
+			t.Fatalf("Ping: %v", err)
+		}
+		got := make([]byte, 4)
+		if _, err := io.ReadFull(br, got); err != nil || string(got) != "\r\n\r\n" {
+			t.Fatalf("ping = %q, %v", got, err)
+		}
+		if _, err := peer.Write([]byte("\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-pongs:
+		case <-time.After(waitFor):
+			t.Fatal("no pong reported")
+		}
+		eventually(t, "the pong to start the idle period again", func() bool {
+			return !conn.last().Before(before.Add(idle))
+		})
+		if _, ok := client.Flow(flow); !ok {
+			t.Fatalf("round %d: the flow is gone; stats = %+v", round, client.Stats())
+		}
 	}
 }
 
