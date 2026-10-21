@@ -96,6 +96,11 @@ var (
 	// ErrTerminated is passed to a client transaction's handler when the TU
 	// ends the transaction with Terminate.
 	ErrTerminated = errors.New("transaction: terminated by the TU")
+	// ErrFlowClosed is passed to a client transaction's handler when the flow
+	// it was sent over (Destination.Flow) closed before a final response
+	// came. It wraps transport.ErrNoFlow, as a send onto that flow would
+	// have failed, so a proxy answers it 430 (RFC 5626 §5.3).
+	ErrFlowClosed = fmt.Errorf("transaction: the flow closed with the request pending: %w", transport.ErrNoFlow)
 )
 
 // Sender sends messages; *transport.Transport implements it.
@@ -290,7 +295,10 @@ type Layer struct {
 	// serverBytes is what the server transactions hold: their requests and
 	// the responses kept for retransmission.
 	serverBytes int64
-	closed      bool
+	// byFlow holds the client transactions sent over a given flow
+	// (Destination.Flow), which FlowClosed ends.
+	byFlow map[transport.FlowID]map[*ClientTransaction]struct{}
+	closed bool
 }
 
 // New returns a Layer that sends through s and passes requests and failures to tu.
@@ -336,6 +344,7 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 		delayTrying:   cfg.DelayTrying,
 		clients:       make(map[string]*ClientTransaction),
 		servers:       make(map[string]*ServerTransaction),
+		byFlow:        make(map[transport.FlowID]map[*ClientTransaction]struct{}),
 	}
 	if l.clock == nil {
 		l.clock = SystemClock
@@ -657,8 +666,35 @@ func (l *Layer) remove(key string, server bool) {
 			l.serverBytes -= tx.size
 		}
 		delete(l.servers, key)
-	} else {
-		delete(l.clients, key)
+		return
+	}
+	if tx := l.clients[key]; tx != nil && tx.dst.Flow != "" {
+		txs := l.byFlow[tx.dst.Flow]
+		delete(txs, tx)
+		if len(txs) == 0 {
+			delete(l.byFlow, tx.dst.Flow)
+		}
+	}
+	delete(l.clients, key)
+}
+
+// FlowClosed ends at once, with ErrFlowClosed, every client transaction
+// sent over the flow id that has no final response yet. A request written
+// onto a connection that then closes is otherwise only noticed by Timer B or
+// F, 64*T1 later: an INVITE gets a late 408, and a non-INVITE no answer at
+// all (RFC 4320 §4.2), where the sender should get 430 Flow Failed at once
+// and try another flow (RFC 5626 §5.3, TS 24.229 §5.2.6.4). A service calls
+// it from transport.Config.OnFlowClosed; transactions sent to an address
+// rather than a flow are not affected.
+func (l *Layer) FlowClosed(id transport.FlowID) {
+	l.mu.Lock()
+	txs := make([]*ClientTransaction, 0, len(l.byFlow[id]))
+	for tx := range l.byFlow[id] {
+		txs = append(txs, tx)
+	}
+	l.mu.Unlock()
+	for _, tx := range txs {
+		tx.flowClosed()
 	}
 }
 

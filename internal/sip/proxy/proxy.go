@@ -435,6 +435,13 @@ func (p *Proxy) drainResponse(req *sip.Request) (*sip.Response, error) {
 	return p.response(req, code, [2]string{"Retry-After", strconv.FormatInt(int64(retryAfter/time.Second), 10)})
 }
 
+// FlowClosed tells the proxy that a flow has closed, from the transport's
+// OnFlowClosed. A branch sent over it (Target.Destination with Flow) that
+// has no final response ends at once and counts as 430 Flow Failed, as a
+// send onto the closed flow would (RFC 5626 §5.3), instead of waiting 64*T1
+// for Timer B or F.
+func (p *Proxy) FlowClosed(id transport.FlowID) { p.layer.FlowClosed(id) }
+
 // Close stops the proxy: every transaction ends without a response, pending
 // timers are stopped, and Close returns once the proxy's goroutines have. A
 // Router or hook still running sees its context cancelled, and Close waits for
