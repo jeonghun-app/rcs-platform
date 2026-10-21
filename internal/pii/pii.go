@@ -150,17 +150,22 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 // [asciiNumberChars]. Other digit-like characters (superscripts, circled
 // digits) are not digits here. The invisible format characters a log viewer
 // hides (U+200B ZWSP, U+2060 WJ, U+00AD SHY, U+FEFF, variation selectors)
-// inside a number are dropped first, so they split no number, though they
-// still end the word before them; see [dropInvisibles]. A "+" may be followed
-// by a bracketed country code ("+(81)3 1234 5678"); the full-width "＊" and
-// "＃" of a tel number and the small "﹢" read as "*", "#" and "+" (#154).
+// inside a number, and the combining marks drawn over one of its digits (a
+// keycap "1<VS16><U+20E3>"), are dropped first, so they split no number,
+// though they still end the word before them; see [dropInvisibles]. So are
+// invisible characters inside a URI scheme ("si<SHY>p:", [joinSchemes]) and
+// inside a URI user, whose hint is then the plain user's. The line and
+// paragraph separators and the braille blank group a number as spaces do. A
+// "+" may be followed by a bracketed country code ("+(81)3 1234 5678"); the
+// full-width "＊" and "＃" of a tel number and the small "﹢" read as "*", "#"
+// and "+" (#154, #413).
 //
 // Schemes match case-insensitively (RFC 3261 §19.1.4, RFC 3966 §3). The output
 // never contains a run of eight or more decimal digits. Redact runs in time
 // linear in len(s), because it is given attacker-controlled header values.
 func (r *Redactor) Redact(s string) string {
-	s, cutAt := asciiNumberChars(dropInvisibles(s))
-	cuts := cutSet(cutAt, len(s))
+	s, cutAt := asciiNumberChars(dropInvisibles(joinSchemes(s)))
+	cuts := &cutList{at: cutAt}
 	var b strings.Builder
 	b.Grow(len(s))
 	// A sip or sips URI that starts before noUserBefore has no '@' before its end:
@@ -270,7 +275,7 @@ func startsNumber(s string, i int) bool {
 // scanned once. Spaces and dashes outside ASCII reach it as ASCII ones (see
 // [asciiNumberChars]). cuts are where dropInvisibles removed characters, as
 // startsWord reads them.
-func numberAt(s string, i int, cuts []bool) (from, end int) {
+func numberAt(s string, i int, cuts *cutList) (from, end int) {
 	p := i
 	if s[p] == '+' {
 		p++
@@ -281,7 +286,7 @@ func numberAt(s string, i int, cuts []bool) (from, end int) {
 		if isDigit(s[p]) {
 			// A removed run splits a group for this as it did before it
 			// was removed ("30<BOM>010-0000-0001").
-			if (run == 0 || cutBefore(cuts, p)) && national < 0 && s[p] == '0' && startsWord(s, p, cuts) {
+			if (run == 0 || cuts.before(p)) && national < 0 && s[p] == '0' && startsWord(s, p, cuts) {
 				national, digitsBeforeNational = p, digits
 			}
 			digits++
@@ -319,7 +324,7 @@ func numberAt(s string, i int, cuts []bool) (from, end int) {
 // continueWritten extends a number ending at end over further groups joined by
 // one or two separators, so that a mask is never followed by a group whose
 // digits would read as the rest of the number together with the mask's hint.
-func continueWritten(s string, end int, cuts []bool) int {
+func continueWritten(s string, end int, cuts *cutList) int {
 	for end < len(s) {
 		q := end
 		for q < len(s) && q-end < 3 && isNumberSeparator(s[q]) {
@@ -341,22 +346,39 @@ func continueWritten(s string, end int, cuts []bool) int {
 // Where dropInvisibles removed characters (cuts), they still end the word,
 // as they did before they were removed: "1<ZWSP>-010-0000-0001" is masked
 // as it was before #154.
-func startsWord(s string, p int, cuts []bool) bool {
-	if p == 0 || cutBefore(cuts, p) {
+func startsWord(s string, p int, cuts *cutList) bool {
+	if p == 0 || cuts.before(p) {
 		return true
 	}
 	switch c := s[p-1]; {
 	case isAlnum(c):
 		return false
 	case c == '.' || c == '-':
-		return p < 2 || cutBefore(cuts, p-1) || !isDigit(s[p-2])
+		return p < 2 || cuts.before(p-1) || !isDigit(s[p-2])
 	}
 	return true
 }
 
-// cutBefore reports whether dropInvisibles removed characters right before
-// s[p]; cuts is nil when it removed none.
-func cutBefore(cuts []bool, p int) bool { return p < len(cuts) && cuts[p] }
+// cutList holds, in increasing order, the positions before which
+// dropInvisibles removed characters, and reads them with a cursor: numberAt
+// asks about positions mostly in increasing order, and goes back only over
+// what it reads again, so the cursor moves as far as the scans do (#413).
+type cutList struct {
+	at []int
+	k  int // at[:k] are before the position last asked about
+}
+
+// before reports whether dropInvisibles removed characters right before
+// s[p].
+func (c *cutList) before(p int) bool {
+	for c.k > 0 && c.at[c.k-1] >= p {
+		c.k--
+	}
+	for c.k < len(c.at) && c.at[c.k] < p {
+		c.k++
+	}
+	return c.k < len(c.at) && c.at[c.k] == p
+}
 
 func isNumberSeparator(c byte) bool {
 	return c == ' ' || isVisualSeparator(c)
@@ -400,10 +422,10 @@ func letters(sum []byte, n int) string {
 func canonical(v string) string {
 	digits := false
 	for _, r := range v {
-		switch {
+		switch c, _ := asciiNumberChar(r); {
 		case r < utf8.RuneSelf && isDigit(byte(r)):
 			digits = true
-		case r < utf8.RuneSelf && (r == '+' || isNumberSeparator(byte(r))), unicode.Is(unicode.Zs, r):
+		case r < utf8.RuneSelf && (r == '+' || isNumberSeparator(byte(r))), c == ' ':
 		default:
 			return v
 		}
@@ -547,10 +569,7 @@ func asciiNumberChars(s string, cuts []int) (string, []int) {
 			// (continueWritten), and the number may be empty.
 			seps, inURI = 0, true
 			if hasUserinfo(s[i:i+n]) && i+n > userEnd {
-				userEnd = i + n
-				for userEnd < len(s) && s[userEnd] != '@' && (s[userEnd] >= utf8.RuneSelf || !endsURI(s[userEnd])) {
-					userEnd++
-				}
+				userEnd = userScanEnd(s, i+n)
 				// Redact masks a user only up to an "@"; without one, a
 				// Unicode space after the scheme groups a number.
 				if userEnd < len(s) && s[userEnd] == '@' {
@@ -617,19 +636,6 @@ func asciiNumberChars(s string, cuts []int) (string, []int) {
 	return b.String(), cuts
 }
 
-// cutSet returns the positions cuts in a text of length n as a set, or nil
-// when there are none.
-func cutSet(cuts []int, n int) []bool {
-	if len(cuts) == 0 {
-		return nil
-	}
-	set := make([]bool, n)
-	for _, c := range cuts {
-		set[c] = true
-	}
-	return set
-}
-
 // numberCharAt returns the ASCII form of the rune at s[i] if it has one (see
 // asciiNumberChar), or 0, and the rune's size; at the end of s it returns 0,
 // 0.
@@ -690,14 +696,16 @@ func bracketedDigits(s string, i int) (closeAt int, ok bool) {
 
 // asciiNumberChar returns the ASCII character that r stands for in a number,
 // if it stands for one: a decimal digit, a space, a dash, or one of the
-// full-width "＋", "．", "（", "）".
+// full-width "＋", "．", "（", "）", "＊", "＃" and the small "﹢".
 func asciiNumberChar(r rune) (byte, bool) {
 	switch {
 	case r < utf8.RuneSelf:
 		return 0, false
 	case unicode.IsDigit(r):
 		return asciiDigit(r), true
-	case unicode.Is(unicode.Zs, r):
+	case unicode.In(r, unicode.Zs, unicode.Zl, unicode.Zp), r == '\u2800':
+		// Every space, the line and paragraph separators, and the braille
+		// blank, which shows as one (#413).
 		return ' ', true
 	case unicode.Is(unicode.Pd, r), r == '\u2212', r == 'ー', r == 'ｰ':
 		return '-', true
@@ -710,21 +718,108 @@ func asciiNumberChar(r rune) (byte, bool) {
 	return 0, false
 }
 
+// joinSchemes removes the runs of invisible characters inside a URI scheme
+// ("si<SHY>p:", "tel<ZWSP>:"), which a log viewer shows as the scheme, so
+// that Redact finds the scheme as it does without them (#413). A run is
+// removed when the text before it ends with the start of a scheme and the
+// text after it, read past further runs, goes on with the rest. The rest is
+// at most 13 bytes, so this is linear.
+func joinSchemes(s string) string {
+	if isASCII(s) {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !isInvisible(r) {
+			i += size
+			continue
+		}
+		end := i + size
+		for end < len(s) {
+			r2, size2 := utf8.DecodeRuneInString(s[end:])
+			if !isInvisible(r2) {
+				break
+			}
+			end += size2
+		}
+		if splitsScheme(b.String(), s[last:i], s[end:]) {
+			b.WriteString(s[last:i])
+			last = end
+		}
+		i = end
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// splitsScheme reports whether a run of invisible characters, after the text
+// written followed by pending and before rest, is inside a scheme.
+func splitsScheme(written, pending, rest string) bool {
+	for _, sch := range schemes {
+		for k := 1; k < len(sch); k++ {
+			if endsWithFold(written, pending, sch[:k]) && startsWithFoldPast(rest, sch[k:]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// endsWithFold reports whether written followed by pending ends with p,
+// ignoring case.
+func endsWithFold(written, pending, p string) bool {
+	if n := len(pending); n >= len(p) {
+		return strings.EqualFold(pending[n-len(p):], p)
+	}
+	k := len(p) - len(pending)
+	return len(written) >= k && strings.EqualFold(written[len(written)-k:], p[:k]) && strings.EqualFold(pending, p[k:])
+}
+
+// startsWithFoldPast reports whether s starts with p, ignoring case and the
+// invisible characters between p's bytes.
+func startsWithFoldPast(s, p string) bool {
+	j := 0
+	for i := 0; i < len(p); i++ {
+		for j < len(s) {
+			r, size := utf8.DecodeRuneInString(s[j:])
+			if !isInvisible(r) {
+				break
+			}
+			j += size
+		}
+		if j == len(s) || !strings.EqualFold(s[j:j+1], p[i:i+1]) {
+			return false
+		}
+		j++
+	}
+	return true
+}
+
 // dropInvisibles removes the invisible format characters that sit inside a
 // number (#154): a run of characters of category Cf, Default_Ignorable or a
-// variation selector (U+200B ZWSP, U+2060 WJ, U+00AD SHY, U+FEFF) between
+// variation selector (U+200B ZWSP, U+2060 WJ, U+00AD SHY, U+FEFF), and of
+// combining marks (Mn, Me) when it follows a digit (#413), between
 // two number characters, one of them a digit; between two number characters
 // of a tel or urn:gsma:imei URI, which Redact masks all of; or where at most
 // two separators lead to a digit after it, and before it to a digit or the
 // end of a URI's number, as numberAt and continueWritten join groups, or a
 // "+" is just before it ("+1 <ZWSP>(555)", "+<ZWSP>(81)"). A log viewer shows
 // such a number with its digits joined, and so it is masked as if written
-// without them, with the same hint. Elsewhere they are text and are kept.
+// without them, with the same hint. Every such run inside the user of a sip,
+// sips, im or pres URI that reaches its "@" is removed too, so that the
+// user's hint is the plain user's (#413). Elsewhere they are text and are
+// kept.
 //
 // It returns, in increasing order, the positions in its result before which
 // it removed a run: there a removed run still ends a word (startsWord), as it
 // did before #154. The look for a digit after a run crosses at most two
-// separators, and so at most two later runs, so this is linear.
+// separators, and so at most two later runs, and the scans for the "@" of a
+// user do not overlap, so this is linear.
 func dropInvisibles(s string) (string, []int) {
 	if isASCII(s) {
 		return s, nil
@@ -737,6 +832,9 @@ func dropInvisibles(s string) (string, []int) {
 	// seps counts the separators since a digit or the end of a URI's
 	// number, or is -1 if something else came after it.
 	seps := -1
+	// Before s[userAt] is the user of a sip, sips, im or pres URI that
+	// reaches its "@", as asciiNumberChars finds it.
+	userAt, userEnd := -1, -1
 	for i := 0; i < len(s); {
 		if n := schemeLen(s[i:]); n > 0 {
 			// Redact goes on from the end of a tel or urn:gsma:imei URI's
@@ -744,12 +842,19 @@ func dropInvisibles(s string) (string, []int) {
 			inURI, prev, seps = !hasUserinfo(s[i:i+n]), ':', -1
 			if inURI {
 				seps = 0
+			} else if i+n > userEnd {
+				if userEnd = userScanEnd(s, i+n); userEnd < len(s) && s[userEnd] == '@' {
+					userAt = userEnd
+				}
 			}
 			i += n
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if !isInvisible(r) {
+		// A combining mark right after a digit is drawn over it, and so
+		// joins the run (a keycap "1<VS16><U+20E3>", #413).
+		marks := digitRune(prev)
+		if !isInvisible(r) && !(marks && isMark(r)) {
 			inURI = inURI && uriNumberRune(r)
 			switch {
 			case digitRune(r) || inURI:
@@ -766,7 +871,7 @@ func dropInvisibles(s string) (string, []int) {
 		end := i + size
 		for end < len(s) {
 			r2, size2 := utf8.DecodeRuneInString(s[end:])
-			if !isInvisible(r2) {
+			if !isInvisible(r2) && !(marks && isMark(r2)) {
 				break
 			}
 			end += size2
@@ -776,8 +881,16 @@ func dropInvisibles(s string) (string, []int) {
 			next, _ = utf8.DecodeRuneInString(s[end:])
 		}
 		joins := numberSide(prev) && numberSide(next) && (digitRune(prev) || digitRune(next)) ||
-			inURI && uriNumberRune(prev) && uriNumberRune(next)
-		if joins || (plusRune(prev) || 0 <= seps && seps <= 2) && digitAfter(s, end) {
+			// prev is the scheme's ':' only right after it, where the
+			// URI's number starts.
+			inURI && (uriNumberRune(prev) || prev == ':') && uriNumberRune(next)
+		switch {
+		case i < userAt:
+			// Inside a user, which Redact masks whole: dropped, so that
+			// the hint is the plain user's (#413).
+			b.WriteString(s[last:i])
+			last = end
+		case joins || (plusRune(prev) || 0 <= seps && seps <= 2) && digitAfter(s, end):
 			b.WriteString(s[last:i])
 			cuts = append(cuts, b.Len())
 			last = end
@@ -834,6 +947,19 @@ func uriNumberRune(r rune) bool {
 func plusRune(r rune) bool {
 	c, _ := asciiNumberChar(r)
 	return r == '+' || c == '+'
+}
+
+// isMark reports whether r is a combining mark (Mn, Me).
+func isMark(r rune) bool { return unicode.In(r, unicode.Mn, unicode.Me) }
+
+// userScanEnd returns where the user of a sip, sips, im or pres URI that
+// starts at s[i] ends, as Redact reads it: at its "@", or at the first byte
+// that ends a URI (endsURI), or at the end of s.
+func userScanEnd(s string, i int) int {
+	for i < len(s) && s[i] != '@' && (s[i] >= utf8.RuneSelf || !endsURI(s[i])) {
+		i++
+	}
+	return i
 }
 
 // isInvisible reports whether r is a character a log viewer does not show:
