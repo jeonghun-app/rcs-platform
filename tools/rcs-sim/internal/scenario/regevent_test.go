@@ -310,8 +310,10 @@ func TestRegEventChecksQARound2Pins(t *testing.T) {
 			"network-deregister", "the network deregistration could not be asked for"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			// The rig's step timeout: every check here fails its step at
+			// once, and a shorter one only bounded the steps before it,
+			// such as the register a loaded host took 3.6 s for (#387).
 			cfg, core := sipStack(t)
-			cfg.StepTimeout = 3 * time.Second
 			if tc.dereg != nil {
 				cfg.Deregister = tc.dereg
 			}
