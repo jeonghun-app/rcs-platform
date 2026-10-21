@@ -47,6 +47,9 @@ type respContext struct {
 	// transaction, by the proxy or by the layer for it: the request is no
 	// longer in progress for Drain, even while its context lingers.
 	handed atomic.Bool
+	// replacedFinal records that a final response whose hook panicked was
+	// replaced by the proxy's 500 (panicAnswer).
+	replacedFinal atomic.Bool
 	// unwatch stops watching the server transaction for the layer's own 500
 	// (layerAnswered).
 	unwatch func() bool
@@ -222,7 +225,7 @@ func (c *respContext) run() {
 		c.answerWith(400)
 		return
 	}
-	dec := p.router.Route(c.reqCtx, in)
+	dec := p.route(c.reqCtx, in)
 
 	c.mu.Lock()
 	cancelled := c.cancelled
@@ -342,8 +345,13 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 		return nil
 	}
 	c.mu.Lock()
-	uas, cancelled := c.uas, c.cancelled
+	uas, cancelled, decided := c.uas, c.cancelled, c.finalSent || c.done
 	c.mu.Unlock()
+	if decided {
+		// Drain's second pass, while the first pass's answer is still
+		// queued: DrainAnswer is asked once a request (QA of #436).
+		return nil
+	}
 	if uas != nil {
 		// The service answers for itself. It learns of the stop through its
 		// context, and serve answers for it if it returns without a final
@@ -390,8 +398,14 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	acts = append(acts, func() {
 		c.up.do(func() {
 			defer close(sent)
-			if hook != nil {
-				hook(c.ctx, res)
+			res := res
+			// Drain's Retry-After sends the client to another task, so
+			// the 500 in place of a half-changed answer keeps it.
+			ra := res.Header.Get("Retry-After")
+			if hook != nil && !c.p.hook("OnResponse", func() { hook(c.ctx, res) }) {
+				if res = c.panicAnswer(ra); res == nil {
+					return
+				}
 			}
 			err := c.tx.Respond(res)
 			c.handed.Store(true)
@@ -701,6 +715,24 @@ func (c *respContext) failureResponse(err error) final {
 	return c.made(503)
 }
 
+// panicAnswer is the 500 sent in place of a final response whose hook
+// panicked (Proxy.hook), which may have half changed it, with retryAfter as
+// its Retry-After if not empty; nil if it cannot be built. A 2xx that comes
+// again after it is dropped (forwardAs): the transaction has its final.
+func (c *respContext) panicAnswer(retryAfter string) *sip.Response {
+	c.replacedFinal.Store(true)
+	var fields [][2]string
+	if retryAfter != "" {
+		fields = append(fields, [2]string{"Retry-After", retryAfter})
+	}
+	res, err := c.p.response(c.tx.Request(), 500, fields...)
+	if err != nil {
+		c.p.log.Error("proxy: building a response", slog.Int("status", 500), slog.String("error", err.Error()))
+		return nil
+	}
+	return res
+}
+
 // made builds a response of the proxy's own to the request received. mu must be
 // held.
 func (c *respContext) made(code int, fields ...[2]string) final {
@@ -869,7 +901,9 @@ func (c *respContext) branchEnded(b *branch, f final, err error) []func() {
 	failure := BranchFailure{Target: b.target, Response: f.res.Clone(), Err: err, Provisional: b.provisional, Progress: b.progress}
 	return []func(){func() {
 		c.p.spawn(func() {
-			targets := hook(c.ctx, failure)
+			// A panic leaves the branch failed, with nothing in its place.
+			var targets []Target
+			c.p.hook("OnBranchFailure", func() { targets = hook(c.ctx, failure) })
 			c.mu.Lock()
 			c.pending--
 			var acts []func()
@@ -1089,9 +1123,24 @@ func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 		c.forwarded2xx = true
 	}
 	send := func() {
-		if hook != nil {
-			hook(c.ctx, res)
+		if again && c.replacedFinal.Load() {
+			// The 2xx a 500 replaced, again: the transaction would refuse
+			// it, which is no upstream error.
+			return
 		}
+		res := res
+		if hook != nil && !c.p.hook("OnResponse", func() { hook(c.ctx, res) }) {
+			// The hook may have half changed the response. A provisional
+			// response or a 2xx retransmission is dropped; a final
+			// response becomes a 500.
+			if code < 200 || again {
+				return
+			}
+			if res = c.panicAnswer(""); res == nil {
+				return
+			}
+		}
+
 		// §16.9: a response that cannot be sent is dropped, and the
 		// branches are left alone.
 		if err := c.tx.Respond(res); err != nil {
@@ -1144,16 +1193,23 @@ func (c *respContext) sendBest() []func() {
 	hook := c.dec.OnResponse
 	return []func(){func() {
 		c.up.do(func() {
+			res, ok := res, true
 			if onFinal != nil {
-				onFinal(c.ctx, res)
+				ok = c.p.hook("OnFinal", func() { onFinal(c.ctx, res) })
 			} else if res.StatusCode == 430 {
 				// RFC 5626 §11.5: an endpoint must not see 430, which is
 				// for the authoritative proxy. A service that is the edge
 				// proxy keeps it with OnFinal.
 				res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
 			}
-			if hook != nil {
-				hook(c.ctx, res)
+			if ok && hook != nil {
+				ok = c.p.hook("OnResponse", func() { hook(c.ctx, res) })
+			}
+			if !ok {
+				// A hook may have half changed it.
+				if res = c.panicAnswer(""); res == nil {
+					return
+				}
 			}
 			if err := c.tx.Respond(res); err != nil {
 				c.p.stats.upstreamErrors.Add(1)
