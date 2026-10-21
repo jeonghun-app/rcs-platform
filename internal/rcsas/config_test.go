@@ -132,7 +132,8 @@ func TestProductionRefusesTheMemoryStoreAndALocalEndpoint(t *testing.T) {
 	var out bytes.Buffer
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	env := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCSAS_DYNAMODB_ENDPOINT", "http://ddb:8000")
+	env := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCSAS_DYNAMODB_ENDPOINT", "http://ddb:8000",
+		"RCSAS_GROUP_CHAT_ENABLED", "true", "RCSAS_SIP_HOST", "10.0.0.7")
 	status := runtime.Run(ctx, runtime.Service[Config]{
 		Name: "rcs-as", EnvPrefix: EnvPrefix, Configure: Configure,
 		Run: func(context.Context, *runtime.Runtime, Config) error { return nil },
@@ -140,10 +141,21 @@ func TestProductionRefusesTheMemoryStoreAndALocalEndpoint(t *testing.T) {
 	if status != runtime.ExitFailure {
 		t.Fatalf("status = %d", status)
 	}
-	for _, want := range []string{"RCSAS_STORE=memory", "RCSAS_DYNAMODB_ENDPOINT"} {
+	for _, want := range []string{"RCSAS_STORE=memory", "RCSAS_DYNAMODB_ENDPOINT", "RCSAS_SIP_HOST with RCSAS_GROUP_CHAT_ENABLED"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("refusal does not mention %q:\n%s", want, out.String())
 		}
+	}
+	// An address of its own is fine without group chat (security review on
+	// #431).
+	out.Reset()
+	delete(env, "RCSAS_GROUP_CHAT_ENABLED")
+	runtime.Run(ctx, runtime.Service[Config]{
+		Name: "rcs-as", EnvPrefix: EnvPrefix, Configure: Configure,
+		Run: func(context.Context, *runtime.Runtime, Config) error { return nil },
+	}, runtime.Process{LookupEnv: func(k string) (string, bool) { v, ok := env[k]; return v, ok }, Stdout: &out})
+	if strings.Contains(out.String(), "RCSAS_SIP_HOST") {
+		t.Errorf("RCSAS_SIP_HOST refused without group chat:\n%s", out.String())
 	}
 }
 

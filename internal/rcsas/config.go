@@ -153,6 +153,13 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("SIP_LISTEN_ADDR", "needs a port")
 	}
 	c.SIPHost = runtime.InstanceAddr(e, "SIP_HOST", interfaceAddrs)
+	// A group's owner is told by its address too: a task that finds its
+	// own address on a group takes it at once, as the owner's must be
+	// gone (#121). Two tasks given one address would take each other's
+	// groups for good, so with group chat each task's is its own,
+	// discovered (security review on #431).
+	s.ForbidInProduction(c.GroupChat && e.String("SIP_HOST", "") != "",
+		"RCSAS_SIP_HOST with RCSAS_GROUP_CHAT_ENABLED: every task must find its own address, which owns its groups")
 	c.HomeDomain = s.Shared.RequiredString("IMS_DOMAIN")
 	c.Namespace = s.ServiceNamespace()
 	c.Core = coreURI(s)

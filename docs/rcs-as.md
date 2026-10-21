@@ -1000,7 +1000,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_MSRP_HOST` | required | This task's address in MSRP paths ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_MSRP_LISTEN_ADDR` | `:2855` | MSRP listener for `msrp-relay`; its port is the advertised one |
 | `RCSAS_SIP_LISTEN_ADDR` | `0.0.0.0:5060` | SIP listener (TCP), which only the core reaches; port 0 is refused, since the HSS's AS URI names a fixed port |
-| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
+| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)). Refused in staging and prod with `RCSAS_GROUP_CHAT_ENABLED`: a group's owner is known by its address too, and two tasks given one would take each other's groups (#121) |
 | `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, a private or loopback address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
 | `RCSAS_SERVICE_NAME` | `rcs-as.<RCS_SERVICE_NAMESPACE>`, none without a namespace | The host of the AS URI the iFC name rcs-as by (`HSS_RCS_AS_URI`), which rcs-as takes as its own in a `Route`. Change both together, or an OPTIONS scscf hands rcs-as comes back to it (482) |
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
