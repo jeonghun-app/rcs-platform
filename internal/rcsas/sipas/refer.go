@@ -52,7 +52,7 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 			s.respondWith(u, req, 415, [2]string{"Accept", resourcelists.ContentType})
 			return
 		}
-		entries, err := resourcelists.Parse(req.Body, s.cfg.MaxGroupParticipants-1)
+		entries, _, err := resourcelists.Parse(req.Body, s.cfg.MaxGroupParticipants-1)
 		switch {
 		case errors.Is(err, resourcelists.ErrTooMany):
 			s.cfg.Metrics.Count("sip.group.list_too_long", 1)

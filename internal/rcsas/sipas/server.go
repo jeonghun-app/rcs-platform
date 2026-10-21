@@ -130,7 +130,20 @@ type Server struct {
 	// rcs-as opens (session.largeKey).
 	perUser map[string]int
 	pending int
-	large   map[string]bool
+	// answering counts the sessions added whose first answer has not gone
+	// yet (settle).
+	answering sync.WaitGroup
+	// swept is set once Close has taken the sessions it ends, and
+	// sweeping while it still waits for their BYEs' answers; lateByes
+	// counts the BYEs settle sends meanwhile, which Close waits for too.
+	swept, sweeping bool
+	lateByes        sync.WaitGroup
+	// closeBy is when Close returns at the latest, which bounds the late
+	// BYEs it waits for.
+	closeBy time.Time
+	// closeOnce runs Close once; a later call waits for it.
+	closeOnce sync.Once
+	large     map[string]bool
 	// registered is when each user's registration, as rcs-as last heard
 	// of it, runs out (register).
 	registered map[string]time.Time

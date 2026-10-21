@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -43,10 +44,21 @@ type chatRig struct {
 	groupReads *countingGroups
 }
 
-// countingGroups counts the reads of a groups store.
+// countingGroups counts the reads of a groups store, and fails the next
+// failUpdates updates.
 type countingGroups struct {
 	groupstore.Store
-	gets atomic.Int64
+	gets        atomic.Int64
+	failUpdates atomic.Int64
+}
+
+var errFakeStore = errors.New("fake: the store failed")
+
+func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, token string) error {
+	if c.failUpdates.Add(-1) >= 0 {
+		return errFakeStore
+	}
+	return c.Store.Update(ctx, g, token)
 }
 
 func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {
@@ -92,6 +104,12 @@ func newChatRigWith(t *testing.T, mc messaging.Config, cfg Config, tune ...func(
 // newChatRigOn is newChatRigWith on a transport configured by tc.
 func newChatRigOn(t *testing.T, mc messaging.Config, cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *chatRig {
 	t.Helper()
+	return newChatRigStore(t, mc, cfg, tc, store.NewMemory(), tune...)
+}
+
+// newChatRigStore is newChatRigOn on the store st.
+func newChatRigStore(t *testing.T, mc messaging.Config, cfg Config, tc transport.Config, st store.Store, tune ...func(*proxy.Config)) *chatRig {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +120,7 @@ func newChatRigOn(t *testing.T, mc messaging.Config, cfg Config, tc transport.Co
 	mc.Logger = slog.New(slog.DiscardHandler)
 	var a *as
 	r.metrics = &counter{n: map[string]int64{}}
-	r.store = store.NewMemory()
+	r.store = st
 	e, err := messaging.New(mc, r.store, deliverer{&a}, r.metrics)
 	if err != nil {
 		t.Fatal(err)

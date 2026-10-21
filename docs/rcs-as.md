@@ -312,7 +312,18 @@ In every session:
   (a client that never connects to the relay), a 2xx without an ACK (RFC 3261
   §13.3.1.4), an unrefreshed timer and a terminating large-mode leg that is
   `Finished` each end the session with a BYE from rcs-as. So does shutdown,
-  before the transport closes; it waits up to 2 s for the BYEs' answers.
+  before the transport closes, in this order: it takes no new session; it lets
+  a session still being answered (a client's INVITE whose first message is
+  being stored, or rcs-as's ACK to a client's 2xx) send that answer first,
+  so that no BYE ever comes before its dialog's 2xx (#270); then it ends every
+  session with a BYE, each once its dialog is confirmed: the client's ACK of
+  rcs-as's 2xx has come, or rcs-as has sent its own ACK, since a callee must
+  not send a BYE before the ACK (RFC 3261 §15). The answers and the ACKs share
+  one bound of 2 s, and a BYE is sent when it runs out, ACK or not; a session
+  answered after it ends itself the same way, from its own path, and while
+  shutdown still waits for its own BYEs' answers it waits for those too. The
+  BYEs' answers have a bound of 2 s of their own, so shutdown takes at most
+  4 s here. Calls after the first wait for it, and end nothing twice.
 - **The MSRP direction.** A BYE with SIP cause 488 in its `Reason`, in a session
   rcs-as started that has carried no message yet, tells the engine
   `ErrNoSessions`: it is how pcscf ends a session whose client answered
@@ -549,9 +560,11 @@ How the SIP layer serves it:
   supports; it carries a `multipart/mixed` body of its SDP and
   a resource list (RFC 5366, RFC 4826), which `internal/resourcelists` reads
   as a stream, stopping at the first entry beyond `RCSAS_GROUP_MAX_PARTICIPANTS`
-  (403). Entries for the factory or at the conference host are left out
-  (`sip.group.invitee_skipped`): the focus's INVITE to one would come back
-  as a loop. The subject is its `Subject`, the creator's name its `From`
+  (403). An entry whose `uri` is missing or no URI a client means (not text,
+  or with white space or control characters) is left out, and so are entries
+  for the factory or at the conference host, whose focus INVITE would come
+  back as a loop (`sip.group.invitee_skipped`); a bad entry never refuses the
+  list, and every entry counts toward the bound. The subject is its `Subject`, the creator's name its `From`
   display name, and its `Contribution-ID`, which every session with the group
   carries, is required (400 without): rcsjta takes it as the chat's identity,
   and sends no `Conversation-ID`, which the group then makes. Every part of
@@ -561,8 +574,14 @@ How the SIP layer serves it:
 - **One group per Contribution-ID.** The conference URI is made from the
   `Contribution-ID` (`chat-` and the first 32 hex digits of its SHA-256), so
   the same ID always names the same group. A new group lasts 2 minutes until
-  its creator's session is set up (`group.Service.Established`, once the 200
-  has gone), then `RCSAS_GROUP_IDLE_TTL` from its last use. Until then the
+  its creator's session is set up (`group.Service.Established`, once the
+  200's ACK has come), then `RCSAS_GROUP_IDLE_TTL` from its last use. A 200
+  the client never got leaves the group to its creator's next INVITE under
+  that ID, which takes it up. A write of that
+  which fails is tried three more times, after 0.1, 0.4 and 1.6 s; if it
+  still fails, the creator's session ends with a BYE and nobody is invited,
+  so that the client makes the group again rather than keep a session with
+  one that ends within minutes (`sip.group.establish_abandoned`). Until then the
   creator's INVITE tried again under that ID, after a CANCEL or a failure,
   takes up the group it made; a group no session came of ends on its own.
   Any other INVITE to the factory naming an ID a live group has, from someone
@@ -574,10 +593,10 @@ How the SIP layer serves it:
   with `Contact: <conference URI>;isfocus` (RFC 4579 §5.2) and the chat
   feature tag: rcsjta keeps that URI to rejoin the group, and tells a group's
   INVITE from a 1-to-1 one by `isfocus`.
-- **The invitations.** Once the creator's session is answered, the focus
-  invites each invitee through the engine (`Engine.Invite`), which counts the
-  invitation like its own, so that a message queued meanwhile waits for that
-  session rather than ringing the client again. The INVITE is a terminating
+- **The invitations.** Once the creator's session is set up, its ACK in,
+  the focus invites each invitee through the engine (`Engine.Invite`), which
+  counts the invitation like its own, so that a message queued meanwhile
+  waits for that session rather than ringing the client again. The INVITE is a terminating
   request as for 1-to-1 chat, from the conference URI, asserted as it, with
   the same `Contact`, the group's `Subject`, `Conversation-ID` and the
   creator's `Contribution-ID`, and `Referred-By` naming who brings the
@@ -590,8 +609,9 @@ How the SIP layer serves it:
   with the group itself or is added again.
 - **Feature tags.** Every INVITE rcs-as sends for a chat, 1-to-1 or in a
   group, has both the CPM chat ICSI and the OMA SIMPLE IM tag
-  `+g.oma.sip-im` in `Contact` and `Accept-Contact`: rcsjta takes a chat
-  session by the latter.
+  `+g.oma.sip-im` in `Contact`, and one `Accept-Contact` for each, so that a
+  contact with either matches (RFC 3841): rcsjta takes a chat session by the
+  latter, a CPM client by the former.
 - **Join.** An INVITE to a conference URI, with only an SDP body, is `Join`:
   404 for a group that has ended, which rcsjta takes as the end of the group,
   and 403 for someone who is not a participant. A Request-URI at the
@@ -1111,7 +1131,7 @@ identifier ever appears in a metric name.
 | `sip.asserted.refused` | Requests whose `P-Asserted-Identity` is not one user's, as pcscf asserts it, refused with 403 |
 | `sip.pager.<status>`, `sip.pager.timeout`, `sip.pager.unsent`, `sip.pager.unresolved` | MESSAGEs rcs-as sent, by final status, and those that got none, could not be sent or found no next hop |
 | `sip.loop` | Requests rcs-as originated that came back to it, answered 482: by their `rcsas-` tag, or from a conference URI |
-| `sip.group.invitee_skipped`, `sip.group.establish_failed`, `group.create_retried`, `group.rejected.taken`, `invite.undeliverable` | Invitees at the factory or the conference host left out; new groups whose establishment could not be written (they end after 2 minutes); creators' INVITEs tried again that took up their group; INVITEs to the factory refused for another group's Contribution-ID; group invitations that will never reach the participant |
+| `sip.group.invitee_skipped`, `sip.group.establish_failed`, `sip.group.establish_abandoned`, `group.create_retried`, `group.rejected.taken`, `invite.undeliverable` | Invitees at the factory or the conference host left out; writes of a new group's establishment that failed, and groups given up after four, whose creator's session ended; creators' INVITEs tried again that took up their group; INVITEs to the factory refused for another group's Contribution-ID; group invitations that will never reach the participant |
 | `sip.group.created`, `sip.group.joined`, `sip.group.refused`, `sip.group.offer_refused`, `sip.group.service_refused`, `sip.group.list_too_long`, `sip.group.list_refused` | Clients' INVITEs to a group: groups created, joins, refusals by the group, and refusals for the offer (488), the service (403), a resource list too long (403) or unreadable (400) |
 | `sip.group.declined`, `sip.group.left`, `sip.group.leave_failed`, `sip.group.join_refused` | Participants who left by a 603 to the focus's INVITE or by a BYE that says so, Leaves that failed, and 2xx answers to the focus whose Join the group refused |
 | `sip.group.added`, `sip.group.removed`, `sip.group.invite_failed` | REFERs that added or removed, and additions whose invitations could not be sent for want of the group |

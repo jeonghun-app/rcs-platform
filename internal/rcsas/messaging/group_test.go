@@ -710,3 +710,25 @@ func TestAnUndeliverableGroupInvitationGivesTheCopiesUp(t *testing.T) {
 		t.Fatalf("bob's queue holds %d after he was added again", n)
 	}
 }
+
+// QA on #279: a participant the group's invitation found unreachable
+// that opens a session with the group itself is reachable again: once
+// that session has ended, its next copy waits for it, rather than being
+// given up.
+func TestAParticipantsOwnSessionLiftsTheUnreachableMark(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.InviteFailed(Invitation{Recipient: bob, Peer: groupURI, Mode: store.Group}, ErrUndeliverable)
+	l := r.listen(t)
+	leg, _ := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	_ = leg.Close()
+	waitFor(t, "bob's leg gone", func() bool { return r.e.chatLeg(bob, groupURI) == nil })
+	r.clock.Advance(r.e.cfg.InviteTimeout)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := r.store.(*store.Memory).Len(bob); n != 1 || r.m.get("delivery.undeliverable") != 0 {
+		t.Fatalf("bob's queue holds %d, %d given up", n, r.m.get("delivery.undeliverable"))
+	}
+}

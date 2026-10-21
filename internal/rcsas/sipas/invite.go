@@ -227,8 +227,12 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	ss.mu.Unlock()
 	// Known before the ACK leaves, so that a BYE right behind it finds
 	// the session.
-	added := s.addSession(ss)
+	answered, added := s.addSession(ss)
 	s.sendACK(ack, next)
+	if added == nil {
+		ss.confirm()
+	}
+	answered()
 	if added != nil {
 		// The session cannot be kept: it is ended, and the message waits
 		// for the next one.
@@ -403,8 +407,13 @@ func (s *Server) inviteRequest(ss *session) (*sip.Request, error) {
 		{"P-Asserted-Identity", "<" + inv.Peer + ">"},
 		{"P-Served-User", "<" + inv.Recipient + ">;sescase=term"},
 		{"P-Asserted-Service", icsi},
-		{"Accept-Contact", "*;" + ss.inviteTags()},
 		{"Allow", allowed},
+	}
+	// One Accept-Contact per feature tag, so that a contact with either
+	// matches (RFC 3841 §9.2): rcsjta advertises +g.oma.sip-im, a CPM
+	// client the ICSI.
+	for _, tag := range ss.acceptTags() {
+		fields = append(fields, [2]string{"Accept-Contact", "*;" + tag})
 	}
 	for _, h := range [][2]string{{"Conversation-ID", inv.Conversation.ID}, {"Contribution-ID", inv.Conversation.Contribution},
 		{"InReplyTo-Contribution-ID", inv.Conversation.InReplyTo}, {"Subject", inv.Subject}, {"Referred-By", referredBy(inv)}} {

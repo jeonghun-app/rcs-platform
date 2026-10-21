@@ -39,7 +39,7 @@ func TestE2EComposeStack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	for _, svc := range []string{"hss", "ft-server", "msrp-relay"} {
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	waitReady(ctx, t, acsURL+"/readyz")
@@ -64,6 +64,29 @@ func TestE2EComposeStack(t *testing.T) {
 		}
 	}
 	uploadURL := doc.value("FT", "ftHTTPCSURI")
+
+	// hss: the number's SIP and tel IMPUs in one implicit registration set
+	// (docs/architecture.md §4, #282), so a terminating request to the tel
+	// form reaches the client. Routing one needs scscf in the stack; until
+	// then this checks what it would route by.
+	var sub struct {
+		PublicIdentities []struct {
+			IMPU        string `json:"impu"`
+			ImplicitSet int    `json:"implicit_set"`
+		} `json:"public_identities"`
+	}
+	if status := callJSON(ctx, t, http.MethodGet, hssAPI+"/v1/subscriptions/"+url.PathEscape(impi), env(t, "HSS_ADMIN_TOKEN"), nil, &sub); status != http.StatusOK {
+		t.Fatalf("hss: reading the test subscription answered %d", status)
+	}
+	sets := map[string]int{}
+	for _, p := range sub.PublicIdentities {
+		sets[p.IMPU] = p.ImplicitSet
+	}
+	sipSet, okSIP := sets[impu]
+	telSet, okTel := sets["tel:"+composeMSISDN]
+	if !okSIP || !okTel || sipSet != telSet {
+		t.Errorf("hss lists the identities %+v, want %s and tel:%s in one implicit set", sub.PublicIdentities, impu, composeMSISDN)
+	}
 
 	// acs 1.4.0 cannot provision ftHTTPCSUser and ftHTTPCSPwd yet
 	// (auto-configuration-server#69), so the test issues the FT password

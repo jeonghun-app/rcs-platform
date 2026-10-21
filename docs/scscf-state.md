@@ -127,8 +127,9 @@ are failing closed: every REGISTER that needs a challenge gets 500.
 
 `scscf` and `icscf` find the HSS tasks with Cloud Map (`cxclient`,
 `CloudMapDiscovery`), so both task roles need
-`servicediscovery:DiscoverInstances` on the HSS namespace. Without it no HSS
-peer is found and every Cx request fails.
+`servicediscovery:DiscoverInstances` with both the namespace and its `hss`
+service as resources, since the call names both. Without it no HSS peer is
+found and every Cx request fails.
 
 ## Challenge keys
 

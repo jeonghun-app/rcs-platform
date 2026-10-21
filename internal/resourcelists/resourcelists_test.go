@@ -18,7 +18,7 @@ const rcsjtaList = `<?xml version="1.0" encoding="UTF-8"?>
 </resource-lists>`
 
 func TestTheEntriesOfAListAreRead(t *testing.T) {
-	got, err := Parse([]byte(rcsjtaList), 10)
+	got, _, err := Parse([]byte(rcsjtaList), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestNestedListsAreReadInOrderAndReferencesLeftOut(t *testing.T) {
 	doc := `<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list>
 <entry uri="tel:+15550100002"/><list name="b"><entry uri="tel:+15550100003"/></list>
 <entry-ref ref="x"/><external anchor="http://example.invalid/l"/></list></resource-lists>`
-	got, err := Parse([]byte(doc), 10)
+	got, _, err := Parse([]byte(doc), 10)
 	if err != nil || len(got) != 2 || got[1].URI != "tel:+15550100003" {
 		t.Fatalf("got %v, %v", got, err)
 	}
@@ -47,7 +47,7 @@ func TestAListBeyondTheLimitIsRefused(t *testing.T) {
 	}
 	// What follows the third entry does not parse: it is never reached.
 	b.WriteString(`<<<`)
-	if _, err := Parse([]byte(b.String()), 3); !errors.Is(err, ErrTooMany) {
+	if _, _, err := Parse([]byte(b.String()), 3); !errors.Is(err, ErrTooMany) {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -57,33 +57,54 @@ func TestWhatIsNotAResourceListIsRefused(t *testing.T) {
 		doc  string
 		want error
 	}{
-		"a DTD":          {`<!DOCTYPE x [<!ENTITY a "b">]><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrDTD},
-		"too large":      {strings.Repeat(" ", MaxDocumentSize+1), ErrTooLarge},
-		"another root":   {`<lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
-		"no namespace":   {`<resource-lists><list><entry uri="tel:+15550100002"/></list></resource-lists>`, ErrMalformed},
-		"two roots":      {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
-		"no root":        {` `, ErrMalformed},
-		"entry, no uri":  {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry/></list></resource-lists>`, ErrMalformed},
-		"repeated attr":  {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a" uri="b"/></list></resource-lists>`, ErrMalformed},
-		"text outside":   {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>x`, ErrMalformed},
-		"unclosed":       {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list>`, ErrMalformed},
-		"deep":           {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists">` + strings.Repeat("<list>", maxDepth) + strings.Repeat("</list>", maxDepth) + `</resource-lists>`, ErrMalformed},
-		"CR LF in a uri": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a@b&#13;&#10;Via: x"/></list></resource-lists>`, ErrMalformed},
-		"space in a uri": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a b@c"/></list></resource-lists>`, ErrMalformed},
-		"DEL in a uri":   {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a&#x7f;@b"/></list></resource-lists>`, ErrMalformed},
-		"a surrogate":    {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a&#xD800;@b"/></list></resource-lists>`, ErrMalformed},
-		"surrogate name": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a@b"><display-name>&#xDFFF;</display-name></entry></list></resource-lists>`, ErrMalformed},
-		"long name":      {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a"><display-name>` + strings.Repeat("n", maxNameBytes+1) + `</display-name></entry></list></resource-lists>`, ErrMalformed},
+		"a DTD":         {`<!DOCTYPE x [<!ENTITY a "b">]><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrDTD},
+		"too large":     {strings.Repeat(" ", MaxDocumentSize+1), ErrTooLarge},
+		"another root":  {`<lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
+		"no namespace":  {`<resource-lists><list><entry uri="tel:+15550100002"/></list></resource-lists>`, ErrMalformed},
+		"two roots":     {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>`, ErrMalformed},
+		"no root":       {` `, ErrMalformed},
+		"repeated attr": {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a" uri="b"/></list></resource-lists>`, ErrMalformed},
+		"text outside":  {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"/>x`, ErrMalformed},
+		"unclosed":      {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list>`, ErrMalformed},
+		"deep":          {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists">` + strings.Repeat("<list>", maxDepth) + strings.Repeat("</list>", maxDepth) + `</resource-lists>`, ErrMalformed},
+		"long name":     {`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="a"><display-name>` + strings.Repeat("n", maxNameBytes+1) + `</display-name></entry></list></resource-lists>`, ErrMalformed},
 	} {
-		if _, err := Parse([]byte(c.doc), 10); !errors.Is(err, c.want) {
+		if _, _, err := Parse([]byte(c.doc), 10); !errors.Is(err, c.want) {
 			t.Errorf("%s: %v, want %v", name, err, c.want)
 		}
 	}
 }
 
+// One bad entry does not refuse a list (docs/rcs-as.md): an entry whose
+// uri is missing, not text, or has white space or control characters is
+// left out and counted, and still counts toward the limit; a name that is
+// not text is dropped and its entry kept.
+func TestABadEntryIsSkippedNotRefused(t *testing.T) {
+	for name, doc := range map[string]string{
+		"entry, no uri":  `<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry/></list></resource-lists>`,
+		"CR LF in a uri": `<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a@b&#13;&#10;Via: x"/></list></resource-lists>`,
+		"space in a uri": `<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a b@c"/></list></resource-lists>`,
+		"DEL in a uri":   `<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a&#x7f;@b"/></list></resource-lists>`,
+		"a surrogate":    `<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a&#xD800;@b"/></list></resource-lists>`,
+	} {
+		doc = strings.Replace(doc, "</list>", `<entry uri="tel:+15550100002"/></list>`, 1)
+		got, skipped, err := Parse([]byte(doc), 10)
+		if err != nil || skipped != 1 || len(got) != 1 || got[0].URI != "tel:+15550100002" {
+			t.Errorf("%s: %v, %d skipped, %v", name, got, skipped, err)
+		}
+		if _, _, err := Parse([]byte(doc), 1); !errors.Is(err, ErrTooMany) {
+			t.Errorf("%s: a skipped entry did not count toward the limit: %v", name, err)
+		}
+	}
+	got, skipped, err := Parse([]byte(`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="sip:a@b"><display-name>&#xDFFF;</display-name></entry></list></resource-lists>`), 10)
+	if err != nil || skipped != 0 || len(got) != 1 || got[0].DisplayName != "" {
+		t.Errorf("a name that is not text: %v, %d skipped, %v", got, skipped, err)
+	}
+}
+
 // An error never quotes the input.
 func TestAnErrorDoesNotQuoteTheDocument(t *testing.T) {
-	_, err := Parse([]byte(`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="tel:+15550100002"></bad></list></resource-lists>`), 10)
+	_, _, err := Parse([]byte(`<resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists"><list><entry uri="tel:+15550100002"></bad></list></resource-lists>`), 10)
 	if err == nil || strings.Contains(err.Error(), "+1555") || strings.Contains(err.Error(), "bad") {
 		t.Fatalf("error %v", err)
 	}
