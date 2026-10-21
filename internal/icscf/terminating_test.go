@@ -189,10 +189,19 @@ func TestARoutedRequestGoesOnlyToAConfiguredSCSCF(t *testing.T) {
 		{"a Route back to this I-CSCF", invite(t, impu1, "Route: <"+self+">"), 482},
 		{"a Route that comes back further down", invite(t, impu1, "Route: <"+scscfURI+";lr>, <"+self+">"), 482},
 		{"in a dialog to this I-CSCF", invite(t, "sip:icscf.rcs.local:5060", "To: <"+impu1+">;tag=t1"), 482},
+		// The S-CSCF would send it back here once it has used its Route.
+		{"this I-CSCF as the Request-URI behind a Route", invite(t, "sip:icscf.rcs.local", "Route: <"+scscfURI+";lr>"), 482},
+		{"in a dialog to this I-CSCF behind a Route", invite(t, "sip:icscf.rcs.local", "To: <"+impu1+">;tag=t1", "Route: <"+scscfURI+";lr>"), 482},
+		// However the Route below writes this I-CSCF, as the proxy would
+		// recognise its own.
+		{"further down with a trailing dot", invite(t, impu1, "Route: <"+scscfURI+";lr>, <sip:icscf.rcs.local.:5060;lr>"), 482},
+		{"further down in capitals with a trailing dot", invite(t, impu1, "Route: <"+scscfURI+";lr>, <sip:ICSCF.RCS.LOCAL.:5060;lr>"), 482},
+		{"further down as an IPv4-mapped IPv6 address", invite(t, impu1, "Route: <"+scscfURI+";lr>, <sip:[::ffff:192.0.2.31]:5060;lr>"), 482},
+		{"further down without the default port", invite(t, impu1, "Route: <"+scscfURI+";lr>, <sip:icscf.rcs.local;transport=tcp;lr>"), 482},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI(self)} })
+			g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI(self), mustURI("sip:192.0.2.31:5060;lr")} })
 			if got := describe(t, g.route(tc.req)); got.status != tc.status {
 				t.Errorf("decision = %+v, want %d", got, tc.status)
 			}

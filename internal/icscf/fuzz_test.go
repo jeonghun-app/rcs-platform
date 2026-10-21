@@ -1,10 +1,14 @@
 package icscf
 
 import (
+	"context"
+	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // ParseSCSCFs either refuses its input or returns a list New accepts.
@@ -77,6 +81,7 @@ func FuzzRoutedNextHop(f *testing.F) {
 		{"", scscfURI},
 		{"", "sip:icscf.rcs.local"},
 		{"<sip:[::ffff:192.0.2.1]:5060;lr>", "sip:x@[::1]"},
+		{"<" + scscfURI + ";lr>, <sip:[::ffff:192.0.2.31]:5060;lr>", "sip:icscf.rcs.local."},
 	} {
 		f.Add(tc[0], tc[1])
 	}
@@ -99,7 +104,7 @@ func FuzzRoutedNextHop(f *testing.F) {
 		if !ok {
 			return
 		}
-		g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI(self)} })
+		g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI(self), mustURI("sip:" + fuzzSelf.String() + ";lr")} })
 		d := g.route(req)
 		if len(d.Targets) == 0 {
 			if d.Status != 403 && d.Status != 482 {
@@ -111,17 +116,48 @@ func FuzzRoutedNextHop(f *testing.F) {
 		if err != nil {
 			t.Fatalf("forwarded a request whose Route does not parse: %v", err)
 		}
+		// The oracle is the proxy's resolver, not the Router's own checks
+		// (review of #350): where the request would really go, against where
+		// the configured S-CSCF and this I-CSCF are.
 		next := req.URI
 		if len(routes) > 0 {
 			next = routes[0].URI
 		}
-		if !g.r.scscfHop(next) {
-			t.Fatalf("forwarded to %s, not a configured S-CSCF", next.String())
+		if got, ok := fuzzDestination(next); !ok || got != fuzzSCSCF {
+			t.Fatalf("forwarded to %s, which is %+v, not the S-CSCF at %+v", next.String(), got, fuzzSCSCF)
 		}
-		for _, a := range routes {
-			if g.r.self(a.URI) {
-				t.Fatalf("forwarded a request whose Route names this I-CSCF: %s", a.URI.String())
+		for _, u := range append([]sip.URI{req.URI}, uris(routes)...) {
+			if got, ok := fuzzDestination(u); ok && got.Addr == fuzzSelf {
+				t.Fatalf("forwarded a request that names this I-CSCF: %s", u.String())
 			}
 		}
 	})
+}
+
+// The addresses FuzzRoutedNextHop's names stand for: the Router's S-CSCF
+// (scscfURI) and the Self it is given.
+var (
+	fuzzSCSCF = transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("192.0.2.30:5060")}
+	fuzzSelf  = netip.MustParseAddrPort("192.0.2.31:5060")
+)
+
+// fuzzDestination is where the proxy's NumericResolver sends u once its host
+// name is looked up as DNS would: without case or a trailing dot.
+func fuzzDestination(u sip.URI) (transport.Destination, bool) {
+	switch strings.TrimSuffix(strings.ToLower(u.Host), ".") {
+	case "scscf.rcs.local":
+		u.Host = fuzzSCSCF.Addr.Addr().String()
+	case "icscf.rcs.local":
+		u.Host = fuzzSelf.Addr().String()
+	}
+	d, err := proxy.NumericResolver{}.Resolve(context.Background(), u)
+	return transport.Destination{Network: d.Network, Addr: d.Addr}, err == nil
+}
+
+func uris(as []sip.Address) []sip.URI {
+	us := make([]sip.URI, len(as))
+	for i, a := range as {
+		us[i] = a.URI
+	}
+	return us
 }

@@ -20,7 +20,7 @@ the mapping of every HSS answer to a SIP response with its clause;
   says, without the HSS, when its next hop (the first Route left, or the
   Request-URI) is a configured S-CSCF as it is reached: the same scheme,
   host, port and transport. Any other next hop gets 403, and a request whose
-  Route names `icscf` again gets 482 (#337). `icscf` inserts no
+  Route or Request-URI names `icscf` again gets 482 (#337). `icscf` inserts no
   Record-Route, so dialogs do not pass it.
 - **When the HSS cannot be asked**, or answers that it could not do it
   (`DIAMETER_UNABLE_TO_COMPLY`, a store failure): 480 with `Retry-After`
@@ -93,7 +93,7 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | Counter | Counts |
 |---|---|
 | `icscf.<kind>.forwarded` | requests forwarded; `kind` is `register`, `terminating`, or `routed` (a Route left, or inside a dialog) |
-| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 600), and 500 for an S-CSCF it could not reach |
+| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 482, 600), and 500 for an S-CSCF it could not reach; a refused ACK is counted, though it gets no answer |
 | `icscf.<kind>.cancelled` | requests cancelled while the HSS was asked |
 | `icscf.hss.unavailable` | HSS queries that could not be completed; alarm on a rise |
 | `icscf.hss.bad_server_name` | HSS answers naming an S-CSCF that is not a SIP URI |
