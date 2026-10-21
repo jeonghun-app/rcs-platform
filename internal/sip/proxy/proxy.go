@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +22,7 @@ import (
 const (
 	// DefaultTimerC is just over the 3 minutes RFC 3261 §16.6 step 11 sets as
 	// the least Timer C may be.
-	DefaultTimerC = 3*time.Minute + time.Second
+	DefaultTimerC = transaction.DefaultTimerC
 	// DefaultMaxContexts bounds the requests being forwarded at once. A context
 	// lives from the request until every branch has ended, which for an INVITE
 	// can be minutes of ringing, so it is sized for the calls a task carries,
@@ -62,7 +63,11 @@ type Config struct {
 	// Transaction configures the transaction layer the proxy runs on. Its
 	// Clock also runs Timer C, and its T1 times out an unanswered CANCEL (§9.1).
 	// DelayTrying is always set, since the proxy forwards provisional responses
-	// of its own (§17.2.1).
+	// of its own (§17.2.1). The layer's safety net for a request the proxy
+	// never answers must come after the proxy's own deadlines: zero
+	// InviteFinalTimeout takes transaction.InviteFinalTimeoutFor(TimerC, T1),
+	// and less is refused, as is a NonInviteFinalTimeout under 64*T1 (Timer F)
+	// plus transaction.FinalTimeoutMargin.
 	Transaction transaction.Config
 	// TimerC is how long an INVITE branch may go without a provisional
 	// response other than 100 (§16.6 step 11, §16.7 step 2). It must exceed 3
@@ -88,6 +93,12 @@ type Config struct {
 	// Logger receives operational events, never message content. Nil discards
 	// them.
 	Logger *slog.Logger
+	// DrainAnswer, if set, chooses the final response Drain gives a request
+	// still without one when the stop's time runs out: its status code, 300
+	// to 699, and a Retry-After if retryAfter is a second or more. Nil, or a
+	// code outside that range, answers 500 with Retry-After: 5. A request
+	// cancelled upstream gets 487 whatever it says (§9.2).
+	DrainAnswer func(req *sip.Request) (code int, retryAfter time.Duration)
 }
 
 // Proxy is the transaction-stateful proxy core of RFC 3261 §16, the transaction
@@ -111,6 +122,15 @@ type Proxy struct {
 	// must not be sent (silence).
 	silent sync.Map
 	ids    sip.IDGenerator
+	// drainAns is Config.DrainAnswer.
+	drainAns func(*sip.Request) (int, time.Duration)
+	// stopping is set once Drain has answered what was left: a request
+	// that arrives after that gets the same answer at once, before the
+	// Close that follows (QA of #310).
+	stopping atomic.Bool
+	// cancelsSending counts the CANCELs on their way to the transaction
+	// layer, which Drain waits for.
+	cancelsSending atomic.Int64
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
@@ -190,6 +210,20 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if tcfg.T2 <= 0 {
 		tcfg.T2 = transaction.DefaultT2
 	}
+	// The layer answers 500 for a request the proxy has not answered in
+	// time; the proxy's own 487 after Timer C and its CANCEL, and its
+	// silence after a branch's Timer F (RFC 4320 §4.2), must come first
+	// (decided on #156).
+	inviteFinal := transaction.InviteFinalTimeoutFor(cfg.TimerC, tcfg.T1)
+	if tcfg.InviteFinalTimeout == 0 {
+		tcfg.InviteFinalTimeout = inviteFinal
+	}
+	if tcfg.InviteFinalTimeout < inviteFinal {
+		return nil, fmt.Errorf("proxy: Transaction.InviteFinalTimeout %v is under Timer C, 64*T1 and the margin (%v)", tcfg.InviteFinalTimeout, inviteFinal)
+	}
+	if n := tcfg.NonInviteFinalTimeout; n != 0 && n < 64*tcfg.T1+transaction.FinalTimeoutMargin {
+		return nil, fmt.Errorf("proxy: Transaction.NonInviteFinalTimeout %v is under Timer F and the margin (%v)", n, 64*tcfg.T1+transaction.FinalTimeoutMargin)
+	}
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(cfg.Rand, key); err != nil {
 		return nil, fmt.Errorf("proxy: reading the hash key: %w", err)
@@ -210,6 +244,7 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
+		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
@@ -283,6 +318,130 @@ func (p *Proxy) Receive(in transport.Inbound) { p.layer.Receive(in) }
 // of its own as a UAC.
 func (p *Proxy) Layer() *transaction.Layer { return p.layer }
 
+// Drain lets the requests in progress finish before a stop, as a service
+// does on SIGTERM: it waits until none is left, or until ctx ends, and then
+// answers each one still without a final response, 500 with Retry-After
+// unless Config.DrainAnswer says otherwise, so its sender tries another
+// instance at once instead of waiting 64*T1 for its timers (#281). A request
+// a Serve handler is answering is the handler's: its context is cancelled,
+// and the handler answers, or the proxy for it once it returns. New
+// requests are still served meanwhile: a service's peers keep finding a
+// task until its Cloud Map registration and DNS answers age out, and pcscf
+// still reaches the clients it has not yet closed. It reports how many
+// answers it sent. Call Close after it.
+//
+// A request that has its final response is not in progress, even while its
+// context lingers, after a 2xx to an INVITE to pass retransmissions on or
+// while a forked branch waits for the answer to its CANCEL.
+func (p *Proxy) Drain(ctx context.Context) int {
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if p.inProgress() == 0 {
+			// The last answers may still sit in the transport's queues.
+			p.flushSender(time.Now().Add(DrainSendWait))
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			return p.answerForStop()
+		case <-tick.C:
+		}
+	}
+}
+
+// inProgress is the number of requests still without a final response.
+func (p *Proxy) inProgress() int {
+	n := 0
+	for _, c := range p.openContexts() {
+		if c.inProgress() {
+			n++
+		}
+	}
+	return n
+}
+
+// openContexts returns the contexts not yet released.
+func (p *Proxy) openContexts() []*respContext {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	all := make([]*respContext, 0, len(p.contexts))
+	for _, c := range p.contexts {
+		all = append(all, c)
+	}
+	return all
+}
+
+// DrainSendWait bounds how long Drain waits, after the requests it waited
+// for, for the answers and CANCELs to be handed to the transport, which waits
+// at most its WriteTimeout for a slow peer, and then written. A service's
+// stop margin must leave room for it.
+const DrainSendWait = 2 * time.Second
+
+// answerForStop answers every request still without a final response, and
+// waits until the answers have gone out, so that a Close right after does
+// not drop them: handed to the sender, and with a *transport.Transport,
+// whose Close drops what its send queues still hold, written as well.
+func (p *Proxy) answerForStop() int {
+	// From here on a new request is answered as it arrives (Request). One
+	// that got its context just before is caught by the second pass.
+	p.stopping.Store(true)
+	var answered atomic.Int64
+	var sent []<-chan struct{}
+	for range 2 {
+		for _, c := range p.openContexts() {
+			if ch := c.answerForStop(&answered); ch != nil {
+				sent = append(sent, ch)
+			}
+		}
+	}
+	deadline := time.Now().Add(DrainSendWait)
+	for _, ch := range sent {
+		select {
+		case <-ch:
+		case <-time.After(time.Until(deadline)):
+			return int(answered.Load())
+		}
+	}
+	p.flushSender(deadline)
+	return int(answered.Load())
+}
+
+// flushSender waits, until deadline, for the CANCELs on their way to be
+// handed to the transaction layer, and for a *transport.Transport sender to
+// write what its send queues hold: its Close drops it.
+func (p *Proxy) flushSender(deadline time.Time) {
+	for p.cancelsSending.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if tr, ok := p.sender.(*transport.Transport); ok {
+		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+// drainResponse is the final response Drain gives req (Config.DrainAnswer).
+func (p *Proxy) drainResponse(req *sip.Request) (*sip.Response, error) {
+	code, retryAfter := 500, 5*time.Second
+	if p.drainAns != nil {
+		if c, ra := p.drainAns(req); c >= 300 && c <= 699 {
+			code, retryAfter = c, ra
+		}
+	}
+	if retryAfter < time.Second {
+		return p.response(req, code)
+	}
+	return p.response(req, code, [2]string{"Retry-After", strconv.FormatInt(int64(retryAfter/time.Second), 10)})
+}
+
+// FlowClosed tells the proxy that a flow has closed, from the transport's
+// OnFlowClosed. A branch sent over it (Target.Destination with Flow) that
+// has no final response ends at once and counts as 430 Flow Failed, as a
+// send onto the closed flow would (RFC 5626 §5.3), instead of waiting 64*T1
+// for Timer B or F.
+func (p *Proxy) FlowClosed(id transport.FlowID) { p.layer.FlowClosed(id) }
+
 // Close stops the proxy: every transaction ends without a response, pending
 // timers are stopped, and Close returns once the proxy's goroutines have. A
 // Router or hook still running sees its context cancelled, and Close waits for
@@ -355,6 +514,16 @@ func (p *Proxy) Request(tx *transaction.ServerTransaction) {
 		p.receiveCancel(tx)
 		return
 	}
+	if p.stopping.Load() {
+		// Drain has answered everything else: this one is answered as they
+		// were, statelessly, before the proxy closes.
+		if res, err := p.drainResponse(tx.Request()); err == nil {
+			if err := tx.Respond(res); err != nil {
+				p.stats.upstreamErrors.Add(1)
+			}
+		}
+		return
+	}
 	c := p.newContext(tx)
 	if c == nil {
 		// At MaxContexts or MaxContextBytes.
@@ -416,6 +585,7 @@ func (p *Proxy) release(c *respContext, linger bool) {
 	p.mu.Lock()
 	delete(p.contexts, c.tx)
 	p.mu.Unlock()
+	c.unwatch()
 	c.mu.Lock()
 	n := c.reserved
 	c.reserved = 0
@@ -519,12 +689,16 @@ type Stats struct {
 	ACKsMissing            uint64 // 2xx a Serve handler sent whose ACK never came
 	ACKsDropped            uint64 // ACKs that could not be forwarded
 	UpstreamErrors         uint64 // responses the upstream transaction could not send, dropped (§16.9)
+
+	// Drained counts the answers Drain sent to requests that had no final
+	// response when the stop's time ran out.
+	Drained uint64
 }
 
 type counters struct {
 	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
-	upstreamErrors atomic.Uint64
+	upstreamErrors, drained atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -552,5 +726,7 @@ func (p *Proxy) Stats() Stats {
 		ACKsMissing:            s.acksMissing.Load(),
 		ACKsDropped:            s.acksDropped.Load(),
 		UpstreamErrors:         s.upstreamErrors.Load(),
+
+		Drained: s.drained.Load(),
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
 // Tests from the reviews of #276.
@@ -167,7 +169,10 @@ func (r *running) waitReadiness(t *testing.T, code int) {
 // Retry-After, as a terminating request does.
 func TestARegisterToAnUnreachableSCSCFGets500WithRetryAfter(t *testing.T) {
 	hss := startHSS(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// A port closed on a loopback address icscf never listens on, so its
+	// own core listener, on 127.0.0.1, cannot take the port over and turn
+	// the REGISTER into a loop (#325).
+	ln, err := net.Listen("tcp", "127.0.0.9:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,6 +288,30 @@ func (s *slowSCSCF) uri() string { return "sip:" + s.ln.Addr().String() + ";tran
 func (r *running) sendAsync(t *testing.T, method, uri string, fields ...string) chan string {
 	t.Helper()
 	out := make(chan string, 1)
+	res := r.sendAsyncResponse(t, method, uri, fields...)
+	go func() {
+		got := <-res
+		if got.err != nil {
+			out <- "no final response: " + got.err.Error()
+			return
+		}
+		out <- fmt.Sprint(got.res.StatusCode)
+	}()
+	return out
+}
+
+// final is a request's final response, or why there was none.
+type final struct {
+	res *sip.Response
+	err error
+	at  time.Time
+}
+
+// sendAsyncResponse is sendAsync with the final response itself, and when
+// it came.
+func (r *running) sendAsyncResponse(t *testing.T, method, uri string, fields ...string) chan final {
+	t.Helper()
+	out := make(chan final, 1)
 	nc, err := net.Dial("tcp", r.core.String())
 	if err != nil {
 		t.Fatal(err)
@@ -306,11 +335,11 @@ func (r *running) sendAsync(t *testing.T, method, uri string, fields ...string) 
 		for {
 			m, err := rd.ReadMessage()
 			if err != nil {
-				out <- "no final response: " + err.Error()
+				out <- final{err: err, at: time.Now()}
 				return
 			}
 			if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
-				out <- fmt.Sprint(res.StatusCode)
+				out <- final{res: res, at: time.Now()}
 				return
 			}
 		}
@@ -420,10 +449,24 @@ func TestARequestGoesPastEveryRefusingAddress(t *testing.T) {
 
 // blackholeDialer never completes a connection to hole, as the address of a
 // stopped task in a VPC drops the SYN, and dials anything else.
-type blackholeDialer struct{ hole string }
+// It counts the dials to hole and keeps the longest time one was given.
+type blackholeDialer struct {
+	hole    string
+	mu      sync.Mutex
+	dials   int
+	allowed time.Duration
+}
 
-func (b blackholeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (b *blackholeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if host, _, _ := net.SplitHostPort(address); host == b.hole {
+		b.mu.Lock()
+		b.dials++
+		if dl, ok := ctx.Deadline(); !ok {
+			b.allowed = time.Duration(math.MaxInt64)
+		} else {
+			b.allowed = max(b.allowed, time.Until(dl))
+		}
+		b.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -431,9 +474,18 @@ func (b blackholeDialer) DialContext(ctx context.Context, network, address strin
 	return d.DialContext(ctx, network, address)
 }
 
+// holeDials is how many dials went to the hole, and the longest any of them
+// was given.
+func (b *blackholeDialer) holeDials() (int, time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dials, b.allowed
+}
+
 // QA of #276: a blackholed address costs the 2 s connection timeout, not
 // the transport's 5 s, and only once: the next request goes to another
-// address first.
+// address first. Both are judged from the dials, not from how long the
+// requests took, which a loaded host stretches (#313).
 func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 	hss := startHSS(t)
 	scscf := startSCSCF(t)
@@ -442,21 +494,125 @@ func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 	lookup := func(context.Context, string, string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("127.0.0.9"), netip.MustParseAddr("127.0.0.1")}, nil
 	}
+	hole := &blackholeDialer{hole: "127.0.0.9"}
 	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(fmt.Sprintf("sip:scscf.rcs.local:%d;transport=tcp", port))}}, func(_ *ServiceConfig, d *deps) {
 		d.lookup = lookup
 		d.shuffle = func(int, func(i, j int)) {}
-		d.sipDialer = blackholeDialer{hole: "127.0.0.9"}
+		d.sipDialer = hole
 	})
 	r.waitReady(t)
-	send := func() (int, time.Duration) {
-		start := time.Now()
-		res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
-		return res.StatusCode, time.Since(start)
+	send := func() int {
+		return r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">").StatusCode
 	}
-	if code, took := send(); code != 200 || took > 4*time.Second {
-		t.Fatalf("first: %d after %v, want 200 after about 2s", code, took)
+	if code := send(); code != 200 {
+		t.Fatalf("first: %d, want 200 from the good address", code)
 	}
-	if code, took := send(); code != 200 || took > 500*time.Millisecond {
-		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)
+	if n, allowed := hole.holeDials(); n != 1 || allowed > 2*time.Second {
+		t.Fatalf("first: %d dials to the blackholed address, given up to %v, want one of at most 2s", n, allowed)
+	}
+	if code := send(); code != 200 {
+		t.Fatalf("second: %d, want 200 from the good address", code)
+	}
+	if n, _ := hole.holeDials(); n != 1 {
+		t.Fatalf("the second request dialed the blackholed address again (%d dials in all)", n)
+	}
+}
+
+// #37: past ICSCF_MAX_SERVER_TRANSACTIONS a request is answered 503 with
+// Retry-After, icscf's own overload (decided on #15), while the one in
+// progress goes on.
+func TestARequestPastTheTransactionCapGets503(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hss.answer = func(uint32) (cx.Result, string) {
+		once.Do(func() { close(held); <-release })
+		return cx.ResultCode(diameter.ResultSuccess), scscf.uri()
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.MaxServerTransactions = 1
+	})
+	r.waitReady(t)
+	first := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	select {
+	case <-held:
+	case <-time.After(realWait):
+		t.Fatal("the first request never reached the HSS")
+	}
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f2", "To: <"+tel1+">")
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
+		t.Errorf("past the cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	close(release)
+	if got := <-first; got != "200" {
+		t.Fatalf("the request in progress got %s, want 200", got)
+	}
+}
+
+// And past ICSCF_MAX_SERVER_TRANSACTION_BYTES: with a bound smaller than any
+// request, every one is refused.
+func TestARequestPastTheTransactionByteCapGets503(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.MaxServerTransactionBytes = 64
+	})
+	r.waitReady(t)
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
+		t.Errorf("past the byte cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
+
+// #281: a request still in progress when ICSCF_DRAIN_TIMEOUT runs out is
+// answered 500 with Retry-After, so the sender tries another task at once.
+func TestAStopAnswersARequestLeftInProgress500(t *testing.T) {
+	scscf := startSlowSCSCF(t, 20*time.Second)
+	hss := startHSS(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	// Long enough that four times it would pass the bound below.
+	const drain = time.Second
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.DrainTimeout = drain
+	})
+	r.waitReady(t)
+	msg := r.sendAsyncResponse(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	<-scscf.got
+	stopped := time.Now()
+	go r.stop()
+	got := <-msg
+	if got.err != nil || got.res.StatusCode != 500 || got.res.Header.Get("Retry-After") != "5" {
+		t.Fatalf("MESSAGE left at the stop: %v %v, want 500 with Retry-After 5", got.res, got.err)
+	}
+	// It comes once the drain's time is up, and no later than the wait
+	// for answers to go out after it (QA of #310).
+	if took := got.at.Sub(stopped); took < drain || took > drain+proxy.DrainSendWait {
+		t.Errorf("answered %v after the stop, want between %v and %v", took, drain, drain+proxy.DrainSendWait)
+	}
+	if proxy.DrainSendWait >= stopMargin {
+		t.Errorf("the proxy's %v answer wait leaves nothing of the %v stop margin", proxy.DrainSendWait, stopMargin)
+	}
+}
+
+// #310: a REGISTER left at the stop gets 503 with Retry-After instead, which
+// pcscf retries on another icscf at once.
+func TestAStopAnswersARegisterLeftInProgress503(t *testing.T) {
+	scscf := startSlowSCSCF(t, 20*time.Second)
+	hss := startHSS(t)
+	hss.answer = func(uint32) (cx.Result, string) {
+		return cx.ExperimentalResult(cx.SubsequentRegistration), scscf.uri()
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.DrainTimeout = 300 * time.Millisecond
+	})
+	r.waitReady(t)
+	reg := r.sendAsyncResponse(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">",
+		"Contact: <sip:127.0.0.1:5070;transport=tcp>;expires=600")
+	<-scscf.got
+	go r.stop()
+	if got := <-reg; got.err != nil || got.res.StatusCode != 503 || got.res.Header.Get("Retry-After") != "5" {
+		t.Errorf("REGISTER left at the stop: %v %v, want 503 with Retry-After 5", got.res, got.err)
 	}
 }

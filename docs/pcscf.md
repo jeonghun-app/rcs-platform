@@ -376,8 +376,8 @@ request is sent over that flow whatever its Route or Request-URI say below.
 - **430.** A request whose Route names no flow, or a flow that is not a live
   client flow of this task (closed, from an earlier start, or a core
   connection), is answered 430 Flow Failed, and so is one whose flow is
-  already gone when it is to be sent. One whose flow closes while it is
-  under way may not get 430 yet
+  already gone when it is to be sent, or closes while it is under way, before
+  its final response: the branch ends when the flow does, not at Timer B or F
   ([#234](https://github.com/jeonghun-app/rcs-platform/issues/234)). The
   430 reaches `scscf` as it is, so that it tries the client's other flows
   (RFC 5626 §5.3). Flow tokens are an HMAC under a key
@@ -433,6 +433,113 @@ request is sent over that flow whatever its Route or Request-URI say below.
   whom the core reached. The client's own network-only headers are gone
   already, removed on arrival.
 
+## MSRP anchoring
+
+`pcscf` anchors every MSRP session of its clients through `msrp-relay`
+([ADR 0004](adr/0004-msrp-anchoring.md), #136), the way a P-CSCF controls an
+IMS access gateway: it rewrites the `m=message` lines of the session's
+offer and answer, so that the client connects to the relay and the relay
+to `rcs-as`, and holds the relay's binding while the session lives. A
+session it cannot anchor is refused or ended; it never runs end to end.
+This version anchors the sessions a client sets up (ADR 0004, first row).
+Until #136's second change anchors the rest, `pcscf` answers 488 to an
+MSRP offer from the core, to an INVITE from the core without an offer
+(the client's 2xx would carry one), and inside a dialog to an MSRP
+description in an INVITE, UPDATE or PRACK and to an INVITE without an
+offer; an ACK with an MSRP description is not passed on.
+
+- **The description.** It is the body of `application/sdp`, or the one
+  `application/sdp` part of a `multipart/*` body, as a chat INVITE
+  carrying its first message has. The other parts go as they came, byte
+  for byte; a rewritten part's own `Content-Length`, if it has one, is
+  made the new length. A description with MSRP lines is written again
+  whole: its other lines keep their meaning, not their spelling (CRLF
+  line ends, one space between fields).
+- **What is refused.** A body `pcscf` cannot split in one way only is
+  answered 488 rather than passed on, since another reader might find a
+  description in it that `pcscf` did not: a message with two
+  `Content-Type` fields, two descriptions, a multipart
+  inside a part, a part header folded or with a `Content-Type` that does
+  not parse or comes twice, a line that starts like a delimiter but is
+  not one, bare LF line ends, a description in a transfer encoding, or
+  with a `Content-Length` other than its length. So is an offer with more
+  than two MSRP lines, a line offering `a=setup:passive` (RFC 6135
+  §4.2.2) or `holdconn`, which `pcscf` cannot answer in kind (RFC 4145
+  §4), and a path the relay would not take: more than one URI (RFC 4976
+  relays), or one that is not MSRP over TCP with a port and a session id.
+  Each is counted in `msrp.refused.offer`.
+- **The offer.** Each MSRP line of the client's INVITE gets a binding
+  (`POST /v1/bindings` with the client's path, for 1800 s), and goes to
+  the core with the relay's core-side path, `a=setup:active` and port 9.
+  The INVITE offers no reliable provisional response: `100rel` is taken
+  out of its `Supported`, since an offer in one would be answered in a
+  PRACK `pcscf` does not anchor, and one whose `Require` has it is
+  answered 420 with `Unsupported: 100rel` (RFC 3261 §8.2.2.3). Nor does it keep a
+  `Record-Route` the client wrote: only `pcscf`'s values go on.
+- **The answer.** The first 1xx or 2xx with a description (#136 decision
+  3) completes each binding with `rcs-as`'s path (`PATCH`) and reaches
+  the client with the relay's client path, `a=setup:passive` (an answer
+  without `a=setup` is passive, RFC 4145 §4), and the relay's port and
+  transport. No address of the core reaches the client: `o=` and the
+  session-level `c=` show the relay's host (or `PCSCF_PUBLIC_HOST` where
+  no binding serves, as for a late offer), and every line but the
+  anchored ones is declined (port 0) without its `c=`, `b=` and `a=`
+  lines, as only MSRP goes through the relay. A line `rcs-as` declined
+  releases its binding. Retransmissions are rewritten the same.
+- **Refusals that wait.** Past a flow's or the task's bindings
+  (`PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_MAX_BINDINGS`), without a relay
+  token, or when the relay fails or does not answer within
+  `PCSCF_RELAY_TIMEOUT`, the INVITE is answered 503 with `Retry-After: 1`
+  (#136 decisions 4 to 6), counted in `msrp.refused.binding_limit` or
+  `msrp.refused.relay`; a binding already made for it is released. Past
+  the bindings a flow may create in a minute
+  (`PCSCF_BINDINGS_PER_MINUTE`, whatever it holds), it is 503 with the
+  seconds until it may, counted in `msrp.refused.binding_rate`. A path
+  the relay refuses (400) is 488, as waiting will not change it.
+- **Ending a dialog.** A 2xx cannot be refused, so a dialog `pcscf` cannot
+  serve is forwarded and then ended: once the client's ACK passes, or
+  32 s after the 2xx, a BYE goes to the client over its flow, as from the
+  far end, and to the core along the route the core recorded below
+  `pcscf`'s values, as from the client, both with a `Reason` and a CSeq
+  past what each side sent in the dialog:
+  - the relay failed at answer time, or the answer could not be read or
+    served (#136 decision 6): `cause=503`, after the binding is released;
+    the client's copy points at the relay, never at `rcs-as`;
+  - an extension the relay answers 404, the binding being gone:
+    `cause=503`, at once;
+  - a 2xx after the session ended, such as one the proxy forwards after
+    Timer C's 408: `cause=503`, with every line declined;
+  - another answer, or a 2xx of another fork (decision 3): `cause=488`,
+    with every line declined. A 2xx of another fork than the first
+    answer's, which came in a 1xx, also releases the bindings at once:
+    they served an early dialog that 2xx ends;
+  - a late offer, an MSRP offer in a 1xx or 2xx of an INVITE without one
+    (decision 2): the lines are declined, and the 2xx's dialog ended with
+    `cause=488`.
+
+  Each is counted once, in `msrp.ended.relay_failed`,
+  `msrp.ended.second_answer` and `msrp.ended.late_offer`, however often
+  the 2xx is retransmitted. A BYE that cannot be built or sent, or that
+  gets a final response other than 2xx and 481, is counted in
+  `msrp.bye_failed` and logged by side and step, naming no one.
+- **Releases.** A binding is released (`DELETE`) on a BYE from either
+  side of the dialog it serves (another fork's BYE ends that dialog
+  alone), a final failure (a 3xx, or a CANCEL's 487, included), the flow
+  closing, a setup no final response ended within 10 minutes, and the
+  dialog being ended as above. The sweep extends the bindings of a
+  confirmed session every 15 minutes (`PATCH` for 1800 s), so a session
+  without a session timer lives as long as its flow (decision 1); an
+  extension that fails is tried again at the next sweep. A flow that
+  closes, and the sweep, never wait for the relay. `msrp.bindings` is the
+  gauge of bindings held, which must come back to zero;
+  `msrp.relay_errors` counts the relay calls that failed.
+
+The control API is reached at `PCSCF_RELAY_URL`, a private host only
+(ADR 0007 §5: the dialer refuses any other address the name resolves to),
+with the bearer token `PCSCF_RELAY_TOKEN`, which in AWS comes from Secrets
+Manager. The token and `client_path`, the client's way into the session,
+never reach a log; errors name the operation and status alone.
+
 ## Settings
 
 Environment variables with the `PCSCF_` prefix, plus the shared ones of
@@ -466,6 +573,11 @@ start with that value.
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | connections the client listener holds among them, counted from accept; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
 | `PCSCF_CORE_CONNECTIONS` | `256` | connections the core listener holds, kept for it |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
+| `PCSCF_RELAY_URL` | `http://msrp-relay.<RCS_SERVICE_NAMESPACE>:8082` | `msrp-relay`'s control API: `http` or `https` of a private host, without a path |
+| `PCSCF_RELAY_TOKEN` | none | `pcscf`'s bearer token for it, from Secrets Manager in AWS; unset or under 43 characters is refused; without one, MSRP sessions are refused |
+| `PCSCF_RELAY_TIMEOUT` | `2s` | one call to the control API |
+| `PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_MAX_BINDINGS` | `16`, `20000` | relay bindings one client flow, and the task, hold |
+| `PCSCF_BINDINGS_PER_MINUTE` | `32` | relay bindings one client flow may create in a minute |
 | `PCSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop spreads the closing of client flows over; plus 5 s it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 
 For production, set `RCS_SHUTDOWN_TIMEOUT` to most of the ECS stop timeout,
@@ -476,7 +588,11 @@ for example `115s`, so that the drain spreads over about 110 s.
 On SIGTERM `pcscf` stops accepting client connections and closes the client
 flows one by one, evenly spread over `PCSCF_DRAIN_TIMEOUT`. A flow that
 already ended takes no time of its own. The core listener stays open until
-the end, so `scscf` can still reach the clients not yet closed. A stopping task's
+the end, so `scscf` can still reach the clients not yet closed. After the last
+flow, `pcscf` spends up to 4 s of the 5 s margin on the requests still in
+progress: up to 2 s waiting for them, then it answers what is left 500 with
+`Retry-After` (`proxy.Drain`, #281), so its sender tries another task at
+once, and waits up to 2 s more for those answers to be written. The wait is also what lets a request on one of the last flows closed get its 430 first (#234). A stopping task's
 clients then reconnect to another task and re-register over the stop
 timeout, not all at once, and `hss` and `scscf` are sized for that burst
 ([ADR 0003](adr/0003-aws-topology.md)).
