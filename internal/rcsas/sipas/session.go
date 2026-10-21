@@ -54,7 +54,16 @@ type session struct {
 	// reserved is set while a session rcs-as started holds its place
 	// before its 2xx (Server.reserve); guarded by the Server's mu.
 	reserved bool
-	mode     store.Mode
+	// live is set once the session's first answer is on its way: rcs-as's
+	// 2xx to a client's INVITE, or its ACK to the client's 2xx. A BYE
+	// before it would end a dialog the other side does not have yet
+	// (#270). Guarded by the Server's mu.
+	live bool
+	// confirmed is closed once the dialog is confirmed both ways (confirm);
+	// addSession makes it.
+	confirmed   chan struct{}
+	confirmOnce sync.Once
+	mode        store.Mode
 	// inv is the invitation of a session rcs-as started; zero otherwise.
 	inv messaging.Invitation
 
@@ -101,7 +110,13 @@ var (
 // addSession makes ss reachable by the requests in its dialog, unless s
 // is closing or a bound on sessions is reached (threat model T9). A session
 // rcs-as started holds its place already (reserve), which it takes over.
-func (s *Server) addSession(ss *session) error {
+//
+// The session it adds is being answered until answered is called, which
+// the caller defers once addSession succeeds: once the session's first
+// answer has gone (rcs-as's 2xx to a client's INVITE, or its ACK of the
+// client's 2xx), or the session ended before. Until then Close sends it no
+// BYE (#270). On an error, answered does nothing.
+func (s *Server) addSession(ss *session) (answered func(), err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ss.reserved {
@@ -109,16 +124,57 @@ func (s *Server) addSession(ss *session) error {
 		s.pending--
 		if s.closed {
 			s.dropUser(ss)
-			return errClosing
+			return func() {}, errClosing
 		}
 	} else {
 		if err := s.roomFor(ss); err != nil {
-			return err
+			return func() {}, err
 		}
 		s.perUser[ss.budget()]++
 	}
 	s.sessions[ss.d.ID()] = ss
-	return nil
+	ss.confirmed = make(chan struct{})
+	s.answering.Add(1)
+	var once sync.Once
+	return func() { once.Do(func() { s.settle(ss) }) }, nil
+}
+
+// settle marks a session that addSession took as live, its first answer
+// having gone, or as done with if it ended before. A session that becomes
+// live while s is closing is ended now, once its dialog is confirmed or
+// closeWait has passed: Close waited for it, up to its bound, and leaves
+// the BYE of one it did not see live to this.
+func (s *Server) settle(ss *session) {
+	s.mu.Lock()
+	ss.live = true
+	closed := s.closed
+	s.mu.Unlock()
+	s.answering.Done()
+	if closed {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), s.closeWait())
+			defer cancel()
+			ss.byeConfirmed(ctx)
+		}()
+	}
+}
+
+// confirm records that the session's dialog is confirmed both ways: the
+// client's ACK of rcs-as's 2xx came, or never will (proxy.ErrNoACK), or
+// rcs-as sent its own ACK.
+func (ss *session) confirm() { ss.confirmOnce.Do(func() { close(ss.confirmed) }) }
+
+// byeConfirmed ends the session with a BYE once its dialog is confirmed,
+// or once ctx ends: a callee must not send a BYE before the 2xx's ACK
+// comes or its transaction times out (RFC 3261 §15), since the BYE could
+// overtake the 2xx; a shutdown cannot wait as long. What it returns is
+// bye's.
+func (ss *session) byeConfirmed(ctx context.Context) <-chan struct{} {
+	select {
+	case <-ss.confirmed:
+	case <-ctx.Done():
+	}
+	return ss.bye("")
 }
 
 // reserve holds a place for a session rcs-as is about to start for ss's
@@ -237,33 +293,59 @@ func (s *Server) sessionOf(req *sip.Request) *session {
 	return s.sessions[id]
 }
 
-// closeWait bounds how long Close waits for the answers to its BYEs.
+// closeWait bounds each of Close's two waits: for the sessions still being
+// answered and their ACKs, and for the answers to its BYEs.
 const closeWait = 2 * time.Second
 
+func (s *Server) closeWait() time.Duration {
+	if s.cfg.closeWait > 0 {
+		return s.cfg.closeWait
+	}
+	return closeWait
+}
+
 // Close ends every session with a BYE, before the transport closes, and
-// takes no new one. It waits for the BYEs' answers, up to closeWait: the
-// transport writes a request after SendRequest returns, and closing it at
-// once could drop the BYE.
+// takes no new one. A session still being answered is answered first, and
+// a session's BYE waits for the 2xx's ACK (RFC 3261 §15), both up to
+// closeWait. Then it waits for the BYEs' answers, up to closeWait again:
+// the transport writes a request after SendRequest returns, and closing it
+// at once could drop the BYE. So Close takes at most twice closeWait.
 func (s *Server) Close() {
 	s.mu.Lock()
 	s.closed = true
+	s.mu.Unlock()
+	wait := s.closeWait()
+	// One bound for every session's answer and ACK: a closed Done reaches
+	// every waiter.
+	answering, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	// A session whose first answer has not gone yet, as one whose first
+	// message is being stored, gets it first: its BYE follows its 2xx
+	// (#270), from settle if it comes too late for this.
+	answered := make(chan struct{})
+	go func() { s.answering.Wait(); close(answered) }()
+	select {
+	case <-answered:
+	case <-answering.Done():
+	}
+	s.mu.Lock()
 	all := make([]*session, 0, len(s.sessions))
 	for _, ss := range s.sessions {
-		all = append(all, ss)
+		if ss.live {
+			all = append(all, ss)
+		}
 	}
 	s.mu.Unlock()
-	wait := s.cfg.closeWait
-	if wait <= 0 {
-		wait = closeWait
-	}
-	// One bound for all of them: a closed Done reaches every waiter.
-	ctx, cancel := context.WithTimeout(context.Background(), wait)
-	defer cancel()
 	var wg sync.WaitGroup
 	for _, ss := range all {
 		wg.Go(func() {
+			done := ss.byeConfirmed(answering)
+			// The BYE's answer has a budget of its own, whatever the
+			// answers above took.
+			ctx, cancel := context.WithTimeout(context.Background(), wait)
+			defer cancel()
 			select {
-			case <-ss.bye(""):
+			case <-done:
 			case <-ctx.Done():
 			}
 		})
@@ -502,7 +584,9 @@ func containsFold(list []string, v string) bool {
 // has made its delivery (messaging.Leg.Finished).
 func (ss *session) watch(u *proxy.UAS) {
 	if u != nil {
-		if _, err := u.ACK(context.Background()); errors.Is(err, proxy.ErrNoACK) {
+		_, err := u.ACK(context.Background())
+		ss.confirm()
+		if errors.Is(err, proxy.ErrNoACK) {
 			ss.s.cfg.Metrics.Count("sip.session.no_ack", 1)
 			ss.bye("")
 			return

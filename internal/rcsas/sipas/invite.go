@@ -216,8 +216,12 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	ss.mu.Unlock()
 	// Known before the ACK leaves, so that a BYE right behind it finds
 	// the session.
-	added := s.addSession(ss)
+	answered, added := s.addSession(ss)
 	s.sendACK(ack, next)
+	if added == nil {
+		ss.confirm()
+	}
+	answered()
 	if added != nil {
 		// The session cannot be kept: it is ended, and the message waits
 		// for the next one.
