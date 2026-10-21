@@ -554,6 +554,46 @@ func TestTheWatchdogSendsNoDWRAfterTheDPR(t *testing.T) {
 	}
 }
 
+// The same on the side that answers the peer's DPR: a watchdog interval
+// that passes while the node drains its handlers before the DPA sends no
+// DWR, which would reach the wire ahead of the DPA (code review of #383).
+func TestTheWatchdogSendsNoDWRWhileDrainingBeforeTheDPA(t *testing.T) {
+	started, release := make(chan *Message, 1), make(chan struct{})
+	scscf, peer, dialer, clock := startInitiator(t, func(c *Config) { c.WatchdogInterval = MinWatchdogInterval })
+	scscf.Handle(appCx, cmdTest, blockingHandler(scscf, started, release))
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "peer to open", peer.Available)
+	c := peer.current()
+	s.request(&Message{Code: cmdTest, ApplicationID: appCx, AVPs: s.origin()})
+	<-started
+	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	waitFor(t, "the DPR to be read", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.closing
+	})
+	c.mu.Lock()
+	armed := c.wdTimer
+	c.mu.Unlock()
+	clock.Advance(MinWatchdogInterval + 100*time.Millisecond)
+	waitFor(t, "the watchdog to run", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.wdTimer != armed
+	})
+	close(release)
+	for {
+		m := s.read()
+		if m.IsRequest() {
+			t.Fatalf("request %d before the DPA", m.Code)
+		}
+		if m.Code == CodeDisconnectPeer && m.HopByHop == dpr.HopByHop {
+			return
+		}
+	}
+}
+
 // A DWR already in the control queue when the writer takes the DPR is not
 // written after it either (#376).
 func TestADWRQueuedAsTheDPRGoesIsDropped(t *testing.T) {
