@@ -199,9 +199,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// requests are answered, and the sweeps stop.
 	stopSweeps()
 	sweeps.Wait()
-	router.Stop()
+	// The router and the notifier share what is left of the budget: an
+	// application server or a P-CSCF that does not answer holds neither
+	// past it (#439 QA).
 	waitCtx, cancelWait := context.WithDeadline(context.Background(), stopBy)
 	defer cancelWait()
+	if !router.StopBy(waitCtx) {
+		rt.Logger.Info("gave up on third-party REGISTERs at the stop")
+	}
 	if !notifier.WaitFor(waitCtx) {
 		rt.Logger.Info("left NOTIFYs to the sweeps of the other tasks")
 	}

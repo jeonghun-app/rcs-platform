@@ -121,16 +121,16 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 		rt.tp.wg.Add(1)
 		go func() {
 			defer rt.tp.wg.Done()
-			if prev != nil {
-				<-prev
+			if rt.turn(prev, q.slots) {
+				rt.tp.mu.Lock()
+				p.sent = true
+				r, server := p.r, p.server
+				rt.tp.mu.Unlock()
+				rt.registerWith(ctx, r, server)
+				<-q.slots
+			} else {
+				rt.count("routing.third_party.dropped_at_stop")
 			}
-			q.slots <- struct{}{}
-			rt.tp.mu.Lock()
-			p.sent = true
-			r, server := p.r, p.server
-			rt.tp.mu.Unlock()
-			rt.registerWith(ctx, r, server)
-			<-q.slots
 			rt.tp.mu.Lock()
 			q.queued--
 			if sq.queued--; sq.queued == 0 {
@@ -140,6 +140,30 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 			close(done)
 		}()
 	}
+}
+
+// turn waits for the set's registration before this one, prev, to be done
+// and for one of the server's slots, and takes the slot. It is false, with
+// no slot taken, once StopBy has given up.
+func (rt *Router) turn(prev, slots chan struct{}) bool {
+	if prev != nil {
+		select {
+		case <-prev:
+		case <-rt.halted.Done():
+			return false
+		}
+	}
+	select {
+	case slots <- struct{}{}:
+	case <-rt.halted.Done():
+		return false
+	}
+	// Both may have been ready: a stop that gave up sends nothing more.
+	if rt.halted.Err() != nil {
+		<-slots
+		return false
+	}
+	return true
 }
 
 // enqueue queues p, a registration of the set key for server, and returns
@@ -211,9 +235,14 @@ func (rt *Router) registerWith(ctx context.Context, r registrar.ThirdPartyRegist
 		rt.internalLog("building a third-party REGISTER", err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, rt.cfg.ThirdPartyTimeout)
+	ctx, cancel := rt.bounded(ctx, rt.cfg.ThirdPartyTimeout)
 	defer cancel()
 	res, err := rt.cfg.Sender.Send(ctx, req)
+	if err != nil && rt.halted.Err() != nil {
+		// Cut short by the stop, not unanswered: no default handling.
+		rt.count("routing.third_party.dropped_at_stop")
+		return
+	}
 	switch {
 	case err == nil && res.StatusCode < 300:
 		rt.count("routing.third_party.registered")

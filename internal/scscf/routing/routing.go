@@ -176,6 +176,11 @@ type Router struct {
 	// once Stop waits (#379 QA).
 	stop    sync.Mutex
 	stopped bool
+	// halted ends once StopBy gives up waiting: the repairs and the
+	// third-party registrations under way are cut short, and those waiting
+	// for their turn are dropped.
+	halted context.Context
+	halt   context.CancelFunc
 }
 
 // New validates cfg and returns a Router.
@@ -252,6 +257,7 @@ func New(cfg Config) (*Router, error) {
 	}
 	rt := &Router{cfg: cfg, log: log, ids: sip.IDGenerator{Rand: cfg.Rand}}
 	rt.tp.servers = map[string]*serverQueue{}
+	rt.halted, rt.halt = context.WithCancel(context.Background())
 	return rt, nil
 }
 
@@ -261,16 +267,45 @@ func (noMetrics) Count(string, int64) {}
 
 func (rt *Router) count(name string) { rt.cfg.Metrics.Count(name, 1) }
 
-// Stop stops the Router from starting identity repairs and third-party
-// registrations, and returns once those under way are done: for a
-// shutdown, once the registrar tells it of no more, and for tests.
-// Requests are still routed.
-func (rt *Router) Stop() {
+// Stop is StopBy with no bound.
+func (rt *Router) Stop() { rt.StopBy(context.Background()) }
+
+// StopBy stops the Router from starting identity repairs and third-party
+// registrations, and waits for those under way until ctx ends; then it
+// gives them up, counting each third-party registration sent or waiting as
+// routing.third_party.dropped_at_stop, and returns false. A shutdown calls
+// it once the registrar tells it of no more, with what is left of
+// RCS_SHUTDOWN_TIMEOUT, which a server that does not answer would
+// otherwise overrun by its ThirdPartyTimeout (#439 QA). Requests are still
+// routed.
+func (rt *Router) StopBy(ctx context.Context) bool {
 	rt.stop.Lock()
 	rt.stopped = true
 	rt.stop.Unlock()
-	rt.repairs.Wait()
-	rt.tp.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		rt.repairs.Wait()
+		rt.tp.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+	}
+	rt.halt()
+	<-done
+	return false
+}
+
+// bounded is ctx ended by d, or by StopBy giving up, whichever is first.
+func (rt *Router) bounded(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	unhook := context.AfterFunc(rt.halted, cancel)
+	return ctx, func() {
+		unhook()
+		cancel()
+	}
 }
 
 // internalLog logs a failure by its step and error, which name no identity.
