@@ -312,16 +312,29 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		if !ok {
 			return nil, errors.New("got a request")
 		}
-		if res.StatusCode >= 200 {
+		if res.StatusCode >= 200 && answers(res, callID, cseq, m.method) {
 			return res, nil
 		}
 	}
+}
+
+// answers reports whether res answers the request with callID and CSeq
+// seq method: a retransmitted 2xx of an earlier INVITE on the same
+// connection, sent again until its ACK arrives (RFC 3261 §13.3.1.4), is
+// not the answer to the next request (#303).
+func answers(res *sip.Response, callID string, seq int, method string) bool {
+	c, err := res.Header.CSeq()
+	return err == nil && res.Header.Get("Call-ID") == callID && int(c.Seq) == seq && c.Method == method
 }
 
 // forward sends req as the core would, after its own processing, and
 // returns its final response.
 func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 	b, err := req.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	cseq, err := req.Header.CSeq()
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +347,7 @@ func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 {
+		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 && answers(res, req.Header.Get("Call-ID"), int(cseq.Seq), req.Method) {
 			return res, nil
 		}
 	}

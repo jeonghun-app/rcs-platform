@@ -52,11 +52,21 @@ toolchain:
 	  $(DOCKER) build -q -f deploy/toolchain.Dockerfile -t $(GOIMAGE) deploy >/dev/null
 
 # The cache volumes are created root-owned; hand them to the calling user once so
-# the toolchain container can run unprivileged.
+# the toolchain container can run unprivileged. Every target runs this, and a
+# chown -R over a full cache takes minutes when several makes run at once (#360),
+# so it runs only while a volume root or one of its top-level entries belongs to
+# someone else. Anything deeper that a root container wrote is not looked for;
+# `make clean` drops the volumes.
 .PHONY: volumes
 volumes: toolchain
 	@$(DOCKER) run --rm -v $(GOCACHE_VOL):/gocache -v $(GOMOD_VOL):/gomodcache \
-	  $(GOIMAGE) chown -R $(shell id -u):$(shell id -g) /gocache /gomodcache
+	  $(GOIMAGE) sh -c 'u=$(shell id -u); g=$(shell id -g); \
+	    for d in /gocache /gomodcache; do \
+	      if [ "$$(stat -c %u:%g "$$d")" != "$$u:$$g" ] || \
+	        [ -n "$$(find "$$d" -maxdepth 1 \( ! -user "$$u" -o ! -group "$$g" \) | head -n 1)" ]; then \
+	        echo "volumes: handing $$d to $$u:$$g"; chown -R "$$u:$$g" "$$d"; \
+	      fi; \
+	    done'
 
 .PHONY: tidy
 tidy: volumes ## Resolve dependencies and write go.sum
