@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -86,6 +87,16 @@ func (g *groupRig) again(t *testing.T, sub *subscribed, expires string) *sip.Res
 	return g.p.send(msg{method: "SUBSCRIBE", uri: g.uri, callID: sub.callID, cseq: sub.cseq,
 		from: "<" + sub.who + ">;tag=" + sub.fromTag, to: "<" + g.uri + ">;tag=" + sub.toTag,
 		fields: []string{"Event: conference", "Expires: " + expires}})
+}
+
+// after reports whether req is a NOTIFY of the subscription of first that
+// came after it: the core's answer to first may be made only after a test
+// changes how the core answers.
+func after(req, first *sip.Request) bool {
+	c, err1 := req.Header.CSeq()
+	f, err2 := first.Header.CSeq()
+	return err1 == nil && err2 == nil && req.Method == "NOTIFY" &&
+		req.Header.Get("Call-ID") == first.Header.Get("Call-ID") && c.Seq > f.Seq
 }
 
 // notified is a NOTIFY rcs-as sent and the document it carries, if any.
@@ -417,9 +428,10 @@ func TestAGapInTheVersionsSendsTheFullRoster(t *testing.T) {
 func TestARefusedNotifyEndsTheSubscription(t *testing.T) {
 	g := newGroupRig(t, bob, carol)
 	g.subscribe(t, alice, "600")
-	g.nextNotify(t)
+	first := g.nextNotify(t)
 	g.core.setAnswer(func(req *sip.Request) int {
-		if req.Method == "NOTIFY" {
+		// Not the first NOTIFY, which the core may answer only now.
+		if after(req, first.req) {
 			return 481
 		}
 		return 200
@@ -472,7 +484,8 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	// Without Refer-Sub: false, the implicit subscription starts with
 	// "100 Trying" (RFC 3515 §2.4.4) and ends with how the focus's INVITE
 	// ended. bob, invited already and rung at the group's creation, gets
-	// no second INVITE, so the subscription ends at its bound.
+	// no second INVITE, so the subscription ends at its bound, with 480 as
+	// for any failure.
 	grp, _ := g.groups.Get(t.Context(), g.uri)
 	if res := g.inSession(t, alice, "a1", g.s, 5, "REFER", []string{"Refer-To: <" + bob + ">"}, ""); res.StatusCode != 202 {
 		t.Fatalf("a REFER for bob answered %d", res.StatusCode)
@@ -484,7 +497,7 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	}
 	g.clock.fire(referWait)
 	n = g.core.nextOf(t, "NOTIFY")
-	if !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") || string(n.Body) != "SIP/2.0 408 Request Timeout\r\n" {
+	if !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") || string(n.Body) != "SIP/2.0 480 Temporarily Unavailable\r\n" {
 		t.Fatalf("refer NOTIFY State %q: %q", n.Header.Get("Subscription-State"), n.Body)
 	}
 	g.a.srv.mu.Lock()
@@ -606,8 +619,10 @@ func TestCloseWaitsForTheLastNotifysAnswer(t *testing.T) {
 }
 
 // QA on #340: a REFER's implicit subscription ends with the outcome of the
-// focus's INVITE it caused, here the invitee's 486, not a 200 sent before
-// the INVITE went out.
+// focus's INVITE it caused, not a 200 sent before the INVITE went out. A
+// failure, here the invitee's 486, is told as 480 alone, so that the
+// referrer does not learn whether the number is a subscriber or online
+// (security review on #340).
 func TestAReferNotifiesTheInvitesOutcome(t *testing.T) {
 	g := newGroupRig(t, bob)
 	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
@@ -621,8 +636,67 @@ func TestAReferNotifiesTheInvitesOutcome(t *testing.T) {
 		}
 	}
 	if !strings.HasPrefix(bodies[0], "active") || !strings.HasSuffix(bodies[0], "100 Trying\r\n") ||
-		!strings.HasPrefix(bodies[1], "terminated") || !strings.HasSuffix(bodies[1], "486 Busy Here\r\n") {
+		!strings.HasPrefix(bodies[1], "terminated") || !strings.HasSuffix(bodies[1], "480 Temporarily Unavailable\r\n") {
 		t.Fatalf("refer NOTIFYs %q", bodies)
+	}
+}
+
+// QA on #340: a REFER's implicit subscription ends with 200 once the
+// invitee's session is up, and with 200 for a removal, rather than with a
+// failure at its bound.
+func TestAReferReportsTheSuccessOfAnAdditionAndARemoval(t *testing.T) {
+	g := newGroupRig(t, bob)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			return []*sip.Response{g.answerInvite(t, req, relayPath(), "active")}
+		}
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	final := func(id string) string {
+		t.Helper()
+		for {
+			n := g.core.nextOf(t, "NOTIFY")
+			if n.Header.Get("Event") == "refer;id="+id && strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") {
+				return string(n.Body)
+			}
+		}
+	}
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	if body := final("2"); body != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("addition ended with %q", body)
+	}
+	if res := g.inSession(t, alice, "a1", g.s, 3, "REFER", []string{"Refer-To: <" + carol + ";method=BYE>"}, ""); res.StatusCode != 202 {
+		t.Fatalf("remove answered %d", res.StatusCode)
+	}
+	if body := final("3"); body != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("removal ended with %q", body)
+	}
+}
+
+// QA on #340: a focus INVITE whose 2xx sets up no dialog, here one
+// without a Contact, fails at once, and so does the REFER that asked for
+// it: 480 then, not at the bound.
+func TestAReferReportsAnInviteWithoutADialogAsAFailure(t *testing.T) {
+	g := newGroupRig(t, bob)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	for {
+		n := g.core.nextOf(t, "NOTIFY")
+		if n.Header.Get("Event") != "refer;id=2" || !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") {
+			continue
+		}
+		if string(n.Body) != "SIP/2.0 480 Temporarily Unavailable\r\n" || g.metrics.get("sip.invite.no_dialog") != 1 {
+			t.Fatalf("ended with %q, %d INVITEs without a dialog", n.Body, g.metrics.get("sip.invite.no_dialog"))
+		}
+		return
 	}
 }
 
@@ -681,14 +755,15 @@ func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
 func TestANotifyRefusedForAPassingReasonKeepsTheSubscription(t *testing.T) {
 	g := newGroupRig(t, bob, carol)
 	_, sub := g.subscribe(t, alice, "600")
-	g.nextNotify(t)
+	first := g.nextNotify(t)
 	var refused atomic.Bool
 	g.core.setReply(func(req *sip.Request) []*sip.Response {
 		code := 200
 		if req.Method == "INVITE" {
 			code = 486
 		}
-		if req.Method == "NOTIFY" && refused.CompareAndSwap(false, true) {
+		// Not the first NOTIFY, which the core may answer only now.
+		if after(req, first.req) && refused.CompareAndSwap(false, true) {
 			code = 503
 		}
 		res, _ := sip.NewResponse(req, code, "", "core1")
@@ -706,6 +781,27 @@ func TestANotifyRefusedForAPassingReasonKeepsTheSubscription(t *testing.T) {
 	}
 	if res := g.again(t, &sub, "600"); res.StatusCode != 200 {
 		t.Fatalf("refresh answered %d", res.StatusCode)
+	}
+	g.nextNotify(t) // the refresh's full roster
+	// A refresh's full roster also brings a stale subscription up to
+	// date: the change after it is a partial document again.
+	refused.Store(false)
+	if err := g.groups.Add(t.Context(), g.uri, alice, []group.Invitee{{Identity: dave}}); err != nil {
+		t.Fatal(err)
+	}
+	g.nextNotify(t) // refused
+	waitUntil(t, "the subscription marked stale again", func() bool { return g.metrics.get("sip.subscription.stale") == 2 })
+	if res := g.again(t, &sub, "600"); res.StatusCode != 200 {
+		t.Fatalf("refresh answered %d", res.StatusCode)
+	}
+	if n := g.nextNotify(t); n.doc.State != conference.Full {
+		t.Fatalf("refresh sent a %s document", n.doc.State)
+	}
+	if err := g.groups.Add(t.Context(), g.uri, alice, []group.Invitee{{Identity: erin}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := g.nextNotify(t); n.doc.State != conference.Partial {
+		t.Fatalf("after a refresh, a %s document", n.doc.State)
 	}
 }
 
@@ -865,7 +961,10 @@ func TestTheFactoryIsFoundInAnySpelling(t *testing.T) {
 
 // Security review on #340: with group chat off (RCSAS_GROUP_CHAT_ENABLED),
 // a request to the factory or a conference URI is 404 and makes nothing;
-// it is not taken for a 1-to-1 chat either.
+// it is not taken for a 1-to-1 chat either. The engine's invitation of a
+// group's participant is answered offline, not undeliverable, so that
+// what is queued for it waits for group chat to be turned on again (code
+// review and QA on #340).
 func TestGroupChatOffRefusesEveryGroupRequest(t *testing.T) {
 	r := newChatRigWith(t, messaging.Config{}, Config{groupChatOff: true})
 	p := r.a.dial(t)
@@ -881,6 +980,13 @@ func TestGroupChatOffRefusesEveryGroupRequest(t *testing.T) {
 	}
 	if n := r.groupReads.gets.Load(); n != 0 {
 		t.Fatalf("%d store reads", n)
+	}
+	err := r.a.srv.Invite(t.Context(), messaging.Invitation{Recipient: bob, Peer: uri, Mode: store.Group})
+	if !errors.Is(err, messaging.ErrOffline) || errors.Is(err, messaging.ErrUndeliverable) {
+		t.Fatalf("a group invitation with group chat off: %v", err)
+	}
+	if n := r.metrics.get("leg.opened"); n != 0 {
+		t.Fatalf("%d legs opened for it", n)
 	}
 }
 

@@ -101,7 +101,7 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 		if removed, ok := messaging.UserOf(who[0].Identity, s.cfg.HomeDomain); ok {
 			s.removed(ss.group, removed)
 		}
-		w.finish(200)
+		w.finish(true)
 		return
 	}
 	s.cfg.Metrics.Count("sip.group.added", 1)
@@ -112,7 +112,9 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 // subscription (RFC 4488 §4), as rcsjta does, the subscription starts with
 // a NOTIFY of "SIP/2.0 100 Trying" (RFC 3515 §2.4.4) and ends with the
 // outcome of what the REFER asked for, which the returned referWatch
-// reports; nil when there is none.
+// reports; nil when there is none. The outcome is only 200 or 480, never
+// the invitee's own answer, which would tell the referrer whether a number
+// is a subscriber and whether it is online (security review on #340).
 func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) *referWatch {
 	noSub := strings.EqualFold(strings.TrimSpace(req.Header.Get("Refer-Sub")), "false")
 	ss.mu.Lock()
@@ -140,12 +142,13 @@ func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) *r
 	w.event.Params.Set("id", strconv.FormatUint(uint64(cseq.Seq), 10))
 	active := sip.SubscriptionState{State: "active"}
 	active.Params.Set("expires", strconv.Itoa(int(referWait/time.Second)))
-	w.send(active, 100)
 	// The outcome may never come, as for an invitation the engine does
-	// not send; the subscription ends all the same.
+	// not send; the subscription ends all the same. The bound is armed
+	// before the first NOTIFY, so that it runs from the 202.
 	w.mu.Lock()
-	w.timer = s.cfg.Clock.AfterFunc(referWait, func() { w.finish(408) })
+	w.timer = s.cfg.Clock.AfterFunc(referWait, func() { w.finish(false) })
 	w.mu.Unlock()
+	w.send(active, 100)
 	return w
 }
 
@@ -153,8 +156,9 @@ func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) *r
 // focus's INVITE may ring (RCSAS_ANSWER_TIMEOUT) and be cancelled.
 const referWait = 2 * time.Minute
 
-// referWatch is the implicit subscription of a REFER that added someone
-// (RFC 3515): it ends with a NOTIFY of the outcome of the focus's INVITE.
+// referWatch is the implicit subscription of a REFER (RFC 3515): it ends
+// with a NOTIFY of the outcome, for an addition of one person the
+// outcome of the focus's INVITE.
 type referWatch struct {
 	ss    *session
 	event sip.Event
@@ -186,10 +190,16 @@ func (w *referWatch) send(state sip.SubscriptionState, code int) {
 	}
 }
 
-// finish ends the subscription with code, once; nil does nothing.
-func (w *referWatch) finish(code int) {
+// finish ends the subscription, once, with "200 OK" if what the REFER
+// asked for came about and "480 Temporarily Unavailable" for any failure,
+// a timeout included; nil does nothing.
+func (w *referWatch) finish(ok bool) {
 	if w == nil {
 		return
+	}
+	code := 480
+	if ok {
+		code = 200
 	}
 	w.once.Do(func() {
 		w.mu.Lock()
@@ -239,8 +249,8 @@ func (s *Server) unwatchRefer(w *referWatch) {
 }
 
 // referDone tells the REFERs that asked for the focus's INVITE to who in
-// the group uri how it ended.
-func (s *Server) referDone(uri, who string, code int) {
+// the group uri whether it set up a session.
+func (s *Server) referDone(uri, who string, ok bool) {
 	if uri == "" {
 		return // a 1-to-1 session: no REFER waits for it
 	}
@@ -250,7 +260,7 @@ func (s *Server) referDone(uri, who string, code int) {
 	delete(s.refers, k)
 	s.mu.Unlock()
 	for _, w := range ws {
-		w.finish(code)
+		w.finish(ok)
 	}
 }
 
@@ -280,7 +290,7 @@ func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Con
 	cancel()
 	if err != nil {
 		s.cfg.Metrics.Count("sip.group.invite_failed", 1)
-		w.finish(500)
+		w.finish(false)
 		return
 	}
 	invited := map[string]bool{}
@@ -295,7 +305,7 @@ func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Con
 	if p, ok := oneInvited(g, invited); ok {
 		s.watchRefer(uri, p, w)
 	} else {
-		w.finish(200)
+		w.finish(true)
 	}
 	s.inviteInvited(g, conv, invited, referrer)
 }

@@ -559,9 +559,11 @@ has a session with it: a leg of mode `group` whose peer is that URI.
 Group chat is off unless `RCSAS_GROUP_CHAT_ENABLED=true`. While it is off, a
 request to the conference factory or to a URI at the conference host is
 answered 404 (`sip.group.disabled`), before anything is read or created; it is
-not taken for a 1-to-1 request either. Turn it on with rcs-as on a single task
-until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) (see
-below).
+not taken for a 1-to-1 request either. Group messages already queued are kept:
+their recipients are taken as offline, so the messages wait up to
+`RCSAS_STORE_TTL` and go once group chat is on again. Turn it on with rcs-as on
+a single task until
+[#121](https://github.com/jeonghun-app/rcs-platform/issues/121) (see below).
 
 How the SIP layer serves it:
 
@@ -656,8 +658,8 @@ How the SIP layer serves it:
   410, 416, 480 to 485, 489, 501 or 604 (RFC 6665 §4.2.2) or 430 (RFC 5626),
   ends the subscription without another. Any other failure, as a 503 from a
   busy proxy, keeps it (`sip.subscription.stale`): the subscriber missed a
-  document, so the next change sends the full roster, and its refresh is
-  answered as usual. A participant who leaves, declines or is removed gets
+  document, so the next change sends the full roster, unless a refresh,
+  answered as usual with the full roster, brought it up to date first. A participant who leaves, declines or is removed gets
   the change that says so, and its subscriptions end with it. On
   shutdown each subscription ends with `reason=deactivated`, so that the
   subscriber may subscribe again at once, to another task. Subscriptions are
@@ -674,12 +676,14 @@ How the SIP layer serves it:
   4488), as rcsjta sends, the 202 says so and there is no implicit
   subscription. Without it, the subscription (`Event: refer`,
   `message/sipfrag`, RFC 3515 §2.4.4) starts with `SIP/2.0 100 Trying` and
-  ends with the outcome: for a REFER that adds one person not yet in the
-  group, the focus's INVITE's (`200 OK` once it is answered 2xx and the
-  session is up, else its final code, `408` if it got none); for a removal,
-  a list, or someone in the group already, `200 OK` once the group has
-  changed. One that hears nothing for 2 minutes ends with `408`, as for
-  someone invited already whom the focus does not ring again. A REFER outside a
+  ends with `200 OK` or `480 Temporarily Unavailable`. For a REFER that adds
+  one person not yet in the group, it is `200 OK` once the focus's INVITE is
+  answered 2xx and the session is up, and `480` for any failure. For a
+  removal, a list, or someone in the group already, it is `200 OK` once the
+  group has changed. One that hears nothing for 2 minutes ends with `480`,
+  as for someone invited already whom the focus does not ring again. The
+  invitee's own answer is never passed on: it would tell the referrer
+  whether a number is a subscriber and whether it is online. A REFER outside a
   session, or in a 1-to-1 one, is 405.
 - Other answers: 403 for a rate limit or a group too large, 400 for a request
   the group cannot take (nobody else in the list), 500 with `Retry-After: 1`
@@ -996,7 +1000,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
 | `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as`, and must not be `RCS_IMS_DOMAIN`, whose users' requests would all be taken for a group's |
-| `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404. Turn it on with a single rcs-as task until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) |
+| `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404, and queued group messages wait (up to `RCSAS_STORE_TTL`) instead of being given up. Turn it on with a single rcs-as task until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) |
 | `RCSAS_CONFERENCE_FACTORY_URI` | `sip:conf-factory@<RCS_IMS_DOMAIN>` | Where clients create group chats: the `ConfFctyURI` ACS provisions. A SIP URI with a user; its user is compared with escapes undone and without case, its host without case |
 | `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
 | `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200. Former participants are kept up to the same number, fewer above 104, so that the roster stays within 256 KiB (see [Roster events](#roster-events)) |

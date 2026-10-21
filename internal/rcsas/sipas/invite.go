@@ -36,8 +36,15 @@ const cancelWait = 32 * time.Second
 // before its leg is put to work. A 603 Decline is the participant leaving
 // (declined), and goes to no InviteFailed.
 func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
-	if inv.Mode == store.Group && (s.groups == nil || !s.cfg.GroupChat) {
+	if inv.Mode == store.Group && s.groups == nil {
 		return fmt.Errorf("sipas: no groups: %w", messaging.ErrUndeliverable)
+	}
+	if inv.Mode == store.Group && !s.cfg.GroupChat {
+		// Off (RCSAS_GROUP_CHAT_ENABLED): the participant is taken as
+		// offline, so that what is queued for it waits, up to its storage
+		// time, for group chat to be turned on again rather than being
+		// given up (code review on #340).
+		return fmt.Errorf("sipas: group chat is off: %w", messaging.ErrOffline)
 	}
 	ss := &session{s: s, user: inv.Recipient, mode: inv.Mode, inv: inv}
 	if inv.Mode == store.Group {
@@ -152,14 +159,14 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 	case err != nil:
 		ss.final = true
 		s.cfg.Metrics.Count("sip.invite.timeout", 1)
-		go s.referDone(ss.group, ss.user, 408)
+		go s.referDone(ss.group, ss.user, false)
 		go ss.fail(fmt.Errorf("sipas: invite: %w", messaging.ErrOffline))
 	case res.StatusCode < 200:
 	case res.StatusCode >= 300:
 		if !ss.final {
 			ss.final = true
 			s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.%d", res.StatusCode), 1)
-			go s.referDone(ss.group, ss.user, res.StatusCode)
+			go s.referDone(ss.group, ss.user, false)
 			if ss.group != "" && res.StatusCode == 603 {
 				go ss.declined()
 				return
@@ -203,6 +210,7 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 
 // fail ends a session that did not come about, and tells the engine.
 func (ss *session) fail(err error) {
+	ss.s.referDone(ss.group, ss.user, false)
 	ss.s.release(ss)
 	ss.s.engine.InviteFailed(ss.inv, err)
 	ss.end()
@@ -238,6 +246,7 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	if added != nil {
 		// The session cannot be kept: it is ended, and the message waits
 		// for the next one.
+		s.referDone(ss.group, ss.user, false)
 		s.engine.InviteFailed(ss.inv, fmt.Errorf("%w: %w", added, messaging.ErrOffline))
 		ss.bye("")
 		return
@@ -250,6 +259,7 @@ func (s *Server) established(ss *session, res *sip.Response) {
 		// A BYE ended the session meanwhile, and told the engine what
 		// it had to (inDialog): nothing more reaches it.
 		s.cfg.Metrics.Count("sip.invite.ended_early", 1)
+		s.referDone(ss.group, ss.user, false)
 		return
 	}
 	if err == nil && ss.group != "" {
@@ -266,12 +276,12 @@ func (s *Server) established(ss *session, res *sip.Response) {
 		s.cfg.Metrics.Count("sip.invite.unusable_answer", 1)
 		// The participant answered, but has no session: for a REFER, the
 		// addition did not come about.
-		s.referDone(ss.group, ss.user, 488)
+		s.referDone(ss.group, ss.user, false)
 		s.engine.InviteFailed(ss.inv, err)
 		ss.bye(reason)
 		return
 	}
-	s.referDone(ss.group, ss.user, 200)
+	s.referDone(ss.group, ss.user, true)
 	s.cfg.Metrics.Count("sip.invite.accepted", 1)
 	ss.arm()
 	ss.watch(nil)

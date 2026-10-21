@@ -348,7 +348,8 @@ func (s *Server) resubscribe(ctx context.Context, u *proxy.UAS, sub *subscriptio
 	}
 	s.respondExpires(u, req, sub, expires)
 	s.cfg.Metrics.Count("sip.subscription.refreshed", 1)
-	sub.version = version
+	// The full roster brings a stale subscription up to date too.
+	sub.version, sub.stale = version, false
 	sub.arm(expires)
 	sub.notify(sub.active(), doc)
 }
