@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"unicode"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // Request is the view of a SIP request that service point triggers examine.
@@ -1116,7 +1118,7 @@ func (in *input) headers() []HeaderField {
 			// Annex F matches names and values with white space at either
 			// end removed and inner runs of it reduced to one space, which
 			// is what collapse does.
-			in.fields = append(in.fields, HeaderField{Name: collapse(h.Name), Value: collapse(h.Value)})
+			in.fields = append(in.fields, HeaderField{Name: xmlsafe.Collapse(h.Name), Value: xmlsafe.Collapse(h.Value)})
 		}
 		in.fieldsDone = true
 	}

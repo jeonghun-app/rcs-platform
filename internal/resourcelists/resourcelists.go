@@ -11,7 +11,6 @@
 package resourcelists
 
 import (
-	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -19,6 +18,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // Namespace is the resource-lists namespace (RFC 4826 §3.4.1).
@@ -44,15 +45,22 @@ var (
 	// ErrDTD reports a document type declaration, never accepted: entity
 	// definitions are how XML parsers are made to read files or expand
 	// input without bound (docs/architecture.md §8).
-	ErrDTD = errors.New("resourcelists: document type declarations are not accepted")
+	ErrDTD = fmt.Errorf("resourcelists: %w", xmlsafe.ErrDTD)
 	// ErrTooLarge reports a document beyond MaxDocumentSize.
-	ErrTooLarge = errors.New("resourcelists: document too large")
+	ErrTooLarge = fmt.Errorf("resourcelists: %w", xmlsafe.ErrTooLarge)
 	// ErrTooMany reports a document with more entries than allowed.
 	ErrTooMany = errors.New("resourcelists: too many entries")
 	// ErrMalformed reports a document that is not a resource-lists
 	// document this package reads.
 	ErrMalformed = errors.New("resourcelists: malformed document")
 )
+
+// document is what Parse checks a document for, and the errors it reports
+// (internal/xmlsafe).
+// A character reference to a surrogate is read as U+FFFD, and isText
+// skips the entry that holds it rather than refusing the list.
+var document = xmlsafe.Doc{MaxSize: MaxDocumentSize, MaxDepth: maxDepth, DTD: ErrDTD, TooLarge: ErrTooLarge, Malformed: ErrMalformed,
+	SurrogateRefs: true}
 
 // Entry is one entry of a list: its uri attribute, and its display-name.
 type Entry struct {
@@ -71,10 +79,10 @@ type Entry struct {
 // (docs/rcs-as.md), and no list is read past limit. A display name that
 // is not text is dropped, its entry kept.
 func Parse(data []byte, limit int) (entries []Entry, skipped int, err error) {
-	if len(data) > MaxDocumentSize {
-		return nil, 0, ErrTooLarge
+	d, err := document.NewReader(data)
+	if err != nil {
+		return nil, 0, err
 	}
-	d := xml.NewDecoder(bytes.NewReader(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))))
 	var (
 		out    []Entry
 		seen   int // entries, skipped ones included
@@ -82,31 +90,21 @@ func Parse(data []byte, limit int) (entries []Entry, skipped int, err error) {
 		stack  []xml.Name
 		entry  *Entry
 		inName bool
-		roots  int
 	)
 	for {
+		// The Reader refuses a DTD, a second root, nesting past maxDepth,
+		// repeated attributes and text outside the root.
 		tok, err := d.Token()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, 0, decodeError(err)
+			return nil, 0, err
 		}
 		switch t := tok.(type) {
-		case xml.Directive:
-			return nil, 0, ErrDTD
 		case xml.StartElement:
-			if len(stack) == 0 {
-				roots++
-				if roots > 1 || t.Name != (xml.Name{Space: Namespace, Local: "resource-lists"}) {
-					return nil, 0, fmt.Errorf("%w: not one resource-lists root", ErrMalformed)
-				}
-			}
-			if len(stack) >= maxDepth {
-				return nil, 0, fmt.Errorf("%w: elements nested deeper than %d", ErrMalformed, maxDepth)
-			}
-			if repeatedAttr(t.Attr) {
-				return nil, 0, fmt.Errorf("%w: repeated attribute", ErrMalformed)
+			if len(stack) == 0 && t.Name != (xml.Name{Space: Namespace, Local: "resource-lists"}) {
+				return nil, 0, fmt.Errorf("%w: not one resource-lists root", ErrMalformed)
 			}
 			parent := xml.Name{}
 			if len(stack) > 0 {
@@ -151,19 +149,13 @@ func Parse(data []byte, limit int) (entries []Entry, skipped int, err error) {
 				}
 			}
 		case xml.CharData:
-			switch {
-			case len(stack) == 0 && len(bytes.Trim(t, " \t\r\n")) > 0:
-				return nil, 0, fmt.Errorf("%w: text outside the root element", ErrMalformed)
-			case inName && entry != nil:
+			if inName && entry != nil {
 				if len(entry.DisplayName)+len(t) > maxNameBytes {
 					return nil, 0, fmt.Errorf("%w: display name too long", ErrMalformed)
 				}
 				entry.DisplayName += string(t)
 			}
 		}
-	}
-	if roots == 0 {
-		return nil, 0, fmt.Errorf("%w: no root element", ErrMalformed)
 	}
 	for i := range out {
 		if !isText(out[i].DisplayName) {
@@ -182,29 +174,8 @@ func attr(attrs []xml.Attr, name string) string {
 	return ""
 }
 
-func repeatedAttr(attrs []xml.Attr) bool {
-	seen := make(map[xml.Name]bool, len(attrs))
-	for _, a := range attrs {
-		if seen[a.Name] {
-			return true
-		}
-		seen[a.Name] = true
-	}
-	return false
-}
-
 // isText reports valid UTF-8 without U+FFFD: encoding/xml passes on what
 // it could not read as U+FFFD, a character reference to a surrogate
 // (&#xD800;) included, and no name or URI a client means has one (QA on
 // #279).
 func isText(s string) bool { return utf8.ValidString(s) && !strings.ContainsRune(s, utf8.RuneError) }
-
-// decodeError reduces an encoding/xml error to its line number: the
-// decoder's messages quote the input.
-func decodeError(err error) error {
-	var se *xml.SyntaxError
-	if errors.As(err, &se) {
-		return fmt.Errorf("%w: XML syntax error on line %d", ErrMalformed, se.Line)
-	}
-	return fmt.Errorf("%w: document does not have the expected structure", ErrMalformed)
-}
