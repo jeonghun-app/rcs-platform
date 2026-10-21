@@ -267,6 +267,40 @@ func TestEachAddressGetsItsShareOfTheDialTime(t *testing.T) {
 	}
 }
 
+// The caller's deadline bounds the lookup too, when it is the sooner: the
+// lookup runs within ctx, not only within Timeout (code review of #395).
+func TestTheCallersDeadlineAlsoBoundsTheLookup(t *testing.T) {
+	var deadline time.Time
+	d := InternalDialer{
+		Timeout: time.Hour,
+		Lookup: func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			deadline, _ = ctx.Deadline()
+			if !deadline.Before(time.Now().Add(time.Minute)) {
+				return nil, errors.New("the lookup was not bounded by the caller's deadline")
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	want, _ := ctx.Deadline()
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.DialContext(ctx, "tcp", "hss.rcs.local:8081")
+		done <- err
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("DialContext did not return")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || !deadline.Equal(want) {
+		t.Fatalf("DialContext returned %v with the lookup's deadline %v from the caller's, want the caller's deadline", err, deadline.Sub(want))
+	}
+}
+
 // Timeout bounds name resolution as net.Dialer.Timeout does: http.Transport
 // dials with a context the request's cancellation does not reach, so an
 // unresponsive resolver must not hold the connection slot beyond it (#114;
