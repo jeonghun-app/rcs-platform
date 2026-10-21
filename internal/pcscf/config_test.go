@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -35,6 +36,7 @@ var prodEnv = with(devEnv,
 	"RCS_PROXY_PROTOCOL", "true",
 	"PCSCF_CLIENT_TRANSPORT", "nlb-tls",
 	"PCSCF_PUBLIC_ADDRS", "203.0.113.10, 203.0.113.11",
+	"PCSCF_RELAY_TOKEN", testRelayToken,
 )
 
 func with(base map[string]string, kv ...string) map[string]string {
@@ -91,6 +93,9 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		MaxRegistrations: DefaultMaxRegistrations, RegisterRate: DefaultRegisterRate, RegisterBurst: DefaultRegisterBurst,
 		InitialRate: DefaultInitialRate, InitialBurst: DefaultInitialBurst,
 		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
+		RelayURL: &url.URL{Scheme: "http", Host: "msrp-relay.rcs.internal:8082"}, RelayTimeout: DefaultRelayTimeout,
+		MaxBindingsPerFlow: DefaultMaxBindingsPerFlow, MaxBindings: DefaultMaxBindings, BindingsPerMinute: 32,
+		MaxCoreOfferBindingsPerFlow: 32, CoreOfferBindingsPerMinute: 32,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -237,6 +242,23 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_DRAIN_TIMEOUT", "16s"}, "PCSCF_DRAIN_TIMEOUT: plus 5s must not exceed RCS_SHUTDOWN_TIMEOUT (20s)"},
 		{[]string{"PCSCF_DRAIN_TIMEOUT", "0s"}, "PCSCF_DRAIN_TIMEOUT: must be greater than zero"},
 		{[]string{"RCS_SHUTDOWN_TIMEOUT", "5s"}, "PCSCF_DRAIN_TIMEOUT: must be greater than zero, and RCS_SHUTDOWN_TIMEOUT longer than 5s"},
+		// msrp-relay's control API (#136).
+		{[]string{"RCS_SERVICE_NAMESPACE", "", "PCSCF_ICSCF_URI", "sip:10.0.3.7;transport=tcp;lr", "PCSCF_SCSCF_HOST", ""}, "PCSCF_RELAY_URL: required when RCS_SERVICE_NAMESPACE is unset"},
+		{[]string{"PCSCF_RELAY_URL", "http://msrp-relay.example.net:8082"}, "PCSCF_RELAY_URL: not an http or https URL of a private host"},
+		{[]string{"PCSCF_RELAY_URL", "http://203.0.113.5:8082"}, "PCSCF_RELAY_URL: not an http or https URL of a private host"},
+		{[]string{"PCSCF_RELAY_URL", "ftp://10.0.5.5"}, "PCSCF_RELAY_URL: not an http or https URL of a private host"},
+		{[]string{"PCSCF_RELAY_URL", "http://10.0.5.5:8082/v1"}, "PCSCF_RELAY_URL: not an http or https URL of a private host, without a path"},
+		{[]string{"PCSCF_RELAY_URL", "http://u:p@10.0.5.5:8082"}, "PCSCF_RELAY_URL: not an http"},
+		{[]string{"PCSCF_RELAY_URL", "http://10.0.5.5:8082?x=1"}, "PCSCF_RELAY_URL: not an http"},
+		{[]string{"PCSCF_RELAY_TOKEN", "two words"}, "PCSCF_RELAY_TOKEN: not a bearer token"},
+		{[]string{"PCSCF_RELAY_TOKEN", "a\r\nX: y"}, "PCSCF_RELAY_TOKEN: not a bearer token"},
+		{[]string{"PCSCF_RELAY_TOKEN", "==="}, "PCSCF_RELAY_TOKEN: not a bearer token"},
+		{[]string{"PCSCF_RELAY_TIMEOUT", "0s"}, "PCSCF_RELAY_TIMEOUT: must be greater than zero"},
+		{[]string{"PCSCF_MAX_BINDINGS_PER_FLOW", "0"}, "PCSCF_MAX_BINDINGS_PER_FLOW: must be positive"},
+		{[]string{"PCSCF_MAX_BINDINGS", "-1"}, "PCSCF_MAX_BINDINGS: must be positive"},
+		{[]string{"PCSCF_BINDINGS_PER_MINUTE", "0"}, "PCSCF_BINDINGS_PER_MINUTE: must be positive"},
+		{[]string{"PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW", "0"}, "PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW: must be positive"},
+		{[]string{"PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE", "-1"}, "PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE: must be positive"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			_, err := configure(with(devEnv, tt.kv...))
@@ -271,6 +293,9 @@ func TestProductionRefusesWhatLetsClientsPastTheEdge(t *testing.T) {
 		{[]string{"RCS_PROXY_PROTOCOL", "false"}, "RCS_PROXY_PROTOCOL is false"},
 		{[]string{"RCS_PROXY_PROTOCOL", ""}, "RCS_PROXY_PROTOCOL is false"},
 		{[]string{"PCSCF_PUBLIC_ADDRS", ""}, "PCSCF_PUBLIC_ADDRS is unset"},
+		{[]string{"PCSCF_RELAY_TOKEN", ""}, "PCSCF_RELAY_TOKEN is unset"},
+		{[]string{"PCSCF_RELAY_TOKEN", strings.Repeat("t", 42)}, "PCSCF_RELAY_TOKEN is shorter than 43 characters"},
+		{[]string{"PCSCF_RELAY_URL", "http://127.0.0.1:8082"}, "PCSCF_RELAY_URL: not an http or https URL of a private host"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			status, out := startup(t, with(prodEnv, tt.kv...))

@@ -204,50 +204,58 @@ func TestContentionUntilTheAPIDeadlineIsBusyNotAStoreFailure(t *testing.T) {
 	}
 }
 
-// losingFor loses every write of one subscription, and reports the first.
-type losingFor struct {
-	store.Store
-	impi string
-	once sync.Once
-	lost chan struct{}
-}
-
-func (l *losingFor) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
-	if s.IMPI == l.impi {
-		l.once.Do(func() { close(l.lost) })
-		return nil, store.ErrConflict
-	}
-	return l.Store.UpdateSubscription(ctx, old, s)
-}
-
 // TestTwoSubscriptionsNeverWaitOnEachOther: each subscription has a lock
-// of its own, so a request that holds one through a contended update's
-// retries holds up no other subscription (QA's minor 3 on #244).
+// of its own, so a request that holds one, here through a store write that
+// does not return, holds up no other subscription (QA's minor 3 on #244).
+// The other update must finish while the first still holds its lock; how
+// long it takes is not measured, so a loaded host cannot fail it (#321).
 func TestTwoSubscriptionsNeverWaitOnEachOther(t *testing.T) {
-	lf := &losingFor{Store: store.NewMemory(), impi: impi1, lost: make(chan struct{})}
-	e := newEnvWith(t, lf)
+	bf := &blockingFor{Store: store.NewMemory(), impi: impi1, entered: make(chan struct{}), release: make(chan struct{})}
+	e := newEnvWith(t, bf)
 	e.provision(impi1, impu1)
 	e.provision(impi2, impu2)
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := e.h.update(ctx, impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
+		_, err := e.h.update(context.Background(), impi1, func(s *store.Subscription) error { s.AuthPending = true; return nil })
 		done <- err
 	}()
-	<-lf.lost
-	start := time.Now()
-	short, cancelShort := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancelShort()
-	if _, err := e.h.update(short, impi2, func(s *store.Subscription) error { s.AuthPending = true; return nil }); err != nil {
-		t.Fatalf("the other subscription's update: %v", err)
+	<-bf.entered // the first update holds impi1's lock, inside its write
+	// Only a failure waits this long: an update that waits for the first
+	// would never finish while the first is held.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := e.h.update(ctx, impi2, func(s *store.Subscription) error { s.AuthPending = true; return nil }); err != nil {
+		t.Fatalf("the other subscription's update while the first held its lock: %v", err)
 	}
-	if took := time.Since(start); took > 150*time.Millisecond {
-		t.Errorf("the other subscription waited %v", took)
+	select {
+	case err := <-done:
+		t.Fatalf("the first update ended (%v) before it was released", err)
+	default:
 	}
-	if err := <-done; !errors.Is(err, errContention) {
-		t.Errorf("the contended update: %v", err)
+	close(bf.release)
+	if err := <-done; err != nil {
+		t.Errorf("the first update: %v", err)
 	}
+}
+
+// blockingFor holds the first write of one subscription until release.
+type blockingFor struct {
+	store.Store
+	impi    string
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingFor) UpdateSubscription(ctx context.Context, old, s *store.Subscription) (*store.Subscription, error) {
+	if s.IMPI == b.impi {
+		first := false
+		b.once.Do(func() { first = true; close(b.entered) })
+		if first {
+			<-b.release
+		}
+	}
+	return b.Store.UpdateSubscription(ctx, old, s)
 }
 
 // TestALockGoesWhenNoRequestHoldsIt: the locks of a task are as many as the
@@ -365,9 +373,9 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	if len(n.deadlines) != 1 || !n.deadlines[0].Equal(pushEnd) {
 		t.Fatalf("RTR deadlines %v, want the push's own %v", n.deadlines, pushEnd)
 	}
-	// The update's deadline is half of what was left when it started, so
-	// at least half of what was left when the push began less the time it
-	// took to start, and before the push's end by as much.
+	// The update's deadline is half of what was left when it started, read
+	// from one clock reading: at least half of what is left now, and at
+	// most half of the push.
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if len(ds.deadlines) != 1 {

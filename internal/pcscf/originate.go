@@ -40,6 +40,7 @@ const (
 func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	src := r.Source
 	if !p.initials.allow(clientKey(src.Addr)) {
+		p.count(metricRequestRate, 1)
 		return p.refuse(r, 503, "Too Many Requests")
 	}
 	regs := p.registry.flowRegistrations(src.Flow)
@@ -53,6 +54,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	if len(reg.serviceRoute) == 0 {
 		// Without it the next hop would be the Request-URI, a core
 		// address the client chose, past scscf.
+		p.count(metricRequestNoRoute, 1)
 		return proxy.Decision{Status: 500, Reason: "No Service-Route"}
 	}
 	icid, err := p.icid()
@@ -64,7 +66,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	if dialogForming(r.Message.Method) {
 		rr = p.recordRoute(src.Flow, contactHasOb(r.Message), icid, r.Message.Header.Get("Call-ID"))
 	}
-	return proxy.Decision{
+	return p.anchorInitial(r, proxy.Decision{
 		Targets:     []proxy.Target{{URI: r.Message.URI}},
 		RecordRoute: rr,
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
@@ -72,6 +74,17 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			// client wrote below pcscf's own entry is not where it
 			// registered.
 			req.Header.Del("Route")
+			// A client records no route: only pcscf's values, which the
+			// proxy put on top, go on, so that the route set of the
+			// dialog's core side is what pcscf and the core recorded, and
+			// a request pcscf sends in it goes nowhere the client chose
+			// (#248 security review).
+			req.Header.Del("Record-Route")
+			for _, a := range rr {
+				if err := req.Header.Add("Record-Route", a.String()); err != nil {
+					return err
+				}
+			}
 			for _, a := range routes {
 				if err := req.Header.Add("Route", a.String()); err != nil {
 					return err
@@ -85,7 +98,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			}
 			return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 		},
-	}
+	}, clientSide, src.Flow)
 }
 
 // dialogForming reports whether a request of method sets up a dialog, and so
@@ -371,6 +384,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 			}
 			return proxy.Decision{Discard: true}
 		}
+		p.count(metricInDialogRate, 1)
 		return p.refuse(r, 503, "Too Many Requests")
 	}
 	var core *sip.URI
@@ -384,6 +398,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 		}
 	}
 	if core == nil || !client || !p.inDialogWith(*core, r.Message.Header.Get("Call-ID")) {
+		p.count(metricInDialogRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	next := r.Message.URI
@@ -391,12 +406,15 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 		next = routes[0].URI
 	}
 	if !p.scscfHop(next) {
+		p.count(metricInDialogRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	if _, err := p.resolve.Resolve(ctx, next); err != nil {
 		if errors.As(err, new(*net.DNSError)) {
+			p.count(metricInDialogUnresolved, 1)
 			return p.refuse(r, 503, "Service Unavailable")
 		}
+		p.count(metricInDialogRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	icid, ok := routeICID(*core)
@@ -411,7 +429,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 	d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 		return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 	}
-	return d
+	return p.anchorInDialog(r, d, clientSide, r.Source.Flow)
 }
 
 // scscfHop reports whether u names scscf as the next hop of a request inside
