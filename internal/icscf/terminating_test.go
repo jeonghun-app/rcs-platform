@@ -151,10 +151,15 @@ func TestRequestsWithARouteOrInADialogAreForwardedWithoutAskingTheHSS(t *testing
 		{"in a dialog", invite(t, impu1, "To: <"+impu1+">;tag=t1", route)},
 		{"in a dialog to the S-CSCF itself", invite(t, scscfURI, "To: <"+impu1+">;tag=t1")},
 		{"ACK in a dialog", request(t, "ACK", "sip:192.0.2.20", "To: <"+impu1+">;tag=t1", "CSeq: 1 ACK", route)},
+		// Not this I-CSCF, which is icscf.rcs.local at 5060: another port,
+		// another host, or a host it only starts.
+		{"a Route below to this I-CSCF's host on another port", invite(t, impu1, route+", <sip:icscf.rcs.local:5070;lr>")},
+		{"a Request-URI of this I-CSCF's host on another port", invite(t, "sip:icscf.rcs.local:5070", route)},
+		{"a Route below to another host", invite(t, impu1, route+", <sip:icscf.rcs.local.example;lr>")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			g := newRig(t)
+			g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI("sip:icscf.rcs.local:5060;lr")} })
 			d := g.route(tc.req)
 			if got := describe(t, d); got.uri != tc.req.URI.String() || got.route != "" {
 				t.Errorf("decision = %+v, want the request's own Request-URI and no Route", got)

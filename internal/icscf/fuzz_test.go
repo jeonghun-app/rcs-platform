@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -68,8 +69,10 @@ func FuzzTelForm(f *testing.F) {
 }
 
 // A request with a Route, or inside a dialog, is forwarded only to a
-// configured S-CSCF, and never while its Route names this I-CSCF; anything
-// else is refused 403 or 482 (#337).
+// configured S-CSCF, and never while its Route or Request-URI names this
+// I-CSCF; anything else is refused 403 or 482 (#337). It is checked twice:
+// through a proxy, whose own Route handling runs before and after the
+// Router's, and at the Router alone, with the Route as it arrived.
 func FuzzRoutedNextHop(f *testing.F) {
 	const self = "sip:icscf.rcs.local:5060;lr"
 	for _, tc := range [][2]string{
@@ -83,6 +86,11 @@ func FuzzRoutedNextHop(f *testing.F) {
 		{"<sip:[::ffff:192.0.2.1]:5060;lr>", "sip:x@[::1]"},
 		{"<" + scscfURI + ";maddr=192.0.2.66;lr>", "sip:+15550100001@" + home},
 		{"<" + scscfURI + ";lr>, <sip:[::ffff:192.0.2.31]:5060;lr>", "sip:icscf.rcs.local."},
+		// QA of #350: this I-CSCF as the Request-URI, behind a loose or a
+		// strict S-CSCF, or put back from the end of the Route (§16.4).
+		{"<" + scscfURI + ";lr>", "sip:icscf.rcs.local"},
+		{"<" + scscfURI + ">", "sip:icscf.rcs.local:5060"},
+		{"<" + scscfURI + ";lr>, <sip:icscf.rcs.local:5060>", "sip:icscf.rcs.local:5060;lr"},
 	} {
 		f.Add(tc[0], tc[1])
 	}
@@ -105,7 +113,9 @@ func FuzzRoutedNextHop(f *testing.F) {
 		if !ok {
 			return
 		}
-		g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI(self), mustURI("sip:" + fuzzSelf.String() + ";lr")} })
+		selfURIs := []sip.URI{mustURI(self), mustURI("sip:" + fuzzSelf.String() + ";lr")}
+		g := newRig(t, func(c *Config) { c.Self = selfURIs })
+		throughProxy(t, g.r, selfURIs, req)
 		d := g.route(req)
 		if len(d.Targets) == 0 {
 			if d.Status != 403 && d.Status != 482 {
@@ -148,14 +158,97 @@ var (
 // fuzzDestination is where the proxy's NumericResolver sends u once its host
 // name is looked up as DNS would: without case or a trailing dot.
 func fuzzDestination(u sip.URI) (transport.Destination, bool) {
+	d, err := fuzzResolver{}.Resolve(context.Background(), u)
+	return transport.Destination{Network: d.Network, Addr: d.Addr}, err == nil
+}
+
+// fuzzResolver is fuzzDestination as the proxy's Resolver.
+type fuzzResolver struct{}
+
+func (fuzzResolver) Resolve(ctx context.Context, u sip.URI) (transport.Destination, error) {
 	switch strings.TrimSuffix(strings.ToLower(u.Host), ".") {
 	case "scscf.rcs.local":
 		u.Host = fuzzSCSCF.Addr.Addr().String()
 	case "icscf.rcs.local":
 		u.Host = fuzzSelf.Addr().String()
 	}
-	d, err := proxy.NumericResolver{}.Resolve(context.Background(), u)
-	return transport.Destination{Network: d.Network, Addr: d.Addr}, err == nil
+	return proxy.NumericResolver{}.Resolve(ctx, u)
+}
+
+// throughProxy hands req to a proxy built as Run builds it, on r and self,
+// and checks what leaves it: a final response, or the request on its way to
+// the S-CSCF with nothing in its Request-URI or Route that names this
+// I-CSCF. The proxy removes this I-CSCF's own Route entries before the
+// Router sees them and rewrites the Route for a strict next hop after, so
+// a loop either side of the Router shows here.
+func throughProxy(t *testing.T, r *Router, self []sip.URI, req *sip.Request) {
+	t.Helper()
+	if req.Validate() != nil {
+		return
+	}
+	out := &recordingSender{done: make(chan sentMessage, 1)}
+	p, err := proxy.New(out, proxy.Config{Self: self, Router: r, Resolver: fuzzResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.Receive(transport.Inbound{Message: req.Clone(), Source: transport.Source{
+		Flow: "f1", Network: transport.TCP, Addr: netip.MustParseAddrPort("192.0.2.10:5060"), Listener: "core",
+	}})
+	var sent sentMessage
+	select {
+	case sent = <-out.done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the proxy neither answered nor forwarded %s", req.URI.String())
+	}
+	if sent.res != nil {
+		if sent.res.StatusCode < 300 {
+			t.Fatalf("the proxy answered %d itself", sent.res.StatusCode)
+		}
+		return
+	}
+	if sent.dst.Network != fuzzSCSCF.Network || sent.dst.Addr != fuzzSCSCF.Addr {
+		t.Fatalf("the proxy sent %s to %+v, not the S-CSCF at %+v", req.URI.String(), sent.dst, fuzzSCSCF)
+	}
+	routes, err := sent.req.Header.Route()
+	if err != nil {
+		t.Fatalf("the proxy sent a Route that does not parse: %v", err)
+	}
+	for _, u := range append([]sip.URI{sent.req.URI}, uris(routes)...) {
+		if got, ok := fuzzDestination(u); ok && got.Addr == fuzzSelf {
+			t.Fatalf("the proxy sent the S-CSCF a request that names this I-CSCF: %s", u.String())
+		}
+	}
+}
+
+// sentMessage is the first thing a proxy sent: a request and where it went,
+// or a final response.
+type sentMessage struct {
+	req *sip.Request
+	dst transport.Destination
+	res *sip.Response
+}
+
+// recordingSender is the transport under throughProxy's proxy.
+type recordingSender struct{ done chan sentMessage }
+
+func (s *recordingSender) SendRequest(req *sip.Request, dst transport.Destination, _ ...transport.SendOption) (transport.Network, error) {
+	s.record(sentMessage{req: req.Clone(), dst: dst})
+	return dst.Network, nil
+}
+
+func (s *recordingSender) SendResponse(res *sip.Response, _ transport.Source, _ ...transport.SendOption) error {
+	if res.StatusCode >= 200 {
+		s.record(sentMessage{res: res})
+	}
+	return nil
+}
+
+func (s *recordingSender) record(m sentMessage) {
+	select {
+	case s.done <- m:
+	default:
+	}
 }
 
 func uris(as []sip.Address) []sip.URI {

@@ -487,3 +487,26 @@ func TestARoutedRequestIsCheckedThroughRun(t *testing.T) {
 		t.Errorf("the HSS got %d requests, want none", n)
 	}
 }
+
+// #337: a Request-URI that names this I-CSCF brings the request back to it,
+// whether the S-CSCF routes loosely (to the Request-URI) or strictly (the
+// proxy moves the Request-URI to the end of the Route, RFC 3261 §16.6 step 6),
+// and when the proxy has put it back from the end of the Route (§16.4). From
+// QA of #350.
+func TestARoutedRequestWhoseRequestURINamesThisICSCFIsALoop(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
+	r.waitReady(t)
+	self := fmt.Sprintf("sip:icscf.rcs.local:%d", r.core.Port())
+	from, to := "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">;tag=t1"
+	for _, tc := range []struct{ name, ruri, route string }{
+		{"strict next hop", self, "Route: <" + scscf.uri() + ">"},
+		{"loose next hop", self, "Route: <" + scscf.uri() + ";lr>"},
+		{"this I-CSCF last in the Route", self + ";lr", "Route: <" + scscf.uri() + ";lr>, <" + self + ">"},
+	} {
+		if res := r.send(t, "MESSAGE", tc.ruri, from, to, tc.route); res.StatusCode != 482 {
+			t.Errorf("%s: %d, want 482", tc.name, res.StatusCode)
+		}
+	}
+}
