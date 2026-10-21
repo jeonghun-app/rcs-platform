@@ -46,7 +46,12 @@ func (rt *Router) servicesOf(ctx context.Context, set state.SetKey, impu string)
 	case err != nil:
 		return nil, err
 	}
-	k := servicesKey{set: set, received: p.Received.UnixNano(), impu: impu}
+	return rt.servicesIn(p, impu)
+}
+
+// servicesIn is the compiled iFC of impu in the profile p.
+func (rt *Router) servicesIn(p *state.Profile, impu string) (*ifc.Set, error) {
+	k := servicesKey{set: p.Key, received: p.Received.UnixNano(), impu: impu}
 	rt.svc.mu.Lock()
 	cached := rt.svc.sets[k]
 	rt.svc.mu.Unlock()

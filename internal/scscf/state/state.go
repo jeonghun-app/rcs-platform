@@ -161,6 +161,13 @@ type Registration struct {
 	// backing off and giving up by MaxReassertAttempts at the latest.
 	Reassert         time.Time
 	ReassertAttempts int
+	// RegisteredAs are the public identities in the To of the REGISTERs
+	// that registered the set's bindings, canonical, each once and each one
+	// of Identities, which the application servers were told of (TS 24.229
+	// §5.4.1.7): the end of the set is told of every one. Devices of one set
+	// may register different identities of it. It is empty in a record saved
+	// before it was kept, whose end names Key.IMPU.
+	RegisteredAs []string
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). A new item starts at a
 	// random value (FirstVersion), and every save raises it, so of two reads
@@ -314,6 +321,7 @@ func (r *Registration) Prune(now time.Time) []Contact {
 func (r *Registration) Clone() *Registration {
 	c := *r
 	c.Identities = slices.Clone(r.Identities)
+	c.RegisteredAs = slices.Clone(r.RegisteredAs)
 	c.Contacts = make([]Contact, len(r.Contacts))
 	for i, ct := range r.Contacts {
 		ct.Path = slices.Clone(ct.Path)
@@ -364,6 +372,14 @@ func (r *Registration) Validate() error {
 	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
+	}
+	if len(r.RegisteredAs) > MaxIdentities {
+		return fmt.Errorf("%w: more than %d identities in RegisteredAs", ErrInvalid, MaxIdentities)
+	}
+	for _, impu := range r.RegisteredAs {
+		if !canonicalIMPU(impu) {
+			return fmt.Errorf("%w: RegisteredAs holds an identity that is not a canonical public identity", ErrInvalid)
+		}
 	}
 	for _, c := range r.Contacts {
 		if c.URI == "" || !validTime(c.Expires) {
