@@ -1651,15 +1651,21 @@ func (e *env) hopSets(hops, perHop int) []*state.Registration {
 	var out []*state.Registration
 	for h := range hops {
 		key := state.SetKey{IMPI: fmt.Sprintf("hop%d@%s", h, realm), IMPU: fmt.Sprintf("sip:hop%d@%s", h, realm)}
-		out = append(out, e.saved(&state.Registration{Key: key, Incarnation: 1, Contacts: []state.Contact{binding(1, time.Hour)},
+		// Each set's binding came over a P-CSCF of its own, the next hop
+		// of its NOTIFYs.
+		path := fmt.Sprintf("sip:term@pcscf-%d.%s;lr", h, realm)
+		b := binding(1, time.Hour)
+		b.Path = []string{"<" + path + ">"}
+		out = append(out, e.saved(&state.Registration{Key: key, Incarnation: 1, Contacts: []state.Contact{b},
 			Identities: []state.SetIdentity{{IMPU: key.IMPU}}}))
 		if _, err := e.store.SaveIdentity(bg, &state.Identity{IMPU: key.IMPU, Set: key, Incarnation: 1, KeepUntil: t0.Add(48 * time.Hour)}, t0); err != nil {
 			e.t.Fatal(err)
 		}
 		for i := range perHop {
-			req := subscribe(e.t, key.IMPU, pcscfPath, 3600)
+			req := subscribe(e.t, key.IMPU, path, 3600)
 			_ = req.Header.Set("Call-ID", fmt.Sprintf("hop%d-%d", h, i))
 			_ = req.Header.Set("Contact", fmt.Sprintf("<sip:pcscf-%d.%s:5060;transport=tcp>", h, realm))
+			_ = req.Header.Set("Record-Route", fmt.Sprintf("<sip:pcscf-%d.%s;lr>", h, realm))
 			res, _ := n.Subscribe(bg, req)
 			wantStatus(e.t, res, 200)
 		}
@@ -1864,5 +1870,27 @@ func TestAMergedNotifyTellsOfEachContactByTheChangeThatEndedIt(t *testing.T) {
 	}
 	if len(told) != 4 {
 		t.Errorf("each subscriber told of the two ends %d times in all, want 4", len(told))
+	}
+}
+
+// TestWaitForGivesUpAtItsDeadline: a NOTIFY whose answer does not come
+// holds WaitFor only until its context ends; once answered, WaitFor
+// returns at once, everything done.
+func TestWaitForGivesUpAtItsDeadline(t *testing.T) {
+	e := newEnv(t)
+	before := e.registered(binding(1, time.Hour))
+	e.subscribedMany(1)
+	g := newGate(1)
+	n := newNotifierWith(t, e, e.store, g)
+	n.Changed(bg, before, before, Registered)
+	<-g.entered
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	if n.WaitFor(ctx) {
+		t.Error("WaitFor reported everything done with a NOTIFY unanswered")
+	}
+	g.release <- struct{}{}
+	if !n.WaitFor(bg) {
+		t.Error("WaitFor gave up without a deadline")
 	}
 }
