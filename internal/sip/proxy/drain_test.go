@@ -329,3 +329,73 @@ func TestDrainLeavesAHandlerThatAnsweredAlone(t *testing.T) {
 	h.settle()
 	check(t, "upstream", h.upstream(), codes(200))
 }
+
+// A Router that hands the request to a Serve handler while DrainAnswer runs
+// leaves the request to the handler: Drain cancels its context instead of
+// answering (code review of #310).
+func TestDrainLeavesARequestServedWhileItsAnswerWasMade(t *testing.T) {
+	inHook, releaseHook := make(chan struct{}), make(chan struct{})
+	h := newHarness(t, Config{DrainAnswer: func(*sip.Request) (int, time.Duration) {
+		close(inHook)
+		<-releaseHook
+		return 500, 5 * time.Second
+	}})
+	routing, releaseRouter := make(chan struct{}), make(chan struct{})
+	serving := make(chan context.Context, 1)
+	h.route(func(context.Context, *Request) Decision {
+		close(routing)
+		<-releaseRouter
+		return Decision{Serve: func(ctx context.Context, _ *UAS) {
+			serving <- ctx
+			<-ctx.Done()
+		}}
+	})
+	h.p.Receive(inboundFrom(request(t, "MESSAGE", "sip:bob@example.com"), "up"))
+	<-routing
+	done := drainFor(h, 100*time.Millisecond)
+	<-inHook
+	close(releaseRouter)
+	ctx := <-serving
+	close(releaseHook)
+	if n := <-done; n != 0 {
+		t.Fatalf("Drain answered %d itself", n)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler's context was not cancelled")
+	}
+	h.settle()
+	res := h.upstreamResponses()
+	if len(res) != 1 || res[0].StatusCode != 500 || res[0].Header.Has("Retry-After") {
+		t.Fatalf("upstream got %v, want serve's own 500 alone", res)
+	}
+}
+
+// An INVITE cancelled upstream while DrainAnswer runs gets the 487.
+func TestDrainAnswers487ToAnInviteCancelledWhileItsAnswerWasMade(t *testing.T) {
+	inHook, releaseHook := make(chan struct{}), make(chan struct{})
+	h := newHarness(t, Config{DrainAnswer: func(*sip.Request) (int, time.Duration) {
+		close(inHook)
+		<-releaseHook
+		return 500, 5 * time.Second
+	}})
+	h.decide(Decision{Targets: []Target{target("sip:bob@192.0.2.2")}})
+	req := invite(t)
+	h.receive(req)
+	h.reply(h.one(), 180)
+	h.upstream()
+	done := drainFor(h, 100*time.Millisecond)
+	<-inHook
+	h.receive(uacCancel(t, req))
+	close(releaseHook)
+	<-done
+	h.settle()
+	var finals []int
+	for _, res := range h.upstreamResponses() {
+		if cseq, _ := res.Header.CSeq(); cseq.Method == "INVITE" {
+			finals = append(finals, res.StatusCode)
+		}
+	}
+	check(t, "INVITE finals", finals, codes(487))
+}

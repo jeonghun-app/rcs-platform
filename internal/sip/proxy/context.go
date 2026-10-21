@@ -351,10 +351,22 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 		return nil
 	}
 	c.mu.Lock()
-	if c.finalSent || c.done {
+	switch {
+	case c.finalSent || c.done:
 		// Answered meanwhile.
 		c.mu.Unlock()
 		return nil
+	case c.uas != nil:
+		// The Router handed the request to a Serve handler meanwhile.
+		c.mu.Unlock()
+		c.cancelReq()
+		return nil
+	case c.cancelled && !cancelled:
+		// Cancelled upstream meanwhile: 487 after all.
+		if res, err = c.p.response(c.tx.Request(), 487); err != nil {
+			c.mu.Unlock()
+			return nil
+		}
 	}
 	c.finalSent = true
 	acts := c.closeBranches()
