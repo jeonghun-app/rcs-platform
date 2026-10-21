@@ -323,6 +323,7 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		}
 		j.bare = j.bare || why == lapsedPCSCF || set == nil && before == nil
 	}
+	held := false
 	if j.final && !j.first && !sub.Terminated {
 		// Saved first, so that a stop from here on leaves the end to a
 		// sweep (SweepSubscriptions).
@@ -334,7 +335,7 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		if ended == nil {
 			return nil
 		}
-		sub = ended
+		sub, held = ended, true
 	}
 	cseq, version := sub.CSeq, sub.ReginfoVersion
 	switch {
@@ -344,6 +345,16 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		// it was sent with, so that the subscriber takes the two for one.
 		n.count("regevent.final_resent")
 	default:
+		if j.final && !held {
+			// Terminated when the set ended, the final may have waited its
+			// turn here since (SetConcurrency, HopConcurrency) while its
+			// expiry ran: it is held again from now, for as long as its
+			// send may wait for an answer, or a sweep could send it at the
+			// same time (#336). A sweep that took it over meanwhile has it.
+			if sub = n.hold(ctx, sub, now); sub == nil {
+				return nil
+			}
+		}
 		var err error
 		of := int64(state.FinalNotify)
 		if !j.final {
@@ -390,11 +401,31 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 	}
 }
 
+// hold saves sub's expiry pendingEnd from now, under the version read: nil
+// if another instance changed it since, a sweep that claimed it above all,
+// or if it is gone.
+func (n *Notifier) hold(ctx context.Context, sub *state.Subscription, now time.Time) *state.Subscription {
+	next := sub.Clone()
+	next.Expires = now.Add(n.pendingEnd())
+	saved, err := n.cfg.Store.SaveSubscription(ctx, next)
+	switch {
+	case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrNotFound):
+		n.count("regevent.final_taken_over")
+		return nil
+	case err != nil:
+		n.internalLog("holding a final NOTIFY", err)
+		return nil
+	}
+	return saved
+}
+
 // maxFinalSends bounds how often a final NOTIFY is sent without an answer,
 // and finalBackoff is the wait before the second send, doubled for each
-// after it: the last send about 2 min 30 s after the first (0, 10 s, 30 s,
-// 1 min 10 s, 2 min 30 s, plus the time each unanswered send waits), about
-// the time a P-CSCF task takes to be replaced.
+// after it, counted from when the send ended: the last send about 3 min 10 s
+// after the first for a subscriber that stays silent (0, 20, 50, 100 and
+// 190 s, each send waiting NotifyTimeout), 2 min 30 s when each fails at
+// once (0, 10 s, 30 s, 1 min 10 s, 2 min 30 s); about the time a P-CSCF
+// task takes to be replaced.
 const (
 	maxFinalSends = 5
 	finalBackoff  = 10 * time.Second
