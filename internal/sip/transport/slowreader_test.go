@@ -14,78 +14,26 @@ import (
 // (16 KiB every 50 ms) while 128 senders offer a burst far larger than the send
 // queue. Sends that find no room in time may fail, but the connection to a peer
 // that is reading must stay up, with everything already queued for it. QA ran
-// this with the default WriteTimeout; 5 s keeps the test shorter while leaving a
-// wide margin over the 50 ms the reader sleeps.
+// this with the default WriteTimeout; 5 s keeps the test shorter.
 //
-// On a loaded host the reader itself can be kept from reading for longer than
-// WriteTimeout, and then cutting the connection is right (#266, as #155 for
-// the test below). The writer cuts only a write of one writeChunk that made no
-// headway for WriteTimeout, which needs a full receive buffer that the peer
-// took at most two 16 KiB reads from in that time: somewhere it went a third
-// of WriteTimeout without reading. So a cut fails the test only if the peer
-// never paused for a quarter of WriteTimeout; after a longer pause it is the
-// host's doing, and the run is tried again.
+// The peer is a pipe behind a connection that ignores write deadlines, so a
+// loaded host that slows the reader cannot make the writer's deadline pass
+// (#266): only the transport closing the connection for another reason can
+// fail the test. The deadline itself is TestWriteThatTimesOutClosesTheConnection's.
 func TestSlowButReadingPeerKeepsItsConnectionUnderABurst(t *testing.T) {
-	const writeTimeout = 5 * time.Second
-	for attempt := 1; attempt <= 3; attempt++ {
-		r := slowReaderBurst(t, writeTimeout)
-		if !r.cut {
-			if r.sent == 0 || uint64(r.failed) != r.stats.QueueWaitTimeouts {
-				t.Errorf("sent %d, failed %d, QueueWaitTimeouts %d", r.sent, r.failed, r.stats.QueueWaitTimeouts)
-			}
-			return
-		}
-		if r.longestPause < writeTimeout/4 {
-			t.Fatalf("the peer never paused more than %v between reads, yet its connection was closed (failed sends=%d; QueueOverflows=%d Dialed=%d OpenOutbound=%d)",
-				r.longestPause, r.failed, r.stats.QueueOverflows, r.stats.Dialed, r.stats.OpenOutbound)
-		}
-		t.Logf("attempt %d: the peer paused %v between reads; the host kept it from reading, trying again", attempt, r.longestPause)
-	}
-	t.Skip("the host kept the peer from reading in every attempt")
-}
-
-type burstResult struct {
-	// cut reports that the connection to the peer was closed, or that a
-	// second one was dialed.
-	cut          bool
-	sent, failed int64
-	stats        Stats
-	// longestPause is the longest the peer went between two reads, until it
-	// saw the cut.
-	longestPause time.Duration
-}
-
-func slowReaderBurst(t *testing.T, writeTimeout time.Duration) burstResult {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	pauses := make(chan time.Duration, 1)
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			pauses <- 0
-			return
-		}
-		defer c.Close()
 		buf := make([]byte, 16<<10)
-		var longest time.Duration
-		last := time.Now()
 		for {
-			_, err := c.Read(buf)
-			longest = max(longest, time.Since(last))
-			last = time.Now()
-			if err != nil {
-				pauses <- longest
+			if _, err := peer.Read(buf); err != nil {
 				return
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
 	}()
-	tr, _ := newTransport(t, Config{WriteTimeout: writeTimeout})
-	dst := Destination{Network: TCP, Addr: addrPortOf(ln.Addr())}
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{noWriteDeadline{server}}, WriteTimeout: 5 * time.Second})
+	listen(t, tr, ListenerConfig{Network: TCP})
 	body := []byte(strings.Repeat("x", 64<<10))
 	var failed, sent atomic.Int64
 	var wg sync.WaitGroup
@@ -96,7 +44,7 @@ func slowReaderBurst(t *testing.T, writeTimeout time.Duration) burstResult {
 			for i := range 4 {
 				req := newRequest(t, "MESSAGE", fmt.Sprintf("SIP/2.0/TCP p.invalid;branch=z9hG4bKb%d-%d", g, i))
 				req.Body = body
-				if _, err := tr.SendRequest(req, dst); err != nil {
+				if _, err := tr.SendRequest(req, pipeDst); err != nil {
 					failed.Add(1)
 				} else {
 					sent.Add(1)
@@ -105,18 +53,21 @@ func slowReaderBurst(t *testing.T, writeTimeout time.Duration) burstResult {
 		}()
 	}
 	wg.Wait()
-	r := burstResult{sent: sent.Load(), failed: failed.Load(), stats: tr.Stats()}
-	r.cut = r.stats.QueueOverflows > 0 || r.stats.Dialed != 1 || r.stats.OpenOutbound != 1
-	if r.cut {
-		// The first connection is closed, so the peer sees the cut.
-		select {
-		case r.longestPause = <-pauses:
-		case <-time.After(waitFor + writeTimeout):
-			t.Fatal("the peer never saw its connection end")
-		}
+	s := tr.Stats()
+	if s.QueueOverflows > 0 || s.Dialed != 1 || s.OpenOutbound != 1 {
+		t.Errorf("failed sends=%d; QueueOverflows=%d Dialed=%d OpenOutbound=%d: the connection to a reading peer was closed",
+			failed.Load(), s.QueueOverflows, s.Dialed, s.OpenOutbound)
 	}
-	return r
+	if sent.Load() == 0 || uint64(failed.Load()) != s.QueueWaitTimeouts {
+		t.Errorf("sent %d, failed %d, QueueWaitTimeouts %d", sent.Load(), failed.Load(), s.QueueWaitTimeouts)
+	}
 }
+
+// noWriteDeadline is a connection whose writes never time out, as to a peer
+// that always reads in time.
+type noWriteDeadline struct{ net.Conn }
+
+func (noWriteDeadline) SetWriteDeadline(time.Time) error { return nil }
 
 func TestLargeMessageToASteadyReaderIsNotCutByTheWriteTimeout(t *testing.T) {
 	// The whole message takes about 1.6 s to drain, longer than WriteTimeout,
