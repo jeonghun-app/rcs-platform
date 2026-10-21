@@ -98,6 +98,10 @@ type conn struct {
 	controlMu    sync.Mutex
 	control      [][]byte
 	controlBytes int
+
+	// wroteLast, the writer's alone, is set once it has taken a DPR or DPA
+	// from the main queue.
+	wroteLast bool
 }
 
 func newConn(n *Node, nc net.Conn) *conn {
@@ -476,6 +480,10 @@ const maxAnswersInARow = 16
 // ahead of it.
 var testHookTookLast func(*conn)
 
+// testHookDropped, when set by a test, runs when the writer drops a request
+// that reached the main queue behind a DPR or DPA.
+var testHookDropped func(*conn)
+
 // writeLoop writes the control queue first, then handlers' answers, then
 // the main queue, but serves the main queue after at most
 // maxAnswersInARow (or MaxInFlight) answers in a row.
@@ -532,8 +540,20 @@ func (c *conn) writeLoop() {
 // one at random, and an answer queued before a DPR or DPA must reach the
 // peer before it (drain). Those are all in the queue by now, so only that
 // many are written first, however many more arrive.
+//
+// Nothing but another DPR or DPA from the main queue follows one (RFC 6733
+// §5.4). A sender that found the connection open can still be waiting for
+// room in the queue when the DPR or DPA goes in, and get its request in
+// behind it (#324); that request is dropped, and ends with the connection.
 func (c *conn) writeQueued(q queued) bool {
+	if c.wroteLast && !q.last {
+		if testHookDropped != nil {
+			testHookDropped(c)
+		}
+		return true
+	}
 	if q.last {
+		c.wroteLast = true
 		if testHookTookLast != nil {
 			testHookTookLast(c)
 		}
