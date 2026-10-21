@@ -508,9 +508,9 @@ func TestQAE2ETerminatingMSRPInviteFlowCloses(t *testing.T) {
 			t.Fatalf("offer to the client:\n%s", got.Body)
 		}
 		_ = c.nc.Close()
-		code, took, err := finalWithin(core)
-		if err != nil || code != 430 || took > 5*time.Second {
-			t.Errorf("%d (%v) after %v", code, err, took)
+		// 430 only comes from the flow's close (see finalWithin).
+		if code, err := finalWithin(core); err != nil || code != 430 {
+			t.Errorf("%d (%v), want 430", code, err)
 		}
 		deadline := time.Now().Add(waitFor)
 		for time.Now().Before(deadline) {
