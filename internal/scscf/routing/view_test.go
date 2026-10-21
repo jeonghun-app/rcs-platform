@@ -2,6 +2,7 @@ package routing
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -41,5 +42,36 @@ func TestTheIFCViewPresentsEachValueOfAListOnItsOwn(t *testing.T) {
 	}
 	if v := (view{req: r}); v.Method() != "INVITE" || v.RequestURI() != impu1 {
 		t.Errorf("%s %s", v.Method(), v.RequestURI())
+	}
+}
+
+// TestTheIFCViewReadsTheSDPPartOfAMultipartBody (code review on #359):
+// rcsjta's chat INVITE carries its SDP and its first message together.
+func TestTheIFCViewReadsTheSDPPartOfAMultipartBody(t *testing.T) {
+	r := request(t, "INVITE", impu1, "Content-Type: multipart/mixed;boundary=b1").Message
+	r.Body = []byte("--b1\r\nContent-Type: message/cpim\r\n\r\nFrom: <sip:anonymous@anonymous.invalid>\r\n\r\nhi\r\n" +
+		"--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\nm=message 9 TCP/MSRP *\r\n--b1--\r\n")
+	if lines := (view{req: r}).SDPLines(); !slices.Equal(lines, []string{"v=0", "m=message 9 TCP/MSRP *"}) {
+		t.Errorf("SDP %q", lines)
+	}
+	for name, body := range map[string]string{
+		"no SDP part":      "--b1\r\nContent-Type: text/plain\r\n\r\nhi\r\n--b1--\r\n",
+		"not multipart":    "garbage",
+		"another boundary": "--b2\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b2--\r\n",
+	} {
+		r.Body = []byte(body)
+		if lines := (view{req: r}).SDPLines(); lines != nil {
+			t.Errorf("%s: SDP %q", name, lines)
+		}
+	}
+	// An SDP part past the parts looked through is not read.
+	var b strings.Builder
+	for range maxParts {
+		b.WriteString("--b1\r\nContent-Type: text/plain\r\n\r\nx\r\n")
+	}
+	b.WriteString("--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--\r\n")
+	r.Body = []byte(b.String())
+	if lines := (view{req: r}).SDPLines(); lines != nil {
+		t.Errorf("an SDP part past %d parts: %q", maxParts, lines)
 	}
 }

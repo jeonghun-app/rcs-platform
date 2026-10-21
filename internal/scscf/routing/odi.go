@@ -38,6 +38,9 @@ type position struct {
 	// keeps seeing: the one the S-CSCF puts in toward a server replaces it
 	// (TS 24.229 §5.4.3.2), and hiding that would hide the request's own.
 	kept bool
+	// expires is when the position signed for the request opened stops
+	// opening, zero for one not opened.
+	expires time.Time
 }
 
 // Bits of the flags byte of a signed position.
@@ -109,6 +112,7 @@ func (rt *Router) openODI(v, callID string, now time.Time) (position, error) {
 		kept:       payload[9]&flagKept != 0,
 		priority:   int(int32(binary.BigEndian.Uint32(payload[10:]))),
 		served:     string(payload[14:]),
+		expires:    time.Unix(expires, 0).UTC(),
 	}, nil
 }
 

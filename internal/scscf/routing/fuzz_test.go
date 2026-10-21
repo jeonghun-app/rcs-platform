@@ -55,6 +55,7 @@ func FuzzODI(f *testing.F) {
 		pos := position{served: served, scase: ifc.SessionCase(scase), registered: registered, kept: kept, priority: int(priority)}
 		signed := rt.signODI(pos, callID, t0.Add(time.Minute))
 		got, err := rt.openODI(signed, callID, t0)
+		pos.expires = t0.Add(time.Minute)
 		if err != nil || got != pos {
 			t.Fatalf("signed %+v, opened %+v, %v", pos, got, err)
 		}

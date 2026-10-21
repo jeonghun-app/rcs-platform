@@ -2,6 +2,8 @@ package routing
 
 import (
 	"bytes"
+	"io"
+	"mime/multipart"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -60,14 +62,63 @@ func (v view) HeaderFields() []ifc.HeaderField {
 
 func (v view) SDPLines() []string {
 	ct, err := v.req.Header.ContentType()
-	if err != nil || !strings.EqualFold(ct.Type, "application") || !strings.EqualFold(ct.Subtype, "sdp") {
+	if err != nil {
+		return nil
+	}
+	body := v.req.Body
+	switch {
+	case isSDP(ct):
+	case strings.EqualFold(ct.Type, "multipart"):
+		if body = sdpPart(ct, body); body == nil {
+			return nil
+		}
+	default:
 		return nil
 	}
 	var out []string
-	for _, l := range bytes.Split(v.req.Body, []byte("\n")) {
+	for _, l := range bytes.Split(body, []byte("\n")) {
 		if l = bytes.TrimRight(l, "\r"); len(l) > 0 {
 			out = append(out, string(l))
 		}
 	}
 	return out
+}
+
+func isSDP(ct sip.MediaType) bool {
+	return strings.EqualFold(ct.Type, "application") && strings.EqualFold(ct.Subtype, "sdp")
+}
+
+// maxParts bounds the parts of a multipart body sdpPart looks through: an
+// RCS INVITE carries two, its SDP and the first message (CPIM).
+const maxParts = 8
+
+// sdpPart is the first application/sdp part of a multipart body, as
+// rcsjta's chat INVITE with its first message has (RFC 2046 §5.1), read up
+// to what iFC examine of an SDP (ifc.MaxSDPBytes); nil without one, or if
+// the body does not read.
+func sdpPart(ct sip.MediaType, body []byte) []byte {
+	boundary, ok := ct.Params.Get("boundary")
+	if !ok || boundary == "" {
+		return nil
+	}
+	r := multipart.NewReader(bytes.NewReader(body), boundary)
+	for range maxParts {
+		p, err := r.NextPart()
+		if err != nil {
+			return nil
+		}
+		var h sip.Header
+		if h.Add("Content-Type", p.Header.Get("Content-Type")) != nil {
+			continue
+		}
+		if pct, err := h.ContentType(); err != nil || !isSDP(pct) {
+			continue
+		}
+		b, err := io.ReadAll(io.LimitReader(p, ifc.MaxSDPBytes))
+		if err != nil {
+			return nil
+		}
+		return b
+	}
+	return nil
 }

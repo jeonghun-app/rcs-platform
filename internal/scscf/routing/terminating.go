@@ -64,6 +64,10 @@ func (rt *Router) terminating(ctx context.Context, r *proxy.Request) step {
 		rt.count("routing.terminating.not_registered")
 		return answer(480, "Temporarily Unavailable")
 	case errors.Is(err, registrar.ErrServedElsewhere):
+		// §5.4.3.3 would have a 305 name the other S-CSCF; every instance
+		// shares one name here (ADR 0005), so the I-CSCF's choice and the
+		// HSS's disagree only for a moment, which 480 lets the caller wait
+		// out.
 		rt.count("routing.terminating.served_elsewhere")
 		return answer(480, "Temporarily Unavailable")
 	case err != nil:

@@ -24,10 +24,19 @@
 // for the set: the request goes to its application server, the Request-URI
 // unchanged, with P-Served-User naming the served user and the session
 // case, and a Route back to the S-CSCF. A server that does not answer, by
-// a timeout (Config.ASTimeout, for any request but INVITE), a transport
-// failure or a 408, is passed over if its criterion's default handling
-// continues the session; any answer of its own goes upstream unchanged, a
-// 500 with Retry-After included. iFC see the request without a
+// a timeout (Config.ASTimeout, for any request but INVITE) or a transport
+// failure, or answers 408 or 5xx, without a provisional response first and
+// before it sent the request back, has its criterion's default handling
+// apply: SESSION_CONTINUED passes it over, SESSION_TERMINATED sends its
+// answer upstream, a 500 with Retry-After included. Whether it sent the
+// request back is settled in the store, as the request may come back to
+// another instance (state.AttemptODI): the first of the two to go on with
+// the position does, and the other is refused. Any other answer of a
+// server's goes upstream unchanged. The position is bound to the Call-ID,
+// so a B2BUA application server that sends the request on in a dialog of
+// its own is not supported (ADR 0005). The SDP iFC see is a request's
+// application/sdp body, or the first such part of a multipart one, as
+// rcsjta's chat INVITE with its first message has. iFC see the request without a
 // P-Served-User unless it came with one of its own and not from a P-CSCF:
 // the one the S-CSCF inserted comes back with the request, and must not
 // make rcs-as's triggers, which skip requests rcs-as sends for its users
