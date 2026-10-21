@@ -84,8 +84,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
-		OnFlowClosed:   fl.closed,
-		Logger:         rt.Logger,
+		OnFlowClosed: func(id transport.FlowID, info transport.FlowInfo) {
+			fl.closed(id, info)
+			// A request the core sent the client over this flow gets 430
+			// now rather than waiting for Timer B or F (#234).
+			if px := p.Load(); px != nil {
+				px.FlowClosed(id)
+			}
+		},
+		Logger: rt.Logger,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
@@ -212,7 +219,23 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
+	awaitAnswers(px, tr, answersWait)
 	return nil
+}
+
+// awaitAnswers returns once no request is in progress and the transport has
+// written what it queued, or after d in all. It polls, since a flow's close
+// reaches the proxy on a goroutine of the transport's. The second wait is
+// for the answers just sent: Transport.Close drops what its send queues
+// still hold (QA of #293). #281's Proxy.Drain replaces it.
+func awaitAnswers(px *proxy.Proxy, tr *transport.Transport, d time.Duration) {
+	end := time.Now().Add(d)
+	for px.Stats().Contexts > 0 && time.Now().Before(end) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	for tr.Stats().QueuedBytes > 0 && time.Now().Before(end) {
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // relayDialer opens the connections to msrp-relay's control API: in
