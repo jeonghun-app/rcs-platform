@@ -207,7 +207,7 @@ participating function and store messages for users who are offline
 
 | Priority | Trigger | Default handling |
 |---|---|---|
-| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service`, or an MSRP stream (`m=message … TCP/MSRP` or `TCP/TLS/MSRP`, in any case) in its SDP | SESSION_TERMINATED |
+| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service`, or an MSRP stream (`m=message … TCP/MSRP` or `TCP/TLS/MSRP`, in any case) in its SDP when no feature tag names a service (no ICSI or IARI) | SESSION_TERMINATED |
 | 20 | MESSAGE | SESSION_TERMINATED |
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
@@ -229,6 +229,11 @@ literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.`,
 `3gpp-application\.ims\.iari\.rcs\.` or `\+g\.oma\.sip-im`), the ICSI and IARI
 text after `urn-7`, which is the same in percent-encoded feature tags and in the
 plain service headers, or the OMA SIMPLE IM tag, with which rcsjta asks for a chat.
+An INVITE that offers MSRP but names no service in a feature tag is taken for
+a chat too, so that a client cannot send a chat past `rcs-as` by leaving its tags
+out (#359). One that names another service, such as image share
+(`iari.gsma-is`), or a call's ICSI, goes to the callee as before: the platform
+does not serve those, and `rcs-as` would refuse them.
 The profile is created at start if missing; an operator's changes to it are kept.
 So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
 (#137) keeps its old triggers until an operator updates it through the API. No

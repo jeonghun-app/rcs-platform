@@ -113,3 +113,37 @@ func TestSDPAndIFCAgreeOnWhatIsAnMSRPStream(t *testing.T) {
 		})
 	}
 }
+
+// TestAnMSRPOfferThatNamesAnotherServiceSkipsRCSAS (#359 code review): the
+// MSRP stream takes an INVITE to rcs-as only when no feature tag names a
+// service; image share, which names its IARI however spelled, or a call
+// that names its ICSI, goes on as before.
+func TestAnMSRPOfferThatNamesAnotherServiceSkipsRCSAS(t *testing.T) {
+	set, err := ifc.Compile(hssprofile.DefaultRCSProfile(hssprofile.DefaultProfileID, rcsAS).Criteria)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=message 9 TCP/MSRP *\r\na=file-selector:type:image/jpeg\r\n"
+	for name, c := range map[string]struct {
+		fields []string
+		chat   bool
+	}{
+		"no service named":               {nil, true},
+		"image share":                    {[]string{`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`}, false},
+		"image share, spelled otherwise": {[]string{`Contact: <sip:ue3@192.0.2.13:5060>;+G.3GPP.IARI-REF="URN%3aURN-7%3a3GPP-APPLICATION.IMS.IARI.GSMA-IS"`}, false},
+		"a call's ICSI":                  {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`}, false},
+		"the chat ICSI":                  {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := request(t, "INVITE", impu1, append(c.fields, "Content-Type: application/sdp")...).Message
+			r.Body = []byte(body)
+			matched, err := set.Match(view{req: r, hide: "P-Served-User"}, ifc.Context{Case: ifc.TerminatingRegistered})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.ContainsFunc(matched, func(fc ifc.FilterCriteria) bool { return fc.Priority == 10 }); got != c.chat {
+				t.Errorf("to rcs-as %v, want %v", got, c.chat)
+			}
+		})
+	}
+}
