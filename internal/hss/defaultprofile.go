@@ -25,8 +25,12 @@ const (
 	// An MSRP message stream in a session description's m= line, which a
 	// chat's or a file transfer's INVITE offers whatever its feature tags
 	// say (RFC 4975 §8.1): the trigger then holds even for a request that
-	// names its service in a way no feature-tag pattern expects.
-	msrpMedia = `^message .*MSRP`
+	// names its service in a way no feature-tag pattern expects. It takes
+	// the lines sdp.Media.IsMSRP takes, whose media type and protocol
+	// compare without case, so that no spelling of the stream reaches the
+	// callee as MSRP and past rcs-as (#359 security review). An ERE has no
+	// case flag, hence the bracket pairs.
+	msrpMedia = `^[Mm][Ee][Ss][Ss][Aa][Gg][Ee] [^ ]+ [Tt][Cc][Pp]/([Tt][Ll][Ss]/)?[Mm][Ss][Rr][Pp] `
 )
 
 // featureTagHeaders carry the caller's and callee's feature tags;

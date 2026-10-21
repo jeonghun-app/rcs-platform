@@ -207,7 +207,7 @@ participating function and store messages for users who are offline
 
 | Priority | Trigger | Default handling |
 |---|---|---|
-| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service`, or an MSRP stream (`m=message … MSRP`) in its SDP | SESSION_TERMINATED |
+| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service`, or an MSRP stream (`m=message … TCP/MSRP` or `TCP/TLS/MSRP`, in any case) in its SDP | SESSION_TERMINATED |
 | 20 | MESSAGE | SESSION_TERMINATED |
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
