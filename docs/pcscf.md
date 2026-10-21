@@ -628,8 +628,10 @@ On SIGTERM `pcscf` stops accepting client connections and closes the client
 flows one by one, evenly spread over `PCSCF_DRAIN_TIMEOUT`. A flow that
 already ended takes no time of its own. The core listener stays open until
 the end, so `scscf` can still reach the clients not yet closed. After the last
-flow, `pcscf` waits up to 2 s of the 5 s margin for the requests still in
-progress, so a request on one of the last flows closed still gets its 430. A stopping task's
+flow, `pcscf` spends up to 4 s of the 5 s margin on the requests still in
+progress: up to 2 s waiting for them, then it answers what is left 500 with
+`Retry-After` (`proxy.Drain`, #281), so its sender tries another task at
+once, and waits up to 2 s more for those answers to be written. The wait is also what lets a request on one of the last flows closed get its 430 first (#234). A stopping task's
 clients then reconnect to another task and re-register over the stop
 timeout, not all at once, and `hss` and `scscf` are sized for that burst
 ([ADR 0003](adr/0003-aws-topology.md)).
