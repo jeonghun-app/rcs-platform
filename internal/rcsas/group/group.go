@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -340,7 +341,9 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		return groupstore.Group{}, err
 	}
 	conv := r.Conversation
-	if conv == "" {
+	if conv == "" && r.Contribution != "" {
+		conv = groupConversationID(creator, r.Contribution)
+	} else if conv == "" {
 		if conv, err = s.randomUUID(); err != nil {
 			return groupstore.Group{}, err
 		}
@@ -933,20 +936,52 @@ func (s *Service) touch(ctx context.Context, g groupstore.Group, now time.Time) 
 	}
 }
 
-// randomUUID is a random UUID (RFC 9562 §5.4, version 4), the form OMA CPM
-// asks of a Conversation-ID (Conversation Functions, Appendix C.1.1) and
-// in which the focus makes one for a group created without (#305). Groups
+// A group created without a Conversation-ID gets one in the UUID form OMA
+// CPM asks of it (Conversation Functions, Appendix C.1.1; #305). Groups
 // stored before keep the 32 hex digits they were made with: a
 // Conversation-ID is opaque, and is read and compared as stored.
+
+// randomUUID is a random UUID (RFC 9562 §5.4, version 4), for a group
+// created without a Contribution-ID either.
 func (s *Service) randomUUID() (string, error) {
 	u := make([]byte, 16)
 	if _, err := io.ReadFull(s.rand, u); err != nil {
 		return "", fmt.Errorf("group: random source: %w", err)
 	}
-	u[6] = u[6]&0x0f | 0x40 // version 4
-	u[8] = u[8]&0x3f | 0x80 // the RFC 9562 variant
+	return uuidString(u, 4), nil
+}
+
+// groupNamespace is the UUID namespace of groupConversationID's
+// name-based UUIDs, chosen for rcs-as's groups; it is not
+// messaging.PairConversationID's.
+var groupNamespace = [16]byte{0xe5, 0x1a, 0xd9, 0x37, 0x23, 0x61, 0x43, 0x3b, 0xa3, 0xe7, 0x28, 0x3a, 0x7e, 0xf6, 0x41, 0xae}
+
+// groupConversationID is the Conversation-ID of a group its creator made
+// with a Contribution-ID and no Conversation-ID: a name-based UUID (RFC
+// 9562 §5.5, version 5) of the creator's canonical identity and the
+// Contribution-ID. rcsjta restarts a group that ended (RestartGroupChat
+// Session) at the factory under the same Contribution-ID, which gives the
+// same conference URI (conferenceID); this keeps its Conversation-ID too,
+// so that a client that threads by it keeps one thread. Another creator
+// under the same Contribution-ID gets another ID. A version 5 UUID never
+// equals a version 4 one, the version digit differing.
+//
+// The ID is an unsalted hash of the creator's identity: it is personal
+// data wherever it is logged (internal/pii).
+func groupConversationID(creator, contribution string) string {
+	h := sha1.New()
+	h.Write(groupNamespace[:])
+	h.Write([]byte(creator + "\x00" + contribution))
+	return uuidString(h.Sum(nil)[:16], 5)
+}
+
+// uuidString sets u's version and the RFC 9562 variant, and writes it in
+// the 8-4-4-4-12 form.
+func uuidString(u []byte, version byte) string {
+	u[6] = u[6]&0x0f | version<<4
+	u[8] = u[8]&0x3f | 0x80
 	x := hex.EncodeToString(u)
-	return x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32], nil
+	return x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 }
 
 func (s *Service) randomHex(n int) (string, error) {

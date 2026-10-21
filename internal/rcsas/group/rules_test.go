@@ -458,3 +458,45 @@ func TestAGroupsConversationIDIsAUUID(t *testing.T) {
 		t.Fatalf("writing in the old group: %v", err)
 	}
 }
+
+// #305, lead's decision on #381: a group made under a Contribution-ID and
+// no Conversation-ID gets a name-based UUID (version 5) of its creator and
+// the Contribution-ID. rcsjta restarts an ended group under its
+// Contribution-ID, which gives the same conference URI, and the restart
+// keeps the Conversation-ID as well. Another creator under the same
+// Contribution-ID gets another ID, and a version 5 ID never meets a random
+// (version 4) one.
+func TestAGroupsConversationIDFollowsItsCreatorAndContribution(t *testing.T) {
+	r := newRig(t, Config{})
+	uuid5 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	create := func(creator, contribution string) groupstore.Group {
+		t.Helper()
+		g, err := r.s.Create(t.Context(), CreateRequest{Creator: creator, Invitees: []Invitee{{Identity: carol}}, Contribution: contribution})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	first := create(alice, "chat-id-1")
+	if !uuid5.MatchString(first.Conversation) {
+		t.Fatalf("Conversation-ID %q", first.Conversation)
+	}
+	// Never established, it ends after DefaultPendingTTL. alice's client
+	// starts it again, writing her number another way.
+	r.clock.Advance(DefaultPendingTTL + time.Second)
+	if _, err := r.s.Get(t.Context(), first.URI); !errors.Is(err, ErrNoGroup) {
+		t.Fatalf("the first group after DefaultPendingTTL: %v", err)
+	}
+	again := create("tel:+1-555-010-0001", "chat-id-1")
+	if again.URI != first.URI || again.Conversation != first.Conversation {
+		t.Fatalf("restarted as %s %q, was %s %q", again.URI, again.Conversation, first.URI, first.Conversation)
+	}
+	r.clock.Advance(DefaultPendingTTL + time.Second)
+	other := create(bob, "chat-id-1")
+	if other.Conversation == first.Conversation || !uuid5.MatchString(other.Conversation) {
+		t.Fatalf("bob's group under alice's Contribution-ID has Conversation-ID %q", other.Conversation)
+	}
+	if random := create(alice, ""); random.Conversation[14] != '4' || random.Conversation == first.Conversation {
+		t.Fatalf("a group without a Contribution-ID has Conversation-ID %q", random.Conversation)
+	}
+}
