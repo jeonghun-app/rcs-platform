@@ -398,16 +398,19 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 		}
 		return time.Since(start)
 	}
-	// Far past anything load does to two timings that last about as long,
-	// twice in a row, fails the test without parsing the whole input
-	// fifteen times more at quadratic cost (code review). Once is not
-	// enough: one burst of load can stretch a single timing that far (1 in
-	// 300 runs under the load model).
+	// Far past anything load does to two timings that last about as long
+	// fails the test without parsing the whole input fifteen times more at
+	// quadratic cost (code review). Each side is timed twice and the
+	// shorter taken: one burst of load can stretch a single timing that
+	// far (1 in 300 runs under the load model), and a burst on a single
+	// yardstick would send a quadratic parser down the slow path, which
+	// took 433 s once (code review).
 	const bound, farPast = 8, 4 * 8
-	if base := parse(small, 64); first > farPast*base {
-		if again, base := parse(data, 1), parse(small, 64); again > farPast*base {
-			t.Fatalf("parsing %d bytes once took %v and %v, a 64th of it 64 times %v: not linear", len(data), first, again, base)
-		}
+	base := parse(small, 64)
+	again := parse(data, 1)
+	base = min(base, parse(small, 64))
+	if large := min(first, again); large > farPast*base {
+		t.Fatalf("parsing %d bytes once took %v at best of two, a 64th of it 64 times %v: not linear", len(data), large, base)
 	}
 	var smallTime, largeTime time.Duration
 	for range 3 {
