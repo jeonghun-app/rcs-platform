@@ -123,6 +123,7 @@ type branch struct {
 	cancelReq    *sip.Request
 	dst          transport.Destination
 	provisional  bool
+	progress     bool
 	final        bool
 	cancel       cancelState
 	timerC       transaction.Timer
@@ -814,6 +815,7 @@ func (b *branch) received(res *sip.Response) []func() {
 	switch {
 	case code < 200:
 		b.provisional = true
+		b.progress = b.progress || code > 100
 		if c.invite && code > 100 {
 			b.armTimerC()
 		}
@@ -864,7 +866,7 @@ func (c *respContext) branchEnded(b *branch, f final, err error) []func() {
 	// service learns of every failed flow; the context waits for it, so its
 	// ctx stays valid while it runs.
 	c.pending++
-	failure := BranchFailure{Target: b.target, Response: f.res.Clone(), Err: err, Provisional: b.provisional}
+	failure := BranchFailure{Target: b.target, Response: f.res.Clone(), Err: err, Provisional: b.provisional, Progress: b.progress}
 	return []func(){func() {
 		c.p.spawn(func() {
 			targets := hook(c.ctx, failure)

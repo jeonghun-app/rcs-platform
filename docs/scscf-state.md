@@ -51,10 +51,14 @@ additionally sealed (below).
   conditional save, whichever identity it came for; each IMPU's item only
   names its set and the set's incarnation (`state.Identity`), written when
   the S-CSCF is assigned the set or the set changes, before the record that
-  names them: the record's save is the commit point, and an item naming a
-  record not saved is as good as none. A re-registration only keeps the
-  items, or repairs a missing one. A terminating request reads the IMPU's
-  item, the set and the profile. An IMPU names one set: a public identity shared by several
+  names them: the record's save is the commit point. An item naming an
+  incarnation that was never saved still finds its set's record if the
+  record lists the IMPU, is live and is not being deregistered: a
+  terminating request uses it and repairs the item in the background
+  (internal/scscf/routing), so that an interrupted REGISTER costs no call;
+  with no such record the item is as good as none. A re-registration only
+  keeps the items, or repairs one. A terminating request reads the IMPU's
+  item and the set. An IMPU names one set: a public identity shared by several
   IMPIs (TS 23.228 §4.3.3.4) is out of scope, and the second IMPI to
   register it takes the IMPU's item.
 - **Identities go before their set.** Every deregistration deletes the IMPU

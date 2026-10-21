@@ -203,6 +203,10 @@ type BranchFailure struct {
 	// 100 Trying included, before it ended: the target had the request, which
 	// a service deciding whether to try it again may need to know.
 	Provisional bool
+	// Progress reports that one of them was not 100 Trying (101-199): the
+	// target itself, not only the next hop, which sends a 100 of its own
+	// (RFC 3261 §16.2), had the request.
+	Progress bool
 }
 
 // Resolver finds the next hop for a URI (the first Route, or the Request-URI if
