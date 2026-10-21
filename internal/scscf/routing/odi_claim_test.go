@@ -22,7 +22,7 @@ func asTimeout(tg proxy.Target) proxy.BranchFailure {
 // once with one position, and each copy goes on; the default handling does
 // not go on after them.
 func TestEveryCopyAServerSendsBackGoesOn(t *testing.T) {
-	other := "sip:+15550100009@" + realm
+	other := "sip:+15550100004@" + realm
 	for name, c := range map[string]struct {
 		method string
 		start  func(t *testing.T) *proxy.Request
