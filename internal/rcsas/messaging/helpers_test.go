@@ -323,6 +323,23 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// waitProgress is waitFor for a wait that takes as long as the work it
+// waits for, on a loaded host longer than hangGuard: it fails only once
+// progress, whatever counts the work done, has stood still for hangGuard
+// (#306).
+func waitProgress(t *testing.T, what string, cond func() bool, progress func() int64) {
+	t.Helper()
+	last, since := progress(), time.Now()
+	for !cond() {
+		if p := progress(); p != last {
+			last, since = p, time.Now()
+		} else if time.Since(since) > hangGuard {
+			t.Fatalf("no progress for %v waiting for %s (at %d)", hangGuard, what, p)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // queued is how many messages are queued, unclaimed, for recipient.
 func (r *rig) queued(t *testing.T, recipient string) int {
 	t.Helper()

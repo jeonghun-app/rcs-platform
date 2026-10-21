@@ -205,10 +205,15 @@ func TestNineGroupsOfReceiptsAreAllReadByAll(t *testing.T) {
 		_, c := r.connect(t, l, LegParams{User: alice, Peer: group(g), Conversation: conv, Mode: store.Group})
 		a.listen(t, c)
 	}
-	for g := range 9 {
-		waitFor(t, fmt.Sprint("g", g, " read by all"), func() bool { return a.readByAll(fmt.Sprint("g", g), everyone[1:]) })
+	// Some 900 notifications go out: on a loaded host that takes longer
+	// than hangGuard, so the waits fail only when nothing moves (#306).
+	progress := func() int64 {
+		return a.got.Load() + r.m.get("group.summary.sent") + r.m.get("group.summary.expanded")
 	}
-	waitFor(t, "the summaries expanded", func() bool { return r.m.get("group.summary.expanded") == 9 })
+	for g := range 9 {
+		waitProgress(t, fmt.Sprint("g", g, " read by all"), func() bool { return a.readByAll(fmt.Sprint("g", g), everyone[1:]) }, progress)
+	}
+	waitProgress(t, "the summaries expanded", func() bool { return r.m.get("group.summary.expanded") == 9 }, progress)
 }
 
 // interrupting runs hook before the first RemoveSummary, once.
