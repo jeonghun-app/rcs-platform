@@ -2,12 +2,14 @@ package pcscf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -24,24 +26,39 @@ var (
 // to the client.
 func (a *anchoring) coreInvite(t *testing.T, body string) call {
 	t.Helper()
+	c, err := a.coreInviteIn(t, "", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// coreInviteIn is coreInvite with Call-ID callID, unless empty; it returns
+// the error of a decision that does not forward the INVITE or whose
+// Prepare fails.
+func (a *anchoring) coreInviteIn(t *testing.T, callID, body string) (call, error) {
+	t.Helper()
 	r := fromCore(t, "INVITE", false, []string{pathEntry}, "Contact: <sip:rcs-as@10.0.1.20:5060;transport=tcp>",
 		"Record-Route: <sip:scscf.rcs.internal;transport=tcp;lr>", "P-Called-Party-ID: <"+aliceIMPU+">")
+	if callID != "" {
+		_ = r.Message.Header.Set("Call-ID", callID)
+	}
 	if body != "" {
 		_ = r.Message.Header.Set("Content-Type", "application/sdp")
 		r.Message.Body = []byte(body)
 	}
 	d := a.p.Route(context.Background(), r)
 	if len(d.Targets) != 1 {
-		t.Fatalf("not forwarded: %+v", d)
+		return call{r: r, d: d}, fmt.Errorf("not forwarded: %+v", d)
 	}
 	req := r.Message.Clone()
 	for i := len(d.RecordRoute) - 1; i >= 0; i-- {
 		_ = req.Header.Prepend("Record-Route", d.RecordRoute[i].String())
 	}
 	if err := d.Prepare(context.Background(), d.Targets[0], req); err != nil {
-		t.Fatalf("Prepare: %v", err)
+		return call{r: r, d: d}, fmt.Errorf("Prepare: %w", err)
 	}
-	return call{r: r, d: d, req: req}
+	return call{r: r, d: d, req: req}, nil
 }
 
 // clientAnswered is alice's response with code to req, with tag a1, her
@@ -563,6 +580,7 @@ func TestRcsAsRefreshOffersRetransmittedOrRefused(t *testing.T) {
 	}
 
 	a = newAnchoring(t, 16, 100)
+	out := a.recordMetrics()
 	c = confirmedChat(t, a)
 	re = reInvite(t, a, c, "INVITE", 2, "")
 	ok = answered(t, re.req, 200, "b1", strings.Replace(rcsAsOffer, "a=setup:actpass", "a=setup:active", 1))
@@ -570,4 +588,185 @@ func TestRcsAsRefreshOffersRetransmittedOrRefused(t *testing.T) {
 	mediaOf(t, ok.Body, "m=message 0 ")
 	a.p.Route(context.Background(), inCall(t, c, "ACK", "b1", 2, ""))
 	checkEndSeq(t, a, "b1", reasonOfferRefused, "3 BYE")
+	// Counted as the offer it is, not as the relay failing (#315 code
+	// review 4).
+	a.p.metrics.Flush()
+	if !strings.Contains(out.String(), `"`+metricEndedOffer+`":1`) || strings.Contains(out.String(), metricEndedRelay) {
+		t.Errorf("metrics %s", out.String())
+	}
+}
+
+// recordMetrics has a's pcscf write its metrics to the returned builder.
+func (a *anchoring) recordMetrics() *strings.Builder {
+	out := &strings.Builder{}
+	a.p.metrics = runtime.NewMetrics(out, "RCS", "pcscf", a.clock.now, a.p.log)
+	return out
+}
+
+// #315 code review 2: the sessions rcs-as starts toward a flow take from a
+// share of their own. With that share full, alice still starts her own
+// chat, and only the next session coming in is refused, 503.
+func TestIncomingSessionsLeaveTheClientItsOwnShare(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	for i := range 16 {
+		if _, err := a.coreInviteIn(t, fmt.Sprintf("term-%d", i), rcsAsOffer); err != nil {
+			t.Fatalf("incoming session %d: %v", i, err)
+		}
+	}
+	c := a.invite(t, "chat-own", "application/sdp", clientChatOffer)
+	mediaOf(t, c.req.Body, "a=path:"+corePathFor(17))
+	if a.p.msrp.limit.held() != 17 {
+		t.Fatalf("held %d", a.p.msrp.limit.held())
+	}
+	if _, err := a.coreInviteIn(t, "term-16", rcsAsOffer); !errors.Is(err, errBindingLimit) {
+		t.Fatalf("a 17th incoming session: %v", err)
+	}
+}
+
+// #315 code review 1: rcsjta, as the refresher, sends a re-INVITE without
+// an offer, and acknowledges the offer rcs-as makes in the 2xx (#252) with
+// an ACK without an answer (SessionTimerManager). The exchange is given
+// up: the session goes on with its binding, and neither the next refresh
+// nor an offer is 491. An ACK of an earlier 2xx, sent again, gives up
+// nothing.
+func TestAnACKWithoutTheAnswerToARefreshOfferGivesItUp(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	c := confirmedChat(t, a)
+	calls := len(a.relay.log())
+	for seq := 2; seq <= 3; seq++ {
+		re := reInvite(t, a, c, "INVITE", seq, "")
+		if re.req == nil {
+			t.Fatalf("refresh %d: %+v", seq, re.d)
+		}
+		ok := answered(t, re.req, 200, "b1", rcsAsOffer)
+		re.d.OnResponse(context.Background(), ok)
+		mediaOf(t, ok.Body, "a=path:"+clientPathFor(1))
+		if seq == 3 {
+			a.p.Route(context.Background(), inCall(t, c, "ACK", "b1", 1, ""))
+			if d := a.p.Route(context.Background(), inCall(t, c, "UPDATE", "b1", 4, clientChatOffer)); d.Status != 491 {
+				t.Fatalf("an offer before the refresh's ACK: %+v", d)
+			}
+		}
+		a.p.Route(context.Background(), inCall(t, c, "ACK", "b1", seq, ""))
+	}
+	if re := reInvite(t, a, c, "INVITE", 5, clientChatOffer); re.req == nil {
+		t.Fatalf("an offer after the refreshes: %+v", re.d)
+	}
+	a.settle()
+	if len(a.sent.take(a.p)) != 0 || a.p.msrp.limit.held() != 1 || len(a.relay.log()) != calls {
+		t.Errorf("held %d, calls %q", a.p.msrp.limit.held(), a.relay.log())
+	}
+}
+
+// An offer in a 2xx that made a binding, as one that moves rcs-as's path,
+// leaves the relay without the client's path for it: an ACK without the
+// answer ends the session with BYE 488, and its bindings go. So does the
+// ACK to the offer in the 2xx of an INVITE without one.
+func TestAnACKWithoutTheAnswerToANewBindingEndsTheSession(t *testing.T) {
+	moved := strings.Replace(rcsAsOffer, "as9f2c1", "m0v3d9x", 1)
+	t.Run("refresh", func(t *testing.T) {
+		a := newAnchoring(t, 16, 100)
+		out := a.recordMetrics()
+		c := confirmedChat(t, a)
+		re := reInvite(t, a, c, "INVITE", 2, "")
+		re.d.OnResponse(context.Background(), answered(t, re.req, 200, "b1", moved))
+		if a.relay.count(http.MethodPost) != 2 {
+			t.Fatalf("calls %q", a.relay.log())
+		}
+		a.p.Route(context.Background(), inCall(t, c, "ACK", "b1", 2, ""))
+		a.settle()
+		checkEndSeq(t, a, "b1", reasonNoAnswer, "3 BYE")
+		a.p.metrics.Flush()
+		if a.p.msrp.limit.held() != 0 || a.relay.count(http.MethodDelete) != 2 || !strings.Contains(out.String(), `"`+metricEndedNoAnswer+`":1`) {
+			t.Errorf("held %d, calls %q, metrics %s", a.p.msrp.limit.held(), a.relay.log(), out.String())
+		}
+	})
+	t.Run("setup", func(t *testing.T) {
+		a := newAnchoring(t, 16, 100)
+		c := a.invite(t, "chat-1", "", "")
+		ok := c.respond(answered(t, c.req, 200, "b1", rcsAsOffer))
+		a.p.Route(context.Background(), ackFor(t, c, ok))
+		a.settle()
+		checkEnd(t, a, "b1", reasonNoAnswer)
+		if a.p.msrp.limit.held() != 0 || len(a.p.msrp.all()) != 0 {
+			t.Errorf("held %d", a.p.msrp.limit.held())
+		}
+	})
+}
+
+// #315 code review 3: rcs-as's offer in a reliable 183 to a re-INVITE
+// without one, which the client answers passive in the PRACK, ends the
+// session with BYE 488 after the 2xx (#136 part 2, decision 3); so does a
+// PRACK without the answer to one that made a binding.
+func TestAPRACKThatCannotServeARefreshOfferEndsTheSession(t *testing.T) {
+	for name, tc := range map[string]struct{ offer, prack, reason string }{
+		"passive":   {rcsAsOffer, strings.Replace(clientAnswer, "a=setup:active", "a=setup:passive", 1), reasonDirection},
+		"no answer": {strings.Replace(rcsAsOffer, "as9f2c1", "m0v3d9x", 1), "", reasonNoAnswer},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAnchoring(t, 16, 100)
+			c := confirmedChat(t, a)
+			re := reInvite(t, a, c, "INVITE", 2, "")
+			early := answered(t, re.req, 183, "b1", tc.offer)
+			_ = early.Header.Set("Require", "100rel")
+			_ = early.Header.Set("RSeq", "1")
+			re.d.OnResponse(context.Background(), early)
+			prack := inCall(t, c, "PRACK", "b1", 3, tc.prack)
+			_ = prack.Message.Header.Set("RAck", "1 2 INVITE")
+			d := a.p.Route(context.Background(), prack)
+			if len(d.Targets) != 1 {
+				t.Fatalf("PRACK: %+v", d)
+			}
+			if d.Prepare != nil {
+				if err := d.Prepare(context.Background(), d.Targets[0], prack.Message.Clone()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			re.d.OnResponse(context.Background(), answered(t, re.req, 200, "b1", ""))
+			a.settle()
+			if sent := a.sent.take(a.p); len(sent) != 0 {
+				t.Fatalf("%d sent before the ACK", len(sent))
+			}
+			a.p.Route(context.Background(), inCall(t, c, "ACK", "b1", 2, ""))
+			a.settle()
+			checkEndSeq(t, a, "b1", tc.reason, "4 BYE")
+			if a.p.msrp.limit.held() != 0 {
+				t.Errorf("held %d", a.p.msrp.limit.held())
+			}
+		})
+	}
+}
+
+// #315 code review 5: a refresh offer that declines the MSRP line (port 0,
+// RFC 3264 §8.2) goes to rcs-as without the client's path, and the line's
+// binding goes once rcs-as answers. An INVITE whose MSRP line is declined
+// goes without it too.
+func TestADeclinedLineGoesWithoutItsPathAndReleasesItsBinding(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	c := confirmedChat(t, a)
+	declined := strings.Replace(clientChatOffer, "m=message 9 ", "m=message 0 ", 1)
+	re := reInvite(t, a, c, "INVITE", 2, declined)
+	if re.req == nil {
+		t.Fatalf("refresh: %+v", re.d)
+	}
+	if strings.Contains(string(re.req.Body), "a=path:") {
+		t.Errorf("the client's path went to rcs-as:\n%s", re.req.Body)
+	}
+	if a.relay.count(http.MethodDelete) != 0 {
+		t.Fatalf("released before the answer: %q", a.relay.log())
+	}
+	re.d.OnResponse(context.Background(), answered(t, re.req, 200, "b1", strings.Replace(rcsAsAnswer, "m=message 2855 ", "m=message 0 ", 1)))
+	a.settle()
+	if a.relay.count(http.MethodDelete) != 1 || a.p.msrp.limit.held() != 0 {
+		t.Errorf("held %d, calls %q", a.p.msrp.limit.held(), a.relay.log())
+	}
+	if len(a.sent.take(a.p)) != 0 {
+		t.Error("the session was ended")
+	}
+
+	b := newAnchoring(t, 16, 100)
+	in := b.invite(t, "chat-2", "application/sdp", declined)
+	if strings.Contains(string(in.req.Body), "a=path:") || !strings.Contains(string(in.req.Body), "m=message 0 ") || len(b.relay.log()) != 0 {
+		t.Errorf("calls %q, INVITE to rcs-as:\n%s", b.relay.log(), in.req.Body)
+	}
 }

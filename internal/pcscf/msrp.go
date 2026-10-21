@@ -59,6 +59,8 @@ const (
 	metricEndedDirection   = "msrp.ended.direction"
 	metricEndedSecond      = "msrp.ended.second_answer"
 	metricEndedRelay       = "msrp.ended.relay_failed"
+	metricEndedOffer       = "msrp.ended.offer_refused"
+	metricEndedNoAnswer    = "msrp.ended.no_answer"
 	metricRelayErrors      = "msrp.relay_errors"
 	metricByeFailed        = "msrp.bye_failed"
 	reasonDirection        = `SIP;cause=488;text="MSRP direction not supported"`
@@ -195,6 +197,13 @@ func newSession(flow transport.FlowID, origin side, invite *sip.Request, now tim
 		s.clientTag = strings.ToLower(from.Tag())
 	}
 	return s
+}
+
+// share is the share of the binding limits s's bindings come from: its
+// flow's own, or, for a session rcs-as started, its flow's terminating
+// share. key and origin never change.
+func (s *msrpSession) share() share {
+	return share{flow: s.key.flow, terminating: s.origin == coreSide}
 }
 
 // msrpAnchor is the anchoring state of a task: the relay client, nil
@@ -352,7 +361,7 @@ func (p *pcscf) releaseLine(s *msrpSession, l *anchoredLine) {
 		return
 	}
 	l.released = true
-	p.msrp.limit.give(s.key.flow, 1)
+	p.msrp.limit.give(s.share(), 1)
 	id := p.msrp.relay
 	bid := l.binding.ID
 	p.msrp.goRun(func(ctx context.Context) {
@@ -371,7 +380,7 @@ func (p *pcscf) releaseNow(ctx context.Context, s *msrpSession) {
 	for _, l := range s.every {
 		if !l.released && l.binding.ID != "" {
 			l.released = true
-			p.msrp.limit.give(s.key.flow, 1)
+			p.msrp.limit.give(s.share(), 1)
 			ids = append(ids, l.binding.ID)
 		}
 	}
@@ -430,6 +439,10 @@ func (p *pcscf) sendEnd(s *msrpSession, e pendingEnd) {
 		p.count(metricEndedDirection, 1)
 	case reasonSecondAnswer:
 		p.count(metricEndedSecond, 1)
+	case reasonOfferRefused:
+		p.count(metricEndedOffer, 1)
+	case reasonNoAnswer:
+		p.count(metricEndedNoAnswer, 1)
 	default:
 		p.count(metricEndedRelay, 1)
 	}

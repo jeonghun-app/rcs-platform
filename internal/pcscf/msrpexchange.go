@@ -30,16 +30,22 @@ import (
 type exchange struct {
 	offerer side
 	// inResponse says the offer came in a response, with To tag tag, its
-	// answer coming in an ACK or a PRACK.
+	// answer coming in an ACK or a PRACK; cseq and rseq are the response's
+	// CSeq number and RSeq, 0 in a 2xx, by which that ACK or PRACK is known
+	// (acknowledges).
 	inResponse bool
 	tag        string
+	cseq, rseq uint32
 	// offerIn is the offer as it came and offerOut as it went, so that a
 	// retransmission goes the same (proxy Decision.OnResponse).
 	offerIn, offerOut []byte
 	// lines are the bindings that serve the offer's MSRP lines, by m= line
-	// index, and fresh says which were made for it.
-	lines map[int]*anchoredLine
-	fresh map[int]bool
+	// index, and fresh says which were made for it. dropped are the lines
+	// of the session the offer no longer has with a port (RFC 3264 §8.2),
+	// whose bindings go once the exchange is taken (#315 code review 5).
+	lines   map[int]*anchoredLine
+	fresh   map[int]bool
+	dropped map[int]bool
 	// answered says an answer came, in a message with To tag answerTag;
 	// answerIn and answerOut are as for the offer, and failed is the Reason
 	// that ends the dialog if pcscf cannot serve it. declined are the lines
@@ -118,7 +124,7 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 	if p.msrp.relay == nil {
 		return nil, 0, errNoRelay
 	}
-	wait, err := p.msrp.limit.take(s.key.flow, len(want))
+	wait, err := p.msrp.limit.take(s.share(), len(want))
 	if err != nil {
 		return nil, wait, err
 	}
@@ -129,7 +135,7 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 			p.releaseLine(s, l)
 		}
 		s.mu.Unlock()
-		p.msrp.limit.give(s.key.flow, len(want)-len(made))
+		p.msrp.limit.give(s.share(), len(want)-len(made))
 		return nil, 0, err
 	}
 	for _, i := range sortedKeys(want) {
@@ -179,22 +185,30 @@ func sortedKeys[V any](m map[int]V) []int {
 // may be held, s.mu must not be. On an error nothing is held, and the wait
 // is the rate's (refusalOf).
 func (p *pcscf) anchorOffer(ctx context.Context, s *msrpSession, from side, d []byte) (*exchange, []byte, time.Duration, error) {
-	offer, lines, err := offerLines(d, from, p.msrp.limit.most())
+	offer, lines, err := offerLines(d, from, p.msrp.limit.most(s.origin == coreSide))
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	x := &exchange{offerer: from, offerIn: slices.Clone(d), lines: map[int]*anchoredLine{}, fresh: map[int]bool{}, declined: map[int]bool{}}
+	x := &exchange{offerer: from, offerIn: slices.Clone(d), lines: map[int]*anchoredLine{}, fresh: map[int]bool{},
+		dropped: map[int]bool{}, declined: map[int]bool{}}
 	want := map[int][]string{}
 	s.mu.Lock()
 	if s.released {
 		s.mu.Unlock()
 		return nil, nil, 0, errNoRelay
 	}
+	offered := map[int]bool{}
 	for _, l := range lines {
+		offered[l.index] = true
 		if cur := s.lines[l.index]; cur != nil && !cur.released && slices.Equal(cur.pathOf(from), l.path) {
 			x.lines[l.index] = cur
 		} else {
 			want[l.index] = l.path
+		}
+	}
+	for i := range s.lines {
+		if !offered[i] {
+			x.dropped[i] = true
 		}
 	}
 	s.mu.Unlock()
@@ -342,6 +356,12 @@ func (p *pcscf) commit(s *msrpSession, x *exchange) {
 	x.settled = true
 	if s.x == x {
 		s.x = nil
+	}
+	for i := range x.dropped {
+		if old := s.lines[i]; old != nil {
+			p.releaseLine(s, old)
+			delete(s.lines, i)
+		}
 	}
 	for i, l := range x.lines {
 		old := s.lines[i]

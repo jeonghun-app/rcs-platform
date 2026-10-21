@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -26,8 +28,13 @@ import (
 var errFlowClosed = errors.New("pcscf: the client's flow closed")
 
 // reasonOfferRefused ends a dialog whose MSRP offer came in a response and
-// could not be anchored, as an offer pcscf refuses.
-const reasonOfferRefused = `SIP;cause=488;text="MSRP offer not supported"`
+// could not be anchored, as an offer pcscf refuses; reasonNoAnswer one
+// whose offer in a response got no answer in the ACK or PRACK, and made
+// bindings the relay has no answerer's path for (answerMissing).
+const (
+	reasonOfferRefused = `SIP;cause=488;text="MSRP offer not supported"`
+	reasonNoAnswer     = `SIP;cause=488;text="MSRP answer missing"`
+)
 
 // refuseOffer answers an offer pcscf will not anchor with 488 (ADR 0004).
 func (p *pcscf) refuseOffer() proxy.Decision {
@@ -58,10 +65,14 @@ func (p *pcscf) anchorInitial(r *proxy.Request, d proxy.Decision, from side, flo
 		return p.refuseOffer()
 	}
 	if found {
-		_, lines, err := offerLines(part.description(), from, p.msrp.limit.most())
+		offer, lines, err := offerLines(part.description(), from, p.msrp.limit.most(from == coreSide))
 		switch {
 		case err != nil:
 			return p.refuseOffer()
+		case len(lines) == 0 && from == clientSide && hasMSRP(offer):
+			// Declined MSRP lines alone: nothing to anchor, but rcs-as
+			// learns no path of the client's (#315 code review 5).
+			return withDescription(d, part, declineMSRP(part.description()))
 		case len(lines) == 0:
 			return d
 		case p.msrp.relay == nil:
@@ -102,6 +113,32 @@ func (p *pcscf) anchorInitial(r *proxy.Request, d proxy.Decision, from side, flo
 		} else {
 			p.offerToInitial(ctx, s, res)
 		}
+	}
+	return d
+}
+
+// hasMSRP reports whether s has an MSRP line, with a port or not.
+func hasMSRP(s *sdp.Session) bool {
+	for i := range s.Media {
+		if s.Media[i].IsMSRP() {
+			return true
+		}
+	}
+	return false
+}
+
+// withDescription is d sending its request with desc in place of the
+// description of its body part.
+func withDescription(d proxy.Decision, part sdpPart, desc []byte) proxy.Decision {
+	prepare := d.Prepare
+	d.Prepare = func(ctx context.Context, t proxy.Target, req *sip.Request) error {
+		if prepare != nil {
+			if err := prepare(ctx, t, req); err != nil {
+				return err
+			}
+		}
+		req.Body = part.with(desc)
+		return nil
 	}
 	return d
 }
@@ -374,6 +411,7 @@ func (p *pcscf) offerToInitial(ctx context.Context, s *msrpSession, res *sip.Res
 			out = p.declineToward(s.origin, s, d)
 		}
 		nx.inResponse, nx.tag = true, tag
+		nx.cseq, nx.rseq = responseSeqs(res)
 		s.mu.Lock()
 		s.setup, s.dialogTag = nx, tag
 		if aerr == nil {
@@ -566,13 +604,11 @@ func (p *pcscf) ackPassed(s *msrpSession, req *sip.Request, from side) {
 // that answer anchored, the same each time it is retransmitted; any other
 // description in one is refused, an ACK being dropped. An answer pcscf
 // cannot serve ends the session once the ACK has gone, or with the 2xx
-// after the PRACK.
+// after the PRACK. One without a description is answerMissing's.
 func (p *pcscf) answerInRequest(s *msrpSession, r *proxy.Request, d proxy.Decision, from side, part sdpPart, found bool) proxy.Decision {
 	method := r.Message.Method
 	if !found {
-		if method == "ACK" {
-			p.ackPassed(s, r.Message, from)
-		}
+		p.answerMissing(s, r.Message, from)
 		return d
 	}
 	desc := part.description()
@@ -617,6 +653,74 @@ func (p *pcscf) answerInRequest(s *msrpSession, r *proxy.Request, d proxy.Decisi
 		return nil
 	}
 	return d
+}
+
+// answerMissing takes an ACK or PRACK of s from side from without a
+// description. One that acknowledges the response carrying the other
+// side's offer of the exchange under way, which it should have answered
+// (RFC 3264 §4, RFC 3262 §5), gives that exchange up, so that the next
+// offer is not 491: rcsjta acknowledges so the offer rcs-as makes in the
+// 2xx of its refresh (#315 code review 1). An exchange that made bindings
+// leaves the relay without the answerer's path for them, so the session
+// ends with reasonNoAnswer: once the ACK has passed, or after the 2xx that
+// follows the PRACK. One that made none leaves the session as it was.
+func (p *pcscf) answerMissing(s *msrpSession, req *sip.Request, from side) {
+	s.answering.Lock()
+	s.mu.Lock()
+	x := s.x
+	missing := x != nil && x.inResponse && x.offerer == from.other() && !x.answered && !x.settled && acknowledges(req, x)
+	fresh := missing && len(x.fresh) > 0
+	if fresh {
+		x.failed = reasonNoAnswer
+	}
+	s.mu.Unlock()
+	if missing {
+		p.abort(s, x)
+	}
+	s.answering.Unlock()
+	if req.Method != "ACK" {
+		return
+	}
+	p.ackPassed(s, req, from)
+	if fresh {
+		p.endNow(s, reasonNoAnswer)
+	}
+}
+
+// responseSeqs returns the CSeq number of res and its RSeq, 0 for a final
+// response or one without: what the ACK or PRACK that acknowledges res
+// carries (RFC 3261 §17.1.1.3, RFC 3262 §7.2).
+func responseSeqs(res *sip.Response) (cseq, rseq uint32) {
+	if c, err := res.Header.CSeq(); err == nil {
+		cseq = c.Seq
+	}
+	if res.StatusCode < 200 {
+		if n, err := strconv.ParseUint(strings.TrimSpace(res.Header.Get("RSeq")), 10, 32); err == nil {
+			rseq = uint32(n)
+		}
+	}
+	return cseq, rseq
+}
+
+// acknowledges reports whether req, an ACK or a PRACK, acknowledges the
+// response that carried x's offer: an ACK by its INVITE's CSeq, a PRACK by
+// its RAck, the response's RSeq and CSeq (RFC 3262 §7.2). An ACK of an
+// earlier 2xx, sent again, is not one.
+func acknowledges(req *sip.Request, x *exchange) bool {
+	if req.Method == "ACK" {
+		c, err := req.Header.CSeq()
+		return err == nil && c.Seq == x.cseq
+	}
+	f := strings.Fields(req.Header.Get("RAck"))
+	if len(f) != 3 || x.rseq == 0 {
+		return false
+	}
+	rseq, err := strconv.ParseUint(f[0], 10, 32)
+	if err != nil {
+		return false
+	}
+	cseq, err := strconv.ParseUint(f[1], 10, 32)
+	return err == nil && uint32(rseq) == x.rseq && uint32(cseq) == x.cseq
 }
 
 // takeAnswer takes desc, the answer to x in an ACK or PRACK, once, and
@@ -671,7 +775,7 @@ func (p *pcscf) offerInRequest(s *msrpSession, d proxy.Decision, from side, part
 	case under:
 		return proxy.Decision{Status: 491, Reason: "Request Pending"}
 	}
-	if _, _, err := offerLines(desc, from, p.msrp.limit.most()); err != nil {
+	if _, _, err := offerLines(desc, from, p.msrp.limit.most(s.origin == coreSide)); err != nil {
 		return p.refuseOffer()
 	}
 	var refused atomic.Pointer[refusal]
@@ -870,6 +974,7 @@ func (p *pcscf) offerInResponse(s *msrpSession, d proxy.Decision, from side) pro
 			}
 			to, _ := res.Header.To()
 			nx.inResponse, nx.tag = true, strings.ToLower(to.Tag())
+			nx.cseq, nx.rseq = responseSeqs(res)
 			s.mu.Lock()
 			s.x = nx
 			s.mu.Unlock()
@@ -879,6 +984,16 @@ func (p *pcscf) offerInResponse(s *msrpSession, d proxy.Decision, from side) pro
 			setBody(res, part, x.offerOut)
 		default:
 			setBody(res, part, p.declineToward(from, s, part.description()))
+		}
+		if code >= 200 && x != nil {
+			// An answer in the PRACK that pcscf could not serve, or none
+			// at all (answerMissing), ends the session after the 2xx.
+			s.mu.Lock()
+			failed := x.failed
+			s.mu.Unlock()
+			if failed != "" {
+				p.endAfterRefresh(s, from, res, failed)
+			}
 		}
 	}
 	return d

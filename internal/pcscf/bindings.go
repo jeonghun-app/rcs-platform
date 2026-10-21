@@ -21,75 +21,113 @@ var (
 	errBindingRate  = errors.New("pcscf: MSRP bindings created too fast")
 )
 
-// bindingLimit counts the relay bindings held for each flow and in all,
-// and the bindings each flow creates, in a token bucket of perMinute that
+// A share is the bindings one client flow may hold and create: those of
+// the sessions it starts, or, terminating, those of the sessions rcs-as
+// starts toward it. The two are counted apart, so that sessions coming in
+// cannot keep a client from starting its own (#315 code review 2).
+type share struct {
+	flow        transport.FlowID
+	terminating bool
+}
+
+// shareLimits are the bindings a share may hold, and create in a minute.
+type shareLimits struct {
+	perFlow   int
+	perMinute float64
+}
+
+// bindingLimit counts the relay bindings held for each share and in all,
+// and the bindings each share creates, in a token bucket of perMinute that
 // fills at perMinute a minute. Its methods are safe for concurrent use.
 type bindingLimit struct {
-	perFlow, total int
-	perMinute      float64
-	now            func() time.Time
+	client, terminating shareLimits
+	total               int
+	now                 func() time.Time
 
 	mu      sync.Mutex
-	byFlow  map[transport.FlowID]int
-	created map[transport.FlowID]*bucket
+	byShare map[share]int
+	created map[share]*bucket
 	count   int
 }
 
+// newBindingLimit limits each share to perFlow bindings and perMinute
+// created a minute, and the task to total; terminatingShare sets other
+// limits for the sessions rcs-as starts.
 func newBindingLimit(perFlow, total, perMinute int, now func() time.Time) *bindingLimit {
-	return &bindingLimit{perFlow: perFlow, total: total, perMinute: float64(perMinute), now: now,
-		byFlow: map[transport.FlowID]int{}, created: map[transport.FlowID]*bucket{}}
+	sl := shareLimits{perFlow: perFlow, perMinute: float64(perMinute)}
+	return &bindingLimit{client: sl, terminating: sl, total: total, now: now,
+		byShare: map[share]int{}, created: map[share]*bucket{}}
 }
 
-// most is the most bindings one session can ever take: more is refused as
-// an offer, not as a wait (#248 code review 2).
-func (l *bindingLimit) most() int {
-	return min(l.perFlow, l.total, int(l.perMinute))
+// terminatingShare limits the share of the sessions rcs-as starts toward a
+// flow to perFlow bindings and perMinute created a minute.
+func (l *bindingLimit) terminatingShare(perFlow, perMinute int) *bindingLimit {
+	l.terminating = shareLimits{perFlow: perFlow, perMinute: float64(perMinute)}
+	return l
 }
 
-// take takes n bindings for flow. It takes none and returns errBindingLimit
-// if the flow or the task would go past its limit, or errBindingRate and
-// how long until the flow may create n if it created too many of late.
-func (l *bindingLimit) take(flow transport.FlowID, n int) (time.Duration, error) {
+func (l *bindingLimit) limitsOf(sh share) shareLimits {
+	if sh.terminating {
+		return l.terminating
+	}
+	return l.client
+}
+
+// most is the most bindings one session of a share, terminating or not,
+// can ever take: more is refused as an offer, not as a wait (#248 code
+// review 2).
+func (l *bindingLimit) most(terminating bool) int {
+	sl := l.limitsOf(share{terminating: terminating})
+	return min(sl.perFlow, l.total, int(sl.perMinute))
+}
+
+// take takes n bindings for sh. It takes none and returns errBindingLimit
+// if the share or the task would go past its limit, or errBindingRate and
+// how long until the share may create n if it created too many of late.
+func (l *bindingLimit) take(sh share, n int) (time.Duration, error) {
 	t := l.now()
+	sl := l.limitsOf(sh)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.byFlow[flow]+n > l.perFlow || l.count+n > l.total {
+	if l.byShare[sh]+n > sl.perFlow || l.count+n > l.total {
 		return 0, errBindingLimit
 	}
-	b := l.created[flow]
+	b := l.created[sh]
 	if b == nil {
-		b = &bucket{tokens: l.perMinute, at: t}
-		l.created[flow] = b
+		b = &bucket{tokens: sl.perMinute, at: t}
+		l.created[sh] = b
 	}
-	rate := l.perMinute / 60
-	b.tokens = min(l.perMinute, b.tokens+t.Sub(b.at).Seconds()*rate)
+	rate := sl.perMinute / 60
+	b.tokens = min(sl.perMinute, b.tokens+t.Sub(b.at).Seconds()*rate)
 	b.at = t
 	if b.tokens < float64(n) {
 		wait := math.Ceil((float64(n) - b.tokens) / rate)
 		return time.Duration(wait) * time.Second, errBindingRate
 	}
 	b.tokens -= float64(n)
-	l.byFlow[flow] += n
+	l.byShare[sh] += n
 	l.count += n
 	return 0, nil
 }
 
-// give gives back n bindings of flow that take took.
-func (l *bindingLimit) give(flow transport.FlowID, n int) {
+// give gives back n bindings of sh that take took.
+func (l *bindingLimit) give(sh share, n int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	n = min(n, l.byFlow[flow])
-	if l.byFlow[flow] -= n; l.byFlow[flow] <= 0 {
-		delete(l.byFlow, flow)
+	n = min(n, l.byShare[sh])
+	if l.byShare[sh] -= n; l.byShare[sh] <= 0 {
+		delete(l.byShare, sh)
 	}
 	l.count -= n
 }
 
-// forget drops the creation count of a flow that closed.
+// forget drops the creation counts of a flow that closed, of both its
+// shares.
 func (l *bindingLimit) forget(flow transport.FlowID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.created, flow)
+	delete(l.created, share{flow: flow})
+	delete(l.created, share{flow: flow, terminating: true})
 }
 
 // sweep drops the creation counts that have filled again, which carry no
@@ -99,9 +137,10 @@ func (l *bindingLimit) sweep() {
 	t := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for flow, b := range l.created {
-		if b.tokens+t.Sub(b.at).Seconds()*l.perMinute/60 >= l.perMinute {
-			delete(l.created, flow)
+	for sh, b := range l.created {
+		perMinute := l.limitsOf(sh).perMinute
+		if b.tokens+t.Sub(b.at).Seconds()*perMinute/60 >= perMinute {
+			delete(l.created, sh)
 		}
 	}
 }

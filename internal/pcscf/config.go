@@ -71,6 +71,11 @@ const (
 	// in a minute, whatever it holds (#248 security review): a chat or a
 	// file transfer every two seconds is far past what a person does.
 	DefaultBindingsPerMinute = 32
+	// The sessions rcs-as starts toward a client flow have a share of
+	// their own, by default the same as the client's: sessions coming in
+	// cannot keep a client from starting its own (#315 code review 2).
+	DefaultMaxTerminatingBindingsPerFlow = DefaultMaxBindingsPerFlow
+	DefaultTerminatingBindingsPerMinute  = DefaultBindingsPerMinute
 	// DefaultRelayTimeout bounds one call to msrp-relay's control API.
 	DefaultRelayTimeout = 2 * time.Second
 	// minRelayTokenLength is the shortest relay token accepted in staging
@@ -169,8 +174,10 @@ type Config struct {
 	RelayTimeout time.Duration
 	// MaxBindingsPerFlow and MaxBindings bound the relay bindings of one
 	// flow and of the task, and BindingsPerMinute those one flow creates
-	// in a minute.
-	MaxBindingsPerFlow, MaxBindings, BindingsPerMinute int
+	// in a minute, for the sessions the client starts; the Terminating
+	// two bound, apart, those of the sessions rcs-as starts toward it.
+	MaxBindingsPerFlow, MaxBindings, BindingsPerMinute          int
+	MaxTerminatingBindingsPerFlow, TerminatingBindingsPerMinute int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -215,6 +222,8 @@ func Configure(s *runtime.Settings) Config {
 	c.MaxBindingsPerFlow = e.Int("MAX_BINDINGS_PER_FLOW", DefaultMaxBindingsPerFlow)
 	c.MaxBindings = e.Int("MAX_BINDINGS", DefaultMaxBindings)
 	c.BindingsPerMinute = e.Int("BINDINGS_PER_MINUTE", DefaultBindingsPerMinute)
+	c.MaxTerminatingBindingsPerFlow = e.Int("MAX_TERMINATING_BINDINGS_PER_FLOW", DefaultMaxTerminatingBindingsPerFlow)
+	c.TerminatingBindingsPerMinute = e.Int("TERMINATING_BINDINGS_PER_MINUTE", DefaultTerminatingBindingsPerMinute)
 	if c.RelayTimeout <= 0 {
 		e.Invalid("RELAY_TIMEOUT", "must be greater than zero")
 	}
@@ -282,6 +291,8 @@ func Configure(s *runtime.Settings) Config {
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
 		{"MAX_BINDINGS_PER_FLOW", c.MaxBindingsPerFlow}, {"MAX_BINDINGS", c.MaxBindings},
 		{"BINDINGS_PER_MINUTE", c.BindingsPerMinute},
+		{"MAX_TERMINATING_BINDINGS_PER_FLOW", c.MaxTerminatingBindingsPerFlow},
+		{"TERMINATING_BINDINGS_PER_MINUTE", c.TerminatingBindingsPerMinute},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")

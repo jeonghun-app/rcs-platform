@@ -376,8 +376,15 @@ func towardClient(s *sdp.Session, anchored map[int]string, host string, answer b
 
 // towardCore writes into s, a description going to rcs-as, the relay's
 // core-side path of each line in anchored, active: the relay connects to
-// rcs-as, offer or answer (ADR 0004), on port 9 (RFC 4145 §4).
+// rcs-as, offer or answer (ADR 0004), on port 9 (RFC 4145 §4). A declined
+// MSRP line keeps no path, so that rcs-as learns none of the client's
+// (#315 code review 5).
 func towardCore(s *sdp.Session, anchored map[int]string, answer bool) error {
+	for i := range s.Media {
+		if m := &s.Media[i]; m.IsMSRP() && m.Port == 0 {
+			m.Attributes.Remove("path")
+		}
+	}
 	for i, path := range anchored {
 		if err := anchorLine(s, i, path, sdp.SetupActive, answer); err != nil {
 			return err

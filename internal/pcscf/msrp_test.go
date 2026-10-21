@@ -322,17 +322,17 @@ func TestAnUnanchoredOfferIs503(t *testing.T) {
 	}{
 		{"past the flow's limit", func(a *anchoring) {
 			a.p.msrp.limit = newBindingLimit(2, 100, 32, a.clock.now)
-			_, _ = a.p.msrp.limit.take("FLOW-A", 1)
+			_, _ = a.p.msrp.limit.take(share{flow: "FLOW-A"}, 1)
 		}, nil, 503, "1", 0},
 		{"past the task's limit", func(a *anchoring) {
 			a.p.msrp.limit = newBindingLimit(16, 2, 32, a.clock.now)
-			_, _ = a.p.msrp.limit.take("FLOW-B", 1)
+			_, _ = a.p.msrp.limit.take(share{flow: "FLOW-B"}, 1)
 		}, nil, 503, "1", 0},
 		// Two a minute: the one taken comes back in 30 s.
 		{"past the flow's rate", func(a *anchoring) {
 			a.p.msrp.limit = newBindingLimit(16, 100, 2, a.clock.now)
-			_, _ = a.p.msrp.limit.take("FLOW-A", 1)
-			a.p.msrp.limit.give("FLOW-A", 1)
+			_, _ = a.p.msrp.limit.take(share{flow: "FLOW-A"}, 1)
+			a.p.msrp.limit.give(share{flow: "FLOW-A"}, 1)
 		}, nil, 503, "30", 0},
 		{"the relay refusing", nil, func(m string, _ int) int {
 			if m == http.MethodPost {
