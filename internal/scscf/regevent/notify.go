@@ -402,21 +402,41 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 }
 
 // hold saves sub's expiry pendingEnd from now, under the version read: nil
-// if another instance changed it since, a sweep that claimed it above all,
-// or if it is gone.
+// if another instance took the final over, a sweep's claim above all, or it
+// is gone. A save that loses to a write that left the final as it was, a
+// change's NOTIFY numbering itself, reads the subscription again and holds
+// that: only a write that moved the expiry, or numbered the final, took it
+// over (#346 code review).
 func (n *Notifier) hold(ctx context.Context, sub *state.Subscription, now time.Time) *state.Subscription {
-	next := sub.Clone()
-	next.Expires = now.Add(n.pendingEnd())
-	saved, err := n.cfg.Store.SaveSubscription(ctx, next)
-	switch {
-	case errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrNotFound):
-		n.count("regevent.final_taken_over")
-		return nil
-	case err != nil:
-		n.internalLog("holding a final NOTIFY", err)
-		return nil
+	expires := sub.Expires
+	for range saveAttempts {
+		next := sub.Clone()
+		next.Expires = now.Add(n.pendingEnd())
+		saved, err := n.cfg.Store.SaveSubscription(ctx, next)
+		switch {
+		case err == nil:
+			return saved
+		case errors.Is(err, state.ErrNotFound):
+			return nil
+		case !errors.Is(err, state.ErrConflict):
+			n.internalLog("holding a final NOTIFY", err)
+			return nil
+		}
+		cur, err := n.cfg.Store.Subscription(ctx, sub.ID)
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+			return nil
+		case err != nil:
+			n.internalLog("reading a subscription", err)
+			return nil
+		case !cur.Terminated || cur.NotifiedOf == state.FinalNotify || !cur.Expires.Equal(expires):
+			n.count("regevent.final_taken_over")
+			return nil
+		}
+		sub = cur
 	}
-	return saved
+	n.count("regevent.final_taken_over")
+	return nil
 }
 
 // maxFinalSends bounds how often a final NOTIFY is sent without an answer,
