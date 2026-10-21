@@ -126,11 +126,14 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 				res := g.ok(req, r, nil, nil)
 				if setEnded {
 					// The set's last binding went: the servers hear it
-					// ended, without a body, which §5.4.1.7 g) gives only
-					// to an initial registration and a refresh.
-					tp := registeredFor(cur.Key, r.impu, ifc.DeRegistration, nil, now)
-					tp.Profile = ended
-					g.cfg.ThirdParty.Registered(ctx, tp)
+					// ended, for every identity it was registered under,
+					// without a body, which §5.4.1.7 g) gives only to an
+					// initial registration and a refresh.
+					for _, impu := range registeredIdentities(cur, r.impu) {
+						tp := registeredFor(cur.Key, impu, ifc.DeRegistration, nil, now)
+						tp.Profile = ended
+						g.cfg.ThirdParty.Registered(ctx, tp)
+					}
 				}
 				return res, nil
 			}
@@ -306,13 +309,13 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 			return nil, err
 		}
 	}
-	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings, RegisteredAs: r.impu}
+	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings, RegisteredAs: []string{r.impu}}
 	if cur != nil && cur.Key == key {
 		n.Incarnation, n.Version = cur.Incarnation, cur.Version
-		if registered && cur.RegisteredAs != "" {
-			// The servers were told of the REGISTER that made the
-			// registration, and hear of its end under that identity.
-			n.RegisteredAs = cur.RegisteredAs
+		if registered {
+			// The servers hear of the set's end under every identity a
+			// REGISTER of it was told under, which are still the set's.
+			n.RegisteredAs = withRegistered(cur.RegisteredAs, r.impu, set.identities)
 		}
 	}
 	if cur == nil || cur.Key != key || !cur.Deregistering.IsZero() {

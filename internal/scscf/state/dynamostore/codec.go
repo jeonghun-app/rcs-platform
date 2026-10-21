@@ -28,7 +28,7 @@ type registrationDoc struct {
 	Attempts      int           `json:"reassert_attempts,omitempty"`
 	// RegisteredAs is lost to an older instance's save, which is harmless:
 	// the end the network makes then names the default identity.
-	RegisteredAs string `json:"registered_as,omitempty"`
+	RegisteredAs []string `json:"registered_as,omitempty"`
 }
 
 type identityRef struct {
@@ -121,7 +121,7 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 		r.Reassert = *doc.Reassert
 	}
 	r.ReassertAttempts = doc.Attempts
-	r.RegisteredAs = doc.RegisteredAs
+	r.RegisteredAs = nilIfEmpty(doc.RegisteredAs)
 	for _, c := range doc.Contacts {
 		r.Contacts = append(r.Contacts, state.Contact{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: nilIfEmpty(c.Path), Expires: c.Expires,

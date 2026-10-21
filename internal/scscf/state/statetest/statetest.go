@@ -186,7 +186,7 @@ func Registration(impi, impu string, expiries ...time.Duration) *state.Registrat
 func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour, 2*time.Hour)
 	r.Contacts[1].Q = 500
-	r.RegisteredAs = IMPU1
+	r.RegisteredAs = []string{IMPU1, IMPU2}
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
 	if saved.Version == 0 {
 		t.Error("a saved registration has version 0")
@@ -372,7 +372,7 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	after9999 := Registration(IMPI1, IMPU1)
 	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
 	registeredAsNonCanonical := Registration(IMPI1, IMPU1, time.Hour)
-	registeredAsNonCanonical.RegisteredAs = "sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"
+	registeredAsNonCanonical.RegisteredAs = []string{"sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}
 	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999, registeredAsNonCanonical} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
@@ -393,12 +393,13 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 
 func testNoAliasing(t *testing.T, a, _ state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour)
+	r.RegisteredAs = []string{IMPU1}
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
-	r.Contacts[0].Path[0] = "changed"
-	saved.Contacts[0].Path[0] = "changed"
+	r.Contacts[0].Path[0], r.RegisteredAs[0] = "changed", "changed"
+	saved.Contacts[0].Path[0], saved.RegisteredAs[0] = "changed", "changed"
 	read := must(a.Registration(ctx(t), Key1(IMPU1)))(t)
-	read.Contacts[0].Path[0] = "changed"
-	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" {
+	read.Contacts[0].Path[0], read.RegisteredAs[0] = "changed", "changed"
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" || got.RegisteredAs[0] == "changed" {
 		t.Error("a caller's change reached the stored registration")
 	}
 }

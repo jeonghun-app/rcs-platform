@@ -2,6 +2,7 @@ package registrar
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -21,8 +22,8 @@ type ThirdParty interface {
 // of.
 type ThirdPartyRegistration struct {
 	// Set is the user's implicit registration set, and IMPU the identity
-	// registered: the REGISTER's, or for an end the network made the one
-	// the registration was made with (state.Registration.RegisteredAs).
+	// registered: the REGISTER's, or for the end of the set each one it was
+	// registered under (state.Registration.RegisteredAs), told apart.
 	Set  state.SetKey
 	IMPU string
 	Type ifc.RegistrationType
@@ -61,10 +62,35 @@ func (g *Registrar) endedByNetwork(ctx context.Context, before *state.Registrati
 	if len(before.Contacts) == 0 && !before.Unregistered.IsZero() {
 		return
 	}
-	impu := before.RegisteredAs
-	if impu == "" {
-		impu = before.Key.IMPU
+	for _, impu := range registeredIdentities(before, "") {
+		r := ThirdPartyRegistration{Set: before.Key, IMPU: impu, Type: ifc.DeRegistration, Profile: profile}
+		g.cfg.ThirdParty.Registered(ctx, r)
 	}
-	r := ThirdPartyRegistration{Set: before.Key, IMPU: impu, Type: ifc.DeRegistration, Profile: profile}
-	g.cfg.ThirdParty.Registered(ctx, r)
+}
+
+// registeredIdentities are the identities reg's set was registered under
+// and also, which the servers were told of: the set's default identity for
+// a record saved before they were kept (#379 code review).
+func registeredIdentities(reg *state.Registration, also string) []string {
+	out := slices.Clone(reg.RegisteredAs)
+	if also != "" && !slices.Contains(out, also) {
+		out = append(out, also)
+	}
+	if len(out) == 0 {
+		out = []string{reg.Key.IMPU}
+	}
+	return out
+}
+
+// withRegistered is registered with impu added, keeping only identities of
+// the set, so that it holds at most the set's identities.
+func withRegistered(registered []string, impu string, set []state.SetIdentity) []string {
+	var out []string
+	for _, r := range append(slices.Clone(registered), impu) {
+		inSet := slices.ContainsFunc(set, func(id state.SetIdentity) bool { return id.IMPU == r })
+		if inSet && !slices.Contains(out, r) {
+			out = append(out, r)
+		}
+	}
+	return out
 }

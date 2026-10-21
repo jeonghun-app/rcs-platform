@@ -2,7 +2,7 @@ package registrar
 
 import (
 	"context"
-	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -133,40 +133,67 @@ func TestARefusedRegistrationIsNotTold(t *testing.T) {
 	}
 }
 
-// TestAnEndTheNetworkMadeNamesTheIdentityRegistered (#379 code review and
-// QA): a user who registered another identity of the set than its default
-// one hears of the sweep's or an RTR's end under that identity, which the
-// servers took for registered, and a second device's REGISTER under the
-// default identity does not change it.
-func TestAnEndTheNetworkMadeNamesTheIdentityRegistered(t *testing.T) {
-	for _, how := range []string{"sweep", "RTR"} {
+// TestTheEndOfASetNamesEveryIdentityRegistered (#379 code review and QA):
+// two devices registered two identities of the set, neither its default
+// one, and the end of the set, the sweep's, an RTR's or the last device's
+// deregistration, is told of each of them, which the servers took for
+// registered.
+func TestTheEndOfASetNamesEveryIdentityRegistered(t *testing.T) {
+	for _, how := range []string{"sweep", "RTR", "deregistration"} {
 		t.Run(how, func(t *testing.T) {
 			e := newEnv(t)
 			tp := &recordedThirdParty{}
 			g := e.instance(1, withThirdParty(tp))
-			u := e.akaUser(impi1, impu2, impu3)
+			u := e.akaUser(impi1, impu1, impu2, impu3)
 			u.impu = impu3
 			u.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
 			wantStatus(t, u.registerWith(g, 600), 200)
 			other := device(u, 2)
 			other.impu = impu2
 			wantStatus(t, other.registerWith(g, 600), 200)
-			if how == "sweep" {
+			switch how {
+			case "sweep":
 				e.clock.advance(601 * time.Second)
 				if _, err := g.Sweep(bg, 10); err != nil {
 					t.Fatal(err)
 				}
-			} else {
+			case "RTR":
 				wantResult(t, g.HandleRTR(bg, &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}), resultSuccess)
+			default:
+				wantStatus(t, u.registerWith(g, 0), 200)
+				wantStatus(t, other.registerWith(g, 0), 200)
 			}
-			got := tp.got()
-			if len(got) != 3 || got[0].IMPU != impu3 || got[2].Type != ifc.DeRegistration || got[2].IMPU != impu3 {
-				var told []string
-				for _, r := range got {
-					told = append(told, fmt.Sprintf("%d %s", r.Type, r.IMPU))
+			var ended []string
+			for _, r := range tp.got() {
+				if r.Type == ifc.DeRegistration {
+					ended = append(ended, r.IMPU)
 				}
-				t.Errorf("told %v, want the end for %s", told, impu3)
+			}
+			slices.Sort(ended)
+			if want := []string{impu2, impu3}; !slices.Equal(ended, want) {
+				t.Errorf("the end told for %v, want %v", ended, want)
 			}
 		})
+	}
+}
+
+// TestTheEndOfASetSavedWithoutItsIdentitiesNamesTheREGISTERs (#379): a
+// record an older instance saved holds no RegisteredAs; the user's
+// deregistration of its last binding tells the end under the identity its
+// REGISTER names.
+func TestTheEndOfASetSavedWithoutItsIdentitiesNamesTheREGISTERs(t *testing.T) {
+	e := newEnv(t)
+	tp := &recordedThirdParty{}
+	g := e.instance(1, withThirdParty(tp))
+	u := e.akaUser(impi1, impu1, impu3)
+	u.impu = impu3
+	wantStatus(t, u.registerWith(g, 600), 200)
+	r := must(e.store.Registration(bg, set1))(t)
+	r.RegisteredAs = nil
+	must(e.store.SaveRegistration(bg, r))(t)
+	wantStatus(t, u.registerWith(g, 0), 200)
+	got := tp.got()
+	if last := got[len(got)-1]; last.Type != ifc.DeRegistration || last.IMPU != impu3 || len(got) != 2 {
+		t.Errorf("told %+v, want the end for %s alone", got, impu3)
 	}
 }
