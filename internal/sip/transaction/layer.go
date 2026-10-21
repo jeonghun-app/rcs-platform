@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"cmp"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -53,6 +54,24 @@ const (
 	MaxRetryAfter     = time.Hour
 )
 
+// DefaultTimerC is the Timer C a proxy TU uses unless configured otherwise
+// (proxy.DefaultTimerC): just over the 3 minutes RFC 3261 §16.6 step 11 sets as
+// the least Timer C may be.
+const DefaultTimerC = 3*time.Minute + time.Second
+
+// FinalTimeoutMargin is how much later than a proxy TU's own last deadline its
+// layer's safety timer fires, so the proxy's final response, or its silence,
+// always comes first.
+const FinalTimeoutMargin = 5 * time.Second
+
+// InviteFinalTimeoutFor is the least InviteFinalTimeout under a proxy TU whose
+// Timer C is timerC: the proxy cancels a branch when Timer C fires, then waits
+// 64*T1 for the 487 to its CANCEL before it answers itself (RFC 3261 §16.8,
+// §9.1).
+func InviteFinalTimeoutFor(timerC, t1 time.Duration) time.Duration {
+	return timerC + 64*t1 + FinalTimeoutMargin
+}
+
 // minTimerD is the lower bound RFC 3261 §17.1.1.2 sets for Timer D over an
 // unreliable transport.
 const minTimerD = 32 * time.Second
@@ -68,6 +87,10 @@ var (
 	// ErrDuplicate means a client transaction with the same branch and method
 	// already exists.
 	ErrDuplicate = errors.New("transaction: duplicate branch")
+	// ErrNoFinalResponse is the cause of a server transaction's Context when
+	// the TU sent no final response in time and the layer answered 500 for it,
+	// and what Respond returns for a final response sent after that.
+	ErrNoFinalResponse = errors.New("transaction: no final response from the TU in time")
 	// ErrClosed means the layer has been closed.
 	ErrClosed = errors.New("transaction: layer closed")
 	// ErrTerminated is passed to a client transaction's handler when the TU
@@ -116,7 +139,9 @@ type TU interface {
 	// its final response: Timer H fired before the ACK (ErrTimeout, RFC 3261
 	// §17.2.1), or the transport failed on a retransmission or on a delayed 100
 	// Trying the transaction sent itself (§17.2.4). Failures of a send the TU asked for
-	// are returned by Respond instead.
+	// are returned by Respond instead. It is not called for the 500 the
+	// layer sent for a TU that did not answer in time (Config.InviteFinalTimeout):
+	// the TU never sent that response, and the Context has told it already.
 	ServerFailed(tx *ServerTransaction, err error)
 }
 
@@ -193,9 +218,29 @@ type Config struct {
 	// zero takes DefaultRetryAfter, and Validate accepts up to MaxRetryAfter.
 	RetryAfter time.Duration
 	// IDs is the randomness of the layer: the key of the 503's To tags, drawn
-	// once in New, and the To tag of a response the layer makes up otherwise.
-	// The zero value draws from crypto/rand.
+	// once in New, and the To tag of a response the layer makes up otherwise,
+	// such as a safety-timer 500 when the TU sent no provisional response to
+	// take it from. The zero value draws from crypto/rand.
 	IDs sip.IDGenerator
+
+	// NonInviteFinalTimeout and InviteFinalTimeout are the safety net for a TU
+	// that never answers. A server transaction whose TU has sent no final
+	// response within the timeout is answered 500 by the layer, its Context
+	// is cancelled with ErrNoFinalResponse, and it ends as any transaction
+	// with a 500 does; so a TU bug cannot hold a transaction, and a slot of
+	// MaxServerTransactions, forever. Non-INVITE: zero takes 128*T1, and
+	// Validate refuses less than 64*T1. The client gives up at 64*T1 (Timer
+	// F), but a proxy TU forwards only after routing, and its own client
+	// transaction's Timer F, which ends the request without a reply (RFC
+	// 4320 §4.2), must come first; the safety net is for a TU that is stuck,
+	// not slow (decided on #156). INVITE: every
+	// provisional response the TU sends starts the timeout again, since a
+	// ringing call may last minutes, and zero takes
+	// InviteFinalTimeoutFor(DefaultTimerC, T1), so a proxy with the default
+	// Timer C has ended its branches first; proxy.New sets it from its own
+	// Timer C. ServerTransaction.Progress starts either timeout again.
+	NonInviteFinalTimeout time.Duration
+	InviteFinalTimeout    time.Duration
 }
 
 // Validate reports a configuration New refuses, so a service can check its
@@ -212,6 +257,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("transaction: RetryAfter %v is outside 0..%v", c.RetryAfter, MaxRetryAfter)
 	case c.T1 < 0 || c.T2 < 0 || c.T4 < 0:
 		return errors.New("transaction: negative timer base")
+	case c.NonInviteFinalTimeout < 0 || c.InviteFinalTimeout < 0:
+		return errors.New("transaction: negative final response timeout")
+	case c.NonInviteFinalTimeout != 0 && c.NonInviteFinalTimeout < 64*cmp.Or(c.T1, DefaultT1):
+		return fmt.Errorf("transaction: NonInviteFinalTimeout %v is under 64*T1, before the client and a proxy TU have given up", c.NonInviteFinalTimeout)
 	}
 	return nil
 }
@@ -235,6 +284,10 @@ type Layer struct {
 	maxBytes                   int64
 	clientServers, clientBytes int64
 	tagKey                     []byte
+	// nonInviteFinal and inviteFinal are the safety timeouts; timedOut and
+	// lateFinals count what they did.
+	nonInviteFinal, inviteFinal time.Duration
+	timedOut, lateFinals        atomic.Uint64
 
 	mu      sync.Mutex
 	clients map[string]*ClientTransaction
@@ -304,6 +357,13 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 	}
 	if l.t4 <= 0 {
 		l.t4 = DefaultT4
+	}
+	l.nonInviteFinal, l.inviteFinal = cfg.NonInviteFinalTimeout, cfg.InviteFinalTimeout
+	if l.nonInviteFinal == 0 {
+		l.nonInviteFinal = 128 * l.t1
+	}
+	if l.inviteFinal == 0 {
+		l.inviteFinal = InviteFinalTimeoutFor(DefaultTimerC, l.t1)
 	}
 	return l, nil
 }
@@ -533,6 +593,11 @@ type Stats struct {
 	ServerTransactionsRejected uint64
 	// RefusalAcksAbsorbed counts ACKs for those 503s, which go no further.
 	RefusalAcksAbsorbed uint64
+	// ServerTransactionsTimedOut counts server transactions the layer answered
+	// 500 because the TU sent no final response in time; LateFinalResponses
+	// counts final responses the TU sent after that, which were dropped.
+	ServerTransactionsTimedOut uint64
+	LateFinalResponses         uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -541,7 +606,8 @@ func (l *Layer) Stats() Stats {
 	c, s, b := len(l.clients), len(l.servers), l.serverBytes
 	l.mu.Unlock()
 	return Stats{ClientTransactions: c, ServerTransactions: s, ServerTransactionBytes: b,
-		ServerTransactionsRejected: l.rejected.Load(), RefusalAcksAbsorbed: l.absorbed.Load()}
+		ServerTransactionsRejected: l.rejected.Load(), RefusalAcksAbsorbed: l.absorbed.Load(),
+		ServerTransactionsTimedOut: l.timedOut.Load(), LateFinalResponses: l.lateFinals.Load()}
 }
 
 // matchServer finds the server transaction a request belongs to (RFC 3261

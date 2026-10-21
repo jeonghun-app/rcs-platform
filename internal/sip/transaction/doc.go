@@ -24,6 +24,14 @@
 // transaction (RFC 3261 §21.5.4, §8.2.7), and the ACK for that 503 goes no
 // further, so a flood of requests cannot grow memory without bound.
 //
+// A server transaction whose TU sends no final response in time is answered 500
+// by the layer, and its Context is cancelled so the TU can stop: after 128*T1
+// for non-INVITE, later than a proxy TU's own Timer F, and for INVITE after
+// Timer C, 64*T1 for the answer to a CANCEL and a margin since the TU's last
+// provisional response, since a ringing call may last minutes
+// (Config.InviteFinalTimeout). A TU that starts new work on the request, such
+// as a proxy's next fork group, starts the timer again (Progress).
+//
 // A client transaction sent over a flow (Destination.Flow) ends at once, with
 // ErrFlowClosed, when that flow closes before its final response
 // (Layer.FlowClosed): Timer B or F would notice only 64*T1 later.

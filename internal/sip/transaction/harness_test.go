@@ -73,6 +73,15 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// pendingAt reports whether a timer that has neither fired nor been stopped is
+// due at exactly at, measured from the start, so a test can tell that one
+// timer, by its deadline, is still armed.
+func (c *fakeClock) pendingAt(at time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.ContainsFunc(c.timers, func(t *fakeTimer) bool { return !t.done && t.at == at })
+}
+
 func (c *fakeClock) elapsed() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()

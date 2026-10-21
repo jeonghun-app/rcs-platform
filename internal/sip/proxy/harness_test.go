@@ -85,6 +85,8 @@ type fakeNet struct {
 	upstream []*sip.Response
 	// fail, if set, decides the error of each request send.
 	fail func(req *sip.Request, dst transport.Destination) error
+	// failUpstream, if set, is the error of every response send.
+	failUpstream error
 	// held, if set, stops the sends it matches until released, to stand for a
 	// peer whose connection has no room.
 	held *hold
@@ -151,6 +153,9 @@ func (n *fakeNet) SendRequest(req *sip.Request, dst transport.Destination, _ ...
 func (n *fakeNet) SendResponse(res *sip.Response, _ transport.Source, _ ...transport.SendOption) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.failUpstream != nil {
+		return n.failUpstream
+	}
 	n.upstream = append(n.upstream, res.Clone())
 	return nil
 }
