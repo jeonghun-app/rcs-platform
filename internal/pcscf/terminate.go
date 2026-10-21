@@ -66,6 +66,7 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		}
 	}
 	if entry == nil || p.clientFlow == nil || !p.clientFlow(transport.FlowID(entry.User)) {
+		p.count(metricTerminatingFlow, 1)
 		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
 	}
 	flow := transport.FlowID(entry.User)
@@ -74,6 +75,7 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 	// Inside a dialog only the Record-Route value pcscf wrote for it, not
 	// the Path or another dialog's, names the flow.
 	if !initial && !p.inDialogWith(*entry, callID) {
+		p.count(metricTerminatingRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	fallback := ""
@@ -104,7 +106,15 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 			return nil
 		},
 		// scscf, the authoritative proxy, needs the 430 (RFC 5626 §11.5).
-		OnFinal: func(context.Context, *sip.Response) {},
+		// A flow that failed as the request went is 430 too, which the
+		// proxy makes; it is counted with the ones refused above. A 430
+		// the client sent over its flow, still live, is passed on but not
+		// counted, as no flow failed (#345 QA).
+		OnFinal: func(_ context.Context, res *sip.Response) {
+			if res.StatusCode == statusFlowFailed && !p.clientFlow(flow) {
+				p.count(metricTerminatingFlow, 1)
+			}
+		},
 	}
 	// routes is the Record-Route a 1xx or 2xx must return, nil when it
 	// cannot be known: the core's did not parse, so a rewrite would lose it.

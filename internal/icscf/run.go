@@ -76,15 +76,6 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// The S-CSCFs are found by their Cloud Map names, every address of one
 	// (#198), so a request can go to the next when a task is gone.
 	dns := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Shuffle: d.shuffle, Logger: rt.Logger}
-	router, err := New(Config{
-		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
-		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
-		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
-	})
-	if err != nil {
-		return err
-	}
-
 	// The proxy is made once the core listener's port is known, which its
 	// Self needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
@@ -105,11 +96,25 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return fmt.Errorf("icscf: core listener: %w", err)
 	}
+	self := selfURIs(cfg, int(coreAddr.Port()))
+	router, err := New(Config{
+		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
+		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
+		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
+		Self: self,
+	})
+	if err != nil {
+		return err
+	}
+	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
-		Self:     selfURIs(cfg, int(coreAddr.Port())),
-		Router:   router,
-		Resolver: dns,
-		Logger:   rt.Logger,
+		Self:            self,
+		Router:          router,
+		Resolver:        dns,
+		Logger:          rt.Logger,
+		Transaction:     tcfg,
+		MaxContexts:     maxContexts,
+		MaxContextBytes: maxContextBytes,
 		// A REGISTER left at the stop gets 503, which pcscf retries on
 		// another icscf at once (decided on #310).
 		DrainAnswer: drainAnswer,
@@ -149,6 +154,22 @@ func drainAnswer(req *sip.Request) (int, time.Duration) {
 		return 503, transaction.DefaultRetryAfter
 	}
 	return 500, transaction.DefaultRetryAfter
+}
+
+// proxyLimits are the bounds of icscf's proxy: its layer's server
+// transaction caps (#37); as many contexts as server transactions, so the
+// layer's count, not the proxy's, is the one a burst meets; and the same
+// bytes for the proxy's own memory bound, which the proxy charges
+// differently (a request's body, two copies of its header, and two per
+// branch), so either may refuse a request first. Both refusals are counted:
+// the layer's ServerTransactionsRejected and the proxy's Overloaded (code
+// review of #311, option A).
+func proxyLimits(cfg ServiceConfig) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
+	tcfg = transaction.Config{
+		MaxServerTransactions:     cfg.MaxServerTransactions,
+		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
+	}
+	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
 }
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own

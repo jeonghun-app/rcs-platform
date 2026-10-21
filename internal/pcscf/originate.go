@@ -40,6 +40,7 @@ const (
 func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	src := r.Source
 	if !p.initials.allow(clientKey(src.Addr)) {
+		p.count(metricRequestRate, 1)
 		return p.refuse(r, 503, "Too Many Requests")
 	}
 	regs := p.registry.flowRegistrations(src.Flow)
@@ -53,6 +54,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	if len(reg.serviceRoute) == 0 {
 		// Without it the next hop would be the Request-URI, a core
 		// address the client chose, past scscf.
+		p.count(metricRequestNoRoute, 1)
 		return proxy.Decision{Status: 500, Reason: "No Service-Route"}
 	}
 	icid, err := p.icid()
@@ -382,6 +384,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 			}
 			return proxy.Decision{Discard: true}
 		}
+		p.count(metricInDialogRate, 1)
 		return p.refuse(r, 503, "Too Many Requests")
 	}
 	var core *sip.URI
@@ -395,6 +398,7 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 		}
 	}
 	if core == nil || !client || !p.inDialogWith(*core, r.Message.Header.Get("Call-ID")) {
+		p.count(metricInDialogRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	next := r.Message.URI
@@ -402,12 +406,15 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 		next = routes[0].URI
 	}
 	if !p.scscfHop(next) {
+		p.count(metricInDialogRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	if _, err := p.resolve.Resolve(ctx, next); err != nil {
 		if errors.As(err, new(*net.DNSError)) {
+			p.count(metricInDialogUnresolved, 1)
 			return p.refuse(r, 503, "Service Unavailable")
 		}
+		p.count(metricInDialogRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	icid, ok := routeICID(*core)
