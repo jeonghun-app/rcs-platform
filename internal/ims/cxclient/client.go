@@ -165,6 +165,9 @@ type Client struct {
 	wg     sync.WaitGroup
 	// shuttingDown counts node shutdowns in progress, for tests.
 	shuttingDown atomic.Int32
+	// send sends a request to a peer: (*diameter.Peer).Send, which tests
+	// replace to fail one attempt as a race with the peer's state would.
+	send func(context.Context, *diameter.Peer, *diameter.Message) (*diameter.Message, error)
 }
 
 // hssPeer is one HSS task. Each has a node of its own because a node keeps
@@ -271,6 +274,9 @@ func New(cfg Config) (*Client, error) {
 		clock:     clock,
 		discovery: cfg.Discovery,
 		peers:     map[netip.Addr]*hssPeer{},
+		send: func(ctx context.Context, p *diameter.Peer, m *diameter.Message) (*diameter.Message, error) {
+			return p.Send(ctx, m)
+		},
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.wg.Add(1)
