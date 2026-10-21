@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"mime/multipart"
+	"net/url"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -114,7 +115,7 @@ func (v view) Method() string     { return v.req.Method }
 func (v view) RequestURI() string { return v.req.URI.String() }
 
 func (v view) HeaderFields() []ifc.HeaderField {
-	var out []ifc.HeaderField
+	var out, tags []ifc.HeaderField
 	for _, f := range v.req.Header.Fields() {
 		name := sip.CanonicalName(f.Name)
 		if v.hide != "" && strings.EqualFold(name, v.hide) {
@@ -125,6 +126,11 @@ func (v view) HeaderFields() []ifc.HeaderField {
 			if one.Add(name, f.Value) == nil {
 				if els, err := one.Elements(name); err == nil {
 					for _, e := range els {
+						if name == "Accept-Contact" || name == "Contact" {
+							for _, tag := range featureTagsOf(name, e) {
+								tags = append(tags, ifc.HeaderField{Name: ifc.FeatureTagField, Value: tag})
+							}
+						}
 						if featureHeaders[name] {
 							e = featuresSpelled(e)
 						}
@@ -136,7 +142,64 @@ func (v view) HeaderFields() []ifc.HeaderField {
 		}
 		out = append(out, ifc.HeaderField{Name: name, Value: f.Value})
 	}
+	return append(out, tags...)
+}
+
+// baseTags are the feature tags RFC 3840 §10 defines without a "+".
+var baseTags = map[string]bool{
+	"actor": true, "application": true, "audio": true, "automata": true, "class": true,
+	"control": true, "data": true, "description": true, "duplex": true, "events": true,
+	"extensions": true, "isfocus": true, "language": true, "methods": true, "mobility": true,
+	"priority": true, "schemes": true, "text": true, "type": true, "video": true,
+}
+
+// featureTagsOf are the feature tags of el, an element of the field name,
+// Accept-Contact or Contact, as ifc.FeatureTagField presents them, parsed
+// as caller preferences parse them (prefs.go): parameters of the element,
+// not of its URI, and not its display name or another parameter's value.
+// An element that does not parse has none (#359 security review).
+func featureTagsOf(name, el string) []string {
+	var ps sip.Params
+	switch {
+	case name == "Accept-Contact":
+		as, err := parseAcceptContact(el)
+		if err != nil || len(as) != 1 {
+			return nil
+		}
+		ps = as[0].Params
+	case strings.HasPrefix(strings.TrimSpace(el), "*"):
+		return nil
+	default:
+		a, err := sip.ParseAddress(el)
+		if err != nil {
+			return nil
+		}
+		ps = a.Params
+	}
+	var out []string
+	for _, p := range ps {
+		n := strings.ToLower(p.Name)
+		switch {
+		case !strings.HasPrefix(n, "+") && !baseTags[n]:
+		case !p.Quoted || strings.HasPrefix(strings.TrimSpace(p.Value), "<"):
+			// A flag, a token or a string: the name tells enough.
+			out = append(out, n)
+		default:
+			for _, v := range valuesOf(p) {
+				out = append(out, n+"="+decodedToken(v))
+			}
+		}
+	}
 	return out
+}
+
+// decodedToken is v percent-decoded, as an ICSI or IARI is written in a
+// feature tag, and in lower case; as it is if it does not decode.
+func decodedToken(v string) string {
+	if d, err := url.PathUnescape(v); err == nil {
+		v = d
+	}
+	return strings.ToLower(v)
 }
 
 func (v view) SDPLines() []string {
