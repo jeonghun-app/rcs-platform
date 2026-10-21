@@ -14,6 +14,11 @@ import (
 // The acceptance tests of #234, from QA's review of #221: a request the core
 // sends a client whose flow then closes, before any answer, reaches the core
 // as 430 at once, not as a 408 after Timer B or no answer after Timer F.
+//
+// The code tells which: only the flow's close ends the branch with 430, and
+// without it the INVITE gets 408 and the MESSAGE nothing, so the tests check
+// the code and not the time it took, which a loaded host stretches (#412).
+// The read deadline, past Timer F, only bounds a hang.
 
 func setupTerm(t *testing.T) (*service, *peer, string, *peer) {
 	t.Helper()
@@ -25,19 +30,17 @@ func setupTerm(t *testing.T) (*service, *peer, string, *peer) {
 	return s, c, path, dial(t, s.core, nil)
 }
 
-// finalWithin reads the core's responses until the final one and says how
-// long it took; it runs on other goroutines than the test's, so it returns
-// its error.
-func finalWithin(core *peer) (int, time.Duration, error) {
-	start := time.Now()
+// finalWithin reads the core's responses until the final one; it runs on
+// other goroutines than the test's, so it returns its error.
+func finalWithin(core *peer) (int, error) {
 	_ = core.nc.SetDeadline(time.Now().Add(45 * time.Second))
 	for {
 		m, err := core.r.ReadMessage()
 		if err != nil {
-			return 0, time.Since(start), err
+			return 0, err
 		}
 		if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
-			return res.StatusCode, time.Since(start), nil
+			return res.StatusCode, nil
 		}
 	}
 }
@@ -47,8 +50,8 @@ func TestAFlowThatClosesWithAnInviteOutstandingIs430(t *testing.T) {
 	core.write(withAudioOffer(coreRequest("INVITE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("close-inv-%d", requests.Add(1)), "", 1, "Route: <"+path+">")))
 	_ = c.nextRequest()
 	_ = c.nc.Close()
-	if code, took, err := finalWithin(core); err != nil || code != 430 || took > 5*time.Second {
-		t.Errorf("%d (%v) after %v, want 430 at once", code, err, took.Round(time.Millisecond))
+	if code, err := finalWithin(core); err != nil || code != 430 {
+		t.Errorf("%d (%v), want 430", code, err)
 	}
 }
 
@@ -57,8 +60,8 @@ func TestAFlowThatClosesWithAMessageOutstandingIs430(t *testing.T) {
 	core.write(coreRequest("MESSAGE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("close-msg-%d", requests.Add(1)), "", 1, "Route: <"+path+">"))
 	_ = c.nextRequest()
 	_ = c.nc.Close()
-	if code, took, err := finalWithin(core); err != nil || code != 430 || took > 5*time.Second {
-		t.Errorf("%d (%v) after %v, want 430 at once", code, err, took.Round(time.Millisecond))
+	if code, err := finalWithin(core); err != nil || code != 430 {
+		t.Errorf("%d (%v), want 430", code, err)
 	}
 }
 
@@ -72,7 +75,6 @@ func TestFlowsThatCloseDuringConcurrentSendsAreAll430(t *testing.T) {
 	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1")})
 	var wg sync.WaitGroup
 	codes := make([]int, n)
-	took := make([]time.Duration, n)
 	for i := range n {
 		c, path := registered(t, s, icscf)
 		core := dial(t, s.core, nil)
@@ -82,13 +84,13 @@ func TestFlowsThatCloseDuringConcurrentSendsAreAll430(t *testing.T) {
 			core.write(coreRequest("MESSAGE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("close-many-%d", requests.Add(1)), "", 1, "Route: <"+path+">"))
 			time.Sleep(time.Duration(i%4) * 300 * time.Microsecond)
 			_ = c.nc.Close()
-			codes[i], took[i], _ = finalWithin(core)
+			codes[i], _ = finalWithin(core)
 		}()
 	}
 	wg.Wait()
 	for i, code := range codes {
-		if code != 430 || took[i] > 3*time.Second {
-			t.Errorf("flow %d: %d after %v, want 430 at once", i, code, took[i].Round(time.Millisecond))
+		if code != 430 {
+			t.Errorf("flow %d: %d, want 430", i, code)
 		}
 	}
 }
@@ -116,7 +118,7 @@ func TestADrainedFlowsPendingRequestIs430(t *testing.T) {
 			var wg sync.WaitGroup
 			for i, core := range cores {
 				wg.Add(1)
-				go func() { defer wg.Done(); codes[i], _, errs[i] = finalWithin(core) }()
+				go func() { defer wg.Done(); codes[i], errs[i] = finalWithin(core) }()
 			}
 			s.stop()
 			wg.Wait()

@@ -638,7 +638,9 @@ How the SIP layer serves it:
   `Leg.Answer`; a 603 is `Leave` (below). A 404, 604 or 482 says the
   invitation will never reach the participant: what is queued for it from
   the group is given up (`delivery.undeliverable`) until it opens a session
-  with the group itself or is added again.
+  with the group itself or is added again. A 404 or 604 that comes after
+  the participant registered on a new flow is not taken so, as the
+  registration shows it exists now (#384); a 482, a loop, always is.
 - **Feature tags.** Every INVITE rcs-as sends for a chat, 1-to-1 or in a
   group, has both the CPM chat ICSI and the OMA SIMPLE IM tag
   `+g.oma.sip-im` in `Contact`, and one `Accept-Contact` for each, so that a
@@ -778,7 +780,20 @@ request (`invalid`); a bad invitee or name never does:
   are not normalized (NFC), and look-alike letters of different scripts are
   not folded.
 - **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
-  in 1-to-1 chat.
+  in 1-to-1 chat. A group created without one gets one in the UUID form OMA
+  CPM asks of a Conversation-ID (Conversation Functions, Appendix C.1.1):
+  - with a `Contribution-ID`, as rcsjta sends, a name-based UUID (version 5,
+    in a namespace of rcs-as's groups, not the pairs') of the
+    `Contribution-ID` alone, as the conference URI is made from it. rcsjta
+    starts a group that ended again under its `Contribution-ID`, from
+    whichever participant writes next; the new group gets the same
+    conference URI and the same Conversation-ID, so that it stays one
+    thread;
+  - without one, a random UUID (version 4), which never equals a version 5
+    one.
+
+  Groups made before #305 keep the 32 hex digits they were given: the value
+  is opaque, and read and compared as stored.
 
 ### Fan-out
 
@@ -1205,7 +1220,7 @@ identifier ever appears in a metric name.
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
-| `invite.sent`, `invite.failed`, `invite.no_sessions`, `invite.untracked` | Terminating session requests |
+| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, which leave no mark (the registration had the queue read already); a group's 482 is never one |
 | `leg.opened`, `leg.unanswered` | MSRP legs, and offers that got no answer |
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
@@ -1249,9 +1264,9 @@ Signals to alarm on (Phase 7):
   C.1.1 requires the latter, and gets the pair's (above). Residual: a CPM
   client that names its own Conversation-ID and an rcsjta client that
   answers it without one see two threads, the CPM client's and the pair's;
-  joining them would need rcs-as to remember the ID a pair last used. A
-  group's Conversation-ID, made when none is given, is 32 hex digits rather
-  than the UUID form C.1.1 asks for (#305).
+  joining them would need rcs-as to remember the ID a pair last used.
+  Groups made before #305 keep the 32 hex digits they were given as their
+  Conversation-ID, rather than the UUID form C.1.1 asks for, until they end.
 - **Legs are per task.** A message is delivered on a leg of the task that
   works on its queue. That holds for the B2BUA model, where both legs of a
   chat live on the task whose instance address the SIP dialog names (ADR

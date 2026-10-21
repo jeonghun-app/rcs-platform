@@ -493,7 +493,7 @@ func referredBy(inv messaging.Invitation) string {
 // on #279).
 func inviteOutcome(ss *session, code int) error {
 	if ss.group != "" && code == 482 {
-		return fmt.Errorf("sipas: %d: %w", code, messaging.ErrUndeliverable)
+		return fmt.Errorf("sipas: %d: %w", code, messaging.ErrLooped)
 	}
 	return pagerOutcome(code)
 }

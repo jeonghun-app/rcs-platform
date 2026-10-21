@@ -64,6 +64,79 @@ func (f *failures) String() string {
 	return fmt.Sprint(f.kinds)
 }
 
+// burstGuard bounds a whole burst subtest. A burst takes seconds, and under
+// a CPU quota with busy loops at most about 25 s; this only turns a burst
+// that never ends into a failure with a record of what moved (#254). Each
+// subtest also takes at most a fifth of the time the package has left
+// (guard), so that the five of them, each failing on its guard, still end
+// inside the package's timeout (code review of #407).
+const burstGuard = 150 * time.Second
+
+// guard is the bound of the burst subtest t.
+func guard(t *testing.T) time.Duration {
+	d, ok := t.Deadline()
+	if !ok {
+		return burstGuard
+	}
+	return min(burstGuard, time.Until(d)/5)
+}
+
+// burstProgress counts what a burst has done: requests handed to the layer,
+// and transactions ended either way.
+type burstProgress struct {
+	submitted, final, failed atomic.Int64
+}
+
+func (p *burstProgress) moved() int64 { return p.submitted.Load() + p.final.Load() + p.failed.Load() }
+
+// await waits until want transactions have ended and the senders are done.
+// It fails the test, with a record of the last samples, if nothing moves for
+// 2*burstWriteTimeout, the longest a send may wait for room, or if the burst
+// outlasts its guard; it then reports false, and the caller stops the
+// burst.
+func (p *burstProgress) await(t *testing.T, want int64, sendersDone <-chan struct{}, stats func() string) bool {
+	t.Helper()
+	start := time.Now()
+	bound := guard(t)
+	last, lastAt := p.moved(), start
+	var samples []string
+	nextSample := start
+	for {
+		select {
+		case <-sendersDone:
+			if p.final.Load()+p.failed.Load() >= want {
+				return true
+			}
+		default:
+		}
+		now := time.Now()
+		if now.After(nextSample) {
+			samples = append(samples, fmt.Sprintf("%v: submitted=%d final=%d failed=%d %s",
+				now.Sub(start).Round(time.Second), p.submitted.Load(), p.final.Load(), p.failed.Load(), stats()))
+			if len(samples) > 12 {
+				samples = samples[1:]
+			}
+			nextSample = now.Add(5 * time.Second)
+		}
+		if m := p.moved(); m != last {
+			last, lastAt = m, now
+		}
+		var why string
+		switch {
+		case now.Sub(lastAt) > 2*burstWriteTimeout:
+			why = fmt.Sprintf("nothing moved for %v", now.Sub(lastAt).Round(time.Second))
+		case now.Sub(start) > bound:
+			why = fmt.Sprintf("the burst outlasted %v", bound.Round(time.Second))
+		}
+		if why != "" {
+			t.Errorf("%s: submitted=%d final=%d failed=%d of %d; %s\nlast samples:\n%s", why,
+				p.submitted.Load(), p.final.Load(), p.failed.Load(), want, stats(), strings.Join(samples, "\n"))
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 	total := 20000
 	if raceEnabled {
@@ -74,6 +147,7 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 		delay bool
 	}{{503, false}, {200, false}, {503, true}} {
 		t.Run(fmt.Sprintf("%d DelayTrying=%v", v.code, v.delay), func(t *testing.T) {
+			var stop []func()
 			mk := func(code int) (*transport.Transport, *Layer, netip.AddrPort) {
 				var layer *Layer
 				tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout}, func(in transport.Inbound) { layer.Receive(in) })
@@ -86,12 +160,14 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { layer.Close(); tr.Close() })
+				stop = append(stop, func() { layer.Close(); tr.Close() })
 				return tr, layer, a
 			}
 			atr, al, _ := mk(200)
 			btr, _, baddr := mk(v.code)
 			body := []byte(strings.Repeat("a=x\r\n", 800)) // 4 KiB
-			var final, failed atomic.Int64
+			var p burstProgress
+			final, failed := &p.final, &p.failed
 			var why failures
 			var wg sync.WaitGroup
 			for w := range 8 {
@@ -116,12 +192,13 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 							failed.Add(1)
 							why.add(err)
 						}
+						p.submitted.Add(1)
 					}
 				}()
 			}
-			wg.Wait()
-			for deadline := time.Now().Add(2 * burstWriteTimeout); final.Load()+failed.Load() < int64(total) && time.Now().Before(deadline); {
-				time.Sleep(20 * time.Millisecond)
+			if !p.await(t, int64(total), wgDone(&wg), func() string { return fmt.Sprintf("A %+v; B %+v", atr.Stats(), btr.Stats()) }) {
+				stopBurst(t, stop, &wg)
+				return
 			}
 			if failed.Load() > 0 || final.Load() != int64(total) {
 				t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), total, &why,
@@ -157,6 +234,7 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 	}
 	for _, code := range []int{200, 486} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			var stop []func()
 			mk := func() (*transport.Transport, *Layer, *sourceTU, netip.AddrPort) {
 				tu := &sourceTU{code: code, first: make(chan transport.Source, 1)}
 				var layer *Layer
@@ -170,13 +248,15 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { layer.Close(); tr.Close() })
+				stop = append(stop, func() { layer.Close(); tr.Close() })
 				return tr, layer, tu, a
 			}
 			atr, al, _, _ := mk()
 			btr, bl, btu, baddr := mk()
 			body := []byte(strings.Repeat("a=x\r\n", 32<<10/5)) // 32 KiB
 
-			var final, failed atomic.Int64
+			var p burstProgress
+			final, failed := &p.final, &p.failed
 			var why failures
 			collect := func(res *sip.Response, err error) {
 				if err != nil {
@@ -198,6 +278,7 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			if _, err := al.Request(invite("a", 0), transport.Destination{Network: transport.TCP, Addr: baddr}, collect); err != nil {
 				t.Fatal(err)
 			}
+			p.submitted.Add(1)
 			toA := transport.Destination{Flow: (<-btu.first).Flow}
 
 			var wg sync.WaitGroup
@@ -208,6 +289,7 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 						failed.Add(1)
 						why.add(err)
 					}
+					p.submitted.Add(1)
 				}
 			}
 			for w := range 4 {
@@ -215,10 +297,10 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 				go send(al, "a", transport.Destination{Network: transport.TCP, Addr: baddr}, 1+w)
 				go send(bl, "b", toA, w)
 			}
-			wg.Wait()
 			want := int64(2 * total) // each side sends total INVITEs, A's first included
-			for deadline := time.Now().Add(2 * burstWriteTimeout); final.Load()+failed.Load() < want && time.Now().Before(deadline); {
-				time.Sleep(20 * time.Millisecond)
+			if !p.await(t, want, wgDone(&wg), func() string { return fmt.Sprintf("A %+v; B %+v", atr.Stats(), btr.Stats()) }) {
+				stopBurst(t, stop, &wg)
+				return
 			}
 			as, bs := atr.Stats(), btr.Stats()
 			if failed.Load() > 0 || final.Load() != want || as.Dialed != 1 || bs.Dialed != 0 ||
@@ -226,5 +308,29 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 				t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), want, &why, as, bs)
 			}
 		})
+	}
+}
+
+// wgDone is closed once wg's goroutines have returned.
+func wgDone(wg *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// stopBurst closes both ends of a burst that failed and waits for its
+// senders, whose sends the closing ends, so that none outlives the test.
+func stopBurst(t *testing.T, stop []func(), wg *sync.WaitGroup) {
+	t.Helper()
+	for _, f := range stop {
+		f()
+	}
+	select {
+	case <-wgDone(wg):
+	case <-time.After(2 * burstWriteTimeout):
+		t.Error("the senders did not stop once both ends closed")
 	}
 }
