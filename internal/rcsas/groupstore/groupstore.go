@@ -3,12 +3,18 @@
 // the version of its roster, in the DynamoDB groupchats table
 // (docs/architecture.md §7) or in memory for tests.
 //
-// Any rcs-as task may handle any group (ADR 0005), so two tasks may change
-// one group at once. Every change is a conditional write on the revision
-// the change was computed from, so exactly one of two concurrent changes
-// lands and the other is computed again; that is also what makes the
-// roster version a counter shared by all tasks. storetest checks that every
-// backend meets the same contract.
+// Every change is a conditional write on the revision the change was
+// computed from, so exactly one of two concurrent changes lands and the
+// other is computed again; that is also what makes the roster version a
+// counter shared by all tasks.
+//
+// One task owns each group (#121, ADR 0005): its sessions, subscriptions
+// and fan-out live there. The store keeps the group's Owner, which every
+// change and Touch is fenced by: a write under an owner the store no
+// longer holds, as by a task that lost the group while paused, is refused
+// (ErrNotOwner), never applied. A task takes a group over with TakeOver,
+// once the owner's heartbeat (Task) has lapsed. storetest checks that
+// every backend meets the same contract.
 package groupstore
 
 import (
@@ -25,9 +31,33 @@ var (
 	// ErrExists means Create found the conference URI taken.
 	ErrExists = errors.New("groupstore: already exists")
 	// ErrConflict means the group changed since it was read: Update's
-	// revision is not the stored one.
+	// revision is not the stored one, or TakeOver's owner is not.
 	ErrConflict = errors.New("groupstore: changed by another writer")
+	// ErrNotOwner means the write's owner is not the group's: another task
+	// took the group over.
+	ErrNotOwner = errors.New("groupstore: not the group's owner")
 )
+
+// Owner is the task that serves a group (#121).
+type Owner struct {
+	// Task is the owner's task id, random at every start, so that a task
+	// that comes up on a dead one's address is never taken for it.
+	Task string
+	// SIP is the owner's SIP instance address (host:port), where another
+	// task forwards the group's requests.
+	SIP string
+	// Epoch is raised by every takeover: a write fenced by an older one is
+	// refused.
+	Epoch int64
+}
+
+// Task is one rcs-as task's heartbeat: the task owns its groups while
+// AliveUntil has not passed.
+type Task struct {
+	ID         string
+	SIP        string
+	AliveUntil time.Time
+}
 
 // Role is a participant's role in a group, as the roster names it (RFC
 // 4575 §5.6.3 roles).
@@ -145,23 +175,42 @@ func (g Group) Clone() Group {
 // Store is where rcs-as keeps groups. Every method is safe for concurrent
 // use, also across processes sharing a backend.
 type Store interface {
-	// Create stores g at revision 1; ErrExists if its URI is taken by a
-	// group that has not expired at now. token identifies the attempt, as
-	// for Update, so that a repeat of a create that took effect succeeds.
-	Create(ctx context.Context, g Group, token string, now time.Time) error
+	// Create stores g at revision 1, owned by owner at epoch 1, whatever
+	// owner.Epoch says; ErrExists if its URI is taken by a group that has
+	// not expired at now. token identifies the attempt, as for Update, so
+	// that a repeat of a create that took effect succeeds.
+	Create(ctx context.Context, g Group, owner Owner, token string, now time.Time) error
 	// Get returns the group, ErrNotFound if there is none or it has
 	// expired at now.
 	Get(ctx context.Context, uri string, now time.Time) (Group, error)
-	// Update replaces the group if its stored revision is still g.Rev,
-	// storing revision g.Rev+1: ErrConflict if another write came first,
-	// ErrNotFound if the group is gone. token identifies the attempt, so
-	// that a repeat of an update that took effect (an SDK retry) succeeds.
-	Update(ctx context.Context, g Group, token string) error
+	// Update replaces the group if its stored revision is still g.Rev and
+	// its owner still owner (task and epoch), storing revision g.Rev+1:
+	// ErrConflict if another write came first, ErrNotOwner if another task
+	// took the group over, ErrNotFound if the group is gone. token
+	// identifies the attempt, so that a repeat of an update that took
+	// effect (an SDK retry) succeeds.
+	Update(ctx context.Context, g Group, owner Owner, token string) error
 	// Touch records that the group was used at active, moving Active and
 	// Expires forward together, and only when active is later than the
 	// stored Active: a touch older than the last write, which may have
 	// ended the group, changes nothing. ErrNotFound if the group is gone
-	// or has expired at active. It does not change the revision, so it
-	// never makes an Update fail.
-	Touch(ctx context.Context, uri string, active, expires time.Time) error
+	// or has expired at active, ErrNotOwner as for Update. It does not
+	// change the revision, so it never makes an Update fail.
+	Touch(ctx context.Context, uri string, owner Owner, active, expires time.Time) error
+	// Owner returns the group's owner, the zero Owner for a group stored
+	// before #121 that no task has taken yet.
+	Owner(ctx context.Context, uri string) (Owner, error)
+	// TakeOver makes to the group's owner at from.Epoch+1, if from is
+	// still the stored one (the zero Owner: none), and returns it:
+	// ErrConflict if another task took the group first. expires is the
+	// group's, which the owner record must outlive. token identifies the
+	// attempt, so that a repeat that took effect succeeds.
+	TakeOver(ctx context.Context, uri string, from, to Owner, expires time.Time, token string) (Owner, error)
+	// Beat stores t's heartbeat, AliveUntil a time it renews ahead of
+	// itself; a task that stops beats one at its present time, so that
+	// another may take its groups at once.
+	Beat(ctx context.Context, t Task) error
+	// Task returns task id's last heartbeat, ErrNotFound if it never beat
+	// or its record has gone.
+	Task(ctx context.Context, id string) (Task, error)
 }

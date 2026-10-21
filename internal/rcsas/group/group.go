@@ -133,8 +133,14 @@ type Config struct {
 	// MaxTracked bounds the rate buckets and activity marks kept in
 	// memory.
 	MaxTracked int
-	Clock      msrp.Clock
-	Rand       io.Reader
+	// Task is this task's id, random at every start, and SIP its SIP
+	// instance address (host:port), as the owner of the groups it serves
+	// (#121); an empty Task is a random one. TaskHeartbeat, TaskLease and
+	// TaskSkew time its heartbeat (StartHeartbeat).
+	Task, SIP                          string
+	TaskHeartbeat, TaskLease, TaskSkew time.Duration
+	Clock                              msrp.Clock
+	Rand                               io.Reader
 }
 
 func (c Config) withDefaults() Config {
@@ -152,6 +158,15 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxTracked <= 0 {
 		c.MaxTracked = DefaultMaxTracked
+	}
+	if c.TaskHeartbeat <= 0 {
+		c.TaskHeartbeat = DefaultTaskHeartbeat
+	}
+	if c.TaskLease <= 0 {
+		c.TaskLease = DefaultTaskLease
+	}
+	if c.TaskSkew <= 0 {
+		c.TaskSkew = DefaultTaskSkew
 	}
 	addRate := messaging.Rate{PerMinute: DefaultAddRate.PerMinute, Burst: DefaultAddBurst(c.MaxParticipants)}
 	fanoutRate := messaging.Rate{PerMinute: DefaultFanoutRate.PerMinute, Burst: DefaultFanoutBurst(c.MaxParticipants)}
@@ -243,6 +258,11 @@ type Service struct {
 
 	mu      sync.Mutex
 	touched map[string]time.Time
+	// owned holds the groups this task owns, with the epoch it owns them
+	// at; beating and lastBeat its heartbeat (StartHeartbeat).
+	owned    map[string]groupstore.Owner
+	beating  bool
+	lastBeat time.Time
 }
 
 // New returns a Service and makes it the engine's GroupHandler.
@@ -281,7 +301,13 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		adds:        messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
+		owned:       map[string]groupstore.Owner{},
 		maxFormer:   former,
+	}
+	if s.cfg.Task == "" {
+		if s.cfg.Task, err = s.randomHex(16); err != nil {
+			return nil, err
+		}
 	}
 	engine.SetGroupHandler(s)
 	return s, nil
@@ -368,12 +394,19 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	if err != nil {
 		return groupstore.Group{}, ErrInvalid
 	}
-	if err := s.store.Create(ctx, g, token, now); errors.Is(err, groupstore.ErrExists) && r.Contribution != "" {
+	if !s.alive(now) {
+		// Its heartbeat has lapsed: another task may own what it made.
+		return groupstore.Group{}, ErrNotOwner
+	}
+	if err := s.store.Create(ctx, g, s.me(), token, now); errors.Is(err, groupstore.ErrExists) && r.Contribution != "" {
 		return s.retried(ctx, g.URI, creator)
 	} else if err != nil {
 		return groupstore.Group{}, err
 	}
 	g.Rev = 1
+	owner := s.me()
+	owner.Epoch = 1
+	s.own(g.URI, owner)
 	s.metrics.Count("group.created", 1)
 	s.metrics.Count("group.name_dropped", int64(dropped))
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})
@@ -431,16 +464,23 @@ func (s *Service) Established(ctx context.Context, uri string) error {
 			return nil
 		}
 		g.Expires = s.cfg.Clock.Now().Add(s.cfg.IdleTTL)
+		owner, err := s.owner(ctx, g)
+		if err != nil {
+			return err
+		}
 		token, err := s.randomHex(8)
 		if err != nil {
 			return err
 		}
-		err = s.store.Update(ctx, g, token)
+		err = s.store.Update(ctx, g, owner, token)
 		switch {
 		case errors.Is(err, groupstore.ErrConflict):
 			continue
 		case errors.Is(err, groupstore.ErrNotFound):
 			return ErrNoGroup
+		case errors.Is(err, groupstore.ErrNotOwner):
+			s.disown(uri)
+			return ErrNotOwner
 		}
 		return err
 	}
@@ -781,17 +821,25 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 			s.metrics.Count("group.rejected.invalid", 1)
 			return groupstore.Group{}, ErrInvalid
 		}
+		owner, err := s.owner(ctx, g)
+		if err != nil {
+			return groupstore.Group{}, err
+		}
 		token, err := s.randomHex(8)
 		if err != nil {
 			return groupstore.Group{}, err
 		}
-		err = s.store.Update(ctx, g, token)
+		err = s.store.Update(ctx, g, owner, token)
 		if errors.Is(err, groupstore.ErrConflict) {
 			s.metrics.Count("group.update_conflict", 1)
 			continue
 		}
 		if errors.Is(err, groupstore.ErrNotFound) {
 			return groupstore.Group{}, ErrNoGroup
+		}
+		if errors.Is(err, groupstore.ErrNotOwner) {
+			s.disown(uri)
+			return groupstore.Group{}, ErrNotOwner
 		}
 		if err != nil {
 			return groupstore.Group{}, err
@@ -954,8 +1002,15 @@ func (s *Service) touch(ctx context.Context, g groupstore.Group, now time.Time) 
 	}
 	s.touched[g.URI] = now
 	s.mu.Unlock()
-	if err := s.store.Touch(ctx, g.URI, now, now.Add(s.cfg.IdleTTL)); err == nil {
+	owner, err := s.owner(ctx, g)
+	if err != nil {
+		return // the owner touches it
+	}
+	switch err := s.store.Touch(ctx, g.URI, owner, now, now.Add(s.cfg.IdleTTL)); {
+	case err == nil:
 		s.metrics.Count("group.touched", 1)
+	case errors.Is(err, groupstore.ErrNotOwner):
+		s.disown(g.URI)
 	}
 }
 

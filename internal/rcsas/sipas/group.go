@@ -389,7 +389,10 @@ func (s *Server) refuseGroup(u *proxy.UAS, req *sip.Request, err error) {
 		code = 403
 	case errors.Is(err, group.ErrInvalid):
 		code = 400
-	case errors.Is(err, group.ErrBusy), errors.Is(err, store.ErrBusy):
+	case errors.Is(err, group.ErrBusy), errors.Is(err, store.ErrBusy), errors.Is(err, group.ErrNotOwner):
+		// Another task owns the group, or this one's heartbeat lapsed
+		// (#121): never a 404, which rcsjta takes for the group's end and
+		// restarts it; the request is forwarded to the owner from D3.
 		retry = true
 	}
 	s.cfg.Metrics.Count("sip.group.refused", 1)

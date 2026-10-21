@@ -221,7 +221,7 @@ func TestAGroupIsNotWrittenUnlessItsRosterCanBe(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored.Participants = append(stored.Participants, stored.Participants[1])
-	if err := r.groups.Update(t.Context(), stored, "corrupt"); err != nil {
+	if err := r.groups.Update(t.Context(), stored, r.owner(t, g.URI), "corrupt"); err != nil {
 		t.Fatal(err)
 	}
 	before := len(r.n.all())

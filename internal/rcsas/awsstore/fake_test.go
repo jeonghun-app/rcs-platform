@@ -83,9 +83,10 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 		if exists && nOf(old[attrExpires]) > nOf(in.ExpressionAttributeValues[":now"]) {
 			return nil, errCondition
 		}
-	case "#rev = :rev":
-		if !exists || nOf(old[attrRev]) != nOf(in.ExpressionAttributeValues[":rev"]) {
-			return nil, errCondition
+	case "":
+		// A task's heartbeat.
+		if sOf(in.Item[attrSK]) != taskSK {
+			f.t.Errorf("PutItem without a condition of %v", in.Item[attrSK])
 		}
 	default:
 		f.t.Errorf("PutItem condition %q", cond)
@@ -171,6 +172,26 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 		}
 		row[attrActive], row[attrExpires], row[attrTTL] = vals[":active"], vals[":expires"], vals[":ttl"]
 		return &dynamodb.UpdateItemOutput{}, nil
+	case upd == "SET #task = :to, #sip = :sip, #epoch = :next, #token = :token, #ttl = :ttl":
+		switch cond {
+		case "attribute_not_exists(#pk)":
+			if exists {
+				return nil, errCondition
+			}
+		case fenceCondition:
+			if !exists || sOf(row[attrTask]) != sOf(vals[":task"]) || nOf(row[attrEpoch]) != nOf(vals[":epoch"]) {
+				return nil, errCondition
+			}
+		default:
+			f.t.Errorf("take over if %q", cond)
+			return nil, errCondition
+		}
+		if !exists {
+			row = maps.Clone(in.Key)
+			f.rows[k] = row
+		}
+		row[attrTask], row[attrSIP], row[attrEpoch], row[attrToken], row[attrTTL] = vals[":to"], vals[":sip"], vals[":next"], vals[":token"], vals[":ttl"]
+		return &dynamodb.UpdateItemOutput{}, nil
 	case cond == "#count = :wasCount AND #bytes = :wasBytes" && upd == "SET #count = :count, #bytes = :bytes":
 		if !exists || nOf(row[attrCount]) != nOf(vals[":wasCount"]) || nOf(row[attrBytes]) != nOf(vals[":wasBytes"]) {
 			return nil, errCondition
@@ -205,6 +226,10 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return nil, f.fail
+	}
+	if first := in.TransactItems[0]; first.Put != nil && sOf(first.Put.Item[attrSK]) == groupSK ||
+		first.Update != nil && sOf(first.Update.Key[attrSK]) == groupSK {
+		return f.groupTransaction(in.TransactItems)
 	}
 	// A 1-to-1 notification has no share item: two items; a group
 	// notification has the total besides: four; else three.
@@ -267,6 +292,60 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 		if ttl, ok := u.ExpressionAttributeValues[":ttl"]; ok {
 			f.rows[rowKey(u.Key)][attrTTL] = ttl
 		}
+	}
+	return &dynamodb.TransactWriteItemsOutput{}, nil
+}
+
+// groupTransaction is a group's Create (put the group if free, put its
+// owner), Update (put the group at its revision) or Touch (move its
+// activity), the last two with the fence on the owner item; needs f.mu.
+func (f *fakeDynamo) groupTransaction(items []dtypes.TransactWriteItem) (*dynamodb.TransactWriteItemsOutput, error) {
+	if len(items) != 2 {
+		f.t.Fatalf("group transaction %+v", items)
+	}
+	failed := []bool{false, false}
+	group, second := items[0], items[1]
+	var apply []func()
+	switch {
+	case group.Put != nil && aws.ToString(group.Put.ConditionExpression) == "attribute_not_exists(#pk) OR #expires <= :now":
+		old, exists := f.rows[rowKey(group.Put.Item)]
+		failed[0] = exists && nOf(old[attrExpires]) > nOf(group.Put.ExpressionAttributeValues[":now"])
+		if second.Put == nil || second.Put.ConditionExpression != nil || sOf(second.Put.Item[attrSK]) != ownerSK {
+			f.t.Fatalf("create %+v", second)
+		}
+		apply = append(apply, func() { f.rows[rowKey(second.Put.Item)] = maps.Clone(second.Put.Item) })
+	case group.Put != nil && aws.ToString(group.Put.ConditionExpression) == "#rev = :rev":
+		old, exists := f.rows[rowKey(group.Put.Item)]
+		failed[0] = !exists || nOf(old[attrRev]) != nOf(group.Put.ExpressionAttributeValues[":rev"])
+	case group.Update != nil && aws.ToString(group.Update.ConditionExpression) ==
+		"attribute_exists(#pk) AND #expires > :active AND #active < :active AND #expires < :expires":
+		row, exists := f.rows[rowKey(group.Update.Key)]
+		vals := group.Update.ExpressionAttributeValues
+		failed[0] = !exists || nOf(row[attrExpires]) <= nOf(vals[":active"]) || nOf(row[attrActive]) >= nOf(vals[":active"]) ||
+			nOf(row[attrExpires]) >= nOf(vals[":expires"])
+		apply = append(apply, func() {
+			row[attrActive], row[attrExpires], row[attrTTL] = vals[":active"], vals[":expires"], vals[":ttl"]
+		})
+	default:
+		f.t.Fatalf("group transaction %+v", group)
+	}
+	if group.Put != nil {
+		apply = append(apply, func() { f.rows[rowKey(group.Put.Item)] = maps.Clone(group.Put.Item) })
+	}
+	if u := second.Update; u != nil {
+		if aws.ToString(u.ConditionExpression) != fenceCondition || aws.ToString(u.UpdateExpression) != "SET #ttl = :ttl" {
+			f.t.Errorf("fence %q if %q", aws.ToString(u.UpdateExpression), aws.ToString(u.ConditionExpression))
+		}
+		row, exists := f.rows[rowKey(u.Key)]
+		failed[1] = !exists || sOf(row[attrTask]) != sOf(u.ExpressionAttributeValues[":task"]) ||
+			nOf(row[attrEpoch]) != nOf(u.ExpressionAttributeValues[":epoch"])
+		apply = append(apply, func() { row[attrTTL] = u.ExpressionAttributeValues[":ttl"] })
+	}
+	if slices.Contains(failed, true) {
+		return nil, cancelled(failed...)
+	}
+	for _, a := range apply {
+		a()
 	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
