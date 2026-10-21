@@ -254,8 +254,12 @@ func (s *interrupting) RemoveSummary(ctx context.Context, m store.Message, owner
 }
 
 func (s *interrupting) Release(ctx context.Context, recipient, id, owner string) error {
-	defer s.settle(id)
-	return s.Store.Release(ctx, recipient, id, owner)
+	// Only a release that took effect ends the claim (QA of #424).
+	err := s.Store.Release(ctx, recipient, id, owner)
+	if err == nil {
+		s.settle(id)
+	}
+	return err
 }
 
 func (s *interrupting) Remove(ctx context.Context, m store.Message, owner string) error {
