@@ -2,9 +2,10 @@
 // registers nor serves itself: the requests of the users it serves, which
 // it routes along their iFC chains through application servers (TS 24.229
 // §5.4.3.2, §5.4.3.3), and those inside a dialog it stays on the route of
-// (RFC 3261 §16.12). Third-party registration comes in a later part of #14;
-// cmd/scscf puts the parts behind one proxy.Router, the registrar and the
-// reg event notifier taking REGISTER and SUBSCRIBE for reg before Initial.
+// (RFC 3261 §16.12), and it registers the users with the application
+// servers their criteria name (Registered). cmd/scscf puts the parts behind
+// one proxy.Router, the registrar and the reg event notifier taking
+// REGISTER and SUBSCRIBE for reg before Initial.
 //
 // A request outside a dialog is one of three kinds (Initial). One back from
 // an application server carries, in the Route that names the S-CSCF, its
@@ -81,6 +82,20 @@
 // T2). The P-CSCF's public address as the next hop ends the route set:
 // rcsjta puts it after the route set of its session refreshes, and the
 // request goes by its Request-URI.
+//
+// The registrar tells the router of every registration, refresh and end of
+// a set (registrar.ThirdParty), and the router sends a third-party REGISTER
+// to each application server whose criterion takes the REGISTER, its
+// RegistrationType included (TS 24.229 §5.4.1.7, TS 29.228 B.2.3): from the
+// S-CSCF, for the user in To, with an Expires that is how long the set stays
+// registered, 0 once it has no binding, and, as the criterion asks, the
+// UE's REGISTER and the 200 for it in the body. An end the network made, a
+// sweep's or an RTR's, has no REGISTER to show the criteria or the server:
+// one for the user stands in, and the body is empty. The REGISTERs go off
+// the registrar's goroutine, those of one set in order, at most
+// MaxThirdParty at a time. A server that does not answer is counted, and
+// one whose default handling ends the session only logged: deregistering
+// the user for it waits on a decision (#14).
 //
 // Logs carry no identity or URI.
 package routing

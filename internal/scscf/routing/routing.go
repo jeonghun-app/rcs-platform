@@ -79,6 +79,15 @@ type Config struct {
 	// them, after the dialog's route set in its session refreshes (#14):
 	// a next hop that names one ends the route set.
 	EdgeProxyPublicHosts []string
+	// Sender sends the third-party REGISTERs (Registered); none are sent
+	// without one.
+	Sender Sender
+	// ThirdPartyTimeout bounds each third-party REGISTER's transaction;
+	// DefaultThirdPartyTimeout when 0.
+	ThirdPartyTimeout time.Duration
+	// MaxThirdParty bounds the third-party registrations under way, past
+	// which one is dropped and counted; DefaultMaxThirdParty when 0.
+	MaxThirdParty int
 	// RepairTimeout bounds the background repair of an identity's item;
 	// DefaultRepairTimeout when 0.
 	RepairTimeout time.Duration
@@ -102,6 +111,14 @@ const (
 	DefaultASTimeout = 5 * time.Second
 	// DefaultEdgeProxyPort is pcscf's core listener (docs/pcscf.md).
 	DefaultEdgeProxyPort = 5070
+	// DefaultThirdPartyTimeout is a non-INVITE transaction's Timer F
+	// at a third of the default (RFC 3261 §17.1.2.2): a server slower than
+	// that is as good as none for a registration.
+	DefaultThirdPartyTimeout = 10 * time.Second
+	// DefaultMaxThirdParty leaves room for a burst of registrations, such
+	// as clients coming back after an outage, without holding unbounded
+	// goroutines for servers that do not answer.
+	DefaultMaxThirdParty = 256
 )
 
 // checkHosts refuses an entry of cfg that names no host, which would be
@@ -147,6 +164,7 @@ type Router struct {
 	// repairs counts the identity repairs under way, for Wait.
 	repairs sync.WaitGroup
 	svc     services
+	tp      thirdParty
 }
 
 // New validates cfg and returns a Router.
@@ -196,6 +214,12 @@ func New(cfg Config) (*Router, error) {
 		ids[k.ID] = true
 		cfg.DialogKeys[i].Key = slices.Clone(k.Key)
 	}
+	if cfg.ThirdPartyTimeout <= 0 {
+		cfg.ThirdPartyTimeout = DefaultThirdPartyTimeout
+	}
+	if cfg.MaxThirdParty <= 0 {
+		cfg.MaxThirdParty = DefaultMaxThirdParty
+	}
 	if cfg.EdgeProxyPort == 0 {
 		cfg.EdgeProxyPort = DefaultEdgeProxyPort
 	}
@@ -215,7 +239,10 @@ func New(cfg Config) (*Router, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Router{cfg: cfg, log: log, ids: sip.IDGenerator{Rand: cfg.Rand}}, nil
+	rt := &Router{cfg: cfg, log: log, ids: sip.IDGenerator{Rand: cfg.Rand}}
+	rt.tp.slots = make(chan struct{}, cfg.MaxThirdParty)
+	rt.tp.tails = map[string]chan struct{}{}
+	return rt, nil
 }
 
 type noMetrics struct{}
@@ -224,9 +251,12 @@ func (noMetrics) Count(string, int64) {}
 
 func (rt *Router) count(name string) { rt.cfg.Metrics.Count(name, 1) }
 
-// Wait returns once the identity repairs under way are done: for a
-// shutdown, and for tests.
-func (rt *Router) Wait() { rt.repairs.Wait() }
+// Wait returns once the identity repairs and third-party registrations
+// under way are done: for a shutdown, and for tests.
+func (rt *Router) Wait() {
+	rt.repairs.Wait()
+	rt.tp.wg.Wait()
+}
 
 // internalLog logs a failure by its step and error, which name no identity.
 func (rt *Router) internalLog(what string, err error) {

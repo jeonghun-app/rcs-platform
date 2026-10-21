@@ -137,6 +137,7 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			g.count("registrar.rtr_left_to_sweep")
 			return true, nil
 		}
+		g.endedByNetwork(ctx, reg, profile)
 		if err := g.unpoint(ctx, reg); err != nil {
 			return false, err
 		}
