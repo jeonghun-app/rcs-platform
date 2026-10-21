@@ -178,3 +178,41 @@ func longestDigitRun(s string) int {
 	}
 	return longest
 }
+
+// TruncateIPsIn leaves no whole IPv4 address standing alone in text, is
+// idempotent, and leaves text without an address character as it was.
+func FuzzTruncateIPsIn(f *testing.F) {
+	for _, s := range []string{
+		"http: TLS handshake error from 203.0.113.5:51234: EOF",
+		"error reading preface from client [2001:db8::1]:443: EOF",
+		"10.0.0.0/8 192.0.2.7/32 1.2.3.4.5 go1.2.3.4 ::ffff:1.2.3.4",
+		"a:b:c::1 ::: [::1] [::1%25lo]:5 1.02.003.4:00",
+	} {
+		f.Add(s)
+	}
+	quad := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}`)
+	f.Fuzz(func(t *testing.T, s string) {
+		got := TruncateIPsIn(s)
+		if again := TruncateIPsIn(got); again != got {
+			t.Fatalf("not idempotent: %q -> %q -> %q", s, got, again)
+		}
+		if !strings.ContainsAny(s, ".:[") && got != s {
+			t.Fatalf("%q changed to %q", s, got)
+		}
+		for _, m := range quad.FindAllStringIndex(got, -1) {
+			before, after := byte(' '), byte(' ')
+			if m[0] > 0 {
+				before = got[m[0]-1]
+			}
+			if m[1] < len(got) {
+				after = got[m[1]]
+			}
+			if wordByte(before) || before == '.' || wordByte(after) || after == '.' {
+				continue // part of a longer token, not an address alone
+			}
+			if _, ok := parseDottedQuad(got[m[0]:m[1]]); ok && after != '/' {
+				t.Fatalf("%q left %q whole in %q", s, got[m[0]:m[1]], got)
+			}
+		}
+	})
+}

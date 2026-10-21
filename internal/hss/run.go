@@ -133,7 +133,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
-		ErrorLog:          slog.NewLogLogger(rt.Logger.Handler(), slog.LevelWarn),
+		ErrorLog:          runtime.HTTPErrorLog(rt.Logger),
 	}
 	failed := make(chan error, 2)
 	go func() {

@@ -2,9 +2,12 @@ package pii
 
 import (
 	"bytes"
+	"fmt"
 	"net/netip"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestClientIPsAreTruncatedToTheirNetwork(t *testing.T) {
@@ -17,6 +20,7 @@ func TestClientIPsAreTruncatedToTheirNetwork(t *testing.T) {
 		"fe80::1%eth0":            "fe80::/48",
 		"[fe80::1%25eth0]:443":    "fe80::/48",
 		"::ffff:203.0.113.9":      "203.0.113.0/24",
+		"::ffff:203.000.113.009":  "203.0.113.0/24",
 		"[::ffff:203.0.113.9]:80": "203.0.113.0/24",
 		"10.1.2.3":                "10.1.2.0/24",
 		"":                        "***",
@@ -88,4 +92,92 @@ func FuzzTruncateIP(f *testing.F) {
 			t.Fatalf("TruncateIP(%q) = %q, not a /24 or /48", s, out)
 		}
 	})
+}
+
+// Free text, such as net/http's error lines, keeps only the networks of
+// the addresses in it, and everything else as it was (#36).
+func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
+	for in, want := range map[string]string{
+		"http: TLS handshake error from 203.0.113.5:51234: EOF":                  "http: TLS handshake error from 203.0.113.0/24: EOF",
+		"http2: server: error reading preface from client [2001:db8:5:6::8]:443": "http2: server: error reading preface from client [2001:db8:5::/48]",
+		"peer 2001:db8:5:6:7::8 closed":                                          "peer 2001:db8:5::/48 closed",
+		"from ::ffff:203.0.113.9 and 192.000.002.001.":                           "from 203.0.113.0/24 and 192.0.2.0/24.",
+		"6to4 2002:c000:201::1":                                                  "6to4 2002::/16",
+		"two: 192.0.2.7, 198.51.100.8:5060;":                                     "two: 192.0.2.0/24, 198.51.100.0/24;",
+		"host:192.0.2.7 and host:2001:db8:5:6::8":                                "host:192.0.2.0/24 and host:2001:db8:5::/48",
+		// What is not an address stays.
+		"go1.26.10 at 2026-10-21T12:42:25.4376791Z, version 1.2.3, 1.2.3.4.5": "go1.26.10 at 2026-10-21T12:42:25.4376791Z, version 1.2.3, 1.2.3.4.5",
+		"mac aa:bb:cc:dd:ee:ff, ratio 3:2, time 12:42:25, 192.0.2.300":        "mac aa:bb:cc:dd:ee:ff, ratio 3:2, time 12:42:25, 192.0.2.300",
+		"id x192.0.2.7 and 192.0.2.7x":                                        "id x192.0.2.7 and 192.0.2.7x",
+		// A network as wide as a truncated one, or wider, is not an
+		// address of anyone's, and stays as written; a narrower one is
+		// truncated.
+		"RELAY_CORE_NETWORKS 10.0.0.0/8 and 2001:db8::/32": "RELAY_CORE_NETWORKS 10.0.0.0/8 and 2001:db8::/32",
+		"host 192.0.2.7/32 and 2001:db8:5:6::8/128":        "host 192.0.2.0/24 and 2001:db8:5::/48",
+		"": "",
+	} {
+		if got := TruncateIPsIn(in); got != want {
+			t.Errorf("TruncateIPsIn(%q)\n = %q\nwant %q", in, got, want)
+		}
+	}
+}
+
+// TruncateIPsIn reads its input in linear time whatever the input
+// (docs/architecture.md §8), for the runs that would make a naive scanner
+// try every start or every end: 64 times the input costs at most 512
+// times the allocations, and, outside the race detector, at most 8 times
+// the CPU time of 64 reads of the small one, the best of five, in one of
+// three attempts (the method of reginfo's linearity test, #317).
+func TestTruncateIPsInIsLinear(t *testing.T) {
+	cpu := func() time.Duration {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			t.Fatal(err)
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+	}
+	read := func(text string, n int) time.Duration {
+		start := cpu()
+		for range n {
+			_ = TruncateIPsIn(text)
+		}
+		return cpu() - start
+	}
+	for name, unit := range map[string]string{
+		"dots":         ".",
+		"colons":       ":",
+		"brackets":     "[",
+		"open v6":      "[::1",
+		"quads":        "1.2.3.4:",
+		"dotted digit": "1.",
+		"hex colons":   "a:",
+		"long token":   "a:b:c::4 " + strings.Repeat(".", 64),
+		"mixed":        "[1.2.3.4]:5 ::ffff:1.2.3.4/24 ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			small := strings.Repeat(unit, max(1, 1024/len(unit)))
+			large := strings.Repeat(small, 64)
+			a := testing.AllocsPerRun(3, func() { _ = TruncateIPsIn(small) })
+			b := testing.AllocsPerRun(3, func() { _ = TruncateIPsIn(large) })
+			if b > 512*max(a, 1) {
+				t.Fatalf("64× the input made %v allocations against %v: not linear", b, a)
+			}
+			if raceEnabled {
+				return
+			}
+			var ratios []string
+			for range 3 {
+				s, l := time.Duration(1<<62), time.Duration(1<<62)
+				for range 5 {
+					s = min(s, read(small, 64))
+					l = min(l, read(large, 1))
+				}
+				if l <= 8*s {
+					return
+				}
+				ratios = append(ratios, fmt.Sprintf("%v against %v (%.1f×)", l, s, float64(l)/float64(s)))
+			}
+			t.Fatalf("64× the input once took, against 64 of the small, three times over: %s: not linear", strings.Join(ratios, "; "))
+		})
+	}
 }

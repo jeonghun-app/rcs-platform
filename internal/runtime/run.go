@@ -391,7 +391,7 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    8 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		ErrorLog:          HTTPErrorLog(log),
 	}
 	adminDone := make(chan error, 1)
 	go func() { adminDone <- srv.Serve(ln) }()
