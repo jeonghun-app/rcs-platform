@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -439,43 +440,101 @@ func TestAClientsIntegrityProtectedDoesNotReachICSCF(t *testing.T) {
 // stalls and it retries another, still registers the client: the first
 // attempt outlasts that retry, and a second copy elsewhere, which a
 // registrar refuses as out of order, is never sent (review of #198). The
-// timeouts are scaled down for the test.
+// proxy's timers run on a fake clock, so the answer comes 9 s into the 12 s
+// of the first attempt whatever the load (#447).
 func TestASlowCoreStillRegistersTheClient(t *testing.T) {
-	var mu sync.Mutex
-	seen := map[string]bool{}
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	node := startCoreNode(t, func(req *sip.Request) string {
+		<-release
+		return echo200(req)
+	})
+	clock := &fakeTransactionClock{}
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, fmt.Sprintf("sip:icscf.rcs.internal:%d;transport=tcp;lr", node.ln.Addr().(*net.TCPAddr).Port))
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1", "127.0.0.6"), clock: clock})
+	c := dial(t, s.client, nil)
+	_ = c.nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := io.WriteString(c.nc, strings.ReplaceAll(registerText(outboundContact, "Supported: outbound"), "reg-1", "reg-slow-core")); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
-	node := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), answer: func(req *sip.Request) string {
-		key := req.Header.Get("Call-ID") + " " + req.Header.Get("CSeq")
-		mu.Lock()
-		again := seen[key]
-		seen[key] = true
-		mu.Unlock()
-		if again {
-			return strings.Replace(echo200(req), "200 OK", "500 Out of Order REGISTER", 1)
+	node.receive(t)
+	// 9 s into the first attempt, of its 12. Had the attempt been cut, the
+	// late 200 would not be the answer.
+	clock.advance(9 * time.Second)
+	close(release)
+	for {
+		m, err := c.r.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(time.Second) // 9 s of 12, scaled
-		return echo200(req)
-	}}
-	go func() {
-		for {
-			nc, err := ln.Accept()
-			if err != nil {
-				return
+		if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
+			if res.StatusCode != 200 {
+				t.Fatalf("REGISTER: %d, want the slow 200", res.StatusCode)
 			}
-			go node.serve(t, nc)
+			return
 		}
-	}()
-	port := ln.Addr().(*net.TCPAddr).Port
-	cfg := testConfig()
-	cfg.ICSCF = mustURI(t, fmt.Sprintf("sip:icscf.rcs.internal:%d;transport=tcp;lr", port))
-	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1", "127.0.0.6"), icscfFirst: 2 * time.Second, icscfTotal: 4 * time.Second})
-	if res := registerOver(t, dial(t, s.client, nil)); res.StatusCode != 200 {
-		t.Fatalf("REGISTER: %d, want the slow 200", res.StatusCode)
 	}
+}
+
+// fakeTransactionClock runs the proxy's timers only when advanced, on the
+// calling goroutine.
+type fakeTransactionClock struct {
+	mu     sync.Mutex
+	now    time.Duration
+	timers []*fakeTransactionTimer
+}
+
+type fakeTransactionTimer struct {
+	c    *fakeTransactionClock
+	at   time.Duration
+	f    func()
+	done bool
+}
+
+func (c *fakeTransactionClock) AfterFunc(d time.Duration, f func()) transaction.Timer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &fakeTransactionTimer{c: c, at: c.now + d, f: f}
+	c.timers = append(c.timers, t)
+	return t
+}
+
+func (t *fakeTransactionTimer) Stop() bool {
+	t.c.mu.Lock()
+	defer t.c.mu.Unlock()
+	was := !t.done
+	t.done = true
+	return was
+}
+
+// advance moves the clock by d, firing the timers that fall due in order.
+func (c *fakeTransactionClock) advance(d time.Duration) {
+	c.mu.Lock()
+	end := c.now + d
+	for {
+		var next *fakeTransactionTimer
+		for _, t := range c.timers {
+			if !t.done && t.at <= end && (next == nil || t.at < next.at) {
+				next = t
+			}
+		}
+		if next == nil {
+			break
+		}
+		next.done, c.now = true, next.at
+		c.mu.Unlock()
+		next.f()
+		c.mu.Lock()
+	}
+	c.now = end
+	c.mu.Unlock()
 }
 
 // final reads responses until a final one.
