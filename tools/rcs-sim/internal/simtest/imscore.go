@@ -64,6 +64,9 @@ type IMSCore struct {
 
 	mu       sync.Mutex
 	bindings map[string]transport.FlowID
+	// invites are the INVITEs the core forwarded and has no final answer
+	// for yet, by their server transaction, for a CANCEL (RFC 3261 §16.10).
+	invites map[*transaction.ServerTransaction]*forwardedInvite
 	// instances are each IMPU's last registered +sip.instance, and stored
 	// the requests StoreAndForward holds for it, by aorKey.
 	instances map[string]string
@@ -189,6 +192,7 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	c := &IMSCore{
 		Domain: domain, t: t, ds: ds, users: users,
 		bindings: map[string]transport.FlowID{}, instances: map[string]string{}, stored: map[string][]*sip.Request{},
+		invites:  map[*transaction.ServerTransaction]*forwardedInvite{},
 		contacts: map[string]string{}, events: map[string]string{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
 	}
 	go func() {
@@ -313,9 +317,88 @@ func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 		}
 	case req.Method == "SUBSCRIBE" && strings.EqualFold(eventPackage(req), "reg"):
 		c.subscribe(tx)
+	case req.Method == "CANCEL":
+		c.cancel(tx)
 	default:
 		c.route(tx)
 	}
+}
+
+// forwardedInvite is an INVITE the core forwarded: the CANCEL for it, the
+// flow it went over, whether the originator has cancelled it, whether the
+// INVITE has gone to the transaction layer, and whether the CANCEL has: it
+// goes only after the INVITE (RFC 3261 §9.1), whichever comes first.
+type forwardedInvite struct {
+	cancel                *sip.Request
+	flow                  transport.FlowID
+	cancelled, sent, gone bool
+}
+
+// cancelNow reports whether the CANCEL should go now, and if so marks it
+// gone; c.mu must be held.
+func (f *forwardedInvite) cancelNow() bool {
+	if f.cancelled && f.sent && !f.gone {
+		f.gone = true
+		return true
+	}
+	return false
+}
+
+func (c *IMSCore) sendCancel(f *forwardedInvite) {
+	go func() {
+		_, _ = c.layer.Request(f.cancel, transport.Destination{Flow: f.flow}, func(*sip.Response, error) {})
+	}()
+}
+
+// cancel answers a CANCEL as a proxy does (RFC 3261 §16.10): 200, and the
+// CANCEL goes on to the callee for the INVITE the core forwarded, whose
+// final answer, normally 487, comes back through the INVITE. A CANCEL that
+// matches no INVITE in progress gets 481 (§9.2).
+func (c *IMSCore) cancel(tx *transaction.ServerTransaction) {
+	req := tx.Request()
+	code := 481
+	var send *forwardedInvite
+	if inv, ok := c.layer.InviteFor(req); ok {
+		c.mu.Lock()
+		if f := c.invites[inv]; f != nil {
+			code = 200
+			f.cancelled = true
+			if f.cancelNow() {
+				send = f
+			}
+		}
+		c.mu.Unlock()
+	}
+	tag, _ := c.ids.Tag()
+	if res, err := sip.NewResponse(req, code, "", tag); err == nil {
+		c.respond(tx, res)
+	}
+	if send != nil {
+		c.sendCancel(send)
+	}
+}
+
+// cancelOf is the CANCEL of a forwarded INVITE (RFC 3261 §9.1): its
+// Request-URI, Via, Route, From, To, Call-ID and CSeq number.
+func cancelOf(invite *sip.Request) (*sip.Request, error) {
+	cseq, err := invite.Header.CSeq()
+	if err != nil {
+		return nil, err
+	}
+	c := &sip.Request{Method: "CANCEL", URI: invite.URI}
+	for _, name := range []string{"Via", "Route", "From", "To", "Call-ID"} {
+		for _, v := range invite.Header.Values(name) {
+			if err := c.Header.Add(name, v); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, f := range [][2]string{{"Max-Forwards", "70"}, {"CSeq", sip.CSeq{Seq: cseq.Seq, Method: "CANCEL"}.String()}} {
+		if err := c.Header.Add(f[0], f[1]); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // Stray implements transaction.TU: an ACK to a 2xx goes to the flow its
@@ -684,10 +767,33 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	if c.Rewrite != nil {
 		c.Rewrite(fwd)
 	}
+	// An INVITE in progress can be cancelled; its CANCEL is built now,
+	// since the transport owns fwd once it is sent.
+	var invite *forwardedInvite
+	if req.Method == "INVITE" {
+		if cancel, err := cancelOf(fwd); err == nil {
+			invite = &forwardedInvite{cancel: cancel, flow: flow}
+			c.mu.Lock()
+			c.invites[tx] = invite
+			c.mu.Unlock()
+		}
+	}
+	// ended forgets the INVITE, which has its final answer, and reports
+	// whether the originator had cancelled it.
+	ended := func() bool {
+		if invite == nil {
+			return false
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.invites, tx)
+		return invite.cancelled
+	}
 	// Off the reading goroutine: Request waits for room on the other flow.
 	go func() {
 		_, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
 			if err != nil {
+				cancelled := ended()
 				// The far end never answered, or its flow went. A
 				// non-INVITE that timed out is left unanswered, as the
 				// platform's proxy leaves it (RFC 4320 §4.2 forbids the
@@ -698,6 +804,11 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 				switch {
 				case errors.Is(err, transaction.ErrTimeout) && req.Method != "INVITE":
 					c.silence(tx, req)
+				case cancelled && (errors.Is(err, transaction.ErrTimeout) || errors.Is(err, transport.ErrNoFlow)):
+					// A cancelled INVITE whose branch ended without a final
+					// answer counts as the 487 its CANCEL asked for, as on
+					// the platform: it was cancelled, not failed.
+					answer(487)
 				case errors.Is(err, transaction.ErrTimeout):
 					answer(408)
 				default:
@@ -708,6 +819,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			if res.StatusCode == 100 {
 				return
 			}
+			if res.StatusCode >= 200 {
+				ended()
+			}
 			back := res.Clone()
 			if err := back.Header.RemoveFirstElement("Via"); err != nil {
 				return
@@ -715,9 +829,24 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			_ = tx.Respond(back)
 		})
 		if err != nil {
+			code := failureCode(err)
+			if ended() {
+				code = 487 // cancelled before it could go
+			}
 			tag, _ := c.ids.Tag()
-			if res, e := sip.NewResponse(req, failureCode(err), "", tag); e == nil {
+			if res, e := sip.NewResponse(req, code, "", tag); e == nil {
 				_ = tx.Respond(res)
+			}
+			return
+		}
+		if invite != nil {
+			// A CANCEL that came before the INVITE went goes now.
+			c.mu.Lock()
+			invite.sent = true
+			send := invite.cancelNow()
+			c.mu.Unlock()
+			if send {
+				c.sendCancel(invite)
 			}
 		}
 	}()
@@ -728,12 +857,13 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 // the request went or while it waited (ErrFlowClosed wraps ErrNoFlow), is
 // the edge proxy's 430 (RFC 5626 §5.3.1), which reaches an endpoint as 480
 // (§11.5; internal/sip/proxy keeps the 430 between its proxies only). Any
-// other transport failure is 503 (RFC 3261 §16.9).
+// other failure is a 503 for the one branch there (§16.9), which the
+// proxy answers upstream as 500 (§16.7 step 6).
 func failureCode(err error) int {
 	if errors.Is(err, transport.ErrNoFlow) {
 		return 480
 	}
-	return 503
+	return 500
 }
 
 // forwarded is req as a proxy sends it on (RFC 3261 §16.6): the core's own
