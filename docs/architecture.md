@@ -274,7 +274,8 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   endings, limits), is rejected. XML parsers never resolve entities, and read
   every document through `internal/xmlsafe`, which refuses what encoding/xml
   lets through but a well-formed document cannot have (a DTD, a reference to
-  a surrogate, attributes run together, `<?XML`).
+  a surrogate, attributes run together, `<?XML`, a declaration after anything
+  but white space).
 - **Time and randomness** are injected so timers and nonces are testable.
 
 ## 9. Specifications

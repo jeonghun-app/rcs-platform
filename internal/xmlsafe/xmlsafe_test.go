@@ -36,7 +36,6 @@ func TestTheChecksRefuseWhatEncodingXMLLetsThrough(t *testing.T) {
 		"a mixed-case declaration":      {`<?xMl version="1.0"?><a/>`, errPkg},
 		"unbalanced":                    {`<a><b></a>`, errPkg},
 		"a declaration inside":          {`<a><?xml version="1.0"?></a>`, errPkg},
-		"a declaration after a space":   {` <?xml version="1.0"?><a/>`, errPkg},
 		"a declaration after a comment": {`<!--c--><?xml version="1.0"?><a/>`, errPkg},
 	} {
 		if err := testDoc.Check([]byte(tc.doc)); !errors.Is(err, tc.want) {
@@ -44,13 +43,14 @@ func TestTheChecksRefuseWhatEncodingXMLLetsThrough(t *testing.T) {
 		}
 	}
 	for name, doc := range map[string]string{
-		"at the depth limit":           "<a><b><c><d/></c></b></a>",
-		"a declaration and a BOM":      "\xef\xbb\xbf" + `<?xml version="1.0" encoding="UTF-8"?><a/>`,
-		"attributes apart":             "<a x=\"1\"\ty='2' z=\"'\"/>",
-		"the last attribute before />": `<a x="1"/>`,
-		"other references":             `<a x="&#xD7FF;&#xE000;">&#x10FFFF;&#65533;&amp;#xD800;</a>`,
-		"a surrogate in CDATA":         `<a><![CDATA[&#xD800;]]></a>`,
-		"a comment and a PI":           `<!-- &#xD800; --><?pi x?><a/>`,
+		"at the depth limit":              "<a><b><c><d/></c></b></a>",
+		"a declaration and a BOM":         "\xef\xbb\xbf" + `<?xml version="1.0" encoding="UTF-8"?><a/>`,
+		"white space, then a declaration": "\r\n \t<?xml version=\"1.0\"?><a/>",
+		"attributes apart":                "<a x=\"1\"\ty='2' z=\"'\"/>",
+		"the last attribute before />":    `<a x="1"/>`,
+		"other references":                `<a x="&#xD7FF;&#xE000;">&#x10FFFF;&#65533;&amp;#xD800;</a>`,
+		"a surrogate in CDATA":            `<a><![CDATA[&#xD800;]]></a>`,
+		"a comment and a PI":              `<!-- &#xD800; --><?pi x?><a/>`,
 	} {
 		if err := testDoc.Check([]byte(doc)); err != nil {
 			t.Errorf("%s: %v", name, err)

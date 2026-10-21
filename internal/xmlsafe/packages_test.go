@@ -70,10 +70,16 @@ func TestEveryReaderRefusesWhatIsNotWellFormed(t *testing.T) {
 		if _, err := p.parse([]byte(`<?xml version="1.0"?>` + doc("&#xD7FF;", "\t"))); err != nil {
 			t.Fatalf("%s: with a declaration, a tab and a reference: %v", p.name, err)
 		}
+		// A CR LF before the declaration, as clients send, is taken (lead
+		// on #403); a comment before it, or one in the document, is not.
+		if _, err := p.parse([]byte("\r\n" + `<?xml version="1.0"?>` + plain)); err != nil {
+			t.Fatalf("%s: a CR LF, then the declaration: %v", p.name, err)
+		}
 		refused := map[string]string{
-			"attributes run together":     doc("", ""),
-			"an upper-case declaration":   `<?XML version="1.0"?>` + plain,
-			"a declaration not the first": `<!-- c --><?xml version="1.0"?>` + plain,
+			"attributes run together":       doc("", ""),
+			"an upper-case declaration":     `<?XML version="1.0"?>` + plain,
+			"a comment, then a declaration": `<!-- c --><?xml version="1.0"?>` + plain,
+			"a declaration in the document": strings.Replace(plain, "><", `><?xml version="1.0"?><`, 1),
 		}
 		if !p.skipsSurrogate {
 			refused["a surrogate"] = doc("&#xD800;", " ")

@@ -73,7 +73,7 @@ var (
 // notWellFormed says which of #17's rules data breaks, found without
 // encoding/xml: a reference to a surrogate outside CDATA and comments,
 // attributes run together in a start tag, or an xml PI target in another
-// case or not at the very start.
+// case or after anything but white space.
 func notWellFormed(data []byte) string {
 	blank := func(b []byte) []byte { return bytes.Repeat([]byte(" "), len(b)) }
 	markup := skipped.ReplaceAllFunc(data, blank)
@@ -88,7 +88,8 @@ func notWellFormed(data []byte) string {
 	}
 	for _, at := range pis.FindAllIndex(markup, -1) {
 		pi := markup[at[0]:at[1]]
-		if xmlTarget.Match(pi) && xmlTarget.FindIndex(pi)[0] == 0 && (at[0] != 0 || !bytes.HasPrefix(pi, []byte("<?xml"))) {
+		late := len(bytes.Trim(data[:at[0]], " \t\r\n")) > 0 // data, not markup, keeps a comment before it
+		if xmlTarget.Match(pi) && xmlTarget.FindIndex(pi)[0] == 0 && (late || !bytes.HasPrefix(pi, []byte("<?xml"))) {
 			return "an xml PI target in another case or not at the start"
 		}
 	}

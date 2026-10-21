@@ -119,8 +119,10 @@ func (d Doc) NewReader(data []byte) (*Reader, error) {
 //     different values could become one (unless Doc.SurrogateRefs);
 //   - an XML declaration or processing instruction whose target is xml in
 //     another case (<?XML ?>), which XML 1.0 §2.6 reserves, and an XML
-//     declaration anywhere but at the very start (§2.8), after a leading
-//     byte order mark.
+//     declaration after anything but white space (§2.8). White space
+//     before it, which §2.8 does not allow either, is taken: clients send
+//     a leading CR LF, and main took it before #17 (lead's decision on
+//     #403). A leading byte order mark is dropped first.
 func (r *Reader) Token() (xml.Token, error) {
 	malformed := r.doc.errMalformed()
 	tok, err := r.d.Token()
@@ -143,7 +145,7 @@ func (r *Reader) Token() (xml.Token, error) {
 		switch {
 		case t.Target != "xml" && strings.EqualFold(t.Target, "xml"):
 			return nil, fmt.Errorf("%w: an XML declaration not in lower case", malformed)
-		case t.Target == "xml" && from != 0:
+		case t.Target == "xml" && len(bytes.Trim(r.data[:from], " \t\r\n")) > 0:
 			return nil, fmt.Errorf("%w: an XML declaration not at the start", malformed)
 		}
 	case xml.StartElement:
