@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -325,14 +326,20 @@ func (c *crossingHSS) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
 	return saa, err
 }
 
+// TestADeregistrationOvertakenByARegistrationGivesTheSetBackToTheHSS, and
+// does not tell the application servers it ended, which B's REGISTER told
+// them is registered (#379 code review).
 func TestADeregistrationOvertakenByARegistrationGivesTheSetBackToTheHSS(t *testing.T) {
 	e := newEnv(t)
+	tp := &recordedThirdParty{}
 	a := e.akaUser(impi1, impu1, tel1)
 	a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
-	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+	wantStatus(t, a.registerWith(e.instance(1, withThirdParty(tp)), 600), 200)
 	b := device(a, 2)
 	ch := &crossingHSS{HSS: e.hss, kind: cx.UserDeregistration}
-	plain := func(seed byte) *Registrar { return e.instance(seed, func(c *Config) { c.HSS = ch }) }
+	plain := func(seed byte) *Registrar {
+		return e.instance(seed, func(c *Config) { c.HSS, c.ThirdParty = ch, tp })
+	}
 	// A's deregistration has claimed the set; its SAR is still on its way
 	// when B registers completely, its SAR REGISTRATION reaching the HSS
 	// first.
@@ -348,9 +355,42 @@ func TestADeregistrationOvertakenByARegistrationGivesTheSetBackToTheHSS(t *testi
 		t.Error("the record B took over from the lease kept its incarnation")
 	}
 	wantPointed(t, e, impu1, tel1)
+	wantLastToldRegistered(t, tp)
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	if ch.last != cx.Registration {
 		t.Errorf("the HSS was last told %v, with B registered here", ch.last)
 	}
+}
+
+// wantLastToldRegistered fails unless the application servers last heard
+// of the set as registered.
+func wantLastToldRegistered(t *testing.T, tp *recordedThirdParty) {
+	t.Helper()
+	got := tp.got()
+	if len(got) == 0 || got[len(got)-1].Type == ifc.DeRegistration || got[len(got)-1].Expires == 0 {
+		var told []string
+		for _, r := range got {
+			told = append(told, fmt.Sprintf("%d %v", r.Type, r.Expires))
+		}
+		t.Errorf("the servers were told %v, the last with B registered", told)
+	}
+}
+
+// TestADeregistrationOvertakenOnOneInstanceIsNotTold (#379 QA): A's
+// deregistration and B's registration on the same instance.
+func TestADeregistrationOvertakenOnOneInstanceIsNotTold(t *testing.T) {
+	e := newEnv(t)
+	tp := &recordedThirdParty{}
+	a := e.akaUser(impi1, impu1, tel1)
+	a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+	ch := &crossingHSS{HSS: e.hss, kind: cx.UserDeregistration}
+	g := e.instance(3, func(c *Config) { c.HSS, c.ThirdParty = ch, tp })
+	wantStatus(t, a.registerWith(g, 600), 200)
+	b := device(a, 2)
+	ch.hook = func() { wantStatus(t, b.registerWith(g, 600), 200) }
+	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, a.request(0, auth), upstream), 200)
+	wantSameBindings(t, e, 1, impu1, tel1)
+	wantLastToldRegistered(t, tp)
 }
