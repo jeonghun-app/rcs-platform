@@ -3,6 +3,7 @@ package simtest_test
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,13 +164,17 @@ func TestAChangeIsToldOnlyToThoseSubscribedWhenItHappened(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
-	held, release := make(chan struct{}), make(chan struct{})
+	held, gate := make(chan struct{}), make(chan struct{})
+	// Released on every way out, so that a failed check ends the test
+	// rather than leaving A's goroutine, and the core's Close, waiting.
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
 	var once sync.Once
 	simtest.SetAnswered(core, func(req *sip.Request) {
 		if exp, err := req.Header.Expires(); err == nil && exp == 0 {
 			once.Do(func() {
 				close(held)
-				<-release
+				<-gate
 			})
 		}
 	})
@@ -187,7 +192,7 @@ func TestAChangeIsToldOnlyToThoseSubscribedWhenItHappened(t *testing.T) {
 	} else if c, ok := ownContact(t, n.Info, impuA, b.ContactURI()); !ok || !c.Active() {
 		t.Fatalf("first notification %+v, contact %+v", n.Info, c)
 	}
-	close(release)
+	release()
 	// B's own changes, and nothing of A's, in order.
 	if _, err := b.Register(ctx); err != nil {
 		t.Fatal(err)
@@ -202,6 +207,53 @@ func TestAChangeIsToldOnlyToThoseSubscribedWhenItHappened(t *testing.T) {
 	n = nextNotification(t, ctx, sub)
 	if c, ok := ownContact(t, n.Info, impuA, b.ContactURI()); n.State != "terminated" || !ok || c.Active() || c.Event != reginfo.Unregistered {
 		t.Fatalf("notification after B's de-registration %+v, contact %+v", n, c)
+	}
+}
+
+func TestEachNOTIFYWaitsForTheTwoHundredOfItsRequest(t *testing.T) {
+	// QA on #287: a NOTIFY goes after the 200 of the REGISTER or SUBSCRIBE
+	// that made it, as an S-CSCF sends them. Just before each 200 is
+	// written, its NOTIFY must be queued and waiting, its gate shut, and
+	// no NOTIFY sent since the request came.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password"})
+	var sent atomic.Int32
+	core.Rewrite = func(*sip.Request) { sent.Add(1) }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ua := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	gates := make(chan (<-chan struct{}), 4)
+	var checked atomic.Int32
+	simtest.SetOrderHooks(core, func(req *sip.Request) {
+		before := sent.Load()
+		var gate <-chan struct{}
+		select {
+		case gate = <-gates:
+		case <-ctx.Done():
+			t.Errorf("%s: no NOTIFY waits for its 200", req.Method)
+			return
+		}
+		select {
+		case <-gate:
+			t.Errorf("%s: the NOTIFY's gate opened before the 200", req.Method)
+		default:
+		}
+		if sent.Load() != before {
+			t.Errorf("%s: a NOTIFY went before the 200", req.Method)
+		}
+		checked.Add(1)
+	}, func(gate <-chan struct{}) { gates <- gate })
+	defer simtest.SetOrderHooks(core, nil, nil)
+	sub, _, err := ua.SubscribeRegEvent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextNotification(t, ctx, sub)
+	if _, err := ua.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	nextNotification(t, ctx, sub)
+	if checked.Load() != 2 {
+		t.Fatalf("%d 200s checked, want the SUBSCRIBE's and the REGISTER's", checked.Load())
 	}
 }
 

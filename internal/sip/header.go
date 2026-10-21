@@ -165,6 +165,25 @@ type HeaderField struct {
 // Len returns the number of header fields.
 func (h *Header) Len() int { return len(h.fields) }
 
+// WireSize returns the length of the header fields as a message writes them,
+// each with its CRLF. A parsed field counts as received, its whitespace and
+// line folds included, since the parsed message keeps those bytes: it is the
+// measure of the memory a held message takes that Fields, which trims values,
+// understates.
+func (h *Header) WireSize() int {
+	n := 0
+	for i := range h.fields {
+		f := &h.fields[i]
+		if f.raw != "" {
+			n += len(f.raw)
+		} else {
+			n += len(f.name) + 2 + len(f.value)
+		}
+		n += 2
+	}
+	return n
+}
+
 // Fields returns a copy of the header fields in order.
 func (h *Header) Fields() []HeaderField {
 	out := make([]HeaderField, len(h.fields))

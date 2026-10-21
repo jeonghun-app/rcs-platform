@@ -39,6 +39,11 @@ type IMSCore struct {
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
+	// answering, if set (export_test.go), runs just before the 200 of a
+	// REGISTER or a SUBSCRIBE is written; waiting, if set, runs on the
+	// notifier's goroutine as each NOTIFY begins to wait for its gate.
+	answering func(*sip.Request)
+	waiting   func(gate <-chan struct{})
 	// Offline, when set before any request, is what the core does with a
 	// request to an IMPU that has no binding.
 	Offline Offline
@@ -162,7 +167,9 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	if len(t1) > 0 {
 		cfg.T1 = t1[0]
 	}
-	c.layer = transaction.New(tr, c, cfg)
+	if c.layer, err = transaction.New(tr, c, cfg); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { c.layer.Close(); tr.Close() })
 	if c.Addr, err = tr.Listen(transport.ListenerConfig{
 		Network: transport.TCP, Addr: "127.0.0.1:0", ClientFacing: true,
@@ -266,9 +273,18 @@ func (c *IMSCore) Stray(in transport.Inbound) {
 func (c *IMSCore) ServerFailed(*transaction.ServerTransaction, error) {}
 
 func (c *IMSCore) respond(tx *transaction.ServerTransaction, res *sip.Response) {
-	if res != nil {
-		_ = tx.Respond(res)
+	if res == nil {
+		return
 	}
+	if req := tx.Request(); res.StatusCode == 200 && (req.Method == "REGISTER" || req.Method == "SUBSCRIBE") {
+		c.mu.Lock()
+		answering := c.answering
+		c.mu.Unlock()
+		if answering != nil {
+			answering(req)
+		}
+	}
+	_ = tx.Respond(res)
 }
 
 // register answers a REGISTER: 401 until it has Digest credentials that
@@ -459,16 +475,30 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 	close(gate)
 }
 
+// awaitGate waits until gate is closed, after the 200 of the request that
+// made the NOTIFY, and reports false if the core stops first. waiting, the
+// test hook, hears of the wait as it begins.
+func (c *IMSCore) awaitGate(gate <-chan struct{}, waiting func(<-chan struct{})) bool {
+	if waiting != nil {
+		waiting(gate)
+	}
+	select {
+	case <-gate:
+		return true
+	case <-c.stop:
+		return false
+	}
+}
+
 // notifyLocked queues a NOTIFY of s's next version: the IMPU's one
 // contact, active with event, or terminated. It goes once gate is closed,
 // after the 200 of the request that made it. c.mu is held, so NOTIFYs are
 // queued in the order of the changes; the queue is long enough that this
 // does not wait, and the notifier's goroutine never takes c.mu.
 func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active bool, gate <-chan struct{}) {
+	waiting := c.waiting
 	send := func() {
-		select {
-		case <-gate:
-		case <-c.stop:
+		if !c.awaitGate(gate, waiting) {
 			return
 		}
 		branch, _ := c.ids.Branch()

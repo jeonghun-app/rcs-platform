@@ -110,7 +110,10 @@ type Server struct {
 	// rcs-as opens (session.largeKey).
 	perUser map[string]int
 	pending int
-	large   map[string]bool
+	// answering counts the sessions added whose first answer has not gone
+	// yet (settle).
+	answering sync.WaitGroup
+	large     map[string]bool
 	// registered is when each user's registration, as rcs-as last heard
 	// of it, runs out (register).
 	registered map[string]time.Time

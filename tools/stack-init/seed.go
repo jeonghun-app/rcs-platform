@@ -179,8 +179,11 @@ func seedOne(ctx context.Context, client *http.Client, c seedConfig, s subscribe
 		fmt.Fprintf(out, "hss: %s test subscription created\n", s.name)
 	case status == http.StatusConflict:
 		// A stack seeded before, perhaps with fewer identities (#282):
-		// the same subscription again, which leaves its Cx state and
-		// credentials as they are.
+		// the same subscription again. A PUT replaces every provisioned
+		// field: the identities, the service profile (hss's default,
+		// rcs-default, as the body names none), the charging information
+		// (none) and acs_managed. It leaves the Cx state, the
+		// credentials and the SQN as they are.
 		status, err = call(ctx, client, c, http.MethodPut, c.hssAPI+"/v1/subscriptions/"+url.PathEscape(c.impi(s)), c.hssToken, sub)
 		switch {
 		case err != nil:
@@ -188,7 +191,7 @@ func seedOne(ctx context.Context, client *http.Client, c seedConfig, s subscribe
 		case status != http.StatusOK:
 			return fmt.Errorf("hss: update subscription: HTTP %d", status)
 		}
-		fmt.Fprintf(out, "hss: %s test subscription exists, brought up to date\n", s.name)
+		fmt.Fprintf(out, "hss: %s test subscription exists, put again: identities, default service profile, no charging information\n", s.name)
 	default:
 		return fmt.Errorf("hss: create subscription: HTTP %d", status)
 	}

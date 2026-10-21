@@ -26,9 +26,12 @@ const (
 	composeDomain = "ims.mnc001.mcc001.3gppnetwork.org"
 	composeIMSI   = "001010000000001"
 	composeMSISDN = "+15550100001"
-	hssAPI        = "http://hss:8081"
-	acsURL        = "http://acs:8080"
-	relayControl  = "http://msrp-relay:8082"
+	// The peer, stack-seed's second subscriber.
+	composePeerIMSI   = "001010000000002"
+	composePeerMSISDN = "+15550100002"
+	hssAPI            = "http://hss:8081"
+	acsURL            = "http://acs:8080"
+	relayControl      = "http://msrp-relay:8082"
 )
 
 func TestE2EComposeStack(t *testing.T) {
@@ -39,7 +42,7 @@ func TestE2EComposeStack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	for _, svc := range []string{"hss", "ft-server", "msrp-relay"} {
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	waitReady(ctx, t, acsURL+"/readyz")
@@ -69,23 +72,9 @@ func TestE2EComposeStack(t *testing.T) {
 	// (docs/architecture.md §4, #282), so a terminating request to the tel
 	// form reaches the client. Routing one needs scscf in the stack; until
 	// then this checks what it would route by.
-	var sub struct {
-		PublicIdentities []struct {
-			IMPU        string `json:"impu"`
-			ImplicitSet int    `json:"implicit_set"`
-		} `json:"public_identities"`
-	}
-	if status := callJSON(ctx, t, http.MethodGet, hssAPI+"/v1/subscriptions/"+url.PathEscape(impi), env(t, "HSS_ADMIN_TOKEN"), nil, &sub); status != http.StatusOK {
-		t.Fatalf("hss: reading the test subscription answered %d", status)
-	}
-	sets := map[string]int{}
-	for _, p := range sub.PublicIdentities {
-		sets[p.IMPU] = p.ImplicitSet
-	}
-	sipSet, okSIP := sets[impu]
-	telSet, okTel := sets["tel:"+composeMSISDN]
-	if !okSIP || !okTel || sipSet != telSet {
-		t.Errorf("hss lists the identities %+v, want %s and tel:%s in one implicit set", sub.PublicIdentities, impu, composeMSISDN)
+	// Both subscribers stack-seed provisions, the client and the peer.
+	for _, sub := range []struct{ imsi, msisdn string }{{composeIMSI, composeMSISDN}, {composePeerIMSI, composePeerMSISDN}} {
+		checkImplicitSet(ctx, t, sub.imsi+"@"+domain, "sip:"+sub.msisdn+"@"+domain, "tel:"+sub.msisdn)
 	}
 
 	// acs 1.4.0 cannot provision ftHTTPCSUser and ftHTTPCSPwd yet
@@ -126,6 +115,30 @@ func TestE2EComposeStack(t *testing.T) {
 		"chat-client-originated/client-to-core", "chat-client-originated/keep-alive", "chat-client-originated/release",
 		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/release",
 	}, issued.Password, env(t, "RELAY_PCSCF_TOKEN"), impi, self)
+}
+
+// checkImplicitSet checks that hss lists sip and tel in one implicit
+// registration set of impi's subscription.
+func checkImplicitSet(ctx context.Context, t *testing.T, impi, sip, tel string) {
+	t.Helper()
+	var sub struct {
+		PublicIdentities []struct {
+			IMPU        string `json:"impu"`
+			ImplicitSet int    `json:"implicit_set"`
+		} `json:"public_identities"`
+	}
+	if status := callJSON(ctx, t, http.MethodGet, hssAPI+"/v1/subscriptions/"+url.PathEscape(impi), env(t, "HSS_ADMIN_TOKEN"), nil, &sub); status != http.StatusOK {
+		t.Fatalf("hss: reading a test subscription answered %d", status)
+	}
+	sets := map[string]int{}
+	for _, p := range sub.PublicIdentities {
+		sets[p.IMPU] = p.ImplicitSet
+	}
+	sipSet, okSIP := sets[sip]
+	telSet, okTel := sets[tel]
+	if !okSIP || !okTel || sipSet != telSet {
+		t.Errorf("hss lists the identities %+v, want %s and %s in one implicit set", sub.PublicIdentities, sip, tel)
+	}
 }
 
 // env returns a setting of deploy/compose.env, which make e2e-compose passes.
