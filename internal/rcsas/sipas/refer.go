@@ -143,7 +143,9 @@ func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) *r
 	w.send(active, 100)
 	// The outcome may never come, as for an invitation the engine does
 	// not send; the subscription ends all the same.
+	w.mu.Lock()
 	w.timer = s.cfg.Clock.AfterFunc(referWait, func() { w.finish(408) })
+	w.mu.Unlock()
 	return w
 }
 
@@ -156,6 +158,9 @@ const referWait = 2 * time.Minute
 type referWatch struct {
 	ss    *session
 	event sip.Event
+	// mu guards timer, which its own callback may read before AfterFunc
+	// has returned.
+	mu    sync.Mutex
 	timer msrp.Timer
 	once  sync.Once
 	// key is where watchRefer filed it, "" if nowhere; gone, that it has
@@ -187,8 +192,11 @@ func (w *referWatch) finish(code int) {
 		return
 	}
 	w.once.Do(func() {
-		if w.timer != nil {
-			w.timer.Stop()
+		w.mu.Lock()
+		timer := w.timer
+		w.mu.Unlock()
+		if timer != nil {
+			timer.Stop()
 		}
 		w.ss.s.unwatchRefer(w)
 		w.ss.s.cfg.Metrics.Count("sip.refer.notified", 1)

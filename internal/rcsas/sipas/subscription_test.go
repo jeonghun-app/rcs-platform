@@ -16,6 +16,8 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/resourcelists"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
 // More participants, on .github/allowed-test-identifiers.txt.
@@ -638,6 +640,40 @@ func TestAReferredInviteNamesTheReferrerNotTheCreator(t *testing.T) {
 	}
 }
 
+// A NOTIFY that is not answered, as when the subscriber's flow is gone,
+// ends the subscription at the transaction's timeout (RFC 6665 §4.2.2).
+func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{T1: 5 * time.Millisecond} })
+	r.core.setAnswer(func(req *sip.Request) int {
+		switch req.Method {
+		case "INVITE":
+			return 486
+		case "NOTIFY":
+			return 0 // never answered
+		}
+		return 200
+	})
+	p := r.a.dial(t)
+	uri, s := r.create(t, p, relayPath(), bob, carol)
+	r.core.nextOf(t, "INVITE")
+	r.core.nextOf(t, "INVITE")
+	g := &groupRig{chatRig: r, p: p, uri: uri, s: s}
+	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
+		t.Fatalf("SUBSCRIBE answered %d", res.StatusCode)
+	}
+	g.nextNotify(t)
+	waitUntil(t, "the subscription removed at the NOTIFY's timeout", func() bool {
+		g.a.srv.mu.Lock()
+		defer g.a.srv.mu.Unlock()
+		return len(g.a.srv.subs) == 0
+	})
+	if n := g.metrics.get("sip.subscription.stale"); n != 0 {
+		t.Fatalf("%d subscriptions marked stale", n)
+	}
+	g.rejoin(t, bob)
+	g.noNotify(t, "after an unanswered NOTIFY")
+}
+
 // Code review on #340: a NOTIFY refused for a passing reason, a 503 from a
 // proxy whose queue is full (RFC 5057), keeps the subscription. The
 // subscriber missed a document, so the next change brings the full roster,
@@ -879,6 +915,11 @@ func TestAnEndedSubscriptionGivesItsPlaceBack(t *testing.T) {
 	}
 	if res := g.again(t, &first, "0"); res.StatusCode != 200 {
 		t.Fatalf("unsubscribing answered %d", res.StatusCode)
+	}
+	// The place is given back before the last NOTIFY is sent, and the
+	// 200 goes before both (RFC 6665 §4.2.1.4).
+	if n := g.nextNotify(t); n.state.State != "terminated" {
+		t.Fatalf("after unsubscribing, a NOTIFY %s", n.state.State)
 	}
 	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
 		t.Fatalf("a subscription in the place given back answered %d", res.StatusCode)
