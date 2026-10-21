@@ -365,9 +365,9 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	if len(n.deadlines) != 1 || !n.deadlines[0].Equal(pushEnd) {
 		t.Fatalf("RTR deadlines %v, want the push's own %v", n.deadlines, pushEnd)
 	}
-	// The update's deadline is half of what was left when it started, so
-	// at least half of what was left when the push began less the time it
-	// took to start, and before the push's end by as much.
+	// The update's deadline is half of what was left when it started, read
+	// from one clock reading: at least half of what is left now, and at
+	// most half of the push.
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if len(ds.deadlines) != 1 {
