@@ -28,6 +28,10 @@ const (
 // Defaults of the settings in docs/pcscf.md.
 const (
 	DefaultCoreAddr = "0.0.0.0:5070"
+	// DefaultCorePort is DefaultCoreAddr's port, RCS_PCSCF_CORE_PORT's
+	// default: scscf reads the same setting to know where a dialog's
+	// requests may go to a P-CSCF (#14).
+	DefaultCorePort = 5070
 	// DefaultMaxRegistrations bounds the registrations one task keeps.
 	DefaultMaxRegistrations = 100_000
 	// DefaultRegisterRate and DefaultRegisterBurst bound the REGISTERs of one
@@ -199,7 +203,7 @@ func Configure(s *runtime.Settings) Config {
 		TLSCertFile:              e.String("TLS_CERT_FILE", ""),
 		TLSKeyFile:               e.String("TLS_KEY_FILE", ""),
 		ClientUDPAddr:            e.String("CLIENT_UDP_ADDR", ""),
-		CoreAddr:                 e.String("CORE_ADDR", DefaultCoreAddr),
+		CoreAddr:                 e.String("CORE_ADDR", "0.0.0.0:"+strconv.Itoa(s.Shared.Int("PCSCF_CORE_PORT", DefaultCorePort))),
 		ProxyProtocol:            s.Shared.Bool("PROXY_PROTOCOL", false),
 		MaxFlowsPerIP:            e.Int("MAX_FLOWS_PER_IP", DefaultMaxFlowsPerIP),
 		MaxConnections:           e.Int("MAX_CONNECTIONS", DefaultMaxConnections),
@@ -274,6 +278,13 @@ func Configure(s *runtime.Settings) Config {
 		}
 		if _, _, err := net.SplitHostPort(a.v); err != nil {
 			e.Invalid(a.name, "not host:port")
+		}
+	}
+	// scscf lets a dialog's requests go to RCS_PCSCF_CORE_PORT only: a core
+	// listener on another port would get none of them.
+	if want := s.Shared.String("PCSCF_CORE_PORT", ""); want != "" {
+		if _, port, err := net.SplitHostPort(c.CoreAddr); err == nil && port != want {
+			e.Invalid("CORE_ADDR", "its port is not RCS_PCSCF_CORE_PORT ("+want+"), where scscf sends requests inside a dialog")
 		}
 	}
 	c.CoreHost = runtime.InstanceAddr(e, "CORE_HOST", interfaceAddrs)
