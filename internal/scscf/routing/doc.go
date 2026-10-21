@@ -25,10 +25,23 @@
 // for the set: the request goes to its application server, the Request-URI
 // unchanged, with P-Served-User naming the served user and the session
 // case, and a Route back to the S-CSCF. A server that does not answer, by
-// a timeout (Config.ASTimeout, for any request but INVITE), a transport
-// failure or a 408, is passed over if its criterion's default handling
-// continues the session; any answer of its own goes upstream unchanged, a
-// 500 with Retry-After included. iFC see the request without a
+// a timeout (Config.ASTimeout, for any request but INVITE) or a transport
+// failure, or answers 408 or 5xx, without a provisional response first and
+// before it sent the request back, has its criterion's default handling
+// apply: SESSION_CONTINUED passes it over, SESSION_TERMINATED sends its
+// answer upstream, a 500 with Retry-After included. Whether it sent the
+// request back is settled in the store, as the request may come back to
+// another instance (state.AttemptODI): the first of the two to go on with
+// the position does, and the other is refused. Any other answer of a
+// server's goes upstream unchanged. The position is bound to the Call-ID,
+// so a B2BUA application server that sends the request on in a dialog of
+// its own is not supported (ADR 0005). Nor is a proxy server that records
+// the route on a terminating chain: the callee's requests in the dialog
+// then come from its P-CSCF with the server's Record-Route value next, not
+// the S-CSCF's, which signs nothing they carry, and are refused. rcs-as, a
+// B2BUA that sends its legs as new requests (#137), is neither. The SDP iFC see is a request's
+// application/sdp body, or the first such part of a multipart one, as
+// rcsjta's chat INVITE with its first message has. iFC see the request without a
 // P-Served-User unless it came with one of its own and not from a P-CSCF:
 // the one the S-CSCF inserted comes back with the request, and must not
 // make rcs-as's triggers, which skip requests rcs-as sends for its users
@@ -66,7 +79,8 @@
 // the chain, and the request goes to the I-CSCF for that user.
 //
 // A dialog's requests come back along the S-CSCF's Record-Route value,
-// which it signs when the dialog is set up (#322): with a key ID and a MAC,
+// which it writes only on a request that sets up a dialog (INVITE,
+// SUBSCRIBE, REFER) and signs as the dialog is set up (#322): with a key ID and a MAC,
 // under a key every scscf instance shares, over the Call-ID, the S-CSCF's
 // name and each of the dialog's hops next to it, scheme, user, host, port
 // and transport. The value in the request the callee gets signs the hop

@@ -77,7 +77,10 @@ func (s *scriptedRelay) count(method string) int {
 	return n
 }
 
-func bindingIDFor(n int) string { return strings.Repeat("a", 51) + string(rune('a'+n)) }
+// bindingIDFor is the n-th binding's id, 52 letters for any n below 26².
+func bindingIDFor(n int) string {
+	return strings.Repeat("a", 50) + string(rune('a'+n/26)) + string(rune('a'+n%26))
+}
 func clientPathFor(n int) string {
 	return fmt.Sprintf("msrps://msrp.example.net:2856/%sclient%d;tcp", strings.Repeat("c", 24), n)
 }
@@ -180,9 +183,9 @@ type call struct {
 	req *sip.Request
 }
 
-func (a *anchoring) invite(t *testing.T, callID, contentType, body string) call {
+func (a *anchoring) invite(t *testing.T, callID, contentType, body string, extra ...string) call {
 	t.Helper()
-	r := clientRequest(t, inviteWith(callID, contentType, body), "FLOW-A")
+	r := clientRequest(t, inviteWith(callID, contentType, body, extra...), "FLOW-A")
 	d := a.p.Route(context.Background(), r)
 	if len(d.Targets) != 1 {
 		t.Fatalf("not forwarded: %+v", d)
@@ -322,17 +325,17 @@ func TestAnUnanchoredOfferIs503(t *testing.T) {
 	}{
 		{"past the flow's limit", func(a *anchoring) {
 			a.p.msrp.limit = newBindingLimit(2, 100, 32, a.clock.now)
-			_, _ = a.p.msrp.limit.take("FLOW-A", 1)
+			_, _ = a.p.msrp.limit.take(share{flow: "FLOW-A"}, 1)
 		}, nil, 503, "1", 0},
 		{"past the task's limit", func(a *anchoring) {
 			a.p.msrp.limit = newBindingLimit(16, 2, 32, a.clock.now)
-			_, _ = a.p.msrp.limit.take("FLOW-B", 1)
+			_, _ = a.p.msrp.limit.take(share{flow: "FLOW-B"}, 1)
 		}, nil, 503, "1", 0},
 		// Two a minute: the one taken comes back in 30 s.
 		{"past the flow's rate", func(a *anchoring) {
 			a.p.msrp.limit = newBindingLimit(16, 100, 2, a.clock.now)
-			_, _ = a.p.msrp.limit.take("FLOW-A", 1)
-			a.p.msrp.limit.give("FLOW-A", 1)
+			_, _ = a.p.msrp.limit.take(share{flow: "FLOW-A"}, 1)
+			a.p.msrp.limit.give(share{flow: "FLOW-A"}, 1)
 		}, nil, 503, "30", 0},
 		{"the relay refusing", nil, func(m string, _ int) int {
 			if m == http.MethodPost {
@@ -429,6 +432,13 @@ func ackFor(t *testing.T, c call, res *sip.Response) *proxy.Request {
 // route past pcscf's own values, as from the client; both with reason.
 func checkEnd(t *testing.T, a *anchoring, toTag, reason string) {
 	t.Helper()
+	checkEndSeq(t, a, toTag, reason, "2 BYE")
+}
+
+// checkEndSeq is checkEnd with the CSeq the BYE to the core has, past the
+// client's requests in the dialog.
+func checkEndSeq(t *testing.T, a *anchoring, toTag, reason, cseq string) {
+	t.Helper()
 	sent := a.sent.take(a.p)
 	if len(sent) != 2 {
 		t.Fatalf("%d requests sent, want two BYEs", len(sent))
@@ -455,7 +465,7 @@ func checkEnd(t *testing.T, a *anchoring, toTag, reason string) {
 	kt, _ := core.req.Header.To()
 	if core.req.Method != "BYE" || core.req.URI.String() != "sip:rcs-as@10.0.1.20:5060;transport=tcp" || kf.Tag() != "a1" || kt.Tag() != toTag ||
 		core.req.Header.Get("Reason") != reason || strings.Join(core.req.Header.Values("Route"), ",") != "<sip:scscf.rcs.internal;transport=tcp;lr>" ||
-		core.req.Header.Get("CSeq") != "2 BYE" || core.dst.Addr != netip.MustParseAddrPort("10.0.4.4:5060") {
+		core.req.Header.Get("CSeq") != cseq || core.dst.Addr != netip.MustParseAddrPort("10.0.4.4:5060") {
 		t.Errorf("BYE to the core: %s %s From %q To %q Reason %q Route %q CSeq %q to %+v", core.req.Method, core.req.URI,
 			core.req.Header.Get("From"), core.req.Header.Get("To"), core.req.Header.Get("Reason"), core.req.Header.Values("Route"), core.req.Header.Get("CSeq"), core.dst)
 	}
@@ -534,38 +544,6 @@ func TestASecondAnswerIsEnded(t *testing.T) {
 	checkEnd(t, a, "b3", reasonSecondAnswer)
 }
 
-// An INVITE without an offer is forwarded as it is; if its 2xx offers
-// MSRP, which pcscf does not anchor, the client gets it declined and the
-// dialog is ended with Reason 488 (#136 decision 2).
-func TestALateOfferIsEnded(t *testing.T) {
-	a := newAnchoring(t, 16, 100)
-	var out strings.Builder
-	a.p.metrics = runtime.NewMetrics(&out, "RCS", "pcscf", a.clock.now, a.p.log)
-	c := a.invite(t, "chat-1", "", "")
-	if len(c.req.Body) != 0 {
-		t.Fatal("a body appeared")
-	}
-	offer := strings.Replace(rcsAsAnswer, "a=setup:passive", "a=setup:actpass", 1)
-	ok := c.respond(answered(t, c.req, 200, "b1", offer))
-	mediaOf(t, ok.Body, "m=message 0 TCP/MSRP *")
-	if strings.Contains(string(ok.Body), "a=path") {
-		t.Errorf("the late offer keeps its path:\n%s", ok.Body)
-	}
-	a.p.Route(context.Background(), ackFor(t, c, ok))
-	a.settle()
-	checkEnd(t, a, "b1", reasonLateOffer)
-	a.p.metrics.Flush()
-	if !strings.Contains(out.String(), `"`+metricEndedLateOffer+`":1`) || len(a.relay.log()) != 0 || len(a.p.msrp.all()) != 0 {
-		t.Errorf("metrics %s, calls %q", out.String(), a.relay.log())
-	}
-	// A 2xx without MSRP leaves the session alone.
-	c = a.invite(t, "call-2", "", "")
-	c.respond(answered(t, c.req, 200, "b1", strings.Split(offer, "m=message")[0]))
-	if len(a.p.msrp.all()) != 0 {
-		t.Error("a session for a call without MSRP")
-	}
-}
-
 // A confirmed session's bindings are extended every 15 minutes; a
 // session whose flow has gone, or whose setup never ended, is released.
 func TestTheSweepKeepsLiveSessionsAndEndsTheRest(t *testing.T) {
@@ -612,37 +590,6 @@ func TestAClosedFlowReleasesItsSessions(t *testing.T) {
 	a.settle()
 	if a.relay.count(http.MethodDelete) != 1 || a.p.msrp.limit.held() != 0 {
 		t.Errorf("calls %q", a.relay.log())
-	}
-}
-
-// Inside a dialog, and from the core outside one, an MSRP offer is refused
-// until #136's second change anchors it, so none goes end to end; the
-// core's BYE releases the binding.
-func TestOffersPcscfDoesNotAnchorYetAreRefused(t *testing.T) {
-	a := newAnchoring(t, 16, 100)
-	reinvite := inDialogFrom(t, []string{clientEnt, coreEntry}, "sip:rcs-as@10.0.1.20:5060", "Route: "+scscfRoute, "Content-Type: application/sdp")
-	reinvite.Message.Method = "INVITE"
-	reinvite.Message.Body = []byte(clientChatOffer)
-	if d := a.p.Route(context.Background(), reinvite); d.Status != 488 {
-		t.Errorf("re-INVITE: %+v", d)
-	}
-	core := fromCore(t, "INVITE", false, []string{pathEntry}, "Content-Type: application/sdp")
-	core.Message.Body = []byte(clientChatOffer)
-	if d := a.p.Route(context.Background(), core); d.Status != 488 {
-		t.Errorf("an INVITE from the core: %+v", d)
-	}
-
-	c := a.invite(t, "term-1", "application/sdp", clientChatOffer)
-	c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
-	bye := fromCore(t, "BYE", true, []string{"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;dlg=" + a.p.dialogMAC("FLOW-A", "term-1", ""), "sip:" + publicHost + ":5060;transport=tcp;lr"})
-	_ = bye.Message.Header.Set("From", "<"+bobIMPU+">;tag=b1")
-	_ = bye.Message.Header.Set("To", "<"+aliceIMPU+">;tag=A1")
-	if d := a.p.Route(context.Background(), bye); len(d.Targets) != 1 {
-		t.Fatalf("BYE from the core: %+v", d)
-	}
-	a.settle()
-	if a.relay.count(http.MethodDelete) != 1 {
-		t.Errorf("the core's BYE did not release: %q", a.relay.log())
 	}
 }
 

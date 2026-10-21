@@ -28,7 +28,8 @@ var (
 // the identities pointing at it, as a REGISTER saves them. Later requests
 // find the record until a sweep ends that state with the HSS, and a REGISTER
 // turns it into a registration. A record another request saved meanwhile is
-// returned as it is.
+// returned as it is; if it is a registration, the HSS, which the SAR made
+// hold the user unregistered, is told again (reassign).
 //
 // It fails with ErrUnknownUser, ErrServedElsewhere or ErrHSSUnavailable for
 // what the HSS answered, or with the store's error.
@@ -66,6 +67,18 @@ func (g *Registrar) Unregistered(ctx context.Context, impu string) (*state.Regis
 	if cur, f := g.set(ctx, key); f != nil {
 		return nil, f
 	} else if cur != nil {
+		if isRegistered(cur) {
+			// The set is registered here after all, and only impu's item
+			// was missing (a REGISTER cut short between its save and its
+			// pointers, a PPR meanwhile): the SAR just made the HSS hold
+			// the user unregistered. Its items are pointed and the HSS is
+			// told again, as after a deregistration a REGISTER overtook
+			// (#359 security review).
+			g.count("registrar.unregistered_was_registered")
+			if err := g.reassign(ctx, cur); err != nil {
+				g.internal("telling the HSS again of a registered set", err)
+			}
+		}
 		return cur, nil
 	}
 	until := received.Add(g.cfg.UnregisteredTTL)

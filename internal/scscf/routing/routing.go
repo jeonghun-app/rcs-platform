@@ -98,6 +98,11 @@ type Config struct {
 	Metrics Metrics
 }
 
+// maxDialogKeys are the current key and the previous one: a rotation keeps
+// the old key only until what it signed has ended, and a list that grows
+// with each one would keep every key that ever leaked.
+const maxDialogKeys = 2
+
 // Defaults of Config.
 const (
 	// DefaultRepairTimeout bounds a repair: the store's two calls, a read
@@ -202,8 +207,8 @@ func New(cfg Config) (*Router, error) {
 	if err := checkHosts(cfg); err != nil {
 		return nil, err
 	}
-	if len(cfg.DialogKeys) == 0 {
-		return nil, errors.New("routing: DialogKeys is required")
+	if len(cfg.DialogKeys) == 0 || len(cfg.DialogKeys) > maxDialogKeys {
+		return nil, errors.New("routing: DialogKeys needs the current key, and at most the previous one")
 	}
 	ids := map[string]bool{}
 	cfg.DialogKeys = slices.Clone(cfg.DialogKeys)

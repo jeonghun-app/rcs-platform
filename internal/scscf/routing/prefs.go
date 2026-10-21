@@ -149,17 +149,6 @@ func (p preferences) keeps(f features, ops *int) bool {
 	return true
 }
 
-// accepted are the bindings of cs that req's caller preferences accept, as
-// preferences.accepted; with preferences that are refused, every binding.
-func accepted(cs []state.Contact, req *sip.Request) []state.Contact {
-	p, err := preferencesOf(req)
-	if err != nil {
-		return cs
-	}
-	var ops int
-	return p.accepted(cs, &ops)
-}
-
 // features is the feature set of a binding (RFC 3840 §9), by lower-case
 // name, each feature's values read once.
 type features map[string]*stated
@@ -234,14 +223,15 @@ func (p predicate) matches(f features, ops *int) bool {
 
 // allows compares a predicate's values with a binding's (RFC 3840 §9): of
 // the predicate's values the binding must have one, or, for one written with
-// a leading !, lack it. Tokens and booleans compare without case, a string
-// in angle brackets whole and with case, numbers by value: a predicate's
+// a leading !, have one that is not it (lacks). Tokens and booleans compare
+// without case, a string in angle brackets whole and with case, numbers by
+// value: a predicate's
 // #>=n, #<=n, #=n or #a:b against a binding's #=n.
 func (s *stated) allows(values []string, ops *int) bool {
 	for _, v := range values {
 		*ops++
 		if neg, ok := strings.CutPrefix(v, "!"); ok {
-			if !s.has(neg) {
+			if s.lacks(neg) {
 				return true
 			}
 			continue
@@ -261,6 +251,51 @@ func (s *stated) has(v string) bool {
 		return s.number(v[1:])
 	}
 	return s.tokens[strings.ToLower(v)]
+}
+
+// lacks reports whether one of s's values is not v: the binding is a set of
+// feature collections, one per value, and !v asks for a collection without
+// v (RFC 3840 Appendix A, RFC 2533), so a binding with fthttp and geopush
+// matches !fthttp.
+func (s *stated) lacks(v string) bool {
+	others := len(s.tokens) + len(s.strings) + len(s.numbers)
+	switch {
+	case strings.HasPrefix(v, "<"):
+		if s.strings[v] {
+			others--
+		}
+		return others > 0
+	case strings.HasPrefix(v, "#"):
+		return len(s.tokens)+len(s.strings) > 0 || s.numberNot(v[1:])
+	}
+	if s.tokens[strings.ToLower(v)] {
+		others--
+	}
+	return others > 0
+}
+
+// numberNot reports whether one of s's numbers does not meet rel.
+func (s *stated) numberNot(rel string) bool {
+	ns := s.numbers
+	if len(ns) == 0 {
+		return false
+	}
+	lowest, highest := ns[0], ns[len(ns)-1]
+	switch {
+	case strings.HasPrefix(rel, ">="):
+		n, ok := number(rel[2:])
+		return !ok || lowest < n
+	case strings.HasPrefix(rel, "<="):
+		n, ok := number(rel[2:])
+		return !ok || highest > n
+	case strings.HasPrefix(rel, "="):
+		n, ok := number(rel[1:])
+		return !ok || lowest != n || highest != n
+	}
+	lo, hi, ok := strings.Cut(rel, ":")
+	a, okA := number(lo)
+	b, okB := number(hi)
+	return !ok || !okA || !okB || lowest < a || highest > b
 }
 
 // number reports whether one of s's numbers meets rel, a predicate's

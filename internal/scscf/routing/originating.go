@@ -97,12 +97,11 @@ func assertedUser(req *sip.Request) (string, bool) {
 // sign for the request, or that has expired (ADR 0005).
 func (rt *Router) resume(ctx context.Context, r *proxy.Request, v string) step {
 	now := rt.cfg.Now()
-	pos, err := rt.openODI(v, r.Message.Header.Get("Call-ID"), now)
+	pos, err := rt.openODI(v, requestOf(r.Message), now)
 	if err != nil {
 		rt.count("routing.odi.refused")
 		return answer(403, "Forbidden")
 	}
-	rt.count("routing.odi.resumed")
 	set, err := rt.lookup(ctx, pos.served, now)
 	switch {
 	case errors.Is(err, errBarred):
@@ -118,6 +117,18 @@ func (rt *Router) resume(ctx context.Context, r *proxy.Request, v string) step {
 		rt.internalLog("looking up the served user", err)
 		return rt.unavailable(r.Message)
 	}
+	switch taken, err := rt.takeUp(ctx, set, v, pos.expires); {
+	case err != nil:
+		// Going on is the safe side here: the default handling, failing
+		// on the same store, does not go on (toAS).
+		rt.internalLog("taking up a position in an iFC chain", err)
+	case !taken:
+		// Its default handling went on without the server already, on
+		// this instance or another: this copy would be a second.
+		rt.count("routing.odi.late")
+		return answer(403, "Forbidden")
+	}
+	rt.count("routing.odi.resumed")
 	if pos.scase == ifc.Originating {
 		return rt.next(ctx, r.Message, pos, set, rt.toTerminatingSide(r.Message))
 	}

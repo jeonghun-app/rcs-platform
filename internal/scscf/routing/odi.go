@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,9 @@ type position struct {
 	// keeps seeing: the one the S-CSCF puts in toward a server replaces it
 	// (TS 24.229 §5.4.3.2), and hiding that would hide the request's own.
 	kept bool
+	// expires is when the position signed for the request opened stops
+	// opening, zero for one not opened.
+	expires time.Time
 }
 
 // Bits of the flags byte of a signed position.
@@ -50,10 +54,19 @@ const (
 // the request, or has expired.
 var errBadODI = errors.New("routing: bad or expired iFC position")
 
-// signODI writes pos as the value of the odi parameter for the request with
-// callID, valid until expires: the current key's ID, the position, and an
-// HMAC under that key over it and the Call-ID, so that it cannot be
-// changed, replayed on another request, or used later (ADR 0005).
+// requestOf names the request a position is signed for: its Call-ID, its
+// method and its CSeq number, which an application server that proxies it
+// keeps, so that the position opens for that request alone, not for
+// another of its dialog (#359 QA and security reviews).
+func requestOf(req *sip.Request) string {
+	cseq, _ := req.Header.CSeq()
+	return req.Header.Get("Call-ID") + "\n" + req.Method + "\n" + strconv.FormatUint(uint64(cseq.Seq), 10)
+}
+
+// signODI writes pos as the value of the odi parameter for the request
+// requestOf names as callID, valid until expires: the current key's ID, the
+// position, and an HMAC under that key over it and the request, so that it
+// cannot be changed, replayed on another request, or used later (ADR 0005).
 func (rt *Router) signODI(pos position, callID string, expires time.Time) string {
 	payload := make([]byte, 0, 14+len(pos.served))
 	payload = binary.BigEndian.AppendUint64(payload, uint64(expires.Unix()))
@@ -109,6 +122,7 @@ func (rt *Router) openODI(v, callID string, now time.Time) (position, error) {
 		kept:       payload[9]&flagKept != 0,
 		priority:   int(int32(binary.BigEndian.Uint32(payload[10:]))),
 		served:     string(payload[14:]),
+		expires:    time.Unix(expires, 0).UTC(),
 	}, nil
 }
 

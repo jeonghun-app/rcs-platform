@@ -41,6 +41,7 @@ type Router struct {
 	metrics         Metrics
 	log             *slog.Logger
 	now             func() time.Time
+	selfURIs        []sip.URI
 	unknownLog      everyMinute
 	failed          recentFailures
 }
@@ -131,6 +132,7 @@ func New(cfg Config) (*Router, error) {
 		ids:             cfg.IDs,
 		metrics:         cfg.Metrics,
 		log:             cfg.Logger,
+		selfURIs:        cfg.Self,
 		now:             cfg.Now,
 	}, nil
 }
@@ -149,13 +151,70 @@ func (r *Router) Route(ctx context.Context, req *proxy.Request) proxy.Decision {
 	case m.Method == "REGISTER":
 		return r.register(ctx, m)
 	case !req.Initial() || m.Header.Has("Route"):
-		// A request inside a dialog goes where its Route or Request-URI
-		// says (RFC 3261 §16.12), and so does one whose Route continues
-		// past this I-CSCF (TS 24.229 §5.3.2.1): neither needs the HSS.
-		r.count(kindRouted, "forwarded")
-		return forwarding(proxy.Forward(req))
+		return r.routed(req)
 	}
 	return r.terminating(ctx, m)
+}
+
+// routed forwards a request inside a dialog where its Route or Request-URI
+// says (RFC 3261 §16.12), and one whose Route continues past this I-CSCF
+// (TS 24.229 §5.3.2.1), without the HSS. Its next hop must be a configured
+// S-CSCF, matched by scheme, host, port and transport: anything else is
+// refused 403 rather than sent wherever the request names (#337). A request
+// that names this I-CSCF again, anywhere in its Route or as its
+// Request-URI, is a loop: 482. A Request-URI behind a Route counts too: the
+// last Route's owner sends the request there (§16.12).
+func (r *Router) routed(req *proxy.Request) proxy.Decision {
+	m := req.Message
+	routes, err := m.Header.Route()
+	if err != nil {
+		return r.reject(kindRouted, 403)
+	}
+	next := m.URI
+	if len(routes) > 0 {
+		next = routes[0].URI
+	}
+	if r.self(m.URI) || slices.ContainsFunc(routes, func(a sip.Address) bool { return r.self(a.URI) }) {
+		return r.reject(kindRouted, 482)
+	}
+	if !r.scscfHop(next) {
+		return r.reject(kindRouted, 403)
+	}
+	r.count(kindRouted, "forwarded")
+	return forwarding(proxy.Forward(req))
+}
+
+// scscfHop reports whether u names a configured S-CSCF exactly as it is
+// reached: the same scheme, host, port and transport, defaults applied. A
+// maddr is refused: RFC 3263 §4 sends the request to it instead of the host,
+// so the host would vouch for an address it does not name once a resolver
+// honours it (security review of #350).
+func (r *Router) scscfHop(u sip.URI) bool {
+	if _, ok := u.Param("maddr"); ok || !u.IsSIP() {
+		return false
+	}
+	for _, c := range r.scscfs {
+		if c.uri.Scheme == u.Scheme && proxy.SameHost(c.uri.Host, u.Host) && port(c.uri) == port(u) && transportOf(c.uri) == transportOf(u) {
+			return true
+		}
+	}
+	return false
+}
+
+// self reports whether u names this I-CSCF (Config.Self), as the proxy
+// recognises its own Route entries, so that the two never disagree.
+func (r *Router) self(u sip.URI) bool { return proxy.IsSelf(r.selfURIs, u) }
+
+// transportOf is u's transport in lower case, or its scheme's default (RFC
+// 3261 §19.1.2): UDP for sip, TLS for sips.
+func transportOf(u sip.URI) string {
+	if t, ok := u.Param("transport"); ok && t != "" {
+		return strings.ToLower(t)
+	}
+	if u.Scheme == "sips" {
+		return "tls"
+	}
+	return "udp"
 }
 
 // register applies TS 24.229 §5.3.1.2 and §5.3.1.3.

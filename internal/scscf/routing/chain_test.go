@@ -202,6 +202,8 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			b.Routed[0].URI.Params.Set(odiParam, parts[0]+"."+base64.RawURLEncoding.EncodeToString(payload)+"."+parts[2])
 		},
 		"another Call-ID": func(b *proxy.Request) { _ = b.Message.Header.Set("Call-ID", "term-call-2") },
+		"another method":  func(b *proxy.Request) { b.Message.Method = "OPTIONS"; _ = b.Message.Header.Set("CSeq", "1 OPTIONS") },
+		"another CSeq":    func(b *proxy.Request) { _ = b.Message.Header.Set("CSeq", "2 INVITE") },
 		"expired":         func(*proxy.Request) { e.clock.advance(DefaultODILifetime + time.Second) },
 		"just in time":    func(*proxy.Request) { e.clock.advance(DefaultODILifetime) },
 		"empty":           func(b *proxy.Request) { b.Routed[0].URI.Params.SetFlag(odiParam) },
@@ -211,14 +213,14 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 		},
 		"from another key": func(b *proxy.Request) {
 			v, _ := b.Routed[0].URI.Param(odiParam)
-			pos, err := e.router(nil).openODI(v, "term-call-1", t0)
+			pos, err := e.router(nil).openODI(v, requestOf(b.Message), t0)
 			if err != nil {
 				t.Fatal(err)
 			}
 			other := e.router(nil, func(c *Config) {
 				c.DialogKeys = []DialogKey{{ID: "k2", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
 			})
-			b.Routed[0].URI.Params.Set(odiParam, other.signODI(pos, "term-call-1", t0.Add(time.Minute)))
+			b.Routed[0].URI.Params.Set(odiParam, other.signODI(pos, requestOf(b.Message), t0.Add(time.Minute)))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -226,7 +228,8 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			b := backFrom(t, r, d, 0)
 			b.Routed[0].URI.Params = append(sip.Params(nil), b.Routed[0].URI.Params...)
 			change(b)
-			got := e.router(nil).Initial(bg, b)
+			// Each case is its own return, with no claim on its position.
+			got := e.router(claimsApart(e.store)).Initial(bg, b)
 			switch {
 			case name == "as signed" || name == "just in time":
 				if serverOf(t, got) != "third-as.rcs.local" {
@@ -237,7 +240,7 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			}
 		})
 	}
-	if e.metrics.get("routing.odi.refused") != 6 || e.metrics.get("routing.odi.resumed") != 2 {
+	if e.metrics.get("routing.odi.refused") != 8 || e.metrics.get("routing.odi.resumed") != 2 {
 		t.Errorf("refused %d", e.metrics.get("routing.odi.refused"))
 	}
 }
@@ -254,7 +257,7 @@ func TestTheEndOfAnOriginatingChainIsTheICSCFOfTheHomeDomain(t *testing.T) {
 	} {
 		e := newEnv(t)
 		e.registered(binding(1, 0, time.Hour))
-		d := e.router(nil).Originating(bg, fromUser(t, "MESSAGE", target))
+		d := e.router(nil).Originating(bg, fromUser(t, "INVITE", target))
 		if want == "" {
 			if d.Status != 404 {
 				t.Errorf("%s: status %d, targets %v", target, d.Status, uris(d.Targets))
@@ -343,10 +346,11 @@ func (e *env) unregistered() *state.Registration {
 }
 
 // TestDefaultHandlingAppliesOnlyToAServerThatDoesNotAnswer (TS 24.229
-// §5.4.3.2): with its session continued, a server's silence, a failure to
-// reach it, or a 408, sends the request on as if the criterion had not
-// matched; an answer of its own, or a session terminated, ends the request
-// with the proxy's answer.
+// §5.4.3.2, §5.4.3.3): with its session continued, a server's silence, a
+// failure to reach it, a 408 or a 5xx, without a provisional response from
+// it first, sends the request on as if the criterion had not matched; any
+// other answer, one after a provisional, or a session terminated, ends the
+// request with the server's answer.
 func TestDefaultHandlingAppliesOnlyToAServerThatDoesNotAnswer(t *testing.T) {
 	for name, c := range map[string]struct {
 		handling ifc.DefaultHandling
@@ -364,7 +368,22 @@ func TestDefaultHandlingAppliesOnlyToAServerThatDoesNotAnswer(t *testing.T) {
 		}, "third-as.rcs.local"},
 		"its own 500": {ifc.SessionContinued, func(tg proxy.Target) proxy.BranchFailure {
 			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 500}}
+		}, "third-as.rcs.local"},
+		"its own 500, terminated": {ifc.SessionTerminated, func(tg proxy.Target) proxy.BranchFailure {
+			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 500}}
 		}, ""},
+		"its own 486": {ifc.SessionContinued, func(tg proxy.Target) proxy.BranchFailure {
+			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 486}}
+		}, ""},
+		"a 408 after a 180": {ifc.SessionContinued, func(tg proxy.Target) proxy.BranchFailure {
+			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 408}, Provisional: true, Progress: true}
+		}, ""},
+		"closed after a 180": {ifc.SessionContinued, func(tg proxy.Target) proxy.BranchFailure {
+			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 503}, Err: errors.New("connection closed"), Provisional: true, Progress: true}
+		}, ""},
+		"a 408 after only a 100": {ifc.SessionContinued, func(tg proxy.Target) proxy.BranchFailure {
+			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 408}, Provisional: true}
+		}, "third-as.rcs.local"},
 		"terminated": {ifc.SessionTerminated, func(tg proxy.Target) proxy.BranchFailure {
 			return proxy.BranchFailure{Target: tg, Response: &sip.Response{StatusCode: 408}, Err: proxy.ErrTargetTimeout}
 		}, ""},
@@ -608,7 +627,7 @@ func TestARetargetedRequestGoesToItsNewUsersSide(t *testing.T) {
 	} {
 		back := backFrom(t, r, d, 0)
 		back.Message.URI, _ = sip.ParseURI(target)
-		if host := serverOf(t, e.router(nil).Initial(bg, back)); host != want {
+		if host := serverOf(t, e.router(claimsApart(e.store)).Initial(bg, back)); host != want {
 			t.Errorf("%s: to %s", target, host)
 		}
 	}
@@ -793,7 +812,9 @@ func TestADefaultHandlingThatCannotGoOnAnswersAsTheChainWould(t *testing.T) {
 	}
 
 	st.reads = -1 << 30
-	d = e.router(st).Initial(bg, fromUser(t, "MESSAGE", impu2))
+	second := fromUser(t, "MESSAGE", impu2)
+	_ = second.Message.Header.Set("Call-ID", "term-call-2")
+	d = e.router(st).Initial(bg, second)
 	more := d.OnBranchFailure(bg, timeout(d.Targets[0]))
 	if len(more) != 1 || more[0].Routes[0].URI.Host != "icscf.rcs.local" {
 		t.Fatalf("then %v", uris(more))
@@ -903,5 +924,99 @@ func TestTheFirstStepOfAChainSignsTheDialogsRoute(t *testing.T) {
 	back := backFrom(t, r, d, 0)
 	if d := e.router(nil).Initial(bg, back); d.OnResponse != nil || len(d.RecordRoute) != 0 {
 		t.Error("the step back from the server records the route again")
+	}
+}
+
+// claimsApart is st with the claims of iFC positions (state.AttemptODI)
+// kept apart, in a store of their own, as a test that resumes one position
+// in several cases needs.
+func claimsApart(st *state.Memory) state.Store {
+	return &apartClaims{Memory: st, claims: state.NewMemory()}
+}
+
+type apartClaims struct {
+	*state.Memory
+	claims *state.Memory
+}
+
+func (s *apartClaims) CountAttempt(ctx context.Context, a state.Attempt, n int64, expires time.Time) (int64, error) {
+	if a.Kind == state.AttemptODI {
+		return s.claims.CountAttempt(ctx, a, n, expires)
+	}
+	return s.Memory.CountAttempt(ctx, a, n, expires)
+}
+
+// TestAServerThatSentTheRequestBackIsNotPassedOver (code review on #359):
+// an OPTIONS rcs-as sent on, whose callee is slow, times out on the branch
+// toward rcs-as; the default handling does not send a second copy, as the
+// copy rcs-as sent back goes on, on any instance. A copy back after the
+// default handling went on is refused.
+func TestAServerThatSentTheRequestBackIsNotPassedOver(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), ifc.SessionContinued))
+	r := fromUser(t, "OPTIONS", impu2)
+	d := e.router(nil).Initial(bg, r)
+	back := backFrom(t, r, d, 0)
+	if host := serverOf(t, e.router(nil).Initial(bg, back)); host != "icscf.rcs.local" {
+		t.Fatalf("the copy back went to %s", host)
+	}
+	timeout := proxy.BranchFailure{Target: d.Targets[0], Response: &sip.Response{StatusCode: 408}, Err: proxy.ErrTargetTimeout}
+	if more := d.OnBranchFailure(bg, timeout); len(more) != 0 {
+		t.Errorf("a second copy went to %v", uris(more))
+	}
+	// The other way round: the default handling first.
+	r2 := fromUser(t, "OPTIONS", impu2)
+	_ = r2.Message.Header.Set("Call-ID", "term-call-2")
+	d2 := e.router(nil).Initial(bg, r2)
+	timeout.Target = d2.Targets[0]
+	if more := d2.OnBranchFailure(bg, timeout); len(more) != 1 {
+		t.Fatalf("the default handling did not go on: %v", uris(more))
+	}
+	if got := e.router(nil).Initial(bg, backFrom(t, r2, d2, 0)); got.Status != 403 || e.metrics.get("routing.odi.late") != 1 {
+		t.Errorf("the late copy back is %d", got.Status)
+	}
+}
+
+// TestARingingINVITEIsNotSentOnPastItsServer (code review on #359): a
+// SESSION_CONTINUED operator server that had the callee ring, and then
+// ends with 408, is not passed over: the callee would ring twice.
+func TestARingingINVITEIsNotSentOnPastItsServer(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(5, operatorAS, method("INVITE"), ifc.SessionContinued))
+	d := e.router(nil).Initial(bg, fromUser(t, "INVITE", impu2))
+	f := proxy.BranchFailure{Target: d.Targets[0], Response: &sip.Response{StatusCode: 408}, Provisional: true, Progress: true}
+	if more := d.OnBranchFailure(bg, f); len(more) != 0 {
+		t.Errorf("sent on to %v", uris(more))
+	}
+}
+
+// TestTheChainsAnswerKeepsItsRetryAfter (code review on #359): a default
+// handling that goes on and finds the store failing answers 500 with
+// Retry-After, as the first step would.
+func TestTheChainsAnswerKeepsItsRetryAfter(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), ifc.SessionContinued))
+	d := e.router(&profileOnce{Memory: e.store}).Initial(bg, fromUser(t, "MESSAGE", impu2))
+	d.OnBranchFailure(bg, proxy.BranchFailure{Target: d.Targets[0], Response: &sip.Response{StatusCode: 408}, Err: proxy.ErrTargetTimeout})
+	res := &sip.Response{StatusCode: 504, Reason: "Server Time-out"}
+	d.OnFinal(bg, res)
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") != storeRetryAfter {
+		t.Errorf("%d with Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
+
+// TestAStandaloneRequestsChainRecordsNoRoute (#322): an originating MESSAGE
+// sets up no dialog, and its branches carry no Record-Route.
+func TestAStandaloneRequestsChainRecordsNoRoute(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), ifc.SessionContinued))
+	r := fromUser(t, "MESSAGE", impu2)
+	d := e.router(nil).Initial(bg, r)
+	if len(d.RecordRoute) != 0 || d.OnResponse != nil {
+		t.Errorf("Record-Route %v", d.RecordRoute)
 	}
 }

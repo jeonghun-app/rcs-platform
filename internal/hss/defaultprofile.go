@@ -22,6 +22,11 @@ const (
 	// The OMA SIMPLE IM feature tag, with which the reference client
 	// (rcsjta) asks for a 1-to-1 chat instead of the CPM chat ICSI.
 	omaIM = `\+g\.oma\.sip-im`
+	// An MSRP message stream in a session description's m= line, which a
+	// chat's or a file transfer's INVITE offers whatever its feature tags
+	// say (RFC 4975 §8.1): the trigger then holds even for a request that
+	// names its service in a way no feature-tag pattern expects.
+	msrpMedia = `^message .*MSRP`
 )
 
 // featureTagHeaders carry the caller's and callee's feature tags;
@@ -49,7 +54,7 @@ const servedUserHeader = "P-Served-User"
 // offline (docs/architecture.md §5):
 //
 //	10  INVITE for an RCS service (CPM ICSI, RCS IARI, or
-//	    OMA SIMPLE IM, rcsjta's chat)                        SESSION_TERMINATED
+//	    OMA SIMPLE IM, rcsjta's chat, or an MSRP stream)     SESSION_TERMINATED
 //	20  MESSAGE                                             SESSION_TERMINATED
 //	30  OPTIONS for an RCS service (capability discovery)   SESSION_CONTINUED
 //	40  REGISTER (third-party registration)                 SESSION_CONTINUED
@@ -81,6 +86,9 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 		}
 		for _, h := range serviceHeaders {
 			spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SIPHeader{Header: h, Content: cpmICSI}})
+		}
+		if method == "INVITE" {
+			spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SessionDescription{Line: "m", Content: msrpMedia}})
 		}
 		spts = append(spts, notServed(2))
 		return &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: spts}

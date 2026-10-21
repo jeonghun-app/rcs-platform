@@ -732,10 +732,14 @@ type Challenges interface {
 const ReservedNoncePrefix = "#"
 
 // The kinds of CountAttempt: the challenges the S-CSCF issues, and the
-// resynchronisations among them.
+// resynchronisations among them; and the taking up of a request's place in
+// its iFC chain, by its return from an application server or by its
+// default handling, which only the first may do (routing, #14), counted
+// under the served user's IMPI and ODIScope.
 const (
 	AttemptChallenge = "challenge"
 	AttemptResync    = "resync"
+	AttemptODI       = "odi"
 )
 
 // Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
@@ -754,12 +758,19 @@ func FlowScope(token string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// ODIScope is the Attempt scope of a signed iFC position: a digest, as
+// FlowScope's is.
+func ODIScope(odi string) string {
+	sum := sha256.Sum256([]byte("scscf/attempt-odi|" + odi))
+	return hex.EncodeToString(sum[:16])
+}
+
 // ValidAttempt checks CountAttempt's arguments; the backends apply it.
 func ValidAttempt(a Attempt, n int64, expires time.Time) error {
 	if err := identity.ValidIMPI(a.IMPI); err != nil {
 		return fmt.Errorf("%w: attempt IMPI: %w", ErrInvalid, err)
 	}
-	if a.Kind != AttemptChallenge && a.Kind != AttemptResync {
+	if a.Kind != AttemptChallenge && a.Kind != AttemptResync && a.Kind != AttemptODI {
 		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
 	}
 	if a.Scope != "" && !validScope(a.Scope) {

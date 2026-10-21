@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -43,11 +44,13 @@ type plan struct {
 	hops   map[string]hop
 	status int
 	reason string
+	// retryAfter is the answer's Retry-After, "" without one.
+	retryAfter string
 }
 
 // decide is the Decision for s, the step of req: its answer, or its hops,
 // with the S-CSCF's Record-Route, signed for the dialog's hops (recorder),
-// if recordRoute.
+// if recordRoute and req sets up a dialog (formsDialog).
 func (rt *Router) decide(req *sip.Request, s step, recordRoute bool) proxy.Decision {
 	switch {
 	case s.response != nil:
@@ -57,7 +60,7 @@ func (rt *Router) decide(req *sip.Request, s step, recordRoute bool) proxy.Decis
 	}
 	p := &plan{hops: map[string]hop{}}
 	d := proxy.Decision{Targets: p.add(s.hops), Prepare: p.prepare, OnBranchFailure: p.failed, OnFinal: p.final}
-	if recordRoute {
+	if recordRoute && formsDialog(req.Method) {
 		p.rec = rt.recorder(req)
 		d.RecordRoute = []sip.Address{rt.cfg.RecordRoute}
 		d.OnResponse = p.rec.response
@@ -113,19 +116,21 @@ func (p *plan) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Target
 		return nil
 	}
 	s := h.failed(ctx, f)
-	status, reason := s.status, s.reason
+	status, reason, retry := s.status, s.reason, ""
 	if s.response != nil {
 		status, reason = s.response.StatusCode, s.response.Reason
+		retry = s.response.Header.Get("Retry-After")
 	}
 	if status != 0 {
 		p.mu.Lock()
-		p.status, p.reason = status, reason
+		p.status, p.reason, p.retryAfter = status, reason, retry
 		p.mu.Unlock()
 	}
 	return p.add(s.hops)
 }
 
-// final gives the final response the chain's answer if it has one, and
+// final gives the final response the chain's answer, Retry-After
+// included, if it has one, and
 // otherwise turns a 430 into 480, as the proxy does without OnFinal: 430 is
 // between an edge proxy and the S-CSCF (RFC 5626 §11.5).
 func (p *plan) final(_ context.Context, res *sip.Response) {
@@ -133,11 +138,15 @@ func (p *plan) final(_ context.Context, res *sip.Response) {
 		return
 	}
 	p.mu.Lock()
-	status, reason := p.status, p.reason
+	status, reason, retry := p.status, p.reason, p.retryAfter
 	p.mu.Unlock()
 	switch {
 	case status != 0:
 		res.StatusCode, res.Reason = status, reason
+		res.Header.Del("Retry-After")
+		if retry != "" {
+			_ = res.Header.Set("Retry-After", retry)
+		}
 	case res.StatusCode == 430:
 		res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
 	}
@@ -198,18 +207,22 @@ func (rt *Router) next(ctx context.Context, req *sip.Request, pos position, set 
 // toAS is the hop to an application server: the request's Request-URI
 // unchanged, along the server and then back to the S-CSCF, whose Route
 // carries pos signed (odi), with P-Served-User naming the served user and
-// the session case (RFC 5502). Without an answer from the server, the
-// criterion's default handling applies: SESSION_CONTINUED goes on with the
-// chain as if the server had not matched, SESSION_TERMINATED ends the
-// request with the proxy's answer (TS 24.229 §5.4.3.2). An answer the
-// server sends is passed on as it is, a 500 with Retry-After included.
+// the session case (RFC 5502). When the server does not answer, or answers
+// 408 or 5xx, without a provisional response first and before it sent the
+// request back, the criterion's default handling applies (TS 24.229
+// §5.4.3.2, §5.4.3.3): SESSION_CONTINUED goes on with the chain as if the
+// server had not matched, SESSION_TERMINATED ends the request with the
+// server's answer, a 500 with Retry-After included, or the proxy's. Any
+// other answer the server sends is passed on as it is.
 func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, as sip.URI, handling ifc.DefaultHandling, end func(context.Context) step) step {
 	server := as
 	server.Params = append(sip.Params(nil), as.Params...)
 	server.Params.SetFlag("lr")
 	back := rt.cfg.RecordRoute.URI
 	back.Params = append(sip.Params(nil), back.Params...)
-	back.Params.Set(odiParam, rt.signODI(pos, req.Header.Get("Call-ID"), rt.cfg.Now().Add(rt.cfg.ODILifetime)))
+	expires := rt.cfg.Now().Add(rt.cfg.ODILifetime).Truncate(time.Second)
+	odi := rt.signODI(pos, requestOf(req), expires)
+	back.Params.Set(odiParam, odi)
 	t := proxy.Target{URI: req.URI, Routes: []sip.Address{{URI: server}, {URI: back}}}
 	if req.Method != "INVITE" {
 		// An INVITE's branch may ring for long, and Timeout would cancel
@@ -222,7 +235,25 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 			return b.Header.Set("P-Served-User", servedUser(pos))
 		},
 		failed: func(ctx context.Context, f proxy.BranchFailure) step {
-			if handling != ifc.SessionContinued || !unanswered(f) {
+			switch {
+			case handling != ifc.SessionContinued || !unanswered(f):
+				return step{}
+			case f.Progress:
+				// The server answered with a provisional response, so it
+				// has the request (§5.4.3.2, §5.4.3.3).
+				rt.count("routing.ifc.answered_provisionally")
+				return step{}
+			}
+			switch taken, err := rt.takeUp(ctx, set, odi, expires); {
+			case err != nil:
+				// Two copies of the request are worse than the server's
+				// failure passed upstream.
+				rt.internalLog("taking up a position in an iFC chain", err)
+				return step{}
+			case !taken:
+				// The server sent the request on with this position,
+				// to this instance or another, which goes on with it.
+				rt.count("routing.ifc.returned_meanwhile")
 				return step{}
 			}
 			rt.count("routing.ifc.default_handling_continued")
@@ -231,10 +262,26 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 	}}}
 }
 
-// unanswered reports whether a branch ended without an answer from its
-// target: a failure the proxy made up (a timeout, the transport), or a 408.
+// unanswered reports whether a branch ended without an answer that does
+// for the server's: a failure the proxy made up (a timeout, the
+// transport), a 408 or a 5xx (§5.4.3.2, §5.4.3.3).
 func unanswered(f proxy.BranchFailure) bool {
-	return f.Err != nil || f.Response != nil && f.Response.StatusCode == 408
+	return f.Err != nil || f.Response != nil && (f.Response.StatusCode == 408 || f.Response.StatusCode >= 500 && f.Response.StatusCode < 600)
+}
+
+// takeUp claims the request's place in its chain signed as odi, valid
+// until expires, for whoever goes on with it first: the server's return
+// with it (resume), or its default handling on the branch's failure, on
+// any instance (state.AttemptODI). It is false once the other has.
+func (rt *Router) takeUp(ctx context.Context, set *state.Registration, odi string, expires time.Time) (bool, error) {
+	if set == nil {
+		// A user deregistered meanwhile: no IMPI keys the claim, and the
+		// chain ends in any case.
+		return true, nil
+	}
+	a := state.Attempt{IMPI: set.Key.IMPI, Kind: state.AttemptODI, Scope: state.ODIScope(odi), Window: expires.Add(-time.Second)}
+	n, err := rt.cfg.Store.CountAttempt(ctx, a, 1, expires.Add(rt.cfg.ODILifetime))
+	return n == 1, err
 }
 
 // servedUser is the P-Served-User toward an application server: the served

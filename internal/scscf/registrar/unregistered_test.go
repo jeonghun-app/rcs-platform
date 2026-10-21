@@ -166,3 +166,33 @@ func (s *savingFirst) SaveRegistration(ctx context.Context, r *state.Registratio
 	}
 	return s.Memory.SaveRegistration(ctx, r)
 }
+
+// TestARegisteredSetFoundAfterTheSARIsAssertedAgain (#359 security review):
+// a REGISTER cut short left an identity of a live set without its item, so
+// a terminating request asked the HSS, which now holds the user
+// unregistered; the item is pointed and the HSS told of the registration.
+func TestARegisteredSetFoundAfterTheSARIsAssertedAgain(t *testing.T) {
+	e := newEnv(t)
+	e.akaUser(impi1, impu1, tel1)
+	live := seed(t, e, impi1, []string{impu1, tel1}, func(r *state.Registration) {
+		r.Contacts = []state.Contact{{URI: "sip:ue1@192.0.2.10:5060", Expires: t0.Add(time.Hour), CallID: "c", CSeq: 1}}
+	})
+	id := must(e.store.Identity(bg, tel1, t0))(t)
+	if err := e.store.DeleteIdentity(bg, id); err != nil {
+		t.Fatal(err)
+	}
+	m := &counts{}
+	rec := must(e.instance(1, func(c *Config) { c.Metrics = m }).Unregistered(bg, tel1))(t)
+	if rec.Incarnation != live.Incarnation {
+		t.Errorf("record %+v", rec)
+	}
+	if sar := e.hss.lastSAR(t); sar.AssignmentType != cx.Registration {
+		t.Errorf("the HSS was last told %v, want REGISTRATION", sar.AssignmentType)
+	}
+	if got, err := e.store.Identity(bg, tel1, t0); err != nil || got.Set != live.Key || got.Incarnation != live.Incarnation {
+		t.Errorf("tel1's item %+v, %v", got, err)
+	}
+	if m.get("registrar.unregistered_was_registered") != 1 {
+		t.Error("not counted")
+	}
+}
