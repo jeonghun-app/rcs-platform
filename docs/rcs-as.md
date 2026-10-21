@@ -780,7 +780,20 @@ request (`invalid`); a bad invitee or name never does:
   are not normalized (NFC), and look-alike letters of different scripts are
   not folded.
 - **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
-  in 1-to-1 chat.
+  in 1-to-1 chat. A group created without one gets one in the UUID form OMA
+  CPM asks of a Conversation-ID (Conversation Functions, Appendix C.1.1):
+  - with a `Contribution-ID`, as rcsjta sends, a name-based UUID (version 5,
+    in a namespace of rcs-as's groups, not the pairs') of the
+    `Contribution-ID` alone, as the conference URI is made from it. rcsjta
+    starts a group that ended again under its `Contribution-ID`, from
+    whichever participant writes next; the new group gets the same
+    conference URI and the same Conversation-ID, so that it stays one
+    thread;
+  - without one, a random UUID (version 4), which never equals a version 5
+    one.
+
+  Groups made before #305 keep the 32 hex digits they were given: the value
+  is opaque, and read and compared as stored.
 
 ### Fan-out
 
@@ -1251,9 +1264,9 @@ Signals to alarm on (Phase 7):
   C.1.1 requires the latter, and gets the pair's (above). Residual: a CPM
   client that names its own Conversation-ID and an rcsjta client that
   answers it without one see two threads, the CPM client's and the pair's;
-  joining them would need rcs-as to remember the ID a pair last used. A
-  group's Conversation-ID, made when none is given, is 32 hex digits rather
-  than the UUID form C.1.1 asks for (#305).
+  joining them would need rcs-as to remember the ID a pair last used.
+  Groups made before #305 keep the 32 hex digits they were given as their
+  Conversation-ID, rather than the UUID form C.1.1 asks for, until they end.
 - **Legs are per task.** A message is delivered on a leg of the task that
   works on its queue. That holds for the B2BUA model, where both legs of a
   chat live on the task whose instance address the SIP dialog names (ADR
