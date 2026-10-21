@@ -721,7 +721,7 @@ func TestSendWaitsForRoomWhileThePeerReads(t *testing.T) {
 func TestPeerThatNeverReadsFailsTheWaitingSendAndIsClosedByTheWriter(t *testing.T) {
 	server, peer := net.Pipe()
 	t.Cleanup(func() { peer.Close() })
-	conn := &stalledConn{Conn: server, writing: make(chan time.Time, 1), deadline: make(chan struct{})}
+	conn := &stalledConn{Conn: server, writing: make(chan time.Time, 1), deadline: make(chan struct{}), closed: make(chan struct{})}
 	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, WriteTimeout: time.Hour, SendQueueBytes: 1000})
 	listen(t, tr, ListenerConfig{Network: TCP})
 	q := &queueTest{t: t, tr: tr}
@@ -762,14 +762,22 @@ func TestPeerThatNeverReadsFailsTheWaitingSendAndIsClosedByTheWriter(t *testing.
 
 // stalledConn is a connection whose peer never reads: Write reports the
 // deadline it was given on writing and blocks until deadline is closed, then
-// fails as a passed write deadline does.
+// fails as a passed write deadline does. Close releases it too, so a test
+// that fails early ends with its own message rather than a hung cleanup.
 type stalledConn struct {
 	net.Conn
 	writing  chan time.Time
 	deadline chan struct{}
+	closed   chan struct{}
+	once     sync.Once
 
 	mu  sync.Mutex
 	set time.Time
+}
+
+func (c *stalledConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 func (c *stalledConn) SetWriteDeadline(t time.Time) error {
@@ -787,19 +795,32 @@ func (c *stalledConn) Write([]byte) (int, error) {
 	case c.writing <- set:
 	default:
 	}
-	<-c.deadline
-	return 0, os.ErrDeadlineExceeded
+	select {
+	case <-c.deadline:
+		return 0, os.ErrDeadlineExceeded
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
 }
 
 // parkedIn reports whether a goroutine is blocked inside fn.
 func parkedIn(fn string) bool {
-	buf := make([]byte, 1<<20)
-	for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+	for _, g := range strings.Split(string(allStacks()), "\n\n") {
 		if strings.Contains(g, fn) && (strings.Contains(g, "[select") || strings.Contains(g, "[chan receive")) {
 			return true
 		}
 	}
 	return false
+}
+
+// allStacks is every goroutine's stack, however many there are.
+func allStacks() []byte {
+	for size := 1 << 20; ; size *= 2 {
+		buf := make([]byte, size)
+		if n := runtime.Stack(buf, true); n < size {
+			return buf[:n]
+		}
+	}
 }
 
 func TestDialedConnectionWithoutAnAddressOrListenerIsNotGivenABrokenVia(t *testing.T) {
