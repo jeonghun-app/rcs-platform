@@ -46,6 +46,9 @@ type author struct {
 	mu     sync.Mutex
 	status map[string]map[string]imdn.Kind // Message-ID → participant → strongest kind
 	got    atomic.Int64
+	// changed counts the notifications that raised a status, which a
+	// sender repeating itself does not.
+	changed atomic.Int64
 }
 
 // sentDateTime is the DateTime of every message chat builds.
@@ -88,7 +91,16 @@ func (a *author) take(t *testing.T, body []byte) {
 	}
 	if kindRank[n.Kind] > kindRank[a.status[n.MessageID][from.URI]] {
 		a.status[n.MessageID][from.URI] = n.Kind
+		a.changed.Add(1)
 	}
+}
+
+// deliveredWork counts the work done toward alice reading her messages by
+// all: statuses raised, summaries expanded, and her queue emptying. A
+// notification sent again, or a summary resent every pass, does not count,
+// so a delivery that loops stands still (code review on #335).
+func deliveredWork(r *rig, a *author) int64 {
+	return a.changed.Load() + r.m.get("group.summary.expanded") - int64(r.store.(*store.Memory).Len(alice))
 }
 
 func (a *author) readByAll(id string, recipients []string) bool {
@@ -165,7 +177,7 @@ func TestAnOfflineAuthorSeesItsMessageReadByAll(t *testing.T) {
 	a.listen(t, c)
 	// 99 and more notifications: on a loaded host that takes longer than
 	// hangGuard, so the waits fail only when nothing moves (#306).
-	progress := func() int64 { return a.got.Load() + r.m.get("group.summary.sent") + r.m.get("group.summary.expanded") }
+	progress := func() int64 { return deliveredWork(r, a) }
 	waitProgress(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) }, progress)
 	waitProgress(t, "alice's queue empty", func() bool { return r.store.(*store.Memory).Len(alice) == 0 }, progress)
 	waitProgress(t, "the summary expanded", func() bool { return r.m.get("group.summary.expanded") == 1 }, progress)
@@ -173,7 +185,7 @@ func TestAnOfflineAuthorSeesItsMessageReadByAll(t *testing.T) {
 		t.Fatalf("metrics %v", r.m)
 	}
 	// One per participant from the summary, its strongest: displayed.
-	waitProgress(t, "every notification taken", func() bool { return a.got.Load() >= int64(share)+99 }, progress)
+	waitProgress(t, "every notification taken", func() bool { return a.got.Load() >= int64(share)+99 }, a.got.Load)
 	if got := a.got.Load(); got != int64(share)+99 {
 		t.Fatalf("alice got %d notifications, want %d receipts and 99 from the summary", got, share)
 	}
@@ -210,9 +222,7 @@ func TestNineGroupsOfReceiptsAreAllReadByAll(t *testing.T) {
 	}
 	// Some 900 notifications go out: on a loaded host that takes longer
 	// than hangGuard, so the waits fail only when nothing moves (#306).
-	progress := func() int64 {
-		return a.got.Load() + r.m.get("group.summary.sent") + r.m.get("group.summary.expanded")
-	}
+	progress := func() int64 { return deliveredWork(r, a) }
 	for g := range 9 {
 		waitProgress(t, fmt.Sprint("g", g, " read by all"), func() bool { return a.readByAll(fmt.Sprint("g", g), everyone[1:]) }, progress)
 	}
@@ -455,7 +465,7 @@ func TestAConnectedAuthorGetsItsReceiptsAsTheyCome(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	waitProgress(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) }, a.got.Load)
+	waitProgress(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) }, a.changed.Load)
 	if r.m.get("group.notification.summarized") != 0 || r.m.get("group.summary.expanded") != 0 {
 		t.Fatalf("metrics %v", r.m)
 	}
