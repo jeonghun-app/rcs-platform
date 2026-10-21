@@ -130,9 +130,10 @@ func TestARequestWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
 	// ends the request with 430 (RFC 5626 §5.3.1), which reaches the
 	// originator as 480 (§11.5). A request sent to the IMPU once the flow
 	// is gone gets 480 too: the binding stays until it expires, as a
-	// registration does. The originator's clock is normal, so its own
-	// Timer F, 32 s out, is not what ends the first one.
-	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	// registration does. The core's T1 is the default, so its own Timer
+	// F, 32 s out, cannot end the request before a flow closed late under
+	// load (review of #425), and neither can the originator's.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
@@ -154,9 +155,10 @@ func TestARequestWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
 }
 
 func TestAnInviteWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
-	// #414: as for a MESSAGE, and not 408 at Timer B: B's layer sent 100
-	// Trying, so only the flow's end can end the INVITE.
-	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	// #414: as for a MESSAGE, and not 408 at Timer B: the core's T1 is
+	// the default, so Timer B is 32 s out, and B's layer sends 100 Trying,
+	// which stops it, so only the flow's end can end the INVITE.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
