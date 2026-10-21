@@ -45,7 +45,8 @@ const TerminatedGrace = time.Minute
 // the next sweep after it calls handle again, which finds what is left; an
 // identity it never reaches still goes at its KeepUntil.
 //
-// A live registration whose Reassert is due is claimed the same way, Reassert
+// A live registration whose Reassert is due, an unregistered user's record
+// whose state has not ended included, is claimed the same way, Reassert
 // moved one lease ahead, and handed to handle, whose before.ReassertDue tells
 // it to tell the HSS again. The sweep does no more for it: handle saves after
 // under its version, with Reassert and ReassertAttempts cleared once the HSS
@@ -67,7 +68,13 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 		if len(next.Prune(now)) == 0 && len(next.Contacts) > 0 && !reassert {
 			continue
 		}
-		if len(next.Contacts) == 0 {
+		// An unregistered user's state that has not ended is no end: only
+		// its Reassert can have brought it here.
+		unregistered := len(next.Contacts) == 0 && next.Deregistering.IsZero() && next.Unregistered.After(now)
+		if unregistered && !reassert {
+			continue
+		}
+		if len(next.Contacts) == 0 && !unregistered {
 			next.Deregistering = now.Add(SweepLease)
 			// Nothing is left to reassert: the set ends.
 			next.Reassert, next.ReassertAttempts = time.Time{}, 0
@@ -88,7 +95,7 @@ func SweepRegistrations(ctx context.Context, s Registrations, now time.Time, lim
 			errs = errors.Join(errs, err)
 			continue
 		}
-		if len(after.Contacts) == 0 {
+		if !after.Deregistering.IsZero() {
 			if err := ignoreLost(s.DeleteRegistration(ctx, after)); err != nil {
 				return n, errors.Join(errs, err)
 			}

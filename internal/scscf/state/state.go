@@ -168,6 +168,11 @@ type Registration struct {
 	// may register different identities of it. It is empty in a record saved
 	// before it was kept, whose end names Key.IMPU.
 	RegisteredAs []string
+	// Tombstone marks a deregistration's lease that holds the key of a set
+	// that was already gone (registrar's undoIfEnded): nothing was
+	// registered under it, so its end tells the application servers
+	// nothing. It has no contacts, and Deregistering is set.
+	Tombstone bool
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). A new item starts at a
 	// random value (FirstVersion), and every save raises it, so of two reads
@@ -282,20 +287,26 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or a due Reassert if earlier, or, without contacts, when its
-// deregistration may be retried, or else when its unregistered state ends. A
+// contact expiry, or without contacts, when its deregistration may be
+// retried, or else when its unregistered state ends; a due Reassert if
+// earlier, but on a deregistration's lease, which ends the set anyway. A
 // registration with none of these is due at once.
 func (r *Registration) SweepAt() time.Time {
+	var at time.Time
 	switch {
 	case len(r.Contacts) > 0:
-		if next := r.NextExpiry(); r.Reassert.IsZero() || next.Before(r.Reassert) {
-			return next
-		}
-		return r.Reassert
+		at = r.NextExpiry()
 	case !r.Deregistering.IsZero():
 		return r.Deregistering
+	default:
+		at = r.Unregistered
 	}
-	return r.Unregistered
+	if !r.Reassert.IsZero() && r.Reassert.Before(at) {
+		// An unregistered user's record is reasserted too (#410 code
+		// review).
+		return r.Reassert
+	}
+	return at
 }
 
 // ReassertDue reports whether a sweep at now should tell the HSS again that
@@ -372,6 +383,9 @@ func (r *Registration) Validate() error {
 	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
+	}
+	if r.Tombstone && (len(r.Contacts) > 0 || r.Deregistering.IsZero()) {
+		return fmt.Errorf("%w: a tombstone has contacts or no lease", ErrInvalid)
 	}
 	if len(r.RegisteredAs) > MaxIdentities {
 		return fmt.Errorf("%w: more than %d identities in RegisteredAs", ErrInvalid, MaxIdentities)
