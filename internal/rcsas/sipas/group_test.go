@@ -17,6 +17,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/resourcelists"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
 // carol is a third participant, on .github/allowed-test-identifiers.txt.
@@ -148,7 +149,6 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 			"P-Asserted-Identity": "<" + uri + ">",
 			"P-Served-User":       "<" + who + ">;sescase=term",
 			"Contact":             "<" + uri + ">;isfocus;" + chatTag + ";" + omaIMTag,
-			"Accept-Contact":      "*;" + chatTag + ";" + omaIMTag,
 			"Referred-By":         "<" + alice + ">",
 			"Subject":             "Lunch",
 			"Conversation-ID":     g.Conversation,
@@ -157,6 +157,11 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 			if got := h.Get(name); got != want {
 				t.Errorf("INVITE to %s: %s %q, want %q", who, name, got, want)
 			}
+		}
+		// One Accept-Contact per feature tag, so a contact with either
+		// matches (code review on #279).
+		if ac := h.Values("Accept-Contact"); !slices.Equal(ac, []string{"*;" + chatTag, "*;" + omaIMTag}) {
+			t.Errorf("INVITE to %s: Accept-Contact %q", who, ac)
 		}
 		// The SIP URI of carol's number at the home domain is carol.
 		if (who != bob && who != carol) || from.URI.String() != uri || strings.HasPrefix(from.Tag(), ownTagPrefix) {
@@ -623,5 +628,136 @@ func TestADeclineGivesThePlaceBack(t *testing.T) {
 	inv := messaging.Invitation{Recipient: bob, Peer: uri, Mode: store.Group, Conversation: messaging.Conversation{Contribution: "gch4t1"}}
 	if err := r.a.srv.Invite(t.Context(), inv); err != nil {
 		t.Fatalf("the next invitation: %v", err)
+	}
+}
+
+// Code review on #279: a group whose establishment cannot be written is
+// tried again, with a pause, and once three more tries have failed its
+// creator's session ends with a BYE and nobody is invited: the group ends
+// within minutes, and the client makes it again rather than keep a
+// session with a group that is gone.
+func TestAGroupThatCannotBeEstablishedEndsItsCreatorsSession(t *testing.T) {
+	saved := establishBackoff
+	establishBackoff = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { establishBackoff = saved })
+
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	// Two failures are tried through: bob is invited, and the group
+	// outlives its first minutes (QA on #279).
+	r.groupReads.failUpdates.Store(2)
+	uri, _ := r.create(t, p, relayPath(), bob)
+	if inv := r.core.nextOf(t, "INVITE"); inv.URI.String() != bob {
+		t.Fatalf("INVITE to %s", inv.URI)
+	}
+	r.clock.Advance(3 * time.Minute)
+	if _, err := r.groups.Get(t.Context(), uri); err != nil {
+		t.Fatalf("3 minutes on: %v", err)
+	}
+	// Four are not: alice's session ends, and carol is not invited.
+	r.groupReads.failUpdates.Store(4)
+	m := r.factoryInvite(relayPath(), carol)
+	m.fields[3] = "Contribution-ID: gch4t2"
+	s := answeredBy(t, p.send(m))
+	p.ack(s)
+	for {
+		req := r.core.next(t)
+		if req.Method == "INVITE" {
+			t.Fatalf("INVITE to %s for a group that was never established", req.URI)
+		}
+		if req.Method == "BYE" && req.Header.Get("Call-ID") == s.callID {
+			break
+		}
+	}
+	if n := r.metrics.get("sip.group.establish_abandoned"); n != 1 {
+		t.Fatalf("%d abandoned", n)
+	}
+}
+
+// Code review on #279: one bad entry in the factory's resource list is
+// left out and counted, not a reason to refuse the list.
+func TestABadEntryInTheListIsSkipped(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	list := strings.Replace(groupList(bob), "</list>", `<entry uri="sip:a b@example.net"/><entry/></list>`, 1)
+	m := r.groupInvite(confFactory, `multipart/mixed;boundary="boundary1"`,
+		firstMessageBody([2]string{sdpType, offerSDP(relayPath(), "active")}, [2]string{resourcelists.ContentType, list}),
+		"Require: recipient-list-invite")
+	s := answeredBy(t, p.send(m))
+	p.ack(s)
+	if inv := r.core.nextOf(t, "INVITE"); inv.URI.String() != bob {
+		t.Fatalf("INVITE to %s", inv.URI)
+	}
+	if n := r.metrics.get("sip.group.invitee_skipped"); n != 2 {
+		t.Fatalf("%d skipped", n)
+	}
+}
+
+// QA on #279: the creator's 200 is lost (no ACK); its client tries the
+// factory INVITE again under the same chat ID, never having learnt the
+// conference URI, and takes up its group. Nobody is invited until the
+// creator's ACK comes.
+func TestTheCreatorTakesUpItsGroupAfterALost200(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	first := p.send(r.factoryInvite(relayPath(), bob)) // never ACKed
+	select {
+	case req := <-r.core.got:
+		t.Fatalf("%s to %s before the creator's ACK", req.Method, req.URI)
+	case <-time.After(100 * time.Millisecond):
+	}
+	res := p.send(r.factoryInvite(relayPath(), bob))
+	if res.StatusCode != 200 || res.Header.Get("Contact") != first.Header.Get("Contact") {
+		t.Fatalf("the creator's retry answered %d, Contact %q", res.StatusCode, res.Header.Get("Contact"))
+	}
+	p.ack(answeredBy(t, res))
+	if inv := r.core.nextOf(t, "INVITE"); inv.URI.String() != bob {
+		t.Fatalf("INVITE to %s", inv.URI)
+	}
+}
+
+// QA on #279: an INVITE that names a reply without the contribution it
+// belongs to is refused.
+func TestAReplyWithoutAContributionIsRefused(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	p := r.a.dial(t)
+	chat := r.chatInvite(offerSDP(relayPath(), "active"))
+	chat.fields = slices.DeleteFunc(chat.fields, func(f string) bool {
+		return strings.HasPrefix(f, "Conversation-ID:") || strings.HasPrefix(f, "Contribution-ID:")
+	})
+	chat.fields = append(chat.fields, "InReplyTo-Contribution-ID: r1")
+	if res := p.send(chat); res.StatusCode != 400 {
+		t.Fatalf("a chat INVITE with only InReplyTo-Contribution-ID answered %d", res.StatusCode)
+	}
+	group := r.factoryInvite(relayPath(), bob)
+	group.fields[3] = "InReplyTo-Contribution-ID: r1"
+	if res := p.send(group); res.StatusCode != 400 {
+		t.Fatalf("a factory INVITE with only InReplyTo-Contribution-ID answered %d", res.StatusCode)
+	}
+}
+
+// QA on #279: a creator's 200 that gets no ACK at all (64*T1) neither
+// establishes the group nor invites anyone: the client never had the
+// conference URI.
+func TestAGroupWhoseCreatorNeverACKsInvitesNobody(t *testing.T) {
+	r := newChatRig(t, messaging.Config{}, func(pc *proxy.Config) { pc.Transaction.T1 = 5 * time.Millisecond })
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	if res := p.send(r.factoryInvite(relayPath(), bob)); res.StatusCode != 200 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	waitUntil(t, "the 2xx given up", func() bool { return r.metrics.get("sip.session.no_ack") == 1 })
+	select {
+	case req := <-r.core.got:
+		if req.Method == "INVITE" {
+			t.Fatalf("INVITE to %s for a group whose creator never ACKed", req.URI)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+	if n := r.metrics.get("sip.group.creator_unacknowledged"); n != 1 {
+		t.Fatalf("%d unacknowledged", n)
 	}
 }

@@ -64,13 +64,21 @@ type Entry struct {
 // ErrTooMany as soon as there are more than limit. Entries by reference
 // (entry-ref, external) are not followed: there is nothing to dereference
 // them against here, and they are left out.
-func Parse(data []byte, limit int) ([]Entry, error) {
+//
+// An entry whose uri is missing or no URI a client means (not text, or
+// with white space or control characters) is left out too, and counted in
+// skipped, but counts toward limit: one bad entry does not refuse a list
+// (docs/rcs-as.md), and no list is read past limit. A display name that
+// is not text is dropped, its entry kept.
+func Parse(data []byte, limit int) (entries []Entry, skipped int, err error) {
 	if len(data) > MaxDocumentSize {
-		return nil, ErrTooLarge
+		return nil, 0, ErrTooLarge
 	}
 	d := xml.NewDecoder(bytes.NewReader(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))))
 	var (
 		out    []Entry
+		seen   int // entries, skipped ones included
+		bad    int
 		stack  []xml.Name
 		entry  *Entry
 		inName bool
@@ -82,23 +90,23 @@ func Parse(data []byte, limit int) ([]Entry, error) {
 			break
 		}
 		if err != nil {
-			return nil, decodeError(err)
+			return nil, 0, decodeError(err)
 		}
 		switch t := tok.(type) {
 		case xml.Directive:
-			return nil, ErrDTD
+			return nil, 0, ErrDTD
 		case xml.StartElement:
 			if len(stack) == 0 {
 				roots++
 				if roots > 1 || t.Name != (xml.Name{Space: Namespace, Local: "resource-lists"}) {
-					return nil, fmt.Errorf("%w: not one resource-lists root", ErrMalformed)
+					return nil, 0, fmt.Errorf("%w: not one resource-lists root", ErrMalformed)
 				}
 			}
 			if len(stack) >= maxDepth {
-				return nil, fmt.Errorf("%w: elements nested deeper than %d", ErrMalformed, maxDepth)
+				return nil, 0, fmt.Errorf("%w: elements nested deeper than %d", ErrMalformed, maxDepth)
 			}
 			if repeatedAttr(t.Attr) {
-				return nil, fmt.Errorf("%w: repeated attribute", ErrMalformed)
+				return nil, 0, fmt.Errorf("%w: repeated attribute", ErrMalformed)
 			}
 			parent := xml.Name{}
 			if len(stack) > 0 {
@@ -110,15 +118,18 @@ func Parse(data []byte, limit int) ([]Entry, error) {
 			}
 			switch {
 			case t.Name.Local == "entry" && parent == (xml.Name{Space: Namespace, Local: "list"}):
+				if seen == limit {
+					return nil, 0, ErrTooMany
+				}
+				seen++
 				uri := attr(t.Attr, "uri")
 				if uri == "" || !isText(uri) || strings.ContainsFunc(uri, unicode.IsSpace) || strings.ContainsFunc(uri, unicode.IsControl) {
 					// A URI has neither white space nor control
 					// characters (RFC 3986 §2), and one with a CR LF
 					// could become a header wherever it is written.
-					return nil, fmt.Errorf("%w: entry without a uri", ErrMalformed)
-				}
-				if len(out) == limit {
-					return nil, ErrTooMany
+					bad++
+					entry = nil
+					continue
 				}
 				out = append(out, Entry{URI: uri})
 				entry = &out[len(out)-1]
@@ -127,7 +138,7 @@ func Parse(data []byte, limit int) ([]Entry, error) {
 			}
 		case xml.EndElement:
 			if len(stack) == 0 {
-				return nil, fmt.Errorf("%w: unbalanced element", ErrMalformed)
+				return nil, 0, fmt.Errorf("%w: unbalanced element", ErrMalformed)
 			}
 			top := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
@@ -142,24 +153,24 @@ func Parse(data []byte, limit int) ([]Entry, error) {
 		case xml.CharData:
 			switch {
 			case len(stack) == 0 && len(bytes.Trim(t, " \t\r\n")) > 0:
-				return nil, fmt.Errorf("%w: text outside the root element", ErrMalformed)
+				return nil, 0, fmt.Errorf("%w: text outside the root element", ErrMalformed)
 			case inName && entry != nil:
 				if len(entry.DisplayName)+len(t) > maxNameBytes {
-					return nil, fmt.Errorf("%w: display name too long", ErrMalformed)
+					return nil, 0, fmt.Errorf("%w: display name too long", ErrMalformed)
 				}
 				entry.DisplayName += string(t)
 			}
 		}
 	}
 	if roots == 0 {
-		return nil, fmt.Errorf("%w: no root element", ErrMalformed)
+		return nil, 0, fmt.Errorf("%w: no root element", ErrMalformed)
 	}
 	for i := range out {
 		if !isText(out[i].DisplayName) {
-			return nil, fmt.Errorf("%w: display name is not text", ErrMalformed)
+			out[i].DisplayName = ""
 		}
 	}
-	return out, nil
+	return out, bad, nil
 }
 
 func attr(attrs []xml.Attr, name string) string {

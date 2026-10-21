@@ -91,7 +91,9 @@ type session struct {
 	// other forks rcs-as ended.
 	final, noDialog bool
 	dropped         map[string]bool
-	ended           bool
+	// acked is set once the client's ACK of rcs-as's 2xx came (watch).
+	acked bool
+	ended bool
 }
 
 // contactTag is the feature tag of the session's service.
@@ -111,6 +113,15 @@ func (ss *session) inviteTags() string {
 		return largeTag
 	}
 	return chatTag + ";" + omaIMTag
+}
+
+// acceptTags are the feature tags of an INVITE's Accept-Contact values,
+// one each (inviteTags).
+func (ss *session) acceptTags() []string {
+	if ss.mode == store.Standalone {
+		return []string{largeTag}
+	}
+	return []string{chatTag, omaIMTag}
 }
 
 // contact is the Contact of rcs-as's side of the session: this task, where
@@ -179,14 +190,30 @@ func (s *Server) addSession(ss *session) (answered func(), err error) {
 func (s *Server) settle(ss *session) {
 	s.mu.Lock()
 	ss.live = true
-	closed := s.closed
+	// Before Close takes its sessions, this one is among them, and Close
+	// ends it and waits for its BYE's answer; after, it is ended here, and
+	// Close, while it still waits for its own BYEs, waits for this one
+	// too (QA on #273).
+	late, counted, by := s.swept, s.sweeping, s.closeBy
+	if counted {
+		s.lateByes.Add(1)
+	}
 	s.mu.Unlock()
 	s.answering.Done()
-	if closed {
+	if late {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), s.closeWait())
 			defer cancel()
-			ss.byeConfirmed(ctx)
+			if counted {
+				defer s.lateByes.Done()
+				// Within Close's own bound, which waits for it.
+				ctx, cancel = context.WithDeadline(ctx, by)
+				defer cancel()
+			}
+			select {
+			case <-ss.byeConfirmed(ctx):
+			case <-ctx.Done():
+			}
 		}()
 	}
 }
@@ -195,6 +222,14 @@ func (s *Server) settle(ss *session) {
 // client's ACK of rcs-as's 2xx came, or never will (proxy.ErrNoACK), or
 // rcs-as sent its own ACK.
 func (ss *session) confirm() { ss.confirmOnce.Do(func() { close(ss.confirmed) }) }
+
+// acknowledged reports whether the client's ACK of rcs-as's 2xx came, once
+// confirmed is closed.
+func (ss *session) acknowledged() bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.acked
+}
 
 // byeConfirmed ends the session with a BYE once its dialog is confirmed,
 // or once ctx ends: a callee must not send a BYE before the 2xx's ACK
@@ -342,11 +377,14 @@ func (s *Server) closeWait() time.Duration {
 // closeWait. Then it waits for the BYEs' answers, up to closeWait again:
 // the transport writes a request after SendRequest returns, and closing it
 // at once could drop the BYE. So Close takes at most twice closeWait.
-func (s *Server) Close() {
+func (s *Server) Close() { s.closeOnce.Do(s.close) }
+
+func (s *Server) close() {
+	wait := s.closeWait()
 	s.mu.Lock()
 	s.closed = true
+	s.closeBy = time.Now().Add(2 * wait)
 	s.mu.Unlock()
-	wait := s.closeWait()
 	// One bound for every session's answer and ACK: a closed Done reaches
 	// every waiter.
 	answering, cancel := context.WithTimeout(context.Background(), wait)
@@ -367,6 +405,7 @@ func (s *Server) Close() {
 			all = append(all, ss)
 		}
 	}
+	s.swept, s.sweeping = true, true
 	s.mu.Unlock()
 	var wg sync.WaitGroup
 	for _, ss := range all {
@@ -383,6 +422,12 @@ func (s *Server) Close() {
 		})
 	}
 	wg.Wait()
+	// No settle counts a BYE once this is cleared, so that no Add races
+	// the Wait below.
+	s.mu.Lock()
+	s.sweeping = false
+	s.mu.Unlock()
+	s.lateByes.Wait()
 }
 
 // msrpOffer reads the SDP offer in body: its first MSRP media line, with
@@ -617,6 +662,9 @@ func containsFold(list []string, v string) bool {
 func (ss *session) watch(u *proxy.UAS) {
 	if u != nil {
 		_, err := u.ACK(context.Background())
+		ss.mu.Lock()
+		ss.acked = err == nil
+		ss.mu.Unlock()
 		ss.confirm()
 		if errors.Is(err, proxy.ErrNoACK) {
 			ss.s.cfg.Metrics.Count("sip.session.no_ack", 1)

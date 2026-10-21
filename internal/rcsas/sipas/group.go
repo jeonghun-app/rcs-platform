@@ -233,7 +233,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	if factory {
 		// Read no further than a group holds: a longer list is refused
 		// unread (docs/rcs-as.md).
-		entries, err := resourcelists.Parse(list, s.cfg.MaxGroupParticipants)
+		entries, skipped, err := resourcelists.Parse(list, s.cfg.MaxGroupParticipants)
 		switch {
 		case errors.Is(err, resourcelists.ErrTooMany):
 			s.cfg.Metrics.Count("sip.group.list_too_long", 1)
@@ -244,6 +244,8 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 			s.respond(u, req, 400)
 			return
 		}
+		// A bad entry is left out, not a reason to refuse the list.
+		s.cfg.Metrics.Count("sip.group.invitee_skipped", int64(skipped))
 		invitees = s.invitees(entries)
 	}
 	tag, err := s.ids.Tag()
@@ -305,11 +307,13 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 		_ = ss.leg.Close()
 		return
 	}
-	if err := s.addSession(ss); err != nil {
+	answered, err := s.addSession(ss)
+	if err != nil {
 		_ = ss.leg.Close()
 		s.refuseRoom(u, req, err)
 		return
 	}
+	defer answered()
 	if err := u.Respond(res); err != nil {
 		s.cfg.Metrics.Count("sip.respond_failed", 1)
 		ss.end()
@@ -317,7 +321,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	}
 	if factory {
 		s.cfg.Metrics.Count("sip.group.created", 1)
-		go s.establish(g, conv)
+		go s.establish(ss, g, conv)
 	} else {
 		s.cfg.Metrics.Count("sip.group.joined", 1)
 	}
@@ -376,17 +380,40 @@ func (s *Server) refuseGroup(u *proxy.UAS, req *sip.Request, err error) {
 	s.respond(u, req, code)
 }
 
-// establish makes a new group last once its creator has its session
-// (group.Service.Established): until then a CANCEL, or a failure after
-// the group was stored, leaves a group that ends on its own, and that the
-// creator's next INVITE under the same Contribution-ID takes up again.
-// Then the focus invites the invitees.
-func (s *Server) establish(g groupstore.Group, conv messaging.Conversation) {
-	ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
-	err := s.groups.Established(ctx, g.URI)
-	cancel()
-	if err != nil {
+// establishBackoff are the waits before establish tries again.
+var establishBackoff = []time.Duration{100 * time.Millisecond, 400 * time.Millisecond, 1600 * time.Millisecond}
+
+// establish makes a new group last once its creator has its session ss,
+// the 200's ACK having come (group.Service.Established): until then a
+// CANCEL, a failure after the group was stored, or a 200 the client never
+// got, leaves a group that ends on its own, and that the creator's next
+// INVITE under the same Contribution-ID takes up again (QA on #279). Then
+// the focus invites the invitees. A write that still fails after
+// three more tries ends the creator's session with a BYE and invites
+// nobody: the group ends within minutes, and the client makes it again
+// rather than keep a session with a group that is gone (code review on
+// #279).
+func (s *Server) establish(ss *session, g groupstore.Group, conv messaging.Conversation) {
+	<-ss.confirmed
+	if !ss.acknowledged() {
+		// No ACK: the session ends from watch, and the group with it.
+		s.cfg.Metrics.Count("sip.group.creator_unacknowledged", 1)
+		return
+	}
+	for attempt := 0; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
+		err := s.groups.Established(ctx, g.URI)
+		cancel()
+		if err == nil {
+			break
+		}
 		s.cfg.Metrics.Count("sip.group.establish_failed", 1)
+		if attempt == len(establishBackoff) {
+			s.cfg.Metrics.Count("sip.group.establish_abandoned", 1)
+			ss.bye("")
+			return
+		}
+		time.Sleep(establishBackoff[attempt])
 	}
 	s.inviteAll(g, conv)
 }

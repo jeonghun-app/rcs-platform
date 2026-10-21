@@ -70,7 +70,6 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 		"P-Asserted-Service":  chatICSI,
 		// Both the CPM ICSI and the OMA SIMPLE IM tag, by which rcsjta
 		// takes a chat (code review on #279).
-		"Accept-Contact":  "*;" + chatTag + ";" + omaIMTag,
 		"Contact":         "<sip:" + r.a.addr.String() + ";transport=tcp>;" + chatTag + ";" + omaIMTag,
 		"Conversation-ID": "c0nv1",
 		"Content-Type":    sdpType,
@@ -78,6 +77,10 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 		if got := ih.Get(name); got != want {
 			t.Errorf("INVITE %s: %q, want %q", name, got, want)
 		}
+	}
+	// One Accept-Contact per feature tag (code review on #279).
+	if ac := ih.Values("Accept-Contact"); !slices.Equal(ac, []string{"*;" + chatTag, "*;" + omaIMTag}) {
+		t.Errorf("INVITE Accept-Contact %q", ac)
 	}
 	if inv.URI.String() != bob || ih.Has("Supported") {
 		t.Errorf("INVITE %s, Supported %q", inv.URI.String(), ih.Get("Supported"))

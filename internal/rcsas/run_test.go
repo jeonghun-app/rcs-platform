@@ -444,6 +444,15 @@ func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 	if res.StatusCode != 200 || err != nil || contact.URI.Host != devEnv["RCSAS_CONFERENCE_HOST"] || !contact.Params.Has("isfocus") {
 		t.Fatalf("answered %d, Contact %q", res.StatusCode, res.Header.Get("Contact"))
 	}
+	// The group is established, and its invitees invited, once the 200's
+	// ACK has come.
+	to, _ := res.Header.To()
+	ack := "ACK " + contact.URI.String() + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-group-ack\r\n" +
+		"Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <" + factory + ">;tag=" + to.Tag() + "\r\n" +
+		"Call-ID: rcsas-run-group\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
+	if _, err := io.WriteString(nc, ack); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.After(waitFor)
 	for {
 		select {

@@ -312,9 +312,11 @@ metadata.
   creator trying again before the group is established, which takes up the
   same group (#279). A participant the chairman removed cannot make a group
   that its former members' clients would merge into the one it was removed
-  from. An ended group frees its ID. The conference URI is no secret from
-  anyone who knows the ID, the group's participants; it grants nothing, as
-  every request to it is checked against the roster.
+  from. An ended group frees its ID. Residual risk: once a group has ended,
+  anyone who knows its Contribution-ID can make a group under it first, and
+  a former member's restart under that ID then gets 403. The conference URI
+  is no secret from anyone who knows the ID, the group's participants; it
+  grants nothing, as every request to it is checked against the roster.
 - **Roster privacy.** The roster keeps former participants (up to the size
   limit), so a participant who joins later sees who was in the group before.
   This is accepted: it is how RFC 4575 rosters and RCS clients show who left.

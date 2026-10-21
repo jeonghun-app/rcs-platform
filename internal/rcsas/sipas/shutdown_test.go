@@ -294,3 +294,189 @@ func TestQA273AnInviteAnsweredAfterCloseIsEndedAfterIts200(t *testing.T) {
 	r.ackOf(t, res)
 	r.byeFor(t, res)
 }
+
+// QA on #273: a session answered after Close's bound, whose client never
+// ACKs, is ended within closeWait of its 200, not at Timer H.
+func TestALateAnswerWithoutAnACKIsEndedWithinTheBound(t *testing.T) {
+	const w = 150 * time.Millisecond
+	r := newShutdownRig(t, w)
+	answered := r.heldInvite(t)
+	r.a.srv.Close()
+	r.release()
+	<-answered
+	at := time.Now()
+	select {
+	case req := <-r.core.got:
+		if d := time.Since(at); req.Method != "BYE" || d < w-30*time.Millisecond {
+			t.Fatalf("%s %v after the 200", req.Method, d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no BYE within 3 s of a 200 answered after Close, with no ACK")
+	}
+}
+
+// QA on #273: Close called three times at once ends a session once.
+func TestCloseRunsOnce(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{closeWait: 200 * time.Millisecond})
+	p := r.a.dial(t)
+	s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
+	p.ack(s)
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(r.a.srv.Close)
+	}
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
+	n := 0
+	for len(r.core.got) > 0 {
+		if (<-r.core.got).Method == "BYE" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d BYEs", n)
+	}
+}
+
+// QA on #273 and #279 (the merged-tree test): Close ends a group session
+// with a BYE like any other, and does not sit out its bound for it.
+func TestQABothCloseEndsAGroupSession(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{closeWait: 2 * time.Second})
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		code := 486
+		if req.Method == "BYE" {
+			code = 200
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		return []*sip.Response{res}
+	})
+	p := r.a.dial(t)
+	_, s := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	start := time.Now()
+	r.a.srv.Close()
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("Close sat out its bound (%v): the group session never settled", took)
+	}
+	if bye := r.core.nextOf(t, "BYE"); bye.Header.Get("Call-ID") != s.callID {
+		t.Errorf("BYE for %q, want alice's group session", bye.Header.Get("Call-ID"))
+	}
+}
+
+// heldByes has the fake core hold its answer to each BYE until the test
+// releases it, by Call-ID.
+type heldByes struct {
+	mu      sync.Mutex
+	release map[string]chan struct{}
+}
+
+func (h *heldByes) gate(callID string) chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.release[callID] == nil {
+		h.release[callID] = make(chan struct{})
+	}
+	return h.release[callID]
+}
+
+func (h *heldByes) open(callID string) {
+	c := h.gate(callID)
+	select {
+	case <-c:
+	default:
+		close(c)
+	}
+}
+
+func holdByes(t *testing.T, r *shutdownRig) *heldByes {
+	h := &heldByes{release: map[string]chan struct{}{}}
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "BYE" {
+			<-h.gate(req.Header.Get("Call-ID"))
+		}
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	t.Cleanup(func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, c := range h.release {
+			select {
+			case <-c:
+			default:
+				close(c)
+			}
+		}
+	})
+	return h
+}
+
+// QA on #273: a session settled while Close still waits for the sessions
+// being answered is one of Close's own: Close sends its BYE and waits for
+// the answer, which settle's own BYE would have left it no part in.
+func TestASessionSettledDuringCloseIsClosesOwn(t *testing.T) {
+	for range 5 {
+		r := newShutdownRig(t, time.Hour)
+		held := holdByes(t, r)
+		answered := r.heldInvite(t)
+		r.close()
+		r.release()
+		res := answeredOK(t, answered)
+		r.ackOf(t, res)
+		r.core.nextOf(t, "BYE")
+		r.quiet(t, 100*time.Millisecond, false, "before its BYE was answered")
+		held.open(res.Header.Get("Call-ID"))
+		r.waitClosed(t)
+	}
+}
+
+// QA on #273: a session that settles once Close has taken its sessions,
+// while Close still waits for its own BYEs, ends itself, and Close waits
+// for that BYE's answer too.
+func TestCloseWaitsForALateSessionsBye(t *testing.T) {
+	const wait = time.Second
+	r := newShutdownRig(t, wait)
+	held := holdByes(t, r)
+	live := r.p.send(r.chatInvite(offerSDP(relayPath(), "active")))
+	if live.StatusCode != 200 {
+		t.Fatalf("answered %d", live.StatusCode)
+	}
+	r.ackOf(t, live)
+	answered := r.heldInvite(t)
+	r.close()
+	// Close's first bound passes waiting for the stored message; then the
+	// live session's BYE goes, and its answer is held.
+	r.byeFor(t, live)
+	r.release()
+	late := answeredOK(t, answered)
+	r.ackOf(t, late)
+	held.open(live.Header.Get("Call-ID"))
+	r.byeFor(t, late)
+	r.quiet(t, 200*time.Millisecond, false, "before the late session's BYE was answered")
+	held.open(late.Header.Get("Call-ID"))
+	r.waitClosed(t)
+}
+
+// QA on #273: Close runs once, and a second call waits for the first,
+// rather than returning while its BYEs are still unanswered.
+func TestASecondCloseWaitsForTheFirst(t *testing.T) {
+	r := newShutdownRig(t, time.Hour)
+	held := holdByes(t, r)
+	res := r.p.send(r.chatInvite(offerSDP(relayPath(), "active")))
+	if res.StatusCode != 200 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	r.ackOf(t, res)
+	r.close()
+	r.byeFor(t, res)
+	second := make(chan struct{})
+	go func() { r.a.srv.Close(); close(second) }()
+	select {
+	case <-second:
+		t.Fatal("a second Close returned before the first's BYE was answered")
+	case <-time.After(100 * time.Millisecond):
+	}
+	held.open(res.Header.Get("Call-ID"))
+	<-second
+	r.waitClosed(t)
+}

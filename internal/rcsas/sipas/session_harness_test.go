@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -41,10 +42,21 @@ type chatRig struct {
 	groupReads *countingGroups
 }
 
-// countingGroups counts the reads of a groups store.
+// countingGroups counts the reads of a groups store, and fails the next
+// failUpdates updates.
 type countingGroups struct {
 	groupstore.Store
-	gets atomic.Int64
+	gets        atomic.Int64
+	failUpdates atomic.Int64
+}
+
+var errFakeStore = errors.New("fake: the store failed")
+
+func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, token string) error {
+	if c.failUpdates.Add(-1) >= 0 {
+		return errFakeStore
+	}
+	return c.Store.Update(ctx, g, token)
 }
 
 func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {
