@@ -66,6 +66,9 @@ type session struct {
 	mode        store.Mode
 	// inv is the invitation of a session rcs-as started; zero otherwise.
 	inv messaging.Invitation
+	// group is the conference URI of a session with a group chat, which
+	// rcs-as is the focus of; empty otherwise.
+	group string
 
 	mu sync.Mutex
 	d  *dialog.Dialog
@@ -88,7 +91,9 @@ type session struct {
 	// other forks rcs-as ended.
 	final, noDialog bool
 	dropped         map[string]bool
-	ended           bool
+	// acked is set once the client's ACK of rcs-as's 2xx came (watch).
+	acked bool
+	ended bool
 }
 
 // contactTag is the feature tag of the session's service.
@@ -97,6 +102,44 @@ func (ss *session) contactTag() string {
 		return largeTag
 	}
 	return chatTag
+}
+
+// inviteTags are the feature tags of the INVITEs rcs-as sends for the
+// session's service, in Contact and Accept-Contact: for a chat, with a
+// group too, both the CPM chat ICSI and the OMA SIMPLE IM tag, by which
+// rcsjta takes a chat session (ImsServiceDispatcher, ChatUtils).
+func (ss *session) inviteTags() string {
+	if ss.mode == store.Standalone {
+		return largeTag
+	}
+	return chatTag + ";" + omaIMTag
+}
+
+// acceptTags are the feature tags of an INVITE's Accept-Contact values,
+// one each (inviteTags).
+func (ss *session) acceptTags() []string {
+	if ss.mode == store.Standalone {
+		return []string{largeTag}
+	}
+	return []string{chatTag, omaIMTag}
+}
+
+// contact is the Contact of rcs-as's side of the session: this task, where
+// the requests in the dialog reach it, with the service's feature tag; or,
+// in a session with a group, the conference URI marked as a focus (RFC
+// 4579 §5.2), which is how rcsjta tells a group's INVITE from a 1-to-1
+// one (ChatUtils.isGroupChatInvitation) and what it rejoins the group at.
+func (ss *session) contact() string { return ss.contactWith(ss.contactTag()) }
+
+// inviteContact is contact with the feature tags of an INVITE
+// (inviteTags).
+func (ss *session) inviteContact() string { return ss.contactWith(ss.inviteTags()) }
+
+func (ss *session) contactWith(tags string) string {
+	if ss.group != "" {
+		return "<" + ss.group + ">;isfocus;" + tags
+	}
+	return sip.Address{URI: ss.s.cfg.Contact}.String() + ";" + tags
 }
 
 // Why addSession did not add a session.
@@ -147,14 +190,30 @@ func (s *Server) addSession(ss *session) (answered func(), err error) {
 func (s *Server) settle(ss *session) {
 	s.mu.Lock()
 	ss.live = true
-	closed := s.closed
+	// Before Close takes its sessions, this one is among them, and Close
+	// ends it and waits for its BYE's answer; after, it is ended here, and
+	// Close, while it still waits for its own BYEs, waits for this one
+	// too (QA on #273).
+	late, counted, by := s.swept, s.sweeping, s.closeBy
+	if counted {
+		s.lateByes.Add(1)
+	}
 	s.mu.Unlock()
 	s.answering.Done()
-	if closed {
+	if late {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), s.closeWait())
 			defer cancel()
-			ss.byeConfirmed(ctx)
+			if counted {
+				defer s.lateByes.Done()
+				// Within Close's own bound, which waits for it.
+				ctx, cancel = context.WithDeadline(ctx, by)
+				defer cancel()
+			}
+			select {
+			case <-ss.byeConfirmed(ctx):
+			case <-ctx.Done():
+			}
 		}()
 	}
 }
@@ -163,6 +222,14 @@ func (s *Server) settle(ss *session) {
 // client's ACK of rcs-as's 2xx came, or never will (proxy.ErrNoACK), or
 // rcs-as sent its own ACK.
 func (ss *session) confirm() { ss.confirmOnce.Do(func() { close(ss.confirmed) }) }
+
+// acknowledged reports whether the client's ACK of rcs-as's 2xx came, once
+// confirmed is closed.
+func (ss *session) acknowledged() bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.acked
+}
 
 // byeConfirmed ends the session with a BYE once its dialog is confirmed,
 // or once ctx ends: a callee must not send a BYE before the 2xx's ACK
@@ -310,11 +377,14 @@ func (s *Server) closeWait() time.Duration {
 // closeWait. Then it waits for the BYEs' answers, up to closeWait again:
 // the transport writes a request after SendRequest returns, and closing it
 // at once could drop the BYE. So Close takes at most twice closeWait.
-func (s *Server) Close() {
+func (s *Server) Close() { s.closeOnce.Do(s.close) }
+
+func (s *Server) close() {
+	wait := s.closeWait()
 	s.mu.Lock()
 	s.closed = true
+	s.closeBy = time.Now().Add(2 * wait)
 	s.mu.Unlock()
-	wait := s.closeWait()
 	// One bound for every session's answer and ACK: a closed Done reaches
 	// every waiter.
 	answering, cancel := context.WithTimeout(context.Background(), wait)
@@ -335,6 +405,7 @@ func (s *Server) Close() {
 			all = append(all, ss)
 		}
 	}
+	s.swept, s.sweeping = true, true
 	s.mu.Unlock()
 	var wg sync.WaitGroup
 	for _, ss := range all {
@@ -351,6 +422,12 @@ func (s *Server) Close() {
 		})
 	}
 	wg.Wait()
+	// No settle counts a BYE once this is cleared, so that no Add races
+	// the Wait below.
+	s.mu.Lock()
+	s.sweeping = false
+	s.mu.Unlock()
+	s.lateByes.Wait()
 }
 
 // msrpOffer reads the SDP offer in body: its first MSRP media line, with
@@ -518,12 +595,12 @@ func (ss *session) offerAgain() ([]byte, error) {
 	return body, nil
 }
 
-// sessionHeaders adds the header fields of a 2xx in a session: Contact with
-// the service's feature tag, Allow, the SDP if any and, with a timer, the
-// Session-Expires the UAC refreshes (RFC 4028 §9).
-func (s *Server) sessionHeaders(res *sip.Response, tag string, body []byte, interval time.Duration) error {
+// sessionHeaders adds the header fields of a 2xx in a session: contact,
+// Allow, the SDP if any and, with a timer, the Session-Expires the UAC
+// refreshes (RFC 4028 §9).
+func (s *Server) sessionHeaders(res *sip.Response, contact string, body []byte, interval time.Duration) error {
 	fields := [][2]string{
-		{"Contact", sip.Address{URI: s.cfg.Contact}.String() + ";" + tag},
+		{"Contact", contact},
 		{"Allow", allowed},
 		{"Supported", "timer"},
 	}
@@ -585,6 +662,9 @@ func containsFold(list []string, v string) bool {
 func (ss *session) watch(u *proxy.UAS) {
 	if u != nil {
 		_, err := u.ACK(context.Background())
+		ss.mu.Lock()
+		ss.acked = err == nil
+		ss.mu.Unlock()
 		ss.confirm()
 		if errors.Is(err, proxy.ErrNoACK) {
 			ss.s.cfg.Metrics.Count("sip.session.no_ack", 1)
@@ -710,7 +790,7 @@ func (s *Server) sendACK(ack *sip.Request, next sip.URI) {
 // inDialog serves a request the other side sent in a session: BYE ends
 // it, a re-INVITE or UPDATE refreshes it (RFC 4028 §7), OPTIONS is
 // answered, and nothing else is taken.
-func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
+func (s *Server) inDialog(ctx context.Context, u *proxy.UAS) {
 	req := u.Request().Message
 	ss := s.sessionOf(req)
 	if ss == nil {
@@ -738,12 +818,16 @@ func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
 		// Ended before the 200 leaves, so that what the other side does
 		// next finds the session gone.
 		carried := ss.leg.Carried()
-		if ss.end() && ss.inv.Recipient != "" && !carried && directionRefusedBy(req) {
+		switch {
+		case !ss.end():
+		case ss.inv.Recipient != "" && !carried && directionRefusedBy(req):
 			// The client answered passive and pcscf ended the session
 			// before any MSRP traffic (ADR 0004): it takes no session
 			// from the network. A session that carried messages was
 			// served, whatever its BYE says.
 			s.engine.InviteFailed(ss.inv, messaging.ErrNoSessions)
+		case ss.group != "" && leaves(req):
+			s.left(ctx, ss)
 		}
 		s.respond(u, req, 200)
 	case "INVITE", "UPDATE":
@@ -757,14 +841,17 @@ func (s *Server) inDialog(_ context.Context, u *proxy.UAS) {
 
 // directionRefusedBy reports a BYE whose Reason is SIP cause 488, with
 // which pcscf ends a session whose client answered passive (ADR 0004).
-func directionRefusedBy(req *sip.Request) bool {
+func directionRefusedBy(req *sip.Request) bool { return sipCause(req, 488) }
+
+// sipCause reports a request whose Reason names SIP cause code (RFC 3326).
+func sipCause(req *sip.Request, code int) bool {
 	reasons, err := req.Header.Reason()
 	if err != nil {
 		return false
 	}
 	return slices.ContainsFunc(reasons, func(r sip.Reason) bool {
 		cause, ok := r.Cause()
-		return ok && cause == 488 && strings.EqualFold(r.Protocol, "SIP")
+		return ok && cause == code && strings.EqualFold(r.Protocol, "SIP")
 	})
 }
 
@@ -813,7 +900,7 @@ func (s *Server) refresh(u *proxy.UAS, ss *session, req *sip.Request) {
 	tag := ss.d.LocalTag()
 	ss.mu.Unlock()
 	res, err := sip.NewResponse(req, 200, "", tag)
-	if err != nil || s.sessionHeaders(res, ss.contactTag(), body, interval) != nil {
+	if err != nil || s.sessionHeaders(res, ss.contact(), body, interval) != nil {
 		return // the proxy answers 500
 	}
 	ss.mu.Lock()

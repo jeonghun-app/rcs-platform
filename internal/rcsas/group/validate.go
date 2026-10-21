@@ -5,7 +5,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 )
@@ -27,18 +26,21 @@ const (
 )
 
 // canonical returns id in the one form the group stores and compares
-// identities in, identity.CanonicalIMPU's: the form the HSS provisions and
-// the CSCFs assert. A SIP URI keeps its user part and loses its
-// parameters, its host is lower case; a tel URI is a global number without
-// visual separators. It is false for anything else, such as a URI without
-// a user, a local number or a value that is no URI at all. The SIP layer
-// names users in the same form (docs/rcs-as.md), so the identities a
-// client adds match the asserted ones that later join.
-func canonical(id string) (string, bool) {
+// identities in, messaging.UserOf's at the home domain: the form in which
+// the SIP layer names users and the engine keys their queues. A telephone
+// number is its tel URI, whether written as one, as a SIP URI with
+// user=phone or as a SIP URI at the home domain whose user part is the
+// number; any other SIP URI keeps its user part, loses its parameters and
+// has its host in lower case. It is false for anything else, such as a URI
+// without a user, a local number or a value that is no URI at all. So the
+// identities a client adds match the asserted ones that later join,
+// whichever of a subscriber's SIP and tel URIs the core asserts, and a
+// participant's copies are queued where its other messages are.
+func (s *Service) canonical(id string) (string, bool) {
 	if len(id) > messaging.MaxIdentityLength {
 		return "", false
 	}
-	c, ok := identity.CanonicalIMPU(id)
+	c, ok := messaging.UserOf(id, s.cfg.HomeDomain)
 	// An identity is written into the roster twice, as XML attributes; one
 	// that XML would escape could take five times its length there, which
 	// rosterBound does not allow for. No real IMPU has these.

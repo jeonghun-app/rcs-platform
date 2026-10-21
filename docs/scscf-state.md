@@ -124,23 +124,27 @@ additionally sealed (below).
   RTR deletes a set's record, each of the set's subscriptions is saved
   Terminated, with the reason and an expiry five seconds past a NOTIFY's
   timeout (`regevent.Config.NotifyTimeout`), set again when the final is
-  numbered, after any wait for its turn, so that no sweep sends it while that
-  send may still be answered (#336), and its final NOTIFY is queued
+  numbered, after any wait for its turn, so that no sweep sends it while
+  that send may still be answered (#336), and its final NOTIFY is queued
   (`regevent.Notifier.Ended`); a listing that fails is tried again, and one
   that keeps failing keeps the record under a deregistration's lease for the
   sweep after it, an RTR's too, since the HSS does not send an RTR again
-  (`registrar.rtr_left_to_sweep`), and counts `regevent.end_failed`. A store
+  (`registrar.rtr_left_to_sweep`), and counts `regevent.end_failed`. The
+  lease of an RTR that ended the set for good is marked `rejected`, so that
+  the sweep's NOTIFY says `reason=rejected` as the RTR's would have (#334);
+  the lease holds no bindings, so that NOTIFY names no contacts. A store
   failure or a stop at any point thus leaves either the record or the saved
   ends, and a sweep sends a final NOTIFY nobody sent. A subscription is
   deleted only once its final NOTIFY is answered (a 2xx, a code RFC 6665
-  §4.2.2 lists, or 430); one without an answer is sent again by a sweep, with
-  the CSeq and version it was numbered with, 10 s after the send ended and
-  twice as late each time (the last about 3 min 10 s after the first for a
-  silent subscriber, 2 min 30 s when each send fails at once), and given up
-  after five sends (`regevent.final_abandoned`). An end whose set was
-  registered again meanwhile, a new record, says terminated without a body, so
-  that it ends nothing of the new registration. The subscription sweep must
-  therefore run every few seconds to a minute, as the registration sweep does.
+  §4.2.2 lists, or 430); one without an answer is sent again by a sweep,
+  with the CSeq and version it was numbered with, 10 s after the send ended
+  and twice as late each time (the last about 3 min 10 s after the first for
+  a silent subscriber, 2 min 30 s when each send fails at once), and given
+  up after five sends (`regevent.final_abandoned`). An end whose set was
+  registered again meanwhile, a new record, says terminated without a body,
+  so that it ends nothing of the new registration. The subscription sweep
+  must therefore run every few seconds to a minute, as the registration
+  sweep does.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
   document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
   store's limits, 32 identities (`MaxIdentities`) each listing up to 32

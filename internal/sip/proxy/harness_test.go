@@ -96,6 +96,8 @@ type fakeNet struct {
 	// moveToTCP makes INVITEs meant for UDP go over TCP, as the transport does
 	// with a large one (RFC 3261 §18.1.1), rewriting the Via to match.
 	moveToTCP bool
+	// onResponse, if set, sees each response as it is sent upstream.
+	onResponse func(*sip.Response)
 }
 
 type hold struct {
@@ -155,8 +157,11 @@ func (n *fakeNet) SendRequest(req *sip.Request, dst transport.Destination, _ ...
 
 func (n *fakeNet) SendResponse(res *sip.Response, _ transport.Source, _ ...transport.SendOption) error {
 	n.mu.Lock()
-	stall := n.stallUpstream
+	stall, seen := n.stallUpstream, n.onResponse
 	n.mu.Unlock()
+	if seen != nil {
+		seen(res)
+	}
 	if stall != nil {
 		<-stall
 	}

@@ -5,7 +5,8 @@
 // disposition notifications (IMDN, RFC 5438) back to senders. docs/rcs-as.md
 // describes the design; this comment gives the shape.
 //
-// The package has no SIP code. The SIP layer (a later issue) drives it:
+// The package has no SIP code. The SIP layer (internal/rcsas/sipas) drives
+// it:
 //
 //   - When it answers a client's INVITE it opens a Leg (OpenLeg): an MSRP
 //     session on which rcs-as is the passive endpoint (ADR 0004), bound when
