@@ -44,7 +44,7 @@ func finalWithin(core *peer) (int, time.Duration, error) {
 
 func TestAFlowThatClosesWithAnInviteOutstandingIs430(t *testing.T) {
 	_, c, path, core := setupTerm(t)
-	core.write(coreRequest("INVITE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("close-inv-%d", requests.Add(1)), "", 1, "Route: <"+path+">"))
+	core.write(withAudioOffer(coreRequest("INVITE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("close-inv-%d", requests.Add(1)), "", 1, "Route: <"+path+">")))
 	_ = c.nextRequest()
 	_ = c.nc.Close()
 	if code, took, err := finalWithin(core); err != nil || code != 430 || took > 5*time.Second {
