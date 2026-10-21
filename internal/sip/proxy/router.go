@@ -196,8 +196,13 @@ type BranchFailure struct {
 	// Err is the transport, timer or Prepare error behind a response the proxy
 	// made up, nil for a received one: ErrTargetTimeout when Target.Timeout
 	// ended the branch, transaction.ErrTimeout or ErrTerminated for Timer B,
-	// F or C.
+	// F or C, transaction.ErrFlowClosed when the flow the request was sent
+	// over closed before its final response (RFC 5626 §5.3.1).
 	Err error
+	// Provisional reports that the branch received a provisional response,
+	// 100 Trying included, before it ended: the target had the request, which
+	// a service deciding whether to try it again may need to know.
+	Provisional bool
 }
 
 // Resolver finds the next hop for a URI (the first Route, or the Request-URI if

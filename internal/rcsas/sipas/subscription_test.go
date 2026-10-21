@@ -458,9 +458,9 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 		got[g.core.nextOf(t, "INVITE").URI.String()] = true
 	}
 	// A bad entry in the list is left out and counted, not a reason to
-	// refuse it; with the factory above, two are skipped.
-	if !got[dave] || !got[erin] || g.metrics.get("sip.group.invitee_skipped") != 2 {
-		t.Fatalf("invited %v, %d skipped", got, g.metrics.get("sip.group.invitee_skipped"))
+	// refuse it; the factory above is the other skip.
+	if !got[dave] || !got[erin] || g.metrics.get("sip.group.invitee_skipped.loop") != 1 || g.metrics.get("sip.group.invitee_skipped.malformed") != 1 {
+		t.Fatalf("invited %v, %d and %d skipped", got, g.metrics.get("sip.group.invitee_skipped.loop"), g.metrics.get("sip.group.invitee_skipped.malformed"))
 	}
 	g.stateOf(t, g.uri, erin, groupstore.Invited)
 

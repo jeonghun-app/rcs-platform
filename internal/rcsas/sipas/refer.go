@@ -64,7 +64,7 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 			return
 		}
 		// A bad entry is left out, as in a new group's list.
-		s.cfg.Metrics.Count("sip.group.invitee_skipped", int64(skipped))
+		s.cfg.Metrics.Count("sip.group.invitee_skipped.malformed", int64(skipped))
 		who = s.invitees(entries)
 	default:
 		method, _ := target.URI.Param("method")

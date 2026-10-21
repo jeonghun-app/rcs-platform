@@ -323,29 +323,80 @@ func (l *Leg) activate() {
 			l.done()
 			return
 		}
-		delete(e.invites, inviteKey{l.p.User, l.p.Peer, store.Standalone, l.p.QueueID})
+		// The invitation stays marked until the attempt is over. A pass that
+		// read the message before deliverLarge claims it would otherwise
+		// find no key and ask for a second session for it (#264); marked
+		// afresh, in case the mark from the invite has run out meanwhile.
+		// The mark goes as the attempt ends, while the message is still
+		// claimed: once it is back in the queue its next invitation may go
+		// at once, unless a newer one was asked for meanwhile (after a
+		// registration on a new flow cleared the marks), which keeps its
+		// mark.
+		key := inviteKey{l.p.User, l.p.Peer, store.Standalone, l.p.QueueID}
+		e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout), by: l}
 		e.wg.Add(1)
 		e.mu.Unlock()
 		go func() {
 			defer e.wg.Done()
 			defer l.done()
-			e.deliverLarge(l)
+			e.deliverLarge(l, func() {
+				e.mu.Lock()
+				defer e.mu.Unlock()
+				if e.invites[key].by == l {
+					delete(e.invites, key)
+				}
+			})
 		}()
 	}
 }
 
-// deliverLarge sends a terminating large-mode leg's one message.
-func (e *Engine) deliverLarge(l *Leg) {
+// deliverLarge sends a terminating large-mode leg's one message. over runs
+// once the attempt is over, before the message is released.
+func (e *Engine) deliverLarge(l *Leg, over func()) {
 	m, ok := e.claim(e.ctx, store.Message{Recipient: l.p.User, ID: l.p.QueueID})
 	if !ok {
+		over()
 		return
 	}
 	if m.Sender != l.p.Peer || m.Notification || m.Mode != store.Standalone {
 		// Not the message this session was asked for.
+		over()
 		e.release(m)
+		e.retryReleased(m.Recipient)
 		return
 	}
-	e.sendClaimed(e.ctx, l, m)
+	if e.sendClaimedThen(e.ctx, l, m, over) == stop {
+		e.retryReleased(m.Recipient)
+	}
+}
+
+// retryReleased has the queue of user read again after a large-mode
+// attempt, made apart from any pass, put a message back in it (#294). A
+// full pass during the attempt found the message claimed and may have let
+// the recipient go with no retry timer; nothing else would read the queue
+// before the recipient's next event. While a pass runs, it reads the
+// queue once more when done; otherwise the retry timer is armed, with its
+// backoff, so a client that never binds is not asked again at once. The
+// queue waits rather than blocks: the failure says nothing about the
+// recipient's other messages, which still go as they come.
+func (e *Engine) retryReleased(user string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	r := e.state(user)
+	if r.run != runIdle {
+		r.full = true
+		return
+	}
+	if r.hold == holdNone {
+		r.hold = holdWaiting
+	}
+	if r.retry == nil {
+		r.wait = min(max(2*r.wait, e.cfg.RetryInterval), e.cfg.MaxRetryInterval)
+		r.retry = e.clock.AfterFunc(r.wait, func() { e.kickRetry(user) })
+	}
 }
 
 func (l *Leg) done() { l.finish.Do(func() { close(l.finished) }) }

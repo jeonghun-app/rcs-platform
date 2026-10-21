@@ -1,11 +1,17 @@
 package pcscf
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/netip"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -116,6 +122,142 @@ func FuzzRouteICID(f *testing.F) {
 			if !ok || again != got {
 				t.Fatalf("%q read as %q, written again and read as %q, %v", raw, got, again, ok)
 			}
+		}
+	})
+}
+
+// FuzzAnchorSDP checks the SDP path of MSRP anchoring on any body (#136):
+// finding the description never loses the rest of the body, every MSRP line
+// it anchors ends up with the relay's path alone, the other lines keep
+// their meaning (compared as parsed, fmt.Sprint of each sdp.Media: the
+// description is written again, so not their bytes), and a description
+// declined toward the client keeps no line, path or address of its
+// writer's.
+func FuzzAnchorSDP(f *testing.F) {
+	f.Add("application/sdp", []byte(clientChatOffer))
+	f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\nContent-Type: application/sdp\r\n\r\n"+clientChatOffer+"\r\n--b1\r\nContent-Type: message/cpim\r\n\r\nx\r\n--b1--\r\n"))
+	f.Add("application/sdp", []byte(rcsAsAnswer))
+	f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\n\r\n--b1--"))
+	f.Fuzz(func(t *testing.T, contentType string, body []byte) {
+		part, found, err := findSDP(contentType, body)
+		if err != nil || !found {
+			return
+		}
+		if string(part.with(part.description())) != string(body) {
+			t.Fatal("the body did not survive its description being put back")
+		}
+		s, ls, err := msrpLines(part.description(), true)
+		if err != nil {
+			return
+		}
+		before := len(s.Media)
+		var others []string
+		for i := range s.Media {
+			if !s.Media[i].IsMSRP() || s.Media[i].Port == 0 {
+				others = append(others, fmt.Sprint(s.Media[i]))
+			}
+		}
+		for _, l := range ls {
+			if err := anchorLine(s, l.index, corePathFor(1), sdp.SetupActive, false); err != nil {
+				t.Fatalf("anchoring line %d: %v", l.index, err)
+			}
+		}
+		out, err := s.Marshal()
+		if err != nil {
+			return
+		}
+		back, ls2, err := msrpLines(out, true)
+		if err != nil || len(back.Media) != before || len(ls2) != len(ls) {
+			t.Fatalf("the anchored description reads back as %d lines, %v", len(ls2), err)
+		}
+		for _, l := range ls2 {
+			if len(l.path) != 1 || l.path[0] != corePathFor(1) || l.setup != sdp.SetupActive {
+				t.Fatalf("line %d: path %q, setup %q", l.index, l.path, l.setup)
+			}
+		}
+		var others2 []string
+		for i := range back.Media {
+			if !back.Media[i].IsMSRP() || back.Media[i].Port == 0 {
+				others2 = append(others2, fmt.Sprint(back.Media[i]))
+			}
+		}
+		if strings.Join(others, "\x00") != strings.Join(others2, "\x00") {
+			t.Fatalf("other lines changed:\n%q\n%q", others, others2)
+		}
+		if d := declineAll(part.description(), "msrp.example.net"); d != nil {
+			ds, err := sdp.Parse(d)
+			if err != nil {
+				t.Fatalf("a declined description does not read back: %v", err)
+			}
+			if ds.Origin.Address != "msrp.example.net" || ds.Connection == nil || ds.Connection.Address != "msrp.example.net" {
+				t.Fatalf("a declined description shows %q, %v", ds.Origin.Address, ds.Connection)
+			}
+			for _, m := range ds.Media {
+				if m.Port != 0 || len(m.Attributes) != 0 || len(m.Connections) != 0 {
+					t.Fatalf("a declined line kept %d, %v, %v", m.Port, m.Attributes, m.Connections)
+				}
+			}
+		}
+	})
+}
+
+// stdlibSDP is what Go's mime/multipart reader finds as the first
+// application/sdp part of a body: a second reader, which pcscf's must agree
+// with or refuse.
+func stdlibSDP(contentType string, body []byte) ([]byte, bool) {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, false
+	}
+	r := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	for {
+		p, err := r.NextPart()
+		if err != nil {
+			return nil, false
+		}
+		mt, _, err := mime.ParseMediaType(p.Header.Get("Content-Type"))
+		if err == nil && mt == "application/sdp" {
+			b, err := io.ReadAll(p)
+			return b, err == nil
+		}
+	}
+}
+
+// FuzzMultipartAgreesWithMIME checks pcscf's multipart reader against Go's
+// (review of #248): whenever mime/multipart finds an application/sdp part,
+// pcscf finds the same bytes or refuses the body, so no description goes
+// through unanchored for want of being found; and a body found is rebuilt
+// as it was.
+func FuzzMultipartAgreesWithMIME(f *testing.F) {
+	for _, seed := range []string{
+		"--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--\r\n",
+		"--b1\r\nContent-Type: application/sdp\r\nContent-Length: 5\r\n\r\nv=0\r\n\r\n--b1\r\nContent-Type: message/cpim\r\n\r\nx\r\n--b1--",
+		"preamble\r\n--b1\r\n\r\nplain\r\n--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--\r\n",
+		"--b1\r\nContent-Type:\r\n application/sdp\r\n\r\nv=0\r\n--b1--\r\n",
+		"--b1\nContent-Type: application/sdp\n\nv=0\n--b1--\n",
+		"--b1\r\nContent-Type: application/sdp; x\r\n\r\nv=0\r\n--b1--\r\n",
+		"--b1\r\nContent-TYpe: AppliCAtion/sdp\r\nContent-Length:\r\n\r\n0\r\n--b1--",
+	} {
+		f.Add("b1", []byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, boundary string, body []byte) {
+		ct := mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": boundary})
+		if ct == "" {
+			return
+		}
+		part, found, err := findSDP(ct, body)
+		if err == nil && found && !bytes.Equal(part.with(part.description()), body) {
+			t.Fatal("the body did not survive its description being put back")
+		}
+		want, ok := stdlibSDP(ct, body)
+		if !ok || err != nil {
+			return
+		}
+		if !found {
+			t.Fatalf("mime/multipart finds a description pcscf does not: %q", want)
+		}
+		if !bytes.Equal(part.description(), want) {
+			t.Fatalf("pcscf found %q, mime/multipart %q", part.description(), want)
 		}
 	})
 }

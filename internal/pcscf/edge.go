@@ -199,6 +199,9 @@ type pcscf struct {
 	// transaction of a SUBSCRIBE; nil in tests that need none.
 	subs *subscriptions
 	send sender
+	// msrp anchors MSRP sessions through msrp-relay; nil in tests that
+	// need none.
+	msrp *msrpAnchor
 }
 
 // Route implements proxy.Router. A client's REGISTER goes to icscf, its
