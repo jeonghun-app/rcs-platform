@@ -395,10 +395,13 @@ func (nopHandler) HandleReport(*msrp.Session, msrp.Report)          {}
 // Run wires the group chat focus: an INVITE to the conference factory
 // (sip:conf-factory@<RCS_IMS_DOMAIN> by default) creates a group, whose
 // conference URI at RCSAS_CONFERENCE_HOST answers as a focus, and the
-// focus invites bob through the core from it.
+// focus invites bob through the core from it. Run passes the group
+// settings on: RCSAS_GROUP_CHAT_ENABLED, and the per-user subscription
+// bound.
 func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 	core := newCoreStub(t)
 	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCSAS_MSRP_HOST", "127.0.0.1", "RCSAS_GROUP_CHAT_ENABLED", "true",
+		"RCSAS_MAX_SUBSCRIPTIONS_PER_USER", "1",
 		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
 	if err != nil {
 		t.Fatal(err)
@@ -454,6 +457,7 @@ func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.After(waitFor)
+invited:
 	for {
 		select {
 		case req := <-core.got:
@@ -463,9 +467,33 @@ func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 			if from, err := req.Header.From(); err != nil || from.URI.String() != contact.URI.String() || req.URI.String() != "tel:+15550100002" {
 				t.Fatalf("INVITE %s from %q", req.URI, req.Header.Get("From"))
 			}
-			return
+			break invited
 		case <-deadline:
 			t.Fatal("the focus invited no one")
+		}
+	}
+	// Run passes RCSAS_MAX_SUBSCRIPTIONS_PER_USER on: alice's second
+	// subscription is beyond it (security review on #340).
+	for i, want := range []int{200, 486} {
+		sub := fmt.Sprintf("SUBSCRIBE %s SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-sub%d\r\n", contact.URI, i) +
+			fmt.Sprintf("Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=s%d\r\nTo: <%s>\r\n", i, contact.URI) +
+			fmt.Sprintf("Call-ID: rcsas-run-sub%d\r\nCSeq: 1 SUBSCRIBE\r\nP-Asserted-Identity: <tel:+15550100001>\r\n", i) +
+			"Contact: <sip:" + core.l.Addr().String() + ";transport=tcp>\r\nEvent: conference\r\nExpires: 600\r\nContent-Length: 0\r\n\r\n"
+		if _, err := io.WriteString(nc, sub); err != nil {
+			t.Fatal(err)
+		}
+		var got *sip.Response
+		for got == nil {
+			m, err := r.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if x, ok := m.(*sip.Response); ok && x.StatusCode >= 200 && x.Header.Get("Call-ID") == fmt.Sprintf("rcsas-run-sub%d", i) {
+				got = x
+			}
+		}
+		if got.StatusCode != want {
+			t.Fatalf("subscription %d answered %d, want %d", i+1, got.StatusCode, want)
 		}
 	}
 }
