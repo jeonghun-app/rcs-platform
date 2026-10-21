@@ -627,22 +627,27 @@ func TestAThirdPartyREGISTERIsBoundedByThirdPartyTimeout(t *testing.T) {
 	for _, c := range []struct{ cfg, want time.Duration }{{0, DefaultThirdPartyTimeout}, {150 * time.Millisecond, 150 * time.Millisecond}} {
 		e := newEnv(t)
 		e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
-		var left atomic.Int64
+		// The deadline is wall clock, the transaction's, not the S-CSCF's
+		// injected time: it is set after start, so it is at least the
+		// timeout past start, and before the send reads it, so at most the
+		// timeout past then, however slow the scheduler.
+		var sinceStart, untilEnd atomic.Int64
+		start := time.Now()
 		s := senderFunc(func(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+			now := time.Now()
 			d, ok := ctx.Deadline()
 			if !ok {
 				return nil, errors.New("no deadline")
 			}
-			left.Store(int64(time.Until(d)))
+			sinceStart.Store(int64(d.Sub(start)))
+			untilEnd.Store(int64(d.Sub(now)))
 			return sip.NewResponse(req, 200, "", "as")
 		})
 		rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.ThirdPartyTimeout = c.cfg })
 		rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
 		rt.Stop()
-		// The deadline is wall clock: the transaction's, not the S-CSCF's
-		// injected time.
-		if got := time.Duration(left.Load()); got <= 0 || got > c.want {
-			t.Errorf("deadline in %v, want at most %v", got, c.want)
+		if from, until := time.Duration(sinceStart.Load()), time.Duration(untilEnd.Load()); from < c.want || until > c.want {
+			t.Errorf("deadline %v after the start and %v after the send, want at least and at most %v", from, until, c.want)
 		}
 	}
 }
