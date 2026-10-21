@@ -474,9 +474,11 @@ type Settled struct {
 // answers in a row can agree while the server still holds the upload, and
 // a resume then gets 503. The quiet time runs from the request that first
 // got the value to the request that gets it again, so it is time the server
-// held the value, however slowly the answers came. A 404 is asked again until
-// within has passed, and then returned as ErrNothingHeld. Bytes held that are
-// still changing when within has passed are returned with ErrNotSettled.
+// held the value, however slowly the answers came. within bounds when the
+// requests are sent, likewise: a 404 is asked again until a request sent
+// after within has passed gets one too, and is then returned as
+// ErrNothingHeld; bytes held still changing in the answer to such a request
+// are returned with ErrNotSettled.
 //
 // Nothing the server sends says the upload is released: its lease lasts
 // minutes when the process holding it dies, and ft-server's upload-info
@@ -509,7 +511,12 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 		if held != last {
 			last, since = held, asked
 		}
-		if now().After(deadline) {
+		// within bounds when a request is sent, not when its answer comes:
+		// one slow answer on a loaded host says nothing about the server
+		// still storing, and the next request may confirm what it holds
+		// (#344). A request sent past the deadline that does not settle
+		// ends the wait.
+		if asked.After(deadline) {
 			if err == nil {
 				err = ErrNotSettled
 			}

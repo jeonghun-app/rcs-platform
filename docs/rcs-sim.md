@@ -67,9 +67,11 @@ network, seconds after the break; the simulator asks at once, before
 `ft-server` may have noticed the break. So `get_upload_info` asks again, every
 100 ms. It stops once the answers have named the same bytes held for 300 ms,
 counted from the request that first got that value. A 404 is asked again for
-up to 3 s (`-upload-settle`). If the bytes held are still changing when the 3 s have passed, the
-step fails ("the server is still storing the broken upload") instead of
-resuming from a value that has not settled. Two equal answers in a row were not enough:
+up to 3 s (`-upload-settle`). If a request sent after the 3 s finds the bytes held still changing,
+the step fails ("the server is still storing the broken upload") instead of
+resuming from a value that has not settled. The 3 s bound when requests are
+sent, not when answers come, so one slow answer on a loaded host does not
+fail the step (#344). Two equal answers in a row were not enough:
 `ft-server` may still hold the broken upload, and about one resume in 800 got
 503 (#77). Nothing in the upload-info document says the upload is released.
 Its lease runs for minutes when the process holding it has gone, so waiting

@@ -380,6 +380,35 @@ func TestUploadInfoSettlesOnlyAfterAQuietTime(t *testing.T) {
 	}
 }
 
+func TestUploadInfoSettlesThoughAnAnswerComesAfterItsTime(t *testing.T) {
+	// #344: a server that holds the parts from the start but takes longer
+	// than within to answer once is not still storing: the deadline bounds
+	// when a request is sent, not when its answer comes, so the next
+	// request, which confirms the bytes held, still goes.
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		if first {
+			time.Sleep(300 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	info, st, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	if held, _ := info.Held(); err != nil || held != 20 || st.Retries != 1 {
+		t.Fatalf("SettledUploadInfo = %v, held %d, %+v", err, held, st)
+	}
+}
+
 func TestUploadInfoThatNeverHoldsAnythingEndsAsNothingHeld(t *testing.T) {
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
@@ -601,7 +630,9 @@ func TestUploadInfoMeasuresItsQuietTimeAndDeadlineOnItsClock(t *testing.T) {
 func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
 	// The deadline as well comes from the clock: the bytes held keep
 	// changing, the clock moves an hour per read and the settle time is
-	// 3 h, so the second answer finds the deadline passed (QA on #203).
+	// 3 h. The call reads it at 1 h, so the deadline is 4 h; the requests go
+	// at 2, 3, 4 and 5 h, and the fourth, sent past the deadline, ends the
+	// wait (QA on #203; the deadline bounds when a request is sent, #344).
 	var mu sync.Mutex
 	n := 0
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -624,7 +655,7 @@ func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if n != 2 {
-		t.Fatalf("%d answers before the deadline, want 2", n)
+	if n != 4 {
+		t.Fatalf("%d answers, want 4: the deadline was not taken from the clock", n)
 	}
 }
