@@ -67,8 +67,14 @@ func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 
 func runAll(t *testing.T, cfg scenario.Config, names ...string) (bool, []scenario.Result) {
 	t.Helper()
+	return runAllWithin(t, context.Background(), cfg, names...)
+}
+
+// runAllWithin is runAll for a run that ctx can end.
+func runAllWithin(t *testing.T, ctx context.Context, cfg scenario.Config, names ...string) (bool, []scenario.Result) {
+	t.Helper()
 	var results []scenario.Result
-	ok, err := scenario.Run(context.Background(), cfg, names, func(r scenario.Result) { results = append(results, r) })
+	ok, err := scenario.Run(ctx, cfg, names, func(r scenario.Result) { results = append(results, r) })
 	if err != nil {
 		t.Fatal(err)
 	}

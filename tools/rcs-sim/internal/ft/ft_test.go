@@ -632,11 +632,12 @@ func TestPrecheckNeedsAChallenge(t *testing.T) {
 
 func TestMalformedDocumentsAreErrors(t *testing.T) {
 	for name, body := range map[string]string{
-		"doctype":      `<!DOCTYPE x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
-		"not xml":      `{}`,
-		"too large":    strings.Repeat(" ", 70<<10),
-		"bad range":    `<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="5" end="9"/><data url="/ft/x"/></file-resume-info>`,
-		"wrong status": "",
+		"doctype":            `<!DOCTYPE x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
+		"lower-case doctype": `<!doctype x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
+		"not xml":            `{}`,
+		"too large":          strings.Repeat(" ", 70<<10),
+		"bad range":          `<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="5" end="9"/><data url="/ft/x"/></file-resume-info>`,
+		"wrong status":       "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -735,6 +736,85 @@ func TestUploadInfoMeasuresItsQuietTimeAndDeadlineOnItsClock(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("%d answers, want 2: the quiet time was not taken from the clock", n)
 	}
+}
+
+// serverClocked is a server whose clock moves an hour as it takes each
+// signed get_upload_info, so request n is asked at n-1 hours and answered
+// at n hours however often the call reads the clock. held(n) is the bytes
+// held the n-th answer names; below zero it is a 404.
+func serverClocked(t *testing.T, held func(n int) int) (c *ft.Client, requests func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	n := 0
+	var clock atomic.Int64
+	c = fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		h := held(n)
+		mu.Unlock()
+		clock.Add(int64(time.Hour))
+		if h < 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(h))
+	})
+	c.Now = func() time.Time { return time.Unix(0, clock.Load()) }
+	return c, func() int { mu.Lock(); defer mu.Unlock(); return n }
+}
+
+func TestUploadInfoExtendsItsDeadlineToTheQuietTimesEnd(t *testing.T) {
+	// QA of #397: on a server clock the exact number of requests pins
+	// where the one extension past the deadline ends, since+quiet from the
+	// answer that first named the bytes held, which a test with answers
+	// that come at once cannot tell from asked+quiet.
+	for name, tc := range map[string]struct {
+		held          func(n int) int
+		within, quiet time.Duration
+		err           error
+		requests      int
+	}{
+		// Asked at 4 h, past the 3 h deadline, answered at 5 h: the
+		// extension ends at 5.5 h, so the request at 5 h still goes and
+		// the one at 6 h ends the wait (asked+quiet would end it at 6).
+		"still changing": {func(n int) int { return 10 + n }, 3 * time.Hour, 30 * time.Minute, ft.ErrNotSettled, 7},
+		// A 404 past the deadline gets no extension.
+		"never held": {func(int) int { return -1 }, 3 * time.Hour, 30 * time.Minute, ft.ErrNothingHeld, 5},
+		// 20 bytes first named at 2 h settle with the request at 4 h.
+		"settled": {func(n int) int {
+			if n == 1 {
+				return 12
+			}
+			return 20
+		}, 10 * time.Hour, 90 * time.Minute, nil, 5},
+		// Held from the request at 2, 3 and 4 h: first named before, just
+		// at and past the 3 h deadline, all settle.
+		"held from 2 h": {func(n int) int { return heldFrom(n, 3) }, 3 * time.Hour, 90 * time.Minute, nil, 6},
+		"held from 3 h": {func(n int) int { return heldFrom(n, 4) }, 3 * time.Hour, 90 * time.Minute, nil, 7},
+		"held from 4 h": {func(n int) int { return heldFrom(n, 5) }, 3 * time.Hour, 90 * time.Minute, nil, 8},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, requests := serverClocked(t, tc.held)
+			_, _, err := c.SettledUploadInfo(ctx(t), "x", tc.within, time.Millisecond, tc.quiet)
+			if !errors.Is(err, tc.err) || (tc.err == nil && err != nil) || requests() != tc.requests {
+				t.Fatalf("SettledUploadInfo = %v after %d requests, want %v after %d", err, requests(), tc.err, tc.requests)
+			}
+		})
+	}
+}
+
+// heldFrom is 20 bytes held from the first-th answer on, a 404 before.
+func heldFrom(n, first int) int {
+	if n < first {
+		return -1
+	}
+	return 20
 }
 
 func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {

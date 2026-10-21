@@ -183,8 +183,12 @@ type SetIdentity struct {
 // Identity is what one public identity names: the implicit registration set
 // it belongs to. Identities go before their record both ways. They are
 // written before a record with a new incarnation or new identities is saved,
-// the save being the commit point: one naming a record not saved (yet) is
-// as good as none, and its KeepUntil ends it. They are deleted with the set
+// the save being the commit point. One naming an incarnation of its set's
+// record that was not saved still finds the record, if the record lists the
+// identity, is live and is not being deregistered: the terminating lookup
+// uses it and repairs the item (internal/scscf/routing), and the set's next
+// REGISTER points it again; with no such record it is as good as none, and
+// its KeepUntil ends it. They are deleted with the set
 // before its record, so that a deregistration cut short is done again by a
 // sweep. A re-registration only keeps them (KeepIdentity), or repairs them.
 // An IMPU names one set: an IMPU shared by several private identities (TS

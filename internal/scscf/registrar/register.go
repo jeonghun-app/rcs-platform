@@ -318,7 +318,7 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 		// Another REGISTER of the set may commit first; the attempt that
 		// follows then repairs what this one pointed elsewhere.
 		r.pointedAhead = true
-		if err := g.point(ctx, n, keep); err != nil {
+		if err := g.pointAhead(ctx, n, keep); err != nil {
 			return nil, err
 		}
 	}
@@ -373,6 +373,40 @@ func (g *Registrar) point(ctx context.Context, reg *state.Registration, keep tim
 		}
 	}
 	return nil
+}
+
+// pointAhead points reg's identities ahead of its save, as point does, but
+// leaves an item naming another, saved and live record of the same set: the
+// REGISTER of another device of the user committed it first, and this
+// one's save then fails with ErrExists and its retry applies to that record.
+// Taking the item would leave it naming a record that, if this save fails
+// for another reason, is never saved (#196 QA).
+func (g *Registrar) pointAhead(ctx context.Context, reg *state.Registration, keep time.Time) error {
+	for _, id := range reg.Identities {
+		want := state.Identity{IMPU: id.IMPU, Set: reg.Key, Incarnation: reg.Incarnation, Barred: id.Barred, KeepUntil: keep}
+		if err := g.pointOneAhead(ctx, want); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (g *Registrar) pointOneAhead(ctx context.Context, want state.Identity) error {
+	cur, err := g.cfg.Store.Identity(ctx, want.IMPU, g.cfg.Now())
+	switch {
+	case errors.Is(err, state.ErrNotFound):
+	case err != nil:
+		return err
+	case cur.Set == want.Set && cur.Incarnation != want.Incarnation:
+		other, f := g.set(ctx, cur.Set)
+		if f != nil {
+			return f
+		}
+		if other != nil && other.Incarnation == cur.Incarnation && other.Deregistering.IsZero() && live(other, g.cfg.Now()) {
+			return nil
+		}
+	}
+	return g.pointOne(ctx, want)
 }
 
 func (g *Registrar) pointOne(ctx context.Context, want state.Identity) error {
@@ -547,6 +581,14 @@ func (g *Registrar) putBack(ctx context.Context, claimed *state.Registration, bi
 	}
 	back.Incarnation = inc
 	saved, err := g.cfg.Store.SaveRegistration(ctx, back)
+	if errors.Is(err, state.ErrConflict) {
+		// Applied with its answer lost, as register and deregister read
+		// again (#196 QA): the record is back and holds no lease, so no
+		// sweep would come for its identities.
+		if again, f := g.set(ctx, back.Key); f == nil && putBackBy(again, back) {
+			saved, err = again, nil
+		}
+	}
 	if err != nil {
 		g.count("registrar.deregistration_left_to_sweep")
 		return
@@ -560,6 +602,13 @@ func (g *Registrar) putBack(ctx context.Context, claimed *state.Registration, bi
 	if _, err := g.cfg.Store.SaveRegistration(ctx, lease); err != nil {
 		g.internal("claiming a set put back half-pointed", err)
 	}
+}
+
+// putBackBy reports whether reg is the record back was saved as: the same
+// incarnation, no lease and back's bindings.
+func putBackBy(reg, back *state.Registration) bool {
+	return reg != nil && reg.Incarnation == back.Incarnation && reg.Deregistering.IsZero() &&
+		slices.EqualFunc(reg.Contacts, back.Contacts, func(a, b state.Contact) bool { return a.CallID == b.CallID && a.CSeq == b.CSeq && a.URI == b.URI })
 }
 
 // leasedBy reports whether reg is the record lease was saved as: the same
@@ -589,7 +638,11 @@ func (g *Registrar) endSet(ctx context.Context, claimed *state.Registration, pro
 			return f
 		case again == nil:
 			return nil
-		case live(again, now):
+		case live(again, now) && again.Deregistering.IsZero():
+			// A REGISTER that took the set over from the lease saved a
+			// record without one (assign). A lease that is live only by
+			// an unregistered user's state, which it keeps, is not one
+			// (#394 code review).
 			return g.reassign(ctx, again)
 		case again.Version != claimed.Version:
 			// Another deregistration claimed it since: it finishes.
