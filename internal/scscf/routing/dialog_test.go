@@ -305,3 +305,66 @@ func TestASignedSIPSHopIsItsTLSListener(t *testing.T) {
 		}
 	}
 }
+
+// TestNoSignatureCoversAContactAClientWrote (QA on #322): a standalone
+// request's branch carries no signed Record-Route, so no request names its
+// client-written Contact as a signed hop. One row a method.
+func TestNoSignatureCoversAContactAClientWrote(t *testing.T) {
+	core := "sip:10.0.130.25:5060;transport=tcp"
+	for _, method := range []string{"MESSAGE", "OPTIONS", "INFO", "PUBLISH", "NOTIFY", "UPDATE"} {
+		t.Run(method, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, 0, time.Hour))
+			rt := e.router(nil)
+			r := request(t, method, impu1, "Contact: <"+core+">")
+			_ = r.Message.Header.Set("Call-ID", "dialog-1")
+			d := rt.Terminating(bg, r)
+			b := r.Message.Clone()
+			b.URI = d.Targets[0].URI
+			for i := len(d.RecordRoute) - 1; i >= 0; i-- {
+				_ = b.Header.Prepend("Record-Route", d.RecordRoute[i].String())
+			}
+			if err := d.Prepare(bg, d.Targets[0], b); err != nil {
+				t.Fatal(err)
+			}
+			rr, _ := b.Header.RecordRoute()
+			for _, a := range rr {
+				if _, ok := a.URI.Param(dlgParam); ok {
+					t.Errorf("the branch carries a signed Record-Route %s", a.String())
+					if rt.InDialog(bg, inDialog(t, core, "", a)).Status == 0 {
+						t.Error("which signs the client-written Contact")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestASignatureHoldsOnlyWhole (QA on #322): a MAC cut short, or one an
+// S-CSCF of another name made, signs nothing; a hop signed without its
+// port is the one on the default port.
+func TestASignatureHoldsOnlyWhole(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil)
+	ue := "sip:ue@192.0.2.40:5060;transport=tcp"
+	good := signedFor(rt, pcscfUE)
+	v, _ := good.URI.Param(dlgParam)
+	id, mac, _ := strings.Cut(v, ".")
+	cut := good
+	cut.URI.Params = append(sip.Params(nil), good.URI.Params...)
+	cut.URI.Params.Set(dlgParam, id+"."+mac[:len(mac)-2])
+	otherName := e.router(nil, func(c *Config) {
+		c.RecordRoute = mustAddress("<sip:scscf.other.local;transport=tcp;lr>")
+	})
+	for name, a := range map[string]sip.Address{"cut short": cut, "another S-CSCF's": signedFor(otherName, pcscfUE)} {
+		if d := rt.InDialog(bg, inDialog(t, ue, "<"+pcscfUE+">", a)); d.Status != 403 {
+			t.Errorf("%s: status %d, want 403", name, d.Status)
+		}
+	}
+	if d := rt.InDialog(bg, inDialog(t, ue, "<"+pcscfUE+">", good)); d.Status != 0 {
+		t.Errorf("the whole signature: %d", d.Status)
+	}
+	if d := rt.InDialog(bg, inDialog(t, asTask, "", signedFor(rt, "sip:10.0.131.7;transport=tcp"))); d.Status != 0 {
+		t.Errorf("default port: %d", d.Status)
+	}
+}
