@@ -3,6 +3,7 @@ package registrar
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -313,5 +314,101 @@ func TestAREGISTERDuringARejectedLeaseIsNotRejected(t *testing.T) {
 		if got == "terminated;rejected" {
 			t.Errorf("an expiry after a new REGISTER said rejected: %v", reasonsSent(s, k))
 		}
+	}
+}
+
+// stoppingEvents stops the goroutine that tells it of an end, as an
+// instance that stops there does, after noting what the store holds then.
+type stoppingEvents struct {
+	e    *env
+	seen *state.Registration
+}
+
+func (s *stoppingEvents) Changed(context.Context, *state.Registration, *state.Registration, regevent.Cause) {
+}
+
+func (s *stoppingEvents) Ended(context.Context, *state.Registration, regevent.Cause) error {
+	s.seen, _ = s.e.store.Registration(bg, state.SetKey{IMPI: impi1, IMPU: impu1})
+	runtime.Goexit()
+	return nil
+}
+
+// TestAnRTRCutShortAfterItsClaimIsFinishedByTheSweep (#368): the record is
+// claimed, with its mark, before the subscribers are told, so an instance
+// that stops there leaves a lease the sweep ends as rejected.
+func TestAnRTRCutShortAfterItsClaimIsFinishedByTheSweep(t *testing.T) {
+	e := newEnv(t)
+	g, n, s := withNotifier(t, e)
+	registered(t, e, g, 600, impu1)
+	n.Wait()
+	subscribeAsPCSCF(t, n)
+	k := s.count()
+	stop := &stoppingEvents{e: e}
+	rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.instance(2, func(cfg *Config) { cfg.Events = stop }).HandleRTR(bg, rtr)
+	}()
+	<-done
+	if stop.seen == nil || len(stop.seen.Contacts) != 0 || stop.seen.Deregistering.IsZero() || !stop.seen.Rejected {
+		t.Fatalf("what the store held as the subscribers were to be told: %+v", stop.seen)
+	}
+	e.clock.advance(2 * time.Minute)
+	if _, err := g.Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	n.Wait()
+	if got := reasonsSent(s, k); len(got) != 1 || got[0] != "terminated;rejected" {
+		t.Errorf("NOTIFYs after the sweep %v", got)
+	}
+	if _, err := regOf(e, impu1); err == nil {
+		t.Error("the record outlived the sweep")
+	}
+}
+
+// failingSaves fails every SaveRegistration.
+type failingSaves struct{ state.Store }
+
+func (failingSaves) SaveRegistration(context.Context, *state.Registration) (*state.Registration, error) {
+	return nil, errors.New("throttled")
+}
+
+// TestAnRTRWhoseClaimCannotBeSavedTellsNoOne (#368): the RTR fails, and the
+// subscribers are not told of an end the store does not hold.
+func TestAnRTRWhoseClaimCannotBeSavedTellsNoOne(t *testing.T) {
+	e := newEnv(t)
+	g, n, s := withNotifier(t, e)
+	registered(t, e, g, 600, impu1)
+	n.Wait()
+	subscribeAsPCSCF(t, n)
+	k := s.count()
+	rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}
+	if res := e.instance(2, func(cfg *Config) { cfg.Store, cfg.Events = failingSaves{e.store}, n }).HandleRTR(bg, rtr); res == resultSuccess {
+		t.Error("the RTR succeeded though its claim was not saved")
+	}
+	n.Wait()
+	if got := reasonsSent(s, k); len(got) != 0 {
+		t.Errorf("NOTIFYs %v for an end the store does not hold", got)
+	}
+	if r := must(regOf(e, impu1))(t); len(r.Contacts) == 0 {
+		t.Errorf("record %+v", r)
+	}
+}
+
+// TestALaterRTRKeepsALeasesRejection (#368): a NEW_SERVER_ASSIGNED RTR on
+// the lease a PERMANENT_TERMINATION's left keeps it rejected.
+func TestALaterRTRKeepsALeasesRejection(t *testing.T) {
+	e := newEnv(t)
+	g, n, s := withNotifier(t, e)
+	registered(t, e, g, 600, impu1)
+	n.Wait()
+	subscribeAsPCSCF(t, n)
+	for _, code := range []cx.ReasonCode{cx.PermanentTermination, cx.NewServerAssigned} {
+		rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: code}}
+		wantResult(t, e.instance(2, func(cfg *Config) { cfg.Events = failingNotifier(t, e, s) }).HandleRTR(bg, rtr), resultSuccess)
+	}
+	if !must(regOf(e, impu1))(t).Rejected {
+		t.Error("the second RTR took the rejection off the lease")
 	}
 }

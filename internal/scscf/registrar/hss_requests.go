@@ -89,10 +89,12 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	return resultSuccess
 }
 
-// endSetNow ends set k at the HSS's request: its identities, its profile if
-// still the one read, and last its record, under the version read, as every
-// deregistration does (endSet); a record that changed meanwhile is read
-// again and ended too. With unregisteredOnly it ends k only as an
+// endSetNow ends set k at the HSS's request: it claims the record for a
+// deregistration's lease, tells the subscribers (Events.Ended), and then
+// removes its identities, its profile if still the one read, and last the
+// record, under the version claimed, as every deregistration does
+// (endSet); a record that changed meanwhile is read again and ended too.
+// Cut short after the claim, it leaves the lease for the sweep to finish. With unregisteredOnly it ends k only as an
 // unregistered user's record, and one that a REGISTER turned into a
 // registration meanwhile has its identities pointed at it again. It reports
 // whether it ended one.
@@ -117,25 +119,28 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			return false, err
 		}
 		touched = true
-		// The subscriptions end before the record does, so that an error
-		// here or a stop later leaves the record, or their saved ends, for
-		// the sweep. The HSS does not send the RTR again (its pushes are
-		// logged, not retried), so the record is claimed for a lease, as a
-		// user's deregistration leaves it: the sweep after it tells the HSS
-		// (which refuses, as it ended the set), calls Ended again and
-		// deletes the set (#256 code review).
+		// The record is claimed for a deregistration's lease first, as a
+		// user's deregistration claims it (deregister): the HSS does not
+		// send the RTR again (its pushes are logged, not retried), so a
+		// stop or a store failure from here on leaves the lease, and the
+		// sweep after it tells the HSS (which refuses, as it ended the
+		// set), calls Ended and deletes the set (#368). The mark says why
+		// the set ended, and stays once set: a later RTR of another
+		// reason does not make a rejection less of one.
+		lease := reg.Clone()
+		lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
+		lease.Rejected = reg.Rejected || cause == regevent.Rejected
+		claimed, err := g.cfg.Store.SaveRegistration(ctx, lease)
+		switch {
+		case errors.Is(err, state.ErrConflict):
+			continue
+		case err != nil:
+			return false, err
+		}
+		// The subscriptions end before the record does, told of the
+		// bindings it had.
 		if err := g.cfg.Events.Ended(ctx, reg, cause); err != nil {
 			g.internal("ending a set's subscriptions for an RTR", err)
-			lease := reg.Clone()
-			lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
-			// The sweep's own Ended says why the set ended.
-			lease.Rejected = cause == regevent.Rejected
-			if _, err := g.cfg.Store.SaveRegistration(ctx, lease); err != nil {
-				if errors.Is(err, state.ErrConflict) {
-					continue
-				}
-				return false, err
-			}
 			g.count("registrar.rtr_left_to_sweep")
 			return true, nil
 		}
@@ -149,7 +154,7 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 				return false, err
 			}
 		}
-		err = g.cfg.Store.DeleteRegistration(ctx, reg)
+		err = g.cfg.Store.DeleteRegistration(ctx, claimed)
 		switch {
 		case errors.Is(err, state.ErrConflict):
 			continue
