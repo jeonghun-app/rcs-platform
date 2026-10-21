@@ -1032,10 +1032,10 @@ func (c *conn) watchdogExpired() {
 		return
 	}
 	if c.closing {
-		// Disconnecting, from the drain that comes before our DPR or our DPA
-		// on: no DWR goes, so none can follow the DPR or DPA (RFC 6733 §5.6,
-		// Closing; #376), and the DPR's timeout or the peer closing ends the
-		// connection, not the watchdog.
+		// Disconnecting, from the start of the disconnect (the drain before
+		// our DPR, or the peer's DPR) on: no DWR goes, so none can follow the
+		// DPR or DPA (RFC 6733 §5.6, Closing; #376), and the DPR's timeout or
+		// the peer closing ends the connection, not the watchdog.
 		c.armWatchdogLocked(now)
 		c.mu.Unlock()
 		return

@@ -615,6 +615,26 @@ func TestADWRQueuedAsTheDPRGoesIsDropped(t *testing.T) {
 	}
 }
 
+// The same for the DPA: a DWR queued as the writer takes it is dropped,
+// while the writer goes on answering (QA of #383).
+func TestADWRQueuedAsTheDPAGoesIsDropped(t *testing.T) {
+	_, peer, dialer, _ := startInitiator(t, nil)
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "peer to open", peer.Available)
+	s.sync()
+	hookFor(t, peer.current(), func(c *conn) { c.sendDWR() }, nil)
+	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	if dpa := s.read(); dpa.IsRequest() || dpa.Code != CodeDisconnectPeer || dpa.HopByHop != dpr.HopByHop {
+		t.Fatalf("expected the DPA, got %+v", dpa)
+	}
+	dwr := s.request(&Message{Code: CodeDeviceWatchdog, AVPs: s.origin()})
+	if m := s.read(); m.IsRequest() || m.Code != CodeDeviceWatchdog || m.HopByHop != dwr.HopByHop {
+		t.Fatalf("after the DPA expected the DWA, got %+v (request %v)", m, m.IsRequest())
+	}
+	_ = s.nc.Close() // RFC 6733 §5.4: the DPR's sender closes on the DPA
+}
+
 // expectNoRequestBeforeTheDPAToACrossingDPR sends a DPR and checks that its
 // DPA is the next thing s reads.
 func expectNoRequestBeforeTheDPAToACrossingDPR(t *testing.T, s *script) {
