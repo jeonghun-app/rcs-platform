@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -75,6 +76,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 
 	fl := newFlows(cfg.MaxClientFlows, cfg.MaxFlowsPerIP)
+	if rt.Metrics != nil {
+		fl.refused = func(metric string) { rt.Metrics.Count(metric, 1) }
+	}
 	// The proxy is made once the core listener's port is known, which its
 	// Self needs. Only the core listener is open before it, scscf has no
 	// reason to reach a pcscf that is not ready, and a request that does
@@ -84,8 +88,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
-		OnFlowClosed:   fl.closed,
-		Logger:         rt.Logger,
+		OnFlowClosed: func(id transport.FlowID, info transport.FlowInfo) {
+			fl.closed(id, info)
+			// A request the core sent the client over this flow gets 430
+			// now rather than waiting for Timer B or F (#234).
+			if px := p.Load(); px != nil {
+				px.FlowClosed(id)
+			}
+		},
+		Logger: rt.Logger,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
@@ -135,7 +146,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken.v, cfg.RelayTimeout, relayDialer(cfg))
 	}
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
-	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now))
+	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).
+		coreOfferShare(cfg.MaxCoreOfferBindingsPerFlow, cfg.CoreOfferBindingsPerMinute))
 	defer pc.msrp.close()
 	defer stopAnchor()
 	// A closed flow's registrations and MSRP sessions are gone (RFC 5626
@@ -193,11 +205,21 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		d.sweep = sweepInterval
 	}
 	var tm transportMetrics
+	var lm layerMetrics
+	report := func() {
+		ts := tr.Stats()
+		tm.record(rt.Metrics, ts)
+		lm.record(rt.Metrics, ts, px.Layer().Stats())
+		if rt.Metrics != nil {
+			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
+			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
+		}
+	}
 	stopSweep := every(d.sweep, func() {
 		pc.registry.sweep()
 		pc.reconcileSubscriptions()
 		pc.sweepMSRP()
-		tm.record(rt.Metrics, tr.Stats())
+		report()
 	})
 	defer stopSweep()
 
@@ -212,6 +234,21 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
+	// Requests are served all through the flow drain. What is still in
+	// progress after it gets answersWait, so a request on one of the last
+	// flows closed still gets its 430 (#234), then a 500 with Retry-After,
+	// so its sender tries another task at once (#281). Drain returns once
+	// those answers are written, which Close would drop.
+	answersCtx, cancelAnswers := context.WithTimeout(context.Background(), answersWait)
+	defer cancelAnswers()
+	if n := px.Drain(answersCtx); n > 0 {
+		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
+	}
+	// What the drain counted since the last sweep goes out with the
+	// runtime's last flush, the sweep stopped so that it does not record
+	// at the same time (#345 code review 4).
+	stopSweep()
+	report()
 	return nil
 }
 
@@ -231,11 +268,13 @@ func relayDialer(cfg Config) func(ctx context.Context, network, address string) 
 // itself, so this bounds memory and frees the slots.
 const sweepInterval = 30 * time.Second
 
-// every runs f every interval until the returned stop is called.
+// every runs f every interval until the returned stop is called, which
+// returns once f is not running, and may be called again.
 func every(interval time.Duration, f func()) (stop func()) {
 	t := time.NewTicker(interval)
-	done := make(chan struct{})
+	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-t.C:
@@ -245,7 +284,11 @@ func every(interval time.Duration, f func()) (stop func()) {
 			}
 		}
 	}()
-	return func() { t.Stop(); close(done) }
+	var once sync.Once
+	return func() {
+		once.Do(func() { t.Stop(); close(done) })
+		<-stopped
+	}
 }
 
 // coreResolver resolves a core hop and sends it through the core listener,

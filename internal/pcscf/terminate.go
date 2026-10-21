@@ -33,8 +33,10 @@ var toClientOnly = []string{"P-Served-User", "P-Profile-Key"}
 // it on. A request naming no flow, or one that is not a live client flow
 // of this task (closed, from an earlier start, or a core connection), is
 // answered 430 Flow Failed, which scscf takes as a sign to try the client's
-// other flows (RFC 5626 §5.3). A flow already gone before the send gets 430
-// too; one that closes while the request is under way may not yet (#234).
+// other flows (RFC 5626 §5.3). So does a flow already gone before the send,
+// and one that closes while the request is under way, before its final
+// response: the transport tells the proxy (OnFlowClosed, Proxy.FlowClosed),
+// which ends the branch at once instead of at Timer B or F (#234).
 //
 // A request outside a dialog that sets up one gets pcscf's two Record-Route
 // values, the client-facing one on top, so that the dialog's requests come
@@ -64,6 +66,7 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		}
 	}
 	if entry == nil || p.clientFlow == nil || !p.clientFlow(transport.FlowID(entry.User)) {
+		p.count(metricTerminatingFlow, 1)
 		return proxy.Decision{Status: statusFlowFailed, Reason: "Flow Failed"}
 	}
 	flow := transport.FlowID(entry.User)
@@ -72,13 +75,8 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 	// Inside a dialog only the Record-Route value pcscf wrote for it, not
 	// the Path or another dialog's, names the flow.
 	if !initial && !p.inDialogWith(*entry, callID) {
+		p.count(metricTerminatingRoute, 1)
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
-	}
-	// MSRP sessions rcs-as sets up are anchored by #136's second change;
-	// until then their offers are refused, never passed on unanchored, and
-	// so is an INVITE without an offer, whose 2xx would carry the client's.
-	if initial && p.msrp != nil && (offersMSRP(r.Message) || offerless(r.Message)) || !initial && !p.msrpInDialog(flow, r.Message, false) {
-		return p.refuseOffer()
 	}
 	fallback := ""
 	if !initial {
@@ -108,7 +106,15 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 			return nil
 		},
 		// scscf, the authoritative proxy, needs the 430 (RFC 5626 §11.5).
-		OnFinal: func(context.Context, *sip.Response) {},
+		// A flow that failed as the request went is 430 too, which the
+		// proxy makes; it is counted with the ones refused above. A 430
+		// the client sent over its flow, still live, is passed on but not
+		// counted, as no flow failed (#345 QA).
+		OnFinal: func(_ context.Context, res *sip.Response) {
+			if res.StatusCode == statusFlowFailed && !p.clientFlow(flow) {
+				p.count(metricTerminatingFlow, 1)
+			}
+		},
 	}
 	// routes is the Record-Route a 1xx or 2xx must return, nil when it
 	// cannot be known: the core's did not parse, so a rewrite would lose it.
@@ -140,7 +146,12 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 			}
 		}
 	}
-	return d
+	// MSRP sessions rcs-as sets up, and the requests inside them, are
+	// anchored through msrp-relay (ADR 0004).
+	if initial {
+		return p.anchorInitial(r, d, coreSide, flow)
+	}
+	return p.anchorInDialog(r, d, coreSide, flow)
 }
 
 // keepRecordRoute puts routes back as the Record-Route of a response that

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -679,19 +680,27 @@ func TestARefreshOfASessionRCSASStartedTakesTheNextVersion(t *testing.T) {
 // written yet.
 func TestCloseWaitsForTheAnswersToItsBYEs(t *testing.T) {
 	r := newChatRigWith(t, messaging.Config{}, Config{closeWait: time.Hour})
-	got, release := make(chan struct{}, 1), make(chan struct{})
+	got, held := make(chan struct{}, 1), make(chan struct{})
+	// Released however the test ends, a failed assertion included, and
+	// before the core's own cleanup waits for its reply (#307).
+	release := sync.OnceFunc(func() { close(held) })
+	defer release()
+	t.Cleanup(release)
 	r.core.setReply(func(req *sip.Request) []*sip.Response {
 		if req.Method != "BYE" {
 			return nil
 		}
 		got <- struct{}{}
-		<-release
+		<-held
 		res, _ := sip.NewResponse(req, 200, "", "core1")
 		return []*sip.Response{res}
 	})
 	p := r.a.dial(t)
 	s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
 	p.ack(s)
+	// Close begins once the session is settled and its ACK in, so that
+	// the BYE is Close's own to wait for (#307).
+	settled(t, r.a.srv, s.callID)
 	closed := make(chan struct{})
 	go func() { r.a.srv.Close(); close(closed) }()
 	select {
@@ -704,11 +713,40 @@ func TestCloseWaitsForTheAnswersToItsBYEs(t *testing.T) {
 		t.Fatal("Close returned before its BYE was answered")
 	default:
 	}
-	close(release)
+	release()
 	select {
 	case <-closed:
 	case <-time.After(waitFor):
 		t.Fatal("Close did not return after the answer")
+	}
+}
+
+// settled waits until the session with callID is live and its dialog
+// confirmed: its 2xx out, settle run, and its ACK in.
+func settled(t *testing.T, s *Server, callID string) {
+	t.Helper()
+	deadline := time.Now().Add(waitFor)
+	for {
+		s.mu.Lock()
+		var ss *session
+		for _, x := range s.sessions {
+			if strings.HasPrefix(x.d.ID(), callID+"\x00") {
+				ss = x
+			}
+		}
+		live := ss != nil && ss.live
+		s.mu.Unlock()
+		if live {
+			select {
+			case <-ss.confirmed:
+				return
+			default:
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session %s not settled", callID)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -750,4 +788,23 @@ func TestAThirdPartyRegisterTellsTheEngine(t *testing.T) {
 	if res := p.send(m); res.StatusCode != 400 {
 		t.Fatalf("REGISTER without Expires answered %d", res.StatusCode)
 	}
+}
+
+// #303: the harness's peer reads the answer to the request it sent, not
+// a retransmission of an earlier INVITE's 2xx still waiting for its ACK
+// (RFC 3261 §13.3.1.4), which comes on the same connection T1 after the
+// 2xx. TestCloseEndsTheSessions read one under load.
+func TestThePeerReadsTheAnswerToItsOwnRequest(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	p := r.a.dial(t)
+	s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
+	// Not acknowledged: the 2xx comes again at T1 (500 ms), and next at
+	// 1.5 s (RFC 3261 §13.3.1.4). At 1.2 s one retransmission is waiting
+	// on the connection, with margin on a loaded host either way.
+	time.Sleep(1200 * time.Millisecond)
+	res := p.send(msg{method: "OPTIONS", uri: bob, fields: []string{"P-Asserted-Identity: <" + alice + ">"}})
+	if c, _ := res.Header.CSeq(); c.Method != "OPTIONS" || res.Header.Get("Call-ID") == s.callID {
+		t.Fatalf("read %d for %s %q", res.StatusCode, c.Method, res.Header.Get("Call-ID"))
+	}
+	p.ack(s)
 }

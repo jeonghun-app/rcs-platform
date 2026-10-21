@@ -11,6 +11,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
 // HSS discovery modes (ICSCF_HSS_DISCOVERY).
@@ -42,6 +43,13 @@ const (
 	// stopMargin is what Run needs after the drain to close the proxy, the
 	// transport and the Cx client, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
+	// minServerTransactionBytes is room for the largest request icscf's
+	// transport reads (its default header and body limits) as either bound
+	// charges it: the proxy counts the body and its header four times (two
+	// for the context, two for its one branch), more than the layer's
+	// request plus its per-header overhead. 2 MiB leaves room for both
+	// (code review of #311).
+	minServerTransactionBytes = 2 << 20
 )
 
 // ServiceConfig is icscf's configuration (docs/icscf.md), read by Configure
@@ -78,6 +86,12 @@ type ServiceConfig struct {
 	// progress to get their final responses: by default RCS_SHUTDOWN_TIMEOUT
 	// less what the rest of the stop needs.
 	DrainTimeout time.Duration
+	// MaxServerTransactions and MaxServerTransactionBytes bound the server
+	// transactions icscf holds, by count and by memory (#37): a request past
+	// either is answered 503 with Retry-After, which icscf sends only for an
+	// overload of its own (decided on #15).
+	MaxServerTransactions     int
+	MaxServerTransactionBytes int64
 }
 
 // drainTimeout reads ICSCF_DRAIN_TIMEOUT, by default RCS_SHUTDOWN_TIMEOUT
@@ -134,6 +148,9 @@ func Configure(s *runtime.Settings) ServiceConfig {
 		OriginRealm:     e.String("DIAMETER_REALM", domain),
 		HSSDiscovery:    e.String("HSS_DISCOVERY", DiscoveryCloudMap),
 		CxTimeout:       e.Duration("CX_TIMEOUT", DefaultCxTimeout),
+
+		MaxServerTransactions:     e.Int("MAX_SERVER_TRANSACTIONS", transaction.DefaultMaxServerTransactions),
+		MaxServerTransactionBytes: int64(e.Int("MAX_SERVER_TRANSACTION_BYTES", transaction.DefaultMaxServerTransactionBytes)),
 	}
 	c.HSSRealm = e.String("HSS_REALM", c.OriginRealm)
 	c.HSSHostPattern = e.String("HSS_HOST_PATTERN", "hss-*."+c.Namespace)
@@ -177,6 +194,15 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	}
 	if c.CxTimeout <= 0 {
 		e.Invalid("CX_TIMEOUT", "must be greater than zero")
+	}
+	if c.MaxServerTransactions < 1 || c.MaxServerTransactions > transaction.MaxMaxServerTransactions {
+		e.Invalid("MAX_SERVER_TRANSACTIONS", "must be from 1 to "+strconv.Itoa(transaction.MaxMaxServerTransactions))
+	}
+	// A bound below the largest request icscf reads (the transport's default
+	// limits) would refuse that request however idle icscf is (code review
+	// of #311).
+	if c.MaxServerTransactionBytes < minServerTransactionBytes {
+		e.Invalid("MAX_SERVER_TRANSACTION_BYTES", "must be at least "+strconv.Itoa(minServerTransactionBytes)+" (2 MiB), room for the largest request icscf reads")
 	}
 	// A REGISTER waits for a UAR, an attempt and its retry on another HSS
 	// task, then for a connection to the S-CSCF, and then for its answer:

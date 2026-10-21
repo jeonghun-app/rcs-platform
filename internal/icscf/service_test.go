@@ -61,7 +61,8 @@ func TestConfigureTakesTheDefaults(t *testing.T) {
 		c.CoreHost != netip.MustParseAddr("10.0.3.9") || c.OriginRealm != home || c.HSSRealm != home ||
 		c.HSSDiscovery != DiscoveryCloudMap || c.HSSHostPattern != "hss-*.rcs.local" ||
 		c.RetryAfter != DefaultRetryAfter || c.RegisterTimeout != DefaultRegisterTimeout ||
-		c.CxTimeout != DefaultCxTimeout || c.OriginHost != "" || c.DrainTimeout != 15*time.Second {
+		c.CxTimeout != DefaultCxTimeout || c.OriginHost != "" || c.DrainTimeout != 15*time.Second ||
+		c.MaxServerTransactions != 20000 || c.MaxServerTransactionBytes != 256<<20 {
 		t.Errorf("defaults = %+v", c)
 	}
 	if len(c.SCSCFs) != 1 || c.SCSCFs[0].URI.String() != "sip:scscf.rcs.local:5060;transport=tcp" {
@@ -82,6 +83,8 @@ func TestConfigureReadsEverySetting(t *testing.T) {
 		"ICSCF_HSS_DISCOVERY", "dns",
 		"ICSCF_HSS_HOST_PATTERN", "hss-*.other.example.net",
 		"ICSCF_CX_TIMEOUT", "3s",
+		"ICSCF_MAX_SERVER_TRANSACTIONS", "500",
+		"ICSCF_MAX_SERVER_TRANSACTION_BYTES", "2097152",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +93,8 @@ func TestConfigureReadsEverySetting(t *testing.T) {
 		c.RetryAfter != 30*time.Second || c.RegisterTimeout != 8*time.Second ||
 		c.OriginHost != "icscf-a.core.example.net" || c.OriginRealm != "realm.example.net" ||
 		c.HSSRealm != "hss.example.net" || c.HSSDiscovery != DiscoveryDNS ||
-		c.HSSHostPattern != "hss-*.other.example.net" || c.CxTimeout != 3*time.Second {
+		c.HSSHostPattern != "hss-*.other.example.net" || c.CxTimeout != 3*time.Second ||
+		c.MaxServerTransactions != 500 || c.MaxServerTransactionBytes != 2<<20 {
 		t.Errorf("config = %+v", c)
 	}
 }
@@ -126,6 +130,13 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"a stop deadline the margin eats": with(devEnv, "RCS_SHUTDOWN_TIMEOUT", "5s"),
 		// 2 × 7 s + 2 s to connect + 16 s reaches Timer F.
 		"Cx, connection and register past Timer F": with(devEnv, "ICSCF_CX_TIMEOUT", "7s"),
+		// #37's caps.
+		"no server transactions":        with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "0"),
+		"server transactions past 10^6": with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000001"),
+		"a count that is not a number":  with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "many"),
+		"no server transaction bytes":   with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "0"),
+		// One byte short of the largest request icscf reads.
+		"bytes below one request": with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "2097151"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
@@ -196,5 +207,27 @@ func startup(t *testing.T, env map[string]string) (int, string) {
 func TestABudgetJustUnderTimerFIsAccepted(t *testing.T) {
 	if _, err := configure(with(devEnv, "ICSCF_CX_TIMEOUT", "6999ms")); err != nil {
 		t.Fatalf("2 × 6.999 s + 2 s + 16 s refused: %v", err)
+	}
+}
+
+// The largest transaction count the layer takes is accepted, and a byte
+// bound of exactly one largest request (16 KiB of header, 1 MiB of body).
+func TestTheTransactionCapBoundsAreAccepted(t *testing.T) {
+	if _, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000000", "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "2097152")); err != nil {
+		t.Fatalf("10^6 transactions and 2097152 bytes refused: %v", err)
+	}
+	// QA of #311: the count's floor is 1.
+	if c, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1")); err != nil || c.MaxServerTransactions != 1 {
+		t.Fatalf("one transaction: %v, %d", err, c.MaxServerTransactions)
+	}
+}
+
+// The proxy allows as many contexts as the layer allows server transactions,
+// so a burst meets the layer's count first, and as many bytes as the layer
+// (code review of #311).
+func TestTheProxyAllowsAsManyContextsAsServerTransactions(t *testing.T) {
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 30000, MaxServerTransactionBytes: 1 << 30})
+	if tcfg.MaxServerTransactions != 30000 || tcfg.MaxServerTransactionBytes != 1<<30 || contexts != 30000 || bytes != 1<<30 {
+		t.Fatalf("limits = %+v, %d contexts, %d bytes", tcfg, contexts, bytes)
 	}
 }
