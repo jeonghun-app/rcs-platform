@@ -557,9 +557,10 @@ it cannot anchor is refused or ended; it never runs end to end.
   Each is counted once, in `msrp.ended.direction`,
   `msrp.ended.relay_failed`, `msrp.ended.second_answer`,
   `msrp.ended.offer_refused`, `msrp.ended.no_answer` and
-  `msrp.ended.declined`, however often the 2xx is retransmitted. A BYE that cannot be built or sent, or that
-  gets a final response other than 2xx and 481, is counted in
-  `msrp.bye_failed` and logged by side and step, naming no one.
+  `msrp.ended.declined`, however often the 2xx is retransmitted. A BYE
+  that cannot be built or sent, or that gets a final response other than
+  2xx and 481, is counted in `msrp.bye_failed` and logged by side and
+  step, naming no one.
 - **Releases.** A binding is released (`DELETE`) on a BYE from either
   side of the dialog it serves (another fork's BYE ends that dialog
   alone), a final failure (a 3xx, or a CANCEL's 487, included), the flow
