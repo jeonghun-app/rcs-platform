@@ -3,6 +3,7 @@ package sipas
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,12 +25,17 @@ type Groups interface {
 	Create(ctx context.Context, r group.CreateRequest) (groupstore.Group, error)
 	Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error)
 	Leave(ctx context.Context, uri, who string) error
+	Add(ctx context.Context, uri, by string, who []group.Invitee) error
+	Remove(ctx context.Context, uri, by, who string) error
+	Roster(ctx context.Context, uri, who string) ([]byte, uint32, error)
+	FullRoster(ctx context.Context, uri string) (groupstore.Group, []byte, error)
+	Get(ctx context.Context, uri string) (groupstore.Group, error)
 	Established(ctx context.Context, uri string) error
 }
 
-// groupAllowed are the methods a conference URI or the factory takes
-// outside a session.
-const groupAllowed = "INVITE, ACK, CANCEL, BYE, UPDATE"
+// groupAllowed are the methods of a group chat's requests (RFC 3261
+// §20.5): INVITE and SUBSCRIBE outside a dialog, the others in one.
+const groupAllowed = "INVITE, ACK, CANCEL, BYE, UPDATE, SUBSCRIBE, REFER"
 
 // groupTimeout bounds a group operation the SIP layer makes outside the
 // request it serves: the Join of a 2xx to the focus's INVITE, the Leave of
@@ -41,7 +47,18 @@ const groupTimeout = 5 * time.Second
 // case (RFC 3261 §19.1.4).
 func (s *Server) isFactory(u sip.URI) bool {
 	f := s.cfg.ConferenceFactory
-	return u.IsSIP() && u.User == f.User && sameHost(u.Host, f.Host)
+	return u.IsSIP() && sameUser(u.User, f.User) && sameHost(u.Host, f.Host)
+}
+
+// sameUser compares two user parts as the one user they name: with their
+// escapes undone and without case, so that sip:conf%2Dfactory@<domain> or
+// sip:CONF-FACTORY@<domain> is the factory too, and cannot take a group's
+// request onto the 1-to-1 path (security review on #340). An escape that
+// does not decode names no factory.
+func sameUser(a, b string) bool {
+	ua, err1 := url.PathUnescape(a)
+	ub, err2 := url.PathUnescape(b)
+	return err1 == nil && err2 == nil && strings.EqualFold(ua, ub)
 }
 
 // atConference reports whether u is at the conference host, where every
@@ -127,12 +144,21 @@ func (s *Server) invitees(entries []resourcelists.Entry) []group.Invitee {
 	return out
 }
 
-// routeGroup serves a group chat's request outside a session: an INVITE
-// that creates the group or joins it. The conference event package and
-// REFER come in a later part of #137.
+// routeGroup serves a group chat's request outside a dialog: an INVITE
+// that creates the group or joins it, or a SUBSCRIBE to its conference
+// event package. A REFER is taken in the referrer's session (refer).
 func (s *Server) routeGroup(r *proxy.Request) proxy.Decision {
-	if r.Message.Method == "INVITE" {
+	if !s.cfg.GroupChat {
+		// Off (RCSAS_GROUP_CHAT_ENABLED): nothing is created, and the
+		// request is not taken for a 1-to-1 one either.
+		s.cfg.Metrics.Count("sip.group.disabled", 1)
+		return proxy.Decision{Status: 404}
+	}
+	switch r.Message.Method {
+	case "INVITE":
 		return proxy.Decision{Serve: s.groupInvite}
+	case "SUBSCRIBE":
+		return proxy.Decision{Serve: s.groupSubscribe}
 	}
 	return s.refuseMethod(r, groupAllowed)
 }
@@ -274,6 +300,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	}
 	ss.group = g.URI
 	conv.ID = g.Conversation
+	ss.conversation = conv
 	if d.LocalTarget, err = sip.ParseURI(g.URI); err != nil {
 		s.respond(u, req, 500)
 		return
@@ -408,21 +435,23 @@ func (s *Server) establish(ss *session, g groupstore.Group, conv messaging.Conve
 		}
 		time.Sleep(establishBackoff[attempt])
 	}
-	s.inviteAll(g, conv)
+	s.inviteInvited(g, conv, nil, g.Creator)
 }
 
-// inviteAll has the focus invite each participant g holds invited, once
-// its creator's session is set up: through the engine, which counts the
+// inviteInvited has the focus invite each participant g holds invited, of
+// those in only unless it is nil, on behalf of referrer (Referred-By): once
+// its creator's session is set up, or once a REFER added them. It goes
+// through the engine, which counts the
 // invitation, so that a message queued meanwhile waits for that session
 // rather than ringing the participant again.
-func (s *Server) inviteAll(g groupstore.Group, conv messaging.Conversation) {
+func (s *Server) inviteInvited(g groupstore.Group, conv messaging.Conversation, only map[string]bool, referrer string) {
 	for _, p := range g.Participants {
-		if p.State != groupstore.Invited {
+		if p.State != groupstore.Invited || only != nil && !only[p.Identity] {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
 		s.engine.Invite(ctx, messaging.Invitation{
-			Recipient: p.Identity, Peer: g.URI, Mode: store.Group, Subject: g.Subject, Referrer: g.Creator,
+			Recipient: p.Identity, Peer: g.URI, Mode: store.Group, Subject: g.Subject, Referrer: referrer,
 			Conversation: messaging.Conversation{ID: g.Conversation, Contribution: conv.Contribution},
 		})
 		cancel()
@@ -442,6 +471,7 @@ func (ss *session) declined() {
 		ss.s.cfg.Metrics.Count("sip.group.leave_failed", 1)
 	} else {
 		ss.s.cfg.Metrics.Count("sip.group.declined", 1)
+		ss.s.endSubscriptions(ss.group, ss.user, reasonRejected)
 	}
 	ss.end()
 }
@@ -455,13 +485,15 @@ func (ss *session) declined() {
 // (RCC.07 Group Chat): a participant that left could do neither.
 func leaves(req *sip.Request) bool { return sipCause(req, 200) }
 
-// left records that a participant left its group by its BYE (Leave).
+// left records that a participant left its group by its BYE (Leave), and
+// ends its subscriptions, so that it learns no later change.
 func (s *Server) left(ctx context.Context, ss *session) {
 	if err := s.groups.Leave(ctx, ss.group, ss.user); err != nil {
 		s.cfg.Metrics.Count("sip.group.leave_failed", 1)
 		return
 	}
 	s.cfg.Metrics.Count("sip.group.left", 1)
+	s.endSubscriptions(ss.group, ss.user, reasonRejected)
 }
 
 // joined records that the participant answered the focus's INVITE with a
@@ -473,8 +505,3 @@ func (ss *session) joined() error {
 	_, err := ss.s.groups.Join(ctx, ss.group, ss.user, "")
 	return err
 }
-
-// RosterChanged implements group.Notifier. Subscriptions to the conference
-// event package (RFC 4575) come in a later part of #137; until then a
-// roster change is sent to no one.
-func (s *Server) RosterChanged(context.Context, group.RosterUpdate) {}

@@ -66,8 +66,16 @@ type Config struct {
 	MaxSessions        int
 	MaxOutgoingPerUser int
 	MaxIncomingPerUser int
-	Store              string
-	DynamoDB           awsstore.Config
+	// GroupChat turns the conference factory and the conference URIs on
+	// (RCSAS_GROUP_CHAT_ENABLED); off, they answer 404. A group's
+	// subscriptions and sessions live in one task until #121, so it is
+	// turned on with one task only.
+	GroupChat bool
+	// MaxSubscriptionsPerUser bounds one user's conference subscriptions
+	// across all its groups (RCSAS_MAX_SUBSCRIPTIONS_PER_USER).
+	MaxSubscriptionsPerUser int
+	Store                   string
+	DynamoDB                awsstore.Config
 	// Messaging is the engine's configuration; its Clock, Rand and Logger
 	// are left for the service to set.
 	Messaging messaging.Config
@@ -134,6 +142,9 @@ func Configure(s *runtime.Settings) Config {
 	positive(e, "MAX_OUTGOING_SESSIONS_PER_USER", c.MaxOutgoingPerUser)
 	c.MaxIncomingPerUser = e.Int("MAX_INCOMING_SESSIONS_PER_USER", sipas.DefaultMaxSessionsPerUser)
 	positive(e, "MAX_INCOMING_SESSIONS_PER_USER", c.MaxIncomingPerUser)
+	c.GroupChat = e.Bool("GROUP_CHAT_ENABLED", false)
+	c.MaxSubscriptionsPerUser = e.Int("MAX_SUBSCRIPTIONS_PER_USER", sipas.DefaultMaxSubscriptionsPerUser)
+	positive(e, "MAX_SUBSCRIPTIONS_PER_USER", c.MaxSubscriptionsPerUser)
 	if _, port, err := net.SplitHostPort(c.SIPListenAddr); err != nil {
 		e.Invalid("SIP_LISTEN_ADDR", "not host:port")
 	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
