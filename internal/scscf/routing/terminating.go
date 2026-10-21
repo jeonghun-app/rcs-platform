@@ -62,7 +62,7 @@ func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decis
 		return proxy.Decision{Status: 480, Reason: "Temporarily Unavailable"}
 	}
 	var ops int
-	d := &delivery{rt: rt, key: set.Key, candidates: prefs.accepted(live(set, now), &ops)}
+	d := &delivery{rt: rt, key: set.Key, candidates: prefs.accepted(live(set, now), &ops), invite: r.Message.Method == "INVITE"}
 	targets := d.targets(onePerInstance(d.candidates))
 	if len(targets) == 0 {
 		rt.count("routing.terminating.no_contact")
@@ -164,6 +164,8 @@ type delivery struct {
 	rt         *Router
 	key        state.SetKey
 	candidates []state.Contact
+	// invite says the request is an INVITE.
+	invite bool
 
 	mu    sync.Mutex
 	tried map[string]state.Contact
@@ -247,7 +249,10 @@ func keyOf(t proxy.Target) string {
 // failed acts on a branch that failed: one its edge proxy answered 430 Flow
 // Failed went to a flow that is gone (RFC 5626 §5.3), so its binding is
 // ended, and the request is tried over the instance's latest flow not tried
-// yet (§7).
+// yet (§7). An INVITE the device answered with a provisional response
+// (BranchFailure.Progress) is not: the device has it, and would take the
+// same INVITE over its other flow for a merged request (RFC 3261 §8.2.2.2)
+// or ring again (#14, #293).
 func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Target {
 	if f.Response == nil || f.Response.StatusCode != 430 {
 		return nil
@@ -261,6 +266,10 @@ func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Ta
 	d.rt.count("routing.terminating.flow_failed")
 	d.rt.endBinding(ctx, d.key, gone)
 	if gone.InstanceID == "" {
+		return nil
+	}
+	if d.invite && f.Progress {
+		d.rt.count("routing.terminating.not_retried_after_progress")
 		return nil
 	}
 	d.mu.Lock()

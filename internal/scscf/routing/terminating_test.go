@@ -388,3 +388,35 @@ func TestAnOPTIONSIsRoutedAsAnyRequest(t *testing.T) {
 		t.Errorf("without a live binding: %d", d.Status)
 	}
 }
+
+// TestARingingINVITEIsNotTriedOverTheInstancesOtherFlow (#14, #293): once
+// the device answered with a provisional response, it has the INVITE; a
+// 100 Trying, which the edge proxy sends itself, does not count, nor does a
+// request other than INVITE.
+func TestARingingINVITEIsNotTriedOverTheInstancesOtherFlow(t *testing.T) {
+	for name, c := range map[string]struct {
+		method                string
+		provisional, progress bool
+		retried               bool
+	}{
+		"no provisional":        {"INVITE", false, false, true},
+		"only the hop's 100":    {"INVITE", true, false, true},
+		"a 180 from the device": {"INVITE", true, true, false},
+		"a MESSAGE's 1xx":       {"MESSAGE", true, true, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, 1, time.Hour), binding(2, 1, 2*time.Hour))
+			d := e.router(nil).Terminating(bg, request(t, c.method, impu1))
+			f := failure(d.Targets[0], 430)
+			f.Provisional, f.Progress = c.provisional, c.progress
+			more := d.OnBranchFailure(bg, f)
+			if got := len(more) == 1; got != c.retried {
+				t.Errorf("retried %v (%v), want %v", got, uris(more), c.retried)
+			}
+			if set, _ := e.store.Registration(bg, set1); !set.Contacts[1].Expired(t0) {
+				t.Error("the gone flow's binding was not ended")
+			}
+		})
+	}
+}
