@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,14 +194,10 @@ func TestTheRegistrationTypeChoosesTheServers(t *testing.T) {
 	s := &sentRegisters{}
 	rt := e.router(nil, withSender(s))
 	rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
-	rt.Wait()
-	if len(s.got()) != 0 {
-		t.Error("a re-registration went to a server for de-registrations")
-	}
 	rt.Registered(bg, registration(t, ifc.DeRegistration, 0))
 	rt.Wait()
-	if len(s.got()) != 1 {
-		t.Error("the de-registration did not go")
+	if got := s.got(); len(got) != 1 || got[0].Header.Get("Expires") != "0" {
+		t.Errorf("%d sent, want the de-registration alone", len(got))
 	}
 }
 
@@ -219,7 +217,7 @@ func TestOneSetsRegistrationsGoInTheirOrder(t *testing.T) {
 	other.Profile = profileFor(t, e, other.Set, impu2)
 	rt.Registered(bg, other)
 	// The other set's goes while the first is held.
-	if to := <-s.finished; to != impu2 {
+	if to := recv(t, s.finished); to != impu2 {
 		t.Fatalf("%s finished first", to)
 	}
 	close(s.held)
@@ -274,20 +272,71 @@ func profileFor(t *testing.T, e *env, set state.SetKey, impu string) *state.Prof
 	return &state.Profile{Key: set, UserData: data, Received: t0, KeepUntil: t0.Add(time.Hour)}
 }
 
-// TestRegistrationsPastTheBoundAreDropped: with every slot held, one more
-// is counted and not sent.
-func TestRegistrationsPastTheBoundAreDropped(t *testing.T) {
+// recv is the next value from ch, failing the test if none comes soon.
+func recv[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatal("nothing came")
+	}
+	panic("unreachable")
+}
+
+// otherSet is a registration of the n-th of other users' sets, with a
+// REGISTER criterion to rcsAS.
+func otherSet(t *testing.T, e *env, n int) registrar.ThirdPartyRegistration {
+	t.Helper()
+	impu := fmt.Sprintf("sip:user%03d@%s", n, realm)
+	r := registration(t, ifc.InitialRegistration, time.Hour)
+	r.Set = state.SetKey{IMPI: fmt.Sprintf("user%03d@%s", n, realm), IMPU: impu}
+	r.IMPU, r.Profile = impu, profileFor(t, e, r.Set, impu)
+	return r
+}
+
+// TestRegistrationsPastAServersQueueAreDropped: with the server's one slot
+// held, four registrations of as many sets wait for it, and one more is
+// counted and not sent.
+func TestRegistrationsPastAServersQueueAreDropped(t *testing.T) {
+	e := newEnv(t)
+	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 8)}
+	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 1 })
+	for n := range queuedPerServer + 1 {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	dropped := e.metrics.get("routing.third_party.dropped")
+	close(s.hold)
+	rt.Wait()
+	if len(s.got()) != queuedPerServer || dropped != 1 {
+		t.Errorf("%d sent, %d dropped", len(s.got()), dropped)
+	}
+}
+
+// TestOneSetsQueueLeavesRoomForOthers (#379 code review and QA): a set's
+// refreshes past queuedPerSet are dropped while its first is at the
+// server, and another user's registration goes meanwhile.
+func TestOneSetsQueueLeavesRoomForOthers(t *testing.T) {
 	e := newEnv(t)
 	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 8)}
-	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 1 })
-	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-	<-s.inside
-	rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
+	rt := e.router(nil, withSender(s))
+	for range DefaultMaxThirdParty {
+		rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
+	}
+	recv(t, s.inside)
+	rt.Registered(bg, otherSet(t, e, 1))
+	recv(t, s.inside)
+	if got := s.got(); len(got) != 2 || got[1].Header.Get("To") != "<sip:user001@"+realm+">" {
+		t.Errorf("sent %d; the other user's is not at the server", len(got))
+	}
 	close(s.hold)
 	rt.Wait()
-	if len(s.got()) != 1 || e.metrics.get("routing.third_party.dropped") != 1 {
-		t.Errorf("%d sent, %d dropped", len(s.got()), e.metrics.get("routing.third_party.dropped"))
+	if n, d := len(s.got()), e.metrics.get("routing.third_party.dropped"); n != queuedPerSet+1 || d != int64(DefaultMaxThirdParty-queuedPerSet) {
+		t.Errorf("%d sent, %d dropped", n, d)
 	}
 }
 
@@ -381,7 +430,7 @@ func TestALaterRegistrationWaitsForEveryOneBeforeIt(t *testing.T) {
 		rt.Registered(bg, registration(t, ifc.ReRegistration, exp*time.Second))
 	}
 	close(s.hold["100"])
-	if got := <-s.finished; got != "100" {
+	if got := recv(t, s.finished); got != "100" {
 		t.Fatalf("%s finished first", got)
 	}
 	rt.Registered(bg, registration(t, ifc.ReRegistration, 400*time.Second))
@@ -394,5 +443,252 @@ func TestALaterRegistrationWaitsForEveryOneBeforeIt(t *testing.T) {
 	}
 	if !slices.Equal(order, []string{"200", "300", "400"}) {
 		t.Errorf("then in the order %v", order)
+	}
+}
+
+type senderFunc func(context.Context, *sip.Request) (*sip.Response, error)
+
+func (f senderFunc) Send(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	return f(ctx, req)
+}
+
+// TestAServerThatDoesNotAnswerHoldsUpNoOther (#379 QA): an operator server
+// that never answers, before rcs-as in priority, has its queue fill while
+// rcs-as gets each of a burst of registrations at once.
+func TestAServerThatDoesNotAnswerHoldsUpNoOther(t *testing.T) {
+	e := newEnv(t)
+	dead := make(chan struct{})
+	toRCSAS := make(chan struct{}, 512)
+	var atDead atomic.Int64
+	s := senderFunc(func(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+		if req.URI.Host == "operator-as.rcs.local" {
+			atDead.Add(1)
+			<-dead
+			return nil, errors.New("no answer")
+		}
+		toRCSAS <- struct{}{}
+		return sip.NewResponse(req, 200, "", "as")
+	})
+	rt := e.router(nil, withSender(s))
+	const n = 300
+	for i := range n {
+		r := otherSet(t, e, i)
+		sub := ifc.Subscription{PrivateID: r.Set.IMPI, ServiceProfiles: []ifc.ServiceProfile{{
+			PublicIdentities: []ifc.PublicIdentity{{Identity: r.IMPU}},
+			InitialFilterCriteria: []ifc.FilterCriteria{
+				criterion(10, operatorAS, registerTrigger(), ifc.SessionContinued),
+				criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued),
+			},
+		}}}
+		data, err := sub.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Profile.UserData = data
+		rt.Registered(bg, r)
+	}
+	for range n {
+		recv(t, toRCSAS)
+	}
+	if got := atDead.Load(); got > DefaultMaxThirdParty {
+		t.Errorf("%d at the silent server at once, past %d", got, DefaultMaxThirdParty)
+	}
+	close(dead)
+	rt.Wait()
+	if d := e.metrics.get("routing.third_party.dropped"); d != 0 {
+		t.Errorf("%d dropped", d)
+	}
+}
+
+// TestASixHundredIsTheServersRefusal (§5.4.1.7, #379 code review): only no
+// answer, a 408 and a 5xx have the default handling apply.
+func TestASixHundredIsTheServersRefusal(t *testing.T) {
+	for _, h := range []ifc.DefaultHandling{ifc.SessionContinued, ifc.SessionTerminated} {
+		for _, code := range []int{600, 603, 604, 606} {
+			e := newEnv(t)
+			e.profile(t0, criterion(40, rcsAS, registerTrigger(), h))
+			rt := e.router(nil, withSender(&sentRegisters{answer: status(code)}))
+			rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+			rt.Wait()
+			if e.metrics.get("routing.third_party.refused") != 1 || e.metrics.get("routing.third_party.unanswered") != 0 {
+				t.Errorf("handling %d, %d: not counted as refused", h, code)
+			}
+		}
+	}
+}
+
+// TestRegistrationsToldWhileTheRouterStopsAreDroppedOrSent (#379 QA): Wait
+// stops new ones, so that none is added to what it waits for meanwhile;
+// each is sent or counted.
+func TestRegistrationsToldWhileTheRouterStopsAreDroppedOrSent(t *testing.T) {
+	e := newEnv(t)
+	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+	s := &sentRegisters{}
+	rt := e.router(nil, withSender(s))
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			for range 4 {
+				rt.Registered(bg, otherSet(t, e, i))
+			}
+		})
+	}
+	wg.Go(func() {
+		for range 50 {
+			rt.Wait()
+		}
+	})
+	wg.Wait()
+	rt.Wait()
+	if n := int64(len(s.got())) + e.metrics.get("routing.third_party.dropped"); n != 64 {
+		t.Errorf("%d sent or dropped of 64", n)
+	}
+	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+	if e.metrics.get("routing.third_party.dropped") == 0 {
+		t.Error("a registration told after Wait was not dropped")
+	}
+}
+
+// TestAThirdPartyREGISTERIsBoundedByThirdPartyTimeout (#379 QA).
+func TestAThirdPartyREGISTERIsBoundedByThirdPartyTimeout(t *testing.T) {
+	if DefaultThirdPartyTimeout != 10*time.Second {
+		t.Errorf("DefaultThirdPartyTimeout %v", DefaultThirdPartyTimeout)
+	}
+	for _, c := range []struct{ cfg, want time.Duration }{{0, DefaultThirdPartyTimeout}, {150 * time.Millisecond, 150 * time.Millisecond}} {
+		e := newEnv(t)
+		e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+		var left atomic.Int64
+		s := senderFunc(func(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+			d, ok := ctx.Deadline()
+			if !ok {
+				return nil, errors.New("no deadline")
+			}
+			left.Store(int64(time.Until(d)))
+			return sip.NewResponse(req, 200, "", "as")
+		})
+		rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.ThirdPartyTimeout = c.cfg })
+		rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+		rt.Wait()
+		// The deadline is wall clock: the transaction's, not the S-CSCF's
+		// injected time.
+		if got := time.Duration(left.Load()); got <= 0 || got > c.want {
+			t.Errorf("deadline in %v, want at most %v", got, c.want)
+		}
+	}
+}
+
+// TestAtMostTheBoundAreAtAServerAtOnce (#379 QA): of a burst past
+// DefaultMaxThirdParty to one server that holds them, that many are at it,
+// the rest wait, and every one is sent in the end.
+func TestAtMostTheBoundAreAtAServerAtOnce(t *testing.T) {
+	if DefaultMaxThirdParty != 256 {
+		t.Errorf("DefaultMaxThirdParty %d", DefaultMaxThirdParty)
+	}
+	e := newEnv(t)
+	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 512)}
+	rt := e.router(nil, withSender(s))
+	const n = 300
+	for i := range n {
+		rt.Registered(bg, otherSet(t, e, i))
+	}
+	for range DefaultMaxThirdParty {
+		recv(t, s.inside)
+	}
+	at := len(s.got())
+	close(s.hold)
+	rt.Wait()
+	if at != DefaultMaxThirdParty || len(s.got()) != n || e.metrics.get("routing.third_party.dropped") != 0 {
+		t.Errorf("%d at the server at once, %d sent, %d dropped", at, len(s.got()), e.metrics.get("routing.third_party.dropped"))
+	}
+}
+
+// TestARegistrationOutlivesItsCallerAndWhatItChangesAfterward (#379 QA):
+// the caller's context ending, and its REGISTER and 200 changing once
+// Registered has returned, change nothing of what is sent; a 202 is a
+// registration, and the S-CSCF's Contact names TCP.
+func TestARegistrationOutlivesItsCallerAndWhatItChangesAfterward(t *testing.T) {
+	e := newEnv(t)
+	fc := criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued)
+	fc.ApplicationServer.IncludeRegisterRequest, fc.ApplicationServer.IncludeRegisterResponse = true, true
+	e.profile(t0, fc)
+	release := make(chan struct{})
+	var sent atomic.Pointer[sip.Request]
+	s := senderFunc(func(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+		<-release
+		sent.Store(req)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return sip.NewResponse(req, 202, "", "as")
+	})
+	rt := e.router(nil, withSender(s))
+	ctx, cancel := context.WithCancel(bg)
+	r := registration(t, ifc.InitialRegistration, time.Hour)
+	rt.Registered(ctx, r)
+	cancel()
+	_ = r.Request.Header.Set("Expires", "1")
+	_ = r.Response.Header.Set("Expires", "2")
+	close(release)
+	rt.Wait()
+	got := sent.Load()
+	if got == nil || e.metrics.get("routing.third_party.registered") != 1 {
+		t.Fatalf("registered %d, unanswered %d, refused %d", e.metrics.get("routing.third_party.registered"),
+			e.metrics.get("routing.third_party.unanswered"), e.metrics.get("routing.third_party.refused"))
+	}
+	if bytes.Contains(got.Body, []byte("Expires: 1\r\n")) || bytes.Contains(got.Body, []byte("Expires: 2\r\n")) {
+		t.Error("the body carries what the caller changed after Registered returned")
+	}
+	cs, _ := got.Header.Contact()
+	if len(cs) != 1 {
+		t.Fatalf("Contact %v", cs)
+	}
+	if tr, _ := cs[0].URI.Params.Get("transport"); tr != "tcp" {
+		t.Errorf("Contact %v", cs)
+	}
+}
+
+// TestAnOriginatingCriterionTakesTheREGISTER (#379 QA): the REGISTER is
+// matched in the originating case (TS 29.228 B.2.3).
+func TestAnOriginatingCriterionTakesTheREGISTER(t *testing.T) {
+	e := newEnv(t)
+	tp := registerTrigger()
+	tp.SPTs = append(tp.SPTs, ifc.SPT{Condition: ifc.Originating, Groups: []int{1}})
+	e.profile(t0, criterion(40, rcsAS, tp, ifc.SessionContinued))
+	s := &sentRegisters{}
+	rt := e.router(nil, withSender(s))
+	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+	rt.Wait()
+	if len(s.got()) != 1 {
+		t.Errorf("%d sent", len(s.got()))
+	}
+}
+
+// TestTheBodysREGISTERCarriesNoCredentials (#379, lead's decision): the
+// Authorization and Proxy-Authorization of the UE's REGISTER stay out of
+// the server's body.
+func TestTheBodysREGISTERCarriesNoCredentials(t *testing.T) {
+	e := newEnv(t)
+	fc := criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued)
+	fc.ApplicationServer.IncludeRegisterRequest = true
+	e.profile(t0, fc)
+	s := &sentRegisters{}
+	rt := e.router(nil, withSender(s))
+	r := registration(t, ifc.InitialRegistration, time.Hour)
+	for _, h := range []string{"Authorization", "Proxy-Authorization"} {
+		if err := r.Request.Header.Add(h, `Digest username="001010000000001@`+realm+`", realm="`+realm+`", nonce="bm9uY2U=", uri="sip:`+realm+`", response="0123456789abcdef0123456789abcdef"`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt.Registered(bg, r)
+	rt.Wait()
+	got := s.got()
+	if len(got) != 1 {
+		t.Fatalf("%d sent", len(got))
+	}
+	if b := string(got[0].Body); !strings.HasPrefix(b, "REGISTER ") || strings.Contains(b, "Authorization") || strings.Contains(b, "response=") {
+		t.Errorf("body %q", b)
+	}
+	if r.Request.Header.Get("Authorization") == "" {
+		t.Error("the caller's REGISTER lost its Authorization")
 	}
 }

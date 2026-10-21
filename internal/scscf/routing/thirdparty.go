@@ -21,25 +21,52 @@ type Sender interface {
 	Send(ctx context.Context, req *sip.Request) (*sip.Response, error)
 }
 
-// thirdParty is the third-party registrations under way: at most
-// MaxThirdParty at a time, each set's in the order the registrar told of
-// them, so that a server does not hear a registration after the
-// deregistration that followed it.
+// thirdParty is the third-party registrations under way, queued per
+// application server so that one that does not answer holds up no other
+// (#379 QA).
 type thirdParty struct {
-	slots chan struct{}
-	wg    sync.WaitGroup
+	wg sync.WaitGroup
 
-	mu sync.Mutex
-	// tails are the last registration of each set under way, closed once
-	// it is done.
-	tails map[string]chan struct{}
+	mu      sync.Mutex
+	servers map[string]*serverQueue
 }
+
+// serverQueue is one application server's third-party registrations: at
+// most MaxThirdParty at the server at a time, which hold a slot only while
+// they are sent, and up to queuedPerServer of them waiting or sent. Each
+// set's go in the order the registrar told of them, so that the server
+// does not hear a registration after the deregistration that followed it,
+// and at most queuedPerSet of a set's are queued, so that one set's
+// refreshes do not take the queue (#379 code review).
+type serverQueue struct {
+	slots  chan struct{}
+	queued int
+	sets   map[string]*setQueue
+}
+
+// setQueue is a set's registrations queued for one server: tail is closed
+// once the last one told of is done.
+type setQueue struct {
+	tail   chan struct{}
+	queued int
+}
+
+// queuedPerServer bounds the registrations queued for a server, as a
+// multiple of MaxThirdParty, which bounds the goroutines that wait for a
+// server that does not answer.
+const queuedPerServer = 4
+
+// queuedPerSet bounds one set's registrations queued for a server, the one
+// under way included: a registration, a refresh and an end, with room for
+// one more.
+const queuedPerSet = 4
 
 // Registered sends the application servers whose criteria take r's
 // REGISTER a third-party REGISTER for it (TS 24.229 §5.4.1.7), off the
-// caller's goroutine. The criteria are read now, from r.Profile or the
-// store: once a set has ended its profile goes. Past MaxThirdParty
-// registrations under way, it is dropped and counted.
+// caller's goroutine, to each server apart. The criteria are read now,
+// from r.Profile or the store: once a set has ended its profile goes. One
+// past a server's or a set's queue (serverQueue), or told of after Wait,
+// is dropped and counted.
 func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistration) {
 	if rt.cfg.Sender == nil {
 		return
@@ -62,39 +89,65 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 	if len(matched) == 0 {
 		return
 	}
-	select {
-	case rt.tp.slots <- struct{}{}:
-	default:
+	r.Request, r.Response = withoutCredentials(r.Request), clonedResponse(r.Response)
+	key := r.Set.IMPI + "\x00" + r.Set.IMPU
+	ctx = context.WithoutCancel(ctx)
+	rt.stop.Lock()
+	defer rt.stop.Unlock()
+	if rt.stopped {
 		rt.count("routing.third_party.dropped")
 		return
 	}
-	r.Request, r.Response = clonedRequest(r.Request), clonedResponse(r.Response)
-	key := r.Set.IMPI + "\x00" + r.Set.IMPU
-	done := make(chan struct{})
-	rt.tp.mu.Lock()
-	prev := rt.tp.tails[key]
-	rt.tp.tails[key] = done
-	rt.tp.mu.Unlock()
-	rt.tp.wg.Add(1)
-	ctx = context.WithoutCancel(ctx)
-	go func() {
-		defer func() {
+	for _, fc := range matched {
+		q, sq, prev, done, ok := rt.enqueue(fc.ApplicationServer.ServerName, key)
+		if !ok {
+			rt.count("routing.third_party.dropped")
+			continue
+		}
+		rt.tp.wg.Add(1)
+		go func() {
+			defer rt.tp.wg.Done()
+			if prev != nil {
+				<-prev
+			}
+			q.slots <- struct{}{}
+			rt.registerWith(ctx, r, fc.ApplicationServer)
+			<-q.slots
 			rt.tp.mu.Lock()
-			if rt.tp.tails[key] == done {
-				delete(rt.tp.tails, key)
+			q.queued--
+			if sq.queued--; sq.queued == 0 {
+				delete(q.sets, key)
 			}
 			rt.tp.mu.Unlock()
 			close(done)
-			<-rt.tp.slots
-			rt.tp.wg.Done()
 		}()
-		if prev != nil {
-			<-prev
-		}
-		for _, fc := range matched {
-			rt.registerWith(ctx, r, fc.ApplicationServer)
-		}
-	}()
+	}
+}
+
+// enqueue queues a registration of the set key for server, and returns its
+// queues, the channel the one before it of the set's closes, nil if none,
+// and the one it closes itself; not ok when either queue is full.
+func (rt *Router) enqueue(server, key string) (q *serverQueue, sq *setQueue, prev, done chan struct{}, ok bool) {
+	rt.tp.mu.Lock()
+	defer rt.tp.mu.Unlock()
+	q = rt.tp.servers[server]
+	if q == nil {
+		q = &serverQueue{slots: make(chan struct{}, rt.cfg.MaxThirdParty), sets: map[string]*setQueue{}}
+		rt.tp.servers[server] = q
+	}
+	sq = q.sets[key]
+	switch {
+	case q.queued >= queuedPerServer*rt.cfg.MaxThirdParty, sq != nil && sq.queued >= queuedPerSet:
+		return nil, nil, nil, nil, false
+	case sq == nil:
+		sq = &setQueue{}
+		q.sets[key] = sq
+	}
+	prev, done = sq.tail, make(chan struct{})
+	sq.tail = done
+	sq.queued++
+	q.queued++
+	return q, sq, prev, done, true
 }
 
 // thirdPartyServices are the criteria of r's identity.
@@ -138,7 +191,8 @@ func (rt *Router) registerWith(ctx context.Context, r registrar.ThirdPartyRegist
 	case err == nil && res.StatusCode < 300:
 		rt.count("routing.third_party.registered")
 		return
-	case err == nil && res.StatusCode != 408 && res.StatusCode < 500:
+	case err == nil && res.StatusCode != 408 && (res.StatusCode < 500 || res.StatusCode >= 600):
+		// A 6xx is the server's answer too, not its silence.
 		rt.count("routing.third_party.refused")
 		return
 	}
@@ -243,11 +297,18 @@ func multipartBody(boundary string, parts [][]byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func clonedRequest(r *sip.Request) *sip.Request {
+// withoutCredentials is a copy of the UE's REGISTER for a server's body,
+// without its Authorization and Proxy-Authorization: the Digest response
+// and nonces would let a server guess a password offline, and no server
+// needs them (#379, lead's decision).
+func withoutCredentials(r *sip.Request) *sip.Request {
 	if r == nil {
 		return nil
 	}
-	return r.Clone()
+	c := r.Clone()
+	c.Header.Del("Authorization")
+	c.Header.Del("Proxy-Authorization")
+	return c
 }
 
 func clonedResponse(r *sip.Response) *sip.Response {

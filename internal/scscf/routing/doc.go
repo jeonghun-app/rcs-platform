@@ -97,19 +97,19 @@
 // rcsjta puts it after the route set of its session refreshes, and the
 // request goes by its Request-URI.
 //
-// The registrar tells the router of every registration, refresh and end of
-// a set (registrar.ThirdParty), and the router sends a third-party REGISTER
-// to each application server whose criterion takes the REGISTER, its
+// The registrar tells the router of every registration, refresh and end of a
+// set (registrar.ThirdParty), and the router sends a third-party REGISTER to
+// each application server whose criterion takes the REGISTER, its
 // RegistrationType included (TS 24.229 §5.4.1.7, TS 29.228 B.2.3): from the
 // S-CSCF, for the user in To, with an Expires that is how long the set stays
-// registered, 0 once it has no binding, and, as the criterion asks, the
-// UE's REGISTER and the 200 for it in the body. An end the network made, a
+// registered, 0 once it has no binding, and, as the criterion asks, the UE's
+// REGISTER and the 200 for it in the body. An end the network made, a
 // sweep's or an RTR's, has no REGISTER to show the criteria or the server:
 // one for the user stands in, and the body is empty. The REGISTERs go off
-// the registrar's goroutine, those of one set in order, at most
-// MaxThirdParty at a time. A server that does not answer is counted, and
-// one whose default handling ends the session only logged: deregistering
-// the user for it waits on a decision (#14).
+// the registrar's goroutine, to each server apart, those of one set in
+// order, at most MaxThirdParty at a server at a time. A server that does not
+// answer is counted, and one whose default handling ends the session only
+// logged: deregistering the user for it waits on a decision (#14).
 //
 // Logs carry no identity or URI.
 package routing

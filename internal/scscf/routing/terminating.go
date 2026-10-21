@@ -194,6 +194,12 @@ func (rt *Router) repair(ctx context.Context, id *state.Identity, set *state.Reg
 	want := *id
 	want.Incarnation = set.Incarnation
 	ctx = context.WithoutCancel(ctx)
+	rt.stop.Lock()
+	defer rt.stop.Unlock()
+	if rt.stopped {
+		// The set's next REGISTER points it.
+		return
+	}
 	rt.repairs.Add(1)
 	go func() {
 		defer rt.repairs.Done()

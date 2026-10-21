@@ -85,8 +85,9 @@ type Config struct {
 	// ThirdPartyTimeout bounds each third-party REGISTER's transaction;
 	// DefaultThirdPartyTimeout when 0.
 	ThirdPartyTimeout time.Duration
-	// MaxThirdParty bounds the third-party registrations under way, past
-	// which one is dropped and counted; DefaultMaxThirdParty when 0.
+	// MaxThirdParty bounds the third-party registrations at one application
+	// server at a time; up to four times as many wait for it, past which
+	// one is dropped and counted. DefaultMaxThirdParty when 0.
 	MaxThirdParty int
 	// RepairTimeout bounds the background repair of an identity's item;
 	// DefaultRepairTimeout when 0.
@@ -170,6 +171,11 @@ type Router struct {
 	repairs sync.WaitGroup
 	svc     services
 	tp      thirdParty
+	// stopped is set by Wait, under stop, which a repair or a third-party
+	// registration takes to be counted in its WaitGroup: none is added
+	// once Wait waits (#379 QA).
+	stop    sync.Mutex
+	stopped bool
 }
 
 // New validates cfg and returns a Router.
@@ -245,8 +251,7 @@ func New(cfg Config) (*Router, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	rt := &Router{cfg: cfg, log: log, ids: sip.IDGenerator{Rand: cfg.Rand}}
-	rt.tp.slots = make(chan struct{}, cfg.MaxThirdParty)
-	rt.tp.tails = map[string]chan struct{}{}
+	rt.tp.servers = map[string]*serverQueue{}
 	return rt, nil
 }
 
@@ -256,9 +261,14 @@ func (noMetrics) Count(string, int64) {}
 
 func (rt *Router) count(name string) { rt.cfg.Metrics.Count(name, 1) }
 
-// Wait returns once the identity repairs and third-party registrations
-// under way are done: for a shutdown, and for tests.
+// Wait stops the Router from starting identity repairs and third-party
+// registrations, and returns once those under way are done: for a
+// shutdown, once the registrar tells it of no more, and for tests.
+// Requests are still routed.
 func (rt *Router) Wait() {
+	rt.stop.Lock()
+	rt.stopped = true
+	rt.stop.Unlock()
 	rt.repairs.Wait()
 	rt.tp.wg.Wait()
 }
