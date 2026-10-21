@@ -94,10 +94,10 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 // removes its identities, its profile if still the one read, and last the
 // record, under the version claimed, as every deregistration does
 // (endSet); a record that changed meanwhile is read again and ended too.
-// Cut short after the claim, it leaves the lease for the sweep to finish. With unregisteredOnly it ends k only as an
-// unregistered user's record, and one that a REGISTER turned into a
-// registration meanwhile has its identities pointed at it again. It reports
-// whether it ended one.
+// Cut short after the claim, it leaves the lease for the sweep to finish.
+// With unregisteredOnly it ends k only as an unregistered user's record,
+// and one that a REGISTER turned into a registration meanwhile has its
+// identities pointed at it again. It reports whether it ended one.
 func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool, cause regevent.Cause) (bool, error) {
 	touched := false
 	for range saveAttempts {
