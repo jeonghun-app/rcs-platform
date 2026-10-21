@@ -365,6 +365,243 @@ func TestALargeModeSessionCarriesItsOneMessage(t *testing.T) {
 	waitDone(t, leg3.Finished())
 }
 
+// #264: a pass that read a large message before its session's leg
+// activated, and asks for its session after, asks for none while the leg
+// makes its attempt, even when the mark the invitation left has run out
+// meanwhile; once the attempt is over and the message is back in the
+// queue, it may ask again at once.
+func TestNoSecondLargeModeSessionIsAskedForWhileOneDelivers(t *testing.T) {
+	const mark = time.Minute
+	for name, wait := range map[string]time.Duration{"within the invitation's mark": 0, "after it ran out": mark} {
+		t.Run(name, func(t *testing.T) {
+			// Retries stay far off, so that only this test asks for sessions.
+			r := newRig(t, Config{PagerLimit: 600, InviteTimeout: mark, RetryInterval: time.Hour})
+			if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+				t.Fatal(err)
+			}
+			inv := r.d.nextInvite(t)
+			waitFor(t, "idle", r.idle)
+			// What the pass read before the leg activated and claimed the
+			// message.
+			ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+			if err != nil || len(ms) != 1 || ms[0].ID != inv.QueueID {
+				t.Fatalf("Pending = %+v, %v", ms, err)
+			}
+			r.clock.Advance(wait)
+			leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+				Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = leg.Close() }) // before the engine closes, which waits for the attempt
+			// Nobody binds the leg, so its attempt waits until the leg closes.
+			if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+				t.Fatal(err)
+			}
+			// QA on #284: once the attempt is under way, so that a mark
+			// deleted as it starts is caught too.
+			waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+			r.e.invite(t.Context(), ms[0])
+			select {
+			case again := <-r.d.invites:
+				t.Fatalf("a second session was asked for: %+v", again)
+			default:
+			}
+			_ = leg.Close()
+			waitDone(t, leg.Finished())
+			r.e.invite(t.Context(), ms[0])
+			if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+				t.Fatalf("invitation %+v", got)
+			}
+		})
+	}
+}
+
+// Code review on #284: the leg deletes the mark it wrote, not a newer one.
+// A registration on a new flow clears the invitations while the leg makes
+// its attempt, and the message is asked for again; the attempt's end must
+// leave that newer invitation's mark, or yet another session is asked for.
+func TestALargeModeLegsEndLeavesANewerInvitationsMark(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600, RetryInterval: time.Hour})
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("Pending = %+v, %v", ms, err)
+	}
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() }) // before the engine closes, which waits for the attempt
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	r.e.UserRegistered(bob, true)
+	r.e.invite(t.Context(), ms[0])
+	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+		t.Fatalf("invitation %+v", got)
+	}
+	waitFor(t, "idle", r.idle)
+	_ = leg.Close()
+	waitDone(t, leg.Finished())
+	r.e.invite(t.Context(), ms[0])
+	select {
+	case again := <-r.d.invites:
+		t.Fatalf("the newer invitation's mark went with the leg: %+v", again)
+	default:
+	}
+}
+
+// releaseSpy is a store that calls onRelease as a message is released.
+type releaseSpy struct {
+	store.Store
+	onRelease func(id string)
+}
+
+func (s releaseSpy) Release(ctx context.Context, recipient, id, owner string) error {
+	s.onRelease(id)
+	return s.Store.Release(ctx, recipient, id, owner)
+}
+
+// QA on #284: a failed attempt's mark goes before its message is back in
+// the queue, so a pass that reads it there asks for its next session at
+// once, rather than finding the mark and waiting for the retry timer.
+func TestAFailedLargeModeAttemptsMarkGoesBeforeItsRelease(t *testing.T) {
+	var r *rig
+	var marked atomic.Int32
+	spy := releaseSpy{Store: store.NewMemory(), onRelease: func(id string) {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		for k := range r.e.invites {
+			if k.id == id {
+				marked.Add(1)
+			}
+		}
+	}}
+	r = newRigWith(t, Config{PagerLimit: 600}, spy, newFakeClock())
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	_ = leg.Close() // the client never binds: the attempt fails
+	waitDone(t, leg.Finished())
+	if r.queued(t, bob) != 1 || marked.Load() != 0 {
+		t.Fatalf("queued %d, the mark still there at the release %d times", r.queued(t, bob), marked.Load())
+	}
+}
+
+// #294 (QA's reproduction): a full pass during a large-mode attempt finds
+// the message claimed, the queue empty, and lets the recipient go with no
+// retry timer. The attempt then fails and releases the message, which
+// must still get its next session: on the retry timer, not only on the
+// next event for the recipient.
+func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600, InviteTimeout: time.Minute})
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	r.e.kickEvent(bob) // any full pass during the attempt
+	waitFor(t, "idle", r.idle)
+	_ = leg.Close() // the client never binds
+	waitDone(t, leg.Finished())
+	if n := r.queued(t, bob); n != 1 {
+		t.Fatalf("queued = %d, want the released message", n)
+	}
+	waitFor(t, "the retry timer", func() bool { return r.clock.armed(DefaultRetryInterval) })
+	// Code review on #284: with the retry timer's backoff, not at once.
+	select {
+	case got := <-r.d.invites:
+		t.Fatalf("asked again before the retry timer: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+	r.clock.Advance(DefaultRetryInterval)
+	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+		t.Fatalf("invitation %+v", got)
+	}
+}
+
+// failLargeAttempt makes one large-mode attempt for bob that fails: the
+// client answers and never binds.
+func failLargeAttempt(t *testing.T, r *rig) {
+	t.Helper()
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	_ = leg.Close()
+	waitDone(t, leg.Finished())
+	waitFor(t, "idle", r.idle)
+}
+
+// Code review on #284: a failed large-mode attempt waits for the retry
+// timer itself, and holds up nothing else for the recipient: a message
+// within the pager limit goes at once (the fake clock stays where it is).
+func TestAPagerMessageGoesAtOnceAfterAFailedLargeModeAttempt(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600})
+	failLargeAttempt(t, r)
+	short := chat(t, "S1", "short", 0)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: short}); err != nil {
+		t.Fatal(err)
+	}
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, short) {
+		t.Fatalf("pager delivery %q", d.CPIM)
+	}
+}
+
+// The same with a chat leg open and bound: alice's chat message goes on it.
+func TestAChatMessageGoesOnItsLegAfterAFailedLargeModeAttempt(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600})
+	l := r.listen(t)
+	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	failLargeAttempt(t, r)
+	msg := chat(t, "C1", "on the open leg", 0)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: msg}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.next(t); !bytes.Equal(got.Body, msg) {
+		t.Fatalf("bob got %q", got.Body)
+	}
+}
+
 // An open chat leg with the sender is no session for a large-mode
 // message, which still gets one of its own: invite looks for an open leg
 // only for the modes that go on one (#260).
