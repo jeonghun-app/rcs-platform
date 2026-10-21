@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -464,7 +465,9 @@ func TestARequestAfterDrainHasAnsweredGetsItsAnswer(t *testing.T) {
 }
 
 // However many answers cannot go out, Drain gives them DrainSendWait in all,
-// not each (QA of #310).
+// not each (QA of #310). The test stands in for that timer (drainTimer): it
+// must be armed once, for DrainSendWait, and Drain must wait for it and
+// return once it fires, which no bound on wall clock decides (#408).
 func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.decide(Decision{Targets: []Target{target("sip:bob@192.0.2.2")}})
@@ -477,10 +480,41 @@ func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 	h.net.stallUpstream = stall
 	h.net.mu.Unlock()
 	t.Cleanup(func() { close(stall) })
-	start := time.Now()
-	<-drainFor(h, 50*time.Millisecond)
-	if took := time.Since(start); took < DrainSendWait || took > DrainSendWait+time.Second {
-		t.Fatalf("Drain returned after %v, want about %v after its 50 ms", took, DrainSendWait)
+	var mu sync.Mutex
+	var armed []time.Duration
+	fire := make(chan time.Time)
+	after := func(d time.Duration) <-chan time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		armed = append(armed, d)
+		return fire
+	}
+	drainTimer.Store(&after)
+	t.Cleanup(func() { drainTimer.Store(nil) })
+	timers := func() []time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(armed)
+	}
+	done := drainFor(h, 50*time.Millisecond)
+	for deadline := time.Now().Add(5 * time.Second); len(timers()) == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("Drain armed no timer for its answers")
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("Drain returned before its DrainSendWait was over, with its answers still queued")
+	default:
+	}
+	close(fire)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return once its DrainSendWait was over")
+	}
+	if got := timers(); len(got) != 1 || got[0] != DrainSendWait {
+		t.Fatalf("Drain armed %v for five answers, want one DrainSendWait (%v) in all", got, DrainSendWait)
 	}
 }
 

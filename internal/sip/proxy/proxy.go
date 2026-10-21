@@ -416,16 +416,27 @@ func (p *Proxy) answerForStop() int {
 		}
 	}
 	deadline := time.Now().Add(drainSendWait)
+	// One timer for all the answers, not one each (QA of #310).
+	expired := time.After(drainSendWait)
+	if f := drainTimer.Load(); f != nil {
+		expired = (*f)(drainSendWait)
+	}
 	for _, ch := range sent {
 		select {
 		case <-ch:
-		case <-time.After(time.Until(deadline)):
+		case <-expired:
 			return int(answered.Load())
 		}
 	}
 	p.flushSender(deadline)
 	return int(answered.Load())
 }
+
+// drainTimer, empty but in tests, stands for time.After in answerForStop's
+// wait, so that a test fires the end of DrainSendWait itself rather than
+// bounding Drain by wall clock (#408). It is atomic since a Drain may
+// outlive the test that set it.
+var drainTimer atomic.Pointer[func(time.Duration) <-chan time.Time]
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
