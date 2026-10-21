@@ -142,7 +142,10 @@ additionally sealed (below).
   user's deregistration does, so that a stop or a store failure at any point
   after leaves it to the sweep (#368); a claim the store fails to save is
   tried again, and then answered DIAMETER_TOO_BUSY, which the HSS sends
-  again (#394). The lease of an RTR that ended the set for good is marked
+  again (#394), as is a store read before the claim that fails for a reason
+  that may pass: the identity, the listing, the record or the profile, with
+  nothing written yet (#422). A read the store refuses as invalid is
+  answered DIAMETER_UNABLE_TO_COMPLY. The lease of an RTR that ended the set for good is marked
   `rejected`, and stays so whatever RTR comes after, so that the sweep's
   NOTIFY says `reason=rejected` as the RTR's would have (#334); the lease
   holds no bindings, so that NOTIFY names no contacts. A store failure or a
