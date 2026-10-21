@@ -216,13 +216,27 @@ func TestFlowIdleTimeoutCanBeShortenedAndTakesEffectAtOnce(t *testing.T) {
 	eventually(t, "an idle timeout", func() bool { return server.Stats().IdleTimeouts == 1 })
 }
 
+// The flow's timeout is lengthened from the handler of its first message,
+// which runs before the reading goroutine starts the idle period that
+// follows the message, so the listener's 300 ms cannot run out first however
+// slow the host is (#299).
 func TestFlowIdleTimeoutCanBeLengthened(t *testing.T) {
-	server, rec := newTransport(t, Config{})
+	rec := make(recorder, 16)
+	var server *Transport
+	server, err := New(Config{}, func(in Inbound) {
+		if req, ok := in.Message.(*sip.Request); ok && req.Method == "REGISTER" && !server.SetFlowIdleTimeout(in.Source.Flow, time.Hour) {
+			t.Error("SetFlowIdleTimeout refused a live flow")
+		}
+		rec.handle(in)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
 	addr := listen(t, server, ListenerConfig{Network: TCP, IdleTimeout: 300 * time.Millisecond})
 	c := dialRaw(t, addr)
 	c.Write([]byte(rawRequest("REGISTER", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bK1")))
 	id := rec.next(t).Source.Flow
-	server.SetFlowIdleTimeout(id, time.Hour)
 	time.Sleep(600 * time.Millisecond) // past the listener's idle timeout
 	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bK2")))
 	if in := rec.next(t); in.Source.Flow != id {
