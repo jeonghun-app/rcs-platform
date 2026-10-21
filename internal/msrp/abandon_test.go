@@ -91,7 +91,8 @@ func (r *abandonRig) firstChunk(t *testing.T) *Message {
 // check at the top of Send's loop). The test holds the session's lock
 // while the first chunk is written: Send takes it (touch) after that write
 // and before it looks at the context again, so the cancel made meanwhile
-// is the one it finds there.
+// is the one it finds there. That order is what the test relies on; a
+// comment at the touch in Send says so.
 func TestASendCancelledBetweenChunksIsAborted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newAbandonRig(t, Config{WriteTimeout: DefaultWriteTimeout}, newRecorder())
@@ -169,11 +170,13 @@ func TestASendCancelledWhileWaitingForRoomForReportsIsAborted(t *testing.T) {
 			t.Fatalf("%d reports waiting for the handler, want 1", n)
 		}
 		b1 := r.firstChunk(t)
+		// Answered, so b1 gives its window place back: what holds B's
+		// second chunk then is the room for reports alone (QA of #400).
+		r.p.respond(t, b1, StatusOK)
 		synctest.Wait() // B's second chunk waits for room for reports
 		cancel()
 		cancelled(t, b)
 		close(h.gate) // the handler takes the reports, which makes room for C
-		r.p.respond(t, b1, StatusOK)
 		r.abortBeforeC(t, b1)
 	})
 }
