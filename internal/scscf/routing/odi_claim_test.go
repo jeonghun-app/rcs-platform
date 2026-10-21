@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -174,5 +175,66 @@ func TestASTimeoutBoundsOnlyTheWaitForTheServer(t *testing.T) {
 	e.profile(t0, criterion(30, rcsAS, method("INVITE"), ifc.SessionContinued))
 	if tg := e.router(nil).Initial(bg, fromUser(t, "INVITE", impu2)).Targets[0]; tg.Timeout != 0 || tg.OnTimeout != nil {
 		t.Errorf("an INVITE's branch has timeout %v, OnTimeout set %v", tg.Timeout, tg.OnTimeout != nil)
+	}
+}
+
+// A copy the server sends back after the timeout took the position is
+// refused 403, and the server may relay that 403 on the branch before the
+// proxy ends it: the default handling still applies, as the timeout's
+// (code review of #443). SESSION_CONTINUED goes on to the next hop,
+// SESSION_TERMINATED answers 504, not the 403.
+func TestTheTimeoutsPositionStandsAgainstTheRelayedLateRefusal(t *testing.T) {
+	for _, handling := range []ifc.DefaultHandling{ifc.SessionContinued, ifc.SessionTerminated} {
+		name := map[ifc.DefaultHandling]string{ifc.SessionContinued: "SESSION_CONTINUED", ifc.SessionTerminated: "SESSION_TERMINATED"}[handling]
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, 0, time.Hour))
+			e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), handling))
+			r := fromUser(t, "OPTIONS", impu2)
+			d := e.router(nil).Initial(bg, r)
+			tg := d.Targets[0]
+			if !tg.OnTimeout(bg) {
+				t.Fatal("the timeout did not apply to a server that had not sent the request back")
+			}
+			late := e.router(nil).Initial(bg, backFrom(t, r, d, 0))
+			if late.Status != 403 {
+				t.Fatalf("the copy sent back after the timeout got %+v, want 403", late)
+			}
+			// The server relays that 403 on its branch.
+			relayed := &sip.Response{StatusCode: 403, Reason: "Forbidden"}
+			more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: tg, Response: relayed})
+			if handling == ifc.SessionContinued {
+				if len(more) != 1 || more[0].Routes[0].URI.Host != "icscf.rcs.local" {
+					t.Fatalf("after the relayed 403 the request went to %v, want on to the I-CSCF", uris(more))
+				}
+				return
+			}
+			if len(more) != 0 {
+				t.Fatalf("SESSION_TERMINATED went on to %v", uris(more))
+			}
+			d.OnFinal(bg, relayed)
+			if relayed.StatusCode != 504 {
+				t.Errorf("the caller gets %d, want the timeout's 504", relayed.StatusCode)
+			}
+		})
+	}
+}
+
+// failingClaims fails every claim of an iFC position, as a throttled store.
+type failingClaims struct{ *state.Memory }
+
+func (failingClaims) ClaimODI(context.Context, string, string, time.Time, time.Time) (string, error) {
+	return "", errors.New("throttled")
+}
+
+// A store that cannot say whether the server sent the request back leaves
+// the timeout to apply, as before #386 (QA of #443).
+func TestTheTimeoutAppliesWhenTheStoreCannotSay(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), ifc.SessionContinued))
+	d := e.router(failingClaims{e.store}).Initial(bg, fromUser(t, "OPTIONS", impu2))
+	if !d.Targets[0].OnTimeout(bg) {
+		t.Error("a store failure kept the branch")
 	}
 }

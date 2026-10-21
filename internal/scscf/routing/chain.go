@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -224,6 +225,8 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 	odi := rt.signODI(pos, requestOf(req), expires)
 	back.Params.Set(odiParam, odi)
 	t := proxy.Target{URI: req.URI, Routes: []sip.Address{{URI: server}, {URI: back}}}
+	// timedOut is set once the timeout has taken the position (OnTimeout).
+	var timedOut atomic.Bool
 	if req.Method != "INVITE" {
 		// An INVITE's branch may ring for long, and Timeout would cancel
 		// it: the server's silence is Timer B's to find (RFC 3261 §17.1.1).
@@ -245,6 +248,7 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 				rt.count("routing.ifc.returned_before_timeout")
 				return false
 			}
+			timedOut.Store(true)
 			return true
 		}
 	}
@@ -254,6 +258,17 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 			return b.Header.Set("P-Served-User", servedUser(pos))
 		},
 		failed: func(ctx context.Context, f proxy.BranchFailure) step {
+			if timedOut.Load() {
+				// The timeout took the position, whatever the branch ended
+				// with meanwhile: a 403 the server relayed for a copy it
+				// sent back after it, refused as late, is no answer of its
+				// own (code review of #443).
+				if handling != ifc.SessionContinued {
+					return answer(504, sip.DefaultReason(504))
+				}
+				rt.count("routing.ifc.default_handling_continued")
+				return rt.next(ctx, req, pos, set, end)
+			}
 			switch {
 			case handling != ifc.SessionContinued || !unanswered(f):
 				return step{}
