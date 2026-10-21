@@ -3,10 +3,16 @@ package sipas
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/resourcelists"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -89,23 +95,25 @@ func (s *Server) refer(ctx context.Context, u *proxy.UAS, ss *session, req *sip.
 		s.refuseGroup(u, req, err)
 		return
 	}
-	s.respondReferred(u, req, ss)
+	w := s.respondReferred(u, req, ss)
 	if remove {
 		s.cfg.Metrics.Count("sip.group.removed", 1)
 		if removed, ok := messaging.UserOf(who[0].Identity, s.cfg.HomeDomain); ok {
 			s.removed(ss.group, removed)
 		}
+		w.finish(200)
 		return
 	}
 	s.cfg.Metrics.Count("sip.group.added", 1)
-	go s.inviteAdded(ss.group, who, ss.conversation, ss.user)
+	go s.inviteAdded(ss.group, who, ss.conversation, ss.user, w)
 }
 
-// respondReferred answers a REFER 202 and, unless it asked for no implicit
-// subscription (RFC 4488 §4), ends that subscription at once with a NOTIFY
-// (RFC 3515 §2.4.4): rcs-as does not follow each invitation for the
-// referrer, who learns of it from the roster.
-func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) {
+// respondReferred answers a REFER 202. Unless it asked for no implicit
+// subscription (RFC 4488 §4), as rcsjta does, the subscription starts with
+// a NOTIFY of "SIP/2.0 100 Trying" (RFC 3515 §2.4.4) and ends with the
+// outcome of what the REFER asked for, which the returned referWatch
+// reports; nil when there is none.
+func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) *referWatch {
 	noSub := strings.EqualFold(strings.TrimSpace(req.Header.Get("Refer-Sub")), "false")
 	ss.mu.Lock()
 	tag := ss.d.LocalTag()
@@ -119,23 +127,122 @@ func (s *Server) respondReferred(u *proxy.UAS, req *sip.Request, ss *session) {
 	}
 	if err != nil {
 		s.cfg.Metrics.Count("sip.respond_failed", 1)
-		return
+		return nil
 	}
 	if noSub {
-		return
+		return nil
 	}
 	cseq, err := req.Header.CSeq()
 	if err != nil {
+		return nil
+	}
+	w := &referWatch{ss: ss, event: sip.Event{Type: "refer"}}
+	w.event.Params.Set("id", strconv.FormatUint(uint64(cseq.Seq), 10))
+	active := sip.SubscriptionState{State: "active"}
+	active.Params.Set("expires", strconv.Itoa(int(referWait/time.Second)))
+	w.send(active, 100)
+	// The outcome may never come, as for an invitation the engine does
+	// not send; the subscription ends all the same.
+	w.timer = s.cfg.Clock.AfterFunc(referWait, func() { w.finish(408) })
+	return w
+}
+
+// referWait bounds a REFER's implicit subscription: longer than the
+// focus's INVITE may ring (RCSAS_ANSWER_TIMEOUT) and be cancelled.
+const referWait = 2 * time.Minute
+
+// referWatch is the implicit subscription of a REFER that added someone
+// (RFC 3515): it ends with a NOTIFY of the outcome of the focus's INVITE.
+type referWatch struct {
+	ss    *session
+	event sip.Event
+	timer msrp.Timer
+	once  sync.Once
+	// key is where watchRefer filed it, "" if nowhere; gone, that it has
+	// ended and is not to be filed. Both are under the Server's mu.
+	key  string
+	gone bool
+}
+
+// send sends a NOTIFY of code as a sipfrag in the referrer's session.
+func (w *referWatch) send(state sip.SubscriptionState, code int) {
+	ss := w.ss
+	frag := fmt.Sprintf("SIP/2.0 %d %s\r\n", code, sip.DefaultReason(code))
+	ss.mu.Lock()
+	if ss.ended {
+		ss.mu.Unlock()
 		return
 	}
-	event := sip.Event{Type: "refer"}
-	event.Params.Set("id", strconv.FormatUint(uint64(cseq.Seq), 10))
-	ss.mu.Lock()
-	notify, err := ss.d.Notify(event, terminated("noresource"), "message/sipfrag", []byte("SIP/2.0 200 OK\r\n"), s.ids)
+	notify, err := ss.d.Notify(w.event, state, "message/sipfrag", []byte(frag), ss.s.ids)
 	next := ss.d.NextHop()
 	ss.mu.Unlock()
 	if err == nil {
-		s.sendInDialog(notify, next)
+		ss.s.sendInDialog(notify, next)
+	}
+}
+
+// finish ends the subscription with code, once; nil does nothing.
+func (w *referWatch) finish(code int) {
+	if w == nil {
+		return
+	}
+	w.once.Do(func() {
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		w.ss.s.unwatchRefer(w)
+		w.ss.s.cfg.Metrics.Count("sip.refer.notified", 1)
+		w.send(terminated("noresource"), code)
+	})
+}
+
+// watchRefer has w told the outcome of the focus's INVITE to who in the
+// group uri (referDone).
+func (s *Server) watchRefer(uri, who string, w *referWatch) {
+	if w == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w.gone {
+		return
+	}
+	k := uri + "\x00" + who
+	w.key = k
+	s.refers[k] = append(s.refers[k], w)
+}
+
+// unwatchRefer forgets w, ended by its bound or told already, so that
+// REFERs whose INVITE never comes are not kept.
+func (s *Server) unwatchRefer(w *referWatch) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.gone = true
+	if w.key == "" {
+		return
+	}
+	ws := slices.DeleteFunc(s.refers[w.key], func(x *referWatch) bool { return x == w })
+	if len(ws) == 0 {
+		delete(s.refers, w.key)
+	} else {
+		s.refers[w.key] = ws
+	}
+	w.key = ""
+}
+
+// referDone tells the REFERs that asked for the focus's INVITE to who in
+// the group uri how it ended.
+func (s *Server) referDone(uri, who string, code int) {
+	if uri == "" {
+		return // a 1-to-1 session: no REFER waits for it
+	}
+	s.mu.Lock()
+	k := uri + "\x00" + who
+	ws := s.refers[k]
+	delete(s.refers, k)
+	s.mu.Unlock()
+	for _, w := range ws {
+		w.finish(code)
 	}
 }
 
@@ -159,12 +266,13 @@ func (s *Server) removed(uri, user string) {
 // inviteAdded has the focus invite those of who that the group now holds
 // invited, as inviteAll does for a new group: someone already joined is
 // left alone.
-func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Conversation, referrer string) {
+func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Conversation, referrer string, w *referWatch) {
 	ctx, cancel := context.WithTimeout(context.Background(), groupTimeout)
 	g, err := s.groups.Get(ctx, uri)
 	cancel()
 	if err != nil {
 		s.cfg.Metrics.Count("sip.group.invite_failed", 1)
+		w.finish(500)
 		return
 	}
 	invited := map[string]bool{}
@@ -173,5 +281,27 @@ func (s *Server) inviteAdded(uri string, who []group.Invitee, conv messaging.Con
 			invited[id] = true
 		}
 	}
+	// A REFER for one person learns how the focus's INVITE ended; one for
+	// a list, or for someone in the group already, learns that the
+	// additions were made.
+	if p, ok := oneInvited(g, invited); ok {
+		s.watchRefer(uri, p, w)
+	} else {
+		w.finish(200)
+	}
 	s.inviteInvited(g, conv, invited, referrer)
+}
+
+// oneInvited is the one participant of only that g holds invited, if only
+// names one.
+func oneInvited(g groupstore.Group, only map[string]bool) (string, bool) {
+	if len(only) != 1 {
+		return "", false
+	}
+	for id := range only {
+		if p, ok := g.Participant(id); ok && p.State == groupstore.Invited {
+			return id, true
+		}
+	}
+	return "", false
 }

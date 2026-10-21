@@ -36,7 +36,7 @@ const cancelWait = 32 * time.Second
 // before its leg is put to work. A 603 Decline is the participant leaving
 // (declined), and goes to no InviteFailed.
 func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
-	if inv.Mode == store.Group && s.groups == nil {
+	if inv.Mode == store.Group && (s.groups == nil || !s.cfg.GroupChat) {
 		return fmt.Errorf("sipas: no groups: %w", messaging.ErrUndeliverable)
 	}
 	ss := &session{s: s, user: inv.Recipient, mode: inv.Mode, inv: inv}
@@ -152,12 +152,14 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 	case err != nil:
 		ss.final = true
 		s.cfg.Metrics.Count("sip.invite.timeout", 1)
+		go s.referDone(ss.group, ss.user, 408)
 		go ss.fail(fmt.Errorf("sipas: invite: %w", messaging.ErrOffline))
 	case res.StatusCode < 200:
 	case res.StatusCode >= 300:
 		if !ss.final {
 			ss.final = true
 			s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.%d", res.StatusCode), 1)
+			go s.referDone(ss.group, ss.user, res.StatusCode)
 			if ss.group != "" && res.StatusCode == 603 {
 				go ss.declined()
 				return
@@ -262,10 +264,14 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	}
 	if err != nil {
 		s.cfg.Metrics.Count("sip.invite.unusable_answer", 1)
+		// The participant answered, but has no session: for a REFER, the
+		// addition did not come about.
+		s.referDone(ss.group, ss.user, 488)
 		s.engine.InviteFailed(ss.inv, err)
 		ss.bye(reason)
 		return
 	}
+	s.referDone(ss.group, ss.user, 200)
 	s.cfg.Metrics.Count("sip.invite.accepted", 1)
 	ss.arm()
 	ss.watch(nil)

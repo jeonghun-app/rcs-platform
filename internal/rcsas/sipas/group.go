@@ -3,6 +3,7 @@ package sipas
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ type Groups interface {
 	Add(ctx context.Context, uri, by string, who []group.Invitee) error
 	Remove(ctx context.Context, uri, by, who string) error
 	Roster(ctx context.Context, uri, who string) ([]byte, uint32, error)
+	FullRoster(ctx context.Context, uri string) (groupstore.Group, []byte, error)
 	Get(ctx context.Context, uri string) (groupstore.Group, error)
 	Established(ctx context.Context, uri string) error
 }
@@ -45,7 +47,18 @@ const groupTimeout = 5 * time.Second
 // case (RFC 3261 §19.1.4).
 func (s *Server) isFactory(u sip.URI) bool {
 	f := s.cfg.ConferenceFactory
-	return u.IsSIP() && u.User == f.User && sameHost(u.Host, f.Host)
+	return u.IsSIP() && sameUser(u.User, f.User) && sameHost(u.Host, f.Host)
+}
+
+// sameUser compares two user parts as the one user they name: with their
+// escapes undone and without case, so that sip:conf%2Dfactory@<domain> or
+// sip:CONF-FACTORY@<domain> is the factory too, and cannot take a group's
+// request onto the 1-to-1 path (security review on #340). An escape that
+// does not decode names no factory.
+func sameUser(a, b string) bool {
+	ua, err1 := url.PathUnescape(a)
+	ub, err2 := url.PathUnescape(b)
+	return err1 == nil && err2 == nil && strings.EqualFold(ua, ub)
 }
 
 // atConference reports whether u is at the conference host, where every
@@ -142,6 +155,12 @@ func (s *Server) invitees(entries []resourcelists.Entry) []group.Invitee {
 // that creates the group or joins it, or a SUBSCRIBE to its conference
 // event package. A REFER is taken in the referrer's session (refer).
 func (s *Server) routeGroup(r *proxy.Request) proxy.Decision {
+	if !s.cfg.GroupChat {
+		// Off (RCSAS_GROUP_CHAT_ENABLED): nothing is created, and the
+		// request is not taken for a 1-to-1 one either.
+		s.cfg.Metrics.Count("sip.group.disabled", 1)
+		return proxy.Decision{Status: 404}
+	}
 	switch r.Message.Method {
 	case "INVITE":
 		return proxy.Decision{Serve: s.groupInvite}

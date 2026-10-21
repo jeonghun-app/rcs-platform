@@ -432,16 +432,27 @@ func (s *Server) close() {
 	// task (RFC 6665 §4.1.3, deactivated).
 	for _, sub := range subs {
 		wg.Go(func() {
-			sub.mu.Lock()
-			var done <-chan struct{} = closedChan
-			if !sub.ended {
-				done = sub.end(reasonDeactivated)
-			}
-			sub.mu.Unlock()
 			ctx, cancel := context.WithTimeout(context.Background(), wait)
 			defer cancel()
+			// The lock may be held by a SUBSCRIBE reading the roster from
+			// a slow store: taking it counts against the bound too (QA
+			// on #340).
+			ended := make(chan (<-chan struct{}), 1)
+			go func() {
+				sub.mu.Lock()
+				var done <-chan struct{} = closedChan
+				if !sub.ended {
+					done = sub.end(reasonDeactivated)
+				}
+				sub.mu.Unlock()
+				ended <- done
+			}()
 			select {
-			case <-done:
+			case done := <-ended:
+				select {
+				case <-done:
+				case <-ctx.Done():
+				}
 			case <-ctx.Done():
 			}
 		})

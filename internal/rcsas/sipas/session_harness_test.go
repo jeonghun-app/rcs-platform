@@ -50,6 +50,8 @@ type countingGroups struct {
 	groupstore.Store
 	gets        atomic.Int64
 	failUpdates atomic.Int64
+	// getHook, when set, is called before each read.
+	getHook atomic.Pointer[func()]
 }
 
 var errFakeStore = errors.New("fake: the store failed")
@@ -63,6 +65,9 @@ func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, token s
 
 func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {
 	c.gets.Add(1)
+	if h := c.getHook.Load(); h != nil {
+		(*h)()
+	}
 	return c.Store.Get(ctx, uri, now)
 }
 
@@ -334,9 +339,14 @@ func offered(t *testing.T, req *sip.Request) (msrp.URI, sdp.Setup) {
 type counter struct {
 	mu sync.Mutex
 	n  map[string]int64
+	// hook, when set, is called with each name first.
+	hook atomic.Pointer[func(string)]
 }
 
 func (c *counter) Count(name string, n int64) {
+	if h := c.hook.Load(); h != nil {
+		(*h)(name)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.n[name] += n

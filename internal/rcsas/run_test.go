@@ -398,7 +398,7 @@ func (nopHandler) HandleReport(*msrp.Session, msrp.Report)          {}
 // focus invites bob through the core from it.
 func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 	core := newCoreStub(t)
-	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCSAS_MSRP_HOST", "127.0.0.1",
+	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCSAS_MSRP_HOST", "127.0.0.1", "RCSAS_GROUP_CHAT_ENABLED", "true",
 		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
 	if err != nil {
 		t.Fatal(err)

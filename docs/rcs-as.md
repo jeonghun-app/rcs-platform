@@ -333,7 +333,11 @@ In every session:
   those waiting for an answer included. A user's sessions are bounded each way
   apart: those it opens (`RCSAS_MAX_OUTGOING_SESSIONS_PER_USER`, 486 past it),
   and those rcs-as opens to it (`RCSAS_MAX_INCOMING_SESSIONS_PER_USER`), so
-  that other users' messages cannot take the user's own room. One sender has
+  that other users' messages cannot take the user's own room. A user's
+  subscriptions to group rosters are bounded across its groups
+  (`RCSAS_MAX_SUBSCRIPTIONS_PER_USER`, 486 past it), so that one account in
+  many groups cannot take the task's room for subscriptions, which
+  `RCSAS_MAX_SESSIONS` bounds too, from everyone else. One sender has
   at most one large-mode session open to one recipient at a time; the next
   message waits for it. A session rcs-as cannot start for a bound waits as for
   a recipient offline.
@@ -552,10 +556,19 @@ that the conference factory URI reaches. Each group has a conference URI of its
 own, `sip:chat-<32 hex digits>@RCSAS_CONFERENCE_HOST` (made from its Contribution-ID, or random without one), and every participant
 has a session with it: a leg of mode `group` whose peer is that URI.
 
+Group chat is off unless `RCSAS_GROUP_CHAT_ENABLED=true`. While it is off, a
+request to the conference factory or to a URI at the conference host is
+answered 404 (`sip.group.disabled`), before anything is read or created; it is
+not taken for a 1-to-1 request either. Turn it on with rcs-as on a single task
+until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) (see
+below).
+
 How the SIP layer serves it:
 
 - **Create.** A client's INVITE to the conference factory
-  (`RCSAS_CONFERENCE_FACTORY_URI`, the `ConfFctyURI` ACS provisions) may
+  (`RCSAS_CONFERENCE_FACTORY_URI`, the `ConfFctyURI` ACS provisions, its
+  user part compared with escapes undone and without case, its host without
+  case or a trailing dot) may
   carry `Require: recipient-list-invite`, as rcsjta's does, which rcs-as
   supports; it carries a `multipart/mixed` body of its SDP and
   a resource list (RFC 5366, RFC 4826), which `internal/resourcelists` reads
@@ -637,9 +650,15 @@ How the SIP layer serves it:
   may subscribe (403), to a group that exists (404); another event package is
   489 with `Allow-Events: conference`, and an `Accept` without
   `application/conference-info+xml` 406. A participant holds at most 4
-  subscriptions to one group (486 beyond), and a task at most
-  `RCSAS_MAX_SESSIONS` (500 with `Retry-After`). A NOTIFY that is refused or
-  not answered ends the subscription without another (RFC 6665 §4.2.2). On
+  subscriptions to one group and `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` across
+  its groups (486 beyond either), and a task at most `RCSAS_MAX_SESSIONS`
+  (500 with `Retry-After`). A NOTIFY that times out, or is answered 404, 405,
+  410, 416, 480 to 485, 489, 501 or 604 (RFC 6665 §4.2.2) or 430 (RFC 5626),
+  ends the subscription without another. Any other failure, as a 503 from a
+  busy proxy, keeps it (`sip.subscription.stale`): the subscriber missed a
+  document, so the next change sends the full roster, and its refresh is
+  answered as usual. A participant who leaves, declines or is removed gets
+  the change that says so, and its subscriptions end with it. On
   shutdown each subscription ends with `reason=deactivated`, so that the
   subscriber may subscribe again at once, to another task. Subscriptions are
   kept in the task's memory only, as groups are single-task.
@@ -653,9 +672,14 @@ How the SIP layer serves it:
   §5.11), which only the chairman may: the removed participant's sessions with
   the group get a BYE and its subscriptions end. With `Refer-Sub: false` (RFC
   4488), as rcsjta sends, the 202 says so and there is no implicit
-  subscription; without it, one NOTIFY (`Event: refer`, terminated,
-  `message/sipfrag`) ends it at once, as rcs-as does not follow each
-  invitation for the referrer, who sees it in the roster. A REFER outside a
+  subscription. Without it, the subscription (`Event: refer`,
+  `message/sipfrag`, RFC 3515 §2.4.4) starts with `SIP/2.0 100 Trying` and
+  ends with the outcome: for a REFER that adds one person not yet in the
+  group, the focus's INVITE's (`200 OK` once it is answered 2xx and the
+  session is up, else its final code, `408` if it got none); for a removal,
+  a list, or someone in the group already, `200 OK` once the group has
+  changed. One that hears nothing for 2 minutes ends with `408`, as for
+  someone invited already whom the focus does not ring again. A REFER outside a
   session, or in a 1-to-1 one, is 405.
 - Other answers: 403 for a rate limit or a group too large, 400 for a request
   the group cannot take (nobody else in the list), 500 with `Retry-After: 1`
@@ -948,6 +972,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
 | `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` | `32` | Sessions one user opens on this task; an INVITE beyond it is answered 486 |
 | `RCSAS_MAX_INCOMING_SESSIONS_PER_USER` | `32` | Sessions rcs-as opens to one user on this task; a delivery beyond it waits |
+| `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` | `32` | Subscriptions to group rosters one user holds on this task, across its groups; a SUBSCRIBE beyond it is answered 486 |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
@@ -971,7 +996,8 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
 | `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as`, and must not be `RCS_IMS_DOMAIN`, whose users' requests would all be taken for a group's |
-| `RCSAS_CONFERENCE_FACTORY_URI` | `sip:conf-factory@<RCS_IMS_DOMAIN>` | Where clients create group chats: the `ConfFctyURI` ACS provisions. A SIP URI with a user; its user is compared exactly, its host without case |
+| `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404. Turn it on with a single rcs-as task until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) |
+| `RCSAS_CONFERENCE_FACTORY_URI` | `sip:conf-factory@<RCS_IMS_DOMAIN>` | Where clients create group chats: the `ConfFctyURI` ACS provisions. A SIP URI with a user; its user is compared with escapes undone and without case, its host without case |
 | `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
 | `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200. Former participants are kept up to the same number, fewer above 104, so that the roster stays within 256 KiB (see [Roster events](#roster-events)) |
 | `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
@@ -1137,8 +1163,9 @@ identifier ever appears in a metric name.
 | `sip.group.created`, `sip.group.joined`, `sip.group.refused`, `sip.group.offer_refused`, `sip.group.service_refused`, `sip.group.list_too_long`, `sip.group.list_refused` | Clients' INVITEs to a group: groups created, joins, refusals by the group, and refusals for the offer (488), the service (403), a resource list too long (403) or unreadable (400) |
 | `sip.group.declined`, `sip.group.left`, `sip.group.leave_failed`, `sip.group.join_refused` | Participants who left by a 603 to the focus's INVITE or by a BYE that says so, Leaves that failed, and 2xx answers to the focus whose Join the group refused |
 | `sip.group.added`, `sip.group.removed`, `sip.group.invite_failed` | REFERs that added or removed, and additions whose invitations could not be sent for want of the group |
-| `sip.subscription.started`, `sip.subscription.refreshed`, `sip.subscription.fetched`, `sip.subscription.expired`, `sip.subscription.ended.<reason>`, `sip.subscription.bad_event`, `sip.subscription.task_limit`, `sip.subscription.user_limit` | Subscriptions to the conference event package, by what became of them |
-| `sip.subscription.notified`, `sip.subscription.notify_failed`, `sip.subscription.notify_unsent`, `sip.subscription.resynced`, `sip.subscription.roster_failed` | NOTIFYs sent, refused or unanswered (which end their subscription), not built, full rosters sent for a gap, and rosters that could not be read for one |
+| `sip.subscription.started`, `sip.subscription.refreshed`, `sip.subscription.fetched`, `sip.subscription.expired`, `sip.subscription.ended.<reason>`, `sip.subscription.bad_event`, `sip.subscription.task_limit`, `sip.subscription.user_limit` | Subscriptions to the conference event package, by what became of them; `user_limit` counts those refused for a participant's 4 in one group and for `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` |
+| `sip.subscription.notified`, `sip.subscription.notify_failed`, `sip.subscription.stale`, `sip.subscription.notify_unsent`, `sip.subscription.resynced`, `sip.subscription.roster_failed` | NOTIFYs sent, refused or unanswered, refused for a passing reason (whose subscription stands, to get the full roster next), not built, full rosters sent for a gap or after a failure, and rosters that could not be read for one |
+| `sip.group.disabled`, `sip.refer.notified` | Requests to the factory or a conference URI answered 404 while `RCSAS_GROUP_CHAT_ENABLED` is off; REFER subscriptions ended with their outcome |
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
 | `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |
@@ -1287,8 +1314,9 @@ Signals to alarm on (Phase 7):
   message written on one task would invite participants whose session is on
   another instead of delivering to it, and a roster change would reach only
   the subscriptions of the task that made it. #121 anchors each group's focus
-  on one task (an owner lease, ADR 0005 amendment); until then, deploy
-  rcs-as with group chat on a single task.
+  on one task (an owner lease, ADR 0005 amendment); until then, turn
+  `RCSAS_GROUP_CHAT_ENABLED` on only with rcs-as on a single task. It is off
+  by default.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;

@@ -113,6 +113,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Resolver: resolver, MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions,
 		MaxOutgoingPerUser: cfg.MaxOutgoingPerUser, MaxIncomingPerUser: cfg.MaxIncomingPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
 		ConferenceFactory: cfg.ConferenceFactory, ConferenceHost: cfg.Group.ConferenceHost, MaxGroupParticipants: cfg.Group.MaxParticipants,
+		GroupChat: cfg.GroupChat, MaxSubscriptionsPerUser: cfg.MaxSubscriptionsPerUser,
 	})
 	if err != nil {
 		return err

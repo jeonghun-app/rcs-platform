@@ -3,6 +3,7 @@ package sipas
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,9 +12,11 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/dialog"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
 // conferenceEvent is the conference event package (RFC 4575 §3).
@@ -26,6 +29,12 @@ const (
 	maxSubscriptionExpires = 3600
 	minSubscriptionExpires = 60
 )
+
+// DefaultMaxSubscriptionsPerUser bounds the subscriptions one user holds
+// on a task across all its groups, so that one account cannot take the
+// task's whole share (Config.MaxSessions) from everyone else (security
+// review on #340): a user in many groups subscribes once in each.
+const DefaultMaxSubscriptionsPerUser = 32
 
 // MaxSubscriptionsPerParticipant bounds the subscriptions one participant
 // holds to one group: one per device it is signed in on, a few at most.
@@ -62,9 +71,15 @@ type subscription struct {
 	// version is the roster version the subscriber has, from the last
 	// NOTIFY: a change at or below it is in what it has already.
 	version uint32
+	// stale is set when a NOTIFY failed but the subscription stands: the
+	// subscriber lacks a document, and the next change sends it all.
+	stale   bool
 	expires time.Time
 	timer   msrp.Timer
-	ended   bool
+	// armed counts arm's calls, so that a timer superseded by a refresh
+	// that ran first knows it.
+	armed uint64
+	ended bool
 }
 
 func (sub *subscription) key() string { return sub.group + "\x00" + sub.user }
@@ -80,15 +95,21 @@ func (s *Server) addSubscription(sub *subscription) error {
 	switch {
 	case s.closed:
 		return errClosing
-	case len(s.subs) >= s.cfg.MaxSessions:
-		s.cfg.Metrics.Count("sip.subscription.task_limit", 1)
-		return errTooManySubscriptions
 	case s.subsOf[sub.key()] >= MaxSubscriptionsPerParticipant:
 		s.cfg.Metrics.Count("sip.subscription.user_limit", 1)
 		return errUserSessions
+	case s.subsOf[sub.user] >= s.cfg.MaxSubscriptionsPerUser:
+		// Before the task's bound, so that a user who filled the task
+		// hears it is its own bound (security review on #340).
+		s.cfg.Metrics.Count("sip.subscription.user_limit", 1)
+		return errUserSessions
+	case len(s.subs) >= s.cfg.MaxSessions:
+		s.cfg.Metrics.Count("sip.subscription.task_limit", 1)
+		return errTooManySubscriptions
 	}
 	s.subs[sub.d.ID()] = sub
 	s.subsOf[sub.key()]++
+	s.subsOf[sub.user]++
 	if s.groupSubs[sub.group] == nil {
 		s.groupSubs[sub.group] = map[*subscription]bool{}
 	}
@@ -103,8 +124,10 @@ func (s *Server) removeSubscription(sub *subscription) {
 		return
 	}
 	delete(s.subs, sub.d.ID())
-	if s.subsOf[sub.key()]--; s.subsOf[sub.key()] <= 0 {
-		delete(s.subsOf, sub.key())
+	for _, k := range []string{sub.key(), sub.user} {
+		if s.subsOf[k]--; s.subsOf[k] <= 0 {
+			delete(s.subsOf, k)
+		}
 	}
 	delete(s.groupSubs[sub.group], sub)
 	if len(s.groupSubs[sub.group]) == 0 {
@@ -231,7 +254,9 @@ func (s *Server) groupSubscribe(ctx context.Context, u *proxy.UAS) {
 			return
 		}
 	}
-	doc, version, err := s.groups.Roster(ctx, uri, who)
+	rctx, cancel := context.WithTimeout(ctx, groupTimeout)
+	doc, version, err := s.groups.Roster(rctx, uri, who)
+	cancel()
 	if err != nil {
 		if expires > 0 {
 			sub.ended = true
@@ -311,7 +336,9 @@ func (s *Server) resubscribe(ctx context.Context, u *proxy.UAS, sub *subscriptio
 		sub.end(reasonTimeout)
 		return
 	}
-	doc, version, err := s.groups.Roster(ctx, sub.group, sub.user)
+	rctx, cancel := context.WithTimeout(ctx, groupTimeout)
+	doc, version, err := s.groups.Roster(rctx, sub.group, sub.user)
+	cancel()
 	if err != nil {
 		s.refuseGroup(u, req, err)
 		if errors.Is(err, group.ErrNotParticipant) || errors.Is(err, group.ErrNoGroup) {
@@ -344,34 +371,67 @@ func (s *Server) respondExpires(u *proxy.UAS, req *sip.Request, sub *subscriptio
 // gets the change in a NOTIFY, unless it has it already. One that would
 // see a gap in the versions, as when two changes race to it, gets the full
 // roster instead, so that no subscriber is left to find the gap itself.
+//
+// The subscriptions that need the full roster share one read of the group
+// per change (code review on #340). A subscription whose subscriber the
+// change took out of the group (RosterUpdate.Departed) ends with it, under
+// the same lock, so that it gets no later change.
 func (s *Server) RosterChanged(ctx context.Context, up group.RosterUpdate) {
+	full := &sharedRoster{s: s, uri: up.Group}
 	for _, sub := range s.subscriptionsOf(up.Group, "") {
-		sub.changed(ctx, up)
+		sub.changed(ctx, up, full)
 	}
 }
 
-func (sub *subscription) changed(ctx context.Context, up group.RosterUpdate) {
+// sharedRoster reads a group's full roster once, for every subscription
+// of one change that needs it.
+type sharedRoster struct {
+	s    *Server
+	uri  string
+	read bool
+	g    groupstore.Group
+	doc  []byte
+	err  error
+}
+
+func (r *sharedRoster) get(ctx context.Context) (groupstore.Group, []byte, error) {
+	if !r.read {
+		r.read = true
+		rctx, cancel := context.WithTimeout(ctx, groupTimeout)
+		r.g, r.doc, r.err = r.s.groups.FullRoster(rctx, r.uri)
+		cancel()
+	}
+	return r.g, r.doc, r.err
+}
+
+func (sub *subscription) changed(ctx context.Context, up group.RosterUpdate, full *sharedRoster) {
 	sub.mu.Lock()
 	defer sub.mu.Unlock()
 	switch {
-	case sub.ended || up.Version <= sub.version:
-	case up.Full || up.Version == sub.version+1:
+	case sub.ended || up.Version <= sub.version && !sub.stale:
+	case !sub.stale && (up.Full || up.Version == sub.version+1):
 		sub.version = up.Version
 		sub.notify(sub.active(), up.Document)
 	default:
-		doc, version, err := sub.s.groups.Roster(ctx, sub.group, sub.user)
+		g, doc, err := full.get(ctx)
+		p, member := g.Participant(sub.user)
 		switch {
-		case errors.Is(err, group.ErrNotParticipant) || errors.Is(err, group.ErrNoGroup):
+		case errors.Is(err, group.ErrNoGroup) || err == nil && (!member || !p.State.Active()):
 			sub.end(reasonRejected)
+			return
 		case err != nil:
 			// The next change, or the subscriber's refresh, brings it
 			// up to date.
 			sub.s.cfg.Metrics.Count("sip.subscription.roster_failed", 1)
-		case version > sub.version:
+			return
+		case g.Version > sub.version || sub.stale:
 			sub.s.cfg.Metrics.Count("sip.subscription.resynced", 1)
-			sub.version = version
+			sub.version, sub.stale = g.Version, false
 			sub.notify(sub.active(), doc)
 		}
+	}
+	if !sub.ended && slices.Contains(up.Departed, sub.user) {
+		sub.end(reasonRejected)
 	}
 }
 
@@ -410,10 +470,15 @@ func (sub *subscription) arm(expires uint32) {
 	}
 	d := time.Duration(expires) * time.Second
 	sub.expires = sub.s.cfg.Clock.Now().Add(d)
+	sub.armed++
+	armed := sub.armed
 	sub.timer = sub.s.cfg.Clock.AfterFunc(d, func() {
 		sub.mu.Lock()
 		defer sub.mu.Unlock()
-		if !sub.ended {
+		// A refresh that came while this waited for the lock armed the
+		// subscription again, and this timer no longer counts (code
+		// review on #340).
+		if !sub.ended && sub.armed == armed {
 			sub.s.cfg.Metrics.Count("sip.subscription.expired", 1)
 			sub.end(reasonTimeout)
 		}
@@ -434,9 +499,14 @@ func (sub *subscription) end(reason string) <-chan struct{} {
 }
 
 // notify sends a NOTIFY in the subscription's dialog with state and doc, if
-// any; it needs sub.mu. A NOTIFY that is refused or not answered ends the
-// subscription without another (RFC 6665 §4.2.2): the subscriber is gone,
-// and the next one it makes starts afresh. What it returns is closed once
+// any; it needs sub.mu. A NOTIFY that times out, or that is answered with
+// one of the codes RFC 6665 §4.2.2 says end the subscription, or 430
+// (RFC 5626 §5.3.2, the flow is gone), ends it without another: the
+// subscriber is gone, and the next one it makes starts afresh. Any other
+// failure, a 503 from a proxy whose queue is full say (RFC 5057 Table 1:
+// a complaint about the transaction, not the usage), keeps the
+// subscription, marked stale: the subscriber missed a document, so the
+// next change brings it the full roster. What it returns is closed once
 // the NOTIFY is answered, or was not sent.
 func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan struct{} {
 	contentType := ""
@@ -453,17 +523,33 @@ func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan 
 		if err == nil && res.StatusCode < 300 {
 			return
 		}
+		gone := errors.Is(err, transaction.ErrTimeout) || err == nil && endsSubscription(res.StatusCode)
 		sub.s.cfg.Metrics.Count("sip.subscription.notify_failed", 1)
 		go func() {
 			sub.mu.Lock()
 			defer sub.mu.Unlock()
-			if !sub.ended {
+			switch {
+			case sub.ended:
+			case gone:
 				sub.ended = true
 				if sub.timer != nil {
 					sub.timer.Stop()
 				}
 				sub.s.removeSubscription(sub)
+			default:
+				sub.s.cfg.Metrics.Count("sip.subscription.stale", 1)
+				sub.stale = true
 			}
 		}()
 	})
+}
+
+// endsSubscription reports a final answer to a NOTIFY that ends its
+// subscription: those of RFC 6665 §4.2.2, and 430 (RFC 5626 §5.3.2).
+func endsSubscription(code int) bool {
+	switch code {
+	case 404, 405, 410, 416, 480, 481, 482, 483, 484, 485, 489, 501, 604, 430:
+		return true
+	}
+	return false
 }

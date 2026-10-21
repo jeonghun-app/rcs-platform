@@ -1,8 +1,11 @@
 package sipas
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -464,16 +467,29 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	}
 	g.stateOf(t, g.uri, erin, groupstore.Invited)
 
-	// Without Refer-Sub: false, rcs-as ends the implicit subscription at
-	// once.
+	// Without Refer-Sub: false, the implicit subscription starts with
+	// "100 Trying" (RFC 3515 §2.4.4) and ends with how the focus's INVITE
+	// ended. bob, invited already and rung at the group's creation, gets
+	// no second INVITE, so the subscription ends at its bound.
 	grp, _ := g.groups.Get(t.Context(), g.uri)
 	if res := g.inSession(t, alice, "a1", g.s, 5, "REFER", []string{"Refer-To: <" + bob + ">"}, ""); res.StatusCode != 202 {
 		t.Fatalf("a REFER for bob answered %d", res.StatusCode)
 	}
 	n := g.core.nextOf(t, "NOTIFY")
-	if n.Header.Get("Event") != "refer;id=5" || !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") ||
-		n.Header.Get("Content-Type") != "message/sipfrag" {
-		t.Fatalf("refer NOTIFY Event %q, State %q, Content-Type %q", n.Header.Get("Event"), n.Header.Get("Subscription-State"), n.Header.Get("Content-Type"))
+	if n.Header.Get("Event") != "refer;id=5" || !strings.HasPrefix(n.Header.Get("Subscription-State"), "active") ||
+		n.Header.Get("Content-Type") != "message/sipfrag" || string(n.Body) != "SIP/2.0 100 Trying\r\n" {
+		t.Fatalf("refer NOTIFY Event %q, State %q, Content-Type %q: %q", n.Header.Get("Event"), n.Header.Get("Subscription-State"), n.Header.Get("Content-Type"), n.Body)
+	}
+	g.clock.fire(referWait)
+	n = g.core.nextOf(t, "NOTIFY")
+	if !strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") || string(n.Body) != "SIP/2.0 408 Request Timeout\r\n" {
+		t.Fatalf("refer NOTIFY State %q: %q", n.Header.Get("Subscription-State"), n.Body)
+	}
+	g.a.srv.mu.Lock()
+	waiting := len(g.a.srv.refers)
+	g.a.srv.mu.Unlock()
+	if waiting != 0 {
+		t.Fatalf("%d REFERs kept after their bound", waiting)
 	}
 	// bob, invited already, was left alone.
 	if after, _ := g.groups.Get(t.Context(), g.uri); after.Version != grp.Version {
@@ -584,5 +600,287 @@ func TestCloseWaitsForTheLastNotifysAnswer(t *testing.T) {
 	case <-closed:
 	case <-time.After(waitFor):
 		t.Fatal("Close did not return after the answer")
+	}
+}
+
+// QA on #340: a REFER's implicit subscription ends with the outcome of the
+// focus's INVITE it caused, here the invitee's 486, not a 200 sent before
+// the INVITE went out.
+func TestAReferNotifiesTheInvitesOutcome(t *testing.T) {
+	g := newGroupRig(t, bob)
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	var bodies []string
+	for len(bodies) < 2 {
+		n := g.core.nextOf(t, "NOTIFY")
+		if n.Header.Get("Event") == "refer;id=2" {
+			bodies = append(bodies, n.Header.Get("Subscription-State")+" "+string(n.Body))
+		}
+	}
+	if !strings.HasPrefix(bodies[0], "active") || !strings.HasSuffix(bodies[0], "100 Trying\r\n") ||
+		!strings.HasPrefix(bodies[1], "terminated") || !strings.HasSuffix(bodies[1], "486 Busy Here\r\n") {
+		t.Fatalf("refer NOTIFYs %q", bodies)
+	}
+}
+
+// Code review and QA on #340: Referred-By names whoever sent the REFER,
+// here bob, who is not the group's creator.
+func TestAReferredInviteNamesTheReferrerNotTheCreator(t *testing.T) {
+	g := newGroupRig(t, bob)
+	bs := g.rejoin(t, bob)
+	g.stateOf(t, g.uri, bob, groupstore.Joined)
+	if res := g.inSession(t, bob, "r02", bs, 2, "REFER", []string{"Refer-To: <" + dave + ">", "Refer-Sub: false"}, ""); res.StatusCode != 202 {
+		t.Fatalf("bob's REFER answered %d", res.StatusCode)
+	}
+	if inv := g.core.nextOf(t, "INVITE"); inv.URI.String() != dave || inv.Header.Get("Referred-By") != "<"+bob+">" {
+		t.Fatalf("INVITE %s, Referred-By %q", inv.URI, inv.Header.Get("Referred-By"))
+	}
+}
+
+// Code review on #340: a NOTIFY refused for a passing reason, a 503 from a
+// proxy whose queue is full (RFC 5057), keeps the subscription. The
+// subscriber missed a document, so the next change brings the full roster,
+// and its refresh is answered 200.
+func TestANotifyRefusedForAPassingReasonKeepsTheSubscription(t *testing.T) {
+	g := newGroupRig(t, bob, carol)
+	_, sub := g.subscribe(t, alice, "600")
+	g.nextNotify(t)
+	var refused atomic.Bool
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		code := 200
+		if req.Method == "INVITE" {
+			code = 486
+		}
+		if req.Method == "NOTIFY" && refused.CompareAndSwap(false, true) {
+			code = 503
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		if code == 503 {
+			_ = res.Header.Add("Retry-After", "1")
+		}
+		return []*sip.Response{res}
+	})
+	g.rejoin(t, bob)
+	g.nextNotify(t) // refused
+	waitUntil(t, "the subscription marked stale", func() bool { return g.metrics.get("sip.subscription.stale") == 1 })
+	g.rejoin(t, carol)
+	if n := g.nextNotify(t); n.doc.State != conference.Full {
+		t.Fatalf("after a refused NOTIFY, %s document", n.doc.State)
+	}
+	if res := g.again(t, &sub, "600"); res.StatusCode != 200 {
+		t.Fatalf("refresh answered %d", res.StatusCode)
+	}
+}
+
+// Code review on #340: a refresh that comes as the expiry timer fires, and
+// takes the lock first, keeps the subscription: the timer it replaced no
+// longer ends it.
+func TestARefreshRacingTheExpiryKeepsTheSubscription(t *testing.T) {
+	g := newGroupRig(t, bob)
+	_, sub := g.subscribe(t, alice, "120")
+	g.nextNotify(t)
+	g.clock.mu.Lock()
+	var expiry func()
+	for _, tm := range g.clock.timers {
+		if tm.d == 120*time.Second && !tm.stopped {
+			expiry = tm.f
+		}
+	}
+	g.clock.mu.Unlock()
+	if expiry == nil {
+		t.Fatal("no expiry timer")
+	}
+	if res := g.again(t, &sub, "600"); res.StatusCode != 200 {
+		t.Fatalf("refresh answered %d", res.StatusCode)
+	}
+	g.nextNotify(t)
+	expiry() // fired already, and ran once the refresh let go of the lock
+	g.noNotify(t, "after the replaced timer ran")
+	if res := g.again(t, &sub, "600"); res.StatusCode != 200 {
+		t.Fatalf("a refresh after the replaced timer answered %d", res.StatusCode)
+	}
+}
+
+// QA on #340: a change made between the store write of bob's Leave and the
+// end of his subscriptions never reaches him; his subscription ends with
+// the Leave's own NOTIFY.
+func TestNoNotifyAfterLeaveEvenWithAConcurrentChange(t *testing.T) {
+	g := newGroupRig(t, bob, carol)
+	s := g.rejoin(t, bob)
+	_, bobSub := g.subscribe(t, bob, "600")
+	g.nextNotify(t)
+	var once sync.Once
+	h := func(name string) {
+		if name == "sip.group.left" { // Leave returned, subscriptions not ended yet
+			once.Do(func() { _, _ = g.groups.Join(context.Background(), g.uri, carol, "") })
+		}
+	}
+	g.metrics.hook.Store(&h)
+	defer g.metrics.hook.Store(nil)
+	if res := g.inSession(t, bob, "r02", s, 2, "BYE", []string{"Reason: SIP;cause=200"}, ""); res.StatusCode != 200 {
+		t.Fatalf("bob's BYE answered %d", res.StatusCode)
+	}
+	for {
+		n := g.nextNotify(t)
+		if n.req.Header.Get("Call-ID") != bobSub.callID {
+			continue
+		}
+		if n.state.State == "terminated" {
+			return
+		}
+		if n.doc != nil && n.doc.Users != nil {
+			for _, u := range n.doc.Users.List {
+				if u.Entity == carol {
+					t.Fatalf("bob, who left, heard of carol's join (version %d)", n.doc.Version)
+				}
+			}
+		}
+	}
+}
+
+// QA on #340: Close keeps its bound while a SUBSCRIBE holds its
+// subscription's lock to read the roster from a slow store.
+func TestCloseIsBoundedWhileARosterReadIsHeld(t *testing.T) {
+	g := newGroupRig(t, bob)
+	hold, entered := make(chan struct{}), make(chan struct{}, 1)
+	release := sync.OnceFunc(func() { close(hold) })
+	defer release()
+	t.Cleanup(release)
+	var once sync.Once
+	h := func() { once.Do(func() { entered <- struct{}{}; <-hold }) }
+	g.groupReads.getHook.Store(&h)
+	defer g.groupReads.getHook.Store(nil)
+	go func() {
+		_, _ = g.p.try(msg{method: "SUBSCRIBE", uri: g.uri, from: "<" + alice + ">;tag=sh1", to: "<" + g.uri + ">",
+			fields: []string{"P-Asserted-Identity: <" + alice + ">", "Contact: <sip:" + g.core.l.Addr().String() + ";transport=tcp>", "Event: conference"}})
+	}()
+	<-entered
+	start := time.Now()
+	g.a.srv.Close()
+	if took, bound := time.Since(start), 2*g.a.srv.closeWait(); took > bound+500*time.Millisecond {
+		t.Errorf("Close took %v, documented bound 2*closeWait=%v", took, bound)
+	}
+}
+
+// Security review on #340: one user's subscriptions across all its groups
+// are bounded, so that it cannot take the task's whole share from others:
+// alice past her bound gets 486, and bob still subscribes.
+func TestAUsersSubscriptionsAreBoundedAcrossGroups(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{MaxSubscriptionsPerUser: 2})
+	r.core.setAnswer(func(req *sip.Request) int {
+		if req.Method == "INVITE" {
+			return 486
+		}
+		return 200
+	})
+	p := r.a.dial(t)
+	first, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	m := r.factoryInvite(relayPath(), carol)
+	m.fields[3] = "Contribution-ID: gch4t2"
+	s := answeredBy(t, p.send(m))
+	p.ack(s)
+	contact, _ := sip.ParseAddress(s.res.Header.Get("Contact"))
+	second := contact.URI.String()
+	r.core.nextOf(t, "INVITE")
+	sub := func(uri, who, tag string) int {
+		return p.send(msg{method: "SUBSCRIBE", uri: uri, from: "<" + who + ">;tag=" + tag, to: "<" + uri + ">",
+			fields: []string{"P-Asserted-Identity: <" + who + ">", "Contact: <sip:" + r.core.l.Addr().String() + ";transport=tcp>", "Event: conference"}}).StatusCode
+	}
+	if a, b := sub(first, alice, "u1"), sub(second, alice, "u2"); a != 200 || b != 200 {
+		t.Fatalf("alice's subscriptions answered %d, %d", a, b)
+	}
+	if c := sub(first, alice, "u3"); c != 486 {
+		t.Fatalf("alice's third subscription answered %d", c)
+	}
+	if b := sub(first, bob, "u4"); b != 200 {
+		t.Fatalf("bob's subscription answered %d", b)
+	}
+}
+
+// Security review on #340: the factory is found in any spelling of its
+// user part, escaped or upper case, and of its host, with a trailing dot,
+// so that none of them takes a group's INVITE onto the 1-to-1 path.
+func TestTheFactoryIsFoundInAnySpelling(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(req *sip.Request) int {
+		if req.Method == "INVITE" {
+			return 486
+		}
+		return 200
+	})
+	p := r.a.dial(t)
+	for i, uri := range []string{
+		"sip:conf%2Dfactory@" + domain, "sip:CONF-FACTORY@" + strings.ToUpper(domain), "sip:conf-factory@" + domain + ".",
+		"sip:%63onf-factory@" + domain,
+	} {
+		m := r.factoryInvite(relayPath(), bob)
+		m.uri = uri
+		m.fields[3] = fmt.Sprintf("Contribution-ID: spelled%d", i)
+		s := answeredBy(t, p.send(m))
+		p.ack(s)
+		if c := s.res.Header.Get("Contact"); !strings.Contains(c, ";isfocus") {
+			t.Fatalf("%s: answered as no group, Contact %q", uri, c)
+		}
+		r.core.nextOf(t, "INVITE")
+	}
+}
+
+// Security review on #340: with group chat off (RCSAS_GROUP_CHAT_ENABLED),
+// a request to the factory or a conference URI is 404 and makes nothing;
+// it is not taken for a 1-to-1 chat either.
+func TestGroupChatOffRefusesEveryGroupRequest(t *testing.T) {
+	r := newChatRigWith(t, messaging.Config{}, Config{groupChatOff: true})
+	p := r.a.dial(t)
+	if res := p.send(r.factoryInvite(relayPath(), bob)); res.StatusCode != 404 {
+		t.Fatalf("a factory INVITE answered %d", res.StatusCode)
+	}
+	uri := "sip:chat-" + strings.Repeat("0", 32) + "@" + confHost
+	if res := p.send(r.groupInvite(uri, sdpType, offerSDP(relayPath(), "active"))); res.StatusCode != 404 {
+		t.Fatalf("an INVITE to a conference URI answered %d", res.StatusCode)
+	}
+	if n := r.metrics.get("group.created") + r.metrics.get("leg.opened"); n != 0 {
+		t.Fatalf("%d groups and legs made", n)
+	}
+	if n := r.groupReads.gets.Load(); n != 0 {
+		t.Fatalf("%d store reads", n)
+	}
+}
+
+// Code review on #340: the subscriptions that need the full roster for one
+// change share one read of the group, so that a gap costs the change that
+// made it one read, not one per subscription.
+func TestAGapIsMendedWithOneReadForAllSubscriptions(t *testing.T) {
+	g := newGroupRig(t, bob)
+	for i := range 3 {
+		g.subscribe(t, alice, "600")
+		if n := g.nextNotify(t); i == 2 {
+			before := g.groupReads.gets.Load()
+			// A version none of them can reach from theirs.
+			g.a.srv.RosterChanged(t.Context(), group.RosterUpdate{Group: g.uri, Version: n.doc.Version + 2})
+			if reads := g.groupReads.gets.Load() - before; reads != 1 {
+				t.Fatalf("%d reads of the group for 3 subscriptions", reads)
+			}
+		}
+	}
+}
+
+// A subscription that ends gives its place under
+// RCSAS_MAX_SUBSCRIPTIONS_PER_USER back.
+func TestAnEndedSubscriptionGivesItsPlaceBack(t *testing.T) {
+	g := newGroupRigWith(t, Config{MaxSubscriptionsPerUser: 2}, bob)
+	_, first := g.subscribe(t, alice, "600")
+	g.nextNotify(t)
+	g.subscribe(t, alice, "600")
+	g.nextNotify(t)
+	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 486 {
+		t.Fatalf("a third subscription answered %d", res.StatusCode)
+	}
+	if res := g.again(t, &first, "0"); res.StatusCode != 200 {
+		t.Fatalf("unsubscribing answered %d", res.StatusCode)
+	}
+	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
+		t.Fatalf("a subscription in the place given back answered %d", res.StatusCode)
 	}
 }

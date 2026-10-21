@@ -72,6 +72,16 @@ type Config struct {
 	// reads (RCSAS_GROUP_MAX_PARTICIPANTS); zero is
 	// group.DefaultMaxParticipants.
 	MaxGroupParticipants int
+	// GroupChat turns group chat on (RCSAS_GROUP_CHAT_ENABLED). While it is
+	// off, a request to the conference factory or a conference URI is
+	// answered 404 and creates nothing. Group chat needs rcs-as to run as
+	// one task until #121.
+	GroupChat bool
+	// MaxSubscriptionsPerUser bounds the subscriptions to group rosters
+	// one user holds on this task, across groups
+	// (RCSAS_MAX_SUBSCRIPTIONS_PER_USER); zero is
+	// DefaultMaxSubscriptionsPerUser.
+	MaxSubscriptionsPerUser int
 	// MaxMessageSize is the a=max-size of its SDP; zero leaves it out.
 	MaxMessageSize int
 	// MaxSessions bounds the sessions this task holds (threat model T9).
@@ -95,6 +105,9 @@ type Config struct {
 
 	// closeWait is closeWait unless a test sets it.
 	closeWait time.Duration
+	// groupChatOff keeps GroupChat off in the tests, whose rigs turn it
+	// on wherever they run a group service.
+	groupChatOff bool
 	// Metrics counts events, without identifiers; nil counts nothing.
 	Metrics messaging.Counter
 	// Logger receives operational events, never identities or content; nil
@@ -120,10 +133,14 @@ type Server struct {
 	sessions map[string]*session
 	// subs are the subscriptions to the conference event package by
 	// dialog, groupSubs those of each group, and subsOf how many each
-	// participant holds to each group (subscription.key).
+	// participant holds to each group (subscription.key) and how many
+	// each user holds in all (keyed by the user alone).
 	subs      map[string]*subscription
 	groupSubs map[string]map[*subscription]bool
 	subsOf    map[string]int
+	// refers are the REFERs waiting to hear how the focus's INVITE to
+	// someone in a group ended, by group and invitee (referDone).
+	refers map[string][]*referWatch
 	// perUser counts each user's sessions each way (session.budget),
 	// those still waiting for an answer included; pending counts those for
 	// all users. large holds the user and peer of each large-mode session
@@ -172,6 +189,9 @@ func New(cfg Config) (*Server, error) {
 		// Every user's request would be taken for a group's.
 		return nil, errors.New("sipas: ConferenceHost must not be the home domain")
 	}
+	if cfg.MaxSubscriptionsPerUser <= 0 {
+		cfg.MaxSubscriptionsPerUser = DefaultMaxSubscriptionsPerUser
+	}
 	if cfg.MaxGroupParticipants <= 0 {
 		cfg.MaxGroupParticipants = group.DefaultMaxParticipants
 	}
@@ -201,6 +221,7 @@ func New(cfg Config) (*Server, error) {
 		sessions: map[string]*session{}, perUser: map[string]int{}, large: map[string]bool{},
 		registered: map[string]time.Time{},
 		subs:       map[string]*subscription{}, groupSubs: map[string]map[*subscription]bool{}, subsOf: map[string]int{},
+		refers: map[string][]*referWatch{},
 	}, nil
 }
 
