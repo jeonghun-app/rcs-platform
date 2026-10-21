@@ -66,9 +66,20 @@ func (f *failures) String() string {
 
 // burstGuard bounds a whole burst subtest. A burst takes seconds, and under
 // a CPU quota with busy loops at most about 25 s; this only turns a burst
-// that never ends into a failure with a record of what moved, well inside
-// the package's 10 minute timeout (#254).
+// that never ends into a failure with a record of what moved (#254). Each
+// subtest also takes at most a fifth of the time the package has left
+// (guard), so that the five of them, each failing on its guard, still end
+// inside the package's timeout (code review of #407).
 const burstGuard = 150 * time.Second
+
+// guard is the bound of the burst subtest t.
+func guard(t *testing.T) time.Duration {
+	d, ok := t.Deadline()
+	if !ok {
+		return burstGuard
+	}
+	return min(burstGuard, time.Until(d)/5)
+}
 
 // burstProgress counts what a burst has done: requests handed to the layer,
 // and transactions ended either way.
@@ -81,11 +92,12 @@ func (p *burstProgress) moved() int64 { return p.submitted.Load() + p.final.Load
 // await waits until want transactions have ended and the senders are done.
 // It fails the test, with a record of the last samples, if nothing moves for
 // 2*burstWriteTimeout, the longest a send may wait for room, or if the burst
-// outlasts burstGuard; it then reports false, and the caller stops the
+// outlasts its guard; it then reports false, and the caller stops the
 // burst.
 func (p *burstProgress) await(t *testing.T, want int64, sendersDone <-chan struct{}, stats func() string) bool {
 	t.Helper()
 	start := time.Now()
+	bound := guard(t)
 	last, lastAt := p.moved(), start
 	var samples []string
 	nextSample := start
@@ -113,8 +125,8 @@ func (p *burstProgress) await(t *testing.T, want int64, sendersDone <-chan struc
 		switch {
 		case now.Sub(lastAt) > 2*burstWriteTimeout:
 			why = fmt.Sprintf("nothing moved for %v", now.Sub(lastAt).Round(time.Second))
-		case now.Sub(start) > burstGuard:
-			why = fmt.Sprintf("the burst outlasted %v", burstGuard)
+		case now.Sub(start) > bound:
+			why = fmt.Sprintf("the burst outlasted %v", bound.Round(time.Second))
 		}
 		if why != "" {
 			t.Errorf("%s: submitted=%d final=%d failed=%d of %d; %s\nlast samples:\n%s", why,
@@ -266,6 +278,7 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			if _, err := al.Request(invite("a", 0), transport.Destination{Network: transport.TCP, Addr: baddr}, collect); err != nil {
 				t.Fatal(err)
 			}
+			p.submitted.Add(1)
 			toA := transport.Destination{Flow: (<-btu.first).Flow}
 
 			var wg sync.WaitGroup
