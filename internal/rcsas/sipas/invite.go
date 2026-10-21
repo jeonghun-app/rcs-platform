@@ -21,8 +21,6 @@ import (
 // (RFC 3261 §9.1), after which its transaction is ended.
 const cancelWait = 32 * time.Second
 
-var errGroupNotServed = errors.New("sipas: group sessions are not served yet")
-
 // Invite implements messaging.Deliverer: it starts a terminating session
 // to inv.Recipient and returns once the INVITE is on its way. The INVITE
 // goes to the core as a terminating request, as a pager MESSAGE does (no
@@ -31,11 +29,27 @@ var errGroupNotServed = errors.New("sipas: group sessions are not served yet")
 // pcscf answers for active; any other end of it goes to
 // Engine.InviteFailed. A leg that ends before the INVITE is answered, as
 // one that waited AnswerTimeout does, cancels it.
+//
+// An invitation with Mode store.Group is the focus's INVITE to a
+// participant of the group inv.Peer names: from the conference URI, which
+// the Contact marks as a focus, and answered by a Join of the participant
+// before its leg is put to work. A 603 Decline is the participant leaving
+// (declined), and goes to no InviteFailed.
 func (s *Server) Invite(ctx context.Context, inv messaging.Invitation) error {
-	if inv.Mode == store.Group {
-		return errGroupNotServed
+	if inv.Mode == store.Group && s.groups == nil {
+		return fmt.Errorf("sipas: no groups: %w", messaging.ErrUndeliverable)
+	}
+	if inv.Mode == store.Group && !s.cfg.GroupChat {
+		// Off (RCSAS_GROUP_CHAT_ENABLED): the participant is taken as
+		// offline, so that what is queued for it waits, up to its storage
+		// time, for group chat to be turned on again rather than being
+		// given up (code review on #340).
+		return fmt.Errorf("sipas: group chat is off: %w", messaging.ErrOffline)
 	}
 	ss := &session{s: s, user: inv.Recipient, mode: inv.Mode, inv: inv}
+	if inv.Mode == store.Group {
+		ss.group, ss.conversation = inv.Peer, inv.Conversation
+	}
 	if err := s.reserve(ss); err != nil {
 		return fmt.Errorf("%w: %w", err, messaging.ErrOffline)
 	}
@@ -145,13 +159,19 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 	case err != nil:
 		ss.final = true
 		s.cfg.Metrics.Count("sip.invite.timeout", 1)
+		go s.referDone(ss.group, ss.user, false)
 		go ss.fail(fmt.Errorf("sipas: invite: %w", messaging.ErrOffline))
 	case res.StatusCode < 200:
 	case res.StatusCode >= 300:
 		if !ss.final {
 			ss.final = true
 			s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.%d", res.StatusCode), 1)
-			go ss.fail(pagerOutcome(res.StatusCode))
+			go s.referDone(ss.group, ss.user, false)
+			if ss.group != "" && res.StatusCode == 603 {
+				go ss.declined()
+				return
+			}
+			go ss.fail(inviteOutcome(ss, res.StatusCode))
 		}
 	case ss.d == nil && ss.noDialog:
 		// A retransmission of the 2xx that set up no dialog: the engine
@@ -190,6 +210,7 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 
 // fail ends a session that did not come about, and tells the engine.
 func (ss *session) fail(err error) {
+	ss.s.referDone(ss.group, ss.user, false)
 	ss.s.release(ss)
 	ss.s.engine.InviteFailed(ss.inv, err)
 	ss.end()
@@ -225,6 +246,7 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	if added != nil {
 		// The session cannot be kept: it is ended, and the message waits
 		// for the next one.
+		s.referDone(ss.group, ss.user, false)
 		s.engine.InviteFailed(ss.inv, fmt.Errorf("%w: %w", added, messaging.ErrOffline))
 		ss.bye("")
 		return
@@ -237,17 +259,29 @@ func (s *Server) established(ss *session, res *sip.Response) {
 		// A BYE ended the session meanwhile, and told the engine what
 		// it had to (inDialog): nothing more reaches it.
 		s.cfg.Metrics.Count("sip.invite.ended_early", 1)
+		s.referDone(ss.group, ss.user, false)
 		return
+	}
+	if err == nil && ss.group != "" {
+		// The participant's answer joins it to the group, which may no
+		// longer hold it: it left or was removed meanwhile.
+		if err = ss.joined(); err != nil {
+			s.cfg.Metrics.Count("sip.group.join_refused", 1)
+		}
 	}
 	if err == nil {
 		err = ss.leg.Answer(path)
 	}
 	if err != nil {
 		s.cfg.Metrics.Count("sip.invite.unusable_answer", 1)
+		// The participant answered, but has no session: for a REFER, the
+		// addition did not come about.
+		s.referDone(ss.group, ss.user, false)
 		s.engine.InviteFailed(ss.inv, err)
 		ss.bye(reason)
 		return
 	}
+	s.referDone(ss.group, ss.user, true)
 	s.cfg.Metrics.Count("sip.invite.accepted", 1)
 	ss.arm()
 	ss.watch(nil)
@@ -348,8 +382,12 @@ func (s *Server) inviteRequest(ss *session) (*sip.Request, error) {
 		return nil, fmt.Errorf("sipas: peer: %w", messaging.ErrUndeliverable)
 	}
 	// Marked as rcs-as's own, as a pager MESSAGE is, so that one that
-	// comes back is refused (looped).
+	// comes back is refused (looped); a focus's INVITE is known by its
+	// From instead (fromFocus).
 	tag, err := s.ownTag()
+	if ss.group != "" {
+		tag, err = s.ids.Tag()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -381,15 +419,20 @@ func (s *Server) inviteRequest(ss *session) (*sip.Request, error) {
 		{"To", "<" + inv.Recipient + ">"},
 		{"Call-ID", callID},
 		{"CSeq", "1 INVITE"},
-		{"Contact", sip.Address{URI: s.cfg.Contact}.String() + ";" + ss.contactTag()},
+		{"Contact", ss.inviteContact()},
 		{"P-Asserted-Identity", "<" + inv.Peer + ">"},
 		{"P-Served-User", "<" + inv.Recipient + ">;sescase=term"},
 		{"P-Asserted-Service", icsi},
-		{"Accept-Contact", "*;" + ss.contactTag()},
 		{"Allow", allowed},
 	}
+	// One Accept-Contact per feature tag, so that a contact with either
+	// matches (RFC 3841 §9.2): rcsjta advertises +g.oma.sip-im, a CPM
+	// client the ICSI.
+	for _, tag := range ss.acceptTags() {
+		fields = append(fields, [2]string{"Accept-Contact", "*;" + tag})
+	}
 	for _, h := range [][2]string{{"Conversation-ID", inv.Conversation.ID}, {"Contribution-ID", inv.Conversation.Contribution},
-		{"InReplyTo-Contribution-ID", inv.Conversation.InReplyTo}} {
+		{"InReplyTo-Contribution-ID", inv.Conversation.InReplyTo}, {"Subject", inv.Subject}, {"Referred-By", referredBy(inv)}} {
 		if h[1] != "" {
 			fields = append(fields, h)
 		}
@@ -429,4 +472,28 @@ func (s *Server) offerSDP(ss *session) ([]byte, error) {
 		Times: []sdp.Time{{}}, Media: []sdp.Media{m},
 	}
 	return offer.Marshal()
+}
+
+// referredBy is the Referred-By of a group's INVITE (RFC 3892): who brings
+// the recipient in. rcsjta takes the inviter from it, and failing that
+// from P-Asserted-Identity as a number, which a focus's is not
+// (ChatUtils.getReferredIdentityAsContactId); without either it declines
+// the INVITE (code review on #279).
+func referredBy(inv messaging.Invitation) string {
+	if inv.Mode != store.Group || inv.Referrer == "" {
+		return ""
+	}
+	return "<" + inv.Referrer + ">"
+}
+
+// inviteOutcome is what a final failure to rcs-as's INVITE says, as for a
+// pager MESSAGE (pagerOutcome); for a group's, a 482 too says it will never
+// reach the participant: the INVITE came back to rcs-as (fromFocus), as it
+// does for an invitee at the conference host, every time (security review
+// on #279).
+func inviteOutcome(ss *session, code int) error {
+	if ss.group != "" && code == 482 {
+		return fmt.Errorf("sipas: %d: %w", code, messaging.ErrLooped)
+	}
+	return pagerOutcome(code)
 }

@@ -33,7 +33,7 @@ func (s *Subscription) Marshal() ([]byte, error) {
 	// The parser's document checks, size above all, apply to what is
 	// written too: a profile the S-CSCF would refuse with ErrTooLarge is
 	// better refused when it is provisioned.
-	if err := checkDocument(out); err != nil {
+	if err := document.Check(out); err != nil {
 		return nil, err
 	}
 	return out, nil

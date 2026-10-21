@@ -138,6 +138,12 @@ type Registration struct {
 	// any sweep retries it. A registration without contacts is deleted once
 	// that has succeeded.
 	Deregistering time.Time
+	// Rejected is set on the lease (Deregistering) of a set an RTR ended
+	// for good (PERMANENT_TERMINATION) whose subscribers could not be told
+	// then: the sweep that finishes the deregistration tells them the
+	// registrations were rejected, not that they expired (#334). A
+	// REGISTER's record never has it.
+	Rejected bool
 	// Unregistered is set on the record of an unregistered user, which the
 	// S-CSCF stores after SAR UNREGISTERED_USER (TS 29.228 §6.1.2) so that
 	// later terminating requests reuse the set's profile instead of asking
@@ -357,6 +363,9 @@ func (r *Registration) Validate() error {
 		// with them would be brought back under the claimed incarnation
 		// without counting as a revival (Incarnation).
 		return fmt.Errorf("%w: a record claimed for a deregistration has contacts, or Deregistering is out of range", ErrInvalid)
+	}
+	if r.Rejected && r.Deregistering.IsZero() {
+		return fmt.Errorf("%w: Rejected is set on a record no deregistration holds", ErrInvalid)
 	}
 	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
 		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)

@@ -126,9 +126,10 @@ func TestAnRTRDeletesASetThatChangedSinceItWasRead(t *testing.T) {
 	registered(t, e, e.instance(1), 600, impu1)
 	cs := &changingStore{Memory: e.store}
 	cs.change = func() {
-		// Read by its key: the RTR has deleted the identities already.
+		// Read by its key: the RTR has deleted the identities already, and
+		// a sweep claims the lease it left again meanwhile (#368).
 		r := must(e.store.Registration(bg, set1))(t)
-		r.Contacts[0].Expires = r.Contacts[0].Expires.Add(time.Minute)
+		r.Deregistering = r.Deregistering.Add(time.Minute)
 		must(e.store.SaveRegistration(bg, r))(t)
 	}
 	g := e.instance(2, func(c *Config) { c.Store = cs })
@@ -386,7 +387,10 @@ func TestARemoveSCSCFThatARegisterOvertakesLeavesTheSetPointedAt(t *testing.T) {
 	cs.change = func() {
 		// The REGISTER pointed the identities before the RTR deleted them.
 		r := must(e.store.Registration(bg, set1))(t)
-		r.Unregistered = time.Time{}
+		// The RTR's lease is taken over as a REGISTER takes one: a new
+		// incarnation, no lease (#368).
+		r.Unregistered, r.Deregistering, r.Rejected = time.Time{}, time.Time{}, false
+		r.Incarnation++
 		r.Contacts = []state.Contact{{URI: "sip:ue1@192.0.2.10:5060;transport=tcp", CallID: "c", CSeq: 1, Expires: t0.Add(time.Hour)}}
 		must(e.store.SaveRegistration(bg, r))(t)
 	}
@@ -423,7 +427,10 @@ func TestARemoveSCSCFThatARegisterOvertakesKeepsTheRegistersProfile(t *testing.T
 		// registration.
 		must(0, e.store.SaveProfile(bg, &state.Profile{Key: set1, UserData: userDataOf(impi1, nil, impu1, tel1), Received: e.clock.Now(), KeepUntil: t0.Add(26 * time.Hour)}))(t)
 		r := must(e.store.Registration(bg, set1))(t)
-		r.Unregistered = time.Time{}
+		// The RTR's lease is taken over as a REGISTER takes one: a new
+		// incarnation, no lease (#368).
+		r.Unregistered, r.Deregistering, r.Rejected = time.Time{}, time.Time{}, false
+		r.Incarnation++
 		r.Contacts = []state.Contact{{URI: "sip:ue1@192.0.2.10:5060;transport=tcp", CallID: "c", CSeq: 1, Expires: t0.Add(time.Hour)}}
 		must(e.store.SaveRegistration(bg, r))(t)
 	}

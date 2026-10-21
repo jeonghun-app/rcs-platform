@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,17 +56,11 @@ func TestReassemblyMemoryFollowsReceivedOctetsNotDeclaredRanges(t *testing.T) {
 	}
 }
 
-// fastest runs f three times and returns its shortest time: other work on
-// the host can only lengthen a run, so the shortest is the closest to f's
-// own cost.
-func fastest(f func()) time.Duration {
-	best := time.Duration(1<<63 - 1)
-	for range 3 {
-		start := time.Now()
-		f()
-		best = min(best, time.Since(start))
-	}
-	return best
+// timed returns how long f takes.
+func timed(f func()) time.Duration {
+	start := time.Now()
+	f()
+	return time.Since(start)
 }
 
 func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
@@ -87,7 +82,7 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	}
 	refused, maxHeld := 0, int64(0)
 	var n uint64
-	spreadTime := fastest(func() {
+	spreadRun := func() {
 		r := Reassembler{MaxSize: size}
 		refused, maxHeld = 0, 0
 		n = allocated(func() {
@@ -98,15 +93,36 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 				maxHeld = max(maxHeld, r.Buffered())
 			}
 		})
-	})
-	baseTime := fastest(func() {
+	}
+	inOrderRun := func() {
 		r := Reassembler{MaxSize: size}
 		for _, m := range inOrder {
 			if _, err := r.Add(m, t0); err != nil {
 				t.Fatal(err)
 			}
 		}
-	})
+	}
+	// A spread run costs about two in-order ones (7.7 ms against 3.5 ms
+	// unloaded, QA of #352), and each timing of the yardstick runs four:
+	// the yardstick then lasts about twice the spread, long enough that
+	// load seldom leaves it unthrottled while it stretches the spread
+	// (#232: the best of three 200 ms spread runs against 7 ms in-order
+	// ones made 28.7x). Two runs, which would match the spread, failed
+	// unchanged code 2 times in 100 under the load model, against none for
+	// four in the same slots (QA of #352). The two are timed in turn, so a
+	// burst of load meets both, and the shortest of each is taken, since
+	// other work only adds time.
+	const baseRuns = 4
+	spreadTime, baseTime := time.Duration(1<<63-1), time.Duration(1<<63-1)
+	for range 5 {
+		spreadTime = min(spreadTime, timed(spreadRun))
+		baseTime = min(baseTime, timed(func() {
+			for range baseRuns {
+				inOrderRun()
+			}
+		}))
+	}
+	baseTime /= baseRuns
 	// The 65th gap is refused and the message dropped, so it starts over;
 	// at most one fragment limit's worth is ever held.
 	if refused < chunks/(DefaultMaxFragments+1)-1 || maxHeld > DefaultMaxFragments {
@@ -391,11 +407,16 @@ func TestWhatSessionsHoldBeyondTheirReserveIsBoundedTogether(t *testing.T) {
 
 func TestAStalledPeerIsDisconnectedWithinTheWriteDeadline(t *testing.T) {
 	// Write deadlines are enforced by the operating system in real time,
-	// so this test runs on a short real one.
+	// so this test runs on a short real one. That the write deadline ended
+	// the connection is its error; that the deadline is WriteTimeout is
+	// the one the connection set, read where it sets it. A bound on the
+	// time to the end in wall clock is no part of either, and a loaded host
+	// under -race passed 2 s (#401).
 	const deadline = 100 * time.Millisecond
 	ours, theirs := net.Pipe()
 	defer theirs.Close()
-	c, err := NewActiveConn(ours, Config{Clock: newFakeClock(), WriteTimeout: deadline})
+	nc := &deadlineRecorder{Conn: ours}
+	c, err := NewActiveConn(nc, Config{Clock: newFakeClock(), WriteTimeout: deadline})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,13 +424,44 @@ func TestAStalledPeerIsDisconnectedWithinTheWriteDeadline(t *testing.T) {
 	start := time.Now()
 	go func() { _ = c.Open(context.Background(), s) }() // the peer never reads it
 	waitDone(t, c.Done(), "connection")
-	if elapsed := time.Since(start); elapsed > 20*deadline {
-		t.Fatalf("disconnected after %v", elapsed)
-	}
 	if !errors.Is(c.Err(), os.ErrDeadlineExceeded) {
 		t.Fatalf("Err = %v", c.Err())
 	}
+	// A deadline never comes early.
+	if elapsed := time.Since(start); elapsed < deadline {
+		t.Fatalf("disconnected after %v, before the %v write deadline", elapsed, deadline)
+	}
+	// The deadline is WriteTimeout from when the write began: it was
+	// computed after start and before the call that set it, so it lies
+	// between start+deadline and call+deadline however late either came.
+	set, at := nc.first()
+	if set.IsZero() || set.Before(start.Add(deadline)) || set.After(at.Add(deadline)) {
+		t.Fatalf("write deadline %v, set at %v; want WriteTimeout %v after the write began (start %v)", set, at, deadline, start)
+	}
 	waitDone(t, s.Done(), "session")
+}
+
+// deadlineRecorder records the first write deadline set on its Conn and
+// when it was set.
+type deadlineRecorder struct {
+	net.Conn
+	mu      sync.Mutex
+	set, at time.Time
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	if d.at.IsZero() {
+		d.set, d.at = t, time.Now()
+	}
+	d.mu.Unlock()
+	return d.Conn.SetWriteDeadline(t)
+}
+
+func (d *deadlineRecorder) first() (set, at time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.set, d.at
 }
 
 // discard is a Handler that keeps nothing, for floods.

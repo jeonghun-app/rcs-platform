@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // XMLNamespace is the namespace of notification documents (RFC 5438 §11.1).
@@ -105,13 +106,13 @@ func (n Notification) Time() (time.Time, error) {
 
 func (n Notification) validate() error {
 	switch {
-	case !cpim.IsToken(n.MessageID) || !isXMLText(n.MessageID):
+	case !cpim.IsToken(n.MessageID) || !xmlsafe.IsText(n.MessageID):
 		return fmt.Errorf("%w: message-id is not a token", ErrMalformed)
-	case n.DateTime == "" || len(n.DateTime) > MaxDateTimeLength || !isXMLText(n.DateTime):
+	case n.DateTime == "" || len(n.DateTime) > MaxDateTimeLength || !xmlsafe.IsText(n.DateTime):
 		return fmt.Errorf("%w: datetime missing, too long or not XML text", ErrMalformed)
 	case !isURIText(n.RecipientURI) || !isURIText(n.OriginalRecipientURI):
 		return fmt.Errorf("%w: recipient URI contains white space or invalid characters", ErrMalformed)
-	case !isXMLText(n.Subject):
+	case !xmlsafe.IsText(n.Subject):
 		return fmt.Errorf("%w: subject contains characters XML cannot carry", ErrMalformed)
 	case n.SubjectLang != "" && !isLanguageTag(n.SubjectLang):
 		return fmt.Errorf("%w: subject language is not a language tag", ErrMalformed)
@@ -124,7 +125,7 @@ func (n Notification) validate() error {
 // isURIText reports whether s can be an anyURI value that survives a round
 // trip; empty means absent.
 func isURIText(s string) bool {
-	return isXMLText(s) && !strings.ContainsAny(s, " \t\r\n")
+	return xmlsafe.IsText(s) && !strings.ContainsAny(s, " \t\r\n")
 }
 
 // isLanguageTag checks the xs:language shape: alphanumeric subtags of one to
@@ -152,17 +153,17 @@ func (n Notification) Marshal() ([]byte, error) {
 	}
 	var b bytes.Buffer
 	b.WriteString(xml.Header)
-	w := &xmlWriter{e: xml.NewEncoder(&b)}
+	w := xmlsafe.NewWriter(&b)
 	// The namespace is declared once on the root; encoding/xml would repeat
 	// it on every element if the names carried it.
-	w.start("imdn", xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: XMLNamespace})
-	w.text("message-id", n.MessageID)
-	w.text("datetime", n.DateTime)
+	w.Start("imdn", xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: XMLNamespace})
+	w.Text("message-id", n.MessageID)
+	w.Text("datetime", n.DateTime)
 	if n.RecipientURI != "" {
-		w.text("recipient-uri", n.RecipientURI)
+		w.Text("recipient-uri", n.RecipientURI)
 	}
 	if n.OriginalRecipientURI != "" {
-		w.text("original-recipient-uri", n.OriginalRecipientURI)
+		w.Text("original-recipient-uri", n.OriginalRecipientURI)
 	}
 	// A subject with only a language is valid (§11.1.9) and kept.
 	if n.Subject != "" || n.SubjectLang != "" {
@@ -170,18 +171,18 @@ func (n Notification) Marshal() ([]byte, error) {
 		if n.SubjectLang != "" {
 			attrs = append(attrs, xml.Attr{Name: xml.Name{Space: xmlLangNamespace, Local: "lang"}, Value: n.SubjectLang})
 		}
-		w.start("subject", attrs...)
-		w.chars(n.Subject)
-		w.end("subject")
+		w.Start("subject", attrs...)
+		w.Chars(n.Subject)
+		w.End("subject")
 	}
-	w.start(string(n.Kind))
-	w.start("status")
-	w.start(string(n.Status))
-	w.end(string(n.Status))
-	w.end("status")
-	w.end(string(n.Kind))
-	w.end("imdn")
-	if err := w.close(); err != nil {
+	w.Start(string(n.Kind))
+	w.Start("status")
+	w.Start(string(n.Status))
+	w.End(string(n.Status))
+	w.End("status")
+	w.End(string(n.Kind))
+	w.End("imdn")
+	if err := w.Close(); err != nil {
 		return nil, err
 	}
 	// Never write what ParseNotification would refuse to read.
@@ -224,13 +225,13 @@ type wireStatus struct {
 
 // ParseNotification parses a message/imdn+xml document.
 func ParseNotification(data []byte) (Notification, error) {
-	if err := checkDocument(data); err != nil {
+	if err := document.Check(data); err != nil {
 		return Notification{}, err
 	}
 	var w wireIMDN
-	data = withoutBOM(data)
+	data = xmlsafe.WithoutBOM(data)
 	if err := xml.NewDecoder(bytes.NewReader(data)).Decode(&w); err != nil {
-		return Notification{}, decodeError(err)
+		return Notification{}, document.DecodeError(err)
 	}
 
 	var n Notification

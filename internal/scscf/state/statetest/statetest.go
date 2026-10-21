@@ -87,6 +87,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"ItemsOverTheSizeLimitAreRefusedByEveryBackend", testItemSize},
 		{"BoundaryValuesAreTheSameEverywhere", testBoundaries},
 		{"AFailedDeregistrationIsRetriedAfterTheLease", testSweepRetry},
+		{"ARejectedLeaseKeepsItsMarkThroughTheSweep", testRejectedLease},
 		{"AClaimedSubscriptionKeepsItsGraceFromTheClaim", testTerminatedGrace},
 		{"NotifyCountersStopAtTheirLimit", testCounterLimit},
 		{"ProfilesAreKeptApartFromRegistrations", testProfiles},

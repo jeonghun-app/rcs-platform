@@ -332,10 +332,31 @@ metadata.
     stranger cannot grow a group's stored item past DynamoDB's limit and
     break the group.
 - **Metrics.** None names a group or a participant.
+- **Chat identity.** RCS clients name a group chat by its Contribution-ID
+  (rcsjta's chat ID), which its creator chooses, and would take a new group
+  under a known ID for the old one. So a Contribution-ID names one live
+  group: the conference URI is made from it, and an INVITE to the factory
+  under an ID a live group has is refused (403) unless it is that group's
+  creator trying again before the group is established, which takes up the
+  same group (#279). A participant the chairman removed cannot make a group
+  that its former members' clients would merge into the one it was removed
+  from. An ended group frees its ID. Residual risk: once a group has ended,
+  anyone who knows its Contribution-ID can make a group under it first, and
+  a former member's restart under that ID then gets 403. The conference URI
+  is no secret from anyone who knows the ID, the group's participants; it
+  grants nothing, as every request to it is checked against the roster.
 - **Roster privacy.** The roster keeps former participants (up to the size
   limit), so a participant who joins later sees who was in the group before.
   This is accepted: it is how RFC 4575 rosters and RCS clients show who left.
   Only current participants read the roster.
+- **Invitee domains.** An invitee, in a new group's list or a REFER, may be
+  any SIP or tel URI: `rcs-as` does not restrict its domain. The focus's
+  INVITE always goes to the core (`RCSAS_CORE_URI`), never to the invitee's
+  host: the stored identity is canonical, without `maddr`, `transport` or
+  other parameters, and an invitee with a port or URI headers is refused
+  (400) or left out of a list. Residual risk: once the S-CSCF routes off-net (BGCF, NNI), a
+  participant can have the focus call a URI outside the network. Where an
+  invitee may be is decided with that routing (#337, #14 PR F).
 
 **Status:** implemented in `internal/rcsas/group` (#108). The SIP layer must:
 

@@ -76,7 +76,12 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		g.count("registrar.expire_failed")
 		return errors.New("registrar: SAR TIMEOUT_DEREGISTRATION failed: " + o.String())
 	}
-	if err := g.cfg.Events.Ended(ctx, before, regevent.Expired); err != nil {
+	cause := regevent.Expired
+	if before.Rejected {
+		// An RTR's end the sweep finishes (endSetNow).
+		cause = regevent.Rejected
+	}
+	if err := g.cfg.Events.Ended(ctx, before, cause); err != nil {
 		// The record keeps its lease: the sweep after it tries again.
 		return err
 	}
