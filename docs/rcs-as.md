@@ -63,8 +63,12 @@ rcsjta, a pre-CPM client, sends a `Contribution-ID` alone with its INVITEs.
 rcs-as takes that as a leniency (#298): the engine gives such a 1-to-1
 message the pair's `Conversation-ID`, a name-based UUID of the two users'
 keys in sorted order (`PairConversationID`), so that every message between
-them, either way, threads together, and delivers it with that ID, as the
-sender C.1.1 asks it to be. The SIP layer must give `Origin.Sender` the
+the same two keys, either way, threads together, and delivers it with that
+ID, as the sender C.1.1 asks it to be. A subscriber reached by a SIP name
+identity and by its tel URI has two keys (`UserOf` folds only a number's SIP
+and tel forms), and its messages so get two IDs. The ID is an unsalted hash
+of the two identities, so it is personal data, as they are, if it is ever
+logged. The SIP layer must give `Origin.Sender` the
 identity the network asserted, never one the client chose. It must name each
 user in one canonical form, since the queue and the sent-message records are
 keyed by that string.

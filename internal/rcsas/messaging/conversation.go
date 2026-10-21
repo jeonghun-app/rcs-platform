@@ -114,9 +114,15 @@ var pairNamespace = [16]byte{0x93, 0x33, 0xb4, 0xd3, 0xf0, 0xc3, 0x44, 0x0b, 0x8
 // that came with a Contribution-ID and no Conversation-ID (#298): a
 // name-based UUID (RFC 9562 §5.5, version 5), in the UUID form OMA CPM
 // Appendix C.1.1 asks of a Conversation-ID, of the two users' keys
-// (UserOf) in sorted order. Every message between the same two users, in
+// (UserOf) in sorted order. Every message between the same two keys, in
 // either direction, so has one Conversation-ID, and threads together on a
-// client that reads it, as the client that left it out would not see.
+// client that reads it. Two keys of one subscriber do not meet: a SIP name
+// identity and the same subscriber's tel URI are two keys (UserOf folds
+// only a number's SIP and tel forms), and give two IDs.
+//
+// The ID is an unsalted hash of the two identities: anyone who knows them
+// can compute it, and test a guess against it. It is personal data, as the
+// identities are, wherever it is logged (internal/pii).
 func PairConversationID(a, b string) string {
 	if b < a {
 		a, b = b, a
