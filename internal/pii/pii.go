@@ -509,10 +509,11 @@ func hasUserinfo(scheme string) bool {
 // wherever it is: rewriting only long digit runs would let a short run sit
 // next to a mask and form a long one with the hint ("…-２３４５６７" after a
 // tel number). The characters that group a number become ASCII only where
-// they do: every space (Unicode Zs: U+3000, no-break and thin spaces) becomes
-// " ", every dash (Unicode Pd, U+2212 minus and the long vowel marks "ー" and
-// "ｰ" that the "-" key types in a Japanese kana mode) becomes "-", and "．",
-// "（", "）", "＋", "﹢", "＊" and "＃" become ASCII,
+// they do: every space (Unicode Zs: U+3000, no-break and thin spaces), the
+// line and paragraph separators (Zl, Zp) and U+2800 BRAILLE PATTERN BLANK
+// become " ", every dash (Unicode Pd, U+2212 minus and the long vowel marks
+// "ー" and "ｰ" that the "-" key types in a Japanese kana mode) becomes "-",
+// and "．", "（", "）", "＋", "﹢", "＊" and "＃" become ASCII,
 //
 //   - when one or two of them join two digits, as numberAt reads them
 //     ("０１０ー１２３４", "+1 (555)" with U+3000 and "（");
