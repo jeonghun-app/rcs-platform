@@ -798,8 +798,10 @@ func TestThePeerReadsTheAnswerToItsOwnRequest(t *testing.T) {
 	r := newChatRig(t, messaging.Config{})
 	p := r.a.dial(t)
 	s := answeredBy(t, p.send(r.chatInvite(offerSDP(relayPath(), "active"))))
-	// Not acknowledged: the 2xx comes again at T1 (500 ms).
-	time.Sleep(700 * time.Millisecond)
+	// Not acknowledged: the 2xx comes again at T1 (500 ms), and next at
+	// 1.5 s (RFC 3261 §13.3.1.4). At 1.2 s one retransmission is waiting
+	// on the connection, with margin on a loaded host either way.
+	time.Sleep(1200 * time.Millisecond)
 	res := p.send(msg{method: "OPTIONS", uri: bob, fields: []string{"P-Asserted-Identity: <" + alice + ">"}})
 	if c, _ := res.Header.CSeq(); c.Method != "OPTIONS" || res.Header.Get("Call-ID") == s.callID {
 		t.Fatalf("read %d for %s %q", res.StatusCode, c.Method, res.Header.Get("Call-ID"))
