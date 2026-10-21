@@ -330,11 +330,13 @@ func (c *respContext) answer(res *sip.Response) {
 // Over a *transport.Transport, a final already on its way to the transaction
 // is not in progress either: if it waits for room in a stalled peer's
 // queue, Drain would wait for it until its own deadline, and
-// Transport.Flush, which Drain ends with, waits for it anyway, as a sender
-// waiting for room, giving up only once that connection stalls (#375). The
-// gap is the transaction layer's few lines between taking the response and
-// handing it to the transport: a final caught there when Flush looks is not
-// waited for, and Close may drop it.
+// Transport.Flush, which Drain ends with, waits for it anyway: from the
+// start of SendResponse, its connection dialled again to the Via address
+// included, as a send under way, then as a sender waiting for room, giving
+// up only once it stops getting anywhere (#375). The gap is the transaction
+// layer's few lines between taking the response and calling SendResponse:
+// a final caught there when Flush looks is not waited for, and Close may
+// drop it.
 func (c *respContext) inProgress() bool {
 	c.mu.Lock()
 	uas := c.uas
@@ -1176,6 +1178,9 @@ func (c *respContext) sendBest() []func() {
 			if hook != nil {
 				hook(c.ctx, res)
 			}
+			// On its way, as the other finals (inProgress; code review of
+			// #438).
+			c.responding.Store(true)
 			if err := c.tx.Respond(res); err != nil {
 				c.p.stats.upstreamErrors.Add(1)
 			}

@@ -544,14 +544,12 @@ func waitUntil(t *testing.T, what string, cond func() bool, progress func() int6
 // as senders waiting for room, and gives up once the connection stalls. The
 // deadline is an hour here; before #375 Drain waited all of it.
 func TestDrainDoesNotWaitOutItsDeadlineForFinalsBehindAStalledPeer(t *testing.T) {
-	for _, serve := range []bool{false, true} {
-		t.Run(map[bool]string{false: "the proxy's own answers", true: "a Serve handler's answers"}[serve], func(t *testing.T) {
-			finalsBehindAStalledPeer(t, serve)
-		})
+	for _, kind := range []string{"the proxy's own answers", "a Serve handler's answers", "answers for branches that all failed"} {
+		t.Run(kind, func(t *testing.T) { finalsBehindAStalledPeer(t, kind) })
 	}
 }
 
-func finalsBehindAStalledPeer(t *testing.T, serve bool) {
+func finalsBehindAStalledPeer(t *testing.T, kind string) {
 	var routed atomic.Int64
 	var px atomic.Pointer[Proxy]
 	tr, err := transport.New(transport.Config{WriteTimeout: time.Hour}, func(in transport.Inbound) {
@@ -571,14 +569,19 @@ func finalsBehindAStalledPeer(t *testing.T, serve bool) {
 		Self: []sip.URI{mustURI("sip:" + addr.String() + ";lr")},
 		Router: RouterFunc(func(context.Context, *Request) Decision {
 			routed.Add(1)
-			if !serve {
-				return Decision{Status: 200}
+			switch kind {
+			case "a Serve handler's answers":
+				return Decision{Serve: func(_ context.Context, u *UAS) {
+					if res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1"); err == nil {
+						_ = u.Respond(res)
+					}
+				}}
+			case "answers for branches that all failed":
+				// A flow that is gone: the branch fails at once, and the
+				// proxy answers the best failure, 430 (code review of #438).
+				return Decision{Targets: []Target{{URI: mustURI("sip:bob@192.0.2.10"), Destination: &transport.Destination{Flow: "gone"}}}}
 			}
-			return Decision{Serve: func(_ context.Context, u *UAS) {
-				if res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1"); err == nil {
-					_ = u.Respond(res)
-				}
-			}}
+			return Decision{Status: 200}
 		}),
 	})
 	if err != nil {
@@ -608,9 +611,8 @@ func finalsBehindAStalledPeer(t *testing.T, serve bool) {
 		}
 	}()
 	waitUntil(t, "every request to be routed", func() bool { return routed.Load() == requests }, routed.Load, tr)
-	if p.inProgress() != 0 {
-		t.Fatalf("%d requests count as in progress with their finals decided", p.inProgress())
-	}
+	inProgress := func() int64 { return int64(p.inProgress()) }
+	waitUntil(t, "no request in progress, the finals decided", func() bool { return inProgress() == 0 }, inProgress, tr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 	defer cancel()
 	done := make(chan struct{})
@@ -620,4 +622,120 @@ func finalsBehindAStalledPeer(t *testing.T, serve bool) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Drain is still waiting for the finals behind a peer that does not read")
 	}
+}
+
+// A final whose connection closed and is being dialled again, to the Via's
+// sent-by (RFC 3261 §18.2.2), is in no queue yet, but on its way: Drain's
+// flush waits for it, and the peer still gets it (code review of #438,
+// whose repro this is). The dial is held until the test sees that Drain
+// has not returned.
+func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
+	drainFlushStall = 10 * time.Second
+	t.Cleanup(func() { drainFlushStall = time.Second })
+	// The peer's own address, where the 200 goes once its connection closed.
+	back, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { back.Close() })
+	dialing, release := make(chan struct{}, 1), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	var px atomic.Pointer[Proxy]
+	tr, err := transport.New(transport.Config{Dialer: heldDialer{dialing: dialing, release: release}}, func(in transport.Inbound) {
+		if p := px.Load(); p != nil {
+			p.Receive(in)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	addr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	p, err := New(tr, Config{
+		Self: []sip.URI{mustURI("sip:" + addr.String() + ";lr")},
+		Router: RouterFunc(func(context.Context, *Request) Decision {
+			<-closed // the peer's connection is gone before the answer
+			return Decision{Status: 200}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	px.Store(p)
+
+	nc, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.WriteString(nc, fmt.Sprintf("MESSAGE sip:bob@example.com SIP/2.0\r\n"+
+		"Via: SIP/2.0/TCP %s;branch=z9hG4bK-redial\r\nMax-Forwards: 70\r\n"+
+		"To: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
+		"Call-ID: redial\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n", back.Addr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the connection to be accepted", func() bool { return tr.Stats().OpenInbound == 1 }, func() int64 { return int64(tr.Stats().Accepted) }, tr)
+	_ = nc.Close()
+	waitUntil(t, "the connection to close", func() bool { return tr.Stats().OpenInbound == 0 }, func() int64 { return int64(tr.Stats().OpenInbound) }, tr)
+	close(closed)
+	select {
+	case <-dialing:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the 200 never went to the Via's address")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		p.Drain(ctx)
+		_ = tr.Close() // as pcscf and icscf do
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("Drain returned while the 200 was still being dialled")
+	case <-time.After(200 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Drain did not return once the dial was done")
+	}
+	got, err := back.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	_ = got.SetReadDeadline(time.Now().Add(30 * time.Second))
+	m, err := sip.NewReader(bufio.NewReader(got), sip.Limits{}).ReadMessage()
+	if res, ok := m.(*sip.Response); err != nil || !ok || res.StatusCode != 200 {
+		t.Fatalf("the peer got %v, %v, want the 200", m, err)
+	}
+}
+
+// heldDialer dials once release is closed, and says on dialing that it was
+// asked.
+type heldDialer struct {
+	dialing, release chan struct{}
+}
+
+func (d heldDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	select {
+	case d.dialing <- struct{}{}:
+	default:
+	}
+	select {
+	case <-d.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, address)
 }
