@@ -473,7 +473,9 @@ type queued struct {
 // errDroppedAtDisconnect ends a request the writer dropped behind a DPR or
 // DPA. It is ErrPeerUnavailable, as for a request refused before the send,
 // since none of it reached the peer: a caller may retry it elsewhere at once
-// (cxclient.NeverSent).
+// (cxclient.NeverSent). It already has its End-to-End Identifier, so a retry
+// keeps it and carries the T flag, which is harmless for a request the first
+// peer never saw.
 var errDroppedAtDisconnect = fmt.Errorf("%w: the connection was disconnecting", ErrPeerUnavailable)
 
 // maxAnswersInARow bounds how many handlers' answers the writer sends before
@@ -507,6 +509,13 @@ func (c *conn) writeLoop() {
 	inARow := 0 // answers written since the main queue was last served
 	for {
 		if b, ok := c.popControl(); ok {
+			// The control queue's one request is the watchdog's DWR, which
+			// the Closing state does not send either (#376): one queued
+			// before the DPR or DPA went out is dropped. Its answer was not
+			// awaited.
+			if c.wroteLast && len(b) > 4 && CommandFlags(b[4])&FlagRequest != 0 {
+				continue
+			}
 			if !c.write(b) {
 				return
 			}
@@ -1019,6 +1028,14 @@ func (c *conn) watchdogExpired() {
 	now := c.node.cfg.Clock.Now()
 	if now.Before(c.wdDeadline) {
 		c.wdTimer = c.node.cfg.Clock.AfterFunc(c.wdDeadline.Sub(now), c.fireWatchdog)
+		c.mu.Unlock()
+		return
+	}
+	if c.closing {
+		// Disconnecting (RFC 6733 §5.6, Closing): no DWR goes after the DPR
+		// or DPA (#376), and the DPR's timeout or the peer closing ends the
+		// connection, not the watchdog.
+		c.armWatchdogLocked(now)
 		c.mu.Unlock()
 		return
 	}
