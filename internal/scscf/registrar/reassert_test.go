@@ -244,15 +244,38 @@ func isReassertion(r *cx.SAR) bool {
 		(r.AssignmentType == cx.Registration || r.AssignmentType == cx.UnregisteredUser)
 }
 
-// wantDeregisteredLast fails unless the set is gone here and the HSS was
-// last told of a deregistration.
+// wantDeregisteredLast fails unless the set holds no binding here, only
+// the undo's tombstone, and the HSS was last told of a deregistration; and
+// unless the sweep after the tombstone's lease ends it.
 func wantDeregisteredLast(t *testing.T, e *env) {
 	t.Helper()
-	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
-		t.Fatalf("the set is still here: %v", err)
-	}
+	wantOnlyATombstone(t, e)
 	if got := e.hss.sarsOf(); len(got) == 0 || got[len(got)-1] != cx.UserDeregistration {
 		t.Errorf("SARs %v, want the HSS told USER_DEREGISTRATION last", got)
+	}
+	e.clock.advance(state.SweepLease)
+	if _, err := e.instance(9).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("the tombstone outlived the sweep after its lease: %v", err)
+	}
+	if got := e.hss.sarsOf(); got[len(got)-1] != cx.TimeoutDeregistration && got[len(got)-1] != cx.UserDeregistration {
+		t.Errorf("SARs %v after the sweep, want a deregistration last", got)
+	}
+}
+
+// wantOnlyATombstone fails unless set1 is gone or held by a
+// deregistration's lease without bindings.
+func wantOnlyATombstone(t *testing.T, e *env) {
+	t.Helper()
+	r, err := e.store.Registration(bg, set1)
+	switch {
+	case errors.Is(err, state.ErrNotFound):
+	case err != nil:
+		t.Fatal(err)
+	case len(r.Contacts) != 0 || r.Deregistering.IsZero():
+		t.Fatalf("the set is still here: %+v", r)
 	}
 }
 
@@ -410,7 +433,8 @@ func (f *failingSARs) failed() int {
 
 // TestAnUndoTheHSSDoesNotTakeIsCounted (#241, #410 code review): the undo
 // is tried undoAttempts times, then counted and logged, not returned, as no
-// record is left for anyone to try again from; its tombstone goes.
+// record is left for anyone to try again from; its tombstone stays for the
+// sweep after its lease.
 func TestAnUndoTheHSSDoesNotTakeIsCounted(t *testing.T) {
 	e := newEnv(t)
 	u := reassertDue(t, e, e.instance(1))
@@ -426,9 +450,7 @@ func TestAnUndoTheHSSDoesNotTakeIsCounted(t *testing.T) {
 		t.Errorf("undo_failed %d, undone %d, %d undo SARs", m.get("registrar.reassert_undo_failed"), m.get("registrar.reassert_undone"), f.failed())
 	}
 	_ = k
-	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
-		t.Errorf("a record is left: %v", err)
-	}
+	wantOnlyATombstone(t, e)
 }
 
 // TestAnUndoTriesAFailureThatMayPassAgain (#410 code review): one SAR the
@@ -660,5 +682,74 @@ func TestAFailedReassertIsNotUndone(t *testing.T) {
 	}
 	if got := e.hss.sarsOf(); m.get("registrar.reassert_undone") != 0 || got[len(got)-1] != cx.UserDeregistration || len(got) != 2 {
 		t.Errorf("SARs %v, undone %d; want the user's deregistration last and alone after the registration", got, m.get("registrar.reassert_undone"))
+	}
+}
+
+// TestAnUndoOverALeaseCrossingARegisterMarksTheSet (#410 code review): the
+// set is under another deregistration's lease when the undo reads it; that
+// deregistration finishes, and a new REGISTER registers the set, all before
+// the undo's SAR reaches the HSS. The undo saved its tombstone over the
+// lease, so the deregistration finishes nothing, the REGISTER takes the set
+// over from the tombstone and is marked.
+func TestAnUndoOverALeaseCrossingARegisterMarksTheSet(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: e.hss, match: isReassertion}
+	b.hook = func() {
+		// A deregistration under way: its lease holds the record, its SAR
+		// has reached the HSS.
+		r := must(e.store.Registration(bg, set1))(t)
+		r.Contacts, r.Deregistering = nil, e.clock.Now().Add(state.SweepLease)
+		must(e.store.SaveRegistration(bg, r))(t)
+		must(e.hss.SAR(bg, &cx.SAR{UserName: impi1, PublicIdentities: []string{impu1}, AssignmentType: cx.UserDeregistration}))(t)
+	}
+	undo := &beforeSAR{HSS: b, match: func(r *cx.SAR) bool { return r.AssignmentType == cx.UserDeregistration }}
+	undo.hook = func() {
+		// The deregistration tries to finish, then the UE registers again.
+		if err := e.store.DeleteRegistration(bg, must(e.store.Registration(bg, set1))(t)); err != nil {
+			t.Logf("the deregistration's delete: %v", err)
+		}
+		wantStatus(t, u.registerWith(e.instance(4), 600), 200)
+	}
+	if _, err := e.instance(3, func(c *Config) { c.HSS = undo }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	sars := e.hss.sarsOf()
+	r := must(e.store.Registration(bg, set1))(t)
+	if len(r.Contacts) != 1 || sars[len(sars)-1] == cx.UserDeregistration && r.Reassert.IsZero() {
+		t.Errorf("SARs %v; record %d contacts, Reassert %v: registered here, the HSS last told USER_DEREGISTRATION, and nothing marked", sars, len(r.Contacts), r.Reassert)
+	}
+}
+
+// TestARegisterThatTakesOverTheTombstoneIsMarked (#410 code review): a
+// REGISTER that reads the undo's tombstone sends its SAR, which reaches
+// the HSS before the undo's, and saves only after the undo has read the
+// set again; taking the set over from a lease marks it for the sweep.
+func TestARegisterThatTakesOverTheTombstoneIsMarked(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: e.hss, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	block := &qaBlockFirstSave{Store: e.store, entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan struct{})
+	undo := &beforeSAR{HSS: b, match: func(r *cx.SAR) bool { return r.AssignmentType == cx.UserDeregistration }}
+	undo.hook = func() {
+		// The tombstone is saved: the REGISTER reads it, sends its SAR,
+		// and holds its save.
+		go func() {
+			defer close(done)
+			wantStatus(t, u.registerWith(e.instance(4, func(c *Config) { c.Store = block }), 600), 200)
+		}()
+		recvWithin(t, block.entered)
+	}
+	if _, err := e.instance(3, func(c *Config) { c.HSS = undo }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	close(block.release)
+	<-done
+	sars := e.hss.sarsOf()
+	r := must(e.store.Registration(bg, set1))(t)
+	if len(r.Contacts) != 1 || sars[len(sars)-1] == cx.UserDeregistration && r.Reassert.IsZero() {
+		t.Errorf("SARs %v; record %d contacts, Reassert %v: registered here, the HSS last told USER_DEREGISTRATION, and nothing marked", sars, len(r.Contacts), r.Reassert)
 	}
 }

@@ -293,6 +293,13 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings}
 	if cur != nil && cur.Key == key {
 		n.Incarnation, n.Version = cur.Incarnation, cur.Version
+		if !cur.Deregistering.IsZero() {
+			// A set taken over from a deregistration's lease, of a user's,
+			// an RTR's, a sweep's or an undo's (undoIfEnded): that
+			// deregistration's SAR may reach the HSS after this one's, so a
+			// sweep tells the HSS again (#410 code review).
+			n.Reassert, n.ReassertAttempts = g.cfg.Now().Add(reassertBackoff), 1
+		}
 	}
 	if cur == nil || cur.Key != key || !cur.Deregistering.IsZero() {
 		// A record taken over from a deregistration's lease is a new
@@ -657,67 +664,66 @@ func assignmentOf(reg *state.Registration) cx.ServerAssignmentType {
 // that no sweep would end (#241). So if the set is gone, or no longer live,
 // the HSS is told again (SAR USER_DEREGISTRATION, undo).
 //
-// A gone set's key is held while that SAR is on its way, by a record
-// created for a deregistration's lease (a tombstone), deleted under its
-// version after. A REGISTER that registers the set meanwhile takes the
-// record over from the lease, whatever it read first, so the delete
-// conflicts; its SAR may have reached the HSS before the undo's, and its
-// record is marked for a sweep to tell the HSS again (markReassert), as a
-// crossed deregistration's is (#410 code review). A set still under a
-// deregistration's lease is left to that deregistration, whose endSet
-// gives the set back to the HSS if a REGISTER takes it over.
+// While that SAR is on its way, and for a lease after, the set's key is
+// held by a deregistration's lease that undoIfEnded saved itself (a
+// tombstone): created for a gone set, or saved over the record that is
+// there, which leaves that record's deregistration to the sweep after the
+// lease. A REGISTER whose SAR may have reached the HSS before the undo's
+// meets the tombstone whenever it saves within the lease, and takes the
+// set over from it, which marks the record for a sweep to tell the HSS
+// again (assign); one that did so before the record is read again after
+// the undo is marked here (#410 code review and QA). The tombstone is not
+// deleted: the sweep after its lease ends it, with an SAR the HSS already
+// holds.
 //
 // An undo the HSS does not take is logged and counted, not returned: no
 // record is left for anyone to try again from, and the HSS keeps the set
 // until the user registers again, as before #241.
 func (g *Registrar) undoIfEnded(ctx context.Context, key state.SetKey) error {
-	now := g.cfg.Now()
-	again, f := g.set(ctx, key)
-	switch {
-	case f != nil:
-		return f
-	case again != nil && live(again, now) && again.Deregistering.IsZero():
-		return nil
-	}
-	var tomb *state.Registration
-	if again == nil {
-		inc, err := g.incarnation()
-		if err != nil {
-			return err
-		}
-		tomb, err = g.cfg.Store.SaveRegistration(ctx, &state.Registration{
-			Key: key, Incarnation: inc, Identities: []state.SetIdentity{{IMPU: key.IMPU}}, Deregistering: now.Add(state.SweepLease),
-		})
-		switch {
-		case errors.Is(err, state.ErrExists), errors.Is(err, state.ErrConflict):
-			// A REGISTER created the set since it was read: the HSS's
-			// last word is that SAR or this one's, both a registration.
-			return nil
-		case err != nil:
-			return err
-		}
-	}
-	g.undo(ctx, key)
-	if tomb == nil {
-		return nil
-	}
-	err := g.cfg.Store.DeleteRegistration(ctx, tomb)
-	switch {
-	case err == nil, errors.Is(err, state.ErrNotFound):
-		return nil
-	case errors.Is(err, state.ErrConflict):
+	for range saveAttempts {
+		now := g.cfg.Now()
 		again, f := g.set(ctx, key)
 		switch {
 		case f != nil:
 			return f
-		case again != nil:
+		case again != nil && live(again, now) && again.Deregistering.IsZero():
+			return nil
+		}
+		tomb, err := g.tombstone(ctx, key, again, now)
+		switch {
+		case errors.Is(err, state.ErrExists), errors.Is(err, state.ErrConflict), errors.Is(err, state.ErrNotFound):
+			// The set changed since it was read: read it again.
+			continue
+		case err != nil:
+			return err
+		}
+		g.undo(ctx, key)
+		if again, f = g.set(ctx, key); f != nil {
+			return f
+		}
+		if again != nil && again.Version != tomb.Version {
 			return g.markReassert(ctx, again)
 		}
 		return nil
 	}
-	// The tombstone stands: the sweep after its lease ends the set with
-	// the HSS, as it does any deregistration left as a lease.
-	return err
+	return errors.New("registrar: the set kept changing while a reassertion was undone")
+}
+
+// tombstone saves the deregistration's lease that holds key while an undo
+// is on its way: a record of its own for a gone set, created only if none
+// exists, or else cur claimed again under its version, without bindings.
+func (g *Registrar) tombstone(ctx context.Context, key state.SetKey, cur *state.Registration, now time.Time) (*state.Registration, error) {
+	if cur == nil {
+		inc, err := g.incarnation()
+		if err != nil {
+			return nil, err
+		}
+		cur = &state.Registration{Key: key, Incarnation: inc, Identities: []state.SetIdentity{{IMPU: key.IMPU}}}
+	} else {
+		cur = cur.Clone()
+	}
+	cur.Contacts, cur.Deregistering = nil, now.Add(state.SweepLease)
+	return g.cfg.Store.SaveRegistration(ctx, cur)
 }
 
 // undoAttempts bounds how often an undo's SAR is sent: the HSS that took
