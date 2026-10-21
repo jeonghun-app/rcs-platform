@@ -76,6 +76,8 @@ required.
 | `ICSCF_HSS_HOST_PATTERN` | `hss-*.<namespace>` | the Origin-Host every HSS task must have; a peer that claims another gets no request |
 | `ICSCF_CX_TIMEOUT` | `5s` | one Cx attempt; a failed or busy one is retried once on another HSS task |
 | `ICSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop waits for the requests in progress to get their final responses |
+| `ICSCF_MAX_SERVER_TRANSACTIONS` | `20000` | the requests icscf holds at once, 1 to 1000000; one past it is answered 503 with `Retry-After: 5`, icscf's own overload |
+| `ICSCF_MAX_SERVER_TRANSACTION_BYTES` | `268435456` (256 MiB) | the memory those requests and the responses kept for them may hold, in bytes; one that would pass it is answered the same |
 
 ## Metrics
 
@@ -119,7 +121,9 @@ service as resources: the call names both. Infra adds it on #56.
 
 ## Not in place yet
 
-- The transaction caps of #37 are not configurable here until it lands.
+- A metric for the requests refused at the transaction caps: the
+  transaction layer counts them (`transaction.Stats`), but no service
+  exports those statistics yet.
 - S-CSCF re-selection, and the other parts of TS 24.229 §5.3 listed in the
   package documentation.
 - A drain shared by every proxy service (#281); icscf has its own until then.

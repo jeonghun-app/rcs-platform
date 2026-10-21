@@ -460,3 +460,35 @@ func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)
 	}
 }
+
+// #37: past ICSCF_MAX_SERVER_TRANSACTIONS a request is answered 503 with
+// Retry-After, icscf's own overload (decided on #15), while the one in
+// progress goes on.
+func TestARequestPastTheTransactionCapGets503(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hss.answer = func(uint32) (cx.Result, string) {
+		once.Do(func() { close(held); <-release })
+		return cx.ResultCode(diameter.ResultSuccess), scscf.uri()
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.MaxServerTransactions = 1
+	})
+	r.waitReady(t)
+	first := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	select {
+	case <-held:
+	case <-time.After(realWait):
+		t.Fatal("the first request never reached the HSS")
+	}
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f2", "To: <"+tel1+">")
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
+		t.Errorf("past the cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	close(release)
+	if got := <-first; got != "200" {
+		t.Fatalf("the request in progress got %s, want 200", got)
+	}
+}

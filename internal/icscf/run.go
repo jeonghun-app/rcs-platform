@@ -23,6 +23,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -109,6 +110,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		Router:   router,
 		Resolver: dns,
 		Logger:   rt.Logger,
+		Transaction: transaction.Config{
+			MaxServerTransactions:     cfg.MaxServerTransactions,
+			MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
+		},
 	})
 	if err != nil {
 		return err
