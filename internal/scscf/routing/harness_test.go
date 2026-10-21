@@ -168,6 +168,25 @@ func request(t *testing.T, method, target string, extra ...string) *proxy.Reques
 	return &proxy.Request{Message: parse(t, strings.Join(fields, "\r\n")+"\r\nContent-Length: 0\r\n\r\n")}
 }
 
+// tryRequest is request for impu1 with extra header fields, if it parses.
+func tryRequest(extra []string) (*sip.Request, bool) {
+	fields := append([]string{
+		"INVITE " + impu1 + " SIP/2.0",
+		"Via: SIP/2.0/TCP icscf.rcs.local;branch=z9hG4bK-term",
+		"Max-Forwards: 69",
+		"From: <sip:+15550100003@" + realm + ">;tag=caller",
+		"To: <" + impu1 + ">",
+		"Call-ID: term-call-1",
+		"CSeq: 1 INVITE",
+	}, extra...)
+	m, err := sip.ParseMessage([]byte(strings.Join(fields, "\r\n") + "\r\nContent-Length: 0\r\n\r\n"))
+	if err != nil {
+		return nil, false
+	}
+	r, ok := m.(*sip.Request)
+	return r, ok
+}
+
 func parse(t *testing.T, text string) *sip.Request {
 	t.Helper()
 	m, err := sip.ParseMessage([]byte(text))
