@@ -456,6 +456,10 @@ func TestCloseWaitsForALateSessionsBye(t *testing.T) {
 	r.release()
 	late := answeredOK(t, answered)
 	r.ackOf(t, late)
+	// The client can read the 200 before the session settles: release
+	// the live BYE's answer only once it has, while Close still waits for
+	// its own BYEs, so that the late one is counted (QA on #340: 1 in 80).
+	waitLive(t, r.a.srv, late.Header.Get("Call-ID"))
 	held.open(live.Header.Get("Call-ID"))
 	r.byeFor(t, late)
 	r.quiet(t, 200*time.Millisecond, false, "before the late session's BYE was answered")
@@ -485,4 +489,49 @@ func TestASecondCloseWaitsForTheFirst(t *testing.T) {
 	held.open(res.Header.Get("Call-ID"))
 	<-second
 	r.waitClosed(t)
+}
+
+// waitLive waits until the session with callID is live: its answer gone
+// and settle run.
+func waitLive(t *testing.T, s *Server, callID string) {
+	t.Helper()
+	deadline := time.Now().Add(waitFor)
+	for {
+		s.mu.Lock()
+		live := false
+		for _, ss := range s.sessions {
+			if ss.d.CallID == callID && ss.live {
+				live = true
+			}
+		}
+		s.mu.Unlock()
+		if live {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session %s never settled", callID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// QA on #341: Close called while a session is still settling, its 200 out
+// and its ACK on the way, ends it with a BYE it waits the answer to, every
+// time: the session is either among Close's own or a late one Close
+// counts.
+func TestCloseMidSettleWaitsForTheBye(t *testing.T) {
+	for range 10 {
+		r := newShutdownRig(t, time.Hour)
+		held := holdByes(t, r)
+		res := r.p.send(r.chatInvite(offerSDP(relayPath(), "active")))
+		if res.StatusCode != 200 {
+			t.Fatalf("answered %d", res.StatusCode)
+		}
+		r.ackOf(t, res)
+		r.close()
+		r.byeFor(t, res)
+		r.quiet(t, 50*time.Millisecond, false, "before its BYE was answered")
+		held.open(res.Header.Get("Call-ID"))
+		r.waitClosed(t)
+	}
 }
