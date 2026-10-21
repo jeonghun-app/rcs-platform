@@ -13,7 +13,9 @@ import (
 // ResponseHandler receives what a client transaction passes to the TU: each
 // response the TU must see, in order, or one error after which nothing follows.
 // The error is ErrTimeout when Timer B or F fires, ErrTerminated after
-// Terminate, or a transport error from a retransmission.
+// Terminate, ErrFlowClosed when the flow the request went over closed first
+// (Layer.FlowClosed, RFC 5626 §5.3.1), or a transport error from a
+// retransmission.
 //
 // Calls for one transaction never overlap and arrive in the order the
 // transaction produced them, though not always on the goroutine that produced
@@ -120,6 +122,14 @@ func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseH
 		return nil, ErrDuplicate
 	}
 	l.clients[key] = tx
+	if dst.Flow != "" {
+		// Recorded before the send, so a close that comes right after it
+		// is not missed; FlowClosed waits on tx.mu until the send is done.
+		if l.byFlow[dst.Flow] == nil {
+			l.byFlow[dst.Flow] = make(map[*ClientTransaction]struct{})
+		}
+		l.byFlow[dst.Flow][tx] = struct{}{}
+	}
 	l.mu.Unlock()
 
 	tx.mu.Lock()
@@ -177,6 +187,20 @@ func (tx *ClientTransaction) Terminate() {
 	tx.mu.Unlock()
 	if live {
 		tx.out.deliver(nil, ErrTerminated)
+	}
+}
+
+// flowClosed ends the transaction with ErrFlowClosed if it still awaits a
+// final response.
+func (tx *ClientTransaction) flowClosed() {
+	tx.mu.Lock()
+	pending := tx.state == Calling || tx.state == Proceeding || !tx.invite && tx.state == Trying
+	if pending {
+		tx.terminate()
+	}
+	tx.mu.Unlock()
+	if pending {
+		tx.out.deliver(nil, ErrFlowClosed)
 	}
 }
 

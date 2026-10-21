@@ -33,8 +33,10 @@ var toClientOnly = []string{"P-Served-User", "P-Profile-Key"}
 // it on. A request naming no flow, or one that is not a live client flow
 // of this task (closed, from an earlier start, or a core connection), is
 // answered 430 Flow Failed, which scscf takes as a sign to try the client's
-// other flows (RFC 5626 §5.3). A flow already gone before the send gets 430
-// too; one that closes while the request is under way may not yet (#234).
+// other flows (RFC 5626 §5.3). So does a flow already gone before the send,
+// and one that closes while the request is under way, before its final
+// response: the transport tells the proxy (OnFlowClosed, Proxy.FlowClosed),
+// which ends the branch at once instead of at Timer B or F (#234).
 //
 // A request outside a dialog that sets up one gets pcscf's two Record-Route
 // values, the client-facing one on top, so that the dialog's requests come
