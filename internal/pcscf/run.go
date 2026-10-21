@@ -198,6 +198,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
+	// The transport closes before the proxy does (the deferred Close). A
+	// peer that stopped reading leaves senders waiting for room in its
+	// connection's queue, and the proxy's Close waits for them, for up to
+	// WriteTimeout, past the stop margin (#323); closing the connections
+	// releases them at once. A second Close does nothing.
+	_ = tr.Close()
 	return nil
 }
 
