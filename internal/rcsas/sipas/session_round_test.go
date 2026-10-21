@@ -108,7 +108,20 @@ func TestAFirstMessageINVITERCSASCannotTakeApartIsRefused(t *testing.T) {
 // in its 2xx, with the same o= version, and the timer starts again; an
 // answer in the ACK that moves the leg ends the session.
 func TestAnOfferlessRefreshGetsTheLastSDP(t *testing.T) {
-	r := newChatRig(t, messaging.Config{})
+	offerlessRefresh(t)
+}
+
+// #327: the same, with every ACK slower than T1, so that each 2xx is
+// retransmitted (RFC 3261 §13.3.1.4) before its ACK and reaches the core
+// again while its next request is under way. Each request still gets its
+// own answer.
+func TestAnOfferlessRefreshGetsTheLastSDPWhenTheACKsAreSlow(t *testing.T) {
+	offerlessRefresh(t, func(pc *proxy.Config) { pc.Transaction.Clock = t1AtOnce{} })
+}
+
+func offerlessRefresh(t *testing.T, tune ...func(*proxy.Config)) {
+	t.Helper()
+	r := newChatRig(t, messaging.Config{}, tune...)
 	p := r.a.dial(t)
 	from := relayPath()
 	s := answeredBy(t, p.send(r.chatInvite(offerSDP(from, "active"), "Supported: timer", "Session-Expires: 1800")))
