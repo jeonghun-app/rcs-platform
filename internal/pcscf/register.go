@@ -131,6 +131,7 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 			if !retryICSCF(f.Response.StatusCode) {
 				return nil
 			}
+			tries.lastRetryAfter(f.Response)
 			next, left, ok := tries.next(p.now())
 			if !ok {
 				return nil
@@ -139,6 +140,12 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 		},
 		OnFinal: func(_ context.Context, res *sip.Response) {
 			switch {
+			case tries.exhausted.Load() && tries.retryAfter() != "":
+				// The last icscf refused for a while, as a draining one does
+				// (#310): the client may try again after that, which a 504
+				// without Retry-After would not tell it.
+				res.StatusCode, res.Reason = 500, sip.DefaultReason(500)
+				_ = res.Header.Set("Retry-After", tries.retryAfter())
 			case tries.exhausted.Load():
 				res.StatusCode, res.Reason = 504, sip.DefaultReason(504)
 			case res.StatusCode == statusFlowFailed:
@@ -180,6 +187,25 @@ type icscfTries struct {
 	// exhausted is set when a retryable failure found no address, or no
 	// time, left.
 	exhausted atomic.Bool
+	// after is the Retry-After of the last icscf's 503, if it sent one.
+	after string
+}
+
+// lastRetryAfter keeps the Retry-After of res if it is a 503 an icscf sent
+// with one, and forgets an earlier one otherwise.
+func (t *icscfTries) lastRetryAfter(res *sip.Response) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.after = ""
+	if res.StatusCode == 503 {
+		t.after = res.Header.Get("Retry-After")
+	}
+}
+
+func (t *icscfTries) retryAfter() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.after
 }
 
 // next is the address to try at now and how long it may take.
