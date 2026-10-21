@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"strings"
@@ -221,8 +222,11 @@ func TestTheTransactionCapBoundsAreAccepted(t *testing.T) {
 // The proxy allows as many contexts as the layer allows server transactions,
 // so a burst meets the layer's cap first (code review of #311).
 func TestTheProxyAllowsAsManyContextsAsServerTransactions(t *testing.T) {
-	tcfg, contexts := proxyLimits(ServiceConfig{MaxServerTransactions: 30000, MaxServerTransactionBytes: 1 << 30})
-	if tcfg.MaxServerTransactions != 30000 || tcfg.MaxServerTransactionBytes != 1<<30 || contexts != 30000 {
-		t.Fatalf("limits = %+v, %d contexts", tcfg, contexts)
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 30000, MaxServerTransactionBytes: 1 << 30})
+	if tcfg.MaxServerTransactions != 30000 || tcfg.MaxServerTransactionBytes != 1<<30 || contexts != 30000 || bytes != 34<<30 {
+		t.Fatalf("limits = %+v, %d contexts, %d bytes", tcfg, contexts, bytes)
+	}
+	if _, _, bytes := proxyLimits(ServiceConfig{MaxServerTransactionBytes: math.MaxInt64 / 2}); bytes != math.MaxInt64 {
+		t.Fatalf("a bound that would overflow gives %d bytes", bytes)
 	}
 }

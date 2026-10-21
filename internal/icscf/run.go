@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"strconv"
@@ -105,14 +106,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return fmt.Errorf("icscf: core listener: %w", err)
 	}
-	tcfg, maxContexts := proxyLimits(cfg)
+	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
-		Self:        selfURIs(cfg, int(coreAddr.Port())),
-		Router:      router,
-		Resolver:    dns,
-		Logger:      rt.Logger,
-		Transaction: tcfg,
-		MaxContexts: maxContexts,
+		Self:            selfURIs(cfg, int(coreAddr.Port())),
+		Router:          router,
+		Resolver:        dns,
+		Logger:          rt.Logger,
+		Transaction:     tcfg,
+		MaxContexts:     maxContexts,
+		MaxContextBytes: maxContextBytes,
 	})
 	if err != nil {
 		return err
@@ -147,15 +149,30 @@ func drain(px *proxy.Proxy, d time.Duration) {
 }
 
 // proxyLimits are the bounds of icscf's proxy: its layer's server
-// transaction caps (#37), and as many contexts as server transactions, so
-// the layer's cap, whose refusals the transaction statistics count, is the
-// one a burst meets, not a 503 of the proxy's own (code review of #311).
-func proxyLimits(cfg ServiceConfig) (transaction.Config, int) {
-	return transaction.Config{
+// transaction caps (#37), as many contexts as server transactions, and
+// proxyByteCharge times the layer's bytes, so the layer's caps, whose
+// refusals the transaction statistics count, are the ones a burst meets,
+// not a 503 of the proxy's own (code review of #311).
+func proxyLimits(cfg ServiceConfig) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
+	tcfg = transaction.Config{
 		MaxServerTransactions:     cfg.MaxServerTransactions,
 		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
-	}, cfg.MaxServerTransactions
+	}
+	maxContextBytes = math.MaxInt64
+	if cfg.MaxServerTransactionBytes <= math.MaxInt64/proxyByteCharge {
+		maxContextBytes = proxyByteCharge * cfg.MaxServerTransactionBytes
+	}
+	return tcfg, cfg.MaxServerTransactions, maxContextBytes
 }
+
+// proxyByteCharge bounds what the proxy charges a request against its bytes
+// for each byte the layer charges it: the layer counts the request as
+// received, at least its header and body, and the proxy its body and two
+// copies of its header, plus two for every branch, up to MaxBranches. So
+// with MaxContextBytes this many times the layer's bound, the layer's
+// refusals, which the transaction statistics count, always come first
+// (code review of #311).
+const proxyByteCharge = 2 + 2*proxy.DefaultMaxBranches
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own
 // Origin-Host (ADR 0005).

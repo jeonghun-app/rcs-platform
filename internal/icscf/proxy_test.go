@@ -3,6 +3,7 @@ package icscf
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -375,5 +376,38 @@ func TestARegisterToTheProductionFormOfANameLeavesOverTCP(t *testing.T) {
 	g.net.mu.Unlock()
 	if fwd := g.net.sent()[0]; network != transport.TCP || fwd.URI.String() != "sip:192.0.2.30:5060;transport=tcp" {
 		t.Errorf("the REGISTER left over %s to %s, want TCP to the configured URI", network, fwd.URI.String())
+	}
+}
+
+// Code review of #311, scaled down: with a 4 MiB layer bound and the proxy
+// limits proxyLimits gives, 300 KiB MESSAGEs held at the S-CSCF are refused
+// by the transaction layer, whose refusals #56's alarm counts, and never by
+// the proxy's own byte bound.
+func TestTheLayerRefusesLargeRequestsBeforeTheProxy(t *testing.T) {
+	g := &proxied{rig: newRig(t), clock: &fakeClock{}, net: &fakeNet{}}
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 20000, MaxServerTransactionBytes: 4 << 20})
+	tcfg.Clock = g.clock
+	p, err := proxy.New(g.net, proxy.Config{
+		Self:            []sip.URI{mustURI("sip:icscf.rcs.local;lr")},
+		Router:          g.r,
+		Resolver:        resolver{},
+		Transaction:     tcfg,
+		MaxContexts:     contexts,
+		MaxContextBytes: bytes,
+		Rand:            &lockedReader{r: rand.NewChaCha8([32]byte{1})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.p = p
+	t.Cleanup(p.Close)
+	for i := range 20 {
+		m := request(t, "MESSAGE", impu1, fmt.Sprintf("Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKbig%d", i), fmt.Sprintf("Call-ID: big-%d@192.0.2.10", i))
+		m.Body = make([]byte, 300<<10)
+		g.receive(m)
+	}
+	waitFor(t, "a refusal", func() bool { return slices.Contains(g.net.responses(), "503 MESSAGE") })
+	if ls, ps := p.Layer().Stats(), p.Stats(); ls.ServerTransactionsRejected == 0 || ps.Overloaded != 0 {
+		t.Fatalf("layer %+v, proxy %+v: the proxy refused first", ls, ps)
 	}
 }
