@@ -290,7 +290,10 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 						if err == nil {
 							code = res.StatusCode
 						}
-						dropped <- code
+						select { // the first answer counts; the hook must not block
+						case dropped <- code:
+						default:
+						}
 						cancel()
 					}
 				}
