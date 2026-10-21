@@ -203,7 +203,7 @@ type Engine struct {
 	queue      []string
 	recipients map[string]*recipient
 	legs       map[legKey][]*Leg
-	invites    map[inviteKey]time.Time
+	invites    map[inviteKey]inviteMark
 	pagerOnly  map[string]struct{}
 	groups     GroupHandler
 	// departed marks the participants that left a group on this task
@@ -248,7 +248,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		composing:  newLimiter(IsComposingRate, cfg.MaxTracked),
 		recipients: map[string]*recipient{},
 		legs:       map[legKey][]*Leg{},
-		invites:    map[inviteKey]time.Time{},
+		invites:    map[inviteKey]inviteMark{},
 		pagerOnly:  map[string]struct{}{},
 		departed:   map[legKey]time.Time{},
 		groupLegs:  map[string]int{},
@@ -571,7 +571,7 @@ func (e *Engine) InviteFailed(inv Invitation, err error) {
 		e.kickEvent(inv.Recipient)
 		return
 	}
-	e.invites[key] = e.clock.Now().Add(e.cfg.InviteTimeout)
+	e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout)}
 	e.mu.Unlock()
 	e.metrics.Count("invite.failed", 1)
 }
