@@ -127,7 +127,10 @@ additionally sealed (below).
   is tried again, and one that keeps failing keeps the record under a
   deregistration's lease for the sweep after it, an RTR's too, since the
   HSS does not send an RTR again (`registrar.rtr_left_to_sweep`), and
-  counts `regevent.end_failed`. A store failure or a stop at any
+  counts `regevent.end_failed`. The lease of an RTR that ended the set for
+  good is marked `rejected`, so that the sweep's NOTIFY says
+  `reason=rejected` as the RTR's would have (#334); the lease holds no
+  bindings, so that NOTIFY names no contacts. A store failure or a stop at any
   point thus leaves either the record or the saved ends, and a sweep sends
   a final NOTIFY nobody sent. A subscription is deleted only once its final
   NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or 430); one
