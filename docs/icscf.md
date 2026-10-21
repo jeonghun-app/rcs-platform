@@ -33,6 +33,12 @@ optional ones first. With none, a REGISTER is answered 600 and a request for
 a user 480, counted as `icscf.scscf.no_capable`: a provisioning problem to
 alarm on.
 
+A name always wins over capabilities. This platform has one S-CSCF service,
+and `hss` puts the names in `HSS_SCSCF_NAMES` into every Server-Capabilities
+it sends, so while that is set the profile's capabilities choose nothing: no
+REGISTER gets 600, and no request 480, for want of a capability. Capabilities
+choose the S-CSCF only with `HSS_SCSCF_NAMES` unset ([hss](hss.md)).
+
 ## Reaching the S-CSCF
 
 The S-CSCF's URI from `ICSCF_SCSCF` is resolved by its Cloud Map name inside

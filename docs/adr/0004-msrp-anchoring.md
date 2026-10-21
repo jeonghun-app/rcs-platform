@@ -27,6 +27,11 @@ gateway controlled by the P-CSCF (TS 23.334).
     answer: it does not listen on its core address, and RFC 6135 §4.2.2 requires
     `active` from an endpoint that cannot provide a transport address it accepts
     connections on. The relay still sends an explicit `a=setup` (§4.2.1).
+  - No address of the core reaches a client: in a description toward the
+    client, `pcscf` also writes the relay's host into `o=` and the
+    session-level `c=` (RFC 8866 §5.2 lets `o=` carry any host the
+    originator chooses), and declines every line it does not anchor, since
+    only MSRP goes through the relay (#248).
   - A missing `a=setup` takes the RFC 4145 §4 defaults (`active` in an offer,
     `passive` in an answer), so a client without connection negotiation
     (RFC 6135 §5) is served.

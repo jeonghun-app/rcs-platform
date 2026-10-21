@@ -377,3 +377,20 @@ func TestARegisterToTheProductionFormOfANameLeavesOverTCP(t *testing.T) {
 		t.Errorf("the REGISTER left over %s to %s, want TCP to the configured URI", network, fwd.URI.String())
 	}
 }
+
+// QA of #274: a next hop out of room gets the proxy's own overload 503,
+// with its single Retry-After, and is not an unreachable S-CSCF.
+func TestAnOverloadedNextHopReachesTheCallerAs503WithOneRetryAfter(t *testing.T) {
+	g := newProxied(t)
+	g.net.mu.Lock()
+	g.net.fail = transport.ErrQueueFull
+	g.net.mu.Unlock()
+	g.receive(request(t, "MESSAGE", impu1))
+	waitFor(t, "a final response", func() bool { return len(g.net.responses()) > 0 })
+	if got := g.net.response(t, 503).Header.Values("Retry-After"); !slices.Equal(got, []string{"5"}) {
+		t.Errorf("the 503 carries Retry-After %v, want [5]", got)
+	}
+	if slices.Contains(g.metrics.names(), "icscf.scscf.unreachable") {
+		t.Error("an overloaded next hop was counted unreachable")
+	}
+}

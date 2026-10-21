@@ -13,6 +13,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
@@ -106,10 +107,31 @@ type Config struct {
 	Now     func() time.Time
 	Rand    io.Reader
 	Metrics Metrics
+	// Events is told of every change of a set's bindings, for the reg event
+	// (regevent.Notifier); nil tells no one.
+	Events Events
 	// Logger receives failures without identities, which are only logged
 	// through internal/pii, and never credentials. Nil discards them.
 	Logger *slog.Logger
 }
+
+// Events receives the changes of a set: before became after because of
+// cause (Changed), or before ended (Ended). regevent.Notifier implements
+// it. Changed must return at once, as the request that changed the set is
+// answered after it. Ended is called before the set's record is deleted,
+// and saves the end of its subscriptions: on an error the record is kept,
+// under a deregistration's lease, and the sweep after the lease calls it
+// again, so that the end is never lost (#256). The HSS does not send an
+// RTR again, so an RTR whose Ended fails leaves the lease too.
+type Events interface {
+	Changed(ctx context.Context, before, after *state.Registration, cause regevent.Cause)
+	Ended(ctx context.Context, before *state.Registration, cause regevent.Cause) error
+}
+
+type noEvents struct{}
+
+func (noEvents) Changed(context.Context, *state.Registration, *state.Registration, regevent.Cause) {}
+func (noEvents) Ended(context.Context, *state.Registration, regevent.Cause) error                  { return nil }
 
 // Registrar handles REGISTER requests (TS 24.229 §5.4.1).
 type Registrar struct {
@@ -139,6 +161,9 @@ func New(cfg Config) (*Registrar, error) {
 	}
 	if cfg.Metrics == nil {
 		cfg.Metrics = noMetrics{}
+	}
+	if cfg.Events == nil {
+		cfg.Events = noEvents{}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
