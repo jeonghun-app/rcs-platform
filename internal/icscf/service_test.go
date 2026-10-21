@@ -84,7 +84,7 @@ func TestConfigureReadsEverySetting(t *testing.T) {
 		"ICSCF_HSS_HOST_PATTERN", "hss-*.other.example.net",
 		"ICSCF_CX_TIMEOUT", "3s",
 		"ICSCF_MAX_SERVER_TRANSACTIONS", "500",
-		"ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1048576",
+		"ICSCF_MAX_SERVER_TRANSACTION_BYTES", "2097152",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestConfigureReadsEverySetting(t *testing.T) {
 		c.OriginHost != "icscf-a.core.example.net" || c.OriginRealm != "realm.example.net" ||
 		c.HSSRealm != "hss.example.net" || c.HSSDiscovery != DiscoveryDNS ||
 		c.HSSHostPattern != "hss-*.other.example.net" || c.CxTimeout != 3*time.Second ||
-		c.MaxServerTransactions != 500 || c.MaxServerTransactionBytes != 1<<20 {
+		c.MaxServerTransactions != 500 || c.MaxServerTransactionBytes != 2<<20 {
 		t.Errorf("config = %+v", c)
 	}
 }
@@ -135,6 +135,8 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"server transactions past 10^6": with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000001"),
 		"a count that is not a number":  with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "many"),
 		"no server transaction bytes":   with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "0"),
+		// One byte short of the largest request icscf reads.
+		"bytes below one request": with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1064959"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
@@ -208,9 +210,19 @@ func TestABudgetJustUnderTimerFIsAccepted(t *testing.T) {
 	}
 }
 
-// The largest transaction count the layer takes is accepted.
-func TestTheLargestTransactionCapIsAccepted(t *testing.T) {
-	if _, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000000", "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1")); err != nil {
-		t.Fatalf("10^6 transactions and 1 byte refused: %v", err)
+// The largest transaction count the layer takes is accepted, and a byte
+// bound of exactly one largest request (16 KiB of header, 1 MiB of body).
+func TestTheTransactionCapBoundsAreAccepted(t *testing.T) {
+	if _, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000000", "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1064960")); err != nil {
+		t.Fatalf("10^6 transactions and 1064960 bytes refused: %v", err)
+	}
+}
+
+// The proxy allows as many contexts as the layer allows server transactions,
+// so a burst meets the layer's cap first (code review of #311).
+func TestTheProxyAllowsAsManyContextsAsServerTransactions(t *testing.T) {
+	tcfg, contexts := proxyLimits(ServiceConfig{MaxServerTransactions: 30000, MaxServerTransactionBytes: 1 << 30})
+	if tcfg.MaxServerTransactions != 30000 || tcfg.MaxServerTransactionBytes != 1<<30 || contexts != 30000 {
+		t.Fatalf("limits = %+v, %d contexts", tcfg, contexts)
 	}
 }

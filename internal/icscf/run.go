@@ -105,15 +105,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return fmt.Errorf("icscf: core listener: %w", err)
 	}
+	tcfg, maxContexts := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
-		Self:     selfURIs(cfg, int(coreAddr.Port())),
-		Router:   router,
-		Resolver: dns,
-		Logger:   rt.Logger,
-		Transaction: transaction.Config{
-			MaxServerTransactions:     cfg.MaxServerTransactions,
-			MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
-		},
+		Self:        selfURIs(cfg, int(coreAddr.Port())),
+		Router:      router,
+		Resolver:    dns,
+		Logger:      rt.Logger,
+		Transaction: tcfg,
+		MaxContexts: maxContexts,
 	})
 	if err != nil {
 		return err
@@ -145,6 +144,17 @@ func drain(px *proxy.Proxy, d time.Duration) {
 	for px.Stats().Contexts > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// proxyLimits are the bounds of icscf's proxy: its layer's server
+// transaction caps (#37), and as many contexts as server transactions, so
+// the layer's cap, whose refusals the transaction statistics count, is the
+// one a burst meets, not a 503 of the proxy's own (code review of #311).
+func proxyLimits(cfg ServiceConfig) (transaction.Config, int) {
+	return transaction.Config{
+		MaxServerTransactions:     cfg.MaxServerTransactions,
+		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
+	}, cfg.MaxServerTransactions
 }
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own
