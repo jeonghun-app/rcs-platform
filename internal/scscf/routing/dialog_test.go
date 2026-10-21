@@ -1,6 +1,12 @@
 package routing
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -239,6 +245,63 @@ func TestAStandaloneRequestIsNotRecorded(t *testing.T) {
 		unsigned := sip.Address{URI: mustURI("sip:scscf.rcs.local;transport=tcp;lr")}
 		if d := rt.InDialog(bg, inDialog(t, core, "", unsigned)); d.Status != 403 {
 			t.Errorf("%s: a request to its Contact is %d", method, d.Status)
+		}
+	}
+}
+
+// TestADialogKeyPrintsWithoutItsKey (security on #322): fmt, slog and JSON
+// show its ID alone, in a Config as on its own.
+func TestADialogKeyPrintsWithoutItsKey(t *testing.T) {
+	k := DialogKey{ID: "k2", Key: []byte("0123456789abcdef0123456789abcdef")}
+	cfg := Config{DialogKeys: []DialogKey{k}}
+	var logged bytes.Buffer
+	slog.New(slog.NewTextHandler(&logged, nil)).Info("key", "key", k, "keys", cfg.DialogKeys)
+	js, err := json.Marshal(struct{ Keys []DialogKey }{cfg.DialogKeys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{fmt.Sprint(k), fmt.Sprintf("%v %+v %#v %s %x", k, k, k, k, k), fmt.Sprintf("%+v", cfg), logged.String(), string(js)} {
+		for _, leak := range []string{"0123456789abcdef", hex.EncodeToString(k.Key[:8]), base64.StdEncoding.EncodeToString(k.Key[:9])} {
+			if strings.Contains(out, leak) {
+				t.Errorf("%q gives the key away", out)
+			}
+		}
+		if !strings.Contains(out, "k2") {
+			t.Errorf("%q does not name the key", out)
+		}
+	}
+}
+
+// TestNewKeepsTheCurrentAndThePreviousKeyAlone: a third is refused, as a
+// list that grew with each rotation would keep every key that leaked.
+func TestNewKeepsTheCurrentAndThePreviousKeyAlone(t *testing.T) {
+	e := newEnv(t)
+	k := func(id string, b byte) DialogKey {
+		return DialogKey{ID: id, Key: bytes.Repeat([]byte{b}, MinDialogKeyBytes)}
+	}
+	if _, err := New(validConfig(e, func(c *Config) { c.DialogKeys = []DialogKey{k("k3", 3), k("k2", 2)} })); err != nil {
+		t.Errorf("two keys: %v", err)
+	}
+	if _, err := New(validConfig(e, func(c *Config) { c.DialogKeys = []DialogKey{k("k3", 3), k("k2", 2), k("k1", 1)} })); err == nil {
+		t.Error("three keys accepted")
+	}
+}
+
+// TestASignedSIPSHopIsItsTLSListener: sips: defaults to TLS on 5061, which
+// the same URI written out names, and no TCP one does.
+func TestASignedSIPSHopIsItsTLSListener(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil, func(c *Config) {
+		c.ApplicationServers = append(c.ApplicationServers, mustURI("sips:rcs-as.rcs.local:5061"))
+	})
+	signed := signedFor(rt, "sips:as@10.0.131.7")
+	for target, want := range map[string]int{
+		"sips:as@10.0.131.7":                    0,
+		"sips:as@10.0.131.7:5061;transport=tls": 0,
+		"sip:as@10.0.131.7:5061;transport=tcp":  403,
+	} {
+		if d := rt.InDialog(bg, inDialog(t, target, "", signed)); d.Status != want {
+			t.Errorf("%s: %d, want %d", target, d.Status, want)
 		}
 	}
 }

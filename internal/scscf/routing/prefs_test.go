@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // TestCallerPreferenceRules (RFC 3841 §7.2): which bindings a preference
@@ -122,6 +123,7 @@ func TestMoreCallerPreferencesThanEightAre400(t *testing.T) {
 		"eight accepts": {"Accept-Contact: " + strings.Repeat("*;audio, ", 7) + "*;audio", 0},
 		"nine accepts":  {"Accept-Contact: " + strings.Repeat("*;audio, ", 8) + "*;audio", 400},
 		"nine rejects":  {"Reject-Contact: " + strings.Repeat("*;video, ", 8) + "*;video", 400},
+		"nine fields":   {strings.TrimSuffix(strings.Repeat("Accept-Contact: *;audio\r\n", 9), "\r\n"), 400},
 	} {
 		if d := rt.Terminating(bg, request(t, "INVITE", impu1, c.field)); d.Status != c.status {
 			t.Errorf("%s: status %d, want %d", name, d.Status, c.status)
@@ -235,4 +237,16 @@ func TestANegatedValueDropsABindingWithOnlyThatValue(t *testing.T) {
 			t.Errorf("%s: kept %v, want %v", name, len(got) == 1, c.kept)
 		}
 	}
+}
+
+// accepted are the bindings of cs that req's caller preferences accept, as
+// preferences.accepted, for the tests; with preferences that are refused,
+// every binding.
+func accepted(cs []state.Contact, req *sip.Request) []state.Contact {
+	p, err := preferencesOf(req)
+	if err != nil {
+		return cs
+	}
+	var ops int
+	return p.accepted(cs, &ops)
 }

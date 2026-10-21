@@ -6,6 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +38,17 @@ type DialogKey struct {
 	ID  string
 	Key []byte
 }
+
+// redactedKey is what a DialogKey prints as: its ID, never its key.
+func (k DialogKey) redacted() string { return "DialogKey{ID:" + k.ID + " Key:[redacted]}" }
+
+// String, GoString, Format, LogValue and MarshalJSON print the key's ID
+// alone, so that a Config logged or printed does not give the key away.
+func (k DialogKey) String() string               { return k.redacted() }
+func (k DialogKey) GoString() string             { return k.redacted() }
+func (k DialogKey) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, k.redacted()) }
+func (k DialogKey) LogValue() slog.Value         { return slog.StringValue(k.redacted()) }
+func (k DialogKey) MarshalJSON() ([]byte, error) { return json.Marshal(k.redacted()) }
 
 // endpoint is a URI as a hop of a dialog: its scheme, user, host, port and
 // transport, the default port and transport written out, so that the URI a

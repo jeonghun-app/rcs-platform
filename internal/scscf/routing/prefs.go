@@ -149,17 +149,6 @@ func (p preferences) keeps(f features, ops *int) bool {
 	return true
 }
 
-// accepted are the bindings of cs that req's caller preferences accept, as
-// preferences.accepted; with preferences that are refused, every binding.
-func accepted(cs []state.Contact, req *sip.Request) []state.Contact {
-	p, err := preferencesOf(req)
-	if err != nil {
-		return cs
-	}
-	var ops int
-	return p.accepted(cs, &ops)
-}
-
 // features is the feature set of a binding (RFC 3840 §9), by lower-case
 // name, each feature's values read once.
 type features map[string]*stated
