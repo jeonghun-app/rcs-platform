@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"strings"
@@ -448,10 +449,24 @@ func TestARequestGoesPastEveryRefusingAddress(t *testing.T) {
 
 // blackholeDialer never completes a connection to hole, as the address of a
 // stopped task in a VPC drops the SYN, and dials anything else.
-type blackholeDialer struct{ hole string }
+// It counts the dials to hole and keeps the longest time one was given.
+type blackholeDialer struct {
+	hole    string
+	mu      sync.Mutex
+	dials   int
+	allowed time.Duration
+}
 
-func (b blackholeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (b *blackholeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if host, _, _ := net.SplitHostPort(address); host == b.hole {
+		b.mu.Lock()
+		b.dials++
+		if dl, ok := ctx.Deadline(); !ok {
+			b.allowed = time.Duration(math.MaxInt64)
+		} else {
+			b.allowed = max(b.allowed, time.Until(dl))
+		}
+		b.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -459,9 +474,18 @@ func (b blackholeDialer) DialContext(ctx context.Context, network, address strin
 	return d.DialContext(ctx, network, address)
 }
 
+// holeDials is how many dials went to the hole, and the longest any of them
+// was given.
+func (b *blackholeDialer) holeDials() (int, time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dials, b.allowed
+}
+
 // QA of #276: a blackholed address costs the 2 s connection timeout, not
 // the transport's 5 s, and only once: the next request goes to another
-// address first.
+// address first. Both are judged from the dials, not from how long the
+// requests took, which a loaded host stretches (#313).
 func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 	hss := startHSS(t)
 	scscf := startSCSCF(t)
@@ -470,22 +494,75 @@ func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 	lookup := func(context.Context, string, string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("127.0.0.9"), netip.MustParseAddr("127.0.0.1")}, nil
 	}
+	hole := &blackholeDialer{hole: "127.0.0.9"}
 	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(fmt.Sprintf("sip:scscf.rcs.local:%d;transport=tcp", port))}}, func(_ *ServiceConfig, d *deps) {
 		d.lookup = lookup
 		d.shuffle = func(int, func(i, j int)) {}
-		d.sipDialer = blackholeDialer{hole: "127.0.0.9"}
+		d.sipDialer = hole
 	})
 	r.waitReady(t)
-	send := func() (int, time.Duration) {
-		start := time.Now()
-		res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
-		return res.StatusCode, time.Since(start)
+	send := func() int {
+		return r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">").StatusCode
 	}
-	if code, took := send(); code != 200 || took > 4*time.Second {
-		t.Fatalf("first: %d after %v, want 200 after about 2s", code, took)
+	if code := send(); code != 200 {
+		t.Fatalf("first: %d, want 200 from the good address", code)
 	}
-	if code, took := send(); code != 200 || took > 500*time.Millisecond {
-		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)
+	if n, allowed := hole.holeDials(); n != 1 || allowed > 2*time.Second {
+		t.Fatalf("first: %d dials to the blackholed address, given up to %v, want one of at most 2s", n, allowed)
+	}
+	if code := send(); code != 200 {
+		t.Fatalf("second: %d, want 200 from the good address", code)
+	}
+	if n, _ := hole.holeDials(); n != 1 {
+		t.Fatalf("the second request dialed the blackholed address again (%d dials in all)", n)
+	}
+}
+
+// #37: past ICSCF_MAX_SERVER_TRANSACTIONS a request is answered 503 with
+// Retry-After, icscf's own overload (decided on #15), while the one in
+// progress goes on.
+func TestARequestPastTheTransactionCapGets503(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hss.answer = func(uint32) (cx.Result, string) {
+		once.Do(func() { close(held); <-release })
+		return cx.ResultCode(diameter.ResultSuccess), scscf.uri()
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.MaxServerTransactions = 1
+	})
+	r.waitReady(t)
+	first := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	select {
+	case <-held:
+	case <-time.After(realWait):
+		t.Fatal("the first request never reached the HSS")
+	}
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f2", "To: <"+tel1+">")
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
+		t.Errorf("past the cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	close(release)
+	if got := <-first; got != "200" {
+		t.Fatalf("the request in progress got %s, want 200", got)
+	}
+}
+
+// And past ICSCF_MAX_SERVER_TRANSACTION_BYTES: with a bound smaller than any
+// request, every one is refused.
+func TestARequestPastTheTransactionByteCapGets503(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.MaxServerTransactionBytes = 64
+	})
+	r.waitReady(t)
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
+		t.Errorf("past the byte cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
 	}
 }
 
