@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
@@ -262,5 +263,77 @@ func TestTwoRequestsOfOneTaskTakeAGroupOverAtOnce(t *testing.T) {
 	}
 	if _, ok := got.Participant(dave); !ok {
 		t.Fatalf("participants %+v", got.Participants)
+	}
+}
+
+// write has who write text in uri through r's engine.
+func (r *rig) write(t *testing.T, uri, who, id string) error {
+	t.Helper()
+	return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: uri, Sender: who, CPIM: message(t, who, id, "x", 0)})
+}
+
+// #121 D2: a message written on a task that does not own the group, its
+// owner alive, is refused there and queues nothing: its copies are the
+// owner's to queue (D3 forwards the session there).
+func TestAMessageOnATaskThatDoesNotOwnTheGroupQueuesNothing(t *testing.T) {
+	a, b, _, _ := twoTasks(t, Config{}, Config{})
+	g := a.create(bob)
+	if err := b.write(t, g.URI, alice, "m1"); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("the write on b = %v", err)
+	}
+	if n := b.queues.Len(bob); n != 0 {
+		t.Fatalf("%d copies queued on b", n)
+	}
+	if err := a.write(t, g.URI, alice, "m2"); err != nil {
+		t.Fatalf("the write on the owner = %v", err)
+	}
+	if n := a.queues.Len(bob); n != 1 {
+		t.Fatalf("%d copies queued on a", n)
+	}
+}
+
+// #121 D2 (T4): an owner paused while another task took its group over
+// (its own clock still sees its lease, and it remembers the group as its
+// own) queues no copy of a message written to it: each is queued under its
+// fence, which the store no longer holds.
+func TestAPausedOwnerQueuesNoCopy(t *testing.T) {
+	a, b, sa, _ := twoTasks(t, Config{}, Config{})
+	g := a.create(bob)
+	if err := a.write(t, g.URI, alice, "m1"); err != nil {
+		t.Fatal(err)
+	}
+	sa.failBeats.Store(true)
+	b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+	if err := b.add(t, g.URI, carol); err != nil {
+		t.Fatal(err)
+	}
+	before := a.queues.Len(bob)
+	if err := a.write(t, g.URI, alice, "m2"); !errors.Is(err, store.ErrNotOwner) {
+		t.Fatalf("the paused owner's write = %v", err)
+	}
+	if a.queues.Len(bob) != before || a.m.get("group.fanout.not_owner") != 1 {
+		t.Fatalf("bob's queue %d, was %d; %d refused", a.queues.Len(bob), before, a.m.get("group.fanout.not_owner"))
+	}
+}
+
+// #121 D2: whether this task owns a group is remembered for a heartbeat
+// when another task does, so that a queue of the group's copies costs no
+// read of the store each.
+func TestThatAnotherTaskOwnsAGroupIsRemembered(t *testing.T) {
+	a, b, _, sb := twoTasks(t, Config{}, Config{})
+	g := a.create(bob)
+	if owns, err := b.s.Owns(t.Context(), g.URI); err != nil || owns {
+		t.Fatalf("b owns a's group: %v, %v", owns, err)
+	}
+	reads := sb.gets.Load() + sb.owners.Load() + sb.tasks.Load()
+	if owns, _ := b.s.Owns(t.Context(), g.URI); owns || sb.gets.Load()+sb.owners.Load()+sb.tasks.Load() != reads {
+		t.Fatal("b read the store again within a heartbeat")
+	}
+	if owns, err := a.s.Owns(t.Context(), g.URI); err != nil || !owns {
+		t.Fatalf("a does not own its group: %v, %v", owns, err)
+	}
+	b.pass(t, DefaultTaskHeartbeat)
+	if b.s.Owns(t.Context(), g.URI); sb.gets.Load()+sb.owners.Load()+sb.tasks.Load() == reads {
+		t.Fatal("b never asked again")
 	}
 }

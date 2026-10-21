@@ -7,6 +7,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
 // Defaults of the ownership settings (#121, ADR 0005).
@@ -102,6 +103,59 @@ func (s *Service) owner(ctx context.Context, g groupstore.Group) (groupstore.Own
 	s.metrics.Count("group.owner_takeover", 1)
 	s.own(g.URI, next)
 	return next, nil
+}
+
+// Owns implements messaging.GroupHandler: whether this task owns the
+// group uri, taking it over if its owner has stopped (owner). That another
+// task owns it is remembered for TaskHeartbeat, so that a queue of copies
+// of its messages costs no read for each; an ended group is no one's.
+func (s *Service) Owns(ctx context.Context, uri string) (bool, error) {
+	now := s.cfg.Clock.Now()
+	s.mu.Lock()
+	_, mine := s.owned[uri]
+	until, other := s.others[uri]
+	s.mu.Unlock()
+	switch {
+	case mine && s.alive(now):
+		return true, nil
+	case other && now.Before(until):
+		return false, nil
+	}
+	g, err := s.get(ctx, uri)
+	if errors.Is(err, ErrNoGroup) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, err = s.owner(ctx, g)
+	if errors.Is(err, ErrNotOwner) {
+		s.mu.Lock()
+		if len(s.others) >= s.cfg.MaxTracked {
+			clear(s.others)
+		}
+		s.others[uri] = now.Add(s.cfg.TaskHeartbeat)
+		s.mu.Unlock()
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// fence is the store.Fence of g's copies: the owner this task queues them
+// under, with a heartbeat running (StartHeartbeat), where another task
+// may take the group; none without one.
+func (s *Service) fence(ctx context.Context, g groupstore.Group) (*store.Fence, error) {
+	s.mu.Lock()
+	beating := s.beating
+	s.mu.Unlock()
+	if !beating {
+		return nil, nil
+	}
+	o, err := s.owner(ctx, g)
+	if err != nil {
+		return nil, err
+	}
+	return &store.Fence{Group: g.URI, Task: o.Task, Epoch: o.Epoch}, nil
 }
 
 func (s *Service) own(uri string, o groupstore.Owner) {

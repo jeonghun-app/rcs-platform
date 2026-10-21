@@ -1133,6 +1133,7 @@ The task role needs these IAM actions:
 | `dynamodb:UpdateItem` | table | `Claim`, `Release`, `MarkNotified`, `UnmarkNotified`, size corrections, and the `Update`s inside both transactions |
 | `dynamodb:DeleteItem` | table | the `Delete` inside the removal transactions |
 | `dynamodb:ConditionCheckItem` | table | the `ConditionCheck` inside a summary's removal |
+| `dynamodb:ConditionCheckItem` | the `groupchats` table | the `ConditionCheck` of a group's owner inside a group message copy's enqueue (#121) |
 | `dynamodb:Query` | table | `Pending`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
 | `dynamodb:DescribeTable` | table | readiness |
@@ -1216,7 +1217,16 @@ chat on has a heartbeat item:
   another task holds it.
 
 Each group message costs one strongly consistent read of the group item and,
-per recipient, the enqueue transaction of the `messages` table. The fan-out
+per recipient, the enqueue transaction of the `messages` table, which also
+checks the group's owner item in `groupchats` (#121): one more item in the
+transaction, so each copy costs about 2 more write units. A copy is queued
+only while the owner item still names the task that queues it, so a task that
+lost the group queues none (the fan-out stops at the first refused copy,
+`group.fanout.not_owner`, and the sender is answered as for a store failure).
+Only the owner invites a participant for its queued copies
+(`delivery.group_not_owned` counts those another task's queue pass left
+alone); the owner reads the queue again on `Engine.Wake`, which #121 D3's
+wake message from the task that saw a registration calls. The fan-out
 budget bounds that per group. A notification costs a read of its sent-message
 record first, and of the group item only when the record exists; an
 is-composing indication reads the group item only when another participant
@@ -1271,6 +1281,7 @@ identifier ever appears in a metric name.
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
+| `group.fanout.not_owner`, `delivery.group_not_owned`, `group.wake` | #121: fan-outs stopped because another task took the group over; group copies a task that does not own the group did not invite for; queue reads the owner was asked for |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but neither queued nor summarized, the summaries' total or the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through

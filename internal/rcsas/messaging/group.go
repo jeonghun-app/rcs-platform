@@ -49,6 +49,11 @@ type GroupHandler interface {
 	// that messages are kept for; false, without an error, when the group
 	// has ended.
 	Member(ctx context.Context, group, user string) (bool, error)
+	// Owns reports whether this task owns group (#121), taking it over if
+	// its owner has stopped: false when another task, alive, does. Only
+	// the owner invites a group's participants for their queued copies,
+	// so that a group's sessions all open on one task.
+	Owns(ctx context.Context, group string) (bool, error)
 }
 
 // Audience is who a participant's message in a group goes to, and the
@@ -59,6 +64,17 @@ type Audience struct {
 	// empty. It replaces the name the sender's client wrote in the CPIM
 	// From, which could be another participant's.
 	SenderName string
+	// Fence, when set, is the group's owner the message's copies are
+	// queued under (store.Message.Fence, #121).
+	Fence *store.Fence
+}
+
+// Wake has the engine read user's queue again, as a registration on a new
+// flow does: for the owner of a group whose copies wait in it, told by
+// the task that saw the registration (#121).
+func (e *Engine) Wake(user string) {
+	e.metrics.Count("group.wake", 1)
+	e.kickEvent(user)
 }
 
 // SetGroupHandler gives the engine the group package that runs the
@@ -311,10 +327,18 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 		q := store.Message{
 			Recipient: r, ID: id, Sender: o.Group, Author: o.Sender, Mode: store.Group, MessageID: m.Request.MessageID,
 			Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
-			CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
+			CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL), Fence: aud.Fence,
 		}
 		sctx, cancel := e.withTimeout(fctx, e.cfg.StoreTimeout)
 		err = e.enqueue(sctx, q)
+		if errors.Is(err, store.ErrNotOwner) {
+			// Another task took the group over: it queues nothing more of
+			// this message, and the sender's client sends it again, to
+			// the new owner (#121).
+			cancel()
+			e.metrics.Count("group.fanout.not_owner", 1)
+			return err
+		}
 		if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {
 			e.metrics.Count("group.fanout.queue_full", 1)
 			if n, nerr := e.notification(q, failedDelivery, q.ID+"-f", now); nerr == nil {
