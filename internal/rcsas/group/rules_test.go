@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -420,5 +421,40 @@ func TestRenamingInAGroupIsBounded(t *testing.T) {
 	}
 	if r.m.get("group.name_dropped") != 2 {
 		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// #305: a group created without a Conversation-ID gets a random UUID
+// (version 4), the form OMA CPM Appendix C.1.1 asks for; one the client
+// gives is kept, and a group stored with the 32 hex digits groups were
+// given before is read and used as it is.
+func TestAGroupsConversationIDIsAUUID(t *testing.T) {
+	r := newRig(t, Config{})
+	uuid4 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	seen := map[string]bool{}
+	for range 3 {
+		g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !uuid4.MatchString(g.Conversation) || seen[g.Conversation] {
+			t.Fatalf("Conversation-ID %q", g.Conversation)
+		}
+		seen[g.Conversation] = true
+	}
+	given, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}, Conversation: "given-1"})
+	if err != nil || given.Conversation != "given-1" {
+		t.Fatalf("given %q, %v", given.Conversation, err)
+	}
+	old := r.create(bob)
+	old.Conversation = "0123456789abcdef0123456789abcdef"
+	if err := r.groups.Update(t.Context(), old, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := r.s.Get(t.Context(), old.URI); err != nil || g.Conversation != old.Conversation {
+		t.Fatalf("the old group %+v, %v", g, err)
+	}
+	if _, err := r.s.Recipients(t.Context(), old.URI, alice, messaging.GroupText); err != nil {
+		t.Fatalf("writing in the old group: %v", err)
 	}
 }

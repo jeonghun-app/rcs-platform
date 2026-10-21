@@ -306,7 +306,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	}
 	conv := r.Conversation
 	if conv == "" {
-		if conv, err = s.randomHex(16); err != nil {
+		if conv, err = s.randomUUID(); err != nil {
 			return groupstore.Group{}, err
 		}
 	}
@@ -827,6 +827,22 @@ func (s *Service) touch(ctx context.Context, g groupstore.Group, now time.Time) 
 	if err := s.store.Touch(ctx, g.URI, now, now.Add(s.cfg.IdleTTL)); err == nil {
 		s.metrics.Count("group.touched", 1)
 	}
+}
+
+// randomUUID is a random UUID (RFC 9562 §5.4, version 4), the form OMA CPM
+// asks of a Conversation-ID (Conversation Functions, Appendix C.1.1) and
+// in which the focus makes one for a group created without (#305). Groups
+// stored before keep the 32 hex digits they were made with: a
+// Conversation-ID is opaque, and is read and compared as stored.
+func (s *Service) randomUUID() (string, error) {
+	u := make([]byte, 16)
+	if _, err := io.ReadFull(s.rand, u); err != nil {
+		return "", fmt.Errorf("group: random source: %w", err)
+	}
+	u[6] = u[6]&0x0f | 0x40 // version 4
+	u[8] = u[8]&0x3f | 0x80 // the RFC 9562 variant
+	x := hex.EncodeToString(u)
+	return x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32], nil
 }
 
 func (s *Service) randomHex(n int) (string, error) {

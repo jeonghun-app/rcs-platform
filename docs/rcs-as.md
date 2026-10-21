@@ -609,7 +609,10 @@ request (`invalid`); a bad invitee or name never does:
   are not normalized (NFC), and look-alike letters of different scripts are
   not folded.
 - **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
-  in 1-to-1 chat.
+  in 1-to-1 chat. A group created without one gets a random UUID (version 4),
+  the form OMA CPM asks of a Conversation-ID (Conversation Functions,
+  Appendix C.1.1). Groups made before #305 keep the 32 hex digits they were
+  given: the value is opaque, and read and compared as stored.
 
 ### Fan-out
 
