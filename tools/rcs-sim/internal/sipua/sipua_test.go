@@ -515,6 +515,10 @@ func TestSameInstanceFollowsTheURNRules(t *testing.T) {
 		{"<tag:x:Y>", "<foo:x:Y>", false},
 		{"urn:uuid:1>", "<urn:uuid:1>", false},
 		{"<urn:example:ab%2f>", "<urn:example:ab%2F>", true},
+		// QA on #280: an escape cut off at the end is no index past the
+		// value, and a URN needs its closing ">".
+		{"<urn:example:a%2>", "<urn:example:a%2>", true},
+		{"<urn:uuid:1", "<urn:uuid:1>", false},
 	} {
 		if got := SameInstance(c.a, c.b); got != c.same {
 			t.Errorf("SameInstance(%q, %q) = %v, want %v", c.a, c.b, got, c.same)

@@ -64,7 +64,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	if dialogForming(r.Message.Method) {
 		rr = p.recordRoute(src.Flow, contactHasOb(r.Message), icid, r.Message.Header.Get("Call-ID"))
 	}
-	return proxy.Decision{
+	return p.anchorOriginating(r, proxy.Decision{
 		Targets:     []proxy.Target{{URI: r.Message.URI}},
 		RecordRoute: rr,
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
@@ -72,6 +72,17 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			// client wrote below pcscf's own entry is not where it
 			// registered.
 			req.Header.Del("Route")
+			// A client records no route: only pcscf's values, which the
+			// proxy put on top, go on, so that the route set of the
+			// dialog's core side is what pcscf and the core recorded, and
+			// a request pcscf sends in it goes nowhere the client chose
+			// (#248 security review).
+			req.Header.Del("Record-Route")
+			for _, a := range rr {
+				if err := req.Header.Add("Record-Route", a.String()); err != nil {
+					return err
+				}
+			}
 			for _, a := range routes {
 				if err := req.Header.Add("Route", a.String()); err != nil {
 					return err
@@ -85,7 +96,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			}
 			return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 		},
-	}
+	})
 }
 
 // dialogForming reports whether a request of method sets up a dialog, and so
@@ -406,6 +417,9 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 		if icid, err = p.icid(); err != nil {
 			return proxy.Decision{Status: 500}
 		}
+	}
+	if !p.msrpInDialog(r.Source.Flow, r.Message, true) {
+		return p.refuseOffer()
 	}
 	d := proxy.Forward(r)
 	d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
