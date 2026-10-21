@@ -1044,7 +1044,8 @@ func testRefusedSaveKeepsAGoneProfileGone(t *testing.T, a, b state.Store, _ Opti
 
 // testRejectedLease: a deregistration's lease marked Rejected reads back
 // with the mark, and keeps it through a sweep's claim, on every backend;
-// a record no deregistration holds cannot have it (#334).
+// a record no deregistration holds, with bindings or an unregistered
+// user's without, cannot have it (#334).
 func testRejectedLease(t *testing.T, a, b state.Store, o Options) {
 	r := Registration(IMPI1, IMPU1)
 	r.Deregistering, r.Rejected = T0.Add(-time.Second), true
@@ -1071,5 +1072,11 @@ func testRejectedLease(t *testing.T, a, b state.Store, o Options) {
 	live := Registration(IMPI2, IMPU2, time.Hour)
 	live.Rejected = true
 	_, err := a.SaveRegistration(ctx(t), live)
+	wantErr(t, err, state.ErrInvalid)
+	// Keyed on the lease, not on the bindings: an unregistered user's
+	// record has none, and no lease (QA on #351).
+	unreg := Registration(IMPI2, IMPU2)
+	unreg.Unregistered, unreg.Rejected = T0.Add(time.Hour), true
+	_, err = a.SaveRegistration(ctx(t), unreg)
 	wantErr(t, err, state.ErrInvalid)
 }

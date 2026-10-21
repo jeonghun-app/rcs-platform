@@ -251,3 +251,67 @@ func TestAnRTRsEndTheSweepFinishesSaysRejected(t *testing.T) {
 		})
 	}
 }
+
+// failingNotifier is a notifier on e's store whose listings all fail, so
+// that every Ended it is asked for fails.
+func failingNotifier(t *testing.T, e *env, s regevent.Sender) *regevent.Notifier {
+	t.Helper()
+	ts := &troubledStore{Store: e.store, listFails: 1 << 20}
+	u, _ := sip.ParseURI("sip:scscf." + realm)
+	n, err := regevent.New(regevent.Config{Store: ts, Sender: s, Contact: u, Now: e.clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// reasonsSent are the Subscription-States of the NOTIFYs s sent from the
+// from-th on, as state;reason.
+func reasonsSent(s *notifySender, from int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, req := range s.sent[from:] {
+		ss, _ := req.Header.SubscriptionState()
+		r, _ := ss.Params.Get("reason")
+		out = append(out, ss.State+";"+r)
+	}
+	return out
+}
+
+// TestAREGISTERDuringARejectedLeaseIsNotRejected (QA on #351): the user
+// registers again while an RTR's rejected lease holds (the operator
+// provisioned it again); the REGISTER succeeds, its record has no mark,
+// and its later expiry says deactivated.
+func TestAREGISTERDuringARejectedLeaseIsNotRejected(t *testing.T) {
+	e := newEnv(t)
+	g, n, s := withNotifier(t, e)
+	u := registered(t, e, g, 600, impu1)
+	n.Wait()
+	subscribeAsPCSCF(t, n)
+	rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}
+	wantResult(t, e.instance(2, func(cfg *Config) { cfg.Events = failingNotifier(t, e, s) }).HandleRTR(bg, rtr), resultSuccess)
+	if !must(regOf(e, impu1))(t).Rejected {
+		t.Fatal("no mark on the lease")
+	}
+	e.clock.advance(10 * time.Second)
+	wantStatus(t, u.registerWith(g, 600), 200)
+	n.Wait()
+	r := must(regOf(e, impu1))(t)
+	if r.Rejected || len(r.Contacts) == 0 || !r.Deregistering.IsZero() {
+		t.Fatalf("record after the REGISTER: %+v", r)
+	}
+	subscribeAsPCSCF(t, n)
+	k := s.count()
+	e.clock.advance(601 * time.Second)
+	for range 3 {
+		_, _ = g.Sweep(bg, 10)
+		n.Wait()
+		e.clock.advance(state.SweepLease + time.Second)
+	}
+	for _, got := range reasonsSent(s, k) {
+		if got == "terminated;rejected" {
+			t.Errorf("an expiry after a new REGISTER said rejected: %v", reasonsSent(s, k))
+		}
+	}
+}
