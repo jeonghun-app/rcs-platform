@@ -37,7 +37,11 @@ type thirdParty struct {
 // set's go in the order the registrar told of them, so that the server
 // does not hear a registration after the deregistration that followed it,
 // and at most queuedPerSet of a set's are queued, so that one set's
-// refreshes do not take the queue (#379 code review).
+// refreshes do not take the queue (#379 code review). One past either
+// bound takes the place of its set's last one waiting, which it is newer
+// than, so that the server hears the set's latest state, its end above
+// all (#379 code review); it is dropped only when its set has none
+// waiting.
 type serverQueue struct {
 	slots  chan struct{}
 	queued int
@@ -45,10 +49,19 @@ type serverQueue struct {
 }
 
 // setQueue is a set's registrations queued for one server: tail is closed
-// once the last one told of is done.
+// once the last one told of is done, and last is that one.
 type setQueue struct {
 	tail   chan struct{}
 	queued int
+	last   *pending
+}
+
+// pending is a registration queued for a server, which a later one of its
+// set may take the place of until it is sent.
+type pending struct {
+	r      registrar.ThirdPartyRegistration
+	server ifc.ApplicationServer
+	sent   bool
 }
 
 // queuedPerServer bounds the registrations queued for a server, as a
@@ -65,8 +78,9 @@ const queuedPerSet = 4
 // REGISTER a third-party REGISTER for it (TS 24.229 §5.4.1.7), off the
 // caller's goroutine, to each server apart. The criteria are read now,
 // from r.Profile or the store: once a set has ended its profile goes. One
-// past a server's or a set's queue (serverQueue), or told of after Wait,
-// is dropped and counted.
+// past a server's or a set's queue (serverQueue) replaces its set's last
+// one waiting, or, with none, is dropped and counted, as is one told of
+// after Stop.
 func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistration) {
 	if rt.cfg.Sender == nil {
 		return
@@ -99,9 +113,9 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 		return
 	}
 	for _, fc := range matched {
-		q, sq, prev, done, ok := rt.enqueue(fc.ApplicationServer.ServerName, key)
-		if !ok {
-			rt.count("routing.third_party.dropped")
+		p := &pending{r: r, server: fc.ApplicationServer}
+		q, sq, prev, done, queued := rt.enqueue(fc.ApplicationServer.ServerName, key, p)
+		if !queued {
 			continue
 		}
 		rt.tp.wg.Add(1)
@@ -111,7 +125,11 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 				<-prev
 			}
 			q.slots <- struct{}{}
-			rt.registerWith(ctx, r, fc.ApplicationServer)
+			rt.tp.mu.Lock()
+			p.sent = true
+			r, server := p.r, p.server
+			rt.tp.mu.Unlock()
+			rt.registerWith(ctx, r, server)
 			<-q.slots
 			rt.tp.mu.Lock()
 			q.queued--
@@ -124,10 +142,12 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 	}
 }
 
-// enqueue queues a registration of the set key for server, and returns its
-// queues, the channel the one before it of the set's closes, nil if none,
-// and the one it closes itself; not ok when either queue is full.
-func (rt *Router) enqueue(server, key string) (q *serverQueue, sq *setQueue, prev, done chan struct{}, ok bool) {
+// enqueue queues p, a registration of the set key for server, and returns
+// its queues, the channel the one before it of the set's closes, nil if
+// none, and the one it closes itself. Past either bound p takes the place
+// of the set's last one waiting, or is dropped; either way, counted, and
+// not queued.
+func (rt *Router) enqueue(server, key string, p *pending) (q *serverQueue, sq *setQueue, prev, done chan struct{}, queued bool) {
 	rt.tp.mu.Lock()
 	defer rt.tp.mu.Unlock()
 	q = rt.tp.servers[server]
@@ -137,14 +157,21 @@ func (rt *Router) enqueue(server, key string) (q *serverQueue, sq *setQueue, pre
 	}
 	sq = q.sets[key]
 	switch {
-	case q.queued >= queuedPerServer*rt.cfg.MaxThirdParty, sq != nil && sq.queued >= queuedPerSet:
+	case q.queued < queuedPerServer*rt.cfg.MaxThirdParty && (sq == nil || sq.queued < queuedPerSet):
+	case sq != nil && sq.last != nil && !sq.last.sent:
+		sq.last.r, sq.last.server = p.r, p.server
+		rt.count("routing.third_party.replaced")
 		return nil, nil, nil, nil, false
-	case sq == nil:
+	default:
+		rt.count("routing.third_party.dropped")
+		return nil, nil, nil, nil, false
+	}
+	if sq == nil {
 		sq = &setQueue{}
 		q.sets[key] = sq
 	}
 	prev, done = sq.tail, make(chan struct{})
-	sq.tail = done
+	sq.tail, sq.last = done, p
 	sq.queued++
 	q.queued++
 	return q, sq, prev, done, true

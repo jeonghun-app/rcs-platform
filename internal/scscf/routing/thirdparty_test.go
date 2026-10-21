@@ -91,7 +91,7 @@ func TestAServerWhoseCriterionTakesTheREGISTERGetsAThirdPartyREGISTER(t *testing
 	s := &sentRegisters{}
 	rt := e.router(nil, withSender(s))
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, 599*time.Second+time.Millisecond))
-	rt.Wait()
+	rt.Stop()
 	got := s.got()
 	if len(got) != 1 {
 		t.Fatalf("%d REGISTERs", len(got))
@@ -130,7 +130,7 @@ func TestAServerAsksForTheREGISTERAndThe200InTheBody(t *testing.T) {
 			s := &sentRegisters{}
 			rt := e.router(nil, withSender(s))
 			rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-			rt.Wait()
+			rt.Stop()
 			r := s.got()[0]
 			ct := r.Header.Get("Content-Type")
 			switch len(c.parts) {
@@ -179,7 +179,7 @@ func TestAnEndTheNetworkMadeIsSentWithoutABody(t *testing.T) {
 	s := &sentRegisters{}
 	rt := e.router(nil, withSender(s))
 	rt.Registered(bg, registrar.ThirdPartyRegistration{Set: set1, IMPU: impu1, Type: ifc.DeRegistration, Profile: p})
-	rt.Wait()
+	rt.Stop()
 	got := s.got()
 	if len(got) != 1 || got[0].Header.Get("Expires") != "0" || len(got[0].Body) != 0 {
 		t.Fatalf("%d REGISTERs: %v", len(got), got)
@@ -195,7 +195,7 @@ func TestTheRegistrationTypeChoosesTheServers(t *testing.T) {
 	rt := e.router(nil, withSender(s))
 	rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
 	rt.Registered(bg, registration(t, ifc.DeRegistration, 0))
-	rt.Wait()
+	rt.Stop()
 	if got := s.got(); len(got) != 1 || got[0].Header.Get("Expires") != "0" {
 		t.Errorf("%d sent, want the de-registration alone", len(got))
 	}
@@ -221,7 +221,7 @@ func TestOneSetsRegistrationsGoInTheirOrder(t *testing.T) {
 		t.Fatalf("%s finished first", to)
 	}
 	close(s.held)
-	rt.Wait()
+	rt.Stop()
 	close(s.finished)
 	var order []string
 	for to := range s.finished {
@@ -310,7 +310,7 @@ func TestRegistrationsPastAServersQueueAreDropped(t *testing.T) {
 	}
 	dropped := e.metrics.get("routing.third_party.dropped")
 	close(s.hold)
-	rt.Wait()
+	rt.Stop()
 	if len(s.got()) != queuedPerServer || dropped != 1 {
 		t.Errorf("%d sent, %d dropped", len(s.got()), dropped)
 	}
@@ -336,10 +336,78 @@ func TestOneSetsQueueLeavesRoomForOthers(t *testing.T) {
 		t.Errorf("sent %d; the other user's is not at the server", len(got))
 	}
 	close(s.hold)
-	rt.Wait()
-	if n, d := len(s.got()), e.metrics.get("routing.third_party.dropped"); n != queuedPerSet+1 || d != int64(DefaultMaxThirdParty-queuedPerSet) {
-		t.Errorf("%d sent, %d dropped", n, d)
+	rt.Stop()
+	if n, d := len(s.got()), e.metrics.get("routing.third_party.replaced"); n != queuedPerSet+1 || d != int64(DefaultMaxThirdParty-queuedPerSet) {
+		t.Errorf("%d sent, %d replaced", n, d)
 	}
+}
+
+// TestASetsEndTakesThePlaceOfItsLastWaitingRegistration (#379 code
+// review): with the set's queue full behind a slow server, its end is not
+// dropped but replaces the last refresh waiting, so that the server hears
+// the end last.
+func TestASetsEndTakesThePlaceOfItsLastWaitingRegistration(t *testing.T) {
+	for name, c := range map[string]struct {
+		max, refreshes, others int
+	}{
+		"the set's queue": {DefaultMaxThirdParty, queuedPerSet - 1, 0},
+		// One slot, so four queued fill the server's queue: the set's
+		// first and a refresh, and two other sets'.
+		"the server's queue": {1, 1, queuedPerServer - 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+			s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+			rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = c.max })
+			rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+			recv(t, s.inside)
+			for range c.refreshes {
+				rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
+			}
+			for n := range c.others {
+				rt.Registered(bg, otherSet(t, e, n))
+			}
+			rt.Registered(bg, registration(t, ifc.DeRegistration, 0))
+			close(s.hold)
+			rt.Stop()
+			got := s.expiresOf(impu1)
+			if len(got) == 0 || got[len(got)-1] != "0" || e.metrics.get("routing.third_party.replaced") != 1 || e.metrics.get("routing.third_party.dropped") != 0 {
+				t.Errorf("the server heard %v for the set; replaced %d, dropped %d", got, e.metrics.get("routing.third_party.replaced"), e.metrics.get("routing.third_party.dropped"))
+			}
+		})
+	}
+}
+
+// orderedExpires holds every REGISTER until hold is closed, signalling
+// inside as each arrives, and records each one's To and Expires in order.
+type orderedExpires struct {
+	mu     sync.Mutex
+	hold   chan struct{}
+	inside chan struct{}
+	sent   [][2]string
+}
+
+func (s *orderedExpires) Send(_ context.Context, req *sip.Request) (*sip.Response, error) {
+	s.inside <- struct{}{}
+	<-s.hold
+	to, _ := req.Header.To()
+	s.mu.Lock()
+	s.sent = append(s.sent, [2]string{to.URI.String(), req.Header.Get("Expires")})
+	s.mu.Unlock()
+	return sip.NewResponse(req, 200, "", "as")
+}
+
+func (s *orderedExpires) expiresOf(impu string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, r := range s.sent {
+		if r[0] == impu {
+			out = append(out, r[1])
+		}
+	}
+	return out
 }
 
 // TestWhatAServerAnswersIsCounted: a 2xx registers, another answer is the
@@ -363,7 +431,7 @@ func TestWhatAServerAnswersIsCounted(t *testing.T) {
 			e.profile(t0, criterion(40, rcsAS, registerTrigger(), c.handling))
 			rt := e.router(nil, withSender(&sentRegisters{answer: c.answer}))
 			rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-			rt.Wait()
+			rt.Stop()
 			if e.metrics.get(c.counted) != 1 {
 				t.Errorf("%s not counted", c.counted)
 			}
@@ -387,14 +455,14 @@ func TestNothingIsSentWithoutASenderOrACriterion(t *testing.T) {
 	s := &sentRegisters{}
 	rt := e.router(nil, withSender(s))
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-	rt.Wait()
+	rt.Stop()
 	if len(s.got()) != 0 || e.metrics.get("routing.third_party.bad_server") != 1 {
 		t.Errorf("%d sent, bad servers %d", len(s.got()), e.metrics.get("routing.third_party.bad_server"))
 	}
 	e2 := newEnv(t)
 	rt = e2.router(nil, withSender(s))
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-	rt.Wait()
+	rt.Stop()
 	if len(s.got()) != 0 {
 		t.Error("sent without a profile")
 	}
@@ -437,7 +505,7 @@ func TestALaterRegistrationWaitsForEveryOneBeforeIt(t *testing.T) {
 	}
 	rt.Registered(bg, registration(t, ifc.ReRegistration, 400*time.Second))
 	close(s.hold["200"])
-	rt.Wait()
+	rt.Stop()
 	close(s.finished)
 	var order []string
 	for exp := range s.finished {
@@ -496,7 +564,7 @@ func TestAServerThatDoesNotAnswerHoldsUpNoOther(t *testing.T) {
 		t.Errorf("%d at the silent server at once, past %d", got, DefaultMaxThirdParty)
 	}
 	close(dead)
-	rt.Wait()
+	rt.Stop()
 	if d := e.metrics.get("routing.third_party.dropped"); d != 0 {
 		t.Errorf("%d dropped", d)
 	}
@@ -511,7 +579,7 @@ func TestASixHundredIsTheServersRefusal(t *testing.T) {
 			e.profile(t0, criterion(40, rcsAS, registerTrigger(), h))
 			rt := e.router(nil, withSender(&sentRegisters{answer: status(code)}))
 			rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-			rt.Wait()
+			rt.Stop()
 			if e.metrics.get("routing.third_party.refused") != 1 || e.metrics.get("routing.third_party.unanswered") != 0 {
 				t.Errorf("handling %d, %d: not counted as refused", h, code)
 			}
@@ -519,7 +587,7 @@ func TestASixHundredIsTheServersRefusal(t *testing.T) {
 	}
 }
 
-// TestRegistrationsToldWhileTheRouterStopsAreDroppedOrSent (#379 QA): Wait
+// TestRegistrationsToldWhileTheRouterStopsAreDroppedOrSent (#379 QA): Stop
 // stops new ones, so that none is added to what it waits for meanwhile;
 // each is sent or counted.
 func TestRegistrationsToldWhileTheRouterStopsAreDroppedOrSent(t *testing.T) {
@@ -537,17 +605,17 @@ func TestRegistrationsToldWhileTheRouterStopsAreDroppedOrSent(t *testing.T) {
 	}
 	wg.Go(func() {
 		for range 50 {
-			rt.Wait()
+			rt.Stop()
 		}
 	})
 	wg.Wait()
-	rt.Wait()
+	rt.Stop()
 	if n := int64(len(s.got())) + e.metrics.get("routing.third_party.dropped"); n != 64 {
 		t.Errorf("%d sent or dropped of 64", n)
 	}
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
 	if e.metrics.get("routing.third_party.dropped") == 0 {
-		t.Error("a registration told after Wait was not dropped")
+		t.Error("a registration told after Stop was not dropped")
 	}
 }
 
@@ -570,7 +638,7 @@ func TestAThirdPartyREGISTERIsBoundedByThirdPartyTimeout(t *testing.T) {
 		})
 		rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.ThirdPartyTimeout = c.cfg })
 		rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-		rt.Wait()
+		rt.Stop()
 		// The deadline is wall clock: the transaction's, not the S-CSCF's
 		// injected time.
 		if got := time.Duration(left.Load()); got <= 0 || got > c.want {
@@ -598,7 +666,7 @@ func TestAtMostTheBoundAreAtAServerAtOnce(t *testing.T) {
 	}
 	at := len(s.got())
 	close(s.hold)
-	rt.Wait()
+	rt.Stop()
 	if at != DefaultMaxThirdParty || len(s.got()) != n || e.metrics.get("routing.third_party.dropped") != 0 {
 		t.Errorf("%d at the server at once, %d sent, %d dropped", at, len(s.got()), e.metrics.get("routing.third_party.dropped"))
 	}
@@ -631,7 +699,7 @@ func TestARegistrationOutlivesItsCallerAndWhatItChangesAfterward(t *testing.T) {
 	_ = r.Request.Header.Set("Expires", "1")
 	_ = r.Response.Header.Set("Expires", "2")
 	close(release)
-	rt.Wait()
+	rt.Stop()
 	got := sent.Load()
 	if got == nil || e.metrics.get("routing.third_party.registered") != 1 {
 		t.Fatalf("registered %d, unanswered %d, refused %d", e.metrics.get("routing.third_party.registered"),
@@ -659,7 +727,7 @@ func TestAnOriginatingCriterionTakesTheREGISTER(t *testing.T) {
 	s := &sentRegisters{}
 	rt := e.router(nil, withSender(s))
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
-	rt.Wait()
+	rt.Stop()
 	if len(s.got()) != 1 {
 		t.Errorf("%d sent", len(s.got()))
 	}
@@ -682,7 +750,7 @@ func TestTheBodysREGISTERCarriesNoCredentials(t *testing.T) {
 		}
 	}
 	rt.Registered(bg, r)
-	rt.Wait()
+	rt.Stop()
 	got := s.got()
 	if len(got) != 1 {
 		t.Fatalf("%d sent", len(got))
@@ -692,5 +760,43 @@ func TestTheBodysREGISTERCarriesNoCredentials(t *testing.T) {
 	}
 	if r.Request.Header.Get("Authorization") == "" {
 		t.Error("the caller's REGISTER lost its Authorization")
+	}
+}
+
+// TestARegistrationWaitingForItsSetHoldsNoSlot (#379 QA): with two slots,
+// set1's first at the server and two more queued behind it, another
+// user's still reaches the server. The pause gives the queued ones the time
+// to take the slots if they held one while waiting; the test passes
+// without it on this code, whatever the scheduling.
+func TestARegistrationWaitingForItsSetHoldsNoSlot(t *testing.T) {
+	e := newEnv(t)
+	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+	release := make(chan struct{})
+	arrived := make(chan string, 8)
+	s := senderFunc(func(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+		to, _ := req.Header.To()
+		arrived <- to.URI.String()
+		if to.URI.String() == impu1 {
+			<-release
+		}
+		return sip.NewResponse(req, 200, "", "as")
+	})
+	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 2 })
+	defer func() { close(release); rt.Stop() }()
+	for range 3 {
+		rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
+	}
+	if got := recv(t, arrived); got != impu1 {
+		t.Fatalf("%s first", got)
+	}
+	time.Sleep(100 * time.Millisecond)
+	rt.Registered(bg, otherSet(t, e, 1))
+	select {
+	case got := <-arrived:
+		if got != "sip:user001@"+realm {
+			t.Errorf("%s arrived, want the other user's", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the other user's registration waited for set1's queue: a waiting registration held a slot")
 	}
 }

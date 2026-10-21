@@ -167,13 +167,13 @@ type Router struct {
 	cfg Config
 	log *slog.Logger
 	ids sip.IDGenerator
-	// repairs counts the identity repairs under way, for Wait.
+	// repairs counts the identity repairs under way, for Stop.
 	repairs sync.WaitGroup
 	svc     services
 	tp      thirdParty
-	// stopped is set by Wait, under stop, which a repair or a third-party
+	// stopped is set by Stop, under stop, which a repair or a third-party
 	// registration takes to be counted in its WaitGroup: none is added
-	// once Wait waits (#379 QA).
+	// once Stop waits (#379 QA).
 	stop    sync.Mutex
 	stopped bool
 }
@@ -261,11 +261,11 @@ func (noMetrics) Count(string, int64) {}
 
 func (rt *Router) count(name string) { rt.cfg.Metrics.Count(name, 1) }
 
-// Wait stops the Router from starting identity repairs and third-party
+// Stop stops the Router from starting identity repairs and third-party
 // registrations, and returns once those under way are done: for a
 // shutdown, once the registrar tells it of no more, and for tests.
 // Requests are still routed.
-func (rt *Router) Wait() {
+func (rt *Router) Stop() {
 	rt.stop.Lock()
 	rt.stopped = true
 	rt.stop.Unlock()

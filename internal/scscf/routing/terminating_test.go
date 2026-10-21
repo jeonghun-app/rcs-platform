@@ -143,9 +143,34 @@ func TestAnIdentityNamingAnotherIncarnationStillReachesItsUser(t *testing.T) {
 	if len(d.Targets) != 1 {
 		t.Fatalf("status %d, %d targets", d.Status, len(d.Targets))
 	}
-	rt.Wait()
+	rt.Stop()
 	if got, _ := e.store.Identity(bg, tel1, t0); got == nil || got.Incarnation != 7 || e.metrics.get("routing.identity_repaired") != 1 {
 		t.Errorf("item after the repair: %+v", got)
+	}
+}
+
+// TestARouterThatStoppedRepairsNothing (#379 QA): once Stop has run, the
+// request is still routed, but no repair starts, which would be added to a
+// WaitGroup Stop has waited on; the set's next REGISTER points the item.
+func TestARouterThatStoppedRepairsNothing(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	id, err := e.store.Identity(bg, tel1, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id.Incarnation = 9
+	if _, err := e.store.SaveIdentity(bg, id, t0); err != nil {
+		t.Fatal(err)
+	}
+	rt := e.router(nil)
+	rt.Stop()
+	if d := rt.Terminating(bg, request(t, "INVITE", tel1)); len(d.Targets) != 1 {
+		t.Fatalf("status %d, %d targets", d.Status, len(d.Targets))
+	}
+	rt.Stop()
+	if got, _ := e.store.Identity(bg, tel1, t0); got == nil || got.Incarnation != 9 || e.metrics.get("routing.identity_repaired") != 0 {
+		t.Errorf("item after Stop: %+v", got)
 	}
 }
 
@@ -163,7 +188,7 @@ func TestAnIdentityNamingADeadRecordIsNotRepaired(t *testing.T) {
 	if d := rt.Terminating(bg, request(t, "INVITE", tel1)); d.Status != 480 {
 		t.Errorf("status %d", d.Status)
 	}
-	rt.Wait()
+	rt.Stop()
 	if got, _ := e.store.Identity(bg, tel1, t0); got.Incarnation != 9 || e.metrics.get("routing.identity_repaired") != 0 {
 		t.Errorf("item %+v repaired for a record without a live binding", got)
 	}
@@ -185,7 +210,7 @@ func TestARepairLosesToAREGISTERThatPointedTheItemMeanwhile(t *testing.T) {
 		}
 	}})
 	rt.Terminating(bg, request(t, "INVITE", tel1))
-	rt.Wait()
+	rt.Stop()
 	if got, _ := e.store.Identity(bg, tel1, t0); got.Incarnation != 11 || e.metrics.get("routing.identity_repair_failed") != 1 {
 		t.Errorf("item %+v: the repair overwrote a later pointer", got)
 	}
@@ -368,7 +393,7 @@ func TestAnItemNamingTheSavedIncarnationIsNotWritten(t *testing.T) {
 	e.registered(binding(1, 0, time.Hour))
 	rt := e.router(nil)
 	rt.Terminating(bg, request(t, "INVITE", impu1))
-	rt.Wait()
+	rt.Stop()
 	if n := e.metrics.get("routing.identity_repaired") + e.metrics.get("routing.identity_repair_failed"); n != 0 {
 		t.Errorf("%d repairs for an item naming the saved incarnation", n)
 	}
