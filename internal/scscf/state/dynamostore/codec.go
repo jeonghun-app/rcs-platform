@@ -23,6 +23,7 @@ type registrationDoc struct {
 	Identities    []identityRef `json:"identities"`
 	Contacts      []contactDoc  `json:"contacts,omitempty"`
 	Deregistering *time.Time    `json:"deregistering,omitempty"`
+	Rejected      bool          `json:"rejected,omitempty"`
 	Unregistered  *time.Time    `json:"unregistered,omitempty"`
 	Reassert      *time.Time    `json:"reassert,omitempty"`
 	Attempts      int           `json:"reassert_attempts,omitempty"`
@@ -76,6 +77,7 @@ func encodeRegistration(r *state.Registration) ([]byte, error) {
 	for _, id := range r.Identities {
 		doc.Identities = append(doc.Identities, identityRef{IMPU: id.IMPU, Barred: id.Barred})
 	}
+	doc.Rejected = r.Rejected
 	if !r.Deregistering.IsZero() {
 		t := r.Deregistering.UTC()
 		doc.Deregistering = &t
@@ -107,6 +109,7 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	for _, id := range doc.Identities {
 		r.Identities = append(r.Identities, state.SetIdentity{IMPU: id.IMPU, Barred: id.Barred})
 	}
+	r.Rejected = doc.Rejected
 	if doc.Deregistering != nil {
 		r.Deregistering = *doc.Deregistering
 	}
