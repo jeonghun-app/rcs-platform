@@ -116,22 +116,15 @@ func groupConversation(req *sip.Request) (messaging.Conversation, bool) {
 }
 
 // sessionConversation reads the conversation headers of a session's
-// INVITE: each a token as in a pager MESSAGE (messaging.ValidID), but the
-// Conversation-ID optional, as rcsjta sends only a Contribution-ID with an
-// INVITE (code review on #279). One that names a Conversation-ID or a
-// reply without a Contribution-ID is refused, as by
-// messaging.ParseConversationHeaders; one without any is a session outside
-// a conversation, as before.
+// INVITE by the rule pager MESSAGEs follow
+// (messaging.ParseConversationHeaders): Conversation-ID optional, as
+// rcsjta sends only a Contribution-ID with an INVITE (#298); a
+// Conversation-ID or a reply without a Contribution-ID refused; none of
+// the three a session outside a conversation.
 func sessionConversation(req *sip.Request) (messaging.Conversation, bool) {
-	trim := func(name string) string { return strings.Trim(req.Header.Get(name), " \t") }
-	c := messaging.Conversation{
-		ID: trim(messaging.HeaderConversationID), Contribution: trim(messaging.HeaderContributionID),
-		InReplyTo: trim(messaging.HeaderInReplyTo),
-	}
-	valid := func(v string) bool { return v == "" || messaging.ValidID(v) }
-	ok := valid(c.ID) && valid(c.Contribution) && valid(c.InReplyTo) &&
-		(c.Contribution != "" || c.ID == "" && c.InReplyTo == "")
-	return c, ok
+	c, err := messaging.ParseConversationHeaders(req.Header.Get(messaging.HeaderConversationID),
+		req.Header.Get(messaging.HeaderContributionID), req.Header.Get(messaging.HeaderInReplyTo))
+	return c, err == nil
 }
 
 // invitees are the entries of a resource list as the group's invitees,

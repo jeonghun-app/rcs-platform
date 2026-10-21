@@ -467,7 +467,8 @@ func TestCloseWaitsForALateSessionsBye(t *testing.T) {
 	// The client can read the 200 before the session settles: release
 	// the live BYE's answer only once it has, while Close still waits for
 	// its own BYEs, so that the late one is counted (QA on #340: 1 in 80).
-	waitLive(t, r.a.srv, late.Header.Get("Call-ID"))
+	// Settled, it may have sent its BYE and left already (QA on #279).
+	waitSettled(t, r, late.Header.Get("Call-ID"), 2)
 	held.open(live.Header.Get("Call-ID"))
 	r.byeFor(t, late)
 	r.quiet(t, 200*time.Millisecond, false, "before the late session's BYE was answered")
@@ -499,10 +500,13 @@ func TestASecondCloseWaitsForTheFirst(t *testing.T) {
 	r.waitClosed(t)
 }
 
-// waitLive waits until the session with callID is live: its answer gone
-// and settle run.
-func waitLive(t *testing.T, s *Server, callID string) {
+// waitSettled waits until the session with callID has settled: it is
+// live, its answer gone and settle run, or byes BYEs have gone, its own
+// among them, as a session that settled during Close sends its BYE at
+// once and leaves the session table.
+func waitSettled(t *testing.T, r *shutdownRig, callID string, byes int64) {
 	t.Helper()
+	s := r.a.srv
 	deadline := time.Now().Add(waitFor)
 	for {
 		s.mu.Lock()
@@ -513,7 +517,7 @@ func waitLive(t *testing.T, s *Server, callID string) {
 			}
 		}
 		s.mu.Unlock()
-		if live {
+		if live || r.metrics.get("sip.bye.sent") >= byes {
 			return
 		}
 		if time.Now().After(deadline) {
