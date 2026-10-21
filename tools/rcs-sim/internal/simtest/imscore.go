@@ -170,7 +170,7 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 		// NonInviteFinalTimeout, 128*T1 by default. A request routed to a
 		// callee that never answers ends at the forwarded request's Timer F,
 		// 64*T1, with the 408 the originator is owed (RFC 3261 §16.7,
-		// §16.8); with a T1 of milliseconds the two were milliseconds
+		// §16.8); with a T1 of milliseconds the two were a fraction of a second
 		// apart, and a loaded host let the 500 come first (#339). The
 		// safety net keeps the margin a proxy's has instead, in time the
 		// work takes rather than in T1.
