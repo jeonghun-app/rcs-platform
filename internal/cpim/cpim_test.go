@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -400,17 +401,23 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	}
 	// Far past anything load does to two timings that last about as long
 	// fails the test without parsing the whole input fifteen times more at
-	// quadratic cost (code review). Each side is timed twice and the
-	// shorter taken: one burst of load can stretch a single timing that
-	// far (1 in 300 runs under the load model), and a burst on a single
-	// yardstick would send a quadratic parser down the slow path, which
-	// took 433 s once (code review).
+	// quadratic cost (code review). Each side is timed three times, in
+	// turn, and the medians compared, so one timing that load got wrong
+	// either way decides nothing: one stretched large parse failed a
+	// linear parser (1 in 300 runs under the load model), one yardstick
+	// that ran unthrottled did too when the shortest of two was taken (1
+	// in 100), and one stretched yardstick sent a quadratic parser down
+	// the slow path, which took 433 s once (code review).
 	const bound, farPast = 8, 4 * 8
-	base := parse(small, 64)
-	again := parse(data, 1)
-	base = min(base, parse(small, 64))
-	if large := min(first, again); large > farPast*base {
-		t.Fatalf("parsing %d bytes once took %v at best of two, a 64th of it 64 times %v: not linear", len(data), large, base)
+	larges, bases := []time.Duration{first}, []time.Duration{parse(small, 64)}
+	for range 2 {
+		larges = append(larges, parse(data, 1))
+		bases = append(bases, parse(small, 64))
+	}
+	slices.Sort(larges)
+	slices.Sort(bases)
+	if large, base := larges[1], bases[1]; large > farPast*base {
+		t.Fatalf("parsing %d bytes once took %v (median of three), a 64th of it 64 times %v: not linear", len(data), large, base)
 	}
 	var smallTime, largeTime time.Duration
 	for range 3 {
