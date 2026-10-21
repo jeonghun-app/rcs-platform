@@ -492,3 +492,19 @@ func TestARequestPastTheTransactionCapGets503(t *testing.T) {
 		t.Fatalf("the request in progress got %s, want 200", got)
 	}
 }
+
+// And past ICSCF_MAX_SERVER_TRANSACTION_BYTES: with a bound smaller than any
+// request, every one is refused.
+func TestARequestPastTheTransactionByteCapGets503(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.MaxServerTransactionBytes = 64
+	})
+	r.waitReady(t)
+	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
+		t.Errorf("past the byte cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
