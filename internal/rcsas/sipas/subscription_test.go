@@ -442,7 +442,7 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	g.stateOf(t, g.uri, carol, groupstore.Invited)
 
 	res = g.inSession(t, alice, "a1", g.s, 4, "REFER", []string{"Refer-To: <cid:list1@" + domain + ">",
-		"Require: multiple-refer, norefersub", "Content-Type: " + resourcelists.ContentType}, groupList(dave, "sip:+15550100005@"+domain))
+		"Require: multiple-refer, norefersub", "Content-Type: " + resourcelists.ContentType}, strings.Replace(groupList(dave, "sip:+15550100005@"+domain), "</list>", `<entry uri="sip:a b@example.net"/></list>`, 1))
 	if res.StatusCode != 202 {
 		t.Fatalf("a REFER with a list answered %d", res.StatusCode)
 	}
@@ -450,8 +450,10 @@ func TestAReferAddsAndTheFocusInvites(t *testing.T) {
 	for range 2 {
 		got[g.core.nextOf(t, "INVITE").URI.String()] = true
 	}
-	if !got[dave] || !got[erin] {
-		t.Fatalf("invited %v", got)
+	// A bad entry in the list is left out and counted, not a reason to
+	// refuse it; with the factory above, two are skipped.
+	if !got[dave] || !got[erin] || g.metrics.get("sip.group.invitee_skipped") != 2 {
+		t.Fatalf("invited %v, %d skipped", got, g.metrics.get("sip.group.invitee_skipped"))
 	}
 	g.stateOf(t, g.uri, erin, groupstore.Invited)
 
