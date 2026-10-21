@@ -483,3 +483,58 @@ func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 		t.Fatalf("Drain returned after %v, want about %v after its 50 ms", took, DrainSendWait)
 	}
 }
+
+// A request that arrives after Drain found nothing in progress gets the
+// drain's answer at once too, rather than nothing when the proxy closes
+// right after (QA of #310).
+func TestARequestAfterAnEarlyDrainGetsItsAnswer(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{Targets: []Target{target("sip:bob@192.0.2.2")}})
+	if n := <-drainFor(h, time.Hour); n != 0 {
+		t.Fatalf("Drain answered %d", n)
+	}
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+	res := h.upstreamResponses()
+	if len(res) != 1 || res[0].StatusCode != 500 || res[0].Header.Get("Retry-After") != "5" {
+		t.Fatalf("a request after the drain got %v, want 500 with Retry-After 5", res)
+	}
+	check(t, "sent", h.sentMethods(), nil)
+}
+
+// A Serve handler's final response that the upstream peer has not taken yet
+// keeps the request in progress, as the proxy's own does (QA of #310): Drain
+// waits until it has been handed over.
+func TestDrainWaitsForAHandlersAnswerStillOnItsWay(t *testing.T) {
+	h := newHarness(t, Config{})
+	stall := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(stall) }) })
+	responding := make(chan struct{})
+	h.decide(Decision{Serve: func(_ context.Context, u *UAS) {
+		res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		h.net.mu.Lock()
+		h.net.stallUpstream = stall
+		h.net.mu.Unlock()
+		close(responding)
+		_ = u.Respond(res)
+	}})
+	h.p.Receive(inboundFrom(request(t, "MESSAGE", "sip:bob@example.com"), "up"))
+	<-responding
+	done := drainFor(h, time.Hour)
+	select {
+	case <-done:
+		t.Fatal("Drain returned while the handler's 200 was still on its way")
+	case <-time.After(300 * time.Millisecond):
+	}
+	once.Do(func() { close(stall) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return once the 200 was handed over")
+	}
+	check(t, "upstream", h.upstream(), codes(200))
+}

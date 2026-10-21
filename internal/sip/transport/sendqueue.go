@@ -49,6 +49,10 @@ type sendQueue struct {
 	queued int
 	limit  int
 	closed bool
+	// sent counts the bytes of the messages written in full, and waiting
+	// those of the senders waiting for room, for Flush.
+	sent    uint64
+	waiting int
 	// progress is when the queue last went from empty to holding output, or
 	// its writer last wrote a chunk, in Unix nanoseconds, which tells a stalled
 	// peer from a slow one.
@@ -100,10 +104,17 @@ const (
 
 // tryPush queues b if it fits within max and the transport's budget. A message
 // is always accepted into an empty queue, budget permitting, so a limit below
-// the largest message cannot make a connection unusable.
-func (q *sendQueue) tryPush(b []byte, max int) pushResult {
+// the largest message cannot make a connection unusable. A sender that has
+// been waiting for room (waited) stops counting as waiting once it is done,
+// in the same step that queues its message.
+func (q *sendQueue) tryPush(b []byte, max int, waited bool) (r pushResult) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	defer func() {
+		if waited && r != queueFull {
+			q.waiting -= len(b)
+		}
+	}()
 	if q.closed {
 		return queueGone
 	}
@@ -133,14 +144,19 @@ func (q *sendQueue) tryPush(b []byte, max int) pushResult {
 // waits for the transport's budget.
 func (q *sendQueue) push(b []byte, wait bool, deadline time.Time) pushResult {
 	if !wait {
-		return q.tryPush(b, 2*q.limit)
+		return q.tryPush(b, 2*q.limit, false)
 	}
 	var expired <-chan time.Time
 	for {
-		if r := q.tryPush(b, q.limit); r != queueFull {
+		if r := q.tryPush(b, q.limit, expired != nil); r != queueFull {
 			return r
 		}
 		if expired == nil {
+			// Counted while it waits: Flush waits for it too, as output
+			// already decided for this connection (QA of #366).
+			q.mu.Lock()
+			q.waiting += len(b)
+			q.mu.Unlock()
 			t := time.NewTimer(time.Until(deadline))
 			defer t.Stop()
 			expired = t.C
@@ -148,11 +164,20 @@ func (q *sendQueue) push(b []byte, wait bool, deadline time.Time) pushResult {
 		select {
 		case <-q.room:
 		case <-q.done:
+			q.unwait(len(b))
 			return queueGone
 		case <-expired:
+			q.unwait(len(b))
 			return waitTimedOut
 		}
 	}
+}
+
+// unwait ends the count of a sender that gave up waiting for room.
+func (q *sendQueue) unwait(n int) {
+	q.mu.Lock()
+	q.waiting -= n
+	q.mu.Unlock()
 }
 
 func notify(c chan struct{}) {
@@ -183,6 +208,7 @@ func (q *sendQueue) written(n int) {
 	q.mu.Lock()
 	if !q.closed {
 		q.queued -= n
+		q.sent += uint64(n)
 		q.budget.release(n)
 	}
 	q.mu.Unlock()

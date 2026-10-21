@@ -39,7 +39,10 @@
 //     that they find it when they join.
 //
 // Every change is computed from the stored group and written back
-// conditionally (groupstore.Store.Update), so two tasks changing one group
-// at once never lose a change, and each change gets the next roster
-// version.
+// conditionally (groupstore.Store.Update), so two writers changing one
+// group at once never lose a change, and each change gets the next roster
+// version. One task owns each group (#121): it makes it, or takes it over
+// once the owner's heartbeat has lapsed (StartHeartbeat), and every write
+// is fenced by the owner the store holds, so that a task that lost a group
+// writes nothing to it (ErrNotOwner).
 package group
