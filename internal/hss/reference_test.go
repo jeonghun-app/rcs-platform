@@ -48,6 +48,27 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	plainInvite.headers = slices.DeleteFunc(slices.Clone(plainInvite.headers), func(h ifc.HeaderField) bool {
 		return h.Name == "Contact" || h.Name == "Accept-Contact" || h.Name == "P-Preferred-Service"
 	})
+	// A voice call offers audio, not an MSRP stream.
+	plainInvite.sdp = []string{"v=0", "m=audio 49170 RTP/AVP 0"}
+	// A chat INVITE that names its service in no feature tag still offers
+	// MSRP (#359 security review).
+	msrpOnly := plainInvite
+	msrpOnly.sdp = []string{"v=0", "m=message 9 TCP/MSRP *", "a=accept-types:message/cpim"}
+	// rcsjta's image share names its own IARI and offers MSRP too: it goes
+	// to the callee as before, not to rcs-as (#359 code review). The
+	// S-CSCF's view adds each feature tag's name (ifc.FeatureTagField).
+	imageShare := msrpOnly
+	imageShare.headers = append(slices.Clone(msrpOnly.headers),
+		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + `>;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`},
+		ifc.HeaderField{Name: "Accept-Contact", Value: `*;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`},
+		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.iari-ref=urn:urn-7:3gpp-application.ims.iari.gsma-is"},
+		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.iari-ref=urn:urn-7:3gpp-application.ims.iari.gsma-is"})
+	imageShare.sdp = []string{"v=0", "m=message 9 TCP/MSRP *", "a=accept-types:image/jpeg", "a=file-selector:type:image/jpeg"}
+	// So does a call that names its ICSI only in its Contact.
+	mmtel := msrpOnly
+	mmtel.headers = append(slices.Clone(msrpOnly.headers),
+		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + `>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`},
+		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.icsi-ref=urn:urn-7:3gpp-service.ims.icsi.mmtel"})
 	for name, c := range map[string]struct {
 		req  ifc.Request
 		want []int
@@ -59,6 +80,9 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 		"rcsjta chat INVITE": {&imInvite, []int{10}},
 		"rcsjta OPTIONS":     {&imOptions, []int{30}},
 		"INVITE for voice":   {&plainInvite, nil},
+		"INVITE with MSRP":   {&msrpOnly, []int{10}},
+		"image share INVITE": {&imageShare, nil},
+		"MMTEL with MSRP":    {&mmtel, nil},
 	} {
 		for _, ctx := range referenceContexts {
 			matched, err := set.Match(c.req, ctx)

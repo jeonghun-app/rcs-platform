@@ -82,9 +82,11 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 		}
 		var err error
 		var saved *state.Registration
+		var ended *state.Profile
+		setEnded := false
 		switch {
 		case len(next) == 0 && registered:
-			err = g.deregister(ctx, r, cur)
+			ended, setEnded, err = g.deregister(ctx, r, cur)
 		case len(next) == 0:
 			// Nothing was registered and nothing is: no assignment to make.
 		default:
@@ -123,14 +125,33 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 		default:
 			g.count("registrar.registered")
 			if saved == nil {
-				return g.ok(req, r, nil, nil), nil
+				res := g.ok(req, r, nil, nil)
+				if setEnded {
+					// The set's last binding went: the servers hear it
+					// ended, for every identity it was registered under,
+					// without a body, which §5.4.1.7 g) gives only to an
+					// initial registration and a refresh.
+					for _, impu := range registeredIdentities(cur, r.impu) {
+						tp := registeredFor(cur.Key, impu, ifc.DeRegistration, nil, now)
+						tp.Profile = ended
+						g.cfg.ThirdParty.Registered(ctx, tp)
+					}
+				}
+				return res, nil
 			}
 			var before *state.Registration
+			t := ifc.InitialRegistration
 			if registered {
-				before = cur
+				before, t = cur, ifc.ReRegistration
 			}
 			g.cfg.Events.Changed(ctx, before, saved, regevent.Registered)
-			return g.ok(req, r, saved.Contacts, saved), nil
+			res := g.ok(req, r, saved.Contacts, saved)
+			if res.StatusCode == 200 {
+				tp := registeredFor(saved.Key, r.impu, t, saved.Contacts, now)
+				tp.Request, tp.Response = req, res
+				g.cfg.ThirdParty.Registered(ctx, tp)
+			}
+			return res, nil
 		}
 		registered = isRegistered(cur)
 		conflicted = true
@@ -290,7 +311,7 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 			return nil, err
 		}
 	}
-	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings}
+	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings, RegisteredAs: []string{r.impu}}
 	if cur != nil && cur.Key == key {
 		n.Incarnation, n.Version = cur.Incarnation, cur.Version
 		if !cur.Deregistering.IsZero() {
@@ -299,6 +320,11 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 			// deregistration's SAR may reach the HSS after this one's, so a
 			// sweep tells the HSS again (#410 code review).
 			n.Reassert, n.ReassertAttempts = g.cfg.Now().Add(reassertBackoff), 1
+		}
+		if registered {
+			// The servers hear of the set's end under every identity a
+			// REGISTER of it was told under, which are still the set's.
+			n.RegisteredAs = withRegistered(cur.RegisteredAs, r.impu, set.identities)
 		}
 	}
 	if cur == nil || cur.Key != key || !cur.Deregistering.IsZero() {
@@ -513,11 +539,11 @@ func (g *Registrar) unassign(ctx context.Context, r *register) {
 // and endSet. If the HSS cannot be told, the bindings are put back, or, if
 // another instance changed the record meanwhile, a sweep tells the HSS after
 // the lease.
-func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Registration) error {
+func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Registration) (*state.Profile, bool, error) {
 	now := g.cfg.Now()
 	profile, err := g.cfg.Store.Profile(ctx, cur.Key, now)
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
-		return err
+		return nil, false, err
 	}
 	lease := cur.Clone()
 	lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
@@ -533,7 +559,7 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 		}
 	}
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: r.impi, PublicIdentities: []string{r.impu}, AssignmentType: cx.UserDeregistration})
 	var res cx.Result
@@ -542,7 +568,7 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 	}
 	if f := g.cxFailure("SAR", res, err); f != nil {
 		g.putBack(ctx, claimed, cur.Contacts)
-		return f
+		return nil, false, f
 	}
 	g.count("registrar.deregistered")
 	// The HSS has the deregistration: the subscribers learn of it whatever
@@ -550,16 +576,17 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 	if err := g.cfg.Events.Ended(ctx, cur, regevent.Unregistered); err != nil {
 		g.internal("ending a deregistered set's subscriptions", err)
 		g.count("registrar.deregistration_left_to_sweep")
-		return nil
+		return profile, false, nil
 	}
-	if err := g.endSet(ctx, claimed, profile); err != nil {
+	ended, err := g.endSet(ctx, claimed, profile)
+	if err != nil {
 		// The HSS has taken the deregistration, so the client's is done:
 		// what is left of the set holds the lease, and the sweep after it
 		// finishes, as it does for an instance that stopped here.
 		g.internal("finishing a deregistration", err)
 		g.count("registrar.deregistration_left_to_sweep")
 	}
-	return nil
+	return profile, ended, nil
 }
 
 // putBack gives a set claimed for a deregistration that the HSS could not be
@@ -628,32 +655,35 @@ func leasedBy(reg, lease *state.Registration) bool {
 // version claimed (state.SweepRegistrations): cut short before that, the
 // record keeps its lease and a sweep after it does the rest. A record already
 // gone was deleted after its items, by this deregistration (a delete applied
-// but reported lost) or another.
-func (g *Registrar) endSet(ctx context.Context, claimed *state.Registration, profile *state.Profile) error {
+// but reported lost) or another. It reports whether the set ended, which the
+// application servers are then told of: not when another device registered
+// it meanwhile, whose REGISTER told them, nor when another deregistration
+// claimed it, which tells them itself (#379 code review).
+func (g *Registrar) endSet(ctx context.Context, claimed *state.Registration, profile *state.Profile) (bool, error) {
 	for range saveAttempts {
 		now := g.cfg.Now()
 		again, f := g.set(ctx, claimed.Key)
 		switch {
 		case f != nil:
-			return f
+			return false, f
 		case again == nil:
-			return nil
+			return true, nil
 		case live(again, now) && again.Deregistering.IsZero():
 			// A REGISTER that took the set over from the lease saved a
 			// record without one (assign). A lease that is live only by
 			// an unregistered user's state, which it keeps, is not one
 			// (#394 code review).
-			return g.reassign(ctx, again)
+			return false, g.reassign(ctx, again)
 		case again.Version != claimed.Version:
 			// Another deregistration claimed it since: it finishes.
-			return nil
+			return false, nil
 		}
 		if err := g.unpoint(ctx, again); err != nil {
-			return err
+			return false, err
 		}
 		if profile != nil {
 			if err := g.cfg.Store.DeleteProfileIf(ctx, again.Key, profile.Received); err != nil && !errors.Is(err, state.ErrConflict) {
-				return err
+				return false, err
 			}
 		}
 		err := g.cfg.Store.DeleteRegistration(ctx, again)
@@ -662,12 +692,12 @@ func (g *Registrar) endSet(ctx context.Context, claimed *state.Registration, pro
 			// Changed since it was read, or deleted with the answer lost:
 			// read again.
 			continue
-		case errors.Is(err, state.ErrNotFound):
-			return nil
+		case errors.Is(err, state.ErrNotFound), err == nil:
+			return true, nil
 		}
-		return err
+		return false, err
 	}
-	return errors.New("registrar: the set kept changing while it was deregistered")
+	return false, errors.New("registrar: the set kept changing while it was deregistered")
 }
 
 // reassertBackoff is how long after a failed reassign a sweep tells the HSS

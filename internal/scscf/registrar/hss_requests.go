@@ -193,6 +193,9 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		case errors.Is(err, state.ErrConflict):
 			continue
 		case errors.Is(err, state.ErrNotFound), err == nil:
+			// Told once the set has ended, as a deregistration's end is
+			// (endSet), not for each try.
+			g.endedByNetwork(ctx, reg, profile)
 			return true, nil
 		}
 		return g.leftToSweep("removing a set an RTR ends", err)
