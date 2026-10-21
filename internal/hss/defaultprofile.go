@@ -24,10 +24,21 @@ const (
 	omaIM = `\+g\.oma\.sip-im`
 	// An MSRP message stream in a session description's m= line, which a
 	// chat's or a file transfer's INVITE offers whatever its feature tags
-	// say (RFC 4975 §8.1): the trigger then holds even for a request that
-	// names its service in a way no feature-tag pattern expects.
-	msrpMedia = `^message .*MSRP`
+	// say (RFC 4975 §8.1): the trigger then holds for a request that names
+	// no service in a feature tag at all (serviceTags), which a client
+	// could otherwise send past rcs-as. One that names another service,
+	// such as image share's IARI, goes on as before. It takes
+	// the lines sdp.Media.IsMSRP takes, whose media type and protocol
+	// compare without case, so that no spelling of the stream reaches the
+	// callee as MSRP and past rcs-as (#359 security review). An ERE has no
+	// case flag, hence the bracket pairs.
+	msrpMedia = `^[Mm][Ee][Ss][Ss][Aa][Gg][Ee] [^ ]+ [Tt][Cc][Pp]/([Tt][Ll][Ss]/)?[Mm][Ss][Rr][Pp] `
 )
+
+// serviceTags are the feature tags that name a service (TS 24.229 §7.9.2,
+// RCC.07 §2.6.1): an ICSI or an IARI, as the S-CSCF's view spells them, in
+// lower case.
+var serviceTags = []string{`\+g\.3gpp\.icsi-ref`, `\+g\.3gpp\.iari-ref`}
 
 // featureTagHeaders carry the caller's and callee's feature tags;
 // serviceHeaders the requested or asserted service.
@@ -54,7 +65,8 @@ const servedUserHeader = "P-Served-User"
 // offline (docs/architecture.md §5):
 //
 //	10  INVITE for an RCS service (CPM ICSI, RCS IARI, or
-//	    OMA SIMPLE IM, rcsjta's chat, or an MSRP stream)     SESSION_TERMINATED
+//	    OMA SIMPLE IM, rcsjta's chat, or an MSRP stream
+//	    with no ICSI or IARI)                               SESSION_TERMINATED
 //	20  MESSAGE                                             SESSION_TERMINATED
 //	30  OPTIONS for an RCS service (capability discovery)   SESSION_CONTINUED
 //	40  REGISTER (third-party registration)                 SESSION_CONTINUED
@@ -76,21 +88,37 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 	// (method) AND (an RCS service in a feature tag or a service header)
 	// AND NOT (P-Served-User), in conjunctive normal form: group 0 is the
 	// method, group 1 the ORed service conditions, one header and one
-	// literal each, group 2 the served-user check.
+	// literal each, and the last group the served-user check. An INVITE
+	// also takes the trigger by an MSRP stream with no service named in a
+	// feature tag: rcs OR (msrp AND NOT tag1 AND NOT tag2 ...), which in
+	// CNF is group 1 with msrp, and one group per tag and header that holds
+	// the service conditions and that tag's absence.
 	rcsRequest := func(method string) *ifc.TriggerPoint {
+		groups := []int{1}
+		var absent []ifc.SPT
+		if method == "INVITE" {
+			for _, h := range featureTagHeaders {
+				for _, tag := range serviceTags {
+					g := len(groups) + 1
+					groups = append(groups, g)
+					absent = append(absent, ifc.SPT{ConditionNegated: true, Groups: []int{g}, Condition: ifc.SIPHeader{Header: h, Content: tag}})
+				}
+			}
+		}
 		spts := []ifc.SPT{{Groups: []int{0}, Condition: ifc.Method(method)}}
 		for _, h := range featureTagHeaders {
 			for _, tag := range []string{cpmICSI, rcsIARI, omaIM} {
-				spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SIPHeader{Header: h, Content: tag}})
+				spts = append(spts, ifc.SPT{Groups: groups, Condition: ifc.SIPHeader{Header: h, Content: tag}})
 			}
 		}
 		for _, h := range serviceHeaders {
-			spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SIPHeader{Header: h, Content: cpmICSI}})
+			spts = append(spts, ifc.SPT{Groups: groups, Condition: ifc.SIPHeader{Header: h, Content: cpmICSI}})
 		}
 		if method == "INVITE" {
 			spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SessionDescription{Line: "m", Content: msrpMedia}})
+			spts = append(spts, absent...)
 		}
-		spts = append(spts, notServed(2))
+		spts = append(spts, notServed(len(groups)+1))
 		return &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: spts}
 	}
 	// (method) AND NOT (P-Served-User).

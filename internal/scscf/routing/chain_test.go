@@ -229,7 +229,7 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			b.Routed[0].URI.Params = append(sip.Params(nil), b.Routed[0].URI.Params...)
 			change(b)
 			// Each case is its own return, with no claim on its position.
-			got := e.router(claimsApart(e.store)).Initial(bg, b)
+			got := e.router(nil).Initial(bg, b)
 			switch {
 			case name == "as signed" || name == "just in time":
 				if serverOf(t, got) != "third-as.rcs.local" {
@@ -627,7 +627,7 @@ func TestARetargetedRequestGoesToItsNewUsersSide(t *testing.T) {
 	} {
 		back := backFrom(t, r, d, 0)
 		back.Message.URI, _ = sip.ParseURI(target)
-		if host := serverOf(t, e.router(claimsApart(e.store)).Initial(bg, back)); host != want {
+		if host := serverOf(t, e.router(nil).Initial(bg, back)); host != want {
 			t.Errorf("%s: to %s", target, host)
 		}
 	}
@@ -925,25 +925,6 @@ func TestTheFirstStepOfAChainSignsTheDialogsRoute(t *testing.T) {
 	if d := e.router(nil).Initial(bg, back); d.OnResponse != nil || len(d.RecordRoute) != 0 {
 		t.Error("the step back from the server records the route again")
 	}
-}
-
-// claimsApart is st with the claims of iFC positions (state.AttemptODI)
-// kept apart, in a store of their own, as a test that resumes one position
-// in several cases needs.
-func claimsApart(st *state.Memory) state.Store {
-	return &apartClaims{Memory: st, claims: state.NewMemory()}
-}
-
-type apartClaims struct {
-	*state.Memory
-	claims *state.Memory
-}
-
-func (s *apartClaims) CountAttempt(ctx context.Context, a state.Attempt, n int64, expires time.Time) (int64, error) {
-	if a.Kind == state.AttemptODI {
-		return s.claims.CountAttempt(ctx, a, n, expires)
-	}
-	return s.Memory.CountAttempt(ctx, a, n, expires)
 }
 
 // TestAServerThatSentTheRequestBackIsNotPassedOver (code review on #359):

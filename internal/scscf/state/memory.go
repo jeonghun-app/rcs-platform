@@ -28,6 +28,7 @@ type Memory struct {
 	added         int
 	attempts      map[attemptKey]*attempt
 	counted       int
+	odiClaims     map[string]odiClaim
 	subscriptions map[string]*Subscription
 }
 
@@ -43,6 +44,11 @@ type attempt struct {
 	expires time.Time
 }
 
+type odiClaim struct {
+	side    string
+	expires time.Time
+}
+
 var _ Store = (*Memory)(nil)
 
 // NewMemory returns an empty store.
@@ -54,6 +60,7 @@ func NewMemory() *Memory {
 		profiles:      map[SetKey]*Profile{},
 		challenges:    map[challengeKey]*Challenge{},
 		attempts:      map[attemptKey]*attempt{},
+		odiClaims:     map[string]odiClaim{},
 		subscriptions: map[string]*Subscription{},
 	}
 }
@@ -332,6 +339,28 @@ func (m *Memory) CountAttempt(_ context.Context, at Attempt, n int64, expires ti
 		}
 	}
 	return a.n, nil
+}
+
+// ClaimODI implements Challenges. Every purgeEvery claims it forgets those
+// that have expired by now.
+func (m *Memory) ClaimODI(_ context.Context, scope, side string, now, expires time.Time) (string, error) {
+	if err := ValidODIClaim(scope, side, now, expires); err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.odiClaims[scope]; ok && c.expires.After(now) {
+		return c.side, nil
+	}
+	m.odiClaims[scope] = odiClaim{side: side, expires: expires}
+	if m.counted++; m.counted%purgeEvery == 0 {
+		for k, c := range m.odiClaims {
+			if !c.expires.After(now) {
+				delete(m.odiClaims, k)
+			}
+		}
+	}
+	return side, nil
 }
 
 // AddChallenge implements Challenges. Every purgeEvery challenges it forgets
