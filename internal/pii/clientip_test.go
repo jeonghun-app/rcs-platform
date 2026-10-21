@@ -116,6 +116,41 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 		"RELAY_CORE_NETWORKS 10.0.0.0/8 and 2001:db8::/32": "RELAY_CORE_NETWORKS 10.0.0.0/8 and 2001:db8::/32",
 		"host 192.0.2.7/32 and 2001:db8:5:6::8/128":        "host 192.0.2.0/24 and 2001:db8:5::/48",
 		"": "",
+		// net/http writes ": <err>" right after the peer's address and
+		// port: the port goes all the same (#389 reviews).
+		"http: TLS handshake error from [2001:db8:5:6::8]:51234: EOF":       "http: TLS handshake error from [2001:db8:5::/48]: EOF",
+		"http: panic serving [2001:db8:5:6::8]:51234: boom":                 "http: panic serving [2001:db8:5::/48]: boom",
+		"read tcp [2001:db8::1]:8443->[2001:db8:5:6::8]:51234: i/o timeout": "read tcp [2001:db8::/48]->[2001:db8:5::/48]: i/o timeout",
+		"read tcp 10.0.1.5:8443->203.0.113.9:51234: i/o timeout":            "read tcp 10.0.1.0/24->203.0.113.0/24: i/o timeout",
+		"from 203.0.113.5:51234.":                                           "from 203.0.113.0/24.",
+		"from 203.0.113.5:51234x":                                           "from 203.0.113.0/24x",
+		// Ellipses, characters outside ASCII and other separators.
+		"from 203.0.113.9...":                    "from 203.0.113.0/24...",
+		"conn...203.0.113.9":                     "conn...203.0.113.0/24",
+		"from 203.0.113.9.. x":                   "from 203.0.113.0/24.. x",
+		"peer 2001:db8:5:6::8...":                "peer 2001:db8:5::/48...",
+		"nbsp\u00a0203.0.113.9":                  "nbsp\u00a0203.0.113.0/24",
+		"来自203.0.113.9。":                         "来自203.0.113.0/24。",
+		"：203.0.113.9":                           "：203.0.113.0/24",
+		"“203.0.113.9”":                          "“203.0.113.0/24”",
+		"udp/2001:db8:5:6::8 and ip/203.0.113.9": "udp/2001:db8:5::/48 and ip/203.0.113.0/24",
+		" :2001:db8:5:6::8 =:2001:db8:5:6::9":    " :2001:db8:5::/48 =:2001:db8:5::/48",
+		// After a word's colon, whatever letter ends the word.
+		"remote:2001:db8:5:6::8 node:2001:db8:5:6::8":    "remote:2001:db8:5::/48 node:2001:db8:5::/48",
+		"ipv6:2001:db8:5:6::8 cafe:2001:db8:5:6:7:8:9:a": "ipv6:2001:db8:5::/48 cafe:2001:db8::/48",
+		// A 6to4 network keeps only its /16, which holds no IPv4 address.
+		"from 2002:cb00:7109::/48 x": "from 2002::/16 x",
+		"2002:cb00:7108::/47":        "2002::/16",
+		"2002::/16":                  "2002::/16",
+		// A network length with host bits under it does not keep the
+		// address (#389 QA), and a port of five digits goes whole.
+		"inet 203.0.113.5/24 brd":   "inet 203.0.113.0/24 brd",
+		"[2001:db8:5:6::8]:51234 x": "[2001:db8:5::/48] x",
+		"203.0.113.5:51234 x":       "203.0.113.0/24 x",
+		// A length is read up to the first character that is no digit.
+		"203.0.113.5/24x":           "203.0.113.0/24x",
+		"203.0.113.5/255.255.255.0": "203.0.113.0/24/255.255.255.0/24",
+		"::ffff:cb00:7105/96":       "203.0.113.0/24",
 	} {
 		if got := TruncateIPsIn(in); got != want {
 			t.Errorf("TruncateIPsIn(%q)\n = %q\nwant %q", in, got, want)
@@ -180,5 +215,19 @@ func TestTruncateIPsInIsLinear(t *testing.T) {
 			}
 			t.Fatalf("64× the input once took, against 64 of the small, three times over: %s: not linear", strings.Join(ratios, "; "))
 		})
+	}
+}
+
+// QA's test on #389: the ports go in the line shapes net/http writes.
+func TestPortsAreDroppedInNetHTTPsLineShape(t *testing.T) {
+	for in, want := range map[string]string{
+		"http: TLS handshake error from 203.0.113.5:51234: EOF":                         "http: TLS handshake error from 203.0.113.0/24: EOF",
+		"http: TLS handshake error from [2001:db8:5:6::8]:51234: EOF":                   "http: TLS handshake error from [2001:db8:5::/48]: EOF",
+		"http2: server: error reading preface from client [2001:db8:5:6::8]:51234: EOF": "http2: server: error reading preface from client [2001:db8:5::/48]: EOF",
+		"read tcp [2001:db8::1]:443->[2001:db8:5:6::8]:51234: i/o timeout":              "read tcp [2001:db8::/48]->[2001:db8:5::/48]: i/o timeout",
+	} {
+		if got := TruncateIPsIn(in); got != want {
+			t.Errorf("TruncateIPsIn(%q)\n = %q\nwant %q", in, got, want)
+		}
 	}
 }

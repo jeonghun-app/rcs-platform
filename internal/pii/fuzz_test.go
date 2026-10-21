@@ -2,8 +2,8 @@ package pii
 
 import (
 	"math/rand/v2"
+	"net/netip"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -189,10 +189,22 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		"10.0.0.0/8 192.0.2.7/32 1.2.3.4.5 go1.2.3.4 ::ffff:1.2.3.4",
 		"a:b:c::1 ::: [::1] [::1%25lo]:5 1.02.003.4:00",
 		"peer 203.0.113.250 closed, 255.255.255.254.",
+		"http: panic serving [2001:db8:5:6::8]:51234: boom; from 203.0.113.5:51234.",
+		"remote:2001:db8:5:6::8 cafe:2001:db8:5:6:7:8:9:a conn...203.0.113.9 来自203.0.113.9。",
+		"2002:cb00:7109::/48 203.0.113.5/24x ::ffff:cb00:7105/96 udp/2001:db8::1",
 	} {
 		f.Add(s)
 	}
-	quad := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}`)
+	run := regexp.MustCompile(`[0-9A-Fa-f:.]+`)
+	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
+	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
+	// letter is what makes a run part of a longer word: an ASCII letter
+	// past f, or "_" (digits and hex letters are in the run itself).
+	letter := func(c byte) bool { return 'g' <= c && c <= 'z' || 'G' <= c && c <= 'Z' || c == '_' }
+	alnum := func(c byte) bool {
+		return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '_'
+	}
+	sixToFour := netip.MustParsePrefix("2002::/16")
 	f.Fuzz(func(t *testing.T, s string) {
 		got := TruncateIPsIn(s)
 		if again := TruncateIPsIn(got); again != got {
@@ -201,24 +213,140 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		if !strings.ContainsAny(s, ".:[") && got != s {
 			t.Fatalf("%q changed to %q", s, got)
 		}
-		// The oracle reads addresses its own way, not with the code under
-		// test: four parts of up to three digits, each at most 255, with
-		// no letter, digit, "_", non-ASCII byte or dot around them.
-		word := func(c byte) bool {
-			return c == '_' || c == '.' || c >= 0x80 || unicode.IsLetter(rune(c)) || unicode.IsDigit(rune(c))
-		}
-		for _, m := range quad.FindAllStringIndex(got, -1) {
-			if m[0] > 0 && word(got[m[0]-1]) || m[1] < len(got) && word(got[m[1]]) {
-				continue // part of a longer token, not an address alone
+		// The oracle reads addresses its own way, with netip and not the
+		// code under test: every maximal run of [0-9A-Fa-f:.] in the
+		// output, and every part of one after a colon, that netip reads
+		// as an address with the dots or colons around it trimmed, is a
+		// network as wide as a truncated one or text the input did not
+		// hold, unless the run is part of a longer word.
+		for _, m := range run.FindAllStringIndex(got, -1) {
+			if m[1] < len(got) && letter(got[m[1]]) {
+				continue // a longer word, as 1.2.3.4x
 			}
-			valid := true
-			for _, part := range strings.Split(got[m[0]:m[1]], ".") {
-				if n, err := strconv.Atoi(part); err != nil || n > 255 {
-					valid = false
+			r := got[m[0]:m[1]]
+			var cands []string
+			// Nor is a run right after an address's "/" ("/24::1", "::/0::1"),
+			// whose start may be a length rather than an address.
+			afterLength := m[0] >= 2 && got[m[0]-1] == '/' && run.MatchString(got[m[0]-2:m[0]-1])
+			if (m[0] == 0 || !letter(got[m[0]-1])) && !afterLength {
+				cands = append(cands, r)
+			}
+			for k := 0; k < len(r); k++ {
+				if r[k] == ':' {
+					cands = append(cands, r[k+1:])
 				}
 			}
-			if valid && (m[1] == len(got) || got[m[1]] != '/') {
-				t.Fatalf("%q left %q whole in %q", s, got[m[0]:m[1]], got)
+			// An address may be followed by dots (the end of a sentence) and
+			// by one colon (the end of a field), and preceded by dots
+			// unless a word or number is before them (x.1.2.3.4).
+			trimEnd := func(v string) []string {
+				v = strings.TrimRight(v, ".")
+				if n := len(v); n > 1 && v[n-1] == ':' && v[n-2] != ':' {
+					return []string{v, v[:n-1]}
+				}
+				return []string{v}
+			}
+			for ci, c := range cands {
+				vs := append([]string{c}, trimEnd(c)...)
+				if lead := strings.TrimLeft(c, "."); lead != c && (ci > 0 || m[0] == 0 || !alnum(got[m[0]-1])) {
+					vs = append(vs, trimEnd(lead)...)
+				}
+				for _, v := range vs {
+					ip, err := netip.ParseAddr(v)
+					if err != nil {
+						continue
+					}
+					ip = ip.Unmap()
+					bits := 48
+					switch {
+					case ip.Is4():
+						bits = 24
+					case sixToFour.Contains(ip):
+						bits = 16
+					}
+					wide := func() bool {
+						if strings.Contains(v, ".") && ip.Is6() {
+							// An embedded IPv4 address is as wide as its /24,
+							// and the bits above it as their /48.
+							b := ip.As16()
+							v4 := netip.AddrFrom4([4]byte(b[12:16]))
+							p, _ := v4.Prefix(24)
+							return p.Addr() == v4 && [6]byte(b[6:12]) == [6]byte{}
+						}
+						p, err := ip.Prefix(bits)
+						return err == nil && p.Addr() == ip
+					}
+					// A leak is an address of the input that survives
+					// whole; text the output makes up, such as a hex word
+					// before a network (cafe:2001:db8::), is none.
+					if !wide() && strings.Contains(s, v) {
+						t.Fatalf("%q left %q whole in %q", s, v, got)
+					}
+				}
+			}
+		}
+		// No port (one to five digits, not followed by another or by a dot
+		// and a digit, which make a number) is left after an address the
+		// function truncated: the
+		// digits after such a network are not the port the input had right
+		// after an address ("]:51234", ".5:51234"), unless the input held
+		// the network as written.
+		// count counts the places the input has the port text with what
+		// followed it, by whether an address's last part or a bracketed
+		// address is right before it.
+		count := func(port, after string, address func(head string) bool) (atAddress, elsewhere int) {
+			for i := 0; i <= len(s); i++ {
+				j := strings.Index(s[i:], port+after)
+				if j < 0 {
+					break
+				}
+				i += j
+				if after == "" && i+len(port) != len(s) {
+					continue
+				}
+				if address(s[:i]) {
+					atAddress++
+				} else {
+					elsewhere++
+				}
+			}
+			return atAddress, elsewhere
+		}
+		digitsAfter := func(head, sep string, most int) bool {
+			k := len(head)
+			for k > 0 && len(head)-k < most && '0' <= head[k-1] && head[k-1] <= '9' {
+				k--
+			}
+			return k < len(head) && strings.HasSuffix(head[:k], sep)
+		}
+		lastPart := func(head string) bool { return digitsAfter(head, ".", 3) }
+		bracketed := func(head string) bool {
+			if !strings.HasSuffix(head, "]") {
+				return false
+			}
+			k := strings.LastIndexByte(head, '[')
+			if k < 0 || len(head)-k > 66 {
+				return false
+			}
+			_, err := netip.ParseAddr(head[k+1 : len(head)-1])
+			return err == nil
+		}
+		// A leak is more such texts after a network in the output than
+		// the input had other than after an address, or as a network
+		// written out: some port the input had after an address is left.
+		for re, address := range map[*regexp.Regexp]func(string) bool{ipv4Port: lastPart, bracketPort: bracketed} {
+			outs := map[[2]string]int{}
+			written := map[[2]string]int{}
+			for _, m := range re.FindAllStringSubmatch(got, -1) {
+				k := [2]string{m[1], m[2]}
+				outs[k]++
+				written[k] += strings.Count(s, m[0])
+			}
+			for k, n := range outs {
+				atAddress, elsewhere := count(k[0], k[1], address)
+				if atAddress > 0 && n > elsewhere+written[k] {
+					t.Fatalf("%q left the port %q in %q", s, k[0], got)
+				}
 			}
 		}
 	})
