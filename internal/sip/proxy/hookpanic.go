@@ -35,29 +35,34 @@ func (p *Proxy) route(ctx context.Context, in *Request) Decision {
 	return dec
 }
 
-// hookNames are the hooks Proxy.hook runs, each logged at most once a
-// minute (everyMinute).
-var hookNames = []string{"Route", "Serve", "Prepare", "Resolve", "OnBranchFailure", "OnFinal", "OnResponse", "DrainAnswer"}
-
 // everyMinute allows one event a minute: a hook that panics on every request
 // logs one line a minute, as the counters give how many there were (code
-// review of #436; icscf's unknownLog does the same).
-type everyMinute struct{ last atomic.Int64 }
-
-func (e *everyMinute) allow(now time.Time) bool {
-	last := e.last.Load()
-	if last != 0 && now.UnixNano()-last < int64(time.Minute) {
-		return false
-	}
-	return e.last.CompareAndSwap(last, now.UnixNano())
+// review of #436; icscf's unknownLog does the same). Times are how long the
+// proxy has run, which a time.Now reading measures on the monotonic clock,
+// so a step of the wall clock neither silences nor floods the log; one that
+// is earlier than the last allowed, as a clock set back gives, is allowed.
+type everyMinute struct {
+	// last is the time of the last event allowed plus one nanosecond, or 0
+	// before the first.
+	last atomic.Int64
 }
 
-func newPanicLogs() map[string]*everyMinute {
-	m := make(map[string]*everyMinute, len(hookNames))
-	for _, n := range hookNames {
-		m[n] = &everyMinute{}
+func (e *everyMinute) allow(at time.Duration) bool {
+	last := e.last.Load()
+	if since := at - time.Duration(last-1); last != 0 && since >= 0 && since < time.Minute {
+		return false
 	}
-	return m
+	return e.last.CompareAndSwap(last, int64(at)+1)
+}
+
+// panicLog returns the limiter of hook name's log lines, made on its first
+// panic, so that every name Proxy.hook is given has one.
+func (p *Proxy) panicLog(name string) *everyMinute {
+	if l, ok := p.panicLogs.Load(name); ok {
+		return l.(*everyMinute)
+	}
+	l, _ := p.panicLogs.LoadOrStore(name, &everyMinute{})
+	return l.(*everyMinute)
 }
 
 // maxPanicFrames bounds the frames logged for a hook's panic: enough to find
@@ -91,7 +96,7 @@ func (p *Proxy) hookPanicked(name string, v any) {
 	if p.metrics != nil {
 		p.metrics.Count(MetricHookPanics, 1)
 	}
-	if l := p.panicLogs[name]; l != nil && !l.allow(p.now()) {
+	if !p.panicLog(name).allow(p.now().Sub(p.started)) {
 		return
 	}
 	p.log.Error("proxy: a service hook panicked",

@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,7 +118,7 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 			},
 		},
 		{
-			name: "Resolver", hook: "Resolve", cfg: Config{Resolver: panickingResolver{}}, want: codes(500),
+			name: "Resolver", hook: "Resolver", cfg: Config{Resolver: panickingResolver{}}, want: codes(500),
 			run: func(t *testing.T, h *harness) []int {
 				h.decide(Decision{Targets: []Target{target("sip:a@panic.example.net")}})
 				h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
@@ -247,8 +249,10 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 			},
 		},
 		{
-			// Drain's own answer goes through OnResponse as well.
+			// Drain's own answer goes through OnResponse as well; the 500
+			// keeps its Retry-After, which sends the client elsewhere.
 			name: "OnResponse on Drain's answer", hook: "OnResponse", draining: true, want: codes(500),
+			cfg: Config{DrainAnswer: func(*sip.Request) (int, time.Duration) { return 503, 7 * time.Second }},
 			run: func(t *testing.T, h *harness) []int {
 				h.decide(Decision{
 					Targets: []Target{target("sip:bob@192.0.2.2")},
@@ -267,9 +271,71 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 					if r.Header.Has("X-Half") {
 						t.Error("the response the hook half changed was sent")
 					}
+					if ra := r.Header.Get("Retry-After"); ra != "7" {
+						t.Errorf("Retry-After = %q, want DrainAnswer's 7", ra)
+					}
 					out = append(out, r.StatusCode)
 				}
 				return out
+			},
+		},
+		{
+			// A panic value that is an error is logged by its type only:
+			// its text may quote the message.
+			name: "Router with an error value", hook: "Route", want: codes(500),
+			run: func(t *testing.T, h *harness) []int {
+				h.route(func(_ contextT, r *Request) Decision {
+					panic(fmt.Errorf("%s %s", hookSecret, r.Message.Header.Get("From")))
+				})
+				h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+				return h.upstream()
+			},
+		},
+		{
+			// OnFinal's panic leaves OnResponse out, as pcscf sets both:
+			// the response OnFinal half changed is not passed on.
+			name: "OnFinal with OnResponse", hook: "OnFinal", want: codes(500),
+			run: func(t *testing.T, h *harness) []int {
+				var calls atomic.Int32
+				h.decide(Decision{
+					Targets: []Target{target("sip:a@192.0.2.1")},
+					OnFinal: func(_ contextT, res *sip.Response) {
+						res.StatusCode = 486
+						panicWith(&res.Header)
+					},
+					OnResponse: func(contextT, *sip.Response) { calls.Add(1) },
+				})
+				h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+				h.reply(h.one(), 404)
+				if n := calls.Load(); n != 0 {
+					t.Errorf("OnResponse called %d times after OnFinal panicked", n)
+				}
+				return h.upstream()
+			},
+		},
+		{
+			// The 2xx the 500 replaced comes again: dropped, and no
+			// upstream error (QA of #436).
+			name: "OnResponse on an INVITE's first 2xx", hook: "OnResponse", want: codes(500),
+			run: func(t *testing.T, h *harness) []int {
+				var calls atomic.Int32
+				h.decide(Decision{
+					Targets: []Target{target("sip:a@192.0.2.1")},
+					OnResponse: func(_ contextT, res *sip.Response) {
+						if calls.Add(1) == 1 {
+							panicWith(&res.Header)
+						}
+					},
+				})
+				h.receive(invite(t))
+				fwd := h.one()
+				h.reply(fwd, 200)
+				h.reply(fwd, 200)
+				h.reply(fwd, 200)
+				if n := h.p.Stats().UpstreamErrors; n != 0 {
+					t.Errorf("UpstreamErrors = %d for the replaced 2xx's retransmissions", n)
+				}
+				return h.upstream()
 			},
 		},
 		{
@@ -295,10 +361,10 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 			cfg.Metrics = metrics
 			h := newHarness(t, cfg)
 			check(t, "upstream", tt.run(t, h), tt.want)
-			// Drain asks DrainAnswer again on its second pass, which the
-			// first answer, still queued, has not ended.
+			// One panic, Drain's included: it asks DrainAnswer once a
+			// request (QA of #436).
 			n := h.p.Stats().HookPanics
-			if n != 1 && !(tt.draining && n >= 1) {
+			if n != 1 {
 				t.Errorf("HookPanics = %d, want 1", n)
 			}
 			if m := metrics.count(MetricHookPanics); m != int64(n) {
@@ -332,31 +398,61 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 }
 
 // A hook that panics on every request logs one line a minute, and counts
-// every panic (code review of #436).
+// every panic (code review of #436): none more at 59 s, the next at 60 s,
+// and one at once when the clock goes back, rather than none until it has
+// caught up (QA of #436).
 func TestAHookPanicIsLoggedOnceAMinute(t *testing.T) {
 	var logs lockedBuffer
 	h := newHarness(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
-	now := time.Unix(1_800_000_000, 0)
+	now := h.p.started
 	h.p.now = func() time.Time { return now }
 	h.route(func(_ contextT, r *Request) Decision { panicWith(&r.Message.Header); return Decision{} })
-	send := func(n int) {
+	n := 0
+	send := func() {
+		n++
 		h.receive(request(t, "MESSAGE", "sip:bob@example.com",
 			"Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKup-"+itoa(n), "Call-ID: call-"+itoa(n)+"@192.0.2.10"))
 	}
 	lines := func() int { return strings.Count(logs.String(), "hook=Route") }
-	for n := range 3 {
-		send(n)
+	for _, step := range []struct {
+		advance time.Duration
+		want    int
+	}{
+		{0, 1}, {0, 1}, {0, 1},
+		{59 * time.Second, 1},
+		{time.Second, 2},
+		{-time.Hour, 3},
+		{59 * time.Second, 3},
+		{time.Second, 4},
+	} {
+		now = now.Add(step.advance)
+		send()
+		if got := lines(); got != step.want {
+			t.Fatalf("after panic %d (clock %v): %d lines, want %d", n, now.Sub(h.p.started), got, step.want)
+		}
 	}
-	if lines() != 1 {
-		t.Errorf("%d lines for 3 panics within a minute, want 1:\n%s", lines(), logs.String())
+	if got := h.p.Stats().HookPanics; got != uint64(n) {
+		t.Errorf("HookPanics = %d, want %d", got, n)
 	}
-	now = now.Add(time.Minute)
-	send(3)
-	if lines() != 2 {
-		t.Errorf("%d lines once a minute has passed, want 2", lines())
+	check(t, "upstream", h.upstream(), codes(500, 500, 500, 500, 500, 500, 500, 500))
+}
+
+// A Serve handler that panics after a CANCEL is answered 487, as one that
+// returns without an answer then is (§9.2).
+func TestAServePanicAfterACancelIsAnswered487(t *testing.T) {
+	h := newHarness(t, Config{})
+	entered := make(chan struct{})
+	h.decide(Decision{Serve: func(ctx context.Context, u *UAS) {
+		close(entered)
+		<-ctx.Done()
+		panicWith(&u.Request().Message.Header)
+	}})
+	req := invite(t)
+	h.p.Receive(inboundFrom(req, "up"))
+	<-entered
+	h.receive(uacCancel(t, req))
+	check(t, "upstream", h.upstream(), codes(200, 487))
+	if n := h.p.Stats().HookPanics; n != 1 {
+		t.Errorf("HookPanics = %d, want 1", n)
 	}
-	if n := h.p.Stats().HookPanics; n != 4 {
-		t.Errorf("HookPanics = %d, want 4", n)
-	}
-	check(t, "upstream", h.upstream(), codes(500, 500, 500, 500))
 }

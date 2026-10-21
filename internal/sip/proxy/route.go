@@ -342,7 +342,7 @@ func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Targ
 		next = routes[0].URI
 	}
 	var dst transport.Destination
-	if !p.hook("Resolve", func() { dst, err = p.resolver.Resolve(ctx, next) }) {
+	if !p.hook("Resolver", func() { dst, err = p.resolver.Resolve(ctx, next) }) {
 		return nil, transport.Destination{}, errHookPanic
 	}
 	if err != nil {
