@@ -32,7 +32,9 @@
 //   - cancels the INVITE branches still pending after a 2xx, a 6xx or a
 //     CANCEL from upstream, each only once it has a provisional response
 //     (§9.1), and terminates a branch whose CANCEL is not answered within
-//     64*T1;
+//     64*T1; a branch not yet sent when the CANCEL came, its Prepare or
+//     Resolver still running, is never sent, as the CANCEL's 200 goes only
+//     once the request counts as cancelled (#361);
 //   - runs Timer C on every INVITE branch (§16.8): a branch that has had a
 //     provisional response is cancelled, one that has not counts as a 408;
 //     Target.Timeout bounds a branch more tightly where a service needs it.

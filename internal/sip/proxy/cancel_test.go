@@ -108,6 +108,54 @@ func TestACancelWhileTheRouterRunsAnswers487AndForwardsNothing(t *testing.T) {
 	check(t, "sent", h.sentMethods(), nil)
 }
 
+// #361: a CANCEL that comes while a branch's Prepare runs is answered 200
+// only once the request counts as cancelled, so that the branch, prepared
+// after the client has its 200, is never sent: the INVITE gets its 487 at
+// once, not after a downstream that may never send a provisional, which a
+// CANCEL waits for (§9.1), runs out Timer B (§16.10).
+func TestACancelDuringPrepareIsAnswered200OnlyOnceTheRequestIsCancelled(t *testing.T) {
+	h := newHarness(t, Config{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	h.route(func(_ contextT, r *Request) Decision {
+		d := Forward(r)
+		d.Prepare = func(contextT, Target, *sip.Request) error {
+			once.Do(func() { close(entered) })
+			<-release
+			return nil
+		}
+		return d
+	})
+	var cancelledFirst []bool
+	h.net.mu.Lock()
+	h.net.onResponse = func(res *sip.Response) {
+		if cseq, _ := res.Header.CSeq(); res.StatusCode != 200 || cseq.Method != "CANCEL" {
+			return
+		}
+		h.p.mu.Lock()
+		var ctxs []*respContext
+		for _, c := range h.p.contexts {
+			ctxs = append(ctxs, c)
+		}
+		h.p.mu.Unlock()
+		for _, c := range ctxs {
+			c.mu.Lock()
+			cancelledFirst = append(cancelledFirst, c.cancelled && c.closed)
+			c.mu.Unlock()
+		}
+	}
+	h.net.mu.Unlock()
+	inv := invite(t)
+	h.p.Receive(inboundFrom(inv, "up"))
+	<-entered
+	h.p.Receive(inboundFrom(uacCancel(t, inv), "up"))
+	close(release)
+	h.settle()
+	check(t, "cancelled before the 200", cancelledFirst, []bool{true})
+	check(t, "upstream", labels(h.upstreamResponses()), []string{"200 CANCEL", "487 INVITE"})
+	check(t, "sent", h.sentMethods(), nil)
+}
+
 // TestACancelWhileTheInviteIsBeingSentWaitsForItsProvisional holds the branch
 // in its send while the CANCEL arrives: the INVITE still goes, and is cancelled
 // once it is known to have arrived.
