@@ -1186,7 +1186,15 @@ chat on has a heartbeat item:
   beat is `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` old; it beats once more
   at its present time on shutdown, after its sessions have ended, so that
   another task takes its groups at once. A task remembers the groups it
-  owns, so that a change of one costs no more reads than before. Until D3 of
+  owns, so that a change of one costs no more reads than before. It forgets
+  them all when a beat is stored later than its last one's hold
+  (`RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW`), whether it saw itself lapse
+  or was paused unaware, and forgets one when the store refuses a write or a
+  message's copy for it. Whether to invite a participant for a group's
+  queued copies, which the store does not fence, it asks the owner item
+  again once what it remembers is `RCSAS_TASK_HEARTBEAT` old: a task that
+  lost a group stops inviting for it within a heartbeat, even one that
+  writes nothing to it. Until D3 of
   #121 forwards requests to a group's owner, a request for a group another
   task owns is answered 500 with `Retry-After` (never 404, which rcsjta
   takes for the group's end and restarts it at the factory).
@@ -1197,7 +1205,9 @@ chat on has a heartbeat item:
   after the old task's last beat; after a clean shutdown, which stores a last
   beat at its present time, `RCSAS_TASK_SKEW` (2 s). Meanwhile a change to
   one of those groups is answered 500 with `Retry-After`, which clients try
-  again; a task on the old one's address takes its groups at once. Before
+  again, and a message written in one is refused as one not stored
+  (`StatusTryAgain`), as its copies are queued under the owner's fence;
+  a task on the old one's address takes its groups at once. Before
   #121, a replacement changed them at once. Deployments stop tasks cleanly.
 - **Touch.** At most once an hour per task, and not within an hour of a
   change, a group in use has its `active`, `expires` and `ttl` moved forward,
@@ -1214,7 +1224,9 @@ chat on has a heartbeat item:
   DynamoDB bills at twice the write units of each. A task's heartbeat is one
   small write every `RCSAS_TASK_HEARTBEAT`. A task's first change of a group
   it does not know reads the owner item, and the owner's heartbeat item if
-  another task holds it.
+  another task holds it. Whether to invite for a group's queued copies reads
+  the group and owner items at most once per group every
+  `RCSAS_TASK_HEARTBEAT`.
 
 Each group message costs one strongly consistent read of the group item and,
 per recipient, the enqueue transaction of the `messages` table, which also
@@ -1223,6 +1235,13 @@ transaction, so each copy costs about 2 more write units. A copy is queued
 only while the owner item still names the task that queues it, so a task that
 lost the group queues none (the fan-out stops at the first refused copy,
 `group.fanout.not_owner`, and the sender is answered as for a store failure).
+The other group-mode items are not fenced, as two tasks cannot both queue one:
+a participant's notification for the author is queued once its mark is
+stored, which only one writer does (`MarkNotified`); a summary has an ID
+fixed by the message it reports on (`r-<Message-ID>`), so a second is
+refused as existing; and a fan-out's failure notice for a full queue follows
+a copy refused with its fence held (the store checks the fence first), so
+only the owner queues one.
 Only the owner invites a participant for its queued copies
 (`delivery.group_not_owned` counts those another task's queue pass left
 alone); the owner reads the queue again on `Engine.Wake`, which #121 D3's
