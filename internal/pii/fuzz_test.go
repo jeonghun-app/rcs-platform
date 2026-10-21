@@ -84,6 +84,13 @@ func FuzzRedact(f *testing.F) {
 		"+1\u00a0555\u202f010\u20090001 ０１０ー００００\u2212０００１ 010\u2013 0000\u2014 0001 名前\u3000（注）\u300010 tel:（０３）１２３４",
 		`From: <im:"bob smith"@` + testDomain + `> pres:"a \"" im:"x`,
 		`im:"` + testMSISDN + `"@` + testDomain,
+		// From the reviews of #398.
+		"sip:a\u00a0+1\u00a0555\u00a0010\u00a00001 SIM:\u00a0+1\u00a0555\u00a0010\u00a00001",
+		"Interim:\u00a0010\u00a00000\u00a00001 im:\u3000０１０\u3000００００\u3000０００１",
+		"1\u200b-010-0000-0001 8\ufeff010 0000 0001 +\u200b(1)555 010 0001",
+		"+1 \u200b(555) 010-0001 +1 \u2066(555)\u2069 010-0001 010-\u200b-0000-0001",
+		"sips:urn:gsma:imei:\u3000555\u3000010@x sip:ims.example.com経由\u3000０３\u3000１２３４",
+		"0900〜1800 sip:+1\u00a0555\u00a0010\u00a00001@x",
 	} {
 		f.Add(s, false)
 		f.Add(s, true)
@@ -117,29 +124,35 @@ func FuzzRedact(f *testing.F) {
 		if !strings.ContainsRune(s, ':') && !strings.ContainsFunc(s, unicode.IsDigit) && out != s {
 			t.Fatalf("Redact(%q) = %q changed text with no digits or schemes", s, out)
 		}
+		// Never less than main masked before #154 (review of #398).
+		if lost := maskedLessThanMain(s); lost != "" {
+			t.Fatal(lost)
+		}
 	})
 }
 
 // FuzzRedactAnyForm is the differential check of
 // TestRedactReadsANumberInAnyFormAsInASCII on any ASCII text: the ASCII
 // characters of s, with every digit and number character replaced at random
-// (from seed) by a form from another script, are redacted as the ASCII text
-// is, after the forms left in the output are read back as ASCII. Texts with a
-// sip, sips, im or pres scheme are left to the test: Redact masks such a user
-// whole whatever its characters, and when it is not a number written as
-// asciiNumberChars reads one, a form left in it changes the hint, or a space
-// outside ASCII does not end it.
+// (from seed) by a form from another script and with invisible characters
+// between number characters, are redacted as the ASCII text is
+// (readsAsASCII). Texts with a sip, sips, im or pres scheme followed by an
+// "@" are left to the test: Redact masks such a user whole whatever its
+// characters, and when it is not a number written as asciiNumberChars reads
+// one, a form left in it changes the hint, or a space outside ASCII does not
+// end it. A scheme without an "@" after it, as in "SIM: +1 555 010 0001",
+// is no user, and is checked here.
 func FuzzRedactAnyForm(f *testing.F) {
 	for _, s := range []string{
 		"call +1 (555) 010-0001 or 010-0000-0001.",
 		"tel:(03)1234-5678;phone-context=example.net tel: 0000000",
 		"urn:gsma:imei:35-209900-176148-1 (1) 10-20 1 - 2",
 		"+0 (000) 000 0000 tel:1.736-.4-.5)) (1)-89553",
+		"sip:a +1 555 010 0001 SIM: 010 0000 0001 sips:pcscf;lr (0) 1-010-0000-0001",
 	} {
 		f.Add(s, uint64(0))
 		f.Add(s, uint64(1))
 	}
-	unkeyed, keyed := NewRedactor(nil), NewRedactor(testKey)
 	f.Fuzz(func(t *testing.T, s string, seed uint64) {
 		var b strings.Builder
 		for i := range len(s) {
@@ -152,15 +165,12 @@ func FuzzRedactAnyForm(f *testing.F) {
 			return
 		}
 		for i := range len(ascii) {
-			if n := schemeLen(ascii[i:]); n > 0 && hasUserinfo(ascii[i:i+n]) {
+			if n := schemeLen(ascii[i:]); n > 0 && hasUserinfo(ascii[i:i+n]) && strings.Contains(ascii[i:], "@") {
 				return
 			}
 		}
-		wide := anyFormOf(rand.New(rand.NewPCG(seed, 0)), ascii)
-		for _, r := range []*Redactor{unkeyed, keyed} {
-			if want, got := r.Redact(ascii), r.Redact(wide); asciiForm(got) != want {
-				t.Fatalf("Redact(%q) = %q\nRedact(%q) = %q", ascii, want, wide, got)
-			}
+		if bad := readsAsASCII(ascii, anyFormOf(rand.New(rand.NewPCG(seed, 0)), ascii)); bad != "" {
+			t.Fatal(bad)
 		}
 	})
 }
