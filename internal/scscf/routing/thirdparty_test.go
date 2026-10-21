@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -164,7 +165,7 @@ func TestAServerAsksForTheREGISTERAndThe200InTheBody(t *testing.T) {
 func TestAnEndTheNetworkMadeIsSentWithoutABody(t *testing.T) {
 	e := newEnv(t)
 	fc := criterion(40, rcsAS, registerTrigger(ifc.DeRegistration), ifc.SessionContinued)
-	fc.ApplicationServer.IncludeRegisterRequest = true
+	fc.ApplicationServer.IncludeRegisterRequest, fc.ApplicationServer.IncludeRegisterResponse = true, true
 	e.profile(t0, fc)
 	p, err := e.store.Profile(bg, set1, t0)
 	if err != nil {
@@ -315,6 +316,9 @@ func TestWhatAServerAnswersIsCounted(t *testing.T) {
 			if e.metrics.get(c.counted) != 1 {
 				t.Errorf("%s not counted", c.counted)
 			}
+			if c.handling != ifc.SessionTerminated && e.metrics.get("routing.third_party.terminated_unanswered") != 0 {
+				t.Error("a server whose session continues is counted as one that ends it")
+			}
 		})
 	}
 }
@@ -342,5 +346,53 @@ func TestNothingIsSentWithoutASenderOrACriterion(t *testing.T) {
 	rt.Wait()
 	if len(s.got()) != 0 {
 		t.Error("sent without a profile")
+	}
+}
+
+// expiringSender holds each REGISTER whose Expires is in hold until that
+// value is let go, and reports the Expires of each as it finishes.
+type expiringSender struct {
+	mu       sync.Mutex
+	hold     map[string]chan struct{}
+	finished chan string
+}
+
+func (s *expiringSender) Send(_ context.Context, req *sip.Request) (*sip.Response, error) {
+	exp := req.Header.Get("Expires")
+	s.mu.Lock()
+	h := s.hold[exp]
+	s.mu.Unlock()
+	if h != nil {
+		<-h
+	}
+	s.finished <- exp
+	return sip.NewResponse(req, 200, "", "as")
+}
+
+// TestALaterRegistrationWaitsForEveryOneBeforeIt: when the first of a set's
+// queued registrations ends, the set's queue still has the later ones, and
+// one told of next waits for them too.
+func TestALaterRegistrationWaitsForEveryOneBeforeIt(t *testing.T) {
+	e := newEnv(t)
+	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+	s := &expiringSender{hold: map[string]chan struct{}{"100": make(chan struct{}), "200": make(chan struct{})}, finished: make(chan string, 8)}
+	rt := e.router(nil, withSender(s))
+	for _, exp := range []time.Duration{100, 200, 300} {
+		rt.Registered(bg, registration(t, ifc.ReRegistration, exp*time.Second))
+	}
+	close(s.hold["100"])
+	if got := <-s.finished; got != "100" {
+		t.Fatalf("%s finished first", got)
+	}
+	rt.Registered(bg, registration(t, ifc.ReRegistration, 400*time.Second))
+	close(s.hold["200"])
+	rt.Wait()
+	close(s.finished)
+	var order []string
+	for exp := range s.finished {
+		order = append(order, exp)
+	}
+	if !slices.Equal(order, []string{"200", "300", "400"}) {
+		t.Errorf("then in the order %v", order)
 	}
 }
