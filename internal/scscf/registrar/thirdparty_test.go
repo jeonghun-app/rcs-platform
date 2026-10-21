@@ -32,8 +32,9 @@ func withThirdParty(r *recordedThirdParty) func(*Config) { return func(c *Config
 
 // TestEveryRegistrationIsToldToTheApplicationServers (TS 24.229 §5.4.1.7):
 // an initial registration, a refresh, a second device and the end of the
-// set, with the UE's REGISTER, the 200 and how long the set stays
-// registered; a query is not one.
+// set, with how long the set stays registered, and the UE's REGISTER and
+// the 200 but for the end, which §5.4.1.7 g) leaves without (#379, lead's
+// decision); a query is not one.
 func TestEveryRegistrationIsToldToTheApplicationServers(t *testing.T) {
 	e := newEnv(t)
 	tp := &recordedThirdParty{}
@@ -62,7 +63,8 @@ func TestEveryRegistrationIsToldToTheApplicationServers(t *testing.T) {
 	}
 	for i, w := range want {
 		r := got[i]
-		if r.Type != w.t || r.Expires != w.expires || r.IMPU != impu1 || r.Set.IMPU != impu1 || r.Request == nil || r.Response == nil || r.Response.StatusCode != 200 {
+		withBody := r.Request != nil && r.Response != nil && r.Response.StatusCode == 200
+		if r.Type != w.t || r.Expires != w.expires || r.IMPU != impu1 || r.Set.IMPU != impu1 || withBody != (w.t != ifc.DeRegistration) {
 			t.Errorf("%d: %+v, want type %d, expires %v", i, r, w.t, w.expires)
 		}
 	}
@@ -129,3 +131,4 @@ func TestARefusedRegistrationIsNotTold(t *testing.T) {
 		t.Errorf("told %+v", got)
 	}
 }
+
