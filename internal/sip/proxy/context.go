@@ -42,7 +42,10 @@ type respContext struct {
 	// request is cancelled upstream.
 	reqCtx    context.Context
 	cancelReq context.CancelFunc
-	up        serial
+	// unwatch stops watching the server transaction for the layer's own 500
+	// (layerAnswered).
+	unwatch func() bool
+	up      serial
 	// reserved is what the context holds of Config.MaxContextBytes.
 	reserved int64
 	// header is the size of the request's header, which every branch copies.
@@ -155,6 +158,7 @@ func newRespContext(p *Proxy, tx *transaction.ServerTransaction, cost, header in
 	c.ctx, c.cancelCtx = context.WithCancel(p.ctx)
 	c.reqCtx, c.cancelReq = context.WithCancel(c.ctx)
 	c.up.p = p
+	c.unwatch = context.AfterFunc(tx.Context(), c.layerAnswered)
 	return c
 }
 
@@ -163,6 +167,30 @@ func newRespContext(p *Proxy, tx *transaction.ServerTransaction, cost, header in
 // held.
 func (c *respContext) stopped() bool {
 	return c.closed || c.finalSent || c.ctx.Err() != nil || c.p.isClosed()
+}
+
+// layerAnswered runs when the server transaction's Context ends. If the layer
+// answered the request 500 itself, because a Router, Resolver or hook stalled
+// past its safety timer (transaction.ErrNoFinalResponse), the client has its
+// final response, so the context stops as if it had sent one: the Router and
+// hooks see their context cancelled, no branch starts, and the INVITE branches
+// still pending, such as one that started just before this ran, are cancelled
+// (§16.10), so a call the caller has given up on does not ring on. A
+// transaction that ended normally needs nothing, and a 2xx's retransmissions
+// keep their context for Timer M.
+func (c *respContext) layerAnswered() {
+	if !errors.Is(context.Cause(c.tx.Context()), transaction.ErrNoFinalResponse) || c.p.isClosed() {
+		return
+	}
+	c.mu.Lock()
+	c.finalSent = true
+	acts := c.closeBranches()
+	acts = append(acts, c.progress()...)
+	c.mu.Unlock()
+	runAll(acts)
+	// Last, so that whoever sees the context cancelled finds the context
+	// stopped and its CANCELs under way.
+	c.cancelCtx()
 }
 
 // run validates, preprocesses and routes the request, then starts the first
@@ -194,8 +222,8 @@ func (c *respContext) run() {
 	c.mu.Unlock()
 	switch {
 	case closing:
-		// The proxy is closing: its transactions are gone and nothing may be
-		// sent.
+		// The proxy is closing, its transactions gone, or the layer has
+		// answered the request (layerAnswered): nothing may be sent.
 		c.finish()
 		return
 	case c.uas != nil:
@@ -391,9 +419,13 @@ func (c *respContext) allFinal() bool {
 
 // startBranches starts a branch for each target not tried before, within
 // MaxBranches and MaxContextBytes (§16.5 forbids sending to the same target
-// twice; RFC 5393 §3 motivates bounding them). mu must be held.
+// twice; RFC 5393 §3 motivates bounding them). Starting one is progress, so
+// the layer's safety timer starts again (#156): each fork group and each
+// replacement gets its own Timer C or F before the layer answers for the
+// proxy. mu must be held.
 func (c *respContext) startBranches(targets []Target) []func() {
 	var acts []func()
+	started := false
 	for _, t := range targets {
 		if slices.ContainsFunc(c.branches, func(b *branch) bool { return sameTarget(b.target, t) }) {
 			continue
@@ -415,7 +447,11 @@ func (c *respContext) startBranches(targets []Target) []func() {
 		c.reserved += cost
 		c.pending++
 		c.p.stats.branches.Add(1)
+		started = true
 		acts = append(acts, func() { c.p.spawn(b.start) })
+	}
+	if started {
+		acts = append([]func(){c.tx.Progress}, acts...)
 	}
 	return acts
 }
