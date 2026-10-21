@@ -22,15 +22,16 @@ func (d *Dynamo) subscriptionItem(s *state.Subscription, version int64) (map[str
 		return nil, err
 	}
 	item := map[string]types.AttributeValue{
-		attrPK:      str(s.ID),
-		attrVersion: num(version),
-		attrDoc:     bin(doc),
-		attrWriter:  str(d.token()),
-		attrIMPU:    str(s.IMPU),
-		attrCSeq:    num(int64(s.CSeq)),
-		attrRver:    num(int64(s.ReginfoVersion)),
-		attrShard:   str(shardOf(s.ID)),
-		attrExpires: num(s.Expires.Unix()),
+		attrPK:         str(s.ID),
+		attrVersion:    num(version),
+		attrDoc:        bin(doc),
+		attrWriter:     str(d.token()),
+		attrIMPU:       str(s.IMPU),
+		attrCSeq:       num(int64(s.CSeq)),
+		attrRver:       num(int64(s.ReginfoVersion)),
+		attrNotifiedOf: num(s.NotifiedOf),
+		attrShard:      str(shardOf(s.ID)),
+		attrExpires:    num(s.Expires.Unix()),
 	}
 	return item, checkSize(item, "subscription")
 }
@@ -52,7 +53,18 @@ func decodeSubscriptionItem(item map[string]types.AttributeValue) (*state.Subscr
 	if err != nil {
 		return nil, err
 	}
-	return decodeSubscription(doc, version, cseq, rver)
+	var of int64
+	if _, ok := item[attrNotifiedOf]; ok {
+		if of, err = nv(item, attrNotifiedOf); err != nil {
+			return nil, err
+		}
+	}
+	s, err := decodeSubscription(doc, version, cseq, rver)
+	if err != nil {
+		return nil, err
+	}
+	s.NotifiedOf = of
+	return s, nil
 }
 
 func counter(item map[string]types.AttributeValue, name string) (uint32, error) {
@@ -125,7 +137,7 @@ func (d *Dynamo) DeleteSubscription(ctx context.Context, s *state.Subscription) 
 // to both counters and the version, below state.MaxCounter. The token makes it
 // idempotent: a resent update finds its own token and fails its condition, and
 // the values the first attempt produced are read back.
-func (d *Dynamo) NextNotify(ctx context.Context, id string) (uint32, uint32, error) {
+func (d *Dynamo) NextNotify(ctx context.Context, id string, of int64) (uint32, uint32, error) {
 	if !state.KeyOK(id, state.MaxKey) {
 		return 0, 0, fmt.Errorf("dynamostore: next notify: %w", state.ErrNotFound)
 	}
@@ -133,12 +145,12 @@ func (d *Dynamo) NextNotify(ctx context.Context, id string) (uint32, uint32, err
 	out, err := d.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           aws.String(d.subscriptions),
 		Key:                 key(id),
-		UpdateExpression:    aws.String("SET #tok = :tok, #v = #v + :one ADD #cseq :one, #rver :one"),
-		ConditionExpression: aws.String("attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max"),
+		UpdateExpression:    aws.String("SET #tok = :tok, #v = #v + :one, #of = :of ADD #cseq :one, #rver :one"),
+		ConditionExpression: aws.String("attribute_exists(#pk) AND (attribute_not_exists(#tok) OR #tok <> :tok) AND #cseq < :max AND #rver < :max AND (attribute_not_exists(#of) OR (#of <= :of AND #of < :final))"),
 		ExpressionAttributeNames: map[string]string{
-			"#pk": attrPK, "#tok": attrNToken, "#v": attrVersion, "#cseq": attrCSeq, "#rver": attrRver,
+			"#pk": attrPK, "#tok": attrNToken, "#v": attrVersion, "#cseq": attrCSeq, "#rver": attrRver, "#of": attrNotifiedOf,
 		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":tok": str(tok), ":one": num(1), ":max": num(state.MaxCounter)},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":tok": str(tok), ":one": num(1), ":max": num(state.MaxCounter), ":of": num(of), ":final": num(state.FinalNotify)},
 		ReturnValues:              types.ReturnValueAllNew,
 	})
 	var item map[string]types.AttributeValue
@@ -150,11 +162,14 @@ func (d *Dynamo) NextNotify(ctx context.Context, id string) (uint32, uint32, err
 		}
 		c, _ := nv(cur, attrCSeq)
 		r, _ := nv(cur, attrRver)
+		last, _ := nv(cur, attrNotifiedOf)
 		switch {
 		case tok != "" && sv(cur[attrNToken]) == tok:
 			// An earlier attempt of this call succeeded.
 		case c >= state.MaxCounter || r >= state.MaxCounter:
 			return 0, 0, fmt.Errorf("dynamostore: next notify: %w", state.ErrExhausted)
+		case last > of || last == state.FinalNotify:
+			return 0, 0, fmt.Errorf("dynamostore: next notify: %w", state.ErrStale)
 		default:
 			// Unreachable unless the item went and came back between the two
 			// requests; the caller asks again.

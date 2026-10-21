@@ -595,7 +595,7 @@ func TestAChallengeABusyHSSAnsweredKeepsItsCounts(t *testing.T) {
 type overloadedHSS struct {
 	*fakeHSS
 	mu      sync.Mutex
-	mode    string // "busy", "timeout", "resync-timeout", "resync-refused", ""
+	mode    string // "busy", "timeout", "sent", "resync-timeout", "resync-refused", "resync-sent", ""
 	reached int
 }
 
@@ -609,7 +609,9 @@ func (o *overloadedHSS) fail(ctx context.Context, r *cx.MAR) (*cx.MAA, error, bo
 		mode = "timeout"
 	case mode == "resync-refused" && resync:
 		mode = "refused"
-	case mode == "resync-timeout", mode == "resync-refused":
+	case mode == "resync-sent" && resync:
+		mode = "sent"
+	case mode == "resync-timeout", mode == "resync-refused", mode == "resync-sent":
 		mode = ""
 	}
 	if mode != "" {
@@ -624,6 +626,10 @@ func (o *overloadedHSS) fail(ctx context.Context, r *cx.MAR) (*cx.MAA, error, bo
 		return nil, diameter.ErrTimeout, true
 	case "refused":
 		return &cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(diameter.ResultAuthorizationRejected)}}, nil, true
+	case "sent":
+		// What cxclient says of a first attempt answered TOO_BUSY whose
+		// retry found its task gone (#261).
+		return nil, &cxclient.SentError{Err: fmt.Errorf("cxclient: MAR: %w", diameter.ErrPeerUnavailable)}, true
 	}
 	return nil, nil, false
 }
@@ -713,4 +719,60 @@ func TestAResyncOverTheChallengesFlowCostsTheFlowNothing(t *testing.T) {
 	e.clock.advance(30 * time.Second)
 	second := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
 	wantStatus(t, g.Register(bg, u.request(600, resyncOf(u, second)), upstream), 401)
+}
+
+// TestAChallengeWhoseFirstAttemptReachedTheHSSKeepsItsCounts: the MAR's
+// first attempt was answered TOO_BUSY and its retry found no HSS task; the
+// error is the retry's, but the HSS saw the MAR, so the counts stay (#261).
+func TestAChallengeWhoseFirstAttemptReachedTheHSSKeepsItsCounts(t *testing.T) {
+	e := newEnv(t)
+	o := &overloadedHSS{fakeHSS: e.hss, mode: "sent"}
+	g := e.instance(1, func(c *Config) { c.HSS = o })
+	e.akaUser(impi1, impu1)
+	for i := range DefaultChallengeLimit {
+		wantStatus(t, g.Register(bg, attacker(t, impi1, impu1, i).request(600, ""), upstream), 480)
+	}
+	healthy := e.instance(2)
+	wantStatus(t, healthy.Register(bg, attacker(t, impi1, impu1, 99).request(600, ""), upstream), 500)
+}
+
+// TestAResyncWhoseFirstAttemptReachedTheHSSKeepsItsSlot: as above, for the
+// AUTS's MAR (#261).
+func TestAResyncWhoseFirstAttemptReachedTheHSSKeepsItsSlot(t *testing.T) {
+	e := newEnv(t)
+	o := &overloadedHSS{fakeHSS: e.hss, mode: "resync-sent"}
+	g := e.instance(1, roomForResyncs, func(c *Config) { c.HSS = o })
+	u := e.akaUser(impi1, impu1)
+	for i := range DefaultResyncLimit {
+		ch := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+		if code := g.Register(bg, u.request(600, resyncOf(u, ch)), upstream).StatusCode; code != 480 {
+			t.Fatalf("resync %d whose retry found no task: %d", i+1, code)
+		}
+	}
+	o.mu.Lock()
+	o.mode = ""
+	o.mu.Unlock()
+	ch := u.challengeOf(g.Register(bg, u.request(600, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, u.request(600, resyncOf(u, ch)), upstream), 403)
+}
+
+// TestAnAUTSOverAnotherFlowCountsInThatFlowsBudget: an AUTS that comes
+// over a flow other than its challenge's is that flow's new attempt, and
+// pays its budget (QA on #223: the && at sameFlow).
+func TestAnAUTSOverAnotherFlowCountsInThatFlowsBudget(t *testing.T) {
+	e := newEnv(t)
+	a := e.instance(1, func(c *Config) { c.ResyncLimit = 100 })
+	e.akaUser(impi1, impu1)
+	one, two := attacker(t, impi1, impu1, 1), attacker(t, impi1, impu1, 2)
+	for range DefaultFlowChallengeLimit - 1 { // flow 2 spends all but one
+		a.Register(bg, two.request(600, ""), upstream)
+	}
+	var codes []int
+	for range 2 { // flow 1 is challenged, flow 2 answers with an AUTS
+		ch := one.challengeOf(a.Register(bg, one.request(600, ""), upstream), 0)
+		codes = append(codes, a.Register(bg, two.request(600, forgedAUTS(t, two, ch)), upstream).StatusCode)
+	}
+	if codes[1] != 500 {
+		t.Errorf("cross-flow AUTSs %v: the second did not find flow 2's budget spent", codes)
+	}
 }

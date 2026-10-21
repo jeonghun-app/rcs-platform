@@ -13,6 +13,29 @@ import (
 // ErrNoPeer means no HSS task was connected and available.
 var ErrNoPeer = errors.New("cxclient: no HSS peer is available")
 
+// SentError is the error of a request whose last attempt never left this
+// node, though an earlier one did: it may have reached an HSS task, which
+// may have served it. It wraps the last attempt's error, which Is and As
+// still find, so the outcome is classified as before; NeverSent tells the
+// two apart.
+type SentError struct{ Err error }
+
+func (e *SentError) Error() string { return e.Err.Error() }
+func (e *SentError) Unwrap() error { return e.Err }
+
+// NeverSent reports whether err is from a request that certainly reached no
+// HSS task: none was connected (ErrNoPeer), or every attempt found its task
+// unavailable before the send (diameter.ErrPeerUnavailable). A request one
+// attempt of which was sent (SentError), or that failed any other way, a
+// timeout or a closed connection included, may have been served.
+func NeverSent(err error) bool {
+	var se *SentError
+	if errors.As(err, &se) {
+		return false
+	}
+	return errors.Is(err, ErrNoPeer) || errors.Is(err, diameter.ErrPeerUnavailable)
+}
+
 // ProtocolError is an answer with a protocol error (3xxx, RFC 6733 §7.1.3),
 // whose generic format carries none of the command's fields.
 type ProtocolError struct {
@@ -79,6 +102,7 @@ func call[A any](ctx context.Context, c *Client, cmd string, common *cx.Request,
 		return zero, ErrNoPeer
 	}
 	msg, ans, err := c.attempt(ctx, first, build, nil)
+	sent := left(msg, err)
 	if timedOut(ctx, err) {
 		c.exclude(first)
 	}
@@ -92,7 +116,12 @@ func call[A any](ctx context.Context, c *Client, cmd string, common *cx.Request,
 	}
 	if err != nil {
 		c.metrics.Count("cxclient."+cmd+".error."+errorKind(err), 1)
-		return zero, fmt.Errorf("cxclient: %s: %w", cmd, err)
+		err = fmt.Errorf("cxclient: %s: %w", cmd, err)
+		if sent && NeverSent(err) {
+			// The retry found no task, but the first attempt left (#261).
+			err = &SentError{Err: err}
+		}
+		return zero, err
 	}
 	if rc, ok := ans.ResultCode(); ok && diameter.IsProtocolError(rc) {
 		res := cx.ResultCode(rc)
@@ -123,8 +152,14 @@ func (c *Client) attempt(ctx context.Context, p *hssPeer, build func(*diameter.N
 	}
 	actx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)
 	defer cancel()
-	ans, err := p.peer.Send(actx, msg)
+	ans, err := c.send(actx, p.peer, msg)
 	return msg, ans, err
+}
+
+// left reports whether an attempt that built msg and ended with err left
+// for its task: all but one whose task was unavailable at the send.
+func left(msg *diameter.Message, err error) bool {
+	return msg != nil && !errors.Is(err, diameter.ErrPeerUnavailable) && !errors.Is(err, diameter.ErrApplicationNotNegotiated)
 }
 
 // retryable reports whether a failed attempt may be repeated on another HSS
