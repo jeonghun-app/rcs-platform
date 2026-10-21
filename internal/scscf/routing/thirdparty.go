@@ -1,9 +1,11 @@
 package routing
 
 import (
+	"bytes"
 	"context"
+	"mime/multipart"
+	"net/textproto"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -206,7 +208,9 @@ func (rt *Router) thirdPartyRequest(r registrar.ThirdPartyRegistration, as sip.U
 			return nil, err
 		}
 		fields = append(fields, [2]string{"Content-Type", "multipart/mixed;boundary=" + boundary})
-		req.Body = multipart(boundary, parts)
+		if req.Body, err = multipartBody(boundary, parts); err != nil {
+			return nil, err
+		}
 	}
 	for _, f := range fields {
 		if err := req.Header.Add(f[0], f[1]); err != nil {
@@ -216,17 +220,27 @@ func (rt *Router) thirdPartyRequest(r registrar.ThirdPartyRegistration, as sip.U
 	return req, nil
 }
 
-// multipart writes parts, each message/sip, as a multipart/mixed body with
-// boundary (RFC 2046 §5.1.1).
-func multipart(boundary string, parts [][]byte) []byte {
-	var b strings.Builder
-	for _, p := range parts {
-		b.WriteString("--" + boundary + "\r\nContent-Type: message/sip\r\n\r\n")
-		b.Write(p)
-		b.WriteString("\r\n")
+// multipartBody writes parts, each message/sip, as a multipart/mixed body
+// with boundary (RFC 2046 §5.1.1).
+func multipartBody(boundary string, parts [][]byte) ([]byte, error) {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	if err := w.SetBoundary(boundary); err != nil {
+		return nil, err
 	}
-	b.WriteString("--" + boundary + "--\r\n")
-	return []byte(b.String())
+	for _, p := range parts {
+		pw, err := w.CreatePart(textproto.MIMEHeader{"Content-Type": {"message/sip"}})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := pw.Write(p); err != nil {
+			return nil, err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
 }
 
 func clonedRequest(r *sip.Request) *sip.Request {
