@@ -220,7 +220,7 @@ func Configure(s *runtime.Settings) ServiceConfig {
 		e.Invalid("HSS_HOST_PATTERN", "not a domain name with one '*' at most in a label")
 	}
 	s.ForbidInProduction(!prefixWildcard(c.HSSHostPattern, c.Namespace),
-		"SCSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>: a wider pattern trusts as the HSS peers that are not HSS tasks (threat model T1)")
+		"SCSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>, with the namespace spelt as it is: a pattern without the wildcard names one HSS task, though every task has an Origin-Host of its own, and a wider one trusts as the HSS peers that are not HSS tasks (threat model T1)")
 	if c.CxTimeout <= 0 {
 		e.Invalid("CX_TIMEOUT", "must be greater than zero")
 	}

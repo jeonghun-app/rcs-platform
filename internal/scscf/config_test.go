@@ -148,6 +148,9 @@ func TestProductionRefusesWhatIsUnsafeThere(t *testing.T) {
 		{[]string{"SCSCF_DYNAMODB_ENDPOINT", "http://dynamodb:8000"}, "SCSCF_DYNAMODB_ENDPOINT"},
 		{[]string{"SCSCF_DIAMETER_HOST", "scscf-a.rcs.local"}, "SCSCF_DIAMETER_HOST is set"},
 		{[]string{"SCSCF_HSS_HOST_PATTERN", "*.rcs.local"}, "SCSCF_HSS_HOST_PATTERN is not <prefix>*.<namespace>"},
+		// Narrower, but no use, and the message says why (#439 QA).
+		{[]string{"SCSCF_HSS_HOST_PATTERN", "hss-1.rcs.local"}, "a pattern without the wildcard names one HSS task"},
+		{[]string{"SCSCF_HSS_HOST_PATTERN", "HSS-*.RCS.LOCAL"}, "with the namespace spelt as it is"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			status, out := startup(t, with(prodEnv, tt.kv...))
