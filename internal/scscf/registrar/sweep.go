@@ -8,6 +8,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
@@ -36,9 +37,16 @@ func (g *Registrar) Sweep(ctx context.Context, limit int) (int, error) {
 func (g *Registrar) swept(ctx context.Context, before, after *state.Registration) error {
 	if len(after.Contacts) > 0 {
 		if before.ReassertDue(g.cfg.Now()) {
+			// The sweep may have pruned bindings too, which the
+			// subscribers must hear of whatever the reassertion does.
+			if len(after.Contacts) != len(before.Contacts) {
+				g.cfg.Events.Changed(ctx, before, after, regevent.Expired)
+			}
 			return g.reassert(ctx, after)
 		}
-		// Some bindings expired, others remain: nothing to tell the HSS.
+		// Some bindings expired, others remain: nothing to tell the HSS,
+		// but the subscribers.
+		g.cfg.Events.Changed(ctx, before, after, regevent.Expired)
 		return nil
 	}
 	// The profile endSet may delete, and only if still this one
@@ -67,6 +75,10 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 	default:
 		g.count("registrar.expire_failed")
 		return errors.New("registrar: SAR TIMEOUT_DEREGISTRATION failed: " + o.String())
+	}
+	if err := g.cfg.Events.Ended(ctx, before, regevent.Expired); err != nil {
+		// The record keeps its lease: the sweep after it tries again.
+		return err
 	}
 	return g.endSet(ctx, after, profile)
 }
