@@ -163,14 +163,17 @@ func TestAnOfflineAuthorSeesItsMessageReadByAll(t *testing.T) {
 	l := r.listen(t)
 	_, c := r.connect(t, l, LegParams{User: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
 	a.listen(t, c)
-	waitFor(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) })
-	waitFor(t, "alice's queue empty", func() bool { return r.store.(*store.Memory).Len(alice) == 0 })
-	waitFor(t, "the summary expanded", func() bool { return r.m.get("group.summary.expanded") == 1 })
+	// 99 and more notifications: on a loaded host that takes longer than
+	// hangGuard, so the waits fail only when nothing moves (#306).
+	progress := func() int64 { return a.got.Load() + r.m.get("group.summary.sent") + r.m.get("group.summary.expanded") }
+	waitProgress(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) }, progress)
+	waitProgress(t, "alice's queue empty", func() bool { return r.store.(*store.Memory).Len(alice) == 0 }, progress)
+	waitProgress(t, "the summary expanded", func() bool { return r.m.get("group.summary.expanded") == 1 }, progress)
 	if r.m.get("group.summary.sent") != 99 {
 		t.Fatalf("metrics %v", r.m)
 	}
 	// One per participant from the summary, its strongest: displayed.
-	waitFor(t, "every notification taken", func() bool { return a.got.Load() >= int64(share)+99 })
+	waitProgress(t, "every notification taken", func() bool { return a.got.Load() >= int64(share)+99 }, progress)
 	if got := a.got.Load(); got != int64(share)+99 {
 		t.Fatalf("alice got %d notifications, want %d receipts and 99 from the summary", got, share)
 	}
@@ -452,7 +455,7 @@ func TestAConnectedAuthorGetsItsReceiptsAsTheyCome(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	waitFor(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) })
+	waitProgress(t, "read by all", func() bool { return a.readByAll("m1", everyone[1:]) }, a.got.Load)
 	if r.m.get("group.notification.summarized") != 0 || r.m.get("group.summary.expanded") != 0 {
 		t.Fatalf("metrics %v", r.m)
 	}
