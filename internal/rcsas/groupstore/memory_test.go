@@ -8,7 +8,8 @@ import (
 )
 
 func TestMemoryMeetsTheContract(t *testing.T) {
-	storetest.Run(t, func(*testing.T) groupstore.Store { return groupstore.NewMemory() })
+	storetest.Run(t, func(*testing.T) groupstore.Store { return groupstore.NewMemory() },
+		func(_ *testing.T, s groupstore.Store, uri string) { s.(*groupstore.Memory).Disown(uri) })
 }
 
 func TestStatesHaveNamesAndOnlyCurrentOnesAreActive(t *testing.T) {

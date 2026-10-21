@@ -1000,7 +1000,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_MSRP_HOST` | required | This task's address in MSRP paths ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_MSRP_LISTEN_ADDR` | `:2855` | MSRP listener for `msrp-relay`; its port is the advertised one |
 | `RCSAS_SIP_LISTEN_ADDR` | `0.0.0.0:5060` | SIP listener (TCP), which only the core reaches; port 0 is refused, since the HSS's AS URI names a fixed port |
-| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
+| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)). Refused in staging and prod with `RCSAS_GROUP_CHAT_ENABLED`: a group's owner is known by its address too, and two tasks given one would take each other's groups (#121) |
 | `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, a private or loopback address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
 | `RCSAS_SERVICE_NAME` | `rcs-as.<RCS_SERVICE_NAMESPACE>`, none without a namespace | The host of the AS URI the iFC name rcs-as by (`HSS_RCS_AS_URI`), which rcs-as takes as its own in a `Route`. Change both together, or an OPTIONS scscf hands rcs-as comes back to it (482) |
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
@@ -1039,6 +1039,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
+| `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121): a task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
 
 A rate of `0` turns that limit off.
 
@@ -1147,11 +1148,15 @@ once.
 ## DynamoDB `groupchats` table
 
 The `groupchats` table has the same key schema as `messages` (`pk`, `sk`,
-TTL attribute `ttl`) and no index. Each group is one item:
+TTL attribute `ttl`) and no index. Each group is one item, with a small
+item that names its owner next to it (#121), and each rcs-as task with group
+chat on has a heartbeat item:
 
-| `pk` | `sk` |
-|---|---|
-| `g#<len>#<conference URI>` | `group` |
+| `pk` | `sk` | Holds |
+|---|---|---|
+| `g#<len>#<conference URI>` | `group` | The group |
+| `g#<len>#<conference URI>` | `owner` | The owner task's id (`task`, random at every start), its SIP instance address (`sip`), `epoch`, `wtoken` |
+| `t#<len>#<task id>` | `task` | The task's SIP instance address, `alive_until` |
 
 - **Contents.** The item holds the subject, creator, Conversation-ID, roster
   version, times, the participants as a list, and the identities of removed
@@ -1163,6 +1168,36 @@ TTL attribute `ttl`) and no index. Each group is one item:
 - **Writes.** Every change rewrites the item on the condition that its `rev`
   is the one the change was computed from. A token (`wtoken`) tells a repeat
   of the write from another writer's; `Create` uses one too.
+- **Ownership** (#121). One task owns each group: the one that made it,
+  or the one that took it over. `Create` writes the group and its owner item,
+  at epoch 1, in one transaction. Every change and every touch is a
+  transaction of the group's write and an update of the owner item's `ttl`
+  on the condition that it still names the writer's task and epoch: a task
+  that lost the group, even one paused and unaware of it, writes nothing,
+  and gives the group up (`group.fenced`). A task takes a group over by a
+  conditional update of the owner item (same task, same epoch; epoch one
+  up), only once the owner's heartbeat item says `alive_until` plus
+  `RCSAS_TASK_SKEW` has passed, or at once when the owner's address is its
+  own and its task id is not (the address was reused, so the owner is
+  gone); a group stored before #121, without an owner item, is taken from
+  none. A task beats every `RCSAS_TASK_HEARTBEAT`, `alive_until`
+  `RCSAS_TASK_LEASE` ahead, and stops writing groups once its last stored
+  beat is `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` old; it beats once more
+  at its present time on shutdown, after its sessions have ended, so that
+  another task takes its groups at once. A task remembers the groups it
+  owns, so that a change of one costs no more reads than before. Until D3 of
+  #121 forwards requests to a group's owner, a request for a group another
+  task owns is answered 500 with `Retry-After` (never 404, which rcsjta
+  takes for the group's end and restarts it at the factory).
+- **A replacement task waits for the old one's lease.** Even with one task,
+  a task that replaces another, on a new address, may not change the old
+  task's groups until the old one's last heartbeat has run out: after a
+  crash, up to `RCSAS_TASK_LEASE` plus `RCSAS_TASK_SKEW` (22 s by default)
+  after the old task's last beat; after a clean shutdown, which stores a last
+  beat at its present time, `RCSAS_TASK_SKEW` (2 s). Meanwhile a change to
+  one of those groups is answered 500 with `Retry-After`, which clients try
+  again; a task on the old one's address takes its groups at once. Before
+  #121, a replacement changed them at once. Deployments stop tasks cleanly.
 - **Touch.** At most once an hour per task, and not within an hour of a
   change, a group in use has its `active`, `expires` and `ttl` moved forward,
   without changing `rev`. The update is conditional on the stored `active`
@@ -1170,9 +1205,15 @@ TTL attribute `ttl`) and no index. Each group is one item:
   ended the group) changes nothing. Creating a group and every change set
   `expires` to `RCSAS_GROUP_IDLE_TTL` from then.
 - **Expiry.** `ttl` is the group's expiry plus a day; every read checks the
-  expiry itself.
+  expiry itself. The owner item's `ttl` moves with the group's; a task's
+  heartbeat item's is its last `alive_until` plus a day.
 - **IAM.** The task role needs `GetItem`, `PutItem`, `UpdateItem` and
-  `DescribeTable` on the table.
+  `DescribeTable` on the table; `TransactWriteItems` writes with them.
+- **Cost** (#121). A change or a touch is a transaction of two items, which
+  DynamoDB bills at twice the write units of each. A task's heartbeat is one
+  small write every `RCSAS_TASK_HEARTBEAT`. A task's first change of a group
+  it does not know reads the owner item, and the owner's heartbeat item if
+  another task holds it.
 
 Each group message costs one strongly consistent read of the group item and,
 per recipient, the enqueue transaction of the `messages` table. The fan-out
@@ -1226,6 +1267,7 @@ identifier ever appears in a metric name.
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
+| `group.owner_takeover`, `group.fenced`, `group.owner_lapsed`, `task.heartbeat_failed` | Ownership (#121): groups this task took over, writes the store refused because another task had taken the group (which this task then gives up), writes refused because this task's own heartbeat had lapsed, and heartbeats that failed |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
@@ -1355,7 +1397,10 @@ Signals to alarm on (Phase 7):
   message written on one task would invite participants whose session is on
   another instead of delivering to it, and a roster change would reach only
   the subscriptions of the task that made it. #121 anchors each group's focus
-  on one task (an owner lease, ADR 0005 amendment); until then, turn
+  on one task (an owner lease, ADR 0005 amendment). Its store part is in:
+  each group has an owner task, and every write is fenced by it (see the
+  `groupchats` table). Until the SIP layer forwards a group's requests to its
+  owner and the engine leaves other tasks' groups alone (#121 D2, D3), turn
   `RCSAS_GROUP_CHAT_ENABLED` on only with rcs-as on a single task. It is off
   by default.
 - **Not checked against a licensed copy of RCC.07.** These follow the public

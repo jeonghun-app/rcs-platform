@@ -207,6 +207,47 @@ func newRigWith(t *testing.T, cfg Config, ecfg messaging.Config, queues *store.M
 	return r
 }
 
+// beat runs the Service's heartbeat until the test ends, and returns once
+// the first beat is stored.
+func (r *rig) beat(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := r.s.StartHeartbeat(ctx)
+	t.Cleanup(func() { cancel(); stopped() })
+	waitFor(t, "the first heartbeat", func() bool { return r.s.alive(r.clock.Now()) })
+}
+
+// pass moves r's clock on by d, a heartbeat at a time, waiting at each
+// beat's time for the beat to be stored, so that r stays alive.
+func (r *rig) pass(t *testing.T, d time.Duration) {
+	t.Helper()
+	for d > 0 {
+		step := min(d, r.s.cfg.TaskHeartbeat-r.clock.Now().Sub(r.lastBeat())%r.s.cfg.TaskHeartbeat)
+		r.clock.Advance(step)
+		d -= step
+		if r.clock.Now().Sub(r.lastBeat()) >= r.s.cfg.TaskHeartbeat {
+			waitFor(t, "the heartbeat", func() bool { return r.lastBeat().Equal(r.clock.Now()) })
+		}
+	}
+}
+
+func (r *rig) lastBeat() time.Time {
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	return r.s.lastBeat
+}
+
+// owner is uri's stored owner, which a test writing the store directly
+// writes under.
+func (r *rig) owner(t *testing.T, uri string) groupstore.Owner {
+	t.Helper()
+	o, err := r.groups.Owner(t.Context(), uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
 // create makes a group of alice and the others, all joined.
 func (r *rig) create(others ...string) groupstore.Group {
 	r.t.Helper()
