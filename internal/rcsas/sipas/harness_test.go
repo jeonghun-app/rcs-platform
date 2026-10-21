@@ -274,9 +274,10 @@ func (p *peer) send(m msg) *sip.Response {
 
 func (p *peer) try(m msg) (*sip.Response, error) {
 	n := requests.Add(1)
+	branch := fmt.Sprintf("z9hG4bK-sipas-%d", n)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s SIP/2.0\r\n", m.method, m.uri)
-	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-sipas-%d\r\n", n)
+	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.20:5060;branch=%s\r\n", branch)
 	b.WriteString("Max-Forwards: 70\r\n")
 	from, to := "From: <"+alice+">;tag=a1", "To: <"+bob+">"
 	if m.toTag != "" {
@@ -317,7 +318,7 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		// loaded host a retransmission can come after the ACK has gone,
 		// where it would pass for the next request's answer (#290). A UAC
 		// matches a response to its transaction; this one by CSeq.
-		if !answers(res, sip.CSeq{Seq: uint32(cseq), Method: m.method}) {
+		if !answers(res, branch, sip.CSeq{Seq: uint32(cseq), Method: m.method}) {
 			continue
 		}
 		if res.StatusCode >= 200 {
@@ -326,10 +327,16 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 	}
 }
 
-// answers reports whether res is the answer to the request with CSeq
-// want: a UAC matches a response to its transaction, and a test peer takes
-// nothing else for its request's answer (#290).
-func answers(res *sip.Response, want sip.CSeq) bool {
+// answers reports whether res is the answer to the request whose top Via
+// has branch and whose CSeq is want: a UAC matches a response to its
+// transaction by the two (RFC 3261 §17.1.3), and a test peer takes nothing
+// else for its request's answer (#290). The CSeq alone is not enough, as
+// every call starts at 1: another call's retransmitted 2xx would pass.
+func answers(res *sip.Response, branch string, want sip.CSeq) bool {
+	vias, err := res.Header.Via()
+	if err != nil || len(vias) == 0 || vias[0].Branch() != branch {
+		return false
+	}
 	cs, err := res.Header.CSeq()
 	return err == nil && cs == want
 }
@@ -341,6 +348,11 @@ func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	vias, err := req.Header.Via()
+	if err != nil || len(vias) == 0 {
+		return nil, errors.New("a request to forward needs a Via")
+	}
+	branch := vias[0].Branch()
 	b, err := req.Bytes()
 	if err != nil {
 		return nil, err
@@ -355,7 +367,7 @@ func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 			return nil, err
 		}
 		// The answer to req only, as try takes (#290).
-		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 && answers(res, want) {
+		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 && answers(res, branch, want) {
 			return res, nil
 		}
 	}
@@ -407,52 +419,75 @@ func (e *fakeEngine) origins() []messaging.Origin {
 }
 
 // #290: the test peer takes the answer to its own request only, for a
-// request it sends (try) and one it forwards as the core (forward). A 2xx
-// of an earlier INVITE, retransmitted after the ACK went, comes first here,
-// as it did under load, and must not pass for the UPDATE's answer.
+// request it sends (try) and one it forwards as the core (forward). Before
+// that answer comes a 2xx retransmitted after its ACK went, as under load:
+// the dialog's earlier INVITE's, and another call's INVITE's, at CSeq 1 as
+// every call starts (code review on #333).
 func TestThePeerTakesTheAnswerToItsOwnRequest(t *testing.T) {
-	update := "UPDATE " + bob + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-f\r\nMax-Forwards: 70\r\n" +
-		"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c1\r\nCSeq: 3 UPDATE\r\nContent-Length: 0\r\n\r\n"
-	for name, send := range map[string]func(*peer) (*sip.Response, error){
-		"try": func(p *peer) (*sip.Response, error) {
-			return p.try(msg{method: "UPDATE", uri: bob, toTag: "b1", callID: "c1", cseq: 3})
-		},
-		"forward": func(p *peer) (*sip.Response, error) {
-			m, err := sip.NewReader(bufio.NewReader(strings.NewReader(update)), sip.Limits{}).ReadMessage()
+	request := func(method string, cseq int, callID string) string {
+		return method + " " + bob + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-f" + callID + "\r\nMax-Forwards: 70\r\n" +
+			"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: " + callID + "\r\nCSeq: " + fmt.Sprint(cseq, " ", method) + "\r\nContent-Length: 0\r\n\r\n"
+	}
+	forward := func(raw string) func(*peer) (*sip.Response, error) {
+		return func(p *peer) (*sip.Response, error) {
+			m, err := sip.NewReader(bufio.NewReader(strings.NewReader(raw)), sip.Limits{}).ReadMessage()
 			if err != nil {
 				return nil, err
 			}
 			return p.forward(m.(*sip.Request))
-		},
+		}
+	}
+	for _, c := range []struct {
+		name                   string
+		staleBranch, staleCSeq string // of the stale 2xx that comes first
+		send                   func(*peer) (*sip.Response, error)
+	}{
+		{"try, the dialog's INVITE", "z9hG4bK-old", "2 INVITE", func(p *peer) (*sip.Response, error) {
+			return p.try(msg{method: "UPDATE", uri: bob, toTag: "b1", callID: "c1", cseq: 3})
+		}},
+		{"try, another call", "z9hG4bK-other", "1 INVITE", func(p *peer) (*sip.Response, error) {
+			return p.try(msg{method: "INVITE", uri: bob, callID: "c2", cseq: 1})
+		}},
+		{"forward, the dialog's INVITE", "z9hG4bK-old", "2 INVITE", forward(request("UPDATE", 3, "c1"))},
+		{"forward, another call", "z9hG4bK-other", "1 INVITE", forward(request("INVITE", 1, "c2"))},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			ours, theirs := net.Pipe()
 			t.Cleanup(func() { _ = ours.Close(); _ = theirs.Close() })
 			p := &peer{t: t, nc: ours, r: sip.NewReader(bufio.NewReader(ours), sip.Limits{})}
 			go func() {
 				br := bufio.NewReader(theirs)
+				var via, cseq string
 				for {
 					line, err := br.ReadString('\n')
 					if err != nil {
 						return
 					}
-					if line == "\r\n" {
-						break
+					switch {
+					case line == "\r\n":
+						goto answer
+					case strings.HasPrefix(line, "Via: "):
+						via = strings.TrimSpace(line)
+					case strings.HasPrefix(line, "CSeq: "):
+						cseq = strings.TrimSpace(strings.TrimPrefix(line, "CSeq: "))
 					}
 				}
-				answer := func(cseq string, body string) string {
-					return "SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-x\r\n" +
-						"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c1\r\nCSeq: " + cseq + "\r\n" +
+			answer:
+				reply := func(via, cseq, body string) string {
+					return "SIP/2.0 200 OK\r\n" + via + "\r\n" +
+						"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c0\r\nCSeq: " + cseq + "\r\n" +
 						"Content-Length: " + fmt.Sprint(len(body)) + "\r\n\r\n" + body
 				}
-				_, _ = io.WriteString(theirs, answer("2 INVITE", "v=0\r\n")+answer("3 UPDATE", ""))
+				stale := reply("Via: SIP/2.0/TCP 192.0.2.20:5060;branch="+c.staleBranch, c.staleCSeq, "v=0\r\n")
+				_, _ = io.WriteString(theirs, stale+reply(via, cseq, ""))
 			}()
-			res, err := send(p)
+			res, err := c.send(p)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if cs, _ := res.Header.CSeq(); cs.Seq != 3 || cs.Method != "UPDATE" || len(res.Body) != 0 {
-				t.Fatalf("took %v with %q for the UPDATE's answer", cs, res.Body)
+			if len(res.Body) != 0 {
+				cs, _ := res.Header.CSeq()
+				t.Fatalf("took the stale %v with %q for the request's answer", cs, res.Body)
 			}
 		})
 	}
