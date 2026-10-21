@@ -632,7 +632,13 @@ func xmlText(s string) string {
 	return b.String()
 }
 
+// flowFor is the flow uri is registered on. A tel URI is taken for the SIP
+// IMPU with its number at the home domain, as an implicit set holds both
+// (#282).
 func (c *IMSCore) flowFor(uri sip.URI) (transport.FlowID, bool) {
+	if uri.Scheme == "tel" {
+		uri = sip.URI{Scheme: "sip", User: uri.User, Host: c.Domain}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	flow, ok := c.bindings[aorKey(uri)]
