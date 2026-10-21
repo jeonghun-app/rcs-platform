@@ -217,9 +217,9 @@ func TestADeclineToTheFocusIsLeaving(t *testing.T) {
 	r.focusInvites(t, 2)
 	r.stateOf(t, uri, bob, groupstore.Left)
 	r.stateOf(t, uri, carol, groupstore.Left)
-	if n := r.metrics.get("sip.group.declined"); n != 2 {
-		t.Fatalf("%d declined", n)
-	}
+	// Counted once each Leave has returned, which may be just after the
+	// state the test saw.
+	waitUntil(t, "both declines counted", func() bool { return r.metrics.get("sip.group.declined") == 2 })
 	select {
 	case err := <-r.e.failed:
 		t.Fatalf("a decline went to InviteFailed: %v", err)
