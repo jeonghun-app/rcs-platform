@@ -17,6 +17,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -212,12 +213,31 @@ func startASOn(t *testing.T, e Engine, cfg Config, tc transport.Config, tune ...
 	return &as{srv: srv, addr: addr}
 }
 
+// t1AtOnce is a proxy clock on which a timer of T1 fires at once, so that a
+// 2xx to an INVITE is sent again as soon as it is sent, as when its ACK
+// comes later than T1 (RFC 3261 §13.3.1.4). Timers of other lengths run as
+// on the system clock.
+type t1AtOnce struct{}
+
+func (t1AtOnce) AfterFunc(d time.Duration, f func()) transaction.Timer {
+	if d == transaction.DefaultT1 {
+		d = 0
+	}
+	return time.AfterFunc(d, f)
+}
+
 // peer is the core's side of a connection to rcs-as, from which it sends
 // the requests iFC route to rcs-as.
 type peer struct {
 	t  *testing.T
 	nc net.Conn
 	r  *sip.Reader
+
+	mu sync.Mutex
+	// sent holds the branch of each request the peer sent, whose
+	// responses, such as a 2xx retransmitted before its ACK, may still come
+	// while a later request waits for its own (#327).
+	sent map[string]bool
 }
 
 // requests numbers every request a test sends, so no two share a branch
@@ -231,7 +251,7 @@ func (a *as) dial(t *testing.T) *peer {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = nc.Close() })
-	return &peer{t: t, nc: nc, r: sip.NewReader(bufio.NewReader(nc), sip.Limits{})}
+	return &peer{t: t, nc: nc, r: sip.NewReader(bufio.NewReader(nc), sip.Limits{}), sent: map[string]bool{}}
 }
 
 // msg is a request the core sends rcs-as.
@@ -274,9 +294,10 @@ func (p *peer) send(m msg) *sip.Response {
 
 func (p *peer) try(m msg) (*sip.Response, error) {
 	n := requests.Add(1)
+	branch := fmt.Sprintf("z9hG4bK-sipas-%d", n)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s SIP/2.0\r\n", m.method, m.uri)
-	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-sipas-%d\r\n", n)
+	fmt.Fprintf(&b, "Via: SIP/2.0/TCP 192.0.2.20:5060;branch=%s\r\n", branch)
 	b.WriteString("Max-Forwards: 70\r\n")
 	from, to := "From: <"+alice+">;tag=a1", "To: <"+bob+">"
 	if m.toTag != "" {
@@ -296,6 +317,7 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		b.WriteString(f + "\r\n")
 	}
 	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n%s", len(m.body), m.body)
+	p.sending(branch)
 	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(p.nc, b.String()); err != nil {
 		return nil, err
@@ -303,6 +325,20 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 	if m.method == "ACK" {
 		return nil, nil
 	}
+	return p.finalFor(branch, sip.CSeq{Seq: uint32(cseq), Method: m.method})
+}
+
+// sending notes that a request with branch goes out.
+func (p *peer) sending(branch string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sent[branch] = true
+}
+
+// finalFor reads the final response to the request with branch and cseq.
+// A response to an earlier request of the peer is passed over; one to no
+// request of the peer is an error, not a response to wait past.
+func (p *peer) finalFor(branch string, cseq sip.CSeq) (*sip.Response, error) {
 	for {
 		msg, err := p.r.ReadMessage()
 		if err != nil {
@@ -312,8 +348,26 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		if !ok {
 			return nil, errors.New("got a request")
 		}
-		if res.StatusCode >= 200 {
-			return res, nil
+		vias, err := res.Header.Via()
+		if err != nil || len(vias) == 0 {
+			return nil, fmt.Errorf("a %d without a Via: %v", res.StatusCode, err)
+		}
+		got, err := res.Header.CSeq()
+		if err != nil {
+			return nil, err
+		}
+		b := vias[0].Branch()
+		p.mu.Lock()
+		earlier := b != branch && p.sent[b]
+		p.mu.Unlock()
+		switch {
+		case b == branch && got == cseq:
+			if res.StatusCode >= 200 {
+				return res, nil
+			}
+		case earlier:
+		default:
+			return nil, fmt.Errorf("a %d to no request of this peer: CSeq %d %s, branch %q", res.StatusCode, got.Seq, got.Method, b)
 		}
 	}
 }
@@ -325,19 +379,20 @@ func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	vias, err := req.Header.Via()
+	if err != nil || len(vias) == 0 {
+		return nil, fmt.Errorf("a %s without a Via: %v", req.Method, err)
+	}
+	cseq, err := req.Header.CSeq()
+	if err != nil {
+		return nil, err
+	}
+	p.sending(vias[0].Branch())
 	_ = p.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := p.nc.Write(b); err != nil {
 		return nil, err
 	}
-	for {
-		msg, err := p.r.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 {
-			return res, nil
-		}
-	}
+	return p.finalFor(vias[0].Branch(), cseq)
 }
 
 // fakeEngine records what it is given and answers with err.
@@ -383,4 +438,74 @@ func (e *fakeEngine) origins() []messaging.Origin {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]messaging.Origin(nil), e.got...)
+}
+
+// #327: a peer takes for its request's answer only the final response
+// with the request's branch and CSeq. A response to one of its earlier
+// requests, which the connection may still carry (a 2xx retransmitted
+// before its ACK), is passed over; one to no request of the peer is an
+// error.
+func TestAPeerTakesOnlyTheResponseToItsRequest(t *testing.T) {
+	here, there := net.Pipe()
+	t.Cleanup(func() { _ = here.Close(); _ = there.Close() })
+	p := &peer{t: t, nc: here, r: sip.NewReader(bufio.NewReader(here), sip.Limits{}), sent: map[string]bool{}}
+	in := sip.NewReader(bufio.NewReader(there), sip.Limits{})
+	// The far end reads one request and writes what reply makes of it.
+	answer := func(reply func(req *sip.Request) []*sip.Response) {
+		go func() {
+			_ = there.SetDeadline(time.Now().Add(waitFor))
+			m, err := in.ReadMessage()
+			req, ok := m.(*sip.Request)
+			if err != nil || !ok {
+				return
+			}
+			for _, res := range reply(req) {
+				b, err := res.Bytes()
+				if err != nil {
+					return
+				}
+				if _, err := there.Write(b); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	respond := func(req *sip.Request, code int, reason string) *sip.Response {
+		res, err := sip.NewResponse(req, code, reason, "b1")
+		if err != nil {
+			t.Error(err)
+		}
+		return res
+	}
+	options := func(cseq int) msg { return msg{method: "OPTIONS", uri: bob, callID: "sipas-peer-test", cseq: cseq} }
+
+	var first *sip.Response
+	answer(func(req *sip.Request) []*sip.Response {
+		first = respond(req, 200, "first")
+		return []*sip.Response{first}
+	})
+	if res := p.send(options(1)); res.Reason != "first" {
+		t.Fatalf("first request: %d %s", res.StatusCode, res.Reason)
+	}
+	answer(func(req *sip.Request) []*sip.Response {
+		return []*sip.Response{first, respond(req, 100, "Trying"), respond(req, 200, "second")}
+	})
+	if res := p.send(options(2)); res.Reason != "second" {
+		t.Fatalf("second request took %d %s", res.StatusCode, res.Reason)
+	}
+	for name, change := range map[string]func(*sip.Response){
+		"another branch": func(res *sip.Response) {
+			_ = res.Header.Set("Via", "SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-sipas-elsewhere")
+		},
+		"another CSeq": func(res *sip.Response) { _ = res.Header.Set("CSeq", "9 OPTIONS") },
+	} {
+		answer(func(req *sip.Request) []*sip.Response {
+			res := respond(req, 200, "stray")
+			change(res)
+			return []*sip.Response{res}
+		})
+		if res, err := p.try(options(3)); err == nil || !strings.Contains(err.Error(), "no request of this peer") {
+			t.Errorf("%s: %v, %v", name, res, err)
+		}
+	}
 }
