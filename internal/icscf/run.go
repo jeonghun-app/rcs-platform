@@ -23,6 +23,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -105,11 +106,18 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return err
 	}
+	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
-		Self:     self,
-		Router:   router,
-		Resolver: dns,
-		Logger:   rt.Logger,
+		Self:            self,
+		Router:          router,
+		Resolver:        dns,
+		Logger:          rt.Logger,
+		Transaction:     tcfg,
+		MaxContexts:     maxContexts,
+		MaxContextBytes: maxContextBytes,
+		// A REGISTER left at the stop gets 503, which pcscf retries on
+		// another icscf at once (decided on #310).
+		DrainAnswer: drainAnswer,
 	})
 	if err != nil {
 		return err
@@ -125,22 +133,43 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		d.listening(coreAddr)
 	}
 	<-ctx.Done()
-	drain(px, cfg.DrainTimeout)
+	// The listener stays open meanwhile, since Cloud Map's DNS answers name
+	// this task for their TTL after it is deregistered (review of #276).
+	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)
+	defer cancel()
+	if n := px.Drain(drainCtx); n > 0 {
+		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
+	}
 	return nil
 }
 
-// drain waits, for at most d, until no request is in progress, so a stop
-// does not cut off a REGISTER waiting for the S-CSCF or a ringing INVITE:
-// their senders would get no final response (review of #276). The listener
-// stays open meanwhile, since Cloud Map's DNS answers name this task for
-// their TTL after it is deregistered. A context that lingers after a 2xx to
-// pass its retransmissions on no longer counts, so a stop right after a call
-// returns at once. #281 tracks a drain shared by every proxy.
-func drain(px *proxy.Proxy, d time.Duration) {
-	deadline := time.Now().Add(d)
-	for px.Stats().Contexts > 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+// drainAnswer is what icscf answers a request left in progress at the end
+// of its drain (proxy.Config.DrainAnswer). A REGISTER gets 503 with
+// Retry-After, which pcscf retries on another icscf at once; it never
+// passed through scscf, so the rule that a proxy turns a 503 into a 500
+// (#281) does not apply to it. Everything else gets the proxy's 500 with
+// Retry-After (decided on #310).
+func drainAnswer(req *sip.Request) (int, time.Duration) {
+	if req.Method == "REGISTER" {
+		return 503, transaction.DefaultRetryAfter
 	}
+	return 500, transaction.DefaultRetryAfter
+}
+
+// proxyLimits are the bounds of icscf's proxy: its layer's server
+// transaction caps (#37); as many contexts as server transactions, so the
+// layer's count, not the proxy's, is the one a burst meets; and the same
+// bytes for the proxy's own memory bound, which the proxy charges
+// differently (a request's body, two copies of its header, and two per
+// branch), so either may refuse a request first. Both refusals are counted:
+// the layer's ServerTransactionsRejected and the proxy's Overloaded (code
+// review of #311, option A).
+func proxyLimits(cfg ServiceConfig) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
+	tcfg = transaction.Config{
+		MaxServerTransactions:     cfg.MaxServerTransactions,
+		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
+	}
+	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
 }
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own
