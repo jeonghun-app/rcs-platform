@@ -562,11 +562,12 @@ func TestPrecheckNeedsAChallenge(t *testing.T) {
 
 func TestMalformedDocumentsAreErrors(t *testing.T) {
 	for name, body := range map[string]string{
-		"doctype":      `<!DOCTYPE x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
-		"not xml":      `{}`,
-		"too large":    strings.Repeat(" ", 70<<10),
-		"bad range":    `<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="5" end="9"/><data url="/ft/x"/></file-resume-info>`,
-		"wrong status": "",
+		"doctype":            `<!DOCTYPE x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
+		"lower-case doctype": `<!doctype x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
+		"not xml":            `{}`,
+		"too large":          strings.Repeat(" ", 70<<10),
+		"bad range":          `<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="5" end="9"/><data url="/ft/x"/></file-resume-info>`,
+		"wrong status":       "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {

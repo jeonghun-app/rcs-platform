@@ -56,6 +56,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 )
 
@@ -705,22 +706,26 @@ func readFileDocument(resp *http.Response, op string) (FileDocument, error) {
 	return d, nil
 }
 
-// decode reads one document. The server is the platform's own, but a
-// simulator run against a deployed stack still bounds what it reads and
-// refuses a document type declaration, as the platform's parsers do.
+// document is what decode checks a document for: the server is the
+// platform's own, but a simulator run against a deployed stack still bounds
+// what it reads and refuses what the platform's parsers do
+// (internal/xmlsafe).
+var document = xmlsafe.Doc{MaxSize: maxDocument, MaxDepth: 32,
+	DTD:       errors.New("document type declarations are refused"),
+	TooLarge:  errors.New("document too large"),
+	Malformed: errors.New("malformed document")}
+
+// decode reads one document.
 func decode(r io.Reader, v any) error {
 	data, err := io.ReadAll(io.LimitReader(r, maxDocument+1))
 	if err != nil {
 		return safeerr.Body(err)
 	}
-	if len(data) > maxDocument {
-		return errors.New("document too large")
+	if err := document.Check(data); err != nil {
+		return err
 	}
-	if bytes.Contains(data, []byte("<!DOCTYPE")) {
-		return errors.New("document type declarations are refused")
-	}
-	if err := xml.Unmarshal(data, v); err != nil {
-		return errors.New("malformed document")
+	if err := xml.Unmarshal(xmlsafe.WithoutBOM(data), v); err != nil {
+		return document.Malformed
 	}
 	return nil
 }

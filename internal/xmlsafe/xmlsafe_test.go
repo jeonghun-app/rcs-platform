@@ -3,7 +3,10 @@ package xmlsafe
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"math"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -17,21 +20,24 @@ func TestTheChecksRefuseWhatEncodingXMLLetsThrough(t *testing.T) {
 		doc  string
 		want error
 	}{
-		"a DTD":                       {`<!DOCTYPE a [<!ENTITY e "x">]><a/>`, ErrDTD},
-		"too large":                   {"<a>" + strings.Repeat("x", 1<<10) + "</a>", ErrTooLarge},
-		"nested too deep":             {"<a><b><c><d><e/></d></c></b></a>", errPkg},
-		"two roots":                   {"<a/><b/>", errPkg},
-		"no root":                     {"  ", errPkg},
-		"text outside the root":       {"<a/>x", errPkg},
-		"a repeated attribute":        {`<a x="1" x="2"/>`, errPkg},
-		"attributes run together":     {`<a x="1"y="2"/>`, errPkg},
-		"attributes run together ' ":  {`<a x='1'y='2'/>`, errPkg},
-		"a surrogate in text":         {`<a>&#xD800;</a>`, errPkg},
-		"a surrogate, decimal":        {`<a>&#57343;</a>`, errPkg},
-		"a surrogate in an attribute": {`<a x="&#xdfff;"/>`, errPkg},
-		"an upper-case declaration":   {`<?XML version="1.0"?><a/>`, errPkg},
-		"a mixed-case declaration":    {`<?xMl version="1.0"?><a/>`, errPkg},
-		"unbalanced":                  {`<a><b></a>`, errPkg},
+		"a DTD":                         {`<!DOCTYPE a [<!ENTITY e "x">]><a/>`, ErrDTD},
+		"too large":                     {"<a>" + strings.Repeat("x", 1<<10) + "</a>", ErrTooLarge},
+		"nested too deep":               {"<a><b><c><d><e/></d></c></b></a>", errPkg},
+		"two roots":                     {"<a/><b/>", errPkg},
+		"no root":                       {"  ", errPkg},
+		"text outside the root":         {"<a/>x", errPkg},
+		"a repeated attribute":          {`<a x="1" x="2"/>`, errPkg},
+		"attributes run together":       {`<a x="1"y="2"/>`, errPkg},
+		"attributes run together ' ":    {`<a x='1'y='2'/>`, errPkg},
+		"a surrogate in text":           {`<a>&#xD800;</a>`, errPkg},
+		"a surrogate, decimal":          {`<a>&#57343;</a>`, errPkg},
+		"a surrogate in an attribute":   {`<a x="&#xdfff;"/>`, errPkg},
+		"an upper-case declaration":     {`<?XML version="1.0"?><a/>`, errPkg},
+		"a mixed-case declaration":      {`<?xMl version="1.0"?><a/>`, errPkg},
+		"unbalanced":                    {`<a><b></a>`, errPkg},
+		"a declaration inside":          {`<a><?xml version="1.0"?></a>`, errPkg},
+		"a declaration after a space":   {` <?xml version="1.0"?><a/>`, errPkg},
+		"a declaration after a comment": {`<!--c--><?xml version="1.0"?><a/>`, errPkg},
 	} {
 		if err := testDoc.Check([]byte(tc.doc)); !errors.Is(err, tc.want) {
 			t.Errorf("%s: %v, want %v", name, err, tc.want)
@@ -120,5 +126,58 @@ func TestAWriterKeepsTheFirstError(t *testing.T) {
 	w.Start("a")
 	if err := w.Close(); err == nil {
 		t.Fatal("an unbalanced end tag wrote")
+	}
+}
+
+// Security review on #403: Check is linear in its input. What it allocates
+// for an adversarial document eight times as long grows at most about
+// eight times, measured in bytes allocated (not time, which load skews,
+// #317): many attributes, many character references, text in many short
+// tokens, and nesting at the limit over and over.
+func TestCheckIsLinearInItsInput(t *testing.T) {
+	const small = 32 << 10
+	big := Doc{MaxSize: 8 * small, MaxDepth: 32}
+	for name, build := range map[string]func(n int) string{
+		"attributes": func(n int) string {
+			var b strings.Builder
+			b.WriteString("<a")
+			for i := 0; b.Len() < n-16; i++ {
+				fmt.Fprintf(&b, ` x%d="&#x41;'"`, i)
+			}
+			b.WriteString("/>")
+			return b.String()
+		},
+		"references": func(n int) string {
+			return "<a>" + strings.Repeat("&#xD7FF;&#65;&amp;", (n-16)/18) + "</a>"
+		},
+		"short tokens": func(n int) string {
+			return "<a>" + strings.Repeat("<b/>x<!--c-->", (n-16)/13) + "</a>"
+		},
+		"nesting": func(n int) string {
+			one := strings.Repeat("<e>", 31) + strings.Repeat("</e>", 31)
+			return "<a>" + strings.Repeat(one, (n-16)/len(one)) + "</a>"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			alloc := func(doc string) uint64 {
+				data := []byte(doc)
+				if err := big.Check(data); err != nil {
+					t.Fatalf("%d bytes: %v", len(data), err)
+				}
+				least := uint64(math.MaxUint64)
+				for range 3 {
+					var before, after runtime.MemStats
+					runtime.ReadMemStats(&before)
+					_ = big.Check(data)
+					runtime.ReadMemStats(&after)
+					least = min(least, after.TotalAlloc-before.TotalAlloc)
+				}
+				return least
+			}
+			a, b := alloc(build(small)), alloc(build(8*small))
+			if b > 12*a {
+				t.Fatalf("8× the input allocated %d bytes against %d: not linear", b, a)
+			}
+		})
 	}
 }
