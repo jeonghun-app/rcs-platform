@@ -318,7 +318,7 @@ func (c *respContext) inProgress() bool {
 	c.mu.Lock()
 	uas := c.uas
 	c.mu.Unlock()
-	return !c.handed.Load() && (uas == nil || !uas.hasAnswered())
+	return !c.handed.Load() && (uas == nil || !uas.handedFinal())
 }
 
 // answerForStop answers a request still without a final response 500 with
