@@ -20,14 +20,20 @@ func publicIdentity(m *sip.Request) (string, bool) {
 }
 
 // privateIdentity is the User-Name of a REGISTER's UAR: the username of its
-// Digest credentials, or, without any, the IMPU without its scheme, which
-// is what TS 24.229 §5.3.1.2 derives (impu is canonical, so port and
-// parameters are already gone). A username that is not an IMPI is refused,
-// as the HSS would refuse it.
-func privateIdentity(m *sip.Request, impu string) (string, bool) {
+// Digest credentials for realm, the home network's, or, without any, the
+// IMPU without its scheme, which is what TS 24.229 §5.3.1.2 derives (impu is
+// canonical, so port and parameters are already gone). Credentials for
+// another realm are not for this network (RFC 3261 §22.4), and scscf passes
+// them over the same way. A username that is not an IMPI is refused, as the
+// HSS would refuse it.
+func privateIdentity(m *sip.Request, impu, realm string) (string, bool) {
 	if creds, err := m.Header.Authorization(); err == nil {
 		for _, c := range creds {
 			if !strings.EqualFold(c.Scheme, "Digest") {
+				continue
+			}
+			// An exact match, as RFC 2617 compares realms and scscf does.
+			if v, _ := c.Param("realm"); v != realm {
 				continue
 			}
 			if user, ok := c.Param("username"); ok && user != "" {

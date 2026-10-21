@@ -1008,51 +1008,101 @@ var _ Metrics = (*runtime.Metrics)(nil)
 
 // unavailableFrom makes every send from the k-th on (1-based) fail as one
 // to a task that became unavailable after it was picked, the race #261 is
-// about, and counts the sends.
-func unavailableFrom(c *Client, k int) *atomic.Int32 {
+// about, and counts the sends; the first fails with first instead, if set,
+// rather than going to its task.
+func unavailableFrom(c *Client, k int, first ...error) *atomic.Int32 {
+	return failFrom(c, k, diameter.ErrPeerUnavailable, first...)
+}
+
+// failFrom is unavailableFrom with err for the attempts from the k-th.
+func failFrom(c *Client, k int, err error, first ...error) *atomic.Int32 {
 	var n atomic.Int32
 	real := c.send
 	c.send = func(ctx context.Context, p *diameter.Peer, m *diameter.Message) (*diameter.Message, error) {
-		if int(n.Add(1)) >= k {
-			return nil, diameter.ErrPeerUnavailable
+		i := int(n.Add(1))
+		switch {
+		case i >= k:
+			return nil, err
+		case i == 1 && len(first) > 0:
+			return nil, first[0]
 		}
 		return real(ctx, p, m)
 	}
 	return &n
 }
 
+// unableToDeliver is the answer of an HSS task that is draining.
+func unableToDeliver(uint32, *diameter.Message) (*diameter.Message, error) {
+	return nil, &diameter.Error{ResultCode: diameter.ResultUnableToDeliver}
+}
+
 // TestAnErrorSaysWhetherAnyAttemptWasSent: a first attempt answered busy,
-// whose retry then found its task unavailable, may have been served, though
-// the error is the retry's; only one whose every attempt never left is
-// NeverSent (#261).
+// or by a task draining (3002), or that timed out or lost its connection,
+// may have been served, though its retry then found its task unavailable
+// and the error is the retry's; only one whose every attempt never left,
+// unavailable or not speaking Cx in either order, is NeverSent (#261).
 func TestAnErrorSaysWhetherAnyAttemptWasSent(t *testing.T) {
 	for _, c := range []struct {
-		name      string
+		name string
+		// tasks is the number of HSS tasks, 2 when 0; answer is theirs,
+		// busy when nil.
+		tasks  int
+		answer func(uint32, *diameter.Message) (*diameter.Message, error)
+		// From the from-th attempt on, each fails with retry, unavailable
+		// when nil; the first, before that, with first if given.
 		from      int
+		retry     error
+		first     []error
 		neverSent bool
 	}{
-		{"first busy, retry unavailable", 2, false},
-		{"both unavailable", 1, true},
+		{name: "first busy, retry unavailable", from: 2},
+		{name: "first draining, retry unavailable", answer: unableToDeliver, from: 2},
+		{name: "first timed out, retry unavailable", from: 2, first: []error{diameter.ErrTimeout}},
+		{name: "first's deadline passed, retry unavailable", from: 2, first: []error{context.DeadlineExceeded}},
+		{name: "first's connection closed, retry unavailable", from: 2, first: []error{diameter.ErrConnectionClosed}},
+		{name: "first not negotiated, retry unavailable", from: 2, first: []error{diameter.ErrApplicationNotNegotiated}, neverSent: true},
+		{name: "first unavailable, retry not negotiated", from: 2, retry: diameter.ErrApplicationNotNegotiated, first: []error{diameter.ErrPeerUnavailable}, neverSent: true},
+		{name: "the one task not negotiated", tasks: 1, from: 1, retry: diameter.ErrApplicationNotNegotiated, neverSent: true},
+		{name: "both unavailable", from: 1, neverSent: true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			e := newEnv(t, nil)
-			a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
-			b := startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
-			a.setAnswer(busy)
-			b.setAnswer(busy)
-			e.refresh("192.0.2.1", "192.0.2.2")
-			sends := unavailableFrom(e.client, c.from)
+			answer, retry, tasks := c.answer, c.retry, c.tasks
+			if answer == nil {
+				answer = busy
+			}
+			if retry == nil {
+				retry = diameter.ErrPeerUnavailable
+			}
+			if tasks == 0 {
+				tasks = 2
+			}
+			addrs := []string{"192.0.2.1", "192.0.2.2"}[:tasks]
+			for i, a := range addrs {
+				startHSS(t, e.net, a, []string{"hss-a.rcs.local", "hss-b.rcs.local"}[i]).setAnswer(answer)
+			}
+			e.refresh(addrs...)
+			sends := failFrom(e.client, c.from, retry, c.first...)
 			_, err := e.client.MAR(ctx(t), &cx.MAR{UserName: impi1, PublicIdentity: impu1, NumberAuthItems: 1})
-			if sends.Load() != 2 || !errors.Is(err, diameter.ErrPeerUnavailable) {
-				t.Fatalf("%d sends, error %v; want the retry's unavailable peer", sends.Load(), err)
+			if int(sends.Load()) != tasks || !errors.Is(err, retry) {
+				t.Fatalf("%d sends, error %v; want %d and the last attempt's %v", sends.Load(), err, tasks, retry)
 			}
 			if NeverSent(err) != c.neverSent || ErrorOutcome(err) != Unavailable {
 				t.Errorf("NeverSent = %v, outcome %v; want %v, Unavailable", NeverSent(err), ErrorOutcome(err), c.neverSent)
 			}
 		})
 	}
-	if !NeverSent(ErrNoPeer) || NeverSent(diameter.ErrTimeout) || NeverSent(diameter.ErrConnectionClosed) {
-		t.Error("NeverSent of a single error")
+	for _, err := range []error{ErrNoPeer, diameter.ErrPeerUnavailable, diameter.ErrApplicationNotNegotiated} {
+		if !NeverSent(err) {
+			t.Errorf("NeverSent(%v) is false", err)
+		}
+	}
+	// A caller that gave up, as when the REGISTER's flow closed, may have
+	// done so after the send.
+	for _, err := range []error{diameter.ErrTimeout, diameter.ErrConnectionClosed, context.DeadlineExceeded, context.Canceled} {
+		if NeverSent(err) {
+			t.Errorf("NeverSent(%v) is true", err)
+		}
 	}
 }
 
