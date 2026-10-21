@@ -15,7 +15,10 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
+	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -659,10 +662,14 @@ func (q *queueTest) send(opts ...SendOption) error {
 }
 
 // writerBusy waits until the writer has taken everything queued and is blocked
-// writing it.
+// writing it. A connection that closed meanwhile fails the test (#220).
 func (q *queueTest) writerBusy() {
+	q.t.Helper()
 	eventually(q.t, "the writer to take the queue", func() bool {
 		f := q.tr.flows.peer(reuseKey{network: TCP, remote: pipeDst.Addr})
+		if f == nil {
+			q.t.Fatal("the connection closed while its writer was to be blocked")
+		}
 		f.q.mu.Lock()
 		defer f.q.mu.Unlock()
 		return len(f.q.bufs) == 0
@@ -704,24 +711,95 @@ func TestSendWaitsForRoomWhileThePeerReads(t *testing.T) {
 	}
 }
 
+// A peer that never reads leaves the writer blocked until its write deadline,
+// and a send waiting for room meanwhile fails when the writer then closes the
+// connection. The test, not the clock, decides when the deadline passes: the
+// connection's Write blocks until the test makes it fail as the deadline
+// would. With a real 50 ms WriteTimeout a slow host let the write time out
+// before the test had the second send waiting, and the run went wrong
+// (#220).
 func TestPeerThatNeverReadsFailsTheWaitingSendAndIsClosedByTheWriter(t *testing.T) {
-	tr, _ := pipeTransport(t, Config{WriteTimeout: 50 * time.Millisecond, SendQueueBytes: 1000})
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	conn := &stalledConn{Conn: server, writing: make(chan time.Time, 1), deadline: make(chan struct{})}
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, WriteTimeout: time.Hour, SendQueueBytes: 1000})
+	listen(t, tr, ListenerConfig{Network: TCP})
 	q := &queueTest{t: t, tr: tr}
 	if err := q.send(); err != nil {
 		t.Fatal(err)
 	}
-	q.writerBusy()
-	// The waiting send fails, by timing out (ErrQueueFull) or by seeing the
-	// connection close, whichever happens first: both run out after
-	// WriteTimeout. What closes the connection is the stalled write, not the
-	// full queue.
-	if err := q.send(); !errors.Is(err, ErrQueueFull) && !errors.Is(err, ErrNoFlow) {
-		t.Fatalf("send = %v, want ErrQueueFull or ErrNoFlow", err)
+	var deadline time.Time
+	select {
+	case deadline = <-conn.writing:
+	case <-time.After(waitFor):
+		t.Fatal("the writer never wrote")
+	}
+	if until := time.Until(deadline); until < 59*time.Minute {
+		t.Fatalf("the write deadline is %v away, want WriteTimeout", until)
+	}
+	// The first message is still being written and counts against the
+	// queue, so the second waits for room.
+	second := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKq-second")
+	second.Body = make([]byte, 600)
+	waited := make(chan error, 1)
+	go func() { _, err := tr.SendRequest(second, pipeDst); waited <- err }()
+	eventually(t, "the second send to wait for room", func() bool { return parkedIn("(*sendQueue).push") })
+	close(conn.deadline)
+	// What closes the connection is the stalled write, not the full queue.
+	select {
+	case err := <-waited:
+		if !errors.Is(err, ErrNoFlow) || errors.Is(err, ErrQueueFull) {
+			t.Fatalf("send = %v, want ErrNoFlow: the writer closed the connection", err)
+		}
+	case <-time.After(waitFor):
+		t.Fatal("the waiting send was not released by the failed write")
 	}
 	eventually(t, "the connection to close", func() bool { return tr.Stats().OpenOutbound == 0 })
-	if s := tr.Stats(); s.QueueOverflows != 0 || s.WriteErrors != 1 {
+	if s := tr.Stats(); s.QueueOverflows != 0 || s.WriteErrors != 1 || s.Dialed != 1 {
 		t.Fatalf("stats = %+v", s)
 	}
+}
+
+// stalledConn is a connection whose peer never reads: Write reports the
+// deadline it was given on writing and blocks until deadline is closed, then
+// fails as a passed write deadline does.
+type stalledConn struct {
+	net.Conn
+	writing  chan time.Time
+	deadline chan struct{}
+
+	mu  sync.Mutex
+	set time.Time
+}
+
+func (c *stalledConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.set = t
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *stalledConn) Write([]byte) (int, error) {
+	c.mu.Lock()
+	set := c.set
+	c.mu.Unlock()
+	select {
+	case c.writing <- set:
+	default:
+	}
+	<-c.deadline
+	return 0, os.ErrDeadlineExceeded
+}
+
+// parkedIn reports whether a goroutine is blocked inside fn.
+func parkedIn(fn string) bool {
+	buf := make([]byte, 1<<20)
+	for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+		if strings.Contains(g, fn) && (strings.Contains(g, "[select") || strings.Contains(g, "[chan receive")) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDialedConnectionWithoutAnAddressOrListenerIsNotGivenABrokenVia(t *testing.T) {
