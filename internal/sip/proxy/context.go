@@ -911,8 +911,9 @@ func (c *respContext) closeBranches() []func() {
 // cancelUpstream handles a CANCEL for the request (§16.10): it marks the
 // request cancelled, so that no branch starts from here on, and returns
 // what is to be done for it, the CANCELs of the pending branches and the
-// final response if the request has its answer now, which run after the
-// CANCEL's own 200. A request the service is answering itself is the
+// final response if the request has its answer now, which receiveCancel
+// runs after the CANCEL's own 200. A branch that ends unsent in between
+// sends the final response itself, which may then go before the 200. A request the service is answering itself is the
 // service's to end: it learns of the CANCEL through its context, and the
 // proxy answers for it only if it returns without a final response.
 func (c *respContext) cancelUpstream() (then func()) {

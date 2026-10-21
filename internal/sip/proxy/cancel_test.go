@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -110,9 +111,12 @@ func TestACancelWhileTheRouterRunsAnswers487AndForwardsNothing(t *testing.T) {
 
 // #361: a CANCEL that comes while a branch's Prepare runs is answered 200
 // only once the request counts as cancelled, so that the branch, prepared
-// after the client has its 200, is never sent: the INVITE gets its 487 at
+// once the client has its 200, is never sent: the INVITE gets its 487 at
 // once, not after a downstream that may never send a provisional, which a
-// CANCEL waits for (§9.1), runs out Timer B (§16.10).
+// CANCEL waits for (§9.1), runs out Timer B (§16.10). Prepare returns from
+// the 200's send, the earliest the client can have it, and the 200 waits
+// for the branch to be sent or dropped. The 487 may come before the 200:
+// they are two transactions, which RFC 3261 does not order.
 func TestACancelDuringPrepareIsAnswered200OnlyOnceTheRequestIsCancelled(t *testing.T) {
 	h := newHarness(t, Config{})
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -143,17 +147,34 @@ func TestACancelDuringPrepareIsAnswered200OnlyOnceTheRequestIsCancelled(t *testi
 			cancelledFirst = append(cancelledFirst, c.cancelled && c.closed)
 			c.mu.Unlock()
 		}
+		// Prepare returns, and the 200 waits until the branch has decided,
+		// sent or not: whatever the proxy does after the 200 cannot help it.
+		close(release)
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			sent := 0
+			h.net.mu.Lock()
+			sent = len(h.net.requests)
+			h.net.mu.Unlock()
+			ctxs[0].mu.Lock()
+			decided := ctxs[0].pending == 0
+			ctxs[0].mu.Unlock()
+			if sent > 0 || decided {
+				return
+			}
+		}
+		t.Error("the branch never decided")
 	}
 	h.net.mu.Unlock()
 	inv := invite(t)
 	h.p.Receive(inboundFrom(inv, "up"))
 	<-entered
 	h.p.Receive(inboundFrom(uacCancel(t, inv), "up"))
-	close(release)
 	h.settle()
 	check(t, "cancelled before the 200", cancelledFirst, []bool{true})
-	check(t, "upstream", labels(h.upstreamResponses()), []string{"200 CANCEL", "487 INVITE"})
 	check(t, "sent", h.sentMethods(), nil)
+	got := labels(h.upstreamResponses())
+	slices.Sort(got)
+	check(t, "upstream", got, []string{"200 CANCEL", "487 INVITE"})
 }
 
 // TestACancelWhileTheInviteIsBeingSentWaitsForItsProvisional holds the branch
