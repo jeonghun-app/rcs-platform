@@ -35,6 +35,12 @@ func (g *Registrar) Sweep(ctx context.Context, limit int) (int, error) {
 // HSS out of reach, is an error, so a sweep after the lease tries again; a
 // permanent one is not (state.SweepRegistrations).
 func (g *Registrar) swept(ctx context.Context, before, after *state.Registration) error {
+	if len(after.Contacts) == 0 && after.Deregistering.IsZero() {
+		// An unregistered user's record whose Reassert came, which the
+		// sweep claimed as a live set (state.SweepRegistrations): told
+		// UNREGISTERED_USER (assignmentOf; #410 code review).
+		return g.reassert(ctx, after)
+	}
 	if len(after.Contacts) > 0 {
 		if before.ReassertDue(g.cfg.Now()) {
 			// The sweep may have pruned bindings too, which the

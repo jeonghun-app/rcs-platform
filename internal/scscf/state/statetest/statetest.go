@@ -104,6 +104,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AttemptsAreCountedOnceAcrossInstances", testAttemptCounts},
 		{"NoClientCanTakeAnAttemptCount", testAttemptCountNotAChallenge},
 		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
+		{"ASweepClaimsAnUnregisteredUsersRecordWhoseReassertIsDueAndKeepsIt", testUnregisteredReassertSweep},
 		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
 		{"ASaveFromBeforeAKeepIdentityCannotUndoIt", testIdentityKeepNeverUndone},
 		{"ARecordBroughtBackFromADeregistrationTakesANewIncarnation", testReviveTakesANewIncarnation},

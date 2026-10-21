@@ -956,6 +956,45 @@ func testReassertSweep(t *testing.T, a, b state.Store, o Options) {
 	wantErr(t, err, state.ErrInvalid)
 }
 
+// testUnregisteredReassertSweep: an unregistered user's record whose
+// Reassert comes before its state ends is listed then, claimed as a live
+// set (Reassert one lease ahead, no deregistration lease) and handed over
+// once, and the sweep does not delete it (#410 code review).
+func testUnregisteredReassertSweep(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1)
+	r.Unregistered = T0.Add(2 * time.Hour)
+	r.Reassert, r.ReassertAttempts = T0.Add(time.Minute), 1
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if regs := must(b.ExpiringRegistrations(ctx(t), T0, 10))(t); len(regs) != 0 {
+		t.Error("listed before its Reassert")
+	}
+	at := T0.Add(time.Minute)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), at, 10))(t)) == 1
+	})
+	called := 0
+	sweep := func(s state.Store, now time.Time) {
+		t.Helper()
+		if _, err := state.SweepRegistrations(ctx(t), s, now, 10, func(before, after *state.Registration) error {
+			called++
+			if !before.ReassertDue(now) || !after.Deregistering.IsZero() || !after.Reassert.Equal(now.Add(state.SweepLease)) || !after.Unregistered.Equal(r.Unregistered) {
+				t.Errorf("handled %+v then %+v", before, after)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweep(a, at)
+	sweep(b, at.Add(state.SweepLease/2))
+	if called != 1 {
+		t.Fatalf("handled %d times within the lease", called)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); !got.Unregistered.Equal(r.Unregistered) || !got.Deregistering.IsZero() {
+		t.Errorf("after the sweep: %+v", got)
+	}
+}
+
 // testReviveTakesANewIncarnation: a record claimed for a deregistration that
 // a save brings back, with bindings or as an unregistered user's record, must
 // carry a new incarnation, or the deregistration would delete the identities
