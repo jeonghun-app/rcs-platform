@@ -52,7 +52,9 @@ type service struct {
 	h                 *runtimetest.Harness
 	client, udp, core netip.AddrPort
 	stop              func()
-	done              chan error
+	// stopWithin is stop, failing the test if run has not returned within d.
+	stopWithin func(d time.Duration)
+	done       chan error
 }
 
 // start runs pcscf with cfg and d until the test ends.
@@ -82,7 +84,7 @@ func startWith(t *testing.T, h *runtimetest.Harness, cfg Config, d deps) *servic
 		t.Fatal("pcscf did not start")
 	}
 	var once sync.Once
-	s.stop = func() {
+	s.stopWithin = func(d time.Duration) {
 		once.Do(func() {
 			cancel()
 			select {
@@ -90,11 +92,12 @@ func startWith(t *testing.T, h *runtimetest.Harness, cfg Config, d deps) *servic
 				if err != nil {
 					t.Errorf("run: %v", err)
 				}
-			case <-time.After(waitFor):
-				t.Error("pcscf did not stop")
+			case <-time.After(d):
+				t.Errorf("pcscf did not stop within %v", d)
 			}
 		})
 	}
+	s.stop = func() { s.stopWithin(waitFor) }
 	t.Cleanup(s.stop)
 	return s
 }
