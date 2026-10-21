@@ -331,6 +331,11 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		if !ok {
 			return nil, errors.New("got a request")
 		}
+		// A response to an earlier request, as a 2xx to an INVITE sent
+		// again before its ACK came in, is not this one's.
+		if c, err := res.Header.CSeq(); err != nil || res.Header.Get("Call-ID") != callID || c.Seq != uint32(cseq) || c.Method != m.method {
+			continue
+		}
 		if res.StatusCode >= 200 {
 			return res, nil
 		}
