@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -139,12 +140,62 @@ func (c *sipConn) final(t *testing.T) *sip.Response {
 
 // A peer that has stopped reading leaves its answers in the transport's
 // queue, where Close drops them whatever Drain waits: Drain stops waiting
-// once the queues no longer shrink, rather than spend all of DrainSendWait,
-// most of a service's stop margin, on them (QA of #366). DrainSendWait is an
-// hour here, so only that ends the wait.
+// once no connection with output queued makes progress, rather than spend
+// all of DrainSendWait, most of a service's stop margin, on them (QA of
+// #366). Another peer that keeps sending and reading meanwhile does not hide
+// the stalled one: progress is per connection. DrainSendWait is an hour
+// here, so only that rule ends the wait.
 func TestDrainDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
-	drainSendWait = time.Hour
-	t.Cleanup(func() { drainSendWait = DrainSendWait })
+	for _, chatty := range []bool{false, true} {
+		t.Run(map[bool]string{false: "alone", true: "with a busy peer that reads"}[chatty], func(t *testing.T) {
+			drainSendWait = time.Hour
+			t.Cleanup(func() { drainSendWait = DrainSendWait })
+			p, tr, addr := stalledPeerProxy(t)
+			if chatty {
+				busy := dialSIP(t, addr.String())
+				_ = busy.nc.SetDeadline(time.Now().Add(time.Hour))
+				go func() { _, _ = io.Copy(io.Discard, busy.nc) }()
+				stop := make(chan struct{})
+				t.Cleanup(func() { close(stop) })
+				go func() {
+					for {
+						select {
+						case <-stop:
+							return
+						case <-time.After(20 * time.Millisecond):
+						}
+						n := flowSends.Add(1)
+						if _, err := io.WriteString(busy.nc, fmt.Sprintf("OPTIONS sip:bob@example.com SIP/2.0\r\n"+
+							"Via: SIP/2.0/TCP %s;branch=z9hG4bK-busy-%d\r\nMax-Forwards: 70\r\n"+
+							"To: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
+							"Call-ID: busy-%d\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+							busy.nc.LocalAddr(), n, n)); err != nil {
+							return
+						}
+					}
+				}()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			done := make(chan struct{})
+			go func() { p.Drain(ctx); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("Drain is still waiting for a peer that does not read")
+			}
+			if tr.Stats().QueuedBytes == 0 {
+				t.Fatal("the stalled peer's queue emptied, so nothing showed that Drain stopped waiting on it")
+			}
+		})
+	}
+}
+
+// stalledPeerProxy is a proxy over a real transport that answers every
+// request 200, with a peer that stopped reading and has over 1 MiB of
+// answers queued.
+func stalledPeerProxy(t *testing.T) (*Proxy, *transport.Transport, netip.AddrPort) {
+	t.Helper()
 	var px atomic.Pointer[Proxy]
 	tr, err := transport.New(transport.Config{WriteTimeout: time.Hour}, func(in transport.Inbound) {
 		if p := px.Load(); p != nil {
@@ -182,7 +233,10 @@ func TestDrainDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
 				"Via: SIP/2.0/TCP %s;branch=z9hG4bK-stall-%d;p=%s\r\n"+
 				"Max-Forwards: 70\r\nTo: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
 				"Call-ID: stall-%d\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n", peer.nc.LocalAddr(), i, pad, i)
-			if _, err := io.WriteString(peer.nc, text); err != nil {
+			// Stop past 1 MiB, well short of the queue's limit, so that no
+			// answer waits for room in it: Drain would wait for that for
+			// DrainSendWait, which these tests make an hour.
+			if _, err := io.WriteString(peer.nc, text); err != nil || tr.Stats().QueuedBytes >= 1<<20 {
 				return
 			}
 		}
@@ -194,32 +248,35 @@ func TestDrainDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	done := make(chan struct{})
-	go func() { p.Drain(ctx); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Drain is still waiting for a peer that does not read")
-	}
-	if tr.Stats().QueuedBytes == 0 {
-		t.Fatal("the peer's queue emptied, so nothing showed that Drain stopped waiting on it")
-	}
+	return p, tr, addr
 }
 
 // A peer that reads, slowly, still gets a long answer that takes it well
 // past drainFlushStall to read: what counts as progress is bytes written,
 // chunk by chunk, not a whole message leaving the queue (code review of
 // #366). The peer reads 32 KiB every 45 ms, about 700 KB/s, so the 900 KiB
-// answer takes over a second, longer than drainFlushStall, while the kernel
-// takes more of it every quarter second or so. The transport closes right
+// answer takes over a second, while the kernel takes more of it every
+// quarter second or so. The transport closes right
 // after Drain, as in pcscf, and drops whatever is left. DrainSendWait is an
 // hour, so only the stall rule could cut the answer short.
 func TestDrainWaitsForAPeerThatReadsALongAnswerSlowly(t *testing.T) {
+	for _, stalled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "alone", true: "beside a peer that stopped reading"}[stalled], func(t *testing.T) {
+			longAnswerToASlowReader(t, stalled)
+		})
+	}
+}
+
+// longAnswerToASlowReader is TestDrainWaitsForAPeerThatReadsALongAnswerSlowly,
+// with another peer that has stopped reading and holds a full queue
+// meanwhile if stalled, which must not end the wait for the one still
+// reading (QA of #366). drainFlushStall is long, so that a loaded host
+// cannot make the reader look stalled; Transport.Flush's tests cover the
+// window itself.
+func longAnswerToASlowReader(t *testing.T, stalled bool) {
 	const long = 900 << 10
-	drainSendWait = time.Hour
-	t.Cleanup(func() { drainSendWait = DrainSendWait })
+	drainSendWait, drainFlushStall = time.Hour, 10*time.Second
+	t.Cleanup(func() { drainSendWait, drainFlushStall = DrainSendWait, time.Second })
 	responded := make(chan struct{}, 2)
 	var px atomic.Pointer[Proxy]
 	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) {
@@ -253,7 +310,9 @@ func TestDrainWaitsForAPeerThatReadsALongAnswerSlowly(t *testing.T) {
 				if err := u.Respond(res); err != nil {
 					t.Errorf("answering %s: %v", r.Message.Method, err)
 				}
-				responded <- struct{}{}
+				if r.Message.Method != "INFO" {
+					responded <- struct{}{}
+				}
 			}}
 		}),
 	})
@@ -262,6 +321,35 @@ func TestDrainWaitsForAPeerThatReadsALongAnswerSlowly(t *testing.T) {
 	}
 	t.Cleanup(p.Close)
 	px.Store(p)
+
+	if stalled {
+		stuck := dialSIP(t, addr.String())
+		if tc, ok := stuck.nc.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(4096)
+		}
+		_ = stuck.nc.SetDeadline(time.Now().Add(time.Hour))
+		pad := strings.Repeat("z", 3000)
+		go func() {
+			for i := 0; ; i++ {
+				text := fmt.Sprintf("INFO sip:bob@example.com SIP/2.0\r\n"+
+					"Via: SIP/2.0/TCP %s;branch=z9hG4bK-stuck-%d;p=%s\r\n"+
+					"Max-Forwards: 70\r\nTo: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
+					"Call-ID: stuck-%d\r\nCSeq: 1 INFO\r\nContent-Length: 0\r\n\r\n", stuck.nc.LocalAddr(), i, pad, i)
+				// Stop past 1 MiB, well short of the queue's limit, so that
+				// no answer waits for room in it: Drain would wait for that
+				// for DrainSendWait, an hour here.
+				if _, err := io.WriteString(stuck.nc, text); err != nil || tr.Stats().QueuedBytes >= 1<<20 {
+					return
+				}
+			}
+		}()
+		for deadline := time.Now().Add(time.Minute); tr.Stats().QueuedBytes < 1<<20; {
+			if time.Now().After(deadline) {
+				t.Fatalf("the stalled peer's queue holds %d bytes, want 1 MiB", tr.Stats().QueuedBytes)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 
 	peer := dialSIP(t, addr.String())
 	// The two sockets' buffers then hold well under the long answer, so it

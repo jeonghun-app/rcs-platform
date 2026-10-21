@@ -689,10 +689,6 @@ type Stats struct {
 	// ProxyHeaderErrors counts every other failure of a header begun, so
 	// that it says the NLB is not sending the header.
 	ProxyHeaderEmpty uint64
-	// BytesWritten counts what the stream connections' writers have handed
-	// the kernel, chunk by chunk (writeAll), so it moves while a long message
-	// is still going out, which QueuedBytes does only once it is all written.
-	BytesWritten uint64
 }
 
 type counters struct {
@@ -700,10 +696,49 @@ type counters struct {
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
 	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses,
-	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty, bytesWritten atomic.Uint64
+	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
+// Flush waits until each stream connection has written the output it had
+// queued when Flush was called, until that connection's writer has made no
+// progress (a chunk written, see writeAll) for stall, counted from the call
+// at the earliest, or until deadline. Output queued meanwhile is not waited
+// for, so a busy connection ends the wait as soon as its earlier output is
+// out. A service that stops uses it before Close, which drops what the
+// queues hold: a peer that still reads gets its answers, however long they
+// are, and one that has stopped reading costs stall, not the whole deadline,
+// and does not hide behind another peer's traffic (QA of #366).
+func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
+	start := time.Now()
+	type pending struct {
+		q      *sendQueue
+		target uint64 // sent once the output queued at the start is out
+	}
+	var ps []pending
+	for _, f := range t.flows.streams() {
+		f.q.mu.Lock()
+		if f.q.queued > 0 && !f.q.closed {
+			ps = append(ps, pending{f.q, f.q.sent + uint64(f.q.queued)})
+		}
+		f.q.mu.Unlock()
+	}
+	for len(ps) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		now := time.Now()
+		ps = slices.DeleteFunc(ps, func(p pending) bool {
+			p.q.mu.Lock()
+			sent, closed := p.q.sent, p.q.closed
+			p.q.mu.Unlock()
+			last := time.Unix(0, p.q.progress.Load())
+			if last.Before(start) {
+				last = start
+			}
+			return closed || sent >= p.target || now.Sub(last) >= stall
+		})
+	}
+}
+
 func (t *Transport) Stats() Stats {
 	c := &t.stats
 	ts := t.flows.stats()
@@ -736,7 +771,6 @@ func (t *Transport) Stats() Stats {
 		IdleTimeouts:       c.idleTimeouts.Load(),
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
-		BytesWritten:       c.bytesWritten.Load(),
 		QueueOverflows:     c.queueOverflows.Load(),
 		QueueWaitTimeouts:  c.queueWaitTimeouts.Load(),
 		BudgetSheds:        c.budgetSheds.Load(),

@@ -49,6 +49,8 @@ type sendQueue struct {
 	queued int
 	limit  int
 	closed bool
+	// sent counts the bytes of the messages written in full, for Flush.
+	sent uint64
 	// progress is when the queue last went from empty to holding output, or
 	// its writer last wrote a chunk, in Unix nanoseconds, which tells a stalled
 	// peer from a slow one.
@@ -183,6 +185,7 @@ func (q *sendQueue) written(n int) {
 	q.mu.Lock()
 	if !q.closed {
 		q.queued -= n
+		q.sent += uint64(n)
 		q.budget.release(n)
 	}
 	q.mu.Unlock()
@@ -245,7 +248,6 @@ func (t *Transport) writeAll(f *flow, b []byte) error {
 		if _, err := f.conn.Write(b[:n]); err != nil {
 			return err
 		}
-		t.stats.bytesWritten.Add(uint64(n))
 		f.q.progress.Store(time.Now().UnixNano())
 		b = b[n:]
 	}
