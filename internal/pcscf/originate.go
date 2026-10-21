@@ -66,7 +66,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 	if dialogForming(r.Message.Method) {
 		rr = p.recordRoute(src.Flow, contactHasOb(r.Message), icid, r.Message.Header.Get("Call-ID"))
 	}
-	return p.anchorOriginating(r, proxy.Decision{
+	return p.anchorInitial(r, proxy.Decision{
 		Targets:     []proxy.Target{{URI: r.Message.URI}},
 		RecordRoute: rr,
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
@@ -98,7 +98,7 @@ func (p *pcscf) originate(_ context.Context, r *proxy.Request) proxy.Decision {
 			}
 			return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 		},
-	})
+	}, clientSide, src.Flow)
 }
 
 // dialogForming reports whether a request of method sets up a dialog, and so
@@ -425,14 +425,11 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 			return proxy.Decision{Status: 500}
 		}
 	}
-	if !p.msrpInDialog(r.Source.Flow, r.Message, true) {
-		return p.refuseOffer()
-	}
 	d := proxy.Forward(r)
 	d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 		return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 	}
-	return d
+	return p.anchorInDialog(r, d, clientSide, r.Source.Flow)
 }
 
 // scscfHop reports whether u names scscf as the next hop of a request inside
