@@ -69,13 +69,19 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 		"P-Asserted-Identity": "<" + alice + ">",
 		"P-Served-User":       "<" + bob + ">;sescase=term",
 		"P-Asserted-Service":  chatICSI,
-		"Accept-Contact":      "*;" + chatTag,
-		"Conversation-ID":     "c0nv1",
-		"Content-Type":        sdpType,
+		// Both the CPM ICSI and the OMA SIMPLE IM tag, by which rcsjta
+		// takes a chat (code review on #279).
+		"Contact":         "<sip:" + r.a.addr.String() + ";transport=tcp>;" + chatTag + ";" + omaIMTag,
+		"Conversation-ID": "c0nv1",
+		"Content-Type":    sdpType,
 	} {
 		if got := ih.Get(name); got != want {
 			t.Errorf("INVITE %s: %q, want %q", name, got, want)
 		}
+	}
+	// One Accept-Contact per feature tag (code review on #279).
+	if ac := ih.Values("Accept-Contact"); !slices.Equal(ac, []string{"*;" + chatTag, "*;" + omaIMTag}) {
+		t.Errorf("INVITE Accept-Contact %q", ac)
 	}
 	if inv.URI.String() != bob || ih.Has("Supported") {
 		t.Errorf("INVITE %s, Supported %q", inv.URI.String(), ih.Get("Supported"))
@@ -758,15 +764,6 @@ func settled(t *testing.T, s *Server, callID string) {
 			t.Fatalf("session %s not settled", callID)
 		}
 		time.Sleep(time.Millisecond)
-	}
-}
-
-func TestGroupSessionsAreNotServedYet(t *testing.T) {
-	r := newChatRig(t, messaging.Config{})
-	inv := invitation()
-	inv.Mode = store.Group
-	if err := r.a.srv.Invite(t.Context(), inv); !errors.Is(err, errGroupNotServed) {
-		t.Fatalf("Invite: %v", err)
 	}
 }
 
