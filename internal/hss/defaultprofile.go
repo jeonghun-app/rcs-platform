@@ -22,7 +22,27 @@ const (
 	// The OMA SIMPLE IM feature tag, with which the reference client
 	// (rcsjta) asks for a 1-to-1 chat instead of the CPM chat ICSI.
 	omaIM = `\+g\.oma\.sip-im`
+	// An MSRP message stream in a session description's m= line, which a
+	// chat's or a file transfer's INVITE offers whatever its feature tags
+	// say (RFC 4975 §8.1): the trigger then holds for a request that names
+	// no known service other than chat (otherService), which a client
+	// could otherwise send past rcs-as by naming none, or one no pattern
+	// expects. One that names image share, say, goes on as before. It takes
+	// the lines sdp.Media.IsMSRP takes, whose media type and protocol
+	// compare without case, so that no spelling of the stream reaches the
+	// callee as MSRP and past rcs-as (#359 security review). An ERE has no
+	// case flag, hence the bracket pairs.
+	msrpMedia = `^[Mm][Ee][Ss][Ss][Aa][Gg][Ee] [^ ]+ [Tt][Cc][Pp]/([Tt][Ll][Ss]/)?[Mm][Ss][Rr][Pp] `
 )
+
+// otherService is a feature tag, as an ifc.FeatureTagField presents it,
+// that names a service other than chat which offers an MSRP stream or
+// may: image share's and video share's IARIs, and the MMTEL ICSI (RCC.07
+// Table 3, TS 24.173). An MSRP INVITE that names one of them goes to the
+// callee; one that names any other, or none, is taken for a chat (lead's
+// decision on #359). It matches a parameter of Accept-Contact or Contact,
+// not the same text anywhere else in them (#359 security review).
+const otherService = `^(\+g\.3gpp\.iari-ref=urn:urn-7:3gpp-application\.ims\.iari\.gsma-(is|vs)|\+g\.3gpp\.icsi-ref=urn:urn-7:3gpp-service\.ims\.icsi\.mmtel)$`
 
 // featureTagHeaders carry the caller's and callee's feature tags;
 // serviceHeaders the requested or asserted service.
@@ -49,7 +69,8 @@ const servedUserHeader = "P-Served-User"
 // offline (docs/architecture.md §5):
 //
 //	10  INVITE for an RCS service (CPM ICSI, RCS IARI, or
-//	    OMA SIMPLE IM, rcsjta's chat)                        SESSION_TERMINATED
+//	    OMA SIMPLE IM, rcsjta's chat, or an MSRP stream
+//	    unless image share, video share or MMTEL)           SESSION_TERMINATED
 //	20  MESSAGE                                             SESSION_TERMINATED
 //	30  OPTIONS for an RCS service (capability discovery)   SESSION_CONTINUED
 //	40  REGISTER (third-party registration)                 SESSION_CONTINUED
@@ -71,18 +92,32 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 	// (method) AND (an RCS service in a feature tag or a service header)
 	// AND NOT (P-Served-User), in conjunctive normal form: group 0 is the
 	// method, group 1 the ORed service conditions, one header and one
-	// literal each, group 2 the served-user check.
+	// literal each, and the last group the served-user check. An INVITE
+	// also takes the trigger by an MSRP stream unless it names a known
+	// service that is not chat: rcs OR (msrp AND NOT other), which in CNF
+	// is group 1 with msrp, and group 2 with the service conditions and the
+	// other service's absence.
 	rcsRequest := func(method string) *ifc.TriggerPoint {
+		groups := []int{1}
+		var absent []ifc.SPT
+		if method == "INVITE" {
+			groups = []int{1, 2}
+			absent = []ifc.SPT{{ConditionNegated: true, Groups: []int{2}, Condition: ifc.SIPHeader{Header: ifc.FeatureTagField, Content: otherService}}}
+		}
 		spts := []ifc.SPT{{Groups: []int{0}, Condition: ifc.Method(method)}}
 		for _, h := range featureTagHeaders {
 			for _, tag := range []string{cpmICSI, rcsIARI, omaIM} {
-				spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SIPHeader{Header: h, Content: tag}})
+				spts = append(spts, ifc.SPT{Groups: groups, Condition: ifc.SIPHeader{Header: h, Content: tag}})
 			}
 		}
 		for _, h := range serviceHeaders {
-			spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SIPHeader{Header: h, Content: cpmICSI}})
+			spts = append(spts, ifc.SPT{Groups: groups, Condition: ifc.SIPHeader{Header: h, Content: cpmICSI}})
 		}
-		spts = append(spts, notServed(2))
+		if method == "INVITE" {
+			spts = append(spts, ifc.SPT{Groups: []int{1}, Condition: ifc.SessionDescription{Line: "m", Content: msrpMedia}})
+			spts = append(spts, absent...)
+		}
+		spts = append(spts, notServed(len(groups)+1))
 		return &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: spts}
 	}
 	// (method) AND NOT (P-Served-User).

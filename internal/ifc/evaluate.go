@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"unicode"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // Request is the view of a SIP request that service point triggers examine.
@@ -141,6 +143,18 @@ type HeaderField struct {
 	Name  string
 	Value string
 }
+
+// FeatureTagField names the header fields the S-CSCF adds to a request it
+// evaluates, for each feature tag (RFC 3840 §9) that an Accept-Contact or
+// Contact value carries as a parameter: its name in lower case, as
+// "+g.oma.sip-im", or for each value of a quoted one, "name=value", the
+// value percent-decoded and in lower case, as
+// "+g.3gpp.iari-ref=urn:urn-7:3gpp-application.ims.iari.gsma-is". A
+// criterion can then tell a feature tag from the same text in a URI, a
+// display name or another parameter's value. No SIP header field has this
+// name: a field name is a token, which has no space (RFC 3261 §25.1), so
+// no request can carry one of its own.
+const FeatureTagField = "Feature tag"
 
 // Context is what the S-CSCF knows about a request besides its content.
 type Context struct {
@@ -1116,7 +1130,7 @@ func (in *input) headers() []HeaderField {
 			// Annex F matches names and values with white space at either
 			// end removed and inner runs of it reduced to one space, which
 			// is what collapse does.
-			in.fields = append(in.fields, HeaderField{Name: collapse(h.Name), Value: collapse(h.Value)})
+			in.fields = append(in.fields, HeaderField{Name: xmlsafe.Collapse(h.Name), Value: xmlsafe.Collapse(h.Value)})
 		}
 		in.fieldsDone = true
 	}

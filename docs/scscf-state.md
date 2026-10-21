@@ -11,7 +11,7 @@ them.
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
 | `registrations` | `pk` (S): `set#<IMPI>#<default IMPU>`, a canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only, of sets only; TTL on `ttl` | per implicit registration set its bindings (or an unregistered user's record) and its User-Data, and per IMPU the set it belongs to |
-| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations |
+| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>`; or `pk` `#odi#<scope>`, `sk` `#odi` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations; which side took up an iFC position, its return from the application server or its default handling (routing, ADR 0005) |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions: the watched IMPU, the set and incarnation it watches, the subscriber and its kind, a UE's binding, the dialog; and their NOTIFY counters (`cseq`, `rver`) and the record version the last NOTIFY carried (`nof`) |
 
 Data at rest: registration items hold Contact URIs (device addresses),
@@ -41,6 +41,10 @@ additionally sealed (below).
   later requests reuse. A sweep then claims the record like an expired
   registration and sends SAR TIMEOUT_DEREGISTRATION; a REGISTER before that
   turns it into a registration. PPR and RTR apply to it as to a registration.
+  An IMPU whose set has a record that is neither, its bindings expired or
+  being deregistered, is answered 480 without a SAR: the HSS makes a
+  registered user unregistered on SAR UNREGISTERED_USER, ahead of the sweep
+  that ends the record.
 - **One profile per implicit registration set.** The HSS sends User-Data per
   set: an SAA for the set of the IMPU in the request, a PPR for one set at a
   time. A set is therefore keyed by the IMPI and its default IMPU
@@ -51,10 +55,14 @@ additionally sealed (below).
   conditional save, whichever identity it came for; each IMPU's item only
   names its set and the set's incarnation (`state.Identity`), written when
   the S-CSCF is assigned the set or the set changes, before the record that
-  names them: the record's save is the commit point, and an item naming a
-  record not saved is as good as none. A re-registration only keeps the
-  items, or repairs a missing one. A terminating request reads the IMPU's
-  item, the set and the profile. An IMPU names one set: a public identity shared by several
+  names them: the record's save is the commit point. An item naming an
+  incarnation that was never saved still finds its set's record if the
+  record lists the IMPU, is live and is not being deregistered: a
+  terminating request uses it and repairs the item in the background
+  (internal/scscf/routing), so that an interrupted REGISTER costs no call;
+  with no such record the item is as good as none. A re-registration only
+  keeps the items, or repairs one. A terminating request reads the IMPU's
+  item and the set. An IMPU names one set: a public identity shared by several
   IMPIs (TS 23.228 §4.3.3.4) is out of scope, and the second IMPI to
   register it takes the IMPU's item.
 - **Identities go before their set.** Every deregistration deletes the IMPU
@@ -129,22 +137,27 @@ additionally sealed (below).
   (`regevent.Notifier.Ended`); a listing that fails is tried again, and one
   that keeps failing keeps the record under a deregistration's lease for the
   sweep after it, an RTR's too, since the HSS does not send an RTR again
-  (`registrar.rtr_left_to_sweep`), and counts `regevent.end_failed`. The
-  lease of an RTR that ended the set for good is marked `rejected`, so that
-  the sweep's NOTIFY says `reason=rejected` as the RTR's would have (#334);
-  the lease holds no bindings, so that NOTIFY names no contacts. A store
-  failure or a stop at any point thus leaves either the record or the saved
-  ends, and a sweep sends a final NOTIFY nobody sent. A subscription is
-  deleted only once its final NOTIFY is answered (a 2xx, a code RFC 6665
-  §4.2.2 lists, or 430); one without an answer is sent again by a sweep,
-  with the CSeq and version it was numbered with, 10 s after the send ended
-  and twice as late each time (the last about 3 min 10 s after the first for
-  a silent subscriber, 2 min 30 s when each send fails at once), and given
-  up after five sends (`regevent.final_abandoned`). An end whose set was
-  registered again meanwhile, a new record, says terminated without a body,
-  so that it ends nothing of the new registration. The subscription sweep
-  must therefore run every few seconds to a minute, as the registration
-  sweep does.
+  (`registrar.rtr_left_to_sweep`), and counts `regevent.end_failed`. An RTR
+  claims the record for that lease before it tells the subscribers, as a
+  user's deregistration does, so that a stop or a store failure at any point
+  after leaves it to the sweep (#368); a claim the store fails to save is
+  tried again, and then answered DIAMETER_TOO_BUSY, which the HSS sends
+  again (#394). The lease of an RTR that ended the set for good is marked
+  `rejected`, and stays so whatever RTR comes after, so that the sweep's
+  NOTIFY says `reason=rejected` as the RTR's would have (#334); the lease
+  holds no bindings, so that NOTIFY names no contacts. A store failure or a
+  stop at any point thus leaves either the record or the saved ends, and a
+  sweep sends a final NOTIFY nobody sent. A subscription is deleted only
+  once its final NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or
+  430); one without an answer is sent again by a sweep, with the CSeq and
+  version it was numbered with, 10 s after the send ended and twice as late
+  each time (the last about 3 min 10 s after the first for a silent
+  subscriber, 2 min 30 s when each send fails at once), and given up after
+  five sends (`regevent.final_abandoned`). An end whose set was registered
+  again meanwhile, a new record, says terminated without a body, so that it
+  ends nothing of the new registration. The subscription sweep must
+  therefore run every few seconds to a minute, as the registration sweep
+  does.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
   document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
   store's limits, 32 identities (`MaxIdentities`) each listing up to 32

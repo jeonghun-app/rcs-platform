@@ -52,7 +52,10 @@ func startFakeRelay(t *testing.T, answer func(method, path string) (int, string)
 	}))
 	t.Cleanup(srv.Close)
 	base, _ := url.Parse(srv.URL)
-	return f, newRelayClient(base, testRelayToken, time.Second, nil)
+	// waitFor, not a protocol bound: these tests read what the client makes
+	// of an answer, which a loaded host may be slow to serve (#388).
+	// TestTheRelayClientIsBounded times the client with its own.
+	return f, newRelayClient(base, testRelayToken, waitFor, nil)
 }
 
 // createdJSON is the relay's 201 to POST.

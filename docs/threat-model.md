@@ -45,6 +45,12 @@ separate from its core listener; core SIP ports admit only platform services
 (ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
 default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
 messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
+`scscf` reads it only on a terminating request that did not come from a
+`pcscf` core listener, removes the one it inserted toward application servers
+before the request leaves for the terminating side or a contact, and carries
+a request's place in the iFC chain back from a server only in a Route
+parameter it signed (HMAC over the position, the Call-ID and an expiry, ADR
+0005), refusing any other with 403 (#14).
 **Status:** planned (#16, Phase 7 infrastructure).
 **Residual risk (accepted, #208, narrowed in #221):** `pcscf` checks
 in-dialog requests against its own Record-Route values only, keeping no
@@ -63,9 +69,22 @@ as long as the flow lives, but not reach the client with any other. `pcscf` fixe
 client's in-dialog request, to `scscf`; whether such requests then reach
 `rcs-as`, which records itself in the dialog, depends on `scscf`, which
 checks it as an acceptance criterion of
-[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
-mitigation is a dialog-state check in `scscf`, such as a signed
-Record-Route parameter it verifies.
+[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). `scscf`
+signs its own Record-Route value when it sets up a dialog: a key ID and a MAC,
+under a key every `scscf` task shares (current and previous, for rotation),
+over the Call-ID, its name and each of the dialog's hops next to it (scheme,
+user, host, port, transport). It sends a request inside a dialog on only to
+a hop that value signs, at a `pcscf` core port or an application server's
+port, and never to itself (`internal/scscf/routing`, #322); a client that
+names any other core address, or drops an application server's entry from
+its route set, gets 403. No host or subnet list is involved: every core task
+shares the private subnets, and task addresses change. `scscf` records, and
+signs, only requests that set up a dialog (INVITE, SUBSCRIBE, REFER), which
+`pcscf` record-routes too, so the hop toward a client is always `pcscf`'s
+value; the sender's Contact stands in only for a core service that records
+no route, as `rcs-as` does for the requests it sends for its users. As with `pcscf`'s
+value, the binding covers the Call-ID and not the tags, so a peer can go on
+sending to the dialog's own hops with that Call-ID after the call has ended.
 The client's in-dialog requests are checked against the same MAC, so a
 client cannot change the icid its dialog's requests are charged to (review
 of #221; this closes the #208 residual risk that it could).

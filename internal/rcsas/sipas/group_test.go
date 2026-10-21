@@ -351,8 +351,9 @@ func TestAFocusInviteThatComesBackIsRefusedAsALoop(t *testing.T) {
 		t.Fatalf("the returning INVITE was answered %d", code)
 	}
 	// The 482 says the invitation will never reach bob: what is queued
-	// for him from the group is given up (security review on #279).
-	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrUndeliverable) {
+	// for him from the group is given up (security review on #279), as a
+	// loop that no registration of his changes (#384).
+	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrLooped) {
 		t.Fatalf("the invitation failed with %v", err)
 	}
 	if n := r.metrics.get("sip.loop"); n != 1 {

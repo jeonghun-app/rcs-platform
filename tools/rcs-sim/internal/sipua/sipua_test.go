@@ -100,6 +100,40 @@ func (c Config) proxyHost() string {
 	return c.Proxy.Addr().String()
 }
 
+func TestAnAnswerThatCameIsNotLostToALateCancel(t *testing.T) {
+	// Code review of #416: Send's answer is in, and its context ends
+	// before Send wakes to take it, as when a loaded host is slow to run
+	// it. Both are then ready, and Send must return the answer, not the
+	// context's error. Each round has the answer in before the cancel; a
+	// Send that picks either at random fails one of the 20 rounds but once
+	// in a million.
+	s := newStandIn(t, transport.TCP)
+	ua := dial(t, s.config())
+	register(t, ua)
+	s.next(t)
+	t.Cleanup(func() { sendWaiting = nil })
+	target := mustURI(t, "sip:+15550100002@ims.example.com")
+	for round := range 20 {
+		ctx, cancel := context.WithCancel(context.Background())
+		sendWaiting = func(answered func() bool) {
+			for end := time.Now().Add(waitFor); !answered() && time.Now().Before(end); {
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+		}
+		req, err := ua.NewRequest("MESSAGE", target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := ua.Send(ctx, req)
+		cancel()
+		if err != nil || res == nil || res.StatusCode != 200 {
+			t.Fatalf("round %d: Send = %v, %v; want the 200 that had come", round, res, err)
+		}
+		s.next(t)
+	}
+}
+
 func TestRequestsAfterRegistrationCarryTheRouteSet(t *testing.T) {
 	s := newStandIn(t, transport.TCP)
 	ua := dial(t, s.config())
