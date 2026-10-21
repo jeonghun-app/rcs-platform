@@ -25,7 +25,7 @@ func (e *SentError) Unwrap() error { return e.Err }
 
 // NeverSent reports whether err is from a request that certainly reached no
 // HSS task: none was connected (ErrNoPeer), or every attempt found its task
-// unavailable, or not speaking Cx, before the send (left). A request one
+// unavailable, or not speaking Cx, before the send (unsent). A request one
 // attempt of which was sent (SentError), or that failed any other way, a
 // timeout or a closed connection included, may have been served.
 func NeverSent(err error) bool {
