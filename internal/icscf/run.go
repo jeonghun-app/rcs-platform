@@ -75,15 +75,6 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// The S-CSCFs are found by their Cloud Map names, every address of one
 	// (#198), so a request can go to the next when a task is gone.
 	dns := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Shuffle: d.shuffle, Logger: rt.Logger}
-	router, err := New(Config{
-		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
-		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
-		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
-	})
-	if err != nil {
-		return err
-	}
-
 	// The proxy is made once the core listener's port is known, which its
 	// Self needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
@@ -104,8 +95,18 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return fmt.Errorf("icscf: core listener: %w", err)
 	}
+	self := selfURIs(cfg, int(coreAddr.Port()))
+	router, err := New(Config{
+		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
+		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
+		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
+		Self: self,
+	})
+	if err != nil {
+		return err
+	}
 	px, err := proxy.New(tr, proxy.Config{
-		Self:     selfURIs(cfg, int(coreAddr.Port())),
+		Self:     self,
 		Router:   router,
 		Resolver: dns,
 		Logger:   rt.Logger,

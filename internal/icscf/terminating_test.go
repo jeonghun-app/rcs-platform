@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -138,15 +139,18 @@ func TestTerminatingNonInviteRequestsAreLookedUpToo(t *testing.T) {
 }
 
 // §5.3.2.1: a Route left below this I-CSCF's own, or a request inside a
-// dialog, goes where it says.
+// dialog, goes where it says when that is a configured S-CSCF.
 func TestRequestsWithARouteOrInADialogAreForwardedWithoutAskingTheHSS(t *testing.T) {
+	route := "Route: <" + scscfURI + ";lr>"
 	cases := []struct {
 		name string
 		req  *sip.Request
 	}{
-		{"Route left", invite(t, impu1, "Route: <sip:scscf.rcs.local;lr>")},
-		{"in a dialog", invite(t, impu1, "To: <"+impu1+">;tag=t1")},
-		{"ACK in a dialog", request(t, "ACK", "sip:192.0.2.20", "To: <"+impu1+">;tag=t1", "CSeq: 1 ACK")},
+		{"Route left", invite(t, impu1, route)},
+		{"Route left, the host in capitals", invite(t, impu1, "Route: <sip:SCSCF.rcs.local:5060;transport=TCP;lr>")},
+		{"in a dialog", invite(t, impu1, "To: <"+impu1+">;tag=t1", route)},
+		{"in a dialog to the S-CSCF itself", invite(t, scscfURI, "To: <"+impu1+">;tag=t1")},
+		{"ACK in a dialog", request(t, "ACK", "sip:192.0.2.20", "To: <"+impu1+">;tag=t1", "CSeq: 1 ACK", route)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -165,6 +169,43 @@ func TestRequestsWithARouteOrInADialogAreForwardedWithoutAskingTheHSS(t *testing
 	}
 }
 
+// #337: the next hop of a routed request must be a configured S-CSCF as it
+// is reached, scheme, host, port and transport; anything else is refused
+// 403, and a request that comes back through this I-CSCF is a loop, 482.
+func TestARoutedRequestGoesOnlyToAConfiguredSCSCF(t *testing.T) {
+	self := "sip:icscf.rcs.local:5060;lr"
+	cases := []struct {
+		name   string
+		req    *sip.Request
+		status int
+	}{
+		{"a Route to another host", invite(t, impu1, "Route: <sip:192.0.2.66:5060;transport=tcp;lr>"), 403},
+		{"a Route to the S-CSCF on another port", invite(t, impu1, "Route: <sip:scscf.rcs.local:5070;transport=tcp;lr>"), 403},
+		{"a Route to the S-CSCF over another transport", invite(t, impu1, "Route: <sip:scscf.rcs.local:5060;lr>"), 403},
+		{"a Route to the S-CSCF with another scheme", invite(t, impu1, "Route: <sips:scscf.rcs.local:5060;transport=tcp;lr>"), 403},
+		{"a Route that is not SIP", invite(t, impu1, "Route: <tel:+15550100001>"), 403},
+		{"in a dialog to a client", invite(t, impu1, "To: <"+impu1+">;tag=t1"), 403},
+		{"ACK in a dialog to a client", request(t, "ACK", "sip:192.0.2.20", "To: <"+impu1+">;tag=t1", "CSeq: 1 ACK"), 403},
+		{"a Route back to this I-CSCF", invite(t, impu1, "Route: <"+self+">"), 482},
+		{"a Route that comes back further down", invite(t, impu1, "Route: <"+scscfURI+";lr>, <"+self+">"), 482},
+		{"in a dialog to this I-CSCF", invite(t, "sip:icscf.rcs.local:5060", "To: <"+impu1+">;tag=t1"), 482},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newRig(t, func(c *Config) { c.Self = []sip.URI{mustURI(self)} })
+			if got := describe(t, g.route(tc.req)); got.status != tc.status {
+				t.Errorf("decision = %+v, want %d", got, tc.status)
+			}
+			if n := g.hss.calls(); n != 0 {
+				t.Errorf("the HSS got %d requests, want none", n)
+			}
+			if names := g.metrics.names(); !slices.Equal(names, []string{"icscf.routed." + strconv.Itoa(tc.status)}) {
+				t.Errorf("metrics = %v", names)
+			}
+		})
+	}
+}
+
 // §5.3.2.1: P-Profile-Key is discarded in requests and responses.
 func TestPProfileKeyIsRemovedFromForwardedRequestsAndResponses(t *testing.T) {
 	cases := []struct {
@@ -173,7 +214,7 @@ func TestPProfileKeyIsRemovedFromForwardedRequestsAndResponses(t *testing.T) {
 	}{
 		{"terminating", invite(t, impu1, "P-Profile-Key: <sip:!.*!@"+home+">")},
 		{"register", register(t, "P-Profile-Key: <sip:!.*!@"+home+">")},
-		{"routed", invite(t, impu1, "P-Profile-Key: <sip:!.*!@"+home+">", "Route: <sip:scscf.rcs.local;lr>")},
+		{"routed", invite(t, impu1, "P-Profile-Key: <sip:!.*!@"+home+">", "Route: <"+scscfURI+";lr>")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

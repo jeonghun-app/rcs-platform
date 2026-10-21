@@ -17,8 +17,11 @@ the mapping of every HSS answer to a SIP response with its clause;
   S-CSCF becomes the topmost Route. A `user=phone` SIP URI is looked up, and
   forwarded, as its tel URI.
 - **A request with a Route left, or inside a dialog**: forwarded where it
-  says, without the HSS. `icscf` inserts no Record-Route, so dialogs do not
-  pass it.
+  says, without the HSS, when its next hop (the first Route left, or the
+  Request-URI) is a configured S-CSCF as it is reached: the same scheme,
+  host, port and transport. Any other next hop gets 403, and a request whose
+  Route names `icscf` again gets 482 (#337). `icscf` inserts no
+  Record-Route, so dialogs do not pass it.
 - **When the HSS cannot be asked**, or answers that it could not do it
   (`DIAMETER_UNABLE_TO_COMPLY`, a store failure): 480 with `Retry-After`
   (`ICSCF_RETRY_AFTER`). When the S-CSCF cannot be reached: 500 with the same

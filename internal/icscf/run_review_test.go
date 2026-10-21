@@ -460,3 +460,30 @@ func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)
 	}
 }
+
+// #337, through Run: a routed request goes on to the configured S-CSCF, one
+// for another next hop is refused 403, and one whose Route comes back to
+// this I-CSCF by its service name is refused 482.
+func TestARoutedRequestIsCheckedThroughRun(t *testing.T) {
+	hss := startHSS(t)
+	scscf := startSCSCF(t)
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}})
+	r.waitReady(t)
+	self := fmt.Sprintf("<sip:icscf.rcs.local:%d;lr>", r.core.Port())
+	from, to := "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">;tag=t1"
+	for _, tc := range []struct {
+		name, route string
+		want        int
+	}{
+		{"to the S-CSCF", "Route: <" + scscf.uri() + ";lr>", 200},
+		{"elsewhere", "Route: <sip:192.0.2.66:5060;transport=tcp;lr>", 403},
+		{"back to this I-CSCF", "Route: <" + scscf.uri() + ";lr>, " + self, 482},
+	} {
+		if res := r.send(t, "MESSAGE", tel1, from, to, tc.route); res.StatusCode != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, res.StatusCode, tc.want)
+		}
+	}
+	if n := len(hss.commands()); n != 0 {
+		t.Errorf("the HSS got %d requests, want none", n)
+	}
+}
