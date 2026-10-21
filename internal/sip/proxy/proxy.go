@@ -343,7 +343,7 @@ func (p *Proxy) Drain(ctx context.Context) int {
 			// #310). The last answers may still sit in the transport's
 			// queues.
 			p.stopping.Store(true)
-			p.flushSender(time.Now().Add(DrainSendWait))
+			p.flushSender(time.Now().Add(drainSendWait))
 			return 0
 		}
 		select {
@@ -382,6 +382,17 @@ func (p *Proxy) openContexts() []*respContext {
 // stop margin must leave room for it.
 const DrainSendWait = 2 * time.Second
 
+// drainSendWait is DrainSendWait, which a test lengthens to show that
+// something else ends the wait.
+var drainSendWait = DrainSendWait
+
+// drainFlushStall is how long flushSender waits for the transport's queues
+// to shrink before it gives up on what they hold: a peer that has stopped
+// reading takes none of it before the Close drops it, and would otherwise
+// keep a stop waiting the whole DrainSendWait, most of the stop margin (QA of
+// #366). A peer that reads takes a message well within it, however slowly.
+const drainFlushStall = 500 * time.Millisecond
+
 // answerForStop answers every request still without a final response, and
 // waits until the answers have gone out, so that a Close right after does
 // not drop them: handed to the sender, and with a *transport.Transport,
@@ -399,7 +410,7 @@ func (p *Proxy) answerForStop() int {
 			}
 		}
 	}
-	deadline := time.Now().Add(DrainSendWait)
+	deadline := time.Now().Add(drainSendWait)
 	for _, ch := range sent {
 		select {
 		case <-ch:
@@ -413,14 +424,24 @@ func (p *Proxy) answerForStop() int {
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
-// write what its send queues hold: its Close drops it.
+// write what its send queues hold: its Close drops it. It stops waiting for
+// the queues once they have not shrunk for drainFlushStall.
 func (p *Proxy) flushSender(deadline time.Time) {
 	for p.cancelsSending.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if tr, ok := p.sender.(*transport.Transport); ok {
-		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
+	tr, ok := p.sender.(*transport.Transport)
+	if !ok {
+		return
+	}
+	// Only a fall counts: new output queued meanwhile is not progress.
+	low, since := tr.Stats().QueuedBytes, time.Now()
+	for low > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		if n := tr.Stats().QueuedBytes; n < low {
+			low, since = n, time.Now()
+		} else if time.Since(since) >= drainFlushStall {
+			return
 		}
 	}
 }
