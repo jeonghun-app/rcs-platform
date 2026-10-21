@@ -432,3 +432,33 @@ func TestAnOverloadedNextHopReachesTheCallerAs503WithOneRetryAfter(t *testing.T)
 		t.Error("an overloaded next hop was counted unreachable")
 	}
 }
+
+// Code review of #311: at the byte floor, a request at the transport's
+// limits, about 14 KiB of header and a 1 MiB body, still fits both the
+// layer's bound and the proxy's.
+func TestTheLargestRequestFitsAtTheByteFloor(t *testing.T) {
+	g := &proxied{rig: newRig(t), clock: &fakeClock{}, net: &fakeNet{}}
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 20000, MaxServerTransactionBytes: minServerTransactionBytes})
+	tcfg.Clock = g.clock
+	p, err := proxy.New(g.net, proxy.Config{
+		Self:            []sip.URI{mustURI("sip:icscf.rcs.local;lr")},
+		Router:          g.r,
+		Resolver:        resolver{},
+		Transaction:     tcfg,
+		MaxContexts:     contexts,
+		MaxContextBytes: bytes,
+		Rand:            &lockedReader{r: rand.NewChaCha8([32]byte{1})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.p = p
+	t.Cleanup(p.Close)
+	m := request(t, "MESSAGE", impu1, "X-Pad: "+strings.Repeat("x", 14<<10))
+	m.Body = make([]byte, sip.DefaultMaxBodyBytes)
+	g.receive(m)
+	waitFor(t, "the MESSAGE downstream", func() bool { return len(g.net.sent()) == 1 })
+	if ls, ps := p.Layer().Stats(), p.Stats(); ls.ServerTransactionsRejected != 0 || ps.Overloaded != 0 {
+		t.Fatalf("layer %+v, proxy %+v: refused at the floor", ls, ps)
+	}
+}

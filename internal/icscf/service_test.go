@@ -136,7 +136,7 @@ func TestConfigureRefusesWhatCannotWork(t *testing.T) {
 		"a count that is not a number":  with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "many"),
 		"no server transaction bytes":   with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "0"),
 		// One byte short of the largest request icscf reads.
-		"bytes below one request": with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1064959"),
+		"bytes below one request": with(devEnv, "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "2097151"),
 	}
 	for name, env := range cases {
 		if _, err := configure(env); err == nil {
@@ -213,8 +213,8 @@ func TestABudgetJustUnderTimerFIsAccepted(t *testing.T) {
 // The largest transaction count the layer takes is accepted, and a byte
 // bound of exactly one largest request (16 KiB of header, 1 MiB of body).
 func TestTheTransactionCapBoundsAreAccepted(t *testing.T) {
-	if _, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000000", "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1064960")); err != nil {
-		t.Fatalf("10^6 transactions and 1064960 bytes refused: %v", err)
+	if _, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000000", "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "2097152")); err != nil {
+		t.Fatalf("10^6 transactions and 2097152 bytes refused: %v", err)
 	}
 	// QA of #311: the count's floor is 1.
 	if c, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1")); err != nil || c.MaxServerTransactions != 1 {

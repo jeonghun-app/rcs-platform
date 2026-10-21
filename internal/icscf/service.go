@@ -11,7 +11,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
-	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
@@ -44,9 +43,13 @@ const (
 	// stopMargin is what Run needs after the drain to close the proxy, the
 	// transport and the Cx client, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
-	// minServerTransactionBytes is the largest request icscf's transport
-	// reads, its default header and body limits together.
-	minServerTransactionBytes = sip.DefaultMaxHeaderBytes + sip.DefaultMaxBodyBytes
+	// minServerTransactionBytes is room for the largest request icscf's
+	// transport reads (its default header and body limits) as either bound
+	// charges it: the proxy counts the body and its header four times (two
+	// for the context, two for its one branch), more than the layer's
+	// request plus its per-header overhead. 2 MiB leaves room for both
+	// (code review of #311).
+	minServerTransactionBytes = 2 << 20
 )
 
 // ServiceConfig is icscf's configuration (docs/icscf.md), read by Configure
@@ -199,7 +202,7 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	// limits) would refuse that request however idle icscf is (code review
 	// of #311).
 	if c.MaxServerTransactionBytes < minServerTransactionBytes {
-		e.Invalid("MAX_SERVER_TRANSACTION_BYTES", "must be at least "+strconv.Itoa(minServerTransactionBytes)+", the largest request icscf reads")
+		e.Invalid("MAX_SERVER_TRANSACTION_BYTES", "must be at least "+strconv.Itoa(minServerTransactionBytes)+" (2 MiB), room for the largest request icscf reads")
 	}
 	// A REGISTER waits for a UAR, an attempt and its retry on another HSS
 	// task, then for a connection to the S-CSCF, and then for its answer:
