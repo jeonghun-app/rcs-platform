@@ -115,6 +115,9 @@ const (
 type branch struct {
 	c      *respContext
 	target Target
+	// breadth is the branch's share of the request's Max-Breadth, held
+	// until it is final (RFC 5393 §5.3.3.1).
+	breadth int
 
 	// Guarded by c.mu.
 	tx *transaction.ClientTransaction
@@ -492,19 +495,41 @@ func (c *respContext) allFinal() bool {
 // the layer's safety timer starts again (#156): each fork group and each
 // replacement gets its own Timer C or F before the layer answers for the
 // proxy. mu must be held.
+//
+// The branches started together share what the request's Max-Breadth leaves
+// beside the branches still without a final response, at least 1 each (RFC
+// 5393 §5.3.3): a target beyond that fails at once as 440 Max-Breadth
+// Exceeded, the answer when no other branch does better.
 func (c *respContext) startBranches(targets []Target) []func() {
 	var acts []func()
 	started := false
+	var fresh []Target
 	for _, t := range targets {
-		if slices.ContainsFunc(c.branches, func(b *branch) bool { return sameTarget(b.target, t) }) {
+		if slices.ContainsFunc(c.branches, func(b *branch) bool { return sameTarget(b.target, t) }) ||
+			slices.ContainsFunc(fresh, func(f Target) bool { return sameTarget(f, t) }) {
 			continue
 		}
-		if len(c.branches) >= c.p.maxBranch {
+		if len(c.branches)+len(fresh) >= c.p.maxBranch {
 			c.p.stats.targetsDropped.Add(1)
 			continue
 		}
-		b := &branch{c: c, target: t}
+		fresh = append(fresh, t)
+	}
+	free := incomingBreadth(c.in.Message)
+	for _, b := range c.branches {
+		if !b.final {
+			free -= b.breadth
+		}
+	}
+	shares := breadthShares(free, len(fresh))
+	for i, t := range fresh {
+		b := &branch{c: c, target: t, breadth: shares[i]}
 		c.branches = append(c.branches, b)
+		if b.breadth == 0 {
+			c.p.stats.breadthExceeded.Add(1)
+			acts = append(acts, c.branchEnded(b, c.failureResponse(errMaxBreadth), errMaxBreadth)...)
+			continue
+		}
 		// Each branch holds a copy of the header (the body is shared) and its
 		// CANCEL.
 		cost := 2 * c.header
@@ -543,6 +568,25 @@ func sameTarget(a, b Target) bool {
 // errOverload fails a branch that would take the proxy past MaxContextBytes.
 var errOverload = errors.New("proxy: over the memory budget")
 
+// errMaxBreadth fails a branch the request's Max-Breadth leaves no share for
+// (RFC 5393 §5.3.3).
+var errMaxBreadth = errors.New("proxy: no Max-Breadth left for the branch")
+
+// breadthShares splits free Max-Breadth among n branches started together,
+// as evenly as it goes, the first ones taking what is left over; the
+// branches past free get 0.
+func breadthShares(free, n int) []int {
+	shares := make([]int, n)
+	k := min(n, max(free, 0))
+	for i := range k {
+		shares[i] = free / k
+		if i < free%k {
+			shares[i]++
+		}
+	}
+	return shares
+}
+
 // start builds and sends the branch's request (§16.6), on a goroutine of its
 // own since resolving, Prepare and the send itself can block.
 func (b *branch) start() {
@@ -555,7 +599,7 @@ func (b *branch) start() {
 		return
 	}
 	c.mu.Unlock()
-	fwd, dst, err := p.buildBranch(c.ctx, c.in, &c.dec, b.target, true)
+	fwd, dst, err := p.buildBranch(c.ctx, c.in, &c.dec, b.target, true, b.breadth)
 	if err == nil {
 		err = b.addVia(fwd, dst)
 	}
@@ -687,6 +731,8 @@ func (c *respContext) failureResponse(err error) final {
 	switch {
 	case errors.Is(err, errPrepare):
 		return c.made(500)
+	case errors.Is(err, errMaxBreadth):
+		return c.made(440)
 	case errors.Is(err, transport.ErrNoFlow):
 		// RFC 5626 §5.3.1: the flow the target was registered over is gone.
 		return c.made(430)

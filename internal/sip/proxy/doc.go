@@ -8,7 +8,7 @@
 // transaction.Layer it owns, and for every request the layer passes up it:
 //
 //   - validates it (§16.3): the Request-URI scheme (416), Max-Forwards (483),
-//     loops (482) and Proxy-Require (420);
+//     a malformed Max-Breadth (400), loops (482) and Proxy-Require (420);
 //   - preprocesses its Route (§16.4): it undoes a strict router's rewrite and
 //     removes the Route values naming itself (Config.Self), two in a row when
 //     it recorded two (RFC 5658 §5), and hands them to the Router;
@@ -20,7 +20,12 @@
 //     keyed loop-detection hash (RFC 5393 §4.2), the Record-Route values of
 //     the decision, the routes of the target, and Decision.Prepare's changes;
 //   - forks: targets of equal q in parallel, lower q only once every higher
-//     one has failed;
+//     one has failed. The parallel branches share the request's Max-Breadth
+//     (RFC 5393 §5): its own, at most MaxBreadth (60), or 60 when it has
+//     none, split among the branches that go out together and carried in
+//     each, a branch's share free again once it is final; a target with no
+//     share left fails at once as 440 Max-Breadth Exceeded, the answer when
+//     no other branch does better;
 //   - forwards provisional responses and every 2xx at once and keeps the
 //     other finals, then sends the best of them (§16.7): a 6xx over all, then
 //     the lowest class, preferring 401, 407, 415, 420 and 484 within 4xx, with

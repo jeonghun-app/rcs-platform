@@ -43,6 +43,18 @@ func (h *Header) MaxForwards() (int, error) {
 	})
 }
 
+// MaxBreadth returns the Max-Breadth value, a positive integer (RFC 5393
+// §5.3.1).
+func (h *Header) MaxBreadth() (int, error) {
+	return singleOf(h, "Max-Breadth", func(s string) (int, error) {
+		n, ok := parseDelta(s)
+		if !ok || n == 0 {
+			return 0, syntaxError("invalid Max-Breadth")
+		}
+		return int(min(n, 1<<20)), nil
+	})
+}
+
 // Contact returns the Contact elements. A "*" contact is returned alone with Star
 // set; "*" mixed with addresses is malformed.
 func (h *Header) Contact() (Contacts, error) {
