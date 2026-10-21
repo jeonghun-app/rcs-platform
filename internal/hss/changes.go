@@ -183,7 +183,8 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	// its deadline, behind another task's writes, still leaves the RTR some.
 	uctx, cancel := ctx, context.CancelFunc(func() {})
 	if d, ok := ctx.Deadline(); ok {
-		uctx, cancel = context.WithDeadline(ctx, time.Now().Add(time.Until(d)/2))
+		now := time.Now()
+		uctx, cancel = context.WithDeadline(ctx, now.Add(d.Sub(now)/2))
 	}
 	defer cancel()
 	_, err := h.update(uctx, s.IMPI, func(cur *store.Subscription) error {

@@ -32,9 +32,20 @@ type relayStack struct {
 	posted  chan struct{}
 	release chan struct{}
 	block   atomic.Bool
+	// svc is the running pcscf, and icscf the node alice registered
+	// through.
+	svc   *service
+	icscf *fakeCoreNode
 }
 
 func startRelayStack(t *testing.T, scscfAnswer func(*sip.Request) string, relayTimeout time.Duration, d deps) *relayStack {
+	t.Helper()
+	return startRelayStackAt(t, scscfAnswer, relayTimeout, d, nil)
+}
+
+// startRelayStackAt is startRelayStack with the control API at relayURL,
+// or scripted if it is nil.
+func startRelayStackAt(t *testing.T, scscfAnswer func(*sip.Request) string, relayTimeout time.Duration, d deps, relayURL *url.URL) *relayStack {
 	t.Helper()
 	st := &relayStack{posted: make(chan struct{}, 16), release: make(chan struct{})}
 	st.relay = &scriptedRelay{bodies: map[int]map[string]any{}}
@@ -58,11 +69,15 @@ func startRelayStack(t *testing.T, scscfAnswer func(*sip.Request) string, relayT
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	cfg.SCSCFPort = scscfPort
 	cfg.RelayURL, _ = url.Parse(srv.URL)
+	if relayURL != nil {
+		cfg.RelayURL = relayURL
+	}
 	cfg.RelayToken = relayToken{testRelayToken}
 	cfg.RelayTimeout = relayTimeout
 	d.lookup = icscfLookup("127.0.0.1")
 	d.started = func(p *pcscf) { st.pc = p }
 	s := start(t, cfg, d)
+	st.svc, st.icscf = s, icscf
 	st.c = dial(t, s.client, nil)
 	_ = st.c.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(st.c.nc, registerText(outboundContact, "Supported: outbound")); err != nil {
