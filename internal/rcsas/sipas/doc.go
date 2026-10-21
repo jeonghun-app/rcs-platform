@@ -23,8 +23,15 @@
 //     served in it: session timers as RFC 4028 has a UAS that never
 //     refreshes, and a leg that never moves.
 //   - scscf's third-party REGISTER tells the engine a user registered.
-//   - Every other method is refused with 405; the group chat focus comes in
-//     a later part of #137.
+//   - A request to the conference factory or to a conference URI is a group
+//     chat's, told apart before anything else, so that none is taken for a
+//     1-to-1 chat: an INVITE to the factory with a resource list creates the
+//     group (group.Service.Create) and has the focus invite its members, one
+//     to a conference URI joins it (Join). rcs-as is the focus of every
+//     session with a group: its Contact is the conference URI, marked
+//     isfocus (RFC 4579). The conference event package and REFER come in a
+//     later part of #137.
+//   - Every other method is refused with 405.
 //
 // Server is also the engine's Deliverer. Pager sends a MESSAGE to scscf
 // (Config.Core) as a terminating request: without the orig parameter, and

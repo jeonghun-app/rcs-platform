@@ -267,11 +267,15 @@ func TestFlowIdleTimeoutCanBeLengthened(t *testing.T) {
 
 // Lengthening an idle period that is already running, as pcscf does on the
 // registrar's 200 (#318 reviews), moves its deadline later, counted from the
-// period's start. The connection records the deadlines instead of applying
-// them, so no deadline can pass however slow the host is.
+// period's start. The connection records the read deadlines instead of
+// applying them, and the peer reads what the OPTIONS writes, so no deadline
+// can pass however slow the host is.
 func TestARunningIdlePeriodCanBeLengthened(t *testing.T) {
 	server, peer := net.Pipe()
 	t.Cleanup(func() { peer.Close() })
+	// Without a reader the OPTIONS would sit in the pipe until its write
+	// deadline closed the flow (review of #318).
+	go func() { _, _ = io.Copy(io.Discard, peer) }()
 	conn := &readDeadlines{Conn: server}
 	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, IdleTimeout: 300 * time.Millisecond})
 	listen(t, tr, ListenerConfig{Network: TCP})

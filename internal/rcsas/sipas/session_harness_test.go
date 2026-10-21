@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
@@ -32,6 +35,33 @@ type chatRig struct {
 	clock   *fakeClock
 	msrp    net.Listener
 	store   store.Store
+	// groups is the group chat focus, on groupStore, whose reads
+	// groupReads counts.
+	groups     *group.Service
+	groupStore *groupstore.Memory
+	groupReads *countingGroups
+}
+
+// countingGroups counts the reads of a groups store, and fails the next
+// failUpdates updates.
+type countingGroups struct {
+	groupstore.Store
+	gets        atomic.Int64
+	failUpdates atomic.Int64
+}
+
+var errFakeStore = errors.New("fake: the store failed")
+
+func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, token string) error {
+	if c.failUpdates.Add(-1) >= 0 {
+		return errFakeStore
+	}
+	return c.Store.Update(ctx, g, token)
+}
+
+func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {
+	c.gets.Add(1)
+	return c.Store.Get(ctx, uri, now)
 }
 
 // recordingEngine is the engine, with the failed invitations recorded.
@@ -94,13 +124,19 @@ func newChatRigStore(t *testing.T, mc messaging.Config, cfg Config, tc transport
 		t.Fatal(err)
 	}
 	r.e = &recordingEngine{Engine: e, failed: make(chan error, 16)}
+	r.groupStore = groupstore.NewMemory()
+	r.groupReads = &countingGroups{Store: r.groupStore}
+	if r.groups, err = group.New(group.Config{ConferenceHost: confHost, HomeDomain: domain, Clock: r.clock},
+		r.groupReads, e, notifier{&a}, r.metrics); err != nil {
+		t.Fatal(err)
+	}
 	if cfg.closeWait == 0 {
 		// Most fake cores leave a BYE unanswered: the test's end need not
 		// wait the 2 s Close gives a real one.
 		cfg.closeWait = 50 * time.Millisecond
 	}
 	cfg.Core, cfg.Clock, cfg.MaxMessageSize, cfg.Metrics = r.core.uri(), r.clock, messaging.DefaultMaxMessageSize, r.metrics
-	a = startASOn(t, r.e, cfg, tc, tune...)
+	a = startASOn(t, r.e, r.groups, cfg, tc, tune...)
 	r.a = a
 	// Closed before the Server's BYEs and the transport, which carries the
 	// answers to the deliveries it waits for.

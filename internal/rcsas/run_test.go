@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
@@ -87,6 +88,14 @@ func startRun(t *testing.T, cfg Config, d deps) netip.AddrPort {
 // the test's end calls it too.
 func startStoppable(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr, func()) {
 	t.Helper()
+	addr, msrpAddr, stop, _ := startStoppableHarness(t, cfg, d)
+	return addr, msrpAddr, stop
+}
+
+// startStoppableHarness is startStoppable, with the runtime harness whose
+// metrics and logs the service writes.
+func startStoppableHarness(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr, func(), *runtimetest.Harness) {
+	t.Helper()
 	cfg.SIPListenAddr = "127.0.0.1:0"
 	// The MSRP port too, which the engine advertises.
 	ml, err := net.Listen("tcp", "127.0.0.1:0")
@@ -98,7 +107,7 @@ func startStoppable(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr,
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
 	done := make(chan error, 1)
-	d.store = store.NewMemory()
+	d.store, d.groups = store.NewMemory(), groupstore.NewMemory()
 	d.listening = func(a netip.AddrPort) { listening <- a }
 	go func() { done <- run(ctx, h.Runtime, cfg, d) }()
 	var once sync.Once
@@ -118,13 +127,13 @@ func startStoppable(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr,
 	t.Cleanup(stop)
 	select {
 	case addr := <-listening:
-		return addr, ml.Addr(), stop
+		return addr, ml.Addr(), stop, h
 	case err := <-done:
 		t.Fatalf("run ended: %v", err)
 	case <-time.After(waitFor):
 		t.Fatal("rcs-as did not start")
 	}
-	return netip.AddrPort{}, nil, nil
+	return netip.AddrPort{}, nil, nil, nil
 }
 
 // rcs-as end to end, with the memory store: a pager-mode MESSAGE from the
@@ -297,7 +306,7 @@ func TestRunServesSessionsAndEndsThemOnShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, msrpAddr, stop := startStoppable(t, cfg, deps{})
+	addr, msrpAddr, stop, h := startStoppableHarness(t, cfg, deps{})
 	nc, err := net.Dial("tcp", addr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -381,7 +390,15 @@ func TestRunServesSessionsAndEndsThemOnShutdown(t *testing.T) {
 				return
 			}
 		case <-deadline:
-			t.Fatal("no BYE on shutdown")
+			// #374: seen once under load, on a tree without #279's
+			// Close fixes. These tell a BYE never sent from one sent
+			// and lost, or not resolved, next time.
+			var b strings.Builder
+			for _, name := range []string{"sip.invite.answered", "sip.bye.sent", "sip.dialog.unsent", "sip.dialog.unresolved", "sip.respond_failed"} {
+				v, _ := h.Metric(name)
+				fmt.Fprintf(&b, " %s=%v", name, v)
+			}
+			t.Fatalf("no BYE on shutdown:%s", b.String())
 		}
 	}
 }
@@ -390,3 +407,81 @@ type nopHandler struct{}
 
 func (nopHandler) HandleMessage(*msrp.Session, *msrp.Message) error { return nil }
 func (nopHandler) HandleReport(*msrp.Session, msrp.Report)          {}
+
+// Run wires the group chat focus: an INVITE to the conference factory
+// (sip:conf-factory@<RCS_IMS_DOMAIN> by default) creates a group, whose
+// conference URI at RCSAS_CONFERENCE_HOST answers as a focus, and the
+// focus invites bob through the core from it.
+func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
+	core := newCoreStub(t)
+	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCSAS_MSRP_HOST", "127.0.0.1",
+		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := startRun(t, cfg, deps{})
+	nc, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nc.Close() })
+	relay := msrp.URI{Host: "127.0.0.1", Port: 9, SessionID: "runrelay2", Transport: "tcp"}
+	offer := "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=message 9 TCP/MSRP *\r\n" +
+		"a=accept-types:message/cpim\r\na=path:" + relay.String() + "\r\na=setup:active\r\na=sendrecv\r\n"
+	list := `<?xml version="1.0" encoding="UTF-8"?><resource-lists xmlns="urn:ietf:params:xml:ns:resource-lists">` +
+		`<list><entry uri="tel:+15550100002"/></list></resource-lists>`
+	body := "--b1\r\nContent-Type: application/sdp\r\n\r\n" + offer + "\r\n--b1\r\nContent-Type: application/resource-lists+xml\r\n" +
+		"Content-Disposition: recipient-list\r\n\r\n" + list + "\r\n--b1--\r\n"
+	factory := "sip:conf-factory@" + devEnv["RCS_IMS_DOMAIN"]
+	var b strings.Builder
+	b.WriteString("INVITE " + factory + " SIP/2.0\r\n")
+	b.WriteString("Via: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-group\r\n")
+	b.WriteString("Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <" + factory + ">\r\n")
+	b.WriteString("Call-ID: rcsas-run-group\r\nCSeq: 1 INVITE\r\nP-Asserted-Identity: <tel:+15550100001>\r\n")
+	b.WriteString("Contact: <sip:" + core.l.Addr().String() + ";transport=tcp>\r\nAccept-Contact: *;+g.oma.sip-im\r\n")
+	b.WriteString("Require: recipient-list-invite\r\nConversation-ID: runconv\r\nContribution-ID: runchat\r\n")
+	fmt.Fprintf(&b, "Content-Type: multipart/mixed;boundary=b1\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	_ = nc.SetDeadline(time.Now().Add(waitFor))
+	if _, err := io.WriteString(nc, b.String()); err != nil {
+		t.Fatal(err)
+	}
+	r := sip.NewReader(bufio.NewReader(nc), sip.Limits{})
+	var res *sip.Response
+	for res == nil {
+		m, err := r.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if x, ok := m.(*sip.Response); ok && x.StatusCode >= 200 {
+			res = x
+		}
+	}
+	contact, err := sip.ParseAddress(res.Header.Get("Contact"))
+	if res.StatusCode != 200 || err != nil || contact.URI.Host != devEnv["RCSAS_CONFERENCE_HOST"] || !contact.Params.Has("isfocus") {
+		t.Fatalf("answered %d, Contact %q", res.StatusCode, res.Header.Get("Contact"))
+	}
+	// The group is established, and its invitees invited, once the 200's
+	// ACK has come.
+	to, _ := res.Header.To()
+	ack := "ACK " + contact.URI.String() + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-group-ack\r\n" +
+		"Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <" + factory + ">;tag=" + to.Tag() + "\r\n" +
+		"Call-ID: rcsas-run-group\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
+	if _, err := io.WriteString(nc, ack); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(waitFor)
+	for {
+		select {
+		case req := <-core.got:
+			if req.Method != "INVITE" {
+				continue
+			}
+			if from, err := req.Header.From(); err != nil || from.URI.String() != contact.URI.String() || req.URI.String() != "tel:+15550100002" {
+				t.Fatalf("INVITE %s from %q", req.URI, req.Header.Get("From"))
+			}
+			return
+		case <-deadline:
+			t.Fatal("the focus invited no one")
+		}
+	}
+}

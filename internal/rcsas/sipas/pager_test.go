@@ -35,12 +35,14 @@ func TestAStoredMessageGoesToTheCoreAsATerminatingRequest(t *testing.T) {
 	req := core.next(t)
 	h := &req.Header
 	for name, want := range map[string]string{
-		"Route":                     "<" + core.uri().String() + ">",
-		"To":                        "<" + bob + ">",
-		"P-Asserted-Identity":       "<" + alice + ">",
-		"P-Served-User":             "<" + bob + ">;sescase=term",
-		"P-Asserted-Service":        messagingICSI,
-		"Accept-Contact":            messagingAcceptTag,
+		"Route":               "<" + core.uri().String() + ">",
+		"To":                  "<" + bob + ">",
+		"P-Asserted-Identity": "<" + alice + ">",
+		"P-Served-User":       "<" + bob + ">;sescase=term",
+		"P-Asserted-Service":  messagingICSI,
+		// Only the contacts that registered the messaging ICSI get it
+		// (RFC 3841, #332).
+		"Accept-Contact":            `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg";require;explicit`,
 		"Conversation-ID":           "c0nv1",
 		"Contribution-ID":           "c0ntr1",
 		"InReplyTo-Contribution-ID": "c0ntr0",
@@ -50,6 +52,9 @@ func TestAStoredMessageGoesToTheCoreAsATerminatingRequest(t *testing.T) {
 		if got := h.Get(name); got != want {
 			t.Errorf("%s: %q, want %q", name, got, want)
 		}
+	}
+	if acs, err := h.AcceptContact(); err != nil || len(acs) != 1 || !acs[0].Require() || !acs[0].Explicit() || len(h.Values("Accept-Contact")) != 1 {
+		t.Errorf("Accept-Contact %q: %+v, %v", h.Values("Accept-Contact"), acs, err)
 	}
 	if req.Method != "MESSAGE" || req.URI.String() != bob || string(req.Body) != cpimBody("m1", "hi") {
 		t.Fatalf("%s %s with %q", req.Method, req.URI.String(), req.Body)

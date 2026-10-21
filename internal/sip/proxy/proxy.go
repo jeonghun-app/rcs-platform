@@ -479,20 +479,37 @@ func (p *Proxy) isClosed() bool {
 
 // spawn runs f on a goroutine of its own, counted for Close.
 func (p *Proxy) spawn(f func()) {
+	p.begin()
+	go func() {
+		defer p.end()
+		f()
+	}()
+}
+
+// counted runs f on the calling goroutine, counted for Close as spawn's
+// goroutines are: for a callback on a goroutine the proxy did not start,
+// such as context.AfterFunc's (#319). It is counted from when it starts, so
+// a wait that returns before then still misses it; what it does checks
+// isClosed first.
+func (p *Proxy) counted(f func()) {
+	p.begin()
+	defer p.end()
+	f()
+}
+
+func (p *Proxy) begin() {
 	p.activeMu.Lock()
 	p.active++
 	p.activeMu.Unlock()
-	go func() {
-		defer func() {
-			p.activeMu.Lock()
-			p.active--
-			if p.active == 0 {
-				p.idle.Broadcast()
-			}
-			p.activeMu.Unlock()
-		}()
-		f()
-	}()
+}
+
+func (p *Proxy) end() {
+	p.activeMu.Lock()
+	p.active--
+	if p.active == 0 {
+		p.idle.Broadcast()
+	}
+	p.activeMu.Unlock()
 }
 
 // wait returns once no goroutine started by spawn is running.
@@ -613,12 +630,22 @@ func (p *Proxy) receiveCancel(tx *transaction.ServerTransaction) {
 		p.reply(tx, 481)
 		return
 	}
-	p.reply(tx, 200)
 	p.mu.Lock()
 	c := p.contexts[invite]
 	p.mu.Unlock()
+	// The request counts as cancelled before its CANCEL is answered, so
+	// that no branch whose Prepare or Resolver is still running is sent
+	// once the client has the 200 (#361). What the CANCEL sets going here
+	// follows the 200; but such a branch, ending unsent meanwhile, may
+	// have the INVITE's 487 written before the 200, which RFC 3261 leaves
+	// unordered, the two being different transactions.
+	var then func()
 	if c != nil {
-		c.cancelUpstream()
+		then = c.cancelUpstream()
+	}
+	p.reply(tx, 200)
+	if then != nil {
+		then()
 	}
 }
 
