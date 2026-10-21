@@ -404,8 +404,14 @@ func TestUploadInfoSettlesThoughAnAnswerComesAfterItsTime(t *testing.T) {
 		_, _ = io.WriteString(w, resumeInfo(20))
 	})
 	info, st, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
-	if held, _ := info.Held(); err != nil || held != 20 || st.Retries != 1 {
-		t.Fatalf("SettledUploadInfo = %v, held %d, %+v", err, held, st)
+	if err != nil {
+		t.Fatalf("SettledUploadInfo = %v after one answer slower than its time, want it settled", err)
+	}
+	if held, _ := info.Held(); held != 20 {
+		t.Fatalf("held %d, want 20", held)
+	}
+	if st.Retries != 1 {
+		t.Fatalf("asked again %d times, want once: the second request confirms", st.Retries)
 	}
 }
 
