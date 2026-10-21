@@ -331,6 +331,8 @@ func (p *Proxy) Drain(ctx context.Context) int {
 	defer tick.Stop()
 	for {
 		if p.inProgress() == 0 {
+			// The last answers may still sit in the transport's queues.
+			p.flushSender(time.Now().Add(drainSendWait))
 			return 0
 		}
 		select {
@@ -388,12 +390,20 @@ func (p *Proxy) answerForStop() int {
 			return int(answered.Load())
 		}
 	}
-	if tr, ok := p.sender.(*transport.Transport); ok && len(sent) > 0 {
+	if len(sent) > 0 {
+		p.flushSender(deadline)
+	}
+	return int(answered.Load())
+}
+
+// flushSender waits, until deadline, for a *transport.Transport sender to
+// write what its send queues hold: its Close drops it.
+func (p *Proxy) flushSender(deadline time.Time) {
+	if tr, ok := p.sender.(*transport.Transport); ok {
 		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	return int(answered.Load())
 }
 
 // drainResponse is the final response Drain gives req (Config.DrainAnswer).

@@ -43,6 +43,10 @@ type respContext struct {
 	// request is cancelled upstream.
 	reqCtx    context.Context
 	cancelReq context.CancelFunc
+	// handed records that a final response has been handed to the server
+	// transaction, by the proxy or by the layer for it: the request is no
+	// longer in progress for Drain, even while its context lingers.
+	handed atomic.Bool
 	// unwatch stops watching the server transaction for the layer's own 500
 	// (layerAnswered).
 	unwatch func() bool
@@ -183,6 +187,7 @@ func (c *respContext) layerAnswered() {
 	if !errors.Is(context.Cause(c.tx.Context()), transaction.ErrNoFinalResponse) || c.p.isClosed() {
 		return
 	}
+	c.handed.Store(true)
 	c.mu.Lock()
 	c.finalSent = true
 	acts := c.closeBranches()
@@ -305,13 +310,15 @@ func (c *respContext) answer(res *sip.Response) {
 }
 
 // inProgress reports whether the request still waits for its final
-// response: none was sent, and a Serve handler has not sent one either (a
-// handler that answered may still wait on its context, for an ACK).
+// response: none has been handed to its transaction, a forwarded one queued
+// for a slow upstream peer included, and a Serve handler has not sent one
+// either (a handler that answered may still wait on its context, for an
+// ACK).
 func (c *respContext) inProgress() bool {
 	c.mu.Lock()
-	open, uas := !c.finalSent && !c.done, c.uas
+	uas := c.uas
 	c.mu.Unlock()
-	return open && (uas == nil || !uas.hasAnswered())
+	return !c.handed.Load() && (uas == nil || !uas.hasAnswered())
 }
 
 // answerForStop answers a request still without a final response 500 with
@@ -378,7 +385,9 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 			if hook != nil {
 				hook(c.ctx, res)
 			}
-			if err := c.tx.Respond(res); err != nil {
+			err := c.tx.Respond(res)
+			c.handed.Store(true)
+			if err != nil {
 				c.p.stats.upstreamErrors.Add(1)
 				return
 			}
@@ -1067,6 +1076,9 @@ func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 		// branches are left alone.
 		if err := c.tx.Respond(res); err != nil {
 			c.p.stats.upstreamErrors.Add(1)
+		}
+		if code >= 200 {
+			c.handed.Store(true)
 		}
 	}
 	switch {

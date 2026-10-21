@@ -3,10 +3,12 @@ package proxy
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // drainFor runs Drain with a deadline d away and returns its result.
@@ -398,4 +400,44 @@ func TestDrainAnswers487ToAnInviteCancelledWhileItsAnswerWasMade(t *testing.T) {
 		}
 	}
 	check(t, "INVITE finals", finals, codes(487))
+}
+
+// A final response forwarded but still queued for the upstream peer, here
+// held by its OnResponse hook, keeps the request in progress: Drain waits
+// until it has been handed over, so a Close right after does not drop it.
+func TestDrainWaitsForAForwardedAnswerStillQueued(t *testing.T) {
+	h := newHarness(t, Config{})
+	holding, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	h.decide(Decision{
+		Targets: []Target{target("sip:bob@192.0.2.2")},
+		OnResponse: func(_ context.Context, res *sip.Response) {
+			if res.StatusCode == 200 {
+				close(holding)
+				<-release
+			}
+		},
+	})
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+	fwd := h.one()
+	done := drainFor(h, time.Hour)
+	h.p.Receive(transport.Inbound{Message: responseTo(t, fwd, 200), Source: downstreamSource})
+	select {
+	case <-holding:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the 200 never reached OnResponse")
+	}
+	select {
+	case <-done:
+		t.Fatal("Drain returned while the 200 was still queued")
+	case <-time.After(300 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return once the 200 was handed over")
+	}
+	check(t, "upstream", h.upstream(), codes(200))
 }
