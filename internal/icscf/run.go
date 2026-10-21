@@ -114,6 +114,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		Transaction:     tcfg,
 		MaxContexts:     maxContexts,
 		MaxContextBytes: maxContextBytes,
+		// A REGISTER left at the stop gets 503, which pcscf retries on
+		// another icscf at once (decided on #310).
+		DrainAnswer: drainAnswer,
 	})
 	if err != nil {
 		return err
@@ -129,22 +132,27 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		d.listening(coreAddr)
 	}
 	<-ctx.Done()
-	drain(px, cfg.DrainTimeout)
+	// The listener stays open meanwhile, since Cloud Map's DNS answers name
+	// this task for their TTL after it is deregistered (review of #276).
+	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)
+	defer cancel()
+	if n := px.Drain(drainCtx); n > 0 {
+		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
+	}
 	return nil
 }
 
-// drain waits, for at most d, until no request is in progress, so a stop
-// does not cut off a REGISTER waiting for the S-CSCF or a ringing INVITE:
-// their senders would get no final response (review of #276). The listener
-// stays open meanwhile, since Cloud Map's DNS answers name this task for
-// their TTL after it is deregistered. A context that lingers after a 2xx to
-// pass its retransmissions on no longer counts, so a stop right after a call
-// returns at once. #281 tracks a drain shared by every proxy.
-func drain(px *proxy.Proxy, d time.Duration) {
-	deadline := time.Now().Add(d)
-	for px.Stats().Contexts > 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+// drainAnswer is what icscf answers a request left in progress at the end
+// of its drain (proxy.Config.DrainAnswer). A REGISTER gets 503 with
+// Retry-After, which pcscf retries on another icscf at once; it never
+// passed through scscf, so the rule that a proxy turns a 503 into a 500
+// (#281) does not apply to it. Everything else gets the proxy's 500 with
+// Retry-After (decided on #310).
+func drainAnswer(req *sip.Request) (int, time.Duration) {
+	if req.Method == "REGISTER" {
+		return 503, transaction.DefaultRetryAfter
 	}
+	return 500, transaction.DefaultRetryAfter
 }
 
 // proxyLimits are the bounds of icscf's proxy: its layer's server
