@@ -138,6 +138,9 @@ func FuzzAnchorSDP(f *testing.F) {
 	f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\nContent-Type: application/sdp\r\n\r\n"+clientChatOffer+"\r\n--b1\r\nContent-Type: message/cpim\r\n\r\nx\r\n--b1--\r\n"))
 	f.Add("application/sdp", []byte(rcsAsAnswer))
 	f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\n\r\n--b1--"))
+	for _, blanks := range []string{" ", "  ", "\t", " \t "} {
+		f.Add("multipart/mixed;boundary=b1", []byte("--b1\r\nContent-Type: application/sdp\r\nContent-Length:"+blanks+"\r\n\r\nv=0\r\n--b1--\r\n"))
+	}
 	f.Fuzz(func(t *testing.T, contentType string, body []byte) {
 		part, found, err := findSDP(contentType, body)
 		if err != nil || !found {
@@ -237,6 +240,9 @@ func FuzzMultipartAgreesWithMIME(f *testing.F) {
 		"--b1\nContent-Type: application/sdp\n\nv=0\n--b1--\n",
 		"--b1\r\nContent-Type: application/sdp; x\r\n\r\nv=0\r\n--b1--\r\n",
 		"--b1\r\nContent-TYpe: AppliCAtion/sdp\r\nContent-Length:\r\n\r\n0\r\n--b1--",
+		"--b1\r\nContent-Type: application/sdp\r\nContent-Length: \r\n\r\nv=0\r\n--b1--\r\n",
+		"--b1\r\nContent-Type: application/sdp\r\nContent-Length: \t \r\n\r\nv=0\r\n--b1--",
+		"--b1\r\nContent-Type: message/cpim\r\nContent-Length:  \r\n\r\nx\r\n--b1\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n--b1--",
 	} {
 		f.Add("b1", []byte(seed))
 	}
