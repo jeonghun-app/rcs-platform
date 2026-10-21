@@ -490,3 +490,57 @@ func wantHeld(t *testing.T, e *env, ahead time.Duration) {
 		}
 	}
 }
+
+// holdFailing fails, while failing, every save of a subscription already
+// saved Terminated: the hold of a final, not the save that ended it.
+type holdFailing struct {
+	*state.Memory
+	mu      sync.Mutex
+	failing bool
+}
+
+func (h *holdFailing) SaveSubscription(ctx context.Context, s *state.Subscription) (*state.Subscription, error) {
+	h.mu.Lock()
+	failing := h.failing
+	h.mu.Unlock()
+	if cur, err := h.Memory.Subscription(ctx, s.ID); failing && err == nil && cur.Terminated {
+		return nil, errThrottled
+	}
+	return h.Memory.SaveSubscription(ctx, s)
+}
+
+// TestAFinalWhoseHoldCannotBeSavedIsLeftToTheSweep (#346 QA): a store
+// failure while the final is held again sends nothing, as the hold is what
+// keeps a sweep from sending it at the same time; the end saved before it
+// stays, and the sweep after its expiry sends the final.
+func TestAFinalWhoseHoldCannotBeSavedIsLeftToTheSweep(t *testing.T) {
+	e := newEnv(t)
+	set := e.registered(binding(1, time.Hour))
+	e.subscribed(e.notifier(1))
+	h := &holdFailing{Memory: e.store, failing: true}
+	s := &sender{}
+	m := &counts{}
+	n := newNotifierWith(t, e, h, s, func(c *Config) { c.Metrics = m })
+	if err := n.Ended(bg, set, Rejected); err != nil {
+		t.Fatal(err)
+	}
+	n.Wait()
+	if len(s.notifies()) != 0 || m.get("regevent.internal_errors") != 1 {
+		t.Fatalf("%d NOTIFYs, %d internal errors; want none and 1", len(s.notifies()), m.get("regevent.internal_errors"))
+	}
+	h.mu.Lock()
+	h.failing = false
+	h.mu.Unlock()
+	e.clock.advance(time.Minute)
+	if _, err := n.Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	n.Wait()
+	got := s.notifies()
+	if len(got) != 1 {
+		t.Fatalf("%d NOTIFYs from the sweep", len(got))
+	}
+	if ss, _ := got[0].Header.SubscriptionState(); ss.State != "terminated" || ss.Reason() != "rejected" {
+		t.Errorf("sent as %+v, want terminated;reason=rejected", ss)
+	}
+}
