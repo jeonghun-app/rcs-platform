@@ -185,6 +185,7 @@ func Registration(impi, impu string, expiries ...time.Duration) *state.Registrat
 func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour, 2*time.Hour)
 	r.Contacts[1].Q = 500
+	r.RegisteredAs = IMPU1
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
 	if saved.Version == 0 {
 		t.Error("a saved registration has version 0")
@@ -369,7 +370,9 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	before1970.Unregistered = time.Date(1969, 12, 31, 0, 0, 0, 0, time.UTC)
 	after9999 := Registration(IMPI1, IMPU1)
 	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999} {
+	registeredAsNonCanonical := Registration(IMPI1, IMPU1, time.Hour)
+	registeredAsNonCanonical.RegisteredAs = "sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999, registeredAsNonCanonical} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}

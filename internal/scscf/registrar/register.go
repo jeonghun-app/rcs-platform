@@ -306,9 +306,14 @@ func (g *Registrar) assign(ctx context.Context, r *register, cur *state.Registra
 			return nil, err
 		}
 	}
-	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings}
+	n := &state.Registration{Key: key, Identities: set.identities, Contacts: bindings, RegisteredAs: r.impu}
 	if cur != nil && cur.Key == key {
 		n.Incarnation, n.Version = cur.Incarnation, cur.Version
+		if registered && cur.RegisteredAs != "" {
+			// The servers were told of the REGISTER that made the
+			// registration, and hear of its end under that identity.
+			n.RegisteredAs = cur.RegisteredAs
+		}
 	}
 	if cur == nil || cur.Key != key || !cur.Deregistering.IsZero() {
 		// A record taken over from a deregistration's lease is a new

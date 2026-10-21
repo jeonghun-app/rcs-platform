@@ -2,6 +2,7 @@ package registrar
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -132,3 +133,40 @@ func TestARefusedRegistrationIsNotTold(t *testing.T) {
 	}
 }
 
+// TestAnEndTheNetworkMadeNamesTheIdentityRegistered (#379 code review and
+// QA): a user who registered another identity of the set than its default
+// one hears of the sweep's or an RTR's end under that identity, which the
+// servers took for registered, and a second device's REGISTER under the
+// default identity does not change it.
+func TestAnEndTheNetworkMadeNamesTheIdentityRegistered(t *testing.T) {
+	for _, how := range []string{"sweep", "RTR"} {
+		t.Run(how, func(t *testing.T) {
+			e := newEnv(t)
+			tp := &recordedThirdParty{}
+			g := e.instance(1, withThirdParty(tp))
+			u := e.akaUser(impi1, impu2, impu3)
+			u.impu = impu3
+			u.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+			wantStatus(t, u.registerWith(g, 600), 200)
+			other := device(u, 2)
+			other.impu = impu2
+			wantStatus(t, other.registerWith(g, 600), 200)
+			if how == "sweep" {
+				e.clock.advance(601 * time.Second)
+				if _, err := g.Sweep(bg, 10); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				wantResult(t, g.HandleRTR(bg, &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}), resultSuccess)
+			}
+			got := tp.got()
+			if len(got) != 3 || got[0].IMPU != impu3 || got[2].Type != ifc.DeRegistration || got[2].IMPU != impu3 {
+				var told []string
+				for _, r := range got {
+					told = append(told, fmt.Sprintf("%d %s", r.Type, r.IMPU))
+				}
+				t.Errorf("told %v, want the end for %s", told, impu3)
+			}
+		})
+	}
+}

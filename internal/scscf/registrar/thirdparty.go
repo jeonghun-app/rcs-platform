@@ -21,8 +21,8 @@ type ThirdParty interface {
 // of.
 type ThirdPartyRegistration struct {
 	// Set is the user's implicit registration set, and IMPU the identity
-	// registered: the REGISTER's, or the set's default one for an end the
-	// network made.
+	// registered: the REGISTER's, or for an end the network made the one
+	// the registration was made with (state.Registration.RegisteredAs).
 	Set  state.SetKey
 	IMPU string
 	Type ifc.RegistrationType
@@ -61,6 +61,10 @@ func (g *Registrar) endedByNetwork(ctx context.Context, before *state.Registrati
 	if len(before.Contacts) == 0 && !before.Unregistered.IsZero() {
 		return
 	}
-	r := ThirdPartyRegistration{Set: before.Key, IMPU: before.Key.IMPU, Type: ifc.DeRegistration, Profile: profile}
+	impu := before.RegisteredAs
+	if impu == "" {
+		impu = before.Key.IMPU
+	}
+	r := ThirdPartyRegistration{Set: before.Key, IMPU: impu, Type: ifc.DeRegistration, Profile: profile}
 	g.cfg.ThirdParty.Registered(ctx, r)
 }
