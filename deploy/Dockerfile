@@ -8,7 +8,7 @@
 # The toolchain matches deploy/toolchain.Dockerfile and the go directive in
 # go.mod; GOTOOLCHAIN=local makes a mismatch fail instead of downloading a
 # different Go at build time.
-FROM golang:1.26.9-alpine3.23@sha256:6750308561953d451210ed1a8086d36c8c8bdcbf672d38d9d0d424b8a7a0216c AS build
+FROM golang:1.26.10-alpine3.23@sha256:a07f231c19b03e6106cf442f02a5bcf262147e744d15b7b5e4b6d81d420c70a0 AS build
 ENV CGO_ENABLED=0 GOFLAGS=-buildvcs=false GOTOOLCHAIN=local
 WORKDIR /src
 
