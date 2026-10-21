@@ -415,6 +415,40 @@ func TestUploadInfoSettlesThoughAnAnswerComesAfterItsTime(t *testing.T) {
 	}
 }
 
+func TestUploadInfoSettlesThoughASlowFirstAnswerHeldNothing(t *testing.T) {
+	// The usual slow answer (QA of #356): the first request comes before
+	// the server has noticed the break and is answered 404 after the
+	// deadline; from then on the server holds 20 bytes. Those are first
+	// seen by a request sent past the deadline, and still settle.
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		if first {
+			time.Sleep(300 * time.Millisecond)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	info, st, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("SettledUploadInfo = %v after a slow 404, want 20 bytes held settled", err)
+	}
+	if held, _ := info.Held(); held != 20 || st.NotHeld != 1 {
+		t.Fatalf("held %d after %d 404s, want 20 after 1", held, st.NotHeld)
+	}
+}
+
 func TestUploadInfoThatNeverHoldsAnythingEndsAsNothingHeld(t *testing.T) {
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
@@ -637,8 +671,10 @@ func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
 	// The deadline as well comes from the clock: the bytes held keep
 	// changing, the clock moves an hour per read and the settle time is
 	// 3 h. The call reads it at 1 h, so the deadline is 4 h; the requests go
-	// at 2, 3, 4 and 5 h, and the fourth, sent past the deadline, ends the
-	// wait (QA on #203; the deadline bounds when a request is sent, #344).
+	// at 2, 3, 4 and 5 h. The fourth, sent past the deadline, is the first
+	// to see its value and gets one quiet time more, to 5.5 h, so the fifth,
+	// at 6 h, ends the wait (QA on #203; the deadline bounds when a request
+	// is sent, #344; one more quiet time, QA of #356).
 	var mu sync.Mutex
 	n := 0
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -661,7 +697,7 @@ func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if n != 4 {
-		t.Fatalf("%d answers, want 4: the deadline was not taken from the clock", n)
+	if n != 5 {
+		t.Fatalf("%d answers, want 5: the deadline was not taken from the clock", n)
 	}
 }
