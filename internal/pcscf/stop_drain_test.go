@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
 // #281: a request of the core still in progress when pcscf stops gets a
@@ -92,5 +93,29 @@ func TestARegisterADrainingICSCFRefusesGoesToAnotherOne(t *testing.T) {
 	}
 	if n := len(icscf.got); n != 2 {
 		t.Fatalf("the icscf tasks got %d REGISTERs, want 2", n)
+	}
+}
+
+// QA of #310: with only one icscf, a REGISTER it refuses while draining
+// (503 with Retry-After) reaches the client as 500 with that Retry-After,
+// so the client knows when to try again; a 504 would not tell it.
+func TestARegisterTheOnlyICSCFRefusesKeepsItsRetryAfter(t *testing.T) {
+	icscf := startCoreNode(t, func(req *sip.Request) string {
+		return strings.Replace(echo200(req), "200 OK", "503 Service Unavailable\r\nRetry-After: 5", 1)
+	})
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1")})
+	res := registerOver(t, dial(t, s.client, nil))
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") != "5" {
+		t.Fatalf("REGISTER: %d with Retry-After %q, want 500 with 5", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
+
+// The wait after the flow drain and the proxy's wait for its answers to go
+// out fit in the stop margin together (QA of #310).
+func TestTheStopWaitsFitTheMargin(t *testing.T) {
+	if answersWait+proxy.DrainSendWait >= stopMargin {
+		t.Fatalf("answersWait %v and the proxy's %v leave nothing of the %v stop margin", answersWait, proxy.DrainSendWait, stopMargin)
 	}
 }

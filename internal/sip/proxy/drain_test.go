@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -440,4 +441,45 @@ func TestDrainWaitsForAForwardedAnswerStillQueued(t *testing.T) {
 		t.Fatal("Drain did not return once the 200 was handed over")
 	}
 	check(t, "upstream", h.upstream(), codes(200))
+}
+
+// A request that arrives once Drain has answered what was left gets the
+// same answer at once, rather than nothing when the proxy closes right
+// after (QA of #310).
+func TestARequestAfterDrainHasAnsweredGetsItsAnswer(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{Targets: []Target{target("sip:bob@192.0.2.2")}})
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+	h.one()
+	if n := <-drainFor(h, 50*time.Millisecond); n != 1 {
+		t.Fatalf("Drain answered %d, want 1", n)
+	}
+	h.upstream()
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKup-late", "Call-ID: call-late@192.0.2.10"))
+	res := h.upstreamResponses()
+	if len(res) != 1 || res[0].StatusCode != 500 || res[0].Header.Get("Retry-After") != "5" {
+		t.Fatalf("a request after the drain got %v, want 500 with Retry-After 5", res)
+	}
+	check(t, "sent", h.sentMethods(), nil)
+}
+
+// However many answers cannot go out, Drain gives them DrainSendWait in all,
+// not each (QA of #310).
+func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{Targets: []Target{target("sip:bob@192.0.2.2")}})
+	for i := range 5 {
+		h.receive(request(t, "MESSAGE", "sip:bob@example.com", fmt.Sprintf("Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKup-stall%d", i), fmt.Sprintf("Call-ID: stall-%d@192.0.2.10", i)))
+	}
+	h.sent()
+	stall := make(chan struct{})
+	h.net.mu.Lock()
+	h.net.stallUpstream = stall
+	h.net.mu.Unlock()
+	t.Cleanup(func() { close(stall) })
+	start := time.Now()
+	<-drainFor(h, 50*time.Millisecond)
+	if took := time.Since(start); took < DrainSendWait || took > DrainSendWait+time.Second {
+		t.Fatalf("Drain returned after %v, want about %v after its 50 ms", took, DrainSendWait)
+	}
 }

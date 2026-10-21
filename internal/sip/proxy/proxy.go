@@ -124,6 +124,13 @@ type Proxy struct {
 	ids    sip.IDGenerator
 	// drainAns is Config.DrainAnswer.
 	drainAns func(*sip.Request) (int, time.Duration)
+	// stopping is set once Drain has answered what was left: a request
+	// that arrives after that gets the same answer at once, before the
+	// Close that follows (QA of #310).
+	stopping atomic.Bool
+	// cancelsSending counts the CANCELs on their way to the transaction
+	// layer, which Drain waits for.
+	cancelsSending atomic.Int64
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
@@ -332,7 +339,7 @@ func (p *Proxy) Drain(ctx context.Context) int {
 	for {
 		if p.inProgress() == 0 {
 			// The last answers may still sit in the transport's queues.
-			p.flushSender(time.Now().Add(drainSendWait))
+			p.flushSender(time.Now().Add(DrainSendWait))
 			return 0
 		}
 		select {
@@ -365,24 +372,30 @@ func (p *Proxy) openContexts() []*respContext {
 	return all
 }
 
-// drainSendWait bounds how long Drain waits for its answers to be handed to
-// the transport, which waits at most its WriteTimeout for a slow peer, and
-// then written.
-const drainSendWait = 2 * time.Second
+// DrainSendWait bounds how long Drain waits, after the requests it waited
+// for, for the answers and CANCELs to be handed to the transport, which waits
+// at most its WriteTimeout for a slow peer, and then written. A service's
+// stop margin must leave room for it.
+const DrainSendWait = 2 * time.Second
 
 // answerForStop answers every request still without a final response, and
 // waits until the answers have gone out, so that a Close right after does
 // not drop them: handed to the sender, and with a *transport.Transport,
 // whose Close drops what its send queues still hold, written as well.
 func (p *Proxy) answerForStop() int {
+	// From here on a new request is answered as it arrives (Request). One
+	// that got its context just before is caught by the second pass.
+	p.stopping.Store(true)
 	var answered atomic.Int64
 	var sent []<-chan struct{}
-	for _, c := range p.openContexts() {
-		if ch := c.answerForStop(&answered); ch != nil {
-			sent = append(sent, ch)
+	for range 2 {
+		for _, c := range p.openContexts() {
+			if ch := c.answerForStop(&answered); ch != nil {
+				sent = append(sent, ch)
+			}
 		}
 	}
-	deadline := time.Now().Add(drainSendWait)
+	deadline := time.Now().Add(DrainSendWait)
 	for _, ch := range sent {
 		select {
 		case <-ch:
@@ -390,15 +403,17 @@ func (p *Proxy) answerForStop() int {
 			return int(answered.Load())
 		}
 	}
-	if len(sent) > 0 {
-		p.flushSender(deadline)
-	}
+	p.flushSender(deadline)
 	return int(answered.Load())
 }
 
-// flushSender waits, until deadline, for a *transport.Transport sender to
+// flushSender waits, until deadline, for the CANCELs on their way to be
+// handed to the transaction layer, and for a *transport.Transport sender to
 // write what its send queues hold: its Close drops it.
 func (p *Proxy) flushSender(deadline time.Time) {
+	for p.cancelsSending.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if tr, ok := p.sender.(*transport.Transport); ok {
 		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
@@ -490,6 +505,16 @@ func (p *Proxy) wait() {
 func (p *Proxy) Request(tx *transaction.ServerTransaction) {
 	if tx.Request().Method == "CANCEL" {
 		p.receiveCancel(tx)
+		return
+	}
+	if p.stopping.Load() {
+		// Drain has answered everything else: this one is answered as they
+		// were, statelessly, before the proxy closes.
+		if res, err := p.drainResponse(tx.Request()); err == nil {
+			if err := tx.Respond(res); err != nil {
+				p.stats.upstreamErrors.Add(1)
+			}
+		}
 		return
 	}
 	c := p.newContext(tx)

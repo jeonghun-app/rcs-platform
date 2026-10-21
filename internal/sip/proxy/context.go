@@ -936,8 +936,12 @@ func (b *branch) sendCancel() []func() {
 	if cancel == nil {
 		return nil
 	}
+	// Counted until handed to the transaction layer, so Drain can wait for
+	// it before a Close.
+	p.cancelsSending.Add(1)
 	return []func(){func() {
 		p.spawn(func() {
+			defer p.cancelsSending.Add(-1)
 			// The CANCEL's own transaction ends by itself and its response
 			// tells the proxy nothing it acts on. If it cannot be sent, the
 			// 64*T1 timer still ends the INVITE.
