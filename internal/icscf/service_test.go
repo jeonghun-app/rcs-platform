@@ -216,6 +216,10 @@ func TestTheTransactionCapBoundsAreAccepted(t *testing.T) {
 	if _, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1000000", "ICSCF_MAX_SERVER_TRANSACTION_BYTES", "1064960")); err != nil {
 		t.Fatalf("10^6 transactions and 1064960 bytes refused: %v", err)
 	}
+	// QA of #311: the count's floor is 1.
+	if c, err := configure(with(devEnv, "ICSCF_MAX_SERVER_TRANSACTIONS", "1")); err != nil || c.MaxServerTransactions != 1 {
+		t.Fatalf("one transaction: %v, %d", err, c.MaxServerTransactions)
+	}
 }
 
 // The proxy allows as many contexts as the layer allows server transactions,
