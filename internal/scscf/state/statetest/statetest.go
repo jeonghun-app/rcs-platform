@@ -103,6 +103,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
 		{"AttemptsAreCountedOnceAcrossInstances", testAttemptCounts},
 		{"NoClientCanTakeAnAttemptCount", testAttemptCountNotAChallenge},
+		{"AnIFCPositionIsTakenUpByOneSideAcrossInstances", testODIClaims},
 		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
 		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
 		{"ASaveFromBeforeAKeepIdentityCannotUndoIt", testIdentityKeepNeverUndone},

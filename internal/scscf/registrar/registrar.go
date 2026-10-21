@@ -52,6 +52,10 @@ const (
 	DefaultFlowChallengeLimit           = 3
 	DefaultRegisteredFlowChallengeLimit = 6
 	DefaultResyncLimit                  = 3
+	// DefaultUnregisteredTTL is how long an unregistered user's profile is
+	// kept after SAR UNREGISTERED_USER, for the terminating requests that
+	// follow (state.Registration.Unregistered).
+	DefaultUnregisteredTTL = time.Hour
 )
 
 // Config configures a Registrar.
@@ -95,6 +99,9 @@ type Config struct {
 	// ResyncLimit bounds the resynchronisations of one IMPI in a
 	// ChallengeLifetime, those of its registered UE's flow apart.
 	ResyncLimit int
+	// UnregisteredTTL is how long an unregistered user's record lasts
+	// (Unregistered); DefaultUnregisteredTTL when 0.
+	UnregisteredTTL time.Duration
 	// TrustIntegrityProtected lets a re-registration whose Authorization
 	// carries integrity-protected="tls-yes" go without a challenge (TS 24.229
 	// §5.4.1.2.1). It needs a P-CSCF that sets the parameter itself, for a
@@ -194,6 +201,9 @@ func New(cfg Config) (*Registrar, error) {
 	}
 	if cfg.ResyncLimit <= 0 {
 		cfg.ResyncLimit = DefaultResyncLimit
+	}
+	if cfg.UnregisteredTTL <= 0 {
+		cfg.UnregisteredTTL = DefaultUnregisteredTTL
 	}
 	switch {
 	case cfg.MinExpires > cfg.MaxExpires || cfg.DefaultExpires < cfg.MinExpires || cfg.DefaultExpires > cfg.MaxExpires:
