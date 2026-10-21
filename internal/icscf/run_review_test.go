@@ -25,8 +25,13 @@ import (
 // QA [major] 1: a stop (Run's ctx ends, as on SIGTERM) while a REGISTER and
 // a ringing INVITE are at the S-CSCF lets both final responses reach the
 // sender.
+//
+// The S-CSCF answers only once the stop has begun, and the drain has a
+// minute, so a loaded host cannot turn the 200s into the drain's 500s
+// (#411).
 func TestAStopLetsTheTransactionsInFlightFinish(t *testing.T) {
-	scscf := startSlowSCSCF(t, 500*time.Millisecond)
+	scscf := startHeldSCSCF(t)
+	draining := make(chan struct{})
 	hss := startHSS(t)
 	hss.answer = func(code uint32) (cx.Result, string) {
 		if code == cx.CodeUserAuthorization {
@@ -34,8 +39,9 @@ func TestAStopLetsTheTransactionsInFlightFinish(t *testing.T) {
 		}
 		return cx.ResultCode(diameter.ResultSuccess), scscf.uri()
 	}
-	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
-		c.DrainTimeout = 3 * time.Second
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, d *deps) {
+		c.DrainTimeout = time.Minute
+		d.draining = func() { close(draining) }
 	})
 	r.waitReady(t)
 	reg := r.sendAsync(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">",
@@ -45,7 +51,9 @@ func TestAStopLetsTheTransactionsInFlightFinish(t *testing.T) {
 	<-scscf.got
 	<-scscf.got
 	stopped := make(chan struct{})
-	go func() { r.stop(); close(stopped) }()
+	go func() { r.stopWithin(2 * time.Minute); close(stopped) }()
+	<-draining
+	scscf.answer()
 	if got := <-reg; got != "200" {
 		t.Errorf("REGISTER in flight at the stop: %s, want 200", got)
 	}
@@ -54,8 +62,8 @@ func TestAStopLetsTheTransactionsInFlightFinish(t *testing.T) {
 	}
 	select {
 	case <-stopped:
-	case <-time.After(realWait):
-		t.Fatal("Run did not return after the drain timeout")
+	case <-time.After(2 * time.Minute):
+		t.Fatal("Run did not return once the answers were out")
 	}
 }
 
@@ -232,16 +240,37 @@ type slowSCSCF struct {
 	ln    net.Listener
 	delay time.Duration
 	got   chan *sip.Request
+	// release, if set, is what each 200 waits for instead of delay
+	// (answer).
+	release chan struct{}
+	once    sync.Once
 }
 
+// startHeldSCSCF is startSlowSCSCF with every 200 held until answer, so
+// that a test decides when it goes, rather than the clock (#411).
+func startHeldSCSCF(t *testing.T) *slowSCSCF {
+	t.Helper()
+	s := startSlowSCSCFWith(t, 0, make(chan struct{}))
+	t.Cleanup(s.answer)
+	return s
+}
+
+// answer lets the held 200s go.
+func (s *slowSCSCF) answer() { s.once.Do(func() { close(s.release) }) }
+
 func startSlowSCSCF(t *testing.T, delay time.Duration) *slowSCSCF {
+	t.Helper()
+	return startSlowSCSCFWith(t, delay, nil)
+}
+
+func startSlowSCSCFWith(t *testing.T, delay time.Duration, release chan struct{}) *slowSCSCF {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	s := &slowSCSCF{ln: ln, delay: delay, got: make(chan *sip.Request, 16)}
+	s := &slowSCSCF{ln: ln, delay: delay, got: make(chan *sip.Request, 16), release: release}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -273,7 +302,14 @@ func startSlowSCSCF(t *testing.T, delay time.Duration) *slowSCSCF {
 					if req.Method == "INVITE" {
 						write(req, 180)
 					}
-					go func() { time.Sleep(s.delay); write(req, 200) }()
+					go func() {
+						if s.release != nil {
+							<-s.release
+						} else {
+							time.Sleep(s.delay)
+						}
+						write(req, 200)
+					}()
 				}
 			}()
 		}
@@ -413,16 +449,20 @@ func TestAnSCSCFNameWithoutAddressesGets500WithRetryAfter(t *testing.T) {
 
 // QA of #276: the drain also waits for a single request in progress.
 func TestAStopLetsASingleRequestInFlightFinish(t *testing.T) {
-	scscf := startSlowSCSCF(t, 500*time.Millisecond)
+	scscf := startHeldSCSCF(t)
+	draining := make(chan struct{})
 	hss := startHSS(t)
 	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
-	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
-		c.DrainTimeout = 3 * time.Second
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, d *deps) {
+		c.DrainTimeout = time.Minute
+		d.draining = func() { close(draining) }
 	})
 	r.waitReady(t)
 	msg := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
 	<-scscf.got
-	go r.stop()
+	go r.stopWithin(2 * time.Minute)
+	<-draining
+	scscf.answer()
 	if got := <-msg; got != "200" {
 		t.Errorf("MESSAGE in flight at the stop: %s, want 200", got)
 	}
