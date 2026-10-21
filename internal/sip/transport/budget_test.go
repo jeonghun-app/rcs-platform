@@ -77,6 +77,11 @@ func (d *pipesDialer) DialContext(context.Context, string, string) (net.Conn, er
 // once, and waiting out the shedding grace for real would only slow the tests.
 func stalled(f *flow) { f.q.progress.Store(time.Now().Add(-time.Hour).UnixNano()) }
 
+// progressing marks a flow's writer as making progress for the next hour, so
+// it stays inside the shedding grace however long the host takes to reach the
+// send under test (#283).
+func progressing(f *flow) { f.q.progress.Store(time.Now().Add(time.Hour).UnixNano()) }
+
 // budgetRig is a transport with a 3000-byte budget whose dials are pipes no
 // one reads, and a sender of ~850-byte MESSAGEs (or larger, with extra body).
 type budgetRig struct {
@@ -154,9 +159,12 @@ func TestFullBudgetFailsOnlyTheSendNeverTheSendersConnection(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Only the first one stalls, so shedding everything it can still
-				// frees less than the send needs.
+				// frees less than the send needs. The others stay inside the
+				// shedding grace however slow the host is (#318).
 				if tc.stallOthers && h == "192.0.2.1" {
 					stalled(r.flow(h))
+				} else {
+					progressing(r.flow(h))
 				}
 			}
 			// The sender's connection exists before the budget runs out. It is
@@ -178,6 +186,21 @@ func TestFullBudgetFailsOnlyTheSendNeverTheSendersConnection(t *testing.T) {
 				t.Fatalf("stats = %+v", s)
 			}
 		})
+	}
+}
+
+// A writer that made progress within half its WriteTimeout, at most a
+// second, is safe from shedding.
+func TestTheSheddingGraceIsHalfTheWriteTimeoutUpToASecond(t *testing.T) {
+	for _, tc := range []struct{ writeTimeout, grace time.Duration }{
+		{time.Hour, time.Second},
+		{2 * time.Second, time.Second},
+		{time.Second, 500 * time.Millisecond},
+	} {
+		tr, _ := newTransport(t, Config{WriteTimeout: tc.writeTimeout})
+		if got := tr.shedGrace(); got != tc.grace {
+			t.Errorf("WriteTimeout %v: grace %v, want %v", tc.writeTimeout, got, tc.grace)
+		}
 	}
 }
 
@@ -211,13 +234,27 @@ func TestFlowIdleTimeoutCanBeShortenedAndTakesEffectAtOnce(t *testing.T) {
 	eventually(t, "an idle timeout", func() bool { return server.Stats().IdleTimeouts == 1 })
 }
 
+// The flow's timeout is lengthened from the handler of its first message,
+// which runs before the reading goroutine starts the idle period that
+// follows the message, so the listener's 300 ms cannot run out first however
+// slow the host is (#299).
 func TestFlowIdleTimeoutCanBeLengthened(t *testing.T) {
-	server, rec := newTransport(t, Config{})
+	rec := make(recorder, 16)
+	var server *Transport
+	server, err := New(Config{}, func(in Inbound) {
+		if req, ok := in.Message.(*sip.Request); ok && req.Method == "REGISTER" && !server.SetFlowIdleTimeout(in.Source.Flow, time.Hour) {
+			t.Error("SetFlowIdleTimeout refused a live flow")
+		}
+		rec.handle(in)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
 	addr := listen(t, server, ListenerConfig{Network: TCP, IdleTimeout: 300 * time.Millisecond})
 	c := dialRaw(t, addr)
 	c.Write([]byte(rawRequest("REGISTER", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bK1")))
 	id := rec.next(t).Source.Flow
-	server.SetFlowIdleTimeout(id, time.Hour)
 	time.Sleep(600 * time.Millisecond) // past the listener's idle timeout
 	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bK2")))
 	if in := rec.next(t); in.Source.Flow != id {
@@ -226,6 +263,58 @@ func TestFlowIdleTimeoutCanBeLengthened(t *testing.T) {
 	if s := server.Stats(); s.IdleTimeouts != 0 {
 		t.Fatalf("the listener's idle timeout still applied: %+v", s)
 	}
+}
+
+// Lengthening an idle period that is already running, as pcscf does on the
+// registrar's 200 (#318 reviews), moves its deadline later, counted from the
+// period's start. The connection records the deadlines instead of applying
+// them, so no deadline can pass however slow the host is.
+func TestARunningIdlePeriodCanBeLengthened(t *testing.T) {
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	conn := &readDeadlines{Conn: server}
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, IdleTimeout: 300 * time.Millisecond})
+	listen(t, tr, ListenerConfig{Network: TCP})
+	req := newRequest(t, "OPTIONS", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKidle")
+	if _, err := tr.SendRequest(req, pipeDst); err != nil {
+		t.Fatal(err)
+	}
+	var armed time.Time
+	eventually(t, "the idle period to start", func() bool { armed = conn.last(); return !armed.IsZero() })
+	f := tr.flows.peer(reuseKey{network: TCP, remote: pipeDst.Addr})
+	if f == nil {
+		t.Fatal("the flow closed")
+	}
+	if !tr.SetFlowIdleTimeout(f.id, time.Hour) {
+		t.Fatal("SetFlowIdleTimeout refused a live flow")
+	}
+	// The period started 300 ms before its first deadline.
+	if got, want := conn.last(), armed.Add(time.Hour-300*time.Millisecond); !got.Equal(want) {
+		t.Fatalf("read deadline %v after lengthening, want %v", got.Sub(armed), want.Sub(armed))
+	}
+}
+
+// readDeadlines records the read deadlines it is given and applies none.
+type readDeadlines struct {
+	net.Conn
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (c *readDeadlines) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadlines = append(c.deadlines, t)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *readDeadlines) last() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.deadlines) == 0 {
+		return time.Time{}
+	}
+	return c.deadlines[len(c.deadlines)-1]
 }
 
 func TestSetFlowIdleTimeoutRefusesWhatItCannotApply(t *testing.T) {
@@ -436,14 +525,16 @@ func TestBudgetRefusalOfAResponseLeavesTheClientFlowOpen(t *testing.T) {
 	c.Write([]byte(rawRequest("MESSAGE", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bKr")))
 	in := rec.next(t)
 
-	// Three core connections fill the budget just now, inside the shedding
-	// grace, so none of them can be shed yet.
+	// Three core connections fill the budget, and their writers are inside
+	// the shedding grace, so none of them can be shed.
 	for _, h := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
 		req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK"+h)
 		req.Body = make([]byte, 600) // about 850 bytes
-		if _, err := server.SendRequest(req, Destination{Network: TCP, Addr: netip.MustParseAddrPort(h + ":5060")}); err != nil {
+		dst := netip.MustParseAddrPort(h + ":5060")
+		if _, err := server.SendRequest(req, Destination{Network: TCP, Addr: dst}); err != nil {
 			t.Fatal(err)
 		}
+		progressing(server.flows.peer(reuseKey{network: TCP, remote: dst}))
 	}
 
 	res := respond(t, in.Message.(*sip.Request), 200)
@@ -455,7 +546,7 @@ func TestBudgetRefusalOfAResponseLeavesTheClientFlowOpen(t *testing.T) {
 	if _, open := server.Flow(in.Source.Flow); !open {
 		t.Fatal("a budget refusal closed a healthy client's flow")
 	}
-	if s := server.Stats(); s.ResponseFlowCloses != 0 || s.BudgetRefusals != 1 {
+	if s := server.Stats(); s.ResponseFlowCloses != 0 || s.BudgetRefusals != 1 || s.BudgetSheds != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 }

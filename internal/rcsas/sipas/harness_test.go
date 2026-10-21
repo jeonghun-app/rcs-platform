@@ -336,8 +336,9 @@ func (p *peer) sending(branch string) {
 }
 
 // finalFor reads the final response to the request with branch and cseq.
-// A response to an earlier request of the peer is passed over; one to no
-// request of the peer is an error, not a response to wait past.
+// A response to an earlier request of the peer, such as a 2xx sent again
+// until its ACK arrives (RFC 3261 §13.3.1.4; #303, #327), is passed over;
+// one to no request of the peer is an error, not a response to wait past.
 func (p *peer) finalFor(branch string, cseq sip.CSeq) (*sip.Response, error) {
 	for {
 		msg, err := p.r.ReadMessage()
