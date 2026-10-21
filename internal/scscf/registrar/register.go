@@ -580,7 +580,11 @@ func (g *Registrar) endSet(ctx context.Context, claimed *state.Registration, pro
 			return f
 		case again == nil:
 			return nil
-		case live(again, now):
+		case live(again, now) && again.Deregistering.IsZero():
+			// A REGISTER that took the set over from the lease saved a
+			// record without one (assign). A lease that is live only by
+			// an unregistered user's state, which it keeps, is not one
+			// (#394 code review).
 			return g.reassign(ctx, again)
 		case again.Version != claimed.Version:
 			// Another deregistration claimed it since: it finishes.

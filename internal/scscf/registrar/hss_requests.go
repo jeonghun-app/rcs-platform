@@ -3,7 +3,9 @@ package registrar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"slices"
 	"time"
 
@@ -17,6 +19,9 @@ import (
 var (
 	resultSuccess        = cx.ResultCode(diameter.ResultSuccess)
 	resultUnableToComply = cx.ResultCode(diameter.ResultUnableToComply)
+	// resultTooBusy is a protocol error (RFC 6733 §7.1.3), which the HSS
+	// sends again to another S-CSCF peer (internal/hss, push.go).
+	resultTooBusy = cx.ResultCode(diameter.ResultTooBusy)
 )
 
 // HandleRTR answers a Registration-Termination-Request (TS 29.228 §6.1.3),
@@ -70,37 +75,54 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 			}
 		}
 	}
-	ended := 0
+	// Every set is tried, whatever one of them does: the HSS does not send
+	// the RTR again unless told to (#394 code review).
+	ended, result := 0, resultSuccess
 	for _, k := range keys {
 		cause := regevent.Deactivated
 		if r.DeregistrationReason.Code == cx.PermanentTermination {
 			cause = regevent.Rejected
 		}
 		done, err := g.endSetNow(ctx, k, r.DeregistrationReason.Code == cx.RemoveSCSCF, cause)
-		if err != nil {
+		switch {
+		case errors.Is(err, errClaimBusy):
 			g.log.Error("registrar: RTR: ending a set", slog.String("error", err.Error()))
-			return resultUnableToComply
-		}
-		if done {
+			if result == resultSuccess {
+				result = resultTooBusy
+			}
+		case err != nil:
+			g.log.Error("registrar: RTR: ending a set", slog.String("error", err.Error()))
+			result = resultUnableToComply
+		case done:
 			ended++
 		}
 	}
 	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
-	return resultSuccess
+	return result
 }
+
+// errClaimBusy is a claim of an RTR's lease that the store failed to save
+// for a reason that may pass, as a throttled write whose SDK retries are
+// spent: the RTR is answered DIAMETER_TOO_BUSY, so that the HSS sends it
+// again, rather than leave the set live (#394 code review).
+var errClaimBusy = errors.New("registrar: the store did not save an RTR's claim")
 
 // endSetNow ends set k at the HSS's request: it claims the record for a
 // deregistration's lease, tells the subscribers (Events.Ended), and then
 // removes its identities, its profile if still the one read, and last the
 // record, under the version claimed, as every deregistration does
 // (endSet); a record that changed meanwhile is read again and ended too.
-// Cut short after the claim, it leaves the lease for the sweep to finish.
-// With unregisteredOnly it ends k only as an unregistered user's record,
-// and one that a REGISTER turned into a registration meanwhile has its
-// identities pointed at it again. It reports whether it ended one.
+// Cut short after the claim, by a stop or a store failure, it leaves the
+// lease for the sweep to finish, and counts as done. A claim the store
+// fails to save is tried again with the record read again, and then is
+// errClaimBusy, unless the store refused it as invalid. With
+// unregisteredOnly it ends k only as an unregistered user's record, and one
+// that a REGISTER turned into a registration meanwhile has its identities
+// pointed at it again. It reports whether it ended one.
 func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredOnly bool, cause regevent.Cause) (bool, error) {
 	touched := false
-	for range saveAttempts {
+	var claimErr error
+	for attempt := range saveAttempts {
 		now := g.cfg.Now()
 		reg, f := g.set(ctx, k)
 		switch {
@@ -134,24 +156,36 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		switch {
 		case errors.Is(err, state.ErrConflict):
 			continue
-		case err != nil:
+		case errors.Is(err, state.ErrInvalid):
 			return false, err
+		case err != nil:
+			// The HSS does not send the RTR again: a write that failed
+			// once, its SDK retries spent, often succeeds a moment later
+			// (#394 QA), as a listing does (regevent).
+			claimErr = err
+			if attempt < saveAttempts-1 {
+				select {
+				case <-time.After(time.Duration(10<<attempt+mathrand.IntN(10)) * time.Millisecond):
+				case <-ctx.Done():
+					return false, fmt.Errorf("%w: %w", errClaimBusy, ctx.Err())
+				}
+			}
+			continue
 		}
+		claimErr = nil
 		// The subscriptions end before the record does, told of the
 		// bindings it had.
 		if err := g.cfg.Events.Ended(ctx, reg, cause); err != nil {
-			g.internal("ending a set's subscriptions for an RTR", err)
-			g.count("registrar.rtr_left_to_sweep")
-			return true, nil
+			return g.leftToSweep("ending a set's subscriptions for an RTR", err)
 		}
 		if err := g.unpoint(ctx, reg); err != nil {
-			return false, err
+			return g.leftToSweep("removing the identities of a set an RTR ends", err)
 		}
 		if profile != nil {
 			// Only the one read: a REGISTER that lands meanwhile saves its
 			// own, which this RTR then does not end.
 			if err := g.cfg.Store.DeleteProfileIf(ctx, k, profile.Received); err != nil && !errors.Is(err, state.ErrConflict) {
-				return false, err
+				return g.leftToSweep("removing the profile of a set an RTR ends", err)
 			}
 		}
 		err = g.cfg.Store.DeleteRegistration(ctx, claimed)
@@ -161,9 +195,21 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 		case errors.Is(err, state.ErrNotFound), err == nil:
 			return true, nil
 		}
-		return false, err
+		return g.leftToSweep("removing a set an RTR ends", err)
+	}
+	if claimErr != nil {
+		return false, fmt.Errorf("%w: %w", errClaimBusy, claimErr)
 	}
 	return false, errors.New("registrar: the set kept changing")
+}
+
+// leftToSweep is endSetNow cut short by err after its claim: the lease
+// stands, and the sweep after it finishes the set, so the RTR has done its
+// part.
+func (g *Registrar) leftToSweep(what string, err error) (bool, error) {
+	g.internal(what, err)
+	g.count("registrar.rtr_left_to_sweep")
+	return true, nil
 }
 
 // HandlePPR answers a Push-Profile-Request (TS 29.228 §6.2.2), for
