@@ -88,6 +88,14 @@ func startRun(t *testing.T, cfg Config, d deps) netip.AddrPort {
 // the test's end calls it too.
 func startStoppable(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr, func()) {
 	t.Helper()
+	addr, msrpAddr, stop, _ := startStoppableHarness(t, cfg, d)
+	return addr, msrpAddr, stop
+}
+
+// startStoppableHarness is startStoppable, with the runtime harness whose
+// metrics and logs the service writes.
+func startStoppableHarness(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr, func(), *runtimetest.Harness) {
+	t.Helper()
 	cfg.SIPListenAddr = "127.0.0.1:0"
 	// The MSRP port too, which the engine advertises.
 	ml, err := net.Listen("tcp", "127.0.0.1:0")
@@ -119,13 +127,13 @@ func startStoppable(t *testing.T, cfg Config, d deps) (netip.AddrPort, net.Addr,
 	t.Cleanup(stop)
 	select {
 	case addr := <-listening:
-		return addr, ml.Addr(), stop
+		return addr, ml.Addr(), stop, h
 	case err := <-done:
 		t.Fatalf("run ended: %v", err)
 	case <-time.After(waitFor):
 		t.Fatal("rcs-as did not start")
 	}
-	return netip.AddrPort{}, nil, nil
+	return netip.AddrPort{}, nil, nil, nil
 }
 
 // rcs-as end to end, with the memory store: a pager-mode MESSAGE from the
@@ -298,7 +306,7 @@ func TestRunServesSessionsAndEndsThemOnShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, msrpAddr, stop := startStoppable(t, cfg, deps{})
+	addr, msrpAddr, stop, h := startStoppableHarness(t, cfg, deps{})
 	nc, err := net.Dial("tcp", addr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -382,7 +390,15 @@ func TestRunServesSessionsAndEndsThemOnShutdown(t *testing.T) {
 				return
 			}
 		case <-deadline:
-			t.Fatal("no BYE on shutdown")
+			// #374: seen once under load, on a tree without #279's
+			// Close fixes. These tell a BYE never sent from one sent
+			// and lost, or not resolved, next time.
+			var b strings.Builder
+			for _, name := range []string{"sip.invite.answered", "sip.bye.sent", "sip.dialog.unsent", "sip.dialog.unresolved", "sip.respond_failed"} {
+				v, _ := h.Metric(name)
+				fmt.Fprintf(&b, " %s=%v", name, v)
+			}
+			t.Fatalf("no BYE on shutdown:%s", b.String())
 		}
 	}
 }

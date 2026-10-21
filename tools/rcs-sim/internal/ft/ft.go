@@ -474,9 +474,12 @@ type Settled struct {
 // answers in a row can agree while the server still holds the upload, and
 // a resume then gets 503. The quiet time runs from the request that first
 // got the value to the request that gets it again, so it is time the server
-// held the value, however slowly the answers came. A 404 is asked again until
-// within has passed, and then returned as ErrNothingHeld. Bytes held that are
-// still changing when within has passed are returned with ErrNotSettled.
+// held the value, however slowly the answers came. within bounds when the
+// requests are sent, likewise: a 404 is asked again until a request sent
+// after within has passed gets one too, and is then returned as
+// ErrNothingHeld. Bytes held that such a request is the first to report
+// are given one more quiet time; bytes held still changing after that are
+// returned with ErrNotSettled.
 //
 // Nothing the server sends says the upload is released: its lease lasts
 // minutes when the process holding it dies, and ft-server's upload-info
@@ -491,6 +494,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 	deadline := now().Add(within)
 	last := int64(-1)
 	var since time.Time
+	extended := false
 	for {
 		asked := now()
 		info, err := c.UploadInfo(ctx, tid)
@@ -509,11 +513,24 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 		if held != last {
 			last, since = held, asked
 		}
-		if now().After(deadline) {
-			if err == nil {
-				err = ErrNotSettled
+		// within bounds when a request is sent, not when its answer comes:
+		// one slow answer on a loaded host says nothing about the server
+		// still storing, and the next request may confirm what it holds
+		// (#344). A request sent past the deadline that does not settle
+		// ends the wait, except that bytes held first seen by such a
+		// request get one quiet time more. The slow answer is most often
+		// the 404 to a request sent before the server noticed the break,
+		// and the server may well be done storing by now; ending here
+		// would fail the step on one slow answer after all.
+		if asked.After(deadline) {
+			if err == nil && since.Equal(asked) && !extended {
+				deadline, extended = asked.Add(quiet), true
+			} else {
+				if err == nil {
+					err = ErrNotSettled
+				}
+				return info, st, err
 			}
-			return info, st, err
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return info, st, err
