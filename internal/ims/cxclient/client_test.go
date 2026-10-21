@@ -1005,3 +1005,71 @@ func TestLatencyAndPeerGaugesAreRecorded(t *testing.T) {
 
 // The services pass their *runtime.Metrics.
 var _ Metrics = (*runtime.Metrics)(nil)
+
+// unavailableFrom makes every send from the k-th on (1-based) fail as one
+// to a task that became unavailable after it was picked, the race #261 is
+// about, and counts the sends.
+func unavailableFrom(c *Client, k int) *atomic.Int32 {
+	var n atomic.Int32
+	real := c.send
+	c.send = func(ctx context.Context, p *diameter.Peer, m *diameter.Message) (*diameter.Message, error) {
+		if int(n.Add(1)) >= k {
+			return nil, diameter.ErrPeerUnavailable
+		}
+		return real(ctx, p, m)
+	}
+	return &n
+}
+
+// TestAnErrorSaysWhetherAnyAttemptWasSent: a first attempt answered busy,
+// whose retry then found its task unavailable, may have been served, though
+// the error is the retry's; only one whose every attempt never left is
+// NeverSent (#261).
+func TestAnErrorSaysWhetherAnyAttemptWasSent(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		from      int
+		neverSent bool
+	}{
+		{"first busy, retry unavailable", 2, false},
+		{"both unavailable", 1, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			a := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+			b := startHSS(t, e.net, "192.0.2.2", "hss-b.rcs.local")
+			a.setAnswer(busy)
+			b.setAnswer(busy)
+			e.refresh("192.0.2.1", "192.0.2.2")
+			sends := unavailableFrom(e.client, c.from)
+			_, err := e.client.MAR(ctx(t), &cx.MAR{UserName: impi1, PublicIdentity: impu1, NumberAuthItems: 1})
+			if sends.Load() != 2 || !errors.Is(err, diameter.ErrPeerUnavailable) {
+				t.Fatalf("%d sends, error %v; want the retry's unavailable peer", sends.Load(), err)
+			}
+			if NeverSent(err) != c.neverSent || ErrorOutcome(err) != Unavailable {
+				t.Errorf("NeverSent = %v, outcome %v; want %v, Unavailable", NeverSent(err), ErrorOutcome(err), c.neverSent)
+			}
+		})
+	}
+	if !NeverSent(ErrNoPeer) || NeverSent(diameter.ErrTimeout) || NeverSent(diameter.ErrConnectionClosed) {
+		t.Error("NeverSent of a single error")
+	}
+}
+
+// TestAnAuthenticationWhoseFirstSchemeWasAnsweredWasSent: the AKA MAR got
+// 5006 from the HSS and the SIP Digest one found no task: the HSS saw the
+// first (#261).
+func TestAnAuthenticationWhoseFirstSchemeWasAnsweredWasSent(t *testing.T) {
+	e := newEnv(t, nil)
+	h := startHSS(t, e.net, "192.0.2.1", "hss-a.rcs.local")
+	e.refresh("192.0.2.1")
+	h.setAnswer(func(code uint32, req *diameter.Message) (*diameter.Message, error) {
+		return h.result(code, req, cx.ExperimentalResult(cx.ErrorAuthSchemeNotSupported))
+	})
+	unavailableFrom(e.client, 2)
+	schemes, _ := Schemes("", nil)
+	_, err := e.client.Authenticate(ctx(t), &cx.MAR{UserName: impi1, PublicIdentity: impu1, NumberAuthItems: 1}, schemes)
+	if !errors.Is(err, diameter.ErrPeerUnavailable) || NeverSent(err) {
+		t.Errorf("error %v, NeverSent %v; want the second MAR's unavailable peer, sent", err, NeverSent(err))
+	}
+}

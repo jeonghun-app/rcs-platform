@@ -131,9 +131,11 @@ func isKey(v string) bool {
 }
 
 // impi and impu are a test subscriber's identities, as acs derives them
-// from the IMSI and MSISDN.
+// from the IMSI and MSISDN; tel is the same number's tel URI, which the
+// network also addresses the subscriber by (docs/architecture.md §4).
 func (c seedConfig) impi(s subscriber) string { return s.imsi + "@" + c.imsDomain }
 func (c seedConfig) impu(s subscriber) string { return "sip:" + s.msisdn + "@" + c.imsDomain }
+func (c seedConfig) tel(s subscriber) string  { return "tel:" + s.msisdn }
 
 // seed provisions each test subscriber: the subscription in hss, managed
 // by acs as ADR 0006 has it, with its own AKA keys, and the subscriber in
@@ -155,11 +157,19 @@ func seed(ctx context.Context, c seedConfig, out io.Writer) error {
 }
 
 func seedOne(ctx context.Context, client *http.Client, c seedConfig, s subscriber, out io.Writer) error {
+	// The SIP IMPU and the tel IMPU of one number share an implicit
+	// registration set (architecture §4), so a request to either form
+	// reaches the client once it registers. The SIP IMPU comes first: it
+	// is the set's default identity (TS 29.228 §6.5.1.1), the one acs
+	// hands out.
 	sub := map[string]any{
-		"impi":              c.impi(s),
-		"imsi":              s.imsi,
-		"public_identities": []map[string]any{{"impu": c.impu(s)}},
-		"acs_managed":       true,
+		"impi": c.impi(s),
+		"imsi": s.imsi,
+		"public_identities": []map[string]any{
+			{"impu": c.impu(s), "implicit_set": 0},
+			{"impu": c.tel(s), "implicit_set": 0},
+		},
+		"acs_managed": true,
 	}
 	status, err := call(ctx, client, c, http.MethodPost, c.hssAPI+"/v1/subscriptions", c.hssToken, sub)
 	switch {
@@ -168,7 +178,17 @@ func seedOne(ctx context.Context, client *http.Client, c seedConfig, s subscribe
 	case status == http.StatusCreated:
 		fmt.Fprintf(out, "hss: %s test subscription created\n", s.name)
 	case status == http.StatusConflict:
-		fmt.Fprintf(out, "hss: %s test subscription exists\n", s.name)
+		// A stack seeded before, perhaps with fewer identities (#282):
+		// the same subscription again, which leaves its Cx state and
+		// credentials as they are.
+		status, err = call(ctx, client, c, http.MethodPut, c.hssAPI+"/v1/subscriptions/"+url.PathEscape(c.impi(s)), c.hssToken, sub)
+		switch {
+		case err != nil:
+			return fmt.Errorf("hss: update subscription: %w", err)
+		case status != http.StatusOK:
+			return fmt.Errorf("hss: update subscription: HTTP %d", status)
+		}
+		fmt.Fprintf(out, "hss: %s test subscription exists, brought up to date\n", s.name)
 	default:
 		return fmt.Errorf("hss: create subscription: HTTP %d", status)
 	}

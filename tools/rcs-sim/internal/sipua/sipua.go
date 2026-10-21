@@ -327,7 +327,11 @@ func Dial(ctx context.Context, cfg Config) (*UA, error) {
 		c.Close()
 		return nil, err
 	}
-	ua.layer = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock})
+	if ua.layer, err = transaction.New(ua.tr, tu{ua}, transaction.Config{Clock: cfg.Clock}); err != nil {
+		ua.tr.Close()
+		c.Close()
+		return nil, err
+	}
 	return ua, nil
 }
 
@@ -649,11 +653,68 @@ func (ua *UA) registration(res *sip.Response) (*Registration, error) {
 // binding: the same instance and reg-id (RFC 5626 §6).
 func (ua *UA) isOurs(c sip.Contact) bool {
 	inst, ok := c.Instance()
-	if !ok || inst != "<"+ua.cfg.InstanceID+">" {
+	if !ok || !SameInstance(inst, "<"+ua.cfg.InstanceID+">") {
 		return false
 	}
 	id, present, err := c.RegID()
 	return present && err == nil && id == ua.cfg.RegID
+}
+
+// SameInstance reports whether two +sip.instance values, written as RFC
+// 5626 §4.1 has them ("<urn:...>"), name the same instance. §4.1 compares
+// them by the rules of their URN namespace, and lexically (RFC 8141 §3.1)
+// for one it does not know. Only urn:uuid is compared by its own rules:
+// its UUIDs compare without case throughout (RFC 9562 §4). Every other
+// namespace, urn:gsma:imei included, is compared lexically: case does not
+// matter in "urn", in the namespace ID or in percent-encoding hex, and
+// does in the rest. A value that is not a URN in angle brackets must match
+// exactly.
+func SameInstance(a, b string) bool {
+	ka, okA := instanceKey(a)
+	kb, okB := instanceKey(b)
+	if !okA || !okB {
+		return a == b
+	}
+	return ka == kb
+}
+
+// instanceKey is the form of a "<urn:NID:NSS>" value that equal instances
+// share: "urn" and the NID in lower case, and the NSS with its
+// percent-encoding hex in upper case, or wholly in lower case for uuid.
+func instanceKey(v string) (string, bool) {
+	urn, ok := strings.CutPrefix(v, "<")
+	if !ok {
+		return "", false
+	}
+	if urn, ok = strings.CutSuffix(urn, ">"); !ok {
+		return "", false
+	}
+	scheme, rest, ok := strings.Cut(urn, ":")
+	if !ok || !strings.EqualFold(scheme, "urn") {
+		return "", false
+	}
+	nid, nss, ok := strings.Cut(rest, ":")
+	if !ok || nid == "" {
+		return "", false
+	}
+	nid = strings.ToLower(nid)
+	if nid == "uuid" {
+		return "urn:uuid:" + strings.ToLower(nss), true
+	}
+	b := []byte(nss)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1], b[i+2] = upperHex(b[i+1]), upperHex(b[i+2])
+		}
+	}
+	return "urn:" + nid + ":" + string(b), true
+}
+
+func upperHex(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 'A'
+	}
+	return c
 }
 
 // NewRequest returns a request outside any dialog, from the IMPU to target,

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -22,18 +23,40 @@ import (
 // noticed rather than misroute responses.
 const viaPlaceholderHost = "invalid"
 
-// isSelf reports whether u names this proxy (Config.Self).
+// isSelf reports whether u names this proxy (Config.Self): the same host,
+// however it is written (SameHost), and the same port once defaults are
+// applied. A form of its own address it failed to recognise would make the
+// proxy forward a request to itself.
 func (p *Proxy) isSelf(u sip.URI) bool {
 	if !u.IsSIP() {
 		return false
 	}
 	port := portOf(u)
 	for _, s := range p.self {
-		if strings.EqualFold(s.Host, u.Host) && portOf(s) == port {
+		if SameHost(s.Host, u.Host) && portOf(s) == port {
 			return true
 		}
 	}
 	return false
+}
+
+// SameHost reports whether two URI hosts name the same host: names compared
+// without case or a trailing dot, addresses as addresses, so that an
+// IPv4-mapped IPv6 address, a bracketed IPv6 address or a different
+// spelling of an IPv6 address matches the plain form.
+func SameHost(a, b string) bool {
+	return HostKey(a) == HostKey(b)
+}
+
+// HostKey writes a URI host in the form SameHost compares: an address in
+// its canonical text without brackets, zone or IPv4 mapping, a name in
+// lower case without a trailing dot.
+func HostKey(host string) string {
+	h := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.Unmap().WithZone("").String()
+	}
+	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
 
 // portOf is the port a SIP or SIPS URI names, explicitly or by default (RFC

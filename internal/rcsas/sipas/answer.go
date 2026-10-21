@@ -112,7 +112,8 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 	// Known before the 2xx leaves, so that a BYE right behind its ACK
 	// finds the session; and before a first message is stored, so that an
 	// INVITE past a bound stores nothing its client would send again.
-	if err := s.addSession(ss); err != nil {
+	answered, err := s.addSession(ss)
+	if err != nil {
 		_ = leg.Close()
 		if errors.Is(err, errUserSessions) {
 			// The user's own sessions are what is busy (RFC 3261
@@ -126,6 +127,7 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respondRetry(u, req, 500)
 		return
 	}
+	defer answered()
 	if first != nil {
 		// The first message goes in as the session's would, stored
 		// before the 2xx; one the engine refuses fails the INVITE with

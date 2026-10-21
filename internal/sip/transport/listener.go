@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -323,13 +324,21 @@ func (l *listener) serveAccepted(raw net.Conn) {
 	remote := addrPortOf(raw.RemoteAddr())
 	if l.proxy {
 		raw.SetReadDeadline(time.Now().Add(l.proxyHeader))
-		h, err := ReadProxyHeader(raw)
+		read := &countingReader{r: raw}
+		h, err := ReadProxyHeader(read)
 		if err != nil {
-			// A timeout is a slow or silent client; a malformed header, a
-			// peer that is not the NLB.
-			if ne := net.Error(nil); errors.As(err, &ne) && ne.Timeout() {
+			// A timeout is a slow or silent client. Of the connections
+			// that closed or failed otherwise, by their bytes: one that
+			// sent none, closed or reset, is a client or a scanner that
+			// gave up, since the NLB's health checks send a LOCAL header
+			// (ADR 0003); one that sent some, however few or many, a peer
+			// that is not the NLB, which a misconfigured NLB shows as.
+			switch ne := net.Error(nil); {
+			case errors.As(err, &ne) && ne.Timeout():
 				t.stats.proxyHeaderTimeouts.Add(1)
-			} else {
+			case read.n == 0:
+				t.stats.proxyHeaderEmpty.Add(1)
+			default:
 				t.stats.proxyHeaderErrors.Add(1)
 			}
 			raw.Close()
@@ -451,4 +460,16 @@ func (t *Transport) sentByOf(f *flow) (string, int, error) {
 		return "", 0, fmt.Errorf("%w: no %s listener and no local address for the Via", ErrNoListener, f.network)
 	}
 	return hostString(local.Addr()), int(local.Port()), nil
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }

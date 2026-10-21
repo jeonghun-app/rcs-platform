@@ -17,7 +17,7 @@ func TestClientRequestsLoseTheHeadersOnlyTheNetworkMaySet(t *testing.T) {
 	for _, name := range []string{
 		"P-Asserted-Identity", "P-Served-User", "P-Asserted-Service", "P-Charging-Vector",
 		"P-Charging-Function-Addresses", "P-Visited-Network-ID", "P-Associated-URI", "P-Called-Party-ID",
-		"P-Media-Authorization", "Feature-Caps", "P-Private-Network-Indication", "P-Profile-Key",
+		"P-Media-Authorization", "Feature-Caps", "P-Private-Network-Indication", "P-Profile-Key", "Path",
 	} {
 		t.Run(name, func(t *testing.T) {
 			var h sip.Header
