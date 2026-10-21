@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -20,9 +21,9 @@ import (
 // mostly taken by a "127.0.0.1:0" listener of another test package running
 // at the same time (Linux gives those odd ports), and otherwise by the local
 // port of an outgoing connection (even ports), of which the test process
-// makes many. The relay's own FreePorts picks can return it too. Each chat
-// scenario listens again on the same port, so holding one listener open
-// would not be enough.
+// makes many. The relay's own FreePorts picks can return it too. A test in
+// the process holds the port with StandInListener instead; StandInPort is
+// for a stand-in in another process, which listens itself.
 //
 // StandInPort picks outside the ephemeral range, which none of those ever
 // uses: below it, or above it when the range leaves no room below, and it
@@ -94,3 +95,77 @@ func standInPorts(contents string, readErr error) (lo, hi int, err error) {
 	}
 	return 0, 0, fmt.Errorf("simtest: the ephemeral range %d-%d leaves no room for the rcs-as stand-in's port (%d-%d)", low, high, minStandInPort, maxPort)
 }
+
+// StandInListener holds one loopback listener on port 0 for the rcs-as
+// stand-in, from before the relay starts until the test ends, and lends it
+// to each chat scenario in turn: the port the relay is told about is never
+// free for another process to take, as a port picked ahead and listened on
+// again by each scenario was (#186). Connections wait for the next
+// scenario's stand-in when none is accepting.
+type StandInListener struct {
+	ln    net.Listener
+	conns chan net.Conn
+	done  chan struct{}
+}
+
+// ListenStandIn starts a StandInListener; the test's end closes it.
+func ListenStandIn(t testing.TB) *StandInListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &StandInListener{ln: ln, conns: make(chan net.Conn), done: make(chan struct{})}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case s.conns <- c:
+			case <-s.done:
+				_ = c.Close()
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(s.done)
+		_ = ln.Close()
+	})
+	return s
+}
+
+// Port is the listener's port, for the relay's RELAY_CORE_PORTS.
+func (s *StandInListener) Port() int { return s.ln.Addr().(*net.TCPAddr).Port }
+
+// Lend returns a listener that takes the connections until it is closed,
+// which leaves the port listening for the next.
+func (s *StandInListener) Lend() (net.Listener, error) {
+	return &lent{s: s, closed: make(chan struct{})}, nil
+}
+
+type lent struct {
+	s      *StandInListener
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *lent) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.s.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	case <-l.s.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *lent) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *lent) Addr() net.Addr { return l.s.ln.Addr() }

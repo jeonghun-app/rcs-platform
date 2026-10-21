@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -109,4 +110,39 @@ func atoi(t *testing.T, s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+func TestTheStandInListenerHoldsItsPortBetweenScenarios(t *testing.T) {
+	// #186: the port the relay is told about stays taken by the test from
+	// the first scenario to the last, and each scenario's stand-in gets the
+	// connections made while it listens.
+	s := ListenStandIn(t)
+	addr := "127.0.0.1:" + strconv.Itoa(s.Port())
+	for round := range 2 {
+		ln, err := s.Lend()
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("round %d: dial %v", round, err)
+		}
+		got, err := ln.Accept()
+		if err != nil {
+			t.Fatalf("round %d: accept %v", round, err)
+		}
+		_ = got.Close()
+		_ = c.Close()
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ln.Accept(); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("round %d: Accept after Close = %v", round, err)
+		}
+		// Between two scenarios nobody else can listen on it.
+		if other, err := net.Listen("tcp", addr); err == nil {
+			_ = other.Close()
+			t.Fatalf("round %d: the port was free between scenarios", round)
+		}
+	}
 }
