@@ -186,8 +186,9 @@ func TestAnRTRsEndOutlivesAStoreFailureAndAStop(t *testing.T) {
 		}
 		return all, rejected
 	}
-	// The ends were saved: the sweep sends them, without the HSS's retry.
-	e.clock.advance(10 * time.Second)
+	// The ends were saved: the sweep sends them, without the HSS's retry,
+	// once the stopped instance's own send could no longer be waiting.
+	e.clock.advance(regevent.DefaultNotifyTimeout + 10*time.Second)
 	if _, err := n.Sweep(bg, 10); err != nil {
 		t.Fatal(err)
 	}
