@@ -96,7 +96,7 @@ func testImpossibleKeys(t *testing.T, a, _ state.Store, _ Options) {
 		wantErr(t, err, state.ErrNotFound)
 		_, err = a.Subscription(ctx(t), impu)
 		wantErr(t, err, state.ErrNotFound)
-		_, _, err = a.NextNotify(ctx(t), impu)
+		_, _, err = a.NextNotify(ctx(t), impu, 0)
 		wantErr(t, err, state.ErrNotFound)
 		for _, k := range []state.SetKey{{IMPI: IMPI1, IMPU: impu}, {IMPI: impu, IMPU: IMPU1}} {
 			_, err = a.Profile(ctx(t), k, T0)
@@ -230,7 +230,8 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 		}); err != nil {
 			t.Error(err)
 		}
-		_, _, final = a.NextNotify(ctx(t), s.ID)
+		_, _, final = a.NextNotify(ctx(t), s.ID, state.FinalNotify)
+		finish(t, a, s.ID)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -240,9 +241,10 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	_, err := a.Subscription(ctx(t), "s1")
 	wantErr(t, err, state.ErrNotFound)
 
-	// One the S-CSCF ended itself, with the grace ahead, goes after it.
+	// One the S-CSCF ended itself, with the grace ahead, its final NOTIFY
+	// sent without an answer, is handed over after it, to send it again.
 	ended := Subscription("s2", IMPU1, time.Hour)
-	ended.Terminated, ended.Expires = true, T0.Add(state.TerminatedGrace)
+	ended.Terminated, ended.Expires, ended.NotifiedOf = true, T0.Add(state.TerminatedGrace), state.FinalNotify
 	must(a.SaveSubscription(ctx(t), ended))(t)
 	if _, err := state.SweepSubscriptions(ctx(t), b, T0, 10, func(*state.Subscription) {}); err != nil {
 		t.Fatal(err)
@@ -252,10 +254,15 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(b.ExpiringSubscriptions(ctx(t), later, 10))(t)) == 1
 	})
-	if _, err := state.SweepSubscriptions(ctx(t), b, later, 10, func(*state.Subscription) {
-		t.Error("a Terminated subscription was handled")
+	handled := 0
+	if _, err := state.SweepSubscriptions(ctx(t), b, later, 10, func(s *state.Subscription) {
+		handled++
+		finish(t, b, s.ID)
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if handled != 1 {
+		t.Errorf("handed over %d times after its grace", handled)
 	}
 	_, err = a.Subscription(ctx(t), "s2")
 	wantErr(t, err, state.ErrNotFound)
@@ -265,10 +272,10 @@ func testCounterLimit(t *testing.T, a, b state.Store, _ Options) {
 	s := Subscription("s1", IMPU1, time.Hour)
 	s.CSeq = state.MaxCounter - 1
 	must(a.SaveSubscription(ctx(t), s))(t)
-	if c, _, err := b.NextNotify(ctx(t), "s1"); err != nil || c != state.MaxCounter {
+	if c, _, err := b.NextNotify(ctx(t), "s1", 0); err != nil || c != state.MaxCounter {
 		t.Fatalf("NextNotify below the limit = %d, %v", c, err)
 	}
-	_, _, err := b.NextNotify(ctx(t), "s1")
+	_, _, err := b.NextNotify(ctx(t), "s1", 0)
 	wantErr(t, err, state.ErrExhausted)
 	if got := must(a.Subscription(ctx(t), "s1"))(t); got.CSeq != state.MaxCounter {
 		t.Errorf("stored CSeq %d", got.CSeq)
