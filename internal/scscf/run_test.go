@@ -3,18 +3,22 @@ package scscf
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
+	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -36,14 +40,26 @@ const (
 var password = []byte("test-password")
 
 // diameterHSS is an HSS task that answers MAR with a SIP Digest vector for
-// impi, and SAR with impi's User-Data, and records the SARs.
+// impi, or an IMS AKA one once aka is set, and SAR with impi's User-Data,
+// and records the SARs. With asURI set, the User-Data sends that server a
+// third-party REGISTER.
 type diameterHSS struct {
-	addr string
-	mu   sync.Mutex
-	sars []*cx.SAR
+	addr  string
+	node  *diameter.Node
+	asURI atomic.Pointer[string]
+	mu    sync.Mutex
+	sars  []*cx.SAR
+	aka   *milenage.Milenage
+	sqn   milenage.SQN
+	rands uint64
 }
 
-func startHSS(t *testing.T) *diameterHSS {
+// startHSS starts an HSS whose subscriber registers with SIP Digest.
+func startHSS(t *testing.T) *diameterHSS { return startHSSOf(t, nil) }
+
+// startHSSOf starts an HSS whose subscriber registers with IMS AKA, with
+// aka as the keys its card holds, or with SIP Digest when aka is nil.
+func startHSSOf(t *testing.T, aka *milenage.Milenage) *diameterHSS {
 	t.Helper()
 	dict, err := diameter.NewDictionary(cx.AVPs...)
 	if err != nil {
@@ -66,8 +82,20 @@ func startHSS(t *testing.T) *diameterHSS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &diameterHSS{addr: l.Addr().String()}
+	h := &diameterHSS{addr: l.Addr().String(), node: n, aka: aka}
+	if aka != nil {
+		if h.sqn, err = milenage.NewSQN(32, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
 	n.HandleFunc(cx.ApplicationID, cx.CodeMultimediaAuth, func(_ context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+		if h.aka != nil {
+			item, err := h.akaVector()
+			if err != nil {
+				return nil, err
+			}
+			return (&cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserName: impi, AuthDataItems: []cx.AuthDataItem{item}}).Message(n, req)
+		}
 		ha1, err := digest.ComputeHA1(digest.MD5, impi, realm, password)
 		if err != nil {
 			return nil, err
@@ -84,8 +112,15 @@ func startHSS(t *testing.T) *diameterHSS {
 		h.mu.Lock()
 		h.sars = append(h.sars, sar)
 		h.mu.Unlock()
-		sub := ifc.Subscription{PrivateID: impi, ServiceProfiles: []ifc.ServiceProfile{{PublicIdentities: []ifc.PublicIdentity{{Identity: impu}}}}}
-		data, err := sub.Marshal()
+		sp := ifc.ServiceProfile{PublicIdentities: []ifc.PublicIdentity{{Identity: impu}}}
+		if as := h.asURI.Load(); as != nil {
+			sp.InitialFilterCriteria = []ifc.FilterCriteria{{
+				Priority:          40,
+				TriggerPoint:      &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: []ifc.SPT{{Condition: ifc.Method("REGISTER"), Groups: []int{0}}}},
+				ApplicationServer: ifc.ApplicationServer{ServerName: *as, DefaultHandling: ifc.SessionContinued},
+			}}
+		}
+		data, err := (&ifc.Subscription{PrivateID: impi, ServiceProfiles: []ifc.ServiceProfile{sp}}).Marshal()
 		if err != nil {
 			return nil, err
 		}
@@ -100,6 +135,26 @@ func startHSS(t *testing.T) *diameterHSS {
 	return h
 }
 
+// akaVector is the next IMS AKA vector for impi (TS 33.203): RAND‖AUTN,
+// XRES and the keys, under the next sequence number.
+func (h *diameterHSS) akaVector() (cx.AuthDataItem, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rands++
+	var rnd [16]byte
+	binary.BigEndian.PutUint64(rnd[8:], h.rands)
+	var err error
+	if h.sqn, err = h.sqn.Next(); err != nil {
+		return cx.AuthDataItem{}, err
+	}
+	v := h.aka.Vector(rnd, h.sqn, [2]byte{0x80, 0})
+	autn, xres, ck, ik := v.AUTN(), v.XRES(), v.CK(), v.IK()
+	return cx.AuthDataItem{
+		Scheme: cx.SchemeDigestAKAv1MD5, Authenticate: append(rnd[:], autn[:]...),
+		Authorization: xres[:], ConfidentialityKey: ck[:], IntegrityKey: ik[:],
+	}, nil
+}
+
 func (h *diameterHSS) sarsOf() []*cx.SAR {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -110,20 +165,32 @@ type staticDiscovery []netip.Addr
 
 func (s staticDiscovery) HSSAddresses(context.Context) ([]netip.Addr, error) { return s, nil }
 
-// constantBytes is a reader of one byte, over and over.
-type constantBytes byte
+// seededRand is a reproducible random source the service's goroutines can
+// share. Unlike one byte over and over, it gives each nonce, branch and tag
+// a value of its own, so that a test of more than one request does not
+// meet a repeated one (#439 QA).
+type seededRand struct {
+	mu sync.Mutex
+	c  *rand.ChaCha8
+}
 
-func (c constantBytes) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = byte(c)
-	}
-	return len(p), nil
+func newSeededRand(seed byte) *seededRand {
+	var s [32]byte
+	s[0] = seed
+	return &seededRand{c: rand.NewChaCha8(s)}
+}
+
+func (r *seededRand) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.c.Read(p)
 }
 
 // running is scscf started by startSCSCF.
 type running struct {
 	core netip.AddrPort
 	stop func() error
+	h    *runtimetest.Harness
 }
 
 // testConfig is a configuration as Configure would give it, with the
@@ -155,13 +222,28 @@ func mustURI(s string) sip.URI {
 	return u
 }
 
+// stopWait bounds a test's wait for a stop, which takes up to
+// DrainTimeout plus stopMargin.
+const stopWait = 30 * time.Second
+
 // startSCSCF runs scscf until the test ends, with its HSS at hss.
 func startSCSCF(t *testing.T, hss *diameterHSS, store state.Store) *running {
 	t.Helper()
+	return startSCSCFWith(t, hss, store, 1, nil)
+}
+
+// startSCSCFWith is startSCSCF with seed for its random source, which two
+// instances must not share, and tweak applied to its configuration.
+func startSCSCFWith(t *testing.T, hss *diameterHSS, store state.Store, seed byte, tweak func(*ServiceConfig)) *running {
+	t.Helper()
 	h := runtimetest.New(t, "scscf")
 	listening := make(chan netip.AddrPort, 1)
+	cfg := testConfig()
+	if tweak != nil {
+		tweak(&cfg)
+	}
 	d := deps{
-		rand:      constantBytes(0x0c),
+		rand:      newSeededRand(seed),
 		store:     store,
 		discovery: staticDiscovery{netip.MustParseAddr("127.0.0.1")},
 		dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -173,8 +255,8 @@ func startSCSCF(t *testing.T, hss *diameterHSS, store state.Store) *running {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, h.Runtime, testConfig(), d) }()
-	r := &running{}
+	go func() { done <- run(ctx, h.Runtime, cfg, d) }()
+	r := &running{h: h}
 	select {
 	case r.core = <-listening:
 	case err := <-done:
@@ -191,8 +273,8 @@ func startSCSCF(t *testing.T, hss *diameterHSS, store state.Store) *running {
 			cancel()
 			select {
 			case stopErr = <-done:
-			case <-time.After(realWait):
-				stopErr = fmt.Errorf("scscf did not stop")
+			case <-time.After(stopWait):
+				stopErr = fmt.Errorf("scscf did not stop in %v", stopWait)
 			}
 		})
 		return stopErr
