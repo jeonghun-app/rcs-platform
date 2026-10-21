@@ -219,30 +219,24 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
-	awaitAnswers(px, tr, answersWait)
+	// Requests are served all through the flow drain. What is still in
+	// progress after it gets answersWait, so a request on one of the last
+	// flows closed still gets its 430 (#234), then a 500 with Retry-After,
+	// so its sender tries another task at once (#281). Drain returns once
+	// those answers are written, which Close would drop.
+	answersCtx, cancelAnswers := context.WithTimeout(context.Background(), answersWait)
+	defer cancelAnswers()
+	if n := px.Drain(answersCtx); n > 0 {
+		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
+	}
 	// The transport closes before the proxy does (the deferred Close), once
-	// the answers above are written. A peer that stopped reading leaves
+	// Drain has written its answers. A peer that stopped reading leaves
 	// senders waiting for room in its connection's queue, and the proxy's
 	// Close waits for them, for up to WriteTimeout, past the stop margin
 	// (#323); closing the connections releases them at once. A second Close
 	// does nothing.
 	_ = tr.Close()
 	return nil
-}
-
-// awaitAnswers returns once no request is in progress and the transport has
-// written what it queued, or after d in all. It polls, since a flow's close
-// reaches the proxy on a goroutine of the transport's. The second wait is
-// for the answers just sent: Transport.Close drops what its send queues
-// still hold (QA of #293). #281's Proxy.Drain replaces it.
-func awaitAnswers(px *proxy.Proxy, tr *transport.Transport, d time.Duration) {
-	end := time.Now().Add(d)
-	for px.Stats().Contexts > 0 && time.Now().Before(end) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	for tr.Stats().QueuedBytes > 0 && time.Now().Before(end) {
-		time.Sleep(time.Millisecond)
-	}
 }
 
 // relayDialer opens the connections to msrp-relay's control API: in
