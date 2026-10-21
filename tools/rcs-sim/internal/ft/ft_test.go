@@ -382,12 +382,21 @@ func TestUploadInfoSettlesOnlyAfterAQuietTime(t *testing.T) {
 
 func TestUploadInfoTimesTheServerShowingWhatItHoldsNotItsAnswers(t *testing.T) {
 	// #286: a server that holds the parts from the start shows them to the
-	// first request, however slowly it answers; one that answers 404 first
-	// shows them only to a later request.
+	// first request, however slowly it answers; one that answers 404 first,
+	// or whose bytes held still change, shows what it keeps only to a later
+	// request.
 	for _, c := range []struct {
 		name     string
+		first    func(http.ResponseWriter) // the first answer, when not the final one
 		notFirst bool
-	}{{"held at once", false}, {"404 first", true}} {
+	}{
+		{"held at once", nil, false},
+		{"404 first", func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) }, true},
+		{"held bytes change", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", ft.ContentType)
+			_, _ = io.WriteString(w, resumeInfo(10))
+		}, true},
+	} {
 		t.Run(c.name, func(t *testing.T) {
 			const answer = 100 * time.Millisecond
 			var mu sync.Mutex
@@ -403,8 +412,8 @@ func TestUploadInfoTimesTheServerShowingWhatItHoldsNotItsAnswers(t *testing.T) {
 				n++
 				first := n == 1
 				mu.Unlock()
-				if first && c.notFirst {
-					w.WriteHeader(http.StatusNotFound)
+				if first && c.first != nil {
+					c.first(w)
 					return
 				}
 				w.Header().Set("Content-Type", ft.ContentType)
@@ -422,7 +431,7 @@ func TestUploadInfoTimesTheServerShowingWhatItHoldsNotItsAnswers(t *testing.T) {
 			case !c.notFirst && st.Showed >= answer:
 				t.Fatalf("Showed %v for parts held from the first answer", st.Showed)
 			case c.notFirst && st.Showed < answer:
-				t.Fatalf("Showed %v, sooner than the 404 came back", st.Showed)
+				t.Fatalf("Showed %v, sooner than the first answer came back", st.Showed)
 			}
 		})
 	}
