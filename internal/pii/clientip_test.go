@@ -104,6 +104,7 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 		"from ::ffff:203.0.113.9 and 192.000.002.001.":                           "from 203.0.113.0/24 and 192.0.2.0/24.",
 		"6to4 2002:c000:201::1":                                                  "6to4 2002::/16",
 		"two: 192.0.2.7, 198.51.100.8:5060;":                                     "two: 192.0.2.0/24, 198.51.100.0/24;",
+		"peer 203.0.113.250 closed":                                              "peer 203.0.113.0/24 closed",
 		"host:192.0.2.7 and host:2001:db8:5:6::8":                                "host:192.0.2.0/24 and host:2001:db8:5::/48",
 		// What is not an address stays.
 		"go1.26.10 at 2026-10-21T12:42:25.4376791Z, version 1.2.3, 1.2.3.4.5": "go1.26.10 at 2026-10-21T12:42:25.4376791Z, version 1.2.3, 1.2.3.4.5",

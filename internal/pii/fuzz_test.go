@@ -3,6 +3,7 @@ package pii
 import (
 	"math/rand/v2"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -187,6 +188,7 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		"error reading preface from client [2001:db8::1]:443: EOF",
 		"10.0.0.0/8 192.0.2.7/32 1.2.3.4.5 go1.2.3.4 ::ffff:1.2.3.4",
 		"a:b:c::1 ::: [::1] [::1%25lo]:5 1.02.003.4:00",
+		"peer 203.0.113.250 closed, 255.255.255.254.",
 	} {
 		f.Add(s)
 	}
@@ -199,18 +201,23 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		if !strings.ContainsAny(s, ".:[") && got != s {
 			t.Fatalf("%q changed to %q", s, got)
 		}
+		// The oracle reads addresses its own way, not with the code under
+		// test: four parts of up to three digits, each at most 255, with
+		// no letter, digit, "_", non-ASCII byte or dot around them.
+		word := func(c byte) bool {
+			return c == '_' || c == '.' || c >= 0x80 || unicode.IsLetter(rune(c)) || unicode.IsDigit(rune(c))
+		}
 		for _, m := range quad.FindAllStringIndex(got, -1) {
-			before, after := byte(' '), byte(' ')
-			if m[0] > 0 {
-				before = got[m[0]-1]
-			}
-			if m[1] < len(got) {
-				after = got[m[1]]
-			}
-			if wordByte(before) || before == '.' || wordByte(after) || after == '.' {
+			if m[0] > 0 && word(got[m[0]-1]) || m[1] < len(got) && word(got[m[1]]) {
 				continue // part of a longer token, not an address alone
 			}
-			if _, ok := parseDottedQuad(got[m[0]:m[1]]); ok && after != '/' {
+			valid := true
+			for _, part := range strings.Split(got[m[0]:m[1]], ".") {
+				if n, err := strconv.Atoi(part); err != nil || n > 255 {
+					valid = false
+				}
+			}
+			if valid && (m[1] == len(got) || got[m[1]] != '/') {
 				t.Fatalf("%q left %q whole in %q", s, got[m[0]:m[1]], got)
 			}
 		}
