@@ -478,3 +478,24 @@ func TestAStopAnswersARequestLeftInProgress500(t *testing.T) {
 		t.Errorf("MESSAGE left at the stop: %s, want 500", got)
 	}
 }
+
+// #310: a REGISTER left at the stop gets 503 with Retry-After instead, which
+// pcscf retries on another icscf at once.
+func TestAStopAnswersARegisterLeftInProgress503(t *testing.T) {
+	scscf := startSlowSCSCF(t, 20*time.Second)
+	hss := startHSS(t)
+	hss.answer = func(uint32) (cx.Result, string) {
+		return cx.ExperimentalResult(cx.SubsequentRegistration), scscf.uri()
+	}
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.DrainTimeout = 300 * time.Millisecond
+	})
+	r.waitReady(t)
+	reg := r.sendAsync(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">",
+		"Contact: <sip:127.0.0.1:5070;transport=tcp>;expires=600")
+	<-scscf.got
+	go r.stop()
+	if got := <-reg; got != "503" {
+		t.Errorf("REGISTER left at the stop: %s, want 503", got)
+	}
+}

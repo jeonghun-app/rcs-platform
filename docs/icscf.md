@@ -110,9 +110,11 @@ On SIGTERM `icscf` keeps its listener open and waits, for at most
 `ICSCF_DRAIN_TIMEOUT`, until no request is in progress, so a REGISTER at the
 S-CSCF or a ringing INVITE still gets its final response. A call that has
 had its 2xx no longer counts, so a stop right after one returns at once.
-A request still in progress at the end is answered 500 with `Retry-After`,
-and its INVITE branches are cancelled, so its sender tries another task at
-once instead of waiting for its own timers (`proxy.Drain`, #281).
+A request still in progress at the end is answered, and its INVITE branches
+are cancelled, so its sender tries another task at once instead of waiting
+for its own timers (`proxy.Drain`, #281): a REGISTER with 503 and
+`Retry-After`, which pcscf retries on another icscf at once, anything else
+with 500 and `Retry-After` (#310).
 
 ## AWS permissions
 

@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
@@ -22,6 +23,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -108,6 +110,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		Router:   router,
 		Resolver: dns,
 		Logger:   rt.Logger,
+		// A REGISTER left at the stop gets 503, which pcscf retries on
+		// another icscf at once (decided on #310).
+		DrainAnswer: drainAnswer,
 	})
 	if err != nil {
 		return err
@@ -131,6 +136,19 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
 	}
 	return nil
+}
+
+// drainAnswer is what icscf answers a request left in progress at the end
+// of its drain (proxy.Config.DrainAnswer). A REGISTER gets 503 with
+// Retry-After, which pcscf retries on another icscf at once; it never
+// passed through scscf, so the rule that a proxy turns a 503 into a 500
+// (#281) does not apply to it. Everything else gets the proxy's 500 with
+// Retry-After (decided on #310).
+func drainAnswer(req *sip.Request) (int, time.Duration) {
+	if req.Method == "REGISTER" {
+		return 503, transaction.DefaultRetryAfter
+	}
+	return 500, transaction.DefaultRetryAfter
 }
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own

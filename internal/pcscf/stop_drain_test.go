@@ -2,6 +2,9 @@ package pcscf
 
 import (
 	"fmt"
+	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,5 +47,50 @@ func TestAStopAnswersTheCoreRequestsLeftInProgress(t *testing.T) {
 			t.Fatalf("answered after %v, want by the 1 s drain", took)
 		}
 		return
+	}
+}
+
+// #310: a REGISTER that a stopping icscf answers 503 with Retry-After, as
+// its drain does, is sent on to another icscf at once, and the client gets
+// the 200 from there. The fake answers the first copy as the draining
+// task and the second as a healthy one.
+func TestARegisterADrainingICSCFRefusesGoesToAnotherOne(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	// Every loopback address, so both icscf addresses reach it.
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	icscf := &fakeCoreNode{ln: ln, got: make(chan *sip.Request, 16), answer: func(req *sip.Request) string {
+		key := req.Header.Get("Call-ID") + " " + req.Header.Get("CSeq")
+		mu.Lock()
+		again := seen[key]
+		seen[key] = true
+		mu.Unlock()
+		if !again {
+			return strings.Replace(echo200(req), "200 OK", "503 Service Unavailable\r\nRetry-After: 5", 1)
+		}
+		return echo200(req)
+	}}
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go icscf.serve(t, nc)
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, fmt.Sprintf("sip:icscf.rcs.internal:%d;transport=tcp;lr", port))
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1", "127.0.0.6")})
+	if res := registerOver(t, dial(t, s.client, nil)); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d, want the 200 of the second icscf", res.StatusCode)
+	}
+	if n := len(icscf.got); n != 2 {
+		t.Fatalf("the icscf tasks got %d REGISTERs, want 2", n)
 	}
 }

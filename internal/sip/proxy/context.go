@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -212,7 +213,9 @@ func (c *respContext) run() {
 
 	c.mu.Lock()
 	cancelled := c.cancelled
-	closing := c.ctx.Err() != nil || p.isClosed()
+	// Drain may have answered the request while the Router decided; what
+	// the Router decided then starts nothing.
+	closing := c.ctx.Err() != nil || p.isClosed() || c.finalSent
 	if dec.Serve != nil && !closing {
 		// routing stays set while the service answers, so that a CANCEL
 		// leaves the answer to it (finish ends the context).
@@ -222,8 +225,9 @@ func (c *respContext) run() {
 	c.mu.Unlock()
 	switch {
 	case closing:
-		// The proxy is closing, its transactions gone, or the layer has
-		// answered the request (layerAnswered): nothing may be sent.
+		// The proxy is closing, its transactions gone, or the request has
+		// its answer from the layer (layerAnswered) or Drain: nothing may be
+		// sent.
 		c.finish()
 		return
 	case c.uas != nil:
@@ -308,13 +312,29 @@ func (c *respContext) answer(res *sip.Response) {
 //
 // It returns a channel closed once the 500 has been handed to the
 // transport, or nil when the request needed no answer.
-func (c *respContext) answerForStop() <-chan struct{} {
+func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	c.mu.Lock()
 	if c.finalSent || c.done {
 		c.mu.Unlock()
 		return nil
 	}
-	res, err := c.p.response(c.tx.Request(), 500, [2]string{"Retry-After", overloadRetryAfter})
+	if c.uas != nil {
+		// The service answers for itself. It learns of the stop through its
+		// context, and serve answers for it if it returns without a final
+		// response.
+		c.mu.Unlock()
+		c.cancelReq()
+		return nil
+	}
+	var res *sip.Response
+	var err error
+	if c.cancelled {
+		// §9.2: what a CANCEL from upstream asked for, as best and serve
+		// answer.
+		res, err = c.p.response(c.tx.Request(), 487)
+	} else {
+		res, err = c.p.drainResponse(c.tx.Request())
+	}
 	if err != nil {
 		c.mu.Unlock()
 		return nil
@@ -331,7 +351,10 @@ func (c *respContext) answerForStop() <-chan struct{} {
 			}
 			if err := c.tx.Respond(res); err != nil {
 				c.p.stats.upstreamErrors.Add(1)
+				return
 			}
+			answered.Add(1)
+			c.p.stats.drained.Add(1)
 		})
 	})
 	acts = append(acts, c.progress()...)

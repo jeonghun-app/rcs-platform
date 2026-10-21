@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,12 @@ type Config struct {
 	// Logger receives operational events, never message content. Nil discards
 	// them.
 	Logger *slog.Logger
+	// DrainAnswer, if set, chooses the final response Drain gives a request
+	// still without one when the stop's time runs out: its status code, 300
+	// to 699, and a Retry-After if retryAfter is a second or more. Nil, or a
+	// code outside that range, answers 500 with Retry-After: 5. A request
+	// cancelled upstream gets 487 whatever it says (§9.2).
+	DrainAnswer func(req *sip.Request) (code int, retryAfter time.Duration)
 }
 
 // Proxy is the transaction-stateful proxy core of RFC 3261 §16, the transaction
@@ -115,6 +122,8 @@ type Proxy struct {
 	// must not be sent (silence).
 	silent sync.Map
 	ids    sip.IDGenerator
+	// drainAns is Config.DrainAnswer.
+	drainAns func(*sip.Request) (int, time.Duration)
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
@@ -228,6 +237,7 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
+		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
@@ -303,15 +313,19 @@ func (p *Proxy) Layer() *transaction.Layer { return p.layer }
 
 // Drain lets the requests in progress finish before a stop, as a service
 // does on SIGTERM: it waits until none is left, or until ctx ends, and then
-// answers each one still without a final response 500 with Retry-After,
-// so its sender tries another instance at once instead of waiting 64*T1
-// for its timers (#281). New requests are still served meanwhile: a
-// service's peers keep finding a task until its Cloud Map registration and
-// DNS answers age out, and pcscf still reaches the clients it has not yet
-// closed. It reports how many requests it answered so. Call Close after it.
+// answers each one still without a final response, 500 with Retry-After
+// unless Config.DrainAnswer says otherwise, so its sender tries another
+// instance at once instead of waiting 64*T1 for its timers (#281). A request
+// a Serve handler is answering is the handler's: its context is cancelled,
+// and the handler answers, or the proxy for it once it returns. New
+// requests are still served meanwhile: a service's peers keep finding a
+// task until its Cloud Map registration and DNS answers age out, and pcscf
+// still reaches the clients it has not yet closed. It reports how many
+// answers it sent. Call Close after it.
 //
-// A context lingers 64*T1 after a 2xx to an INVITE to pass retransmissions
-// on, but holds no request then, so Drain does not wait for it.
+// A request that has its final response is not in progress, even while its
+// context lingers, after a 2xx to an INVITE to pass retransmissions on or
+// while a forked branch waits for the answer to its CANCEL.
 func (p *Proxy) Drain(ctx context.Context) int {
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
@@ -327,11 +341,28 @@ func (p *Proxy) Drain(ctx context.Context) int {
 	}
 }
 
-// inProgress is the number of requests whose context is still open.
+// inProgress is the number of requests still without a final response.
 func (p *Proxy) inProgress() int {
+	n := 0
+	for _, c := range p.openContexts() {
+		c.mu.Lock()
+		if !c.finalSent {
+			n++
+		}
+		c.mu.Unlock()
+	}
+	return n
+}
+
+// openContexts returns the contexts not yet released.
+func (p *Proxy) openContexts() []*respContext {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.contexts)
+	all := make([]*respContext, 0, len(p.contexts))
+	for _, c := range p.contexts {
+		all = append(all, c)
+	}
+	return all
 }
 
 // drainSendWait bounds how long Drain waits for its answers to be handed to
@@ -344,25 +375,19 @@ const drainSendWait = 2 * time.Second
 // not drop them: handed to the sender, and with a *transport.Transport,
 // whose Close drops what its send queues still hold, written as well.
 func (p *Proxy) answerForStop() int {
-	p.mu.Lock()
-	all := make([]*respContext, 0, len(p.contexts))
-	for _, c := range p.contexts {
-		all = append(all, c)
-	}
-	p.mu.Unlock()
+	var answered atomic.Int64
 	var sent []<-chan struct{}
-	for _, c := range all {
-		if ch := c.answerForStop(); ch != nil {
+	for _, c := range p.openContexts() {
+		if ch := c.answerForStop(&answered); ch != nil {
 			sent = append(sent, ch)
 		}
 	}
-	p.stats.drained.Add(uint64(len(sent)))
 	deadline := time.Now().Add(drainSendWait)
 	for _, ch := range sent {
 		select {
 		case <-ch:
 		case <-time.After(time.Until(deadline)):
-			return len(sent)
+			return int(answered.Load())
 		}
 	}
 	if tr, ok := p.sender.(*transport.Transport); ok && len(sent) > 0 {
@@ -370,7 +395,21 @@ func (p *Proxy) answerForStop() int {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	return len(sent)
+	return int(answered.Load())
+}
+
+// drainResponse is the final response Drain gives req (Config.DrainAnswer).
+func (p *Proxy) drainResponse(req *sip.Request) (*sip.Response, error) {
+	code, retryAfter := 500, 5*time.Second
+	if p.drainAns != nil {
+		if c, ra := p.drainAns(req); c >= 300 && c <= 699 {
+			code, retryAfter = c, ra
+		}
+	}
+	if retryAfter < time.Second {
+		return p.response(req, code)
+	}
+	return p.response(req, code, [2]string{"Retry-After", strconv.FormatInt(int64(retryAfter/time.Second), 10)})
 }
 
 // Close stops the proxy: every transaction ends without a response, pending
@@ -611,7 +650,7 @@ type Stats struct {
 	ACKsDropped            uint64 // ACKs that could not be forwarded
 	UpstreamErrors         uint64 // responses the upstream transaction could not send, dropped (§16.9)
 
-	// Drained counts requests Drain answered 500 because they had no final
+	// Drained counts the answers Drain sent to requests that had no final
 	// response when the stop's time ran out.
 	Drained uint64
 }
