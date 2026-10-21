@@ -75,9 +75,11 @@ func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
 	// the core sends the originator nothing, as the platform's proxy does
 	// (RFC 4320 §4.2 forbids the 408 RFC 3261 §16.7 had), and the
 	// originator's own transaction times out. The core's T1 is 10 ms, so
-	// it gives up at 640 ms; the originator's Timer F, on a clock five
-	// times fast, comes at 6.4 s, so a 408 or a 500 from the core would
-	// reach it first.
+	// it gives up at 640 ms, and its layer's 500 safety net would come
+	// about 5 s after that (64*T1 + FinalTimeoutMargin); the originator's
+	// Timer F, on a clock twice as fast, comes at 16 s, so a 408 or a 500
+	// from the core would reach it first even on a loaded host (review of
+	// #372: at five times fast, 6.4 s, the 500 was only 0.75 s ahead).
 	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -87,7 +89,7 @@ func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
 		t.Fatal(err)
 	}
 	a, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: domain, IMPU: u,
-		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000001", Credentials: creds, Clock: fastClock{5}})
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000001", Credentials: creds, Clock: fastClock{2}})
 	if err != nil {
 		t.Fatal(err)
 	}
