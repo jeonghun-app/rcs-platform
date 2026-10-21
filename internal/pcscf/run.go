@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync/atomic"
 	"time"
@@ -136,8 +137,20 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// After the proxy closes, so that every SUBSCRIBE under way has ended.
 	defer pc.subs.close()
 	defer stopSubs()
-	// A closed flow's registrations are gone (RFC 5626 §5.3).
-	fl.onClosed = pc.registry.removeFlow
+	var relay *relayClient
+	if cfg.RelayToken.v != "" && cfg.RelayURL != nil {
+		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken.v, cfg.RelayTimeout, relayDialer(cfg))
+	}
+	anchorCtx, stopAnchor := context.WithCancel(context.Background())
+	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now))
+	defer pc.msrp.close()
+	defer stopAnchor()
+	// A closed flow's registrations and MSRP sessions are gone (RFC 5626
+	// §5.3).
+	fl.onClosed = func(id transport.FlowID) {
+		pc.registry.removeFlow(id)
+		pc.msrpFlowClosed(id)
+	}
 	router := d.router
 	if router == nil {
 		router = pc
@@ -190,6 +203,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	stopSweep := every(d.sweep, func() {
 		pc.registry.sweep()
 		pc.reconcileSubscriptions()
+		pc.sweepMSRP()
 		tm.record(rt.Metrics, tr.Stats())
 	})
 	defer stopSweep()
@@ -222,6 +236,17 @@ func awaitAnswers(px *proxy.Proxy, tr *transport.Transport, d time.Duration) {
 	for tr.Stats().QueuedBytes > 0 && time.Now().Before(end) {
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// relayDialer opens the connections to msrp-relay's control API: in
+// staging and prod only to private addresses, whatever the name resolves
+// to, so the token goes nowhere else (ADR 0007 §5); dev reaches a relay on
+// loopback.
+func relayDialer(cfg Config) func(ctx context.Context, network, address string) (net.Conn, error) {
+	if cfg.AllowLoopback {
+		return (&net.Dialer{Timeout: cfg.RelayTimeout}).DialContext
+	}
+	return runtime.InternalDialer{Timeout: cfg.RelayTimeout}.DialContext
 }
 
 // sweepInterval is how often expired registrations, and reservations no
