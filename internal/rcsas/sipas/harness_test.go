@@ -317,7 +317,7 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		// loaded host a retransmission can come after the ACK has gone,
 		// where it would pass for the next request's answer (#290). A UAC
 		// matches a response to its transaction; this one by CSeq.
-		if cs, err := res.Header.CSeq(); err != nil || cs.Seq != uint32(cseq) || cs.Method != m.method {
+		if !answers(res, sip.CSeq{Seq: uint32(cseq), Method: m.method}) {
 			continue
 		}
 		if res.StatusCode >= 200 {
@@ -326,9 +326,21 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 	}
 }
 
+// answers reports whether res is the answer to the request with CSeq
+// want: a UAC matches a response to its transaction, and a test peer takes
+// nothing else for its request's answer (#290).
+func answers(res *sip.Response, want sip.CSeq) bool {
+	cs, err := res.Header.CSeq()
+	return err == nil && cs == want
+}
+
 // forward sends req as the core would, after its own processing, and
 // returns its final response.
 func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
+	want, err := req.Header.CSeq()
+	if err != nil {
+		return nil, err
+	}
 	b, err := req.Bytes()
 	if err != nil {
 		return nil, err
@@ -342,7 +354,8 @@ func (p *peer) forward(req *sip.Request) (*sip.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 {
+		// The answer to req only, as try takes (#290).
+		if res, ok := msg.(*sip.Response); ok && res.StatusCode >= 200 && answers(res, want) {
 			return res, nil
 		}
 	}
@@ -393,36 +406,54 @@ func (e *fakeEngine) origins() []messaging.Origin {
 	return append([]messaging.Origin(nil), e.got...)
 }
 
-// #290: the test peer takes the answer to its own request only. A 2xx of
-// an earlier INVITE, retransmitted after the ACK went, comes first here,
+// #290: the test peer takes the answer to its own request only, for a
+// request it sends (try) and one it forwards as the core (forward). A 2xx
+// of an earlier INVITE, retransmitted after the ACK went, comes first here,
 // as it did under load, and must not pass for the UPDATE's answer.
 func TestThePeerTakesTheAnswerToItsOwnRequest(t *testing.T) {
-	ours, theirs := net.Pipe()
-	t.Cleanup(func() { _ = ours.Close(); _ = theirs.Close() })
-	p := &peer{t: t, nc: ours, r: sip.NewReader(bufio.NewReader(ours), sip.Limits{})}
-	go func() {
-		br := bufio.NewReader(theirs)
-		for {
-			line, err := br.ReadString('\n')
+	update := "UPDATE " + bob + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-f\r\nMax-Forwards: 70\r\n" +
+		"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c1\r\nCSeq: 3 UPDATE\r\nContent-Length: 0\r\n\r\n"
+	for name, send := range map[string]func(*peer) (*sip.Response, error){
+		"try": func(p *peer) (*sip.Response, error) {
+			return p.try(msg{method: "UPDATE", uri: bob, toTag: "b1", callID: "c1", cseq: 3})
+		},
+		"forward": func(p *peer) (*sip.Response, error) {
+			m, err := sip.NewReader(bufio.NewReader(strings.NewReader(update)), sip.Limits{}).ReadMessage()
 			if err != nil {
-				return
+				return nil, err
 			}
-			if line == "\r\n" {
-				break
+			return p.forward(m.(*sip.Request))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ours, theirs := net.Pipe()
+			t.Cleanup(func() { _ = ours.Close(); _ = theirs.Close() })
+			p := &peer{t: t, nc: ours, r: sip.NewReader(bufio.NewReader(ours), sip.Limits{})}
+			go func() {
+				br := bufio.NewReader(theirs)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == "\r\n" {
+						break
+					}
+				}
+				answer := func(cseq string, body string) string {
+					return "SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-x\r\n" +
+						"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c1\r\nCSeq: " + cseq + "\r\n" +
+						"Content-Length: " + fmt.Sprint(len(body)) + "\r\n\r\n" + body
+				}
+				_, _ = io.WriteString(theirs, answer("2 INVITE", "v=0\r\n")+answer("3 UPDATE", ""))
+			}()
+			res, err := send(p)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		answer := func(cseq string, body string) string {
-			return "SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-x\r\n" +
-				"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c1\r\nCSeq: " + cseq + "\r\n" +
-				"Content-Length: " + fmt.Sprint(len(body)) + "\r\n\r\n" + body
-		}
-		_, _ = io.WriteString(theirs, answer("2 INVITE", "v=0\r\n")+answer("3 UPDATE", ""))
-	}()
-	res, err := p.try(msg{method: "UPDATE", uri: bob, toTag: "b1", callID: "c1", cseq: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cs, _ := res.Header.CSeq(); cs.Seq != 3 || cs.Method != "UPDATE" || len(res.Body) != 0 {
-		t.Fatalf("took %v with %q for the UPDATE's answer", cs, res.Body)
+			if cs, _ := res.Header.CSeq(); cs.Seq != 3 || cs.Method != "UPDATE" || len(res.Body) != 0 {
+				t.Fatalf("took %v with %q for the UPDATE's answer", cs, res.Body)
+			}
+		})
 	}
 }
