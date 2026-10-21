@@ -166,6 +166,9 @@ type Config struct {
 	// Logger, if set, receives warnings about answers the HSS should not
 	// have sent. Nothing logged names a user.
 	Logger *slog.Logger
+	// Self are the URIs that name this I-CSCF, the proxy's Self: a request
+	// whose Route names it again is refused as a loop.
+	Self []sip.URI
 	// Now, if set, is the clock behind the 30 s an address that failed
 	// stays at the back of the list, and behind the rate of a warning;
 	// nil is time.Now.
