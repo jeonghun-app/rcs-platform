@@ -242,12 +242,8 @@ func stalledPeerProxy(t *testing.T) (*Proxy, *transport.Transport, netip.AddrPor
 		}
 	}()
 	// Well past what the two sockets' buffers take: the writer is stuck.
-	for deadline := time.Now().Add(time.Minute); tr.Stats().QueuedBytes < 1<<20; {
-		if time.Now().After(deadline) {
-			t.Fatalf("the peer's queue holds %d bytes, want 1 MiB", tr.Stats().QueuedBytes)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	queued := func() int64 { return int64(tr.Stats().QueuedBytes) }
+	waitUntil(t, "1 MiB queued for the peer that does not read", func() bool { return queued() >= 1<<20 }, queued, tr)
 	return p, tr, addr
 }
 
@@ -279,7 +275,9 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 	t.Cleanup(func() { drainSendWait, drainFlushStall = DrainSendWait, time.Second })
 	responded := make(chan struct{}, 2)
 	var px atomic.Pointer[Proxy]
-	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) {
+	// No write deadline cuts the stalled peer first, which would end its
+	// connection rather than let Drain judge it.
+	tr, err := transport.New(transport.Config{WriteTimeout: time.Hour}, func(in transport.Inbound) {
 		if p := px.Load(); p != nil {
 			p.Receive(in)
 		}
@@ -307,12 +305,17 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 				}
 				res.Header.Set("Content-Type", "text/plain")
 				res.Body = []byte(strings.Repeat("b", size))
-				if err := u.Respond(res); err != nil {
+				err = u.Respond(res)
+				if r.Message.Method == "INFO" {
+					// The stalled peer's: the requests it had in flight
+					// when it stopped fill its queue, and the answers still
+					// waiting for room fail when the transport closes.
+					return
+				}
+				if err != nil {
 					t.Errorf("answering %s: %v", r.Message.Method, err)
 				}
-				if r.Message.Method != "INFO" {
-					responded <- struct{}{}
-				}
+				responded <- struct{}{}
 			}}
 		}),
 	})
@@ -343,12 +346,8 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 				}
 			}
 		}()
-		for deadline := time.Now().Add(time.Minute); tr.Stats().QueuedBytes < 1<<20; {
-			if time.Now().After(deadline) {
-				t.Fatalf("the stalled peer's queue holds %d bytes, want 1 MiB", tr.Stats().QueuedBytes)
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+		queued := func() int64 { return int64(tr.Stats().QueuedBytes) }
+		waitUntil(t, "1 MiB queued for the peer that does not read", func() bool { return queued() >= 1<<20 }, queued, tr)
 	}
 
 	peer := dialSIP(t, addr.String())
@@ -403,5 +402,108 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 	slices.Sort(sizes)
 	if !slices.Equal(sizes, []int{10, long}) {
 		t.Fatalf("the peer got answers of %v bytes, want the long one and the short one", sizes)
+	}
+}
+
+// Answers already decided but still waiting for room in a queue when Drain
+// starts are delivered too, to a peer that reads: Flush waits for them as for
+// what is queued (QA of #366, whose probe this is). The peer sends 3000
+// requests, each answered 200 with its long Via, and reads none until every
+// one has been routed, so most answers wait for room in the full queue; it
+// then reads at about 16 MB/s while Drain runs, and the transport closes
+// right after it, as in pcscf.
+func TestDrainDeliversAnswersStillWaitingForRoom(t *testing.T) {
+	const requests = 3000
+	drainSendWait, drainFlushStall = time.Hour, 10*time.Second
+	t.Cleanup(func() { drainSendWait, drainFlushStall = DrainSendWait, time.Second })
+	var routed atomic.Int64
+	var px atomic.Pointer[Proxy]
+	tr, err := transport.New(transport.Config{WriteTimeout: time.Hour}, func(in transport.Inbound) {
+		if p := px.Load(); p != nil {
+			p.Receive(in)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	addr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(tr, Config{
+		Self: []sip.URI{mustURI("sip:" + addr.String() + ";lr")},
+		Router: RouterFunc(func(context.Context, *Request) Decision {
+			routed.Add(1)
+			return Decision{Status: 200}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	px.Store(p)
+
+	peer := dialSIP(t, addr.String())
+	_ = peer.nc.SetDeadline(time.Now().Add(time.Hour))
+	pad := strings.Repeat("z", 3000)
+	go func() {
+		for i := range requests {
+			text := fmt.Sprintf("MESSAGE sip:bob@example.com SIP/2.0\r\n"+
+				"Via: SIP/2.0/TCP %s;branch=z9hG4bK-room-%d;p=%s\r\n"+
+				"Max-Forwards: 70\r\nTo: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
+				"Call-ID: room-%d\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n", peer.nc.LocalAddr(), i, pad, i)
+			if _, err := io.WriteString(peer.nc, text); err != nil {
+				return
+			}
+		}
+	}()
+	waitUntil(t, "every request to be routed", func() bool { return routed.Load() == requests }, routed.Load, tr)
+	read := make(chan []byte, 1)
+	go func() {
+		var got bytes.Buffer
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := peer.nc.Read(buf)
+			got.Write(buf[:n])
+			if err != nil {
+				read <- got.Bytes()
+				return
+			}
+			time.Sleep(4 * time.Millisecond)
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.Drain(ctx)
+	_ = tr.Close()
+	r := sip.NewReader(bufio.NewReader(bytes.NewReader(<-read)), sip.Limits{})
+	answered := 0
+	for {
+		m, err := r.ReadMessage()
+		if err != nil {
+			break
+		}
+		if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
+			answered++
+		}
+	}
+	if answered != requests {
+		t.Fatalf("the peer got %d final responses of %d", answered, requests)
+	}
+}
+
+// waitUntil waits for cond while progress keeps changing, and fails, with
+// the transport's stats, once it has not for 30 s.
+func waitUntil(t *testing.T, what string, cond func() bool, progress func() int64, tr *transport.Transport) {
+	t.Helper()
+	last, lastAt := progress(), time.Now()
+	for !cond() {
+		if n := progress(); n != last {
+			last, lastAt = n, time.Now()
+		} else if time.Since(lastAt) > 30*time.Second {
+			t.Fatalf("waiting for %s, nothing moved for 30 s: %+v", what, tr.Stats())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

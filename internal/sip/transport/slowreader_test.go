@@ -254,3 +254,68 @@ func TestFlushWaitsForQueuedOutputUnlessTheWriterStalls(t *testing.T) {
 		})
 	}
 }
+
+// Flush also waits for a message whose sender was waiting for room in the
+// queue when it began: that output is decided as much as what is queued
+// (QA of #366).
+func TestFlushWaitsForASenderWaitingForRoom(t *testing.T) {
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	start := make(chan struct{})
+	var read atomic.Int64
+	go func() {
+		<-start
+		buf := make([]byte, writeChunk)
+		for {
+			n, err := peer.Read(buf)
+			read.Add(int64(n))
+			if err != nil {
+				return
+			}
+			// Slowly, so that a Flush that stopped after the first message
+			// would leave most of the second unread.
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{noWriteDeadline{server}}, SendQueueBytes: 64 << 10, WriteTimeout: time.Hour})
+	listen(t, tr, ListenerConfig{Network: TCP})
+	first := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKfirst")
+	first.Body = []byte(strings.Repeat("x", 4*writeChunk))
+	if _, err := tr.SendRequest(first, pipeDst); err != nil {
+		t.Fatal(err)
+	}
+	second := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKsecond")
+	second.Body = []byte(strings.Repeat("y", 4*writeChunk))
+	sent := make(chan error, 1)
+	go func() {
+		_, err := tr.SendRequest(second, pipeDst)
+		sent <- err
+	}()
+	f := tr.flows.peer(reuseKey{network: TCP, remote: pipeDst.Addr})
+	if f == nil {
+		t.Fatal("no flow")
+	}
+	eventually(t, "the second send to wait for room", func() bool {
+		f.q.mu.Lock()
+		defer f.q.mu.Unlock()
+		return f.q.waiting > 0
+	})
+	done := make(chan int64, 1)
+	go func() {
+		tr.Flush(time.Now().Add(time.Hour), 10*time.Second)
+		done <- read.Load() // the peer reads on meanwhile
+	}()
+	close(start)
+	var got int64
+	select {
+	case got = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Flush did not return")
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(len(first.Body) + len(second.Body)); got < want {
+		t.Fatalf("the peer had read %d bytes when Flush returned, fewer than the two bodies' %d", got, want)
+	}
+}

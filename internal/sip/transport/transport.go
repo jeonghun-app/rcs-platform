@@ -702,9 +702,9 @@ type counters struct {
 	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty atomic.Uint64
 }
 
-// Stats returns the current gauges and counters.
 // Flush waits until each stream connection has written the output it had
-// queued when Flush was called, until that connection's writer has made no
+// queued when Flush was called, and that of the senders then waiting for room
+// in its queue, until that connection's writer has made no
 // progress (a chunk written, see writeAll) for stall, counted from the call
 // at the earliest, or until deadline. Output queued meanwhile is not waited
 // for, so a busy connection ends the wait as soon as its earlier output is
@@ -721,8 +721,8 @@ func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
 	var ps []pending
 	for _, f := range t.flows.streams() {
 		f.q.mu.Lock()
-		if f.q.queued > 0 && !f.q.closed {
-			ps = append(ps, pending{f.q, f.q.sent + uint64(f.q.queued)})
+		if f.q.queued+f.q.waiting > 0 && !f.q.closed {
+			ps = append(ps, pending{f.q, f.q.sent + uint64(f.q.queued+f.q.waiting)})
 		}
 		f.q.mu.Unlock()
 	}
@@ -742,6 +742,7 @@ func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
 	}
 }
 
+// Stats returns the current gauges and counters.
 func (t *Transport) Stats() Stats {
 	c := &t.stats
 	ts := t.flows.stats()

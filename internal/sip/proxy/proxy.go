@@ -430,8 +430,9 @@ func (p *Proxy) answerForStop() int {
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
 // write what its send queues hold: its Close drops it. It waits for each
-// connection's queue as it was then, and gives up on one whose writer makes
-// no progress for drainFlushStall (Transport.Flush).
+// connection's queue as it was then, the answers still waiting for room in
+// it included, and gives up on one whose writer makes no progress for
+// drainFlushStall (Transport.Flush).
 func (p *Proxy) flushSender(deadline time.Time) {
 	for p.cancelsSending.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
