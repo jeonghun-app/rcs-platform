@@ -3,7 +3,6 @@ package ifc
 import (
 	"encoding/xml"
 	"fmt"
-	"math"
 	"strconv"
 )
 
@@ -190,9 +189,7 @@ func (r *reader) publicIdentity(where string, w *wirePublicIdentity) PublicIdent
 }
 
 func (r *reader) filterCriteria(where string, w *wireFilterCriteria) FilterCriteria {
-	// A priority fits an int32, as TS 29.228 writes it (xs:int), and as the
-	// S-CSCF signs it into a request's place in the chain.
-	fc := FilterCriteria{Priority: r.requiredInteger(where, "Priority", w.Priority, 0, math.MaxInt32)}
+	fc := FilterCriteria{Priority: r.requiredInteger(where, "Priority", w.Priority, 0, maxInt)}
 	if tp := atMostOne(r, where, "TriggerPoint", w.TriggerPoint); tp != nil {
 		fc.TriggerPoint = r.triggerPoint(where+"/TriggerPoint", tp)
 	}

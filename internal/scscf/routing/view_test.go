@@ -75,3 +75,21 @@ func TestTheIFCViewReadsTheSDPPartOfAMultipartBody(t *testing.T) {
 		t.Errorf("an SDP part past %d parts: %q", maxParts, lines)
 	}
 }
+
+// TestTheIFCViewSpellsFeatureTagsOneWay (#359 security review): names and
+// quoted tokens in lower case, an escape's hex digits in upper case, the
+// Contact's own URI and a string value kept.
+func TestTheIFCViewSpellsFeatureTagsOneWay(t *testing.T) {
+	r := request(t, "INVITE", impu1,
+		`Accept-Contact: *;+G.3GPP.ICSI-REF="URN%3aURN-7%3a3GPP-SERVICE.IMS.ICSI.OMA.CPM.SESSION";REQUIRE`,
+		`Contact: <sip:UE@192.0.2.10;Transport=TCP>;+SIP.Instance="<urn:uuid:ABC>";+G.OMA.SIP-IM`).Message
+	want := map[string]string{
+		"Accept-Contact": `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";require`,
+		"Contact":        `<sip:UE@192.0.2.10;Transport=TCP>;+sip.instance="<urn:uuid:ABC>";+g.oma.sip-im`,
+	}
+	for _, h := range (view{req: r}).HeaderFields() {
+		if w, ok := want[h.Name]; ok && h.Value != w {
+			t.Errorf("%s: %q, want %q", h.Name, h.Value, w)
+		}
+	}
+}

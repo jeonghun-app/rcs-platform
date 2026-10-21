@@ -50,7 +50,7 @@ type plan struct {
 
 // decide is the Decision for s, the step of req: its answer, or its hops,
 // with the S-CSCF's Record-Route, signed for the dialog's hops (recorder),
-// if recordRoute.
+// if recordRoute and req sets up a dialog (formsDialog).
 func (rt *Router) decide(req *sip.Request, s step, recordRoute bool) proxy.Decision {
 	switch {
 	case s.response != nil:
@@ -60,7 +60,7 @@ func (rt *Router) decide(req *sip.Request, s step, recordRoute bool) proxy.Decis
 	}
 	p := &plan{hops: map[string]hop{}}
 	d := proxy.Decision{Targets: p.add(s.hops), Prepare: p.prepare, OnBranchFailure: p.failed, OnFinal: p.final}
-	if recordRoute {
+	if recordRoute && formsDialog(req.Method) {
 		p.rec = rt.recorder(req)
 		d.RecordRoute = []sip.Address{rt.cfg.RecordRoute}
 		d.OnResponse = p.rec.response

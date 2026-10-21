@@ -1,6 +1,12 @@
 package routing
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +19,11 @@ import (
 // below the S-CSCF's in the request, and the callee's P-CSCF entry, above
 // it in the response.
 var (
-	callerPCSCF = "<sip:" + flow(7) + "@198.51.100.7:5070;transport=tcp;lr>"
-	calleePCSCF = "<sip:" + flow(1) + "@198.51.100.5:5070;transport=tcp;lr>"
+	// As pcscf writes its core-facing value: the flow, outbound, the icid
+	// and its own dialog MAC, also named dlg, which the S-CSCF's hops leave
+	// out.
+	callerPCSCF = "<sip:" + flow(7) + "@198.51.100.7:5070;transport=tcp;lr;ob;icid=call7;dlg=pcscfmac7>"
+	calleePCSCF = "<sip:" + flow(1) + "@198.51.100.5:5070;transport=tcp;lr;ob;icid=call1;dlg=pcscfmac1>"
 )
 
 // setUp runs an INVITE for impu1 through Terminating with extra header
@@ -43,7 +52,8 @@ func setUp(t *testing.T, e *env, rt *Router, extra ...string) (proxy.Decision, *
 	return d, b
 }
 
-// ourEntry is the S-CSCF's Record-Route value in h, the one with dlg.
+// ourEntry is the S-CSCF's Record-Route value in h: its host, with dlg,
+// which pcscf's values carry too.
 func ourEntry(t *testing.T, h *sip.Header) sip.Address {
 	t.Helper()
 	rr, err := h.RecordRoute()
@@ -51,7 +61,7 @@ func ourEntry(t *testing.T, h *sip.Header) sip.Address {
 		t.Fatal(err)
 	}
 	for _, a := range rr {
-		if _, ok := a.URI.Param(dlgParam); ok {
+		if _, ok := a.URI.Param(dlgParam); ok && a.URI.Host == "scscf.rcs.local" {
 			return a
 		}
 	}
@@ -205,5 +215,156 @@ func TestOnlyTheSCSCFsOwnValueIsSigned(t *testing.T) {
 	}
 	if got, _ := b.Header.Elements("Record-Route"); len(got) != 1 || got[0] != callerPCSCF {
 		t.Errorf("Record-Route %q", got)
+	}
+}
+
+// TestAStandaloneRequestIsNotRecorded (#322): an OPTIONS or a MESSAGE sets
+// up no dialog, and its Contact, which no proxy checked, is signed for
+// nothing; a request naming that hop as inside a dialog is 403. An INVITE
+// is recorded.
+func TestAStandaloneRequestIsNotRecorded(t *testing.T) {
+	core := "sip:10.0.130.25:5060;transport=tcp"
+	for _, method := range []string{"OPTIONS", "MESSAGE", "INVITE", "SUBSCRIBE", "REFER"} {
+		e := newEnv(t)
+		e.registered(binding(1, 1, time.Hour))
+		rt := e.router(nil)
+		r := request(t, method, impu1, "Contact: <"+core+">")
+		_ = r.Message.Header.Set("Call-ID", "dialog-1")
+		d := rt.Terminating(bg, r)
+		recorded := len(d.RecordRoute) == 1 && d.OnResponse != nil
+		if want := method != "OPTIONS" && method != "MESSAGE"; recorded != want {
+			t.Errorf("%s: recorded %v, want %v", method, recorded, want)
+		}
+		if recorded {
+			continue
+		}
+		b := r.Message.Clone()
+		if err := d.Prepare(bg, d.Targets[0], b); err != nil || b.Header.Has("Record-Route") {
+			t.Errorf("%s: prepared %v with Record-Route %q", method, err, b.Header.Get("Record-Route"))
+		}
+		unsigned := sip.Address{URI: mustURI("sip:scscf.rcs.local;transport=tcp;lr")}
+		if d := rt.InDialog(bg, inDialog(t, core, "", unsigned)); d.Status != 403 {
+			t.Errorf("%s: a request to its Contact is %d", method, d.Status)
+		}
+	}
+}
+
+// TestADialogKeyPrintsWithoutItsKey (security on #322): fmt, slog and JSON
+// show its ID alone, in a Config as on its own.
+func TestADialogKeyPrintsWithoutItsKey(t *testing.T) {
+	k := DialogKey{ID: "k2", Key: []byte("0123456789abcdef0123456789abcdef")}
+	cfg := Config{DialogKeys: []DialogKey{k}}
+	var logged bytes.Buffer
+	slog.New(slog.NewTextHandler(&logged, nil)).Info("key", "key", k, "keys", cfg.DialogKeys)
+	js, err := json.Marshal(struct{ Keys []DialogKey }{cfg.DialogKeys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{fmt.Sprint(k), fmt.Sprintf("%v %+v %#v %s %x", k, k, k, k, k), fmt.Sprintf("%+v", cfg), logged.String(), string(js)} {
+		for _, leak := range []string{"0123456789abcdef", hex.EncodeToString(k.Key[:8]), base64.StdEncoding.EncodeToString(k.Key[:9])} {
+			if strings.Contains(out, leak) {
+				t.Errorf("%q gives the key away", out)
+			}
+		}
+		if !strings.Contains(out, "k2") {
+			t.Errorf("%q does not name the key", out)
+		}
+	}
+}
+
+// TestNewKeepsTheCurrentAndThePreviousKeyAlone: a third is refused, as a
+// list that grew with each rotation would keep every key that leaked.
+func TestNewKeepsTheCurrentAndThePreviousKeyAlone(t *testing.T) {
+	e := newEnv(t)
+	k := func(id string, b byte) DialogKey {
+		return DialogKey{ID: id, Key: bytes.Repeat([]byte{b}, MinDialogKeyBytes)}
+	}
+	if _, err := New(validConfig(e, func(c *Config) { c.DialogKeys = []DialogKey{k("k3", 3), k("k2", 2)} })); err != nil {
+		t.Errorf("two keys: %v", err)
+	}
+	if _, err := New(validConfig(e, func(c *Config) { c.DialogKeys = []DialogKey{k("k3", 3), k("k2", 2), k("k1", 1)} })); err == nil {
+		t.Error("three keys accepted")
+	}
+}
+
+// TestASignedSIPSHopIsItsTLSListener: sips: defaults to TLS on 5061, which
+// the same URI written out names, and no TCP one does.
+func TestASignedSIPSHopIsItsTLSListener(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil, func(c *Config) {
+		c.ApplicationServers = append(c.ApplicationServers, mustURI("sips:rcs-as.rcs.local:5061"))
+	})
+	signed := signedFor(rt, "sips:as@10.0.131.7")
+	for target, want := range map[string]int{
+		"sips:as@10.0.131.7":                    0,
+		"sips:as@10.0.131.7:5061;transport=tls": 0,
+		"sip:as@10.0.131.7:5061;transport=tcp":  403,
+	} {
+		if d := rt.InDialog(bg, inDialog(t, target, "", signed)); d.Status != want {
+			t.Errorf("%s: %d, want %d", target, d.Status, want)
+		}
+	}
+}
+
+// TestNoSignatureCoversAContactAClientWrote (QA on #322): a standalone
+// request's branch carries no signed Record-Route, so no request names its
+// client-written Contact as a signed hop. One row a method.
+func TestNoSignatureCoversAContactAClientWrote(t *testing.T) {
+	core := "sip:10.0.130.25:5060;transport=tcp"
+	for _, method := range []string{"MESSAGE", "OPTIONS", "INFO", "PUBLISH", "NOTIFY", "UPDATE"} {
+		t.Run(method, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, 0, time.Hour))
+			rt := e.router(nil)
+			r := request(t, method, impu1, "Contact: <"+core+">")
+			_ = r.Message.Header.Set("Call-ID", "dialog-1")
+			d := rt.Terminating(bg, r)
+			b := r.Message.Clone()
+			b.URI = d.Targets[0].URI
+			for i := len(d.RecordRoute) - 1; i >= 0; i-- {
+				_ = b.Header.Prepend("Record-Route", d.RecordRoute[i].String())
+			}
+			if err := d.Prepare(bg, d.Targets[0], b); err != nil {
+				t.Fatal(err)
+			}
+			rr, _ := b.Header.RecordRoute()
+			for _, a := range rr {
+				if _, ok := a.URI.Param(dlgParam); ok {
+					t.Errorf("the branch carries a signed Record-Route %s", a.String())
+					if rt.InDialog(bg, inDialog(t, core, "", a)).Status == 0 {
+						t.Error("which signs the client-written Contact")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestASignatureHoldsOnlyWhole (QA on #322): a MAC cut short, or one an
+// S-CSCF of another name made, signs nothing; a hop signed without its
+// port is the one on the default port.
+func TestASignatureHoldsOnlyWhole(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil)
+	ue := "sip:ue@192.0.2.40:5060;transport=tcp"
+	good := signedFor(rt, pcscfUE)
+	v, _ := good.URI.Param(dlgParam)
+	id, mac, _ := strings.Cut(v, ".")
+	cut := good
+	cut.URI.Params = append(sip.Params(nil), good.URI.Params...)
+	cut.URI.Params.Set(dlgParam, id+"."+mac[:len(mac)-2])
+	otherName := e.router(nil, func(c *Config) {
+		c.RecordRoute = mustAddress("<sip:scscf.other.local;transport=tcp;lr>")
+	})
+	for name, a := range map[string]sip.Address{"cut short": cut, "another S-CSCF's": signedFor(otherName, pcscfUE)} {
+		if d := rt.InDialog(bg, inDialog(t, ue, "<"+pcscfUE+">", a)); d.Status != 403 {
+			t.Errorf("%s: status %d, want 403", name, d.Status)
+		}
+	}
+	if d := rt.InDialog(bg, inDialog(t, ue, "<"+pcscfUE+">", good)); d.Status != 0 {
+		t.Errorf("the whole signature: %d", d.Status)
+	}
+	if d := rt.InDialog(bg, inDialog(t, asTask, "", signedFor(rt, "sip:10.0.131.7;transport=tcp"))); d.Status != 0 {
+		t.Errorf("default port: %d", d.Status)
 	}
 }

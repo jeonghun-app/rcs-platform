@@ -71,6 +71,9 @@ func (r *reader) validateProfile(where string, p *ServiceProfile) {
 }
 
 func (r *reader) validateCriteria(where string, fc *FilterCriteria) {
+	// A priority fits an int32, as TS 29.228 writes it (xs:int), and as the
+	// S-CSCF signs it into a request's place in the chain; parsing runs this
+	// too.
 	if fc.Priority < 0 || fc.Priority > math.MaxInt32 {
 		r.fail(where, "Priority is negative or beyond an int32")
 	}

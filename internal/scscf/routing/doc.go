@@ -78,7 +78,8 @@
 // the chain, and the request goes to the I-CSCF for that user.
 //
 // A dialog's requests come back along the S-CSCF's Record-Route value,
-// which it signs when the dialog is set up (#322): with a key ID and a MAC,
+// which it writes only on a request that sets up a dialog (INVITE,
+// SUBSCRIBE, REFER) and signs as the dialog is set up (#322): with a key ID and a MAC,
 // under a key every scscf instance shares, over the Call-ID, the S-CSCF's
 // name and each of the dialog's hops next to it, scheme, user, host, port
 // and transport. The value in the request the callee gets signs the hop

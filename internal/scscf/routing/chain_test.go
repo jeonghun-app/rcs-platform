@@ -257,7 +257,7 @@ func TestTheEndOfAnOriginatingChainIsTheICSCFOfTheHomeDomain(t *testing.T) {
 	} {
 		e := newEnv(t)
 		e.registered(binding(1, 0, time.Hour))
-		d := e.router(nil).Originating(bg, fromUser(t, "MESSAGE", target))
+		d := e.router(nil).Originating(bg, fromUser(t, "INVITE", target))
 		if want == "" {
 			if d.Status != 404 {
 				t.Errorf("%s: status %d, targets %v", target, d.Status, uris(d.Targets))
@@ -1005,5 +1005,18 @@ func TestTheChainsAnswerKeepsItsRetryAfter(t *testing.T) {
 	d.OnFinal(bg, res)
 	if res.StatusCode != 500 || res.Header.Get("Retry-After") != storeRetryAfter {
 		t.Errorf("%d with Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
+
+// TestAStandaloneRequestsChainRecordsNoRoute (#322): an originating MESSAGE
+// sets up no dialog, and its branches carry no Record-Route.
+func TestAStandaloneRequestsChainRecordsNoRoute(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), ifc.SessionContinued))
+	r := fromUser(t, "MESSAGE", impu2)
+	d := e.router(nil).Initial(bg, r)
+	if len(d.RecordRoute) != 0 || d.OnResponse != nil {
+		t.Errorf("Record-Route %v", d.RecordRoute)
 	}
 }

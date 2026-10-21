@@ -35,8 +35,8 @@ const saveAttempts = 3
 // not know, 480 for a user without a live binding the preferences accept,
 // 400 for more than maxPreferences of them or one that requires something
 // and does not parse, and 500 with Retry-After for a store or HSS that
-// cannot be asked. The S-CSCF's Record-Route value signs the dialog's hops
-// (recorder).
+// cannot be asked. For a request that sets up a dialog the S-CSCF's
+// Record-Route value signs the dialog's hops (recorder).
 func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decision {
 	return rt.decide(r.Message, rt.terminating(ctx, r), true)
 }
@@ -83,6 +83,15 @@ func (rt *Router) terminating(ctx context.Context, r *proxy.Request) step {
 	// pcscf removes any a client wrote (ADR 0007 §7).
 	pos.kept = r.Message.Header.Has("P-Served-User") && !rt.fromEdgeProxy(r.Message)
 	return rt.next(ctx, r.Message, pos, set, rt.toContacts(r.Message, set))
+}
+
+// formsDialog reports whether a request of method sets up a dialog, the
+// S-CSCF recording its route (RFC 3261 §12.1, RFC 6665, RFC 3515), as
+// pcscf's does. A standalone request, such as OPTIONS or MESSAGE, is not
+// recorded: no proxy records it, so its hop toward the caller would be a
+// Contact nobody checked, which a signature would then vouch for (#322).
+func formsDialog(method string) bool {
+	return method == "INVITE" || method == "SUBSCRIBE" || method == "REFER"
 }
 
 // badPreferences answers a request whose caller preferences are refused.
