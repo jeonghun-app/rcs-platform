@@ -262,6 +262,9 @@ type rig struct {
 	addrs   []string
 	logs    *bytes.Buffer
 	logMu   *sync.Mutex
+	// openWait bounds a test client's Open: the rig's store timeout when
+	// a test sets one, as the relay's bind makes store calls under it.
+	openWait time.Duration
 }
 
 type rigOption func(*relayOptions)
@@ -293,12 +296,15 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 	loopback := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
 	ports := []uint16{r.as.addr.Port()}
 	stTimeout := 5 * time.Second
+	r.openWait = 5 * time.Second
 	for _, opt := range opts {
 		switch opt := opt.(type) {
 		case extraCorePorts:
 			ports = append(ports, opt...)
 		case storeTimeout:
 			stTimeout = time.Duration(opt)
+			// A bind makes two store calls, each bounded by stTimeout.
+			r.openWait = max(r.openWait, 2*stTimeout)
 		case rigOption, func(*relayOptions):
 		default:
 			t.Fatalf("unknown rig option %T", opt)
@@ -425,8 +431,9 @@ func (r *rig) patch(id string, body map[string]any) {
 // client is a fake RCS client: an active MSRP endpoint on a TCP connection
 // to one relay task.
 type client struct {
-	conn *msrp.Conn
-	nc   net.Conn
+	conn     *msrp.Conn
+	nc       net.Conn
+	openWait time.Duration
 }
 
 // dial connects to relay task i, sending prefix (a PROXY header) first.
@@ -446,7 +453,7 @@ func (r *rig) dial(i int, prefix []byte) *client {
 		r.t.Fatal(err)
 	}
 	r.t.Cleanup(func() { _ = c.Close() })
-	return &client{conn: c, nc: nc}
+	return &client{conn: c, nc: nc, openWait: r.openWait}
 }
 
 // open binds a client session at the relay URI it was given, as a client
@@ -464,7 +471,11 @@ func (c *client) openAs(t *testing.T, local, relayPath string, h msrp.Handler) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	wait := c.openWait
+	if wait == 0 {
+		wait = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
 	return s, c.conn.Open(ctx, s)
 }
