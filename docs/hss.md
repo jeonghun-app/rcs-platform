@@ -186,7 +186,13 @@ A PPA failure is acted on as §6.2.2.1 asks of an HSS without restoration:
 the subscription to not registered (`push.ppr.user_unknown`);
 `DIAMETER_ERROR_NOT_SUPPORTED_USER_DATA` or `TOO_MUCH_DATA` sets them to not
 registered and sends RTR `SERVER_CHANGE`, so the user registers again
-(`push.ppr.data_refused`).
+(`push.ppr.data_refused`). Either way the change's later pushes for that
+subscription are not sent: the S-CSCF no longer holds the user.
+
+One change's pushes go one at a time, each once the one before is answered.
+A set that loses an identity goes first: when an identity moves from one
+implicit set to another, the PPR for the set losing it goes before the one
+for the set gaining it (§6.5.2.1).
 
 | Change | Request |
 |---|---|

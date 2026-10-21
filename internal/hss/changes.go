@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"slices"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -44,7 +45,11 @@ type push struct {
 //   - a change of charging information alone is a PPR without User-Data
 //     (§6.5.2.3).
 //
-// Sets that were not served stay or become not registered.
+// A set that loses an identity is told before any other: when an identity
+// moves from one set to another, the S-CSCF updates the set losing it
+// first, then the one gaining it (§6.5.2.1), and notify sends them in that
+// order, each once the one before is answered. Sets that were not served
+// stay or become not registered.
 func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 	state := map[int]store.RegistrationState{}
 	for _, p := range old.PublicIdentities {
@@ -54,31 +59,47 @@ func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 		next.PublicIdentities[i].State = store.NotRegistered
 	}
 	chargingChanged := !reflect.DeepEqual(old.Charging, next.Charging)
-	var pushes []push
+	var losing, others []push
 	pprSent := false
 	for _, set := range targetSets(old, nil) {
 		if !state[set].Served() {
 			continue
 		}
 		was, now := members(old, set), members(next, set)
+		pushes := &others
+		if lost(was, now) {
+			pushes = &losing
+		}
 		switch {
 		case len(now) == 0:
-			pushes = append(pushes, push{deregister: true, reason: cx.PermanentTermination, impus: impusOf(was), set: -1})
+			*pushes = append(*pushes, push{deregister: true, reason: cx.PermanentTermination, impus: impusOf(was), set: -1})
 		case defaultIdentity(old, set) != defaultIdentity(next, set):
-			pushes = append(pushes, push{deregister: true, reason: cx.ServerChange, impus: impusOf(was), set: -1})
+			*pushes = append(*pushes, push{deregister: true, reason: cx.ServerChange, impus: impusOf(was), set: -1})
 		default:
 			setState(next, set, state[set])
 			if profileChanged || !sameMembers(was, now) {
-				pushes = append(pushes, push{set: set, charging: chargingChanged})
+				*pushes = append(*pushes, push{set: set, charging: chargingChanged})
 				pprSent = true
 			}
 		}
 	}
+	pushes := append(losing, others...)
 	if chargingChanged && !pprSent && served(next) {
 		pushes = append(pushes, push{set: -1, charging: true})
 	}
 	clearServerIfIdle(next)
 	return pushes
+}
+
+// lost reports whether a set whose identities were was and are now has lost
+// one of them.
+func lost(was, now []store.PublicIdentity) bool {
+	for _, p := range was {
+		if !slices.ContainsFunc(now, func(q store.PublicIdentity) bool { return q.IMPU == p.IMPU }) {
+			return true
+		}
+	}
+	return false
 }
 
 func impusOf(ids []store.PublicIdentity) []string {
@@ -154,8 +175,12 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 				pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
 		}
 		var rejected *RejectedError
-		if !ps.deregister && errors.As(err, &rejected) {
-			h.pprRejected(ctx, n, s, rejected.Result)
+		if !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result) {
+			// The user is no longer registered at the S-CSCF, which knows
+			// it no longer or is deregistering it: a set's PPR after this
+			// one, the set gaining a moved identity say, has nothing left
+			// to update (#213).
+			return
 		}
 	}
 }
@@ -170,14 +195,17 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 //     keeps the old data and the HSS deregisters the user with
 //     SERVER_CHANGE, setting the state to not registered, so that the user
 //     registers again and gets an S-CSCF that takes the new data.
-func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result) {
+//
+// It reports whether it acted on the failure, the user being no longer
+// registered at the S-CSCF either way.
+func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result) bool {
 	if r.Vendor != cx.Vendor3GPP {
-		return
+		return false
 	}
 	switch r.Code {
 	case cx.ErrorUserUnknown, cx.ErrorNotSupportedUserData, cx.ErrorTooMuchData:
 	default:
-		return
+		return false
 	}
 	// The update gets half of the time left, so that one that wins only at
 	// its deadline, behind another task's writes, still leaves the RTR some.
@@ -200,11 +228,11 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	if err != nil {
 		h.log.Warn("could not mark a user the S-CSCF refused as not registered", pii.Identity("impi", s.IMPI),
 			slog.String("error", pii.Redact(err.Error())))
-		return
+		return true
 	}
 	if r.Code == cx.ErrorUserUnknown {
 		h.metrics.Count("push.ppr.user_unknown", 1)
-		return
+		return true
 	}
 	h.metrics.Count("push.ppr.data_refused", 1)
 	err = n.Deregister(ctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
@@ -212,6 +240,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 		h.log.Warn("could not deregister a user whose S-CSCF refused new data", pii.Identity("impi", s.IMPI),
 			slog.String("error", pii.Redact(err.Error())))
 	}
+	return true
 }
 
 func (h *HSS) send(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push) error {

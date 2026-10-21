@@ -236,6 +236,51 @@ func TestProvisioningChangesTellTheSCSCFWhatItMustKnow(t *testing.T) {
 	}
 }
 
+// #213: an identity that moves between two served implicit registration
+// sets updates the set losing it first, then the one gaining it (TS 29.228
+// §6.5.2.1), whichever comes first in the subscription.
+func TestAnIdentityMovingBetweenSetsUpdatesTheOldSetFirst(t *testing.T) {
+	registered := func(list ...store.PublicIdentity) *store.Subscription {
+		s := &store.Subscription{IMPI: impi1, Profile: DefaultProfileID, ServerName: scscfName, PublicIdentities: list}
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = reg
+		}
+		return s
+	}
+	id := func(impu string, set int) store.PublicIdentity {
+		return store.PublicIdentity{IMPU: impu, ImplicitSet: set}
+	}
+	for name, c := range map[string]struct {
+		old, next []store.PublicIdentity
+		want      []push
+	}{
+		// set 1 comes first in the subscription, and gains tel1.
+		"from set 0 to set 1": {
+			[]store.PublicIdentity{id(impu2, 1), id(impu1, 0), id(tel1, 0)},
+			[]store.PublicIdentity{id(impu2, 1), id(tel1, 1), id(impu1, 0)},
+			[]push{{set: 0}, {set: 1}},
+		},
+		// set 0 comes first, and gains impu3.
+		"from set 1 to set 0": {
+			[]store.PublicIdentity{id(impu1, 0), id(impu2, 1), id(impu3, 1)},
+			[]store.PublicIdentity{id(impu1, 0), id(impu3, 0), id(impu2, 1)},
+			[]push{{set: 1}, {set: 0}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			next := registered(c.next...)
+			if got := reconcile(registered(c.old...), next, false); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("pushes\n got %+v\nwant %+v", got, c.want)
+			}
+			for _, p := range next.PublicIdentities {
+				if p.State != reg {
+					t.Errorf("%s state = %v, want registered", p.IMPU, p.State)
+				}
+			}
+		})
+	}
+}
+
 func TestDigestAndDeletionPushes(t *testing.T) {
 	if p := digestPushes(subWith(reg, nr, scscfName, false)); len(p) != 1 || !p[0].digest {
 		t.Errorf("registered: %+v", p)

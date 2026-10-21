@@ -3,6 +3,7 @@ package hss
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -806,6 +807,93 @@ func TestAKAOverTheAPIAuthenticatesOverCx(t *testing.T) {
 // TS 29.228 §6.2.2.1: a PPA that says the S-CSCF lost the user brings the
 // HSS's state in line; one that refuses the data deregisters the user with
 // SERVER_CHANGE so they register again.
+// setsBody is a subscription of impi with each identity in the implicit
+// registration set given after it.
+func setsBody(impi string, ids ...any) string {
+	var parts []string
+	for i := 0; i < len(ids); i += 2 {
+		parts = append(parts, fmt.Sprintf(`{"impu":%q,"barred":false,"implicit_set":%d}`, ids[i], ids[i+1]))
+	}
+	return `{"impi":"` + impi + `","imsi":"` + imsi1 + `","public_identities":[` + strings.Join(parts, ",") + `],"acs_managed":true}`
+}
+
+// #213: provisioning that moves tel1 from set 0 to set 1, set 1 coming
+// first in the subscription, sends the PPR for set 0, without tel1, and
+// once it is answered, the PPR for set 1, with it (TS 29.228 §6.5.2.1).
+func TestAMoveBetweenSetsPushesTheOldSetFirst(t *testing.T) {
+	a := newAPIEnv(t)
+	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, impu2, 1, impu1, 0, tel1, 0)); code != http.StatusCreated {
+		t.Fatalf("create = %d %v", code, body)
+	}
+	a.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = store.Registered
+		}
+	})
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu2, 1, tel1, 1, impu1, 0)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	_, pprs := a.notifier.got()
+	if len(pprs) != 2 {
+		t.Fatalf("%d PPRs", len(pprs))
+	}
+	for i, want := range [][]string{{impu1}, {impu2, tel1}} {
+		doc, err := ifc.ParseSubscription(pprs[i].UserData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, p := range doc.ServiceProfiles[0].PublicIdentities {
+			got = append(got, p.Identity)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("PPR %d names %v, want %v", i, got, want)
+		}
+	}
+	if s := a.sub(impi1); s.Identity(tel1).State != store.Registered {
+		t.Errorf("tel1 is %v in its new set", s.Identity(tel1).State)
+	}
+}
+
+// #213: when the S-CSCF answers the old set's PPR with
+// DIAMETER_ERROR_USER_UNKNOWN (5001), the user is marked not registered as
+// for any PPR (§6.2.2.1), and the new set's PPR, for a user it does not
+// know, is not sent.
+func TestAMoveWhoseFirstPPRIsRefusedForAnUnknownUserStops(t *testing.T) {
+	a := newAPIEnv(t)
+	a.notifier.pprErr = &RejectedError{Command: "PPR", Result: exp(cx.ErrorUserUnknown)}
+	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, impu1, 0, impu2, 1, impu3, 1)); code != http.StatusCreated {
+		t.Fatalf("create = %d %v", code, body)
+	}
+	a.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = store.Registered
+		}
+	})
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu1, 0, impu3, 0, impu2, 1)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	rtrs, pprs := a.notifier.got()
+	if len(pprs) != 1 || len(rtrs) != 0 {
+		t.Fatalf("%d PPRs, %d RTRs", len(pprs), len(rtrs))
+	}
+	doc, err := ifc.ParseSubscription(pprs[0].UserData)
+	if err != nil || len(doc.ServiceProfiles[0].PublicIdentities) != 1 || doc.ServiceProfiles[0].PublicIdentities[0].Identity != impu2 {
+		t.Fatalf("the PPR sent is not set 1's: %v %+v", err, doc)
+	}
+	s := a.sub(impi1)
+	for _, p := range s.PublicIdentities {
+		if p.State != store.NotRegistered {
+			t.Errorf("%s is %v", p.IMPU, p.State)
+		}
+	}
+	if s.ServerName != "" || a.metrics.get("push.ppr.user_unknown") != 1 {
+		t.Errorf("server %q, %d counted", s.ServerName, a.metrics.get("push.ppr.user_unknown"))
+	}
+}
+
 func TestPPAFailuresAreActedOn(t *testing.T) {
 	for name, c := range map[string]struct {
 		result cx.Result
