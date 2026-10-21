@@ -124,8 +124,10 @@ func (c *counter) String() string {
 
 // notifier records roster updates.
 type notifier struct {
-	mu      sync.Mutex
-	updates []RosterUpdate
+	mu       sync.Mutex
+	updates  []RosterUpdate
+	disowned []string
+	wakes    []wake
 }
 
 func (n *notifier) RosterChanged(_ context.Context, u RosterUpdate) {
@@ -133,6 +135,22 @@ func (n *notifier) RosterChanged(_ context.Context, u RosterUpdate) {
 	defer n.mu.Unlock()
 	n.updates = append(n.updates, u)
 }
+
+func (n *notifier) Disowned(uri string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.disowned = append(n.disowned, uri)
+}
+
+func (n *notifier) WakeOwner(_ context.Context, at, uri, user string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.wakes = append(n.wakes, wake{at, uri, user})
+	return nil
+}
+
+// wake is a WakeOwner the notifier was asked for.
+type wake struct{ at, uri, user string }
 
 func (n *notifier) all() []RosterUpdate {
 	n.mu.Lock()

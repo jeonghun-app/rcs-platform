@@ -269,6 +269,12 @@ func (n notifier) RosterChanged(ctx context.Context, u group.RosterUpdate) {
 	(*n.a).srv.RosterChanged(ctx, u)
 }
 
+func (n notifier) Disowned(uri string) { (*n.a).srv.Disowned(uri) }
+
+func (n notifier) WakeOwner(ctx context.Context, at, uri, user string) error {
+	return (*n.a).srv.WakeOwner(ctx, at, uri, user)
+}
+
 // #298: a pager MESSAGE as rcsjta sends it, without conversation headers,
 // or as a client that names only its Contribution-ID, is taken; the engine
 // gives the latter its pair's Conversation-ID (conversation_test.go).

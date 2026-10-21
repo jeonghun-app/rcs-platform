@@ -58,6 +58,10 @@ type GroupHandler interface {
 	// the Fence of group's Audience: another task owns the group now, and
 	// Owns must not take it for this task's any more.
 	Lost(group string)
+	// WakeOwner asks the task that owns group, another, to read user's
+	// queue again: this task's queue pass left a copy of the group's to
+	// it, which it may not know of, as when user registered here.
+	WakeOwner(ctx context.Context, group, user string)
 }
 
 // Audience is who a participant's message in a group goes to, and the
@@ -113,6 +117,13 @@ func (e *Engine) ParticipantLeft(group, user string) {
 // mark records k in marks for as long as a copy could be queued for it,
 // within MaxTracked marks; it needs e.mu.
 func (e *Engine) mark(marks map[legKey]time.Time, k legKey) {
+	// Nothing queued outlives StoreTTL, so neither need the mark.
+	e.markFor(marks, k, e.cfg.StoreTTL)
+}
+
+// markFor records k in marks for d, within MaxTracked marks; it needs
+// e.mu.
+func (e *Engine) markFor(marks map[legKey]time.Time, k legKey, d time.Duration) {
 	now := e.clock.Now()
 	if len(marks) >= e.cfg.MaxTracked {
 		for k, until := range marks {
@@ -127,8 +138,7 @@ func (e *Engine) mark(marks map[legKey]time.Time, k legKey) {
 			delete(marks, k)
 		}
 	}
-	// Nothing queued outlives StoreTTL, so neither need the mark.
-	marks[k] = now.Add(e.cfg.StoreTTL)
+	marks[k] = now.Add(d)
 }
 
 // ParticipantAdded tells the engine that user is a participant of group

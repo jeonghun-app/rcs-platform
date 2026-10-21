@@ -99,3 +99,69 @@ horizontal scaling without sticky load balancing.
 - In-dialog requests from the core reach the client the same way terminating
   initial requests do: the core-facing `Record-Route` entry `pcscf` inserts
   carries the same signed flow token as `Path`.
+
+## Amendment (#121): one owner per group chat
+
+**Context.** A group chat's participants hold their MSRP sessions with the
+group's conference focus. With more than one `rcs-as` task, each task knew only
+the sessions it held, so a message written on one task re-invited participants
+whose sessions lived on another, and roster NOTIFYs reached only the
+subscribers of the task that made the change.
+
+**Decision.**
+
+- Each group has exactly one **owner task**. All of the group's MSRP legs,
+  conference subscriptions, fan-out, roster NOTIFYs and invitations for its
+  queued copies live on the owner.
+- Ownership is recorded in DynamoDB `groupchats`:
+  - an **owner item** per group (`sk` = `owner`) holding the owner's task id,
+    its SIP instance address and an **epoch** that every takeover raises by
+    one;
+  - a **heartbeat item** per task, whose `alive_until` the task renews every
+    `RCSAS_TASK_HEARTBEAT` (5 s) to `RCSAS_TASK_LEASE` (20 s) ahead. Task ids
+    are random per start, so a task that reuses a dead task's IP is never
+    taken for it.
+- A task that receives a request for a group it does not own, initial or in
+  one of the group's dialogs (whose Contact is the conference URI, so the core
+  may give their requests to any task), forwards it once to the owner's
+  instance address over internal SIP (ADR 0007), with a `Route` marked
+  `rcsas-fwd`, adds no `Record-Route`, and does not serve it. A forwarded
+  request that reaches a task that is not the owner is not forwarded again: it
+  is answered 500 with `Retry-After`, never 404, which the reference client
+  takes for the group's end. The owner's address is used only if it is a
+  private address on `rcs-as`'s SIP port.
+- A task takes a group over with a conditional write on the owner item (same
+  owner, same epoch), only once the owner's `alive_until` plus
+  `RCSAS_TASK_SKEW` (2 s) has passed, or at once when the owner's address is its
+  own and the task id is not.
+- **Fencing.** Every write that changes a group (roster changes, activity) and
+  every enqueue of a group message's copy is a transaction that includes a
+  condition check on the owner item: this task, this epoch. A task that has
+  lost a group therefore cannot change it or fan a message out, whatever its
+  clock or pauses; its write is refused, never applied twice, and it gives the
+  group up. A task whose heartbeat has not succeeded within `RCSAS_TASK_LEASE`
+  minus `RCSAS_TASK_SKEW` writes no group until a beat lands, and then gives up
+  every group it held. Decisions the store does not fence (whether to invite
+  for a queued copy, where to forward a request) read the owner item again
+  once a heartbeat old.
+- A task that gives a group up ends the sessions and subscriptions it holds
+  of it, the sessions with a BYE and the subscriptions with
+  `reason=deactivated`, so that the participants rejoin through the owner.
+- A task whose queue pass finds a copy of another task's group, as when the
+  participant registers there, sends the owner an internal `MESSAGE` that has
+  it read the queue, at most once per participant and group every
+  `RCSAS_INVITE_TIMEOUT`.
+
+**Consequences.**
+
+- When an owner task stops, its groups' sessions and subscriptions drop with
+  it, as any `rcs-as` session does; the next request for a group takes it over,
+  and clients rejoin as they do an idle group (RCC.07). Rolling updates release
+  a task's heartbeat on shutdown so that takeover takes `RCSAS_TASK_SKEW`
+  rather than the lease.
+- `rcs-as` reaches `rcs-as` on its SIP port (ADR 0007 security group matrix).
+- Each copy of a group message costs one more transactional condition check
+  (about 2 WCU); each task writes its heartbeat every 5 s; a request for a
+  group costs a read of the group and owner items at most once per group every
+  heartbeat on each task.
+- The task role needs `dynamodb:ConditionCheckItem` on `groupchats`.

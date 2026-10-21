@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,6 +45,7 @@ type Engine interface {
 	InviteFailed(inv messaging.Invitation, err error)
 	UserRegistered(user string, newFlow bool)
 	Invite(ctx context.Context, inv messaging.Invitation)
+	Wake(user string)
 }
 
 // Config configures a Server.
@@ -108,6 +110,11 @@ type Config struct {
 	// groupChatOff keeps GroupChat off in the tests, whose rigs turn it
 	// on wherever they run a group service.
 	groupChatOff bool
+	// peers, when a test sets it, says which addresses of a group's owner
+	// requests are forwarded to (peer), in place of the private addresses
+	// on this task's port: the tests' tasks are on loopback, each on a
+	// port of its own.
+	peers func(netip.AddrPort) bool
 	// Metrics counts events, without identifiers; nil counts nothing.
 	Metrics messaging.Counter
 	// Logger receives operational events, never identities or content; nil
@@ -269,7 +276,7 @@ func looped(req *sip.Request) bool {
 // conference factory or to a conference URI, is told apart first, so that
 // none of them, a rejoin INVITE without a resource list say, is ever taken
 // for a 1-to-1 chat (security review on #252).
-func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
+func (s *Server) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
 	initial := r.Initial() && r.Message.Method != "ACK"
 	if initial && (looped(r.Message) || s.fromFocus(r.Message)) {
 		// 482 Loop Detected (RFC 3261 §21.4.20); the sender of the
@@ -279,7 +286,14 @@ func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 482}
 	}
 	if initial && s.forGroup(r.Message.URI) {
-		return s.routeGroup(r)
+		return s.routeGroup(ctx, r)
+	}
+	if !initial {
+		// A group's dialog this task does not hold goes to the group's
+		// owner (#121).
+		if d, ok := s.inDialogElsewhere(ctx, r); ok {
+			return d
+		}
 	}
 	switch m := r.Message.Method; {
 	case m == "ACK":

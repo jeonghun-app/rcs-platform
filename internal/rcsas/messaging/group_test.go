@@ -24,7 +24,8 @@ const groupURI = "sip:chat-1@conf.ims.example.net"
 // Member leaves out those in left: a copy written to them before they
 // left. The group is this task's unless another, alive, owns it
 // (notMine), and its copies are queued under fence; lost counts the
-// groups the engine said it lost.
+// groups the engine said it lost, and woken the owners it asked to read a
+// queue.
 type members struct {
 	all     []string
 	left    []string
@@ -33,6 +34,7 @@ type members struct {
 	notMine bool
 	fence   *store.Fence
 	lost    *atomic.Int64
+	woken   *atomic.Int64
 }
 
 func (h members) Owns(_ context.Context, group string) (bool, error) {
@@ -42,6 +44,12 @@ func (h members) Owns(_ context.Context, group string) (bool, error) {
 func (h members) Lost(group string) {
 	if h.lost != nil && group == groupURI {
 		h.lost.Add(1)
+	}
+}
+
+func (h members) WakeOwner(_ context.Context, group, user string) {
+	if h.woken != nil && group == groupURI {
+		h.woken.Add(1)
 	}
 }
 
@@ -767,6 +775,30 @@ func TestOnlyTheGroupsOwnerInvitesForItsCopies(t *testing.T) {
 	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI || r.m.get("group.wake") != 1 {
 		t.Fatalf("invitation %+v after the wake", inv)
 	}
+}
+
+// #121 T8: a task's queue pass that leaves a group's copy to the group's
+// owner asks the owner to read the queue, which it may not know needs it
+// (a registration here, say): once per InviteTimeout, as often as the
+// owner would invite.
+func TestANonOwnersQueuePassWakesTheOwner(t *testing.T) {
+	r := newRig(t, Config{})
+	h := members{all: []string{alice, bob}, notMine: true, woken: new(atomic.Int64)}
+	r.e.SetGroupHandler(h)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the owner woken", func() bool { return h.woken.Load() == 1 })
+	before := r.m.get("delivery.group_not_owned")
+	r.e.UserRegistered(bob, true)
+	waitFor(t, "the next pass", func() bool { return r.m.get("delivery.group_not_owned") > before })
+	waitFor(t, "idle", r.idle)
+	if n := h.woken.Load(); n != 1 {
+		t.Fatalf("the owner was woken %d times within InviteTimeout", n)
+	}
+	r.clock.Advance(DefaultInviteTimeout)
+	r.e.UserRegistered(bob, true)
+	waitFor(t, "the owner woken again", func() bool { return h.woken.Load() == 2 })
 }
 
 // #121 D2 (T4): every copy is queued under the group's owner the handler

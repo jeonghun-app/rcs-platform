@@ -217,6 +217,10 @@ type Engine struct {
 	// unreachable for good (InviteFailed with ErrUndeliverable), until
 	// when their copies could still be queued: those are given up.
 	unreachable map[legKey]time.Time
+	// woken marks the participants whose group's owner this task asked to
+	// read their queue (GroupHandler.WakeOwner), until when it does not
+	// ask again.
+	woken map[legKey]time.Time
 	// groupLegs counts the open group legs of each group on this task.
 	groupLegs map[string]int
 	// summaries remembers group notification summaries between their
@@ -259,7 +263,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		invites:    map[inviteKey]inviteMark{},
 		pagerOnly:  map[string]struct{}{},
 		flows:      map[string]uint64{},
-		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{},
+		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{}, woken: map[legKey]time.Time{},
 		groupLegs: map[string]int{},
 		summaries: map[legKey]*summaryState{},
 	}

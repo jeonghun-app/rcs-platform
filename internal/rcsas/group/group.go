@@ -187,11 +187,20 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// Notifier is what the package needs from the SIP layer to tell the
+// Notifier is what the package needs from the SIP layer: to tell the
 // subscribers of a group's conference event package (RFC 4575) what
-// changed: it sends Document in a NOTIFY to each subscription of Group.
+// changed, for which it sends Document in a NOTIFY to each subscription of
+// Group; and to act on who owns a group (#121).
 type Notifier interface {
 	RosterChanged(ctx context.Context, u RosterUpdate)
+	// Disowned says that this task no longer owns the group uri (#121):
+	// another task took it over, or this one's heartbeat lapsed. The
+	// participants' sessions and subscriptions with it here end, so that
+	// they come back through its owner.
+	Disowned(uri string)
+	// WakeOwner asks the task at the SIP instance address at, which owns
+	// the group uri, to read user's queue again (Service.WakeOwner).
+	WakeOwner(ctx context.Context, at, uri, user string) error
 }
 
 // RosterUpdate is one change to a group's roster.
@@ -264,7 +273,7 @@ type Service struct {
 	owned map[string]ownership
 	// others holds the groups another task was found to own, until when
 	// Owns takes that for granted.
-	others   map[string]time.Time
+	others   map[string]otherOwner
 	beating  bool
 	lastBeat time.Time
 }
@@ -306,7 +315,7 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
 		owned:       map[string]ownership{},
-		others:      map[string]time.Time{},
+		others:      map[string]otherOwner{},
 		maxFormer:   former,
 	}
 	if s.cfg.Task == "" {
@@ -426,8 +435,19 @@ func (s *Service) conferenceID(contribution string) (string, error) {
 	if contribution == "" {
 		return s.randomHex(16)
 	}
+	return contributionID(contribution), nil
+}
+
+func contributionID(contribution string) string {
 	sum := sha256.Sum256([]byte("rcs-as group chat\x00" + contribution))
-	return hex.EncodeToString(sum[:16]), nil
+	return hex.EncodeToString(sum[:16])
+}
+
+// URIFor is the conference URI of the group a creator's INVITE under the
+// Contribution-ID contribution makes or takes up (Create), which the SIP
+// layer finds the group's owner by (#121).
+func (s *Service) URIFor(contribution string) string {
+	return "sip:chat-" + contributionID(contribution) + "@" + s.cfg.ConferenceHost
 }
 
 // retried is the group uri for its creator trying its INVITE again

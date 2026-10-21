@@ -445,10 +445,32 @@ func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool)
 		// invitation from here would open the session on this task
 		// instead, and the next message would invite back (#121).
 		e.metrics.Count("delivery.group_not_owned", 1)
+		e.wakeOwner(ctx, m)
 		return skip
 	}
 	e.invite(ctx, m)
 	return skip
+}
+
+// wakeOwner asks the owner of m's group to read m's recipient's queue
+// (GroupHandler.WakeOwner), once per InviteTimeout: as often as the owner
+// would invite the recipient for it.
+func (e *Engine) wakeOwner(ctx context.Context, m store.Message) {
+	h := e.groupHandler()
+	if h == nil {
+		return
+	}
+	k := legKey{m.Recipient, m.Sender}
+	e.mu.Lock()
+	until, asked := e.woken[k]
+	due := !asked || !e.clock.Now().Before(until)
+	if due {
+		e.markFor(e.woken, k, e.cfg.InviteTimeout)
+	}
+	e.mu.Unlock()
+	if due {
+		h.WakeOwner(ctx, m.Sender, m.Recipient)
+	}
 }
 
 // ownsGroup asks the GroupHandler whether this task owns m's group; when
