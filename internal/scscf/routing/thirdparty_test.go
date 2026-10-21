@@ -800,3 +800,90 @@ func TestARegistrationWaitingForItsSetHoldsNoSlot(t *testing.T) {
 		t.Error("the other user's registration waited for set1's queue: a waiting registration held a slot")
 	}
 }
+
+// twoIdentities is a profile of set1 in which impu1 and impu2 both have
+// the REGISTER criterion, and a registration of each.
+func twoIdentities(t *testing.T, typ ifc.RegistrationType, expires time.Duration) (registrar.ThirdPartyRegistration, registrar.ThirdPartyRegistration) {
+	t.Helper()
+	sub := ifc.Subscription{PrivateID: set1.IMPI, ServiceProfiles: []ifc.ServiceProfile{{
+		PublicIdentities:      []ifc.PublicIdentity{{Identity: impu1}, {Identity: impu2}},
+		InitialFilterCriteria: []ifc.FilterCriteria{criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued)},
+	}}}
+	data, err := sub.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &state.Profile{Key: set1, UserData: data, Received: t0, KeepUntil: t0.Add(time.Hour)}
+	a := registration(t, typ, expires)
+	a.Profile = p
+	b := a
+	b.IMPU = impu2
+	return a, b
+}
+
+// TestASetsEndIsNotDroppedWhenItsServersQueueIsFull (#420, QA on #379):
+// with the server's queue full of other sets' registrations and nothing of
+// the ending set's waiting, the end goes past the bound and reaches the
+// server; past that further allowance, a registration is dropped.
+func TestASetsEndIsNotDroppedWhenItsServersQueueIsFull(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	// One slot, so four queued fill the server's queue: one at the server
+	// and three waiting, all other sets'.
+	for n := range queuedPerServer {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	end := registration(t, ifc.DeRegistration, 0)
+	end.Profile = profileFor(t, e, set1, impu1)
+	rt.Registered(bg, end)
+	// A refresh of yet another set has no allowance past the bound, and
+	// another end none past the allowance, MaxThirdParty, which the first
+	// took.
+	rt.Registered(bg, otherSet(t, e, queuedPerServer))
+	other := otherSet(t, e, queuedPerServer+1)
+	other.Type, other.Expires = ifc.DeRegistration, 0
+	rt.Registered(bg, other)
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf(impu1); len(got) != 1 || got[0] != "0" {
+		t.Errorf("the server heard %v for the ending set, want its end", got)
+	}
+	if e.metrics.get("routing.third_party.end_past_bound") != 1 || e.metrics.get("routing.third_party.dropped") != 2 {
+		t.Errorf("end_past_bound %d, dropped %d", e.metrics.get("routing.third_party.end_past_bound"), e.metrics.get("routing.third_party.dropped"))
+	}
+}
+
+// TestEveryIdentityOfAnEndingSetHearsItsEnd (#420, code review on #379):
+// the server keeps a registration per To, so the queue is per identity: a
+// set registered under two identities that ends while its queue is full
+// tells each of them Expires 0, the one not taking the other's place.
+func TestEveryIdentityOfAnEndingSetHearsItsEnd(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s))
+	a, b := twoIdentities(t, ifc.ReRegistration, time.Hour)
+	// impu1's first is at the server; each identity then has its queue
+	// full of refreshes.
+	rt.Registered(bg, a)
+	recv(t, s.inside)
+	for range queuedPerSet - 1 {
+		rt.Registered(bg, a)
+	}
+	for range queuedPerSet {
+		rt.Registered(bg, b)
+	}
+	endA, endB := twoIdentities(t, ifc.DeRegistration, 0)
+	rt.Registered(bg, endA)
+	rt.Registered(bg, endB)
+	close(s.hold)
+	rt.Stop()
+	for _, impu := range []string{impu1, impu2} {
+		if got := s.expiresOf(impu); len(got) == 0 || got[len(got)-1] != "0" {
+			t.Errorf("%s heard %v, want its end last", impu, got)
+		}
+	}
+}

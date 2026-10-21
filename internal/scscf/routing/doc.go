@@ -107,10 +107,12 @@
 // REGISTER and the 200 for it in the body. An end the network made, a
 // sweep's or an RTR's, has no REGISTER to show the criteria or the server:
 // one for the user stands in, and the body is empty. The REGISTERs go off
-// the registrar's goroutine, to each server apart, those of one set in
-// order, at most MaxThirdParty at a server at a time. A server that does not
-// answer is counted, and one whose default handling ends the session only
-// logged: deregistering the user for it waits on a decision (#14).
+// the registrar's goroutine, to each server apart, those of one identity of
+// a set in order, at most MaxThirdParty at a server at a time; an end is
+// never dropped for a full queue but past MaxThirdParty more. A server that
+// does not answer is counted, and one whose default handling ends the
+// session only logged: deregistering the user for it waits on a decision
+// (#14).
 //
 // Logs carry no identity or URI.
 package routing

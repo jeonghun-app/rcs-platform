@@ -33,31 +33,35 @@ type thirdParty struct {
 
 // serverQueue is one application server's third-party registrations: at
 // most MaxThirdParty at the server at a time, which hold a slot only while
-// they are sent, and up to queuedPerServer of them waiting or sent. Each
-// set's go in the order the registrar told of them, so that the server
-// does not hear a registration after the deregistration that followed it,
-// and at most queuedPerSet of a set's are queued, so that one set's
-// refreshes do not take the queue (#379 code review). One past either
-// bound takes the place of its set's last one waiting, which it is newer
-// than, so that the server hears the set's latest state, its end above
-// all (#379 code review); it is dropped only when its set has none
-// waiting.
+// they are sent, and up to queuedPerServer of them waiting or sent. They
+// are queued per set and identity registered, as the server keeps a
+// registration per To (#420): each identity's go in the order the
+// registrar told of them, so that the server does not hear a registration
+// after the deregistration that followed it, and at most queuedPerSet of
+// them are queued, so that one user's refreshes do not take the queue
+// (#379 code review). One past either bound takes the place of the same
+// identity's last one waiting, which it is newer than, so that the server
+// hears the latest state (#379 code review). An end with none to take the
+// place of goes past the server's bound, by at most MaxThirdParty, as no
+// later registration would tell the server of it (#420); only beyond that
+// is a registration dropped.
 type serverQueue struct {
 	slots  chan struct{}
 	queued int
 	sets   map[string]*setQueue
 }
 
-// setQueue is a set's registrations queued for one server: tail is closed
-// once the last one told of is done, and last is that one.
+// setQueue is the registrations of one identity of a set queued for one
+// server: tail is closed once the last one told of is done, and last is
+// that one.
 type setQueue struct {
 	tail   chan struct{}
 	queued int
 	last   *pending
 }
 
-// pending is a registration queued for a server, which a later one of its
-// set may take the place of until it is sent.
+// pending is a registration queued for a server, which a later one of the
+// same identity may take the place of until it is sent.
 type pending struct {
 	r      registrar.ThirdPartyRegistration
 	server ifc.ApplicationServer
@@ -104,7 +108,7 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 		return
 	}
 	r.Request, r.Response = withoutCredentials(r.Request), clonedResponse(r.Response)
-	key := r.Set.IMPI + "\x00" + r.Set.IMPU
+	key := r.Set.IMPI + "\x00" + r.Set.IMPU + "\x00" + r.IMPU
 	ctx = context.WithoutCancel(ctx)
 	rt.stop.Lock()
 	defer rt.stop.Unlock()
@@ -142,11 +146,12 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 	}
 }
 
-// enqueue queues p, a registration of the set key for server, and returns
-// its queues, the channel the one before it of the set's closes, nil if
-// none, and the one it closes itself. Past either bound p takes the place
-// of the set's last one waiting, or is dropped; either way, counted, and
-// not queued.
+// enqueue queues p, a registration of the set and identity key for
+// server, and returns its queues, the channel the one before it of the
+// same key closes, nil if none, and the one it closes itself. Past either
+// bound p takes the place of the key's last one waiting, or is dropped,
+// either way counted and not queued, unless it is an end, which goes past
+// the server's bound by at most MaxThirdParty (serverQueue).
 func (rt *Router) enqueue(server, key string, p *pending) (q *serverQueue, sq *setQueue, prev, done chan struct{}, queued bool) {
 	rt.tp.mu.Lock()
 	defer rt.tp.mu.Unlock()
@@ -156,12 +161,15 @@ func (rt *Router) enqueue(server, key string, p *pending) (q *serverQueue, sq *s
 		rt.tp.servers[server] = q
 	}
 	sq = q.sets[key]
+	bound := queuedPerServer * rt.cfg.MaxThirdParty
 	switch {
-	case q.queued < queuedPerServer*rt.cfg.MaxThirdParty && (sq == nil || sq.queued < queuedPerSet):
+	case q.queued < bound && (sq == nil || sq.queued < queuedPerSet):
 	case sq != nil && sq.last != nil && !sq.last.sent:
 		sq.last.r, sq.last.server = p.r, p.server
 		rt.count("routing.third_party.replaced")
 		return nil, nil, nil, nil, false
+	case p.r.Type == ifc.DeRegistration && q.queued < bound+rt.cfg.MaxThirdParty:
+		rt.count("routing.third_party.end_past_bound")
 	default:
 		rt.count("routing.third_party.dropped")
 		return nil, nil, nil, nil, false
