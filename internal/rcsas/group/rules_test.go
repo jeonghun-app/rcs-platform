@@ -499,3 +499,17 @@ func TestAGroupsConversationIDFollowsItsContribution(t *testing.T) {
 		t.Fatalf("a group without a Contribution-ID has Conversation-ID %q", random.Conversation)
 	}
 }
+
+// QA on #381: the derived Conversation-ID is pinned, so that no refactor
+// changes the ID a restarted group gets after an upgrade. The values are
+// Python's uuid.uuid5 in groupNamespace (e51ad937-2361-433b-a3e7-283a7ef641ae).
+func TestAGroupsDerivedConversationIDIsStable(t *testing.T) {
+	for contribution, want := range map[string]string{
+		"gch4t1":    "e0f8d3d1-d77c-598d-b120-23ea011606ab",
+		"chat-id-1": "282da727-4d14-5968-9cd3-74bc98622cc3",
+	} {
+		if got := groupConversationID(contribution); got != want {
+			t.Errorf("groupConversationID(%q) = %s, want %s", contribution, got, want)
+		}
+	}
+}
