@@ -234,6 +234,11 @@ a chat too, so that a client cannot send a chat past `rcs-as` by leaving its tag
 out (#359). One that names another service, such as image share
 (`iari.gsma-is`), or a call's ICSI, goes to the callee as before: the platform
 does not serve those, and `rcs-as` would refuse them.
+That check reads the field `Feature tag`, which scscf adds to the request it
+evaluates, one per feature-tag parameter of `Accept-Contact` and `Contact`
+(`ifc.FeatureTagField`): the tag's name in a URI, a display name or another
+parameter's value names no service. No SIP header can have that name, as it
+holds a space.
 The profile is created at start if missing; an operator's changes to it are kept.
 So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
 (#137) keeps its old triggers until an operator updates it through the API. No

@@ -35,10 +35,11 @@ const (
 	msrpMedia = `^[Mm][Ee][Ss][Ss][Aa][Gg][Ee] [^ ]+ [Tt][Cc][Pp]/([Tt][Ll][Ss]/)?[Mm][Ss][Rr][Pp] `
 )
 
-// serviceTags are the feature tags that name a service (TS 24.229 §7.9.2,
-// RCC.07 §2.6.1): an ICSI or an IARI, as the S-CSCF's view spells them, in
-// lower case.
-var serviceTags = []string{`\+g\.3gpp\.icsi-ref`, `\+g\.3gpp\.iari-ref`}
+// serviceTag is a feature tag that names a service (TS 24.229 §7.9.2,
+// RCC.07 §2.6.1), an ICSI or an IARI, as the name of an
+// ifc.FeatureTagField: a parameter of Accept-Contact or Contact, not the
+// same text anywhere else in them (#359 security review).
+const serviceTag = `^\+g\.3gpp\.(icsi|iari)-ref$`
 
 // featureTagHeaders carry the caller's and callee's feature tags;
 // serviceHeaders the requested or asserted service.
@@ -90,20 +91,14 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 	// method, group 1 the ORed service conditions, one header and one
 	// literal each, and the last group the served-user check. An INVITE
 	// also takes the trigger by an MSRP stream with no service named in a
-	// feature tag: rcs OR (msrp AND NOT tag1 AND NOT tag2 ...), which in
-	// CNF is group 1 with msrp, and one group per tag and header that holds
-	// the service conditions and that tag's absence.
+	// feature tag: rcs OR (msrp AND NOT tag), which in CNF is group 1 with
+	// msrp, and group 2 with the service conditions and the tag's absence.
 	rcsRequest := func(method string) *ifc.TriggerPoint {
 		groups := []int{1}
 		var absent []ifc.SPT
 		if method == "INVITE" {
-			for _, h := range featureTagHeaders {
-				for _, tag := range serviceTags {
-					g := len(groups) + 1
-					groups = append(groups, g)
-					absent = append(absent, ifc.SPT{ConditionNegated: true, Groups: []int{g}, Condition: ifc.SIPHeader{Header: h, Content: tag}})
-				}
-			}
+			groups = []int{1, 2}
+			absent = []ifc.SPT{{ConditionNegated: true, Groups: []int{2}, Condition: ifc.SIPHeader{Header: ifc.FeatureTagField, Content: serviceTag}}}
 		}
 		spts := []ifc.SPT{{Groups: []int{0}, Condition: ifc.Method(method)}}
 		for _, h := range featureTagHeaders {
