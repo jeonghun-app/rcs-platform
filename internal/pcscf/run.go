@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -204,10 +205,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	var tm transportMetrics
 	var lm layerMetrics
-	stopSweep := every(d.sweep, func() {
-		pc.registry.sweep()
-		pc.reconcileSubscriptions()
-		pc.sweepMSRP()
+	report := func() {
 		ts := tr.Stats()
 		tm.record(rt.Metrics, ts)
 		lm.record(rt.Metrics, ts, px.Layer().Stats())
@@ -215,6 +213,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
 			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
 		}
+	}
+	stopSweep := every(d.sweep, func() {
+		pc.registry.sweep()
+		pc.reconcileSubscriptions()
+		pc.sweepMSRP()
+		report()
 	})
 	defer stopSweep()
 
@@ -230,6 +234,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
 	awaitAnswers(px, tr, answersWait)
+	// What the drain counted since the last sweep goes out with the
+	// runtime's last flush, the sweep stopped so that it does not record
+	// at the same time (#345 code review 4).
+	stopSweep()
+	report()
 	return nil
 }
 
@@ -264,11 +273,13 @@ func relayDialer(cfg Config) func(ctx context.Context, network, address string) 
 // itself, so this bounds memory and frees the slots.
 const sweepInterval = 30 * time.Second
 
-// every runs f every interval until the returned stop is called.
+// every runs f every interval until the returned stop is called, which
+// returns once f is not running, and may be called again.
 func every(interval time.Duration, f func()) (stop func()) {
 	t := time.NewTicker(interval)
-	done := make(chan struct{})
+	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-t.C:
@@ -278,7 +289,11 @@ func every(interval time.Duration, f func()) (stop func()) {
 			}
 		}
 	}()
-	return func() { t.Stop(); close(done) }
+	var once sync.Once
+	return func() {
+		once.Do(func() { t.Stop(); close(done) })
+		<-stopped
+	}
 }
 
 // coreResolver resolves a core hop and sends it through the core listener,

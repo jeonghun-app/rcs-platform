@@ -39,9 +39,11 @@ func proxyHeaderFrom(src string) []byte {
 //     names, without P-Asserted-Identity when it asks for privacy (AC 4);
 //  6. a NOTIFY that ends the binding deregisters the client (AC 2);
 //  7. a request to a flow that closed is 430 (AC 4);
-//  8. a stop closes the flows left (AC 5);
 //
-// and the metrics count what happened (AC 6).
+// and the metrics count what happened (AC 6). How a stop closes the flows
+// left, one by one over the drain (AC 5), is
+// TestAStopClosesTheClientFlowsOneByOne's: here run's own close of the
+// transport would close them all the same (#345 code review 2).
 func TestAClientGoesThroughEveryRule(t *testing.T) {
 	scscf := startCoreNode(t, answerSubscribe)
 	scscfPort := scscf.ln.Addr().(*net.TCPAddr).Port
@@ -59,7 +61,8 @@ func TestAClientGoesThroughEveryRule(t *testing.T) {
 
 	// 1. Flows, by the address in the PROXY header.
 	c := dial(t, s.client, proxyHeaderFrom("192.0.2.10:40000"))
-	spare := dial(t, s.client, proxyHeaderFrom("192.0.2.10:40001"))
+	// The spare flow stays open to the end.
+	_ = dial(t, s.client, proxyHeaderFrom("192.0.2.10:40001"))
 	// The flows are admitted once their headers are read, in their own
 	// order: the third comes once the first two are in.
 	tr := pc.flows.(*transport.Transport)
@@ -149,9 +152,10 @@ func TestAClientGoesThroughEveryRule(t *testing.T) {
 		t.Fatalf("NOTIFY ending the binding: %d, registered %v", res.StatusCode, aliceRegistered(t, pc, flow))
 	}
 
-	// 7. The client goes; its flow is not reused. A request sent before
-	// pcscf has seen the close would wait for Timer F, so the request goes
-	// once the client listener holds the spare connection alone.
+	// 7. The client goes; its flow is not reused. The request goes once the
+	// client listener holds the spare connection alone, so that it meets a
+	// flow known to be gone and gets terminate's own 430, not the proxy's
+	// for a flow that closes under it (#293), which other tests count.
 	_ = c.nc.Close()
 	for deadline := time.Now().Add(waitFor); tr.Stats().ListenerConnections[clientListener] != 1; time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
@@ -169,11 +173,5 @@ func TestAClientGoesThroughEveryRule(t *testing.T) {
 		if n, ok := h.Metric(name); !ok || n < 1 {
 			t.Errorf("%s: %v, %v", name, n, ok)
 		}
-	}
-
-	// 8. A stop closes the flows left.
-	s.stop()
-	if !spare.closed() {
-		t.Error("the stop left a client flow open")
 	}
 }

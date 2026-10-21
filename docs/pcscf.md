@@ -553,7 +553,7 @@ the sweep, every 30 s.
 |---|---|---|
 | `flows.client` | gauge | client flows open |
 | `registrations` | gauge | registrations held, with the reservations of REGISTERs under way |
-| `flows.refused.total`, `flows.refused.per_client` | count | client flows refused at `PCSCF_MAX_CLIENT_FLOWS`, and at `PCSCF_MAX_FLOWS_PER_IP` for one client |
+| `flows.refused.total`, `flows.refused.per_client` | count | client flows the transport's Admit refused: past `PCSCF_MAX_CLIENT_FLOWS` counting UDP flows (dev), and past `PCSCF_MAX_FLOWS_PER_IP` for one client. A TCP or TLS connection at `PCSCF_MAX_CLIENT_FLOWS` is refused before Admit, at accept, and counted in `transport.client_listener_rejected`, the metric to alarm on for that limit |
 | `register.refused.rate` | count | REGISTERs refused past one client's rate (503) |
 | `register.refused_task_rate` | count | REGISTERs refused past the task's rate (503) |
 | `register.refused.pending` | count | REGISTERs refused with too many of a flow's or a client's under way (503) |
@@ -567,7 +567,7 @@ the sweep, every 30 s.
 | `indialog.refused.rate` | count | a client's requests inside a dialog refused past its rate (503) |
 | `indialog.refused.route` | count | requests inside a dialog on a route this `pcscf` did not record for the flow, or not to `scscf` (403) |
 | `indialog.refused.unresolved` | count | requests inside a dialog whose `scscf` did not resolve (503) |
-| `terminating.flow_failed` | count | requests from the core answered 430 Flow Failed, by `pcscf` or by the proxy when the flow failed as they went |
+| `terminating.flow_failed` | count | requests from the core answered 430 Flow Failed by `pcscf`, or by the proxy when the flow closed as they went (#293); a 430 the client sent itself is passed on, not counted |
 | `terminating.refused.route` | count | requests from the core inside a dialog on another dialog's route (403) |
 | `terminating.pai_omitted`, `terminating.record_route_malformed` | count | as in [Requests from the core](#requests-from-the-core) |
 | `regevent.deregistered`, `regevent.subscribe_failed` | count | as in [Reg event](#reg-event) |
@@ -579,10 +579,13 @@ the sweep, every 30 s.
 | `ResponseFlowCloses` | count | client flows closed because a response could not be queued |
 | `ServerTransactionBytes` | gauge | bytes the server transactions hold, against their cap |
 | `ServerTransactionsRejected` | count | requests refused at the server transaction caps (503) |
+| `RefusalAcksAbsorbed` | count | ACKs of those 503s, which go no further |
 
-The last six keep the names of the transport's and the transaction
-layer's `Stats` fields, which the alarms of `infra/platform.yaml` read
-(#56, #170).
+The last seven keep the names of the transport's and the transaction
+layer's `Stats` fields, which the alarms and the dashboard of
+`infra/platform.yaml` read (#56, #170; the infra change is #126). The
+counts are written at each sweep and once more when a stop has drained
+the flows.
 
 ## Settings
 

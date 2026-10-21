@@ -113,9 +113,11 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 		},
 		// scscf, the authoritative proxy, needs the 430 (RFC 5626 §11.5).
 		// A flow that failed as the request went is 430 too, which the
-		// proxy makes; it is counted with the ones refused above.
+		// proxy makes; it is counted with the ones refused above. A 430
+		// the client sent over its flow, still live, is passed on but not
+		// counted, as no flow failed (#345 QA).
 		OnFinal: func(_ context.Context, res *sip.Response) {
-			if res.StatusCode == statusFlowFailed {
+			if res.StatusCode == statusFlowFailed && !p.clientFlow(flow) {
 				p.count(metricTerminatingFlow, 1)
 			}
 		},

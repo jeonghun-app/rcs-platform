@@ -32,11 +32,11 @@ const (
 )
 
 // layerMetrics exports the transport's queue counters and the transaction
-// layer's, under the names their Stats fields have, which the alarms of
-// infra/platform.yaml read (#56, #170): QueuedBytes and
-// ServerTransactionBytes as gauges, BudgetSheds, BudgetRefusals,
-// ResponseFlowCloses and ServerTransactionsRejected as counts since the
-// last sweep.
+// layer's, under the names their Stats fields have, which the alarms and
+// the dashboard of infra/platform.yaml read (#56, #170; the infra change
+// is #126): QueuedBytes and ServerTransactionBytes as gauges, BudgetSheds,
+// BudgetRefusals, ResponseFlowCloses, ServerTransactionsRejected and
+// RefusalAcksAbsorbed as counts since the last record.
 type layerMetrics struct {
 	transport   transport.Stats
 	transaction transaction.Stats
@@ -52,5 +52,6 @@ func (lm *layerMetrics) record(m *runtime.Metrics, ts transport.Stats, xs transa
 	m.Count("ResponseFlowCloses", int64(ts.ResponseFlowCloses-lm.transport.ResponseFlowCloses))
 	m.Gauge("ServerTransactionBytes", xs.ServerTransactionBytes)
 	m.Count("ServerTransactionsRejected", int64(xs.ServerTransactionsRejected-lm.transaction.ServerTransactionsRejected))
+	m.Count("RefusalAcksAbsorbed", int64(xs.RefusalAcksAbsorbed-lm.transaction.RefusalAcksAbsorbed))
 	lm.transport, lm.transaction = ts, xs
 }

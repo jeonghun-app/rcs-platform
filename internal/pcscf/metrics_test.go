@@ -124,12 +124,12 @@ func TestTheLayersCountersGoOutUnderTheAlarmsNames(t *testing.T) {
 	m := runtime.NewMetrics(&out, "RCS", "pcscf", clock.now, nil)
 	var lm layerMetrics
 	lm.record(m, transport.Stats{QueuedBytes: 10, BudgetSheds: 2, BudgetRefusals: 3, ResponseFlowCloses: 1},
-		transaction.Stats{ServerTransactionBytes: 7, ServerTransactionsRejected: 4})
+		transaction.Stats{ServerTransactionBytes: 7, ServerTransactionsRejected: 4, RefusalAcksAbsorbed: 1})
 	lm.record(m, transport.Stats{QueuedBytes: 20, BudgetSheds: 5, BudgetRefusals: 3, ResponseFlowCloses: 1},
-		transaction.Stats{ServerTransactionBytes: 9, ServerTransactionsRejected: 6})
+		transaction.Stats{ServerTransactionBytes: 9, ServerTransactionsRejected: 6, RefusalAcksAbsorbed: 3})
 	m.Flush()
 	for _, want := range []string{`"QueuedBytes":20`, `"BudgetSheds":5`, `"BudgetRefusals":3`, `"ResponseFlowCloses":1`,
-		`"ServerTransactionBytes":9`, `"ServerTransactionsRejected":6`} {
+		`"ServerTransactionBytes":9`, `"ServerTransactionsRejected":6`, `"RefusalAcksAbsorbed":3`} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("metrics lack %s:\n%s", want, out.String())
 		}
@@ -153,6 +153,22 @@ func TestRunsSweepReportsFlowsAndRegistrations(t *testing.T) {
 	}
 	if _, ok := h.Metric("QueuedBytes"); !ok {
 		t.Error("no QueuedBytes")
+	}
+}
+
+// A stop records the layers' counters once more after the drain, so that
+// what the last 30 s counted goes out with the runtime's last flush (#345
+// code review 4): with a sweep that never runs, the counters still go out.
+func TestAStopRecordsTheCountersOnceMore(t *testing.T) {
+	h := runtimetest.New(t, "pcscf")
+	s := startWith(t, h, testConfig(), deps{sweep: time.Hour})
+	_ = dial(t, s.client, nil)
+	s.stop()
+	h.Runtime.Metrics.Flush()
+	for _, name := range []string{"QueuedBytes", "ServerTransactionsRejected", metricFlows} {
+		if _, ok := h.Metric(name); !ok {
+			t.Errorf("no %s:\n%s", name, h.Output())
+		}
 	}
 }
 
