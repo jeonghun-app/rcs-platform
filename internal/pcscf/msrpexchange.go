@@ -3,6 +3,7 @@ package pcscf
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"strconv"
 	"sync"
@@ -156,7 +157,7 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 			return fail(ctx.Err())
 		}
 		if err != nil {
-			p.relayFailed("create", err)
+			p.createFailed(err)
 			return fail(err)
 		}
 		u, err := msrp.ParseURI(b.ClientPath)
@@ -175,6 +176,18 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 		s.mu.Unlock()
 	}
 	return made, 0, nil
+}
+
+// createFailed counts a binding create that failed: a relay error, or one
+// the stop cut, which says nothing about the relay. A binding the relay may
+// already have made for a cut one is left to its expiry.
+func (p *pcscf) createFailed(err error) {
+	if p.msrp.ctx.Err() != nil {
+		p.count(metricCreateCutAtStop, 1)
+		p.log.Debug("msrp-relay create cut by the stop", slog.String("error", err.Error()))
+		return
+	}
+	p.relayFailed("create", err)
 }
 
 // errCreateAbandoned is a binding create that ctx ended first (create).
@@ -213,7 +226,7 @@ func (p *pcscf) create(ctx context.Context, sh share, paths relayPaths) (relayBi
 				p.relayFailed("release", err)
 			}
 		} else if err != nil {
-			p.relayFailed("create", err)
+			p.createFailed(err)
 		}
 		p.msrp.limit.give(sh, 1)
 	})

@@ -64,6 +64,7 @@ const (
 	metricEndedDeclined    = "msrp.ended.declined"
 	metricRelayErrors      = "msrp.relay_errors"
 	metricReleasedCancel   = "msrp.released_after_cancel"
+	metricCreateCutAtStop  = "msrp.create_cut_at_stop"
 	metricByeFailed        = "msrp.bye_failed"
 	reasonDirection        = `SIP;cause=488;text="MSRP direction not supported"`
 	reasonSecondAnswer     = `SIP;cause=488;text="MSRP answer already given"`

@@ -527,7 +527,10 @@ it cannot anchor is refused or ended; it never runs end to end.
   `PCSCF_RELAY_TIMEOUT` and cut short by the stop, keeping its share of the
   flow's bindings until it ends. A binding the relay made meanwhile is then
   released, counted in `msrp.released_after_cancel`. A release that fails
-  leaves the binding to its expiry, counted in `msrp.relay_errors`.
+  leaves the binding to its expiry, counted in `msrp.relay_errors`. A
+  create the stop cuts is counted in `msrp.create_cut_at_stop`, not as a
+  relay error; a binding the relay may already have made for it is left to
+  expire.
 - **Ending a dialog.** A 2xx cannot be refused, nor an ACK, so a dialog
   `pcscf` cannot serve is forwarded and then ended: once the ACK of the 2xx
   passes, or 32 s after the 2xx, a BYE goes to the client over its flow,
@@ -617,7 +620,7 @@ the sweep, every 30 s.
 | `terminating.refused.route` | count | requests from the core inside a dialog on another dialog's route (403) |
 | `terminating.pai_omitted`, `terminating.record_route_malformed` | count | as in [Requests from the core](#requests-from-the-core) |
 | `regevent.deregistered`, `regevent.subscribe_failed` | count | as in [Reg event](#reg-event) |
-| `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.released_after_cancel`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
+| `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.released_after_cancel`, `msrp.create_cut_at_stop`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
 | `transport.listener_connections.*`, `transport.*` | gauge, count | as in [Edge rules](#edge-rules) |
 | `QueuedBytes` | gauge | bytes waiting in every send queue, against the transport's budget |
 | `BudgetSheds` | count | stalled connections closed to keep the queues in their budget |

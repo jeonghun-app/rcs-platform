@@ -186,6 +186,35 @@ func TestACancelDoesNotWaitForAStalledRelayCall(t *testing.T) {
 	}
 }
 
+// A create still running when pcscf stops, after its CANCEL, is cut by the
+// stop: counted as such, not as a relay error, and not logged as one; the
+// binding the relay may have made is left to expire (#382 review).
+func TestACreateTheStopCutsIsNotARelayError(t *testing.T) {
+	st := startRelayStack(t, func(*sip.Request) string { return "" }, time.Hour, deps{})
+	st.block.Store(true)
+	st.invite(t, "e2e-cut", "INVITE", clientChatOffer)
+	<-st.posted
+	st.invite(t, "e2e-cut", "CANCEL", "")
+	if res := st.c.final(); res.StatusCode != 200 {
+		t.Errorf("CANCEL: %d", res.StatusCode)
+	}
+	if res := st.c.final(); res.StatusCode != 487 {
+		t.Errorf("INVITE: %d", res.StatusCode)
+	}
+	st.svc.stop() // the relay still holds the POST
+	close(st.release)
+	h := st.svc.h
+	if n, _ := h.Metric(metricCreateCutAtStop); n != 1 {
+		t.Errorf("%s = %v, want 1", metricCreateCutAtStop, n)
+	}
+	if n, _ := h.Metric(metricRelayErrors); n != 0 {
+		t.Errorf("%s = %v, want 0", metricRelayErrors, n)
+	}
+	if logs := h.Logs("msrp-relay call failed"); len(logs) != 0 {
+		t.Errorf("logged %v", logs)
+	}
+}
+
 // A CANCEL after the INVITE has reached scscf, the order #361 left to
 // chance, ends it with scscf's 487 at once, as scscf answers the INVITE
 // 100 Trying and the CANCEL as a UAS does (RFC 3261 §9.2), and releases the
