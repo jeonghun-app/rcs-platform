@@ -13,8 +13,11 @@ import (
 // below the S-CSCF's in the request, and the callee's P-CSCF entry, above
 // it in the response.
 var (
-	callerPCSCF = "<sip:" + flow(7) + "@198.51.100.7:5070;transport=tcp;lr>"
-	calleePCSCF = "<sip:" + flow(1) + "@198.51.100.5:5070;transport=tcp;lr>"
+	// As pcscf writes its core-facing value: the flow, outbound, the icid
+	// and its own dialog MAC, also named dlg, which the S-CSCF's hops leave
+	// out.
+	callerPCSCF = "<sip:" + flow(7) + "@198.51.100.7:5070;transport=tcp;lr;ob;icid=call7;dlg=pcscfmac7>"
+	calleePCSCF = "<sip:" + flow(1) + "@198.51.100.5:5070;transport=tcp;lr;ob;icid=call1;dlg=pcscfmac1>"
 )
 
 // setUp runs an INVITE for impu1 through Terminating with extra header
@@ -43,7 +46,8 @@ func setUp(t *testing.T, e *env, rt *Router, extra ...string) (proxy.Decision, *
 	return d, b
 }
 
-// ourEntry is the S-CSCF's Record-Route value in h, the one with dlg.
+// ourEntry is the S-CSCF's Record-Route value in h: its host, with dlg,
+// which pcscf's values carry too.
 func ourEntry(t *testing.T, h *sip.Header) sip.Address {
 	t.Helper()
 	rr, err := h.RecordRoute()
@@ -51,7 +55,7 @@ func ourEntry(t *testing.T, h *sip.Header) sip.Address {
 		t.Fatal(err)
 	}
 	for _, a := range rr {
-		if _, ok := a.URI.Param(dlgParam); ok {
+		if _, ok := a.URI.Param(dlgParam); ok && a.URI.Host == "scscf.rcs.local" {
 			return a
 		}
 	}
@@ -205,5 +209,36 @@ func TestOnlyTheSCSCFsOwnValueIsSigned(t *testing.T) {
 	}
 	if got, _ := b.Header.Elements("Record-Route"); len(got) != 1 || got[0] != callerPCSCF {
 		t.Errorf("Record-Route %q", got)
+	}
+}
+
+// TestAStandaloneRequestIsNotRecorded (#322): an OPTIONS or a MESSAGE sets
+// up no dialog, and its Contact, which no proxy checked, is signed for
+// nothing; a request naming that hop as inside a dialog is 403. An INVITE
+// is recorded.
+func TestAStandaloneRequestIsNotRecorded(t *testing.T) {
+	core := "sip:10.0.130.25:5060;transport=tcp"
+	for _, method := range []string{"OPTIONS", "MESSAGE", "INVITE", "SUBSCRIBE", "REFER"} {
+		e := newEnv(t)
+		e.registered(binding(1, 1, time.Hour))
+		rt := e.router(nil)
+		r := request(t, method, impu1, "Contact: <"+core+">")
+		_ = r.Message.Header.Set("Call-ID", "dialog-1")
+		d := rt.Terminating(bg, r)
+		recorded := len(d.RecordRoute) == 1 && d.OnResponse != nil
+		if want := method != "OPTIONS" && method != "MESSAGE"; recorded != want {
+			t.Errorf("%s: recorded %v, want %v", method, recorded, want)
+		}
+		if recorded {
+			continue
+		}
+		b := r.Message.Clone()
+		if err := d.Prepare(bg, d.Targets[0], b); err != nil || b.Header.Has("Record-Route") {
+			t.Errorf("%s: prepared %v with Record-Route %q", method, err, b.Header.Get("Record-Route"))
+		}
+		unsigned := sip.Address{URI: mustURI("sip:scscf.rcs.local;transport=tcp;lr")}
+		if d := rt.InDialog(bg, inDialog(t, core, "", unsigned)); d.Status != 403 {
+			t.Errorf("%s: a request to its Contact is %d", method, d.Status)
+		}
 	}
 }

@@ -368,15 +368,16 @@ func TestAnItemNamingTheSavedIncarnationIsNotWritten(t *testing.T) {
 	}
 }
 
-// TestAnOPTIONSIsRoutedAsAnyRequest (#14 AC 6): forked to the bindings,
-// recorded and prepared alike, and 480 for a user without a live binding.
+// TestAnOPTIONSIsRoutedAsAnyRequest (#14 AC 6): forked to the bindings and
+// prepared alike, though not recorded, as it sets up no dialog, and 480 for
+// a user without a live binding.
 func TestAnOPTIONSIsRoutedAsAnyRequest(t *testing.T) {
 	e := newEnv(t)
 	e.registered(binding(1, 0, time.Hour), binding(2, 0, time.Hour))
 	rt := e.router(nil)
 	r := request(t, "OPTIONS", impu1)
 	d := rt.Terminating(bg, r)
-	if got := uris(d.Targets); len(got) != 2 || len(d.RecordRoute) != 1 {
+	if got := uris(d.Targets); len(got) != 2 || len(d.RecordRoute) != 0 {
 		t.Fatalf("targets %v, Record-Route %v", got, d.RecordRoute)
 	}
 	b := r.Message.Clone()

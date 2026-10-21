@@ -20,12 +20,14 @@
 // feature is kept), with
 // the Request-URI it was sent to in P-Called-Party-ID. A binding whose edge proxy answers 430 Flow Failed is
 // ended, as an expired one is, for the sweep to finish, and the request
-// tried over the instance's other flows (RFC 5626 §7). A barred identity,
+// tried over the instance's other flows (RFC 5626 §7), unless it is an
+// INVITE the device already answered with a provisional. A barred identity,
 // or a Request-URI that is no public identity, is 404; a user without a
 // live binding is 480 until the unregistered user's iFC come (§5.4.3.3).
 //
 // A dialog's requests come back along the S-CSCF's Record-Route value,
-// which it signs when the dialog is set up (#322): with a key ID and a MAC,
+// which it writes only on a request that sets up a dialog (INVITE,
+// SUBSCRIBE, REFER) and signs as the dialog is set up (#322): with a key ID and a MAC,
 // under a key every scscf instance shares, over the Call-ID, the S-CSCF's
 // name and each of the dialog's hops next to it, scheme, user, host, port
 // and transport. The value in the request the callee gets signs the hop

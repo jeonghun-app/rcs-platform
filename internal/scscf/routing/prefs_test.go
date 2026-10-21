@@ -34,11 +34,12 @@ func TestCallerPreferenceRules(t *testing.T) {
 		"a flag that must be false, quoted":               {`Accept-Contact: *;+g.oma.sip-im="FALSE";require;explicit`, []int{2}},
 		"a flag quoted as TRUE":                           {`Accept-Contact: *;+g.oma.sip-im="TRUE";require;explicit`, []int{1, 2}},
 		"a flag quoted as true":                           {`Accept-Contact: *;+g.oma.sip-im="true";require;explicit`, []int{1, 2}},
-		"negated, the one with the value dropped":         {`Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require;explicit`, []int{2}},
+		"negated, another value keeps it (RFC 2533)":      {`Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require;explicit`, []int{1, 2}},
+		"rejected by a negation another value matches":    {`Reject-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp"`, []int{0, 2}},
 		"one of a list":                                   {`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.geopush";require;explicit`, []int{1, 2}},
 		"any of a list":                                   {`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Ax,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require;explicit`, []int{1, 2}},
 		"a token without case (§7.2.4)":                   {`Accept-Contact: *;+G.3GPP.ICSI-REF="URN%3aURN-7%3a3GPP-SERVICE.IMS.ICSI.OMA.CPM.SESSION";require;explicit`, []int{0, 2}},
-		"negated":                                         {`Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require`, []int{0, 2}},
+		"negated":                                         {`Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require`, []int{0, 1, 2}},
 		"a flag":                                          {"Accept-Contact: *;+g.oma.sip-im;require;explicit", []int{1, 2}},
 		"two features, both needed":                       {"Accept-Contact: *;+g.oma.sip-im;" + chat + ";require;explicit", []int{2}},
 		"two preferences, each needed":                    {"Accept-Contact: *;+g.oma.sip-im;require;explicit\r\nAccept-Contact: *;" + chat + ";require;explicit", []int{2}},
@@ -210,5 +211,28 @@ func TestANegatedValueKeepsABindingWithAnotherValue(t *testing.T) {
 	r := request(t, "INVITE", impu1, `Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require;explicit`)
 	if got := accepted(cs, r.Message); len(got) != 1 {
 		t.Errorf("a binding with geopush only was dropped by !fthttp")
+	}
+}
+
+// TestANegatedValueDropsABindingWithOnlyThatValue (RFC 2533): no feature
+// collection of it is without the value; a number outside a negated range
+// keeps one.
+func TestANegatedValueDropsABindingWithOnlyThatValue(t *testing.T) {
+	ft := `+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp"`
+	for name, c := range map[string]struct {
+		tags  []string
+		field string
+		kept  bool
+	}{
+		"only the value":       {[]string{ft}, `Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require;explicit`, false},
+		"only the value, case": {[]string{ft}, `Accept-Contact: *;+g.3gpp.iari-ref="!URN%3aurn-7%3a3gpp-application.ims.iari.rcs.FTHTTP";require;explicit`, false},
+		"a number in range":    {[]string{`+x.n="#=4"`}, `Accept-Contact: *;+x.n="!#3:5";require;explicit`, false},
+		"a number out of it":   {[]string{`+x.n="#=4,#=9"`}, `Accept-Contact: *;+x.n="!#3:5";require;explicit`, true},
+		"a string":             {[]string{`+x.s="<a b>"`}, `Accept-Contact: *;+x.s="!<a b>";require;explicit`, false},
+	} {
+		got := accepted([]state.Contact{binding(1, 0, time.Hour, c.tags...)}, request(t, "INVITE", impu1, c.field).Message)
+		if (len(got) == 1) != c.kept {
+			t.Errorf("%s: kept %v, want %v", name, len(got) == 1, c.kept)
+		}
 	}
 }

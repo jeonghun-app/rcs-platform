@@ -31,8 +31,8 @@ const saveAttempts = 3
 // without a live binding the preferences accept, 400 for more than
 // maxPreferences of them or one that requires something and does not
 // parse, and 500 with Retry-After for a store that cannot
-// be read. The S-CSCF's Record-Route value signs the dialog's hops
-// (recorder).
+// be read. For a request that sets up a dialog the S-CSCF's Record-Route
+// value signs the dialog's hops (recorder).
 func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decision {
 	impu, ok := identity.CanonicalIMPU(r.Message.URI.String())
 	if !ok {
@@ -70,21 +70,37 @@ func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decis
 	}
 	rt.count("routing.terminating")
 	called := sip.Address{URI: r.Message.URI}.String()
-	rec := rt.recorder(r.Message)
-	return proxy.Decision{
-		Targets:     targets,
-		RecordRoute: []sip.Address{rt.cfg.RecordRoute},
+	dec := proxy.Decision{
+		Targets: targets,
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 			// The Request-URI the request came with, which the contact's
 			// Request-URI replaces (§5.4.3.3).
-			if err := req.Header.Set("P-Called-Party-ID", called); err != nil {
+			return req.Header.Set("P-Called-Party-ID", called)
+		},
+		OnBranchFailure: d.failed,
+	}
+	if formsDialog(r.Message.Method) {
+		rec := rt.recorder(r.Message)
+		prepare := dec.Prepare
+		dec.RecordRoute = []sip.Address{rt.cfg.RecordRoute}
+		dec.Prepare = func(ctx context.Context, t proxy.Target, req *sip.Request) error {
+			if err := prepare(ctx, t, req); err != nil {
 				return err
 			}
 			return rec.prepare(req)
-		},
-		OnResponse:      rec.response,
-		OnBranchFailure: d.failed,
+		}
+		dec.OnResponse = rec.response
 	}
+	return dec
+}
+
+// formsDialog reports whether a request of method sets up a dialog, the
+// S-CSCF recording its route (RFC 3261 §12.1, RFC 6665, RFC 3515), as
+// pcscf's does. A standalone request, such as OPTIONS or MESSAGE, is not
+// recorded: no proxy records it, so its hop toward the caller would be a
+// Contact nobody checked, which a signature would then vouch for (#322).
+func formsDialog(method string) bool {
+	return method == "INVITE" || method == "SUBSCRIBE" || method == "REFER"
 }
 
 // errBarred is the lookup of a barred identity.
