@@ -112,6 +112,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		Router:          router,
 		Resolver:        dns,
 		Logger:          rt.Logger,
+		Metrics:         rt.Metrics,
 		Transaction:     tcfg,
 		MaxContexts:     maxContexts,
 		MaxContextBytes: maxContextBytes,

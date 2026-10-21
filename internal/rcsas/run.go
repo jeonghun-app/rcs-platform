@@ -118,7 +118,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if err != nil {
 		return err
 	}
-	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger})
+	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger, Metrics: rt.Metrics})
 	if err != nil {
 		return err
 	}
