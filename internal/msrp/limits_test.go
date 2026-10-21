@@ -101,13 +101,16 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 			}
 		}
 	}
-	// A spread run costs a few in-order ones, so each timing of the
-	// yardstick runs it baseRuns times: the two timings then last about as
-	// long, and a loaded host, which preempts a long timing more often
-	// than a short one, stretches both about alike (#232: the best of
-	// three 200 ms spread runs against 7 ms in-order ones made 28.7x).
-	// The two are timed in turn, so a burst of load meets both, and the
-	// shortest of each is taken, since other work only adds time.
+	// A spread run costs about two in-order ones (7.7 ms against 3.5 ms
+	// unloaded, QA of #352), and each timing of the yardstick runs four:
+	// the yardstick then lasts about twice the spread, long enough that
+	// load seldom leaves it unthrottled while it stretches the spread
+	// (#232: the best of three 200 ms spread runs against 7 ms in-order
+	// ones made 28.7x). Two runs, which would match the spread, failed
+	// unchanged code 2 times in 100 under the load model, against none for
+	// four in the same slots (QA of #352). The two are timed in turn, so a
+	// burst of load meets both, and the shortest of each is taken, since
+	// other work only adds time.
 	const baseRuns = 4
 	spreadTime, baseTime := time.Duration(1<<63-1), time.Duration(1<<63-1)
 	for range 5 {
