@@ -59,7 +59,9 @@ func registeredFor(set state.SetKey, impu string, t ifc.RegistrationType, bindin
 // ended: an unregistered user's record, which no REGISTER made, has none
 // to tell.
 func (g *Registrar) endedByNetwork(ctx context.Context, before *state.Registration, profile *state.Profile) {
-	if len(before.Contacts) == 0 && !before.Unregistered.IsZero() {
+	if len(before.Contacts) == 0 && !before.Unregistered.IsZero() || before.Tombstone {
+		// An undo's tombstone holds a set whose end the servers were told
+		// of already (#410 code review).
 		return
 	}
 	for _, impu := range registeredIdentities(before, "") {

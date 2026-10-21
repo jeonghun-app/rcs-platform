@@ -107,7 +107,10 @@ func startStoppableHarness(t *testing.T, cfg Config, d deps) (netip.AddrPort, ne
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
 	done := make(chan error, 1)
-	d.store, d.groups = store.NewMemory(), groupstore.NewMemory()
+	d.store = store.NewMemory()
+	if d.groups == nil {
+		d.groups = groupstore.NewMemory()
+	}
 	d.listening = func(a netip.AddrPort) { listening <- a }
 	go func() { done <- run(ctx, h.Runtime, cfg, d) }()
 	var once sync.Once
@@ -442,11 +445,22 @@ func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nc, r, res := inviteTheFactory(t, core, startRun(t, cfg, deps{}))
+	groups := groupstore.NewMemory()
+	sipAddr := startRun(t, cfg, deps{groups: groups})
+	nc, r, res := inviteTheFactory(t, core, sipAddr)
 	factory := "sip:conf-factory@" + devEnv["RCS_IMS_DOMAIN"]
 	contact, err := sip.ParseAddress(res.Header.Get("Contact"))
 	if res.StatusCode != 200 || err != nil || contact.URI.Host != devEnv["RCSAS_CONFERENCE_HOST"] || !contact.Params.Has("isfocus") {
 		t.Fatalf("answered %d, Contact %q", res.StatusCode, res.Header.Get("Contact"))
+	}
+	// With group chat on, the task owns the group it made, and beats as
+	// its SIP instance address (#121).
+	owner, err := groups.Owner(t.Context(), "sip:"+contact.URI.User+"@"+contact.URI.Host)
+	if err != nil || owner.Epoch != 1 || owner.SIP != sipAddr.String() {
+		t.Fatalf("owner %+v, %v; SIP at %s", owner, err, sipAddr)
+	}
+	if task, err := groups.Task(t.Context(), owner.Task); err != nil || task.SIP != sipAddr.String() || !task.AliveUntil.After(time.Now()) {
+		t.Fatalf("heartbeat %+v, %v", task, err)
 	}
 	// The group is established, and its invitees invited, once the 200's
 	// ACK has come.
