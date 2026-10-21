@@ -69,13 +69,19 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 		"P-Asserted-Identity": "<" + alice + ">",
 		"P-Served-User":       "<" + bob + ">;sescase=term",
 		"P-Asserted-Service":  chatICSI,
-		"Accept-Contact":      "*;" + chatTag,
-		"Conversation-ID":     "c0nv1",
-		"Content-Type":        sdpType,
+		// Both the CPM ICSI and the OMA SIMPLE IM tag, by which rcsjta
+		// takes a chat (code review on #279).
+		"Contact":         "<sip:" + r.a.addr.String() + ";transport=tcp>;" + chatTag + ";" + omaIMTag,
+		"Conversation-ID": "c0nv1",
+		"Content-Type":    sdpType,
 	} {
 		if got := ih.Get(name); got != want {
 			t.Errorf("INVITE %s: %q, want %q", name, got, want)
 		}
+	}
+	// One Accept-Contact per feature tag (code review on #279).
+	if ac := ih.Values("Accept-Contact"); !slices.Equal(ac, []string{"*;" + chatTag, "*;" + omaIMTag}) {
+		t.Errorf("INVITE Accept-Contact %q", ac)
 	}
 	if inv.URI.String() != bob || ih.Has("Supported") {
 		t.Errorf("INVITE %s, Supported %q", inv.URI.String(), ih.Get("Supported"))
@@ -261,7 +267,18 @@ func TestALargeModeInviteIsAnsweredForCPIMOnly(t *testing.T) {
 // RFC 4028 as the UAS that never refreshes: the client refreshes, and a
 // session it stops refreshing is ended before it expires (§10).
 func TestASessionTimerIsTakenRefreshedAndEndsTheSession(t *testing.T) {
-	r := newChatRig(t, messaging.Config{})
+	sessionTimer(t)
+}
+
+// #290: the same, with every ACK slower than T1, so that the re-INVITE's
+// 2xx is retransmitted while the UPDATE waits for its own.
+func TestASessionTimerIsTakenRefreshedAndEndsTheSessionWhenTheACKsAreSlow(t *testing.T) {
+	sessionTimer(t, func(pc *proxy.Config) { pc.Transaction.Clock = t1AtOnce{} })
+}
+
+func sessionTimer(t *testing.T, tune ...func(*proxy.Config)) {
+	t.Helper()
+	r := newChatRig(t, messaging.Config{}, tune...)
 	p := r.a.dial(t)
 	from := relayPath()
 	offer := offerSDP(from, "active")
@@ -747,15 +764,6 @@ func settled(t *testing.T, s *Server, callID string) {
 			t.Fatalf("session %s not settled", callID)
 		}
 		time.Sleep(time.Millisecond)
-	}
-}
-
-func TestGroupSessionsAreNotServedYet(t *testing.T) {
-	r := newChatRig(t, messaging.Config{})
-	inv := invitation()
-	inv.Mode = store.Group
-	if err := r.a.srv.Invite(t.Context(), inv); !errors.Is(err, errGroupNotServed) {
-		t.Fatalf("Invite: %v", err)
 	}
 }
 

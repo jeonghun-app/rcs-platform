@@ -164,7 +164,7 @@ func newRespContext(p *Proxy, tx *transaction.ServerTransaction, cost, header in
 	c.ctx, c.cancelCtx = context.WithCancel(p.ctx)
 	c.reqCtx, c.cancelReq = context.WithCancel(c.ctx)
 	c.up.p = p
-	c.unwatch = context.AfterFunc(tx.Context(), c.layerAnswered)
+	c.unwatch = context.AfterFunc(tx.Context(), func() { p.counted(c.layerAnswered) })
 	return c
 }
 
@@ -198,7 +198,14 @@ func (c *respContext) layerAnswered() {
 	// Last, so that whoever sees the context cancelled finds the context
 	// stopped and its CANCELs under way.
 	c.cancelCtx()
+	if h := testHookLayerAnswered.Load(); h != nil {
+		(*h)()
+	}
 }
+
+// testHookLayerAnswered, when set by a test, runs at the end of a
+// layerAnswered that stopped a context.
+var testHookLayerAnswered atomic.Pointer[func()]
 
 // run validates, preprocesses and routes the request, then starts the first
 // fork group. It runs on a goroutine of its own.
@@ -910,22 +917,28 @@ func (c *respContext) closeBranches() []func() {
 	return acts
 }
 
-// cancelUpstream handles a CANCEL for the request (§16.10). A request the
-// service is answering itself is the service's to end: it learns of the
-// CANCEL through its context, and the proxy answers for it only if it returns
-// without a final response.
-func (c *respContext) cancelUpstream() {
+// cancelUpstream handles a CANCEL for the request (§16.10): it marks the
+// request cancelled, so that no branch starts from here on, and returns
+// what is to be done for it, the CANCELs of the pending branches and the
+// final response if the request has its answer now, which receiveCancel
+// runs after the CANCEL's own 200. A branch that ends unsent in between
+// sends the final response itself, which may then go before the 200. A request the service is answering itself is the
+// service's to end: it learns of the CANCEL through its context, and the
+// proxy answers for it only if it returns without a final response.
+func (c *respContext) cancelUpstream() (then func()) {
 	c.mu.Lock()
 	c.cancelled = true
 	acts := c.closeBranches()
 	acts = append(acts, c.progress()...)
 	uas := c.uas
 	c.mu.Unlock()
-	// A CANCEL after the service's final response has no effect (§9.2).
-	if uas == nil || !uas.hasAnswered() {
-		c.cancelReq()
+	return func() {
+		// A CANCEL after the service's final response has no effect (§9.2).
+		if uas == nil || !uas.hasAnswered() {
+			c.cancelReq()
+		}
+		runAll(acts)
 	}
-	runAll(acts)
 }
 
 // sendCancel sends the branch's CANCEL and gives the INVITE 64*T1 to end

@@ -373,10 +373,149 @@ func TestUploadInfoSettlesOnlyAfterAQuietTime(t *testing.T) {
 	}
 	// The request it settled on reached the server at least a quiet time
 	// after the last answer naming other bytes (the third): the quiet time
-	// runs from the request that first got 20 bytes, which was sent after
-	// that answer.
+	// runs from the answer that first named 20 bytes, which came after that
+	// one (#377).
 	if gap := signed[len(signed)-1].Sub(signed[2]); gap < quiet {
 		t.Fatalf("settled %v after the bytes held last changed, want at least %v", gap, quiet)
+	}
+}
+
+func TestUploadInfoSettlesThoughAnAnswerComesAfterItsTime(t *testing.T) {
+	// #344: a server that holds the parts from the start but takes longer
+	// than within to answer once is not still storing: the deadline bounds
+	// when a request is sent, not when its answer comes, so later
+	// requests, which confirm the bytes held once they have been quiet
+	// from that answer on (#377), still go.
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		if first {
+			time.Sleep(300 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	info, st, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("SettledUploadInfo = %v after one answer slower than its time, want it settled", err)
+	}
+	if held, _ := info.Held(); held != 20 {
+		t.Fatalf("held %d, want 20", held)
+	}
+	if st.Retries < 1 {
+		t.Fatalf("asked again %d times: the slow answer settled on its own", st.Retries)
+	}
+}
+
+func TestUploadInfoCountsItsQuietTimeFromTheAnswer(t *testing.T) {
+	// #377: the server reads what it holds somewhere between a request and
+	// its answer, so what it is known to have held for a while is the time
+	// from the answer that first named the bytes held to a later request.
+	// The first answer here takes 300 ms; counted from its request, that
+	// wait alone would pass for the 50 ms quiet time, and the next request,
+	// 5 ms after the answer, would settle.
+	var mu sync.Mutex
+	var firstAnswer, last time.Time
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		first := firstAnswer.IsZero()
+		last = time.Now()
+		mu.Unlock()
+		if first {
+			time.Sleep(300 * time.Millisecond)
+			mu.Lock()
+			firstAnswer = time.Now()
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	const quiet = 50 * time.Millisecond
+	if _, _, err := c.SettledUploadInfo(ctx(t), "x", 10*time.Second, 5*time.Millisecond, quiet); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if d := last.Sub(firstAnswer); d < quiet {
+		t.Fatalf("settled on a request %v after the first answer, under the %v quiet time", d, quiet)
+	}
+}
+
+func TestUploadInfoSettlesBytesHeldFirstSeenJustBeforeTheDeadline(t *testing.T) {
+	// QA of #356: ft-server notices the break and holds 20 bytes from 80
+	// ms on, inside the last quiet time before the 100 ms deadline. Those
+	// bytes get the rest of their quiet time too, not only bytes first
+	// seen after the deadline. Any request sent after the deadline reaches
+	// the server after the switch, so a loaded host cannot turn this into
+	// a 404.
+	start := time.Now()
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if time.Since(start) < 80*time.Millisecond {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	info, _, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("SettledUploadInfo = %v for bytes held first seen just before the deadline, want them settled", err)
+	}
+	if held, _ := info.Held(); held != 20 {
+		t.Fatalf("held %d, want 20", held)
+	}
+}
+
+func TestUploadInfoSettlesThoughASlowFirstAnswerHeldNothing(t *testing.T) {
+	// The usual slow answer (QA of #356): the first request comes before
+	// the server has noticed the break and is answered 404 after the
+	// deadline; from then on the server holds 20 bytes. Those are first
+	// seen by a request sent past the deadline, and still settle.
+	var mu sync.Mutex
+	n := 0
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		if first {
+			time.Sleep(300 * time.Millisecond)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	info, st, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("SettledUploadInfo = %v after a slow 404, want 20 bytes held settled", err)
+	}
+	if held, _ := info.Held(); held != 20 || st.NotHeld != 1 {
+		t.Fatalf("held %d after %d 404s, want 20 after 1", held, st.NotHeld)
 	}
 }
 
@@ -493,11 +632,12 @@ func TestPrecheckNeedsAChallenge(t *testing.T) {
 
 func TestMalformedDocumentsAreErrors(t *testing.T) {
 	for name, body := range map[string]string{
-		"doctype":      `<!DOCTYPE x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
-		"not xml":      `{}`,
-		"too large":    strings.Repeat(" ", 70<<10),
-		"bad range":    `<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="5" end="9"/><data url="/ft/x"/></file-resume-info>`,
-		"wrong status": "",
+		"doctype":            `<!DOCTYPE x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
+		"lower-case doctype": `<!doctype x><file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"/>`,
+		"not xml":            `{}`,
+		"too large":          strings.Repeat(" ", 70<<10),
+		"bad range":          `<file-resume-info xmlns="urn:gsma:params:xml:ns:rcs:rcs:fthttp"><file-range start="5" end="9"/><data url="/ft/x"/></file-resume-info>`,
+		"wrong status":       "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -601,7 +741,13 @@ func TestUploadInfoMeasuresItsQuietTimeAndDeadlineOnItsClock(t *testing.T) {
 func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
 	// The deadline as well comes from the clock: the bytes held keep
 	// changing, the clock moves an hour per read and the settle time is
-	// 3 h, so the second answer finds the deadline passed (QA on #203).
+	// 3 h. The clock is read before and after each request. The call reads
+	// it at 1 h, so the deadline is 4 h; the requests go at 2, 4 and 6 h,
+	// answered at 3, 5 and 7 h. The third, sent past the deadline, gets the
+	// rest of its value's quiet time, from its answer to 7.5 h, so the
+	// fourth, at 8 h, ends the wait (QA on #203; the deadline bounds when a
+	// request is sent, #344; the rest of a quiet time, QA of #356; quiet
+	// from the answer, #377).
 	var mu sync.Mutex
 	n := 0
 	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -624,7 +770,7 @@ func TestUploadInfoEndsAtTheDeadlineOnItsClock(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if n != 2 {
-		t.Fatalf("%d answers before the deadline, want 2", n)
+	if n != 4 {
+		t.Fatalf("%d answers, want 4: the deadline was not taken from the clock", n)
 	}
 }

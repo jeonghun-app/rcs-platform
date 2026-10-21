@@ -33,6 +33,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // ContentType is the MIME type of a registration information document (RFC
@@ -227,15 +228,15 @@ type Param struct {
 
 // Parse reads a registration information document.
 func Parse(data []byte) (*Info, error) {
-	if err := checkDocument(data); err != nil {
+	if err := document.Check(data); err != nil {
 		return nil, err
 	}
 	if err := checkElements(data); err != nil {
 		return nil, err
 	}
 	var w wireInfo
-	if err := xml.NewDecoder(bytes.NewReader(withoutBOM(data))).Decode(&w); err != nil {
-		return nil, decodeError(err)
+	if err := xml.NewDecoder(bytes.NewReader(xmlsafe.WithoutBOM(data))).Decode(&w); err != nil {
+		return nil, document.DecodeError(err)
 	}
 	info, err := w.info()
 	if err != nil {
@@ -261,22 +262,22 @@ func (r *Info) Marshal() ([]byte, error) {
 	}
 	var b bytes.Buffer
 	b.WriteString(xml.Header)
-	w := &xmlWriter{e: xml.NewEncoder(&b)}
+	w := xmlsafe.NewWriter(&b)
 	// The namespace is declared once on the root; encoding/xml would repeat
 	// it on every element if the names carried it.
-	w.start("reginfo",
+	w.Start("reginfo",
 		xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: Namespace},
 		attr("version", strconv.FormatUint(uint64(r.Version), 10)),
 		attr("state", string(r.State)))
 	for _, reg := range r.Registrations {
-		w.start("registration", attr("aor", reg.AOR), attr("id", reg.ID), attr("state", string(reg.State)))
+		w.Start("registration", attr("aor", reg.AOR), attr("id", reg.ID), attr("state", string(reg.State)))
 		for _, c := range reg.Contacts {
 			writeContact(w, c)
 		}
-		w.end("registration")
+		w.End("registration")
 	}
-	w.end("reginfo")
-	if err := w.close(); err != nil {
+	w.End("reginfo")
+	if err := w.Close(); err != nil {
 		return nil, err
 	}
 	// The counts allow more than MaxDocumentSize, which Parse refuses.
@@ -286,7 +287,7 @@ func (r *Info) Marshal() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func writeContact(w *xmlWriter, c Contact) {
+func writeContact(w *xmlsafe.Writer, c Contact) {
 	attrs := []xml.Attr{attr("id", c.ID), attr("state", string(c.State)), attr("event", string(c.Event))}
 	for _, n := range []struct {
 		name string
@@ -302,23 +303,23 @@ func writeContact(w *xmlWriter, c Contact) {
 	if c.CallID != "" {
 		attrs = append(attrs, attr("callid", c.CallID))
 	}
-	w.start("contact", attrs...)
-	w.text("uri", c.URI)
+	w.Start("contact", attrs...)
+	w.Text("uri", c.URI)
 	if c.DisplayName != "" || c.Language != "" {
 		var lang []xml.Attr
 		if c.Language != "" {
 			lang = []xml.Attr{{Name: xml.Name{Local: "xml:lang"}, Value: c.Language}}
 		}
-		w.start("display-name", lang...)
-		w.chars(c.DisplayName)
-		w.end("display-name")
+		w.Start("display-name", lang...)
+		w.Chars(c.DisplayName)
+		w.End("display-name")
 	}
 	for _, p := range c.Params {
-		w.start("unknown-param", attr("name", p.Name))
-		w.chars(p.Value)
-		w.end("unknown-param")
+		w.Start("unknown-param", attr("name", p.Name))
+		w.Chars(p.Value)
+		w.End("unknown-param")
 	}
-	w.end("contact")
+	w.End("contact")
 }
 
 func attr(name, value string) xml.Attr {
@@ -397,7 +398,7 @@ func (reg Registration) validate() error {
 	if !validURI(reg.AOR) {
 		return fmt.Errorf("%w: aor is not a SIP or tel URI", ErrMalformed)
 	}
-	if !isXMLText(reg.ID) {
+	if !xmlsafe.IsText(reg.ID) {
 		return fmt.Errorf("%w: invalid registration id", ErrMalformed)
 	}
 	switch reg.State {
@@ -425,7 +426,7 @@ func (reg Registration) validate() error {
 }
 
 func (c Contact) validate() error {
-	if !isXMLText(c.ID) {
+	if !xmlsafe.IsText(c.ID) {
 		return fmt.Errorf("%w: invalid contact id", ErrMalformed)
 	}
 	if c.State != ContactActive && c.State != ContactTerminated {
@@ -444,12 +445,12 @@ func (c Contact) validate() error {
 		return fmt.Errorf("%w: contact uri is not a SIP or tel URI", ErrMalformed)
 	}
 	for _, s := range []string{c.DisplayName, c.Language, c.Q, c.CallID} {
-		if !isXMLText(s) {
+		if !xmlsafe.IsText(s) {
 			return fmt.Errorf("%w: invalid contact text", ErrMalformed)
 		}
 	}
 	for _, p := range c.Params {
-		if p.Name == "" || !isXMLText(p.Name) || !isXMLText(p.Value) {
+		if p.Name == "" || !xmlsafe.IsText(p.Name) || !xmlsafe.IsText(p.Value) {
 			return fmt.Errorf("%w: invalid unknown-param", ErrMalformed)
 		}
 	}
@@ -641,5 +642,5 @@ func equalURI(s string, u sip.URI) bool {
 // subscriber compares with the identities and contacts it knows.
 func validURI(s string) bool {
 	u, err := sip.ParseURI(s)
-	return err == nil && (u.IsSIP() || u.Scheme == "tel") && isXMLText(s)
+	return err == nil && (u.IsSIP() || u.Scheme == "tel") && xmlsafe.IsText(s)
 }

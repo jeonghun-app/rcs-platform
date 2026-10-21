@@ -404,6 +404,16 @@ func sessionBound(m store.Message) bool {
 // into a group they are not in.
 func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool) outcome {
 	key := legKey{m.Recipient, m.Sender}
+	if e.chatLeg(m.Recipient, m.Sender) == nil && e.marked(e.unreachable, key) {
+		// The group's invitation will never reach the recipient: an
+		// address that does not exist, or one that comes back to rcs-as
+		// (security review on #279). Its copies are given up, rather
+		// than kept, and retried, for StoreTTL.
+		if c, ok := e.claim(ctx, m); ok {
+			e.giveUp(c, "delivery.undeliverable")
+		}
+		return done
+	}
 	asked := false
 	if e.hasDeparted(key) {
 		if o, member := e.stillMember(ctx, m); !member {
@@ -596,8 +606,11 @@ func invitation(m store.Message) (Invitation, inviteKey) {
 		Recipient: m.Recipient, Peer: m.Sender, Mode: m.Mode,
 		Conversation: Conversation{ID: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo},
 	}
-	if m.Mode == store.Standalone {
+	switch m.Mode {
+	case store.Standalone:
 		inv.QueueID = m.ID
+	case store.Group:
+		inv.Referrer = m.Author
 	}
 	return inv, inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 }
@@ -617,6 +630,26 @@ func (e *Engine) inviteDue(m store.Message) bool {
 // session for this message alone for a standalone one.
 func (e *Engine) invite(ctx context.Context, m store.Message) {
 	inv, key := invitation(m)
+	e.ask(ctx, inv, key)
+}
+
+// Invite asks the Deliverer for inv's session as the engine asks for the
+// sessions of what it queues, unless one was asked for within
+// InviteTimeout or the recipient takes no sessions from the network: the
+// SIP layer's way to invite a group's new participants, for whom nothing
+// is queued yet. A message queued for one meanwhile then waits for that
+// session rather than ringing its client a second time.
+func (e *Engine) Invite(ctx context.Context, inv Invitation) {
+	e.mu.Lock()
+	_, pagerOnly := e.pagerOnly[inv.Recipient]
+	e.mu.Unlock()
+	if pagerOnly {
+		return
+	}
+	e.ask(ctx, inv, inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID})
+}
+
+func (e *Engine) ask(ctx context.Context, inv Invitation, key inviteKey) {
 	now := e.clock.Now()
 	e.mu.Lock()
 	if mark, ok := e.invites[key]; ok && now.Before(mark.until) {
@@ -652,6 +685,7 @@ func (e *Engine) invite(ctx context.Context, m store.Message) {
 		return
 	}
 	e.invites[key] = inviteMark{until: now.Add(e.cfg.InviteTimeout)}
+	inv.flow = e.flows[inv.Recipient]
 	e.mu.Unlock()
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	err := e.deliverer.Invite(ctx, inv)

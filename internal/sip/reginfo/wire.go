@@ -7,6 +7,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // The wire types decode with namespace-qualified names, so an extension
@@ -208,27 +210,23 @@ var parents = map[string]string{
 // element of the reginfo namespace where the schema has none, such as a
 // contact straight under reginfo, or one it does not define, which
 // encoding/xml would drop (§5.1 lets only other namespaces extend a
-// document), and an XML declaration anywhere but at the start (XML 1.0
-// §2.8). Elements inside an extension element are the extension's.
+// document). A late XML declaration is document.Check's (internal/xmlsafe).
+// Elements inside an extension element are the extension's.
 func checkElements(data []byte) error {
-	d := xml.NewDecoder(bytes.NewReader(withoutBOM(data)))
+	d := xml.NewDecoder(bytes.NewReader(xmlsafe.WithoutBOM(data)))
 	// stack holds, for each open element, whether it is an extension's:
 	// outside the namespace, or anywhere inside such an element.
 	var stack []bool
 	var names []string
-	for first := true; ; first = false {
+	for {
 		tok, err := d.Token()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
-			return decodeError(err)
+			return document.DecodeError(err)
 		}
 		switch t := tok.(type) {
-		case xml.ProcInst:
-			if strings.EqualFold(t.Target, "xml") && !first {
-				return fmt.Errorf("%w: XML declaration after the start", ErrMalformed)
-			}
 		case xml.StartElement:
 			inExtension := len(stack) > 0 && stack[len(stack)-1]
 			extension := inExtension || t.Name.Space != Namespace

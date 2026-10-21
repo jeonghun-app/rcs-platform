@@ -1,6 +1,10 @@
 package ifc
 
-import "math"
+import (
+	"math"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
+)
 
 // validate checks what the schema requires of a subscription built in code,
 // and that every value can be written as XML. ParseSubscription runs it too,
@@ -30,13 +34,13 @@ func (r *reader) identity(where, name, v string) {
 }
 
 func (r *reader) optionalIdentity(where, name, v string) {
-	if v != collapse(v) || !isXMLText(v) {
+	if v != xmlsafe.Collapse(v) || !xmlsafe.IsText(v) {
 		r.fail(where, "%s has white space around it or characters XML cannot carry", name)
 	}
 }
 
 func (r *reader) text(where, name, v string) {
-	if !isXMLText(v) {
+	if !xmlsafe.IsText(v) {
 		r.fail(where, "%s has characters XML cannot carry", name)
 	}
 }

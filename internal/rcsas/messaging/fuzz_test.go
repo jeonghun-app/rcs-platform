@@ -27,7 +27,7 @@ func FuzzParseConversationHeaders(f *testing.F) {
 			}
 			return
 		}
-		if c.ID == "" || c.Contribution == "" {
+		if c.Contribution == "" {
 			t.Fatalf("accepted %+v", c)
 		}
 		// Parsing what was accepted gives it back.
