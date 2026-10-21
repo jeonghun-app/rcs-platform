@@ -56,11 +56,11 @@ type countingGroups struct {
 
 var errFakeStore = errors.New("fake: the store failed")
 
-func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, token string) error {
+func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, owner groupstore.Owner, token string) error {
 	if c.failUpdates.Add(-1) >= 0 {
 		return errFakeStore
 	}
-	return c.Store.Update(ctx, g, token)
+	return c.Store.Update(ctx, g, owner, token)
 }
 
 func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {

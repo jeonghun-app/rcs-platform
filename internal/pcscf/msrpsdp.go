@@ -240,10 +240,12 @@ func partHeader(body []byte, start, end int) (partHeaders, error) {
 			if h.lenStart >= 0 {
 				return h, errBodyUnreadable
 			}
+			// The value without the blanks around it; one of blanks only
+			// is empty, and so not the content's length.
 			v := line[colon+1:]
-			lead := len(v) - len(bytes.TrimLeft(v, " \t"))
-			h.lenStart = lineStart + colon + 1 + lead
-			h.lenEnd = lineStart + len(line) - (len(v) - len(bytes.TrimRight(v, " \t")))
+			trimmed := bytes.TrimLeft(v, " \t")
+			h.lenStart = lineStart + colon + 1 + len(v) - len(trimmed)
+			h.lenEnd = h.lenStart + len(bytes.TrimRight(trimmed, " \t"))
 		}
 	}
 	return h, nil
