@@ -471,9 +471,10 @@ offer; an ACK with an MSRP description is not passed on.
 - **The offer.** Each MSRP line of the client's INVITE gets a binding
   (`POST /v1/bindings` with the client's path, for 1800 s), and goes to
   the core with the relay's core-side path, `a=setup:active` and port 9.
-  The INVITE asks for no reliable provisional response: `100rel` is taken
-  out of its `Supported` and `Require`, since an offer in one would be
-  answered in a PRACK `pcscf` does not anchor. Nor does it keep a
+  The INVITE offers no reliable provisional response: `100rel` is taken
+  out of its `Supported`, since an offer in one would be answered in a
+  PRACK `pcscf` does not anchor, and one whose `Require` has it is
+  answered 420 with `Unsupported: 100rel` (RFC 3261 §8.2.2.3). Nor does it keep a
   `Record-Route` the client wrote: only `pcscf`'s values go on.
 - **The answer.** The first 1xx or 2xx with a description (#136 decision
   3) completes each binding with `rcs-as`'s path (`PATCH`) and reaches

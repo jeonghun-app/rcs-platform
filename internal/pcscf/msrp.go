@@ -272,9 +272,10 @@ func (p *pcscf) hiddenHost() string {
 //     port 9.
 //
 // An INVITE without an offer is watched for an MSRP offer in its 1xx and
-// 2xx, which is not supported (#136 decision 2). Neither asks for reliable
-// provisional responses: one could carry an offer, answered in a PRACK,
-// that pcscf does not anchor (RFC 3262 §5).
+// 2xx, which is not supported (#136 decision 2). Neither offers reliable
+// provisional responses, and one that requires them is 420: one could
+// carry an offer, answered in a PRACK, that pcscf does not anchor (RFC
+// 3262 §5).
 func (p *pcscf) anchorOriginating(r *proxy.Request, d proxy.Decision) proxy.Decision {
 	if r.Message.Method != "INVITE" || p.msrp == nil {
 		return d
@@ -283,15 +284,18 @@ func (p *pcscf) anchorOriginating(r *proxy.Request, d proxy.Decision) proxy.Deci
 	if err != nil {
 		return p.refuseOffer()
 	}
-	if !found {
-		return p.watchLateOffer(r, d)
-	}
 	_, lines, err := msrpLines(part.description(), true)
-	if err != nil {
+	if found && err != nil {
 		return p.refuseOffer()
 	}
-	if len(lines) == 0 {
+	if found && len(lines) == 0 {
 		return d
+	}
+	if requires100rel(&r.Message.Header) {
+		return p.refuse100rel(r)
+	}
+	if !found {
+		return p.watchLateOffer(r, d)
 	}
 	if len(lines) > min(maxMSRPLines, p.msrp.limit.most()) {
 		return p.refuseOffer()
@@ -353,11 +357,32 @@ func (p *pcscf) anchorOriginating(r *proxy.Request, d proxy.Decision) proxy.Deci
 	return d
 }
 
-// without100rel takes the 100rel option out of a request's Supported and
-// Require, so that the core sends no reliable provisional response (RFC
-// 3262 §3), which could carry an offer pcscf does not anchor.
+// requires100rel reports whether a request's Require has the 100rel
+// option.
+func requires100rel(h *sip.Header) bool {
+	options, err := h.Require()
+	return err != nil || slices.ContainsFunc(options, func(o string) bool { return strings.EqualFold(o, "100rel") })
+}
+
+// refuse100rel answers an INVITE pcscf anchors that requires reliable
+// provisional responses with 420 and Unsupported: 100rel (RFC 3261
+// §8.2.2.3): one could carry an offer, answered in a PRACK, that pcscf does
+// not anchor until #136's second change; the client may try again without
+// (RFC 3262 §4). A Require pcscf cannot read is refused the same.
+func (p *pcscf) refuse100rel(r *proxy.Request) proxy.Decision {
+	res, err := sip.NewResponse(r.Message, 420, "", p.mustTag())
+	if err != nil || res.Header.Set("Unsupported", "100rel") != nil {
+		return proxy.Decision{Status: 420}
+	}
+	return proxy.Decision{Response: res}
+}
+
+// without100rel takes the 100rel option out of a request's Supported, so
+// that the core sends no reliable provisional response (RFC 3262 §3),
+// which could carry an offer pcscf does not anchor; a Require of it is
+// refused before (refuse100rel).
 func without100rel(h *sip.Header) error {
-	for _, name := range []string{"Supported", "Require"} {
+	for _, name := range []string{"Supported"} {
 		if !h.Has(name) {
 			continue
 		}

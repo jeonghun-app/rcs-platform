@@ -90,13 +90,15 @@ func TestAnOfferTheRelayCouldNotServeIsRefused(t *testing.T) {
 	}
 }
 
-// An INVITE pcscf anchors, or watches for a late offer, asks for no
+// An INVITE pcscf anchors, or watches for a late offer, offers no
 // reliable provisional response, whose offer would be answered in a PRACK
-// pcscf does not anchor (RFC 3262).
+// pcscf does not anchor (RFC 3262): 100rel goes from its Supported, and
+// one that requires it is 420 with Unsupported: 100rel (RFC 3261
+// §8.2.2.3), never sent on without the requirement (#248 code review).
 func TestAnchoredInvitesAskForNoReliableResponses(t *testing.T) {
 	for _, tt := range []struct{ ct, body string }{{"application/sdp", clientChatOffer}, {"", ""}} {
 		a := newAnchoring(t, 16, 100)
-		r := clientRequest(t, inviteWith("chat-1", tt.ct, tt.body, "Supported: 100rel, timer", "Require: 100rel", "Require: precondition"), "FLOW-A")
+		r := clientRequest(t, inviteWith("chat-1", tt.ct, tt.body, "Supported: 100rel, timer", "Require: precondition"), "FLOW-A")
 		d := a.p.Route(context.Background(), r)
 		req := r.Message.Clone()
 		if err := d.Prepare(context.Background(), d.Targets[0], req); err != nil {
@@ -108,6 +110,18 @@ func TestAnchoredInvitesAskForNoReliableResponses(t *testing.T) {
 		if got := req.Header.Values("Require"); !slices.Equal(got, []string{"precondition"}) {
 			t.Errorf("Require %q", got)
 		}
+		calls := len(a.relay.log())
+		r = clientRequest(t, inviteWith("chat-2", tt.ct, tt.body, "Supported: timer", "Require: precondition, 100REL"), "FLOW-A")
+		d = a.p.Route(context.Background(), r)
+		if d.Response == nil || d.Response.StatusCode != 420 || d.Response.Header.Get("Unsupported") != "100rel" || len(a.relay.log()) != calls {
+			t.Errorf("Require: 100rel: %+v, calls %q", d, a.relay.log())
+		}
+	}
+	// An offer without MSRP is pcscf's to leave alone.
+	a := newAnchoring(t, 16, 100)
+	audio := strings.Split(clientChatOffer, "m=message")[0]
+	if d := a.p.Route(context.Background(), clientRequest(t, inviteWith("call-1", "application/sdp", audio, "Require: 100rel"), "FLOW-A")); len(d.Targets) != 1 {
+		t.Errorf("an audio INVITE requiring 100rel: %+v", d)
 	}
 }
 
