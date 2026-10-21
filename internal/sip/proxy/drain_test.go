@@ -290,3 +290,42 @@ func TestDrainCountsOnlyTheAnswersSent(t *testing.T) {
 		t.Fatalf("stats = %+v", s)
 	}
 }
+
+// A handler that has sent its final response and still waits on its
+// context, as rcs-as does for the ACK of its 2xx, is not in progress: Drain
+// returns at once and leaves its context alone.
+func TestDrainLeavesAHandlerThatAnsweredAlone(t *testing.T) {
+	h := newHarness(t, Config{})
+	answered := make(chan context.Context, 1)
+	release := make(chan struct{})
+	h.decide(Decision{Serve: func(ctx context.Context, u *UAS) {
+		res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1")
+		if err == nil {
+			err = u.Respond(res)
+		}
+		if err != nil {
+			t.Error(err)
+		}
+		answered <- ctx
+		select {
+		case <-ctx.Done():
+		case <-release:
+		}
+	}})
+	h.p.Receive(inboundFrom(request(t, "MESSAGE", "sip:bob@example.com"), "up"))
+	ctx := <-answered
+	select {
+	case n := <-drainFor(h, time.Hour):
+		if n != 0 {
+			t.Fatalf("Drain answered %d", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain waited for a handler that had answered")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Drain cancelled the context of a handler that had answered")
+	}
+	close(release)
+	h.settle()
+	check(t, "upstream", h.upstream(), codes(200))
+}

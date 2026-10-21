@@ -304,6 +304,16 @@ func (c *respContext) answer(res *sip.Response) {
 	runAll(acts)
 }
 
+// inProgress reports whether the request still waits for its final
+// response: none was sent, and a Serve handler has not sent one either (a
+// handler that answered may still wait on its context, for an ACK).
+func (c *respContext) inProgress() bool {
+	c.mu.Lock()
+	open, uas := !c.finalSent && !c.done, c.uas
+	c.mu.Unlock()
+	return open && (uas == nil || !uas.hasAnswered())
+}
+
 // answerForStop answers a request still without a final response 500 with
 // Retry-After, and closes its branches: INVITE branches are cancelled
 // (§16.10 does the same for a CANCEL from upstream), and the others end on
@@ -313,22 +323,24 @@ func (c *respContext) answer(res *sip.Response) {
 // It returns a channel closed once the 500 has been handed to the
 // transport, or nil when the request needed no answer.
 func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
-	c.mu.Lock()
-	if c.finalSent || c.done {
-		c.mu.Unlock()
+	if !c.inProgress() {
 		return nil
 	}
-	if c.uas != nil {
+	c.mu.Lock()
+	uas, cancelled := c.uas, c.cancelled
+	c.mu.Unlock()
+	if uas != nil {
 		// The service answers for itself. It learns of the stop through its
 		// context, and serve answers for it if it returns without a final
 		// response.
-		c.mu.Unlock()
 		c.cancelReq()
 		return nil
 	}
+	// The response, and the service's DrainAnswer, are made without the
+	// lock, as every hook runs.
 	var res *sip.Response
 	var err error
-	if c.cancelled {
+	if cancelled {
 		// §9.2: what a CANCEL from upstream asked for, as best and serve
 		// answer.
 		res, err = c.p.response(c.tx.Request(), 487)
@@ -336,6 +348,11 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 		res, err = c.p.drainResponse(c.tx.Request())
 	}
 	if err != nil {
+		return nil
+	}
+	c.mu.Lock()
+	if c.finalSent || c.done {
+		// Answered meanwhile.
 		c.mu.Unlock()
 		return nil
 	}

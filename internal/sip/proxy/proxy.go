@@ -345,11 +345,9 @@ func (p *Proxy) Drain(ctx context.Context) int {
 func (p *Proxy) inProgress() int {
 	n := 0
 	for _, c := range p.openContexts() {
-		c.mu.Lock()
-		if !c.finalSent {
+		if c.inProgress() {
 			n++
 		}
-		c.mu.Unlock()
 	}
 	return n
 }
