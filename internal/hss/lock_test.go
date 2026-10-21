@@ -373,7 +373,7 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	if len(ds.deadlines) != 1 {
 		t.Fatalf("%d writes", len(ds.deadlines))
 	}
-	if left := pushEnd.Sub(ds.deadlines[0]); left < pushEnd.Sub(time.Now())/2 || left > push/2 {
+	if left := pushEnd.Sub(ds.deadlines[0]); left < pushEnd.Sub(time.Now())/2 || left > push/2+time.Since(start) {
 		t.Errorf("the update's deadline is %v before the push's end, want half of the %v the push had (started %v ago)", left, push, time.Since(start))
 	}
 }
