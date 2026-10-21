@@ -63,21 +63,25 @@ func TestTheTelFormOfAnIdentityReachesItsUser(t *testing.T) {
 	}
 }
 
-// TestWhoCannotBeReachedIsAnswered: 404 for what is no public identity and
-// for a barred one (§5.4.3.3), 480 for a user without a live binding.
+// TestWhoCannotBeReachedIsAnswered: 404 for what is no public identity, for
+// a barred one and for one the HSS does not know (§5.4.3.3), 480 for a user
+// whose record has no live binding; the HSS is asked only of a user with no
+// record listing the identity (registrar.Unregistered).
 func TestWhoCannotBeReachedIsAnswered(t *testing.T) {
 	for name, c := range map[string]struct {
 		setUp  func(e *env)
 		target string
 		status int
+		asked  int
 	}{
-		"no public identity":  {func(e *env) { e.registered(binding(1, 0, time.Hour)) }, "sip:" + realm, 404},
-		"barred":              {func(e *env) { e.registered(binding(1, 0, time.Hour)) }, impu2, 404},
-		"unknown":             {func(*env) {}, "sip:+15550100004@" + realm, 480},
-		"every binding gone":  {func(e *env) { e.registered(binding(1, 0, -time.Second)) }, impu1, 480},
-		"being deregistered":  {func(e *env) { e.deregistering() }, impu1, 480},
-		"left the set":        {func(e *env) { e.withoutTel() }, tel1, 480},
-		"record gone already": {func(e *env) { e.recordGone() }, impu1, 480},
+		"no public identity":  {func(e *env) { e.registered(binding(1, 0, time.Hour)) }, "sip:" + realm, 404, 0},
+		"barred":              {func(e *env) { e.registered(binding(1, 0, time.Hour)) }, impu2, 404, 0},
+		"barred, no binding":  {func(e *env) { e.registered(binding(1, 0, -time.Second)) }, impu2, 404, 0},
+		"unknown to the HSS":  {func(*env) {}, "sip:+15550100004@" + realm, 404, 1},
+		"every binding gone":  {func(e *env) { e.registered(binding(1, 0, -time.Second)) }, impu1, 480, 0},
+		"being deregistered":  {func(e *env) { e.deregistering() }, impu1, 480, 0},
+		"left the set":        {func(e *env) { e.withoutTel() }, tel1, 404, 1},
+		"record gone already": {func(e *env) { e.recordGone() }, impu1, 404, 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
@@ -85,6 +89,9 @@ func TestWhoCannotBeReachedIsAnswered(t *testing.T) {
 			d := e.router(nil).Terminating(bg, request(t, "INVITE", c.target))
 			if d.Status != c.status || len(d.Targets) != 0 {
 				t.Errorf("status %d with %d targets, want %d", d.Status, len(d.Targets), c.status)
+			}
+			if got := e.hss.calls(); got != c.asked {
+				t.Errorf("the HSS was asked %d times, want %d", got, c.asked)
 			}
 		})
 	}

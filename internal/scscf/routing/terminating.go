@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -22,62 +24,106 @@ const storeRetryAfter = "5"
 const saveAttempts = 3
 
 // Terminating routes a request outside a dialog to the user its
-// Request-URI names (TS 24.229 §5.4.3.3): to the live bindings of the
-// user's implicit registration set that the caller's preferences accept,
-// each along its Path, the S-CSCF recording the route; of the flows of one
-// instance only the latest at a time (RFC 5626 §7), the next if that one's
-// edge proxy answers 430. It is 404 for a
-// Request-URI that is no public identity or is a barred one, 480 for a user
-// without a live binding the preferences accept, and 500 with Retry-After
-// for a store that cannot be read.
+// Request-URI names (TS 24.229 §5.4.3.3): along the user's terminating iFC
+// chain, then to the live bindings of the user's implicit registration set
+// that the caller's preferences accept, each along its Path, the S-CSCF
+// recording the route; of the flows of one instance only the latest at a
+// time (RFC 5626 §7), the next if that one's edge proxy answers 430. A user
+// with no record here is looked up in the HSS (Config.Registrar) and served
+// as unregistered, by the iFC of that state. It is 404 for a
+// Request-URI that is no public identity, a barred one or one the HSS does
+// not know, 480 for a user without a live binding the preferences accept,
+// and 500 with Retry-After for a store or HSS that cannot be asked.
 func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decision {
+	return rt.decide(rt.terminating(ctx, r), true)
+}
+
+func (rt *Router) terminating(ctx context.Context, r *proxy.Request) step {
 	impu, ok := identity.CanonicalIMPU(r.Message.URI.String())
 	if !ok {
 		rt.count("routing.terminating.not_found")
-		return proxy.Decision{Status: 404, Reason: "Not Found"}
+		return answer(404, "Not Found")
 	}
 	now := rt.cfg.Now()
-	set, err := rt.lookup(ctx, impu, now)
+	set, err := rt.served(ctx, impu, now)
 	switch {
 	case errors.Is(err, errBarred):
 		rt.count("routing.terminating.barred")
-		return proxy.Decision{Status: 404, Reason: "Not Found"}
+		return answer(404, "Not Found")
+	case errors.Is(err, registrar.ErrUnknownUser):
+		rt.count("routing.terminating.not_found")
+		return answer(404, "Not Found")
+	case errors.Is(err, errEnding):
+		rt.count("routing.terminating.not_registered")
+		return answer(480, "Temporarily Unavailable")
+	case errors.Is(err, registrar.ErrServedElsewhere):
+		rt.count("routing.terminating.served_elsewhere")
+		return answer(480, "Temporarily Unavailable")
 	case err != nil:
 		rt.internalLog("looking up the served user", err)
 		return rt.unavailable(r.Message)
-	case set == nil:
-		rt.count("routing.terminating.not_registered")
-		return proxy.Decision{Status: 480, Reason: "Temporarily Unavailable"}
 	}
-	d := &delivery{rt: rt, key: set.Key, candidates: accepted(live(set, now), r.Message)}
-	targets := d.targets(onePerInstance(d.candidates))
-	if len(targets) == 0 {
-		rt.count("routing.terminating.no_contact")
-		return proxy.Decision{Status: 480, Reason: "Temporarily Unavailable"}
+	pos := position{served: impu, scase: ifc.TerminatingRegistered, registered: true, priority: -1}
+	if len(live(set, now)) == 0 {
+		pos.scase, pos.registered = ifc.TerminatingUnregistered, false
 	}
-	rt.count("routing.terminating")
-	called := sip.Address{URI: r.Message.URI}.String()
-	return proxy.Decision{
-		Targets:     targets,
-		RecordRoute: []sip.Address{rt.cfg.RecordRoute},
-		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
-			// The Request-URI the request came with, which the contact's
-			// Request-URI replaces (§5.4.3.3).
-			return req.Header.Set("P-Called-Party-ID", called)
-		},
-		OnBranchFailure: d.failed,
-	}
+	// A request from an application server that sent it for its user names
+	// the user in P-Served-User (#137); one from a P-CSCF never does, and
+	// pcscf removes any a client wrote (ADR 0007 §7).
+	pos.kept = r.Message.Header.Has("P-Served-User") && !rt.fromEdgeProxy(r.Source)
+	return rt.next(ctx, r.Message, pos, set, rt.toContacts(r.Message, set))
 }
 
-// errBarred is the lookup of a barred identity.
-var errBarred = errors.New("routing: the identity is barred")
+// errBarred is the lookup of a barred identity, errEnding that of one whose
+// set has a record here that is neither registered nor unregistered: its
+// bindings expired, or it is being deregistered, and a sweep ends it.
+var (
+	errBarred = errors.New("routing: the identity is barred")
+	errEnding = errors.New("routing: the identity's set is being deregistered")
+)
 
-// lookup is the record of impu's set if the user is registered: the record
-// impu's item names lists impu and has a live binding, which a record that
-// a deregistration holds (Deregistering) never has. An item naming another incarnation of the record, which an
-// interrupted REGISTER can leave (#196), still finds it, and is repaired in
-// the background. It is nil without such a record, and errBarred for a
-// barred identity.
+// served is the record of impu's set for a terminating request: as lookup
+// finds it, or, without one, the record of the unregistered user the HSS
+// makes of impu (registrar.Registrar.Unregistered).
+func (rt *Router) served(ctx context.Context, impu string, now time.Time) (*state.Registration, error) {
+	set, err := rt.lookup(ctx, impu, now)
+	if err != nil || set != nil {
+		return set, err
+	}
+	set, err = rt.cfg.Registrar.Unregistered(ctx, impu)
+	if err != nil {
+		return nil, err
+	}
+	rt.count("routing.terminating.unregistered_user")
+	// The registrar returns a record of the set it finds saved already, by
+	// a REGISTER say, which may no longer list impu.
+	switch id, ok := inSet(set, impu); {
+	case !ok:
+		return nil, errEnding
+	case id.Barred:
+		return nil, errBarred
+	}
+	return set, nil
+}
+
+// inSet is impu's entry in set's identities.
+func inSet(set *state.Registration, impu string) (state.SetIdentity, bool) {
+	i := slices.IndexFunc(set.Identities, func(s state.SetIdentity) bool { return s.IMPU == impu })
+	if i < 0 {
+		return state.SetIdentity{}, false
+	}
+	return set.Identities[i], true
+}
+
+// lookup is the record of impu's set if the user is served here: the
+// record impu's item names lists impu and has a live binding, or is the
+// record of an unregistered user (state.Registration.Unregistered) that
+// has not ended. An item naming another incarnation of the record, which
+// an interrupted REGISTER can leave (#196), still finds it, and is
+// repaired in the background. It is nil without a record listing impu,
+// errBarred for a barred identity, and errEnding for a record that is
+// neither, as one a deregistration holds (Deregistering) or one whose
+// bindings expired.
 func (rt *Router) lookup(ctx context.Context, impu string, now time.Time) (*state.Registration, error) {
 	id, err := rt.cfg.Store.Identity(ctx, impu, now)
 	switch {
@@ -93,12 +139,16 @@ func (rt *Router) lookup(ctx context.Context, impu string, now time.Time) (*stat
 	case err != nil:
 		return nil, err
 	}
-	i := slices.IndexFunc(set.Identities, func(s state.SetIdentity) bool { return s.IMPU == impu })
-	if i < 0 || len(live(set, now)) == 0 {
+	sid, ok := inSet(set, impu)
+	switch {
+	case !ok:
 		return nil, nil
-	}
-	if set.Identities[i].Barred {
+	case sid.Barred:
 		return nil, errBarred
+	case len(live(set, now)) > 0:
+	case set.Deregistering.IsZero() && set.Unregistered.After(now):
+	default:
+		return nil, errEnding
 	}
 	if id.Incarnation != set.Incarnation {
 		rt.repair(ctx, id, set)
@@ -136,12 +186,37 @@ func live(set *state.Registration, now time.Time) []state.Contact {
 	return out
 }
 
+// toContacts is the end of a terminating request's iFC chain: the live
+// bindings of set the caller's preferences accept, with the Request-URI the
+// request came with in P-Called-Party-ID, which the contact's replaces
+// (§5.4.3.3); 480 without one.
+func (rt *Router) toContacts(req *sip.Request, set *state.Registration) func(context.Context) step {
+	return func(context.Context) step {
+		bindings := live(set, rt.cfg.Now())
+		if len(bindings) == 0 {
+			rt.count("routing.terminating.not_registered")
+			return answer(480, "Temporarily Unavailable")
+		}
+		called := sip.Address{URI: req.URI}.String()
+		d := &delivery{rt: rt, key: set.Key, candidates: accepted(bindings, req), called: called}
+		hops := d.hops(d.targets(onePerInstance(d.candidates)))
+		if len(hops) == 0 {
+			rt.count("routing.terminating.no_contact")
+			return answer(480, "Temporarily Unavailable")
+		}
+		rt.count("routing.terminating")
+		return step{hops: hops}
+	}
+}
+
 // delivery is one terminating request's forwarding: the set's bindings it
 // may use, and which of them it has tried.
 type delivery struct {
 	rt         *Router
 	key        state.SetKey
 	candidates []state.Contact
+	// called is the P-Called-Party-ID of every branch.
+	called string
 
 	mu    sync.Mutex
 	tried map[string]state.Contact
@@ -196,6 +271,21 @@ func (d *delivery) targets(cs []state.Contact) []proxy.Target {
 	return out
 }
 
+// hops are the hops to ts.
+func (d *delivery) hops(ts []proxy.Target) []hop {
+	out := make([]hop, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, hop{target: t, prepare: d.prepare, failed: d.failed})
+	}
+	return out
+}
+
+func (d *delivery) prepare(_ context.Context, req *sip.Request) error {
+	// The S-CSCF's own toward application servers; pcscf would remove it.
+	req.Header.Del("P-Served-User")
+	return req.Header.Set("P-Called-Party-ID", d.called)
+}
+
 func targetOf(c state.Contact) (proxy.Target, bool) {
 	u, err := sip.ParseURI(c.URI)
 	if err != nil {
@@ -226,20 +316,20 @@ func keyOf(t proxy.Target) string {
 // Failed went to a flow that is gone (RFC 5626 §5.3), so its binding is
 // ended, and the request is tried over the instance's latest flow not tried
 // yet (§7).
-func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Target {
+func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) step {
 	if f.Response == nil || f.Response.StatusCode != 430 {
-		return nil
+		return step{}
 	}
 	d.mu.Lock()
 	gone, ok := d.tried[keyOf(f.Target)]
 	d.mu.Unlock()
 	if !ok {
-		return nil
+		return step{}
 	}
 	d.rt.count("routing.terminating.flow_failed")
 	d.rt.endBinding(ctx, d.key, gone)
 	if gone.InstanceID == "" {
-		return nil
+		return step{}
 	}
 	d.mu.Lock()
 	var rest []state.Contact
@@ -250,7 +340,7 @@ func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Ta
 		}
 	}
 	d.mu.Unlock()
-	return d.targets(onePerInstance(rest))
+	return step{hops: d.hops(d.targets(onePerInstance(rest)))}
 }
 
 // endBinding ends the binding of c in the record of k, as if it had
@@ -293,19 +383,4 @@ func (rt *Router) endBinding(ctx context.Context, k state.SetKey, c state.Contac
 // over the same flow, registered by the same REGISTER sequence.
 func sameBinding(a, b state.Contact) bool {
 	return a.URI == b.URI && slices.Equal(a.Path, b.Path) && a.InstanceID == b.InstanceID && a.RegID == b.RegID
-}
-
-// unavailable answers req 500 with Retry-After: the store failed, and the
-// caller may try again soon (RFC 3261 §21.5.1).
-func (rt *Router) unavailable(req *sip.Request) proxy.Decision {
-	tag, err := rt.ids.Tag()
-	if err != nil {
-		return proxy.Decision{Status: 500}
-	}
-	res, err := sip.NewResponse(req, 500, "Server Internal Error", tag)
-	if err != nil {
-		return proxy.Decision{Status: 500}
-	}
-	_ = res.Header.Set("Retry-After", storeRetryAfter)
-	return proxy.Decision{Response: res}
 }

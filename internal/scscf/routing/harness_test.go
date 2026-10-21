@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -99,14 +101,43 @@ func (c *counts) get(name string) int64 {
 }
 
 type env struct {
-	t       *testing.T
+	t       testing.TB
 	store   *state.Memory
 	clock   *clock
 	metrics *counts
+	hss     *fakeRegistrar
 }
 
 func newEnv(t *testing.T) *env {
-	return &env{t: t, store: state.NewMemory(), clock: &clock{now: t0}, metrics: &counts{}}
+	return &env{t: t, store: state.NewMemory(), clock: &clock{now: t0}, metrics: &counts{}, hss: &fakeRegistrar{}}
+}
+
+// odiKey is the key every router of a test signs positions with.
+var odiKey = bytes.Repeat([]byte{0x6b}, MinODIKeyBytes)
+
+// fakeRegistrar stands in for the registrar's SAR UNREGISTERED_USER: the
+// HSS knows no one unless serve says otherwise.
+type fakeRegistrar struct {
+	mu    sync.Mutex
+	serve func(impu string) (*state.Registration, error)
+	asked []string
+}
+
+func (f *fakeRegistrar) Unregistered(_ context.Context, impu string) (*state.Registration, error) {
+	f.mu.Lock()
+	f.asked = append(f.asked, impu)
+	serve := f.serve
+	f.mu.Unlock()
+	if serve == nil {
+		return nil, registrar.ErrUnknownUser
+	}
+	return serve(impu)
+}
+
+func (f *fakeRegistrar) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.asked)
 }
 
 func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
@@ -116,8 +147,10 @@ func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
 	}
 	self, _ := sip.ParseURI("sip:scscf.rcs.local")
 	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;lr>")
+	icscf, _ := sip.ParseURI("sip:icscf.rcs.local;lr")
 	cfg := Config{
 		Store: st, RecordRoute: rr, Self: []sip.URI{self}, Now: e.clock.Now, Metrics: e.metrics,
+		Registrar: e.hss, ODIKey: odiKey, ICSCF: icscf, HomeDomain: realm,
 		ApplicationServers: []string{"rcs-as.rcs.local"},
 		EdgeProxyHosts:     []string{"pcscf.rcs.local"},
 		EdgeProxyNets:      []netip.Prefix{netip.MustParsePrefix("198.51.100.0/28")},

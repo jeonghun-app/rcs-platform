@@ -41,6 +41,10 @@ additionally sealed (below).
   later requests reuse. A sweep then claims the record like an expired
   registration and sends SAR TIMEOUT_DEREGISTRATION; a REGISTER before that
   turns it into a registration. PPR and RTR apply to it as to a registration.
+  An IMPU whose set has a record that is neither, its bindings expired or
+  being deregistered, is answered 480 without a SAR: the HSS makes a
+  registered user unregistered on SAR UNREGISTERED_USER, ahead of the sweep
+  that ends the record.
 - **One profile per implicit registration set.** The HSS sends User-Data per
   set: an SAA for the set of the IMPU in the request, a PPR for one set at a
   time. A set is therefore keyed by the IMPI and its default IMPU

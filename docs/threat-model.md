@@ -45,6 +45,12 @@ separate from its core listener; core SIP ports admit only platform services
 (ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
 default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
 messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
+`scscf` reads it only on a terminating request that did not come from a
+`pcscf` core listener, removes the one it inserted toward application servers
+before the request leaves for the terminating side or a contact, and carries
+a request's place in the iFC chain back from a server only in a Route
+parameter it signed (HMAC over the position, the Call-ID and an expiry, ADR
+0005), refusing any other with 403 (#14).
 **Status:** planned (#16, Phase 7 infrastructure).
 **Residual risk (accepted, #208, narrowed in #221):** `pcscf` checks
 in-dialog requests against its own Record-Route values only, keeping no
