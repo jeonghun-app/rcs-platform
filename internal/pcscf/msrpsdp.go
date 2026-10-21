@@ -340,13 +340,14 @@ func relayTakesPath(path []string) bool {
 
 // towardClient makes s, a description going to the client, show nothing of
 // the core: each line in anchored gets the relay's client path it maps to,
-// passive, as an answer (RFC 6135 §4.2.2), and every other line is declined
-// (port 0, RFC 3264 §6) without its c=, b= and a= lines, since only MSRP
-// goes through the relay and a declined line's address means nothing. The
-// o= and the session-level c= get host, the relay's host or pcscf's own,
-// in place of rcs-as's address (RFC 8866 §5.2 lets o= carry any host the
-// originator chooses; ADR 0004).
-func towardClient(s *sdp.Session, anchored map[int]string, host string) error {
+// passive in an answer (RFC 6135 §4.2.2) and actpass in an offer (ADR 0004,
+// second row), and every other line is declined (port 0, RFC 3264 §6)
+// without its c=, b= and a= lines, since only MSRP goes through the relay
+// and a declined line's address means nothing. The o= and the
+// session-level c= get host, the relay's host or pcscf's own, in place of
+// rcs-as's address (RFC 8866 §5.2 lets o= carry any host the originator
+// chooses; ADR 0004).
+func towardClient(s *sdp.Session, anchored map[int]string, host string, answer bool) error {
 	addrType := "IP4"
 	if a, err := netip.ParseAddr(host); err == nil && a.Is6() {
 		addrType = "IP6"
@@ -360,12 +361,35 @@ func towardClient(s *sdp.Session, anchored map[int]string, host string) error {
 		m.Connections, m.Bandwidths, m.Attributes, m.Key = nil, nil, nil, ""
 	}
 	s.Connection = &sdp.Connection{NetType: "IN", AddrType: addrType, Address: host}
+	setup := sdp.SetupActPass
+	if answer {
+		setup = sdp.SetupPassive
+	}
 	for i, path := range anchored {
-		if err := anchorLine(s, i, path, sdp.SetupPassive, true); err != nil {
+		if err := anchorLine(s, i, path, setup, answer); err != nil {
 			return err
 		}
 	}
 	s.Origin.AddrType, s.Origin.Address = addrType, host
+	return nil
+}
+
+// towardCore writes into s, a description going to rcs-as, the relay's
+// core-side path of each line in anchored, active: the relay connects to
+// rcs-as, offer or answer (ADR 0004), on port 9 (RFC 4145 §4). A declined
+// MSRP line keeps no path, so that rcs-as learns none of the client's
+// (#315 code review 5).
+func towardCore(s *sdp.Session, anchored map[int]string, answer bool) error {
+	for i := range s.Media {
+		if m := &s.Media[i]; m.IsMSRP() && m.Port == 0 {
+			m.Attributes.Remove("path")
+		}
+	}
+	for i, path := range anchored {
+		if err := anchorLine(s, i, path, sdp.SetupActive, answer); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -374,8 +398,29 @@ func towardClient(s *sdp.Session, anchored map[int]string, host string) error {
 // the relay does not serve, nor an address of the core.
 func declineAll(d []byte, host string) []byte {
 	s, err := sdp.Parser{MaxSize: maxSDP}.Parse(d)
-	if err != nil || towardClient(s, nil, host) != nil {
+	if err != nil || towardClient(s, nil, host, true) != nil {
 		return nil
+	}
+	out, err := s.Marshal()
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// declineMSRP returns d with its MSRP lines declined and their paths
+// removed, or nil if d cannot be read: what rcs-as gets of a description
+// pcscf cannot anchor, so that it learns no path of the client's.
+func declineMSRP(d []byte) []byte {
+	s, err := sdp.Parser{MaxSize: maxSDP}.Parse(d)
+	if err != nil {
+		return nil
+	}
+	for i := range s.Media {
+		if m := &s.Media[i]; m.IsMSRP() {
+			m.Port, m.PortCount = 0, 0
+			m.Attributes.Remove("path")
+		}
 	}
 	out, err := s.Marshal()
 	if err != nil {

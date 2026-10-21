@@ -26,8 +26,11 @@
 // asks for that identity. The S-CSCF becomes the topmost Route, with lr;
 // the Request-URI stays. A request with a Route left, or one inside a
 // dialog, is forwarded where it says without asking the HSS (§5.3.2.1,
-// RFC 3261 §16.12). A pres: or im: Request-URI is refused 416 by the proxy
-// before the Router sees it.
+// RFC 3261 §16.12), but only to a configured S-CSCF, matched by scheme,
+// host, port and transport, without a maddr: another next hop is refused
+// 403, and a request whose Route or Request-URI names this I-CSCF again
+// 482 (#337). A pres: or im: Request-URI is refused 416 by the proxy before
+// the Router sees it.
 //
 // # Answers
 //
@@ -111,8 +114,10 @@
 //	icscf.<kind>.forwarded      requests forwarded, kind register,
 //	                            terminating or routed (Route or dialog)
 //	icscf.<kind>.<code>         requests answered with code (403, 404,
-//	                            480, 600) by the I-CSCF, and 500 for an
-//	                            S-CSCF it could not reach
+//	                            480, 482, 600) by the I-CSCF, and 500 for
+//	                            an S-CSCF it could not reach; an ACK
+//	                            refused is counted, though it gets no
+//	                            answer
 //	icscf.<kind>.cancelled      requests cancelled while the HSS was asked
 //	icscf.hss.unavailable       HSS queries that could not be completed
 //	icscf.hss.bad_server_name   answers naming an S-CSCF that is not a SIP
