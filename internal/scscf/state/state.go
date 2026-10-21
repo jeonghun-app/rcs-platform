@@ -161,6 +161,18 @@ type Registration struct {
 	// backing off and giving up by MaxReassertAttempts at the latest.
 	Reassert         time.Time
 	ReassertAttempts int
+	// RegisteredAs are the public identities in the To of the REGISTERs
+	// that registered the set's bindings, canonical, each once and each one
+	// of Identities, which the application servers were told of (TS 24.229
+	// §5.4.1.7): the end of the set is told of every one. Devices of one set
+	// may register different identities of it. It is empty in a record saved
+	// before it was kept, whose end names Key.IMPU.
+	RegisteredAs []string
+	// Tombstone marks a deregistration's lease that holds the key of a set
+	// that was already gone (registrar's undoIfEnded): nothing was
+	// registered under it, so its end tells the application servers
+	// nothing. It has no contacts, and Deregistering is set.
+	Tombstone bool
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). A new item starts at a
 	// random value (FirstVersion), and every save raises it, so of two reads
@@ -183,8 +195,12 @@ type SetIdentity struct {
 // Identity is what one public identity names: the implicit registration set
 // it belongs to. Identities go before their record both ways. They are
 // written before a record with a new incarnation or new identities is saved,
-// the save being the commit point: one naming a record not saved (yet) is
-// as good as none, and its KeepUntil ends it. They are deleted with the set
+// the save being the commit point. One naming an incarnation of its set's
+// record that was not saved still finds the record, if the record lists the
+// identity, is live and is not being deregistered: the terminating lookup
+// uses it and repairs the item (internal/scscf/routing), and the set's next
+// REGISTER points it again; with no such record it is as good as none, and
+// its KeepUntil ends it. They are deleted with the set
 // before its record, so that a deregistration cut short is done again by a
 // sweep. A re-registration only keeps them (KeepIdentity), or repairs them.
 // An IMPU names one set: an IMPU shared by several private identities (TS
@@ -271,20 +287,26 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or a due Reassert if earlier, or, without contacts, when its
-// deregistration may be retried, or else when its unregistered state ends. A
+// contact expiry, or without contacts, when its deregistration may be
+// retried, or else when its unregistered state ends; a due Reassert if
+// earlier, but on a deregistration's lease, which ends the set anyway. A
 // registration with none of these is due at once.
 func (r *Registration) SweepAt() time.Time {
+	var at time.Time
 	switch {
 	case len(r.Contacts) > 0:
-		if next := r.NextExpiry(); r.Reassert.IsZero() || next.Before(r.Reassert) {
-			return next
-		}
-		return r.Reassert
+		at = r.NextExpiry()
 	case !r.Deregistering.IsZero():
 		return r.Deregistering
+	default:
+		at = r.Unregistered
 	}
-	return r.Unregistered
+	if !r.Reassert.IsZero() && r.Reassert.Before(at) {
+		// An unregistered user's record is reasserted too (#410 code
+		// review).
+		return r.Reassert
+	}
+	return at
 }
 
 // ReassertDue reports whether a sweep at now should tell the HSS again that
@@ -310,6 +332,7 @@ func (r *Registration) Prune(now time.Time) []Contact {
 func (r *Registration) Clone() *Registration {
 	c := *r
 	c.Identities = slices.Clone(r.Identities)
+	c.RegisteredAs = slices.Clone(r.RegisteredAs)
 	c.Contacts = make([]Contact, len(r.Contacts))
 	for i, ct := range r.Contacts {
 		ct.Path = slices.Clone(ct.Path)
@@ -360,6 +383,17 @@ func (r *Registration) Validate() error {
 	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
+	}
+	if r.Tombstone && (len(r.Contacts) > 0 || r.Deregistering.IsZero()) {
+		return fmt.Errorf("%w: a tombstone has contacts or no lease", ErrInvalid)
+	}
+	if len(r.RegisteredAs) > MaxIdentities {
+		return fmt.Errorf("%w: more than %d identities in RegisteredAs", ErrInvalid, MaxIdentities)
+	}
+	for _, impu := range r.RegisteredAs {
+		if !canonicalIMPU(impu) {
+			return fmt.Errorf("%w: RegisteredAs holds an identity that is not a canonical public identity", ErrInvalid)
+		}
 	}
 	for _, c := range r.Contacts {
 		if c.URI == "" || !validTime(c.Expires) {
@@ -729,6 +763,14 @@ type Challenges interface {
 	// instance counts into the same count, which is kept until expires. A
 	// resent request may count twice: that errs on the side of the limit.
 	CountAttempt(ctx context.Context, a Attempt, n int64, expires time.Time) (int64, error)
+	// ClaimODI records side, ODIReturned or ODIDefault, as the one that
+	// goes on with the request whose signed iFC position has scope
+	// (ODIScope), unless a side is recorded already and has not expired at
+	// now, and returns the side recorded, which is kept until expires.
+	// Every instance claims into the same record, and of concurrent claims
+	// one side is recorded. A resent request finds its own side, so a claim
+	// the store applied but whose answer was lost still goes on.
+	ClaimODI(ctx context.Context, scope, side string, now, expires time.Time) (string, error)
 }
 
 // ReservedNoncePrefix starts no challenge's nonce: the backends keep their
@@ -741,6 +783,15 @@ const ReservedNoncePrefix = "#"
 const (
 	AttemptChallenge = "challenge"
 	AttemptResync    = "resync"
+)
+
+// The sides of ClaimODI: a request's place in its iFC chain is taken up by
+// its return from the application server, as many times as the server sends
+// it back (TS 24.229 §5.4.3.2 NOTE 8), or by its default handling, which
+// passes the server over; never by both (routing, #14).
+const (
+	ODIReturned = "returned"
+	ODIDefault  = "default"
 )
 
 // Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
@@ -756,6 +807,14 @@ type Attempt struct {
 // and alphabet whatever the token holds.
 func FlowScope(token string) string {
 	sum := sha256.Sum256([]byte("scscf/attempt-flow|" + token))
+	return hex.EncodeToString(sum[:16])
+}
+
+// ODIScope is the ClaimODI scope of a signed iFC position: a digest, as
+// FlowScope's is, so that the claim needs no IMPI, which a request that
+// comes back after its user deregistered has none of.
+func ODIScope(odi string) string {
+	sum := sha256.Sum256([]byte("scscf/attempt-odi|" + odi))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -775,6 +834,19 @@ func ValidAttempt(a Attempt, n int64, expires time.Time) error {
 	}
 	if !validTime(a.Window) || !expires.After(a.Window) {
 		return fmt.Errorf("%w: an attempt window needs a start and a later expiry", ErrInvalid)
+	}
+	return nil
+}
+
+// ValidODIClaim checks ClaimODI's arguments; the backends apply it.
+func ValidODIClaim(scope, side string, now, expires time.Time) error {
+	switch {
+	case !validScope(scope):
+		return fmt.Errorf("%w: an iFC position's scope is an ODIScope", ErrInvalid)
+	case side != ODIReturned && side != ODIDefault:
+		return fmt.Errorf("%w: unknown side of an iFC position", ErrInvalid)
+	case !validTime(now) || !expires.After(now):
+		return fmt.Errorf("%w: an iFC position's claim needs a time and a later expiry", ErrInvalid)
 	}
 	return nil
 }

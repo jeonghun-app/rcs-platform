@@ -1,5 +1,11 @@
 package ifc
 
+import (
+	"math"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
+)
+
 // validate checks what the schema requires of a subscription built in code,
 // and that every value can be written as XML. ParseSubscription runs it too,
 // so the two directions accept the same documents.
@@ -28,13 +34,13 @@ func (r *reader) identity(where, name, v string) {
 }
 
 func (r *reader) optionalIdentity(where, name, v string) {
-	if v != collapse(v) || !isXMLText(v) {
+	if v != xmlsafe.Collapse(v) || !xmlsafe.IsText(v) {
 		r.fail(where, "%s has white space around it or characters XML cannot carry", name)
 	}
 }
 
 func (r *reader) text(where, name, v string) {
-	if !isXMLText(v) {
+	if !xmlsafe.IsText(v) {
 		r.fail(where, "%s has characters XML cannot carry", name)
 	}
 }
@@ -69,8 +75,11 @@ func (r *reader) validateProfile(where string, p *ServiceProfile) {
 }
 
 func (r *reader) validateCriteria(where string, fc *FilterCriteria) {
-	if fc.Priority < 0 {
-		r.fail(where, "Priority is negative")
+	// A priority fits an int32, as TS 29.228 writes it (xs:int), and as the
+	// S-CSCF signs it into a request's place in the chain; parsing runs this
+	// too.
+	if fc.Priority < 0 || fc.Priority > math.MaxInt32 {
+		r.fail(where, "Priority is negative or beyond an int32")
 	}
 	if fc.ProfilePart < ProfilePartAny || fc.ProfilePart > ProfilePartUnregistered {
 		r.fail(where, "ProfilePart is out of range")

@@ -187,6 +187,8 @@ type running struct {
 	// stop does what runtime.Run does on SIGTERM and waits for Run to
 	// return.
 	stop func()
+	// stopWithin is stop, failing the test if Run has not returned within d.
+	stopWithin func(d time.Duration)
 }
 
 // startICSCF runs icscf until the test ends, with its HSS at hss and the
@@ -233,7 +235,7 @@ func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF, opts ...func(*Se
 		t.Fatal("icscf did not start")
 	}
 	var once sync.Once
-	r.stop = func() {
+	r.stopWithin = func(d time.Duration) {
 		once.Do(func() {
 			cancel()
 			select {
@@ -241,11 +243,12 @@ func startICSCF(t *testing.T, hss *diameterHSS, scscfs []SCSCF, opts ...func(*Se
 				if err != nil {
 					t.Errorf("run: %v", err)
 				}
-			case <-time.After(realWait):
-				t.Error("icscf did not stop")
+			case <-time.After(d):
+				t.Errorf("icscf did not stop within %v", d)
 			}
 		})
 	}
+	r.stop = func() { r.stopWithin(realWait) }
 	t.Cleanup(r.stop)
 	return r
 }

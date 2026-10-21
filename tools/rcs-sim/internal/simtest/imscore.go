@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +37,12 @@ type IMSCore struct {
 	// goroutine for a NOTIFY, so two calls may run at once and a Rewrite
 	// that keeps state must lock it.
 	Rewrite func(*sip.Request)
+	// NotifyAnswered, when set before any request, hears how each NOTIFY
+	// the core sent ended: the subscriber's final response, or the error
+	// that ended its transaction. It runs on the transaction's goroutine
+	// and must not block. A test waits on it for a subscriber that must
+	// drop a NOTIFY to have done so (#396).
+	NotifyAnswered func(req *sip.Request, res *sip.Response, err error)
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
@@ -72,7 +79,44 @@ type IMSCore struct {
 	// off the reading goroutine.
 	notifies chan func()
 	stop     chan struct{}
+	// silent marks the responses quietSender drops; silenced counts the
+	// requests left unanswered so.
+	silent   sync.Map
+	silenced atomic.Int64
 }
+
+// quietSender is the stand-in's transaction layer's sender. It drops the
+// responses silence marked, the way the platform's proxy ends a server
+// transaction without sending anything (internal/sip/proxy).
+type quietSender struct {
+	transaction.Sender
+	c *IMSCore
+}
+
+func (q quietSender) SendResponse(res *sip.Response, src transport.Source, opts ...transport.SendOption) error {
+	if _, ok := q.c.silent.Load(res); ok {
+		return nil
+	}
+	return q.Sender.SendResponse(res, src, opts...)
+}
+
+// silence ends tx without a response: it is given one quietSender never
+// sends, so that it completes, and the layer's own 500 for a TU that never
+// answers does not go either (RFC 4320 §4.2).
+func (c *IMSCore) silence(tx *transaction.ServerTransaction, req *sip.Request) {
+	tag, _ := c.ids.Tag()
+	res, err := sip.NewResponse(req, 408, "", tag)
+	if err != nil {
+		return
+	}
+	c.silent.Store(res, true)
+	c.silenced.Add(1)
+	_ = tx.Respond(res)
+}
+
+// Silenced is how many requests the core has left unanswered after they
+// timed out on their way to the callee.
+func (c *IMSCore) Silenced() int { return int(c.silenced.Load()) }
 
 // regSub is one subscription to an IMPU's reg event, from the notifier's
 // side.
@@ -167,18 +211,19 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	if len(t1) > 0 {
 		cfg.T1 = t1[0]
 		// The layer answers 500 for a TU that has not answered within
-		// NonInviteFinalTimeout, 128*T1 by default. The stand-in answers a
-		// request routed to a callee that never answers itself, once the
-		// forwarded request's Timer F (64*T1) ends it, with the 408 its
-		// tests expect (#363 is to answer as the platform's proxy does, which
-		// sends no 408 to a non-INVITE, RFC 4320 §4.2). With a T1 of
-		// milliseconds the two timers were a fraction of a second apart,
-		// and a loaded host let the layer's 500 come first (#339). The
-		// safety net keeps the margin a proxy's has instead, in time the
-		// work takes rather than in T1.
+		// NonInviteFinalTimeout, 128*T1 by default. A non-INVITE routed to
+		// a callee that never answers is left unanswered once the
+		// forwarded request's Timer F (64*T1) ends it, as the platform's
+		// proxy leaves it (RFC 4320 §4.2, #363): the stand-in ends its
+		// server transaction with an answer it does not send, and that
+		// has to come before the layer's 500. With a T1 of milliseconds
+		// the two timers were a fraction of a second apart, and a loaded
+		// host let the 500 come first (#339). The safety net keeps the
+		// margin a proxy's has instead, in time the work takes rather than
+		// in T1.
 		cfg.NonInviteFinalTimeout = 64*cfg.T1 + transaction.FinalTimeoutMargin
 	}
-	if c.layer, err = transaction.New(tr, c, cfg); err != nil {
+	if c.layer, err = transaction.New(quietSender{Sender: tr, c: c}, c, cfg); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.layer.Close(); tr.Close() })
@@ -549,6 +594,9 @@ func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active b
 		done := make(chan struct{})
 		if _, err := c.layer.Request(req, transport.Destination{Flow: s.flow}, func(res *sip.Response, err error) {
 			if err != nil || res.StatusCode >= 200 {
+				if c.NotifyAnswered != nil {
+					c.NotifyAnswered(req, res, err)
+				}
 				select {
 				case <-done:
 				default:
@@ -634,13 +682,20 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	go func() {
 		_, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
 			if err != nil {
-				// The far end never answered, or its flow went: the
-				// originator hears it (RFC 3261 §16.7, §16.8).
-				code := 500
-				if errors.Is(err, transaction.ErrTimeout) {
-					code = 408
+				// The far end never answered, or its flow went. A
+				// non-INVITE that timed out is left unanswered, as the
+				// platform's proxy leaves it (RFC 4320 §4.2 forbids the
+				// 408): the originator's own transaction times out. An
+				// INVITE gets its 408 (RFC 3261 §16.8), anything else 500
+				// (§16.7).
+				switch {
+				case errors.Is(err, transaction.ErrTimeout) && req.Method != "INVITE":
+					c.silence(tx, req)
+				case errors.Is(err, transaction.ErrTimeout):
+					answer(408)
+				default:
+					answer(500)
 				}
-				answer(code)
 				return
 			}
 			if res.StatusCode == 100 {

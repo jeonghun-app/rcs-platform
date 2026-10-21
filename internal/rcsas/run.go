@@ -113,11 +113,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Resolver: resolver, MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions,
 		MaxOutgoingPerUser: cfg.MaxOutgoingPerUser, MaxIncomingPerUser: cfg.MaxIncomingPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
 		ConferenceFactory: cfg.ConferenceFactory, ConferenceHost: cfg.Group.ConferenceHost, MaxGroupParticipants: cfg.Group.MaxParticipants,
+		GroupChat: cfg.GroupChat, MaxSubscriptionsPerUser: cfg.MaxSubscriptionsPerUser,
 	})
 	if err != nil {
 		return err
 	}
-	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger})
+	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger, Metrics: rt.Metrics})
 	if err != nil {
 		return err
 	}
@@ -132,9 +133,19 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// answers to the deliveries in flight that it waits for (bounded by
 	// RCSAS_DELIVERY_TIMEOUT).
 	defer engine.Close()
-	groups, err := group.New(cfg.Group, gst, engine, srv, rt.Metrics)
+	gcfg := cfg.Group
+	gcfg.SIP = hostPort(cfg.SIPHost, addr.Port())
+	groups, err := group.New(gcfg, gst, engine, srv, rt.Metrics)
 	if err != nil {
 		return err
+	}
+	if cfg.GroupChat {
+		// #121: this task holds the groups it owns while it beats. Stopped
+		// last, after the sessions have ended (srv.Close), with a beat that
+		// lets another task take the groups at once.
+		beatCtx, stopBeating := context.WithCancel(context.Background())
+		stopped := groups.StartHeartbeat(beatCtx)
+		defer func() { stopBeating(); stopped() }()
 	}
 	srv.Bind(engine, groups, px.Layer(), tr)
 	// Run first of the deferred calls: the sessions end with a BYE while

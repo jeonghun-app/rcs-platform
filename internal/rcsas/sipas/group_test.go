@@ -351,8 +351,9 @@ func TestAFocusInviteThatComesBackIsRefusedAsALoop(t *testing.T) {
 		t.Fatalf("the returning INVITE was answered %d", code)
 	}
 	// The 482 says the invitation will never reach bob: what is queued
-	// for him from the group is given up (security review on #279).
-	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrUndeliverable) {
+	// for him from the group is given up (security review on #279), as a
+	// loop that no registration of his changes (#384).
+	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrLooped) {
 		t.Fatalf("the invitation failed with %v", err)
 	}
 	if n := r.metrics.get("sip.loop"); n != 1 {
@@ -759,5 +760,38 @@ func TestAGroupWhoseCreatorNeverACKsInvitesNobody(t *testing.T) {
 	}
 	if n := r.metrics.get("sip.group.creator_unacknowledged"); n != 1 {
 		t.Fatalf("%d unacknowledged", n)
+	}
+}
+
+// #121 D1: a group another task owns, and that task alive, is not this
+// task's to change: bob's join is answered 500 with Retry-After, never
+// 404, which rcsjta takes for the group's end and restarts it at the
+// factory. The group stays as it was.
+func TestAJoinToAGroupAnotherTaskOwnsIsToBeTriedAgain(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	uri, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	mine, err := r.groupStore.Owner(t.Context(), uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := groupstore.Owner{Task: "another-task", SIP: "10.0.1.9:5060"}
+	if _, err := r.groupStore.TakeOver(t.Context(), uri, mine, other, r.clock.Now().Add(time.Hour), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.groupStore.Beat(t.Context(), groupstore.Task{ID: other.Task, AliveUntil: r.clock.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.groups.Get(t.Context(), uri)
+	m := r.groupInvite(uri, sdpType, offerSDP(relayPath(), "active"))
+	m.from, m.fields[0] = "<"+bob+">;tag=b1", "P-Asserted-Identity: <"+bob+">"
+	res := p.send(m)
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	if after, _ := r.groups.Get(t.Context(), uri); after.Rev != before.Rev {
+		t.Fatalf("the group changed: rev %d, was %d", after.Rev, before.Rev)
 	}
 }

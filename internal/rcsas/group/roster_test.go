@@ -3,6 +3,7 @@ package group
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -35,9 +36,19 @@ func TestPartialRosterUpdatesAddUpToTheFullRoster(t *testing.T) {
 	}
 	updates := r.n.all()
 	var state *conference.Info
+	// Who each change took out of the group, whose subscriptions the SIP
+	// layer ends with it (#340): after the creation and bob's and carol's
+	// joins, the steps.
+	departed := [][]string{nil, nil, nil, nil, nil, {carol}, {alice}, nil}
+	if len(updates) != len(departed) {
+		t.Fatalf("%d updates", len(updates))
+	}
 	for i, u := range updates {
 		if u.Version != uint32(i+1) || u.Full != (i == 0) {
 			t.Fatalf("update %d: version %d, full %v", i, u.Version, u.Full)
+		}
+		if !slices.Equal(u.Departed, departed[i]) {
+			t.Fatalf("update %d: departed %q, want %q", i, u.Departed, departed[i])
 		}
 		doc := roster(t, u.Document)
 		if doc.Version != u.Version || doc.Entity != g.URI {
@@ -58,6 +69,10 @@ func TestPartialRosterUpdatesAddUpToTheFullRoster(t *testing.T) {
 	}
 	if version != updates[len(updates)-1].Version || !bytes.Equal(merged, full) {
 		t.Fatalf("merged roster\n%s\nfull roster v%d\n%s", merged, version, full)
+	}
+	// FullRoster, for whoever checks who may read it, is the same roster.
+	if fg, doc, err := r.s.FullRoster(ctx, g.URI); err != nil || fg.Version != version || !bytes.Equal(doc, full) {
+		t.Fatalf("FullRoster v%d, %v\n%s", fg.Version, err, doc)
 	}
 	// What the roster says about each participant.
 	byEntity := map[string]conference.User{}
@@ -110,33 +125,36 @@ func TestAPartialRosterNamesOnlyWhoChanged(t *testing.T) {
 	}
 }
 
-// Two rcs-as tasks changing one group at once: every change gets its own
-// version, one above the last, and none is lost.
-func TestTheRosterVersionCountsAcrossTasks(t *testing.T) {
+// Writers changing one group at once, its owner's requests on several
+// goroutines: every change gets its own version, one above the last, and
+// none is lost. Another task, alive, changes nothing (#121): the group is
+// its owner's.
+func TestTheRosterVersionCountsAcrossWriters(t *testing.T) {
 	groups, clock := slowReads{groupstore.NewMemory()}, newFakeClock()
 	r1 := newRigWith(t, Config{AddRate: rateOff}, engineConfig(), store.NewMemory(), groups, clock, 1)
 	r2 := newRigWith(t, Config{AddRate: rateOff}, engineConfig(), store.NewMemory(), groups, clock, 2)
+	r1.beat(t)
+	r2.beat(t)
 	g := r1.create(bob)
 	const each = 20
 	var wg sync.WaitGroup
-	for i, r := range []*rig{r1, r2} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for i := range 2 {
+		wg.Go(func() {
 			for j := range each {
 				who := fmt.Sprintf("sip:u%d-%d@example.net", i, j)
-				if err := r.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: who}}); err != nil {
+				if err := r1.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: who}}); err != nil {
 					t.Error(err)
 				}
 			}
-		}()
+		})
+	}
+	if err := r2.s.Add(t.Context(), g.URI, bob, []Invitee{{Identity: "sip:other@example.net"}}); !errors.Is(err, ErrNotOwner) {
+		t.Errorf("another task's Add = %v", err)
 	}
 	wg.Wait()
 	var versions []uint32
-	for _, r := range []*rig{r1, r2} {
-		for _, u := range r.n.all() {
-			versions = append(versions, u.Version)
-		}
+	for _, u := range r1.n.all() {
+		versions = append(versions, u.Version)
 	}
 	slices.Sort(versions)
 	// Creation (1), bob joining (2), and one version per add.
@@ -146,10 +164,10 @@ func TestTheRosterVersionCountsAcrossTasks(t *testing.T) {
 		}
 	}
 	final, _ := r1.s.Get(t.Context(), g.URI)
-	if len(versions) != 2+2*each || final.Version != uint32(len(versions)) || len(final.Participants) != 2+2*each {
-		t.Fatalf("%d updates, final version %d with %d participants", len(versions), final.Version, len(final.Participants))
+	if len(versions) != 2+2*each || final.Version != uint32(len(versions)) || len(final.Participants) != 2+2*each || len(r2.n.all()) != 0 {
+		t.Fatalf("%d updates, final version %d with %d participants; %d from the other task", len(versions), final.Version, len(final.Participants), len(r2.n.all()))
 	}
-	if r1.m.get("group.update_conflict")+r2.m.get("group.update_conflict") == 0 {
+	if r1.m.get("group.update_conflict") == 0 {
 		t.Fatal("no update met another's: the test did not contend")
 	}
 }

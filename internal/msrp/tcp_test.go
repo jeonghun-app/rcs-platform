@@ -239,6 +239,9 @@ type relayRigTCP struct {
 	diagMu sync.Mutex
 	conns  []roleConn
 	events []string
+	// kernelBase are the kernel's TCP counters when the rig began, which
+	// a report gives the changes since (#140).
+	kernelBase map[string]int64
 }
 
 type roleConn struct {
@@ -306,7 +309,7 @@ func (r *pairBinder) Bind(_ *Conn, to URI) (*Session, error) {
 func newRelayRigTCP(t *testing.T, relayClientCfg, asCfg Config, opts ...func(*relayRigTCP)) *relayRigTCP {
 	t.Helper()
 	asL, relayL := tcpListen(t), tcpListen(t)
-	rig := &relayRigTCP{relayAddr: relayL.Addr().String(), asReg: &Registry{}, relayConns: make(chan *Conn, 16)}
+	rig := &relayRigTCP{relayAddr: relayL.Addr().String(), asReg: &Registry{}, relayConns: make(chan *Conn, 16), kernelBase: kernelCounters()}
 	for _, o := range opts {
 		o(rig)
 	}
@@ -450,7 +453,9 @@ func allStacks() []byte {
 }
 
 // report is how far relayPub's bind got, the state of every connection the
-// rig knows and the latest events, then every goroutine's stack.
+// rig knows and the latest events, on Linux the kernel's view of each
+// socket, then every goroutine's stack. It is only taken for a bind that
+// waits past bindWatchdog and only shown if the bind fails.
 func (rig *relayRigTCP) report(relayPub URI) string {
 	var b strings.Builder
 	b.WriteString(rig.bindState(relayPub))
@@ -480,6 +485,7 @@ func (rig *relayRigTCP) report(relayPub URI) string {
 	for _, e := range events {
 		b.WriteString("  " + e + "\n")
 	}
+	b.WriteString(kernelReport(rig.kernelBase, conns))
 	b.WriteString("goroutines:\n")
 	b.Write(allStacks())
 	return b.String()
@@ -525,6 +531,9 @@ func TestABindStuckOnTheCoreOpenIsReportedWhileItWaits(t *testing.T) {
 	if !strings.Contains(waited, "relay core 0x") || !strings.Contains(waited, ": 0 frames queued (0 bytes posted), 1 requests awaiting an answer") {
 		t.Errorf("the report does not show the core connection awaiting its bind's answer:\n%s", waited)
 	}
+	// Where the kernel can say, the report says which end holds the
+	// octets of a stalled connection and whether TCP is backing off (#140).
+	checkKernelReport(t, waited)
 }
 
 // bindState says how far a client's bind got: whether the relay still

@@ -35,6 +35,12 @@ func (g *Registrar) Sweep(ctx context.Context, limit int) (int, error) {
 // HSS out of reach, is an error, so a sweep after the lease tries again; a
 // permanent one is not (state.SweepRegistrations).
 func (g *Registrar) swept(ctx context.Context, before, after *state.Registration) error {
+	if len(after.Contacts) == 0 && after.Deregistering.IsZero() {
+		// An unregistered user's record whose Reassert came, which the
+		// sweep claimed as a live set (state.SweepRegistrations): told
+		// UNREGISTERED_USER (assignmentOf; #410 code review).
+		return g.reassert(ctx, after)
+	}
 	if len(after.Contacts) > 0 {
 		if before.ReassertDue(g.cfg.Now()) {
 			// The sweep may have pruned bindings too, which the
@@ -85,7 +91,11 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		// The record keeps its lease: the sweep after it tries again.
 		return err
 	}
-	return g.endSet(ctx, after, profile)
+	ended, err := g.endSet(ctx, after, profile)
+	if ended {
+		g.endedByNetwork(ctx, before, profile)
+	}
+	return err
 }
 
 // permanent reports whether an SAR's outcome is one the HSS will not answer
@@ -111,11 +121,14 @@ const maxReassertTries = 5
 // permanent one, or the last, gives up, counted, and the set's next
 // re-registration tells the HSS anyway. Saves are conditional on the version
 // the sweep claimed: a REGISTER that saved the set meanwhile told the HSS
-// itself and left no Reassert.
+// itself and left no Reassert. A save that loses after a SAR the HSS took
+// may have lost to a deregistration, which undoIfEnded tells the HSS of
+// again; one that wins shows that none has ended the set, and any that
+// follows sends its SAR after this one's answer.
 func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error {
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
 		UserName: reg.Key.IMPI, PublicIdentities: []string{reg.Key.IMPU},
-		AssignmentType: cx.Registration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
+		AssignmentType: assignmentOf(reg), UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
 	})
 	var res cx.Result
 	if saa != nil {
@@ -139,7 +152,10 @@ func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error
 		next.Reassert, next.ReassertAttempts = time.Time{}, 0
 	}
 	_, err = g.cfg.Store.SaveRegistration(ctx, next)
-	if errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound) {
+	switch {
+	case (errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound)) && o == cxclient.Success:
+		return g.undoIfEnded(ctx, reg.Key)
+	case errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound):
 		return nil
 	}
 	return err

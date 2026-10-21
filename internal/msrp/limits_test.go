@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -406,11 +408,16 @@ func TestWhatSessionsHoldBeyondTheirReserveIsBoundedTogether(t *testing.T) {
 
 func TestAStalledPeerIsDisconnectedWithinTheWriteDeadline(t *testing.T) {
 	// Write deadlines are enforced by the operating system in real time,
-	// so this test runs on a short real one.
+	// so this test runs on a short real one. That the write deadline ended
+	// the connection is its error; that the deadline is WriteTimeout is
+	// the one the connection set, read where it sets it. A bound on the
+	// time to the end in wall clock is no part of either, and a loaded host
+	// under -race passed 2 s (#401).
 	const deadline = 100 * time.Millisecond
 	ours, theirs := net.Pipe()
 	defer theirs.Close()
-	c, err := NewActiveConn(ours, Config{Clock: newFakeClock(), WriteTimeout: deadline})
+	nc := &deadlineRecorder{Conn: ours}
+	c, err := NewActiveConn(nc, Config{Clock: newFakeClock(), WriteTimeout: deadline})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,13 +425,51 @@ func TestAStalledPeerIsDisconnectedWithinTheWriteDeadline(t *testing.T) {
 	start := time.Now()
 	go func() { _ = c.Open(context.Background(), s) }() // the peer never reads it
 	waitDone(t, c.Done(), "connection")
-	if elapsed := time.Since(start); elapsed > 20*deadline {
-		t.Fatalf("disconnected after %v", elapsed)
-	}
 	if !errors.Is(c.Err(), os.ErrDeadlineExceeded) {
 		t.Fatalf("Err = %v", c.Err())
 	}
+	// A deadline never comes early.
+	if elapsed := time.Since(start); elapsed < deadline {
+		t.Fatalf("disconnected after %v, before the %v write deadline", elapsed, deadline)
+	}
+	// The deadline is WriteTimeout from when the write began: it was
+	// computed after start and before the call that set it, so it lies
+	// between start+deadline and call+deadline however late either came.
+	// Every write the connection made, not only the first: a frame written
+	// before the one that stalled sets a deadline too (QA of #417).
+	ds := nc.all()
+	if len(ds) == 0 {
+		t.Fatal("no write deadline was set")
+	}
+	for _, d := range ds {
+		if d.set.Before(start.Add(deadline)) || d.set.After(d.at.Add(deadline)) {
+			t.Fatalf("write deadline %v, set at %v; want WriteTimeout %v after the write began (start %v)", d.set, d.at, deadline, start)
+		}
+	}
 	waitDone(t, s.Done(), "session")
+}
+
+// deadlineRecorder records every write deadline set on its Conn and when
+// it was set.
+type deadlineRecorder struct {
+	net.Conn
+	mu        sync.Mutex
+	deadlines []setDeadline
+}
+
+type setDeadline struct{ set, at time.Time }
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.deadlines = append(d.deadlines, setDeadline{t, time.Now()})
+	d.mu.Unlock()
+	return d.Conn.SetWriteDeadline(t)
+}
+
+func (d *deadlineRecorder) all() []setDeadline {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.deadlines)
 }
 
 // discard is a Handler that keeps nothing, for floods.

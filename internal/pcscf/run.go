@@ -48,6 +48,8 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
+	// writeTimeout replaces the transport's WriteTimeout when set.
+	writeTimeout time.Duration
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -96,7 +98,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 				px.FlowClosed(id)
 			}
 		},
-		Logger: rt.Logger,
+		WriteTimeout: d.writeTimeout,
+		Logger:       rt.Logger,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
@@ -166,6 +169,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Resolver:  resolver,
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
+		Metrics:   rt.Metrics,
 	})
 	if err != nil {
 		return err
@@ -244,6 +248,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if n := px.Drain(answersCtx); n > 0 {
 		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
 	}
+	// The transport closes before the proxy does (the deferred Close), once
+	// Drain has written its answers. A peer that stopped reading leaves
+	// senders waiting for room in its connection's queue, and the proxy's
+	// Close waits for them, for up to WriteTimeout, past the stop margin
+	// (#323); closing the connections releases them at once. A second Close
+	// does nothing.
+	_ = tr.Close()
 	// What the drain counted since the last sweep goes out with the
 	// runtime's last flush, the sweep stopped so that it does not record
 	// at the same time (#345 code review 4).

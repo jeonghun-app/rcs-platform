@@ -93,6 +93,9 @@ type Config struct {
 	// Logger receives operational events, never message content. Nil discards
 	// them.
 	Logger *slog.Logger
+	// Metrics, if set, counts the panics recovered from the service's hooks
+	// as MetricHookPanics, at once (#428); Stats counts them too.
+	Metrics Metrics
 	// DrainAnswer, if set, chooses the final response Drain gives a request
 	// still without one when the stop's time runs out: its status code, 300
 	// to 699, and a Retry-After if retryAfter is a second or more. Nil, or a
@@ -134,8 +137,14 @@ type Proxy struct {
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
-	key []byte
-	log *slog.Logger
+	key     []byte
+	log     *slog.Logger
+	metrics Metrics
+	// panicLogs limits the log lines of each hook's panics, by its name
+	// (panicLog); now is their clock, read against started.
+	panicLogs sync.Map
+	now       func() time.Time
+	started   time.Time
 	// ctx is the parent of every request's context; Close cancels it.
 	ctx  context.Context
 	stop context.CancelFunc
@@ -244,6 +253,9 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
+		metrics:   cfg.Metrics,
+		now:       time.Now,
+		started:   time.Now(),
 		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
@@ -338,8 +350,12 @@ func (p *Proxy) Drain(ctx context.Context) int {
 	defer tick.Stop()
 	for {
 		if p.inProgress() == 0 {
-			// The last answers may still sit in the transport's queues.
-			p.flushSender(time.Now().Add(DrainSendWait))
+			// From here on a request is answered as it arrives, as after
+			// the deadline: the Close that follows would drop it (QA of
+			// #310). The last answers may still sit in the transport's
+			// queues.
+			p.stopping.Store(true)
+			p.flushSender(time.Now().Add(drainSendWait))
 			return 0
 		}
 		select {
@@ -378,6 +394,22 @@ func (p *Proxy) openContexts() []*respContext {
 // stop margin must leave room for it.
 const DrainSendWait = 2 * time.Second
 
+// drainSendWait is DrainSendWait, which a test lengthens to show that
+// something else ends the wait.
+var drainSendWait = DrainSendWait
+
+// drainFlushStall is how long flushSender waits for any connection with
+// output queued to make progress before it gives up on what the queues hold:
+// a peer that has stopped reading takes none of it before the Close drops it,
+// and would otherwise keep a stop waiting the whole DrainSendWait, most of
+// the stop margin (QA of #366). Progress is per connection and per chunk
+// written, so neither a long message nor another peer's traffic hides it. The
+// kernel takes a full socket's output in steps of about 160 KiB, so this
+// keeps waiting for a peer that reads 160 KiB a second or more, however long
+// its message; a slower one with that much queued loses the rest at the
+// Close, as it did at the end of DrainSendWait. A test lengthens it.
+var drainFlushStall = time.Second
+
 // answerForStop answers every request still without a final response, and
 // waits until the answers have gone out, so that a Close right after does
 // not drop them: handed to the sender, and with a *transport.Transport,
@@ -395,7 +427,7 @@ func (p *Proxy) answerForStop() int {
 			}
 		}
 	}
-	deadline := time.Now().Add(DrainSendWait)
+	deadline := time.Now().Add(drainSendWait)
 	for _, ch := range sent {
 		select {
 		case <-ch:
@@ -409,23 +441,29 @@ func (p *Proxy) answerForStop() int {
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
-// write what its send queues hold: its Close drops it.
+// write what its send queues hold: its Close drops it. It waits for each
+// connection's queue as it was then, the answers still waiting for room in
+// it included, and gives up on one whose writer makes no progress for
+// drainFlushStall (Transport.Flush).
 func (p *Proxy) flushSender(deadline time.Time) {
 	for p.cancelsSending.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if tr, ok := p.sender.(*transport.Transport); ok {
-		for tr.Stats().QueuedBytes > 0 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
+	tr, ok := p.sender.(*transport.Transport)
+	if !ok {
+		return
 	}
+	tr.Flush(deadline, drainFlushStall)
 }
 
 // drainResponse is the final response Drain gives req (Config.DrainAnswer).
 func (p *Proxy) drainResponse(req *sip.Request) (*sip.Response, error) {
 	code, retryAfter := 500, 5*time.Second
 	if p.drainAns != nil {
-		if c, ra := p.drainAns(req); c >= 300 && c <= 699 {
+		var c int
+		var ra time.Duration
+		// A panic leaves the default answer.
+		if p.hook("DrainAnswer", func() { c, ra = p.drainAns(req) }) && c >= 300 && c <= 699 {
 			code, retryAfter = c, ra
 		}
 	}
@@ -716,6 +754,7 @@ type Stats struct {
 	ACKsMissing            uint64 // 2xx a Serve handler sent whose ACK never came
 	ACKsDropped            uint64 // ACKs that could not be forwarded
 	UpstreamErrors         uint64 // responses the upstream transaction could not send, dropped (§16.9)
+	HookPanics             uint64 // panics recovered from the service's hooks (#428)
 
 	// Drained counts the answers Drain sent to requests that had no final
 	// response when the stop's time ran out.
@@ -725,7 +764,7 @@ type Stats struct {
 type counters struct {
 	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
-	upstreamErrors, drained atomic.Uint64
+	upstreamErrors, hookPanics, drained atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -753,6 +792,7 @@ func (p *Proxy) Stats() Stats {
 		ACKsMissing:            s.acksMissing.Load(),
 		ACKsDropped:            s.acksDropped.Load(),
 		UpstreamErrors:         s.upstreamErrors.Load(),
+		HookPanics:             s.hookPanics.Load(),
 
 		Drained: s.drained.Load(),
 	}

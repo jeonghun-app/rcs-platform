@@ -107,7 +107,10 @@ func startStoppableHarness(t *testing.T, cfg Config, d deps) (netip.AddrPort, ne
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
 	done := make(chan error, 1)
-	d.store, d.groups = store.NewMemory(), groupstore.NewMemory()
+	d.store = store.NewMemory()
+	if d.groups == nil {
+		d.groups = groupstore.NewMemory()
+	}
 	d.listening = func(a netip.AddrPort) { listening <- a }
 	go func() { done <- run(ctx, h.Runtime, cfg, d) }()
 	var once sync.Once
@@ -408,18 +411,113 @@ type nopHandler struct{}
 func (nopHandler) HandleMessage(*msrp.Session, *msrp.Message) error { return nil }
 func (nopHandler) HandleReport(*msrp.Session, msrp.Report)          {}
 
-// Run wires the group chat focus: an INVITE to the conference factory
-// (sip:conf-factory@<RCS_IMS_DOMAIN> by default) creates a group, whose
-// conference URI at RCSAS_CONFERENCE_HOST answers as a focus, and the
-// focus invites bob through the core from it.
-func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
+// With RCSAS_GROUP_CHAT_ENABLED unset, Run serves no group chat: an INVITE
+// to the conference factory is 404, and the focus sends nothing to the
+// core (QA on #340). Run does not turn it on of itself.
+func TestRunServesNoGroupChatByDefault(t *testing.T) {
 	core := newCoreStub(t)
 	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCSAS_MSRP_HOST", "127.0.0.1",
 		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := startRun(t, cfg, deps{})
+	if _, _, res := inviteTheFactory(t, core, startRun(t, cfg, deps{})); res.StatusCode != 404 {
+		t.Fatalf("a factory INVITE answered %d", res.StatusCode)
+	}
+	select {
+	case req := <-core.got:
+		t.Fatalf("the core got a %s", req.Method)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Run wires the group chat focus: an INVITE to the conference factory
+// (sip:conf-factory@<RCS_IMS_DOMAIN> by default) creates a group, whose
+// conference URI at RCSAS_CONFERENCE_HOST answers as a focus, and the
+// focus invites bob through the core from it. Run passes the group
+// settings on: RCSAS_GROUP_CHAT_ENABLED, and the per-user subscription
+// bound.
+func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
+	core := newCoreStub(t)
+	cfg, err := configure(with(devEnv, "RCSAS_SIP_HOST", "127.0.0.1", "RCSAS_MSRP_HOST", "127.0.0.1", "RCSAS_GROUP_CHAT_ENABLED", "true",
+		"RCSAS_MAX_SUBSCRIPTIONS_PER_USER", "1",
+		"RCSAS_CORE_URI", "sip:"+core.l.Addr().String()+";transport=tcp;lr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := groupstore.NewMemory()
+	sipAddr := startRun(t, cfg, deps{groups: groups})
+	nc, r, res := inviteTheFactory(t, core, sipAddr)
+	factory := "sip:conf-factory@" + devEnv["RCS_IMS_DOMAIN"]
+	contact, err := sip.ParseAddress(res.Header.Get("Contact"))
+	if res.StatusCode != 200 || err != nil || contact.URI.Host != devEnv["RCSAS_CONFERENCE_HOST"] || !contact.Params.Has("isfocus") {
+		t.Fatalf("answered %d, Contact %q", res.StatusCode, res.Header.Get("Contact"))
+	}
+	// With group chat on, the task owns the group it made, and beats as
+	// its SIP instance address (#121).
+	owner, err := groups.Owner(t.Context(), "sip:"+contact.URI.User+"@"+contact.URI.Host)
+	if err != nil || owner.Epoch != 1 || owner.SIP != sipAddr.String() {
+		t.Fatalf("owner %+v, %v; SIP at %s", owner, err, sipAddr)
+	}
+	if task, err := groups.Task(t.Context(), owner.Task); err != nil || task.SIP != sipAddr.String() || !task.AliveUntil.After(time.Now()) {
+		t.Fatalf("heartbeat %+v, %v", task, err)
+	}
+	// The group is established, and its invitees invited, once the 200's
+	// ACK has come.
+	to, _ := res.Header.To()
+	ack := "ACK " + contact.URI.String() + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-group-ack\r\n" +
+		"Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <" + factory + ">;tag=" + to.Tag() + "\r\n" +
+		"Call-ID: rcsas-run-group\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
+	if _, err := io.WriteString(nc, ack); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(waitFor)
+invited:
+	for {
+		select {
+		case req := <-core.got:
+			if req.Method != "INVITE" {
+				continue
+			}
+			if from, err := req.Header.From(); err != nil || from.URI.String() != contact.URI.String() || req.URI.String() != "tel:+15550100002" {
+				t.Fatalf("INVITE %s from %q", req.URI, req.Header.Get("From"))
+			}
+			break invited
+		case <-deadline:
+			t.Fatal("the focus invited no one")
+		}
+	}
+	// Run passes RCSAS_MAX_SUBSCRIPTIONS_PER_USER on: alice's second
+	// subscription is beyond it (security review on #340).
+	for i, want := range []int{200, 486} {
+		sub := fmt.Sprintf("SUBSCRIBE %s SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-sub%d\r\n", contact.URI, i) +
+			fmt.Sprintf("Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=s%d\r\nTo: <%s>\r\n", i, contact.URI) +
+			fmt.Sprintf("Call-ID: rcsas-run-sub%d\r\nCSeq: 1 SUBSCRIBE\r\nP-Asserted-Identity: <tel:+15550100001>\r\n", i) +
+			"Contact: <sip:" + core.l.Addr().String() + ";transport=tcp>\r\nEvent: conference\r\nExpires: 600\r\nContent-Length: 0\r\n\r\n"
+		if _, err := io.WriteString(nc, sub); err != nil {
+			t.Fatal(err)
+		}
+		var got *sip.Response
+		for got == nil {
+			m, err := r.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if x, ok := m.(*sip.Response); ok && x.StatusCode >= 200 && x.Header.Get("Call-ID") == fmt.Sprintf("rcsas-run-sub%d", i) {
+				got = x
+			}
+		}
+		if got.StatusCode != want {
+			t.Fatalf("subscription %d answered %d, want %d", i+1, got.StatusCode, want)
+		}
+	}
+}
+
+// inviteTheFactory sends alice's INVITE to the default conference factory,
+// with bob in its resource list, to the rcs-as Run serves at addr, and
+// returns the connection, its reader and the final answer.
+func inviteTheFactory(t *testing.T, core *coreStub, addr netip.AddrPort) (net.Conn, *sip.Reader, *sip.Response) {
+	t.Helper()
 	nc, err := net.Dial("tcp", addr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -456,32 +554,5 @@ func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 			res = x
 		}
 	}
-	contact, err := sip.ParseAddress(res.Header.Get("Contact"))
-	if res.StatusCode != 200 || err != nil || contact.URI.Host != devEnv["RCSAS_CONFERENCE_HOST"] || !contact.Params.Has("isfocus") {
-		t.Fatalf("answered %d, Contact %q", res.StatusCode, res.Header.Get("Contact"))
-	}
-	// The group is established, and its invitees invited, once the 200's
-	// ACK has come.
-	to, _ := res.Header.To()
-	ack := "ACK " + contact.URI.String() + " SIP/2.0\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-rcsas-run-group-ack\r\n" +
-		"Max-Forwards: 70\r\nFrom: <tel:+15550100001>;tag=a1\r\nTo: <" + factory + ">;tag=" + to.Tag() + "\r\n" +
-		"Call-ID: rcsas-run-group\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
-	if _, err := io.WriteString(nc, ack); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.After(waitFor)
-	for {
-		select {
-		case req := <-core.got:
-			if req.Method != "INVITE" {
-				continue
-			}
-			if from, err := req.Header.From(); err != nil || from.URI.String() != contact.URI.String() || req.URI.String() != "tel:+15550100002" {
-				t.Fatalf("INVITE %s from %q", req.URI, req.Header.Get("From"))
-			}
-			return
-		case <-deadline:
-			t.Fatal("the focus invited no one")
-		}
-	}
+	return nc, r, res
 }
