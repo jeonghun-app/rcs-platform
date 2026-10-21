@@ -145,8 +145,10 @@ func (c *Client) attempt(ctx context.Context, p *hssPeer, build func(*diameter.N
 		return nil, nil, err
 	}
 	if prev != nil && prev.EndToEnd != 0 {
-		// The first attempt may have reached its task; one that never left
-		// has no End-to-End Identifier and needs no T flag.
+		// The first attempt may have reached its task. One refused before
+		// the send has no End-to-End Identifier and needs no T flag; one
+		// the diameter writer dropped behind a DPR or DPA has one, so it
+		// goes again with the T flag, though it never left (#324).
 		msg.EndToEnd = prev.EndToEnd
 		msg.Flags |= diameter.FlagRetransmit
 	}
