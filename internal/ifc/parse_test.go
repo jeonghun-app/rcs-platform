@@ -2,6 +2,7 @@ package ifc
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -374,6 +375,7 @@ func TestMalformedDocumentsAreRejected(t *testing.T) {
 		"no Priority":                   doc(`<InitialFilterCriteria>` + as + `</InitialFilterCriteria>`),
 		"negative Priority":             doc(`<InitialFilterCriteria><Priority>-1</Priority>` + as + `</InitialFilterCriteria>`),
 		"Priority beyond int":           doc(`<InitialFilterCriteria><Priority>99999999999999999999</Priority>` + as + `</InitialFilterCriteria>`),
+		"Priority beyond int32":         doc(`<InitialFilterCriteria><Priority>2147483648</Priority>` + as + `</InitialFilterCriteria>`),
 		"Priority not a number":         doc(`<InitialFilterCriteria><Priority>first</Priority>` + as + `</InitialFilterCriteria>`),
 		"no ApplicationServer":          ifcWith(""),
 		"two ApplicationServers":        ifcWith(as + as),
@@ -438,6 +440,7 @@ func TestMarshalRefusesWhatTheParserWouldRefuse(t *testing.T) {
 		},
 		"negative shared set":      func(s *Subscription) { s.ServiceProfiles[0].SharedIFCSetIDs = []int{-1} },
 		"negative priority":        func(s *Subscription) { fc(s).Priority = -1 },
+		"priority beyond int32":    func(s *Subscription) { fc(s).Priority = math.MaxInt32 + 1 },
 		"ProfilePart 7":            func(s *Subscription) { fc(s).ProfilePart = 7 },
 		"no ServerName":            func(s *Subscription) { fc(s).ApplicationServer.ServerName = "" },
 		"DefaultHandling 3":        func(s *Subscription) { fc(s).ApplicationServer.DefaultHandling = 3 },
@@ -476,5 +479,14 @@ func TestMarshalRefusesASubscriptionLargerThanTheParserAccepts(t *testing.T) {
 	out, err := s.Marshal()
 	if !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Marshal = %d bytes, %v; want ErrTooLarge", len(out), err)
+	}
+}
+
+// TestThePriorityOfAnInt32Parses: the largest TS 29.228 writes (xs:int).
+func TestThePriorityOfAnInt32Parses(t *testing.T) {
+	const as = `<ApplicationServer><ServerName>sip:as</ServerName></ApplicationServer>`
+	sub, err := ParseSubscription([]byte(doc(`<InitialFilterCriteria><Priority>2147483647</Priority>` + as + `</InitialFilterCriteria>`)))
+	if err != nil || sub.ServiceProfiles[0].InitialFilterCriteria[0].Priority != math.MaxInt32 {
+		t.Errorf("parsed %v, %v", sub, err)
 	}
 }

@@ -133,3 +133,42 @@ func (d *Dynamo) CountAttempt(ctx context.Context, a state.Attempt, n int64, exp
 	}
 	return nv(out.Attributes, attrCount)
 }
+
+// odiClaimKey is the item of the claim of an iFC position, in the challenges
+// table: its partition and sort key start with the reserved prefix, so no
+// challenge or attempt count has its key, and a client's nonce cannot name it.
+func odiClaimKey(scope string) map[string]types.AttributeValue {
+	return challengeKey(state.ReservedNoncePrefix+"odi#"+scope, state.ReservedNoncePrefix+"odi")
+}
+
+// ClaimODI implements state.Challenges with one conditional put, which only
+// one of concurrent claims passes; a claim refused reads the side recorded.
+// A resend of a put DynamoDB applied is refused by its own item, and reads
+// its own side. A claim that has expired, which TTL removes later, is taken
+// over.
+func (d *Dynamo) ClaimODI(ctx context.Context, scope, side string, now, expires time.Time) (string, error) {
+	if err := state.ValidODIClaim(scope, side, now, expires); err != nil {
+		return "", err
+	}
+	item := odiClaimKey(scope)
+	item[attrSide] = str(side)
+	item[attrExpires] = num(expires.Unix())
+	_, err := d.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                 aws.String(d.challenges),
+		Item:                      item,
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #ttl <= :now"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrExpires},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":now": num(now.Unix())},
+	})
+	switch {
+	case ccf(err):
+		cur, err := d.get(ctx, d.challenges, odiClaimKey(scope), "claim iFC position")
+		if err != nil {
+			return "", err
+		}
+		return sv(cur[attrSide]), nil
+	case err != nil:
+		return "", sanitize("claim iFC position", err)
+	}
+	return side, nil
+}

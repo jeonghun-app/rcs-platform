@@ -85,7 +85,11 @@ func (g *Registrar) swept(ctx context.Context, before, after *state.Registration
 		// The record keeps its lease: the sweep after it tries again.
 		return err
 	}
-	return g.endSet(ctx, after, profile)
+	ended, err := g.endSet(ctx, after, profile)
+	if ended {
+		g.endedByNetwork(ctx, before, profile)
+	}
+	return err
 }
 
 // permanent reports whether an SAR's outcome is one the HSS will not answer

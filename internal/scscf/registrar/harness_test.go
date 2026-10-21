@@ -185,6 +185,9 @@ func (f *fakeHSS) SAR(_ context.Context, r *cx.SAR) (*cx.SAA, error) {
 			return saa, err
 		}
 	}
+	if r.AssignmentType == cx.UnregisteredUser && r.UserName == "" {
+		return f.unregisteredSAA(r), nil
+	}
 	s := f.subs[r.UserName]
 	if s == nil {
 		return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
@@ -198,6 +201,17 @@ func (f *fakeHSS) SAR(_ context.Context, r *cx.SAR) (*cx.SAA, error) {
 		saa.UserData = userDataOf(s.impi, s.barred, set...)
 	}
 	return saa, nil
+}
+
+// unregisteredSAA answers a SAR UNREGISTERED_USER without a User-Name: the
+// HSS finds the user by the identity, and names it (TS 29.228 §6.1.2).
+func (f *fakeHSS) unregisteredSAA(r *cx.SAR) *cx.SAA {
+	for _, s := range f.subs {
+		if set := s.setOf(r.PublicIdentities[0]); set != nil {
+			return &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserName: s.impi, UserData: userDataOf(s.impi, s.barred, set...)}
+		}
+	}
+	return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}
 }
 
 func (f *fakeHSS) lastSAR(t *testing.T) *cx.SAR {
