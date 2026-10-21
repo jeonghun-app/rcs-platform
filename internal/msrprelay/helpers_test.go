@@ -272,6 +272,10 @@ type extraCorePorts []uint16
 
 func withProxyProtocol(o *relayOptions) { o.ProxyProtocol = true }
 
+// storeTimeout replaces the rig's StoreTimeout, of the control API and of
+// every task alike.
+type storeTimeout time.Duration
+
 func newRig(t *testing.T, tasks int, opts ...any) *rig {
 	t.Helper()
 	return newRigWithStore(t, tasks, store.NewMemory(), opts...)
@@ -288,17 +292,20 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 	rnd := &sequence{}
 	loopback := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
 	ports := []uint16{r.as.addr.Port()}
+	stTimeout := 5 * time.Second
 	for _, opt := range opts {
 		switch opt := opt.(type) {
 		case extraCorePorts:
 			ports = append(ports, opt...)
+		case storeTimeout:
+			stTimeout = time.Duration(opt)
 		case rigOption, func(*relayOptions):
 		default:
 			t.Fatalf("unknown rig option %T", opt)
 		}
 	}
 	r.control = newControl(controlOptions{
-		Store: r.store, StoreTimeout: 5 * time.Second, Public: public, CoreHost: coreHostAddr,
+		Store: r.store, StoreTimeout: stTimeout, Public: public, CoreHost: coreHostAddr,
 		CoreNetworks: loopback, CorePorts: ports, MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken},
 		Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
 	})
@@ -306,7 +313,7 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 		o := relayOptions{
 			// The store timeout is generous: a loaded host must not turn
 			// a slow DynamoDB Local answer into a refusal.
-			Store: r.store, StoreTimeout: 5 * time.Second, Public: public,
+			Store: r.store, StoreTimeout: stTimeout, Public: public,
 			MaxConnections: 100, MaxConnectionsPerSource: 100, MaxConcurrentBinds: 8, FailedLookupsPerSource: 100,
 			PathWait: DefaultPathWait, CoreConnectTimeout: 5 * time.Second, IdleTimeout: time.Minute,
 			Dial: coreDialer(loopback, ports, 5*time.Second), Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
