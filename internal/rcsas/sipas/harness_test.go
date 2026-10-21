@@ -201,6 +201,9 @@ func startASOn(t *testing.T, e Engine, groups Groups, cfg Config, tc transport.C
 		t.Fatal(err)
 	}
 	cfg.Host, cfg.Listener, cfg.Contact, cfg.HomeDomain = "127.0.0.1", "core", self, domain
+	if groups != nil && !cfg.groupChatOff {
+		cfg.GroupChat = true
+	}
 	if cfg.ConferenceHost == "" {
 		cfg.ConferenceHost = confHost
 	}

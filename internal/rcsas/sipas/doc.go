@@ -29,8 +29,9 @@
 //     group (group.Service.Create) and has the focus invite its members, one
 //     to a conference URI joins it (Join). rcs-as is the focus of every
 //     session with a group: its Contact is the conference URI, marked
-//     isfocus (RFC 4579). The conference event package and REFER come in a
-//     later part of #137.
+//     isfocus (RFC 4579). A participant's SUBSCRIBE to the conference event
+//     package gets the roster and then each change (RFC 4575), and its REFER
+//     in its session adds someone, or with method=BYE removes them.
 //   - Every other method is refused with 405.
 //
 // Server is also the engine's Deliverer. Pager sends a MESSAGE to scscf

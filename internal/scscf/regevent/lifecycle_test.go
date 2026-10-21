@@ -939,7 +939,7 @@ func TestTheEndsOfOtherSetsAreDeliveredWhileOneSubscriberIsSlow(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	e.clock.advance(pendingEnd + time.Second)
+	e.clock.advance(n.pendingEnd() + time.Second)
 	if _, err := n.Sweep(bg, 2*ended); err != nil {
 		t.Fatal(err)
 	}
@@ -985,7 +985,7 @@ func TestAnRTRsNotifyIsNotLostBehindADeadPCSCF(t *testing.T) {
 	}
 	n.Changed(bg, live, nil, Rejected)
 	n.Wait()
-	e.clock.advance(pendingEnd + time.Second)
+	e.clock.advance(n.pendingEnd() + time.Second)
 	if _, err := n.Sweep(bg, 100); err != nil {
 		t.Fatal(err)
 	}

@@ -55,17 +55,11 @@ func TestReassemblyMemoryFollowsReceivedOctetsNotDeclaredRanges(t *testing.T) {
 	}
 }
 
-// fastest runs f three times and returns its shortest time: other work on
-// the host can only lengthen a run, so the shortest is the closest to f's
-// own cost.
-func fastest(f func()) time.Duration {
-	best := time.Duration(1<<63 - 1)
-	for range 3 {
-		start := time.Now()
-		f()
-		best = min(best, time.Since(start))
-	}
-	return best
+// timed returns how long f takes.
+func timed(f func()) time.Duration {
+	start := time.Now()
+	f()
+	return time.Since(start)
 }
 
 func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
@@ -87,7 +81,7 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	}
 	refused, maxHeld := 0, int64(0)
 	var n uint64
-	spreadTime := fastest(func() {
+	spreadRun := func() {
 		r := Reassembler{MaxSize: size}
 		refused, maxHeld = 0, 0
 		n = allocated(func() {
@@ -98,15 +92,36 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 				maxHeld = max(maxHeld, r.Buffered())
 			}
 		})
-	})
-	baseTime := fastest(func() {
+	}
+	inOrderRun := func() {
 		r := Reassembler{MaxSize: size}
 		for _, m := range inOrder {
 			if _, err := r.Add(m, t0); err != nil {
 				t.Fatal(err)
 			}
 		}
-	})
+	}
+	// A spread run costs about two in-order ones (7.7 ms against 3.5 ms
+	// unloaded, QA of #352), and each timing of the yardstick runs four:
+	// the yardstick then lasts about twice the spread, long enough that
+	// load seldom leaves it unthrottled while it stretches the spread
+	// (#232: the best of three 200 ms spread runs against 7 ms in-order
+	// ones made 28.7x). Two runs, which would match the spread, failed
+	// unchanged code 2 times in 100 under the load model, against none for
+	// four in the same slots (QA of #352). The two are timed in turn, so a
+	// burst of load meets both, and the shortest of each is taken, since
+	// other work only adds time.
+	const baseRuns = 4
+	spreadTime, baseTime := time.Duration(1<<63-1), time.Duration(1<<63-1)
+	for range 5 {
+		spreadTime = min(spreadTime, timed(spreadRun))
+		baseTime = min(baseTime, timed(func() {
+			for range baseRuns {
+				inOrderRun()
+			}
+		}))
+	}
+	baseTime /= baseRuns
 	// The 65th gap is refused and the message dropped, so it starts over;
 	// at most one fragment limit's worth is ever held.
 	if refused < chunks/(DefaultMaxFragments+1)-1 || maxHeld > DefaultMaxFragments {
