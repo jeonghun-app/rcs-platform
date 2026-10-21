@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -177,14 +179,20 @@ func startup(t *testing.T, env map[string]string) (int, string) {
 	return status, out.String()
 }
 
-// TestTheConfigurationGivesNoKeyAway: printed, logged or formatted, it
-// shows none of its keys.
+// TestTheConfigurationGivesNoKeyAway: printed, formatted, logged or
+// encoded as JSON, it shows none of its keys.
 func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 	c, err := configure(devEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, out := range []string{fmt.Sprint(c), fmt.Sprintf("%v %+v %#v %s", c, c, c, c)} {
+	j, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("config", "config", c)
+	for _, out := range []string{fmt.Sprint(c), fmt.Sprintf("%v %+v %#v %s", c, c, c, c), string(j), logged.String()} {
 		for _, secret := range []string{"0123456789abcdef", "fedcba9876543210", "abcdefghijklmnop", nonceKey, dialogKey, challengeKey} {
 			if strings.Contains(out, secret) {
 				t.Errorf("%q gives a key away", out)

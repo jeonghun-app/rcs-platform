@@ -3,7 +3,9 @@ package scscf
 import (
 	"cmp"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
@@ -135,6 +137,11 @@ func (c ServiceConfig) String() string { return "scscf.ServiceConfig{[redacted]}
 
 // GoString is String, so that %#v gives no key away either.
 func (c ServiceConfig) GoString() string { return c.String() }
+
+// LogValue and MarshalJSON are String, for log/slog and encoding/json.
+func (c ServiceConfig) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
+func (c ServiceConfig) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
 // interfaceAddrs finds this task's addresses; tests replace it.
 var interfaceAddrs = net.InterfaceAddrs
