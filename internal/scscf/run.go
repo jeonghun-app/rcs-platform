@@ -61,6 +61,10 @@ type deps struct {
 	allow  func(netip.Addr) bool
 	// sipDialer, if set, opens the transport's connections.
 	sipDialer transport.Dialer
+	// writeTimeout replaces the transport's WriteTimeout when set.
+	writeTimeout time.Duration
+	// transportMade, if set, hears of the transport once it is made.
+	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
 	now func() time.Time
 	// listening, if set, hears the core listener's bound address.
@@ -90,12 +94,17 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return err
 	}
-	defer func() { _ = hss.Close(context.Background()) }()
+	// The stop closes the Cx client by its deadline; a return before the
+	// stop closes it here. Only the first Close counts: a second would wait
+	// again, with no deadline, for what the first gave up on.
+	var cxClosed sync.Once
+	closeCx := func(ctx context.Context) { cxClosed.Do(func() { _ = hss.Close(ctx) }) }
+	defer closeCx(context.Background())
 	rt.Admin.AddReadinessCheck("hss", func(context.Context) error { return hss.Ready() })
 
 	resolver := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Logger: rt.Logger}
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, WriteTimeout: d.writeTimeout, Dialer: d.sipDialer, Logger: rt.Logger}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}
@@ -104,6 +113,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		return err
 	}
 	defer func() { _ = tr.Close() }()
+	if d.transportMade != nil {
+		d.transportMade(tr)
+	}
 	coreAddr, err := tr.Listen(transport.ListenerConfig{
 		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr, AdvertisedHost: hostOf(cfg.CoreHost),
 	})
@@ -160,14 +172,17 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	third.router.Store(router)
 
-	tcfg := transaction.Config{MaxServerTransactions: cfg.MaxServerTransactions, MaxServerTransactionBytes: cfg.MaxServerTransactionBytes}
+	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger}
+	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
-		Self:        self,
-		Router:      &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger},
-		Resolver:    resolver,
-		Supported:   []string{"path"},
-		Logger:      rt.Logger,
-		Transaction: tcfg,
+		Self:            self,
+		Router:          disp,
+		Resolver:        resolver,
+		Supported:       []string{"path"},
+		Logger:          rt.Logger,
+		Transaction:     tcfg,
+		MaxContexts:     maxContexts,
+		MaxContextBytes: maxContextBytes,
 	})
 	if err != nil {
 		return err
@@ -199,18 +214,39 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// requests are answered, and the sweeps stop.
 	stopSweeps()
 	sweeps.Wait()
-	// The router and the notifier share what is left of the budget: an
-	// application server or a P-CSCF that does not answer holds neither
-	// past it (#439 QA).
-	waitCtx, cancelWait := context.WithDeadline(context.Background(), stopBy)
+	// The router, the first NOTIFYs and the notifier's queue share what is
+	// left of the budget but closeMargin: an application server or a P-CSCF
+	// that does not answer holds none of them past it (#439 QA and code
+	// review).
+	waitCtx, cancelWait := context.WithDeadline(context.Background(), stopBy.Add(-closeMargin))
 	defer cancelWait()
 	if !router.StopBy(waitCtx) {
 		rt.Logger.Info("gave up on third-party REGISTERs at the stop")
 	}
-	if !notifier.WaitFor(waitCtx) {
+	if !disp.firsts.wait(waitCtx) || !notifier.WaitFor(waitCtx) {
 		rt.Logger.Info("left NOTIFYs to the sweeps of the other tasks")
 	}
+	// The transport closes before the proxy does (the deferred Close), as
+	// pcscf's (#366): a peer that stopped reading leaves senders waiting for
+	// room in its connection's queue, and the proxy's Close waits for them,
+	// for up to WriteTimeout, past the budget; closing the connections
+	// releases them at once; a second Close does nothing. The Cx client
+	// says goodbye to the HSS tasks (DPR) by the deadline.
+	_ = tr.Close()
+	closeCtx, cancelClose := context.WithDeadline(context.Background(), stopBy)
+	defer cancelClose()
+	closeCx(closeCtx)
 	return nil
+}
+
+// proxyLimits are the bounds of scscf's proxy, as icscf's (#311 code
+// review, option A): its layer's server transaction caps, and as many
+// contexts and bytes for the proxy's own bounds, so that a burst meets the
+// configured count first. Both refusals are counted, the layer's and the
+// proxy's.
+func proxyLimits(cfg ServiceConfig) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
+	tcfg = transaction.Config{MaxServerTransactions: cfg.MaxServerTransactions, MaxServerTransactionBytes: cfg.MaxServerTransactionBytes}
+	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
 }
 
 // runSubscriptionSweeps runs the notifier's sweep every interval until ctx

@@ -3,6 +3,7 @@ package scscf
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
@@ -23,6 +24,7 @@ type dispatcher struct {
 	notifier  *regevent.Notifier
 	router    *routing.Router
 	log       *slog.Logger
+	firsts    firstNotifies
 }
 
 func (d *dispatcher) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
@@ -39,13 +41,55 @@ func (d *dispatcher) Route(ctx context.Context, r *proxy.Request) proxy.Decision
 			if after != nil {
 				// The NOTIFY the SUBSCRIBE set up goes once the 200 is on
 				// its way (RFC 6665 §4.2.1.2), under a context of its own.
-				go after(context.WithoutCancel(ctx))
+				d.firsts.start(func() { after(context.WithoutCancel(ctx)) })
 			}
 		}}
 	case r.Initial():
 		return d.router.Initial(ctx, r)
 	}
 	return d.router.InDialog(ctx, r)
+}
+
+// firstNotifies runs the first NOTIFYs of the SUBSCRIBEs served, each on a
+// goroutine of its own, and lets the stop wait for them. The drain does not:
+// a SUBSCRIBE is done for it once its 200 is written, before its NOTIFY
+// goes, which the closes after the drain would lose (#439 code review).
+type firstNotifies struct {
+	mu      sync.Mutex
+	waiting bool
+	wg      sync.WaitGroup
+}
+
+// start runs a first NOTIFY, counted for wait until wait has begun: a
+// WaitGroup takes no Add once its Wait may be waiting. One started after
+// that, from a request the drain gave up on, is not waited for.
+func (f *firstNotifies) start(run func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.waiting {
+		go run()
+		return
+	}
+	f.wg.Go(run)
+}
+
+// wait waits for the NOTIFYs start ran, until ctx ends, and reports whether
+// they were all done.
+func (f *firstNotifies) wait(ctx context.Context) bool {
+	f.mu.Lock()
+	f.waiting = true
+	f.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		f.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // respond hands res to u, logging only that it could not.

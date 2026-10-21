@@ -143,22 +143,14 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 }
 
 // turn waits for the set's registration before this one, prev, to be done
-// and for one of the server's slots, and takes the slot. It is false, with
-// no slot taken, once StopBy has given up.
+// and takes one of the server's slots. It is false, with no slot taken,
+// once StopBy has given up. The wait is short then: StopBy cuts short the
+// send of whatever holds the turn.
 func (rt *Router) turn(prev, slots chan struct{}) bool {
 	if prev != nil {
-		select {
-		case <-prev:
-		case <-rt.halted.Done():
-			return false
-		}
+		<-prev
 	}
-	select {
-	case slots <- struct{}{}:
-	case <-rt.halted.Done():
-		return false
-	}
-	// Both may have been ready: a stop that gave up sends nothing more.
+	slots <- struct{}{}
 	if rt.halted.Err() != nil {
 		<-slots
 		return false

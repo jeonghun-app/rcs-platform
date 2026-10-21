@@ -116,20 +116,22 @@ On `SIGTERM`, `scscf` keeps its listener open and runs these steps in order:
 1. It drains the requests in progress, for at most `SCSCF_DRAIN_TIMEOUT`.
 2. It stops the sweeps.
 3. It stops the third-party registrations: none starts after this. It waits
-   for those under way and queued, and for the identity repairs, for no
-   longer than the rest of the shutdown, then drops what is left and counts
-   it as `routing.third_party.dropped_at_stop`.
-4. It waits for the NOTIFYs it queued, for no longer than what is still left
-   of the shutdown.
+   for those under way and queued, and for the identity repairs, then drops
+   what is left and counts it as `routing.third_party.dropped_at_stop`.
+4. It waits for the NOTIFYs it queued, and for the first NOTIFY of each
+   SUBSCRIBE it answered.
+5. It closes the transport, disconnects from the HSS tasks (DPR), and closes
+   the proxy.
 
-The rest of the shutdown is `SCSCF_DRAIN_TIMEOUT` plus 5 s from the
-`SIGTERM`, which is within `RCS_SHUTDOWN_TIMEOUT`.
+Steps 3 and 4 end 1 s before the budget does, which is `SCSCF_DRAIN_TIMEOUT`
+plus 5 s from the `SIGTERM`, within `RCS_SHUTDOWN_TIMEOUT`. Step 5 has the
+last second.
 
 An application server that missed a third-party REGISTER at a stop hears of
 the registration at its next refresh. What the stop leaves undone is the other
-tasks' sweeps' to finish. Every end of a
-set is saved before its NOTIFY is queued, and the lease of a deregistration
-cut short is finished by the sweep after it ([docs/scscf-state.md](scscf-state.md)).
+tasks' sweeps' to finish. Every end of a set is saved before its NOTIFY is
+queued, and the lease of a deregistration cut short is finished by the sweep
+after it ([docs/scscf-state.md](scscf-state.md)).
 
 ## AWS permissions
 

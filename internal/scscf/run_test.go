@@ -233,15 +233,13 @@ func startSCSCF(t *testing.T, hss *diameterHSS, store state.Store) *running {
 }
 
 // startSCSCFWith is startSCSCF with seed for its random source, which two
-// instances must not share, and tweak applied to its configuration.
-func startSCSCFWith(t *testing.T, hss *diameterHSS, store state.Store, seed byte, tweak func(*ServiceConfig)) *running {
+// instances must not share, and tweak applied to its configuration and
+// deps.
+func startSCSCFWith(t *testing.T, hss *diameterHSS, store state.Store, seed byte, tweak func(*ServiceConfig, *deps)) *running {
 	t.Helper()
 	h := runtimetest.New(t, "scscf")
 	listening := make(chan netip.AddrPort, 1)
 	cfg := testConfig()
-	if tweak != nil {
-		tweak(&cfg)
-	}
 	d := deps{
 		rand:      newSeededRand(seed),
 		store:     store,
@@ -252,6 +250,9 @@ func startSCSCFWith(t *testing.T, hss *diameterHSS, store state.Store, seed byte
 		},
 		listening: func(a netip.AddrPort) { listening <- a },
 		allow:     func(a netip.Addr) bool { return a.IsLoopback() },
+	}
+	if tweak != nil {
+		tweak(&cfg, &d)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // These tests are #439 QA's probes of the wired service: the Cx push
@@ -277,7 +279,7 @@ func TestAnRTREndsTheRegistrationOnceWired(t *testing.T) {
 func TestAStopLeavesNOTIFYsToAPCSCFThatDoesNotAnswer(t *testing.T) {
 	hss := startHSS(t)
 	silent := startSilentPeer(t)
-	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig) { c.NotifyTimeout = time.Minute })
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, _ *deps) { c.NotifyTimeout = time.Minute })
 	p := dialSCSCF(t, r)
 	dv := deviceAt(silent.addr, 1)
 	p.registerFully(t, dv, 600)
@@ -310,7 +312,7 @@ func TestAStopGivesUpOnAThirdPartyREGISTERToAServerThatDoesNotAnswer(t *testing.
 	as := startSilentPeer(t)
 	uri := "sip:" + as.addr + ";transport=tcp"
 	hss.asURI.Store(&uri)
-	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig) { c.ThirdPartyTimeout = time.Minute })
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, _ *deps) { c.ThirdPartyTimeout = time.Minute })
 	p := dialSCSCF(t, r)
 	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
 	waitFor(t, "third-party REGISTER at the server", func() bool { return as.got.Load() > 0 })
@@ -350,5 +352,219 @@ func TestAChallengeOnOneInstanceIsAnsweredOnAnother(t *testing.T) {
 				t.Errorf("%d Service-Routes", got)
 			}
 		})
+	}
+}
+
+// holdingCore is a P-CSCF core listener that answers each request 200
+// once release is closed, and records whether the S-CSCF was still
+// connected to hss when it answered.
+type holdingCore struct {
+	ln      net.Listener
+	got     chan *sip.Request
+	release chan struct{}
+	hssUp   atomic.Bool
+}
+
+func startHoldingCore(t *testing.T, hss *diameterHSS) *holdingCore {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	p := &holdingCore{ln: ln, got: make(chan *sip.Request, 16), release: make(chan struct{})}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				r := sip.NewReader(bufio.NewReader(c), sip.Limits{})
+				for {
+					m, err := r.ReadMessage()
+					if err != nil {
+						return
+					}
+					req, ok := m.(*sip.Request)
+					if !ok {
+						continue
+					}
+					p.got <- req
+					<-p.release
+					p.hssUp.Store(hss.connected())
+					res, err := sip.NewResponse(req, 200, "", "pcscf1")
+					if err != nil {
+						return
+					}
+					b, err := res.Bytes()
+					if err != nil {
+						return
+					}
+					_, _ = c.Write(b)
+				}
+			}()
+		}
+	}()
+	return p
+}
+
+// connected reports whether an S-CSCF is connected to the HSS.
+func (h *diameterHSS) connected() bool {
+	for _, p := range h.node.Peers() {
+		if p.Available() {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAStopAnswersItsWorkBeforeItClosesTheTransportAndTheCxClient (#439
+// code review): a stop with a SUBSCRIBE's first NOTIFY at a P-CSCF that
+// holds its answer waits for the answer, which still comes over the open
+// transport, with the HSS still connected, and only then closes the
+// transport and says goodbye to the HSS.
+func TestAStopAnswersItsWorkBeforeItClosesTheTransportAndTheCxClient(t *testing.T) {
+	hss := startHSS(t)
+	core := startHoldingCore(t, hss)
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, _ *deps) { c.NotifyTimeout = 30 * time.Second })
+	p := dialSCSCF(t, r)
+	dv := deviceAt(core.ln.Addr().String(), 1)
+	p.registerFully(t, dv, 600)
+	p.subscribeReg(t, dv.path, core.ln.Addr().String(), "sub-order")
+	if n := recv(t, core.got); n.Method != "NOTIFY" {
+		t.Fatalf("the P-CSCF got a %s", n.Method)
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- r.stop() }()
+	// Long enough for a stop that did not wait to have closed what it
+	// closes; the stop that waits has its budget, over five seconds.
+	time.Sleep(500 * time.Millisecond)
+	close(core.release)
+	if err := recv(t, stopped); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.h.Metric("regevent.notified"); got != 1 {
+		t.Errorf("%v NOTIFYs answered, want the held one, its answer over the open transport", got)
+	}
+	if !core.hssUp.Load() {
+		t.Error("the Cx client closed before the NOTIFY was answered")
+	}
+	waitFor(t, "goodbye to the HSS", func() bool { return !hss.connected() })
+}
+
+// slowReads is the memory store, whose registration reads take delay once
+// it is set, as DynamoDB's may.
+type slowReads struct {
+	*state.Memory
+	delay atomic.Int64
+}
+
+func (s *slowReads) Registration(ctx context.Context, k state.SetKey) (*state.Registration, error) {
+	time.Sleep(time.Duration(s.delay.Load()))
+	return s.Memory.Registration(ctx, k)
+}
+
+// TestAStopRightAfterASUBSCRIBEStillSendsItsFirstNOTIFY (#439 code
+// review): the SUBSCRIBE is done for the drain once its 200 is written, and
+// its NOTIFY, which reads the set again first, goes after; the stop waits
+// for it.
+func TestAStopRightAfterASUBSCRIBEStillSendsItsFirstNOTIFY(t *testing.T) {
+	hss := startHSS(t)
+	core := startPCSCFCore(t)
+	store := &slowReads{Memory: state.NewMemory()}
+	r := startSCSCF(t, hss, store)
+	p := dialSCSCF(t, r)
+	dv := deviceAt(core.ln.Addr().String(), 1)
+	p.registerFully(t, dv, 600)
+	store.delay.Store(int64(300 * time.Millisecond))
+	p.subscribeReg(t, dv.path, core.ln.Addr().String(), "sub-at-stop")
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-core.got:
+		if n.Method != "NOTIFY" {
+			t.Errorf("the P-CSCF got a %s", n.Method)
+		}
+	default:
+		t.Error("the stop returned before the SUBSCRIBE's first NOTIFY went")
+	}
+}
+
+// TestTheProxyAllowsAsManyContextsAsServerTransactions: as icscf's (#311
+// code review), so that a burst meets the configured count first.
+func TestTheProxyAllowsAsManyContextsAsServerTransactions(t *testing.T) {
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 30000, MaxServerTransactionBytes: 1 << 30})
+	if tcfg.MaxServerTransactions != 30000 || tcfg.MaxServerTransactionBytes != 1<<30 || contexts != 30000 || bytes != 1<<30 {
+		t.Fatalf("limits = %+v, %d contexts, %d bytes", tcfg, contexts, bytes)
+	}
+}
+
+// recv is the next value of ch, or fails the test.
+func recv[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(stopWait):
+		t.Fatal("nothing came")
+	}
+	panic("unreachable")
+}
+
+// TestAStopDoesNotWaitOnAPeerThatStoppedReading (#439 code review, after
+// pcscf's for #366): a core peer that stops reading while the S-CSCF
+// answers it does not hold the stop, nor fail a write on its deadline,
+// which is long here so that filling the queue on a loaded host cannot
+// trip it. The answers come from the proxy's goroutines, so they overflow
+// the connection's queue, and the transport closes the connection; the
+// transport also closes before the proxy at the stop, as pcscf's does.
+func TestAStopDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
+	const writeTimeout = time.Minute
+	var tr *transport.Transport
+	r := startSCSCFWith(t, startHSS(t), state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.writeTimeout = writeTimeout
+		d.transportMade = func(made *transport.Transport) { tr = made }
+	})
+	c, err := net.DialTimeout("tcp", r.core.String(), realWait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(4096)
+	}
+	// Each request is in a dialog the S-CSCF never signed a route for, which
+	// the router refuses 403 at once, from a goroutine the proxy's Close
+	// waits for; its long Via makes the answer large. They are sent until
+	// the stop closes the connection, so the queue stays full.
+	pad := strings.Repeat("z", 3000)
+	_ = c.SetWriteDeadline(time.Now().Add(writeTimeout))
+	go func() {
+		for i := 0; ; i++ {
+			text := strings.Join([]string{
+				"MESSAGE sip:ue1@192.0.2.11:5060;transport=tcp SIP/2.0",
+				fmt.Sprintf("Via: SIP/2.0/TCP 127.0.0.1:5070;branch=z9hG4bK-stall%d;p=%s", i, pad),
+				"Max-Forwards: 69",
+				"From: <" + impu + ">;tag=stall", "To: <" + impu + ">;tag=dialog",
+				fmt.Sprintf("Call-ID: stall-%d", i), "CSeq: 1 MESSAGE", "Content-Length: 0",
+			}, "\r\n") + "\r\n\r\n"
+			if _, err := io.WriteString(c, text); err != nil {
+				return
+			}
+		}
+	}()
+	full := int64(transport.DefaultSendQueueBytes - 64<<10)
+	waitFor(t, "full send queue", func() bool { return int64(tr.Stats().QueuedBytes) >= full })
+	failed := tr.Stats().WriteErrors
+	start := time.Now()
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	checkStopTook(t, time.Since(start))
+	if n := tr.Stats().WriteErrors - failed; n != 0 {
+		t.Errorf("%d writes to the peer failed on their deadline during the stop, which waited for them", n)
 	}
 }

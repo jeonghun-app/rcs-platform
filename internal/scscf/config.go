@@ -57,6 +57,9 @@ const (
 	// notifier's queues, the Cx client and the transport, inside
 	// RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
+	// closeMargin is the end of stopMargin kept for the closes: the
+	// transport's, the proxy's and the Cx client's goodbye to the HSS.
+	closeMargin = time.Second
 	// coreDialTimeout bounds opening a connection to a P-CSCF, an
 	// application server or the I-CSCF: inside the VPC, where a stopped
 	// task drops the SYN, as icscf's.
