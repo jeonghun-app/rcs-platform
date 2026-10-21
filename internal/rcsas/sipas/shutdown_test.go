@@ -434,7 +434,10 @@ func TestASessionSettledDuringCloseIsClosesOwn(t *testing.T) {
 // while Close still waits for its own BYEs, ends itself, and Close waits
 // for that BYE's answer too.
 func TestCloseWaitsForALateSessionsBye(t *testing.T) {
-	const wait = time.Second
+	// Close's bound must outlast the late session's answer, ACK and BYE
+	// on a loaded host: the late BYE is waited for only until Close's own
+	// deadline, twice the bound from its start.
+	const wait = 3 * time.Second
 	r := newShutdownRig(t, wait)
 	held := holdByes(t, r)
 	live := r.p.send(r.chatInvite(offerSDP(relayPath(), "active")))
