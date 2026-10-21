@@ -44,6 +44,7 @@ func testConfig() Config {
 		Namespace: "rcs.internal", HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org", VisitedNetworkID: "ims.mnc001.mcc001.3gppnetwork.org",
 		MaxConnections: DefaultMaxConnections, MaxClientFlows: DefaultMaxClientFlows, CoreConnections: DefaultCoreConnections,
 		MaxBindingsPerFlow: DefaultMaxBindingsPerFlow, MaxBindings: DefaultMaxBindings, BindingsPerMinute: DefaultBindingsPerMinute,
+		MaxCoreOfferBindingsPerFlow: DefaultMaxCoreOfferBindingsPerFlow, CoreOfferBindingsPerMinute: DefaultCoreOfferBindingsPerMinute,
 	}
 }
 

@@ -1041,3 +1041,42 @@ func testRefusedSaveKeepsAGoneProfileGone(t *testing.T, a, b state.Store, _ Opti
 	_, err := a.Profile(ctx(t), Set1, T0.Add(3*time.Hour))
 	wantErr(t, err, state.ErrNotFound)
 }
+
+// testRejectedLease: a deregistration's lease marked Rejected reads back
+// with the mark, and keeps it through a sweep's claim, on every backend;
+// a record no deregistration holds, with bindings or an unregistered
+// user's without, cannot have it (#334).
+func testRejectedLease(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1)
+	r.Deregistering, r.Rejected = T0.Add(-time.Second), true
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if got := must(b.Registration(ctx(t), Key1(IMPU1)))(t); !got.Rejected {
+		t.Fatalf("read back %+v", got)
+	}
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), T0, 10))(t)) == 1
+	})
+	handled := 0
+	if _, err := state.SweepRegistrations(ctx(t), b, T0, 10, func(before, after *state.Registration) error {
+		handled++
+		if !before.Rejected || !after.Rejected {
+			t.Errorf("the claim lost the mark: before %v, after %v", before.Rejected, after.Rejected)
+		}
+		return errors.New("SAR failed")
+	}); handled != 1 {
+		t.Fatalf("handled %d, %v", handled, err)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); !got.Rejected {
+		t.Error("the claimed lease lost the mark")
+	}
+	live := Registration(IMPI2, IMPU2, time.Hour)
+	live.Rejected = true
+	_, err := a.SaveRegistration(ctx(t), live)
+	wantErr(t, err, state.ErrInvalid)
+	// Keyed on the lease, not on the bindings: an unregistered user's
+	// record has none, and no lease (QA on #351).
+	unreg := Registration(IMPI2, IMPU2)
+	unreg.Unregistered, unreg.Rejected = T0.Add(time.Hour), true
+	_, err = a.SaveRegistration(ctx(t), unreg)
+	wantErr(t, err, state.ErrInvalid)
+}

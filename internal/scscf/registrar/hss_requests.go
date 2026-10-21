@@ -128,6 +128,8 @@ func (g *Registrar) endSetNow(ctx context.Context, k state.SetKey, unregisteredO
 			g.internal("ending a set's subscriptions for an RTR", err)
 			lease := reg.Clone()
 			lease.Contacts, lease.Deregistering = nil, now.Add(state.SweepLease)
+			// The sweep's own Ended says why the set ended.
+			lease.Rejected = cause == regevent.Rejected
 			if _, err := g.cfg.Store.SaveRegistration(ctx, lease); err != nil {
 				if errors.Is(err, state.ErrConflict) {
 					continue

@@ -635,12 +635,22 @@ func (p *Proxy) receiveCancel(tx *transaction.ServerTransaction) {
 		p.reply(tx, 481)
 		return
 	}
-	p.reply(tx, 200)
 	p.mu.Lock()
 	c := p.contexts[invite]
 	p.mu.Unlock()
+	// The request counts as cancelled before its CANCEL is answered, so
+	// that no branch whose Prepare or Resolver is still running is sent
+	// once the client has the 200 (#361). What the CANCEL sets going here
+	// follows the 200; but such a branch, ending unsent meanwhile, may
+	// have the INVITE's 487 written before the 200, which RFC 3261 leaves
+	// unordered, the two being different transactions.
+	var then func()
 	if c != nil {
-		c.cancelUpstream()
+		then = c.cancelUpstream()
+	}
+	p.reply(tx, 200)
+	if then != nil {
+		then()
 	}
 }
 

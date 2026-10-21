@@ -220,11 +220,12 @@ const writeChunk = 32 << 10
 
 // socketSendBuffer caps the kernel's send buffer of every stream socket. Linux
 // grows it to several MiB by itself, which is memory the queue budget cannot
-// see, and reports a full socket writable again only once a large part of it
-// has drained; with a slow reader that wait alone could exceed WriteTimeout. A
-// small buffer keeps waiting output in the accounted queue and makes the write
-// deadline mean "no progress". 128 KiB per round trip is far more than SIP needs
-// inside a VPC or across the internet.
+// see; capped, waiting output stays in the accounted queue. Linux doubles the
+// value for its own bookkeeping and reports a full socket writable again only
+// once about a third of it has drained, so this and the peer's receive buffer
+// set how much the peer must read before a chunk write returns (see writeAll).
+// 128 KiB per round trip is far more than SIP needs inside a VPC or across the
+// internet.
 const socketSendBuffer = 128 << 10
 
 // capSendBuffer applies socketSendBuffer to a TCP connection; other connections,
@@ -235,10 +236,24 @@ func capSendBuffer(c net.Conn) {
 	}
 }
 
-// writeAll writes b in chunks, each with its own deadline, so WriteTimeout
-// measures how long the peer goes without taking any data rather than how long a
-// whole message takes. A peer reading slowly but steadily keeps its connection;
-// one that stops reading loses it after WriteTimeout.
+// writeAll writes b in chunks of writeChunk, each with its own WriteTimeout
+// deadline, so the deadline bounds one chunk rather than a whole message. A
+// chunk write returns only once the kernel has taken all of it, so the deadline
+// is a throughput floor, not a pause length: once the send buffer
+// (socketSendBuffer) and the peer's receive buffer are full, the peer must read
+// about 200 KiB within WriteTimeout to keep its connection. Measured on loopback
+// with the default 10 s (#329), a peer reading 16 KiB every 500 ms (32 KiB/s)
+// kept it, one every 700 ms (23 KiB/s) was at the edge, and one every second
+// (16 KiB/s) was cut within about 15 to 30 s, depending on how full the
+// buffers were when it fell behind. A peer that stops reading is cut after
+// WriteTimeout.
+//
+// The floor is meant for SIP, the only thing this transport carries (MSRP media
+// has its own relay transport): a backlog that size, drained slower than that,
+// holds messages already more than WriteTimeout late. Writing on after a
+// timeout that took part of a chunk would lower the floor only about threefold,
+// since the kernel wakes a writer in steps of a third of its buffer, and would
+// let a peer that trickles keep its share of the queue budget for longer.
 func (t *Transport) writeAll(f *flow, b []byte) error {
 	for len(b) > 0 {
 		n := min(len(b), writeChunk)
@@ -255,9 +270,9 @@ func (t *Transport) writeAll(f *flow, b []byte) error {
 }
 
 // writeLoop writes a stream flow's queue until the flow closes. A write that
-// fails, or makes no progress for WriteTimeout, closes the connection, since part
-// of a message may have been sent and the peer could not find the start of the
-// next.
+// fails, or does not get a chunk out within WriteTimeout (writeAll), closes the
+// connection, since part of a message may have been sent and the peer could not
+// find the start of the next.
 func (t *Transport) writeLoop(f *flow) {
 	defer t.wg.Done()
 	for range f.q.wake {

@@ -344,7 +344,11 @@ func TestMeteredConnCountsAndReportsIdleness(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 	m := newCounters()
-	c := &meteredConn{Conn: a, idle: 10 * time.Millisecond, in: &m.bytesIn, out: &m.bytesOut}
+	// The read and the write that carry octets get an idle time no host
+	// reaches, so they wait on the other end, however late it is
+	// scheduled; only the read meant to time out gets a short one (#180:
+	// the first read once timed out at 10 ms, before the writer ran).
+	c := &meteredConn{Conn: a, idle: time.Hour, in: &m.bytesIn, out: &m.bytesOut}
 	go func() { _, _ = b.Write([]byte("abc")); _, _ = io.ReadAll(b) }()
 	buf := make([]byte, 8)
 	if n, err := c.Read(buf); n != 3 || err != nil {
@@ -353,8 +357,19 @@ func TestMeteredConnCountsAndReportsIdleness(t *testing.T) {
 	if _, err := c.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Read(buf); !errors.Is(err, errIdle) || !c.idled.Load() {
-		t.Fatalf("Read after the idle time = %v", err)
+	if c.idled.Load() {
+		t.Fatal("idle before the idle time")
+	}
+	c.idle = 10 * time.Millisecond
+	read := make(chan error, 1)
+	go func() { _, err := c.Read(buf); read <- err }()
+	select {
+	case err := <-read:
+		if !errors.Is(err, errIdle) || !c.idled.Load() {
+			t.Fatalf("Read after the idle time = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a Read with nothing coming did not end at the idle time")
 	}
 	if m.bytesIn.Load() != 3 || m.bytesOut.Load() != 5 {
 		t.Fatalf("in %d out %d", m.bytesIn.Load(), m.bytesOut.Load())

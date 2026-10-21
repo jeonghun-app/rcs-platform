@@ -86,8 +86,9 @@ func TestAGroupMessageIsQueuedOncePerOtherParticipant(t *testing.T) {
 		t.Fatalf("Sent = %+v, %v", sent, err)
 	}
 	// Never pager mode: nobody has a session, so the engine asks for one.
+	// It names the author as who brings the recipient back (Referred-By).
 	inv := r.d.nextInvite(t)
-	if inv.Peer != groupURI || inv.Mode != store.Group {
+	if inv.Peer != groupURI || inv.Mode != store.Group || inv.Referrer != alice {
 		t.Fatalf("invitation %+v", inv)
 	}
 	waitFor(t, "idle", r.idle)
@@ -645,5 +646,89 @@ func TestAGroupSenderIsNamedInCanonicalForm(t *testing.T) {
 	}
 	if got := rejected(r.e.SubmitGroup(t.Context(), groupFrom("not a URI", chat(t, "m2", "hi", 0)))); got != ReasonNotParticipant {
 		t.Fatalf("a sender that is no URI: %q", got)
+	}
+}
+
+// The SIP layer invites a new group's participants through Invite, which
+// keeps the engine's own count: once for each, and a message queued for
+// one meanwhile waits for that session rather than ringing its client a
+// second time (#137).
+func TestInviteAsksOnceForAParticipantsSession(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	inv := Invitation{Recipient: bob, Peer: groupURI, Conversation: conv, Mode: store.Group}
+	r.e.Invite(t.Context(), inv)
+	r.e.Invite(t.Context(), inv)
+	if got := r.d.nextInvite(t); got != inv {
+		t.Fatalf("invitation %+v", got)
+	}
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 {
+		t.Fatalf("%d more invitations", n)
+	}
+	// A recipient that takes no sessions from the network is not rung.
+	r.e.InviteFailed(Invitation{Recipient: alice, Peer: bob, Mode: store.Chat}, ErrNoSessions)
+	r.e.Invite(t.Context(), Invitation{Recipient: alice, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 {
+		t.Fatalf("%d invitations to a pager-only recipient", n)
+	}
+}
+
+// A group's invitation that will never reach its recipient
+// (ErrUndeliverable: an address that does not exist, or one that comes
+// back to rcs-as) gives up the copies queued for it from the group, rather
+// than keeping them, and inviting again, for StoreTTL (security review on
+// #279). Being added again lifts that.
+func TestAnUndeliverableGroupInvitationGivesTheCopiesUp(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.d.onInvite(func(inv Invitation) error {
+		if inv.Recipient == bob {
+			return ErrUndeliverable
+		}
+		return nil
+	})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "bob's copy given up", func() bool { return r.store.(*store.Memory).Len(bob) == 0 })
+	if n := r.m.get("delivery.undeliverable"); n != 1 {
+		t.Fatalf("%d given up", n)
+	}
+	r.e.ParticipantAdded(groupURI, bob)
+	r.d.onInvite(func(Invitation) error { return nil })
+	r.clock.Advance(r.e.cfg.InviteTimeout)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m2", "again", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := r.store.(*store.Memory).Len(bob); n != 1 {
+		t.Fatalf("bob's queue holds %d after he was added again", n)
+	}
+}
+
+// QA on #279: a participant the group's invitation found unreachable
+// that opens a session with the group itself is reachable again: once
+// that session has ended, its next copy waits for it, rather than being
+// given up.
+func TestAParticipantsOwnSessionLiftsTheUnreachableMark(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.InviteFailed(Invitation{Recipient: bob, Peer: groupURI, Mode: store.Group}, ErrUndeliverable)
+	l := r.listen(t)
+	leg, _ := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	_ = leg.Close()
+	waitFor(t, "bob's leg gone", func() bool { return r.e.chatLeg(bob, groupURI) == nil })
+	r.clock.Advance(r.e.cfg.InviteTimeout)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := r.store.(*store.Memory).Len(bob); n != 1 || r.m.get("delivery.undeliverable") != 0 {
+		t.Fatalf("bob's queue holds %d, %d given up", n, r.m.get("delivery.undeliverable"))
 	}
 }

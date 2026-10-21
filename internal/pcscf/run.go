@@ -149,7 +149,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken.v, cfg.RelayTimeout, relayDialer(cfg))
 	}
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
-	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now))
+	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).
+		coreOfferShare(cfg.MaxCoreOfferBindingsPerFlow, cfg.CoreOfferBindingsPerMinute))
 	defer pc.msrp.close()
 	defer stopAnchor()
 	// A closed flow's registrations and MSRP sessions are gone (RFC 5626
