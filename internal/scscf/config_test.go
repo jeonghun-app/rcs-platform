@@ -192,8 +192,26 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 	}
 	var logged bytes.Buffer
 	slog.New(slog.NewJSONHandler(&logged, nil)).Info("config", "config", c)
-	for _, out := range []string{fmt.Sprint(c), fmt.Sprintf("%v %+v %#v %s", c, c, c, c), string(j), logged.String()} {
-		for _, secret := range []string{"0123456789abcdef", "fedcba9876543210", "abcdefghijklmnop", nonceKey, dialogKey, challengeKey} {
+	keys, err := json.Marshal(c.ChallengeKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loggedKeys bytes.Buffer
+	slog.New(slog.NewJSONHandler(&loggedKeys, nil)).Info("keys", "challenge", c.ChallengeKeys, "dialog", c.DialogKeys,
+		"one challenge key", c.ChallengeKeys[0], "one dialog key", c.DialogKeys[0])
+	for _, out := range []string{
+		fmt.Sprint(c), fmt.Sprintf("%v %+v %#v %s %d %o %b %t %x", c, c, c, c, c, c, c, c, c), string(j), logged.String(),
+		// The key slices on their own.
+		fmt.Sprintf("%v %+v %#v %s %d %x", c.ChallengeKeys, c.ChallengeKeys, c.ChallengeKeys, c.ChallengeKeys, c.ChallengeKeys, c.ChallengeKeys),
+		fmt.Sprintf("%v %+v %#v %s %d %x", c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys),
+		string(keys), loggedKeys.String(),
+	} {
+		for _, secret := range []string{
+			"0123456789abcdef", "fedcba9876543210", "abcdefghijklmnop", nonceKey, dialogKey, challengeKey,
+			// %d and %x of the nonce, challenge and dialog keys' bytes.
+			"48 49 50 51 52", "97 98 99 100 101", "102 101 100 99 98",
+			fmt.Sprintf("%x", []byte("01234567")), fmt.Sprintf("%x", []byte("abcdefgh")), fmt.Sprintf("%x", []byte("fedcba98")),
+		} {
 			if strings.Contains(out, secret) {
 				t.Errorf("%q gives a key away", out)
 			}

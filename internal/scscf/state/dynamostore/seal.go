@@ -3,9 +3,11 @@ package dynamostore
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
@@ -22,6 +24,18 @@ type ChallengeKey struct {
 	ID  string
 	Key []byte
 }
+
+// redacted is what a ChallengeKey prints as: its ID, never its key.
+func (k ChallengeKey) redacted() string { return "ChallengeKey{ID:" + k.ID + " Key:[redacted]}" }
+
+// String, GoString, Format, LogValue and MarshalJSON print the key's ID
+// alone, as routing.DialogKey's do, so that a Config logged or printed does
+// not give the key away (#439 security review).
+func (k ChallengeKey) String() string               { return k.redacted() }
+func (k ChallengeKey) GoString() string             { return k.redacted() }
+func (k ChallengeKey) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, k.redacted()) }
+func (k ChallengeKey) LogValue() slog.Value         { return slog.StringValue(k.redacted()) }
+func (k ChallengeKey) MarshalJSON() ([]byte, error) { return json.Marshal(k.redacted()) }
 
 // sealer seals challenge documents with AES-256-GCM under the seal key and
 // opens them with any key it knows. A sealed document is the length of the

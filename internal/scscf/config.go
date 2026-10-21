@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -130,17 +132,15 @@ type ServiceConfig struct {
 	MaxServerTransactionBytes int64
 }
 
-// Secrets in ServiceConfig print as "[redacted]": the keys are
-// []byte fields of types that redact themselves, and NonceKey is written
-// out by String.
+// A ServiceConfig prints as a placeholder, whatever the verb, under fmt,
+// log/slog and encoding/json: it holds NonceKey, the dialog keys and the
+// challenge keys, which must never reach an output. The key types redact
+// themselves too, for when one is printed on its own.
 func (c ServiceConfig) String() string { return "scscf.ServiceConfig{[redacted]}" }
 
-// GoString is String, so that %#v gives no key away either.
-func (c ServiceConfig) GoString() string { return c.String() }
-
-// LogValue and MarshalJSON are String, for log/slog and encoding/json.
-func (c ServiceConfig) LogValue() slog.Value { return slog.StringValue(c.String()) }
-
+func (c ServiceConfig) GoString() string             { return c.String() }
+func (c ServiceConfig) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, c.String()) }
+func (c ServiceConfig) LogValue() slog.Value         { return slog.StringValue(c.String()) }
 func (c ServiceConfig) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
 // interfaceAddrs finds this task's addresses; tests replace it.
