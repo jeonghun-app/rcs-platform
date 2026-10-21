@@ -48,11 +48,18 @@ const (
 	DefaultMaxPerSet = 16
 )
 
-// pendingEnd is how far ahead the expiry of a subscription is set when it is
-// terminated before its final NOTIFY is queued: if the queue drops the
+// pendingMargin is how much longer than a NOTIFY's transaction
+// (NotifyTimeout) the expiry of a subscription is set ahead when it is
+// terminated before its final NOTIFY is queued (pendingEnd): the time the
+// NOTIFY may wait in the queue.
+const pendingMargin = 5 * time.Second
+
+// pendingEnd is how far ahead that expiry is: if the queue drops the
 // NOTIFY, or the instance stops, the next sweep after it sends it
-// (state.SweepSubscriptions), within seconds of the subscription's end.
-const pendingEnd = 5 * time.Second
+// (state.SweepSubscriptions), within seconds of the subscription's end;
+// but never while this instance's send may still be waiting for its
+// answer, or the same final would go out twice at once (#336).
+func (n *Notifier) pendingEnd() time.Duration { return n.cfg.NotifyTimeout + pendingMargin }
 
 // storeRetryAfter is the Retry-After of a 500 for a store failure, in
 // seconds: DynamoDB throttling and timeouts pass within seconds.

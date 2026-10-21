@@ -132,7 +132,7 @@ func (n *Notifier) Ended(ctx context.Context, before *state.Registration, cause 
 				n.enqueueNotify(ctx, sub, job{}, nil)
 				continue
 			}
-			ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(pendingEnd), j.reason, true)
+			ended, err := n.terminate(ctx, sub, n.cfg.Now().Add(n.pendingEnd()), j.reason, true)
 			if err != nil {
 				errs = errors.Join(errs, err)
 				continue
@@ -326,7 +326,7 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 	if j.final && !j.first && !sub.Terminated {
 		// Saved first, so that a stop from here on leaves the end to a
 		// sweep (SweepSubscriptions).
-		ended, err := n.terminate(ctx, sub, now.Add(pendingEnd), j.reason, j.ended)
+		ended, err := n.terminate(ctx, sub, now.Add(n.pendingEnd()), j.reason, j.ended)
 		if err != nil {
 			n.internalLog("terminating a subscription", err)
 			return nil
@@ -392,8 +392,9 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 
 // maxFinalSends bounds how often a final NOTIFY is sent without an answer,
 // and finalBackoff is the wait before the second send, doubled for each
-// after it: about five minutes in all, the time a P-CSCF task takes to be
-// replaced.
+// after it: the last send about 2 min 30 s after the first (0, 10 s, 30 s,
+// 1 min 10 s, 2 min 30 s, plus the time each unanswered send waits), about
+// the time a P-CSCF task takes to be replaced.
 const (
 	maxFinalSends = 5
 	finalBackoff  = 10 * time.Second

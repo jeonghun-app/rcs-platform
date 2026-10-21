@@ -2,6 +2,7 @@ package regevent
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -191,5 +192,102 @@ func TestAnEndOfASetRegisteredAgainHasNoBody(t *testing.T) {
 	}
 	if ss, _ := got[0].Header.SubscriptionState(); ss.State != "terminated" || ss.Reason() != "deactivated" || len(got[0].Body) != 0 {
 		t.Errorf("the end: %+v with %d bytes of body", ss, len(got[0].Body))
+	}
+}
+
+// timedSender answers every NOTIFY 500 at once and records when, by the
+// test's clock, each was sent.
+type timedSender struct {
+	mu  sync.Mutex
+	now func() time.Time
+	at  []time.Time
+}
+
+func (s *timedSender) Send(_ context.Context, req *sip.Request) (*sip.Response, error) {
+	s.mu.Lock()
+	s.at = append(s.at, s.now())
+	s.mu.Unlock()
+	return sip.NewResponse(req, 500, "", "s")
+}
+
+// TestAnUnansweredFinalIsSentAgainLaterEachTime (#336): at 0, 10 s, 30 s,
+// 1 min 10 s and 2 min 30 s after the first send, when each fails at once.
+func TestAnUnansweredFinalIsSentAgainLaterEachTime(t *testing.T) {
+	e := newEnv(t)
+	before := e.registered(binding(1, time.Hour))
+	e.subscribed(e.notifier(1))
+	s := &timedSender{now: e.clock.Now}
+	n := newNotifierWith(t, e, e.store, s)
+	start := e.clock.Now()
+	if err := n.Ended(bg, before, Rejected); err != nil {
+		t.Fatal(err)
+	}
+	n.Wait()
+	for range 300 {
+		e.clock.advance(time.Second)
+		_, _ = n.Sweep(bg, 10)
+		n.Wait()
+	}
+	var got []time.Duration
+	for _, at := range s.at {
+		got = append(got, at.Sub(start))
+	}
+	want := []time.Duration{0, 10 * time.Second, 30 * time.Second, 70 * time.Second, 150 * time.Second}
+	if !slices.Equal(got, want) {
+		t.Errorf("sent at %v, want %v", got, want)
+	}
+}
+
+// heldSender holds every NOTIFY until release is closed, then fails it,
+// and counts the sends in flight at once.
+type heldSender struct {
+	mu      sync.Mutex
+	release chan struct{}
+	sent    chan struct{}
+	busy    int
+	most    int
+	n       int
+}
+
+func (s *heldSender) Send(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+	s.mu.Lock()
+	s.n++
+	s.busy++
+	s.most = max(s.most, s.busy)
+	s.mu.Unlock()
+	s.sent <- struct{}{}
+	defer func() { s.mu.Lock(); s.busy--; s.mu.Unlock() }()
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+	}
+	return nil, transport.ErrQueueFull
+}
+
+// TestAFinalIsNotSentAgainWhileItsFirstSendWaits (#336): another instance's
+// sweep leaves alone the final whose send may still be waiting for its
+// answer, for as long as NotifyTimeout, and takes it over only after.
+func TestAFinalIsNotSentAgainWhileItsFirstSendWaits(t *testing.T) {
+	e := newEnv(t)
+	before := e.registered(binding(1, time.Hour))
+	e.subscribed(e.notifier(1))
+	s := &heldSender{release: make(chan struct{}), sent: make(chan struct{}, 4)}
+	a := newNotifierWith(t, e, e.store, s)
+	b := newNotifierWith(t, e, e.store, s)
+	if err := a.Ended(bg, before, Rejected); err != nil {
+		t.Fatal(err)
+	}
+	<-s.sent
+	e.clock.advance(DefaultNotifyTimeout)
+	if _, err := b.Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	b.Wait()
+	close(s.release)
+	a.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.n != 1 || s.most != 1 {
+		t.Errorf("%d sends, %d at once, while the first could still be answered", s.n, s.most)
 	}
 }
