@@ -61,14 +61,14 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	imageShare.headers = append(slices.Clone(msrpOnly.headers),
 		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + `>;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`},
 		ifc.HeaderField{Name: "Accept-Contact", Value: `*;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`},
-		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.iari-ref"},
-		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.iari-ref"})
+		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.iari-ref=urn:urn-7:3gpp-application.ims.iari.gsma-is"},
+		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.iari-ref=urn:urn-7:3gpp-application.ims.iari.gsma-is"})
 	imageShare.sdp = []string{"v=0", "m=message 9 TCP/MSRP *", "a=accept-types:image/jpeg", "a=file-selector:type:image/jpeg"}
 	// So does a call that names its ICSI only in its Contact.
 	mmtel := msrpOnly
 	mmtel.headers = append(slices.Clone(msrpOnly.headers),
 		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + `>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`},
-		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.icsi-ref"})
+		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.icsi-ref=urn:urn-7:3gpp-service.ims.icsi.mmtel"})
 	for name, c := range map[string]struct {
 		req  ifc.Request
 		want []int

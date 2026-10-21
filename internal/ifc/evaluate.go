@@ -143,12 +143,15 @@ type HeaderField struct {
 }
 
 // FeatureTagField names the header fields the S-CSCF adds to a request it
-// evaluates: one per feature tag (RFC 3840 §9) that an Accept-Contact or
-// Contact value carries as a parameter, its name in lower case. A criterion
-// can then tell a feature tag from the same text in a URI, a display name
-// or another parameter's value. No SIP header field has this name: a field
-// name is a token, which has no space (RFC 3261 §25.1), so no request can
-// carry one of its own.
+// evaluates, for each feature tag (RFC 3840 §9) that an Accept-Contact or
+// Contact value carries as a parameter: its name in lower case, as
+// "+g.oma.sip-im", or for each value of a quoted one, "name=value", the
+// value percent-decoded and in lower case, as
+// "+g.3gpp.iari-ref=urn:urn-7:3gpp-application.ims.iari.gsma-is". A
+// criterion can then tell a feature tag from the same text in a URI, a
+// display name or another parameter's value. No SIP header field has this
+// name: a field name is a token, which has no space (RFC 3261 §25.1), so
+// no request can carry one of its own.
 const FeatureTagField = "Feature tag"
 
 // Context is what the S-CSCF knows about a request besides its content.

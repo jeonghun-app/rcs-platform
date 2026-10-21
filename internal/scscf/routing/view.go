@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"mime/multipart"
+	"net/url"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -152,11 +153,11 @@ var baseTags = map[string]bool{
 	"priority": true, "schemes": true, "text": true, "type": true, "video": true,
 }
 
-// featureTagsOf are the names of the feature tags of el, an element of the
-// field name, Accept-Contact or Contact, in lower case, parsed as caller
-// preferences parse them (prefs.go): parameters of the element, not of its
-// URI, and not its display name or another parameter's value. An element
-// that does not parse has none (#359 security review).
+// featureTagsOf are the feature tags of el, an element of the field name,
+// Accept-Contact or Contact, as ifc.FeatureTagField presents them, parsed
+// as caller preferences parse them (prefs.go): parameters of the element,
+// not of its URI, and not its display name or another parameter's value.
+// An element that does not parse has none (#359 security review).
 func featureTagsOf(name, el string) []string {
 	var ps sip.Params
 	switch {
@@ -177,11 +178,28 @@ func featureTagsOf(name, el string) []string {
 	}
 	var out []string
 	for _, p := range ps {
-		if n := strings.ToLower(p.Name); strings.HasPrefix(n, "+") || baseTags[n] {
+		n := strings.ToLower(p.Name)
+		switch {
+		case !strings.HasPrefix(n, "+") && !baseTags[n]:
+		case !p.Quoted || strings.HasPrefix(strings.TrimSpace(p.Value), "<"):
+			// A flag, a token or a string: the name tells enough.
 			out = append(out, n)
+		default:
+			for _, v := range valuesOf(p) {
+				out = append(out, n+"="+decodedToken(v))
+			}
 		}
 	}
 	return out
+}
+
+// decodedToken is v percent-decoded, as an ICSI or IARI is written in a
+// feature tag, and in lower case; as it is if it does not decode.
+func decodedToken(v string) string {
+	if d, err := url.PathUnescape(v); err == nil {
+		v = d
+	}
+	return strings.ToLower(v)
 }
 
 func (v view) SDPLines() []string {

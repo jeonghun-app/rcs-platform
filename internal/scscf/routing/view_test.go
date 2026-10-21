@@ -94,15 +94,16 @@ func TestTheIFCViewSpellsFeatureTagsOneWay(t *testing.T) {
 	}
 }
 
-// TestTheIFCViewNamesEachFeatureTag (#359 security review): one
-// ifc.FeatureTagField per feature-tag parameter of an Accept-Contact or
-// Contact element, in lower case, after the request's own fields; none
+// TestTheIFCViewNamesEachFeatureTag (#359 security review): an
+// ifc.FeatureTagField for each feature-tag parameter of an Accept-Contact
+// or Contact element, a flag by its name, a quoted one by each of its
+// values, decoded, in lower case, after the request's own fields; none
 // for a URI parameter, a display name, another parameter's value, a
 // Reject-Contact or an element that does not parse.
 func TestTheIFCViewNamesEachFeatureTag(t *testing.T) {
 	r := request(t, "INVITE", impu1,
 		`Accept-Contact: *;+G.3GPP.IARI-REF="x";require;explicit, *;audio;+g.example="+g.3gpp.icsi-ref"`,
-		`Contact: "+g.3gpp.icsi-ref" <sip:ue1@192.0.2.11:5060;+g.3gpp.icsi-ref>;+g.oma.sip-im;expires=60`,
+		`Contact: "+g.3gpp.icsi-ref" <sip:ue1@192.0.2.11:5060;+g.3gpp.icsi-ref>;+g.3gpp.iari-ref="URN%3AURN-7%3AA,urn%3aurn-7%3ab";+g.oma.sip-im;expires=60`,
 		`Reject-Contact: *;+g.3gpp.icsi-ref="y"`).Message
 	var got []string
 	fields := (view{req: r}).HeaderFields()
@@ -113,7 +114,7 @@ func TestTheIFCViewNamesEachFeatureTag(t *testing.T) {
 			t.Errorf("field %d, %s, after the feature tags", i, h.Name)
 		}
 	}
-	if want := []string{"+g.3gpp.iari-ref", "audio", "+g.example", "+g.oma.sip-im"}; !slices.Equal(got, want) {
+	if want := []string{"+g.3gpp.iari-ref=x", "audio", "+g.example=+g.3gpp.icsi-ref", "+g.3gpp.iari-ref=urn:urn-7:a", "+g.3gpp.iari-ref=urn:urn-7:b", "+g.oma.sip-im"}; !slices.Equal(got, want) {
 		t.Errorf("feature tags %q, want %q", got, want)
 	}
 }

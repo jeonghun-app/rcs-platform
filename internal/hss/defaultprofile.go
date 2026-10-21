@@ -25,9 +25,9 @@ const (
 	// An MSRP message stream in a session description's m= line, which a
 	// chat's or a file transfer's INVITE offers whatever its feature tags
 	// say (RFC 4975 §8.1): the trigger then holds for a request that names
-	// no service in a feature tag at all (serviceTags), which a client
-	// could otherwise send past rcs-as. One that names another service,
-	// such as image share's IARI, goes on as before. It takes
+	// no known service other than chat (otherService), which a client
+	// could otherwise send past rcs-as by naming none, or one no pattern
+	// expects. One that names image share, say, goes on as before. It takes
 	// the lines sdp.Media.IsMSRP takes, whose media type and protocol
 	// compare without case, so that no spelling of the stream reaches the
 	// callee as MSRP and past rcs-as (#359 security review). An ERE has no
@@ -35,11 +35,14 @@ const (
 	msrpMedia = `^[Mm][Ee][Ss][Ss][Aa][Gg][Ee] [^ ]+ [Tt][Cc][Pp]/([Tt][Ll][Ss]/)?[Mm][Ss][Rr][Pp] `
 )
 
-// serviceTag is a feature tag that names a service (TS 24.229 §7.9.2,
-// RCC.07 §2.6.1), an ICSI or an IARI, as the name of an
-// ifc.FeatureTagField: a parameter of Accept-Contact or Contact, not the
-// same text anywhere else in them (#359 security review).
-const serviceTag = `^\+g\.3gpp\.(icsi|iari)-ref$`
+// otherService is a feature tag, as an ifc.FeatureTagField presents it,
+// that names a service other than chat which offers an MSRP stream or
+// may: image share's and video share's IARIs, and the MMTEL ICSI (RCC.07
+// Table 3, TS 24.173). An MSRP INVITE that names one of them goes to the
+// callee; one that names any other, or none, is taken for a chat (lead's
+// decision on #359). It matches a parameter of Accept-Contact or Contact,
+// not the same text anywhere else in them (#359 security review).
+const otherService = `^(\+g\.3gpp\.iari-ref=urn:urn-7:3gpp-application\.ims\.iari\.gsma-(is|vs)|\+g\.3gpp\.icsi-ref=urn:urn-7:3gpp-service\.ims\.icsi\.mmtel)$`
 
 // featureTagHeaders carry the caller's and callee's feature tags;
 // serviceHeaders the requested or asserted service.
@@ -67,7 +70,7 @@ const servedUserHeader = "P-Served-User"
 //
 //	10  INVITE for an RCS service (CPM ICSI, RCS IARI, or
 //	    OMA SIMPLE IM, rcsjta's chat, or an MSRP stream
-//	    with no ICSI or IARI)                               SESSION_TERMINATED
+//	    unless image share, video share or MMTEL)           SESSION_TERMINATED
 //	20  MESSAGE                                             SESSION_TERMINATED
 //	30  OPTIONS for an RCS service (capability discovery)   SESSION_CONTINUED
 //	40  REGISTER (third-party registration)                 SESSION_CONTINUED
@@ -90,15 +93,16 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 	// AND NOT (P-Served-User), in conjunctive normal form: group 0 is the
 	// method, group 1 the ORed service conditions, one header and one
 	// literal each, and the last group the served-user check. An INVITE
-	// also takes the trigger by an MSRP stream with no service named in a
-	// feature tag: rcs OR (msrp AND NOT tag), which in CNF is group 1 with
-	// msrp, and group 2 with the service conditions and the tag's absence.
+	// also takes the trigger by an MSRP stream unless it names a known
+	// service that is not chat: rcs OR (msrp AND NOT other), which in CNF
+	// is group 1 with msrp, and group 2 with the service conditions and the
+	// other service's absence.
 	rcsRequest := func(method string) *ifc.TriggerPoint {
 		groups := []int{1}
 		var absent []ifc.SPT
 		if method == "INVITE" {
 			groups = []int{1, 2}
-			absent = []ifc.SPT{{ConditionNegated: true, Groups: []int{2}, Condition: ifc.SIPHeader{Header: ifc.FeatureTagField, Content: serviceTag}}}
+			absent = []ifc.SPT{{ConditionNegated: true, Groups: []int{2}, Condition: ifc.SIPHeader{Header: ifc.FeatureTagField, Content: otherService}}}
 		}
 		spts := []ifc.SPT{{Groups: []int{0}, Condition: ifc.Method(method)}}
 		for _, h := range featureTagHeaders {

@@ -119,7 +119,9 @@ func TestSDPAndIFCAgreeOnWhatIsAnMSRPStream(t *testing.T) {
 // service; image share, which names its IARI however spelled, or a call
 // that names its ICSI, goes on as before. The tag's name elsewhere in the
 // fields, which caller preferences do not take for a feature tag, names no
-// service (#359 security review).
+// service (#359 security review). Only a service known not to be chat
+// keeps the INVITE from rcs-as: an invented tag, a bare ICSI flag or an
+// IARI no list knows does not (lead's decision on #359).
 func TestAnMSRPOfferThatNamesAnotherServiceSkipsRCSAS(t *testing.T) {
 	set, err := ifc.Compile(hssprofile.DefaultRCSProfile(hssprofile.DefaultProfileID, rcsAS).Criteria)
 	if err != nil {
@@ -130,15 +132,20 @@ func TestAnMSRPOfferThatNamesAnotherServiceSkipsRCSAS(t *testing.T) {
 		fields []string
 		chat   bool
 	}{
-		"no service named":               {nil, true},
-		"image share":                    {[]string{`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`}, false},
-		"image share, spelled otherwise": {[]string{`Contact: <sip:ue3@192.0.2.13:5060>;+G.3GPP.IARI-REF="URN%3aURN-7%3a3GPP-APPLICATION.IMS.IARI.GSMA-IS"`}, false},
-		"a call's ICSI":                  {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`}, false},
-		"the chat ICSI":                  {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`}, true},
-		"in a URI parameter":             {[]string{`Contact: <sip:ue3@192.0.2.13:5060;+g.3gpp.iari-ref>`}, true},
-		"in a display name":              {[]string{`Contact: "+g.3gpp.iari-ref" <sip:ue3@192.0.2.13:5060>`}, true},
-		"in another parameter's value":   {[]string{`Contact: <sip:ue3@192.0.2.13:5060>;+g.example="+g.3gpp.iari-ref"`, `Accept-Contact: *;+g.example="+g.3gpp.iari-ref"`}, true},
-		"in a Reject-Contact":            {[]string{`Reject-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`}, true},
+		"no service named":                   {nil, true},
+		"image share":                        {[]string{`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`}, false},
+		"image share, spelled otherwise":     {[]string{`Contact: <sip:ue3@192.0.2.13:5060>;+G.3GPP.IARI-REF="URN%3aURN-7%3a3GPP-APPLICATION.IMS.IARI.GSMA-IS"`}, false},
+		"a call's ICSI":                      {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`}, false},
+		"the chat ICSI":                      {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`}, true},
+		"in a URI parameter":                 {[]string{`Contact: <sip:ue3@192.0.2.13:5060;+g.3gpp.iari-ref>`}, true},
+		"in a display name":                  {[]string{`Contact: "+g.3gpp.iari-ref" <sip:ue3@192.0.2.13:5060>`}, true},
+		"in another parameter's value":       {[]string{`Contact: <sip:ue3@192.0.2.13:5060>;+g.example="+g.3gpp.iari-ref"`, `Accept-Contact: *;+g.example="+g.3gpp.iari-ref"`}, true},
+		"in a Reject-Contact":                {[]string{`Reject-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`}, true},
+		"video share":                        {[]string{`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-vs"`}, false},
+		"an invented tag":                    {[]string{`Accept-Contact: *;+g.example.newservice`}, true},
+		"a bare ICSI flag":                   {[]string{`Accept-Contact: *;+g.3gpp.icsi-ref`}, true},
+		"an unknown IARI":                    {[]string{`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.example"`}, true},
+		"image share beside an invented tag": {[]string{`Accept-Contact: *;+g.example.newservice;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"`}, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := request(t, "INVITE", impu1, append(c.fields, "Content-Type: application/sdp")...).Message
