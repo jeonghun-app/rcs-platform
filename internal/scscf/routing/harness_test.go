@@ -115,12 +115,13 @@ func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
 		st = e.store
 	}
 	self, _ := sip.ParseURI("sip:scscf.rcs.local")
-	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;lr>")
+	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
 	cfg := Config{
 		Store: st, RecordRoute: rr, Self: []sip.URI{self}, Now: e.clock.Now, Metrics: e.metrics,
-		ApplicationServers: []string{"rcs-as.rcs.local"},
-		EdgeProxyHosts:     []string{"pcscf.rcs.local"},
-		EdgeProxyNets:      []netip.Prefix{netip.MustParsePrefix("198.51.100.0/28")},
+		ApplicationServers:   []string{"rcs-as.rcs.local"},
+		EdgeProxyHosts:       []string{"pcscf.rcs.local"},
+		EdgeProxyNets:        []netip.Prefix{netip.MustParsePrefix("198.51.100.0/28")},
+		EdgeProxyPublicHosts: []string{"pcscf.example.net", "203.0.113.5"},
 	}
 	for _, f := range tweak {
 		f(&cfg)

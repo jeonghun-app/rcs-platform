@@ -73,6 +73,7 @@ func TestWhoCannotBeReachedIsAnswered(t *testing.T) {
 	}{
 		"no public identity":  {func(e *env) { e.registered(binding(1, 0, time.Hour)) }, "sip:" + realm, 404},
 		"barred":              {func(e *env) { e.registered(binding(1, 0, time.Hour)) }, impu2, 404},
+		"barred, no binding":  {func(e *env) { e.registered(binding(1, 0, -time.Second)) }, impu2, 404},
 		"unknown":             {func(*env) {}, "sip:+15550100004@" + realm, 480},
 		"every binding gone":  {func(e *env) { e.registered(binding(1, 0, -time.Second)) }, impu1, 480},
 		"being deregistered":  {func(e *env) { e.deregistering() }, impu1, 480},
@@ -336,7 +337,8 @@ func TestEndingABindingReadsTheRecordAgainAfterLosingARace(t *testing.T) {
 func TestCallerPreferencesChooseTheBindings(t *testing.T) {
 	chat := `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`
 	e := newEnv(t)
-	e.registered(binding(1, 0, time.Hour, chat), binding(2, 0, time.Hour))
+	mmtel := `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+	e.registered(binding(1, 0, time.Hour, chat), binding(2, 0, time.Hour, mmtel))
 	rt := e.router(nil)
 	r := request(t, "INVITE", impu1, "Accept-Contact: *;"+chat+";require;explicit")
 	if got := uris(rt.Terminating(bg, r).Targets); !slices.Equal(got, []string{binding(1, 0, 0).URI}) {

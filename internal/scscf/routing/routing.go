@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +24,9 @@ type Config struct {
 	// Store is the state every scscf instance shares.
 	Store state.Store
 	// RecordRoute is the S-CSCF's own Record-Route value, its service name
-	// with lr (ADR 0005), which keeps it on the route of the dialogs it
-	// forwards, so that their requests come back through InDialog.
+	// with transport=tcp and lr (ADR 0005, #208), which keeps it on the
+	// route of the dialogs it forwards, so that their requests come back
+	// through InDialog.
 	RecordRoute sip.Address
 	// Self are the URIs that name this S-CSCF, as proxy.Config.Self: no
 	// request inside a dialog is sent to them.
@@ -37,6 +39,11 @@ type Config struct {
 	// whose URI names a flow by its user part.
 	EdgeProxyHosts []string
 	EdgeProxyNets  []netip.Prefix
+	// EdgeProxyPublicHosts are the names and addresses clients reach the
+	// P-CSCF at. rcsjta puts the Route of a dialog's first INVITE, one of
+	// them, after the dialog's route set in its session refreshes (#14):
+	// a next hop that names one ends the route set.
+	EdgeProxyPublicHosts []string
 	// RepairTimeout bounds the background repair of an identity's item;
 	// DefaultRepairTimeout when 0.
 	RepairTimeout time.Duration
@@ -68,6 +75,11 @@ func New(cfg Config) (*Router, error) {
 	rr := cfg.RecordRoute.URI
 	if !rr.IsSIP() || rr.Host == "" || !rr.Params.Has("lr") {
 		return nil, errors.New("routing: RecordRoute must be a SIP URI with lr")
+	}
+	if t, ok := rr.Param("transport"); !ok || !strings.EqualFold(t, "tcp") {
+		// pcscf refuses a dialog's requests along a route to the S-CSCF
+		// over any other transport (#208).
+		return nil, errors.New("routing: RecordRoute must carry transport=tcp")
 	}
 	if len(cfg.Self) == 0 {
 		return nil, errors.New("routing: Self is required")

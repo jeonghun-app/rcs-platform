@@ -94,11 +94,15 @@ func (rt *Router) lookup(ctx context.Context, impu string, now time.Time) (*stat
 		return nil, err
 	}
 	i := slices.IndexFunc(set.Identities, func(s state.SetIdentity) bool { return s.IMPU == impu })
-	if i < 0 || len(live(set, now)) == 0 {
+	switch {
+	case i < 0:
 		return nil, nil
-	}
-	if set.Identities[i].Barred {
+	case set.Identities[i].Barred:
+		// Barred whether or not the set is registered: rcs-as gives up a
+		// message only on 404 or 604 (#279), and keeps it on a 480.
 		return nil, errBarred
+	case len(live(set, now)) == 0:
+		return nil, nil
 	}
 	if id.Incarnation != set.Incarnation {
 		rt.repair(ctx, id, set)

@@ -17,14 +17,17 @@ import (
 // listener naming a flow, and with 403 otherwise. The S-CSCF's own entries
 // are gone from the Route by now; the rest are as the client wrote them,
 // so this is what keeps a client from reaching through the S-CSCF any
-// address it reaches (#208, docs/threat-model.md T2).
+// address it reaches (#208, docs/threat-model.md T2). A next hop that is
+// the P-CSCF's public address (Config.EdgeProxyPublicHosts) ends the route
+// set, as rcsjta writes one there.
 func (rt *Router) InDialog(_ context.Context, r *proxy.Request) proxy.Decision {
 	next := r.Message.URI
 	routes, err := r.Message.Header.Route()
 	if err != nil {
 		return proxy.Decision{Status: 400, Reason: "Bad Route"}
 	}
-	if len(routes) > 0 {
+	ended := len(routes) > 0 && rt.edgeProxyPublic(routes[0].URI.Host)
+	if len(routes) > 0 && !ended {
 		next = routes[0].URI
 	}
 	if !rt.nextHopAllowed(next) {
@@ -32,7 +35,24 @@ func (rt *Router) InDialog(_ context.Context, r *proxy.Request) proxy.Decision {
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
 	rt.count("routing.in_dialog")
-	return proxy.Forward(r)
+	d := proxy.Forward(r)
+	if ended {
+		// rcsjta's session refresh: the P-CSCF's public address it put
+		// after the route set is where the client sent the dialog's first
+		// INVITE, not a hop of the dialog; the route set ends before it,
+		// and the request goes by its Request-URI.
+		rt.count("routing.in_dialog.trailing_route")
+		d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
+			req.Header.Del("Route")
+			return nil
+		}
+	}
+	return d
+}
+
+// edgeProxyPublic reports whether host is one clients reach the P-CSCF at.
+func (rt *Router) edgeProxyPublic(host string) bool {
+	return slices.ContainsFunc(rt.cfg.EdgeProxyPublicHosts, func(h string) bool { return proxy.SameHost(h, host) })
 }
 
 // nextHopAllowed reports whether u is a next hop a request inside a dialog

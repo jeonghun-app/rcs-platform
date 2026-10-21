@@ -15,6 +15,10 @@ func FuzzCallerPreferences(f *testing.F) {
 	f.Add(`*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session";require;explicit`, `*;+g.oma.sip-im`, `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`)
 	f.Add(`*;+a="!x,y";require`, `*;audio`, `+a="y,z";audio`)
 	f.Add(`sip:x`, `*;;;`, `"`)
+	f.Add(`*;+g.3gpp.icsi-ref="URN%3aX";require;explicit`, `*;+a="!b"`, `+g.3gpp.icsi-ref="urn%3Ax"`)
+	f.Add(`*;+sip.description="<a,b>";require;explicit`, `*;+x="#>=4"`, `+sip.description="<a,b>";+x="#=4"`)
+	f.Add(`*;+x="#1:5,#-2.5:-1.";require`, `*;+x="#<=+3."`, `+x="#=3"`)
+	f.Add(`*;audio;require;explicit`, `*;video`, ``)
 	f.Fuzz(func(t *testing.T, accept, reject, tags string) {
 		if strings.ContainsAny(accept+reject, "\r\n") {
 			return

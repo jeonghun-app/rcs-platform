@@ -16,8 +16,8 @@
 // interrupted REGISTER left behind (#196). The request is forked to every
 // live binding of the set, along the binding's Path, keeping only the
 // bindings the caller's preferences accept (RFC 3841: Accept-Contact with
-// require, Reject-Contact), with the Request-URI it was sent to in
-// P-Called-Party-ID. A binding whose edge proxy answers 430 Flow Failed is
+// require, Reject-Contact; a binding that states no feature is kept), with
+// the Request-URI it was sent to in P-Called-Party-ID. A binding whose edge proxy answers 430 Flow Failed is
 // ended, as an expired one is, for the sweep to finish, and the request
 // tried over the instance's other flows (RFC 5626 §7). A barred identity,
 // or a Request-URI that is no public identity, is 404; a user without a
@@ -31,6 +31,9 @@
 // write, so without this a client could reach any address the S-CSCF
 // reaches, the I-CSCF and the network's private addresses included (#208,
 // docs/threat-model.md T2). A hop naming the S-CSCF itself is refused too.
+// The P-CSCF's public address as the next hop ends the route set: rcsjta
+// puts it after the route set of its session refreshes, and the request
+// goes by its Request-URI.
 //
 // Logs carry no identity or URI.
 package routing

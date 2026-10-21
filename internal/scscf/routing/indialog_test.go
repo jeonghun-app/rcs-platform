@@ -79,3 +79,68 @@ func TestAnUnreadableRouteInsideADialogIs400(t *testing.T) {
 		t.Errorf("status %d", d.Status)
 	}
 }
+
+// TestThePCSCFsPublicAddressEndsTheRouteSet (#14): rcsjta puts the Route of
+// a dialog's first INVITE, the P-CSCF's public address, after the route
+// set in its session refreshes; the request goes by its Request-URI, which
+// must still be a hop the platform runs.
+func TestThePCSCFsPublicAddressEndsTheRouteSet(t *testing.T) {
+	for name, c := range map[string]struct {
+		target, route string
+		allowed       bool
+	}{
+		"to an application server":  {"sip:rcs-as.rcs.local;transport=tcp", "<sip:pcscf.example.net:5061;transport=tls;lr>", true},
+		"by its address":            {"sip:rcs-as.rcs.local", "<sip:203.0.113.5:5061;transport=tls;lr>", true},
+		"with more after it":        {"sip:rcs-as.rcs.local", "<sip:pcscf.example.net;lr>, <sip:10.0.3.7:8080;lr>", true},
+		"to a client flow":          {"sip:" + flow(1) + "@198.51.100.6:5070", "<sip:pcscf.example.net;lr>", true},
+		"to the I-CSCF":             {"sip:icscf.rcs.local", "<sip:pcscf.example.net;lr>", false},
+		"to a client's own address": {"sip:ue@192.0.2.40:5060", "<sip:pcscf.example.net;lr>", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			r := inDialog(t, c.target, c.route)
+			d := e.router(nil).InDialog(bg, r)
+			if got := d.Status == 0; got != c.allowed {
+				t.Fatalf("forwarded %v (status %d), want %v", got, d.Status, c.allowed)
+			}
+			if !c.allowed {
+				return
+			}
+			b := r.Message.Clone()
+			if err := d.Prepare(bg, d.Targets[0], b); err != nil {
+				t.Fatal(err)
+			}
+			if b.Header.Has("Route") || d.Targets[0].URI.String() != r.Message.URI.String() {
+				t.Errorf("Route %q, Request-URI %s", b.Header.Get("Route"), d.Targets[0].URI.String())
+			}
+			if e.metrics.get("routing.in_dialog.trailing_route") != 1 {
+				t.Error("not counted")
+			}
+		})
+	}
+	// Without the P-CSCF's public address in the way, the Route is kept.
+	e := newEnv(t)
+	r := inDialog(t, "sip:ue@192.0.2.40:5060", "<sip:rcs-as.rcs.local;lr>, <sip:pcscf.example.net;lr>")
+	if d := e.router(nil).InDialog(bg, r); d.Status != 0 || d.Prepare != nil {
+		t.Errorf("status %d, Prepare set %v", d.Status, d.Prepare != nil)
+	}
+}
+
+// TestNewRefusesARecordRouteOverAnotherTransport (#208): pcscf refuses
+// the dialog's requests along it.
+func TestNewRefusesARecordRouteOverAnotherTransport(t *testing.T) {
+	for _, v := range []string{"<sip:scscf.rcs.local;lr>", "<sip:scscf.rcs.local;transport=udp;lr>"} {
+		e := newEnv(t)
+		rr, _ := sip.ParseAddress(v)
+		self, _ := sip.ParseURI("sip:scscf.rcs.local")
+		if _, err := New(Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}}); err == nil {
+			t.Errorf("%s accepted", v)
+		}
+	}
+	e := newEnv(t)
+	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=TCP;lr>")
+	self, _ := sip.ParseURI("sip:scscf.rcs.local")
+	if _, err := New(Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}}); err != nil {
+		t.Error(err)
+	}
+}
