@@ -312,6 +312,14 @@ func (p *peer) try(m msg) (*sip.Response, error) {
 		if !ok {
 			return nil, errors.New("got a request")
 		}
+		// Only the answer to this request: rcs-as retransmits an INVITE's
+		// 2xx until the ACK reaches it (RFC 3261 §13.3.1.4), and on a
+		// loaded host a retransmission can come after the ACK has gone,
+		// where it would pass for the next request's answer (#290). A UAC
+		// matches a response to its transaction; this one by CSeq.
+		if cs, err := res.Header.CSeq(); err != nil || cs.Seq != uint32(cseq) || cs.Method != m.method {
+			continue
+		}
 		if res.StatusCode >= 200 {
 			return res, nil
 		}
@@ -383,4 +391,38 @@ func (e *fakeEngine) origins() []messaging.Origin {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]messaging.Origin(nil), e.got...)
+}
+
+// #290: the test peer takes the answer to its own request only. A 2xx of
+// an earlier INVITE, retransmitted after the ACK went, comes first here,
+// as it did under load, and must not pass for the UPDATE's answer.
+func TestThePeerTakesTheAnswerToItsOwnRequest(t *testing.T) {
+	ours, theirs := net.Pipe()
+	t.Cleanup(func() { _ = ours.Close(); _ = theirs.Close() })
+	p := &peer{t: t, nc: ours, r: sip.NewReader(bufio.NewReader(ours), sip.Limits{})}
+	go func() {
+		br := bufio.NewReader(theirs)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		answer := func(cseq string, body string) string {
+			return "SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-x\r\n" +
+				"From: <" + alice + ">;tag=a1\r\nTo: <" + bob + ">;tag=b1\r\nCall-ID: c1\r\nCSeq: " + cseq + "\r\n" +
+				"Content-Length: " + fmt.Sprint(len(body)) + "\r\n\r\n" + body
+		}
+		_, _ = io.WriteString(theirs, answer("2 INVITE", "v=0\r\n")+answer("3 UPDATE", ""))
+	}()
+	res, err := p.try(msg{method: "UPDATE", uri: bob, toTag: "b1", callID: "c1", cseq: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs, _ := res.Header.CSeq(); cs.Seq != 3 || cs.Method != "UPDATE" || len(res.Body) != 0 {
+		t.Fatalf("took %v with %q for the UPDATE's answer", cs, res.Body)
+	}
 }
