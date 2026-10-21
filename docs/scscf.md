@@ -76,7 +76,7 @@ is `id:base64` pairs, comma separated, the first the one that signs or seals.
 | `SCSCF_DIALOG_KEYS` | none; required | the current key and at most the previous one, at least 32 bytes each, that sign the `Record-Route` values and iFC positions (odi) |
 | `SCSCF_ICSCF_URI` | `sip:icscf.<namespace>:5060;transport=tcp;lr` | where an originating request goes once its chain is done |
 | `SCSCF_APPLICATION_SERVERS` | `sip:rcs-as.<namespace>:5060;transport=tcp` | the application servers' SIP listeners, comma separated: a request inside a dialog may go to their port and transport |
-| `SCSCF_EDGE_PROXY_PUBLIC_HOSTS` | none | the names and addresses clients reach pcscf at, comma separated; a next hop naming one ends a dialog's route set |
+| `SCSCF_EDGE_PROXY_PUBLIC_HOSTS` | none | the names and addresses clients reach pcscf at, comma separated; a next hop naming one ends a dialog's route set; required in staging and prod |
 | `SCSCF_AS_TIMEOUT` | `5s` | wait for an application server's answer to a request other than INVITE, after which its default handling applies |
 | `SCSCF_THIRD_PARTY_TIMEOUT` | `10s` | one third-party REGISTER's transaction |
 | `SCSCF_MAX_THIRD_PARTY` | `256` | third-party REGISTERs at one application server at a time |

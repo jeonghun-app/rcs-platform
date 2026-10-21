@@ -40,6 +40,7 @@ var prodEnv = with(devEnv,
 	"RCS_ENV", "prod",
 	"RCS_PII_HMAC_KEY", strings.Repeat("k", 32),
 	"RCS_SERVICE_NAMESPACE", "rcs.local",
+	"SCSCF_EDGE_PROXY_PUBLIC_HOSTS", "pcscf.example.net,203.0.113.5",
 )
 
 func with(base map[string]string, kv ...string) map[string]string {
@@ -151,6 +152,7 @@ func TestProductionRefusesWhatIsUnsafeThere(t *testing.T) {
 		// Narrower, but no use, and the message says why (#439 QA).
 		{[]string{"SCSCF_HSS_HOST_PATTERN", "hss-1.rcs.local"}, "a pattern without the wildcard names one HSS task"},
 		{[]string{"SCSCF_HSS_HOST_PATTERN", "HSS-*.RCS.LOCAL"}, "with the namespace spelt as it is"},
+		{[]string{"SCSCF_EDGE_PROXY_PUBLIC_HOSTS", ""}, "SCSCF_EDGE_PROXY_PUBLIC_HOSTS is empty"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			status, out := startup(t, with(prodEnv, tt.kv...))
@@ -164,7 +166,7 @@ func TestProductionRefusesWhatIsUnsafeThere(t *testing.T) {
 	if _, out := startup(t, prodEnv); strings.Contains(out, "SCSCF_") {
 		t.Errorf("a valid production configuration was refused:\n%s", out)
 	}
-	for _, kv := range [][]string{{"SCSCF_STORE", StoreMemory}, {"SCSCF_HSS_DISCOVERY", DiscoveryDNS}, {"SCSCF_DIAMETER_HOST", "scscf-a.rcs.local"}, {"SCSCF_HSS_HOST_PATTERN", "*.rcs.local"}} {
+	for _, kv := range [][]string{{"SCSCF_STORE", StoreMemory}, {"SCSCF_HSS_DISCOVERY", DiscoveryDNS}, {"SCSCF_DIAMETER_HOST", "scscf-a.rcs.local"}, {"SCSCF_HSS_HOST_PATTERN", "*.rcs.local"}, {"SCSCF_EDGE_PROXY_PUBLIC_HOSTS", ""}} {
 		if _, err := configure(with(devEnv, kv...)); err != nil {
 			t.Errorf("dev refused %s=%s: %v", kv[0], kv[1], err)
 		}

@@ -224,6 +224,11 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	if c.CxTimeout <= 0 {
 		e.Invalid("CX_TIMEOUT", "must be greater than zero")
 	}
+	// rcsjta's session-timer re-INVITE carries pcscf's public address after
+	// its route set (#208, #322): without the names, scscf takes it for a
+	// next hop it did not sign (#439 code review).
+	s.ForbidInProduction(len(c.EdgeProxyPublicHosts) == 0,
+		"SCSCF_EDGE_PROXY_PUBLIC_HOSTS is empty: a re-INVITE whose route set ends at pcscf's public address, as rcsjta's session refreshes do, would be refused 403; list the names and addresses clients reach pcscf at")
 
 	switch c.Store {
 	case StoreDynamoDB:
