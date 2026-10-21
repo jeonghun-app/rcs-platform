@@ -244,8 +244,12 @@ event that last changed it. `Deregister` ends an IMPU's registration from
 the network side, with `deactivated` or `rejected`. A request to an IMPU without a binding gets
 480, or, as a test chooses, is stored and delivered at the next
 registration (or stored with its text changed), answered 200 and lost, or
-refused with 404. A request the far end never answers
-is answered 408 to its sender, and one its flow cannot take 500.
+refused with 404. It answers what it cannot get to the far end as the
+platform does: an INVITE the far end never answers gets 408, any other
+request is left unanswered, so its sender's own transaction times out (RFC
+4320 §4.2, #363); a request whose far end's flow is gone, before it was sent
+or while it waited, gets 480 (the P-CSCF's 430 as an endpoint sees it, RFC
+5626 §5.3.1, #414), and one the transport fails otherwise 503.
 
 ## Running it
 

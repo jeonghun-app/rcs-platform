@@ -196,7 +196,13 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 		}
 	}()
 	t.Cleanup(func() { close(c.stop) })
-	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) { c.layer.Receive(in) })
+	// A flow that closes ends the requests sent over it at once, as the
+	// platform's P-CSCF ends them (Proxy.FlowClosed, #234), rather than at
+	// Timer B or F (#414). The layer exists before the core listens, so
+	// before any flow can close.
+	tr, err := transport.New(transport.Config{
+		OnFlowClosed: func(id transport.FlowID, _ transport.FlowInfo) { c.layer.FlowClosed(id) },
+	}, func(in transport.Inbound) { c.layer.Receive(in) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -677,15 +683,16 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 				// non-INVITE that timed out is left unanswered, as the
 				// platform's proxy leaves it (RFC 4320 §4.2 forbids the
 				// 408): the originator's own transaction times out. An
-				// INVITE gets its 408 (RFC 3261 §16.8), anything else 500
-				// (§16.7).
+				// INVITE gets its 408 (RFC 3261 §16.8). The rest is
+				// answered as the platform answers it, the core standing
+				// for its P-CSCF and S-CSCF both (#414).
 				switch {
 				case errors.Is(err, transaction.ErrTimeout) && req.Method != "INVITE":
 					c.silence(tx, req)
 				case errors.Is(err, transaction.ErrTimeout):
 					answer(408)
 				default:
-					answer(500)
+					answer(failureCode(err))
 				}
 				return
 			}
@@ -700,11 +707,24 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 		})
 		if err != nil {
 			tag, _ := c.ids.Tag()
-			if res, e := sip.NewResponse(req, 503, "", tag); e == nil {
+			if res, e := sip.NewResponse(req, failureCode(err), "", tag); e == nil {
 				_ = tx.Respond(res)
 			}
 		}
 	}()
+}
+
+// failureCode is the answer to a request the core could not get to the
+// callee, as the platform gives it. A flow that is gone, whether before
+// the request went or while it waited (ErrFlowClosed wraps ErrNoFlow), is
+// the edge proxy's 430 (RFC 5626 §5.3.1), which reaches an endpoint as 480
+// (§11.5; internal/sip/proxy keeps the 430 between its proxies only). Any
+// other transport failure is 503 (RFC 3261 §16.9).
+func failureCode(err error) int {
+	if errors.Is(err, transport.ErrNoFlow) {
+		return 480
+	}
+	return 503
 }
 
 // forwarded is req as a proxy sends it on (RFC 3261 §16.6): the core's own

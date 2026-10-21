@@ -114,6 +114,67 @@ func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
 	}
 }
 
+// closingCallee registers B, which closes its connection as the first
+// request reaches it, unanswered.
+func closingCallee(t *testing.T, ctx context.Context, core *simtest.IMSCore) {
+	t.Helper()
+	var b *sipua.UA
+	var once sync.Once
+	b = registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(*transaction.ServerTransaction) { once.Do(func() { go func() { _ = b.Close() }() }) })
+}
+
+func TestARequestWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
+	// #414: when the callee's flow closes while the core waits for its
+	// answer, the core answers at once, as the platform does: its P-CSCF
+	// ends the request with 430 (RFC 5626 §5.3.1), which reaches the
+	// originator as 480 (§11.5). A request sent to the IMPU once the flow
+	// is gone gets 480 too: the binding stays until it expires, as a
+	// registration does. The originator's clock is normal, so its own
+	// Timer F, 32 s out, is not what ends the first one.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	closingCallee(t, ctx, core)
+	b, _ := sip.ParseURI(impuB)
+	for _, what := range []string{"while it waits", "once it is gone"} {
+		req, err := a.NewMessage(b, "text/plain", []byte("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := a.Send(ctx, req)
+		if err != nil || res == nil || res.StatusCode != 480 {
+			t.Fatalf("MESSAGE whose callee's flow closed %s = %v, %v; want the core's 480", what, res, err)
+		}
+	}
+	if n := core.Silenced(); n != 0 {
+		t.Fatalf("the core left %d requests unanswered, want none", n)
+	}
+}
+
+func TestAnInviteWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
+	// #414: as for a MESSAGE, and not 408 at Timer B: B's layer sent 100
+	// Trying, so only the flow's end can end the INVITE.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	closingCallee(t, ctx, core)
+	b, _ := sip.ParseURI(impuB)
+	req, err := a.NewInvite(b, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, res, err := a.Invite(ctx, req, nil)
+	if err != nil || d != nil || res == nil {
+		t.Fatalf("INVITE whose callee's flow closed = dialog %v, %v; want the core's 480", d, err)
+	}
+	if res.StatusCode != 480 {
+		t.Fatalf("INVITE whose callee's flow closed = %d %s, want the core's 480", res.StatusCode, res.Reason)
+	}
+}
+
 func TestAnInviteTheCalledPartyNeverGetsIsAnswered408(t *testing.T) {
 	// #363, review of #372: unlike a non-INVITE, an INVITE whose
 	// terminating transaction times out gets its 408 (RFC 3261 §16.8), as
