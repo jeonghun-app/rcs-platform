@@ -55,7 +55,8 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	if c.Store != StoreDynamoDB || c.DynamoDB.Table != "messages" || c.MSRPListenAddr != ":2855" || m.MSRPPort != 2855 ||
 		m.MSRPHost != "10.0.0.7" || m.StoreTTL != 7*24*time.Hour || m.SentTTL != 8*24*time.Hour || m.PagerLimit != 1300 ||
 		m.MaxMessageSize != 256<<10 || m.SenderRate.PerMinute != 60 || m.MSRP.KeepAliveInterval != 240*time.Second ||
-		c.MaxSessions != 20_000 || c.MaxOutgoingPerUser != 32 || c.MaxIncomingPerUser != 32 {
+		c.MaxSessions != 20_000 || c.MaxOutgoingPerUser != 32 || c.MaxIncomingPerUser != 32 ||
+		c.GroupChat || c.MaxSubscriptionsPerUser != 32 {
 		t.Fatalf("config %+v", c)
 	}
 }
@@ -70,7 +71,8 @@ func TestEverySettingIsRead(t *testing.T) {
 		"RCSAS_INVITE_TIMEOUT", "1m", "RCSAS_STORE_TIMEOUT", "2s", "RCSAS_SWEEP_INTERVAL", "30s", "RCSAS_MSRP_KEEPALIVE", "100s",
 		"RCSAS_TRUSTED_ROUTES", "sip:as.ims.example.net;lr", "RCSAS_QUEUE_SENDER_SHARE", "4", "RCSAS_MAX_QUEUE_MESSAGES", "50", "RCSAS_MAX_QUEUE_BYTES", "1048576",
 		"RCSAS_ANSWER_TIMEOUT", "20s", "RCSAS_RETRY_INTERVAL", "30s", "RCSAS_MAX_RETRY_INTERVAL", "10m",
-		"RCSAS_MAX_SESSIONS", "500", "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "8", "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "9"))
+		"RCSAS_MAX_SESSIONS", "500", "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "8", "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "9",
+		"RCSAS_GROUP_CHAT_ENABLED", "true", "RCSAS_MAX_SUBSCRIPTIONS_PER_USER", "4"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +84,8 @@ func TestEverySettingIsRead(t *testing.T) {
 		m.SweepInterval != 30*time.Second || m.MSRP.KeepAliveInterval != 100*time.Second ||
 		m.TrustedRoutes[0] != "sip:as.ims.example.net;lr" || m.QueueSenderShare != 4 || m.MaxQueueMessages != 50 || m.MaxQueueBytes != 1<<20 ||
 		m.AnswerTimeout != 20*time.Second || m.RetryInterval != 30*time.Second || m.MaxRetryInterval != 10*time.Minute ||
-		c.MaxSessions != 500 || c.MaxOutgoingPerUser != 8 || c.MaxIncomingPerUser != 9 {
+		c.MaxSessions != 500 || c.MaxOutgoingPerUser != 8 || c.MaxIncomingPerUser != 9 ||
+		!c.GroupChat || c.MaxSubscriptionsPerUser != 4 {
 		t.Fatalf("config %+v", c)
 	}
 }
@@ -92,29 +95,31 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		"no host":         {with(devEnv, "RCSAS_MSRP_HOST", ""), "RCSAS_MSRP_HOST"},
-		"bad listen":      {with(devEnv, "RCSAS_MSRP_LISTEN_ADDR", "2855"), "RCSAS_MSRP_LISTEN_ADDR"},
-		"no port":         {with(devEnv, "RCSAS_MSRP_LISTEN_ADDR", ":http"), "RCSAS_MSRP_LISTEN_ADDR"},
-		"unknown store":   {with(devEnv, "RCSAS_STORE", "redis"), "RCSAS_STORE"},
-		"zero size":       {with(devEnv, "RCSAS_MAX_MESSAGE_SIZE", "0"), "RCSAS_MAX_MESSAGE_SIZE"},
-		"zero pager":      {with(devEnv, "RCSAS_PAGER_LIMIT", "0"), "RCSAS_PAGER_LIMIT"},
-		"zero ttl":        {with(devEnv, "RCSAS_STORE_TTL", "0s"), "RCSAS_STORE_TTL"},
-		"zero sweep":      {with(devEnv, "RCSAS_SWEEP_INTERVAL", "0s"), "RCSAS_SWEEP_INTERVAL"},
-		"short sent ttl":  {with(devEnv, "RCSAS_SENT_TTL", "1h"), "RCSAS_SENT_TTL"},
-		"pager over size": {with(devEnv, "RCSAS_MAX_MESSAGE_SIZE", "1000"), "RCSAS_PAGER_LIMIT"},
-		"beyond an item":  {with(devEnv, "RCSAS_STORE", "dynamodb", "RCSAS_MAX_MESSAGE_SIZE", "400000"), "RCSAS_MAX_MESSAGE_SIZE"},
-		"not a duration":  {with(devEnv, "RCSAS_STORE_TTL", "7d"), "RCSAS_STORE_TTL"},
-		"negative rate":   {with(devEnv, "RCSAS_SENDER_RATE", "-1"), "RCSAS_SENDER_RATE"},
-		"zero queue":      {with(devEnv, "RCSAS_MAX_QUEUE_MESSAGES", "0"), "RCSAS_MAX_QUEUE_MESSAGES"},
-		"share too small": {with(devEnv, "RCSAS_QUEUE_SENDER_SHARE", "128"), "RCSAS_QUEUE_SENDER_SHARE"},
-		"zero share":      {with(devEnv, "RCSAS_QUEUE_SENDER_SHARE", "0"), "RCSAS_QUEUE_SENDER_SHARE"},
-		"queue below one": {with(devEnv, "RCSAS_MAX_QUEUE_BYTES", "1000"), "RCSAS_MAX_QUEUE_BYTES"},
-		"zero answer":     {with(devEnv, "RCSAS_ANSWER_TIMEOUT", "0s"), "RCSAS_ANSWER_TIMEOUT"},
-		"retry backwards": {with(devEnv, "RCSAS_RETRY_INTERVAL", "2h"), "RCSAS_MAX_RETRY_INTERVAL"},
-		"negative burst":  {with(devEnv, "RCSAS_NOTIFICATION_BURST", "-1"), "RCSAS_NOTIFICATION_BURST"},
-		"zero sessions":   {with(devEnv, "RCSAS_MAX_SESSIONS", "0"), "RCSAS_MAX_SESSIONS"},
-		"zero per user":   {with(devEnv, "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER"},
-		"zero incoming":   {with(devEnv, "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_INCOMING_SESSIONS_PER_USER"},
+		"no host":            {with(devEnv, "RCSAS_MSRP_HOST", ""), "RCSAS_MSRP_HOST"},
+		"bad listen":         {with(devEnv, "RCSAS_MSRP_LISTEN_ADDR", "2855"), "RCSAS_MSRP_LISTEN_ADDR"},
+		"no port":            {with(devEnv, "RCSAS_MSRP_LISTEN_ADDR", ":http"), "RCSAS_MSRP_LISTEN_ADDR"},
+		"unknown store":      {with(devEnv, "RCSAS_STORE", "redis"), "RCSAS_STORE"},
+		"zero size":          {with(devEnv, "RCSAS_MAX_MESSAGE_SIZE", "0"), "RCSAS_MAX_MESSAGE_SIZE"},
+		"zero pager":         {with(devEnv, "RCSAS_PAGER_LIMIT", "0"), "RCSAS_PAGER_LIMIT"},
+		"zero ttl":           {with(devEnv, "RCSAS_STORE_TTL", "0s"), "RCSAS_STORE_TTL"},
+		"zero sweep":         {with(devEnv, "RCSAS_SWEEP_INTERVAL", "0s"), "RCSAS_SWEEP_INTERVAL"},
+		"short sent ttl":     {with(devEnv, "RCSAS_SENT_TTL", "1h"), "RCSAS_SENT_TTL"},
+		"pager over size":    {with(devEnv, "RCSAS_MAX_MESSAGE_SIZE", "1000"), "RCSAS_PAGER_LIMIT"},
+		"beyond an item":     {with(devEnv, "RCSAS_STORE", "dynamodb", "RCSAS_MAX_MESSAGE_SIZE", "400000"), "RCSAS_MAX_MESSAGE_SIZE"},
+		"not a duration":     {with(devEnv, "RCSAS_STORE_TTL", "7d"), "RCSAS_STORE_TTL"},
+		"negative rate":      {with(devEnv, "RCSAS_SENDER_RATE", "-1"), "RCSAS_SENDER_RATE"},
+		"zero queue":         {with(devEnv, "RCSAS_MAX_QUEUE_MESSAGES", "0"), "RCSAS_MAX_QUEUE_MESSAGES"},
+		"share too small":    {with(devEnv, "RCSAS_QUEUE_SENDER_SHARE", "128"), "RCSAS_QUEUE_SENDER_SHARE"},
+		"zero share":         {with(devEnv, "RCSAS_QUEUE_SENDER_SHARE", "0"), "RCSAS_QUEUE_SENDER_SHARE"},
+		"queue below one":    {with(devEnv, "RCSAS_MAX_QUEUE_BYTES", "1000"), "RCSAS_MAX_QUEUE_BYTES"},
+		"zero answer":        {with(devEnv, "RCSAS_ANSWER_TIMEOUT", "0s"), "RCSAS_ANSWER_TIMEOUT"},
+		"retry backwards":    {with(devEnv, "RCSAS_RETRY_INTERVAL", "2h"), "RCSAS_MAX_RETRY_INTERVAL"},
+		"negative burst":     {with(devEnv, "RCSAS_NOTIFICATION_BURST", "-1"), "RCSAS_NOTIFICATION_BURST"},
+		"zero sessions":      {with(devEnv, "RCSAS_MAX_SESSIONS", "0"), "RCSAS_MAX_SESSIONS"},
+		"zero per user":      {with(devEnv, "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER"},
+		"zero incoming":      {with(devEnv, "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_INCOMING_SESSIONS_PER_USER"},
+		"zero subscriptions": {with(devEnv, "RCSAS_MAX_SUBSCRIPTIONS_PER_USER", "0"), "RCSAS_MAX_SUBSCRIPTIONS_PER_USER"},
+		"group chat yes":     {with(devEnv, "RCSAS_GROUP_CHAT_ENABLED", "yes"), "RCSAS_GROUP_CHAT_ENABLED"},
 	} {
 		_, err := configure(c.env)
 		if err == nil || !strings.Contains(err.Error(), c.want) {

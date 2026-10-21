@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -189,6 +190,10 @@ type RosterUpdate struct {
 	// gap and refreshes its subscription for a full document (Roster).
 	Full     bool
 	Document []byte
+	// Departed are the participants the change took out of the group:
+	// who left, declined or was removed. Their subscriptions end with it,
+	// so that they get no later change (#340).
+	Departed []string
 }
 
 // Invitee names someone to add to a group.
@@ -340,8 +345,10 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		return groupstore.Group{}, err
 	}
 	conv := r.Conversation
-	if conv == "" {
-		if conv, err = s.randomHex(16); err != nil {
+	if conv == "" && r.Contribution != "" {
+		conv = groupConversationID(r.Contribution)
+	} else if conv == "" {
+		if conv, err = s.randomUUID(); err != nil {
 			return groupstore.Group{}, err
 		}
 	}
@@ -712,6 +719,19 @@ func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, 
 	return doc, g.Version, err
 }
 
+// FullRoster returns the group and its full conference-info document, for
+// whoever checks for itself who may read it: the SIP layer, to bring the
+// subscriptions of a group that missed a change up to date with one read
+// of the group for all of them (code review on #340).
+func (s *Service) FullRoster(ctx context.Context, uri string) (groupstore.Group, []byte, error) {
+	g, err := s.get(ctx, uri)
+	if err != nil {
+		return groupstore.Group{}, nil, err
+	}
+	doc, err := fullDocument(g)
+	return g, doc, err
+}
+
 // Get returns the group, ErrNoGroup if there is none.
 func (s *Service) Get(ctx context.Context, uri string) (groupstore.Group, error) {
 	return s.get(ctx, uri)
@@ -778,7 +798,13 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 		}
 		g.Rev++
 		s.metrics.Count("group.roster_changed", 1)
-		s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Document: doc})
+		var departed []string
+		for _, id := range changed {
+			if p, ok := g.Participant(id); ok && !p.State.Active() {
+				departed = append(departed, id)
+			}
+		}
+		s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Document: doc, Departed: departed})
 		return g, nil
 	}
 	return groupstore.Group{}, ErrBusy
@@ -931,6 +957,52 @@ func (s *Service) touch(ctx context.Context, g groupstore.Group, now time.Time) 
 	if err := s.store.Touch(ctx, g.URI, now, now.Add(s.cfg.IdleTTL)); err == nil {
 		s.metrics.Count("group.touched", 1)
 	}
+}
+
+// A group created without a Conversation-ID gets one in the UUID form OMA
+// CPM asks of it (Conversation Functions, Appendix C.1.1; #305). Groups
+// stored before keep the 32 hex digits they were made with: a
+// Conversation-ID is opaque, and is read and compared as stored.
+
+// randomUUID is a random UUID (RFC 9562 §5.4, version 4), for a group
+// created without a Contribution-ID either.
+func (s *Service) randomUUID() (string, error) {
+	u := make([]byte, 16)
+	if _, err := io.ReadFull(s.rand, u); err != nil {
+		return "", fmt.Errorf("group: random source: %w", err)
+	}
+	return uuidString(u, 4), nil
+}
+
+// groupNamespace is the UUID namespace of groupConversationID's
+// name-based UUIDs, chosen for rcs-as's groups; it is not
+// messaging.PairConversationID's.
+var groupNamespace = [16]byte{0xe5, 0x1a, 0xd9, 0x37, 0x23, 0x61, 0x43, 0x3b, 0xa3, 0xe7, 0x28, 0x3a, 0x7e, 0xf6, 0x41, 0xae}
+
+// groupConversationID is the Conversation-ID of a group made with a
+// Contribution-ID and no Conversation-ID: a name-based UUID (RFC 9562
+// §5.5, version 5) of the Contribution-ID alone, as the conference URI is
+// (conferenceID). rcsjta restarts a group that ended
+// (RestartGroupChatSession) at the factory under the same Contribution-ID,
+// from whichever participant writes next, not only its creator; the
+// restarted group so gets the same conference URI and Conversation-ID, and
+// a client that threads by it keeps one thread (lead's decision on #381).
+// A version 5 UUID never equals a version 4 one, the version digit
+// differing.
+func groupConversationID(contribution string) string {
+	h := sha1.New()
+	h.Write(groupNamespace[:])
+	h.Write([]byte(contribution))
+	return uuidString(h.Sum(nil)[:16], 5)
+}
+
+// uuidString sets u's version and the RFC 9562 variant, and writes it in
+// the 8-4-4-4-12 form.
+func uuidString(u []byte, version byte) string {
+	u[6] = u[6]&0x0f | version<<4
+	u[8] = u[8]&0x3f | 0x80
+	x := hex.EncodeToString(u)
+	return x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 }
 
 func (s *Service) randomHex(n int) (string, error) {

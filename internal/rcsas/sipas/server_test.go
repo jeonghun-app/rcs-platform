@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,9 +249,23 @@ func (d deliverer) Invite(ctx context.Context, v messaging.Invitation) error {
 }
 
 // notifier is the group chat focus's Notifier: the Server, once started.
-type notifier struct{ a **as }
+// While skip is above zero, it drops that many updates, as a change made on
+// another task would reach no subscription here.
+type notifier struct {
+	a    **as
+	skip *atomic.Int32
+}
 
 func (n notifier) RosterChanged(ctx context.Context, u group.RosterUpdate) {
+	for n.skip != nil {
+		v := n.skip.Load()
+		if v <= 0 {
+			break
+		}
+		if n.skip.CompareAndSwap(v, v-1) {
+			return
+		}
+	}
 	(*n.a).srv.RosterChanged(ctx, u)
 }
 
