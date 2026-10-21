@@ -47,6 +47,8 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
+	// writeTimeout replaces the transport's WriteTimeout when set.
+	writeTimeout time.Duration
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -92,7 +94,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 				px.FlowClosed(id)
 			}
 		},
-		Logger: rt.Logger,
+		WriteTimeout: d.writeTimeout,
+		Logger:       rt.Logger,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
