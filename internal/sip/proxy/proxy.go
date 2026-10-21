@@ -726,6 +726,7 @@ type Stats struct {
 	Cancels             uint64 // CANCELs sent downstream
 	TimerC              uint64 // INVITE branches whose Timer C fired
 	TargetTimeouts      uint64 // branches whose Target.Timeout fired
+	TargetTimeoutsKept  uint64 // of those, branches Target.OnTimeout kept
 	Overloaded          uint64 // requests and branches refused at MaxContexts or MaxContextBytes
 	Loops               uint64 // requests answered 482 (RFC 3261 §16.3 step 4)
 	Silenced            uint64 // non-INVITE requests left unanswered instead of 408 (RFC 4320 §4.2)
@@ -746,7 +747,7 @@ type Stats struct {
 }
 
 type counters struct {
-	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
+	branches, targetsDropped, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
 	upstreamErrors, drained atomic.Uint64
 }
@@ -765,6 +766,7 @@ func (p *Proxy) Stats() Stats {
 		Cancels:                s.cancels.Load(),
 		TimerC:                 s.timerC.Load(),
 		TargetTimeouts:         s.targetTimeouts.Load(),
+		TargetTimeoutsKept:     s.targetTimeoutsKept.Load(),
 		Overloaded:             s.overloaded.Load(),
 		Loops:                  s.loops.Load(),
 		Silenced:               s.silenced.Load(),

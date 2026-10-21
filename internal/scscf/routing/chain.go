@@ -228,6 +228,25 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 		// An INVITE's branch may ring for long, and Timeout would cancel
 		// it: the server's silence is Timer B's to find (RFC 3261 §17.1.1).
 		t.Timeout = rt.cfg.ASTimeout
+		// ASTimeout bounds only the wait for the server to answer or to
+		// send the request back. Once it has sent it back, the far end
+		// answers along this branch, on the transaction's own timers
+		// (#386). Which came first is settled as for the default handling:
+		// the timeout takes the position unless the return did, so a copy
+		// sent back after it is refused as late.
+		t.OnTimeout = func(ctx context.Context) bool {
+			taken, err := rt.takeUp(ctx, odi, state.ODIDefault, expires)
+			switch {
+			case err != nil:
+				// The timeout applies, as it did before the store said.
+				rt.internalLog("taking up a position in an iFC chain", err)
+				return true
+			case !taken:
+				rt.count("routing.ifc.returned_before_timeout")
+				return false
+			}
+			return true
+		}
 	}
 	return step{hops: []hop{{
 		target: t,

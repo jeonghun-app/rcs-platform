@@ -171,6 +171,13 @@ type Target struct {
 	// timeout is answered 504, which OnFinal may change: unlike a 408 after
 	// Timer F (RFC 4320 §4.2) it reaches the client in time.
 	Timeout time.Duration
+	// OnTimeout, if set, runs when Timeout passes, on a goroutine of its own
+	// with the hooks' context, and reports whether the timeout ends the
+	// branch: false keeps it, and it ends on its transaction's own timers
+	// then, as a branch without Timeout does. scscf keeps the branch to an
+	// application server that has sent the request back meanwhile, as the
+	// far end is now the one answering (#386).
+	OnTimeout func(ctx context.Context) bool
 }
 
 // Forward is the decision to send a request on to its Request-URI unchanged,

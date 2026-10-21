@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -124,5 +125,54 @@ func TestTheChainsAnswerDropsTheServersRetryAfter(t *testing.T) {
 	d.OnFinal(bg, busy)
 	if busy.StatusCode != 480 || busy.Header.Get("Retry-After") != "" {
 		t.Errorf("answered %d with Retry-After %q", busy.StatusCode, busy.Header.Get("Retry-After"))
+	}
+}
+
+// TestASTimeoutBoundsOnlyTheWaitForTheServer (#386): once the server has
+// sent a non-INVITE back, its branch is no longer cut at ASTimeout, as the
+// far end answers along it; a server that has not keeps the timeout, and a
+// copy it sends back after that is late. Either way, as for the default
+// handling, the first of the two to take up the position decides.
+func TestASTimeoutBoundsOnlyTheWaitForTheServer(t *testing.T) {
+	for _, handling := range []ifc.DefaultHandling{ifc.SessionContinued, ifc.SessionTerminated} {
+		for _, returned := range []bool{true, false} {
+			name := map[ifc.DefaultHandling]string{ifc.SessionContinued: "SESSION_CONTINUED", ifc.SessionTerminated: "SESSION_TERMINATED"}[handling]
+			t.Run(fmt.Sprintf("%s, sent back %v", name, returned), func(t *testing.T) {
+				e := newEnv(t)
+				e.registered(binding(1, 0, time.Hour))
+				e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), handling))
+				r := fromUser(t, "OPTIONS", impu2)
+				d := e.router(nil).Initial(bg, r)
+				tg := d.Targets[0]
+				if tg.Timeout != DefaultASTimeout || tg.OnTimeout == nil {
+					t.Fatalf("timeout %v, OnTimeout set %v", tg.Timeout, tg.OnTimeout != nil)
+				}
+				if returned {
+					if got := serverOf(t, e.router(nil).Initial(bg, backFrom(t, r, d, 0))); got != "icscf.rcs.local" {
+						t.Fatalf("the copy sent back went to %s", got)
+					}
+				}
+				if applies := tg.OnTimeout(bg); applies == returned {
+					t.Fatalf("the timeout applies %v with the request sent back %v", applies, returned)
+				}
+				if returned {
+					if n := e.metrics.get("routing.ifc.returned_before_timeout"); n != 1 {
+						t.Errorf("returned_before_timeout %d", n)
+					}
+					return
+				}
+				// Sent back after the timeout took the position: late.
+				if got := e.router(nil).Initial(bg, backFrom(t, r, d, 0)); got.Status != 403 {
+					t.Errorf("a copy sent back after the timeout got %+v, want 403", got)
+				}
+			})
+		}
+	}
+	// An INVITE keeps no Timeout, and so no OnTimeout either.
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(30, rcsAS, method("INVITE"), ifc.SessionContinued))
+	if tg := e.router(nil).Initial(bg, fromUser(t, "INVITE", impu2)).Targets[0]; tg.Timeout != 0 || tg.OnTimeout != nil {
+		t.Errorf("an INVITE's branch has timeout %v, OnTimeout set %v", tg.Timeout, tg.OnTimeout != nil)
 	}
 }
