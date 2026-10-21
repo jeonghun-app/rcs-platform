@@ -385,6 +385,9 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	}
 	c.finalSent = true
 	acts := c.closeBranches()
+	// The request has its answer: what still prepares or resolves a
+	// branch for it, under reqCtx, stops (#382).
+	acts = append(acts, c.cancelReq)
 	sent := make(chan struct{})
 	hook := c.dec.OnResponse
 	acts = append(acts, func() {
@@ -555,19 +558,24 @@ func (b *branch) start() {
 		return
 	}
 	c.mu.Unlock()
-	fwd, dst, err := p.buildBranch(c.ctx, c.in, &c.dec, b.target, true)
+	// Under reqCtx, which a CANCEL and Drain's deadline end, so that a
+	// stalled Prepare or Resolver, such as pcscf waiting on msrp-relay, does
+	// not hold the 487 or the drain's answer back (#382).
+	fwd, dst, err := p.buildBranch(c.reqCtx, c.in, &c.dec, b.target, true)
 	if err == nil {
 		err = b.addVia(fwd, dst)
 	}
-	if err == nil {
+	{
 		// Prepare and the Resolver may have blocked: a 2xx, a 6xx or a CANCEL
 		// that came meanwhile means the branch must not be sent after all
 		// (§16.7 step 5, §16.10). A response that arrives while the send is
-		// under way is handled by the CANCEL that follows its provisional.
+		// under way is handled by the CANCEL that follows its provisional. A
+		// Prepare or Resolver the CANCEL cut short (#382) fails for that
+		// reason, not the branch's: it is unsent too, not a 500.
 		c.mu.Lock()
 		stopped := c.stopped()
 		c.mu.Unlock()
-		if stopped {
+		if err == nil && stopped || err != nil && c.reqCtx.Err() != nil {
 			c.mu.Lock()
 			acts := b.unsent()
 			c.mu.Unlock()
