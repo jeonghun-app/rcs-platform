@@ -2,6 +2,8 @@ package pcscf
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -124,5 +126,28 @@ func TestADrainedFlowsPendingRequestIs430(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// QA of #293: the wait after the drain is bounded. A REGISTER the core never
+// answers holds a request in progress to the end; the stop still returns
+// after answersWait, well inside the stop margin.
+func TestTheStopWaitForAnswersIsBounded(t *testing.T) {
+	icscf := startCoreNode(t, func(*sip.Request) string { return "" })
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
+	cfg.DrainTimeout = 200 * time.Millisecond
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1")})
+	c := dial(t, s.client, nil)
+	n := strconv.FormatInt(requests.Add(1), 10)
+	c.write(strings.ReplaceAll(registerText(outboundContact, "Supported: outbound"), "reg-1", "reg-stop-"+n))
+	icscf.receive(t)
+	start := time.Now()
+	s.stop()
+	if took := time.Since(start); took > 4*time.Second {
+		t.Errorf("stop took %v with a REGISTER pending at the core, want about answersWait", took)
+	}
+	if answersWait >= stopMargin {
+		t.Errorf("answersWait %v is not inside the %v stop margin", answersWait, stopMargin)
 	}
 }
