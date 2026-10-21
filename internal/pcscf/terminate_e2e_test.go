@@ -85,6 +85,14 @@ func coreRequest(method, contact, call, toTag string, cseq int, extra ...string)
 	return b.String()
 }
 
+// withAudioOffer gives text, a request with no body, an offer without
+// MSRP: an INVITE from the core without one is refused until #136's second
+// change.
+func withAudioOffer(text string) string {
+	audio := strings.Split(clientChatOffer, "m=message")[0]
+	return strings.Replace(text, "Content-Length: 0\r\n\r\n", fmt.Sprintf("Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", len(audio), audio), 1)
+}
+
 // registered registers a client over a new connection to s through icscf,
 // and returns it with the Path icscf received.
 func registered(t *testing.T, s *service, icscf *fakeCoreNode) (*peer, string) {
@@ -120,10 +128,10 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 	core := dial(t, s.core, nil)
 	contact := "sip:alice@192.0.2.10:40000;transport=tcp"
 	call := fmt.Sprintf("term-e2e-%d", requests.Add(1))
-	core.write(coreRequest("INVITE", contact, call, "", 1, "Route: <"+path+">", "Record-Route: "+scscfRR,
+	core.write(withAudioOffer(coreRequest("INVITE", contact, call, "", 1, "Route: <"+path+">", "Record-Route: "+scscfRR,
 		fmt.Sprintf("Contact: <sip:bob@scscf.rcs.internal:%d;transport=tcp>", scscfPort),
 		"P-Asserted-Identity: <"+bobIMPU+">", "P-Called-Party-ID: <"+aliceIMPU+">",
-		"P-Charging-Vector: icid-value="+coreICID+";orig-ioi=home.example.net", "P-Charging-Function-Addresses: ccf=192.0.2.200"))
+		"P-Charging-Vector: icid-value="+coreICID+";orig-ioi=home.example.net", "P-Charging-Function-Addresses: ccf=192.0.2.200")))
 	invite := c.nextRequest()
 	// The network's charging data stays in the network (TS 24.229 §5.2.1).
 	if invite.Header.Has("P-Charging-Vector") || invite.Header.Has("P-Charging-Function-Addresses") {
@@ -214,7 +222,7 @@ func TestACallFromTheCoreReachesTheClientAndItsDialogFollows(t *testing.T) {
 
 	// A call the client turns down: its 486 brings no preference of the
 	// client's to the core (QA of #221).
-	core.write(coreRequest("INVITE", contact, "term-busy", "", 1, "Route: <"+path+">", "P-Called-Party-ID: <"+aliceIMPU+">"))
+	core.write(withAudioOffer(coreRequest("INVITE", contact, "term-busy", "", 1, "Route: <"+path+">", "P-Called-Party-ID: <"+aliceIMPU+">")))
 	busy := c.nextRequest()
 	c.write(respondTo(busy, 486, "a2", preferred))
 	if res := core.final(); res.StatusCode != 486 || res.Header.Has("P-Preferred-Identity") {
