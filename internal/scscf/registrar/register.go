@@ -801,7 +801,7 @@ func (g *Registrar) tombstone(ctx context.Context, key state.SetKey, cur *state.
 		if err != nil {
 			return nil, err
 		}
-		cur = &state.Registration{Key: key, Incarnation: inc, Identities: []state.SetIdentity{{IMPU: key.IMPU}}}
+		cur = &state.Registration{Key: key, Incarnation: inc, Identities: []state.SetIdentity{{IMPU: key.IMPU}}, Tombstone: true}
 	} else {
 		cur = cur.Clone()
 	}

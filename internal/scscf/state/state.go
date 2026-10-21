@@ -168,6 +168,11 @@ type Registration struct {
 	// may register different identities of it. It is empty in a record saved
 	// before it was kept, whose end names Key.IMPU.
 	RegisteredAs []string
+	// Tombstone marks a deregistration's lease that holds the key of a set
+	// that was already gone (registrar's undoIfEnded): nothing was
+	// registered under it, so its end tells the application servers
+	// nothing. It has no contacts, and Deregistering is set.
+	Tombstone bool
 	// Version is the stored version, 0 before the first save. Saves are
 	// conditional on it (optimistic concurrency). A new item starts at a
 	// random value (FirstVersion), and every save raises it, so of two reads
@@ -378,6 +383,9 @@ func (r *Registration) Validate() error {
 	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
+	}
+	if r.Tombstone && (len(r.Contacts) > 0 || r.Deregistering.IsZero()) {
+		return fmt.Errorf("%w: a tombstone has contacts or no lease", ErrInvalid)
 	}
 	if len(r.RegisteredAs) > MaxIdentities {
 		return fmt.Errorf("%w: more than %d identities in RegisteredAs", ErrInvalid, MaxIdentities)

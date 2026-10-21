@@ -203,6 +203,12 @@ func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	again := Registration(IMPI1, IMPU1, time.Hour)
 	_, err := b.SaveRegistration(ctx(t), again)
 	wantErr(t, err, state.ErrExists)
+	tomb := Registration(IMPI2, IMPU2)
+	tomb.Deregistering, tomb.Tombstone = T0.Add(time.Minute), true
+	tomb.Version = must(a.SaveRegistration(ctx(t), tomb))(t).Version
+	if got := must(b.Registration(ctx(t), state.SetKey{IMPI: IMPI2, IMPU: IMPU2}))(t); !reflect.DeepEqual(got, tomb) {
+		t.Errorf("read tombstone %+v, want %+v", got, tomb)
+	}
 	_, err = a.Registration(ctx(t), Key1(IMPU2))
 	wantErr(t, err, state.ErrNotFound)
 }
@@ -373,9 +379,13 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	before1970.Unregistered = time.Date(1969, 12, 31, 0, 0, 0, 0, time.UTC)
 	after9999 := Registration(IMPI1, IMPU1)
 	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	tombstoneWithContacts := Registration(IMPI1, IMPU1, time.Hour)
+	tombstoneWithContacts.Tombstone = true
+	tombstoneWithoutLease := Registration(IMPI1, IMPU1)
+	tombstoneWithoutLease.Tombstone = true
 	registeredAsNonCanonical := Registration(IMPI1, IMPU1, time.Hour)
 	registeredAsNonCanonical.RegisteredAs = []string{"sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999, registeredAsNonCanonical} {
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999, registeredAsNonCanonical, tombstoneWithContacts, tombstoneWithoutLease} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}

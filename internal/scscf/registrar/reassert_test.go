@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
@@ -751,5 +752,39 @@ func TestARegisterThatTakesOverTheTombstoneIsMarked(t *testing.T) {
 	r := must(e.store.Registration(bg, set1))(t)
 	if len(r.Contacts) != 1 || sars[len(sars)-1] == cx.UserDeregistration && r.Reassert.IsZero() {
 		t.Errorf("SARs %v; record %d contacts, Reassert %v: registered here, the HSS last told USER_DEREGISTRATION, and nothing marked", sars, len(r.Contacts), r.Reassert)
+	}
+}
+
+// TestTheSweepThatEndsATombstoneTellsTheServersNothing (#410 code review):
+// the user's deregistration told the application servers of the end; the
+// undo's tombstone, which the sweep ends after its lease, tells them no
+// second time.
+func TestTheSweepThatEndsATombstoneTellsTheServersNothing(t *testing.T) {
+	e := newEnv(t)
+	tp := &recordedThirdParty{}
+	u := reassertDue(t, e, e.instance(1, withThirdParty(tp)))
+	b := &beforeSAR{HSS: e.hss, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2, withThirdParty(tp)), 0), 200) }
+	if _, err := e.instance(3, func(c *Config) { c.HSS, c.ThirdParty = b, tp }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	if r := must(e.store.Registration(bg, set1))(t); !r.Tombstone {
+		t.Fatalf("no tombstone: %+v", r)
+	}
+	e.clock.advance(state.SweepLease)
+	if _, err := e.instance(9, withThirdParty(tp)).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("the tombstone outlived the sweep: %v", err)
+	}
+	ends := 0
+	for _, r := range tp.got() {
+		if r.Type == ifc.DeRegistration {
+			ends++
+		}
+	}
+	if ends != 1 {
+		t.Errorf("the servers heard of the end %d times, want once", ends)
 	}
 }
