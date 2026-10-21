@@ -201,8 +201,11 @@ send it again. It also carries:
 - `From` with the sender's CPIM name as its display name, escaped by the engine
   (`EscapeDisplayName`) and written as a quoted string, its backslashes escaped
   again;
-- `P-Asserted-Service` and `Accept-Contact` with the standalone messaging ICSI
-  (`urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg`);
+- `P-Asserted-Service` with the standalone messaging ICSI
+  (`urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg`), and `Accept-Contact` with
+  the same ICSI and `;require;explicit`, so that `scscf` forks it only to the
+  contacts that registered that ICSI, not to a device without CPM (RFC 3841,
+  #332);
 - the conversation headers when the message has them, and the CPIM body as
   `message/cpim`.
 
