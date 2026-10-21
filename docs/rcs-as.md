@@ -1248,6 +1248,7 @@ identifier ever appears in a metric name.
 | `sip.invite.first_message.<status>`, `sip.invite.answer_ignored` | First messages in a client's INVITE, by the status a pager MESSAGE would get; retransmitted 2xx responses that set up no dialog |
 | `leg.unbound` | Legs closed because no connection bound them in time |
 | `sip.session.expired`, `sip.session.no_ack` | Sessions rcs-as ended for an unrefreshed timer, and for a 2xx without an ACK |
+| `sip.close.subscription_unfinished` | Subscriptions whose last NOTIFY, or whose lock held by a slow roster read, a stop gave up waiting for at its bound |
 | `sip.bye.sent`, `sip.bye.received`, `sip.refresh.answered`, `sip.refresh.refused` | Session ends and refreshes |
 | `sip.dialog.unresolved`, `sip.dialog.unsent` | Requests in a dialog (ACK, BYE) without a next hop, or not sent |
 | `sip.register.taken`, `sip.register.ended` | Third-party registrations and de-registrations |

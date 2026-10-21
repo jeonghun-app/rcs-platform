@@ -451,10 +451,13 @@ func (s *Server) close() {
 			case done := <-ended:
 				select {
 				case <-done:
+					return
 				case <-ctx.Done():
 				}
 			case <-ctx.Done():
 			}
+			// Its last NOTIFY, or its lock, outlasted the bound.
+			s.cfg.Metrics.Count("sip.close.subscription_unfinished", 1)
 		})
 	}
 	wg.Wait()
