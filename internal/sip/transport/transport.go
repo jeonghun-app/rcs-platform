@@ -689,6 +689,10 @@ type Stats struct {
 	// ProxyHeaderErrors counts every other failure of a header begun, so
 	// that it says the NLB is not sending the header.
 	ProxyHeaderEmpty uint64
+	// BytesWritten counts what the stream connections' writers have handed
+	// the kernel, chunk by chunk (writeAll), so it moves while a long message
+	// is still going out, which QueuedBytes does only once it is all written.
+	BytesWritten uint64
 }
 
 type counters struct {
@@ -696,7 +700,7 @@ type counters struct {
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
 	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses,
-	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty atomic.Uint64
+	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty, bytesWritten atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -732,6 +736,7 @@ func (t *Transport) Stats() Stats {
 		IdleTimeouts:       c.idleTimeouts.Load(),
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
+		BytesWritten:       c.bytesWritten.Load(),
 		QueueOverflows:     c.queueOverflows.Load(),
 		QueueWaitTimeouts:  c.queueWaitTimeouts.Load(),
 		BudgetSheds:        c.budgetSheds.Load(),

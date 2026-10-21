@@ -159,3 +159,43 @@ func steadyReaderRun(t *testing.T, writeTimeout time.Duration) (read int, pause 
 		}
 	}
 }
+
+// BytesWritten counts a long message chunk by chunk as the peer takes it,
+// before the whole message leaves the queue, which is what a stop that
+// waits for a slow reader judges its progress by (code review of #366).
+func TestBytesWrittenMovesWhileALongMessageGoesOut(t *testing.T) {
+	server, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	release := make(chan struct{})
+	var read atomic.Int64
+	go func() {
+		buf := make([]byte, writeChunk)
+		for {
+			n, err := peer.Read(buf)
+			if read.Add(int64(n)) >= writeChunk {
+				<-release // hold the rest of the message back
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{noWriteDeadline{server}}})
+	listen(t, tr, ListenerConfig{Network: TCP})
+	req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKbytes")
+	req.Body = []byte(strings.Repeat("x", 4*writeChunk))
+	if _, err := tr.SendRequest(req, pipeDst); err != nil {
+		t.Fatal(err)
+	}
+	// The pipe takes nothing more until release, so the first chunk is out
+	// and the message is not.
+	eventually(t, "the first chunk to be counted", func() bool { return tr.Stats().BytesWritten >= writeChunk })
+	if st := tr.Stats(); st.QueuedBytes == 0 || st.BytesWritten >= uint64(4*writeChunk) {
+		t.Fatalf("queued %d, written %d, want the message still going out", st.QueuedBytes, st.BytesWritten)
+	}
+	close(release)
+	eventually(t, "the message to be out", func() bool { return tr.Stats().QueuedBytes == 0 })
+	if got := tr.Stats().BytesWritten; got != uint64(read.Load()) {
+		t.Fatalf("BytesWritten %d, but the peer read %d", got, read.Load())
+	}
+}

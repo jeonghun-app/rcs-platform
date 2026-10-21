@@ -245,6 +245,7 @@ func (t *Transport) writeAll(f *flow, b []byte) error {
 		if _, err := f.conn.Write(b[:n]); err != nil {
 			return err
 		}
+		t.stats.bytesWritten.Add(uint64(n))
 		f.q.progress.Store(time.Now().UnixNano())
 		b = b[n:]
 	}

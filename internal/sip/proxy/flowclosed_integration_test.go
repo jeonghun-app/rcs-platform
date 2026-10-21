@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,5 +205,115 @@ func TestDrainDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
 	}
 	if tr.Stats().QueuedBytes == 0 {
 		t.Fatal("the peer's queue emptied, so nothing showed that Drain stopped waiting on it")
+	}
+}
+
+// A peer that reads, slowly, still gets a long answer that takes it well
+// past drainFlushStall to read: what counts as progress is bytes written,
+// chunk by chunk, not a whole message leaving the queue (code review of
+// #366). The peer reads 32 KiB every 45 ms, about 700 KB/s, so the 900 KiB
+// answer takes over a second, longer than drainFlushStall, while the kernel
+// takes more of it every quarter second or so. The transport closes right
+// after Drain, as in pcscf, and drops whatever is left. DrainSendWait is an
+// hour, so only the stall rule could cut the answer short.
+func TestDrainWaitsForAPeerThatReadsALongAnswerSlowly(t *testing.T) {
+	const long = 900 << 10
+	drainSendWait = time.Hour
+	t.Cleanup(func() { drainSendWait = DrainSendWait })
+	responded := make(chan struct{}, 2)
+	var px atomic.Pointer[Proxy]
+	tr, err := transport.New(transport.Config{}, func(in transport.Inbound) {
+		if p := px.Load(); p != nil {
+			p.Receive(in)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	addr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(tr, Config{
+		Self: []sip.URI{mustURI("sip:" + addr.String() + ";lr")},
+		Router: RouterFunc(func(_ context.Context, r *Request) Decision {
+			size := 10
+			if r.Message.Method == "MESSAGE" {
+				size = long
+			}
+			return Decision{Serve: func(_ context.Context, u *UAS) {
+				res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				res.Header.Set("Content-Type", "text/plain")
+				res.Body = []byte(strings.Repeat("b", size))
+				if err := u.Respond(res); err != nil {
+					t.Errorf("answering %s: %v", r.Message.Method, err)
+				}
+				responded <- struct{}{}
+			}}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	px.Store(p)
+
+	peer := dialSIP(t, addr.String())
+	// The two sockets' buffers then hold well under the long answer, so it
+	// is still in the queue when Drain starts.
+	if tc, ok := peer.nc.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(64 << 10)
+	}
+	_ = peer.nc.SetDeadline(time.Now().Add(time.Minute))
+	peer.send(t, "MESSAGE", "long")
+	peer.send(t, "OPTIONS", "short")
+	for range 2 {
+		select {
+		case <-responded:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the handlers did not answer")
+		}
+	}
+	if tr.Stats().QueuedBytes == 0 {
+		t.Fatal("the answers are already out, so Drain has nothing to wait for")
+	}
+	read := make(chan []byte, 1)
+	go func() {
+		var got bytes.Buffer
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := peer.nc.Read(buf)
+			got.Write(buf[:n])
+			if err != nil {
+				read <- got.Bytes()
+				return
+			}
+			time.Sleep(45 * time.Millisecond)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	p.Drain(ctx)
+	_ = tr.Close()
+	r := sip.NewReader(bufio.NewReader(bytes.NewReader(<-read)), sip.Limits{MaxBodyBytes: 1 << 20})
+	var sizes []int
+	for {
+		m, err := r.ReadMessage()
+		if err != nil {
+			break
+		}
+		if res, ok := m.(*sip.Response); ok && res.StatusCode == 200 {
+			sizes = append(sizes, len(res.Body))
+		}
+	}
+	// The two handlers answer concurrently, so either may come first.
+	slices.Sort(sizes)
+	if !slices.Equal(sizes, []int{10, long}) {
+		t.Fatalf("the peer got answers of %v bytes, want the long one and the short one", sizes)
 	}
 }
