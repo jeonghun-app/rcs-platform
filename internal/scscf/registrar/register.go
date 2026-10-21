@@ -617,22 +617,77 @@ const reassertBackoff = time.Minute
 // set's identities at the record again, which the deregistration may have
 // deleted. If the HSS cannot be told, the record is marked (Reassert) for a
 // sweep to try again: the HSS may otherwise hold the set as deregistered
-// while its devices are registered here.
+// while its devices are registered here. If it is told, a deregistration
+// that ended the set meanwhile is told again (undoIfEnded).
 func (g *Registrar) reassign(ctx context.Context, reg *state.Registration) error {
 	g.count("registrar.reassigned")
-	if err := g.point(ctx, reg, latestExpiry(reg.Contacts).Add(state.ProfileGrace)); err != nil {
+	if err := g.point(ctx, reg, keepUntil(reg).Add(state.ProfileGrace)); err != nil {
 		return err
 	}
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
 		UserName: reg.Key.IMPI, PublicIdentities: []string{reg.Key.IMPU},
-		AssignmentType: cx.Registration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
+		AssignmentType: assignmentOf(reg), UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
 	})
 	if err == nil && saa != nil && cxclient.Classify(saa.Result) == cxclient.Success {
-		return nil
+		return g.undoIfEnded(ctx, reg.Key)
 	}
 	g.count("registrar.hss_failed")
 	g.count("registrar.reassert_failed")
 	return g.markReassert(ctx, reg)
+}
+
+// assignmentOf is the SAR that tells the HSS again that this S-CSCF serves
+// reg's set (TS 29.228 §6.1.2): UNREGISTERED_USER for an unregistered
+// user's record, which has no binding, REGISTRATION for a registration.
+// Told REGISTRATION, the HSS would take an unregistered user for one
+// registered here (#210 code review).
+func assignmentOf(reg *state.Registration) cx.ServerAssignmentType {
+	if !reg.Unregistered.IsZero() {
+		return cx.UnregisteredUser
+	}
+	return cx.Registration
+}
+
+// undoIfEnded reads key's set again after a SAR the HSS took that tells it
+// this S-CSCF serves the set (reassign, reassert). A deregistration that
+// ended the set meanwhile, a user's or an RTR's, may have reached the HSS
+// first: the HSS then holds an assignment that no record here backs and
+// that no sweep would end (#241). So if the set is gone or no longer live,
+// the HSS is told again (SAR USER_DEREGISTRATION). A REGISTER that makes
+// the set live after that read sent its own SAR, which may in turn have
+// reached the HSS before this one: the record is marked for a sweep to
+// tell the HSS again (markReassert), as a crossed deregistration's is.
+func (g *Registrar) undoIfEnded(ctx context.Context, key state.SetKey) error {
+	again, f := g.set(ctx, key)
+	switch {
+	case f != nil:
+		return f
+	case again != nil && live(again, g.cfg.Now()):
+		return nil
+	}
+	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: key.IMPI, PublicIdentities: []string{key.IMPU}, AssignmentType: cx.UserDeregistration})
+	var res cx.Result
+	if saa != nil {
+		res = saa.Result
+	}
+	o := cxclient.Classify(res)
+	if err != nil {
+		o = cxclient.ErrorOutcome(err)
+	}
+	if o != cxclient.Success && !permanent(o) {
+		// No record is left for a sweep to try again from: the HSS holds
+		// the set until the user registers again, as before #241.
+		g.count("registrar.reassert_undo_failed")
+		return errors.New("registrar: SAR USER_DEREGISTRATION undoing a reassertion failed: " + o.String())
+	}
+	g.count("registrar.reassert_undone")
+	if again, f = g.set(ctx, key); f != nil {
+		return f
+	}
+	if again != nil && live(again, g.cfg.Now()) {
+		return g.markReassert(ctx, again)
+	}
+	return nil
 }
 
 // markReassert sets reg's Reassert, under the version read, unless the

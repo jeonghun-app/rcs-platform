@@ -220,3 +220,197 @@ func TestRepointingAnIdentityNeverBringsItsKeepUntilCloser(t *testing.T) {
 		t.Errorf("tel1 after the set changed: %+v, %v; want barred and kept until %v", id, err, long)
 	}
 }
+
+// beforeSAR runs hook once before it forwards the first SAR that match
+// takes: what happens elsewhere while that SAR is on its way to the HSS.
+type beforeSAR struct {
+	HSS
+	match func(*cx.SAR) bool
+	once  sync.Once
+	hook  func()
+}
+
+func (b *beforeSAR) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
+	if b.match(r) {
+		b.once.Do(b.hook)
+	}
+	return b.HSS.SAR(ctx, r)
+}
+
+// isReassertion matches a SAR that tells the HSS again that this S-CSCF
+// serves a set, which asks for no User-Data, unlike a REGISTER's own.
+func isReassertion(r *cx.SAR) bool {
+	return r.UserDataAlreadyAvailable == cx.UserDataAlreadyAvailable &&
+		(r.AssignmentType == cx.Registration || r.AssignmentType == cx.UnregisteredUser)
+}
+
+// wantDeregisteredLast fails unless the set is gone here and the HSS was
+// last told of a deregistration.
+func wantDeregisteredLast(t *testing.T, e *env) {
+	t.Helper()
+	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("the set is still here: %v", err)
+	}
+	if got := e.hss.sarsOf(); len(got) == 0 || got[len(got)-1] != cx.UserDeregistration {
+		t.Errorf("SARs %v, want the HSS told USER_DEREGISTRATION last", got)
+	}
+}
+
+// TestAReassertOvertakenByADeregistrationIsUndone (#241; QA on #210): the
+// sweep's SAR REGISTRATION reaches the HSS after the user's deregistration,
+// or an RTR's end, has; the HSS is told of the deregistration again.
+func TestAReassertOvertakenByADeregistrationIsUndone(t *testing.T) {
+	for name, end := range map[string]func(t *testing.T, e *env, u *ue){
+		"the user's": func(t *testing.T, e *env, u *ue) { wantStatus(t, u.registerWith(e.instance(2), 0), 200) },
+		"an RTR's": func(t *testing.T, e *env, _ *ue) {
+			wantResult(t, e.instance(2).HandleRTR(bg, &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}}), resultSuccess)
+		},
+		// One still under way: its lease holds the record, its SAR has
+		// reached the HSS.
+		"one under way": func(t *testing.T, e *env, _ *ue) {
+			r := must(e.store.Registration(bg, set1))(t)
+			r.Contacts, r.Deregistering = nil, e.clock.Now().Add(state.SweepLease)
+			must(e.store.SaveRegistration(bg, r))(t)
+			must(e.hss.SAR(bg, &cx.SAR{UserName: impi1, PublicIdentities: []string{impu1}, AssignmentType: cx.UserDeregistration}))(t)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			u := reassertDue(t, e, e.instance(1))
+			b := &beforeSAR{HSS: e.hss, match: isReassertion}
+			b.hook = func() { end(t, e, u) }
+			m := &counts{}
+			if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err != nil {
+				t.Fatal(err)
+			}
+			if name == "one under way" {
+				// The deregistration under way finishes after.
+				must(0, e.store.DeleteRegistration(bg, must(e.store.Registration(bg, set1))(t)))(t)
+			}
+			wantDeregisteredLast(t, e)
+			if m.get("registrar.reassert_undone") != 1 {
+				t.Errorf("registrar.reassert_undone = %d", m.get("registrar.reassert_undone"))
+			}
+		})
+	}
+}
+
+// TestAReassignOvertakenByADeregistrationIsUndone (#241; code review on
+// #210): A's deregistration was overtaken by B's registration, and while
+// the SAR that gives the set back to the HSS is on its way, B deregisters
+// to the end.
+func TestAReassignOvertakenByADeregistrationIsUndone(t *testing.T) {
+	e := newEnv(t)
+	a := e.akaUser(impi1, impu1, tel1)
+	a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+	b := device(a, 2)
+	overtaken := &crossingHSS{HSS: e.hss, kind: cx.UserDeregistration}
+	overtaken.hook = func() { wantStatus(t, b.registerWith(e.instance(2), 600), 200) }
+	reassigned := &beforeSAR{HSS: overtaken, match: isReassertion}
+	reassigned.hook = func() { wantStatus(t, b.registerWith(e.instance(4), 0), 200) }
+	g := e.instance(3, func(c *Config) { c.HSS = reassigned })
+	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, a.request(0, auth), upstream), 200)
+	wantDeregisteredLast(t, e)
+}
+
+// TestAnUndoOvertakenByARegistrationMarksTheSet (#241): a REGISTER that
+// makes the set live again while the undo's SAR is on its way may have its
+// SAR reach the HSS first; the record is marked for a sweep to tell the
+// HSS again.
+func TestAnUndoOvertakenByARegistrationMarksTheSet(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: e.hss, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	undo := &beforeSAR{HSS: b, match: func(r *cx.SAR) bool { return r.AssignmentType == cx.UserDeregistration }}
+	undo.hook = func() { wantStatus(t, u.registerWith(e.instance(4), 600), 200) }
+	// The user's own deregistration goes through e.hss: only the sweep's
+	// SARs pass the hooks, the undo first among USER_DEREGISTRATIONs.
+	if _, err := e.instance(3, func(c *Config) { c.HSS = undo }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	r := must(regOf(e, impu1))(t)
+	if len(r.Contacts) != 1 || !r.Reassert.Equal(e.clock.Now().Add(reassertBackoff)) {
+		t.Errorf("after the undo: %d contacts, Reassert %v", len(r.Contacts), r.Reassert)
+	}
+}
+
+// TestAnUnregisteredUsersRecordIsReassignedAsUnregistered (#241, #210 code
+// review): the record that overtook a deregistration is an unregistered
+// user's, as a terminating request leaves one (#14), and the HSS is told
+// UNREGISTERED_USER, not REGISTRATION; its identities are kept until its
+// state ends.
+func TestAnUnregisteredUsersRecordIsReassignedAsUnregistered(t *testing.T) {
+	e := newEnv(t)
+	a := e.akaUser(impi1, impu1, tel1)
+	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+	// Past what A's registration kept the identities for.
+	until := e.clock.Now().Add(600*time.Second + state.ProfileGrace + time.Hour)
+	ch := &crossingHSS{HSS: e.hss, kind: cx.UserDeregistration}
+	ch.hook = func() {
+		r := must(e.store.Registration(bg, set1))(t)
+		r.Deregistering, r.Unregistered, r.Incarnation = time.Time{}, until, r.Incarnation+1
+		must(e.store.SaveRegistration(bg, r))(t)
+	}
+	g := e.instance(3, func(c *Config) { c.HSS = ch })
+	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, a.request(0, auth), upstream), 200)
+	got := e.hss.sarsOf()
+	if len(got) == 0 || got[len(got)-1] != cx.UnregisteredUser {
+		t.Errorf("SARs %v, want UNREGISTERED_USER last", got)
+	}
+	for _, impu := range []string{impu1, tel1} {
+		id := must(e.store.Identity(bg, impu, e.clock.Now()))(t)
+		if id.KeepUntil.Before(until) {
+			t.Errorf("%s kept until %v, before the state ends at %v", impu, id.KeepUntil, until)
+		}
+	}
+}
+
+// failingSARs fails every SAR of a kind that passes it, as an HSS out of
+// reach does.
+type failingSARs struct {
+	HSS
+	kind cx.ServerAssignmentType
+}
+
+func (f *failingSARs) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
+	if r.AssignmentType == f.kind {
+		return nil, errUnreachable
+	}
+	return f.HSS.SAR(ctx, r)
+}
+
+// TestAnUndoTheHSSDoesNotTakeIsCounted (#241): with no record left, no sweep
+// tries it again, so the failure is counted and returned.
+func TestAnUndoTheHSSDoesNotTakeIsCounted(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: &failingSARs{HSS: e.hss, kind: cx.UserDeregistration}, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	m := &counts{}
+	if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err == nil {
+		t.Error("the sweep reported no failure")
+	}
+	if m.get("registrar.reassert_undo_failed") != 1 || m.get("registrar.reassert_undone") != 0 {
+		t.Errorf("undo_failed %d, undone %d", m.get("registrar.reassert_undo_failed"), m.get("registrar.reassert_undone"))
+	}
+}
+
+// TestAFailedReassertIsNotUndone (#241): a SAR the HSS did not take left
+// nothing to undo, whatever ended the set meanwhile.
+func TestAFailedReassertIsNotUndone(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: &failingSARs{HSS: e.hss, kind: cx.Registration}, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	m := &counts{}
+	if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.hss.sarsOf(); m.get("registrar.reassert_undone") != 0 || got[len(got)-1] != cx.UserDeregistration || len(got) != 2 {
+		t.Errorf("SARs %v, undone %d; want the user's deregistration last and alone after the registration", got, m.get("registrar.reassert_undone"))
+	}
+}

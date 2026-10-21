@@ -111,11 +111,14 @@ const maxReassertTries = 5
 // permanent one, or the last, gives up, counted, and the set's next
 // re-registration tells the HSS anyway. Saves are conditional on the version
 // the sweep claimed: a REGISTER that saved the set meanwhile told the HSS
-// itself and left no Reassert.
+// itself and left no Reassert. A save that loses after a SAR the HSS took
+// may have lost to a deregistration, which undoIfEnded tells the HSS of
+// again; one that wins shows that none has ended the set, and any that
+// follows sends its SAR after this one's answer.
 func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error {
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
 		UserName: reg.Key.IMPI, PublicIdentities: []string{reg.Key.IMPU},
-		AssignmentType: cx.Registration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
+		AssignmentType: assignmentOf(reg), UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
 	})
 	var res cx.Result
 	if saa != nil {
@@ -139,7 +142,10 @@ func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error
 		next.Reassert, next.ReassertAttempts = time.Time{}, 0
 	}
 	_, err = g.cfg.Store.SaveRegistration(ctx, next)
-	if errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound) {
+	switch {
+	case (errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound)) && o == cxclient.Success:
+		return g.undoIfEnded(ctx, reg.Key)
+	case errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound):
 		return nil
 	}
 	return err
