@@ -2,6 +2,7 @@ package sipas
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,7 +32,13 @@ type groupRig struct {
 
 func newGroupRig(t *testing.T, invitees ...string) *groupRig {
 	t.Helper()
-	r := newChatRig(t, messaging.Config{})
+	return newGroupRigWith(t, Config{}, invitees...)
+}
+
+// newGroupRigWith is newGroupRig on a Server configured by cfg.
+func newGroupRigWith(t *testing.T, cfg Config, invitees ...string) *groupRig {
+	t.Helper()
+	r := newChatRigWith(t, messaging.Config{}, cfg)
 	r.core.setAnswer(func(req *sip.Request) int {
 		if req.Method == "INVITE" {
 			return 486
@@ -533,5 +540,49 @@ func TestShutdownDeactivatesSubscriptions(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+// Close waits for the answer to a subscription's last NOTIFY, as it does
+// for a BYE's: the transport closing at once could drop it.
+func TestCloseWaitsForTheLastNotifysAnswer(t *testing.T) {
+	g := newGroupRigWith(t, Config{closeWait: time.Hour}, bob)
+	g.subscribe(t, alice, "600")
+	g.nextNotify(t)
+	// alice's session ends (she stays in the group), so that the only
+	// answer Close waits for is the NOTIFY's: the core answers in turn,
+	// and a BYE behind the held NOTIFY would hold Close too.
+	if res := g.inSession(t, alice, "a1", g.s, 2, "BYE", nil, ""); res.StatusCode != 200 {
+		t.Fatalf("alice's BYE answered %d", res.StatusCode)
+	}
+	got, held := make(chan struct{}, 1), make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	defer release()
+	t.Cleanup(release)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "NOTIFY" {
+			got <- struct{}{}
+			<-held
+		}
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	closed := make(chan struct{})
+	go func() { g.a.srv.Close(); close(closed) }()
+	select {
+	case <-got:
+	case <-time.After(waitFor):
+		t.Fatal("no NOTIFY on shutdown")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before its NOTIFY was answered")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-closed:
+	case <-time.After(waitFor):
+		t.Fatal("Close did not return after the answer")
 	}
 }
