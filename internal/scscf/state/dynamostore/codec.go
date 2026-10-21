@@ -23,9 +23,16 @@ type registrationDoc struct {
 	Identities    []identityRef `json:"identities"`
 	Contacts      []contactDoc  `json:"contacts,omitempty"`
 	Deregistering *time.Time    `json:"deregistering,omitempty"`
+	Rejected      bool          `json:"rejected,omitempty"`
 	Unregistered  *time.Time    `json:"unregistered,omitempty"`
 	Reassert      *time.Time    `json:"reassert,omitempty"`
 	Attempts      int           `json:"reassert_attempts,omitempty"`
+	// RegisteredAs is lost to an older instance's save, which is harmless:
+	// the end the network makes then names the default identity.
+	RegisteredAs []string `json:"registered_as,omitempty"`
+	// Tombstone is lost to an older instance's save too: the sweep that
+	// ends the record then tells the servers of an end once more.
+	Tombstone bool `json:"tombstone,omitempty"`
 }
 
 type identityRef struct {
@@ -76,6 +83,7 @@ func encodeRegistration(r *state.Registration) ([]byte, error) {
 	for _, id := range r.Identities {
 		doc.Identities = append(doc.Identities, identityRef{IMPU: id.IMPU, Barred: id.Barred})
 	}
+	doc.Rejected = r.Rejected
 	if !r.Deregistering.IsZero() {
 		t := r.Deregistering.UTC()
 		doc.Deregistering = &t
@@ -89,6 +97,7 @@ func encodeRegistration(r *state.Registration) ([]byte, error) {
 		doc.Reassert = &t
 	}
 	doc.Attempts = r.ReassertAttempts
+	doc.RegisteredAs, doc.Tombstone = r.RegisteredAs, r.Tombstone
 	for _, c := range r.Contacts {
 		doc.Contacts = append(doc.Contacts, contactDoc{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: c.Path, Expires: c.Expires.UTC(),
@@ -107,6 +116,7 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 	for _, id := range doc.Identities {
 		r.Identities = append(r.Identities, state.SetIdentity{IMPU: id.IMPU, Barred: id.Barred})
 	}
+	r.Rejected = doc.Rejected
 	if doc.Deregistering != nil {
 		r.Deregistering = *doc.Deregistering
 	}
@@ -117,6 +127,7 @@ func decodeRegistration(b []byte, version int64) (*state.Registration, error) {
 		r.Reassert = *doc.Reassert
 	}
 	r.ReassertAttempts = doc.Attempts
+	r.RegisteredAs, r.Tombstone = nilIfEmpty(doc.RegisteredAs), doc.Tombstone
 	for _, c := range doc.Contacts {
 		r.Contacts = append(r.Contacts, state.Contact{
 			URI: c.URI, Q: c.Q, InstanceID: c.InstanceID, RegID: c.RegID, Path: nilIfEmpty(c.Path), Expires: c.Expires,

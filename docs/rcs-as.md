@@ -5,9 +5,10 @@
 core: how 1-to-1 chat, group chat and standalone messages are accepted,
 stored, delivered and answered with disposition notifications (IMDN, RFC
 5438), and how group chats are run ([Group chat](#group-chat)). Of the SIP
-side, pager-mode MESSAGE is served ([The SIP layer](#the-sip-layer)); INVITE
-and SDP, the group chat focus over SIP and the third-party REGISTER from
-`scscf` come in later parts of #137. The core is driven through interfaces so
+side ([The SIP layer](#the-sip-layer)), pager-mode MESSAGE, 1-to-1 and
+large-mode sessions, the third-party REGISTER from `scscf` and the group chat
+focus (sessions, the conference event package and REFER) are served. The core
+is driven through interfaces so
 that it can be built and tested first.
 
 The code:
@@ -34,6 +35,7 @@ The code:
 | A pager-mode MESSAGE arrives (RFC 3428) | `Submit` with `Pager: true` and the `message/cpim` body |
 | A registration (scscf's third-party REGISTER) | `UserRegistered`, saying whether it is on a new flow, as far as rcs-as can tell ([Sessions](#sessions)) |
 | The BYE with `Reason: SIP;cause=488;text="MSRP direction not supported"` before any MSRP traffic (ADR 0004) | `InviteFailed` with `ErrNoSessions` |
+| A group's invitees are to be invited, nothing being queued for them yet ([Group chat](#group-chat)) | `Invite` with the invitation, which the engine counts as its own and passes to `Deliverer.Invite`, so that a message queued meanwhile waits for that session |
 | A terminating large-mode leg is `Finished` | a BYE |
 | The SIP session ends | `Leg.Close` |
 
@@ -54,12 +56,24 @@ The SIP layer implements `Deliverer`:
   header the network vouches for.
 
 The SIP layer reads the `Conversation-ID`, `Contribution-ID` and
-`InReplyTo-Contribution-ID` headers with `ParseConversationHeaders`.
-Notifications in pager mode come without them (rcsjta), which gives an empty
-`Conversation`. The SIP layer must give `Origin.Sender` the identity the
-network asserted, never one the client chose. It must name each user in one
-canonical form, since the queue and the sent-message records are keyed by
-that string.
+`InReplyTo-Contribution-ID` headers with `ParseConversationHeaders`. rcsjta
+sends pager-mode messages and notifications without them, which gives an
+empty `Conversation`. A `Conversation-ID` or an `InReplyTo-Contribution-ID`
+without a `Contribution-ID` is refused (400). OMA CPM requires a sender to
+include `Conversation-ID` (Conversation Functions, Appendix C.1.1), but
+rcsjta, a pre-CPM client, sends a `Contribution-ID` alone with its INVITEs.
+rcs-as takes that as a leniency (#298): the engine gives such a 1-to-1
+message the pair's `Conversation-ID`, a name-based UUID of the two users'
+keys in sorted order (`PairConversationID`), so that every message between
+the same two keys, either way, threads together, and delivers it with that
+ID, as the sender C.1.1 asks it to be. A subscriber reached by a SIP name
+identity and by its tel URI has two keys (`UserOf` folds only a number's SIP
+and tel forms), and its messages so get two IDs. The ID is an unsalted hash
+of the two identities, so it is personal data, as they are, if it is ever
+logged. The SIP layer must give `Origin.Sender` the
+identity the network asserted, never one the client chose. It must name each
+user in one canonical form, since the queue and the sent-message records are
+keyed by that string.
 
 Legs offer and answer with `AcceptTypes(mode)`:
 
@@ -90,10 +104,11 @@ only the core reaches ([ADR 0007](adr/0007-internal-transport.md) §2). Its
 | Request | What rcs-as does |
 |---|---|
 | `MESSAGE` outside a dialog (pager mode, RFC 3428) | `Submit` with `Pager: true`, `Mode: Standalone`; answered as below |
+| any request to the conference factory or a conference URI, outside a dialog | a group chat's, told apart before anything else: an `INVITE` creates or joins the group, a `SUBSCRIBE` subscribes to its roster ([Group chat](#group-chat)), any other method is 405 with `Allow` |
 | `INVITE` outside a dialog | a chat or large-mode session, answered as in [Sessions](#sessions) |
 | `REGISTER` (scscf's third-party registration) | 200, and `UserRegistered` (see [Sessions](#sessions)) |
 | `OPTIONS` outside a dialog | forwarded along its `Route`, back to `scscf`: the default profile hands it to `rcs-as` with SESSION_CONTINUED, and capability discovery must not stop there |
-| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`; any other method 405); 481 when there is no such session, as for a `MESSAGE` in a dialog, since pager mode has none |
+| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`, and `REFER` in a session with a group; any other method 405), or in its subscription to a group's roster (`SUBSCRIBE`); 481 when there is no such session, as for a `MESSAGE` in a dialog, since pager mode has none |
 | `ACK` | the ACK of a 2xx rcs-as sent is taken by its UAS; any other is dropped |
 | anything else | 405 with `Allow` |
 
@@ -105,6 +120,15 @@ terminating requests to rcs-as again, lacking the default profile's
 `P-Served-User` exclusion ([HSS](hss.md)); rcs-as would otherwise take its own
 delivery for a new message and send it once more without end. A client that
 writes such a tag only has its own request refused.
+
+The focus's INVITEs to a group's participants carry no such tag: with #121, a
+group's requests pass from one task to the one that owns the group, which must
+serve them. One that comes back is known by its `From`, a conference URI, and
+is answered 482 and counted the same way; taken for a 1-to-1 chat from the
+group to the participant, it would loop as a delivery does. A request to the
+conference factory or a conference URI is a group chat's whatever it carries,
+so that none, a rejoin `INVITE` without a resource list say, becomes a 1-to-1
+chat with a conference URI (security review on #252).
 
 scscf hands rcs-as a request with the AS URI of the iFC on top of its `Route`
 (TS 24.229 §5.4.3.2), `HSS_RCS_AS_URI` (`sip:rcs-as.<RCS_SERVICE_NAMESPACE>` by
@@ -164,7 +188,7 @@ set.
 | not `message/cpim` | 415, with `Accept: message/cpim` |
 | no asserted identity, or not as above | 403 |
 | a Request-URI that names no user | 404 |
-| unreadable `Conversation-ID` or `Contribution-ID` | 400 |
+| unreadable `Conversation-ID` or `Contribution-ID`, or either of `Conversation-ID` and `InReplyTo-Contribution-ID` without a `Contribution-ID` | 400 |
 | refused for its size / type / syntax (`Rejection`) | 413 / 415 / 400; the 415 without `Accept`, since the client sent `message/cpim` already |
 | any other refusal (rates, queue full, forged or unrequested notification, ...) | 403 |
 | the store busy after its retries (`store.ErrBusy`) | 500 with `Retry-After: 1` |
@@ -189,8 +213,11 @@ send it again. It also carries:
 - `From` with the sender's CPIM name as its display name, escaped by the engine
   (`EscapeDisplayName`) and written as a quoted string, its backslashes escaped
   again;
-- `P-Asserted-Service` and `Accept-Contact` with the standalone messaging ICSI
-  (`urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg`);
+- `P-Asserted-Service` with the standalone messaging ICSI
+  (`urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg`), and `Accept-Contact` with
+  the same ICSI and `;require;explicit`, so that `scscf` forks it only to the
+  contacts that registered that ICSI, not to a device without CPM (RFC 3841,
+  #332);
 - the conversation headers when the message has them, and the CPIM body as
   `message/cpim`.
 
@@ -223,8 +250,10 @@ then:
 | a final failure | `InviteFailed`: 404 and 604 with `ErrUndeliverable`, 408, 430, 480 and 503 with `ErrOffline`, any other with an error of its own |
 | no final answer before the leg's `RCSAS_ANSWER_TIMEOUT` | CANCEL; the 487 is the failure; without one, the transaction is ended 32 s later (RFC 3261 §9.1) and the failure is `ErrOffline` |
 
-A group invitation is refused (`Invite` returns an error); group sessions come
-with the group focus's SIP layer (#137).
+A group invitation is the focus's INVITE ([Group chat](#group-chat)): from the
+conference URI, without the `rcsas-` tag, a 2xx joining the participant before
+`Leg.Answer`, and a 603 Decline leaving the group rather than going to
+`InviteFailed`.
 
 ### Sessions
 
@@ -244,9 +273,9 @@ A client's INVITE (the originating session):
 | none of the chat ICSI, the OMA SIMPLE IM tag `+g.oma.sip-im` (with which rcsjta, the reference client, asks for a chat) or the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service`; or an offer with `a=file-selector` (RFC 5547 §6), a file transfer, which rcsjta asks for with the same `+g.oma.sip-im` tag. File transfer is not served here | 403 |
 | no asserted identity, or not as for MESSAGE | 403 |
 | a Request-URI that names no user | 404 |
-| unreadable `Conversation-ID` or `Contribution-ID` | 400 |
+| unreadable `Conversation-ID` or `Contribution-ID`, or either of `Conversation-ID` and `InReplyTo-Contribution-ID` without a `Contribution-ID` | 400 |
 | `Session-Expires` below 90 s from a client with `Supported: timer` | 422 with `Min-SE: 90` (RFC 4028 §6); a client without the extension, which could not act on a 422, gets no timer instead |
-| a body that is not an SDP offer, or a `multipart/mixed` one other than one SDP part and at most one `message/cpim` part (a group INVITE's resource list, two descriptions, a nested multipart); no offer (a late offer); no MSRP line; an offer of `passive` (RFC 6135 §4.2.2); no type in common; a first message in a large-mode INVITE | 488 |
+| a body that is not an SDP offer, or a `multipart/mixed` one other than one SDP part and at most one `message/cpim` part (a resource list, which only a group chat's INVITE carries, two descriptions, a nested multipart); no offer (a late offer); no MSRP line; an offer of `passive` (RFC 6135 §4.2.2); no type in common; a first message in a large-mode INVITE | 488 |
 | a first message the engine refuses | as a pager MESSAGE's (413, 415, 400, 403, 500 with `Retry-After: 1`), and no session; the session's place is given back |
 | this task holds `RCSAS_MAX_SESSIONS` sessions, those still waiting for an answer included | 500 with `Retry-After: 1`, as for a busy store: the client may try again, and another task may take it |
 | the user has opened `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` sessions | 486 Busy Here |
@@ -306,9 +335,10 @@ In every session:
   rcs-as's 2xx has come, or rcs-as has sent its own ACK, since a callee must
   not send a BYE before the ACK (RFC 3261 §15). The answers and the ACKs share
   one bound of 2 s, and a BYE is sent when it runs out, ACK or not; a session
-  answered after it ends itself the same way, from its own path. The BYEs'
-  answers then have a bound of 2 s of their own, so shutdown takes at most
-  4 s here.
+  answered after it ends itself the same way, from its own path, and while
+  shutdown still waits for its own BYEs' answers it waits for those too. The
+  BYEs' answers have a bound of 2 s of their own, so shutdown takes at most
+  4 s here. Calls after the first wait for it, and end nothing twice.
 - **The MSRP direction.** A BYE with SIP cause 488 in its `Reason`, in a session
   rcs-as started that has carried no message yet, tells the engine
   `ErrNoSessions`: it is how pcscf ends a session whose client answered
@@ -318,7 +348,11 @@ In every session:
   those waiting for an answer included. A user's sessions are bounded each way
   apart: those it opens (`RCSAS_MAX_OUTGOING_SESSIONS_PER_USER`, 486 past it),
   and those rcs-as opens to it (`RCSAS_MAX_INCOMING_SESSIONS_PER_USER`), so
-  that other users' messages cannot take the user's own room. One sender has
+  that other users' messages cannot take the user's own room. A user's
+  subscriptions to group rosters are bounded across its groups
+  (`RCSAS_MAX_SUBSCRIPTIONS_PER_USER`, 486 past it), so that one account in
+  many groups cannot take the task's room for subscriptions, which
+  `RCSAS_MAX_SESSIONS` bounds too, from everyone else. One sender has
   at most one large-mode session open to one recipient at a time; the next
   message waits for it. A session rcs-as cannot start for a bound waits as for
   a recipient offline.
@@ -534,8 +568,143 @@ expired after `RCSAS_STORE_TTL` and gives up on them.
 
 `rcs-as` is the controlling function of RCC.07 Group Chat: a conference focus
 that the conference factory URI reaches. Each group has a conference URI of its
-own, `sip:chat-<128 random bits>@RCSAS_CONFERENCE_HOST`, and every participant
+own, `sip:chat-<32 hex digits>@RCSAS_CONFERENCE_HOST` (made from its Contribution-ID, or random without one), and every participant
 has a session with it: a leg of mode `group` whose peer is that URI.
+
+Group chat is off unless `RCSAS_GROUP_CHAT_ENABLED=true`. While it is off, a
+request to the conference factory or to a URI at the conference host is
+answered 404 (`sip.group.disabled`), before anything is read or created; it is
+not taken for a 1-to-1 request either. Group messages already queued are kept:
+their recipients are taken as offline, so the messages wait up to
+`RCSAS_STORE_TTL` and go once group chat is on again. Turn it on with rcs-as on
+a single task until
+[#121](https://github.com/jeonghun-app/rcs-platform/issues/121) (see below).
+
+How the SIP layer serves it:
+
+- **Create.** A client's INVITE to the conference factory
+  (`RCSAS_CONFERENCE_FACTORY_URI`, the `ConfFctyURI` ACS provisions, its
+  user part compared with escapes undone and without case, its host without
+  case or a trailing dot) may
+  carry `Require: recipient-list-invite`, as rcsjta's does, which rcs-as
+  supports; it carries a `multipart/mixed` body of its SDP and
+  a resource list (RFC 5366, RFC 4826), which `internal/resourcelists` reads
+  as a stream, stopping at the first entry beyond `RCSAS_GROUP_MAX_PARTICIPANTS`
+  (403). An entry whose `uri` is missing or no URI a client means (not text,
+  or with white space or control characters) is left out
+  (`sip.group.invitee_skipped.malformed`), and so is an entry for the
+  factory or at the conference host, whose focus INVITE would come back as a
+  loop (`sip.group.invitee_skipped.loop`); a bad entry never refuses the
+  list, and every entry counts toward the bound. The subject is its
+  `Subject`, the creator's name its `From` display name, and its
+  `Contribution-ID`, which every session with the group
+  carries, is required (400 without): rcsjta takes it as the chat's identity,
+  and sends no `Conversation-ID`, which the group then makes. Every part of
+  the request is read, and the session's place held, before the group is
+  stored. A first message in it is refused (488): it could only be stored
+  once the group is, and then be refused after the group was made.
+- **One group per Contribution-ID.** The conference URI is made from the
+  `Contribution-ID` (`chat-` and the first 32 hex digits of its SHA-256), so
+  the same ID always names the same group. A new group lasts 2 minutes until
+  its creator's session is set up (`group.Service.Established`, once the
+  200's ACK has come), then `RCSAS_GROUP_IDLE_TTL` from its last use. If
+  writing that fails, it is tried three more times, after 0.1, 0.4 and
+  1.6 s; if it still fails, the creator's session ends with a BYE and nobody
+  is invited, so that the client makes the group again rather than keep a
+  session with one that ends within minutes
+  (`sip.group.establish_abandoned`). Until the group is established, the
+  creator's INVITE tried again under that ID, after a CANCEL, a failure or
+  a 200 the client never got, takes up the group it made; a group no
+  session came of ends on its own.
+  Any other INVITE to the factory naming an ID a live group has, from someone
+  else or once the group is established, is 403, and no group is made: a
+  participant the chairman removed could otherwise make a group its members'
+  clients take for the first one (threat model T11). A group that has ended
+  frees its ID.
+- **The answer.** A session with a group is answered as a 1-to-1 chat is,
+  with `Contact: <conference URI>;isfocus` (RFC 4579 §5.2) and the chat
+  feature tag: rcsjta keeps that URI to rejoin the group, and tells a group's
+  INVITE from a 1-to-1 one by `isfocus`.
+- **The invitations.** Once the creator's session is set up, its ACK in,
+  the focus invites each invitee through the engine (`Engine.Invite`), which
+  counts the invitation like its own, so that a message queued meanwhile
+  waits for that session rather than ringing the client again. The INVITE is a terminating
+  request as for 1-to-1 chat, from the conference URI, asserted as it, with
+  the same `Contact`, the group's `Subject`, `Conversation-ID` and the
+  creator's `Contribution-ID`, and `Referred-By` naming who brings the
+  participant in: the creator, or the author of the message a later
+  invitation is for. rcsjta takes the inviter from `Referred-By`, and
+  declines an INVITE that names none it can read. A 2xx is `Join`, then
+  `Leg.Answer`; a 603 is `Leave` (below). A 404, 604 or 482 says the
+  invitation will never reach the participant: what is queued for it from
+  the group is given up (`delivery.undeliverable`) until it opens a session
+  with the group itself or is added again. A 404 or 604 that comes after
+  the participant registered on a new flow is not taken so, as the
+  registration shows it exists now (#384); a 482, a loop, always is.
+- **Feature tags.** Every INVITE rcs-as sends for a chat, 1-to-1 or in a
+  group, has both the CPM chat ICSI and the OMA SIMPLE IM tag
+  `+g.oma.sip-im` in `Contact`, and one `Accept-Contact` for each, so that a
+  contact with either matches (RFC 3841): rcsjta takes a chat session by the
+  latter, a CPM client by the former.
+- **Join.** An INVITE to a conference URI, with only an SDP body, is `Join`:
+  404 for a group that has ended, which rcsjta takes as the end of the group,
+  and 403 for someone who is not a participant. A Request-URI at the
+  conference host whose user part is not `chat-` and 32 lower-case hex digits,
+  the form groups are given, is 404 before the store is read.
+- **Leave.** A BYE with `Reason: SIP;cause=200`, which rcsjta sends when its
+  user closes the chat, is `Leave`; any other BYE, as for a session idle too
+  long, ends the session only, and the participant rejoins or is invited back
+  for the next message (the lead's decision on #137). A 603 to the focus's
+  INVITE is `Leave` too.
+- **The roster.** A participant's SUBSCRIBE to the conference URI with
+  `Event: conference` (RFC 4575) is answered 200 with `Expires` and the
+  conference URI as `Contact`, and its first NOTIFY carries the full roster
+  (`Roster`); each change then comes as the partial document `RosterChanged`
+  gives, one version up. A subscription that would see a gap in the versions,
+  as when two changes race to it, gets the full roster instead. A refresh in
+  the subscription's dialog gets the full roster too; `Expires: 0` ends the
+  subscription, and an initial SUBSCRIBE with `Expires: 0` fetches the roster
+  once (RFC 6665 §4.1.2). A subscription lasts at most 3600 s, the default,
+  and at least 60 s (423 with `Min-Expires` below). Only a current participant
+  may subscribe (403), to a group that exists (404); another event package is
+  489 with `Allow-Events: conference`, and an `Accept` without
+  `application/conference-info+xml` 406. A participant holds at most 4
+  subscriptions to one group and `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` across
+  its groups (486 beyond either), and a task at most `RCSAS_MAX_SESSIONS`
+  (500 with `Retry-After`). A NOTIFY that times out, or is answered 404, 405,
+  410, 416, 480 to 485, 489, 501 or 604 (RFC 6665 §4.2.2) or 430 (RFC 5626),
+  ends the subscription without another. Any other failure, as a 503 from a
+  busy proxy, keeps it (`sip.subscription.stale`): the subscriber missed a
+  document, so the next change sends the full roster, unless a refresh,
+  answered as usual with the full roster, brought it up to date first. A participant who leaves, declines or is removed gets
+  the change that says so, and its subscriptions end with it. On
+  shutdown each subscription ends with `reason=deactivated`, so that the
+  subscriber may subscribe again at once, to another task. Subscriptions are
+  kept in the task's memory only, as groups are single-task.
+- **REFER.** A participant adds someone by a REFER in its session with the
+  group (RFC 4579 §5.5, rcsjta's `GroupChatSession.inviteParticipants`):
+  `Refer-To` naming them, or a `cid:` URI with `Require: multiple-refer` and a
+  resource list as the body (RFC 5368), read no further than
+  `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 entries. It is `Add`, answered 202, and
+  the focus invites each one the group now holds invited (`Engine.Invite`).
+  `Refer-To` naming a participant with `method=BYE` is `Remove` (RFC 4579
+  §5.11), which only the chairman may: the removed participant's sessions with
+  the group get a BYE and its subscriptions end. With `Refer-Sub: false` (RFC
+  4488), as rcsjta sends, the 202 says so and there is no implicit
+  subscription. Without it, the subscription (`Event: refer`,
+  `message/sipfrag`, RFC 3515 §2.4.4) starts with `SIP/2.0 100 Trying` and
+  ends with `200 OK` or `480 Temporarily Unavailable`. For a REFER that adds
+  one person not yet in the group, it is `200 OK` once the focus's INVITE is
+  answered 2xx and the session is up, and `480` for any failure. For a
+  removal, a list, or someone in the group already, it is `200 OK` once the
+  group has changed. One that hears nothing for 2 minutes ends with `480`,
+  as for someone invited already whom the focus does not ring again. The
+  invitee's own answer is never passed on: it would tell the referrer
+  whether a number is a subscriber and whether it is online. A REFER outside a
+  session, or in a 1-to-1 one, is 405.
+- Other answers: 403 for a rate limit or a group too large, 400 for a request
+  the group cannot take (nobody else in the list), 500 with `Retry-After: 1`
+  when the group kept changing under the request or the store was busy.
 
 Group mode is single-task for now: run it on one rcs-as task until
 [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) anchors each
@@ -548,11 +717,12 @@ limitations](#assumptions-and-limitations)).
 |---|---|
 | An INVITE to the conference factory, with a resource list | `group.Service.Create` (the creator is joined; the invitees are invited, and the SIP layer invites them). A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` entries is refused (`ErrTooMany`) before any entry is read; the SIP layer should bound the resource-list body it parses to about that many entries too |
 | A participant's session with the group is set up (its INVITE, or its answer to the focus's) | `Join`, then `OpenLeg` / `Offer` and `Leg.Answer` with `Mode: store.Group` and the conference URI as `Peer`. If `Join` refuses, the session is refused and no leg opened |
-| A BYE on that session | `Leave`, and `Leg.Close` |
+| A BYE on that session with `Reason: SIP;cause=200` | `Leave`, and `Leg.Close`. rcsjta ends a session its user closes with that Reason ("Call completed") |
+| Any other BYE on that session | `Leg.Close` only: a session idle too long ends without the participant leaving, and it rejoins by an INVITE to the conference URI, or the focus invites it back for the next message (RCC.07 rejoin). A participant that had left could do neither |
 | A 603 Decline to the focus's INVITE | `Leave`, not `InviteFailed`. The reference client declines the first INVITE of a group it left while offline (RCC.07 6.3.3.1; rcsjta `isGroupChatNextInviteRejected`), and accepts later ones as a new addition. Other failures stay `InviteFailed` |
 | A REFER adding someone | `Add`. A list of more than `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 is refused unread, as for `Create` |
 | A REFER with `method=BYE` removing someone | `Remove`, then a BYE on the removed participant's session and `Leg.Close` |
-| `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated`), so that it learns no later roster change |
+| `Leave` or `Remove` succeeds | end that participant's subscriptions to the conference event package (a final NOTIFY with `Subscription-State: terminated;reason=rejected`, without a document), so that it learns no later roster change; no NOTIFY follows it |
 | A SUBSCRIBE to the conference event package | `Roster`: the full document for the first NOTIFY |
 | `Notifier.RosterChanged` | a NOTIFY with the document to each subscription |
 | `Deliverer.Invite` with `Mode: store.Group` | an INVITE that brings the participant back into the group. The engine asks `Member` first, so it is only ever for a current participant |
@@ -583,14 +753,15 @@ request (`invalid`); a bad invitee or name never does:
   out (`group.invitee_skipped`) and the others are invited; the SIP layer
   finds who was in the group returned. A list with nobody left is
   `invalid`.
-  They are stored and compared in canonical form (`identity.CanonicalIMPU`,
-  the form the HSS provisions): a SIP URI keeps its user part, loses its
-  parameters and has its host in lower case; a tel URI is a global number
-  without visual separators. One person added as `tel:+1-555-…` and joining
-  as `tel:+1555…` is one participant. The SIP layer passes asserted
-  identities in the same form, as the CSCFs assert them. The engine puts a
-  group leg's `User`, and a group message's sender, in that form too, so a
-  leg opened under another spelling still gets its participant's copies.
+  They are stored and compared in the one form rcs-as names users in
+  (`messaging.UserOf` at `RCS_IMS_DOMAIN`, above): a telephone number is its
+  tel URI, however it is written, and any other SIP URI keeps its user part,
+  loses its parameters and has its host in lower case. One person added as
+  `tel:+1-555-…` or `sip:+1555…@<domain>` and joining as `tel:+1555…` is one
+  participant. The SIP layer passes asserted identities in the same form. The
+  engine puts a group leg's `User`, and a group message's sender, in that form
+  too, so a leg opened under another spelling still gets its participant's
+  copies, and a participant's copies are queued where its 1-to-1 messages are.
 - **Names** are at most 100 bytes and **the subject** at most 256 bytes of
   UTF-8 that XML can carry, without control characters.
 - **A name is one participant's, and never keeps anyone out.** A name that is
@@ -609,7 +780,20 @@ request (`invalid`); a bad invitee or name never does:
   are not normalized (NFC), and look-alike letters of different scripts are
   not folded.
 - **The Conversation-ID** is one RFC 3261 token of at most 256 characters, as
-  in 1-to-1 chat.
+  in 1-to-1 chat. A group created without one gets one in the UUID form OMA
+  CPM asks of a Conversation-ID (Conversation Functions, Appendix C.1.1):
+  - with a `Contribution-ID`, as rcsjta sends, a name-based UUID (version 5,
+    in a namespace of rcs-as's groups, not the pairs') of the
+    `Contribution-ID` alone, as the conference URI is made from it. rcsjta
+    starts a group that ended again under its `Contribution-ID`, from
+    whichever participant writes next; the new group gets the same
+    conference URI and the same Conversation-ID, so that it stays one
+    thread;
+  - without one, a random UUID (version 4), which never equals a version 5
+    one.
+
+  Groups made before #305 keep the 32 hex digits they were given: the value
+  is opaque, and read and compared as stored.
 
 ### Fan-out
 
@@ -816,12 +1000,13 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_MSRP_HOST` | required | This task's address in MSRP paths ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
 | `RCSAS_MSRP_LISTEN_ADDR` | `:2855` | MSRP listener for `msrp-relay`; its port is the advertised one |
 | `RCSAS_SIP_LISTEN_ADDR` | `0.0.0.0:5060` | SIP listener (TCP), which only the core reaches; port 0 is refused, since the HSS's AS URI names a fixed port |
-| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) |
+| `RCSAS_SIP_HOST` | the task's one private IPv4 address | This task's address, in the Via and Call-ID of what it sends ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)). Refused in staging and prod with `RCSAS_GROUP_CHAT_ENABLED`: a group's owner is known by its address too, and two tasks given one would take each other's groups (#121) |
 | `RCSAS_CORE_URI` | `sip:scscf.<RCS_SERVICE_NAMESPACE>;transport=tcp;lr` | Where rcs-as sends the requests it originates: a SIP URI of a host with `transport=tcp` and `lr`, a private or loopback address or a name inside the namespace. Required without `RCS_SERVICE_NAMESPACE` |
 | `RCSAS_SERVICE_NAME` | `rcs-as.<RCS_SERVICE_NAMESPACE>`, none without a namespace | The host of the AS URI the iFC name rcs-as by (`HSS_RCS_AS_URI`), which rcs-as takes as its own in a `Route`. Change both together, or an OPTIONS scscf hands rcs-as comes back to it (482) |
 | `RCSAS_MAX_SESSIONS` | `20000` | SIP sessions this task holds, each with its MSRP leg; an INVITE beyond it is answered 500 with `Retry-After: 1` ([threat model](threat-model.md) T9) |
 | `RCSAS_MAX_OUTGOING_SESSIONS_PER_USER` | `32` | Sessions one user opens on this task; an INVITE beyond it is answered 486 |
 | `RCSAS_MAX_INCOMING_SESSIONS_PER_USER` | `32` | Sessions rcs-as opens to one user on this task; a delivery beyond it waits |
+| `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` | `32` | Subscriptions to group rosters one user holds on this task, across its groups; a SUBSCRIBE beyond it is answered 486 |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
@@ -844,7 +1029,9 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_RETRY_INTERVAL`, `RCSAS_MAX_RETRY_INTERVAL` | `1m`, `1h` | First and longest wait before a held queue is read again |
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
-| `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as` |
+| `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as`, and must not be `RCS_IMS_DOMAIN`, whose users' requests would all be taken for a group's |
+| `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404, and queued group messages wait (up to `RCSAS_STORE_TTL`) instead of being given up. Turn it on with a single rcs-as task until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) |
+| `RCSAS_CONFERENCE_FACTORY_URI` | `sip:conf-factory@<RCS_IMS_DOMAIN>` | Where clients create group chats: the `ConfFctyURI` ACS provisions. A SIP URI with a user; its user is compared with escapes undone and without case, its host without case |
 | `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
 | `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200. Former participants are kept up to the same number, fewer above 104, so that the roster stays within 256 KiB (see [Roster events](#roster-events)) |
 | `RCSAS_GROUP_IDLE_TTL` | `720h` | A group not used for this long ends |
@@ -852,6 +1039,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
+| `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121): a task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
 
 A rate of `0` turns that limit off.
 
@@ -960,11 +1148,15 @@ once.
 ## DynamoDB `groupchats` table
 
 The `groupchats` table has the same key schema as `messages` (`pk`, `sk`,
-TTL attribute `ttl`) and no index. Each group is one item:
+TTL attribute `ttl`) and no index. Each group is one item, with a small
+item that names its owner next to it (#121), and each rcs-as task with group
+chat on has a heartbeat item:
 
-| `pk` | `sk` |
-|---|---|
-| `g#<len>#<conference URI>` | `group` |
+| `pk` | `sk` | Holds |
+|---|---|---|
+| `g#<len>#<conference URI>` | `group` | The group |
+| `g#<len>#<conference URI>` | `owner` | The owner task's id (`task`, random at every start), its SIP instance address (`sip`), `epoch`, `wtoken` |
+| `t#<len>#<task id>` | `task` | The task's SIP instance address, `alive_until` |
 
 - **Contents.** The item holds the subject, creator, Conversation-ID, roster
   version, times, the participants as a list, and the identities of removed
@@ -976,6 +1168,36 @@ TTL attribute `ttl`) and no index. Each group is one item:
 - **Writes.** Every change rewrites the item on the condition that its `rev`
   is the one the change was computed from. A token (`wtoken`) tells a repeat
   of the write from another writer's; `Create` uses one too.
+- **Ownership** (#121). One task owns each group: the one that made it,
+  or the one that took it over. `Create` writes the group and its owner item,
+  at epoch 1, in one transaction. Every change and every touch is a
+  transaction of the group's write and an update of the owner item's `ttl`
+  on the condition that it still names the writer's task and epoch: a task
+  that lost the group, even one paused and unaware of it, writes nothing,
+  and gives the group up (`group.fenced`). A task takes a group over by a
+  conditional update of the owner item (same task, same epoch; epoch one
+  up), only once the owner's heartbeat item says `alive_until` plus
+  `RCSAS_TASK_SKEW` has passed, or at once when the owner's address is its
+  own and its task id is not (the address was reused, so the owner is
+  gone); a group stored before #121, without an owner item, is taken from
+  none. A task beats every `RCSAS_TASK_HEARTBEAT`, `alive_until`
+  `RCSAS_TASK_LEASE` ahead, and stops writing groups once its last stored
+  beat is `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` old; it beats once more
+  at its present time on shutdown, after its sessions have ended, so that
+  another task takes its groups at once. A task remembers the groups it
+  owns, so that a change of one costs no more reads than before. Until D3 of
+  #121 forwards requests to a group's owner, a request for a group another
+  task owns is answered 500 with `Retry-After` (never 404, which rcsjta
+  takes for the group's end and restarts it at the factory).
+- **A replacement task waits for the old one's lease.** Even with one task,
+  a task that replaces another, on a new address, may not change the old
+  task's groups until the old one's last heartbeat has run out: after a
+  crash, up to `RCSAS_TASK_LEASE` plus `RCSAS_TASK_SKEW` (22 s by default)
+  after the old task's last beat; after a clean shutdown, which stores a last
+  beat at its present time, `RCSAS_TASK_SKEW` (2 s). Meanwhile a change to
+  one of those groups is answered 500 with `Retry-After`, which clients try
+  again; a task on the old one's address takes its groups at once. Before
+  #121, a replacement changed them at once. Deployments stop tasks cleanly.
 - **Touch.** At most once an hour per task, and not within an hour of a
   change, a group in use has its `active`, `expires` and `ttl` moved forward,
   without changing `rev`. The update is conditional on the stored `active`
@@ -983,9 +1205,15 @@ TTL attribute `ttl`) and no index. Each group is one item:
   ended the group) changes nothing. Creating a group and every change set
   `expires` to `RCSAS_GROUP_IDLE_TTL` from then.
 - **Expiry.** `ttl` is the group's expiry plus a day; every read checks the
-  expiry itself.
+  expiry itself. The owner item's `ttl` moves with the group's; a task's
+  heartbeat item's is its last `alive_until` plus a day.
 - **IAM.** The task role needs `GetItem`, `PutItem`, `UpdateItem` and
-  `DescribeTable` on the table.
+  `DescribeTable` on the table; `TransactWriteItems` writes with them.
+- **Cost** (#121). A change or a touch is a transaction of two items, which
+  DynamoDB bills at twice the write units of each. A task's heartbeat is one
+  small write every `RCSAS_TASK_HEARTBEAT`. A task's first change of a group
+  it does not know reads the owner item, and the owner's heartbeat item if
+  another task holds it.
 
 Each group message costs one strongly consistent read of the group item and,
 per recipient, the enqueue transaction of the `messages` table. The fan-out
@@ -1005,8 +1233,16 @@ identifier ever appears in a metric name.
 | `sip.message.<status>` | Pager-mode MESSAGEs rcs-as answered, by status |
 | `sip.asserted.refused` | Requests whose `P-Asserted-Identity` is not one user's, as pcscf asserts it, refused with 403 |
 | `sip.pager.<status>`, `sip.pager.timeout`, `sip.pager.unsent`, `sip.pager.unresolved` | MESSAGEs rcs-as sent, by final status, and those that got none, could not be sent or found no next hop |
-| `sip.loop` | Requests rcs-as originated that came back to it, answered 482 |
+| `sip.loop` | Requests rcs-as originated that came back to it, answered 482: by their `rcsas-` tag, or from a conference URI |
+| `sip.group.invitee_skipped.malformed`, `sip.group.invitee_skipped.loop`, `sip.group.establish_failed`, `sip.group.establish_abandoned`, `group.create_retried`, `group.rejected.taken`, `invite.undeliverable` | Resource-list entries left out for a uri no client means, and for one at the factory or the conference host; writes of a new group's establishment that failed, and groups given up after four, whose creator's session ended; creators' INVITEs tried again that took up their group; INVITEs to the factory refused for another group's Contribution-ID; group invitations that will never reach the participant |
+| `sip.group.created`, `sip.group.joined`, `sip.group.refused`, `sip.group.offer_refused`, `sip.group.service_refused`, `sip.group.list_too_long`, `sip.group.list_refused` | Clients' INVITEs to a group: groups created, joins, refusals by the group, and refusals for the offer (488), the service (403), a resource list too long (403) or unreadable (400) |
+| `sip.group.declined`, `sip.group.left`, `sip.group.leave_failed`, `sip.group.join_refused` | Participants who left by a 603 to the focus's INVITE or by a BYE that says so, Leaves that failed, and 2xx answers to the focus whose Join the group refused |
+| `sip.group.added`, `sip.group.removed`, `sip.group.invite_failed` | REFERs that added or removed, and additions whose invitations could not be sent for want of the group |
+| `sip.subscription.started`, `sip.subscription.refreshed`, `sip.subscription.fetched`, `sip.subscription.expired`, `sip.subscription.ended.<reason>`, `sip.subscription.bad_event`, `sip.subscription.task_limit`, `sip.subscription.user_limit` | Subscriptions to the conference event package, by what became of them; `user_limit` counts those refused for a participant's 4 in one group and for `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` |
+| `sip.subscription.notified`, `sip.subscription.notify_failed`, `sip.subscription.stale`, `sip.subscription.notify_unsent`, `sip.subscription.notify_after_refusal`, `sip.subscription.resynced`, `sip.subscription.roster_failed` | NOTIFYs sent, refused or unanswered, refused for a passing reason (whose subscription stands, to get the full roster next), not built, not sent because the subscriber had refused one (RFC 6665 §4.2.2), full rosters sent for a gap or after a failure, and rosters that could not be read for one |
+| `sip.group.disabled`, `sip.refer.notified` | Requests to the factory or a conference URI answered 404 while `RCSAS_GROUP_CHAT_ENABLED` is off; REFER subscriptions ended with their outcome |
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
+| `proxy.hook_panics` | Panics recovered while rcs-as routed or served a request: it was answered 500 if it had no answer yet (#428); alarm on any |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
 | `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |
 | `sip.session.task_limit`, `sip.session.user_limit` | Sessions refused for `RCSAS_MAX_SESSIONS` and for a user's own bound, either way |
@@ -1026,12 +1262,13 @@ identifier ever appears in a metric name.
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
-| `invite.sent`, `invite.failed`, `invite.no_sessions`, `invite.untracked` | Terminating session requests |
+| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, which leave no mark (the registration had the queue read already); a group's 482 is never one |
 | `leg.opened`, `leg.unanswered` | MSRP legs, and offers that got no answer |
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
+| `group.owner_takeover`, `group.fenced`, `group.owner_lapsed`, `task.heartbeat_failed` | Ownership (#121): groups this task took over, writes the store refused because another task had taken the group (which this task then gives up), writes refused because this task's own heartbeat had lapsed, and heartbeats that failed |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
@@ -1065,7 +1302,14 @@ Signals to alarm on (Phase 7):
 
 - **Conversation identifiers.** RCC.07 gives no grammar for them beyond SIP,
   so each must be one RFC 3261 token of at most 256 characters. Clients
-  generate UUIDs or hex strings.
+  generate UUIDs or hex strings. A request with a `Contribution-ID` and no
+  `Conversation-ID`, as rcsjta sends, is taken although OMA CPM Appendix
+  C.1.1 requires the latter, and gets the pair's (above). Residual: a CPM
+  client that names its own Conversation-ID and an rcsjta client that
+  answers it without one see two threads, the CPM client's and the pair's;
+  joining them would need rcs-as to remember the ID a pair last used.
+  Groups made before #305 keep the 32 hex digits they were given as their
+  Conversation-ID, rather than the UUID form C.1.1 asks for, until they end.
 - **Legs are per task.** A message is delivered on a leg of the task that
   works on its queue. That holds for the B2BUA model, where both legs of a
   chat live on the task whose instance address the SIP dialog names (ADR
@@ -1154,8 +1398,12 @@ Signals to alarm on (Phase 7):
   message written on one task would invite participants whose session is on
   another instead of delivering to it, and a roster change would reach only
   the subscriptions of the task that made it. #121 anchors each group's focus
-  on one task (an owner lease, ADR 0005 amendment); until then, deploy
-  rcs-as with group chat on a single task.
+  on one task (an owner lease, ADR 0005 amendment). Its store part is in:
+  each group has an owner task, and every write is fenced by it (see the
+  `groupchats` table). Until the SIP layer forwards a group's requests to its
+  owner and the engine leaves other tasks' groups alone (#121 D2, D3), turn
+  `RCSAS_GROUP_CHAT_ENABLED` on only with rcs-as on a single task. It is off
+  by default.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;

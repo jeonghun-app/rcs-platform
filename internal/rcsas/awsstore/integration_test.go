@@ -249,7 +249,7 @@ func integrationGroups(t *testing.T) *Groups {
 
 func TestIntegrationGroupsStoreMeetsTheContract(t *testing.T) {
 	groups := integrationGroups(t)
-	groupstoretest.Run(t, func(*testing.T) groupstore.Store { return groups })
+	groupstoretest.Run(t, func(*testing.T) groupstore.Store { return groups }, disownIn(groups))
 }
 
 // Two tasks raising one group's roster version at once, each from what it
@@ -260,7 +260,7 @@ func TestIntegrationTheLargestGroupIsStoredWhole(t *testing.T) {
 	ctx := t.Context()
 	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	g := largestGroup(t1)
-	if err := groups.Create(ctx, g, "c", t1); err != nil {
+	if err := groups.Create(ctx, g, testOwner, "c", t1); err != nil {
 		t.Fatal(err)
 	}
 	got, err := groups.Get(ctx, g.URI, t1)
@@ -282,7 +282,7 @@ func TestIntegrationGroupVersionsCountAcrossWriters(t *testing.T) {
 	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	g := groupstore.Group{URI: "sip:chat-v@conf.example.net", Version: 1, Created: t1, Active: t1, Expires: t1.Add(time.Hour),
 		Participants: []groupstore.Participant{{Identity: "sip:a@example.net", Role: groupstore.Chairman, State: groupstore.Joined, Since: t1}}}
-	if err := groups.Create(ctx, g, "c", t1); err != nil {
+	if err := groups.Create(ctx, g, testOwner, "c", t1); err != nil {
 		t.Fatal(err)
 	}
 	const each = 15
@@ -300,7 +300,7 @@ func TestIntegrationGroupVersionsCountAcrossWriters(t *testing.T) {
 					return
 				}
 				cur.Version++
-				err = groups.Update(ctx, cur, fmt.Sprintf("w%d-%d", w, i))
+				err = groups.Update(ctx, cur, testOwner, fmt.Sprintf("w%d-%d", w, i))
 				if errors.Is(err, groupstore.ErrConflict) {
 					continue
 				}

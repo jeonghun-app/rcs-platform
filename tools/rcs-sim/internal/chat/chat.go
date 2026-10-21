@@ -345,13 +345,18 @@ func ListenCore(addr, advertise string, cfg msrp.Config) (*Core, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ServeCore(ln, advertise, cfg), nil
+}
+
+// ServeCore is ListenCore on a listener the caller made; Close closes it.
+func ServeCore(ln net.Listener, advertise string, cfg msrp.Config) *Core {
 	tcp := ln.Addr().(*net.TCPAddr)
 	if advertise == "" {
 		advertise = tcp.IP.String()
 	}
 	c := &Core{ln: ln, host: advertise, port: tcp.Port, cfg: cfg, done: make(chan struct{})}
 	go c.accept()
-	return c, nil
+	return c
 }
 
 func (c *Core) accept() {

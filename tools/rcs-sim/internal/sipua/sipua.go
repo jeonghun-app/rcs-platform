@@ -814,6 +814,9 @@ func (ua *UA) Send(ctx context.Context, req *sip.Request) (*sip.Response, error)
 	if err != nil {
 		return nil, ua.sendError(err)
 	}
+	if sendWaiting != nil {
+		sendWaiting(func() bool { return len(final) > 0 })
+	}
 	select {
 	case r := <-final:
 		if r.err != nil {
@@ -821,6 +824,16 @@ func (ua *UA) Send(ctx context.Context, req *sip.Request) (*sip.Response, error)
 		}
 		return r.res, nil
 	case <-ctx.Done():
+		// An answer that came before Send woke is not lost to a cancel
+		// that came after it: with both ready, select picks either.
+		select {
+		case r := <-final:
+			if r.err != nil {
+				return nil, ua.sendError(r.err)
+			}
+			return r.res, nil
+		default:
+		}
 		tx.Terminate()
 		return nil, ctx.Err()
 	case <-ua.done:
@@ -833,6 +846,10 @@ type result struct {
 	res *sip.Response
 	err error
 }
+
+// sendWaiting, nil but in tests, runs as Send begins to wait for its
+// answer; answered reports whether the answer is in.
+var sendWaiting func(answered func() bool)
 
 // destination is where every request goes: the flow once it is known, the
 // P-CSCF's address before (the one connection either way).

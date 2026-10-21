@@ -116,6 +116,12 @@ func TestABodyPcscfCannotSplitIsRefused(t *testing.T) {
 		"a length that is not the part's": {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length: 4\r\n\r\nv=0\r\n--b1--"},
 		"an empty length":                 {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length:\r\n\r\nv=0\r\n--b1--"},
 		"two lengths":                     {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nv=0\r\n--b1--"},
+		// A length of blanks only has no value either.
+		"a length of a space":             {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length: \r\n\r\nv=0\r\n--b1--\r\n"},
+		"a length of two spaces":          {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length:  \r\n\r\nv=0\r\n--b1--"},
+		"a length of a tab":               {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length:\t\r\n\r\nv=0\r\n--b1--"},
+		"a length of blanks around a tab": {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: application/sdp\r\nContent-Length: \t \r\n\r\nv=0\r\n--b1--"},
+		"a blank length on another part":  {"multipart/mixed;boundary=b1", "--b1\r\nContent-Type: message/cpim\r\nContent-Length: \r\n\r\nx\r\n--b1\r\nContent-Type: application/sdp\r\nContent-Length: \t\r\n\r\nv=0\r\n--b1--"},
 	} {
 		if _, _, err := findSDP(tt.ct, []byte(tt.body)); !errors.Is(err, errBodyUnreadable) {
 			t.Errorf("%s: %v", name, err)

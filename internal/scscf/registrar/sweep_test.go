@@ -175,13 +175,19 @@ func TestAnUnregisteredUsersRecordIsDeregisteredWhenItsStateEnds(t *testing.T) {
 	}
 }
 
+// TestARegistrationBetweenTheSweepsClaimAndItsSARGetsTheSetBack, and the
+// sweep does not tell the application servers the set ended (#379 code
+// review).
 func TestARegistrationBetweenTheSweepsClaimAndItsSARGetsTheSetBack(t *testing.T) {
 	e := newEnv(t)
-	a := registered(t, e, e.instance(1), 600, impu1, tel1)
+	tp := &recordedThirdParty{}
+	a := registered(t, e, e.instance(1, withThirdParty(tp)), 600, impu1, tel1)
 	e.clock.advance(601 * time.Second)
 	b := device(a, 2)
 	ch := &crossingHSS{HSS: e.hss, kind: cx.TimeoutDeregistration}
-	plain := func(seed byte) *Registrar { return e.instance(seed, func(c *Config) { c.HSS = ch }) }
+	plain := func(seed byte) *Registrar {
+		return e.instance(seed, func(c *Config) { c.HSS, c.ThirdParty = ch, tp })
+	}
 	// The sweep has claimed the set; before its SAR reaches the HSS, B
 	// registers completely, its SAR REGISTRATION first.
 	ch.hook = func() { wantStatus(t, b.registerWith(plain(2), 600), 200) }
@@ -190,6 +196,7 @@ func TestARegistrationBetweenTheSweepsClaimAndItsSARGetsTheSetBack(t *testing.T)
 	}
 	wantSameBindings(t, e, 1, impu1, tel1)
 	must(e.store.Profile(bg, set1, e.clock.Now()))(t)
+	wantLastToldRegistered(t, tp)
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	if ch.last != cx.Registration {

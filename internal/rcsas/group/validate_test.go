@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
 // Values internal/conference could not write, or that no identity is.
@@ -167,6 +169,47 @@ func TestIdentitiesAreComparedInCanonicalForm(t *testing.T) {
 	}
 }
 
+// A subscriber's SIP URI at the home domain and its tel URI are one
+// participant, as they are one user to the SIP layer and the engine
+// (messaging.UserOf): bob added by his SIP URI joins by his tel URI, and a
+// leg opened under his SIP URI gets the copies queued for him (#137, the
+// lead's decision on #242).
+func TestASubscribersSIPAndTelURIsAreOneParticipant(t *testing.T) {
+	const home = "ims.example.net"
+	ecfg := engineConfig()
+	ecfg.HomeDomain = home
+	r := newRigWith(t, Config{HomeDomain: home}, ecfg, store.NewMemory(), groupstore.NewMemory(), newFakeClock(), 1)
+	bobSIP := "sip:+15550100002@IMS.example.net;transport=tcp"
+	g, err := r.s.Create(t.Context(), CreateRequest{Creator: "sip:+15550100001@" + home, Invitees: []Invitee{{Identity: bobSIP}, {Identity: bob}, {Identity: carol}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Participants) != 3 || g.Creator != alice {
+		t.Fatalf("creator %q, participants %+v", g.Creator, g.Participants)
+	}
+	if _, ok := g.Participant(bob); !ok {
+		t.Fatalf("participants %+v", g.Participants)
+	}
+	if _, err := r.s.Join(t.Context(), g.URI, bob, ""); err != nil {
+		t.Fatal(err)
+	}
+	a := r.connect(g, "sip:+15550100001@"+home, nil)
+	b := r.connect(g, bobSIP, nil)
+	if code := a.send(t, message(t, alice, "m1", "hello", 0)); code != msrp.StatusOK {
+		t.Fatalf("alice's message answered %d", code)
+	}
+	// The author is named as the group names alice, whichever URI her
+	// session asserted.
+	got := asSeen(t, b.next(t))
+	if from, _ := fromTo(t, got); from.URI != alice || string(got.Body) != "hello" {
+		t.Fatalf("bob got From %v: %q", from, got.Body)
+	}
+	// Someone else's number at another host is no form of bob's.
+	if ok, err := r.s.Member(t.Context(), g.URI, "sip:+15550100002@other.example.net"); err != nil || ok {
+		t.Fatalf("bob's number at another host = %v, %v", ok, err)
+	}
+}
+
 // The documents are built before the write: a stored group that could not
 // be written as one (here, written by something else with a participant
 // twice) is not changed further, and nothing is notified.
@@ -178,7 +221,7 @@ func TestAGroupIsNotWrittenUnlessItsRosterCanBe(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored.Participants = append(stored.Participants, stored.Participants[1])
-	if err := r.groups.Update(t.Context(), stored, "corrupt"); err != nil {
+	if err := r.groups.Update(t.Context(), stored, r.owner(t, g.URI), "corrupt"); err != nil {
 		t.Fatal(err)
 	}
 	before := len(r.n.all())

@@ -293,3 +293,52 @@ func TestOnlyTheLayers500StopsTheBranches(t *testing.T) {
 		t.Fatalf("stats %+v", s)
 	}
 }
+
+// What the proxy does when its layer has answered 500 runs on a goroutine
+// that context.AfterFunc starts, which the proxy counts too (#319): the
+// proxy's wait, which Close and these tests' settle use, does not return
+// while it runs. The hook holds it after the stalled Router has been let go.
+func TestTheProxyWaitsForWhatItDoesOnTheLayers500(t *testing.T) {
+	inHook, leave := make(chan struct{}), make(chan struct{})
+	hook := func() {
+		close(inHook)
+		<-leave
+	}
+	testHookLayerAnswered.Store(&hook)
+	t.Cleanup(func() { testHookLayerAnswered.Store(nil) })
+	s := newStall()
+	routed := make(chan struct{})
+	h := newHarness(t, Config{})
+	h.route(func(ctx context.Context, r *Request) Decision {
+		s.wait(ctx)
+		defer close(routed)
+		return Forward(r)
+	})
+	h.p.Receive(inboundFrom(invite(t), "up"))
+	s.entered(t)
+	h.clock.advance(4 * time.Minute)
+	select {
+	case <-inHook:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the layer's 500 did not reach the proxy")
+	}
+	close(s.release)
+	<-routed
+	waited := make(chan struct{})
+	go func() {
+		h.p.wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("the proxy's wait returned while its answer to the layer's 500 was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(leave)
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proxy's wait did not return once it had")
+	}
+	check(t, "upstream", h.upstream(), codes(100, 500))
+}

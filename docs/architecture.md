@@ -76,6 +76,8 @@ internal/
   msrp/                     RFC 4975 codec, chunking, reports, connections, Bridge
   cpim/, imdn/              message/cpim wrapper and IMDN notifications
   conference/               RFC 4575 conference-info documents
+  xmlsafe/                  the checks every XML document reader shares: size,
+                            DTD, depth, one root, attributes, character references
   ftserver/                 ft-server service logic
   ftserver/store/           ft-server storage interfaces, memory backends,
                             storetest contract
@@ -144,6 +146,10 @@ a library package under `internal/`.
    returns 200 with `Service-Route` and `P-Associated-URI`.
 5. `scscf` performs third-party REGISTER to application servers whose iFC match
    REGISTER (RCS-AS learns the client is online, flushes stored messages).
+6. `pcscf` keeps the 200's `Service-Route` and `P-Associated-URI` for the flow in
+   instance memory, gives an outbound client a `Flow-Timer` for its keep-alives,
+   and subscribes to the user's reg event at `scscf` (TS 24.229 §5.2.3): a NOTIFY
+   that ends a binding ends that registration on the task ([pcscf](pcscf.md)).
 
 ### 5.2 Originating and terminating requests
 
@@ -202,6 +208,7 @@ store-and-forward, IMDN and group fan-out.
 | Authentication challenges, reg-event subscriptions | `scscf` | DynamoDB `auth-challenges`, `reg-subscriptions` | Second REGISTER and NOTIFY numbering work across instances (ADR 0005) |
 | Position in the iFC chain | `scscf` | signed parameter in the `Route` back to `scscf` | Original dialog identifier, HMAC with a key shared by `scscf` instances |
 | Client connections (flows) | `pcscf` | instance memory | `Path` and core-facing `Record-Route` name the instance; flow tokens are HMACs under a per-start key, unknown ones get 430 (ADR 0005) |
+| Registrations as the edge sees them, reg-event subscriptions | `pcscf` | instance memory | Per flow: identities, `Service-Route`, contacts; a task's subscriptions end with it, and a client's next REGISTER through another task sets them up there |
 | SIP transactions | every SIP service | instance memory | Responses follow `Via` back to the instance that sent the request |
 | Stored messages, group chat state | `rcs-as` | DynamoDB `messages`, `groupchats` | |
 | MSRP bindings | `msrp-relay` | DynamoDB `msrp-bindings`, expiry checked on read, TTL for cleanup | Keyed by the SHA-256 of the client-side session id, which is never stored; strongly consistent reads; one conditional claim per binding across tasks; a client that connects before `pcscf` has recorded its path waits up to `RELAY_PATH_WAIT` ([msrp-relay](msrp-relay.md)) |
@@ -264,7 +271,11 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   may *interpret* common deviations leniently where interoperability needs it
   (e.g. bare LF, extra whitespace) and count them; senders are strict. Anything
   ambiguous, or a security risk (control characters, invalid UTF-8, mixed line
-  endings, limits), is rejected. XML parsers never resolve entities.
+  endings, limits), is rejected. XML parsers never resolve entities, and read
+  every document through `internal/xmlsafe`, which refuses what encoding/xml
+  lets through but a well-formed document cannot have (a DTD, a reference to
+  a surrogate, attributes run together, `<?XML`, a declaration after anything
+  but white space).
 - **Time and randomness** are injected so timers and nonces are testable.
 
 ## 9. Specifications

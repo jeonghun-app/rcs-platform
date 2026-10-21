@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -18,6 +19,11 @@ var (
 	// example the identity does not exist); the engine gives up on it and
 	// sends a negative delivery notification if one was requested.
 	ErrUndeliverable = errors.New("messaging: undeliverable")
+	// ErrLooped, an ErrUndeliverable, means the invitation came back to
+	// rcs-as (482), as it does for a group invitee at the conference host
+	// every time: unlike a 404 or 604, no registration of the recipient
+	// changes that.
+	ErrLooped = fmt.Errorf("messaging: the invitation came back: %w", ErrUndeliverable)
 	// ErrNoSessions, from Invite, means the recipient's contact cannot take
 	// sessions from the network: it answered an earlier terminating offer
 	// with a=setup:passive, which msrp-relay never dials (ADR 0004). The
@@ -76,4 +82,15 @@ type Invitation struct {
 	// QueueID names, for a large-mode session, the one queued message it
 	// is for; empty for a chat session.
 	QueueID string
+	// Subject is a group's subject, for the INVITE that brings a new
+	// participant into it (Engine.Invite); empty otherwise.
+	Subject string
+	// Referrer is, for a group, who brings the recipient in: the creator
+	// or whoever added it, or the author of the message the invitation is
+	// for (RFC 3892 Referred-By, which rcsjta names the inviter by).
+	Referrer string
+	// flow is the recipient's registration on a new flow the engine had
+	// heard of when it asked for the session (Engine.flows), so that
+	// InviteFailed can tell a failure that a later registration overtook.
+	flow uint64
 }
