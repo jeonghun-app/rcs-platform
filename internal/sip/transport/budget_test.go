@@ -77,6 +77,11 @@ func (d *pipesDialer) DialContext(context.Context, string, string) (net.Conn, er
 // once, and waiting out the shedding grace for real would only slow the tests.
 func stalled(f *flow) { f.q.progress.Store(time.Now().Add(-time.Hour).UnixNano()) }
 
+// progressing marks a flow's writer as making progress for the next hour, so
+// it stays inside the shedding grace however long the host takes to reach the
+// send under test (#283).
+func progressing(f *flow) { f.q.progress.Store(time.Now().Add(time.Hour).UnixNano()) }
+
 // budgetRig is a transport with a 3000-byte budget whose dials are pipes no
 // one reads, and a sender of ~850-byte MESSAGEs (or larger, with extra body).
 type budgetRig struct {
@@ -436,14 +441,16 @@ func TestBudgetRefusalOfAResponseLeavesTheClientFlowOpen(t *testing.T) {
 	c.Write([]byte(rawRequest("MESSAGE", "Via: SIP/2.0/TCP client.example.com;branch=z9hG4bKr")))
 	in := rec.next(t)
 
-	// Three core connections fill the budget just now, inside the shedding
-	// grace, so none of them can be shed yet.
+	// Three core connections fill the budget, and their writers are inside
+	// the shedding grace, so none of them can be shed.
 	for _, h := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
 		req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bK"+h)
 		req.Body = make([]byte, 600) // about 850 bytes
-		if _, err := server.SendRequest(req, Destination{Network: TCP, Addr: netip.MustParseAddrPort(h + ":5060")}); err != nil {
+		dst := netip.MustParseAddrPort(h + ":5060")
+		if _, err := server.SendRequest(req, Destination{Network: TCP, Addr: dst}); err != nil {
 			t.Fatal(err)
 		}
+		progressing(server.flows.peer(reuseKey{network: TCP, remote: dst}))
 	}
 
 	res := respond(t, in.Message.(*sip.Request), 200)
@@ -455,7 +462,7 @@ func TestBudgetRefusalOfAResponseLeavesTheClientFlowOpen(t *testing.T) {
 	if _, open := server.Flow(in.Source.Flow); !open {
 		t.Fatal("a budget refusal closed a healthy client's flow")
 	}
-	if s := server.Stats(); s.ResponseFlowCloses != 0 || s.BudgetRefusals != 1 {
+	if s := server.Stats(); s.ResponseFlowCloses != 0 || s.BudgetRefusals != 1 || s.BudgetSheds != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 }
