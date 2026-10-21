@@ -13,11 +13,12 @@ import (
 
 // messagingService is the OMA CPM ICSI of standalone messaging (RCC.07
 // §2.6.1), which a pager-mode MESSAGE and its notifications carry: in
-// Accept-Contact, so that scscf forks it to the contacts that take it
-// (RFC 3841), and asserted, since rcs-as is the network.
+// Accept-Contact with require and explicit, so that scscf forks it only to
+// the contacts that registered the ICSI, never to a device without CPM
+// (RFC 3841, #332), and asserted, since rcs-as is the network.
 const (
 	messagingICSI      = "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg"
-	messagingAcceptTag = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg"`
+	messagingAcceptTag = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg";require;explicit`
 )
 
 // viaPlaceholderHost is the sent-by of the Via rcs-as writes, which the

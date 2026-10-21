@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -108,7 +109,20 @@ func TestAFirstMessageINVITERCSASCannotTakeApartIsRefused(t *testing.T) {
 // in its 2xx, with the same o= version, and the timer starts again; an
 // answer in the ACK that moves the leg ends the session.
 func TestAnOfferlessRefreshGetsTheLastSDP(t *testing.T) {
-	r := newChatRig(t, messaging.Config{})
+	offerlessRefresh(t)
+}
+
+// #327: the same, with every ACK slower than T1, so that each 2xx is
+// retransmitted (RFC 3261 §13.3.1.4) before its ACK and reaches the core
+// again while its next request is under way. Each request still gets its
+// own answer.
+func TestAnOfferlessRefreshGetsTheLastSDPWhenTheACKsAreSlow(t *testing.T) {
+	offerlessRefresh(t, func(pc *proxy.Config) { pc.Transaction.Clock = t1AtOnce{} })
+}
+
+func offerlessRefresh(t *testing.T, tune ...func(*proxy.Config)) {
+	t.Helper()
+	r := newChatRig(t, messaging.Config{}, tune...)
 	p := r.a.dial(t)
 	from := relayPath()
 	s := answeredBy(t, p.send(r.chatInvite(offerSDP(from, "active"), "Supported: timer", "Session-Expires: 1800")))
@@ -669,5 +683,22 @@ func TestAFileTransferInviteIsRefused(t *testing.T) {
 	// And an offer with no type in common is counted as refused.
 	if res := r.a.dial(t).send(r.chatInvite(offerSDP(relayPath(), "active", "image/jpeg"))); res.StatusCode != 488 || r.metrics.get("sip.invite.offer_refused") != 1 {
 		t.Fatalf("answered %d, offer_refused %d", res.StatusCode, r.metrics.get("sip.invite.offer_refused"))
+	}
+}
+
+// Code review on #279: rcsjta's chat INVITE carries a Contribution-ID and
+// no Conversation-ID, and is answered.
+func TestAChatInviteWithOnlyAContributionIDIsAnswered(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	m := r.chatInvite(offerSDP(relayPath(), "active"))
+	m.fields = slices.DeleteFunc(m.fields, func(f string) bool { return strings.HasPrefix(f, "Conversation-ID:") })
+	p := r.a.dial(t)
+	if res := p.send(m); res.StatusCode != 200 {
+		t.Fatalf("answered %d", res.StatusCode)
+	}
+	bad := r.chatInvite(offerSDP(relayPath(), "active"))
+	bad.fields = slices.DeleteFunc(bad.fields, func(f string) bool { return strings.HasPrefix(f, "Contribution-ID:") })
+	if res := p.send(bad); res.StatusCode != 400 {
+		t.Fatalf("a Conversation-ID without a Contribution-ID answered %d", res.StatusCode)
 	}
 }

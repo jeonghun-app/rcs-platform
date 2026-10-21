@@ -8,8 +8,8 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 )
 
-// RCSAS_GROUP_IDLE_TTL at the service: creating and every roster change
-// set the expiry to IdleTTL from then; messages alone keep a group alive,
+// RCSAS_GROUP_IDLE_TTL at the service: establishing a group and every
+// roster change set the expiry to IdleTTL from then; messages alone keep a group alive,
 // writing its activity at most once per TouchInterval and not just after
 // a change; a group nobody uses ends IdleTTL after its last use.
 func TestAGroupInUseLivesAndAnIdleOneEnds(t *testing.T) {
@@ -27,8 +27,15 @@ func TestAGroupInUseLivesAndAnIdleOneEnds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Until its creator's session is set up, it lasts PendingTTL.
+	if _, expires := stored(); !expires.Equal(r.clock.Now().Add(DefaultPendingTTL)) {
+		t.Fatalf("a new group expires at %v, want PendingTTL from now", expires)
+	}
+	if err := r.s.Established(t.Context(), g.URI); err != nil {
+		t.Fatal(err)
+	}
 	if _, expires := stored(); !expires.Equal(r.clock.Now().Add(idle)) {
-		t.Fatalf("a new group expires at %v, want IdleTTL from now", expires)
+		t.Fatalf("an established group expires at %v, want IdleTTL from now", expires)
 	}
 	r.clock.Advance(time.Hour)
 	if _, err := r.s.Join(t.Context(), g.URI, bob, ""); err != nil {
@@ -100,4 +107,47 @@ func rejected(err error) messaging.Reason {
 		return r.Reason
 	}
 	return ""
+}
+
+// A group made under a Contribution-ID (rcsjta's chat ID) is found again
+// by its creator trying its INVITE once more, until it is established;
+// anyone else naming that ID, or the creator once it is established, is
+// refused, and no second group is made (security review on #279). A group
+// that is never established ends PendingTTL after it was made, and its ID
+// may then be used again.
+func TestACreateUnderAContributionIDIsTriedAgainOnlyByItsCreator(t *testing.T) {
+	r := newRig(t, Config{})
+	req := CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}, Contribution: "chat-id-1"}
+	first, err := r.s.Create(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := r.s.Create(t.Context(), CreateRequest{Creator: "tel:+1-555-010-0001", Invitees: []Invitee{{Identity: carol}}, Contribution: "chat-id-1"})
+	if err != nil || again.URI != first.URI || len(again.Participants) != 2 {
+		t.Fatalf("the creator's retry got %+v, %v", again, err)
+	}
+	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: bob, Invitees: []Invitee{{Identity: carol}}, Contribution: "chat-id-1"}); !errors.Is(err, ErrTaken) {
+		t.Fatalf("someone else's create under the ID: %v", err)
+	}
+	if err := r.s.Established(t.Context(), first.URI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.s.Create(t.Context(), req); !errors.Is(err, ErrTaken) {
+		t.Fatalf("the creator's create once established: %v", err)
+	}
+	if r.m.get("group.created") != 1 {
+		t.Fatalf("%d groups made", r.m.get("group.created"))
+	}
+
+	pending, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}, Contribution: "chat-id-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(DefaultPendingTTL)
+	if _, err := r.s.Get(t.Context(), pending.URI); !errors.Is(err, ErrNoGroup) {
+		t.Fatalf("a group never established, after PendingTTL: %v", err)
+	}
+	if _, err := r.s.Create(t.Context(), CreateRequest{Creator: bob, Invitees: []Invitee{{Identity: carol}}, Contribution: "chat-id-2"}); err != nil {
+		t.Fatalf("the ID of a group that ended: %v", err)
+	}
 }

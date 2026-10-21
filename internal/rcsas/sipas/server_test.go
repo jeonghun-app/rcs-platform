@@ -11,6 +11,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -244,6 +245,13 @@ func (d deliverer) Pager(ctx context.Context, v messaging.Delivery) error {
 
 func (d deliverer) Invite(ctx context.Context, v messaging.Invitation) error {
 	return (*d.a).srv.Invite(ctx, v)
+}
+
+// notifier is the group chat focus's Notifier: the Server, once started.
+type notifier struct{ a **as }
+
+func (n notifier) RosterChanged(ctx context.Context, u group.RosterUpdate) {
+	(*n.a).srv.RosterChanged(ctx, u)
 }
 
 // #298: a pager MESSAGE as rcsjta sends it, without conversation headers,
