@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -379,13 +380,14 @@ func TestARegisterToTheProductionFormOfANameLeavesOverTCP(t *testing.T) {
 	}
 }
 
-// Code review of #311, scaled down: with a 4 MiB layer bound and the proxy
-// limits proxyLimits gives, 300 KiB MESSAGEs held at the S-CSCF are refused
-// by the transaction layer, whose refusals #56's alarm counts, and never by
-// the proxy's own byte bound.
-func TestTheLayerRefusesLargeRequestsBeforeTheProxy(t *testing.T) {
+// Code review of #311, scaled down: header-heavy requests, as REGISTERs
+// through pcscf are, cost the proxy more than the layer, so the proxy's own
+// byte bound, 1:1 with the layer's, refuses first. Its refusal is counted
+// (Overloaded), as the layer's would be, which is what the overload metric
+// adds up.
+func TestAHeaderHeavyBurstIsRefusedAtTheProxysBoundAndCounted(t *testing.T) {
 	g := &proxied{rig: newRig(t), clock: &fakeClock{}, net: &fakeNet{}}
-	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 20000, MaxServerTransactionBytes: 4 << 20})
+	tcfg, contexts, bytes := proxyLimits(ServiceConfig{MaxServerTransactions: 20000, MaxServerTransactionBytes: 1 << 20})
 	tcfg.Clock = g.clock
 	p, err := proxy.New(g.net, proxy.Config{
 		Self:            []sip.URI{mustURI("sip:icscf.rcs.local;lr")},
@@ -401,13 +403,15 @@ func TestTheLayerRefusesLargeRequestsBeforeTheProxy(t *testing.T) {
 	}
 	g.p = p
 	t.Cleanup(p.Close)
-	for i := range 20 {
-		m := request(t, "MESSAGE", impu1, fmt.Sprintf("Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKbig%d", i), fmt.Sprintf("Call-ID: big-%d@192.0.2.10", i))
-		m.Body = make([]byte, 300<<10)
+	pad := strings.Repeat("x", 12<<10)
+	for i := range 100 {
+		m := request(t, "MESSAGE", impu1, fmt.Sprintf("Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKhdr%d", i),
+			fmt.Sprintf("Call-ID: hdr-%d@192.0.2.10", i), "X-Pad: "+pad)
 		g.receive(m)
 	}
 	waitFor(t, "a refusal", func() bool { return slices.Contains(g.net.responses(), "503 MESSAGE") })
-	if ls, ps := p.Layer().Stats(), p.Stats(); ls.ServerTransactionsRejected == 0 || ps.Overloaded != 0 {
-		t.Fatalf("layer %+v, proxy %+v: the proxy refused first", ls, ps)
+	ls, ps := p.Layer().Stats(), p.Stats()
+	if ps.Overloaded == 0 {
+		t.Fatalf("layer %+v, proxy %+v: the proxy's refusal was not counted", ls, ps)
 	}
 }

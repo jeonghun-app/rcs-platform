@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/netip"
 	"strconv"
@@ -149,30 +148,20 @@ func drain(px *proxy.Proxy, d time.Duration) {
 }
 
 // proxyLimits are the bounds of icscf's proxy: its layer's server
-// transaction caps (#37), as many contexts as server transactions, and
-// proxyByteCharge times the layer's bytes, so the layer's caps, whose
-// refusals the transaction statistics count, are the ones a burst meets,
-// not a 503 of the proxy's own (code review of #311).
+// transaction caps (#37); as many contexts as server transactions, so the
+// layer's count, not the proxy's, is the one a burst meets; and the same
+// bytes for the proxy's own memory bound, which the proxy charges
+// differently (a request's body, two copies of its header, and two per
+// branch), so either may refuse a request first. Both refusals are counted:
+// the layer's ServerTransactionsRejected and the proxy's Overloaded (code
+// review of #311, option A).
 func proxyLimits(cfg ServiceConfig) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
 	tcfg = transaction.Config{
 		MaxServerTransactions:     cfg.MaxServerTransactions,
 		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
 	}
-	maxContextBytes = math.MaxInt64
-	if cfg.MaxServerTransactionBytes <= math.MaxInt64/proxyByteCharge {
-		maxContextBytes = proxyByteCharge * cfg.MaxServerTransactionBytes
-	}
-	return tcfg, cfg.MaxServerTransactions, maxContextBytes
+	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
 }
-
-// proxyByteCharge bounds what the proxy charges a request against its bytes
-// for each byte the layer charges it: the layer counts the request as
-// received, at least its header and body, and the proxy its body and two
-// copies of its header, plus two for every branch, up to MaxBranches. So
-// with MaxContextBytes this many times the layer's bound, the layer's
-// refusals, which the transaction statistics count, always come first
-// (code review of #311).
-const proxyByteCharge = 2 + 2*proxy.DefaultMaxBranches
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own
 // Origin-Host (ADR 0005).
