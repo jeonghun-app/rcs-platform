@@ -33,6 +33,9 @@ type UAS struct {
 
 	mu       sync.Mutex
 	answered bool
+	// handed is set once a final response has been handed to the server
+	// transaction; answered is set before, to refuse a second one.
+	handed   bool
 	accepted bool
 	// The 2xx being retransmitted, and what became of it.
 	ok       *sip.Response
@@ -101,7 +104,15 @@ func (u *UAS) Respond(res *sip.Response) error {
 		// back at once is not taken for one to forward.
 		u.retransmit(res)
 	}
-	if err := u.tx.Respond(res); err != nil {
+	err := u.tx.Respond(res)
+	if final {
+		// Only now is the request no longer in progress for Drain, as
+		// for the proxy's own answers (respContext.handed).
+		u.mu.Lock()
+		u.handed = true
+		u.mu.Unlock()
+	}
+	if err != nil {
 		if accept {
 			u.end()
 		}
@@ -113,6 +124,14 @@ func (u *UAS) Respond(res *sip.Response) error {
 		u.mu.Unlock()
 	}
 	return nil
+}
+
+// handedFinal reports whether the service's final response has been handed
+// to the server transaction.
+func (u *UAS) handedFinal() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.handed
 }
 
 func (u *UAS) hasAnswered() bool {
@@ -230,7 +249,8 @@ func (u *UAS) ACK(ctx context.Context) (*sip.Request, error) {
 func (c *respContext) serve(in *Request) {
 	u := c.uas
 	u.req = in
-	c.dec.Serve(c.reqCtx, u)
+	// A panic is answered as a return without an answer.
+	c.p.hook("Serve", func() { c.dec.Serve(c.reqCtx, u) })
 	if !u.hasAnswered() {
 		c.mu.Lock()
 		code := 500

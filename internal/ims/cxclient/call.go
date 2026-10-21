@@ -25,7 +25,7 @@ func (e *SentError) Unwrap() error { return e.Err }
 
 // NeverSent reports whether err is from a request that certainly reached no
 // HSS task: none was connected (ErrNoPeer), or every attempt found its task
-// unavailable before the send (diameter.ErrPeerUnavailable). A request one
+// unavailable, or not speaking Cx, before the send (unsent). A request one
 // attempt of which was sent (SentError), or that failed any other way, a
 // timeout or a closed connection included, may have been served.
 func NeverSent(err error) bool {
@@ -33,7 +33,7 @@ func NeverSent(err error) bool {
 	if errors.As(err, &se) {
 		return false
 	}
-	return errors.Is(err, ErrNoPeer) || errors.Is(err, diameter.ErrPeerUnavailable)
+	return errors.Is(err, ErrNoPeer) || unsent(err)
 }
 
 // ProtocolError is an answer with a protocol error (3xxx, RFC 6733 §7.1.3),
@@ -145,8 +145,10 @@ func (c *Client) attempt(ctx context.Context, p *hssPeer, build func(*diameter.N
 		return nil, nil, err
 	}
 	if prev != nil && prev.EndToEnd != 0 {
-		// The first attempt may have reached its task; one that never left
-		// has no End-to-End Identifier and needs no T flag.
+		// The first attempt may have reached its task. One refused before
+		// the send has no End-to-End Identifier and needs no T flag; one
+		// the diameter writer dropped behind a DPR or DPA has one, so it
+		// goes again with the T flag, though it never left (#324).
 		msg.EndToEnd = prev.EndToEnd
 		msg.Flags |= diameter.FlagRetransmit
 	}
@@ -157,9 +159,13 @@ func (c *Client) attempt(ctx context.Context, p *hssPeer, build func(*diameter.N
 }
 
 // left reports whether an attempt that built msg and ended with err left
-// for its task: all but one whose task was unavailable at the send.
-func left(msg *diameter.Message, err error) bool {
-	return msg != nil && !errors.Is(err, diameter.ErrPeerUnavailable) && !errors.Is(err, diameter.ErrApplicationNotNegotiated)
+// for its task: all but one the peer refused before the send (unsent).
+func left(msg *diameter.Message, err error) bool { return msg != nil && !unsent(err) }
+
+// unsent reports an error the peer returns before it sends anything: no
+// open connection, or no Cx on it.
+func unsent(err error) bool {
+	return errors.Is(err, diameter.ErrPeerUnavailable) || errors.Is(err, diameter.ErrApplicationNotNegotiated)
 }
 
 // retryable reports whether a failed attempt may be repeated on another HSS

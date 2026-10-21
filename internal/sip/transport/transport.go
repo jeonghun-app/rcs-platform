@@ -178,8 +178,11 @@ type Config struct {
 	// until the first message is complete, so a connection that never sends a
 	// message frees its MaxConnections slot quickly.
 	ReadTimeout time.Duration
-	// WriteTimeout bounds writing one message. A stream connection whose write
-	// fails or times out is closed, since part of a message may have been sent.
+	// WriteTimeout bounds writing each 32 KiB of a message to a stream
+	// connection, which makes it a throughput floor for a peer whose buffers
+	// are full (about 20 KiB/s at the default; see writeAll). A stream
+	// connection whose write fails or times out is closed, since part of a
+	// message may have been sent.
 	WriteTimeout time.Duration
 	// SendQueueBytes bounds what may wait to be written to one stream
 	// connection: a send waits for room, for at most WriteTimeout, while it is
@@ -697,6 +700,49 @@ type counters struct {
 	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses,
 	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty atomic.Uint64
+}
+
+// Flush waits until each stream connection has written the output it had
+// queued when Flush was called, and that of the senders then waiting for room
+// in its queue, until that connection's writer has made no
+// progress (a chunk written, see writeAll) for stall, counted from the call
+// at the earliest, or until deadline. Output queued meanwhile is not waited
+// for, so a busy connection ends the wait as soon as its earlier output is
+// out. A service that stops uses it before Close, which drops what the
+// queues hold: a peer that still reads gets its answers, however long they
+// are, and one that has stopped reading costs stall, not the whole deadline,
+// and does not hide behind another peer's traffic (QA of #366). The target is
+// in bytes, not messages: a sender that queues after the start and wins the
+// room a waiting one was given can complete it while that one still waits,
+// which needs a full queue that keeps taking new output.
+func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
+	start := time.Now()
+	type pending struct {
+		q      *sendQueue
+		target uint64 // sent once the output queued at the start is out
+	}
+	var ps []pending
+	for _, f := range t.flows.streams() {
+		f.q.mu.Lock()
+		if f.q.queued+f.q.waiting > 0 && !f.q.closed {
+			ps = append(ps, pending{f.q, f.q.sent + uint64(f.q.queued+f.q.waiting)})
+		}
+		f.q.mu.Unlock()
+	}
+	for len(ps) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		now := time.Now()
+		ps = slices.DeleteFunc(ps, func(p pending) bool {
+			p.q.mu.Lock()
+			sent, closed := p.q.sent, p.q.closed
+			p.q.mu.Unlock()
+			last := time.Unix(0, p.q.progress.Load())
+			if last.Before(start) {
+				last = start
+			}
+			return closed || sent >= p.target || now.Sub(last) >= stall
+		})
+	}
 }
 
 // Stats returns the current gauges and counters.

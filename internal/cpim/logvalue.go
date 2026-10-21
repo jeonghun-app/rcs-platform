@@ -2,6 +2,7 @@ package cpim
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -19,7 +20,8 @@ import (
 // The receiver is a pointer so that a nil one can be told apart: a value
 // receiver would make slog log the panic of its call. A Message value,
 // which has no LogValue then, reaches slog's JSON handler through
-// encoding/json, and MarshalJSON writes the same fields.
+// encoding/json, and MarshalJSON writes the same fields; it reaches the
+// text handler through fmt, and Format prints them.
 func (m *Message) LogValue() slog.Value {
 	if m == nil {
 		return slog.GroupValue()
@@ -44,6 +46,17 @@ func (m *Message) LogValue() slog.Value {
 // struct field or a slice, which slog's JSON handler hands to encoding/json,
 // is redacted too. Nothing encodes a Message as JSON for another purpose.
 func (m Message) MarshalJSON() ([]byte, error) { return json.Marshal(m.logged()) }
+
+// Format implements fmt.Formatter with what MarshalJSON writes, whatever the
+// verb, so that a Message value, which has no LogValue, never prints its
+// formal names, Subject or body: not through fmt, and not through slog's
+// text handler, which formats such a value with %+v (#171). fmt prints a nil
+// *Message as <nil>, as it prints any nil pointer whose method panics.
+func (m Message) Format(f fmt.State, _ rune) {
+	// The encoding cannot fail: the log form holds only strings and ints.
+	b, _ := m.MarshalJSON()
+	_, _ = f.Write(b)
+}
 
 type loggedMessage struct {
 	Headers     []string  `json:"headers"`

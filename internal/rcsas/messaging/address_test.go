@@ -266,3 +266,23 @@ func TestASendersOwnAddressInAnotherFormIsItsOwn(t *testing.T) {
 		t.Error("a tel sender does not name itself as sip:...;user=phone")
 	}
 }
+
+// A group message's sender is named as UserOf names it at the home domain,
+// the form the group keys its participants by: alice asserted by her SIP
+// URI at the home domain is the author tel:+…, which the GroupHandler
+// knows, and her copies say so; her From may still be her SIP URI.
+func TestAGroupSenderIsNamedAsTheGroupNamesIt(t *testing.T) {
+	const home = "ims.example.net"
+	r := newRig(t, Config{HomeDomain: home})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	sipAlice := "sip:+15550100001@" + home
+	body := cpimMessage(t, cpim.Address{URI: sipAlice}, "m1", "hi", 0)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(sipAlice, body)); err != nil {
+		t.Fatal(err)
+	}
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 || ms[0].Author != alice {
+		t.Fatalf("bob's queue %+v, %v", ms, err)
+	}
+	readAddresses(t, ms[0].CPIM, cpim.Address{URI: alice}, "<"+groupURI+">")
+}

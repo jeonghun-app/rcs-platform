@@ -14,6 +14,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -42,6 +43,7 @@ type Engine interface {
 	Offer(p messaging.LegParams) (*messaging.Leg, error)
 	InviteFailed(inv messaging.Invitation, err error)
 	UserRegistered(user string, newFlow bool)
+	Invite(ctx context.Context, inv messaging.Invitation)
 }
 
 // Config configures a Server.
@@ -59,6 +61,27 @@ type Config struct {
 	// Contact is this task's SIP URI, the Contact of its sessions, where
 	// the requests in their dialogs reach it.
 	Contact sip.URI
+	// ConferenceFactory is the URI a client sends the INVITE that creates
+	// a group chat to (RCSAS_CONFERENCE_FACTORY_URI, the ConfFctyURI ACS
+	// provisions), and ConferenceHost the host of the conference URIs of
+	// the groups (RCSAS_CONFERENCE_HOST). A request to either is a group
+	// chat's, and never goes the 1-to-1 way. Both are required.
+	ConferenceFactory sip.URI
+	ConferenceHost    string
+	// MaxGroupParticipants bounds the entries of a resource list rcs-as
+	// reads (RCSAS_GROUP_MAX_PARTICIPANTS); zero is
+	// group.DefaultMaxParticipants.
+	MaxGroupParticipants int
+	// GroupChat turns group chat on (RCSAS_GROUP_CHAT_ENABLED). While it is
+	// off, a request to the conference factory or a conference URI is
+	// answered 404 and creates nothing. Group chat needs rcs-as to run as
+	// one task until #121.
+	GroupChat bool
+	// MaxSubscriptionsPerUser bounds the subscriptions to group rosters
+	// one user holds on this task, across groups
+	// (RCSAS_MAX_SUBSCRIPTIONS_PER_USER); zero is
+	// DefaultMaxSubscriptionsPerUser.
+	MaxSubscriptionsPerUser int
 	// MaxMessageSize is the a=max-size of its SDP; zero leaves it out.
 	MaxMessageSize int
 	// MaxSessions bounds the sessions this task holds (threat model T9).
@@ -82,6 +105,9 @@ type Config struct {
 
 	// closeWait is closeWait unless a test sets it.
 	closeWait time.Duration
+	// groupChatOff keeps GroupChat off in the tests, whose rigs turn it
+	// on wherever they run a group service.
+	groupChatOff bool
 	// Metrics counts events, without identifiers; nil counts nothing.
 	Metrics messaging.Counter
 	// Logger receives operational events, never identities or content; nil
@@ -96,6 +122,7 @@ type Server struct {
 	cfg    Config
 	ids    sip.IDGenerator
 	engine Engine
+	groups Groups
 	layer  *transaction.Layer
 	// sender sends the ACKs of 2xx responses, which belong to no
 	// transaction (RFC 3261 §13.2.2.4).
@@ -104,6 +131,16 @@ type Server struct {
 	mu       sync.Mutex
 	closed   bool
 	sessions map[string]*session
+	// subs are the subscriptions to the conference event package by
+	// dialog, groupSubs those of each group, and subsOf how many each
+	// participant holds to each group (subscription.key) and how many
+	// each user holds in all (keyed by the user alone).
+	subs      map[string]*subscription
+	groupSubs map[string]map[*subscription]bool
+	subsOf    map[string]int
+	// refers are the REFERs waiting to hear how the focus's INVITE to
+	// someone in a group ended, by group and invitee (referDone).
+	refers map[string][]*referWatch
 	// perUser counts each user's sessions each way (session.budget),
 	// those still waiting for an answer included; pending counts those for
 	// all users. large holds the user and peer of each large-mode session
@@ -113,6 +150,16 @@ type Server struct {
 	// answering counts the sessions added whose first answer has not gone
 	// yet (settle).
 	answering sync.WaitGroup
+	// swept is set once Close has taken the sessions it ends, and
+	// sweeping while it still waits for their BYEs' answers; lateByes
+	// counts the BYEs settle sends meanwhile, which Close waits for too.
+	swept, sweeping bool
+	lateByes        sync.WaitGroup
+	// closeBy is when Close returns at the latest, which bounds the late
+	// BYEs it waits for.
+	closeBy time.Time
+	// closeOnce runs Close once; a later call waits for it.
+	closeOnce sync.Once
 	large     map[string]bool
 	// registered is when each user's registration, as rcs-as last heard
 	// of it, runs out (register).
@@ -132,6 +179,21 @@ func New(cfg Config) (*Server, error) {
 	}
 	if !cfg.Contact.IsSIP() {
 		return nil, errors.New("sipas: Contact must be a SIP URI")
+	}
+	if !cfg.ConferenceFactory.IsSIP() || cfg.ConferenceFactory.User == "" || cfg.ConferenceHost == "" {
+		return nil, errors.New("sipas: ConferenceFactory must be a SIP URI with a user, and ConferenceHost is required")
+	}
+	// The spelling the group writes conference URIs with (conferenceURI).
+	cfg.ConferenceHost = strings.ToLower(strings.TrimSuffix(cfg.ConferenceHost, "."))
+	if sameHost(cfg.ConferenceHost, cfg.HomeDomain) {
+		// Every user's request would be taken for a group's.
+		return nil, errors.New("sipas: ConferenceHost must not be the home domain")
+	}
+	if cfg.MaxSubscriptionsPerUser <= 0 {
+		cfg.MaxSubscriptionsPerUser = DefaultMaxSubscriptionsPerUser
+	}
+	if cfg.MaxGroupParticipants <= 0 {
+		cfg.MaxGroupParticipants = group.DefaultMaxParticipants
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = proxy.NumericResolver{}
@@ -158,15 +220,18 @@ func New(cfg Config) (*Server, error) {
 		cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand},
 		sessions: map[string]*session{}, perUser: map[string]int{}, large: map[string]bool{},
 		registered: map[string]time.Time{},
+		subs:       map[string]*subscription{}, groupSubs: map[string]map[*subscription]bool{}, subsOf: map[string]int{},
+		refers: map[string][]*referWatch{},
 	}, nil
 }
 
-// Bind gives s the engine it submits to, the transaction layer it sends
-// through, which is the proxy's (proxy.Proxy.Layer), and the transport
-// under it. It must be called before the transport takes requests and
-// before the engine delivers.
-func (s *Server) Bind(e Engine, l *transaction.Layer, tr transaction.Sender) {
-	s.engine, s.layer, s.sender = e, l, tr
+// Bind gives s the engine it submits to, the group chat focus that runs
+// the groups, the transaction layer it sends through, which is the proxy's
+// (proxy.Proxy.Layer), and the transport under it. It must be called before
+// the transport takes requests and before the engine delivers. Without
+// groups, every group chat request is answered 404.
+func (s *Server) Bind(e Engine, g Groups, l *transaction.Layer, tr transaction.Sender) {
+	s.engine, s.groups, s.layer, s.sender = e, g, l, tr
 }
 
 type noMetrics struct{}
@@ -185,6 +250,7 @@ func (systemClock) AfterFunc(d time.Duration, f func()) msrp.Timer { return time
 // P-Served-User exclusion of the default one (docs/hss.md): rcs-as would
 // take its own delivery for a new message and send it once more, without
 // end. A client that writes such a tag only has its own request refused.
+// The focus's requests to a group's participants carry none (fromFocus).
 const ownTagPrefix = "rcsas-"
 
 // ownTag is a From tag for a request rcs-as originates.
@@ -199,14 +265,21 @@ func looped(req *sip.Request) bool {
 	return err == nil && strings.HasPrefix(from.Tag(), ownTagPrefix)
 }
 
-// Route implements proxy.Router.
+// Route implements proxy.Router. A group chat's request, one to the
+// conference factory or to a conference URI, is told apart first, so that
+// none of them, a rejoin INVITE without a resource list say, is ever taken
+// for a 1-to-1 chat (security review on #252).
 func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
-	if r.Initial() && r.Message.Method != "ACK" && looped(r.Message) {
+	initial := r.Initial() && r.Message.Method != "ACK"
+	if initial && (looped(r.Message) || s.fromFocus(r.Message)) {
 		// 482 Loop Detected (RFC 3261 §21.4.20); the sender of the
 		// request, rcs-as itself, takes it as a failure and tries again
 		// later, until the profile is put right.
 		s.cfg.Metrics.Count("sip.loop", 1)
 		return proxy.Decision{Status: 482}
+	}
+	if initial && s.forGroup(r.Message.URI) {
+		return s.routeGroup(r)
 	}
 	switch m := r.Message.Method; {
 	case m == "ACK":
@@ -226,18 +299,23 @@ func (s *Server) Route(_ context.Context, r *proxy.Request) proxy.Decision {
 		// below its own entry, back to scscf.
 		return proxy.Forward(r)
 	default:
-		// 405 must say what is allowed (RFC 3261 §21.4.6).
-		s.cfg.Metrics.Count("sip.refused.method", 1)
-		tag, err := s.ids.Tag()
-		if err != nil {
-			return proxy.Decision{Status: 500}
-		}
-		res, err := sip.NewResponse(r.Message, 405, "", tag)
-		if err != nil || res.Header.Set("Allow", allowed) != nil {
-			return proxy.Decision{Status: 500}
-		}
-		return proxy.Decision{Response: res}
+		return s.refuseMethod(r, allowed)
 	}
+}
+
+// refuseMethod answers r 405, which must say what is allowed (RFC 3261
+// §21.4.6).
+func (s *Server) refuseMethod(r *proxy.Request, allow string) proxy.Decision {
+	s.cfg.Metrics.Count("sip.refused.method", 1)
+	tag, err := s.ids.Tag()
+	if err != nil {
+		return proxy.Decision{Status: 500}
+	}
+	res, err := sip.NewResponse(r.Message, 405, "", tag)
+	if err != nil || res.Header.Set("Allow", allow) != nil {
+		return proxy.Decision{Status: 500}
+	}
+	return proxy.Decision{Response: res}
 }
 
 // allowed are the methods rcs-as takes.

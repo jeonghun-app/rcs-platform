@@ -1,8 +1,10 @@
 package pcscf
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -60,9 +62,37 @@ const (
 	// nothing for 340 s, just under the NLB TLS listener's fixed 350 s, so the
 	// client sees a clean close rather than a later reset (ADR 0003).
 	DefaultClientIdleTimeout = 340 * time.Second
+	// DefaultMaxBindingsPerFlow and DefaultMaxBindings bound the msrp-relay
+	// bindings one client flow and one task hold (#136 decision 4): a chat
+	// and a few file transfers at once fit a flow's share.
+	DefaultMaxBindingsPerFlow = 16
+	DefaultMaxBindings        = 20_000
+	// DefaultBindingsPerMinute bounds the bindings one client flow creates
+	// in a minute, whatever it holds (#248 security review): a chat or a
+	// file transfer every two seconds is far past what a person does.
+	DefaultBindingsPerMinute = 32
+	// rcs-as's offers toward a client flow have a share of their own, so
+	// that offers coming in cannot keep a client from making its own (#315
+	// code review 2, security review). A flow holds the bindings of as many
+	// sessions as rcs-as lets come in for one user (its
+	// RCSAS_MAX_INCOMING_SESSIONS_PER_USER, 32), one MSRP line each.
+	DefaultMaxCoreOfferBindingsPerFlow = 32
+	DefaultCoreOfferBindingsPerMinute  = 32
+	// DefaultRelayTimeout bounds one call to msrp-relay's control API.
+	DefaultRelayTimeout = 2 * time.Second
+	// minRelayTokenLength is the shortest relay token accepted in staging
+	// and prod, the relay's own rule: 256 random bits in base64 (ADR 0007
+	// §4).
+	minRelayTokenLength = 43
 	// stopMargin is what Run needs after the drain to close the proxy and
 	// the transport and flush the last metrics, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
+	// answersWait, a part of stopMargin, bounds the wait after the drain
+	// for the requests still in progress: the 430 for a request on one of
+	// the last flows closed goes out after the close (#234), and closing
+	// the proxy first would drop it. A request still waiting on the core
+	// holds it to the end.
+	answersWait = 2 * time.Second
 )
 
 // Config is pcscf's configuration (docs/pcscf.md).
@@ -137,6 +167,19 @@ type Config struct {
 	// MaxPendingRegistersPerIP bounds the identities one client address may
 	// have REGISTERs under way for at once.
 	MaxPendingRegistersPerIP int
+	// RelayURL is msrp-relay's control API, a private host (ADR 0007 §5),
+	// and RelayToken pcscf's bearer token for it, which prints as
+	// "[redacted]". Without a token no MSRP session is anchored, and every
+	// offer of one is refused (#136 decision 5).
+	RelayURL     *url.URL
+	RelayToken   relayToken
+	RelayTimeout time.Duration
+	// MaxBindingsPerFlow and MaxBindings bound the relay bindings of one
+	// flow and of the task, and BindingsPerMinute those one flow creates
+	// in a minute, for the client's offers; the CoreOffer two bound,
+	// apart, those of rcs-as's offers toward it.
+	MaxBindingsPerFlow, MaxBindings, BindingsPerMinute      int
+	MaxCoreOfferBindingsPerFlow, CoreOfferBindingsPerMinute int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -176,6 +219,16 @@ func Configure(s *runtime.Settings) Config {
 		HomeDomain:               strings.TrimSuffix(strings.ToLower(s.Shared.RequiredString("IMS_DOMAIN")), "."),
 	}
 	c.VisitedNetworkID = e.String("VISITED_NETWORK_ID", c.HomeDomain)
+	c.RelayURL, c.RelayToken = relaySettings(s)
+	c.RelayTimeout = e.Duration("RELAY_TIMEOUT", DefaultRelayTimeout)
+	c.MaxBindingsPerFlow = e.Int("MAX_BINDINGS_PER_FLOW", DefaultMaxBindingsPerFlow)
+	c.MaxBindings = e.Int("MAX_BINDINGS", DefaultMaxBindings)
+	c.BindingsPerMinute = e.Int("BINDINGS_PER_MINUTE", DefaultBindingsPerMinute)
+	c.MaxCoreOfferBindingsPerFlow = e.Int("MAX_CORE_OFFER_BINDINGS_PER_FLOW", DefaultMaxCoreOfferBindingsPerFlow)
+	c.CoreOfferBindingsPerMinute = e.Int("CORE_OFFER_BINDINGS_PER_MINUTE", DefaultCoreOfferBindingsPerMinute)
+	if c.RelayTimeout <= 0 {
+		e.Invalid("RELAY_TIMEOUT", "must be greater than zero")
+	}
 	c.ICSCF = icscfURI(s)
 	c.SCSCFHost, c.SCSCFPort = scscfService(s, c.PublicHost)
 	if c.HomeDomain != "" && !validHostName(c.HomeDomain) {
@@ -238,6 +291,10 @@ func Configure(s *runtime.Settings) Config {
 		{"MAX_REGISTER_RATE", c.MaxRegisterRate}, {"MAX_REGISTER_BURST", c.MaxRegisterBurst},
 		{"MAX_FLOWS_PER_IP", c.MaxFlowsPerIP}, {"MAX_CONNECTIONS", c.MaxConnections},
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
+		{"MAX_BINDINGS_PER_FLOW", c.MaxBindingsPerFlow}, {"MAX_BINDINGS", c.MaxBindings},
+		{"BINDINGS_PER_MINUTE", c.BindingsPerMinute},
+		{"MAX_CORE_OFFER_BINDINGS_PER_FLOW", c.MaxCoreOfferBindingsPerFlow},
+		{"CORE_OFFER_BINDINGS_PER_MINUTE", c.CoreOfferBindingsPerMinute},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")
@@ -275,6 +332,81 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("DRAIN_TIMEOUT", "plus "+stopMargin.String()+" must not exceed RCS_SHUTDOWN_TIMEOUT ("+stop.String()+")")
 	}
 	return c
+}
+
+// relayToken is a bearer token that never prints.
+type relayToken struct{ v string }
+
+func (relayToken) String() string   { return "[redacted]" }
+func (relayToken) GoString() string { return "[redacted]" }
+
+// relaySettings reads PCSCF_RELAY_URL, an http or https URL of a private
+// host, msrp-relay's Cloud Map name on its control port by default, and
+// PCSCF_RELAY_TOKEN, which staging and prod require, of at least
+// minRelayTokenLength characters; in AWS it comes from Secrets Manager.
+func relaySettings(s *runtime.Settings) (*url.URL, relayToken) {
+	e := s.Env
+	def := ""
+	if ns := s.ServiceNamespace(); ns != "" {
+		def = "http://msrp-relay." + ns + ":8082"
+	}
+	var u *url.URL
+	switch v := e.String("RELAY_URL", def); {
+	case v == "":
+		e.Invalid("RELAY_URL", "required when RCS_SERVICE_NAMESPACE is unset")
+	default:
+		parsed, err := url.Parse(v)
+		if err != nil || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" ||
+			!runtime.IsPrivateInternalURL(parsed, s.ServiceNamespace()) && !(!s.Environment.Production() && isLoopbackURL(parsed)) {
+			e.Invalid("RELAY_URL", "not an http or https URL of a private host, without a path (ADR 0007 §5)")
+		} else {
+			u = parsed
+		}
+	}
+	token := e.String("RELAY_TOKEN", "")
+	s.ForbidInProduction(token == "", "PCSCF_RELAY_TOKEN is unset: every MSRP session would be refused")
+	if token != "" {
+		if !validBearerToken(token) {
+			e.Invalid("RELAY_TOKEN", "not a bearer token: letters, digits and -._~+/ with optional trailing = (RFC 6750 §2.1)")
+			token = ""
+		} else {
+			s.ForbidInProduction(len(token) < minRelayTokenLength, fmt.Sprintf(
+				"PCSCF_RELAY_TOKEN is shorter than %d characters (ADR 0007 §4: at least 256 random bits)", minRelayTokenLength))
+		}
+	}
+	return u, relayToken{token}
+}
+
+// isLoopbackURL reports whether u names a loopback host, as a dev stack's
+// relay on one host is.
+func isLoopbackURL(u *url.URL) bool {
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Hostname() == "localhost" {
+		return true
+	}
+	a, err := netip.ParseAddr(u.Hostname())
+	return err == nil && a.IsLoopback()
+}
+
+// validBearerToken reports whether t is a b64token (RFC 6750 §2.1), which
+// an Authorization header can carry as it is.
+func validBearerToken(t string) bool {
+	if t == "" || len(t) > 512 {
+		return false
+	}
+	body := strings.TrimRight(t, "=")
+	if body == "" {
+		return false
+	}
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("-._~+/", c) >= 0) {
+			return false
+		}
+	}
+	return true
 }
 
 // icscfURI reads PCSCF_ICSCF_URI, a SIP URI with lr, or makes icscf's Cloud

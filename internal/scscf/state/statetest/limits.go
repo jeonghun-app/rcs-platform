@@ -96,7 +96,7 @@ func testImpossibleKeys(t *testing.T, a, _ state.Store, _ Options) {
 		wantErr(t, err, state.ErrNotFound)
 		_, err = a.Subscription(ctx(t), impu)
 		wantErr(t, err, state.ErrNotFound)
-		_, _, err = a.NextNotify(ctx(t), impu)
+		_, _, err = a.NextNotify(ctx(t), impu, 0)
 		wantErr(t, err, state.ErrNotFound)
 		for _, k := range []state.SetKey{{IMPI: IMPI1, IMPU: impu}, {IMPI: impu, IMPU: IMPU1}} {
 			_, err = a.Profile(ctx(t), k, T0)
@@ -230,7 +230,8 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 		}); err != nil {
 			t.Error(err)
 		}
-		_, _, final = a.NextNotify(ctx(t), s.ID)
+		_, _, final = a.NextNotify(ctx(t), s.ID, state.FinalNotify)
+		finish(t, a, s.ID)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -240,9 +241,10 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	_, err := a.Subscription(ctx(t), "s1")
 	wantErr(t, err, state.ErrNotFound)
 
-	// One the S-CSCF ended itself, with the grace ahead, goes after it.
+	// One the S-CSCF ended itself, with the grace ahead, its final NOTIFY
+	// sent without an answer, is handed over after it, to send it again.
 	ended := Subscription("s2", IMPU1, time.Hour)
-	ended.Terminated, ended.Expires = true, T0.Add(state.TerminatedGrace)
+	ended.Terminated, ended.Expires, ended.NotifiedOf = true, T0.Add(state.TerminatedGrace), state.FinalNotify
 	must(a.SaveSubscription(ctx(t), ended))(t)
 	if _, err := state.SweepSubscriptions(ctx(t), b, T0, 10, func(*state.Subscription) {}); err != nil {
 		t.Fatal(err)
@@ -252,10 +254,15 @@ func testTerminatedGrace(t *testing.T, a, b state.Store, o Options) {
 	eventually(t, o, "the index to list it", func() bool {
 		return len(must(b.ExpiringSubscriptions(ctx(t), later, 10))(t)) == 1
 	})
-	if _, err := state.SweepSubscriptions(ctx(t), b, later, 10, func(*state.Subscription) {
-		t.Error("a Terminated subscription was handled")
+	handled := 0
+	if _, err := state.SweepSubscriptions(ctx(t), b, later, 10, func(s *state.Subscription) {
+		handled++
+		finish(t, b, s.ID)
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if handled != 1 {
+		t.Errorf("handed over %d times after its grace", handled)
 	}
 	_, err = a.Subscription(ctx(t), "s2")
 	wantErr(t, err, state.ErrNotFound)
@@ -265,10 +272,10 @@ func testCounterLimit(t *testing.T, a, b state.Store, _ Options) {
 	s := Subscription("s1", IMPU1, time.Hour)
 	s.CSeq = state.MaxCounter - 1
 	must(a.SaveSubscription(ctx(t), s))(t)
-	if c, _, err := b.NextNotify(ctx(t), "s1"); err != nil || c != state.MaxCounter {
+	if c, _, err := b.NextNotify(ctx(t), "s1", 0); err != nil || c != state.MaxCounter {
 		t.Fatalf("NextNotify below the limit = %d, %v", c, err)
 	}
-	_, _, err := b.NextNotify(ctx(t), "s1")
+	_, _, err := b.NextNotify(ctx(t), "s1", 0)
 	wantErr(t, err, state.ErrExhausted)
 	if got := must(a.Subscription(ctx(t), "s1"))(t); got.CSeq != state.MaxCounter {
 		t.Errorf("stored CSeq %d", got.CSeq)
@@ -908,6 +915,73 @@ func testAttemptCountNotAChallenge(t *testing.T, a, _ state.Store, _ Options) {
 	wantErr(t, a.AddChallenge(ctx(t), Challenge(IMPI1, state.ReservedNoncePrefix+"x", time.Minute)), state.ErrInvalid)
 }
 
+// testODIClaims: the first side to claim a position is recorded for every
+// instance, a claim of that side again goes on, as does a resend of the
+// first, the other side gets the first's, of concurrent claims one side is
+// recorded, and a claim that has expired is taken over.
+func testODIClaims(t *testing.T, a, b state.Store, _ Options) {
+	scope, exp := state.ODIScope("odi-1"), T0.Add(time.Minute)
+	if side := must(a.ClaimODI(ctx(t), scope, state.ODIReturned, T0, exp))(t); side != state.ODIReturned {
+		t.Fatalf("the first claim recorded %q", side)
+	}
+	for _, s := range []state.Store{a, b} {
+		for _, side := range []string{state.ODIReturned, state.ODIDefault} {
+			if got := must(s.ClaimODI(ctx(t), scope, side, T0, exp))(t); got != state.ODIReturned {
+				t.Errorf("a claim for %s found %q, want the first's", side, got)
+			}
+		}
+	}
+	other := state.ODIScope("odi-2")
+	if side := must(b.ClaimODI(ctx(t), other, state.ODIDefault, T0, exp))(t); side != state.ODIDefault {
+		t.Errorf("another position recorded %q", side)
+	}
+	race := state.ODIScope("odi-3")
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got := map[string]int{}
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, side := a, state.ODIReturned
+			if i%2 == 1 {
+				s, side = b, state.ODIDefault
+			}
+			recorded, err := s.ClaimODI(ctx(t), race, side, T0, exp)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			got[recorded]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(got) != 1 {
+		t.Errorf("concurrent claims recorded %v, want one side", got)
+	}
+	if side := must(b.ClaimODI(ctx(t), scope, state.ODIDefault, exp, exp.Add(time.Minute)))(t); side != state.ODIDefault {
+		t.Errorf("a claim after the first expired found %q", side)
+	}
+	for _, bad := range []struct {
+		scope, side string
+		now, exp    time.Time
+	}{
+		{"odi-1", state.ODIReturned, T0, exp},
+		{strings.ToUpper(scope), state.ODIReturned, T0, exp},
+		{scope, "both", T0, exp},
+		{scope, state.ODIReturned, T0, T0},
+		{scope, state.ODIReturned, time.Time{}, exp},
+	} {
+		_, err := a.ClaimODI(ctx(t), bad.scope, bad.side, bad.now, bad.exp)
+		wantErr(t, err, state.ErrInvalid)
+	}
+	// No challenge's key names a claim.
+	_, err := a.TakeChallenge(ctx(t), state.ReservedNoncePrefix+"odi#"+scope, state.ReservedNoncePrefix+"odi", T0)
+	wantErr(t, err, state.ErrNotFound)
+}
+
 // testReassertSweep: a live registration whose Reassert has come is handed to
 // one sweep, which claims it for a lease, and is due again only when that
 // lease ends or the handler moves Reassert.
@@ -947,6 +1021,45 @@ func testReassertSweep(t *testing.T, a, b state.Store, o Options) {
 	bad.ReassertAttempts = state.MaxReassertAttempts + 1
 	_, err := a.SaveRegistration(ctx(t), bad)
 	wantErr(t, err, state.ErrInvalid)
+}
+
+// testUnregisteredReassertSweep: an unregistered user's record whose
+// Reassert comes before its state ends is listed then, claimed as a live
+// set (Reassert one lease ahead, no deregistration lease) and handed over
+// once, and the sweep does not delete it (#410 code review).
+func testUnregisteredReassertSweep(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1)
+	r.Unregistered = T0.Add(2 * time.Hour)
+	r.Reassert, r.ReassertAttempts = T0.Add(time.Minute), 1
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if regs := must(b.ExpiringRegistrations(ctx(t), T0, 10))(t); len(regs) != 0 {
+		t.Error("listed before its Reassert")
+	}
+	at := T0.Add(time.Minute)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), at, 10))(t)) == 1
+	})
+	called := 0
+	sweep := func(s state.Store, now time.Time) {
+		t.Helper()
+		if _, err := state.SweepRegistrations(ctx(t), s, now, 10, func(before, after *state.Registration) error {
+			called++
+			if !before.ReassertDue(now) || !after.Deregistering.IsZero() || !after.Reassert.Equal(now.Add(state.SweepLease)) || !after.Unregistered.Equal(r.Unregistered) {
+				t.Errorf("handled %+v then %+v", before, after)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweep(a, at)
+	sweep(b, at.Add(state.SweepLease/2))
+	if called != 1 {
+		t.Fatalf("handled %d times within the lease", called)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); !got.Unregistered.Equal(r.Unregistered) || !got.Deregistering.IsZero() {
+		t.Errorf("after the sweep: %+v", got)
+	}
 }
 
 // testReviveTakesANewIncarnation: a record claimed for a deregistration that
@@ -1033,4 +1146,43 @@ func testRefusedSaveKeepsAGoneProfileGone(t *testing.T, a, b state.Store, _ Opti
 	wantErr(t, b.SaveProfile(ctx(t), late), state.ErrConflict)
 	_, err := a.Profile(ctx(t), Set1, T0.Add(3*time.Hour))
 	wantErr(t, err, state.ErrNotFound)
+}
+
+// testRejectedLease: a deregistration's lease marked Rejected reads back
+// with the mark, and keeps it through a sweep's claim, on every backend;
+// a record no deregistration holds, with bindings or an unregistered
+// user's without, cannot have it (#334).
+func testRejectedLease(t *testing.T, a, b state.Store, o Options) {
+	r := Registration(IMPI1, IMPU1)
+	r.Deregistering, r.Rejected = T0.Add(-time.Second), true
+	must(a.SaveRegistration(ctx(t), r))(t)
+	if got := must(b.Registration(ctx(t), Key1(IMPU1)))(t); !got.Rejected {
+		t.Fatalf("read back %+v", got)
+	}
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringRegistrations(ctx(t), T0, 10))(t)) == 1
+	})
+	handled := 0
+	if _, err := state.SweepRegistrations(ctx(t), b, T0, 10, func(before, after *state.Registration) error {
+		handled++
+		if !before.Rejected || !after.Rejected {
+			t.Errorf("the claim lost the mark: before %v, after %v", before.Rejected, after.Rejected)
+		}
+		return errors.New("SAR failed")
+	}); handled != 1 {
+		t.Fatalf("handled %d, %v", handled, err)
+	}
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); !got.Rejected {
+		t.Error("the claimed lease lost the mark")
+	}
+	live := Registration(IMPI2, IMPU2, time.Hour)
+	live.Rejected = true
+	_, err := a.SaveRegistration(ctx(t), live)
+	wantErr(t, err, state.ErrInvalid)
+	// Keyed on the lease, not on the bindings: an unregistered user's
+	// record has none, and no lease (QA on #351).
+	unreg := Registration(IMPI2, IMPU2)
+	unreg.Unregistered, unreg.Rejected = T0.Add(time.Hour), true
+	_, err = a.SaveRegistration(ctx(t), unreg)
+	wantErr(t, err, state.ErrInvalid)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -420,5 +421,97 @@ func TestRenamingInAGroupIsBounded(t *testing.T) {
 	}
 	if r.m.get("group.name_dropped") != 2 {
 		t.Fatalf("metrics %v", r.m)
+	}
+}
+
+// #305: a group created without a Conversation-ID gets a random UUID
+// (version 4), the form OMA CPM Appendix C.1.1 asks for; one the client
+// gives is kept, and a group stored with the 32 hex digits groups were
+// given before is read and used as it is.
+func TestAGroupsConversationIDIsAUUID(t *testing.T) {
+	r := newRig(t, Config{})
+	uuid4 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	seen := map[string]bool{}
+	for range 3 {
+		g, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !uuid4.MatchString(g.Conversation) || seen[g.Conversation] {
+			t.Fatalf("Conversation-ID %q", g.Conversation)
+		}
+		seen[g.Conversation] = true
+	}
+	given, err := r.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}, Conversation: "given-1"})
+	if err != nil || given.Conversation != "given-1" {
+		t.Fatalf("given %q, %v", given.Conversation, err)
+	}
+	old := r.create(bob)
+	old.Conversation = "0123456789abcdef0123456789abcdef"
+	if err := r.groups.Update(t.Context(), old, r.owner(t, old.URI), "old"); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := r.s.Get(t.Context(), old.URI); err != nil || g.Conversation != old.Conversation {
+		t.Fatalf("the old group %+v, %v", g, err)
+	}
+	if _, err := r.s.Recipients(t.Context(), old.URI, alice, messaging.GroupText); err != nil {
+		t.Fatalf("writing in the old group: %v", err)
+	}
+}
+
+// #305, lead's decision on #381: a group made under a Contribution-ID and
+// no Conversation-ID gets a name-based UUID (version 5) of the
+// Contribution-ID. rcsjta restarts an ended group under its
+// Contribution-ID from whichever participant writes next, which gives the
+// same conference URI; the restart keeps the Conversation-ID as well.
+// Another Contribution-ID gives another ID, and a version 5 ID never meets
+// a random (version 4) one.
+func TestAGroupsConversationIDFollowsItsContribution(t *testing.T) {
+	r := newRig(t, Config{})
+	uuid5 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	create := func(creator, contribution string) groupstore.Group {
+		t.Helper()
+		g, err := r.s.Create(t.Context(), CreateRequest{Creator: creator, Invitees: []Invitee{{Identity: carol}}, Contribution: contribution})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	first := create(alice, "chat-id-1")
+	if !uuid5.MatchString(first.Conversation) {
+		t.Fatalf("Conversation-ID %q", first.Conversation)
+	}
+	// Never established, it ends after DefaultPendingTTL. bob, a member,
+	// starts it again.
+	r.clock.Advance(DefaultPendingTTL + time.Second)
+	if _, err := r.s.Get(t.Context(), first.URI); !errors.Is(err, ErrNoGroup) {
+		t.Fatalf("the first group after DefaultPendingTTL: %v", err)
+	}
+	again := create(bob, "chat-id-1")
+	if again.URI != first.URI || again.Conversation != first.Conversation {
+		t.Fatalf("restarted as %s %q, was %s %q", again.URI, again.Conversation, first.URI, first.Conversation)
+	}
+	other := create(alice, "chat-id-2")
+	if other.Conversation == first.Conversation || !uuid5.MatchString(other.Conversation) {
+		t.Fatalf("another Contribution-ID gives Conversation-ID %q", other.Conversation)
+	}
+	if random := create(alice, ""); random.Conversation[14] != '4' || random.Conversation == first.Conversation {
+		t.Fatalf("a group without a Contribution-ID has Conversation-ID %q", random.Conversation)
+	}
+}
+
+// QA on #381: the derived Conversation-ID is pinned, so that no refactor
+// changes the ID a restarted group gets after an upgrade. The values are
+// Python's uuid.uuid5 in groupNamespace (e51ad937-2361-433b-a3e7-283a7ef641ae).
+func TestAGroupsDerivedConversationIDIsStable(t *testing.T) {
+	for contribution, want := range map[string]string{
+		"gch4t1":    "e0f8d3d1-d77c-598d-b120-23ea011606ab",
+		"chat-id-1": "282da727-4d14-5968-9cd3-74bc98622cc3",
+		// QA on #381: case is kept, so that folding it cannot slip in.
+		"GCH4T1": "c1f9b30e-4c55-50cc-ad87-1c903f91cfa0",
+	} {
+		if got := groupConversationID(contribution); got != want {
+			t.Errorf("groupConversationID(%q) = %s, want %s", contribution, got, want)
+		}
 	}
 }

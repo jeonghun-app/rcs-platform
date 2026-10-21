@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -106,6 +108,74 @@ func TestACancelWhileTheRouterRunsAnswers487AndForwardsNothing(t *testing.T) {
 	h.settle()
 	check(t, "upstream", labels(h.upstreamResponses()), []string{"200 CANCEL", "487 INVITE"})
 	check(t, "sent", h.sentMethods(), nil)
+}
+
+// #361: a CANCEL that comes while a branch's Prepare runs is answered 200
+// only once the request counts as cancelled, so that the branch, prepared
+// once the client has its 200, is never sent: the INVITE gets its 487 at
+// once, not after a downstream that may never send a provisional, which a
+// CANCEL waits for (§9.1), runs out Timer B (§16.10). Prepare returns from
+// the 200's send, the earliest the client can have it, and the 200 waits
+// for the branch to be sent or dropped. The 487 may come before the 200:
+// they are two transactions, which RFC 3261 does not order.
+func TestACancelDuringPrepareIsAnswered200OnlyOnceTheRequestIsCancelled(t *testing.T) {
+	h := newHarness(t, Config{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	h.route(func(_ contextT, r *Request) Decision {
+		d := Forward(r)
+		d.Prepare = func(contextT, Target, *sip.Request) error {
+			once.Do(func() { close(entered) })
+			<-release
+			return nil
+		}
+		return d
+	})
+	var cancelledFirst []bool
+	h.net.mu.Lock()
+	h.net.onResponse = func(res *sip.Response) {
+		if cseq, _ := res.Header.CSeq(); res.StatusCode != 200 || cseq.Method != "CANCEL" {
+			return
+		}
+		h.p.mu.Lock()
+		var ctxs []*respContext
+		for _, c := range h.p.contexts {
+			ctxs = append(ctxs, c)
+		}
+		h.p.mu.Unlock()
+		for _, c := range ctxs {
+			c.mu.Lock()
+			cancelledFirst = append(cancelledFirst, c.cancelled && c.closed)
+			c.mu.Unlock()
+		}
+		// Prepare returns, and the 200 waits until the branch has decided,
+		// sent or not: whatever the proxy does after the 200 cannot help it.
+		close(release)
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			sent := 0
+			h.net.mu.Lock()
+			sent = len(h.net.requests)
+			h.net.mu.Unlock()
+			ctxs[0].mu.Lock()
+			decided := ctxs[0].pending == 0
+			ctxs[0].mu.Unlock()
+			if sent > 0 || decided {
+				return
+			}
+		}
+		t.Error("the branch never decided")
+	}
+	h.net.mu.Unlock()
+	inv := invite(t)
+	h.p.Receive(inboundFrom(inv, "up"))
+	<-entered
+	h.p.Receive(inboundFrom(uacCancel(t, inv), "up"))
+	h.settle()
+	check(t, "cancelled before the 200", cancelledFirst, []bool{true})
+	check(t, "sent", h.sentMethods(), nil)
+	got := labels(h.upstreamResponses())
+	slices.Sort(got)
+	check(t, "upstream", got, []string{"200 CANCEL", "487 INVITE"})
 }
 
 // TestACancelWhileTheInviteIsBeingSentWaitsForItsProvisional holds the branch
@@ -277,4 +347,77 @@ func TestACancelFollowsItsInviteOntoTCP(t *testing.T) {
 	if got := cancels[0].req.Header.Get("Via"); got != sent[0].req.Header.Values("Via")[0] {
 		t.Errorf("CANCEL Via = %q, want the INVITE's %q", got, sent[0].req.Header.Values("Via")[0])
 	}
+}
+
+// A CANCEL ends the context Prepare and the Resolver run under, so a stalled
+// one does not hold the 487 back: it comes at once, with no timer advanced
+// and nothing sent downstream (#382).
+func TestACancelCutsAStalledPrepareOrResolverShort(t *testing.T) {
+	for _, stalled := range []string{"Prepare", "Resolver"} {
+		t.Run(stalled, func(t *testing.T) {
+			entered := make(chan struct{}, 1)
+			hold := func(ctx context.Context) error {
+				entered <- struct{}{}
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			cfg := Config{}
+			if stalled == "Resolver" {
+				cfg.Resolver = resolverFunc(func(ctx context.Context, u sip.URI) (transport.Destination, error) {
+					return transport.Destination{}, hold(ctx)
+				})
+			}
+			h := newHarness(t, cfg)
+			h.route(func(_ context.Context, r *Request) Decision {
+				d := Forward(r)
+				if stalled == "Prepare" {
+					d.Prepare = func(ctx context.Context, _ Target, _ *sip.Request) error { return hold(ctx) }
+				}
+				return d
+			})
+			inv := invite(t)
+			h.p.Receive(inboundFrom(inv, "up"))
+			<-entered
+			h.p.Receive(inboundFrom(uacCancel(t, inv), "up"))
+			h.settle()
+			check(t, "upstream", labels(h.upstreamResponses()), []string{"200 CANCEL", "487 INVITE"})
+			check(t, "sent", h.sentMethods(), nil)
+		})
+	}
+}
+
+// Drain's deadline ends it too: the drain's 500 goes, and the stalled
+// Prepare returns rather than run on after the stop (#382).
+func TestDrainsDeadlineEndsAStalledPrepare(t *testing.T) {
+	entered, returned := make(chan struct{}, 1), make(chan struct{})
+	h := newHarness(t, Config{})
+	h.route(func(_ context.Context, r *Request) Decision {
+		d := Forward(r)
+		d.Prepare = func(ctx context.Context, _ Target, _ *sip.Request) error {
+			entered <- struct{}{}
+			<-ctx.Done()
+			close(returned)
+			return ctx.Err()
+		}
+		return d
+	})
+	h.p.Receive(inboundFrom(request(t, "MESSAGE", "sip:bob@example.com"), "up"))
+	<-entered
+	<-drainFor(h, 50*time.Millisecond)
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stalled Prepare did not see the drain's deadline")
+	}
+	res := h.upstreamResponses()
+	if len(res) != 1 || res[0].StatusCode != 500 {
+		t.Fatalf("upstream got %v, want the drain's 500", res)
+	}
+	check(t, "sent", h.sentMethods(), nil)
+}
+
+type resolverFunc func(ctx context.Context, u sip.URI) (transport.Destination, error)
+
+func (f resolverFunc) Resolve(ctx context.Context, u sip.URI) (transport.Destination, error) {
+	return f(ctx, u)
 }

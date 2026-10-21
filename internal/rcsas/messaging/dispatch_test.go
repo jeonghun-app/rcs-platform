@@ -102,6 +102,111 @@ func TestARegistrationOnANewFlowInvitesAgainAtOnce(t *testing.T) {
 	}
 }
 
+// #384: an invitation's failure that a registration on a new flow
+// overtook, as one sipas reports after the registration came in, leaves no
+// mark: the registration already cleared the marks and has the queue read,
+// and the late failure must not hold it until InviteTimeout. Here the
+// pass that asked is still running when both come, so the queue is read
+// again right after it, and that read invites again.
+func TestARegistrationOvertakesALateInvitationFailure(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	asked, release := make(chan Invitation, 1), make(chan struct{})
+	var once sync.Once
+	r.d.onInvite(func(inv Invitation) error {
+		once.Do(func() { asked <- inv; <-release })
+		return nil
+	})
+	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+	if err := r.e.Submit(t.Context(), o); err != nil {
+		t.Fatal(err)
+	}
+	first := <-asked // the pass waits in Invite
+	r.e.UserRegistered(bob, true)
+	r.e.InviteFailed(first, ErrOffline) // the old flow's 480, come late
+	close(release)
+	r.d.nextInvite(t) // the first
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v", inv)
+	}
+	if n := r.m.get("invite.failed_overtaken"); n != 1 {
+		t.Fatalf("%d overtaken failures", n)
+	}
+}
+
+// QA on #402: a failure of the recipient's current flow is marked. An
+// ErrNoSessions for a session asked after the registration sends the
+// message by pager, as without any registration; so it does when the
+// recipient's registration number was forgotten (MaxTracked) while the
+// invitation was out, as it then counts as never registered.
+func TestAFailureOfTheCurrentFlowIsMarked(t *testing.T) {
+	for _, forgotten := range []bool{false, true} {
+		r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour, MaxTracked: 1})
+		r.e.UserRegistered(bob, true)
+		asked, release := make(chan Invitation, 1), make(chan struct{})
+		var once sync.Once
+		r.d.onInvite(func(inv Invitation) error {
+			once.Do(func() { asked <- inv; <-release })
+			return nil
+		})
+		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+		if err := r.e.Submit(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+		inv := <-asked
+		if forgotten {
+			r.e.UserRegistered(carol, true) // MaxTracked 1: bob's number goes
+		}
+		close(release)
+		r.d.nextInvite(t)
+		waitFor(t, "idle", r.idle)
+		r.e.InviteFailed(inv, ErrNoSessions) // bob's client answered passive
+		if d := r.d.nextPager(t); d.Recipient != bob || r.m.get("invite.failed_overtaken") != 0 {
+			t.Fatalf("forgotten %v: pager %+v, %d overtaken", forgotten, d, r.m.get("invite.failed_overtaken"))
+		}
+	}
+}
+
+// Lead's decision on #402: a registration on a new flow that overtakes a
+// group invitation's 404 or 604 (ErrUndeliverable) overrides it too, as
+// it shows the user exists now: the copies stay and bob is invited again.
+// A 482 (ErrLooped), which no registration changes, still gives them up.
+func TestAnOvertakenGroupFailureGivesUpOnlyALoop(t *testing.T) {
+	for _, tc := range []struct {
+		err     error
+		givenUp bool
+	}{{ErrUndeliverable, false}, {ErrLooped, true}} {
+		r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+		r.e.SetGroupHandler(members{all: []string{alice, bob}})
+		asked, release := make(chan Invitation, 1), make(chan struct{})
+		var once sync.Once
+		r.d.onInvite(func(inv Invitation) error {
+			once.Do(func() { asked <- inv; <-release })
+			return nil
+		})
+		if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+			t.Fatal(err)
+		}
+		first := <-asked
+		r.e.UserRegistered(bob, true)
+		r.e.InviteFailed(first, tc.err)
+		close(release)
+		r.d.nextInvite(t) // the first
+		if tc.givenUp {
+			waitFor(t, "the copy given up", func() bool { return r.m.get("delivery.undeliverable") == 1 && r.idle() })
+			if n := r.store.(*store.Memory).Len(bob); n != 0 {
+				t.Fatalf("%v: %d copies kept", tc.err, n)
+			}
+			continue
+		}
+		if inv := r.d.nextInvite(t); inv.Recipient != bob || r.m.get("invite.failed_overtaken") != 1 {
+			t.Fatalf("%v: invitation %+v, %d overtaken", tc.err, inv, r.m.get("invite.failed_overtaken"))
+		}
+		if n := r.store.(*store.Memory).Len(bob); n != 1 || r.m.get("delivery.undeliverable") != 0 {
+			t.Fatalf("%v: %d copies, %d given up", tc.err, n, r.m.get("delivery.undeliverable"))
+		}
+	}
+}
+
 // cancelStore fails what records an outcome on a cancelled context, as
 // the SDK does.
 type cancelStore struct{ store.Store }

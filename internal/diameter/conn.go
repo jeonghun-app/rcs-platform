@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -98,6 +99,10 @@ type conn struct {
 	controlMu    sync.Mutex
 	control      [][]byte
 	controlBytes int
+
+	// wroteLast, the writer's alone, is set once it has taken a DPR or DPA
+	// from the main queue.
+	wroteLast bool
 }
 
 func newConn(n *Node, nc net.Conn) *conn {
@@ -457,11 +462,21 @@ func (c *conn) popControl() ([]byte, bool) {
 }
 
 // queued is a message in the main queue. last marks the DPR and the DPA,
-// which end what the peer is sent.
+// which end what the peer is sent; hbh is a request's Hop-by-Hop
+// Identifier, so that the writer can end one it drops.
 type queued struct {
 	b    []byte
 	last bool
+	hbh  uint32
 }
+
+// errDroppedAtDisconnect ends a request the writer dropped behind a DPR or
+// DPA. It is ErrPeerUnavailable, as for a request refused before the send,
+// since none of it reached the peer: a caller may retry it elsewhere at once
+// (cxclient.NeverSent). It already has its End-to-End Identifier, so a retry
+// keeps it and carries the T flag, which is harmless for a request the first
+// peer never saw.
+var errDroppedAtDisconnect = fmt.Errorf("%w: the connection was disconnecting", ErrPeerUnavailable)
 
 // maxAnswersInARow bounds how many handlers' answers the writer sends before
 // it serves the main queue again, so that a peer keeping requests
@@ -471,10 +486,20 @@ type queued struct {
 // with a smaller MaxInFlight uses that bound instead.
 const maxAnswersInARow = 16
 
-// testHookTookLast, when set by a test, runs once the writer has taken a
-// DPR or DPA from the main queue, before it writes the answers queued
-// ahead of it.
-var testHookTookLast func(*conn)
+// Test hooks. They are atomic, and get the connection, because a writer or
+// sender of an earlier test's node may still run while the next test sets
+// them (QA of #367).
+var (
+	// testHookTookLast runs once the writer has taken a DPR or DPA from the
+	// main queue, before it writes the answers queued ahead of it.
+	testHookTookLast atomic.Pointer[func(*conn)]
+	// testHookDropped runs when the writer drops a request that reached the
+	// main queue behind a DPR or DPA.
+	testHookDropped atomic.Pointer[func(*conn)]
+	// testHookQueuing runs in a request's sender after its closing check,
+	// before it waits for room in the main queue.
+	testHookQueuing atomic.Pointer[func(*conn, *Message)]
+)
 
 // writeLoop writes the control queue first, then handlers' answers, then
 // the main queue, but serves the main queue after at most
@@ -484,6 +509,13 @@ func (c *conn) writeLoop() {
 	inARow := 0 // answers written since the main queue was last served
 	for {
 		if b, ok := c.popControl(); ok {
+			// The control queue's one request is the watchdog's DWR, which
+			// the Closing state does not send either (#376): one queued
+			// before the DPR or DPA went out is dropped. Its answer was not
+			// awaited.
+			if c.wroteLast && len(b) > 4 && CommandFlags(b[4])&FlagRequest != 0 {
+				continue
+			}
 			if !c.write(b) {
 				return
 			}
@@ -532,10 +564,26 @@ func (c *conn) writeLoop() {
 // one at random, and an answer queued before a DPR or DPA must reach the
 // peer before it (drain). Those are all in the queue by now, so only that
 // many are written first, however many more arrive.
+//
+// Nothing but another DPR or DPA from the main queue follows one: a
+// connection in the Closing state sends no messages (RFC 6733 §5.6), and the
+// DPA is the last the peer gets (§5.4). A DPR or DPA still goes, for a DPR
+// that crossed ours. A sender that found the connection open can still be
+// waiting for room in the queue when the DPR or DPA goes in, and get its
+// request in behind it (#324); that request is dropped and ends at once with
+// errDroppedAtDisconnect.
 func (c *conn) writeQueued(q queued) bool {
+	if c.wroteLast && !q.last {
+		c.complete(q.hbh, 0, result{err: errDroppedAtDisconnect})
+		if h := testHookDropped.Load(); h != nil {
+			(*h)(c)
+		}
+		return true
+	}
 	if q.last {
-		if testHookTookLast != nil {
-			testHookTookLast(c)
+		c.wroteLast = true
+		if h := testHookTookLast.Load(); h != nil {
+			(*h)(c)
 		}
 		for range len(c.answers) {
 			if !c.write(<-c.answers) {
@@ -643,12 +691,15 @@ func (c *conn) roundTrip(ctx context.Context, req *Message, internal bool) (*Mes
 	p.timer = n.cfg.Clock.AfterFunc(n.cfg.RequestTimeout, func() { c.complete(hbh, 0, result{err: ErrTimeout}) })
 	c.mu.Unlock()
 
+	if h := testHookQueuing.Load(); h != nil {
+		(*h)(c, req)
+	}
 	// Waiting for room in the queue ends with the request: its timer or the
 	// connection closing completes it, and so does the caller's context.
 	b, err := req.Encode()
 	if err == nil {
 		select {
-		case c.writes <- queued{b: b, last: req.Code == CodeDisconnectPeer}:
+		case c.writes <- queued{b: b, last: req.Code == CodeDisconnectPeer, hbh: hbh}:
 		case r := <-p.ch:
 			return r.m, r.err
 		case <-ctx.Done():
@@ -977,6 +1028,15 @@ func (c *conn) watchdogExpired() {
 	now := c.node.cfg.Clock.Now()
 	if now.Before(c.wdDeadline) {
 		c.wdTimer = c.node.cfg.Clock.AfterFunc(c.wdDeadline.Sub(now), c.fireWatchdog)
+		c.mu.Unlock()
+		return
+	}
+	if c.closing {
+		// Disconnecting, from the start of the disconnect (the drain before
+		// our DPR, or the peer's DPR) on: no DWR goes, so none can follow the
+		// DPR or DPA (RFC 6733 §5.6, Closing; #376), and the DPR's timeout or
+		// the peer closing ends the connection, not the watchdog.
+		c.armWatchdogLocked(now)
 		c.mu.Unlock()
 		return
 	}
