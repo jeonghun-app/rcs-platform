@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"errors"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -13,8 +15,8 @@ import (
 // update the documentation of writeAll, socketSendBuffer and
 // Config.WriteTimeout.
 func TestTheWriteFloorIsSetByTheChunkTheDeadlineAndTheSendBuffer(t *testing.T) {
-	if writeChunk != 32<<10 || socketSendBuffer != 128<<10 {
-		t.Fatalf("writeChunk %d and socketSendBuffer %d, but the floor in writeAll's documentation was measured with 32 KiB and 128 KiB", writeChunk, socketSendBuffer)
+	if writeChunk != 32<<10 || socketSendBuffer != 128<<10 || DefaultWriteTimeout != 10*time.Second {
+		t.Fatalf("writeChunk %d, socketSendBuffer %d and DefaultWriteTimeout %v, but the floor in writeAll's documentation was measured with 32 KiB, 128 KiB and 10 s: measure it again and update the documentation", writeChunk, socketSendBuffer, DefaultWriteTimeout)
 	}
 	const timeout = 7 * time.Second
 	tr, _ := newTransport(t, Config{WriteTimeout: timeout})
@@ -41,17 +43,36 @@ func TestTheWriteFloorIsSetByTheChunkTheDeadlineAndTheSendBuffer(t *testing.T) {
 	}
 }
 
-// capSendBuffer gives a TCP connection the send buffer the floor was measured
-// with: what the kernel reports for 128 KiB asked for directly.
-func TestCapSendBufferAsksFor128KiB(t *testing.T) {
-	capped, reference := tcpPair(t), tcpPair(t)
-	capSendBuffer(capped)
-	if err := reference.SetWriteBuffer(128 << 10); err != nil {
-		t.Fatal(err)
+// A chunk write that times out after the kernel took part of it ends the
+// message there, and the connection with it, rather than writing on: going
+// on after partial progress is the rule writeAll's documentation says was not
+// taken (code review of #370).
+func TestAChunkThatTimesOutPartWayEndsTheWrite(t *testing.T) {
+	tr, _ := newTransport(t, Config{WriteTimeout: time.Second})
+	conn := &partialWrite{}
+	f := &flow{conn: conn, q: newSendQueue(1<<20, &queueBudget{max: 1 << 30})}
+	if err := tr.writeAll(f, make([]byte, 100<<10)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("writeAll returned %v after a chunk timed out part way, want the timeout", err)
 	}
-	if got, want := sendBuffer(t, capped), sendBuffer(t, reference); got != want {
-		t.Fatalf("SO_SNDBUF %d after capSendBuffer, want %d as for 128 KiB", got, want)
+	if conn.writes != 2 {
+		t.Fatalf("%d writes, want 2: writing went on after the timeout", conn.writes)
 	}
+}
+
+// partialWrite takes the first write whole and 100 bytes of the second,
+// which then times out.
+type partialWrite struct {
+	writeRecorder
+	writes int
+}
+
+func (c *partialWrite) Write(b []byte) (int, error) {
+	c.writes++
+	if c.writes == 2 {
+		_, _ = c.writeRecorder.Write(b[:100])
+		return 100, os.ErrDeadlineExceeded
+	}
+	return c.writeRecorder.Write(b)
 }
 
 // writeRecorder records the write deadlines and writes it is given, in

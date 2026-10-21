@@ -241,7 +241,8 @@ func capSendBuffer(c net.Conn) {
 // about 200 KiB within WriteTimeout to keep its connection. Measured on loopback
 // with the default 10 s (#329), a peer reading 16 KiB every 500 ms (32 KiB/s)
 // kept it, one every 700 ms (23 KiB/s) was at the edge, and one every second
-// (16 KiB/s) was cut after 19 s. A peer that stops reading is cut after
+// (16 KiB/s) was cut within about 15 to 30 s, depending on how full the
+// buffers were when it fell behind. A peer that stops reading is cut after
 // WriteTimeout.
 //
 // The floor is meant for SIP, the only thing this transport carries (MSRP media
