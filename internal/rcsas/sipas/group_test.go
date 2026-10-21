@@ -762,3 +762,36 @@ func TestAGroupWhoseCreatorNeverACKsInvitesNobody(t *testing.T) {
 		t.Fatalf("%d unacknowledged", n)
 	}
 }
+
+// #121 D1: a group another task owns, and that task alive, is not this
+// task's to change: bob's join is answered 500 with Retry-After, never
+// 404, which rcsjta takes for the group's end and restarts it at the
+// factory. The group stays as it was.
+func TestAJoinToAGroupAnotherTaskOwnsIsToBeTriedAgain(t *testing.T) {
+	r := newChatRig(t, messaging.Config{})
+	r.core.setAnswer(func(*sip.Request) int { return 486 })
+	p := r.a.dial(t)
+	uri, _ := r.create(t, p, relayPath(), bob)
+	r.core.nextOf(t, "INVITE")
+	mine, err := r.groupStore.Owner(t.Context(), uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := groupstore.Owner{Task: "another-task", SIP: "10.0.1.9:5060"}
+	if _, err := r.groupStore.TakeOver(t.Context(), uri, mine, other, r.clock.Now().Add(time.Hour), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.groupStore.Beat(t.Context(), groupstore.Task{ID: other.Task, AliveUntil: r.clock.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.groups.Get(t.Context(), uri)
+	m := r.groupInvite(uri, sdpType, offerSDP(relayPath(), "active"))
+	m.from, m.fields[0] = "<"+bob+">;tag=b1", "P-Asserted-Identity: <"+bob+">"
+	res := p.send(m)
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	if after, _ := r.groups.Get(t.Context(), uri); after.Rev != before.Rev {
+		t.Fatalf("the group changed: rev %d, was %d", after.Rev, before.Rev)
+	}
+}

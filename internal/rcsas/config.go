@@ -153,6 +153,13 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("SIP_LISTEN_ADDR", "needs a port")
 	}
 	c.SIPHost = runtime.InstanceAddr(e, "SIP_HOST", interfaceAddrs)
+	// A group's owner is told by its address too: a task that finds its
+	// own address on a group takes it at once, as the owner's must be
+	// gone (#121). Two tasks given one address would take each other's
+	// groups for good, so with group chat each task's is its own,
+	// discovered (security review on #431).
+	s.ForbidInProduction(c.GroupChat && e.String("SIP_HOST", "") != "",
+		"RCSAS_SIP_HOST with RCSAS_GROUP_CHAT_ENABLED: every task must find its own address, which owns its groups")
 	c.HomeDomain = s.Shared.RequiredString("IMS_DOMAIN")
 	c.Namespace = s.ServiceNamespace()
 	c.Core = coreURI(s)
@@ -243,6 +250,10 @@ func Configure(s *runtime.Settings) Config {
 			messaging.Rate{PerMinute: group.DefaultFanoutRate.PerMinute, Burst: group.DefaultFanoutBurst(maxParticipants)}),
 		AddRate:    readRate(e, "GROUP_ADD", addRate),
 		CreateRate: readRate(e, "GROUP_CREATE", group.DefaultCreateRate),
+		// #121: how a task holds the groups it owns.
+		TaskHeartbeat: e.Duration("TASK_HEARTBEAT", group.DefaultTaskHeartbeat),
+		TaskLease:     e.Duration("TASK_LEASE", group.DefaultTaskLease),
+		TaskSkew:      e.Duration("TASK_SKEW", group.DefaultTaskSkew),
 	}
 	c.Group.HomeDomain = c.HomeDomain
 	// One spelling, which the group writes its conference URIs with and
@@ -264,6 +275,11 @@ func Configure(s *runtime.Settings) Config {
 	}
 	if c.Group.IdleTTL <= 0 {
 		e.Invalid("GROUP_IDLE_TTL", "must be positive")
+	}
+	if g := c.Group; g.TaskHeartbeat <= 0 || g.TaskSkew <= 0 || g.TaskLease <= g.TaskHeartbeat+g.TaskSkew {
+		// A task must beat again before its lease, less the skew it stops
+		// writing at, runs out.
+		e.Invalid("TASK_LEASE", "not more than RCSAS_TASK_HEARTBEAT and RCSAS_TASK_SKEW together, or one of them not positive")
 	}
 	if r := c.Group.FanoutRate; r.PerMinute > 0 && r.Burst/group.FanoutSenderShare < group.FanoutSenderMessages*(c.Group.MaxParticipants-1) {
 		// One sender may use a quarter of the budget, which must still
