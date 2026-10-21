@@ -840,6 +840,7 @@ func TestADeclinedLineGoesWithoutItsPathAndReleasesItsBinding(t *testing.T) {
 // left no line the relay serves.
 func TestAClientAnswerWithNoLineTheRelayServesEndsTheSession(t *testing.T) {
 	a := newAnchoring(t, 16, 100)
+	out := a.recordMetrics()
 	c := a.coreInvite(t, rcsAsOffer)
 	ans := strings.Replace(strings.Replace(clientAnswer, "m=message 9 ", "m=message 0 ", 1),
 		"m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
@@ -851,8 +852,9 @@ func TestAClientAnswerWithNoLineTheRelayServesEndsTheSession(t *testing.T) {
 	a.p.Route(context.Background(), fromCoreInCall(t, a, c, "ACK", "b1", 1, ""))
 	a.settle()
 	checkEndOfCoreSession(t, a, reasonDeclined)
-	if a.p.msrp.limit.held() != 0 {
-		t.Errorf("held %d", a.p.msrp.limit.held())
+	a.p.metrics.Flush()
+	if a.p.msrp.limit.held() != 0 || !strings.Contains(out.String(), `"`+metricEndedDeclined+`":1`) {
+		t.Errorf("held %d, metrics %s", a.p.msrp.limit.held(), out.String())
 	}
 }
 
@@ -898,5 +900,73 @@ func TestAnOfferThatLosesTheRaceIs491(t *testing.T) {
 	a.settle()
 	if res.StatusCode != 491 || a.relay.count(http.MethodPost) != 2 || a.relay.count(http.MethodDelete) != 1 || a.p.msrp.limit.held() != 1 {
 		t.Errorf("%d, held %d, calls %q", res.StatusCode, a.p.msrp.limit.held(), a.relay.log())
+	}
+}
+
+// #315 QA F1 and F2, for the ACKs of two forks that both got an offer in
+// a 2xx: one fork's ACK, with no answer or with the answer the other fork
+// got, neither gives up nor takes the other fork's exchange.
+func TestAnotherForksACKLeavesTheExchangeAlone(t *testing.T) {
+	t.Run("without an answer", func(t *testing.T) {
+		a := newAnchoring(t, 16, 100)
+		c := a.invite(t, "chat-1", "", "")
+		ok1 := c.respond(answered(t, c.req, 200, "b1", rcsAsOffer))
+		ok2 := c.respond(answered(t, c.req, 200, "b2", rcsAsOffer))
+		a.p.Route(context.Background(), ackFor(t, c, ok2))
+		a.settle()
+		a.sent.take(a.p) // b2's two BYEs
+		ack1 := ackFor(t, c, ok1)
+		_ = ack1.Message.Header.Set("Content-Type", "application/sdp")
+		ack1.Message.Body = []byte(clientAnswer)
+		d := a.p.Route(context.Background(), ack1)
+		if len(d.Targets) != 1 {
+			t.Fatalf("b1's ACK: %+v", d)
+		}
+		fwd := ack1.Message.Clone()
+		if err := d.Prepare(context.Background(), d.Targets[0], fwd); err != nil {
+			t.Fatal(err)
+		}
+		mediaOf(t, fwd.Body, "a=path:"+corePathFor(1))
+		a.settle()
+		if a.p.msrp.limit.held() != 1 || len(a.sent.take(a.p)) != 0 {
+			t.Errorf("held %d, calls %q", a.p.msrp.limit.held(), a.relay.log())
+		}
+	})
+	t.Run("with the other fork's answer", func(t *testing.T) {
+		a := newAnchoring(t, 16, 100)
+		c := a.invite(t, "chat-1", "", "")
+		ok1 := c.respond(answered(t, c.req, 200, "b1", rcsAsOffer))
+		ok2 := c.respond(answered(t, c.req, 200, "b2", rcsAsOffer))
+		for i, ok := range []*sip.Response{ok1, ok2} {
+			ack := ackFor(t, c, ok)
+			_ = ack.Message.Header.Set("Content-Type", "application/sdp")
+			ack.Message.Body = []byte(clientAnswer)
+			d := a.p.Route(context.Background(), ack)
+			if i == 0 {
+				if len(d.Targets) != 1 || d.Prepare(context.Background(), d.Targets[0], ack.Message.Clone()) != nil {
+					t.Fatalf("b1's ACK: %+v", d)
+				}
+				continue
+			}
+			if len(d.Targets) != 0 {
+				fwd := ack.Message.Clone()
+				_ = d.Prepare(context.Background(), d.Targets[0], fwd)
+				t.Errorf("b2's ACK went on with b1's answer:\n%s", fwd.Body)
+			}
+		}
+	})
+}
+
+// An offer of rcs-as's inside a dialog is held to rcs-as's share: with
+// the client's own at one binding and rcs-as's at two, rcs-as's refresh
+// with two MSRP lines is anchored.
+func TestAnOfferInADialogIsHeldToItsOfferersShare(t *testing.T) {
+	a := newAnchoring(t, 1, 100)
+	a.p.msrp.limit.coreOfferShare(2, 32)
+	c := confirmedChat(t, a)
+	second := strings.Replace(rcsAsOffer, "m=audio 0 RTP/AVP 0\r\n", "m=message 2856 TCP/MSRP *\r\na=path:msrp://10.0.1.20:2856/ft2;tcp\r\na=setup:actpass\r\n", 1)
+	re := fromCoreInCall(t, a, c, "INVITE", "b1", 2, second)
+	if d := a.p.Route(context.Background(), re); len(d.Targets) != 1 {
+		t.Fatalf("rcs-as's refresh with two lines: %+v", d)
 	}
 }
