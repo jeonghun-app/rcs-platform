@@ -724,6 +724,14 @@ type Challenges interface {
 	// instance counts into the same count, which is kept until expires. A
 	// resent request may count twice: that errs on the side of the limit.
 	CountAttempt(ctx context.Context, a Attempt, n int64, expires time.Time) (int64, error)
+	// ClaimODI records side, ODIReturned or ODIDefault, as the one that
+	// goes on with the request whose signed iFC position has scope
+	// (ODIScope), unless a side is recorded already and has not expired at
+	// now, and returns the side recorded, which is kept until expires.
+	// Every instance claims into the same record, and of concurrent claims
+	// one side is recorded. A resent request finds its own side, so a claim
+	// the store applied but whose answer was lost still goes on.
+	ClaimODI(ctx context.Context, scope, side string, now, expires time.Time) (string, error)
 }
 
 // ReservedNoncePrefix starts no challenge's nonce: the backends keep their
@@ -732,14 +740,19 @@ type Challenges interface {
 const ReservedNoncePrefix = "#"
 
 // The kinds of CountAttempt: the challenges the S-CSCF issues, and the
-// resynchronisations among them; and the taking up of a request's place in
-// its iFC chain, by its return from an application server or by its
-// default handling, which only the first may do (routing, #14), counted
-// under the served user's IMPI and ODIScope.
+// resynchronisations among them.
 const (
 	AttemptChallenge = "challenge"
 	AttemptResync    = "resync"
-	AttemptODI       = "odi"
+)
+
+// The sides of ClaimODI: a request's place in its iFC chain is taken up by
+// its return from the application server, as many times as the server sends
+// it back (TS 24.229 §5.4.3.2 NOTE 8), or by its default handling, which
+// passes the server over; never by both (routing, #14).
+const (
+	ODIReturned = "returned"
+	ODIDefault  = "default"
 )
 
 // Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
@@ -758,8 +771,9 @@ func FlowScope(token string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-// ODIScope is the Attempt scope of a signed iFC position: a digest, as
-// FlowScope's is.
+// ODIScope is the ClaimODI scope of a signed iFC position: a digest, as
+// FlowScope's is, so that the claim needs no IMPI, which a request that
+// comes back after its user deregistered has none of.
 func ODIScope(odi string) string {
 	sum := sha256.Sum256([]byte("scscf/attempt-odi|" + odi))
 	return hex.EncodeToString(sum[:16])
@@ -770,7 +784,7 @@ func ValidAttempt(a Attempt, n int64, expires time.Time) error {
 	if err := identity.ValidIMPI(a.IMPI); err != nil {
 		return fmt.Errorf("%w: attempt IMPI: %w", ErrInvalid, err)
 	}
-	if a.Kind != AttemptChallenge && a.Kind != AttemptResync && a.Kind != AttemptODI {
+	if a.Kind != AttemptChallenge && a.Kind != AttemptResync {
 		return fmt.Errorf("%w: unknown kind of attempt", ErrInvalid)
 	}
 	if a.Scope != "" && !validScope(a.Scope) {
@@ -781,6 +795,19 @@ func ValidAttempt(a Attempt, n int64, expires time.Time) error {
 	}
 	if !validTime(a.Window) || !expires.After(a.Window) {
 		return fmt.Errorf("%w: an attempt window needs a start and a later expiry", ErrInvalid)
+	}
+	return nil
+}
+
+// ValidODIClaim checks ClaimODI's arguments; the backends apply it.
+func ValidODIClaim(scope, side string, now, expires time.Time) error {
+	switch {
+	case !validScope(scope):
+		return fmt.Errorf("%w: an iFC position's scope is an ODIScope", ErrInvalid)
+	case side != ODIReturned && side != ODIDefault:
+		return fmt.Errorf("%w: unknown side of an iFC position", ErrInvalid)
+	case !validTime(now) || !expires.After(now):
+		return fmt.Errorf("%w: an iFC position's claim needs a time and a later expiry", ErrInvalid)
 	}
 	return nil
 }

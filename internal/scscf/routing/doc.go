@@ -30,8 +30,9 @@
 // apply: SESSION_CONTINUED passes it over, SESSION_TERMINATED sends its
 // answer upstream, a 500 with Retry-After included. Whether it sent the
 // request back is settled in the store, as the request may come back to
-// another instance (state.AttemptODI): the first of the two to go on with
-// the position does, and the other is refused. Any other answer of a
+// another instance (state.Challenges.ClaimODI): the first of the two to go
+// on with the position does, and the other is refused, while every copy the
+// server sends back goes on once one has (TS 24.229 §5.4.3.2 NOTE 8). Any other answer of a
 // server's goes upstream unchanged. The position is bound to the Call-ID,
 // so a B2BUA application server that sends the request on in a dialog of
 // its own is not supported (ADR 0005). Nor is a proxy server that records

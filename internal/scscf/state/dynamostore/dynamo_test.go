@@ -81,6 +81,23 @@ func TestAResentWriteIsRecognisedByItsToken(t *testing.T) {
 	}
 }
 
+// TestAResentClaimOfAnIFCPositionGoesOn: the put the SDK resends finds the
+// item its first attempt wrote, and reads its own side back, so that the
+// only copy of a request is not taken for a second (#359 QA).
+func TestAResentClaimOfAnIFCPositionGoesOn(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	scope := state.ODIScope("odi")
+	f.resendNext = true
+	side, err := d.ClaimODI(bg(), scope, state.ODIDefault, statetest.T0, statetest.T0.Add(time.Minute))
+	if err != nil || side != state.ODIDefault {
+		t.Fatalf("resent claim = %q, %v; want its own side", side, err)
+	}
+	if side, _ := d.ClaimODI(bg(), scope, state.ODIReturned, statetest.T0, statetest.T0.Add(time.Minute)); side != state.ODIDefault {
+		t.Errorf("the other side then found %q", side)
+	}
+}
+
 func TestAWriteWithoutRandomnessFailsSafeAsAConflict(t *testing.T) {
 	f := newFake(t)
 	d := newTestStore(t, f)

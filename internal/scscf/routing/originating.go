@@ -112,19 +112,21 @@ func (rt *Router) resume(ctx context.Context, r *proxy.Request, v string) step {
 		return answer(404, "Not Found")
 	case errors.Is(err, errEnding):
 		// The user deregistered meanwhile, and set is nil: the chain ends
-		// as it would without services.
+		// as it would without services, once its place is claimed, as the
+		// default handling may go on from the set it had.
 	case err != nil:
 		rt.internalLog("looking up the served user", err)
 		return rt.unavailable(r.Message)
 	}
-	switch taken, err := rt.takeUp(ctx, set, v, pos.expires); {
+	switch taken, err := rt.takeUp(ctx, v, state.ODIReturned, pos.expires); {
 	case err != nil:
 		// Going on is the safe side here: the default handling, failing
 		// on the same store, does not go on (toAS).
 		rt.internalLog("taking up a position in an iFC chain", err)
 	case !taken:
 		// Its default handling went on without the server already, on
-		// this instance or another: this copy would be a second.
+		// this instance or another: this copy would be a second. A copy
+		// the server sent back before goes on, and so does this one then.
 		rt.count("routing.odi.late")
 		return answer(403, "Forbidden")
 	}

@@ -244,7 +244,7 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 				rt.count("routing.ifc.answered_provisionally")
 				return step{}
 			}
-			switch taken, err := rt.takeUp(ctx, set, odi, expires); {
+			switch taken, err := rt.takeUp(ctx, odi, state.ODIDefault, expires); {
 			case err != nil:
 				// Two copies of the request are worse than the server's
 				// failure passed upstream.
@@ -270,18 +270,15 @@ func unanswered(f proxy.BranchFailure) bool {
 }
 
 // takeUp claims the request's place in its chain signed as odi, valid
-// until expires, for whoever goes on with it first: the server's return
-// with it (resume), or its default handling on the branch's failure, on
-// any instance (state.AttemptODI). It is false once the other has.
-func (rt *Router) takeUp(ctx context.Context, set *state.Registration, odi string, expires time.Time) (bool, error) {
-	if set == nil {
-		// A user deregistered meanwhile: no IMPI keys the claim, and the
-		// chain ends in any case.
-		return true, nil
-	}
-	a := state.Attempt{IMPI: set.Key.IMPI, Kind: state.AttemptODI, Scope: state.ODIScope(odi), Window: expires.Add(-time.Second)}
-	n, err := rt.cfg.Store.CountAttempt(ctx, a, 1, expires.Add(rt.cfg.ODILifetime))
-	return n == 1, err
+// until expires, for side: the server's return with it (resume,
+// state.ODIReturned), or its default handling on the branch's failure
+// (state.ODIDefault), on any instance (state.Challenges.ClaimODI). It is
+// false once the other side has. The server may send the request back more
+// than once, as when it forks it or sends it to another target after a
+// busy callee, and each copy goes on (TS 24.229 §5.4.3.2 NOTE 8).
+func (rt *Router) takeUp(ctx context.Context, odi, side string, expires time.Time) (bool, error) {
+	recorded, err := rt.cfg.Store.ClaimODI(ctx, state.ODIScope(odi), side, rt.cfg.Now(), expires.Add(rt.cfg.ODILifetime))
+	return recorded == side, err
 }
 
 // servedUser is the P-Served-User toward an application server: the served

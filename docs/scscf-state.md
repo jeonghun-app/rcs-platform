@@ -11,7 +11,7 @@ them.
 | Table | Key | Indexes | Holds |
 |---|---|---|---|
 | `registrations` | `pk` (S): `set#<IMPI>#<default IMPU>`, a canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only, of sets only; TTL on `ttl` | per implicit registration set its bindings (or an unregistered user's record) and its User-Data, and per IMPU the set it belongs to |
-| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations |
+| `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>`; or `pk` `#odi#<scope>`, `sk` `#odi` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations; which side took up an iFC position, its return from the application server or its default handling (routing, ADR 0005) |
 | `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions: the watched IMPU, the set and incarnation it watches, the subscriber and its kind, a UE's binding, the dialog; and their NOTIFY counters (`cseq`, `rver`) and the record version the last NOTIFY carried (`nof`) |
 
 Data at rest: registration items hold Contact URIs (device addresses),
