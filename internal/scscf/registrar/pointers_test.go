@@ -19,14 +19,16 @@ func TestAnAheadPointerDoesNotTakeASavedRecordsIdentity(t *testing.T) {
 	b := device(a, 2)
 	st := &v3Steps{at: -1}
 	// A's writes: SaveProfile, SaveIdentity(impu1), SaveIdentity(tel1),
-	// SaveRegistration; the fourth fails.
+	// SaveRegistration, the fourth failing; one that leaves tel1's item to
+	// B's record makes three, and its save fails with ErrExists.
 	fs := &faultStore{Store: &countingStore{Store: e.store, steps: st}, at: 3, kind: "error"}
 	g := e.instance(3, func(c *Config) { c.Store = fs })
 	auth := a.answer(e.instance(4).Register(bg, a.request(600, ""), upstream), 0)
 	st.mu.Lock()
-	// Store steps: Identity TakeChallenge Registration SaveProfile Identity
+	// Store steps: Identity TakeChallenge Registration SaveProfile
+	// Identity (impu1's item, read before it is pointed ahead) Identity
 	// SaveIdentity | Identity(tel1) ...: B runs before A reads tel1's item.
-	st.n, st.at = 0, 6
+	st.n, st.at = 0, 7
 	st.hook = func() { wantStatus(t, b.registerWith(e.instance(5), 600), 200) }
 	st.mu.Unlock()
 	defer func() {

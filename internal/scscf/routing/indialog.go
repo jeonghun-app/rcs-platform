@@ -40,9 +40,7 @@ func (rt *Router) InDialog(_ context.Context, r *proxy.Request) proxy.Decision {
 // application server; or a P-CSCF's core listener, with a well-formed flow
 // token as its user, as pcscf writes its Path and Record-Route values.
 func (rt *Router) nextHopAllowed(u sip.URI) bool {
-	if !u.IsSIP() {
-		return false
-	}
+	// A URI without a host, such as a tel URI, names no hop below.
 	for _, s := range rt.cfg.Self {
 		if proxy.SameHost(s.Host, u.Host) {
 			return false

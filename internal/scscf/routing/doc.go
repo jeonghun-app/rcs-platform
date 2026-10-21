@@ -10,8 +10,8 @@
 // identity in SIP or tel form, which the router looks up in the state every
 // scscf instance shares (internal/scscf/state): the identity's item, then
 // the record of its implicit registration set. The record counts if it
-// lists the identity, is not being deregistered and has a live binding,
-// even if the item names another of its incarnations: the item is then
+// lists the identity and has a live binding, which one being deregistered
+// never has, even if the item names another of its incarnations: the item is then
 // repaired in the background, and the request is not lost to a pointer an
 // interrupted REGISTER left behind (#196). The request is forked to every
 // live binding of the set, along the binding's Path, keeping only the

@@ -73,8 +73,8 @@ func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decis
 var errBarred = errors.New("routing: the identity is barred")
 
 // lookup is the record of impu's set if the user is registered: the record
-// impu's item names lists impu, holds no deregistration's lease and has a
-// live binding. An item naming another incarnation of the record, which an
+// impu's item names lists impu and has a live binding, which a record that
+// a deregistration holds (Deregistering) never has. An item naming another incarnation of the record, which an
 // interrupted REGISTER can leave (#196), still finds it, and is repaired in
 // the background. It is nil without such a record, and errBarred for a
 // barred identity.
@@ -94,7 +94,7 @@ func (rt *Router) lookup(ctx context.Context, impu string, now time.Time) (*stat
 		return nil, err
 	}
 	i := slices.IndexFunc(set.Identities, func(s state.SetIdentity) bool { return s.IMPU == impu })
-	if i < 0 || !set.Deregistering.IsZero() || len(live(set, now)) == 0 {
+	if i < 0 || len(live(set, now)) == 0 {
 		return nil, nil
 	}
 	if set.Identities[i].Barred {

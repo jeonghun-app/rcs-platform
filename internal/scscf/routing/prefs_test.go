@@ -27,6 +27,8 @@ func TestCallerPreferenceRules(t *testing.T) {
 		"require explicit": {"Accept-Contact: *;" + chat + ";require;explicit", []int{0}},
 		"require, not stated matches implicitly (§7.2.4)": {"Accept-Contact: *;" + chat + ";require", []int{0, 1, 2}},
 		"without require, all":                            {"Accept-Contact: *;" + chat, []int{0, 1, 2}},
+		"without require, even a contradicting one":       {`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aother"`, []int{0, 1, 2}},
+		"a flag that must be false":                       {"Accept-Contact: *;+g.oma.sip-im=FALSE;require;explicit", nil},
 		"one of a list":                                   {`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.geopush";require;explicit`, []int{1}},
 		"any of a list":                                   {`Accept-Contact: *;+g.3gpp.iari-ref="urn%3Ax,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require;explicit`, []int{1}},
 		"negated":                                         {`Accept-Contact: *;+g.3gpp.iari-ref="!urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp";require`, []int{0, 2}},

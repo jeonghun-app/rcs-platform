@@ -142,6 +142,26 @@ func TestAnIdentityNamingAnotherIncarnationStillReachesItsUser(t *testing.T) {
 	}
 }
 
+// TestAnIdentityNamingADeadRecordIsNotRepaired: a record whose bindings
+// have all expired does not count, and its item is left as it is.
+func TestAnIdentityNamingADeadRecordIsNotRepaired(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, -time.Second))
+	id, _ := e.store.Identity(bg, tel1, t0)
+	id.Incarnation = 9
+	if _, err := e.store.SaveIdentity(bg, id, t0); err != nil {
+		t.Fatal(err)
+	}
+	rt := e.router(nil)
+	if d := rt.Terminating(bg, request(t, "INVITE", tel1)); d.Status != 480 {
+		t.Errorf("status %d", d.Status)
+	}
+	rt.Wait()
+	if got, _ := e.store.Identity(bg, tel1, t0); got.Incarnation != 9 || e.metrics.get("routing.identity_repaired") != 0 {
+		t.Errorf("item %+v repaired for a record without a live binding", got)
+	}
+}
+
 // TestARepairLosesToAREGISTERThatPointedTheItemMeanwhile: it is
 // conditional on the version read.
 func TestARepairLosesToAREGISTERThatPointedTheItemMeanwhile(t *testing.T) {
@@ -226,8 +246,13 @@ func TestA430EndsTheBindingAndTriesTheInstancesNextFlow(t *testing.T) {
 	if got := uris(d.Targets); !slices.Equal(got, []string{binding(2, 1, 0).URI, binding(3, 0, 0).URI}) {
 		t.Fatalf("targets %v", got)
 	}
-	if more := d.OnBranchFailure(bg, failure(d.Targets[1], 486)); more != nil {
-		t.Errorf("a 486 brought targets %v", uris(more))
+	for _, code := range []int{486, 503, 408} {
+		if more := d.OnBranchFailure(bg, failure(d.Targets[1], code)); more != nil {
+			t.Errorf("a %d brought targets %v", code, uris(more))
+		}
+	}
+	if set, _ := e.store.Registration(bg, set1); set.Contacts[2].Expired(t0) {
+		t.Error("a failure other than 430 ended the binding")
 	}
 	next := d.OnBranchFailure(bg, failure(d.Targets[0], 430))
 	if got := uris(next); !slices.Equal(got, []string{binding(1, 1, 0).URI}) {
@@ -252,6 +277,20 @@ func TestA430EndsTheBindingAndTriesTheInstancesNextFlow(t *testing.T) {
 	}
 	if set, _ := e.store.Registration(bg, set1); !set.Contacts[2].Expired(t0) {
 		t.Error("the binding without an instance was not ended")
+	}
+}
+
+// TestA430TriesOnlyTheSameInstancesFlows: another instance's flow not
+// tried yet is not the failed instance's to fall back on.
+func TestA430TriesOnlyTheSameInstancesFlows(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 1, time.Hour), binding(2, 1, 2*time.Hour), binding(4, 2, time.Hour), binding(5, 2, 2*time.Hour))
+	d := e.router(nil).Terminating(bg, request(t, "INVITE", impu1))
+	if got := uris(d.Targets); !slices.Equal(got, []string{binding(2, 1, 0).URI, binding(5, 2, 0).URI}) {
+		t.Fatalf("targets %v", got)
+	}
+	if got := uris(d.OnBranchFailure(bg, failure(d.Targets[0], 430))); !slices.Equal(got, []string{binding(1, 1, 0).URI}) {
+		t.Errorf("after instance 1's 430: %v", got)
 	}
 }
 

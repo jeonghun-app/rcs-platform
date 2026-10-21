@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
@@ -45,12 +46,19 @@ func TestARequestInsideADialogGoesOnlyWhereThePlatformRuns(t *testing.T) {
 		"a private address":                {ue, "<sip:10.0.3.7:8080;lr>", false},
 		"a flow token elsewhere":           {ue, "<sip:" + flow(1) + "@10.0.3.7;lr>", false},
 		"the S-CSCF itself":                {ue, "<sip:" + flow(1) + "@scscf.rcs.local;lr>", false},
+		"the S-CSCF among the P-CSCFs":     {ue, "<sip:" + flow(1) + "@198.51.100.9;lr>", false},
 		"the client's contact itself":      {ue, "", false},
 		"a tel URI":                        {"tel:+15550100003", "", false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
-			d := e.router(nil).InDialog(bg, inDialog(t, c.target, c.route))
+			// The S-CSCF's own address is in the P-CSCFs' network too, as
+			// tasks of one subnet are.
+			rt := e.router(nil, func(cfg *Config) {
+				self, _ := sip.ParseURI("sip:198.51.100.9")
+				cfg.Self = append(cfg.Self, self)
+			})
+			d := rt.InDialog(bg, inDialog(t, c.target, c.route))
 			if got := d.Status == 0; got != c.allowed {
 				t.Errorf("forwarded %v (status %d), want %v", got, d.Status, c.allowed)
 			}
