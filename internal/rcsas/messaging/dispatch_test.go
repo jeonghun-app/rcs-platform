@@ -102,6 +102,37 @@ func TestARegistrationOnANewFlowInvitesAgainAtOnce(t *testing.T) {
 	}
 }
 
+// #384: an invitation's failure that a registration on a new flow
+// overtook, as one sipas reports after the registration came in, leaves no
+// mark: the registration already cleared the marks and has the queue read,
+// and the late failure must not hold it until InviteTimeout. Here the
+// pass that asked is still running when both come, so the queue is read
+// again right after it, and that read invites again.
+func TestARegistrationOvertakesALateInvitationFailure(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	asked, release := make(chan Invitation, 1), make(chan struct{})
+	var once sync.Once
+	r.d.onInvite(func(inv Invitation) error {
+		once.Do(func() { asked <- inv; <-release })
+		return nil
+	})
+	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+	if err := r.e.Submit(t.Context(), o); err != nil {
+		t.Fatal(err)
+	}
+	first := <-asked // the pass waits in Invite
+	r.e.UserRegistered(bob, true)
+	r.e.InviteFailed(first, ErrOffline) // the old flow's 480, come late
+	close(release)
+	r.d.nextInvite(t) // the first
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v", inv)
+	}
+	if n := r.m.get("invite.failed_overtaken"); n != 1 {
+		t.Fatalf("%d overtaken failures", n)
+	}
+}
+
 // cancelStore fails what records an outcome on a cancelled context, as
 // the SDK does.
 type cancelStore struct{ store.Store }

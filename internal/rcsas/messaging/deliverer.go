@@ -83,4 +83,8 @@ type Invitation struct {
 	// or whoever added it, or the author of the message the invitation is
 	// for (RFC 3892 Referred-By, which rcsjta names the inviter by).
 	Referrer string
+	// flow is the recipient's registration on a new flow the engine had
+	// heard of when it asked for the session (Engine.flows), so that
+	// InviteFailed can tell a failure that a later registration overtook.
+	flow uint64
 }
