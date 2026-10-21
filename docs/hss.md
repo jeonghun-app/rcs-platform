@@ -43,7 +43,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_ACS_RATE`, `HSS_ACS_BURST` | `20`, `40` | requests per second and burst of each `acs` token, in each task: a bucket per token slot per task, so the most one caller gets is rate × tasks × 2 slots (a shared limit is a follow-up) |
 | `HSS_DEFAULT_PROFILE` | `rcs-default` | profile of subscriptions created without one |
 | `HSS_CREATE_DEFAULT_PROFILE` | `true` | create that profile at start, as [below](#default-service-profile), unless it exists |
-| `HSS_RCS_AS_URI` | `sip:rcs-as.<namespace>` | application server of the default profile |
+| `HSS_RCS_AS_URI` | `sip:rcs-as.<namespace>;transport=tcp` | application server of the default profile; `sip:host[:port]` with at most `;transport=tcp` or `tls` |
 | `HSS_MAX_AUTH_ITEMS` | `4` | AKA vectors per MAR at most (1 to 16) |
 | `HSS_CX_TIMEOUT` | `3s` | store work per Cx request, waiting for the subscriber's lock included |
 | `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included |
