@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -17,7 +16,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
-	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // Application servers of the tests: rcs-as, and an operator's server that
@@ -71,7 +69,6 @@ func fromUser(t *testing.T, method, target string, extra ...string) *proxy.Reque
 	r := request(t, method, target, append([]string{"P-Asserted-Identity: <" + impu1 + ">"}, extra...)...)
 	orig, _ := sip.ParseAddress("<sip:scscf.rcs.local;lr;orig>")
 	r.Routed = []sip.Address{orig}
-	r.Source = transport.Source{Addr: netipAddrPort("198.51.100.5:5070")}
 	return r
 }
 
@@ -86,7 +83,7 @@ func backFrom(t *testing.T, r *proxy.Request, d proxy.Decision, i int) *proxy.Re
 	tg := d.Targets[i]
 	b := branchOf(t, r, d, tg)
 	b.Header.Del("Route")
-	return &proxy.Request{Message: b, Routed: []sip.Address{tg.Routes[1]}, Source: transport.Source{Addr: netipAddrPort("192.0.2.200:5060")}}
+	return &proxy.Request{Message: b, Routed: []sip.Address{tg.Routes[1]}}
 }
 
 // branchOf is the copy of r the proxy sends to tg.
@@ -199,22 +196,28 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 		"changed": func(b *proxy.Request) {
 			// The priority raised past the next criterion, the MAC kept.
 			v, _ := b.Routed[0].URI.Param(odiParam)
-			p, m, _ := strings.Cut(v, ".")
-			payload, _ := base64.RawURLEncoding.DecodeString(p)
+			parts := strings.Split(v, ".")
+			payload, _ := base64.RawURLEncoding.DecodeString(parts[1])
 			payload[13] = 25
-			b.Routed[0].URI.Params.Set(odiParam, base64.RawURLEncoding.EncodeToString(payload)+"."+m)
+			b.Routed[0].URI.Params.Set(odiParam, parts[0]+"."+base64.RawURLEncoding.EncodeToString(payload)+"."+parts[2])
 		},
 		"another Call-ID": func(b *proxy.Request) { _ = b.Message.Header.Set("Call-ID", "term-call-2") },
 		"expired":         func(*proxy.Request) { e.clock.advance(DefaultODILifetime + time.Second) },
 		"just in time":    func(*proxy.Request) { e.clock.advance(DefaultODILifetime) },
 		"empty":           func(b *proxy.Request) { b.Routed[0].URI.Params.SetFlag(odiParam) },
+		"a key not kept": func(b *proxy.Request) {
+			v, _ := b.Routed[0].URI.Param(odiParam)
+			b.Routed[0].URI.Params.Set(odiParam, "k9"+strings.TrimPrefix(v, "k2"))
+		},
 		"from another key": func(b *proxy.Request) {
 			v, _ := b.Routed[0].URI.Param(odiParam)
 			pos, err := e.router(nil).openODI(v, "term-call-1", t0)
 			if err != nil {
 				t.Fatal(err)
 			}
-			other := e.router(nil, func(c *Config) { c.ODIKey = bytes.Repeat([]byte{1}, MinODIKeyBytes) })
+			other := e.router(nil, func(c *Config) {
+				c.DialogKeys = []DialogKey{{ID: "k2", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
+			})
 			b.Routed[0].URI.Params.Set(odiParam, other.signODI(pos, "term-call-1", t0.Add(time.Minute)))
 		},
 	} {
@@ -234,7 +237,7 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			}
 		})
 	}
-	if e.metrics.get("routing.odi.refused") != 5 || e.metrics.get("routing.odi.resumed") != 2 {
+	if e.metrics.get("routing.odi.refused") != 6 || e.metrics.get("routing.odi.resumed") != 2 {
 		t.Errorf("refused %d", e.metrics.get("routing.odi.refused"))
 	}
 }
@@ -307,8 +310,6 @@ func TestAnOriginatingRequestNeedsARegisteredAssertedUser(t *testing.T) {
 		t.Errorf("a store failure is answered %+v", d)
 	}
 }
-
-func netipAddrPort(s string) netip.AddrPort { return netip.MustParseAddrPort(s) }
 
 // registrarErr is the registrar's error for what the HSS said.
 func registrarErr(what string) error {
@@ -477,7 +478,6 @@ func TestARequestAServerSentForItsUserPassesItsTriggers(t *testing.T) {
 	e.registered(binding(1, 0, time.Hour))
 	e.profile(t0, criterion(5, operatorAS, method("MESSAGE"), ifc.SessionContinued), criterion(10, rcsAS, notServed("MESSAGE"), ifc.SessionTerminated))
 	r := request(t, "MESSAGE", impu1, "P-Served-User: <"+impu1+">;sescase=term")
-	r.Source = transport.Source{Addr: netipAddrPort("192.0.2.200:5060")}
 	d := e.router(nil).Initial(bg, r)
 	if serverOf(t, d) != "operator-as.rcs.local" {
 		t.Fatal("not to the operator's server")
@@ -498,7 +498,9 @@ func TestAPServedUserFromAnEdgeProxyIsNotTrusted(t *testing.T) {
 	e.registered(binding(1, 0, time.Hour))
 	e.profile(t0, criterion(10, rcsAS, notServed("MESSAGE"), ifc.SessionTerminated))
 	r := request(t, "MESSAGE", impu1, "P-Served-User: <"+impu1+">;sescase=term")
-	r.Source = transport.Source{Addr: netipAddrPort("198.51.100.5:5070")}
+	if err := r.Message.Header.Set("Via", "SIP/2.0/TCP 198.51.100.5:5070;branch=z9hG4bK-edge"); err != nil {
+		t.Fatal(err)
+	}
 	if host := serverOf(t, e.router(nil).Initial(bg, r)); host != "rcs-as.rcs.local" {
 		t.Errorf("sent to %s", host)
 	}
@@ -678,16 +680,15 @@ func TestAChangedProfileIsEvaluatedAfresh(t *testing.T) {
 func TestNewRefusesAnIncompleteConfig(t *testing.T) {
 	for name, tweak := range map[string]func(*Config){
 		"no registrar":      func(c *Config) { c.Registrar = nil },
-		"short key":         func(c *Config) { c.ODIKey = c.ODIKey[:MinODIKeyBytes-1] },
 		"I-CSCF without lr": func(c *Config) { c.ICSCF.Params = nil },
 		"I-CSCF not SIP":    func(c *Config) { c.ICSCF, _ = sip.ParseURI("tel:+15550100005") },
 		"no home domain":    func(c *Config) { c.HomeDomain = "" },
 	} {
 		e := newEnv(t)
 		self, _ := sip.ParseURI("sip:scscf.rcs.local")
-		rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;lr>")
+		rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
 		icscf, _ := sip.ParseURI("sip:icscf.rcs.local;lr")
-		cfg := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}, Registrar: e.hss, ODIKey: odiKey, ICSCF: icscf, HomeDomain: realm}
+		cfg := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}, Registrar: e.hss, DialogKeys: []DialogKey{{ID: "k2", Key: dialogKey}}, ICSCF: icscf, HomeDomain: realm}
 		if _, err := New(cfg); err != nil {
 			t.Fatalf("the complete config: %v", err)
 		}
@@ -860,26 +861,47 @@ func TestEachIdentityHasTheCriteriaOfItsServiceProfile(t *testing.T) {
 	}
 }
 
-// TestTheRouterKeepsItsOwnCopyOfTheKey: a caller that clears its key, as
-// one holding it from Secrets Manager may, leaves the router signing.
-func TestTheRouterKeepsItsOwnCopyOfTheKey(t *testing.T) {
-	e := newEnv(t)
-	key := bytes.Clone(odiKey)
-	rt := e.router(nil, func(c *Config) { c.ODIKey = key })
-	clear(key)
-	pos := position{served: impu1, scase: ifc.Originating, registered: true, priority: 10}
-	if _, err := e.router(nil).openODI(rt.signODI(pos, "c", t0.Add(time.Minute)), "c", t0); err != nil {
-		t.Error(err)
-	}
-}
-
 // TestAPositionTooShortIsRefusedEvenWithItsMAC: only a key holder can make
 // one, and it must not take the router down.
 func TestAPositionTooShortIsRefusedEvenWithItsMAC(t *testing.T) {
 	rt := newEnv(t).router(nil)
 	payload := []byte{0, 0, 0, 0}
-	v := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(rt.odiMAC(payload, "c"))
+	k := DialogKey{ID: "k2", Key: dialogKey}
+	v := "k2." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(odiMAC(k, payload, "c"))
 	if _, err := rt.openODI(v, "c", t0); err == nil {
 		t.Error("opened")
+	}
+}
+
+// TestTheFirstStepOfAChainSignsTheDialogsRoute (#322): the S-CSCF's
+// Record-Route value in the branch toward the server is signed for the hop
+// toward the caller, and responses are signed again; a step back from a
+// server records nothing.
+func TestTheFirstStepOfAChainSignsTheDialogsRoute(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(10, rcsAS, method("INVITE"), ifc.SessionContinued))
+	caller := "<sip:" + flow(7) + "@198.51.100.7:5070;transport=tcp;lr>"
+	r := fromUser(t, "INVITE", impu2, "Record-Route: "+caller)
+	d := e.router(nil).Initial(bg, r)
+	if d.OnResponse == nil || len(d.RecordRoute) != 1 {
+		t.Fatal("the first step records no route")
+	}
+	b := r.Message.Clone()
+	b.URI = d.Targets[0].URI
+	if err := b.Header.Prepend("Record-Route", d.RecordRoute[0].String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Prepare(bg, d.Targets[0], b); err != nil {
+		t.Fatal(err)
+	}
+	rr, _ := b.Header.RecordRoute()
+	v, ok := rr[0].URI.Param(dlgParam)
+	if !ok || !e.router(nil).signedHop(v, "term-call-1", hopKey(mustURI(strings.Trim(caller, "<>")))) {
+		t.Errorf("Record-Route %s is not signed for the caller's hop", rr[0].String())
+	}
+	back := backFrom(t, r, d, 0)
+	if d := e.router(nil).Initial(bg, back); d.OnResponse != nil || len(d.RecordRoute) != 0 {
+		t.Error("the step back from the server records the route again")
 	}
 }

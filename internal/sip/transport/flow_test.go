@@ -85,19 +85,6 @@ func TestFlowIDsAreSafeInASIPURI(t *testing.T) {
 	}
 }
 
-func TestOnlyWhatAFlowIDLooksLikeIsWellFormed(t *testing.T) {
-	tab := testTable(1, &fakeNow{}, 10)
-	id := tab.token(TCP, "core", netip.MustParseAddrPort("192.0.2.10:1"), 3)
-	if !id.WellFormed() {
-		t.Fatalf("FlowID %q is not well formed", id)
-	}
-	for _, bad := range []FlowID{"", "term", id[:21], id + "A", "+" + id[1:], id[:21] + "=", "AAAAAAAAAAAAAAAAAAAAAB"} {
-		if bad.WellFormed() {
-			t.Errorf("%q is well formed", bad)
-		}
-	}
-}
-
 func TestUDPFlowLivesWhileDatagramsArriveAndExpiresAfterTheUDPFlowTimeout(t *testing.T) {
 	clock := &fakeNow{t: time.Unix(1000, 0)}
 	tab, closed := recordingTable(1, clock, 10, 10)

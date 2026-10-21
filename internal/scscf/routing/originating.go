@@ -9,7 +9,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
-	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // origParam marks the Service-Route the registrar gives a user's P-CSCF,
@@ -25,7 +24,7 @@ const origParam = "orig"
 // I-CSCF or one an application server sends for its user (#137) is.
 func (rt *Router) Initial(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if v, ok := routedODI(r.Routed); ok {
-		return rt.decide(rt.resume(ctx, r, v), false)
+		return rt.decide(r.Message, rt.resume(ctx, r, v), false)
 	}
 	if alongServiceRoute(r.Routed) {
 		return rt.Originating(ctx, r)
@@ -51,7 +50,7 @@ func alongServiceRoute(routed []sip.Address) bool {
 // registered or is barred, and 500 with Retry-After for a store that
 // cannot be read.
 func (rt *Router) Originating(ctx context.Context, r *proxy.Request) proxy.Decision {
-	return rt.decide(rt.originating(ctx, r), true)
+	return rt.decide(r.Message, rt.originating(ctx, r), true)
 }
 
 func (rt *Router) originating(ctx context.Context, r *proxy.Request) step {
@@ -193,7 +192,12 @@ func dropServedUser(_ context.Context, req *sip.Request) error {
 	return nil
 }
 
-// fromEdgeProxy reports whether src is a P-CSCF task's core listener.
-func (rt *Router) fromEdgeProxy(src transport.Source) bool {
-	return src.Addr.IsValid() && rt.edgeProxy(src.Addr.Addr().String())
+// fromEdgeProxy reports whether req came from a P-CSCF: its topmost Via,
+// the previous hop's, names the P-CSCF core port (Config.EdgeProxyPort).
+// Task addresses tell no service apart (#322), and every core service may
+// write any Via; this only keeps a P-Served-User a P-CSCF failed to remove
+// from passing for an application server's.
+func (rt *Router) fromEdgeProxy(req *sip.Request) bool {
+	vias, err := req.Header.Via()
+	return err == nil && len(vias) > 0 && vias[0].Port == rt.cfg.EdgeProxyPort
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,9 +24,6 @@ const odiLabel = "rcs-platform scscf odi v1"
 
 // odiMACBytes is how much of the HMAC-SHA256 the parameter keeps.
 const odiMACBytes = 16
-
-// MinODIKeyBytes is the shortest Config.ODIKey.
-const MinODIKeyBytes = 32
 
 // position is where a request is in its served user's iFC chain: the
 // user, the session case and its state, and the priority of the last
@@ -53,9 +51,9 @@ const (
 var errBadODI = errors.New("routing: bad or expired iFC position")
 
 // signODI writes pos as the value of the odi parameter for the request with
-// callID, valid until expires: the position, and an HMAC over it and the
-// Call-ID, so that it cannot be changed, replayed on another request, or
-// used later (ADR 0005).
+// callID, valid until expires: the current key's ID, the position, and an
+// HMAC under that key over it and the Call-ID, so that it cannot be
+// changed, replayed on another request, or used later (ADR 0005).
 func (rt *Router) signODI(pos position, callID string, expires time.Time) string {
 	payload := make([]byte, 0, 14+len(pos.served))
 	payload = binary.BigEndian.AppendUint64(payload, uint64(expires.Unix()))
@@ -70,12 +68,14 @@ func (rt *Router) signODI(pos position, callID string, expires time.Time) string
 	payload = append(payload, flags)
 	payload = binary.BigEndian.AppendUint32(payload, uint32(int32(pos.priority)))
 	payload = append(payload, pos.served...)
+	k := rt.cfg.DialogKeys[0]
 	enc := base64.RawURLEncoding
-	return enc.EncodeToString(payload) + "." + enc.EncodeToString(rt.odiMAC(payload, callID))
+	return k.ID + "." + enc.EncodeToString(payload) + "." + enc.EncodeToString(odiMAC(k, payload, callID))
 }
 
-func (rt *Router) odiMAC(payload []byte, callID string) []byte {
-	m := hmac.New(sha256.New, rt.cfg.ODIKey)
+// odiMAC is the MAC under k of payload for the request with callID.
+func odiMAC(k DialogKey, payload []byte, callID string) []byte {
+	m := hmac.New(sha256.New, k.Key)
 	m.Write([]byte(odiLabel))
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(payload)))
@@ -89,13 +89,14 @@ func (rt *Router) odiMAC(payload []byte, callID string) []byte {
 // now: errBadODI unless it is intact and not expired.
 func (rt *Router) openODI(v, callID string, now time.Time) (position, error) {
 	enc := base64.RawURLEncoding.Strict()
-	p, m, ok := strings.Cut(v, ".")
-	if !ok {
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
 		return position{}, errBadODI
 	}
-	payload, err1 := enc.DecodeString(p)
-	mac, err2 := enc.DecodeString(m)
-	if err1 != nil || err2 != nil || len(payload) < 14 || !hmac.Equal(mac, rt.odiMAC(payload, callID)) {
+	i := slices.IndexFunc(rt.cfg.DialogKeys, func(k DialogKey) bool { return k.ID == parts[0] })
+	payload, err1 := enc.DecodeString(parts[1])
+	mac, err2 := enc.DecodeString(parts[2])
+	if i < 0 || err1 != nil || err2 != nil || len(payload) < 14 || !hmac.Equal(mac, odiMAC(rt.cfg.DialogKeys[i], payload, callID)) {
 		return position{}, errBadODI
 	}
 	expires := int64(binary.BigEndian.Uint64(payload))

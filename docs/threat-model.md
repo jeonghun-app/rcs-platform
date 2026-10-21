@@ -69,14 +69,18 @@ as long as the flow lives, but not reach the client with any other. `pcscf` fixe
 client's in-dialog request, to `scscf`; whether such requests then reach
 `rcs-as`, which records itself in the dialog, depends on `scscf`, which
 checks it as an acceptance criterion of
-[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
-mitigation is a dialog-state check in `scscf`, such as a signed
-Record-Route parameter it verifies. `scscf` sends a request inside a dialog
-on only to an application server or to a `pcscf` core listener naming a
-flow, never to itself, the I-CSCF or any other core address
-(`internal/scscf/routing`, #14); it keeps no dialog state, so a client can
-still drop an application server's entry from its route set, which the
-signed parameter would also close.
+[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). `scscf`
+signs its own Record-Route value when it sets up a dialog: a key ID and a MAC,
+under a key every `scscf` task shares (current and previous, for rotation),
+over the Call-ID, its name and each of the dialog's hops next to it (scheme,
+user, host, port, transport). It sends a request inside a dialog on only to
+a hop that value signs, at a `pcscf` core port or an application server's
+port, and never to itself (`internal/scscf/routing`, #322); a client that
+names any other core address, or drops an application server's entry from
+its route set, gets 403. No host or subnet list is involved: every core task
+shares the private subnets, and task addresses change. As with `pcscf`'s
+value, the binding covers the Call-ID and not the tags, so a peer can go on
+sending to the dialog's own hops with that Call-ID after the call has ended.
 The client's in-dialog requests are checked against the same MAC, so a
 client cannot change the icid its dialog's requests are charged to (review
 of #221; this closes the #208 residual risk that it could).
@@ -127,7 +131,7 @@ compromised, its reach is what its security group and tokens allow:
 
 | Service | Implemented in the service | Planned |
 |---|---|---|
-| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, and each listener's connections limited from accept, the PROXY header and TLS handshake included, so the core listener keeps its room (#193); registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to `scscf`'s service name alone and never back into the task; a request from the core only over the client flow of this task its Route names, else 430; the reg event: a NOTIFY only from the core, to a subscription's random Contact and in its dialog, acting only on that user's registrations on the task ([pcscf](pcscf.md)) | security groups (#56), a dialog-state check in `scscf` (T2 residual risk) |
+| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, and each listener's connections limited from accept, the PROXY header and TLS handshake included, so the core listener keeps its room (#193); registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to `scscf`'s service name alone and never back into the task; a request from the core only over the client flow of this task its Route names, else 430; the reg event: a NOTIFY only from the core, to a subscription's random Contact and in its dialog, acting only on that user's registrations on the task; MSRP anchored through `msrp-relay` with its token from Secrets Manager, at most two MSRP lines an offer, its bindings limited per flow and per task and those a flow creates in a minute, a body it cannot split in one way only refused, no core address shown to a client, and never end to end, a client's Record-Route not kept so that a BYE `pcscf` sends follows only the core's route ([pcscf](pcscf.md)); residual risk: the per-minute limit is per flow, so a client that opens many flows creates that many times as many bindings, which the flow limit per client address and the per-client rate of initial requests bound | security groups (#56), a dialog-state check in `scscf` (T2 residual risk) |
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |

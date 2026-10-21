@@ -12,7 +12,7 @@ them.
 |---|---|---|---|
 | `registrations` | `pk` (S): `set#<IMPI>#<default IMPU>`, a canonical IMPU, or `profile#<IMPI>#<default IMPU>` | `impi-index` (`impi`), `expiry-index` (`shard`, `expires` N), both keys only, of sets only; TTL on `ttl` | per implicit registration set its bindings (or an unregistered user's record) and its User-Data, and per IMPU the set it belongs to |
 | `auth-challenges` | `pk` (S): IMPI, `sk` (S): nonce, or `#count#<kind>#<window>` | none; TTL on `expires` | the vector or Digest state between the two REGISTERs, sealed; the per-IMPI counts of challenges and resynchronisations |
-| `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions and their NOTIFY counters |
+| `reg-subscriptions` | `pk` (S): subscription ID | `impu-index` (`impu`), `expiry-index` (`shard`, `expires` N), both keys only | reg event subscriptions: the watched IMPU, the set and incarnation it watches, the subscriber and its kind, a UE's binding, the dialog; and their NOTIFY counters (`cseq`, `rver`) and the record version the last NOTIFY carried (`nof`) |
 
 Data at rest: registration items hold Contact URIs (device addresses),
 `+sip.instance` (for 3GPP devices an IMEI URN), Path and the IMSSubscription,
@@ -119,6 +119,42 @@ additionally sealed (below).
   busy answer); for a permanent one such as `DIAMETER_ERROR_USER_UNKNOWN`
   (5001) it returns nil, or the SAR would be retried every minute.
 
+- **A reg event subscription watches one record.** It names the set and
+  the incarnation its identity was in when it was made, and every NOTIFY
+  reads that record: one whose record went, or is another incarnation, or
+  whose identity left it, ends. A NOTIFY is numbered by `NextNotify` for the
+  version of the record it was read from, which every save raises within an
+  incarnation; the store refuses a version below the last numbered (`nof`),
+  so the NOTIFY with the highest reginfo version carries the newest state.
+  A subscription's last NOTIFY is numbered with `FinalNotify`, after which
+  nothing is, so it goes once whichever instances end the subscription.
+- **The end of a set is never lost.** Before a deregistration, a sweep or
+  an RTR deletes a set's record, each of the set's subscriptions is saved
+  Terminated, with the reason and an expiry five seconds ahead, and its
+  final NOTIFY is queued (`regevent.Notifier.Ended`); a listing that fails
+  is tried again, and one that keeps failing keeps the record under a
+  deregistration's lease for the sweep after it, an RTR's too, since the
+  HSS does not send an RTR again (`registrar.rtr_left_to_sweep`), and
+  counts `regevent.end_failed`. A store failure or a stop at any
+  point thus leaves either the record or the saved ends, and a sweep sends
+  a final NOTIFY nobody sent. A subscription is deleted only once its final
+  NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or 430); one
+  without an answer is sent again by a sweep, with the CSeq and version it
+  was numbered with, 10 s later and twice as late each time, and given up
+  after five sends (`regevent.final_abandoned`). An end whose set was
+  registered again meanwhile, a new record, says terminated without a
+  body, so that it ends nothing of the new registration.
+  The subscription sweep must therefore run every few seconds to a minute,
+  as the registration sweep does.
+- **Known limit: the first NOTIFY of a very large set.** A full reginfo
+  document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
+  store's limits, 32 identities (`MaxIdentities`) each listing up to 32
+  contacts (`MaxContacts`) with long URIs, Call-IDs and instance URNs, is
+  larger. A change of such a set goes out as a partial document with what
+  changed, and its end with the identities alone, but a subscription's first
+  NOTIFY must be full, so it is not sent and is counted in
+  `regevent.too_large`.
+
 ## Metrics and alarms
 
 `registrar.challenge_limited` and `registrar.resync_limited` count the
@@ -130,6 +166,19 @@ connection, is held back while it lasts (T12). While it is raised, postpone
 P-CSCF deploys and drains: each moves its clients to new connections.
 `registrar.internal_errors` with a store that cannot count says the counts
 are failing closed: every REGISTER that needs a challenge gets 500.
+
+The reg event notifier counts, without dimensions:
+`regevent.subscribed`, `refused`, `refused_full`, `replaced`,
+`no_subscription`, `refresh_conflict`, `notified`, `notify_refused`,
+`notify_failed`, `notify_merged`, `notify_dropped`, `notify_deferred`,
+`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`,
+`final_resent`, `final_retry`, `final_abandoned` and `internal_errors`. Alarm on `regevent.notify_dropped` and
+`regevent.notify_deferred` (any sustained rate): NOTIFYs are queuing faster
+than subscribers answer (below), and ends are waiting for the sweep. Alarm
+on any `regevent.end_failed`: a set's end could not be saved, and its
+deregistration waits for a retry. Alarm on any `regevent.final_abandoned`:
+a subscriber, most likely a P-CSCF task, never heard that a set ended, and
+may still serve a user the network deregistered.
 
 ## HSS discovery
 
@@ -177,3 +226,25 @@ update of the IMPI's count before each MAR. Sweeps read each expiring set once.
 second, some 4.8 M IMPUs at 600 s re-registrations. The shard of an item is
 fixed when it is written, so a larger deployment raises the shard count before
 its first item.
+
+### Reg event NOTIFYs
+
+The registrar tells the notifier of every change of a set, refreshes
+included, and each change sends a NOTIFY to every subscription of the set:
+about two per user, the P-CSCF's and the UE's. Each NOTIFY is prepared on
+one of `Workers` (8) workers: a read of the set, the `NextNotify` update,
+and a delete when it ends, some 10–20 ms, so an instance prepares about
+`Workers` / 15 ms, some 500 a second. The wait for the answer is not a
+worker's; it is bounded instead per set (`SetConcurrency`, 2) and per next
+hop (`HopConcurrency`, 32). A P-CSCF task, the next hop of its users' UE
+subscriptions too, therefore takes about `HopConcurrency` / round trip: a UE
+behind a radio link answers in some 300 ms, which gives about 100 NOTIFYs a
+second, enough for 20 000 users re-registering every 600 s with two
+subscriptions each (67 a second). A P-CSCF task that does not answer holds
+its users' NOTIFYs back, and those waiting for it take a quarter of `Queue`
+(4096) at most; what waits beyond that, or beyond `Queue`, is dropped
+(`regevent.notify_dropped`), or for an end left to the sweep
+(`regevent.notify_deferred`). Four stalled P-CSCF tasks therefore fill the
+queue, and every other NOTIFY but an end is dropped until they answer or
+time out: alarm on `regevent.notify_dropped`. Raise `HopConcurrency` for
+P-CSCF tasks with more users, and `Workers` if the store is slow.

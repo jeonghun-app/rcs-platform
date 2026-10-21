@@ -343,7 +343,8 @@ func TestEndingABindingReadsTheRecordAgainAfterLosingARace(t *testing.T) {
 func TestCallerPreferencesChooseTheBindings(t *testing.T) {
 	chat := `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session"`
 	e := newEnv(t)
-	e.registered(binding(1, 0, time.Hour, chat), binding(2, 0, time.Hour))
+	mmtel := `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+	e.registered(binding(1, 0, time.Hour, chat), binding(2, 0, time.Hour, mmtel))
 	rt := e.router(nil)
 	r := request(t, "INVITE", impu1, "Accept-Contact: *;"+chat+";require;explicit")
 	if got := uris(rt.Terminating(bg, r).Targets); !slices.Equal(got, []string{binding(1, 0, 0).URI}) {
@@ -356,5 +357,72 @@ func TestCallerPreferencesChooseTheBindings(t *testing.T) {
 	r = request(t, "INVITE", impu1, `Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aother";require;explicit`)
 	if d := rt.Terminating(bg, r); d.Status != 480 {
 		t.Errorf("no device for the service: %d", d.Status)
+	}
+}
+
+// TestAnItemNamingTheSavedIncarnationIsNotWritten: only a stale item is
+// repaired, or every terminating request would cost a store write (QA on
+// #322).
+func TestAnItemNamingTheSavedIncarnationIsNotWritten(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	rt := e.router(nil)
+	rt.Terminating(bg, request(t, "INVITE", impu1))
+	rt.Wait()
+	if n := e.metrics.get("routing.identity_repaired") + e.metrics.get("routing.identity_repair_failed"); n != 0 {
+		t.Errorf("%d repairs for an item naming the saved incarnation", n)
+	}
+}
+
+// TestAnOPTIONSIsRoutedAsAnyRequest (#14 AC 6): forked to the bindings,
+// recorded and prepared alike, and 480 for a user without a live binding.
+func TestAnOPTIONSIsRoutedAsAnyRequest(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour), binding(2, 0, time.Hour))
+	rt := e.router(nil)
+	r := request(t, "OPTIONS", impu1)
+	d := rt.Terminating(bg, r)
+	if got := uris(d.Targets); len(got) != 2 || len(d.RecordRoute) != 1 {
+		t.Fatalf("targets %v, Record-Route %v", got, d.RecordRoute)
+	}
+	b := r.Message.Clone()
+	if err := d.Prepare(bg, d.Targets[0], b); err != nil || b.Header.Get("P-Called-Party-ID") != "<"+impu1+">" {
+		t.Errorf("prepared %v, P-Called-Party-ID %q", err, b.Header.Get("P-Called-Party-ID"))
+	}
+	e.clock.advance(2 * time.Hour)
+	if d := rt.Terminating(bg, request(t, "OPTIONS", impu1)); d.Status != 480 {
+		t.Errorf("without a live binding: %d", d.Status)
+	}
+}
+
+// TestARingingINVITEIsNotTriedOverTheInstancesOtherFlow (#14, #293): once
+// the device answered with a provisional response, it has the INVITE; a
+// 100 Trying, which the edge proxy sends itself, does not count, nor does a
+// request other than INVITE.
+func TestARingingINVITEIsNotTriedOverTheInstancesOtherFlow(t *testing.T) {
+	for name, c := range map[string]struct {
+		method                string
+		provisional, progress bool
+		retried               bool
+	}{
+		"no provisional":        {"INVITE", false, false, true},
+		"only the hop's 100":    {"INVITE", true, false, true},
+		"a 180 from the device": {"INVITE", true, true, false},
+		"a MESSAGE's 1xx":       {"MESSAGE", true, true, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, 1, time.Hour), binding(2, 1, 2*time.Hour))
+			d := e.router(nil).Terminating(bg, request(t, c.method, impu1))
+			f := failure(d.Targets[0], 430)
+			f.Provisional, f.Progress = c.provisional, c.progress
+			more := d.OnBranchFailure(bg, f)
+			if got := len(more) == 1; got != c.retried {
+				t.Errorf("retried %v (%v), want %v", got, uris(more), c.retried)
+			}
+			if set, _ := e.store.Registration(bg, set1); !set.Contacts[1].Expired(t0) {
+				t.Error("the gone flow's binding was not ended")
+			}
+		})
 	}
 }

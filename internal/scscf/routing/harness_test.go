@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -112,9 +111,6 @@ func newEnv(t *testing.T) *env {
 	return &env{t: t, store: state.NewMemory(), clock: &clock{now: t0}, metrics: &counts{}, hss: &fakeRegistrar{}}
 }
 
-// odiKey is the key every router of a test signs positions with.
-var odiKey = bytes.Repeat([]byte{0x6b}, MinODIKeyBytes)
-
 // fakeRegistrar stands in for the registrar's SAR UNREGISTERED_USER: the
 // HSS knows no one unless serve says otherwise.
 type fakeRegistrar struct {
@@ -140,20 +136,35 @@ func (f *fakeRegistrar) calls() int {
 	return len(f.asked)
 }
 
+// dialogKey signs the routers' Record-Route values; asURI is rcs-as's
+// listener.
+var (
+	dialogKey = bytes.Repeat([]byte{0x5d}, MinDialogKeyBytes)
+	asURI     = mustURI("sip:rcs-as.rcs.local:5060;transport=tcp")
+)
+
+func mustURI(s string) sip.URI {
+	u, err := sip.ParseURI(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
 func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
 	e.t.Helper()
 	if st == nil {
 		st = e.store
 	}
 	self, _ := sip.ParseURI("sip:scscf.rcs.local")
-	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;lr>")
+	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
 	icscf, _ := sip.ParseURI("sip:icscf.rcs.local;lr")
 	cfg := Config{
 		Store: st, RecordRoute: rr, Self: []sip.URI{self}, Now: e.clock.Now, Metrics: e.metrics,
-		Registrar: e.hss, ODIKey: odiKey, ICSCF: icscf, HomeDomain: realm,
-		ApplicationServers: []string{"rcs-as.rcs.local"},
-		EdgeProxyHosts:     []string{"pcscf.rcs.local"},
-		EdgeProxyNets:      []netip.Prefix{netip.MustParsePrefix("198.51.100.0/28")},
+		Registrar: e.hss, ICSCF: icscf, HomeDomain: realm,
+		DialogKeys:           []DialogKey{{ID: "k2", Key: dialogKey}},
+		ApplicationServers:   []sip.URI{asURI},
+		EdgeProxyPublicHosts: []string{"pcscf.example.net", "203.0.113.5"},
 	}
 	for _, f := range tweak {
 		f(&cfg)

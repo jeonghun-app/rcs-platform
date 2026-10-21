@@ -6,8 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,10 +33,6 @@ type Config struct {
 	Store state.Store
 	// Registrar serves the unregistered users terminating requests name.
 	Registrar Registrar
-	// ODIKey signs a request's place in its iFC chain toward an application
-	// server (ADR 0005), at least MinODIKeyBytes long, and the same on every
-	// scscf instance, any of which may get the request back.
-	ODIKey []byte
 	// ODILifetime is how long an application server may take to send the
 	// request back; DefaultODILifetime when 0.
 	ODILifetime time.Duration
@@ -52,20 +48,37 @@ type Config struct {
 	// with a global number is sent on as the SIP URI of the number in it.
 	HomeDomain string
 	// RecordRoute is the S-CSCF's own Record-Route value, its service name
-	// with lr (ADR 0005), which keeps it on the route of the dialogs it
-	// forwards, so that their requests come back through InDialog.
+	// with transport=tcp and lr (ADR 0005, #208), which keeps it on the
+	// route of the dialogs it forwards, so that their requests come back
+	// through InDialog.
 	RecordRoute sip.Address
-	// Self are the URIs that name this S-CSCF, as proxy.Config.Self: no
-	// request inside a dialog is sent to them.
+	// Self are the URIs that name this S-CSCF, as proxy.Config.Self, its
+	// service name and its task's address: no request inside a dialog is
+	// sent to them.
 	Self []sip.URI
-	// ApplicationServers are the hosts of the application servers a request
-	// inside a dialog may go to, such as rcs-as's service name.
-	ApplicationServers []string
-	// EdgeProxyHosts and EdgeProxyNets are the names and addresses of the
-	// P-CSCF tasks' core listeners: a request inside a dialog may go to one
-	// whose URI names a flow by its user part.
-	EdgeProxyHosts []string
-	EdgeProxyNets  []netip.Prefix
+	// DialogKeys sign the Record-Route values the S-CSCF writes, so that a
+	// request inside a dialog goes on only to a hop the dialog was set up
+	// through (#322), and a request's place in its iFC chain toward an
+	// application server (odi, ADR 0005): the first signs, each verifies,
+	// so that a key is rotated by putting the new one first and keeping the
+	// old one until what it signed has ended. The same on every scscf
+	// instance, any of which may get a request back.
+	DialogKeys []DialogKey
+	// EdgeProxyPort is the port of the P-CSCF tasks' core listener, over
+	// TCP; DefaultEdgeProxyPort when 0. With the application servers'
+	// ports, it is where a request inside a dialog may go, whatever the
+	// signed hops say.
+	EdgeProxyPort int
+	// ApplicationServers are the SIP listeners of the application servers,
+	// such as rcs-as's service name with its port and transport=tcp: a
+	// request inside a dialog may go to the port and transport of one. The
+	// host is not compared, as a server's task writes its own address.
+	ApplicationServers []sip.URI
+	// EdgeProxyPublicHosts are the names and addresses clients reach the
+	// P-CSCF at. rcsjta puts the Route of a dialog's first INVITE, one of
+	// them, after the dialog's route set in its session refreshes (#14):
+	// a next hop that names one ends the route set.
+	EdgeProxyPublicHosts []string
 	// RepairTimeout bounds the background repair of an identity's item;
 	// DefaultRepairTimeout when 0.
 	RepairTimeout time.Duration
@@ -87,7 +100,43 @@ const (
 	// DefaultASTimeout leaves the client most of its Timer F (32 s) for
 	// what follows a server that does not answer.
 	DefaultASTimeout = 5 * time.Second
+	// DefaultEdgeProxyPort is pcscf's core listener (docs/pcscf.md).
+	DefaultEdgeProxyPort = 5070
 )
+
+// checkHosts refuses an entry of cfg that names no host, which would be
+// taken for a URI without one, such as a tel URI, or no port (#322).
+func checkHosts(cfg Config) error {
+	for _, u := range cfg.Self {
+		if u.Host == "" {
+			return errors.New("routing: an entry of Self has no host")
+		}
+	}
+	for _, u := range cfg.ApplicationServers {
+		if !u.IsSIP() || u.Host == "" || u.Port == 0 {
+			return errors.New("routing: each of ApplicationServers must be a SIP URI with a host and a port")
+		}
+	}
+	if slices.Contains(cfg.EdgeProxyPublicHosts, "") {
+		return errors.New("routing: an entry of EdgeProxyPublicHosts is empty")
+	}
+	return nil
+}
+
+// isKeyID reports whether id is a key ID: 1 to 8 letters and digits, which
+// a URI parameter carries as they are.
+func isKeyID(id string) bool {
+	if id == "" || len(id) > 8 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
 
 // Router routes the requests of the users the S-CSCF serves, outside
 // dialogs and inside.
@@ -109,14 +158,16 @@ func New(cfg Config) (*Router, error) {
 	if !rr.IsSIP() || rr.Host == "" || !rr.Params.Has("lr") {
 		return nil, errors.New("routing: RecordRoute must be a SIP URI with lr")
 	}
+	if t, ok := rr.Param("transport"); !ok || !strings.EqualFold(t, "tcp") {
+		// pcscf refuses a dialog's requests along a route to the S-CSCF
+		// over any other transport (#208).
+		return nil, errors.New("routing: RecordRoute must carry transport=tcp")
+	}
 	if len(cfg.Self) == 0 {
 		return nil, errors.New("routing: Self is required")
 	}
 	if cfg.Registrar == nil {
 		return nil, errors.New("routing: Registrar is required")
-	}
-	if len(cfg.ODIKey) < MinODIKeyBytes {
-		return nil, errors.New("routing: ODIKey must be at least 32 bytes")
 	}
 	if !cfg.ICSCF.IsSIP() || cfg.ICSCF.Host == "" || !cfg.ICSCF.Params.Has("lr") {
 		return nil, errors.New("routing: ICSCF must be a SIP URI with lr")
@@ -124,12 +175,29 @@ func New(cfg Config) (*Router, error) {
 	if cfg.HomeDomain == "" {
 		return nil, errors.New("routing: HomeDomain is required")
 	}
-	cfg.ODIKey = slices.Clone(cfg.ODIKey)
 	if cfg.ODILifetime <= 0 {
 		cfg.ODILifetime = DefaultODILifetime
 	}
 	if cfg.ASTimeout <= 0 {
 		cfg.ASTimeout = DefaultASTimeout
+	}
+	if err := checkHosts(cfg); err != nil {
+		return nil, err
+	}
+	if len(cfg.DialogKeys) == 0 {
+		return nil, errors.New("routing: DialogKeys is required")
+	}
+	ids := map[string]bool{}
+	cfg.DialogKeys = slices.Clone(cfg.DialogKeys)
+	for i, k := range cfg.DialogKeys {
+		if !isKeyID(k.ID) || ids[k.ID] || len(k.Key) < MinDialogKeyBytes {
+			return nil, errors.New("routing: each DialogKey needs its own ID of letters and digits and a key of at least 32 bytes")
+		}
+		ids[k.ID] = true
+		cfg.DialogKeys[i].Key = slices.Clone(k.Key)
+	}
+	if cfg.EdgeProxyPort == 0 {
+		cfg.EdgeProxyPort = DefaultEdgeProxyPort
 	}
 	if cfg.RepairTimeout <= 0 {
 		cfg.RepairTimeout = DefaultRepairTimeout

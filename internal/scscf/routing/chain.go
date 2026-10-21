@@ -36,15 +36,19 @@ type hop struct {
 // which the proxy calls for every branch, and the answer of a chain that
 // ended after its last hop failed.
 type plan struct {
+	// rec signs the S-CSCF's Record-Route in every branch, nil without one.
+	rec *recorder
+
 	mu     sync.Mutex
 	hops   map[string]hop
 	status int
 	reason string
 }
 
-// decide is the Decision for s: its answer, or its hops, with the S-CSCF's
-// Record-Route if recordRoute.
-func (rt *Router) decide(s step, recordRoute bool) proxy.Decision {
+// decide is the Decision for s, the step of req: its answer, or its hops,
+// with the S-CSCF's Record-Route, signed for the dialog's hops (recorder),
+// if recordRoute.
+func (rt *Router) decide(req *sip.Request, s step, recordRoute bool) proxy.Decision {
 	switch {
 	case s.response != nil:
 		return proxy.Decision{Response: s.response}
@@ -54,7 +58,9 @@ func (rt *Router) decide(s step, recordRoute bool) proxy.Decision {
 	p := &plan{hops: map[string]hop{}}
 	d := proxy.Decision{Targets: p.add(s.hops), Prepare: p.prepare, OnBranchFailure: p.failed, OnFinal: p.final}
 	if recordRoute {
+		p.rec = rt.recorder(req)
 		d.RecordRoute = []sip.Address{rt.cfg.RecordRoute}
+		d.OnResponse = p.rec.response
 	}
 	return d
 }
@@ -89,7 +95,13 @@ func (p *plan) prepare(ctx context.Context, t proxy.Target, req *sip.Request) er
 	if !ok {
 		return errNoHop
 	}
-	return h.prepare(ctx, req)
+	if err := h.prepare(ctx, req); err != nil {
+		return err
+	}
+	if p.rec != nil {
+		return p.rec.prepare(req)
+	}
+	return nil
 }
 
 // failed is the step after a failed branch: its hops are tried, and an

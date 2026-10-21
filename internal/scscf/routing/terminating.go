@@ -33,9 +33,12 @@ const saveAttempts = 3
 // as unregistered, by the iFC of that state. It is 404 for a
 // Request-URI that is no public identity, a barred one or one the HSS does
 // not know, 480 for a user without a live binding the preferences accept,
-// and 500 with Retry-After for a store or HSS that cannot be asked.
+// 400 for more than maxPreferences of them or one that requires something
+// and does not parse, and 500 with Retry-After for a store or HSS that
+// cannot be asked. The S-CSCF's Record-Route value signs the dialog's hops
+// (recorder).
 func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decision {
-	return rt.decide(rt.terminating(ctx, r), true)
+	return rt.decide(r.Message, rt.terminating(ctx, r), true)
 }
 
 func (rt *Router) terminating(ctx context.Context, r *proxy.Request) step {
@@ -43,6 +46,10 @@ func (rt *Router) terminating(ctx context.Context, r *proxy.Request) step {
 	if !ok {
 		rt.count("routing.terminating.not_found")
 		return answer(404, "Not Found")
+	}
+	if _, err := preferencesOf(r.Message); err != nil {
+		// Refused before the chain, as at its end (toContacts).
+		return rt.badPreferences(err)
 	}
 	now := rt.cfg.Now()
 	set, err := rt.served(ctx, impu, now)
@@ -70,8 +77,18 @@ func (rt *Router) terminating(ctx context.Context, r *proxy.Request) step {
 	// A request from an application server that sent it for its user names
 	// the user in P-Served-User (#137); one from a P-CSCF never does, and
 	// pcscf removes any a client wrote (ADR 0007 §7).
-	pos.kept = r.Message.Header.Has("P-Served-User") && !rt.fromEdgeProxy(r.Source)
+	pos.kept = r.Message.Header.Has("P-Served-User") && !rt.fromEdgeProxy(r.Message)
 	return rt.next(ctx, r.Message, pos, set, rt.toContacts(r.Message, set))
+}
+
+// badPreferences answers a request whose caller preferences are refused.
+func (rt *Router) badPreferences(err error) step {
+	if errors.Is(err, errTooManyPreferences) {
+		rt.count("routing.terminating.too_many_preferences")
+		return answer(400, "Too Many Caller Preferences")
+	}
+	rt.count("routing.terminating.bad_preference")
+	return answer(400, "Bad Caller Preference")
 }
 
 // errBarred is the lookup of a barred identity, errEnding that of one whose
@@ -144,6 +161,8 @@ func (rt *Router) lookup(ctx context.Context, impu string, now time.Time) (*stat
 	case !ok:
 		return nil, nil
 	case sid.Barred:
+		// Barred whether or not the set is registered: rcs-as gives up a
+		// message only on 404 or 604 (#279), and keeps it on a 480.
 		return nil, errBarred
 	case len(live(set, now)) > 0:
 	case set.Deregistering.IsZero() && set.Unregistered.After(now):
@@ -197,8 +216,13 @@ func (rt *Router) toContacts(req *sip.Request, set *state.Registration) func(con
 			rt.count("routing.terminating.not_registered")
 			return answer(480, "Temporarily Unavailable")
 		}
+		prefs, err := preferencesOf(req)
+		if err != nil {
+			return rt.badPreferences(err)
+		}
+		var ops int
 		called := sip.Address{URI: req.URI}.String()
-		d := &delivery{rt: rt, key: set.Key, candidates: accepted(bindings, req), called: called}
+		d := &delivery{rt: rt, key: set.Key, candidates: prefs.accepted(bindings, &ops), called: called, invite: req.Method == "INVITE"}
 		hops := d.hops(d.targets(onePerInstance(d.candidates)))
 		if len(hops) == 0 {
 			rt.count("routing.terminating.no_contact")
@@ -217,6 +241,8 @@ type delivery struct {
 	candidates []state.Contact
 	// called is the P-Called-Party-ID of every branch.
 	called string
+	// invite says the request is an INVITE.
+	invite bool
 
 	mu    sync.Mutex
 	tried map[string]state.Contact
@@ -315,7 +341,10 @@ func keyOf(t proxy.Target) string {
 // failed acts on a branch that failed: one its edge proxy answered 430 Flow
 // Failed went to a flow that is gone (RFC 5626 §5.3), so its binding is
 // ended, and the request is tried over the instance's latest flow not tried
-// yet (§7).
+// yet (§7). An INVITE the device answered with a provisional response
+// (BranchFailure.Progress) is not: the device has it, and would take the
+// same INVITE over its other flow for a merged request (RFC 3261 §8.2.2.2)
+// or ring again (#14, #293).
 func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) step {
 	if f.Response == nil || f.Response.StatusCode != 430 {
 		return step{}
@@ -329,6 +358,10 @@ func (d *delivery) failed(ctx context.Context, f proxy.BranchFailure) step {
 	d.rt.count("routing.terminating.flow_failed")
 	d.rt.endBinding(ctx, d.key, gone)
 	if gone.InstanceID == "" {
+		return step{}
+	}
+	if d.invite && f.Progress {
+		d.rt.count("routing.terminating.not_retried_after_progress")
 		return step{}
 	}
 	d.mu.Lock()
