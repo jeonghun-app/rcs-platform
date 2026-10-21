@@ -117,6 +117,9 @@ type Config struct {
 	// Events is told of every change of a set's bindings, for the reg event
 	// (regevent.Notifier); nil tells no one.
 	Events Events
+	// ThirdParty registers the users with their application servers;
+	// nil tells none.
+	ThirdParty ThirdParty
 	// Logger receives failures without identities, which are only logged
 	// through internal/pii, and never credentials. Nil discards them.
 	Logger *slog.Logger
@@ -171,6 +174,9 @@ func New(cfg Config) (*Registrar, error) {
 	}
 	if cfg.Events == nil {
 		cfg.Events = noEvents{}
+	}
+	if cfg.ThirdParty == nil {
+		cfg.ThirdParty = noThirdParty{}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
