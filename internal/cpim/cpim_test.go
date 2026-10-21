@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -360,20 +361,32 @@ func TestContentHeaderLimitsCountEveryLineAndByte(t *testing.T) {
 // for either, quadratic 64 times as long for the one, so a bound of 8
 // between them needs no slack; and as both take about as long, a loaded
 // host stretches both about alike, which it did not for one small parse
-// against one large one. The best of five of each is taken, and only three
-// attempts in a row over the bound fail the test. Under the race detector,
-// which times its own instrumentation as much as the parser, only
-// allocations are compared, as in internal/sip/reginfo (#263).
+// against one large one. The time is the process's CPU time, as in
+// internal/sip/reginfo (#317): a CPU quota throttles a timing in wall time
+// by up to 50 times, and a short one now and then not at all, which no
+// bound of 8 or 32 survives (review of #331). The best of five of each is
+// taken, and only three attempts in a row over the bound fail the test.
+// Under the race detector, which times its own instrumentation as much as
+// the parser, only allocations are compared, as in internal/sip/reginfo
+// (#263).
 func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	data := foldedHeaders(DefaultMaxSize - 64)
 	l := Limits{MaxSize: DefaultMaxSize, MaxHeaders: DefaultMaxSize, MaxContentHeaderSize: DefaultMaxSize}
 
+	// cpu is the process's CPU time, GC included.
+	cpu := func() time.Duration {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			t.Fatal(err)
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+	}
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	start := time.Now()
+	start := cpu()
 	m, err := l.Parse(data)
-	first := time.Since(start)
+	first := cpu() - start
 	runtime.ReadMemStats(&after)
 	if err != nil {
 		t.Fatal(err)
@@ -391,23 +404,20 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	}
 	small := foldedHeaders(DefaultMaxSize/64 - 64)
 	parse := func(b []byte, times int) time.Duration {
-		start := time.Now()
+		start := cpu()
 		for range times {
 			if _, err := l.Parse(b); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return time.Since(start)
+		return cpu() - start
 	}
 	// Far past anything load does to two timings that last about as long
 	// fails the test without parsing the whole input fifteen times more at
 	// quadratic cost (code review). Each side is timed three times, in
-	// turn, and the medians compared, so one timing that load got wrong
-	// either way decides nothing: one stretched large parse failed a
-	// linear parser (1 in 300 runs under the load model), one yardstick
-	// that ran unthrottled did too when the shortest of two was taken (1
-	// in 100), and one stretched yardstick sent a quadratic parser down
-	// the slow path, which took 433 s once (code review).
+	// turn, and the medians compared, so one timing that went wrong either
+	// way decides nothing: one stretched yardstick sent a quadratic parser
+	// down the slow path, which took 433 s once (code review).
 	const bound, farPast = 8, 4 * 8
 	larges, bases := []time.Duration{first}, []time.Duration{parse(small, 64)}
 	for range 2 {
