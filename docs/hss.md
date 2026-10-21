@@ -158,7 +158,9 @@ logged as contention rather than a store failure (#200).
 
 The I-CSCF gets Server-Capabilities with the profile's mandatory and optional
 capabilities and the names in `HSS_SCSCF_NAMES`; without any it may pick any
-S-CSCF. Restoration (TS 23.380), emergency registration, wildcarded identities and
+S-CSCF. A name steers the I-CSCF's choice over the capabilities (TS 29.228
+§6.7), so `HSS_SCSCF_NAMES` turns capability selection off: with it set, the
+profile's capabilities choose nothing ([icscf](icscf.md)). Restoration (TS 23.380), emergency registration, wildcarded identities and
 PSIs are not supported.
 
 ### HSS-initiated requests

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync/atomic"
 	"time"
@@ -83,8 +84,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
-		OnFlowClosed:   fl.closed,
-		Logger:         rt.Logger,
+		OnFlowClosed: func(id transport.FlowID, info transport.FlowInfo) {
+			fl.closed(id, info)
+			// A request the core sent the client over this flow gets 430
+			// now rather than waiting for Timer B or F (#234).
+			if px := p.Load(); px != nil {
+				px.FlowClosed(id)
+			}
+		},
+		Logger: rt.Logger,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
@@ -129,8 +137,20 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// After the proxy closes, so that every SUBSCRIBE under way has ended.
 	defer pc.subs.close()
 	defer stopSubs()
-	// A closed flow's registrations are gone (RFC 5626 §5.3).
-	fl.onClosed = pc.registry.removeFlow
+	var relay *relayClient
+	if cfg.RelayToken.v != "" && cfg.RelayURL != nil {
+		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken.v, cfg.RelayTimeout, relayDialer(cfg))
+	}
+	anchorCtx, stopAnchor := context.WithCancel(context.Background())
+	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now))
+	defer pc.msrp.close()
+	defer stopAnchor()
+	// A closed flow's registrations and MSRP sessions are gone (RFC 5626
+	// §5.3).
+	fl.onClosed = func(id transport.FlowID) {
+		pc.registry.removeFlow(id)
+		pc.msrpFlowClosed(id)
+	}
 	router := d.router
 	if router == nil {
 		router = pc
@@ -183,6 +203,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	stopSweep := every(d.sweep, func() {
 		pc.registry.sweep()
 		pc.reconcileSubscriptions()
+		pc.sweepMSRP()
 		tm.record(rt.Metrics, tr.Stats())
 	})
 	defer stopSweep()
@@ -198,13 +219,41 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
-	// The transport closes before the proxy does (the deferred Close). A
-	// peer that stopped reading leaves senders waiting for room in its
-	// connection's queue, and the proxy's Close waits for them, for up to
-	// WriteTimeout, past the stop margin (#323); closing the connections
-	// releases them at once. A second Close does nothing.
+	awaitAnswers(px, tr, answersWait)
+	// The transport closes before the proxy does (the deferred Close), once
+	// the answers above are written. A peer that stopped reading leaves
+	// senders waiting for room in its connection's queue, and the proxy's
+	// Close waits for them, for up to WriteTimeout, past the stop margin
+	// (#323); closing the connections releases them at once. A second Close
+	// does nothing.
 	_ = tr.Close()
 	return nil
+}
+
+// awaitAnswers returns once no request is in progress and the transport has
+// written what it queued, or after d in all. It polls, since a flow's close
+// reaches the proxy on a goroutine of the transport's. The second wait is
+// for the answers just sent: Transport.Close drops what its send queues
+// still hold (QA of #293). #281's Proxy.Drain replaces it.
+func awaitAnswers(px *proxy.Proxy, tr *transport.Transport, d time.Duration) {
+	end := time.Now().Add(d)
+	for px.Stats().Contexts > 0 && time.Now().Before(end) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	for tr.Stats().QueuedBytes > 0 && time.Now().Before(end) {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// relayDialer opens the connections to msrp-relay's control API: in
+// staging and prod only to private addresses, whatever the name resolves
+// to, so the token goes nowhere else (ADR 0007 §5); dev reaches a relay on
+// loopback.
+func relayDialer(cfg Config) func(ctx context.Context, network, address string) (net.Conn, error) {
+	if cfg.AllowLoopback {
+		return (&net.Dialer{Timeout: cfg.RelayTimeout}).DialContext
+	}
+	return runtime.InternalDialer{Timeout: cfg.RelayTimeout}.DialContext
 }
 
 // sweepInterval is how often expired registrations, and reservations no
