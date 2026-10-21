@@ -32,9 +32,20 @@ type relayStack struct {
 	posted  chan struct{}
 	release chan struct{}
 	block   atomic.Bool
+	// svc is the running pcscf, and icscf the node alice registered
+	// through.
+	svc   *service
+	icscf *fakeCoreNode
 }
 
 func startRelayStack(t *testing.T, scscfAnswer func(*sip.Request) string, relayTimeout time.Duration, d deps) *relayStack {
+	t.Helper()
+	return startRelayStackAt(t, scscfAnswer, relayTimeout, d, nil)
+}
+
+// startRelayStackAt is startRelayStack with the control API at relayURL,
+// or scripted if it is nil.
+func startRelayStackAt(t *testing.T, scscfAnswer func(*sip.Request) string, relayTimeout time.Duration, d deps, relayURL *url.URL) *relayStack {
 	t.Helper()
 	st := &relayStack{posted: make(chan struct{}, 16), release: make(chan struct{})}
 	st.relay = &scriptedRelay{bodies: map[int]map[string]any{}}
@@ -58,11 +69,15 @@ func startRelayStack(t *testing.T, scscfAnswer func(*sip.Request) string, relayT
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	cfg.SCSCFPort = scscfPort
 	cfg.RelayURL, _ = url.Parse(srv.URL)
+	if relayURL != nil {
+		cfg.RelayURL = relayURL
+	}
 	cfg.RelayToken = relayToken{testRelayToken}
 	cfg.RelayTimeout = relayTimeout
 	d.lookup = icscfLookup("127.0.0.1")
 	d.started = func(p *pcscf) { st.pc = p }
 	s := start(t, cfg, d)
+	st.svc, st.icscf = s, icscf
 	st.c = dial(t, s.client, nil)
 	_ = st.c.nc.SetDeadline(time.Now().Add(waitFor))
 	if _, err := io.WriteString(st.c.nc, registerText(outboundContact, "Supported: outbound")); err != nil {
@@ -138,6 +153,29 @@ func TestACancelDuringAllocationReleasesTheBinding(t *testing.T) {
 	if st.relay.count(http.MethodDelete) != 1 {
 		t.Errorf("relay %q", st.relay.log())
 	}
+}
+
+// A CANCEL after the INVITE has reached scscf, the order #361 left to
+// chance, ends it with scscf's 487 at once, as scscf answers the INVITE
+// 100 Trying and the CANCEL as a UAS does (RFC 3261 §9.2), and releases the
+// binding; not at Timer B.
+func TestACancelAfterTheInviteReachedTheCoreReleasesTheBinding(t *testing.T) {
+	st := startRelayStack(t, func(*sip.Request) string { return "" }, 2*time.Second, deps{})
+	st.invite(t, "e2e-cancel-sent", "INVITE", clientChatOffer)
+	if inv := st.scscf.receive(t); inv.Method != "INVITE" {
+		t.Fatalf("scscf got %s", inv.Method)
+	}
+	st.invite(t, "e2e-cancel-sent", "CANCEL", "")
+	got := map[string]int{}
+	for range 2 {
+		res := st.c.final()
+		cseq, _ := res.Header.CSeq()
+		got[cseq.Method] = res.StatusCode
+	}
+	if got["CANCEL"] != 200 || got["INVITE"] != 487 {
+		t.Errorf("finals %v", got)
+	}
+	st.waitHeld(t, 0)
 }
 
 // A relay that does not answer within PCSCF_RELAY_TIMEOUT has the INVITE

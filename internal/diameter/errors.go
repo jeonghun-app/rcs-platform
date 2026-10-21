@@ -30,9 +30,12 @@ func (e *Error) Error() string {
 
 // Errors returned by the peer and request API.
 var (
-	// ErrPeerUnavailable means the peer has no open connection, or its
-	// watchdog has marked it suspect (RFC 3539 §3.4.1) and it must not be
-	// given new requests.
+	// ErrPeerUnavailable means the request was not sent: the peer has no open
+	// connection, or its watchdog has marked it suspect (RFC 3539 §3.4.1) and
+	// it must not be given new requests, or the request reached the write
+	// queue only behind a DPR or DPA and was dropped (#324). A dropped one
+	// already has its End-to-End Identifier, so a retry on another peer keeps
+	// it and sets the T bit, though the first peer never saw it.
 	ErrPeerUnavailable = errors.New("diameter: peer unavailable")
 	// ErrTimeout means no answer arrived within the request timeout.
 	ErrTimeout = errors.New("diameter: request timed out")

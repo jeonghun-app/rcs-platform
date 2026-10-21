@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 	"sort"
 	"strings"
@@ -45,6 +46,12 @@ type Config struct {
 	// CoreListen is where the rcs-as stand-in listens, and CoreAdvertise
 	// the host the relay is told to connect to (empty: the listener's).
 	CoreListen, CoreAdvertise string
+	// CoreListener, when set, gives each chat scenario's stand-in its
+	// listener instead of CoreListen: a test that listens on port 0 before
+	// it starts the relay holds the port the relay is told about from the
+	// first, where listening anew on it for each scenario could find it
+	// taken (#186).
+	CoreListener func() (net.Listener, error)
 	// MSRP configures both ends' connections, the keep-alive interval
 	// among them.
 	MSRP msrp.Config

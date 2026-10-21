@@ -285,7 +285,7 @@ func (n *Notifier) makeRoom(ctx context.Context, sub *state.Subscription, set *s
 	pushOut := func(is func(*state.Subscription) bool, keep int) error {
 		for k := countOf(all, is); k > keep; k-- {
 			i := slices.IndexFunc(all, is)
-			old, err := n.terminate(ctx, all[i], now.Add(pendingEnd), "deactivated", false)
+			old, err := n.terminate(ctx, all[i], now.Add(n.pendingEnd()), "deactivated", false)
 			if err != nil {
 				return err
 			}
@@ -434,7 +434,7 @@ func (n *Notifier) refresh(ctx context.Context, req *sip.Request, ev sip.Event) 
 		next.Expires = now.Add(exp)
 		j := job{}
 		if exp == 0 {
-			next.Terminated, next.Expires, next.EndReason = true, now.Add(pendingEnd), ""
+			next.Terminated, next.Expires, next.EndReason = true, now.Add(n.pendingEnd()), ""
 			j = job{final: true}
 		}
 		saved, err := n.cfg.Store.SaveSubscription(ctx, next)

@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
-	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -75,7 +74,8 @@ type LegParams struct {
 	Remote []msrp.URI
 	// User is the asserted identity of the client on this leg, and
 	// Identities the others it may name in the CPIM From. A group leg puts
-	// User in canonical form (identity.CanonicalIMPU), as the group does.
+	// User in the form UserOf gives at Config.HomeDomain, as the group
+	// does.
 	User       string
 	Identities []string
 	// Peer is the other party of the conversation.
@@ -211,10 +211,10 @@ func (e *Engine) newLeg(p LegParams) (*Leg, error) {
 		return nil, err
 	}
 	if p.Mode == store.Group {
-		// The group stores and names its participants in canonical form
-		// (the group package), and their copies are queued under it; a
+		// The group stores and names its participants as UserOf does (the
+		// group package), and their copies are queued under that name; a
 		// leg keyed otherwise would never be found for them.
-		user, ok := identity.CanonicalIMPU(p.User)
+		user, ok := UserOf(p.User, e.cfg.HomeDomain)
 		if !ok {
 			return nil, errors.New("messaging: a group leg's user must be a SIP or tel URI")
 		}
@@ -288,6 +288,8 @@ func (l *Leg) activate() {
 		e.legs[key] = append(e.legs[key], l)
 		if group {
 			e.groupLegs[l.p.Peer]++
+			// A session with the group reaches the participant after all.
+			delete(e.unreachable, key)
 		}
 		delete(e.invites, inviteKey{l.p.User, l.p.Peer, l.p.Mode, ""})
 		e.mu.Unlock()

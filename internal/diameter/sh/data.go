@@ -5,6 +5,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"strconv"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // Data is the subset of an Sh-Data document (TS 29.328 Annex D, tSh-Data)
@@ -69,13 +71,13 @@ type wireServiceData struct {
 // ParseData parses an Sh-Data document, normally the User-Data of a UDA, SNA
 // or PNR. It returns ErrTooLarge, ErrDTD or an error wrapping ErrMalformed.
 func ParseData(data []byte) (*Data, error) {
-	data = withoutBOM(data)
-	if err := checkDocument(data); err != nil {
+	data = xmlsafe.WithoutBOM(data)
+	if err := document.Check(data); err != nil {
 		return nil, err
 	}
 	var w wireData
 	if err := xml.Unmarshal(data, &w); err != nil {
-		return nil, decodeError(err)
+		return nil, document.DecodeError(err)
 	}
 	d := &Data{}
 	if len(w.PublicIdentifiers) > 1 {
@@ -85,7 +87,7 @@ func ParseData(data []byte) (*Data, error) {
 		p := w.PublicIdentifiers[0]
 		d.PublicIdentifiers = &PublicIdentifiers{MSISDNs: p.MSISDN}
 		for _, id := range p.IMSPublicIdentity {
-			d.PublicIdentifiers.IMSPublicIdentities = append(d.PublicIdentifiers.IMSPublicIdentities, collapse(id))
+			d.PublicIdentifiers.IMSPublicIdentities = append(d.PublicIdentifiers.IMSPublicIdentities, xmlsafe.Collapse(id))
 		}
 	}
 	for i, r := range w.RepositoryData {
@@ -107,7 +109,7 @@ func readRepositoryData(w wireRepositoryData) (RepositoryData, error) {
 		return rd, fmt.Errorf("needs one ServiceIndication, one SequenceNumber and at most one ServiceData")
 	}
 	rd.ServiceIndication = w.ServiceIndication[0]
-	n, err := strconv.Atoi(collapse(w.SequenceNumber[0]))
+	n, err := strconv.Atoi(xmlsafe.Collapse(w.SequenceNumber[0]))
 	if err != nil || n < 0 || n > maxSequenceNumber {
 		return rd, fmt.Errorf("SequenceNumber is not an integer from 0 to %d", maxSequenceNumber)
 	}
@@ -126,19 +128,19 @@ func readRepositoryData(w wireRepositoryData) (RepositoryData, error) {
 func (d *Data) validate() error {
 	if p := d.PublicIdentifiers; p != nil {
 		for _, id := range p.IMSPublicIdentities {
-			if id == "" || id != collapse(id) || !isXMLText(id) {
+			if id == "" || id != xmlsafe.Collapse(id) || !xmlsafe.IsText(id) {
 				return fmt.Errorf("%w: IMSPublicIdentity is empty, has white space around it or characters XML cannot carry", ErrMalformed)
 			}
 		}
 		for _, n := range p.MSISDNs {
-			if !isXMLText(n) {
+			if !xmlsafe.IsText(n) {
 				return fmt.Errorf("%w: MSISDN has characters XML cannot carry", ErrMalformed)
 			}
 		}
 	}
 	for i, rd := range d.RepositoryData {
 		switch {
-		case !isXMLText(rd.ServiceIndication):
+		case !xmlsafe.IsText(rd.ServiceIndication):
 			return fmt.Errorf("%w: RepositoryData[%d]: ServiceIndication has characters XML cannot carry", ErrMalformed, i+1)
 		case rd.SequenceNumber < 0 || rd.SequenceNumber > maxSequenceNumber:
 			return fmt.Errorf("%w: RepositoryData[%d]: SequenceNumber is out of range", ErrMalformed, i+1)
@@ -170,7 +172,7 @@ func (d *Data) Marshal() ([]byte, error) {
 			// elements of its own to the document. Size and depth are
 			// checked on the whole document below.
 			wrapped := append(append([]byte("<ServiceData>"), rd.ServiceData.InnerXML...), "</ServiceData>"...)
-			if err := checkDocument(wrapped); err != nil {
+			if err := document.Check(wrapped); err != nil {
 				return nil, fmt.Errorf("RepositoryData[%d]: ServiceData: %w", i+1, err)
 			}
 			wr.ServiceData = []wireServiceData{{InnerXML: rd.ServiceData.InnerXML}}
@@ -188,7 +190,7 @@ func (d *Data) Marshal() ([]byte, error) {
 	// limit, and the depth limit at the depth ServiceData really sits at.
 	// Otherwise the HSS, or this AS reading its data back, would refuse
 	// what was written.
-	if err := checkDocument(out.Bytes()); err != nil {
+	if err := document.Check(out.Bytes()); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil

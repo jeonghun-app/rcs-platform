@@ -178,8 +178,11 @@ type Config struct {
 	// until the first message is complete, so a connection that never sends a
 	// message frees its MaxConnections slot quickly.
 	ReadTimeout time.Duration
-	// WriteTimeout bounds writing one message. A stream connection whose write
-	// fails or times out is closed, since part of a message may have been sent.
+	// WriteTimeout bounds writing each 32 KiB of a message to a stream
+	// connection, which makes it a throughput floor for a peer whose buffers
+	// are full (about 20 KiB/s at the default; see writeAll). A stream
+	// connection whose write fails or times out is closed, since part of a
+	// message may have been sent.
 	WriteTimeout time.Duration
 	// SendQueueBytes bounds what may wait to be written to one stream
 	// connection: a send waits for room, for at most WriteTimeout, while it is
