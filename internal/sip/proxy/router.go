@@ -64,8 +64,9 @@ func (r *Request) Initial() bool {
 // ends only what it was for: Route's and Serve's request is answered 500,
 // Prepare's branch fails with 500, OnBranchFailure adds no target, and a
 // final response whose OnFinal or OnResponse panicked is replaced by a 500,
-// a provisional one or a 2xx retransmission dropped. It is logged without
-// its value and counted (Config.Metrics, #428).
+// a provisional one or a 2xx retransmission dropped. It is counted
+// (Config.Metrics, #428), and logged without its value, at most once a
+// minute for each hook.
 type Router interface {
 	Route(ctx context.Context, r *Request) Decision
 }

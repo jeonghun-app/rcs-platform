@@ -140,6 +140,10 @@ type Proxy struct {
 	key     []byte
 	log     *slog.Logger
 	metrics Metrics
+	// panicLogs limits the log lines of each hook's panics; now is their
+	// clock.
+	panicLogs map[string]*everyMinute
+	now       func() time.Time
 	// ctx is the parent of every request's context; Close cancels it.
 	ctx  context.Context
 	stop context.CancelFunc
@@ -249,6 +253,8 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		key:       key,
 		log:       cfg.Logger,
 		metrics:   cfg.Metrics,
+		panicLogs: newPanicLogs(),
+		now:       time.Now,
 		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),

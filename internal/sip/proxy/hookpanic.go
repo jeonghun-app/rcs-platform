@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // MetricHookPanics counts the panics recovered from the hooks a service gives
@@ -33,6 +35,31 @@ func (p *Proxy) route(ctx context.Context, in *Request) Decision {
 	return dec
 }
 
+// hookNames are the hooks Proxy.hook runs, each logged at most once a
+// minute (everyMinute).
+var hookNames = []string{"Route", "Serve", "Prepare", "Resolve", "OnBranchFailure", "OnFinal", "OnResponse", "DrainAnswer"}
+
+// everyMinute allows one event a minute: a hook that panics on every request
+// logs one line a minute, as the counters give how many there were (code
+// review of #436; icscf's unknownLog does the same).
+type everyMinute struct{ last atomic.Int64 }
+
+func (e *everyMinute) allow(now time.Time) bool {
+	last := e.last.Load()
+	if last != 0 && now.UnixNano()-last < int64(time.Minute) {
+		return false
+	}
+	return e.last.CompareAndSwap(last, now.UnixNano())
+}
+
+func newPanicLogs() map[string]*everyMinute {
+	m := make(map[string]*everyMinute, len(hookNames))
+	for _, n := range hookNames {
+		m[n] = &everyMinute{}
+	}
+	return m
+}
+
 // maxPanicFrames bounds the frames logged for a hook's panic: enough to find
 // the hook, few enough for one line.
 const maxPanicFrames = 8
@@ -42,7 +69,8 @@ const maxPanicFrames = 8
 // returned. A panic in it is recovered here, on the hook's goroutine, so that
 // it ends only the request, branch or response the hook was for: the caller
 // answers or drops that as it would after the hook's error. The panic is
-// logged, without its value, which may hold message content, and counted.
+// counted, and logged without its value, which may hold message content, at
+// most once a minute for each hook.
 //
 // The proxy calls no hook with a lock of its own held, so none is left held.
 // A hook that panics while it holds a lock of the service's still leaves that
@@ -62,6 +90,9 @@ func (p *Proxy) hookPanicked(name string, v any) {
 	p.stats.hookPanics.Add(1)
 	if p.metrics != nil {
 		p.metrics.Count(MetricHookPanics, 1)
+	}
+	if l := p.panicLogs[name]; l != nil && !l.allow(p.now()) {
+		return
 	}
 	p.log.Error("proxy: a service hook panicked",
 		slog.String("hook", name),

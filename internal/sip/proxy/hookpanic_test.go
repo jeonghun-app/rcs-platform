@@ -330,3 +330,33 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 		})
 	}
 }
+
+// A hook that panics on every request logs one line a minute, and counts
+// every panic (code review of #436).
+func TestAHookPanicIsLoggedOnceAMinute(t *testing.T) {
+	var logs lockedBuffer
+	h := newHarness(t, Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	now := time.Unix(1_800_000_000, 0)
+	h.p.now = func() time.Time { return now }
+	h.route(func(_ contextT, r *Request) Decision { panicWith(&r.Message.Header); return Decision{} })
+	send := func(n int) {
+		h.receive(request(t, "MESSAGE", "sip:bob@example.com",
+			"Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKup-"+itoa(n), "Call-ID: call-"+itoa(n)+"@192.0.2.10"))
+	}
+	lines := func() int { return strings.Count(logs.String(), "hook=Route") }
+	for n := range 3 {
+		send(n)
+	}
+	if lines() != 1 {
+		t.Errorf("%d lines for 3 panics within a minute, want 1:\n%s", lines(), logs.String())
+	}
+	now = now.Add(time.Minute)
+	send(3)
+	if lines() != 2 {
+		t.Errorf("%d lines once a minute has passed, want 2", lines())
+	}
+	if n := h.p.Stats().HookPanics; n != 4 {
+		t.Errorf("HookPanics = %d, want 4", n)
+	}
+	check(t, "upstream", h.upstream(), codes(500, 500, 500, 500))
+}
