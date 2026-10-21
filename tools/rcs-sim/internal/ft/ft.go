@@ -461,9 +461,15 @@ var ErrNothingHeld = errors.New("ft: the server holds nothing of the upload")
 var ErrNotSettled = errors.New("ft: the server is still storing the broken upload")
 
 // Settled says how SettledUploadInfo got its answer: how often it asked
-// again, and how many answers were 404.
+// again, how many answers were 404, and Showed: how long after the call
+// the request was sent that first got the bytes held it settled on. That
+// is how long the server took to show what it keeps of a broken upload,
+// apart from how long its answers take, which a loaded host stretches:
+// a server that held them at once shows them to the first request,
+// however slowly it answers (#286).
 type Settled struct {
 	Retries, NotHeld int64
+	Showed           time.Duration
 }
 
 // SettledUploadInfo is the simulator's own wait, not rcsjta's. A device
@@ -488,7 +494,8 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 	if now == nil {
 		now = time.Now
 	}
-	deadline := now().Add(within)
+	start := now()
+	deadline := start.Add(within)
 	last := int64(-1)
 	var since time.Time
 	for {
@@ -508,6 +515,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 		}
 		if held != last {
 			last, since = held, asked
+			st.Showed = since.Sub(start)
 		}
 		if now().After(deadline) {
 			if err == nil {

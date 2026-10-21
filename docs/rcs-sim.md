@@ -74,15 +74,18 @@ resuming from a value that has not settled. Two equal answers in a row were not 
 503 (#77). Nothing in the upload-info document says the upload is released.
 Its lease runs for minutes when the process holding it has gone, so waiting
 for it is no option. The 300 ms stand for the time a device takes to come back
-on a network. The step reports how often it asked again (`retries`) and how
-many of those answers were 404 (`not_held`).
+on a network. The step reports how often it asked again (`retries`), how
+many of those answers were 404 (`not_held`), and how long after the step
+began it sent the request that first got the bytes it settled on
+(`showed_ms`): the time the server took to show what it keeps.
 
-`make e2e` asserts that `get_upload_info` took at most 2 s, its quiet time
-included. It also asserts that `ft-resume` resumed rather than uploading again,
+`make e2e` asserts that `showed_ms` is at most 2 s. It also asserts that `ft-resume` resumed rather than uploading again,
 and that `busy_retries` is 0 on every step. So a server that is slow to keep a
-broken upload, or busy on an idle stack, fails the run. The bound is on
-elapsed time rather than on the number of answers, so a loaded host that
-answers slowly keeps the margin.
+broken upload, or busy on an idle stack, fails the run. The bound is on time
+rather than on the number of answers, so a loaded host that answers slowly
+keeps the margin, and on the time until the parts showed rather than the
+step's whole time, which the answers' own slowness and the quiet time's
+confirmation stretch to seconds on a loaded host (#286).
 
 The chat client connects actively, as a device behind NAT does: over TLS for
 an `msrps:` path, plain for `msrp:`. It binds the session with a bodiless SEND
@@ -293,7 +296,7 @@ the flag or variable, never its value.
 One JSON line per step on standard output:
 
 ```json
-{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2}}
+{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2,"showed_ms":104}}
 {"scenario":"chat-core-originated","step":"keep-alive","ok":true,"ms":1500,"detail":{"bytes_while_quiet":514}}
 ```
 
