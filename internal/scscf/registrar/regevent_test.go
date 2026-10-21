@@ -203,3 +203,51 @@ func TestAnRTRsEndOutlivesAStoreFailureAndAStop(t *testing.T) {
 		t.Errorf("%d subscriptions left", len(subs))
 	}
 }
+
+// TestAnRTRsEndTheSweepFinishesSaysRejected (#334): an RTR
+// PERMANENT_TERMINATION whose subscriptions cannot be listed leaves the
+// record under a lease; the sweep after it tells the subscribers the
+// registrations were rejected, as the RTR would have.
+func TestAnRTRsEndTheSweepFinishesSaysRejected(t *testing.T) {
+	for name, c := range map[string]struct {
+		code   cx.ReasonCode
+		reason string
+	}{
+		"for good":         {cx.PermanentTermination, "rejected"},
+		"for a new S-CSCF": {cx.NewServerAssigned, "deactivated"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			g, n, s := withNotifier(t, e)
+			registered(t, e, g, 600, impu1)
+			n.Wait()
+			subscribeAsPCSCF(t, n)
+			k := s.count()
+			ts := &troubledStore{Store: e.store, listFails: 1 << 10}
+			u, _ := sip.ParseURI("sip:scscf." + realm)
+			failing, err := regevent.New(regevent.Config{Store: ts, Sender: s, Contact: u, Now: e.clock.Now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rtr := &cx.RTR{UserName: impi1, DeregistrationReason: cx.DeregistrationReason{Code: c.code}}
+			wantResult(t, e.instance(2, func(cfg *Config) { cfg.Events = failing }).HandleRTR(bg, rtr), resultSuccess)
+			if lease, err := regOf(e, impu1); err != nil || lease.Rejected != (c.reason == "rejected") {
+				t.Fatalf("lease %+v, %v", lease, err)
+			}
+			e.clock.advance(2 * time.Minute)
+			if _, err := g.Sweep(bg, 10); err != nil {
+				t.Fatal(err)
+			}
+			n.Wait()
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if len(s.sent) != k+1 {
+				t.Fatalf("%d NOTIFYs after the sweep", len(s.sent)-k)
+			}
+			ss, _ := s.sent[k].Header.SubscriptionState()
+			if r, _ := ss.Params.Get("reason"); ss.State != "terminated" || r != c.reason {
+				t.Errorf("Subscription-State %s;reason=%s, want terminated;reason=%s", ss.State, r, c.reason)
+			}
+		})
+	}
+}
