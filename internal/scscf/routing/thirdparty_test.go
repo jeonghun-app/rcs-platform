@@ -322,7 +322,9 @@ func TestRegistrationsPastAServersQueueAreDropped(t *testing.T) {
 func TestOneSetsQueueLeavesRoomForOthers(t *testing.T) {
 	e := newEnv(t)
 	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
-	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 8)}
+	// Room for every send, so that a queue past its bound fails the test
+	// rather than blocks it.
+	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 2*DefaultMaxThirdParty)}
 	rt := e.router(nil, withSender(s))
 	for range DefaultMaxThirdParty {
 		rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
