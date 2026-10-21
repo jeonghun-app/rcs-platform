@@ -424,7 +424,10 @@ func TestAGapInTheVersionsSendsTheFullRoster(t *testing.T) {
 }
 
 // A NOTIFY the subscriber refuses ends the subscription without another
-// (RFC 6665 §4.2.2).
+// (RFC 6665 §4.2.2), from its answer on, not from the removal that follows
+// under the subscription's lock (#423): the test holds that removal back
+// while carol's rejoin changes the roster, and the change must send
+// nothing. Each outcome shows: the NOTIFY, or the count of one not sent.
 func TestARefusedNotifyEndsTheSubscription(t *testing.T) {
 	g := newGroupRig(t, bob, carol)
 	g.subscribe(t, alice, "600")
@@ -436,10 +439,29 @@ func TestARefusedNotifyEndsTheSubscription(t *testing.T) {
 		}
 		return 200
 	})
+	hold := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(func() { refusalTakesLock.Store(nil); release() })
+	wait := func() { <-hold }
+	refusalTakesLock.Store(&wait)
 	g.rejoin(t, bob)
 	g.nextNotify(t)
-	waitUntil(t, "the subscription removed", func() bool { return g.metrics.get("sip.subscription.notify_failed") == 1 })
+	waitUntil(t, "the refusal", func() bool { return g.metrics.get("sip.subscription.notify_failed") == 1 })
 	g.rejoin(t, carol)
+	deadline := time.After(waitFor)
+	for g.metrics.get("sip.subscription.notify_after_refusal") == 0 {
+		select {
+		case req := <-g.core.got:
+			if req.Method == "NOTIFY" {
+				t.Fatalf("after a refused NOTIFY: a NOTIFY %q", req.Header.Get("Subscription-State"))
+			}
+		case <-deadline:
+			t.Fatal("carol's rejoin neither sent a NOTIFY nor dropped one")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	release()
 	g.noNotify(t, "after a refused NOTIFY")
 }
 

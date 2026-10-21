@@ -518,6 +518,7 @@ func (sub *subscription) end(reason string) <-chan struct{} {
 func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan struct{} {
 	if sub.refused.Load() {
 		// The subscriber has said the subscription is gone.
+		sub.s.cfg.Metrics.Count("sip.subscription.notify_after_refusal", 1)
 		return closedChan
 	}
 	contentType := ""
@@ -541,6 +542,9 @@ func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan 
 		}
 		sub.s.cfg.Metrics.Count("sip.subscription.notify_failed", 1)
 		go func() {
+			if hold := refusalTakesLock.Load(); hold != nil {
+				(*hold)()
+			}
 			sub.mu.Lock()
 			defer sub.mu.Unlock()
 			switch {
@@ -558,6 +562,12 @@ func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan 
 		}()
 	})
 }
+
+// refusalTakesLock, empty but in tests, runs as the answer to a failed
+// NOTIFY goes to take the subscription's lock to remove or mark it: a test
+// holds it there to show that nothing waits on the removal (#423). It is
+// atomic since such a goroutine may outlive the test that set it.
+var refusalTakesLock atomic.Pointer[func()]
 
 // endsSubscription reports a final answer to a NOTIFY that ends its
 // subscription: those of RFC 6665 §4.2.2, and 430 (RFC 5626 §5.3.2).
