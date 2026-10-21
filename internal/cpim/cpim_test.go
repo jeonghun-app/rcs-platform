@@ -370,7 +370,9 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
+	start := time.Now()
 	m, err := l.Parse(data)
+	first := time.Since(start)
 	runtime.ReadMemStats(&after)
 	if err != nil {
 		t.Fatal(err)
@@ -378,8 +380,10 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	if n := len(m.ContentType()); n < DefaultMaxSize/2 {
 		t.Fatalf("ContentType is only %d bytes; the input did not exercise folding", n)
 	}
+	// A parse that copies costs time too; once its allocations say so,
+	// timing it more only makes the failure slow to come (code review).
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8*uint64(len(data)) {
-		t.Errorf("parsing %d bytes allocated %d bytes", len(data), allocated)
+		t.Fatalf("parsing %d bytes allocated %d bytes", len(data), allocated)
 	}
 	if raceEnabled {
 		return
@@ -394,6 +398,13 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 		}
 		return time.Since(start)
 	}
+	// Far past anything load does to two timings that last about as long,
+	// the first parse alone fails the test, without parsing the whole
+	// input fifteen times more at quadratic cost (code review).
+	const bound, farPast = 8, 4 * 8
+	if base := parse(small, 64); first > farPast*base {
+		t.Fatalf("parsing %d bytes once took %v, a 64th of it 64 times %v: not linear", len(data), first, base)
+	}
 	var smallTime, largeTime time.Duration
 	for range 3 {
 		smallTime, largeTime = time.Duration(1<<62), time.Duration(1<<62)
@@ -401,7 +412,7 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 			smallTime = min(smallTime, parse(small, 64))
 			largeTime = min(largeTime, parse(data, 1))
 		}
-		if largeTime <= 8*smallTime {
+		if largeTime <= bound*smallTime {
 			return
 		}
 	}
