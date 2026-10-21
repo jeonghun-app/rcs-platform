@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
@@ -80,6 +81,11 @@ type subscription struct {
 	// that ran first knows it.
 	armed uint64
 	ended bool
+	// refused is set by the answer to a NOTIFY that ends the subscription,
+	// on the transaction's goroutine, before the subscription is removed
+	// under mu: from then on no NOTIFY goes, though a change may come in
+	// between (RFC 6665 §4.2.2, #423).
+	refused atomic.Bool
 }
 
 func (sub *subscription) key() string { return sub.group + "\x00" + sub.user }
@@ -510,6 +516,10 @@ func (sub *subscription) end(reason string) <-chan struct{} {
 // next change brings it the full roster. What it returns is closed once
 // the NOTIFY is answered, or was not sent.
 func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan struct{} {
+	if sub.refused.Load() {
+		// The subscriber has said the subscription is gone.
+		return closedChan
+	}
 	contentType := ""
 	if len(doc) > 0 {
 		contentType = conference.ContentType
@@ -525,6 +535,10 @@ func (sub *subscription) notify(state sip.SubscriptionState, doc []byte) <-chan 
 			return
 		}
 		gone := errors.Is(err, transaction.ErrTimeout) || err == nil && endsSubscription(res.StatusCode)
+		if gone {
+			// At once, before the removal below gets mu.
+			sub.refused.Store(true)
+		}
 		sub.s.cfg.Metrics.Count("sip.subscription.notify_failed", 1)
 		go func() {
 			sub.mu.Lock()
