@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,10 @@ func TestRegisterAnswersFollowTheMappingTable(t *testing.T) {
 			if names := g.metrics.names(); !slices.Contains(names, tc.metric) {
 				t.Errorf("metrics %v lack %s", names, tc.metric)
 			}
+			// QA of #274: a 480 is counted by its kind as well.
+			if tc.want == retry && g.metrics.counts["icscf.register.480"] != 1 {
+				t.Errorf("icscf.register.480 counted %d, want 1", g.metrics.counts["icscf.register.480"])
+			}
 		})
 	}
 }
@@ -122,6 +127,28 @@ func TestRegisterSendsTheUsernameOfItsDigestCredentials(t *testing.T) {
 		`Authorization: Digest username="`+impi1+`", realm="`+home+`", nonce="", uri="sip:`+home+`", response=""`))
 	if got := g.hss.lastUAR(t).UserName; got != impi1 {
 		t.Errorf("User-Name = %q, want %q", got, impi1)
+	}
+}
+
+// QA of #274: with credentials for several realms, the home realm's give
+// the User-Name, as scscf takes them; with only another realm's, the IMPI
+// is derived from the IMPU as without any.
+func TestRegisterTakesTheCredentialsOfTheHomeRealm(t *testing.T) {
+	other := `Authorization: Digest username="other@visited.example.net", realm="visited.example.net", nonce="", uri="sip:` + home + `", response=""`
+	ours := `Authorization: Digest username="` + impi1 + `", realm="` + home + `", nonce="", uri="sip:` + home + `", response=""`
+	for _, tc := range []struct {
+		name   string
+		fields []string
+		want   string
+	}{
+		{"another realm first", []string{other, ours}, impi1},
+		{"only another realm", []string{other}, strings.TrimPrefix(impu1, "sip:")},
+	} {
+		g := newRig(t)
+		g.route(register(t, tc.fields...))
+		if got := g.hss.lastUAR(t).UserName; got != tc.want {
+			t.Errorf("%s: User-Name = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -171,6 +198,8 @@ func TestRegisterNamesTheVisitedNetworkTheProxyCSCFInserted(t *testing.T) {
 		{`P-Visited-Network-ID: "Visited Network 1", other.example`, "Visited Network 1"},
 		{"P-Visited-Network-ID: visited.example;x=1", "visited.example"},
 		{"P-Visited-Network-ID: ,,,", home},
+		// QA of #274: an empty first value is no network.
+		{`P-Visited-Network-ID: "", other.example`, home},
 	}
 	for _, tc := range cases {
 		g := newRig(t)
