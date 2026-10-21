@@ -378,8 +378,10 @@ type Origin struct {
 	Identities []string
 	// Recipient is the identity the message is for.
 	Recipient string
-	// Conversation is empty for a notification that came without the
-	// conversation headers, as pager-mode ones do.
+	// Conversation is empty when the request came without the
+	// conversation headers, as rcsjta's pager-mode messages and
+	// notifications do. Its ID may be empty beside a Contribution-ID
+	// (ParseConversationHeaders), and the engine fills it in.
 	Conversation Conversation
 	Mode         store.Mode
 	// Pager marks a message that arrived in a SIP MESSAGE, which must fit
@@ -444,6 +446,11 @@ func (e *Engine) submit(ctx context.Context, o Origin) error {
 	}
 	if !namesSender(m.From.URI, o.Sender, o.Identities, e.cfg.HomeDomain) {
 		return reject(ReasonFromMismatch, nil)
+	}
+	if c := &o.Conversation; c.ID == "" && c.Contribution != "" {
+		// rcs-as delivers it, and a sender must name the conversation
+		// (OMA CPM Appendix C.1.1): the pair's, so that it threads.
+		c.ID = PairConversationID(o.Sender, o.Recipient)
 	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 	defer cancel()

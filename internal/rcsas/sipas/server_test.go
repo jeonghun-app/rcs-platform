@@ -247,13 +247,11 @@ func (d deliverer) Invite(ctx context.Context, v messaging.Invitation) error {
 }
 
 // #298: a pager MESSAGE as rcsjta sends it, without conversation headers,
-// or as a client that names only its Contribution-ID, is taken, and the
-// stored message goes on with a Contribution-ID and no Conversation-ID
-// made up for it.
+// or as a client that names only its Contribution-ID, is taken; the engine
+// gives the latter its pair's Conversation-ID (conversation_test.go).
 func TestAPagerMessageWithoutAConversationIDIsTaken(t *testing.T) {
 	e := &fakeEngine{}
-	core := newFakeCore(t)
-	a := startAS(t, e, core)
+	a := startAS(t, e, newFakeCore(t))
 	p := a.dial(t)
 	plain := pager(cpimBody("m1", "hi"))
 	contribution := pager(cpimBody("m2", "hi"))
@@ -267,13 +265,5 @@ func TestAPagerMessageWithoutAConversationIDIsTaken(t *testing.T) {
 	if len(got) != 2 || got[0].Conversation != (messaging.Conversation{}) ||
 		got[1].Conversation != (messaging.Conversation{Contribution: "c0ntr1"}) {
 		t.Fatalf("origins %+v", got)
-	}
-	d := delivery()
-	d.Conversation = got[1].Conversation
-	if err := a.srv.Pager(t.Context(), d); err != nil {
-		t.Fatal(err)
-	}
-	if req := core.next(t); req.Header.Get("Contribution-ID") != "c0ntr1" || req.Header.Has("Conversation-ID") {
-		t.Fatalf("MESSAGE with Contribution-ID %q, Conversation-ID %q", req.Header.Get("Contribution-ID"), req.Header.Get("Conversation-ID"))
 	}
 }

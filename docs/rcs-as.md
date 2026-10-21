@@ -54,16 +54,20 @@ The SIP layer implements `Deliverer`:
   header the network vouches for.
 
 The SIP layer reads the `Conversation-ID`, `Contribution-ID` and
-`InReplyTo-Contribution-ID` headers with `ParseConversationHeaders`.
-rcsjta sends pager-mode messages and notifications without them, which gives
-an empty `Conversation`, and a `Contribution-ID` without a `Conversation-ID`
-with an INVITE, which is taken as it is (#298): a `Conversation-ID` made up
-for each request would put the messages of one conversation in different
-ones. A `Conversation-ID` or an `InReplyTo-Contribution-ID` without a
-`Contribution-ID` is refused (400). The SIP layer must give `Origin.Sender` the identity the
-network asserted, never one the client chose. It must name each user in one
-canonical form, since the queue and the sent-message records are keyed by
-that string.
+`InReplyTo-Contribution-ID` headers with `ParseConversationHeaders`. rcsjta
+sends pager-mode messages and notifications without them, which gives an
+empty `Conversation`. A `Conversation-ID` or an `InReplyTo-Contribution-ID`
+without a `Contribution-ID` is refused (400). OMA CPM requires a sender to
+include `Conversation-ID` (Conversation Functions, Appendix C.1.1), but
+rcsjta, a pre-CPM client, sends a `Contribution-ID` alone with its INVITEs.
+rcs-as takes that as a leniency (#298): the engine gives such a 1-to-1
+message the pair's `Conversation-ID`, a name-based UUID of the two users'
+keys in sorted order (`PairConversationID`), so that every message between
+them, either way, threads together, and delivers it with that ID, as the
+sender C.1.1 asks it to be. The SIP layer must give `Origin.Sender` the
+identity the network asserted, never one the client chose. It must name each
+user in one canonical form, since the queue and the sent-message records are
+keyed by that string.
 
 Legs offer and answer with `AcceptTypes(mode)`:
 
@@ -168,7 +172,7 @@ set.
 | not `message/cpim` | 415, with `Accept: message/cpim` |
 | no asserted identity, or not as above | 403 |
 | a Request-URI that names no user | 404 |
-| unreadable `Conversation-ID` or `Contribution-ID` | 400 |
+| unreadable `Conversation-ID` or `Contribution-ID`, or either of `Conversation-ID` and `InReplyTo-Contribution-ID` without a `Contribution-ID` | 400 |
 | refused for its size / type / syntax (`Rejection`) | 413 / 415 / 400; the 415 without `Accept`, since the client sent `message/cpim` already |
 | any other refusal (rates, queue full, forged or unrequested notification, ...) | 403 |
 | the store busy after its retries (`store.ErrBusy`) | 500 with `Retry-After: 1` |
@@ -248,7 +252,7 @@ A client's INVITE (the originating session):
 | none of the chat ICSI, the OMA SIMPLE IM tag `+g.oma.sip-im` (with which rcsjta, the reference client, asks for a chat) or the large-mode ICSI in `Accept-Contact`, `P-Asserted-Service` or `P-Preferred-Service`; or an offer with `a=file-selector` (RFC 5547 §6), a file transfer, which rcsjta asks for with the same `+g.oma.sip-im` tag. File transfer is not served here | 403 |
 | no asserted identity, or not as for MESSAGE | 403 |
 | a Request-URI that names no user | 404 |
-| unreadable `Conversation-ID` or `Contribution-ID` | 400 |
+| unreadable `Conversation-ID` or `Contribution-ID`, or either of `Conversation-ID` and `InReplyTo-Contribution-ID` without a `Contribution-ID` | 400 |
 | `Session-Expires` below 90 s from a client with `Supported: timer` | 422 with `Min-SE: 90` (RFC 4028 §6); a client without the extension, which could not act on a 422, gets no timer instead |
 | a body that is not an SDP offer, or a `multipart/mixed` one other than one SDP part and at most one `message/cpim` part (a group INVITE's resource list, two descriptions, a nested multipart); no offer (a late offer); no MSRP line; an offer of `passive` (RFC 6135 §4.2.2); no type in common; a first message in a large-mode INVITE | 488 |
 | a first message the engine refuses | as a pager MESSAGE's (413, 415, 400, 403, 500 with `Retry-After: 1`), and no session; the session's place is given back |
@@ -1059,7 +1063,11 @@ Signals to alarm on (Phase 7):
 
 - **Conversation identifiers.** RCC.07 gives no grammar for them beyond SIP,
   so each must be one RFC 3261 token of at most 256 characters. Clients
-  generate UUIDs or hex strings.
+  generate UUIDs or hex strings. A request with a `Contribution-ID` and no
+  `Conversation-ID`, as rcsjta sends, is taken although OMA CPM Appendix
+  C.1.1 requires the latter, and gets the pair's (above). A group's
+  Conversation-ID, made when none is given, is 32 hex digits rather than
+  the UUID form C.1.1 asks for (#305).
 - **Legs are per task.** A message is delivered on a leg of the task that
   works on its queue. That holds for the B2BUA model, where both legs of a
   chat live on the task whose instance address the SIP dialog names (ADR
