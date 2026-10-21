@@ -723,6 +723,8 @@ func TestPeerThatNeverReadsFailsTheWaitingSendAndIsClosedByTheWriter(t *testing.
 	t.Cleanup(func() { peer.Close() })
 	conn := &stalledConn{Conn: server, writing: make(chan time.Time, 1), deadline: make(chan struct{}), closed: make(chan struct{})}
 	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, WriteTimeout: time.Hour, SendQueueBytes: 1000})
+	// Before the transport's Close, which waits for the writer (QA of #330).
+	t.Cleanup(conn.release)
 	listen(t, tr, ListenerConfig{Network: TCP})
 	q := &queueTest{t: t, tr: tr}
 	if err := q.send(); err != nil {
@@ -776,9 +778,12 @@ type stalledConn struct {
 }
 
 func (c *stalledConn) Close() error {
-	c.once.Do(func() { close(c.closed) })
+	c.release()
 	return c.Conn.Close()
 }
+
+// release lets a blocked Write return; it may be called more than once.
+func (c *stalledConn) release() { c.once.Do(func() { close(c.closed) }) }
 
 func (c *stalledConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
