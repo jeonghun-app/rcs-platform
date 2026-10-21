@@ -160,8 +160,14 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 	g := c.Group
 	if c.GroupsTable != "groupchats" || g.ConferenceHost != "conf.ims.example.net" || g.MaxParticipants != 100 ||
 		g.IdleTTL != 30*24*time.Hour || g.SenderRate.PerMinute != 60 || g.FanoutRate.PerMinute != 6000 || g.FanoutRate.Burst != 3960 || g.AddRate.PerMinute != 30 ||
-		g.AddRate.Burst != 100 || g.CreateRate.Burst != 10 {
-		t.Fatalf("defaults %+v", c.Group)
+		g.AddRate.Burst != 100 || g.CreateRate.Burst != 10 || g.HomeDomain != "ims.mnc001.mcc001.3gppnetwork.org" ||
+		c.ConferenceFactory.String() != "sip:conf-factory@ims.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("defaults %+v, factory %v", c.Group, c.ConferenceFactory)
+	}
+	// One spelling of the conference host, as the group writes its URIs
+	// and the SIP layer compares them (QA on #279).
+	if c, err := configure(with(devEnv, "RCSAS_CONFERENCE_HOST", "Conf.IMS.example.net.")); err != nil || c.Group.ConferenceHost != "conf.ims.example.net" {
+		t.Fatalf("conference host %q, %v", c.Group.ConferenceHost, err)
 	}
 	// The largest groups take a larger add burst by default.
 	if c, err := configure(with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "200")); err != nil || c.Group.AddRate.Burst != 199 ||
@@ -171,12 +177,13 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 	c, err = configure(with(devEnv, "RCSAS_GROUPCHATS_TABLE", "rcs-groups", "RCSAS_GROUP_MAX_PARTICIPANTS", "20",
 		"RCSAS_GROUP_IDLE_TTL", "240h", "RCSAS_GROUP_SENDER_RATE", "10", "RCSAS_GROUP_SENDER_BURST", "3",
 		"RCSAS_GROUP_FANOUT_RATE", "0", "RCSAS_GROUP_ADD_RATE", "5", "RCSAS_GROUP_ADD_BURST", "19",
-		"RCSAS_GROUP_CREATE_RATE", "1", "RCSAS_GROUP_CREATE_BURST", "1"))
+		"RCSAS_GROUP_CREATE_RATE", "1", "RCSAS_GROUP_CREATE_BURST", "1",
+		"RCSAS_CONFERENCE_FACTORY_URI", "sip:Factory@conf.ims.example.net"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	g = c.Group
-	if c.GroupsTable != "rcs-groups" || g.MaxParticipants != 20 || g.IdleTTL != 240*time.Hour || g.SenderRate.Burst != 3 ||
+	if c.GroupsTable != "rcs-groups" || c.ConferenceFactory.String() != "sip:Factory@conf.ims.example.net" || g.MaxParticipants != 20 || g.IdleTTL != 240*time.Hour || g.SenderRate.Burst != 3 ||
 		g.FanoutRate.PerMinute >= 0 || g.AddRate.Burst != 19 || g.CreateRate.PerMinute != 1 {
 		t.Fatalf("settings %+v", c.Group)
 	}
@@ -184,14 +191,17 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		"no conference host":    {with(devEnv, "RCSAS_CONFERENCE_HOST", ""), "RCSAS_CONFERENCE_HOST"},
-		"no participants":       {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "0"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
-		"too many participants": {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "201", "RCSAS_GROUP_FANOUT_BURST", "1000"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
-		"no idle time":          {with(devEnv, "RCSAS_GROUP_IDLE_TTL", "0s"), "RCSAS_GROUP_IDLE_TTL"},
-		"a small fan-out":       {with(devEnv, "RCSAS_GROUP_FANOUT_BURST", "3959"), "RCSAS_GROUP_FANOUT_BURST"},
-		"a small add burst":     {with(devEnv, "RCSAS_GROUP_ADD_BURST", "98"), "RCSAS_GROUP_ADD_BURST"},
-		"a negative rate":       {with(devEnv, "RCSAS_GROUP_ADD_RATE", "-1"), "RCSAS_GROUP_ADD_RATE"},
-		"a negative burst":      {with(devEnv, "RCSAS_GROUP_CREATE_BURST", "-1"), "RCSAS_GROUP_CREATE_BURST"},
+		"no conference host":     {with(devEnv, "RCSAS_CONFERENCE_HOST", ""), "RCSAS_CONFERENCE_HOST"},
+		"the home domain":        {with(devEnv, "RCSAS_CONFERENCE_HOST", "IMS.mnc001.mcc001.3gppnetwork.org"), "RCSAS_CONFERENCE_HOST"},
+		"a factory with no user": {with(devEnv, "RCSAS_CONFERENCE_FACTORY_URI", "sip:conf.ims.example.net"), "RCSAS_CONFERENCE_FACTORY_URI"},
+		"a tel factory":          {with(devEnv, "RCSAS_CONFERENCE_FACTORY_URI", "tel:+15550100001"), "RCSAS_CONFERENCE_FACTORY_URI"},
+		"no participants":        {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "0"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
+		"too many participants":  {with(devEnv, "RCSAS_GROUP_MAX_PARTICIPANTS", "201", "RCSAS_GROUP_FANOUT_BURST", "1000"), "RCSAS_GROUP_MAX_PARTICIPANTS"},
+		"no idle time":           {with(devEnv, "RCSAS_GROUP_IDLE_TTL", "0s"), "RCSAS_GROUP_IDLE_TTL"},
+		"a small fan-out":        {with(devEnv, "RCSAS_GROUP_FANOUT_BURST", "3959"), "RCSAS_GROUP_FANOUT_BURST"},
+		"a small add burst":      {with(devEnv, "RCSAS_GROUP_ADD_BURST", "98"), "RCSAS_GROUP_ADD_BURST"},
+		"a negative rate":        {with(devEnv, "RCSAS_GROUP_ADD_RATE", "-1"), "RCSAS_GROUP_ADD_RATE"},
+		"a negative burst":       {with(devEnv, "RCSAS_GROUP_CREATE_BURST", "-1"), "RCSAS_GROUP_CREATE_BURST"},
 	} {
 		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v", name, err)
