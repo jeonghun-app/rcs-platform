@@ -586,6 +586,9 @@ func (c *Client) serveRTR(ctx context.Context, n *diameter.Node, from *diameter.
 		res = c.cfg.OnRTR(ctx, r)
 	}
 	c.metrics.Count("cxclient.RTR."+resultName(res), 1)
+	if err := protocolError(res); err != nil {
+		return nil, err
+	}
 	return (&cx.RTA{Answer: cx.Answer{Result: res}}).Message(n, req)
 }
 
@@ -605,7 +608,21 @@ func (c *Client) servePPR(ctx context.Context, n *diameter.Node, from *diameter.
 		res = c.cfg.OnPPR(ctx, r)
 	}
 	c.metrics.Count("cxclient.PPR."+resultName(res), 1)
+	if err := protocolError(res); err != nil {
+		return nil, err
+	}
 	return (&cx.PPA{Answer: cx.Answer{Result: res}}).Message(n, req)
+}
+
+// protocolError is res as the node answers a protocol error, with the E
+// bit and no command AVPs (RFC 6733 §7.2), for a 3xxx Result-Code such as
+// DIAMETER_TOO_BUSY, which the HSS sends to another peer; nil for any other
+// result. cx.Answer refuses to build one (#394 code review).
+func protocolError(res cx.Result) error {
+	if res.Vendor == 0 && diameter.IsProtocolError(res.Code) {
+		return &diameter.Error{ResultCode: res.Code}
+	}
+	return nil
 }
 
 // resultName is how a result appears in a metric name: the code, prefixed

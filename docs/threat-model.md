@@ -45,6 +45,12 @@ separate from its core listener; core SIP ports admit only platform services
 (ADR 0007 §2, §7). The same holds for `P-Served-User`, which also makes the
 default profile skip `rcs-as` (docs/hss.md): a client that could set it would send
 messages that bypass `rcs-as` and its checks (T10), so `pcscf` must strip it.
+`scscf` reads it only on a terminating request that did not come from a
+`pcscf` core listener, removes the one it inserted toward application servers
+before the request leaves for the terminating side or a contact, and carries
+a request's place in the iFC chain back from a server only in a Route
+parameter it signed (HMAC over the position, the Call-ID and an expiry, ADR
+0005), refusing any other with 403 (#14).
 **Status:** planned (#16, Phase 7 infrastructure).
 **Residual risk (accepted, #208, narrowed in #221):** `pcscf` checks
 in-dialog requests against its own Record-Route values only, keeping no
@@ -63,9 +69,22 @@ as long as the flow lives, but not reach the client with any other. `pcscf` fixe
 client's in-dialog request, to `scscf`; whether such requests then reach
 `rcs-as`, which records itself in the dialog, depends on `scscf`, which
 checks it as an acceptance criterion of
-[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
-mitigation is a dialog-state check in `scscf`, such as a signed
-Record-Route parameter it verifies.
+[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). `scscf`
+signs its own Record-Route value when it sets up a dialog: a key ID and a MAC,
+under a key every `scscf` task shares (current and previous, for rotation),
+over the Call-ID, its name and each of the dialog's hops next to it (scheme,
+user, host, port, transport). It sends a request inside a dialog on only to
+a hop that value signs, at a `pcscf` core port or an application server's
+port, and never to itself (`internal/scscf/routing`, #322); a client that
+names any other core address, or drops an application server's entry from
+its route set, gets 403. No host or subnet list is involved: every core task
+shares the private subnets, and task addresses change. `scscf` records, and
+signs, only requests that set up a dialog (INVITE, SUBSCRIBE, REFER), which
+`pcscf` record-routes too, so the hop toward a client is always `pcscf`'s
+value; the sender's Contact stands in only for a core service that records
+no route, as `rcs-as` does for the requests it sends for its users. As with `pcscf`'s
+value, the binding covers the Call-ID and not the tags, so a peer can go on
+sending to the dialog's own hops with that Call-ID after the call has ended.
 The client's in-dialog requests are checked against the same MAC, so a
 client cannot change the icid its dialog's requests are charged to (review
 of #221; this closes the #208 residual risk that it could).
@@ -116,7 +135,7 @@ compromised, its reach is what its security group and tokens allow:
 
 | Service | Implemented in the service | Planned |
 |---|---|---|
-| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, and each listener's connections limited from accept, the PROXY header and TLS handshake included, so the core listener keeps its room (#193); registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to `scscf`'s service name alone and never back into the task; a request from the core only over the client flow of this task its Route names, else 430; the reg event: a NOTIFY only from the core, to a subscription's random Contact and in its dialog, acting only on that user's registrations on the task ([pcscf](pcscf.md)) | security groups (#56), a dialog-state check in `scscf` (T2 residual risk) |
+| `pcscf` | the listeners and edge rules: PROXY v2 required and plain TCP and UDP refused in staging and prod, the network-only headers removed from every client message, client flows limited per client (IPv4 address or IPv6 /64) and in total, and each listener's connections limited from accept, the PROXY header and TLS handshake included, so the core listener keeps its room (#193); registration, with the client's Path and Route dropped; a client's requests: outside a dialog only over a registered flow, along its Service-Route, with an identity its registration allows and a per-client rate; inside a dialog only along a route this `pcscf` recorded for that flow, to `scscf`'s service name alone and never back into the task; a request from the core only over the client flow of this task its Route names, else 430; the reg event: a NOTIFY only from the core, to a subscription's random Contact and in its dialog, acting only on that user's registrations on the task; MSRP anchored through `msrp-relay` with its token from Secrets Manager, at most two MSRP lines an offer, its bindings limited per client flow, apart for the client's offers and for `rcs-as`'s toward it, and per task, and those each creates in a minute, a body it cannot split in one way only refused, no core address shown to a client, and never end to end, a client's Record-Route not kept so that a BYE `pcscf` sends follows only the core's route ([pcscf](pcscf.md)); residual risk: the per-minute limit is per flow, so a client that opens many flows creates that many times as many bindings, which the flow limit per client address and the per-client rate of initial requests bound | security groups (#56), a dialog-state check in `scscf` (T2 residual risk) |
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |
@@ -172,6 +191,15 @@ user's own room; one sender has one large-mode session at a time with one
 recipient. In time, a leg that no msrp-relay connection binds within
 `RCSAS_ANSWER_TIMEOUT` is closed and its session ended, so a client that
 answers or offers and never connects cannot hold a place.
+`pcscf` bounds the `msrp-relay` bindings of each client flow by the side
+whose offer made them: the client's own offers
+(`PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_BINDINGS_PER_MINUTE`) and `rcs-as`'s
+toward it (`PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW`, at least
+`RCSAS_MAX_INCOMING_SESSIONS_PER_USER`, and
+`PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE`) each have their own room and rate,
+so that invitations sent to a user, answered or not, cannot keep the user
+from starting a chat; only the task's `PCSCF_MAX_BINDINGS` is shared
+(#315).
 
 ## T10 — Forged receipts, routes and floods through `rcs-as`
 
@@ -304,10 +332,31 @@ metadata.
     stranger cannot grow a group's stored item past DynamoDB's limit and
     break the group.
 - **Metrics.** None names a group or a participant.
+- **Chat identity.** RCS clients name a group chat by its Contribution-ID
+  (rcsjta's chat ID), which its creator chooses, and would take a new group
+  under a known ID for the old one. So a Contribution-ID names one live
+  group: the conference URI is made from it, and an INVITE to the factory
+  under an ID a live group has is refused (403) unless it is that group's
+  creator trying again before the group is established, which takes up the
+  same group (#279). A participant the chairman removed cannot make a group
+  that its former members' clients would merge into the one it was removed
+  from. An ended group frees its ID. Residual risk: once a group has ended,
+  anyone who knows its Contribution-ID can make a group under it first, and
+  a former member's restart under that ID then gets 403. The conference URI
+  is no secret from anyone who knows the ID, the group's participants; it
+  grants nothing, as every request to it is checked against the roster.
 - **Roster privacy.** The roster keeps former participants (up to the size
   limit), so a participant who joins later sees who was in the group before.
   This is accepted: it is how RFC 4575 rosters and RCS clients show who left.
   Only current participants read the roster.
+- **Invitee domains.** An invitee, in a new group's list or a REFER, may be
+  any SIP or tel URI: `rcs-as` does not restrict its domain. The focus's
+  INVITE always goes to the core (`RCSAS_CORE_URI`), never to the invitee's
+  host: the stored identity is canonical, without `maddr`, `transport` or
+  other parameters, and an invitee with a port or URI headers is refused
+  (400) or left out of a list. Residual risk: once the S-CSCF routes off-net (BGCF, NNI), a
+  participant can have the focus call a URI outside the network. Where an
+  invitee may be is decided with that routing (#337, #14 PR F).
 
 **Status:** implemented in `internal/rcsas/group` (#108). The SIP layer must:
 

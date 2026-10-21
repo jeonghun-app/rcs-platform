@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -35,6 +36,9 @@ var (
 	// ErrExhausted means a subscription's NOTIFY counters have reached their
 	// limit; the subscription must be ended.
 	ErrExhausted = errors.New("state: NOTIFY counters exhausted")
+	// ErrStale means a NOTIFY would number an older state than one already
+	// numbered, or follow the subscription's last; it is not sent.
+	ErrStale = errors.New("state: a later state was notified")
 	// ErrContended means a write lost to other writers on every attempt; the
 	// caller may try again later. It is not ErrConflict, which says what won.
 	ErrContended = errors.New("state: changed by others on every attempt")
@@ -134,6 +138,12 @@ type Registration struct {
 	// any sweep retries it. A registration without contacts is deleted once
 	// that has succeeded.
 	Deregistering time.Time
+	// Rejected is set on the lease (Deregistering) of a set an RTR ended
+	// for good (PERMANENT_TERMINATION) whose subscribers could not be told
+	// then: the sweep that finishes the deregistration tells them the
+	// registrations were rejected, not that they expired (#334). A
+	// REGISTER's record never has it.
+	Rejected bool
 	// Unregistered is set on the record of an unregistered user, which the
 	// S-CSCF stores after SAR UNREGISTERED_USER (TS 29.228 §6.1.2) so that
 	// later terminating requests reuse the set's profile instead of asking
@@ -151,9 +161,23 @@ type Registration struct {
 	// backing off and giving up by MaxReassertAttempts at the latest.
 	Reassert         time.Time
 	ReassertAttempts int
+	// RegisteredAs are the public identities in the To of the REGISTERs
+	// that registered the set's bindings, canonical, each once and each one
+	// of Identities, which the application servers were told of (TS 24.229
+	// §5.4.1.7): the end of the set is told of every one. Devices of one set
+	// may register different identities of it. It is empty in a record saved
+	// before it was kept, whose end names Key.IMPU.
+	RegisteredAs []string
+	// Tombstone marks a deregistration's lease that holds the key of a set
+	// that was already gone (registrar's undoIfEnded): nothing was
+	// registered under it, so its end tells the application servers
+	// nothing. It has no contacts, and Deregistering is set.
+	Tombstone bool
 	// Version is the stored version, 0 before the first save. Saves are
-	// conditional on it (optimistic concurrency). It is opaque: a new item
-	// starts at a random value (FirstVersion).
+	// conditional on it (optimistic concurrency). A new item starts at a
+	// random value (FirstVersion), and every save raises it, so of two reads
+	// of one record the later never has the lower version: NextNotify orders
+	// NOTIFYs by it.
 	Version int64
 }
 
@@ -171,8 +195,12 @@ type SetIdentity struct {
 // Identity is what one public identity names: the implicit registration set
 // it belongs to. Identities go before their record both ways. They are
 // written before a record with a new incarnation or new identities is saved,
-// the save being the commit point: one naming a record not saved (yet) is
-// as good as none, and its KeepUntil ends it. They are deleted with the set
+// the save being the commit point. One naming an incarnation of its set's
+// record that was not saved still finds the record, if the record lists the
+// identity, is live and is not being deregistered: the terminating lookup
+// uses it and repairs the item (internal/scscf/routing), and the set's next
+// REGISTER points it again; with no such record it is as good as none, and
+// its KeepUntil ends it. They are deleted with the set
 // before its record, so that a deregistration cut short is done again by a
 // sweep. A re-registration only keeps them (KeepIdentity), or repairs them.
 // An IMPU names one set: an IMPU shared by several private identities (TS
@@ -259,20 +287,26 @@ func (r *Registration) NextExpiry() time.Time {
 }
 
 // SweepAt is when a sweep next has something to do with r: its earliest
-// contact expiry, or a due Reassert if earlier, or, without contacts, when its
-// deregistration may be retried, or else when its unregistered state ends. A
+// contact expiry, or without contacts, when its deregistration may be
+// retried, or else when its unregistered state ends; a due Reassert if
+// earlier, but on a deregistration's lease, which ends the set anyway. A
 // registration with none of these is due at once.
 func (r *Registration) SweepAt() time.Time {
+	var at time.Time
 	switch {
 	case len(r.Contacts) > 0:
-		if next := r.NextExpiry(); r.Reassert.IsZero() || next.Before(r.Reassert) {
-			return next
-		}
-		return r.Reassert
+		at = r.NextExpiry()
 	case !r.Deregistering.IsZero():
 		return r.Deregistering
+	default:
+		at = r.Unregistered
 	}
-	return r.Unregistered
+	if !r.Reassert.IsZero() && r.Reassert.Before(at) {
+		// An unregistered user's record is reasserted too (#410 code
+		// review).
+		return r.Reassert
+	}
+	return at
 }
 
 // ReassertDue reports whether a sweep at now should tell the HSS again that
@@ -298,6 +332,7 @@ func (r *Registration) Prune(now time.Time) []Contact {
 func (r *Registration) Clone() *Registration {
 	c := *r
 	c.Identities = slices.Clone(r.Identities)
+	c.RegisteredAs = slices.Clone(r.RegisteredAs)
 	c.Contacts = make([]Contact, len(r.Contacts))
 	for i, ct := range r.Contacts {
 		ct.Path = slices.Clone(ct.Path)
@@ -340,11 +375,25 @@ func (r *Registration) Validate() error {
 		// without counting as a revival (Incarnation).
 		return fmt.Errorf("%w: a record claimed for a deregistration has contacts, or Deregistering is out of range", ErrInvalid)
 	}
+	if r.Rejected && r.Deregistering.IsZero() {
+		return fmt.Errorf("%w: Rejected is set on a record no deregistration holds", ErrInvalid)
+	}
 	if !r.Reassert.IsZero() && !validTime(r.Reassert) || r.ReassertAttempts < 0 || r.ReassertAttempts > MaxReassertAttempts {
 		return fmt.Errorf("%w: Reassert out of range", ErrInvalid)
 	}
 	if !r.Unregistered.IsZero() && (!validTime(r.Unregistered) || len(r.Contacts) > 0) {
 		return fmt.Errorf("%w: an unregistered user's record has contacts, or Unregistered is out of range", ErrInvalid)
+	}
+	if r.Tombstone && (len(r.Contacts) > 0 || r.Deregistering.IsZero()) {
+		return fmt.Errorf("%w: a tombstone has contacts or no lease", ErrInvalid)
+	}
+	if len(r.RegisteredAs) > MaxIdentities {
+		return fmt.Errorf("%w: more than %d identities in RegisteredAs", ErrInvalid, MaxIdentities)
+	}
+	for _, impu := range r.RegisteredAs {
+		if !canonicalIMPU(impu) {
+			return fmt.Errorf("%w: RegisteredAs holds an identity that is not a canonical public identity", ErrInvalid)
+		}
 	}
 	for _, c := range r.Contacts {
 		if c.URI == "" || !validTime(c.Expires) {
@@ -391,11 +440,11 @@ type Registrations interface {
 	// 29.228 §6.1.3). It is read through an index, which may miss one saved
 	// moments ago.
 	RegistrationsOf(ctx context.Context, impi string) ([]*Registration, error)
-	// SaveRegistration stores r and returns it with its new version. A
-	// Version of 0 creates it and fails with ErrExists if it exists; any
-	// other is conditional on that version and fails with ErrConflict if the
-	// stored one differs, which includes an item deleted and created again
-	// since r was read, or ErrNotFound if it is gone.
+	// SaveRegistration stores r and returns it with its new version, above
+	// r's. A Version of 0 creates it and fails with ErrExists if it exists;
+	// any other is conditional on that version and fails with ErrConflict if
+	// the stored one differs, which includes an item deleted and created
+	// again since r was read, or ErrNotFound if it is gone.
 	SaveRegistration(ctx context.Context, r *Registration) (*Registration, error)
 	// DeleteRegistration deletes r if its version is still the stored one
 	// (ErrConflict otherwise, ErrNotFound if gone).
@@ -714,6 +763,14 @@ type Challenges interface {
 	// instance counts into the same count, which is kept until expires. A
 	// resent request may count twice: that errs on the side of the limit.
 	CountAttempt(ctx context.Context, a Attempt, n int64, expires time.Time) (int64, error)
+	// ClaimODI records side, ODIReturned or ODIDefault, as the one that
+	// goes on with the request whose signed iFC position has scope
+	// (ODIScope), unless a side is recorded already and has not expired at
+	// now, and returns the side recorded, which is kept until expires.
+	// Every instance claims into the same record, and of concurrent claims
+	// one side is recorded. A resent request finds its own side, so a claim
+	// the store applied but whose answer was lost still goes on.
+	ClaimODI(ctx context.Context, scope, side string, now, expires time.Time) (string, error)
 }
 
 // ReservedNoncePrefix starts no challenge's nonce: the backends keep their
@@ -726,6 +783,15 @@ const ReservedNoncePrefix = "#"
 const (
 	AttemptChallenge = "challenge"
 	AttemptResync    = "resync"
+)
+
+// The sides of ClaimODI: a request's place in its iFC chain is taken up by
+// its return from the application server, as many times as the server sends
+// it back (TS 24.229 §5.4.3.2 NOTE 8), or by its default handling, which
+// passes the server over; never by both (routing, #14).
+const (
+	ODIReturned = "returned"
+	ODIDefault  = "default"
 )
 
 // Attempt names one count of CountAttempt: an IMPI's attempts of Kind in the
@@ -741,6 +807,14 @@ type Attempt struct {
 // and alphabet whatever the token holds.
 func FlowScope(token string) string {
 	sum := sha256.Sum256([]byte("scscf/attempt-flow|" + token))
+	return hex.EncodeToString(sum[:16])
+}
+
+// ODIScope is the ClaimODI scope of a signed iFC position: a digest, as
+// FlowScope's is, so that the claim needs no IMPI, which a request that
+// comes back after its user deregistered has none of.
+func ODIScope(odi string) string {
+	sum := sha256.Sum256([]byte("scscf/attempt-odi|" + odi))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -764,6 +838,19 @@ func ValidAttempt(a Attempt, n int64, expires time.Time) error {
 	return nil
 }
 
+// ValidODIClaim checks ClaimODI's arguments; the backends apply it.
+func ValidODIClaim(scope, side string, now, expires time.Time) error {
+	switch {
+	case !validScope(scope):
+		return fmt.Errorf("%w: an iFC position's scope is an ODIScope", ErrInvalid)
+	case side != ODIReturned && side != ODIDefault:
+		return fmt.Errorf("%w: unknown side of an iFC position", ErrInvalid)
+	case !validTime(now) || !expires.After(now):
+		return fmt.Errorf("%w: an iFC position's claim needs a time and a later expiry", ErrInvalid)
+	}
+	return nil
+}
+
 // Subscription is a subscription to the reg event package (RFC 3680) that the
 // S-CSCF, as notifier, serves: pcscf and the UA subscribe to the state of a
 // registration (TS 24.229 §5.4.2.1).
@@ -772,16 +859,41 @@ type Subscription struct {
 	ID string
 	// IMPU is the watched registration, in canonical form.
 	IMPU string
-	// Subscriber is the identity of the watcher.
+	// Set and Incarnation are the record of the set IMPU belonged to when
+	// the subscription was made: it watches that set alone, and ends when
+	// IMPU leaves it or the record goes, so that it never reports another
+	// set's state (#256 security review).
+	Set         SetKey
+	Incarnation int64
+	// Subscriber is the identity of the watcher, and Kind what it is: the
+	// P-CSCF (SubscriberPCSCF), whose identity is the Path of a binding of
+	// the set, or the UE (SubscriberUE), one of the set's identities.
 	Subscriber string
-	Dialog     Dialog
-	// Expires is when the subscription ends. A Terminated one is deleted by
-	// the first sweep after it; whoever terminates a subscription sets it a
-	// little ahead (TerminatedGrace) to send its final NOTIFY first.
+	Kind       string
+	// Binding is, for a UE, the binding key of the UE's own binding
+	// (regevent), "" if none matched: the subscription ends with it.
+	Binding string
+	// EventID is the id parameter of the SUBSCRIBE's Event, which every
+	// NOTIFY carries back (RFC 6665 §4.5.2).
+	EventID string
+	Dialog  Dialog
+	// Expires is when the subscription ends. Whoever terminates a
+	// subscription sets it a little ahead, to send its final NOTIFY first;
+	// a sweep after it hands the subscription over again
+	// (SweepSubscriptions), to send that NOTIFY, or send it again.
 	Expires time.Time
-	// Terminated marks a subscription that has ended and is about to be
-	// deleted; a sweep sets it to claim the subscription's final NOTIFY.
+	// Terminated marks a subscription that has ended and is deleted once
+	// its final NOTIFY is answered, or given up; a sweep sets it to claim
+	// that NOTIFY.
 	Terminated bool
+	// EndReason is the Subscription-State reason of the final NOTIFY of a
+	// Terminated subscription, "" for none, and SetEnded says that its set
+	// ended: a sweep that sends the NOTIFY in place of whoever terminated
+	// it sends it so (regevent). FinalAttempts counts the sends of that
+	// NOTIFY that got no answer.
+	EndReason     string
+	SetEnded      bool
+	FinalAttempts int
 	// CSeq is the last CSeq the notifier used in the dialog and
 	// ReginfoVersion the last reginfo version it sent. NextNotify advances
 	// both, so the subscription's first NOTIFY, version 0 (RFC 3680 §5.2), is
@@ -789,9 +901,24 @@ type Subscription struct {
 	// NextNotify's.
 	CSeq           uint32
 	ReginfoVersion uint32
+	// NotifiedOf is the version of the set's record whose state the last
+	// NOTIFY numbered by NextNotify carried, so that no older state takes a
+	// later reginfo version.
+	NotifiedOf int64
 	// Version is the stored version, as for Registration.
 	Version int64
 }
+
+// FinalNotify is the of of a subscription's last NOTIFY (NextNotify): no
+// state is later, and no call after it numbers another, so that two
+// instances ending one subscription send one terminated NOTIFY.
+const FinalNotify = math.MaxInt64
+
+// The kinds of subscriber (Subscription.Kind).
+const (
+	SubscriberPCSCF = "pcscf"
+	SubscriberUE    = "ue"
+)
 
 // Dialog is the notifier's side of the subscription dialog (RFC 3261 §12).
 type Dialog struct {
@@ -802,6 +929,9 @@ type Dialog struct {
 	RemoteURI    string
 	RemoteTarget string
 	RouteSet     []string
+	// RemoteSeq is the CSeq of the subscriber's last SUBSCRIBE, which a
+	// refresh must not go below (RFC 3261 §12.2.2).
+	RemoteSeq uint32
 }
 
 // Clone returns a deep copy.
@@ -818,6 +948,12 @@ func (s *Subscription) Validate() error {
 	}
 	if canon, ok := identity.CanonicalIMPU(s.IMPU); !ok || canon != s.IMPU {
 		return fmt.Errorf("%w: subscription IMPU is not a canonical public identity", ErrInvalid)
+	}
+	if err := validSetKey(s.Set); err != nil || s.Incarnation == 0 {
+		return fmt.Errorf("%w: a subscription names its set and its incarnation", ErrInvalid)
+	}
+	if s.Kind != SubscriberPCSCF && s.Kind != SubscriberUE || !textOK(s.Binding, s.EventID, s.EndReason) || s.FinalAttempts < 0 {
+		return fmt.Errorf("%w: unknown kind of subscriber", ErrInvalid)
 	}
 	d := s.Dialog
 	if d.CallID == "" || !textOK(d.CallID, d.LocalTag, d.RemoteTag, d.LocalURI, d.RemoteURI, d.RemoteTarget) {
@@ -851,11 +987,15 @@ type Subscriptions interface {
 	// DeleteSubscription deletes s if its version is still the stored one.
 	DeleteSubscription(ctx context.Context, s *Subscription) error
 	// NextNotify advances the CSeq and reginfo version of a subscription in
-	// one atomic step and returns the new values, for the next NOTIFY. Two
-	// calls, on any instances, never return the same values. It changes the
-	// item's version, so a save based on an earlier read fails. At MaxCounter
-	// it fails with ErrExhausted and the subscription must be ended.
-	NextNotify(ctx context.Context, id string) (cseq, reginfoVersion uint32, err error)
+	// one atomic step and returns the new values, for a NOTIFY of the state
+	// of the set's record at version of. Two calls, on any instances, never
+	// return the same values, and a call with an of below the last one's
+	// fails with ErrStale: a later state has the later number already, as
+	// does any call after one with FinalNotify. It
+	// changes the item's version, so a save based on an earlier read fails.
+	// At MaxCounter it fails with ErrExhausted and the subscription must be
+	// ended.
+	NextNotify(ctx context.Context, id string, of int64) (cseq, reginfoVersion uint32, err error)
 	// ExpiringSubscriptions returns up to limit subscriptions whose expiry has
 	// passed at now, Terminated ones included, for SweepSubscriptions.
 	ExpiringSubscriptions(ctx context.Context, now time.Time, limit int) ([]*Subscription, error)

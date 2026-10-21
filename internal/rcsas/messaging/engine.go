@@ -205,10 +205,18 @@ type Engine struct {
 	legs       map[legKey][]*Leg
 	invites    map[inviteKey]inviteMark
 	pagerOnly  map[string]struct{}
-	groups     GroupHandler
+	// flows numbers each user's latest registration on a new flow
+	// (UserRegistered), from flowSeq; see Invitation.flow.
+	flows   map[string]uint64
+	flowSeq uint64
+	groups  GroupHandler
 	// departed marks the participants that left a group on this task
 	// (ParticipantLeft), until when their copies could still be queued.
 	departed map[legKey]time.Time
+	// unreachable marks the participants a group's invitation found
+	// unreachable for good (InviteFailed with ErrUndeliverable), until
+	// when their copies could still be queued: those are given up.
+	unreachable map[legKey]time.Time
 	// groupLegs counts the open group legs of each group on this task.
 	groupLegs map[string]int
 	// summaries remembers group notification summaries between their
@@ -250,9 +258,10 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		legs:       map[legKey][]*Leg{},
 		invites:    map[inviteKey]inviteMark{},
 		pagerOnly:  map[string]struct{}{},
-		departed:   map[legKey]time.Time{},
-		groupLegs:  map[string]int{},
-		summaries:  map[legKey]*summaryState{},
+		flows:      map[string]uint64{},
+		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{},
+		groupLegs: map[string]int{},
+		summaries: map[legKey]*summaryState{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {
@@ -378,8 +387,10 @@ type Origin struct {
 	Identities []string
 	// Recipient is the identity the message is for.
 	Recipient string
-	// Conversation is empty for a notification that came without the
-	// conversation headers, as pager-mode ones do.
+	// Conversation is empty when the request came without the
+	// conversation headers, as rcsjta's pager-mode messages and
+	// notifications do. Its ID may be empty beside a Contribution-ID
+	// (ParseConversationHeaders), and the engine fills it in.
 	Conversation Conversation
 	Mode         store.Mode
 	// Pager marks a message that arrived in a SIP MESSAGE, which must fit
@@ -444,6 +455,11 @@ func (e *Engine) submit(ctx context.Context, o Origin) error {
 	}
 	if !namesSender(m.From.URI, o.Sender, o.Identities, e.cfg.HomeDomain) {
 		return reject(ReasonFromMismatch, nil)
+	}
+	if c := &o.Conversation; c.ID == "" && c.Contribution != "" {
+		// rcs-as delivers it, and a sender must name the conversation
+		// (OMA CPM Appendix C.1.1): the pair's, so that it threads.
+		c.ID = PairConversationID(o.Sender, o.Recipient)
 	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 	defer cancel()
@@ -541,6 +557,18 @@ func (e *Engine) countDeviations(d cpim.Deviation) {
 func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
+		if _, ok := e.flows[user]; !ok && len(e.flows) >= e.cfg.MaxTracked {
+			// A user forgotten here is as one never registered: a late
+			// failure of its invitations still out is marked as before
+			// #384, which only one that registers again in that window
+			// notices.
+			for k := range e.flows {
+				delete(e.flows, k)
+				break
+			}
+		}
+		e.flowSeq++
+		e.flows[user] = e.flowSeq
 		delete(e.pagerOnly, user)
 		for k := range e.invites {
 			if k.user == user {
@@ -559,10 +587,29 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 // about. ErrNoSessions marks the recipient as reachable by pager mode only
 // until it registers on a new flow, and sends it what fits; for any other
 // error the next invitation waits for InviteTimeout or the next
-// registration on a new flow.
+// registration on a new flow. ErrUndeliverable for a group gives up what
+// is queued for the recipient from the group, unless it opens a session
+// with the group itself or is added again: the invitation will never
+// reach it.
+//
+// A failure of an invitation asked for before the recipient's latest
+// registration on a new flow is of the old flow, and is not marked: the
+// registration cleared the marks and had the queue read (#384). That holds
+// for a group's 404 or 604 too, as the registration shows that the user
+// exists now; only ErrLooped, a 482, is marked whatever the registrations.
+// A recipient this engine has no registration number for (none, or one
+// forgotten past MaxTracked) is never overtaken.
 func (e *Engine) InviteFailed(inv Invitation, err error) {
 	key := inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 	e.mu.Lock()
+	if cur, ok := e.flows[inv.Recipient]; ok && cur != inv.flow && !errors.Is(err, ErrLooped) {
+		// The recipient registered on a new flow after the session was
+		// asked for: marking the failure now would hold the queue past
+		// the registration.
+		e.mu.Unlock()
+		e.metrics.Count("invite.failed_overtaken", 1)
+		return
+	}
 	if errors.Is(err, ErrNoSessions) {
 		delete(e.invites, key)
 		e.markPagerOnly(inv.Recipient)
@@ -572,8 +619,16 @@ func (e *Engine) InviteFailed(inv Invitation, err error) {
 		return
 	}
 	e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout)}
+	unreachable := inv.Mode == store.Group && errors.Is(err, ErrUndeliverable)
+	if unreachable {
+		e.mark(e.unreachable, legKey{inv.Recipient, inv.Peer})
+	}
 	e.mu.Unlock()
 	e.metrics.Count("invite.failed", 1)
+	if unreachable {
+		e.metrics.Count("invite.undeliverable", 1)
+		e.kickEvent(inv.Recipient)
+	}
 }
 
 // markPagerOnly needs e.mu.

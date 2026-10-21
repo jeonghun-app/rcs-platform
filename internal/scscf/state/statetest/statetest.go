@@ -76,6 +76,9 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"SubscriptionsReadBackAndAreListedByIMPU", testSubscriptionRoundTrip},
 		{"NotifyCountersNeverRepeatAcrossInstances", testNotifyCounters},
 		{"NextNotifyInvalidatesEarlierReads", testNotifyVersion},
+		{"NoOlderStateTakesALaterNotify", testNotifyOrder},
+		{"EverySaveRaisesARegistrationsVersion", testRegistrationVersionRises},
+		{"ASweepHandsOverAFinalNotifyNotAnswered", testPendingFinal},
 		{"ConcurrentSweepsEndEverySubscriptionOnce", testSubscriptionSweep},
 		{"ASweepFromAStaleListingKeepsAFreshRegistration", testSweepFromAStaleListing},
 		{"ASaveFromBeforeADeleteDoesNotOverwriteANewRegistration", testStaleSaveAfterRecreate},
@@ -84,6 +87,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"ItemsOverTheSizeLimitAreRefusedByEveryBackend", testItemSize},
 		{"BoundaryValuesAreTheSameEverywhere", testBoundaries},
 		{"AFailedDeregistrationIsRetriedAfterTheLease", testSweepRetry},
+		{"ARejectedLeaseKeepsItsMarkThroughTheSweep", testRejectedLease},
 		{"AClaimedSubscriptionKeepsItsGraceFromTheClaim", testTerminatedGrace},
 		{"NotifyCountersStopAtTheirLimit", testCounterLimit},
 		{"ProfilesAreKeptApartFromRegistrations", testProfiles},
@@ -99,7 +103,9 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
 		{"AttemptsAreCountedOnceAcrossInstances", testAttemptCounts},
 		{"NoClientCanTakeAnAttemptCount", testAttemptCountNotAChallenge},
+		{"AnIFCPositionIsTakenUpByOneSideAcrossInstances", testODIClaims},
 		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
+		{"ASweepClaimsAnUnregisteredUsersRecordWhoseReassertIsDueAndKeepsIt", testUnregisteredReassertSweep},
 		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
 		{"ASaveFromBeforeAKeepIdentityCannotUndoIt", testIdentityKeepNeverUndone},
 		{"ARecordBroughtBackFromADeregistrationTakesANewIncarnation", testReviveTakesANewIncarnation},
@@ -182,6 +188,7 @@ func Registration(impi, impu string, expiries ...time.Duration) *state.Registrat
 func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour, 2*time.Hour)
 	r.Contacts[1].Q = 500
+	r.RegisteredAs = []string{IMPU1, IMPU2}
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
 	if saved.Version == 0 {
 		t.Error("a saved registration has version 0")
@@ -196,6 +203,12 @@ func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	again := Registration(IMPI1, IMPU1, time.Hour)
 	_, err := b.SaveRegistration(ctx(t), again)
 	wantErr(t, err, state.ErrExists)
+	tomb := Registration(IMPI2, IMPU2)
+	tomb.Deregistering, tomb.Tombstone = T0.Add(time.Minute), true
+	tomb.Version = must(a.SaveRegistration(ctx(t), tomb))(t).Version
+	if got := must(b.Registration(ctx(t), state.SetKey{IMPI: IMPI2, IMPU: IMPU2}))(t); !reflect.DeepEqual(got, tomb) {
+		t.Errorf("read tombstone %+v, want %+v", got, tomb)
+	}
 	_, err = a.Registration(ctx(t), Key1(IMPU2))
 	wantErr(t, err, state.ErrNotFound)
 }
@@ -366,7 +379,13 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	before1970.Unregistered = time.Date(1969, 12, 31, 0, 0, 0, 0, time.UTC)
 	after9999 := Registration(IMPI1, IMPU1)
 	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999} {
+	tombstoneWithContacts := Registration(IMPI1, IMPU1, time.Hour)
+	tombstoneWithContacts.Tombstone = true
+	tombstoneWithoutLease := Registration(IMPI1, IMPU1)
+	tombstoneWithoutLease.Tombstone = true
+	registeredAsNonCanonical := Registration(IMPI1, IMPU1, time.Hour)
+	registeredAsNonCanonical.RegisteredAs = []string{"sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999, registeredAsNonCanonical, tombstoneWithContacts, tombstoneWithoutLease} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}
@@ -386,12 +405,13 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 
 func testNoAliasing(t *testing.T, a, _ state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour)
+	r.RegisteredAs = []string{IMPU1}
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
-	r.Contacts[0].Path[0] = "changed"
-	saved.Contacts[0].Path[0] = "changed"
+	r.Contacts[0].Path[0], r.RegisteredAs[0] = "changed", "changed"
+	saved.Contacts[0].Path[0], saved.RegisteredAs[0] = "changed", "changed"
 	read := must(a.Registration(ctx(t), Key1(IMPU1)))(t)
-	read.Contacts[0].Path[0] = "changed"
-	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" {
+	read.Contacts[0].Path[0], read.RegisteredAs[0] = "changed", "changed"
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" || got.RegisteredAs[0] == "changed" {
 		t.Error("a caller's change reached the stored registration")
 	}
 }
@@ -486,10 +506,11 @@ func testChallengeExpiry(t *testing.T, a, b state.Store, _ Options) {
 func Subscription(id, impu string, ttl time.Duration) *state.Subscription {
 	return &state.Subscription{
 		ID: id, IMPU: impu, Subscriber: "sip:pcscf.rcs.local", Expires: T0.Add(ttl),
+		Set: Key1(impu), Incarnation: 1, Kind: state.SubscriberPCSCF, EventID: "7",
 		Dialog: state.Dialog{
 			CallID: "dialog-" + id, LocalTag: "local", RemoteTag: "remote",
 			LocalURI: impu, RemoteURI: "sip:pcscf.rcs.local", RemoteTarget: "sip:pcscf@192.0.2.20:5060",
-			RouteSet: []string{"<sip:pcscf.rcs.local;lr>"},
+			RouteSet: []string{"<sip:pcscf.rcs.local;lr>"}, RemoteSeq: 7,
 		},
 	}
 }
@@ -520,7 +541,7 @@ func testSubscriptionRoundTrip(t *testing.T, a, b state.Store, o Options) {
 	}
 	_, err = a.Subscription(ctx(t), "s1")
 	wantErr(t, err, state.ErrNotFound)
-	_, _, err = a.NextNotify(ctx(t), "s1")
+	_, _, err = a.NextNotify(ctx(t), "s1", 0)
 	wantErr(t, err, state.ErrNotFound)
 }
 
@@ -538,7 +559,7 @@ func testNotifyCounters(t *testing.T, a, b state.Store, _ Options) {
 			go func() {
 				defer wg.Done()
 				for range each {
-					c, v, err := s.NextNotify(ctx(t), "s1")
+					c, v, err := s.NextNotify(ctx(t), "s1", 0)
 					if err != nil {
 						t.Error(err)
 						return
@@ -567,7 +588,7 @@ func testNotifyCounters(t *testing.T, a, b state.Store, _ Options) {
 
 func testNotifyVersion(t *testing.T, a, b state.Store, _ Options) {
 	read := must(a.SaveSubscription(ctx(t), Subscription("s1", IMPU1, time.Hour)))(t)
-	if _, _, err := b.NextNotify(ctx(t), "s1"); err != nil {
+	if _, _, err := b.NextNotify(ctx(t), "s1", 0); err != nil {
 		t.Fatal(err)
 	}
 	refresh := read.Clone()
@@ -577,7 +598,7 @@ func testNotifyVersion(t *testing.T, a, b state.Store, _ Options) {
 	fresh := must(a.Subscription(ctx(t), "s1"))(t)
 	fresh.Expires = T0.Add(2 * time.Hour)
 	must(a.SaveSubscription(ctx(t), fresh))(t)
-	if c, v, err := b.NextNotify(ctx(t), "s1"); err != nil || c != 2 || v != 2 {
+	if c, v, err := b.NextNotify(ctx(t), "s1", 0); err != nil || c != 2 || v != 2 {
 		t.Errorf("after a refresh NextNotify = %d, %d, %v; want the counters kept", c, v, err)
 	}
 }
@@ -598,10 +619,7 @@ func testSubscriptionSweep(t *testing.T, a, b state.Store, o Options) {
 			go func() {
 				defer wg.Done()
 				_, err := state.SweepSubscriptions(ctx(t), s, T0, 10, func(sub *state.Subscription) {
-					// The final NOTIFY takes the next CSeq.
-					if _, _, err := s.NextNotify(ctx(t), sub.ID); err != nil {
-						t.Error(err)
-					}
+					finish(t, s, sub.ID)
 					mu.Lock()
 					handled[sub.ID]++
 					mu.Unlock()
@@ -621,4 +639,135 @@ func testSubscriptionSweep(t *testing.T, a, b state.Store, o Options) {
 		wantErr(t, err, state.ErrNotFound)
 	}
 	must(a.Subscription(ctx(t), "s3"))(t)
+}
+
+// testNotifyOrder: NextNotify numbers the state of a set's record at a
+// version, and refuses a version below the last one numbered (ErrStale), so
+// that the NOTIFY a subscriber keeps, the one with the highest reginfo
+// version, never carries an older state (#256).
+func testNotifyOrder(t *testing.T, a, b state.Store, _ Options) {
+	must(a.SaveSubscription(ctx(t), Subscription("s1", IMPU1, time.Hour)))(t)
+	c, v, err := a.NextNotify(ctx(t), "s1", 10)
+	if err != nil || c != 1 || v != 1 {
+		t.Fatalf("NextNotify(10) = %d, %d, %v", c, v, err)
+	}
+	_, _, err = b.NextNotify(ctx(t), "s1", 9)
+	wantErr(t, err, state.ErrStale)
+	if c, v, err := b.NextNotify(ctx(t), "s1", 10); err != nil || c != 2 || v != 2 {
+		t.Errorf("the same version again: %d, %d, %v", c, v, err)
+	}
+	if c, _, err := a.NextNotify(ctx(t), "s1", 11); err != nil || c != 3 {
+		t.Errorf("a later version: %d, %v", c, err)
+	}
+	if got := must(b.Subscription(ctx(t), "s1"))(t); got.NotifiedOf != 11 {
+		t.Errorf("NotifiedOf = %d, want 11", got.NotifiedOf)
+	}
+	// The last NOTIFY is numbered once, whoever asks.
+	if c, _, err := b.NextNotify(ctx(t), "s1", state.FinalNotify); err != nil || c != 4 {
+		t.Errorf("the last: %d, %v", c, err)
+	}
+	_, _, err = a.NextNotify(ctx(t), "s1", state.FinalNotify)
+	wantErr(t, err, state.ErrStale)
+}
+
+// testRegistrationVersionRises: NextNotify orders NOTIFYs by the version of
+// the record they were read from, so every save must raise it, whichever
+// instance saves.
+func testRegistrationVersionRises(t *testing.T, a, b state.Store, _ Options) {
+	r := must(a.SaveRegistration(ctx(t), Registration(IMPI1, IMPU1, time.Hour)))(t)
+	for i, s := range []state.Store{a, b, a, b} {
+		next := r.Clone()
+		next.Contacts[0].CSeq++
+		saved := must(s.SaveRegistration(ctx(t), next))(t)
+		if saved.Version <= r.Version {
+			t.Fatalf("save %d: version %d after %d", i, saved.Version, r.Version)
+		}
+		if got := must(b.Registration(ctx(t), r.Key))(t); got.Version != saved.Version {
+			t.Fatalf("save %d: read back version %d, saved %d", i, got.Version, saved.Version)
+		}
+		r = saved
+	}
+}
+
+// finish is what a sweep's handle does once a subscription's final NOTIFY
+// is answered: the NOTIFY is numbered, once, and the subscription deleted.
+func finish(t *testing.T, s state.Store, id string) {
+	t.Helper()
+	if _, _, err := s.NextNotify(ctx(t), id, state.FinalNotify); err != nil && !errors.Is(err, state.ErrStale) {
+		t.Error(err)
+	}
+	cur, err := s.Subscription(ctx(t), id)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if err := s.DeleteSubscription(ctx(t), cur); err != nil {
+		t.Error(err)
+	}
+}
+
+// testPendingFinal: a subscription terminated by an instance that did not
+// send its final NOTIFY, or had no answer to it, is handed over by a sweep
+// once its expiry has passed, with its EndReason, and again after the
+// grace until a handle deletes it; one that expired without being
+// terminated ends with "timeout".
+func testPendingFinal(t *testing.T, a, b state.Store, o Options) {
+	s := Subscription("s1", IMPU1, -time.Second)
+	s.Terminated, s.EndReason, s.SetEnded = true, "rejected", true
+	must(a.SaveSubscription(ctx(t), s))(t)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringSubscriptions(ctx(t), T0, 10))(t)) == 1
+	})
+	var seen []*state.Subscription
+	sweep := func(at time.Time, handle func(*state.Subscription)) {
+		t.Helper()
+		if _, err := state.SweepSubscriptions(ctx(t), b, at, 10, func(sub *state.Subscription) {
+			seen = append(seen, sub)
+			if sub.EndReason != "rejected" || !sub.SetEnded {
+				t.Errorf("handed over with EndReason %q, SetEnded %v", sub.EndReason, sub.SetEnded)
+			}
+			handle(sub)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Sent, but no answer: numbered, and kept.
+	sweep(T0, func(sub *state.Subscription) {
+		if _, _, err := b.NextNotify(ctx(t), sub.ID, state.FinalNotify); err != nil {
+			t.Error(err)
+		}
+	})
+	must(a.Subscription(ctx(t), "s1"))(t)
+	sweep(T0.Add(time.Second), func(*state.Subscription) { t.Error("handed over again within the grace") })
+	later := T0.Add(state.TerminatedGrace + time.Second)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringSubscriptions(ctx(t), later, 10))(t)) == 1
+	})
+	// Sent again, with the numbers it has, and answered.
+	sweep(later, func(sub *state.Subscription) {
+		if sub.NotifiedOf != state.FinalNotify {
+			t.Errorf("handed over again with NotifiedOf %d", sub.NotifiedOf)
+		}
+		finish(t, b, sub.ID)
+	})
+	if len(seen) != 2 {
+		t.Fatalf("handed over %d times", len(seen))
+	}
+	_, err := a.Subscription(ctx(t), "s1")
+	wantErr(t, err, state.ErrNotFound)
+
+	must(a.SaveSubscription(ctx(t), Subscription("s2", IMPU1, -time.Second)))(t)
+	eventually(t, o, "the index to list it", func() bool {
+		return len(must(b.ExpiringSubscriptions(ctx(t), T0, 10))(t)) == 1
+	})
+	if _, err := state.SweepSubscriptions(ctx(t), b, T0, 10, func(sub *state.Subscription) {
+		if !sub.Terminated || sub.EndReason != "timeout" || sub.SetEnded {
+			t.Errorf("claimed %+v", sub)
+		}
+		finish(t, b, sub.ID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Subscription(ctx(t), "s2")
+	wantErr(t, err, state.ErrNotFound)
 }

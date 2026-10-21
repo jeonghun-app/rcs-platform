@@ -18,7 +18,33 @@ import (
 )
 
 func TestTheGroupsStoreMeetsTheContractOverTheFake(t *testing.T) {
-	storetest.Run(t, func(t *testing.T) groupstore.Store { return NewGroupsWithClient("groupchats", newFakeDynamo(t)) })
+	storetest.Run(t, func(t *testing.T) groupstore.Store { return NewGroupsWithClient("groupchats", newFakeDynamo(t)) },
+		disownIn(nil))
+}
+
+// testOwner owns the groups these tests make.
+var testOwner = groupstore.Owner{Task: "task-a", SIP: "10.0.1.1:5060", Epoch: 1}
+
+// disownIn deletes a group's owner item in s, or in the store the check
+// passes when s is nil, as for a group stored before #121.
+func disownIn(s *Groups) func(t *testing.T, st groupstore.Store, uri string) {
+	return func(t *testing.T, st groupstore.Store, uri string) {
+		g := s
+		if g == nil {
+			g = st.(*Groups)
+		}
+		if f, ok := g.api.(*fakeDynamo); ok {
+			f.mu.Lock()
+			delete(f.rows, rowKey(ownerKey(uri)))
+			f.mu.Unlock()
+			return
+		}
+		if _, err := g.api.(*dynamodb.Client).DeleteItem(t.Context(), &dynamodb.DeleteItemInput{
+			TableName: &g.table, Key: ownerKey(uri),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestARepeatedGroupUpdateThatTookEffectIsNotAConflict(t *testing.T) {
@@ -27,7 +53,7 @@ func TestARepeatedGroupUpdateThatTookEffectIsNotAConflict(t *testing.T) {
 	ctx := context.Background()
 	g := groupstore.Group{URI: "sip:chat-1@conf.example.net", Version: 1, Created: t0, Active: t0, Expires: t0.Add(time.Hour),
 		Participants: []groupstore.Participant{{Identity: "a", Role: groupstore.Chairman, State: groupstore.Joined, Since: t0}}}
-	if err := NewGroupsWithClient("groupchats", putTwice{f}).Create(ctx, g, "c", t0); err != nil {
+	if err := NewGroupsWithClient("groupchats", writeTwice{f}).Create(ctx, g, testOwner, "c", t0); err != nil {
 		t.Fatalf("repeated Create = %v", err)
 	}
 	got, err := s.Get(ctx, g.URI, t0)
@@ -35,24 +61,34 @@ func TestARepeatedGroupUpdateThatTookEffectIsNotAConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	got.Subject = "x"
-	// The fake applies the put and then answers a second time: the
+	// The fake applies the write and then answers a second time: the
 	// second answer is the failed condition the SDK's retry would meet.
-	if err := NewGroupsWithClient("groupchats", putTwice{f}).Update(ctx, got, "tok"); err != nil {
+	if err := NewGroupsWithClient("groupchats", writeTwice{f}).Update(ctx, got, testOwner, "tok"); err != nil {
 		t.Fatalf("Update = %v", err)
 	}
-	if err := s.Touch(ctx, g.URI, t0.Add(time.Minute), t0.Add(2*time.Hour)); err != nil {
+	if err := NewGroupsWithClient("groupchats", writeTwice{f}).Touch(ctx, g.URI, testOwner, t0.Add(time.Minute), t0.Add(2*time.Hour)); err != nil {
 		t.Fatalf("Touch = %v", err)
+	}
+	b := groupstore.Owner{Task: "task-b"}
+	if o, err := s.TakeOver(ctx, g.URI, testOwner, b, g.Expires, "t1"); err != nil || o.Epoch != 2 {
+		t.Fatalf("TakeOver = %+v, %v", o, err)
+	}
+	// The same takeover repeated after it took effect: its own, not
+	// another task's.
+	if o, err := s.TakeOver(ctx, g.URI, testOwner, b, g.Expires, "t1"); err != nil || o.Epoch != 2 {
+		t.Fatalf("repeated TakeOver = %+v, %v", o, err)
 	}
 }
 
-// putTwice performs every put twice and returns the second answer.
-type putTwice struct{ *fakeDynamo }
+// writeTwice performs every group transaction twice and returns the
+// second answer.
+type writeTwice struct{ *fakeDynamo }
 
-func (p putTwice) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
-	if _, err := p.fakeDynamo.PutItem(ctx, in, o...); err != nil {
+func (w writeTwice) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if _, err := w.fakeDynamo.TransactWriteItems(ctx, in, o...); err != nil {
 		return nil, err
 	}
-	return p.fakeDynamo.PutItem(ctx, in, o...)
+	return w.fakeDynamo.TransactWriteItems(ctx, in, o...)
 }
 
 func TestEveryGroupOperationReportsAFailedRequest(t *testing.T) {
@@ -62,11 +98,15 @@ func TestEveryGroupOperationReportsAFailedRequest(t *testing.T) {
 	f.fail = &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException"}
 	g := groupstore.Group{URI: "sip:chat-1@conf.example.net"}
 	for name, op := range map[string]func() error{
-		"Create": func() error { return s.Create(ctx, g, "c", t0) },
-		"Get":    func() error { _, err := s.Get(ctx, g.URI, t0); return err },
-		"Update": func() error { return s.Update(ctx, g, "t") },
-		"Touch":  func() error { return s.Touch(ctx, g.URI, t0, t0) },
-		"Ready":  func() error { return s.Ready(ctx) },
+		"Create":   func() error { return s.Create(ctx, g, testOwner, "c", t0) },
+		"Get":      func() error { _, err := s.Get(ctx, g.URI, t0); return err },
+		"Update":   func() error { return s.Update(ctx, g, testOwner, "t") },
+		"Touch":    func() error { return s.Touch(ctx, g.URI, testOwner, t0, t0) },
+		"Owner":    func() error { _, err := s.Owner(ctx, g.URI); return err },
+		"TakeOver": func() error { _, err := s.TakeOver(ctx, g.URI, groupstore.Owner{}, testOwner, t0, "t"); return err },
+		"Beat":     func() error { return s.Beat(ctx, groupstore.Task{ID: "x"}) },
+		"Task":     func() error { _, err := s.Task(ctx, "x"); return err },
+		"Ready":    func() error { return s.Ready(ctx) },
 	} {
 		if err := op(); err == nil || !strings.Contains(err.Error(), "ProvisionedThroughputExceededException") {
 			t.Errorf("%s = %v", name, err)

@@ -158,7 +158,9 @@ logged as contention rather than a store failure (#200).
 
 The I-CSCF gets Server-Capabilities with the profile's mandatory and optional
 capabilities and the names in `HSS_SCSCF_NAMES`; without any it may pick any
-S-CSCF. Restoration (TS 23.380), emergency registration, wildcarded identities and
+S-CSCF. A name steers the I-CSCF's choice over the capabilities (TS 29.228
+§6.7), so `HSS_SCSCF_NAMES` turns capability selection off: with it set, the
+profile's capabilities choose nothing ([icscf](icscf.md)). Restoration (TS 23.380), emergency registration, wildcarded identities and
 PSIs are not supported.
 
 ### HSS-initiated requests
@@ -205,7 +207,7 @@ participating function and store messages for users who are offline
 
 | Priority | Trigger | Default handling |
 |---|---|---|
-| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, or a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service` | SESSION_TERMINATED |
+| 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service`, or an MSRP stream (`m=message … TCP/MSRP` or `TCP/TLS/MSRP`, in any case) in its SDP unless a feature tag names image share, video share or MMTEL (below) | SESSION_TERMINATED |
 | 20 | MESSAGE | SESSION_TERMINATED |
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
@@ -227,6 +229,26 @@ literal pattern (`3gpp-service\.ims\.icsi\.oma\.cpm\.`,
 `3gpp-application\.ims\.iari\.rcs\.` or `\+g\.oma\.sip-im`), the ICSI and IARI
 text after `urn-7`, which is the same in percent-encoded feature tags and in the
 plain service headers, or the OMA SIMPLE IM tag, with which rcsjta asks for a chat.
+An INVITE that offers MSRP is taken for a chat too, unless one of its feature
+tags names a service known not to be chat, so that a client cannot send a chat
+past `rcs-as` by leaving its tags out or naming a service nobody knows (#359).
+The services known not to be chat are:
+
+| Service | Feature tag |
+|---|---|
+| Image share | `+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-is"` |
+| Video share | `+g.3gpp.iari-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-vs"` |
+| Voice and video calls (MMTEL) | `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"` |
+
+Such an INVITE goes to the callee as before: the platform does not serve those,
+and `rcs-as` would refuse them. Any other tag, an invented one, an IARI not on
+the list or a bare `+g.3gpp.icsi-ref`, does not keep an MSRP INVITE from
+`rcs-as`. The check reads the field `Feature tag`, which scscf adds to the
+request it evaluates for each feature-tag parameter of `Accept-Contact` and
+`Contact`, with its value decoded (`ifc.FeatureTagField`): the tag's text in a
+URI, a display name or another parameter's value names no service. No SIP header
+can have that name, as it holds a space.
+
 The profile is created at start if missing; an operator's changes to it are kept.
 So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
 (#137) keeps its old triggers until an operator updates it through the API. No

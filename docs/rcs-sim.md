@@ -66,21 +66,27 @@ One wait is the simulator's own. A device resumes once it is back on a
 network, seconds after the break; the simulator asks at once, before
 `ft-server` may have noticed the break. So `get_upload_info` asks again, every
 100 ms. It stops once the answers have named the same bytes held for 300 ms,
-counted from the request that first got that value. A 404 is asked again for
-up to 3 s (`-upload-settle`). If the bytes held are still changing when the 3 s have passed, the
-step fails ("the server is still storing the broken upload") instead of
-resuming from a value that has not settled. Two equal answers in a row were not enough:
-`ft-server` may still hold the broken upload, and about one resume in 800 got
-503 (#77). Nothing in the upload-info document says the upload is released.
-Its lease runs for minutes when the process holding it has gone, so waiting
-for it is no option. The 300 ms stand for the time a device takes to come back
-on a network. The step reports how often it asked again (`retries`), how
+counted from the answer that first named that value: the server reads what
+it holds somewhere between a request and its answer, so a slow answer's wait
+is no time it is known to have held them (#377). A 404 is asked again for up
+to 3 s (`-upload-settle`). A request sent after the 3 s gets, once, the rest
+of the 300 ms for the bytes held it names. If the bytes held are still
+changing after that, the step fails ("the server is still storing the broken
+upload") instead of resuming from a value that has not settled. The 3 s bound
+when requests are sent, not when answers come, so one slow answer on a loaded
+host does not fail the step, not even a slow 404 to the first request (#344).
+Two equal answers in a row were not enough: `ft-server` may still hold the
+broken upload, and about one resume in 800 got 503 (#77). Nothing in the
+upload-info document says the upload is released. Its lease runs for
+minutes when the process holding it has gone, so waiting for it is no
+option. The 300 ms stand for the time a device takes to come back on a
+network. The step reports how often it asked again (`retries`), how
 many of those answers were 404 (`not_held`), and how long after the step
 began it sent the request that first got the bytes it settled on
 (`showed_ms`): the time the server took to show what it keeps.
 
-`make e2e` asserts that `showed_ms` is at most 2 s. It also asserts that `ft-resume` resumed rather than uploading again,
-and that `busy_retries` is 0 on every step. So a server that is slow to keep a
+`make e2e` asserts that `showed_ms` is at most 2 s. It also asserts that
+`ft-resume` resumed rather than uploading again, and that `busy_retries` is 0 on every step. So a server that is slow to keep a
 broken upload, or busy on an idle stack, fails the run. The bound is on time
 rather than on the number of answers, so a loaded host that answers slowly
 keeps the margin, and on the time until the parts showed rather than the

@@ -516,6 +516,10 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 			}
 			return id, err
 		}
+		// Between a chunk's write and the next look at ctx:
+		// TestASendCancelledBetweenChunksIsAborted holds s.mu across this
+		// point to land its cancel on that look. Moving the touch before
+		// the write sends that test down another abandon path.
 		s.touch(c)
 	}
 	return id, nil

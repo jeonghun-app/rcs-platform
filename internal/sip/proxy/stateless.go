@@ -51,7 +51,7 @@ func (p *Proxy) forwardACK(req *sip.Request, src transport.Source) bool {
 	if err != nil {
 		return false
 	}
-	dec := p.router.Route(p.ctx, in)
+	dec := p.route(p.ctx, in)
 	if dec.Response != nil || dec.Status != 0 || len(dec.Targets) == 0 {
 		return false
 	}

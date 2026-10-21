@@ -56,6 +56,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 )
 
@@ -478,11 +479,15 @@ type Settled struct {
 // stored what it keeps and released the upload. So this asks every poll
 // until the same bytes held have been reported for at least quiet: two
 // answers in a row can agree while the server still holds the upload, and
-// a resume then gets 503. The quiet time runs from the request that first
-// got the value to the request that gets it again, so it is time the server
-// held the value, however slowly the answers came. A 404 is asked again until
-// within has passed, and then returned as ErrNothingHeld. Bytes held that are
-// still changing when within has passed are returned with ErrNotSettled.
+// a resume then gets 503. The server reads what it holds somewhere between
+// a request and its answer, so the quiet time runs from the answer that
+// first named the value to a later request that gets it again: time the
+// server is known to have held the value, which a slow answer's wait is not
+// (#377). within bounds when the requests are sent: a 404 is asked again
+// until a request sent after within has passed gets one too, and is then
+// returned as ErrNothingHeld. Bytes held that such a request names are
+// given, once, the rest of their quiet time; bytes held still changing
+// after that are returned with ErrNotSettled.
 //
 // Nothing the server sends says the upload is released: its lease lasts
 // minutes when the process holding it dies, and ft-server's upload-info
@@ -498,9 +503,11 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 	deadline := start.Add(within)
 	last := int64(-1)
 	var since time.Time
+	extended := false
 	for {
 		asked := now()
 		info, err := c.UploadInfo(ctx, tid)
+		answered := now()
 		held := int64(-1)
 		switch {
 		case errors.Is(err, ErrNothingHeld):
@@ -514,14 +521,29 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 			}
 		}
 		if held != last {
-			last, since = held, asked
-			st.Showed = since.Sub(start)
+			last, since = held, answered
+			// From the request, not the answer: the request's time is when
+			// the server could first have shown it (#286).
+			st.Showed = asked.Sub(start)
 		}
-		if now().After(deadline) {
-			if err == nil {
-				err = ErrNotSettled
+		// within bounds when a request is sent, not when its answer comes:
+		// one slow answer on a loaded host says nothing about the server
+		// still storing, and the next request may confirm what it holds
+		// (#344). A request sent past the deadline that does not settle
+		// ends the wait, except that the bytes held it names get, once, the
+		// rest of their quiet time. The slow answer is most often the 404
+		// to a request sent before the server noticed the break, and the
+		// server may well be done storing by now; ending here would fail
+		// the step on one slow answer after all.
+		if asked.After(deadline) {
+			if err == nil && !extended {
+				deadline, extended = since.Add(quiet), true
+			} else {
+				if err == nil {
+					err = ErrNotSettled
+				}
+				return info, st, err
 			}
-			return info, st, err
 		}
 		if err := sleep(ctx, poll); err != nil {
 			return info, st, err
@@ -696,22 +718,26 @@ func readFileDocument(resp *http.Response, op string) (FileDocument, error) {
 	return d, nil
 }
 
-// decode reads one document. The server is the platform's own, but a
-// simulator run against a deployed stack still bounds what it reads and
-// refuses a document type declaration, as the platform's parsers do.
+// document is what decode checks a document for: the server is the
+// platform's own, but a simulator run against a deployed stack still bounds
+// what it reads and refuses what the platform's parsers do
+// (internal/xmlsafe).
+var document = xmlsafe.Doc{MaxSize: maxDocument, MaxDepth: 32,
+	DTD:       errors.New("document type declarations are refused"),
+	TooLarge:  errors.New("document too large"),
+	Malformed: errors.New("malformed document")}
+
+// decode reads one document.
 func decode(r io.Reader, v any) error {
 	data, err := io.ReadAll(io.LimitReader(r, maxDocument+1))
 	if err != nil {
 		return safeerr.Body(err)
 	}
-	if len(data) > maxDocument {
-		return errors.New("document too large")
+	if err := document.Check(data); err != nil {
+		return err
 	}
-	if bytes.Contains(data, []byte("<!DOCTYPE")) {
-		return errors.New("document type declarations are refused")
-	}
-	if err := xml.Unmarshal(data, v); err != nil {
-		return errors.New("malformed document")
+	if err := xml.Unmarshal(xmlsafe.WithoutBOM(data), v); err != nil {
+		return document.Malformed
 	}
 	return nil
 }

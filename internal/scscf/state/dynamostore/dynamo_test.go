@@ -81,6 +81,23 @@ func TestAResentWriteIsRecognisedByItsToken(t *testing.T) {
 	}
 }
 
+// TestAResentClaimOfAnIFCPositionGoesOn: the put the SDK resends finds the
+// item its first attempt wrote, and reads its own side back, so that the
+// only copy of a request is not taken for a second (#359 QA).
+func TestAResentClaimOfAnIFCPositionGoesOn(t *testing.T) {
+	f := newFake(t)
+	d := newTestStore(t, f)
+	scope := state.ODIScope("odi")
+	f.resendNext = true
+	side, err := d.ClaimODI(bg(), scope, state.ODIDefault, statetest.T0, statetest.T0.Add(time.Minute))
+	if err != nil || side != state.ODIDefault {
+		t.Fatalf("resent claim = %q, %v; want its own side", side, err)
+	}
+	if side, _ := d.ClaimODI(bg(), scope, state.ODIReturned, statetest.T0, statetest.T0.Add(time.Minute)); side != state.ODIDefault {
+		t.Errorf("the other side then found %q", side)
+	}
+}
+
 func TestAWriteWithoutRandomnessFailsSafeAsAConflict(t *testing.T) {
 	f := newFake(t)
 	d := newTestStore(t, f)
@@ -103,11 +120,11 @@ func TestAResentNextNotifyReturnsTheFirstAttemptsValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.resendNext = true
-	c, v, err := d.NextNotify(bg(), "s1")
+	c, v, err := d.NextNotify(bg(), "s1", 0)
 	if err != nil || c != 1 || v != 1 {
 		t.Fatalf("NextNotify = %d, %d, %v; want 1, 1", c, v, err)
 	}
-	if c, v, _ := d.NextNotify(bg(), "s1"); c != 2 || v != 2 {
+	if c, v, _ := d.NextNotify(bg(), "s1", 0); c != 2 || v != 2 {
 		t.Errorf("next NextNotify = %d, %d; the resend counted twice", c, v)
 	}
 }
@@ -393,7 +410,7 @@ func TestSDKErrorsCarryNoKey(t *testing.T) {
 		func() error { _, err := d.ExpiringRegistrations(bg(), statetest.T0, 1); return err }(),
 		d.AddChallenge(bg(), statetest.Challenge(statetest.IMPI1, "n", time.Minute)),
 		func() error { _, err := d.TakeChallenge(bg(), statetest.IMPI1, "n", statetest.T0); return err }(),
-		func() error { _, _, err := d.NextNotify(bg(), "s1"); return err }(),
+		func() error { _, _, err := d.NextNotify(bg(), "s1", 0); return err }(),
 		d.Ready(bg()),
 	}
 	for _, err := range checks {

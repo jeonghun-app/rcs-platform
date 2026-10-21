@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -244,4 +246,47 @@ func (d deliverer) Pager(ctx context.Context, v messaging.Delivery) error {
 
 func (d deliverer) Invite(ctx context.Context, v messaging.Invitation) error {
 	return (*d.a).srv.Invite(ctx, v)
+}
+
+// notifier is the group chat focus's Notifier: the Server, once started.
+// While skip is above zero, it drops that many updates, as a change made on
+// another task would reach no subscription here.
+type notifier struct {
+	a    **as
+	skip *atomic.Int32
+}
+
+func (n notifier) RosterChanged(ctx context.Context, u group.RosterUpdate) {
+	for n.skip != nil {
+		v := n.skip.Load()
+		if v <= 0 {
+			break
+		}
+		if n.skip.CompareAndSwap(v, v-1) {
+			return
+		}
+	}
+	(*n.a).srv.RosterChanged(ctx, u)
+}
+
+// #298: a pager MESSAGE as rcsjta sends it, without conversation headers,
+// or as a client that names only its Contribution-ID, is taken; the engine
+// gives the latter its pair's Conversation-ID (conversation_test.go).
+func TestAPagerMessageWithoutAConversationIDIsTaken(t *testing.T) {
+	e := &fakeEngine{}
+	a := startAS(t, e, newFakeCore(t))
+	p := a.dial(t)
+	plain := pager(cpimBody("m1", "hi"))
+	contribution := pager(cpimBody("m2", "hi"))
+	contribution.fields = append(contribution.fields, "Contribution-ID: c0ntr1")
+	for _, m := range []msg{plain, contribution} {
+		if res := p.send(m); res.StatusCode != 202 {
+			t.Fatalf("answered %d", res.StatusCode)
+		}
+	}
+	got := e.origins()
+	if len(got) != 2 || got[0].Conversation != (messaging.Conversation{}) ||
+		got[1].Conversation != (messaging.Conversation{Contribution: "c0ntr1"}) {
+		t.Fatalf("origins %+v", got)
+	}
 }

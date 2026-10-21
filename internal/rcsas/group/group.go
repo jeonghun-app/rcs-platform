@@ -3,6 +3,8 @@ package group
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,6 +31,11 @@ const (
 	// cost a write per message.
 	DefaultTouchInterval = time.Hour
 	DefaultMaxTracked    = 100_000
+	// DefaultPendingTTL is how long a new group lasts until its creator's
+	// session is set up (Established): long enough for the client to try
+	// its INVITE again after a CANCEL or a failure, short enough that a
+	// group no session came of does not linger.
+	DefaultPendingTTL = 2 * time.Minute
 	// maxAttempts bounds the rereads of a group whose update keeps meeting
 	// another writer's; each attempt loses only to a write that landed.
 	maxAttempts = 32
@@ -92,16 +99,25 @@ var (
 	ErrRateLimited = errors.New("group: rate limited")
 	// ErrBusy: the group kept changing under the update; try again.
 	ErrBusy = errors.New("group: too many concurrent changes")
+	// ErrTaken: a group already has the Contribution-ID a Create names,
+	// and is not one its creator may take up again.
+	ErrTaken = errors.New("group: the Contribution-ID names another group")
 )
 
 // Config configures a Service. Zero fields take the defaults.
 type Config struct {
 	// ConferenceHost is the host of the conference URIs the focus
-	// allocates, sip:chat-<random>@ConferenceHost; it must route to
+	// allocates, sip:chat-<32 hex digits>@ConferenceHost; it must route to
 	// rcs-as. Required.
-	ConferenceHost  string
+	ConferenceHost string
+	// HomeDomain is the operator's IMS domain (RCS_IMS_DOMAIN), at which
+	// a SIP URI whose user part is a global number names that number, as
+	// the SIP layer and the engine take it (messaging.UserOf).
+	HomeDomain      string
 	MaxParticipants int
 	IdleTTL         time.Duration
+	// PendingTTL is how long a group lasts until Established.
+	PendingTTL time.Duration
 	// SenderRate bounds the messages one participant writes in one group;
 	// FanoutRate the deliveries one group makes, a message counting once
 	// per recipient, of which one sender may use 1/FanoutSenderShare;
@@ -117,8 +133,14 @@ type Config struct {
 	// MaxTracked bounds the rate buckets and activity marks kept in
 	// memory.
 	MaxTracked int
-	Clock      msrp.Clock
-	Rand       io.Reader
+	// Task is this task's id, random at every start, and SIP its SIP
+	// instance address (host:port), as the owner of the groups it serves
+	// (#121); an empty Task is a random one. TaskHeartbeat, TaskLease and
+	// TaskSkew time its heartbeat (StartHeartbeat).
+	Task, SIP                          string
+	TaskHeartbeat, TaskLease, TaskSkew time.Duration
+	Clock                              msrp.Clock
+	Rand                               io.Reader
 }
 
 func (c Config) withDefaults() Config {
@@ -128,11 +150,23 @@ func (c Config) withDefaults() Config {
 	if c.IdleTTL <= 0 {
 		c.IdleTTL = DefaultIdleTTL
 	}
+	if c.PendingTTL <= 0 || c.PendingTTL >= c.IdleTTL {
+		c.PendingTTL = min(DefaultPendingTTL, c.IdleTTL/2)
+	}
 	if c.TouchInterval <= 0 {
 		c.TouchInterval = DefaultTouchInterval
 	}
 	if c.MaxTracked <= 0 {
 		c.MaxTracked = DefaultMaxTracked
+	}
+	if c.TaskHeartbeat <= 0 {
+		c.TaskHeartbeat = DefaultTaskHeartbeat
+	}
+	if c.TaskLease <= 0 {
+		c.TaskLease = DefaultTaskLease
+	}
+	if c.TaskSkew <= 0 {
+		c.TaskSkew = DefaultTaskSkew
 	}
 	addRate := messaging.Rate{PerMinute: DefaultAddRate.PerMinute, Burst: DefaultAddBurst(c.MaxParticipants)}
 	fanoutRate := messaging.Rate{PerMinute: DefaultFanoutRate.PerMinute, Burst: DefaultFanoutBurst(c.MaxParticipants)}
@@ -171,6 +205,10 @@ type RosterUpdate struct {
 	// gap and refreshes its subscription for a full document (Roster).
 	Full     bool
 	Document []byte
+	// Departed are the participants the change took out of the group:
+	// who left, declined or was removed. Their subscriptions end with it,
+	// so that they get no later change (#340).
+	Departed []string
 }
 
 // Invitee names someone to add to a group.
@@ -192,6 +230,13 @@ type CreateRequest struct {
 	// Conversation is the Conversation-ID of the request, a token as in
 	// 1-to-1 chat (messaging.ValidID); empty means one is generated.
 	Conversation string
+	// Contribution is the request's Contribution-ID, which names the chat
+	// to its clients (rcsjta's chat ID), a token too. When set, the
+	// conference URI is made from it, so that a creator trying its INVITE
+	// again after a CANCEL or a failure finds the group it made rather
+	// than making another under the same chat ID; anyone else naming it
+	// is refused (ErrTaken). Empty means a random URI.
+	Contribution string
 }
 
 // Service runs groups. Its methods are safe for concurrent use.
@@ -213,6 +258,11 @@ type Service struct {
 
 	mu      sync.Mutex
 	touched map[string]time.Time
+	// owned holds the groups this task owns, with the epoch it owns them
+	// at; beating and lastBeat its heartbeat (StartHeartbeat).
+	owned    map[string]groupstore.Owner
+	beating  bool
+	lastBeat time.Time
 }
 
 // New returns a Service and makes it the engine's GroupHandler.
@@ -251,17 +301,33 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		adds:        messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
+		owned:       map[string]groupstore.Owner{},
 		maxFormer:   former,
+	}
+	if s.cfg.Task == "" {
+		if s.cfg.Task, err = s.randomHex(16); err != nil {
+			return nil, err
+		}
 	}
 	engine.SetGroupHandler(s)
 	return s, nil
 }
 
 // Create makes a group of the creator, its chairman and already joined
-// (its INVITE is what creates it), and the invitees, invited.
+// (its INVITE is what creates it), and the invitees, invited. The group
+// lasts PendingTTL until Established, so that one no session came of
+// ends on its own.
+//
+// A Create whose Contribution names a group that exists returns that
+// group if the same creator made it and it is not yet established: its
+// INVITE is being tried again, with the group as it was first made. Any
+// other is ErrTaken, so that nobody, a participant the chairman removed
+// say, makes a group that its members' clients would take for the first
+// one (security review on #279).
 func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group, error) {
-	creator, ok := canonical(r.Creator)
-	if !ok || !validText(r.Subject, MaxSubjectLength) || r.Conversation != "" && !messaging.ValidID(r.Conversation) {
+	creator, ok := s.canonical(r.Creator)
+	if !ok || !validText(r.Subject, MaxSubjectLength) || r.Conversation != "" && !messaging.ValidID(r.Conversation) ||
+		r.Contribution != "" && !messaging.ValidID(r.Contribution) {
 		return groupstore.Group{}, ErrInvalid
 	}
 	r.Creator = creator
@@ -296,7 +362,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		s.metrics.Count("group.rejected.rate_limited", 1)
 		return groupstore.Group{}, ErrRateLimited
 	}
-	id, err := s.randomHex(16)
+	id, err := s.conferenceID(r.Contribution)
 	if err != nil {
 		return groupstore.Group{}, err
 	}
@@ -305,8 +371,10 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		return groupstore.Group{}, err
 	}
 	conv := r.Conversation
-	if conv == "" {
-		if conv, err = s.randomHex(16); err != nil {
+	if conv == "" && r.Contribution != "" {
+		conv = groupConversationID(r.Contribution)
+	} else if conv == "" {
+		if conv, err = s.randomUUID(); err != nil {
 			return groupstore.Group{}, err
 		}
 	}
@@ -315,7 +383,7 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 		Participants: []groupstore.Participant{{
 			Identity: r.Creator, DisplayName: r.CreatorName, Role: groupstore.Chairman, State: groupstore.Joined, Since: now,
 		}},
-		Version: 1, Created: now, Active: now, Expires: now.Add(s.cfg.IdleTTL),
+		Version: 1, Created: now, Active: now, Expires: now.Add(s.cfg.PendingTTL),
 	}
 	for _, in := range invitees {
 		g.Participants = append(g.Participants, groupstore.Participant{
@@ -326,14 +394,96 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	if err != nil {
 		return groupstore.Group{}, ErrInvalid
 	}
-	if err := s.store.Create(ctx, g, token, now); err != nil {
+	if !s.alive(now) {
+		// Its heartbeat has lapsed: another task may own what it made.
+		return groupstore.Group{}, ErrNotOwner
+	}
+	if err := s.store.Create(ctx, g, s.me(), token, now); errors.Is(err, groupstore.ErrExists) && r.Contribution != "" {
+		return s.retried(ctx, g.URI, creator)
+	} else if err != nil {
 		return groupstore.Group{}, err
 	}
+	// The owner record's epoch goes on from the URI's last group's (Create):
+	// the first write reads it, and remembers it.
 	g.Rev = 1
 	s.metrics.Count("group.created", 1)
 	s.metrics.Count("group.name_dropped", int64(dropped))
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})
 	return g, nil
+}
+
+// conferenceID is the identifier of a new group's conference URI, 32
+// lower-case hex digits: made from contribution, when there is one, or
+// random. A Contribution-ID is no secret from the group's participants,
+// who know the conference URI anyway, and the URI grants nothing: every
+// request to it is checked against the roster.
+func (s *Service) conferenceID(contribution string) (string, error) {
+	if contribution == "" {
+		return s.randomHex(16)
+	}
+	sum := sha256.Sum256([]byte("rcs-as group chat\x00" + contribution))
+	return hex.EncodeToString(sum[:16]), nil
+}
+
+// retried is the group uri for its creator trying its INVITE again
+// (Create), or ErrTaken.
+func (s *Service) retried(ctx context.Context, uri, creator string) (groupstore.Group, error) {
+	g, err := s.get(ctx, uri)
+	switch {
+	case errors.Is(err, ErrNoGroup):
+		// It ended in between: the client tries again, and makes it.
+		return groupstore.Group{}, ErrBusy
+	case err != nil:
+		return groupstore.Group{}, err
+	case g.Creator != creator || !s.pending(g):
+		s.metrics.Count("group.rejected.taken", 1)
+		return groupstore.Group{}, ErrTaken
+	}
+	s.metrics.Count("group.create_retried", 1)
+	return g, nil
+}
+
+// pending reports a group not yet Established: it still expires
+// PendingTTL after it was made, which any later write moves on.
+func (s *Service) pending(g groupstore.Group) bool {
+	return !g.Expires.After(g.Created.Add(s.cfg.PendingTTL))
+}
+
+// Established records that the group's creator has its session, so that
+// the group lasts as any other, RCSAS_GROUP_IDLE_TTL from its last use,
+// and that a Create naming its Contribution-ID is no longer its creator
+// trying again. It changes no roster and sends no NOTIFY.
+func (s *Service) Established(ctx context.Context, uri string) error {
+	for range maxAttempts {
+		g, err := s.get(ctx, uri)
+		if err != nil {
+			return err
+		}
+		if !s.pending(g) {
+			return nil
+		}
+		g.Expires = s.cfg.Clock.Now().Add(s.cfg.IdleTTL)
+		owner, err := s.owner(ctx, g)
+		if err != nil {
+			return err
+		}
+		token, err := s.randomHex(8)
+		if err != nil {
+			return err
+		}
+		err = s.store.Update(ctx, g, owner, token)
+		switch {
+		case errors.Is(err, groupstore.ErrConflict):
+			continue
+		case errors.Is(err, groupstore.ErrNotFound):
+			return ErrNoGroup
+		case errors.Is(err, groupstore.ErrNotOwner):
+			s.disown(uri)
+			return ErrNotOwner
+		}
+		return err
+	}
+	return ErrBusy
 }
 
 // canonicalInvitees puts the invitees' identities in canonical form,
@@ -348,7 +498,7 @@ func (s *Service) canonicalInvitees(in []Invitee) ([]Invitee, int) {
 	seen := make(map[string]bool, len(in))
 	skipped, dropped := 0, 0
 	for _, x := range in {
-		id, ok := canonical(x.Identity)
+		id, ok := s.canonical(x.Identity)
 		if !ok {
 			skipped++
 			continue
@@ -374,7 +524,7 @@ func (s *Service) canonicalInvitees(in []Invitee) ([]Invitee, int) {
 // group (messaging.Engine.ParticipantLeft): a copy queued before it left
 // or was removed is then given up, not kept to invite it again.
 func (s *Service) Join(ctx context.Context, uri, who, displayName string) (groupstore.Group, error) {
-	who, ok := canonical(who)
+	who, ok := s.canonical(who)
 	if !ok {
 		return groupstore.Group{}, ErrInvalid
 	}
@@ -429,7 +579,7 @@ func (s *Service) join(ctx context.Context, uri, who, displayName string) (group
 // left, the group ends. What is still queued for who from the group is
 // given up (messaging.Engine.ParticipantLeft).
 func (s *Service) Leave(ctx context.Context, uri, who string) error {
-	who, ok := canonical(who)
+	who, ok := s.canonical(who)
 	if !ok {
 		return ErrInvalid
 	}
@@ -485,7 +635,7 @@ func successor(g *groupstore.Group) int {
 // (messaging.Engine.ParticipantAdded). Only the chairman adds back someone
 // who was removed.
 func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error {
-	by, ok := canonical(by)
+	by, ok := s.canonical(by)
 	if !ok {
 		return ErrInvalid
 	}
@@ -560,8 +710,8 @@ func (s *Service) Add(ctx context.Context, uri, by string, who []Invitee) error 
 
 // Remove removes who from the group on behalf of by, its chairman.
 func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
-	by, ok := canonical(by)
-	who, ok2 := canonical(who)
+	by, ok := s.canonical(by)
+	who, ok2 := s.canonical(who)
 	if !ok || !ok2 {
 		return ErrInvalid
 	}
@@ -593,7 +743,7 @@ func (s *Service) Remove(ctx context.Context, uri, by, who string) error {
 // first NOTIFY of a subscription by who, a current participant (RFC 4575
 // §4.6). Others get ErrNotParticipant: the roster says who talks to whom.
 func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, error) {
-	who, ok := canonical(who)
+	who, ok := s.canonical(who)
 	if !ok {
 		return nil, 0, ErrInvalid
 	}
@@ -606,6 +756,19 @@ func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, 
 	}
 	doc, err := fullDocument(g)
 	return doc, g.Version, err
+}
+
+// FullRoster returns the group and its full conference-info document, for
+// whoever checks for itself who may read it: the SIP layer, to bring the
+// subscriptions of a group that missed a change up to date with one read
+// of the group for all of them (code review on #340).
+func (s *Service) FullRoster(ctx context.Context, uri string) (groupstore.Group, []byte, error) {
+	g, err := s.get(ctx, uri)
+	if err != nil {
+		return groupstore.Group{}, nil, err
+	}
+	doc, err := fullDocument(g)
+	return g, doc, err
 }
 
 // Get returns the group, ErrNoGroup if there is none.
@@ -657,11 +820,15 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 			s.metrics.Count("group.rejected.invalid", 1)
 			return groupstore.Group{}, ErrInvalid
 		}
+		owner, err := s.owner(ctx, g)
+		if err != nil {
+			return groupstore.Group{}, err
+		}
 		token, err := s.randomHex(8)
 		if err != nil {
 			return groupstore.Group{}, err
 		}
-		err = s.store.Update(ctx, g, token)
+		err = s.store.Update(ctx, g, owner, token)
 		if errors.Is(err, groupstore.ErrConflict) {
 			s.metrics.Count("group.update_conflict", 1)
 			continue
@@ -669,12 +836,22 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 		if errors.Is(err, groupstore.ErrNotFound) {
 			return groupstore.Group{}, ErrNoGroup
 		}
+		if errors.Is(err, groupstore.ErrNotOwner) {
+			s.disown(uri)
+			return groupstore.Group{}, ErrNotOwner
+		}
 		if err != nil {
 			return groupstore.Group{}, err
 		}
 		g.Rev++
 		s.metrics.Count("group.roster_changed", 1)
-		s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Document: doc})
+		var departed []string
+		for _, id := range changed {
+			if p, ok := g.Participant(id); ok && !p.State.Active() {
+				departed = append(departed, id)
+			}
+		}
+		s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Document: doc, Departed: departed})
 		return g, nil
 	}
 	return groupstore.Group{}, ErrBusy
@@ -749,7 +926,7 @@ func activeCount(g *groupstore.Group) int {
 // is-composing indication only to the joined ones, which have a session to
 // show it on. The sender's name is the one the roster holds.
 func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messaging.GroupKind) (messaging.Audience, error) {
-	sender, ok := canonical(sender)
+	sender, ok := s.canonical(sender)
 	if !ok {
 		return messaging.Audience{}, messaging.Reject(messaging.ReasonNotParticipant)
 	}
@@ -795,7 +972,7 @@ func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messa
 // Member implements messaging.GroupHandler: whether user is a current
 // participant, invited or joined.
 func (s *Service) Member(ctx context.Context, uri, user string) (bool, error) {
-	user, ok := canonical(user)
+	user, ok := s.canonical(user)
 	if !ok {
 		return false, nil
 	}
@@ -824,9 +1001,62 @@ func (s *Service) touch(ctx context.Context, g groupstore.Group, now time.Time) 
 	}
 	s.touched[g.URI] = now
 	s.mu.Unlock()
-	if err := s.store.Touch(ctx, g.URI, now, now.Add(s.cfg.IdleTTL)); err == nil {
-		s.metrics.Count("group.touched", 1)
+	owner, err := s.owner(ctx, g)
+	if err != nil {
+		return // the owner touches it
 	}
+	switch err := s.store.Touch(ctx, g.URI, owner, now, now.Add(s.cfg.IdleTTL)); {
+	case err == nil:
+		s.metrics.Count("group.touched", 1)
+	case errors.Is(err, groupstore.ErrNotOwner):
+		s.disown(g.URI)
+	}
+}
+
+// A group created without a Conversation-ID gets one in the UUID form OMA
+// CPM asks of it (Conversation Functions, Appendix C.1.1; #305). Groups
+// stored before keep the 32 hex digits they were made with: a
+// Conversation-ID is opaque, and is read and compared as stored.
+
+// randomUUID is a random UUID (RFC 9562 §5.4, version 4), for a group
+// created without a Contribution-ID either.
+func (s *Service) randomUUID() (string, error) {
+	u := make([]byte, 16)
+	if _, err := io.ReadFull(s.rand, u); err != nil {
+		return "", fmt.Errorf("group: random source: %w", err)
+	}
+	return uuidString(u, 4), nil
+}
+
+// groupNamespace is the UUID namespace of groupConversationID's
+// name-based UUIDs, chosen for rcs-as's groups; it is not
+// messaging.PairConversationID's.
+var groupNamespace = [16]byte{0xe5, 0x1a, 0xd9, 0x37, 0x23, 0x61, 0x43, 0x3b, 0xa3, 0xe7, 0x28, 0x3a, 0x7e, 0xf6, 0x41, 0xae}
+
+// groupConversationID is the Conversation-ID of a group made with a
+// Contribution-ID and no Conversation-ID: a name-based UUID (RFC 9562
+// §5.5, version 5) of the Contribution-ID alone, as the conference URI is
+// (conferenceID). rcsjta restarts a group that ended
+// (RestartGroupChatSession) at the factory under the same Contribution-ID,
+// from whichever participant writes next, not only its creator; the
+// restarted group so gets the same conference URI and Conversation-ID, and
+// a client that threads by it keeps one thread (lead's decision on #381).
+// A version 5 UUID never equals a version 4 one, the version digit
+// differing.
+func groupConversationID(contribution string) string {
+	h := sha1.New()
+	h.Write(groupNamespace[:])
+	h.Write([]byte(contribution))
+	return uuidString(h.Sum(nil)[:16], 5)
+}
+
+// uuidString sets u's version and the RFC 9562 variant, and writes it in
+// the 8-4-4-4-12 form.
+func uuidString(u []byte, version byte) string {
+	u[6] = u[6]&0x0f | version<<4
+	u[8] = u[8]&0x3f | 0x80
+	x := hex.EncodeToString(u)
+	return x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 }
 
 func (s *Service) randomHex(n int) (string, error) {

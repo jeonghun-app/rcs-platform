@@ -2,6 +2,9 @@ package diameter
 
 import (
 	"context"
+	"errors"
+	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -225,8 +228,7 @@ func TestAnAnswerReadyWhenTheWriterTakesTheDPRGoesFirst(t *testing.T) {
 	}
 	// The DPR exchange needs a running connection; the DWR proves it.
 	s.sync()
-	testHookTookLast = func(c *conn) { c.answers <- b }
-	t.Cleanup(func() { testHookTookLast = nil })
+	hookFor(t, hss.Peer(scscfHost).current(), func(c *conn) { c.answers <- b }, nil)
 	errc := make(chan error, 1)
 	go func() { errc <- hss.Shutdown(context.Background()) }()
 	if ans := s.read(); ans.IsRequest() || ans.HopByHop != late.HopByHop {
@@ -243,6 +245,406 @@ func TestAnAnswerReadyWhenTheWriterTakesTheDPRGoesFirst(t *testing.T) {
 	}
 }
 
+// A request that reaches the main queue only after the DPR, as one whose
+// sender found the connection open and was still waiting for room when
+// the DPR went in, is not written after it: nothing follows the DPR on the
+// wire (RFC 6733 §5.6, #324). The hook queues the request once the writer
+// has taken the DPR; then either the next read gets it or the writer drops
+// it. The writer goes on after the drop: the peer's DWR still gets its DWA.
+func TestNothingFollowsTheDPROnTheWire(t *testing.T) {
+	hss, ln, _ := startResponder(t, nil)
+	s := openScript(t, ln, scscfHost)
+	late := &Message{Flags: FlagRequest, Code: cmdTest, ApplicationID: appCx, HopByHop: 0x5152, EndToEnd: 0x5152, AVPs: s.origin()}
+	b, err := late.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sync()
+	dropped := make(chan struct{}, 1)
+	// The DPR has just left the main queue, so there is room for one.
+	hookFor(t, hss.Peer(scscfHost).current(),
+		func(c *conn) { c.writes <- queued{b: b, hbh: late.HopByHop} },
+		func(*conn) { dropped <- struct{}{} })
+	errc := make(chan error, 1)
+	go func() { errc <- hss.Shutdown(context.Background()) }()
+	dpr := s.read()
+	if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+		t.Fatalf("expected the DPR, got %+v", dpr)
+	}
+	reads := expectDropped(t, s, "DPR", dropped)
+	expectDWA(t, s, reads)
+	s.write(s.answer(dpr, ResultSuccess))
+	expectEnd(t, reads)
+	if err := <-errc; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// The same for the DPA a node sends when the peer disconnects.
+func TestNothingFollowsTheDPAOnTheWire(t *testing.T) {
+	_, peer, dialer, _ := startInitiator(t, nil)
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "peer to open", peer.Available)
+	s.sync()
+	late := &Message{Flags: FlagRequest, Code: cmdTest, ApplicationID: appCx, HopByHop: 0x5153, EndToEnd: 0x5153, AVPs: s.origin()}
+	b, err := late.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropped := make(chan struct{}, 1)
+	hookFor(t, peer.current(),
+		func(c *conn) { c.writes <- queued{b: b, hbh: late.HopByHop} },
+		func(*conn) { dropped <- struct{}{} })
+	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	if dpa := s.read(); dpa.IsRequest() || dpa.Code != CodeDisconnectPeer || dpa.HopByHop != dpr.HopByHop {
+		t.Fatalf("expected the DPA, got %+v", dpa)
+	}
+	reads := expectDropped(t, s, "DPA", dropped)
+	expectDWA(t, s, reads)
+	_ = s.nc.Close() // RFC 6733 §5.4: the DPR's sender closes on the DPA
+	expectEnd(t, reads)
+}
+
+// A DPR from the peer that crosses ours still gets its DPA: it is the one
+// message the main queue still sends after a DPR (code review of #367).
+func TestACrossingDPRGetsItsDPA(t *testing.T) {
+	hss, ln, _ := startResponder(t, nil)
+	s := openScript(t, ln, scscfHost)
+	s.sync()
+	errc := make(chan error, 1)
+	go func() { errc <- hss.Shutdown(context.Background()) }()
+	dpr := s.read()
+	if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+		t.Fatalf("expected the DPR, got %+v", dpr)
+	}
+	mine := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	if dpa := s.read(); dpa.IsRequest() || dpa.Code != CodeDisconnectPeer || dpa.HopByHop != mine.HopByHop {
+		t.Fatalf("expected the DPA to the crossing DPR, got %+v", dpa)
+	}
+	s.write(s.answer(dpr, ResultSuccess))
+	s.expectClosed()
+	if err := <-errc; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// A real Send that found the connection open, and reaches the main queue
+// only once the writer has taken the DPR, is dropped, and its caller learns
+// at once that it was not sent, as for a request refused before the send:
+// cxclient then retries it on another HSS task straight away and counts it
+// as never sent, rather than waiting for the connection to close, or for
+// RequestTimeout if the peer never answers the DPR (QA and code review of
+// #367).
+func TestARealSendBehindTheDPREndsAtOnceAsNotSent(t *testing.T) {
+	for _, answered := range []bool{true, false} {
+		t.Run(map[bool]string{true: "the peer answers the DPR", false: "the peer never answers it"}[answered], func(t *testing.T) {
+			hss, ln, clock := startResponder(t, nil)
+			s := openScript(t, ln, scscfHost)
+			s.sync()
+			peer := hss.Peer(scscfHost)
+			res, dropped := holdASend(t, peer.current(), func() error {
+				_, err := peer.Send(context.Background(), hss.NewRequest(cmdTest, appCx, hss.NewSessionID("")))
+				return err
+			})
+			errc := make(chan error, 1)
+			go func() { errc <- hss.Shutdown(context.Background()) }()
+			dpr := s.read()
+			if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+				t.Fatalf("expected the DPR, got %+v", dpr)
+			}
+			reads := expectDropped(t, s, "DPR", dropped)
+			expectNotSent(t, res)
+			if answered {
+				s.write(s.answer(dpr, ResultSuccess))
+			} else {
+				clock.waitForTimer(t, testRequestWait)
+				clock.Advance(testRequestWait)
+			}
+			expectEnd(t, reads)
+			<-errc
+		})
+	}
+}
+
+// The same behind the DPA a node sends when the peer disconnects.
+func TestARealSendBehindTheDPAEndsAtOnceAsNotSent(t *testing.T) {
+	for _, closes := range []bool{true, false} {
+		t.Run(map[bool]string{true: "the peer closes", false: "the peer keeps the connection"}[closes], func(t *testing.T) {
+			scscf, peer, dialer, clock := startInitiator(t, nil)
+			s := dialer.next(t)
+			acceptCER(t, s)
+			waitFor(t, "peer to open", peer.Available)
+			s.sync()
+			res, dropped := holdASend(t, peer.current(), func() error {
+				_, err := peer.Send(context.Background(), scscf.NewRequest(cmdTest, appCx, scscf.NewSessionID("")))
+				return err
+			})
+			dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+			if dpa := s.read(); dpa.IsRequest() || dpa.Code != CodeDisconnectPeer || dpa.HopByHop != dpr.HopByHop {
+				t.Fatalf("expected the DPA, got %+v", dpa)
+			}
+			reads := expectDropped(t, s, "DPA", dropped)
+			expectNotSent(t, res)
+			if closes {
+				_ = s.nc.Close()
+			} else {
+				// The grace timer starts once the DPA is written.
+				clock.waitForTimer(t, disconnectWaitForPeerToDrop)
+				clock.Advance(disconnectWaitForPeerToDrop)
+			}
+			expectEnd(t, reads)
+		})
+	}
+}
+
+// holdASend starts send, whose request on c is held after its closing check
+// until the writer has taken the DPR or DPA, and returns its outcome and the
+// writer's drops.
+func holdASend(t *testing.T, c *conn, send func() error) (<-chan error, <-chan struct{}) {
+	t.Helper()
+	reached, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	queuing := func(x *conn, m *Message) {
+		if x == c && m.Code == cmdTest {
+			once.Do(func() { close(reached); <-release })
+		}
+	}
+	testHookQueuing.Store(&queuing)
+	t.Cleanup(func() { testHookQueuing.Store(nil) })
+	dropped := make(chan struct{}, 1)
+	hookFor(t, c, func(*conn) { close(release) }, func(*conn) { dropped <- struct{}{} })
+	res := make(chan error, 1)
+	go func() { res <- send() }()
+	select {
+	case <-reached:
+	case <-time.After(realWait):
+		t.Fatal("the Send did not reach the queue")
+	}
+	return res, dropped
+}
+
+// expectNotSent checks that the dropped request's caller has its answer
+// already: ErrPeerUnavailable, which cxclient counts as never sent.
+func expectNotSent(t *testing.T, res <-chan error) {
+	t.Helper()
+	select {
+	case err := <-res:
+		if !errors.Is(err, ErrPeerUnavailable) || errors.Is(err, ErrConnectionClosed) || errors.Is(err, ErrTimeout) {
+			t.Fatalf("the dropped request ended with %v, want ErrPeerUnavailable", err)
+		}
+	case <-time.After(realWait):
+		t.Fatal("the dropped request has not ended while the connection is still open")
+	}
+}
+
+// hookFor sets the writer's hooks for c alone until the test ends.
+func hookFor(t *testing.T, c *conn, tookLast, dropped func(*conn)) {
+	t.Helper()
+	took := func(x *conn) {
+		if x == c && tookLast != nil {
+			tookLast(x)
+		}
+	}
+	drop := func(x *conn) {
+		if x == c && dropped != nil {
+			dropped(x)
+		}
+	}
+	testHookTookLast.Store(&took)
+	testHookDropped.Store(&drop)
+	t.Cleanup(func() { testHookTookLast.Store(nil); testHookDropped.Store(nil) })
+}
+
+type read struct {
+	m   *Message
+	err error
+}
+
+// expectDropped reads on from s and fails if a message follows the DPR or
+// DPA (what) before the writer drops the request queued behind it. It
+// returns what is read after that, up to the first error.
+func expectDropped(t *testing.T, s *script, what string, dropped <-chan struct{}) <-chan read {
+	t.Helper()
+	reads := make(chan read, 4)
+	go func() {
+		for {
+			_ = s.nc.SetReadDeadline(time.Now().Add(realWait))
+			m, err := ReadMessage(s.br, s.dict, Limits{})
+			reads <- read{m, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case r := <-reads:
+		if r.err == nil {
+			t.Fatalf("command %d followed the %s", r.m.Code, what)
+		}
+		t.Fatalf("the writer neither wrote nor dropped the request behind the %s: %v", what, r.err)
+	case <-dropped:
+	}
+	return reads
+}
+
+// expectDWA sends a DWR and checks that its answer is what s reads next: the
+// writer still writes after the drop.
+func expectDWA(t *testing.T, s *script, reads <-chan read) {
+	t.Helper()
+	dwr := s.request(&Message{Code: CodeDeviceWatchdog, AVPs: s.origin()})
+	r := <-reads
+	if r.err != nil || r.m.IsRequest() || r.m.Code != CodeDeviceWatchdog || r.m.HopByHop != dwr.HopByHop {
+		t.Fatalf("expected the DWA after the drop, got %+v", r)
+	}
+}
+
+// expectEnd checks that the connection closes next.
+func expectEnd(t *testing.T, reads <-chan read) {
+	t.Helper()
+	r := <-reads
+	if r.err == nil {
+		t.Fatalf("expected the connection to close, got command %d", r.m.Code)
+	}
+	if !errors.Is(r.err, io.EOF) && !errors.Is(r.err, io.ErrClosedPipe) {
+		t.Fatalf("expected the connection to close, got %v", r.err)
+	}
+}
+
+// The watchdog sends no DWR while the node disconnects (RFC 6733 §5.6,
+// Closing; #376): its interval passing after the DPR brings nothing before
+// the DPA to a crossing DPR, nor anything more before the connection
+// closes.
+func TestTheWatchdogSendsNoDWRAfterTheDPR(t *testing.T) {
+	hss, ln, clock := startResponder(t, nil)
+	s := openScript(t, ln, scscfHost)
+	s.sync()
+	c := hss.Peer(scscfHost).current()
+	clock.Advance(testWatchdog - 3*time.Second)
+	errc := make(chan error, 1)
+	go func() { errc <- hss.Shutdown(context.Background()) }()
+	dpr := s.read()
+	if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+		t.Fatalf("expected the DPR, got %+v", dpr)
+	}
+	// Past the watchdog's interval, short of the DPR's timeout; the
+	// watchdog has run once it has set its next timer.
+	c.mu.Lock()
+	armed := c.wdTimer
+	c.mu.Unlock()
+	clock.Advance(6 * time.Second)
+	waitFor(t, "the watchdog to run", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.wdTimer != armed
+	})
+	// The writer would drop a DWR now too; the watchdog does not even
+	// count one as sent.
+	c.mu.Lock()
+	pending := c.dwrPending
+	c.mu.Unlock()
+	if pending {
+		t.Fatal("the watchdog sent a DWR while the node disconnects")
+	}
+	expectNoRequestBeforeTheDPAToACrossingDPR(t, s)
+	s.write(s.answer(dpr, ResultSuccess))
+	s.expectClosed()
+	if err := <-errc; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// The same on the side that answers the peer's DPR: a watchdog interval
+// that passes while the node drains its handlers before the DPA sends no
+// DWR, which would reach the wire ahead of the DPA (code review of #383).
+func TestTheWatchdogSendsNoDWRWhileDrainingBeforeTheDPA(t *testing.T) {
+	started, release := make(chan *Message, 1), make(chan struct{})
+	scscf, peer, dialer, clock := startInitiator(t, func(c *Config) { c.WatchdogInterval = MinWatchdogInterval })
+	scscf.Handle(appCx, cmdTest, blockingHandler(scscf, started, release))
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "peer to open", peer.Available)
+	c := peer.current()
+	s.request(&Message{Code: cmdTest, ApplicationID: appCx, AVPs: s.origin()})
+	<-started
+	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	waitFor(t, "the DPR to be read", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.closing
+	})
+	c.mu.Lock()
+	armed := c.wdTimer
+	c.mu.Unlock()
+	clock.Advance(MinWatchdogInterval + 100*time.Millisecond)
+	waitFor(t, "the watchdog to run", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.wdTimer != armed
+	})
+	close(release)
+	for {
+		m := s.read()
+		if m.IsRequest() {
+			t.Fatalf("request %d before the DPA", m.Code)
+		}
+		if m.Code == CodeDisconnectPeer && m.HopByHop == dpr.HopByHop {
+			return
+		}
+	}
+}
+
+// A DWR already in the control queue when the writer takes the DPR is not
+// written after it either (#376).
+func TestADWRQueuedAsTheDPRGoesIsDropped(t *testing.T) {
+	hss, ln, _ := startResponder(t, nil)
+	s := openScript(t, ln, scscfHost)
+	s.sync()
+	hookFor(t, hss.Peer(scscfHost).current(), func(c *conn) { c.sendDWR() }, nil)
+	errc := make(chan error, 1)
+	go func() { errc <- hss.Shutdown(context.Background()) }()
+	dpr := s.read()
+	if !dpr.IsRequest() || dpr.Code != CodeDisconnectPeer {
+		t.Fatalf("expected the DPR, got %+v", dpr)
+	}
+	expectNoRequestBeforeTheDPAToACrossingDPR(t, s)
+	s.write(s.answer(dpr, ResultSuccess))
+	s.expectClosed()
+	if err := <-errc; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// The same for the DPA: a DWR queued as the writer takes it is dropped,
+// while the writer goes on answering (QA of #383).
+func TestADWRQueuedAsTheDPAGoesIsDropped(t *testing.T) {
+	_, peer, dialer, _ := startInitiator(t, nil)
+	s := dialer.next(t)
+	acceptCER(t, s)
+	waitFor(t, "peer to open", peer.Available)
+	s.sync()
+	hookFor(t, peer.current(), func(c *conn) { c.sendDWR() }, nil)
+	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	if dpa := s.read(); dpa.IsRequest() || dpa.Code != CodeDisconnectPeer || dpa.HopByHop != dpr.HopByHop {
+		t.Fatalf("expected the DPA, got %+v", dpa)
+	}
+	dwr := s.request(&Message{Code: CodeDeviceWatchdog, AVPs: s.origin()})
+	if m := s.read(); m.IsRequest() || m.Code != CodeDeviceWatchdog || m.HopByHop != dwr.HopByHop {
+		t.Fatalf("after the DPA expected the DWA, got %+v (request %v)", m, m.IsRequest())
+	}
+	_ = s.nc.Close() // RFC 6733 §5.4: the DPR's sender closes on the DPA
+}
+
+// expectNoRequestBeforeTheDPAToACrossingDPR sends a DPR and checks that its
+// DPA is the next thing s reads.
+func expectNoRequestBeforeTheDPAToACrossingDPR(t *testing.T, s *script) {
+	t.Helper()
+	mine := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
+	if m := s.read(); m.IsRequest() || m.Code != CodeDisconnectPeer || m.HopByHop != mine.HopByHop {
+		t.Fatalf("expected the DPA to the crossing DPR, got %+v (request %v)", m, m.IsRequest())
+	}
+}
+
 // The same for the DPA a node sends when the peer disconnects.
 func TestAnAnswerReadyWhenTheWriterTakesTheDPAGoesFirst(t *testing.T) {
 	scscf, peer, dialer, _ := startInitiator(t, nil)
@@ -255,8 +657,7 @@ func TestAnAnswerReadyWhenTheWriterTakesTheDPAGoesFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testHookTookLast = func(c *conn) { c.answers <- b }
-	t.Cleanup(func() { testHookTookLast = nil })
+	hookFor(t, peer.current(), func(c *conn) { c.answers <- b }, nil)
 	dpr := s.request(&Message{Code: CodeDisconnectPeer, AVPs: s.origin()})
 	if ans := s.read(); ans.IsRequest() || ans.HopByHop != late.HopByHop {
 		t.Fatalf("expected the ready answer first, got %+v", ans)

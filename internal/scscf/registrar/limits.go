@@ -227,7 +227,8 @@ func overRegisteredFlow(reg *state.Registration, flow string, now time.Time) boo
 
 // neverSent reports whether a MAR certainly did not reach the HSS
 // (cxclient.NeverSent): no HSS task was connected, or every attempt found
-// its task gone before the send. Only then are its counts given back. A
+// its task gone, or not speaking Cx, before the send. Only then are its
+// counts given back. A
 // DIAMETER_TOO_BUSY, an HSS that waited for the subscriber's lock, an
 // attempt that timed out, or a first attempt that did any of those before
 // its retry found no task (#261), which the HSS may have served, keeps
