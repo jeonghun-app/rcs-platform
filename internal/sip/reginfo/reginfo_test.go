@@ -806,8 +806,10 @@ func TestTheAORKeyAgreesWithEqualOnAWideSet(t *testing.T) {
 }
 
 // allocatedBytes is the bytes one Parse of text allocates, the fewest of
-// three runs: TotalAlloc counts only what this goroutine and the runtime
-// allocate meanwhile, and the test runs alone.
+// three runs. TotalAlloc counts what the whole process allocates meanwhile,
+// the runtime and every goroutine included, so the measure holds only while
+// nothing else in the package runs at the same time: no test here calls
+// t.Parallel, and one that did would make these counts its own too.
 func allocatedBytes(text string) uint64 {
 	best := uint64(1<<64 - 1)
 	var before, after runtime.MemStats

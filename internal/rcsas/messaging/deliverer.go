@@ -76,4 +76,11 @@ type Invitation struct {
 	// QueueID names, for a large-mode session, the one queued message it
 	// is for; empty for a chat session.
 	QueueID string
+	// Subject is a group's subject, for the INVITE that brings a new
+	// participant into it (Engine.Invite); empty otherwise.
+	Subject string
+	// Referrer is, for a group, who brings the recipient in: the creator
+	// or whoever added it, or the author of the message the invitation is
+	// for (RFC 3892 Referred-By, which rcsjta names the inviter by).
+	Referrer string
 }

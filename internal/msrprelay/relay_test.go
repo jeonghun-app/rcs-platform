@@ -432,13 +432,18 @@ func TestCoreDialerRefusesAddressesOutsideItsNetworks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	dial := coreDialer([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, []uint16{2855}, time.Second)
+	// No dial timeout: what is checked is the refusal, which Control makes
+	// on the resolved address before any connect, and the 1 s it had also
+	// bounded the lookup of localhost, which a loaded host took longer for
+	// (#292). Every dial here ends at Control, or at the go test timeout.
+	const noTimeout = 0
+	dial := coreDialer([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, []uint16{2855}, noTimeout)
 	if _, err := dial(context.Background(), "tcp", ln.Addr().String()); !errors.Is(err, errCoreNotAllowed) {
 		t.Fatalf("dial = %v, want errCoreNotAllowed", err)
 	}
 	// So is the port, inside the allowed networks.
 	loopback := []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
-	if _, err := coreDialer(loopback, []uint16{1}, time.Second)(context.Background(), "tcp", ln.Addr().String()); !errors.Is(err, errCoreNotAllowed) {
+	if _, err := coreDialer(loopback, []uint16{1}, noTimeout)(context.Background(), "tcp", ln.Addr().String()); !errors.Is(err, errCoreNotAllowed) {
 		t.Fatalf("dial to a port outside the list = %v, want errCoreNotAllowed", err)
 	}
 	// A name is checked on what it resolves to.
