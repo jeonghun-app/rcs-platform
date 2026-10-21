@@ -353,3 +353,38 @@ func TestCallerPreferencesChooseTheBindings(t *testing.T) {
 		t.Errorf("no device for the service: %d", d.Status)
 	}
 }
+
+// TestAnItemNamingTheSavedIncarnationIsNotWritten: only a stale item is
+// repaired, or every terminating request would cost a store write (QA on
+// #322).
+func TestAnItemNamingTheSavedIncarnationIsNotWritten(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	rt := e.router(nil)
+	rt.Terminating(bg, request(t, "INVITE", impu1))
+	rt.Wait()
+	if n := e.metrics.get("routing.identity_repaired") + e.metrics.get("routing.identity_repair_failed"); n != 0 {
+		t.Errorf("%d repairs for an item naming the saved incarnation", n)
+	}
+}
+
+// TestAnOPTIONSIsRoutedAsAnyRequest (#14 AC 6): forked to the bindings,
+// recorded and prepared alike, and 480 for a user without a live binding.
+func TestAnOPTIONSIsRoutedAsAnyRequest(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour), binding(2, 0, time.Hour))
+	rt := e.router(nil)
+	r := request(t, "OPTIONS", impu1)
+	d := rt.Terminating(bg, r)
+	if got := uris(d.Targets); len(got) != 2 || len(d.RecordRoute) != 1 {
+		t.Fatalf("targets %v, Record-Route %v", got, d.RecordRoute)
+	}
+	b := r.Message.Clone()
+	if err := d.Prepare(bg, d.Targets[0], b); err != nil || b.Header.Get("P-Called-Party-ID") != "<"+impu1+">" {
+		t.Errorf("prepared %v, P-Called-Party-ID %q", err, b.Header.Get("P-Called-Party-ID"))
+	}
+	e.clock.advance(2 * time.Hour)
+	if d := rt.Terminating(bg, request(t, "OPTIONS", impu1)); d.Status != 480 {
+		t.Errorf("without a live binding: %d", d.Status)
+	}
+}

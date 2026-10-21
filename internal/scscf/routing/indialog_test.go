@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -8,9 +9,18 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
-// inDialog is a request inside a dialog for target, with route as its Route
-// after the S-CSCF's own entries ("" for none).
-func inDialog(t *testing.T, target, route string) *proxy.Request {
+// Hops of the tests' dialogs: rcs-as's task, a P-CSCF's core listener with
+// a flow, and core addresses no dialog goes through.
+var (
+	asTask  = "sip:10.0.131.7:5060;transport=tcp"
+	pcscfUE = "sip:" + flow(1) + "@198.51.100.5:5070;transport=tcp;lr"
+	icscf   = "sip:" + flow(1) + "@10.0.130.25:5060;transport=tcp;lr"
+	hss     = "sip:" + flow(1) + "@10.0.130.26:3868;transport=tcp;lr"
+)
+
+// inDialog is a request inside dialog-1 for target, with route as its Route
+// after the S-CSCF's own entries ("" for none), which it consumed as routed.
+func inDialog(t *testing.T, target, route string, routed ...sip.Address) *proxy.Request {
 	t.Helper()
 	fields := []string{
 		"BYE " + target + " SIP/2.0",
@@ -24,41 +34,65 @@ func inDialog(t *testing.T, target, route string) *proxy.Request {
 	if route != "" {
 		fields = append(fields, "Route: "+route)
 	}
-	return &proxy.Request{Message: parse(t, strings.Join(fields, "\r\n")+"\r\nContent-Length: 0\r\n\r\n")}
+	return &proxy.Request{Message: parse(t, strings.Join(fields, "\r\n")+"\r\nContent-Length: 0\r\n\r\n"), Routed: routed}
 }
 
-// TestARequestInsideADialogGoesOnlyWhereThePlatformRuns (#208): to an
-// application server, or a P-CSCF's core listener naming a flow; anywhere
-// else, the S-CSCF itself included, is 403.
-func TestARequestInsideADialogGoesOnlyWhereThePlatformRuns(t *testing.T) {
+// signedFor is the S-CSCF's Record-Route value rt signs dialog-1's hops
+// with.
+func signedFor(rt *Router, hops ...string) sip.Address {
+	keys := make([]string, len(hops))
+	for i, h := range hops {
+		keys[i] = hopKey(mustURI(h))
+	}
+	return rt.signedRR("dialog-1", keys...)
+}
+
+// TestARequestInsideADialogGoesOnlyToAHopItsRouteSigned (#322): the next
+// hop, the Route after the S-CSCF's or the Request-URI, must be one its
+// Record-Route value signed for the dialog, at a P-CSCF's core port or an
+// application server's, and never the S-CSCF; anything else is 403.
+func TestARequestInsideADialogGoesOnlyToAHopItsRouteSigned(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil, func(c *Config) { c.Self = append(c.Self, mustURI("sip:10.0.131.9")) })
+	old := e.router(nil, func(c *Config) {
+		c.DialogKeys = []DialogKey{{ID: "k1", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
+	})
+	rotated := e.router(nil, func(c *Config) {
+		c.DialogKeys = []DialogKey{{ID: "k3", Key: bytes.Repeat([]byte{3}, MinDialogKeyBytes)}, {ID: "k1", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
+	})
+	other := e.router(nil, func(c *Config) {
+		c.DialogKeys = []DialogKey{{ID: "k2", Key: bytes.Repeat([]byte{9}, MinDialogKeyBytes)}}
+	})
 	ue := "sip:ue@192.0.2.40:5060;transport=tcp"
 	for name, c := range map[string]struct {
+		rt            *Router
 		target, route string
+		routed        []sip.Address
 		allowed       bool
 	}{
-		"an application server":            {ue, "<sip:rcs-as.rcs.local;lr>", true},
-		"a P-CSCF by name, with a flow":    {ue, "<sip:" + flow(1) + "@pcscf.rcs.local:5070;lr>", true},
-		"a P-CSCF by address, with a flow": {ue, pathOf(1), true},
-		"a P-CSCF named by the target":     {"sip:" + flow(1) + "@198.51.100.6:5070", "", true},
-		"a P-CSCF without a flow":          {ue, "<sip:pcscf.rcs.local:5070;lr>", false},
-		"a P-CSCF with what is no flow":    {ue, "<sip:term@pcscf.rcs.local:5070;lr>", false},
-		"the I-CSCF":                       {ue, "<sip:icscf.rcs.local;lr>", false},
-		"a private address":                {ue, "<sip:10.0.3.7:8080;lr>", false},
-		"a flow token elsewhere":           {ue, "<sip:" + flow(1) + "@10.0.3.7;lr>", false},
-		"the S-CSCF itself":                {ue, "<sip:" + flow(1) + "@scscf.rcs.local;lr>", false},
-		"the S-CSCF among the P-CSCFs":     {ue, "<sip:" + flow(1) + "@198.51.100.9;lr>", false},
-		"the client's contact itself":      {ue, "", false},
-		"a tel URI":                        {"tel:+15550100003", "", false},
+		"rcs-as's task, its Contact":        {rt, asTask, "", []sip.Address{signedFor(rt, asTask, pcscfUE)}, true},
+		"a P-CSCF's flow":                   {rt, ue, "<" + pcscfUE + ">", []sip.Address{signedFor(rt, asTask, pcscfUE)}, true},
+		"a hop signed with the old key":     {rotated, ue, "<" + pcscfUE + ">", []sip.Address{signedFor(old, pcscfUE)}, true},
+		"the hop the dialog did not go to":  {rt, ue, "<" + icscf + ">", []sip.Address{signedFor(rt, asTask, pcscfUE)}, false},
+		"another flow of the P-CSCF":        {rt, ue, "<sip:" + flow(2) + "@198.51.100.5:5070;transport=tcp;lr>", []sip.Address{signedFor(rt, pcscfUE)}, false},
+		"another port of the hop":           {rt, ue, "<sip:" + flow(1) + "@198.51.100.5:5071;transport=tcp;lr>", []sip.Address{signedFor(rt, pcscfUE)}, false},
+		"another transport of the hop":      {rt, ue, "<sip:" + flow(1) + "@198.51.100.5:5070;transport=udp;lr>", []sip.Address{signedFor(rt, pcscfUE)}, false},
+		"a signed hop at no role's port":    {rt, ue, "<" + hss + ">", []sip.Address{signedFor(rt, hss)}, false},
+		"the S-CSCF itself, signed":         {rt, "sip:10.0.131.9:5060;transport=tcp", "", []sip.Address{signedFor(rt, "sip:10.0.131.9:5060;transport=tcp")}, false},
+		"no signature":                      {rt, asTask, "", []sip.Address{{URI: mustURI("sip:scscf.rcs.local;transport=tcp;lr")}}, false},
+		"nothing routed":                    {rt, asTask, "", nil, false},
+		"another key":                       {rt, asTask, "", []sip.Address{signedFor(other, asTask)}, false},
+		"a key no longer kept":              {rt, asTask, "", []sip.Address{signedFor(old, asTask)}, false},
+		"the hop the last entry signs":      {rt, asTask, "", []sip.Address{signedFor(rt, pcscfUE), signedFor(rt, asTask)}, true},
+		"not the hop the last entry signs":  {rt, asTask, "", []sip.Address{signedFor(rt, asTask), signedFor(rt, pcscfUE)}, false},
+		"a garbled signature":               {rt, asTask, "", []sip.Address{garbled(signedFor(rt, asTask))}, false},
+		"a key's MAC under another's ID":    {rotated, asTask, "", []sip.Address{relabelled(signedFor(old, asTask), "k3")}, false},
+		"a signed hop at 5070 over UDP":     {rt, ue, "<sip:10.0.140.1:5070;transport=udp;lr>", []sip.Address{signedFor(rt, "sip:10.0.140.1:5070;transport=udp")}, false},
+		"a signed hop at 5060 over UDP":     {rt, "sip:10.0.140.1:5060;transport=udp", "", []sip.Address{signedFor(rt, "sip:10.0.140.1:5060;transport=udp")}, false},
+		"a signature without a key ID part": {rt, asTask, "", []sip.Address{{URI: mustURI("sip:scscf.rcs.local;transport=tcp;lr;dlg=k2")}}, false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			e := newEnv(t)
-			// The S-CSCF's own address is in the P-CSCFs' network too, as
-			// tasks of one subnet are.
-			rt := e.router(nil, func(cfg *Config) {
-				self, _ := sip.ParseURI("sip:198.51.100.9")
-				cfg.Self = append(cfg.Self, self)
-			})
-			d := rt.InDialog(bg, inDialog(t, c.target, c.route))
+			d := c.rt.InDialog(bg, inDialog(t, c.target, c.route, c.routed...))
 			if got := d.Status == 0; got != c.allowed {
 				t.Errorf("forwarded %v (status %d), want %v", got, d.Status, c.allowed)
 			}
@@ -70,6 +104,33 @@ func TestARequestInsideADialogGoesOnlyWhereThePlatformRuns(t *testing.T) {
 			}
 		})
 	}
+	// Another Call-ID: the signature is the dialog's.
+	r := inDialog(t, asTask, "", signedFor(rt, asTask))
+	_ = r.Message.Header.Set("Call-ID", "dialog-2")
+	if d := rt.InDialog(bg, r); d.Status != 403 {
+		t.Errorf("another dialog's request is %d", d.Status)
+	}
+}
+
+// relabelled is a with its signature's key ID changed to id.
+func relabelled(a sip.Address, id string) sip.Address {
+	v, _ := a.URI.Param(dlgParam)
+	_, macs, _ := strings.Cut(v, ".")
+	a.URI.Params = append(sip.Params(nil), a.URI.Params...)
+	a.URI.Params.Set(dlgParam, id+"."+macs)
+	return a
+}
+
+// garbled is a with the last character of its signature changed.
+func garbled(a sip.Address) sip.Address {
+	v, _ := a.URI.Param(dlgParam)
+	last := "A"
+	if strings.HasSuffix(v, "A") {
+		last = "B"
+	}
+	a.URI.Params = append(sip.Params(nil), a.URI.Params...)
+	a.URI.Params.Set(dlgParam, v[:len(v)-1]+last)
+	return a
 }
 
 func TestAnUnreadableRouteInsideADialogIs400(t *testing.T) {
@@ -83,23 +144,23 @@ func TestAnUnreadableRouteInsideADialogIs400(t *testing.T) {
 // TestThePCSCFsPublicAddressEndsTheRouteSet (#14): rcsjta puts the Route of
 // a dialog's first INVITE, the P-CSCF's public address, after the route
 // set in its session refreshes; the request goes by its Request-URI, which
-// must still be a hop the platform runs.
+// must still be a hop the dialog was signed for.
 func TestThePCSCFsPublicAddressEndsTheRouteSet(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil)
+	signed := signedFor(rt, asTask, pcscfUE)
 	for name, c := range map[string]struct {
 		target, route string
 		allowed       bool
 	}{
-		"to an application server":  {"sip:rcs-as.rcs.local;transport=tcp", "<sip:pcscf.example.net:5061;transport=tls;lr>", true},
-		"by its address":            {"sip:rcs-as.rcs.local", "<sip:203.0.113.5:5061;transport=tls;lr>", true},
-		"with more after it":        {"sip:rcs-as.rcs.local", "<sip:pcscf.example.net;lr>, <sip:10.0.3.7:8080;lr>", true},
-		"to a client flow":          {"sip:" + flow(1) + "@198.51.100.6:5070", "<sip:pcscf.example.net;lr>", true},
-		"to the I-CSCF":             {"sip:icscf.rcs.local", "<sip:pcscf.example.net;lr>", false},
-		"to a client's own address": {"sip:ue@192.0.2.40:5060", "<sip:pcscf.example.net;lr>", false},
+		"to rcs-as's task":   {asTask, "<sip:pcscf.example.net:5061;transport=tls;lr>", true},
+		"by its address":     {asTask, "<sip:203.0.113.5:5061;transport=tls;lr>", true},
+		"with more after it": {asTask, "<sip:pcscf.example.net;lr>, <sip:10.0.3.7:8080;lr>", true},
+		"to the I-CSCF":      {"sip:10.0.130.25:5060;transport=tcp", "<sip:pcscf.example.net;lr>", false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			e := newEnv(t)
-			r := inDialog(t, c.target, c.route)
-			d := e.router(nil).InDialog(bg, r)
+			r := inDialog(t, c.target, c.route, signed)
+			d := rt.InDialog(bg, r)
 			if got := d.Status == 0; got != c.allowed {
 				t.Fatalf("forwarded %v (status %d), want %v", got, d.Status, c.allowed)
 			}
@@ -113,15 +174,14 @@ func TestThePCSCFsPublicAddressEndsTheRouteSet(t *testing.T) {
 			if b.Header.Has("Route") || d.Targets[0].URI.String() != r.Message.URI.String() {
 				t.Errorf("Route %q, Request-URI %s", b.Header.Get("Route"), d.Targets[0].URI.String())
 			}
-			if e.metrics.get("routing.in_dialog.trailing_route") != 1 {
-				t.Error("not counted")
-			}
 		})
 	}
-	// Without the P-CSCF's public address in the way, the Route is kept.
-	e := newEnv(t)
-	r := inDialog(t, "sip:ue@192.0.2.40:5060", "<sip:rcs-as.rcs.local;lr>, <sip:pcscf.example.net;lr>")
-	if d := e.router(nil).InDialog(bg, r); d.Status != 0 || d.Prepare != nil {
+	if e.metrics.get("routing.in_dialog.trailing_route") != 3 {
+		t.Errorf("counted %d", e.metrics.get("routing.in_dialog.trailing_route"))
+	}
+	// Without the P-CSCF's public address next, the Route is kept.
+	r := inDialog(t, "sip:ue@192.0.2.40:5060", "<"+pcscfUE+">, <sip:pcscf.example.net;lr>", signed)
+	if d := rt.InDialog(bg, r); d.Status != 0 || d.Prepare != nil {
 		t.Errorf("status %d, Prepare set %v", d.Status, d.Prepare != nil)
 	}
 }
@@ -132,15 +192,58 @@ func TestNewRefusesARecordRouteOverAnotherTransport(t *testing.T) {
 	for _, v := range []string{"<sip:scscf.rcs.local;lr>", "<sip:scscf.rcs.local;transport=udp;lr>"} {
 		e := newEnv(t)
 		rr, _ := sip.ParseAddress(v)
-		self, _ := sip.ParseURI("sip:scscf.rcs.local")
-		if _, err := New(Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}}); err == nil {
+		if _, err := New(validConfig(e, func(c *Config) { c.RecordRoute = rr })); err == nil {
 			t.Errorf("%s accepted", v)
 		}
 	}
 	e := newEnv(t)
 	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=TCP;lr>")
-	self, _ := sip.ParseURI("sip:scscf.rcs.local")
-	if _, err := New(Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}}); err != nil {
+	if _, err := New(validConfig(e, func(c *Config) { c.RecordRoute = rr })); err != nil {
 		t.Error(err)
+	}
+}
+
+// validConfig is a config New takes, changed by tweak.
+func validConfig(e *env, tweak func(*Config)) Config {
+	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
+	c := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{mustURI("sip:scscf.rcs.local")}, DialogKeys: []DialogKey{{ID: "k2", Key: dialogKey}}}
+	tweak(&c)
+	return c
+}
+
+// TestNewRefusesWhatWouldLetAnyHopThrough (#322): an entry without a host
+// would be taken for a URI without one, and a dialog key must be one.
+func TestNewRefusesWhatWouldLetAnyHopThrough(t *testing.T) {
+	key := DialogKey{ID: "k2", Key: dialogKey}
+	for name, tweak := range map[string]func(*Config){
+		"no dialog key":            func(c *Config) { c.DialogKeys = nil },
+		"a short key":              func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k2", Key: dialogKey[:MinDialogKeyBytes-1]}} },
+		"a key without an ID":      func(c *Config) { c.DialogKeys = []DialogKey{{Key: dialogKey}} },
+		"a key ID with a dot":      func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k.2", Key: dialogKey}} },
+		"a long key ID":            func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k23456789", Key: dialogKey}} },
+		"two keys of one ID":       func(c *Config) { c.DialogKeys = []DialogKey{key, key} },
+		"a server without a port":  func(c *Config) { c.ApplicationServers = []sip.URI{mustURI("sip:rcs-as.rcs.local;transport=tcp")} },
+		"a server without a host":  func(c *Config) { c.ApplicationServers = []sip.URI{{Scheme: "sip", Port: 5060}} },
+		"a server that is not SIP": func(c *Config) { c.ApplicationServers = []sip.URI{mustURI("tel:+15550100005")} },
+		"an empty public host":     func(c *Config) { c.EdgeProxyPublicHosts = []string{"pcscf.example.net", ""} },
+		"a Self without a host":    func(c *Config) { c.Self = append(c.Self, sip.URI{Scheme: "sip"}) },
+	} {
+		e := newEnv(t)
+		if _, err := New(validConfig(e, tweak)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// TestTheRouterKeepsItsOwnCopyOfTheKeys: a caller that clears its keys
+// leaves the router signing as before.
+func TestTheRouterKeepsItsOwnCopyOfTheKeys(t *testing.T) {
+	e := newEnv(t)
+	keys := []DialogKey{{ID: "k2", Key: bytes.Clone(dialogKey)}}
+	rt := e.router(nil, func(c *Config) { c.DialogKeys = keys })
+	clear(keys[0].Key)
+	keys[0].ID = "x"
+	if d := e.router(nil).InDialog(bg, inDialog(t, asTask, "", signedFor(rt, asTask))); d.Status != 0 {
+		t.Errorf("status %d", d.Status)
 	}
 }

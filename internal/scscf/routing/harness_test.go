@@ -1,10 +1,10 @@
 package routing
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
-	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -99,7 +99,7 @@ func (c *counts) get(name string) int64 {
 }
 
 type env struct {
-	t       *testing.T
+	t       testing.TB
 	store   *state.Memory
 	clock   *clock
 	metrics *counts
@@ -107,6 +107,21 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	return &env{t: t, store: state.NewMemory(), clock: &clock{now: t0}, metrics: &counts{}}
+}
+
+// dialogKey signs the routers' Record-Route values; asURI is rcs-as's
+// listener.
+var (
+	dialogKey = bytes.Repeat([]byte{0x5d}, MinDialogKeyBytes)
+	asURI     = mustURI("sip:rcs-as.rcs.local:5060;transport=tcp")
+)
+
+func mustURI(s string) sip.URI {
+	u, err := sip.ParseURI(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
 }
 
 func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
@@ -118,9 +133,8 @@ func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
 	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
 	cfg := Config{
 		Store: st, RecordRoute: rr, Self: []sip.URI{self}, Now: e.clock.Now, Metrics: e.metrics,
-		ApplicationServers:   []string{"rcs-as.rcs.local"},
-		EdgeProxyHosts:       []string{"pcscf.rcs.local"},
-		EdgeProxyNets:        []netip.Prefix{netip.MustParsePrefix("198.51.100.0/28")},
+		DialogKeys:           []DialogKey{{ID: "k2", Key: dialogKey}},
+		ApplicationServers:   []sip.URI{asURI},
 		EdgeProxyPublicHosts: []string{"pcscf.example.net", "203.0.113.5"},
 	}
 	for _, f := range tweak {

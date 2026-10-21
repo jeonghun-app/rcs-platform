@@ -37,3 +37,25 @@ func FuzzCallerPreferences(f *testing.F) {
 		}
 	})
 }
+
+// FuzzDialogSignature: a dlg value signs the hops it was made for, for its
+// Call-ID, and any other value signs nothing, without a panic.
+func FuzzDialogSignature(f *testing.F) {
+	e := &env{t: f, store: state.NewMemory(), clock: &clock{now: t0}, metrics: &counts{}}
+	rt := e.router(nil)
+	f.Add("k2.AAAAAAAAAAAAAAAAAAAAAA", "dialog-1", "sip:a@198.51.100.5:5070;tcp", "sip:@10.0.131.7:5060;tcp")
+	f.Add("k2..", "", "", "")
+	f.Add(".", "x", "y", "z")
+	f.Fuzz(func(t *testing.T, v, callID, hopA, hopB string) {
+		if rt.signedHop(v, callID, hopA) {
+			t.Fatalf("a value the router did not make signs %q", hopA)
+		}
+		signed, _ := rt.signedRR(callID, hopA, hopB).URI.Param(dlgParam)
+		if !rt.signedHop(signed, callID, hopA) || !rt.signedHop(signed, callID, hopB) {
+			t.Fatal("a signed hop does not verify")
+		}
+		if other := hopA + "x"; other != hopB && rt.signedHop(signed, callID, other) || rt.signedHop(signed, callID+"x", hopA) {
+			t.Fatal("verified for another hop or dialog")
+		}
+	})
+}

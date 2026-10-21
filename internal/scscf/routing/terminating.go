@@ -28,13 +28,25 @@ const saveAttempts = 3
 // instance only the latest at a time (RFC 5626 §7), the next if that one's
 // edge proxy answers 430. It is 404 for a
 // Request-URI that is no public identity or is a barred one, 480 for a user
-// without a live binding the preferences accept, and 500 with Retry-After
-// for a store that cannot be read.
+// without a live binding the preferences accept, 400 for more than
+// maxPreferences of them or one that requires something and does not
+// parse, and 500 with Retry-After for a store that cannot
+// be read. The S-CSCF's Record-Route value signs the dialog's hops
+// (recorder).
 func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decision {
 	impu, ok := identity.CanonicalIMPU(r.Message.URI.String())
 	if !ok {
 		rt.count("routing.terminating.not_found")
 		return proxy.Decision{Status: 404, Reason: "Not Found"}
+	}
+	prefs, err := preferencesOf(r.Message)
+	switch {
+	case errors.Is(err, errTooManyPreferences):
+		rt.count("routing.terminating.too_many_preferences")
+		return proxy.Decision{Status: 400, Reason: "Too Many Caller Preferences"}
+	case err != nil:
+		rt.count("routing.terminating.bad_preference")
+		return proxy.Decision{Status: 400, Reason: "Bad Caller Preference"}
 	}
 	now := rt.cfg.Now()
 	set, err := rt.lookup(ctx, impu, now)
@@ -49,7 +61,8 @@ func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decis
 		rt.count("routing.terminating.not_registered")
 		return proxy.Decision{Status: 480, Reason: "Temporarily Unavailable"}
 	}
-	d := &delivery{rt: rt, key: set.Key, candidates: accepted(live(set, now), r.Message)}
+	var ops int
+	d := &delivery{rt: rt, key: set.Key, candidates: prefs.accepted(live(set, now), &ops)}
 	targets := d.targets(onePerInstance(d.candidates))
 	if len(targets) == 0 {
 		rt.count("routing.terminating.no_contact")
@@ -57,14 +70,19 @@ func (rt *Router) Terminating(ctx context.Context, r *proxy.Request) proxy.Decis
 	}
 	rt.count("routing.terminating")
 	called := sip.Address{URI: r.Message.URI}.String()
+	rec := rt.recorder(r.Message)
 	return proxy.Decision{
 		Targets:     targets,
 		RecordRoute: []sip.Address{rt.cfg.RecordRoute},
 		Prepare: func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 			// The Request-URI the request came with, which the contact's
 			// Request-URI replaces (§5.4.3.3).
-			return req.Header.Set("P-Called-Party-ID", called)
+			if err := req.Header.Set("P-Called-Party-ID", called); err != nil {
+				return err
+			}
+			return rec.prepare(req)
 		},
+		OnResponse:      rec.response,
 		OnBranchFailure: d.failed,
 	}
 }

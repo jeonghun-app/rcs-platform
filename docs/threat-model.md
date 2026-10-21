@@ -63,14 +63,18 @@ as long as the flow lives, but not reach the client with any other. `pcscf` fixe
 client's in-dialog request, to `scscf`; whether such requests then reach
 `rcs-as`, which records itself in the dialog, depends on `scscf`, which
 checks it as an acceptance criterion of
-[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). A possible
-mitigation is a dialog-state check in `scscf`, such as a signed
-Record-Route parameter it verifies. `scscf` sends a request inside a dialog
-on only to an application server or to a `pcscf` core listener naming a
-flow, never to itself, the I-CSCF or any other core address
-(`internal/scscf/routing`, #14); it keeps no dialog state, so a client can
-still drop an application server's entry from its route set, which the
-signed parameter would also close.
+[#14](https://github.com/jeonghun-app/rcs-platform/issues/14). `scscf`
+signs its own Record-Route value when it sets up a dialog: a key ID and a MAC,
+under a key every `scscf` task shares (current and previous, for rotation),
+over the Call-ID, its name and each of the dialog's hops next to it (scheme,
+user, host, port, transport). It sends a request inside a dialog on only to
+a hop that value signs, at a `pcscf` core port or an application server's
+port, and never to itself (`internal/scscf/routing`, #322); a client that
+names any other core address, or drops an application server's entry from
+its route set, gets 403. No host or subnet list is involved: every core task
+shares the private subnets, and task addresses change. As with `pcscf`'s
+value, the binding covers the Call-ID and not the tags, so a peer can go on
+sending to the dialog's own hops with that Call-ID after the call has ended.
 The client's in-dialog requests are checked against the same MAC, so a
 client cannot change the icid its dialog's requests are charged to (review
 of #221; this closes the #208 residual risk that it could).
