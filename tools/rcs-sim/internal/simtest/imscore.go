@@ -205,15 +205,16 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	if len(t1) > 0 {
 		cfg.T1 = t1[0]
 		// The layer answers 500 for a TU that has not answered within
-		// NonInviteFinalTimeout, 128*T1 by default. The stand-in answers a
-		// request routed to a callee that never answers itself, once the
-		// forwarded request's Timer F (64*T1) ends it, with the 408 its
-		// tests expect (#363 is to answer as the platform's proxy does, which
-		// sends no 408 to a non-INVITE, RFC 4320 §4.2). With a T1 of
-		// milliseconds the two timers were a fraction of a second apart,
-		// and a loaded host let the layer's 500 come first (#339). The
-		// safety net keeps the margin a proxy's has instead, in time the
-		// work takes rather than in T1.
+		// NonInviteFinalTimeout, 128*T1 by default. A non-INVITE routed to
+		// a callee that never answers is left unanswered once the
+		// forwarded request's Timer F (64*T1) ends it, as the platform's
+		// proxy leaves it (RFC 4320 §4.2, #363): the stand-in ends its
+		// server transaction with an answer it does not send, and that
+		// has to come before the layer's 500. With a T1 of milliseconds
+		// the two timers were a fraction of a second apart, and a loaded
+		// host let the 500 come first (#339). The safety net keeps the
+		// margin a proxy's has instead, in time the work takes rather than
+		// in T1.
 		cfg.NonInviteFinalTimeout = 64*cfg.T1 + transaction.FinalTimeoutMargin
 	}
 	if c.layer, err = transaction.New(quietSender{Sender: tr, c: c}, c, cfg); err != nil {

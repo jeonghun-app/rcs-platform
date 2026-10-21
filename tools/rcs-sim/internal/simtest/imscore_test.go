@@ -3,6 +3,9 @@ package simtest_test
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -107,6 +110,103 @@ func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
 	if n := core.Silenced(); n != 1 {
 		t.Fatalf("the core left %d requests unanswered, want the MESSAGE", n)
 	}
+}
+
+func TestAnInviteTheCalledPartyNeverGetsIsAnswered408(t *testing.T) {
+	// #363, review of #372: unlike a non-INVITE, an INVITE whose
+	// terminating transaction times out gets its 408 (RFC 3261 §16.8), as
+	// the platform's proxy sends it. B's layer would send 100 Trying to
+	// any INVITE it got, which stops Timer B, so B is cut off instead: it
+	// registers through a hop that afterwards passes nothing the core
+	// sends. The core's T1 is 10 ms, so its Timer B ends the INVITE at
+	// 640 ms, long before the originator's own 32 s.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	hop, cutOff := oneWayHop(t, core.Addr)
+	bURI, _ := sip.ParseURI(impuB)
+	creds, err := sipua.DigestCredentials(impiB, []byte("b-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: hop, Domain: domain, IMPU: bURI,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000002", Credentials: creds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if _, err := b.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cutOff()
+	req, err := a.NewInvite(bURI, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, res, err := a.Invite(ctx, req, nil)
+	if err != nil || d != nil || res == nil {
+		t.Fatalf("INVITE nobody gets = dialog %v, %v; want the core's 408", d, err)
+	}
+	if res.StatusCode != 408 {
+		t.Fatalf("INVITE nobody gets = %d %s, want the core's 408", res.StatusCode, res.Reason)
+	}
+	if n := core.Silenced(); n != 0 {
+		t.Fatalf("the core left %d requests unanswered, want none", n)
+	}
+}
+
+// oneWayHop relays one TCP connection to target and back; once cutOff is
+// called it drops what target sends instead of passing it on.
+func oneWayHop(t *testing.T, target netip.AddrPort) (addr netip.AddrPort, cutOff func()) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cut atomic.Bool
+	var mu sync.Mutex
+	var conns []net.Conn
+	keep := func(c net.Conn) {
+		mu.Lock()
+		defer mu.Unlock()
+		conns = append(conns, c)
+	}
+	t.Cleanup(func() {
+		_ = l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		in, err := l.Accept()
+		if err != nil {
+			return
+		}
+		keep(in)
+		out, err := net.Dial("tcp", target.String())
+		if err != nil {
+			_ = in.Close()
+			return
+		}
+		keep(out)
+		go func() { _, _ = io.Copy(out, in) }()
+		buf := make([]byte, 4096)
+		for {
+			n, err := out.Read(buf)
+			if n > 0 && !cut.Load() {
+				if _, err := in.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return netip.MustParseAddrPort(l.Addr().String()), func() { cut.Store(true) }
 }
 
 func TestAnExpiredBindingEndsItsRegEventSubscription(t *testing.T) {
