@@ -353,12 +353,14 @@ func TestContentHeaderLimitsCountEveryLineAndByte(t *testing.T) {
 // allocate a small multiple of the input, which load does not change.
 //
 // Time is measured too, for a quadratic step that allocates nothing, but
-// compared rather than bounded (#289; a 5 s bound failed at host load 225
-// under -race): 64 times the input is about 64 times the time if linear and
-// 4096 times if quadratic, so a bound of 512 between them needs no slack.
-// The two sizes are timed in turn, the best of five runs of each taken, and
-// only three attempts in a row over the bound fail the test: a loaded host
-// slows one attempt, a quadratic parser every one. Under the race detector,
+// compared rather than bounded (#289: a 5 s bound failed at host load 225
+// under -race). The same total of input is parsed both ways: the maximum
+// size once, and a 64th of it 64 times. Linear parsing takes about as long
+// for either, quadratic 64 times as long for the one, so a bound of 8
+// between them needs no slack; and as both take about as long, a loaded
+// host stretches both about alike, which it did not for one small parse
+// against one large one. The best of five of each is taken, and only three
+// attempts in a row over the bound fail the test. Under the race detector,
 // which times its own instrumentation as much as the parser, only
 // allocations are compared, as in internal/sip/reginfo (#263).
 func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
@@ -383,10 +385,12 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 		return
 	}
 	small := foldedHeaders(DefaultMaxSize/64 - 64)
-	parse := func(b []byte) time.Duration {
+	parse := func(b []byte, times int) time.Duration {
 		start := time.Now()
-		if _, err := l.Parse(b); err != nil {
-			t.Fatal(err)
+		for range times {
+			if _, err := l.Parse(b); err != nil {
+				t.Fatal(err)
+			}
 		}
 		return time.Since(start)
 	}
@@ -394,14 +398,14 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	for range 3 {
 		smallTime, largeTime = time.Duration(1<<62), time.Duration(1<<62)
 		for range 5 {
-			smallTime = min(smallTime, parse(small))
-			largeTime = min(largeTime, parse(data))
+			smallTime = min(smallTime, parse(small, 64))
+			largeTime = min(largeTime, parse(data, 1))
 		}
-		if largeTime <= 512*smallTime {
+		if largeTime <= 8*smallTime {
 			return
 		}
 	}
-	t.Errorf("64× the input took %v against %v, three times over: not linear", largeTime, smallTime)
+	t.Errorf("parsing %d bytes once took %v, a 64th of it 64 times %v, three times over: not linear", len(data), largeTime, smallTime)
 }
 
 func TestHeaderNamesAreCaseSensitive(t *testing.T) {
