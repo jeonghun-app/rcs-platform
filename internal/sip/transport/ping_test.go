@@ -159,6 +159,11 @@ func TestPongsKeepAPingingFlowFromGoingIdle(t *testing.T) {
 		eventually(t, "the pong to start the idle period again", func() bool {
 			return !conn.last().Before(before.Add(idle))
 		})
+		// The idle period, not a longer one such as the read timeout of a
+		// message begun (code review of #404).
+		if l := conn.last(); l.After(time.Now().Add(idle)) {
+			t.Fatalf("round %d: idle deadline %v from now, more than the idle timeout %v", round, time.Until(l).Round(10*time.Millisecond), idle)
+		}
 		if _, ok := client.Flow(flow); !ok {
 			t.Fatalf("round %d: the flow is gone; stats = %+v", round, client.Stats())
 		}
