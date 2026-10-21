@@ -27,6 +27,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // ContentType is the MIME type of a conference-info document (RFC 4575 §9.2).
@@ -167,12 +169,12 @@ type Endpoint struct {
 // the content of a deleted element is dropped, as RFC 4575 §4.4 tells a
 // subscriber to ignore it.
 func Parse(data []byte) (*Info, error) {
-	if err := checkDocument(data); err != nil {
+	if err := document.Check(data); err != nil {
 		return nil, err
 	}
 	var w wireInfo
-	if err := xml.NewDecoder(bytes.NewReader(withoutBOM(data))).Decode(&w); err != nil {
-		return nil, decodeError(err)
+	if err := xml.NewDecoder(bytes.NewReader(xmlsafe.WithoutBOM(data))).Decode(&w); err != nil {
+		return nil, document.DecodeError(err)
 	}
 	info, err := w.info()
 	if err != nil {
@@ -192,62 +194,62 @@ func (c *Info) Marshal() ([]byte, error) {
 	}
 	var b bytes.Buffer
 	b.WriteString(xml.Header)
-	w := &xmlWriter{e: xml.NewEncoder(&b)}
+	w := xmlsafe.NewWriter(&b)
 	// The namespace is declared once on the root; encoding/xml would repeat
 	// it on every element if the names carried it.
-	w.start("conference-info",
+	w.Start("conference-info",
 		xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: Namespace},
 		attr("entity", c.Entity),
 		attr("state", string(c.State.orFull())),
 		attr("version", strconv.FormatUint(uint64(c.Version), 10)))
 	if d := c.Description; d != nil {
-		w.start("conference-description")
+		w.Start("conference-description")
 		optionalText(w, "display-text", d.DisplayText)
 		optionalText(w, "subject", d.Subject)
-		w.end("conference-description")
+		w.End("conference-description")
 	}
 	if c.Users != nil {
-		w.start("users", attr("state", string(c.Users.State.orFull())))
+		w.Start("users", attr("state", string(c.Users.State.orFull())))
 		for _, u := range c.Users.List {
 			writeUser(w, u)
 		}
-		w.end("users")
+		w.End("users")
 	}
-	w.end("conference-info")
-	if err := w.close(); err != nil {
+	w.End("conference-info")
+	if err := w.Close(); err != nil {
 		return nil, err
 	}
 	return b.Bytes(), nil
 }
 
-func writeUser(w *xmlWriter, u User) {
-	w.start("user", attr("entity", u.Entity), attr("state", string(u.State.orFull())))
+func writeUser(w *xmlsafe.Writer, u User) {
+	w.Start("user", attr("entity", u.Entity), attr("state", string(u.State.orFull())))
 	optionalText(w, "display-text", u.DisplayText)
 	if len(u.Roles) > 0 {
-		w.start("roles")
+		w.Start("roles")
 		for _, r := range u.Roles {
-			w.text("entry", r)
+			w.Text("entry", r)
 		}
-		w.end("roles")
+		w.End("roles")
 	}
 	for _, e := range u.Endpoints {
-		w.start("endpoint", attr("entity", e.Entity), attr("state", string(e.State.orFull())))
+		w.Start("endpoint", attr("entity", e.Entity), attr("state", string(e.State.orFull())))
 		optionalText(w, "display-text", e.DisplayText)
 		optionalText(w, "status", string(e.Status))
 		optionalText(w, "joining-method", string(e.JoiningMethod))
 		optionalText(w, "disconnection-method", string(e.DisconnectionMethod))
-		w.end("endpoint")
+		w.End("endpoint")
 	}
-	w.end("user")
+	w.End("user")
 }
 
 func attr(name, value string) xml.Attr {
 	return xml.Attr{Name: xml.Name{Local: name}, Value: value}
 }
 
-func optionalText(w *xmlWriter, name, value string) {
+func optionalText(w *xmlsafe.Writer, name, value string) {
 	if value != "" {
-		w.text(name, value)
+		w.Text(name, value)
 	}
 }
 
@@ -272,7 +274,7 @@ func (c *Info) validate() error {
 			return fmt.Errorf("%w: deleted conference with content", ErrMalformed)
 		}
 	}
-	if d := c.Description; d != nil && (!isXMLText(d.DisplayText) || !isXMLText(d.Subject)) {
+	if d := c.Description; d != nil && (!xmlsafe.IsText(d.DisplayText) || !xmlsafe.IsText(d.Subject)) {
 		return fmt.Errorf("%w: description contains characters XML cannot carry", ErrMalformed)
 	}
 	if c.Users != nil {
@@ -313,11 +315,11 @@ func (u *User) validate(parent State) error {
 	if u.State.orFull() == Deleted && (u.DisplayText != "" || len(u.Roles) > 0 || len(u.Endpoints) > 0) {
 		return fmt.Errorf("%w: deleted user with content", ErrMalformed)
 	}
-	if !isXMLText(u.DisplayText) {
+	if !xmlsafe.IsText(u.DisplayText) {
 		return fmt.Errorf("%w: user display text contains characters XML cannot carry", ErrMalformed)
 	}
 	for _, r := range u.Roles {
-		if !isXMLText(r) {
+		if !xmlsafe.IsText(r) {
 			return fmt.Errorf("%w: role contains characters XML cannot carry", ErrMalformed)
 		}
 	}
@@ -336,7 +338,7 @@ func (u *User) validate(parent State) error {
 
 func (e *Endpoint) validate(parent State) error {
 	// The endpoint entity is an xs:string rather than a URI (RFC 4575 §6).
-	if e.Entity == "" || !isXMLText(e.Entity) {
+	if e.Entity == "" || !xmlsafe.IsText(e.Entity) {
 		return fmt.Errorf("%w: endpoint entity missing or invalid", ErrMalformed)
 	}
 	if err := childState(parent, e.State); err != nil {
@@ -346,7 +348,7 @@ func (e *Endpoint) validate(parent State) error {
 		return fmt.Errorf("%w: deleted endpoint with content", ErrMalformed)
 	}
 	switch {
-	case !isXMLText(e.DisplayText):
+	case !xmlsafe.IsText(e.DisplayText):
 		return fmt.Errorf("%w: endpoint display text contains characters XML cannot carry", ErrMalformed)
 	case e.Status != "" && !slices.Contains(endpointStatuses, e.Status):
 		return fmt.Errorf("%w: unknown endpoint status", ErrMalformed)
@@ -379,5 +381,5 @@ func childState(parent, child State) error {
 // isURIText reports whether s can be an anyURI value that survives a round
 // trip unchanged.
 func isURIText(s string) bool {
-	return isXMLText(s) && !strings.ContainsAny(s, " \t\r\n")
+	return xmlsafe.IsText(s) && !strings.ContainsAny(s, " \t\r\n")
 }

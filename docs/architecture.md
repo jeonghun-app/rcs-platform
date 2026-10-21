@@ -76,6 +76,8 @@ internal/
   msrp/                     RFC 4975 codec, chunking, reports, connections, Bridge
   cpim/, imdn/              message/cpim wrapper and IMDN notifications
   conference/               RFC 4575 conference-info documents
+  xmlsafe/                  the checks every XML document reader shares: size,
+                            DTD, depth, one root, attributes, character references
   ftserver/                 ft-server service logic
   ftserver/store/           ft-server storage interfaces, memory backends,
                             storetest contract
@@ -269,7 +271,10 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   may *interpret* common deviations leniently where interoperability needs it
   (e.g. bare LF, extra whitespace) and count them; senders are strict. Anything
   ambiguous, or a security risk (control characters, invalid UTF-8, mixed line
-  endings, limits), is rejected. XML parsers never resolve entities.
+  endings, limits), is rejected. XML parsers never resolve entities, and read
+  every document through `internal/xmlsafe`, which refuses what encoding/xml
+  lets through but a well-formed document cannot have (a DTD, a reference to
+  a surrogate, attributes run together, `<?XML`).
 - **Time and randomness** are injected so timers and nonces are testable.
 
 ## 9. Specifications
