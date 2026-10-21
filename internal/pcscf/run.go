@@ -197,12 +197,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer cancel()
 	ids := fl.ids()
 	rt.Logger.Info("draining client flows", slog.Int("flows", len(ids)), slog.Duration("over", cfg.DrainTimeout))
-	// The requests in progress finish meanwhile, under the same deadline;
-	// what is left then is answered 500 with Retry-After (#281).
-	answered := make(chan int, 1)
-	go func() { answered <- px.Drain(drainCtx) }()
 	drain(drainCtx, ids, cfg.DrainTimeout, tr.CloseFlow, d.sleep, d.now)
-	if n := <-answered; n > 0 {
+	// Requests are served all through the flow drain. What is still in
+	// progress after it gets answersWait, then a 500 with Retry-After, so
+	// its sender tries another task at once (#281).
+	answersCtx, cancelAnswers := context.WithTimeout(context.Background(), answersWait)
+	defer cancelAnswers()
+	if n := px.Drain(answersCtx); n > 0 {
 		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
 	}
 	return nil

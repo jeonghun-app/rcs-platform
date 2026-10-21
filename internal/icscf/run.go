@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"strconv"
 	"sync/atomic"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
@@ -124,22 +123,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		d.listening(coreAddr)
 	}
 	<-ctx.Done()
-	drain(px, cfg.DrainTimeout)
-	return nil
-}
-
-// drain waits, for at most d, until no request is in progress, so a stop
-// does not cut off a REGISTER waiting for the S-CSCF or a ringing INVITE:
-// their senders would get no final response (review of #276). The listener
-// stays open meanwhile, since Cloud Map's DNS answers name this task for
-// their TTL after it is deregistered. A context that lingers after a 2xx to
-// pass its retransmissions on no longer counts, so a stop right after a call
-// returns at once. #281 tracks a drain shared by every proxy.
-func drain(px *proxy.Proxy, d time.Duration) {
-	deadline := time.Now().Add(d)
-	for px.Stats().Contexts > 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// The listener stays open meanwhile, since Cloud Map's DNS answers name
+	// this task for their TTL after it is deregistered (review of #276).
+	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)
+	defer cancel()
+	if n := px.Drain(drainCtx); n > 0 {
+		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
 	}
+	return nil
 }
 
 // newCxClient is the Cx client to the HSS tasks, with this task's own

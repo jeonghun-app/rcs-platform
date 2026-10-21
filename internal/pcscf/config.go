@@ -63,6 +63,12 @@ const (
 	// stopMargin is what Run needs after the drain to close the proxy and
 	// the transport and flush the last metrics, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
+	// answersWait, a part of stopMargin, bounds the wait after the drain
+	// for the requests still in progress: the 430 for a request on one of
+	// the last flows closed goes out after the close (#234), and closing
+	// the proxy first would drop it. A request still waiting on the core
+	// holds it to the end.
+	answersWait = 2 * time.Second
 )
 
 // Config is pcscf's configuration (docs/pcscf.md).

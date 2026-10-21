@@ -460,3 +460,21 @@ func TestABlackholedAddressCostsOneShortTimeoutOnce(t *testing.T) {
 		t.Fatalf("second: %d after %v, want 200 at once from the good address", code, took)
 	}
 }
+
+// #281: a request still in progress when ICSCF_DRAIN_TIMEOUT runs out is
+// answered 500 with Retry-After, so the sender tries another task at once.
+func TestAStopAnswersARequestLeftInProgress500(t *testing.T) {
+	scscf := startSlowSCSCF(t, 20*time.Second)
+	hss := startHSS(t)
+	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), scscf.uri() }
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
+		c.DrainTimeout = 300 * time.Millisecond
+	})
+	r.waitReady(t)
+	msg := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
+	<-scscf.got
+	go r.stop()
+	if got := <-msg; got != "500" {
+		t.Errorf("MESSAGE left at the stop: %s, want 500", got)
+	}
+}

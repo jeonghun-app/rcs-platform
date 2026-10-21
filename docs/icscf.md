@@ -110,6 +110,9 @@ On SIGTERM `icscf` keeps its listener open and waits, for at most
 `ICSCF_DRAIN_TIMEOUT`, until no request is in progress, so a REGISTER at the
 S-CSCF or a ringing INVITE still gets its final response. A call that has
 had its 2xx no longer counts, so a stop right after one returns at once.
+A request still in progress at the end is answered 500 with `Retry-After`,
+and its INVITE branches are cancelled, so its sender tries another task at
+once instead of waiting for its own timers (`proxy.Drain`, #281).
 
 ## AWS permissions
 
@@ -122,4 +125,3 @@ service as resources: the call names both. Infra adds it on #56.
 - The transaction caps of #37 are not configurable here until it lands.
 - S-CSCF re-selection, and the other parts of TS 24.229 §5.3 listed in the
   package documentation.
-- A drain shared by every proxy service (#281); icscf has its own until then.
