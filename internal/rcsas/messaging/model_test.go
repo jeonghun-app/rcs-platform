@@ -2,12 +2,14 @@ package messaging
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
 func TestConversationHeadersAreTrimmedTokens(t *testing.T) {
@@ -21,6 +23,30 @@ func TestConversationHeadersAreTrimmedTokens(t *testing.T) {
 	c, err = ParseConversationHeaders("a", "b", " Cc.!%*_+`'~ ")
 	if err != nil || c.InReplyTo != "Cc.!%*_+`'~" {
 		t.Fatalf("got %+v, %v", c, err)
+	}
+}
+
+// rcsjta sends a Contribution-ID without a Conversation-ID (#298): the
+// request is in the contribution, with no Conversation-ID made up for it.
+func TestAContributionIDAloneIsTaken(t *testing.T) {
+	for _, h := range [][3]string{{"", "b", ""}, {" ", "b", "c"}} {
+		c, err := ParseConversationHeaders(h[0], h[1], h[2])
+		if err != nil || c != (Conversation{Contribution: "b", InReplyTo: h[2]}) {
+			t.Errorf("ParseConversationHeaders(%q) = %+v, %v", h, c, err)
+		}
+	}
+}
+
+// #298: the Conversation-ID of a pair is a name-based UUID, the same in
+// either direction and for nobody else, in the UUID form OMA CPM Appendix
+// C.1.1 asks for. The value is pinned: it is on what clients have stored.
+func TestAPairHasOneConversationID(t *testing.T) {
+	id := PairConversationID(alice, bob)
+	if id != "68bd5347-a895-52c6-9c0b-96a162a0fbd9" || PairConversationID(bob, alice) != id || !ValidID(id) {
+		t.Fatalf("PairConversationID = %q, %q", id, PairConversationID(bob, alice))
+	}
+	if PairConversationID(alice, carol) == id || PairConversationID(alice, alice) == id {
+		t.Fatal("another pair has the same ID")
 	}
 }
 
@@ -54,8 +80,8 @@ func TestQueueIDsKeepTheirOrderWithinATask(t *testing.T) {
 func TestConversationHeadersOutsideTheGrammarAreRefused(t *testing.T) {
 	long := strings.Repeat("a", MaxIDLength+1)
 	for _, h := range [][3]string{
-		{"", "b", ""},
 		{"a", "", ""},
+		{"", "", "c"},
 		{"a b", "c", ""},
 		{"a", "b;c", ""},
 		{"a", "b", "c\r\nVia: x"},
@@ -201,5 +227,36 @@ func TestTheLimiterForgetsSendersRatherThanGrow(t *testing.T) {
 	l.allow("new", t0)
 	if _, ok := l.full["used"]; !ok || len(l.full) != 2 {
 		t.Fatalf("buckets %v", l.full)
+	}
+}
+
+// #298: two messages between the same pair, one each way, each with a
+// Contribution-ID and no Conversation-ID, are stored with one
+// Conversation-ID, the pair's, which rcs-as delivers them with; one that
+// names its own keeps it, and one with no conversation headers has none.
+func TestMessagesOfAPairWithoutAConversationIDShareOne(t *testing.T) {
+	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}})
+	for _, o := range []Origin{
+		{Sender: alice, Recipient: bob, Conversation: Conversation{Contribution: "c1"}},
+		{Sender: bob, Recipient: alice, Conversation: Conversation{Contribution: "c2", InReplyTo: "c1"}},
+		{Sender: alice, Recipient: bob, Conversation: Conversation{ID: "own", Contribution: "c3"}},
+		{Sender: alice, Recipient: bob},
+	} {
+		o.Mode, o.Pager, o.CPIM = store.Standalone, true, chat(t, "", "hi", 0)
+		if err := r.e.Submit(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each goes out in pager mode with the conversation it was stored
+	// with; the store is not read, as a delivered message leaves it.
+	pair := PairConversationID(alice, bob)
+	var got []string
+	for range 4 {
+		d := r.d.nextPager(t)
+		got = append(got, d.Conversation.Contribution+"="+d.Conversation.ID)
+	}
+	slices.Sort(got)
+	if want := []string{"=", "c1=" + pair, "c2=" + pair, "c3=own"}; !slices.Equal(got, want) {
+		t.Fatalf("delivered %v, want %v", got, want)
 	}
 }
