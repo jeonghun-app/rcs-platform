@@ -336,9 +336,10 @@ func (p *peer) sending(branch string) {
 }
 
 // finalFor reads the final response to the request with branch and cseq.
-// A response to an earlier request of the peer, such as a 2xx sent again
-// until its ACK arrives (RFC 3261 §13.3.1.4; #303, #327), is passed over;
-// one to no request of the peer is an error, not a response to wait past.
+// A 2xx to an earlier INVITE of the peer, sent again until its ACK arrives
+// (RFC 3261 §13.3.1.4; #303, #327), is passed over; any other response to
+// an earlier request, or one to no request of the peer, is an error, not a
+// response to wait past.
 func (p *peer) finalFor(branch string, cseq sip.CSeq) (*sip.Response, error) {
 	for {
 		msg, err := p.r.ReadMessage()
@@ -366,7 +367,11 @@ func (p *peer) finalFor(branch string, cseq sip.CSeq) (*sip.Response, error) {
 			if res.StatusCode >= 200 {
 				return res, nil
 			}
+		case earlier && res.StatusCode/100 == 2 && got.Method == "INVITE":
+			// The one response sent again over TCP: a 2xx to an INVITE,
+			// until its ACK (RFC 3261 §13.3.1.4, §17.2.2).
 		case earlier:
+			return nil, fmt.Errorf("a %d to an earlier %s of this peer, which is never sent again", res.StatusCode, got.Method)
 		default:
 			return nil, fmt.Errorf("a %d to no request of this peer: CSeq %d %s, branch %q", res.StatusCode, got.Seq, got.Method, b)
 		}
@@ -442,10 +447,10 @@ func (e *fakeEngine) origins() []messaging.Origin {
 }
 
 // #327: a peer takes for its request's answer only the final response
-// with the request's branch and CSeq. A response to one of its earlier
-// requests, which the connection may still carry (a 2xx retransmitted
-// before its ACK), is passed over; one to no request of the peer is an
-// error.
+// with the request's branch and CSeq. A 2xx to one of its earlier INVITEs,
+// which the connection may still carry until the ACK, is passed over; any
+// other response to an earlier request, which TCP never sends again, or
+// one to no request of the peer, is an error.
 func TestAPeerTakesOnlyTheResponseToItsRequest(t *testing.T) {
 	here, there := net.Pipe()
 	t.Cleanup(func() { _ = here.Close(); _ = there.Close() })
@@ -478,34 +483,40 @@ func TestAPeerTakesOnlyTheResponseToItsRequest(t *testing.T) {
 		}
 		return res
 	}
-	options := func(cseq int) msg { return msg{method: "OPTIONS", uri: bob, callID: "sipas-peer-test", cseq: cseq} }
+	in1 := func(method string, cseq int) msg {
+		return msg{method: method, uri: bob, callID: "sipas-peer-test", cseq: cseq}
+	}
 
-	var first *sip.Response
+	var invited, optioned *sip.Response
 	answer(func(req *sip.Request) []*sip.Response {
-		first = respond(req, 200, "first")
-		return []*sip.Response{first}
+		invited = respond(req, 200, "invited")
+		return []*sip.Response{invited}
 	})
-	if res := p.send(options(1)); res.Reason != "first" {
-		t.Fatalf("first request: %d %s", res.StatusCode, res.Reason)
+	if res := p.send(in1("INVITE", 1)); res.Reason != "invited" {
+		t.Fatalf("the INVITE: %d %s", res.StatusCode, res.Reason)
 	}
 	answer(func(req *sip.Request) []*sip.Response {
-		return []*sip.Response{first, respond(req, 100, "Trying"), respond(req, 200, "second")}
+		optioned = respond(req, 200, "second")
+		return []*sip.Response{invited, respond(req, 100, "Trying"), optioned}
 	})
-	if res := p.send(options(2)); res.Reason != "second" {
-		t.Fatalf("second request took %d %s", res.StatusCode, res.Reason)
+	if res := p.send(in1("OPTIONS", 2)); res.Reason != "second" {
+		t.Fatalf("the OPTIONS took %d %s", res.StatusCode, res.Reason)
 	}
-	for name, change := range map[string]func(*sip.Response){
-		"another branch": func(res *sip.Response) {
-			_ = res.Header.Set("Via", "SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-sipas-elsewhere")
-		},
-		"another CSeq": func(res *sip.Response) { _ = res.Header.Set("CSeq", "9 OPTIONS") },
-	} {
-		answer(func(req *sip.Request) []*sip.Response {
+	for name, stray := range map[string]func(req *sip.Request) *sip.Response{
+		"an earlier OPTIONS's 200": func(*sip.Request) *sip.Response { return optioned },
+		"another branch": func(req *sip.Request) *sip.Response {
 			res := respond(req, 200, "stray")
-			change(res)
-			return []*sip.Response{res}
-		})
-		if res, err := p.try(options(3)); err == nil || !strings.Contains(err.Error(), "no request of this peer") {
+			_ = res.Header.Set("Via", "SIP/2.0/TCP 192.0.2.20:5060;branch=z9hG4bK-sipas-elsewhere")
+			return res
+		},
+		"another CSeq": func(req *sip.Request) *sip.Response {
+			res := respond(req, 200, "stray")
+			_ = res.Header.Set("CSeq", "9 OPTIONS")
+			return res
+		},
+	} {
+		answer(func(req *sip.Request) []*sip.Response { return []*sip.Response{stray(req)} })
+		if res, err := p.try(in1("OPTIONS", 3)); err == nil || !strings.Contains(err.Error(), "of this peer") {
 			t.Errorf("%s: %v, %v", name, res, err)
 		}
 	}
