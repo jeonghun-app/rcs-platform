@@ -66,6 +66,7 @@ func Run(t *testing.T, newStore func(t *testing.T) groupstore.Store, disown func
 		unowned(t, s, func(uri string) { disown(t, s, uri) })
 	})
 	t.Run("AnExpiredGroupsURIGetsANewOwner", func(t *testing.T) { recreated(t, newStore(t)) })
+	t.Run("ALateWriteOfAnExpiredGroupMissesItsSuccessor", func(t *testing.T) { recreatedBySameTask(t, newStore(t)) })
 	t.Run("HeartbeatsReadBack", func(t *testing.T) { heartbeats(t, newStore(t)) })
 }
 
@@ -432,12 +433,42 @@ func recreated(t *testing.T, s groupstore.Store) {
 	if err := s.Create(ctx, g2, c, "c2", later); err != nil {
 		t.Fatal(err)
 	}
-	if o, _ := s.Owner(ctx, g.URI); o.Task != c.Task || o.Epoch != 1 {
+	// The epoch goes on from the old group's (a 1, b 2).
+	if o, _ := s.Owner(ctx, g.URI); o.Task != c.Task || o.Epoch != 3 {
 		t.Fatalf("Owner of the new group = %+v", o)
 	}
 	got, _ := s.Get(ctx, g.URI, later)
 	if err := s.Update(ctx, got, b, "u1"); !errors.Is(err, groupstore.ErrNotOwner) {
 		t.Fatalf("the old group's owner's Update = %v", err)
+	}
+}
+
+// Code review on #431: the same task makes a URI again after its group
+// expired. A write of the old group that comes late (an SDK retry, a
+// delay), at revision 1 and under the old owner, must not land on the new
+// group, also at revision 1: the epoch tells the two apart.
+func recreatedBySameTask(t *testing.T, s groupstore.Store) {
+	ctx := context.Background()
+	g := group()
+	if err := s.Create(ctx, g, ownerA, "c1", t0); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := s.Get(ctx, g.URI, t0)
+	old.Subject = "the old group's"
+	later := t0.Add(time.Hour)
+	g2 := g
+	g2.Subject, g2.Created, g2.Active, g2.Expires = "the new group's", later, later, later.Add(time.Hour)
+	if err := s.Create(ctx, g2, ownerA, "c2", later); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := s.Owner(ctx, g.URI); o.Task != ownerA.Task || o.Epoch != 2 {
+		t.Fatalf("Owner of the new group = %+v", o)
+	}
+	if err := s.Update(ctx, old, ownerA, "late"); !errors.Is(err, groupstore.ErrNotOwner) {
+		t.Fatalf("the old group's late Update = %v", err)
+	}
+	if got, _ := s.Get(ctx, g.URI, later); got.Subject != "the new group's" {
+		t.Fatalf("the old group's write landed on the new group: %q", got.Subject)
 	}
 }
 

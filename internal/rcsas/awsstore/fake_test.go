@@ -310,10 +310,22 @@ func (f *fakeDynamo) groupTransaction(items []dtypes.TransactWriteItem) (*dynamo
 	case group.Put != nil && aws.ToString(group.Put.ConditionExpression) == "attribute_not_exists(#pk) OR #expires <= :now":
 		old, exists := f.rows[rowKey(group.Put.Item)]
 		failed[0] = exists && nOf(old[attrExpires]) > nOf(group.Put.ExpressionAttributeValues[":now"])
-		if second.Put == nil || second.Put.ConditionExpression != nil || sOf(second.Put.Item[attrSK]) != ownerSK {
+		u := second.Update
+		if u == nil || u.ConditionExpression != nil || sOf(u.Key[attrSK]) != ownerSK ||
+			aws.ToString(u.UpdateExpression) != "SET #task = :task, #sip = :sip, #token = :token, #ttl = :ttl ADD #epoch :one" {
 			f.t.Fatalf("create %+v", second)
 		}
-		apply = append(apply, func() { f.rows[rowKey(second.Put.Item)] = maps.Clone(second.Put.Item) })
+		second = dtypes.TransactWriteItem{} // not a fence
+		apply = append(apply, func() {
+			row, ok := f.rows[rowKey(u.Key)]
+			if !ok {
+				row = maps.Clone(u.Key)
+				f.rows[rowKey(u.Key)] = row
+			}
+			v := u.ExpressionAttributeValues
+			row[attrTask], row[attrSIP], row[attrToken], row[attrTTL] = v[":task"], v[":sip"], v[":token"], v[":ttl"]
+			row[attrEpoch] = &dtypes.AttributeValueMemberN{Value: strconv.FormatInt(nOf(row[attrEpoch])+1, 10)}
+		})
 	case group.Put != nil && aws.ToString(group.Put.ConditionExpression) == "#rev = :rev":
 		old, exists := f.rows[rowKey(group.Put.Item)]
 		failed[0] = !exists || nOf(old[attrRev]) != nOf(group.Put.ExpressionAttributeValues[":rev"])

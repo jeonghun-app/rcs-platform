@@ -83,7 +83,17 @@ func (s *Service) owner(ctx context.Context, g groupstore.Group) (groupstore.Own
 	}
 	next, err := s.store.TakeOver(ctx, g.URI, cur, s.me(), g.Expires, token)
 	if errors.Is(err, groupstore.ErrConflict) {
-		// Another task came first, and owns it now.
+		// Another takeover came first: of another request on this task
+		// (as a group's participants rejoin at once after its owner
+		// stopped, #121 Q4), which this one may write under, or of
+		// another task, which owns the group now.
+		if cur, err = s.store.Owner(ctx, g.URI); err != nil {
+			return groupstore.Owner{}, err
+		}
+		if cur.Task == s.cfg.Task {
+			s.own(g.URI, cur)
+			return cur, nil
+		}
 		return groupstore.Owner{}, ErrNotOwner
 	}
 	if err != nil {

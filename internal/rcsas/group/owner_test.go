@@ -17,6 +17,9 @@ type ownedStore struct {
 	*groupstore.Memory
 	failBeats                                   atomic.Bool
 	gets, updates, owners, tasks, takeovers, bs atomic.Int64
+	// takeOverGate, when set, holds each TakeOver until it is closed.
+	takeOverGate atomic.Pointer[chan struct{}]
+	arrived      atomic.Int64
 }
 
 func newOwnedStore() *ownedStore { return &ownedStore{Memory: groupstore.NewMemory()} }
@@ -43,6 +46,10 @@ func (s *ownedStore) Task(ctx context.Context, id string) (groupstore.Task, erro
 
 func (s *ownedStore) TakeOver(ctx context.Context, uri string, from, to groupstore.Owner, expires time.Time, token string) (groupstore.Owner, error) {
 	s.takeovers.Add(1)
+	if g := s.takeOverGate.Load(); g != nil {
+		s.arrived.Add(1)
+		<-*g
+	}
 	return s.Memory.TakeOver(ctx, uri, from, to, expires, token)
 }
 
@@ -203,8 +210,9 @@ func TestAGroupWithoutAnOwnerIsTakenByTheFirstWriter(t *testing.T) {
 }
 
 // #121 T11: a change of a group this task owns costs what it did before
-// #121, a read and a write of the group: the owner is remembered, and no
-// heartbeat is read.
+// #121, a read and a write of the group: the owner is remembered once read
+// (Create does not know the epoch the store gave it, code review on #431),
+// and no heartbeat is read.
 func TestAChangeOfAnOwnedGroupReadsNoOwner(t *testing.T) {
 	st := newOwnedStore()
 	r := newRigWith(t, Config{}, engineConfig(), store.NewMemory(), st, newFakeClock(), 1)
@@ -213,12 +221,46 @@ func TestAChangeOfAnOwnedGroupReadsNoOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gets, updates := st.gets.Load(), st.updates.Load()
+	if err := r.add(t, g.URI, carol); err != nil || st.owners.Load() != 1 {
+		t.Fatalf("the first change = %v, %d owner reads", err, st.owners.Load())
+	}
+	gets, updates, owners := st.gets.Load(), st.updates.Load(), st.owners.Load()
 	if _, err := r.s.Join(t.Context(), g.URI, bob, "Bob"); err != nil || st.updates.Load() == updates {
 		t.Fatalf("Join = %v, no write", err)
 	}
-	if st.gets.Load()-gets != 1 || st.updates.Load()-updates != 1 || st.owners.Load()+st.tasks.Load()+st.takeovers.Load() != 0 {
+	if st.gets.Load()-gets != 1 || st.updates.Load()-updates != 1 || st.owners.Load()-owners+st.tasks.Load()+st.takeovers.Load() != 0 {
 		t.Fatalf("a change: %d gets, %d updates, %d owner reads, %d heartbeat reads, %d takeovers",
-			st.gets.Load()-gets, st.updates.Load()-updates, st.owners.Load(), st.tasks.Load(), st.takeovers.Load())
+			st.gets.Load()-gets, st.updates.Load()-updates, st.owners.Load()-owners, st.tasks.Load(), st.takeovers.Load())
+	}
+}
+
+// Code review on #431: two requests of one task take a group over at once,
+// as its participants rejoin together after its owner stopped (#121 Q4).
+// The one whose takeover came second finds its own task the owner, and
+// goes on: both changes land, after one takeover.
+func TestTwoRequestsOfOneTaskTakeAGroupOverAtOnce(t *testing.T) {
+	a, b, sa, sb := twoTasks(t, Config{}, Config{})
+	g := a.create(bob)
+	sa.failBeats.Store(true)
+	b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+	gate := make(chan struct{})
+	sb.takeOverGate.Store(&gate)
+	errs := make(chan error, 2)
+	for _, who := range []string{carol, dave} {
+		go func() { errs <- b.add(t, g.URI, who) }()
+	}
+	waitFor(t, "both takeovers", func() bool { return sb.arrived.Load() == 2 })
+	close(gate)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("an Add = %v", err)
+		}
+	}
+	got, _ := b.s.Get(t.Context(), g.URI)
+	if _, ok := got.Participant(carol); !ok || b.m.get("group.owner_takeover") != 1 {
+		t.Fatalf("participants %+v, %d takeovers", got.Participants, b.m.get("group.owner_takeover"))
+	}
+	if _, ok := got.Participant(dave); !ok {
+		t.Fatalf("participants %+v", got.Participants)
 	}
 }

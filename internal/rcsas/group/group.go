@@ -403,10 +403,9 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	} else if err != nil {
 		return groupstore.Group{}, err
 	}
+	// The owner record's epoch goes on from the URI's last group's (Create):
+	// the first write reads it, and remembers it.
 	g.Rev = 1
-	owner := s.me()
-	owner.Epoch = 1
-	s.own(g.URI, owner)
 	s.metrics.Count("group.created", 1)
 	s.metrics.Count("group.name_dropped", int64(dropped))
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})

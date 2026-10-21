@@ -1189,6 +1189,15 @@ chat on has a heartbeat item:
   #121 forwards requests to a group's owner, a request for a group another
   task owns is answered 500 with `Retry-After` (never 404, which rcsjta
   takes for the group's end and restarts it at the factory).
+- **A replacement task waits for the old one's lease.** Even with one task,
+  a task that replaces another, on a new address, may not change the old
+  task's groups until the old one's last heartbeat has run out: after a
+  crash, up to `RCSAS_TASK_LEASE` plus `RCSAS_TASK_SKEW` (22 s by default)
+  after the old task's last beat; after a clean shutdown, which stores a last
+  beat at its present time, `RCSAS_TASK_SKEW` (2 s). Meanwhile a change to
+  one of those groups is answered 500 with `Retry-After`, which clients try
+  again; a task on the old one's address takes its groups at once. Before
+  #121, a replacement changed them at once. Deployments stop tasks cleanly.
 - **Touch.** At most once an hour per task, and not within an hour of a
   change, a group in use has its `active`, `expires` and `ttl` moved forward,
   without changing `rev`. The update is conditional on the stored `active`

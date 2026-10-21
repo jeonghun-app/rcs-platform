@@ -175,10 +175,13 @@ func (g Group) Clone() Group {
 // Store is where rcs-as keeps groups. Every method is safe for concurrent
 // use, also across processes sharing a backend.
 type Store interface {
-	// Create stores g at revision 1, owned by owner at epoch 1, whatever
-	// owner.Epoch says; ErrExists if its URI is taken by a group that has
-	// not expired at now. token identifies the attempt, as for Update, so
-	// that a repeat of a create that took effect succeeds.
+	// Create stores g at revision 1, owned by owner at the epoch after
+	// the last one the URI's owner record held (1 for a URI never used),
+	// whatever owner.Epoch says: a write of an expired group under the same
+	// URI, which its revision cannot tell from one of the new group, fails
+	// its fence. ErrExists if the URI is taken by a group that has not
+	// expired at now. token identifies the attempt, as for Update, so that
+	// a repeat of a create that took effect succeeds.
 	Create(ctx context.Context, g Group, owner Owner, token string, now time.Time) error
 	// Get returns the group, ErrNotFound if there is none or it has
 	// expired at now.

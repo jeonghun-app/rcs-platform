@@ -47,7 +47,7 @@ func (s *Memory) Create(_ context.Context, g Group, owner Owner, token string, n
 	g = g.Clone()
 	g.Rev = 1
 	s.groups[g.URI] = stored{g: g, token: token}
-	owner.Epoch = 1
+	owner.Epoch = s.owners[g.URI].o.Epoch + 1
 	s.owners[g.URI] = owned{o: owner, token: token}
 	return nil
 }

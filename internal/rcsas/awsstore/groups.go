@@ -229,9 +229,6 @@ func decodeGroup(uri string, item map[string]types.AttributeValue) (groupstore.G
 
 // Create implements groupstore.Store.
 func (s *Groups) Create(ctx context.Context, g groupstore.Group, owner groupstore.Owner, token string, now time.Time) error {
-	ownerItem := ownerKey(g.URI)
-	ownerItem[attrTask], ownerItem[attrSIP], ownerItem[attrEpoch] = str(owner.Task), str(owner.SIP), num(1)
-	ownerItem[attrToken], ownerItem[attrTTL] = str(token), ttlOf(g.Expires.Add(retained))
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
 		{Put: &types.Put{
 			TableName:                 aws.String(s.table),
@@ -241,8 +238,19 @@ func (s *Groups) Create(ctx context.Context, g groupstore.Group, owner groupstor
 			ExpressionAttributeValues: map[string]types.AttributeValue{":now": stamp(now)},
 		}},
 		// An expired group's owner, if its item is still there, is
-		// replaced: the new group is its creator's.
-		{Put: &types.Put{TableName: aws.String(s.table), Item: ownerItem}},
+		// replaced: the new group is its creator's, at the epoch after
+		// the old one's, which a late write of the old group still holds.
+		{Update: &types.Update{
+			TableName:        aws.String(s.table),
+			Key:              ownerKey(g.URI),
+			UpdateExpression: aws.String("SET #task = :task, #sip = :sip, #token = :token, #ttl = :ttl ADD #epoch :one"),
+			ExpressionAttributeNames: map[string]string{
+				"#task": attrTask, "#sip": attrSIP, "#token": attrToken, "#ttl": attrTTL, "#epoch": attrEpoch,
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":task": str(owner.Task), ":sip": str(owner.SIP), ":token": str(token), ":ttl": ttlOf(g.Expires.Add(retained)), ":one": num(1),
+			},
+		}},
 	}})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
 		cur, curToken, err := s.read(ctx, "create group", g.URI)
