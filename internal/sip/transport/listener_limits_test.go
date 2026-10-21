@@ -183,22 +183,23 @@ func TestProxyTLSHandshakeStallFreesItsSlotAtReadTimeout(t *testing.T) {
 
 // QA (PR #227): the deadline runs from accept and is the configured one, so
 // a header trickled a byte at a time is cut at 400 ms, before its last byte.
-// The trickle takes at least 1.75 s, less than the 2 s default: a header
-// deadline that ignored the configured one, or restarted at every byte,
-// would let the header through. The test checks that outcome, not how soon
-// the close is seen, which a loaded host delays (#304); the cut cannot come
-// before the deadline, and load only makes it later.
+// The trickle takes at least 700 ms: a header deadline that ignored the
+// configured one (the 2 s default), or was twice or four times it, or
+// restarted at every byte, would let the header through. The test checks
+// that outcome, not how soon the close is seen, which a loaded host delays
+// (#304); the cut cannot come before the deadline, and load only makes it
+// later.
 func TestTrickledProxyHeaderIsCutAtTheConfiguredDeadline(t *testing.T) {
 	server, rec := newTransport(t, Config{})
 	addr := listen(t, server, ListenerConfig{Network: TCP, ProxyProtocol: true, ProxyHeaderTimeout: 400 * time.Millisecond})
 	start := time.Now()
 	c := dialRaw(t, addr)
 	h := proxyHeaderFor(netip.MustParseAddrPort("192.0.2.10:40000"), netip.MustParseAddrPort("198.51.100.1:5060"), awsTLV)
-	for _, b := range h { // 36 bytes, 50 ms apart
+	for _, b := range h { // 36 bytes, 20 ms apart
 		if _, err := c.Write([]byte{b}); err != nil {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	waitClosed(t, c)
 	if d := time.Since(start); d < 400*time.Millisecond {
