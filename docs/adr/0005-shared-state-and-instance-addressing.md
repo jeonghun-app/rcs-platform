@@ -152,6 +152,28 @@ subscribers of the task that made the change.
   it read the queue, at most once per participant and group every
   `RCSAS_INVITE_TIMEOUT`.
 
+**Choices made in implementing it** (accepted by the lead on #121):
+
+- **A wake, not a forwarded receipt.** The design forwarded a notification
+  that arrives by pager `MESSAGE` on a task that does not own its group. The
+  wake covers that case and a registration on such a task with one mechanism.
+  The notification is unique by its mark wherever it is queued, and the task
+  whose queue pass then finds it wakes the owner, which delivers it.
+- **500 with `Retry-After`, not 503.** A request that cannot reach the owner
+  now gets the answer D1 gives a group another task owns. A proxy must not
+  pass a 503 on unchanged (RFC 3261 §16.7), and scscf passes a 500 as it is.
+  rcsjta treats every failure to rejoin other than 404 the same: it keeps the
+  chat and tries again.
+- **A plain `rcsas-fwd` flag, without the epoch.** The task that receives a
+  forwarded request decides by whether it owns the group now, read from the
+  store; the epoch the forwarder saw would not change that decision.
+- **Only private IPv4 and IPv6 unique local owners.** A task forwards only
+  to an owner address in RFC 1918 or `fc00::/7`, on rcs-as's own SIP port.
+  The tasks run in a VPC on private addresses (ADR 0003), and a stored
+  address outside them is not a task to send a participant's request to.
+  A deployment on global IPv6 addresses would need this widened, and until
+  then answers such requests 500 with `Retry-After`.
+
 **Consequences.**
 
 - When an owner task stops, its groups' sessions and subscriptions drop with
