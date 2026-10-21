@@ -2,6 +2,7 @@ package simtest_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,24 +59,53 @@ func TestBindingsAndLookupsUseOneKey(t *testing.T) {
 	}
 }
 
-func TestARequestTheCalledPartyNeverAnswersGets408(t *testing.T) {
-	// QA on #209: when the terminating transaction times out, the
-	// originator hears it (RFC 3261 §16.7), not a step timeout. T1 is 10
-	// ms here, so Timer F fires after 640 ms.
+// fastClock runs timers k times sooner than asked, for a UA whose Timer F
+// should fire in seconds rather than 32.
+type fastClock struct{ k time.Duration }
+
+func (c fastClock) AfterFunc(d time.Duration, f func()) transaction.Timer {
+	return time.AfterFunc(d/c.k, f)
+}
+
+func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
+	// #363: when the terminating transaction of a non-INVITE times out,
+	// the core sends the originator nothing, as the platform's proxy does
+	// (RFC 4320 §4.2 forbids the 408 RFC 3261 §16.7 had), and the
+	// originator's own transaction times out. The core's T1 is 10 ms, so
+	// it gives up at 640 ms; the originator's Timer F, on a clock five
+	// times fast, comes at 6.4 s, so a 408 or a 500 from the core would
+	// reach it first.
 	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
-	// B takes every request and never answers it.
-	registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
-		func(*transaction.ServerTransaction) {})
-	u, _ := sip.ParseURI(impuB)
-	req, err := a.NewMessage(u, "text/plain", []byte("x"))
+	u, _ := sip.ParseURI(impuA)
+	creds, err := sipua.DigestCredentials(impiA, []byte("a-password"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res, err := a.Send(ctx, req); err != nil || res.StatusCode != 408 {
-		t.Fatalf("MESSAGE nobody answers = %v, %v; want 408", res, err)
+	a, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: domain, IMPU: u,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000001", Credentials: creds, Clock: fastClock{5}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	if _, err := a.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// B takes every request and never answers it.
+	registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(*transaction.ServerTransaction) {})
+	b, _ := sip.ParseURI(impuB)
+	req, err := a.NewMessage(b, "text/plain", []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Send(ctx, req)
+	if res != nil || !errors.Is(err, transaction.ErrTimeout) {
+		t.Fatalf("MESSAGE nobody answers = %v, %v; want no answer, the originator's own timeout", res, err)
+	}
+	if n := core.Silenced(); n != 1 {
+		t.Fatalf("the core left %d requests unanswered, want the MESSAGE", n)
 	}
 }
 
