@@ -268,17 +268,52 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 		}, "unregister", "the subscription ended for a reason it should not"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			// The rig's step timeout: a shorter one also held the steps
+			// before the one a case checks, which a loaded host can take
+			// seconds for (#387, #396).
 			cfg, core := sipStack(t)
-			cfg.StepTimeout = 3 * time.Second
 			core.Rewrite = func(req *sip.Request) {
 				if req.Method == "NOTIFY" && (tc.cseq == "" || req.Header.Get("CSeq") == tc.cseq) {
 					tc.rewrite(req)
 				}
 			}
-			ok, results := runAll(t, cfg, "reg-event")
+			// A NOTIFY the client must drop leaves its step waiting for
+			// one that never comes. The run ends once the client has
+			// answered the dropped NOTIFY, which must be 481: a request in
+			// a dialog the client does not have (RFC 3261 §12.2.2).
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dropped := make(chan int, 1)
+			if tc.err == "no NOTIFY came" {
+				core.NotifyAnswered = func(req *sip.Request, res *sip.Response, err error) {
+					if req.Header.Get("CSeq") == tc.cseq {
+						code := 0
+						if err == nil {
+							code = res.StatusCode
+						}
+						select { // the first answer counts; the hook must not block
+						case dropped <- code:
+						default:
+						}
+						cancel()
+					}
+				}
+			}
+			ok, results := runAllWithin(t, ctx, cfg, "reg-event")
 			last := results[len(results)-1]
 			if ok || last.Step != tc.step || last.OK || last.Error != tc.err {
 				t.Fatalf("results %+v", results)
+			}
+			if tc.err == "no NOTIFY came" {
+				// The run ended, so the answer is in, or never came.
+				select {
+				case code := <-dropped:
+					if code != 481 {
+						t.Fatalf("the client answered the NOTIFY it should drop with %d, want 481", code)
+					}
+				case <-time.After(cfg.StepTimeout):
+					t.Fatal("the client never answered the NOTIFY it should drop")
+				}
 			}
 		})
 	}
@@ -310,8 +345,10 @@ func TestRegEventChecksQARound2Pins(t *testing.T) {
 			"network-deregister", "the network deregistration could not be asked for"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			// The rig's step timeout: every check here fails its step at
+			// once, and a shorter one only bounded the steps before it,
+			// such as the register a loaded host took 3.6 s for (#387).
 			cfg, core := sipStack(t)
-			cfg.StepTimeout = 3 * time.Second
 			if tc.dereg != nil {
 				cfg.Deregister = tc.dereg
 			}

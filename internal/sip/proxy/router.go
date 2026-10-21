@@ -59,6 +59,14 @@ func (r *Request) Initial() bool {
 // An ACK for a 2xx is forwarded statelessly (§16.11): only the first target is
 // used and nothing can be answered, and since its retransmissions must go
 // where the first copy went, the choice must depend on the message alone.
+//
+// A panic in Route or in a Decision's hooks is recovered on its goroutine and
+// ends only what it was for: Route's and Serve's request is answered 500,
+// Prepare's branch fails with 500, OnBranchFailure adds no target, and a
+// final response whose OnFinal or OnResponse panicked is replaced by a 500,
+// a provisional one or a 2xx retransmission dropped. It is counted
+// (Config.Metrics, #428), and logged without its value, at most once a
+// minute for each hook.
 type Router interface {
 	Route(ctx context.Context, r *Request) Decision
 }
@@ -203,6 +211,10 @@ type BranchFailure struct {
 	// 100 Trying included, before it ended: the target had the request, which
 	// a service deciding whether to try it again may need to know.
 	Provisional bool
+	// Progress reports that one of them was not 100 Trying (101-199): the
+	// target itself, not only the next hop, which sends a 100 of its own
+	// (RFC 3261 §16.2), had the request.
+	Progress bool
 }
 
 // Resolver finds the next hop for a URI (the first Route, or the Request-URI if

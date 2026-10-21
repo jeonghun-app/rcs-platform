@@ -42,6 +42,11 @@
 // expires (number), which is also the table's TTL attribute: DynamoDB removes
 // challenges nobody answered, and a read checks the expiry itself because TTL
 // deletion can lag by days.
+// The same table keeps the attempt counts, sk #count#<kind>#<scope>#<window>
+// beside their IMPI's challenges, with n (number), and the claims of iFC
+// positions, pk #odi#<ODIScope> and sk #odi, with side (string): which of a
+// request's return from an application server and its default handling took
+// up its place in the chain (state.Challenges.ClaimODI).
 //
 // reg-subscriptions, partition key pk (string = subscription ID): version, doc,
 // writer, shard and expires as for registrations, impu (string, key of

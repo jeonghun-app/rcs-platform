@@ -27,12 +27,19 @@ const viaPlaceholderHost = "invalid"
 // however it is written (SameHost), and the same port once defaults are
 // applied. A form of its own address it failed to recognise would make the
 // proxy forward a request to itself.
-func (p *Proxy) isSelf(u sip.URI) bool {
+func (p *Proxy) isSelf(u sip.URI) bool { return IsSelf(p.self, u) }
+
+// IsSelf reports whether u names one of self as the proxy recognises its own
+// Route entries: a SIP or SIPS URI with the same host, compared as SameHost
+// does, and the same port, defaults applied. A Router that looks for its
+// service further down a Route uses it so that both checks agree on what is
+// this service.
+func IsSelf(self []sip.URI, u sip.URI) bool {
 	if !u.IsSIP() {
 		return false
 	}
 	port := portOf(u)
-	for _, s := range p.self {
+	for _, s := range self {
 		if SameHost(s.Host, u.Host) && portOf(s) == port {
 			return true
 		}
@@ -309,7 +316,11 @@ func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Targ
 		return nil, transport.Destination{}, err
 	}
 	if d.Prepare != nil {
-		if err := d.Prepare(ctx, t, fwd); err != nil {
+		var err error
+		if !p.hook("Prepare", func() { err = d.Prepare(ctx, t, fwd) }) {
+			err = errHookPanic
+		}
+		if err != nil {
 			return nil, transport.Destination{}, fmt.Errorf("%w: %w", errPrepare, err)
 		}
 	}
@@ -330,7 +341,10 @@ func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Targ
 	if len(routes) > 0 && !strict {
 		next = routes[0].URI
 	}
-	dst, err := p.resolver.Resolve(ctx, next)
+	var dst transport.Destination
+	if !p.hook("Resolver", func() { dst, err = p.resolver.Resolve(ctx, next) }) {
+		return nil, transport.Destination{}, errHookPanic
+	}
 	if err != nil {
 		return nil, transport.Destination{}, err
 	}

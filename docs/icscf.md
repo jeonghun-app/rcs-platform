@@ -17,8 +17,11 @@ the mapping of every HSS answer to a SIP response with its clause;
   S-CSCF becomes the topmost Route. A `user=phone` SIP URI is looked up, and
   forwarded, as its tel URI.
 - **A request with a Route left, or inside a dialog**: forwarded where it
-  says, without the HSS. `icscf` inserts no Record-Route, so dialogs do not
-  pass it.
+  says, without the HSS, when its next hop (the first Route left, or the
+  Request-URI) is a configured S-CSCF as it is reached: the same scheme,
+  host, port and transport, with no `maddr`. Any other next hop gets 403,
+  and a request whose Route or Request-URI names `icscf` again gets 482
+  (#337). `icscf` inserts no Record-Route, so dialogs do not pass it.
 - **When the HSS cannot be asked**, or answers that it could not do it
   (`DIAMETER_UNABLE_TO_COMPLY`, a store failure): 480 with `Retry-After`
   (`ICSCF_RETRY_AFTER`). When the S-CSCF cannot be reached: 500 with the same
@@ -92,7 +95,7 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | Counter | Counts |
 |---|---|
 | `icscf.<kind>.forwarded` | requests forwarded; `kind` is `register`, `terminating`, or `routed` (a Route left, or inside a dialog) |
-| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 600), and 500 for an S-CSCF it could not reach |
+| `icscf.<kind>.<code>` | requests icscf answered itself with `code` (403, 404, 480, 482, 600), and 500 for an S-CSCF it could not reach; a refused ACK is counted, though it gets no answer |
 | `icscf.<kind>.cancelled` | requests cancelled while the HSS was asked |
 | `icscf.hss.unavailable` | HSS queries that could not be completed; alarm on a rise |
 | `icscf.hss.bad_server_name` | HSS answers naming an S-CSCF that is not a SIP URI |
@@ -101,6 +104,7 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | `icscf.scscf.unreachable` | requests answered 500 because the S-CSCF could not be reached |
 | `icscf.scscf.next_address` | requests sent to the next address of the S-CSCF after one refused |
 | `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
+| `proxy.hook_panics` | panics recovered in icscf's routing: the request was answered 500 (#428); alarm on any |
 
 `cxclient.*` counts the Cx answers by result code and their latency.
 

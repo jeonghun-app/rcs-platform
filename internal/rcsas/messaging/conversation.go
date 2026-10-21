@@ -1,6 +1,8 @@
 package messaging
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"strings"
 )
@@ -27,7 +29,10 @@ var ErrInvalidConversation = errors.New("messaging: invalid conversation identif
 // The values are opaque and compared exactly.
 type Conversation struct {
 	// ID is the Conversation-ID, shared by every session and message of
-	// the conversation.
+	// the conversation. It is empty for a request that came without any of
+	// the conversation headers (rcsjta's pager mode); one that came with a
+	// Contribution-ID alone gets the pair's (PairConversationID) when the
+	// engine takes it.
 	ID string
 	// Contribution is the Contribution-ID of one session or standalone
 	// message.
@@ -44,10 +49,17 @@ type Conversation struct {
 // taken as one RFC 3261 token, the form clients generate (hex strings and
 // UUIDs), of at most MaxIDLength characters, with surrounding white space
 // removed. A request with none of the three gives the zero Conversation:
-// pager-mode notifications come without them (rcsjta), and the engine
-// does not need them for a notification. Otherwise Conversation-ID and
-// Contribution-ID are required, since a message without them cannot be
-// put in any conversation; InReplyTo-Contribution-ID is optional.
+// rcsjta sends pager-mode messages and notifications without them, and the
+// engine does not need them. Otherwise Contribution-ID is required, since
+// a Conversation-ID or a reply means nothing without the contribution it
+// belongs to. InReplyTo-Contribution-ID is optional.
+//
+// Conversation-ID is required of a sender by OMA CPM (Conversation
+// Functions, Appendix C.1.1), but rcsjta, a pre-CPM client, sends a
+// Contribution-ID alone with its INVITEs (#298). That is taken as a
+// leniency, with the ID left empty here; the engine then gives the request
+// its pair's Conversation-ID (PairConversationID), which rcs-as, the sender
+// of what it delivers, must include.
 func ParseConversationHeaders(conversationID, contributionID, inReplyTo string) (Conversation, error) {
 	c := Conversation{
 		ID:           trimSpace(conversationID),
@@ -57,7 +69,7 @@ func ParseConversationHeaders(conversationID, contributionID, inReplyTo string) 
 	if c == (Conversation{}) {
 		return c, nil
 	}
-	if !isID(c.ID) || !isID(c.Contribution) || c.InReplyTo != "" && !isID(c.InReplyTo) {
+	if c.ID != "" && !isID(c.ID) || !isID(c.Contribution) || c.InReplyTo != "" && !isID(c.InReplyTo) {
 		return Conversation{}, ErrInvalidConversation
 	}
 	return c, nil
@@ -92,4 +104,35 @@ func isTokenChar(c byte) bool {
 		return true
 	}
 	return strings.IndexByte("-.!%*_+`'~", c) >= 0
+}
+
+// pairNamespace is the UUID namespace of PairConversationID's name-based
+// UUIDs, chosen for rcs-as.
+var pairNamespace = [16]byte{0x93, 0x33, 0xb4, 0xd3, 0xf0, 0xc3, 0x44, 0x0b, 0x85, 0xcf, 0x39, 0xb4, 0x27, 0x42, 0x92, 0x81}
+
+// PairConversationID is the Conversation-ID rcs-as gives a 1-to-1 request
+// that came with a Contribution-ID and no Conversation-ID (#298): a
+// name-based UUID (RFC 9562 §5.5, version 5), in the UUID form OMA CPM
+// Appendix C.1.1 asks of a Conversation-ID, of the two users' keys
+// (UserOf) in sorted order. Every message between the same two keys, in
+// either direction, so has one Conversation-ID, and threads together on a
+// client that reads it. Two keys of one subscriber do not meet: a SIP name
+// identity and the same subscriber's tel URI are two keys (UserOf folds
+// only a number's SIP and tel forms), and give two IDs.
+//
+// The ID is an unsalted hash of the two identities: anyone who knows them
+// can compute it, and test a guess against it. It is personal data, as the
+// identities are, wherever it is logged (internal/pii).
+func PairConversationID(a, b string) string {
+	if b < a {
+		a, b = b, a
+	}
+	h := sha1.New()
+	h.Write(pairNamespace[:])
+	h.Write([]byte(a + "\x00" + b))
+	u := h.Sum(nil)[:16]
+	u[6] = u[6]&0x0f | 0x50 // version 5
+	u[8] = u[8]&0x3f | 0x80 // the RFC 9562 variant
+	x := hex.EncodeToString(u)
+	return x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 }

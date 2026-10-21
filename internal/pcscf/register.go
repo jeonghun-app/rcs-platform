@@ -67,18 +67,22 @@ const metricRegisterTaskLimit = "register.refused_task_rate"
 func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	src := r.Source
 	if !p.registers.allow(clientKey(src.Addr)) {
+		p.count(metricRegisterRate, 1)
 		return p.refuse(r, 503, "Too Many Registrations")
 	}
 	to, err := r.Message.Header.To()
 	if err != nil {
+		p.count(metricRegisterMalformed, 1)
 		return proxy.Decision{Status: 400, Reason: "Bad To"}
 	}
 	contacts, err := r.Message.Header.Contact()
 	if err != nil {
+		p.count(metricRegisterMalformed, 1)
 		return proxy.Decision{Status: 400, Reason: "Bad Contact"}
 	}
 	creds, err := r.Message.Header.Authorization()
 	if err != nil {
+		p.count(metricRegisterMalformed, 1)
 		return proxy.Decision{Status: 400, Reason: "Bad Authorization"}
 	}
 	aor := aorKey(to.URI)
@@ -96,8 +100,10 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	}
 	switch err := p.registry.reserve(src.Flow, aor, clientKey(src.Addr), p.now().Add(reservationHold)); {
 	case errors.Is(err, errTooManyPending):
+		p.count(metricRegisterPending, 1)
 		return p.refuse(r, 503, "Too Many Registrations")
 	case err != nil:
+		p.count(metricRegisterFull, 1)
 		return p.refuse(r, 503, "Registry Full")
 	}
 	var once sync.Once
@@ -110,6 +116,7 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 	dsts, err := p.icscfs.ResolveAll(ctx, p.cfg.ICSCF)
 	if err != nil {
 		release()
+		p.count(metricRegisterNoICSCF, 1)
 		return proxy.Decision{Status: 504, Reason: "No I-CSCF"}
 	}
 	tries := &icscfTries{left: dsts[1:min(len(dsts), maxICSCFAttempts)], deadline: p.now().Add(p.icscfTotal)}

@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/sipas"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -31,8 +33,9 @@ func Service() runtime.Service[Config] {
 
 // deps are what Run takes from the outside world; tests replace them.
 type deps struct {
-	// store, if set, replaces the configured one.
-	store store.Store
+	// store and groups, if set, replace the configured ones.
+	store  store.Store
+	groups groupstore.Store
 	// resolver, if set, replaces the namespace resolver of the core.
 	resolver proxy.Resolver
 	// listening, if set, hears the SIP listener's bound address.
@@ -47,18 +50,33 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	st := d.store
-	if st == nil {
-		switch cfg.Store {
-		case StoreMemory:
+	st, gst := d.store, d.groups
+	switch {
+	case cfg.Store == StoreMemory:
+		if st == nil {
 			st = store.NewMemory()
-		default:
+		}
+		if gst == nil {
+			gst = groupstore.NewMemory()
+		}
+	default:
+		if st == nil {
 			dyn, err := awsstore.New(ctx, cfg.DynamoDB)
 			if err != nil {
 				return err
 			}
 			rt.Admin.AddReadinessCheck("dynamodb", dyn.Ready)
 			st = dyn
+		}
+		if gst == nil {
+			gc := cfg.DynamoDB
+			gc.Table = cfg.GroupsTable
+			groups, err := awsstore.NewGroups(ctx, gc)
+			if err != nil {
+				return err
+			}
+			rt.Admin.AddReadinessCheck("dynamodb-groupchats", groups.Ready)
+			gst = groups
 		}
 	}
 	resolver := d.resolver
@@ -94,11 +112,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Core: cfg.Core, Host: cfg.SIPHost.String(), HomeDomain: cfg.HomeDomain, Contact: self, Listener: sipListener,
 		Resolver: resolver, MaxMessageSize: cfg.Messaging.MaxMessageSize, MaxSessions: cfg.MaxSessions,
 		MaxOutgoingPerUser: cfg.MaxOutgoingPerUser, MaxIncomingPerUser: cfg.MaxIncomingPerUser, Metrics: rt.Metrics, Logger: rt.Logger,
+		ConferenceFactory: cfg.ConferenceFactory, ConferenceHost: cfg.Group.ConferenceHost, MaxGroupParticipants: cfg.Group.MaxParticipants,
+		GroupChat: cfg.GroupChat, MaxSubscriptionsPerUser: cfg.MaxSubscriptionsPerUser,
 	})
 	if err != nil {
 		return err
 	}
-	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger})
+	px, err := proxy.New(tr, proxy.Config{Self: selfURIs(cfg, addr.Port()), Router: srv, Resolver: resolver, Logger: rt.Logger, Metrics: rt.Metrics})
 	if err != nil {
 		return err
 	}
@@ -113,7 +133,21 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// answers to the deliveries in flight that it waits for (bounded by
 	// RCSAS_DELIVERY_TIMEOUT).
 	defer engine.Close()
-	srv.Bind(engine, px.Layer(), tr)
+	gcfg := cfg.Group
+	gcfg.SIP = hostPort(cfg.SIPHost, addr.Port())
+	groups, err := group.New(gcfg, gst, engine, srv, rt.Metrics)
+	if err != nil {
+		return err
+	}
+	if cfg.GroupChat {
+		// #121: this task holds the groups it owns while it beats. Stopped
+		// last, after the sessions have ended (srv.Close), with a beat that
+		// lets another task take the groups at once.
+		beatCtx, stopBeating := context.WithCancel(context.Background())
+		stopped := groups.StartHeartbeat(beatCtx)
+		defer func() { stopBeating(); stopped() }()
+	}
+	srv.Bind(engine, groups, px.Layer(), tr)
 	// Run first of the deferred calls: the sessions end with a BYE while
 	// the transport still carries it.
 	defer srv.Close()

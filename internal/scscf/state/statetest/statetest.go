@@ -87,6 +87,7 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"ItemsOverTheSizeLimitAreRefusedByEveryBackend", testItemSize},
 		{"BoundaryValuesAreTheSameEverywhere", testBoundaries},
 		{"AFailedDeregistrationIsRetriedAfterTheLease", testSweepRetry},
+		{"ARejectedLeaseKeepsItsMarkThroughTheSweep", testRejectedLease},
 		{"AClaimedSubscriptionKeepsItsGraceFromTheClaim", testTerminatedGrace},
 		{"NotifyCountersStopAtTheirLimit", testCounterLimit},
 		{"ProfilesAreKeptApartFromRegistrations", testProfiles},
@@ -102,7 +103,9 @@ func Run(t *testing.T, newStore func(t *testing.T) state.Store, o Options) {
 		{"AConditionalProfileDeleteSparesAProfileSavedSince", testDeleteProfileIf},
 		{"AttemptsAreCountedOnceAcrossInstances", testAttemptCounts},
 		{"NoClientCanTakeAnAttemptCount", testAttemptCountNotAChallenge},
+		{"AnIFCPositionIsTakenUpByOneSideAcrossInstances", testODIClaims},
 		{"ASweepClaimsALiveRegistrationWhoseReassertIsDue", testReassertSweep},
+		{"ASweepClaimsAnUnregisteredUsersRecordWhoseReassertIsDueAndKeepsIt", testUnregisteredReassertSweep},
 		{"AnIdentityALostDeregistrationLeftGoesAtItsKeepUntil", testIdentityKeepUntil},
 		{"ASaveFromBeforeAKeepIdentityCannotUndoIt", testIdentityKeepNeverUndone},
 		{"ARecordBroughtBackFromADeregistrationTakesANewIncarnation", testReviveTakesANewIncarnation},
@@ -185,6 +188,7 @@ func Registration(impi, impu string, expiries ...time.Duration) *state.Registrat
 func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour, 2*time.Hour)
 	r.Contacts[1].Q = 500
+	r.RegisteredAs = []string{IMPU1, IMPU2}
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
 	if saved.Version == 0 {
 		t.Error("a saved registration has version 0")
@@ -199,6 +203,12 @@ func testRegistrationRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	again := Registration(IMPI1, IMPU1, time.Hour)
 	_, err := b.SaveRegistration(ctx(t), again)
 	wantErr(t, err, state.ErrExists)
+	tomb := Registration(IMPI2, IMPU2)
+	tomb.Deregistering, tomb.Tombstone = T0.Add(time.Minute), true
+	tomb.Version = must(a.SaveRegistration(ctx(t), tomb))(t).Version
+	if got := must(b.Registration(ctx(t), state.SetKey{IMPI: IMPI2, IMPU: IMPU2}))(t); !reflect.DeepEqual(got, tomb) {
+		t.Errorf("read tombstone %+v, want %+v", got, tomb)
+	}
 	_, err = a.Registration(ctx(t), Key1(IMPU2))
 	wantErr(t, err, state.ErrNotFound)
 }
@@ -369,7 +379,13 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	before1970.Unregistered = time.Date(1969, 12, 31, 0, 0, 0, 0, time.UTC)
 	after9999 := Registration(IMPI1, IMPU1)
 	after9999.Unregistered = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
-	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999} {
+	tombstoneWithContacts := Registration(IMPI1, IMPU1, time.Hour)
+	tombstoneWithContacts.Tombstone = true
+	tombstoneWithoutLease := Registration(IMPI1, IMPU1)
+	tombstoneWithoutLease.Tombstone = true
+	registeredAsNonCanonical := Registration(IMPI1, IMPU1, time.Hour)
+	registeredAsNonCanonical.RegisteredAs = []string{"sip:+15550100001@IMS.MNC001.MCC001.3GPPNETWORK.ORG"}
+	for _, r := range []*state.Registration{nonCanonical, tooMany, badIMPI, noDefault, noIncarnation, tooManyIdentities, before1970, after9999, registeredAsNonCanonical, tombstoneWithContacts, tombstoneWithoutLease} {
 		_, err := a.SaveRegistration(ctx(t), r)
 		wantErr(t, err, state.ErrInvalid)
 	}
@@ -389,12 +405,13 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 
 func testNoAliasing(t *testing.T, a, _ state.Store, _ Options) {
 	r := Registration(IMPI1, IMPU1, time.Hour)
+	r.RegisteredAs = []string{IMPU1}
 	saved := must(a.SaveRegistration(ctx(t), r))(t)
-	r.Contacts[0].Path[0] = "changed"
-	saved.Contacts[0].Path[0] = "changed"
+	r.Contacts[0].Path[0], r.RegisteredAs[0] = "changed", "changed"
+	saved.Contacts[0].Path[0], saved.RegisteredAs[0] = "changed", "changed"
 	read := must(a.Registration(ctx(t), Key1(IMPU1)))(t)
-	read.Contacts[0].Path[0] = "changed"
-	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" {
+	read.Contacts[0].Path[0], read.RegisteredAs[0] = "changed", "changed"
+	if got := must(a.Registration(ctx(t), Key1(IMPU1)))(t); got.Contacts[0].Path[0] == "changed" || got.RegisteredAs[0] == "changed" {
 		t.Error("a caller's change reached the stored registration")
 	}
 }

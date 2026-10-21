@@ -21,7 +21,10 @@ import (
 // answers each request with what answer returns, nothing if that is empty,
 // after passing it to got, or a SUBSCRIBE, which pcscf sends of its own
 // accord after a registration, to subscribes. Each answer is written once
-// it is ready, so one that waits holds up no other.
+// it is ready, so one that waits holds up no other. As a UAS it answers an
+// INVITE 100 Trying at once, and a CANCEL 200 and its INVITE 487, unless a
+// final response went before (RFC 3261 §9.2, §17.2.1): a CANCEL pcscf sends
+// once it has the 100 then ends the INVITE at once, not at Timer B.
 type fakeCoreNode struct {
 	ln         net.Listener
 	got        chan *sip.Request
@@ -52,6 +55,13 @@ func startCoreNode(t *testing.T, answer func(*sip.Request) string) *fakeCoreNode
 func (f *fakeCoreNode) serve(t *testing.T, nc net.Conn) {
 	defer nc.Close()
 	var mu sync.Mutex
+	// invites holds whether each INVITE, by its top Via branch, has had a
+	// final response; mu guards it and the writes.
+	invites := map[string]*sip.Request{}
+	finished := map[string]bool{}
+	write := func(text string) {
+		_, _ = io.WriteString(nc, text)
+	}
 	r := sip.NewReader(bufio.NewReader(nc), sip.Limits{})
 	for {
 		m, err := r.ReadMessage()
@@ -62,6 +72,22 @@ func (f *fakeCoreNode) serve(t *testing.T, nc net.Conn) {
 		if !ok {
 			continue
 		}
+		branch := topBranch(req)
+		switch req.Method {
+		case "INVITE":
+			mu.Lock()
+			invites[branch] = req
+			write(respondTo(req, 100, "s1"))
+			mu.Unlock()
+		case "CANCEL":
+			mu.Lock()
+			write(respondTo(req, 200, "s1"))
+			if inv := invites[branch]; inv != nil && !finished[branch] {
+				finished[branch] = true
+				write(respondTo(inv, 487, "s1"))
+			}
+			mu.Unlock()
+		}
 		if req.Method == "SUBSCRIBE" {
 			select {
 			case f.subscribes <- req:
@@ -70,14 +96,42 @@ func (f *fakeCoreNode) serve(t *testing.T, nc net.Conn) {
 		} else {
 			f.got <- req
 		}
+		if req.Method == "CANCEL" {
+			continue
+		}
 		go func() {
-			if a := f.answer(req); a != "" {
-				mu.Lock()
-				defer mu.Unlock()
-				_, _ = io.WriteString(nc, a)
+			a := f.answer(req)
+			if a == "" {
+				return
 			}
+			mu.Lock()
+			defer mu.Unlock()
+			if req.Method == "INVITE" && finalText(a) {
+				if finished[branch] {
+					return // cancelled: its 487 went
+				}
+				finished[branch] = true
+			}
+			write(a)
 		}()
 	}
+}
+
+// topBranch is the branch of req's top Via, which a CANCEL shares with its
+// INVITE (RFC 3261 §9.1).
+func topBranch(req *sip.Request) string {
+	vias, err := req.Header.Via()
+	if err != nil || len(vias) == 0 {
+		return ""
+	}
+	return vias[0].Branch()
+}
+
+// finalText reports whether a, a response's text, has a final status:
+// "SIP/2.0 " and a code not of the 1xx class.
+func finalText(a string) bool {
+	const start = "SIP/2.0 "
+	return strings.HasPrefix(a, start) && len(a) > len(start) && a[len(start)] != '1'
 }
 
 // receive waits for the next request at f.

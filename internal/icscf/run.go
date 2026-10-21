@@ -55,6 +55,10 @@ type deps struct {
 	hssResolver cxclient.Resolver
 	// listening, if set, hears the core listener's bound address.
 	listening func(netip.AddrPort)
+	// transport, if set, gets the SIP transport once it is made.
+	transport func(*transport.Transport)
+	// writeTimeout replaces the transport's WriteTimeout when set.
+	writeTimeout time.Duration
 }
 
 // Run serves cfg until ctx ends.
@@ -76,20 +80,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// The S-CSCFs are found by their Cloud Map names, every address of one
 	// (#198), so a request can go to the next when a task is gone.
 	dns := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Shuffle: d.shuffle, Logger: rt.Logger}
-	router, err := New(Config{
-		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
-		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
-		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
-	})
-	if err != nil {
-		return err
-	}
-
 	// The proxy is made once the core listener's port is known, which its
 	// Self needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, WriteTimeout: d.writeTimeout, Logger: rt.Logger}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}
@@ -98,6 +93,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		return err
 	}
 	defer func() { _ = tr.Close() }()
+	if d.transport != nil {
+		d.transport(tr)
+	}
 	coreAddr, err := tr.Listen(transport.ListenerConfig{
 		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr,
 		AdvertisedHost: hostOf(cfg.CoreHost),
@@ -105,12 +103,23 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if err != nil {
 		return fmt.Errorf("icscf: core listener: %w", err)
 	}
+	self := selfURIs(cfg, int(coreAddr.Port()))
+	router, err := New(Config{
+		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
+		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
+		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
+		Self: self,
+	})
+	if err != nil {
+		return err
+	}
 	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
-		Self:            selfURIs(cfg, int(coreAddr.Port())),
+		Self:            self,
 		Router:          router,
 		Resolver:        dns,
 		Logger:          rt.Logger,
+		Metrics:         rt.Metrics,
 		Transaction:     tcfg,
 		MaxContexts:     maxContexts,
 		MaxContextBytes: maxContextBytes,
@@ -139,6 +148,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if n := px.Drain(drainCtx); n > 0 {
 		rt.Logger.Info("answered requests left at the stop", slog.Int("requests", n))
 	}
+	// The transport closes before the proxy does (the deferred Close), once
+	// Drain has written its answers, as in pcscf (#323). A core peer that
+	// stopped reading leaves senders waiting for room in its connection's
+	// queue, and the proxy's Close waits for them, for up to WriteTimeout,
+	// past the stop margin (#338); closing the connections releases them at
+	// once. A second Close does nothing.
+	_ = tr.Close()
 	return nil
 }
 

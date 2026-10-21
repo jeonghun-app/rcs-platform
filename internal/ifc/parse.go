@@ -4,6 +4,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"strconv"
+
+	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
 
 // ParseSubscription parses an IMSSubscription document, normally the
@@ -13,13 +15,13 @@ import (
 // The patterns in the criteria are not compiled here; [Compile] does that,
 // so that one bad pattern is reported where the criteria are used.
 func ParseSubscription(data []byte) (*Subscription, error) {
-	data = withoutBOM(data)
-	if err := checkDocument(data); err != nil {
+	data = xmlsafe.WithoutBOM(data)
+	if err := document.Check(data); err != nil {
 		return nil, err
 	}
 	var w wireSubscription
 	if err := xml.Unmarshal(data, &w); err != nil {
-		return nil, decodeError(err)
+		return nil, document.DecodeError(err)
 	}
 	r := &reader{}
 	s := r.subscription(&w)
@@ -80,7 +82,7 @@ func (r *reader) str(where, name string, values []string, required bool) string 
 
 func (r *reader) uri(where, name string, values []string, required bool) string {
 	v, ok := r.one(where, name, values, required)
-	v = collapse(v)
+	v = xmlsafe.Collapse(v)
 	if ok && required && v == "" {
 		r.fail(where, "%s is empty", name)
 	}
@@ -89,7 +91,7 @@ func (r *reader) uri(where, name string, values []string, required bool) string 
 
 // integer reads an xs:integer limited to [lo, hi].
 func (r *reader) integer(where, name, value string, lo, hi int) int {
-	n, err := strconv.Atoi(collapse(value))
+	n, err := strconv.Atoi(xmlsafe.Collapse(value))
 	if err != nil || n < lo || n > hi {
 		r.fail(where, "%s is not an integer from %d to %d", name, lo, hi)
 		return 0
@@ -120,7 +122,7 @@ func (r *reader) boolean(where, name string, values []string, required bool) boo
 	if !ok {
 		return false
 	}
-	switch collapse(v) {
+	switch xmlsafe.Collapse(v) {
 	case "1", "true":
 		return true
 	case "0", "false":
