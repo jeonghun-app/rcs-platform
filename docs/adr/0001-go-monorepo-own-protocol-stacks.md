@@ -17,7 +17,7 @@ deployment model are fully under the project's control.
 - SIP, SDP, Diameter, MSRP, CPIM, IMDN and Milenage are implemented in `internal/`.
 - Runtime dependencies are the Go standard library and `aws-sdk-go-v2`. Any other
   runtime dependency needs an ADR.
-- Go is pinned to a toolchain image (`golang:1.26.9-alpine3.23`, plus gcc for the race detector in `deploy/toolchain.Dockerfile`)
+- Go is pinned to a toolchain image (`golang:1.26.10-alpine3.23`, plus gcc for the race detector in `deploy/toolchain.Dockerfile`)
   and runs in a container, so the host needs only Docker.
 
 ## Rationale
