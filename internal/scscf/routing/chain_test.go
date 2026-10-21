@@ -509,6 +509,19 @@ func TestAPServedUserFromAnEdgeProxyIsNotTrusted(t *testing.T) {
 // unregistered state apply, with regstate=unreg toward the server; without
 // one the request is 480.
 func TestAnUnregisteredUserIsServedByItsUnregisteredCriteria(t *testing.T) {
+	t.Run("ending", func(t *testing.T) {
+		// One a sweep holds is neither, and gets no SAR of its own.
+		e := newEnv(t)
+		r := e.unregistered()
+		r.Deregistering = t0.Add(time.Minute)
+		if _, err := e.store.SaveRegistration(bg, r); err != nil {
+			t.Fatal(err)
+		}
+		e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), ifc.SessionTerminated))
+		if d := e.router(nil).Initial(bg, request(t, "MESSAGE", impu1)); d.Status != 480 || e.hss.calls() != 0 {
+			t.Errorf("status %d after %d SARs", d.Status, e.hss.calls())
+		}
+	})
 	e := newEnv(t)
 	e.hss.serve = func(string) (*state.Registration, error) { return e.unregistered(), nil }
 	registeredOnly := criterion(5, operatorAS, method("MESSAGE"), ifc.SessionContinued)
@@ -552,6 +565,8 @@ func TestWhatTheHSSSaysOfAUserWithoutARecordIsAnswered(t *testing.T) {
 		"unavailable":      {func(*env) (*state.Registration, error) { return nil, registrarErr("unavailable") }, impu1, 500},
 		"barred":           {func(e *env) (*state.Registration, error) { return e.unregistered(), nil }, impu2, 404},
 		"not in the set": {func(e *env) (*state.Registration, error) {
+			// Its profile would send the request to rcs-as.
+			e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), ifc.SessionTerminated))
 			r := e.unregistered()
 			r.Identities = r.Identities[:1]
 			return r, nil
@@ -855,5 +870,16 @@ func TestTheRouterKeepsItsOwnCopyOfTheKey(t *testing.T) {
 	pos := position{served: impu1, scase: ifc.Originating, registered: true, priority: 10}
 	if _, err := e.router(nil).openODI(rt.signODI(pos, "c", t0.Add(time.Minute)), "c", t0); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestAPositionTooShortIsRefusedEvenWithItsMAC: only a key holder can make
+// one, and it must not take the router down.
+func TestAPositionTooShortIsRefusedEvenWithItsMAC(t *testing.T) {
+	rt := newEnv(t).router(nil)
+	payload := []byte{0, 0, 0, 0}
+	v := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(rt.odiMAC(payload, "c"))
+	if _, err := rt.openODI(v, "c", t0); err == nil {
+		t.Error("opened")
 	}
 }

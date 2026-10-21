@@ -113,9 +113,8 @@ func (rt *Router) resume(ctx context.Context, r *proxy.Request, v string) step {
 		}
 		return answer(404, "Not Found")
 	case errors.Is(err, errEnding):
-		// The user deregistered meanwhile: the chain ends as it would
-		// without services.
-		set = nil
+		// The user deregistered meanwhile, and set is nil: the chain ends
+		// as it would without services.
 	case err != nil:
 		rt.internalLog("looking up the served user", err)
 		return rt.unavailable(r.Message)

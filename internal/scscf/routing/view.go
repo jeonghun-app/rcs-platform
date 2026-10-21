@@ -45,7 +45,7 @@ func (v view) HeaderFields() []ifc.HeaderField {
 		if listHeaders[name] {
 			var one sip.Header
 			if one.Add(name, f.Value) == nil {
-				if els, err := one.Elements(name); err == nil && len(els) > 0 {
+				if els, err := one.Elements(name); err == nil {
 					for _, e := range els {
 						out = append(out, ifc.HeaderField{Name: name, Value: e})
 					}

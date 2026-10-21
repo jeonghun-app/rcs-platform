@@ -31,9 +31,13 @@ func TestTheIFCViewPresentsEachValueOfAListOnItsOwn(t *testing.T) {
 	if lines := (view{req: r}).SDPLines(); !slices.Equal(lines, []string{"v=0", "m=message 9 TCP/MSRP *"}) {
 		t.Errorf("SDP %q", lines)
 	}
-	r.Header.Set("Content-Type", "text/plain")
-	if lines := (view{req: r}).SDPLines(); lines != nil {
-		t.Errorf("a text body read as SDP: %q", lines)
+	for _, ct := range []string{"text/plain", "application/xml"} {
+		if err := r.Header.Set("Content-Type", ct); err != nil {
+			t.Fatal(err)
+		}
+		if lines := (view{req: r}).SDPLines(); lines != nil {
+			t.Errorf("a %s body read as SDP: %q", ct, lines)
+		}
 	}
 	if v := (view{req: r}); v.Method() != "INVITE" || v.RequestURI() != impu1 {
 		t.Errorf("%s %s", v.Method(), v.RequestURI())

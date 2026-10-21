@@ -57,6 +57,9 @@ func TestAnUnregisteredUsersRecordEndsWithTheHSSAtItsTTL(t *testing.T) {
 	e.akaUser(impi1, impu1, tel1)
 	g := e.instance(1)
 	rec := must(g.Unregistered(bg, impu1))(t)
+	if !rec.Unregistered.Equal(t0.Add(DefaultUnregisteredTTL)) {
+		t.Errorf("the state ends at %v", rec.Unregistered)
+	}
 	if n := must(g.Sweep(bg, 10))(t); n != 0 {
 		t.Fatalf("swept %d sets before the TTL", n)
 	}
@@ -104,7 +107,7 @@ func TestWhatTheHSSAnswersAnUnregisteredUsersSARIsTold(t *testing.T) {
 				t.Fatalf("record %+v, error %v", rec, err)
 			case c.want != nil && !errors.Is(err, c.want):
 				t.Errorf("error %v, want %v", err, c.want)
-			case c.want == nil && (errors.Is(err, ErrUnknownUser) || errors.Is(err, ErrServedElsewhere) || errors.Is(err, ErrHSSUnavailable)):
+			case c.want == nil && (errors.Is(err, ErrUnknownUser) || errors.Is(err, ErrServedElsewhere) || errors.Is(err, ErrHSSUnavailable) || errors.Is(err, state.ErrInvalid)):
 				t.Errorf("error %v", err)
 			}
 			if _, err := e.store.Identity(bg, impu1, t0); !errors.Is(err, state.ErrNotFound) {
