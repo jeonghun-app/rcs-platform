@@ -376,8 +376,8 @@ request is sent over that flow whatever its Route or Request-URI say below.
 - **430.** A request whose Route names no flow, or a flow that is not a live
   client flow of this task (closed, from an earlier start, or a core
   connection), is answered 430 Flow Failed, and so is one whose flow is
-  already gone when it is to be sent. One whose flow closes while it is
-  under way may not get 430 yet
+  already gone when it is to be sent, or closes while it is under way, before
+  its final response: the branch ends when the flow does, not at Timer B or F
   ([#234](https://github.com/jeonghun-app/rcs-platform/issues/234)). The
   430 reaches `scscf` as it is, so that it tries the client's other flows
   (RFC 5626 §5.3). Flow tokens are an HMAC under a key
@@ -632,7 +632,9 @@ for example `115s`, so that the drain spreads over about 110 s.
 On SIGTERM `pcscf` stops accepting client connections and closes the client
 flows one by one, evenly spread over `PCSCF_DRAIN_TIMEOUT`. A flow that
 already ended takes no time of its own. The core listener stays open until
-the end, so `scscf` can still reach the clients not yet closed. A stopping task's
+the end, so `scscf` can still reach the clients not yet closed. After the last
+flow, `pcscf` waits up to 2 s of the 5 s margin for the requests still in
+progress, so a request on one of the last flows closed still gets its 430. A stopping task's
 clients then reconnect to another task and re-register over the stop
 timeout, not all at once, and `hss` and `scscf` are sized for that burst
 ([ADR 0003](adr/0003-aws-topology.md)).
