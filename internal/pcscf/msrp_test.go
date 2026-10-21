@@ -105,7 +105,9 @@ func newAnchoring(t *testing.T, perFlow, total int) *anchoring {
 	t.Cleanup(srv.Close)
 	base, _ := url.Parse(srv.URL)
 	a := &anchoring{p: p, clock: clock, relay: relay, base: base, sent: &fakeSender{}, alive: map[transport.FlowID]bool{"FLOW-A": true}}
-	p.msrp = newMSRPAnchor(context.Background(), newRelayClient(base, testRelayToken, time.Second, nil), newBindingLimit(perFlow, total, DefaultBindingsPerMinute, clock.now))
+	// The relay's answers are timed by the test, never by the client: a
+	// loaded host may take more than a second for one (make race).
+	p.msrp = newMSRPAnchor(context.Background(), newRelayClient(base, testRelayToken, waitFor, nil), newBindingLimit(perFlow, total, DefaultBindingsPerMinute, clock.now))
 	p.send = a.sent.send
 	var mu sync.Mutex
 	p.clientFlow = func(id transport.FlowID) bool { mu.Lock(); defer mu.Unlock(); return a.alive[id] }
