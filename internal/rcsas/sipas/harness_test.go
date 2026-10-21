@@ -93,14 +93,20 @@ func (c *fakeCore) serve(nc net.Conn) {
 		if !ok {
 			continue
 		}
+		// The answer is the one set when the request arrived: a test that
+		// sees the request (next) and then sets another answer changes
+		// the answer to later requests, never to this one (#406). It is
+		// called after the request is published, so a reply that waits on
+		// the test, as a held BYE does, cannot hold up next.
+		reply, answer := c.reply.Load(), c.answer.Load()
 		c.got <- req
 		if req.Method == "ACK" {
 			continue // nothing answers an ACK
 		}
 		var out []*sip.Response
-		if f := c.reply.Load(); f != nil {
-			out = (*f)(req)
-		} else if code := (*c.answer.Load())(req); code != 0 {
+		if reply != nil {
+			out = (*reply)(req)
+		} else if code := (*answer)(req); code != 0 {
 			res, err := sip.NewResponse(req, code, "", "core1")
 			if err != nil {
 				return
