@@ -448,7 +448,7 @@ func TestAGroupsConversationIDIsAUUID(t *testing.T) {
 	}
 	old := r.create(bob)
 	old.Conversation = "0123456789abcdef0123456789abcdef"
-	if err := r.groups.Update(t.Context(), old, "old"); err != nil {
+	if err := r.groups.Update(t.Context(), old, r.owner(t, old.URI), "old"); err != nil {
 		t.Fatal(err)
 	}
 	if g, err := r.s.Get(t.Context(), old.URI); err != nil || g.Conversation != old.Conversation {
@@ -507,6 +507,8 @@ func TestAGroupsDerivedConversationIDIsStable(t *testing.T) {
 	for contribution, want := range map[string]string{
 		"gch4t1":    "e0f8d3d1-d77c-598d-b120-23ea011606ab",
 		"chat-id-1": "282da727-4d14-5968-9cd3-74bc98622cc3",
+		// QA on #381: case is kept, so that folding it cannot slip in.
+		"GCH4T1": "c1f9b30e-4c55-50cc-ad87-1c903f91cfa0",
 	} {
 		if got := groupConversationID(contribution); got != want {
 			t.Errorf("groupConversationID(%q) = %s, want %s", contribution, got, want)

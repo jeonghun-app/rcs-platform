@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -304,8 +305,14 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 				t.Fatalf("results %+v", results)
 			}
 			if tc.err == "no NOTIFY came" {
-				if code := <-dropped; code != 481 {
-					t.Fatalf("the client answered the NOTIFY it should drop with %d, want 481", code)
+				// The run ended, so the answer is in, or never came.
+				select {
+				case code := <-dropped:
+					if code != 481 {
+						t.Fatalf("the client answered the NOTIFY it should drop with %d, want 481", code)
+					}
+				case <-time.After(cfg.StepTimeout):
+					t.Fatal("the client never answered the NOTIFY it should drop")
 				}
 			}
 		})

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -434,34 +435,41 @@ func TestAStalledPeerIsDisconnectedWithinTheWriteDeadline(t *testing.T) {
 	// The deadline is WriteTimeout from when the write began: it was
 	// computed after start and before the call that set it, so it lies
 	// between start+deadline and call+deadline however late either came.
-	set, at := nc.first()
-	if set.IsZero() || set.Before(start.Add(deadline)) || set.After(at.Add(deadline)) {
-		t.Fatalf("write deadline %v, set at %v; want WriteTimeout %v after the write began (start %v)", set, at, deadline, start)
+	// Every write the connection made, not only the first: a frame written
+	// before the one that stalled sets a deadline too (QA of #417).
+	ds := nc.all()
+	if len(ds) == 0 {
+		t.Fatal("no write deadline was set")
+	}
+	for _, d := range ds {
+		if d.set.Before(start.Add(deadline)) || d.set.After(d.at.Add(deadline)) {
+			t.Fatalf("write deadline %v, set at %v; want WriteTimeout %v after the write began (start %v)", d.set, d.at, deadline, start)
+		}
 	}
 	waitDone(t, s.Done(), "session")
 }
 
-// deadlineRecorder records the first write deadline set on its Conn and
-// when it was set.
+// deadlineRecorder records every write deadline set on its Conn and when
+// it was set.
 type deadlineRecorder struct {
 	net.Conn
-	mu      sync.Mutex
-	set, at time.Time
+	mu        sync.Mutex
+	deadlines []setDeadline
 }
+
+type setDeadline struct{ set, at time.Time }
 
 func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
 	d.mu.Lock()
-	if d.at.IsZero() {
-		d.set, d.at = t, time.Now()
-	}
+	d.deadlines = append(d.deadlines, setDeadline{t, time.Now()})
 	d.mu.Unlock()
 	return d.Conn.SetWriteDeadline(t)
 }
 
-func (d *deadlineRecorder) first() (set, at time.Time) {
+func (d *deadlineRecorder) all() []setDeadline {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.set, d.at
+	return slices.Clone(d.deadlines)
 }
 
 // discard is a Handler that keeps nothing, for floods.
