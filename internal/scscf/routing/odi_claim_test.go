@@ -107,3 +107,22 @@ func TestAUserWhoDeregisteredMeanwhileStillGetsOneCopy(t *testing.T) {
 		t.Errorf("a second copy went to %v", uris(more))
 	}
 }
+
+// TestTheChainsAnswerDropsTheServersRetryAfter (#359 QA): a server passed
+// over after its 500 with Retry-After does not lend it to the answer the
+// chain makes, which is about the user, not the server.
+func TestTheChainsAnswerDropsTheServersRetryAfter(t *testing.T) {
+	e := newEnv(t)
+	e.unregistered()
+	e.profile(t0, criterion(10, rcsAS, method("OPTIONS"), ifc.SessionContinued))
+	d := e.router(nil).Initial(bg, request(t, "OPTIONS", impu1))
+	busy := &sip.Response{StatusCode: 500, Reason: "Server Internal Error"}
+	_ = busy.Header.Set("Retry-After", "120")
+	if more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: d.Targets[0], Response: busy}); len(more) != 0 {
+		t.Fatalf("then %v", uris(more))
+	}
+	d.OnFinal(bg, busy)
+	if busy.StatusCode != 480 || busy.Header.Get("Retry-After") != "" {
+		t.Errorf("answered %d with Retry-After %q", busy.StatusCode, busy.Header.Get("Retry-After"))
+	}
+}
