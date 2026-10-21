@@ -206,7 +206,8 @@ func TestNewRefusesARecordRouteOverAnotherTransport(t *testing.T) {
 // validConfig is a config New takes, changed by tweak.
 func validConfig(e *env, tweak func(*Config)) Config {
 	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
-	c := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{mustURI("sip:scscf.rcs.local")}, DialogKeys: []DialogKey{{ID: "k2", Key: dialogKey}}}
+	c := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{mustURI("sip:scscf.rcs.local")}, DialogKeys: []DialogKey{{ID: "k2", Key: dialogKey}},
+		Registrar: e.hss, ICSCF: mustURI("sip:icscf.rcs.local;lr"), HomeDomain: realm}
 	tweak(&c)
 	return c
 }

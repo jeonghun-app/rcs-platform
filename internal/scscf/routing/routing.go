@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -19,10 +20,33 @@ type Metrics interface {
 	Count(name string, n int64)
 }
 
+// Registrar makes an identity the S-CSCF has no record of an unregistered
+// user it serves; *registrar.Registrar implements it. It fails with
+// registrar.ErrUnknownUser for an identity the HSS does not know.
+type Registrar interface {
+	Unregistered(ctx context.Context, impu string) (*state.Registration, error)
+}
+
 // Config configures a Router.
 type Config struct {
 	// Store is the state every scscf instance shares.
 	Store state.Store
+	// Registrar serves the unregistered users terminating requests name.
+	Registrar Registrar
+	// ODILifetime is how long an application server may take to send the
+	// request back; DefaultODILifetime when 0.
+	ODILifetime time.Duration
+	// ASTimeout bounds the wait for an application server's answer to a
+	// request other than INVITE, after which its default handling applies
+	// (TS 24.229 §5.4.3.2); DefaultASTimeout when 0.
+	ASTimeout time.Duration
+	// ICSCF is where an originating request goes once its iFC chain is
+	// done, toward the terminating user's S-CSCF: the I-CSCF of the home
+	// network, with lr.
+	ICSCF sip.URI
+	// HomeDomain is the domain of the home network's SIP URIs: a tel URI
+	// with a global number is sent on as the SIP URI of the number in it.
+	HomeDomain string
 	// RecordRoute is the S-CSCF's own Record-Route value, its service name
 	// with transport=tcp and lr (ADR 0005, #208), which keeps it on the
 	// route of the dialogs it forwards, so that their requests come back
@@ -34,9 +58,11 @@ type Config struct {
 	Self []sip.URI
 	// DialogKeys sign the Record-Route values the S-CSCF writes, so that a
 	// request inside a dialog goes on only to a hop the dialog was set up
-	// through (#322): the first signs, each verifies, so that a key is
-	// rotated by putting the new one first and keeping the old one until
-	// the dialogs it signed have ended. The same on every scscf instance.
+	// through (#322), and a request's place in its iFC chain toward an
+	// application server (odi, ADR 0005): the first signs, each verifies,
+	// so that a key is rotated by putting the new one first and keeping the
+	// old one until what it signed has ended. The same on every scscf
+	// instance, any of which may get a request back.
 	DialogKeys []DialogKey
 	// EdgeProxyPort is the port of the P-CSCF tasks' core listener, over
 	// TCP; DefaultEdgeProxyPort when 0. With the application servers'
@@ -73,6 +99,12 @@ const (
 	// DefaultRepairTimeout bounds a repair: the store's two calls, a read
 	// and a conditional write.
 	DefaultRepairTimeout = 5 * time.Second
+	// DefaultODILifetime is Timer B and F at the default T1 (RFC 3261
+	// §17.1.1.2), past which the request has failed anyway.
+	DefaultODILifetime = 32 * time.Second
+	// DefaultASTimeout leaves the client most of its Timer F (32 s) for
+	// what follows a server that does not answer.
+	DefaultASTimeout = 5 * time.Second
 	// DefaultEdgeProxyPort is pcscf's core listener (docs/pcscf.md).
 	DefaultEdgeProxyPort = 5070
 )
@@ -111,13 +143,15 @@ func isKeyID(id string) bool {
 	return true
 }
 
-// Router routes terminating requests and requests inside dialogs.
+// Router routes the requests of the users the S-CSCF serves, outside
+// dialogs and inside.
 type Router struct {
 	cfg Config
 	log *slog.Logger
 	ids sip.IDGenerator
 	// repairs counts the identity repairs under way, for Wait.
 	repairs sync.WaitGroup
+	svc     services
 }
 
 // New validates cfg and returns a Router.
@@ -136,6 +170,21 @@ func New(cfg Config) (*Router, error) {
 	}
 	if len(cfg.Self) == 0 {
 		return nil, errors.New("routing: Self is required")
+	}
+	if cfg.Registrar == nil {
+		return nil, errors.New("routing: Registrar is required")
+	}
+	if !cfg.ICSCF.IsSIP() || cfg.ICSCF.Host == "" || !cfg.ICSCF.Params.Has("lr") {
+		return nil, errors.New("routing: ICSCF must be a SIP URI with lr")
+	}
+	if cfg.HomeDomain == "" {
+		return nil, errors.New("routing: HomeDomain is required")
+	}
+	if cfg.ODILifetime <= 0 {
+		cfg.ODILifetime = DefaultODILifetime
+	}
+	if cfg.ASTimeout <= 0 {
+		cfg.ASTimeout = DefaultASTimeout
 	}
 	if err := checkHosts(cfg); err != nil {
 		return nil, err
