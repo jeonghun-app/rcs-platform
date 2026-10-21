@@ -23,7 +23,8 @@ const groupURI = "sip:chat-1@conf.ims.example.net"
 // each other, under the names in names, or refuse when refuse is set.
 // Member leaves out those in left: a copy written to them before they
 // left. The group is this task's unless another, alive, owns it
-// (notMine), and its copies are queued under fence.
+// (notMine), and its copies are queued under fence; lost counts the
+// groups the engine said it lost.
 type members struct {
 	all     []string
 	left    []string
@@ -31,10 +32,17 @@ type members struct {
 	refuse  error
 	notMine bool
 	fence   *store.Fence
+	lost    *atomic.Int64
 }
 
 func (h members) Owns(_ context.Context, group string) (bool, error) {
 	return group == groupURI && !h.notMine, nil
+}
+
+func (h members) Lost(group string) {
+	if h.lost != nil && group == groupURI {
+		h.lost.Add(1)
+	}
 }
 
 func (h members) Recipients(_ context.Context, group, sender string, kind GroupKind) (Audience, error) {
@@ -770,7 +778,7 @@ func TestACopyIsQueuedOnlyUnderTheGroupsOwner(t *testing.T) {
 	owner := atomic.Int64{}
 	owner.Store(1)
 	mem.SetFence(func(f store.Fence) bool { return f.Group == groupURI && f.Epoch == owner.Load() })
-	h := members{all: []string{alice, bob, carol}, fence: &store.Fence{Group: groupURI, Task: "task-a", Epoch: 1}}
+	h := members{all: []string{alice, bob, carol}, fence: &store.Fence{Group: groupURI, Task: "task-a", Epoch: 1}, lost: new(atomic.Int64)}
 	r.e.SetGroupHandler(h)
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
 		t.Fatal(err)
@@ -784,5 +792,10 @@ func TestACopyIsQueuedOnlyUnderTheGroupsOwner(t *testing.T) {
 	}
 	if mem.Len(bob)+mem.Len(carol) != 2 || r.m.get("group.fanout.not_owner") != 1 {
 		t.Fatalf("queues: bob %d, carol %d; %d refused", mem.Len(bob), mem.Len(carol), r.m.get("group.fanout.not_owner"))
+	}
+	// The group package hears of it, and reads the owner again before it
+	// invites for the group (QA on #440).
+	if h.lost.Load() != 1 {
+		t.Fatalf("the handler was told %d times", h.lost.Load())
 	}
 }

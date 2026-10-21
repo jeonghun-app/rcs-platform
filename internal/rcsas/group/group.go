@@ -259,8 +259,9 @@ type Service struct {
 	mu      sync.Mutex
 	touched map[string]time.Time
 	// owned holds the groups this task owns, with the epoch it owns them
-	// at; beating and lastBeat its heartbeat (StartHeartbeat).
-	owned map[string]groupstore.Owner
+	// at and when the store said so; beating and lastBeat its heartbeat
+	// (StartHeartbeat).
+	owned map[string]ownership
 	// others holds the groups another task was found to own, until when
 	// Owns takes that for granted.
 	others   map[string]time.Time
@@ -304,7 +305,7 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		adds:        messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
-		owned:       map[string]groupstore.Owner{},
+		owned:       map[string]ownership{},
 		others:      map[string]time.Time{},
 		maxFormer:   former,
 	}

@@ -54,6 +54,10 @@ type GroupHandler interface {
 	// the owner invites a group's participants for their queued copies,
 	// so that a group's sessions all open on one task.
 	Owns(ctx context.Context, group string) (bool, error)
+	// Lost tells the handler that the store refused a copy queued under
+	// the Fence of group's Audience: another task owns the group now, and
+	// Owns must not take it for this task's any more.
+	Lost(group string)
 }
 
 // Audience is who a participant's message in a group goes to, and the
@@ -337,6 +341,9 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 			// the new owner (#121).
 			cancel()
 			e.metrics.Count("group.fanout.not_owner", 1)
+			if h := e.groupHandler(); h != nil {
+				h.Lost(o.Group)
+			}
 			return err
 		}
 		if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {

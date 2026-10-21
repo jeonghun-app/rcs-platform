@@ -34,11 +34,19 @@ func (s *Service) me() groupstore.Owner { return groupstore.Owner{Task: s.cfg.Ta
 // alive reports whether this task may write its groups at now: its last
 // heartbeat holds them, with the skew to spare. A Service that runs no
 // heartbeat (StartHeartbeat), one task with the memory store, always
-// may: no other task takes its groups.
+// may: no other task takes its groups. Once it may not, another task may
+// take any of them, so the next beat stored forgets them all (beat).
 func (s *Service) alive(now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return !s.beating || now.Before(s.lastBeat.Add(s.cfg.TaskLease-s.cfg.TaskSkew))
+}
+
+// ownership is a group this task owns: the owner it writes the group
+// under, and when the store last said so.
+type ownership struct {
+	groupstore.Owner
+	read time.Time
 }
 
 // owner returns the owner this task writes g under, taking g over first
@@ -49,38 +57,48 @@ func (s *Service) alive(now time.Time) bool {
 // The groups this task owns are remembered, so that a write to one reads
 // nothing more; a fenced write's refusal forgets it (disown).
 func (s *Service) owner(ctx context.Context, g groupstore.Group) (groupstore.Owner, error) {
+	o, _, err := s.ownerOrOther(ctx, g, 0)
+	return o, err
+}
+
+// ownerOrOther is owner, taking what this task remembers owning only if
+// the store said so within maxAge, any age if it is zero. With
+// ErrNotOwner, other is the task the store names, alive, that owns g; it
+// is the zero Owner when this task's own heartbeat has lapsed instead.
+func (s *Service) ownerOrOther(ctx context.Context, g groupstore.Group, maxAge time.Duration) (mine, other groupstore.Owner, err error) {
 	now := s.cfg.Clock.Now()
 	if !s.alive(now) {
 		s.metrics.Count("group.owner_lapsed", 1)
-		return groupstore.Owner{}, ErrNotOwner
+		return groupstore.Owner{}, groupstore.Owner{}, ErrNotOwner
 	}
 	s.mu.Lock()
 	o, ok := s.owned[g.URI]
 	s.mu.Unlock()
-	if ok {
-		return o, nil
+	if ok && (maxAge == 0 || now.Before(o.read.Add(maxAge))) {
+		return o.Owner, groupstore.Owner{}, nil
 	}
 	cur, err := s.store.Owner(ctx, g.URI)
 	if err != nil {
-		return groupstore.Owner{}, err
+		return groupstore.Owner{}, groupstore.Owner{}, err
 	}
 	if cur.Task == s.cfg.Task {
 		s.own(g.URI, cur)
-		return cur, nil
+		return cur, groupstore.Owner{}, nil
 	}
 	if cur.Task != "" && (cur.SIP == "" || cur.SIP != s.cfg.SIP) {
 		t, err := s.store.Task(ctx, cur.Task)
 		switch {
 		case errors.Is(err, groupstore.ErrNotFound):
 		case err != nil:
-			return groupstore.Owner{}, err
+			return groupstore.Owner{}, groupstore.Owner{}, err
 		case now.Before(t.AliveUntil.Add(s.cfg.TaskSkew)):
-			return groupstore.Owner{}, ErrNotOwner
+			s.notOwned(g.URI)
+			return groupstore.Owner{}, cur, ErrNotOwner
 		}
 	}
 	token, err := s.randomHex(8)
 	if err != nil {
-		return groupstore.Owner{}, err
+		return groupstore.Owner{}, groupstore.Owner{}, err
 	}
 	next, err := s.store.TakeOver(ctx, g.URI, cur, s.me(), g.Expires, token)
 	if errors.Is(err, groupstore.ErrConflict) {
@@ -89,34 +107,40 @@ func (s *Service) owner(ctx context.Context, g groupstore.Group) (groupstore.Own
 		// stopped, #121 Q4), which this one may write under, or of
 		// another task, which owns the group now.
 		if cur, err = s.store.Owner(ctx, g.URI); err != nil {
-			return groupstore.Owner{}, err
+			return groupstore.Owner{}, groupstore.Owner{}, err
 		}
 		if cur.Task == s.cfg.Task {
 			s.own(g.URI, cur)
-			return cur, nil
+			return cur, groupstore.Owner{}, nil
 		}
-		return groupstore.Owner{}, ErrNotOwner
+		s.notOwned(g.URI)
+		return groupstore.Owner{}, cur, ErrNotOwner
 	}
 	if err != nil {
-		return groupstore.Owner{}, err
+		return groupstore.Owner{}, groupstore.Owner{}, err
 	}
 	s.metrics.Count("group.owner_takeover", 1)
 	s.own(g.URI, next)
-	return next, nil
+	return next, groupstore.Owner{}, nil
 }
 
 // Owns implements messaging.GroupHandler: whether this task owns the
-// group uri, taking it over if its owner has stopped (owner). That another
-// task owns it is remembered for TaskHeartbeat, so that a queue of copies
-// of its messages costs no read for each; an ended group is no one's.
+// group uri, taking it over if its owner has stopped (owner); an ended
+// group is no one's. Unlike a write, an invitation is not fenced by the
+// store, so the owner is read again once the store's word is a heartbeat
+// old: an owner paused while another task took a group over, which never
+// saw its own heartbeat lapse and writes nothing to the group, invites
+// for it no longer than that (code review and QA on #440). That another
+// task owns a group is remembered for TaskHeartbeat too, so that a queue
+// of copies of its messages costs no read for each.
 func (s *Service) Owns(ctx context.Context, uri string) (bool, error) {
 	now := s.cfg.Clock.Now()
 	s.mu.Lock()
-	_, mine := s.owned[uri]
+	o, mine := s.owned[uri]
 	until, other := s.others[uri]
 	s.mu.Unlock()
 	switch {
-	case mine && s.alive(now):
+	case mine && now.Before(o.read.Add(s.cfg.TaskHeartbeat)) && s.alive(now):
 		return true, nil
 	case other && now.Before(until):
 		return false, nil
@@ -128,8 +152,9 @@ func (s *Service) Owns(ctx context.Context, uri string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, err = s.owner(ctx, g)
-	if errors.Is(err, ErrNotOwner) {
+	_, at, err := s.ownerOrOther(ctx, g, s.cfg.TaskHeartbeat)
+	switch {
+	case errors.Is(err, ErrNotOwner) && at.Task != "":
 		s.mu.Lock()
 		if len(s.others) >= s.cfg.MaxTracked {
 			clear(s.others)
@@ -137,9 +162,19 @@ func (s *Service) Owns(ctx context.Context, uri string) (bool, error) {
 		s.others[uri] = now.Add(s.cfg.TaskHeartbeat)
 		s.mu.Unlock()
 		return false, nil
+	case errors.Is(err, ErrNotOwner):
+		// This task's own heartbeat has lapsed, which is not remembered:
+		// once a beat lands the group may be its own still.
+		return false, nil
 	}
 	return err == nil, err
 }
+
+// Lost implements messaging.GroupHandler: the store refused a copy of a
+// message in the group uri queued under this task's fence, as another
+// task owns the group now. The group is forgotten, so that the next
+// invitation for its copies, or write, reads its owner again.
+func (s *Service) Lost(uri string) { s.disown(uri) }
 
 // fence is the store.Fence of g's copies: the owner this task queues them
 // under, with a heartbeat running (StartHeartbeat), where another task
@@ -158,6 +193,7 @@ func (s *Service) fence(ctx context.Context, g groupstore.Group) (*store.Fence, 
 	return &store.Fence{Group: g.URI, Task: o.Task, Epoch: o.Epoch}, nil
 }
 
+// own records that this task owns uri as o, which the store just said.
 func (s *Service) own(uri string, o groupstore.Owner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -165,16 +201,22 @@ func (s *Service) own(uri string, o groupstore.Owner) {
 		// A group forgotten is only read again.
 		clear(s.owned)
 	}
-	s.owned[uri] = o
+	s.owned[uri] = ownership{Owner: o, read: s.cfg.Clock.Now()}
 }
 
 // disown forgets that this task owns uri, after a write the store refused
 // for its owner: another task took the group over.
 func (s *Service) disown(uri string) {
+	s.notOwned(uri)
+	s.metrics.Count("group.fenced", 1)
+}
+
+// notOwned forgets that this task owns uri, which the store says another
+// task does.
+func (s *Service) notOwned(uri string) {
 	s.mu.Lock()
 	delete(s.owned, uri)
 	s.mu.Unlock()
-	s.metrics.Count("group.fenced", 1)
 }
 
 // StartHeartbeat keeps this task's groups its own (#121): it stores the
@@ -217,9 +259,17 @@ func (s *Service) beat(ctx context.Context, until time.Time) {
 		s.metrics.Count("task.heartbeat_failed", 1)
 		return
 	}
+	stored := s.cfg.Clock.Now()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !stored.Before(s.lastBeat.Add(s.cfg.TaskLease - s.cfg.TaskSkew)) {
+		// The last beat's hold ran out before this one was stored, whether
+		// this task saw itself lapse (alive) or, paused or held up in the
+		// call, never did: another task may have taken any group meanwhile
+		// (#121 §4), so each is read again before it is written.
+		clear(s.owned)
+	}
 	s.lastBeat = at
-	s.mu.Unlock()
 }
 
 // heartbeat beats at next, and every TaskHeartbeat after, until ctx ends.
