@@ -49,6 +49,7 @@ func (s State) String() string {
 //	linger      D, K, I, J, L, M: how long a finished transaction absorbs
 //	            retransmissions
 //	trying      the 200 ms 100 Trying delay (§17.2.1)
+//	final       the safety net for a TU that never sends a final response
 type timerID int
 
 const (
@@ -56,6 +57,7 @@ const (
 	timerTimeout
 	timerLinger
 	timerTrying
+	timerFinal
 	timerSlots
 )
 
@@ -72,6 +74,8 @@ type machine struct {
 	server bool
 	// onTimer handles a timer that fired; it runs with mu held.
 	onTimer func(timerID) func()
+	// onEnd, if set, runs once when the transaction terminates, with mu held.
+	onEnd func()
 
 	mu       sync.Mutex
 	state    State
@@ -139,6 +143,9 @@ func (m *machine) terminate() {
 		m.stop(timerID(id))
 	}
 	m.l.remove(m.key, m.server)
+	if m.onEnd != nil {
+		m.onEnd()
+	}
 }
 
 // unlessReliable returns d for an unreliable transport and zero for a reliable

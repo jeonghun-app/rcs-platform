@@ -11,6 +11,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -122,6 +123,11 @@ func (g *Registrar) register(ctx context.Context, req *sip.Request, r *register)
 			if saved == nil {
 				return g.ok(req, r, nil, nil), nil
 			}
+			var before *state.Registration
+			if registered {
+				before = cur
+			}
+			g.cfg.Events.Changed(ctx, before, saved, regevent.Registered)
 			return g.ok(req, r, saved.Contacts, saved), nil
 		}
 		registered = isRegistered(cur)
@@ -496,6 +502,13 @@ func (g *Registrar) deregister(ctx context.Context, r *register, cur *state.Regi
 		return f
 	}
 	g.count("registrar.deregistered")
+	// The HSS has the deregistration: the subscribers learn of it whatever
+	// is left to clean up (TS 24.229 §5.4.2.1.2), before the record goes.
+	if err := g.cfg.Events.Ended(ctx, cur, regevent.Unregistered); err != nil {
+		g.internal("ending a deregistered set's subscriptions", err)
+		g.count("registrar.deregistration_left_to_sweep")
+		return nil
+	}
 	if err := g.endSet(ctx, claimed, profile); err != nil {
 		// The HSS has taken the deregistration, so the client's is done:
 		// what is left of the set holds the lease, and the sweep after it
