@@ -2,9 +2,12 @@ package reginfo
 
 import (
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"reflect"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -386,19 +389,30 @@ func TestAParamIsReadWithoutCaseAndUnquoted(t *testing.T) {
 }
 
 // docs/architecture.md §8: a parser is linear on a maximum-size adversarial
-// input. 64 times the input is about 64 times the work if linear and 4096
-// times if quadratic, so a bound of 512 between them needs no slack. The
-// work is measured twice:
-//   - in allocations, which load does not change, so this part never
-//     flakes (#263) and catches a quadratic step that allocates, as the
-//     pairwise URI.Equal duplicate check did (QA of #233);
-//   - in time, for a quadratic step that allocates nothing. Times are
-//     compared, not bounded, the two sizes timed in turn and the best of
-//     five runs of each taken, and only three attempts in a row over the
-//     bound fail the test: a loaded host slows one attempt, a quadratic
-//     parser every one. Under the race detector, which times its own
-//     instrumentation as much as the parser (#223 QA), only allocations
-//     are compared.
+// input. The work of one input of MaxDocumentSize is compared with that of
+// one of MaxDocumentSize/64, three ways:
+//   - in allocations and in bytes allocated, which load does not change,
+//     so these never flake (#263). 64 times the input is 52 to 88 times
+//     either for a linear parser and some 4096 times for a quadratic one,
+//     so the bound is 512: the count catches a quadratic step that
+//     allocates as often as it compares, as the pairwise URI.Equal
+//     duplicate check did (QA of #233), the bytes one that allocates once
+//     a step but copies quadratically, as a path of element names grown by
+//     concatenation would (#317 reviews).
+//   - in CPU time, for a quadratic step that allocates nothing: the
+//     process's (getrusage, GC included), so that time spent waiting for a
+//     CPU on a loaded host is not counted, the large input parsed once
+//     against the small one parsed 64 times, so the two run as long and a
+//     loaded host stretches both alike. A linear parser takes 1 to 6 times
+//     as long for the large; the bound is 8, which catches a quadratic
+//     term only once it is about 8 times the linear cost at the maximum
+//     size. "aors with parameters" sits highest, its duplicate check
+//     comparing the AORs of one key pairwise (sameAOR, at most
+//     maxRegistrations), leaving it a margin of about 1.4 on an
+//     oversubscribed host (#317 QA). Each of three attempts takes the
+//     least of five runs; only all three over the bound fail. Under the
+//     race detector, which times its own instrumentation as much as the
+//     parser (#223 QA), only allocations are compared.
 func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 	for name, build := range map[string]func(n int) string{
 		"attributes on the root": func(n int) string {
@@ -450,10 +464,21 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			parse := func(text string) time.Duration {
-				start := time.Now()
-				_, _ = Parse([]byte(text))
-				return time.Since(start)
+			// cpu is the process's CPU time, GC included.
+			cpu := func() time.Duration {
+				var ru syscall.Rusage
+				if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+					t.Fatal(err)
+				}
+				return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+			}
+			// parse is the CPU time of n parses of text.
+			parse := func(text string, n int) time.Duration {
+				start := cpu()
+				for range n {
+					_, _ = Parse([]byte(text))
+				}
+				return cpu() - start
 			}
 			input := func(n int) string {
 				text := build(n)
@@ -466,23 +491,28 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 			smallAllocs := testing.AllocsPerRun(3, func() { _, _ = Parse([]byte(smallText)) })
 			largeAllocs := testing.AllocsPerRun(3, func() { _, _ = Parse([]byte(largeText)) })
 			if largeAllocs > 512*smallAllocs {
-				t.Fatalf("64× the input made %v allocations against %v: not linear", largeAllocs, smallAllocs)
+				t.Fatalf("64× the input made %v allocations against %v (%.0f×): not linear", largeAllocs, smallAllocs, largeAllocs/smallAllocs)
+			}
+			smallBytes, largeBytes := allocatedBytes(smallText), allocatedBytes(largeText)
+			if largeBytes > 512*smallBytes {
+				t.Fatalf("64× the input allocated %d bytes against %d (%d×): not linear", largeBytes, smallBytes, largeBytes/smallBytes)
 			}
 			if raceEnabled {
 				return
 			}
-			var small, large time.Duration
+			var ratios []string
 			for range 3 {
-				small, large = time.Duration(1<<62), time.Duration(1<<62)
+				small, large := time.Duration(1<<62), time.Duration(1<<62)
 				for range 5 {
-					small = min(small, parse(smallText))
-					large = min(large, parse(largeText))
+					small = min(small, parse(smallText, 64))
+					large = min(large, parse(largeText, 1))
 				}
-				if large <= 512*small {
+				if large <= 8*small {
 					return
 				}
+				ratios = append(ratios, fmt.Sprintf("%v against %v (%.1f×)", large, small, float64(large)/float64(small)))
 			}
-			t.Fatalf("64× the input took %v against %v, three times over: not linear", large, small)
+			t.Fatalf("64× the input once took, against 64 of the small, three times over: %s: not linear", strings.Join(ratios, "; "))
 		})
 	}
 }
@@ -773,4 +803,19 @@ func TestTheAORKeyAgreesWithEqualOnAWideSet(t *testing.T) {
 	if bad > 0 {
 		t.Errorf("%d of %d pairs disagree with Equal", bad, len(es)*len(es))
 	}
+}
+
+// allocatedBytes is the bytes one Parse of text allocates, the fewest of
+// three runs: TotalAlloc counts only what this goroutine and the runtime
+// allocate meanwhile, and the test runs alone.
+func allocatedBytes(text string) uint64 {
+	best := uint64(1<<64 - 1)
+	var before, after runtime.MemStats
+	for range 3 {
+		runtime.ReadMemStats(&before)
+		_, _ = Parse([]byte(text))
+		runtime.ReadMemStats(&after)
+		best = min(best, after.TotalAlloc-before.TotalAlloc)
+	}
+	return best
 }
