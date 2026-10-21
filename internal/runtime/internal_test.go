@@ -271,21 +271,43 @@ func TestEachAddressGetsItsShareOfTheDialTime(t *testing.T) {
 // dials with a context the request's cancellation does not reach, so an
 // unresponsive resolver must not hold the connection slot beyond it (#114;
 // the test is QA's from the review of #105).
+//
+// The lookup checks the deadline it is given rather than racing a timer of
+// its own, so a loaded host cannot fail a dialer that is right (#179); the
+// clock bounds only a hang.
 func TestTheDialTimeoutAlsoBoundsTheLookup(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	var entered, deadline time.Time
 	d := InternalDialer{
-		Timeout: 200 * time.Millisecond,
+		Timeout: timeout,
 		Lookup: func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(2 * time.Second):
+			entered = time.Now()
+			var ok bool
+			if deadline, ok = ctx.Deadline(); !ok {
 				return nil, errors.New("the lookup was not bounded by Timeout")
 			}
+			<-ctx.Done()
+			return nil, ctx.Err()
 		},
 	}
-	start := time.Now()
-	_, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081")
-	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
-		t.Fatalf("%v after %v, want a deadline error after about 200ms", err, time.Since(start))
+	before := time.Now()
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() {
+		_, err := d.DialContext(context.Background(), "tcp", "hss.rcs.local:8081")
+		done <- result{err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("DialContext did not return")
+	}
+	if !errors.Is(r.err, context.DeadlineExceeded) {
+		t.Fatalf("DialContext returned %v, want a deadline error", r.err)
+	}
+	// The deadline is Timeout from when DialContext began.
+	if deadline.Before(before.Add(timeout)) || deadline.After(entered.Add(timeout)) {
+		t.Fatalf("the lookup's deadline is %v after the call began, want %v", deadline.Sub(before), timeout)
 	}
 }
