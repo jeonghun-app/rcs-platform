@@ -274,6 +274,7 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 	drainSendWait, drainFlushStall = time.Hour, 10*time.Second
 	t.Cleanup(func() { drainSendWait, drainFlushStall = DrainSendWait, time.Second })
 	responded := make(chan struct{}, 2)
+	var draining atomic.Bool
 	var px atomic.Pointer[Proxy]
 	// No write deadline cuts the stalled peer first, which would end its
 	// connection rather than let Drain judge it.
@@ -309,7 +310,12 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 				if r.Message.Method == "INFO" {
 					// The stalled peer's: the requests it had in flight
 					// when it stopped fill its queue, and the answers still
-					// waiting for room fail when the transport closes.
+					// waiting for room fail once Drain has begun and the
+					// transport closes. Before that, a failure is a broken
+					// setup.
+					if err != nil && !draining.Load() {
+						t.Errorf("answering INFO before Drain: %v", err)
+					}
 					return
 				}
 				if err != nil {
@@ -383,8 +389,16 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 			time.Sleep(45 * time.Millisecond)
 		}
 	}()
+	if stalled {
+		// Still there, with its output queued: otherwise this would be the
+		// case alone (code review of #366).
+		if st := tr.Stats(); st.OpenInbound != 2 || st.QueuedBytes < 1<<20 {
+			t.Fatalf("before Drain, %d connections and %d bytes queued, want both peers and the stalled one's 1 MiB", st.OpenInbound, st.QueuedBytes)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
+	draining.Store(true)
 	p.Drain(ctx)
 	_ = tr.Close()
 	r := sip.NewReader(bufio.NewReader(bytes.NewReader(<-read)), sip.Limits{MaxBodyBytes: 1 << 20})

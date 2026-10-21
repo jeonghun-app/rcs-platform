@@ -711,7 +711,10 @@ type counters struct {
 // out. A service that stops uses it before Close, which drops what the
 // queues hold: a peer that still reads gets its answers, however long they
 // are, and one that has stopped reading costs stall, not the whole deadline,
-// and does not hide behind another peer's traffic (QA of #366).
+// and does not hide behind another peer's traffic (QA of #366). The target is
+// in bytes, not messages: a sender that queues after the start and wins the
+// room a waiting one was given can complete it while that one still waits,
+// which needs a full queue that keeps taking new output.
 func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
 	start := time.Now()
 	type pending struct {
