@@ -55,17 +55,11 @@ func TestReassemblyMemoryFollowsReceivedOctetsNotDeclaredRanges(t *testing.T) {
 	}
 }
 
-// fastest runs f three times and returns its shortest time: other work on
-// the host can only lengthen a run, so the shortest is the closest to f's
-// own cost.
-func fastest(f func()) time.Duration {
-	best := time.Duration(1<<63 - 1)
-	for range 3 {
-		start := time.Now()
-		f()
-		best = min(best, time.Since(start))
-	}
-	return best
+// timed returns how long f takes.
+func timed(f func()) time.Duration {
+	start := time.Now()
+	f()
+	return time.Since(start)
 }
 
 func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
@@ -87,7 +81,7 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 	}
 	refused, maxHeld := 0, int64(0)
 	var n uint64
-	spreadTime := fastest(func() {
+	spreadRun := func() {
 		r := Reassembler{MaxSize: size}
 		refused, maxHeld = 0, 0
 		n = allocated(func() {
@@ -98,15 +92,33 @@ func TestAMaximumSizeSpreadOfOneOctetChunksStaysCheap(t *testing.T) {
 				maxHeld = max(maxHeld, r.Buffered())
 			}
 		})
-	})
-	baseTime := fastest(func() {
+	}
+	inOrderRun := func() {
 		r := Reassembler{MaxSize: size}
 		for _, m := range inOrder {
 			if _, err := r.Add(m, t0); err != nil {
 				t.Fatal(err)
 			}
 		}
-	})
+	}
+	// A spread run costs a few in-order ones, so each timing of the
+	// yardstick runs it baseRuns times: the two timings then last about as
+	// long, and a loaded host, which preempts a long timing more often
+	// than a short one, stretches both about alike (#232: the best of
+	// three 200 ms spread runs against 7 ms in-order ones made 28.7x).
+	// The two are timed in turn, so a burst of load meets both, and the
+	// shortest of each is taken, since other work only adds time.
+	const baseRuns = 4
+	spreadTime, baseTime := time.Duration(1<<63-1), time.Duration(1<<63-1)
+	for range 5 {
+		spreadTime = min(spreadTime, timed(spreadRun))
+		baseTime = min(baseTime, timed(func() {
+			for range baseRuns {
+				inOrderRun()
+			}
+		}))
+	}
+	baseTime /= baseRuns
 	// The 65th gap is refused and the message dropped, so it starts over;
 	// at most one fragment limit's worth is ever held.
 	if refused < chunks/(DefaultMaxFragments+1)-1 || maxHeld > DefaultMaxFragments {
