@@ -167,7 +167,10 @@ func (r *running) waitReadiness(t *testing.T, code int) {
 // Retry-After, as a terminating request does.
 func TestARegisterToAnUnreachableSCSCFGets500WithRetryAfter(t *testing.T) {
 	hss := startHSS(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// A port closed on a loopback address icscf never listens on, so its
+	// own core listener, on 127.0.0.1, cannot take the port over and turn
+	// the REGISTER into a loop (#325).
+	ln, err := net.Listen("tcp", "127.0.0.9:0")
 	if err != nil {
 		t.Fatal(err)
 	}
