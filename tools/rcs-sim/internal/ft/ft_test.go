@@ -455,6 +455,36 @@ func TestUploadInfoCountsItsQuietTimeFromTheAnswer(t *testing.T) {
 	}
 }
 
+func TestUploadInfoSettlesBytesHeldFirstSeenJustBeforeTheDeadline(t *testing.T) {
+	// QA of #356: ft-server notices the break and holds 20 bytes from 80
+	// ms on, inside the last quiet time before the 100 ms deadline. Those
+	// bytes get the rest of their quiet time too, not only bytes first
+	// seen after the deadline. Any request sent after the deadline reaches
+	// the server after the switch, so a loaded host cannot turn this into
+	// a 404.
+	start := time.Now()
+	c := fakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if time.Since(start) < 80*time.Millisecond {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", ft.ContentType)
+		_, _ = io.WriteString(w, resumeInfo(20))
+	})
+	info, _, err := c.SettledUploadInfo(ctx(t), "x", 100*time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("SettledUploadInfo = %v for bytes held first seen just before the deadline, want them settled", err)
+	}
+	if held, _ := info.Held(); held != 20 {
+		t.Fatalf("held %d, want 20", held)
+	}
+}
+
 func TestUploadInfoSettlesThoughASlowFirstAnswerHeldNothing(t *testing.T) {
 	// The usual slow answer (QA of #356): the first request comes before
 	// the server has noticed the break and is answered 404 after the
