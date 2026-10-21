@@ -1,20 +1,15 @@
 package pcscf
 
 import (
-	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/jeonghun-app/rcs-platform/internal/msrp"
-	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/dialog"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -22,13 +17,17 @@ import (
 )
 
 // pcscf anchors every MSRP session of its clients through msrp-relay (ADR
-// 0004, #136): it rewrites the m=message lines of the session's offer and
-// answer so that the client connects to the relay, and the relay to rcs-as,
-// and it holds the relay's binding for as long as the session lives. A
-// session it cannot anchor is refused, or ended, and never left to run end
-// to end. This file covers the sessions a client sets up; the ones rcs-as
-// sets up, and offers inside a dialog, are refused until #136's second
-// change.
+// 0004, #136): it rewrites the m=message lines of each offer and answer of
+// the session, so that the client connects to the relay and the relay to
+// rcs-as, and it holds the relay's bindings for as long as the session
+// lives. A session it cannot anchor is refused, or ended, and never left to
+// run end to end.
+//
+// This file keeps the sessions: their bindings, the dialogs to end and the
+// BYEs that end them, the flows that close and the sweep. msrpexchange.go
+// anchors one offer and its answer, and msrphooks.go puts the two into the
+// proxy's decisions, for the sessions either side sets up and the requests
+// inside them.
 const (
 	// bindingExpiresIn is how long a binding is asked for, and
 	// bindingExtendEvery how often the sweep extends a live one (#136
@@ -57,94 +56,118 @@ const (
 	metricRefusedRate      = "msrp.refused.binding_rate"
 	metricRefusedRelay     = "msrp.refused.relay"
 	metricRefusedOffer     = "msrp.refused.offer"
-	metricEndedLateOffer   = "msrp.ended.late_offer"
+	metricEndedDirection   = "msrp.ended.direction"
 	metricEndedSecond      = "msrp.ended.second_answer"
 	metricEndedRelay       = "msrp.ended.relay_failed"
 	metricRelayErrors      = "msrp.relay_errors"
 	metricByeFailed        = "msrp.bye_failed"
-	reasonLateOffer        = `SIP;cause=488;text="MSRP offer in an answer not supported"`
+	reasonDirection        = `SIP;cause=488;text="MSRP direction not supported"`
 	reasonSecondAnswer     = `SIP;cause=488;text="MSRP answer already given"`
 	reasonRelayUnavailable = `SIP;cause=503;text="MSRP relay unavailable"`
 )
 
-// msrpKey names an anchored session: the client's flow, the Call-ID and
-// the client's own tag, which is the From tag of its requests and the To
-// tag of the core's.
+// side is a side of a session: the client's, or the core's, rcs-as.
+type side int
+
+const (
+	clientSide side = iota
+	coreSide
+)
+
+func (s side) other() side { return 1 - s }
+
+// msrpKey names an anchored session: the client's flow and the Call-ID.
+// The client has one tag in all the dialogs of a Call-ID, those of the
+// forks of its INVITE included, so the two name the session whichever side
+// set it up; the tag is checked once known (msrpSession.clientTag).
 type msrpKey struct {
-	flow        transport.FlowID
-	callID, tag string
+	flow   transport.FlowID
+	callID string
 }
 
-// keyOf is the key of a session, its tag in lower case since tags compare
-// without case (RFC 3261 §19.3).
-func keyOf(flow transport.FlowID, callID, tag string) msrpKey {
-	return msrpKey{flow: flow, callID: callID, tag: strings.ToLower(tag)}
+func keyOf(flow transport.FlowID, callID string) msrpKey {
+	return msrpKey{flow: flow, callID: callID}
 }
 
-// anchoredLine is an MSRP line of the offer and the binding that anchors
-// it.
+// anchoredLine is a relay binding and the endpoint paths the relay has for
+// it, each set once (docs/api/msrp-relay.yaml).
 type anchoredLine struct {
-	line     msrpLine
-	binding  relayBinding
-	released bool
+	binding              relayBinding
+	clientPath, corePath []string
+	released             bool
+}
+
+// pathOf is the endpoint path of l on side s.
+func (l *anchoredLine) pathOf(s side) []string {
+	if s == clientSide {
+		return l.clientPath
+	}
+	return l.corePath
 }
 
 // pendingEnd is a dialog of the session to be ended with a BYE on each
-// side, once the ACK of its 2xx has passed or endAfter has.
+// side, once the ACK that ackFrom sends for its 2xx has passed or endAfter
+// has.
 type pendingEnd struct {
-	ok     *sip.Response
-	reason string
-	at     time.Time
+	// ok is the 2xx of the INVITE that set the dialog up, from which its
+	// BYEs are made.
+	ok      *sip.Response
+	reason  string
+	ackFrom side
+	at      time.Time
 	// sent says its BYEs went, or its dialog ended otherwise, so a 2xx
 	// retransmitted after its ACK does not end it twice.
 	sent bool
 }
 
-// refusal is how an INVITE that Prepare could not anchor is answered: the
+// refusal is how a request that Prepare could not anchor is answered: the
 // proxy's 500 becomes it.
 type refusal struct {
 	status             int
 	reason, retryAfter string
 }
 
-// msrpSession is a session pcscf anchors, from the offer until it ends.
+// msrpSession is a session pcscf anchors, from its INVITE until it ends.
 //
 // Once its bindings are released it serves nothing, but it stays known
 // while a dialog of it is still to be ended, so that the dialog's ACK, or
 // the sweep, sends its BYEs; a 2xx that comes after, as the proxy forwards
 // a late one (RFC 6026 §7.2), is ended too.
 type msrpSession struct {
-	key   msrpKey
-	lines []anchoredLine
-	// host is the relay's client-side host, which an answer toward the
-	// client shows in place of rcs-as's address.
-	host string
-	// clientInvite is the INVITE as the client sent it, and invite as it
-	// went to the core, from which the BYEs that end the session are made.
-	clientInvite, invite *sip.Request
-	created              time.Time
+	key msrpKey
+	// origin is the side that sent the INVITE: initial is that INVITE as
+	// it came, and forwarded as it went to the other side, from which the
+	// BYEs that end a dialog are made.
+	origin             side
+	initial, forwarded *sip.Request
+	created            time.Time
 
-	// answering lets the core's responses through one at a time, across the
-	// relay calls an answer makes; mu is never held across one, so a flow
-	// that closes and the sweep never wait for the relay (#248 code review
-	// 5).
+	// answering lets the responses to the session's requests through one
+	// at a time, across the relay calls an offer or an answer makes; mu is
+	// never held across one, so a flow that closes and the sweep never
+	// wait for the relay (#248 code review 5).
 	answering sync.Mutex
 
 	mu sync.Mutex
-	// held is what the session took of the binding limit.
-	held int
+	// clientTag is the client's tag, once known: the From tag of its
+	// INVITE, or the To tag of its first response to the core's.
+	clientTag string
+	// host is the relay's client-side host, which a description toward
+	// the client shows in place of rcs-as's address.
+	host string
+	// lines are the bindings that serve the session, by m= line index;
+	// every holds each binding made for it, to release them all.
+	lines map[int]*anchoredLine
+	every []*anchoredLine
+	// setup is the exchange of the INVITE that set the session up, and x
+	// one under way inside its dialog.
+	setup, x *exchange
+	// dialogTag is the tag of the dialog the bindings serve, in lower case:
+	// the To tag of the response with the first answer, or with the offer
+	// to an INVITE without one.
+	dialogTag string
 	// released says the bindings are released and the limit given back.
 	released bool
-	// answered says an answer came, in the response with To tag answerTag,
-	// in lower case; answerIn is its description as rcs-as wrote it and
-	// answerOut as the client got it, so a retransmission is rewritten the
-	// same (proxy Decision.OnResponse).
-	answered            bool
-	answerTag           string
-	answerIn, answerOut []byte
-	// failed holds the Reason of an answer the relay could not serve, which
-	// ends the dialog once its 2xx is answered.
-	failed string
 	// confirmed says the 2xx ok came, extended when the bindings were last
 	// extended, and extending that an extension is under way.
 	confirmed bool
@@ -155,12 +178,23 @@ type msrpSession struct {
 	// sent inside the session's dialogs, which a BYE pcscf sends for that
 	// side must exceed (RFC 3261 §12.2.1.1).
 	clientSeq, coreSeq uint32
-	// ends are the dialogs to end, by To tag in lower case.
+	// ends are the dialogs to end, by the To tag of their 2xx in lower
+	// case.
 	ends map[string]pendingEnd
 
-	// refused is set when the session could not be anchored before it was
+	// refused is set when the INVITE could not be anchored before it was
 	// sent.
 	refused atomic.Pointer[refusal]
+}
+
+func newSession(flow transport.FlowID, origin side, invite *sip.Request, now time.Time) *msrpSession {
+	s := &msrpSession{key: keyOf(flow, invite.Header.Get("Call-ID")), origin: origin, initial: invite.Clone(),
+		created: now, lines: map[int]*anchoredLine{}, ends: map[string]pendingEnd{}}
+	if origin == clientSide {
+		from, _ := invite.Header.From()
+		s.clientTag = strings.ToLower(from.Tag())
+	}
+	return s
 }
 
 // msrpAnchor is the anchoring state of a task: the relay client, nil
@@ -246,436 +280,35 @@ func (p *pcscf) count(name string, n int64) {
 	}
 }
 
-// refuseOffer answers an offer pcscf will not anchor with 488 (ADR 0004).
-func (p *pcscf) refuseOffer() proxy.Decision {
-	p.count(metricRefusedOffer, 1)
-	return proxy.Decision{Status: 488, Reason: "Not Acceptable Here"}
-}
-
-// hiddenHost is the host a description toward the client shows when no
-// relay binding gives one: pcscf's public name.
-func (p *pcscf) hiddenHost() string {
-	return cmp.Or(p.cfg.PublicHost, "0.0.0.0")
-}
-
-// anchorOriginating anchors the MSRP lines of a client's INVITE outside a
-// dialog, d being where originate sends it (ADR 0004, first row):
-//   - a body pcscf cannot read, more than maxMSRPLines MSRP lines, or a
-//     line the relay could not serve, is 488: one that offers
-//     a=setup:passive (RFC 6135 §4.2.2) or holdconn, which pcscf cannot
-//     answer as it must (RFC 4145 §4), or whose path the relay would refuse
-//     (relayTakesPath);
-//   - without a relay token, or past the binding limits, or when the relay
-//     fails, 503 with Retry-After (#136 decisions 4 to 6);
-//   - otherwise each line gets a binding for the client's path, and the
-//     INVITE goes to the core with the relay's core-side path, active, on
-//     port 9.
-//
-// An INVITE without an offer is watched for an MSRP offer in its 1xx and
-// 2xx, which is not supported (#136 decision 2). Neither offers reliable
-// provisional responses, and one that requires them is 420: one could
-// carry an offer, answered in a PRACK, that pcscf does not anchor (RFC
-// 3262 §5).
-func (p *pcscf) anchorOriginating(r *proxy.Request, d proxy.Decision) proxy.Decision {
-	if r.Message.Method != "INVITE" || p.msrp == nil {
-		return d
-	}
-	part, found, err := messageSDP(&r.Message.Header, r.Message.Body)
-	if err != nil {
-		return p.refuseOffer()
-	}
-	_, lines, err := msrpLines(part.description(), true)
-	if found && err != nil {
-		return p.refuseOffer()
-	}
-	if found && len(lines) == 0 {
-		return d
-	}
-	if requires100rel(&r.Message.Header) {
-		return p.refuse100rel(r)
-	}
-	if !found {
-		return p.watchLateOffer(r, d)
-	}
-	if len(lines) > min(maxMSRPLines, p.msrp.limit.most()) {
-		return p.refuseOffer()
-	}
-	for _, l := range lines {
-		if l.holdconn || l.setup != sdp.SetupActive && l.setup != sdp.SetupActPass || !relayTakesPath(l.path) {
-			return p.refuseOffer()
-		}
-	}
-	from, _ := r.Message.Header.From()
-	s := &msrpSession{
-		key:          keyOf(r.Source.Flow, r.Message.Header.Get("Call-ID"), from.Tag()),
-		clientInvite: r.Message.Clone(),
-		created:      p.now(),
-		ends:         map[string]pendingEnd{},
-	}
-	for _, l := range lines {
-		s.lines = append(s.lines, anchoredLine{line: l})
-	}
-	if p.msrp.relay == nil {
-		p.count(metricRefusedRelay, 1)
-		return p.refuse(r, 503, "MSRP Relay Unavailable")
-	}
-	prepare := d.Prepare
-	d.Prepare = func(ctx context.Context, t proxy.Target, req *sip.Request) error {
-		if prepare != nil {
-			if err := prepare(ctx, t, req); err != nil {
-				return err
-			}
-		}
-		if err := without100rel(&req.Header); err != nil {
-			return err
-		}
-		return p.allocate(ctx, s, req)
-	}
-	d.OnFinal = func(_ context.Context, res *sip.Response) {
-		switch rf := s.refused.Load(); {
-		case rf != nil && res.StatusCode == 500:
-			res.StatusCode, res.Reason = rf.status, rf.reason
-		case res.StatusCode == statusFlowFailed:
-			// What the proxy does without OnFinal: a client must not see
-			// 430 (RFC 5626 §11.5).
-			res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
-		}
-	}
-	next := d.OnResponse
-	d.OnResponse = func(ctx context.Context, res *sip.Response) {
-		if next != nil {
-			next(ctx, res)
-		}
-		if rf := s.refused.Load(); rf != nil && res.StatusCode == rf.status {
-			if rf.retryAfter != "" {
-				_ = res.Header.Set("Retry-After", rf.retryAfter)
-			}
-			return
-		}
-		p.originatingResponse(ctx, s, res)
-	}
-	return d
-}
-
-// requires100rel reports whether a request's Require has the 100rel
-// option.
-func requires100rel(h *sip.Header) bool {
-	options, err := h.Require()
-	return err != nil || slices.ContainsFunc(options, func(o string) bool { return strings.EqualFold(o, "100rel") })
-}
-
-// refuse100rel answers an INVITE pcscf anchors that requires reliable
-// provisional responses with 420 and Unsupported: 100rel (RFC 3261
-// §8.2.2.3): one could carry an offer, answered in a PRACK, that pcscf does
-// not anchor until #136's second change; the client may try again without
-// (RFC 3262 §4). A Require pcscf cannot read is refused the same.
-func (p *pcscf) refuse100rel(r *proxy.Request) proxy.Decision {
-	res, err := sip.NewResponse(r.Message, 420, "", p.mustTag())
-	if err != nil || res.Header.Set("Unsupported", "100rel") != nil {
-		return proxy.Decision{Status: 420}
-	}
-	return proxy.Decision{Response: res}
-}
-
-// without100rel takes the 100rel option out of a request's Supported, so
-// that the core sends no reliable provisional response (RFC 3262 §3),
-// which could carry an offer pcscf does not anchor; a Require of it is
-// refused before (refuse100rel).
-func without100rel(h *sip.Header) error {
-	for _, name := range []string{"Supported"} {
-		if !h.Has(name) {
-			continue
-		}
-		options, err := h.Elements(name)
-		if err != nil {
-			return err
-		}
-		kept := slices.DeleteFunc(options, func(o string) bool { return strings.EqualFold(strings.TrimSpace(o), "100rel") })
-		if len(kept) == len(options) {
-			continue
-		}
-		h.Del(name)
-		if len(kept) > 0 {
-			if err := h.Add(name, strings.Join(kept, ", ")); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// allocate takes s's share of the binding limits, allocates a binding for
-// each line and writes the relay's core-side path into req. On an error
-// nothing is held, and the INVITE is answered as s.refused says.
-func (p *pcscf) allocate(ctx context.Context, s *msrpSession, req *sip.Request) error {
-	wait, err := p.msrp.limit.take(s.key.flow, len(s.lines))
-	switch {
-	case errors.Is(err, errBindingRate):
-		s.refused.Store(&refusal{status: 503, reason: "MSRP Relay Unavailable", retryAfter: strconv.Itoa(int(wait / time.Second))})
-		p.count(metricRefusedRate, 1)
-		return err
-	case err != nil:
-		s.refused.Store(&refusal{status: 503, reason: "MSRP Relay Unavailable", retryAfter: retryAfter})
-		p.count(metricRefusedLimit, 1)
-		return err
-	}
-	s.held = len(s.lines)
-	fail := func(err error) error {
-		if errors.Is(err, errRelayInvalid) {
-			s.refused.Store(&refusal{status: 488, reason: "Not Acceptable Here"})
-			p.count(metricRefusedOffer, 1)
-		} else {
-			s.refused.Store(&refusal{status: 503, reason: "MSRP Relay Unavailable", retryAfter: retryAfter})
-			p.count(metricRefusedRelay, 1)
-		}
-		p.releaseSession(s)
-		return err
-	}
-	for i := range s.lines {
-		b, err := p.msrp.relay.create(ctx, relayPaths{ClientEndpointPath: s.lines[i].line.path, ExpiresIn: bindingExpiresIn})
-		if err != nil {
-			p.relayFailed("create", err)
-			return fail(err)
-		}
-		s.lines[i].binding = b
-	}
-	u, err := msrp.ParseURI(s.lines[0].binding.ClientPath)
-	if err != nil {
-		return fail(err)
-	}
-	s.host = u.Host
-	part, _, err := messageSDP(&req.Header, req.Body)
-	if err != nil {
-		return fail(err)
-	}
-	d, _, err := msrpLines(part.description(), true)
-	if err != nil {
-		return fail(err)
-	}
-	for _, l := range s.lines {
-		if err := anchorLine(d, l.line.index, l.binding.CorePathLocal, sdp.SetupActive, false); err != nil {
-			return fail(err)
-		}
-	}
-	out, err := d.Marshal()
-	if err != nil {
-		return fail(err)
-	}
-	req.Body = part.with(out)
-	s.invite = req.Clone()
-	s.extended = p.now()
-	if old := p.msrp.get(s.key); old != nil {
-		// An INVITE again with the Call-ID and tag of one whose session
-		// lives: that session is over.
-		p.forgetSession(old)
-	}
-	p.msrp.add(s)
-	if p.clientFlow != nil && !p.clientFlow(s.key.flow) {
-		// The flow closed while the relay was asked; flowClosed may have
-		// run before the session was added. Nothing goes to the core for
-		// it.
-		p.forgetSession(s)
-		s.refused.Store(&refusal{status: 503, reason: "MSRP Relay Unavailable", retryAfter: retryAfter})
-		return errFlowClosed
-	}
-	return nil
-}
-
-// errFlowClosed fails an INVITE whose client's flow closed while its
-// session was being anchored.
-var errFlowClosed = errors.New("pcscf: the client's flow closed")
-
 // relayFailed counts and logs a failed call to the relay, by operation.
 func (p *pcscf) relayFailed(op string, err error) {
 	p.count(metricRelayErrors, 1)
 	p.log.Warn("msrp-relay call failed", slog.String("op", op), slog.String("error", err.Error()))
 }
 
-// originatingResponse anchors the answer in res, a response from the core
-// to a client's INVITE that s anchors, and keeps track of the session:
-//   - the first answer, in a 1xx or 2xx (#136 decision 3), completes each
-//     binding with rcs-as's path and goes to the client with the relay's
-//     client path, passive; a line rcs-as declined loses its binding;
-//   - a later answer the same is rewritten the same, and any other, or one
-//     of another fork, or one after the bindings are released, goes to the
-//     client with every line declined and its dialog is ended (#136
-//     decision 3); a 2xx of another fork than the first answer's also
-//     releases the bindings, which served an early dialog that 2xx ends
-//     (RFC 3261 §13.2.2.4);
-//   - an answer the relay cannot serve still goes to the client, its MSRP
-//     lines pointing at the relay, and the dialog is ended once its 2xx is
-//     answered (#136 decision 6);
-//   - a final failure ends the session.
-func (p *pcscf) originatingResponse(ctx context.Context, s *msrpSession, res *sip.Response) {
-	code := res.StatusCode
-	if code == 100 {
-		return
+// hiddenHost is the host a description toward the client shows when no
+// relay binding gives one: pcscf's public name.
+func (p *pcscf) hiddenHost() string {
+	if p.cfg.PublicHost != "" {
+		return p.cfg.PublicHost
 	}
-	s.answering.Lock()
-	defer s.answering.Unlock()
-	if code >= 300 {
-		p.endSession(s)
-		return
-	}
-	to, _ := res.Header.To()
-	tag := strings.ToLower(to.Tag())
-	received := res.Clone()
-	part, found, err := messageSDP(&res.Header, res.Body)
-	var d []byte
-	if err == nil && found {
-		d = part.description()
-	}
+	return "0.0.0.0"
+}
 
+// hostFor is the host a description toward the client of s shows.
+func (p *pcscf) hostFor(s *msrpSession) string {
 	s.mu.Lock()
-	first := d != nil && !s.released && !s.answered
-	// A retransmission of an answer the relay could not serve goes as the
-	// first did; one whose bindings were released for another cause does
-	// not hand out their path again.
-	same := d != nil && s.answered && tag == s.answerTag && bytes.Equal(d, s.answerIn) && (!s.released || s.failed != "")
-	if first {
-		s.answered, s.answerTag, s.answerIn = true, tag, slices.Clone(d)
+	defer s.mu.Unlock()
+	if s.host != "" {
+		return s.host
 	}
-	if err != nil && !s.answered && !s.released {
-		s.answered, s.answerTag, s.failed = true, tag, reasonRelayUnavailable
-	}
-	answerOut := s.answerOut
-	s.mu.Unlock()
-
-	other := false
-	switch {
-	case err != nil:
-		// An answer pcscf cannot read cannot be anchored, and must not
-		// reach the client as it is.
-		dropBody(res)
-		other = tag != s.answerTag
-	case !found:
-	case first:
-		out, failed := p.anchorAnswer(ctx, s, d)
-		s.mu.Lock()
-		if s.released {
-			// The flow closed while the relay was asked.
-			out, failed = declineAll(d, s.host), reasonRelayUnavailable
-		}
-		s.answerOut, s.failed = out, failed
-		s.mu.Unlock()
-		setBody(res, part, out)
-	case same:
-		setBody(res, part, answerOut)
-	default:
-		setBody(res, part, declineAll(d, s.host))
-		other = true
-	}
-	if code < 200 {
-		return
-	}
-
-	s.mu.Lock()
-	reason, release, releaseNow := "", false, false
-	switch {
-	case s.released:
-		reason = cmp.Or(s.failed, reasonRelayUnavailable)
-	case !s.answered:
-		// A 2xx without an answer to the offer.
-		s.answered, s.answerTag, s.failed = true, tag, reasonRelayUnavailable
-		reason, releaseNow = s.failed, true
-	case other || tag != s.answerTag:
-		reason, release = reasonSecondAnswer, tag != s.answerTag && !s.confirmed
-	case s.failed != "":
-		// The relay cannot serve it: released before the 2xx goes on
-		// (#136 decision 6), so the relay never connects for it.
-		reason, releaseNow = s.failed, true
-	case !s.confirmed:
-		s.confirmed, s.ok = true, received
-	}
-	s.mu.Unlock()
-	switch {
-	case releaseNow:
-		p.releaseNow(ctx, s)
-	case release:
-		p.releaseSession(s)
-	}
-	if reason != "" {
-		p.endDialog(s, received, reason)
-	}
+	return p.hiddenHost()
 }
 
-// setBody makes d the description of res's body part, or drops the body
-// if d is nil.
-func setBody(res *sip.Response, part sdpPart, d []byte) {
-	if d == nil {
-		dropBody(res)
-		return
-	}
-	res.Body = part.with(d)
-}
-
-// dropBody removes the body of res, which pcscf cannot let reach the client.
-func dropBody(res *sip.Response) {
-	res.Body = nil
-	res.Header.Del("Content-Type")
-}
-
-// anchorAnswer completes s's bindings from rcs-as's answer d and returns the
-// answer the client gets, or nil if it cannot be written, and the Reason
-// that ends the dialog if the relay cannot serve it. It calls the relay:
-// s.answering is held, s.mu is not.
-func (p *pcscf) anchorAnswer(ctx context.Context, s *msrpSession, d []byte) ([]byte, string) {
-	ans, err := sdp.Parser{MaxSize: maxSDP}.Parse(d)
-	if err != nil {
-		return nil, reasonRelayUnavailable
-	}
-	failed := ""
-	anchored := map[int]string{}
-	var declined []int
-	for i := range s.lines {
-		l := &s.lines[i]
-		if l.line.index >= len(ans.Media) || !ans.Media[l.line.index].IsMSRP() {
-			failed = reasonRelayUnavailable
-			continue
-		}
-		m := &ans.Media[l.line.index]
-		if m.Port == 0 {
-			// rcs-as declined it: nothing to relay.
-			declined = append(declined, i)
-			continue
-		}
-		path, err := m.Path()
-		if err != nil {
-			failed = reasonRelayUnavailable
-			continue
-		}
-		setup, serr := ans.MediaSetup(l.line.index)
-		if errors.Is(serr, sdp.ErrNoAttribute) {
-			setup, serr = sdp.SetupPassive, nil
-		}
-		// The relay offered active, so rcs-as must listen (RFC 6135 §4.2.2).
-		if serr != nil || len(path) != 1 || setup != sdp.SetupPassive {
-			failed = reasonRelayUnavailable
-		} else if err := p.msrp.relay.update(ctx, l.binding.ID, relayPaths{CorePath: path}); err != nil {
-			p.relayFailed("update", err)
-			failed = reasonRelayUnavailable
-		}
-		// Whatever happened, the client sees the relay, never rcs-as.
-		anchored[l.line.index] = l.binding.ClientPath
-	}
-	s.mu.Lock()
-	for _, i := range declined {
-		p.releaseLine(&s.lines[i])
-	}
-	s.mu.Unlock()
-	if towardClient(ans, anchored, s.host) != nil {
-		return nil, reasonRelayUnavailable
-	}
-	out, err := ans.Marshal()
-	if err != nil {
-		return nil, reasonRelayUnavailable
-	}
-	return out, failed
-}
-
-// endDialog marks the dialog of ok, a 2xx, to be ended with reason, unless
-// it is already, and keeps s known until it is.
-func (p *pcscf) endDialog(s *msrpSession, ok *sip.Response, reason string) {
+// endDialog marks the dialog of ok, a 2xx, to be ended with reason once
+// ackFrom's ACK has passed, unless it is already, and keeps s known until
+// it is.
+func (p *pcscf) endDialog(s *msrpSession, ok *sip.Response, ackFrom side, reason string) {
 	to, _ := ok.Header.To()
 	key := strings.ToLower(to.Tag())
 	s.mu.Lock()
@@ -683,78 +316,43 @@ func (p *pcscf) endDialog(s *msrpSession, ok *sip.Response, reason string) {
 	if _, ending := s.ends[key]; ending {
 		return
 	}
-	s.ends[key] = pendingEnd{ok: ok, reason: reason, at: p.now()}
+	s.ends[key] = pendingEnd{ok: ok, reason: reason, ackFrom: ackFrom, at: p.now()}
 	p.msrp.keep(s)
 }
 
-// watchLateOffer forwards an INVITE without an offer as d says, and ends
-// its dialog if the 2xx carries an MSRP offer, which pcscf does not
-// anchor (#136 decision 2): the 1xx and 2xx with one go to the client with
-// every line declined. The INVITE asks for no reliable provisional
-// response.
-func (p *pcscf) watchLateOffer(r *proxy.Request, d proxy.Decision) proxy.Decision {
-	from, _ := r.Message.Header.From()
-	key := keyOf(r.Source.Flow, r.Message.Header.Get("Call-ID"), from.Tag())
-	clientInvite := r.Message.Clone()
-	// s is made with the first 2xx to end and serves its retransmissions
-	// and other forks' 2xx after it (#248 code review 6).
-	var s *msrpSession
-	var forwarded *sip.Request
-	var mu sync.Mutex
-	prepare := d.Prepare
-	d.Prepare = func(ctx context.Context, t proxy.Target, req *sip.Request) error {
-		if prepare != nil {
-			if err := prepare(ctx, t, req); err != nil {
-				return err
-			}
+// endNow ends the session's dialog at once, with reason: its ACK, if any,
+// has passed. It is the dialog the bindings serve, of the 2xx s.ok.
+func (p *pcscf) endNow(s *msrpSession, reason string) {
+	s.mu.Lock()
+	ok := s.ok
+	var e pendingEnd
+	due := false
+	if ok != nil {
+		to, _ := ok.Header.To()
+		key := strings.ToLower(to.Tag())
+		if prev, ending := s.ends[key]; !ending || !prev.sent {
+			e = pendingEnd{ok: ok, reason: reason, ackFrom: s.origin, at: p.now(), sent: true}
+			s.ends[key] = e
+			due = true
 		}
-		if err := without100rel(&req.Header); err != nil {
-			return err
-		}
-		mu.Lock()
-		forwarded = req.Clone()
-		mu.Unlock()
-		return nil
 	}
-	next := d.OnResponse
-	d.OnResponse = func(ctx context.Context, res *sip.Response) {
-		if next != nil {
-			next(ctx, res)
-		}
-		if res.StatusCode < 101 || res.StatusCode >= 300 {
-			return
-		}
-		part, found, err := messageSDP(&res.Header, res.Body)
-		if err != nil {
-			dropBody(res)
-		} else if !found {
-			return
-		} else if _, lines, err := msrpLines(part.description(), true); err == nil && len(lines) == 0 {
-			return
-		} else {
-			setBody(res, part, declineAll(part.description(), p.hiddenHost()))
-		}
-		if res.StatusCode < 200 {
-			return
-		}
-		mu.Lock()
-		if s == nil {
-			s = &msrpSession{key: key, clientInvite: clientInvite, invite: forwarded, created: p.now(), ends: map[string]pendingEnd{}}
-		}
-		ls := s
-		mu.Unlock()
-		p.endDialog(ls, res.Clone(), reasonLateOffer)
+	s.mu.Unlock()
+	if due {
+		p.sendEnd(s, e)
+		return
 	}
-	return d
+	p.endSession(s)
 }
 
-// releaseLine releases the binding of l, if it has one still. s.mu of its
-// session must be held; the relay is called in the background.
-func (p *pcscf) releaseLine(l *anchoredLine) {
+// releaseLine releases the binding of l, if it has one still, and gives
+// back its share of the limit. s.mu of its session must be held; the relay
+// is called in the background.
+func (p *pcscf) releaseLine(s *msrpSession, l *anchoredLine) {
 	if l.released || l.binding.ID == "" {
 		return
 	}
 	l.released = true
+	p.msrp.limit.give(s.key.flow, 1)
 	id := p.msrp.relay
 	bid := l.binding.ID
 	p.msrp.goRun(func(ctx context.Context) {
@@ -770,13 +368,14 @@ func (p *pcscf) releaseLine(l *anchoredLine) {
 func (p *pcscf) releaseNow(ctx context.Context, s *msrpSession) {
 	s.mu.Lock()
 	var ids []string
-	for i := range s.lines {
-		if l := &s.lines[i]; !l.released && l.binding.ID != "" {
+	for _, l := range s.every {
+		if !l.released && l.binding.ID != "" {
 			l.released = true
+			p.msrp.limit.give(s.key.flow, 1)
 			ids = append(ids, l.binding.ID)
 		}
 	}
-	p.releaseLocked(s)
+	s.released = true
 	s.mu.Unlock()
 	for _, id := range ids {
 		if err := p.msrp.relay.release(ctx, id); err != nil {
@@ -785,22 +384,13 @@ func (p *pcscf) releaseNow(ctx context.Context, s *msrpSession) {
 	}
 }
 
-// releaseSession releases every binding of s and gives back its share of
-// the limit; s then serves nothing.
+// releaseSession releases every binding of s; s then serves nothing.
 func (p *pcscf) releaseSession(s *msrpSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p.releaseLocked(s)
-}
-
-func (p *pcscf) releaseLocked(s *msrpSession) {
 	s.released = true
-	for i := range s.lines {
-		p.releaseLine(&s.lines[i])
-	}
-	if s.held > 0 {
-		p.msrp.limit.give(s.key.flow, s.held)
-		s.held = 0
+	for _, l := range s.every {
+		p.releaseLine(s, l)
 	}
 }
 
@@ -831,93 +421,13 @@ func (p *pcscf) forgetSession(s *msrpSession) {
 	p.releaseSession(s)
 }
 
-// msrpInDialog keeps track of a request inside a dialog of an anchored
-// session, from the client (fromClient) or from the core over flow: a BYE
-// ends its dialog, and the session with the dialog its bindings serve, and
-// the ACK of a 2xx whose dialog is to be ended sends the BYEs. It reports
-// false for a request pcscf does not anchor inside a dialog yet (#136's
-// second change), and which is answered 488 or, an ACK, dropped: one with
-// an MSRP description, or a body pcscf cannot read, in an INVITE, UPDATE,
-// PRACK or ACK, and an INVITE without an offer, whose 2xx would bring one.
-func (p *pcscf) msrpInDialog(flow transport.FlowID, req *sip.Request, fromClient bool) bool {
-	if p.msrp == nil {
-		return true
-	}
-	ok := true
-	switch req.Method {
-	case "INVITE", "UPDATE", "PRACK", "ACK":
-		part, found, err := messageSDP(&req.Header, req.Body)
-		switch {
-		case err != nil:
-			ok = false
-		case found:
-			_, lines, err := msrpLines(part.description(), true)
-			ok = err == nil && len(lines) == 0
-		default:
-			ok = req.Method != "INVITE"
-		}
-	}
-	from, _ := req.Header.From()
-	to, _ := req.Header.To()
-	tag, other := from.Tag(), to.Tag()
-	if !fromClient {
-		tag, other = other, tag
-	}
-	other = strings.ToLower(other)
-	s := p.msrp.get(keyOf(flow, req.Header.Get("Call-ID"), tag))
-	if s == nil {
-		return ok
-	}
-	if cseq, err := req.Header.CSeq(); err == nil && req.Method != "ACK" && req.Method != "CANCEL" {
-		s.mu.Lock()
-		if fromClient {
-			s.clientSeq = max(s.clientSeq, cseq.Seq)
-		} else {
-			s.coreSeq = max(s.coreSeq, cseq.Seq)
-		}
-		s.mu.Unlock()
-	}
-	switch req.Method {
-	case "BYE":
-		s.mu.Lock()
-		// A BYE of another fork's dialog ends that dialog alone (#248 code
-		// review 4).
-		mine := s.answerTag == "" || other == s.answerTag
-		if e, ok := s.ends[other]; ok && !e.sent {
-			e.sent = true
-			s.ends[other] = e
-		}
-		s.mu.Unlock()
-		if mine {
-			p.endSession(s)
-		} else {
-			p.forgetIfDone(s)
-		}
-	case "ACK":
-		if fromClient {
-			s.mu.Lock()
-			e, due := s.ends[other]
-			due = due && !e.sent
-			if due {
-				e.sent = true
-				s.ends[other] = e
-			}
-			s.mu.Unlock()
-			if due {
-				p.sendEnd(s, e)
-			}
-		}
-	}
-	return ok
-}
-
 // sendEnd ends the dialog of e on both sides with a BYE carrying its
 // Reason (ADR 0004), and the session with it if its bindings serve it.
 // e is marked sent already.
 func (p *pcscf) sendEnd(s *msrpSession, e pendingEnd) {
 	switch e.reason {
-	case reasonLateOffer:
-		p.count(metricEndedLateOffer, 1)
+	case reasonDirection:
+		p.count(metricEndedDirection, 1)
 	case reasonSecondAnswer:
 		p.count(metricEndedSecond, 1)
 	default:
@@ -925,7 +435,7 @@ func (p *pcscf) sendEnd(s *msrpSession, e pendingEnd) {
 	}
 	to, _ := e.ok.Header.To()
 	s.mu.Lock()
-	mine := s.answerTag == "" || strings.EqualFold(to.Tag(), s.answerTag)
+	mine := s.dialogTag == "" || strings.EqualFold(to.Tag(), s.dialogTag)
 	clientSeq, coreSeq := s.clientSeq, s.coreSeq
 	s.mu.Unlock()
 	if mine {
@@ -959,27 +469,28 @@ func (p *pcscf) byeHandler(side string) func(*sip.Response, error) {
 }
 
 // byeClient sends the client the BYE of the far end of e's dialog, over
-// its flow: the dialog the client set up with its INVITE, from the 2xx's
-// To and Contact (RFC 3261 §12.1.1), past the CSeq of the core's requests
-// in it.
+// its flow, past the CSeq of the core's requests in it: as the UAS of the
+// client's INVITE, from the 2xx's To and Contact (RFC 3261 §12.1.1), or as
+// the UAC of the core's, from the client's 2xx (§12.1.2).
 func (p *pcscf) byeClient(s *msrpSession, e pendingEnd, seq uint32) {
-	to, err := e.ok.Header.To()
-	if err != nil {
-		p.byeFailed("client", "dialog")
-		return
+	var d *dialog.Dialog
+	var err error
+	if s.origin == clientSide {
+		to, cs, cerr := toAndContact(e.ok)
+		if cerr != nil {
+			p.byeFailed("client", "dialog")
+			return
+		}
+		d, err = dialog.UAS(s.initial, to.Tag(), cs)
+	} else {
+		d, err = dialog.UAC(s.forwarded, e.ok)
 	}
-	cs, err := e.ok.Header.Contact()
-	if err != nil || len(cs) != 1 {
-		p.byeFailed("client", "dialog")
-		return
-	}
-	d, err := dialog.UAS(s.clientInvite, to.Tag(), cs[0].URI)
 	if err != nil {
 		p.byeFailed("client", "dialog")
 		return
 	}
 	d.RouteSet = nil
-	d.LocalSeq = seq
+	d.LocalSeq = max(d.LocalSeq, seq)
 	bye, err := d.Request("BYE", p.ids)
 	if err != nil || bye.Header.Set("Reason", e.reason) != nil {
 		p.byeFailed("client", "request")
@@ -990,32 +501,60 @@ func (p *pcscf) byeClient(s *msrpSession, e pendingEnd, seq uint32) {
 	}
 }
 
-// byeCore sends the core the client's BYE for e's dialog, along the route
-// set the 2xx recorded past pcscf's own values (RFC 3261 §12.1.2), past
-// the CSeq of the client's requests in it. Only what the core recorded is
-// followed: originate keeps no Record-Route of the client's (#248 security
-// review), and a route set without pcscf's values is not followed at all.
-func (p *pcscf) byeCore(ctx context.Context, s *msrpSession, e pendingEnd, seq uint32) {
-	if s.invite == nil {
-		p.byeFailed("core", "dialog")
-		return
-	}
-	d, err := dialog.UAC(s.invite, e.ok)
+// toAndContact is the To and the one Contact URI of res.
+func toAndContact(res *sip.Response) (sip.Address, sip.URI, error) {
+	to, err := res.Header.To()
 	if err != nil {
-		p.byeFailed("core", "dialog")
-		return
+		return sip.Address{}, sip.URI{}, err
 	}
-	last := -1
-	for i, a := range d.RouteSet {
-		if p.ownRoute(a.URI) {
-			last = i
+	cs, err := res.Header.Contact()
+	if err != nil || len(cs) != 1 {
+		return sip.Address{}, sip.URI{}, errors.New("pcscf: not one Contact")
+	}
+	return to, cs[0].URI, nil
+}
+
+// byeCore sends the core the client's BYE for e's dialog, past the CSeq of
+// the client's requests in it: as the UAC of the client's INVITE, along
+// the route set the 2xx recorded below pcscf's own values (RFC 3261
+// §12.1.2), or as the UAS of the core's, along the Record-Route it came
+// with (§12.1.1). Only what the core recorded is followed: originate keeps
+// no Record-Route of the client's (#248 security review), and a route set
+// without pcscf's values is not followed at all.
+func (p *pcscf) byeCore(ctx context.Context, s *msrpSession, e pendingEnd, seq uint32) {
+	var d *dialog.Dialog
+	var err error
+	if s.origin == clientSide {
+		if s.forwarded == nil {
+			p.byeFailed("core", "dialog")
+			return
+		}
+		if d, err = dialog.UAC(s.forwarded, e.ok); err != nil {
+			p.byeFailed("core", "dialog")
+			return
+		}
+		last := -1
+		for i, a := range d.RouteSet {
+			if p.ownRoute(a.URI) {
+				last = i
+			}
+		}
+		if last < 0 {
+			p.byeFailed("core", "route")
+			return
+		}
+		d.RouteSet = d.RouteSet[last+1:]
+	} else {
+		to, cs, cerr := toAndContact(e.ok)
+		if cerr != nil {
+			p.byeFailed("core", "dialog")
+			return
+		}
+		if d, err = dialog.UAS(s.initial, to.Tag(), cs); err != nil {
+			p.byeFailed("core", "dialog")
+			return
 		}
 	}
-	if last < 0 {
-		p.byeFailed("core", "route")
-		return
-	}
-	d.RouteSet = d.RouteSet[last+1:]
 	d.LocalSeq = max(d.LocalSeq, seq)
 	bye, err := d.Request("BYE", p.ids)
 	if err != nil || bye.Header.Set("Reason", e.reason) != nil {
@@ -1039,30 +578,6 @@ func (p *pcscf) ownRoute(u sip.URI) bool {
 		return true
 	}
 	return proxy.SameHost(u.Host, hostOf(p.cfg.CoreHost)) && u.Port == p.corePort
-}
-
-// offersMSRP reports whether req carries an MSRP offer, or a body pcscf
-// cannot read for one.
-func offersMSRP(req *sip.Request) bool {
-	part, found, err := messageSDP(&req.Header, req.Body)
-	if err != nil {
-		return true
-	}
-	if !found {
-		return false
-	}
-	_, lines, err := msrpLines(part.description(), true)
-	return err != nil || len(lines) > 0
-}
-
-// offerless reports whether req is an INVITE without a session
-// description.
-func offerless(req *sip.Request) bool {
-	if req.Method != "INVITE" {
-		return false
-	}
-	_, found, err := messageSDP(&req.Header, req.Body)
-	return err == nil && !found
 }
 
 // msrpFlowClosed forgets the sessions of a flow that closed (RFC 5626
@@ -1103,11 +618,11 @@ func (p *pcscf) sweepMSRP() {
 			}
 		}
 		stale := !s.confirmed && !now.Before(s.created.Add(maxSetupTime))
-		extend := s.confirmed && !s.released && s.failed == "" && !s.extending && !now.Before(s.extended.Add(bindingExtendEvery))
+		extend := s.confirmed && !s.released && !s.extending && !now.Before(s.extended.Add(bindingExtendEvery))
 		var ids []string
 		if extend {
 			s.extending = true
-			for _, l := range s.lines {
+			for _, l := range s.every {
 				if !l.released && l.binding.ID != "" {
 					ids = append(ids, l.binding.ID)
 				}
@@ -1153,21 +668,9 @@ func (p *pcscf) extend(ctx context.Context, s *msrpSession, ids []string, now ti
 	if err == nil {
 		s.extended = now
 	}
-	var e pendingEnd
-	gone := errors.Is(err, errRelayGone) && !s.released && s.ok != nil
-	if gone {
-		to, _ := s.ok.Header.To()
-		key := strings.ToLower(to.Tag())
-		_, ending := s.ends[key]
-		gone = !ending
-		if gone {
-			s.failed = reasonRelayUnavailable
-			e = pendingEnd{ok: s.ok, reason: s.failed, at: now, sent: true}
-			s.ends[key] = e
-		}
-	}
+	gone := errors.Is(err, errRelayGone) && !s.released
 	s.mu.Unlock()
 	if gone {
-		p.sendEnd(s, e)
+		p.endNow(s, reasonRelayUnavailable)
 	}
 }

@@ -74,12 +74,6 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 	if !initial && !p.inDialogWith(*entry, callID) {
 		return proxy.Decision{Status: 403, Reason: "Not On This Route"}
 	}
-	// MSRP sessions rcs-as sets up are anchored by #136's second change;
-	// until then their offers are refused, never passed on unanchored, and
-	// so is an INVITE without an offer, whose 2xx would carry the client's.
-	if initial && p.msrp != nil && (offersMSRP(r.Message) || offerless(r.Message)) || !initial && !p.msrpInDialog(flow, r.Message, false) {
-		return p.refuseOffer()
-	}
 	fallback := ""
 	if !initial {
 		fallback, _ = routeICID(*entry)
@@ -140,7 +134,12 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 			}
 		}
 	}
-	return d
+	// MSRP sessions rcs-as sets up, and the requests inside them, are
+	// anchored through msrp-relay (ADR 0004).
+	if initial {
+		return p.anchorInitial(r, d, coreSide, flow)
+	}
+	return p.anchorInDialog(r, d, coreSide, flow)
 }
 
 // keepRecordRoute puts routes back as the Record-Route of a response that
