@@ -548,6 +548,61 @@ func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
 	}
 }
 
+// pendingGate is a store whose Pending, once armed, returns what it read
+// only when released: a pass that has read the queue and not finished.
+type pendingGate struct {
+	store.Store
+	armed   atomic.Bool
+	read    chan struct{}
+	release chan struct{}
+}
+
+func (s *pendingGate) Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]store.Message, error) {
+	ms, err := s.Store.Pending(ctx, recipient, after, now, limit)
+	if s.armed.CompareAndSwap(true, false) {
+		close(s.read)
+		<-s.release
+	}
+	return ms, err
+}
+
+// QA on #284: a large-mode attempt that releases its message while a pass
+// of the recipient's queue is under way, a pass that read the queue with
+// the message still claimed, has that pass read the queue once more. The
+// pass would otherwise find nothing held, stop the retry timer and let the
+// recipient go, and the message would wait for the next event (#294).
+func TestAReleaseDuringAPassHasTheQueueReadAgain(t *testing.T) {
+	st := &pendingGate{Store: store.NewMemory(), read: make(chan struct{}), release: make(chan struct{})}
+	r := newRigWith(t, Config{PagerLimit: 600}, st, newFakeClock())
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	// A pass reads the queue, the message claimed, and is held there.
+	st.armed.Store(true)
+	r.e.kickEvent(bob)
+	waitDone(t, st.read)
+	_ = leg.Close() // the attempt fails and releases the message
+	waitDone(t, leg.Finished())
+	close(st.release)
+	// The same pass, or the one it has run after it, asks for the session;
+	// the fake clock does not move, so no retry timer does.
+	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+		t.Fatalf("invitation %+v", got)
+	}
+}
+
 // failLargeAttempt makes one large-mode attempt for bob that fails: the
 // client answers and never binds.
 func failLargeAttempt(t *testing.T, r *rig) {
