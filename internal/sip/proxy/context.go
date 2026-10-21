@@ -47,6 +47,10 @@ type respContext struct {
 	// transaction, by the proxy or by the layer for it: the request is no
 	// longer in progress for Drain, even while its context lingers.
 	handed atomic.Bool
+	// responding is set just before a final response goes to the server
+	// transaction, which may then wait for room in a stalled peer's queue
+	// (#375).
+	responding atomic.Bool
 	// unwatch stops watching the server transaction for the layer's own 500
 	// (layerAnswered).
 	unwatch func() bool
@@ -322,11 +326,24 @@ func (c *respContext) answer(res *sip.Response) {
 // for a slow upstream peer included, and a Serve handler has not sent one
 // either (a handler that answered may still wait on its context, for an
 // ACK).
+//
+// Over a *transport.Transport, a final already on its way to the transaction
+// is not in progress either: if it waits for room in a stalled peer's
+// queue, Drain would wait for it until its own deadline, and
+// Transport.Flush, which Drain ends with, waits for it anyway, as a sender
+// waiting for room, giving up only once that connection stalls (#375). The
+// gap is the transaction layer's few lines between taking the response and
+// handing it to the transport: a final caught there when Flush looks is not
+// waited for, and Close may drop it.
 func (c *respContext) inProgress() bool {
 	c.mu.Lock()
 	uas := c.uas
 	c.mu.Unlock()
-	return !c.handed.Load() && (uas == nil || !uas.handedFinal())
+	flushed := c.p.flushes
+	if c.handed.Load() || flushed && c.responding.Load() {
+		return false
+	}
+	return uas == nil || !uas.handedFinal() && !(flushed && uas.hasAnswered())
 }
 
 // answerForStop answers a request still without a final response 500 with
@@ -393,6 +410,7 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 			if hook != nil {
 				hook(c.ctx, res)
 			}
+			c.responding.Store(true)
 			err := c.tx.Respond(res)
 			c.handed.Store(true)
 			if err != nil {
@@ -1094,6 +1112,9 @@ func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 		}
 		// §16.9: a response that cannot be sent is dropped, and the
 		// branches are left alone.
+		if code >= 200 {
+			c.responding.Store(true)
+		}
 		if err := c.tx.Respond(res); err != nil {
 			c.p.stats.upstreamErrors.Add(1)
 		}

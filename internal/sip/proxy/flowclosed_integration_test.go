@@ -427,6 +427,17 @@ func longAnswerToASlowReader(t *testing.T, stalled bool) {
 // then reads at about 16 MB/s while Drain runs, and the transport closes
 // right after it, as in pcscf.
 func TestDrainDeliversAnswersStillWaitingForRoom(t *testing.T) {
+	// Past its deadline Drain goes straight to the flush; far from it,
+	// Drain no longer waits for the finals already on their way (#375), and
+	// the flush still delivers them.
+	for _, far := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the drain's deadline passed", true: "the drain's deadline far off"}[far], func(t *testing.T) {
+			answersWaitingForRoom(t, far)
+		})
+	}
+}
+
+func answersWaitingForRoom(t *testing.T, far bool) {
 	const requests = 3000
 	drainSendWait, drainFlushStall = time.Hour, 10*time.Second
 	t.Cleanup(func() { drainSendWait, drainFlushStall = DrainSendWait, time.Second })
@@ -488,7 +499,13 @@ func TestDrainDeliversAnswersStillWaitingForRoom(t *testing.T) {
 		}
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	if far {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Hour)
+	}
+	defer cancel()
+	if !far {
+		cancel()
+	}
 	p.Drain(ctx)
 	_ = tr.Close()
 	r := sip.NewReader(bufio.NewReader(bytes.NewReader(<-read)), sip.Limits{})
@@ -519,5 +536,88 @@ func waitUntil(t *testing.T, what string, cond func() bool, progress func() int6
 			t.Fatalf("waiting for %s, nothing moved for 30 s: %+v", what, tr.Stats())
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A stalled peer's finals waiting for room in its full queue do not hold
+// Drain to its deadline (#375): they are on their way, Flush waits for them
+// as senders waiting for room, and gives up once the connection stalls. The
+// deadline is an hour here; before #375 Drain waited all of it.
+func TestDrainDoesNotWaitOutItsDeadlineForFinalsBehindAStalledPeer(t *testing.T) {
+	for _, serve := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the proxy's own answers", true: "a Serve handler's answers"}[serve], func(t *testing.T) {
+			finalsBehindAStalledPeer(t, serve)
+		})
+	}
+}
+
+func finalsBehindAStalledPeer(t *testing.T, serve bool) {
+	var routed atomic.Int64
+	var px atomic.Pointer[Proxy]
+	tr, err := transport.New(transport.Config{WriteTimeout: time.Hour}, func(in transport.Inbound) {
+		if p := px.Load(); p != nil {
+			p.Receive(in)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	addr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(tr, Config{
+		Self: []sip.URI{mustURI("sip:" + addr.String() + ";lr")},
+		Router: RouterFunc(func(context.Context, *Request) Decision {
+			routed.Add(1)
+			if !serve {
+				return Decision{Status: 200}
+			}
+			return Decision{Serve: func(_ context.Context, u *UAS) {
+				if res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1"); err == nil {
+					_ = u.Respond(res)
+				}
+			}}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	px.Store(p)
+
+	peer := dialSIP(t, addr.String())
+	if tc, ok := peer.nc.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(4096)
+	}
+	_ = peer.nc.SetDeadline(time.Now().Add(time.Hour))
+	// Far more 200s than the queue holds, each with the request's long Via;
+	// the peer reads none of them.
+	const requests = 2000
+	pad := strings.Repeat("z", 3000)
+	go func() {
+		for i := range requests {
+			text := fmt.Sprintf("MESSAGE sip:bob@example.com SIP/2.0\r\n"+
+				"Via: SIP/2.0/TCP %s;branch=z9hG4bK-behind-%d;p=%s\r\n"+
+				"Max-Forwards: 70\r\nTo: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
+				"Call-ID: behind-%d\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n", peer.nc.LocalAddr(), i, pad, i)
+			if _, err := io.WriteString(peer.nc, text); err != nil {
+				return
+			}
+		}
+	}()
+	waitUntil(t, "every request to be routed", func() bool { return routed.Load() == requests }, routed.Load, tr)
+	if p.inProgress() != 0 {
+		t.Fatalf("%d requests count as in progress with their finals decided", p.inProgress())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { p.Drain(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Drain is still waiting for the finals behind a peer that does not read")
 	}
 }

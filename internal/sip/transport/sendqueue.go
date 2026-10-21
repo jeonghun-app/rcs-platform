@@ -146,17 +146,19 @@ func (q *sendQueue) push(b []byte, wait bool, deadline time.Time) pushResult {
 	if !wait {
 		return q.tryPush(b, 2*q.limit, false)
 	}
+	// Counted as waiting from the start, and until it is queued or gives
+	// up: Flush waits for it too, as output already decided for this
+	// connection (QA of #366), however soon after the send began it looks
+	// (#375).
+	q.mu.Lock()
+	q.waiting += len(b)
+	q.mu.Unlock()
 	var expired <-chan time.Time
 	for {
-		if r := q.tryPush(b, q.limit, expired != nil); r != queueFull {
+		if r := q.tryPush(b, q.limit, true); r != queueFull {
 			return r
 		}
 		if expired == nil {
-			// Counted while it waits: Flush waits for it too, as output
-			// already decided for this connection (QA of #366).
-			q.mu.Lock()
-			q.waiting += len(b)
-			q.mu.Unlock()
 			t := time.NewTimer(time.Until(deadline))
 			defer t.Stop()
 			expired = t.C
