@@ -34,7 +34,11 @@
 // the position does, and the other is refused. Any other answer of a
 // server's goes upstream unchanged. The position is bound to the Call-ID,
 // so a B2BUA application server that sends the request on in a dialog of
-// its own is not supported (ADR 0005). The SDP iFC see is a request's
+// its own is not supported (ADR 0005). Nor is a proxy server that records
+// the route on a terminating chain: the callee's requests in the dialog
+// then come from its P-CSCF with the server's Record-Route value next, not
+// the S-CSCF's, which signs nothing they carry, and are refused. rcs-as, a
+// B2BUA that sends its legs as new requests (#137), is neither. The SDP iFC see is a request's
 // application/sdp body, or the first such part of a multipart one, as
 // rcsjta's chat INVITE with its first message has. iFC see the request without a
 // P-Served-User unless it came with one of its own and not from a P-CSCF:

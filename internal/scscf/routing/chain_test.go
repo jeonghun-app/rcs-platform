@@ -202,6 +202,8 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			b.Routed[0].URI.Params.Set(odiParam, parts[0]+"."+base64.RawURLEncoding.EncodeToString(payload)+"."+parts[2])
 		},
 		"another Call-ID": func(b *proxy.Request) { _ = b.Message.Header.Set("Call-ID", "term-call-2") },
+		"another method":  func(b *proxy.Request) { b.Message.Method = "OPTIONS"; _ = b.Message.Header.Set("CSeq", "1 OPTIONS") },
+		"another CSeq":    func(b *proxy.Request) { _ = b.Message.Header.Set("CSeq", "2 INVITE") },
 		"expired":         func(*proxy.Request) { e.clock.advance(DefaultODILifetime + time.Second) },
 		"just in time":    func(*proxy.Request) { e.clock.advance(DefaultODILifetime) },
 		"empty":           func(b *proxy.Request) { b.Routed[0].URI.Params.SetFlag(odiParam) },
@@ -211,14 +213,14 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 		},
 		"from another key": func(b *proxy.Request) {
 			v, _ := b.Routed[0].URI.Param(odiParam)
-			pos, err := e.router(nil).openODI(v, "term-call-1", t0)
+			pos, err := e.router(nil).openODI(v, requestOf(b.Message), t0)
 			if err != nil {
 				t.Fatal(err)
 			}
 			other := e.router(nil, func(c *Config) {
 				c.DialogKeys = []DialogKey{{ID: "k2", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
 			})
-			b.Routed[0].URI.Params.Set(odiParam, other.signODI(pos, "term-call-1", t0.Add(time.Minute)))
+			b.Routed[0].URI.Params.Set(odiParam, other.signODI(pos, requestOf(b.Message), t0.Add(time.Minute)))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -238,7 +240,7 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 			}
 		})
 	}
-	if e.metrics.get("routing.odi.refused") != 6 || e.metrics.get("routing.odi.resumed") != 2 {
+	if e.metrics.get("routing.odi.refused") != 8 || e.metrics.get("routing.odi.resumed") != 2 {
 		t.Errorf("refused %d", e.metrics.get("routing.odi.refused"))
 	}
 }

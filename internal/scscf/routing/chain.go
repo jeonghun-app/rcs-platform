@@ -221,7 +221,7 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 	back := rt.cfg.RecordRoute.URI
 	back.Params = append(sip.Params(nil), back.Params...)
 	expires := rt.cfg.Now().Add(rt.cfg.ODILifetime).Truncate(time.Second)
-	odi := rt.signODI(pos, req.Header.Get("Call-ID"), expires)
+	odi := rt.signODI(pos, requestOf(req), expires)
 	back.Params.Set(odiParam, odi)
 	t := proxy.Target{URI: req.URI, Routes: []sip.Address{{URI: server}, {URI: back}}}
 	if req.Method != "INVITE" {

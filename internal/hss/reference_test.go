@@ -48,6 +48,12 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	plainInvite.headers = slices.DeleteFunc(slices.Clone(plainInvite.headers), func(h ifc.HeaderField) bool {
 		return h.Name == "Contact" || h.Name == "Accept-Contact" || h.Name == "P-Preferred-Service"
 	})
+	// A voice call offers audio, not an MSRP stream.
+	plainInvite.sdp = []string{"v=0", "m=audio 49170 RTP/AVP 0"}
+	// A chat INVITE that names its service in no feature tag still offers
+	// MSRP (#359 security review).
+	msrpOnly := plainInvite
+	msrpOnly.sdp = []string{"v=0", "m=message 9 TCP/MSRP *", "a=accept-types:message/cpim"}
 	for name, c := range map[string]struct {
 		req  ifc.Request
 		want []int
@@ -59,6 +65,7 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 		"rcsjta chat INVITE": {&imInvite, []int{10}},
 		"rcsjta OPTIONS":     {&imOptions, []int{30}},
 		"INVITE for voice":   {&plainInvite, nil},
+		"INVITE with MSRP":   {&msrpOnly, []int{10}},
 	} {
 		for _, ctx := range referenceContexts {
 			matched, err := set.Match(c.req, ctx)

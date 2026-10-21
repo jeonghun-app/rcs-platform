@@ -1,5 +1,7 @@
 package ifc
 
+import "math"
+
 // validate checks what the schema requires of a subscription built in code,
 // and that every value can be written as XML. ParseSubscription runs it too,
 // so the two directions accept the same documents.
@@ -69,8 +71,8 @@ func (r *reader) validateProfile(where string, p *ServiceProfile) {
 }
 
 func (r *reader) validateCriteria(where string, fc *FilterCriteria) {
-	if fc.Priority < 0 {
-		r.fail(where, "Priority is negative")
+	if fc.Priority < 0 || fc.Priority > math.MaxInt32 {
+		r.fail(where, "Priority is negative or beyond an int32")
 	}
 	if fc.ProfilePart < ProfilePartAny || fc.ProfilePart > ProfilePartUnregistered {
 		r.fail(where, "ProfilePart is out of range")

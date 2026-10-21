@@ -30,7 +30,8 @@ follows `Via`, a terminating request follows `Path`, an in-dialog request follow
     dialog identifier (TS 24.229 §5.4.3.2/§5.4.3.3): the served user, session
     case and next iFC priority, HMAC-signed with a key shared by all `scscf`
     instances (Secrets Manager). Any instance can resume filter evaluation; a bad
-    signature is rejected with 403. Because the signature covers the Call-ID,
+    signature is rejected with 403. Because the signature covers the request
+    (its Call-ID, method and CSeq number),
     an application server acting as a B2BUA that sends the request on in a
     dialog of its own, with a new Call-ID, is not supported: its requests come
     back with a position signed for another Call-ID and get 403, though TS
@@ -90,9 +91,11 @@ horizontal scaling without sticky load balancing.
   keeps a Cx connection to every `hss` task (every address of `hss.<namespace>`,
   resolved again periodically); otherwise a change provisioned on a task no
   `scscf` is connected to cannot be pushed.
-- The signed iFC-position parameter covers the Call-ID and an expiry (default
-  32 s, Timer B/F) as well as served user, session case and next priority, so it
-  cannot be replayed on another request or later.
+- The signed iFC-position parameter covers the request, by its Call-ID, method
+  and CSeq number, and an expiry (default 32 s, Timer B/F) as well as served
+  user, session case and next priority, so it cannot be replayed on another
+  request, another of the same dialog included, or later. (Amended in #359:
+  the Call-ID alone let one request's position serve another of its dialog.)
 - In-dialog requests from the core reach the client the same way terminating
   initial requests do: the core-facing `Record-Route` entry `pcscf` inserts
   carries the same signed flow token as `Path`.

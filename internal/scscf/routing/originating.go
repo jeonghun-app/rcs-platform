@@ -97,7 +97,7 @@ func assertedUser(req *sip.Request) (string, bool) {
 // sign for the request, or that has expired (ADR 0005).
 func (rt *Router) resume(ctx context.Context, r *proxy.Request, v string) step {
 	now := rt.cfg.Now()
-	pos, err := rt.openODI(v, r.Message.Header.Get("Call-ID"), now)
+	pos, err := rt.openODI(v, requestOf(r.Message), now)
 	if err != nil {
 		rt.count("routing.odi.refused")
 		return answer(403, "Forbidden")

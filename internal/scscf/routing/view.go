@@ -24,6 +24,82 @@ var listHeaders = map[string]bool{
 	"Route": true, "Service-Route": true, "Supported": true, "Unsupported": true, "Via": true,
 }
 
+// featureHeaders carry feature tags (RFC 3840, RFC 3841), which the caller
+// preferences compare by name and token value without case (prefs.go).
+var featureHeaders = map[string]bool{"Accept-Contact": true, "Reject-Contact": true, "Contact": true}
+
+// featuresSpelled is el, an element of a featureHeaders field, with its
+// parameters' names in lower case and their quoted token values too, the
+// hex digits of an escape in upper case (RFC 3986 §2.1): what the caller
+// preferences take for one feature tag is spelled one way for iFC, so that
+// no spelling routes a request as chat by its preferences while it misses
+// a criterion written for chat (#359 security review). A string value in
+// angle brackets, which compares with case, is kept, and an element that
+// does not parse is presented as it is.
+func featuresSpelled(el string) string {
+	if !strings.HasPrefix(strings.TrimSpace(el), "*") {
+		// A Contact: its own URI parameters stay as they are.
+		a, err := sip.ParseAddress(el)
+		if err != nil {
+			return el
+		}
+		a.Params = spelled(a.Params)
+		return a.String()
+	}
+	var h sip.Header
+	if h.Add("Accept-Contact", el) != nil {
+		return el
+	}
+	acs, err := h.AcceptContact()
+	if err != nil || len(acs) != 1 {
+		return el
+	}
+	var b strings.Builder
+	b.WriteString("*")
+	for _, p := range spelled(acs[0].Params) {
+		b.WriteString(";" + p.Name)
+		switch {
+		case p.Quoted:
+			b.WriteString(`="` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(p.Value) + `"`)
+		case p.Value != "":
+			b.WriteString("=" + p.Value)
+		}
+	}
+	return b.String()
+}
+
+// spelled is ps with the names in lower case and the quoted token values
+// as tokenSpelled writes them.
+func spelled(ps sip.Params) sip.Params {
+	out := make(sip.Params, len(ps))
+	for i, p := range ps {
+		p.Name = strings.ToLower(p.Name)
+		if p.Quoted && !strings.HasPrefix(strings.TrimSpace(p.Value), "<") {
+			p.Value = tokenSpelled(p.Value)
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// tokenSpelled is v in lower case, an escape's hex digits in upper case.
+func tokenSpelled(v string) string {
+	b := []byte(strings.ToLower(v))
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1], b[i+2] = upperHex(b[i+1]), upperHex(b[i+2])
+		}
+	}
+	return string(b)
+}
+
+func upperHex(c byte) byte {
+	if 'a' <= c && c <= 'f' {
+		return c - 'a' + 'A'
+	}
+	return c
+}
+
 // view presents a SIP request to iFC evaluation (ifc.Request): header names
 // in their full form, list headers split into their values, and the SDP
 // lines of a session description body. hide leaves a header out, as the
@@ -49,6 +125,9 @@ func (v view) HeaderFields() []ifc.HeaderField {
 			if one.Add(name, f.Value) == nil {
 				if els, err := one.Elements(name); err == nil {
 					for _, e := range els {
+						if featureHeaders[name] {
+							e = featuresSpelled(e)
+						}
 						out = append(out, ifc.HeaderField{Name: name, Value: e})
 					}
 					continue
