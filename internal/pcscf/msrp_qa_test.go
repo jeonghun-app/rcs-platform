@@ -16,6 +16,9 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
+// QA's round 3 tests are at the end: F6, F7 and the unanchored dialog's
+// declined line.
+
 // declinedAnswer is the client's answer to an offer whose MSRP line pcscf
 // declined: the line at port 0.
 var declinedAnswer = strings.Replace(clientAnswer, "m=message 9 ", "m=message 0 ", 1)
@@ -520,5 +523,107 @@ func TestQAE2ETerminatingMSRPInviteFlowCloses(t *testing.T) {
 		if pc.msrp.limit.held() != 0 || len(pc.msrp.all()) != 0 || relay.count(http.MethodDelete) != 1 {
 			t.Errorf("held %d sessions %d calls %q", pc.msrp.limit.held(), len(pc.msrp.all()), relay.log())
 		}
+	}
+}
+
+// R3-5 (F6): a PRACK without a description that acknowledges another
+// reliable 1xx than the one with the offer (an earlier 180, RSeq 1; or the
+// right RSeq with another CSeq) gives nothing up: the offer's own PRACK then
+// carries the answer and is anchored.
+func TestQAR3PRACKOfAnotherReliableResponseGivesNothingUp(t *testing.T) {
+	for _, rack := range []string{"1 1 INVITE", "2 9 INVITE"} {
+		a := newAnchoring(t, 16, 100)
+		c := a.invite(t, "chat-1", "", "", "Supported: 100rel")
+		e := answered(t, c.req, 183, "b1", rcsAsOffer)
+		_ = e.Header.Set("Require", "100rel")
+		_ = e.Header.Set("RSeq", "2")
+		e = c.respond(e)
+		mediaOf(t, e.Body, "a=path:"+clientPathFor(1))
+		other := inCall(t, c, "PRACK", "b1", 2, "")
+		_ = other.Message.Header.Set("RAck", rack)
+		a.p.Route(context.Background(), other)
+		pr := inCall(t, c, "PRACK", "b1", 3, clientAnswer)
+		_ = pr.Message.Header.Set("RAck", "2 1 INVITE")
+		d := a.p.Route(context.Background(), pr)
+		if len(d.Targets) != 1 {
+			t.Errorf("RAck %q: the offer's PRACK refused: %d", rack, d.Status)
+			continue
+		}
+		fwd := pr.Message.Clone()
+		_ = d.Prepare(context.Background(), d.Targets[0], fwd)
+		mediaOf(t, fwd.Body, "a=path:"+corePathFor(1))
+		a.settle()
+		if a.p.msrp.limit.held() != 1 || a.relay.count(http.MethodDelete) != 0 {
+			t.Errorf("RAck %q: held %d calls %q", rack, a.p.msrp.limit.held(), a.relay.log())
+		}
+	}
+}
+
+// R3-6 (F7): run applies PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW: with 1,
+// rcs-as's second chat toward alice is 503 while her own chat is still
+// anchored.
+func TestQAR3RunAppliesTheCoreOfferShare(t *testing.T) {
+	relay := &scriptedRelay{bodies: map[int]map[string]any{}}
+	srv := httptest.NewServer(relay)
+	t.Cleanup(srv.Close)
+	icscf := startCoreNode(t, echo200)
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
+	cfg.RelayURL, _ = url.Parse(srv.URL)
+	cfg.RelayToken = relayToken{testRelayToken}
+	cfg.RelayTimeout = 5 * time.Second
+	cfg.MaxCoreOfferBindingsPerFlow = 1
+	var pc *pcscf
+	s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1"), started: func(p *pcscf) { pc = p }})
+	_, path := registered(t, s, icscf)
+	core := dial(t, s.core, nil)
+	codes := []int{}
+	for i := 0; i < 2; i++ {
+		inv := coreRequest("INVITE", "sip:alice@192.0.2.10:40000;transport=tcp", fmt.Sprintf("qa-share-%d", requests.Add(1)), "", 1, "Route: <"+path+">")
+		inv = strings.Replace(inv, "Content-Length: 0\r\n\r\n", fmt.Sprintf("Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", len(rcsAsOffer), rcsAsOffer), 1)
+		core.write(inv)
+	}
+	deadline := time.Now().Add(waitFor)
+	for time.Now().Before(deadline) {
+		pc.msrp.wait()
+		if relay.count(http.MethodPost) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = core.nc.SetDeadline(time.Now().Add(10 * time.Second))
+	for len(codes) < 1 {
+		m, err := core.r.ReadMessage()
+		if err != nil {
+			break
+		}
+		if res, ok := m.(*sip.Response); ok && res.StatusCode >= 200 {
+			codes = append(codes, res.StatusCode)
+		}
+	}
+	if len(codes) != 1 || codes[0] != 503 || relay.count(http.MethodPost) != 1 {
+		t.Errorf("finals %v, POSTs %d", codes, relay.count(http.MethodPost))
+	}
+}
+
+// R3-4: in a dialog pcscf does not anchor, a client's UPDATE whose MSRP
+// line is declined (port 0) carries no a=path to the core (QA round 3's
+// probe, made an assertion with the fix).
+func TestQAR3UnanchoredDialogDeclinedLineKeepsNoPath(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	audio := strings.Split(clientChatOffer, "m=message")[0]
+	c := a.invite(t, "call-1", "application/sdp", audio)
+	c.respond(answered(t, c.req, 200, "b1", strings.Split(rcsAsAnswer, "m=message")[0]))
+	r := inCall(t, c, "UPDATE", "b1", 2, strings.Replace(clientChatOffer, "m=message 9 ", "m=message 0 ", 1))
+	d := a.p.Route(context.Background(), r)
+	if len(d.Targets) != 1 {
+		t.Fatalf("status %d", d.Status)
+	}
+	fwd := r.Message.Clone()
+	if d.Prepare != nil {
+		_ = d.Prepare(context.Background(), d.Targets[0], fwd)
+	}
+	if strings.Contains(string(fwd.Body), "s7d2k8f") || !strings.Contains(string(fwd.Body), "m=message 0 ") {
+		t.Errorf("client path reaches the core in an unanchored dialog:\n%s", fwd.Body)
 	}
 }

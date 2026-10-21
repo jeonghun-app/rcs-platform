@@ -526,8 +526,14 @@ func (p *pcscf) anchorInDialog(r *proxy.Request, d proxy.Decision, from side, fl
 	s := p.sessionOf(flow, req, from)
 	if s == nil {
 		if found {
-			if _, lines, err := msrpLines(part.description(), true); err != nil || len(lines) > 0 {
+			desc, lines, err := msrpLines(part.description(), true)
+			if err != nil || len(lines) > 0 {
 				return p.refuseOffer()
+			}
+			if from == clientSide && hasMSRP(desc) {
+				// Declined MSRP lines alone: rcs-as learns no path of the
+				// client's from them (#315 QA round 3).
+				d = withDescription(d, part, declineMSRP(part.description()))
 			}
 		}
 		if req.Method == "INVITE" && !found {

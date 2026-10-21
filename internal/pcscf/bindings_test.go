@@ -129,6 +129,19 @@ func TestCoreOffersHaveAShareOfTheirOwn(t *testing.T) {
 	if _, err := l.take(share{flow: "FLOW-C", coreOffer: true}, 1); err != nil || l.held() != 5 {
 		t.Fatalf("the task's last binding: %v, %d held", err, l.held())
 	}
+	// The sweep judges each share's count by that share's own rate: the
+	// core offers', at 3 a minute, is full again 30 s after one creation
+	// (#315 QA round 3).
+	sweepy := newBindingLimit(16, 100, 100, clock.now).coreOfferShare(16, 3)
+	if _, err := sweepy.take(share{flow: "FLOW-D", coreOffer: true}, 1); err != nil {
+		t.Fatal(err)
+	}
+	sweepy.give(share{flow: "FLOW-D", coreOffer: true}, 1)
+	clock.t = clock.t.Add(30 * time.Second)
+	sweepy.sweep()
+	if len(sweepy.created) != 0 {
+		t.Errorf("a full core offers' count kept: %v", sweepy.created)
+	}
 	// forget drops both shares' counts.
 	l.forget("FLOW-A")
 	if _, ok := l.created[in]; ok {
