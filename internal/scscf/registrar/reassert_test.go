@@ -273,6 +273,14 @@ func TestAReassertOvertakenByADeregistrationIsUndone(t *testing.T) {
 			must(e.store.SaveRegistration(bg, r))(t)
 			must(e.hss.SAR(bg, &cx.SAR{UserName: impi1, PublicIdentities: []string{impu1}, AssignmentType: cx.UserDeregistration}))(t)
 		},
+		// An unregistered user's under way: live by the user's state, but
+		// under a lease (#410 code review).
+		"an unregistered user's under way": func(t *testing.T, e *env, _ *ue) {
+			r := must(e.store.Registration(bg, set1))(t)
+			r.Contacts, r.Deregistering, r.Unregistered = nil, e.clock.Now().Add(state.SweepLease), e.clock.Now().Add(time.Hour)
+			must(e.store.SaveRegistration(bg, r))(t)
+			must(e.hss.SAR(bg, &cx.SAR{UserName: impi1, PublicIdentities: []string{impu1}, AssignmentType: cx.UserDeregistration}))(t)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
@@ -283,7 +291,7 @@ func TestAReassertOvertakenByADeregistrationIsUndone(t *testing.T) {
 			if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err != nil {
 				t.Fatal(err)
 			}
-			if name == "one under way" {
+			if strings.HasSuffix(name, "under way") {
 				// The deregistration under way finishes after.
 				must(0, e.store.DeleteRegistration(bg, must(e.store.Registration(bg, set1))(t)))(t)
 			}
@@ -369,33 +377,273 @@ func TestAnUnregisteredUsersRecordIsReassignedAsUnregistered(t *testing.T) {
 	}
 }
 
-// failingSARs fails every SAR of a kind that passes it, as an HSS out of
-// reach does.
+// failingSARs fails the SARs of a kind that pass it, as an HSS out of
+// reach does: the first times of them, every one when times is 0.
 type failingSARs struct {
 	HSS
-	kind cx.ServerAssignmentType
+	kind  cx.ServerAssignmentType
+	times int
+	mu    sync.Mutex
+	n     int
 }
 
 func (f *failingSARs) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
 	if r.AssignmentType == f.kind {
-		return nil, errUnreachable
+		f.mu.Lock()
+		fail := f.times == 0 || f.n < f.times
+		if fail {
+			f.n++
+		}
+		f.mu.Unlock()
+		if fail {
+			return nil, errUnreachable
+		}
 	}
 	return f.HSS.SAR(ctx, r)
 }
 
-// TestAnUndoTheHSSDoesNotTakeIsCounted (#241): with no record left, no sweep
-// tries it again, so the failure is counted and returned.
+func (f *failingSARs) failed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n
+}
+
+// TestAnUndoTheHSSDoesNotTakeIsCounted (#241, #410 code review): the undo
+// is tried undoAttempts times, then counted and logged, not returned, as no
+// record is left for anyone to try again from; its tombstone goes.
 func TestAnUndoTheHSSDoesNotTakeIsCounted(t *testing.T) {
 	e := newEnv(t)
 	u := reassertDue(t, e, e.instance(1))
-	b := &beforeSAR{HSS: &failingSARs{HSS: e.hss, kind: cx.UserDeregistration}, match: isReassertion}
+	f := &failingSARs{HSS: e.hss, kind: cx.UserDeregistration}
+	b := &beforeSAR{HSS: f, match: isReassertion}
 	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
 	m := &counts{}
-	if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err == nil {
-		t.Error("the sweep reported no failure")
+	k := len(e.hss.sarsOf())
+	if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err != nil {
+		t.Error(err)
 	}
-	if m.get("registrar.reassert_undo_failed") != 1 || m.get("registrar.reassert_undone") != 0 {
-		t.Errorf("undo_failed %d, undone %d", m.get("registrar.reassert_undo_failed"), m.get("registrar.reassert_undone"))
+	if m.get("registrar.reassert_undo_failed") != 1 || m.get("registrar.reassert_undone") != 0 || f.failed() != undoAttempts {
+		t.Errorf("undo_failed %d, undone %d, %d undo SARs", m.get("registrar.reassert_undo_failed"), m.get("registrar.reassert_undone"), f.failed())
+	}
+	_ = k
+	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("a record is left: %v", err)
+	}
+}
+
+// TestAnUndoTriesAFailureThatMayPassAgain (#410 code review): one SAR the
+// HSS does not take is sent again, and the set ends there.
+func TestAnUndoTriesAFailureThatMayPassAgain(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	f := &failingSARs{HSS: e.hss, kind: cx.UserDeregistration, times: 1}
+	b := &beforeSAR{HSS: f, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	m := &counts{}
+	if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	wantDeregisteredLast(t, e)
+	if m.get("registrar.reassert_undone") != 1 || m.get("registrar.reassert_undo_failed") != 0 {
+		t.Errorf("undone %d, undo_failed %d", m.get("registrar.reassert_undone"), m.get("registrar.reassert_undo_failed"))
+	}
+}
+
+// TestAnUndoTheHSSRefusesForGoodIsNotSentAgain (#410 code review): a user
+// the HSS no longer has holds nothing to undo.
+func TestAnUndoTheHSSRefusesForGoodIsNotSentAgain(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: &refusingDeregistrations{HSS: e.hss}, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	m := &counts{}
+	k := len(e.hss.sarsOf())
+	if _, err := e.instance(3, func(c *Config) { c.HSS, c.Metrics = b, m }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	if m.get("registrar.reassert_undo_refused") != 1 || m.get("registrar.reassert_undo_failed") != 0 {
+		t.Errorf("undo_refused %d, undo_failed %d", m.get("registrar.reassert_undo_refused"), m.get("registrar.reassert_undo_failed"))
+	}
+	undos := 0
+	for _, sar := range e.hss.sarsOf()[k:] {
+		if sar == cx.UserDeregistration {
+			undos++
+		}
+	}
+	// The user's own deregistration, and one refused undo.
+	if r := refusals(b); undos != 1 || r != 1 {
+		t.Errorf("%d USER_DEREGISTRATIONs reached the HSS, %d refused", undos, r)
+	}
+}
+
+// refusingDeregistrations answers every USER_DEREGISTRATION that passes it
+// DIAMETER_ERROR_USER_UNKNOWN, without the HSS seeing it.
+type refusingDeregistrations struct {
+	HSS
+	mu      sync.Mutex
+	refused int
+}
+
+func (r *refusingDeregistrations) SAR(ctx context.Context, s *cx.SAR) (*cx.SAA, error) {
+	if s.AssignmentType == cx.UserDeregistration {
+		r.mu.Lock()
+		r.refused++
+		r.mu.Unlock()
+		return &cx.SAA{Answer: cx.Answer{Result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
+	}
+	return r.HSS.SAR(ctx, s)
+}
+
+func refusals(b *beforeSAR) int {
+	r := b.HSS.(*refusingDeregistrations)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.refused
+}
+
+// TestAFailedUndoOfAReassignLeavesNothingToTheSweep (#410 code review): the
+// deregistration whose endSet gave the set back finished; an undo the HSS
+// did not take is no deregistration left to the sweep.
+func TestAFailedUndoOfAReassignLeavesNothingToTheSweep(t *testing.T) {
+	e := newEnv(t)
+	a := e.akaUser(impi1, impu1, tel1)
+	a.instance = "<urn:uuid:00000000-0000-0000-0000-0000000000aa>"
+	wantStatus(t, a.registerWith(e.instance(1), 600), 200)
+	b := device(a, 2)
+	overtaken := &crossingHSS{HSS: e.hss, kind: cx.UserDeregistration}
+	overtaken.hook = func() { wantStatus(t, b.registerWith(e.instance(2), 600), 200) }
+	reassigned := &beforeSAR{HSS: overtaken, match: isReassertion}
+	reassigned.hook = func() { wantStatus(t, b.registerWith(e.instance(4), 0), 200) }
+	// Past the hooks, every USER_DEREGISTRATION of instance 3 fails: A's
+	// own went first, through the crossing.
+	m := &counts{}
+	failing := &failingAfterFirst{HSS: reassigned, kind: cx.UserDeregistration}
+	g := e.instance(3, func(c *Config) { c.HSS, c.Metrics = failing, m })
+	auth := a.answer(g.Register(bg, a.request(0, ""), upstream), 0)
+	wantStatus(t, g.Register(bg, a.request(0, auth), upstream), 200)
+	if m.get("registrar.reassert_undo_failed") != 1 || m.get("registrar.deregistration_left_to_sweep") != 0 {
+		t.Errorf("undo_failed %d, deregistration_left_to_sweep %d", m.get("registrar.reassert_undo_failed"), m.get("registrar.deregistration_left_to_sweep"))
+	}
+}
+
+// failingAfterFirst forwards the first SAR of kind and fails the others.
+type failingAfterFirst struct {
+	HSS
+	kind cx.ServerAssignmentType
+	mu   sync.Mutex
+	seen int
+}
+
+func (f *failingAfterFirst) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
+	if r.AssignmentType == f.kind {
+		f.mu.Lock()
+		f.seen++
+		n := f.seen
+		f.mu.Unlock()
+		if n > 1 {
+			return nil, errUnreachable
+		}
+	}
+	return f.HSS.SAR(ctx, r)
+}
+
+// holdingHSS forwards a REGISTER's own SAR REGISTRATION at once, but holds
+// its answer until release is closed, as an SAA late on the wire.
+type holdingHSS struct {
+	HSS
+	once      sync.Once
+	forwarded chan struct{}
+	release   chan struct{}
+}
+
+func (h *holdingHSS) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
+	saa, err := h.HSS.SAR(ctx, r)
+	if r.AssignmentType == cx.Registration && r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable {
+		h.once.Do(func() { close(h.forwarded) })
+		<-h.release
+	}
+	return saa, err
+}
+
+// TestAnUndoCrossingARegistersLateAnswerMarksTheSet (#410 code review): a
+// REGISTER whose SAR reaches the HSS before the undo's, but whose record is
+// saved after the undo, takes the set over from the undo's tombstone; the
+// record is marked for the sweep to tell the HSS again.
+func TestAnUndoCrossingARegistersLateAnswerMarksTheSet(t *testing.T) {
+	e := newEnv(t)
+	u := reassertDue(t, e, e.instance(1))
+	b := &beforeSAR{HSS: e.hss, match: isReassertion}
+	b.hook = func() { wantStatus(t, u.registerWith(e.instance(2), 0), 200) }
+	h := &holdingHSS{HSS: e.hss, forwarded: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan struct{})
+	undo := &beforeSAR{HSS: b, match: func(r *cx.SAR) bool { return r.AssignmentType == cx.UserDeregistration }}
+	undo.hook = func() {
+		go func() {
+			defer close(done)
+			wantStatus(t, u.registerWith(e.instance(4, func(c *Config) { c.HSS = h }), 600), 200)
+		}()
+		recvWithin(t, h.forwarded)
+	}
+	// The REGISTER's record is saved once its answer comes, after the
+	// undo: released when the undo has been sent.
+	after := &afterSAR{HSS: undo, match: func(r *cx.SAR) bool { return r.AssignmentType == cx.UserDeregistration }, then: func() { close(h.release); <-done }}
+	if _, err := e.instance(3, func(c *Config) { c.HSS = after }).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	sars := e.hss.sarsOf()
+	r := must(e.store.Registration(bg, set1))(t)
+	// Either the REGISTER, reading the tombstone, told the HSS again after
+	// the undo, or its record is marked for the sweep to.
+	if len(r.Contacts) != 1 || sars[len(sars)-1] == cx.UserDeregistration && r.Reassert.IsZero() {
+		t.Errorf("SARs %v; record %d contacts, Reassert %v: registered here, the HSS last told USER_DEREGISTRATION, and nothing marked", sars, len(r.Contacts), r.Reassert)
+	}
+}
+
+// afterSAR runs then once after it forwards the first SAR that match takes.
+type afterSAR struct {
+	HSS
+	match func(*cx.SAR) bool
+	once  sync.Once
+	then  func()
+}
+
+func (a *afterSAR) SAR(ctx context.Context, r *cx.SAR) (*cx.SAA, error) {
+	saa, err := a.HSS.SAR(ctx, r)
+	if a.match(r) {
+		a.once.Do(a.then)
+	}
+	return saa, err
+}
+
+func recvWithin(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("nothing came")
+	}
+}
+
+// TestASweepReassertsAnUnregisteredUsersRecord (#410 code review): a
+// Reassert on an unregistered user's record, which a reassign the HSS did
+// not take leaves, comes before its state ends; the sweep tells the HSS
+// UNREGISTERED_USER and keeps the record.
+func TestASweepReassertsAnUnregisteredUsersRecord(t *testing.T) {
+	e := newEnv(t)
+	reassertDue(t, e, e.instance(1))
+	r := must(e.store.Registration(bg, set1))(t)
+	r.Contacts, r.Unregistered = nil, e.clock.Now().Add(2*time.Hour)
+	must(e.store.SaveRegistration(bg, r))(t)
+	k := len(e.hss.sarsOf())
+	if _, err := e.instance(3).Sweep(bg, 10); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.hss.sarsOf()[k:]; len(got) != 1 || got[0] != cx.UnregisteredUser {
+		t.Errorf("SARs %v, want [UNREGISTERED_USER]", got)
+	}
+	left := must(e.store.Registration(bg, set1))(t)
+	if !left.Unregistered.Equal(r.Unregistered) || !left.Reassert.IsZero() || !left.Deregistering.IsZero() {
+		t.Errorf("after the sweep: %+v", left)
 	}
 }
 

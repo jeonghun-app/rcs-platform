@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"log/slog"
+	mathrand "math/rand/v2"
 	"slices"
 	"time"
 
@@ -652,42 +654,111 @@ func assignmentOf(reg *state.Registration) cx.ServerAssignmentType {
 // this S-CSCF serves the set (reassign, reassert). A deregistration that
 // ended the set meanwhile, a user's or an RTR's, may have reached the HSS
 // first: the HSS then holds an assignment that no record here backs and
-// that no sweep would end (#241). So if the set is gone or no longer live,
-// the HSS is told again (SAR USER_DEREGISTRATION). A REGISTER that makes
-// the set live after that read sent its own SAR, which may in turn have
-// reached the HSS before this one: the record is marked for a sweep to
-// tell the HSS again (markReassert), as a crossed deregistration's is.
+// that no sweep would end (#241). So if the set is gone, or no longer live,
+// the HSS is told again (SAR USER_DEREGISTRATION, undo).
+//
+// A gone set's key is held while that SAR is on its way, by a record
+// created for a deregistration's lease (a tombstone), deleted under its
+// version after. A REGISTER that registers the set meanwhile takes the
+// record over from the lease, whatever it read first, so the delete
+// conflicts; its SAR may have reached the HSS before the undo's, and its
+// record is marked for a sweep to tell the HSS again (markReassert), as a
+// crossed deregistration's is (#410 code review). A set still under a
+// deregistration's lease is left to that deregistration, whose endSet
+// gives the set back to the HSS if a REGISTER takes it over.
+//
+// An undo the HSS does not take is logged and counted, not returned: no
+// record is left for anyone to try again from, and the HSS keeps the set
+// until the user registers again, as before #241.
 func (g *Registrar) undoIfEnded(ctx context.Context, key state.SetKey) error {
+	now := g.cfg.Now()
 	again, f := g.set(ctx, key)
 	switch {
 	case f != nil:
 		return f
-	case again != nil && live(again, g.cfg.Now()):
+	case again != nil && live(again, now) && again.Deregistering.IsZero():
 		return nil
 	}
-	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: key.IMPI, PublicIdentities: []string{key.IMPU}, AssignmentType: cx.UserDeregistration})
-	var res cx.Result
-	if saa != nil {
-		res = saa.Result
+	var tomb *state.Registration
+	if again == nil {
+		inc, err := g.incarnation()
+		if err != nil {
+			return err
+		}
+		tomb, err = g.cfg.Store.SaveRegistration(ctx, &state.Registration{
+			Key: key, Incarnation: inc, Identities: []state.SetIdentity{{IMPU: key.IMPU}}, Deregistering: now.Add(state.SweepLease),
+		})
+		switch {
+		case errors.Is(err, state.ErrExists), errors.Is(err, state.ErrConflict):
+			// A REGISTER created the set since it was read: the HSS's
+			// last word is that SAR or this one's, both a registration.
+			return nil
+		case err != nil:
+			return err
+		}
 	}
-	o := cxclient.Classify(res)
-	if err != nil {
-		o = cxclient.ErrorOutcome(err)
+	g.undo(ctx, key)
+	if tomb == nil {
+		return nil
 	}
-	if o != cxclient.Success && !permanent(o) {
-		// No record is left for a sweep to try again from: the HSS holds
-		// the set until the user registers again, as before #241.
-		g.count("registrar.reassert_undo_failed")
-		return errors.New("registrar: SAR USER_DEREGISTRATION undoing a reassertion failed: " + o.String())
+	err := g.cfg.Store.DeleteRegistration(ctx, tomb)
+	switch {
+	case err == nil, errors.Is(err, state.ErrNotFound):
+		return nil
+	case errors.Is(err, state.ErrConflict):
+		again, f := g.set(ctx, key)
+		switch {
+		case f != nil:
+			return f
+		case again != nil:
+			return g.markReassert(ctx, again)
+		}
+		return nil
 	}
-	g.count("registrar.reassert_undone")
-	if again, f = g.set(ctx, key); f != nil {
-		return f
+	// The tombstone stands: the sweep after its lease ends the set with
+	// the HSS, as it does any deregistration left as a lease.
+	return err
+}
+
+// undoAttempts bounds how often an undo's SAR is sent: the HSS that took
+// the reassertion a moment ago is likely to take this too.
+const undoAttempts = 3
+
+// undo tells the HSS that key's set has ended (SAR USER_DEREGISTRATION),
+// trying a failure that may pass again after a short, jittered wait, as an
+// RTR's claim is. A refusal for good, as for a user the HSS no longer has,
+// is no failure: there is nothing to undo.
+func (g *Registrar) undo(ctx context.Context, key state.SetKey) {
+	var o cxclient.Outcome
+	for attempt := range undoAttempts {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(10<<attempt+mathrand.IntN(10)) * time.Millisecond):
+			case <-ctx.Done():
+				g.count("registrar.reassert_undo_failed")
+				return
+			}
+		}
+		saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: key.IMPI, PublicIdentities: []string{key.IMPU}, AssignmentType: cx.UserDeregistration})
+		var res cx.Result
+		if saa != nil {
+			res = saa.Result
+		}
+		o = cxclient.Classify(res)
+		if err != nil {
+			o = cxclient.ErrorOutcome(err)
+		}
+		switch {
+		case o == cxclient.Success:
+			g.count("registrar.reassert_undone")
+			return
+		case permanent(o):
+			g.count("registrar.reassert_undo_refused")
+			return
+		}
 	}
-	if again != nil && live(again, g.cfg.Now()) {
-		return g.markReassert(ctx, again)
-	}
-	return nil
+	g.count("registrar.reassert_undo_failed")
+	g.log.Warn("registrar: the HSS did not take the undo of a reassertion", slog.String("outcome", o.String()))
 }
 
 // markReassert sets reg's Reassert, under the version read, unless the
