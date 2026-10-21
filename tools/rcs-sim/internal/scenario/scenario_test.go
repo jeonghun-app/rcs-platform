@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,8 +47,8 @@ func stack(t *testing.T) scenario.Config {
 func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 	t.Helper()
 	f := simtest.StartFT(t, part)
-	corePort := simtest.StandInPort(t)
-	r := simtest.StartRelay(t, corePort)
+	core := simtest.ListenStandIn(t)
+	r := simtest.StartRelay(t, core.Port())
 	// IdleWait is six keep-alive intervals, so a slow scheduler still sees
 	// one go out.
 	return scenario.Config{
@@ -58,7 +57,7 @@ func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 		FileSize:     100 << 10,
 		ResumeSize:   5*part + 123,
 		Control:      &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)},
-		CoreListen:   "127.0.0.1:" + strconv.Itoa(corePort),
+		CoreListener: core.Lend,
 		MSRP:         msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
 		IdleWait:     600 * time.Millisecond,
 		Self:         self, Peer: peer,
@@ -492,10 +491,10 @@ func TestASlowStepBeforeTheKeepAliveStepIsNotHeldToItsBound(t *testing.T) {
 func tlsStack(t *testing.T) scenario.Config {
 	t.Helper()
 	cfg := stack(t)
-	corePort := simtest.FreePort(t)
-	r := simtest.StartRelayBehindTLS(t, corePort)
+	core := simtest.ListenStandIn(t)
+	r := simtest.StartRelayBehindTLS(t, core.Port())
 	cfg.Control = &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)}
-	cfg.CoreListen = "127.0.0.1:" + strconv.Itoa(corePort)
+	cfg.CoreListener = core.Lend
 	cfg.TLS = &tls.Config{RootCAs: r.TLSRoots, MinVersion: tls.VersionTLS12}
 	return cfg
 }
@@ -545,7 +544,7 @@ func TestAWrongRelayTokenFailsTheChatAtAllocation(t *testing.T) {
 
 func TestAStandInThatCannotListenFailsTheChat(t *testing.T) {
 	cfg := stack(t)
-	cfg.CoreListen = "256.0.0.1:1"
+	cfg.CoreListener, cfg.CoreListen = nil, "256.0.0.1:1"
 	ok, results := runAll(t, cfg, "chat-core-originated")
 	if ok || results[0].Step != "listen-core" || results[0].OK {
 		t.Fatalf("results %+v", results)

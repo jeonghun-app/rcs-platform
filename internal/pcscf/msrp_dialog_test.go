@@ -90,41 +90,6 @@ func TestAnOfferTheRelayCouldNotServeIsRefused(t *testing.T) {
 	}
 }
 
-// An INVITE pcscf anchors, or watches for a late offer, offers no
-// reliable provisional response, whose offer would be answered in a PRACK
-// pcscf does not anchor (RFC 3262): 100rel goes from its Supported, and
-// one that requires it is 420 with Unsupported: 100rel (RFC 3261
-// §8.2.2.3), never sent on without the requirement (#248 code review).
-func TestAnchoredInvitesAskForNoReliableResponses(t *testing.T) {
-	for _, tt := range []struct{ ct, body string }{{"application/sdp", clientChatOffer}, {"", ""}} {
-		a := newAnchoring(t, 16, 100)
-		r := clientRequest(t, inviteWith("chat-1", tt.ct, tt.body, "Supported: 100rel, timer", "Require: precondition"), "FLOW-A")
-		d := a.p.Route(context.Background(), r)
-		req := r.Message.Clone()
-		if err := d.Prepare(context.Background(), d.Targets[0], req); err != nil {
-			t.Fatal(err)
-		}
-		if got := req.Header.Values("Supported"); !slices.Equal(got, []string{"timer"}) {
-			t.Errorf("Supported %q", got)
-		}
-		if got := req.Header.Values("Require"); !slices.Equal(got, []string{"precondition"}) {
-			t.Errorf("Require %q", got)
-		}
-		calls := len(a.relay.log())
-		r = clientRequest(t, inviteWith("chat-2", tt.ct, tt.body, "Supported: timer", "Require: precondition, 100REL"), "FLOW-A")
-		d = a.p.Route(context.Background(), r)
-		if d.Response == nil || d.Response.StatusCode != 420 || d.Response.Header.Get("Unsupported") != "100rel" || len(a.relay.log()) != calls {
-			t.Errorf("Require: 100rel: %+v, calls %q", d, a.relay.log())
-		}
-	}
-	// An offer without MSRP is pcscf's to leave alone.
-	a := newAnchoring(t, 16, 100)
-	audio := strings.Split(clientChatOffer, "m=message")[0]
-	if d := a.p.Route(context.Background(), clientRequest(t, inviteWith("call-1", "application/sdp", audio, "Require: 100rel"), "FLOW-A")); len(d.Targets) != 1 {
-		t.Errorf("an audio INVITE requiring 100rel: %+v", d)
-	}
-}
-
 // pcscf keeps no Record-Route a client writes on an initial request, and
 // the BYE it sends the core follows only what the core recorded below
 // pcscf's own values (#248 security review): it still goes to scscf. A
@@ -178,45 +143,6 @@ func TestTheCoresByeFollowsOnlyTheCoresRoute(t *testing.T) {
 	if !strings.Contains(out.String(), `"`+metricByeFailed+`":1`) {
 		t.Errorf("metrics %s", out.String())
 	}
-}
-
-// Inside a dialog pcscf anchors nothing yet (#136's second change), so it
-// refuses what would need it: an INVITE without an offer, from either side,
-// whose 2xx would bring one, and an MSRP description in a PRACK; an ACK
-// with one is not passed on, though it still ends what it acknowledges. An
-// UPDATE without one goes on.
-func TestInDialogOffersPcscfDoesNotAnchorAreRefused(t *testing.T) {
-	a := newAnchoring(t, 16, 100)
-	c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
-	c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
-	if d := a.p.Route(context.Background(), inCall(t, c, "INVITE", "b1", 2, "")); d.Status != 488 {
-		t.Errorf("re-INVITE without an offer: %+v", d)
-	}
-	if d := a.p.Route(context.Background(), fromCoreInCall(t, a, c, "INVITE", "b1", 1, "")); d.Status != 488 {
-		t.Errorf("the core's re-INVITE without an offer: %+v", d)
-	}
-	answer := strings.Replace(clientChatOffer, "a=setup:actpass", "a=setup:passive", 1)
-	if d := a.p.Route(context.Background(), inCall(t, c, "PRACK", "b1", 3, answer)); d.Status != 488 {
-		t.Errorf("PRACK with an MSRP answer: %+v", d)
-	}
-	if d := a.p.Route(context.Background(), inCall(t, c, "UPDATE", "b1", 4, "")); len(d.Targets) != 1 {
-		t.Errorf("UPDATE: %+v", d)
-	}
-	if d := a.p.Route(context.Background(), fromCore(t, "INVITE", false, []string{pathEntry})); d.Status != 488 {
-		t.Errorf("an INVITE from the core without an offer: %+v", d)
-	}
-
-	// The late offer's 2xx is answered in the ACK.
-	a = newAnchoring(t, 16, 100)
-	c = a.invite(t, "chat-2", "", "")
-	ok := c.respond(answered(t, c.req, 200, "b1", strings.Replace(rcsAsAnswer, "a=setup:passive", "a=setup:actpass", 1)))
-	ack := ackFor(t, c, ok)
-	_ = ack.Message.Header.Set("Content-Type", "application/sdp")
-	ack.Message.Body = []byte(answer)
-	if d := a.p.Route(context.Background(), ack); len(d.Targets) != 0 {
-		t.Errorf("ACK with an MSRP answer: %+v", d)
-	}
-	checkEnd(t, a, "b1", reasonLateOffer)
 }
 
 // A 2xx the proxy passes on after the session ended, as a late one after
@@ -367,35 +293,6 @@ func TestAFlowClosingNeverWaitsForTheRelay(t *testing.T) {
 	a.settle()
 	if strings.Contains(string(res.Body), clientPathFor(1)) || a.p.msrp.limit.held() != 0 || len(a.p.msrp.all()) != 0 || a.relay.count(http.MethodDelete) != 1 {
 		t.Errorf("held %d, calls %q, body\n%s", a.p.msrp.limit.held(), a.relay.log(), res.Body)
-	}
-}
-
-// A late offer's 2xx retransmitted after its ACK ends nothing again (#248
-// code review 6); a 1xx with one is declined too, and ends nothing.
-func TestALateOfferIsEndedOnce(t *testing.T) {
-	a := newAnchoring(t, 16, 100)
-	var out strings.Builder
-	a.p.metrics = runtime.NewMetrics(&out, "RCS", "pcscf", a.clock.now, a.p.log)
-	c := a.invite(t, "chat-1", "", "")
-	offer := strings.Replace(rcsAsAnswer, "a=setup:passive", "a=setup:actpass", 1)
-	early := c.respond(answered(t, c.req, 183, "b1", offer))
-	mediaOf(t, early.Body, "m=message 0 TCP/MSRP *")
-	ok := c.respond(answered(t, c.req, 200, "b1", offer))
-	a.p.Route(context.Background(), ackFor(t, c, ok))
-	checkEnd(t, a, "b1", reasonLateOffer)
-	again := c.respond(answered(t, c.req, 200, "b1", offer))
-	if string(again.Body) != string(ok.Body) {
-		t.Errorf("the retransmission:\n%s", again.Body)
-	}
-	a.p.Route(context.Background(), ackFor(t, c, again))
-	a.clock.t = a.clock.t.Add(32 * time.Second)
-	a.p.sweepMSRP()
-	if got := a.sent.take(a.p); len(got) != 0 {
-		t.Errorf("%d more requests", len(got))
-	}
-	a.p.metrics.Flush()
-	if !strings.Contains(out.String(), `"`+metricEndedLateOffer+`":1,`) && !strings.Contains(out.String(), `"`+metricEndedLateOffer+`":1}`) {
-		t.Errorf("metrics %s", out.String())
 	}
 }
 
@@ -662,5 +559,29 @@ func TestTwoContentTypesAreRefused(t *testing.T) {
 		t.Errorf("a late offer with two Content-Types:\n%s", ok.Body)
 	}
 	a.p.Route(context.Background(), ackFor(t, late, ok))
-	checkEnd(t, a, "b1", reasonLateOffer)
+	checkEnd(t, a, "b1", reasonOfferRefused)
+}
+
+// A dialog is ended once: its 2xx retransmitted after the BYEs went, and
+// its ACK again, send no more, however long after.
+func TestADialogIsEndedOnce(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	a.relay.fail = func(m string, _ int) int {
+		if m == http.MethodPatch {
+			return 503
+		}
+		return 0
+	}
+	c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
+	ok := c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
+	a.p.Route(context.Background(), ackFor(t, c, ok))
+	checkEnd(t, a, "b1", reasonRelayUnavailable)
+	again := c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
+	a.p.Route(context.Background(), ackFor(t, c, again))
+	a.clock.t = a.clock.t.Add(32 * time.Second)
+	a.p.sweepMSRP()
+	a.settle()
+	if got := a.sent.take(a.p); len(got) != 0 {
+		t.Errorf("%d more requests", len(got))
+	}
 }

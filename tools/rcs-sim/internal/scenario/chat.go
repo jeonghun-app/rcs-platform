@@ -131,7 +131,16 @@ func (r *run) listenCore(cs *chatSession) error {
 		if r.cfg.Control == nil {
 			return nil, errNoControl
 		}
-		core, err := chat.ListenCore(r.cfg.CoreListen, r.cfg.CoreAdvertise, r.cfg.MSRP)
+		var core *chat.Core
+		var err error
+		if r.cfg.CoreListener != nil {
+			var ln net.Listener
+			if ln, err = r.cfg.CoreListener(); err == nil {
+				core = chat.ServeCore(ln, r.cfg.CoreAdvertise, r.cfg.MSRP)
+			}
+		} else {
+			core, err = chat.ListenCore(r.cfg.CoreListen, r.cfg.CoreAdvertise, r.cfg.MSRP)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("rcs-as stand-in: %w", err)
 		}
