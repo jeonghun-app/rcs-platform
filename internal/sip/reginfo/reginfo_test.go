@@ -386,16 +386,20 @@ func TestAParamIsReadWithoutCaseAndUnquoted(t *testing.T) {
 }
 
 // docs/architecture.md §8: a parser is linear on a maximum-size adversarial
-// input. Times are compared, not bounded, so a loaded host slows both
-// alike; the two sizes are timed in turn and the best of five runs of each
-// is compared, so a burst of load costs one run, not one size. Under the
-// race detector the test is skipped: it times its own instrumentation as
-// much as the parser, and failed so on a loaded host (#223 QA); the run
-// without it is the one that catches a quadratic parser.
+// input. 64 times the input is about 64 times the work if linear and 4096
+// times if quadratic, so a bound of 512 between them needs no slack. The
+// work is measured twice:
+//   - in allocations, which load does not change, so this part never
+//     flakes (#263) and catches a quadratic step that allocates, as the
+//     pairwise URI.Equal duplicate check did (QA of #233);
+//   - in time, for a quadratic step that allocates nothing. Times are
+//     compared, not bounded, the two sizes timed in turn and the best of
+//     five runs of each taken, and only three attempts in a row over the
+//     bound fail the test: a loaded host slows one attempt, a quadratic
+//     parser every one. Under the race detector, which times its own
+//     instrumentation as much as the parser (#223 QA), only allocations
+//     are compared.
 func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
-	if raceEnabled {
-		t.Skip("timing under the race detector says little about the parser")
-	}
 	for name, build := range map[string]func(n int) string{
 		"attributes on the root": func(n int) string {
 			var b strings.Builder
@@ -459,16 +463,26 @@ func TestMaximumSizeAdversarialDocumentsParseInLinearTime(t *testing.T) {
 				return text
 			}
 			smallText, largeText := input(MaxDocumentSize/64), input(MaxDocumentSize)
-			small, large := time.Duration(1<<62), time.Duration(1<<62)
-			for range 5 {
-				small = min(small, parse(smallText))
-				large = min(large, parse(largeText))
+			smallAllocs := testing.AllocsPerRun(3, func() { _, _ = Parse([]byte(smallText)) })
+			largeAllocs := testing.AllocsPerRun(3, func() { _, _ = Parse([]byte(largeText)) })
+			if largeAllocs > 512*smallAllocs {
+				t.Fatalf("64× the input made %v allocations against %v: not linear", largeAllocs, smallAllocs)
 			}
-			// 64 times the input: about 64 times the time if linear, 4096
-			// if quadratic; the bound between needs no absolute slack.
-			if large > 512*small {
-				t.Fatalf("64× the input took %v against %v: not linear", large, small)
+			if raceEnabled {
+				return
 			}
+			var small, large time.Duration
+			for range 3 {
+				small, large = time.Duration(1<<62), time.Duration(1<<62)
+				for range 5 {
+					small = min(small, parse(smallText))
+					large = min(large, parse(largeText))
+				}
+				if large <= 512*small {
+					return
+				}
+			}
+			t.Fatalf("64× the input took %v against %v, three times over: not linear", large, small)
 		})
 	}
 }
