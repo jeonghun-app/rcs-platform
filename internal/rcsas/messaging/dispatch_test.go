@@ -574,6 +574,11 @@ func (s *pendingGate) Pending(ctx context.Context, recipient, after string, now 
 func TestAReleaseDuringAPassHasTheQueueReadAgain(t *testing.T) {
 	st := &pendingGate{Store: store.NewMemory(), read: make(chan struct{}), release: make(chan struct{})}
 	r := newRigWith(t, Config{PagerLimit: 600}, st, newFakeClock())
+	// Released on every way out, before the engine closes (cleanups run
+	// last first), so that a failed check does not leave the held pass,
+	// and Close waiting on it, until the package's timeout.
+	release := sync.OnceFunc(func() { close(st.release) })
+	t.Cleanup(release)
 	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +600,7 @@ func TestAReleaseDuringAPassHasTheQueueReadAgain(t *testing.T) {
 	waitDone(t, st.read)
 	_ = leg.Close() // the attempt fails and releases the message
 	waitDone(t, leg.Finished())
-	close(st.release)
+	release()
 	// The same pass, or the one it has run after it, asks for the session;
 	// the fake clock does not move, so no retry timer does.
 	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
