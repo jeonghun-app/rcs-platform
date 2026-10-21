@@ -603,23 +603,78 @@ func (a *anchoring) recordMetrics() *strings.Builder {
 	return out
 }
 
-// #315 code review 2: the sessions rcs-as starts toward a flow take from a
-// share of their own. With that share full, alice still starts her own
-// chat, and only the next session coming in is refused, 503.
-func TestIncomingSessionsLeaveTheClientItsOwnShare(t *testing.T) {
+// #315 code review 2 and the security review: rcs-as's offers toward a
+// flow take bindings from a share of their own, as many as rcs-as lets
+// come in for one user, and create them at a rate of their own. With 16
+// invitations unanswered, alice still sets up her own chat; the share
+// holds 32, and only the 33rd invitation is refused.
+func TestUnansweredInvitationsLeaveTheClientItsOwnShare(t *testing.T) {
 	a := newAnchoring(t, 16, 100)
+	a.p.msrp.limit.coreOfferShare(DefaultMaxCoreOfferBindingsPerFlow, DefaultCoreOfferBindingsPerMinute)
 	for i := range 16 {
 		if _, err := a.coreInviteIn(t, fmt.Sprintf("term-%d", i), rcsAsOffer); err != nil {
-			t.Fatalf("incoming session %d: %v", i, err)
+			t.Fatalf("invitation %d: %v", i, err)
 		}
 	}
 	c := a.invite(t, "chat-own", "application/sdp", clientChatOffer)
 	mediaOf(t, c.req.Body, "a=path:"+corePathFor(17))
-	if a.p.msrp.limit.held() != 17 {
-		t.Fatalf("held %d", a.p.msrp.limit.held())
+	for i := 16; i < 32; i++ {
+		if _, err := a.coreInviteIn(t, fmt.Sprintf("term-%d", i), rcsAsOffer); err != nil {
+			t.Fatalf("invitation %d: %v", i, err)
+		}
 	}
-	if _, err := a.coreInviteIn(t, "term-16", rcsAsOffer); !errors.Is(err, errBindingLimit) {
-		t.Fatalf("a 17th incoming session: %v", err)
+	if _, err := a.coreInviteIn(t, "term-32", rcsAsOffer); !errors.Is(err, errBindingLimit) {
+		t.Fatalf("a 33rd invitation: %v", err)
+	}
+	if a.p.msrp.limit.held() != 33 {
+		t.Errorf("held %d", a.p.msrp.limit.held())
+	}
+}
+
+// The security review's second probe: invitations the client declines
+// create bindings at rcs-as's rate, not hers. With her own rate at 8 a
+// minute, 8 declined invitations leave her own chat its bindings.
+func TestDeclinedInvitationsLeaveTheClientItsOwnRate(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	a.p.msrp.limit = newBindingLimit(16, 100, 8, a.clock.now).coreOfferShare(32, 32)
+	for i := range 8 {
+		c, err := a.coreInviteIn(t, fmt.Sprintf("term-%d", i), rcsAsOffer)
+		if err != nil {
+			t.Fatalf("invitation %d: %v", i, err)
+		}
+		c.respond(clientAnswered(t, c.req, 603, ""))
+	}
+	a.settle()
+	if a.p.msrp.limit.held() != 0 || a.relay.count(http.MethodDelete) != 8 {
+		t.Fatalf("held %d, calls %q", a.p.msrp.limit.held(), a.relay.log())
+	}
+	c := a.invite(t, "chat-own", "application/sdp", clientChatOffer)
+	mediaOf(t, c.req.Body, "a=path:"+corePathFor(9))
+}
+
+// A binding goes back to the share of the side whose offer made it:
+// rcs-as's refresh offer that moves its path, in a chat alice set up,
+// takes from rcs-as's share, and gives it back there.
+func TestABindingGoesBackToTheShareOfItsOffer(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	c := confirmedChat(t, a)
+	re := reInvite(t, a, c, "INVITE", 2, "")
+	re.d.OnResponse(context.Background(), answered(t, re.req, 200, "b1", strings.Replace(rcsAsOffer, "as9f2c1", "m0v3d9x", 1)))
+	l := a.p.msrp.limit
+	own, theirs := share{flow: "FLOW-A"}, share{flow: "FLOW-A", coreOffer: true}
+	l.mu.Lock()
+	held := [2]int{l.byShare[own], l.byShare[theirs]}
+	l.mu.Unlock()
+	if held != [2]int{1, 1} {
+		t.Fatalf("held by share %v", held)
+	}
+	a.p.Route(context.Background(), inCall(t, c, "ACK", "b1", 2, clientAnswer))
+	a.p.Route(context.Background(), inCall(t, c, "BYE", "b1", 3, ""))
+	a.settle()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.byShare) != 0 || l.count != 0 {
+		t.Errorf("left %v, %d", l.byShare, l.count)
 	}
 }
 
@@ -697,11 +752,15 @@ func TestAnACKWithoutTheAnswerToANewBindingEndsTheSession(t *testing.T) {
 // #315 code review 3: rcs-as's offer in a reliable 183 to a re-INVITE
 // without one, which the client answers passive in the PRACK, ends the
 // session with BYE 488 after the 2xx (#136 part 2, decision 3); so does a
-// PRACK without the answer to one that made a binding.
+// PRACK without the answer to one that made a binding, whose binding goes
+// with the PRACK.
 func TestAPRACKThatCannotServeARefreshOfferEndsTheSession(t *testing.T) {
-	for name, tc := range map[string]struct{ offer, prack, reason string }{
-		"passive":   {rcsAsOffer, strings.Replace(clientAnswer, "a=setup:active", "a=setup:passive", 1), reasonDirection},
-		"no answer": {strings.Replace(rcsAsOffer, "as9f2c1", "m0v3d9x", 1), "", reasonNoAnswer},
+	for name, tc := range map[string]struct {
+		offer, prack, reason string
+		released             int
+	}{
+		"passive":   {rcsAsOffer, strings.Replace(clientAnswer, "a=setup:active", "a=setup:passive", 1), reasonDirection, 0},
+		"no answer": {strings.Replace(rcsAsOffer, "as9f2c1", "m0v3d9x", 1), "", reasonNoAnswer, 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			a := newAnchoring(t, 16, 100)
@@ -721,6 +780,10 @@ func TestAPRACKThatCannotServeARefreshOfferEndsTheSession(t *testing.T) {
 				if err := d.Prepare(context.Background(), d.Targets[0], prack.Message.Clone()); err != nil {
 					t.Fatal(err)
 				}
+			}
+			a.settle()
+			if a.relay.count(http.MethodDelete) != tc.released {
+				t.Errorf("released with the PRACK: %q", a.relay.log())
 			}
 			re.d.OnResponse(context.Background(), answered(t, re.req, 200, "b1", ""))
 			a.settle()
@@ -768,5 +831,72 @@ func TestADeclinedLineGoesWithoutItsPathAndReleasesItsBinding(t *testing.T) {
 	in := b.invite(t, "chat-2", "application/sdp", declined)
 	if strings.Contains(string(in.req.Body), "a=path:") || !strings.Contains(string(in.req.Body), "m=message 0 ") || len(b.relay.log()) != 0 {
 		t.Errorf("calls %q, INVITE to rcs-as:\n%s", b.relay.log(), in.req.Body)
+	}
+}
+
+// The security review's minor: a client that declines the line the relay
+// offered and answers with an MSRP line of its own at another index gives
+// rcs-as no path of its own, and its session is ended, BYE 488, as it
+// left no line the relay serves.
+func TestAClientAnswerWithNoLineTheRelayServesEndsTheSession(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	c := a.coreInvite(t, rcsAsOffer)
+	ans := strings.Replace(strings.Replace(clientAnswer, "m=message 9 ", "m=message 0 ", 1),
+		"m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+		"m=message 9 TCP/TLS/MSRP *\r\na=path:msrps://192.0.2.10:9/own1;tcp\r\na=setup:active\r\n", 1)
+	ok := c.respond(clientAnswered(t, c.req, 200, ans))
+	if strings.Contains(string(ok.Body), "own1") || strings.Count(string(ok.Body), "m=message 0 ") != 2 {
+		t.Errorf("the answer to rcs-as:\n%s", ok.Body)
+	}
+	a.p.Route(context.Background(), fromCoreInCall(t, a, c, "ACK", "b1", 1, ""))
+	a.settle()
+	checkEndOfCoreSession(t, a, reasonDeclined)
+	if a.p.msrp.limit.held() != 0 {
+		t.Errorf("held %d", a.p.msrp.limit.held())
+	}
+}
+
+// #315 QA F5 (M2): two forks that answer with the same description each
+// get their own: the first the relay's path, the other its lines declined.
+func TestTwoForksWithTheSameAnswerAreToldApart(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	c := a.invite(t, "chat-1", "application/sdp", clientChatOffer)
+	ok1 := c.respond(answered(t, c.req, 200, "b1", rcsAsAnswer))
+	ok2 := c.respond(answered(t, c.req, 200, "b2", rcsAsAnswer))
+	mediaOf(t, ok1.Body, "a=path:"+clientPathFor(1))
+	mediaOf(t, ok2.Body, "m=message 0 ")
+	if strings.Contains(string(ok2.Body), clientPathFor(1)) {
+		t.Errorf("b2 got b1's relay path:\n%s", ok2.Body)
+	}
+}
+
+// #315 QA F5 (M16): two offers routed before either is prepared both find
+// no exchange under way; the one prepared second finds the first's, and is
+// 491 with its new binding released.
+func TestAnOfferThatLosesTheRaceIs491(t *testing.T) {
+	a := newAnchoring(t, 16, 100)
+	c := confirmedChat(t, a)
+	first := inCall(t, c, "INVITE", "b1", 2, clientChatOffer)
+	second := inCall(t, c, "UPDATE", "b1", 3, strings.Replace(clientChatOffer, "s7d2k8f", "m0v3d9x", 1))
+	d1 := a.p.Route(context.Background(), first)
+	d2 := a.p.Route(context.Background(), second)
+	if len(d1.Targets) != 1 || len(d2.Targets) != 1 {
+		t.Fatalf("routed: %+v, %+v", d1, d2)
+	}
+	if err := d1.Prepare(context.Background(), d1.Targets[0], first.Message.Clone()); err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.Prepare(context.Background(), d2.Targets[0], second.Message.Clone()); err == nil {
+		t.Fatal("the second offer went on")
+	}
+	res, err := sip.NewResponse(second.Message, 500, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2.OnFinal(context.Background(), res)
+	d2.OnResponse(context.Background(), res)
+	a.settle()
+	if res.StatusCode != 491 || a.relay.count(http.MethodPost) != 2 || a.relay.count(http.MethodDelete) != 1 || a.p.msrp.limit.held() != 1 {
+		t.Errorf("%d, held %d, calls %q", res.StatusCode, a.p.msrp.limit.held(), a.relay.log())
 	}
 }

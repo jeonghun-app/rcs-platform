@@ -124,7 +124,8 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 	if p.msrp.relay == nil {
 		return nil, 0, errNoRelay
 	}
-	wait, err := p.msrp.limit.take(s.share(), len(want))
+	sh := share{flow: s.key.flow, coreOffer: from == coreSide}
+	wait, err := p.msrp.limit.take(sh, len(want))
 	if err != nil {
 		return nil, wait, err
 	}
@@ -135,12 +136,12 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 			p.releaseLine(s, l)
 		}
 		s.mu.Unlock()
-		p.msrp.limit.give(s.share(), len(want)-len(made))
+		p.msrp.limit.give(sh, len(want)-len(made))
 		return nil, 0, err
 	}
 	for _, i := range sortedKeys(want) {
 		paths := relayPaths{ExpiresIn: bindingExpiresIn}
-		l := &anchoredLine{}
+		l := &anchoredLine{share: sh}
 		if from == clientSide {
 			paths.ClientEndpointPath, l.clientPath = want[i], want[i]
 		} else {
@@ -185,7 +186,7 @@ func sortedKeys[V any](m map[int]V) []int {
 // may be held, s.mu must not be. On an error nothing is held, and the wait
 // is the rate's (refusalOf).
 func (p *pcscf) anchorOffer(ctx context.Context, s *msrpSession, from side, d []byte) (*exchange, []byte, time.Duration, error) {
-	offer, lines, err := offerLines(d, from, p.msrp.limit.most(s.origin == coreSide))
+	offer, lines, err := offerLines(d, from, p.msrp.limit.most(from == coreSide))
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -249,8 +250,10 @@ func (p *pcscf) anchorOffer(ctx context.Context, s *msrpSession, from side, d []
 // and the Reason that ends the dialog if pcscf cannot serve it: the relay
 // failing, or an answer it cannot take, reasonRelayUnavailable (#136
 // decision 6); a client that answered passive, which would have the relay
-// dial it, reasonDirection (ADR 0004). A line the answer declines (port 0)
-// is declined on, and its binding goes once x is taken. It calls the
+// dial it, reasonDirection (ADR 0004); a client that declined every line
+// the relay serves, reasonDeclined. A line the answer declines (port 0) is
+// declined on, and its binding goes once x is taken; toward rcs-as, so is
+// every MSRP line of the client's the relay does not serve. It calls the
 // relay: s.answering may be held, s.mu must not be.
 func (p *pcscf) anchorAnswer(ctx context.Context, s *msrpSession, x *exchange, d []byte) ([]byte, string) {
 	from := x.offerer.other()
@@ -324,6 +327,19 @@ func (p *pcscf) anchorAnswer(ctx context.Context, s *msrpSession, x *exchange, d
 			paths[i] = l.binding.ClientPath
 		} else {
 			paths[i] = l.binding.CorePathLocal
+		}
+	}
+	if from == clientSide {
+		// rcs-as gets no MSRP line of the client's but those the relay
+		// serves (#315 security review, QA F4), and a session the client
+		// answered with none of them is over.
+		for i := range ans.Media {
+			if m := &ans.Media[i]; m.IsMSRP() && x.lines[i] == nil {
+				m.Port, m.PortCount = 0, 0
+			}
+		}
+		if len(x.lines) > 0 && len(x.declined) == len(x.lines) {
+			fail(reasonDeclined)
 		}
 	}
 	if from == clientSide && failed == reasonDirection {

@@ -34,6 +34,9 @@ var errFlowClosed = errors.New("pcscf: the client's flow closed")
 const (
 	reasonOfferRefused = `SIP;cause=488;text="MSRP offer not supported"`
 	reasonNoAnswer     = `SIP;cause=488;text="MSRP answer missing"`
+	// reasonDeclined ends a session whose client declined every MSRP line
+	// the relay serves.
+	reasonDeclined = `SIP;cause=488;text="MSRP declined"`
 )
 
 // refuseOffer answers an offer pcscf will not anchor with 488 (ADR 0004).
@@ -612,13 +615,16 @@ func (p *pcscf) answerInRequest(s *msrpSession, r *proxy.Request, d proxy.Decisi
 		return d
 	}
 	desc := part.description()
+	// The ACK or PRACK of a response has its To tag: one of another fork
+	// answers no offer of this one's (#315 QA F1).
+	tag := toTag(r.Message)
 	s.mu.Lock()
 	x := s.x
-	if x == nil || !x.inResponse || x.offerer != from.other() || x.settled && !bytes.Equal(x.answerIn, desc) {
+	if x == nil || !x.inResponse || x.offerer != from.other() || x.tag != tag || x.settled && !bytes.Equal(x.answerIn, desc) {
 		// A retransmitted ACK finds its exchange taken already.
 		x = nil
-		for _, past := range []*exchange{s.setup, s.x} {
-			if past != nil && past.inResponse && past.offerer == from.other() && past.answered && bytes.Equal(past.answerIn, desc) {
+		for _, past := range []*exchange{s.setup, s.x, s.last} {
+			if past != nil && past.inResponse && past.offerer == from.other() && past.tag == tag && past.answered && bytes.Equal(past.answerIn, desc) {
 				x = past
 			}
 		}
@@ -668,7 +674,7 @@ func (p *pcscf) answerMissing(s *msrpSession, req *sip.Request, from side) {
 	s.answering.Lock()
 	s.mu.Lock()
 	x := s.x
-	missing := x != nil && x.inResponse && x.offerer == from.other() && !x.answered && !x.settled && acknowledges(req, x)
+	missing := x != nil && x.inResponse && x.offerer == from.other() && x.tag == toTag(req) && !x.answered && !x.settled && acknowledges(req, x)
 	fresh := missing && len(x.fresh) > 0
 	if fresh {
 		x.failed = reasonNoAnswer
@@ -685,6 +691,13 @@ func (p *pcscf) answerMissing(s *msrpSession, req *sip.Request, from side) {
 	if fresh {
 		p.endNow(s, reasonNoAnswer)
 	}
+}
+
+// toTag is the To tag of req in lower case, as an exchange keeps the tag of
+// the response it acknowledges.
+func toTag(req *sip.Request) string {
+	to, _ := req.Header.To()
+	return strings.ToLower(to.Tag())
 }
 
 // responseSeqs returns the CSeq number of res and its RSeq, 0 for a final
@@ -775,7 +788,7 @@ func (p *pcscf) offerInRequest(s *msrpSession, d proxy.Decision, from side, part
 	case under:
 		return proxy.Decision{Status: 491, Reason: "Request Pending"}
 	}
-	if _, _, err := offerLines(desc, from, p.msrp.limit.most(s.origin == coreSide)); err != nil {
+	if _, _, err := offerLines(desc, from, p.msrp.limit.most(from == coreSide)); err != nil {
 		return p.refuseOffer()
 	}
 	var refused atomic.Pointer[refusal]
@@ -976,7 +989,7 @@ func (p *pcscf) offerInResponse(s *msrpSession, d proxy.Decision, from side) pro
 			nx.inResponse, nx.tag = true, strings.ToLower(to.Tag())
 			nx.cseq, nx.rseq = responseSeqs(res)
 			s.mu.Lock()
-			s.x = nx
+			s.x, s.last = nx, nx
 			s.mu.Unlock()
 			x = nx
 			setBody(res, part, out)

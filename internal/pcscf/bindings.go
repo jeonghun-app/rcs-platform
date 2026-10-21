@@ -21,13 +21,14 @@ var (
 	errBindingRate  = errors.New("pcscf: MSRP bindings created too fast")
 )
 
-// A share is the bindings one client flow may hold and create: those of
-// the sessions it starts, or, terminating, those of the sessions rcs-as
-// starts toward it. The two are counted apart, so that sessions coming in
-// cannot keep a client from starting its own (#315 code review 2).
+// A share is the bindings one client flow may hold and create for the
+// offers of one side: the client's own, or coreOffer, those rcs-as makes
+// toward it. The two are counted apart, so that offers coming in cannot
+// keep a client from making its own (#315 code review 2, security review);
+// only the task's total is shared.
 type share struct {
-	flow        transport.FlowID
-	terminating bool
+	flow      transport.FlowID
+	coreOffer bool
 }
 
 // shareLimits are the bindings a share may hold, and create in a minute.
@@ -40,9 +41,9 @@ type shareLimits struct {
 // and the bindings each share creates, in a token bucket of perMinute that
 // fills at perMinute a minute. Its methods are safe for concurrent use.
 type bindingLimit struct {
-	client, terminating shareLimits
-	total               int
-	now                 func() time.Time
+	client, coreOffer shareLimits
+	total             int
+	now               func() time.Time
 
 	mu      sync.Mutex
 	byShare map[share]int
@@ -51,33 +52,32 @@ type bindingLimit struct {
 }
 
 // newBindingLimit limits each share to perFlow bindings and perMinute
-// created a minute, and the task to total; terminatingShare sets other
-// limits for the sessions rcs-as starts.
+// created a minute, and the task to total; coreOfferShare sets other
+// limits for rcs-as's offers.
 func newBindingLimit(perFlow, total, perMinute int, now func() time.Time) *bindingLimit {
 	sl := shareLimits{perFlow: perFlow, perMinute: float64(perMinute)}
-	return &bindingLimit{client: sl, terminating: sl, total: total, now: now,
+	return &bindingLimit{client: sl, coreOffer: sl, total: total, now: now,
 		byShare: map[share]int{}, created: map[share]*bucket{}}
 }
 
-// terminatingShare limits the share of the sessions rcs-as starts toward a
-// flow to perFlow bindings and perMinute created a minute.
-func (l *bindingLimit) terminatingShare(perFlow, perMinute int) *bindingLimit {
-	l.terminating = shareLimits{perFlow: perFlow, perMinute: float64(perMinute)}
+// coreOfferShare limits the share of rcs-as's offers toward a flow to
+// perFlow bindings and perMinute created a minute.
+func (l *bindingLimit) coreOfferShare(perFlow, perMinute int) *bindingLimit {
+	l.coreOffer = shareLimits{perFlow: perFlow, perMinute: float64(perMinute)}
 	return l
 }
 
 func (l *bindingLimit) limitsOf(sh share) shareLimits {
-	if sh.terminating {
-		return l.terminating
+	if sh.coreOffer {
+		return l.coreOffer
 	}
 	return l.client
 }
 
-// most is the most bindings one session of a share, terminating or not,
-// can ever take: more is refused as an offer, not as a wait (#248 code
-// review 2).
-func (l *bindingLimit) most(terminating bool) int {
-	sl := l.limitsOf(share{terminating: terminating})
+// most is the most bindings one offer, of rcs-as's or not, can ever take:
+// more is refused as an offer, not as a wait (#248 code review 2).
+func (l *bindingLimit) most(coreOffer bool) int {
+	sl := l.limitsOf(share{coreOffer: coreOffer})
 	return min(sl.perFlow, l.total, int(sl.perMinute))
 }
 
@@ -127,7 +127,7 @@ func (l *bindingLimit) forget(flow transport.FlowID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.created, share{flow: flow})
-	delete(l.created, share{flow: flow, terminating: true})
+	delete(l.created, share{flow: flow, coreOffer: true})
 }
 
 // sweep drops the creation counts that have filled again, which carry no

@@ -77,7 +77,10 @@ func (s *scriptedRelay) count(method string) int {
 	return n
 }
 
-func bindingIDFor(n int) string { return strings.Repeat("a", 51) + string(rune('a'+n)) }
+// bindingIDFor is the n-th binding's id, 52 letters for any n below 26².
+func bindingIDFor(n int) string {
+	return strings.Repeat("a", 50) + string(rune('a'+n/26)) + string(rune('a'+n%26))
+}
 func clientPathFor(n int) string {
 	return fmt.Sprintf("msrps://msrp.example.net:2856/%sclient%d;tcp", strings.Repeat("c", 24), n)
 }

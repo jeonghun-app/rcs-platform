@@ -71,11 +71,13 @@ const (
 	// in a minute, whatever it holds (#248 security review): a chat or a
 	// file transfer every two seconds is far past what a person does.
 	DefaultBindingsPerMinute = 32
-	// The sessions rcs-as starts toward a client flow have a share of
-	// their own, by default the same as the client's: sessions coming in
-	// cannot keep a client from starting its own (#315 code review 2).
-	DefaultMaxTerminatingBindingsPerFlow = DefaultMaxBindingsPerFlow
-	DefaultTerminatingBindingsPerMinute  = DefaultBindingsPerMinute
+	// rcs-as's offers toward a client flow have a share of their own, so
+	// that offers coming in cannot keep a client from making its own (#315
+	// code review 2, security review). A flow holds the bindings of as many
+	// sessions as rcs-as lets come in for one user (its
+	// RCSAS_MAX_INCOMING_SESSIONS_PER_USER, 32), one MSRP line each.
+	DefaultMaxCoreOfferBindingsPerFlow = 32
+	DefaultCoreOfferBindingsPerMinute  = 32
 	// DefaultRelayTimeout bounds one call to msrp-relay's control API.
 	DefaultRelayTimeout = 2 * time.Second
 	// minRelayTokenLength is the shortest relay token accepted in staging
@@ -174,10 +176,10 @@ type Config struct {
 	RelayTimeout time.Duration
 	// MaxBindingsPerFlow and MaxBindings bound the relay bindings of one
 	// flow and of the task, and BindingsPerMinute those one flow creates
-	// in a minute, for the sessions the client starts; the Terminating
-	// two bound, apart, those of the sessions rcs-as starts toward it.
-	MaxBindingsPerFlow, MaxBindings, BindingsPerMinute          int
-	MaxTerminatingBindingsPerFlow, TerminatingBindingsPerMinute int
+	// in a minute, for the client's offers; the CoreOffer two bound,
+	// apart, those of rcs-as's offers toward it.
+	MaxBindingsPerFlow, MaxBindings, BindingsPerMinute      int
+	MaxCoreOfferBindingsPerFlow, CoreOfferBindingsPerMinute int
 	// DrainTimeout is how long a stop spreads the closing of client flows
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
@@ -222,8 +224,8 @@ func Configure(s *runtime.Settings) Config {
 	c.MaxBindingsPerFlow = e.Int("MAX_BINDINGS_PER_FLOW", DefaultMaxBindingsPerFlow)
 	c.MaxBindings = e.Int("MAX_BINDINGS", DefaultMaxBindings)
 	c.BindingsPerMinute = e.Int("BINDINGS_PER_MINUTE", DefaultBindingsPerMinute)
-	c.MaxTerminatingBindingsPerFlow = e.Int("MAX_TERMINATING_BINDINGS_PER_FLOW", DefaultMaxTerminatingBindingsPerFlow)
-	c.TerminatingBindingsPerMinute = e.Int("TERMINATING_BINDINGS_PER_MINUTE", DefaultTerminatingBindingsPerMinute)
+	c.MaxCoreOfferBindingsPerFlow = e.Int("MAX_CORE_OFFER_BINDINGS_PER_FLOW", DefaultMaxCoreOfferBindingsPerFlow)
+	c.CoreOfferBindingsPerMinute = e.Int("CORE_OFFER_BINDINGS_PER_MINUTE", DefaultCoreOfferBindingsPerMinute)
 	if c.RelayTimeout <= 0 {
 		e.Invalid("RELAY_TIMEOUT", "must be greater than zero")
 	}
@@ -291,8 +293,8 @@ func Configure(s *runtime.Settings) Config {
 		{"MAX_CLIENT_FLOWS", c.MaxClientFlows}, {"CORE_CONNECTIONS", c.CoreConnections},
 		{"MAX_BINDINGS_PER_FLOW", c.MaxBindingsPerFlow}, {"MAX_BINDINGS", c.MaxBindings},
 		{"BINDINGS_PER_MINUTE", c.BindingsPerMinute},
-		{"MAX_TERMINATING_BINDINGS_PER_FLOW", c.MaxTerminatingBindingsPerFlow},
-		{"TERMINATING_BINDINGS_PER_MINUTE", c.TerminatingBindingsPerMinute},
+		{"MAX_CORE_OFFER_BINDINGS_PER_FLOW", c.MaxCoreOfferBindingsPerFlow},
+		{"CORE_OFFER_BINDINGS_PER_MINUTE", c.CoreOfferBindingsPerMinute},
 	} {
 		if n.v <= 0 {
 			e.Invalid(n.name, "must be positive")

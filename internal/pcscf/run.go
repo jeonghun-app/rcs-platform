@@ -143,7 +143,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
 	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).
-		terminatingShare(cfg.MaxTerminatingBindingsPerFlow, cfg.TerminatingBindingsPerMinute))
+		coreOfferShare(cfg.MaxCoreOfferBindingsPerFlow, cfg.CoreOfferBindingsPerMinute))
 	defer pc.msrp.close()
 	defer stopAnchor()
 	// A closed flow's registrations and MSRP sessions are gone (RFC 5626

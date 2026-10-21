@@ -95,7 +95,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		MaxRegisterRate: DefaultMaxRegisterRate, MaxRegisterBurst: DefaultMaxRegisterBurst, MaxPendingRegistersPerIP: DefaultMaxPendingRegistersPerIP,
 		RelayURL: &url.URL{Scheme: "http", Host: "msrp-relay.rcs.internal:8082"}, RelayTimeout: DefaultRelayTimeout,
 		MaxBindingsPerFlow: DefaultMaxBindingsPerFlow, MaxBindings: DefaultMaxBindings, BindingsPerMinute: 32,
-		MaxTerminatingBindingsPerFlow: 16, TerminatingBindingsPerMinute: 32,
+		MaxCoreOfferBindingsPerFlow: 32, CoreOfferBindingsPerMinute: 32,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -257,8 +257,8 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_MAX_BINDINGS_PER_FLOW", "0"}, "PCSCF_MAX_BINDINGS_PER_FLOW: must be positive"},
 		{[]string{"PCSCF_MAX_BINDINGS", "-1"}, "PCSCF_MAX_BINDINGS: must be positive"},
 		{[]string{"PCSCF_BINDINGS_PER_MINUTE", "0"}, "PCSCF_BINDINGS_PER_MINUTE: must be positive"},
-		{[]string{"PCSCF_MAX_TERMINATING_BINDINGS_PER_FLOW", "0"}, "PCSCF_MAX_TERMINATING_BINDINGS_PER_FLOW: must be positive"},
-		{[]string{"PCSCF_TERMINATING_BINDINGS_PER_MINUTE", "-1"}, "PCSCF_TERMINATING_BINDINGS_PER_MINUTE: must be positive"},
+		{[]string{"PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW", "0"}, "PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW: must be positive"},
+		{[]string{"PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE", "-1"}, "PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE: must be positive"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			_, err := configure(with(devEnv, tt.kv...))

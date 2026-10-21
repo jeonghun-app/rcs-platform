@@ -61,6 +61,7 @@ const (
 	metricEndedRelay       = "msrp.ended.relay_failed"
 	metricEndedOffer       = "msrp.ended.offer_refused"
 	metricEndedNoAnswer    = "msrp.ended.no_answer"
+	metricEndedDeclined    = "msrp.ended.declined"
 	metricRelayErrors      = "msrp.relay_errors"
 	metricByeFailed        = "msrp.bye_failed"
 	reasonDirection        = `SIP;cause=488;text="MSRP direction not supported"`
@@ -97,6 +98,9 @@ type anchoredLine struct {
 	binding              relayBinding
 	clientPath, corePath []string
 	released             bool
+	// share is the share of the limits the binding was taken from, the
+	// one it goes back to.
+	share share
 }
 
 // pathOf is the endpoint path of l on side s.
@@ -161,9 +165,11 @@ type msrpSession struct {
 	// every holds each binding made for it, to release them all.
 	lines map[int]*anchoredLine
 	every []*anchoredLine
-	// setup is the exchange of the INVITE that set the session up, and x
-	// one under way inside its dialog.
-	setup, x *exchange
+	// setup is the exchange of the INVITE that set the session up, x one
+	// under way inside its dialog, and last the last one inside it whose
+	// offer came in a response, kept once taken so that a retransmitted
+	// ACK finds it (#315 QA F3).
+	setup, x, last *exchange
 	// dialogTag is the tag of the dialog the bindings serve, in lower case:
 	// the To tag of the response with the first answer, or with the offer
 	// to an INVITE without one.
@@ -197,13 +203,6 @@ func newSession(flow transport.FlowID, origin side, invite *sip.Request, now tim
 		s.clientTag = strings.ToLower(from.Tag())
 	}
 	return s
-}
-
-// share is the share of the binding limits s's bindings come from: its
-// flow's own, or, for a session rcs-as started, its flow's terminating
-// share. key and origin never change.
-func (s *msrpSession) share() share {
-	return share{flow: s.key.flow, terminating: s.origin == coreSide}
 }
 
 // msrpAnchor is the anchoring state of a task: the relay client, nil
@@ -361,7 +360,7 @@ func (p *pcscf) releaseLine(s *msrpSession, l *anchoredLine) {
 		return
 	}
 	l.released = true
-	p.msrp.limit.give(s.share(), 1)
+	p.msrp.limit.give(l.share, 1)
 	id := p.msrp.relay
 	bid := l.binding.ID
 	p.msrp.goRun(func(ctx context.Context) {
@@ -380,7 +379,7 @@ func (p *pcscf) releaseNow(ctx context.Context, s *msrpSession) {
 	for _, l := range s.every {
 		if !l.released && l.binding.ID != "" {
 			l.released = true
-			p.msrp.limit.give(s.share(), 1)
+			p.msrp.limit.give(l.share, 1)
 			ids = append(ids, l.binding.ID)
 		}
 	}
@@ -443,6 +442,8 @@ func (p *pcscf) sendEnd(s *msrpSession, e pendingEnd) {
 		p.count(metricEndedOffer, 1)
 	case reasonNoAnswer:
 		p.count(metricEndedNoAnswer, 1)
+	case reasonDeclined:
+		p.count(metricEndedDeclined, 1)
 	default:
 		p.count(metricEndedRelay, 1)
 	}

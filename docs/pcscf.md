@@ -470,6 +470,17 @@ it cannot anchor is refused or ended; it never runs end to end.
     in any 1xx (#136 decision 3). A refresh of `rcs-as`'s (#252), an
     `actpass` offer in the 2xx of a re-INVITE without one, is answered
     `active` toward it and keeps the binding.
+  - An ACK or PRACK answers the offer in the response it acknowledges:
+    the one with its To tag (another fork's answers nothing of this
+    fork's), its CSeq and, for a PRACK, its `RAck`. One without a
+    description gives that exchange up, as rcsjta's ACK to `rcs-as`'s
+    refresh offer is: the session goes on as it was, unless the offer
+    made a binding, which the relay has no client's path for, and then
+    the session is ended (below).
+  - In the client's answer, an MSRP line the relay does not serve is
+    declined toward `rcs-as`, and no line declined there carries a path,
+    so `rcs-as` learns no path of the client's. A line an offer declines
+    (port 0, RFC 3264 §8.2) loses its binding once the answer is taken.
   - Retransmissions of a response, an ACK or a PRACK are rewritten the
     same. One exchange at a time: another offer while one is under way is
     491 (RFC 3261 §14.2, RFC 3311 §5.2), and an offer in a PRACK is 488.
@@ -495,16 +506,21 @@ it cannot anchor is refused or ended; it never runs end to end.
   (RFC 4145 §4); and a path the relay would not take: more than one URI
   (RFC 4976 relays), or one that is not MSRP over TCP with a port and a
   session id. Each is counted in `msrp.refused.offer`.
-- **Refusals that wait.** Past a flow's or the task's bindings
-  (`PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_MAX_BINDINGS`), without a relay
-  token, or when the relay fails or does not answer within
-  `PCSCF_RELAY_TIMEOUT`, the request is answered 503 with `Retry-After: 1`
-  (#136 decisions 4 to 6), counted in `msrp.refused.binding_limit` or
-  `msrp.refused.relay`; a binding already made for it is released. Past
-  the bindings a flow may create in a minute
-  (`PCSCF_BINDINGS_PER_MINUTE`, whatever it holds), it is 503 with the
-  seconds until it may, counted in `msrp.refused.binding_rate`. A path
-  the relay refuses (400) is 488, as waiting will not change it.
+- **Refusals that wait.** Bindings are counted per client flow by the
+  side whose offer made them, so that `rcs-as`'s offers toward a client
+  never take the room of the client's own: the client's offers hold at
+  most `PCSCF_MAX_BINDINGS_PER_FLOW` and create at most
+  `PCSCF_BINDINGS_PER_MINUTE` a minute, and `rcs-as`'s
+  `PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW`, as many as `rcs-as` lets come
+  in for one user, and `PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE`. The task's
+  `PCSCF_MAX_BINDINGS` is the one limit both share. Past a share's or the
+  task's bindings, without a relay token, or when the relay fails or does
+  not answer within `PCSCF_RELAY_TIMEOUT`, the request is answered 503
+  with `Retry-After: 1` (#136 decisions 4 to 6), counted in
+  `msrp.refused.binding_limit` or `msrp.refused.relay`; a binding already
+  made for it is released. Past a share's rate it is 503 with the seconds
+  until it may create, counted in `msrp.refused.binding_rate`. A path the
+  relay refuses (400) is 488, as waiting will not change it.
 - **Ending a dialog.** A 2xx cannot be refused, nor an ACK, so a dialog
   `pcscf` cannot serve is forwarded and then ended: once the ACK of the 2xx
   passes, or 32 s after the 2xx, a BYE goes to the client over its flow,
@@ -525,14 +541,23 @@ it cannot anchor is refused or ended; it never runs end to end.
   - an offer in a response that `pcscf` cannot anchor: declined, and its
     2xx ended with `cause=488;text="MSRP offer not supported"`, or
     `cause=503` when the relay failed;
+  - an offer in a response that made a binding and whose ACK or PRACK
+    has no answer: `cause=488;text="MSRP answer missing"`, once the ACK
+    passes or after the 2xx that follows the PRACK, the new binding
+    released at once;
+  - a client answer that declines every line the relay serves:
+    `cause=488;text="MSRP declined"`;
+  - a client answering a refresh offer in a reliable 1xx in a way `pcscf`
+    cannot serve, in the PRACK: as above, after the 2xx;
   - another answer, or a 2xx of another fork (decision 3): `cause=488`,
     with every line declined. A 2xx of another fork than the first
     answer's, which came in a 1xx, also releases the bindings at once:
     they served an early dialog that 2xx ends.
 
   Each is counted once, in `msrp.ended.direction`,
-  `msrp.ended.relay_failed` and `msrp.ended.second_answer`, however often
-  the 2xx is retransmitted. A BYE that cannot be built or sent, or that
+  `msrp.ended.relay_failed`, `msrp.ended.second_answer`,
+  `msrp.ended.offer_refused`, `msrp.ended.no_answer` and
+  `msrp.ended.declined`, however often the 2xx is retransmitted. A BYE that cannot be built or sent, or that
   gets a final response other than 2xx and 481, is counted in
   `msrp.bye_failed` and logged by side and step, naming no one.
 - **Releases.** A binding is released (`DELETE`) on a BYE from either
@@ -591,6 +616,7 @@ start with that value.
 | `PCSCF_RELAY_TIMEOUT` | `2s` | one call to the control API |
 | `PCSCF_MAX_BINDINGS_PER_FLOW`, `PCSCF_MAX_BINDINGS` | `16`, `20000` | relay bindings one client flow, and the task, hold |
 | `PCSCF_BINDINGS_PER_MINUTE` | `32` | relay bindings one client flow may create in a minute |
+| `PCSCF_MAX_CORE_OFFER_BINDINGS_PER_FLOW`, `PCSCF_CORE_OFFER_BINDINGS_PER_MINUTE` | `32`, `32` | the same for `rcs-as`'s offers toward one client flow, counted apart from the client's own |
 | `PCSCF_DRAIN_TIMEOUT` | `RCS_SHUTDOWN_TIMEOUT` less 5 s | how long a stop spreads the closing of client flows over; plus 5 s it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 
 For production, set `RCS_SHUTDOWN_TIMEOUT` to most of the ECS stop timeout,

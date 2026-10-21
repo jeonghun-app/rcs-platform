@@ -92,18 +92,18 @@ func TestBindingsCreatedAreLimitedPerMinute(t *testing.T) {
 	}
 }
 
-// The sessions rcs-as starts toward a flow take from a share of their own,
-// with its own limits, so a flow full of them can still start its own; the
-// task's total is the one of both (#315 code review 2).
-func TestTerminatingSessionsHaveAShareOfTheirOwn(t *testing.T) {
+// rcs-as's offers toward a flow take from a share of their own, with its
+// own limits, so a flow full of them can still make its own; the task's
+// total is the one of both (#315 code review 2, security review).
+func TestCoreOffersHaveAShareOfTheirOwn(t *testing.T) {
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
-	l := newBindingLimit(2, 5, 100, clock.now).terminatingShare(1, 3)
-	in := share{flow: "FLOW-A", terminating: true}
+	l := newBindingLimit(2, 5, 100, clock.now).coreOfferShare(1, 3)
+	in := share{flow: "FLOW-A", coreOffer: true}
 	if _, err := l.take(in, 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := l.take(in, 1); !errors.Is(err, errBindingLimit) {
-		t.Fatalf("past the terminating share: %v", err)
+		t.Fatalf("past the core offers' share: %v", err)
 	}
 	if take(l, "FLOW-A", 2) != nil || l.held() != 3 {
 		t.Fatalf("the client's own share: %d held", l.held())
@@ -120,19 +120,19 @@ func TestTerminatingSessionsHaveAShareOfTheirOwn(t *testing.T) {
 		l.give(in, 1)
 	}
 	if wait, err := l.take(in, 1); !errors.Is(err, errBindingRate) || wait != 20*time.Second {
-		t.Fatalf("past the terminating rate: %v, %v", wait, err)
+		t.Fatalf("past the core offers' rate: %v, %v", wait, err)
 	}
 	// FLOW-A's own 2 and FLOW-B's 2 leave the task 1 of its 5.
 	if take(l, "FLOW-B", 2) != nil || !errors.Is(take(l, "FLOW-C", 2), errBindingLimit) {
 		t.Fatal("the task's total")
 	}
-	if _, err := l.take(share{flow: "FLOW-C", terminating: true}, 1); err != nil || l.held() != 5 {
+	if _, err := l.take(share{flow: "FLOW-C", coreOffer: true}, 1); err != nil || l.held() != 5 {
 		t.Fatalf("the task's last binding: %v, %d held", err, l.held())
 	}
 	// forget drops both shares' counts.
 	l.forget("FLOW-A")
 	if _, ok := l.created[in]; ok {
-		t.Error("the terminating count kept")
+		t.Error("the core offers' count kept")
 	}
 	if _, ok := l.created[share{flow: "FLOW-A"}]; ok {
 		t.Error("the client's count kept")
