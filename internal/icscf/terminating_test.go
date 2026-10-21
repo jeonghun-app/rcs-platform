@@ -70,6 +70,10 @@ func TestTerminatingAnswersFollowTheMappingTable(t *testing.T) {
 			if names := g.metrics.names(); !slices.Contains(names, tc.metric) {
 				t.Errorf("metrics %v lack %s", names, tc.metric)
 			}
+			// QA of #274: a 480 is counted by its kind as well.
+			if tc.want == retry && g.metrics.counts["icscf.terminating.480"] != 1 {
+				t.Errorf("icscf.terminating.480 counted %d, want 1", g.metrics.counts["icscf.terminating.480"])
+			}
 		})
 	}
 }

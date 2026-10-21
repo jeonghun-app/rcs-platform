@@ -165,7 +165,7 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 		// No HSS knows an identity that is not one; it would answer 5001.
 		return r.reject(kindRegister, 403)
 	}
-	impi, ok := privateIdentity(m, impu)
+	impi, ok := privateIdentity(m, impu, string(r.home))
 	if !ok {
 		return r.reject(kindRegister, 403)
 	}
