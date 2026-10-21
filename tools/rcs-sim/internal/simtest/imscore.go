@@ -37,6 +37,12 @@ type IMSCore struct {
 	// goroutine for a NOTIFY, so two calls may run at once and a Rewrite
 	// that keeps state must lock it.
 	Rewrite func(*sip.Request)
+	// NotifyAnswered, when set before any request, hears how each NOTIFY
+	// the core sent ended: the subscriber's final response, or the error
+	// that ended its transaction. It runs on the transaction's goroutine
+	// and must not block. A test waits on it for a subscriber that must
+	// drop a NOTIFY to have done so (#396).
+	NotifyAnswered func(req *sip.Request, res *sip.Response, err error)
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
@@ -588,6 +594,9 @@ func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active b
 		done := make(chan struct{})
 		if _, err := c.layer.Request(req, transport.Destination{Flow: s.flow}, func(res *sip.Response, err error) {
 			if err != nil || res.StatusCode >= 200 {
+				if c.NotifyAnswered != nil {
+					c.NotifyAnswered(req, res, err)
+				}
 				select {
 				case <-done:
 				default:
