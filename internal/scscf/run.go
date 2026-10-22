@@ -254,15 +254,18 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// room in its connection's queue, and the proxy's Close waits for them,
 	// for up to WriteTimeout, past the budget; closing the connections
 	// releases them at once; a second Close does nothing. The sends the
-	// router gave up on are released with them, but for one still opening
-	// its connection, which ends within closeMargin. Then the Cx client
-	// says goodbye to the HSS tasks (DPR) by the deadline.
+	// router gave up on are released with them, and are waited for until
+	// goodbyeMargin before the deadline, so that however slow they are to
+	// return the Cx client has that long to say goodbye to the HSS tasks
+	// (DPR) by the deadline (#502).
 	_ = tr.Close()
-	closeCtx, cancelClose := context.WithDeadline(context.Background(), stopBy)
-	defer cancelClose()
-	if !routed && !router.WaitFor(closeCtx) {
+	sendsCtx, cancelSends := context.WithDeadline(context.Background(), stopBy.Add(-goodbyeMargin))
+	defer cancelSends()
+	if !routed && !router.WaitFor(sendsCtx) {
 		rt.Logger.Warn("third-party REGISTERs still under way at the end of the stop")
 	}
+	closeCtx, cancelClose := context.WithDeadline(context.Background(), stopBy)
+	defer cancelClose()
 	closeCx(closeCtx)
 	return nil
 }

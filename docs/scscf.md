@@ -152,7 +152,8 @@ deadline, and step 5 has those 3 s. That is longer than a connection to a
 peer takes to open or fail (2 s), so a REGISTER or NOTIFY that began to open
 one as the waits ended is done within it. In step 5, the third-party
 REGISTERs given up on in step 3 are waited for once the transport has
-closed, and then the Cx client says goodbye.
+closed, until 1 s before the deadline, and then the Cx client says goodbye:
+it always has that last second, however slow the REGISTERs are to return.
 
 An application server that missed a third-party REGISTER at a stop hears of
 the registration at its next refresh. What the stop leaves undone is the other
