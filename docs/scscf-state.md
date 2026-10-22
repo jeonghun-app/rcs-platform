@@ -145,22 +145,50 @@ additionally sealed (below).
   again (#394), as is a store read before the claim that fails for a reason
   that may pass: the identity, the listing, the record or the profile, with
   nothing written yet (#422). A read the store refuses as invalid is
-  answered DIAMETER_UNABLE_TO_COMPLY. The lease of an RTR that ended the set
-  for good is marked `rejected`, and stays so whatever RTR comes after, so
-  that the sweep's NOTIFY says `reason=rejected` as the RTR's would have
-  (#334); the lease holds no bindings, so that NOTIFY names no contacts. A
-  store failure or a stop at any point thus leaves either the record or the
-  saved ends, and a sweep sends a final NOTIFY nobody sent. A subscription
-  is deleted only once its final NOTIFY is answered (a 2xx, a code RFC 6665
-  §4.2.2 lists, or 430); one without an answer is sent again by a sweep,
-  with the CSeq and version it was numbered with, 10 s after the send ended
-  and twice as late each time (the last about 3 min 10 s after the first for
-  a silent subscriber, 2 min 30 s when each send fails at once), and given
-  up after five sends (`regevent.final_abandoned`). An end whose set was
-  registered again meanwhile, a new record, says terminated without a body,
-  so that it ends nothing of the new registration. The subscription sweep
-  must therefore run every few seconds to a minute, as the registration
-  sweep does.
+  answered DIAMETER_UNABLE_TO_COMPLY. A listing with items that do not
+  decode beside readable sets ends the readable ones, and counts the others
+  (`registrar.rtr_unreadable`): an unreadable item routes nothing here, and
+  the HSS would not send the RTR again for the rest (#451). During a rolling
+  deploy a task of the older version may still read, and route, an item a
+  new validation rule refuses, until its bindings expire. A listing with
+  nothing readable still answers DIAMETER_UNABLE_TO_COMPLY, once the other
+  private identities' sets have ended, and is counted too (#478). If one of
+  those sets could not end for a reason that may pass, the answer is
+  DIAMETER_TOO_BUSY first: the HSS sends the RTR again, the resend can end
+  that set, and it answers DIAMETER_UNABLE_TO_COMPLY for the unreadable
+  listing. The lease
+  of an RTR that ended the set for good is marked `rejected`, and stays so
+  whatever RTR comes after, so that the sweep's NOTIFY says
+  `reason=rejected` as the RTR's would have (#334); the lease holds no
+  bindings, so that NOTIFY names no contacts. A store failure or a stop at
+  any point thus leaves either the record or the saved ends, and a sweep
+  sends a final NOTIFY nobody sent. A subscription is deleted only once its
+  final NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or 430);
+  one without an answer is sent again by a sweep, with the CSeq and version
+  it was numbered with, 10 s after the send ended and twice as late each
+  time (the last about 3 min 10 s after the first for a silent subscriber, 2
+  min 30 s when each send fails at once), and given up after five sends
+  (`regevent.final_abandoned`). An end whose set was registered again
+  meanwhile, a new record, says terminated without a body, so that it ends
+  nothing of the new registration. The subscription sweep must therefore run
+  every few seconds to a minute, as the registration sweep does.
+- **Every re-registration notifies every subscription.** A REGISTER that
+  only refreshes the set's bindings, their expiry and CSeq and nothing else,
+  still sends each of the set's subscriptions a full NOTIFY, its contacts
+  `refreshed` (or `shortened`): TS 24.229 §5.4.2.1.2 has the S-CSCF send a
+  NOTIFY on every dialog when an event pertaining to the user occurs, gives
+  the content for a re-registration (4) e) III), and asks the full state in
+  every NOTIFY. RFC 3680 §4.7.2 alone would let the notifier skip it (#277).
+  Each such NOTIFY costs, per subscription, a read of the set's record, the
+  conditional `NextNotify` write on `reg-subscriptions` and a SIP round trip
+  to the P-CSCF or the UE; the change also lists the subscriptions of each of
+  the set's identities not barred. The rate is about U × S ÷ T for U
+  registered users, S subscriptions a set (one from the P-CSCF per default
+  identity, one more for a UE that subscribes) and T between re-registrations
+  (clients without outbound re-register within 600 s, the expiry `pcscf`
+  caps them to): 1 million users, two subscriptions and 480 s make about
+  4,200 NOTIFYs, and as many writes, a second. `regevent.notify_refresh`
+  counts these NOTIFYs, so the rate can be read from a running stack.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
   document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
   store's limits, 32 identities (`MaxIdentities`) each listing up to 32
@@ -186,8 +214,10 @@ The reg event notifier counts, without dimensions:
 `regevent.subscribed`, `refused`, `refused_full`, `replaced`,
 `no_subscription`, `refresh_conflict`, `notified`, `notify_refused`,
 `notify_failed`, `notify_merged`, `notify_dropped`, `notify_deferred`,
-`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`,
-`final_resent`, `final_retry`, `final_abandoned` and `internal_errors`. Alarm on `regevent.notify_dropped` and
+`notify_superseded`, `notify_refresh`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`,
+`final_resent`, `final_retry`, `final_abandoned` and `internal_errors`;
+`notify_refresh` counts the NOTIFYs numbered and sent for re-registrations
+that only refreshed bindings, answered or not. Alarm on `regevent.notify_dropped` and
 `regevent.notify_deferred` (any sustained rate): NOTIFYs are queuing faster
 than subscribers answer (below), and ends are waiting for the sweep. Alarm
 on any `regevent.end_failed`: a set's end could not be saved, and its

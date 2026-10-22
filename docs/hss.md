@@ -49,7 +49,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included |
 | `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits. At most `240s` (see Operations) |
 | `HSS_KEYRING_BOOTSTRAP` | `false` | allow creating a first data key although subscriptions are stored (see [Secrets](#secrets)) |
-| `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and the pushes one provisioning request causes |
+| `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and each push one provisioning request causes, on its own: a change that causes two pushes waits up to twice it |
 
 In prod every token must be at least 256 bits (43 base64url characters) and no
 token may be shared between callers. Tokens come from Secrets Manager through the
@@ -186,7 +186,23 @@ A PPA failure is acted on as §6.2.2.1 asks of an HSS without restoration:
 the subscription to not registered (`push.ppr.user_unknown`);
 `DIAMETER_ERROR_NOT_SUPPORTED_USER_DATA` or `TOO_MUCH_DATA` sets them to not
 registered and sends RTR `SERVER_CHANGE`, so the user registers again
-(`push.ppr.data_refused`).
+(`push.ppr.data_refused`). Either way, once the user is marked not
+registered, the change's later pushes for that subscription are not sent:
+the S-CSCF no longer holds the user. If that write fails, they still go.
+The write and the RTR each have `HSS_PUSH_TIMEOUT` of their own, so a PPR
+refused near the end of its time still leaves the RTR a whole one.
+
+One change's pushes go one at a time, each once the one before is answered
+or its own `HSS_PUSH_TIMEOUT` has passed, so a push left unanswered does not
+keep the next from going. When identities move between implicit sets, the
+sets losing them go first (§6.5.2.1):
+- first the RTRs of the sets that lose one: an RTR only takes identities away,
+  and the S-CSCF finds the set an RTR names by its identities, so after a PPR
+  that moved one of them it would end the set gaining it as well;
+- then the PPRs of the sets that lose one, a set before any set it gives an
+  identity to; two sets that swap identities by PPRs alone keep the
+  subscription's order, as no order can update both losing sets first;
+- then the rest, the sets that only gain identities among them.
 
 | Change | Request |
 |---|---|

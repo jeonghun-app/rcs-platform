@@ -7,7 +7,11 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -386,6 +390,15 @@ type holdingCore struct {
 	got     chan *sip.Request
 	release chan struct{}
 	hssUp   atomic.Bool
+	mu      sync.Mutex
+	all     []*sip.Request
+}
+
+// received is every request the core got.
+func (p *holdingCore) received() []*sip.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.all)
 }
 
 func startHoldingCore(t *testing.T, hss *diameterHSS) *holdingCore {
@@ -414,6 +427,9 @@ func startHoldingCore(t *testing.T, hss *diameterHSS) *holdingCore {
 					if !ok {
 						continue
 					}
+					p.mu.Lock()
+					p.all = append(p.all, req)
+					p.mu.Unlock()
 					p.got <- req
 					<-p.release
 					p.hssUp.Store(hss.connected())
@@ -470,10 +486,13 @@ func TestAStopAnswersItsWorkBeforeItClosesTheTransportAndTheCxClient(t *testing.
 	}
 	// A change NOTIFY may follow the first, from the registration's own
 	// work still under way when the SUBSCRIBE came; it is held and
-	// answered the same way.
-	if got, _ := r.h.Metric("regevent.notified"); got < 1 {
-		t.Errorf("%v NOTIFYs answered, want the held one, its answer over the open transport", got)
+	// answered the same way. Every one the P-CSCF got was answered over
+	// the open transport, none of them twice (#479).
+	got := core.received()
+	if n, _ := r.h.Metric("regevent.notified"); n < 1 || int(n) != len(got) {
+		t.Errorf("%v NOTIFYs answered of %d the P-CSCF got, want every one, the held one first", n, len(got))
 	}
+	checkNotifySequence(t, got)
 	if !core.hssUp.Load() {
 		t.Error("the Cx client closed before the NOTIFY was answered")
 	}
@@ -660,5 +679,71 @@ func TestAHookPanicIsCountedInScscfsMetrics(t *testing.T) {
 		if strings.Contains(r.h.Output(), secret) {
 			t.Errorf("the output holds %q", secret)
 		}
+	}
+}
+
+// reginfoVersion reads the version of a NOTIFY's reginfo document.
+var reginfoVersion = regexp.MustCompile(`<reginfo[^>]*\sversion="(\d+)"`)
+
+// checkNotifySequence fails the test if the NOTIFYs of one subscription
+// repeat a CSeq or do not raise the reginfo version each time (RFC 3680
+// §5.2): a NOTIFY sent twice would do either.
+func checkNotifySequence(t *testing.T, notifies []*sip.Request) {
+	t.Helper()
+	seen := map[string]bool{}
+	last := -1
+	for _, n := range notifies {
+		cseq := n.Header.Get("CSeq")
+		if seen[cseq] {
+			t.Errorf("two NOTIFYs with CSeq %q", cseq)
+		}
+		seen[cseq] = true
+		m := reginfoVersion.FindSubmatch(n.Body)
+		if m == nil {
+			t.Errorf("a NOTIFY without a reginfo version")
+			continue
+		}
+		v, _ := strconv.Atoi(string(m[1]))
+		if v <= last {
+			t.Errorf("reginfo version %d after %d", v, last)
+		}
+		last = v
+	}
+}
+
+// TestASubscribesFirstNOTIFYIsCountedBeforeIts200 (#479): the stop runs
+// to its end while the dispatcher is held just after the SUBSCRIBE's 200,
+// before the NOTIFY goes. The NOTIFY was counted before the 200, so the
+// stop waits for it, and the P-CSCF gets it.
+func TestASubscribesFirstNOTIFYIsCountedBeforeIts200(t *testing.T) {
+	hss := startHSS(t)
+	core := startPCSCFCore(t)
+	var r *running
+	var once sync.Once
+	stopped := make(chan error, 1)
+	r = startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.subscribeAnswered = func() {
+			once.Do(func() {
+				go func() { stopped <- r.stop() }()
+				// Long enough for a stop that did not count the NOTIFY to
+				// have closed the transport.
+				time.Sleep(500 * time.Millisecond)
+			})
+		}
+	})
+	p := dialSCSCF(t, r)
+	dv := deviceAt(core.ln.Addr().String(), 1)
+	p.registerFully(t, dv, 600)
+	p.subscribeReg(t, dv.path, core.ln.Addr().String(), "sub-held")
+	if err := recv(t, stopped); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-core.got:
+		if n.Method != "NOTIFY" {
+			t.Errorf("the P-CSCF got a %s", n.Method)
+		}
+	default:
+		t.Error("the stop ended before the SUBSCRIBE's first NOTIFY went")
 	}
 }

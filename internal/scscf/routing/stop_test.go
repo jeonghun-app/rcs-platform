@@ -21,7 +21,7 @@ func TestAStopThatRunsOutGivesUpOnTheThirdPartyREGISTERs(t *testing.T) {
 	e := newEnv(t)
 	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionTerminated))
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 4)}
-	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 1 })
+	rt := e.router(nil, withSender(s), holdingLong, func(c *Config) { c.MaxThirdParty = 1 })
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
 	recv(t, s.inside)
 	rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
@@ -139,5 +139,44 @@ func TestWaitForSaysWhetherWhatAStopGaveUpOnHasReturned(t *testing.T) {
 	}
 	if got := e.metrics.get("routing.third_party.dropped_at_stop"); got != 1 {
 		t.Errorf("%d dropped at the stop, want the held one", got)
+	}
+}
+
+// TestAStopDoesNotCountAnEvictedRegistrationAgain (#446 code review): a
+// refresh an end evicted, still waiting for its turn when the stop gives
+// up, is neither counted as dropped at the stop nor released twice; the
+// others are, and the server's queue ends empty.
+func TestAStopDoesNotCountAnEvictedRegistrationAgain(t *testing.T) {
+	e := newEnv(t)
+	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), holdingLong, func(c *Config) { c.MaxThirdParty = 1 })
+	rt.Registered(bg, otherSet(t, e, 0))
+	recv(t, s.inside)
+	for n := 1; n < queuedPerServer; n++ {
+		rt.Registered(bg, otherSet(t, e, n))
+	}
+	for n := 100; n <= 101; n++ {
+		r := otherSet(t, e, n)
+		r.Type, r.Expires = ifc.DeRegistration, 0
+		rt.Registered(bg, r)
+	}
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	if rt.StopBy(ctx) {
+		t.Fatal("StopBy says it waited for all, with a REGISTER held at the server")
+	}
+	rt.WaitFor(bg)
+	// The one at the server, two refreshes and the two ends; user001's
+	// refresh was evicted.
+	if got := e.metrics.get("routing.third_party.dropped_at_stop"); got != 5 {
+		t.Errorf("%d dropped at the stop, want 5", got)
+	}
+	if got := e.metrics.get("routing.third_party.evicted"); got != 1 {
+		t.Errorf("%d evicted, want 1", got)
+	}
+	rt.tp.mu.Lock()
+	defer rt.tp.mu.Unlock()
+	if q := rt.tp.servers[rcsAS]; q.queued != 0 || len(q.keys) != 0 || len(q.sets) != 0 || len(q.waiting) != 0 {
+		t.Errorf("after the stop: %d queued, %d keys, %d sets, %d waiting", q.queued, len(q.keys), len(q.sets), len(q.waiting))
 	}
 }

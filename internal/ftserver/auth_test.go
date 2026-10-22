@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -199,7 +200,7 @@ func TestCredentialLookupsPerTaskAreBounded(t *testing.T) {
 
 func TestChallengeWithoutRandomnessIsAnInternalError(t *testing.T) {
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: realm, NonceKey: make([]byte, 32), NonceCounts: digest.NewMemoryNonceCounts(nil),
+		Realm: realm, NonceKey: secretkey.NewKey(make([]byte, 32)), NonceCounts: digest.NewMemoryNonceCounts(nil),
 		Random: errReader{io.ErrUnexpectedEOF},
 	})
 	if err != nil {

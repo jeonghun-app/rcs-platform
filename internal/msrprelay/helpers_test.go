@@ -269,6 +269,9 @@ type rig struct {
 
 type rigOption func(*relayOptions)
 
+// listenerWrap wraps the listener each relay task serves.
+type listenerWrap func(net.Listener) net.Listener
+
 // corePorts are ports the rig allows toward the core besides the fake
 // rcs-as's own (RELAY_CORE_PORTS).
 type extraCorePorts []uint16
@@ -305,7 +308,7 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 			stTimeout = time.Duration(opt)
 			// A bind makes two store calls, each bounded by stTimeout.
 			r.openWait = max(r.openWait, 2*stTimeout)
-		case rigOption, func(*relayOptions):
+		case rigOption, func(*relayOptions), listenerWrap:
 		default:
 			t.Fatalf("unknown rig option %T", opt)
 		}
@@ -340,7 +343,13 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 		if err != nil {
 			t.Fatal(err)
 		}
-		go func() { _ = relay.Serve(ln) }()
+		var served net.Listener = ln
+		for _, opt := range opts {
+			if wrap, ok := opt.(listenerWrap); ok {
+				served = wrap(ln)
+			}
+		}
+		go func() { _ = relay.Serve(served) }()
 		t.Cleanup(relay.Close)
 		r.relays = append(r.relays, relay)
 		r.addrs = append(r.addrs, ln.Addr().String())

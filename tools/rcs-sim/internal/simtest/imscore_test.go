@@ -1,11 +1,13 @@
 package simtest_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -269,6 +271,216 @@ func TestACancelledInviteWhoseCalledPartysFlowGoesIsAnswered487(t *testing.T) {
 	}
 }
 
+// cancelFor is the CANCEL of invite as sent (RFC 3261 §9.1): its top Via,
+// Route, From, To, Call-ID and CSeq number.
+func cancelFor(t *testing.T, invite *sip.Request) *sip.Request {
+	t.Helper()
+	vias, err := invite.Header.Elements("Via")
+	if err != nil || len(vias) == 0 {
+		t.Fatalf("an INVITE without a Via: %v", err)
+	}
+	cseq, err := invite.Header.CSeq()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &sip.Request{Method: "CANCEL", URI: invite.URI}
+	for _, f := range [][2]string{{"Via", vias[0]}, {"Max-Forwards", "70"}, {"From", invite.Header.Get("From")},
+		{"To", invite.Header.Get("To")}, {"Call-ID", invite.Header.Get("Call-ID")},
+		{"CSeq", sip.CSeq{Seq: cseq.Seq, Method: "CANCEL"}.String()}} {
+		if err := c.Header.Add(f[0], f[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, r := range invite.Header.Values("Route") {
+		if err := c.Header.Add("Route", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return c
+}
+
+// answer answers tx with code, with contact as its Contact if given.
+func answer(t *testing.T, tx *transaction.ServerTransaction, code int, contact string) {
+	res, err := sip.NewResponse(tx.Request(), code, "", "b-tag")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if contact != "" {
+		_ = res.Header.Set("Contact", contact)
+	}
+	_ = tx.Respond(res)
+}
+
+func TestACancelOfAnAnsweredInviteIsAnswered200(t *testing.T) {
+	// QA of #425: a CANCEL that matches an INVITE transaction still live,
+	// here one in Accepted after its 200 (RFC 6026), gets 200 (RFC 3261
+	// §9.2), as from the platform's proxy; one that matches no INVITE gets
+	// 481.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	var b *sipua.UA
+	b = registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(tx *transaction.ServerTransaction) {
+			switch tx.Request().Method {
+			case "INVITE":
+				answer(t, tx, 200, "<"+b.ContactURI().String()+">")
+			case "ACK":
+			default:
+				answer(t, tx, 200, "")
+			}
+		})
+	bURI, _ := sip.ParseURI(impuB)
+	req, err := a.NewInvite(bURI, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, res, err := a.Invite(ctx, req, nil); err != nil || d == nil {
+		t.Fatalf("INVITE = %v, %v; want B's 200", res, err)
+	}
+	if res, err := a.Send(ctx, cancelFor(t, req)); err != nil || res.StatusCode != 200 {
+		t.Fatalf("CANCEL of an answered INVITE whose transaction is live = %v, %v; want 200", res, err)
+	}
+	stray := cancelFor(t, req)
+	_ = stray.Header.Set("Via", "SIP/2.0/TCP a.invalid;branch=z9hG4bK-matches-nothing")
+	if res, err := a.Send(ctx, stray); err != nil || res.StatusCode != 481 {
+		t.Fatalf("CANCEL matching no INVITE = %v, %v; want 481", res, err)
+	}
+}
+
+func TestACancelTheCalleeIgnoresIsAnswered487(t *testing.T) {
+	// QA of #425: B rings, and rings again for the CANCEL, which it ignores.
+	// The core ends the INVITE 64*T1 after it sent the CANCEL, as the
+	// platform's proxy does, and answers 487 (RFC 3261 §9.1). The core's T1
+	// is 10 ms, so 640 ms; the originator's clock runs eight times fast, so
+	// that its own 64*T1 after its CANCEL, which would end it otherwise, is
+	// 4 s. The CANCEL comes on the core's own 100, and the INVITE goes only
+	// once the core has taken it, so that it is cancelled before the core's
+	// Timer B could end it, however late B's ring comes.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	core.Forwarding = func(req *sip.Request) {
+		if req.Method == "INVITE" {
+			<-hold
+		}
+	}
+	core.CancelTaken = release
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	u, _ := sip.ParseURI(impuA)
+	creds, err := sipua.DigestCredentials(impiA, []byte("a-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: domain, IMPU: u,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000001", Credentials: creds, Clock: fastClock{8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	if _, err := a.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var invite atomic.Pointer[transaction.ServerTransaction]
+	registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(tx *transaction.ServerTransaction) {
+			switch tx.Request().Method {
+			case "INVITE":
+				invite.Store(tx)
+				answer(t, tx, 180, "")
+			case "CANCEL":
+				// It rings again instead: a provisional does not stop
+				// the core's 64*T1, only a final answer does.
+				if inv := invite.Load(); inv != nil {
+					answer(t, inv, 180, "")
+				}
+			}
+			// The CANCEL is never answered, nor the INVITE after it.
+		})
+	bURI, _ := sip.ParseURI(impuB)
+	req, err := a.NewInvite(bURI, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ictx, stop := context.WithCancel(ctx)
+	defer stop()
+	var once sync.Once
+	var cancelledAt atomic.Int64
+	_, res, err := a.Invite(ictx, req, func(*sip.Response) {
+		once.Do(func() { cancelledAt.Store(time.Now().UnixNano()); stop() })
+	})
+	if res == nil || res.StatusCode != 487 {
+		t.Fatalf("INVITE whose CANCEL the callee ignores = %v, %v; want the core's 487", res, err)
+	}
+	// QA of #472: the core waited its 64*T1, which starts only after A
+	// cancelled, so this lower bound holds however slow the host. An end
+	// at once, or after T1, would drop a 200 that crossed the CANCEL.
+	if took := time.Since(time.Unix(0, cancelledAt.Load())); took < 64*10*time.Millisecond {
+		t.Fatalf("487 came %v after the CANCEL, before the core's 64*T1", took)
+	}
+}
+
+func TestACancelWaitsForTheCalleesProvisionalAnswer(t *testing.T) {
+	// QA of #425: the core passes a CANCEL on only once the callee has
+	// answered the INVITE provisionally (RFC 3261 §9.1), as the platform's
+	// proxy does. B is cut off, so it answers nothing; the core sends it no
+	// CANCEL, and the INVITE, cancelled, ends at its Timer B with 487. The
+	// core's T1 is 10 ms, so Timer B is 640 ms; the INVITE's forward waits
+	// until the core has taken the CANCEL, so that Timer B cannot end it
+	// before it is cancelled, however late the CANCEL comes.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	core.Forwarding = func(req *sip.Request) {
+		if req.Method == "INVITE" {
+			<-hold
+		}
+	}
+	core.CancelTaken = release
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	hop, cutOff, dropped := oneWayHop(t, core.Addr)
+	bURI, _ := sip.ParseURI(impuB)
+	creds, err := sipua.DigestCredentials(impiB, []byte("b-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: hop, Domain: domain, IMPU: bURI,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000002", Credentials: creds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if _, err := b.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cutOff()
+	req, err := a.NewInvite(bURI, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ictx, stop := context.WithCancel(ctx)
+	defer stop()
+	var once sync.Once
+	_, res, err := a.Invite(ictx, req, func(*sip.Response) { once.Do(stop) })
+	if res == nil || res.StatusCode != 487 {
+		t.Fatalf("cancelled INVITE the callee never got = %v, %v; want the core's 487 at its Timer B", res, err)
+	}
+	got := dropped()
+	if !strings.Contains(got, "INVITE sip:") {
+		t.Fatalf("the core sent B no INVITE: %q", got)
+	}
+	if strings.Contains(got, "CANCEL sip:") {
+		t.Fatal("the core sent B a CANCEL before any provisional answer")
+	}
+}
+
 func TestARequestTheCoreCannotSendOnIsAnswered500(t *testing.T) {
 	// QA of #425: a request the core cannot pass on for any reason but a
 	// gone flow gets 500, as the platform answers a branch that failed so
@@ -307,7 +519,7 @@ func TestAnInviteTheCalledPartyNeverGetsIsAnswered408(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
-	hop, cutOff := oneWayHop(t, core.Addr)
+	hop, cutOff, _ := oneWayHop(t, core.Addr)
 	bURI, _ := sip.ParseURI(impuB)
 	creds, err := sipua.DigestCredentials(impiB, []byte("b-password"))
 	if err != nil {
@@ -340,9 +552,12 @@ func TestAnInviteTheCalledPartyNeverGetsIsAnswered408(t *testing.T) {
 }
 
 // oneWayHop relays one TCP connection to target and back; once cutOff is
-// called it drops what target sends instead of passing it on.
-func oneWayHop(t *testing.T, target netip.AddrPort) (addr netip.AddrPort, cutOff func()) {
+// called it drops what target sends instead of passing it on, and dropped
+// is what it dropped.
+func oneWayHop(t *testing.T, target netip.AddrPort) (addr netip.AddrPort, cutOff func(), dropped func() string) {
 	t.Helper()
+	var dmu sync.Mutex
+	var drop bytes.Buffer
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -379,6 +594,11 @@ func oneWayHop(t *testing.T, target netip.AddrPort) (addr netip.AddrPort, cutOff
 		buf := make([]byte, 4096)
 		for {
 			n, err := out.Read(buf)
+			if n > 0 && cut.Load() {
+				dmu.Lock()
+				drop.Write(buf[:n])
+				dmu.Unlock()
+			}
 			if n > 0 && !cut.Load() {
 				if _, err := in.Write(buf[:n]); err != nil {
 					return
@@ -389,7 +609,11 @@ func oneWayHop(t *testing.T, target netip.AddrPort) (addr netip.AddrPort, cutOff
 			}
 		}
 	}()
-	return netip.MustParseAddrPort(l.Addr().String()), func() { cut.Store(true) }
+	return netip.MustParseAddrPort(l.Addr().String()), func() { cut.Store(true) }, func() string {
+		dmu.Lock()
+		defer dmu.Unlock()
+		return drop.String()
+	}
 }
 
 func TestAnExpiredBindingEndsItsRegEventSubscription(t *testing.T) {

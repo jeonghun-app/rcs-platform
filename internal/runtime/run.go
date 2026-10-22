@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -376,8 +377,11 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 	})
 	log = rt.Logger
 	// Libraries that log through slog's or log's default logger end up in the
-	// same JSON stream instead of as plain text on stderr.
+	// same JSON stream instead of as plain text on stderr. What goes through
+	// log's, such as an http.Server's lines without an ErrorLog, has the IP
+	// addresses in it truncated, as HTTPErrorLog's lines have (#36).
 	slog.SetDefault(log)
+	stdlog.SetOutput(HTTPErrorLog(log).Writer())
 
 	ln, err := p.Listen("tcp", sh.admin.listen)
 	if err != nil {
@@ -391,7 +395,7 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    8 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		ErrorLog:          HTTPErrorLog(log),
 	}
 	adminDone := make(chan error, 1)
 	go func() { adminDone <- srv.Serve(ln) }()

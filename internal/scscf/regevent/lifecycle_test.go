@@ -1894,3 +1894,77 @@ func TestWaitForGivesUpAtItsDeadline(t *testing.T) {
 		t.Error("WaitFor gave up without a deadline")
 	}
 }
+
+// #277: a re-registration that only refreshes the set's bindings still
+// sends every subscription a full NOTIFY (TS 24.229 §5.4.2.1.2), counted in
+// regevent.notify_refresh so that their rate can be measured. A change of
+// the bindings, the subscription's first NOTIFY and a set's end are not
+// counted there.
+func TestARefreshOnlyReRegistrationsNotifiesAreCounted(t *testing.T) {
+	e := newEnv(t)
+	before := e.registered(binding(1, time.Hour))
+	m := &counts{}
+	n := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
+	e.subscribed(n)
+	if got := m.get("regevent.notify_refresh"); got != 0 {
+		t.Fatalf("the first NOTIFY counted %d", got)
+	}
+	sent := len(e.send.notifies())
+	refreshed := before.Clone()
+	refreshed.Contacts[0].Expires = refreshed.Contacts[0].Expires.Add(time.Hour)
+	refreshed.Contacts[0].CSeq++
+	refreshed = e.saved(refreshed)
+	n.Changed(bg, before, refreshed, Registered)
+	n.Wait()
+	if got := len(e.send.notifies()) - sent; got != 1 || m.get("regevent.notify_refresh") != 1 {
+		t.Fatalf("%d NOTIFYs for the refresh, %d counted", got, m.get("regevent.notify_refresh"))
+	}
+	doc, _, _ := info(t, e.send.notifies()[len(e.send.notifies())-1])
+	if doc.State != reginfo.Full {
+		t.Errorf("the refresh's NOTIFY is %s, want full", doc.State)
+	}
+	added := refreshed.Clone()
+	added.Contacts = append(added.Contacts, binding(2, time.Hour))
+	added = e.saved(added)
+	n.Changed(bg, refreshed, added, Registered)
+	n.Wait()
+	moved := added.Clone()
+	moved.Contacts[1].Path = []string{"<sip:other@pcscf." + realm + ";lr>"}
+	n.Changed(bg, added, e.saved(moved), Registered)
+	n.Wait()
+	if got := m.get("regevent.notify_refresh"); got != 1 {
+		t.Errorf("changes of the bindings counted: %d", got)
+	}
+}
+
+func TestRefreshOnlyTellsARefreshFromAChange(t *testing.T) {
+	before := &state.Registration{Key: set1, Incarnation: 7, Contacts: []state.Contact{binding(1, time.Hour)},
+		Identities: []state.SetIdentity{{IMPU: impu1}, {IMPU: tel1}}}
+	with := func(f func(r *state.Registration)) *state.Registration {
+		r := before.Clone()
+		f(r)
+		return r
+	}
+	for name, c := range map[string]struct {
+		after *state.Registration
+		cause Cause
+		want  bool
+	}{
+		"expiry and CSeq": {with(func(r *state.Registration) {
+			r.Contacts[0].Expires = r.Contacts[0].Expires.Add(time.Minute)
+			r.Contacts[0].CSeq++
+		}), Registered, true},
+		"nothing":          {with(func(*state.Registration) {}), Registered, true},
+		"a shorter expiry": {with(func(r *state.Registration) { r.Contacts[0].Expires = r.Contacts[0].Expires.Add(-time.Minute) }), Registered, true},
+		"another cause":    {with(func(*state.Registration) {}), Unregistered, false},
+		"a binding added":  {with(func(r *state.Registration) { r.Contacts = append(r.Contacts, binding(2, time.Hour)) }), Registered, false},
+		"another binding":  {with(func(r *state.Registration) { r.Contacts[0] = binding(2, time.Hour) }), Registered, false},
+		"its Path":         {with(func(r *state.Registration) { r.Contacts[0].Path = []string{"<sip:x@pcscf." + realm + ";lr>"} }), Registered, false},
+		"a barring":        {with(func(r *state.Registration) { r.Identities[1].Barred = true }), Registered, false},
+		"another record":   {with(func(r *state.Registration) { r.Incarnation++ }), Registered, false},
+	} {
+		if got := refreshOnly(before, c.after, c.cause); got != c.want {
+			t.Errorf("%s: refreshOnly = %v, want %v", name, got, c.want)
+		}
+	}
+}

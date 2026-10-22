@@ -13,6 +13,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -46,7 +47,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 		}
 	}
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: cfg.Realm, NonceKey: nonceKey, NonceCounts: stores.nonces,
+		Realm: cfg.Realm, NonceKey: secretkey.NewKey(nonceKey), NonceCounts: stores.nonces,
 		// The rcsjta reference client signs only the path of get_upload_info
 		// and get_download_info (docs/ft-server.md, Authentication).
 		HTTPPathOnlyURI: true,
@@ -101,7 +102,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
-		ErrorLog:          slog.NewLogLogger(rt.Logger.Handler(), slog.LevelWarn),
+		ErrorLog:          runtime.HTTPErrorLog(rt.Logger),
 	}
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()

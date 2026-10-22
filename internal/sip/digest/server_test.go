@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -39,7 +40,7 @@ func newHarness(t testing.TB) *harness {
 	counts := NewMemoryNonceCounts(clock.now)
 	s, err := NewServer(ServerConfig{
 		Realm:       testRealm,
-		NonceKey:    testKey,
+		NonceKey:    secret.NewKey(testKey),
 		NonceCounts: counts,
 		Now:         clock.now,
 		Random:      rand.NewChaCha8([32]byte{1}),
@@ -264,7 +265,7 @@ func TestNonceNotIssuedByThisServerIsInvalid(t *testing.T) {
 	other.server.key = seal(&otherKey)
 	foreign := other.challenge(t, MD5)
 
-	otherRealm, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: testKey, NonceCounts: h.counts, Now: h.clock.now})
+	otherRealm, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: secret.NewKey(testKey), NonceCounts: h.counts, Now: h.clock.now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,12 +467,12 @@ func TestChallengeFailsWhenRandomnessFails(t *testing.T) {
 
 func TestServerConfigIsValidated(t *testing.T) {
 	counts := NewMemoryNonceCounts(nil)
-	good := ServerConfig{Realm: testRealm, NonceKey: testKey, NonceCounts: counts}
+	good := ServerConfig{Realm: testRealm, NonceKey: secret.NewKey(testKey), NonceCounts: counts}
 	cases := map[string]func(*ServerConfig){
 		"empty realm":       func(c *ServerConfig) { c.Realm = "" },
 		"realm with CR LF":  func(c *ServerConfig) { c.Realm = "a\r\nb" },
 		"long realm":        func(c *ServerConfig) { c.Realm = strings.Repeat("r", maxRealmLength+1) },
-		"short key":         func(c *ServerConfig) { c.NonceKey = testKey[:MinNonceKeySize-1] },
+		"short key":         func(c *ServerConfig) { c.NonceKey = secret.NewKey(testKey[:MinNonceKeySize-1]) },
 		"negative lifetime": func(c *ServerConfig) { c.NonceLifetime = -time.Second },
 		"no store":          func(c *ServerConfig) { c.NonceCounts = nil },
 	}
@@ -493,7 +494,7 @@ func TestServerConfigIsValidated(t *testing.T) {
 
 func TestServerCopiesTheNonceKey(t *testing.T) {
 	key := bytes.Clone(testKey)
-	s, err := NewServer(ServerConfig{Realm: testRealm, NonceKey: key, NonceCounts: NewMemoryNonceCounts(nil)})
+	s, err := NewServer(ServerConfig{Realm: testRealm, NonceKey: secret.NewKey(key), NonceCounts: NewMemoryNonceCounts(nil)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,7 +620,7 @@ func TestOpaqueIsBoundToAlgorithmAndRealm(t *testing.T) {
 
 	// A default AKA nonce, which has no tag, issued for another realm that
 	// shares the key, is refused although the nonce itself decodes.
-	other, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: testKey, NonceCounts: h.counts, Now: h.clock.now})
+	other, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: secret.NewKey(testKey), NonceCounts: h.counts, Now: h.clock.now})
 	if err != nil {
 		t.Fatal(err)
 	}

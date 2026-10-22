@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
@@ -55,13 +56,13 @@ func TestARequestInsideADialogGoesOnlyToAHopItsRouteSigned(t *testing.T) {
 	e := newEnv(t)
 	rt := e.router(nil, func(c *Config) { c.Self = append(c.Self, mustURI("sip:10.0.131.9")) })
 	old := e.router(nil, func(c *Config) {
-		c.DialogKeys = []DialogKey{{ID: "k1", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
+		c.DialogKeys = []DialogKey{{ID: "k1", Key: secret.NewKey(bytes.Repeat([]byte{1}, MinDialogKeyBytes))}}
 	})
 	rotated := e.router(nil, func(c *Config) {
-		c.DialogKeys = []DialogKey{{ID: "k3", Key: bytes.Repeat([]byte{3}, MinDialogKeyBytes)}, {ID: "k1", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
+		c.DialogKeys = []DialogKey{{ID: "k3", Key: secret.NewKey(bytes.Repeat([]byte{3}, MinDialogKeyBytes))}, {ID: "k1", Key: secret.NewKey(bytes.Repeat([]byte{1}, MinDialogKeyBytes))}}
 	})
 	other := e.router(nil, func(c *Config) {
-		c.DialogKeys = []DialogKey{{ID: "k2", Key: bytes.Repeat([]byte{9}, MinDialogKeyBytes)}}
+		c.DialogKeys = []DialogKey{{ID: "k2", Key: secret.NewKey(bytes.Repeat([]byte{9}, MinDialogKeyBytes))}}
 	})
 	ue := "sip:ue@192.0.2.40:5060;transport=tcp"
 	for name, c := range map[string]struct {
@@ -206,7 +207,7 @@ func TestNewRefusesARecordRouteOverAnotherTransport(t *testing.T) {
 // validConfig is a config New takes, changed by tweak.
 func validConfig(e *env, tweak func(*Config)) Config {
 	rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
-	c := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{mustURI("sip:scscf.rcs.local")}, DialogKeys: []DialogKey{{ID: "k2", Key: dialogKey}},
+	c := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{mustURI("sip:scscf.rcs.local")}, DialogKeys: []DialogKey{{ID: "k2", Key: secret.NewKey(dialogKey)}},
 		Registrar: e.hss, ICSCF: mustURI("sip:icscf.rcs.local;lr"), HomeDomain: realm}
 	tweak(&c)
 	return c
@@ -215,13 +216,15 @@ func validConfig(e *env, tweak func(*Config)) Config {
 // TestNewRefusesWhatWouldLetAnyHopThrough (#322): an entry without a host
 // would be taken for a URI without one, and a dialog key must be one.
 func TestNewRefusesWhatWouldLetAnyHopThrough(t *testing.T) {
-	key := DialogKey{ID: "k2", Key: dialogKey}
+	key := DialogKey{ID: "k2", Key: secret.NewKey(dialogKey)}
 	for name, tweak := range map[string]func(*Config){
-		"no dialog key":            func(c *Config) { c.DialogKeys = nil },
-		"a short key":              func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k2", Key: dialogKey[:MinDialogKeyBytes-1]}} },
-		"a key without an ID":      func(c *Config) { c.DialogKeys = []DialogKey{{Key: dialogKey}} },
-		"a key ID with a dot":      func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k.2", Key: dialogKey}} },
-		"a long key ID":            func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k23456789", Key: dialogKey}} },
+		"no dialog key": func(c *Config) { c.DialogKeys = nil },
+		"a short key": func(c *Config) {
+			c.DialogKeys = []DialogKey{{ID: "k2", Key: secret.NewKey(dialogKey[:MinDialogKeyBytes-1])}}
+		},
+		"a key without an ID":      func(c *Config) { c.DialogKeys = []DialogKey{{Key: secret.NewKey(dialogKey)}} },
+		"a key ID with a dot":      func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k.2", Key: secret.NewKey(dialogKey)}} },
+		"a long key ID":            func(c *Config) { c.DialogKeys = []DialogKey{{ID: "k23456789", Key: secret.NewKey(dialogKey)}} },
 		"two keys of one ID":       func(c *Config) { c.DialogKeys = []DialogKey{key, key} },
 		"a server without a port":  func(c *Config) { c.ApplicationServers = []sip.URI{mustURI("sip:rcs-as.rcs.local;transport=tcp")} },
 		"a server without a host":  func(c *Config) { c.ApplicationServers = []sip.URI{{Scheme: "sip", Port: 5060}} },
@@ -240,9 +243,10 @@ func TestNewRefusesWhatWouldLetAnyHopThrough(t *testing.T) {
 // leaves the router signing as before.
 func TestTheRouterKeepsItsOwnCopyOfTheKeys(t *testing.T) {
 	e := newEnv(t)
-	keys := []DialogKey{{ID: "k2", Key: bytes.Clone(dialogKey)}}
+	b := bytes.Clone(dialogKey)
+	keys := []DialogKey{{ID: "k2", Key: secret.NewKey(b)}}
 	rt := e.router(nil, func(c *Config) { c.DialogKeys = keys })
-	clear(keys[0].Key)
+	clear(b)
 	keys[0].ID = "x"
 	if d := e.router(nil).InDialog(bg, inDialog(t, asTask, "", signedFor(rt, asTask))); d.Status != 0 {
 		t.Errorf("status %d", d.Status)

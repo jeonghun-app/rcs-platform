@@ -62,6 +62,19 @@ func tcpListen(t *testing.T) net.Listener {
 	return l
 }
 
+// rigListen is tcpListen with a real link's segment size (rigListenConfig),
+// for the relay rig's connections, which carry traffic both ways (#140).
+func rigListen(t *testing.T) net.Listener {
+	t.Helper()
+	lc := rigListenConfig()
+	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
+}
+
 // tcpEndpoints joins alice (active) and bob (passive) over loopback TCP.
 func tcpEndpoints(t *testing.T, cfg Config, aliceH, bobH Handler) (alice, bob *Session, ac, pc *Conn) {
 	t.Helper()
@@ -308,7 +321,7 @@ func (r *pairBinder) Bind(_ *Conn, to URI) (*Session, error) {
 
 func newRelayRigTCP(t *testing.T, relayClientCfg, asCfg Config, opts ...func(*relayRigTCP)) *relayRigTCP {
 	t.Helper()
-	asL, relayL := tcpListen(t), tcpListen(t)
+	asL, relayL := rigListen(t), rigListen(t)
 	rig := &relayRigTCP{relayAddr: relayL.Addr().String(), asReg: &Registry{}, relayConns: make(chan *Conn, 16), kernelBase: kernelCounters()}
 	for _, o := range opts {
 		o(rig)
@@ -400,11 +413,11 @@ func (rig *relayRigTCP) dialClient(t *testing.T, local, relayPub URI, h Handler)
 
 // openClient connects a client and binds its session. A bind normally takes
 // milliseconds, under a starved CPU well under a second; one that waited
-// out the 30 s transaction timeout in CI could not be reproduced (#140), so
-// a failed bind returns a report instead of the session: how far the bind
-// got, the connections' queues and the events they reported, and every
-// goroutine, taken while the bind still waited (after bindWatchdog) and
-// again once it failed. The relay's own wait ends on a timer as long as
+// out the 30 s transaction timeout in CI stood behind a connection loopback
+// had stalled (#140, rigListen). A failed bind returns a report instead of
+// the session: how far the bind got, the connections' queues and the
+// events they reported, and every goroutine, taken while the bind still
+// waited (after bindWatchdog) and again once it failed. The relay's own wait ends on a timer as long as
 // the client's, so by then it may be gone (QA of #165).
 func (rig *relayRigTCP) openClient(t *testing.T, local, relayPub URI, h Handler) (*Session, *Conn, string) {
 	t.Helper()

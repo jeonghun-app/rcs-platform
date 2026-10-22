@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	mathrand "math/rand/v2"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -51,6 +52,9 @@ type job struct {
 	final  bool
 	reason string
 	bare   bool
+	// refresh says the change only refreshed the set's bindings
+	// (refreshOnly), which regevent.notify_refresh counts the NOTIFYs of.
+	refresh bool
 }
 
 // Changed notifies the subscribers of a set that before became after, nil
@@ -95,7 +99,7 @@ func (n *Notifier) fanOut(ctx context.Context, before, after *state.Registration
 			// A subscription to another set, or to an earlier record of
 			// this one, is only checked: it ends if it has lapsed.
 			if sub.Set == after.Key && sub.Incarnation == after.Incarnation {
-				j = job{before: before, cause: cause, ends: ends}
+				j = job{before: before, cause: cause, ends: ends, refresh: refreshOnly(before, after, cause)}
 			}
 			n.enqueueNotify(ctx, sub, j, nil)
 		}
@@ -198,6 +202,31 @@ func endsOf(before, after *state.Registration, cause Cause, now time.Time) map[s
 		}
 	}
 	return ends
+}
+
+// refreshOnly reports a change of before to after by a REGISTER that only
+// refreshed the set's bindings: the same bindings, each with only its expiry
+// or CSeq changed, and the same identities. TS 24.229 §5.4.2.1.2 asks a full
+// NOTIFY of it all the same, its contacts "refreshed" or "shortened" (4) e)
+// III), on every dialog: the cost of re-registrations that docs/scscf-state.md
+// estimates, which regevent.notify_refresh measures (#277).
+func refreshOnly(before, after *state.Registration, cause Cause) bool {
+	if cause != Registered || before == nil || after == nil || before.Key != after.Key ||
+		before.Incarnation != after.Incarnation || len(before.Contacts) != len(after.Contacts) ||
+		!reflect.DeepEqual(before.Identities, after.Identities) {
+		return false
+	}
+	for _, c := range after.Contacts {
+		old, ok := bindingIn(before.Contacts, c)
+		if !ok {
+			return false
+		}
+		old.Expires, old.CSeq = c.Expires, c.CSeq
+		if !reflect.DeepEqual(old, c) {
+			return false
+		}
+	}
+	return true
 }
 
 // identitiesBoth are the identities of before and after, each once.
@@ -386,6 +415,9 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 			n.end(ctx, sub)
 		}
 		return nil
+	}
+	if j.refresh && !j.final {
+		n.count("regevent.notify_refresh")
 	}
 	return func() {
 		switch o := n.deliver(ctx, req); {
