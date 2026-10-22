@@ -19,6 +19,7 @@ import (
 	ftstore "github.com/jeonghun-app/rcs-platform/internal/ftserver/awsstore"
 	hssstore "github.com/jeonghun-app/rcs-platform/internal/hss/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/dynamostore"
+	rcsasstore "github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	scscfstore "github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
 	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 )
@@ -38,6 +39,7 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 			RegistrationsTable: "registrations-" + suffix, ChallengesTable: "challenges-" + suffix, SubscriptionsTable: "reg-subs-" + suffix,
 		},
 		ftTable: "files-" + suffix, ftBucket: "ft-" + suffix, relayTable: "bindings-" + suffix,
+		rcsasMessages: "messages-" + suffix, rcsasGroups: "groupchats-" + suffix,
 	}
 	ctx := t.Context()
 	var first, second bytes.Buffer
@@ -47,7 +49,7 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 	if err := createTables(ctx, c, &second); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	if strings.Count(first.String(), "created") != 8 || strings.Count(second.String(), "exists") != 8 {
+	if strings.Count(first.String(), "created") != 10 || strings.Count(second.String(), "exists") != 10 {
 		t.Fatalf("first run:\n%ssecond run:\n%s", first.String(), second.String())
 	}
 
@@ -81,6 +83,12 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("the msrp-relay store does not accept its table: %v", err)
+	}
+	if err := rcsasstore.NewWithClient(c.rcsasMessages, ddb).Ready(ctx); err != nil {
+		t.Fatalf("the rcs-as store does not accept its messages table: %v", err)
+	}
+	if err := rcsasstore.NewGroupsWithClient(c.rcsasGroups, ddb).Ready(ctx); err != nil {
+		t.Fatalf("the rcs-as store does not accept its groupchats table: %v", err)
 	}
 	for _, name := range []string{c.ftTable, c.relayTable} {
 		ttl, err := ddb.DescribeTimeToLive(context.Background(), &dynamodb.DescribeTimeToLiveInput{TableName: aws.String(name)})

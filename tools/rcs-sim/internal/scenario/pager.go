@@ -294,11 +294,11 @@ func pagerMessage(r *run) error {
 		return err
 	}
 	return r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
-		// #135 AC 5: B is not registered. Today the platform answers 480
-		// (TS 24.229 §5.4.3.3): pager mode has no store-and-forward yet,
-		// which comes with rcs-as's SIP side. A network that stores the
-		// message instead (200 or 202) passes only if it delivers it once
-		// B registers again; one that accepts it and drops it fails.
+		// #135 AC 5: B is not registered. A network without
+		// store-and-forward, as the unit tests' stand-in core, answers 480
+		// (TS 24.229 §5.4.3.3). One that stores the message (200 or 202),
+		// as rcs-as does, passes only if it delivers it once B registers
+		// again; one that accepts it and drops it fails.
 		if _, err := b.ua.Unregister(ctx); err != nil {
 			return nil, fmt.Errorf("peer: %w", sipError(err))
 		}
