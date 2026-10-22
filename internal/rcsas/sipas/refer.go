@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -17,6 +18,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/resourcelists"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
 // refer serves a participant's REFER in its session with a group (RFC 4579
@@ -171,23 +173,43 @@ type referWatch struct {
 	// ended and is not to be filed. Both are under the Server's mu.
 	key  string
 	gone bool
+	// refused is set by an answer to one of its NOTIFYs that ends the
+	// subscription (RFC 6665 §4.2.2), or its timeout: from then on it sends
+	// none, its outcome either (#429).
+	refused atomic.Bool
 }
 
-// send sends a NOTIFY of code as a sipfrag in the referrer's session.
-func (w *referWatch) send(state sip.SubscriptionState, code int) {
+// send sends a NOTIFY of code as a sipfrag in the referrer's session,
+// unless the referrer has ended the subscription by its answer to one, and
+// reports whether it did.
+func (w *referWatch) send(state sip.SubscriptionState, code int) bool {
 	ss := w.ss
+	if w.refused.Load() {
+		ss.s.cfg.Metrics.Count("sip.refer.notify_after_refusal", 1)
+		return false
+	}
 	frag := fmt.Sprintf("SIP/2.0 %d %s\r\n", code, sip.DefaultReason(code))
 	ss.mu.Lock()
 	if ss.ended {
 		ss.mu.Unlock()
-		return
+		return false
 	}
 	notify, err := ss.d.Notify(w.event, state, "message/sipfrag", []byte(frag), ss.s.ids)
 	next := ss.d.NextHop()
 	ss.mu.Unlock()
-	if err == nil {
-		ss.s.sendInDialog(notify, next)
+	if err != nil {
+		return false
 	}
+	ss.s.sendInDialogThen(notify, next, func(res *sip.Response, err error) {
+		if !(errors.Is(err, transaction.ErrTimeout) || err == nil && endsSubscription(res.StatusCode)) {
+			return
+		}
+		// The watch stays filed until its outcome or its bound ends it as
+		// usual (finish), which then sends nothing.
+		w.refused.Store(true)
+		ss.s.cfg.Metrics.Count("sip.refer.notify_failed", 1)
+	})
+	return true
 }
 
 // finish ends the subscription, once, with "200 OK" if what the REFER
@@ -209,8 +231,9 @@ func (w *referWatch) finish(ok bool) {
 			timer.Stop()
 		}
 		w.ss.s.unwatchRefer(w)
-		w.ss.s.cfg.Metrics.Count("sip.refer.notified", 1)
-		w.send(terminated("noresource"), code)
+		if w.send(terminated("noresource"), code) {
+			w.ss.s.cfg.Metrics.Count("sip.refer.notified", 1)
+		}
 	})
 }
 
