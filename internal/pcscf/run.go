@@ -48,11 +48,21 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
+	// serverTransactionBytes and contextBytes, when set, replace the
+	// transaction layer's and the proxy's memory bounds cfg gives, so that
+	// a test meets each overload refusal on its own.
+	serverTransactionBytes, contextBytes int64
 	// clock, if set, runs the proxy's transaction timers, a branch's
 	// Target.Timeout among them; nil is the system clock.
 	clock transaction.Clock
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
+	// transportConfig, if set, sees the transport's configuration before
+	// the transport is made.
+	transportConfig func(transport.Config)
+	// proxyConfig, if set, sees the proxy's configuration before the proxy
+	// is made.
+	proxyConfig func(proxy.Config)
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -89,7 +99,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// reason to reach a pcscf that is not ready, and a request that does
 	// arrive is dropped: its sender times out and tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{
+	trCfg := transport.Config{
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
@@ -101,9 +111,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 				px.FlowClosed(id)
 			}
 		},
-		WriteTimeout: d.writeTimeout,
-		Logger:       rt.Logger,
-	}, func(in transport.Inbound) {
+		WriteTimeout:   cmp.Or(d.writeTimeout, cfg.WriteTimeout),
+		MaxQueuedBytes: cfg.MaxQueuedBytes,
+		Logger:         rt.Logger,
+	}
+	if d.transportConfig != nil {
+		d.transportConfig(trCfg)
+	}
+	tr, err := transport.New(trCfg, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
 			px.Receive(in)
@@ -166,16 +181,29 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if router == nil {
 		router = pc
 	}
-	px, err := proxy.New(tr, proxy.Config{
-		Self:      selfURIs(cfg, int(coreAddr.Port())),
-		Router:    router,
-		Resolver:  resolver,
-		Supported: []string{"path", "outbound"},
-		Logger:    rt.Logger,
-		Metrics:   rt.Metrics,
-		// Clock alone: the other settings keep their defaults.
-		Transaction: transaction.Config{Clock: d.clock},
-	})
+	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
+	tcfg.Clock = d.clock
+	if d.serverTransactionBytes != 0 {
+		tcfg.MaxServerTransactionBytes = d.serverTransactionBytes
+	}
+	if d.contextBytes != 0 {
+		maxContextBytes = d.contextBytes
+	}
+	pcfg := proxy.Config{
+		Self:            selfURIs(cfg, int(coreAddr.Port())),
+		Router:          router,
+		Resolver:        resolver,
+		Supported:       []string{"path", "outbound"},
+		Logger:          rt.Logger,
+		Metrics:         rt.Metrics,
+		Transaction:     tcfg,
+		MaxContexts:     maxContexts,
+		MaxContextBytes: maxContextBytes,
+	}
+	if d.proxyConfig != nil {
+		d.proxyConfig(pcfg)
+	}
+	px, err := proxy.New(tr, pcfg)
 	if err != nil {
 		return err
 	}
@@ -215,11 +243,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	var tm transportMetrics
 	var lm layerMetrics
+	var om proxy.OverloadMeter
 	report := func() {
 		ts := tr.Stats()
 		tm.record(rt.Metrics, ts)
 		lm.record(rt.Metrics, ts, px.Layer().Stats())
 		if rt.Metrics != nil {
+			// The one overload counter of #56's alarms (#467).
+			om.Record(rt.Metrics, px)
 			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
 			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
 		}
@@ -355,6 +386,19 @@ func coreListenerConfig(cfg Config) transport.ListenerConfig {
 		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr,
 		AdvertisedHost: hostOf(cfg.CoreHost), MaxConnections: cfg.CoreConnections,
 	}
+}
+
+// proxyLimits are the bounds of pcscf's proxy, as icscf's are: its layer's
+// server transaction caps; as many contexts as server transactions, so that
+// the layer's count, not the proxy's, is the one a burst meets; and the same
+// bytes for the proxy's own memory bound, which it charges differently, so
+// either may refuse first (#482). Zero settings take the defaults.
+func proxyLimits(cfg Config) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
+	tcfg = transaction.Config{
+		MaxServerTransactions:     cfg.MaxServerTransactions,
+		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
+	}
+	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
 }
 
 // checkListenerLimits checks the listeners pcscf opens against the

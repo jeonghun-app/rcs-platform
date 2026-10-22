@@ -630,6 +630,7 @@ the sweep, every 30 s.
 | `ServerTransactionBytes` | gauge | bytes the server transactions hold, against their cap |
 | `ServerTransactionsRejected` | count | requests refused at the server transaction caps (503) |
 | `RefusalAcksAbsorbed` | count | ACKs of those 503s, which go no further |
+| `sip.overloaded` | count | every request refused as overloaded: the transaction layer's refusals above, and the proxy's own at its context and memory bounds. #56's overload alarms read this one (#467) |
 
 The last seven keep the names of the transport's and the transaction
 layer's `Stats` fields, which the alarms and the dashboard of
@@ -671,6 +672,10 @@ start with that value.
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | connections the client listener holds among them, counted from accept; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
 | `PCSCF_CORE_CONNECTIONS` | `256` | connections the core listener holds, kept for it |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
+| `PCSCF_MAX_SERVER_TRANSACTIONS` | `20000` | the requests pcscf holds at once, 1 to 1000000; one past it is answered 503 with Retry-After, and the proxy allows as many in progress (as icscf, #482). A tenth of the default or less is refused |
+| `PCSCF_MAX_SERVER_TRANSACTION_BYTES` | `268435456` (256 MiB) | the memory those requests and their kept responses hold, client-facing ones 80% of it; the proxy's own memory bound is the same. At least 2.5 MiB, room for the largest request a client sends; a tenth of the default or less is refused |
+| `PCSCF_MAX_QUEUED_BYTES` | `268435456` (256 MiB) | the output every send queue holds together (`QueuedBytes`); at it, stalled client connections are closed (`BudgetSheds`). At least 2 MiB; a tenth of the default or less is refused. An alarm set against the default byte budgets must move with them |
+| `PCSCF_WRITE_TIMEOUT` | `10s` | how long writing each 32 KiB of a message may take, on client and core connections alike; past it the connection is closed (a floor of about 20 KiB/s at the default). It is also how long a send waits for room in a full send queue before it fails (`ErrQueueFull`), leaving the connection open. Outside 1s to 1m is refused |
 | `PCSCF_RELAY_URL` | `http://msrp-relay.<RCS_SERVICE_NAMESPACE>:8082` | `msrp-relay`'s control API: `http` or `https` of a private host, without a path |
 | `PCSCF_RELAY_TOKEN` | none | `pcscf`'s bearer token for it, from Secrets Manager in AWS; unset or under 43 characters is refused; without one, MSRP sessions are refused |
 | `PCSCF_RELAY_TIMEOUT` | `2s` | one call to the control API |

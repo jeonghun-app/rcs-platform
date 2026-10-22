@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -88,7 +89,7 @@ func TestChallengesMustMatchTheConfiguredRealm(t *testing.T) {
 	}
 	_ = s
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: realm, NonceKey: []byte(strings.Repeat("r", digest.MinNonceKeySize)), NonceCounts: digest.NewMemoryNonceCounts(nil),
+		Realm: realm, NonceKey: secret.NewKey([]byte(strings.Repeat("r", digest.MinNonceKeySize))), NonceCounts: digest.NewMemoryNonceCounts(nil),
 	})
 	if err != nil {
 		t.Fatal(err)

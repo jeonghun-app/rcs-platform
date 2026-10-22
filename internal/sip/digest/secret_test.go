@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"log/slog"
 	"net/http/httptest"
 	"slices"
@@ -140,7 +141,7 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 	errs = append(errs, err)
 	_, err = ParseCredentials(`Digest username="` + testPass + `"`)
 	errs = append(errs, err)
-	_, err = NewServer(ServerConfig{Realm: testRealm, NonceKey: testKey[:10]})
+	_, err = NewServer(ServerConfig{Realm: testRealm, NonceKey: secret.NewKey(testKey[:10])})
 	errs = append(errs, err)
 
 	r := httptest.NewRequest("GET", "/f", nil)

@@ -45,6 +45,8 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		}
 	}
 	var keys []state.SetKey
+	// unreadable: a private identity's listing had nothing readable.
+	unreadable := false
 	if len(r.PublicIdentities) > 0 {
 		for _, s := range r.PublicIdentities {
 			impu, ok := identity.CanonicalIMPU(s)
@@ -66,7 +68,25 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	} else {
 		for _, impi := range impis {
 			regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
-			if err != nil {
+			switch {
+			case errors.Is(err, state.ErrInvalid):
+				// Items that do not decode, beside the readable sets the
+				// store still returns: those end, rather than stay live
+				// for want of the others, as the HSS does not send the
+				// RTR again (#451). An unreadable item routes nothing
+				// here; during a rolling deploy, a task of an older
+				// version may still read one. A listing with nothing
+				// readable answers UNABLE_TO_COMPLY, as an invalid read
+				// does (#422), once the other private identities' sets
+				// have ended, unless one of those may still end on a
+				// resend (#478 QA).
+				n := unreadableItems(err)
+				g.log.Error("registrar: RTR: unreadable registration items", slog.Int("items", n))
+				g.cfg.Metrics.Count("registrar.rtr_unreadable", int64(n))
+				if len(regs) == 0 {
+					unreadable = true
+				}
+			case err != nil:
 				g.log.Error("registrar: RTR: listing registrations", slog.String("error", err.Error()))
 				return readFailed(err)
 			}
@@ -98,7 +118,24 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		}
 	}
 	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
+	// A read that may pass comes first: the HSS sends a DIAMETER_TOO_BUSY
+	// RTR again, which can end the set it left, and answers the unreadable
+	// listing then (#478 QA).
+	if unreadable && result == resultSuccess {
+		result = resultUnableToComply
+	}
 	return result
+}
+
+// unreadableItems is how many items err, a listing's ErrInvalid, says did
+// not decode: the store joins one error for each, once. Only that join is
+// counted: an item's own error may wrap several, as one with an invalid
+// IMPI does (#478 QA).
+func unreadableItems(err error) int {
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		return len(j.Unwrap())
+	}
+	return 1
 }
 
 // errReadBusy is a store read before an RTR's claim that failed for a reason

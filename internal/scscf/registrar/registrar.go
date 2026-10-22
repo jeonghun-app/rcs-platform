@@ -15,6 +15,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -74,7 +75,7 @@ type Config struct {
 	ServiceRoute sip.URI
 	// NonceKey authenticates Digest nonces; every instance uses the same one
 	// (digest.ServerConfig.NonceKey).
-	NonceKey []byte
+	NonceKey secret.Key
 	// Schemes is the order in which MAR tries the authentication schemes when
 	// the client named none; cxclient.DefaultSchemes when nil.
 	Schemes []string

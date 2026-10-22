@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"io"
 	"strings"
 	"time"
@@ -95,7 +96,7 @@ type ServerConfig struct {
 	Realm string
 	// NonceKey authenticates nonces. Every instance serving the realm must
 	// use the same key (ADR 0005). At least MinNonceKeySize bytes.
-	NonceKey []byte
+	NonceKey secret.Key
 	// NonceLifetime is how long a nonce stays valid; DefaultNonceLifetime
 	// when zero.
 	NonceLifetime time.Duration
@@ -142,14 +143,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	switch {
 	case cfg.Realm == "" || len(cfg.Realm) > maxRealmLength || !representable(cfg.Realm):
 		return nil, errors.New("digest: realm must be 1 to 512 printable bytes")
-	case len(cfg.NonceKey) < MinNonceKeySize:
+	case cfg.NonceKey.Len() < MinNonceKeySize:
 		return nil, fmt.Errorf("digest: nonce key must be at least %d bytes", MinNonceKeySize)
 	case cfg.NonceLifetime < 0:
 		return nil, errors.New("digest: nonce lifetime is negative")
 	case cfg.NonceCounts == nil:
 		return nil, errors.New("digest: a nonce count store is required for replay protection")
 	}
-	key := bytes.Clone(cfg.NonceKey)
+	key := bytes.Clone(cfg.NonceKey.Reveal())
 	s := &Server{
 		realm:    cfg.Realm,
 		key:      seal(&key),

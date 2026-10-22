@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -75,6 +76,8 @@ type IMSCore struct {
 	// invites are the INVITEs the core forwarded and has no final answer
 	// for yet, by their server transaction, for a CANCEL (RFC 3261 §16.10).
 	invites map[*transaction.ServerTransaction]*forwardedInvite
+	// t1 is the core's T1, for the 64*T1 it gives a CANCEL.
+	t1 time.Duration
 	// instances are each IMPU's last registered +sip.instance, and stored
 	// the requests StoreAndForward holds for it, by aorKey.
 	instances map[string]string
@@ -191,7 +194,7 @@ func keyOf(impu string) string {
 func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...time.Duration) *IMSCore {
 	t.Helper()
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: domain, NonceKey: bytes.Repeat([]byte("i"), digest.MinNonceKeySize),
+		Realm: domain, NonceKey: secret.NewKey(bytes.Repeat([]byte("i"), digest.MinNonceKeySize)),
 		NonceCounts: digest.NewMemoryNonceCounts(nil),
 	})
 	if err != nil {
@@ -226,8 +229,9 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 	}
 	c.tr = tr
 	var cfg transaction.Config
+	c.t1 = transaction.DefaultT1
 	if len(t1) > 0 {
-		cfg.T1 = t1[0]
+		cfg.T1, c.t1 = t1[0], t1[0]
 		// The layer answers 500 for a TU that has not answered within
 		// NonInviteFinalTimeout, 128*T1 by default. A non-INVITE routed to
 		// a callee that never answers is left unanswered once the
@@ -335,17 +339,24 @@ func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 // forwardedInvite is an INVITE the core forwarded: the CANCEL for it, the
 // flow it went over, whether the originator has cancelled it, whether the
 // INVITE has gone to the transaction layer, and whether the CANCEL has: it
-// goes only after the INVITE (RFC 3261 §9.1), whichever comes first.
+// goes only after the INVITE (RFC 3261 §9.1), whichever comes first. end is
+// the 64*T1 timer after the CANCEL, and over says the INVITE has its final
+// answer; c.mu guards both.
 type forwardedInvite struct {
-	cancel                *sip.Request
-	flow                  transport.FlowID
-	cancelled, sent, gone bool
+	cancel                      *sip.Request
+	flow                        transport.FlowID
+	tx                          *transaction.ClientTransaction
+	cancelled, sent, rung, gone bool
+	end                         *time.Timer
+	over                        bool
 }
 
 // cancelNow reports whether the CANCEL should go now, and if so marks it
-// gone; c.mu must be held.
+// gone; c.mu must be held. It goes once the INVITE has gone and the callee
+// has answered it provisionally (RFC 3261 §9.1), as the platform's proxy
+// sends it.
 func (f *forwardedInvite) cancelNow() bool {
-	if f.cancelled && f.sent && !f.gone {
+	if f.cancelled && f.sent && f.rung && !f.gone {
 		f.gone = true
 		return true
 	}
@@ -353,9 +364,18 @@ func (f *forwardedInvite) cancelNow() bool {
 }
 
 // sendCancel passes f's CANCEL on, off the calling goroutine, then calls
-// then if it is not nil.
+// then if it is not nil. An INVITE the callee does not end within 64*T1
+// after it is ended by the core, as the platform's proxy ends it, and
+// answered 487 (§9.1). As on the platform, the timer is armed before the
+// CANCEL goes, and a final answer stops it: a 2xx that crossed the CANCEL
+// keeps its transaction for its own 64*T1 (RFC 6026).
 func (c *IMSCore) sendCancel(f *forwardedInvite, then func()) {
 	go func() {
+		c.mu.Lock()
+		if !f.over {
+			f.end = time.AfterFunc(64*c.t1, f.tx.Terminate)
+		}
+		c.mu.Unlock()
 		_, _ = c.layer.Request(f.cancel, transport.Destination{Flow: f.flow}, func(*sip.Response, error) {})
 		if then != nil {
 			then()
@@ -372,9 +392,11 @@ func (c *IMSCore) cancel(tx *transaction.ServerTransaction) {
 	code := 481
 	var send *forwardedInvite
 	if inv, ok := c.layer.InviteFor(req); ok {
+		// It matches a live INVITE transaction: 200 (§9.2), whether or
+		// not the INVITE still waits for its final answer.
+		code = 200
 		c.mu.Lock()
 		if f := c.invites[inv]; f != nil {
-			code = 200
 			f.cancelled = true
 			if f.cancelNow() {
 				send = f
@@ -801,8 +823,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			c.mu.Unlock()
 		}
 	}
-	// ended forgets the INVITE, which has its final answer, and reports
-	// whether the originator had cancelled it.
+	// ended forgets the INVITE, which has its final answer, stops the
+	// timer after its CANCEL, and reports whether the originator had
+	// cancelled it.
 	ended := func() bool {
 		if invite == nil {
 			return false
@@ -810,6 +833,10 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		delete(c.invites, tx)
+		invite.over = true
+		if invite.end != nil {
+			invite.end.Stop()
+		}
 		return invite.cancelled
 	}
 	// Off the reading goroutine: Request waits for room on the other flow.
@@ -817,7 +844,7 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 		if c.Forwarding != nil {
 			c.Forwarding(fwd)
 		}
-		_, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
+		ct, err := c.layer.Request(fwd, transport.Destination{Flow: flow}, func(res *sip.Response, err error) {
 			if err != nil {
 				cancelled := ended()
 				// The far end never answered, or its flow went. A
@@ -830,7 +857,7 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 				switch {
 				case errors.Is(err, transaction.ErrTimeout) && req.Method != "INVITE":
 					c.silence(tx, req)
-				case cancelled && (errors.Is(err, transaction.ErrTimeout) || errors.Is(err, transport.ErrNoFlow)):
+				case cancelled && (errors.Is(err, transaction.ErrTimeout) || errors.Is(err, transaction.ErrTerminated) || errors.Is(err, transport.ErrNoFlow)):
 					// A cancelled INVITE whose branch ended without a final
 					// answer counts as the 487 its CANCEL asked for, as on
 					// the platform: it was cancelled, not failed.
@@ -841,6 +868,16 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 					answer(failureCode(err))
 				}
 				return
+			}
+			if invite != nil && res.StatusCode < 200 {
+				// The callee has the INVITE: a CANCEL may follow now.
+				c.mu.Lock()
+				invite.rung = true
+				send := invite.cancelNow()
+				c.mu.Unlock()
+				if send {
+					c.sendCancel(invite, nil)
+				}
 			}
 			if res.StatusCode == 100 {
 				return
@@ -866,9 +903,10 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			return
 		}
 		if invite != nil {
-			// A CANCEL that came before the INVITE went goes now.
+			// A CANCEL that came before the INVITE went goes now, if the
+			// callee has answered it provisionally already.
 			c.mu.Lock()
-			invite.sent = true
+			invite.sent, invite.tx = true, ct
 			send := invite.cancelNow()
 			c.mu.Unlock()
 			if send {
