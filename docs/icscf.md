@@ -105,6 +105,7 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | `icscf.scscf.next_address` | requests sent to the next address of the S-CSCF after one refused |
 | `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
 | `proxy.hook_panics` | panics recovered in icscf's routing: the request was answered 500 (#428); alarm on any |
+| `transaction.handler_panics` | panics recovered in a response handler; each ends only that call (#445); alarm on any |
 | `sip.overloaded` | requests refused as overloaded (503 with Retry-After), at the transaction layer's caps (`ICSCF_MAX_SERVER_TRANSACTIONS`, `ICSCF_MAX_SERVER_TRANSACTION_BYTES`) or at the proxy's own bound, which charges headers twice; recorded every 15 s and at the stop. #56's overload alarm reads it (#467) |
 
 `cxclient.*` counts the Cx answers by result code and their latency.

@@ -86,8 +86,10 @@ type Config struct {
 	// DefaultThirdPartyTimeout when 0.
 	ThirdPartyTimeout time.Duration
 	// MaxThirdParty bounds the third-party registrations at one application
-	// server at a time; up to four times as many wait for it, past which
-	// one is dropped and counted. DefaultMaxThirdParty when 0.
+	// server at a time. Up to four times as many are queued for it, and an
+	// end up to five times as many; past that a refresh is dropped and
+	// counted, and an end evicts a waiting refresh, or with none is dropped
+	// and counted apart (serverQueue). DefaultMaxThirdParty when 0.
 	MaxThirdParty int
 	// RepairTimeout bounds the background repair of an identity's item;
 	// DefaultRepairTimeout when 0.
@@ -226,12 +228,11 @@ func New(cfg Config) (*Router, error) {
 	}
 	ids := map[string]bool{}
 	cfg.DialogKeys = slices.Clone(cfg.DialogKeys)
-	for i, k := range cfg.DialogKeys {
-		if !isKeyID(k.ID) || ids[k.ID] || len(k.Key) < MinDialogKeyBytes {
+	for _, k := range cfg.DialogKeys {
+		if !isKeyID(k.ID) || ids[k.ID] || k.Key.Len() < MinDialogKeyBytes {
 			return nil, errors.New("routing: each DialogKey needs its own ID of letters and digits and a key of at least 32 bytes")
 		}
 		ids[k.ID] = true
-		cfg.DialogKeys[i].Key = slices.Clone(k.Key)
 	}
 	if cfg.ThirdPartyTimeout <= 0 {
 		cfg.ThirdPartyTimeout = DefaultThirdPartyTimeout
