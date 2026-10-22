@@ -82,10 +82,12 @@ minutes when the process holding it has gone, so waiting for it is no
 option. The 300 ms stand for the time a device takes to come back on a
 network. The step reports how often it asked again (`retries`), how
 many of those answers were 404 (`not_held`), and how long after the step
-began it sent the request that first got the bytes it settled on
-(`showed_ms`): the time the server took to show what it keeps.
+began it sent the last request that did not get the bytes it settled on
+(`showed_ms`, 0 if the first one got them): the time the server took to
+show what it keeps. The server reads what it holds somewhere between a
+request and its answer, so a slow answer, a 404 among them, adds nothing.
 
-`make e2e` asserts that `showed_ms` is at most 2 s. It also asserts that
+`make e2e` asserts that `showed_ms` is reported and at most 2 s. It also asserts that
 `ft-resume` resumed rather than uploading again, and that `busy_retries` is 0 on every step. So a server that is slow to keep a
 broken upload, or busy on an idle stack, fails the run. The bound is on time
 rather than on the number of answers, so a loaded host that answers slowly
@@ -309,7 +311,7 @@ the flag or variable, never its value.
 One JSON line per step on standard output:
 
 ```json
-{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2,"showed_ms":104}}
+{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2,"showed_ms":0}}
 {"scenario":"chat-core-originated","step":"keep-alive","ok":true,"ms":1500,"detail":{"bytes_while_quiet":514}}
 ```
 

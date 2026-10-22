@@ -463,11 +463,13 @@ var ErrNotSettled = errors.New("ft: the server is still storing the broken uploa
 
 // Settled says how SettledUploadInfo got its answer: how often it asked
 // again, how many answers were 404, and Showed: how long after the call
-// the request was sent that first got the bytes held it settled on. That
-// is how long the server took to show what it keeps of a broken upload,
-// apart from how long its answers take, which a loaded host stretches:
-// a server that held them at once shows them to the first request,
-// however slowly it answers (#286).
+// the last request was sent that did not get the bytes held it settled on
+// (0 if the first one got them). The server reads what it holds between a
+// request and its answer, so that request's sending is the last time it is
+// known not to have shown them. That is how long the server took to show
+// what it keeps of a broken upload, apart from how long its answers take,
+// which a loaded host stretches: a slow 404 counts no more than a slow
+// final answer (#286).
 type Settled struct {
 	Retries, NotHeld int64
 	Showed           time.Duration
@@ -504,6 +506,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 	last := int64(-1)
 	var since time.Time
 	extended := false
+	prevAsked := start // when the request before this one was sent
 	for {
 		asked := now()
 		info, err := c.UploadInfo(ctx, tid)
@@ -522,9 +525,11 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 		}
 		if held != last {
 			last, since = held, answered
-			// From the request, not the answer: the request's time is when
-			// the server could first have shown it (#286).
-			st.Showed = asked.Sub(start)
+			// From the request before, not this one: the server read what
+			// it held for that one at some time before its answer, which a
+			// loaded host may delay by seconds, so its sending is the last
+			// time the server is known not to have shown these (#286).
+			st.Showed = prevAsked.Sub(start)
 		}
 		// within bounds when a request is sent, not when its answer comes:
 		// one slow answer on a loaded host says nothing about the server
@@ -545,6 +550,7 @@ func (c *Client) SettledUploadInfo(ctx context.Context, tid string, within, poll
 				return info, st, err
 			}
 		}
+		prevAsked = asked
 		if err := sleep(ctx, poll); err != nil {
 			return info, st, err
 		}
