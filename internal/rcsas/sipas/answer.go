@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -152,7 +153,7 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		// place back.
 		code, busy := s.submit(ctx, messaging.Origin{
 			Sender: sender, Identities: identities, Recipient: peer, Conversation: conv,
-			Mode: store.Chat, CPIM: first,
+			Mode: store.Chat, CPIM: content.BodyOf(first),
 		})
 		s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.first_message.%d", code), 1)
 		if code != 202 {

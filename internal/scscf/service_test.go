@@ -3,6 +3,7 @@ package scscf
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -760,4 +761,49 @@ func TestASubscribesFirstNOTIFYIsCountedBeforeIts200(t *testing.T) {
 	default:
 		t.Error("the stop ended before the SUBSCRIBE's first NOTIFY went")
 	}
+}
+
+// TestARequestReachesALiveTaskOfAServerWhoseOtherTaskStopped (#574): the
+// application server's name still resolves to a stopped task, first, and
+// a live one. The request the criterion sends to the server reaches the
+// live task, rather than being answered by the default handling, and the
+// failover is counted.
+func TestARequestReachesALiveTaskOfAServerWhoseOtherTaskStopped(t *testing.T) {
+	hss := startHSS(t)
+	live := startSilentPeer(t)
+	port := live.addr[strings.LastIndex(live.addr, ":")+1:]
+	uri, method := "sip:rcs-as.rcs.local:"+port+";transport=tcp", "MESSAGE"
+	hss.asURI.Store(&uri)
+	hss.asMethod.Store(&method)
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			if host != "rcs-as.rcs.local" {
+				return nil, errors.New("no such host")
+			}
+			// Nothing listens on 127.0.0.2: the stopped task.
+			return []netip.Addr{netip.MustParseAddr("127.0.0.2"), netip.MustParseAddr("127.0.0.1")}, nil
+		}
+		d.shuffle = func(int, func(i, j int)) {}
+	})
+	p := dialSCSCF(t, r)
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
+	message := strings.Join([]string{
+		"MESSAGE " + impu + " SIP/2.0",
+		"Via: SIP/2.0/TCP 127.0.0.1:5070;branch=z9hG4bK-failover-1",
+		"Max-Forwards: 69",
+		"From: <sip:+15550100002@" + realm + ">;tag=caller", "To: <" + impu + ">",
+		"Call-ID: failover-1", "CSeq: 1 MESSAGE",
+		"Content-Length: 0",
+	}, "\r\n") + "\r\n\r\n"
+	if _, err := p.c.Write([]byte(message)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the MESSAGE at the live task", func() bool { return live.got.Load() > 0 })
+	if req := live.first.Load(); req == nil || req.Method != "MESSAGE" {
+		t.Fatalf("the live task got %v", req)
+	}
+	waitFor(t, "the failover counted", func() bool {
+		n, _ := r.h.Metric("routing.as_failover")
+		return n == 1
+	})
 }

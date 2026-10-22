@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -164,7 +165,7 @@ func TestAMessageQueuedWhileABlockedPassEndsWaitingIsDelivered(t *testing.T) {
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(bob, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "chat", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "chat", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the first passes", r.idle)
@@ -205,24 +206,24 @@ func TestASinglesPassThatStartsBlockedAndGetsThroughReadsTheQueueAgain(t *testin
 	var third, firstTries atomic.Int32
 	r.d.onPager(func(d Delivery) error {
 		switch {
-		case bytes.Contains(d.CPIM, []byte("text-first")):
+		case bytes.Contains(d.CPIM.Bytes(), []byte("text-first")):
 			if firstTries.Add(1) > 1 {
 				return nil
 			}
 			g1.entered <- struct{}{}
 			<-g1.release
 			return errors.New("480 Temporarily Unavailable")
-		case bytes.Contains(d.CPIM, []byte("text-second")):
+		case bytes.Contains(d.CPIM.Bytes(), []byte("text-second")):
 			g2.entered <- struct{}{}
 			<-g2.release
 			return nil
-		case bytes.Contains(d.CPIM, []byte("text-third")):
+		case bytes.Contains(d.CPIM.Bytes(), []byte("text-third")):
 			third.Add(1)
 		}
 		return nil
 	})
 	// carol's chat message waits for a session: holdWaiting.
-	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "text-chat", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "text-chat", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "idle", r.idle)
@@ -256,23 +257,23 @@ func TestASinglesPassThatGetsThroughUnblocksTheQueue(t *testing.T) {
 	var third, firstTries atomic.Int32
 	r.d.onPager(func(d Delivery) error {
 		switch {
-		case bytes.Contains(d.CPIM, []byte("text-first")):
+		case bytes.Contains(d.CPIM.Bytes(), []byte("text-first")):
 			if firstTries.Add(1) > 1 {
 				return nil
 			}
 			g1.entered <- struct{}{}
 			<-g1.release
 			return errors.New("480 Temporarily Unavailable")
-		case bytes.Contains(d.CPIM, []byte("text-second")):
+		case bytes.Contains(d.CPIM.Bytes(), []byte("text-second")):
 			g2.entered <- struct{}{}
 			<-g2.release
 			return nil
-		case bytes.Contains(d.CPIM, []byte("text-third")):
+		case bytes.Contains(d.CPIM.Bytes(), []byte("text-third")):
 			third.Add(1)
 		}
 		return nil
 	})
-	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "text-chat", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "text-chat", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "idle", r.idle)
@@ -306,7 +307,7 @@ func TestASinglesPassThatStopsReadsNothingMore(t *testing.T) {
 	drainInvites(t, r.d)
 	var tries atomic.Int32
 	r.d.onPager(func(d Delivery) error {
-		if bytes.Contains(d.CPIM, []byte("text-first")) {
+		if bytes.Contains(d.CPIM.Bytes(), []byte("text-first")) {
 			tries.Add(1)
 			return errors.New("480 Temporarily Unavailable")
 		}
@@ -314,7 +315,7 @@ func TestASinglesPassThatStopsReadsNothingMore(t *testing.T) {
 	})
 	// carol's chat message waits for a session: holdWaiting, so s1 is
 	// tried on its own.
-	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "c1", "text-chat", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "text-chat", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "idle", r.idle)

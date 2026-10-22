@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
@@ -415,7 +416,9 @@ type Origin struct {
 	// Pager marks a message that arrived in a SIP MESSAGE, which must fit
 	// the pager limit.
 	Pager bool
-	CPIM  []byte
+	// CPIM is the message/cpim body as received: chat content, held where
+	// no verb or encoder shows it (#547).
+	CPIM content.Body
 }
 
 // Submit runs a message through the pipeline and queues it for delivery.
@@ -451,15 +454,15 @@ func (e *Engine) submit(ctx context.Context, o Origin) error {
 			return reject(ReasonMalformed, errors.New("identity empty or too long"))
 		}
 	}
-	if o.Pager && len(o.CPIM) > e.cfg.PagerLimit {
+	if o.Pager && o.CPIM.Len() > e.cfg.PagerLimit {
 		return reject(ReasonTooLarge, nil)
 	}
-	m, err := ParseMessage(o.CPIM, e.cfg.MaxMessageSize)
+	m, err := ParseMessage(o.CPIM.Bytes(), e.cfg.MaxMessageSize)
 	if err != nil {
 		return err
 	}
 	e.countDeviations(m.CPIM.Deviations())
-	if m.Notification != nil && len(o.CPIM) > e.cfg.PagerLimit {
+	if m.Notification != nil && o.CPIM.Len() > e.cfg.PagerLimit {
 		// Notifications travel in pager mode when no session is open; a
 		// real one is well under a kilobyte (SEC4).
 		return reject(ReasonTooLarge, nil)
@@ -518,7 +521,7 @@ func (e *Engine) submitMessage(ctx context.Context, o Origin, m *Message, now ti
 	if err != nil {
 		return err
 	}
-	q := queued(o, id, o.CPIM, false, m.Request.MessageID, now, e.cfg.StoreTTL)
+	q := queued(o, id, o.CPIM.Bytes(), false, m.Request.MessageID, now, e.cfg.StoreTTL)
 	err = e.enqueue(ctx, q)
 	if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {
 		// The sender learns of it twice, as a refusal and, if it asked,
@@ -541,7 +544,7 @@ func queued(o Origin, id string, body []byte, notification bool, messageID strin
 		Recipient: o.Recipient, ID: id, Sender: o.Sender,
 		Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
 		Mode: o.Mode, Notification: notification, MessageID: messageID,
-		CPIM: body, Enqueued: now, Expires: now.Add(ttl),
+		CPIM: content.BodyOf(body), Enqueued: now, Expires: now.Add(ttl),
 	}
 }
 

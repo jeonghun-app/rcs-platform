@@ -201,7 +201,7 @@ func TestASubscribersSIPAndTelURIsAreOneParticipant(t *testing.T) {
 	// The author is named as the group names alice, whichever URI her
 	// session asserted.
 	got := asSeen(t, b.next(t))
-	if from, _ := fromTo(t, got); from.URI != alice || string(got.Body) != "hello" {
+	if from, _ := fromTo(t, got); from.URI != alice || string(got.Body.Bytes()) != "hello" {
 		t.Fatalf("bob got From %v: %q", from, got.Body)
 	}
 	// Someone else's number at another host is no form of bob's.

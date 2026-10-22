@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -18,7 +19,7 @@ func delivery() messaging.Delivery {
 	return messaging.Delivery{
 		Recipient: bob, Sender: alice, SenderName: `Alice \u000aand Bob`, Mode: store.Standalone,
 		Conversation: messaging.Conversation{ID: "c0nv1", Contribution: "c0ntr1", InReplyTo: "c0ntr0"},
-		CPIM:         []byte(cpimBody("m1", "hi")),
+		CPIM:         content.BodyOf([]byte(cpimBody("m1", "hi"))),
 	}
 }
 

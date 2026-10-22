@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -87,7 +88,7 @@ func (h members) Member(_ context.Context, group, user string) (bool, error) {
 }
 
 func groupFrom(sender string, body []byte) GroupOrigin {
-	return GroupOrigin{Group: groupURI, Sender: sender, Conversation: conv, CPIM: body}
+	return GroupOrigin{Group: groupURI, Sender: sender, Conversation: conv, CPIM: content.BodyOf(body)}
 }
 
 func TestAGroupMessageIsQueuedOncePerOtherParticipant(t *testing.T) {
@@ -105,7 +106,7 @@ func TestAGroupMessageIsQueuedOncePerOtherParticipant(t *testing.T) {
 	if m.Sender != groupURI || m.Author != alice || m.Mode != store.Group || m.MessageID != "m1" || m.Conversation != conv.ID {
 		t.Fatalf("bob's copy %+v", m)
 	}
-	c, err := cpim.Parse(m.CPIM)
+	c, err := cpim.Parse(m.CPIM.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +189,7 @@ func TestGroupMessagesNeedAGroupHandlerThatAgrees(t *testing.T) {
 		want Reason
 	}{
 		"someone else's From": {groupFrom(alice, cpimMessage(t, cpim.Address{URI: carol}, "m2", "x", 0)), ReasonFromMismatch},
-		"no sender":           {GroupOrigin{Group: groupURI, CPIM: chat(t, "m3", "x", 0)}, ReasonMalformed},
+		"no sender":           {GroupOrigin{Group: groupURI, CPIM: content.BodyOf(chat(t, "m3", "x", 0))}, ReasonMalformed},
 		"not CPIM":            {groupFrom(alice, []byte("x")), ReasonMalformed},
 	} {
 		if got := rejected(r.e.SubmitGroup(t.Context(), c.o)); got != c.want {
@@ -230,7 +231,7 @@ func TestGroupViewSetsTheAuthorAndTheGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readAddresses(t, out, cpim.Address{Name: "Al", URI: alice}, "<"+groupURI+">")
-	if string(got.Body) != "hi" {
+	if string(got.Body.Bytes()) != "hi" {
 		t.Fatalf("body %q", got.Body)
 	}
 	if dt, ok := got.Get(cpim.CoreNamespace, cpim.HeaderDateTime); !ok || dt.Value != "2026-03-04T05:06:07Z" {
@@ -253,7 +254,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if from, _ := got.From(); from.URI != alice || string(got.Body) != "hi" {
+	if from, _ := got.From(); from.URI != alice || string(got.Body.Bytes()) != "hi" {
 		t.Fatalf("bob got %v", got)
 	}
 	if code := b.outcome(t, cpim.ContentType, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)); code != 200 {
@@ -314,7 +315,7 @@ func TestGroupNotificationsAreCheckedLikeAnyOther(t *testing.T) {
 		"about nothing":     {groupFrom(bob, receipt(t, "m9", imdn.DeliveryNotification, imdn.Delivered)), ReasonIMDNUnknown},
 		"not asked for":     {groupFrom(bob, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)), ReasonIMDNNotRequested},
 		"from the author":   {groupFrom(alice, receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)), ReasonIMDNForged},
-		"in another group":  {GroupOrigin{Group: "sip:chat-2@x", Sender: bob, CPIM: receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)}, ReasonIMDNUnknown},
+		"in another group":  {GroupOrigin{Group: "sip:chat-2@x", Sender: bob, CPIM: content.BodyOf(receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered))}, ReasonIMDNUnknown},
 		"too large to send": {groupFrom(bob, bigReceipt(t)), ReasonTooLarge},
 	} {
 		if got := rejected(r.e.SubmitGroup(t.Context(), c.o)); got != c.want {
@@ -329,7 +330,7 @@ func TestGroupNotificationsAreCheckedLikeAnyOther(t *testing.T) {
 		t.Fatalf("alice's queue %+v", ms)
 	}
 	// bob wrote the anonymous URI in its To; rcs-as writes alice there.
-	readAddresses(t, ms[0].CPIM, cpim.Address{URI: bob}, "<"+alice+">")
+	readAddresses(t, ms[0].CPIM.Bytes(), cpim.Address{URI: bob}, "<"+alice+">")
 }
 
 // A client that takes no sessions has nothing to show a group message on:
@@ -673,7 +674,7 @@ func TestAGroupSenderIsNamedInCanonicalForm(t *testing.T) {
 	if err != nil || len(ms) != 1 || ms[0].Author != alice {
 		t.Fatalf("bob's queue %+v, %v", ms, err)
 	}
-	readAddresses(t, ms[0].CPIM, cpim.Address{URI: alice}, "<"+groupURI+">")
+	readAddresses(t, ms[0].CPIM.Bytes(), cpim.Address{URI: alice}, "<"+groupURI+">")
 	if _, err := r.store.Sent(t.Context(), alice, "m1", r.clock.Now()); err != nil {
 		t.Fatalf("alice's own record: %v", err)
 	}

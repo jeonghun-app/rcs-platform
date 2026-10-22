@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	groupstoretest "github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore/storetest"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
@@ -81,7 +82,7 @@ func (p *pagerCount) Pager(_ context.Context, d messaging.Delivery) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.got[string(d.CPIM)]++
+	p.got[string(d.CPIM.Bytes())]++
 	return nil
 }
 
@@ -108,7 +109,7 @@ func TestIntegrationTwoEnginesShareTheQueueAndDeliverEachMessageOnce(t *testing.
 	const n = 20
 	for i := range n {
 		body := fmt.Sprintf("From: <tel:+15550100001>\r\nTo: <tel:+15550100002>\r\n\r\nContent-Type: text/plain\r\n\r\nmessage %d", i)
-		o := messaging.Origin{Sender: "tel:+15550100001", Recipient: "tel:+15550100002", Mode: store.Standalone, Pager: true, CPIM: []byte(body)}
+		o := messaging.Origin{Sender: "tel:+15550100001", Recipient: "tel:+15550100002", Mode: store.Standalone, Pager: true, CPIM: content.BodyOf([]byte(body))}
 		if err := engines[i%2].Submit(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -154,7 +155,7 @@ func TestIntegrationADriftedQueueSizeIsCorrectedOnce(t *testing.T) {
 	l := store.Limit{Count: 1, SenderCount: 1}
 	at := func(id string, when time.Time) store.Message {
 		return store.Message{Recipient: "sip:r@example.net", ID: id, Sender: "sip:s@example.net", Mode: store.Chat,
-			CPIM: []byte("x"), Enqueued: when, Expires: when.Add(time.Hour)}
+			CPIM: content.BodyOf([]byte("x")), Enqueued: when, Expires: when.Add(time.Hour)}
 	}
 	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	if err := s.Enqueue(ctx, at("1", t1), l); err != nil {
@@ -306,7 +307,7 @@ func TestIntegrationAFencedEnqueueSpansBothTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyOf := func(id string, owner groupstore.Owner) store.Message {
-		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: g.URI, Mode: store.Group, CPIM: []byte("x"),
+		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: g.URI, Mode: store.Group, CPIM: content.BodyOf([]byte("x")),
 			Enqueued: t1, Expires: t1.Add(time.Hour), Fence: &store.Fence{Group: g.URI, Task: owner.Task, Epoch: owner.Epoch}}
 	}
 	if err := queues.Enqueue(ctx, copyOf("1", testOwner), store.Limit{}); err != nil {

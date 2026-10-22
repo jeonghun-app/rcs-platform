@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
@@ -87,7 +88,7 @@ func TestTheGroupIsAskedBeforeAParticipantIsInvitedBack(t *testing.T) {
 	if err := a.s.Add(t.Context(), g.URI, alice, []Invitee{{Identity: bob}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: message(t, alice, "m1", "hi", 0)}); err != nil {
+	if err := a.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: content.BodyOf(message(t, alice, "m1", "hi", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "bob invited", func() bool { return a.invitesOf(g, bob) == 1 })
@@ -109,7 +110,7 @@ func TestTheGroupIsAskedBeforeAParticipantIsInvitedBack(t *testing.T) {
 	// bob answers the invitation from before: Join refuses him, and task
 	// a gives up anything queued for him since.
 	if err := queues.Enqueue(t.Context(), store.Message{Recipient: bob, ID: "late", Sender: g.URI, Author: alice, Mode: store.Group,
-		CPIM: message(t, alice, "m2", "late", 0), Enqueued: clock.Now(), Expires: clock.Now().Add(time.Hour)}, store.Limit{}); err != nil {
+		CPIM: content.BodyOf(message(t, alice, "m2", "late", 0)), Enqueued: clock.Now(), Expires: clock.Now().Add(time.Hour)}, store.Limit{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.s.Join(t.Context(), g.URI, bob, ""); !errors.Is(err, ErrNotParticipant) {
@@ -136,14 +137,14 @@ func TestAParticipantAddedBackGetsItsMessagesAgain(t *testing.T) {
 	if err := r.s.Add(t.Context(), g.URI, carol, []Invitee{{Identity: bob}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: message(t, alice, "m1", "back?", 0)}); err != nil {
+	if err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: content.BodyOf(message(t, alice, "m1", "back?", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "bob invited back", func() bool { return r.invitesOf(g, bob) == 1 })
 	if _, err := r.s.Join(t.Context(), g.URI, bob, ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := asSeen(t, r.connect(g, bob, nil).next(t)); string(got.Body) != "back?" {
+	if got := asSeen(t, r.connect(g, bob, nil).next(t)); string(got.Body.Bytes()) != "back?" {
 		t.Fatalf("bob got %q", got.Body)
 	}
 }
@@ -194,10 +195,10 @@ func TestALegInAnotherSpellingGetsItsParticipantsMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := r.connect(g, spelled, nil)
-	if err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: message(t, alice, "m1", "hi", 0)}); err != nil {
+	if err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: alice, CPIM: content.BodyOf(message(t, alice, "m1", "hi", 0))}); err != nil {
 		t.Fatal(err)
 	}
-	if got := asSeen(t, b.next(t)); string(got.Body) != "hi" {
+	if got := asSeen(t, b.next(t)); string(got.Body.Bytes()) != "hi" {
 		t.Fatalf("bob got %q", got.Body)
 	}
 	if n := r.invitesOf(g, bob); n != 0 {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
@@ -69,8 +70,9 @@ type Delivery struct {
 	// through Route only when it is set and never through a route header
 	// it reads from the body itself.
 	Route string
-	// CPIM is the body, as the sender sent it.
-	CPIM []byte
+	// CPIM is the body, as the sender sent it: chat content, held where no
+	// verb or encoder shows it (#547).
+	CPIM content.Body
 }
 
 // Invitation asks Deliverer.Invite for a session.

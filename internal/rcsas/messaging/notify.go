@@ -6,6 +6,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -105,11 +106,11 @@ func intermediaryMay(k imdn.Kind, s imdn.Status) bool {
 func (e *Engine) dropOwnRoute(m *Message) ([]byte, error) {
 	routes := m.CPIM.All(imdn.Namespace, imdn.HeaderRoute)
 	if len(routes) == 0 {
-		return m.Raw, nil
+		return m.Raw.Bytes(), nil
 	}
 	a, err := cpim.ParseAddress(routes[0].Value)
 	if err != nil || !slices.Contains(e.cfg.Self, a.URI) {
-		return m.Raw, err
+		return m.Raw.Bytes(), err
 	}
 	i := slices.Index(m.CPIM.Headers, routes[0])
 	m.CPIM.Headers = slices.Delete(m.CPIM.Headers, i, i+1)
@@ -185,7 +186,7 @@ func (e *Engine) Report(ctx context.Context, d Delivery, k imdn.Kind, s imdn.Sta
 // records). IMDN-Route is copied from IMDN-Record-Route, as RFC 5438
 // §7.2.1 has a recipient do, keeping only TrustedRoutes.
 func (e *Engine) notification(m store.Message, d disposition, id string, now time.Time) (store.Message, error) {
-	c, err := e.parseCPIM(m.CPIM)
+	c, err := e.parseCPIM(m.CPIM.Bytes())
 	if err != nil {
 		return store.Message{}, err
 	}
@@ -232,7 +233,7 @@ func (e *Engine) notification(m store.Message, d disposition, id string, now tim
 	return store.Message{
 		Recipient: to, ID: id, Sender: sender, Author: author,
 		Conversation: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo,
-		Mode: m.Mode, Notification: true, CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
+		Mode: m.Mode, Notification: true, CPIM: content.BodyOf(body), Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
 	}, nil
 }
 
