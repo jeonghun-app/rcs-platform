@@ -1,6 +1,8 @@
 package hss
 
 import (
+	"slices"
+
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
@@ -110,6 +112,18 @@ func applySAR(s *store.Subscription, impus []string, r *cx.SAR, keepName bool) s
 		return sarOutcome{result: cx.ExperimentalResult(cx.ErrorIdentityAlreadyRegistered), serverName: s.ServerName}
 	}
 	wantData := r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable
+	if len(impus) > 0 {
+		// The S-CSCF may not hold the set's latest User-Data, whatever it
+		// says: a change's pushes for it ran out of time (#491). §6.6 lets
+		// the HSS download the profile all the same.
+		if i := slices.Index(s.StaleSets, s.Identity(impus[0]).ImplicitSet); i >= 0 {
+			switch r.AssignmentType {
+			case cx.Registration, cx.ReRegistration, cx.UnregisteredUser, cx.NoAssignment:
+				wantData = true
+				s.StaleSets = slices.Delete(slices.Clone(s.StaleSets), i, i+1)
+			}
+		}
+	}
 	switch r.AssignmentType {
 	case cx.Registration, cx.ReRegistration:
 		setState(s, s.Identity(impus[0]).ImplicitSet, store.Registered)
@@ -190,7 +204,7 @@ func targetSets(s *store.Subscription, impus []string) []int {
 // sameState reports whether two copies of a subscription have the same Cx
 // state.
 func sameState(a, b *store.Subscription) bool {
-	if a.ServerName != b.ServerName || a.AuthPending != b.AuthPending {
+	if a.ServerName != b.ServerName || a.AuthPending != b.AuthPending || !slices.Equal(a.StaleSets, b.StaleSets) {
 		return false
 	}
 	for i := range a.PublicIdentities {

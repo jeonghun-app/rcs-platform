@@ -17,8 +17,11 @@ import (
 // What the S-CSCF must be told when provisioning changes a subscription it
 // serves (TS 29.228 §6.5.2, §6.6.1). The HSS changes the stored state in the
 // same write as the provisioning change and sends the requests after the
-// write, so a failure to reach an S-CSCF never undoes the change: the user
-// picks it up at the next registration, at the latest when it expires.
+// write, so a failure to reach an S-CSCF never undoes the change. An
+// S-CSCF that missed a push keeps the profile it holds through the
+// user's refreshes, which tell the HSS it has the data; a change whose
+// pushes ran out of time marks its sets stale, so that the next
+// registration of each fetches the data anyway (notify, applySAR).
 
 // push is one HSS-initiated request to send.
 type push struct {
@@ -27,8 +30,11 @@ type push struct {
 	// impus lists the identities an RTR deregisters; none means all.
 	impus []string
 	// set is the implicit registration set whose User-Data a PPR carries,
-	// or -1 for a PPR without User-Data.
+	// or -1 for a PPR without User-Data; changed is the set a
+	// SERVER_CHANGE RTR is for, whose User-Data a registration must fetch
+	// again if the RTR is never sent (staleSets).
 	set      int
+	changed  int
 	charging bool
 	digest   bool
 }
@@ -81,7 +87,7 @@ func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 		case len(now) == 0:
 			rtrs = append(rtrs, push{deregister: true, reason: cx.PermanentTermination, impus: impusOf(was), set: -1})
 		case defaultIdentity(old, set) != defaultIdentity(next, set):
-			p := push{deregister: true, reason: cx.ServerChange, impus: impusOf(was), set: -1}
+			p := push{deregister: true, reason: cx.ServerChange, impus: impusOf(was), set: -1, changed: set}
 			if loses {
 				rtrs = append(rtrs, p)
 			} else {
@@ -252,21 +258,20 @@ func deletePushes(s *store.Subscription) []push {
 // #476). Failures are logged and counted, not returned: the stored change
 // stands.
 //
-// All of them together take at most t.total, within which each has at
-// most t.each: the provisioning API answers once they are done, before its
-// HTTP write timeout (#491). The pushes left when it runs out are not sent,
-// and counted in push.over_budget; the user picks the change up at the
-// next registration, as after any push that fails.
+// A change the API answers has a budget too (pushTimes.until): the API
+// answers once the pushes are done, and must do so within its HTTP write
+// timeout (#491). A push that would get less than pushFloor of it is not
+// sent, nor any after it: they are counted in push.over_budget, and the
+// sets they were for are marked stale (staleSets), so that the S-CSCF gets
+// their User-Data with the next registration of each, whatever it says it
+// holds (TS 29.228 §6.6).
 func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, pushes []push, t pushTimes) {
 	if n == nil {
 		return
 	}
-	t.until = time.Now().Add(t.total)
 	for i, ps := range pushes {
-		if time.Until(t.until) <= 0 {
-			h.metrics.Count("push.over_budget", int64(len(pushes)-i))
-			h.log.Warn("the S-CSCF requests of a provisioning change ran out of time",
-				pii.Identity("impi", s.IMPI), slog.Int("left", len(pushes)-i))
+		if t.bounded() && t.forPush(ps) < pushFloor {
+			h.overBudget(ctx, s, pushes[i:], t)
 			return
 		}
 		if h.notifyOne(ctx, n, s, p, ps, t) {
@@ -279,22 +284,98 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 	}
 }
 
-// pushTimes bound the pushes of one change (notify): each one, all of them,
-// and until when, from when the first starts.
+// pushFloor is the least time a push of a change is worth starting with.
+const pushFloor = 100 * time.Millisecond
+
+// pushTimes bound the pushes of one change (notify): each one, and with an
+// until, all of them, from before the profile is read. reserve is kept at
+// the end for marking the sets left over stale (overBudget).
+//
+// A PPR leaves a whole each before the end for what its refusal brings,
+// the not-registered write and the RTR (pprRejected), so that an S-CSCF
+// refusing at the PPR's deadline still gets its RTR (code review on #524).
 type pushTimes struct {
-	each, total time.Duration
-	until       time.Time
+	each    time.Duration
+	until   time.Time
+	reserve time.Duration
 }
 
-// next is how long the next request of the change may take.
-func (t pushTimes) next() time.Duration {
-	return max(min(t.each, time.Until(t.until)), 0)
+func (t pushTimes) bounded() bool { return !t.until.IsZero() }
+
+// left is how long a request may take that must leave keep before the end.
+func (t pushTimes) left(keep time.Duration) time.Duration {
+	if !t.bounded() {
+		return t.each
+	}
+	return max(min(t.each, time.Until(t.until)-t.reserve-keep), 0)
+}
+
+// forPush is how long ps may take: a PPR keeps each for its follow-up.
+func (t pushTimes) forPush(ps push) time.Duration {
+	if ps.deregister {
+		return t.left(0)
+	}
+	return t.left(t.each)
+}
+
+// followUp is how long a refused PPR's write and RTR may each take.
+func (t pushTimes) followUp() time.Duration { return t.left(0) }
+
+// overBudget counts the pushes left when the budget ran out, and marks
+// the sets they were for stale in the store, within what is left of it.
+func (h *HSS) overBudget(ctx context.Context, s *store.Subscription, left []push, t pushTimes) {
+	h.metrics.Count("push.over_budget", int64(len(left)))
+	h.log.Warn("the S-CSCF requests of a provisioning change ran out of time",
+		pii.Identity("impi", s.IMPI), slog.Int("left", len(left)))
+	sets := staleSets(left)
+	if len(sets) == 0 {
+		return
+	}
+	sctx, cancel := context.WithDeadline(ctx, t.until)
+	defer cancel()
+	_, err := h.update(sctx, s.IMPI, func(cur *store.Subscription) error {
+		before := len(cur.StaleSets)
+		for _, set := range sets {
+			if !slices.Contains(cur.StaleSets, set) {
+				cur.StaleSets = append(cur.StaleSets, set)
+			}
+		}
+		if len(cur.StaleSets) == before {
+			return errUnchanged
+		}
+		slices.Sort(cur.StaleSets)
+		return nil
+	})
+	if err != nil {
+		h.log.Warn("could not mark the sets of a provisioning change stale", pii.Identity("impi", s.IMPI),
+			slog.String("error", pii.Redact(err.Error())))
+		return
+	}
+	h.metrics.Count("push.stale_marked", 1)
+}
+
+// staleSets are the implicit sets whose User-Data the pushes would have
+// brought the S-CSCF: a PPR's, and a SERVER_CHANGE RTR's. An emptied set's
+// RTR has nothing to fetch: its refreshes are refused, and it ends at the
+// S-CSCF within a registration period. A PPR of charging information alone
+// carries no set.
+func staleSets(pushes []push) []int {
+	var out []int
+	for _, ps := range pushes {
+		switch {
+		case !ps.deregister && ps.set >= 0:
+			out = append(out, ps.set)
+		case ps.deregister && ps.reason == cx.ServerChange && len(ps.impus) > 0:
+			out = append(out, ps.changed)
+		}
+	}
+	return out
 }
 
 // notifyOne sends ps within t, and reports whether it left the user no
 // longer registered (pprRejected).
 func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, t pushTimes) bool {
-	pctx, cancel := context.WithTimeout(ctx, t.next())
+	pctx, cancel := context.WithTimeout(ctx, t.forPush(ps))
 	defer cancel()
 	err := h.send(pctx, n, s, p, ps)
 	if err != nil {
@@ -326,8 +407,8 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 // The not-registered write and the RTR each get t.each of their own, from
 // when they start, rather than what the refused PPR left of its own: an
 // S-CSCF that refuses late would otherwise leave the RTR almost none, and
-// the user registered there with the old data (code review on #476). Both
-// stay within the change's t.total all the same (#491).
+// the user registered there with the old data (code review on #476). A
+// bounded change kept them that time before its end (pushTimes.forPush).
 func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result, t pushTimes) bool {
 	if r.Vendor != cx.Vendor3GPP {
 		return false
@@ -337,7 +418,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	default:
 		return false
 	}
-	uctx, cancel := context.WithTimeout(ctx, t.next())
+	uctx, cancel := context.WithTimeout(ctx, t.followUp())
 	defer cancel()
 	_, err := h.update(uctx, s.IMPI, func(cur *store.Subscription) error {
 		if !served(cur) && !cur.AuthPending && cur.ServerName == "" {
@@ -361,7 +442,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 		return true
 	}
 	h.metrics.Count("push.ppr.data_refused", 1)
-	rctx, rcancel := context.WithTimeout(ctx, t.next())
+	rctx, rcancel := context.WithTimeout(ctx, t.followUp())
 	defer rcancel()
 	err = n.Deregister(rctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
 	if err != nil {

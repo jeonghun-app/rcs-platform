@@ -353,6 +353,8 @@ func (a *API) pushOne(ctx context.Context, impi string, p *store.ServiceProfile)
 	if len(pushes) == 0 {
 		return false
 	}
-	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimes())
+	// In the background, past any request's answer: each push has
+	// PushTimeout and no budget (code review on #524).
+	a.h.notify(ctx, a.notifier, s, p, pushes, pushTimes{each: a.pushTimeout})
 	return true
 }

@@ -973,7 +973,7 @@ func TestARefusedPPRWhoseStateCannotBeWrittenLetsTheNextGo(t *testing.T) {
 				t.Fatal(err)
 			}
 			n := &refusingOnce{recordingNotifier: newRecorder(), result: result, fs: fs}
-			e.h.notify(t.Context(), n, next, p, pushes, pushTimes{each: time.Second, total: PushBudget})
+			e.h.notify(t.Context(), n, next, p, pushes, pushTimes{each: time.Second})
 			if rtrs, pprs := n.got(); len(pprs) != 2 || len(rtrs) != 0 {
 				t.Fatalf("%d PPRs, %d RTRs; want both PPRs and no RTR", len(pprs), len(rtrs))
 			}
@@ -1171,14 +1171,10 @@ func (n *silentNotifier) Deregister(ctx context.Context, _ *cx.RTR) error { retu
 
 func (n *silentNotifier) PushProfile(ctx context.Context, _ *cx.PPR) error { return n.hold(ctx) }
 
-// #491: a change of a subscription served in seven implicit sets, at an
-// S-CSCF that never answers, takes no longer than the push budget, which
-// keeps the API's answer within its write timeout: the pushes left when it
-// runs out are not sent, and are counted.
-func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
-	const each, budget = 200 * time.Millisecond, 300 * time.Millisecond
-	silent := &silentNotifier{}
-	a := newAPIEnv(t, func(o *APIOptions) { o.Notifier, o.PushTimeout, o.PushBudget = silent, each, budget })
+// sevenSets provisions impi1 in seven implicit sets, all registered, and a
+// second profile, chat, to move it to.
+func (a *apiEnv) sevenSets(t *testing.T) []any {
+	t.Helper()
 	ids := []any{impu1, 0, tel1, 1, impu2, 2, "tel:+15550100002", 3, impu3, 4, "tel:+15550100003", 5, impu4, 6}
 	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, ids...)); code != http.StatusCreated {
 		t.Fatalf("create = %d %v", code, body)
@@ -1189,35 +1185,172 @@ func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
 			s.PublicIdentities[i].State = store.Registered
 		}
 	})
-	profile := `{"id":"chat","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[{"group":[0],"method":"MESSAGE"}]},` +
-		`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_TERMINATED"}}],"mandatory_capabilities":[1]}`
-	if code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile); code != http.StatusCreated {
+	if code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, chatProfile); code != http.StatusCreated {
 		t.Fatalf("profile = %d %v", code, body)
 	}
-	// Another profile: a PPR for each of the seven served sets.
-	moved := strings.Replace(setsBody(impi1, ids...), `"acs_managed":true}`, `"acs_managed":true,"service_profile":"chat"}`, 1)
-	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, moved); code != http.StatusOK {
+	return ids
+}
+
+// chatProfile is a second service profile, chat, whose iFC sends MESSAGE
+// to rcs-as.
+const chatProfile = `{"id":"chat","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[{"group":[0],"method":"MESSAGE"}]},` +
+	`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_TERMINATED"}}],"mandatory_capabilities":[1]}`
+
+// toChat is ids moved to the chat profile: a PPR for each served set.
+func toChat(ids []any) string {
+	return strings.Replace(setsBody(impi1, ids...), `"acs_managed":true}`, `"acs_managed":true,"service_profile":"chat"}`, 1)
+}
+
+// #491: a change of a subscription served in seven implicit sets, at an
+// S-CSCF that never answers, takes no longer than the push budget, which
+// keeps the API's answer within its write timeout: the pushes left when it
+// runs out are not sent, are counted and logged once, without any
+// identifier in the clear, and their sets are marked stale.
+func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
+	const each, budget, reserve = 200 * time.Millisecond, 600 * time.Millisecond, 50 * time.Millisecond
+	silent := &silentNotifier{}
+	a := newAPIEnv(t, func(o *APIOptions) {
+		o.Notifier, o.PushTimeout, o.PushBudget, o.staleReserve = silent, each, budget, reserve
+	})
+	ids := a.sevenSets(t)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
 		t.Fatalf("put = %d %v", code, body)
 	}
 	silent.mu.Lock()
 	defer silent.mu.Unlock()
 	sent, skipped := int64(silent.sent), a.metrics.get("push.over_budget")
-	// The first push has its timeout, the second what is left of the
-	// budget, and the five after none.
+	// The first PPR has its timeout and the second what is left before the
+	// end, less a timeout kept for a refusal's follow-up: the five after
+	// have less than pushFloor.
 	if sent+skipped != 7 || sent > 2 {
 		t.Fatalf("%d pushes sent, %d left over budget; want the seven, at most two sent", sent, skipped)
 	}
-	// No push had longer than the budget from the first's start: the
-	// deadlines are compared, not the time the host took (#275).
-	if late := silent.deadline.Sub(silent.first.Add(budget)); late > 0 {
-		t.Errorf("a push's deadline is %v past the budget", late)
+	// No push had longer than the budget, less what it keeps, from the
+	// change's start, which is before the first push: the deadlines are
+	// compared, not the time the host took (#275).
+	if late := silent.deadline.Sub(silent.first.Add(budget - reserve - each)); late > 0 {
+		t.Errorf("a push's deadline is %v past what the budget leaves it", late)
+	}
+	if s := a.sub(impi1); len(s.StaleSets) != int(skipped) {
+		t.Errorf("stale sets %v, %d pushes left over", s.StaleSets, skipped)
+	}
+	var lines []string
+	for _, l := range strings.Split(a.logs.String(), "\n") {
+		if strings.Contains(l, "ran out of time") {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], `"left":`+strconv.FormatInt(skipped, 10)) || !strings.Contains(lines[0], `"impi":"***`) {
+		t.Fatalf("over-budget log lines %q", lines)
+	}
+	for _, clear := range []string{impi1, imsi1, "15550100", domain} {
+		if strings.Contains(lines[0], clear) {
+			t.Errorf("the log line names %q in the clear: %s", clear, lines[0])
+		}
 	}
 }
 
-// #491: HSS_PUSH_TIMEOUT is at most MaxPushTimeout, so that a push fits in
-// the change's budget, and the API's answer in its write timeout.
+// #491, the lead's decision on #524: what an over-budget change left out
+// reaches the S-CSCF with the next registration of each set, though the
+// S-CSCF says it holds the data (TS 29.228 §6.6), once.
+func TestAStaleSetsNextRegistrationGetsItsUserData(t *testing.T) {
+	const each, budget, reserve = 200 * time.Millisecond, 600 * time.Millisecond, 50 * time.Millisecond
+	silent := &silentNotifier{}
+	a := newAPIEnv(t, func(o *APIOptions) {
+		o.Notifier, o.PushTimeout, o.PushBudget, o.staleReserve = silent, each, budget, reserve
+	})
+	ids := a.sevenSets(t)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	s := a.sub(impi1)
+	if len(s.StaleSets) == 0 || !slices.Contains(s.StaleSets, 6) {
+		t.Fatalf("stale sets %v", s.StaleSets)
+	}
+	c := connectCSCF(t, serveHSS(t, a.h, "hss-a.rcs.local"), "scscf-1.rcs.local")
+	reregister := func() *cx.SAA {
+		r := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentities: []string{impu4},
+			ServerName: scscfName, AssignmentType: cx.ReRegistration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable}
+		saa, err := cx.ParseSAA(c.send(r.Message(c.node)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saa
+	}
+	saa := reregister() // impu4's set, 6, was left over
+	if saa.Result != resSuccess || saa.UserData == nil {
+		t.Fatalf("the stale set's re-registration got %+v", saa)
+	}
+	doc, err := ifc.ParseSubscription(saa.UserData)
+	if err != nil || len(doc.ServiceProfiles) != 1 || len(doc.ServiceProfiles[0].InitialFilterCriteria) != 1 ||
+		doc.ServiceProfiles[0].InitialFilterCriteria[0].ApplicationServer.ServerName != asURI {
+		t.Fatalf("User-Data %v %+v, want chat's", err, doc)
+	}
+	if s := a.sub(impi1); slices.Contains(s.StaleSets, 6) {
+		t.Errorf("set 6 still stale: %v", s.StaleSets)
+	}
+	if saa := reregister(); saa.UserData != nil {
+		t.Error("User-Data again, once the set had it")
+	}
+}
+
+// Code review on #524: the shared profile's fan-out runs in the background
+// and answers no request, so it has no budget: a subscriber's pushes each
+// have the push timeout, however long they all take.
+func TestTheFanOutHasNoBudget(t *testing.T) {
+	slow := &slowNotifier{wait: 50 * time.Millisecond}
+	a := newAPIEnv(t, func(o *APIOptions) {
+		o.Notifier, o.PushTimeout, o.PushBudget, o.staleReserve = slow, time.Second, 100*time.Millisecond, 10*time.Millisecond
+	})
+	ids := a.sevenSets(t)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	before := slow.count()
+	updated := strings.Replace(chatProfile, `"MESSAGE"`, `"INVITE"`, 1)
+	if code, body, _ := a.do("PUT", "/v1/service-profiles/chat", adminToken, updated, "If-Match", `"1"`); code != http.StatusOK {
+		t.Fatalf("profile put = %d %v", code, body)
+	}
+	deadline := time.Now().Add(realWait)
+	for slow.count()-before < 7 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the fan-out pushed %d of the seven sets", slow.count()-before)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// slowNotifier answers every push after wait.
+type slowNotifier struct {
+	wait time.Duration
+	mu   sync.Mutex
+	n    int
+}
+
+func (n *slowNotifier) count() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.n
+}
+
+func (n *slowNotifier) Deregister(_ context.Context, _ *cx.RTR) error { return n.answer() }
+
+func (n *slowNotifier) PushProfile(_ context.Context, _ *cx.PPR) error { return n.answer() }
+
+func (n *slowNotifier) answer() error {
+	time.Sleep(n.wait)
+	n.mu.Lock()
+	n.n++
+	n.mu.Unlock()
+	return nil
+}
+
+// #491: HSS_PUSH_TIMEOUT is at most MaxPushTimeout, so that a PPR and what
+// its refusal brings fit in the change's budget, and HSS_API_TIMEOUT at most
+// MaxAPITimeout, so that the change's store work and the budget fit in the
+// API's write timeout.
 func TestThePushTimeoutIsBounded(t *testing.T) {
-	if MaxPushTimeout > PushBudget || PushBudget >= apiWriteTimeout {
-		t.Fatalf("timeout %v, budget %v, write timeout %v", MaxPushTimeout, PushBudget, apiWriteTimeout)
+	if 2*MaxPushTimeout+staleReserve > PushBudget || MaxAPITimeout+PushBudget >= apiWriteTimeout {
+		t.Fatalf("timeout %v, budget %v, store work %v, write timeout %v", MaxPushTimeout, PushBudget, MaxAPITimeout, apiWriteTimeout)
 	}
 }

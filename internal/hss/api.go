@@ -1,6 +1,7 @@
 package hss
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -78,14 +79,18 @@ const (
 
 // DefaultPushTimeout bounds each RTR and PPR a provisioning request causes,
 // and MaxPushTimeout is the most HSS_PUSH_TIMEOUT may be. PushBudget bounds
-// them all together: the API answers a change once its pushes are done,
-// and must do so within apiWriteTimeout, the HTTP server's, with time left
-// for the change's store work (#491).
+// them all together, the profile read for them included: the API answers a
+// change once its pushes are done, and must do so within apiWriteTimeout,
+// the HTTP server's, after the change's store work, which MaxAPITimeout
+// bounds (#491). staleReserve is kept at the budget's end for marking the
+// sets of the pushes left over stale.
 const (
 	DefaultPushTimeout = 5 * time.Second
-	MaxPushTimeout     = 10 * time.Second
-	PushBudget         = 20 * time.Second
+	MaxPushTimeout     = 8 * time.Second
+	PushBudget         = 18 * time.Second
+	MaxAPITimeout      = 10 * time.Second
 	apiWriteTimeout    = 30 * time.Second
+	staleReserve       = time.Second
 )
 
 // APIOptions configures the provisioning API.
@@ -105,6 +110,8 @@ type APIOptions struct {
 	// and PushBudget, PushBudget when zero, all of them together.
 	PushTimeout time.Duration
 	PushBudget  time.Duration
+	// staleReserve, when a test sets it, replaces staleReserve.
+	staleReserve time.Duration
 	// FanoutWorkers bounds the PPRs sent at once after a shared profile
 	// changes; 8 when zero.
 	FanoutWorkers int
@@ -146,6 +153,7 @@ type API struct {
 	defaultProfile string
 	pushTimeout    time.Duration
 	pushBudget     time.Duration
+	staleReserve   time.Duration
 	storeTimeout   time.Duration
 	workers        int
 
@@ -168,6 +176,7 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 	if a.pushBudget <= 0 {
 		a.pushBudget = PushBudget
 	}
+	a.staleReserve = cmp.Or(o.staleReserve, staleReserve)
 	if a.workers <= 0 {
 		a.workers = 8
 	}
@@ -488,5 +497,8 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// pushTimes are the bounds of one change's pushes (HSS.notify).
-func (a *API) pushTimes() pushTimes { return pushTimes{each: a.pushTimeout, total: a.pushBudget} }
+// pushTimes are the bounds of one change's pushes (HSS.notify), its
+// budget running from now.
+func (a *API) pushTimes() pushTimes {
+	return pushTimes{each: a.pushTimeout, until: time.Now().Add(a.pushBudget), reserve: a.staleReserve}
+}
