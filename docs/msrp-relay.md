@@ -180,6 +180,18 @@ succeeds. The task role needs
   closes toward the relay. Messages sent with `Failure-Report: no` or
   `partial` in that window are lost without a report, which those modes
   accept (RFC 4975 §7.1.2).
+- **The connection toward rcs-as and jumbo frames.** All sessions toward one
+  `rcs-as` task share one connection. Linux sends nothing on a connection
+  whose peer's receive window is smaller than one segment, and while traffic
+  comes the other way, each ACK puts off the zero-window probe that would
+  send the part that fits. So the connection stands still and every session
+  on it gets 408 (#140). With the usual VPC MTU of 1500 (MSS 1448) this
+  cannot happen: even the smallest buffer the kernel allows leaves a window
+  above one segment. With jumbo frames (MTU 9001, MSS 8949) the receive
+  window must stay at 16 KiB or more; at 8 KiB the connection all but stops
+  (#517). Neither the relay nor `rcs-as` sets `SO_RCVBUF` on it, so the
+  kernel's autotuning sizes it. A buffer set there later should be 32 KiB or
+  more.
 - **Connections without a session.** A new connection must name a session
   within 30 s (the active side sends its first SEND at once, RFC 4975 §5.4),
   or it is closed (`ClientsClosedUnbound`). A connection whose last bridge
