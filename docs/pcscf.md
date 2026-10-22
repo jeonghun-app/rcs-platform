@@ -671,6 +671,10 @@ start with that value.
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | connections the client listener holds among them, counted from accept; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
 | `PCSCF_CORE_CONNECTIONS` | `256` | connections the core listener holds, kept for it |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
+| `PCSCF_MAX_SERVER_TRANSACTIONS` | `20000` | the requests pcscf holds at once, 1 to 1000000; one past it is answered 503 with Retry-After, and the proxy allows as many in progress (as icscf, #482). A tenth of the default or less is refused |
+| `PCSCF_MAX_SERVER_TRANSACTION_BYTES` | `268435456` (256 MiB) | the memory those requests and their kept responses hold, client-facing ones 80% of it; the proxy's own memory bound is the same. At least 2.5 MiB, room for the largest request a client sends; a tenth of the default or less is refused |
+| `PCSCF_MAX_QUEUED_BYTES` | `268435456` (256 MiB) | the output every send queue holds together (`QueuedBytes`); at it, stalled client connections are closed (`BudgetSheds`). At least 2 MiB; a tenth of the default or less is refused |
+| `PCSCF_WRITE_TIMEOUT` | `10s` | how long a send waits for a peer that has stopped reading before its connection is closed; outside 1s to 1m is refused |
 | `PCSCF_RELAY_URL` | `http://msrp-relay.<RCS_SERVICE_NAMESPACE>:8082` | `msrp-relay`'s control API: `http` or `https` of a private host, without a path |
 | `PCSCF_RELAY_TOKEN` | none | `pcscf`'s bearer token for it, from Secrets Manager in AWS; unset or under 43 characters is refused; without one, MSRP sessions are refused |
 | `PCSCF_RELAY_TIMEOUT` | `2s` | one call to the control API |

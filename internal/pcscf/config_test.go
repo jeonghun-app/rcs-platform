@@ -14,6 +14,8 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 const publicHost = "pcscf.rcs.example.net"
@@ -96,6 +98,8 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		RelayURL: &url.URL{Scheme: "http", Host: "msrp-relay.rcs.internal:8082"}, RelayTimeout: DefaultRelayTimeout,
 		MaxBindingsPerFlow: DefaultMaxBindingsPerFlow, MaxBindings: DefaultMaxBindings, BindingsPerMinute: 32,
 		MaxCoreOfferBindingsPerFlow: 32, CoreOfferBindingsPerMinute: 32,
+		MaxServerTransactions: transaction.DefaultMaxServerTransactions, MaxServerTransactionBytes: transaction.DefaultMaxServerTransactionBytes,
+		MaxQueuedBytes: transport.DefaultMaxQueuedBytes, WriteTimeout: transport.DefaultWriteTimeout,
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("got  %+v\nwant %+v", c, want)
@@ -212,6 +216,12 @@ func TestInvalidSettingsAreRefused(t *testing.T) {
 		{[]string{"PCSCF_REGISTER_BURST", "0"}, "PCSCF_REGISTER_BURST: must be positive"},
 		{[]string{"PCSCF_INITIAL_RATE", "0"}, "PCSCF_INITIAL_RATE: must be positive"},
 		{[]string{"PCSCF_INITIAL_BURST", "-1"}, "PCSCF_INITIAL_BURST: must be positive"},
+		// #482: the caps and the send-queue budget.
+		{[]string{"PCSCF_MAX_SERVER_TRANSACTIONS", "0"}, "PCSCF_MAX_SERVER_TRANSACTIONS: must be from 1 to 1000000"},
+		{[]string{"PCSCF_MAX_SERVER_TRANSACTIONS", "1000001"}, "PCSCF_MAX_SERVER_TRANSACTIONS: must be from 1 to 1000000"},
+		{[]string{"PCSCF_MAX_SERVER_TRANSACTION_BYTES", "2621439"}, "PCSCF_MAX_SERVER_TRANSACTION_BYTES: must be at least 2621440"},
+		{[]string{"PCSCF_MAX_QUEUED_BYTES", "2097151"}, "PCSCF_MAX_QUEUED_BYTES: must be at least 2097152"},
+		{[]string{"PCSCF_WRITE_TIMEOUT", "0s"}, "PCSCF_WRITE_TIMEOUT: must be greater than zero"},
 		{[]string{"RCS_SERVICE_NAMESPACE", ""}, "PCSCF_ICSCF_URI: required when RCS_SERVICE_NAMESPACE is unset"},
 		{[]string{"PCSCF_ICSCF_URI", "sip:icscf.rcs.internal;transport=tcp"}, "PCSCF_ICSCF_URI: not a sip URI of a host with transport=tcp and lr"},
 		{[]string{"PCSCF_ICSCF_URI", "tel:+15550100001"}, "PCSCF_ICSCF_URI: not a sip URI"},
@@ -296,6 +306,12 @@ func TestProductionRefusesWhatLetsClientsPastTheEdge(t *testing.T) {
 		{[]string{"PCSCF_RELAY_TOKEN", ""}, "PCSCF_RELAY_TOKEN is unset"},
 		{[]string{"PCSCF_RELAY_TOKEN", strings.Repeat("t", 42)}, "PCSCF_RELAY_TOKEN is shorter than 43 characters"},
 		{[]string{"PCSCF_RELAY_URL", "http://127.0.0.1:8082"}, "PCSCF_RELAY_URL: not an http or https URL of a private host"},
+		// #482: values for a test.
+		{[]string{"PCSCF_MAX_SERVER_TRANSACTIONS", "2000"}, "PCSCF_MAX_SERVER_TRANSACTIONS is a tenth of its default or less"},
+		{[]string{"PCSCF_MAX_SERVER_TRANSACTION_BYTES", "26843545"}, "PCSCF_MAX_SERVER_TRANSACTION_BYTES is a tenth of its default or less"},
+		{[]string{"PCSCF_MAX_QUEUED_BYTES", "26843545"}, "PCSCF_MAX_QUEUED_BYTES is a tenth of its default or less"},
+		{[]string{"PCSCF_WRITE_TIMEOUT", "999ms"}, "PCSCF_WRITE_TIMEOUT is outside 1s to 1m"},
+		{[]string{"PCSCF_WRITE_TIMEOUT", "61s"}, "PCSCF_WRITE_TIMEOUT is outside 1s to 1m"},
 	} {
 		t.Run(tt.want, func(t *testing.T) {
 			status, out := startup(t, with(prodEnv, tt.kv...))
@@ -305,7 +321,16 @@ func TestProductionRefusesWhatLetsClientsPastTheEdge(t *testing.T) {
 		})
 	}
 	// The same settings are only warned about in dev.
-	if _, err := configure(with(devEnv, "PCSCF_CLIENT_UDP_ADDR", "0.0.0.0:5060")); err != nil {
+	if _, err := configure(with(devEnv, "PCSCF_CLIENT_UDP_ADDR", "0.0.0.0:5060", "PCSCF_MAX_SERVER_TRANSACTIONS", "10", "PCSCF_WRITE_TIMEOUT", "100ms")); err != nil {
+		t.Fatal(err)
+	}
+	// And just above a tenth, or at the edges of the write timeout's
+	// range, production starts.
+	if _, err := configure(with(prodEnv, "PCSCF_MAX_SERVER_TRANSACTIONS", "2001", "PCSCF_MAX_SERVER_TRANSACTION_BYTES", "26843546",
+		"PCSCF_MAX_QUEUED_BYTES", "26843546", "PCSCF_WRITE_TIMEOUT", "1s")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := configure(with(prodEnv, "PCSCF_WRITE_TIMEOUT", "1m")); err != nil {
 		t.Fatal(err)
 	}
 }

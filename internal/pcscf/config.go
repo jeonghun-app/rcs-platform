@@ -11,6 +11,8 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // Client transports: what the client's connection to the NLB is, which
@@ -88,6 +90,17 @@ const (
 	// and prod, the relay's own rule: 256 random bits in base64 (ADR 0007
 	// §4).
 	minRelayTokenLength = 43
+	// minServerTransactionBytes is icscf's room for the largest request its
+	// transport reads (2 MiB), over the 80% of the bound that client-facing
+	// requests may use (transaction.DefaultClientShare).
+	minServerTransactionBytes = 5 << 19
+	// minQueuedBytes is room for the largest message the transport writes.
+	minQueuedBytes = 2 << 20
+	// The bounds staging and prod keep the write timeout in: a shorter one
+	// closes a slow mobile client's flow, a longer one holds a sender for a
+	// peer that has stopped reading.
+	minProductionWriteTimeout = time.Second
+	maxProductionWriteTimeout = time.Minute
 	// stopMargin is what Run needs after the drain to close the proxy and
 	// the transport and flush the last metrics, inside RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
@@ -188,6 +201,45 @@ type Config struct {
 	// over (ADR 0003): by default RCS_SHUTDOWN_TIMEOUT less what the rest of
 	// the stop needs.
 	DrainTimeout time.Duration
+	// MaxServerTransactions and MaxServerTransactionBytes bound the server
+	// transactions pcscf holds, by count and by memory, and its proxy as
+	// icscf's is (proxyLimits): a request past either is answered 503 with
+	// Retry-After (#482).
+	MaxServerTransactions     int
+	MaxServerTransactionBytes int64
+	// MaxQueuedBytes bounds the transport's send queues together, and
+	// WriteTimeout how long a send waits for a peer that does not read
+	// (transport.Config).
+	MaxQueuedBytes int
+	WriteTimeout   time.Duration
+}
+
+// limits checks the transaction caps and the send-queue budget (#482): each
+// must leave room for the largest message, and in staging and prod none may
+// be a tenth of its default or less, as a value meant for a test is, nor
+// the write timeout outside a second to a minute.
+func limits(s *runtime.Settings, c Config) {
+	e := s.Env
+	if c.MaxServerTransactions < 1 || c.MaxServerTransactions > transaction.MaxMaxServerTransactions {
+		e.Invalid("MAX_SERVER_TRANSACTIONS", "must be from 1 to "+strconv.Itoa(transaction.MaxMaxServerTransactions))
+	}
+	if c.MaxServerTransactionBytes < minServerTransactionBytes {
+		e.Invalid("MAX_SERVER_TRANSACTION_BYTES", "must be at least "+strconv.Itoa(minServerTransactionBytes)+" (2.5 MiB), room for the largest request a client sends")
+	}
+	if c.MaxQueuedBytes < minQueuedBytes {
+		e.Invalid("MAX_QUEUED_BYTES", "must be at least "+strconv.Itoa(minQueuedBytes)+" (2 MiB), room for the largest message")
+	}
+	if c.WriteTimeout <= 0 {
+		e.Invalid("WRITE_TIMEOUT", "must be greater than zero")
+	}
+	s.ForbidInProduction(c.MaxServerTransactions*10 <= transaction.DefaultMaxServerTransactions,
+		"PCSCF_MAX_SERVER_TRANSACTIONS is a tenth of its default or less, a value for a test")
+	s.ForbidInProduction(c.MaxServerTransactionBytes*10 <= transaction.DefaultMaxServerTransactionBytes,
+		"PCSCF_MAX_SERVER_TRANSACTION_BYTES is a tenth of its default or less, a value for a test")
+	s.ForbidInProduction(c.MaxQueuedBytes*10 <= transport.DefaultMaxQueuedBytes,
+		"PCSCF_MAX_QUEUED_BYTES is a tenth of its default or less, a value for a test")
+	s.ForbidInProduction(c.WriteTimeout > 0 && (c.WriteTimeout < minProductionWriteTimeout || c.WriteTimeout > maxProductionWriteTimeout),
+		"PCSCF_WRITE_TIMEOUT is outside 1s to 1m")
 }
 
 // interfaceAddrs finds this task's addresses; tests replace it.
@@ -230,6 +282,11 @@ func Configure(s *runtime.Settings) Config {
 	c.BindingsPerMinute = e.Int("BINDINGS_PER_MINUTE", DefaultBindingsPerMinute)
 	c.MaxCoreOfferBindingsPerFlow = e.Int("MAX_CORE_OFFER_BINDINGS_PER_FLOW", DefaultMaxCoreOfferBindingsPerFlow)
 	c.CoreOfferBindingsPerMinute = e.Int("CORE_OFFER_BINDINGS_PER_MINUTE", DefaultCoreOfferBindingsPerMinute)
+	c.MaxServerTransactions = e.Int("MAX_SERVER_TRANSACTIONS", transaction.DefaultMaxServerTransactions)
+	c.MaxServerTransactionBytes = int64(e.Int("MAX_SERVER_TRANSACTION_BYTES", transaction.DefaultMaxServerTransactionBytes))
+	c.MaxQueuedBytes = e.Int("MAX_QUEUED_BYTES", transport.DefaultMaxQueuedBytes)
+	c.WriteTimeout = e.Duration("WRITE_TIMEOUT", transport.DefaultWriteTimeout)
+	limits(s, c)
 	if c.RelayTimeout <= 0 {
 		e.Invalid("RELAY_TIMEOUT", "must be greater than zero")
 	}
