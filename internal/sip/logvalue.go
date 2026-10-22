@@ -3,6 +3,8 @@ package sip
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"strconv"
@@ -280,6 +282,33 @@ func (r Response) LogValue() slog.Value {
 		slog.Int("headers", r.Header.Len()),
 		slog.Int("body_bytes", len(r.Body)),
 	)
+}
+
+// String, GoString and Format print a request as its LogValue logs it:
+// method, redacted Request-URI and sizes, without header values or the
+// body. Body redacts itself too, but fmt calls no method below the top
+// level under a verb a pointer has no meaning for (%s, %q, ...), so a
+// struct holding a *Request would otherwise show the body octets (#573).
+func (r Request) String() string { return r.summary() }
+
+func (r Request) GoString() string { return r.summary() }
+
+func (r Request) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, r.summary()) }
+
+func (r Request) summary() string {
+	return fmt.Sprintf("%s %s (%d headers, %d body octets)", r.Method, r.URI.redacted(), r.Header.Len(), len(r.Body))
+}
+
+// String, GoString and Format print a response as its LogValue logs it,
+// as Request's do.
+func (r Response) String() string { return r.summary() }
+
+func (r Response) GoString() string { return r.summary() }
+
+func (r Response) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, r.summary()) }
+
+func (r Response) summary() string {
+	return fmt.Sprintf("%d %s (%d headers, %d body octets)", r.StatusCode, loggedReason(r.StatusCode, r.Reason), r.Header.Len(), len(r.Body))
 }
 
 // loggedReason is a reason phrase as it may be logged: the peer's text,
