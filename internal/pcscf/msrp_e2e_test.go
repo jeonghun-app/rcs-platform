@@ -158,8 +158,9 @@ func TestACancelDuringAllocationReleasesTheBinding(t *testing.T) {
 // A CANCEL does not wait for a relay call that does not answer: the 487
 // comes while the relay still holds the POST, with an hour of relay timeout,
 // because the CANCEL ends the context the INVITE's Prepare runs under
-// (#382). The call runs on, and once the relay answers, the binding it made
-// is released, and counted.
+// (#382). The call runs on, keeping its share of the flow's binding limit
+// meanwhile (QA of #442), and once the relay answers, the binding it made is
+// released, and counted.
 func TestACancelDoesNotWaitForAStalledRelayCall(t *testing.T) {
 	st := startRelayStack(t, func(*sip.Request) string { return "" }, time.Hour, deps{})
 	st.block.Store(true)
@@ -171,6 +172,11 @@ func TestACancelDoesNotWaitForAStalledRelayCall(t *testing.T) {
 	}
 	if res := st.c.final(); res.StatusCode != 487 {
 		t.Errorf("INVITE: %d before the relay answered, want 487", res.StatusCode)
+	}
+	// The 487 came once Prepare had given up, and with it what the INVITE
+	// took but the create still running.
+	if n := st.pc.msrp.limit.held(); n != 1 {
+		t.Errorf("held %d while the abandoned create runs, want its share, 1", n)
 	}
 	close(st.release)
 	st.waitHeld(t, 0)
