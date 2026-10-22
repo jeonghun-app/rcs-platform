@@ -87,10 +87,15 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 		req  ifc.Request
 		want []int
 	}{
-		"roster SUBSCRIBE":            {reqs["SUBSCRIBE"], []int{25}},
-		"roster SUBSCRIBE with an id": {withEvent("SUBSCRIBE", refConference, "conference;id=r1"), []int{25}},
-		"roster SUBSCRIBE spaced":     {withEvent("SUBSCRIBE", refConference, "conference ; id=r1"), []int{25}},
-		"roster SUBSCRIBE in caps":    {withEvent("SUBSCRIBE", refConference, "CONFERENCE"), []int{25}},
+		"roster SUBSCRIBE":                 {reqs["SUBSCRIBE"], []int{25}},
+		"roster SUBSCRIBE with an id":      {withEvent("SUBSCRIBE", refConference, "conference;id=r1"), []int{25}},
+		"roster SUBSCRIBE spaced":          {withEvent("SUBSCRIBE", refConference, "conference ; id=r1"), []int{25}},
+		"roster SUBSCRIBE in caps":         {withEvent("SUBSCRIBE", refConference, "CONFERENCE"), []int{25}},
+		"roster SUBSCRIBE, two parameters": {withEvent("SUBSCRIBE", refConference, "conference;id=r1;x=y"), []int{25}},
+		// The package's name ends the value of another (code review on
+		// #577): the whole event type is matched, from its start.
+		"reg event naming conference": {withEvent("SUBSCRIBE", refUser, "reg;id=conference"), nil},
+		"a package ending so":         {withEvent("SUBSCRIBE", refConference, "x-conference"), nil},
 		"reg event SUBSCRIBE":         {withEvent("SUBSCRIBE", refUser, "reg"), nil},
 		"presence SUBSCRIBE":          {withEvent("SUBSCRIBE", refPeer, "presence"), nil},
 		"another package":             {withEvent("SUBSCRIBE", refConference, "conference-x"), nil},
@@ -122,6 +127,26 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 			if !slices.Equal(got, c.want) {
 				t.Errorf("%s in case %d: priorities %v, want %v", name, ctx.Case, got, c.want)
 			}
+		}
+	}
+}
+
+// The default handling of each criterion is the one docs/hss.md gives
+// (code review on #577): chat, messaging and the roster fail rather than
+// bypass rcs-as, with an error a client tries again, where a continued
+// roster SUBSCRIBE would reach the S-CSCF's 404 for a conference host and
+// look like a group that does not exist; capability discovery and
+// registration go on without it.
+func TestDefaultProfileHandlingsAreTheDocumentedOnes(t *testing.T) {
+	want := map[int]ifc.DefaultHandling{10: ifc.SessionTerminated, 20: ifc.SessionTerminated, 25: ifc.SessionTerminated,
+		30: ifc.SessionContinued, 40: ifc.SessionContinued}
+	criteria := DefaultRCSProfile(DefaultProfileID, asURI).Criteria
+	if len(criteria) != len(want) {
+		t.Fatalf("%d criteria, want %d", len(criteria), len(want))
+	}
+	for _, fc := range criteria {
+		if h, ok := want[fc.Priority]; !ok || fc.ApplicationServer.DefaultHandling != h {
+			t.Errorf("criterion %d: default handling %v, want %v", fc.Priority, fc.ApplicationServer.DefaultHandling, h)
 		}
 	}
 }

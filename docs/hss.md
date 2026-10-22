@@ -322,7 +322,10 @@ can have that name, as it holds a space.
 The profile is created at start if missing; an operator's changes to it are kept.
 So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
 (#137), or before the roster trigger (#557), keeps its old triggers until an
-operator updates it through the API. No deployment had one.
+operator updates it through the API. No deployment had one. A local stack
+started before #557 holds one too, as DynamoDB Local keeps its data across
+`make up`: `make down` then `make up`, or a PUT of the profile through the API,
+gives it the roster trigger ([local stack](local-stack.md)).
 
 ### Writing iFC
 
@@ -364,7 +367,7 @@ some inputs grows with the square of their length. A profile's patterns
 together may cost at most `MaxSetCompileCost` (1 000 000 units) to compile,
 counted in bytes and instructions processed rather than timed. A profile of
 64 ordinary RCS criteria uses about 92% of it and the default RCS profile
-about 2%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
+about 3.6%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
 development host at load 140 to 230, a profile at the limit took 39 to 48 ms
 of CPU (33 to 70 ms wall) to compile when made of 4 KiB patterns, and about
 2 to 2.3 times as long when made of hundreds of short ones; other hosts and
