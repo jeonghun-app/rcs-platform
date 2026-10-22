@@ -1137,8 +1137,13 @@ func TestDrainWaitsForAServedFinalTheTransactionLayerHas(t *testing.T) {
 	case <-time.After(drainFlushStall + 500*time.Millisecond):
 	}
 	letGo()
-	if err := <-respErr; err != nil {
-		t.Fatalf("UAS.Respond = %v", err)
+	select {
+	case err := <-respErr:
+		if err != nil {
+			t.Fatalf("UAS.Respond = %v", err)
+		}
+	case <-time.After(30 * time.Second): // a hang guard (#565)
+		t.Fatal("UAS.Respond did not return")
 	}
 	select {
 	case <-done:
@@ -1228,8 +1233,13 @@ func TestDrainWaitsForAServeHandlerToAnswerItsCancellation(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Drain and Close did not return")
 	}
-	if err := <-respErr; err != nil {
-		t.Fatalf("UAS.Respond = %v", err)
+	select {
+	case err := <-respErr:
+		if err != nil {
+			t.Fatalf("UAS.Respond = %v", err)
+		}
+	case <-time.After(30 * time.Second): // a hang guard (#565)
+		t.Fatal("UAS.Respond did not return")
 	}
 	_ = nc.SetReadDeadline(time.Now().Add(30 * time.Second))
 	m, err := sip.NewReader(bufio.NewReader(nc), sip.Limits{}).ReadMessage()
