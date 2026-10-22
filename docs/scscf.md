@@ -126,7 +126,11 @@ Alarm on a rise of these:
   that a user ended, so it keeps them registered until the last Expires;
 - `routing.third_party.terminated_unanswered`;
 - `regevent.notify_dropped`;
-- `regevent.final_abandoned`.
+- `regevent.final_abandoned`;
+- `proxy.hook_panics`, panics recovered in scscf's routing (#428), and
+  `transaction.handler_panics`, in a response handler of a request scscf
+  sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
+  the request or the call it was in; alarm on any.
 
 `routing.third_party.evicted` counts refreshes an end took the place of in a
 full queue: a server that does not keep up. Each is made good by the user's
