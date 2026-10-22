@@ -69,7 +69,7 @@ func TestParseReadsEveryPartOfAChatMessage(t *testing.T) {
 		t.Errorf("ContentHeaders = %#v", m.ContentHeaders)
 	}
 	if string(m.Body.Bytes()) != "Hello" {
-		t.Errorf("Body = %q", m.Body)
+		t.Errorf("Body = %q", m.Body.Bytes())
 	}
 
 	from, err := m.From()
@@ -226,7 +226,7 @@ func TestLayoutDeviationsAreReadWithoutRewritingTheValue(t *testing.T) {
 	}
 	m := mustParse(t, []byte("From: <"+alice+">\n\nContent-Type: text/plain\n\nline\r\nend\n"))
 	if string(m.Body.Bytes()) != "line\r\nend\n" {
-		t.Errorf("Body = %q; the body is never touched", m.Body)
+		t.Errorf("Body = %q; the body is never touched", m.Body.Bytes())
 	}
 	out, err := m.Marshal()
 	if err != nil || !bytes.HasPrefix(out, crlf("From: <"+alice+">\n\nContent-Type: text/plain\n\n")) {
@@ -879,7 +879,7 @@ func TestParsedMessageDoesNotAliasTheInput(t *testing.T) {
 		data[i] = 'x'
 	}
 	if string(m.Body.Bytes()) != "Hello" || m.Headers[0].Name != "From" {
-		t.Errorf("message changed with its input: %q", m.Body)
+		t.Errorf("message changed with its input: %q", m.Body.Bytes())
 	}
 }
 

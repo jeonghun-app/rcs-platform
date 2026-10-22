@@ -49,7 +49,7 @@ func FuzzParseMessage(f *testing.F) {
 			}
 			return
 		}
-		if string(m.Raw) != string(data) || (m.Notification != nil && m.Request.Dispositions != 0) {
+		if string(m.Raw.Bytes()) != string(data) || (m.Notification != nil && m.Request.Dispositions != 0) {
 			t.Fatalf("message %+v", m)
 		}
 		checkAccepted(t, m)

@@ -106,11 +106,11 @@ func intermediaryMay(k imdn.Kind, s imdn.Status) bool {
 func (e *Engine) dropOwnRoute(m *Message) ([]byte, error) {
 	routes := m.CPIM.All(imdn.Namespace, imdn.HeaderRoute)
 	if len(routes) == 0 {
-		return m.Raw, nil
+		return m.Raw.Bytes(), nil
 	}
 	a, err := cpim.ParseAddress(routes[0].Value)
 	if err != nil || !slices.Contains(e.cfg.Self, a.URI) {
-		return m.Raw, err
+		return m.Raw.Bytes(), err
 	}
 	i := slices.Index(m.CPIM.Headers, routes[0])
 	m.CPIM.Headers = slices.Delete(m.CPIM.Headers, i, i+1)

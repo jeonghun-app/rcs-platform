@@ -302,8 +302,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	}
 	if !m.Summary {
 		// A summary has no body of its own. The Bytes of an empty Body are
-		// nil, which the SDK would write as null: an empty CPIM is written
-		// as the empty binary it was before #547.
+		// nil, which the SDK would write as null: an empty CPIM, nil or
+		// not, goes out as an empty binary. Before #547 a nil one went out
+		// as null.
 		cpim := m.CPIM.Bytes()
 		if cpim == nil {
 			cpim = []byte{}
