@@ -421,6 +421,18 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   default 60 s start-up fits `startPeriod` 60, `interval` 15, `retries` 3
   (105 s). `startPeriod` is at most 300 s, so `HSS_START_TIMEOUT` is refused
   above 240 s.
+- Inbound Cx connections: one from an address outside every
+  `HSS_DIAMETER_PEER_NETWORKS` CIDR is closed as it is accepted, with no CER
+  exchange, and logged as `diameter connection closed: source outside every
+  accept rule's networks` at most once a minute; a peer missing from the
+  configured networks shows up there. With the variable unset (dev only),
+  every address may connect. Connections still in the CER exchange
+  are capped at 64 in all and 4 from one source address, so a host that
+  opens connections and sends nothing leaves room for the S-CSCFs; a refused
+  one is logged once until the count falls (`too many have not completed
+  CER`, `too many from one source have not completed CER`). Neither cap is
+  configurable: an S-CSCF task holds one connection and reconnects one at a
+  time.
 - The API logs one `audit: provisioning request` line per request: operation,
   caller, token slot (`current` or `next`), status and the masked IMPI.
 - Metrics: `cx.<command>` (latency), `cx.<command>.<result>` (`e` before an

@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +32,16 @@ const (
 	// limit only bites when something is opening connections and sending
 	// nothing.
 	DefaultMaxPendingConnections = 64
+	// DefaultMaxPendingPerSource bounds those from one source address. A
+	// peer task holds one connection to a node, and reconnects one at a
+	// time, so a few leave room for a reconnect racing a dying connection.
+	DefaultMaxPendingPerSource = 4
 )
+
+// outsiderLogEvery spaces the warnings about connections from outside
+// every rule's networks: a scan logs one line a minute, while a peer left
+// out of the configured networks by mistake is still visible.
+const outsiderLogEvery = time.Minute
 
 const (
 	defaultProductName = "rcs-platform"
@@ -81,6 +91,12 @@ type Config struct {
 	// can hold: this many goroutines and read buffers of at most
 	// MaxMessageSize.
 	MaxPendingConnections int
+	// MaxPendingPerSource bounds those from one source address, so that
+	// one host that opens connections and sends nothing takes only its
+	// share of MaxPendingConnections and leaves the rest to the peers
+	// (#32). A source no Accept rule's Networks admits is closed before it
+	// is counted at all.
+	MaxPendingPerSource int
 
 	// WatchdogInterval is Twinit; each wait is jittered by up to ±2 s as
 	// RFC 3539 §3.4.1 requires.
@@ -161,6 +177,9 @@ func (c *Config) setDefaults() error {
 	if c.MaxPendingConnections <= 0 {
 		c.MaxPendingConnections = DefaultMaxPendingConnections
 	}
+	if c.MaxPendingPerSource <= 0 {
+		c.MaxPendingPerSource = DefaultMaxPendingPerSource
+	}
 	if c.Clock == nil {
 		c.Clock = systemClock{}
 	}
@@ -230,9 +249,15 @@ type Node struct {
 	conns     map[*conn]struct{} // every connection, including those still exchanging capabilities
 	peers     map[string]*Peer   // open peers by lower-case Origin-Host
 	// exchanging counts accepted connections still in the capabilities
-	// exchange; limitLogged keeps a flood from logging every refusal.
-	exchanging  int
-	limitLogged bool
+	// exchange, and pendingFrom those by source address; limitLogged and
+	// sourceLogged keep a flood from logging every refusal.
+	exchanging   int
+	pendingFrom  map[netip.Addr]int
+	limitLogged  bool
+	sourceLogged bool
+	// outsiderLoggedAt is when a connection from outside every rule's
+	// networks was last logged.
+	outsiderLoggedAt time.Time
 }
 
 // NewNode validates cfg and returns a node. It does nothing on the network
@@ -242,14 +267,15 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{
-		cfg:       cfg,
-		log:       cfg.Logger.With("diameter_origin_host", cfg.OriginHost),
-		sessions:  NewSessionIDGenerator(cfg.OriginHost, cfg.Clock.Now()),
-		handlers:  make(map[handlerKey]Handler),
-		errorAVPs: make(map[uint32]func(req *Message) []*AVP),
-		listeners: make(map[net.Listener]struct{}),
-		conns:     make(map[*conn]struct{}),
-		peers:     make(map[string]*Peer),
+		cfg:         cfg,
+		log:         cfg.Logger.With("diameter_origin_host", cfg.OriginHost),
+		sessions:    NewSessionIDGenerator(cfg.OriginHost, cfg.Clock.Now()),
+		handlers:    make(map[handlerKey]Handler),
+		errorAVPs:   make(map[uint32]func(req *Message) []*AVP),
+		listeners:   make(map[net.Listener]struct{}),
+		conns:       make(map[*conn]struct{}),
+		pendingFrom: make(map[netip.Addr]int),
+		peers:       make(map[string]*Peer),
 	}
 	n.e2e.Store(uint32(cfg.Random()))
 	n.ctx, n.cancel = context.WithCancel(context.Background())
@@ -464,6 +490,14 @@ func (n *Node) Serve(l net.Listener) error {
 			}
 			return err
 		}
+		src := addrOf(nc.RemoteAddr())
+		if !n.mayAccept(src) {
+			// No rule could take this peer: it gets no exchange, and no
+			// place among those waiting for one (#32).
+			_ = nc.Close()
+			n.logOutsider(nc.RemoteAddr())
+			continue
+		}
 		// Adding to the wait group under the lock that Shutdown takes before
 		// waiting guarantees the Add happens before the Wait.
 		n.mu.Lock()
@@ -483,25 +517,78 @@ func (n *Node) Serve(l net.Listener) error {
 			}
 			continue
 		}
+		if n.pendingFrom[src] >= n.cfg.MaxPendingPerSource {
+			first := !n.sourceLogged
+			n.sourceLogged = true
+			n.mu.Unlock()
+			_ = nc.Close()
+			if first {
+				n.log.Warn("diameter connections refused: too many from one source have not completed CER",
+					"limit", n.cfg.MaxPendingPerSource, "remote", nc.RemoteAddr().String())
+			}
+			continue
+		}
 		n.exchanging++
+		n.pendingFrom[src]++
 		n.wg.Add(1)
 		n.mu.Unlock()
 		go func() {
 			defer n.wg.Done()
-			n.accept(nc)
+			n.accept(nc, src)
 		}()
 	}
 }
 
 // exchangeDone releases a connection's place among those still exchanging
-// capabilities.
-func (n *Node) exchangeDone() {
+// capabilities, its source's included.
+func (n *Node) exchangeDone(src netip.Addr) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.exchanging--
 	if n.exchanging < n.cfg.MaxPendingConnections {
 		n.limitLogged = false
 	}
+	if n.pendingFrom[src]--; n.pendingFrom[src] <= 0 {
+		delete(n.pendingFrom, src)
+		n.sourceLogged = false
+	}
+}
+
+// logOutsider warns that a connection from outside every rule's networks
+// was closed, at most once every outsiderLogEvery. Before #32 such a peer
+// was answered DIAMETER_UNKNOWN_PEER and logged; without this line a
+// misconfigured peer network would leave nothing to see.
+func (n *Node) logOutsider(remote net.Addr) {
+	now := n.cfg.Clock.Now()
+	n.mu.Lock()
+	due := n.outsiderLoggedAt.IsZero() || now.Sub(n.outsiderLoggedAt) >= outsiderLogEvery
+	if due {
+		n.outsiderLoggedAt = now
+	}
+	n.mu.Unlock()
+	if due {
+		n.log.Warn("diameter connection closed: source outside every accept rule's networks",
+			"remote", remote.String())
+	}
+}
+
+// mayAccept reports whether some Accept rule could take a peer at src:
+// one without Networks, or whose Networks hold it. Without rules no peer
+// is accepted, but each is still answered DIAMETER_UNKNOWN_PEER, as there
+// is no peer to keep out (RFC 6733 §5.3).
+func (n *Node) mayAccept(src netip.Addr) bool {
+	if len(n.cfg.Accept) == 0 {
+		return true
+	}
+	for _, r := range n.cfg.Accept {
+		if len(r.Networks) == 0 {
+			return true
+		}
+		if src.IsValid() && slices.ContainsFunc(r.Networks, func(p netip.Prefix) bool { return p.Contains(src) }) {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) isClosed() bool {
