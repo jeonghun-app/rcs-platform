@@ -123,6 +123,10 @@ func TestE2EComposeStack(t *testing.T) {
 	// iFC chains, where the default profile's criterion toward rcs-as,
 	// absent from the stack, goes on by its default handling. pager-message
 	// is left out: the default profile ends a MESSAGE at rcs-as.
+	// The client's default profile first: a run cut short before it put
+	// it back would leave the stub's, whose AS is gone, and fail the
+	// first OPTIONS with a 500 that says nothing of why (#473 code review).
+	putProfile(ctx, t, impi, impu, "tel:"+composeMSISDN, "")
 	pcscf := doc.value("LBO_P-CSCF_Address", "Address")
 	sipCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",

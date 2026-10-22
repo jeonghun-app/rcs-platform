@@ -339,7 +339,7 @@ describe them. #56 provides the AWS values. Locally:
 | "not in deploy/compose.env; make up adds new settings to it" | The env file lacks a setting. `make up` adds it (`scripts/compose-env.sh`); running `docker compose` directly does not. |
 | "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |
 | Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
-| `stack-tables` fails with "only one of the hss tables exists" | A half-made stack. Run `make down` and `make up`. |
+| `stack-tables` fails with "only some of the hss tables exist" (or the scscf tables) | A half-made stack. Run `make down` and `make up`. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
 | `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |
 | `make e2e-compose`: "… is not ready: is the stack up" | The stack exists but a service is not ready within the test's wait. `make logs LOGS="<service>"`. |

@@ -120,22 +120,22 @@ func throughStubAS(ctx context.Context, t *testing.T, as sip.URI, impi, sipIMPU,
 	default:
 		t.Fatalf("hss: creating the stub's service profile answered %d", status)
 	}
-	put := func(ctx context.Context, profile string) int {
-		sub := map[string]any{
-			"impi": impi, "imsi": strings.SplitN(impi, "@", 2)[0], "acs_managed": true,
-			"public_identities": []map[string]any{{"impu": sipIMPU, "implicit_set": 0}, {"impu": telIMPU, "implicit_set": 0}},
-		}
-		if profile != "" {
-			sub["service_profile"] = profile
-		}
-		return callJSON(ctx, t, http.MethodPut, hssAPI+"/v1/subscriptions/"+url.PathEscape(impi), token, sub, nil)
+	putProfile(ctx, t, impi, sipIMPU, telIMPU, stubProfileID)
+	t.Cleanup(func() { putProfile(context.Background(), t, impi, sipIMPU, telIMPU, "") })
+}
+
+// putProfile gives the client subscriber the service profile id, or hss's
+// default with "", putting its subscription again as stack-seed does.
+func putProfile(ctx context.Context, t *testing.T, impi, sipIMPU, telIMPU, id string) {
+	t.Helper()
+	sub := map[string]any{
+		"impi": impi, "imsi": strings.SplitN(impi, "@", 2)[0], "acs_managed": true,
+		"public_identities": []map[string]any{{"impu": sipIMPU, "implicit_set": 0}, {"impu": telIMPU, "implicit_set": 0}},
 	}
-	if status := put(ctx, stubProfileID); status != http.StatusOK {
-		t.Fatalf("hss: giving the client the stub's profile answered %d", status)
+	if id != "" {
+		sub["service_profile"] = id
 	}
-	t.Cleanup(func() {
-		if status := put(context.Background(), ""); status != http.StatusOK {
-			t.Errorf("hss: putting the client's default profile back answered %d", status)
-		}
-	})
+	if status := callJSON(ctx, t, http.MethodPut, hssAPI+"/v1/subscriptions/"+url.PathEscape(impi), env(t, "HSS_ADMIN_TOKEN"), sub, nil); status != http.StatusOK {
+		t.Errorf("hss: putting the client's service profile %q answered %d", id, status)
+	}
 }
