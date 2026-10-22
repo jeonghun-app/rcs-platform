@@ -5,6 +5,7 @@ import (
 	"context"
 	"mime/multipart"
 	"net/textproto"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -33,58 +34,79 @@ type thirdParty struct {
 
 // serverQueue is one application server's third-party registrations: at
 // most MaxThirdParty at the server at a time, which hold a slot only while
-// they are sent, and up to queuedPerServer of them waiting or sent. They
-// are queued per set and identity registered, as the server keeps a
+// they are sent, and up to queuedPerServer times that many waiting or sent.
+//
+// They are queued per set and identity registered, as the server keeps a
 // registration per To (#420): each identity's go in the order the
 // registrar told of them, so that the server does not hear a registration
-// after the deregistration that followed it, and at most queuedPerSet of
-// them are queued, so that one user's refreshes do not take the queue
-// (#379 code review). One past either bound takes the place of the same
-// identity's last one waiting, which it is newer than, so that the server
-// hears the latest state (#379 code review). An end with none to take the
-// place of goes past the server's bound, by at most MaxThirdParty, as no
-// later registration would tell the server of it (#420); only beyond that
-// is a registration dropped.
+// after the deregistration that followed it, and one past a bound takes
+// the place of the same identity's last one waiting, which it is newer
+// than, so that the server hears the latest state (#379 code review). At
+// most queuedPerSet of a whole set's are queued, whatever its identities,
+// so that one user's refreshes do not take the queue (#379 and #446 code
+// review).
+//
+// An end with none to take the place of goes past either bound, by at most
+// MaxThirdParty, as no later registration would tell the server of it
+// (#420). Past that it evicts the oldest refresh waiting under another
+// key, which the identity's next re-registration makes good, and only with
+// none to evict is it dropped, counted apart (#446 QA, the lead's decision
+// on #420). So at most (queuedPerServer+1) × MaxThirdParty are counted,
+// which bounds the goroutines that wait for a server that does not answer;
+// those evicted end at once, but for waiting for the one before them of
+// their identity.
 type serverQueue struct {
 	slots  chan struct{}
 	queued int
-	sets   map[string]*setQueue
+	// keys are the queues per set and identity, and sets count each set's
+	// registrations queued.
+	keys map[string]*keyQueue
+	sets map[string]int
+	// waiting are the refreshes queued and not yet sent, oldest first, an
+	// end may evict.
+	waiting []*pending
 }
 
-// setQueue is the registrations of one identity of a set queued for one
+// keyQueue is the registrations of one identity of a set queued for one
 // server: tail is closed once the last one told of is done, and last is
-// that one.
-type setQueue struct {
+// that one, nil once evicted.
+type keyQueue struct {
 	tail   chan struct{}
 	queued int
 	last   *pending
 }
 
 // pending is a registration queued for a server, which a later one of the
-// same identity may take the place of until it is sent.
+// same identity may take the place of until it is sent, and an end of
+// another evict.
 type pending struct {
-	r      registrar.ThirdPartyRegistration
-	server ifc.ApplicationServer
-	sent   bool
+	r        registrar.ThirdPartyRegistration
+	server   ifc.ApplicationServer
+	set, key string
+	sent     bool
+	evicted  bool
 }
 
 // queuedPerServer bounds the registrations queued for a server, as a
-// multiple of MaxThirdParty, which bounds the goroutines that wait for a
-// server that does not answer.
+// multiple of MaxThirdParty: with the ends' headroom of one MaxThirdParty
+// more, it bounds the goroutines that wait for a server that does not
+// answer.
 const queuedPerServer = 4
 
-// queuedPerSet bounds one set's registrations queued for a server, the one
-// under way included: a registration, a refresh and an end, with room for
-// one more.
+// queuedPerSet bounds one set's registrations queued for a server, all its
+// identities together, the ones under way included: a registration, a
+// refresh and an end, with room for one more. An end goes past it as past
+// the server's bound.
 const queuedPerSet = 4
 
 // Registered sends the application servers whose criteria take r's
 // REGISTER a third-party REGISTER for it (TS 24.229 §5.4.1.7), off the
 // caller's goroutine, to each server apart. The criteria are read now,
 // from r.Profile or the store: once a set has ended its profile goes. One
-// past a server's or a set's queue (serverQueue) replaces its set's last
-// one waiting, or, with none, is dropped and counted, as is one told of
-// after Stop.
+// past a server's or a set's bound (serverQueue) replaces its identity's
+// last one waiting; with none, a refresh is dropped and counted, and an
+// end goes past the bound, or evicts a waiting refresh, or is dropped and
+// counted apart. One told of after Stop is dropped and counted.
 func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistration) {
 	if rt.cfg.Sender == nil {
 		return
@@ -108,7 +130,8 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 		return
 	}
 	r.Request, r.Response = withoutCredentials(r.Request), clonedResponse(r.Response)
-	key := r.Set.IMPI + "\x00" + r.Set.IMPU + "\x00" + r.IMPU
+	set := r.Set.IMPI + "\x00" + r.Set.IMPU
+	key := set + "\x00" + r.IMPU
 	ctx = context.WithoutCancel(ctx)
 	rt.stop.Lock()
 	defer rt.stop.Unlock()
@@ -117,72 +140,133 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 		return
 	}
 	for _, fc := range matched {
-		p := &pending{r: r, server: fc.ApplicationServer}
-		q, sq, prev, done, queued := rt.enqueue(fc.ApplicationServer.ServerName, key, p)
+		p := &pending{r: r, server: fc.ApplicationServer, set: set, key: key}
+		q, prev, done, queued := rt.enqueue(fc.ApplicationServer.ServerName, p)
 		if !queued {
 			continue
 		}
 		rt.tp.wg.Add(1)
 		go func() {
 			defer rt.tp.wg.Done()
+			defer close(done)
 			if prev != nil {
 				<-prev
 			}
+			if rt.evicted(p) {
+				return
+			}
 			q.slots <- struct{}{}
+			defer func() { <-q.slots }()
 			rt.tp.mu.Lock()
+			if p.evicted {
+				rt.tp.mu.Unlock()
+				return
+			}
 			p.sent = true
+			q.unwait(p)
 			r, server := p.r, p.server
 			rt.tp.mu.Unlock()
 			rt.registerWith(ctx, r, server)
-			<-q.slots
 			rt.tp.mu.Lock()
-			q.queued--
-			if sq.queued--; sq.queued == 0 {
-				delete(q.sets, key)
-			}
+			q.release(p)
 			rt.tp.mu.Unlock()
-			close(done)
 		}()
 	}
 }
 
-// enqueue queues p, a registration of the set and identity key for
-// server, and returns its queues, the channel the one before it of the
-// same key closes, nil if none, and the one it closes itself. Past either
-// bound p takes the place of the key's last one waiting, or is dropped,
-// either way counted and not queued, unless it is an end, which goes past
-// the server's bound by at most MaxThirdParty (serverQueue).
-func (rt *Router) enqueue(server, key string, p *pending) (q *serverQueue, sq *setQueue, prev, done chan struct{}, queued bool) {
+// evicted reports whether an end evicted p.
+func (rt *Router) evicted(p *pending) bool {
+	rt.tp.mu.Lock()
+	defer rt.tp.mu.Unlock()
+	return p.evicted
+}
+
+// enqueue queues p, a registration for server, and returns its server's
+// queue, the channel the one before it of the same key closes, nil if
+// none, and the one it closes itself. Past either bound p takes the place
+// of its key's last one waiting, or, a refresh, is dropped, either way
+// counted and not queued; an end goes past the bounds, or evicts a waiting
+// refresh, or is dropped and counted apart (serverQueue).
+func (rt *Router) enqueue(server string, p *pending) (q *serverQueue, prev, done chan struct{}, queued bool) {
 	rt.tp.mu.Lock()
 	defer rt.tp.mu.Unlock()
 	q = rt.tp.servers[server]
 	if q == nil {
-		q = &serverQueue{slots: make(chan struct{}, rt.cfg.MaxThirdParty), sets: map[string]*setQueue{}}
+		q = &serverQueue{slots: make(chan struct{}, rt.cfg.MaxThirdParty), keys: map[string]*keyQueue{}, sets: map[string]int{}}
 		rt.tp.servers[server] = q
 	}
-	sq = q.sets[key]
+	kq := q.keys[p.key]
 	bound := queuedPerServer * rt.cfg.MaxThirdParty
+	end := p.r.Type == ifc.DeRegistration
 	switch {
-	case q.queued < bound && (sq == nil || sq.queued < queuedPerSet):
-	case sq != nil && sq.last != nil && !sq.last.sent:
-		sq.last.r, sq.last.server = p.r, p.server
+	case q.queued < bound && q.sets[p.set] < queuedPerSet:
+	case kq != nil && kq.last != nil && !kq.last.sent:
+		kq.last.r, kq.last.server = p.r, p.server
 		rt.count("routing.third_party.replaced")
-		return nil, nil, nil, nil, false
-	case p.r.Type == ifc.DeRegistration && q.queued < bound+rt.cfg.MaxThirdParty:
+		return nil, nil, nil, false
+	case end && q.queued < bound+rt.cfg.MaxThirdParty:
 		rt.count("routing.third_party.end_past_bound")
+	case end && rt.evict(q, p.key):
+	case end:
+		rt.count("routing.third_party.end_dropped")
+		return nil, nil, nil, false
 	default:
 		rt.count("routing.third_party.dropped")
-		return nil, nil, nil, nil, false
+		return nil, nil, nil, false
 	}
-	if sq == nil {
-		sq = &setQueue{}
-		q.sets[key] = sq
+	if kq == nil {
+		kq = &keyQueue{}
+		q.keys[p.key] = kq
 	}
-	prev, done = sq.tail, make(chan struct{})
-	sq.tail, sq.last = done, p
-	sq.queued++
+	prev, done = kq.tail, make(chan struct{})
+	kq.tail, kq.last = done, p
+	kq.queued++
+	q.sets[p.set]++
 	q.queued++
-	return q, sq, prev, done, true
+	if !end {
+		q.waiting = append(q.waiting, p)
+	}
+	return q, prev, done, true
+}
+
+// evict evicts the oldest refresh waiting under another key than key, which
+// then is no longer counted and is never sent, and reports whether there
+// was one.
+func (rt *Router) evict(q *serverQueue, key string) bool {
+	for _, w := range q.waiting {
+		if w.key == key || w.sent || w.evicted || w.r.Type == ifc.DeRegistration {
+			continue
+		}
+		w.evicted = true
+		q.unwait(w)
+		if kq := q.keys[w.key]; kq != nil && kq.last == w {
+			kq.last = nil
+		}
+		q.release(w)
+		rt.count("routing.third_party.evicted")
+		return true
+	}
+	return false
+}
+
+// unwait takes p off the refreshes waiting.
+func (q *serverQueue) unwait(p *pending) {
+	if i := slices.Index(q.waiting, p); i >= 0 {
+		q.waiting = slices.Delete(q.waiting, i, i+1)
+	}
+}
+
+// release no longer counts p, sent or evicted.
+func (q *serverQueue) release(p *pending) {
+	q.queued--
+	if q.sets[p.set]--; q.sets[p.set] <= 0 {
+		delete(q.sets, p.set)
+	}
+	if kq := q.keys[p.key]; kq != nil {
+		if kq.queued--; kq.queued == 0 {
+			delete(q.keys, p.key)
+		}
+	}
 }
 
 // thirdPartyServices are the criteria of r's identity.
