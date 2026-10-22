@@ -3,9 +3,13 @@ package awsstore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
@@ -177,6 +181,93 @@ func TestNonceCountsReadAgainAfterLosingARace(t *testing.T) {
 	}
 	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); !ok || err != nil {
 		t.Fatalf("nc 92 once the races stop = %v, %v", ok, err)
+	}
+}
+
+// resendingDynamo applies each update and then sends it again, as the SDK
+// does when the answer to a write that landed is lost, and answers with the
+// second outcome.
+type resendingDynamo struct{ *fakeDynamo }
+
+func (r resendingDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	_, _ = r.fakeDynamo.UpdateItem(ctx, in, opts...)
+	return r.fakeDynamo.UpdateItem(ctx, in, opts...)
+}
+
+func TestNonceCountResentAfterItLandedIsAccepted(t *testing.T) {
+	s, _, ddb := fakeStores(t)
+	resent := &NonceCounts{api: resendingDynamo{ddb}, table: s.NonceCounts.table, now: s.NonceCounts.now}
+	ctx := t.Context()
+	exp := storetest.T0.Add(time.Minute)
+	if ok, err := resent.Advance(ctx, "alice", "n", 3, exp); !ok || err != nil {
+		t.Fatalf("Advance whose write was resent = %v, %v; want the count it recorded", ok, err)
+	}
+	// The count is recorded: another request with it is a replay, resent
+	// or not.
+	for _, n := range []*NonceCounts{s.NonceCounts, resent} {
+		if ok, err := n.Advance(ctx, "alice", "n", 3, exp); ok || err != nil {
+			t.Fatalf("nc 3 again = %v, %v", ok, err)
+		}
+	}
+	if ok, err := resent.Advance(ctx, "alice", "n", 2, exp); !ok || err != nil {
+		t.Fatalf("nc 2 = %v, %v", ok, err)
+	}
+}
+
+func TestNonceCountResentBySDKAfterItLandedIsAccepted(t *testing.T) {
+	// Over the SDK: the first UpdateItem lands but answers 500, the resend
+	// fails its condition and gets back the item the first one wrote.
+	var mu sync.Mutex
+	var item map[string]any
+	updates := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		var in struct {
+			ExpressionAttributeValues           map[string]map[string]string
+			ReturnValuesOnConditionCheckFailure string
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		switch r.Header.Get("X-Amz-Target") {
+		case "DynamoDB_20120810.GetItem":
+			_, _ = io.WriteString(w, `{}`)
+		case "DynamoDB_20120810.UpdateItem":
+			updates++
+			if updates == 1 {
+				v := in.ExpressionAttributeValues
+				item = map[string]any{"pk": map[string]string{"S": "n"}, "nc": v[":nc"], "nc_window": v[":w"],
+					"nc_window_at": v[":nc"], "expires": v[":e"], "ttl": v[":ttl"], "nc_writer": v[":by"]}
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"lost"}`)
+				return
+			}
+			body := map[string]any{"__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException", "message": "The conditional request failed"}
+			if in.ReturnValuesOnConditionCheckFailure == "ALL_OLD" {
+				body["Item"] = item
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(body)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"unexpected"}`)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "local")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	stores, err := New(t.Context(), Config{Table: "files", DynamoDBEndpoint: srv.URL, Now: func() time.Time { return storetest.T0 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := stores.NonceCounts.Advance(t.Context(), "alice", "n", 1, storetest.T0.Add(time.Minute))
+	if !ok || err != nil {
+		t.Fatalf("Advance = %v, %v; want the count that landed", ok, err)
+	}
+	if updates != 2 {
+		t.Fatalf("%d UpdateItem calls, want the original and one resend", updates)
 	}
 }
 

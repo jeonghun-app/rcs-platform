@@ -376,12 +376,14 @@ holds three kinds of item:
 |---|---|
 | `f#<file id>` | The upload record: owner, tid, state, file name, content type, sizes, SHA-256, hash state, object key, multipart id and parts (number, ETag, size, CRC32), thumbnail, times, lease, version |
 | `t#<len(owner)>#<owner><tid>` | The owner's tid, pointing at the file id. It is created in one transaction with the record |
-| `n#<len(user)>#<user><nonce>` | The Digest nonce-counts used with (user, nonce): the highest (`nc`), which of the 32 counts ending at it were used, as a bitmap (`nc_window`), and the highest count that bitmap was written for (`nc_window_at`) |
+| `n#<len(user)>#<user><nonce>` | The Digest nonce-counts used with (user, nonce): the highest (`nc`), which of the 32 counts ending at it were used, as a bitmap (`nc_window`), the highest count that bitmap was written for (`nc_window_at`), and a random token of the last write (`nc_writer`) |
 
 Every record write is conditional on the version read. A nonce-count write is
 conditional on the item being as it was read, and on a conflict the item is
-read again, up to 16 times. Request reads are strongly consistent; the
-sweeper's scan is not (see below). Records and tid
+read again, up to 16 times. When the SDK resends a nonce-count write whose
+answer was lost, the item that fails the resend's condition names the write's
+own token, so the count is not taken for a replay. Request reads are strongly
+consistent; the sweeper's scan is not (see below). Records and tid
 items expire 30 days after their validity ends. Nonce-counts expire one hour
 after their nonce. An upload has at most 4999 parts, which keeps a record well
 inside DynamoDB's 400 KB item limit.

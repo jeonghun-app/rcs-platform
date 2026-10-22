@@ -2,6 +2,7 @@ package awsstore
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"math"
@@ -63,6 +64,7 @@ const (
 	attrNC         = "nc"
 	attrNCWindow   = "nc_window"
 	attrNCWindowAt = "nc_window_at"
+	attrNCWriter   = "nc_writer"
 )
 
 // PartitionKey is the name of the table's partition key, for whoever
@@ -292,8 +294,14 @@ var nonceCountAttrs = []struct{ name, attr string }{
 // window, so the window counts only where nc_window_at equals nc. Elsewhere
 // every count up to nc is taken as used, as that version did. DynamoDB
 // deletes expired items late, so expiry is checked here.
+//
+// Each Advance writes a random token of its own in nc_writer. The SDK resends
+// a write whose answer was lost; if the first one had landed, the resend
+// fails its condition, and the item that comes back carries this token, so
+// the count is ours rather than a replay.
 func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
 	k := key(nonceKey(username, nonce))
+	writer := rand.Text()
 	for range maxNonceCountAttempts {
 		out, err := n.api.GetItem(ctx, &dynamodb.GetItemInput{
 			TableName:      aws.String(n.table),
@@ -311,12 +319,13 @@ func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc ui
 		if !ok {
 			return false, nil
 		}
-		names := map[string]string{"#ttl": attrTTL}
+		names := map[string]string{"#ttl": attrTTL, "#by": attrNCWriter}
 		values := map[string]types.AttributeValue{
 			":nc":  num(int64(next.Highest)),
 			":w":   num(int64(next.Window)),
 			":e":   num(expires.UnixMilli()),
 			":ttl": num(expires.Add(time.Hour).Unix()),
+			":by":  str(writer),
 		}
 		var unchanged []string
 		for _, a := range nonceCountAttrs {
@@ -329,15 +338,19 @@ func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc ui
 			}
 		}
 		_, err = n.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-			TableName:                 aws.String(n.table),
-			Key:                       k,
-			UpdateExpression:          aws.String("SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl"),
-			ConditionExpression:       aws.String(strings.Join(unchanged, " AND ")),
-			ExpressionAttributeNames:  names,
-			ExpressionAttributeValues: values,
+			TableName:                           aws.String(n.table),
+			Key:                                 k,
+			UpdateExpression:                    aws.String("SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl, #by = :by"),
+			ConditionExpression:                 aws.String(strings.Join(unchanged, " AND ")),
+			ExpressionAttributeNames:            names,
+			ExpressionAttributeValues:           values,
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		})
 		var failed *types.ConditionalCheckFailedException
 		if errors.As(err, &failed) {
+			if by, ok := failed.Item[attrNCWriter].(*types.AttributeValueMemberS); ok && by.Value == writer {
+				return true, nil
+			}
 			continue
 		}
 		if err != nil {

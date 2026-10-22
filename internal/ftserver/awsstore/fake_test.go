@@ -123,10 +123,10 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 	if f.fail != nil {
 		return nil, f.fail
 	}
-	if got := aws.ToString(in.UpdateExpression); got != "SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl" {
+	if got := aws.ToString(in.UpdateExpression); got != "SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl, #by = :by" {
 		f.t.Fatalf("UpdateItem %q", got)
 	}
-	for name, attr := range map[string]string{"#nc": attrNC, "#w": attrNCWindow, "#at": attrNCWindowAt, "#e": attrExpires, "#ttl": attrTTL} {
+	for name, attr := range map[string]string{"#nc": attrNC, "#w": attrNCWindow, "#at": attrNCWindowAt, "#e": attrExpires, "#ttl": attrTTL, "#by": attrNCWriter} {
 		if got := in.ExpressionAttributeNames[name]; got != attr {
 			f.t.Fatalf("UpdateItem names %s as %q", name, got)
 		}
@@ -146,12 +146,16 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 			f.t.Fatalf("UpdateItem condition %q", aws.ToString(in.ConditionExpression))
 		}
 		if !held {
-			return nil, &dtypes.ConditionalCheckFailedException{}
+			failed := &dtypes.ConditionalCheckFailedException{}
+			if in.ReturnValuesOnConditionCheckFailure == dtypes.ReturnValuesOnConditionCheckFailureAllOld {
+				failed.Item = maps.Clone(cur)
+			}
+			return nil, failed
 		}
 	}
 	f.rows[pk] = map[string]dtypes.AttributeValue{
 		attrPK: in.Key[attrPK], attrNC: v[":nc"], attrNCWindow: v[":w"], attrNCWindowAt: v[":nc"],
-		attrExpires: v[":e"], attrTTL: v[":ttl"],
+		attrExpires: v[":e"], attrTTL: v[":ttl"], attrNCWriter: v[":by"],
 	}
 	return &dynamodb.UpdateItemOutput{}, nil
 }
