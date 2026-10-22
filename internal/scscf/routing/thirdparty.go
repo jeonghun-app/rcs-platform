@@ -52,9 +52,10 @@ type thirdParty struct {
 // key, which the identity's next re-registration makes good, and only with
 // none to evict is it dropped, counted apart (#446 QA, the lead's decision
 // on #420). So at most (queuedPerServer+1) × MaxThirdParty are counted,
-// which bounds the goroutines that wait for a server that does not answer;
-// those evicted end at once, but for waiting for the one before them of
-// their identity.
+// which bounds the goroutines that wait for a server that does not answer.
+// Those evicted are outside that bound: each lingers until the one before
+// it of its identity is done and it gets a slot, which it gives back at
+// once, sending nothing.
 type serverQueue struct {
 	slots  chan struct{}
 	queued int
@@ -152,9 +153,6 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 			if prev != nil {
 				<-prev
 			}
-			if rt.evicted(p) {
-				return
-			}
 			q.slots <- struct{}{}
 			defer func() { <-q.slots }()
 			rt.tp.mu.Lock()
@@ -172,13 +170,6 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 			rt.tp.mu.Unlock()
 		}()
 	}
-}
-
-// evicted reports whether an end evicted p.
-func (rt *Router) evicted(p *pending) bool {
-	rt.tp.mu.Lock()
-	defer rt.tp.mu.Unlock()
-	return p.evicted
 }
 
 // enqueue queues p, a registration for server, and returns its server's
@@ -229,24 +220,44 @@ func (rt *Router) enqueue(server string, p *pending) (q *serverQueue, prev, done
 	return q, prev, done, true
 }
 
-// evict evicts the oldest refresh waiting under another key than key, which
-// then is no longer counted and is never sent, and reports whether there
-// was one.
+// evict evicts the oldest re-registration waiting under another key than
+// key, or with none the oldest initial registration, which then is no
+// longer counted and is never sent, and reports whether there was one. A
+// re-registration lost is no loss to the server, which knows the
+// registration and its last Expires; an initial one lost leaves it unaware
+// of the user until the next refresh, and rcs-as holds the user's stored
+// messages until then (#446 code review).
 func (rt *Router) evict(q *serverQueue, key string) bool {
-	for _, w := range q.waiting {
-		if w.key == key || w.sent || w.evicted || w.r.Type == ifc.DeRegistration {
-			continue
+	for _, typ := range []ifc.RegistrationType{ifc.ReRegistration, ifc.InitialRegistration} {
+		if w := q.oldestWaiting(key, typ); w != nil {
+			rt.evictOne(q, w)
+			return true
 		}
-		w.evicted = true
-		q.unwait(w)
-		if kq := q.keys[w.key]; kq != nil && kq.last == w {
-			kq.last = nil
-		}
-		q.release(w)
-		rt.count("routing.third_party.evicted")
-		return true
 	}
 	return false
+}
+
+// oldestWaiting is the oldest registration of typ waiting under another key
+// than key, nil if none. The type is the one it carries now, after any
+// replacement.
+func (q *serverQueue) oldestWaiting(key string, typ ifc.RegistrationType) *pending {
+	for _, w := range q.waiting {
+		if w.key != key && !w.sent && !w.evicted && w.r.Type == typ {
+			return w
+		}
+	}
+	return nil
+}
+
+// evictOne evicts w: it is no longer counted, and never sent.
+func (rt *Router) evictOne(q *serverQueue, w *pending) {
+	w.evicted = true
+	q.unwait(w)
+	if kq := q.keys[w.key]; kq != nil && kq.last == w {
+		kq.last = nil
+	}
+	q.release(w)
+	rt.count("routing.third_party.evicted")
 }
 
 // unwait takes p off the refreshes waiting.

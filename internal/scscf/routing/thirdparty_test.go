@@ -877,6 +877,37 @@ func TestASetsEndIsNotDroppedWhenItsServersQueueIsFull(t *testing.T) {
 	}
 }
 
+// TestAnEndEvictsARefreshBeforeAnInitialRegistration (#446 code review):
+// an initial registration lost leaves the server unaware of the user, a
+// refresh lost does not, so an end evicts the refreshes waiting first,
+// though the initial registration is older.
+func TestAnEndEvictsARefreshBeforeAnInitialRegistration(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	rt.Registered(bg, otherSet(t, e, 0))
+	recv(t, s.inside)
+	rt.Registered(bg, otherSet(t, e, 1))
+	for n := 2; n <= 3; n++ {
+		r := otherSet(t, e, n)
+		r.Type = ifc.ReRegistration
+		rt.Registered(bg, r)
+	}
+	for n := 100; n <= 101; n++ {
+		r := otherSet(t, e, n)
+		r.Type, r.Expires = ifc.DeRegistration, 0
+		rt.Registered(bg, r)
+	}
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 1 {
+		t.Errorf("the initial registration heard %v: an end evicted it with refreshes waiting", got)
+	}
+	if got := len(s.expiresOf("sip:user002@"+realm)) + len(s.expiresOf("sip:user003@"+realm)); got != 1 {
+		t.Errorf("%d of the two refreshes sent, want one evicted", got)
+	}
+}
+
 // TestAnEndIsDroppedOnlyWithNothingButEndsQueued (#446, the lead's decision
 // on #420): with the server's queue and its headroom full of ends, none of
 // them a refresh to evict, one more end is dropped and counted apart.
