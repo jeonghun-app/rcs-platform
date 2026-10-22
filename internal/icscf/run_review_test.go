@@ -143,10 +143,17 @@ func TestTheSettingsReachTheServiceTheyConfigure(t *testing.T) {
 
 // QA [minor] 4: ready, then the HSS stops (with a DPR), then it is back:
 // /readyz follows, and requests in between get the 480.
+//
+// The Cx reconnect delay is held at 20 ms. With the default backoff, which
+// grows on the wall clock while the HSS is gone, a loaded host that was
+// slow to get the 480 left the next try past the 10 s wait (#606). The
+// wait for the return fails only once nothing has moved for realWait.
 func TestReadinessFollowsTheHSSGoingAndComing(t *testing.T) {
 	hss := startHSS(t)
 	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "" }
-	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}})
+	r := startICSCF(t, hss, []SCSCF{{URI: mustURI("sip:scscf.rcs.local;transport=tcp")}}, func(_ *ServiceConfig, d *deps) {
+		d.hssReconnect = 20 * time.Millisecond
+	})
 	r.waitReady(t)
 	_ = hss.node.Shutdown(context.Background())
 	r.waitReadiness(t, 503)
@@ -156,7 +163,48 @@ func TestReadinessFollowsTheHSSGoingAndComing(t *testing.T) {
 	}
 	again := startHSSAt(t, "hss-0a1b2c.rcs.local", hss.addr)
 	again.answer = hss.answer
-	r.waitReadiness(t, 200)
+	r.waitReconnected(t, again)
+}
+
+// reconnectGuard bounds waitReconnected however much moves.
+const reconnectGuard = 2 * time.Minute
+
+// waitReconnected waits until /readyz answers 200 with hss back. It fails
+// once none of the steps there has moved for realWait: hss accepting a
+// connection, the capabilities exchange opening the peer, /readyz
+// answering 200. A loaded host slows each step without stopping it.
+func (r *running) waitReconnected(t *testing.T, hss *diameterHSS) {
+	t.Helper()
+	step := func() int {
+		switch {
+		case hss.ln.accepted.Load() == 0:
+			return 0
+		case len(hss.node.Peers()) == 0:
+			return 1
+		}
+		return 2
+	}
+	start, last := time.Now(), step()
+	moved := start
+	for {
+		r.h.Advance(2 * time.Second)
+		if got, _ := r.h.Get("/readyz"); got == 200 {
+			return
+		}
+		now := time.Now()
+		if s := step(); s != last {
+			last, moved = s, now
+		}
+		stuck := []string{"no connection accepted", "the capabilities exchange not done", "/readyz still not 200"}[last]
+		switch {
+		case now.Sub(moved) > realWait:
+			_, body := r.h.Get("/readyz")
+			t.Fatalf("waiting for the HSS's return: %s for %v: %s", stuck, realWait, body)
+		case now.Sub(start) > reconnectGuard:
+			t.Fatalf("waiting for the HSS's return: still moving after %v, %s", reconnectGuard, stuck)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // waitReadiness waits until /readyz answers code.

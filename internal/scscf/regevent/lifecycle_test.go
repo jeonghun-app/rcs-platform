@@ -196,19 +196,64 @@ func (silent) Send(ctx context.Context, _ *sip.Request) (*sip.Response, error) {
 	return nil, ctx.Err()
 }
 
+// timedOut answers no NOTIFY: it reports the NOTIFY's timeout at once, as
+// Send does for a subscriber that never answers, and keeps the deadline
+// the NOTIFY was sent under.
+type timedOut struct {
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (s *timedOut) Send(ctx context.Context, _ *sip.Request) (*sip.Response, error) {
+	d, _ := ctx.Deadline()
+	s.mu.Lock()
+	s.deadline = d
+	s.mu.Unlock()
+	return nil, fmt.Errorf("no answer: %w", context.DeadlineExceeded)
+}
+
+// deleteDeadlines is ctxStore that also keeps the deadline of each delete.
+type deleteDeadlines struct {
+	ctxStore
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (d *deleteDeadlines) DeleteSubscription(ctx context.Context, s *state.Subscription) error {
+	dl, _ := ctx.Deadline()
+	d.mu.Lock()
+	d.deadlines = append(d.deadlines, dl)
+	d.mu.Unlock()
+	return d.ctxStore.DeleteSubscription(ctx, s)
+}
+
 // TestASubscriberThatDoesNotAnswerLosesItsSubscription: the NOTIFY's
-// timeout must not also end the delete (QA's M2 on #256).
+// timeout must not also end the delete (QA's M2 on #256): the delete runs
+// under a deadline of its own, later than the NOTIFY's, and the
+// subscription goes. The NOTIFY's timeout is reported at once, rather
+// than waited out on the wall clock, which a loaded host stretched past
+// the delete's own bound (#604).
 func TestASubscriberThatDoesNotAnswerLosesItsSubscription(t *testing.T) {
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
 	e.subscribed(e.notifier(1))
-	n := newNotifierWith(t, e, ctxStore{e.store}, silent{}, func(c *Config) { c.NotifyTimeout = 50 * time.Millisecond })
+	st, s := &deleteDeadlines{ctxStore: ctxStore{e.store}}, &timedOut{}
+	n := newNotifierWith(t, e, st, s, func(c *Config) { c.NotifyTimeout = time.Minute })
 	after := before.Clone()
 	after.Contacts[0].Expires = t0.Add(2 * time.Hour)
 	n.Changed(bg, before, e.saved(after), Registered)
 	n.Wait()
 	if subs := e.subscriptions(impu1); len(subs) != 0 {
 		t.Errorf("%d subscriptions left after a NOTIFY nobody answered", len(subs))
+	}
+	st.mu.Lock()
+	deletes := st.deadlines
+	st.mu.Unlock()
+	s.mu.Lock()
+	sent := s.deadline
+	s.mu.Unlock()
+	if len(deletes) == 0 || sent.IsZero() || !deletes[len(deletes)-1].After(sent) {
+		t.Errorf("the delete's deadlines %v, the NOTIFY's %v: want one of its own, later", deletes, sent)
 	}
 }
 

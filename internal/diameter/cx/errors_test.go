@@ -227,10 +227,10 @@ func TestRequestsMissingARequiredFieldAreNotBuilt(t *testing.T) {
 				AuthDataItem: AuthDataItem{Digest: &DigestAuthenticate{Realm: realm, QoP: "auth"}}}).Message(n)
 		},
 		"PPR with a digest without realm": func() (*diameter.Message, error) {
-			return (&PPR{Request: r, UserName: impi, AuthDataItem: &AuthDataItem{Digest: &DigestAuthenticate{QoP: "auth", HA1: "x"}}}).Message(n)
+			return (&PPR{Request: r, UserName: impi, AuthDataItem: &AuthDataItem{Digest: &DigestAuthenticate{QoP: "auth", HA1: secret.NewString("x")}}}).Message(n)
 		},
 		"PPR with a digest without QoP": func() (*diameter.Message, error) {
-			return (&PPR{Request: r, UserName: impi, AuthDataItem: &AuthDataItem{Digest: &DigestAuthenticate{Realm: realm, HA1: "x"}}}).Message(n)
+			return (&PPR{Request: r, UserName: impi, AuthDataItem: &AuthDataItem{Digest: &DigestAuthenticate{Realm: realm, HA1: secret.NewString("x")}}}).Message(n)
 		},
 		"PPR with a charging name that is not a URI": func() (*diameter.Message, error) {
 			return (&PPR{Request: r, UserName: impi, ChargingInformation: &ChargingInformation{PrimaryEventChargingFunctionName: "ocs.example"}}).Message(n)
@@ -261,7 +261,7 @@ func TestAuthenticationVectorsAreNotPrintedOrLogged(t *testing.T) {
 		ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5,
 		Authenticate: seq(32, 0x61), Authorization: secret.NewKey(seq(8, 0x61)),
 		ConfidentialityKey: secret.NewKey(seq(16, 0x61)), IntegrityKey: secret.NewKey(seq(16, 0x61)),
-		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: ha1},
+		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: secret.NewString(ha1)},
 	}
 	maa := MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), AuthDataItems: []AuthDataItem{item}}
 	var logged bytes.Buffer
@@ -296,7 +296,7 @@ func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
 	item := AuthDataItem{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5,
 		Authenticate: seq(32, 0x41), Authorization: secret.NewKey(seq(8, 0x30)),
 		ConfidentialityKey: secret.NewKey(key), IntegrityKey: secret.NewKey(key),
-		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: ha1, AlternateHA1: ha1 + ha1}}
+		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: secret.NewString(ha1), AlternateHA1: secret.NewString(ha1 + ha1)}}
 	credentials := []string{ha1, "abcdefgh",
 		base64.StdEncoding.EncodeToString(key)[:12],
 		base64.StdEncoding.EncodeToString(seq(32, 0x41))[:12],
@@ -348,21 +348,28 @@ func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
 	}
 }
 
-// An item's XRES, CK and IK print as their placeholder under these verbs,
-// valid ones and the invalid %p and %w, which call no method and print the
-// fields, in an item, its pointer, a slice, a map and the answer that holds
-// it: neither in hex of either case nor as %d writes bytes (#570).
+// An item's XRES, CK and IK and its digest's HA1s print as their
+// placeholder under these verbs, valid ones and invalid ones such as %p, %w
+// and %t, which call no method and print the fields, in an item, its
+// pointer, a slice, a map, the answer that holds it and the digest itself:
+// neither as text, nor in hex of either case, nor as %d writes bytes (#570,
+// #594).
 func TestTheKeysOfAnItemNeverPrint(t *testing.T) {
 	xres, ck, ik := seq(8, 0xa0), seq(16, 0xb0), seq(16, 0xc0)
+	ha1, alternate := "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	digest := DigestAuthenticate{Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: secret.NewString(ha1),
+		AlternateAlgorithm: "SHA-256", AlternateHA1: secret.NewString(alternate)}
 	item := AuthDataItem{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5, Authenticate: seq(32, 0x10),
-		Authorization: secret.NewKey(xres), ConfidentialityKey: secret.NewKey(ck), IntegrityKey: secret.NewKey(ik)}
+		Authorization: secret.NewKey(xres), ConfidentialityKey: secret.NewKey(ck), IntegrityKey: secret.NewKey(ik),
+		Digest: &digest}
 	maa := MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), AuthDataItems: []AuthDataItem{item}}
 	var forms []string
-	for _, k := range [][]byte{xres, ck, ik} {
+	for _, k := range [][]byte{xres, ck, ik, []byte(ha1), []byte(alternate)} {
 		forms = append(forms, fmt.Sprintf("%x", k[:6]), fmt.Sprintf("%X", k[:6]), strings.Trim(fmt.Sprint(k[:6]), "[]"), string(k[:6]))
 	}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%b", "%p", "%w", "%c", "%e"} {
-		for _, v := range []any{item, &item, []AuthDataItem{item}, map[string]AuthDataItem{"k": item}, maa, &maa} {
+	verbs := []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%O", "%b", "%p", "%w", "%c", "%U", "%e", "%f", "%g"}
+	for _, verb := range verbs {
+		for _, v := range []any{item, &item, []AuthDataItem{item}, map[string]AuthDataItem{"k": item}, maa, &maa, digest, &digest} {
 			out := fmt.Sprintf(verb, v)
 			for _, form := range forms {
 				if strings.Contains(out, form) {

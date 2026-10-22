@@ -538,7 +538,7 @@ func TestIssuedIMSCredentialAuthenticatesOverCx(t *testing.T) {
 	c := connectCSCF(t, serveHSS(t, a.h, "hss-a.rcs.local"), "scscf-1.rcs.local")
 	maa := c.mar(impi1, impu1, cx.SchemeSIPDigest, 1, scscfName, nil)
 	want, _ := digest.ComputeHA1(digest.SHA256, impi1, domain, []byte(pw))
-	if maa.Result != resSuccess || maa.AuthDataItems[0].Digest.AlternateHA1 != want {
+	if maa.Result != resSuccess || maa.AuthDataItems[0].Digest.AlternateHA1.RevealString() != want {
 		t.Fatalf("MAA = %+v", maa)
 	}
 	// The password is in the issuing responses only, never in a log.
