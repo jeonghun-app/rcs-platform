@@ -331,10 +331,10 @@ func readKey(e *runtime.Env, name string, required bool, why string) []byte {
 	return []byte(v)
 }
 
-// readKeyPair reads name, the current key, and name_PREVIOUS, the one it
-// replaced, which is kept during a rotation so that what it sealed or
-// signed still opens. The previous key needs a current one, and must
-// differ from it.
+// readKeyPair reads name, the key that signs or seals, and name_PREVIOUS,
+// the other key of a rotation, which only verifies or opens: the new key
+// before every task signs with it, then the old one until what it made has
+// expired (docs/scscf.md). It needs a current key, and must differ from it.
 func readKeyPair(e *runtime.Env, name string, required bool, why string) (current, previous []byte) {
 	current = readKey(e, name, required, why)
 	previous = readKey(e, name+"_PREVIOUS", false, "")
@@ -350,9 +350,10 @@ func readKeyPair(e *runtime.Env, name string, required bool, why string) (curren
 }
 
 // keyID names a key in what it seals or signs: the first 8 hex digits of
-// its SHA-256, the same on every task, which tells nothing of the key.
+// its SHA-256 under a label of its own, the same on every task, which
+// tells nothing of the key and matches no other hash of it.
 func keyID(key []byte) string {
-	sum := sha256.Sum256(key)
+	sum := sha256.Sum256(append([]byte("rcs scscf key id|"), key...))
 	return hex.EncodeToString(sum[:4])
 }
 
