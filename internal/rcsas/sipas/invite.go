@@ -159,19 +159,24 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 	case err != nil:
 		ss.final = true
 		s.cfg.Metrics.Count("sip.invite.timeout", 1)
-		go s.referDone(ss.group, ss.user, false)
-		go ss.fail(fmt.Errorf("sipas: invite: %w", messaging.ErrOffline))
+		// What the goroutines get is read here, under mu, as a go
+		// statement's arguments would be.
+		group, user := ss.group, ss.user
+		s.goRun("invite answer", func() { s.referDone(group, user, false) })
+		s.goRun("invite answer", func() { ss.fail(fmt.Errorf("sipas: invite: %w", messaging.ErrOffline)) })
 	case res.StatusCode < 200:
 	case res.StatusCode >= 300:
 		if !ss.final {
 			ss.final = true
 			s.cfg.Metrics.Count(fmt.Sprintf("sip.invite.%d", res.StatusCode), 1)
-			go s.referDone(ss.group, ss.user, false)
+			group, user := ss.group, ss.user
+			s.goRun("invite answer", func() { s.referDone(group, user, false) })
 			if ss.group != "" && res.StatusCode == 603 {
-				go ss.declined()
+				s.goRun("invite answer", func() { ss.declined() })
 				return
 			}
-			go ss.fail(inviteOutcome(ss, res.StatusCode))
+			outcome := inviteOutcome(ss, res.StatusCode)
+			s.goRun("invite answer", func() { ss.fail(outcome) })
 		}
 	case ss.d == nil && ss.noDialog:
 		// A retransmission of the 2xx that set up no dialog: the engine
@@ -180,7 +185,8 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 	case ss.d == nil && ss.final:
 		// A 2xx from another fork after the INVITE failed: it must be
 		// acknowledged and ended (RFC 3261 §13.2.2.4).
-		go s.dropFork(req, res, ss.firstDrop(res))
+		first := ss.firstDrop(res)
+		s.goRun("invite answer", func() { s.dropFork(req, res, first) })
 	case ss.d == nil:
 		ss.final = true
 		d, err := dialog.UAC(req, res)
@@ -189,22 +195,23 @@ func (s *Server) inviteAnswered(ss *session, req *sip.Request, res *sip.Response
 			// Without a dialog there is no ACK to send; the client's
 			// UAS gives up on its 2xx and ends the session.
 			s.cfg.Metrics.Count("sip.invite.no_dialog", 1)
-			go ss.fail(err)
+			s.goRun("invite answer", func() { ss.fail(err) })
 			return
 		}
 		ack, err := d.Request("ACK", s.ids)
 		if err != nil {
-			go ss.fail(err)
+			s.goRun("invite answer", func() { ss.fail(err) })
 			return
 		}
 		ss.d, ss.ack = d, ack
 		ss.interval = answeredInterval(res)
-		go s.established(ss, res)
+		s.goRun("invite answer", func() { s.established(ss, res) })
 	case sameDialog(ss.d, res):
 		ack, next := ss.ack, ss.d.NextHop()
-		go s.sendACK(ack, next)
+		s.goRun("invite answer", func() { s.sendACK(ack, next) })
 	default:
-		go s.dropFork(req, res, ss.firstDrop(res))
+		first := ss.firstDrop(res)
+		s.goRun("invite answer", func() { s.dropFork(req, res, first) })
 	}
 }
 

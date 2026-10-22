@@ -459,6 +459,16 @@ func (b *binder) Bind(c *msrp.Conn, to msrp.URI) (*msrp.Session, error) {
 		}
 		return nil, b.refuseHard(c, errOverload)
 	}
+	// The slot comes back once, even after a panic in a store call (#471
+	// code review).
+	held := true
+	release := func() {
+		if held {
+			held = false
+			r.release()
+		}
+	}
+	defer release()
 
 	id := BindingID(to.SessionID)
 	bnd, err := r.awaitComplete(id)
@@ -466,7 +476,7 @@ func (b *binder) Bind(c *msrp.Conn, to msrp.URI) (*msrp.Session, error) {
 		// This connection held the binding and its bridge has ended, most
 		// likely from the core side; the client, which cannot know, names
 		// the session again. Not a second connection: the session is over.
-		r.release()
+		release()
 		charged = false
 		r.o.Metrics.refuse(reasonEndedSession)
 		return nil, msrp.ErrNoSession
@@ -476,7 +486,7 @@ func (b *binder) Bind(c *msrp.Conn, to msrp.URI) (*msrp.Session, error) {
 	}
 	// The slot covers the store calls only: connecting to rcs-as happens
 	// outside it, so one unreachable rcs-as cannot use up every slot.
-	r.release()
+	release()
 	if err != nil {
 		charged = errors.Is(err, store.ErrNotFound)
 		return nil, b.refuseBind(c, id, err)

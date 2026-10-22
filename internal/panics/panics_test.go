@@ -76,9 +76,9 @@ func TestARecoveredPanicIsCountedAndLoggedWithoutItsValue(t *testing.T) {
 	}
 	out := logs.String()
 	for _, want := range []string{
-		`msg="x: a callback panicked" hook=Callback panic=string at="panics.failing panics_test.go:`,
-		`hook=NilMap panic="assignment to entry in nil map"`,
-		`hook=Error panic=*errors.errorString`,
+		`msg="x: a callback panicked" name=Callback panic=string at="panics.failing panics_test.go:`,
+		`name=NilMap panic="assignment to entry in nil map"`,
+		`name=Error panic=*errors.errorString`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the log lacks %s:\n%s", want, out)
@@ -113,7 +113,7 @@ func TestEachNameLogsOneLineAMinute(t *testing.T) {
 	start := time.Unix(1_800_000_000, 0)
 	now := start
 	g := New(Config{Metric: "x.panics", Message: "x", Log: slog.New(slog.NewTextHandler(&logs, nil)), Now: func() time.Time { return now }, Start: start})
-	lines := func(name string) int { return strings.Count(logs.String(), "hook="+name+" ") }
+	lines := func(name string) int { return strings.Count(logs.String(), "name="+name+" ") }
 	for i, step := range []struct {
 		advance time.Duration
 		want    int
@@ -147,5 +147,18 @@ func TestKindNamesAValueWithoutItsContents(t *testing.T) {
 		if got := Kind(v); got != want {
 			t.Errorf("Kind(%T) = %q, want %q", v, got, want)
 		}
+	}
+}
+
+// A Guard given no logger writes to slog's default one, still without the
+// panic's value.
+func TestAGuardWithoutALoggerWritesToTheDefaultOne(t *testing.T) {
+	var logs lockedBuffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	New(Config{Metric: "x.panics", Message: "x: a callback panicked"}).Run("Callback", failing)
+	if out := logs.String(); !strings.Contains(out, "name=Callback") || strings.Contains(out, "panic-secret") {
+		t.Errorf("default log:\n%s", out)
 	}
 }

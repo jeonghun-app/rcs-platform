@@ -71,7 +71,7 @@ func TestAPanicInAResponseHandlerEndsOnlyThatCall(t *testing.T) {
 		t.Errorf("%s = %d, want 1", MetricHandlerPanics, n)
 	}
 	out := logs.String()
-	if !strings.Contains(out, "hook=ResponseHandler") {
+	if !strings.Contains(out, "name=ResponseHandler") {
 		t.Errorf("the log does not name the handler:\n%s", out)
 	}
 	if strings.Contains(out, "handler-secret") || strings.Contains(out, "alice@") {

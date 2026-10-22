@@ -38,8 +38,12 @@ func TestAPanicOnAClientConnectionEndsOnlyThatConnection(t *testing.T) {
 	if got := r.metrics.count(msrp.MetricCallbackPanics); got != 1 {
 		t.Fatalf("%s = %d, want 1", msrp.MetricCallbackPanics, got)
 	}
-	// The connection's end says why.
+	// The connection's end says why, and its bind slot is free again
+	// (#471 code review).
 	eventually(t, "Client.Closed.Panicked", func() bool { return r.metrics.count(mClientPrefix+"Closed.Panicked") == 1 })
+	if n := len(r.relays[0].binds); n != 0 {
+		t.Fatalf("%d bind slots held after the panic", n)
+	}
 	if _, err := r.dial(0, nil).open(t, b.clientPath, newRecorder()); err != nil {
 		t.Fatalf("the next connection: %v", err)
 	}
@@ -81,4 +85,40 @@ func TestAPanicBeforeAClientConnectionReadsEndsOnlyThatConnection(t *testing.T) 
 	if _, err := r.dial(0, nil).open(t, b.clientPath, newRecorder()); err != nil {
 		t.Fatalf("the next connection: %v", err)
 	}
+}
+
+// readPanicsOnce panics in its first Read, as a bug in reading the core's
+// input would.
+type readPanicsOnce struct {
+	net.Conn
+	read atomic.Bool
+}
+
+func (c *readPanicsOnce) Read(b []byte) (int, error) {
+	if c.read.CompareAndSwap(false, true) {
+		panic("core")
+	}
+	return c.Conn.Read(b)
+}
+
+// A panic on a connection toward rcs-as is counted as msrp.callback_panics
+// too, and its end as Core.Closed.Panicked: newRelay gives the core side
+// the guard as well (#471 QA).
+func TestAPanicOnACoreConnectionIsCounted(t *testing.T) {
+	r := newRig(t, 1, func(o *relayOptions) {
+		dial := o.Dial
+		o.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			nc, err := dial(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &readPanicsOnce{Conn: nc}, nil
+		}
+	})
+	b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}, "core_path": []string{r.as.uri("asc0re")}})
+	r.as.session(t, "asc0re", b.coreLocal, newRecorder())
+	_, _ = r.dial(0, nil).open(t, b.clientPath, newRecorder())
+	eventually(t, "the core connection's panic", func() bool {
+		return r.metrics.count(msrp.MetricCallbackPanics) == 1 && r.metrics.count(mCorePrefix+"Closed.Panicked") == 1
+	})
 }

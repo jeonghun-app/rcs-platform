@@ -45,7 +45,7 @@ func TestAPanicInBackgroundWorkEndsThatWorkOnly(t *testing.T) {
 	if n := counts.n[metricBackgroundPanics]; n != 1 {
 		t.Errorf("%s = %d, want 1", metricBackgroundPanics, n)
 	}
-	if !strings.Contains(logs.String(), "hook=regevent") {
+	if !strings.Contains(logs.String(), "name=regevent") {
 		t.Errorf("the log does not name the work:\n%s", logs.String())
 	}
 }

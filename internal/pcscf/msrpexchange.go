@@ -193,6 +193,9 @@ func (p *pcscf) createFailed(err error) {
 // errCreateAbandoned is a binding create that ctx ended first (create).
 var errCreateAbandoned = errors.New("pcscf: binding create given up")
 
+// errRelayPanicked is a relay call that panicked (create).
+var errRelayPanicked = errors.New("pcscf: the relay call panicked")
+
 // create asks the relay for a binding, but returns as soon as ctx ends: a
 // CANCEL or the drain's deadline ends the context Prepare runs under, and
 // the 487 or the drain's answer must not wait for a relay that does not
@@ -211,15 +214,34 @@ func (p *pcscf) create(ctx context.Context, sh share, paths relayPaths) (relayBi
 	abandoned := false
 	got := make(chan result, 1)
 	relay := p.msrp.relay
-	started := p.msrp.goRun(func(bctx context.Context) {
-		b, err := relay.create(bctx, paths)
+	// handOver gives r to the caller, unless it has gone.
+	handOver := func(r result) bool {
 		mu.Lock()
-		if !abandoned {
-			got <- result{b, err}
-			mu.Unlock()
+		defer mu.Unlock()
+		if abandoned {
+			return false
+		}
+		got <- r
+		return true
+	}
+	started := p.msrp.goRun(func(bctx context.Context) {
+		// A panic in the call still answers the caller, or, once it has
+		// gone, gives back the share it left to this work, so that it
+		// neither waits for its context nor loses a binding (#471 code
+		// review).
+		settled := false
+		defer func() {
+			if !settled && !handOver(result{err: errRelayPanicked}) {
+				p.msrp.limit.give(sh, 1)
+			}
+		}()
+		b, err := relay.create(bctx, paths)
+		if handOver(result{b, err}) {
+			settled = true
 			return
 		}
-		mu.Unlock()
+		settled = true
+		defer p.msrp.limit.give(sh, 1)
 		if err == nil && b.ID != "" {
 			p.count(metricReleasedCancel, 1)
 			if err := relay.release(bctx, b.ID); err != nil {
@@ -228,7 +250,6 @@ func (p *pcscf) create(ctx context.Context, sh share, paths relayPaths) (relayBi
 		} else if err != nil {
 			p.createFailed(err)
 		}
-		p.msrp.limit.give(sh, 1)
 	})
 	if !started {
 		return relayBinding{}, errNoRelay

@@ -106,7 +106,7 @@ func TestAPanicInHandleReportDropsThatReport(t *testing.T) {
 
 // A HandleRequest that panics is answered 403; the next request is served.
 func TestAPanicInHandleRequestIsAnswered403(t *testing.T) {
-	guard, _ := newGuard()
+	guard, counts := newGuard()
 	h := &panickingHandler{recorder: newRecorder()}
 	_, p := boundPassive(t, h, Config{Panics: guard})
 	nick := func(tid string) []string {
@@ -116,6 +116,9 @@ func TestAPanicInHandleRequestIsAnswered403(t *testing.T) {
 	expectResponse(t, p, "n1ck1", StatusForbidden)
 	p.send(t, nick("n1ck2")...)
 	expectResponse(t, p, "n1ck2", StatusOK)
+	if n := counts.get(MetricCallbackPanics); n != 1 {
+		t.Errorf("%s = %d, want 1", MetricCallbackPanics, n)
+	}
 }
 
 // An OnEvent that panics ends that call; the connection goes on.

@@ -31,7 +31,8 @@ type Config struct {
 	Metric string
 	// Message is the log message, such as "proxy: a service hook panicked".
 	Message string
-	// Log receives the log lines; nil discards them.
+	// Log receives the log lines; nil is slog.Default(), so that code given
+	// no logger, a tool or a test, still shows its panics (#471 code review).
 	Log *slog.Logger
 	// Metrics, if set, counts every panic as Metric, at once.
 	Metrics Counter
@@ -56,7 +57,7 @@ type Guard struct {
 // New returns a Guard for cfg.
 func New(cfg Config) *Guard {
 	if cfg.Log == nil {
-		cfg.Log = slog.New(slog.DiscardHandler)
+		cfg.Log = slog.Default()
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -102,7 +103,7 @@ func (g *Guard) panicked(name string, v any) {
 		return
 	}
 	g.cfg.Log.Error(g.cfg.Message,
-		slog.String("hook", name),
+		slog.String("name", name),
 		slog.String("panic", Kind(v)),
 		slog.String("at", frames()))
 }
