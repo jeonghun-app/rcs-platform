@@ -880,6 +880,40 @@ func TestAWakeForARegistrationInvitesAtOnce(t *testing.T) {
 	}
 }
 
+// #568: the failure of an invitation asked before a wake that tells of a
+// registration on a new flow, as sipas reports it after the wake came in,
+// is the old flow's and leaves no mark, as for a registration here (#384):
+// otherwise it held the participant's copies until InviteTimeout past the
+// wake. The pass that asked is held in Invite while both come, so the
+// queue is read again right after it, and that read invites again.
+func TestAWakeForARegistrationOvertakesALateInvitationFailure(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	asked, release := make(chan Invitation, 1), make(chan struct{})
+	var held atomic.Bool
+	r.d.onInvite(func(inv Invitation) error {
+		if held.CompareAndSwap(false, true) {
+			asked <- inv
+			<-release
+		}
+		return nil
+	})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	first := <-asked // the pass waits in Invite
+	r.e.Wake(bob, groupURI, true)
+	r.e.InviteFailed(first, ErrOffline) // the old flow's 486, come late
+	close(release)
+	r.d.nextInvite(t) // the first
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v", inv)
+	}
+	if n := r.m.get("invite.failed_overtaken"); n != 1 {
+		t.Fatalf("%d overtaken failures", n)
+	}
+}
+
 // #121 D2 (T4): every copy is queued under the group's owner the handler
 // names; once the store no longer holds it, the fan-out stops at the first
 // refused copy and the sender is answered as for a store failure.

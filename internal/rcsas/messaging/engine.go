@@ -570,18 +570,7 @@ func (e *Engine) countDeviations(d cpim.Deviation) {
 func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
-		if _, ok := e.flows[user]; !ok && len(e.flows) >= e.cfg.MaxTracked {
-			// A user forgotten here is as one never registered: a late
-			// failure of its invitations still out is marked as before
-			// #384, which only one that registers again in that window
-			// notices.
-			for k := range e.flows {
-				delete(e.flows, k)
-				break
-			}
-		}
-		e.flowSeq++
-		e.flows[user] = e.flowSeq
+		e.newFlowLocked(user)
 		delete(e.pagerOnly, user)
 		for k := range e.invites {
 			if k.user == user {
@@ -601,6 +590,24 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 	}
 	e.mu.Unlock()
 	e.kickEvent(user)
+}
+
+// newFlowLocked numbers user's latest registration on a new flow, so that
+// a failure of an invitation asked before it is taken for the old flow's
+// (InviteFailed). It needs e.mu.
+func (e *Engine) newFlowLocked(user string) {
+	if _, ok := e.flows[user]; !ok && len(e.flows) >= e.cfg.MaxTracked {
+		// A user forgotten here is as one never registered: a late
+		// failure of its invitations still out is marked as before
+		// #384, which only one that registers again in that window
+		// notices.
+		for k := range e.flows {
+			delete(e.flows, k)
+			break
+		}
+	}
+	e.flowSeq++
+	e.flows[user] = e.flowSeq
 }
 
 // InviteFailed reports that the session Invite asked for did not come
