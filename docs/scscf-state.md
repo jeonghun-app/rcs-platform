@@ -142,22 +142,25 @@ additionally sealed (below).
   user's deregistration does, so that a stop or a store failure at any point
   after leaves it to the sweep (#368); a claim the store fails to save is
   tried again, and then answered DIAMETER_TOO_BUSY, which the HSS sends
-  again (#394). The lease of an RTR that ended the set for good is marked
-  `rejected`, and stays so whatever RTR comes after, so that the sweep's
-  NOTIFY says `reason=rejected` as the RTR's would have (#334); the lease
-  holds no bindings, so that NOTIFY names no contacts. A store failure or a
-  stop at any point thus leaves either the record or the saved ends, and a
-  sweep sends a final NOTIFY nobody sent. A subscription is deleted only
-  once its final NOTIFY is answered (a 2xx, a code RFC 6665 §4.2.2 lists, or
-  430); one without an answer is sent again by a sweep, with the CSeq and
-  version it was numbered with, 10 s after the send ended and twice as late
-  each time (the last about 3 min 10 s after the first for a silent
-  subscriber, 2 min 30 s when each send fails at once), and given up after
-  five sends (`regevent.final_abandoned`). An end whose set was registered
-  again meanwhile, a new record, says terminated without a body, so that it
-  ends nothing of the new registration. The subscription sweep must
-  therefore run every few seconds to a minute, as the registration sweep
-  does.
+  again (#394), as is a store read before the claim that fails for a reason
+  that may pass: the identity, the listing, the record or the profile, with
+  nothing written yet (#422). A read the store refuses as invalid is
+  answered DIAMETER_UNABLE_TO_COMPLY. The lease of an RTR that ended the set
+  for good is marked `rejected`, and stays so whatever RTR comes after, so
+  that the sweep's NOTIFY says `reason=rejected` as the RTR's would have
+  (#334); the lease holds no bindings, so that NOTIFY names no contacts. A
+  store failure or a stop at any point thus leaves either the record or the
+  saved ends, and a sweep sends a final NOTIFY nobody sent. A subscription
+  is deleted only once its final NOTIFY is answered (a 2xx, a code RFC 6665
+  §4.2.2 lists, or 430); one without an answer is sent again by a sweep,
+  with the CSeq and version it was numbered with, 10 s after the send ended
+  and twice as late each time (the last about 3 min 10 s after the first for
+  a silent subscriber, 2 min 30 s when each send fails at once), and given
+  up after five sends (`regevent.final_abandoned`). An end whose set was
+  registered again meanwhile, a new record, says terminated without a body,
+  so that it ends nothing of the new registration. The subscription sweep
+  must therefore run every few seconds to a minute, as the registration
+  sweep does.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
   document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
   store's limits, 32 identities (`MaxIdentities`) each listing up to 32

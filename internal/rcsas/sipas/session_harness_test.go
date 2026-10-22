@@ -56,11 +56,11 @@ type countingGroups struct {
 
 var errFakeStore = errors.New("fake: the store failed")
 
-func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, token string) error {
+func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, owner groupstore.Owner, token string) error {
 	if c.failUpdates.Add(-1) >= 0 {
 		return errFakeStore
 	}
-	return c.Store.Update(ctx, g, token)
+	return c.Store.Update(ctx, g, owner, token)
 }
 
 func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {
@@ -423,6 +423,45 @@ func (c *fakeClock) waitArmed(t *testing.T, want ...time.Duration) {
 	for !slices.Equal(c.armed(), want) {
 		if time.Now().After(deadline) {
 			t.Fatalf("armed %v, want %v", c.armed(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// mark is where the timers armed from now on begin, for fireSince.
+func (c *fakeClock) mark() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.timers)
+}
+
+// fireSince waits for a timer of duration d to be armed since mark, a
+// transaction layer arming its timer only once the request has gone, and
+// runs it, once; it fails t unless there is exactly one.
+func (c *fakeClock) fireSince(t *testing.T, mark int, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(waitFor)
+	for {
+		c.mu.Lock()
+		var found []*fakeTimer
+		for _, tm := range c.timers[mark:] {
+			if !tm.stopped && tm.d == d {
+				found = append(found, tm)
+			}
+		}
+		switch {
+		case len(found) == 1:
+			found[0].stopped = true
+			c.mu.Unlock()
+			found[0].f()
+			return
+		case len(found) > 1:
+			c.mu.Unlock()
+			t.Fatalf("%d timers of %v armed since the mark, want 1", len(found), d)
+		}
+		c.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("no timer of %v armed since the mark", d)
 		}
 		time.Sleep(time.Millisecond)
 	}

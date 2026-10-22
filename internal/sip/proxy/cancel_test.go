@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"slices"
 	"sync"
 	"testing"
@@ -346,4 +347,77 @@ func TestACancelFollowsItsInviteOntoTCP(t *testing.T) {
 	if got := cancels[0].req.Header.Get("Via"); got != sent[0].req.Header.Values("Via")[0] {
 		t.Errorf("CANCEL Via = %q, want the INVITE's %q", got, sent[0].req.Header.Values("Via")[0])
 	}
+}
+
+// A CANCEL ends the context Prepare and the Resolver run under, so a stalled
+// one does not hold the 487 back: it comes at once, with no timer advanced
+// and nothing sent downstream (#382).
+func TestACancelCutsAStalledPrepareOrResolverShort(t *testing.T) {
+	for _, stalled := range []string{"Prepare", "Resolver"} {
+		t.Run(stalled, func(t *testing.T) {
+			entered := make(chan struct{}, 1)
+			hold := func(ctx context.Context) error {
+				entered <- struct{}{}
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			cfg := Config{}
+			if stalled == "Resolver" {
+				cfg.Resolver = resolverFunc(func(ctx context.Context, u sip.URI) (transport.Destination, error) {
+					return transport.Destination{}, hold(ctx)
+				})
+			}
+			h := newHarness(t, cfg)
+			h.route(func(_ context.Context, r *Request) Decision {
+				d := Forward(r)
+				if stalled == "Prepare" {
+					d.Prepare = func(ctx context.Context, _ Target, _ *sip.Request) error { return hold(ctx) }
+				}
+				return d
+			})
+			inv := invite(t)
+			h.p.Receive(inboundFrom(inv, "up"))
+			<-entered
+			h.p.Receive(inboundFrom(uacCancel(t, inv), "up"))
+			h.settle()
+			check(t, "upstream", labels(h.upstreamResponses()), []string{"200 CANCEL", "487 INVITE"})
+			check(t, "sent", h.sentMethods(), nil)
+		})
+	}
+}
+
+// Drain's deadline ends it too: the drain's 500 goes, and the stalled
+// Prepare returns rather than run on after the stop (#382).
+func TestDrainsDeadlineEndsAStalledPrepare(t *testing.T) {
+	entered, returned := make(chan struct{}, 1), make(chan struct{})
+	h := newHarness(t, Config{})
+	h.route(func(_ context.Context, r *Request) Decision {
+		d := Forward(r)
+		d.Prepare = func(ctx context.Context, _ Target, _ *sip.Request) error {
+			entered <- struct{}{}
+			<-ctx.Done()
+			close(returned)
+			return ctx.Err()
+		}
+		return d
+	})
+	h.p.Receive(inboundFrom(request(t, "MESSAGE", "sip:bob@example.com"), "up"))
+	<-entered
+	<-drainFor(h, 50*time.Millisecond)
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stalled Prepare did not see the drain's deadline")
+	}
+	res := h.upstreamResponses()
+	if len(res) != 1 || res[0].StatusCode != 500 {
+		t.Fatalf("upstream got %v, want the drain's 500", res)
+	}
+	check(t, "sent", h.sentMethods(), nil)
+}
+
+type resolverFunc func(ctx context.Context, u sip.URI) (transport.Destination, error)
+
+func (f resolverFunc) Resolve(ctx context.Context, u sip.URI) (transport.Destination, error) {
+	return f(ctx, u)
 }
