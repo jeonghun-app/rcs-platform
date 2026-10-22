@@ -131,7 +131,7 @@ so that none, a rejoin `INVITE` without a resource list say, becomes a 1-to-1
 chat with a conference URI (security review on #252).
 
 scscf hands rcs-as a request with the AS URI of the iFC on top of its `Route`
-(TS 24.229 §5.4.3.2), `HSS_RCS_AS_URI` (`sip:rcs-as.<RCS_SERVICE_NAMESPACE>` by
+(TS 24.229 §5.4.3.2), `HSS_RCS_AS_URI` (`sip:rcs-as.<RCS_SERVICE_NAMESPACE>;transport=tcp` by
 default), and its own entry below. rcs-as takes as its own, and removes, a
 `Route` naming its service name (`RCSAS_SERVICE_NAME`, which must be the host
 of `HSS_RCS_AS_URI`) or its instance address (`RCSAS_SIP_HOST`), on
@@ -1133,6 +1133,7 @@ The task role needs these IAM actions:
 | `dynamodb:UpdateItem` | table | `Claim`, `Release`, `MarkNotified`, `UnmarkNotified`, size corrections, and the `Update`s inside both transactions |
 | `dynamodb:DeleteItem` | table | the `Delete` inside the removal transactions |
 | `dynamodb:ConditionCheckItem` | table | the `ConditionCheck` inside a summary's removal |
+| `dynamodb:ConditionCheckItem` | the `groupchats` table | the `ConditionCheck` of a group's owner inside a group message copy's enqueue (#121) |
 | `dynamodb:Query` | table | `Pending`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
 | `dynamodb:DescribeTable` | table | readiness |
@@ -1185,7 +1186,15 @@ chat on has a heartbeat item:
   beat is `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` old; it beats once more
   at its present time on shutdown, after its sessions have ended, so that
   another task takes its groups at once. A task remembers the groups it
-  owns, so that a change of one costs no more reads than before. Until D3 of
+  owns, so that a change of one costs no more reads than before. It forgets
+  them all when a beat is stored later than its last one's hold
+  (`RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW`), whether it saw itself lapse
+  or was paused unaware, and forgets one when the store refuses a write or a
+  message's copy for it. Whether to invite a participant for a group's
+  queued copies, which the store does not fence, it asks the owner item
+  again once what it remembers is `RCSAS_TASK_HEARTBEAT` old: a task that
+  lost a group stops inviting for it within a heartbeat, even one that
+  writes nothing to it. Until D3 of
   #121 forwards requests to a group's owner, a request for a group another
   task owns is answered 500 with `Retry-After` (never 404, which rcsjta
   takes for the group's end and restarts it at the factory).
@@ -1196,7 +1205,9 @@ chat on has a heartbeat item:
   after the old task's last beat; after a clean shutdown, which stores a last
   beat at its present time, `RCSAS_TASK_SKEW` (2 s). Meanwhile a change to
   one of those groups is answered 500 with `Retry-After`, which clients try
-  again; a task on the old one's address takes its groups at once. Before
+  again, and a message written in one is refused as one not stored
+  (`StatusTryAgain`), as its copies are queued under the owner's fence;
+  a task on the old one's address takes its groups at once. Before
   #121, a replacement changed them at once. Deployments stop tasks cleanly.
 - **Touch.** At most once an hour per task, and not within an hour of a
   change, a group in use has its `active`, `expires` and `ttl` moved forward,
@@ -1213,10 +1224,32 @@ chat on has a heartbeat item:
   DynamoDB bills at twice the write units of each. A task's heartbeat is one
   small write every `RCSAS_TASK_HEARTBEAT`. A task's first change of a group
   it does not know reads the owner item, and the owner's heartbeat item if
-  another task holds it.
+  another task holds it. Whether to invite for a group's queued copies reads
+  the group and owner items at most once per group every
+  `RCSAS_TASK_HEARTBEAT`.
 
 Each group message costs one strongly consistent read of the group item and,
-per recipient, the enqueue transaction of the `messages` table. The fan-out
+per recipient, the enqueue transaction of the `messages` table, which also
+checks the group's owner item in `groupchats` (#121): one more item in the
+transaction, so each copy costs about 2 more write units. A copy is queued
+only while the owner item still names the task that queues it, so a task that
+lost the group queues none (the fan-out stops at the first refused copy,
+`group.fanout.not_owner`, and the sender is answered as for a store failure).
+The copies queued before the refused one stay. When the sender's client sends
+the message again, now to the new owner, those recipients get it twice, as
+after a fan-out that ran past `FanoutTimeout`: the clients drop the repeat by
+its Message-ID (the lead's decision on #440).
+The other group-mode items are not fenced, as two tasks cannot both queue one:
+a participant's notification for the author is queued once its mark is
+stored, which only one writer does (`MarkNotified`); a summary has an ID
+fixed by the message it reports on (`r-<Message-ID>`), so a second is
+refused as existing; and a fan-out's failure notice for a full queue follows
+a copy refused with its fence held (the store checks the fence first), so
+only the owner queues one.
+Only the owner invites a participant for its queued copies
+(`delivery.group_not_owned` counts those another task's queue pass left
+alone); the owner reads the queue again on `Engine.Wake`, which #121 D3's
+wake message from the task that saw a registration calls. The fan-out
 budget bounds that per group. A notification costs a read of its sent-message
 record first, and of the group item only when the record exists; an
 is-composing indication reads the group item only when another participant
@@ -1240,8 +1273,9 @@ identifier ever appears in a metric name.
 | `sip.group.added`, `sip.group.removed`, `sip.group.invite_failed` | REFERs that added or removed, and additions whose invitations could not be sent for want of the group |
 | `sip.subscription.started`, `sip.subscription.refreshed`, `sip.subscription.fetched`, `sip.subscription.expired`, `sip.subscription.ended.<reason>`, `sip.subscription.bad_event`, `sip.subscription.task_limit`, `sip.subscription.user_limit` | Subscriptions to the conference event package, by what became of them; `user_limit` counts those refused for a participant's 4 in one group and for `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` |
 | `sip.subscription.notified`, `sip.subscription.notify_failed`, `sip.subscription.stale`, `sip.subscription.notify_unsent`, `sip.subscription.notify_after_refusal`, `sip.subscription.resynced`, `sip.subscription.roster_failed` | NOTIFYs sent, refused or unanswered, refused for a passing reason (whose subscription stands, to get the full roster next), not built, not sent because the subscriber had refused one (RFC 6665 §4.2.2), full rosters sent for a gap or after a failure, and rosters that could not be read for one |
-| `sip.group.disabled`, `sip.refer.notified` | Requests to the factory or a conference URI answered 404 while `RCSAS_GROUP_CHAT_ENABLED` is off; REFER subscriptions ended with their outcome |
+| `sip.group.disabled`, `sip.refer.notified`, `sip.refer.notify_failed`, `sip.refer.notify_after_refusal` | Requests to the factory or a conference URI answered 404 while `RCSAS_GROUP_CHAT_ENABLED` is off; REFER subscriptions ended with their outcome; REFER NOTIFYs whose answer, or timeout, ended the subscription (RFC 6665 §4.2.2); and NOTIFYs not sent after that, the outcome among them |
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
+| `proxy.hook_panics` | Panics recovered while rcs-as routed or served a request: it was answered 500 if it had no answer yet (#428); alarm on any |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
 | `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |
 | `sip.session.task_limit`, `sip.session.user_limit` | Sessions refused for `RCSAS_MAX_SESSIONS` and for a user's own bound, either way |
@@ -1271,6 +1305,7 @@ identifier ever appears in a metric name.
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
+| `group.fanout.not_owner`, `delivery.group_not_owned`, `group.wake` | #121: fan-outs stopped because another task took the group over; group copies a task that does not own the group did not invite for; queue reads the owner was asked for |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but neither queued nor summarized, the summaries' total or the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through

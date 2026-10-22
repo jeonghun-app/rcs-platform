@@ -44,6 +44,9 @@ var (
 	// ErrSenderShareFull means Enqueue would take the sender's share of the
 	// recipient's queue past its Limit.
 	ErrSenderShareFull = errors.New("store: sender's share of the queue is full")
+	// ErrNotOwner means Enqueue's Fence no longer holds: another task took
+	// the group over (#121).
+	ErrNotOwner = errors.New("store: not the group's owner")
 	// ErrMarksChanged means RemoveSummary found more marks on the sent
 	// record than the summary was expanded from.
 	ErrMarksChanged = errors.New("store: notifications were marked since")
@@ -151,6 +154,20 @@ type Message struct {
 	// message is free.
 	Owner      string
 	LeaseUntil time.Time
+
+	// Fence, for a group message's copy, is the group's owner the copy is
+	// queued under (#121): Enqueue queues it only while the groups table
+	// still names that owner, in the same write, so that a task that lost
+	// the group queues nothing for it (ErrNotOwner). It is not stored.
+	Fence *Fence
+}
+
+// Fence names a group's owner as the groups table holds it: its task and
+// epoch (groupstore.Owner).
+type Fence struct {
+	Group string
+	Task  string
+	Epoch int64
 }
 
 // GroupNotifications names the total of all group notifications in a

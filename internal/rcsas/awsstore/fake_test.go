@@ -232,8 +232,9 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 		return f.groupTransaction(in.TransactItems)
 	}
 	// A 1-to-1 notification has no share item: two items; a group
-	// notification has the total besides: four; else three.
-	if n := len(in.TransactItems); n < 2 || n > 4 {
+	// notification has the total besides: four; else three; and a group
+	// message's copy the owner's fence besides.
+	if n := len(in.TransactItems); n < 2 || n > 5 {
 		f.t.Fatalf("transaction %+v", in.TransactItems)
 	}
 	var sizes []*dtypes.Update
@@ -241,11 +242,16 @@ func (f *fakeDynamo) TransactWriteItems(_ context.Context, in *dynamodb.Transact
 	enqueue := in.TransactItems[0].Put != nil
 	for _, item := range in.TransactItems[1:] {
 		if c := item.ConditionCheck; c != nil {
-			if aws.ToString(c.ConditionExpression) != "attribute_not_exists(#pk) OR #marks = :marks" {
-				f.t.Errorf("condition check %q", aws.ToString(c.ConditionExpression))
-			}
 			row, ok := f.rows[rowKey(c.Key)]
-			failed = append(failed, ok && nOf(row[attrMarkCount]) != nOf(c.ExpressionAttributeValues[":marks"]))
+			switch cond := aws.ToString(c.ConditionExpression); cond {
+			case "attribute_not_exists(#pk) OR #marks = :marks":
+				failed = append(failed, ok && nOf(row[attrMarkCount]) != nOf(c.ExpressionAttributeValues[":marks"]))
+			case fenceCondition:
+				failed = append(failed, !ok || sOf(row[attrTask]) != sOf(c.ExpressionAttributeValues[":task"]) ||
+					nOf(row[attrEpoch]) != nOf(c.ExpressionAttributeValues[":epoch"]))
+			default:
+				f.t.Errorf("condition check %q", cond)
+			}
 			continue
 		}
 		u := item.Update

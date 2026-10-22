@@ -249,7 +249,8 @@ func (u *UAS) ACK(ctx context.Context) (*sip.Request, error) {
 func (c *respContext) serve(in *Request) {
 	u := c.uas
 	u.req = in
-	c.dec.Serve(c.reqCtx, u)
+	// A panic is answered as a return without an answer.
+	c.p.hook("Serve", func() { c.dec.Serve(c.reqCtx, u) })
 	if !u.hasAnswered() {
 		c.mu.Lock()
 		code := 500

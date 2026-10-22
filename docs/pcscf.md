@@ -521,6 +521,16 @@ it cannot anchor is refused or ended; it never runs end to end.
   made for it is released. Past a share's rate it is 503 with the seconds
   until it may create, counted in `msrp.refused.binding_rate`. A path the
   relay refuses (400) is 488, as waiting will not change it.
+- **A CANCEL or the stop's deadline during a relay call.** The INVITE is
+  answered (487, or the drain's answer) at once, not after the relay
+  (#382). The call runs on in the background, for at most
+  `PCSCF_RELAY_TIMEOUT` and cut short by the stop, keeping its share of the
+  flow's bindings until it ends. A binding the relay made meanwhile is then
+  released, counted in `msrp.released_after_cancel`. A release that fails
+  leaves the binding to its expiry, counted in `msrp.relay_errors`. A
+  create the stop cuts is counted in `msrp.create_cut_at_stop`, not as a
+  relay error; a binding the relay may already have made for it is left to
+  expire.
 - **Ending a dialog.** A 2xx cannot be refused, nor an ACK, so a dialog
   `pcscf` cannot serve is forwarded and then ended: once the ACK of the 2xx
   passes, or 32 s after the 2xx, a BYE goes to the client over its flow,
@@ -610,8 +620,9 @@ the sweep, every 30 s.
 | `terminating.refused.route` | count | requests from the core inside a dialog on another dialog's route (403) |
 | `terminating.pai_omitted`, `terminating.record_route_malformed` | count | as in [Requests from the core](#requests-from-the-core) |
 | `regevent.deregistered`, `regevent.subscribe_failed` | count | as in [Reg event](#reg-event) |
-| `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
+| `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.released_after_cancel`, `msrp.create_cut_at_stop`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
 | `transport.listener_connections.*`, `transport.*` | gauge, count | as in [Edge rules](#edge-rules) |
+| `proxy.hook_panics` | count | panics recovered in pcscf's routing, SDP and response hooks: the request was answered 500, or the branch or response the hook was for was ended (#428). Alarm on any |
 | `QueuedBytes` | gauge | bytes waiting in every send queue, against the transport's budget |
 | `BudgetSheds` | count | stalled connections closed to keep the queues in their budget |
 | `BudgetRefusals` | count | sends refused, the connection kept, with the budget full |
@@ -641,7 +652,8 @@ start with that value.
 | `PCSCF_CLIENT_ADDR` | `0.0.0.0:5061`, or `:5060` with `tcp` | client listener (NLB target) |
 | `PCSCF_TLS_CERT_FILE`, `PCSCF_TLS_KEY_FILE` | none | certificate of `tls`, required with it |
 | `PCSCF_CLIENT_UDP_ADDR` | none | UDP client listener; refused |
-| `PCSCF_CORE_ADDR` | `0.0.0.0:5070` | core listener |
+| `PCSCF_CORE_ADDR` | `0.0.0.0:<RCS_PCSCF_CORE_PORT>` | core listener; while `RCS_PCSCF_CORE_PORT` is set, its port must be that one |
+| `RCS_PCSCF_CORE_PORT` | `5070` | the core listener's port, shared with `scscf`, which sends requests inside a dialog to a P-CSCF only on it |
 | `PCSCF_CORE_HOST` | this task's one private IPv4 | the task address `pcscf` names itself by |
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client (IPv4 address or IPv6 /64) |

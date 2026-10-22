@@ -178,6 +178,14 @@ type Router struct {
 	// once Stop waits (#379 QA).
 	stop    sync.Mutex
 	stopped bool
+	// halted ends once StopBy gives up waiting: the repairs and the
+	// third-party registrations under way are cut short, and those waiting
+	// for their turn are dropped.
+	halted context.Context
+	halt   context.CancelFunc
+	// idleOnce makes idleCh, which idle closes.
+	idleOnce sync.Once
+	idleCh   chan struct{}
 }
 
 // New validates cfg and returns a Router.
@@ -254,6 +262,7 @@ func New(cfg Config) (*Router, error) {
 	}
 	rt := &Router{cfg: cfg, log: log, ids: sip.IDGenerator{Rand: cfg.Rand}}
 	rt.tp.servers = map[string]*serverQueue{}
+	rt.halted, rt.halt = context.WithCancel(context.Background())
 	return rt, nil
 }
 
@@ -263,16 +272,70 @@ func (noMetrics) Count(string, int64) {}
 
 func (rt *Router) count(name string) { rt.cfg.Metrics.Count(name, 1) }
 
-// Stop stops the Router from starting identity repairs and third-party
-// registrations, and returns once those under way are done: for a
-// shutdown, once the registrar tells it of no more, and for tests.
-// Requests are still routed.
-func (rt *Router) Stop() {
+// Stop is StopBy with no bound.
+func (rt *Router) Stop() { rt.StopBy(context.Background()) }
+
+// StopBy stops the Router from starting identity repairs and third-party
+// registrations, and waits for those under way until ctx ends. Then it
+// gives them up: their sends are cut short and the registrations waiting
+// for their turn dropped, each third-party one counted as
+// routing.third_party.dropped_at_stop. It reports whether everything was
+// done in time. A shutdown calls it once the registrar tells it of no
+// more, with what is left of RCS_SHUTDOWN_TIMEOUT, which a server that
+// does not answer would otherwise overrun by its ThirdPartyTimeout (#439
+// QA). Requests are still routed.
+//
+// A send given up on returns only once its transaction is under way: one
+// still opening its connection, or waiting for room in it, holds on until
+// the dial times out or the transport closes. WaitFor waits for those
+// (#439 code review).
+func (rt *Router) StopBy(ctx context.Context) bool {
 	rt.stop.Lock()
 	rt.stopped = true
 	rt.stop.Unlock()
-	rt.repairs.Wait()
-	rt.tp.wg.Wait()
+	select {
+	case <-rt.idle():
+		return true
+	case <-ctx.Done():
+	}
+	rt.halt()
+	return false
+}
+
+// WaitFor waits, once StopBy has returned, until every repair and
+// third-party registration has returned, or ctx ends, and reports which.
+func (rt *Router) WaitFor(ctx context.Context) bool {
+	select {
+	case <-rt.idle():
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// idle is closed once the repairs and third-party registrations under way
+// at the stop are done. It is made at the first call, after stopped is
+// set, so that no Add can follow the Waits.
+func (rt *Router) idle() <-chan struct{} {
+	rt.idleOnce.Do(func() {
+		rt.idleCh = make(chan struct{})
+		go func() {
+			rt.repairs.Wait()
+			rt.tp.wg.Wait()
+			close(rt.idleCh)
+		}()
+	})
+	return rt.idleCh
+}
+
+// bounded is ctx ended by d, or by StopBy giving up, whichever is first.
+func (rt *Router) bounded(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	unhook := context.AfterFunc(rt.halted, cancel)
+	return ctx, func() {
+		unhook()
+		cancel()
+	}
 }
 
 // internalLog logs a failure by its step and error, which name no identity.

@@ -47,6 +47,13 @@ type respContext struct {
 	// transaction, by the proxy or by the layer for it: the request is no
 	// longer in progress for Drain, even while its context lingers.
 	handed atomic.Bool
+	// responding is set just before a final response goes to the server
+	// transaction, which may then wait for room in a stalled peer's queue
+	// (#375).
+	responding atomic.Bool
+	// replacedFinal records that a final response whose hook panicked was
+	// replaced by the proxy's 500 (panicAnswer).
+	replacedFinal atomic.Bool
 	// unwatch stops watching the server transaction for the layer's own 500
 	// (layerAnswered).
 	unwatch func() bool
@@ -222,7 +229,7 @@ func (c *respContext) run() {
 		c.answerWith(400)
 		return
 	}
-	dec := p.router.Route(c.reqCtx, in)
+	dec := p.route(c.reqCtx, in)
 
 	c.mu.Lock()
 	cancelled := c.cancelled
@@ -322,11 +329,26 @@ func (c *respContext) answer(res *sip.Response) {
 // for a slow upstream peer included, and a Serve handler has not sent one
 // either (a handler that answered may still wait on its context, for an
 // ACK).
+//
+// Over a *transport.Transport, a final already on its way to the transaction
+// is not in progress either: if it waits for room in a stalled peer's
+// queue, Drain would wait for it until its own deadline, and
+// Transport.Flush, which Drain ends with, waits for it anyway: from the
+// start of SendResponse, its connection dialled again to the Via address
+// included, as a send under way, then as a sender waiting for room, giving
+// up only once it stops getting anywhere (#375). The gap is the transaction
+// layer's few lines between taking the response and calling SendResponse:
+// a final caught there when Flush looks is not waited for, and Close may
+// drop it.
 func (c *respContext) inProgress() bool {
 	c.mu.Lock()
 	uas := c.uas
 	c.mu.Unlock()
-	return !c.handed.Load() && (uas == nil || !uas.handedFinal())
+	flushed := c.p.flushes
+	if c.handed.Load() || flushed && c.responding.Load() {
+		return false
+	}
+	return uas == nil || !uas.handedFinal() && !(flushed && uas.hasAnswered())
 }
 
 // answerForStop answers a request still without a final response 500 with
@@ -342,8 +364,13 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 		return nil
 	}
 	c.mu.Lock()
-	uas, cancelled := c.uas, c.cancelled
+	uas, cancelled, decided := c.uas, c.cancelled, c.finalSent || c.done
 	c.mu.Unlock()
+	if decided {
+		// Drain's second pass, while the first pass's answer is still
+		// queued: DrainAnswer is asked once a request (QA of #436).
+		return nil
+	}
 	if uas != nil {
 		// The service answers for itself. It learns of the stop through its
 		// context, and serve answers for it if it returns without a final
@@ -385,14 +412,24 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	}
 	c.finalSent = true
 	acts := c.closeBranches()
+	// The request has its answer: what still prepares or resolves a
+	// branch for it, under reqCtx, stops (#382).
+	acts = append(acts, c.cancelReq)
 	sent := make(chan struct{})
 	hook := c.dec.OnResponse
 	acts = append(acts, func() {
 		c.up.do(func() {
 			defer close(sent)
-			if hook != nil {
-				hook(c.ctx, res)
+			res := res
+			// Drain's Retry-After sends the client to another task, so
+			// the 500 in place of a half-changed answer keeps it.
+			ra := res.Header.Get("Retry-After")
+			if hook != nil && !c.p.hook("OnResponse", func() { hook(c.ctx, res) }) {
+				if res = c.panicAnswer(ra); res == nil {
+					return
+				}
 			}
+			c.responding.Store(true)
 			err := c.tx.Respond(res)
 			c.handed.Store(true)
 			if err != nil {
@@ -555,19 +592,24 @@ func (b *branch) start() {
 		return
 	}
 	c.mu.Unlock()
-	fwd, dst, err := p.buildBranch(c.ctx, c.in, &c.dec, b.target, true)
+	// Under reqCtx, which a CANCEL and Drain's deadline end, so that a
+	// stalled Prepare or Resolver, such as pcscf waiting on msrp-relay, does
+	// not hold the 487 or the drain's answer back (#382).
+	fwd, dst, err := p.buildBranch(c.reqCtx, c.in, &c.dec, b.target, true)
 	if err == nil {
 		err = b.addVia(fwd, dst)
 	}
-	if err == nil {
+	{
 		// Prepare and the Resolver may have blocked: a 2xx, a 6xx or a CANCEL
 		// that came meanwhile means the branch must not be sent after all
 		// (§16.7 step 5, §16.10). A response that arrives while the send is
-		// under way is handled by the CANCEL that follows its provisional.
+		// under way is handled by the CANCEL that follows its provisional. A
+		// Prepare or Resolver the CANCEL cut short (#382) fails for that
+		// reason, not the branch's: it is unsent too, not a 500.
 		c.mu.Lock()
 		stopped := c.stopped()
 		c.mu.Unlock()
-		if stopped {
+		if err == nil && stopped || err != nil && c.reqCtx.Err() != nil {
 			c.mu.Lock()
 			acts := b.unsent()
 			c.mu.Unlock()
@@ -699,6 +741,24 @@ func (c *respContext) failureResponse(err error) final {
 		return f
 	}
 	return c.made(503)
+}
+
+// panicAnswer is the 500 sent in place of a final response whose hook
+// panicked (Proxy.hook), which may have half changed it, with retryAfter as
+// its Retry-After if not empty; nil if it cannot be built. A 2xx that comes
+// again after it is dropped (forwardAs): the transaction has its final.
+func (c *respContext) panicAnswer(retryAfter string) *sip.Response {
+	c.replacedFinal.Store(true)
+	var fields [][2]string
+	if retryAfter != "" {
+		fields = append(fields, [2]string{"Retry-After", retryAfter})
+	}
+	res, err := c.p.response(c.tx.Request(), 500, fields...)
+	if err != nil {
+		c.p.log.Error("proxy: building a response", slog.Int("status", 500), slog.String("error", err.Error()))
+		return nil
+	}
+	return res
 }
 
 // made builds a response of the proxy's own to the request received. mu must be
@@ -869,7 +929,9 @@ func (c *respContext) branchEnded(b *branch, f final, err error) []func() {
 	failure := BranchFailure{Target: b.target, Response: f.res.Clone(), Err: err, Provisional: b.provisional, Progress: b.progress}
 	return []func(){func() {
 		c.p.spawn(func() {
-			targets := hook(c.ctx, failure)
+			// A panic leaves the branch failed, with nothing in its place.
+			var targets []Target
+			c.p.hook("OnBranchFailure", func() { targets = hook(c.ctx, failure) })
 			c.mu.Lock()
 			c.pending--
 			var acts []func()
@@ -986,14 +1048,42 @@ func (b *branch) terminate() {
 // branch ends at once, counting as a 408, so a replacement can start without
 // waiting: an INVITE branch that has a provisional response is cancelled and
 // its transaction left to absorb the 487 (a 2xx from it is still forwarded,
-// §16.7 step 5), and any other branch's transaction is terminated. mu must be
-// held.
+// §16.7 step 5), and any other branch's transaction is terminated, unless
+// Target.OnTimeout keeps the branch. mu must be held.
 func (b *branch) armTimeout() {
 	c, p := b.c, b.c.p
 	b.timeoutTimer = p.clock.AfterFunc(b.target.Timeout, func() {
 		if p.isClosed() {
 			return
 		}
+		keep := b.target.OnTimeout
+		if keep == nil {
+			b.timeoutNow()
+			return
+		}
+		// It may block, as scscf asks its store, and a timer must not.
+		p.spawn(func() {
+			// A panic leaves applies true: the timeout ends the branch, as
+			// when scscf's store cannot say.
+			applies := true
+			p.hook("OnTimeout", func() { applies = keep(c.ctx) })
+			if applies {
+				b.timeoutNow()
+				return
+			}
+			p.stats.targetTimeouts.Add(1)
+			p.stats.targetTimeoutsKept.Add(1)
+		})
+	})
+}
+
+// timeoutNow ends the branch on its target's timeout (armTimeout).
+func (b *branch) timeoutNow() {
+	c, p := b.c, b.c.p
+	if p.isClosed() {
+		return
+	}
+	{
 		c.mu.Lock()
 		if b.final {
 			c.mu.Unlock()
@@ -1015,7 +1105,7 @@ func (b *branch) armTimeout() {
 		}
 		c.mu.Unlock()
 		b.terminate()
-	})
+	}
 }
 
 // armTimerC starts or restarts Timer C (§16.6 step 11, §16.7 step 2). mu must
@@ -1089,11 +1179,29 @@ func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 		c.forwarded2xx = true
 	}
 	send := func() {
-		if hook != nil {
-			hook(c.ctx, res)
+		if again && c.replacedFinal.Load() {
+			// The 2xx a 500 replaced, again: the transaction would refuse
+			// it, which is no upstream error.
+			return
 		}
+		res := res
+		if hook != nil && !c.p.hook("OnResponse", func() { hook(c.ctx, res) }) {
+			// The hook may have half changed the response. A provisional
+			// response or a 2xx retransmission is dropped; a final
+			// response becomes a 500.
+			if code < 200 || again {
+				return
+			}
+			if res = c.panicAnswer(""); res == nil {
+				return
+			}
+		}
+
 		// §16.9: a response that cannot be sent is dropped, and the
 		// branches are left alone.
+		if code >= 200 {
+			c.responding.Store(true)
+		}
 		if err := c.tx.Respond(res); err != nil {
 			c.p.stats.upstreamErrors.Add(1)
 		}
@@ -1144,17 +1252,27 @@ func (c *respContext) sendBest() []func() {
 	hook := c.dec.OnResponse
 	return []func(){func() {
 		c.up.do(func() {
+			res, ok := res, true
 			if onFinal != nil {
-				onFinal(c.ctx, res)
+				ok = c.p.hook("OnFinal", func() { onFinal(c.ctx, res) })
 			} else if res.StatusCode == 430 {
 				// RFC 5626 §11.5: an endpoint must not see 430, which is
 				// for the authoritative proxy. A service that is the edge
 				// proxy keeps it with OnFinal.
 				res.StatusCode, res.Reason = 480, sip.DefaultReason(480)
 			}
-			if hook != nil {
-				hook(c.ctx, res)
+			if ok && hook != nil {
+				ok = c.p.hook("OnResponse", func() { hook(c.ctx, res) })
 			}
+			if !ok {
+				// A hook may have half changed it.
+				if res = c.panicAnswer(""); res == nil {
+					return
+				}
+			}
+			// On its way, as the other finals (inProgress; code review of
+			// #438).
+			c.responding.Store(true)
 			if err := c.tx.Respond(res); err != nil {
 				c.p.stats.upstreamErrors.Add(1)
 			}

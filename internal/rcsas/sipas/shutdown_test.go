@@ -35,6 +35,8 @@ type shutdownRig struct {
 	release func()
 	p       *peer
 	closed  chan struct{}
+	// closedAt is when Close returned, set before closed is closed.
+	closedAt time.Time
 }
 
 func newShutdownRig(t *testing.T, wait time.Duration) *shutdownRig {
@@ -72,7 +74,7 @@ func (r *shutdownRig) heldInvite(t *testing.T) <-chan *sip.Response {
 
 // close starts Close and returns once the Server is closing.
 func (r *shutdownRig) close() {
-	go func() { r.a.srv.Close(); close(r.closed) }()
+	go func() { r.a.srv.Close(); r.closedAt = time.Now(); close(r.closed) }()
 	for {
 		r.a.srv.mu.Lock()
 		closing := r.a.srv.closed
@@ -223,17 +225,17 @@ func TestTheByesHaveTheirOwnBound(t *testing.T) {
 	start := time.Now()
 	r.close()
 	// The first bound passes waiting for the stored message; then the
-	// live session's BYE goes, and Close waits for its answer.
+	// live session's BYE goes, and Close waits for its answer, which never
+	// comes, for a bound of its own: Close cannot have returned before both
+	// had passed. Deadlines never come early, and load only makes Close
+	// later, so the time Close returned at decides (#450: watching for an
+	// early return on the test's own clock failed when the test woke at
+	// 2.7 s; #314 was Close at 303 ms, with no bound for the BYE).
 	r.byeFor(t, live)
-	for time.Since(start) < wait+wait/2 {
-		select {
-		case <-r.closed:
-			t.Fatalf("Close returned %v after it began, before the BYE was answered", time.Since(start))
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	once.Do(func() { close(answerBye) })
 	r.waitClosed(t)
+	if took := r.closedAt.Sub(start); took < 2*wait {
+		t.Fatalf("Close returned %v after it began, before its BYE had a bound of its own (2*%v)", took, wait)
+	}
 }
 
 // A session rcs-as started is confirmed once rcs-as sent its ACK: its
