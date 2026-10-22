@@ -764,12 +764,20 @@ func TestAReferWhoseFirstNotifyIsRefusedSendsNoOutcome(t *testing.T) {
 	}
 	waitUntil(t, "the refusal", func() bool { return g.metrics.get("sip.refer.notify_failed") == 1 })
 	release()
+	g.referOutcomeDropped(t)
+}
+
+// referOutcomeDropped waits for a REFER's outcome to be settled one way or
+// the other: its NOTIFY reaches the core, which fails the test, or it is
+// counted as not sent; and then requires it was not counted as told.
+func (g *groupRig) referOutcomeDropped(t *testing.T) {
+	t.Helper()
 	deadline := time.After(waitFor)
 	for g.metrics.get("sip.refer.notify_after_refusal") == 0 {
 		select {
 		case req := <-g.core.got:
 			if req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Subscription-State"), "terminated") {
-				t.Fatalf("the outcome %q went after the referrer refused the subscription", req.Body)
+				t.Fatalf("the outcome %q went after the referrer ended the subscription", req.Body)
 			}
 		case <-deadline:
 			t.Fatal("the INVITE's outcome was neither sent nor dropped")
@@ -779,6 +787,121 @@ func TestAReferWhoseFirstNotifyIsRefusedSendsNoOutcome(t *testing.T) {
 	if n := g.metrics.get("sip.refer.notified"); n != 0 {
 		t.Fatalf("%d REFER subscriptions counted as told their outcome", n)
 	}
+}
+
+// A REFER's first NOTIFY that times out ends its implicit subscription as
+// a refused one does (RFC 6665 §4.2.2): the outcome is not sent (#429,
+// #465). The transactions run on a fake clock (#430's txClock): Timer F of
+// that NOTIFY is the first 64*T1 timer armed after the REFER, since the
+// NOTIFY goes before the focus's INVITE does.
+func TestAReferWhoseFirstNotifyTimesOutSendsNoOutcome(t *testing.T) {
+	txc := newFakeClock()
+	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{Clock: txClock{txc}} })
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	var held atomic.Bool
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		switch {
+		case req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Event"), "refer"):
+			return nil // never answered
+		case req.Method == "INVITE" && held.Load():
+			<-hold
+		}
+		code := 200
+		if req.Method == "INVITE" {
+			code = 486
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		return []*sip.Response{res}
+	})
+	p := r.a.dial(t)
+	uri, s := r.create(t, p, relayPath(), bob)
+	r.core.nextOfEach(t, "INVITE", "ACK")
+	g := &groupRig{chatRig: r, p: p, uri: uri, s: s}
+	held.Store(true)
+	since := txc.mark()
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	txc.fireFirstSince(t, since, 64*transaction.DefaultT1)
+	waitUntil(t, "the NOTIFY's timeout", func() bool { return g.metrics.get("sip.refer.notify_failed") == 1 })
+	release()
+	g.referOutcomeDropped(t)
+}
+
+// A REFER's NOTIFY refused for a passing reason, a 503 say (RFC 5057), does
+// not end its subscription: the outcome still goes (QA of #433).
+func TestAReferWhoseFirstNotifyFailsForAPassingReasonStillTellsItsOutcome(t *testing.T) {
+	g := newGroupRig(t, bob)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		code := 200
+		switch {
+		case req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Event"), "refer") &&
+			!strings.HasPrefix(req.Header.Get("Subscription-State"), "terminated"):
+			code = 503
+		case req.Method == "INVITE":
+			code = 486
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		return []*sip.Response{res}
+	})
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	for {
+		n := g.core.nextOf(t, "NOTIFY")
+		if strings.HasPrefix(n.Header.Get("Event"), "refer") && strings.HasPrefix(n.Header.Get("Subscription-State"), "terminated") {
+			if string(n.Body) != "SIP/2.0 480 Temporarily Unavailable\r\n" {
+				t.Fatalf("outcome %q, want 480", n.Body)
+			}
+			break
+		}
+	}
+	if n := g.metrics.get("sip.refer.notify_after_refusal"); n != 0 {
+		t.Fatalf("%d REFER NOTIFYs dropped after a 503 that keeps the subscription", n)
+	}
+}
+
+// The refusal takes effect before it is counted (QA of #433): with the
+// INVITE held, the REFER's own bound ends it at the moment the refusal is
+// counted (the counter's hook runs before the count), and its outcome must
+// already be held back.
+func TestAReferRefusalHoldsBackAnOutcomeDueAtOnce(t *testing.T) {
+	g := newGroupRig(t, bob)
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		code := 200
+		switch {
+		case req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Event"), "refer"):
+			code = 481
+		case req.Method == "INVITE":
+			<-hold
+			code = 486
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		return []*sip.Response{res}
+	})
+	var once sync.Once
+	fired := make(chan struct{})
+	h := func(name string) {
+		if name == "sip.refer.notify_failed" {
+			once.Do(func() { g.clock.fire(referWait); close(fired) }) // finish runs here
+		}
+	}
+	g.metrics.hook.Store(&h)
+	t.Cleanup(func() { g.metrics.hook.Store(nil) })
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	select {
+	case <-fired:
+	case <-time.After(waitFor):
+		t.Fatal("no refusal counted")
+	}
+	g.referOutcomeDropped(t)
 }
 
 // Code review and QA on #340: Referred-By names whoever sent the REFER,
