@@ -5,8 +5,11 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // A Finding is a print call that can show a SIP message's content: its
@@ -23,8 +26,8 @@ type checker struct {
 	// msgPkg is the import path of the package whose Request, Response
 	// and Body hold content (internal/sip).
 	msgPkg string
-	// msg is msgPkg as the package being checked sees it, nil if the
-	// package does not depend on it.
+	// msg is msgPkg as the package being checked sees it, or as the
+	// importer loads it if the package does not depend on it.
 	msg   *types.Package
 	info  *types.Info
 	fset  *token.FileSet
@@ -102,7 +105,8 @@ var printFuncs = map[string]printFunc{
 	// slog's text handler prints an argument it has no LogValuer for with
 	// %+v; its JSON handler uses encoding/json, which skips unexported
 	// fields, so the text handler is the one to guard against.
-	"log/slog.Any": {1, false}, "log/slog.Group": {1, false},
+	"log/slog.Any": {1, false}, "log/slog.AnyValue": {0, false}, "log/slog.Group": {1, false},
+	"log/slog.With": {0, false}, "log/slog.Record.Add": {0, false},
 	"log/slog.Debug": {1, false}, "log/slog.Info": {1, false}, "log/slog.Warn": {1, false}, "log/slog.Error": {1, false},
 	"log/slog.DebugContext": {2, false}, "log/slog.InfoContext": {2, false},
 	"log/slog.WarnContext": {2, false}, "log/slog.ErrorContext": {2, false},
@@ -137,7 +141,15 @@ func (c *checker) funcKey(call *ast.CallExpr) string {
 		return ""
 	}
 	f, ok := c.info.Uses[id].(*types.Func)
-	if !ok || f.Pkg() == nil {
+	if !ok {
+		return ""
+	}
+	return funcKey(f)
+}
+
+// funcKey names f as printFuncs does, or "".
+func funcKey(f *types.Func) string {
+	if f.Pkg() == nil {
 		return ""
 	}
 	sig, _ := f.Type().(*types.Signature)
@@ -155,97 +167,372 @@ func (c *checker) funcKey(call *ast.CallExpr) string {
 }
 
 func (c *checker) call(call *ast.CallExpr) {
-	pf, ok := printFuncs[c.funcKey(call)]
+	key := c.funcKey(call)
+	pf, ok := printFuncs[key]
 	if !ok || call.Ellipsis.IsValid() {
 		// A spread []any holds interfaces, which show nothing statically.
 		return
 	}
-	constantFormat := true
-	if pf.formatted && pf.first > 0 && pf.first-1 < len(call.Args) {
-		tv := c.info.Types[call.Args[pf.first-1]]
-		constantFormat = tv.Value != nil && tv.Value.Kind() == constant.String
+	args := call.Args[min(pf.first, len(call.Args)):]
+	verbs := make([][]verb, len(args))
+	for i := range verbs {
+		verbs[i] = []verb{{r: 'v'}}
 	}
-	for _, arg := range call.Args[min(pf.first, len(call.Args)):] {
+	formatted := pf.formatted && pf.first > 0 && pf.first-1 < len(call.Args)
+	if formatted {
+		verbs = nil
+		tv := c.info.Types[call.Args[pf.first-1]]
+		if tv.Value != nil && tv.Value.Kind() == constant.String {
+			verbs = argVerbs(constant.StringVal(tv.Value), len(args))
+		}
+	}
+	for i, arg := range args {
 		t := c.info.TypeOf(arg)
 		if t == nil {
 			continue
 		}
-		w := walk{c: c, constantFormat: constantFormat || !pf.formatted, seen: map[seenKey]bool{}}
-		if shape := w.reach(t, false, ""); shape != "" {
-			c.found = append(c.found, Finding{Pos: c.fset.Position(arg.Pos()), Shape: shape})
+		if _, isIface := t.Underlying().(*types.Interface); isIface {
+			// Its dynamic type is unknown.
+			continue
+		}
+		vs, desc := anyVerb, "a format that is not a constant"
+		if verbs != nil {
+			vs, desc = verbs[i], ""
+		}
+		for _, v := range vs {
+			if v.r == 'T' {
+				continue // the type's name only
+			}
+			d := desc
+			if d == "" {
+				d = v.String()
+			}
+			w := walk{c: c, verb: v, desc: d, wrapErrs: key == "fmt.Errorf", slog: strings.HasPrefix(key, "log/slog."), seen: map[seenKey]bool{}}
+			if shape := w.reach(t, state{top: true}, ""); shape != "" {
+				c.found = append(c.found, Finding{Pos: c.fset.Position(arg.Pos()), Shape: shape})
+				break
+			}
 		}
 	}
 }
 
-type seenKey struct {
-	t          types.Type
+// A verb is a printf verb and whether it has the # flag, which matters to
+// fmt only for %v and %w.
+type verb struct {
+	r     rune
+	sharp bool
+}
+
+func (v verb) String() string {
+	if v.sharp {
+		return "%#" + string(v.r)
+	}
+	return "%" + string(v.r)
+}
+
+// anyVerb stands for a format that is not a constant: a verb of each kind
+// fmt treats apart. %v, %x and %X call String and print a pointer as its
+// address; %s and %q call String but refuse a pointer; %d, %b and %o print
+// a pointer but call no String; %t and the rest do neither; %#v calls only
+// GoString; %p prints only what is a pointer; %w prints only an error and
+// only in fmt.Errorf.
+var anyVerb = []verb{{r: 'v'}, {r: 's'}, {r: 'd'}, {r: 't'}, {r: 'v', sharp: true}, {r: 'p'}, {r: 'w'}, {r: 'w', sharp: true}}
+
+// argVerbs reads format as fmt's Printf does and returns, for each of n
+// arguments, the verbs that print it; one that no verb names prints with
+// %v, after the output. It returns nil, to be read as any format, if fmt
+// would refuse an argument index in format.
+func argVerbs(format string, n int) [][]verb {
+	verbs := make([][]verb, n)
+	argNum := 0
+	for i := 0; i < len(format); {
+		if format[i] != '%' {
+			i++
+			continue
+		}
+		i++
+		sharp := false
+	flags:
+		for ; i < len(format); i++ {
+			switch format[i] {
+			case '#':
+				sharp = true
+			case '0', '+', '-', ' ':
+			default:
+				break flags
+			}
+		}
+		ok, afterIndex := true, false
+		argNum, i, afterIndex, ok = argIndex(format, i, argNum, n, ok)
+		if i < len(format) && format[i] == '*' {
+			i, argNum, afterIndex = i+1, min(argNum+1, n), false
+		} else if j := digits(format, i); j > i {
+			i, ok = j, ok && !afterIndex
+		}
+		if i+1 < len(format) && format[i] == '.' {
+			i, ok = i+1, ok && !afterIndex
+			argNum, i, afterIndex, ok = argIndex(format, i, argNum, n, ok)
+			if i < len(format) && format[i] == '*' {
+				i, argNum, afterIndex = i+1, min(argNum+1, n), false
+			} else {
+				i = digits(format, i)
+			}
+		}
+		if !afterIndex {
+			argNum, i, _, ok = argIndex(format, i, argNum, n, ok)
+		}
+		if !ok {
+			return nil
+		}
+		if i >= len(format) {
+			break
+		}
+		r, size := utf8.DecodeRuneInString(format[i:])
+		i += size
+		if r == '%' || argNum >= n {
+			continue
+		}
+		v := verb{r: r, sharp: sharp && (r == 'v' || r == 'w')}
+		if !slices.Contains(verbs[argNum], v) {
+			verbs[argNum] = append(verbs[argNum], v)
+		}
+		argNum++
+	}
+	for i := range verbs {
+		if len(verbs[i]) == 0 {
+			verbs[i] = []verb{{r: 'v'}}
+		}
+	}
+	return verbs
+}
+
+// argIndex reads an explicit argument index, [n], at format[i:], as fmt's
+// argNumber does; ok turns false, and stays so, for one fmt refuses.
+func argIndex(format string, i, argNum, n int, ok bool) (int, int, bool, bool) {
+	if i >= len(format) || format[i] != '[' {
+		return argNum, i, false, ok
+	}
+	end := strings.IndexByte(format[i:], ']')
+	if end < 0 {
+		return argNum, i + 1, false, false
+	}
+	index, err := strconv.Atoi(format[i+1 : i+end])
+	if err != nil || index < 1 || index > n {
+		return argNum, i + end + 1, false, false
+	}
+	return index - 1, i + end + 1, true, ok
+}
+
+func digits(format string, i int) int {
+	for i < len(format) && '0' <= format[i] && format[i] <= '9' {
+		i++
+	}
+	return i
+}
+
+// state is where fmt is in printing an argument.
+type state struct {
+	// top is the argument itself, which fmt handles apart: %p and its
+	// methods first, and a pointer to a struct, array, slice or map
+	// followed, once.
+	top bool
+	// unexported says the path went through an unexported field, below
+	// which fmt calls no method.
 	unexported bool
+	// erroring is fmt printing a value a verb does not suit, as
+	// %!t(type=value): with %v and without calling any method, at any
+	// depth.
+	erroring bool
 }
 
-// walk follows one argument's type down to the values fmt reaches.
+// walk follows one argument's type down to the values fmt reaches when it
+// prints the argument with one verb.
 type walk struct {
-	c              *checker
-	constantFormat bool
-	seen           map[seenKey]bool
+	c        *checker
+	verb     verb
+	desc     string // the verb, as findings name it
+	wrapErrs bool   // fmt.Errorf, where %w prints an error
+	slog     bool   // slog, which calls an argument's LogValue first
+	seen     map[seenKey]bool
 }
 
-// reach reports how fmt, printing a value of type t, can show a message's
-// content, or "" if it cannot. unexported says the path so far went
-// through an unexported field, below which fmt calls no method; path names
-// that path for the finding.
-func (w *walk) reach(t types.Type, unexported bool, path string) string {
-	k := seenKey{t, unexported}
+type seenKey struct {
+	t types.Type
+	s state
+}
+
+// stops is what fmt does with a value's own methods.
+type stops int
+
+const (
+	printsFields stops = iota // calls none, and prints the value
+	callsMethod               // calls one, which prints the value
+	refusesVerb               // prints it as erroring
+)
+
+// reach reports how fmt, printing a value of type t in state s, can show a
+// message's content, or "" if it cannot; path names the fields on the way
+// for the finding.
+func (w *walk) reach(t types.Type, s state, path string) string {
+	t = types.Unalias(t)
+	k := seenKey{t, s}
 	if w.seen[k] {
 		return ""
 	}
 	w.seen[k] = true
-	if name, pointer, ok := w.held(t); ok {
-		switch {
-		case unexported:
-			return "a " + kind(name, pointer) + " in an unexported field" + at(path)
-		case !pointer && name != "Body" && !w.constantFormat:
-			// String serves only %v, %s, %q, %x and %X of a value, and a
-			// format vet cannot read may ask for any other.
-			return "a " + kind(name, pointer) + " value with a format that is not a constant" + at(path)
+	if s.top && !s.erroring && w.verb.r == 'p' {
+		if pointerLike(t) {
+			return "" // its address
 		}
-		// Format or String, called on it, prints it as it logs.
-		return ""
+		return w.reach(t, state{top: true, erroring: true}, path)
 	}
-	if !unexported && w.formats(t) {
-		return ""
+	if name, pointer, ok := w.held(t); ok {
+		what := kind(name, pointer)
+		switch {
+		case s.unexported:
+			return "a " + what + " in an unexported field" + at(path)
+		case s.erroring:
+			if pointer && !s.top {
+				return "" // its address
+			}
+		default:
+			switch w.methods(t, s) {
+			case callsMethod:
+				return "" // it prints as redacted, or as it logs
+			case refusesVerb:
+				return w.reach(t, state{top: true, erroring: true}, path)
+			}
+		}
+		if !pointer {
+			what += " value"
+		}
+		return "a " + what + " with " + w.desc + at(path)
 	}
+	_, isIface := t.Underlying().(*types.Interface)
+	if !s.erroring && (s.top || !s.unexported) && !isIface {
+		// An interface's methods are its dynamic value's, which the
+		// interface case below tries.
+		switch w.methods(t, s) {
+		case callsMethod:
+			return ""
+		case refusesVerb:
+			return w.reach(t, state{top: true, erroring: true}, path)
+		}
+	}
+	below := state{unexported: s.unexported, erroring: s.erroring}
 	switch u := t.Underlying().(type) {
 	case *types.Pointer:
-		return w.reach(u.Elem(), unexported, path)
-	case *types.Slice:
-		return w.reach(u.Elem(), unexported, path+"[]")
-	case *types.Array:
-		return w.reach(u.Elem(), unexported, path+"[]")
-	case *types.Map:
-		if s := w.reach(u.Key(), unexported, path+"[key]"); s != "" {
-			return s
+		switch {
+		case s.top:
+			// fmt follows it to a struct, array, slice or map.
+		case s.erroring:
+			return "" // its address
+		case !strings.ContainsRune("vbodxX", w.verb.r):
+			// fmt refuses the verb on a pointer, and prints the pointer
+			// as erroring, which follows it once.
+			return w.reach(u.Elem(), state{unexported: s.unexported, erroring: true}, path)
 		}
-		return w.reach(u.Elem(), unexported, path+"[]")
+		// Below the top fmt prints only its address for these verbs;
+		// following it anyway errs on the side of a finding.
+		return w.reach(u.Elem(), below, path)
+	case *types.Slice:
+		return w.reach(u.Elem(), below, path+"[]")
+	case *types.Array:
+		return w.reach(u.Elem(), below, path+"[]")
+	case *types.Map:
+		if r := w.reach(u.Key(), below, path+"[key]"); r != "" {
+			return r
+		}
+		return w.reach(u.Elem(), below, path+"[]")
 	case *types.Struct:
 		for i := range u.NumFields() {
 			f := u.Field(i)
-			if s := w.reach(f.Type(), unexported || !f.Exported(), path+"."+f.Name()); s != "" {
-				return s
+			fs := below
+			fs.unexported = s.unexported || !f.Exported()
+			if r := w.reach(f.Type(), fs, path+"."+f.Name()); r != "" {
+				return r
 			}
 		}
 	case *types.Interface:
-		if unexported && w.mayHold(u) {
-			return "an interface that may hold a message in an unexported field" + at(path)
+		// fmt prints its dynamic value as the field's: try each message
+		// type the interface can hold.
+		for _, m := range w.c.held(u) {
+			if r := w.reach(m, below, path); r != "" {
+				return "an interface that may hold " + r
+			}
 		}
 	}
 	return ""
+}
+
+// methods reports what fmt does with t's own methods when it prints a
+// value of t with w's verb: handleMethods in fmt's print.go.
+func (w *walk) methods(t types.Type, s state) stops {
+	ms := types.NewMethodSet(t)
+	if w.slog && s.top && method(ms, "LogValue", 0, 1) {
+		// slog resolves a LogValuer before it prints.
+		return callsMethod
+	}
+	v := w.verb
+	if v.r == 'w' {
+		if !w.wrapErrs || !stringMethod(ms, "Error") {
+			return refusesVerb
+		}
+		v.r = 'v'
+	}
+	switch {
+	case method(ms, "Format", 2, 0):
+		return callsMethod
+	case v.sharp && v.r == 'v':
+		if stringMethod(ms, "GoString") {
+			return callsMethod
+		}
+	case strings.ContainsRune("vsxXq", v.r):
+		if stringMethod(ms, "Error") || stringMethod(ms, "String") {
+			return callsMethod
+		}
+	}
+	return printsFields
+}
+
+// method reports whether ms has a method name with params parameters and
+// results results.
+func method(ms *types.MethodSet, name string, params, results int) bool {
+	sel := ms.Lookup(nil, name)
+	if sel == nil {
+		return false
+	}
+	sig, ok := sel.Type().(*types.Signature)
+	return ok && sig.Params().Len() == params && sig.Results().Len() == results
+}
+
+// stringMethod reports whether ms has name() string, as fmt.Stringer,
+// fmt.GoStringer and error do.
+func stringMethod(ms *types.MethodSet, name string) bool {
+	if !method(ms, name, 0, 1) {
+		return false
+	}
+	res := ms.Lookup(nil, name).Type().(*types.Signature).Results().At(0).Type()
+	b, ok := res.Underlying().(*types.Basic)
+	return ok && b.Kind() == types.String
+}
+
+// pointerLike reports whether %p prints a value of t as an address.
+func pointerLike(t types.Type) bool {
+	switch u := t.Underlying().(type) {
+	case *types.Pointer, *types.Slice, *types.Map, *types.Chan, *types.Signature:
+		return true
+	case *types.Basic:
+		return u.Kind() == types.UnsafePointer
+	}
+	return false
 }
 
 // held reports whether t is one of msgPkg's held types, or a pointer to
 // one.
 func (w *walk) held(t types.Type) (name string, pointer, ok bool) {
 	if p, isPtr := t.(*types.Pointer); isPtr {
-		t, pointer = p.Elem(), true
+		t, pointer = types.Unalias(p.Elem()), true
 	}
 	n, isNamed := t.(*types.Named)
 	if !isNamed || n.Obj().Pkg() == nil || n.Obj().Pkg().Path() != w.c.msgPkg || !heldTypes[n.Obj().Name()] {
@@ -254,32 +541,23 @@ func (w *walk) held(t types.Type) (name string, pointer, ok bool) {
 	return n.Obj().Name(), pointer, true
 }
 
-// formats reports whether fmt calls a method of t's own instead of
-// printing its fields: Format for any verb, String for the verbs a
-// constant format can ask for, which go vet checks.
-func (w *walk) formats(t types.Type) bool {
-	ms := types.NewMethodSet(t)
-	if ms.Lookup(nil, "Format") != nil {
-		return true
-	}
-	return w.constantFormat && ms.Lookup(nil, "String") != nil
-}
-
-// mayHold reports whether a value of interface type i may be a message.
-// A package that does not depend on msgPkg can still be handed one in an
-// empty interface.
-func (w *walk) mayHold(i *types.Interface) bool {
-	if w.c.msg == nil {
-		return i.Empty()
-	}
-	for _, name := range []string{"Request", "Response"} {
-		if obj, ok := w.c.msg.Scope().Lookup(name).(*types.TypeName); ok {
-			if types.Implements(types.NewPointer(obj.Type()), i) {
-				return true
+// held returns the held types, by value and behind a pointer, that a value
+// of interface type i may be. A package that does not depend on msgPkg can
+// still be handed one.
+func (c *checker) held(i *types.Interface) []types.Type {
+	var out []types.Type
+	for _, name := range []string{"Request", "Response", "Body"} {
+		obj, ok := c.msg.Scope().Lookup(name).(*types.TypeName)
+		if !ok {
+			continue
+		}
+		for _, t := range []types.Type{obj.Type(), types.NewPointer(obj.Type())} {
+			if types.Implements(t, i) {
+				out = append(out, t)
 			}
 		}
 	}
-	return false
+	return out
 }
 
 func kind(name string, pointer bool) string {

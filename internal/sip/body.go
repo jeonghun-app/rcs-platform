@@ -22,20 +22,35 @@ import (
 //     pointer;
 //   - tools/printguard, which make check runs too, refuses every call to a
 //     print function (fmt's, log's, slog's, testing's) in the module's code
-//     whose argument can reach a message through an unexported field, at
-//     any depth and through local, generic and interface types (Message,
-//     any), or that prints a Request or Response value with a format that
-//     is not a constant (#599);
+//     whose argument fmt can print a message of without calling the
+//     message's own methods: through an unexported field, at any depth and
+//     through local, generic, aliased and interface types (Message, any,
+//     fmt.Stringer); with a verb those methods do not serve, %p and %w
+//     among them; or with a format that is not a constant (#599);
 //   - TestNoStructHoldsAMessageOrBodyByValueUnexported refuses a struct
 //     field that holds a message or a Body by value, unexported, as written.
 //
-// Not guarded: _test.go files; a value already of an interface type at the
-// call, whose dynamic type is unknown; a spread []any; generic code
-// printing a value of a type parameter; and printing through reflection,
-// a function value or a wrapper printguard does not list. internal/content
-// holds the module's other chat content behind a pointer, which closes
-// these cases too; a SIP body is read and written as bytes throughout the
-// SIP layer and every service, so this type keeps it as bytes (#573).
+// Not guarded, listed here only:
+//   - _test.go files, and files built only under a tag that is not on by
+//     default;
+//   - an interface's dynamic value beyond the message types themselves: an
+//     argument already of an interface type, and a message inside a value
+//     held in an interface field (an error that holds a request, say); a
+//     spread []any; and generic code printing a value of a type parameter;
+//   - printing through reflection, a function value, or a wrapper that
+//     printguard's printFuncs does not list; slog takes content through
+//     Any, AnyValue and its ...any arguments, which are listed;
+//   - a conversion that makes content a plain string or bytes, such as
+//     string(req.Body) or a header field's value, which a guard that reads
+//     types cannot follow;
+//   - what a type's own String, Error, GoString, Format or LogValue prints,
+//     which printguard trusts;
+//   - a Header printed on its own, which shows its values until #618.
+//
+// internal/content holds the module's other chat content behind a
+// pointer, which closes these cases too; a SIP body is read and written as
+// bytes throughout the SIP layer and every service, so this type keeps it
+// as bytes (#573).
 type Body []byte
 
 const redactedBody = "[redacted body]"
