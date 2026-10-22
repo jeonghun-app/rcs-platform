@@ -156,8 +156,9 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 // urn:gsma:imei number starts after), are dropped first, so they split no
 // number, though they still end the word before them; see [dropInvisibles].
 // So are invisible characters and combining marks inside a URI scheme
-// ("si<SHY>p:", "t<U+0301>el:", [joinSchemes]) and invisible characters
-// inside a URI user, whose hint is then the plain user's.
+// ("si<SHY>p:", "t<U+0301>el:", [joinSchemes]), invisible characters
+// inside a URI user, whose hint is then the plain user's, and both around
+// the quotes of a quoted im or pres user (#597).
 // The line and paragraph separators and the braille blank group a number as
 // spaces do. A "+" may be followed by a bracketed country code
 // ("+(81)3 1234 5678"); the full-width "＊" and "＃" of a tel number and the
@@ -200,8 +201,8 @@ func (r *Redactor) Redact(s string) string {
 		i = start
 		switch {
 		case hasUserinfo(s[start-n : start]):
-			if at := quotedUserEnd(s, start, s[start-n:start]); at > 0 {
-				b.WriteString(r.mask(s[start+1 : at-1]))
+			if open, close, at := quotedUser(s, start, s[start-n:start]); at > 0 {
+				b.WriteString(r.mask(s[open+1 : close]))
 				i = at
 				continue
 			}
@@ -467,29 +468,51 @@ func schemeLen(s string) int {
 	return 0
 }
 
-// quotedUserEnd returns the index of the '@' after a quoted user that starts
-// at s[start], or -1 when there is none. Only im and pres users may be quoted:
+// quotedUser returns where the quoted user that starts at s[start] opens
+// and closes, the indexes of its quotes, and the index of the '@' after it,
+// or an at of -1 when there is none. Only im and pres users may be quoted:
 // RFC 3860 §3 and RFC 3859 §3 take the user from an RFC 5322 addr-spec, whose
 // local part may be a quoted string with spaces and backslash-escaped
-// characters. The scans of two such users never overlap, because a user's
-// opening quote follows the scheme's ':' and so cannot be an escaped quote
-// inside an earlier user, which keeps Redact linear.
-func quotedUserEnd(s string, start int, scheme string) int {
-	if start >= len(s) || s[start] != '"' || !strings.EqualFold(scheme, "im:") && !strings.EqualFold(scheme, "pres:") {
-		return -1
+// characters. A run of invisible characters and combining marks may stand
+// before the opening quote and after the closing one, which a log viewer
+// shows as nothing or draws over the ":" or the quote: the user is read as
+// without it, and Redact drops it with the quotes (#597). The scans of two
+// such users never overlap, because a user's opening quote follows the
+// scheme's ':' or such a run, and so cannot be an escaped quote inside an
+// earlier user, which keeps Redact linear.
+func quotedUser(s string, start int, scheme string) (open, close, at int) {
+	if !strings.EqualFold(scheme, "im:") && !strings.EqualFold(scheme, "pres:") {
+		return 0, 0, -1
 	}
-	for j := start + 1; j < len(s); j++ {
+	open = hiddenRunEnd(s, start)
+	if open >= len(s) || s[open] != '"' {
+		return 0, 0, -1
+	}
+	for j := open + 1; j < len(s); j++ {
 		switch s[j] {
 		case '\\':
 			j++ // the escaped character, even a quote
 		case '"':
-			if j+1 < len(s) && s[j+1] == '@' {
-				return j + 1
+			if at := hiddenRunEnd(s, j+1); at < len(s) && s[at] == '@' {
+				return open, j, at
 			}
-			return -1
+			return 0, 0, -1
 		}
 	}
-	return -1
+	return 0, 0, -1
+}
+
+// hiddenRunEnd returns where the run of invisible characters and combining
+// marks at s[i] ends: i itself when there is none.
+func hiddenRunEnd(s string, i int) int {
+	for i < len(s) && s[i] >= utf8.RuneSelf {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !isInvisible(r) && !isMark(r) {
+			break
+		}
+		i += size
+	}
+	return i
 }
 
 // hasUserinfo reports whether the scheme's identifier is the part before '@'
