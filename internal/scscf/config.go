@@ -21,6 +21,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
@@ -118,7 +119,7 @@ type ServiceConfig struct {
 	SealKeyID     string
 	// NonceKey authenticates Digest nonces, and DialogKeys sign the
 	// Record-Route values and iFC positions; the same on every task.
-	NonceKey   []byte
+	NonceKey   secret.Key
 	DialogKeys []routing.DialogKey
 
 	// ICSCF is where an originating request goes once its chain is done.
@@ -152,7 +153,9 @@ type ServiceConfig struct {
 // A ServiceConfig prints as a placeholder, under every valid verb of fmt,
 // log/slog and encoding/json: it holds NonceKey, the dialog keys and the
 // challenge keys, which must never reach an output. The key types redact
-// themselves too, for when one is printed on its own.
+// themselves too, for when one is printed on its own, and hold their bytes
+// in a secret.Key, which an invalid verb, one that calls no method, does
+// not show either (#455).
 func (c ServiceConfig) String() string { return "scscf.ServiceConfig{[redacted]}" }
 
 func (c ServiceConfig) GoString() string             { return c.String() }
@@ -262,17 +265,17 @@ func Configure(s *runtime.Settings) ServiceConfig {
 		"required with SCSCF_STORE=dynamodb: challenges are sealed in the table"); current != nil {
 		for _, k := range [][]byte{current, previous} {
 			if k != nil {
-				c.ChallengeKeys = append(c.ChallengeKeys, dynamostore.ChallengeKey{ID: keyID(k), Key: challengeSealKey(k)})
+				c.ChallengeKeys = append(c.ChallengeKeys, dynamostore.ChallengeKey{ID: keyID(k), Key: secret.NewKey(challengeSealKey(k))})
 			}
 		}
 		c.SealKeyID = keyID(current)
 	}
-	c.NonceKey = readKey(e, "NONCE_KEY", true, "required: every task authenticates the Digest nonces of the others")
+	c.NonceKey = secret.NewKey(readKey(e, "NONCE_KEY", true, "required: every task authenticates the Digest nonces of the others"))
 	if current, previous := readKeyPair(e, "DIALOG_KEY", true,
 		"required: it signs the Record-Route values and iFC positions"); current != nil {
 		for _, k := range [][]byte{current, previous} {
 			if k != nil {
-				c.DialogKeys = append(c.DialogKeys, routing.DialogKey{ID: keyID(k), Key: k})
+				c.DialogKeys = append(c.DialogKeys, routing.DialogKey{ID: keyID(k), Key: secret.NewKey(k)})
 			}
 		}
 	}

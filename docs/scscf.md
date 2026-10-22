@@ -110,6 +110,13 @@ Counters, by the names the packages' documentation lists:
 `registrar.*`, `regevent.*`, `routing.*` and `ifc.*`. `cxclient.*` counts the
 Cx answers by result code and their latency.
 
+`sip.overloaded` counts the requests refused as overloaded (503 with
+Retry-After): at the transaction layer's caps
+(`SCSCF_MAX_SERVER_TRANSACTIONS`, `SCSCF_MAX_SERVER_TRANSACTION_BYTES`), or at
+the proxy's own bound, which charges headers twice. It is recorded every 15 s
+and at the stop, as icscf's and pcscf's are; #56's overload alarm reads it
+(#467).
+
 Alarm on a rise of these:
 
 - `registrar.hss_failed`;
