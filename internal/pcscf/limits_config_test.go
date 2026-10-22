@@ -42,6 +42,27 @@ func TestTheTransportGetsTheSendQueueBudget(t *testing.T) {
 	}
 }
 
+// The proxy gets the caps for its transaction layer, as many contexts and as
+// many bytes, and the transaction clock: run sets each of them (#485 code
+// review).
+func TestTheProxyGetsTheCapsAndTheClock(t *testing.T) {
+	got := make(chan proxy.Config, 1)
+	clock := &fakeTransactionClock{}
+	cfg := testConfig()
+	cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes = 30000, 512<<20
+	start(t, cfg, deps{clock: clock, proxyConfig: func(c proxy.Config) { got <- c }})
+	c := <-got
+	if c.Transaction.MaxServerTransactions != 30000 || c.Transaction.MaxServerTransactionBytes != 512<<20 {
+		t.Errorf("transaction layer caps %d, %d", c.Transaction.MaxServerTransactions, c.Transaction.MaxServerTransactionBytes)
+	}
+	if c.Transaction.Clock != clock {
+		t.Error("the transaction layer is not on the clock run was given")
+	}
+	if c.MaxContexts != 30000 || c.MaxContextBytes != 512<<20 {
+		t.Errorf("proxy MaxContexts %d, MaxContextBytes %d", c.MaxContexts, c.MaxContextBytes)
+	}
+}
+
 // holdingRouter holds every request until released, so that it stays in
 // progress.
 type holdingRouter struct {

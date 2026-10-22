@@ -60,6 +60,9 @@ type deps struct {
 	// transportConfig, if set, sees the transport's configuration before
 	// the transport is made.
 	transportConfig func(transport.Config)
+	// proxyConfig, if set, sees the proxy's configuration before the proxy
+	// is made.
+	proxyConfig func(proxy.Config)
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -186,7 +189,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if d.contextBytes != 0 {
 		maxContextBytes = d.contextBytes
 	}
-	px, err := proxy.New(tr, proxy.Config{
+	pcfg := proxy.Config{
 		Self:            selfURIs(cfg, int(coreAddr.Port())),
 		Router:          router,
 		Resolver:        resolver,
@@ -196,7 +199,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Transaction:     tcfg,
 		MaxContexts:     maxContexts,
 		MaxContextBytes: maxContextBytes,
-	})
+	}
+	if d.proxyConfig != nil {
+		d.proxyConfig(pcfg)
+	}
+	px, err := proxy.New(tr, pcfg)
 	if err != nil {
 		return err
 	}

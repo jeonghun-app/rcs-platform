@@ -321,17 +321,34 @@ func TestProductionRefusesWhatLetsClientsPastTheEdge(t *testing.T) {
 		})
 	}
 	// The same settings are only warned about in dev.
-	if _, err := configure(with(devEnv, "PCSCF_CLIENT_UDP_ADDR", "0.0.0.0:5060", "PCSCF_MAX_SERVER_TRANSACTIONS", "10", "PCSCF_WRITE_TIMEOUT", "100ms")); err != nil {
-		t.Fatal(err)
+	status, out := startup(t, with(devEnv, "PCSCF_CLIENT_UDP_ADDR", "0.0.0.0:5060", "PCSCF_MAX_SERVER_TRANSACTIONS", "10", "PCSCF_WRITE_TIMEOUT", "100ms"))
+	if status != runtime.ExitFailure || strings.Contains(out, "configuration rejected") || !strings.Contains(out, "must not start") {
+		t.Fatalf("dev: status %d, want a start that reaches its listeners:\n%s", status, out)
+	}
+	for _, want := range []string{"production-unsafe settings in use", "PCSCF_CLIENT_UDP_ADDR is set",
+		"PCSCF_MAX_SERVER_TRANSACTIONS is a tenth of its default or less", "PCSCF_WRITE_TIMEOUT is outside 1s to 1m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dev: no warning %q:\n%s", want, out)
+		}
 	}
 	// And just above a tenth, or at the edges of the write timeout's
-	// range, production starts.
-	if _, err := configure(with(prodEnv, "PCSCF_MAX_SERVER_TRANSACTIONS", "2001", "PCSCF_MAX_SERVER_TRANSACTION_BYTES", "26843546",
-		"PCSCF_MAX_QUEUED_BYTES", "26843546", "PCSCF_WRITE_TIMEOUT", "1s")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := configure(with(prodEnv, "PCSCF_WRITE_TIMEOUT", "1m")); err != nil {
-		t.Fatal(err)
+	// range, production starts: it gets as far as its listeners (#485
+	// code review).
+	for _, kv := range [][]string{
+		{"PCSCF_MAX_SERVER_TRANSACTIONS", "2001"},
+		{"PCSCF_MAX_SERVER_TRANSACTION_BYTES", "26843546"},
+		{"PCSCF_MAX_QUEUED_BYTES", "26843546"},
+		{"PCSCF_WRITE_TIMEOUT", "1s"},
+		{"PCSCF_WRITE_TIMEOUT", "1m"},
+		{"PCSCF_MAX_SERVER_TRANSACTION_BYTES", "9223372036854775807"},
+		{"PCSCF_MAX_QUEUED_BYTES", "9223372036854775807"},
+	} {
+		t.Run(kv[0]+"="+kv[1], func(t *testing.T) {
+			status, out := startup(t, with(prodEnv, kv...))
+			if status != runtime.ExitFailure || strings.Contains(out, "configuration rejected") || !strings.Contains(out, "must not start") {
+				t.Fatalf("status %d, want a start that reaches its listeners:\n%s", status, out)
+			}
+		})
 	}
 }
 

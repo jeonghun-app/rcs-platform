@@ -97,7 +97,8 @@ const (
 	// minQueuedBytes is room for the largest message the transport writes.
 	minQueuedBytes = 2 << 20
 	// The bounds staging and prod keep the write timeout in: a shorter one
-	// closes a slow mobile client's flow, a longer one holds a sender for a
+	// closes a slow mobile client's flow, or a core connection, with every
+	// transaction on it, behind a burst; a longer one holds a sender for a
 	// peer that has stopped reading.
 	minProductionWriteTimeout = time.Second
 	maxProductionWriteTimeout = time.Minute
@@ -208,8 +209,8 @@ type Config struct {
 	MaxServerTransactions     int
 	MaxServerTransactionBytes int64
 	// MaxQueuedBytes bounds the transport's send queues together, and
-	// WriteTimeout how long a send waits for a peer that does not read
-	// (transport.Config).
+	// WriteTimeout writing each 32 KiB of a message and a send's wait for
+	// room in a full queue (transport.Config).
 	MaxQueuedBytes int
 	WriteTimeout   time.Duration
 }
@@ -232,11 +233,11 @@ func limits(s *runtime.Settings, c Config) {
 	if c.WriteTimeout <= 0 {
 		e.Invalid("WRITE_TIMEOUT", "must be greater than zero")
 	}
-	s.ForbidInProduction(c.MaxServerTransactions*10 <= transaction.DefaultMaxServerTransactions,
+	s.ForbidInProduction(c.MaxServerTransactions <= transaction.DefaultMaxServerTransactions/10,
 		"PCSCF_MAX_SERVER_TRANSACTIONS is a tenth of its default or less, a value for a test")
-	s.ForbidInProduction(c.MaxServerTransactionBytes*10 <= transaction.DefaultMaxServerTransactionBytes,
+	s.ForbidInProduction(c.MaxServerTransactionBytes <= transaction.DefaultMaxServerTransactionBytes/10,
 		"PCSCF_MAX_SERVER_TRANSACTION_BYTES is a tenth of its default or less, a value for a test")
-	s.ForbidInProduction(c.MaxQueuedBytes*10 <= transport.DefaultMaxQueuedBytes,
+	s.ForbidInProduction(c.MaxQueuedBytes <= transport.DefaultMaxQueuedBytes/10,
 		"PCSCF_MAX_QUEUED_BYTES is a tenth of its default or less, a value for a test")
 	s.ForbidInProduction(c.WriteTimeout > 0 && (c.WriteTimeout < minProductionWriteTimeout || c.WriteTimeout > maxProductionWriteTimeout),
 		"PCSCF_WRITE_TIMEOUT is outside 1s to 1m")
