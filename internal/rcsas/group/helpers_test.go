@@ -211,10 +211,30 @@ func newRigWith(t *testing.T, cfg Config, ecfg messaging.Config, queues *store.M
 // the first beat is stored.
 func (r *rig) beat(t *testing.T) {
 	t.Helper()
+	// The queues check a copy's fence in the groups store, as the
+	// messages table does in groupchats.
+	r.queues.SetFence(func(f store.Fence) bool { return fencer(r.groups).Fenced(f.Group, f.Task, f.Epoch) })
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := r.s.StartHeartbeat(ctx)
 	t.Cleanup(func() { cancel(); stopped() })
 	waitFor(t, "the first heartbeat", func() bool { return r.s.alive(r.clock.Now()) })
+}
+
+// fencer finds the memory store under a test's groups store.
+func fencer(s groupstore.Store) interface {
+	Fenced(uri, task string, epoch int64) bool
+} {
+	switch s := s.(type) {
+	case *groupstore.Memory:
+		return s
+	case slowReads:
+		return fencer(s.Store)
+	case interface {
+		Fenced(uri, task string, epoch int64) bool
+	}:
+		return s
+	}
+	panic(fmt.Sprintf("no fence for %T", s))
 }
 
 // pass moves r's clock on by d, a heartbeat at a time, waiting at each

@@ -114,6 +114,187 @@ func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
 	}
 }
 
+// closingCallee registers B, which closes its connection, unanswered, as
+// the first request reaches it, or the first with method if one is given.
+func closingCallee(t *testing.T, ctx context.Context, core *simtest.IMSCore, method ...string) {
+	t.Helper()
+	var b *sipua.UA
+	var once sync.Once
+	b = registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(tx *transaction.ServerTransaction) {
+			if len(method) == 0 || tx.Request().Method == method[0] {
+				once.Do(func() { go func() { _ = b.Close() }() })
+			}
+		})
+}
+
+func TestARequestWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
+	// #414: when the callee's flow closes while the core waits for its
+	// answer, the core answers at once, as the platform does: its P-CSCF
+	// ends the request with 430 (RFC 5626 §5.3.1), which reaches the
+	// originator as 480 (§11.5). A request sent to the IMPU once the flow
+	// is gone gets 480 too: the binding stays until it expires, as a
+	// registration does. The core's T1 is the default, so its own Timer
+	// F, 32 s out, cannot end the request before a flow closed late under
+	// load (review of #425), and neither can the originator's. With
+	// StoreAndForward, a binding the flow's end removed would have the
+	// second MESSAGE stored and answered 202 instead (QA of #425).
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
+	core.Offline = simtest.StoreAndForward
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	closingCallee(t, ctx, core)
+	b, _ := sip.ParseURI(impuB)
+	for _, what := range []string{"while it waits", "once it is gone"} {
+		req, err := a.NewMessage(b, "text/plain", []byte("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := a.Send(ctx, req)
+		if err != nil || res == nil || res.StatusCode != 480 {
+			t.Fatalf("MESSAGE whose callee's flow closed %s = %v, %v; want the core's 480", what, res, err)
+		}
+	}
+	if n := core.Silenced(); n != 0 {
+		t.Fatalf("the core left %d requests unanswered, want none", n)
+	}
+}
+
+func TestAnInviteWhoseCalledPartysFlowGoesIsAnswered480(t *testing.T) {
+	// #414: as for a MESSAGE, and not 408 at Timer B: the core's T1 is
+	// the default, so Timer B is 32 s out, and B's layer sends 100 Trying,
+	// which stops it, so only the flow's end can end the INVITE.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	closingCallee(t, ctx, core)
+	b, _ := sip.ParseURI(impuB)
+	req, err := a.NewInvite(b, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, res, err := a.Invite(ctx, req, nil)
+	if err != nil || d != nil || res == nil {
+		t.Fatalf("INVITE whose callee's flow closed = dialog %v, %v; want the core's 480", d, err)
+	}
+	if res.StatusCode != 480 {
+		t.Fatalf("INVITE whose callee's flow closed = %d %s, want the core's 480", res.StatusCode, res.Reason)
+	}
+}
+
+func TestACancelledInviteWhoseCalledPartysFlowGoesIsAnswered487(t *testing.T) {
+	// QA of #425: an INVITE the originator cancelled, whose callee's flow
+	// closes before the callee has answered it, gets the 487 its CANCEL
+	// asked for, as on the platform, not the 480 of a flow that went. The
+	// core answers the CANCEL and passes it on (RFC 3261 §16.10), only
+	// after the INVITE, with the INVITE's top Via alone (§9.1): the core
+	// holds the INVITE's forward until it has taken the CANCEL (review of
+	// #425), so a CANCEL sent at once would reach B first. B closes its
+	// connection when the CANCEL reaches it.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
+	hold, taken := make(chan struct{}), make(chan struct{})
+	release, took := sync.OnceFunc(func() { close(hold) }), sync.OnceFunc(func() { close(taken) })
+	t.Cleanup(release)
+	core.Forwarding = func(req *sip.Request) {
+		if req.Method == "INVITE" {
+			<-hold
+		}
+	}
+	core.CancelTaken = took
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	var mu sync.Mutex
+	var got []string
+	vias := -1
+	var b *sipua.UA
+	var once sync.Once
+	b = registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
+		func(tx *transaction.ServerTransaction) {
+			req := tx.Request()
+			mu.Lock()
+			got = append(got, req.Method)
+			if req.Method == "CANCEL" {
+				if v, err := req.Header.Elements("Via"); err == nil {
+					vias = len(v)
+				}
+			}
+			mu.Unlock()
+			if req.Method == "CANCEL" {
+				once.Do(func() { go func() { _ = b.Close() }() })
+			}
+		})
+	bURI, _ := sip.ParseURI(impuB)
+	req, err := a.NewInvite(bURI, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ictx, stop := context.WithCancel(ctx)
+	defer stop()
+	var progress sync.Once
+	type result struct {
+		res *sip.Response
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		d, res, err := a.Invite(ictx, req, func(*sip.Response) { progress.Do(stop) })
+		if d != nil {
+			err = errors.New("a dialog")
+		}
+		done <- result{res, err}
+	}()
+	select {
+	case <-taken:
+	case <-ctx.Done():
+		t.Fatal("the core never took the CANCEL")
+	}
+	release()
+	r := <-done
+	if r.res == nil || !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("cancelled INVITE = %v, %v; want the core's 487", r.res, r.err)
+	}
+	if r.res.StatusCode != 487 {
+		t.Fatalf("cancelled INVITE whose callee's flow closed = %d %s, want 487", r.res.StatusCode, r.res.Reason)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) < 2 || got[0] != "INVITE" || got[1] != "CANCEL" {
+		t.Fatalf("B got %v, want the INVITE and then its CANCEL", got)
+	}
+	if vias != 1 {
+		t.Fatalf("the CANCEL B got has %d Vias, want the INVITE's top one only", vias)
+	}
+}
+
+func TestARequestTheCoreCannotSendOnIsAnswered500(t *testing.T) {
+	// QA of #425: a request the core cannot pass on for any reason but a
+	// gone flow gets 500, as the platform answers a branch that failed so
+	// (RFC 3261 §16.7 step 6). Here its own Via lacks the magic cookie, so
+	// the transaction layer refuses to send it.
+	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"})
+	core.Rewrite = func(req *sip.Request) {
+		if req.Method == "MESSAGE" {
+			_ = req.Header.Set("Via", "SIP/2.0/TCP core.invalid;branch=nocookie")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := registered(t, ctx, core, impuA, impiA, "a-password", "urn:uuid:00000000-0000-4000-8000-000000000001", nil)
+	registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002", nil)
+	b, _ := sip.ParseURI(impuB)
+	req, err := a.NewMessage(b, "text/plain", []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Send(ctx, req)
+	if err != nil || res == nil || res.StatusCode != 500 {
+		t.Fatalf("MESSAGE the core cannot send on = %v, %v; want the core's 500", res, err)
+	}
+}
+
 func TestAnInviteTheCalledPartyNeverGetsIsAnswered408(t *testing.T) {
 	// #363, review of #372: unlike a non-INVITE, an INVITE whose
 	// terminating transaction times out gets its 408 (RFC 3261 §16.8), as

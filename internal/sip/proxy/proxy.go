@@ -107,7 +107,10 @@ type Config struct {
 // Proxy is the transaction-stateful proxy core of RFC 3261 §16, the transaction
 // user of a Layer it owns. Its methods are safe for concurrent use.
 type Proxy struct {
-	sender    transaction.Sender
+	sender transaction.Sender
+	// flushes reports that the sender is a *transport.Transport, whose
+	// Flush Drain ends with (see respContext.inProgress).
+	flushes   bool
 	layer     *transaction.Layer
 	self      []sip.URI
 	router    Router
@@ -237,8 +240,10 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if _, err := io.ReadFull(cfg.Rand, key); err != nil {
 		return nil, fmt.Errorf("proxy: reading the hash key: %w", err)
 	}
+	_, flushes := s.(*transport.Transport)
 	p := &Proxy{
 		sender:    s,
+		flushes:   flushes,
 		self:      cfg.Self,
 		router:    cfg.Router,
 		resolver:  cfg.Resolver,
@@ -428,16 +433,27 @@ func (p *Proxy) answerForStop() int {
 		}
 	}
 	deadline := time.Now().Add(drainSendWait)
+	// One timer for all the answers, not one each (QA of #310).
+	expired := time.After(drainSendWait)
+	if f := drainTimer.Load(); f != nil {
+		expired = (*f)(drainSendWait)
+	}
 	for _, ch := range sent {
 		select {
 		case <-ch:
-		case <-time.After(time.Until(deadline)):
+		case <-expired:
 			return int(answered.Load())
 		}
 	}
 	p.flushSender(deadline)
 	return int(answered.Load())
 }
+
+// drainTimer, empty but in tests, stands for time.After in answerForStop's
+// wait, so that a test fires the end of DrainSendWait itself rather than
+// bounding Drain by wall clock (#408). It is atomic since a Drain may
+// outlive the test that set it.
+var drainTimer atomic.Pointer[func(time.Duration) <-chan time.Time]
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
@@ -738,9 +754,11 @@ type Stats struct {
 	// Counters since New.
 	Branches            uint64 // branches started
 	TargetsDropped      uint64 // targets refused past MaxBranches
+	BreadthExceeded     uint64 // targets failed 440, no Max-Breadth left for them (RFC 5393)
 	Cancels             uint64 // CANCELs sent downstream
 	TimerC              uint64 // INVITE branches whose Timer C fired
 	TargetTimeouts      uint64 // branches whose Target.Timeout fired
+	TargetTimeoutsKept  uint64 // of those, branches Target.OnTimeout kept
 	Overloaded          uint64 // requests and branches refused at MaxContexts or MaxContextBytes
 	Loops               uint64 // requests answered 482 (RFC 3261 §16.3 step 4)
 	Silenced            uint64 // non-INVITE requests left unanswered instead of 408 (RFC 4320 §4.2)
@@ -762,7 +780,7 @@ type Stats struct {
 }
 
 type counters struct {
-	branches, targetsDropped, cancels, timerC, targetTimeouts, overloaded, loops, silenced,
+	branches, targetsDropped, breadthExceeded, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
 	upstreamErrors, hookPanics, drained atomic.Uint64
 }
@@ -778,9 +796,11 @@ func (p *Proxy) Stats() Stats {
 		ContextBytes:           p.bytes.Load(),
 		Branches:               s.branches.Load(),
 		TargetsDropped:         s.targetsDropped.Load(),
+		BreadthExceeded:        s.breadthExceeded.Load(),
 		Cancels:                s.cancels.Load(),
 		TimerC:                 s.timerC.Load(),
 		TargetTimeouts:         s.targetTimeouts.Load(),
+		TargetTimeoutsKept:     s.targetTimeoutsKept.Load(),
 		Overloaded:             s.overloaded.Load(),
 		Loops:                  s.loops.Load(),
 		Silenced:               s.silenced.Load(),

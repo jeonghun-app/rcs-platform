@@ -182,7 +182,7 @@ func (t *Transport) serveStream(f *flow, accepted bool) {
 		// goroutine; a peer that pings but does not read loses its connection
 		// once its queue is full.
 		t.stats.keepAlives.Add(1)
-		t.write(f, crlf, false)
+		t.write(f, crlf, false, nil)
 		d.keepAlive(br)
 	}
 	for {
@@ -221,14 +221,30 @@ func (t *Transport) countReadError(err error, strict bool) {
 // time fails alone; a NoWait send past the reserve closes the connection. An
 // error writing a queued message later closes the connection too, and is seen by
 // the sender only as the flow going away.
-func (t *Transport) write(f *flow, b []byte, wait bool) error {
+//
+// counted, if set, runs once the message is in the queue's count, waiting or
+// queued, or will never be: a send under way stops counting for Flush there
+// (#375).
+func (t *Transport) write(f *flow, b []byte, wait bool, counted func()) error {
+	if counted == nil {
+		counted = func() {}
+	}
 	if f.conn == nil {
+		defer counted()
 		return t.sendDatagram(f.lis, f.remote, b)
 	}
 	// One deadline covers the whole send, the retry after shedding included,
 	// so a waiting sender blocks for at most WriteTimeout.
 	deadline := time.Now().Add(t.cfg.WriteTimeout)
-	r := f.q.push(b, wait, deadline)
+	var r pushResult
+	if wait {
+		f.q.beginWait(len(b))
+		counted()
+		r = f.q.push(b, true, deadline)
+	} else {
+		r = f.q.push(b, false, deadline)
+		counted()
+	}
 	if r == overBudget {
 		// Every queue together is at Config.MaxQueuedBytes. Make room by closing
 		// connections whose peers have stopped reading, if there are any, and
@@ -241,6 +257,9 @@ func (t *Transport) write(f *flow, b []byte, wait bool) error {
 			testHookBeforeShed()
 		}
 		t.stats.budgetSheds.Add(uint64(t.shedStalledQueues(f, len(b))))
+		if wait {
+			f.q.beginWait(len(b))
+		}
 		r = f.q.push(b, wait, deadline)
 		if r == overBudget {
 			t.stats.budgetRefusals.Add(1)
@@ -466,10 +485,14 @@ func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName st
 }
 
 func (t *Transport) dial(k reuseKey) (*flow, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), t.cfg.DialTimeout)
+	ctx, cancel := context.WithTimeout(t.dials, t.cfg.DialTimeout)
 	defer cancel()
 	c, err := t.cfg.Dialer.DialContext(ctx, "tcp", k.remote.String())
 	if err != nil {
+		if t.dials.Err() != nil {
+			// Close cut it: no dial error.
+			return nil, ErrClosed
+		}
 		t.stats.dialErrors.Add(1)
 		return nil, fmt.Errorf("transport: connecting over %s: %w", k.network, err)
 	}
@@ -485,6 +508,9 @@ func (t *Transport) dial(k reuseKey) (*flow, error) {
 		tc := tls.Client(c, cfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			c.Close()
+			if t.dials.Err() != nil {
+				return nil, ErrClosed
+			}
 			t.stats.dialErrors.Add(1)
 			return nil, fmt.Errorf("transport: TLS handshake: %w", err)
 		}

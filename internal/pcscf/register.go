@@ -128,7 +128,9 @@ func (p *pcscf) register(ctx context.Context, r *proxy.Request) proxy.Decision {
 			return p.prepareRegister(req, reg, icid, creds)
 		},
 		OnBranchFailure: func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
-			if !retryICSCF(f.Response.StatusCode) {
+			// No other icscf for a target the request's Max-Breadth left no
+			// share for: it would fail the same way (proxy.ErrMaxBreadth).
+			if errors.Is(f.Err, proxy.ErrMaxBreadth) || !retryICSCF(f.Response.StatusCode) {
 				return nil
 			}
 			tries.lastRetryAfter(f.Response)
