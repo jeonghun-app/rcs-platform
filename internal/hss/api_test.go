@@ -802,7 +802,7 @@ func TestAKAOverTheAPIAuthenticatesOverCx(t *testing.T) {
 		t.Fatalf("MAA = %+v", maa)
 	}
 	m := milenage.New(testK, testOPc)
-	if xres := m.F2([16]byte(maa.AuthDataItems[0].Authenticate[:16])); string(xres[:]) != string(maa.AuthDataItems[0].Authorization) {
+	if xres := m.F2([16]byte(maa.AuthDataItems[0].Authenticate[:16])); string(xres[:]) != maa.AuthDataItems[0].Authorization.RevealString() {
 		t.Error("the vector does not come from the provisioned keys")
 	}
 }

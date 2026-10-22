@@ -34,8 +34,9 @@ type Control struct {
 	HTTP *http.Client
 	// URL is the control API's base, e.g. http://msrp-relay.rcs.local:8082.
 	URL *url.URL
-	// Token is pcscf's bearer token, which prints as "[redacted]" under
-	// every verb (#538).
+	// Token is pcscf's bearer token, which prints as "[redacted]" under the
+	// valid verbs and as its closure's address under the invalid ones, never
+	// as its bytes (#538, #570).
 	Token secret.Key
 }
 

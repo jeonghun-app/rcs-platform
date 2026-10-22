@@ -53,13 +53,13 @@ func TestAKARegistrationRunsEndToEnd(t *testing.T) {
 		t.Fatalf("MAA = %+v", maa)
 	}
 	for i, item := range maa.AuthDataItems {
-		if item.ItemNumber != uint32(i+1) || item.Scheme != cx.SchemeDigestAKAv1MD5 || len(item.Authorization) != milenage.RESSize ||
-			len(item.ConfidentialityKey) != milenage.CKSize || len(item.IntegrityKey) != milenage.IKSize {
+		if item.ItemNumber != uint32(i+1) || item.Scheme != cx.SchemeDigestAKAv1MD5 || item.Authorization.Len() != milenage.RESSize ||
+			item.ConfidentialityKey.Len() != milenage.CKSize || item.IntegrityKey.Len() != milenage.IKSize {
 			t.Fatalf("item %d = %v", i, item)
 		}
 		// The vector is what the card computes: XRES equals f2(RAND).
 		m := milenage.New(testK, testOPc)
-		if xres := m.F2([16]byte(item.Authenticate[:16])); !bytes.Equal(xres[:], item.Authorization) {
+		if xres := m.F2([16]byte(item.Authenticate[:16])); !bytes.Equal(xres[:], item.Authorization.Reveal()) {
 			t.Fatalf("item %d XRES is not f2(RAND)", i)
 		}
 	}
@@ -486,7 +486,7 @@ func TestCxAnswersCarryNoSecretInLogs(t *testing.T) {
 	c.sar(impi1, []string{impu1}, cx.Registration, scscfName)
 	logs := e.logs.String()
 	item := maa.AuthDataItems[0]
-	assertNoSecrets(t, "logs", logs, string(hexOf(item.Authorization)), string(hexOf(item.ConfidentialityKey)),
+	assertNoSecrets(t, "logs", logs, string(hexOf(item.Authorization.Reveal())), string(hexOf(item.ConfidentialityKey.Reveal())),
 		dmaa.AuthDataItems[0].Digest.HA1, "15550100001", imsi1)
 }
 

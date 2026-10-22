@@ -152,7 +152,7 @@ func (h *diameterHSS) akaVector() (cx.AuthDataItem, error) {
 	autn, xres, ck, ik := v.AUTN(), v.XRES(), v.CK(), v.IK()
 	return cx.AuthDataItem{
 		Scheme: cx.SchemeDigestAKAv1MD5, Authenticate: append(rnd[:], autn[:]...),
-		Authorization: xres[:], ConfidentialityKey: ck[:], IntegrityKey: ik[:],
+		Authorization: secret.NewKey(xres[:]), ConfidentialityKey: secret.NewKey(ck[:]), IntegrityKey: secret.NewKey(ik[:]),
 	}, nil
 }
 
