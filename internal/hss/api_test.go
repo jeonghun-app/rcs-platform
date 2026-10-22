@@ -983,18 +983,23 @@ func TestARefusedPPRWhoseStateCannotBeWrittenLetsTheNextGo(t *testing.T) {
 }
 
 // QA on #476: an S-CSCF slow to answer the old set's PPR, past the push
-// timeout, leaves the new set's PPR its own time: it is still sent.
+// timeout, leaves the new set's PPR its own time: it is still sent. The old
+// set's answer is held until the test ends, so it is late however loaded
+// the host, and the time each PPR had is read from its own deadline, which
+// no load shortens (#540).
 func TestASlowAnswerLeavesTheNextPushItsOwnTime(t *testing.T) {
 	const timeout = time.Second
 	a := newAPIEnv(t, func(o *APIOptions) { o.PushTimeout = timeout })
 	n := serveHSS(t, a.h, "hss-a.rcs.local")
+	held := make(chan struct{})
 	scscf := connectScriptedSCSCF(t, n, "scscf-1.rcs.local", func(i int) time.Duration {
 		if i == 0 {
-			return timeout + timeout/2
+			<-held
 		}
 		return 0
 	})
-	p := NewPusher(n.node, PusherOptions{SCSCFHostPattern: "scscf-*.rcs.local", Timeout: timeout, Metrics: a.metrics})
+	t.Cleanup(func() { close(held) })
+	p := &deadlines{Notifier: NewPusher(n.node, PusherOptions{SCSCFHostPattern: "scscf-*.rcs.local", Timeout: timeout, Metrics: a.metrics})}
 	a.api = a.h.NewAPI(APIOptions{
 		Tokens:   Tokens{Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}},
 		Notifier: p, DefaultProfile: DefaultProfileID, PushTimeout: timeout,
@@ -1011,9 +1016,42 @@ func TestASlowAnswerLeavesTheNextPushItsOwnTime(t *testing.T) {
 	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu2, 1, tel1, 1, impu1, 0)); code != http.StatusOK {
 		t.Fatalf("put = %d %v", code, body)
 	}
-	if got := scscf.pprs.Load(); got != 2 {
-		t.Fatalf("the S-CSCF got %d PPRs, want the old set's and the new set's", got)
+	got := p.all()
+	if len(got) != 2 {
+		t.Fatalf("%d PPRs were pushed, want the old set's and the new set's", len(got))
 	}
+	// Sharing the first's time, the second would have its deadline.
+	if !got[1].After(got[0].Add(timeout / 2)) {
+		t.Errorf("the new set's PPR had until %v, the old set's until %v: not a time of its own", got[1], got[0])
+	}
+	deadline := time.Now().Add(realWait)
+	for scscf.pprs.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the S-CSCF got %d PPRs, want the old set's and the new set's", scscf.pprs.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// deadlines records the deadline of each PPR's context, and passes it on.
+type deadlines struct {
+	Notifier
+	mu  sync.Mutex
+	got []time.Time
+}
+
+func (d *deadlines) PushProfile(ctx context.Context, r *cx.PPR) error {
+	dl, _ := ctx.Deadline()
+	d.mu.Lock()
+	d.got = append(d.got, dl)
+	d.mu.Unlock()
+	return d.Notifier.PushProfile(ctx, r)
+}
+
+func (d *deadlines) all() []time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.got)
 }
 
 // connectScriptedSCSCF connects an S-CSCF to the HSS node to, which answers
