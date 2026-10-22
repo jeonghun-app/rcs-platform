@@ -22,12 +22,13 @@ type background struct {
 }
 
 // goRun runs f on a goroutine of its own, unless close has been called:
-// the sweep may still be running when the service stops.
-func (b *background) goRun(f func(ctx context.Context)) {
+// the sweep may still be running when the service stops. It reports whether
+// f was started.
+func (b *background) goRun(f func(ctx context.Context)) bool {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return
+		return false
 	}
 	b.running++
 	b.mu.Unlock()
@@ -35,6 +36,7 @@ func (b *background) goRun(f func(ctx context.Context)) {
 		defer b.done()
 		f(b.ctx)
 	}()
+	return true
 }
 
 func (b *background) done() {

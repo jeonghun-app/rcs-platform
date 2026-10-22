@@ -93,6 +93,9 @@ type Config struct {
 	// Logger receives operational events, never message content. Nil discards
 	// them.
 	Logger *slog.Logger
+	// Metrics, if set, counts the panics recovered from the service's hooks
+	// as MetricHookPanics, at once (#428); Stats counts them too.
+	Metrics Metrics
 	// DrainAnswer, if set, chooses the final response Drain gives a request
 	// still without one when the stop's time runs out: its status code, 300
 	// to 699, and a Retry-After if retryAfter is a second or more. Nil, or a
@@ -104,7 +107,10 @@ type Config struct {
 // Proxy is the transaction-stateful proxy core of RFC 3261 §16, the transaction
 // user of a Layer it owns. Its methods are safe for concurrent use.
 type Proxy struct {
-	sender    transaction.Sender
+	sender transaction.Sender
+	// flushes reports that the sender is a *transport.Transport, whose
+	// Flush Drain ends with (see respContext.inProgress).
+	flushes   bool
 	layer     *transaction.Layer
 	self      []sip.URI
 	router    Router
@@ -134,8 +140,14 @@ type Proxy struct {
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
-	key []byte
-	log *slog.Logger
+	key     []byte
+	log     *slog.Logger
+	metrics Metrics
+	// panicLogs limits the log lines of each hook's panics, by its name
+	// (panicLog); now is their clock, read against started.
+	panicLogs sync.Map
+	now       func() time.Time
+	started   time.Time
 	// ctx is the parent of every request's context; Close cancels it.
 	ctx  context.Context
 	stop context.CancelFunc
@@ -228,8 +240,10 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if _, err := io.ReadFull(cfg.Rand, key); err != nil {
 		return nil, fmt.Errorf("proxy: reading the hash key: %w", err)
 	}
+	_, flushes := s.(*transport.Transport)
 	p := &Proxy{
 		sender:    s,
+		flushes:   flushes,
 		self:      cfg.Self,
 		router:    cfg.Router,
 		resolver:  cfg.Resolver,
@@ -244,6 +258,9 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
+		metrics:   cfg.Metrics,
+		now:       time.Now,
+		started:   time.Now(),
 		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
@@ -416,16 +433,27 @@ func (p *Proxy) answerForStop() int {
 		}
 	}
 	deadline := time.Now().Add(drainSendWait)
+	// One timer for all the answers, not one each (QA of #310).
+	expired := time.After(drainSendWait)
+	if f := drainTimer.Load(); f != nil {
+		expired = (*f)(drainSendWait)
+	}
 	for _, ch := range sent {
 		select {
 		case <-ch:
-		case <-time.After(time.Until(deadline)):
+		case <-expired:
 			return int(answered.Load())
 		}
 	}
 	p.flushSender(deadline)
 	return int(answered.Load())
 }
+
+// drainTimer, empty but in tests, stands for time.After in answerForStop's
+// wait, so that a test fires the end of DrainSendWait itself rather than
+// bounding Drain by wall clock (#408). It is atomic since a Drain may
+// outlive the test that set it.
+var drainTimer atomic.Pointer[func(time.Duration) <-chan time.Time]
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
@@ -448,7 +476,10 @@ func (p *Proxy) flushSender(deadline time.Time) {
 func (p *Proxy) drainResponse(req *sip.Request) (*sip.Response, error) {
 	code, retryAfter := 500, 5*time.Second
 	if p.drainAns != nil {
-		if c, ra := p.drainAns(req); c >= 300 && c <= 699 {
+		var c int
+		var ra time.Duration
+		// A panic leaves the default answer.
+		if p.hook("DrainAnswer", func() { c, ra = p.drainAns(req) }) && c >= 300 && c <= 699 {
 			code, retryAfter = c, ra
 		}
 	}
@@ -740,6 +771,7 @@ type Stats struct {
 	ACKsMissing            uint64 // 2xx a Serve handler sent whose ACK never came
 	ACKsDropped            uint64 // ACKs that could not be forwarded
 	UpstreamErrors         uint64 // responses the upstream transaction could not send, dropped (§16.9)
+	HookPanics             uint64 // panics recovered from the service's hooks (#428)
 
 	// Drained counts the answers Drain sent to requests that had no final
 	// response when the stop's time ran out.
@@ -749,7 +781,7 @@ type Stats struct {
 type counters struct {
 	branches, targetsDropped, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
-	upstreamErrors, drained atomic.Uint64
+	upstreamErrors, hookPanics, drained atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -778,6 +810,7 @@ func (p *Proxy) Stats() Stats {
 		ACKsMissing:            s.acksMissing.Load(),
 		ACKsDropped:            s.acksDropped.Load(),
 		UpstreamErrors:         s.upstreamErrors.Load(),
+		HookPanics:             s.hookPanics.Load(),
 
 		Drained: s.drained.Load(),
 	}

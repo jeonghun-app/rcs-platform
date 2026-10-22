@@ -148,6 +148,7 @@ func TestRequestsWithARouteOrInADialogAreForwardedWithoutAskingTheHSS(t *testing
 	}{
 		{"Route left", invite(t, impu1, route)},
 		{"Route left, the host in capitals", invite(t, impu1, "Route: <sip:SCSCF.rcs.local:5060;transport=TCP;lr>")},
+		{"Route left, the host with a trailing dot", invite(t, impu1, "Route: <sip:scscf.rcs.local.:5060;transport=tcp;lr>")},
 		{"in a dialog", invite(t, impu1, "To: <"+impu1+">;tag=t1", route)},
 		{"in a dialog to the S-CSCF itself", invite(t, scscfURI, "To: <"+impu1+">;tag=t1")},
 		{"ACK in a dialog", request(t, "ACK", "sip:192.0.2.20", "To: <"+impu1+">;tag=t1", "CSeq: 1 ACK", route)},
@@ -166,6 +167,27 @@ func TestRequestsWithARouteOrInADialogAreForwardedWithoutAskingTheHSS(t *testing
 			}
 			if n := g.hss.calls(); n != 0 {
 				t.Errorf("the HSS got %d requests, want none", n)
+			}
+			if names := g.metrics.names(); !slices.Equal(names, []string{"icscf.routed.forwarded"}) {
+				t.Errorf("metrics = %v", names)
+			}
+		})
+	}
+}
+
+// An S-CSCF configured by address is matched however the Route writes that
+// address, as the proxy resolves it (QA of #350).
+func TestARoutedRequestReachesAnSCSCFConfiguredByAddressHoweverItIsWritten(t *testing.T) {
+	cases := []struct{ name, scscf, route string }{
+		{"IPv6, another spelling", "sip:[2001:db8::30]:5060;transport=tcp", "<sip:[2001:DB8:0:0::30]:5060;transport=tcp;lr>"},
+		{"IPv4, as IPv4-mapped IPv6", "sip:192.0.2.30:5060;transport=tcp", "<sip:[::ffff:192.0.2.30]:5060;transport=tcp;lr>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newRig(t, func(c *Config) { c.SCSCFs = []SCSCF{{URI: mustURI(tc.scscf)}} })
+			req := invite(t, impu1, "Route: "+tc.route)
+			if got := describe(t, g.route(req)); got.uri != req.URI.String() || got.route != "" {
+				t.Errorf("decision = %+v, want the request forwarded to its Route", got)
 			}
 			if names := g.metrics.names(); !slices.Equal(names, []string{"icscf.routed.forwarded"}) {
 				t.Errorf("metrics = %v", names)
